@@ -126,8 +126,8 @@ impl Executor for UniProcExecutor {
     }
 
     /// Straight through to the worker, which allocated them.
-    fn recurrent_state_snapshots(&self) -> usize {
-        self.worker.recurrent_state_snapshots()
+    fn snapshot_budget(&self) -> Option<scratchy_serving_scheduler::scheduler::SnapshotBudget> {
+        self.worker.snapshot_budget()
     }
 
     fn initialize_cache(

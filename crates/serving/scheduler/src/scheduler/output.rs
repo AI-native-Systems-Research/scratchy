@@ -269,12 +269,56 @@ pub struct RecurrentStateOps {
     pub saves: Vec<StateSnapshotOp>,
     /// Requests (re)admitted this step whose recompute runs over cached KV.
     pub cached_kv: Vec<CachedKvOp>,
+    /// The memory KV and the snapshots hand each other this step (see [`SharedMemoryOps`]).
+    pub memory: SharedMemoryOps,
 }
 
 impl RecurrentStateOps {
     /// Whether this step does any recurrent-state work.
     pub fn is_empty(&self) -> bool {
-        self.restores.is_empty() && self.saves.is_empty() && self.cached_kv.is_empty()
+        self.restores.is_empty()
+            && self.saves.is_empty()
+            && self.cached_kv.is_empty()
+            && self.memory.is_empty()
+    }
+}
+
+/// A run of [`SnapshotBudget::kv_granule_blocks`] KV blocks from block `index × that`: what KV
+/// maps and releases at a time when it shares its budget with recurrent-state snapshots.
+///
+/// [`SnapshotBudget::kv_granule_blocks`]: crate::scheduler::SnapshotBudget::kv_granule_blocks
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct KvGranule(pub u32);
+
+/// A run of [`SnapshotBudget::unit_slots`] snapshot slots from slot `index × that`: what the
+/// snapshots map and release at a time.
+///
+/// [`SnapshotBudget::unit_slots`]: crate::scheduler::SnapshotBudget::unit_slots
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SnapshotUnit(pub u32);
+
+/// ⭐ THE MEMORY ONE STEP MOVES BETWEEN KV AND THE RECURRENT-STATE SNAPSHOTS, which share one
+/// budget: the scheduler decides, the worker maps and releases. The worker releases before it
+/// maps — a release makes room for a map in the same step — and only once every step in flight
+/// is done, since a step scheduled before this one may still read what is released.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedMemoryOps {
+    /// KV granules released: none of their blocks is held, and their cached contents are gone.
+    pub release_kv: Vec<KvGranule>,
+    /// Snapshot units released: their snapshots are gone.
+    pub release_snapshots: Vec<SnapshotUnit>,
+    /// KV granules mapped before this step's forward.
+    pub map_kv: Vec<KvGranule>,
+    /// Snapshot units mapped before this step's forward.
+    pub map_snapshots: Vec<SnapshotUnit>,
+}
+
+impl SharedMemoryOps {
+    pub fn is_empty(&self) -> bool {
+        self.release_kv.is_empty()
+            && self.release_snapshots.is_empty()
+            && self.map_kv.is_empty()
+            && self.map_snapshots.is_empty()
     }
 }
 

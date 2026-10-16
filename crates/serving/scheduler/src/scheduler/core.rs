@@ -24,10 +24,11 @@ use tracing::warn;
 use super::interface::{PauseState, SchedulerInterface};
 use super::output::{
     CachedKvOp, CachedRequestData, NewRequestData, RecurrentStateOps, SchedulerOutput,
-    StateSnapshotOp,
+    SharedMemoryOps, StateSnapshotOp,
 };
-use super::recurrent_state::StateSnapshots;
+use super::recurrent_state::{SnapshotBudget, StateSnapshots};
 use super::request_queue::{RequestQueue, SchedulingPolicy, create_request_queue};
+use super::shared_memory::SharedMemory;
 
 /// ⭐ HOW FAR BEFORE A PROMPT'S END ITS RECURRENT-STATE SNAPSHOT SITS.
 ///
@@ -164,6 +165,11 @@ pub trait KVCacheManagerOps: Send {
         None
     }
 
+    /// Keep what a plan from [`Self::plan_recurrent_prefix`] restores from through this step,
+    /// BEFORE the request's blocks are allocated: an allocation may take memory from the
+    /// snapshots, and must not take the one the request is about to resume from.
+    fn hold_recurrent_prefix(&mut self, _request_id: &str, _plan: &RecurrentPrefixPlan) {}
+
     /// Commit a plan from [`Self::plan_recurrent_prefix`] for a request that was just admitted.
     fn admit_recurrent_prefix(&mut self, _request_id: &str, _plan: &RecurrentPrefixPlan) {}
 
@@ -181,6 +187,12 @@ pub trait KVCacheManagerOps: Send {
 
     /// The step that carried `saves` reported back: those snapshots now hold their state.
     fn commit_state_saves(&mut self, _saves: &[StateSnapshotOp]) {}
+
+    /// The memory this step moves between KV and the snapshots (see [`SharedMemoryOps`]),
+    /// taken once its scheduling is done.
+    fn take_shared_memory_ops(&mut self) -> SharedMemoryOps {
+        SharedMemoryOps::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +346,34 @@ struct RecurrentTracking {
     /// `request_id -> (position, key)` save points still ahead of the request, ascending.
     /// Committed at admission, dropped when the request's blocks are freed.
     save_points: HashMap<String, Vec<(u32, u64)>>,
+    /// The budget KV and the snapshots share, and what each has mapped of it.
+    memory: SharedMemory,
+    /// Per block: the step it was last freed or touched, which is how old its cached contents
+    /// are when the free queue is about to evict them.
+    block_age: Vec<u64>,
+}
+
+impl RecurrentTracking {
+    /// The mapped snapshot unit used least recently that no step reads or writes now, and when
+    /// it was used.
+    fn lru_unit(&self) -> Option<(usize, u64)> {
+        (self.memory.mapped_units())
+            .filter_map(|u| (self.snapshots.age_of(self.memory.slots_of(u))).map(|a| (u, a)))
+            .min_by_key(|&(u, a)| (a, u))
+    }
+
+    /// Release snapshot unit `u` to KV: its snapshots are gone.
+    fn release_unit(&mut self, u: usize) {
+        self.snapshots.evict_all(self.memory.slots_of(u));
+        self.memory.release_unit(u);
+    }
+
+    /// A request let `block` go at the current step.
+    fn give_back(&mut self, block: usize) {
+        let now = self.snapshots.now();
+        self.memory.give_back(block, now);
+        self.block_age[block] = now;
+    }
 }
 
 /// One request's full-block hashes in one hybrid group, and how many of its
@@ -583,27 +623,33 @@ impl SimpleBlockTracker {
         self
     }
 
-    /// ⭐⭐⭐ DECLARE THAT THE MODEL CARRIES RECURRENT STATE, AND HOW MANY SNAPSHOTS OF IT THE WORKER
-    /// KEEPS — Gated-DeltaNet and Mamba-2 hybrids (Qwen3.5 / Qwen3.6, Nemotron-H).
+    /// ⭐⭐⭐ DECLARE THAT THE MODEL CARRIES RECURRENT STATE, AND HOW ITS SNAPSHOTS SHARE THE KV
+    /// BUDGET — Gated-DeltaNet and Mamba-2 hybrids (Qwen3.5 / Qwen3.6, Nemotron-H).
     ///
     /// From then on a prefix hit resumes only where a snapshot of that state exists, and a
     /// request's prefill snapshots its state at the positions worth resuming from as its scan
-    /// passes them.
+    /// passes them. KV and the snapshots draw on one budget — every block of the pool, as with
+    /// caching off — mapped as each needs it and handed between them ([`SharedMemory`]): nothing
+    /// is mapped, so no block is free, until a step maps a granule of them.
     ///
     /// ⛔ ONLY WITH PREFIX CACHING ON, AND NOT ON THE SLIDING-WINDOW PATH. Without caching there is
     /// nothing to resume; the SWA path has its own hit logic, and no arch mixes the two yet.
-    pub fn with_state_snapshots(mut self, num_slots: usize) -> Self {
+    pub fn with_state_snapshots(mut self, budget: SnapshotBudget) -> Self {
         assert!(
             self.enable_caching && self.swa_groups.is_none(),
             "recurrent-state snapshots need prefix caching on the uniform KV path"
         );
         assert!(
-            num_slots > 0,
+            budget.max_slots > 0,
             "recurrent-state snapshots need at least one slot"
         );
+        self.free_queue.clear();
+        self.num_free_blocks = 0;
         self.recurrent = Some(RecurrentTracking {
-            snapshots: StateSnapshots::new(num_slots),
+            snapshots: StateSnapshots::new(budget.max_slots),
             save_points: HashMap::new(),
+            memory: SharedMemory::new(budget, self.total_blocks),
+            block_age: vec![0; self.total_blocks],
         });
         self
     }
@@ -846,37 +892,188 @@ impl SimpleBlockTracker {
     /// (blocks with ref_cnt > 0, already reclaimed via `touch()`). When a
     /// popped block has a hash mapping, the mapping is removed (lazy eviction
     /// matching Python's `_maybe_evict_cached_block`).
+    ///
+    /// Sharing its budget with recurrent-state snapshots, the pool first maps what the
+    /// allocation needs ([`Self::make_room_for_kv`]), and before each pop that would evict a
+    /// cached block grows instead while there is room ([`Self::grow_before_evicting`]).
     fn allocate_fresh_blocks(&mut self, count: usize) -> Option<Vec<usize>> {
-        if self.num_free_blocks < count {
+        if self.available_blocks() < count {
             return None;
         }
+        self.make_room_for_kv(count);
 
         let mut ids = Vec::with_capacity(count);
         while ids.len() < count {
+            self.grow_before_evicting();
             let block_id = self.free_queue.pop_front()?;
 
-            // Skip stale entries: blocks reclaimed via touch() have ref_cnt > 0.
-            if self.ref_cnt[block_id] > 0 {
+            // Skip stale entries: blocks reclaimed via touch() have ref_cnt > 0, and a granule
+            // released to the snapshots leaves its blocks' entries behind.
+            if self.ref_cnt[block_id] > 0 || !self.block_mapped(block_id) {
                 continue;
             }
 
             // Set ref_cnt to 1 (allocated).
             self.ref_cnt[block_id] = 1;
             self.num_free_blocks -= 1;
-
-            // Lazy eviction: remove hash mapping if this block was cached.
-            // Matches Python's `_maybe_evict_cached_block`. Only the mapping that points at THIS
-            // block: a later request that computed the same hash into a block of its own moved
-            // the mapping there, and evicting the older copy must not take it along.
-            if let Some(hash) = self.block_id_to_hash.remove(&block_id)
-                && self.block_hash_to_id.get(&hash) == Some(&block_id)
-            {
-                self.block_hash_to_id.remove(&hash);
+            self.evict_cached(block_id);
+            if let Some(rec) = self.recurrent.as_mut() {
+                rec.memory.take(block_id, rec.snapshots.now());
             }
-
             ids.push(block_id);
         }
         Some(ids)
+    }
+
+    /// Lazy eviction: remove the hash mapping of `block_id` if it was cached. Matches Python's
+    /// `_maybe_evict_cached_block`. Only the mapping that points at THIS block: a later request
+    /// that computed the same hash into a block of its own moved the mapping there, and evicting
+    /// the older copy must not take it along.
+    ///
+    /// ⭐ A SNAPSHOT GOES WITH THE BLOCK IT ENDS AT. Its key is that block's hash, and a hit
+    /// reaches it only through the cached KV of its whole prefix: with the block gone it can never
+    /// be hit again, and its slot — and in the end its unit's memory — is free for what can.
+    fn evict_cached(&mut self, block_id: usize) {
+        if let Some(hash) = self.block_id_to_hash.remove(&block_id)
+            && self.block_hash_to_id.get(&hash) == Some(&block_id)
+        {
+            self.block_hash_to_id.remove(&hash);
+            if let Some(rec) = self.recurrent.as_mut() {
+                rec.snapshots.evict_key(hash);
+            }
+        }
+    }
+
+    /// Whether `block_id`'s memory is mapped: always, unless KV shares its budget with the
+    /// snapshots and the block's granule is not.
+    fn block_mapped(&self, block_id: usize) -> bool {
+        (self.recurrent.as_ref()).is_none_or(|rec| rec.memory.block_mapped(block_id))
+    }
+
+    /// ⭐ THE BLOCKS AN ALLOCATION CAN HAVE: the free ones, and — sharing the budget with the
+    /// snapshots — those of the granules the headroom, and the memory of every snapshot unit not
+    /// read or written this step, would map. Exactly what [`Self::make_room_for_kv`] reaches, so
+    /// an allocation that passes this check cannot fail halfway.
+    fn available_blocks(&self) -> usize {
+        let Some(rec) = self.recurrent.as_ref() else {
+            return self.num_free_blocks;
+        };
+        let mem = &rec.memory;
+        let units = (mem.mapped_units())
+            .filter(|&u| rec.snapshots.age_of(mem.slots_of(u)).is_some())
+            .count() as u64;
+        let mut bytes = mem.headroom() + units * mem.unit_bytes();
+        let mut blocks = self.num_free_blocks;
+        for g in mem.unmapped_granules() {
+            match bytes.checked_sub(mem.granule_bytes(g)) {
+                Some(left) => {
+                    bytes = left;
+                    blocks += mem.blocks_of(g).len();
+                }
+                None => break,
+            }
+        }
+        blocks
+    }
+
+    /// ⭐ LIVE KV FIRST: map granules, lowest first, until `count` blocks are free — out of the
+    /// headroom, then out of the snapshots, least recently used unit first. A request that needs
+    /// a block outranks a snapshot nobody is resuming from this step. The caller checked
+    /// [`Self::available_blocks`].
+    fn make_room_for_kv(&mut self, count: usize) {
+        while self.num_free_blocks < count {
+            let Some(rec) = self.recurrent.as_mut() else {
+                return;
+            };
+            let g = (rec.memory.unmapped_granules().next()).expect("checked by available_blocks");
+            while rec.memory.headroom() < rec.memory.granule_bytes(g) {
+                let (u, _) = rec.lru_unit().expect("checked by available_blocks");
+                rec.release_unit(u);
+            }
+            self.map_granule(g);
+        }
+    }
+
+    /// ⭐ GROW BEFORE EVICTING — the next pop would evict a cached block: map a granule instead
+    /// while the budget has room for one, or while a snapshot unit is older than that block (one
+    /// LRU over both kinds of cached state). A cached block is evicted only when it is the oldest
+    /// thing there is to give up.
+    fn grow_before_evicting(&mut self) {
+        let front = loop {
+            match self.free_queue.front() {
+                Some(&b) if self.ref_cnt[b] > 0 || !self.block_mapped(b) => {
+                    self.free_queue.pop_front();
+                }
+                front => break front.copied(),
+            }
+        };
+        let cached = front.is_some_and(|b| self.block_id_to_hash.contains_key(&b));
+        let Some(rec) = self.recurrent.as_mut() else {
+            return;
+        };
+        if front.is_some() && !cached {
+            return;
+        }
+        let Some(g) = rec.memory.unmapped_granules().next() else {
+            return;
+        };
+        let need = rec.memory.granule_bytes(g);
+        if rec.memory.headroom() < need {
+            let Some(front) = front else {
+                return;
+            };
+            let age = rec.block_age[front];
+            // Only if the units older than the block free enough: releasing one for nothing
+            // would throw a snapshot away and evict the block all the same.
+            let mut older: Vec<(usize, u64)> = (rec.memory.mapped_units())
+                .filter_map(|u| rec.snapshots.age_of(rec.memory.slots_of(u)).map(|a| (u, a)))
+                .filter(|&(_, a)| a < age)
+                .collect();
+            older.sort_by_key(|&(u, a)| (a, u));
+            let reach = older.len() as u64 * rec.memory.unit_bytes() + rec.memory.headroom();
+            if reach < need {
+                return;
+            }
+            for (u, _) in older {
+                if rec.memory.headroom() >= need {
+                    break;
+                }
+                rec.release_unit(u);
+            }
+        }
+        self.map_granule(g);
+    }
+
+    /// Map granule `g`: its blocks are free, at the front of the queue so they go before any
+    /// cached one.
+    fn map_granule(&mut self, g: usize) {
+        let Some(rec) = self.recurrent.as_mut() else {
+            return;
+        };
+        rec.memory.map_granule(g);
+        let blocks = rec.memory.blocks_of(g);
+        self.num_free_blocks += blocks.len();
+        for b in blocks.rev() {
+            self.free_queue.push_front(b);
+        }
+    }
+
+    /// Release granule `g` to the snapshots: no request holds a block of it, and its cached
+    /// blocks are evicted. Their queue entries are skipped as stale.
+    fn release_granule(&mut self, g: usize) {
+        let Some(rec) = self.recurrent.as_mut() else {
+            return;
+        };
+        let blocks = rec.memory.blocks_of(g);
+        rec.memory.release_granule(g);
+        self.num_free_blocks -= blocks.len();
+        for b in blocks {
+            debug_assert_eq!(
+                self.ref_cnt[b], 0,
+                "block {b} of released granule {g} is held"
+            );
+            self.evict_cached(b);
+        }
     }
 
     /// Touch a block: increment ref_cnt. If ref_cnt was 0 (block in free
@@ -889,6 +1086,9 @@ impl SimpleBlockTracker {
             // Block was free, now allocated — decrement free count.
             // The stale free_queue entry will be skipped lazily.
             self.num_free_blocks -= 1;
+            if let Some(rec) = self.recurrent.as_mut() {
+                rec.memory.take(block_id, rec.snapshots.now());
+            }
         }
         self.ref_cnt[block_id] += 1;
     }
@@ -1627,7 +1827,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                         None => fresh_needed += 1,
                     }
                 }
-                if fresh_needed + evictable_reuse > self.num_free_blocks {
+                if fresh_needed + evictable_reuse > self.available_blocks() {
                     return None;
                 }
 
@@ -1767,6 +1967,9 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                     if self.ref_cnt[bid] == 0 {
                         self.num_free_blocks += 1;
                         self.free_queue.push_back(bid);
+                        if let Some(rec) = self.recurrent.as_mut() {
+                            rec.give_back(bid);
+                        }
                     }
                 }
             }
@@ -1857,6 +2060,9 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                     if self.ref_cnt[bid] == 0 {
                         self.num_free_blocks += 1;
                         self.free_queue.push_front(bid);
+                        if let Some(rec) = self.recurrent.as_mut() {
+                            rec.give_back(bid);
+                        }
                     }
                 }
             }
@@ -1980,7 +2186,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                 .min()
                 .unwrap_or(0);
         }
-        self.num_free_blocks
+        self.available_blocks()
     }
 
     fn num_total_blocks(&self) -> usize {
@@ -2037,7 +2243,13 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         let kv_blocks = (kv_hit_tokens as usize / bs).min(hashes.len());
         // At least one token must still run: its logits are the next token.
         let resumable = kv_blocks.min(request.num_tokens().saturating_sub(1) / bs);
-        let hit = (1..=resumable).rev().find_map(|b| {
+        // ⛔ A RESTORE IS HELD THROUGH ITS REQUEST'S ALLOCATION (`hold_recurrent_prefix`), so a
+        // request whose blocks and that snapshot's memory together exceed the budget could never
+        // be admitted beside it: it resumes cold instead, over the same shared KV.
+        let blocks = request.num_tokens().div_ceil(bs) as u64;
+        let fits =
+            blocks * rec.memory.block_bytes() + rec.memory.unit_bytes() <= rec.memory.limit();
+        let hit = (1..=resumable).rev().filter(|_| fits).find_map(|b| {
             rec.snapshots
                 .ready_slot(hashes[b - 1])
                 .map(|slot| (b, slot))
@@ -2090,7 +2302,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         })
     }
 
-    fn admit_recurrent_prefix(&mut self, request_id: &str, plan: &RecurrentPrefixPlan) {
+    fn hold_recurrent_prefix(&mut self, request_id: &str, plan: &RecurrentPrefixPlan) {
         let Some(rec) = self.recurrent.as_mut() else {
             return;
         };
@@ -2102,6 +2314,12 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         if let Some((slot, _)) = plan.restore {
             rec.snapshots.pin(slot, request_id);
         }
+    }
+
+    fn admit_recurrent_prefix(&mut self, request_id: &str, plan: &RecurrentPrefixPlan) {
+        let Some(rec) = self.recurrent.as_mut() else {
+            return;
+        };
         if plan.save_points.is_empty() {
             rec.save_points.remove(request_id);
         } else {
@@ -2128,12 +2346,11 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         if points.is_empty() {
             rec.save_points.remove(request_id);
         }
-        let snapshots = &mut rec.snapshots;
         (passed.into_iter())
             .filter(|&(position, _)| position > from)
             .take(MAX_STATE_SAVES_PER_STEP)
             .filter_map(|(position, key)| {
-                let slot = snapshots.reserve(key, position, request_id)?;
+                let slot = self.reserve_snapshot(key, position, request_id)?;
                 Some(StateSnapshotOp {
                     req_id: request_id.to_owned(),
                     slot,
@@ -2150,6 +2367,67 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                 rec.snapshots.commit(op.slot, op.key, &op.req_id);
             }
         }
+    }
+
+    fn take_shared_memory_ops(&mut self) -> SharedMemoryOps {
+        (self.recurrent.as_mut()).map_or_else(SharedMemoryOps::default, |rec| rec.memory.take_ops())
+    }
+}
+
+impl SimpleBlockTracker {
+    /// ⭐ A SLOT FOR `key`'s NEW SNAPSHOT, written by `writer`'s step: an empty one already
+    /// mapped; else a unit mapped for it ([`Self::map_snapshot_unit`]); else the slot of the
+    /// snapshot it evicts. `None` when `key` has one, or every snapshot is read or written this
+    /// step and no memory can be had.
+    fn reserve_snapshot(&mut self, key: u64, position: u32, writer: &str) -> Option<usize> {
+        let rec = self.recurrent.as_ref()?;
+        if rec.snapshots.contains(key) {
+            return None;
+        }
+        let slot = match rec.snapshots.empty_slot(|s| rec.memory.slot_mapped(s)) {
+            Some(empty) => empty,
+            None => match self.map_snapshot_unit(writer) {
+                Some(first) => first,
+                None => self.recurrent.as_ref()?.snapshots.victim(writer)?.0,
+            },
+        };
+        self.recurrent
+            .as_mut()?
+            .snapshots
+            .place(slot, key, position, writer);
+        Some(slot)
+    }
+
+    /// Map a snapshot unit for a save by `writer`, if the budget has it: out of the headroom, or
+    /// out of KV granules no request holds — oldest first, and only those older than the
+    /// snapshot the save would otherwise evict (one LRU over both kinds of cached state). Taken
+    /// only if they free a whole unit: a granule released for nothing is cache thrown away.
+    /// The unit's first slot.
+    fn map_snapshot_unit(&mut self, writer: &str) -> Option<usize> {
+        let rec = self.recurrent.as_ref()?;
+        let u = rec.memory.lowest_unmapped_unit()?;
+        let need = rec.memory.unit_bytes();
+        if rec.memory.headroom() < need {
+            let evicts = rec.snapshots.victim(writer).map(|(_, age)| age);
+            let mut reach = rec.memory.headroom();
+            let mut take = Vec::new();
+            for (g, age) in rec.memory.free_granules() {
+                if reach >= need || evicts.is_some_and(|evicts| age >= evicts) {
+                    break;
+                }
+                reach += rec.memory.granule_bytes(g);
+                take.push(g);
+            }
+            if reach < need {
+                return None;
+            }
+            for g in take {
+                self.release_granule(g);
+            }
+        }
+        let rec = self.recurrent.as_mut()?;
+        rec.memory.map_unit(u);
+        Some(rec.memory.slots_of(u).start)
     }
 }
 
@@ -2913,6 +3191,9 @@ impl SchedulerInterface for Scheduler {
                 let recurrent = self
                     .kv_cache
                     .plan_recurrent_prefix(&request, num_cached_tokens);
+                if let Some(plan) = &recurrent {
+                    self.kv_cache.hold_recurrent_prefix(&request_id, plan);
+                }
                 let num_cached_tokens = recurrent
                     .as_ref()
                     .map_or(num_cached_tokens, |plan| plan.tokens);
@@ -3178,6 +3459,7 @@ impl SchedulerInterface for Scheduler {
                 restores: state_restores,
                 cached_kv,
                 saves: state_saves,
+                memory: self.kv_cache.take_shared_memory_ops(),
             },
         };
 
@@ -3275,6 +3557,7 @@ impl SchedulerInterface for Scheduler {
 
 #[cfg(test)]
 mod tests {
+    use super::super::output::{KvGranule, SnapshotUnit};
     use super::*;
     use scratchy_core_common::SamplingParams;
     use scratchy_core_config::SchedulerConfig;
@@ -6819,6 +7102,208 @@ mod tests {
 
     // ----- Recurrent-state (Gated-DeltaNet) snapshots -----
 
+    /// `slots` snapshots that take none of the KV budget, KV mapped a block at a time: the
+    /// snapshots and the blocks never compete, so a test sees each alone.
+    fn apart(slots: usize) -> SnapshotBudget {
+        SnapshotBudget {
+            kv_block_bytes: 1,
+            kv_granule_blocks: std::num::NonZeroUsize::MIN,
+            slot_bytes: 0,
+            unit_slots: std::num::NonZeroUsize::MIN,
+            max_slots: slots,
+        }
+    }
+
+    /// 8 blocks of 10 bytes — an 80-byte budget — in granules of 4, and up to 4 snapshot slots of
+    /// 20 bytes, a unit each: a pool where KV and the snapshots compete.
+    fn shared() -> SimpleBlockTracker {
+        SimpleBlockTracker::with_caching(8, 16).with_state_snapshots(SnapshotBudget {
+            kv_block_bytes: 10,
+            kv_granule_blocks: std::num::NonZeroUsize::new(4).unwrap(),
+            slot_bytes: 20,
+            unit_slots: std::num::NonZeroUsize::MIN,
+            max_slots: 4,
+        })
+    }
+
+    /// `n` blocks of prompt unlike any other `seed`'s.
+    fn prompt_blocks(id: &str, n: usize, seed: u32) -> Request {
+        request_with(
+            id,
+            (0..(n * 16) as u32).map(|t| seed * 10_000 + t).collect(),
+        )
+    }
+
+    fn alloc(t: &mut SimpleBlockTracker, r: &Request) -> Option<Vec<usize>> {
+        (t.allocate_slots(r, r.num_tokens(), 0, &[])).map(|mut groups| groups.remove(0))
+    }
+
+    fn holds_snapshot(t: &SimpleBlockTracker, key: u64) -> bool {
+        t.recurrent.as_ref().unwrap().snapshots.contains(key)
+    }
+
+    #[test]
+    fn sharing_the_budget_kv_counts_every_block_and_maps_a_granule_when_a_step_needs_it() {
+        let mut t = shared();
+        assert_eq!(KVCacheManagerOps::num_total_blocks(&t), 8);
+        assert_eq!(
+            KVCacheManagerOps::num_free_blocks(&t),
+            8,
+            "the whole budget, as with caching off"
+        );
+        assert!(t.take_shared_memory_ops().is_empty(), "nothing mapped yet");
+        assert_eq!(alloc(&mut t, &prompt_blocks("a", 1, 1)), Some(vec![0]));
+        assert_eq!(t.take_shared_memory_ops().map_kv, vec![KvGranule(0)]);
+        assert_eq!(KVCacheManagerOps::num_free_blocks(&t), 7);
+    }
+
+    #[test]
+    fn a_snapshot_maps_from_the_headroom_then_from_kv_no_request_holds() {
+        let mut t = shared();
+        alloc(&mut t, &prompt_blocks("a", 8, 1)).unwrap();
+        t.free("a");
+        t.take_shared_memory_ops();
+        t.new_step_starts();
+        // The budget is all KV, cached and held by none, and there is no snapshot to evict.
+        assert_eq!(t.reserve_snapshot(1, 16, "w"), Some(0));
+        let ops = t.take_shared_memory_ops();
+        assert_eq!(
+            (ops.release_kv, ops.map_snapshots),
+            (vec![KvGranule(0)], vec![SnapshotUnit(0)])
+        );
+        assert_eq!(
+            KVCacheManagerOps::num_cached_blocks(&t),
+            4,
+            "granule 0's cached blocks went with it"
+        );
+        assert_eq!(
+            KVCacheManagerOps::num_free_blocks(&t),
+            4,
+            "granule 1's: the 20 bytes left make no granule"
+        );
+        // The rest of granule 0's memory: a second unit, no KV released.
+        assert_eq!(t.reserve_snapshot(2, 32, "w"), Some(1));
+        assert_eq!(
+            t.take_shared_memory_ops().map_snapshots,
+            vec![SnapshotUnit(1)]
+        );
+    }
+
+    #[test]
+    fn a_save_evicts_a_snapshot_older_than_the_kv_it_would_take() {
+        let mut t = shared();
+        assert_eq!(t.reserve_snapshot(1, 16, "w"), Some(0));
+        assert_eq!(t.reserve_snapshot(2, 32, "w"), Some(1));
+        t.new_step_starts();
+        alloc(&mut t, &prompt_blocks("a", 4, 1)).unwrap();
+        t.free("a");
+        t.take_shared_memory_ops();
+        t.new_step_starts();
+        // No headroom; a's granule, freed after both snapshots were saved, is the newer state.
+        let slot = t.reserve_snapshot(3, 48, "w").unwrap();
+        assert!(slot < 2, "a snapshot's slot");
+        assert!(t.take_shared_memory_ops().is_empty(), "no memory moved");
+        assert_eq!(
+            KVCacheManagerOps::num_cached_blocks(&t),
+            4,
+            "a's blocks stay cached"
+        );
+    }
+
+    #[test]
+    fn live_kv_takes_the_snapshots_memory_but_not_a_unit_read_this_step() {
+        let mut t = shared();
+        for key in 0..4 {
+            assert_eq!(t.reserve_snapshot(key, 16, "w"), Some(key as usize));
+        }
+        t.take_shared_memory_ops();
+        t.new_step_starts();
+        t.recurrent.as_mut().unwrap().snapshots.pin(0, "r");
+        // 8 blocks would need slot 0's 20 bytes too: refused, and nothing is released for it.
+        assert_eq!(alloc(&mut t, &prompt_blocks("big", 8, 1)), None);
+        assert!(t.take_shared_memory_ops().is_empty());
+        // 4 blocks: two units go, least recently used first, and never the one read this step.
+        alloc(&mut t, &prompt_blocks("a", 4, 2)).unwrap();
+        let ops = t.take_shared_memory_ops();
+        assert_eq!(
+            (ops.release_snapshots, ops.map_kv),
+            (vec![SnapshotUnit(1), SnapshotUnit(2)], vec![KvGranule(0)])
+        );
+        assert!(holds_snapshot(&t, 0) && holds_snapshot(&t, 3));
+    }
+
+    #[test]
+    fn a_snapshot_goes_with_the_block_it_ends_at() {
+        let mut t = SimpleBlockTracker::with_caching(4, 16).with_state_snapshots(apart(2));
+        let a = alloc(&mut t, &prompt_blocks("a", 4, 1)).unwrap();
+        let key = t.block_id_to_hash[&a[2]];
+        assert_eq!(t.reserve_snapshot(key, 48, "a"), Some(0));
+        t.commit_state_saves(&[StateSnapshotOp {
+            req_id: "a".into(),
+            slot: 0,
+            position: 48,
+            key,
+        }]);
+        t.free("a");
+        t.new_step_starts();
+        // a's blocks wait in the free queue tail first: b's first block is a's last, which the
+        // snapshot does not end at.
+        let one_block = |id: &str, seed: u32| request_with(id, (seed..seed + 8).collect());
+        assert_eq!(
+            alloc(&mut t, &one_block("b", 20_000)).map(|b| b.len()),
+            Some(1)
+        );
+        assert!(holds_snapshot(&t, key), "its block is still cached");
+        alloc(&mut t, &one_block("c", 30_000)).unwrap();
+        assert!(
+            !holds_snapshot(&t, key),
+            "its block was evicted, and it with it"
+        );
+    }
+
+    #[test]
+    fn a_cached_block_outlives_an_older_snapshot_and_gives_way_to_a_newer_one() {
+        // The snapshot is older than a's cached blocks: c's granule comes out of the snapshot.
+        let mut t = shared();
+        assert_eq!(t.reserve_snapshot(9, 16, "w"), Some(0));
+        t.new_step_starts();
+        alloc(&mut t, &prompt_blocks("a", 4, 1)).unwrap();
+        t.free("a");
+        t.take_shared_memory_ops();
+        t.new_step_starts();
+        assert_eq!(
+            alloc(&mut t, &prompt_blocks("c", 4, 2)),
+            Some(vec![4, 5, 6, 7])
+        );
+        let ops = t.take_shared_memory_ops();
+        assert_eq!(
+            (ops.release_snapshots, ops.map_kv),
+            (vec![SnapshotUnit(0)], vec![KvGranule(1)])
+        );
+        assert_eq!(
+            KVCacheManagerOps::num_cached_blocks(&t),
+            4,
+            "a's blocks stay cached"
+        );
+
+        // The snapshot is newer: c evicts a's cached blocks and the snapshot stays.
+        let mut t = shared();
+        alloc(&mut t, &prompt_blocks("a", 4, 1)).unwrap();
+        t.free("a");
+        t.new_step_starts();
+        assert_eq!(t.reserve_snapshot(9, 16, "w"), Some(0));
+        t.take_shared_memory_ops();
+        t.new_step_starts();
+        assert_eq!(
+            alloc(&mut t, &prompt_blocks("c", 4, 2)),
+            Some(vec![3, 2, 1, 0]),
+            "a's blocks, tail first"
+        );
+        assert!(t.take_shared_memory_ops().is_empty());
+        assert_eq!(KVCacheManagerOps::num_cached_blocks(&t), 0);
+        assert!(holds_snapshot(&t, 9));
+    }
+
     /// A caching tracker over a uniform pool that tracks `slots` recurrent-state snapshots.
     fn recurrent_scheduler(slots: usize, budget: usize) -> Scheduler {
         let cfg = SchedulerConfig {
@@ -6829,7 +7314,7 @@ mod tests {
             ..Default::default()
         };
         let kv: Box<dyn KVCacheManagerOps> =
-            Box::new(SimpleBlockTracker::with_caching(1000, 16).with_state_snapshots(slots));
+            Box::new(SimpleBlockTracker::with_caching(1000, 16).with_state_snapshots(apart(slots)));
         Scheduler::new(&cfg, 8192, kv)
     }
 
@@ -7180,6 +7665,59 @@ mod tests {
         run_step(sched);
     }
 
+    /// A request whose blocks need snapshot memory keeps the snapshot it resumes from: the restore
+    /// is held before its blocks are allocated, so the allocation takes the other unit even though
+    /// the restored one is older.
+    #[test]
+    fn recurrent_an_allocation_never_takes_the_snapshot_its_own_request_restores() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 4096,
+            max_num_seqs: 4,
+            enable_chunked_prefill: true,
+            long_prefill_token_threshold: 0,
+            ..Default::default()
+        };
+        // 10 blocks of 10 bytes, mapped one at a time, and 30-byte snapshot slots.
+        let budget = SnapshotBudget {
+            kv_block_bytes: 10,
+            kv_granule_blocks: std::num::NonZeroUsize::MIN,
+            slot_bytes: 30,
+            unit_slots: std::num::NonZeroUsize::MIN,
+            max_slots: 3,
+        };
+        let kv = SimpleBlockTracker::with_caching(10, 16).with_state_snapshots(budget);
+        let mut sched = Scheduler::new(&cfg, 8192, Box::new(kv));
+        let saved = |sched: &mut Scheduler, id: &str, prompt: Vec<u32>| {
+            sched.add_request(request_with(id, prompt));
+            let out = run_step(sched);
+            prefill_and_finish(sched, id);
+            out.recurrent_state.saves[0].clone()
+        };
+        // Two 2-block prompts and their snapshots: 2 × (20 + 30) bytes, the whole budget.
+        let turn1: Vec<u32> = (0..32).collect();
+        let t1 = saved(&mut sched, "t1", turn1.clone());
+        let other = saved(&mut sched, "o", (5000..5032).collect());
+
+        // The next turn resumes at t1's snapshot and needs 3 blocks more than are free.
+        let turn2: Vec<u32> = turn1.iter().copied().chain(1000..1048).collect();
+        sched.add_request(request_with("t2", turn2));
+        let out = run_step(&mut sched);
+        assert_eq!(
+            out.recurrent_state.restores,
+            vec![StateSnapshotOp {
+                req_id: "t2".into(),
+                slot: t1.slot,
+                position: 16,
+                key: t1.key,
+            }]
+        );
+        assert_eq!(
+            out.recurrent_state.memory.release_snapshots,
+            vec![SnapshotUnit(other.slot as u32)],
+            "the other snapshot's memory, not the restored one's"
+        );
+    }
+
     #[test]
     fn recurrent_cold_prompt_snapshots_its_end_in_its_one_forward() {
         let mut sched = recurrent_scheduler(4, 4096);
@@ -7526,7 +8064,7 @@ mod tests {
         };
         // r0 (1 block) + r1 (600 tokens, 38 blocks) fill the pool exactly.
         let kv: Box<dyn KVCacheManagerOps> =
-            Box::new(SimpleBlockTracker::with_caching(39, 16).with_state_snapshots(4));
+            Box::new(SimpleBlockTracker::with_caching(39, 16).with_state_snapshots(apart(4)));
         let mut sched = Scheduler::new(&cfg, 8192, kv);
         let long = |id: &str, n: usize| {
             let mut r = make_request(id, n);
@@ -7593,7 +8131,7 @@ mod tests {
             ..Default::default()
         };
         let kv: Box<dyn KVCacheManagerOps> =
-            Box::new(SimpleBlockTracker::with_caching(79, 16).with_state_snapshots(4));
+            Box::new(SimpleBlockTracker::with_caching(79, 16).with_state_snapshots(apart(4)));
         let mut sched = Scheduler::new(&cfg, 8192, kv);
         sched.add_request(make_request("r1", 600));
         prefill_and_finish(&mut sched, "r1");

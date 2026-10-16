@@ -20,6 +20,26 @@
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::ops::Range;
+
+/// ⭐ HOW A RECURRENT MODEL'S SNAPSHOTS SHARE THE KV BUDGET, as its worker lays the memory out
+/// (#495): KV is mapped and released [`Self::kv_granule_blocks`] blocks at a time and snapshots
+/// [`Self::unit_slots`] slots at a time — each the least run whose bytes are whole sparse tiles in
+/// every store it spans, so a release frees whole tiles and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotBudget {
+    /// Bytes one KV block takes across every store a block lives in.
+    pub kv_block_bytes: u64,
+    /// Blocks per KV granule.
+    pub kv_granule_blocks: NonZeroUsize,
+    /// Bytes one snapshot slot takes across every recurrent-state store.
+    pub slot_bytes: u64,
+    /// Slots per snapshot unit.
+    pub unit_slots: NonZeroUsize,
+    /// Slots the worker can address: as many as the whole budget holds, a whole number of units.
+    pub max_slots: usize,
+}
 
 /// One snapshot slot's contents.
 #[derive(Debug, Clone)]
@@ -110,32 +130,71 @@ impl StateSnapshots {
         }
     }
 
-    /// Reserve a slot for `key` at `position`, written by `writer`'s step. `None` when `key`
-    /// already has a snapshot, or when every slot is read or written this step — save the one
-    /// `writer` alone restores this step, taken over when nothing else can be.
-    pub(crate) fn reserve(&mut self, key: u64, position: u32, writer: &str) -> Option<usize> {
-        if self.contains(key) {
-            return None;
-        }
+    /// The scheduling step now: the clock every `last_used` reads.
+    pub(crate) fn now(&self) -> u64 {
+        self.step
+    }
+
+    /// The first empty slot whose memory `mapped` says is there.
+    pub(crate) fn empty_slot(&self, mapped: impl Fn(usize) -> bool) -> Option<usize> {
+        (0..self.slots.len()).find(|&s| self.slots[s].is_none() && mapped(s))
+    }
+
+    /// The snapshot a save by `writer` would evict, and when it was last used: never one read or
+    /// written this step — but the one `writer` alone restores this step, taken over when nothing
+    /// else can be. `None` when every snapshot is read or written this step.
+    pub(crate) fn victim(&self, writer: &str) -> Option<(usize, u64)> {
         let step = self.step;
-        let slot = match self.slots.iter().position(Option::is_none) {
-            Some(free) => free,
-            None => {
-                let held = |c: &Snapshot| c.pinned < step;
-                let own = |c: &Snapshot| c.pinned == step && c.reader.as_deref() == Some(writer);
-                let (victim, _) = (self.slots.iter().enumerate())
-                    .filter_map(|(i, c)| c.as_ref().map(|c| (i, c)))
-                    .filter(|(_, c)| held(c) || own(c))
-                    // Unpinned first, oldest first; among equals a pending snapshot before a ready
-                    // one (the only kind a request can use), then the DEEPEST: an agent loop
-                    // resumes from the oldest snapshot of its chain once the next user message
-                    // re-renders the loop's turns, and the newest one is pinned by the restore
-                    // that read it.
-                    .min_by_key(|(_, c)| (own(c), c.last_used, c.ready, Reverse(c.position)))?;
-                self.evict(victim);
-                victim
+        let held = |c: &Snapshot| c.pinned < step;
+        let own = |c: &Snapshot| c.pinned == step && c.reader.as_deref() == Some(writer);
+        (self.slots.iter().enumerate())
+            .filter_map(|(i, c)| c.as_ref().map(|c| (i, c)))
+            .filter(|(_, c)| held(c) || own(c))
+            // Unpinned first, oldest first; among equals a pending snapshot before a ready one
+            // (the only kind a request can use), then the DEEPEST: an agent loop resumes from the
+            // oldest snapshot of its chain once the next user message re-renders the loop's turns,
+            // and the newest one is pinned by the restore that read it.
+            .min_by_key(|(_, c)| (own(c), c.last_used, c.ready, Reverse(c.position)))
+            .map(|(i, c)| (i, c.last_used))
+    }
+
+    /// When the snapshots in `slots` were last used (0 with none there), or `None` while one of
+    /// them is read or written this step: whether, and how cheaply, their memory can be released.
+    pub(crate) fn age_of(&self, slots: Range<usize>) -> Option<u64> {
+        let step = self.step;
+        let mut age = 0;
+        for c in self.slots[slots].iter().flatten() {
+            if c.pinned == step {
+                return None;
             }
-        };
+            age = age.max(c.last_used);
+        }
+        Some(age)
+    }
+
+    /// Drop `key`'s snapshot, unless a step reads or writes it now: the KV it resumes over is gone
+    /// (a block a step reads is held, so never evicted under it).
+    pub(crate) fn evict_key(&mut self, key: u64) {
+        let step = self.step;
+        if let Some(&slot) = self.by_key.get(&key)
+            && self.slots[slot].as_ref().is_some_and(|c| c.pinned < step)
+        {
+            self.evict(slot);
+        }
+    }
+
+    /// Drop every snapshot in `slots`: their memory is being released.
+    pub(crate) fn evict_all(&mut self, slots: Range<usize>) {
+        for slot in slots {
+            self.evict(slot);
+        }
+    }
+
+    /// Hold `key`'s snapshot at `position`, written by `writer`'s step, in `slot`, evicting what
+    /// it held.
+    pub(crate) fn place(&mut self, slot: usize, key: u64, position: u32, writer: &str) {
+        self.evict(slot);
+        let step = self.step;
         self.slots[slot] = Some(Snapshot {
             key,
             position,
@@ -146,7 +205,6 @@ impl StateSnapshots {
             reader: None,
         });
         self.by_key.insert(key, slot);
-        Some(slot)
     }
 
     /// `writer`'s step that writes `slot` reported back: its snapshot is usable. A no-op unless
@@ -202,10 +260,20 @@ impl StateSnapshots {
 mod tests {
     use super::*;
 
+    /// A save into a pool whose every slot is mapped: an empty slot first, else the victim's.
+    fn reserve(snaps: &mut StateSnapshots, key: u64, position: u32, writer: &str) -> Option<usize> {
+        if snaps.contains(key) {
+            return None;
+        }
+        let slot = (snaps.empty_slot(|_| true)).or_else(|| snaps.victim(writer).map(|(s, _)| s))?;
+        snaps.place(slot, key, position, writer);
+        Some(slot)
+    }
+
     #[test]
     fn a_reserved_snapshot_is_hit_only_after_commit() {
         let mut snaps = StateSnapshots::new(2);
-        let slot = snaps.reserve(7, 112, "a").unwrap();
+        let slot = reserve(&mut snaps, 7, 112, "a").unwrap();
         assert_eq!(
             snaps.ready_slot(7),
             None,
@@ -219,20 +287,20 @@ mod tests {
     #[test]
     fn one_prefix_is_snapshotted_once() {
         let mut snaps = StateSnapshots::new(4);
-        assert!(snaps.reserve(7, 112, "a").is_some());
-        assert_eq!(snaps.reserve(7, 112, "b"), None, "pending duplicate");
+        assert!(reserve(&mut snaps, 7, 112, "a").is_some());
+        assert_eq!(reserve(&mut snaps, 7, 112, "b"), None, "pending duplicate");
         let slot = snaps.by_key[&7];
         snaps.commit(slot, 7, "a");
-        assert_eq!(snaps.reserve(7, 112, "c"), None, "ready duplicate");
+        assert_eq!(reserve(&mut snaps, 7, 112, "c"), None, "ready duplicate");
     }
 
     #[test]
     fn a_freed_writer_drops_only_its_pending_snapshots() {
         let mut snaps = StateSnapshots::new(3);
-        let done = snaps.reserve(1, 16, "a").unwrap();
+        let done = reserve(&mut snaps, 1, 16, "a").unwrap();
         snaps.commit(done, 1, "a");
-        snaps.reserve(2, 32, "a").unwrap();
-        snaps.reserve(3, 48, "b").unwrap();
+        reserve(&mut snaps, 2, 32, "a").unwrap();
+        reserve(&mut snaps, 3, 48, "b").unwrap();
         snaps.drop_pending_of("a");
         assert_eq!(
             snaps.ready_slot(1),
@@ -246,10 +314,10 @@ mod tests {
     #[test]
     fn a_late_commit_for_a_replaced_reservation_is_ignored() {
         let mut snaps = StateSnapshots::new(1);
-        let slot = snaps.reserve(1, 16, "a").unwrap();
+        let slot = reserve(&mut snaps, 1, 16, "a").unwrap();
         snaps.drop_pending_of("a");
         snaps.tick();
-        assert_eq!(snaps.reserve(2, 32, "b"), Some(slot));
+        assert_eq!(reserve(&mut snaps, 2, 32, "b"), Some(slot));
         snaps.commit(slot, 1, "a");
         assert_eq!(snaps.ready_slot(1), None);
         assert_eq!(
@@ -265,10 +333,10 @@ mod tests {
         // same slot. a's step reporting back (it ran, on a state the failure left) must not make
         // the slot hittable before b's own step writes it.
         let mut snaps = StateSnapshots::new(1);
-        let slot = snaps.reserve(9, 144, "a").unwrap();
+        let slot = reserve(&mut snaps, 9, 144, "a").unwrap();
         snaps.drop_pending_of("a");
         snaps.tick();
-        assert_eq!(snaps.reserve(9, 144, "b"), Some(slot));
+        assert_eq!(reserve(&mut snaps, 9, 144, "b"), Some(slot));
         snaps.commit(slot, 9, "a");
         assert_eq!(snaps.ready_slot(9), None);
         snaps.commit(slot, 9, "b");
@@ -278,19 +346,19 @@ mod tests {
     #[test]
     fn eviction_takes_the_least_recently_used_slot_not_used_this_step() {
         let mut snaps = StateSnapshots::new(2);
-        let a = snaps.reserve(1, 16, "a").unwrap();
+        let a = reserve(&mut snaps, 1, 16, "a").unwrap();
         snaps.commit(a, 1, "a");
-        let b = snaps.reserve(2, 32, "b").unwrap();
+        let b = reserve(&mut snaps, 2, 32, "b").unwrap();
         snaps.commit(b, 2, "b");
         assert_eq!(
-            snaps.reserve(3, 48, "c"),
+            reserve(&mut snaps, 3, 48, "c"),
             None,
             "both slots written this step"
         );
         snaps.tick();
         snaps.touch(a);
         assert_eq!(
-            snaps.reserve(3, 48, "c"),
+            reserve(&mut snaps, 3, 48, "c"),
             Some(b),
             "b is older than a's hit"
         );
@@ -303,15 +371,15 @@ mod tests {
         // A conversation whose own snapshots fill the pool: the turn restores its newest one
         // (pinned) and touches the older one (recency only), and its save still finds a slot.
         let mut snaps = StateSnapshots::new(2);
-        let old = snaps.reserve(1, 592, "t1").unwrap();
+        let old = reserve(&mut snaps, 1, 592, "t1").unwrap();
         snaps.commit(old, 1, "t1");
         snaps.tick();
-        let new = snaps.reserve(2, 976, "t2").unwrap();
+        let new = reserve(&mut snaps, 2, 976, "t2").unwrap();
         snaps.commit(new, 2, "t2");
         snaps.tick();
         snaps.touch(old);
         snaps.pin(new, "t3");
-        assert_eq!(snaps.reserve(3, 1376, "t3"), Some(old));
+        assert_eq!(reserve(&mut snaps, 3, 1376, "t3"), Some(old));
         assert_eq!(
             snaps.ready_slot(2),
             Some(new),
@@ -325,11 +393,11 @@ mod tests {
     #[test]
     fn a_turn_takes_over_the_slot_it_alone_restores() {
         let mut snaps = StateSnapshots::new(1);
-        let slot = snaps.reserve(1, 1024, "t1").unwrap();
+        let slot = reserve(&mut snaps, 1, 1024, "t1").unwrap();
         snaps.commit(slot, 1, "t1");
         snaps.tick();
         snaps.pin(slot, "t2");
-        assert_eq!(snaps.reserve(2, 2048, "t2"), Some(slot));
+        assert_eq!(reserve(&mut snaps, 2, 2048, "t2"), Some(slot));
         assert!(!snaps.contains(1), "the older snapshot is replaced");
         snaps.commit(slot, 2, "t2");
         assert_eq!(snaps.ready_slot(2), Some(slot));
@@ -340,14 +408,14 @@ mod tests {
     #[test]
     fn a_slot_another_request_restores_is_not_taken_over() {
         let mut snaps = StateSnapshots::new(1);
-        let slot = snaps.reserve(1, 1024, "t1").unwrap();
+        let slot = reserve(&mut snaps, 1, 1024, "t1").unwrap();
         snaps.commit(slot, 1, "t1");
         snaps.tick();
         snaps.pin(slot, "a");
-        assert_eq!(snaps.reserve(2, 2048, "b"), None, "read by another");
+        assert_eq!(reserve(&mut snaps, 2, 2048, "b"), None, "read by another");
         snaps.pin(slot, "b");
-        assert_eq!(snaps.reserve(2, 2048, "a"), None, "read by two");
-        assert_eq!(snaps.reserve(2, 2048, "b"), None, "read by two");
+        assert_eq!(reserve(&mut snaps, 2, 2048, "a"), None, "read by two");
+        assert_eq!(reserve(&mut snaps, 2, 2048, "b"), None, "read by two");
         assert_eq!(snaps.ready_slot(1), Some(slot));
     }
 
@@ -355,11 +423,15 @@ mod tests {
     fn among_equally_old_snapshots_the_deepest_goes_first() {
         let mut snaps = StateSnapshots::new(3);
         for (key, position) in [(1, 512), (2, 1024), (3, 1536)] {
-            let slot = snaps.reserve(key, position, "w").unwrap();
+            let slot = reserve(&mut snaps, key, position, "w").unwrap();
             snaps.commit(slot, key, "w");
         }
         snaps.tick();
-        assert_eq!(snaps.reserve(4, 2048, "x"), Some(2), "the 1536 snapshot");
+        assert_eq!(
+            reserve(&mut snaps, 4, 2048, "x"),
+            Some(2),
+            "the 1536 snapshot"
+        );
         assert!(
             snaps.ready_slot(1).is_some(),
             "the oldest of the chain survives"
@@ -369,11 +441,11 @@ mod tests {
     #[test]
     fn clear_forgets_everything() {
         let mut snaps = StateSnapshots::new(2);
-        let a = snaps.reserve(1, 16, "a").unwrap();
+        let a = reserve(&mut snaps, 1, 16, "a").unwrap();
         snaps.commit(a, 1, "a");
         snaps.clear();
         assert_eq!(snaps.num_ready(), 0);
         assert!(!snaps.contains(1));
-        assert_eq!(snaps.reserve(1, 16, "b"), Some(0));
+        assert_eq!(reserve(&mut snaps, 1, 16, "b"), Some(0));
     }
 }

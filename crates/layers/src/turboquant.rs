@@ -404,6 +404,27 @@ pub fn kv_bytes_per_token(
     }
 }
 
+/// What one block of `block_size` tokens takes in each store a TurboQuant pool lays out: a
+/// layer's packed codes, and its norms (one K or V each), and the one-layer fp16 scratch — as the
+/// metal target's `build_tq_provision` lays them out, one source for it and for whoever must know
+/// each store's bytes (the runs a shared KV budget maps apart).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TqBlockBytes {
+    pub packed: usize,
+    pub norms: usize,
+    pub scratch: usize,
+}
+
+impl TqBlockBytes {
+    pub fn of(block_size: usize, num_kv_heads: usize, head_dim: usize, bits: u32) -> Self {
+        Self {
+            packed: block_size * num_kv_heads * packed_dim(head_dim, bits) * 4,
+            norms: block_size * num_kv_heads * 4,
+            scratch: block_size * num_kv_heads * head_dim * SCRATCH_ELEM_BYTES,
+        }
+    }
+}
+
 /// Bytes one token costs in a TurboQuant pool's one-layer fp16 scratch, K and V: what a model
 /// staging through another pool's scratch does not pay.
 pub fn scratch_bytes_per_token(num_kv_heads: usize, head_dim: usize) -> usize {

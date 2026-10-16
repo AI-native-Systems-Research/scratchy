@@ -7,8 +7,8 @@
 //! (`attention.metal`).
 
 use objc2_metal::MTLDevice;
-use scratchy_layers::turboquant::{SCRATCH_ELEM_BYTES, TqBits};
-pub use scratchy_layers::turboquant::{kv_bytes_per_token, scratch_bytes_per_token};
+use scratchy_layers::turboquant::TqBits;
+pub use scratchy_layers::turboquant::{TqBlockBytes, kv_bytes_per_token, scratch_bytes_per_token};
 
 use crate::argmax::Buffer;
 
@@ -108,10 +108,12 @@ pub fn build_tq_provision(
     // `!!!!` on a continuation prefill; a zero norm dequants to 0, which rope overwrites. So does
     // the scratch: the paged attention can stage blocks just past the active context. Packed
     // codes need no zeroing (a garbage code indexes a bounded centroid; times norm 0 is 0).
-    let per_block_elems = block_size * num_kv_heads * head_dim;
-    let packed = (block_size * num_kv_heads * pdim * 4, false);
-    let norms = (block_size * num_kv_heads * 4, true);
-    let scratch = (per_block_elems * SCRATCH_ELEM_BYTES, true);
+    let bytes = TqBlockBytes::of(block_size, num_kv_heads, head_dim, bits);
+    let (packed, norms, scratch) = (
+        (bytes.packed, false),
+        (bytes.norms, true),
+        (bytes.scratch, true),
+    );
     // A lent scratch of this geometry is staged through, and none of this pool's own is laid out:
     // its stores are its lender's, mapped as far as the same blocks are reached.
     let chunk_bytes = blocks_per_chunk * scratch.0;
@@ -196,7 +198,7 @@ mod tests {
     use crate::mtl4_dispatch::{Mtl4DispatchBatch, read_slice};
     use objc2_metal::{MTLBuffer, MTLSize};
     use scratchy_layers::turboquant::{
-        KvCodec, PolarQuantizer, pack_indices, packed_dim, vals_per_word,
+        KvCodec, PolarQuantizer, SCRATCH_ELEM_BYTES, pack_indices, packed_dim, vals_per_word,
     };
 
     /// `tq_compress_paged` baked for `kv` with no offset, writing its dequant back into the pool.
