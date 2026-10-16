@@ -60,6 +60,34 @@ nccl = ["scratchy-forward-compiler/nccl"]
 # with `KV_CODEC = TurboQuant`, the rest stay dense and are named in the build
 # output. Nothing selects it at runtime. `scratchy-cli` turns it on by default.
 turboquant = []
+# ⭐ THE BUILD SIDE OF A SERVING BINARY, GIVEN THE BINARY'S FEATURES. This macro and the
+# `scratchy-models` build script link the same stack the binary does (target-metal,
+# forward-compiler, core-model, …), and cargo resolves their features apart from the binary's.
+# `serve`'s HTTP stack (axum, hyper, tower) and `guided-decoding`'s llguidance (with the
+# `tokenizers` 0.21 its toktrie pins) turn features on in shared crates that nothing on the build
+# side asks for. Then those crates differ between the two sides, and every crate above them,
+# ours included, compiles twice. These two features ask for exactly those features on the build
+# side, so each shared crate resolves the same on both sides and compiles once.
+# `scratchy-models` forwards both. `scratchy-cli` turns them on with the binary's own.
+serve = [
+    "serde_json/raw_value",
+    "tracing/log",
+    "dep:smallvec",
+    "dep:memchr",
+    "dep:http",
+    "dep:httparse",
+    "dep:serde_core",
+]
+guided-decoding = [
+    "serde_json/preserve_order",
+    # `preserve_order` brings these onto the build side; the binary has them with defaults
+    # (indexmap: llguidance, minijinja; hashbrown: scratchy-serving-scheduler).
+    "dep:indexmap",
+    "dep:hashbrown",
+    "dep:regex-automata",
+    "dep:aho-corasick",
+    "dep:getrandom",
+]
 
 [dependencies]
 tracing = { workspace = true }
@@ -84,6 +112,17 @@ quote = "1"
 proc-macro2 = "1"
 serde_json = { workspace = true }
 rayon = { workspace = true }
+# Named only for the features `serve` / `guided-decoding` give them (see there); no code uses them.
+smallvec = { version = "1", optional = true, features = ["const_generics", "const_new"] }
+memchr = { version = "2", optional = true }
+http = { version = "1", optional = true }
+httparse = { version = "1", optional = true }
+serde_core = { version = "1", optional = true }
+indexmap = { version = "2", optional = true }
+hashbrown = { version = "0.17", optional = true }
+regex-automata = { version = "0.4", optional = true, default-features = false, features = ["dfa", "nfa", "perf"] }
+aho-corasick = { version = "1", optional = true }
+getrandom = { version = "0.3", optional = true, default-features = false, features = ["wasm_js"] }
 # `Implementation::fan_out` returns
 # `Vec<Instruction>` typed at proc-macro time, killing the
 # `OpInstance::field_values: Vec<TokenStream>` round-trip. The

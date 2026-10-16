@@ -663,7 +663,7 @@ pub fn bake(tokenizer_json: &str, digest: &str) -> Result<Bake, String> {
     let mut file: serde_json::Value =
         serde_json::from_str(tokenizer_json).map_err(|e| e.to_string())?;
     file["model"] = serde_json::json!({ "digest": digest });
-    let pipeline = serde_json::to_string(&file).map_err(|e| e.to_string())?;
+    let pipeline = serde_json::to_string(&sorted_keys(file)).map_err(|e| e.to_string())?;
 
     // Trust nothing: the baked tokenizer must encode and decode the corpus as the file's does.
     let leaked: &'static [u8] = aligned_copy(&tables);
@@ -691,6 +691,29 @@ pub fn bake(tokenizer_json: &str, digest: &str) -> Result<Bake, String> {
         }
     }
     Ok(Bake { tables, pipeline })
+}
+
+/// `value` with every object's keys in sorted order. A `serde_json::Map` iterates sorted without
+/// serde_json's `preserve_order` and in insertion (file) order with it, and a serving build turns it
+/// on for this crate too (`scratchy-forward-compiler-macro`'s `guided-decoding`): sorted here, the
+/// baked pipeline is the same bytes whichever way the build resolved serde_json.
+fn sorted_keys(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k, sorted_keys(v)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sorted_keys).collect())
+        }
+        other => other,
+    }
 }
 
 /// `bytes`, copied to a 4-aligned allocation that lives for the process (a `bake`'s self-check,

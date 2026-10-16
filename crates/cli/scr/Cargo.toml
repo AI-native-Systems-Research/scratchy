@@ -24,7 +24,7 @@ chat = ["dep:scratchy-serving-api"]
 # exposes a grammar flag, so plain `chat` builds skip the llguidance stack
 # (17 crates incl. a duplicate `tokenizers` pulled by toktrie_hf_tokenizers,
 # which is pinned to tokenizers 0.21 upstream while we're on 0.23).
-serve = ["dep:scratchy-serving-api", "scratchy-serving-api/serve", "guided-decoding"]
+serve = ["dep:scratchy-serving-api", "scratchy-serving-api/serve", "model?/serve", "guided-decoding"]
 # `scr launch claude` spawns `<this binary> serve` as a child, so it needs the
 # server compiled in.
 claude = ["serve"]
@@ -65,7 +65,7 @@ spyre-emu = ["scratchy-serving-api/spyre-emu"]
 # scratchy-serving-api is present). `guided-decoding` is pulled in by `serve`
 # above; enable it explicitly (e.g. `--features chat,guided-decoding`) to
 # build grammar support into a non-`serve` binary.
-guided-decoding = ["scratchy-serving-api?/guided-decoding"]
+guided-decoding = ["scratchy-serving-api?/guided-decoding", "model?/guided-decoding"]
 # Shell tab completion over real HuggingFace model ids: forwards into
 # scratchy-models, whose build script resolves the candidate list against
 # huggingface.co at build time (see docs/BUILD.md). ON by default — completing

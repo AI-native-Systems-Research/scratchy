@@ -760,6 +760,11 @@ spyre-emu = ["spyre", "scratchy-forward-compiler-macro/spyre-emu"]
 # takes (see scratchy-forward-compiler-macro's `turboquant`); no effect on the
 # other backends. Off here like every other scope; `scratchy-cli`'s `metal` turns it on.
 turboquant = ["scratchy-forward-compiler-macro/turboquant"]
+# The binary's serving stack, mirrored on the build side so the stack this crate's build script
+# shares with the binary compiles once (see scratchy-forward-compiler-macro's `serve`).
+# `scratchy-cli` turns each on with its own.
+serve = ["scratchy-forward-compiler-macro/serve"]
+guided-decoding = ["scratchy-forward-compiler-macro/guided-decoding"]
 spyre = [
     "scratchy-forward-compiler-macro/spyre",
     "scratchy-forward-compiler/spyre",
