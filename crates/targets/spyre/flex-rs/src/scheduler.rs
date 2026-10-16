@@ -2248,7 +2248,7 @@ impl ResponseWorker {
         tags_to_be_returned[i] = ResponseTag(local_tag as u32);
         slot.set_state(PendingRequestState::Succeeded);
 
-        let pipeline = {
+        let (id, pipeline) = {
             let mut data = slot.data.lock().unwrap_or_else(|e| e.into_inner());
             data.completion_time_point = Some(now);
             // "Add the CB sent to driver timestamp... Try launch_time_point
@@ -2258,8 +2258,21 @@ impl ResponseWorker {
                 data.issue_time_point = Some(lt);
             }
             data.response_block = Some(received_response);
-            data.pipeline
+            (data.id, data.pipeline)
         };
+
+        // The RB's five cycle counts and power word, recorded for whoever drains the telemetry
+        // ring — the vendor's own telemetry phase (`DecodeTimestamps`/`TimestampDecoder`) consumed
+        // these off this same completion path. Recorded BEFORE `issue_callback` so that when a
+        // caller's `synchronize` returns (the callback chain is what it waits on), every
+        // completed CB's timing is already in the ring.
+        if let Some(pipeline) = pipeline {
+            crate::rb_telemetry::record(crate::rb_telemetry::RbTiming {
+                id,
+                pipeline,
+                rb: received_response,
+            });
+        }
 
         self.issue_callback(slot);
 

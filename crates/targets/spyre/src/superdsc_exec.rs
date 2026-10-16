@@ -151,6 +151,14 @@ struct Diag {
     /// `SCRATCHY_SDSC_PREFIX_TIME`: one drain per call at a ROTATING group, giving a cumulative
     /// ladder whose successive differences are the per-group device times.
     prefix_time: bool,
+    /// `SCRATCHY_SDSC_RB_TIME`: per-op device CYCLES read out of the response blocks' own timestamp
+    /// section. The harvest itself is always on — the completion thread records every completed
+    /// CB's five cycle counts (`flex_rs::rb_telemetry`) — so this knob costs nothing but the
+    /// printing, and needs NO drain beyond the one `synchronize` a step already performs. It is
+    /// the drain-free answer to what `group_time`/`prefix_time` pay ~11% of decode to estimate.
+    /// Combine it with `repeat_probe` and per-op attribution is skipped loudly (the probe's extra
+    /// launches are in the ring but not in the sequence).
+    rb_time: bool,
     /// `SCRATCHY_SDSC_REPEAT_PROBE`: launch the same program twice back to back — separates "a
     /// launch is expensive" from "switching programs is expensive".
     repeat_probe: bool,
@@ -201,6 +209,7 @@ impl Diag {
                 group_time: on("SCRATCHY_SDSC_GROUP_TIME"),
                 submit_time: on("SCRATCHY_SDSC_SUBMIT_TIME"),
                 prefix_time: on("SCRATCHY_SDSC_PREFIX_TIME"),
+                rb_time: on("SCRATCHY_SDSC_RB_TIME"),
                 repeat_probe: on("SCRATCHY_SDSC_REPEAT_PROBE"),
                 body_trace: on("SCRATCHY_SDSC_BODY_TRACE"),
                 segaddr: on("SCRATCHY_SDSC_SEGADDR_DIAG"),
@@ -215,6 +224,53 @@ impl Diag {
             }
         })
     }
+}
+
+/// One pipeline's harvested TS-phase durations plus a CB count, NAMED per the card-measured slot
+/// semantics ([`flex_rs::control_block_wire::ResponseBlockWire::dmai_cycles`] and siblings: the
+/// five TS words are event snapshots of one wrapping cycle counter, so a phase duration is the
+/// wrapping difference of its pair — never a raw sum, which is why this holds durations and not
+/// slot totals). `exec` is the headline — the compute engine's own time, which sums to a
+/// forward's device span; `prep` is the queue+prep wait behind earlier CBs on a pipelined
+/// stream; `tail` is the writeback tail on compute CBs and the D2H duration on D2H CBs.
+#[derive(Default)]
+struct RbCycles {
+    dmai: u64,
+    prep: u64,
+    exec: u64,
+    tail: u64,
+    cbs: u64,
+}
+
+impl RbCycles {
+    /// A compute CB: every phase is its own (`dmai` is exactly 0 — the card writes the same
+    /// snapshot to words 0 and 1 when there is no DMA-in).
+    fn add_compute(&mut self, rb: flex_rs::control_block_wire::ResponseBlockWire) {
+        self.dmai += rb.dmai_cycles() as u64;
+        self.prep += rb.prep_cmpt_cycles() as u64;
+        self.exec += rb.exec_cmpt_cycles() as u64;
+        self.tail += rb.dmao_cycles() as u64;
+        self.cbs += 1;
+    }
+
+    /// An H2D CB: only its DMA-in pair is meaningful (words 3-4 read zero).
+    fn add_dmai(&mut self, rb: flex_rs::control_block_wire::ResponseBlockWire) {
+        self.dmai += rb.dmai_cycles() as u64;
+        self.cbs += 1;
+    }
+
+    /// A D2H CB: only its DMA-out pair is meaningful (words 0-2 read zero).
+    fn add_dmao(&mut self, rb: flex_rs::control_block_wire::ResponseBlockWire) {
+        self.tail += rb.dmao_cycles() as u64;
+        self.cbs += 1;
+    }
+}
+
+/// One op's harvested cycles plus the label the launch loop knew it by.
+#[derive(Default)]
+struct RbOpCycles {
+    cycles: RbCycles,
+    label: String,
 }
 
 /// Accumulators the timing modes write into. Process-wide, like the C++ statics.
@@ -237,6 +293,23 @@ struct Timers {
     prefix_ms: BTreeMap<(usize, usize), (f64, u64, String)>,
     prefix_call: BTreeMap<usize, u64>,
     repeat_ms: BTreeMap<usize, (f64, f64, u64, String)>,
+    /// Per-op harvested RB cycles — keyed like `prefix_ms` (same rung-numbering hazard).
+    rb_cycles: BTreeMap<(usize, usize), RbOpCycles>,
+    /// The async-DMA pipelines' harvested cycles: the preamble-H2D and logits-D2H crossings, which
+    /// no op owns.
+    rb_dmai: RbCycles,
+    rb_dmao: RbCycles,
+    rb_steps: u64,
+    rb_cbs: u64,
+    /// Cumulative `rb_cbs` at the last periodic report — the count jumps a whole forward at a
+    /// time (~162 CBs), so a plain `is_multiple_of` would skip its own thresholds and never fire.
+    rb_reported: u64,
+    /// `SCRATCHY_SDSC_RB_TIME`'s launch sequence: one entry per compute launch this forward, in
+    /// launch order — ((rung length, op index), label). Lives here, not on the executor, because
+    /// the launch loop holds `self` immutably across the stream reference. Cleared at the start of
+    /// every `predict` and zipped against the telemetry ring's id-sorted compute entries after the
+    /// step's synchronize; see [`rb_attribute`].
+    rb_seq: Vec<((usize, usize), String)>,
     forwards: i64,
 }
 
@@ -2308,6 +2381,13 @@ impl Executor {
                     continue;
                 }
 
+                if d.rb_time {
+                    // The launch sequence the post-synchronize drain zips against: entry i is the
+                    // i-th compute CB of this forward in submission order, keyed by (rung length,
+                    // op index) so prefix/body/suffix op numbers cannot average into each other.
+                    timers().rb_seq.push(((ops.len(), oi), op.label()));
+                }
+
                 if d.submit_time {
                     // `submit` is the enqueue alone: no synchronize on purpose — a drain would make
                     // this measure the very pipeline it is trying to leave undisturbed.
@@ -2665,6 +2745,98 @@ impl Executor {
     //  Predict
     // ──────────────────────────────────────────────────────────────────────────────────────────
 
+    /// Attribute this forward's harvested RB timings to the ops that launched them, and report on
+    /// the same cadence `group_time` does. The completion thread records every CB's five device
+    /// cycle counts as it completes (`flex_rs::rb_telemetry`), so after the step's `synchronize`
+    /// — the one the step already performs, no extra drain — the ring holds exactly this
+    /// forward's CBs. Compute-pipeline entries sorted by submission id zip 1:1 against
+    /// [`Timers::rb_seq`], which the launch loop filled in the same order. This is the attribution
+    /// `group_time`/`prefix_time` pay ~11% of decode to estimate, read for free instead.
+    fn rb_attribute(&mut self) {
+        let seq = std::mem::take(&mut timers().rb_seq);
+        let mut entries = flex_rs::rb_telemetry::drain();
+        let mut t = timers();
+        t.rb_steps += 1;
+        // The async-DMA pipelines belong to no op — the preamble-H2D and logits-D2H crossings —
+        // so they accumulate wherever they arrive, attribution-free.
+        for e in &entries {
+            match e.pipeline {
+                flex_rs::scheduler::PipelineId::AsyncDmaI => t.rb_dmai.add_dmai(e.rb),
+                flex_rs::scheduler::PipelineId::AsyncDmaO => t.rb_dmao.add_dmao(e.rb),
+                flex_rs::scheduler::PipelineId::Compute => {}
+            }
+        }
+        // PIN THE MAPPING ON-CARD: raw per-CB records for the first few forwards, verbatim. The
+        // aggregates below blend forwards (prefill and decode CBs differ) and cannot decide the
+        // slot-to-name mapping; these can — an H2D CB lights the dmai slots, a D2H the dmao
+        // slots, a compute CB the rest, and only same-domain slot pairs difference to durations.
+        if t.rb_steps <= 3 {
+            for e in entries
+                .iter()
+                .filter(|e| !matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute))
+            {
+                eprintln!(
+                    "[sdsc-rbtime] fwd {} {:?} id {} slots {:?} power {}",
+                    t.rb_steps,
+                    e.pipeline,
+                    e.id,
+                    e.rb.timestamps(),
+                    e.rb.power()
+                );
+            }
+        }
+        entries.retain(|e| matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute));
+        entries.sort_unstable_by_key(|e| e.id);
+        if entries.len() != seq.len() {
+            // LOUD, NOT SILENT: a mismatch means per-op attribution would be WRONG, not merely
+            // missing — `repeat_probe` launches computes that are in the ring but not in the
+            // sequence, and a rotated ring loses launches from its front. Skip the attribution
+            // entirely; the DMA totals above stay honest either way.
+            eprintln!(
+                "[sdsc-rbtime] sequence mismatch: {} completed compute CBs vs {} recorded \
+                 launches — per-op attribution SKIPPED for this forward",
+                entries.len(),
+                seq.len()
+            );
+            return;
+        }
+        let zipped: Vec<_> = entries.iter().zip(seq).collect();
+        if t.rb_steps <= 3 {
+            let n = zipped.len();
+            for (i, (e, ((rung, oi), label))) in zipped
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i < 20 || *i + 8 >= n)
+            {
+                eprintln!(
+                    "[sdsc-rbtime] fwd {} op ({rung},{oi}) rec {i} id {} slots {:?} power {}  {}",
+                    t.rb_steps,
+                    e.id,
+                    e.rb.timestamps(),
+                    e.rb.power(),
+                    label
+                );
+            }
+        }
+        let mut new_cbs = 0u64;
+        for (e, ((rung, oi), label)) in zipped {
+            let acc = t.rb_cycles.entry((rung, oi)).or_default();
+            acc.cycles.add_compute(e.rb);
+            new_cbs += 1;
+            if acc.label.is_empty() {
+                acc.label = label;
+            }
+        }
+        t.rb_cbs += new_cbs;
+        // Same cadence as `group_time`'s report: rare enough not to distort, often enough that a
+        // long run does not have to end first. Watermarked rather than `is_multiple_of` because
+        // the cumulative count jumps a whole forward at a time.
+        if t.rb_cbs - t.rb_reported >= 20_000 {
+            t.rb_reported = t.rb_cbs;
+            report_rb_time(&t);
+        }
+    }
+
     /// Run ONE forward over `n_new` NEW positions appended at `[seq_pos..seq_pos+n_new)`: refill
     /// the bound activations, launch prefix → body×iters → suffix, and copy the logits row back.
     /// `out_logits` is `None` for a chunk whose logits nobody reads (every prefill chunk but the
@@ -2681,6 +2853,14 @@ impl Executor {
         self.require_sources_filled()?;
         let d = Diag::get();
         let n_new = NewTokens(n_new.0.max(1));
+
+        // RB timing: start the forward's window empty. The previous forward drained its own
+        // entries at its synchronize; what is left in the ring now is pre-forward history
+        // (prepare's weight uploads belong to no op), and the launch sequence starts at zero.
+        if d.rb_time {
+            let _ = flex_rs::rb_telemetry::drain();
+        }
+        timers().rb_seq.clear();
 
         // LEAK FIX: recreate the stream each forward so the destroy DRAINS the scheduler's
         // per-stream fence deques (~2.57 GB/forward otherwise → 200 GB OOM). The previous forward
@@ -2769,6 +2949,10 @@ impl Executor {
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("predict: sync: {e}"))?;
+
+        if d.rb_time {
+            self.rb_attribute();
+        }
 
         if d.phase_time {
             let t3 = Instant::now();
@@ -3699,6 +3883,49 @@ fn report_group_time(t: &Timers) {
     }
 }
 
+/// The RB-timestamp report: per-op device cycles, harvested from the response blocks at
+/// completion (no drain), cumulative across the run. Phases are named per the card-measured slot
+/// semantics ([`flex_rs::control_block_wire::ResponseBlockWire::exec_cmpt_cycles`] and siblings):
+/// `exec` is the compute engine's own time, `prep` the queue+prep wait behind earlier CBs — on a
+/// pipelined stream consecutive CBs overlap (the next CB's prep runs during the previous CB's
+/// exec), so Σ exec, not Σ total, is the stream's device span.
+fn report_rb_time(t: &Timers) {
+    let exec_total: u64 = t.rb_cycles.values().map(|a| a.cycles.exec).sum();
+    let prep_total: u64 = t.rb_cycles.values().map(|a| a.cycles.prep).sum();
+    let dma_total = t.rb_dmai.dmai + t.rb_dmao.tail;
+    eprintln!(
+        "[sdsc-rbtime] device exec cycles by op (of {exec_total} exec + {prep_total} prep + \
+         {dma_total} dma cycles over {} compute CBs, {} forwards)",
+        t.rb_cbs, t.rb_steps
+    );
+    let mut top: Vec<_> = t
+        .rb_cycles
+        .iter()
+        .map(|(k, a)| (a.cycles.exec, *k, a))
+        .collect();
+    top.sort_by_key(|a| std::cmp::Reverse(a.0));
+    for (cyc, (rung, oi), a) in top.iter().take(20) {
+        eprintln!(
+            "[sdsc-rbtime]   op ({rung},{oi:<3}) {:>12} cyc exec  {:>9} cyc/cb  {:6} cbs  \
+             prep {:>12}  {}",
+            cyc,
+            cyc / a.cycles.cbs.max(1),
+            a.cycles.cbs,
+            a.cycles.prep,
+            a.label
+        );
+    }
+    eprintln!(
+        "[sdsc-rbtime]   dmai: {} cb, {} cyc ({} cyc/cb)  |  dmao: {} cb, {} cyc ({} cyc/cb)",
+        t.rb_dmai.cbs,
+        t.rb_dmai.dmai,
+        t.rb_dmai.dmai / t.rb_dmai.cbs.max(1),
+        t.rb_dmao.cbs,
+        t.rb_dmao.tail,
+        t.rb_dmao.tail / t.rb_dmao.cbs.max(1),
+    );
+}
+
 /// The submit / prefix-ladder / repeat-probe reports, emitted with the phase line.
 fn report_phase_timers(compute_ms: f64) {
     let d = Diag::get();
@@ -3723,6 +3950,12 @@ fn report_phase_timers(compute_ms: f64) {
         t.prep_ms = 0.0;
         t.submit_calls = 0;
         t.barrier_launches = 0;
+    }
+    // THE HARVEST, DRAIN-FREE: per-op device cycles the response blocks carried all along. This
+    // section rides the phase line (turn `SCRATCHY_SDSC_RB_TIME` on WITH `phase_time` for the
+    // per-forward view; alone, the report fires on the same 20k-CB cadence as `group_time`).
+    if d.rb_time && t.rb_cbs > 0 {
+        report_rb_time(&t);
     }
     // THE LADDER: T(j) is the mean time from a layer's first launch to the drain after group j, so
     // the RISE from one rung to the next is group j's own device time. A rung with a small rise is a

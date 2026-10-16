@@ -737,6 +737,15 @@ pub const RB_NUM_BYTES: usize = 64;
 /// (QGI/HMI, DMA, R5) union starts in a response block. The section runs to [`RB_NUM_BYTES`], i.e.
 /// four 64-bit beats; see [`AppQgiSection`].
 pub const APP_SECTION: usize = 32;
+/// Port of `hal/1p0/response_block_sbf.hpp`'s `TS_SECTION` — where the timestamp section starts:
+/// `TimeStampSectionSBF` is `array<TimeStampSBF, NUM_SECTION_TIMESTAMPS>` with `NUM_SECTION_TIMESTAMPS
+/// == 5` and `sizeof(TimeStampSBF) == 4` (`time_stamp_sbf.hpp`), so the section is bytes 8..28 as
+/// five little-endian 32-bit words.
+pub const TS_SECTION: usize = 8;
+/// Port of `hal/1p0/response_block_sbf.hpp`'s `PW_SECTION` — the 4-byte power measurement word
+/// between the timestamp section and [`APP_SECTION`] (`sizeof(PowerMeasurementSectionSBF) == 4`,
+/// pinned by the response block's own `static_assert(PW_SECTION + sizeof(...) == APP_SECTION)`).
+pub const PW_SECTION: usize = 28;
 
 /// A fully-encoded, hardware-ready control block: the real bytes that get
 /// queued via `senlib_ffi_scheduler::cbi_queue_control_blocks_sbf`. This is
@@ -976,6 +985,13 @@ impl ControlBlockWire {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseBlockWire {
     ret_word: u64,
+    /// The TIMESTAMP section, `TS_SECTION..PW_SECTION` (bytes 8..28) as five little-endian 32-bit
+    /// words — event snapshots of one wrapping cycle counter, never durations. See the
+    /// [`Self::dmai_cycles`] family for the card-measured semantics.
+    ts_words: [u32; 5],
+    /// The POWER-MEASUREMENT word at `PW_SECTION..APP_SECTION` (bytes 28..32) — the vendor's
+    /// `ResponseBlockWrapper::power()`.
+    power_word: u32,
     /// The APPLICATION-SPECIFIC section, `APP_SECTION..RB_NUM_BYTES` (bytes 32..64) as four
     /// little-endian 64-bit BEATS — kept verbatim rather than decoded here because the section is a
     /// UNION whose meaning depends on `locator()`. [`Self::app_qgi`] reads it as the QGI/HMI variant,
@@ -1006,15 +1022,29 @@ impl ResponseBlockWire {
     /// in particular cannot erase the `state == TIMED_OUT` arm.
     pub const ZERO: Self = Self {
         ret_word: 0,
+        ts_words: [0; 5],
+        power_word: 0,
         app_beats: [0; 4],
     };
 
     /// Decode from the raw 64-byte RB: the `ReturnSectionSBF` (bytes 0..8, `RET_SECTION`) that decides
-    /// completion, plus the APP section (bytes 32..64) held as raw beats for [`Self::app_qgi`].
-    /// Timestamps and power (bytes 8..32) are still not consumed by this crate.
+    /// completion; the timestamp section (bytes 8..28) as five u32 cycle counts; the power word
+    /// (bytes 28..32); and the APP section (bytes 32..64) held as raw beats for [`Self::app_qgi`].
     pub fn from_bytes(bytes: &[u8; RB_NUM_BYTES]) -> Self {
         let mut word = [0u8; 8];
         word.copy_from_slice(&bytes[0..8]);
+        // `TS_SECTION = 8` and five 4-byte `TimeStampSBF`s in wire order (`time_stamp_sbf.hpp`:
+        // `TimeStampSectionSBF = std::array<TimeStampSBF, 5>`, each a single 31:0 bitfield over a
+        // u32 — no sub-field packing to undo).
+        let mut ts_words = [0u32; 5];
+        for (i, ts) in ts_words.iter_mut().enumerate() {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&bytes[TS_SECTION + i * 4..TS_SECTION + i * 4 + 4]);
+            *ts = u32::from_le_bytes(b);
+        }
+        // `PW_SECTION = 28`, one 31:0 bitfield over a u32 (`power_measurement_section_sbf.hpp`).
+        let mut pw = [0u8; 4];
+        pw.copy_from_slice(&bytes[PW_SECTION..PW_SECTION + 4]);
         // `APP_SECTION = 32`, `RB_NUM_BYTES = 64` (`response_block_sbf.hpp:36-39`), and the QGI
         // variant is a `BEGIN_SAFE_BITFIELD_UNION(QGIBeatUnion, 4, std::uint64_t)` — four u64 beats,
         // beat `i` at bits `64i..64i+63`, which the header's own comments confirm ("Beat 2: QGI" for
@@ -1027,8 +1057,70 @@ impl ResponseBlockWire {
         }
         Self {
             ret_word: u64::from_le_bytes(word),
+            ts_words,
+            power_word: u32::from_le_bytes(pw),
             app_beats,
         }
+    }
+
+    /// The TIMESTAMP section verbatim: five raw 32-bit device cycle counts, `TS1..TS5` in wire
+    /// order (`TimeStampSectionSBF`; libaiupti's activity enum calls them `CYCLES_TS1..TS5`
+    /// "cycle count events"). They are event snapshots of one free-running wrapping counter, not
+    /// durations — see the [`Self::dmai_cycles`] family for the card-measured semantics, and
+    /// never sum these raw.
+    pub const fn timestamps(self) -> [u32; 5] {
+        self.ts_words
+    }
+
+    /// ⭐ THE TS SLOTS' CARD-MEASURED SEMANTICS (dd2, granite-3.1-2b fp8, PR #523's on-card run):
+    /// the five words are snapshots of ONE free-running u32 cycle counter (rate ≈
+    /// `CYCLES_PER_USEC` — 1012 cyc/µs cross-checked on card against the phase-line wall clock),
+    /// taken at `word[0]` = CB start / DMA-in start, `word[1]` = DMA-in end (**exactly equal to
+    /// `word[0]` on every CB with no DMA-in — every compute CB**), `word[2]` = CMPT start,
+    /// `word[3]` = CMPT end, `word[4]` = CB end. Slots a CB does not write read zero: an H2D CB
+    /// zeroes words 3-4, a D2H CB zeroes words 0-2. A phase duration is therefore the WRAPPING
+    /// difference of its pair — the counter wraps every ~4.2 s, and a per-CB duration (≤ ~1M
+    /// cycles) is far under the wrap, so `wrapping_sub` is exact. The vendor's
+    /// `ResponseBlockWrapper` names these same five phases (`dmai_cycles()` … `total_cmpt_cycles()`)
+    /// but ships no `.cpp`, so these accessors carry the measurement, not a transcription.
+    ///
+    /// On a D2H CB, `dmai_cycles`/`prep_cmpt_cycles`/`exec_cmpt_cycles` difference zeroed slots
+    /// and are meaningless; on a compute CB, `dmao_cycles` is the ~9-cycle writeback tail. Use
+    /// the pair that matches the CB's pipeline.
+    pub const fn dmai_cycles(self) -> u32 {
+        self.ts_words[1].wrapping_sub(self.ts_words[0])
+    }
+
+    /// The CMPT queue+prep wait: `word[2] - word[1]`, from DMA-in end to the compute engine
+    /// picking the CB up. On a pipelined stream this includes waiting behind the previous CB's
+    /// execution — consecutive compute CBs overlap exactly this way (the next CB's prep runs
+    /// during the previous CB's exec). See [`Self::dmai_cycles`] for the full measured layout.
+    pub const fn prep_cmpt_cycles(self) -> u32 {
+        self.ts_words[2].wrapping_sub(self.ts_words[1])
+    }
+
+    /// The compute engine's execution: `word[3] - word[2]`. The number that sums to the device
+    /// span of a forward (cross-checked on card: Σ exec over a forward's CBs ≈ its
+    /// `[sdsc-phase] compute` wall time). See [`Self::dmai_cycles`].
+    pub const fn exec_cmpt_cycles(self) -> u32 {
+        self.ts_words[3].wrapping_sub(self.ts_words[2])
+    }
+
+    /// The CB's last phase: `word[4] - word[3]` — the D2H duration on a D2H CB, the ~9-cycle
+    /// writeback tail on a compute CB. See [`Self::dmai_cycles`].
+    pub const fn dmao_cycles(self) -> u32 {
+        self.ts_words[4].wrapping_sub(self.ts_words[3])
+    }
+
+    /// The CB's whole CMPT residency: `word[4] - word[1]` = prep + exec + tail (== the full CB
+    /// span on compute CBs, where `word[1] == word[0]`). See [`Self::dmai_cycles`].
+    pub const fn total_cmpt_cycles(self) -> u32 {
+        self.ts_words[4].wrapping_sub(self.ts_words[1])
+    }
+
+    /// The POWER-MEASUREMENT word (`ResponseBlockWrapper::power()`).
+    pub const fn power(self) -> u32 {
+        self.power_word
     }
 
     /// ⭐ THE APP SECTION READ AS THE QGI/HMI VARIANT — the faulting device address of a compute-side
@@ -1324,6 +1416,11 @@ mod tests {
     #[test]
     fn rb_is_64_bytes() {
         assert_eq!(RB_NUM_BYTES, 64);
+        // The response block's own section static asserts (`response_block_sbf.hpp`): RET is 8
+        // bytes, TS is five 4-byte stamps, PW is one 4-byte word, APP runs to the end.
+        assert_eq!(TS_SECTION, 8);
+        assert_eq!(TS_SECTION + 5 * 4, PW_SECTION);
+        assert_eq!(PW_SECTION + 4, APP_SECTION);
     }
 
     #[test]
@@ -1634,6 +1731,55 @@ mod tests {
         let rb = ResponseBlockWire::from_bytes(&bytes);
         assert_eq!(rb.status(), ResponseStatus::Error);
         assert!(rb.cancelled());
+    }
+
+    // ── the timestamp + power sections (bytes 8..32) ──────────────────────────────────────────────
+
+    /// The TS section is five little-endian u32 cycle counts at bytes 8..28 and the power word a
+    /// u32 at 28..32. Values are placed by ABSOLUTE byte offset — the header's own numbering, like
+    /// [`rb_with_qgi_bits`] places by absolute bit number — so the test exercises the decode's
+    /// offsets instead of restating them.
+    #[test]
+    fn response_block_decodes_timestamps_and_power() {
+        let mut bytes = [0u8; RB_NUM_BYTES];
+        let ts = [0xDEAD_BEEFu32, 0, 1, u32::MAX, 0x1234_5678];
+        for (i, v) in ts.iter().enumerate() {
+            bytes[TS_SECTION + i * 4..TS_SECTION + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let power = 0x0BAD_C0DEu32;
+        bytes[PW_SECTION..PW_SECTION + 4].copy_from_slice(&power.to_le_bytes());
+        let rb = ResponseBlockWire::from_bytes(&bytes);
+        assert_eq!(rb.timestamps(), ts);
+        assert_eq!(rb.power(), power);
+
+        // The sections do not bleed into each other: a set APP beat must not reach the power
+        // word, and a set power word must not reach TS.
+        let mut bytes = [0u8; RB_NUM_BYTES];
+        bytes[APP_SECTION..APP_SECTION + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        bytes[PW_SECTION..PW_SECTION + 4].copy_from_slice(&1u32.to_le_bytes());
+        let rb = ResponseBlockWire::from_bytes(&bytes);
+        assert_eq!(rb.timestamps(), [0; 5]);
+        assert_eq!(rb.power(), 1);
+    }
+
+    /// The phase accessors take WRAPPING differences, because the counter wraps every ~4.2 s of
+    /// card time: words straddling a wrap must difference to the small true gap, which plain
+    /// subtraction would misread as ~4.29e9.
+    #[test]
+    fn response_block_ts_phase_differences_wrap() {
+        let mut bytes = [0u8; RB_NUM_BYTES];
+        // CB start and dmai end equal (every compute CB), then prep end, cmpt end and CB end
+        // straddling the u32 wrap.
+        let ts = [4_294_967_000u32, 4_294_967_000, 4_294_967_295, 90, 100];
+        for (i, v) in ts.iter().enumerate() {
+            bytes[TS_SECTION + i * 4..TS_SECTION + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let rb = ResponseBlockWire::from_bytes(&bytes);
+        assert_eq!(rb.dmai_cycles(), 0);
+        assert_eq!(rb.prep_cmpt_cycles(), 295);
+        assert_eq!(rb.exec_cmpt_cycles(), 91);
+        assert_eq!(rb.dmao_cycles(), 10);
+        assert_eq!(rb.total_cmpt_cycles(), 396);
     }
 
     // ── the QGI/HMI app section (bytes 32..64) ────────────────────────────────────────────────────

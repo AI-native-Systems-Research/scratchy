@@ -51,6 +51,7 @@ pub mod host_interface;
 pub mod iommu;
 pub mod memory_region;
 pub mod multi_device;
+pub mod rb_telemetry;
 pub mod runtime;
 pub mod scheduler;
 pub mod senlib_ffi;
