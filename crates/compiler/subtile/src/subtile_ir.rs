@@ -3186,6 +3186,7 @@ mod tests {
         let nz = |k| std::num::NonZeroU32::new(k).unwrap();
         let (heads, hd) = (2u32, 64u32);
         let input = crate::lower::LoweringInput {
+            exported: None,
             sources: vec![
                 SourceShape { rows: 1, cols: 128 },
                 SourceShape {
@@ -3255,6 +3256,7 @@ mod tests {
     fn a_merger_view_registers_its_divided_rows() {
         let nz = |k| std::num::NonZeroU32::new(k).unwrap();
         let input = crate::lower::LoweringInput {
+            exported: None,
             sources: vec![SourceShape { rows: 4, cols: 64 }],
             ops: vec![
                 OpDesc {
@@ -3696,6 +3698,7 @@ mod tests {
         let (qdim, kvdim) = (hq * hd, hkv * hd);
         let source = |rows, cols| SourceShape { rows, cols };
         let input = crate::lower::LoweringInput {
+            exported: None,
             sources: vec![
                 source(m, qdim),  // 0: q
                 source(m, kvdim), // 1: k

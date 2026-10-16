@@ -56,8 +56,13 @@ fn emit_at<const NQH: u32, const NKVH: u32, const HD: u32>(mq: u32) -> Vec<Op> {
         "t_pmask",
         "t_cmask",
         Some("t_kv_idx"),
+        // The batched per-page gathered fold this file measures, not the split-KV chunk.
+        None,
         ktir_superdsc::place::PlaceId::Act(900),
         true,
+        // A batch rung (`rows_are_requests`) keeps the shipped token-stream finalize; the
+        // head-major handoff is a one-request fact.
+        false,
         &mut sym,
         None,
     )
