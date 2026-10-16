@@ -6,24 +6,27 @@ flex-owned functions, 17 ABI entrypoints — see `/tmp/flex_scope_final.json`
 for the master scope). flex's own logic — region/block bookkeeping, best-fit
 + coalescing, allocation-directive resolution, stream/scheduler state
 machines, in-flight counters, completion-callback lifecycle, control-block
-fixup/translation math, RDMA/HDMA rendezvous and bitmap bookkeeping,
-env/JSON config parsing, fp8/fp16 bit-twiddling — is ported natively into
-Rust. Every point where that logic bottoms out into real hardware or
-firmware programming crosses through an `extern "C"` declaration in one of
-this crate's `senlib_ffi*.rs` files, and nowhere else: those files (plus a
-handful of `Drop`-adjacent pointer/slice operations and one `mmap`/`munmap`
-libc binding for the *software* mock-device backend — an OS-syscall
-boundary, not a senlib one) are where every `unsafe` block in this crate
-lives.
+fixup/translation math, env/JSON config parsing, fp8/fp16 bit-twiddling —
+is ported natively into Rust. (The RDMA/HDMA rendezvous and bitmap
+bookkeeping slice was deleted wholesale in issue #530 — see its section
+below.) Every point where that logic bottoms out into real hardware or
+firmware programming crosses through an `extern "C"` declaration in
+`src/senlib_ffi.rs`, and nowhere else: that module (plus a handful of
+`Drop`-adjacent pointer/slice operations) is where every `unsafe` block in
+this crate lives. The former mock-device `mmap`/`munmap` libc binding went
+away with the senulator backend (34a3eb9a6) — the crate has no non-senlib
+`extern "C"` block at all now.
 
 Each parallel phase of this port wrote its own `senlib_ffi_<label>.rs` file
 (to avoid symbol/name collisions while phases were being written
 concurrently) plus a per-phase `SENLIB_BOUNDARY_<label>.md`. This document
 is the Assembly phase's consolidation of all of those into one ordered
-reference; the per-phase `.md` files have been folded in and removed.
-`src/senlib_ffi.rs` is the corresponding code-level consolidation point — it
-re-exports every phase's FFI module and documents the one cross-phase
-duplicate that surfaced (see below).
+reference; the per-phase `.md` files have been folded in and removed. The
+per-phase `.rs` files were folded the same way in issue #530: the former
+re-export hub plus six `senlib_ffi_<label>.rs` modules are now ONE module,
+`src/senlib_ffi.rs`, carrying every declaration, handle type, and safe
+wrapper. Its module doc records the fold and the one cross-phase duplicate
+that surfaced during Assembly (see below).
 
 ## Consolidation fix: duplicate "how many Spyre cards" declarations
 
@@ -37,21 +40,29 @@ declared its own `extern "C"` binding for it:
 | `senlib_senpci_ncards` | `senlib_ffi_config_util.rs` | `FlexConfig::FlexSpyreDevices` (`flex_config.cpp:379,408`) |
 | (part of) `flex_senlib_query_topology` | `senlib_ffi.rs` | topology-phase per-card HBM-layout query |
 
-`flex_senlib_query_topology` legitimately does more than count cards (it
-also reports per-card HBM bank layout), so it stays a separate declaration.
-The other two were an exact duplicate. Resolution: `flex_senlib_pci_ncards`
-in `senlib_ffi_runtime.rs` is kept as the one canonical declaration;
-`senlib_ffi_config_util.rs`'s `senlib_senpci_ncards` extern was deleted and
-its safe wrapper `sen_pci_card_count()` now calls the canonical declaration
+`flex_senlib_query_topology` no longer exists: it was never implemented in
+`cxx-shim/senlib_ffi.cpp`, and real-hardware testing hit a `FlexAllocator`
+OOM traced to runtime bring-up sizing its single domain off a 32 GiB
+placeholder instead of the card's real HBM capacity. It was replaced by
+`flex_senlib_device_memory_size()` + `flex_senlib_rcu_num_cores()` — the
+two real calls `populateDomainTopology` actually makes (`DeviceHandle::
+GetDmpaSize()` → `PfInterface::GetLPDDRSize()`, and
+`SenPci::RCU_num_cores()`); this crate's 1p0 target has exactly one
+domain, so a full multi-domain query was never actually needed. The other
+two rows were an exact duplicate. Resolution: `flex_senlib_pci_ncards`
+(declared in what was then `senlib_ffi_runtime.rs`, now `senlib_ffi.rs`'s
+runtime-bring-up section) is kept as the one canonical declaration; the
+config/util phase's `senlib_senpci_ncards` extern was deleted and its safe
+wrapper `sen_pci_card_count()` now calls the canonical declaration
 directly. No caller (`flex_config.rs`, `runtime.rs`) needed to change.
 
-Also removed during consolidation: `senlib_ffi.rs`'s pre-split placeholder
-externs `flex_senlib_stream_create`/`_destroy`/`_submit`/`_poll_completions`
-and their `SenlibStreamHandle`/`RawControlBlock` types. These had zero
-callers anywhere in the crate — they were superseded by the scheduler
-phase's real, call-site-verified `senlib_ffi_scheduler.rs`
-(`senlib_cbi_*`/`senlib_rbi_*`, used by `scheduler.rs`/`stream.rs`) before
-this file was consolidated, and were dead code.
+Also removed during consolidation: the pre-split hub's placeholder externs
+`flex_senlib_stream_create`/`_destroy`/`_submit`/`_poll_completions` and
+their `SenlibStreamHandle`/`RawControlBlock` types. These had zero callers
+anywhere in the crate — they were superseded by the scheduler phase's
+real, call-site-verified declarations (`senlib_cbi_*`/`senlib_rbi_*`, used
+by `scheduler.rs`/`stream.rs`) before this file was consolidated, and were
+dead code.
 
 Also consolidated (not an FFI duplicate, but the same kind of parallel-agent
 overlap): `util.rs` had re-ported `flex::FlexLogExtra` under the name
@@ -62,20 +73,27 @@ source). The `util.rs` copy had no external callers, so it was deleted;
 
 ## Per-subsystem boundary, in call-graph order
 
-### Foundation: allocator (`allocator.rs`, `memory_region.rs`, `domain.rs`, `topology.rs`, `device_memory_allocator.rs`, `senlib_ffi_allocator.rs`)
+### Foundation: allocator (`allocator.rs`, `memory_region.rs`, `domain.rs`, `topology.rs`, `device_memory_allocator.rs`; FFI in `senlib_ffi.rs`)
 
 Exactly two calls, both verified against `device_memory_allocator.cpp`,
 unified across PF/VF backends since which backend is active is a
 hardware-driver concern, not flex logic:
 
-- **`flex_senlib_memory_allocate(num_bytes, domain_id_or_negative_one) -> SenlibAllocationHandle`** —
+- **`flex_senlib_memory_allocate(num_bytes) -> SenlibAllocationHandle`** —
   PF: `senlib::MemoryAllocator::Allocate()` (`:212`); VF:
-  `senlib::v2::VfWrapper::Allocate()` (`:176-191`, including the
-  retry-with-backoff loop, folded into this call's contract since VF retry
-  policy is firmware behavior). `handle == 0` is the failure sentinel for
-  both.
-- **`flex_senlib_memory_free(handle)`** — PF: `MemoryAllocator::Free()`
-  (`:272`); VF: `VfWrapper::Deallocate()` (`:261`).
+  `senlib::v2::VfWrapper::Allocate()` (`:176`). `handle == 0` is the failure
+  sentinel for both. Takes only a byte count — neither real signature
+  accepts a domain id (`TryAllocate`'s `domain_id` is logged-only in the
+  C++, per its own TODO at `device_memory_allocator.cpp:153`). The VF
+  retry-with-backoff loop (`:180-191`) is flex-side logic, not firmware
+  behavior, and is NOT folded into this call's contract: it is ported
+  natively (`device_memory_allocator.rs`'s `try_allocate`), which calls
+  this FFI function in a loop.
+- **`flex_senlib_memory_free(handle) -> i32`** — PF: `MemoryAllocator::Free()`
+  (`:272`); VF: `VfWrapper::Deallocate()` (`:261`). Returns 0 on success,
+  -1 if the free did not reach senlib — a failed deallocation must be
+  distinguishable from a successful one (the same swallowed-failure shape
+  the doorbell path fixed).
 
 Everything else — `preAllocateRegions`, `allocateNewRegion`,
 `allocateInDomain`/`allocateInRegion`, `alignSpyreAllocation`,
@@ -83,11 +101,13 @@ Everything else — `preAllocateRegions`, `allocateNewRegion`,
 `DeviceTopology`/`MemoryDomain`/`AllocationDirective`/`LogicalAddress`/
 `Chunk`/`CompositeAddress` as pure value types — is native Rust, no
 `unsafe`. `DeviceTopology`'s own *population* (querying real hardware for
-domain/core counts) is `flex_senlib_query_topology`, a different
-subsystem's boundary (declared in `senlib_ffi.rs`; not yet wired to a native
-caller — see that file's doc comment).
+domain/core counts) crosses the boundary as `flex_senlib_device_memory_size`
++ `flex_senlib_rcu_num_cores` (declared in `senlib_ffi.rs`'s
+runtime-bring-up section) and IS wired to a native caller:
+`topology::populate_domain_topology` → `fxa_rust_abi.rs::build_runtime`
+(see the coverage cross-check below).
 
-### Runtime core (`runtime.rs`, `stream.rs`, `senlib_ffi_runtime.rs`)
+### Runtime core (`runtime.rs`, `stream.rs`; FFI in `senlib_ffi.rs`)
 
 `RuntimeContext`'s and `RuntimeStream`'s own state-machine bookkeeping
 (singleton lifecycle, stream table, in-flight counters, shutdown flag,
@@ -107,7 +127,7 @@ hardware submission lives in the scheduler backend (below). Device-interface
 construction, the allocator, and the scheduler backend are each a different
 subsystem's own boundary and are deliberately not re-declared here.
 
-### Scheduler (`scheduler.rs`, `senlib_ffi_scheduler.rs`)
+### Scheduler (`scheduler.rs`; FFI in `senlib_ffi.rs`)
 
 `flex::RuntimeScheduler` (abstract base) + `PfRuntimeScheduler`/
 `VfRuntimeScheduler`/`MockRuntimeScheduler`. Three calls:
@@ -147,7 +167,7 @@ declares owns a graph-compiler-phase object (`ControlBlockStream`,
 does not have — not a disclaimer pointing at a phase that doesn't exist,
 but a real dependency this crate has no module for.
 
-### DMA/compute params + control blocks (`dma.rs`, `compute.rs`, `control_blocks.rs`, `senlib_ffi_controlblocks.rs`)
+### DMA/compute params + control blocks (`dma.rs`, `compute.rs`, `control_blocks.rs`)
 
 Zero senlib calls. `DmaParams`/`ComputeParams`/`FillParams`
 construction+validation, control-block fixup structs
@@ -156,14 +176,34 @@ translation, segment-offset bit arithmetic, and the mock/software
 `DmaControlBlockHandler`/`ControlBlockHandlerBase` CB executors (selected
 when `RuntimeConfig::FlexCompute()` is `"NULL"`/`"SENULATOR"`) are all plain
 struct/arithmetic logic or `memcpy` into a flex-owned `DeviceMemory` mock
-buffer — never a senlib call. `senlib_ffi_controlblocks.rs` intentionally
-declares nothing. The one real hardware-submission path this mock backend
+buffer — never a senlib call. `senlib_ffi.rs`'s module doc carries this
+subsystem's "declares nothing, on purpose" note (formerly the entire
+content of `senlib_ffi_controlblocks.rs`). The one real hardware-submission path this mock backend
 stands in for as an alternative (`ResponseWorker::LaunchCbs`) belongs to the
 scheduler subsystem above, not duplicated here.
 
-### Multi-device / RDMA / HDMA (`multi_device.rs`, `senlib_ffi_multi_device.rs`)
+### Multi-device / RDMA / HDMA — DELETED (issue #530)
 
-Nine calls, all irreducible kernel-driver or hardware-register operations:
+The former `multi_device.rs` (1928 lines: `BitmaskHelper`/`BitSetHelper`
+bit bookkeeping, `CollBufferAllocator_t`/`Hdma_Allocation_Manager`
+allocation algorithms, `HostWdone::make_instruction`/ring-counter
+bookkeeping, `RdmaRendezvousManager::Barrier`/`BarrierAndBcast` over a
+plain POSIX rendezvous file, `CollectiveIPC` over Unix-domain sockets,
+`AIUTopo`'s protocol-selection policy) and its thirteen FFI declarations
+(`senlib_ffi_multi_device.rs`) were deleted wholesale, on evidence:
+
+1. **No callers.** Nothing in the workspace referenced
+   `flex_rs::multi_device` — only `lib.rs`'s module declaration and the
+   FFI hub's re-export.
+2. **No link targets.** `cxx-shim/senlib_ffi.cpp` implements zero of the
+   thirteen symbols; anything calling them would have failed at `ld` with
+   undefined references. They were written against flex-cxx's mock-device
+   shared-memory layer (`RdmaShm`), not even the real P2P surface.
+
+Git history preserves both files in full; the honest shape is to re-add
+the slice with real shim entrypoints when P2P wiring actually happens,
+not to keep a fully-shaped module whose FFI bottom links to nothing. The
+deleted declarations and their verified C++ call sites, for the record:
 
 - **`flex_senlib_pin_and_map`/`_pinned_memory_release`/`_pinned_memory_hptr`** —
   `PfWrapper`/`VfWrapper::allocate_pin_and_map` (`hdma_shm.cpp:903` etc.):
@@ -178,27 +218,12 @@ Nine calls, all irreducible kernel-driver or hardware-register operations:
 - **`flex_senlib_rdma_copy_to_remote`** — the literal RDMA write
   (`rdma_unit.cpp:415-416`, `memcpy` into a peer's mapped device memory).
 - **`flex_senlib_rdma_wdone_inc`/`_check`** — remote write-done counter
-  increment/poll (`rdma_unit.cpp:499,457`).
+  increment/poll (`rdma_unit.cpp:499,457`); `_check` is a mutating
+  read-and-consume (decrements when positive), not a pure read.
 - **`flex_senlib_rdma_xseg_bytes`/`_valid`/`_write`** — the address-translation
   (Xseg) register backing the mock RDMA region (`rdma_unit.cpp:402,409,524`).
 
-Ported natively instead: `BitmaskHelper`/`BitSetHelper` bit bookkeeping,
-`CollBufferAllocator_t`/`Hdma_Allocation_Manager` allocation algorithms,
-`HostWdone::make_instruction`/ring-counter bookkeeping,
-`RdmaRendezvousManager::Barrier`/`BarrierAndBcast` (re-implemented over a
-plain POSIX rendezvous file rather than the C++'s `shm_open`/`mmap`, since
-there is no senlib/PF/VF involvement in that protocol), `CollectiveIPC`
-(Unix-domain sockets), and `AIUTopo`'s protocol-selection policy.
-
-**Known gaps** (not ported, time-boxed out of this pass): JSON
-topology-file ingestion (`AIUTopo::process_topo_json_*`) — `AiuTopo::new`
-takes an already-resolved table instead; `HdmaShmMgmt`/`HcollShmManager_t`'s
-R5/CPU monitor-mode instruction staging and HMLT table read/display;
-`HostWdone`'s background monitor thread (the instruction *encoding* is
-ported, the thread loop reading pinned memory is not); `RdmaUnit`
-construction's PID-rendezvous handshake.
-
-### Config/util (`flex_config.rs`, `util.rs`, `senlib_ffi_config_util.rs`)
+### Config/util (`flex_config.rs`, `util.rs`; FFI in `senlib_ffi.rs`)
 
 Almost entirely env-var/JSON-config parsing with process-wide caching.
 Exactly two calls, both inside `FlexConfig` (not `RuntimeConfig`):
@@ -226,24 +251,29 @@ Status&)` (`status.cpp:43`) has a body, and that one is ported
 two-arg `flex::` overloads, their definition lives in a `.cpp` this port was
 never given.
 
-### Device-interface misc (`device_types.rs`, `compiler_interface.rs`, `host_interface.rs`)
+### Device-interface misc (`host_interface.rs`)
 
-Zero senlib calls anywhere in this slice:
+Zero senlib calls anywhere in this slice. Two of the three modules this
+section originally named have since been deleted: `compiler_interface.rs`
+(b47bd7a5d — helpers for an unported path) and `device_types.rs`
+(34a3eb9a6 — the senulator/mock-device backend and its config knobs went
+with it, taking the local `mmap`/`munmap` libc binding described below;
+the crate now has no non-senlib `extern "C"` block at all). The C++-side
+accounting is kept for provenance:
 
 - `af_device/af_device_memory.cpp` — PF/VF/COMPILE devices have no
   host-accessible device memory at all; every method is a constant, a
   `nullptr`, or an explicit "not implemented" error.
-- `mock_device/{device_memory_mock,mmapped_storage}.*` — the mock backend is
-  a local `mmap`/`shm`-backed file, an OS-syscall boundary, not senlib. The
-  `mmap`/`munmap` libc binding this requires is kept as a small local
-  `extern "C"` block in `device_types.rs` rather than a `senlib_ffi_*.rs`
-  file, specifically so it isn't miscounted as part of the senlib ledger.
+- `mock_device/{device_memory_mock,mmapped_storage}.*` — the mock backend was
+  a local `mmap`/`shm`-backed file, an OS-syscall boundary, not senlib
+  (deleted with the senulator backend).
 - `compiler_interface/dee_graph_converter.cpp`'s five in-scope functions
   (`get_dtcompiler_export_dir`, `remove_dtcompiler_export_dir`,
   `maybe_wrap_dim`, `convert_shape_to_vecint64[_rev]`) — env/config lookups,
-  filesystem cleanup, and plain arithmetic. The rest of that file (`dee::PBD`,
-  DeepRT invocation) is deep compiler-only machinery outside the
-  ABI-reachable closure.
+  filesystem cleanup, and plain arithmetic — were ported into
+  `compiler_interface.rs`, itself later deleted (b47bd7a5d) as helpers for
+  an unported path. The rest of that file (`dee::PBD`, DeepRT invocation)
+  is deep compiler-only machinery outside the ABI-reachable closure.
 - `host_interface/raii_buffer.cpp` — `posix_memalign`/`memset`/`memcpy`/`free`
   only; ported onto `std::alloc` instead, needing no FFI at all.
 
@@ -262,15 +292,18 @@ fused_batchnorm_precompute}.hpp`, `compiler_interface/util/
 {input_output_meta_data,super_node}.hpp` (`HostComputeInterface`,
 `FusedBatchNormPrecompute`, `InputOutputMetaData`, `SuperNode`,
 `ProgramDefinition`) are in the master scope, attributed to this
-subsystem's source directory, but not ported — `compiler_interface.rs`'s
-own scope note only covers the five `dee_graph_converter.cpp` functions
-above. `device_interface/iommu/{iommu_mapping.cpp,iommu_raii_buffer.hpp}`
-and `device_types/pf_device/pf_device_handle.cpp` are likewise unported;
+subsystem's source directory, but not ported — the former
+`compiler_interface.rs` covered only the five `dee_graph_converter.cpp`
+functions above, and was itself deleted.
+`device_interface/iommu/{iommu_mapping.cpp,iommu_raii_buffer.hpp}`
+and `device_types/pf_device/pf_device_handle.cpp` are likewise unported
+(`device_types/pf_device/pf_iommu_mapper.{hpp,cpp}` IS ported, as
+`iommu.rs`);
 `scheduler.rs`'s doc comment refers to "`IommuMapperInterface`/`DeviceHandle`"
 as belonging to "the device-interface phase's files," but no such module
 exists in this crate.
 
-## Coverage cross-check against the master scope (134 types / 320 functions)
+## Coverage cross-check against the master scope (134 types / 320 functions — the ORIGINAL closure; the multi-device slice it counted was deleted in #530)
 
 **The graph-compiler/whole-graph-execution mode is out of scope, confirmed
 by checking the real ABI shim, not assumed.** flex supports two distinct
@@ -344,11 +377,34 @@ awaits that shim itself gaining a device-kind branch).
 
 Everything else in the master scope cross-checked against source-file
 groupings above (allocator, runtime core, scheduler's non-factory pieces,
-control-block fixup/DMA/compute params, multi-device, config/util,
+control-block fixup/DMA/compute params, config/util,
 device-interface-misc's in-scope slice, telemetry) is accounted for either
 as a native port, an FFI wrapper documented above, or one of the
-reasoned/time-boxed stubs listed per subsystem. The gaps above
-should be picked up as a follow-on pass; none of them are on the allocator/
-runtime-core/scheduler-submission/multi-device-transfer critical path this
-crate's existing tests exercise, but they are real entries in the
-320-function closure and are not yet represented anywhere in this crate.
+reasoned/time-boxed stubs listed per subsystem — with the multi-device
+slice now deleted rather than ported (see its section above). The gaps
+above should be picked up as a follow-on pass; none of them are on the
+allocator/runtime-core/scheduler-submission critical path this crate's
+existing tests exercise, but they are real entries in the 320-function
+closure and are not yet represented anywhere in this crate.
+
+## Build/link seams (issue #531, verified 2026-10-16)
+
+#531's original text had two halves. The `sdk_abi.rs` half was mooted by
+PR #512, which deleted `sdk_abi.rs` outright — the tape player now speaks
+flex-rs directly, so there is no C ABI left to keep honest. The build-seam
+half, re-verified at this fold:
+
+- No "adapter TU" language remains anywhere in the spyre tree — the stale
+  talk was pruned by 9d5401888 ("build(spyre): drop stale sendnn_*/flex
+  link flags; correct entrypoint count"), and #512 removed the rest.
+- `flex-rs/build.rs` (the only build script doing SDK work) links ONLY
+  senlib plus its own ldd-verified transitive deps — flightlog and the
+  boost set (log, log_setup, thread, filesystem, atomic, regex, json,
+  container, locale, chrono). No `libflex`, no `sendnn_*`.
+- `scratchy-target-spyre`'s `builder/build.rs` is a doc-only no-op
+  (`rerun-if-changed` only), and `ktir/ktir-emulator/build.rs` links
+  Accelerate/objc2 only — no SDK seams.
+
+What this cannot prove locally is the actual link against the real on-pod
+SDK — `ld` resolving the shim's senlib symbols against
+`/opt/ibm/spyre/senlib/lib`. That needs a pod build, which is user-gated.

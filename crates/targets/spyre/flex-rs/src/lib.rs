@@ -2,8 +2,11 @@
 //! scratchy's Spyre SDK ABI shim: 134 flex-owned types / 320 flex-owned
 //! functions across 17 ABI entrypoints, per CodeQL's class-hierarchy-aware
 //! transitive closure (see `/tmp/flex_scope_final.json` for the master
-//! scope this crate is checked against). See `SENLIB_BOUNDARY.md` at the
-//! crate root for the FFI boundary rationale.
+//! scope this crate is checked against — the ORIGINAL closure, not a live
+//! count: the multi_device (RDMA/HDMA) slice was deleted wholesale in issue
+//! #530 (zero callers, zero shim-implemented declarations; see `senlib_ffi`'s
+//! module doc for the evidence). See `SENLIB_BOUNDARY.md` at the crate root
+//! for the FFI boundary rationale.
 //!
 //! Module map:
 //! - `address`             — LogicalAddress, Chunk, CompositeAddress
@@ -21,14 +24,14 @@
 //! - `host_interface`       — RaiiBuffer
 //! - `flex_config`          — FlexConfig, RuntimeConfig
 //! - `util`                 — sendnn::Status, generic numeric/env helpers
-//! - `multi_device`         — RDMA/HDMA peer-to-peer exchange, barrier/broadcast
 //! - `telemetry`            — FlexLogExtra, FlexConfig subset, Histogram, LatencyBreakdown,
 //!   HistTimer, Profiler/GlobalProfiler, UnifiedProfiler, TimestampCalibrator math
-//! - `senlib_ffi`           — consolidated re-export hub for all senlib FFI boundaries
-//! - `senlib_ffi_allocator`, `senlib_ffi_config_util`, `senlib_ffi_controlblocks`,
-//!   `senlib_ffi_multi_device`, `senlib_ffi_runtime`, `senlib_ffi_scheduler` —
-//!   per-phase `extern "C"` declarations (see `senlib_ffi` module doc for the
-//!   one cross-phase duplicate found and consolidated during Assembly)
+//! - `senlib_ffi`           — THE senlib FFI boundary: every `extern "C"`
+//!   declaration against senlib in this crate (runtime bring-up, topology,
+//!   IOMMU, device-memory allocator, scheduler CBI/RBI submission +
+//!   completion, config/util), plus the opaque handle types and safe
+//!   wrappers around them. Formerly six per-phase `senlib_ffi_*` modules +
+//!   a re-export hub, folded in issue #530.
 
 // A dropped `Result`/`#[must_use]` value in this crate is not a style nit: the
 // long-standing hardware hang was exactly that shape — `FreeResponses` credit
@@ -50,17 +53,10 @@ pub mod flex_config;
 pub mod host_interface;
 pub mod iommu;
 pub mod memory_region;
-pub mod multi_device;
 pub mod rb_telemetry;
 pub mod runtime;
 pub mod scheduler;
 pub mod senlib_ffi;
-pub mod senlib_ffi_allocator;
-pub mod senlib_ffi_config_util;
-pub mod senlib_ffi_controlblocks;
-pub mod senlib_ffi_multi_device;
-pub mod senlib_ffi_runtime;
-pub mod senlib_ffi_scheduler;
 pub mod stream;
 pub mod telemetry;
 pub mod topology;
