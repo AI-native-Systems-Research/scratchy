@@ -123,6 +123,14 @@ impl SharedKernelBmmForm {
         SharedKernelBmmForm(SharedKernelBmmRegime::Requests(HeadOutermostRequests(())))
     }
 
+    /// ⭐ THE QUERY GROUP RE-LAYOUT's DOOR ([`crate::sdsc_abstract::QGroupBlock`]) — the cache write's
+    /// own descriptor shape for the same reason: `y` walks a GQA group's heads, one stick plane per step
+    /// on the stream (`nslab` planes apart) and one row per step on the block, and `[mb, y, in]` strides
+    /// `y` by exactly `in` whatever pitch an operand declares. Head-outermost at every width.
+    pub fn of_query_group_copy() -> Self {
+        SharedKernelBmmForm(SharedKernelBmmRegime::Requests(HeadOutermostRequests(())))
+    }
+
     /// Every batched matmul OUTSIDE the attention emitter: the dense/bmm wrappers, the Kani-tower
     /// seam, the fp8 chain. None of them has request rows, so none of them can be the rung the
     /// corrected walk exists for — they keep the walk they have always emitted. Inside the

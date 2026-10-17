@@ -7507,6 +7507,108 @@ impl ChunkRowBlocks {
     }
 }
 
+/// ⭐⭐⭐ ONE KV HEAD's WHOLE GQA GROUP OF QUERIES AS ITS OWN STANDALONE BLOCK — the one-request decode's
+/// query re-laid group-major above one feature slab, so the chunk can attend a kv head's whole group in
+/// ONE score and ONE PV per slab instead of one per query head ([`ChunkRowBlocks`] says why it cannot
+/// today).
+///
+/// The token stream `[1, nqh·hd]` holds query head `h`'s slab `s` at plane `h·nslab + s`
+/// ([`OperandPlacement::of_token_stream`]): a group's rows are `nslab` planes apart. The re-laid block is
+/// `[nkvh][gqa, hd]`, each kv head's `[gqa, hd]` a WHOLE RowBlocked block of its own — never a row slice
+/// of a taller multi-stick buffer, which dxp reads with the wrong group stride.
+///
+/// Minted only by [`Self::of_decode`], which admits exactly the one-request decode (one row per head)
+/// above one slab: a prompt chunk or a decode batch has `mq > 1` rows per head and keeps the per-head form,
+/// and at one slab a group's rows are contiguous in the stream already.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct QGroupBlock {
+    nkvh: u32,
+    gqa: u32,
+    hd: u32,
+}
+
+impl QGroupBlock {
+    /// The group-major query block for a one-request decode, or `None` where the stream already has it
+    /// (one slab) or a head has more than one row (a prompt chunk, a decode batch).
+    pub const fn of_decode(nkvh: u32, gqa: u32, hd: u32, mq: u32) -> Option<QGroupBlock> {
+        if mq != 1 || nkvh == 0 || gqa == 0 || hd <= POOL_STICK || !hd.is_multiple_of(POOL_STICK) {
+            return None;
+        }
+        Some(QGroupBlock { nkvh, gqa, hd })
+    }
+
+    pub const fn nkvh(self) -> u32 {
+        self.nkvh
+    }
+    pub const fn gqa(self) -> u32 {
+        self.gqa
+    }
+    pub const fn hd(self) -> u32 {
+        self.hd
+    }
+    /// Feature slabs of one head.
+    pub const fn slabs(self) -> u32 {
+        self.hd / POOL_STICK
+    }
+    /// Query rows of one block — a whole GQA group, one row a head.
+    pub const fn rows(self) -> u32 {
+        self.gqa
+    }
+    /// The reservation's shape — `[nkvh·gqa, hd]`, every block end to end.
+    pub const fn footprint_dims(self) -> [u32; 2] {
+        [self.nkvh * self.gqa, self.hd]
+    }
+
+    /// kv head `kvh`'s block, as the `[gqa, hd]` nest it is and the repeat index it sits at.
+    pub fn block_nest(self) -> crate::addr::Nest {
+        crate::addr::Nest::new(&["row", "feat"], &[self.gqa, self.hd], Df::Fp16)
+    }
+
+    /// WHERE THE RE-LAYOUT COPY FOR (kv head `kvh`, slab `s`) WRITES: block `kvh`, slab `s`, `y` walking
+    /// the group's `gqa` rows ONE ROW apart (a stick-blocked row step is one stick), so the plane pitch is
+    /// the block's own `gqa` rows and the copy is the token stream's GQA-group walk landing in one plane.
+    /// `None` past the head or slab count.
+    pub fn copy_dest(self, kvh: u32, s: u32) -> Option<OperandPlacement> {
+        if kvh >= self.nkvh || s >= self.slabs() {
+            return None;
+        }
+        let nest = self.block_nest();
+        Some(OperandPlacement {
+            off: nest.block(kvh).slab(s).dev(),
+            pitch: PhysM(1),
+            head_stride: nest.span(
+                crate::addr::Idx::<crate::addr::Row>::n(0),
+                crate::addr::Idx::<crate::addr::Row>::n(1),
+            ),
+        })
+    }
+
+    /// kv head `kvh`'s whole `[gqa, hd]` block — the score's query operand. `None` past the head count.
+    pub fn block_off(self, kvh: u32) -> Option<crate::addr::DevOff> {
+        if kvh >= self.nkvh {
+            return None;
+        }
+        Some(self.block_nest().block(kvh).dev())
+    }
+
+    /// Where the re-layout copy for (kv head `kvh`, slab `s`) READS: the token stream at the group's
+    /// first query head, slab `s`, `y` walking the group's heads `nslab` planes apart.
+    pub fn copy_src(self, kvh: u32, s: u32) -> Option<OperandPlacement> {
+        if kvh >= self.nkvh || s >= self.slabs() {
+            return None;
+        }
+        Some(OperandPlacement::of_token_stream_by_slab(
+            QueryRowCount::of_mq(1),
+            self.nkvh * self.gqa,
+            self.hd,
+            kvh * self.gqa,
+            0,
+            s,
+            Df::Fp16,
+        ))
+    }
+}
+
 /// A device element corner inside a split-KV chunk tensor — minted ONLY by [`ChunkScratch`]'s own laws
 /// ([`ChunkScratch::kernel_corner`], [`ChunkScratch::rows_corner`]) and spent only through
 /// `addr::DevOff::of_chunk_corner`, so a per-head base cannot be written as caller arithmetic.
