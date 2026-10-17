@@ -1879,8 +1879,6 @@ pub fn compile_carrier(
         struct HeadFacts {
             /// Its forward reads `target_hidden`: it is a head.
             reads_target_hidden: bool,
-            /// The width of the target hidden rows it reads (`target_hidden_size`).
-            target_hidden_width: u64,
             /// The on-disk prefixes of the weights a target lends it — every arch reports its own,
             /// so a TARGET's can be read off the loaded model.
             lent: [Option<String>; 2],
@@ -1902,19 +1900,12 @@ pub fn compile_carrier(
         let head_facts: std::collections::BTreeMap<String, HeadFacts> = solved
             .iter()
             .map(|sm| {
-                let reads_target_hidden = sm.fuf.nodes.iter().any(|n| {
-                    n.op == classified::OpKind::LoadRows(
-                        scratchy_forward_compiler::RowsExtern::TargetHidden,
-                    )
-                });
-                let width = sm.model.bounds.get("target_hidden_size").copied();
                 let facts = HeadFacts {
-                    reads_target_hidden,
-                    target_hidden_width: match (reads_target_hidden, width) {
-                        (true, Some(w)) => w,
-                        (true, None) => panic!("{}: a head's target_hidden_size", sm.mod_name),
-                        (false, _) => 0,
-                    },
+                    reads_target_hidden: sm.fuf.nodes.iter().any(|n| {
+                        n.op == classified::OpKind::LoadRows(
+                            scratchy_forward_compiler::RowsExtern::TargetHidden,
+                        )
+                    }),
                     lent: scratchy_forward_compiler::LentWeight::ALL
                         .map(|w| codegen::lent_weight_prefix(&sm.prog, &sm.fuf, sm.model, w)),
                     lm_head_rows: sm.model.bounds.get("vocab_size").copied().unwrap_or(0),
@@ -1939,6 +1930,18 @@ pub fn compile_carrier(
                 (sm.mod_name.clone(), facts)
             })
             .collect();
+        // The width of the target hidden rows a head variant reads (`target_hidden_size`): its
+        // target's, so it differs between variants of one head arch, unlike its `HeadFacts`.
+        let target_widths: std::collections::BTreeMap<&str, u64> = solved
+            .iter()
+            .filter(|sm| head_facts[&sm.mod_name].reads_target_hidden)
+            .map(|sm| {
+                let width = sm.model.bounds.get("target_hidden_size").copied();
+                let width =
+                    width.unwrap_or_else(|| panic!("{}: a head's target_hidden_size", sm.mod_name));
+                (sm.mod_name.as_str(), width)
+            })
+            .collect();
         let head_tokens = {
             let fact = |a: &DispatchArm| &head_facts[&a.model_ident.to_string()];
             let reads_arms = arch_dispatch_arms.iter().map(|a| {
@@ -1949,13 +1952,9 @@ pub fn compile_carrier(
             // A head's width, read only for a head: every other model's is its hidden size.
             let width_arms = arch_dispatch_arms.iter().map(|a| {
                 let variant_ident = pascal_case(&a.model_ident);
-                match fact(a) {
-                    HeadFacts {
-                        reads_target_hidden: true,
-                        target_hidden_width,
-                        ..
-                    } => quote! { Weights::#variant_ident(_) => #target_hidden_width, },
-                    _ => quote! {
+                match target_widths.get(a.model_ident.to_string().as_str()) {
+                    Some(width) => quote! { Weights::#variant_ident(_) => #width, },
+                    None => quote! {
                         Weights::#variant_ident(_) =>
                             ::scratchy_forward_compiler::ScratchyWeights::hidden_size(self),
                     },
