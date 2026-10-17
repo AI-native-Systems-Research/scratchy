@@ -631,7 +631,7 @@ fn router_head_ir(m: u32, e: u32, hidden: u32) -> (SubtileIR<NeoX>, Vec<usize>, 
         // The KV writer FIRST — it names the layer and its K input is the residual.
         let _rot_k = push(
             SubOp::RopeAppend {
-                head_dim: ktir_superdsc::head_counts::HeadDim::new(hd),
+                head_dim: scratchy_subtile::model_geometry::HeadDim::new(hd),
                 layer: l,
                 attn: AttnMask::Causal,
                 pairing: RopeFormTag::NeoX,

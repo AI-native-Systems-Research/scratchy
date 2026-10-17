@@ -237,6 +237,32 @@ jobs:
           --features scratchy-serving-engine/guided-decoding
 
   # ---------------------------------------------------------------------------
+  # Whether this run needs the macOS jobs. A PR whose every changed file is in
+  # a crate no macOS job compiles (the Spyre target and its triton re-host
+  # crates) skips both; a push to main always runs them. The list, and the lock
+  # each macOS job ends with that keeps it true, are in
+  # scripts/ci-macos-scope.sh.
+  # ---------------------------------------------------------------------------
+  macos-scope:
+    name: macOS scope
+    runs-on: ubuntu-latest
+    outputs:
+      macos: ${{ steps.scope.outputs.macos }}
+    steps:
+      # A PR checks out its merge commit, whose first parent is main: two
+      # commits of history are the PR's whole diff.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - id: scope
+        run: |
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            scripts/ci-macos-scope.sh changed HEAD^1 HEAD >> "$GITHUB_OUTPUT"
+          else
+            echo macos=true >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
   # macOS / arm64 — Metal backend.
   #
   # `scratchy-models` (built here with `all-arches`) is the umbrella that
@@ -258,6 +284,8 @@ jobs:
   # ---------------------------------------------------------------------------
   macos-metal-clippy:
     name: macos-arm64 (metal clippy, all models)
+    needs: macos-scope
+    if: needs.macos-scope.outputs.macos == 'true'
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
@@ -279,8 +307,15 @@ jobs:
       - name: Clippy
         run: cargo clippy -p scratchy-models --features metal,all,mtp,turboquant -- -D warnings
 
+      # The other half of macos-scope's skip: fails if this job compiled a crate
+      # whose PRs skip it.
+      - name: Compiled no crate macos-scope skips for
+        run: scripts/ci-macos-scope.sh lock
+
   macos-metal-tests:
     name: macos-arm64 (metal tests)
+    needs: macos-scope
+    if: needs.macos-scope.outputs.macos == 'true'
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
@@ -505,19 +540,27 @@ jobs:
           --features e2e,metal,scratchy-models/llama-3.2-1b
           --test e_long_prompt_metal long_prompt_metal_chunked_matches_single_prefill -- --test-threads=1
 
+      # See the clippy job's last step.
+      - name: Compiled no crate macos-scope skips for
+        run: scripts/ci-macos-scope.sh lock
+
   # The required check: the branch rules name `macos-arm64 (metal)`, so this
-  # passes only when both macOS jobs did. `always()` is load-bearing: without
-  # it a failed dependency SKIPS this job, and GitHub counts a skipped
-  # required check as passing.
+  # passes only when both macOS jobs did, or when macos-scope found nothing
+  # they compile changed. `always()` is load-bearing: without it a failed
+  # dependency SKIPS this job, and GitHub counts a skipped required check as
+  # passing. A failed macos-scope has no `macos=false`, so it fails this too.
   macos-metal:
     name: macos-arm64 (metal)
-    needs: [macos-metal-clippy, macos-metal-tests]
+    needs: [macos-scope, macos-metal-clippy, macos-metal-tests]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Both macOS jobs passed
+      - name: Both macOS jobs passed, or neither was needed
         run: |
-          echo "clippy: ${{ needs.macos-metal-clippy.result }}, tests: ${{ needs.macos-metal-tests.result }}"
+          echo "scope: ${{ needs.macos-scope.result }} macos=${{ needs.macos-scope.outputs.macos }}, clippy: ${{ needs.macos-metal-clippy.result }}, tests: ${{ needs.macos-metal-tests.result }}"
+          if [ "${{ needs.macos-scope.result }}" = success ] && [ "${{ needs.macos-scope.outputs.macos }}" = false ]; then
+            exit 0
+          fi
           [ "${{ needs.macos-metal-clippy.result }}" = success ]
           [ "${{ needs.macos-metal-tests.result }}" = success ]
 

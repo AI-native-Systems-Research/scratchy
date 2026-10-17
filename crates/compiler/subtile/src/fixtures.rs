@@ -11,10 +11,10 @@ use crate::handoff::{LoweredDecode, SourceBinding};
 use crate::kv_codec::CodecGuard::{Codec, CodecDecode, CodecNotDecode, UnlessCodecDecode};
 use crate::kv_codec::{After, Before, CodecAround, CodecHeadDims, Guarded, KvCodecFacts};
 use crate::lower::{InputRef, LoweringInput, OpDesc};
+use crate::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 use crate::subtile_ir::{
     AttnMask, EwKind, GainConvention, KvOperand, RopeFormTag, SourceShape, SubOp,
 };
-use ktir_superdsc::head_counts::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 
 /// Minimal one-layer Llama-3.2-1B-style decode forward.
 ///

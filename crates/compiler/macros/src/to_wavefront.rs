@@ -35,11 +35,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use ktir_superdsc::head_counts::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 use scratchy_subtile::handoff::{BundleTensor, Expansion, ExpansionId};
 use scratchy_subtile::lower::{
     AffineInt4, ArchOp, ExpertQuant, GemmWeight, InputRef, LoweringInput, OpDesc,
 };
+use scratchy_subtile::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 use scratchy_subtile::subtile_ir::{
     AttnMask, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention, GatedAct, NumExperts,
     RopeFormTag, RouterBundle, RowScale, SharedExpertBound, SourceShape, SubOp, TopK,

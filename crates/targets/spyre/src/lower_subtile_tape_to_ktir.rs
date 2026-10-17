@@ -2979,13 +2979,13 @@ mod attn_scale_weight_fold_tests {
     ) -> SubtileIR {
         // granite's own geometry through the same mint the config path uses, scaled down: the
         // recognizer reads only `scale`, so the geometry is inert — it just has to exist.
-        let geom = ktir_superdsc::head_counts::ModelAttnGeometry::mint(
-            ktir_superdsc::head_counts::QueryHeads::new(2),
-            ktir_superdsc::head_counts::KvHeads::new(1),
-            ktir_superdsc::head_counts::HeadDim::new(8),
+        let geom = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
+            scratchy_subtile::model_geometry::QueryHeads::new(2),
+            scratchy_subtile::model_geometry::KvHeads::new(1),
+            scratchy_subtile::model_geometry::HeadDim::new(8),
         )
         .expect("2 query heads over 1 kv head, head_dim 8, mints");
-        let hd = ktir_superdsc::head_counts::HeadDim::new(8);
+        let hd = scratchy_subtile::model_geometry::HeadDim::new(8);
         let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
         let sources = vec![
             shape(1, 8),  // 0: x (hidden 8)
@@ -3143,13 +3143,13 @@ mod attn_scale_weight_fold_tests {
     #[test]
     fn the_fp8_attention_folds_into_the_dequant_rows() {
         let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
-        let geom = ktir_superdsc::head_counts::ModelAttnGeometry::mint(
-            ktir_superdsc::head_counts::QueryHeads::new(2),
-            ktir_superdsc::head_counts::KvHeads::new(1),
-            ktir_superdsc::head_counts::HeadDim::new(8),
+        let geom = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
+            scratchy_subtile::model_geometry::QueryHeads::new(2),
+            scratchy_subtile::model_geometry::KvHeads::new(1),
+            scratchy_subtile::model_geometry::HeadDim::new(8),
         )
         .expect("2 query heads over 1 kv head, head_dim 8, mints");
-        let hd = ktir_superdsc::head_counts::HeadDim::new(8);
+        let hd = scratchy_subtile::model_geometry::HeadDim::new(8);
         let input = LoweringInput {
             sources: vec![
                 shape(1, 8),  // 0: x
@@ -3352,13 +3352,13 @@ mod attn_scale_weight_fold_tests {
     /// `AttnDecode` nodes differ on are the ones handed in (the scales, and whether the second
     /// chain's query is roped — its foldability lever).
     fn two_attn_graph(a_scale: f32, b_scale: f32, b_unroped: bool) -> SubtileIR {
-        let geom = ktir_superdsc::head_counts::ModelAttnGeometry::mint(
-            ktir_superdsc::head_counts::QueryHeads::new(2),
-            ktir_superdsc::head_counts::KvHeads::new(1),
-            ktir_superdsc::head_counts::HeadDim::new(8),
+        let geom = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
+            scratchy_subtile::model_geometry::QueryHeads::new(2),
+            scratchy_subtile::model_geometry::KvHeads::new(1),
+            scratchy_subtile::model_geometry::HeadDim::new(8),
         )
         .expect("2 query heads over 1 kv head, head_dim 8, mints");
-        let hd = ktir_superdsc::head_counts::HeadDim::new(8);
+        let hd = scratchy_subtile::model_geometry::HeadDim::new(8);
         let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
         let sources = vec![
             shape(1, 8),  // 0: x (hidden 8)
@@ -3535,20 +3535,20 @@ mod attn_scale_weight_fold_tests {
     /// pairs disagree (256/512 vs 128/256 — hd AND k both, like the real arch). This is
     /// the exact boundary the uniformity term draws, stated as a graph.
     fn two_class_fp8_oproj_graph() -> SubtileIR {
-        let geom_a = ktir_superdsc::head_counts::ModelAttnGeometry::mint(
-            ktir_superdsc::head_counts::QueryHeads::new(2),
-            ktir_superdsc::head_counts::KvHeads::new(1),
-            ktir_superdsc::head_counts::HeadDim::new(128),
+        let geom_a = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
+            scratchy_subtile::model_geometry::QueryHeads::new(2),
+            scratchy_subtile::model_geometry::KvHeads::new(1),
+            scratchy_subtile::model_geometry::HeadDim::new(128),
         )
         .expect("2 query heads over 1 kv head, head_dim 128, mints");
-        let geom_b = ktir_superdsc::head_counts::ModelAttnGeometry::mint(
-            ktir_superdsc::head_counts::QueryHeads::new(2),
-            ktir_superdsc::head_counts::KvHeads::new(1),
-            ktir_superdsc::head_counts::HeadDim::new(256),
+        let geom_b = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
+            scratchy_subtile::model_geometry::QueryHeads::new(2),
+            scratchy_subtile::model_geometry::KvHeads::new(1),
+            scratchy_subtile::model_geometry::HeadDim::new(256),
         )
         .expect("2 query heads over 1 kv head, head_dim 256, mints");
-        let hd_a = ktir_superdsc::head_counts::HeadDim::new(128);
-        let hd_b = ktir_superdsc::head_counts::HeadDim::new(256);
+        let hd_a = scratchy_subtile::model_geometry::HeadDim::new(128);
+        let hd_b = scratchy_subtile::model_geometry::HeadDim::new(256);
         let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
         let sources = vec![
             shape(1, 8),    // 0: x (hidden 8)
@@ -3718,13 +3718,13 @@ mod attn_scale_weight_fold_tests {
     /// granite-8b's geometry at fixture size, and the exact shape every term of
     /// [`OprojEdges::geometry_applies`] demands.
     fn uniform_fp8_oproj_graph() -> SubtileIR {
-        let geom = ktir_superdsc::head_counts::ModelAttnGeometry::mint(
-            ktir_superdsc::head_counts::QueryHeads::new(2),
-            ktir_superdsc::head_counts::KvHeads::new(1),
-            ktir_superdsc::head_counts::HeadDim::new(128),
+        let geom = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
+            scratchy_subtile::model_geometry::QueryHeads::new(2),
+            scratchy_subtile::model_geometry::KvHeads::new(1),
+            scratchy_subtile::model_geometry::HeadDim::new(128),
         )
         .expect("2 query heads over 1 kv head, head_dim 128, mints");
-        let hd = ktir_superdsc::head_counts::HeadDim::new(128);
+        let hd = scratchy_subtile::model_geometry::HeadDim::new(128);
         let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
         let sources = vec![
             shape(1, 8),    // 0: x (hidden 8)

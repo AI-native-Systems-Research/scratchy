@@ -1681,13 +1681,13 @@ mod tests {
     use crate::handoff::{Expansion, ExpansionId};
     use crate::kv_codec::expand_kv_codec;
     use crate::lower::{ArchOp, GemmWeight, InputRef, LoweringInput, OpDesc};
+    use crate::model_geometry::HeadDim;
     use crate::subtile_ir::{
         AttnMask, EwKind, GainConvention, RopeFormTag, RowScale, SourceShape, ValidatedGraph,
         lower_region,
     };
     use crate::subtile_tape::{Instr, lower_dag_to_tape};
     use InputRef::{Ext, Op};
-    use ktir_superdsc::head_counts::HeadDim;
 
     /// A neutral kernel identity per fold.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

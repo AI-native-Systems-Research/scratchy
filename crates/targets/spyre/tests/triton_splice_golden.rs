@@ -1615,7 +1615,7 @@ fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
     let node = SubtileNode {
         id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
         op: SubOp::RopeRotate {
-            head_dim: ktir_superdsc::head_counts::HeadDim::new(hd),
+            head_dim: scratchy_subtile::model_geometry::HeadDim::new(hd),
             _form: std::marker::PhantomData,
         },
         inputs: vec![whole(0), whole(1), whole(2)],
@@ -1881,7 +1881,7 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
                 // 0: k' = rope_append(k, cos, sin, v, prefix_k, prefix_v)
                 scratchy_subtile::lower::OpDesc {
                     op: scratchy_subtile::subtile_ir::SubOp::rope_append(
-                        ktir_superdsc::head_counts::HeadDim::new(hd),
+                        scratchy_subtile::model_geometry::HeadDim::new(hd),
                         0,
                         scratchy_subtile::subtile_ir::AttnMask::Causal,
                         scratchy_subtile::subtile_ir::RopeFormTag::NeoX,
@@ -1917,11 +1917,13 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
 }
 
 /// granite's geometry, through the same mint the config path uses.
-fn attn_geometry(geom: (u32, u32, u32)) -> Option<ktir_superdsc::head_counts::ModelAttnGeometry> {
-    ktir_superdsc::head_counts::ModelAttnGeometry::mint(
-        ktir_superdsc::head_counts::QueryHeads::new(geom.0),
-        ktir_superdsc::head_counts::KvHeads::new(geom.1),
-        ktir_superdsc::head_counts::HeadDim::new(geom.2),
+fn attn_geometry(
+    geom: (u32, u32, u32),
+) -> Option<scratchy_subtile::model_geometry::ModelAttnGeometry> {
+    scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
+        scratchy_subtile::model_geometry::QueryHeads::new(geom.0),
+        scratchy_subtile::model_geometry::KvHeads::new(geom.1),
+        scratchy_subtile::model_geometry::HeadDim::new(geom.2),
     )
 }
 

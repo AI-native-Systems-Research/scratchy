@@ -408,10 +408,10 @@ fn attn(
             ),
         });
     }
-    let geom = ktir_superdsc::head_counts::ModelAttnGeometry::mint(
-        ktir_superdsc::head_counts::QueryHeads::new(q_cols / hd),
-        ktir_superdsc::head_counts::KvHeads::new(kv_cols / hd),
-        ktir_superdsc::head_counts::HeadDim::new(hd),
+    let geom = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
+        scratchy_subtile::model_geometry::QueryHeads::new(q_cols / hd),
+        scratchy_subtile::model_geometry::KvHeads::new(kv_cols / hd),
+        scratchy_subtile::model_geometry::HeadDim::new(hd),
     )
     .ok_or_else(|| Error {
         message: format!(

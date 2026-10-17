@@ -50,15 +50,13 @@ counts! {
                 two is the replicate-copy bug, where a slab was strided by the padded count while its \
                 producer packed by the real one.",
     Slabs => "Head-dim slabs at some data format — `head_dim / lanes`, never a literal.",
+    Gqa => "Query heads per kv head — the group size every KV address is built from: \
+            [`Shape::gqa`] divides it out of the shape's head counts, and `sdsc_abstract`'s \
+            `KvHead::of_query`/`group_first_query` take one. The address-side twin of the tape's \
+            `scratchy_subtile::model_geometry::Gqa`, which is divided out once at \
+            `ModelAttnGeometry::mint`; this crate takes no scratchy dependency, so it cannot name \
+            that one.",
 }
-
-/// Query heads per kv head — the SAME type the tape's geometry carries, so the group size a
-/// device address is built from is the one divided out at
-/// `scratchy_subtile::model_geometry::ModelAttnGeometry::mint` and nowhere else.
-/// Re-exported here rather than declared here: `addr` is the address-side face of the model's
-/// parameters, but the parameters themselves are the tape's, and the divisibility proof travels
-/// with them.
-pub use crate::head_counts::Gqa;
 
 /// One model's attention geometry, as types. `HD` is head_dim, `NQH`/`NKVH` the query and key/value
 /// head counts, `CAP` the resident KV capacity.
