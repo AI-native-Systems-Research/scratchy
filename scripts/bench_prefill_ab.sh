@@ -146,21 +146,31 @@ wait_wired_settled() {
 
 # --- prompts and requests ----------------------------------------------------
 
-# Filler paragraph: 75 words ~ 100 tokens per repetition. Word-approximate on
-# purpose; only for the long/chunk/batch shapes, whose sizes are labels, not
-# rung targets. The server log's "prompt tokens:" line is the exact count.
+# Natural filler paragraph, 75 words. Used for the long/batch shapes (labels,
+# not rung targets) and, cut to a token budget, for the rung shapes: a prompt
+# of repeated identical tokens routes MoE traffic to the same few experts, so
+# it times a workload real text never produces — the exact token count lives
+# in the server log's request-finished `prompt_tokens=N` line either way.
+FILLER='The quick brown fox jumps over the lazy dog while the server warms its weights and the scheduler queues the first prefill chunk. Every op is a compile-time constant here: the tape was expanded at build time, the buckets were chosen, and the kernels only wait for their barriers. Latency is the only variable left, so we measure it twice, in both orders, because the second server always pays for the first one teardown.'
+
+# Word-approximate prompt of ~$1 tokens (repeats of the filler).
 synth_prompt() { # $1 = target tokens
-  local para='The quick brown fox jumps over the lazy dog while the server warms its weights and the scheduler queues the first prefill chunk. Every op is a compile-time constant here: the tape was expanded at build time, the buckets were chosen, and the kernels only wait for their barriers. Latency is the only variable left, so we measure it twice, in both orders, because the second server always pays for the first one teardown.'
   local reps=$(( $1 / 95 + 1 ))
-  for _ in $(seq 1 "$reps"); do printf '%s ' "$para"; done
+  for _ in $(seq 1 "$reps"); do printf '%s ' "$FILLER"; done
 }
 
-# Single-token repeats: "token" is one BPE token in the Qwen vocabularies, so
-# N repeats ≈ N tokens (the log's prompt-token count confirms, and the sweep
-# warns if a rung shape lands outside its rung).
-synth_exact() { # $1 = token count
-  local i
-  for i in $(seq 1 "$1"); do printf 'token '; done
+# Natural-text prompt cut to a token budget: words-per-token calibrated on
+# this filler (23,700 words -> 27,502 tokens => 0.8618 words/token), so a
+# $1-token target becomes $1 * 0.8618 words of filler. Approximate on
+# purpose — the rung check warns if the prompt misses its rung.
+synth_natural() { # $1 = target tokens
+  local k reps rem i
+  k=$(( $1 * 8618 / 10000 ))
+  reps=$(( k / 75 )); rem=$(( k % 75 ))
+  # while, not `seq 1 $reps`: BSD seq prints two lines for a zero-count range
+  i=0
+  while [ "$i" -lt "$reps" ]; do printf '%s ' "$FILLER"; i=$(( i + 1 )); done
+  [ "$rem" -gt 0 ] && echo "$FILLER" | cut -d' ' -f1-"$rem"
 }
 
 # request_json <max_tokens> <prompt>  (prompt travels via env, not argv, so
@@ -239,6 +249,8 @@ run_leg() { # $1 scr  $2 shape
       fi
     done
     metric=$(python3 -c "print(f'{(float(open('$tmp1').read().split()[0]) + float(open('$tmp2').read().split()[0])) / 2:.4f}')")
+    # batch legs report their token counts too (one line per request)
+    grep -o 'prompt_tokens=[0-9]*' "$slog" | sed 's/^prompt_tokens=/  prompt tokens: /' >&2
     echo "$metric"
     return 0
   fi
@@ -272,9 +284,10 @@ prompt_for_shape() { # $1 shape
       if [ -n "$PROMPT_FILE" ]; then cat "$PROMPT_FILE"; else synth_prompt "$LONG_TOKENS"; fi ;;
     short) echo 'Say hi and nothing else.' ;;
     batch) synth_prompt 4200 ;;
-    # rung shapes: leave --template-pad tokens of headroom for the chat
-    # template, built from single-token repeats so the count is predictable
-    *) synth_exact $(( $1 - TEMPLATE_PAD )) ;;
+    # rung shapes: natural filler cut to sit under the rung (--template-pad
+    # tokens of headroom for the chat template), so MoE routing stays
+    # representative; the rung check warns if it misses
+    *) synth_natural $(( $1 - TEMPLATE_PAD )) ;;
   esac
 }
 
