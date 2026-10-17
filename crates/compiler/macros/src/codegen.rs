@@ -9543,7 +9543,8 @@ fn emit_superdsc_wiring(
 /// nothing parses it, at build time or after. `OUT_DIR` is cargo's own per-build directory for the crate
 /// being expanded, and every arch crate has a `build.rs`, so it is set here.
 #[cfg(feature = "spyre")]
-fn superdsc_bundle_tokens() -> proc_macro2::TokenStream {
+#[cfg_attr(not(feature = "spyre-hw"), allow(unused_variables))]
+fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     // ⭐⭐⭐ WHAT IS INVENTORIED DEPENDS ON THE DEVICE, AND ONLY ON THE DEVICE.
     //
     // On a CARD the launch names a resident device image by VA, so that image is compiled from this
@@ -9621,6 +9622,33 @@ fn superdsc_bundle_tokens() -> proc_macro2::TokenStream {
                 }
             }
         });
+    }
+    // ── THE BAKE BUDGET, PER MODEL (see `scratchy_target_spyre::superdsc_bake::BakeBudget`) ──
+    //    Launch-group COUNT is the dxp floor's multiplication lever: the floor is total compile
+    //    cost ÷ the queue's width, so a ladder that doubles its rungs doubles the floor no
+    //    parallelism recovers. Checked at the drain — one `#[forward]` expansion, i.e. one
+    //    model's whole ladder — and scaled per LAYER, because the models in scope span the
+    //    measured 25 groups/layer (granite-2b, 40 layers) to 73 (gemma-4-12b, 48): a flat
+    //    ceiling tight enough to hold the 2b refuses the 12b. Card-only: on the emulator the
+    //    drained groups are one-per-op KTIR programs, a different unit this budget never sees.
+    #[cfg(feature = "spyre-hw")]
+    {
+        let layers: usize =
+            *model.bounds.get("num_hidden_layers").unwrap_or_else(|| {
+                panic!("model `{}` missing `num_hidden_layers`", model.source_stem)
+            }) as usize;
+        let per_layer = scratchy_target_spyre::superdsc_bake::BakeBudget::MAX_GROUPS_PER_LAYER;
+        let ceiling = layers * per_layer;
+        if n_groups > ceiling {
+            panic!(
+                "[spyre-superdsc] {}: {n_groups} launch group(s) across {layers} layer(s) is \
+                 PAST THE BAKE BUDGET of {per_layer} groups per layer ({ceiling} total). Group \
+                 count is the dxp floor's multiplication lever — a ladder this wide is a bake \
+                 that grew, not one a wider queue absorbs. Moving the budget is a measured \
+                 decision that names the bake; this refusal is the measurement.",
+                model.source_stem
+            );
+        }
     }
     // The programs are `const` items and the placement tables `static`s; both precede the
     // `inventory::submit!`s that name them.
@@ -13348,7 +13376,7 @@ fn dump_wavefront_mega(
         // ⭐ THE COMPILED DEVICE CODE GOES INTO THE BINARY. This drains the bounded bake queue and
         // renders every bundle it compiled as an `inventory::submit!`ed value the runtime looks up by
         // fingerprint.
-        ktir_bundle_out.extend(superdsc_bundle_tokens());
+        ktir_bundle_out.extend(superdsc_bundle_tokens(model));
         // The typed launch wiring, spliced into the SAME per-model module that
         // holds `Weights` — so the binding of a source to a weight can be
         // generated code naming a real field, the way metal's forward names
