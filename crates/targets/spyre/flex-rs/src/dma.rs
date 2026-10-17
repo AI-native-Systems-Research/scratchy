@@ -129,11 +129,18 @@ pub struct DmaParams {
     iova: Option<IovaAddress>,
     pipeline_shape: DmaPipelineShape,
     pipeline_barrier: bool,
+    skip_hazard: bool,
 }
 
 /// The secondary/optional shaping parameters shared by both `DmaParams`
 /// constructors — bundled so neither constructor exceeds a reasonable
 /// argument count, without dropping any field the C++ constructors take.
+/// `skip_hazard` rides here because in the shipped surface it is a
+/// constructor argument (`skip_hazard_in = false` on both `DmaParams`
+/// constructors, `runtime_submission_params.hpp:169`/`:189`) — the pod
+/// SDK's `createDmaParams` is the only factory that exposes it
+/// (`:662-673`), and every other op kind submits the
+/// `RuntimeOperationParams` base default `false`.
 #[derive(Debug, Clone, Default)]
 pub struct DmaShaping {
     pub dci: Option<DataConversionHandle>,
@@ -141,6 +148,7 @@ pub struct DmaShaping {
     pub iova: Option<IovaAddress>,
     pub pipeline_shape: DmaPipelineShape,
     pub pipeline_barrier: bool,
+    pub skip_hazard: bool,
 }
 
 impl DmaParams {
@@ -185,6 +193,7 @@ impl DmaParams {
             iova: shaping.iova,
             pipeline_shape: shaping.pipeline_shape,
             pipeline_barrier: shaping.pipeline_barrier,
+            skip_hazard: shaping.skip_hazard,
         })
     }
 
@@ -235,6 +244,7 @@ impl DmaParams {
             iova: shaping.iova,
             pipeline_shape: shaping.pipeline_shape,
             pipeline_barrier: shaping.pipeline_barrier,
+            skip_hazard: shaping.skip_hazard,
         })
     }
 
@@ -264,6 +274,17 @@ impl DmaParams {
     }
     pub fn pipeline_barrier(&self) -> bool {
         self.pipeline_barrier
+    }
+
+    /// Port of `RuntimeOperationParams::skip_hazard`
+    /// (`runtime_submission_params.hpp:88`): "If true, hide this op from
+    /// the cross-stream hazard tracker" — neither checked against nor
+    /// recorded as a producer/consumer
+    /// (`runtime_submission_params.hpp:662-664`). Read by
+    /// `RuntimeStream::launch_h2d`/`launch_d2h` onto the submitted
+    /// operation; every other kind carries the base default `false`.
+    pub fn skip_hazard(&self) -> bool {
+        self.skip_hazard
     }
 }
 

@@ -127,6 +127,12 @@ tracing-subscriber = { workspace = true }
 name = "bundle_run_dev"
 required-features = ["spyre-hw"]
 
+# #546's concurrency leg: two tracked OP_ORDERING streams, one cross-stream RAW hazard,
+# one shared card — the hazard tracker's ordering demo on real hardware.
+[[example]]
+name = "hazard_concurrency"
+required-features = ["spyre-hw"]
+
 # The proof harnesses in this crate compile only under the model checker, so `cfg(kani)` is a real name a
 # normal build never defines. DECLARED rather than silenced: an undeclared cfg is how ~100 commits of "the
 # proofs hold" turned out to be vacuous (a normal build skipped the module and said nothing), and declaring

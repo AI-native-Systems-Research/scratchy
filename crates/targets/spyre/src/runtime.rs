@@ -399,19 +399,38 @@ pub struct Stream {
 static STREAM_CREATE: Mutex<()> = Mutex::new(());
 
 impl Stream {
-    /// Create a dedicated stream: `Normal` priority, `STRICT_ORDERING` — the values every scratchy
-    /// session has ever run. The knobs flex-rs exposes (`RuntimeContext::create_stream` takes
-    /// priority and mode) are the door when a caller needs otherwise (#500).
+    /// Create a dedicated stream: `Normal` priority, `STRICT_ORDERING`, untracked — the values
+    /// every scratchy session has ever run. Sessions stay UNTRACKED deliberately: their streams
+    /// are user-owned and order through their own submissions; the hazard tracker's conservative
+    /// Compute address sets would cross-edge concurrent sessions sharing resident weights into
+    /// full serialization. Delegates to [`Self::create_with`].
     pub fn create() -> Result<Stream, HwError> {
+        Self::create_with(
+            RuntimeStreamPriority::Normal,
+            RuntimeStreamMode::StrictOrdering,
+            false,
+        )
+    }
+
+    /// ⭐ The #546 door: a stream with the vendor's full creation surface — priority, ordering
+    /// mode, and `track_hazards` (`runtime_context.hpp:70-78`). `track_hazards = true`
+    /// registers the stream with the scheduler's cross-stream hazard tracker: its ops
+    /// participate in RAW/WAR/WAW edge insertion against every OTHER tracked stream
+    /// (same-stream ordering is unaffected; untracked streams are never edged, in either
+    /// direction). This is the shape for concurrent pipelines over shared device memory —
+    /// `OP_ORDERING` streams whose cross-stream ordering the tracker carries instead of a
+    /// host-side lock; see `examples/hazard_concurrency.rs`, the #546 concurrency leg.
+    pub fn create_with(
+        priority: RuntimeStreamPriority,
+        mode: RuntimeStreamMode,
+        track_hazards: bool,
+    ) -> Result<Stream, HwError> {
         // A poisoned lock still serializes (nothing is protected but the CALL), so recover rather than
         // panic: a panic here would turn one thread's failure into the whole load's.
         let _serialize = STREAM_CREATE.lock().unwrap_or_else(|e| e.into_inner());
         let rt = get_or_init_runtime().map_err(HwError::BringUp)?;
         let id = rt
-            .create_stream(
-                RuntimeStreamPriority::Normal,
-                RuntimeStreamMode::StrictOrdering,
-            )
+            .create_stream(priority, mode, track_hazards)
             .map_err(HwError::StreamCreate)?;
         Ok(Stream { rt, id })
     }
