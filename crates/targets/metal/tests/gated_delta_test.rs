@@ -543,9 +543,10 @@ fn gdn_conv1d_varlen_matches_reference() {
             ConstantValue::uint(0, conv_dim as u32),
             ConstantValue::uint(1, kernel as u32),
             ConstantValue::uint(5, 0),
-            // A 2-token block: three blocks for the 6 rows, the later ones seeding their
-            // windows from x — the blocked form's path past the sequence's head.
-            ConstantValue::uint(6, 2),
+            // A 3-token block — the lock's minimum (the seed window is 3 entries): two blocks
+            // for the 6 rows, the second seeding its window from x and block 0 alone writing
+            // the new ring.
+            ConstantValue::uint(6, 3),
         ],
     );
     let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
@@ -567,7 +568,7 @@ fn gdn_conv1d_varlen_matches_reference() {
         MTLSize {
             width: 1,
             height: groups_y,
-            depth: t.div_ceil(2),
+            depth: t.div_ceil(3),
         }, // x = num_seqs, z = token blocks
         MTLSize {
             width: 1,
@@ -617,8 +618,9 @@ fn gdn_conv1d_varlen_continuity() {
             ConstantValue::uint(0, conv_dim as u32),
             ConstantValue::uint(1, kernel as u32),
             ConstantValue::uint(5, 0),
-            // A 2-token block: the 6-token run walks three blocks, the 1-token continuation one.
-            ConstantValue::uint(6, 2),
+            // A 3-token block — the lock's minimum (the seed window is 3 entries): the
+            // 6-token run walks two blocks, the 1-token continuation one.
+            ConstantValue::uint(6, 3),
         ],
     );
     let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
@@ -641,7 +643,7 @@ fn gdn_conv1d_varlen_continuity() {
             MTLSize {
                 width: 1,
                 height: groups_y,
-                depth: num_tokens.div_ceil(2),
+                depth: num_tokens.div_ceil(3),
             },
             MTLSize {
                 width: 1,
@@ -1372,7 +1374,9 @@ fn gdn_decode_is_the_conv_scan_norm() {
             ConstantValue::uint(0, conv_dim as u32),
             ConstantValue::uint(1, kernel as u32),
             ConstantValue::uint(5, u32::from(drafts)),
-            ConstantValue::uint(6, 1),
+            // The lock's minimum (the seed window is 3 entries); one-row sequences walk one
+            // block either way.
+            ConstantValue::uint(6, 3),
         ];
         let conv = build("gdn_conv1d_varlen", "gdn_conv1d_varlen_f32", conv_consts);
         let conv_out = buf_zero_f32(&device, t * conv_dim);
@@ -1515,7 +1519,7 @@ fn rejected(n: usize) -> Vec<f32> {
     (0..n).map(|i| (i as f32 * 0.37).cos() * 0.5).collect()
 }
 
-/// A verify step's checkpoints, conv ring: 3 tokens, then a verify step of the next token, a kept
+/// A verify step's checkpoints, conv ring: 7 tokens, then a verify step of the next token, a kept
 /// draft and two rejected drafts, then one token resuming from the kept row's checkpoint — equals
 /// the sequence that never saw the rejected drafts. In slot 1 of a 2-slot pool, its checkpoints in
 /// lane 1 of 2 keeping 3 drafts, so the entries are offset and slot 0's and lane 0's must stay
@@ -1535,12 +1539,12 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
     let rows = CheckpointRows(3);
     let lane = DraftLanes::new(rows, 2).and_then(|l| l.lanes().nth(1));
     let lane_entries = rows.rows();
-    let t_full = 6usize;
+    let t_full = 10usize;
     let x_full = fill(t_full * conv_dim);
     let w = fill(conv_dim * kernel);
     let out_full = conv1d_ref(&x_full, &w, conv_dim, kernel, t_full);
     let x_verify = [
-        &x_full[3 * conv_dim..5 * conv_dim],
+        &x_full[7 * conv_dim..9 * conv_dim],
         &rejected(2 * conv_dim)[..],
     ]
     .concat();
@@ -1552,9 +1556,10 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
             ConstantValue::uint(0, conv_dim as u32),
             ConstantValue::uint(1, kernel as u32),
             ConstantValue::uint(5, u32::from(rows.0)),
-            // A 2-token block: the verify and resumed runs walk more than one, the later blocks
-            // seeding their windows from x past the lane's checkpoint.
-            ConstantValue::uint(6, 2),
+            // A 4-token block — the lock's minimum for 3 drafts (a verify step's 4 rows sit in
+            // block 0 alone): the 7-token run walks two blocks, the second seeding its window
+            // from x, and block 0 alone reads the seed and writes the new ring.
+            ConstantValue::uint(6, 4),
         ],
     );
     let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
@@ -1589,7 +1594,7 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
             MTLSize {
                 width: 1,
                 height: 1,
-                depth: num_tokens.div_ceil(2),
+                depth: num_tokens.div_ceil(4),
             },
             MTLSize {
                 width: 1,
@@ -1601,7 +1606,7 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
     };
 
     let Some(_) = run(
-        &x_full[..3 * conv_dim],
+        &x_full[..7 * conv_dim],
         GdnStart::Fresh,
         CheckpointRows::NONE,
     ) else {
@@ -1612,17 +1617,17 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
     };
     assert_close(
         &verify[..2 * conv_dim],
-        &out_full[3 * conv_dim..5 * conv_dim],
+        &out_full[7 * conv_dim..9 * conv_dim],
         "verify kept rows",
     );
     let Some(next) = run(
-        &x_full[5 * conv_dim..],
+        &x_full[9 * conv_dim..],
         GdnStart::Checkpoint(1),
         CheckpointRows::NONE,
     ) else {
         return;
     };
-    assert_close(&next, &out_full[5 * conv_dim..], "resumed row");
+    assert_close(&next, &out_full[9 * conv_dim..], "resumed row");
     let slot0 = read_f32(&state_buf, entry_len);
     assert!(
         slot0.iter().all(|&v| v == 0.0),
@@ -2444,8 +2449,9 @@ fn gdn_conv1d_varlen_saves_and_restores_snapshots() {
             ConstantValue::uint(0, conv_dim as u32),
             ConstantValue::uint(1, kernel as u32),
             ConstantValue::uint(5, u32::from(drafts)),
-            // A 2-token block: the saves land mid-block and on block boundaries alike.
-            ConstantValue::uint(6, 2),
+            // A 3-token block — the lock's minimum (the seed window is 3 entries): the saves
+            // land mid-block and on block boundaries alike over the 7 rows' three blocks.
+            ConstantValue::uint(6, 3),
         ];
         let width = match mamba {
             false => conv_dim,
@@ -2468,7 +2474,7 @@ fn gdn_conv1d_varlen_saves_and_restores_snapshots() {
             let [cu, si, code] = second_of_two(&device, n, seq, start);
             let mut bufs = vec![&out, &x_buf, &w_buf, &state, &cu, &si, &code, &bias_buf];
             bufs.extend((drafts > 0).then_some(&unread_lanes));
-            let (grid, threads) = (dims(2, 1, n.div_ceil(2)), dims(1, conv_dim, 1));
+            let (grid, threads) = (dims(2, 1, n.div_ceil(3)), dims(1, conv_dim, 1));
             common::dispatch_threadgroups(&device, &pipeline, &bufs, grid, threads).then(|| {
                 let after = vec![read_f32(&state, pools[0].len())];
                 (read_f32(&out, n * conv_dim), after)

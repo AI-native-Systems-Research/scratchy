@@ -8,10 +8,14 @@
 // (sequence, channel, GDN_CONV_BLOCK-token block) and walks its block's tokens
 // sequentially, keeping the causal window in registers — so there is NO
 // cross-thread race on `conv_state` (the CUDA prefill kernel races: it writes
-// state while sibling token-threads read it; here only the block running a
-// sequence's last row writes state, once, and only the first block reads the
-// seed). Blocks past a sequence's end early out: the grid's Z is the whole
-// step's rows over GDN_CONV_BLOCK, always at least any one sequence's blocks.
+// state while sibling token-threads read it; here block 0 — the only thread
+// that reads the seed ring — is also the only one that writes the new ring,
+// and no other threadgroup touches either: `GDN_CONV_BLOCK` is at least the
+// seed's `state_len`, so blocks past a sequence's head seed from `x` alone,
+// and at least a verify step's rows, so only block 0 checkpoints its draft
+// lane — both locked on the Rust side). Blocks past a sequence's end early
+// out: the grid's Z is the whole step's rows over GDN_CONV_BLOCK, always at
+// least any one sequence's blocks.
 //
 // The ring update is the CORRECT general shift (matches the decode kernel for
 // seqlen==1 and the prefill kernel for seqlen>=state_len): the new state is the
@@ -52,7 +56,9 @@
 //   GDN_CONV_HAS_BIAS  — optional: add `bias[c]` (buffer 7; unset: no bias, buffer 7 unread)
 //   GDN_CONV_DRAFTS    — the drafts each sequence of a verify step carries (`SPEC_DRAFTS`); 0:
 //                        `conv_lanes` (buffer 8) unread
-//   GDN_CONV_BLOCK     — the tokens a thread owns (the grid's Z is the step's rows over it)
+//   GDN_CONV_BLOCK     — the tokens a thread owns (the grid's Z is the step's rows over it);
+//                        at least kernel-1 and a verify step's rows, so only block 0 touches
+//                        the seed ring and the draft lanes (locked on the Rust side)
 //
 // Dispatch: grid (num_seqs[set via seq_axis=X], ceil(conv_dim/tg),
 // ceil(rows/GDN_CONV_BLOCK) [scaled by num_tokens]); one thread per (seq, channel, block).
@@ -106,6 +112,13 @@ template <typename T>
   if (seqlen <= 0) {
     return;
   }
+  // This thread's block; blocks past the sequence's end have nothing to do — checked before
+  // the weight loads: a batched chunk's Z spans every sequence's blocks, and the idle ones
+  // would each read `kernel_size` weights for nothing.
+  int t0 = int(tgid.z) * int(GDN_CONV_BLOCK);
+  if (t0 >= seqlen) {
+    return;
+  }
   const GdnSeqSlots seq_slots = state_indices[seq];
   uint code = gdn_step[seq];
   uint start = code & 0xffu;
@@ -133,11 +146,6 @@ template <typename T>
   const device float* start_ptr =
       replays ? lane_ptr + (start - 2u) * entry_len : ring(gdn_start_slot(seq_slots, start));
 
-  // This thread's block; blocks past the sequence's end have nothing to do.
-  int t0 = int(tgid.z) * int(GDN_CONV_BLOCK);
-  if (t0 >= seqlen) {
-    return;
-  }
   const int t_end = metal::min(t0 + int(GDN_CONV_BLOCK), seqlen);
 
   // Seed the causal window: the last `state_len` entries of `[seed ++ x]` before row t0 — the
@@ -181,11 +189,17 @@ template <typename T>
     }
   }
 
-  // The block that ran the sequence's last row persists the last `state_len` inputs as the new
-  // ring (correct general shift).
-  if (t_end == seqlen) {
+  // Only block 0 — the thread that read the seed — writes the new ring, so no other
+  // threadgroup touches the seed ring at all: the ring is the last `state_len` entries of
+  // `[seed ++ x]` (the CORRECT general shift), which block 0 recomputes straight from `x`
+  // (~`state_len` extra loads) since its own window only covers its block's rows.
+  if (tgid.z == 0) {
     for (uint ki = 0; ki < state_len; ki++) {
-      state_ptr[ki] = window[ki];
+      int p = int(seqlen) + int(ki) - int(state_len);
+      state_ptr[ki] = p < 0
+                          ? (start == 1u ? 0.0f : start_ptr[uint(seqlen) + ki])
+                          : float(x[(uint(base) + uint(p)) * GDN_CONV_X_STRIDE
+                                    + GDN_CONV_IN_OFFSET + d]);
     }
   }
 }
