@@ -1158,7 +1158,13 @@ fn build_fill_cb(
 /// operation. Port of `ControlBlockStream::CreateGraphFreeCompute`'s call
 /// shape: one xlat entry per tensor operand plus the program at segment 7,
 /// bootstrap pointing at `PROG_OFFSET_BASE + bootstrap_offset`.
-fn build_compute_cb(
+///
+/// `pub` because the vendor's `CreateGraphFreeCompute` is itself a public
+/// method on `ControlBlockStream` — the scheduler calls it internally, and so
+/// can a caller that wants wire images WITHOUT submitting them (#603 PR2's
+/// prepare-time CB-image render and its byte-identical parity gate, reached
+/// through `scratchy::runtime::Stream::render_compute_batch`).
+pub fn build_compute_cb(
     resolver: &dyn DeviceAddressResolver,
     op: &ComputeParams,
     tag: ResponseTag,

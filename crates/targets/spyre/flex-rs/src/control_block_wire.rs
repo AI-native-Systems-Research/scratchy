@@ -784,6 +784,12 @@ impl ControlBlockWire {
         Self { bytes }
     }
 
+    /// The 128 wire bytes, read-only — for diagnostics that name the first
+    /// differing byte of two rendered images (#603 PR2's parity gate).
+    pub const fn bytes(&self) -> &[u8; CB_NUM_BYTES] {
+        &self.bytes
+    }
+
     /// Port of `ControlBlockStream::CreateGraphFreeCompute`: one compute CB
     /// with `xlat[i] = tensor_paddrs[i]` (RW) for each input/output tensor,
     /// `xlat[7] = prog_paddr` (RW), and `cmpt` pointing at `bootstrap_addr`

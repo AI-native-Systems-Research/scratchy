@@ -25,6 +25,7 @@ use flex_rs::allocator::{
     FlexAllocatorInit,
 };
 use flex_rs::compute::{BootstrapOffset, ComputeParams, KernelName};
+use flex_rs::control_block_wire::{ControlBlockWire, ResponseTag};
 use flex_rs::device_memory_allocator::DeviceMemoryAllocator;
 use flex_rs::dma::{DmaDirection, DmaParams, DmaPipelineShape, DmaShaping, HostVirtualAddress};
 use flex_rs::flex_config::DeviceKind;
@@ -33,10 +34,11 @@ use flex_rs::runtime::{RuntimeContext, RuntimeContextError};
 use flex_rs::scheduler::{
     DeviceAddressResolver, FlexAllocatorAddressResolver, HardwareSubmit, QueueCapacitySource,
     SchedulerBackendConfig, SchedulerFactoryError, SenlibHardwareSubmit, SenlibQueueCapacity,
-    create_scheduler,
+    build_compute_cb, create_scheduler,
 };
 use flex_rs::stream::{
-    RuntimeStream, RuntimeStreamError, RuntimeStreamMode, RuntimeStreamPriority, StreamId,
+    RuntimeStream, RuntimeStreamError, RuntimeStreamMode, RuntimeStreamPriority, SchedulerError,
+    StreamId,
 };
 use flex_rs::topology::populate_domain_topology;
 
@@ -298,6 +300,10 @@ pub enum HwError {
     Alloc(AllocError),
     /// `RuntimeContext::reset` refused.
     Reset(RuntimeContextError),
+    /// Rendering compute-CB wire images OFF the submit path refused — the CB
+    /// encoder cannot express an operand ([`Stream::render_compute_batch`]).
+    /// Never a submission: nothing was sent to the device.
+    CbRender(SchedulerError),
 }
 
 impl fmt::Display for HwError {
@@ -318,6 +324,7 @@ impl fmt::Display for HwError {
             Self::StreamCreate(e) => write!(f, "{e}"),
             Self::Alloc(e) => write!(f, "{e}"),
             Self::Reset(e) => write!(f, "{e}"),
+            Self::CbRender(e) => write!(f, "CB image render (no submission): {e}"),
         }
     }
 }
@@ -638,6 +645,48 @@ impl Stream {
         stream
             .launch_compute_batch(params, pipeline_barrier, None)
             .map_err(HwError::Stream)
+    }
+
+    /// Render the wire bytes of a compute batch WITHOUT submitting it (#603
+    /// PR2's image-render door): the same `flex_rs::scheduler::build_compute_cb`
+    /// the submit path runs per CB, over the same resolver TYPE the Pf backend
+    /// resolves with (`FlexAllocatorAddressResolver` on the runtime's own
+    /// allocator — the very `Arc` `build_runtime` handed the backend, so the
+    /// region map both read is one map), at CALLER-chosen tags. Tags only
+    /// reach the CTRL section's tag field; a caller comparing two renders
+    /// feeds both sides the same `first_tag` and the field cancels — the
+    /// 2b patch stage stamps real pool-leased tags there.
+    ///
+    /// Nothing here rings a doorbell, leases a tag, or touches a queue: the
+    /// images are plain bytes until a caller submits them. The parity gate
+    /// (`superdsc_exec::Executor::prepare`) renders one step's batch both the
+    /// walk way and the CbPlan way THROUGH THIS ONE DOOR, so what it compares
+    /// is exactly what the device would be handed.
+    pub fn render_compute_batch(
+        &self,
+        launches: &[BatchedCompute],
+        first_tag: u32,
+    ) -> Result<Vec<ControlBlockWire>, HwError> {
+        let resolver = FlexAllocatorAddressResolver::new(
+            self.rt
+                .get_allocator()
+                .map_err(|e| HwError::Alloc(AllocError::Context(e)))?,
+        );
+        let mut cbs = Vec::with_capacity(launches.len());
+        for (i, l) in launches.iter().enumerate() {
+            let params = ComputeParams::new(
+                l.prog.0.clone(),
+                l.tensor_allocs.iter().map(|a| a.0.clone()).collect(),
+                KernelName(String::new()),
+                BootstrapOffset(l.bootstrap_offset),
+                Vec::new(),
+            );
+            cbs.push(
+                build_compute_cb(&resolver, &params, ResponseTag(first_tag + i as u32))
+                    .map_err(HwError::CbRender)?,
+            );
+        }
+        Ok(cbs)
     }
 }
 
