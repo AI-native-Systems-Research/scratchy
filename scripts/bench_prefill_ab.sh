@@ -213,7 +213,11 @@ run_leg() { # $1 scr  $2 shape
   fi
   # memory confounder: this leg's reservation line, printed and compared
   mem=$(grep -i -m1 'weights+overhead\|kv_budget' "$slog" || true)
-  [ -n "$mem" ] && echo "  mem: $mem" >&2 && printf '%s\n' "$mem" >> "$MEMLOG"
+  if [ -n "$mem" ]; then
+    echo "  mem: $mem" >&2
+    # compare on the line without its timestamp, or every leg "differs"
+    printf '%s\n' "${mem#*INFO }" >> "$MEMLOG"
+  fi
   local url="http://127.0.0.1:$port/v1/messages"
   local hdr='content-type: application/json'
   if [ "$shape" = batch ]; then
