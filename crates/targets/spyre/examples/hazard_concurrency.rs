@@ -22,11 +22,19 @@
 //!   caller's obligation; the round only REPORTS what the racing read saw (old, new,
 //!   or torn) — it cannot assert it, by design.
 //!
-//! 512 MiB is not arbitrary: the card moves a 64 MiB transfer in ~2 ms (~35 GB/s), so
-//! a small buffer leaves A's write in flight for less than the run-to-run noise of the
-//! ~11 ms pin+submit that dominates every launch. 512 MiB keeps A's write outstanding
-//! for ~15 ms after its launch returns — B's park then stands out of the noise as the
-//! tracked-vs-control launch delta the leg prints at the end.
+//! The park's magnitude is NOT the transfer's size — the ported `submitDma` sees to
+//! that. A multi-chunk H2D is paced through the vendor's `DmaBufPool`
+//! (`FLEX_DATA_TRANSFER_BUFFER_COUNT` x `FLEX_DATA_TRANSFER_BUFFER_SIZE`, default
+//! 8 x 4 MiB): past the first `COUNT` chunks, `pool.wait_dequeue()` hands back a
+//! buffer only once its chunk has COMPLETED on the card, so a large write's launch
+//! returns with at most the pool's ~32 MiB still in flight — however big the
+//! transfer. The park B pays is exactly that residual window: card runs measured
+//! ~1.6 ms at 64 MiB AND ~1.6 ms at 512 MiB, i.e. ~32 MiB draining at the card's
+//! ~20 GB/s DMA rate. That size-independence is the signature of the edge waiting
+//! out what is ACTUALLY outstanding at launch-return, not the nominal transfer.
+//! 512 MiB is here for the assertion surface (67M words checked) and for a B
+//! submission (~107 ms pin+submit) that dwarfs the park, so the tracked launch
+//! reads as park + submission, cleanly separated.
 //!
 //! Host buffers are byte slices end to end (the `Stream::h2d`/`d2h` slice-length law):
 //! patterns are built as `u64` words flattened to bytes, and the readback is compared
@@ -37,8 +45,9 @@ use std::time::{Duration, Instant};
 use anyhow::anyhow;
 use scratchy_target_spyre::runtime::{DevAddr, HwError, Stream};
 
-/// 512 MiB — see the module doc: big enough that A's DMA stays in flight for ~15 ms
-/// after its launch returns, so B's park is unmistakable against launch noise.
+/// 512 MiB — see the module doc: the park B pays is the DmaBufPool's bounded residual
+/// (~32 MiB), so the size buys assertion surface (67M words) and a B submission that
+/// dwarfs the park, not a longer park.
 const SIZE_BYTES: usize = 512 * 1024 * 1024;
 
 fn pattern_bytes(xor: u64) -> Vec<u8> {
@@ -176,14 +185,19 @@ fn main() -> anyhow::Result<()> {
     );
 
     // The number the leg exists to print: the tracked B's launch had to park out the
-    // slice of A's write that was still in flight, the control B's launch did not —
-    // the difference IS the park. `saturating_sub` because at 512 MiB the park is
-    // ~8x the ~3 ms launch noise (the module doc's sizing argument), but a delta
-    // printed as zero would still be an honest report, never a panic.
+    // slice of A's write that was still in flight when A's launch returned, the
+    // control B's launch did not — the difference IS the park. The module doc's
+    // DmaBufPool argument pins its expected magnitude at the pool's depth (~32 MiB),
+    // NOT at the transfer size: card runs measured the same ~1.6 ms at 64 MiB and at
+    // 512 MiB. `saturating_sub` keeps a noise-negative delta an honest zero, never a
+    // panic.
     let park = b_launch_tracked.saturating_sub(b_launch_untracked);
+    let pool_depth = flex_rs::flex_config::RuntimeConfig::data_transfer_buffer_count().value()
+        * flex_rs::flex_config::RuntimeConfig::data_transfer_buffer_size().value();
     println!(
         "[hazard-concurrency] park delta: tracked B launch − control B launch = {park:?} \
-         (the slice of A's in-flight write the edge closed)"
+         (A's still-in-flight residual at launch-return; the DmaBufPool caps it at \
+         {pool_depth} bytes of chunks, however big the transfer)"
     );
 
     println!("[hazard-concurrency] LEG PASSED");
