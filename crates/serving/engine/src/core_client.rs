@@ -325,6 +325,7 @@ impl InprocClient {
         request.block_annotations = ec_request.block_annotations;
         request.seal = ec_request.seal;
         request.volatile = ec_request.volatile;
+        request.cache_breakpoints = ec_request.cache_breakpoints;
 
         self.engine.add_request(request);
         Ok(())
@@ -573,6 +574,7 @@ mod tests {
             block_annotations: None,
             seal: false,
             volatile: false,
+            cache_breakpoints: Vec::new(),
         }
     }
 
