@@ -8,7 +8,7 @@
 //! cargo run --release --example hazard_concurrency --features spyre-hw
 //! ```
 //!
-//! Two rounds over the same 64 MiB device buffer:
+//! Two rounds over the same 512 MiB device buffer:
 //!
 //! - **Round 1 (tracked)**: stream A H2D-writes a new pattern; the moment A's launch
 //!   returns — its op registered with the tracker and its DMA in flight — stream B, on
@@ -22,18 +22,24 @@
 //!   caller's obligation; the round only REPORTS what the racing read saw (old, new,
 //!   or torn) — it cannot assert it, by design.
 //!
+//! 512 MiB is not arbitrary: the card moves a 64 MiB transfer in ~2 ms (~35 GB/s), so
+//! a small buffer leaves A's write in flight for less than the run-to-run noise of the
+//! ~11 ms pin+submit that dominates every launch. 512 MiB keeps A's write outstanding
+//! for ~15 ms after its launch returns — B's park then stands out of the noise as the
+//! tracked-vs-control launch delta the leg prints at the end.
+//!
 //! Host buffers are byte slices end to end (the `Stream::h2d`/`d2h` slice-length law):
 //! patterns are built as `u64` words flattened to bytes, and the readback is compared
-//! word-wise through `chunks_exact(8)` — no pointer reinterpretation anywhere.
+//! word-wise through `as_chunks::<8>()` — no pointer reinterpretation anywhere.
 
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use scratchy_target_spyre::runtime::{DevAddr, HwError, Stream};
 
-/// 64 MiB — big enough that A's DMA stays in flight for milliseconds after its
-/// launch returns, so B's park (round 1) is unambiguous in the timings.
-const SIZE_BYTES: usize = 64 * 1024 * 1024;
+/// 512 MiB — see the module doc: big enough that A's DMA stays in flight for ~15 ms
+/// after its launch returns, so B's park is unmistakable against launch noise.
+const SIZE_BYTES: usize = 512 * 1024 * 1024;
 
 fn pattern_bytes(xor: u64) -> Vec<u8> {
     (0..SIZE_BYTES / 8)
@@ -131,7 +137,7 @@ fn main() -> anyhow::Result<()> {
     .map_err(|e| anyhow!("alloc: {e}"))?;
 
     // ── Round 1: tracked OP_ORDERING streams — the RAW edge must order them. ──
-    let (_b_launch_tracked, _t_a, readback) = run_round(true, &addr)?;
+    let (b_launch_tracked, _t_a, readback) = run_round(true, &addr)?;
     let mismatches: usize = words(&readback)
         .enumerate()
         .map(|(i, got)| usize::from(got != pattern_word(i, NEW_XOR)))
@@ -167,6 +173,17 @@ fn main() -> anyhow::Result<()> {
     println!(
         "[hazard-concurrency] round 2 (control, untracked): B launch {b_launch_untracked:?} \
          (no park — submission only); the racing read saw {saw}"
+    );
+
+    // The number the leg exists to print: the tracked B's launch had to park out the
+    // slice of A's write that was still in flight, the control B's launch did not —
+    // the difference IS the park. `saturating_sub` because at 512 MiB the park is
+    // ~8x the ~3 ms launch noise (the module doc's sizing argument), but a delta
+    // printed as zero would still be an honest report, never a panic.
+    let park = b_launch_tracked.saturating_sub(b_launch_untracked);
+    println!(
+        "[hazard-concurrency] park delta: tracked B launch − control B launch = {park:?} \
+         (the slice of A's in-flight write the edge closed)"
     );
 
     println!("[hazard-concurrency] LEG PASSED");
