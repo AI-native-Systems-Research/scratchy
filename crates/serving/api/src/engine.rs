@@ -32,7 +32,8 @@ fn take_cache_breakpoints(text: String) -> (String, Vec<usize>) {
     }
     (kept, marks)
 }
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::panic::AssertUnwindSafe;
+use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
@@ -46,7 +47,7 @@ use scratchy_core_common::{
 use scratchy_serving_engine::core_client::EngineCoreClient;
 use scratchy_serving_engine::engine_core::StepOutcome;
 use scratchy_serving_engine::executor::{Executor, ModelRunnerOutput};
-use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -121,7 +122,7 @@ enum ControlMessage {
     Abort(Vec<String>),
 }
 
-/// Bundled arguments for `spawn_step_loop_inner` / `spawn_step_loop_async`.
+/// Bundled arguments for `step_loop_sync` / `step_loop_async`.
 struct StepLoopArgs {
     client: Box<dyn EngineCoreClient + Send>,
     request_rx: mpsc::UnboundedReceiver<EngineCoreRequest>,
@@ -129,8 +130,45 @@ struct StepLoopArgs {
     control_rx: mpsc::UnboundedReceiver<ControlMessage>,
     requests: Arc<Mutex<HashMap<String, RequestState>>>,
     notify: Arc<Notify>,
-    alive: Arc<AtomicBool>,
     no_progress_timeout: Duration,
+}
+
+/// Where the background step loop is in its life.
+#[derive(Clone, Debug)]
+enum StepLoop {
+    /// Not spawned yet.
+    Pending,
+    Running,
+    /// Gone for good, and every request it was serving has been failed.
+    Ended(StepLoopEnd),
+}
+
+/// How the step loop ended. While anything holds the engine its channels stay open, so either
+/// way the engine is dead: nothing will answer a request again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StepLoopEnd {
+    /// It returned: its channels closed, or its executor thread exited.
+    Exited,
+    /// It panicked, with this message.
+    Panicked(String),
+}
+
+impl std::fmt::Display for StepLoopEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exited => f.write_str("exited"),
+            Self::Panicked(message) => write!(f, "panicked: {message}"),
+        }
+    }
+}
+
+/// What a caught panic said: its payload, when that is the usual string.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|message| message.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a payload that is not a string".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -366,9 +404,9 @@ pub struct AsyncEngine {
     generation_defaults: scratchy_core_common::sampling::GenerationDefaults,
     /// Whether async scheduling is enabled (overlap GPU execution with CPU scheduling).
     async_scheduling: bool,
-    /// Set to `true` when the step loop is running; cleared on exit.
-    /// Checked by `poll_until_done` to detect a dead step loop.
-    step_loop_alive: Arc<AtomicBool>,
+    /// Where the step loop is. `poll_until_done` reads it to see a dead loop, and the server
+    /// watches it to shut down when the loop ends, since nothing can then be served.
+    step_loop: Arc<watch::Sender<StepLoop>>,
     /// Resolved multimodal processor handle. `None` for text-only.
     /// Built at startup from `scratchy_vision::MmMetadata` declared by
     /// the per-arch crate; carries the placeholder token id, size
@@ -415,7 +453,7 @@ impl AsyncEngine {
             default_chat_template_kwargs: None,
             generation_defaults: Default::default(),
             async_scheduling: false,
-            step_loop_alive: Arc::new(AtomicBool::new(false)),
+            step_loop: Arc::new(watch::Sender::new(StepLoop::Pending)),
             #[cfg(feature = "multimodal")]
             mm_processor: None,
             is_pooling: false,
@@ -1665,10 +1703,9 @@ impl AsyncEngine {
             .take()
             .expect("spawn_step_loop called twice");
 
-        let alive = Arc::clone(&self.step_loop_alive);
-        // Set alive BEFORE spawning to avoid a race where poll_until_done
-        // sees alive=false before the spawned task starts.
-        alive.store(true, Ordering::Release);
+        // Running BEFORE spawning, so poll_until_done never takes a loop that hasn't started
+        // yet for a dead one.
+        self.step_loop.send_replace(StepLoop::Running);
 
         let args = StepLoopArgs {
             client,
@@ -1677,14 +1714,83 @@ impl AsyncEngine {
             control_rx,
             requests: Arc::clone(&self.requests),
             notify: Arc::clone(&self.notify),
-            alive,
             no_progress_timeout: self.no_progress_timeout,
         };
+        let requests = Arc::clone(&self.requests);
+        let notify = Arc::clone(&self.notify);
+        let state = Arc::clone(&self.step_loop);
         if self.async_scheduling {
             info!("Async scheduling enabled — overlapping GPU execution with CPU scheduling");
-            Self::spawn_step_loop_async(args)
+            tokio::spawn(Self::run_to_end(
+                Self::step_loop_async(args),
+                requests,
+                notify,
+                state,
+            ))
         } else {
-            Self::spawn_step_loop_inner(args)
+            tokio::spawn(Self::run_to_end(
+                Self::step_loop_sync(args),
+                requests,
+                notify,
+                state,
+            ))
+        }
+    }
+
+    /// Run a step loop to its end, however it ends, then fail every request it was still
+    /// serving and say that it ended. A panic in the loop — a detokenizer slicing inside a
+    /// character took one down in #576 — unwinds past the loop's own exit path, and a loop
+    /// that returns leaves its requests in the map. Either way they waited on a loop that was
+    /// gone: a stream on a sender nothing would send on again, and a server whose graceful
+    /// shutdown waited on that connection forever (#587).
+    async fn run_to_end(
+        step_loop: impl Future<Output = ()>,
+        requests: Arc<Mutex<HashMap<String, RequestState>>>,
+        notify: Arc<Notify>,
+        state: Arc<watch::Sender<StepLoop>>,
+    ) {
+        let end = {
+            let mut step_loop = std::pin::pin!(step_loop);
+            std::future::poll_fn(|cx| {
+                match std::panic::catch_unwind(AssertUnwindSafe(|| step_loop.as_mut().poll(cx))) {
+                    Ok(poll) => poll.map(|()| StepLoopEnd::Exited),
+                    Err(panic) => Poll::Ready(StepLoopEnd::Panicked(panic_message(&*panic))),
+                }
+            })
+            .await
+        }; // The loop drops here, and its engine client with it.
+        match &end {
+            StepLoopEnd::Exited => info!("The engine step loop exited"),
+            StepLoopEnd::Panicked(_) => error!("The engine step loop {end}"),
+        }
+        Self::fail_requests(
+            &mut *requests.lock().await,
+            &format!("the engine step loop {end}"),
+            |_| true,
+        );
+        state.send_replace(StepLoop::Ended(end));
+        notify.notify_waiters(); // Wake any poll_until_done waiters so they see the dead loop.
+    }
+
+    /// How the step loop ended, once it has.
+    pub fn step_loop_end(&self) -> Option<StepLoopEnd> {
+        match &*self.step_loop.borrow() {
+            StepLoop::Ended(end) => Some(end.clone()),
+            StepLoop::Pending | StepLoop::Running => None,
+        }
+    }
+
+    /// Resolves when the step loop ends: the engine is dead then, and can serve nothing again.
+    pub async fn step_loop_ended(&self) -> StepLoopEnd {
+        let mut state = self.step_loop.subscribe();
+        loop {
+            if let StepLoop::Ended(end) = &*state.borrow_and_update() {
+                return end.clone();
+            }
+            state
+                .changed()
+                .await
+                .expect("the engine holds its step loop's state");
         }
     }
 
@@ -1745,8 +1851,8 @@ impl AsyncEngine {
         }
     }
 
-    /// Internal: actually spawn the step loop with the client.
-    fn spawn_step_loop_inner(args: StepLoopArgs) -> tokio::task::JoinHandle<()> {
+    /// The step loop, one step at a time.
+    fn step_loop_sync(args: StepLoopArgs) -> impl Future<Output = ()> + Send + 'static {
         let StepLoopArgs {
             mut client,
             mut request_rx,
@@ -1754,10 +1860,9 @@ impl AsyncEngine {
             mut control_rx,
             requests,
             notify,
-            alive,
             no_progress_timeout,
         } = args;
-        tokio::spawn(async move {
+        async move {
             let mut last_progress = Instant::now();
             loop {
                 // 0. Drain pending embedding requests (synchronous, bypasses scheduler).
@@ -1928,9 +2033,7 @@ impl AsyncEngine {
                     }
                 }
             }
-            alive.store(false, Ordering::Release);
-            notify.notify_waiters(); // Wake any poll_until_done waiters so they see the dead loop.
-        })
+        }
     }
 
     /// Async scheduling step loop: overlaps GPU execution with CPU work.
@@ -1938,7 +2041,7 @@ impl AsyncEngine {
     /// The executor is moved to a dedicated OS thread. The tokio task handles
     /// scheduling, output processing, and request drain concurrently with
     /// GPU execution.
-    fn spawn_step_loop_async(args: StepLoopArgs) -> tokio::task::JoinHandle<()> {
+    fn step_loop_async(args: StepLoopArgs) -> impl Future<Output = ()> + Send + 'static {
         let StepLoopArgs {
             mut client,
             mut request_rx,
@@ -1946,7 +2049,6 @@ impl AsyncEngine {
             mut control_rx,
             requests,
             notify,
-            alive,
             no_progress_timeout,
         } = args;
         // Take the executor out of the client for the dedicated thread.
@@ -1965,7 +2067,7 @@ impl AsyncEngine {
             .spawn(move || executor_thread_loop(executor, sched_rx, model_tx))
             .expect("failed to spawn executor thread");
 
-        tokio::spawn(async move {
+        async move {
             // Pre-scheduling with deferred finalization:
             //
             // GPU: ─execute(N)───────────────────────┬─execute(N+1)──
@@ -1987,7 +2089,7 @@ impl AsyncEngine {
             let mut awaits_step = false;
             let mut last_progress = Instant::now();
 
-            loop {
+            'step: loop {
                 // 0. Drain pending embedding requests.
                 while let Ok(embed_req) = embed_rx.try_recv() {
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -1999,7 +2101,7 @@ impl AsyncEngine {
                         let _ = embed_req.reply.send(Err(ServeError::Internal(
                             "executor thread shut down".into(),
                         )));
-                        continue;
+                        break 'step;
                     }
                     let result = reply_rx
                         .await
@@ -2054,7 +2156,8 @@ impl AsyncEngine {
                                 .await
                                 .is_err()
                             {
-                                break; // Executor thread exited.
+                                // The executor thread exited: nothing will run a step again.
+                                break 'step;
                             }
                             gpu_in_flight += 1;
                             awaits_step = speculative;
@@ -2147,6 +2250,7 @@ impl AsyncEngine {
                                     let _ = embed_req.reply.send(Err(ServeError::Internal(
                                         "executor thread shut down".into(),
                                     )));
+                                    break 'step;
                                 } else {
                                     let result = reply_rx.await.unwrap_or(Err(
                                         ServeError::Internal("embed reply lost".into()),
@@ -2197,12 +2301,9 @@ impl AsyncEngine {
                 notify.notify_waiters();
             }
 
-            alive.store(false, Ordering::Release);
-            notify.notify_waiters(); // Wake any poll_until_done waiters so they see the dead loop.
-
             // Shutdown: drop the sender so the executor thread exits.
             let _ = sched_tx.send(ExecutorWork::Shutdown).await;
-        })
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2322,8 +2423,8 @@ impl AsyncEngine {
             // fires between our check and our await, we still catch it.
             let notified = self.notify.notified();
 
-            // Check if the step loop is still alive.
-            if !self.step_loop_alive.load(Ordering::Acquire) {
+            // Check if the step loop is still running.
+            if !matches!(*self.step_loop.borrow(), StepLoop::Running) {
                 // Step loop has exited — check one more time for results,
                 // then error out if the request isn't done.
                 let mut reqs = self.requests.lock().await;
@@ -5421,8 +5522,46 @@ mod tests {
         }
     }
 
-    fn make_failing_engine(async_scheduling: bool) -> AsyncEngine {
-        let executor = Box::new(FailingExecutor);
+    // -----------------------------------------------------------------------
+    // PanickingExecutor — panics in execute_model
+    // -----------------------------------------------------------------------
+
+    /// An executor whose forward pass panics: the engine dies mid-request, as a detokenizer
+    /// slicing inside a character took it down in #576.
+    struct PanickingExecutor;
+
+    impl scratchy_serving_engine::executor::Executor for PanickingExecutor {
+        fn execute_model(
+            &mut self,
+            _scheduler_output: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
+        ) -> scratchy_serving_engine::error::EngineResult<
+            scratchy_serving_engine::executor::ModelRunnerOutput,
+        > {
+            panic!("simulated forward pass panic")
+        }
+
+        fn initialize_cache(
+            &mut self,
+            _num_gpu_blocks: usize,
+            _num_cpu_blocks: usize,
+        ) -> scratchy_serving_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn determine_available_memory(
+            &mut self,
+        ) -> scratchy_serving_engine::error::EngineResult<Vec<usize>> {
+            Ok(vec![1024 * 16 * 1024])
+        }
+
+        fn shutdown(&mut self) {}
+
+        fn is_sleeping(&self) -> bool {
+            false
+        }
+    }
+
+    fn make_engine_on(executor: Box<dyn Executor>, async_scheduling: bool) -> AsyncEngine {
         let mut config = make_engine_config();
         config.async_scheduling = async_scheduling;
         let client = Box::new(InprocClient::new(config, executor));
@@ -5570,11 +5709,125 @@ mod tests {
         );
     }
 
+    /// A step loop that dies — its forward pass panics — ends the requests it was serving. A
+    /// dead loop left a stream waiting on a sender nothing would send on again, and a server's
+    /// graceful shutdown waiting on that connection forever (#587). The sync loop panics itself;
+    /// the async one loses its executor thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_dead_step_loop_ends_its_requests() {
+        for async_scheduling in [false, true] {
+            let engine = Arc::new(make_engine_on(
+                Box::new(PanickingExecutor),
+                async_scheduling,
+            ));
+            engine.spawn_step_loop();
+
+            let (_, _, mut rx) = engine
+                .chat_completion_stream(make_chat_request())
+                .await
+                .expect("stream starts");
+            let last = tokio::time::timeout(Duration::from_secs(10), async {
+                let mut last = None;
+                while let Some(delta) = rx.recv().await {
+                    last = Some(delta);
+                }
+                last
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("async={async_scheduling}: the dead loop left the stream open")
+            });
+            assert_eq!(
+                last.and_then(|d| d.finish_reason),
+                Some(FinishReason::Abort),
+                "async={async_scheduling}: the stream's last delta says why it ended"
+            );
+
+            // And the loop says it ended, which is what shuts a server down.
+            let end = tokio::time::timeout(Duration::from_secs(10), engine.step_loop_ended())
+                .await
+                .unwrap_or_else(|_| panic!("async={async_scheduling}: the end was never said"));
+            let expected = if async_scheduling {
+                StepLoopEnd::Exited // its executor thread is the one that panicked
+            } else {
+                StepLoopEnd::Panicked("simulated forward pass panic".to_string())
+            };
+            assert_eq!(end, expected, "async={async_scheduling}");
+            assert_eq!(engine.step_loop_end(), Some(expected));
+            assert!(
+                engine.requests.lock().await.is_empty(),
+                "async={async_scheduling}"
+            );
+        }
+    }
+
+    /// A server whose engine dies ends by itself, with the engine's error. Left up, it answered
+    /// every request with a 500 and held its port, and a SIGTERM's graceful shutdown waited
+    /// forever on the stream the dead engine had been serving (#587) — here, a real HTTP one.
+    #[cfg(feature = "serve")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_server_ends_when_its_engine_dies() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let engine = Arc::new(make_engine_on(Box::new(PanickingExecutor), false));
+        engine.spawn_step_loop();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a free port")
+            .port();
+        let state = Arc::new(crate::server::AppState {
+            engine,
+            config: crate::server::ServerConfig {
+                bind_address: format!("127.0.0.1:{port}"),
+                ..Default::default()
+            },
+            is_pooling: false,
+            scratchy_core_config: None,
+            requests_served: std::sync::atomic::AtomicU64::new(0),
+        });
+
+        let stream = async {
+            let mut conn = loop {
+                match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                    Ok(conn) => break conn,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            };
+            let body = r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+            let request = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            conn.write_all(request.as_bytes())
+                .await
+                .expect("request sent");
+            let mut response = String::new();
+            conn.read_to_string(&mut response)
+                .await
+                .expect("response read");
+            response
+        };
+        let (served, response) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(crate::server::serve(state), stream)
+        })
+        .await
+        .expect("the server outlived its engine, or its stream did");
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("[DONE]"), "the stream ends: {response}");
+        let err = served.expect_err("a dead engine ends its server with an error");
+        assert!(
+            err.to_string().contains("simulated forward pass panic"),
+            "{err}"
+        );
+    }
+
     /// Test that a forward pass failure in the **sync** step loop aborts the
     /// request and returns an error instead of hanging forever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_sync_loop_aborts_on_executor_error() {
-        let engine = Arc::new(make_failing_engine(false));
+        let engine = Arc::new(make_engine_on(Box::new(FailingExecutor), false));
         engine.spawn_step_loop();
 
         let request = make_chat_request();
@@ -5605,7 +5858,7 @@ mod tests {
     /// request and returns an error instead of hanging forever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_async_loop_aborts_on_executor_error() {
-        let engine = Arc::new(make_failing_engine(true));
+        let engine = Arc::new(make_engine_on(Box::new(FailingExecutor), true));
         engine.spawn_step_loop();
 
         let request = make_chat_request();

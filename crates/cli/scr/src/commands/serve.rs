@@ -253,14 +253,14 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         scratchy_core_config: Some(scratchy_core_config_snapshot),
         requests_served: std::sync::atomic::AtomicU64::new(0),
     });
-    scratchy_serving_api::server::serve(app_state)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let served = scratchy_serving_api::server::serve(app_state).await;
 
     // `serve` returned because a graceful-shutdown signal (SIGTERM/Ctrl-C)
-    // fired. `app_state` (holding the engine `Arc`) was consumed by `serve`,
-    // so the request senders are now dropped. Stop the engine step loop and
-    // WAIT for it to unwind: dropping the step task's `EngineCoreClient` runs
+    // fired, or because the engine died: then `served` is that error, and the
+    // process exits non-zero. `app_state` (holding the engine `Arc`) was
+    // consumed by `serve`, so the request senders are now dropped. Stop the
+    // engine step loop and WAIT for it to unwind: dropping the step task's
+    // `EngineCoreClient` runs
     // `InprocClient::Drop -> executor.shutdown() -> worker.shutdown()`, which
     // ends the Metal residency set and releases the system-wired GPU memory
     // deterministically. Without this wait the process can exit before that
@@ -268,5 +268,5 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     step_handle.abort();
     let _ = step_handle.await;
 
-    Ok(())
+    served.map_err(|e| anyhow::anyhow!("{e}"))
 }
