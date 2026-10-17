@@ -6485,11 +6485,14 @@ fn recurrent_conv(
     if p.spec_drafts > 0 {
         bindings.push(runtime(RuntimeBindingKind::GdnConvLanes { layer }, 8));
     }
-    // The no-race contract's second half: a verify step's rows (drafts + 1) must all sit in
-    // block 0, so only the thread that reads the lane's checkpoint (a replay's seed) writes it.
+    // The no-race contract: the block must cover the seed window (kernel − 1 entries), so
+    // blocks past a sequence's head seed from `x` alone and never read the seed ring, and a
+    // verify step's rows (drafts + 1), so only the thread that reads the lane's checkpoint
+    // (a replay's seed) writes it.
     assert!(
-        GDN_CONV_BLOCK > p.spec_drafts,
-        "the conv's token block must cover a verify step's rows (drafts + 1)"
+        p.gdn_conv_kernel <= GDN_CONV_BLOCK + 1 && GDN_CONV_BLOCK > p.spec_drafts,
+        "the conv's token block must cover the seed window (kernel - 1) and a verify step's \
+         rows (drafts + 1)"
     );
     if let Some((slice, bias)) = sliced {
         constants.extend(slice.constants(2));
@@ -6524,23 +6527,13 @@ fn recurrent_conv(
     }
 }
 
-/// The conv shader's register-window ceiling (`GDN_CONV_KMAX` in `gdn_conv1d_varlen.metal`): the
-/// seed a block-0 thread reads is at most this many entries. Both sides must agree.
-const GDN_CONV_KMAX: u32 = 8;
-
 /// The conv's tokens a thread owns (`GDN_CONV_BLOCK`, its baked constant slot 6): the token-block
 /// parallelism of `gdn_conv1d_varlen` — the grid's Z is the step's rows over it, each thread
-/// walking its block with the causal window in registers. Locked to at least the seed window's
-/// ceiling (`GDN_CONV_KMAX` − 1, asserted here) and, per model in [`recurrent_conv`], at least a
-/// verify step's rows: block 0 is then the one thread that reads the seed ring and the one that
-/// writes the new ring, and no other threadgroup touches either — the kernel's no-race contract.
-const GDN_CONV_BLOCK: u32 = {
-    assert!(
-        32 >= GDN_CONV_KMAX - 1,
-        "the conv's block must own the whole seed window"
-    );
-    32
-};
+/// walking its block with the causal window in registers. Locked per model in [`recurrent_conv`]
+/// to at least the seed window (`kernel − 1` entries) and a verify step's rows: block 0 is then
+/// the one thread that reads the seed ring and the one that writes the new ring, blocks past a
+/// sequence's head seed from `x` alone, and only block 0 touches the draft lanes.
+const GDN_CONV_BLOCK: u32 = 32;
 
 /// The scans' constant slot of the drafts each sequence of a verify step carries
 /// (`GDN_SCAN_DRAFTS`): what a plain step's kernels, which keep no draft state, do not take.

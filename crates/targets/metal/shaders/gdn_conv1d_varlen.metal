@@ -148,15 +148,20 @@ template <typename T>
 
   const int t_end = metal::min(t0 + int(GDN_CONV_BLOCK), seqlen);
 
-  // Seed the causal window: the last `state_len` entries of `[seed ++ x]` before row t0 — the
-  // seed's own entries while t0 still sits inside it, `x` rows past it.
+  // Seed the causal window: the last `state_len` entries of `[seed ++ x]` before row t0. Block
+  // 0's is the seed itself, kept in `seed` for the ring write below — a replay's seed lives in
+  // the draft lane this step's own checkpoints overwrite, so the ring must not re-read it from
+  // memory. A block past the head (t0 >= state_len, the block lock) seeds from `x` alone.
+  float seed[GDN_CONV_KMAX];
   float window[GDN_CONV_KMAX];
   for (uint ki = 0; ki < state_len; ki++) {
-    uint p = uint(t0) + ki;
-    window[ki] = p < state_len
-                     ? (start == 1u ? 0.0f : start_ptr[p])
-                     : float(x[(uint(base) + p - state_len) * GDN_CONV_X_STRIDE
-                               + GDN_CONV_IN_OFFSET + d]);
+    if (t0 == 0) {
+      seed[ki] = start == 1u ? 0.0f : start_ptr[ki];
+      window[ki] = seed[ki];
+    } else {
+      window[ki] = float(x[(uint(base + t0) + ki - uint(state_len)) * GDN_CONV_X_STRIDE
+                           + GDN_CONV_IN_OFFSET + d]);
+    }
   }
 
   // Walk the block's tokens; the window slides through registers, a save storing its snapshot
@@ -191,13 +196,13 @@ template <typename T>
 
   // Only block 0 — the thread that read the seed — writes the new ring, so no other
   // threadgroup touches the seed ring at all: the ring is the last `state_len` entries of
-  // `[seed ++ x]` (the CORRECT general shift), which block 0 recomputes straight from `x`
-  // (~`state_len` extra loads) since its own window only covers its block's rows.
-  if (tgid.z == 0) {
+  // `[seed ++ x]` (the CORRECT general shift), block 0's seed still in registers and the rest
+  // re-read from `x` (~`state_len` loads) since its own window only covers its block's rows.
+  if (t0 == 0) {
     for (uint ki = 0; ki < state_len; ki++) {
       int p = int(seqlen) + int(ki) - int(state_len);
       state_ptr[ki] = p < 0
-                          ? (start == 1u ? 0.0f : start_ptr[uint(seqlen) + ki])
+                          ? seed[uint(seqlen) + ki]
                           : float(x[(uint(base) + uint(p)) * GDN_CONV_X_STRIDE
                                     + GDN_CONV_IN_OFFSET + d]);
     }

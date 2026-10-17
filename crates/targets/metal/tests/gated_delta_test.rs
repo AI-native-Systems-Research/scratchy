@@ -1640,6 +1640,145 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
     );
 }
 
+/// A one-draft verify step of TWO rows (shorter than the kernel's seed window) replayed from a
+/// checkpoint with its draft kept, then a slot step reading the ring the replay wrote: the ring's
+/// seed entries must be the checkpoint's, not the lane row this step's own checkpoints overwrote
+/// — the replay's seed IS that lane row, so a ring write that re-reads it from memory picks up
+/// this step's inputs instead. The multi-sequence MTP serving shape (one draft per sequence).
+#[test]
+fn gdn_conv1d_varlen_ring_survives_a_short_replayed_verify() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
+
+    let (conv_dim, kernel) = (32usize, 4usize);
+    let entry_len = conv_dim * (kernel - 1);
+    let rows = CheckpointRows(1);
+    let lane = DraftLanes::new(rows, 2).and_then(|l| l.lanes().nth(1));
+    let lane_entries = rows.rows();
+    // Rows 0..4 the prompt, 4 the verify step's token (its draft rejected), 5..6 the replayed
+    // verify (token and draft, both kept), 7 the slot step that reads the ring.
+    let t_full = 8usize;
+    let x_full = fill(t_full * conv_dim);
+    let w = fill(conv_dim * kernel);
+    let out_full = conv1d_ref(&x_full, &w, conv_dim, kernel, t_full);
+    let x_rejected = [&x_full[4 * conv_dim..5 * conv_dim], &rejected(conv_dim)[..]].concat();
+
+    let key = PipelineKey::new(
+        "gdn_conv1d_varlen",
+        "gdn_conv1d_varlen_f32",
+        vec![
+            ConstantValue::uint(0, conv_dim as u32),
+            ConstantValue::uint(1, kernel as u32),
+            ConstantValue::uint(5, u32::from(rows.0)),
+            // The lock's minimum (the seed window is 3 entries): the 4-token prompt walks two
+            // blocks, the 2-row verify steps one — the replay's seed branch of the ring write.
+            ConstantValue::uint(6, 3),
+        ],
+    );
+    let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
+    let w_buf = buf_f32(&device, &w);
+    let state_buf = buf_zero_f32(&device, 2 * entry_len);
+    let lanes_buf = buf_zero_f32(&device, 2 * lane_entries * entry_len);
+    let unread_bias = buf_zero_f32(&device, 1);
+    let run = |x: &[f32], start: GdnStart, checkpoint_rows: CheckpointRows| -> Option<Vec<f32>> {
+        let num_tokens = x.len() / conv_dim;
+        let out_buf = buf_zero_f32(&device, x.len());
+        let x_buf = buf_f32(&device, x);
+        let cu = buf_i32(&device, &[0, num_tokens as i32]);
+        let si = buf_slots(&device, &[1]);
+        let step = buf_u32(
+            &device,
+            &[code(start, checkpoint_rows, RecordArea::First, lane)],
+        );
+        common::dispatch_threadgroups(
+            &device,
+            &pipeline,
+            &[
+                &out_buf,
+                &x_buf,
+                &w_buf,
+                &state_buf,
+                &cu,
+                &si,
+                &step,
+                &unread_bias,
+                &lanes_buf,
+            ],
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: num_tokens.div_ceil(3),
+            },
+            MTLSize {
+                width: 1,
+                height: conv_dim,
+                depth: 1,
+            },
+        )
+        .then(|| read_f32(&out_buf, x.len()))
+    };
+
+    // The prompt, four rows fresh (two blocks).
+    let Some(_) = run(
+        &x_full[..4 * conv_dim],
+        GdnStart::Fresh,
+        CheckpointRows::NONE,
+    ) else {
+        return;
+    };
+    // A verify step of two rows whose draft is rejected: its token is kept, checkpointed in the
+    // lane at row 0 — the row the next step replays from.
+    let Some(verify) = run(&x_rejected, GdnStart::Slot, rows) else {
+        return;
+    };
+    assert_close(
+        &verify[..conv_dim],
+        &out_full[4 * conv_dim..5 * conv_dim],
+        "verify kept row",
+    );
+    // The replayed verify, two rows (the seed window is 3), resumed from the kept row's
+    // checkpoint with its own draft kept — the bug's regime: the ring write's seed entries come
+    // from the lane row this step's checkpoints overwrite.
+    let Some(replay) = run(
+        &x_full[5 * conv_dim..7 * conv_dim],
+        GdnStart::Checkpoint(0),
+        rows,
+    ) else {
+        return;
+    };
+    assert_close(
+        &replay,
+        &out_full[5 * conv_dim..7 * conv_dim],
+        "replayed verify rows",
+    );
+    // The slot step reads the ring the replay wrote: its row is the reference's seventh, whose
+    // window reaches the replay's seed — a ring that picked up this step's inputs instead is
+    // wrong here.
+    let Some(next) = run(
+        &x_full[7 * conv_dim..],
+        GdnStart::Slot,
+        CheckpointRows::NONE,
+    ) else {
+        return;
+    };
+    assert_close(&next, &out_full[7 * conv_dim..], "slot row after replay");
+    let slot0 = read_f32(&state_buf, entry_len);
+    assert!(
+        slot0.iter().all(|&v| v == 0.0),
+        "slot 0's entry was written"
+    );
+    let lane0 = read_f32(&lanes_buf, lane_entries * entry_len);
+    assert!(
+        lane0.iter().all(|&v| v == 0.0),
+        "lane 0's checkpoints were written"
+    );
+}
+
 /// A verify step whose drafts are all kept: the slot holds the state it started from, so the next
 /// step replays all its rows (`Checkpoint(drafts)`) — bit for bit the rows run without drafts.
 #[test]
