@@ -1983,8 +1983,6 @@ impl AsyncEngine {
                 //    already running (or about to run) the next batch, so
                 //    this CPU work overlaps with GPU execution.
                 if let Some((prev_sched, prev_output)) = deferred.take() {
-                    // The last step sent is finalized once none is in flight.
-                    awaits_step &= gpu_in_flight > 0;
                     match client.finalize_step(&prev_sched, &prev_output) {
                         Ok(outputs) => {
                             route_step_outputs(&requests, outputs).await;
@@ -2067,6 +2065,11 @@ impl AsyncEngine {
                             break;
                         }
                     }
+                    // The last step sent has come back once none is in flight, so nothing is left
+                    // to wait on. Here, not in step 2's finalize: a failed step is never
+                    // finalized, and a wait it set would block step 3 for good (#477). Step 2
+                    // still finalizes a returned step before step 3 schedules the next.
+                    awaits_step &= gpu_in_flight > 0;
 
                     // Drain requests that arrived while waiting for GPU.
                     while let Ok(ec_request) = request_rx.try_recv() {
@@ -5566,6 +5569,38 @@ mod tests {
                 || err_msg.contains("step loop exited"),
             "unexpected error: {err_msg}"
         );
+    }
+
+    /// A failed speculative step (an MTP head plans drafts for every request it admits) is
+    /// never finalized, so the async loop must stop waiting on it: the next request is
+    /// scheduled — and fails — at once, not left pending for the no-progress watchdog (#477).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_async_loop_schedules_again_after_a_speculative_step_fails() {
+        let mut config = make_engine_config();
+        config.async_scheduling = true;
+        config.use_spec_decode = true;
+        config.proposer_config = Some(scratchy_serving_engine::spec_decode::ProposerConfig::Mtp(
+            scratchy_serving_engine::spec_decode::MtpProposerConfig {
+                num_speculative_tokens: 2,
+                max_seqs: 2,
+                max_model_len: 4096,
+            },
+        ));
+        let client = Box::new(InprocClient::new(config, Box::new(FailingExecutor)));
+        let mut engine = AsyncEngine::new(client, "test-model".to_string(), 4096);
+        engine.set_async_scheduling(true);
+        let engine = Arc::new(engine);
+        engine.spawn_step_loop();
+
+        for attempt in ["first", "second"] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                engine.chat_completion(make_chat_request()),
+            )
+            .await;
+            let inner = result.unwrap_or_else(|_| panic!("{attempt} request was never scheduled"));
+            inner.expect_err("expected error from failing executor");
+        }
     }
 
     #[test]
