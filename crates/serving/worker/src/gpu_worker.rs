@@ -1775,7 +1775,10 @@ impl MetalWorker {
                 None => PastFirst::Chained,
                 Some(parallel) => {
                     let fail = |why: String| {
-                        ExecutorError::WorkerInit(format!("MTP head: {}: {why}", parallel.mask_hidden))
+                        ExecutorError::WorkerInit(format!(
+                            "MTP head: {}: {why}",
+                            parallel.mask_hidden
+                        ))
                     };
                     let (bytes, dtype, _) = (draft_weights.take_to_cpu_bytes(parallel.mask_hidden))
                         .map_err(|e| fail(e.to_string()))?;
@@ -2016,7 +2019,12 @@ impl MetalWorker {
             layout.bytes,
         );
         let rope_rows = |positions: &[u32]| model.metal_rope_rows(positions);
-        layout.write(&drafting.chain, &buffer.0, rope_rows, self.mask_hidden.as_deref());
+        layout.write(
+            &drafting.chain,
+            &buffer.0,
+            rope_rows,
+            self.mask_hidden.as_deref(),
+        );
         Ok(Some((layout, buffer, behind)))
     }
 
@@ -4215,7 +4223,13 @@ impl ChainLayout {
         let rows = token_rows.iter().map(|&(row, _)| row);
         let window = rows.clone().min().unwrap_or(0)..rows.max().map_or(0, |r| r + 1);
         let (n, drafted, k, passes, rows) = match drafting.map(|d| &d.chain) {
-            Some(c) => (c.num_seqs(), c.drafted.len(), c.drafts(), c.passes(), c.rows()),
+            Some(c) => (
+                c.num_seqs(),
+                c.drafted.len(),
+                c.drafts(),
+                c.passes(),
+                c.rows(),
+            ),
             None => (0, 0, 0, 0, 1),
         };
         let hidden_bytes = hidden * 2;

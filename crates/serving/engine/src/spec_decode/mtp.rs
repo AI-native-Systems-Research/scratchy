@@ -680,7 +680,8 @@ impl MtpDrafter {
             })
             .collect();
         // Placeholders: the last pass's positions at the most drafts accepted.
-        let newest = (seqs.iter()).map(|&[step_row, rows, _]| step.positions[step_row as usize] + rows - 1);
+        let newest =
+            (seqs.iter()).map(|&[step_row, rows, _]| step.positions[step_row as usize] + rows - 1);
         let (positions, input_ids): (Vec<u32>, Vec<u32>) = match past_first {
             PastFirst::Chained => {
                 let last = newest.map(|p| match target_kv {
@@ -694,7 +695,9 @@ impl MtpDrafter {
                 (after.collect(), vec![mask_token; n * rows])
             }
         };
-        let seqused_k = (positions.chunks(rows)).map(|seq| seq[rows - 1] + 1).collect();
+        let seqused_k = (positions.chunks(rows))
+            .map(|seq| seq[rows - 1] + 1)
+            .collect();
         Chain {
             seqs,
             drafted,

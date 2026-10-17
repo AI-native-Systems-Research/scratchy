@@ -14712,11 +14712,7 @@ pub fn emit_model(
     // The width of those rows (the `TargetHidden` extern's, `target_hidden_size`): its target's
     // hidden size — which a drafter of its own width (Gemma 4's assistant) reads and exports at,
     // its passes chained at — or the width it declares (P-EAGLE's three target hidden states).
-    let target_hidden_width: u64 = model
-        .bounds
-        .get("target_hidden_size")
-        .copied()
-        .unwrap_or(0);
+    let target_hidden_width: u64 = model.bounds.get("target_hidden_size").copied().unwrap_or(0);
     let (
         vision_freqs_bytes_lit,
         vision_pixels_bytes_lit,

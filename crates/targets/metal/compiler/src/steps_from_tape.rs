@@ -1962,7 +1962,12 @@ impl Recording<'_> {
             }
             L::LoadRows { source, width } => {
                 let width = st::ActivationWidth::of_cols(width);
-                em(S::LoadRows(out()?, source, width), &[], &[out()?], Vec::new())
+                em(
+                    S::LoadRows(out()?, source, width),
+                    &[],
+                    &[out()?],
+                    Vec::new(),
+                )
             }
             L::Elementwise(E::Gelu) => unary(&|i, o, w| S::Activation(i, o, w, Act::GeluTanh))?,
             L::Elementwise(E::QuickGelu) => {
