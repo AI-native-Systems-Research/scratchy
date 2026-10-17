@@ -1895,9 +1895,9 @@ pub fn compile_carrier(
             /// Its `spec_drafts` and `spec_verify_rows`.
             spec: [u64; 2],
             reads_target_kv: bool,
-            /// A parallel-drafting head's mask token and the tensor of its mask rows' target
-            /// hidden states.
-            parallel: Option<(u64, String)>,
+            /// A parallel-drafting head's mask token, the config key naming it, and the tensor of
+            /// its mask rows' target hidden states.
+            parallel: Option<(u64, String, String)>,
         }
         let head_facts: std::collections::BTreeMap<String, HeadFacts> = solved
             .iter()
@@ -1933,7 +1933,7 @@ pub fn compile_carrier(
                                 sm.mod_name, p.mask_token_key
                             )
                         });
-                        (token, p.mask_hidden.clone())
+                        (token, p.mask_token_key.clone(), p.mask_hidden.clone())
                     }),
                 };
                 (sm.mod_name.clone(), facts)
@@ -2029,12 +2029,13 @@ pub fn compile_carrier(
                         ..
                     } = first;
                     let parallel = match parallel {
-                        Some((token, hidden)) => {
+                        Some((token, key, hidden)) => {
                             let token = u32::try_from(*token).expect("a mask token fits u32");
                             quote! {
                                 ::core::option::Option::Some(
                                     ::scratchy_forward_compiler::ParallelDrafting {
                                         mask_token: #token,
+                                        mask_token_key: #key,
                                         mask_hidden: #hidden,
                                     }
                                 )

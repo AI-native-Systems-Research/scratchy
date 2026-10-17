@@ -61,6 +61,9 @@ pub struct HeadRegistration {
 pub struct ParallelDrafting {
     /// The token each such row embeds (P-EAGLE's `ptd_token_id`).
     pub mask_token: u32,
+    /// The config key naming it, which every checkpoint of the head carries: what tells one from a
+    /// model of the architecture it registers under (P-EAGLE's config reads `LlamaForCausalLM`).
+    pub mask_token_key: &'static str,
     /// The checkpoint tensor holding the target hidden states each such row reads
     /// (`[target_hidden_size]`, P-EAGLE's `mask_hidden`).
     pub mask_hidden: &'static str,
@@ -105,10 +108,16 @@ impl HeadRegistration {
     }
 }
 
-/// The registration of the multi-token-prediction head `arch_hint` names, if it names one.
-pub fn draft_head(arch_hint: &str) -> Option<HeadRegistration> {
+/// The registration of the multi-token-prediction head a draft checkpoint's config names: its
+/// `arch_hint`, and — for a head registering under an architecture other models share (P-EAGLE's
+/// `LlamaForCausalLM`) — the key only its configs carry (`has_key`), so a plain draft model of that
+/// architecture is no head.
+pub fn draft_head(arch_hint: &str, has_key: &dyn Fn(&str) -> bool) -> Option<HeadRegistration> {
     registered()
-        .find(|(hf_arches, _)| hf_arches.contains(&arch_hint))
+        .find(|(hf_arches, head)| {
+            hf_arches.contains(&arch_hint)
+                && head.parallel.is_none_or(|p| has_key(p.mask_token_key))
+        })
         .map(|(_, head)| head)
 }
 

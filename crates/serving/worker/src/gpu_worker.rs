@@ -1766,7 +1766,8 @@ impl MetalWorker {
         draft_weights.set_target_dtype(GpuDType::BF16);
         // A multi-token-prediction head carries no embedding or lm_head: lend it the target's,
         // from the target store's refs (same mmap → no second upload).
-        if let Some(head) = scratchy_forward_compiler::draft_head(&draft_arch) {
+        let has_key = |key: &str| draft_hf_config.extra.contains_key(key);
+        if let Some(head) = scratchy_forward_compiler::draft_head(&draft_arch, &has_key) {
             use ::scratchy_serving_engine::spec_decode::PastFirst;
             // A parallel-drafting head's placeholder target hidden row is a tensor of its
             // checkpoint its forward never binds: the worker lays it out for the rows that read it.
