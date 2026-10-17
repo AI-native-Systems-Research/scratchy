@@ -2982,14 +2982,17 @@ impl QueueCapacitySource for SenlibQueueCapacity {
 /// rather than pre-combined because the two real call shapes need them
 /// combined differently:
 ///
-/// - A field with its own companion offset (DMA's `dmva`, compute's
-///   `bootstrap`) needs `base_paddr` alone as the XLAT entry and
-///   `offset_bytes` in that companion field — hardware computes
+/// - A field with its own companion offset (DMA's `dmva`) needs
+///   `base_paddr` alone as the XLAT entry and `offset_bytes` in that
+///   companion field — hardware computes
 ///   `dmpa = dmpa_allocs[seg] + seg_offset(dmva)` (port of the real
 ///   `TranslateDmvaToDmpa`, `control_block_stream.cpp`: `dmpa =
 ///   dmpa_allocs[seg_id] + seg_offset`, fed by `getDmvaAddress`'s
 ///   `SegmentByteOffset_todmva(seg_id, chunk.addr.offset)` — the offset is
-///   the *chunk's own*, never folded into the XLAT base itself).
+///   the *chunk's own*, never folded into the XLAT base itself). Compute's
+///   `bootstrap` is NOT such a field: the real `CreateGraphFreeCompute`
+///   takes `PROG_OFFSET_BASE + bootstrap_offset`, independent of the
+///   program chunk's placement (see `build_compute_cb`'s correction note).
 /// - A field with NO companion offset (compute's per-tensor XLAT slots,
 ///   which the kernel addresses at a fixed segment with no offset
 ///   parameter of their own) needs the full absolute address —
@@ -3014,8 +3017,8 @@ struct ResolvedChunk {
 }
 
 impl ResolvedChunk {
-    /// For fields with their own companion offset (DMA's `dmva`, compute's
-    /// `bootstrap`): XLAT base alone, no offset folded in.
+    /// For fields with their own companion offset (DMA's `dmva`): XLAT base
+    /// alone, no offset folded in.
     fn xlat_base(&self) -> DevicePhysicalAddress {
         self.base_paddr
     }
@@ -3024,9 +3027,14 @@ impl ResolvedChunk {
     fn xlat_absolute(&self) -> DevicePhysicalAddress {
         DevicePhysicalAddress(self.base_paddr.0 + self.offset_bytes)
     }
-    /// `dmva`/`bootstrap`-style companion field: this chunk's own offset,
-    /// optionally with an additional intra-segment offset added on top
-    /// (`build_compute_cb`'s `bootstrap_offset`).
+    /// The DMA companion field: this chunk's own offset, optionally with the
+    /// intra-transfer piece offset added on top. The only non-zero-extra
+    /// caller is `build_dma_cb_chunk`'s piece offset — `submitDma`'s
+    /// `while(remaining != 0)` loop advances it by whole
+    /// `data_transfer_buffer_size()` pieces (4 MiB default), so the sum is
+    /// always 128-byte aligned, which `Flits::from_bytes`'s release-mode
+    /// guard demands. (Compute's bootstrap does NOT ride this method — see
+    /// the struct doc and `build_compute_cb`'s correction note.)
     fn dmva(&self, extra_offset_bytes: u64) -> VirtualAddressSbf {
         VirtualAddressSbf::new(
             self.segment,
@@ -5102,7 +5110,7 @@ mod resolve_single_chunk_tests {
     /// `SegmentByteOffset_todmva(seg_id, chunk.addr.offset)` and
     /// `buildDmaControlBlocks`'s `translations()[seg_id].SetPaddrBytes(region_id)`
     /// (`pf_runtime_scheduler_utils.cpp`) — the XLAT entry (`xlat_base`) gets
-    /// the region's own base with NO offset folded in, and the DMVA/bootstrap
+    /// the region's own base with NO offset folded in, and the DMVA
     /// companion field (`dmva`) carries this chunk's own byte offset;
     /// hardware adds them back together. Regression test for two bugs this
     /// crate had in turn: first doubling the base into both fields, then
@@ -5147,8 +5155,27 @@ mod resolve_single_chunk_tests {
         assert_eq!(resolved.size, 4096);
     }
 
+    /// The only production caller that passes a non-zero extra offset:
+    /// `build_dma_cb_chunk`'s piece offset, driven by `submitDma`'s
+    /// `while(remaining != 0)` loop — piece offsets advance by whole
+    /// `data_transfer_buffer_size()` pieces (4 MiB default), so the chunk
+    /// offset plus the piece offset is always flit-aligned.
+    ///
+    /// This test was previously `dmva_adds_extra_offset_for_bootstrap`,
+    /// pinning `dmva(bootstrap_offset)` — a call shape this crate
+    /// deliberately abandoned in `build_compute_cb` (it folded the program
+    /// chunk's own offset into the bootstrap PC and missed
+    /// `PROG_OFFSET_BASE` entirely; the real C++ takes
+    /// `PROG_OFFSET_BASE + bootstrap_offset` with no chunk dependency —
+    /// `pf_runtime_scheduler_utils.cpp`'s `CreateGraphFreeCompute` call).
+    /// Its numbers (`0x100 + 0x20 = 288`) also violated the
+    /// flit-alignment law pinned below, so the test could never have run
+    /// past `Flits::from_bytes`'s guard — before #561 it only ever
+    /// "passed" by failing `resolve_single_chunk`'s containment check first
+    /// (the fixture's 4096 B region didn't contain [0x100, 0x1100)); #561
+    /// fixed the fixture and unmasked the panic (issue #536's count).
     #[test]
-    fn dmva_adds_extra_offset_for_bootstrap() {
+    fn dmva_adds_the_dma_piece_offset_on_top_of_the_chunks_own() {
         let resolver = FixedResolver {
             segment: 7,
             base: DevicePhysicalAddress(0x2_0000_0000),
@@ -5165,12 +5192,46 @@ mod resolve_single_chunk_tests {
         let addr = CompositeAddress::from_chunk(chunk);
         let resolved = resolve_single_chunk(&resolver, &addr).unwrap();
 
-        let bootstrap = resolved.dmva(0x20);
+        // A second 4 MiB piece of a transfer staged at this chunk: the
+        // piece offset the chunking loop hands `build_dma_cb_chunk`.
+        let dmva = resolved.dmva(4 * 1024 * 1024);
+        assert_eq!(dmva.segment(), 7);
         assert_eq!(
-            bootstrap.offset(),
-            Flits::from_bytes(0x100 + 0x20),
-            "bootstrap = chunk offset + caller's bootstrap_offset"
+            dmva.offset(),
+            Flits::from_bytes(0x100 + 4 * 1024 * 1024),
+            "dmva = chunk offset + the DMA piece's own offset within the transfer"
         );
+    }
+
+    /// The sum must be flit-aligned, and `Flits::from_bytes` refuses it in
+    /// RELEASE mode on purpose: `>> 7` would silently truncate a misaligned
+    /// byte count to a different address while the XLAT length beside it is
+    /// computed from the untruncated value — the transfer then runs past
+    /// its window and the card answers `0xa35e RAS::PCI::BusFence`, a fault
+    /// with no host-side statement of which transfer caused it. IBM's own
+    /// C++ has this validator COMMENTED OUT, so this assert is the only
+    /// enforcement anywhere. Every real caller is aligned (placements come
+    /// from `align128`; piece offsets are whole 4 MiB pieces), so this pins
+    /// a property that holds, not a new one.
+    #[test]
+    #[should_panic(expected = "not 128-byte aligned")]
+    fn dmva_refuses_a_misaligned_offset_sum() {
+        let resolver = FixedResolver {
+            segment: 7,
+            base: DevicePhysicalAddress(0x2_0000_0000),
+            region_size: crate::address::ByteSize(8192),
+        };
+        let chunk = Chunk::new(
+            LogicalAddress::new(RegionId(1), ByteOffset(0x100)),
+            crate::address::ByteSize(4096),
+            DomainId(0),
+        );
+        let addr = CompositeAddress::from_chunk(chunk);
+        let resolved = resolve_single_chunk(&resolver, &addr).unwrap();
+
+        // 0x100 + 0x20 = 288 B: not a whole number of flits. This is the
+        // exact sum the old bootstrap-framed test asked for.
+        let _ = resolved.dmva(0x20);
     }
 
     /// Regression test for a real hardware bug: `build_dma_cb` conflated the
