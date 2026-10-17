@@ -1186,6 +1186,67 @@ impl WorkPlan {
     }
 }
 
+/// ⭐⭐⭐ THE WHOLE-DXP EAR ENVELOPE — the largest per-core KERNEL slab (bytes) a
+/// [`MatmulStaging::Dxp`] matmul may route.
+///
+/// MEASURED, one card, at the gemma-4 lm_heads (all `[m, hidden]·[hidden, 262144]`; the cost
+/// model spends all 32 core-factors on the vocabulary at one row (`{in:1, mb:1, out:32}`) and
+/// splits `{in:2, mb:2, out:8}` at two — the divisions read off the baked descriptors — so the
+/// per-core KERNEL slab doubles with the row count: per-core `in` halves while per-core `out`
+/// quadruples, and the `mb` split never divides the kernel to relieve it):
+///   * 31b (hidden 5376), the two-row decode form: `2688 × 32768 × 2 B = 176.2 MB/core` — dxp
+///     REFUSES the whole-dxp descriptor, `DtException: EAR overflow detected,
+///     MutableAddrSplitting.cpp:814`, at `sdsc_5` of the decode suffix's group (the failing
+///     bundle's input is `2×5376`; the 31b bake dies there, 23 s in, first bundle write). The
+///     one-row form spends all 32 core-factors on `out` and its slab halves to
+///     `5376 × 8192 × 2 B = 88.1 MB/core` — inside the envelope. The vendor's own predicate is
+///     `max_mutable > 2^EAR_bits·bytesPerStick·8/elem_bits` with
+///     `max_mutable = const_offset + Σ(num_iters−2)·coeff` (`initMASData` :714-745) — a reach
+///     this crate cannot compute from its input schema, so the boundary is pinned by
+///     measurement, not derived.
+///   * 12b (hidden 3840), the same two-row form — the SAME `{in:2, mb:2, out:8}` division, ONE
+///     whole-dxp descriptor in the dump: `1920 × 32768 × 2 B = 125.8 MB/core` — the largest
+///     slab any whole-dxp form of the 12b routes, and the 12b is card-proven coherent under
+///     whole-dxp staging.
+///   * 26b-A4B (hidden 2816), the same two-row form: `1408 × 32768 × 2 B = 92.3 MB/core` —
+///     whole-dxp, bakes green.
+///
+/// The probe that matters: flipping EVERY matmul to [`MatmulStaging::FrontendTrips`] baked the
+/// 31b `RC=0` and ran it coherent on card (greedy France, 64 tokens, fluent), so the trips are
+/// the known-good staging past the envelope — and the placement is DEAD as a discriminator (the
+/// 26b's layer matmuls run at the same ~80 GiB arena top where the 31b's lm_head overflows), so
+/// the slab SIZE is the fact this envelope reads. The limit sits inside the tightest measured
+/// bracket with margin on both sides: the 12b's two-row slab — the same division the 31b's
+/// refused descriptor rode — is accepted at 125.8 MB/core, 25 % below the line, and the 31b's is
+/// refused at 176.2 MB/core, 11 % above it. (The 31b's one-row form is also accepted, at
+/// 88.1 MB/core — consistent, but weaker evidence: a different division, farther from the line.)
+pub const WHOLE_DXP_EAR_KERNEL_SLAB_LIMIT: u64 = 150 * 1024 * 1024;
+
+/// The per-core KERNEL (weight) slab one whole-dxp matmul routes, in bytes:
+/// `per_core_extent("in") · per_core_extent("out") · batch · operand word` — the KERNEL term of
+/// `matmul_lx_resident_generic`, the operand the `mb` split never divides. SEALED (private
+/// field, no public constructor): the only mint is [`KernelSlab::of_plan`], so the formula lives
+/// in one place and [`MatmulStaging::of`] compares a value that cannot be hand-multiplied into
+/// existence at a call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct KernelSlab(u64);
+
+impl KernelSlab {
+    /// Read the slab off the division the whole-dxp form would run. `df` is the OPERAND
+    /// residency format (an fp8 W8A8 matmul hands 1 byte here), not the stick basis.
+    pub fn of_plan(plan: &WorkPlan, df: Df) -> KernelSlab {
+        let k = plan.per_core_extent("in") as u64;
+        let out = plan.per_core_extent("out") as u64;
+        let batch = plan.extent("x").max(plan.extent("y")).max(1) as u64;
+        KernelSlab(k * out * batch * df.word_length() as u64)
+    }
+
+    /// The slab, in bytes.
+    pub const fn bytes(self) -> u64 {
+        self.0
+    }
+}
+
 /// ⭐⭐⭐ WHO STAGES A MATMUL's OPERANDS THROUGH LX — dxp itself, or this frontend's LX-fit time trips.
 ///
 /// torch-spyre never time-tiles a dense matmul in its frontend. It hands DeepTools ONE SuperDSC per matmul
@@ -1209,9 +1270,13 @@ impl WorkPlan {
 ///     the moved cells.
 ///   * dxp baked every shape of both models — none needed the frontend's fit.
 ///
-/// ⛔ ONLY AN UNBATCHED fp16 MATMUL TAKES IT. A `y`-batched matmul keeps the frontend trips: its kernel
-/// is per batch and its forms are the card-proven ones. fp8 keeps them too, because its untiled form has
-/// not been measured on card.
+/// ⛔ ONLY AN UNBATCHED fp16 MATMUL TAKES IT, AND ONLY INSIDE THE EAR ENVELOPE. A `y`-batched matmul
+/// keeps the frontend trips: its kernel is per batch and its forms are the card-proven ones. fp8 keeps
+/// them too, because its untiled form has not been measured on card. And an unbatched fp16 matmul whose
+/// per-core KERNEL slab ([`KernelSlab`]) passes [`WHOLE_DXP_EAR_KERNEL_SLAB_LIMIT`] keeps them as well:
+/// dxp refuses the whole-dxp descriptor there with the EAR overflow (`MutableAddrSplitting.cpp:814`,
+/// the 31b lm_head's measured 176.2 MB/core), and the trips are the staging the flip-everything probe
+/// baked `RC=0` and ran coherent on card for the same shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MatmulStaging {
     /// ONE descriptor over the whole per-core slab, HBM operands, no frontend trips; dxp stages it.
@@ -1221,9 +1286,14 @@ pub enum MatmulStaging {
 }
 
 impl MatmulStaging {
-    /// The staging a matmul of `batch` kernel batches over `df` operands takes.
-    pub const fn of(batch: u32, df: Df) -> MatmulStaging {
-        if batch <= 1 && matches!(df, Df::Fp16) {
+    /// The staging a matmul of `batch` kernel batches over `df` operands takes, when its whole-dxp
+    /// form would route a per-core KERNEL slab of `slab`.
+    ///
+    /// ⛔ THE EAR ENVELOPE: `batch <= 1` and fp16 admit dxp staging only INSIDE
+    /// [`WHOLE_DXP_EAR_KERNEL_SLAB_LIMIT`] — past it the whole-dxp descriptor is refused at dxp's
+    /// mutable-address split, so the matmul takes the frontend's LX-fit time trips instead.
+    pub const fn of(batch: u32, df: Df, slab: KernelSlab) -> MatmulStaging {
+        if batch <= 1 && matches!(df, Df::Fp16) && slab.bytes() <= WHOLE_DXP_EAR_KERNEL_SLAB_LIMIT {
             MatmulStaging::Dxp
         } else {
             MatmulStaging::FrontendTrips
