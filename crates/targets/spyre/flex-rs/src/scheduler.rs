@@ -6605,10 +6605,14 @@ mod hazard_edge_tests {
             waiter.join().expect("waiter must not panic").is_ok(),
             "the waiter's launch itself must succeed"
         );
+        // The fire CONSUMED the producer's parked completion, so exactly
+        // one completion is parked now: b's own — it crossed to the
+        // backend only after the producer completed (had it never
+        // crossed, this would be 0).
         assert_eq!(
             pending(&sched),
-            2,
-            "b's op crossed only after the producer completed"
+            1,
+            "b's op must have crossed and parked its own completion"
         );
 
         // b's own completion — let Drop's synchronize drain.
