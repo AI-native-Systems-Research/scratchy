@@ -1717,6 +1717,12 @@ struct PendingRequestData {
     batch_id: u64,
     cb_idx: u64,
     pipeline: Option<PipelineId>,
+    /// `Some(direction)` when this slot's CB is a DMA — whichever pipeline it
+    /// rides (the #544 crossings ride COMPUTE); `None` for compute and fill
+    /// CBs. Recorded into the telemetry ring on completion so per-op
+    /// attribution can tell a compute-pipeline DMA crossing (preamble H2D,
+    /// logits D2H — belongs to no op) from an op's own compute CB.
+    dma: Option<DmaDirection>,
     queuing_mode: QueuingMode,
     issue_time_point: Option<Instant>,
     launch_time_point: Option<Instant>,
@@ -1759,6 +1765,7 @@ impl PendingRequestSlot {
                 batch_id: 0,
                 cb_idx: 0,
                 pipeline: None,
+                dma: None,
                 queuing_mode: QueuingMode::Regular,
                 issue_time_point: None,
                 launch_time_point: None,
@@ -1997,12 +2004,21 @@ impl ResponseWorker {
     /// tags are handed to the CB builder instead of being stamped into
     /// already-built CBs — the same tags, the same CBs, assigned by the
     /// ResponseWorker under the same `submission_mtx_`.
+    ///
+    /// `dma` is scratchy's own, not a port: `Some(direction)` when the CBs
+    /// being queued are a DMA — whichever pipeline it rides — so the
+    /// completion path can record it in the telemetry ring next to the
+    /// pipeline. The vendor's `QueueCbs` had no such fact because its
+    /// telemetry phase attributed by pipeline alone, which stopped
+    /// separating ops from DMA crossings when the crossings moved onto the
+    /// compute pipeline.
     pub fn queue_cbs(
         &self,
         cb_fn: CallbackFn,
         num_cbs: u64,
         pipeline: PipelineId,
         qm: QueuingMode,
+        dma: Option<DmaDirection>,
         build: impl FnOnce(&[ResponseTag]) -> Result<Vec<ControlBlockWire>, SchedulerError>,
     ) -> Result<(), SchedulerError> {
         let submission_lock = self
@@ -2010,7 +2026,7 @@ impl ResponseWorker {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         self.precheck(num_cbs, qm)?;
-        let batch = self.prepare_cbs(&cb_fn, num_cbs, pipeline, qm, build)?;
+        let batch = self.prepare_cbs(&cb_fn, num_cbs, pipeline, qm, dma, build)?;
         debug_assert_eq!(batch.len() as u64, num_cbs);
         let launch_result = self.launch_cbs(batch);
         drop(submission_lock);
@@ -2077,6 +2093,7 @@ impl ResponseWorker {
         num_cbs: u64,
         pipeline: PipelineId,
         qm: QueuingMode,
+        dma: Option<DmaDirection>,
         build: impl FnOnce(&[ResponseTag]) -> Result<Vec<ControlBlockWire>, SchedulerError>,
     ) -> Result<PreparedBatch, SchedulerError> {
         // "Acquire tags from the available pool (may block if pool
@@ -2124,6 +2141,7 @@ impl ResponseWorker {
                 data.batch_id = batch_id;
                 data.cb_idx = i as u64;
                 data.pipeline = Some(pipeline);
+                data.dma = dma;
                 data.queuing_mode = qm;
                 data.callback_fn = Some(cb_fn.clone());
                 data.node_name.clear();
@@ -2359,7 +2377,7 @@ impl ResponseWorker {
         tags_to_be_returned[i] = ResponseTag(local_tag as u32);
         slot.set_state(PendingRequestState::Succeeded);
 
-        let (id, pipeline) = {
+        let (id, pipeline, dma) = {
             let mut data = slot.data.lock().unwrap_or_else(|e| e.into_inner());
             data.completion_time_point = Some(now);
             // "Add the CB sent to driver timestamp... Try launch_time_point
@@ -2369,7 +2387,7 @@ impl ResponseWorker {
                 data.issue_time_point = Some(lt);
             }
             data.response_block = Some(received_response);
-            (data.id, data.pipeline)
+            (data.id, data.pipeline, data.dma)
         };
 
         // The RB's five cycle counts and power word, recorded for whoever drains the telemetry
@@ -2381,6 +2399,7 @@ impl ResponseWorker {
             crate::rb_telemetry::record(crate::rb_telemetry::RbTiming {
                 id,
                 pipeline,
+                dma,
                 rb: received_response,
             });
         }
@@ -2685,7 +2704,7 @@ mod response_credit_tests {
 #[cfg(test)]
 mod response_worker_tests {
     use super::*;
-    use crate::control_block_wire::{RB_NUM_BYTES, ResponseBlockWire};
+    use crate::control_block_wire::{RB_NUM_BYTES, ResponseBlockWire, TS_SECTION};
 
     /// The C++ fixture's loopback mock device.
     struct LoopbackHardware {
@@ -2759,6 +2778,215 @@ mod response_worker_tests {
         .expect("fill CB")
     }
 
+    /// The TS section `MagicLoopback` stamps into every response it hands back — a value no
+    /// other test's loopback produces (theirs are all-zero), so a test that drains the
+    /// process-wide telemetry ring can pick its own entries out of whatever other tests'
+    /// completions funneled into the same ring meanwhile.
+    const OWNED_TS: [u32; 5] = [
+        0x0549_0001,
+        0x0549_0002,
+        0x0549_0003,
+        0x0549_0004,
+        0x0549_0005,
+    ];
+
+    /// `LoopbackHardware`, except the responses carry [`OWNED_TS`] — same completion path
+    /// (`queue_control_blocks` echoes one Good response per CB, `receive_responses` drains
+    /// them), which is the path that records into `rb_telemetry`'s ring.
+    struct MagicLoopback {
+        queued: Mutex<VecDeque<ResponseBlockWire>>,
+    }
+
+    impl MagicLoopback {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                queued: Mutex::new(VecDeque::new()),
+            })
+        }
+    }
+
+    fn magic_loopback_response(tag: ResponseTag) -> ResponseBlockWire {
+        let word = (tag.0 as u64) << 8;
+        let mut bytes = [0u8; RB_NUM_BYTES];
+        bytes[0..8].copy_from_slice(&word.to_le_bytes());
+        for (i, ts) in OWNED_TS.iter().enumerate() {
+            bytes[TS_SECTION + i * 4..TS_SECTION + i * 4 + 4].copy_from_slice(&ts.to_le_bytes());
+        }
+        ResponseBlockWire::from_bytes(&bytes)
+    }
+
+    impl HardwareSubmit for MagicLoopback {
+        fn queue_control_blocks(
+            &self,
+            _pipeline: PipelineId,
+            cbs: &[ControlBlockWire],
+        ) -> Result<(), SchedulerError> {
+            let mut queued = self.queued.lock().unwrap_or_else(|e| e.into_inner());
+            for cb in cbs {
+                queued.push_back(magic_loopback_response(cb.tag()));
+            }
+            Ok(())
+        }
+
+        fn receive_responses(
+            &self,
+            out: &mut [ResponseBlockWire],
+            _min_count: usize,
+        ) -> (u64, ResponseCredit) {
+            let mut queued = self.queued.lock().unwrap_or_else(|e| e.into_inner());
+            let n = queued.len().min(out.len());
+            for slot in out.iter_mut().take(n) {
+                *slot = queued.pop_front().expect("checked above");
+            }
+            (n as u64, ResponseCredit::received(n as u64))
+        }
+
+        fn free_responses(&self, _pipeline: PipelineId, _credit: PipelineCredit) {}
+    }
+
+    /// The #544 regression, at the wiring `rb_attribute` zips against: the preamble-H2D and
+    /// logits-D2H ride the COMPUTE pipeline, so a forward's ring holds op CBs AND non-op DMA
+    /// CBs under one `PipelineId::Compute`. Per-op attribution zips the Compute entries
+    /// (id-sorted) 1:1 against the op launch sequence — before the `dma` marker it saw four
+    /// entries against three recorded launches and skipped attribution on EVERY forward. This
+    /// test drives the real door (`queue_cbs` → `prepare_cbs` → completion → telemetry ring)
+    /// with a forward-shaped mix — one multi-CB op batch, one compute-pipeline H2D crossing,
+    /// one async-pipeline H2D — and asserts the exact predicate `rb_attribute` retains on:
+    /// compute CBs that are not DMA crossings, in submission order.
+    #[test]
+    fn compute_pipeline_dma_crossings_do_not_pollute_op_entries() {
+        let hw = MagicLoopback::new();
+        let worker = ResponseWorker::new(hw as Arc<dyn HardwareSubmit>);
+
+        let cbs_done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cbs_done_cb = cbs_done.clone();
+        // `queue_cbs` fires its callback once per COMPLETED CB (the grouping
+        // into one callback per submission is `submit_to_hardware`'s wrapper),
+        // so the three batches below — 3 + 1 + 1 CBs — fire it five times.
+        let cb_fn: CallbackFn = Arc::new(move |_pr: &PendingRequest| {
+            cbs_done_cb.fetch_add(1, Ordering::Release);
+        });
+
+        // The forward's ops: three compute CBs through one multi-CB batch (the
+        // `submit_compute_batch` shape), with the tags captured as the launch loop captures
+        // labels — the ring's id-sorted op entries must line up with these, in this order.
+        let op_tags = Arc::new(Mutex::new(Vec::<ResponseTag>::new()));
+        let op_tags_build = op_tags.clone();
+        worker
+            .queue_cbs(
+                cb_fn.clone(),
+                3,
+                PipelineId::Compute,
+                QueuingMode::Regular,
+                None,
+                |tags| {
+                    op_tags_build
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(tags);
+                    Ok(tags.iter().map(|t| dummy_cb(*t)).collect())
+                },
+            )
+            .expect("QueueCbs failed");
+
+        // The #544 preamble-H2D shape: a DMA submitted on the COMPUTE pipeline.
+        worker
+            .queue_cbs(
+                cb_fn.clone(),
+                1,
+                PipelineId::Compute,
+                QueuingMode::Regular,
+                Some(DmaDirection::HostToDevice),
+                |tags| Ok(tags.iter().map(|t| dummy_cb(*t)).collect()),
+            )
+            .expect("QueueCbs failed");
+
+        // The un-moved shape: the same DMA on its async pipeline, direction still recorded.
+        worker
+            .queue_cbs(
+                cb_fn.clone(),
+                1,
+                PipelineId::AsyncDmaI,
+                QueuingMode::Regular,
+                Some(DmaDirection::HostToDevice),
+                |tags| Ok(tags.iter().map(|t| dummy_cb(*t)).collect()),
+            )
+            .expect("QueueCbs failed");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cbs_done.load(Ordering::Acquire) < 5 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            cbs_done.load(Ordering::Acquire),
+            5,
+            "every completed CB's callback fired (queue_cbs fires per CB)"
+        );
+
+        // Only this test's hardware stamps OWNED_TS; everything else in the process-wide ring
+        // is another test's completions and must not survive the filter.
+        let mut mine: Vec<_> = crate::rb_telemetry::drain()
+            .into_iter()
+            .filter(|e| e.rb.timestamps() == OWNED_TS)
+            .collect();
+        assert_eq!(
+            mine.len(),
+            5,
+            "three op CBs, one compute-pipeline crossing, one async H2D"
+        );
+        mine.sort_unstable_by_key(|e| e.id);
+
+        let compute_crossing = mine
+            .iter()
+            .find(|e| e.pipeline == PipelineId::Compute && e.dma.is_some())
+            .expect("the compute-pipeline crossing is in the ring, marked as a DMA");
+        assert_eq!(compute_crossing.dma, Some(DmaDirection::HostToDevice));
+        let async_dma = mine
+            .iter()
+            .find(|e| e.pipeline == PipelineId::AsyncDmaI)
+            .expect("the async H2D is in the ring");
+        assert_eq!(
+            async_dma.dma,
+            Some(DmaDirection::HostToDevice),
+            "async-pipeline DMAs carry their direction too"
+        );
+        assert_eq!(
+            mine.iter().filter(|e| e.dma.is_some()).count(),
+            2,
+            "exactly the two DMA submissions are marked"
+        );
+
+        // THE REGRESSION: `rb_attribute`'s retain — compute CBs that are not DMA crossings —
+        // must leave exactly the op batch, in submission order, which is what its 1:1 zip
+        // against the launch sequence requires. With the marker missing this predicate cannot
+        // be expressed and the four Compute entries mismatch the three recorded launches.
+        let ops: Vec<_> = mine
+            .iter()
+            .filter(|e| e.pipeline == PipelineId::Compute && e.dma.is_none())
+            .collect();
+        assert_eq!(ops.len(), 3, "exactly the op CBs survive the retain");
+        let drained_op_tags: Vec<u32> = ops.iter().map(|e| e.rb.tag().0).collect();
+        let expected_op_tags: Vec<u32> = op_tags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|t| t.0)
+            .collect();
+        assert_eq!(
+            drained_op_tags, expected_op_tags,
+            "id-sorted op entries reproduce the op batch's submission order"
+        );
+        assert!(
+            ops.iter().map(|e| e.id).max().unwrap() < compute_crossing.id,
+            "the crossing was submitted after the op batch, so it sorts after every op"
+        );
+        assert!(
+            compute_crossing.id < async_dma.id,
+            "submission order across batches is preserved in the ids"
+        );
+        worker.shutdown();
+    }
+
     /// The C++ test's own shape, scaled down for a unit test: many threads
     /// submitting multi-CB batches ("Multi-CB batches widen the PrepareCbs
     /// race window"), then a bounded wait for every callback.
@@ -2799,6 +3027,7 @@ mod response_worker_tests {
                             CBS_PER_BATCH,
                             PipelineId::Compute,
                             QueuingMode::Regular,
+                            None,
                             |tags| Ok(tags.iter().map(|t| dummy_cb(*t)).collect()),
                         )
                         .expect("QueueCbs failed");
@@ -2889,6 +3118,7 @@ mod response_worker_tests {
                                 CBS_PER_BATCH,
                                 PipelineId::Compute,
                                 QueuingMode::Regular,
+                                None,
                                 |tags| Ok(tags.iter().map(|t| dummy_cb(*t)).collect()),
                             )
                             .expect("QueueCbs failed");
@@ -2938,6 +3168,7 @@ mod response_worker_tests {
                         CBS_PER_BATCH,
                         PipelineId::Compute,
                         QueuingMode::Regular,
+                        None,
                         |tags| Ok(tags.iter().map(|t| dummy_cb(*t)).collect()),
                     )
                     .expect("QueueCbs failed");
@@ -2999,6 +3230,7 @@ mod response_worker_tests {
                 4,
                 PipelineId::AsyncDmaI,
                 QueuingMode::Regular,
+                None,
                 |tags| Ok(tags.iter().map(|t| dummy_cb(*t)).collect()),
             )
             .unwrap();
@@ -3093,6 +3325,7 @@ mod response_worker_tests {
                 1,
                 PipelineId::AsyncDmaI,
                 QueuingMode::Regular,
+                None,
                 |tags| Ok(tags.iter().map(|t| dummy_cb(*t)).collect()),
             )
             .expect("QueueCbs failed");
@@ -3281,6 +3514,38 @@ fn resolve_single_chunk(
     })
 }
 
+/// What a `submit_to_hardware` group rides: the pipeline, plus the DMA
+/// direction when the group IS a DMA. `dma` is `Some` only from the
+/// `submit_dma` paths — whichever pipeline the transfer took, the #544
+/// crossings included — so the completion path can record it in the telemetry
+/// ring next to the pipeline; the vendor's submission path carried no such
+/// fact because its telemetry attributed by pipeline alone, which stopped
+/// separating ops from DMA crossings once the crossings moved onto the
+/// compute pipeline.
+#[derive(Debug, Clone, Copy)]
+struct SubmitShape {
+    pipeline: PipelineId,
+    dma: Option<DmaDirection>,
+}
+
+impl SubmitShape {
+    /// A non-DMA group: compute CBs, fill CBs.
+    const fn ops(pipeline: PipelineId) -> Self {
+        Self {
+            pipeline,
+            dma: None,
+        }
+    }
+
+    /// A DMA group riding `pipeline` (async or compute) moving `direction`.
+    const fn dma(pipeline: PipelineId, direction: DmaDirection) -> Self {
+        Self {
+            pipeline,
+            dma: Some(direction),
+        }
+    }
+}
+
 /// Port of `PfRuntimeScheduler::submitToHardware`
 /// (`pf_runtime_scheduler_utils.cpp:493-567`) plus `onCbComplete`
 /// (`:429-491`), which `VfRuntimeScheduler` shares verbatim. The real order is
@@ -3314,11 +3579,12 @@ fn submit_to_hardware(
     state: &Arc<SchedulerState>,
     worker: &Arc<ResponseWorker>,
     cap: &dyn QueueCapacitySource,
-    pipeline: PipelineId,
+    shape: SubmitShape,
     num_cbs: u64,
     callback: CompletionCallback,
     build: impl FnOnce(&[ResponseTag]) -> Result<Vec<ControlBlockWire>, SchedulerError>,
 ) {
+    let pipeline = shape.pipeline;
     if !wait_for_queue_capacity(cap, state, pipeline, num_cbs, USE_DEFAULT_TIMEOUT_MS) {
         return callback(Err(mock_error(&format!(
             "RuntimeScheduler: CbQueueCapacityExceeded (pipeline={pipeline:?}, num_cbs={num_cbs})"
@@ -3370,7 +3636,14 @@ fn submit_to_hardware(
         }
     });
 
-    if let Err(e) = worker.queue_cbs(cb_fn, num_cbs, pipeline, QueuingMode::Regular, build) {
+    if let Err(e) = worker.queue_cbs(
+        cb_fn,
+        num_cbs,
+        pipeline,
+        QueuingMode::Regular,
+        shape.dma,
+        build,
+    ) {
         // `RAS::DEVICE_PF::CbQueueFailed().Throw()`. The C++ throw unwinds out
         // of `submitToHardware` without undoing step 2's increment (which
         // then leaks, but the throw is a RAS fatal there); here the operation
@@ -3866,7 +4139,7 @@ impl PfBackend {
             state,
             self.response_worker(),
             self.capacity.as_ref(),
-            pipeline,
+            SubmitShape::dma(pipeline, dma.direction()),
             1,
             Box::new(move |result| {
                 // The ONE question this callback asks, and it asks it of the
@@ -4046,7 +4319,7 @@ impl SchedulerBackend for PfBackend {
             state,
             self.response_worker(),
             self.capacity.as_ref(),
-            PipelineId::Compute,
+            SubmitShape::ops(PipelineId::Compute),
             1,
             callback,
             |tags| Ok(vec![build_compute_cb(resolver, op, tags[0])?]),
@@ -4070,7 +4343,7 @@ impl SchedulerBackend for PfBackend {
             state,
             self.response_worker(),
             self.capacity.as_ref(),
-            PipelineId::Compute,
+            SubmitShape::ops(PipelineId::Compute),
             ops.len() as u64,
             callback,
             |tags| {
@@ -4105,7 +4378,7 @@ impl SchedulerBackend for PfBackend {
             state,
             self.response_worker(),
             self.capacity.as_ref(),
-            pipeline,
+            SubmitShape::ops(pipeline),
             1,
             callback,
             |tags| Ok(vec![build_fill_cb(resolver, fill, tags[0])?]),
@@ -4261,7 +4534,7 @@ impl SchedulerBackend for VfBackend {
             state,
             self.response_worker(),
             self.capacity.as_ref(),
-            pipeline,
+            SubmitShape::dma(pipeline, dma.direction()),
             1,
             callback,
             |tags| Ok(vec![build_dma_cb(resolver, dma, host_addr, tags[0])?]),
@@ -4278,7 +4551,7 @@ impl SchedulerBackend for VfBackend {
             state,
             self.response_worker(),
             self.capacity.as_ref(),
-            PipelineId::Compute,
+            SubmitShape::ops(PipelineId::Compute),
             1,
             callback,
             |tags| Ok(vec![build_compute_cb(resolver, op, tags[0])?]),
@@ -4298,7 +4571,7 @@ impl SchedulerBackend for VfBackend {
             state,
             self.response_worker(),
             self.capacity.as_ref(),
-            PipelineId::Compute,
+            SubmitShape::ops(PipelineId::Compute),
             ops.len() as u64,
             callback,
             |tags| {
@@ -4330,7 +4603,7 @@ impl SchedulerBackend for VfBackend {
             state,
             self.response_worker(),
             self.capacity.as_ref(),
-            pipeline,
+            SubmitShape::ops(pipeline),
             1,
             callback,
             |tags| Ok(vec![build_fill_cb(resolver, fill, tags[0])?]),

@@ -26,6 +26,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use crate::control_block_wire::ResponseBlockWire;
+use crate::dma::DmaDirection;
 use crate::scheduler::PipelineId;
 
 /// One completed CB's timing facts, as hardware wrote them.
@@ -35,10 +36,19 @@ pub struct RbTiming {
     /// (`ProcessTags`'s `global_pr_id`), so sorting drained entries by `id` reproduces submission
     /// order regardless of the order the pipelines completed in.
     pub id: u64,
-    /// Which pipeline the CB ran on. Compute CBs are the ones a caller can attribute to ops; the
-    /// async-DMA pipelines carry the preamble-H2D / logits-D2H crossings, which are their own
-    /// per-step cost.
+    /// Which pipeline the CB ran on. Compute CBs are the ones a caller can attribute to ops —
+    /// except the DMA crossings that ride the compute pipeline, which [`Self::dma`] names. The
+    /// async-DMA pipelines carry the preamble-H2D / logits-D2H crossings that stay there, which
+    /// are their own per-step cost.
     pub pipeline: PipelineId,
+    /// `Some` on every DMA submission, whichever pipeline it rode — `None` on compute and fill
+    /// submissions. #544 moved the preamble-H2D and logits-D2H crossings onto the COMPUTE
+    /// pipeline, so `pipeline` alone no longer separates op CBs from DMA CBs: a crossing enters
+    /// this record as `Compute` + `Some(direction)`, and per-op attribution (which zips the
+    /// `Compute` entries against the op launch sequence) must exclude it by this field, not by
+    /// pipeline. On the async pipelines the field is direction spelled out; the direction and
+    /// the pipeline agree there by construction (`submit_dma` derives one from the other).
+    pub dma: Option<DmaDirection>,
     /// The decoded response block itself — the vendor's `PendingRequest` carried the RB too, and
     /// this way the card-measured phase accessors
     /// ([`ResponseBlockWire::exec_cmpt_cycles`] and siblings) have exactly one definition. This
@@ -122,11 +132,13 @@ mod tests {
         ring.record(RbTiming {
             id: 1,
             pipeline: PipelineId::Compute,
+            dma: None,
             rb: rb_with([1, 2, 3, 4, 5], 6),
         });
         ring.record(RbTiming {
             id: 2,
             pipeline: PipelineId::AsyncDmaI,
+            dma: Some(DmaDirection::HostToDevice),
             rb: rb_with([0; 5], 0),
         });
         let drained = ring.drain();
@@ -136,11 +148,13 @@ mod tests {
                 RbTiming {
                     id: 1,
                     pipeline: PipelineId::Compute,
+                    dma: None,
                     rb: rb_with([1, 2, 3, 4, 5], 6),
                 },
                 RbTiming {
                     id: 2,
                     pipeline: PipelineId::AsyncDmaI,
+                    dma: Some(DmaDirection::HostToDevice),
                     rb: rb_with([0; 5], 0),
                 },
             ]
@@ -155,6 +169,7 @@ mod tests {
             ring.record(RbTiming {
                 id: i,
                 pipeline: PipelineId::Compute,
+                dma: None,
                 rb: rb_with([0; 5], 0),
             });
         }
