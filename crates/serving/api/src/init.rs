@@ -574,24 +574,11 @@ fn init_cache(
     // Python vLLM: total * util - non_kv_cache). On Metal `total` is further
     // capped at `maxBufferLength` (the real wireable ceiling) and util is
     // applied inside the worker, so the returned value is the FINAL KV budget
-    // — do NOT re-apply utilization here (that double-shrinks KV). Only CPU
+    // — do NOT re-apply utilization here (that double-shrinks KV). Spyre is the
+    // same case on both its tiers (see [`kv_budget_is_prebaked`]). Only CPU
     // gets the returned value as raw free memory and applies util locally.
-    let is_gpu_prebaked = (cfg!(feature = "cuda")
-        && device != "cpu"
-        && (device == "auto" || device.starts_with("cuda")))
-        || (cfg!(feature = "metal") && device != "cpu")
-        // Spyre's `determine_available_memory` is, like metal's, the FINAL KV budget (the
-        // region-capped bytes the paged pool was cut from) — utilization is already baked in by
-        // the worker, or deliberately absent. This backend fell to the CPU branch only because
-        // the triage predates it, and the CPU branch's 50% halving sized the scheduler's
-        // allocator from half a pool: the 2b card run computed 204 blocks against a 544-page
-        // host range.
-        || (cfg!(feature = "spyre-hw") && device != "cpu");
-    let is_cpu = device == "cpu"
-        || (device == "auto"
-            && !cfg!(feature = "cuda")
-            && !cfg!(feature = "metal")
-            && !cfg!(feature = "spyre-hw"));
+    let is_gpu_prebaked = kv_budget_is_prebaked(device, cfg!(feature = "spyre"));
+    let is_cpu = device_is_cpu(device, cfg!(feature = "spyre"));
 
     let (kv_cache_bytes, utilization) = if is_gpu_prebaked {
         // Worker already computed: total * util - non_kv_cache (capped at
@@ -4108,6 +4095,38 @@ fn blocks_within(available_bytes: usize, bytes_per_block: usize) -> usize {
     num_blocks.max(16)
 }
 
+/// ⭐ DOES THIS RUN'S WORKER HAND `init_cache` A FINAL KV BUDGET — one with utilization
+/// already baked in (cuda, metal: `total × util − non_kv_cache`), or one where utilization
+/// is deliberately absent (spyre: the card tier's region-capped pool budget, the emulator
+/// tier's flat host-RAM allowance — different shapes, but the triage question is the same
+/// one: is the worker's number final? For both spyre tiers it is)? For those the returned
+/// number IS the budget and must reach `compute_kv_blocks` whole — re-applying utilization
+/// would double-shrink KV. Only a CPU worker returns raw free memory for the engine to
+/// scale.
+///
+/// The spyre arm tripped on `spyre-hw` alone until the emulator's fall-through was caught
+/// in review: a spyre tier landing in the CPU branch gets its budget halved by that
+/// branch's 50%, which sized the 2b card run's scheduler at 204 blocks against a 544-page
+/// pool. `spyre_backend` is a PARAMETER, not a cfg read, so one unit test can hold every
+/// tier at once; the call site passes the api crate's plain `spyre` feature — the common
+/// parent of `spyre-hw` and `spyre-emu`, so BOTH tiers trip it, never only the card.
+fn kv_budget_is_prebaked(device: &str, spyre_backend: bool) -> bool {
+    (cfg!(feature = "cuda") && device != "cpu" && (device == "auto" || device.starts_with("cuda")))
+        || (cfg!(feature = "metal") && device != "cpu")
+        || (spyre_backend && device != "cpu")
+}
+
+/// Is this run on the CPU worker, whose `determine_available_memory` is raw free memory
+/// the engine scales by utilization? `device == "auto"` is CPU only when NO gpu backend
+/// was compiled in.
+fn device_is_cpu(device: &str, spyre_backend: bool) -> bool {
+    device == "cpu"
+        || (device == "auto"
+            && !cfg!(feature = "cuda")
+            && !cfg!(feature = "metal")
+            && !spyre_backend)
+}
+
 /// Compute the KV-cache block count AND the hybrid SWA layout, if any.
 ///
 /// Both layouts spend the WHOLE KV budget, as vLLM does: the scheduler admits
@@ -4244,6 +4263,31 @@ fn extract_model_name(model_path: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_spyre_tier_hands_init_cache_a_final_budget() {
+        // BOTH spyre tiers — the card AND the emulator — must be prebaked and must never
+        // take the CPU branch. The emulator's budget is a different SHAPE (a flat
+        // host-RAM allowance; no paged pool, no stride, no override — the engine's
+        // dense-row estimate is all it divides by), but the triage question is the same
+        // one and a tier that falls through gets its budget halved by the CPU branch's
+        // 50%. Keyed on the plain `spyre` parent at the call site so neither tier can be
+        // added back without this holding.
+        for device in ["auto", "spyre"] {
+            assert!(
+                kv_budget_is_prebaked(device, true),
+                "the spyre tier must be prebaked (device {device})"
+            );
+            assert!(
+                !device_is_cpu(device, true),
+                "the spyre tier must not take the CPU branch (device {device})"
+            );
+        }
+        // An explicit CPU ask stays CPU even on a spyre build — the worker is chosen by
+        // the factory match on the device string, not by the feature list.
+        assert!(device_is_cpu("cpu", true));
+        assert!(!kv_budget_is_prebaked("cpu", true));
+    }
 
     #[test]
     fn a_recurrent_hybrid_is_prefix_cached_only_with_snapshots() {

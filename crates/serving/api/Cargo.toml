@@ -23,9 +23,12 @@ cuda = ["scratchy-serving-worker/cuda", "scratchy-forward-compiler/cuda", "dep:s
 nccl = ["cuda", "dep:scratchy-serving-transport", "scratchy-target-cuda/nccl", "scratchy-serving-worker/nccl", "scratchy-forward-compiler/nccl"]
 metal = ["scratchy-serving-worker/metal", "scratchy-forward-compiler/metal"]
 spyre = ["scratchy-serving-worker/spyre"]
-# A card, and the emulator — siblings, forwarded to the worker's own tiers.
-spyre-hw = ["scratchy-serving-worker/spyre-hw"]
-spyre-emu = ["scratchy-serving-worker/spyre-emu"]
+# A card, and the emulator — siblings, forwarded to the worker's own tiers. Both also enable
+# the plain `spyre` above (mirroring the worker's own feature tree, where they are its
+# children): the api-side cfg that keys "a spyre backend" — e.g. init_cache's budget triage —
+# must see BOTH tiers, never only the card.
+spyre-hw = ["spyre", "scratchy-serving-worker/spyre-hw"]
+spyre-emu = ["spyre", "scratchy-serving-worker/spyre-emu"]
 guided-decoding = ["scratchy-serving-worker/guided-decoding"]
 multimodal = ["scratchy-core-model/multimodal", "dep:image", "dep:scratchy-vision", "scratchy-forward-compiler/vision", "scratchy-serving-worker/vision"]
 # axum-server is the TLS listener ONLY — the plain-HTTP path binds a
