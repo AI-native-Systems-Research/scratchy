@@ -130,6 +130,34 @@ pub enum HybridKvStores {
     GlobalApart,
 }
 
+/// HOW A WORKER BACKS A HYBRID MODEL'S KV BLOCKS WITH MEMORY — declared by the worker, asked once when
+/// the engine builds the block tracker, like [`HybridKvStores`].
+///
+/// It is what a free block the prefix cache still holds costs against one never used. The tracker hands
+/// out never-used blocks first, so a request that ended keeps its cache while other requests run (#330),
+/// but only as far as that costs no memory the never-used block would not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum KvBacking {
+    /// Every block is backed from the start: a never-used block costs nothing a cached one does not. The
+    /// default.
+    #[default]
+    Allocated,
+    /// A block is backed the first time the pool reaches it, and stays backed — metal's KV stores, which
+    /// take no memory until a step maps them. The worker reports how far after each step
+    /// ([`KvBackedBlocks`]); a never-used block past that would map more, so cached ones go first.
+    OnFirstUse,
+}
+
+/// HOW MANY BLOCKS OF EACH KV STORE A [`KvBacking::OnFirstUse`] WORKER HAS BACKED — IDs below it are
+/// mapped — one count per block ID space, as [`HybridKvStores`] lays them out. Only ever grows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum KvBackedBlocks {
+    /// [`HybridKvStores::Shared`]: the blocks every store holding the shared IDs has backed.
+    Shared(usize),
+    /// [`HybridKvStores::GlobalApart`]: the shared pool's backed blocks, and the global group's store's.
+    GlobalApart { pool: usize, global: usize },
+}
+
 /// ⭐⭐⭐ SLOTS APPENDED SINCE THE REPORT WAS MADE — how far a [`KvExtent`] has aged.
 ///
 /// 🛑 **A REPORT IS A MEASUREMENT OF A PAST STEP, AND UNDER ASYNC SCHEDULING THE STEP BEING SCHEDULED IS

@@ -202,6 +202,20 @@ pub trait Worker: Send {
         scratchy_core_common::HybridKvStores::Shared
     }
 
+    /// How this worker backs a hybrid model's KV blocks with memory, known at `load_model` time like
+    /// [`Self::hybrid_kv_stores`]. A worker that declares [`scratchy_core_common::KvBacking::OnFirstUse`]
+    /// reports what it has backed after every step (`ModelRunnerOutput::kv_backed`).
+    fn kv_backing(&self) -> scratchy_core_common::KvBacking {
+        scratchy_core_common::KvBacking::Allocated
+    }
+
+    /// How many blocks of each KV store this worker has backed with memory, as of the step it last ran:
+    /// `Some` only from a worker that declared [`scratchy_core_common::KvBacking::OnFirstUse`]. The
+    /// executor attaches it to every step's output (`ModelRunnerOutput::kv_backed`).
+    fn kv_backed(&self) -> Option<scratchy_core_common::KvBackedBlocks> {
+        None
+    }
+
     /// ⭐⭐⭐ HOW MANY SNAPSHOTS OF ITS MODEL'S RECURRENT STATE THIS WORKER KEEPS FOR THE PREFIX CACHE
     /// — a CAPABILITY, known once `initialize_cache` has allocated them.
     ///

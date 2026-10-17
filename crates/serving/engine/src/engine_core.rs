@@ -273,6 +273,7 @@ impl EngineCore {
                     stores
                 );
                 tracker.enable_hybrid(num_blocks, groups, stores);
+                tracker = tracker.with_kv_backing(executor.kv_backing());
             }
             // ⭐ AND HOW MANY SNAPSHOTS OF THE MODEL'S RECURRENT STATE IT KEEPS. A Gated-DeltaNet
             // hybrid's prefix hit must also restore one; with none, `initialize_core` already kept
@@ -862,6 +863,11 @@ impl EngineCore {
         // whose write page would otherwise land past everything the host allocated for it.
         if let Some(reach) = model_output.kv_pool_reach {
             self.scheduler.set_kv_pool_reach(reach);
+        }
+        // AND HOW MUCH OF EACH KV STORE IS BACKED, for the allocator to spend the prefix cache's free
+        // blocks before one that would map more.
+        if let Some(backed) = model_output.kv_backed {
+            self.scheduler.set_kv_backed(backed);
         }
 
         // Process each request that was scheduled.
@@ -1657,6 +1663,7 @@ mod tests {
                 draft_seed_inputs: None,
                 kv_extent: std::collections::HashMap::new(),
                 kv_pool_reach: None,
+                kv_backed: None,
             };
 
             let outputs = engine.update_from_output(&scheduler_output, &model_output);
@@ -1810,6 +1817,7 @@ mod tests {
             // crate's test target was never built while the check ran elsewhere.
             kv_extent: std::collections::HashMap::new(),
             kv_pool_reach: None,
+            kv_backed: None,
         };
 
         // Set up engine.
@@ -2265,6 +2273,7 @@ mod tests {
             // crate's test target was never built while the check ran elsewhere.
             kv_extent: std::collections::HashMap::new(),
             kv_pool_reach: None,
+            kv_backed: None,
         };
 
         let outputs = engine.update_from_output(&scheduler_output, &model_output);
@@ -2326,6 +2335,7 @@ mod tests {
             // crate's test target was never built while the check ran elsewhere.
             kv_extent: std::collections::HashMap::new(),
             kv_pool_reach: None,
+            kv_backed: None,
         };
 
         let outputs = engine.update_from_output(&scheduler_output, &model_output);
@@ -2375,6 +2385,7 @@ mod tests {
             // crate's test target was never built while the check ran elsewhere.
             kv_extent: std::collections::HashMap::new(),
             kv_pool_reach: None,
+            kv_backed: None,
         };
 
         let outputs = engine.update_from_output(&scheduler_output, &model_output);

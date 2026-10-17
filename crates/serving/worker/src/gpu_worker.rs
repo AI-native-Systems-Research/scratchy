@@ -7661,6 +7661,7 @@ impl Worker for MetalWorker {
             // Token-addressed KV: the write slot IS the token count, so a new request's own allocation
             // already covers the page it writes. Nothing to report.
             kv_pool_reach: None,
+            kv_backed: None,
             d2h_resolver: None,
         })
     }
@@ -7778,6 +7779,39 @@ impl Worker for MetalWorker {
         } else {
             scratchy_core_common::HybridKvStores::Shared
         }
+    }
+
+    /// A hybrid model's KV stores take no memory until a step maps them (`grow_metal_kv_to_cover`),
+    /// and stay mapped — unless they share their budget with recurrent-state snapshots, whose runs
+    /// are mapped apart and released (`SharedKv`).
+    fn kv_backing(&self) -> scratchy_core_common::KvBacking {
+        if cfg!(feature = "metal") && self.kv_is_hybrid && self.gdn_snapshot_cap == 0 {
+            scratchy_core_common::KvBacking::OnFirstUse
+        } else {
+            scratchy_core_common::KvBacking::Allocated
+        }
+    }
+
+    /// The blocks the shared pool's stores have mapped, and TurboQuant's (every store registered for
+    /// the global group's blocks): a block ID space is backed as far as every store it addresses.
+    fn kv_backed(&self) -> Option<scratchy_core_common::KvBackedBlocks> {
+        use scratchy_core_common::{KvBackedBlocks, KvBacking};
+        if self.kv_backing() != KvBacking::OnFirstUse {
+            return None;
+        }
+        let pool = (self.target_kv_stores.as_ref())
+            .map(|s| s.mapped().load(std::sync::atomic::Ordering::Relaxed))?;
+        let coded =
+            (self.gpu_device.as_ref()).and_then(|d| d.allocator.sparse_kv.lock().ok()?.backed());
+        Some(match self.hybrid_kv_stores() {
+            scratchy_core_common::HybridKvStores::Shared => {
+                KvBackedBlocks::Shared(coded.map_or(pool, |coded| coded.min(pool)))
+            }
+            scratchy_core_common::HybridKvStores::GlobalApart => KvBackedBlocks::GlobalApart {
+                pool,
+                global: coded.unwrap_or(0),
+            },
+        })
     }
 }
 

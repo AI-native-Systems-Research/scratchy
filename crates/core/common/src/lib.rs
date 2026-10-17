@@ -33,8 +33,8 @@ pub use engine_io::{
     EngineCoreRequest, FinishReason, SchedulerStats, SpecDecodingStats, StopReason,
 };
 pub use kv::{
-    CacheableTokens, HybridKvStores, InflightSlots, KvAddressing, KvBlockTokens, KvExtent,
-    KvSlotSpan,
+    CacheableTokens, HybridKvStores, InflightSlots, KvAddressing, KvBackedBlocks, KvBacking,
+    KvBlockTokens, KvExtent, KvSlotSpan,
 };
 pub use multimodal::MultimodalData;
 pub use request::{
