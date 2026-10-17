@@ -1074,11 +1074,14 @@ impl SpyreWorker {
         let mut kv_budget_bytes_v: Option<u64> = None;
         // The context the sized pool will actually serve (tokens) — the ONE context law's answer
         // (`resolve_served_context`) over the declaration and what the budget funds, decided in
-        // the SuperDsc branch below where budget, page stride and launch rows first meet.
-        // `usize::MAX` until then, so paths that never size a paged pool report no cap and
-        // `kv_max_addressable_tokens` falls back to the baked mask reach alone.
+        // the SuperDsc branch below where budget, page stride and launch rows first meet, and
+        // ALWAYS decided there on this tier: every path through the pool sizing either resolves
+        // or refuses, so the binding is left UNINITIALIZED on the card tier and the compiler
+        // holds that invariant (no dead `usize::MAX` initializer to warn about, no `#[allow]`).
+        // `usize::MAX` on the paths that never size a paged pool (the emulator tier), so they
+        // report no cap and `kv_max_addressable_tokens` falls back to the baked mask reach alone.
         #[cfg(feature = "spyre-hw")]
-        let mut served_context_v: usize = usize::MAX;
+        let served_context_v: usize;
         #[cfg(not(feature = "spyre-hw"))]
         let served_context_v: usize = usize::MAX;
         #[cfg(feature = "spyre-hw")]
