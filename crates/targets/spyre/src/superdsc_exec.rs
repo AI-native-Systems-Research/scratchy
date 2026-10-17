@@ -26,7 +26,9 @@ use flex_rs::stream::RuntimeStreamError;
 use tracing::{debug, info};
 
 use crate::bundle_code::{self as bundle, KernelWeight, NUM_SEGMENTS, Placement, SweptCols};
-use crate::fold_plan::{self, Bytes, OpKv, RowIdx, RowPage, SessionKv, SlotPos, UniformPages};
+use crate::fold_plan::{
+    self, Bytes, OpKv, PerClass, RowIdx, RowPage, SessionKv, SlotPos, UniformPages, fused_rungs,
+};
 use crate::runtime::{BatchedCompute, ByteOffset, ByteSize, DevAddr, HwError, Stream};
 use crate::sen_convert;
 use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
@@ -583,11 +585,14 @@ pub struct Executor {
     suffix_ops: Ops,
     /// Each class's body with the per-page fold fused back in — one fewer launch per layer. Used
     /// whenever the context fits ONE page, which is the case that must cost what unpaged cost.
-    body_fused: Vec<Ops>,
+    /// `None` unless EVERY class has its twin ([`PerClass`]).
+    body_fused: Option<PerClass<Ops>>,
     /// sk_bucket LADDER (decode): `(active_cap, one ops list per class)` ascending; the top rung
     /// is the full cap.
     body_rungs: Vec<(SweptCols, Vec<Ops>)>,
-    body_rungs_fused: Vec<(SweptCols, Vec<Ops>)>,
+    /// The rungs whose EVERY class has a fold-fused twin, ascending, each with its twins in class
+    /// order ([`fused_rungs`]). A rung with any class sitting out is absent, so it runs split.
+    body_rungs_fused: Vec<(SweptCols, PerClass<Ops>)>,
     /// PAGED: the SPLIT bodies are only reachable once a context outgrows one page, so their
     /// Program memory is allocated on first selection.
     split_bodies_ready: bool,
@@ -783,7 +788,7 @@ impl Executor {
             prefix_ops: Vec::new(),
             body_ops: Vec::new(),
             suffix_ops: Vec::new(),
-            body_fused: Vec::new(),
+            body_fused: None,
             body_rungs: Vec::new(),
             body_rungs_fused: Vec::new(),
             split_bodies_ready: false,
@@ -961,14 +966,12 @@ impl Executor {
         if rungs.is_empty() {
             if let Some(m) = &self.code.reroll {
                 self.body_ops = class_ops(m)?;
-                self.body_fused = m
-                    .bodies_fused
-                    .iter()
-                    .map(|fp| match bundle::sibling(fp) {
-                        Some(f) => bind_ops(f),
-                        None => Vec::new(),
-                    })
-                    .collect();
+                self.body_fused = PerClass::of_every_class(
+                    self.body_ops.len(),
+                    m.bodies_fused
+                        .iter()
+                        .map(|fp| bundle::sibling(fp).map(bind_ops)),
+                );
             } else {
                 self.body_ops = vec![bind_ops(self.code)];
             }
@@ -1021,22 +1024,19 @@ impl Executor {
                     .map(|fp| Self::sibling_ops("decode rung", fp))
                     .collect::<Result<Vec<_>>>()?,
             ));
-            // A rung's fold-fused twins are optional: an ABSENT one simply means that class
-            // always uses the split body at this rung — correct, one launch per layer dearer.
-            // Present ones are ALL-or-nothing per rung (`bodies_fused.len() == bodies.len()`),
-            // with `SiblingFp::none()` marking the classes that sit out.
-            self.body_rungs_fused.push((
+        }
+        // A rung's fold-fused twins are optional: a rung where any class sits out runs its split
+        // bodies — correct, one launch per layer dearer. See [`fused_rungs`] for why it is per rung.
+        self.body_rungs_fused = fused_rungs(rungs.iter().map(|r| {
+            (
                 r.active_cap,
+                r.bodies.len(),
                 r.bodies_fused
                     .iter()
-                    .filter(|fp| !fp.is_none())
-                    .map(|fp| match bundle::sibling(fp) {
-                        Some(f) => bind_ops(f),
-                        None => Vec::new(),
-                    })
-                    .collect(),
-            ));
-        }
+                    .map(|fp| bundle::sibling(fp).map(bind_ops))
+                    .collect::<Vec<_>>(),
+            )
+        }));
         debug!(
             "[sdsc-superdsc] PAGED KV: {} of {} rungs have a fold-fused twin (a context inside one \
              page runs it — the split body costs two extra launches per layer, ~1 ms/token)",
@@ -1746,7 +1746,7 @@ impl Executor {
                 self.alloc_ops_at(ListSel::RungFused(i, c))?;
             }
         }
-        for c in 0..self.body_fused.len() {
+        for c in 0..self.body_fused.as_ref().map_or(0, PerClass::len) {
             self.alloc_ops_at(ListSel::BodyFused(c))?;
         }
         lap("fused-twin-program-h2d", &mut t0);
@@ -2015,9 +2015,13 @@ impl Executor {
             ListSel::Prefix => &mut self.prefix_ops,
             ListSel::Body(c) => &mut self.body_ops[c],
             ListSel::Suffix => &mut self.suffix_ops,
-            ListSel::BodyFused(c) => &mut self.body_fused[c],
+            ListSel::BodyFused(c) => self
+                .body_fused
+                .as_mut()
+                .expect("BodyFused is selected only when every class has its twin")
+                .class_mut(c),
             ListSel::Rung(i, c) => &mut self.body_rungs[i].1[c],
-            ListSel::RungFused(i, c) => &mut self.body_rungs_fused[i].1[c],
+            ListSel::RungFused(i, c) => self.body_rungs_fused[i].1.class_mut(c),
         }
     }
 
@@ -2028,9 +2032,13 @@ impl Executor {
             ListSel::Prefix => &self.prefix_ops,
             ListSel::Body(c) => &self.body_ops[c],
             ListSel::Suffix => &self.suffix_ops,
-            ListSel::BodyFused(c) => &self.body_fused[c],
+            ListSel::BodyFused(c) => self
+                .body_fused
+                .as_ref()
+                .expect("BodyFused is selected only when every class has its twin")
+                .class(c),
             ListSel::Rung(i, c) => &self.body_rungs[i].1[c],
-            ListSel::RungFused(i, c) => &self.body_rungs_fused[i].1[c],
+            ListSel::RungFused(i, c) => self.body_rungs_fused[i].1.class(c),
         }
     }
 
@@ -2232,9 +2240,8 @@ impl Executor {
                 self.trace_body("fused-none-fits", valid_len, n_fold_pages, reqs, 0, false);
                 return self.select_body(valid_len);
             }
-            // The ladderless fused bodies — one per class; present for at least one class is
-            // present (the classes of a bake agree on whether a twin was baked).
-            if self.body_fused.iter().any(|o| !o.is_empty()) {
+            // The ladderless fused bodies — present only when every class has its twin.
+            if self.body_fused.is_some() {
                 self.trace_body("fused-noladder", valid_len, n_fold_pages, reqs, 0, true);
                 return Ok(BodySel::BodyFused);
             }
