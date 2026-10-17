@@ -167,6 +167,27 @@ impl Tokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
+    /// Encode text into token IDs, and for each byte offset of `marks`, the tokens before the first
+    /// one that ends past it: the prompt length that reaches that point of the text and no further
+    /// (a special token a post-processor appends, offset `(0, 0)`, comes after every mark).
+    pub fn encode_through(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+        marks: &[usize],
+    ) -> ServeResult<(Vec<u32>, Vec<u32>)> {
+        let encoding = with_inner!(&self.inner, t => t.encode(text, add_special_tokens))
+            .map_err(|e| ServeError::Engine(format!("Tokenization failed: {e}")))?;
+        let offsets = encoding.get_offsets();
+        let through = (marks.iter())
+            .map(|&mark| {
+                let past = offsets.iter().position(|&(_, end)| end > mark);
+                past.unwrap_or(offsets.len()) as u32
+            })
+            .collect();
+        Ok((encoding.get_ids().to_vec(), through))
+    }
+
     /// Decode token IDs back into text.
     pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> ServeResult<String> {
         with_inner!(&self.inner, t => t.decode(ids, skip_special_tokens))
@@ -292,6 +313,19 @@ pub(crate) fn make_test_tokenizer() -> Tokenizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `encode_through` counts, for each byte offset, the tokens that end at or before it: the
+    /// prompt length that reaches that point and no further.
+    #[test]
+    fn test_tokenizer_encode_through_counts_the_tokens_before_a_mark() {
+        let tok = make_test_tokenizer();
+        let text = "hello world";
+        let (ids, through) = tok.encode_through(text, false, &[0, 5, 11]).unwrap();
+        assert_eq!(ids, tok.encode(text, false).unwrap());
+        assert_eq!(through, vec![0, 5, 11]);
+        let reached = tok.decode(&ids[..through[1] as usize], false).unwrap();
+        assert_eq!(reached, "hello");
+    }
 
     #[test]
     fn test_tokenizer_encode_decode_roundtrip() {

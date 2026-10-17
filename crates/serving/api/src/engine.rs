@@ -10,6 +10,28 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Marks a client's prompt-cache breakpoint in a chat message's text (the Anthropic path's
+/// `cache_control`): taken out of the rendered prompt before it is tokenized, and turned into the
+/// prompt length that reaches it (`EngineCoreRequest::cache_breakpoints`). A private-use code point,
+/// so no client text means it.
+pub(crate) const CACHE_BREAKPOINT: char = '\u{F8FF}';
+
+/// `text` without its [`CACHE_BREAKPOINT`] marks, and the byte offset of each in what is left.
+fn take_cache_breakpoints(text: String) -> (String, Vec<usize>) {
+    if !text.contains(CACHE_BREAKPOINT) {
+        return (text, Vec::new());
+    }
+    let mut kept = String::with_capacity(text.len());
+    let mut marks = Vec::new();
+    for c in text.chars() {
+        match c {
+            CACHE_BREAKPOINT => marks.push(kept.len()),
+            c => kept.push(c),
+        }
+    }
+    (kept, marks)
+}
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1190,6 +1212,7 @@ impl AsyncEngine {
                     block_annotations: request.block_annotations.clone(),
                     seal: request.seal,
                     volatile: request.volatile,
+                    cache_breakpoints: Vec::new(),
                 };
 
                 let detokenizer = self.tokenizer.as_ref().map(|tok| {
@@ -1379,6 +1402,7 @@ impl AsyncEngine {
                     block_annotations: request.block_annotations.clone(),
                     seal: request.seal,
                     volatile: request.volatile,
+                    cache_breakpoints: Vec::new(),
                 };
 
                 let detokenizer = self.tokenizer.as_ref().map(|tok| {
@@ -1478,6 +1502,7 @@ impl AsyncEngine {
                     block_annotations: None,
                     seal: false,
                     volatile: false,
+                    cache_breakpoints: Vec::new(),
                 };
 
                 self.submit_request(
@@ -3243,13 +3268,18 @@ impl AsyncEngine {
             _ => text,
         };
 
+        let (text, marks) = take_cache_breakpoints(text);
+
         // Tokenize the text, or fall back to byte-value IDs.
+        let mut cache_breakpoints = Vec::new();
         #[allow(unused_mut)]
         let mut token_ids = if let Some(tok) = &self.tokenizer {
             if text.is_empty() {
                 vec![]
             } else {
-                tok.encode(&text, true)?
+                let (ids, through) = tok.encode_through(&text, true, &marks)?;
+                cache_breakpoints = through;
+                ids
             }
         } else if text.is_empty() {
             vec![0] // BOS placeholder
@@ -3266,6 +3296,10 @@ impl AsyncEngine {
         };
         #[cfg(not(feature = "multimodal"))]
         let mm_data = None;
+        // An image's placeholder expands past the text's token count: no breakpoint stands then.
+        if mm_data.is_some() {
+            cache_breakpoints.clear();
+        }
 
         Ok(EngineCoreRequest {
             request_id: request_id.to_string(),
@@ -3284,6 +3318,7 @@ impl AsyncEngine {
             block_annotations: None,
             seal: false,
             volatile: false,
+            cache_breakpoints,
         })
     }
 
@@ -3370,6 +3405,7 @@ impl AsyncEngine {
             block_annotations: None,
             seal: false,
             volatile: false,
+            cache_breakpoints: Vec::new(),
         })
     }
 
@@ -4104,6 +4140,17 @@ fn merge_chat_template_kwargs(
 
 #[cfg(test)]
 mod tests {
+    /// The breakpoint marks come out of the rendered prompt, each kept as its byte offset in what
+    /// is left; a prompt with none is passed through as it is.
+    #[test]
+    fn take_cache_breakpoints_strips_the_marks_and_keeps_their_offsets() {
+        let marked = format!("ab{0}c—d{0}", super::CACHE_BREAKPOINT);
+        let (text, marks) = super::take_cache_breakpoints(marked);
+        assert_eq!((text.as_str(), marks), ("abc—d", vec![2, 7]));
+        let (text, marks) = super::take_cache_breakpoints("plain".into());
+        assert_eq!((text.as_str(), marks), ("plain", vec![]));
+    }
+
     use super::*;
     use crate::tokenizer::make_test_tokenizer;
     use scratchy_core_config::{SchedulerConfig, SchedulerPolicy};
