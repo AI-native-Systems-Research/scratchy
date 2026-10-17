@@ -1535,18 +1535,13 @@ impl SpyreWorker {
                         .filter_map(scratchy_target_spyre::bundle_code::bundle)
                         .map(|rc| non_resident(&rc.layout))
                         .sum::<u64>()
-                    + {
-                        let (pmq, psent) = &g0.prefill_prefix;
-                        if *pmq > 1 && !psent.is_empty() {
-                            psent
-                                .strip_prefix(SUPERDSC_SENTINEL)
-                                .and_then(scratchy_target_spyre::bundle_code::bundle)
-                                .map(|rc| non_resident(&rc.layout))
-                                .unwrap_or(0)
-                        } else {
-                            0
-                        }
-                    };
+                    + g0.prefill_prefix
+                        .iter()
+                        .filter(|(pmq, _)| *pmq > 1)
+                        .filter_map(|(_, psent)| psent.strip_prefix(SUPERDSC_SENTINEL))
+                        .filter_map(scratchy_target_spyre::bundle_code::bundle)
+                        .map(|rc| non_resident(&rc.layout))
+                        .sum::<u64>();
                 // ⛔ DEVICE REGIONS ARE NEVER FREED — `DevAddr`'s own doc: "device memory lives until
                 // process exit". The anchor's spare is not a loan the alias later returns:
                 // `alias_seg_from` repoints the borrower's descriptors and the borrower's own regions
@@ -2344,63 +2339,73 @@ impl SpyreWorker {
                     prefill_ladder.iter().map(|(m, _)| *m).collect::<Vec<_>>(),
                     prefill_ladder.last().map(|(m, _)| *m).unwrap_or(0),
                 );
-                // ── PREFIX-CAPABLE PREFILL SESSION ── the bundle a continuation chunk (start>0)
-                // runs on. Every ladder rung above is prefix-FREE, so this is the ONLY prefill bundle
+                // ── PREFIX-CAPABLE PREFILL LADDER ── the bundles a continuation chunk (start>0) runs
+                // on. Every ladder rung above is prefix-FREE, so these are the ONLY prefill bundles
                 // that can attend resident KV. Borrows seg1+seg2 like the rungs, and is built AFTER
-                // the decode session so it cannot affect decode's weight-region placement.
-                let mut prefill_prefix: Option<(usize, SuperDscSession)> = None;
-                {
-                    let (pmq, psent) = g0.prefill_prefix;
-                    if pmq > 1 && !psent.is_empty() {
-                        match psent
-                            .strip_prefix(SUPERDSC_SENTINEL)
-                            .and_then(scratchy_target_spyre::bundle_code::bundle)
-                        {
-                            Some(pcode2) => match SuperDscSession::new_borrowing(
-                                pcode2,
-                                vocab,
-                                kv_dim,
-                                num_blocks,
-                                wirings
-                                    .prefill
-                                    .as_ref()
-                                    .unwrap_or(&wirings.decode)
-                                    .num_sources,
-                                &resident_source_ids(
-                                    wirings.prefill.as_ref().unwrap_or(&wirings.decode),
-                                    &spill_tids,
-                                ),
-                                &[1, 2],
-                            ) {
-                                Ok(mut ps) => {
-                                    let mut ok = true;
-                                    if let Err(e) = adopt_from_owner(&mut ps, &ss, &spill_images) {
-                                        warn!(
-                                            "[spyre-worker] sendnn: prefix-capable prefill \
-                                             m={pmq}: {e} — continuation chunks will be REFUSED"
-                                        );
-                                        ok = false;
-                                    }
-                                    if ok {
-                                        info!(
-                                            "[spyre-worker] sendnn: prefix-capable prefill session \
-                                             ready (m={pmq}, bundle {}) — used for start>0 chunks",
-                                            pcode2.fp
-                                        );
-                                        prefill_prefix = Some((pmq as usize, ps));
-                                    }
+                // the decode session so it cannot affect decode's weight-region placement. A rung that
+                // fails to build is logged and skipped: its chunks run on a wider rung, more padded.
+                let mut prefix_built: Vec<(usize, SuperDscSession)> = Vec::new();
+                for &(pmq, psent) in g0.prefill_prefix {
+                    if pmq <= 1 || psent.is_empty() {
+                        continue;
+                    }
+                    match psent
+                        .strip_prefix(SUPERDSC_SENTINEL)
+                        .and_then(scratchy_target_spyre::bundle_code::bundle)
+                    {
+                        Some(pcode2) => match SuperDscSession::new_borrowing(
+                            pcode2,
+                            vocab,
+                            kv_dim,
+                            num_blocks,
+                            wirings
+                                .prefill
+                                .as_ref()
+                                .unwrap_or(&wirings.decode)
+                                .num_sources,
+                            &resident_source_ids(
+                                wirings.prefill.as_ref().unwrap_or(&wirings.decode),
+                                &spill_tids,
+                            ),
+                            &[1, 2],
+                        ) {
+                            Ok(mut ps) => match adopt_from_owner(&mut ps, &ss, &spill_images) {
+                                Ok(()) => {
+                                    info!(
+                                        "[spyre-worker] sendnn: prefix-capable prefill session \
+                                         ready (m={pmq}, bundle {}) — used for start>0 chunks",
+                                        pcode2.fp
+                                    );
+                                    prefix_built.push((pmq as usize, ps));
                                 }
                                 Err(e) => warn!(
-                                    "[spyre-worker] sendnn: prefix-capable prefill m={pmq} session \
-                                     build failed: {e} — continuation chunks will be REFUSED"
+                                    "[spyre-worker] sendnn: prefix-capable prefill m={pmq}: {e} — \
+                                     SKIPPED"
                                 ),
                             },
-                            None => warn!(
-                                "[spyre-worker] sendnn: prefix-capable prefill sentinel did not \
-                                 resolve — continuation chunks will be REFUSED"
+                            Err(e) => warn!(
+                                "[spyre-worker] sendnn: prefix-capable prefill m={pmq} session \
+                                 build failed: {e} — SKIPPED"
                             ),
-                        }
+                        },
+                        None => warn!(
+                            "[spyre-worker] sendnn: prefix-capable prefill m={pmq} sentinel did \
+                             not resolve — SKIPPED"
+                        ),
                     }
+                }
+                let prefill_prefix = PrefixLadder::of_built(prefix_built);
+                if prefill_prefix.is_empty() {
+                    warn!(
+                        "[spyre-worker] sendnn: no prefix-capable prefill session built — continuation \
+                         chunks will be REFUSED"
+                    );
+                } else {
+                    info!(
+                        "[spyre-worker] sendnn: PREFIX ladder = {:?} (a continuation chunk runs on the \
+                         smallest rung that holds the rows it has left)",
+                        prefill_prefix.widths(),
+                    );
                 }
                 // ── DECODE BATCH LADDER: one session per baked request count ──
                 // Same construction and the same failure rule as the prefill ladder: each rung

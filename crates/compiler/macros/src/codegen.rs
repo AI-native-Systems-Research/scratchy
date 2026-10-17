@@ -10817,18 +10817,22 @@ fn dump_wavefront_mega(
         // mask-coverage guard from `PAGE_SLOTS * pages` to the real `active_cap * pages`.
         let superdsc_decode_rungs: std::cell::RefCell<Vec<(u32, u32, String)>> =
             std::cell::RefCell::new(Vec::new());
-        // The ONE prefill bundle baked with a full resident-prefix sweep. Every ladder rung is baked
-        // prefix-FREE (ActiveCap::NONE) because a start==0 chunk has nothing resident to attend, which
-        // drops 308 of 710 ops/layer. A CONTINUATION chunk (start>0) does have resident KV, so it needs
-        // this one. Baked at the widest rung, so a single bundle covers any start <= cap.
-        let superdsc_prefill_prefix_fp: std::cell::RefCell<Option<String>> =
-            std::cell::RefCell::new(None);
+        // The PREFIX-CAPABLE ladder `[(mq, body_fp)]` — the prefill bundles baked with a full
+        // resident-prefix sweep. Every prefix-free rung is baked ActiveCap::NONE because a start==0 chunk
+        // has nothing resident to attend, which drops 308 of 710 ops/layer. A CONTINUATION chunk (start>0)
+        // does have resident KV, so it runs on the smallest of these that holds it. See
+        // `manifest::SengraphBundleGroup::prefill_prefix`.
+        let superdsc_prefill_prefix_rungs: std::cell::RefCell<Vec<(u32, String)>> =
+            std::cell::RefCell::new(Vec::new());
         // ⭐ WHAT ONE BAKE DOES TO THE EXPANSION'S SHARED STATE, recorded in the order it happens and
         // applied by `commit_bake` — so the heavy part of a bake (`emit_bundle_deferred`) touches no
         // shared state at all, and can run on any thread, while the expansion still sees exactly the
         // writes, in exactly the order, that a serial loop made.
         enum BakeEffect {
-            PrefillPrefixFp(String),
+            PrefillPrefixRung {
+                mq: u32,
+                fp: String,
+            },
             PrefillRung {
                 mq: u32,
                 fp: String,
@@ -12024,11 +12028,11 @@ fn dump_wavefront_mega(
                                             );
                                             // Stamp the DECODE body_fp or the PREFILL body_fp by phase
                                             // (the prefill reroll must NOT clobber the decode fp).
-                                            if prefill_mq.is_some() && active_cap == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL {
-                                            // The PREFIX-CAPABLE prefill bundle: the one continuation
-                                            // chunks (start>0) must use, since they DO have resident KV
-                                            // to attend. One bundle covers every start<=cap.
-                                            fx.push(BakeEffect::PrefillPrefixFp(bfp));
+                                            if let Some(mq) = prefill_mq.filter(|_| active_cap == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL) {
+                                            // A PREFIX-CAPABLE prefill rung: continuation chunks
+                                            // (start>0) run on these, since they DO have resident KV to
+                                            // attend — each on the smallest rung that holds it.
+                                            fx.push(BakeEffect::PrefillPrefixRung { mq, fp: bfp });
                                             prefill_fp_stamped = true;
                                         } else if let Some(mq) = prefill_mq {
                                             // Ladder rung (deduped on mq: a rebake of the same width
@@ -12416,8 +12420,12 @@ fn dump_wavefront_mega(
         let commit_bake = |lwd: &to_wavefront::LoweredDecode, fx: Vec<BakeEffect>| {
             for e in fx {
                 match e {
-                    BakeEffect::PrefillPrefixFp(fp) => {
-                        *superdsc_prefill_prefix_fp.borrow_mut() = Some(fp)
+                    // Deduped on mq like the prefix-free ladder: a rebake of a width must not double-enter.
+                    BakeEffect::PrefillPrefixRung { mq, fp } => {
+                        let mut r = superdsc_prefill_prefix_rungs.borrow_mut();
+                        if !r.iter().any(|(m, _)| *m == mq) {
+                            r.push((mq, fp));
+                        }
                     }
                     // Ladder rung (deduped on mq: a rebake of the same width must not double-enter).
                     BakeEffect::PrefillRung { mq, fp } => {
@@ -12953,51 +12961,69 @@ fn dump_wavefront_mega(
             }
         }
 
-        // ── PREFIX-CAPABLE PREFILL BUNDLE ── one more bake of the WIDEST rung, this time with a full
-        // resident-prefix sweep. The ladder rungs above are all prefix-FREE, which is correct only for
-        // a chunk with start==0; a continuation chunk has resident KV to attend and must use this.
-        // Baking it at the widest width means ONE bundle serves every start <= cap: a continuation
-        // chunk pays some padding, but it is the rarer case and correctness is not negotiable.
-        // ⛔ AND IT IS CARD-ONLY TOO: it is reached through `prefill_prefix`, which
-        // `spyre_forward.rs:1641` reads under `spyre-hw` alone. An emulator build baked this whole
-        // extra model and could never launch it.
-        // ⭐ AT THE LADDER'S CEILING — the pool's whole window. Its attention is the whole-chunk
-        // continuation, whose program is flat in the rows (`attn_program_is_flat_in_rows` refuses
-        // anything else at the door), so the widest rung costs no more to lower than the narrowest.
-        // It was capped within the resident cache while that arm unrolled per row and never finished
-        // lowering at 512 rows.
-        if sendnn_superdsc
-            && cfg!(feature = "spyre-hw")
-            && let Some(top) = superdsc_prefill_rungs
+        // ── PREFIX-CAPABLE PREFILL LADDER ── the prefill bakes with a full resident-prefix sweep. The
+        // ladder rungs above are all prefix-FREE, which is correct only for a chunk with start==0; a
+        // continuation chunk has resident KV to attend and must run on one of these.
+        // ⛔ AND IT IS CARD-ONLY TOO: it is reached through `prefill_prefix`, which the worker reads
+        // under `spyre-hw` alone. An emulator build baked this whole extra model and could never
+        // launch it.
+        // ⭐ AT THE PAGE AND AT THE WINDOW — `PagedKvPool::prefix_rungs`, over the widths that baked.
+        // Every mid-prompt continuation chunk is a whole window (the step-back leaves it room for one),
+        // so only a prompt's LAST chunk can be narrower, and a page is the narrowest a padded write can
+        // be placed in without stepping back into the previous chunk's page. Their attention is the
+        // whole-chunk continuation, whose program is flat in the rows (`attn_program_is_flat_in_rows`
+        // refuses anything else at the door), so the widest rung costs no more to lower than the
+        // narrowest.
+        // ⛔ ONE WIDTH WAS THE MEASURED COST. This baked the widest rung alone, and a 52-row tail ran a
+        // full 512-row chunk — granite-3.1-2b at ~2k tokens: 460 ms against 384 ms on the 256-row build.
+        if sendnn_superdsc && cfg!(feature = "spyre-hw") {
+            let baked: Vec<u32> = superdsc_prefill_rungs
                 .borrow()
                 .iter()
                 .map(|(m, _)| *m)
-                .max()
-        {
-            match crate::to_wavefront::lower_decode_to_wavefront(
-                fuf,
-                decode_asn_check,
-                inferred,
-                decode_bounds,
-                model,
-                crate::to_wavefront::PrefixCapacity::new(prefix_len),
-                top,
-            ) {
-                Ok(lwd_p) => {
-                    emit_bundle(
-                        &lwd_p,
-                        format!("ktir_prefill_{stem_id}"),
-                        prefix_len.get(),
-                        None,
-                        Some(top),
-                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                        1, // a prompt chunk is one request
-                    );
+                .collect();
+            for m in scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_rungs(&baked) {
+                match crate::to_wavefront::lower_decode_to_wavefront(
+                    fuf,
+                    decode_asn_check,
+                    inferred,
+                    decode_bounds,
+                    model,
+                    crate::to_wavefront::PrefixCapacity::new(prefix_len),
+                    m,
+                ) {
+                    Ok(lwd_p) => {
+                        emit_bundle(
+                            &lwd_p,
+                            format!("ktir_prefill_{stem_id}"),
+                            prefix_len.get(),
+                            None,
+                            Some(m),
+                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                            1, // a prompt chunk is one request
+                        );
+                    }
+                    Err(e) => eprintln!(
+                        "[spyre-superdsc] {stem}: prefix-capable prefill bundle (m={m}) NOT LOWERED \
+                         — {e}. Continuation chunks will run on a wider prefix rung, if one baked."
+                    ),
                 }
-                Err(e) => eprintln!(
-                    "[spyre-superdsc] {stem}: prefix-capable prefill bundle (m={top}) NOT LOWERED \
-                     — {e}. Continuation chunks will have no bundle to run on."
-                ),
+            }
+            // ⛔⛔⛔ THE PREFIX LADDER MUST TOP OUT AT THE PREFIX-FREE LADDER's TOP. A mid-prompt continuation
+            // chunk runs at the widest rung's width (it is capped there and the step-back leaves it room), so
+            // a prefix ladder that stops short would put a mid-prompt chunk on a bundle narrower than its rows
+            // — a refusal on the card. Checked on what BAKED, not on the widths asked for.
+            let prefix: Vec<u32> = superdsc_prefill_prefix_rungs
+                .borrow()
+                .iter()
+                .map(|(m, _)| *m)
+                .collect();
+            if let Err(e) =
+                scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_ladder_tops_the_ladder(
+                    &baked, &prefix,
+                )
+            {
+                panic!("[spyre-superdsc] {stem}: {e}");
             }
         }
 
@@ -13352,23 +13378,19 @@ fn dump_wavefront_mega(
             // baked — a single rung is exactly the existing `prefill` slot, so an empty slice keeps
             // the pre-ladder path byte-identical instead of making the worker special-case a 1-rung
             // ladder that buys nothing.
-            // The prefix-capable prefill bundle (start>0 chunks). Its width is the widest rung.
-            let prefill_prefix_lit = {
-                let fp = superdsc_prefill_prefix_fp.borrow();
-                let mq = superdsc_prefill_rungs
-                    .borrow()
+            // The prefix-capable ladder (start>0 chunks), ascending — every width that baked, a single
+            // rung included: unlike the prefix-free ladder there is no other slot carrying it.
+            let prefill_prefix_lits: Vec<proc_macro2::TokenStream> = {
+                let mut rungs = superdsc_prefill_prefix_rungs.borrow().clone();
+                rungs.sort_by_key(|(mq, _)| *mq);
+                rungs
                     .iter()
-                    .map(|(m, _)| *m)
-                    .max()
-                    .unwrap_or(0);
-                match fp.as_ref() {
-                    Some(f) => {
-                        let m = proc_macro2::Literal::u32_unsuffixed(mq);
-                        let sfp = proc_macro2::Literal::string(&format!("SUPERDSC_BUNDLE:{f}"));
-                        quote! { (#m, #sfp) }
-                    }
-                    None => quote! { (0u32, "") },
-                }
+                    .map(|(mq, fp)| {
+                        let m = proc_macro2::Literal::u32_unsuffixed(*mq);
+                        let s = proc_macro2::Literal::string(&format!("SUPERDSC_BUNDLE:{fp}"));
+                        quote! { (#m, #s) }
+                    })
+                    .collect()
             };
             let prefill_rung_lits: Vec<proc_macro2::TokenStream> = {
                 let mut rungs = superdsc_prefill_rungs.borrow().clone();
@@ -13436,7 +13458,7 @@ fn dump_wavefront_mega(
                     },
                     prefill_rungs: &[#(#prefill_rung_lits),*],
                     decode_rungs: &[#(#decode_rung_lits),*],
-                    prefill_prefix: #prefill_prefix_lit,
+                    prefill_prefix: &[#(#prefill_prefix_lits),*],
                 }
             });
         }

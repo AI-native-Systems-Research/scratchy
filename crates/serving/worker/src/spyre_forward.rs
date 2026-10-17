@@ -894,9 +894,9 @@ pub(crate) fn superdsc_forward_chunk(
     // chunk runs on the SMALLEST rung that holds it, so a short prompt stops paying for padding rows
     // and a long one still gets the widest chunk. Empty ⇒ no batched prefill.
     prefill_rungs: &mut Vec<(usize, SuperDscSession)>,
-    // The prefix-capable bundle for continuation chunks (start>0); the rungs above are prefix-free.
-    // `mut` binding: the chunk loop reborrows it per iteration via `as_deref_mut`.
-    mut prefill_prefix: Option<&mut (usize, SuperDscSession)>,
+    // The prefix-capable ladder for continuation chunks (start>0); the rungs above are prefix-free.
+    // A continuation chunk's width is chosen by `PrefixLadder::rung_for` and nowhere else.
+    prefill_prefix: &mut PrefixLadder,
     b: &BundleMeta,
     // The prefill meta bound by `run_prefill_batch` to `prefill_session` (its tensor ids match the prefill
     // manifest, unlike `b`, which is the decode meta the generation steps below use).
@@ -1018,24 +1018,28 @@ pub(crate) fn superdsc_forward_chunk(
                 // ROUTE BY `start`. The ladder rungs are baked PREFIX-FREE (no resident-prefix
                 // blocks at all), which is exactly right for a chunk at start==0 and WRONG for any
                 // continuation chunk, which has resident KV it must attend. So a continuation chunk
-                // runs on the single prefix-capable bundle instead, at its own (widest) width.
-                // Refuse rather than run a continuation chunk on a prefix-free rung: that would
-                // silently drop every earlier token from the attention and produce fluent nonsense.
+                // runs on the prefix-capable ladder instead, on the rung `PrefixLadder::rung_for`
+                // picks for the rows it has left. Refuse rather than run a continuation chunk on a
+                // prefix-free rung: that would silently drop every earlier token from the attention
+                // and produce fluent nonsense.
+                //
+                // ⭐ THE RUNG IS CHOSEN ONCE, HERE, and carried: `prefix_rung` is the cap, the padded
+                // write below, the session and the K/V extent's baked row count. Those used to read the ONE
+                // prefix bundle's width independently; with a ladder they must be one choice, or a chunk
+                // could be placed for one width and proven against another.
                 let use_prefix = chunk_start > 0;
-                let cap_m = if use_prefix {
-                    match prefill_prefix.as_deref() {
-                        Some((m, _)) => *m,
-                        None => {
-                            return Err(werr(format!(
-                                "superdsc batched prefill: chunk at start={chunk_start} needs the \
-                                 prefix-capable bundle, which did not bake. Refusing — running it on \
-                                 a prefix-free rung would ignore the resident KV entirely."
-                            )));
-                        }
-                    }
+                let prefix_rung = if use_prefix {
+                    Some(prefill_prefix.rung_for(chunk_start, tok_end - tok).ok_or_else(|| {
+                        werr(format!(
+                            "superdsc batched prefill: chunk at start={chunk_start} needs a \
+                             prefix-capable bundle, and none baked. Refusing — running it on a \
+                             prefix-free rung would ignore the resident KV entirely."
+                        ))
+                    })?)
                 } else {
-                    prefill_top_m
+                    None
                 };
+                let cap_m = prefix_rung.map_or(prefill_top_m, |r| r.width());
                 // ⛔ THE CHUNK'S **PADDED** WRITE MUST STAY INSIDE ONE PAGE.
                 //
                 // A continuation chunk runs on the ONE prefix-capable bundle, so its cache write covers that
@@ -1098,9 +1102,9 @@ pub(crate) fn superdsc_forward_chunk(
                 let room = scratchy_subtile::sdsc_abstract::PagedKvPool::chunk_room(placed.slot())
                     .get() as usize;
                 let chunk_len = (tok_end - tok).min(cap_m).min(room);
-                let (rung_m, pf, ri, nrungs) = if use_prefix {
-                    let (m, sess) = prefill_prefix.as_deref_mut().expect("checked above");
-                    (*m, sess, usize::MAX, 1usize)
+                let (rung_m, pf, ri, nrungs) = if let Some(r) = prefix_rung {
+                    // The rung `cap_m` was read from — the same value, not a second choice.
+                    (r.width(), prefill_prefix.session(r), usize::MAX, 1usize)
                 } else {
                     // NOTE: pending rungs are built AFTER this chunk is served, not before it (see
                     // the end of the chunk loop). Building on first touch put the 302 ms rung build
@@ -1683,7 +1687,7 @@ pub(crate) fn forward_chunk(
             sh,
             decode,
             prefill_rungs,
-            prefill_prefix.as_mut(),
+            prefill_prefix,
             b,
             prefill_meta,
             req,
@@ -2140,7 +2144,7 @@ pub(crate) fn run_request_step(
             let c_prefill_session = if start == 0 {
                 sb.prefill_top_m() > 1
             } else {
-                sb.prefill_prefix.is_some()
+                !sb.prefill_prefix.is_empty()
             };
             if c_prefill_session {
                 toks.len().max(1)

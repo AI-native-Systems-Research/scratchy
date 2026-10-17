@@ -5463,6 +5463,81 @@ impl PagedKvPool {
         ))
     }
 
+    /// ⭐ THE WIDTHS A PREFIX-CAPABLE PREFILL BUNDLE IS BAKED AT, out of the prefix-free widths that baked
+    /// (`baked`): the top, and one page when the top is wider than a page. Ascending.
+    ///
+    /// A continuation chunk is capped at the top width, and [`chunk_write_start`](Self::chunk_write_start)
+    /// leaves every mid-prompt chunk room for a whole window, so only a prompt's LAST chunk is ever
+    /// narrower — and a page is the narrowest a padded write can take without stepping back into slots an
+    /// earlier chunk owns. So a tail of at most one page runs one page wide, and anything longer runs a
+    /// full window. Nothing in between: a width that is neither would step its write back across the page
+    /// it starts in.
+    ///
+    /// ⛔ ONE WIDTH WAS THE MEASURED COST. Only the top was baked, so a 52-row tail ran a full 512-row
+    /// chunk: granite-3.1-2b at ~2k tokens took 460 ms against 384 ms on the 256-row build.
+    ///
+    /// Empty when nothing baked; just the top when the top fits one page (every model whose causal block
+    /// stays sub-blocked, so its bake is byte-for-byte unchanged).
+    pub fn prefix_rungs(baked: &[u32]) -> Vec<u32> {
+        let page = Self::PAGE_SLOTS as u32;
+        let Some(top) = baked.iter().copied().max() else {
+            return Vec::new();
+        };
+        if top > page && baked.contains(&page) {
+            vec![page, top]
+        } else {
+            vec![top]
+        }
+    }
+
+    /// ⭐ WHICH PREFIX RUNG A CONTINUATION CHUNK AT `want` RUNS ON — the index into `widths` (ascending, the
+    /// rungs that built) of the smallest width that holds the rest of the prompt AS PLACED at that width,
+    /// else the widest (the chunk is then capped at it and the prompt continues). `None` only for an empty
+    /// ladder.
+    ///
+    /// ⛔ AS PLACED, NOT AS ASKED. [`chunk_write_start`](Self::chunk_write_start) may step a padded write
+    /// back, and stepping back GROWS the rows the chunk must cover by the overlap it re-processes: 240 rows
+    /// asked at slot 300 are 284 rows from slot 256 on the 256-row rung, which no longer fits it. Choosing
+    /// on the asked count would put that tail on the narrow rung and split it into two chunks where the
+    /// wide rung runs one. So each width is tried at its own placement, and a narrow rung is chosen only
+    /// when it finishes the prompt in this chunk.
+    ///
+    /// The worker's `PrefixLadder::rung_for` is this over its built sessions, so the rule is one function
+    /// a test can drive without a card.
+    pub fn prefix_rung_for(widths: &[u32], want: KvSlot, rows_left: u32) -> Option<usize> {
+        widths
+            .iter()
+            .position(|&m| {
+                let at = Self::chunk_write_start(want, SlotCount::new(m)).slot().get();
+                rows_left + (want.get() - at) <= m
+            })
+            .or_else(|| widths.len().checked_sub(1))
+    }
+
+    /// ⛔⛔⛔ THE PREFIX-CAPABLE LADDER THAT BAKED MUST TOP OUT AT THE PREFIX-FREE LADDER's TOP — the bake's
+    /// proof, panicked on by the macro.
+    ///
+    /// Every mid-prompt continuation chunk runs at the prefix-free ladder's top width (the cap, and the room
+    /// the step-back leaves). A prefix ladder that stops below it hands such a chunk a bundle narrower than its
+    /// rows, which the host refuses on the card. A prefix ladder that baked NOTHING while a prefix-free ladder
+    /// did is the same shortfall in full: every continuation chunk refused. `Err` names the gap.
+    pub fn prefix_ladder_tops_the_ladder(baked: &[u32], prefix: &[u32]) -> Result<(), String> {
+        let Some(top) = baked.iter().copied().max() else {
+            return Ok(());
+        };
+        match prefix.iter().copied().max() {
+            Some(p) if p == top => Ok(()),
+            Some(p) => Err(format!(
+                "the prefix-capable prefill ladder tops out at {p} rows, below the prefix-free ladder's {top} \
+                 — a mid-prompt continuation chunk runs {top} rows wide and would have no bundle to run on"
+            )),
+            None => Err(format!(
+                "no prefix-capable prefill bundle baked, though the prefix-free ladder reaches {top} rows — \
+                 every continuation chunk (start > 0) would be refused"
+            )),
+        }
+    }
+
     /// ⭐ SLOTS A PADDED CHUNK WRITE MAY OVERRUN ITS PAGE BY — the physical slack every plane carries
     /// past its addressable [`PAGE_SLOTS`](Self::PAGE_SLOTS) so that overrun lands in DEAD SPACE instead
     /// of the next kv head's keys.
