@@ -239,7 +239,9 @@ pub enum KernelId {
     /// `affine_qmm_w4a8_<dtype>_s_<scale>_gs_<gs>_tn_<tn>_nsg_<nsg>`.
     AffineQmmW4a8,
     /// The MoE grouped W4A8 pre-pass over the padded rows (sentinel rows
-    /// skipped). `affine_gather_w4a8_quant_<dtype>`.
+    /// skipped). `affine_gather_w4a8_quant_<dtype>`; or, on a bake that fuses
+    /// the act into it, `affine_gather_w4a8_quant_<act>_<dtype>` — the gate/up
+    /// rows quantized straight from `act(gate) * up`.
     AffineGatherW4a8Quant,
     /// The MoE grouped expert GEMM on the int8 lane: each 32-row tile's
     /// expert slab x its int8 rows.

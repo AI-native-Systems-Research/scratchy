@@ -840,6 +840,34 @@ pub fn w4a8_quant_static_name(rows: W4a8Rows, dtype: DequantDtype) -> &'static s
     }
 }
 
+/// The act the fused grouped pre-pass (`affine_gather_w4a8_quant_<act>_<dtype>`)
+/// applies as it quantizes: a gated expert's `act(gate) * up`, or an ungated
+/// expert's `act(up)` with the gate binding holding the up's rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum W4a8Act {
+    Silu,
+    Gelu,
+    SwigluOai,
+    /// `relu(x)²` — the ungated expert's one in-projection.
+    Relu2,
+}
+
+/// `affine_gather_w4a8_quant_<act>_<dtype>` — the grouped act fused into the
+/// W4A8 pre-pass, skipping the bf16 intermediate the separated pair wrote and
+/// re-read.
+pub fn w4a8_act_quant_static_name(act: W4a8Act, dtype: DequantDtype) -> &'static str {
+    match (act, dtype) {
+        (W4a8Act::Silu, DequantDtype::F16) => "affine_gather_w4a8_quant_silu_f16",
+        (W4a8Act::Silu, DequantDtype::Bf16) => "affine_gather_w4a8_quant_silu_bf16",
+        (W4a8Act::Gelu, DequantDtype::F16) => "affine_gather_w4a8_quant_gelu_f16",
+        (W4a8Act::Gelu, DequantDtype::Bf16) => "affine_gather_w4a8_quant_gelu_bf16",
+        (W4a8Act::SwigluOai, DequantDtype::F16) => "affine_gather_w4a8_quant_swiglu_oai_f16",
+        (W4a8Act::SwigluOai, DequantDtype::Bf16) => "affine_gather_w4a8_quant_swiglu_oai_bf16",
+        (W4a8Act::Relu2, DequantDtype::F16) => "affine_gather_w4a8_quant_relu2_f16",
+        (W4a8Act::Relu2, DequantDtype::Bf16) => "affine_gather_w4a8_quant_relu2_bf16",
+    }
+}
+
 /// `affine_[gather_]qmm_w4a8_<dtype>_s_<scale>_gs_<gs>_tn_<cols>_nsg_<simdgroups>`.
 pub fn qmm_w4a8_static_name(
     rows: W4a8Rows,

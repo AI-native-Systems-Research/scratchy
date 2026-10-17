@@ -46,6 +46,7 @@
 #include "metal_nax.h"   // vendors NAXTile + tile_matmad_nax + MPP internals
 #include <metal_stdlib>
 #include "baked.h"
+#include "gated_act.h"
 
 using namespace metal;
 using namespace mlx::steel;
@@ -82,6 +83,11 @@ SCRATCHY_CONSTANT_OPTIONAL(bool, AFFINE_CODES_OFFSET8, 5);
 // The unfused attention PV's V^T row stride: the STATIC max_kv, sized from the
 // block capacity at load.
 SCRATCHY_CONSTANT_OPTIONAL(int, NAX_PV_W_LD, 6);
+// The fused act+quant (`affine_gather_w4a8_quant_<act>_*`) only: gpt-oss's grouped
+// bake — the pair's expert adds its gate and up LINEAR biases before the activation
+// ([E, 2·K], buffer(4)), the same switch `silu_mul.metal`'s `SILU_MUL_LINEAR_BIAS`
+// makes. Unset: no buffer(4), and the adds const-fold away.
+SCRATCHY_CONSTANT_OPTIONAL(bool, W4A8GQ_LINEAR_BIAS, 7);
 
 // ─────────────────────────────────────────────────────────────────
 // NVFP4 E2M1 decode (sign-magnitude 4-bit). Same byte layout as affine
@@ -1213,6 +1219,105 @@ template <typename T>
     uint lid [[thread_index_in_simdgroup]]) {
     w4a8_quant_impl<T, true>(x, scratch, indices, tgid, sgid, lid);
 }
+
+// ─────────────────────────────────────────────────────────────────
+// The grouped act fused into the W4A8 pre-pass:
+// `affine_gather_w4a8_quant_<act>_<dtype>` quantizes `act(gate) * up`
+// (an ungated expert's `act(up)`, its gate binding the up's rows) straight
+// to the int8 scratch, skipping the bf16 intermediate the separated pair
+// (`silu_mul`-family then `affine_gather_w4a8_quant`) wrote and re-read —
+// at a prefill bucket's padded rows that intermediate is DRAM traffic.
+// The value quantized is the pair's own: the act in float, then rounded
+// through T in-register — the store the elementwise kernel made and the
+// pre-pass reloaded — so the scratch comes out byte-identical.
+// Buffers: gate[0] up[1] scratch[2] indices[3], the gpt-oss gate/up LINEAR
+// biases at [4] behind `W4A8GQ_LINEAR_BIAS` (slot 7). Grid and constants
+// as the plain gather pre-pass: ((K/64)/16, M) x 128, QMM_K/QMM_M/
+// QMM_NUM_EXPERTS at slots 0/2/4.
+// ─────────────────────────────────────────────────────────────────
+
+// `act(gate) * up` per the fused pre-pass's ACT tag: 0 SiLU, 1 GELU (tanh),
+// 2 gpt-oss SwiGLU-OAI — `gated_act.h`, the elementwise kernels' own — and
+// 3 an ungated ReLU² (`relu(x)²`, the gate binding holding the up's rows).
+template <int ACT>
+METAL_FUNC float w4a8_act_mul(float g, float u) {
+    if (ACT == 0) return silu_mul_f(g, u);
+    if (ACT == 1) return gelu_mul_f(g, u);
+    if (ACT == 2) return swiglu_oai_mul_f(g, u);
+    const float r = metal::max(g, 0.0f);
+    return r * r;
+}
+
+template <typename T, int ACT>
+METAL_FUNC void w4a8_act_quant_impl(
+    const device T* gate, const device T* up, device uchar* scratch,
+    const device uint32_t* indices, const device T* linear_bias,
+    uint2 tgid, uint sgid, uint lid) {
+    const int K = QMM_K, M = QMM_M, KC = K / 64;
+    const int c = (int(tgid.x) * 4 + int(sgid)) * 4 + int(lid / 8);
+    const int m = int(tgid.y);
+    if (c >= KC) return;
+    if (indices[m] >= uint(QMM_NUM_EXPERTS)) return;
+    const int l8 = int(lid % 8);
+    const int col = c * 64 + l8 * 8;
+    const device vec<T, 4>* pg = (const device vec<T, 4>*)(gate + int64_t(m) * K + col);
+    const device vec<T, 4>* pu = (const device vec<T, 4>*)(up + int64_t(m) * K + col);
+    float4 g0 = float4(pg[0]), g1 = float4(pg[1]);
+    float4 u0 = float4(pu[0]), u1 = float4(pu[1]);
+    if (W4A8GQ_LINEAR_BIAS) {
+        // [E, 2·K]: the expert's gate rows then its up rows.
+        const device vec<T, 4>* b =
+            (const device vec<T, 4>*)(linear_bias + size_t(indices[m]) * 2 * size_t(K) + col);
+        g0 += float4(b[0]);
+        g1 += float4(b[1]);
+        u0 += float4(b[K / 4]);
+        u1 += float4(b[K / 4 + 1]);
+    }
+    // The act in float, rounded through T — the elementwise kernel's store.
+    const float4 y0 = float4(T(w4a8_act_mul<ACT>(g0.x, u0.x)), T(w4a8_act_mul<ACT>(g0.y, u0.y)),
+                             T(w4a8_act_mul<ACT>(g0.z, u0.z)), T(w4a8_act_mul<ACT>(g0.w, u0.w)));
+    const float4 y1 = float4(T(w4a8_act_mul<ACT>(g1.x, u1.x)), T(w4a8_act_mul<ACT>(g1.y, u1.y)),
+                             T(w4a8_act_mul<ACT>(g1.z, u1.z)), T(w4a8_act_mul<ACT>(g1.w, u1.w)));
+    float amax = max(max(max(abs(y0.x), abs(y0.y)), max(abs(y0.z), abs(y0.w))),
+                     max(max(abs(y1.x), abs(y1.y)), max(abs(y1.z), abs(y1.w))));
+    amax = max(amax, simd_shuffle_xor(amax, 1));
+    amax = max(amax, simd_shuffle_xor(amax, 2));
+    amax = max(amax, simd_shuffle_xor(amax, 4));
+    const float inv = amax > 0.0f ? 127.0f / amax : 0.0f, a = amax / 127.0f;
+    const float4 q0 = rint(y0 * inv), q1 = rint(y1 * inv);
+    float sum = (q0.x + q0.y) + (q0.z + q0.w) + (q1.x + q1.y) + (q1.z + q1.w);
+    sum += simd_shuffle_xor(sum, 1);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 4);
+    device uint2* xq = (device uint2*)(scratch + int64_t(m) * K + c * 64);
+    xq[l8] = uint2(as_type<uint>(char4(q0)), as_type<uint>(char4(q1)));
+    if (l8 == 0) {
+        ((device float2*)(scratch + int64_t(M) * K))[int64_t(m) * KC + c] = float2(a, a * sum);
+    }
+}
+
+template <typename T, int ACT>
+[[kernel]] void affine_gather_act_w4a8_quant(
+    const device T* gate [[buffer(0)]], const device T* up [[buffer(1)]],
+    device uchar* scratch [[buffer(2)]], const device uint32_t* indices [[buffer(3)]],
+    const device T* linear_bias [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]], uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lid [[thread_index_in_simdgroup]]) {
+    w4a8_act_quant_impl<T, ACT>(gate, up, scratch, indices, linear_bias, tgid, sgid, lid);
+}
+
+#define INST_W4A8_ACT_QUANT(act_tag, act_val, dtype_tag, mtl_type)                            \
+  SCRATCHY_KERNEL(affine_gather_w4a8_quant_##act_tag##_##dtype_tag,                           \
+                  affine_gather_act_w4a8_quant<mtl_type, act_val>)
+
+INST_W4A8_ACT_QUANT(silu, 0, f16, half)
+INST_W4A8_ACT_QUANT(silu, 0, bf16, bfloat)
+INST_W4A8_ACT_QUANT(gelu, 1, f16, half)
+INST_W4A8_ACT_QUANT(gelu, 1, bf16, bfloat)
+INST_W4A8_ACT_QUANT(swiglu_oai, 2, f16, half)
+INST_W4A8_ACT_QUANT(swiglu_oai, 2, bf16, bfloat)
+INST_W4A8_ACT_QUANT(relu2, 3, f16, half)
+INST_W4A8_ACT_QUANT(relu2, 3, bf16, bfloat)
 
 template <typename T, typename S, int G, int TM, int TN, int NSG>
 METAL_FUNC void qmm_w4a8_impl(
