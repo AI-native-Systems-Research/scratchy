@@ -141,18 +141,19 @@ impl From<CopyRowsConstants> for Vec<ConstantValue> {
     }
 }
 
-/// `KernelId::ConcatRows` (`concat_rows_<T>`, `elementwise.metal` slots 6 and 7): the elements
-/// the output holds and the width of each operand's rows.
+/// `KernelId::ConcatRows` (`concat_rows_<T>`, `elementwise.metal` slots 6–8): the elements the
+/// output holds and the width of each operand's rows.
 pub struct ConcatRowsConstants {
     pub elements: ElementCount,
-    pub width: ActivationWidth,
+    pub widths: crate::tape::lowered::ConcatWidths,
 }
 
 impl From<ConcatRowsConstants> for Vec<ConstantValue> {
     fn from(c: ConcatRowsConstants) -> Self {
         vec![
             ConstantValue::uint(ConstSlot(6), c.elements.get()),
-            ConstantValue::uint(ConstSlot(7), c.width.get()),
+            ConstantValue::uint(ConstSlot(7), c.widths.a.get()),
+            ConstantValue::uint(ConstSlot(8), c.widths.b.get()),
         ]
     }
 }

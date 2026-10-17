@@ -1101,6 +1101,9 @@ pub fn compile_carrier(
             // `target_hidden`), every downstream `FufInput::Extern` referencing it rewired to
             // read its slot 0. No-op for a body that reads none.
             rows_lowering::materialize_rows(&mut model_fuf);
+            // A target exporting several hidden states (its EAGLE-3 drafter's) exports them side
+            // by side as one. No-op for a forward exporting one or none.
+            rows_lowering::chain_exports(&mut model_fuf);
 
             // At tp>1, the runtime weight tensors are per-rank shards
             // (column-parallel q/k/v/gate/up halve dim 0; row-parallel

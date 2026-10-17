@@ -5368,18 +5368,18 @@ fn lower_one(
 
         // ── Row concatenation: out[t] = a[t] ++ b[t] ───────────────
         //
-        // An MTP head's input fusion. One thread per output element over `eff_m * 2 * width`;
-        // m_scaling shrinks the grid to live num_tokens and the kernel's `gid >= n` guard caps
-        // the tail.
-        I::Concat(Slot(a_slot), Slot(b_slot), Slot(out_slot), width) => {
-            let n_elems = eff_m * 2 * width.get();
+        // An MTP head's input fusion, or a forward's exported hidden states side by side. One
+        // thread per output element over `eff_m * (a + b)`; m_scaling shrinks the grid to live
+        // num_tokens and the kernel's `gid >= n` guard caps the tail.
+        I::Concat(Slot(a_slot), Slot(b_slot), Slot(out_slot), widths) => {
+            let n_elems = eff_m * widths.out();
             LoweredCommand {
                 kernel: KernelId::ConcatRows,
                 library: "elementwise",
                 function: concat_rows_static_name(p.metal_dtype),
                 constants: super::kernel_constants::ConcatRowsConstants {
                     elements: super::ids::ElementCount(n_elems),
-                    width: *width,
+                    widths: *widths,
                 }
                 .into_baked(),
                 dispatch: {

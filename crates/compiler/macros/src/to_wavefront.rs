@@ -1317,7 +1317,8 @@ pub fn lower_decode_to_wavefront(
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
-            // export_hidden(x): x itself, named the forward's exported hidden state.
+            // export_hidden(x): x itself, named the forward's exported hidden state (several,
+            // side by side, are one: `rows_lowering::chain_exports`).
             OpKind::ExportHidden => {
                 let x = bx.input_at(tile, 0)?;
                 let InputRef::Op(j) = x else {
@@ -1535,7 +1536,15 @@ pub fn lower_decode_to_wavefront(
                 let a = bx.input_at(tile, 0)?;
                 let b = bx.input_at(tile, 1)?;
                 let cols = bx.out_cols(tile, 0, "concat cols")?;
-                let idx = bx.push_op(SubOp::Concat { cols }, vec![a, b]);
+                let Some(&FufInput::Tile { id, slot }) = node.inputs.first() else {
+                    return Err(BridgeError::MalformedOp {
+                        tile,
+                        op: node.op,
+                        detail: "concat of a source, not a tile's output",
+                    });
+                };
+                let left = bx.out_cols(id, usize::from(slot), "concat left cols")?;
+                let idx = bx.push_op(SubOp::Concat { left, cols }, vec![a, b]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }

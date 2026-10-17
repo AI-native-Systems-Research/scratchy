@@ -205,6 +205,9 @@ pub struct FoldFacts {
     pub epilogue: BTreeMap<SlotId, SlotId>,
     /// Steps leading a normed-rope fold; with every step absorbed into them, one group each.
     pub normed_rope: BTreeSet<SlotId>,
+    /// Steps read after the forward ran — its result, and the hidden states it exports: their
+    /// buffers hold through the tape's end.
+    pub observed: BTreeSet<SlotId>,
 }
 
 /// The colour of every slot the tape writes.
@@ -479,6 +482,12 @@ pub fn colour_tape(
                 }
             }
         }
+    }
+
+    // What the forward's caller reads after it ran holds to the end: an exported hidden state
+    // made mid-forward (a target's, for its EAGLE-3 drafter) has no reader within it.
+    for s in &folds.observed {
+        last_use[owner[at(s)?]] = n;
     }
 
     let result_step = steps

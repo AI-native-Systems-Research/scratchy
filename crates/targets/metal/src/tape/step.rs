@@ -22,7 +22,7 @@ pub use scratchy_subtile::subtile_ir::{
     RouterBundle, UngatedAct,
 };
 
-pub use super::lowered::ActivationWidth;
+pub use super::lowered::{ActivationWidth, ConcatWidths};
 
 use super::ids::ArenaSlotIdx as Slot;
 use super::lowered::{Fence, RuntimeGate};
@@ -317,8 +317,8 @@ pub enum MetalStep {
     GateSplit(Slot, Slot, Slot),
     /// `(attn, gate, out)`: `attn * sigmoid(gate)`.
     GateApply(Slot, Slot, Slot),
-    /// `(a, b, out, width)`: `out[t] = a[t] ++ b[t]`, each operand `width` wide.
-    Concat(Slot, Slot, Slot, ActivationWidth),
+    /// `(a, b, out, widths)`: `out[t] = a[t] ++ b[t]`, each operand its width.
+    Concat(Slot, Slot, Slot, ConcatWidths),
     /// `(routed, shared, gate, out)`: `routed + shared * sigmoid(gate)`.
     GateScale(Slot, Slot, Slot, Slot),
     /// `(qkv, z, a, b, out, layer)`: Gated-DeltaNet linear attention.

@@ -1946,10 +1946,13 @@ impl Recording<'_> {
                     Vec::new(),
                 )
             }
-            L::Concat { cols } => {
+            L::Concat { left, cols } => {
                 let (a, b, out) = (self.read(i, 0)?, self.read(i, 1)?, out()?);
-                let width = st::ActivationWidth::of_cols(cols / 2);
-                em(S::Concat(a, b, out, width), &[a, b], &[out], Vec::new())
+                let widths = st::ConcatWidths {
+                    a: st::ActivationWidth::of_cols(left),
+                    b: st::ActivationWidth::of_cols(cols - left),
+                };
+                em(S::Concat(a, b, out, widths), &[a, b], &[out], Vec::new())
             }
             L::LoadRows { source, .. } => {
                 em(S::LoadRows(out()?, source), &[], &[out()?], Vec::new())

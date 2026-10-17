@@ -233,6 +233,7 @@ pub fn wave_order(
         })
         .collect();
     x.input.result = at[l.input.result];
+    x.input.exported = l.input.exported.map(|e| at[e]);
     x.op_tiles = order.iter().map(|&i| l.op_tiles[i]).collect();
     x.op_expansion = order.iter().map(|&i| l.op_expansion[i]).collect();
     x.norm_gain_add_tiles = (l.norm_gain_add_tiles.iter())

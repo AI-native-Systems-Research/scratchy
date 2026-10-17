@@ -598,7 +598,12 @@ fn load_dir_mode(
                 model_feature_enabled(arch, stem)
             })
     };
-    let head_drafts = |stem: &str, json: &serde_json::Value| -> Result<Option<u64>, ConfigError> {
+    // What a target's tape bakes of the head that drafts for it: its drafts a step, and — for an
+    // EAGLE-3 drafter reading several of its target's hidden states — the target layers whose
+    // input residual stream it reads (the head config's `eagle_config`, as vLLM reads it).
+    let head_facts = |stem: &str,
+                      json: &serde_json::Value|
+     -> Result<Option<(u64, Option<serde_json::Value>)>, ConfigError> {
         if !mtp_heads || !spec.hf_architectures.is_empty() {
             return Ok(None);
         }
@@ -606,11 +611,24 @@ fn load_dir_mode(
         for arch_dir in arch_dirs(configs_root)? {
             let head = load_arch_json(&arch_dir)?;
             let drafts = (head.bound_defaults.iter()).find(|(k, _)| k == "spec_drafts");
-            let heads_this = compiled_head_targets(&head, mtp).any(|(_, t)| *t == this)
+            let head_config = compiled_head_targets(&head, mtp).find(|(_, t)| *t == this);
+            let heads_this = head_config.is_some()
                 || (head.checkpoint_of.iter().any(|a| a == arch_name) && carries_head(&head, json));
-            if let (true, Some(&(_, drafts))) = (heads_this, drafts) {
-                return Ok(Some(drafts));
-            }
+            let (true, Some(&(_, drafts))) = (heads_this, drafts) else {
+                continue;
+            };
+            let aux = match head_config {
+                Some((head_stem, _)) => {
+                    let (_, mut head_json) =
+                        read_json_file(&arch_dir.join(format!("{head_stem}.json")))?;
+                    apply_overrides_file(&arch_dir, head_stem, &mut head_json, &mut Vec::new())?;
+                    (head_json.get("eagle_config"))
+                        .and_then(|c| c.get(EAGLE_AUX_LAYER_IDS))
+                        .cloned()
+                }
+                None => None,
+            };
+            return Ok(Some((drafts, aux)));
         }
         Ok(None)
     };
@@ -777,8 +795,12 @@ fn load_dir_mode(
         }
         selected_configs().lock().unwrap().insert(p.clone());
         let (raw, mut json) = read_json_file(p)?;
-        if let (Some(drafts), Some(obj)) = (head_drafts(&stem, &json)?, json.as_object_mut()) {
+        if let (Some((drafts, aux)), Some(obj)) = (head_facts(&stem, &json)?, json.as_object_mut())
+        {
             obj.insert("spec_drafts".to_string(), drafts.into());
+            if let Some(aux) = aux {
+                obj.insert(EAGLE_AUX_LAYER_IDS.to_string(), aux);
+            }
         }
         // Dense-base drift surface: `<stem>.overrides.json` deep-merges
         // onto the verbatim checkpoint config (same mechanism the
@@ -1668,11 +1690,13 @@ fn model_params_from_json(
     let name = parse_name(source_stem, source_path)?;
     let mut bounds = extract_bounds(json);
     derive_sliding_window_pattern(json, &mut bounds);
-    let layer_sets =
-        derive_layer_sets(json, &mut bounds).map_err(|reason| ConfigError::LayerPattern {
-            path: source_path.to_path_buf(),
-            reason,
-        })?;
+    let layer_err = |reason| ConfigError::LayerPattern {
+        path: source_path.to_path_buf(),
+        reason,
+    };
+    let mut layer_sets = derive_layer_sets(json, &mut bounds).map_err(layer_err)?;
+    let aux = eagle_aux_layers(json, &bounds).map_err(layer_err)?;
+    layer_sets.insert(EAGLE_AUX_LAYERS.to_string(), aux);
     if let Some(limit) = binding_time_step_limit(json) {
         return Err(ConfigError::TimeStepLimit {
             path: source_path.to_path_buf(),
@@ -2745,6 +2769,44 @@ pub(crate) fn derive_layer_sets(
             (block.set_name().to_string(), LayerSet(members))
         })
         .collect())
+}
+
+/// The config key naming the target layers whose input residual stream an EAGLE-3 drafter reads:
+/// vLLM's, under a drafter config's `eagle_config`; a target it drafts for carries it at its top
+/// level.
+const EAGLE_AUX_LAYER_IDS: &str = "eagle_aux_hidden_state_layer_ids";
+
+/// The layer set a target's DSL exports those residual streams at (`if layer in
+/// eagle_aux_layers:`).
+const EAGLE_AUX_LAYERS: &str = "eagle_aux_layers";
+
+/// The target layers an EAGLE-3 drafter reads the input residual stream of
+/// ([`EAGLE_AUX_LAYER_IDS`]); empty for a config without one, so a target's predicate reads the
+/// empty set when no such drafter compiles beside it.
+fn eagle_aux_layers(
+    json: &serde_json::Value,
+    bounds: &BTreeMap<String, u64>,
+) -> Result<LayerSet, String> {
+    let Some(ids) = json.get(EAGLE_AUX_LAYER_IDS) else {
+        return Ok(LayerSet::default());
+    };
+    let layers = bounds.get("num_hidden_layers").copied();
+    let mut members = (ids.as_array().into_iter().flatten())
+        .map(|v| match (v.as_u64(), layers) {
+            (Some(l), Some(n)) if l < n => Ok(l),
+            _ => Err(format!(
+                "{EAGLE_AUX_LAYER_IDS}: `{v}` is not a layer of this config's {layers:?}"
+            )),
+        })
+        .collect::<Result<Vec<u64>, String>>()?;
+    if members.is_empty() {
+        return Err(format!(
+            "{EAGLE_AUX_LAYER_IDS}: expected a list of layer indices, got {ids}"
+        ));
+    }
+    members.sort_unstable();
+    members.dedup();
+    Ok(LayerSet(members))
 }
 
 fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
