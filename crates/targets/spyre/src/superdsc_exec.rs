@@ -1949,18 +1949,27 @@ impl Executor {
     /// pre-rendered images: it proves, at prepare, that the plan's data twin of the walk is
     /// byte-identical, so no step ever needs to re-derive (or re-check) what it replays.
     ///
+    /// ⭐ STAGE 2b rides along: per context, `cb_plan::patch_check` proves the IMAGE MODEL itself
+    /// — canvas + affine patches ≡ a fresh walk render, at off-sample steps — under the decode
+    /// player's own single-request shape. A geometry too narrow to sample around a mid-page
+    /// canvas (fewer than ~65 slots past it) skips that leg loudly; every shipped bundle's page
+    /// is 2048 slots.
+    ///
     /// ⛔ NOT A PER-STEP CHECK — a step never pays for this. It runs at [`Self::prepare`] (every
     /// list that exists by then) and once more at [`Self::ensure_split_bodies`] (the deferred
     /// rungs, at the one event that makes them exist).
     ///
-    /// The step shape is SYNTHETIC, not the live session's: 2 requests × 3 resident pages, a
-    /// mid-page write slot, request 0's page 2 as the write base. That is the shape that exercises
-    /// the batched fold (reps > 1), the slot write, the non-fold page resolution and the
-    /// per-request intermediate shift — more than any single real step would — while both parity
-    /// sides read the SAME fold, so the gate's meaning (twin agreement) is independent of which
-    /// shape it runs under. The geometry the synthetic fold must not contradict (paged-ness, page
-    /// slots, page stride) is grounded in THIS session's, because a bundle that was never baked
-    /// paged has no fold ops for a paged shape to exercise.
+    /// Both step shapes are SYNTHETIC, not the live session's. The parity gate's: 2 requests × 3
+    /// resident pages, a mid-page write slot, request 0's page 2 as the write base — the shape
+    /// that exercises the batched fold (reps > 1), the slot write, the non-fold page resolution
+    /// and the per-request intermediate shift, more than any single real step would, while both
+    /// parity sides read the SAME fold, so the gate's meaning (twin agreement) is independent of
+    /// which shape it runs under. The patch gate's: ONE request × 3 pages — under a single row
+    /// the launch slot IS the position every op's KV term reads (`op_slot_pos` resolves row
+    /// cursors only when the batch is wide), which is the single-request decode regime the
+    /// player serves; the batched shapes are PR4's. The geometry the synthetic folds must not
+    /// contradict (paged-ness, page slots, page stride) is grounded in THIS session's, because a
+    /// bundle that was never baked paged has no fold ops for a paged shape to exercise.
     fn check_cb_plan_parity(&self) -> Result<()> {
         let stream = self.stream_ref()?;
         let per = self.kv.page_slots.0.max(1);
@@ -2007,22 +2016,27 @@ impl Executor {
                     .is_some_and(|a| a.is_some())
             }
         };
-        let mut wheres: Vec<(String, LaunchWhere)> = Vec::new();
+        // The launch ROWS both gates' sessions share: one (tag, bank, shifts) per distinct
+        // weight bank the session could launch, enumerated once and rendered at each session's
+        // own write slot and page.
+        let mut rows: Vec<(String, usize, [u64; NUM_SEGMENTS])> = Vec::new();
         match self.rolled.as_ref() {
             // Unrolled: no layer boundary to bank on — bank 0 and zero shifts are the only shape
             // the walk ever launches this bundle with.
-            None => wheres.push(("unrolled".into(), mk(0, [0; NUM_SEGMENTS]))),
+            None => rows.push(("unrolled".into(), 0, [0; NUM_SEGMENTS])),
             Some(r) => {
                 if bank_ok(r.prefix_weight_bank) {
-                    wheres.push((
+                    rows.push((
                         format!("prefix-bank{}", r.prefix_weight_bank),
-                        mk(r.prefix_weight_bank, [0; NUM_SEGMENTS]),
+                        r.prefix_weight_bank,
+                        [0; NUM_SEGMENTS],
                     ));
                 }
                 if bank_ok(r.suffix_weight_bank) {
-                    wheres.push((
+                    rows.push((
                         format!("suffix-bank{}", r.suffix_weight_bank),
-                        mk(r.suffix_weight_bank, [0; NUM_SEGMENTS]),
+                        r.suffix_weight_bank,
+                        [0; NUM_SEGMENTS],
                     ));
                 }
                 let mut seen: Vec<usize> = Vec::new();
@@ -2035,9 +2049,54 @@ impl Executor {
                     let mut off = [0u64; NUM_SEGMENTS];
                     off[SEG_WEIGHT.get()] = woff;
                     off[SEG_KV.get()] = kvoff;
-                    wheres.push((format!("launch-row-bank{bank}"), mk(bank, off)));
+                    rows.push((format!("launch-row-bank{bank}"), bank, off));
                 }
             }
+        }
+        let wheres: Vec<(String, LaunchWhere)> = rows
+            .iter()
+            .map(|(tag, bank, off)| (tag.clone(), mk(*bank, *off)))
+            .collect();
+
+        // ⭐ 2b — THE PATCH GATE'S SESSION: the PLAYER's shape, not the batched fold's. ONE
+        // request, three resident pages. The canvas slot is picked to leave the differentials
+        // and the off-sample steps room on both sides: mid-page, off every slab boundary
+        // (`pos % SLAB_SLOTS == 5`), with 65+ slots of page past it.
+        let r_patch = (5 - 2 * per).rem_euclid(fold_plan::SLAB_SLOTS);
+        let fold1 = SessionKv {
+            paged: self.kv.paged,
+            page_slots: fold_plan::PageSlots::per_page(per),
+            page_stride_bytes: Bytes(self.kv.page_stride_bytes.max(1)),
+            block_tables: vec![vec![0, 1, 2]],
+            request_positions: RowCursors::bound(vec![2 * per + r_patch]),
+            fold_requests: 1,
+            mask_rep_stride_bytes: 0,
+            mask_blocks: 64,
+            fold_pages: 3,
+            // A single request has no per-request intermediate shift to exercise — zero is
+            // the decode player's own value, not a skipped dimension.
+            int_rep_stride_bytes: 0,
+        };
+        // The canvas write base is a SYNTHETIC mid-pool page (2·stride): high enough that the
+        // negative-delta sample stays above zero, and never a page the block tables name, so
+        // the page differential measures the caller-base path alone.
+        let page_c = Bytes(2 * self.kv.page_stride_bytes.max(1));
+        let mk1 = |bank: usize, off: [u64; NUM_SEGMENTS]| LaunchWhere {
+            byte_off: off,
+            slot_pos: SeqPos(2 * per + r_patch),
+            kv_page_base: page_c,
+            n_fold_pages: 3,
+            weight_bank: bank,
+        };
+        // The patch gate needs one image's worth of sampling room around its canvas (65+ slots
+        // of page past it; `r_patch ≤ 63`). A page too narrow for that skips the leg loudly —
+        // every shipped bundle's page is 2048 slots.
+        let patch_room = !self.kv.paged || r_patch + 65 <= per;
+        if !patch_room {
+            debug!(
+                "[sdsc-cbplan] patch gate SKIPPED: a page holds {per} slot(s), leaving no \
+                 sampling room around a mid-page canvas. The parity gate above still ran."
+            );
         }
         // Every list the session could launch — the class dimension is enumerated whole here, so
         // a where need not be matched to the classes its rows name (parity reads the same ops
@@ -2062,6 +2121,8 @@ impl Executor {
         }
         let mut cbs = 0usize;
         let mut contexts = 0usize;
+        let mut sites = 0usize;
+        let mut patch_contexts = 0usize;
         for sel in sels {
             let ops = self.list(sel);
             if ops.is_empty() || !ops.iter().all(|o| o.addr.is_some()) {
@@ -2080,12 +2141,28 @@ impl Executor {
                 )?;
                 contexts += 1;
             }
+            if patch_room {
+                for (tag, bank, off) in &rows {
+                    let label = format!("{sel:?}/{tag}");
+                    sites += cb_plan::patch_check(
+                        ops,
+                        &fold1,
+                        &self.seg_addr,
+                        &self.weight_bank_addr,
+                        &mk1(*bank, *off),
+                        &label,
+                        stream,
+                    )?;
+                    patch_contexts += 1;
+                }
+            }
         }
         if contexts == 0 {
             // The gate may not pass vacuously: prepare allocates the prefix and suffix lists
             // unconditionally and bank 0's region exists by the time this runs, so zero
             // checkable contexts means the enumeration itself is broken — refuse rather than
-            // "prove" nothing.
+            // "prove" nothing. Both legs share this enumeration, so it covers the patch gate
+            // too (they cannot disagree about which (list × row) pairs exist).
             bail!(
                 "[cbplan] parity gate REFUSED: no (list × launch-row) context was checkable — \
                  every bank was skipped or no list is allocated"
@@ -2093,7 +2170,8 @@ impl Executor {
         }
         debug!(
             "[sdsc-cbplan] parity gate: {cbs} CB(s) proven byte-identical across {contexts} \
-             (list × launch-row) context(s)"
+             (list × launch-row) context(s); patch gate: {sites} moving word(s) verified \
+             off-sample across {patch_contexts} image(s)"
         );
         Ok(())
     }

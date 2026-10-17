@@ -790,6 +790,15 @@ impl ControlBlockWire {
         &self.bytes
     }
 
+    /// The 128 wire bytes, mutable — for the replay player's patch stage
+    /// (#603 PR2): an image copied into a ring slot is patched in place
+    /// (per-step word edits at prepare-derived offsets), never re-encoded.
+    /// The wire stays 128 bytes; the caller owns keeping the fields it does
+    /// not touch intact.
+    pub fn bytes_mut(&mut self) -> &mut [u8; CB_NUM_BYTES] {
+        &mut self.bytes
+    }
+
     /// Port of `ControlBlockStream::CreateGraphFreeCompute`: one compute CB
     /// with `xlat[i] = tensor_paddrs[i]` (RW) for each input/output tensor,
     /// `xlat[7] = prog_paddr` (RW), and `cmpt` pointing at `bootstrap_addr`
