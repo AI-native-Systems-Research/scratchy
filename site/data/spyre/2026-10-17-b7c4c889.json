@@ -46,15 +46,15 @@
     { "pr": "#563 + #570", "what": "2b fp8 bake now 407 s cold (was 1,185 s), with a guard against regression." }
   ],
   "levers": [
-    { "lever": "8b moonshot", "work": "break the shared short-context floor: measure the card's real HBM ceiling and the 8b step's per-matmul bandwidth; testing whether 512-row prefill chunks halve 8b's per-token MLP cost." },
+    { "lever": "8b moonshot", "work": "at parity (143.4 vs 143 ms) — gate/up run on 25 cores and k/v on 16, at 126 and 89 GB/s; filling all 32 cores is measured at −12.8 ms/step, toward the ≈110 ms floor the card's 149 GB/s ceiling sets." },
     { "lever": "8b 10k decode", "work": "torch-spyre 1.17× ahead — hd128 K/V gather kept in LX, projected 192 → ~165–170 ms." },
     { "lever": "2b ~1k TTFT", "work": "torch-spyre 1.48× ahead — a 27-row tail chunk pays a whole 256-row program." },
-    { "lever": "8b 10k TTFT", "work": "torch-spyre 1.30× ahead — attention plus the MLP's pointwise glue." },
+    { "lever": "8b 10k TTFT", "work": "torch-spyre 1.30× ahead — attention plus the MLP's pointwise glue: a wide elementwise op split across cores by rows runs at half rate, and splitting its columns instead is measured 2.05× faster; 512-row prompt chunks." },
     { "lever": "conc-8", "work": "not re-measured since the fixes; a full matched re-sweep is pending a free pod." }
   ],
   "notes": {
     "decode": [
-      "Short-context parity is a shared floor: both stacks stream 16.4 GB of fp16 weights per token at ~115 GB/s. The cost model's peak is 204.8 GB/s — ≈80–90 ms if reachable — so the 8b gets the moonshot treatment, not parity."
+      "Short-context parity is a shared floor: both stacks stream 16.4 GB of fp16 weights per token. Measured on the card (17 Oct), one fp16 matmul streams at most ~149 GB/s, and only across all 32 cores — the cost model's 204.8 GB/s peak is not reachable — so fp16 at one request bottoms out near 110 ms/token. The next step toward it is filling the cores scratchy's 8b gate/up and k/v projections leave idle."
     ],
     "fp8": [
       "2b fp8 conc-8, 15 Oct run: 56.4 vs 8.25 tok/s — 6.8× (6.8–9.9× across conc 1–8)."
@@ -63,7 +63,7 @@
   "target": {
     "label": "8b moonshot · short-context ITL",
     "model": "granite-3.1-8b", "dtype": "fp16", "metric": "itl_ms", "conc": 1, "context": "~123",
-    "value": 85.0,
-    "why": "cost-model peak 204.8 GB/s — both stacks stream 16.4 GB/token at ~115 GB/s"
+    "value": 110.0,
+    "why": "the card's measured ceiling: 16.36 GB/token at 149 GB/s, one fp16 matmul across all 32 cores"
   }
 }
