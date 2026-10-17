@@ -401,7 +401,9 @@ static STREAM_CREATE: Mutex<()> = Mutex::new(());
 impl Stream {
     /// Create a dedicated stream: `Normal` priority, `STRICT_ORDERING` — the values every scratchy
     /// session has ever run. The knobs flex-rs exposes (`RuntimeContext::create_stream` takes
-    /// priority and mode) are the door when a caller needs otherwise (#500).
+    /// priority, mode, and `track_hazards`) are the door when a caller needs otherwise (#500).
+    /// `track_hazards = false` here: scratchy's streams are user-owned and order through their own
+    /// submissions, not the scheduler's cross-stream edge insertion.
     pub fn create() -> Result<Stream, HwError> {
         // A poisoned lock still serializes (nothing is protected but the CALL), so recover rather than
         // panic: a panic here would turn one thread's failure into the whole load's.
@@ -411,6 +413,7 @@ impl Stream {
             .create_stream(
                 RuntimeStreamPriority::Normal,
                 RuntimeStreamMode::StrictOrdering,
+                false,
             )
             .map_err(HwError::StreamCreate)?;
         Ok(Stream { rt, id })

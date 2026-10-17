@@ -670,6 +670,17 @@ pub struct MockBackend {
     /// submission crossed the backend as ONE batch of N ops rather than N
     /// `submit_compute` calls.
     pub compute_batches: Mutex<Vec<usize>>,
+    /// Manual-completion mode (the `hazard_edge_tests` lever): once set,
+    /// `submit_dma` parks the completion in `pending_completions` instead
+    /// of firing it, and the TEST decides when the op "finishes" — the
+    /// only way to hold a producer outstanding on this otherwise
+    /// fully-synchronous mock, which is exactly what cross-stream-hazard
+    /// tests need (a conflicting later op must stay parked in the hazard
+    /// tracker's `Event::wait` until the producer's completion — the
+    /// hazard-WRAPPED completion, which signals/poisons the op's event —
+    /// is released by `mock_fire_pending`).
+    manual_complete: Mutex<bool>,
+    pending_completions: Mutex<Vec<CompletionCallback>>,
     no_capacity: NoCapacity,
 }
 
@@ -693,6 +704,8 @@ impl Default for MockBackend {
             throw_on_compute: Mutex::new(false),
             barrier_calls: Mutex::new(Vec::new()),
             compute_batches: Mutex::new(Vec::new()),
+            manual_complete: Mutex::new(false),
+            pending_completions: Mutex::new(Vec::new()),
             no_capacity: NoCapacity,
         }
     }
@@ -709,6 +722,28 @@ impl MockBackend {
     pub fn compute_batch_sizes(&self) -> Vec<usize> {
         self.compute_batches.lock().unwrap().clone()
     }
+
+    /// Switch the mock into manual-completion mode: from the next
+    /// submission on, `submit_dma` parks completions instead of firing
+    /// them. Completions already fired are unaffected.
+    pub fn mock_set_manual_complete(&self) {
+        *self.manual_complete.lock().unwrap() = true;
+    }
+
+    /// How many completions are currently parked waiting for
+    /// `mock_fire_pending`.
+    pub fn mock_pending_count(&self) -> usize {
+        self.pending_completions.lock().unwrap().len()
+    }
+
+    /// Fire the OLDEST parked completion with `result`. Panics when none
+    /// is pending — same contract as the stream-test `MockScheduler`'s
+    /// `fire_next`, a test-side sequencing bug rather than a runtime
+    /// condition.
+    pub fn mock_fire_pending(&self, result: Result<(), SchedulerError>) {
+        let cb = self.pending_completions.lock().unwrap().remove(0);
+        cb(result);
+    }
 }
 
 #[cfg(test)]
@@ -723,6 +758,15 @@ impl SchedulerBackend for MockBackend {
             callback(Err(mock_error(
                 "MockRuntimeScheduler: submitDma configured to throw",
             )));
+            return;
+        }
+        if *self.manual_complete.lock().unwrap() {
+            // Parked, not fired: the test releases it with
+            // `mock_fire_pending`, carrying the result it chooses. The
+            // callback is the hazard-wrapped one when the submitting
+            // stream is tracked, so releasing it is what signals (or
+            // poisons) the op's event and retires its tracker record.
+            self.pending_completions.lock().unwrap().push(callback);
             return;
         }
         // Port of the memcpy simulation: direction only matters for the
@@ -863,9 +907,11 @@ impl SchedulerBackend for MockBackend {
 }
 
 mod completion;
+mod hazards;
 
 pub use completion::{CbCompleteError, CbRetired};
 use completion::{QuarantinedBuf, eval_cb_complete_status};
+use hazards::{HazardDisposition, HazardTracker};
 
 fn mock_error(msg: &str) -> SchedulerError {
     Box::<dyn std::error::Error + Send + Sync>::from(msg.to_string())
@@ -4252,6 +4298,12 @@ impl Backend {
 pub struct RuntimeScheduler {
     state: Arc<SchedulerState>,
     backend: Backend,
+    /// The cross-stream hazard tracker (`track_hazards`/
+    /// `skip_hazard`, #546): which streams participate in cross-stream
+    /// RAW/WAR/WAW edge insertion and the outstanding-op records those
+    /// edges park on. See `hazards`' module doc for the vendor surface and
+    /// the synchronous-port translation.
+    hazards: HazardTracker,
 }
 
 /// The scheduling identity of one operation handed to `schedule_pipelined`:
@@ -4279,6 +4331,7 @@ impl RuntimeScheduler {
         Arc::new(Self {
             state: Arc::new(SchedulerState::new(scheduler_type)),
             backend,
+            hazards: HazardTracker::new(),
         })
     }
 
@@ -4292,6 +4345,17 @@ impl RuntimeScheduler {
     pub fn mock_barrier_count(&self) -> Option<usize> {
         match &self.backend {
             Backend::Mock(m) => Some(m.barrier_count()),
+            _ => None,
+        }
+    }
+
+    /// Test-only accessor: the mock backend itself, when this scheduler
+    /// wraps one — the `hazard_edge_tests` handle for manual-completion
+    /// mode (`mock_set_manual_complete`/`mock_fire_pending`).
+    #[cfg(test)]
+    pub fn mock_backend(&self) -> Option<&MockBackend> {
+        match &self.backend {
+            Backend::Mock(m) => Some(m),
             _ => None,
         }
     }
@@ -4383,13 +4447,18 @@ impl RuntimeScheduler {
         )
     }
 
-    /// Port of `RuntimeScheduler::registerStream`.
-    pub fn register_stream(&self, id: StreamId, shutdown: Arc<AtomicBool>) {
+    /// Port of `RuntimeScheduler::registerStream`, extended with the pod
+    /// SDK's `track_hazards` ctor flag (`runtime_stream.hpp:82-88`): a
+    /// stream registering with `true` participates in cross-stream
+    /// RAW/WAR/WAW edge insertion; `false` (the C++ default) leaves it
+    /// user-owned and never edged.
+    pub fn register_stream(&self, id: StreamId, shutdown: Arc<AtomicBool>, track_hazards: bool) {
         self.state
             .stream_shutdown_flags
             .lock()
             .unwrap()
             .insert(id, shutdown);
+        self.hazards.register_stream(id, track_hazards);
     }
 
     fn pipeline_for(kind: RuntimeOperationKind) -> Option<PipelineId> {
@@ -4531,12 +4600,18 @@ impl RuntimeScheduler {
 }
 
 impl SchedulerHandle for RuntimeScheduler {
-    fn register_stream(&self, stream_id: StreamId, shutdown_flag: Arc<AtomicBool>) {
-        RuntimeScheduler::register_stream(self, stream_id, shutdown_flag);
+    fn register_stream(
+        &self,
+        stream_id: StreamId,
+        shutdown_flag: Arc<AtomicBool>,
+        track_hazards: bool,
+    ) {
+        RuntimeScheduler::register_stream(self, stream_id, shutdown_flag, track_hazards);
     }
 
     fn release_stream(&self, stream_id: StreamId) {
         self.state.release_stream(stream_id);
+        self.hazards.release_stream(stream_id);
     }
 
     /// Port of every `RuntimeScheduler::schedule(...)` overload. Downcasts
@@ -4557,6 +4632,32 @@ impl SchedulerHandle for RuntimeScheduler {
         // correctly upstream in `stream.rs`'s `launch_h2d`/`launch_d2h`/
         // `launch_compute`) never reached `maybeSetBarrier` at all.
         let requested_barrier = op.pipeline_barrier;
+        // The hazard-tracker consult (#546, #500 TODO 7): one stop before
+        // the per-kind dispatch. For an op with device addresses on a
+        // tracked stream this parks the caller on every conflicting
+        // still-outstanding cross-stream op's completion event and hands
+        // back a completion wrapped to signal-or-poison this op's own
+        // event; for everything else (untracked stream, `skip_hazard`, no
+        // device addresses — including EventSignal/EventWait/HostCallback)
+        // the completion comes back untouched. `ProducerFailed` means a
+        // conflicting producer failed while this op was parked on it: the
+        // completion has ALREADY been driven with the producer's error
+        // (wrapped in `PoisonedEventError` — the waiter stream's deferred
+        // error, surfaced by its `synchronize()`, never a synchronous
+        // throw), so the op must not be submitted; `Ok(())` for the same
+        // reason the wrong-payload arms below return it — the completion
+        // path is the reporter, and `in_flight` has already drained
+        // through it.
+        let completion = match self.hazards.on_submit(
+            stream_id,
+            op.kind,
+            op.payload.as_ref(),
+            op.skip_hazard,
+            completion,
+        ) {
+            HazardDisposition::Proceed(cb) => cb,
+            HazardDisposition::ProducerFailed => return Ok(()),
+        };
         match op.kind {
             K::EventSignal | K::EventWait => {
                 // Events never cross this boundary: the vendor's scheduler
@@ -5482,6 +5583,7 @@ mod ported_cxx_tests {
             DeviceId(0),
             RuntimeStreamPriority::Normal,
             mode,
+            false,
         );
         (sched, stream)
     }
@@ -5730,6 +5832,7 @@ mod ported_cxx_tests {
                 SubmittedOperation {
                     kind: RuntimeOperationKind::EventSignal,
                     pipeline_barrier: true,
+                    skip_hazard: false,
                     payload: Box::new(()),
                 },
                 None,
@@ -6001,6 +6104,7 @@ mod compute_batch_tests {
             DeviceId(0),
             RuntimeStreamPriority::Normal,
             mode,
+            false,
         );
         (sched, stream)
     }
@@ -6261,6 +6365,7 @@ mod compute_pipeline_submission_tests {
             DeviceId(0),
             RuntimeStreamPriority::Normal,
             RuntimeStreamMode::OpOrdering,
+            false,
         );
         stream
             .launch_h2d(
@@ -6338,5 +6443,342 @@ mod compute_pipeline_submission_tests {
             ],
             "vf submitDma: same ternary as PF (vf_runtime_scheduler.cpp:83-84)"
         );
+    }
+}
+
+/// End-to-end pins for the cross-stream hazard tracker (#546, #500 TODO
+/// 7): ops crossing the REAL `RuntimeScheduler::schedule` — whose hazard
+/// consult parks conflicting submitters and wraps completions — into a
+/// `MockBackend` held in manual-completion mode, so the test controls
+/// exactly when a producer "finishes". The tracker's own unit suite
+/// (`scheduler/hazards.rs`) pins the edge classes and dispositions against
+/// `on_submit` directly; THESE pin the wiring: registration through
+/// `RuntimeStream::new`'s `track_hazards` flag, the schedule()-time
+/// consult, the completion wrapping that signals-or-poisons the op's
+/// event, and producer-failure inheritance surfacing as the waiter
+/// stream's DEFERRED error (sticky shutdown, rethrown by
+/// `synchronize()`), never a synchronous throw.
+///
+/// The barrier logic never interferes here: `maybe_set_barrier` compares
+/// PER-STREAM last-pipeline state, and every second op below is its
+/// stream's first — cross-stream ordering is exactly what the per-stream
+/// barrier policy does not provide, which is the gap the tracker fills.
+#[cfg(test)]
+mod hazard_edge_tests {
+    use super::*;
+    use crate::address::{ByteOffset, LogicalAddress, RegionId};
+    use crate::dma::{DmaShaping, HostVirtualAddress};
+    use crate::memory_region::DomainId;
+    use crate::stream::{DeviceId, RuntimeStream, RuntimeStreamError, RuntimeStreamPriority};
+    use std::thread;
+    use std::time::Duration;
+
+    fn addr_at(region: u64) -> Arc<CompositeAddress> {
+        Arc::new(CompositeAddress::from_chunk(Chunk::new(
+            LogicalAddress::new(RegionId(region), ByteOffset(0)),
+            ByteSize(4096),
+            DomainId(0),
+        )))
+    }
+
+    fn h2d(region: u64) -> DmaParams {
+        DmaParams::from_device_allocation(
+            HostVirtualAddress(0x1000),
+            DmaDirection::HostToDevice,
+            Some(addr_at(region)),
+            DmaShaping::default(),
+        )
+        .expect("addr_at is never None")
+    }
+
+    fn d2h(region: u64, skip_hazard: bool) -> DmaParams {
+        DmaParams::from_device_allocation(
+            HostVirtualAddress(0x1000),
+            DmaDirection::DeviceToHost,
+            Some(addr_at(region)),
+            DmaShaping {
+                skip_hazard,
+                ..Default::default()
+            },
+        )
+        .expect("addr_at is never None")
+    }
+
+    /// The real scheduler over a manual-completion mock backend: DMA
+    /// submissions park their (hazard-wrapped, for tracked streams)
+    /// completions until `fire` releases them.
+    fn manual_scheduler() -> Arc<RuntimeScheduler> {
+        let backend = MockBackend::default();
+        backend.mock_set_manual_complete();
+        RuntimeScheduler::new(Backend::Mock(backend))
+    }
+
+    fn stream_on(
+        sched: &Arc<RuntimeScheduler>,
+        mode: RuntimeStreamMode,
+        track_hazards: bool,
+    ) -> Arc<RuntimeStream> {
+        RuntimeStream::new(
+            sched.clone(),
+            DeviceId(0),
+            RuntimeStreamPriority::Normal,
+            mode,
+            track_hazards,
+        )
+    }
+
+    fn fire(sched: &Arc<RuntimeScheduler>, result: Result<(), SchedulerError>) {
+        sched
+            .mock_backend()
+            .expect("manual_scheduler wraps a mock")
+            .mock_fire_pending(result)
+    }
+
+    fn pending(sched: &Arc<RuntimeScheduler>) -> usize {
+        sched
+            .mock_backend()
+            .expect("manual_scheduler wraps a mock")
+            .mock_pending_count()
+    }
+
+    /// Run `f` on a spawned thread and assert it returns within 50 ms —
+    /// converts a wrongly-parked submission into a clean assertion
+    /// failure instead of a hung test (the parked thread is then leaked,
+    /// but the process is tearing down on failure anyway).
+    fn assert_returns_promptly<T>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T
+    where
+        T: Send + 'static,
+    {
+        let done = Arc::new(AtomicBool::new(false));
+        let done2 = done.clone();
+        let handle = thread::spawn(move || {
+            let r = f();
+            done2.store(true, Ordering::Release);
+            r
+        });
+        thread::sleep(Duration::from_millis(50));
+        assert!(done.load(Ordering::Acquire), "{what} must not park");
+        handle.join().expect("prompt launcher must not panic")
+    }
+
+    // RAW across two tracked streams: b's read of region 1 stays parked in
+    // the hazard tracker while a's earlier write of region 1 is still
+    // outstanding on the backend; releasing the producer's completion
+    // (which signals the op's event) is what lets b's op cross — and only
+    // then does it park its OWN completion.
+    #[test]
+    fn raw_edge_parks_cross_stream_op_until_producer_completes() {
+        let sched = manual_scheduler();
+        let a = stream_on(&sched, RuntimeStreamMode::StrictOrdering, true);
+        let b = stream_on(&sched, RuntimeStreamMode::StrictOrdering, true);
+
+        a.launch_h2d(h2d(1), None).unwrap();
+        assert_eq!(
+            pending(&sched),
+            1,
+            "the producer's completion parks in the backend"
+        );
+
+        let returned = Arc::new(AtomicBool::new(false));
+        let returned2 = returned.clone();
+        let waiter = {
+            let b = b.clone();
+            thread::spawn(move || {
+                let r = b.launch_d2h(d2h(1, false), None);
+                returned2.store(true, Ordering::Release);
+                r
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !returned.load(Ordering::Acquire),
+            "b must stay parked on a's outstanding write"
+        );
+        assert_eq!(
+            pending(&sched),
+            1,
+            "b's op must not cross to the backend while parked"
+        );
+
+        fire(&sched, Ok(()));
+        assert!(
+            waiter.join().expect("waiter must not panic").is_ok(),
+            "the waiter's launch itself must succeed"
+        );
+        assert_eq!(
+            pending(&sched),
+            2,
+            "b's op crossed only after the producer completed"
+        );
+
+        // b's own completion — let Drop's synchronize drain.
+        fire(&sched, Ok(()));
+    }
+
+    // The same RAW edge under OP_ORDERING — the mode the #546 concurrency
+    // leg runs (concurrent pipelines, no same-stream barrier policy). The
+    // consult is mode-independent: cross-stream edges are minted the same
+    // either way, because they answer a question the mode never did.
+    #[test]
+    fn raw_edge_parks_under_op_ordering_too() {
+        let sched = manual_scheduler();
+        let a = stream_on(&sched, RuntimeStreamMode::OpOrdering, true);
+        let b = stream_on(&sched, RuntimeStreamMode::OpOrdering, true);
+
+        a.launch_h2d(h2d(1), None).unwrap();
+
+        let returned = Arc::new(AtomicBool::new(false));
+        let returned2 = returned.clone();
+        let waiter = {
+            let b = b.clone();
+            thread::spawn(move || {
+                let r = b.launch_d2h(d2h(1, false), None);
+                returned2.store(true, Ordering::Release);
+                r
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !returned.load(Ordering::Acquire),
+            "b must stay parked under OP_ORDERING too"
+        );
+
+        fire(&sched, Ok(()));
+        assert!(
+            waiter.join().expect("waiter must not panic").is_ok(),
+            "the waiter's launch itself must succeed"
+        );
+        fire(&sched, Ok(()));
+    }
+
+    // A failed producer, released through the backend, is inherited by the
+    // parked waiter: the waiter's launch still returns Ok (the failure is
+    // its stream's DEFERRED error, never a synchronous throw), and its
+    // synchronize() rethrows a chain naming both the poison and the
+    // producer's own failure. The producer stream rethrows its own error.
+    #[test]
+    fn waiter_inherits_released_producer_failure_as_deferred_error() {
+        let sched = manual_scheduler();
+        let a = stream_on(&sched, RuntimeStreamMode::StrictOrdering, true);
+        let b = stream_on(&sched, RuntimeStreamMode::StrictOrdering, true);
+
+        a.launch_h2d(h2d(1), None).unwrap();
+        let waiter = {
+            let b = b.clone();
+            thread::spawn(move || b.launch_d2h(d2h(1, false), None))
+        };
+        thread::sleep(Duration::from_millis(50));
+
+        fire(&sched, Err(mock_error("producer hardware failure")));
+        assert!(
+            waiter.join().expect("waiter must not panic").is_ok(),
+            "the waiter's launch must defer the inherited failure, not throw it"
+        );
+
+        match b.synchronize() {
+            Err(RuntimeStreamError::Deferred(inner)) => {
+                let msg = inner.to_string();
+                assert!(
+                    msg.contains("poisoned by a failed producer stream"),
+                    "waiter error must name the poison: {msg}"
+                );
+                assert!(
+                    msg.contains("producer hardware failure"),
+                    "waiter error must carry the producer's own error: {msg}"
+                );
+            }
+            other => panic!("expected the waiter's deferred error, got {other:?}"),
+        }
+        match a.synchronize() {
+            Err(RuntimeStreamError::Deferred(inner)) => {
+                assert!(
+                    inner.to_string().contains("producer hardware failure"),
+                    "producer error must survive the shared-handle round trip: {inner}"
+                );
+            }
+            other => panic!("expected the producer's deferred error, got {other:?}"),
+        }
+    }
+
+    // `skip_hazard` on the DMA shaping: "neither checked against nor
+    // recorded as a producer/consumer" — the conflicting read crosses to
+    // the backend immediately, while the producer is still outstanding.
+    #[test]
+    fn skip_hazard_op_crosses_while_producer_outstanding() {
+        let sched = manual_scheduler();
+        let a = stream_on(&sched, RuntimeStreamMode::StrictOrdering, true);
+        let b = stream_on(&sched, RuntimeStreamMode::StrictOrdering, true);
+
+        a.launch_h2d(h2d(1), None).unwrap();
+        let b2 = b.clone();
+        assert_returns_promptly("a skip_hazard op", move || {
+            b2.launch_d2h(d2h(1, true), None).unwrap();
+        });
+        assert_eq!(
+            pending(&sched),
+            2,
+            "the skipped op must have crossed to the backend"
+        );
+
+        fire(&sched, Ok(()));
+        fire(&sched, Ok(()));
+    }
+
+    // Same-stream ordering is the stream's own: a second op on the SAME
+    // tracked stream never edges against the first, even on the same
+    // address (WAW) — it crosses to the backend immediately.
+    #[test]
+    fn same_stream_second_op_does_not_park() {
+        let sched = manual_scheduler();
+        let a = stream_on(&sched, RuntimeStreamMode::StrictOrdering, true);
+
+        a.launch_h2d(h2d(1), None).unwrap();
+        let a2 = a.clone();
+        assert_returns_promptly("a same-stream second op", move || {
+            a2.launch_h2d(h2d(1), None).unwrap();
+        });
+        assert_eq!(pending(&sched), 2);
+
+        fire(&sched, Ok(()));
+        fire(&sched, Ok(()));
+    }
+
+    // An UNTRACKED stream is user-owned: its conflicting op is neither
+    // recorded nor checked — it crosses immediately
+    // (`runtime_stream.hpp:85-86`).
+    #[test]
+    fn untracked_waiter_does_not_park() {
+        let sched = manual_scheduler();
+        let a = stream_on(&sched, RuntimeStreamMode::StrictOrdering, true);
+        let b = stream_on(&sched, RuntimeStreamMode::StrictOrdering, false);
+
+        a.launch_h2d(h2d(1), None).unwrap();
+        let b2 = b.clone();
+        assert_returns_promptly("an untracked waiter", move || {
+            b2.launch_d2h(d2h(1, false), None).unwrap();
+        });
+
+        fire(&sched, Ok(()));
+        fire(&sched, Ok(()));
+    }
+
+    // The flip side: a tracked op does not wait on an UNTRACKED producer's
+    // op — the producer was never recorded, so there is no edge to wait
+    // on. Ordering between a user-owned stream and a tracked one is the
+    // caller's obligation.
+    #[test]
+    fn tracked_waiter_does_not_park_on_untracked_producer() {
+        let sched = manual_scheduler();
+        let a = stream_on(&sched, RuntimeStreamMode::StrictOrdering, false);
+        let b = stream_on(&sched, RuntimeStreamMode::StrictOrdering, true);
+
+        a.launch_h2d(h2d(1), None).unwrap();
+        let b2 = b.clone();
+        assert_returns_promptly("a tracked waiter vs an untracked producer", move || {
+            b2.launch_d2h(d2h(1, false), None).unwrap();
+        });
+
+        fire(&sched, Ok(()));
+        fire(&sched, Ok(()));
     }
 }

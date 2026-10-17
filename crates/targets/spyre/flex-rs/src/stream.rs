@@ -65,6 +65,14 @@ impl StreamId {
     pub fn get(self) -> u64 {
         self.0
     }
+
+    /// Test-only: a deterministic id, so hazard-tracker tests (which assert
+    /// on cross-stream edge insertion between two specific streams) don't
+    /// depend on the global counter's state or on stream construction.
+    #[cfg(test)]
+    pub(crate) fn test_id(raw: u64) -> Self {
+        StreamId(raw)
+    }
 }
 
 /// Zero-based Spyre device index. Newtype over the raw `int` used by
@@ -135,6 +143,17 @@ pub enum RuntimeOperationKind {
 pub struct SubmittedOperation {
     pub kind: RuntimeOperationKind,
     pub pipeline_barrier: bool,
+    /// Port of `RuntimeOperationParams::skip_hazard`
+    /// (`runtime_submission_params.hpp:88`): "If true, hide this op from
+    /// the cross-stream hazard tracker" — a skipped op is "neither checked
+    /// against nor recorded as a producer/consumer"
+    /// (`runtime_submission_params.hpp:662-664`). In the shipped surface
+    /// only the DMA path threads it through (both `DmaParams`
+    /// constructors take `skip_hazard_in = false`); this port mirrors
+    /// that: only `launch_h2d`/`launch_d2h` read it off the
+    /// [`DmaParams`](crate::dma::DmaParams), every other kind submits the
+    /// base default `false`.
+    pub skip_hazard: bool,
     pub payload: Box<dyn std::any::Any + Send>,
 }
 
@@ -280,12 +299,21 @@ pub type CompletionCallback = Box<dyn FnOnce(Result<(), SchedulerError>) + Send>
 /// exact shape. Assembly may re-export/relocate this trait under
 /// `crate::scheduler` without changing its shape.
 pub trait SchedulerHandle: Send + Sync {
-    /// Port of `RuntimeScheduler::registerStream(StreamId, std::atomic<bool>*)`.
+    /// Port of `RuntimeScheduler::registerStream(StreamId, std::atomic<bool>*)`,
+    /// extended with the pod SDK's `track_hazards` stream-constructor flag
+    /// (`runtime_stream.hpp:82-88`): a stream registering with `true`
+    /// participates in cross-stream RAW/WAR/WAW edge insertion; `false`
+    /// (the C++ default) leaves it user-owned and never edged.
     /// `shutdown_flag` is the same `Arc<AtomicBool>` `RuntimeStream` itself
     /// reads/writes via `needs_shutdown`/`set_shutdown`, shared rather than
     /// passed as a raw pointer as in the C++ (the scheduler may want to poll
     /// or set it directly, e.g. on an unrecoverable hardware error).
-    fn register_stream(&self, stream_id: StreamId, shutdown_flag: Arc<AtomicBool>);
+    fn register_stream(
+        &self,
+        stream_id: StreamId,
+        shutdown_flag: Arc<AtomicBool>,
+        track_hazards: bool,
+    );
 
     /// Port of `RuntimeScheduler::releaseStream(StreamId)`.
     fn release_stream(&self, stream_id: StreamId);
@@ -337,16 +365,21 @@ pub struct RuntimeStream {
 
 impl RuntimeStream {
     /// Port of the `RuntimeStream` constructor, including
-    /// `scheduler_->registerStream(streamId(), &shutdown_)`.
+    /// `scheduler_->registerStream(streamId(), &shutdown_)`. The 5th
+    /// parameter is the pod SDK's `track_hazards` ctor flag
+    /// (`runtime_stream.hpp:88`): forwarded to the scheduler's hazard
+    /// tracker at registration time, never stored on the stream itself —
+    /// the vendor's tracker owns the tracked-set membership.
     pub fn new(
         scheduler: Arc<dyn SchedulerHandle>,
         device_id: DeviceId,
         priority: RuntimeStreamPriority,
         mode: RuntimeStreamMode,
+        track_hazards: bool,
     ) -> Arc<Self> {
         let stream_id = StreamId::next();
         let shutdown = Arc::new(AtomicBool::new(false));
-        scheduler.register_stream(stream_id, shutdown.clone());
+        scheduler.register_stream(stream_id, shutdown.clone(), track_hazards);
         Arc::new(Self {
             scheduler,
             stream_id,
@@ -605,6 +638,7 @@ impl RuntimeStream {
         let op = SubmittedOperation {
             kind: RuntimeOperationKind::H2D,
             pipeline_barrier,
+            skip_hazard: params.skip_hazard(),
             payload: Box::new(params),
         };
         self.launch_operation(op, user_cb)
@@ -625,6 +659,7 @@ impl RuntimeStream {
         let op = SubmittedOperation {
             kind: RuntimeOperationKind::D2H,
             pipeline_barrier,
+            skip_hazard: params.skip_hazard(),
             payload: Box::new(params),
         };
         self.launch_operation(op, user_cb)
@@ -651,6 +686,7 @@ impl RuntimeStream {
         let op = SubmittedOperation {
             kind: RuntimeOperationKind::Compute,
             pipeline_barrier,
+            skip_hazard: false,
             payload: Box::new(params),
         };
         self.launch_operation(op, user_cb)
@@ -726,6 +762,7 @@ impl RuntimeStream {
         let op = SubmittedOperation {
             kind: RuntimeOperationKind::Compute,
             pipeline_barrier,
+            skip_hazard: false,
             payload: Box::new(params),
         };
         self.launch_operation(op, user_cb)
@@ -750,6 +787,7 @@ impl RuntimeStream {
         let op = SubmittedOperation {
             kind: RuntimeOperationKind::Fill,
             pipeline_barrier: false,
+            skip_hazard: false,
             payload: Box::new(params),
         };
         self.launch_operation(op, None)
@@ -770,6 +808,7 @@ impl RuntimeStream {
         let op = SubmittedOperation {
             kind: RuntimeOperationKind::P2PRdmaSend,
             pipeline_barrier,
+            skip_hazard: false,
             payload: Box::new(params),
         };
         self.launch_operation(op, user_cb)
@@ -785,6 +824,7 @@ impl RuntimeStream {
         let op = SubmittedOperation {
             kind: RuntimeOperationKind::P2PRdmaWait,
             pipeline_barrier,
+            skip_hazard: false,
             payload: Box::new(params),
         };
         self.launch_operation(op, user_cb)
@@ -800,6 +840,7 @@ impl RuntimeStream {
         let op = SubmittedOperation {
             kind: RuntimeOperationKind::P2PFirmwareSignal,
             pipeline_barrier,
+            skip_hazard: false,
             payload: Box::new(params),
         };
         self.launch_operation(op, user_cb)
@@ -815,6 +856,7 @@ impl RuntimeStream {
         let op = SubmittedOperation {
             kind: RuntimeOperationKind::P2PFirmwareWait,
             pipeline_barrier,
+            skip_hazard: false,
             payload: Box::new(params),
         };
         self.launch_operation(op, user_cb)
@@ -838,6 +880,7 @@ impl RuntimeStream {
         let op = SubmittedOperation {
             kind: RuntimeOperationKind::LegacyP2PDataExchange,
             pipeline_barrier,
+            skip_hazard: false,
             payload: Box::new(operations),
         };
         self.launch_operation(op, user_cb)
@@ -1273,7 +1316,12 @@ mod tests {
     }
 
     impl SchedulerHandle for MockScheduler {
-        fn register_stream(&self, stream_id: StreamId, shutdown_flag: Arc<AtomicBool>) {
+        fn register_stream(
+            &self,
+            stream_id: StreamId,
+            shutdown_flag: Arc<AtomicBool>,
+            _track_hazards: bool,
+        ) {
             self.registered
                 .lock()
                 .unwrap()
@@ -1306,6 +1354,7 @@ mod tests {
         SubmittedOperation {
             kind,
             pipeline_barrier: false,
+            skip_hazard: false,
             payload: Box::new(()),
         }
     }
@@ -1319,6 +1368,7 @@ mod tests {
             DeviceId(0),
             RuntimeStreamPriority::default(),
             RuntimeStreamMode::default(),
+            false,
         );
 
         assert_eq!(stream.execution_mode(), RuntimeStreamMode::StrictOrdering);
@@ -1334,6 +1384,7 @@ mod tests {
             DeviceId(0),
             RuntimeStreamPriority::High,
             RuntimeStreamMode::OpOrdering,
+            false,
         );
 
         assert_eq!(stream.execution_mode(), RuntimeStreamMode::OpOrdering);
@@ -1349,18 +1400,21 @@ mod tests {
             DeviceId(0),
             RuntimeStreamPriority::Normal,
             RuntimeStreamMode::StrictOrdering,
+            false,
         );
         let stream2 = RuntimeStream::new(
             scheduler.clone(),
             DeviceId(0),
             RuntimeStreamPriority::Normal,
             RuntimeStreamMode::OpOrdering,
+            false,
         );
         let stream3 = RuntimeStream::new(
             scheduler,
             DeviceId(0),
             RuntimeStreamPriority::High,
             RuntimeStreamMode::StrictOrdering,
+            false,
         );
 
         assert_ne!(stream1.stream_id(), stream2.stream_id());
@@ -1389,6 +1443,7 @@ mod tests {
             DeviceId(7),
             RuntimeStreamPriority::default(),
             RuntimeStreamMode::default(),
+            false,
         );
 
         assert_eq!(stream.device_id(), DeviceId(7));
@@ -1416,6 +1471,7 @@ mod tests {
                             DeviceId(0),
                             RuntimeStreamPriority::default(),
                             RuntimeStreamMode::default(),
+                            false,
                         );
                         ids.push(stream.stream_id());
                     }
@@ -1455,6 +1511,7 @@ mod tests {
             DeviceId(0),
             RuntimeStreamPriority::default(),
             RuntimeStreamMode::default(),
+            false,
         );
 
         let fired = Arc::new(AtomicBool::new(false));
@@ -1487,6 +1544,7 @@ mod tests {
             DeviceId(0),
             RuntimeStreamPriority::default(),
             RuntimeStreamMode::default(),
+            false,
         );
 
         assert!(
@@ -1520,6 +1578,7 @@ mod tests {
             DeviceId(0),
             RuntimeStreamPriority::default(),
             RuntimeStreamMode::default(),
+            false,
         );
 
         let callback_count = Arc::new(AtomicUsize::new(0));
@@ -1555,6 +1614,7 @@ mod tests {
             DeviceId(0),
             RuntimeStreamPriority::default(),
             RuntimeStreamMode::default(),
+            false,
         );
 
         scheduler.push_outcome(Err("Deferred Error First".to_string()));
@@ -1614,6 +1674,7 @@ mod tests {
             DeviceId(0),
             RuntimeStreamPriority::default(),
             RuntimeStreamMode::default(),
+            false,
         );
         stream
             .launch_operation(dummy_op(RuntimeOperationKind::H2D), None)
@@ -1654,6 +1715,7 @@ mod tests {
             DeviceId(0),
             RuntimeStreamPriority::default(),
             RuntimeStreamMode::default(),
+            false,
         );
         stream.set_shutdown(true);
 
@@ -1677,6 +1739,7 @@ mod tests {
             DeviceId(0),
             RuntimeStreamPriority::default(),
             RuntimeStreamMode::default(),
+            false,
         );
         stream
             .launch_operation(dummy_op(RuntimeOperationKind::H2D), None)
@@ -1725,6 +1788,7 @@ mod tests {
             DeviceId(0),
             RuntimeStreamPriority::default(),
             RuntimeStreamMode::default(),
+            false,
         );
         stream
             .launch_operation(dummy_op(RuntimeOperationKind::H2D), None)
@@ -1758,6 +1822,7 @@ mod tests {
             DeviceId(0),
             RuntimeStreamPriority::default(),
             RuntimeStreamMode::default(),
+            false,
         );
         let event = Arc::new(crate::event::Event::new());
         event.signal();
@@ -1791,6 +1856,7 @@ mod tests {
             DeviceId(0),
             RuntimeStreamPriority::default(),
             RuntimeStreamMode::default(),
+            false,
         );
         let event = Arc::new(crate::event::Event::new());
         event.poison(Arc::new(RuntimeStreamError::Scheduler(
@@ -1833,6 +1899,7 @@ mod tests {
             DeviceId(0),
             RuntimeStreamPriority::default(),
             RuntimeStreamMode::default(),
+            false,
         );
         stream.set_shutdown(true);
 

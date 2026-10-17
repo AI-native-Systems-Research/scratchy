@@ -300,6 +300,10 @@ impl RuntimeContext {
             device_id,
             RuntimeStreamPriority::Normal,
             RuntimeStreamMode::StrictOrdering,
+            // The default stream is untracked (`runtime_context.hpp:70-78`:
+            // `createStream`'s `track_hazards` default is false, and the
+            // default stream is created outside any tracking request).
+            false,
         );
         let default_stream_id = default_stream.stream_id();
         let mut streams = HashMap::new();
@@ -441,14 +445,25 @@ impl RuntimeContext {
         Ok(self.allocator.clone())
     }
 
-    /// Port of `RuntimeContext::createStream`.
+    /// Port of `RuntimeContext::createStream`, extended with the pod SDK's
+    /// `track_hazards` parameter (`runtime_context.hpp:70-78`): `true` and
+    /// "the scheduler mints cross-stream ordering edges for it"; `false`
+    /// (the C++ default) and "the stream is user-owned and untracked.
+    /// Same-stream ordering is unaffected" either way.
     pub fn create_stream(
         &self,
         priority: RuntimeStreamPriority,
         mode: RuntimeStreamMode,
+        track_hazards: bool,
     ) -> Result<StreamId, RuntimeContextError> {
         self.check_active()?;
-        let stream = RuntimeStream::new(self.scheduler.clone(), self.device_id, priority, mode);
+        let stream = RuntimeStream::new(
+            self.scheduler.clone(),
+            self.device_id,
+            priority,
+            mode,
+            track_hazards,
+        );
         let id = stream.stream_id();
         self.streams.lock().unwrap().insert(id, stream);
         Ok(id)
@@ -582,7 +597,13 @@ mod tests {
     /// `launch_operation` ever runs, completes immediately.
     struct NullScheduler;
     impl SchedulerHandle for NullScheduler {
-        fn register_stream(&self, _stream_id: StreamId, _shutdown_flag: Arc<AtomicBool>) {}
+        fn register_stream(
+            &self,
+            _stream_id: StreamId,
+            _shutdown_flag: Arc<AtomicBool>,
+            _track_hazards: bool,
+        ) {
+        }
         fn release_stream(&self, _stream_id: StreamId) {}
         fn schedule(
             &self,
@@ -765,7 +786,8 @@ mod tests {
             assert!(matches!(
                 ctx.create_stream(
                     RuntimeStreamPriority::default(),
-                    RuntimeStreamMode::default()
+                    RuntimeStreamMode::default(),
+                    false
                 ),
                 Err(RuntimeContextError::NotCreated)
             ));
@@ -848,6 +870,7 @@ mod tests {
                 .create_stream(
                     RuntimeStreamPriority::default(),
                     RuntimeStreamMode::default(),
+                    false,
                 )
                 .unwrap();
             let stream = ctx.get_stream(id).unwrap().unwrap();
@@ -865,6 +888,7 @@ mod tests {
                 .create_stream(
                     RuntimeStreamPriority::default(),
                     RuntimeStreamMode::default(),
+                    false,
                 )
                 .unwrap();
             let stream = ctx.get_stream(id).unwrap().unwrap();
@@ -886,6 +910,7 @@ mod tests {
                 .create_stream(
                     RuntimeStreamPriority::default(),
                     RuntimeStreamMode::default(),
+                    false,
                 )
                 .unwrap();
             let stream = ctx.get_stream(id).unwrap().unwrap();
@@ -907,6 +932,7 @@ mod tests {
                 .create_stream(
                     RuntimeStreamPriority::default(),
                     RuntimeStreamMode::default(),
+                    false,
                 )
                 .unwrap();
             let broken = ctx.get_stream(broken_id).unwrap().unwrap();
@@ -917,6 +943,7 @@ mod tests {
                 .create_stream(
                     RuntimeStreamPriority::default(),
                     RuntimeStreamMode::default(),
+                    false,
                 )
                 .unwrap();
             let fresh = ctx.get_stream(fresh_id).unwrap().unwrap();
@@ -934,6 +961,7 @@ mod tests {
                 .create_stream(
                     RuntimeStreamPriority::default(),
                     RuntimeStreamMode::default(),
+                    false,
                 )
                 .unwrap();
             let stream = ctx.get_stream(id).unwrap().unwrap();
