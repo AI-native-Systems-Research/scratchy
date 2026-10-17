@@ -3525,7 +3525,6 @@ dependencies = [
  "hf-hub-downloader",
  "indicatif",
  "inventory",
- "llguidance",
  "safetensors",
  "scratchy-core-common",
  "serde",
@@ -3533,8 +3532,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokenizers 0.23.2",
- "toktrie",
- "toktrie_hf_tokenizers",
  "tracing",
 ]
 
@@ -3737,13 +3734,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "inventory",
+ "llguidance",
  "scratchy-core-common",
  "scratchy-core-config",
  "scratchy-core-model",
  "scratchy-serving-scheduler",
  "scratchy-serving-transport",
+ "serde_json",
  "thiserror 2.0.21",
  "tokenizers 0.23.2",
+ "toktrie",
+ "toktrie_hf_tokenizers",
  "tracing",
 ]
 

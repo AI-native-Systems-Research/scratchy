@@ -31,7 +31,7 @@ spyre-hw = ["spyre", "dep:scratchy-builder-spyre", "scratchy-builder-spyre/spyre
 # differs is the device underneath. Forwards into the models crate so the macro's bake-time
 # numeric gate runs on every emu build (see the macro crate's `spyre-emu`).
 spyre-emu = ["spyre", "scratchy-target-spyre/spyre-emu", "scratchy-models/spyre-emu"]
-guided-decoding = ["scratchy-core-model/guided-decoding", "scratchy-target-cuda?/guided-decoding"]
+guided-decoding = ["scratchy-serving-engine/guided-decoding", "scratchy-target-cuda?/guided-decoding"]
 
 [dependencies]
 # The weight-load path fans the bf16→f16 narrowing across cores; pulled in by `spyre` (see the

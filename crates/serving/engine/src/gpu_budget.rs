@@ -457,7 +457,7 @@ mod bucket_selection_tests {
 
     #[test]
     fn empty_ladder_is_safe() {
-        let sel = select_prefill_bucket(43 * GIB, 1 * GIB, &[], 0.6);
+        let sel = select_prefill_bucket(43 * GIB, GIB, &[], 0.6);
         assert_eq!(
             sel,
             PrefillBucketSelection {

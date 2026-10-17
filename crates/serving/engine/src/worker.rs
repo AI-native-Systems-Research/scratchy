@@ -535,10 +535,7 @@ mod tests {
             "the narrowest reporting rank wins"
         );
         align_all_max_num_seqs(&mut ranks);
-        let widths: Vec<_> = ranks
-            .iter()
-            .map(|w: &Box<dyn Worker>| w.max_num_seqs_override())
-            .collect();
+        let widths: Vec<_> = ranks.iter().map(|w| w.max_num_seqs_override()).collect();
         // Both reporting ranks now sit at ONE width; the silent rank stays
         // silent (its pools were never sized by the flag's default).
         assert_eq!(widths, vec![Some(205), Some(205), None]);

@@ -17,7 +17,8 @@ const SAMPLING_EPS: f64 = 1e-5;
 /// Specifies a grammar constraint for structured output / constrained decoding.
 ///
 /// Stored in `SamplingParams` and used by workers to create per-request
-/// `GrammarGuide` instances that mask logits during sampling.
+/// `scratchy_serving_engine::grammar::GrammarGuide` instances that mask logits
+/// during sampling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GuidedGrammar {
     /// `response_format: { type: "json_object" }` — output must be valid JSON.

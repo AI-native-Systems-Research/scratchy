@@ -8,7 +8,6 @@ description = "Model loading, weight management, and tensor abstractions for vLL
 [features]
 default = []
 multimodal = []
-guided-decoding = ["llguidance", "toktrie", "toktrie_hf_tokenizers"]
 
 [dependencies]
 scratchy-core-common = { workspace = true }
@@ -21,9 +20,6 @@ indicatif = { workspace = true }
 inventory = { workspace = true }
 tokenizers = { workspace = true }
 tracing = { workspace = true }
-llguidance = { workspace = true, optional = true }
-toktrie = { workspace = true, optional = true }
-toktrie_hf_tokenizers = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
