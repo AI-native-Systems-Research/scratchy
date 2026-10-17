@@ -9,19 +9,29 @@
 #   long   - a ~--long-tokens prompt (default 30000; the real-world case is
 #            Claude Code's ~30.3k-token startup prompt — pass --prompt-file)
 #   short  - a ~10-token chat prompt (decode/small-bucket control)
-#   batch  - two concurrent ~4200-token prompts (leg value = mean of the two
-#            requests' TTFTs)
-#   64|512|1024|2048|4096 - a prompt of exactly that many tokens, one per
-#            rung of the default prefill ladder
+#   batch  - two DISTINCT concurrent ~4200-token prompts (leg value = mean of
+#            the two requests' TTFTs; identical prompts could be served one
+#            from the other's prefix cache, which would not be a two-sequence
+#            prefill at all)
+#   64|512|1024|2048|4096 - a prompt sized to land in that rung of the
+#            default prefill ladder: --template-pad tokens of headroom for
+#            the chat template below the rung, built from single-token
+#            repeats. Each leg prints the server-log prompt-token count and
+#            the selected bucket, and the sweep warns if a rung shape landed
+#            outside its rung — the count is exact only in the log.
 #
 # Measurement rules (review-hardened):
-#   - PAIR ORDER BIASES (wired memory released asynchronously after a server
-#     exits): legs settle before launch (vm_stat poll back within ~2 GiB of
-#     the pre-run baseline, bounded) and reps alternate the starting side,
-#     with an EVEN rep count enforced so base-first and candidate-first pairs
-#     balance exactly.
-#   - THE WHOLE MACHINE IS GATED, per launch: any scr serve/chat/bench,
-#     mlx_lm, or cargo/rustc job blocks the next server start (bounded wait).
+#   - PAIR ORDER BIASES (wired memory is released asynchronously after a
+#     server exits): every leg settles before launch — machine-quiet gate,
+#     then a vm_stat poll until wired memory is back within ~2 GiB of the
+#     pre-run baseline. Reps alternate the starting side with an EVEN rep
+#     count enforced, so base-first and candidate-first pairs balance.
+#   - THE GATES ARE GATES: a machine that is still busy, or wired memory
+#     that never settles, FAILS the run — a contaminated leg is not timed
+#     with a warning, it is not timed.
+#   - THE WHOLE MACHINE IS GATED, per launch and per build: any
+#     scr serve/chat/bench, mlx_lm, or cargo/rustc job blocks (this includes
+#     this script's own one-shot release builds).
 #   - FRESH SERVER PER LEG: the in-memory prefix cache makes a warm server
 #     answer in ~0.09s.
 #   - A NON-200 RESPONSE IS A FAILED LEG, NOT A FAST ONE: the server stays
@@ -31,8 +41,6 @@
 #   - Each leg's weights+overhead / kv_budget startup line is printed and
 #     compared across legs of a shape — a reservation difference between base
 #     and candidate is a confounder, not a result.
-#   - The synthetic prompts' real token counts come from the server log
-#     ("prompt tokens: N") — filler is word-approximate, the log is exact.
 #
 # Usage:
 #   one-shot (default):   scripts/bench_prefill_ab.sh --pr 597
@@ -41,10 +49,11 @@
 #   explicit binaries:    scripts/bench_prefill_ab.sh --base <scr> --cand <scr>
 #     (both must have the model compiled in; skips the fetch/build)
 #   scripts/bench_prefill_ab.sh --pr 597 --reps 4 \
-#     [--remote upstream] [--base-ref main] [--cand-ref pull/597/head] \
+#     [--remote upstream] [--base-ref main] \
 #     [--model mlx-community/Qwen3.6-35B-A3B-4bit] \
 #     [--features 'metal,model/qwen3.6-35b-a3b,quant/mlx,serve,claude'] \
-#     [--shapes long,short,batch,64,512,1024,2048,4096] [--prompt-file f]
+#     [--shapes long,short,batch,64,512,1024,2048,4096] [--prompt-file f] \
+#     [--template-pad 32]
 
 set -euo pipefail
 
@@ -59,6 +68,7 @@ REMOTE=upstream
 BASE_REF=main
 PROMPT_FILE=
 LONG_TOKENS=30000
+TEMPLATE_PAD=32
 while [ $# -gt 0 ]; do
   case "$1" in
     --pr) PR=$2; shift 2 ;;
@@ -72,6 +82,7 @@ while [ $# -gt 0 ]; do
     --shapes) SHAPES=$2; shift 2 ;;
     --prompt-file) PROMPT_FILE=$2; shift 2 ;;
     --long-tokens) LONG_TOKENS=$2; shift 2 ;;
+    --template-pad) TEMPLATE_PAD=$2; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -89,38 +100,7 @@ AB="$ROOT/.pr-ab-${PR:-manual}"
 TMP="$AB/tmp"
 mkdir -p "$TMP"
 
-if [ -n "$BASE_BIN" ] && [ -n "$CAND_BIN" ]; then
-  [ -x "$BASE_BIN" ] || { echo "not executable: $BASE_BIN" >&2; exit 2; }
-  [ -x "$CAND_BIN" ] || { echo "not executable: $CAND_BIN" >&2; exit 2; }
-  BASE_BIN=$(realpath "$BASE_BIN"); CAND_BIN=$(realpath "$CAND_BIN")
-elif [ -n "$PR" ]; then
-  CAND_REF="pull/$PR/head"
-  # fetch + build both refs, each in its own worktree and target dir
-  build_ref() { # $1 dir-suffix  $2 git ref
-    local sha wt
-    sha=$(git -C "$ROOT" fetch --quiet "$REMOTE" "$2" && git -C "$ROOT" rev-parse FETCH_HEAD)
-    wt="$AB/$1"
-    if [ ! -d "$wt" ]; then
-      git -C "$ROOT" worktree add --detach "$wt" "$sha"
-    else
-      git -C "$wt" fetch --quiet "$REMOTE" "$2" \
-        && git -C "$wt" checkout --quiet --detach FETCH_HEAD
-    fi
-    echo "building $1 at $sha ($2)" >&2
-    (cd "$wt" && CARGO_TARGET_DIR="$AB/$1-target" \
-       cargo build -F "$FEATURES" --release -p scratchy-cli) >&2
-  }
-  build_ref base "$BASE_REF"
-  build_ref cand "$CAND_REF"
-  BASE_BIN="$AB/base-target/release/scr"
-  CAND_BIN="$AB/cand-target/release/scr"
-  echo "cleanup when done:"
-  echo "  git worktree remove --force $AB/base; git worktree remove --force $AB/cand; rm -rf $AB"
-else
-  echo "need --pr <n>, or both --base and --cand" >&2; exit 2
-fi
-
-# --- machine gates -----------------------------------------------------------
+# --- machine gates (defined before anything that needs them) -----------------
 
 wired_bytes() {
   local pages pagesize
@@ -128,10 +108,10 @@ wired_bytes() {
   pagesize=$(pagesize)
   echo $(( pages * pagesize ))
 }
-BASELINE_WIRED=$(wired_bytes)
 
 # Wait for every GPU/CPU job that would pollute a leg: scr serve/chat/bench,
-# mlx_lm, cargo build/test/clippy (and their rustc children). Bounded.
+# mlx_lm, cargo build/test/clippy (and their rustc children). On timeout the
+# run FAILS — a gate with an escape hatch is not a gate.
 wait_machine_quiet() {
   local deadline=$(( SECONDS + 600 ))
   while pgrep -f 'scr (serve|chat|bench)' >/dev/null 2>&1 \
@@ -139,15 +119,16 @@ wait_machine_quiet() {
      || pgrep -x cargo >/dev/null 2>&1 \
      || pgrep -x rustc >/dev/null 2>&1; do
     if [ $SECONDS -ge $deadline ]; then
-      echo "WARNING: machine still busy after 600s, benching anyway" >&2
-      return 0
+      echo "FAIL: machine still busy after 600s, refusing to bench a contaminated leg" >&2
+      return 1
     fi
     sleep 5
   done
 }
 
 # Wired GPU memory is released asynchronously after a server exits: wait for
-# it to return within ~2 GiB of the pre-run baseline, bounded at 120s.
+# it to return within ~2 GiB of the pre-run baseline. On timeout the run
+# FAILS, for the same reason.
 wait_wired_settled() {
   local deadline=$(( SECONDS + 120 )) w
   while :; do
@@ -156,8 +137,8 @@ wait_wired_settled() {
       return 0
     fi
     if [ $SECONDS -ge $deadline ]; then
-      echo "WARNING: wired memory not settled ($(( (w - BASELINE_WIRED) / 1024 / 1024 )) MiB over baseline), proceeding" >&2
-      return 0
+      echo "FAIL: wired memory not settled ($(( (w - BASELINE_WIRED) / 1024 / 1024 )) MiB over baseline) after 120s" >&2
+      return 1
     fi
     sleep 2
   done
@@ -166,11 +147,20 @@ wait_wired_settled() {
 # --- prompts and requests ----------------------------------------------------
 
 # Filler paragraph: 75 words ~ 100 tokens per repetition. Word-approximate on
-# purpose; the server log's "prompt tokens:" line is the exact count.
+# purpose; only for the long/chunk/batch shapes, whose sizes are labels, not
+# rung targets. The server log's "prompt tokens:" line is the exact count.
 synth_prompt() { # $1 = target tokens
   local para='The quick brown fox jumps over the lazy dog while the server warms its weights and the scheduler queues the first prefill chunk. Every op is a compile-time constant here: the tape was expanded at build time, the buckets were chosen, and the kernels only wait for their barriers. Latency is the only variable left, so we measure it twice, in both orders, because the second server always pays for the first one teardown.'
   local reps=$(( $1 / 95 + 1 ))
   for _ in $(seq 1 "$reps"); do printf '%s ' "$para"; done
+}
+
+# Single-token repeats: "token" is one BPE token in the Qwen vocabularies, so
+# N repeats ≈ N tokens (the log's prompt-token count confirms, and the sweep
+# warns if a rung shape lands outside its rung).
+synth_exact() { # $1 = token count
+  local i
+  for i in $(seq 1 "$1"); do printf 'token '; done
 }
 
 # request_json <max_tokens> <prompt>  (prompt travels via env, not argv, so
@@ -189,10 +179,12 @@ PY
 
 # run_leg <scr> <shape> -> prints one number: the leg's TTFT metric in
 # seconds (server-log ttft_ms for singles; mean curl TTFT for batch), and
-# appends the leg's memory line to $MEMLOG.
+# appends the leg's memory line to $MEMLOG. Writes the leg's prompt-token
+# count and bucket to $LEGINFO.
 run_leg() { # $1 scr  $2 shape
   local scr=$1 shape=$2 port slog req srv ok=0 t code metric mem
-  wait_machine_quiet
+  wait_machine_quiet || return 1
+  wait_wired_settled || return 1
   port=$(( 20000 + RANDOM % 20000 ))
   slog=$(mktemp "$TMP/leg.XXXXXX.log")
   req=$(mktemp "$TMP/leg.XXXXXX.json")
@@ -221,17 +213,22 @@ run_leg() { # $1 scr  $2 shape
   local url="http://127.0.0.1:$port/v1/messages"
   local hdr='content-type: application/json'
   if [ "$shape" = batch ]; then
-    local tmp1 tmp2
+    # two DISTINCT prompts: identical concurrent prompts can be served one
+    # from the other's prefix cache, which would not exercise the
+    # multi-sequence prefill path at all
+    local req2 tmp1 tmp2
+    req2=$(mktemp "$TMP/leg.XXXXXX.json2")
+    request_json 1 "Request B (nonce $RANDOM). $PROMPT" > "$req2"
     tmp1=$(mktemp "$TMP/b1.XXXXXX"); tmp2=$(mktemp "$TMP/b2.XXXXXX")
     cleanup() {
       kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null
-      rm -f "$slog" "$req" "$tmp1" "$tmp2"
+      rm -f "$slog" "$req" "$req2" "$tmp1" "$tmp2"
     }
     curl -s -o /dev/null -w '%{time_starttransfer} %{http_code}\n' -H "$hdr" \
       --data @"$req" "$url" > "$tmp1" &
     local bg=$!
     curl -s -o /dev/null -w '%{time_starttransfer} %{http_code}\n' -H "$hdr" \
-      --data @"$req" "$url" > "$tmp2"
+      --data @"$req2" "$url" > "$tmp2"
     wait "$bg"
     for f in "$tmp1" "$tmp2"; do
       read -r _ code < "$f"
@@ -254,6 +251,14 @@ run_leg() { # $1 scr  $2 shape
     grep -n "panicked\|ERROR" "$slog" | tail -5 >&2
     return 1
   fi
+  # exact sizing evidence: this leg's prompt-token count (the request-finished
+  # line's prompt_tokens=N is the exact count) and the rung it implies — the
+  # per-chunk tape is the smallest ladder rung >= the chunk's tokens; the
+  # startup "prefill bucket =" line is the resident MAX, not the tape used
+  local ptok
+  ptok=$(grep -o 'prompt_tokens=[0-9]*' "$slog" | tail -1 | grep -o '[0-9]*$' || true)
+  echo "  prompt tokens: ${ptok:-?}" >&2
+  printf '%s\n' "${ptok:-?}" > "$LEGINFO"
   # authoritative number: the last ttft_ms in the server log
   local ms
   ms=$(grep -o 'ttft_ms[":= ]*[0-9.]*' "$slog" | tail -1 | grep -o '[0-9.]*$')
@@ -267,15 +272,55 @@ prompt_for_shape() { # $1 shape
       if [ -n "$PROMPT_FILE" ]; then cat "$PROMPT_FILE"; else synth_prompt "$LONG_TOKENS"; fi ;;
     short) echo 'Say hi and nothing else.' ;;
     batch) synth_prompt 4200 ;;
-    *) synth_prompt "$1" ;;   # rung shapes: 64/512/1024/2048/4096
+    # rung shapes: leave --template-pad tokens of headroom for the chat
+    # template, built from single-token repeats so the count is predictable
+    *) synth_exact $(( $1 - TEMPLATE_PAD )) ;;
   esac
 }
 
+# --- one-shot setup ------------------------------------------------------------
+
+if [ -n "$BASE_BIN" ] && [ -n "$CAND_BIN" ]; then
+  [ -x "$BASE_BIN" ] || { echo "not executable: $BASE_BIN" >&2; exit 2; }
+  [ -x "$CAND_BIN" ] || { echo "not executable: $CAND_BIN" >&2; exit 2; }
+  BASE_BIN=$(realpath "$BASE_BIN"); CAND_BIN=$(realpath "$CAND_BIN")
+elif [ -n "$PR" ]; then
+  CAND_REF="pull/$PR/head"
+  # fetch + build both refs, each in its own worktree and target dir. The
+  # builds are gated too: a release build is heavy enough to need the
+  # machine-quiet check (a concurrent leg elsewhere would be polluted).
+  build_ref() { # $1 dir-suffix  $2 git ref
+    local sha wt
+    sha=$(git -C "$ROOT" fetch --quiet "$REMOTE" "$2" && git -C "$ROOT" rev-parse FETCH_HEAD)
+    wt="$AB/$1"
+    if [ ! -d "$wt" ]; then
+      git -C "$ROOT" worktree add --detach "$wt" "$sha"
+    else
+      git -C "$wt" fetch --quiet "$REMOTE" "$2" \
+        && git -C "$wt" checkout --quiet --detach FETCH_HEAD
+    fi
+    echo "building $1 at $sha ($2)" >&2
+    wait_machine_quiet || exit 1
+    (cd "$wt" && CARGO_TARGET_DIR="$AB/$1-target" \
+       cargo build -F "$FEATURES" --release -p scratchy-cli) >&2
+  }
+  build_ref base "$BASE_REF"
+  build_ref cand "$CAND_REF"
+  BASE_BIN="$AB/base-target/release/scr"
+  CAND_BIN="$AB/cand-target/release/scr"
+  echo "cleanup when done:"
+  echo "  git worktree remove --force $AB/base; git worktree remove --force $AB/cand; rm -rf $AB"
+else
+  echo "need --pr <n>, or both --base and --cand" >&2; exit 2
+fi
+
 # --- the sweep ----------------------------------------------------------------
 
+BASELINE_WIRED=$(wired_bytes)
+LEGINFO="$TMP/lastleg.txt"
 echo "base=$BASE_BIN"
 echo "cand=$CAND_BIN"
-echo "model=$MODEL reps=$REPS shapes=$SHAPES"
+echo "model=$MODEL reps=$REPS shapes=$SHAPES template_pad=$TEMPLATE_PAD"
 echo "baseline wired: $(( BASELINE_WIRED / 1024 / 1024 )) MiB"
 for shape in ${SHAPES//,/ }; do
   PROMPT=$(prompt_for_shape "$shape")
@@ -295,6 +340,23 @@ for shape in ${SHAPES//,/ }; do
     fi
     deltas+=("$d")
     echo "rep$i: $fl ${a}s $sl ${b}s delta(cand-base)=${d}ms"
+    # rung sanity: a numeric shape must land inside its rung, or the row is
+    # mislabeled — the bucket selection is the ladder's, not the prompt's
+    case "$shape" in
+      [0-9]*)
+        read -r ptok < "$LEGINFO" 2>/dev/null || ptok='?'
+        if [ "$ptok" != '?' ]; then
+          # the per-chunk tape is the smallest ladder rung >= the prompt
+          expected=OVER
+          for r in 1 2 4 8 64 512 1024 2048 4096; do
+            if [ "$r" -ge "$ptok" ]; then expected=$r; break; fi
+          done
+          if [ "$expected" != "$shape" ]; then
+            echo "WARNING: shape=$shape prompt is $ptok tokens — runs the $expected rung; adjust --template-pad (now $TEMPLATE_PAD)" >&2
+          fi
+        fi
+        ;;
+    esac
   done
   med=$(printf '%s\n' "${deltas[@]}" | sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2}')
   echo "shape=$shape median delta = ${med}ms over $REPS order-balanced pairs"
