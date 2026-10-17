@@ -370,8 +370,10 @@ impl fmt::Display for AllocError {
 }
 impl std::error::Error for AllocError {}
 
-/// One created `flex::RuntimeStream`. Dropping it destroys the stream, which drains the
-/// scheduler's per-stream fence deques (the resident-session leak fix recreates one per forward).
+/// One created `flex::RuntimeStream`. Dropping it destroys the stream, which synchronizes it and
+/// erases its scheduler bookkeeping (per-stream fence deques included — though a resolved fence
+/// now leaves its deque at completion, `SchedulerState::retire_fence`, so those hold only
+/// in-flight fences and the stream can stay alive for a whole resident session).
 ///
 /// `Send` by construction: the handle is an `Arc` clone of the shared `RuntimeContext` plus a
 /// `StreamId` — both plain shared state. The stream is only ever used from the session's own
@@ -641,8 +643,8 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        // `destroy_stream` synchronizes (draining the scheduler's per-stream fence deques — the
-        // leak fix `predict` relies on when it recreates the stream each forward) and itself
+        // `destroy_stream` synchronizes (draining whatever in-flight fences the stream still
+        // owes — resolved ones leave their deque at completion now, `retire_fence`) and itself
         // logs-and-swallows any deferred error.
         let _ = self.rt.destroy_stream(self.id);
     }
