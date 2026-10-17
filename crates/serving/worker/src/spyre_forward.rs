@@ -794,6 +794,9 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
 struct ChunkKeys {
     resident: usize,
     mapped: u32,
+    /// Whose rows the body attends with. It decides the value leg's entry order
+    /// (`ChunkScratch::lx_form`), and the bake took it from the same fact.
+    rows: scratchy_subtile::sdsc_abstract::ChunkRowKind,
 }
 
 #[cfg(feature = "spyre-hw")]
@@ -826,7 +829,11 @@ fn chunk_index_table(
     ctx: PageMapCtx<'_>,
     keys: ChunkKeys,
 ) -> ExecutorResult<Option<Vec<scratchy_subtile::sdsc_abstract::GatherEntry>>> {
-    let ChunkKeys { resident, mapped } = keys;
+    let ChunkKeys {
+        resident,
+        mapped,
+        rows,
+    } = keys;
     if !step.gathers().get() {
         return Ok(None);
     }
@@ -864,14 +871,19 @@ fn chunk_index_table(
             ctx.host.len(),
         ))
     })?;
-    scratchy_subtile::sdsc_abstract::chunk_gather_index_table(scratch, &map.as_i64(), per_page)
-        .map(Some)
-        .ok_or_else(|| {
-            werr(format!(
-                "{what}: could not build the chunk gather's index table from this request's page map \
+    scratchy_subtile::sdsc_abstract::chunk_gather_index_table(
+        scratch,
+        rows,
+        &map.as_i64(),
+        per_page,
+    )
+    .map(Some)
+    .ok_or_else(|| {
+        werr(format!(
+            "{what}: could not build the chunk gather's index table from this request's page map \
                  — the map is empty or an entry overflows int32"
-            ))
-        })
+        ))
+    })
 }
 
 #[cfg(feature = "spyre-hw")]
@@ -1196,6 +1208,7 @@ pub(crate) fn superdsc_forward_chunk(
                     ChunkKeys {
                         resident: chunk_start,
                         mapped: chunk_start as u32,
+                        rows: scratchy_subtile::sdsc_abstract::ChunkRowKind::Prompt,
                     },
                 )?;
                 prefill_logits = run_prefill_batch(
@@ -1483,6 +1496,7 @@ pub(crate) fn superdsc_forward_chunk(
             ChunkKeys {
                 resident: p,
                 mapped: p as u32 + 1,
+                rows: scratchy_subtile::sdsc_abstract::ChunkRowKind::OneRequest,
             },
         )?;
         let inputs = scratchy_target_spyre::forward_tape::ForwardInputs {

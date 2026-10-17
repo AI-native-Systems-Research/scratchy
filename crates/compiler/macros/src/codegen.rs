@@ -9804,6 +9804,14 @@ fn synth_role_tokens(
         R::XSScratch => quote! { #b::XSScratch },
         R::XRaw => quote! { #b::XRaw },
         R::XDqA => quote! { #b::XDqA },
+        R::GatherKtLx(i) => {
+            let i = proc_macro2::Literal::u32_unsuffixed(*i);
+            quote! { #b::GatherKtLx(#i) }
+        }
+        R::GatherVLx(h) => {
+            let h = proc_macro2::Literal::u32_unsuffixed(*h);
+            quote! { #b::GatherVLx(#h) }
+        }
     }
 }
 
@@ -11745,6 +11753,13 @@ fn dump_wavefront_mega(
                                                     },
                                                 },
                                             );
+                                            // ⛔ AND THE SESSION THIS BODY OPENS ALLOCATES FOR EVERY
+                                            // SIBLING IT LAUNCHES, not for itself alone: a rung whose
+                                            // scratch outgrows the ceiling's addresses past its segment.
+                                            if let Err(e) = superdsc::cover_ladder_allocation(&bfp)
+                                            {
+                                                panic!("[spyre-superdsc] {base}: {e}");
+                                            }
                                             // The prefill probe's rotary classes, from the SAME
                                             // bindings the wiring bakes its classes from — one
                                             // value law (`superdsc_rotary_kind`), two consumers

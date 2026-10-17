@@ -478,10 +478,15 @@ pub fn assemble_matmul_placed<O: crate::sdsc_abstract::KindTag>(
 /// OpSpec becomes an EmittedOp cannot apply to one and not the other.
 fn assemble_from_opspec(
     op_name: &str,
-    op: crate::superdsc_opspec::OpSpec,
+    mut op: crate::superdsc_opspec::OpSpec,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
+    // ⭐ A KERNEL MAY LIVE IN LX — the split-KV chunk's gathered Kᵗ and V (`ChunkScratch::lx_form`), read by
+    // the core that gathered it. The residency is the tensor's (decided where its name is pinned), so the
+    // matmul door consults it by name exactly as the pointwise door does; `emit`'s core-local read law
+    // then proves this op hands each core the slice its producer wrote. No-op for every unpinned operand.
+    crate::emit::apply_lx_residency(&mut op, layout);
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"))

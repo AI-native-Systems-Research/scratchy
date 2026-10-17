@@ -310,7 +310,7 @@ pub fn assemble_gather_copy(
     // defect, whose overrun is another page's keys read as block numbers) and the two pins could drift
     // apart with nothing refusing it. See `sdsc_abstract::CopyDims`.
     let d = copy.dims();
-    let op = gather_copy_opspec(
+    let mut op = gather_copy_opspec(
         src,
         dst,
         d.mb(),
@@ -336,6 +336,10 @@ pub fn assemble_gather_copy(
         ),
     )
     .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
+    // ⭐ THE DESTINATION MAY BE CORE-LOCAL LX — the chunk's V, landing in the scratchpad of the core whose
+    // PV contracts it (`ChunkScratch::lx_form`). The copy keeps its own one-entry-per-core division; the
+    // read law holds the PV to it. No-op for an HBM scratch.
+    crate::emit::apply_lx_residency(&mut op, layout);
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"))

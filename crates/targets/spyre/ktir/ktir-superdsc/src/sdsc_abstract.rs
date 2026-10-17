@@ -930,41 +930,69 @@ impl MatM {
     }
 }
 
-/// OUTPUT COLUMNS OF THIS MATMUL — the `out` (N) stick extent.
+/// OUTPUT COLUMNS OF THIS MATMUL — the `out` (N) stick extent, and whether the work division must
+/// keep the rows whole ([`OutputSplit`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct MatN(u32);
+pub struct MatN(u32, OutputSplit);
+
+/// ⭐ WHETHER A MATMUL's OUTPUT IS DIVIDED ACROSS THE CORES BY ITS COLUMNS ALONE — a property of its N,
+/// stated at the door that names the N, the twin of [`ContractionSplit`].
+///
+/// Every door keeps the matmul's own split policy ([`Self::Planned`]) except
+/// [`MatN::of_chunk_decode_scores`]: one PART of the split-KV chunk's one-request score, writing its
+/// columns of a wider score block from its LX-resident Kᵗ. That Kᵗ was gathered one stick of slots
+/// per core (`ChunkScratch::lx_form`), so core `c` can read only slot stick `c`: the score must divide
+/// its columns alone, one whole stick per core, with its rows whole. The planner would also split a
+/// part's handful of rows once its columns run out (`mb:2 × out:16` at a 4-page part), which hands a
+/// core a slice another core holds. `emit`'s core-local read law refuses that at build.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OutputSplit {
+    /// The matmul's own work division (`matmul_split_map` and its regimes), unchanged.
+    Planned,
+    /// Every core takes a whole-stick run of the output columns; rows and contraction stay whole.
+    ColumnsAcrossCores,
+}
 
 impl MatN {
     /// One head's feature width `hd` — the value matmul's and RoPE's output columns.
     pub const fn of_head_dim(hd: u32) -> MatN {
-        MatN(hd)
+        MatN(hd, OutputSplit::Planned)
     }
     /// The score block's kv window — the column count of one online-softmax block (one stick per
     /// fold sub-block by design). Takes the block's own typed width, so the score matmul's N and
     /// the reduce sweep that consumes it are one quantity by construction.
     pub const fn of_kv_window(width: BlockCols) -> MatN {
-        MatN(width.get())
+        MatN(width.get(), OutputSplit::Planned)
+    }
+    /// ⭐ ONE PART OF THE SPLIT-KV CHUNK's ONE-REQUEST SCORE — its columns divided across the cores
+    /// ([`OutputSplit::ColumnsAcrossCores`], which says why).
+    pub const fn of_chunk_decode_scores(width: BlockCols) -> MatN {
+        MatN(width.get(), OutputSplit::ColumnsAcrossCores)
     }
     /// Exactly ONE stick of output columns — the identity-slab copies, whose write is deliberately
     /// one stick so the op has no plane term of its own to get wrong. The width is the machine's
     /// lane count, named by the zero-sized [`Lanes`] witness, so a row count — or any of the other
     /// three 64s — cannot stand in for it.
     pub const fn one_stick(lanes: Lanes) -> MatN {
-        MatN(lanes.n())
+        MatN(lanes.n(), OutputSplit::Planned)
     }
     /// One head-dim SLAB of output features — the per-(head, slab) value matmul, which emits one
     /// slab per op so a head-dim-spanning write cannot mis-stride its second stick group. Demands
     /// quantity (4)'s witness ([`FeatIdx::SLAB_FEATS`]) by type — the pool's lane count no longer
     /// fits this slot.
     pub const fn of_head_slab(feats: SlabFeats) -> MatN {
-        MatN(feats.n())
+        MatN(feats.n(), OutputSplit::Planned)
     }
     /// A projection's output features — N of `A[m,k]·W[k,n]`.
     pub const fn of_out_features(n: u32) -> MatN {
-        MatN(n)
+        MatN(n, OutputSplit::Planned)
     }
     pub const fn get(self) -> u32 {
         self.0
+    }
+    /// How the work division treats this output.
+    pub const fn split(self) -> OutputSplit {
+        self.1
     }
 }
 
@@ -7098,6 +7126,65 @@ impl ChunkScratch {
         })
     }
 
+    /// ⭐⭐⭐ THE CHUNK's GATHER IN LX — the gathered Kᵗ and V never touch HBM. Each copy lands in the
+    /// scratchpad of the core that consumes it, and that core's score and PV read their KERNEL slices
+    /// from there. The reference's decode does exactly this: its gathers write `Tensor2_lx`, its QKᵀ and
+    /// PV read `Tensor1_lx`, all split identically, core `c` ↔ entry `c`.
+    ///
+    /// Measured on granite-3.1-8b, one copy costs only its bytes (10.74 µs per 512 KiB, no per-op
+    /// constant). It moves every byte twice before its consumer reads it a third time, so the bytes are
+    /// the lever, not the op count.
+    ///
+    /// ⭐ BOTH LEGS IN PARTS OF ONE COPY EACH. A copy is one index stick of 32 entries, one per core. A
+    /// decode score divides its slots across the cores, and a decode PV divides its contraction (the
+    /// same slots) across the cores, one 64-slot stick each. All three are the same division exactly
+    /// when one (kv head, part) is one copy: a part of [`ChunkLx::part_pages`] pages
+    /// (`ENTRIES_PER_OP / entries_per_head_page`, 8 at granite-2b).
+    ///
+    /// So both legs are cut into parts of that many pages. Each part's Kᵗ and V copies write one
+    /// core-local tensor per kv head. That part's score and PV read their KERNELs there. The scores fill
+    /// their part's columns of the chunk's score block, and the PVs fold onto each other through the
+    /// value leg's own `run_o`/`otmp` ping-pong. At one slab Kᵗ's and V's entry orders agree, so the two
+    /// gathers read ONE part-major run of the host's table.
+    ///
+    /// A chunk that is not a whole number of parts ends in a TAIL of fewer pages (4 on the 4-page
+    /// ladder). One kv head's tail is fewer than 32 entries, and dxp refuses a copy whose index is
+    /// shorter than one stick: the element-arrangement fold `entries / 32` comes out 0 (`factor_ = 0`,
+    /// `Must be >= 1`, measured on granite-2b fp8's one-page rung). So the tail keeps an HBM scratch per
+    /// leg, copied flat across kv heads as today, and its score and PV are narrower HBM parts.
+    ///
+    /// `Some` exactly where:
+    ///   * the rows are ONE REQUEST's decode ([`ChunkRowKind::OneRequest`]). Only that PV divides its
+    ///     contraction across the cores; a prompt chunk divides its rows, and a batch chunk's rows are
+    ///     other requests;
+    ///   * the chunk has ONE feature slab, so an entry is a 64-slot run of a `[slots, hd]` V block and
+    ///     of an `[hd, slots]` Kᵗ block, and the two legs' entry orders agree;
+    ///   * `ENTRIES_PER_OP == MAX_CORES` and a part is a whole number of pages;
+    ///   * there is at least one full part;
+    ///   * the tail is a whole number of index sticks across the kv heads.
+    ///
+    /// Everything else keeps the HBM scratch. `None` is the existing form, not a refusal. The bake
+    /// proves per op that the copy's and PV's divisions agree (`emit`'s core-local read law). The host
+    /// reads the entry order from this same value ([`chunk_gather_index_table`]).
+    pub const fn lx_form(self, rows: ChunkRowKind) -> Option<ChunkLx> {
+        let one_stick = CopyDims::ENTRIES_PER_OP;
+        let eph = self.entries_per_head_page();
+        if !matches!(rows, ChunkRowKind::OneRequest)
+            || self.plane.slabs() != 1
+            || one_stick != crate::superdsc_opspec::MAX_CORES
+            || eph == 0
+            || !one_stick.is_multiple_of(eph)
+        {
+            return None;
+        }
+        let part_pages = one_stick / eph;
+        let tail_pages = self.pages % part_pages;
+        if self.pages < part_pages || !(self.nkvh() * tail_pages * eph).is_multiple_of(one_stick) {
+            return None;
+        }
+        Some(ChunkLx { chunk: self })
+    }
+
     /// The index stick V's run starts at: 0 at one slab, where V's entry order IS K's and the two gathers
     /// share one run; after K's [`Self::index_sticks`] above it, where V is slab-major
     /// ([`Self::value_entry_coord`]).
@@ -7134,6 +7221,213 @@ impl ChunkScratch {
     /// ⭐ HOW THE CHUNK's WIDE INTERMEDIATES ARE CUT INTO ROW BLOCKS — see [`ChunkRowBlocks`].
     pub const fn row_blocks(self, gqa: u32, mq: u32) -> ChunkRowBlocks {
         ChunkRowBlocks::of_group(self.nkvh(), gqa, mq, self.plane.slabs(), self.slots())
+    }
+}
+
+/// ⭐ A CHUNK WHOSE VALUE LEG STAYS IN LX — minted only by [`ChunkScratch::lx_form`], so a copy or a
+/// pin of this form exists only where the copy's division is PV's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChunkLx {
+    chunk: ChunkScratch,
+}
+
+/// ⭐ A CHUNK WHOSE Kᵗ STAYS IN LX — minted only by [`ChunkLx::keys`], which refuses a chunk with a
+/// tail. Its copies therefore have no tail destination to name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChunkKeysLx {
+    lx: ChunkLx,
+}
+
+impl ChunkKeysLx {
+    pub const fn form(self) -> ChunkLx {
+        self.lx
+    }
+
+    /// The Kᵗ copies, one per (part, kv head), each with the core-local tensor it writes. With no tail
+    /// every stick of the shared run (base 0) is a whole part, so stick `j` writes tensor `j`
+    /// ([`ChunkLx::lx_tensor`] is part-major, as the run is).
+    pub fn copies(self) -> impl Iterator<Item = (u32, GatherCopy)> {
+        self.lx
+            .chunk
+            .copies()
+            .map(|c| (c.stick, GatherCopy { dest_entry: 0, ..c }))
+    }
+}
+
+/// WHOSE ROWS a chunk attends with — the fact that decides its value leg's form
+/// ([`ChunkScratch::lx_form`]). Both ends know it: the bake from the body it lowers, the host from
+/// the body it stages a table for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChunkRowKind {
+    /// One request's decode: one query row per head.
+    OneRequest,
+    /// A prompt chunk's consecutive positions over its resident prefix.
+    Prompt,
+    /// A decode batch: every row is another request ([`BatchChunk`]).
+    Batch,
+}
+
+/// Where one V copy of an LX-resident value leg lands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LxDest {
+    /// Core-local LX tensor `i` ([`ChunkLx::lx_tensor`]), every core's entry at its pin.
+    Lx(u32),
+    /// The tail's HBM scratch, at the copy's own destination entry.
+    Tail,
+}
+
+impl ChunkLx {
+    pub const fn chunk(self) -> ChunkScratch {
+        self.chunk
+    }
+
+    /// Pages per LX part: one kv head's part is one index stick of entries.
+    pub const fn part_pages(self) -> u32 {
+        CopyDims::ENTRIES_PER_OP / self.chunk.entries_per_head_page()
+    }
+
+    /// Whole LX parts in the chunk.
+    pub const fn lx_parts(self) -> u32 {
+        self.chunk.pages / self.part_pages()
+    }
+
+    /// Pages past the last whole part. Those stay in HBM; see [`ChunkScratch::lx_form`].
+    pub const fn tail_pages(self) -> u32 {
+        self.chunk.pages % self.part_pages()
+    }
+
+    /// The core-local tensors of ONE leg, one per (part, kv head).
+    pub const fn lx_tensors(self) -> u32 {
+        self.lx_parts() * self.chunk.nkvh()
+    }
+
+    /// The tensor (of either leg) holding part `part` for kv head `kvh`.
+    pub const fn lx_tensor(self, part: u32, kvh: u32) -> u32 {
+        part * self.chunk.nkvh() + kvh
+    }
+
+    /// One core's slice of one (part, kv head) tensor. That is one entry, which is also the KERNEL
+    /// slice that core's score or PV reads, so it is each tensor's core-local pin. Kᵗ's and V's entries
+    /// are the same size (`hd * POOL_STICK` elements).
+    pub const fn per_core_bytes(self) -> u64 {
+        self.chunk.plane.entry_bytes()
+    }
+
+    /// LX one core holds for ONE leg: every part of every kv head. Both legs pin twice this, 1 MiB at
+    /// granite-2b's 64-page rung.
+    pub const fn lx_bytes_per_core(self) -> u64 {
+        self.lx_tensors() as u64 * self.per_core_bytes()
+    }
+
+    /// The tail's entries for one kv head.
+    const fn tail_entries_per_head(self) -> u32 {
+        self.tail_pages() * self.chunk.entries_per_head_page()
+    }
+
+    /// Each leg's tail HBM scratch shape, `[nkvh, tail block]`. That is one kv head's tail pages, laid
+    /// out like the full scratch's head blocks (the same element count for a Kᵗ and a V block).
+    pub const fn tail_footprint_dims(self) -> [u32; 2] {
+        [
+            self.chunk.nkvh(),
+            (self.tail_pages() as u64 * self.chunk.plane.head_block_elems()) as u32,
+        ]
+    }
+
+    /// Element offset of kv head `kvh`'s block in either leg's tail scratch, which is the tail score's
+    /// and the tail PV's kernel base. `None` past the head count or when there is no tail.
+    pub const fn tail_corner(self, kvh: u32) -> Option<ChunkCorner> {
+        if kvh >= self.chunk.nkvh() || self.tail_pages() == 0 {
+            return None;
+        }
+        let off = kvh as u64 * self.tail_footprint_dims()[1] as u64;
+        if off > u32::MAX as u64 {
+            return None;
+        }
+        Some(ChunkCorner(off as u32))
+    }
+
+    /// ⭐ Kᵗ IN LX TOO — the ONLY door to [`ChunkKeysLx`], and it opens only on a chunk with no tail.
+    /// So a Kᵗ LX form with a tail is unrepresentable: no copy, pin or score part of it can be built.
+    ///
+    /// ⛔ MEASURED ON CARD, granite-3.1-2b fp16, the 12- and 20-page rungs (8 + 4 and 16 + 4 pages).
+    /// With Kᵗ in LX and its 4-page tail in HBM, the chunk FAULTS on the first step at that rung:
+    /// `status=Error locator=0x2 … HMI=STORE addr=… syndrome=0x1`, then `scheduler rejected submission …
+    /// status=Retry`. Measured addresses: core 1
+    /// at `0x8dbf00` and core 31 at `0x8dfb00` (12 pages), core 31 at `0x8ddb00` (20 pages). It faults
+    /// the same way whether the tail score splits its rows (`mb:2 × out:16`) or only its columns. V's
+    /// tail part in HBM runs at those rungs. The no-tail rungs (8, 16, 40 pages) run with Kᵗ in LX.
+    ///
+    /// ⚠️ THOSE MEASUREMENTS ARE CONFOUNDED. A tail rung keeps HBM scratches the 64-page ceiling (no
+    /// tail, everything in LX) lacks, and the session allocated only the ceiling's extents. That alone
+    /// faults the 12-page rung with Kᵗ whole in HBM (`RAS::PCI::BusFence`), and it is fixed at bake by
+    /// the session's allocation law (`cover_ladder_allocation` in the spyre crate). The tail geometry
+    /// itself has not been re-measured under that law.
+    ///
+    /// Until it is, a tail rung keeps the whole Kᵗ leg in HBM: one score over the whole chunk, read
+    /// through its own head-major run. Its V still stays in LX.
+    pub const fn keys(self) -> Option<ChunkKeysLx> {
+        if self.tail_pages() == 0 {
+            Some(ChunkKeysLx { lx: self })
+        } else {
+            None
+        }
+    }
+
+    /// The index stick the LX run starts at. With Kᵗ in LX too, both legs read ONE run: at one slab
+    /// Kᵗ's and V's entry orders agree, so a copy of either leg reads the same stick. Otherwise V's run
+    /// follows Kᵗ's own head-major run.
+    pub const fn index_base(self) -> u32 {
+        if self.keys().is_some() {
+            0
+        } else {
+            self.chunk.index_sticks()
+        }
+    }
+
+    /// ⭐ THE RUN's ENTRY ORDER — `(kv head, page, block)` for entry `e`. This is the one law the copies
+    /// of both legs (destination) and the host's table (source) all read.
+    ///   * The whole parts come first, PART-MAJOR. Stick `p * nkvh + h` is kv head `h`'s part `p`, and
+    ///     its word `c` is page `p * part_pages + c / eph`, block `c % eph`. That is slot run `c` of the
+    ///     part, the run the part's score and PV both hand core `c`.
+    ///   * Then the tail, flat across kv heads exactly as [`ChunkScratch::entry_coord`] lays out a
+    ///     chunk of the tail's pages.
+    pub const fn entry_coord(self, e: u32) -> (u32, u32, u32) {
+        let (stick, eph) = (CopyDims::ENTRIES_PER_OP, self.chunk.entries_per_head_page());
+        let lx_entries = self.lx_tensors() * stick;
+        if e < lx_entries {
+            let (op, c) = (e / stick, e % stick);
+            let (part, kvh) = (op / self.chunk.nkvh(), op % self.chunk.nkvh());
+            (kvh, part * self.part_pages() + c / eph, c % eph)
+        } else {
+            let t = e - lx_entries;
+            let per_head = self.tail_entries_per_head();
+            let (kvh, r) = (t / per_head, t % per_head);
+            (kvh, self.lx_parts() * self.part_pages() + r / eph, r % eph)
+        }
+    }
+
+    /// One leg's copies, one per index stick of the run, in run order. Each comes with where it lands:
+    ///   * a whole part's copy writes that leg's (part, kv head) tensor at offset 0;
+    ///   * a tail copy writes that leg's tail scratch at its flat destination entry.
+    pub fn copies(self) -> impl Iterator<Item = (LxDest, GatherCopy)> {
+        let (base, lx) = (self.index_base(), self.lx_tensors());
+        self.chunk.copies().map(move |c| {
+            let j = c.stick;
+            let dest = if j < lx { LxDest::Lx(j) } else { LxDest::Tail };
+            let dest_entry = if j < lx {
+                0
+            } else {
+                (j - lx) * CopyDims::ENTRIES_PER_OP
+            };
+            (
+                dest,
+                GatherCopy {
+                    stick: j + base,
+                    dest_entry,
+                    ..c
+                },
+            )
+        })
     }
 }
 
@@ -7255,6 +7549,12 @@ impl ChunkPart {
         Some(ChunkCorner(off as u32))
     }
 
+    /// This part's columns of a broadcast `[1, chunk slots]` row (the shared prefix-validity mask): a
+    /// one-row stick-major row is column-major already, so the part starts `first_slot` in.
+    pub const fn row_corner(self) -> ChunkCorner {
+        ChunkCorner(self.first_slot)
+    }
+
     /// kv head `kvh`'s V rows for this part, in feature slab `slab`: rows `[first_slot, first_slot +
     /// slots)` of slab `slab` of its RowBlocked `[chunk slots, hd]` block (slab-major, see
     /// [`ChunkScratch::value_entry_coord`]) — `slab · chunk_slots · stick + first_slot · stick` in. At one
@@ -7288,9 +7588,14 @@ impl ChunkPart {
 /// ([`ChunkScratch::value_entry_coord`]), starting at [`ChunkScratch::value_index_base`] — the stick the
 /// V copies read from. At one slab the orders agree and V reads K's run.
 ///
+/// ⭐ AND WHERE THE GATHER STAYS IN LX ([`ChunkScratch::lx_form`] at these `rows`), the table is ONE
+/// run for both legs, part-major, in [`ChunkLx::entry_coord`]'s order. The copies read the same order.
+/// The bake and this table take the form from the same `(chunk, rows)`, so neither can pick another.
+///
 /// `None` on an empty page list or an entry that leaves `i32`.
 pub fn chunk_gather_index_table(
     scratch: ChunkScratch,
+    rows: ChunkRowKind,
     pages: &[i64],
     per_page: EntriesPerPage,
 ) -> Option<Vec<GatherEntry>> {
@@ -7299,6 +7604,17 @@ pub fn chunk_gather_index_table(
         let phys = *pages.get(page as usize).unwrap_or(&last);
         GatherEntry::of_page_block(per_page, phys, scratch.source_block(kvh, q)?)
     };
+    if let Some(lx) = scratch.lx_form(rows) {
+        let run = (0..scratch.entries()).map(|e| entry(lx.entry_coord(e)));
+        if lx.keys().is_some() {
+            return run.collect();
+        }
+        // Kᵗ in HBM: its own head-major run first, then V's LX run.
+        return (0..scratch.entries())
+            .map(|e| entry(scratch.entry_coord(e)))
+            .chain(run)
+            .collect();
+    }
     let keys = (0..scratch.entries()).map(|e| entry(scratch.entry_coord(e)));
     let values = (0..scratch.entries())
         .filter(|_| scratch.value_index_base() > 0)
@@ -7542,7 +7858,12 @@ pub fn batch_chunk_index_table(
     maps: &[Vec<i64>],
     per_page: EntriesPerPage,
 ) -> Option<Vec<GatherEntry>> {
-    chunk_gather_index_table(bc.chunk(), &bc.page_list(maps)?, per_page)
+    chunk_gather_index_table(
+        bc.chunk(),
+        ChunkRowKind::Batch,
+        &bc.page_list(maps)?,
+        per_page,
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

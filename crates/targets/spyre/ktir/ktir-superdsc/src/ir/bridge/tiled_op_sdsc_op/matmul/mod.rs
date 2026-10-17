@@ -27,7 +27,6 @@ pub use assemble::{
     assemble_matmul_placed, assemble_matmul_seeded, assemble_matmul_split,
     assemble_matmul_windowed, try_assemble_matmul_seeded,
 };
-pub use dims::set_split_mb_forbidden;
 pub use opspec::{
     matmul_opspec, matmul_opspec_batched, matmul_opspec_batched_off, matmul_opspec_off,
     matmul_opspec_off_operands, matmul_opspec_off_operands_phys,

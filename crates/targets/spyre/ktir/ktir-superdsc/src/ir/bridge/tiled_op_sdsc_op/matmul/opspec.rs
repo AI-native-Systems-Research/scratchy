@@ -149,13 +149,17 @@ pub fn matmul_opspec_off_operands_phys<DF: DataFormat>(
         // The strides ride ON the batch axis, so they arrive here already paired with the `y` extent
         // they describe — there is no slot for a caller to fill one without the other.
         batch.batch_strides(),
-        // The contraction's own split rides ON the K — see `ContractionSplit`. Every door but the
-        // chunk's decode value leg is `Planned`, which is the form's splitter exactly as before.
-        match k.split() {
-            crate::sdsc_abstract::ContractionSplit::Planned => matmul_split_map_for(form),
-            crate::sdsc_abstract::ContractionSplit::AcrossCores => {
+        // The contraction's own split rides ON the K — see `ContractionSplit` — and the output's ON
+        // the N — see `OutputSplit`. Every door but the chunk's decode value leg and its decode score
+        // parts is `Planned` on both, which is the form's splitter exactly as before.
+        match (k.split(), n.split()) {
+            (crate::sdsc_abstract::ContractionSplit::AcrossCores, _) => {
                 super::dims::matmul_split_map_contraction
             }
+            (_, crate::sdsc_abstract::OutputSplit::ColumnsAcrossCores) => {
+                super::dims::matmul_split_map_columns
+            }
+            _ => matmul_split_map_for(form),
         },
     )
 }

@@ -81,86 +81,39 @@ pub fn matmul_dims<DF: DataFormat>(
 // The kind is now `sdsc_abstract::QueryRows<K>` with `K` in {`Chunk`, `Requests`} — carried in the type,
 // so no site can read it without having been given it, and none can infer it from a count. Nothing here
 // may reintroduce an ambient copy: if the splitter needs the kind, it takes it as a parameter.
-// ⚠️ SCOPED SURVIVOR, AND IT IS A PERFORMANCE GATE — NOT A SEMANTIC AUTHORITY.
 //
-// The row KIND now lives in a type (`sdsc_abstract::QueryRows<ROWS_ARE_REQUESTS>`) and is threaded
-// through the signatures that make SEMANTIC decisions (main's `lower_rope_node`, `lower_attn_node`). What
-// remains here is one PERF/COMPATIBILITY choice: "a decode batch must not split `mb`", whose purpose is
-// to leave prefill's hardware-proven bundles byte-identical while stopping a decode batch from reloading
-// the stationary weight per split. It is not a correctness fact about what a row means.
+// ⛔ AND THE LAST AMBIENT SURVIVOR, THE DECODE BATCH'S `mb`-SPLIT BAN, IS GONE TOO — BECAUSE IT WAS
+// MEASURED, NOT BECAUSE IT WAS AMBIENT. It was a thread-local set for the span of
+// `lower_subtile_tape_to_ktir`, and every descriptor is built later, in `emit_bundle`, so it never
+// reached one: every shipped decode batch already ran the cost model's own split. Making it reach the
+// emitter (the weight-stationary form: no `mb` split, and the cost model's `in`/`mb` cores handed to
+// `out`) was built and measured on the card against that split, ABAB, conc 1/2/4/8 at ~1k tokens:
 //
-// ⛔ IT IS STILL AMBIENT, AND THAT IS A DEBT, NOT A DESIGN. `matmul_split_map` is consumed as an
-// `impl FnOnce(&[ItDim], u32)` by `TileOp::tile`, and its two call sites in `matmul/opspec.rs` do not
-// receive the kind — threading it there touches every matmul signature in the model, which is the
-// "four signatures" the original comment declined to thread and is a separate, larger change.
+//   | granite-3.1  | conc-1 | conc-2 | conc-4 | conc-8 |
+//   |--------------|--------|--------|--------|--------|
+//   | 2b fp16      | flat   | flat   | flat   | flat   |
+//   | 8b fp16      | flat   | −21%   | −15%   | −6.6%  |
 //
-// ⏭ THE FIX, and it is a CONST GENERIC one: this crate is a PROC-MACRO compiler. `codegen.rs` reads
-// `head_dim`, the head counts and the rung widths from the model config and interpolates them as
-// LITERALS, so every one of them — and the row kind with them — is a compile-time constant. The splitter
-// should be `matmul_split_map::<const ROWS_ARE_REQUESTS: bool>(dims, cores)` and be passed as
-// `matmul_split_map::<RAR>` from a call chain generic over the same const. Then the two split policies
-// are two instantiations rather than one runtime branch, and no ambient value can exist to be stale.
-thread_local! {
-    static SPLIT_MB_FORBIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+// So the premise — that an `mb` split reloads the stationary weight per split and cancels batching's
+// amortization — does not survive the card: a decode batch keeps the cost model's split, the same one
+// prefill runs, and the splitter needs no row kind at all.
 
-/// Whether the bundle being lowered forbids an `mb` split (a decode batch does). PERF GATE ONLY — see
-/// the note above; do not reintroduce semantic decisions on top of this.
-pub(crate) fn split_mb_forbidden() -> bool {
-    SPLIT_MB_FORBIDDEN.with(|c| c.get())
-}
-
-/// Set for one bundle's lowering; returns the previous value so the caller restores it.
-pub fn set_split_mb_forbidden(v: bool) -> bool {
-    SPLIT_MB_FORBIDDEN.with(|c| c.replace(v))
-}
-
-/// ⭐ THE SPLIT POLICY AS A CONST GENERIC — two instantiations, not one runtime branch.
-///
-/// `FORBID_MB_SPLIT` is a compile-time constant of the bundle (a decode batch forbids it; a prefill chunk
-/// does not), so the two policies are now separate specialisations that the compiler can see. Only the
-/// SELECTION between them is still ambient (see [`split_mb_forbidden`]), and that is the remaining debt:
-/// the selection belongs in the call chain as `matmul_split_map::<RAR>`, which needs the kind threaded
-/// through `matmul/opspec.rs`'s two call sites and their 28 callers.
-pub(crate) fn matmul_split_map_gated<const FORBID_MB_SPLIT: bool>(
-    dims: &[crate::superdsc_opspec::ItDim],
-    max_cores: u32,
-) -> std::collections::BTreeMap<&'static str, u32> {
-    matmul_split_map_inner(
-        dims,
-        max_cores,
-        FORBID_MB_SPLIT,
-        BatchedSplit::JointCostModel,
-    )
-}
-
-/// ⛔ THE ADAPTER, AND THE ONLY REMAINING AMBIENT READ IN THE SPLIT PATH. It exists because
-/// `TileOp::tile` consumes the splitter as a bare `impl FnOnce(&[ItDim], u32)` from call sites that were
-/// never given the row kind. One line, named, and greppable — not a fact spread across the file.
+/// The splitter every matmul takes: the joint cost-model search, for prefill and decode batches alike.
 pub fn matmul_split_map(
     dims: &[crate::superdsc_opspec::ItDim],
     max_cores: u32,
 ) -> std::collections::BTreeMap<&'static str, u32> {
-    if split_mb_forbidden() {
-        matmul_split_map_gated::<true>(dims, max_cores)
-    } else {
-        matmul_split_map_gated::<false>(dims, max_cores)
-    }
+    matmul_split_map_inner(dims, max_cores, BatchedSplit::JointCostModel)
 }
 
 /// The REQUEST-BATCH splitter: identical to [`matmul_split_map`] on every dim set without a real
-/// batch axis (including the ambient mb gate), and batch-divides-first on the y>1 arm. Handed out
-/// only by the request regime's [`super::walk::RungRegime::split_map`].
+/// batch axis, and batch-divides-first on the y>1 arm. Handed out only by the request regime's
+/// [`super::walk::RungRegime::split_map`].
 pub(crate) fn matmul_split_map_batch_requests(
     dims: &[crate::superdsc_opspec::ItDim],
     max_cores: u32,
 ) -> std::collections::BTreeMap<&'static str, u32> {
-    matmul_split_map_inner(
-        dims,
-        max_cores,
-        split_mb_forbidden(),
-        BatchedSplit::BatchDividesFirst,
-    )
+    matmul_split_map_inner(dims, max_cores, BatchedSplit::BatchDividesFirst)
 }
 
 /// ⭐ THE CONTRACTION-FIRST SPLITTER — every core a whole-stick run of `in`, rows and output whole.
@@ -191,6 +144,31 @@ pub(crate) fn matmul_split_map_contraction(
     let mut map = std::collections::BTreeMap::new();
     if split > 1 {
         map.insert(InAxis::NAME, split);
+    }
+    map
+}
+
+/// ⭐ THE COLUMNS-FIRST SPLITTER — every core a whole-stick run of `out`, rows and contraction whole.
+///
+/// Reached only through [`crate::sdsc_abstract::OutputSplit::ColumnsAcrossCores`] (a part of the
+/// split-KV chunk's one-request score, which writes its columns of a wider score block). The cores
+/// divide the columns alone: the largest divisor of the output's stick count within the core budget,
+/// so every core's run is whole sticks of the operand's own format.
+pub(crate) fn matmul_split_map_columns(
+    dims: &[crate::superdsc_opspec::ItDim],
+    max_cores: u32,
+) -> std::collections::BTreeMap<&'static str, u32> {
+    use crate::work::FP16_ELEMS_PER_STICK;
+    let (n, stick) = dims
+        .iter()
+        .find(|d| d.name == OutAxis::NAME)
+        .map(|d| (d.size, d.df.elems_per_stick()))
+        .unwrap_or((1, FP16_ELEMS_PER_STICK));
+    let sticks = n.div_ceil(stick).max(1);
+    let split = crate::work::core_split(sticks, max_cores);
+    let mut map = std::collections::BTreeMap::new();
+    if split > 1 {
+        map.insert(OutAxis::NAME, split);
     }
     map
 }
@@ -231,7 +209,6 @@ enum BatchedSplit {
 fn matmul_split_map_inner(
     dims: &[crate::superdsc_opspec::ItDim],
     max_cores: u32,
-    forbid_mb_split: bool,
     batched_split: BatchedSplit,
 ) -> std::collections::BTreeMap<&'static str, u32> {
     use crate::work::{FP16_ELEMS_PER_STICK, core_split, matmul_cost_split, matmul_split_plan};
@@ -266,20 +243,9 @@ fn matmul_split_map_inner(
     // decode's cost is `11.2 + 3.79*B` ms — linear in requests — which is the shape a per-core
     // weight re-read would have, and this says whether that is what is happening.
     let trace = std::env::var_os("SCRATCHY_SDSC_SPLIT_TRACE").is_some();
-    // A DECODE BATCH MUST NOT SPLIT `mb`. The weight is STATIONARY in the PT array and M streams
-    // through it, so the weight load is a FIXED cost amortized over the rows — which is the whole
-    // reason to batch. An `mb` split hands every one of those cores the SAME weight (see the HW CAP
-    // note below), so it reloads once per split and the amortization is cancelled.
-    //
-    // MEASURED: prefill reaches ~6 TFLOP/s on these matmuls at mb=71; a decode batch gets ~1.4 at
-    // mb=8, and per-row cost stays FLAT from 8 to 32 rows instead of falling — because the planner
-    // starts splitting `mb` at 16 (`in=2 mb=2 out=8`). Batching stops paying exactly there.
-    // `shared_weight=true` is why the cost model does not see it: it says the weight is loaded once
-    // and broadcast across M, so an `mb` split looks free.
-    //
-    // Only the decode batch, because prefill already runs at 4x this efficiency and its bundles are
-    // proven on hardware; this must leave every one of them byte-identical.
-    let batched_decode = forbid_mb_split;
+    // A decode batch takes the cost model's split like prefill does: the weight-stationary form that
+    // would have forbidden an `mb` split here measured slower on the card (see the note at the top of
+    // this file).
     if y <= 1 {
         // ⭐ 2026-07-08 ROOT-CAUSE FIX (IBM-reference-confirmed): SPLIT `mb` (M) across cores, not just
         // `out`. The OLD "split ONLY out, keep mb WHOLE (the PT streams M≤8 on one core)" was the mq=8
@@ -313,64 +279,8 @@ fn matmul_split_map_inner(
                 // projections. K-split: `k` cores each contract a K-slice into a PARTIAL product that dxp
                 // PSUM-accumulates into the SHARED output tile (torch-spyre's reduction-dim split); the
                 // #50 disjoint-output guard is relaxed for a reduction (`in`) split (see emit_sdsc).
-                let s = matmul_split_plan(mb, out, in_, 1, out_stick_elems, max_cores, true);
-                let mut s = s;
-                // NO K-SPLIT FOR A DECODE BATCH. Splitting the reduction dim makes `k` cores each
-                // contract a slice of K into a PARTIAL product that dxp PSUM-accumulates into the
-                // SHARED output tile — cross-core accumulation and the traffic that carries it, on
-                // every matmul in the layer.
-                //
-                // It is the one structural difference between the configuration that is fast per row
-                // and the one that is not: at one request the planner picks `out=32` and no K-split
-                // (25.6 ms, essentially the weight stream alone); from two requests up it picks
-                // `in=4 out=8` (47 ms at eight, and the extra scales with rows while being invisible
-                // to op count, launch count, the mb-split and barriers — all measured).
-                //
-                // `out` alone fills the cores here: the projections are 2048 and 8192 wide, which is
-                // 16 and 64 fp8 sticks against 32 cores. So hand the reduction's cores to `out` and
-                // run the geometry one request already runs.
-                // ⛔ HANDING CORES TO `out` MUST KEEP `out`'s SPLIT A DIVISOR OF ITS STICK COUNT.
-                //
-                // `free = sticks / s.n` only bounds how many MORE cores `out` could absorb; it does NOT
-                // make the product legal. `s.n *= give` then produced splits that leave every core a
-                // FRACTION of a stick, which dxp refuses to schedule for the whole group
-                // (`DtException: There must be at least one valid candidate`, L3DlOpsScheduler:1375).
-                //
-                // MEASURED — this is what stopped granite-3.1-8b-FP8 from baking: its MLP `out` is
-                // 12800 = 200 sticks, the cost model picked `n=8 k=4`, `give=4` made `n=32`, and
-                // `200 % 32 == 8`. granite-2b's 8192 = 128 sticks with `128 % 32 == 0`, so the same code
-                // was legal there BY ARITHMETIC LUCK and the fault was invisible on the model every test
-                // used. Any `out` that is not a multiple of `32 * stick` trips it.
-                //
-                // So `give` is chosen as the LARGEST donation that still divides the stick count. The
-                // batched-decode intent is unchanged (cores still move from the reduction/rows to `out`,
-                // which is the whole point — one N-slice per core, weight read once); only illegal
-                // donations are declined, and declining leaves the cost model's own legal split in place.
-                let legal_give = |n: u32, want: u32| -> u32 {
-                    let sticks = out_sticks(out);
-                    let mut give = want.min((sticks / n.max(1)).max(1));
-                    while give > 1 && sticks % n.saturating_mul(give) != 0 {
-                        give -= 1;
-                    }
-                    give
-                };
-                if batched_decode && s.k > 1 {
-                    let give = legal_give(s.n, s.k);
-                    if give > 1 {
-                        s.n = s.n.saturating_mul(give);
-                        s.k /= give;
-                    }
-                }
-                if batched_decode && s.m > 1 {
-                    // Hand those cores to `out`, where each takes its own N-slice and the weight is
-                    // read once — the geometry the 2..8 rungs already run and the one bs=1 runs.
-                    let give = legal_give(s.n, s.m);
-                    if give > 1 {
-                        s.n = s.n.saturating_mul(give);
-                        s.m /= give;
-                    }
-                }
-                // ⛔⛔⛔ AND THE SAME LAW BINDS THE REDUCTION AXIS — `in`, not just `out`. Ported from
+                let mut s = matmul_split_plan(mb, out, in_, 1, out_stick_elems, max_cores, true);
+                // ⛔⛔⛔ THE REDUCTION SPLIT MUST LEAVE EVERY CORE WHOLE STICKS OF `in`. Ported from
                 // `a1cde93f` on the gemma-4 branch, whose one-op-per-dxp-compile table measured it:
                 //
                 //   | k     | n     | in | out | k/in | /128 | n/out | /128 | dxp     |
@@ -381,8 +291,8 @@ fn matmul_split_map_inner(
                 // Checking only `out` got gemma-4's 40-layer body compiling and left FOUR ops refused:
                 // `k=3840 n=15360` split `in=4 out=8` leaves a per-core `in` of 960 = SEVEN AND A HALF
                 // fp8 sticks. dxp schedules the reduction slice in the same unit as the output slice, so
-                // it obeys the same law — `DtException: There must be at least one valid candidate.`
-                // (`L3DlOpsScheduler.cpp:1375`), the same fault the `out` donation above declines.
+                // it obeys the same law as `out` — `DtException: There must be at least one valid
+                // candidate.` (`L3DlOpsScheduler.cpp:1375`).
                 //
                 // ⭐ THE STICK BASIS IS THE REDUCTION OPERAND'S, which is why this reads `in`'s own `df`
                 // rather than reusing `out_stick_elems`: an fp8 matmul contracts in 128-lane sticks while
