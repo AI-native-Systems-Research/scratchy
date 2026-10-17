@@ -27,25 +27,26 @@
 #include <senlib/shared/memory_allocator.hpp>
 #include <senlib/shared/senpci_shared.hpp>
 
-// FIXME(pod-verify) — the multi-device section's one unresolved include: the
-// vfio_backend (senlib's cross-port P2P IOMMU mapping primitive). The pod
-// SDK exposes it at /opt/ibm/spyre/senlib/include/vfio/1p0/vfio_backend.hpp,
-// namespace senlib::v2 per the .so's exported mangled symbol
-// (_ZN6senlib2v212vfio_backend44create_iommu_mapping_for_cross_port_p2p_rdmaENS0_8PciDevIdEm);
-// senlib's "D-2" reorg moved the snt1p0/shared families but may have moved
-// this one too. If the pod build cannot find this path, adjust it (and the
-// matching namespace uses below) — that adjustment is the whole fix.
-#include <senlib/vfio/1p0/vfio_backend.hpp>
+// senlib's cross-port P2P IOMMU mapping primitive, at its post-D-2 final
+// path (pod-verified 2026-10-17: the SDK installs it at
+// /opt/ibm/spyre/senlib/include/vfio/snt1p0/vfio_backend.hpp, class
+// vfio::snt1p0::vfio_backend — the .so's exported
+// _ZN6senlib2v212vfio_backend44… symbol is the pre-reorg mangled name of
+// the same create_iommu_mapping_for_cross_port_p2p_rdma(PciDevId, size_t);
+// the vfio/1p0/ variant is a generated compat stub scheduled for deletion,
+// same as senlib/1p0/). Its public peer_dev_info is
+// std::vector<std::pair<int,void*>>.
+#include <vfio/snt1p0/vfio_backend.hpp>
 
 // senlib's dev stack reorg (its "D-2" step) moved everything from the
 // historical `senlib::v2` / `SentientSoc::V1` namespaces to
-// `senlib::snt1p0` / `hal::snt1p0`, and the shared allocator types
+// `senlib::snt1p0` / `hal::snt1p0`, the shared allocator types
 // (MemoryAllocator, pinned_memory, sgpair, SenPciShared) to
-// `senlib::shared`. The old `senlib/1p0/` include paths survive only as
-// generated compat stubs scheduled for deletion, so this shim uses the final
-// `senlib/snt1p0/` paths. (The vfio include above is the one piece whose
-// post-reorg location could not be checked from this worktree — see its
-// FIXME.)
+// `senlib::shared`, and vfio to the sibling `vfio/` include family with
+// class namespaces `vfio::snt1p0` / `vfio::shared` (pod-verified — see the
+// include above). The old `senlib/1p0/` and `vfio/1p0/` include paths
+// survive only as generated compat stubs scheduled for deletion, so this
+// shim uses the final paths.
 
 #include <algorithm>
 #include <cstdint>
@@ -185,8 +186,9 @@ struct FlexP2pSegmentShim {
 
 // FIXME(pod-verify) — the reachability of the vfio_backend from the public
 // PfInterface this shim holds. Recorded facts (pod disassembly, #550 brief):
-//   1. the concrete `PfInterface_impl` IS-A `senlib::v2::vfio_backend`
-//      (public inheritance), and
+//   1. the concrete `PfInterface_impl` IS-A `vfio_backend` (public
+//      inheritance; `senlib::v2::vfio_backend` in the pre-D-2 disassembly,
+//      `vfio::snt1p0::vfio_backend` since), and
 //   2. `PfInterface` stores its impl pointer at offset +0x18.
 // Both must be re-verified against the pod headers before this is trusted
 // on hardware; if `PfInterface` (or PfWrapper) exposes a public accessor
@@ -196,10 +198,10 @@ struct FlexP2pSegmentShim {
 // of PfInterface_impl (offset 0), which the disassembly's working call
 // sequence also implies; if the inheritance is non-primary, this needs the
 // typed static_cast instead.
-senlib::v2::vfio_backend* p2p_vfio_backend() {
+vfio::snt1p0::vfio_backend* p2p_vfio_backend() {
     auto* iface = g_pfw->interface();
     void* impl = *reinterpret_cast<void**>(reinterpret_cast<char*>(iface) + 0x18);
-    return reinterpret_cast<senlib::v2::vfio_backend*>(impl);
+    return reinterpret_cast<vfio::snt1p0::vfio_backend*>(impl);
 }
 
 }  // namespace
@@ -796,11 +798,13 @@ int32_t flex_senlib_p2p_create_mapping(uint32_t peer_card_index, uint64_t len_by
             } else {
                 // The peer's PciDevId, from the same SenPciShared::pf(index)
                 // lookup this shim's device bring-up and
-                // senlib_senpci_pf_address use.
-                // FIXME(pod-verify): whether SenPciShared::pf's return type
-                // IS the PciDevId this call takes (vfio/shared/pcidevid.hpp)
-                // or converts to it; if the namespaces disagree post-reorg,
-                // construct the PciDevId explicitly here.
+                // senlib_senpci_pf_address use. Pod-verified:
+                // senpci_shared.hpp declares `PciDevId pf(unsigned
+                // whichcard = 0)` and the SDK has exactly one PciDevId class
+                // (vfio::shared, pcidevid.hpp), pulled into vfio::snt1p0 by
+                // using-directive — the call type-checks as the very
+                // PciDevId create_iommu_mapping_for_cross_port_p2p_rdma
+                // takes.
                 auto peer = senlib::shared::SenPciShared::pf(peer_card_index);
                 vb->create_iommu_mapping_for_cross_port_p2p_rdma(
                     peer, static_cast<size_t>(len_bytes));
