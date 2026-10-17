@@ -225,17 +225,22 @@ impl IncrementalDetokenizer {
         // Python line 155: buffer_length = 0 if finished else self.stop_buffer_length
         let buffer_length = if finished { 0 } else { self.stop_buffer_length };
 
+        // ⛔ The holdback counts bytes (the stop strings' lengths), where Python's counts characters:
+        // the cut is rounded down to a character boundary, holding back at least as much. A cut
+        // inside a multi-byte character panicked the request's task and took the engine with it
+        // (#576).
+        let cut = self.output_text.len().saturating_sub(buffer_length);
+        let cut = self.output_text.floor_char_boundary(cut);
         if !delta {
             // Python line 157-159: Return full text
             if buffer_length == 0 {
                 return self.output_text.clone();
             }
-            let end = self.output_text.len().saturating_sub(buffer_length);
-            return self.output_text[..end].to_string();
+            return self.output_text[..cut].to_string();
         }
 
         // Python line 161-166: Delta mode
-        let length = self.output_text.len().saturating_sub(buffer_length);
+        let length = cut;
         let last_offset = self.last_output_text_offset;
         if last_offset < length {
             self.last_output_text_offset = length;
@@ -543,6 +548,29 @@ mod tests {
         // The partial output should be shorter or equal to the full output
         // (shorter by up to stop_buffer_length characters).
         assert!(partial.len() <= full_text.len());
+    }
+
+    /// A multi-byte character across the stop-string holdback is held back whole, never cut (#576):
+    /// the text returned so far ends on a character, and the deltas add up to the full text.
+    #[test]
+    fn test_detokenizer_holdback_never_splits_a_character() {
+        // "END" holds back 2 bytes; '—' is 3.
+        let mut detok = make_detokenizer("X", vec!["END".to_string()]);
+        detok.output_text = "ab—".to_string();
+        assert_eq!(detok.get_next_output_text(false, false), "ab");
+        let mut deltas = detok.get_next_output_text(false, true);
+        assert_eq!(
+            deltas, "ab",
+            "the holdback ends inside '—': the cut is before it"
+        );
+        detok.output_text.push('c');
+        deltas += &detok.get_next_output_text(false, true);
+        assert_eq!(deltas, "ab", "still inside '—'");
+        detok.output_text.push_str("de");
+        deltas += &detok.get_next_output_text(false, true);
+        assert_eq!(deltas, "ab—c");
+        deltas += &detok.get_next_output_text(true, true);
+        assert_eq!(deltas, "ab—cde");
     }
 
     #[test]
