@@ -4,7 +4,14 @@
 //! the commit scratchy's side ran. A sweep holds both stacks' measurements:
 //! torch-spyre and triton-scratchy are measured by their own harnesses (the
 //! file says which), so a cell is a bucket, not a matched prompt — compare
-//! ratios, not absolutes.
+//! ratios, not absolutes. It also holds everything the page says about that
+//! sweep alone (what moved since the last one, the levers left, the notes
+//! under a section, a target): a new sweep is one new file, and nothing on
+//! the page speaks for an older one. `.claude/skills/spyre-bench` is how to
+//! write one.
+//!
+//! Every struct refuses fields it does not know, so a misspelt key fails the
+//! build rather than dropping out of the page.
 
 use std::collections::BTreeMap;
 
@@ -14,6 +21,7 @@ use crate::charts::Better;
 
 /// A whole A/B sweep.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Sweep {
     pub schema: u32,
     /// The day of the sweep, "2026-10-17": the file is named for it.
@@ -26,10 +34,78 @@ pub struct Sweep {
     pub torch_spyre: Provenance,
     pub triton_scratchy: Provenance,
     pub cells: Vec<Cell>,
+    /// The PRs merged on scratchy's side since the previous sweep,
+    /// "#563–#583"; None for a first sweep.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// What those PRs did, one row each.
+    #[serde(default)]
+    pub moved: Vec<Moved>,
+    /// The work still open where torch-spyre leads (or a target is unmet).
+    #[serde(default)]
+    pub levers: Vec<Lever>,
+    /// Paragraphs under a section, after its charts.
+    #[serde(default)]
+    pub notes: Notes,
+    /// A cell's target, beyond parity: a headline tile of its own.
+    #[serde(default)]
+    pub target: Option<Target>,
+}
+
+/// One row of "What moved": a change and what it did, in numbers.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Moved {
+    /// The PR, or PRs: "#566–#568".
+    pub pr: String,
+    pub what: String,
+}
+
+/// One row of "Open levers": where, and the work.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lever {
+    /// The cell or theme: "8b 10k decode".
+    pub lever: String,
+    pub work: String,
+}
+
+/// Each section's closing paragraphs.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Notes {
+    #[serde(default)]
+    pub decode: Vec<String>,
+    #[serde(default)]
+    pub prefill: Vec<String>,
+    #[serde(default)]
+    pub conc: Vec<String>,
+    #[serde(default)]
+    pub fp8: Vec<String>,
+}
+
+/// What one cell should reach, and why: the page sets it beside today's
+/// value there.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Target {
+    /// The tile's heading: "8b moonshot · short-context ITL".
+    pub label: String,
+    pub model: String,
+    pub dtype: Dtype,
+    pub metric: Metric,
+    #[serde(default = "one")]
+    pub conc: u32,
+    pub context: String,
+    /// In the metric's unit (ms, or tok/s).
+    pub value: f64,
+    /// Where the target comes from: "cost-model peak 204.8 GB/s — …".
+    pub why: String,
 }
 
 /// One side's provenance: when, where and how its half of the sweep ran.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Provenance {
     pub measured: String,
     #[serde(default)]
@@ -106,6 +182,7 @@ impl Dtype {
 /// One measured cell: both stacks' value at one model, dtype, metric,
 /// concurrency and context bucket.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Cell {
     pub model: String,
     pub dtype: Dtype,

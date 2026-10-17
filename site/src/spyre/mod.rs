@@ -25,7 +25,7 @@ use crate::charts::{
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab, Theme};
 use crate::thousands_f;
-use data::{Cell, Dtype, Metric, Provenance, Sweep};
+use data::{Cell, Dtype, Metric, Notes, Provenance, Sweep};
 
 /// The sweep files, relative to site/; copied to the same place under
 /// _site/, where the about table links to each.
@@ -47,70 +47,6 @@ const TORCH: Side = Side {
 const NOISE: f64 = 0.04;
 
 const DASH: &str = "—";
-
-/// The largest model's short-context story: the tie both stacks sit on is a
-/// floor, not a result. Its numbers are the charter's own (16.4 GB of fp16
-/// weights per token; the cost model peaks at 204.8 GB/s).
-const FLOOR_NOTE: &str = "Short-context parity is a shared floor: both stacks stream 16.4 GB of \
-                          fp16 weights per token at ~115 GB/s. The cost model's peak is 204.8 GB/s \
-                          — ≈80–90 ms if reachable — so the 8b gets the moonshot treatment, not \
-                          parity.";
-
-/// A 15 Oct fp8 run, kept as a footnote until the conc re-sweep lands.
-const FP8_CONC_NOTE: &str = "2b fp8 conc-8, 15 Oct run: 56.4 vs 8.25 tok/s — 6.8× (6.8–9.9× \
-                             across conc 1–8).";
-
-/// What the latest sweep's scratchy brings over the one before it, and the
-/// levers still open: the charter's state, kept with the page that reports
-/// it.
-const MOVED: [(&str, &str); 5] = [
-    (
-        "#566–#568",
-        "granite coherent on main at 2b and 8b, fp16 and fp8 — logits ≥ 8192 are now written, \
-         the first decode step no longer panics, and 8b fp8 stops reading unwritten o_proj \
-         copies.",
-    ),
-    (
-        "#573",
-        "dxp chunk explorer restored (#299 had disabled it for every group): 2b 10k TTFT \
-         18.1 → 8.9 s; 8b 10k ITL 305 → 233 ms.",
-    ),
-    ("#569", "K/V kept in LX for decode: 2b ITL −14–15% at 10k."),
-    (
-        "#583",
-        "hd128 decode group attention: 8b 10k ITL 233.8 → 192.3 ms, past #502's 204–225 ms \
-         band.",
-    ),
-    (
-        "#563 + #570",
-        "2b fp8 bake now 407 s cold (was 1,185 s), with a guard against regression.",
-    ),
-];
-
-const LEVERS: [(&str, &str); 5] = [
-    (
-        "8b moonshot",
-        "break the shared short-context floor: measure the card's real HBM ceiling and the 8b \
-         step's per-matmul bandwidth; testing whether 512-row prefill chunks halve 8b's \
-         per-token MLP cost.",
-    ),
-    (
-        "8b 10k decode",
-        "torch-spyre 1.17× ahead — hd128 K/V gather kept in LX, projected 192 → ~165–170 ms.",
-    ),
-    (
-        "2b ~1k TTFT",
-        "torch-spyre 1.48× ahead — a 27-row tail chunk pays a whole 256-row program.",
-    ),
-    (
-        "8b 10k TTFT",
-        "torch-spyre 1.30× ahead — attention plus the MLP's pointwise glue.",
-    ),
-    (
-        "conc-8",
-        "not re-measured since the fixes; a full matched re-sweep is pending a free pod.",
-    ),
-];
 
 // --------------------------------------------------------------------- load
 
@@ -150,20 +86,7 @@ fn load(site: &Site) -> Result<Vec<(PathBuf, Sweep)>, String> {
                 "{name}: name it {want} (<date>-<scratchy sha8>.json)"
             ));
         }
-        if sweep.schema != 1 {
-            errors.push(format!("{name}: schema {} is not 1", sweep.schema));
-        }
-        for c in &sweep.cells {
-            if let Some(bucket) = c
-                .context
-                .as_deref()
-                .filter(|k| !sweep.contexts.contains_key(*k))
-            {
-                errors.push(format!(
-                    "{name}: cell context {bucket} is not one of the sweep's"
-                ));
-            }
-        }
+        errors.extend(problems(&sweep).into_iter().map(|e| format!("{name}: {e}")));
         sweeps.push((f, sweep));
     }
     if errors.is_empty() {
@@ -175,6 +98,57 @@ fn load(site: &Site) -> Result<Vec<(PathBuf, Sweep)>, String> {
             .collect::<Vec<_>>()
             .join("\n"))
     }
+}
+
+/// What is wrong inside one sweep, beyond what its types refuse: every cell
+/// at a bucket the sweep has, measured on both sides, once; the target at a
+/// cell that is there.
+fn problems(sweep: &Sweep) -> Vec<String> {
+    let mut out = Vec::new();
+    if sweep.schema != 1 {
+        out.push(format!("schema {} is not 1", sweep.schema));
+    }
+    if sweep.triton_scratchy.commit.is_none() {
+        out.push("triton_scratchy.commit is missing (the commit scratchy's side ran)".to_string());
+    }
+    let mut seen = BTreeSet::new();
+    for c in &sweep.cells {
+        let at = format!(
+            "{} {} {} conc {} at {}",
+            c.model,
+            c.dtype.label(),
+            c.metric.short(),
+            c.conc,
+            c.context.as_deref().unwrap_or(DASH)
+        );
+        if let Some(bucket) = c
+            .context
+            .as_deref()
+            .filter(|k| !sweep.contexts.contains_key(*k))
+        {
+            out.push(format!("cell context {bucket} is not one of the sweep's"));
+        }
+        if !(c.torch.is_finite() && c.torch > 0.0 && c.scratchy.is_finite() && c.scratchy > 0.0) {
+            out.push(format!("{at}: both values must be measured and above 0"));
+        }
+        if !seen.insert((&c.model, c.dtype, c.metric, c.conc, &c.context)) {
+            out.push(format!("{at} is in the sweep twice"));
+        }
+    }
+    if let Some(t) = &sweep.target
+        && cell(sweep, &t.model, t.dtype, t.metric, t.conc, &t.context).is_none()
+    {
+        out.push(format!(
+            "target {}: no cell at {} {} {} conc {} at {}",
+            t.label,
+            t.model,
+            t.dtype.label(),
+            t.metric.short(),
+            t.conc,
+            t.context
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------- accessors
@@ -268,6 +242,18 @@ fn fmt_value(metric: Metric, v: f64) -> String {
     }
 }
 
+/// A value with its unit, as a headline writes it: "143.4 ms", "85 ms",
+/// "77.2 tok/s" (a whole number without its ".0").
+fn fmt_unit(metric: Metric, v: f64) -> String {
+    let n = thousands_f(v, if v.fract() == 0.0 { 0 } else { 1 });
+    match metric {
+        Metric::Itl => format!("{n} ms"),
+        Metric::TokS => format!("{n} tok/s"),
+        // Already in ms or s.
+        Metric::Ttft => fmt_value(metric, v),
+    }
+}
+
 /// How a set of cells reads: who leads where. Ratios inside the noise band
 /// count as ties.
 fn lead_text(cells: &[&Cell]) -> String {
@@ -337,6 +323,24 @@ fn slug(text: &str) -> String {
 
 fn headers<const N: usize>(names: [&str; N]) -> Vec<String> {
     names.map(String::from).to_vec()
+}
+
+/// What a section ends with: the notes on its cells, each once, then the
+/// sweep's own notes for it.
+fn closing_notes<'a>(
+    cells: impl IntoIterator<Item = &'a Cell>,
+    sweep_notes: &'a [String],
+) -> Element {
+    let mut seen = BTreeSet::new();
+    let notes: Vec<&str> = cells
+        .into_iter()
+        .filter_map(|c| c.note.as_deref())
+        .chain(sweep_notes.iter().map(String::as_str))
+        .filter(|n| seen.insert(*n))
+        .collect();
+    rsx! {
+        for n in notes { p { "{n}" } }
+    }
 }
 
 /// A part of a section: its heading, then what explains it, then it.
@@ -592,8 +596,7 @@ fn glance(sweep: &Sweep) -> Element {
                                          request at a time. Colour is how many times faster triton-scratchy is \
                                          than torch-spyre. Blue faster, red slower, the middle step within \
                                          noise. Hover a square for its ratio; a striped square is a cell the \
-                                         sweep did not measure (fp8 past short context: torch-spyre's path is \
-                                         broken there)."
+                                         sweep did not measure."
                                     }
                                     {glance_maps(&[CARD], &stems, |_, model| rsx! {
                                         for (metric, name) in metrics { {mini(model, metric, name)} }
@@ -629,14 +632,14 @@ fn glance(sweep: &Sweep) -> Element {
 }
 
 /// One metric's section shape: its anchor, heading, axis labels, chart
-/// titles, and the notes it ends with.
+/// titles, and which of the sweep's notes it ends with.
 struct SectionSpec {
     id: &'static str,
     heading: &'static str,
     xlabel: &'static str,
     ylabel: &'static str,
     title: fn(&str) -> String,
-    notes: &'static [&'static str],
+    notes: fn(&Notes) -> &[String],
 }
 
 /// One metric's section, per model: a bar chart by context, then the table.
@@ -703,7 +706,10 @@ fn metric_section(
                   Layer { level: 1,
                     Stack { gap: 6,
                         for b in &blocks { {b} }
-                        for n in spec.notes { p { "{n}" } }
+                        {closing_notes(
+                            models.iter().flat_map(|m| cells(sweep, m, dtype, metric, 1)),
+                            (spec.notes)(&sweep.notes),
+                        )}
                     }
                   }
                 }
@@ -719,7 +725,7 @@ const DECODE: SectionSpec = SectionSpec {
     xlabel: "context bucket",
     ylabel: "ITL ms",
     title: |size| format!("Decode ITL, {size} (ms, lower is better)"),
-    notes: &[FLOOR_NOTE],
+    notes: |n| &n.decode,
 };
 
 /// The prefill section's shape: time to first token, fp16.
@@ -729,7 +735,7 @@ const PREFILL: SectionSpec = SectionSpec {
     xlabel: "prompt bucket",
     ylabel: "TTFT ms",
     title: |size| format!("Prefill TTFT, {size} (ms, lower is better)"),
-    notes: &[],
+    notes: |n| &n.prefill,
 };
 
 fn decode_section(sweep: &Sweep) -> Element {
@@ -752,8 +758,8 @@ fn prefill_section(sweep: &Sweep) -> Element {
         &PREFILL,
         rsx! {
             "Time to first token, fp16, one request at a time. " strong { "÷ perfect" } " \
-             scales the ~1k cell's time by prompt length; the ~123 cell sits below that base \
-             (" {DASH} ")."
+             scales each model's second-shortest cell's time by prompt length; its shortest \
+             sits below that base (" {DASH} ")."
         },
         Dtype::Fp16,
         Metric::Ttft,
@@ -795,14 +801,6 @@ fn conc_section(sweep: &Sweep) -> Element {
                 .map(|(k, t, s, _)| (k.clone(), *t, *s))
                 .collect();
             let lead = lead_text(&rows.iter().map(|r| r.3).collect::<Vec<_>>());
-            let notes: Vec<&str> = rows
-                .iter()
-                .filter_map(|(_, _, _, c)| c.note.as_deref())
-                .collect();
-            let notes: Vec<&str> = {
-                let mut seen: BTreeSet<&str> = BTreeSet::new();
-                notes.into_iter().filter(|n| seen.insert(*n)).collect()
-            };
             Some(part(
                 &format!("conc {conc}, fp16"),
                 rsx! {
@@ -833,7 +831,6 @@ fn conc_section(sweep: &Sweep) -> Element {
                                 }
                             }
                         }
-                        for n in notes { p { "{n}" } }
                     }
                 },
             ))
@@ -851,6 +848,12 @@ fn conc_section(sweep: &Sweep) -> Element {
                   Layer { level: 1,
                     Stack { gap: 6,
                         for b in &blocks { {b} }
+                        {closing_notes(
+                            sweep.cells.iter().filter(|c| {
+                                c.conc > 1 && c.dtype == Dtype::Fp16 && c.metric == Metric::TokS
+                            }),
+                            &sweep.notes.conc,
+                        )}
                     }
                   }
                 }
@@ -859,7 +862,7 @@ fn conc_section(sweep: &Sweep) -> Element {
     }
 }
 
-/// fp8: short context only, where torch-spyre's path works.
+/// fp8: every fp8 cell, the chart at each model's shortest context.
 fn fp8_section(sweep: &Sweep) -> Element {
     let models = models(sweep);
     let all: Vec<&Cell> = sweep
@@ -885,21 +888,12 @@ fn fp8_section(sweep: &Sweep) -> Element {
         .filter(|c| c.metric == Metric::Itl)
         .collect();
     let lead = lead_text(&itl);
-    let notes: Vec<&str> = {
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
-        all.iter()
-            .filter_map(|c| c.note.as_deref())
-            .filter(|n| seen.insert(*n))
-            .collect()
-    };
     rsx! {
         Section { id: "fp8", level: 2,
             Stack { gap: 4,
                 Heading { "fp8" }
                 p {
-                    "fp8 weights, one request at a time, short context — torch-spyre's fp8 path \
-                     is broken past it (~10k hangs, TTFT floor 32–55 s), so short context is the \
-                     only fair cell. {lead}. Lower is better."
+                    "fp8 weights, one request at a time. {lead}. Lower is better."
                 }
                 Tile {
                   Layer { level: 1,
@@ -907,7 +901,7 @@ fn fp8_section(sweep: &Sweep) -> Element {
                         if !groups.is_empty() {
                             {bars(
                                 &groups,
-                                ("fp8 decode ITL, short context (ms, lower is better)", "model", "ITL ms"),
+                                ("fp8 decode ITL, shortest context (ms, lower is better)", "model", "ITL ms"),
                                 "220px",
                                 "fp8 decode ITL at short context, triton-scratchy against torch-spyre",
                             )}
@@ -927,8 +921,7 @@ fn fp8_section(sweep: &Sweep) -> Element {
                                 }
                             }
                         }
-                        for n in notes { p { "{n}" } }
-                        p { "{FP8_CONC_NOTE}" }
+                        {closing_notes(all.iter().copied(), &sweep.notes.fp8)}
                     }
                   }
                 }
@@ -937,25 +930,41 @@ fn fp8_section(sweep: &Sweep) -> Element {
     }
 }
 
+/// Whether the sweep says what moved since the one before, or what is left
+/// to do: the "What moved" section is there only then.
+fn says_what_moved(sweep: &Sweep) -> bool {
+    !sweep.moved.is_empty() || !sweep.levers.is_empty()
+}
+
 fn moved_section(sweep: &Sweep) -> Element {
-    let commit = sweep.triton_scratchy.commit.as_deref().unwrap_or("main");
+    if !says_what_moved(sweep) {
+        return rsx! {};
+    }
+    let commit = sweep.triton_scratchy.commit.as_deref().unwrap_or(DASH);
     rsx! {
         Section { id: "moved", level: 2,
             Stack { gap: 4,
                 Heading { "What moved" }
-                p { "triton-scratchy at main " code { "{commit}" } ", #563–#583 merged, since the \
-                     previous sweep." }
-                Table { headers: headers(["change", "what it did"]),
-                    for (pr, what) in MOVED {
-                        TableRow { TableCell { "{pr}" } TableCell { "{what}" } }
+                p {
+                    "triton-scratchy at " code { "{commit}" }
+                    if let Some(since) = &sweep.since { ", {since} merged since the previous sweep" }
+                    "."
+                }
+                if !sweep.moved.is_empty() {
+                    Table { headers: headers(["change", "what it did"]),
+                        for m in &sweep.moved {
+                            TableRow { TableCell { "{m.pr}" } TableCell { "{m.what}" } }
+                        }
                     }
                 }
-                Section { level: 3,
-                    Stack { gap: 3,
-                        Heading { "Open levers" }
-                        Table { headers: headers(["lever", "open work"]),
-                            for (lever, work) in LEVERS {
-                                TableRow { TableCell { "{lever}" } TableCell { "{work}" } }
+                if !sweep.levers.is_empty() {
+                    Section { level: 3,
+                        Stack { gap: 3,
+                            Heading { "Open levers" }
+                            Table { headers: headers(["lever", "open work"]),
+                                for l in &sweep.levers {
+                                    TableRow { TableCell { "{l.lever}" } TableCell { "{l.work}" } }
+                                }
                             }
                         }
                     }
@@ -996,7 +1005,7 @@ fn tile(label: String, value: String, main: String, sub: Option<String>, tone: T
 }
 
 /// The headline tiles under the intro: the sweep's best and worst cells, and
-/// the floor the largest model sits on.
+/// its target.
 fn tiles(sweep: &Sweep) -> Element {
     let models = models(sweep);
     // The first (smallest) and last (largest) models with cells of a kind.
@@ -1027,18 +1036,30 @@ fn tiles(sweep: &Sweep) -> Element {
             Tone::Good,
         ));
     }
-    // The moonshot: the largest model's shared short-context floor.
-    if let Some((m, cs)) = with(Metric::Itl, Dtype::Fp16, 1, false) {
-        let c = cs[0];
+    // The sweep's target, beside where its cell is today.
+    if let Some(t) = &sweep.target
+        && let Some(c) = cell(sweep, &t.model, t.dtype, t.metric, t.conc, &t.context)
+    {
+        let now = format!(
+            "today {} (torch-spyre {})",
+            fmt_unit(t.metric, c.scratchy),
+            fmt_unit(t.metric, c.torch)
+        );
+        // How many times faster scratchy has to get there.
+        let to_go = t
+            .metric
+            .better()
+            .faster(Some(t.value), Some(c.scratchy))
+            .unwrap_or(f64::NAN);
         out.push(tile(
-            format!("{} moonshot · short-context ITL", size_name(&m)),
-            "~85 ms".to_string(),
-            "cost-model peak 204.8 GB/s — both stacks stream 16.4 GB/token at ~115 GB/s"
-                .to_string(),
-            Some(format!(
-                "today's {} tie is a shared floor, not a target",
-                fmt_value(Metric::Itl, c.scratchy)
-            )),
+            t.label.clone(),
+            format!("~{}", fmt_unit(t.metric, t.value)),
+            t.why.clone(),
+            Some(if to_go > 1.0 {
+                format!("{now}: ×{to_go:.2} to go")
+            } else {
+                format!("{now}: met")
+            }),
             Tone::Plain,
         ));
     }
@@ -1119,18 +1140,17 @@ fn about(sweeps: &[(PathBuf, Sweep)]) -> Element {
         Fold { title: "About these numbers",
             Stack { gap: 4,
                 p {
-                    "torch-spyre and triton-scratchy are measured by their own harnesses — vllm \
-                     bench serve for torch-spyre, scr serve for triton-scratchy — at slightly \
-                     different prompt lengths, so cells sit in context buckets and the page \
-                     compares ratios, not absolutes. Each sweep's JSON, with both sides' \
-                     provenance, is linked below."
+                    "torch-spyre and triton-scratchy are measured by their own harnesses (each \
+                     sweep's are in the table below) at slightly different prompt lengths, so \
+                     cells sit in context buckets and the page compares ratios, not absolutes. \
+                     Each sweep's JSON, with both sides' provenance, is linked below."
                 }
                 p {
                     code { "ITL" } " inter-token latency · " code { "TTFT" } " time to first \
                      token · " code { "conc" } " concurrent requests · " code { "tok/s" } " \
                      decoded tokens per second · " code { "÷ perfect" } " triton-scratchy's \
-                     ratio to its own ideal: short-context ITL held flat (decode), the ~1k \
-                     cell's TTFT scaled by prompt length (prefill)."
+                     ratio to its own ideal: short-context ITL held flat (decode), the \
+                     second-shortest cell's TTFT scaled by prompt length (prefill)."
                 }
                 Table { headers: headers(["sweep", "triton-scratchy", "torch-spyre", "harnesses", "data"]),
                     for (file, s) in sweeps.iter().rev() {
@@ -1188,7 +1208,9 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
             if sweep.cells.iter().any(|c| c.dtype == Dtype::Fp8) {
                 sections.push(("fp8".to_string(), "fp8".to_string()));
             }
-            sections.push(("moved".to_string(), "What moved".to_string()));
+            if says_what_moved(sweep) {
+                sections.push(("moved".to_string(), "What moved".to_string()));
+            }
             let names = models(sweep).join(" and ");
             let torch = &sweep.torch_spyre;
             let ours = &sweep.triton_scratchy;
@@ -1197,8 +1219,9 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
                     p {
                         "scratchy's Spyre path against torch-spyre on one Spyre card: {names}, \
                          decode, prefill, concurrency and fp8, from the A/B sweep of \
-                         {sweep.date} — triton-scratchy at " code { "{ours.sha8()}" } " \
-                         (#563–#583 in), torch-spyre measured {torch.measured} on \
+                         {sweep.date} — triton-scratchy at " code { "{ours.sha8()}" }
+                        if let Some(since) = &sweep.since { " ({since} in)" }
+                        ", torch-spyre measured {torch.measured} on \
                          {torch.host.as_deref().unwrap_or(\"the card\")}. Two harnesses, one \
                          card: compare ratios, not absolutes."
                     }
@@ -1237,7 +1260,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
             title: "Spyre performance — scratchy",
             description: Some(
                 "scratchy's Spyre path against torch-spyre on one Spyre card: decode, prefill, \
-                 concurrency and fp8 on granite-3.1 2b and 8b, per A/B sweep.",
+                 concurrency and fp8, per A/B sweep.",
             ),
             og: None,
             root: Root(0),
@@ -1259,4 +1282,55 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
         sweeps.len(),
         out.display()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Sweep, problems};
+
+    /// A sweep of `cells`, with `extra` fields after them.
+    fn sweep(cells: &str, extra: &str) -> serde_json::Result<Sweep> {
+        serde_json::from_str(&format!(
+            r#"{{
+                "schema": 1, "date": "2026-10-17", "contexts": {{ "~1k": 1051 }},
+                "torch_spyre": {{ "measured": "2026-10-14", "harness": "h" }},
+                "triton_scratchy": {{ "measured": "2026-10-17", "commit": "b7c4c8896", "harness": "h" }},
+                "cells": [{cells}]{extra}
+            }}"#
+        ))
+    }
+
+    const CELL: &str = r#"{ "model": "granite-3.1-2b", "dtype": "fp16", "metric": "itl_ms",
+                            "context": "~1k", "torch": 63.0, "scratchy": 46.6 }"#;
+
+    #[test]
+    fn a_clean_sweep_has_no_problems() {
+        let s = sweep(CELL, "").expect("parses");
+        assert!(problems(&s).is_empty(), "{:?}", problems(&s));
+    }
+
+    #[test]
+    fn a_misspelt_key_fails_rather_than_dropping_out() {
+        let err = sweep(CELL, r#", "lever": []"#).err().expect("refused");
+        assert!(err.to_string().contains("unknown field `lever`"), "{err}");
+    }
+
+    #[test]
+    fn problems_name_a_twice_measured_cell_a_zero_and_a_stray_target() {
+        let zero = CELL.replace("46.6", "0.0").replace("itl_ms", "ttft_ms");
+        let s = sweep(
+            &format!("{CELL}, {CELL}, {zero}"),
+            r#", "target": { "label": "t", "model": "granite-3.1-8b", "dtype": "fp16",
+                             "metric": "itl_ms", "context": "~1k", "value": 85.0, "why": "w" }"#,
+        )
+        .expect("parses");
+        let p = problems(&s);
+        assert_eq!(p.len(), 3, "{p:?}");
+        assert!(
+            p[0].contains("ITL conc 1 at ~1k is in the sweep twice"),
+            "{p:?}"
+        );
+        assert!(p[1].contains("both values must be measured"), "{p:?}");
+        assert!(p[2].starts_with("target t: no cell"), "{p:?}");
+    }
 }
