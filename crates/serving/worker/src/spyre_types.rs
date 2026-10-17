@@ -502,9 +502,27 @@ pub(crate) struct Loaded {
     ///
     /// `None` on the paths that never size a paged pool (KTIR emulator, non-paged sessions).
     pub(crate) kv_budget_bytes: Option<u64>,
-    /// ⭐ THE CONTEXT THIS RUN'S POOL CAN ACTUALLY SERVE, in tokens — `min(the declared context, what
-    /// the KV budget funds across the launch rows)`, decided once where budget, page stride and row
-    /// count first meet (the pool sizing in `load_model`).
+    /// THE POOL'S PAGE STRIDE, in bytes — one page = every layer, each layer three planes (Knat, V,
+    /// Kᵀ) of `kv_dim` features across the plane's physical slot extent, at 2 bytes. Set beside
+    /// [`Self::kv_budget_bytes`] at the ONE site both are derived (the pool sizing in `load_model`),
+    /// because the ENGINE's block-count arithmetic divides the budget by this same stride
+    /// ([`Worker::kv_block_bytes`]): `num_gpu_blocks = budget/stride`, clamped to the host range.
+    /// With the real stride the clamp lands exactly on the pool's own host pages, so the scheduler's
+    /// block allocator and the pool are two views of one count — the engine's dense-row estimate
+    /// (no Kᵀ plane) overcounts the page by 4/3 and, the clamp only ever lowering, an
+    /// underestimated block count sailed under it unheard.
+    ///
+    /// `None` on the paths that never size a paged pool.
+    pub(crate) pool_stride_bytes: Option<u64>,
+    /// ⭐ THE CONTEXT THIS RUN SERVES, in tokens — the ONE `--max-model-len` law's answer
+    /// ([`scratchy_serving_engine::gpu_budget::resolve_served_context`]), decided once where
+    /// budget, page stride and row count first meet (the pool sizing in `load_model`).
+    ///
+    /// The law has two branches and NO silent third: an explicit declaration the budget cannot
+    /// fund is REFUSED at load — capping a stated ask is not validating it — and an UNSET flag
+    /// resolves to `min(the model's max_position_embeddings, what the budget funds)`, logged at
+    /// info. So this field is either exactly what was declared or exactly the model's default
+    /// cut to the budget, never a clamp of what was asked.
     ///
     /// This is the MEMORY side of the context law: the bake's pmask covers every pool any card can
     /// express (its block count is `MAX_SEGMENT_BYTES / page_bytes`), so what actually binds a run is

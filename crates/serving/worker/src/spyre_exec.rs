@@ -337,6 +337,36 @@ impl Worker for SpyreWorker {
         Ok(8usize << 30)
     }
 
+    /// THE POOL'S OWN PRICE OF ONE SCHEDULER BLOCK — the page stride, prorated to `block_size`
+    /// tokens.
+    ///
+    /// The engine sizes the scheduler's block allocator as `budget / kv_block_bytes`, then clamps
+    /// DOWN to [`Self::kv_cache_num_blocks_override`]. Without this hook it divided by its own
+    /// dense-row estimate (`2 × kv_heads × head_dim × elem`, no Kᵀ plane), which overcounts a spyre
+    /// page by 4/3 — and because the clamp only ever lowers, an UNDERestimated block count sailed
+    /// under the override unheard, leaving the scheduler naming fewer pages than the pool has (the
+    /// 2b card run: 204 blocks against a 544-page host range). With the real stride the computed
+    /// count is `budget / stride`, which is ≥ the host range by construction (the pool is cut from
+    /// that same division), so the clamp fires and lands exactly on the host range: the two counts
+    /// are one count.
+    ///
+    /// `None` on the paths that never size a paged pool — the engine's estimate is all there is to
+    /// divide by there.
+    fn kv_block_bytes(&self, block_size: usize) -> Option<usize> {
+        self.model
+            .as_ref()
+            .and_then(|m| m.pool_stride_bytes)
+            .map(|stride| {
+                // `PLANE_SLOTS` is how many tokens one page holds, so the stride prorated to
+                // `block_size` tokens is the block cost at ANY block size the engine picks. The
+                // path is fully qualified because the pool/slot vocabulary's imports are
+                // card-only (see this file's header) and the emu tier reaches here too, with
+                // `None` — no pool was ever sized.
+                let plane_slots = scratchy_subtile::sdsc_abstract::PagedKvPool::PLANE_SLOTS as u64;
+                (stride / plane_slots * block_size as u64) as usize
+            })
+    }
+
     /// ⭐ THE POOL'S PAGE COUNT, so every block id the scheduler hands out is a page this pool has.
     ///
     /// `None` — what this returned — let the scheduler size its allocator from a memory estimate while

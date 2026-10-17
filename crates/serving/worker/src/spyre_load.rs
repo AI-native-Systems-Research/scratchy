@@ -113,6 +113,33 @@ fn spilled_weight_spans(
     }
 }
 
+/// ⭐ WHAT A KV BUDGET FUNDS PER REQUEST, IN TOKENS — the pool veto's own advice arithmetic,
+/// hoisted to ONE spelling because the default-context law reads the same number
+/// ([`scratchy_serving_engine::gpu_budget::resolve_served_context`]).
+///
+/// The reserve (one shared scratch page — [`PoolPartition::reserve`]) comes off the top,
+/// the rest splits evenly across the launch rows, and a row spends its pages whole
+/// (`PagedKvPool::PAGE_SLOTS` slots each). ⛔ IT IS THE EXACT INVERSE OF THE POOL DEMAND: a
+/// declaration of exactly this many tokens re-passes the budget veto with zero slack, and one
+/// token more does not — which is what makes an unset flag's resolution veto-proof by
+/// construction instead of by re-checking. Pinned as such by `served_context_tests` below.
+///
+/// Gated to the builds with a caller: the pool veto (`spyre-hw`) and the wiring test
+/// (`test`, so it runs on the emulator build, where the card-only blocks are cfg'd out —
+/// the same cfg artifact the `decode_facts` pair above documents). Pure arithmetic over
+/// the shared pool vocabulary either way.
+#[cfg(any(feature = "spyre-hw", test))]
+pub(crate) fn affordable_context_tokens(
+    budget_bytes: u64,
+    stride_bytes: u64,
+    rows: scratchy_subtile::sdsc_abstract::PoolRows,
+) -> u64 {
+    use scratchy_subtile::sdsc_abstract::{PagedKvPool, PoolPartition};
+    (budget_bytes / stride_bytes).saturating_sub(PoolPartition::reserve() as u64)
+        / rows.get().get() as u64
+        * PagedKvPool::PAGE_SLOTS as u64
+}
+
 use crate::error::ExecutorResult;
 #[cfg(feature = "spyre-hw")]
 use crate::spyre_pool::*;
@@ -1045,12 +1072,24 @@ impl SpyreWorker {
         // ENGINE sizes the scheduler's block allocator off the SAME number the pool was cut from.
         #[allow(unused_mut, unused_assignments)]
         let mut kv_budget_bytes_v: Option<u64> = None;
-        // The context the sized pool can actually serve (tokens) — `min(declared, budget-funded)`,
-        // decided in the SuperDsc branch below where budget, page stride and launch rows first
-        // meet. `usize::MAX` until then, so paths that never size a paged pool report no cap and
-        // `kv_max_addressable_tokens` falls back to the baked mask reach alone.
-        #[allow(unused_mut, unused_assignments)]
-        let mut served_context_v: usize = usize::MAX;
+        // The context the sized pool will actually serve (tokens) — the ONE context law's answer
+        // (`resolve_served_context`) over the declaration and what the budget funds, decided in
+        // the SuperDsc branch below where budget, page stride and launch rows first meet, and
+        // ALWAYS decided there on this tier: every path through the pool sizing either resolves
+        // or refuses, so the binding is left UNINITIALIZED on the card tier and the compiler
+        // holds that invariant (no dead `usize::MAX` initializer to warn about, no `#[allow]`).
+        // `usize::MAX` on the paths that never size a paged pool (the emulator tier), so they
+        // report no cap and `kv_max_addressable_tokens` falls back to the baked mask reach alone.
+        #[cfg(feature = "spyre-hw")]
+        let served_context_v: usize;
+        #[cfg(not(feature = "spyre-hw"))]
+        let served_context_v: usize = usize::MAX;
+        // The paged pool's page stride — filled beside `kv_budget_bytes_v` (the SuperDsc branch
+        // below is the one site both are derived) so `Worker::kv_block_bytes` can hand the engine
+        // the same stride the pool was sized by. Card tier only: the emulator never sizes a pool,
+        // and the construction below carries `None` there.
+        #[cfg(feature = "spyre-hw")]
+        let mut pool_stride_bytes_v: Option<u64> = None;
         #[cfg(feature = "spyre-hw")]
         let session = {
             // ⛔ GUARD (mirror of the build-time flit-cap guard): an EMPTY group
@@ -1276,17 +1315,22 @@ impl SpyreWorker {
                 // the mask reach)) — a mask cap HERE could only fire on worker arithmetic that
                 // disagrees with the bake's, which is exactly what those per-launch guards exist
                 // to catch.
-                let declared_ctx = self.declared_context.unwrap_or(max_model_len).max(1);
-                let pool_demand = scratchy_subtile::sdsc_abstract::PoolDemand::of_declaration(
+                // ⛔ AND IT STAYS THE DECLARED DEPTH THROUGH THE CENSUS, BY DESIGN: the anchor's
+                // reserve policy below needs a pool size to decide against, and what an UNSET
+                // flag should resolve to is only answerable once the budget exists — the
+                // resolution (and the explicit ask's refusal) happen at the budget, in the
+                // context-law block below.
+                let mut declared_ctx = self.declared_context.unwrap_or(max_model_len).max(1);
+                let mut pool_demand = scratchy_subtile::sdsc_abstract::PoolDemand::of_declaration(
                     scratchy_subtile::sdsc_abstract::SlotCount::new(declared_ctx as u32),
                     pool_rows,
                 );
-                let declared_pages = pool_demand.pages().ok_or_else(|| {
+                let mut declared_pages = pool_demand.pages().ok_or_else(|| {
                     werr(format!(
                         "--max-model-len {declared_ctx} overflows a page count"
                     ))
                 })?;
-                let pool_need_bytes = declared_pages.get() as u64 * pool_stride_bytes;
+                let mut pool_need_bytes = declared_pages.get() as u64 * pool_stride_bytes;
                 //
                 // ── THE BATCHED-PREFILL ANCHOR BUNDLE, resolved here because the census below
                 // reads its layout — the anchor session's residency is a budget input now, and
@@ -1630,45 +1674,103 @@ impl SpyreWorker {
                 }
                 // Carry it to `Loaded` so the engine's own KV sizing reads this number and not a constant.
                 kv_budget_bytes_v = Some(pool_budget_bytes);
+                // And the stride beside it, so the engine's block-count arithmetic
+                // (`kv_block_bytes` → `budget/stride`, clamped to the host range) divides by the
+                // same page the pool was cut from — the two counts are then one count.
+                pool_stride_bytes_v = Some(pool_stride_bytes);
                 let num_blocks = {
                     // ⭐ THE POOL'S LAW LIVES ABOVE, ONCE — `pool_need_bytes` / `declared_pages` /
                     // `pool_stride_bytes` / `pool_demand` are the single derivation (hoisted there
                     // because the census and the anchor's reserve policy need them first). This
-                    // block holds only the budget's VETO over the declared pool, and the log that
-                    // states what was decided.
-                    if pool_need_bytes > pool_budget_bytes {
-                        return Err(werr(format!(
-                            "--max-model-len {declared_ctx} × --max-num-seqs {} needs {} KV page(s) \
-                             ({} MB at {} MB per page), but the KV budget is {} MB ({} page(s)). This run \
-                             would fail a request mid-generation once the pool ran out, so it is refused \
-                             here instead. Lower --max-model-len to about {} or --max-num-seqs to {}.",
-                            pool_rows.get(),
-                            declared_pages.get(),
-                            pool_need_bytes / (1024 * 1024),
-                            pool_stride_bytes / (1024 * 1024),
-                            pool_budget_bytes / (1024 * 1024),
-                            pool_budget_bytes / pool_stride_bytes,
-                            // What the budget does fund, stated as the flags the caller typed. The reserve is
-                            // ONE page (the shared scratch page) since the per-row hole run was deleted.
-                            (pool_budget_bytes / pool_stride_bytes).saturating_sub(
-                                scratchy_subtile::sdsc_abstract::PoolPartition::reserve() as u64,
-                            ) / pool_rows.get().get() as u64
-                                * PagedKvPool::PAGE_SLOTS as u64,
-                            (pool_budget_bytes / pool_stride_bytes).saturating_sub(1)
-                                / pool_demand.per_row().get() as u64,
-                        )));
+                    // block holds the CONTEXT LAW's one application to the pool:
+                    // [`resolve_served_context`] over (the CLI's `--max-model-len`, the model's
+                    // own limit, what this budget funds per request), the pool re-derived for
+                    // whatever it served, and the log that states what was decided. The law's
+                    // boundary is the old veto's boundary exactly — an explicit `--max-model-len`
+                    // over what the budget funds is REFUSED with the advice below — and the one
+                    // behavior it adds is the unset flag: the model's own limit resolves DOWN to
+                    // what the budget funds instead of refusing, at info, because a default sized
+                    // by the card is a decision, not a broken ask.
+                    let affordable_ctx =
+                        affordable_context_tokens(pool_budget_bytes, pool_stride_bytes, pool_rows);
+                    match scratchy_serving_engine::gpu_budget::resolve_served_context(
+                        self.declared_context,
+                        max_model_len,
+                        affordable_ctx as usize,
+                    ) {
+                        scratchy_serving_engine::gpu_budget::ServedContext::Refused {
+                            declared,
+                            affordable,
+                        } => {
+                            return Err(werr(format!(
+                                "--max-model-len {declared} × --max-num-seqs {} needs {} KV page(s) \
+                                 ({} MB at {} MB per page), but the KV budget is {} MB ({} page(s)). This run \
+                                 would fail a request mid-generation once the pool ran out, so it is refused \
+                                 here instead. Lower --max-model-len to about {affordable} or --max-num-seqs \
+                                 to {}.",
+                                pool_rows.get(),
+                                declared_pages.get(),
+                                pool_need_bytes / (1024 * 1024),
+                                pool_stride_bytes / (1024 * 1024),
+                                pool_budget_bytes / (1024 * 1024),
+                                pool_budget_bytes / pool_stride_bytes,
+                                // What the budget funds as a WIDTH, stated as the flag the caller
+                                // typed: one page per row past the reserve, at the declaration's
+                                // own per-row page count.
+                                (pool_budget_bytes / pool_stride_bytes).saturating_sub(1)
+                                    / pool_demand.per_row().get() as u64,
+                            )));
+                        }
+                        scratchy_serving_engine::gpu_budget::ServedContext::Tokens(served) => {
+                            // ⭐ AN UNSET DEFAULT RESOLVES HERE, NEVER ABOVE: the census and the
+                            // anchor's reserve policy ran against the DECLARED depth (the model's
+                            // own limit when no flag was given), because the budget that funds the
+                            // resolution is only known once they have. The resolved pool is
+                            // veto-proof by construction — `affordable_context_tokens` is the
+                            // exact inverse of the demand arithmetic, so the re-derived
+                            // `pool_need_bytes` fits the budget it was resolved from — and the
+                            // anchor keeps the BORROW decision the bigger declared pool forced,
+                            // which is the conservative direction (borrowing costs the placement
+                            // effect, never the run).
+                            if served < declared_ctx {
+                                info!(
+                                    "max_model_len unset: serving {served} of the model's \
+                                     {declared_ctx} — what the {} MB KV budget funds across {} \
+                                     launch row(s) at {} MB per page",
+                                    pool_budget_bytes / (1024 * 1024),
+                                    pool_rows.get(),
+                                    pool_stride_bytes / (1024 * 1024),
+                                );
+                                declared_ctx = served;
+                                pool_demand =
+                                    scratchy_subtile::sdsc_abstract::PoolDemand::of_declaration(
+                                        scratchy_subtile::sdsc_abstract::SlotCount::new(
+                                            served as u32,
+                                        ),
+                                        pool_rows,
+                                    );
+                                declared_pages = pool_demand.pages().ok_or_else(|| {
+                                    werr(format!("--max-model-len {served} overflows a page count"))
+                                })?;
+                                pool_need_bytes = declared_pages.get() as u64 * pool_stride_bytes;
+                            }
+                            // What the run SERVES, never `usize::MAX` on a sized pool, so
+                            // `kv_max_addressable_tokens` reports this run's own number and the
+                            // engine's admission cap agrees with the pool by construction.
+                            served_context_v = served;
+                            info!(
+                                "superdsc paged: KV pool {} page(s) = --max-model-len {declared_ctx} ({} page(s) per \
+                                 request) × {} launch row(s) + reserve — {} MB of a {} MB budget at {} MB per page",
+                                declared_pages.get(),
+                                pool_demand.per_row().get(),
+                                pool_rows.get(),
+                                pool_need_bytes / (1024 * 1024),
+                                pool_budget_bytes / (1024 * 1024),
+                                pool_stride_bytes / (1024 * 1024),
+                            );
+                            declared_pages.get() as usize
+                        }
                     }
-                    tracing::info!(
-                        "superdsc paged: KV pool {} page(s) = --max-model-len {declared_ctx} ({} page(s) per \
-                         request) × {} launch row(s) + reserve — {} MB of a {} MB budget at {} MB per page",
-                        declared_pages.get(),
-                        pool_demand.per_row().get(),
-                        pool_rows.get(),
-                        pool_need_bytes / (1024 * 1024),
-                        pool_budget_bytes / (1024 * 1024),
-                        pool_stride_bytes / (1024 * 1024),
-                    );
-                    declared_pages.get() as usize
                 };
                 if let Some(sp) = PagedKvPool::split_pool(num_blocks as u32, pool_rows) {
                     // ⛔ THIS LINE HAS NOW BEEN WRONG TWICE, AND BOTH TIMES BECAUSE IT DESCRIBED A
@@ -2682,6 +2784,13 @@ impl SpyreWorker {
             prefill,
             batched_prefill,
             kv_budget_bytes: kv_budget_bytes_v,
+            pool_stride_bytes: {
+                #[cfg(feature = "spyre-hw")]
+                let stride = pool_stride_bytes_v;
+                #[cfg(not(feature = "spyre-hw"))]
+                let stride = None;
+                stride
+            },
             served_context: served_context_v,
         })
     }
@@ -2897,6 +3006,118 @@ mod weight_copy_tests {
             vec![oproj_row(9, &[1, 2, 3, 4]), oproj_row(to as usize, &[5, 6])],
             "a refusal leaves the staged rows alone"
         );
+    }
+}
+
+/// ⭐ THE DEFAULT-CONTEXT LAW, WIRED AT THE ARITHMETIC THAT DECIDES IT — the granite-3.1-2b
+/// case the law was decided on. The pool veto's site is card-only, but the number it refuses
+/// against and the number an unset flag resolves to are pure arithmetic over the shared pool
+/// vocabulary, so the wiring is pinned HERE: the affordable expression, the ONE predicate, and
+/// the demand the resolution produces, checked against the budget it was resolved from.
+#[cfg(test)]
+mod served_context_tests {
+    use super::*;
+    use scratchy_serving_engine::gpu_budget::{ServedContext, resolve_served_context};
+    use scratchy_subtile::sdsc_abstract::{AdmittedRequests, PoolDemand, PoolRows, SlotCount};
+
+    /// granite-3.1-2b's `max_position_embeddings`, from the checked-in config.
+    const GRANITE_2B_MAX_POS: usize = 131_072;
+    /// One page of granite-3.1-2b KV — the same stride the load derives from the bake's
+    /// `kv_dim`: three planes (Knat, V, Kᵀ) × 8 kv heads × head dim 64 (= kv_dim 512
+    /// features) × 256 plane slots × 2 B × 40 layers. The runtime's own report agrees:
+    /// `kvstride=786432` per layer, `page_stride=31457280`.
+    const GRANITE_2B_PAGE_BYTES: u64 = 3 * (8 * 64) * 256 * 2 * 40;
+    /// The pool is ONE allocation, so the budget that decides the default is a single flex
+    /// region (`bundle::MAX_SEGMENT_BYTES`) — whichever card is under it. This is why the
+    /// 2b's default over-runs: 131,072 tokens at two rows is 1,025 pages ≈ 32.2 GB, two
+    /// regions' worth.
+    const ONE_REGION_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+    /// `scr chat` declares `--max-num-seqs 1`; the width rounds UP to the ladder's smallest
+    /// rung, so a chat run's pool is cut for two launch rows.
+    fn chat_rows() -> PoolRows {
+        PoolRows::for_admission(AdmittedRequests::new(1).expect("1 is nonzero"))
+    }
+
+    #[test]
+    fn the_granite_2b_default_resolves_to_the_affordable_number_and_loads() {
+        let rows = chat_rows();
+        let affordable = affordable_context_tokens(ONE_REGION_BYTES, GRANITE_2B_PAGE_BYTES, rows);
+        // (16 GiB / 31,457,280 B − 1 reserve page) / 2 rows × 256 slots = 69,632 — the number
+        // the card prints from the same arithmetic. NOT the model's 131,072.
+        assert_eq!(affordable, 69_632);
+        assert!(
+            affordable < GRANITE_2B_MAX_POS as u64,
+            "the premise: one region cannot buy the 2b's default"
+        );
+        // THE LAW: the unset default resolves to the affordable number…
+        assert_eq!(
+            resolve_served_context(None, GRANITE_2B_MAX_POS, affordable as usize),
+            ServedContext::Tokens(affordable as usize),
+            "granite-2b's default 131072 resolves to what one region funds"
+        );
+        // …and an explicit over-budget ask refuses WITH that number as the computed advice.
+        assert_eq!(
+            resolve_served_context(
+                Some(GRANITE_2B_MAX_POS),
+                GRANITE_2B_MAX_POS,
+                affordable as usize
+            ),
+            ServedContext::Refused {
+                declared: GRANITE_2B_MAX_POS,
+                affordable: affordable as usize
+            }
+        );
+        // ⭐ THE RESOLUTION IS VETO-PROOF BY CONSTRUCTION: the pool demanded for exactly the
+        // affordable number fits the budget it was resolved from…
+        let need = |tokens: u64| {
+            PoolDemand::of_declaration(SlotCount::new(tokens as u32), rows)
+                .pages()
+                .expect("a region-scale declaration overflows no page count")
+                .get() as u64
+                * GRANITE_2B_PAGE_BYTES
+        };
+        assert!(
+            need(affordable) <= ONE_REGION_BYTES,
+            "the resolved pool fits: {} ≤ {}",
+            need(affordable),
+            ONE_REGION_BYTES
+        );
+        // …and one token MORE does not — the boundary is tight, so the resolution is the
+        // LARGEST context that re-passes the veto, never a rounded guess under it.
+        assert!(
+            need(affordable + 1) > ONE_REGION_BYTES,
+            "one token past the resolution busts the budget: {}",
+            need(affordable + 1)
+        );
+    }
+
+    /// The law's boundary IS the old veto's boundary: for every explicit declaration, the
+    /// predicate refuses exactly the declarations whose pool demand exceeds the budget — the
+    /// rewrite changed the unset branch only, never the refusal's edge.
+    #[test]
+    fn the_laws_boundary_is_the_old_vetos_boundary() {
+        let rows = chat_rows();
+        let affordable =
+            affordable_context_tokens(ONE_REGION_BYTES, GRANITE_2B_PAGE_BYTES, rows) as usize;
+        // 256 = one page; 257 crosses into a second; 65,792 = a deep in-budget ask;
+        // 69,632/69,633 straddle the resolution; 131,072 is the two-region ask.
+        for declared in [256_usize, 257, 4096, 65_792, 69_632, 69_633, 131_072] {
+            let demand = PoolDemand::of_declaration(SlotCount::new(declared as u32), rows)
+                .pages()
+                .expect("a region-scale declaration overflows no page count");
+            let need = demand.get() as u64 * GRANITE_2B_PAGE_BYTES;
+            let old_veto_fires = need > ONE_REGION_BYTES;
+            match resolve_served_context(Some(declared), GRANITE_2B_MAX_POS, affordable) {
+                ServedContext::Refused { .. } => {
+                    assert!(old_veto_fires, "{declared}: refused inside the budget");
+                }
+                ServedContext::Tokens(served) => {
+                    assert!(!old_veto_fires, "{declared}: served past the budget");
+                    assert_eq!(served, declared, "{declared}: verbatim inside the budget");
+                }
+            }
+        }
     }
 }
 
