@@ -1,15 +1,16 @@
 //! The chart machinery the performance pages share: the specs charts.js
-//! hands Carbon Charts, the ratio heat maps' colour scale, and the sparkline
-//! that fills the gap between two lines — blue where scratchy is ahead, red
-//! where it is behind. metal.html and spyre.html render these with their own
-//! data; nothing here knows a page's own numbers.
+//! hands Carbon Charts, the ratio heat maps' colour scale, the "At a glance"
+//! small multiples laid out beside it, and the sparkline that fills the gap
+//! between two lines — blue where scratchy is ahead, red where it is behind.
+//! metal.html and spyre.html render these with their own data; nothing here
+//! knows a page's own numbers.
 
 use std::collections::BTreeMap;
 
 use dioxus::prelude::*;
 use serde::Serialize;
 
-use crate::carbon::{Alignment, Column, Definition, Grid, Gutter, Span};
+use crate::carbon::{Alignment, Definition, Stack};
 
 /// Draws every chart from its rendered spec.
 pub const CHARTS_JS: &str = include_str!("charts.js");
@@ -327,12 +328,12 @@ pub fn chart(spec: &Chart, label: &str, mount: &str, scale: Option<&str>) -> Ele
     }
 }
 
+/// The overview's ratio scale.
+const GLANCE_SCALE: &str = "scale-glance";
+
 /// The ratio heatmaps' colour scale, upright: RATIO_STEPS fastest at the top,
 /// labelled at the ends and the middle. Carbon's heatmap only draws its legend
 /// as a bar underneath.
-/// The overview's ratio scale.
-pub const GLANCE_SCALE: &str = "scale-glance";
-
 pub fn ratio_scale(fit: ScaleFit, id: &str) -> Element {
     let rows = RATIO_STEPS.len();
     let middle = rows / 2 + 1;
@@ -341,10 +342,10 @@ pub fn ratio_scale(fit: ScaleFit, id: &str) -> Element {
         ScaleFit::Beside => (
             // Stretched to the rows beside it: from the top of the first
             // row's grids (below its model names, 1.5rem) to the bottom of
-            // the last's (above its two label lines, 2.25rem). Stacked under
-            // them below the medium breakpoint (charts_beside_scale), it
-            // keeps a readable height.
-            "align-self: stretch; margin-block: 1.5rem 2.25rem; min-height: 12rem; ".to_string(),
+            // the last's (above its two label lines, 2.25rem). Beside a
+            // single row, it keeps a readable height.
+            "flex: none; align-self: stretch; margin-block: 1.5rem 2.25rem; min-height: 12rem; "
+                .to_string(),
             "1fr",
         ),
     };
@@ -357,19 +358,23 @@ pub fn ratio_scale(fit: ScaleFit, id: &str) -> Element {
                     "data-step": "{rows - 1 - row}",
                 }
             }
-            div { style: "grid-column: 2; grid-row: 1; align-self: start",
+            // Each label of no height, its text hanging from its step's top,
+            // centred on its middle, or standing on its bottom: so the labels
+            // never size the steps, and stretched over a single row the scale
+            // is no taller than its rows (or its minimum height) makes it.
+            div { style: "grid-column: 2; grid-row: 1; align-self: start; height: 0; display: flex; align-items: flex-start",
                 Definition { alignment: Alignment::Left,
                     definition: "scratchy at least {RATIO_SPAN} times as fast as the engine the map compares it with; anything faster takes this colour too.",
                     strong { "×{RATIO_SPAN}" }
                 }
             }
-            div { style: "grid-column: 2; grid-row: {middle}; align-self: center",
+            div { style: "grid-column: 2; grid-row: {middle}; align-self: center; height: 0; display: flex; align-items: center",
                 Definition { alignment: Alignment::Left,
                     definition: "The same speed, within run-to-run noise: ×0.96 to ×1.04.",
                     strong { "×1" }
                 }
             }
-            div { style: "grid-column: 2; grid-row: {rows}; align-self: end",
+            div { style: "grid-column: 2; grid-row: {rows}; align-self: end; height: 0; display: flex; align-items: flex-end",
                 Definition { alignment: Alignment::Left,
                     definition: "scratchy at most a quarter as fast as the engine the map compares it with, {RATIO_SPAN} times slower; anything slower takes this colour too.",
                     strong { "×{1.0 / RATIO_SPAN}" }
@@ -387,19 +392,170 @@ pub enum ScaleFit {
     Beside,
 }
 
-/// A glance's charts beside their shared ratio scale, on Carbon's grid: the
-/// charts take the wide column, the scale the narrow one, and the two stack
-/// below the medium breakpoint — Carbon's own columns, no layout of ours.
-/// `charts` is the wide column's content and lays itself out.
-pub fn charts_beside_scale(charts: Element, scale_id: &str) -> Element {
+/// A ratio map's two axes, read like a table: `across` left to right, `down`
+/// top to bottom, each its title and its labels in order.
+pub struct TableAxes<'a> {
+    pub across: (&'a str, Vec<String>),
+    pub down: (&'a str, Vec<String>),
+}
+
+impl<'a> TableAxes<'a> {
+    /// As Carbon's label axes: across on x, down on y.
+    pub fn axes(self, visible: Option<bool>) -> Axes<'a> {
+        let labels = |maps_to, title, domain: Vec<String>| Axis {
+            maps_to,
+            title,
+            scale_type: Some("labels"),
+            ticks: None,
+            include_zero: None,
+            visible,
+            domain: Some(AxisDomain::Labels(domain)),
+        };
+        let (across, (down, mut rows)) = (self.across, self.down);
+        // Carbon draws a vertical axis's first label at the bottom.
+        rows.reverse();
+        Axes {
+            bottom: labels("x", across.0, across.1),
+            left: labels("y", down, rows),
+        }
+    }
+}
+
+/// One square of a ratio map: its place on the map's axes, how many times
+/// faster scratchy is there (None: no ratio), and whether charts.js writes
+/// that factor in it.
+pub struct RatioSquare {
+    pub across: String,
+    pub down: String,
+    pub ratio: Option<f64>,
+    pub highlight: bool,
+}
+
+/// A grid of ratios as a tiny heatmap, colour only: no title, axes or
+/// legend, what is around it names it. Its box is as wide as it is given and
+/// as tall as square cells make it.
+pub fn mini_heatmap(
+    grid: TableAxes,
+    data: Vec<HeatPoint>,
+    total_label: String,
+    label: &str,
+) -> Element {
+    let aspect = format!("{} / {}", grid.across.1.len(), grid.down.1.len());
+    let spec = Chart::Heatmap {
+        data,
+        options: ChartOptions {
+            title: String::new(),
+            axes: grid.axes(Some(false)),
+            color: Some(Colour::Gradient {
+                gradient: Gradient {
+                    colors: &RATIO_STEPS,
+                },
+            }),
+            heatmap: Some(HeatmapOptions {
+                color_legend: ColorLegend {
+                    title: String::new(),
+                    kind: "quantize",
+                },
+                color_domain: Some(RATIO_RANGE),
+            }),
+            // Its box decides.
+            height: "100%".to_string(),
+            width: Some("100%".to_string()),
+            legend: Some(Enabled { enabled: false }),
+            locale: Locale::total(total_label),
+            combo: None,
+            bounds: None,
+            theme: "white",
+            toolbar: Enabled { enabled: false },
+        },
+        ratio: true,
+    };
+    chart(
+        &spec,
+        label,
+        &format!("width: 100%; aspect-ratio: {aspect}"),
+        Some(GLANCE_SCALE),
+    )
+}
+
+/// One of a glance's small multiples: `squares` as a mini_heatmap, `name`
+/// over the range of its ratios under it. Half its cell (glance_maps), however
+/// wide the cell is. `about` says whose grid it is.
+pub fn glance_mini(
+    grid: TableAxes,
+    squares: Vec<RatioSquare>,
+    total_label: String,
+    name: &str,
+    about: &str,
+) -> Element {
+    let ratios: Vec<f64> = squares.iter().filter_map(|s| s.ratio).collect();
+    let range = match (
+        ratios.iter().copied().reduce(f64::min),
+        ratios.iter().copied().reduce(f64::max),
+    ) {
+        (Some(lo), Some(hi)) => format!("×{lo:.2}–×{hi:.2}"),
+        _ => "no ratios".to_string(),
+    };
+    let data = squares
+        .into_iter()
+        .map(|s| HeatPoint {
+            x: s.across,
+            y: s.down,
+            value: s.ratio.map(log2_ratio),
+            highlight: s.highlight,
+        })
+        .collect();
     rsx! {
-        Grid { gutter: Gutter::Cards,
-            Column { span: Span { sm: 4, md: 6, lg: 14 },
-                {charts}
+        div { style: "flex: 1 1 0; min-width: 0",
+            Stack { gap: 2,
+                {mini_heatmap(grid, data, total_label, &format!("{about}: scratchy {range}"))}
+                // Name over range, centred under the grid.
+                div { style: "text-align: center",
+                    div { strong { "{name}" } }
+                    div { "{range}" }
+                }
             }
-            Column { span: Span { sm: 4, md: 2, lg: 2 },
-                {ratio_scale(ScaleFit::Beside, scale_id)}
+        }
+    }
+}
+
+/// A glance's heat maps beside their ratio scale: a row per `rows` (a
+/// machine), its name, then a cell per `columns` (a model), each the column's
+/// name over `cell(row, column)`, that row's grids of that model as
+/// glance_minis. The cells are one width, 11.5rem (two 88px grids and the 8px
+/// between them), and on a narrow screen shrink together rather than wrap, as
+/// the sparkline panels' columns do: so every grid on the page is one size,
+/// the columns line up down the rows, and the scale stands beside them all.
+/// Each row's names share a track and its grids the next, so a name that
+/// wraps onto two lines leaves its grids level with their neighbours'.
+pub fn glance_maps(
+    rows: &[&str],
+    columns: &[&str],
+    cell: impl Fn(&str, &str) -> Element,
+) -> Element {
+    let grid = format!(
+        "flex: 0 1 auto; min-width: 0; align-self: start; display: grid; \
+         grid-template-columns: 7rem repeat({}, minmax(0, 11.5rem)); gap: 1.5rem",
+        columns.len()
+    );
+    rsx! {
+        div { style: "display: flex; gap: 2rem",
+            div { style: "{grid}",
+                for row in rows {
+                    div { style: "grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; row-gap: 0.5rem",
+                        div { style: "grid-row: span 2", "{row}" }
+                        for column in columns {
+                            div { style: "align-self: end; text-align: center", "{column}" }
+                        }
+                        for column in columns {
+                            div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
+                                {cell(row, column)}
+                            }
+                        }
+                    }
+                }
             }
+            {ratio_scale(ScaleFit::Beside, GLANCE_SCALE)}
         }
     }
 }
@@ -674,7 +830,8 @@ pub fn highlight<'s>(steps: impl Iterator<Item = (Better, &'s mut Step)>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Better, RATIO_RANGE, RATIO_SPAN, RATIO_STEPS, Side, Step, ratio_step, spark_points,
+        Axis, AxisDomain, Better, RATIO_RANGE, RATIO_SPAN, RATIO_STEPS, Side, Step, TableAxes,
+        ratio_step, spark_points,
     };
 
     const SCRATCHY: Side = Side {
@@ -760,5 +917,22 @@ mod tests {
         let n = RATIO_STEPS.len();
         assert_eq!(n % 2, 1);
         assert_eq!(RATIO_STEPS[n / 2], "#a8a8a8");
+    }
+
+    #[test]
+    fn a_table_reads_its_first_row_on_top() {
+        let labels = |ls: &[&str]| ls.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        let axes = TableAxes {
+            across: ("context", labels(&["~123", "~1k", "~10k"])),
+            down: ("dtype", labels(&["fp16", "fp8"])),
+        }
+        .axes(None);
+        let domain = |a: &Axis| match &a.domain {
+            Some(AxisDomain::Labels(ls)) => ls.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(domain(&axes.bottom), labels(&["~123", "~1k", "~10k"]));
+        // Carbon draws a vertical axis's first label at the bottom.
+        assert_eq!(domain(&axes.left), labels(&["fp8", "fp16"]));
     }
 }

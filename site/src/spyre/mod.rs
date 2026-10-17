@@ -20,9 +20,8 @@ use crate::carbon::{
     Table, TableCell, TableRow, Tile,
 };
 use crate::charts::{
-    Axes, Axis, AxisDomain, BarPoint, Chart, ChartOptions, ColorLegend, Colour, Enabled,
-    GLANCE_SCALE, Gradient, HeatPoint, HeatmapOptions, Locale, RATIO_RANGE, RATIO_STEPS, Side,
-    SparkAxes, Step, chart, charts_beside_scale, colour, highlight, log2_ratio, sparkline,
+    Axes, Axis, AxisDomain, BarPoint, Chart, ChartOptions, Colour, Enabled, RatioSquare, Side,
+    SparkAxes, Step, TableAxes, chart, colour, glance_maps, glance_mini, highlight, sparkline,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab, Theme};
 use crate::thousands_f;
@@ -419,74 +418,6 @@ fn bars(
     chart(&spec, label, "width: 100%", None)
 }
 
-/// One ratio map: the models down, the context buckets across, each cell how
-/// many times faster scratchy is than torch-spyre, every cell labelled.
-fn heat_map(
-    title: &str,
-    models: &[String],
-    contexts: &[String],
-    at: impl Fn(&str, &str) -> Option<f64>,
-    label: &str,
-) -> Element {
-    let mut data = Vec::new();
-    for m in models {
-        for c in contexts {
-            data.push(HeatPoint {
-                x: c.clone(),
-                y: m.clone(),
-                value: at(m.as_str(), c.as_str())
-                    .filter(|r| r.is_finite())
-                    .map(log2_ratio),
-                highlight: true,
-            });
-        }
-    }
-    let labels = |maps_to, title, domain: Vec<String>| Axis {
-        maps_to,
-        title,
-        scale_type: Some("labels"),
-        ticks: None,
-        include_zero: None,
-        visible: None,
-        domain: Some(AxisDomain::Labels(domain)),
-    };
-    let total = format!("scratchy/{}", TORCH.line);
-    let spec = Chart::Heatmap {
-        data,
-        options: ChartOptions {
-            title: title.to_string(),
-            axes: Axes {
-                bottom: labels("x", "context", contexts.to_vec()),
-                // Carbon draws a vertical axis's first label at the bottom.
-                left: labels("y", "model", models.iter().rev().cloned().collect()),
-            },
-            color: Some(Colour::Gradient {
-                gradient: Gradient {
-                    colors: &RATIO_STEPS,
-                },
-            }),
-            heatmap: Some(HeatmapOptions {
-                color_legend: ColorLegend {
-                    title: total.clone(),
-                    kind: "quantize",
-                },
-                color_domain: Some(RATIO_RANGE),
-            }),
-            // Room for the axes, then about 56px a cell.
-            height: format!("{}px", 100 + 56 * models.len()),
-            width: Some(format!("{}px", 140 + 72 * contexts.len())),
-            legend: Some(Enabled { enabled: false }),
-            locale: Locale::total(total),
-            combo: None,
-            bounds: None,
-            theme: "white",
-            toolbar: Enabled { enabled: false },
-        },
-        ratio: true,
-    };
-    chart(&spec, label, "max-width: 100%", Some(GLANCE_SCALE))
-}
-
 /// One model's sparkline panel: its cells as steps along the context axis.
 struct Panel<'a> {
     model: String,
@@ -594,19 +525,50 @@ const HEAT_MAPS: &str = "Heat maps";
 const DECODE_SPARKS: &str = "Decode by context";
 const PREFILL_SPARKS: &str = "Prefill by context";
 
+/// The glance's one row: the card every sweep ran on, as metal.html's rows
+/// are its machines.
+const CARD: &str = "IBM Spyre";
+
+/// The glance's heat maps as metal.html draws its own: a cell per model, its
+/// prefill grid then its decode grid, each its dtypes down and the context
+/// buckets across, one request at a time.
 fn glance(sweep: &Sweep) -> Element {
     let (models, contexts) = (models(sweep), contexts(sweep));
-    let map = |dtype: Dtype, metric: Metric| -> Element {
-        heat_map(
-            &format!("{} · {}", dtype.label(), metric.label()),
-            &models,
-            &contexts,
-            |m, c| cell(sweep, m, dtype, metric, 1, c).map(|c| c.ratio()),
-            &format!(
-                "{} {}, triton-scratchy vs torch-spyre by context",
-                dtype.label(),
-                metric.label()
+    let dtypes: BTreeSet<Dtype> = sweep
+        .cells
+        .iter()
+        .filter(|c| c.conc == 1)
+        .map(|c| c.dtype)
+        .collect();
+    let stems: Vec<&str> = models.iter().map(String::as_str).collect();
+    let metrics = [(Metric::Ttft, "Prefill"), (Metric::Itl, "Decode")];
+    let mini = |model: &str, metric: Metric, name: &str| -> Element {
+        let grid = TableAxes {
+            across: ("context", contexts.clone()),
+            down: (
+                "dtype",
+                dtypes.iter().map(|d| d.label().to_string()).collect(),
             ),
+        };
+        let squares = dtypes
+            .iter()
+            .flat_map(|&dtype| {
+                contexts.iter().map(move |c| RatioSquare {
+                    across: c.clone(),
+                    down: dtype.label().to_string(),
+                    ratio: cell(sweep, model, dtype, metric, 1, c)
+                        .map(Cell::ratio)
+                        .filter(|r| r.is_finite()),
+                    highlight: false,
+                })
+            })
+            .collect();
+        glance_mini(
+            grid,
+            squares,
+            format!("scratchy/{}", TORCH.line),
+            name,
+            &format!("{model} {}", metric.label()),
         )
     };
     rsx! {
@@ -624,24 +586,18 @@ fn glance(sweep: &Sweep) -> Element {
                             ContentPanel { id: slug(HEAT_MAPS), shown: true,
                                 Stack { gap: 5,
                                     p { style: "contain: inline-size",
-                                        "Every model × context cell of the sweep, one map per dtype and \
-                                         metric: colour is how many times faster triton-scratchy is than \
-                                         torch-spyre — blue faster, red slower, the middle step within \
-                                         noise. Hover a square for its ratio; an empty square is a cell the \
-                                         sweep did not measure (fp8 past short context: torch-spyre's path \
-                                         is broken there)."
+                                        "Every model's dtype × context grid: in each cell, the model's prefill \
+                                         (time to first token) grid, then its decode (inter-token latency) \
+                                         grid (rows: fp16 over fp8; columns: context, short to long), one \
+                                         request at a time. Colour is how many times faster triton-scratchy is \
+                                         than torch-spyre. Blue faster, red slower, the middle step within \
+                                         noise. Hover a square for its ratio; a striped square is a cell the \
+                                         sweep did not measure (fp8 past short context: torch-spyre's path is \
+                                         broken there)."
                                     }
-                                    {charts_beside_scale(
-                                        rsx! {
-                                            div { style: "display: flex; flex-wrap: wrap; gap: 1.5rem",
-                                                {map(Dtype::Fp16, Metric::Itl)}
-                                                {map(Dtype::Fp16, Metric::Ttft)}
-                                                {map(Dtype::Fp8, Metric::Itl)}
-                                                {map(Dtype::Fp8, Metric::Ttft)}
-                                            }
-                                        },
-                                        GLANCE_SCALE,
-                                    )}
+                                    {glance_maps(&[CARD], &stems, |_, model| rsx! {
+                                        for (metric, name) in metrics { {mini(model, metric, name)} }
+                                    })}
                                 }
                             }
                             ContentPanel { id: slug(DECODE_SPARKS), shown: false,

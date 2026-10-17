@@ -24,9 +24,9 @@ use crate::carbon::{
 };
 use crate::charts::{
     Axes, Axis, AxisDomain, BarPoint, Better, Chart, ChartOptions, ColorLegend, Colour, Enabled,
-    GLANCE_SCALE, Gradient, HeatPoint, HeatmapOptions, Locale, RATIO_RANGE, RATIO_STEPS, ScaleFit,
-    SparkAxes, Step, chart, charts_beside_scale, colour, highlight, log2_ratio, ratio_scale,
-    ratio_step, sparkline,
+    Gradient, HeatPoint, HeatmapOptions, Locale, RATIO_RANGE, RATIO_STEPS, RatioSquare, ScaleFit,
+    SparkAxes, Step, TableAxes, chart, colour, glance_maps, glance_mini, highlight, log2_ratio,
+    mini_heatmap, ratio_scale, ratio_step, sparkline,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab, Theme};
 use data::{At, Bytes, Cell, Model, Run, Scenario};
@@ -635,28 +635,10 @@ struct Series {
 
 /// A grid's heatmap axes, read like a table: answer tokens across, prompt
 /// tokens down, each smallest first, so the smallest prompt is on top.
-fn grid_axes<'a>(ins: &[u32], outs: &[u32], visible: Option<bool>) -> Axes<'a> {
-    let labels = |maps_to, title, domain: Vec<String>| Axis {
-        maps_to,
-        title,
-        scale_type: Some("labels"),
-        ticks: None,
-        include_zero: None,
-        visible,
-        domain: Some(AxisDomain::Labels(domain)),
-    };
-    Axes {
-        bottom: labels(
-            "x",
-            "answer tokens",
-            outs.iter().map(u32::to_string).collect(),
-        ),
-        // Carbon draws a vertical axis's first label at the bottom.
-        left: labels(
-            "y",
-            "prompt tokens",
-            ins.iter().rev().map(u32::to_string).collect(),
-        ),
+fn grid_axes(ins: &[u32], outs: &[u32]) -> TableAxes<'static> {
+    TableAxes {
+        across: ("answer tokens", outs.iter().map(u32::to_string).collect()),
+        down: ("prompt tokens", ins.iter().map(u32::to_string).collect()),
     }
 }
 
@@ -793,7 +775,7 @@ fn grid_heatmap(
         data,
         options: ChartOptions {
             title,
-            axes: grid_axes(ins, outs, None),
+            axes: grid_axes(ins, outs).axes(None),
             color: ratio.then_some(Colour::Gradient {
                 gradient: Gradient {
                     colors: &RATIO_STEPS,
@@ -825,51 +807,6 @@ fn grid_heatmap(
     // then grows a scrollbar that resizes the chart under the pointer, over
     // and over.
     chart(&spec, label, "max-width: 100%", scale)
-}
-
-/// One small multiple: a model's whole grid as a tiny heatmap, colour only;
-/// no title, axes or legend, the table around it names it.
-fn mini_heatmap(
-    (ins, outs): (&[u32], &[u32]),
-    data: Vec<HeatPoint>,
-    total_label: String,
-    label: &str,
-) -> Element {
-    let spec = Chart::Heatmap {
-        data,
-        options: ChartOptions {
-            title: String::new(),
-            axes: grid_axes(ins, outs, Some(false)),
-            color: Some(Colour::Gradient {
-                gradient: Gradient {
-                    colors: &RATIO_STEPS,
-                },
-            }),
-            heatmap: Some(HeatmapOptions {
-                color_legend: ColorLegend {
-                    title: String::new(),
-                    kind: "quantize",
-                },
-                color_domain: Some(RATIO_RANGE),
-            }),
-            // Its box decides: square, half its cell.
-            height: "100%".to_string(),
-            width: Some("100%".to_string()),
-            legend: Some(Enabled { enabled: false }),
-            locale: Locale::total(total_label),
-            combo: None,
-            bounds: None,
-            theme: "white",
-            toolbar: Enabled { enabled: false },
-        },
-        ratio: true,
-    };
-    chart(
-        &spec,
-        label,
-        "width: 100%; aspect-ratio: 1",
-        Some(GLANCE_SCALE),
-    )
 }
 
 /// A cell's value for a table view, with what its marks mean: how many
@@ -1505,7 +1442,7 @@ fn versus_mini(g: &ShapeGrid, metric: Metric, e: Engine, label: &str) -> Element
     rsx! {
         div { style: "flex: 0 0 7rem; width: 7rem",
             Stack { gap: 1,
-                {mini_heatmap((g.ins, g.outs), data, format!("scratchy/{}", e.label()), label)}
+                {mini_heatmap(grid_axes(g.ins, g.outs), data, format!("scratchy/{}", e.label()), label)}
                 div { style: "text-align: center; font-size: 0.75rem", "vs {e.label()}" }
             }
         }
@@ -1817,14 +1754,13 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             Ok(g) => g,
             Err(why) => return rsx! { "{why}" },
         };
-        let ratios: Vec<f64> = g.cells.iter().filter_map(|&(_, _, r)| r).collect();
-        let data = g
+        let squares = g
             .cells
             .iter()
-            .map(|&(i, o, r)| HeatPoint {
-                x: o.to_string(),
-                y: i.to_string(),
-                value: r.map(log2_ratio),
+            .map(|&(i, o, r)| RatioSquare {
+                across: o.to_string(),
+                down: i.to_string(),
+                ratio: r,
                 highlight: highlights.contains(&Square {
                     chip,
                     stem,
@@ -1834,33 +1770,15 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                 }),
             })
             .collect();
-        let range = match (
-            ratios.iter().copied().reduce(f64::min),
-            ratios.iter().copied().reduce(f64::max),
-        ) {
-            (Some(lo), Some(hi)) => format!("×{lo:.2}–×{hi:.2}"),
-            _ => "no ratios".to_string(),
-        };
-        rsx! {
-            // Half its cell, however wide the cell grows.
-            div { style: "flex: 1 1 0; min-width: 0",
-                Stack { gap: 2,
-                    {mini_heatmap((g.ins, g.outs), data, format!("scratchy/{}", g.rival.label()), &format!("{stem} on {chip}: scratchy {range}"))}
-                    // Name over range, centred under the grid.
-                    div { style: "text-align: center",
-                        div { strong { "{name}" } }
-                        div { "{range}" }
-                    }
-                }
-            }
-        }
+        glance_mini(
+            grid_axes(g.ins, g.outs),
+            squares,
+            format!("scratchy/{}", g.rival.label()),
+            name,
+            &format!("{stem} on {chip}"),
+        )
     };
-    // Each machine a wrapping row: its name in a fixed-width label, then a cell
-    // per model (its name over its prefill and decode grids), 11.5rem wide or
-    // more. On a wide screen the rows line up as columns at 11.5rem; on a
-    // narrow one the cells wrap, each growing to fill its line, the grids in
-    // it with it, so nothing scrolls sideways and nothing sits in a corner. The scale stands beside the rows, or
-    // wraps below them.
+    let chips: Vec<&str> = machines.keys().copied().collect();
     rsx! {
         Section { id: "glance", level: 2,
             Stack { gap: 4,
@@ -1892,27 +1810,9 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                          llama.cpp, mistral.rs. Blue faster, red slower, the middle step within noise. \
                                          Hover a square for its ratio."
                                     }
-                                    {charts_beside_scale(
-                                        rsx! {
-                                            div { style: "display: flex; flex-direction: column; gap: 1.5rem; min-width: 0",
-                                                for chip in machines.keys() {
-                                                    div { style: "display: flex; flex-wrap: wrap; gap: 1rem 1.5rem; align-items: flex-start",
-                                                        div { style: "flex: none; width: 7rem", "{chip}" }
-                                                        for stem in &stems {
-                                                            // At least two 88px grids and the 8px between them.
-                                                            div { style: "flex: 1 1 11.5rem; min-width: 11.5rem; display: flex; flex-direction: column; gap: 0.5rem",
-                                                                div { style: "text-align: center", "{stem}" }
-                                                                div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
-                                                                    for (_, name) in metrics { {mini(chip, stem, name)} }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        },
-                                        GLANCE_SCALE,
-                                    )}
+                                    {glance_maps(&chips, &stems, |chip, stem| rsx! {
+                                        for (_, name) in metrics { {mini(chip, stem, name)} }
+                                    })}
                                 }
                             }
                             // Each a machine × model matrix, every cell its prefill
