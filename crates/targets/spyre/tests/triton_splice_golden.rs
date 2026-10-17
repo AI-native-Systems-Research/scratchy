@@ -1022,7 +1022,7 @@ fn a_prompt_chunks_rope_does_not_grow_with_its_rows() {
             *kinds.entry(format!("{:?}", o.op_type)).or_default() += 1;
         }
         let mut top: Vec<(String, usize)> = kinds.into_iter().collect();
-        top.sort_by(|a, b| b.1.cmp(&a.1));
+        top.sort_by_key(|k| std::cmp::Reverse(k.1));
         top.truncate(3);
         (ops.len(), top)
     };
