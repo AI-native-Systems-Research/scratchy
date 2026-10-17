@@ -419,124 +419,166 @@ fn w4a8_grouped_expert_runs() {
     });
 }
 
-/// The fused act+quant (`affine_gather_w4a8_quant_silu_*`) produces the SAME scratch the
-/// separated pair produces — `silu_mul` over the gate/up rows, then
-/// `affine_gather_w4a8_quant` over its output — byte for byte, sentinel rows left untouched by
-/// both: the fusion's claim is that it skips the bf16 intermediate's MEMORY, not its rounding,
+/// The fused act+quant (`affine_gather_w4a8_quant_<act>_<dtype>`) produces the SAME scratch the
+/// separated pair produces — the `silu_mul`-family act over the gate/up rows (gpt-oss's with its
+/// gate/up LINEAR biases), an ungated expert's relu² the `relu2` kernel, then
+/// `affine_gather_w4a8_quant` over the act's output — byte for byte, sentinel rows left untouched
+/// by both: the fusion's claim is that it skips the bf16 intermediate's MEMORY, not its rounding,
 /// so anything but an identical scratch is a divergence.
 #[test]
 fn w4a8_act_quant_matches_the_separated_pair() {
     with_nax(|device, cache| {
-        for act in [Dtype::Bf16, Dtype::F16] {
-            let (k, experts, run) = (512, 5, 64);
-            let m = experts * run;
-            let counts = [5, 16, 17, 40, 0];
-            let mut rng = Rng(0xa17 ^ act as u64);
-            let gate: Vec<u16> = (0..m * k)
-                .map(|_| act.bits(4.0 * rng.unit() - 2.0))
-                .collect();
-            let up: Vec<u16> = (0..m * k)
-                .map(|_| act.bits(4.0 * rng.unit() - 2.0))
-                .collect();
-            let indices: Vec<u32> = (0..m)
-                .map(|r| match r % run < counts[r / run] {
-                    true => (r / run) as u32,
-                    false => experts as u32,
-                })
-                .collect();
-            let (g_buf, u_buf, i_buf) = (
-                shared(device, &gate),
-                shared(device, &up),
-                shared(device, &indices),
-            );
-            let scratch_bytes = w4a8_scratch_bytes(m as u32, k as u32) as usize;
-            let quant_consts = vec![
-                ConstantValue::int(0, k as i32),
-                ConstantValue::int(2, m as i32),
-                ConstantValue::int(4, experts as i32),
-            ];
-            let size = |width: usize, height: usize| MTLSize {
-                width,
-                height,
-                depth: 1,
-            };
-            let read = |b: &Buffer, len: usize| unsafe {
-                std::slice::from_raw_parts(b.contents().as_ptr() as *const u8, len).to_vec()
-            };
+        for dtype in [Dtype::Bf16, Dtype::F16] {
+            // Every act the fused pre-pass serves, plus gpt-oss's bias case.
+            for (act, bias) in [
+                (W4a8Act::Silu, false),
+                (W4a8Act::Gelu, false),
+                (W4a8Act::SwigluOai, false),
+                (W4a8Act::SwigluOai, true),
+                (W4a8Act::Relu2, false),
+            ] {
+                let (k, experts, run) = (512, 5, 64);
+                let m = experts * run;
+                let counts = [5, 16, 17, 40, 0];
+                let mut rng = Rng(0xa17 ^ dtype as u64 ^ (act as u64) << 8 ^ (bias as u64) << 16);
+                let gate: Vec<u16> = (0..m * k)
+                    .map(|_| dtype.bits(4.0 * rng.unit() - 2.0))
+                    .collect();
+                let up: Vec<u16> = (0..m * k)
+                    .map(|_| dtype.bits(4.0 * rng.unit() - 2.0))
+                    .collect();
+                // [E, 2·k]: the expert's gate rows then its up rows.
+                let linear_bias: Vec<u16> = (0..experts * 2 * k)
+                    .map(|_| dtype.bits(rng.unit() - 0.5))
+                    .collect();
+                let indices: Vec<u32> = (0..m)
+                    .map(|r| match r % run < counts[r / run] {
+                        true => (r / run) as u32,
+                        false => experts as u32,
+                    })
+                    .collect();
+                let (g_buf, u_buf, i_buf, b_buf) = (
+                    shared(device, &gate),
+                    shared(device, &up),
+                    shared(device, &indices),
+                    shared(device, &linear_bias),
+                );
+                let scratch_bytes = w4a8_scratch_bytes(m as u32, k as u32) as usize;
+                let quant_consts = vec![
+                    ConstantValue::int(0, k as i32),
+                    ConstantValue::int(2, m as i32),
+                    ConstantValue::int(4, experts as i32),
+                ];
+                let size = |width: usize, height: usize| MTLSize {
+                    width,
+                    height,
+                    depth: 1,
+                };
+                let read = |b: &Buffer, len: usize| unsafe {
+                    std::slice::from_raw_parts(b.contents().as_ptr() as *const u8, len).to_vec()
+                };
+                // The separated pair's elementwise half: the `silu_mul`-family kernel over the
+                // gate/up rows (`relu2` over the up rows alone, no sentinel skip), gpt-oss's
+                // adding the pair's LINEAR biases first.
+                let gated = !matches!(act, W4a8Act::Relu2);
+                let (lib, symbol) = match (act, dtype) {
+                    (W4a8Act::Silu, Dtype::F16) => ("silu_mul", "silu_mul_f16"),
+                    (W4a8Act::Silu, Dtype::Bf16) => ("silu_mul", "silu_mul_bf16"),
+                    (W4a8Act::Gelu, Dtype::F16) => ("silu_mul", "gelu_mul_f16"),
+                    (W4a8Act::Gelu, Dtype::Bf16) => ("silu_mul", "gelu_mul_bf16"),
+                    (W4a8Act::SwigluOai, Dtype::F16) => ("silu_mul", "swiglu_oai_mul_f16"),
+                    (W4a8Act::SwigluOai, Dtype::Bf16) => ("silu_mul", "swiglu_oai_mul_bf16"),
+                    (W4a8Act::Relu2, Dtype::F16) => ("activation", "relu2_f16"),
+                    (W4a8Act::Relu2, Dtype::Bf16) => ("activation", "relu2_bf16"),
+                };
+                let y_buf = shared(device, if gated { &gate } else { &up });
+                let mut elem_bindings: Vec<(&Buffer, usize)> = vec![(&y_buf, 0)];
+                let mut elem_consts = vec![ConstantValue::uint(0, (m * k) as u32)];
+                if gated {
+                    elem_bindings.extend([(&g_buf, 1usize), (&u_buf, 2), (&i_buf, 3)]);
+                    elem_consts.extend([
+                        ConstantValue::uint(1, k as u32),
+                        ConstantValue::uint(2, experts as u32),
+                    ]);
+                    if bias {
+                        elem_bindings.push((&b_buf, 4));
+                        elem_consts.push(ConstantValue::boolean(3, true));
+                    }
+                } else {
+                    elem_bindings.push((&u_buf, 1));
+                }
+                let elem = baked_build(cache, &PipelineKey::new(lib, symbol, elem_consts))
+                    .expect("elementwise act pipeline");
 
-            // The pair: `silu_mul` in place over a copy of the gate rows, then the plain
-            // gather pre-pass over its output.
-            let mut batch = Mtl4DispatchBatch::begin(device).expect("mtl4");
-            let y_buf = shared(device, &gate);
-            let n = m * k;
-            let silu_symbol = match act {
-                Dtype::F16 => "silu_mul_f16",
-                Dtype::Bf16 => "silu_mul_bf16",
-            };
-            let silu = PipelineKey::new(
-                "silu_mul",
-                silu_symbol,
-                vec![
-                    ConstantValue::uint(0, n as u32),
-                    ConstantValue::uint(1, k as u32),
-                    ConstantValue::uint(2, experts as u32),
-                ],
-            );
-            let silu = baked_build(cache, &silu).expect("silu_mul pipeline");
-            batch.encode(
-                &silu,
-                &[(&y_buf, 0), (&g_buf, 1), (&u_buf, 2), (&i_buf, 3)],
-                &[],
-                &[],
-                &[],
-                size(n.div_ceil(256), 1),
-                size(256, 1),
-            );
-            batch.barrier();
-            let pair = shared(device, &vec![0xffu8; scratch_bytes]);
-            let quant = PipelineKey::new(
-                "quantized_qmm_nax",
-                w4a8_quant_static_name(W4a8Rows::Grouped, act.act()),
-                quant_consts.clone(),
-            );
-            let quant = baked_build(cache, &quant).expect("quant pipeline");
-            batch.encode(
-                &quant,
-                &[(&y_buf, 0), (&pair, 1), (&i_buf, 2)],
-                &[],
-                &[],
-                &[],
-                size((k / 64).div_ceil(16), m),
-                size(128, 1),
-            );
-            batch.commit(true);
-            let want = read(&pair, scratch_bytes);
+                let mut batch = Mtl4DispatchBatch::begin(device).expect("mtl4");
+                let n = m * k;
+                batch.encode(
+                    &elem,
+                    &elem_bindings,
+                    &[],
+                    &[],
+                    &[],
+                    size(n.div_ceil(256), 1),
+                    size(256, 1),
+                );
+                batch.barrier();
+                let pair = shared(device, &vec![0xffu8; scratch_bytes]);
+                let quant = PipelineKey::new(
+                    "quantized_qmm_nax",
+                    w4a8_quant_static_name(W4a8Rows::Grouped, dtype.act()),
+                    quant_consts.clone(),
+                );
+                let quant = baked_build(cache, &quant).expect("quant pipeline");
+                batch.encode(
+                    &quant,
+                    &[(&y_buf, 0), (&pair, 1), (&i_buf, 2)],
+                    &[],
+                    &[],
+                    &[],
+                    size((k / 64).div_ceil(16), m),
+                    size(128, 1),
+                );
+                batch.commit(true);
+                let want = read(&pair, scratch_bytes);
 
-            // The fusion: one kernel, gate and up straight to the int8 scratch.
-            let fused_buf = shared(device, &vec![0xffu8; scratch_bytes]);
-            let fused = PipelineKey::new(
-                "quantized_qmm_nax",
-                w4a8_act_quant_static_name(W4a8Act::Silu, act.act()),
-                quant_consts,
-            );
-            let fused = baked_build(cache, &fused).expect("fused act+quant pipeline");
-            let mut batch = Mtl4DispatchBatch::begin(device).expect("mtl4");
-            batch.encode(
-                &fused,
-                &[(&g_buf, 0), (&u_buf, 1), (&fused_buf, 2), (&i_buf, 3)],
-                &[],
-                &[],
-                &[],
-                size((k / 64).div_ceil(16), m),
-                size(128, 1),
-            );
-            batch.commit(true);
-            let got = read(&fused_buf, scratch_bytes);
+                // The fusion: one kernel, the act's rows straight to the int8 scratch — an
+                // ungated expert's up rows at the gate slot (its up binding never loaded).
+                let fused_buf = shared(device, &vec![0xffu8; scratch_bytes]);
+                let mut fused_bindings: Vec<(&Buffer, usize)> = vec![
+                    (if gated { &g_buf } else { &u_buf }, 0),
+                    (&u_buf, 1),
+                    (&fused_buf, 2),
+                    (&i_buf, 3),
+                ];
+                let mut fused_consts = quant_consts;
+                if bias {
+                    fused_bindings.push((&b_buf, 4));
+                    fused_consts.push(ConstantValue::boolean(7, true));
+                }
+                let fused = PipelineKey::new(
+                    "quantized_qmm_nax",
+                    w4a8_act_quant_static_name(act, dtype.act()),
+                    fused_consts,
+                );
+                let fused = baked_build(cache, &fused).expect("fused act+quant pipeline");
+                let mut batch = Mtl4DispatchBatch::begin(device).expect("mtl4");
+                batch.encode(
+                    &fused,
+                    &fused_bindings,
+                    &[],
+                    &[],
+                    &[],
+                    size((k / 64).div_ceil(16), m),
+                    size(128, 1),
+                );
+                batch.commit(true);
+                let got = read(&fused_buf, scratch_bytes);
 
-            assert_eq!(
-                want, got,
-                "{act:?}: the fused act+quant must match the separated pair byte for byte"
-            );
+                assert_eq!(
+                    want, got,
+                    "{act:?} bias={bias} {dtype:?}: the fused act+quant must match the separated pair byte for byte"
+                );
+            }
         }
     });
 }

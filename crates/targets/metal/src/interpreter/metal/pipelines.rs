@@ -581,6 +581,7 @@ mod tests {
                 | KernelId::AffineW4a8Quant
                 | KernelId::AffineQmmW4a8
                 | KernelId::AffineGatherW4a8Quant
+                | KernelId::AffineGatherW4a8ActQuant
                 | KernelId::AffineGatherQmmW4a8
                 | KernelId::Nvfp4Qmv
                 | KernelId::Nvfp4QmmT
@@ -763,6 +764,7 @@ mod tests {
             | KernelId::AffineW4a8Quant
             | KernelId::AffineQmmW4a8
             | KernelId::AffineGatherW4a8Quant
+            | KernelId::AffineGatherW4a8ActQuant
             | KernelId::AffineGatherQmmW4a8
             | KernelId::Nvfp4Qmv
             | KernelId::Nvfp4QmmT

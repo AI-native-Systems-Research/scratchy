@@ -7366,6 +7366,45 @@ fn lower_moe_step(
         Some(program) if gathered && e <= threads => (Some(program), None),
         routing => (None, routing.map(S::Route)),
     };
+    // The grouped W4A8 bake's fused act+quant command — the ONE construction every act
+    // routes through (a gated expert's `act(gate) * up`, an ungated expert's `act(up)`
+    // with the up rows at `gate`): `act` quantized straight to the int8 scratch the down
+    // projection reads, the bf16 intermediate the elementwise act wrote and the pre-pass
+    // re-read — DRAM traffic at a prefill bucket's padded rows — never exists.
+    let fused_act_quant_command = |tag: W4a8Act,
+                                   gate: R,
+                                   bias_layer: Option<LayerId>|
+     -> Result<LoweredCommand, LoweringError> {
+        let mpad = s.l.mpad_max;
+        let mut bindings = vec![
+            s.at(0, gate),
+            s.at(1, R::ExpertUp),
+            scratch_at(2, s.l.grp_x_pad),
+            scratch_at(3, s.l.grp_indices_pad),
+        ];
+        let mut constants = vec![
+            C::int(0, inter as i32),
+            C::int(2, mpad as i32),
+            C::int(4, e as i32),
+        ];
+        if let Some(l) = bias_layer {
+            bindings.push(source(
+                router()?,
+                WeightTensor::MoeExpertGateUpLinearBias,
+                l,
+                4,
+            ));
+            constants.push(C::boolean(7, true));
+        }
+        Ok(cmd(
+            KernelId::AffineGatherW4a8ActQuant,
+            "quantized_qmm_nax",
+            w4a8_act_quant_static_name(tag, dtype),
+            constants,
+            grid(((inter / 64).div_ceil(16), mpad, 1), (128, 1, 1), None),
+            bindings,
+        ))
+    };
     // The act over the experts' gate/up rows, at `bias_layer` the gpt-oss pair's expert adding its
     // gate and up LINEAR biases first — the [E, 2·inter] concat the loader interleaves, at 4 with
     // the kernel's switch at slot 3; the grouped GEMMs cannot. Every other bundle's `None` leaves
@@ -7373,46 +7412,20 @@ fn lower_moe_step(
     let gated_act_command =
         |act, bias_layer: Option<LayerId>| -> Result<Vec<LoweredCommand>, LoweringError> {
             // A grouped W4A8 bake fuses the act into the quant pre-pass the down projection
-            // would run: `act(gate) * up` goes straight to the int8 scratch, the bf16
-            // intermediate the elementwise act wrote and the pre-pass re-read — DRAM traffic
-            // at a prefill bucket's padded rows — never exists. The down projection then
-            // emits no quant of its own: the same `moe_w4a8` every step of the block runs
-            // decides both, so the pair cannot disagree.
+            // would run. The down projection then emits no quant of its own: the same
+            // `moe_w4a8` every step of the block runs decides both, so the pair cannot
+            // disagree.
             if moe_w4a8(b, at, &s) {
                 let tag = match act {
                     GatedAct::Silu => W4a8Act::Silu,
                     GatedAct::Gelu => W4a8Act::Gelu,
                     GatedAct::SwigluOai => W4a8Act::SwigluOai,
                 };
-                let mpad = s.l.mpad_max;
-                let mut bindings = vec![
-                    s.at(0, R::ExpertGate),
-                    s.at(1, R::ExpertUp),
-                    scratch_at(2, s.l.grp_x_pad),
-                    scratch_at(3, s.l.grp_indices_pad),
-                ];
-                let mut constants = vec![
-                    C::int(0, inter as i32),
-                    C::int(2, mpad as i32),
-                    C::int(4, e as i32),
-                ];
-                if let Some(l) = bias_layer {
-                    bindings.push(source(
-                        router()?,
-                        WeightTensor::MoeExpertGateUpLinearBias,
-                        l,
-                        4,
-                    ));
-                    constants.push(C::boolean(7, true));
-                }
-                return Ok(vec![cmd(
-                    KernelId::AffineGatherW4a8Quant,
-                    "quantized_qmm_nax",
-                    w4a8_act_quant_static_name(tag, dtype),
-                    constants,
-                    grid(((inter / 64).div_ceil(16), mpad, 1), (128, 1, 1), None),
-                    bindings,
-                )]);
+                return Ok(vec![fused_act_quant_command(
+                    tag,
+                    R::ExpertGate,
+                    bias_layer,
+                )?]);
             }
             let (kernel, symbol) = match act {
                 GatedAct::Silu => (KernelId::SiluMul, silu_mul_static_name(dtype)),
@@ -8202,26 +8215,8 @@ fn lower_moe_step(
         // `act(up)` over the up rows, in place; a bake that sorted runs every padded row.
         S::Act(UngatedAct::Relu2) if moe_w4a8(b, at, &s) => {
             // The grouped W4A8 twin of `gated_act_command`'s fusion: `relu(up)²` quantized
-            // straight to the int8 scratch the down projection reads, the gate binding holding
-            // the up's rows.
-            let mpad = s.l.mpad_max;
-            vec![cmd(
-                KernelId::AffineGatherW4a8Quant,
-                "quantized_qmm_nax",
-                w4a8_act_quant_static_name(W4a8Act::Relu2, dtype),
-                vec![
-                    C::int(0, inter as i32),
-                    C::int(2, mpad as i32),
-                    C::int(4, e as i32),
-                ],
-                grid(((inter / 64).div_ceil(16), mpad, 1), (128, 1, 1), None),
-                vec![
-                    s.at(0, R::ExpertUp),
-                    s.at(1, R::ExpertUp),
-                    scratch_at(2, s.l.grp_x_pad),
-                    scratch_at(3, s.l.grp_indices_pad),
-                ],
-            )]
+            // straight to the int8 scratch, the up rows at the fused command's gate slot.
+            vec![fused_act_quant_command(W4a8Act::Relu2, R::ExpertUp, None)?]
         }
         S::Act(UngatedAct::Relu2) => {
             let (rows, m_scaling) = match s.grouping {
@@ -12040,7 +12035,7 @@ mod tests {
     fn a_grouped_w4a8_bake_fuses_the_act_into_the_quant() {
         use crate::tape::ids::{AffineBits, AffineGroupSize};
         use crate::tape::step::{CombineEnds, ExpertMatmul, ExpertWidth, MoeRows, MoeStep};
-        use scratchy_subtile::subtile_ir::ExpertProj;
+        use scratchy_subtile::subtile_ir::{ExpertProj, UngatedAct};
         let (block, p) = (qwen_moe_block(256), tp());
         let at = MoeBake {
             bucket_m: 512,
@@ -12074,7 +12069,7 @@ mod tests {
             [
                 KernelId::AffineGatherQmmW4a8,
                 KernelId::AffineGatherQmmW4a8,
-                KernelId::AffineGatherW4a8Quant,
+                KernelId::AffineGatherW4a8ActQuant,
             ],
             "gate GEMM, up GEMM, the fused act+quant"
         );
@@ -12126,6 +12121,32 @@ mod tests {
             kernels,
             [KernelId::AffineGatherQmmW4a8, KernelId::MoeWeightedSum],
             "the down GEMM reads the act's scratch — no quant of its own"
+        );
+
+        // The ungated twin: Nemotron-H's relu² runs through the same fused command, the
+        // up rows at its gate slot (the up binding itself dead — the kernel never loads
+        // it for relu²).
+        let relu2 = lower(MoeStep::Act(UngatedAct::Relu2));
+        assert_eq!(relu2.len(), 1, "one fused command, no elementwise act");
+        assert_eq!(relu2[0].kernel, KernelId::AffineGatherW4a8ActQuant);
+        assert_eq!(
+            relu2[0].function,
+            w4a8_act_quant_static_name(W4a8Act::Relu2, dequant_dtype_for(&p))
+        );
+        assert_eq!(
+            relu2[0].bindings,
+            vec![
+                s.at(0, MoeRegion::ExpertUp),
+                s.at(1, MoeRegion::ExpertUp),
+                Binding::MoeScratch {
+                    binding_index: 2,
+                    byte_offset: s.l.grp_x_pad,
+                },
+                Binding::MoeScratch {
+                    binding_index: 3,
+                    byte_offset: s.l.grp_indices_pad,
+                },
+            ]
         );
     }
 

@@ -1238,7 +1238,8 @@ template <typename T>
 
 // `act(gate) * up` per the fused pre-pass's ACT tag: 0 SiLU, 1 GELU (tanh),
 // 2 gpt-oss SwiGLU-OAI — `gated_act.h`, the elementwise kernels' own — and
-// 3 an ungated ReLU² (`relu(x)²`, the gate binding holding the up's rows).
+// 3 an ungated ReLU² (`relu(x)²`, the gate binding holding the up's rows;
+// the up binding is dead for it — never loaded).
 template <int ACT>
 METAL_FUNC float w4a8_act_mul(float g, float u) {
     if (ACT == 0) return silu_mul_f(g, u);
@@ -1263,15 +1264,24 @@ METAL_FUNC void w4a8_act_quant_impl(
     const device vec<T, 4>* pg = (const device vec<T, 4>*)(gate + int64_t(m) * K + col);
     const device vec<T, 4>* pu = (const device vec<T, 4>*)(up + int64_t(m) * K + col);
     float4 g0 = float4(pg[0]), g1 = float4(pg[1]);
-    float4 u0 = float4(pu[0]), u1 = float4(pu[1]);
+    // relu(x)² reads one operand — the up rows an ungated expert binds at the gate
+    // slot — so it skips the up load (and its bias add) rather than read the rows
+    // twice; the discarded zeroes const-fold away.
+    float4 u0 = float4(0.0f), u1 = float4(0.0f);
+    if (ACT != 3) {
+        u0 = float4(pu[0]);
+        u1 = float4(pu[1]);
+    }
     if (W4A8GQ_LINEAR_BIAS) {
         // [E, 2·K]: the expert's gate rows then its up rows.
         const device vec<T, 4>* b =
             (const device vec<T, 4>*)(linear_bias + size_t(indices[m]) * 2 * size_t(K) + col);
         g0 += float4(b[0]);
         g1 += float4(b[1]);
-        u0 += float4(b[K / 4]);
-        u1 += float4(b[K / 4 + 1]);
+        if (ACT != 3) {
+            u0 += float4(b[K / 4]);
+            u1 += float4(b[K / 4 + 1]);
+        }
     }
     // The act in float, rounded through T — the elementwise kernel's store.
     const float4 y0 = float4(T(w4a8_act_mul<ACT>(g0.x, u0.x)), T(w4a8_act_mul<ACT>(g0.y, u0.y)),

@@ -239,10 +239,18 @@ pub enum KernelId {
     /// `affine_qmm_w4a8_<dtype>_s_<scale>_gs_<gs>_tn_<tn>_nsg_<nsg>`.
     AffineQmmW4a8,
     /// The MoE grouped W4A8 pre-pass over the padded rows (sentinel rows
-    /// skipped). `affine_gather_w4a8_quant_<dtype>`; or, on a bake that fuses
-    /// the act into it, `affine_gather_w4a8_quant_<act>_<dtype>` — the gate/up
-    /// rows quantized straight from `act(gate) * up`.
+    /// skipped): the token rows quantized to the int8 scratch.
+    /// `affine_gather_w4a8_quant_<dtype>`; bindings `x @ 0, scratch @ 1,
+    /// indices @ 2`.
     AffineGatherW4a8Quant,
+    /// The grouped act fused into [`KernelId::AffineGatherW4a8Quant`]:
+    /// `act(gate) * up` (an ungated expert's `act(up)`, the up rows bound
+    /// at the gate slot) quantized straight to the int8 scratch — the bf16
+    /// intermediate the separated pair wrote and re-read never exists.
+    /// `affine_gather_w4a8_quant_<act>_<dtype>`; bindings `gate @ 0,
+    /// up @ 1, scratch @ 2, indices @ 3`, the gpt-oss gate/up LINEAR biases
+    /// at `4` behind `W4A8GQ_LINEAR_BIAS` (constant slot 7).
+    AffineGatherW4a8ActQuant,
     /// The MoE grouped expert GEMM on the int8 lane: each 32-row tile's
     /// expert slab x its int8 rows.
     /// `affine_gather_qmm_w4a8_<dtype>_s_<scale>_gs_<gs>_tn_<tn>_nsg_<nsg>`.
@@ -560,6 +568,7 @@ impl KernelId {
             | Self::AffineW4a8Quant
             | Self::AffineQmmW4a8
             | Self::AffineGatherW4a8Quant
+            | Self::AffineGatherW4a8ActQuant
             | Self::AffineGatherQmmW4a8
             | Self::Nvfp4Qmv
             | Self::Nvfp4QmmT
