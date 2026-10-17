@@ -5860,9 +5860,9 @@ pub struct GroupInput {
     pub files: Vec<(String, String)>,
     /// Total bytes, so the staging budget's reservation is exact rather than an estimate.
     pub bytes: usize,
-    /// ⭐ CONTENT KEY over exactly what dxp will read, in read order — the bake queue's memo key.
-    /// Two groups with the same key compile to the same bytes, which 42% of them do.
-    pub key: u64,
+    /// ⭐ CONTENT KEY over exactly what dxp will read, in read order — the bake queue's memo key and
+    /// the persistent cache's. Two groups with the same key compile to the same bytes.
+    pub key: crate::dxp_cache::GroupDigest,
 }
 
 /// Render every launch group's dxp input.
@@ -5918,17 +5918,6 @@ pub fn render_dxp_input(ops: &[EmittedOp], fold: FoldGrouping) -> std::io::Resul
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
             );
         }
-        // ⭐ THE KEY HASHES THE COMPILER'S INPUT, in the order `bundle.mlir` lists it — hashing
-        // anything else would let two different inputs collide, and hashing the directory afterwards
-        // would re-read what we just wrote.
-        let key = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            for j in &group_json {
-                j.hash(&mut h);
-            }
-            h.finish()
-        };
         let mut files: Vec<(String, String)> = Vec::with_capacity(group_json.len() + 1);
         let mut names: Vec<String> = Vec::with_capacity(group_json.len());
         for (li, j) in group_json.into_iter().enumerate() {
@@ -5937,6 +5926,11 @@ pub fn render_dxp_input(ops: &[EmittedOp], fold: FoldGrouping) -> std::io::Resul
             names.push(name);
         }
         files.push(("bundle.mlir".to_string(), bundle_mlir(&names)));
+        // ⭐ THE KEY HASHES THE COMPILER'S INPUT — every file of the group, names included, in the
+        // order dxp reads them. Hashing anything else would let two different inputs collide, and
+        // hashing the directory afterwards would re-read what we just wrote. SHA-256, because the
+        // key also names a compiled group on disk across builds ([`crate::dxp_cache`]).
+        let key = crate::dxp_cache::GroupDigest::of(&files);
         out.push(GroupInput {
             group: gi as u32,
             bytes: files.iter().map(|(_, c)| c.len()).sum(),
@@ -7366,12 +7360,11 @@ fn ktir_groups_via_superdsc(
                     shifts.len(),
                 ))
             })?;
-            // ⭐ THE DISK CACHE FIRST — a group a previous build of this same emission already
-            // compiled never reaches the staging root, the budget, or a `dxp_standalone` child:
-            // the bytes are read back under `id` and the queue never sees the group. The key is
-            // the memo's own content hash, so a hit is byte-identical output by the same law that
-            // lets the in-process memo skip a redundant twin.
-            if bake.supply_cached(&id, g.key) {
+            // ⭐ ALREADY IN HAND — compiled earlier in this build, mid-compile for an identical group,
+            // or by a previous build of the same emission ([`crate::dxp_cache`]): the group never
+            // reaches the staging root, the budget, or a `dxp_standalone` child, and its program is
+            // filed under `id` by the same content law that lets the memo skip a twin.
+            if bake.adopt(&id, g.key) {
                 crate::pc::count("cachit", 1);
                 groups.push((kv, id));
                 continue;

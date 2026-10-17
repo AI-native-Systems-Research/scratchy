@@ -29,7 +29,8 @@
 //!     projections at many widths and each bundle also has a fused twin.
 //!
 //! Compiled output is returned IN MEMORY, keyed by [`GroupId`], for the emitter to bake into the
-//! binary; nothing is written anywhere durable.
+//! binary — and kept in the [`DxpCache`] under the target directory, so the NEXT build compiles only
+//! the groups whose input changed.
 //!
 //! It also makes the build FAIL FAST. The dxp wall that cost a full emission to discover
 //! (`L3DlOpsScheduler` refusing gemma-4's 32-core matmuls) is hit on the FIRST group of the first
@@ -53,6 +54,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use scratchy_spyre_bundle::correction;
+
+use crate::dxp_cache::{DxpCache, DxpIdentity, GroupDigest};
 
 /// ⭐ THE BUILD'S FAILURE AND EVERY LIVE COMPILER PROCESS, UNDER ONE LOCK.
 ///
@@ -592,29 +595,33 @@ fn substr(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// The pure form of [`DxpTool::env_knob_guard`]'s check: every knob name must appear as a
-/// literal in the toolchain's own artifacts (the binary or the L3 scheduler lib), because a
-/// name `dtGetEnv` cannot match is a name the toolchain silently ignores.
+/// literal in one of the toolchain's own artifacts (the binary or a library it loads), because a
+/// name `dtGetEnv` cannot match is a name the toolchain silently ignores. `artifacts` are read in
+/// order and only until every knob is found.
 fn knobs_present(
     knobs: &[&str],
-    bin: &[u8],
-    lib: &[u8],
-    bin_path: &std::path::Path,
-    lib_path: &std::path::Path,
+    artifacts: &mut dyn Iterator<Item = (PathBuf, Vec<u8>)>,
 ) -> Result<(), String> {
-    for knob in knobs {
-        if !substr(bin, knob.as_bytes()) && !substr(lib, knob.as_bytes()) {
-            return Err(format!(
-                "dxp knob '{knob}' is present in neither {} nor {} — this toolchain \
-                 build cannot read it, so it would silently run at the knob's default and \
-                 validate a different behavior than the emission requires (the \
-                 EXPLORE/EXPLODE name-drift class; see DxpTool::env_knob_guard's doc). Fix \
-                 the knob name in superdsc_bake.rs to match the toolchain",
-                bin_path.display(),
-                lib_path.display()
-            ));
+    let mut missing: Vec<&str> = knobs.to_vec();
+    let mut searched: Vec<String> = Vec::new();
+    for (path, bytes) in artifacts {
+        if missing.is_empty() {
+            break;
         }
+        missing.retain(|k| !substr(&bytes, k.as_bytes()));
+        searched.push(path.display().to_string());
     }
-    Ok(())
+    match missing.first() {
+        None => Ok(()),
+        Some(knob) => Err(format!(
+            "dxp knob '{knob}' is present in none of [{}] — this toolchain \
+             build cannot read it, so it would silently run at the knob's default and \
+             validate a different behavior than the emission requires (the \
+             EXPLORE/EXPLODE name-drift class; see DxpTool::env_knob_guard's doc). Fix \
+             the knob name in superdsc_bake.rs to match the toolchain",
+            searched.join(", ")
+        )),
+    }
 }
 
 /// ⭐ ONE `dxp_standalone` CHILD, OWNED — in THIS PROCESS'S process group, registered in the [`Reaper`]
@@ -795,11 +802,21 @@ pub const MAX_STAGED_BYTES: usize = 4 * 1024 * 1024 * 1024;
 /// throughput for a smaller multiple of a wrong number. Run the build so the children see the CPUs
 /// they actually have (`taskset -c` matching `cpu.max`) and the product comes down ~10× with the
 /// width, and this constant, untouched. Measured on a 20-CPU-quota pod: width 8 still failed.
+///
+/// This is the CEILING; [`compile_width`] is how many run.
 pub const COMPILE_WIDTH: usize = 32;
 
-/// Kept as the queue's const-generic parameter — the channel depth, which only has to exceed the
-/// compile width so a finished worker never waits for the producer.
-pub const IN_FLIGHT: usize = COMPILE_WIDTH * 2;
+/// ⭐ HOW MANY COMPILERS THIS BUILD RUNS: one per CPU the process may use, up to [`COMPILE_WIDTH`].
+///
+/// With [`DxpTool::FIXED_ENV`] pinning each child to one thread, a dxp group is a CPU-bound process,
+/// and more of them than CPUs buys no throughput — it only TIME-SLICES them, which is fatal to the
+/// one group that matters most: the bake's longest group (the widest rung's per-page fold, minutes
+/// alone) ran at a third of a core among 32 children on a 10-CPU Mac and set the build's end.
+/// `available_parallelism` follows affinity AND the Linux cgroup quota — the CPUs the process really
+/// has, which is exactly the number `hardware_concurrency` gets wrong (see [`COMPILE_WIDTH`]).
+pub fn compile_width() -> usize {
+    std::thread::available_parallelism().map_or(COMPILE_WIDTH, |n| n.get().min(COMPILE_WIDTH))
+}
 
 /// ⭐ A BYTE BUDGET FOR STAGED JSON, with the blocking on `reserve`.
 ///
@@ -874,12 +891,6 @@ impl Latch {
         }
     }
 
-    /// Undo an `enter` whose work never reached a worker, so a failed send cannot strand the latch
-    /// above zero forever.
-    fn cancel(&self) {
-        self.leave();
-    }
-
     fn leave(&self) {
         if let Ok(mut n) = self.outstanding.lock() {
             *n = n.saturating_sub(1);
@@ -906,7 +917,7 @@ impl Latch {
 
 /// The queue as the emitter names it — the const is bound here so the emitter does not become generic
 /// over it.
-pub type Bake = BakeQueue<IN_FLIGHT>;
+pub type Bake = BakeQueue;
 
 /// Where the per-op json is STAGED for dxp.
 ///
@@ -992,7 +1003,7 @@ pub struct SealedGroup {
     /// rung ladder emits the same projections at many query-row counts and each bundle also has a
     /// fused twin, so identical group content recurs constantly — 42% of dxp invocations were
     /// recompiling input they had already seen.
-    key: u64,
+    key: GroupDigest,
 }
 
 impl SealedGroup {
@@ -1000,7 +1011,12 @@ impl SealedGroup {
     /// `staged_bytes` is what it reserved from the [`StageBudget`], and that `key` hashes exactly the
     /// per-op json dxp will read (so equal keys really do mean equal compiler input).
     /// `id` is what the compiled output is reported under.
-    pub fn sealed(stage: PathBuf, id: GroupId, staged_bytes: usize, key: u64) -> SealedGroup {
+    pub fn sealed(
+        stage: PathBuf,
+        id: GroupId,
+        staged_bytes: usize,
+        key: GroupDigest,
+    ) -> SealedGroup {
         SealedGroup {
             stage,
             id,
@@ -1014,152 +1030,6 @@ impl SealedGroup {
     }
 }
 
-/// ⭐ THE MEMO'S DISK TWIN: compiled groups that outlive the process, under the same content key.
-///
-/// The memo's law holds every build — same `key` ⇒ same dxp input ⇒ same [`CompiledGroup`] — but the
-/// table dies with the process, so a rebuild of an unchanged emission paid the whole dxp wall again.
-/// MEASURED on the port ladder, gemma-4-12b, one pod: ~50 dxp CPU-seconds per group, ~26,900
-/// CPU-seconds of compiler in ONE build, against a 20-CPU cgroup quota — ~22 minutes of wall that a
-/// flip changing no emission then paid AGAIN for byte-identical output. This store gives those bytes
-/// a disk lifetime; the warm build reads them instead of compiling them.
-///
-/// ⛔ THE STAMP NAMES THE COMPILER, NOT THE INPUT. The key covers everything dxp reads of OUR making;
-/// it cannot cover the compiler itself changing underneath (a deeptools upgrade compiles the same
-/// json differently). The stamp hashes the dxp binary's bytes plus a stat-walk of the share dir, and
-/// a store built by any other stamp is WIPED, not read — serving one byte of a previous compiler's
-/// output is the one wrong answer here.
-///
-/// Errors are MISSES, never build failures: a store that cannot be read or written costs a compile,
-/// which is exactly what not having it costs.
-#[derive(Debug)]
-struct DiskCache {
-    dir: PathBuf,
-}
-
-/// Entry-file magic — `SDC1`, little-endian — so a truncated or foreign file reads as a miss.
-const DISK_CACHE_MAGIC: u32 = 0x5344_4331;
-
-impl DiskCache {
-    /// Resolve the store: `$SCRATCHY_SUPERDSC_CACHE` if set, else `<OUT_DIR>/../../superdsc-dxp-cache`
-    /// (the target dir's `build/`, so `cargo clean` takes the cache with it and two model scopes
-    /// share one store), else `None` — a context with no `OUT_DIR` (a bare `cargo test` of this
-    /// crate) keeps only the in-process memo.
-    fn open(tool: &DxpTool) -> Option<DiskCache> {
-        let base = match std::env::var_os("SCRATCHY_SUPERDSC_CACHE") {
-            Some(p) => PathBuf::from(p),
-            None => PathBuf::from(std::env::var_os("OUT_DIR")?)
-                .join("../..")
-                .join("superdsc-dxp-cache"),
-        };
-        let dir = base.join(format!("{:016x}", Self::stamp(tool)));
-        // The stamp is the version. Anything else under `base` is a previous compiler's output (or a
-        // stray), and the whole point of stamping is that it is never read back.
-        if let Ok(rd) = std::fs::read_dir(&base) {
-            for e in rd.flatten() {
-                let p = e.path();
-                if p == dir {
-                    continue;
-                }
-                if p.is_dir() {
-                    let _ = std::fs::remove_dir_all(&p);
-                } else {
-                    let _ = std::fs::remove_file(&p);
-                }
-            }
-        }
-        std::fs::create_dir_all(&dir).ok()?;
-        // Crashed `put`s leave `.tmp-` files behind; they are never valid entries.
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                if e.file_name().to_string_lossy().starts_with(".tmp-") {
-                    let _ = std::fs::remove_file(e.path());
-                }
-            }
-        }
-        Some(DiskCache { dir })
-    }
-
-    /// Hash the compiler's identity: the dxp binary BY BYTES (a rebuild changes them), the share
-    /// dir by a sorted stat-walk (a DDL or template change without a binary change still moves the
-    /// compiled output). A content hash of the share tree would be airtight but walks hundreds of MB
-    /// per build; the stat-walk is milliseconds and errs toward a wipe — a false mismatch costs a
-    /// cold rebuild, and reaching a false match takes identical names, sizes and mtimes.
-    fn stamp(tool: &DxpTool) -> u64 {
-        use std::hash::{Hash, Hasher};
-        fn walk<H: Hasher>(h: &mut H, p: &Path) {
-            let Ok(rd) = std::fs::read_dir(p) else { return };
-            let mut es: Vec<_> = rd.flatten().collect();
-            es.sort_by_key(|e| e.file_name());
-            for e in es {
-                e.file_name().hash(h);
-                if let Ok(md) = e.metadata() {
-                    if md.is_dir() {
-                        walk(h, &e.path());
-                    } else {
-                        md.len().hash(h);
-                        if let Ok(t) = md.modified() {
-                            t.hash(h);
-                        }
-                    }
-                }
-            }
-        }
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        if let Ok(b) = std::fs::read(&tool.bin) {
-            b.hash(&mut h);
-        }
-        walk(&mut h, &tool.deeptools);
-        h.finish()
-    }
-
-    fn entry(&self, key: u64) -> PathBuf {
-        self.dir.join(format!("{key:016x}.bin"))
-    }
-
-    /// The compiled group for `key`, or `None` for any reason at all — absent, truncated, foreign,
-    /// unreadable. A miss is a compile, which is the status quo ante.
-    fn get(&self, key: u64) -> Option<CompiledGroup> {
-        let b = std::fs::read(self.entry(key)).ok()?;
-        // [magic u32][job_bin_ptr u64][init_len u32][corr_len u32][init][corr]
-        if b.len() < 20 || u32::from_le_bytes(b[0..4].try_into().ok()?) != DISK_CACHE_MAGIC {
-            return None;
-        }
-        let job_bin_ptr = u64::from_le_bytes(b[4..12].try_into().ok()?);
-        let init_len = u32::from_le_bytes(b[12..16].try_into().ok()?) as usize;
-        let corr_len = u32::from_le_bytes(b[16..20].try_into().ok()?) as usize;
-        if b.len() != 20 + init_len + corr_len {
-            return None;
-        }
-        Some(CompiledGroup {
-            init_binary: b[20..20 + init_len].to_vec(),
-            job_bin_ptr,
-            correction: b[20 + init_len..].to_vec(),
-        })
-    }
-
-    /// Best-effort write, atomic by rename so a concurrent `get` sees the old file or the new one,
-    /// never a half of either. An image past `u32::MAX` is not stored — the length field cannot
-    /// spell it — and the compile it came from is still served this build by the in-process memo.
-    fn put(&self, key: u64, g: &CompiledGroup) {
-        if g.init_binary.len() > u32::MAX as usize || g.correction.len() > u32::MAX as usize {
-            return;
-        }
-        let mut b = Vec::with_capacity(20 + g.init_binary.len() + g.correction.len());
-        b.extend_from_slice(&DISK_CACHE_MAGIC.to_le_bytes());
-        b.extend_from_slice(&g.job_bin_ptr.to_le_bytes());
-        b.extend_from_slice(&(g.init_binary.len() as u32).to_le_bytes());
-        b.extend_from_slice(&(g.correction.len() as u32).to_le_bytes());
-        b.extend_from_slice(&g.init_binary);
-        b.extend_from_slice(&g.correction);
-        let tmp = self
-            .dir
-            .join(format!(".tmp-{key:016x}-{}", std::process::id()));
-        if std::fs::write(&tmp, &b).is_ok() {
-            let _ = std::fs::rename(&tmp, self.entry(key));
-        }
-    }
-}
-
 /// The dxp compiler, RESOLVED. Constructible only when both the binary and the SDK share dir it
 /// needs are present, so "can this build compile a bundle?" is a `Option<DxpTool>` rather than a
 /// pair of strings someone checks at the call site.
@@ -1170,6 +1040,71 @@ pub struct DxpTool {
 }
 
 impl DxpTool {
+    /// ⭐ THE ENVIRONMENT EVERY COMPILE SETS — one list, read by [`Self::compile`] AND by the persistent
+    /// cache's compiler identity ([`DxpIdentity::probe`]), so the key cannot describe a different command
+    /// than the one that ran.
+    ///
+    /// `DUMP_SPYRE_CODE=1` is what makes dxp emit `spyreCodeDir/` — the artifact the runtime reads and
+    /// the marker `build.rs` skips on. Mirrors build.rs's invocation exactly.
+    ///
+    /// `DT_PARALLEL_THREADS=1`:
+    /// ⛔⛔⛔ CAP dxp's OWN THREAD POOL, or `COMPILE_WIDTH` children is a thread bomb.
+    ///
+    /// dxp sizes its pool from `hardware_concurrency` (`dscglobal.h:56`
+    /// `parallelThreads = std::thread::hardware_concurrency()`), which reports the HOST's core
+    /// count and ignores the cgroup quota. MEASURED with `ps -eo nlwp=,pcpu=,rss=` across a real
+    /// bake: each `dxp_standalone` is **193 threads, ~1.9 GB RSS**, on a pod that advertises
+    /// `nproc` 192 while `cpu.max` is `2000000 100000` = **20 CPUs**. At `COMPILE_WIDTH` = 32 that
+    /// is ~6,200 threads, and the bake dies part-way through a group with
+    /// `LLVM ERROR: pthread_create failed: Resource temporarily unavailable`.
+    ///
+    /// `DT_PARALLEL_THREADS` is deeptools' own knob (`util/utils.cpp:18 parseDtParallelThreads`:
+    /// absolute count, `N%` of hardware_concurrency, or negative for all-minus-N, clamped >= 1).
+    /// `dxp_standalone` exposes no equivalent flag (`-d`/`-b`/`--dump-bundle-module`/`--use-dxp`
+    /// only), so the environment is the only seam.
+    ///
+    /// ⭐ AND IT IS FASTER THAN THROTTLING THE WIDTH, which is the fix this replaces. Measured on
+    /// granite-3.1-8b fp16, one build at a time on an otherwise idle pod:
+    ///
+    ///   | COMPILE_WIDTH | DT_PARALLEL_THREADS | result                    |
+    ///   |---------------|---------------------|---------------------------|
+    ///   | 32            | unset               | ✗ pthread_create (121 s)  |
+    ///   | 20            | unset               | ✗ pthread_create ( 88 s)  |
+    ///   | 12            | unset               | ✓ 680 s                   |
+    ///   | 32            | 1                   | ✓ **448 s**               |
+    ///
+    /// ⛔ THE WIDTH IS THE WRONG LEVER, and not merely the slower one: width 32 with no cap
+    /// SUCCEEDS on one pod (471 s) and fails on another, so any width constant is tuned to one
+    /// host's quota. A per-child cap is host-independent.
+    ///
+    /// ⚠️ NOT CLAIMED: that those 192 threads do no work. `pcpu` sampled ~105 % per dxp, but that
+    /// is instantaneous and a bursty pool would look the same. The 448 s vs 680 s above is the
+    /// evidence that 1 is not slower here — not the thread count.
+    ///
+    /// `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1`:
+    /// ⛔⛔⛔ THE TOKEN-PLANE GATHERED-KERNEL SHAPE ONLY SCHEDULES WITH THE CHUNK-PARAMETER
+    /// EXPLORER OFF. `calculateFlopPerByte` (L3DlOpsScheduler.cpp:2417) runs only inside
+    /// that exploration (its callers at :2695/:2792) and demands an LX `memOrg_` entry
+    /// plus a non-null LX allocate node for EVERY HBM-pinned labeledDs — the gather index
+    /// can satisfy neither, because `allocAllMem` stages arithmetic operands only (an
+    /// index is read into the IBR). `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1`
+    /// (`L3DlOpsScheduler::run`, :9007-9012) sets `enableChunkExplore = false` and the
+    /// explorer — and its check — never runs. This is the admission contract behind
+    /// `emit_sdsc`'s gathered-KERNEL guard: the ONE schedulable shape
+    /// (`GatherIndex::of_expert_planes`, the expert gemm's per-pair gather) was
+    /// probe-proven RC=0 with this knob set; tonight's 26b group_13 refusal
+    /// (`Expect LX in labeledDs memOrg_.`, :2498) was the SAME shape compiled with the
+    /// knob SILENTLY UNSET — the round scripts carried the drifted spelling
+    /// `…EXPLODE` (with a D), which this deeptools build ignores; the correctly-spelled
+    /// knob compiles the exact refusing group RC=0 (card-side dxp repro, 2026-10-13).
+    /// Set HERE, on the child, so no ambient script can forget or misspell it;
+    /// `env_knob_guard` refuses the bake if a toolchain build ever stops reading it.
+    const FIXED_ENV: [(&'static str, &'static str); 3] = [
+        ("DUMP_SPYRE_CODE", "1"),
+        ("DT_PARALLEL_THREADS", "1"),
+        ("DISABLE_ABOVE_LX_CHUNK_EXPLORE", "1"),
+    ];
+
     /// `$DXP_STANDALONE`, else the `bin` sibling of `$DEEPTOOLS_PATH`'s `share` dir, else the
     /// on-pod default — the SAME resolution order `scratchy-builder-spyre`'s `build.rs` uses, so
     /// the two cannot disagree about which compiler ran. `None` when either piece is missing, which
@@ -1207,8 +1142,15 @@ impl DxpTool {
     /// The check is cheap and exact: the knob NAMES are string literals in the toolchain's own
     /// artifacts (measured with `strings`: the standalone binary carries `DEEPTOOLS_PATH` /
     /// `DT_PARALLEL_THREADS`; `lib/libL3DlOpsScheduler.so` carries `DT_PARALLEL_THREADS` and
-    /// `DISABLE_ABOVE_LX_CHUNK_EXPLORE`). A name absent from both is a name this toolchain
+    /// `DISABLE_ABOVE_LX_CHUNK_EXPLORE`). A name absent from all of them is a name this toolchain
     /// cannot read.
+    ///
+    /// ⛔ THE ARTIFACTS ARE THE ONES THE LOADER MAPS, not a path guessed from the SDK layout. The
+    /// scheduler lib is `<sdk>/lib/libL3DlOpsScheduler.so` on the pod and
+    /// `build/dcg/dcg_fe/scheduler/libL3DlOpsScheduler.dylib` in a source build, so a fixed path
+    /// refused every bake on the second one. The loader's own trace
+    /// ([`crate::dxp_cache::loaded_images`]) names wherever it really lives; the SDK path is the
+    /// fallback for a host whose loader cannot be traced.
     fn env_knob_guard(&self) -> Result<(), String> {
         /// The knobs whose SILENT NON-READ changes what the bake validates (a knob whose absence
         /// fails loudly — `DEEPTOOLS_PATH` missing → dxp refuses to start; `DUMP_SPYRE_CODE`
@@ -1220,16 +1162,31 @@ impl DxpTool {
         static GUARD: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
         GUARD
             .get_or_init(|| {
-                let lib = self
-                    .deeptools
-                    .parent()
-                    .map(|sdk| sdk.join("lib").join("libL3DlOpsScheduler.so"))
-                    .ok_or_else(|| "resolving the scheduler lib path".to_string())?;
-                let bin_bytes = std::fs::read(&self.bin)
-                    .map_err(|e| format!("reading {}: {e}", self.bin.display()))?;
-                let lib_bytes =
-                    std::fs::read(&lib).map_err(|e| format!("reading {}: {e}", lib.display()))?;
-                knobs_present(KNOBS, &bin_bytes, &lib_bytes, &self.bin, &lib)
+                let mut paths = vec![self.bin.clone()];
+                match crate::dxp_cache::loaded_images(&self.bin, &self.deeptools, &Self::FIXED_ENV)
+                {
+                    Some(images) => paths.extend(images.into_iter().filter(|p| *p != self.bin)),
+                    None => paths.extend(
+                        self.deeptools
+                            .parent()
+                            .map(|sdk| sdk.join("lib").join("libL3DlOpsScheduler.so")),
+                    ),
+                }
+                let mut read_errors: Vec<String> = Vec::new();
+                let mut artifacts = paths.into_iter().filter_map(|p| match std::fs::read(&p) {
+                    Ok(b) => Some((p, b)),
+                    Err(e) => {
+                        read_errors.push(format!("reading {}: {e}", p.display()));
+                        None
+                    }
+                });
+                knobs_present(KNOBS, &mut artifacts).map_err(|e| {
+                    if read_errors.is_empty() {
+                        e
+                    } else {
+                        format!("{e} ({})", read_errors.join("; "))
+                    }
+                })
             })
             .clone()
     }
@@ -1247,8 +1204,6 @@ impl DxpTool {
         // default, changing what the whole bake validates (see `env_knob_guard`'s doc for the
         // round that cost).
         self.env_knob_guard()?;
-        // DUMP_SPYRE_CODE=1 is what makes dxp emit `spyreCodeDir/` — the artifact the runtime reads
-        // and the marker `build.rs` skips on. Mirrors build.rs's invocation exactly.
         let mut cmd = std::process::Command::new(&self.bin);
         cmd.arg("--bundle")
             .arg("-d")
@@ -1256,58 +1211,7 @@ impl DxpTool {
             .arg("-b")
             .arg("sentient")
             .env("DEEPTOOLS_PATH", &self.deeptools)
-            .env("DUMP_SPYRE_CODE", "1")
-            // ⛔⛔⛔ CAP dxp's OWN THREAD POOL, or `COMPILE_WIDTH` children is a thread bomb.
-            //
-            // dxp sizes its pool from `hardware_concurrency` (`dscglobal.h:56`
-            // `parallelThreads = std::thread::hardware_concurrency()`), which reports the HOST's core
-            // count and ignores the cgroup quota. MEASURED with `ps -eo nlwp=,pcpu=,rss=` across a real
-            // bake: each `dxp_standalone` is **193 threads, ~1.9 GB RSS**, on a pod that advertises
-            // `nproc` 192 while `cpu.max` is `2000000 100000` = **20 CPUs**. At `COMPILE_WIDTH` = 32 that
-            // is ~6,200 threads, and the bake dies part-way through a group with
-            // `LLVM ERROR: pthread_create failed: Resource temporarily unavailable`.
-            //
-            // `DT_PARALLEL_THREADS` is deeptools' own knob (`util/utils.cpp:18 parseDtParallelThreads`:
-            // absolute count, `N%` of hardware_concurrency, or negative for all-minus-N, clamped >= 1).
-            // `dxp_standalone` exposes no equivalent flag (`-d`/`-b`/`--dump-bundle-module`/`--use-dxp`
-            // only), so the environment is the only seam.
-            //
-            // ⭐ AND IT IS FASTER THAN THROTTLING THE WIDTH, which is the fix this replaces. Measured on
-            // granite-3.1-8b fp16, one build at a time on an otherwise idle pod:
-            //
-            //   | COMPILE_WIDTH | DT_PARALLEL_THREADS | result                    |
-            //   |---------------|---------------------|---------------------------|
-            //   | 32            | unset               | ✗ pthread_create (121 s)  |
-            //   | 20            | unset               | ✗ pthread_create ( 88 s)  |
-            //   | 12            | unset               | ✓ 680 s                   |
-            //   | 32            | 1                   | ✓ **448 s**               |
-            //
-            // ⛔ THE WIDTH IS THE WRONG LEVER, and not merely the slower one: width 32 with no cap
-            // SUCCEEDS on one pod (471 s) and fails on another, so any width constant is tuned to one
-            // host's quota. A per-child cap is host-independent.
-            //
-            // ⚠️ NOT CLAIMED: that those 192 threads do no work. `pcpu` sampled ~105 % per dxp, but that
-            // is instantaneous and a bursty pool would look the same. The 448 s vs 680 s above is the
-            // evidence that 1 is not slower here — not the thread count.
-            .env("DT_PARALLEL_THREADS", "1")
-            // ⛔⛔⛔ THE TOKEN-PLANE GATHERED-KERNEL SHAPE ONLY SCHEDULES WITH THE CHUNK-PARAMETER
-            // EXPLORER OFF. `calculateFlopPerByte` (L3DlOpsScheduler.cpp:2417) runs only inside
-            // that exploration (its callers at :2695/:2792) and demands an LX `memOrg_` entry
-            // plus a non-null LX allocate node for EVERY HBM-pinned labeledDs — the gather index
-            // can satisfy neither, because `allocAllMem` stages arithmetic operands only (an
-            // index is read into the IBR). `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1`
-            // (`L3DlOpsScheduler::run`, :9007-9012) sets `enableChunkExplore = false` and the
-            // explorer — and its check — never runs. This is the admission contract behind
-            // `emit_sdsc`'s gathered-KERNEL guard: the ONE schedulable shape
-            // (`GatherIndex::of_expert_planes`, the expert gemm's per-pair gather) was
-            // probe-proven RC=0 with this knob set; tonight's 26b group_13 refusal
-            // (`Expect LX in labeledDs memOrg_.`, :2498) was the SAME shape compiled with the
-            // knob SILENTLY UNSET — the round scripts carried the drifted spelling
-            // `…EXPLODE` (with a D), which this deeptools build ignores; the correctly-spelled
-            // knob compiles the exact refusing group RC=0 (card-side dxp repro, 2026-10-13).
-            // Set HERE, on the child, so no ambient script can forget or misspell it;
-            // `env_knob_guard` refuses the bake if a toolchain build ever stops reading it.
-            .env("DISABLE_ABOVE_LX_CHUNK_EXPLORE", "1")
+            .envs(Self::FIXED_ENV)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // What `Command::output()` did implicitly, and spawning by hand does NOT: dxp gets EOF
@@ -1394,227 +1298,261 @@ fn read_compiled(stage: &Path, id: &GroupId) -> Result<CompiledGroup, String> {
     })
 }
 
-/// What a content key is doing right now: being compiled by someone, or already done.
+/// What a content key is doing right now: waiting for or under a compile, or settled.
 ///
-/// Two workers can hold groups with the SAME key at once, which is common — the fused twin of a
-/// bundle is submitted moments after the split one. The second must WAIT rather than compile: doing
-/// the work twice is what this exists to avoid.
+/// ⭐ ONE COMPILE PER KEY, AND NOBODY WAITS FOR IT. Identical groups are common — a bundle's fused
+/// twin is submitted moments after the split one, and twins differing only in where their bundle
+/// started are hundreds. The FIRST group of a key is queued; every later one is a FOLLOWER of that
+/// entry, never staged and never handed to a worker, and the one compile settles all of them. A
+/// worker that blocked on an identical in-flight group used to sit idle for that whole compile —
+/// and under largest-first ordering twins of one size are popped together, so that was the norm.
 enum MemoState {
-    InProgress,
+    /// Queued or compiling; these groups take its result when it lands.
+    Pending(Vec<GroupId>),
     /// The compiled program, shared — a memo hit is an `Arc` clone.
     Done(Arc<CompiledGroup>),
     /// It failed; do not retry it, and do not report a second consequence of the same cause.
     Failed,
 }
 
-/// A BOUNDED builder work queue: `IN_FLIGHT` groups may be outstanding, `IN_FLIGHT` workers drain
-/// them, and the first dxp failure stops the build.
+/// ⭐ THE STAGED GROUPS NO WORKER HAS TAKEN, LARGEST FIRST.
 ///
-/// The bound is the point. An unbounded queue would let the emitter run ahead and materialise the
-/// whole ladder again — which is the problem this exists to solve — so `submit` blocks rather than
-/// buffering.
-pub struct BakeQueue<const N: usize> {
+/// A group's compile time grows with its size, and the bake ends when its LONGEST compile ends — so
+/// that one has to start first. FIFO started groups in emission order, which put the widest decode
+/// rung's per-page fold (2,156 ops, minutes alone) ~200 s into a granite-2b bake, where it was the
+/// bake's tail by itself. Ordered by staged bytes (the size [`StageBudget`] already counts), ties in
+/// submission order. Only the FIRST group of a key is ever queued ([`MemoState::Pending`]).
+///
+/// Unbounded in COUNT on purpose: [`StageBudget`] is the bound (bytes on disk), reserved before a
+/// group is written. A count bound in front of it only blocked the emitter while dxp chewed through
+/// small groups — and the emitter cannot hand the queue its biggest group until it has emitted it.
+#[derive(Default)]
+struct GroupQueue {
+    pending: Mutex<std::collections::BinaryHeap<Queued>>,
+    ready: Condvar,
+}
+
+/// One queued group, ordered by `(staged bytes, earliest submission)`.
+struct Queued {
+    bytes: usize,
+    seq: std::cmp::Reverse<u64>,
+    group: SealedGroup,
+}
+
+impl PartialEq for Queued {
+    fn eq(&self, o: &Queued) -> bool {
+        (self.bytes, self.seq) == (o.bytes, o.seq)
+    }
+}
+impl Eq for Queued {}
+impl PartialOrd for Queued {
+    fn partial_cmp(&self, o: &Queued) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Queued {
+    fn cmp(&self, o: &Queued) -> std::cmp::Ordering {
+        (self.bytes, self.seq).cmp(&(o.bytes, o.seq))
+    }
+}
+
+impl GroupQueue {
+    fn push(&self, group: SealedGroup, seq: u64) {
+        if let Ok(mut q) = self.pending.lock() {
+            q.push(Queued {
+                bytes: group.staged_bytes,
+                seq: std::cmp::Reverse(seq),
+                group,
+            });
+            self.ready.notify_one();
+        }
+    }
+
+    /// The largest pending group, waiting for one to arrive. `None` only on a poisoned lock.
+    fn pop(&self) -> Option<SealedGroup> {
+        let mut q = self.pending.lock().ok()?;
+        loop {
+            if let Some(p) = q.pop() {
+                return Some(p.group);
+            }
+            q = self.ready.wait(q).ok()?;
+        }
+    }
+}
+
+/// Everything the emitter and the workers share — one `Arc`, so "record a result" and "settle a
+/// key" are one method each rather than a dozen clones threaded into every worker.
+struct Shared {
+    /// The DISK bound. The workers release a group's bytes when its staging dir is deleted — that
+    /// release is what unblocks the emitter's next `reserve`.
+    budget: StageBudget,
+    /// Content key -> what happened to it ([`MemoState`]).
+    memo: Mutex<HashMap<GroupDigest, MemoState>>,
+    /// Groups that took another group's program instead of compiling, for the build log.
+    memo_hits: AtomicUsize,
+    /// The compiled groups earlier builds left behind — `None` when the compiler could not be
+    /// identified ([`DxpIdentity::probe`]) or there is no target directory to keep them in.
+    cache: Option<DxpCache>,
+    /// Groups served from [`Self::cache`] instead of dxp, for the build log.
+    disk_hits: AtomicUsize,
+    /// The groups waiting for a worker.
+    queue: GroupQueue,
+    /// First failure — kept so `submit` can refuse further work and the caller can surface it —
+    /// TOGETHER with every live `dxp_standalone`, because recording that failure is what kills them.
+    /// See [`Reaper`].
+    reaper: Arc<Reaper>,
+    compiled: AtomicUsize,
+    /// Device-image bytes compiled, for the build log.
+    device_bytes: AtomicUsize,
+    /// ⭐ EVERY COMPILED GROUP, BY IDENTITY. The emit's output, in memory, drained by
+    /// [`BakeQueue::finish`].
+    results: Mutex<HashMap<GroupId, Arc<CompiledGroup>>>,
+    /// Groups handed over and not yet accounted for — see [`Latch`].
+    inflight: Latch,
+}
+
+impl Shared {
+    /// File `id`'s program — the return channel, keyed by identity: the group is either here for
+    /// the emitter to bake, or the build fails naming it.
+    fn record(&self, id: GroupId, g: Arc<CompiledGroup>) {
+        self.compiled.fetch_add(1, Ordering::Relaxed);
+        self.device_bytes
+            .fetch_add(g.init_binary.len(), Ordering::Relaxed);
+        if let Ok(mut r) = self.results.lock() {
+            r.insert(id, g);
+        }
+    }
+
+    /// Land the outcome of `key`'s one compile — on the group that compiled AND on every follower
+    /// that attached to it — and account each of them out of the latch.
+    fn settle(&self, key: GroupDigest, id: GroupId, outcome: Result<Arc<CompiledGroup>, String>) {
+        let followers = match self.memo.lock() {
+            Ok(mut m) => {
+                let next = match &outcome {
+                    Ok(g) => MemoState::Done(Arc::clone(g)),
+                    Err(_) => MemoState::Failed,
+                };
+                match m.insert(key, next) {
+                    Some(MemoState::Pending(f)) => f,
+                    _ => Vec::new(),
+                }
+            }
+            Err(_) => Vec::new(),
+        };
+        match outcome {
+            Ok(g) => {
+                for f in followers {
+                    self.memo_hits.fetch_add(1, Ordering::Relaxed);
+                    self.record(f, Arc::clone(&g));
+                    self.inflight.leave();
+                }
+                self.record(id, g);
+            }
+            Err(e) => {
+                // Records the failure AND, if it is the first, SIGKILLs every other live compiler
+                // — one call, because they are one decision under one lock. The followers have no
+                // program; `finish` reports the failure before anything reads their absence.
+                self.reaper.fail(e);
+                for _ in followers {
+                    self.inflight.leave();
+                }
+            }
+        }
+        self.inflight.leave();
+    }
+
+    /// One worker: take the largest pending group, compile it (or read it back from the cache),
+    /// settle its key. Process-lived, like the pool.
+    fn work(&self, tool: &DxpTool) {
+        // The queue lock is held only to take a job, never across the compile.
+        while let Some(job) = self.queue.pop() {
+            let outcome = if self.reaper.has_failed() {
+                // Already failed: drain without working, so the emitter's `submit` error is the one
+                // that surfaces rather than a pile of consequences.
+                let _ = std::fs::remove_dir_all(&job.stage);
+                Err("the bake already failed".to_string())
+            } else {
+                // A previous build's answer for this exact input, when it left one. An entry that does
+                // not read back is compiled over, never trusted.
+                match self.cache.as_ref().and_then(|c| c.get(job.key)) {
+                    Some(g) => {
+                        self.disk_hits.fetch_add(1, Ordering::Relaxed);
+                        let _ = std::fs::remove_dir_all(&job.stage);
+                        Ok(Arc::new(g))
+                    }
+                    None => {
+                        let fresh = tool
+                            .compile(job.path(), &self.reaper)
+                            .and_then(|()| read_compiled(&job.stage, &job.id));
+                        // Fresh output is the one thing worth persisting. Failures are NOT stored — a
+                        // later build deserves its own refusal, not a cached one from a tree or tool it
+                        // may no longer share.
+                        if let (Ok(g), Some(c)) = (&fresh, &self.cache) {
+                            c.put(job.key, g);
+                        }
+                        fresh.map(Arc::new)
+                    }
+                }
+            };
+            // The staging dir is gone by now on success, and on failure it is kept for diagnosis —
+            // either way these bytes are no longer the emitter's problem.
+            self.budget.release(job.staged_bytes);
+            self.settle(job.key, job.id, outcome);
+        }
+    }
+}
+
+/// The builder work queue: groups wait LARGEST FIRST ([`GroupQueue`]), [`compile_width`] workers
+/// drain them, one compile serves every group with the same input ([`MemoState`]), and the first dxp
+/// failure stops the build. The emitter is throttled by the staging budget ([`BakeQueue::reserve`])
+/// alone.
+pub struct BakeQueue {
     stage: StageRoot,
-    /// The DISK bound. Shared with the workers, which release a group's bytes when its staging dir
-    /// is deleted — that release is what unblocks the emitter's next `reserve`.
-    budget: Arc<StageBudget>,
-    /// Content key -> what happened to it. Skips dxp for a group whose exact input was already
-    /// compiled this build (42% of them, measured). Kept alive here even though only the workers'
-    /// cloned `Arc`s read it: this is the handle that outlives the queue itself.
-    #[allow(dead_code)]
-    memo: Arc<(Mutex<std::collections::HashMap<u64, MemoState>>, Condvar)>,
-    /// The memo's disk twin — compiled groups from PREVIOUS builds, keyed by the same content key.
-    /// `None` when no durable location resolved (no `OUT_DIR`, no `$SCRATCHY_SUPERDSC_CACHE`);
-    /// the in-process memo alone then carries the build, exactly as before this existed.
-    disk: Option<Arc<DiskCache>>,
-    /// dxp runs actually skipped, for the build log.
-    memo_hits: Arc<AtomicUsize>,
-    /// `Mutex<Option<..>>` rather than `Option<..>` because ONE queue serves the whole emit from a
-    /// `static` (see [`global`]), so closing it happens through a shared reference.
-    tx: Mutex<Option<std::sync::mpsc::SyncSender<SealedGroup>>>,
+    shared: Arc<Shared>,
+    /// Submission counter — the tie-break that keeps equal-sized groups in emission order.
+    submitted: std::sync::atomic::AtomicU64,
     /// The pool's threads. RETAINED, not read: the pool is process-lived now that [`Self::finish`] is a
     /// barrier rather than a shutdown, and these are what own it. Dropping the handles would only detach
     /// the threads; keeping them is what leaves a real shutdown available if one is ever wanted.
     #[allow(dead_code)]
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
-    /// First failure — kept so `submit` can refuse further work and the caller can surface it — TOGETHER
-    /// with every live `dxp_standalone`, because recording that failure is what kills them. See
-    /// [`Reaper`].
-    reaper: Arc<Reaper>,
-    compiled: Arc<AtomicUsize>,
-    /// Device-image bytes compiled, for the build log.
-    device_bytes: Arc<AtomicUsize>,
-    /// ⭐ EVERY COMPILED GROUP, BY IDENTITY. The emit's output, in memory, drained by [`Self::finish`].
-    results: Arc<Mutex<HashMap<GroupId, Arc<CompiledGroup>>>>,
-    /// Groups handed to the workers and not yet accounted for — see [`Latch`].
-    inflight: Arc<Latch>,
 }
 
-impl<const N: usize> BakeQueue<N> {
-    const _BOUNDED: () = assert!(
-        N > 0,
-        "a bounded queue with no slots cannot make progress — the emitter would block forever"
-    );
-
+impl BakeQueue {
     /// Start the workers. `None` when this build has no dxp (cardless): the caller then writes json
     /// and leaves it for `build.rs`, exactly as before.
     pub fn start() -> Option<Bake> {
-        let () = Self::_BOUNDED;
         let tool = DxpTool::resolve()?;
-        // A SyncSender IS the bound: `send` blocks while `N` items are unclaimed.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<SealedGroup>(N);
-        let rx = Arc::new(Mutex::new(rx));
         let reaper: Arc<Reaper> = Arc::new(Reaper::default());
         // Arm both teardowns before the first child can exist: the emit's own panics unwind only the
         // main thread, and a `^C` unwinds nothing at all, so these hooks are the only things that reap a
         // worker's in-flight child.
         arm_teardown(&reaper);
-        let compiled = Arc::new(AtomicUsize::new(0));
-        let device_bytes = Arc::new(AtomicUsize::new(0));
-        let results: Arc<Mutex<HashMap<GroupId, Arc<CompiledGroup>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let budget = Arc::new(StageBudget::new());
-        let memo: Arc<(Mutex<std::collections::HashMap<u64, MemoState>>, Condvar)> =
-            Arc::new((Mutex::new(std::collections::HashMap::new()), Condvar::new()));
-        let memo_hits = Arc::new(AtomicUsize::new(0));
-        let disk: Option<Arc<DiskCache>> = DiskCache::open(&tool).map(Arc::new);
-        // COMPILE_WIDTH workers, not N: N is only the channel depth. Conflating them is what made
-        // the disk bound and the compile width the same number.
-        let inflight: Arc<Latch> = Arc::new(Latch::default());
-        let mut workers = Vec::with_capacity(COMPILE_WIDTH);
-        for _ in 0..COMPILE_WIDTH {
-            let (rx, reaper, tool) = (Arc::clone(&rx), Arc::clone(&reaper), tool.clone());
-            let (compiled, device_bytes) = (Arc::clone(&compiled), Arc::clone(&device_bytes));
-            let results = Arc::clone(&results);
-            let budget = Arc::clone(&budget);
-            let (memo, memo_hits) = (Arc::clone(&memo), Arc::clone(&memo_hits));
-            let inflight = Arc::clone(&inflight);
-            let disk = disk.clone();
-            workers.push(std::thread::spawn(move || {
-                loop {
-                    // Hold the receiver lock only for the recv, never across the compile — otherwise
-                    // the `N` workers would serialise into one.
-                    let job = match rx.lock() {
-                        Ok(g) => g.recv(),
-                        Err(_) => return,
-                    };
-                    let Ok(job) = job else { return };
-                    // Already failed? Drain without working, so the emitter's `submit` error is the
-                    // one that surfaces rather than a pile of consequences.
-                    if reaper.has_failed() {
-                        // Still release: the emitter may be blocked in `reserve` and has to be able
-                        // to reach its own `submit` error rather than deadlocking behind a drain.
-                        let _ = std::fs::remove_dir_all(&job.stage);
-                        budget.release(job.staged_bytes);
-                        inflight.leave();
-                        continue;
-                    }
-                    // ⭐ HAS THIS EXACT INPUT ALREADY BEEN COMPILED? Claim the key, or wait for
-                    // whoever holds it and copy their result. Waiting rather than racing matters:
-                    // a bundle's fused twin is submitted moments after the split one with identical
-                    // group content, so without the wait both would run dxp on the same bytes.
-                    let mut memoized: Option<Arc<CompiledGroup>> = None;
-                    let mut mine = false;
-                    {
-                        let (lock, cv) = &*memo;
-                        let mut m = match lock.lock() {
-                            Ok(g) => g,
-                            Err(_) => return,
-                        };
-                        loop {
-                            match m.get(&job.key) {
-                                None => {
-                                    m.insert(job.key, MemoState::InProgress);
-                                    mine = true;
-                                    break;
-                                }
-                                Some(MemoState::Done(g)) => {
-                                    memoized = Some(Arc::clone(g));
-                                    break;
-                                }
-                                // Someone else's identical group already failed — its error is the
-                                // one that surfaces; do not compile it again to say the same thing.
-                                Some(MemoState::Failed) => break,
-                                Some(MemoState::InProgress) => {
-                                    m = match cv.wait(m) {
-                                        Ok(g) => g,
-                                        Err(_) => return,
-                                    };
-                                }
-                            }
-                        }
-                    }
-                    let outcome: Result<Arc<CompiledGroup>, String> = match (memoized, mine) {
-                        (Some(done), _) => {
-                            memo_hits.fetch_add(1, Ordering::Relaxed);
-                            // The staged json is this group's only footprint; its compiled twin is
-                            // already in hand.
-                            let _ = std::fs::remove_dir_all(&job.stage);
-                            Ok(done)
-                        }
-                        (None, false) => Err(format!(
-                            "an identical group ({:016x}) already failed to compile",
-                            job.key
-                        )),
-                        (None, true) => tool
-                            .compile(job.path(), &reaper)
-                            .and_then(|()| read_compiled(&job.stage, &job.id))
-                            .map(Arc::new),
-                    };
-                    if mine {
-                        let (lock, cv) = &*memo;
-                        if let Ok(mut m) = lock.lock() {
-                            m.insert(
-                                job.key,
-                                match &outcome {
-                                    Ok(g) => MemoState::Done(Arc::clone(g)),
-                                    Err(_) => MemoState::Failed,
-                                },
-                            );
-                        }
-                        cv.notify_all();
-                        // Fresh output is the one thing worth persisting: a later build whose
-                        // emission did not change reads it instead of running dxp again. Failures
-                        // are NOT stored — a later build deserves its own refusal, not a cached one
-                        // from a tree or tool it may no longer share.
-                        if let (Ok(g), Some(d)) = (&outcome, &disk) {
-                            d.put(job.key, g);
-                        }
-                    }
-                    // The staging dir is gone by now on success, and on failure it is kept for
-                    // diagnosis — either way these bytes are no longer the emitter's problem.
-                    budget.release(job.staged_bytes);
-                    match outcome {
-                        Ok(g) => {
-                            compiled.fetch_add(1, Ordering::Relaxed);
-                            device_bytes.fetch_add(g.init_binary.len(), Ordering::Relaxed);
-                            // ⭐ THE RETURN CHANNEL, keyed by identity: the group is either here for
-                            // the emitter to bake, or the build fails naming it.
-                            if let Ok(mut r) = results.lock() {
-                                r.insert(job.id.clone(), g);
-                            }
-                        }
-                        // Records the failure AND, if it is the first, SIGKILLs every other live
-                        // compiler — one call, because they are one decision under one lock.
-                        Err(e) => reaper.fail(e),
-                    }
-                    inflight.leave();
-                }
-            }));
-        }
+        let shared = Arc::new(Shared {
+            budget: StageBudget::new(),
+            memo: Mutex::new(HashMap::new()),
+            memo_hits: AtomicUsize::new(0),
+            cache: DxpIdentity::probe(&tool.bin, &tool.deeptools, &DxpTool::FIXED_ENV)
+                .and_then(DxpCache::for_build),
+            disk_hits: AtomicUsize::new(0),
+            queue: GroupQueue::default(),
+            reaper,
+            compiled: AtomicUsize::new(0),
+            device_bytes: AtomicUsize::new(0),
+            results: Mutex::new(HashMap::new()),
+            inflight: Latch::default(),
+        });
+        let workers = (0..compile_width())
+            .map(|_| {
+                let (shared, tool) = (Arc::clone(&shared), tool.clone());
+                std::thread::spawn(move || shared.work(&tool))
+            })
+            .collect();
         Some(BakeQueue {
             stage: StageRoot::resolve(),
-            budget,
-            memo,
-            disk,
-            memo_hits,
-            tx: Mutex::new(Some(tx)),
+            shared,
+            submitted: std::sync::atomic::AtomicU64::new(0),
             workers: Mutex::new(workers),
-            reaper,
-            compiled,
-            device_bytes,
-            results,
-            inflight,
         })
     }
 
@@ -1627,47 +1565,120 @@ impl<const N: usize> BakeQueue<N> {
     /// json; the worker releases the same count once that group's staging dir is gone. This is the
     /// disk bound — without it the emitter runs ahead of dxp and stages the whole ladder.
     pub fn reserve(&self, bytes: usize) {
-        self.budget.reserve(bytes);
+        self.shared.budget.reserve(bytes);
     }
 
     /// High-water staging use, for the build log.
     pub fn peak_staged_bytes(&self) -> usize {
-        self.budget.peak_bytes()
+        self.shared.budget.peak_bytes()
     }
 
-    /// Hand one finished group to the compilers. BLOCKS while `N` are outstanding — that block is
-    /// the disk bound. `Err` as soon as any group has failed, so the emitter stops instead of
-    /// writing the rest of a ladder that cannot compile.
+    /// Hand one staged group to the compilers. Never blocks: the disk bound was taken in
+    /// [`Self::reserve`] before the group was written. `Err` as soon as any group has failed, so the
+    /// emitter stops instead of writing the rest of a ladder that cannot compile.
     pub fn submit(&self, group: SealedGroup) -> Result<(), String> {
-        if let Some(e) = self.reaper.first_error() {
+        let s = &self.shared;
+        if let Some(e) = s.reaper.first_error() {
             return Err(e);
         }
-        // Clone the sender out from under the lock: `send` BLOCKS when the queue is full, and
-        // holding the lock across it would serialise every producer behind one blocked send.
-        let tx = match self.tx.lock() {
-            Ok(g) => g.clone(),
-            Err(_) => None,
-        };
-        match tx {
-            // A closed channel means every worker is gone; the stored error explains why.
-            None => Err("bake queue already finished".to_string()),
-            Some(tx) => {
-                // Entered BEFORE the send: a job must be outstanding before any worker can account for
-                // it, or `finish` could return through a gap and read an incomplete `results`.
-                self.inflight.enter();
-                tx.send(group).map_err(|_| {
-                    self.inflight.cancel();
-                    self.reaper
-                        .first_error()
-                        .unwrap_or_else(|| "bake workers exited".to_string())
-                })
+        // Entered BEFORE the group is visible to a worker: a job must be outstanding before anyone
+        // can account for it, or `finish` could return through a gap and read an incomplete `results`.
+        s.inflight.enter();
+        {
+            let Ok(mut m) = s.memo.lock() else {
+                return Err("the bake memo is poisoned".to_string());
+            };
+            match m.get_mut(&group.key) {
+                None => {
+                    m.insert(group.key, MemoState::Pending(Vec::new()));
+                }
+                // [`Self::adopt`] takes every key it can before anything is staged, so a staged
+                // group whose key is already known only arrives through a caller that skipped it.
+                // Still exact: attach or take, and drop the staging that was not needed.
+                Some(MemoState::Pending(f)) => {
+                    f.push(group.id.clone());
+                    drop(m);
+                    let _ = std::fs::remove_dir_all(&group.stage);
+                    s.budget.release(group.staged_bytes);
+                    return Ok(());
+                }
+                Some(MemoState::Done(g)) => {
+                    let g = Arc::clone(g);
+                    drop(m);
+                    let _ = std::fs::remove_dir_all(&group.stage);
+                    s.budget.release(group.staged_bytes);
+                    s.memo_hits.fetch_add(1, Ordering::Relaxed);
+                    s.record(group.id, g);
+                    s.inflight.leave();
+                    return Ok(());
+                }
+                Some(MemoState::Failed) => {
+                    drop(m);
+                    s.inflight.leave();
+                    return Err(s.reaper.first_error().unwrap_or_else(|| {
+                        format!(
+                            "an identical group ({}) already failed to compile",
+                            group.key
+                        )
+                    }));
+                }
             }
         }
+        let seq = self.submitted.fetch_add(1, Ordering::Relaxed);
+        s.queue.push(group, seq);
+        Ok(())
+    }
+
+    /// ⭐ SETTLE A GROUP WITHOUT STAGING IT, when its program is already in hand or already coming —
+    /// compiled earlier in this build ([`MemoState::Done`]), queued or compiling right now
+    /// ([`MemoState::Pending`], which this group then follows), or left by an earlier build
+    /// ([`DxpCache`]). `true` means the caller writes nothing; `false` means stage and
+    /// [`Self::submit`].
+    ///
+    /// Asked BEFORE the json is written: a rebuild whose groups all hit writes no staging at all —
+    /// the ~400 MB a granite-2b bake stages is otherwise paid again on every build.
+    pub fn adopt(&self, id: &GroupId, key: GroupDigest) -> bool {
+        let s = &self.shared;
+        {
+            let Ok(mut m) = s.memo.lock() else {
+                return false;
+            };
+            match m.get_mut(&key) {
+                Some(MemoState::Done(g)) => {
+                    let g = Arc::clone(g);
+                    drop(m);
+                    s.memo_hits.fetch_add(1, Ordering::Relaxed);
+                    s.record(id.clone(), g);
+                    return true;
+                }
+                Some(MemoState::Pending(f)) => {
+                    // Accounted like a submitted group: the compile that settles the key leaves the
+                    // latch for it.
+                    s.inflight.enter();
+                    f.push(id.clone());
+                    return true;
+                }
+                // Stage it and let `submit` report the failure.
+                Some(MemoState::Failed) => return false,
+                None => {}
+            }
+        }
+        let Some(g) = s.cache.as_ref().and_then(|c| c.get(key)).map(Arc::new) else {
+            return false;
+        };
+        // Published to the memo too, so this build's later twins of it hit in memory.
+        if let Ok(mut m) = s.memo.lock() {
+            m.entry(key)
+                .or_insert_with(|| MemoState::Done(Arc::clone(&g)));
+        }
+        s.disk_hits.fetch_add(1, Ordering::Relaxed);
+        s.record(id.clone(), g);
+        true
     }
 
     /// ⛔⛔⛔ A BARRIER, NOT A SHUTDOWN — AND THAT DISTINCTION WAS A BUILD FAILURE.
     ///
-    /// Waits until nothing is outstanding ([`Latch`]), then reports the first failure. The channel stays
+    /// Waits until nothing is outstanding ([`Latch`]), then reports the first failure. The queue stays
     /// open and the workers stay alive.
     ///
     /// 🛑 IT USED TO DROP THE SENDER AND JOIN THE WORKERS, on the reasoning that it is "called ONCE per
@@ -1683,20 +1694,22 @@ impl<const N: usize> BakeQueue<N> {
     /// The latch gives the same guarantee the join gave — every submitted group is in `results` before
     /// this returns — without ending the pool, so the next expansion keeps these workers, this memo table
     /// (which is what lets a projection shared between two models compile once) and this staging budget.
-    /// Still one barrier per expansion, so dxp runs `COMPILE_WIDTH` wide across bundle boundaries.
+    /// Still one barrier per expansion, so dxp runs [`compile_width`] wide across bundle boundaries.
     ///
     /// ⭐ THE COUNTS ARE CUMULATIVE across expansions, deliberately: they describe what the BUILD
     /// compiled, which is what the log line is for.
     pub fn finish(&self) -> Result<BakeStats, String> {
-        self.inflight.wait_empty(&|| self.reaper.has_failed());
-        if let Some(e) = self.reaper.first_error() {
+        let s = &self.shared;
+        s.inflight.wait_empty(&|| s.reaper.has_failed());
+        if let Some(e) = s.reaper.first_error() {
             return Err(e);
         }
         Ok(BakeStats {
-            groups: self.compiled.load(Ordering::Relaxed),
-            device_bytes: self.device_bytes.load(Ordering::Relaxed),
-            peak_staged_bytes: self.budget.peak_bytes(),
-            memo_hits: self.memo_hits.load(Ordering::Relaxed),
+            groups: s.compiled.load(Ordering::Relaxed),
+            device_bytes: s.device_bytes.load(Ordering::Relaxed),
+            peak_staged_bytes: s.budget.peak_bytes(),
+            memo_hits: s.memo_hits.load(Ordering::Relaxed),
+            disk_hits: s.disk_hits.load(Ordering::Relaxed),
         })
     }
 
@@ -1706,32 +1719,12 @@ impl<const N: usize> BakeQueue<N> {
     /// was never submitted, so the caller refuses naming the id rather than baking a bundle with a hole
     /// in its launch sequence.
     pub fn compiled_group(&self, id: &GroupId) -> Option<Arc<CompiledGroup>> {
-        self.results.lock().ok()?.get(id).cloned()
+        self.shared.results.lock().ok()?.get(id).cloned()
     }
 
     /// Has anything been submitted? Lets the caller skip a "0 groups" log line.
     pub fn any(&self) -> bool {
-        self.compiled.load(Ordering::Relaxed) > 0
-    }
-
-    /// ⭐ A GROUP A PREVIOUS BUILD ALREADY COMPILED, supplied without staging or submitting it.
-    ///
-    /// The emitter calls this BEFORE writing a group's json: a hit means the bytes dxp would produce
-    /// are already in hand, so there is nothing to reserve, write, or spawn — the result is filed
-    /// under `id` exactly as a worker would have filed it, and [`Self::finish`] hands it back with
-    /// the rest. `false` is the caller's cue to stage and submit as before.
-    ///
-    /// Counts as a memo hit: it IS a dxp run skipped because an identical group was already
-    /// compiled — in an earlier build of the same emission. A supplied group never enters
-    /// [`Latch`], correctly: it is complete the moment it is filed, so there is nothing to wait for.
-    pub fn supply_cached(&self, id: &GroupId, key: u64) -> bool {
-        let Some(d) = &self.disk else { return false };
-        let Some(g) = d.get(key) else { return false };
-        if let Ok(mut r) = self.results.lock() {
-            r.insert(id.clone(), Arc::new(g));
-        }
-        self.memo_hits.fetch_add(1, Ordering::Relaxed);
-        true
+        self.shared.compiled.load(Ordering::Relaxed) > 0
     }
 }
 
@@ -1809,6 +1802,8 @@ pub struct BakeStats {
     pub peak_staged_bytes: usize,
     /// dxp invocations SKIPPED because an identical group had already been compiled.
     pub memo_hits: usize,
+    /// dxp invocations SKIPPED because an earlier build left this exact program in the [`DxpCache`].
+    pub disk_hits: usize,
 }
 
 /// ⛔ THE ZOMBIE REGRESSION TESTS — a leak that is COUNTED, so the test counts it.
@@ -1842,6 +1837,32 @@ mod tests {
         unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) >= 0 }
     }
 
+    /// A staged group of `bytes` whose identity is its submission number.
+    fn staged(n: u32, bytes: usize) -> SealedGroup {
+        SealedGroup::sealed(
+            PathBuf::from(format!("group_{n}")),
+            GroupId {
+                fp: "f".to_string(),
+                group: n,
+            },
+            bytes,
+            GroupDigest::of(&[(format!("g{n}"), String::new())]),
+        )
+    }
+
+    /// ⭐ THE LONGEST COMPILE STARTS FIRST: the queue hands out the largest staged group, and equal
+    /// sizes in submission order. Mutation: a FIFO pops 0, 1, 2, 3; ties broken latest-first pop 2
+    /// before 1.
+    #[test]
+    fn the_queue_hands_out_the_largest_group_first_ties_in_submission_order() {
+        let q = GroupQueue::default();
+        for (n, bytes) in [(0, 5), (1, 50), (2, 50), (3, 10)] {
+            q.push(staged(n, bytes), u64::from(n));
+        }
+        let order: Vec<u32> = (0..4).map(|_| q.pop().expect("queued").id.group).collect();
+        assert_eq!(order, [1, 2, 3, 0]);
+    }
+
     /// A child that outlives the test if the reap is missing, so a leak is visible rather than racing
     /// with normal exit.
     fn sleeper() -> std::process::Command {
@@ -1869,17 +1890,22 @@ mod tests {
         // exactly like the pod's build.
         let bin: &[u8] = b"xxDT_PARALLEL_THREADSxx";
         let lib: &[u8] = b"xxDT_PARALLEL_THREADSxxxxDISABLE_ABOVE_LX_CHUNK_EXPLORExx";
-        let p = std::path::Path::new("/fake/dxp_standalone");
-        let l = std::path::Path::new("/fake/libL3DlOpsScheduler.so");
+        let arts = |bin: &[u8], lib: &[u8]| {
+            vec![
+                (PathBuf::from("/fake/dxp_standalone"), bin.to_vec()),
+                (PathBuf::from("/fake/libL3DlOpsScheduler.so"), lib.to_vec()),
+            ]
+            .into_iter()
+        };
         // Sanity: the real names are present, so the guard passes.
         assert!(
-            knobs_present(&knobs, bin, lib, p, l).is_ok(),
+            knobs_present(&knobs, &mut arts(bin, lib)).is_ok(),
             "the guard must pass a toolchain that reads every knob it sets"
         );
         // The drifted-name toolchain: carries EXPLODE (what the round scripts exported) but NOT
         // EXPLORE (what the emission needs read). The guard must refuse, naming the unread knob.
         let drifted: &[u8] = b"xxDISABLE_ABOVE_LX_CHUNK_EXPLODExx";
-        let err = knobs_present(&knobs, bin, drifted, p, l)
+        let err = knobs_present(&knobs, &mut arts(bin, drifted))
             .expect_err("a knob absent from both artifacts must refuse the bake");
         assert!(
             err.contains("DISABLE_ABOVE_LX_CHUNK_EXPLORE"),

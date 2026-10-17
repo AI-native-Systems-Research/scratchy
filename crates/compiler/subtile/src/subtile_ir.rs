@@ -242,7 +242,15 @@ pub mod sealed {
 /// };
 /// ```
 pub trait RopeForm:
-    rope_form_seal::Sealed + Copy + std::fmt::Debug + PartialEq + Eq + std::hash::Hash + 'static
+    rope_form_seal::Sealed
+    + Copy
+    + std::fmt::Debug
+    + PartialEq
+    + Eq
+    + std::hash::Hash
+    + Send
+    + Sync
+    + 'static
 {
     /// Erased tag for runtime introspection (printing, unit tests).
     const TAG: RopeFormTag;

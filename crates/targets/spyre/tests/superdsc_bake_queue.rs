@@ -4,7 +4,7 @@
 //! alone — an inline test would silently never run.
 
 use scratchy_target_spyre::superdsc_bake::{
-    Bake, COMPILE_WIDTH, DxpTool, IN_FLIGHT, MAX_STAGED_BYTES, StageRoot,
+    Bake, COMPILE_WIDTH, DxpTool, MAX_STAGED_BYTES, StageRoot, compile_width,
 };
 
 /// ⭐ THE DISK BOUND AND THE COMPILE WIDTH ARE SEPARATE NUMBERS.
@@ -34,10 +34,26 @@ fn the_disk_bound_is_not_the_compile_width() {
             COMPILE_WIDTH <= 128,
             "one dxp process per group; do not fork hundreds"
         );
-        // The channel only has to outrun the workers so a finished one never waits on the producer.
-        assert!(
-            IN_FLIGHT >= COMPILE_WIDTH,
-            "channel shallower than the worker pool starves it"
+    }
+}
+
+/// ⭐ ONE COMPILER PER CPU THE PROCESS MAY USE, UNDER THE CEILING.
+///
+/// Each dxp child runs one thread (`DT_PARALLEL_THREADS=1`), so more children than CPUs buys no
+/// throughput and only time-slices the bake's longest group. (The queue no longer has a channel whose
+/// depth could starve the workers: `submit` never blocks, and the byte budget is the only bound.)
+#[test]
+fn the_compile_width_is_the_cpus_under_the_ceiling() {
+    let w = compile_width();
+    assert!(
+        (1..=COMPILE_WIDTH).contains(&w),
+        "width {w} outside 1..={COMPILE_WIDTH}"
+    );
+    if let Ok(n) = std::thread::available_parallelism() {
+        assert_eq!(
+            w,
+            n.get().min(COMPILE_WIDTH),
+            "one compiler per available CPU"
         );
     }
 }

@@ -1409,37 +1409,69 @@ pub fn graph_wiring<F: RopeForm>(
         )),
         ..Default::default()
     };
+    // ⭐ EVERY NODE IS LOWERED ON ITS OWN, so they are lowered IN PARALLEL and folded IN ORDER. Each
+    // node's arm is a pure function of the node and the graph (the kernel memos it reaches are
+    // process-wide, so a kernel two layers share still compiles once), and this walk is over the
+    // UNROLLED graph: on granite-2b it was two thirds of the models build script, serially, for one
+    // fact per program — its bindings — and one per mask. The fold below sees the results in node
+    // order, so the first error and the mask check read exactly as the serial walk did.
+    // One program's binding order, and the `(mask tid, capacity)` it reads, when it reads one.
+    type WiredProgram = (NodeArgs, Option<(u32, u32)>);
+    let per_node: Vec<Result<Vec<WiredProgram>, SuperDscError>> = {
+        use rayon::prelude::*;
+        ir.nodes
+            .par_iter()
+            .map(|node| {
+                let ops = match lower_one_node(node, ir, ActiveCap::FULL, false) {
+                    NodeLowering::Ops(v) => v,
+                    // A host-routed op runs off the device, so it has no program and binds nothing. It
+                    // still occupies a position in the node order, so it contributes an empty entry.
+                    NodeLowering::HostRouted(_) => Vec::new(),
+                    NodeLowering::Unhandled(why) => return Err(SuperDscError(why)),
+                };
+                let mut out = Vec::with_capacity(ops.len());
+                for e in ops {
+                    let Some(k) = e.ktir else { continue };
+                    let mask = match k.mask {
+                        // ⭐ THE CAPACITY COMES OFF THE PROGRAM, not off the node. The mask parameter's
+                        // own `ktdp.construct_memory_view` states `[1, capacity]`, so the number this pass
+                        // needs to size the host buffer is read where every other extent is read. It
+                        // used to ride on `KtirNode::mask` as the second half of a pair the LOWERING
+                        // never looked at.
+                        Some(mid) => {
+                            let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(&k)
+                                .map_err(|e| SuperDscError(e.message))?;
+                            let cap = regs
+                                .iter()
+                                .find(|r| r.tid == mid.get())
+                                .map(|r| r.v_cols)
+                                .ok_or_else(|| {
+                                    SuperDscError(format!(
+                                        "the mask buffer t{mid} is not among this program's \
+                                         parameters, so its `[1, capacity]` view states no capacity \
+                                         to size the host buffer with"
+                                    ))
+                                })?;
+                            Some((mid.get(), cap))
+                        }
+                        None => None,
+                    };
+                    out.push((
+                        NodeArgs {
+                            args: k.bindings.iter().map(|b| b.get() as usize).collect(),
+                        },
+                        mask,
+                    ));
+                }
+                Ok(out)
+            })
+            .collect()
+    };
     let mut nodes = Vec::with_capacity(ir.nodes.len());
     let mut mask: Option<(u32, u32)> = None;
-    for node in &ir.nodes {
-        let lowered = lower_one_node(node, ir, ActiveCap::FULL, false);
-        let ops = match lowered {
-            NodeLowering::Ops(v) => v,
-            // A host-routed op runs off the device, so it has no program and binds nothing. It
-            // still occupies a position in the node order, so it contributes an empty entry.
-            NodeLowering::HostRouted(_) => Vec::new(),
-            NodeLowering::Unhandled(why) => return Err(SuperDscError(why)),
-        };
-        for e in ops {
-            let Some(k) = e.ktir else { continue };
-            if let Some(mid) = k.mask {
-                // ⭐ THE CAPACITY COMES OFF THE PROGRAM, not off the node. The mask parameter's own
-                // `ktdp.construct_memory_view` states `[1, capacity]`, so the number this pass needs to
-                // size the host buffer is read where every other extent is read. It used to ride on
-                // `KtirNode::mask` as the second half of a pair the LOWERING never looked at.
-                let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(&k)
-                    .map_err(|e| SuperDscError(e.message))?;
-                let cap = regs
-                    .iter()
-                    .find(|r| r.tid == mid.get())
-                    .map(|r| r.v_cols)
-                    .ok_or_else(|| {
-                        SuperDscError(format!(
-                            "the mask buffer t{mid} is not among this program's parameters, so its \
-                             `[1, capacity]` view states no capacity to size the host buffer with"
-                        ))
-                    })?;
-                let m = (mid.get(), cap);
+    for lowered in per_node {
+        for (args, m) in lowered? {
+            if let Some(m) = m {
                 if mask.is_some_and(|prev| prev != m) {
                     return Err(SuperDscError(format!(
                         "the attention mask must be uniform across layers (one shared prefix \
@@ -1449,9 +1481,7 @@ pub fn graph_wiring<F: RopeForm>(
                 }
                 mask = Some(m);
             }
-            nodes.push(NodeArgs {
-                args: k.bindings.iter().map(|b| b.get() as usize).collect(),
-            });
+            nodes.push(args);
         }
     }
     let mut tensor_shapes: Vec<(u32, u32)> = ir.tensors.iter().map(|t| (t.rows, t.cols)).collect();

@@ -3928,6 +3928,7 @@ dependencies = [
  "ktir-emulator",
  "ktir-superdsc",
  "libc",
+ "rayon",
  "scratchy-layers",
  "scratchy-quantizations",
  "scratchy-spyre-bundle",
@@ -3936,6 +3937,7 @@ dependencies = [
  "scratchy-triton-splice",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tracing",
  "tracing-subscriber",
 ]

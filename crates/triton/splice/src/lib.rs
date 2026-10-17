@@ -1700,35 +1700,89 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     } else {
         vec![1]
     };
-    let mut module = compile_kernel(src, &spec, &grid)?;
-    // ⛔ THE DEAD PREFIX'S VIEWS, INJECTED. At `prefix_len == 0` the kernel guards its
-    // kc/vc descriptors away, the ladder DCEs them, and the resident cache parameters would
-    // be "addressed NOWHERE" — but the door requires them: `attn_operands` reads the cache's
-    // identity and capacity off those views, and the card keeps the cache RESIDENT through
-    // them. The builder keeps the view by construction (`KtirFunc::attn`'s zero-length
-    // segment); the splice states the same fact post-compile, as one
-    // `ktdp.construct_memory_view` per cache parameter over the SAME shape the live
-    // segment's view states (the full `[cap, nkvh·hd]` capacity).
-    if prefix_len == 0 {
-        inject_dead_cache_views(&mut module, cap, nkvh * hd)?;
-    }
-    // ⛔ THE MASKLESS SHAPE TRUNCATES THE MASK PARAMETER. The kernel's parameter list is
-    // static Python, so `desc_mask` is declared in every arm; a maskless shape (a
-    // pre-populated cache at decode, a continuation chunk) traces no view over it, and the
-    // handoff refuses an unaddressed parameter rather than inventing a width. The builder's
-    // own maskless arm mints NO mask parameter (`KtirFunc::attn` registers the mask tile
-    // only under `mask_prefix` / the one-pass arm), so the same law holds here: the
-    // parameter must not survive. `desc_mask` is the LAST parameter — the consumer numbers
-    // its buffers by parameter position, so removing the tail renumbers nothing (the
-    // handoff's own law).
-    if !has_mask {
-        truncate_unused_mask_param(&mut module)?;
-    }
-    let k = mint_attn(node, ir, module, attn_program, has_mask)?;
+    let positional = attn_positional(
+        src,
+        &spec,
+        &grid,
+        *attn_program,
+        AttnPostCompile {
+            cap,
+            kv_width: nkvh * hd,
+            dead_prefix: prefix_len == 0,
+            has_mask,
+        },
+    )?;
+    let k = mint_attn(node, ir, positional, has_mask)?;
     let name = format!("attn_s{}", node.id.index());
     let mut e = EmittedOp::bare(name);
     e.ktir = Some(k);
     Ok(e)
+}
+
+/// What [`attn_positional`] does to the compiled module before `node_for` reads it — every input
+/// of those edits, so the memo keys on all of them by name rather than on the claim that the
+/// spec's constexprs already spell them.
+struct AttnPostCompile {
+    cap: u32,
+    kv_width: u32,
+    dead_prefix: bool,
+    has_mask: bool,
+}
+
+/// ⭐ THE ATTENTION PROGRAM, MEMOIZED PAST `node_for` — the per-LAYER cost law.
+///
+/// Every layer of a rung states the SAME spec (the geometry, the widths and the corners are the
+/// rung's, not the layer's), and the wiring walk lowers every layer of the unrolled graph. With
+/// only [`compile_kernel`] memoized, each of the 40 layers still cloned the cached module, edited
+/// it and re-ran `node_for` over it — MEASURED, after the compile memo, `node_for` alone was a
+/// third of the granite-2b models build script on the 256-row prompt chunk. What differs per
+/// layer is exactly what [`mint_attn`] re-states (name, bindings, mask slot), so the positional
+/// node is computed once per (compile key, post-compile edits, program) and cloned.
+fn attn_positional(
+    src: &str,
+    spec: &KernelSpec,
+    grid: &[i64],
+    program: Program,
+    post: AttnPostCompile,
+) -> Result<KtirNode, String> {
+    static NODES: Memo<KtirNode> = Memo::new();
+    let AttnPostCompile {
+        cap,
+        kv_width,
+        dead_prefix,
+        has_mask,
+    } = post;
+    let key = memo_key(src, spec, grid).map(|k| {
+        format!("{k}\0{program:?}\u{1}{cap}\u{1}{kv_width}\u{1}{dead_prefix}\u{1}{has_mask}")
+    });
+    NODES.get_or_compute(key, || {
+        let mut module = compile_kernel(src, spec, grid)?;
+        // ⛔ THE DEAD PREFIX'S VIEWS, INJECTED. At `prefix_len == 0` the kernel guards its
+        // kc/vc descriptors away, the ladder DCEs them, and the resident cache parameters would
+        // be "addressed NOWHERE" — but the door requires them: `attn_operands` reads the cache's
+        // identity and capacity off those views, and the card keeps the cache RESIDENT through
+        // them. The builder keeps the view by construction (`KtirFunc::attn`'s zero-length
+        // segment); the splice states the same fact post-compile, as one
+        // `ktdp.construct_memory_view` per cache parameter over the SAME shape the live
+        // segment's view states (the full `[cap, nkvh·hd]` capacity).
+        if dead_prefix {
+            inject_dead_cache_views(&mut module, cap, kv_width)?;
+        }
+        // ⛔ THE MASKLESS SHAPE TRUNCATES THE MASK PARAMETER. The kernel's parameter list is
+        // static Python, so `desc_mask` is declared in every arm; a maskless shape (a
+        // pre-populated cache at decode, a continuation chunk) traces no view over it, and the
+        // handoff refuses an unaddressed parameter rather than inventing a width. The builder's
+        // own maskless arm mints NO mask parameter (`KtirFunc::attn` registers the mask tile
+        // only under `mask_prefix` / the one-pass arm), so the same law holds here: the
+        // parameter must not survive. `desc_mask` is the LAST parameter — the consumer numbers
+        // its buffers by parameter position, so removing the tail renumbers nothing (the
+        // handoff's own law).
+        if !has_mask {
+            truncate_unused_mask_param(&mut module)?;
+        }
+        triton_ktir_superdsc::node_for(&module, program)
+            .map_err(|e| format!("triton splice: node_for: {e}"))
+    })
 }
 
 /// THE ATTENTION KERNEL'S LAUNCH CONTRACT — the door's own parameter order (q, out, the
@@ -1957,20 +2011,17 @@ fn truncate_unused_mask_param(module: &mut triton_ktir::ir::Module) -> Result<()
     Ok(())
 }
 
-/// THE ATTENTION MINT — the adapter's `node_for` compilation, then the attention's own
-/// re-state: the bindings in the DOOR's parameter order (q, out, then the segment pairs,
-/// with the output SECOND, not last), the mask as a bound synthetic tensor id (the
-/// graph's next free one — the builder's own `graph.tensors.len()` law for the mask id),
+/// THE ATTENTION MINT — the adapter's `node_for` compilation ([`attn_positional`]), then the
+/// attention's own re-state: the bindings in the DOOR's parameter order (q, out, then the
+/// segment pairs, with the output SECOND, not last), the mask as a bound synthetic tensor id
+/// (the graph's next free one — the builder's own `graph.tensors.len()` law for the mask id),
 /// and the builder's `attn_s{id}` name.
 fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
-    module: triton_ktir::ir::Module,
-    program: &Program,
+    positional: KtirNode,
     mask_bound: bool,
 ) -> Result<KtirNode, String> {
-    let positional = triton_ktir_superdsc::node_for(&module, *program)
-        .map_err(|e| format!("triton splice: node_for: {e}"))?;
     // ⛔ THE DOOR'S ORDER, NOT `lower_one`'s: q (inputs[0]), OUT (the node's output), then
     // kc (inputs[1]), kd (inputs[3]), vc (inputs[2]), vd (inputs[4]) — the order
     // `KtirFunc::attn`'s `arg_for` mints and `attn_operands` reads back. `regions()` zips
@@ -3301,14 +3352,58 @@ fn compile_kernel(
     spec: &KernelSpec,
     grid: &[i64],
 ) -> Result<triton_ktir::ir::Module, String> {
-    use std::cell::RefCell;
-    use std::collections::BTreeMap;
-    thread_local! {
-        /// The memo. The key is the canonical `String` spelled below, so it needs no
-        /// `Hash`/`Ord` on `ArgSpec`/`Val` and is deterministic in construction.
-        static CACHE: RefCell<BTreeMap<String, triton_ktir::ir::Module>> =
-            const { RefCell::new(BTreeMap::new()) };
+    /// The memo. The key is [`memo_key`]'s canonical `String`, so it needs no `Hash`/`Ord` on
+    /// `ArgSpec`/`Val` and is deterministic in construction.
+    static CACHE: Memo<triton_ktir::ir::Module> = Memo::new();
+    CACHE.get_or_compute(memo_key(src, spec, grid), || {
+        compile_kernel_uncached(src, spec, grid)
+    })
+}
+
+/// ⭐ A PROCESS-WIDE MEMO, SHARED BY EVERY THREAD OF THE EMIT — one compile per key, ever.
+///
+/// It was `thread_local!`, which made a second thread compile what the first already had, so the
+/// emit could not lower nodes in parallel without paying each kernel once per thread. Each key owns a
+/// `OnceLock`: the first caller computes, a concurrent caller for the SAME key waits on that one
+/// computation, and callers for different keys never wait on each other (the map lock is held only
+/// to find or insert the cell). A failure is memoized like a success — the compile is a pure function
+/// of the key, so a retry could only say the same thing.
+struct Memo<T> {
+    cells: std::sync::Mutex<std::collections::BTreeMap<String, MemoCell<T>>>,
+}
+
+/// One key's result: computed at most once, by whichever caller gets there first.
+type MemoCell<T> = std::sync::Arc<std::sync::OnceLock<Result<T, String>>>;
+
+impl<T: Clone> Memo<T> {
+    const fn new() -> Memo<T> {
+        Memo {
+            cells: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
     }
+
+    /// `f()` once per `key`, cloned out to every caller. A `None` key (a spec [`memo_key`] cannot
+    /// spell injectively) is never memoized: it computes every time.
+    fn get_or_compute(
+        &self,
+        key: Option<String>,
+        f: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let Some(key) = key else {
+            return f();
+        };
+        let cell = {
+            let mut cells = self.cells.lock().unwrap_or_else(|p| p.into_inner());
+            std::sync::Arc::clone(cells.entry(key).or_default())
+        };
+        cell.get_or_init(f).clone()
+    }
+}
+
+/// THE CANONICAL KEY of one (source, spec, grid) compile — `None` for a spec this key cannot
+/// spell injectively, which sits it out of every memo keyed on it.
+fn memo_key(src: &str, spec: &KernelSpec, grid: &[i64]) -> Option<String> {
+    use std::collections::BTreeMap;
     // ⛔ THE SOURCE TEXT IS PART OF THE KEY, not the file path: `read_kernel` re-reads
     // the `.py` from disk on every call and the bake runs inside ONE build-script
     // process, so a same-named file edited between two `lower` calls in one expansion
@@ -3377,14 +3472,7 @@ fn compile_kernel(
     }
     key.push('\0');
     key.push_str(src);
-    if memo_eligible && let Some(hit) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
-        return Ok(hit);
-    }
-    let module = compile_kernel_uncached(src, spec, grid)?;
-    if memo_eligible {
-        CACHE.with(|c| c.borrow_mut().insert(key, module.clone()));
-    }
-    Ok(module)
+    memo_eligible.then_some(key)
 }
 
 /// The compile itself, unstated above so the memo's key construction cannot interleave

@@ -1166,12 +1166,53 @@ impl Module {
         // constants), so a borrowing index would fight the borrow checker for no
         // semantic gain -- the ops it points at are identified by PATH, resolved
         // through `walk::at`, never held.
-        let ops: Vec<Op> = self.ops_deep().into_iter().cloned().collect();
+        //
+        // ⛔ HEADS, NOT OPS. A whole-`Op` copy carries its regions, so copying every op of a
+        // nested module copied each subtree once per enclosing op -- the function op alone
+        // is the whole module -- and the fixed-point passes rebuild this index every trip.
+        // MEASURED: the copy was the largest single cost of `to_ktir` on a 256-row attention
+        // chunk. A definition's consumers read its kind, operands, results and attributes;
+        // [`OpHead`] is exactly that, so a reader that wanted the body does not compile.
+        let ops: Vec<OpHead> = self.ops_deep().into_iter().map(OpHead::of).collect();
         DefIndex {
             defs,
             tys,
             ops: Some(ops),
         }
+    }
+}
+
+/// An op WITHOUT its regions — what a [`DefIndex`] hands back for a definition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpHead {
+    pub kind: OpKind,
+    pub results: Vec<Ssa>,
+    pub result_types: Vec<IrType>,
+    pub operands: Vec<Ssa>,
+    pub attrs: Vec<(AttrKey, Attr)>,
+}
+
+impl OpHead {
+    fn of(o: &Op) -> OpHead {
+        OpHead {
+            kind: o.kind.clone(),
+            results: o.results.clone(),
+            result_types: o.result_types.clone(),
+            operands: o.operands.clone(),
+            attrs: o.attrs.clone(),
+        }
+    }
+
+    pub fn attr(&self, k: &AttrKey) -> Option<&Attr> {
+        self.attrs.iter().find(|(key, _)| key == k).map(|(_, v)| v)
+    }
+
+    pub fn result(&self) -> Option<Ssa> {
+        self.results.first().copied()
+    }
+
+    pub fn result_type(&self) -> Option<&IrType> {
+        self.result_types.first()
     }
 }
 
@@ -1182,11 +1223,11 @@ impl Module {
 pub struct DefIndex {
     defs: HashMap<Ssa, usize>,
     tys: HashMap<Ssa, IrType>,
-    ops: Option<Vec<Op>>,
+    ops: Option<Vec<OpHead>>,
 }
 
 impl DefIndex {
-    pub fn def_of(&self, v: Ssa) -> Option<&Op> {
+    pub fn def_of(&self, v: Ssa) -> Option<&OpHead> {
         let i = self.defs.get(&v).copied()?;
         self.ops.as_ref()?.get(i)
     }

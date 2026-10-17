@@ -1748,13 +1748,9 @@ fn fold_index_arithmetic(module: &mut Module) {
             let c = module.fresh_named(&module.hint(res));
             let idx = path.index();
             let block = walk::block_mut(module, &path).expect("path");
-            block.remove(idx);
-            block.insert(
-                idx,
-                Op::new(OpKind::ArithConstant)
-                    .with_result(c, ty)
-                    .with_attr(AttrKey::Value, Attr::Int(val)),
-            );
+            block[idx] = Op::new(OpKind::ArithConstant)
+                .with_result(c, ty)
+                .with_attr(AttrKey::Value, Attr::Int(val));
             map.insert(res, c);
             folded = true;
         }
@@ -2656,27 +2652,39 @@ fn apply_splat_folds(module: &mut Module, path: &OpPath, folds: Vec<(usize, Fold
             }
         }
     }
-    for p in planned {
-        let Some(block) = walk::block_mut(module, path) else {
+    // ⛔ ONE PASS OVER THE BLOCK, NOT A SPLICE PER FOLD. A `remove`/`insert` per planned op
+    // shifts the whole tail every time — quadratic at kernel scale, where a grid-unrolled
+    // attention body is one block of tens of thousands of ops (MEASURED: the splices were
+    // the bulk of `fold_splat_seeds` on a 256-row prompt chunk). The collect states at most
+    // one fold per op, so each index maps to at most one plan. The rewires go out in ONE
+    // module walk for the same reason (`replace_all_uses_many`'s own header).
+    let mut rewires: HashMap<Ssa, Ssa> = HashMap::new();
+    let Some(block) = walk::block_mut(module, path) else {
+        return;
+    };
+    let mut at: HashMap<usize, Planned> = planned
+        .into_iter()
+        .filter(|p| p.i < block.len())
+        .map(|p| (p.i, p))
+        .collect();
+    let old = std::mem::take(block);
+    let mut rebuilt: Vec<Op> = Vec::with_capacity(old.len() + at.len());
+    for (i, op) in old.into_iter().enumerate() {
+        let Some(p) = at.remove(&i) else {
+            rebuilt.push(op);
             continue;
         };
-        if p.i >= block.len() {
-            continue;
-        }
         match p.action {
             Plan::Drop { to } => {
-                // The rewire runs over the WHOLE module (uses may be in other blocks),
-                // so it borrows the module after the block borrow ends: collect the
-                // removal, drop the block borrow, then rewire.
-                block.remove(p.i);
-                walk::replace_all_uses(module, p.res, to);
+                rewires.insert(p.res, to);
             }
             Plan::Splat { konst, elem, val } => {
-                block[p.i] = Op::new(OpKind::ArithConstant)
-                    .with_result(konst, IrType::Scalar(elem))
-                    .with_attr(AttrKey::Value, Attr::Float(val));
-                block.insert(
-                    p.i + 1,
+                rebuilt.push(
+                    Op::new(OpKind::ArithConstant)
+                        .with_result(konst, IrType::Scalar(elem))
+                        .with_attr(AttrKey::Value, Attr::Float(val)),
+                );
+                rebuilt.push(
                     Op::new(OpKind::TensorSplat)
                         .with_result(p.res, p.res_ty)
                         .with_operands([konst]),
@@ -2684,6 +2692,8 @@ fn apply_splat_folds(module: &mut Module, path: &OpPath, folds: Vec<(usize, Fold
             }
         }
     }
+    *block = rebuilt;
+    walk::replace_all_uses_many(module, &walk::flatten_rewire_map(&rewires));
 }
 
 /// The first result of the op at `path`'s block index `i`, for Forward-chain resolution.
