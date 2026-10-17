@@ -2759,6 +2759,32 @@ mod response_worker_tests {
         .expect("fill CB")
     }
 
+    /// Wait out the completion thread's decrement lag, then prove the count reached zero.
+    ///
+    /// `fetch_and_parse_response_blocks` fires every CB's callback INSIDE its parse loop but
+    /// decrements `num_pending_requests_` only after the WHOLE drain cycle — and the loopback
+    /// queues every response at launch time, so one cycle can carry thousands of responses. A
+    /// test that just saw its last callback fire can therefore still read a positive count
+    /// with nothing wrong, and the eager assert raced exactly that window: 2 of 3 full-suite
+    /// runs on a pristine tree flaked `concurrent_queue_cbs_delivers_every_callback_once` and
+    /// `submission_mtx_ceiling_measurement` this way (descheduled between the last callback
+    /// and the cycle's `fetch_sub`). Bounded like the gated test's own wait below; the assert
+    /// stays, so a count that never reaches zero still fails — loudly, and as what it is: a
+    /// leak, not a lag.
+    fn await_pending_zero(worker: &ResponseWorker) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while worker.num_pending_requests() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            worker.num_pending_requests(),
+            0,
+            "num_pending_requests_ did not return to zero within the deadline — every callback \
+             had already fired, so a nonzero count is a leak (a parsed response whose slot was \
+             never retired), not the drain cycle's decrement lagging the callbacks"
+        );
+    }
+
     /// The C++ test's own shape, scaled down for a unit test: many threads
     /// submitting multi-CB batches ("Multi-CB batches widen the PrepareCbs
     /// race window"), then a bounded wait for every callback.
@@ -2837,11 +2863,7 @@ mod response_worker_tests {
             tags.iter().all(|t| *t >= TagPool::TAG_OFFSET),
             "tag 0 must never be handed out"
         );
-        assert_eq!(
-            worker.num_pending_requests(),
-            0,
-            "num_pending_requests_ did not return to zero"
-        );
+        await_pending_zero(&worker);
         worker.shutdown();
     }
 
@@ -2910,11 +2932,7 @@ mod response_worker_tests {
                 total,
                 "control blocks lost in submission: not every CB's completion callback fired"
             );
-            assert_eq!(
-                worker.num_pending_requests(),
-                0,
-                "num_pending_requests_ did not return to zero"
-            );
+            await_pending_zero(worker);
             elapsed
         }
 
