@@ -12,6 +12,7 @@
 //!
 //! Port of: `vllm/entrypoints/openai/tool_parsers/` (subset)
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -221,32 +222,17 @@ fn parse_tool_call_json(json_str: &str) -> Option<protocol::ToolCall> {
 // ---------------------------------------------------------------------------
 
 struct HermesStreamingState {
-    /// Current tool call index (-1 = no tool call started).
-    current_tool_id: i32,
-    /// Whether the name for the current tool has been sent.
-    current_tool_name_sent: bool,
-    /// Previously parsed tool call JSON objects.
-    prev_tool_call_arr: Vec<serde_json::Value>,
-    /// Streamed argument characters for each tool call (for diffing).
-    streamed_args_for_tool: Vec<String>,
+    /// Progress of each tool call started so far, by index.
+    calls: Vec<StreamedCallProgress>,
     /// Buffer for partial tag tokens.
     buffer: String,
-    /// Number of tool_call open tags seen so far.
-    num_open_tags: usize,
-    /// Number of tool_call close tags seen so far.
-    num_close_tags: usize,
 }
 
 impl HermesStreamingState {
     fn new() -> Self {
         Self {
-            current_tool_id: -1,
-            current_tool_name_sent: false,
-            prev_tool_call_arr: Vec::new(),
-            streamed_args_for_tool: Vec::new(),
+            calls: Vec::new(),
             buffer: String::new(),
-            num_open_tags: 0,
-            num_close_tags: 0,
         }
     }
 }
@@ -269,110 +255,27 @@ impl StreamingToolParserState for HermesStreamingState {
         // Drain the buffer.
         let text_to_process = std::mem::take(&mut self.buffer);
 
-        // Count open/close tags in the full text so far.
-        let new_open_count = current_text.matches(HERMES_TOOL_CALL_OPEN).count();
-        let new_close_count = current_text.matches(HERMES_TOOL_CALL_CLOSE).count();
-
         // If no tool call tags yet, emit as content.
-        if new_open_count == 0 {
+        let Some((_, after_first_open)) = current_text.split_once(HERMES_TOOL_CALL_OPEN) else {
             return ToolParserDelta::Content(text_to_process);
-        }
-
-        // Check if a new tool call just started.
-        if new_open_count > self.num_open_tags {
-            self.num_open_tags = new_open_count;
-            self.current_tool_id += 1;
-            self.current_tool_name_sent = false;
-            self.prev_tool_call_arr.push(serde_json::Value::Null);
-            self.streamed_args_for_tool.push(String::new());
-
-            // The text_to_process might contain text before <tool_call>.
-            // If current_tool_id == 0, there might be leading content.
-            if self.current_tool_id == 0 {
-                // Find content before the first <tool_call> in current_text.
-                if let Some(pos) = current_text.find(HERMES_TOOL_CALL_OPEN) {
-                    let before = current_text[..pos].to_string();
-                    if !before.is_empty() {
-                        // We already emitted this as content in previous deltas.
-                        // Just skip — the content was already streamed.
-                    }
-                }
-            }
-        }
-
-        // Update close tag count.
-        self.num_close_tags = new_close_count;
-
-        // Extract the JSON content for the current tool call.
-        let tool_idx = self.current_tool_id as usize;
-
-        // Get text after the last <tool_call> open tag.
-        let after_last_open = {
-            let mut start = 0;
-            for _ in 0..self.num_open_tags {
-                if let Some(pos) = current_text[start..].find(HERMES_TOOL_CALL_OPEN) {
-                    start = start + pos + HERMES_TOOL_CALL_OPEN.len();
-                }
-            }
-            // If there's a close tag, take text up to it.
-            if let Some(close_pos) = current_text[start..].find(HERMES_TOOL_CALL_CLOSE) {
-                &current_text[start..start + close_pos]
-            } else {
-                &current_text[start..]
-            }
         };
 
-        // Try partial JSON parse of the tool call content.
-        let parsed = partial_json_parse(after_last_open.trim());
-
-        if let Some(ref val) = parsed {
-            // Try to extract name.
-            if !self.current_tool_name_sent
-                && let Some(name) = val.get("name").and_then(|n| n.as_str())
-            {
-                self.current_tool_name_sent = true;
-                self.prev_tool_call_arr[tool_idx] = val.clone();
-
-                return ToolParserDelta::ToolCalls(vec![DeltaToolCall {
-                    index: tool_idx as u32,
-                    id: Some(format!("call_{}", Uuid::new_v4().simple())),
-                    call_type: Some("function".to_string()),
-                    function_name: Some(name.to_string()),
-                    function_arguments: Some(String::new()),
-                }]);
+        // One body per `<tool_call>`, up to its close tag. Stream from the last
+        // call still in progress, so a delta that closes one call and opens the
+        // next still delivers the first call's tail.
+        let bodies = after_first_open
+            .split(HERMES_TOOL_CALL_OPEN)
+            .map(|s| s.split(HERMES_TOOL_CALL_CLOSE).next().unwrap_or(""));
+        let mut deltas = Vec::new();
+        for (idx, body) in bodies.enumerate().skip(self.calls.len().saturating_sub(1)) {
+            if self.calls.len() <= idx {
+                self.calls.push(StreamedCallProgress::default());
             }
-
-            // Stream arguments diff.
-            if self.current_tool_name_sent {
-                let current_args = val
-                    .get("arguments")
-                    .map(|a| {
-                        if a.is_string() {
-                            a.as_str().unwrap().to_string()
-                        } else {
-                            serde_json::to_string(a).unwrap_or_default()
-                        }
-                    })
-                    .unwrap_or_default();
-
-                let prev_args = &self.streamed_args_for_tool[tool_idx];
-                if current_args.len() > prev_args.len() {
-                    let diff = current_args[prev_args.len()..].to_string();
-                    self.streamed_args_for_tool[tool_idx] = current_args;
-                    self.prev_tool_call_arr[tool_idx] = val.clone();
-
-                    return ToolParserDelta::ToolCalls(vec![DeltaToolCall {
-                        index: tool_idx as u32,
-                        id: None,
-                        call_type: None,
-                        function_name: None,
-                        function_arguments: Some(diff),
-                    }]);
-                }
+            if let Some(call) = scan_partial_container(body.trim()) {
+                deltas.extend(stream_json_call(&call, idx as u32, &mut self.calls[idx]));
             }
         }
-
-        ToolParserDelta::None
+        tool_calls_or_none(deltas)
     }
 }
 
@@ -522,29 +425,18 @@ fn json_value_to_tool_call(val: &serde_json::Value) -> Option<protocol::ToolCall
 // ---------------------------------------------------------------------------
 
 struct LlamaJsonStreamingState {
-    /// Current tool call index (-1 = no tool call started).
-    current_tool_id: i32,
-    /// Whether the name for the current tool has been sent.
-    current_tool_name_sent: bool,
-    /// Streamed argument characters for each tool call.
-    streamed_args_for_tool: Vec<String>,
-    /// Whether we've seen the start of JSON (first `{`).
-    json_started: bool,
-    /// Brace depth for tracking JSON object boundaries.
-    brace_depth: i32,
-    /// Start position of the current JSON object in the full text.
-    current_json_start: usize,
+    /// Progress of each tool call started so far, by index.
+    calls: Vec<StreamedCallProgress>,
+    /// Start of the current call's JSON object in the tag-stripped text,
+    /// once its `{` has arrived.
+    current_json_start: Option<usize>,
 }
 
 impl LlamaJsonStreamingState {
     fn new() -> Self {
         Self {
-            current_tool_id: -1,
-            current_tool_name_sent: false,
-            streamed_args_for_tool: Vec::new(),
-            json_started: false,
-            brace_depth: 0,
-            current_json_start: 0,
+            calls: Vec::new(),
+            current_json_start: None,
         }
     }
 }
@@ -562,194 +454,298 @@ impl StreamingToolParserState for LlamaJsonStreamingState {
             .unwrap_or(current_text);
 
         // If we haven't seen a `{` yet, emit as content.
-        if !self.json_started {
-            if let Some(brace_pos) = effective_text.find('{') {
-                self.json_started = true;
-                self.brace_depth = 0;
-                self.current_json_start = brace_pos;
-
-                // Count braces in the text from brace_pos.
-                for ch in effective_text[brace_pos..].chars() {
-                    match ch {
-                        '{' => self.brace_depth += 1,
-                        '}' => self.brace_depth -= 1,
-                        _ => {}
-                    }
-                }
-
-                // Start a new tool call.
-                self.current_tool_id += 1;
-                self.current_tool_name_sent = false;
-                self.streamed_args_for_tool.push(String::new());
-
-                // Content before the first `{` in delta_text.
+        let mut start = match self.current_json_start {
+            Some(start) => start,
+            None => {
                 let delta_stripped = delta_text
                     .strip_prefix(LLAMA_PYTHON_TAG)
                     .unwrap_or(delta_text);
+                let Some(brace_pos) = effective_text.find('{') else {
+                    // No JSON yet, strip python_tag from delta for content.
+                    if delta_stripped.is_empty() {
+                        return ToolParserDelta::None;
+                    }
+                    return ToolParserDelta::Content(delta_stripped.to_string());
+                };
+                // Start a new tool call.
+                self.current_json_start = Some(brace_pos);
+                self.calls.push(StreamedCallProgress::default());
+
+                // Content before the first `{` in delta_text.
                 if let Some(pos) = delta_stripped.find('{') {
                     let before = &delta_stripped[..pos];
                     if !before.is_empty() {
                         return ToolParserDelta::Content(before.to_string());
                     }
                 }
-            } else {
-                // No JSON yet, strip python_tag from delta for content.
-                let delta_stripped = delta_text
-                    .strip_prefix(LLAMA_PYTHON_TAG)
-                    .unwrap_or(delta_text);
-                if delta_stripped.is_empty() {
-                    return ToolParserDelta::None;
-                }
-                return ToolParserDelta::Content(delta_stripped.to_string());
+                brace_pos
             }
-        } else {
-            // Track brace depth for new characters.
-            for ch in delta_text.chars() {
-                match ch {
-                    '{' => self.brace_depth += 1,
-                    '}' => self.brace_depth -= 1,
-                    _ => {}
-                }
-            }
+        };
 
-            // If depth returns to 0, current JSON object is complete.
-            if self.brace_depth == 0 {
-                // A new JSON object might start.
-                // Check if there's another `{` after current close.
-                let remainder = effective_text[self.current_json_start..].trim();
-                if let Some((val, end)) = try_parse_json_object(remainder) {
-                    let after = remainder[end..].trim_start();
-                    if after.starts_with('{') {
-                        // New tool call starting.
-                        self.current_tool_id += 1;
-                        self.current_tool_name_sent = false;
-                        self.streamed_args_for_tool.push(String::new());
-                        self.current_json_start += end + remainder[end..].find('{').unwrap_or(0);
-                        self.brace_depth = 1; // for the new opening brace
-                    }
-                    let _ = val; // processed below via partial parse
-                }
-            }
+        // Stream the current call; once its object has closed, the next `{`
+        // (after Llama's `;` separator) starts another call.
+        let mut deltas = Vec::new();
+        loop {
+            let idx = self.calls.len() - 1;
+            let Some(call) = scan_partial_container(&effective_text[start..]) else {
+                break;
+            };
+            deltas.extend(stream_json_call(&call, idx as u32, &mut self.calls[idx]));
+            let Some(end) = call.end else {
+                break;
+            };
+            let Some(next) = effective_text[start + end..].find('{') else {
+                break;
+            };
+            start += end + next;
+            self.current_json_start = Some(start);
+            self.calls.push(StreamedCallProgress::default());
         }
-
-        // Try partial JSON parse of the current tool call's text.
-        let tool_idx = self.current_tool_id as usize;
-        let json_text = &effective_text[self.current_json_start..];
-        let parsed = partial_json_parse(json_text.trim());
-
-        if let Some(ref val) = parsed {
-            if !self.current_tool_name_sent
-                && let Some(name) = val.get("name").and_then(|n| n.as_str())
-            {
-                self.current_tool_name_sent = true;
-                return ToolParserDelta::ToolCalls(vec![DeltaToolCall {
-                    index: tool_idx as u32,
-                    id: Some(format!("call_{}", Uuid::new_v4().simple())),
-                    call_type: Some("function".to_string()),
-                    function_name: Some(name.to_string()),
-                    function_arguments: Some(String::new()),
-                }]);
-            }
-
-            if self.current_tool_name_sent {
-                let current_args = val
-                    .get("arguments")
-                    .map(|a| {
-                        if a.is_string() {
-                            a.as_str().unwrap().to_string()
-                        } else {
-                            serde_json::to_string(a).unwrap_or_default()
-                        }
-                    })
-                    .unwrap_or_default();
-
-                let prev_args = &self.streamed_args_for_tool[tool_idx];
-                if current_args.len() > prev_args.len() {
-                    let diff = current_args[prev_args.len()..].to_string();
-                    self.streamed_args_for_tool[tool_idx] = current_args;
-
-                    return ToolParserDelta::ToolCalls(vec![DeltaToolCall {
-                        index: tool_idx as u32,
-                        id: None,
-                        call_type: None,
-                        function_name: None,
-                        function_arguments: Some(diff),
-                    }]);
-                }
-            }
-        }
-
-        ToolParserDelta::None
+        tool_calls_or_none(deltas)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Partial JSON helper
+// Streaming JSON tool calls
 // ---------------------------------------------------------------------------
 
-/// Attempt to parse potentially incomplete JSON by closing open braces/brackets.
-///
-/// Tries parsing as-is first, then attempts to fix by appending closing
-/// characters for unmatched `{` and `[`.
-pub fn partial_json_parse(input: &str) -> Option<serde_json::Value> {
-    // Try parsing as-is first.
-    if let Ok(v) = serde_json::from_str(input) {
-        return Some(v);
+/// A JSON value as far as it has arrived: its raw text from its first
+/// character (trailing whitespace trimmed), and whether it has ended.
+#[derive(Debug, Clone, Copy)]
+struct PartialValue<'a> {
+    raw: &'a str,
+    complete: bool,
+}
+
+/// A JSON object or array that may still be arriving, read in one pass.
+#[derive(Debug)]
+struct PartialContainer<'a> {
+    /// Top-level members in order: `(Some(raw key), value)` for an object,
+    /// `(None, element)` for an array. The last one may be unfinished.
+    members: Vec<(Option<&'a str>, PartialValue<'a>)>,
+    /// Byte offset just past the closing `}`/`]`, once it has arrived.
+    end: Option<usize>,
+}
+
+impl<'a> PartialContainer<'a> {
+    fn member(&self, key: &str) -> Option<PartialValue<'a>> {
+        self.members
+            .iter()
+            .find(|(k, _)| *k == Some(key))
+            .map(|(_, v)| *v)
     }
+}
 
-    // Track unmatched delimiters in order (outside strings).
-    let mut delimiter_stack: Vec<char> = Vec::new();
-    let mut in_string = false;
-    let mut prev_backslash = false;
-
-    for ch in input.chars() {
+/// Read the object or array at the start of `text` without needing it to be
+/// finished. Nothing is filled in to make the text parse: every value is a
+/// slice of `text`, so a later read of a longer `text` only ever extends it,
+/// and `complete` says whether its closing character has actually arrived.
+fn scan_partial_container(text: &str) -> Option<PartialContainer<'_>> {
+    let bytes = text.as_bytes();
+    let is_object = match bytes.first() {
+        Some(b'{') => true,
+        Some(b'[') => false,
+        _ => return None,
+    };
+    let mut members = Vec::new();
+    let mut depth = 0usize;
+    let (mut in_string, mut escaped) = (false, false);
+    // The member being read: its key (objects only) and where its value starts.
+    // An array element has no key, so its value can start right away.
+    let (mut key_start, mut key, mut value_start) = (None, None, None);
+    let mut expect_value = !is_object;
+    // Structural characters are all ASCII, so byte offsets are char boundaries.
+    for (i, &b) in bytes.iter().enumerate() {
         if in_string {
-            if ch == '\\' && !prev_backslash {
-                prev_backslash = true;
-                continue;
-            }
-            if ch == '"' && !prev_backslash {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
                 in_string = false;
+                if let Some(ks) = key_start.take() {
+                    key = Some(&text[ks + 1..i]);
+                }
             }
-            prev_backslash = false;
             continue;
         }
-        match ch {
-            '"' => in_string = true,
-            '{' => delimiter_stack.push('{'),
-            '}' => {
-                delimiter_stack.pop();
-            }
-            '[' => delimiter_stack.push('['),
-            ']' => {
-                delimiter_stack.pop();
-            }
-            _ => {}
+        if depth == 1
+            && expect_value
+            && value_start.is_none()
+            && !b.is_ascii_whitespace()
+            && !matches!(b, b',' | b'}' | b']')
+        {
+            value_start = Some(i);
         }
-        prev_backslash = false;
-    }
-
-    if delimiter_stack.is_empty() && !in_string {
-        return None; // Not fixable by closing delimiters.
-    }
-
-    // Try closing the string if we're inside one, then close delimiters
-    // in reverse order (innermost first).
-    let mut fixed = input.to_string();
-
-    if in_string {
-        fixed.push('"');
-    }
-
-    for &delim in delimiter_stack.iter().rev() {
-        match delim {
-            '{' => fixed.push('}'),
-            '[' => fixed.push(']'),
-            _ => {}
+        let member_ends = match b {
+            b'"' => {
+                in_string = true;
+                if depth == 1 && !expect_value {
+                    key_start = Some(i);
+                }
+                false
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                false
+            }
+            b'}' | b']' => {
+                depth -= 1;
+                depth == 0
+            }
+            b':' if depth == 1 => {
+                expect_value = true;
+                false
+            }
+            b',' => depth == 1,
+            _ => false,
+        };
+        if member_ends {
+            if let Some(vs) = value_start.take() {
+                let raw = text[vs..i].trim_end();
+                members.push((
+                    key,
+                    PartialValue {
+                        raw,
+                        complete: true,
+                    },
+                ));
+            }
+            (key, expect_value) = (None, !is_object);
+            if depth == 0 {
+                return Some(PartialContainer {
+                    members,
+                    end: Some(i + 1),
+                });
+            }
         }
     }
+    if let Some(vs) = value_start {
+        let raw = text[vs..].trim_end();
+        members.push((
+            key,
+            PartialValue {
+                raw,
+                complete: false,
+            },
+        ));
+    }
+    Some(PartialContainer { members, end: None })
+}
 
-    serde_json::from_str(&fixed).ok()
+/// The arguments text a value stands for: its raw JSON, borrowed, or the
+/// decoded text when the model sent the arguments as a JSON-encoded string
+/// (the shape [`json_value_to_tool_call`] unwraps). An unfinished string
+/// decodes up to its last whole character, so the result only ever grows.
+fn arguments_text(value: PartialValue<'_>) -> Option<Cow<'_, str>> {
+    if !value.raw.starts_with('"') {
+        return Some(Cow::Borrowed(value.raw));
+    }
+    if value.complete {
+        return serde_json::from_str(value.raw).ok().map(Cow::Owned);
+    }
+    // Drop a trailing unfinished escape. The longest is a surrogate pair missing
+    // its last digit, `\uXXXX\uXXX` (11 bytes): a lone high surrogate doesn't
+    // decode either, so the whole pair waits.
+    (0..=value.raw.len().min(12)).find_map(|cut| {
+        let head = value.raw.get(..value.raw.len() - cut)?;
+        serde_json::from_str(&format!("{head}\""))
+            .ok()
+            .map(Cow::Owned)
+    })
+}
+
+/// How far one tool call has streamed.
+#[derive(Debug, Default)]
+enum StreamedCallProgress {
+    /// Nothing sent yet: the name's closing quote has not arrived.
+    #[default]
+    AwaitingName,
+    /// The name went out, and this many bytes of the arguments text.
+    Streaming { args_sent: usize },
+}
+
+/// The delta a tool call written as `{"name": …, "arguments"|"parameters": …}`
+/// owes the stream now that its object reads `call` (possibly unfinished).
+///
+/// The name goes out only once its string has closed: a partial parse closes
+/// an open string for us, which would send an empty or truncated name and then
+/// never send the rest. The arguments go out as the model's own text, appended
+/// to as it grows: re-serializing each partial parse instead adds closing
+/// quotes and braces the model has not written yet and sorts the keys, so one
+/// serialization is not a prefix of the next and the fragments add up to
+/// garbage.
+fn stream_json_call(
+    call: &PartialContainer<'_>,
+    index: u32,
+    progress: &mut StreamedCallProgress,
+) -> Option<DeltaToolCall> {
+    let mut delta = DeltaToolCall {
+        index,
+        id: None,
+        call_type: None,
+        function_name: None,
+        function_arguments: None,
+    };
+    let mut args_sent = match *progress {
+        StreamedCallProgress::Streaming { args_sent } => args_sent,
+        StreamedCallProgress::AwaitingName => {
+            // The raw text of a string still missing its closing quote does
+            // not parse, so this waits for that quote and no longer.
+            let name = call.member("name")?;
+            delta.function_name = Some(serde_json::from_str(name.raw).ok()?);
+            delta.id = Some(format!("call_{}", Uuid::new_v4().simple()));
+            delta.call_type = Some("function".to_string());
+            delta.function_arguments = Some(String::new());
+            0
+        }
+    };
+    // Llama 3.x writes `"parameters"`; take it when `"arguments"` is absent or
+    // null, as `json_value_to_tool_call` does (a value starting `n` is `null`
+    // on its way in).
+    let args = match call.member("arguments") {
+        Some(v) if !v.raw.starts_with('n') => Some(v),
+        _ => call.member("parameters"),
+    };
+    if let Some(text) = args.and_then(arguments_text)
+        && let Some(fragment) = text.get(args_sent..).filter(|f| !f.is_empty())
+    {
+        delta.function_arguments = Some(fragment.to_string());
+        args_sent = text.len();
+    }
+    *progress = StreamedCallProgress::Streaming { args_sent };
+    (delta.function_name.is_some() || delta.function_arguments.is_some()).then_some(delta)
+}
+
+/// Stream every call in a JSON array of tool-call objects (Jamba, Granite),
+/// from the last one still in progress onward.
+fn stream_json_call_array(
+    array_text: &str,
+    calls: &mut Vec<StreamedCallProgress>,
+) -> ToolParserDelta {
+    let Some(array) = scan_partial_container(array_text) else {
+        return ToolParserDelta::None;
+    };
+    let mut deltas = Vec::new();
+    let first = calls.len().saturating_sub(1);
+    for (idx, (_, element)) in array.members.iter().enumerate().skip(first) {
+        let Some(call) = scan_partial_container(element.raw) else {
+            continue;
+        };
+        if calls.len() <= idx {
+            calls.resize_with(idx + 1, StreamedCallProgress::default);
+        }
+        deltas.extend(stream_json_call(&call, idx as u32, &mut calls[idx]));
+    }
+    tool_calls_or_none(deltas)
+}
+
+fn tool_calls_or_none(deltas: Vec<DeltaToolCall>) -> ToolParserDelta {
+    if deltas.is_empty() {
+        ToolParserDelta::None
+    } else {
+        ToolParserDelta::ToolCalls(deltas)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1729,14 +1725,8 @@ fn jamba_extract(text: &str) -> ExtractedToolCallInfo {
 // ---------------------------------------------------------------------------
 
 struct JambaStreamingState {
-    /// Current tool call index (-1 = no tool call started).
-    current_tool_id: i32,
-    /// Whether the name for the current tool has been sent.
-    current_tool_name_sent: bool,
-    /// Previously parsed tool call array.
-    prev_tool_call_arr: Vec<serde_json::Value>,
-    /// Streamed argument characters for each tool call (for diffing).
-    streamed_args_for_tool: Vec<String>,
+    /// Progress of each tool call started so far, by index.
+    calls: Vec<StreamedCallProgress>,
     /// Buffer for partial tag tokens.
     buffer: String,
     /// Whether we've seen the open tag yet.
@@ -1746,10 +1736,7 @@ struct JambaStreamingState {
 impl JambaStreamingState {
     fn new() -> Self {
         Self {
-            current_tool_id: -1,
-            current_tool_name_sent: false,
-            prev_tool_call_arr: Vec::new(),
-            streamed_args_for_tool: Vec::new(),
+            calls: Vec::new(),
             buffer: String::new(),
             seen_open_tag: false,
         }
@@ -1798,116 +1785,7 @@ impl StreamingToolParserState for JambaStreamingState {
             .next()
             .unwrap_or("");
 
-        // Try partial JSON parse of the array.
-        let parsed = partial_json_parse(parsable_arr.trim());
-
-        let Some(val) = parsed else {
-            return ToolParserDelta::None;
-        };
-
-        let Some(tool_call_arr) = val.as_array() else {
-            return ToolParserDelta::None;
-        };
-
-        // Empty array — nothing to stream yet.
-        if tool_call_arr.is_empty() {
-            return ToolParserDelta::None;
-        }
-
-        // Check if a new tool call started (array grew past our cursor).
-        if tool_call_arr.len() as i32 > self.current_tool_id + 1 {
-            // Flush remaining args for the previous tool if any.
-            let flush_delta = if self.current_tool_id >= 0 {
-                let prev_idx = self.current_tool_id as usize;
-                let prev_call = &tool_call_arr[prev_idx];
-                let cur_args = prev_call
-                    .get("arguments")
-                    .map(|a| {
-                        if a.is_string() {
-                            a.as_str().unwrap().to_string()
-                        } else {
-                            serde_json::to_string(a).unwrap_or_default()
-                        }
-                    })
-                    .unwrap_or_default();
-                let prev_streamed = &self.streamed_args_for_tool[prev_idx];
-                if cur_args.len() > prev_streamed.len() {
-                    let diff = cur_args[prev_streamed.len()..].to_string();
-                    self.streamed_args_for_tool[prev_idx] = cur_args;
-                    Some(DeltaToolCall {
-                        index: prev_idx as u32,
-                        id: None,
-                        call_type: None,
-                        function_name: None,
-                        function_arguments: Some(diff),
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            // Advance to the new tool.
-            self.current_tool_id = tool_call_arr.len() as i32 - 1;
-            self.current_tool_name_sent = false;
-            self.streamed_args_for_tool.push(String::new());
-            self.prev_tool_call_arr = tool_call_arr.clone();
-
-            if let Some(flush) = flush_delta {
-                return ToolParserDelta::ToolCalls(vec![flush]);
-            }
-            // Fall through to try sending the name for the new tool.
-        }
-
-        let tool_idx = self.current_tool_id as usize;
-        let current_tool_call = &tool_call_arr[tool_idx];
-
-        // Try to send the name if not yet sent.
-        if !self.current_tool_name_sent {
-            if let Some(name) = current_tool_call.get("name").and_then(|n| n.as_str()) {
-                self.current_tool_name_sent = true;
-                self.prev_tool_call_arr = tool_call_arr.clone();
-                return ToolParserDelta::ToolCalls(vec![DeltaToolCall {
-                    index: tool_idx as u32,
-                    id: Some(format!("call_{}", Uuid::new_v4().simple())),
-                    call_type: Some("function".to_string()),
-                    function_name: Some(name.to_string()),
-                    function_arguments: Some(String::new()),
-                }]);
-            }
-            return ToolParserDelta::None;
-        }
-
-        // Stream arguments diff.
-        let current_args = current_tool_call
-            .get("arguments")
-            .map(|a| {
-                if a.is_string() {
-                    a.as_str().unwrap().to_string()
-                } else {
-                    serde_json::to_string(a).unwrap_or_default()
-                }
-            })
-            .unwrap_or_default();
-
-        let prev_args = &self.streamed_args_for_tool[tool_idx];
-        if current_args.len() > prev_args.len() {
-            let diff = current_args[prev_args.len()..].to_string();
-            self.streamed_args_for_tool[tool_idx] = current_args;
-            self.prev_tool_call_arr = tool_call_arr.clone();
-
-            return ToolParserDelta::ToolCalls(vec![DeltaToolCall {
-                index: tool_idx as u32,
-                id: None,
-                call_type: None,
-                function_name: None,
-                function_arguments: Some(diff),
-            }]);
-        }
-
-        self.prev_tool_call_arr = tool_call_arr.clone();
-        ToolParserDelta::None
+        stream_json_call_array(parsable_arr.trim(), &mut self.calls)
     }
 }
 
@@ -2034,14 +1912,8 @@ fn granite_extract(text: &str) -> ExtractedToolCallInfo {
 // ---------------------------------------------------------------------------
 
 struct GraniteStreamingState {
-    /// Current tool call index (-1 = no tool call started).
-    current_tool_id: i32,
-    /// Whether the name for the current tool has been sent.
-    current_tool_name_sent: bool,
-    /// Previously parsed tool call array.
-    prev_tool_call_arr: Vec<serde_json::Value>,
-    /// Streamed argument characters for each tool call (for diffing).
-    streamed_args_for_tool: Vec<String>,
+    /// Progress of each tool call started so far, by index.
+    calls: Vec<StreamedCallProgress>,
     /// Whether we've found the `[` start of the JSON array.
     array_started: bool,
     /// Byte offset where the JSON array begins in current_text.
@@ -2051,10 +1923,7 @@ struct GraniteStreamingState {
 impl GraniteStreamingState {
     fn new() -> Self {
         Self {
-            current_tool_id: -1,
-            current_tool_name_sent: false,
-            prev_tool_call_arr: Vec::new(),
-            streamed_args_for_tool: Vec::new(),
+            calls: Vec::new(),
             array_started: false,
             array_start_offset: 0,
         }
@@ -2092,162 +1961,8 @@ impl StreamingToolParserState for GraniteStreamingState {
             }
         }
 
-        // Parse the JSON array portion.
-        let array_text = &current_text[self.array_start_offset..];
-        let parsed = partial_json_parse(array_text.trim());
-
-        let Some(val) = parsed else {
-            return ToolParserDelta::None;
-        };
-
-        let Some(tool_call_arr) = val.as_array() else {
-            return ToolParserDelta::None;
-        };
-
-        if tool_call_arr.is_empty() {
-            return ToolParserDelta::None;
-        }
-
-        // Check completeness of the last element: if the full array_text
-        // parses as valid JSON, the last element is complete.
-        let last_is_complete = serde_json::from_str::<serde_json::Value>(array_text.trim()).is_ok();
-
-        // Check if a new tool call started (array grew past cursor).
-        if tool_call_arr.len() as i32 > self.current_tool_id + 1 {
-            // Flush remaining args for the previous tool.
-            let flush_delta = if self.current_tool_id >= 0 {
-                let prev_idx = self.current_tool_id as usize;
-                let prev_call = &tool_call_arr[prev_idx];
-                let cur_args = prev_call
-                    .get("arguments")
-                    .map(|a| {
-                        if a.is_string() {
-                            a.as_str().unwrap().to_string()
-                        } else {
-                            serde_json::to_string(a).unwrap_or_default()
-                        }
-                    })
-                    .unwrap_or_default();
-                let prev_streamed = &self.streamed_args_for_tool[prev_idx];
-                if cur_args.len() > prev_streamed.len() {
-                    let diff = cur_args[prev_streamed.len()..].to_string();
-                    self.streamed_args_for_tool[prev_idx] = cur_args;
-                    Some(DeltaToolCall {
-                        index: prev_idx as u32,
-                        id: None,
-                        call_type: None,
-                        function_name: None,
-                        function_arguments: Some(diff),
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            self.current_tool_id = tool_call_arr.len() as i32 - 1;
-            self.current_tool_name_sent = false;
-            self.streamed_args_for_tool.push(String::new());
-            self.prev_tool_call_arr = tool_call_arr.clone();
-
-            if let Some(flush) = flush_delta {
-                return ToolParserDelta::ToolCalls(vec![flush]);
-            }
-            // Fall through to try sending the name.
-        }
-
-        let tool_idx = self.current_tool_id as usize;
-        let current_tool_call = &tool_call_arr[tool_idx];
-
-        // Try to send the name if not yet sent.
-        if !self.current_tool_name_sent {
-            if let Some(name) = current_tool_call.get("name").and_then(|n| n.as_str()) {
-                self.current_tool_name_sent = true;
-                self.prev_tool_call_arr = tool_call_arr.clone();
-                return ToolParserDelta::ToolCalls(vec![DeltaToolCall {
-                    index: tool_idx as u32,
-                    id: Some(format!("call_{}", Uuid::new_v4().simple())),
-                    call_type: Some("function".to_string()),
-                    function_name: Some(name.to_string()),
-                    function_arguments: Some(String::new()),
-                }]);
-            }
-            return ToolParserDelta::None;
-        }
-
-        // Stream arguments diff.
-        let cur_arguments = current_tool_call.get("arguments");
-        if let Some(cur_args_val) = cur_arguments {
-            let cur_args_json = if cur_args_val.is_string() {
-                cur_args_val.as_str().unwrap().to_string()
-            } else {
-                serde_json::to_string(cur_args_val).unwrap_or_default()
-            };
-
-            let sent = self.streamed_args_for_tool[tool_idx].len();
-
-            // When the tool call JSON is complete, we can send the rest.
-            // When incomplete, use common-prefix diffing to avoid streaming
-            // close-brackets prematurely.
-            let argument_diff = if last_is_complete || tool_idx < tool_call_arr.len() - 1 {
-                // Complete or not the last element — safe to send remainder.
-                if cur_args_json.len() > sent {
-                    Some(cur_args_json[sent..].to_string())
-                } else {
-                    None
-                }
-            } else {
-                // Last element, incomplete — use common prefix with prev.
-                let prev_args_val = self
-                    .prev_tool_call_arr
-                    .get(tool_idx)
-                    .and_then(|v| v.get("arguments"));
-                if let Some(prev_val) = prev_args_val {
-                    let prev_args_json = if prev_val.is_string() {
-                        prev_val.as_str().unwrap().to_string()
-                    } else {
-                        serde_json::to_string(prev_val).unwrap_or_default()
-                    };
-                    if cur_args_json != prev_args_json {
-                        let prefix_len = find_common_prefix_len(&prev_args_json, &cur_args_json);
-                        if prefix_len > sent {
-                            Some(cur_args_json[sent..prefix_len].to_string())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else if cur_args_json.len() > sent {
-                    // No previous args — send what we have.
-                    Some(cur_args_json[sent..].to_string())
-                } else {
-                    None
-                }
-            };
-
-            if let Some(diff) = argument_diff {
-                self.streamed_args_for_tool[tool_idx].push_str(&diff);
-                self.prev_tool_call_arr = tool_call_arr.clone();
-                return ToolParserDelta::ToolCalls(vec![DeltaToolCall {
-                    index: tool_idx as u32,
-                    id: None,
-                    call_type: None,
-                    function_name: None,
-                    function_arguments: Some(diff),
-                }]);
-            }
-        }
-
-        self.prev_tool_call_arr = tool_call_arr.clone();
-        ToolParserDelta::None
+        stream_json_call_array(&current_text[self.array_start_offset..], &mut self.calls)
     }
-}
-
-/// Find the length of the common prefix between two strings.
-fn find_common_prefix_len(a: &str, b: &str) -> usize {
-    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
 }
 
 // ---------------------------------------------------------------------------
@@ -3198,27 +2913,6 @@ mod tests {
         );
     }
 
-    // -- Partial JSON tests --
-
-    #[test]
-    fn test_partial_json_incomplete() {
-        let input = r#"{"name": "f", "arguments": {"q": "he"#;
-        let result = partial_json_parse(input);
-        assert!(result.is_some());
-        let val = result.unwrap();
-        assert_eq!(val["name"], "f");
-        assert_eq!(val["arguments"]["q"], "he");
-    }
-
-    #[test]
-    fn test_partial_json_complete() {
-        let input = r#"{"name": "f", "arguments": {"q": "hello"}}"#;
-        let result = partial_json_parse(input);
-        assert!(result.is_some());
-        let val = result.unwrap();
-        assert_eq!(val["name"], "f");
-    }
-
     // -- Hermes streaming tests --
 
     #[test]
@@ -3307,6 +3001,309 @@ mod tests {
 
         assert!(got_content, "Should have received content");
         assert!(got_tool, "Should have received tool call");
+    }
+
+    // -- Split-token streaming tests (shared harness) --
+
+    /// What a client rebuilds from a stream, per tool index: every name the
+    /// stream sent for it, and its argument fragments joined.
+    #[derive(Debug, Default)]
+    struct StreamedCall {
+        names: Vec<String>,
+        args: String,
+    }
+
+    /// Feed `tokens` through `parser`'s streaming state one at a time and
+    /// rebuild the calls the way a client does.
+    fn stream_calls(parser: &dyn ToolCallParser, tokens: &[&str]) -> Vec<StreamedCall> {
+        let mut state = parser.create_streaming_state();
+        let mut calls: Vec<StreamedCall> = Vec::new();
+        let mut accumulated = String::new();
+        for token in tokens {
+            let prev = accumulated.clone();
+            accumulated.push_str(token);
+            if let ToolParserDelta::ToolCalls(deltas) =
+                state.process_delta(&prev, &accumulated, token)
+            {
+                for d in deltas {
+                    let idx = d.index as usize;
+                    if calls.len() <= idx {
+                        calls.resize_with(idx + 1, StreamedCall::default);
+                    }
+                    calls[idx].names.extend(d.function_name);
+                    calls[idx]
+                        .args
+                        .push_str(d.function_arguments.as_deref().unwrap_or(""));
+                }
+            }
+        }
+        calls
+    }
+
+    /// Assert one streamed call carries exactly `name` once and arguments
+    /// that parse to `args`.
+    fn assert_streamed(call: &StreamedCall, name: &str, args: serde_json::Value) {
+        assert_eq!(call.names, [name], "names sent: {call:?}");
+        let got: serde_json::Value = serde_json::from_str(&call.args)
+            .unwrap_or_else(|e| panic!("arguments {:?} are not JSON: {e}", call.args));
+        assert_eq!(got, args, "arguments: {:?}", call.args);
+    }
+
+    /// Issue #498: Llama 3.x writes its arguments under `"parameters"`, and a
+    /// real tokenizer splits both the name and the arguments across tokens.
+    /// The name must not go out before its closing quote arrives.
+    #[test]
+    fn test_llama_streaming_split_name_and_parameters() {
+        let tokens = [
+            "<|python_tag|>",
+            "{\"",
+            "name",
+            "\":",
+            " \"",
+            "Ba",
+            "sh",
+            "\",",
+            " \"",
+            "parameters",
+            "\":",
+            " {\"",
+            "command",
+            "\":",
+            " \"",
+            "ls",
+            "\"}}",
+        ];
+        let calls = stream_calls(&LlamaJsonToolParser::new(), &tokens);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_streamed(&calls[0], "Bash", serde_json::json!({"command": "ls"}));
+    }
+
+    #[test]
+    fn test_llama_streaming_split_name_and_arguments() {
+        let tokens = [
+            "{\"name\": \"",
+            "get_",
+            "weather\", \"arguments\": {\"ci",
+            "ty\": \"San ",
+            "Francisco\"}}",
+        ];
+        let calls = stream_calls(&LlamaJsonToolParser::new(), &tokens);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_streamed(
+            &calls[0],
+            "get_weather",
+            serde_json::json!({"city": "San Francisco"}),
+        );
+    }
+
+    /// Arguments whose keys are not in sorted order, holding braces and an
+    /// escaped quote inside strings. The streamed fragments must add up to
+    /// the model's own text, not to a re-serialization of each partial parse.
+    #[test]
+    fn test_llama_streaming_unsorted_keys_and_braces_in_strings() {
+        let tokens = [
+            "{\"name\": \"Write\", \"parameters\": {\"file_path\": \"/tmp/a",
+            ".txt\", \"con",
+            "tent\": \"fn main() {",
+            " println!(\\\"}\\\"); }",
+            "\"}}",
+        ];
+        let calls = stream_calls(&LlamaJsonToolParser::new(), &tokens);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_streamed(
+            &calls[0],
+            "Write",
+            serde_json::json!({
+                "file_path": "/tmp/a.txt",
+                "content": "fn main() { println!(\"}\"); }",
+            }),
+        );
+    }
+
+    #[test]
+    fn test_llama_streaming_two_calls() {
+        let tokens = [
+            "{\"name\": \"f1\", \"parameters\": {\"a\": 1}}",
+            "; ",
+            "{\"name\": \"f",
+            "2\", \"parameters\": {\"b\":",
+            " 2}}",
+        ];
+        let calls = stream_calls(&LlamaJsonToolParser::new(), &tokens);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_streamed(&calls[0], "f1", serde_json::json!({"a": 1}));
+        assert_streamed(&calls[1], "f2", serde_json::json!({"b": 2}));
+    }
+
+    #[test]
+    fn test_hermes_streaming_split_name_and_arguments() {
+        let tokens = [
+            "<tool_call>",
+            "\n{\"name\": \"",
+            "get_",
+            "weather\", \"arguments\": {\"un",
+            "it\": \"c\", \"city\": \"S",
+            "F\"}}",
+            "\n</tool_call>",
+        ];
+        let calls = stream_calls(&HermesToolParser::new(), &tokens);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_streamed(
+            &calls[0],
+            "get_weather",
+            serde_json::json!({"unit": "c", "city": "SF"}),
+        );
+    }
+
+    /// Arguments sent as a JSON-encoded string stream as the decoded text,
+    /// matching what `parse_tool_call_json` returns for the same call.
+    #[test]
+    fn test_hermes_streaming_string_arguments() {
+        let tokens = [
+            "<tool_call>",
+            "{\"name\": \"f\", \"arguments\": \"{\\\"a\\",
+            "\": 1}\"}",
+            "</tool_call>",
+        ];
+        let calls = stream_calls(&HermesToolParser::new(), &tokens);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_streamed(&calls[0], "f", serde_json::json!({"a": 1}));
+    }
+
+    /// Every parser fed one character at a time: each cut lands inside a
+    /// name, a key, a `\u` escape (one of them half of a surrogate pair), a
+    /// multi-byte character, and a string holding `}` and `]`.
+    #[test]
+    fn test_json_parsers_stream_one_char_at_a_time() {
+        let args = r#"{"q": "café 😀 ü }]", "n": [1, {"k": null}]}"#;
+        let expected = serde_json::json!({"q": "café 😀 ü }]", "n": [1, {"k": null}]});
+        // As a JSON-encoded string too, written by hand: `serde_json::to_string`
+        // leaves non-ASCII as plain UTF-8, so it would carry no `\u` escape.
+        let encoded = r#""{\"q\": \"café 😀 ü }]\", \"n\": [1, {\"k\": null}]}""#;
+        let cases: [(&dyn ToolCallParser, String); 4] = [
+            (
+                &LlamaJsonToolParser::new(),
+                format!(
+                    r#"<|python_tag|>{{"name": "f1", "parameters": {args}}}; {{"name": "f2", "arguments": {encoded}}}"#
+                ),
+            ),
+            (
+                &HermesToolParser::new(),
+                format!(
+                    "<tool_call>\n{{\"name\": \"f1\", \"arguments\": {args}}}\n</tool_call>\n\
+                     <tool_call>\n{{\"name\": \"f2\", \"arguments\": {encoded}}}\n</tool_call>"
+                ),
+            ),
+            (
+                &JambaToolParser::new(),
+                format!(
+                    r#"<tool_calls>[{{"name": "f1", "arguments": {args}}}, {{"name": "f2", "arguments": {encoded}}}]</tool_calls>"#
+                ),
+            ),
+            (
+                &GraniteToolParser::new(),
+                format!(
+                    r#"<|tool_call|>[{{"name": "f1", "arguments": {args}}}, {{"name": "f2", "arguments": {encoded}}}]"#
+                ),
+            ),
+        ];
+        for (parser, text) in cases {
+            let chars: Vec<String> = text.chars().map(String::from).collect();
+            let tokens: Vec<&str> = chars.iter().map(String::as_str).collect();
+            let calls = stream_calls(parser, &tokens);
+            assert_eq!(calls.len(), 2, "{text}: {calls:?}");
+            assert_streamed(&calls[0], "f1", expected.clone());
+            assert_streamed(&calls[1], "f2", expected.clone());
+        }
+    }
+
+    /// String-encoded arguments cut inside an escape: the text before the
+    /// escape must already have gone out, not wait for the escape to finish.
+    /// The longest unfinished escape is 11 bytes (`\ud83d\ude0`, a surrogate
+    /// pair missing its last digit), which `arguments_text` must look past.
+    #[test]
+    fn test_hermes_streaming_sends_text_before_an_unfinished_escape() {
+        let tokens = [
+            "<tool_call>",
+            r#"{"name": "f", "arguments": "{\"q\": \"ab\u00"#,
+            r#"e9 cd\ud83d\ude0"#,
+            r#"0\"}"}"#,
+            "</tool_call>",
+        ];
+        let mut state = HermesToolParser::new().create_streaming_state();
+        let mut accumulated = String::new();
+        let mut sent = Vec::new();
+        for token in tokens {
+            let prev = accumulated.clone();
+            accumulated.push_str(token);
+            let mut args = String::new();
+            if let ToolParserDelta::ToolCalls(deltas) =
+                state.process_delta(&prev, &accumulated, token)
+            {
+                for d in deltas {
+                    args.push_str(d.function_arguments.as_deref().unwrap_or(""));
+                }
+            }
+            sent.push(args);
+        }
+        assert_eq!(sent[1], r#"{"q": "ab"#, "{sent:?}");
+        assert_eq!(sent[2], "é cd", "{sent:?}");
+        assert_eq!(sent.concat(), r#"{"q": "abé cd😀"}"#, "{sent:?}");
+    }
+
+    /// `"arguments": null` falls through to `"parameters"`, as in
+    /// `json_value_to_tool_call`.
+    #[test]
+    fn test_llama_streaming_null_arguments_then_parameters() {
+        let tokens = [
+            "{\"name\": \"f\", \"arguments\": nu",
+            "ll, \"parameters\": {\"a\"",
+            ": 1}}",
+        ];
+        let calls = stream_calls(&LlamaJsonToolParser::new(), &tokens);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_streamed(&calls[0], "f", serde_json::json!({"a": 1}));
+    }
+
+    #[test]
+    fn test_jamba_streaming_split_name_and_arguments() {
+        let tokens = [
+            "<tool_calls>",
+            "[{\"name\": \"get_",
+            "weather\", \"arguments\": {\"un",
+            "it\": \"c\", \"city\": \"S",
+            "F\"}}, {\"name\": \"f",
+            "2\", \"arguments\": {}}]",
+            "</tool_calls>",
+        ];
+        let calls = stream_calls(&JambaToolParser::new(), &tokens);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_streamed(
+            &calls[0],
+            "get_weather",
+            serde_json::json!({"unit": "c", "city": "SF"}),
+        );
+        assert_streamed(&calls[1], "f2", serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_granite_streaming_split_name_and_arguments() {
+        let tokens = [
+            "<|tool_call|>",
+            "[{\"name\": \"get_",
+            "weather\", \"arguments\": {\"un",
+            "it\": \"c\", \"city\": \"S",
+            "F\"}}, {\"name\": \"f",
+            "2\", \"arguments\": {}}]",
+        ];
+        let calls = stream_calls(&GraniteToolParser::new(), &tokens);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_streamed(
+            &calls[0],
+            "get_weather",
+            serde_json::json!({"unit": "c", "city": "SF"}),
+        );
+        assert_streamed(&calls[1], "f2", serde_json::json!({}));
     }
 
     // -- Registry tests --
