@@ -428,6 +428,45 @@ impl<'f> ProgramReads<'f> {
         })
     }
 
+    /// The value `v` reads THROUGH rank plumbing — `tensor.expand_shape`,
+    /// `tensor.collapse_shape`, `linalg.broadcast` — or `v` itself when it states none.
+    ///
+    /// This is the question a fused-chain recogniser asks of an operand: "is this mulf's
+    /// operand, through the broadcast the program wraps it in, the round-r max-reduce's
+    /// result?" The walk is the SAME bounded back-walk `program_broadcast_chains` and the
+    /// rmsnorm reader's gain walk take (≤3 steps over the same three op kinds), because that
+    /// is the deepest rank plumbing this door's producers state. A deeper chain is a shape
+    /// none of them recognises either, so the walk stops at the value it reached and hands
+    /// the caller "not plumbing I resolve" rather than guessing past the bound.
+    ///
+    /// ⭐ FROM A BROADCAST'S RESULT THIS REACHES THE SAME VALUE `Bcast::src` NAMES: the chains
+    /// reader starts at the broadcast and walks its source; this starts at the result and
+    /// walks through the broadcast. One law, two entry points — a recogniser that asks
+    /// `through_plumbing(op.operand) == reduce_result` cannot disagree with one that looks
+    /// the operand up in the chains map.
+    ///
+    /// ⛔ THIS IS IDENTITY, NOT CONSUMPTION. It says which value the plumbing CARRIES; it
+    /// does not mark the plumbing ops consumed — `program_broadcast_chains` owns that for
+    /// the chains it recognises, and a composite recogniser collects its own interior (the
+    /// router's round ops, say) itself.
+    pub fn through_plumbing(&self, v: Ssa) -> Ssa {
+        let mut cursor = v;
+        for _ in 0..3 {
+            let Some(d) = self.def_of(cursor) else { break };
+            if !matches!(
+                d.op_type,
+                OpKind::TensorExpandShape | OpKind::TensorCollapseShape | OpKind::LinalgBroadcast
+            ) {
+                break;
+            }
+            let Some(src) = d.operands.first().copied() else {
+                break;
+            };
+            cursor = src;
+        }
+        cursor
+    }
+
     /// THE `Elementwise(Mul)` / `ScalarMul` TIEBREAK, read off ONE op rather than the whole
     /// function.
     ///
@@ -3255,5 +3294,77 @@ mod program_reads_tests {
             None,
             "a copy compares equal but is not the op at any position"
         );
+    }
+
+    /// `through_plumbing` reaches the value a rank chain CARRIES — the question a fused
+    /// recogniser asks of an operand — and agrees with the chains reader's `Bcast::src` from
+    /// the other entry point. The chain is the decoder's own (`[64] → [64, 1] → [64] →
+    /// broadcast`), the shape `broadcast_chain_tests` pins from `decoder_block.py`.
+    #[test]
+    fn through_plumbing_reaches_the_value_the_rank_chain_carries() {
+        let a: &'static Arena = Arena::global();
+        let (src, exp, col, emp, bc, m) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4), Ssa(5));
+        let f = IRFunction {
+            name: "plumbing_probe",
+            arguments: a.args(vec![(src, IrType::Index)]),
+            operations: a.ops(vec![
+                Operation::new(a, Some(exp), OpKind::TensorExpandShape, &[src]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[64, 1]),
+                ),
+                Operation::new(a, Some(col), OpKind::TensorCollapseShape, &[exp]),
+                Operation::new(a, Some(emp), OpKind::TensorEmpty, &[]),
+                Operation::new(a, Some(bc), OpKind::LinalgBroadcast, &[col, emp]),
+                Operation::new(a, Some(m), OpKind::ArithMulf, &[bc, src]),
+            ]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let reads = program_reads(&f);
+        assert_eq!(
+            reads.through_plumbing(bc),
+            src,
+            "from the broadcast's result: the same value `Bcast::src` names"
+        );
+        assert_eq!(
+            reads.through_plumbing(col),
+            src,
+            "the expand is plumbing too — the walk does not stop at the collapse"
+        );
+        assert_eq!(
+            reads.through_plumbing(m),
+            m,
+            "a computed value carries itself; the walk stops where the plumbing does"
+        );
+        assert_eq!(
+            reads.through_plumbing(src),
+            src,
+            "an argument carries itself"
+        );
+    }
+
+    /// ⛔ THE WALK IS BOUNDED AT THREE STEPS — the same bound the chains reader and the
+    /// rmsnorm gain walk state — so a fourth plumbing op is handed back unresolved rather
+    /// than guessed past. Pins the bound the method's doc states.
+    #[test]
+    fn through_plumbing_stops_at_the_same_three_step_bound() {
+        let a: &'static Arena = Arena::global();
+        // src <- e1 <- e2 <- e3 <- e4: four collapses deep.
+        let (src, e1, e2, e3, e4) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let f = IRFunction {
+            name: "deep_plumbing_probe",
+            arguments: a.args(vec![(src, IrType::Index)]),
+            operations: a.ops(vec![
+                Operation::new(a, Some(e1), OpKind::TensorCollapseShape, &[src]),
+                Operation::new(a, Some(e2), OpKind::TensorCollapseShape, &[e1]),
+                Operation::new(a, Some(e3), OpKind::TensorCollapseShape, &[e2]),
+                Operation::new(a, Some(e4), OpKind::TensorCollapseShape, &[e3]),
+            ]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let reads = program_reads(&f);
+        assert_eq!(reads.through_plumbing(e4), e1, "three steps up, not four");
     }
 }
