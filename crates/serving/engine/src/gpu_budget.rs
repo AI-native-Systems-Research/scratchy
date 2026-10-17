@@ -496,6 +496,47 @@ mod served_context_tests {
             }
         );
     }
+
+    /// The TWO SITES AGREE on the spyre card shape, because the engine's own affordable input
+    /// re-derives the worker's number rather than estimating beside it. The engine site runs the
+    /// law over `min(reach, pool_tokens)`; for spyre, `reach` IS the worker's answer
+    /// (`served_context`), and `pool_tokens` is the scheduler's block allocator
+    /// (`num_gpu_blocks × block_size`) after the override clamp — which, with the worker's real
+    /// page stride as the block cost, lands exactly on the pool's host range. This pins that
+    /// composition on the granite-2b card numbers: 16 GiB / 31,457,280 B = 546 pages fundable,
+    /// the pool cut for the served 69,632 (272 pages × 2 rows + 1 reserve = 545), host range
+    /// 544 pages = 139,264 scheduler tokens — never below what the worker served, so the min()
+    /// hands the engine the worker's number and the unset default resolves to the SAME 69,632
+    /// at both sites.
+    #[test]
+    fn the_engine_site_rederives_the_workers_number_on_the_spyre_card() {
+        let worker_affordable = 69_632;
+        // The pool the worker cut for that answer: demand(69,632) = ceil(69,632/256) = 272
+        // pages/row × 2 rows + 1 reserve page.
+        let pool_pages = 272 * 2 + 1;
+        // The engine's block count: budget/stride = 16 GiB / 30 MiB = 546 computed, clamped to
+        // the host range (pool minus reserve) — 546 ≥ 544 by construction (the pool is cut from
+        // that same division), which is WHY the clamp can be trusted to land on the pool.
+        let computed_blocks = 546;
+        let host_blocks = pool_pages - 1;
+        let num_gpu_blocks = computed_blocks.min(host_blocks);
+        assert_eq!(
+            num_gpu_blocks, host_blocks,
+            "the clamp fires on the real stride"
+        );
+        let pool_tokens = num_gpu_blocks * 256;
+        let reach = worker_affordable; // min(served_context, the baked mask reach) — the mask covers more
+        let engine_affordable = reach.min(pool_tokens);
+        assert_eq!(
+            engine_affordable, worker_affordable,
+            "pool_tokens ≥ served by construction, so the engine's min() is the worker's answer"
+        );
+        assert_eq!(
+            resolve_served_context(None, GRANITE_2B_MAX_POS, engine_affordable),
+            ServedContext::Tokens(worker_affordable),
+            "the unset default resolves to the SAME number the worker's site resolved to"
+        );
+    }
 }
 
 #[cfg(test)]

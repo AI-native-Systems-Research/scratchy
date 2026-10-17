@@ -502,6 +502,18 @@ pub(crate) struct Loaded {
     ///
     /// `None` on the paths that never size a paged pool (KTIR emulator, non-paged sessions).
     pub(crate) kv_budget_bytes: Option<u64>,
+    /// THE POOL'S PAGE STRIDE, in bytes — one page = every layer, each layer three planes (Knat, V,
+    /// Kᵀ) of `kv_dim` features across the plane's physical slot extent, at 2 bytes. Set beside
+    /// [`Self::kv_budget_bytes`] at the ONE site both are derived (the pool sizing in `load_model`),
+    /// because the ENGINE's block-count arithmetic divides the budget by this same stride
+    /// ([`Worker::kv_block_bytes`]): `num_gpu_blocks = budget/stride`, clamped to the host range.
+    /// With the real stride the clamp lands exactly on the pool's own host pages, so the scheduler's
+    /// block allocator and the pool are two views of one count — the engine's dense-row estimate
+    /// (no Kᵀ plane) overcounts the page by 4/3 and, the clamp only ever lowering, an
+    /// underestimated block count sailed under it unheard.
+    ///
+    /// `None` on the paths that never size a paged pool.
+    pub(crate) pool_stride_bytes: Option<u64>,
     /// ⭐ THE CONTEXT THIS RUN SERVES, in tokens — the ONE `--max-model-len` law's answer
     /// ([`scratchy_serving_engine::gpu_budget::resolve_served_context`]), decided once where
     /// budget, page stride and row count first meet (the pool sizing in `load_model`).

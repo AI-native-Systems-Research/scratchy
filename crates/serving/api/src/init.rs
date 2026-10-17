@@ -579,9 +579,19 @@ fn init_cache(
     let is_gpu_prebaked = (cfg!(feature = "cuda")
         && device != "cpu"
         && (device == "auto" || device.starts_with("cuda")))
-        || (cfg!(feature = "metal") && device != "cpu");
+        || (cfg!(feature = "metal") && device != "cpu")
+        // Spyre's `determine_available_memory` is, like metal's, the FINAL KV budget (the
+        // region-capped bytes the paged pool was cut from) — utilization is already baked in by
+        // the worker, or deliberately absent. This backend fell to the CPU branch only because
+        // the triage predates it, and the CPU branch's 50% halving sized the scheduler's
+        // allocator from half a pool: the 2b card run computed 204 blocks against a 544-page
+        // host range.
+        || (cfg!(feature = "spyre-hw") && device != "cpu");
     let is_cpu = device == "cpu"
-        || (device == "auto" && !cfg!(feature = "cuda") && !cfg!(feature = "metal"));
+        || (device == "auto"
+            && !cfg!(feature = "cuda")
+            && !cfg!(feature = "metal")
+            && !cfg!(feature = "spyre-hw"));
 
     let (kv_cache_bytes, utilization) = if is_gpu_prebaked {
         // Worker already computed: total * util - non_kv_cache (capped at

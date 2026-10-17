@@ -1084,6 +1084,12 @@ impl SpyreWorker {
         let served_context_v: usize;
         #[cfg(not(feature = "spyre-hw"))]
         let served_context_v: usize = usize::MAX;
+        // The paged pool's page stride — filled beside `kv_budget_bytes_v` (the SuperDsc branch
+        // below is the one site both are derived) so `Worker::kv_block_bytes` can hand the engine
+        // the same stride the pool was sized by. Card tier only: the emulator never sizes a pool,
+        // and the construction below carries `None` there.
+        #[cfg(feature = "spyre-hw")]
+        let mut pool_stride_bytes_v: Option<u64> = None;
         #[cfg(feature = "spyre-hw")]
         let session = {
             // ⛔ GUARD (mirror of the build-time flit-cap guard): an EMPTY group
@@ -1668,6 +1674,10 @@ impl SpyreWorker {
                 }
                 // Carry it to `Loaded` so the engine's own KV sizing reads this number and not a constant.
                 kv_budget_bytes_v = Some(pool_budget_bytes);
+                // And the stride beside it, so the engine's block-count arithmetic
+                // (`kv_block_bytes` → `budget/stride`, clamped to the host range) divides by the
+                // same page the pool was cut from — the two counts are then one count.
+                pool_stride_bytes_v = Some(pool_stride_bytes);
                 let num_blocks = {
                     // ⭐ THE POOL'S LAW LIVES ABOVE, ONCE — `pool_need_bytes` / `declared_pages` /
                     // `pool_stride_bytes` / `pool_demand` are the single derivation (hoisted there
@@ -2774,6 +2784,13 @@ impl SpyreWorker {
             prefill,
             batched_prefill,
             kv_budget_bytes: kv_budget_bytes_v,
+            pool_stride_bytes: {
+                #[cfg(feature = "spyre-hw")]
+                let stride = pool_stride_bytes_v;
+                #[cfg(not(feature = "spyre-hw"))]
+                let stride = None;
+                stride
+            },
             served_context: served_context_v,
         })
     }
