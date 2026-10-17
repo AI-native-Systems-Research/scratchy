@@ -278,9 +278,13 @@ fn check_stop_strings(
 
         // Python line 327: stop_index = output_text.find(stop_str, 1 - new_char_count - stop_string_len)
         let stop_string_len = stop_str.len();
+        // Byte arithmetic, where Python's is in characters: the window starts on a character, a
+        // few bytes earlier at most — a stop string wholly before it was searched for, and would
+        // have stopped generation, when that text was new (#576).
         let search_start = output_text
             .len()
             .saturating_sub(new_char_count + stop_string_len - 1);
+        let search_start = output_text.floor_char_boundary(search_start);
 
         if let Some(pos) = output_text[search_start..].find(stop_str) {
             let stop_index = search_start + pos;
@@ -370,6 +374,19 @@ mod tests {
         assert!(result.is_some());
         // "world" is checked first and matches.
         assert_eq!(result.unwrap().0, "world");
+    }
+
+    /// The search window's start falls inside a multi-byte character — `…` is 3 bytes — and is
+    /// moved to the character's start rather than panicking (#576).
+    #[test]
+    fn test_check_stop_strings_window_never_splits_a_character() {
+        let stops = vec!["STOP".to_string()];
+        // One new byte and a 4-byte stop string: the window starts 4 bytes from the end, inside `…`.
+        let text = "ab…cd";
+        assert!(check_stop_strings(text, 1, &stops, false).is_none());
+        // Two new bytes: the window starts 5 bytes from the end, inside `…`, and still finds it.
+        let found = check_stop_strings("…STOP", 2, &stops, false);
+        assert_eq!(found, Some(("STOP".to_string(), 3)));
     }
 
     #[test]
