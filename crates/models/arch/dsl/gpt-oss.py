@@ -23,6 +23,15 @@ def gpt_oss():
     hidden_states = embed(input_ids, embed_tokens)
     for layer in range(num_hidden_layers):
         normed = rmsnorm(hidden_states, input_layernorm[layer])
+        # An EAGLE-3 drafter compiled beside it (P-EAGLE) reads the residual stream entering
+        # each of its `eagle_aux_layers`, side by side; without one the set is empty. It is read
+        # after the layer's input norm — the fused add+norm that writes it — and before the
+        # attention's in-place residual add overwrites it. Nothing reads either arm's name: the
+        # `* 1.0` passthrough (the if/else merge-carry rule) runs no command.
+        if layer in eagle_aux_layers:
+            exported = export_hidden(hidden_states)
+        else:
+            exported = hidden_states * 1.0
         q = gemm(normed, self_attn.q_proj[layer])
         q = bias_add(q, self_attn.q_proj.bias[layer])
         k = gemm(normed, self_attn.k_proj[layer])

@@ -846,6 +846,20 @@ impl ActivationWidth {
     }
 }
 
+/// A row concatenation's operand widths: `out[t] = a[t] ++ b[t]` is `a + b` wide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct ConcatWidths {
+    pub a: ActivationWidth,
+    pub b: ActivationWidth,
+}
+
+impl ConcatWidths {
+    /// The output row's width.
+    pub fn out(self) -> u32 {
+        self.a.get() + self.b.get()
+    }
+}
+
 /// Where the worker should source the buffer for a binding at worker
 /// init time.
 ///

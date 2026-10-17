@@ -1946,13 +1946,28 @@ impl Recording<'_> {
                     Vec::new(),
                 )
             }
-            L::Concat { cols } => {
-                let (a, b, out) = (self.read(i, 0)?, self.read(i, 1)?, out()?);
-                let width = st::ActivationWidth::of_cols(cols / 2);
-                em(S::Concat(a, b, out, width), &[a, b], &[out], Vec::new())
+            // One operand is its copy: `b` is `a` again, no column of it written.
+            L::Concat { left, cols } => {
+                let a = self.read(i, 0)?;
+                let b = match left == cols {
+                    true => a,
+                    false => self.read(i, 1)?,
+                };
+                let out = out()?;
+                let widths = st::ConcatWidths {
+                    a: st::ActivationWidth::of_cols(left),
+                    b: st::ActivationWidth::of_cols(cols - left),
+                };
+                em(S::Concat(a, b, out, widths), &[a, b], &[out], Vec::new())
             }
-            L::LoadRows { source, .. } => {
-                em(S::LoadRows(out()?, source), &[], &[out()?], Vec::new())
+            L::LoadRows { source, width } => {
+                let width = st::ActivationWidth::of_cols(width);
+                em(
+                    S::LoadRows(out()?, source, width),
+                    &[],
+                    &[out()?],
+                    Vec::new(),
+                )
             }
             L::Elementwise(E::Gelu) => unary(&|i, o, w| S::Activation(i, o, w, Act::GeluTanh))?,
             L::Elementwise(E::QuickGelu) => {

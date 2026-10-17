@@ -23,7 +23,7 @@
 //! - a step already absorbed is never absorbed again, except by a gated activation's
 //!   projections, which fold unconditionally once the activation has.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::handoff::{LoweredDecode, SourceBinding};
 use crate::lower::GemmWeightKind;
@@ -439,6 +439,8 @@ pub struct TapeFolds<K> {
     absorbed_ops: Vec<(usize, usize)>,
     /// The epilogues [`TapeFolds::role`] lowers as epilogues, by source op.
     epilogue_ops: Vec<(usize, usize)>,
+    /// The steps read after the forward ran ([`fold_tape`]'s observed ops).
+    observed: BTreeSet<SlotId>,
 }
 
 impl<K> TapeFolds<K> {
@@ -497,6 +499,7 @@ impl<K> TapeFolds<K> {
                 .filter(|(_, f)| matches!(f.shape, FusedShape::NormedRope { .. }))
                 .map(|(d, _)| d)
                 .collect(),
+            observed: self.observed.clone(),
         }
     }
 }
@@ -1652,6 +1655,7 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
                 .collect()
         };
         TapeFolds {
+            observed: self.observed.iter().map(|&o| slot[o]).collect(),
             absorbed_ops: (self.absorbed.iter().enumerate())
                 .filter_map(|(j, w)| w.map(|w| (j, w)))
                 .collect(),

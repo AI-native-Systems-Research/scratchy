@@ -50,6 +50,15 @@ pub struct PublishedAs {
     pub repo: String,
 }
 
+/// `parallel_drafting` (arch.json): where a parallel-drafting head's placeholders are — the config
+/// key naming its mask token (P-EAGLE's `ptd_token_id`) and the checkpoint tensor holding the
+/// target hidden states its mask rows read (`mask_hidden`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParallelDraftingSpec {
+    pub mask_token_key: String,
+    pub mask_hidden: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DeclaredArchSpec {
     pub safetensors: Option<VisionSafetensorsLayout>,
@@ -109,6 +118,10 @@ pub struct DeclaredArchSpec {
     /// writes none and has no KV pool of its own; each layer reads the target layer its config's
     /// overrides name for its class (`target_kv_sliding_layer`, `target_kv_full_layer`).
     pub reads_target_kv: bool,
+    /// The head drafts every token past its first in one forward (P-EAGLE): its rows past a
+    /// sequence's newest read a placeholder token and placeholder target hidden states. `None`:
+    /// each draft past the first chains on the one before it.
+    pub parallel_drafting: Option<ParallelDraftingSpec>,
     /// The weights a head borrows from its target (`embed_tokens`, `lm_head`); `None`: both.
     pub borrows: Option<Vec<String>>,
     /// Weights at the checkpoint's top level beside the decoder root, as `lm_head` is.

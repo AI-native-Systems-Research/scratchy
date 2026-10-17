@@ -27,7 +27,7 @@ pub use backend::{
 };
 pub use mtp::{
     Chain, DraftBudget, Drafting, HeadPasses, MtpDrafter, MtpProposer, MtpProposerConfig, PassOne,
-    StepRows,
+    PastFirst, StepRows,
 };
 pub use ngram::{NgramProposer, NgramProposerConfig};
 pub use proposer::{DraftModelProposer, DraftSeedInputs, Proposer, ProposerStepCtx};

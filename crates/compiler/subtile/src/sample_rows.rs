@@ -128,6 +128,7 @@ pub fn expand_sample_rows(
     }
     x.input.ops.splice(r..=r, construct);
     x.input.result = at(l.input.result);
+    x.input.exported = l.input.exported.map(at);
     // The gather is its activation's buffer; the scatter and the all-rows matmul the matmul's.
     let rows_tile = match *rows {
         InputRef::Op(j) => l.op_tiles[j],

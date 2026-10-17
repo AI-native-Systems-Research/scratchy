@@ -1,0 +1,38 @@
+{
+  "_comment": "AWS's P-EAGLE drafters (arXiv 2602.01469): EAGLE-3 trained to draft every token of a step in one forward, its rows past the newest reading learned placeholders (the `ptd_token_id` token's embedding and `mask_hidden`, which vLLM's `parallel_drafting` loads the same way). It ships as its own checkpoint with its own config, whose `architectures` reads `LlamaForCausalLM`, so it names its target config (`head_targets`). It drafts only when `--speculative-model` names a checkpoint of it (`spec/mtp` compiles it): AWS publishes only its bf16 drafter, which reads 1.4 GB a pass, and no conversion of it is published yet. One draft a step (`spec_drafts`): a verify step's MoE reads each row's experts, so on a base M5 (gpt-oss-20b at MLX 4-bit, one request, greedy) a two-row verify step costs 1.40x a decode step and a four-row one 2.06x; one draft at 1.66-1.73 tokens a step runs 59.4-65.9 tok/s against 57.9-59.7 alone (+2% on a story, +7% on code, +11% copying a paragraph), at 18-23% more time to first token on a 2.5k-token prompt (its KV pass over every prompt row), where three drafts at 2.38-2.46 tokens a step ran 54.5 (with MLPs at 4 bits and attention at 8). Its tensors sit at the file's top level (`decoder_safetensors_prefix` empty): its first layer as `midlayer.*`, the rest as `layers.<L>.*`. The `-mixed` stem is an MLX conversion at group 64 — MLPs at 3 bits, attention and `fc` at 4, the embedding at 8 — that drafts as many tokens a step as one with attention and the embedding at 8 bits: a 4-bit embedding loses most of the mask rows' acceptance (an MLX transcription of vLLM's drafter: 2.30 -> 1.80 tokens a step). It borrows only its target's lm_head (`borrows`): AWS froze it in training, so the drafter's own copy is the target's bit for bit; its embedding it trained, so that one is its own. It drafts over its target vocabulary's first 65536 ids (`vocab_size`, the lm_head rows it reads), as Qwen3.5's head does; its embedding keeps every id (`embed_vocab_size`), the mask token's (201020) among them. `target_hidden_size` is the width of the three target hidden states `fc` fuses.",
+  "hf_architectures": [
+    "LlamaForCausalLM"
+  ],
+  "head_targets": {
+    "gpt-oss-20b-p-eagle": "gpt-oss/gpt-oss-20b",
+    "gpt-oss-20b-p-eagle-mixed": "gpt-oss/gpt-oss-20b"
+  },
+  "parallel_drafting": {
+    "mask_token": "ptd_token_id",
+    "mask_hidden": "mask_hidden"
+  },
+  "borrows": [
+    "lm_head"
+  ],
+  "decoder_safetensors_prefix": "",
+  "scale_dtype": "bf16",
+  "bound_defaults": {
+    "spec_drafts": 1,
+    "spec_verify_rows": 8
+  },
+  "params": [
+    {
+      "name": "embed_vocab_size",
+      "from": "vocab_size"
+    },
+    {
+      "name": "vocab_size",
+      "value": 65536,
+      "replaces": true
+    },
+    {
+      "name": "target_hidden_size",
+      "expr": "3 * hidden_size"
+    }
+  ]
+}

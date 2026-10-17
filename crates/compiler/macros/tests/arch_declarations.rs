@@ -31,9 +31,11 @@ const KNOWN_KEYS: &[&str] = &[
     "hf_architectures",
     "drafter_repo_infix",
     "head_targets",
+    "published_as",
     "checkpoint_of",
     "checkpoint_prefix",
     "reads_target_kv",
+    "parallel_drafting",
     "borrows",
     "top_level_weights",
     "scale_dtype",
@@ -203,5 +205,5 @@ fn no_dsl_file_declares_anything_but_math() {
         }
         seen += 1;
     }
-    assert_eq!(seen, 31, "expected 31 DSL files, found {seen}");
+    assert_eq!(seen, 33, "expected 33 DSL files, found {seen}");
 }

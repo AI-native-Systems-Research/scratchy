@@ -302,6 +302,9 @@ pub struct MetalWorker {
     /// The passes of a multi-token-prediction head (a `draft_model` that reads the target's
     /// hidden states), run at the end of a step the engine planned drafts for.
     mtp_drafter: Option<::scratchy_serving_engine::spec_decode::MtpDrafter>,
+    /// A parallel-drafting head's placeholder target hidden row (P-EAGLE's `mask_hidden`, the
+    /// model dtype): what each of its rows past a sequence's newest reads.
+    mask_hidden: Option<Vec<u8>>,
     /// Compiled on-GPU token sampler (temperature / top-k / top-p / min-p +
     /// penalties). Cached once at load_model alongside `argmax_kernels`; used
     /// only for non-greedy requests (greedy decode stays on the argmax path).
@@ -1031,6 +1034,7 @@ impl MetalWorker {
             argmax_kernels: None,
             draft_argmax_kernels: None,
             mtp_drafter: None,
+            mask_hidden: None,
             sampler_kernels: None,
             sampler_arena: None,
             sampler_logits: None,
@@ -1762,11 +1766,36 @@ impl MetalWorker {
         draft_weights.set_target_dtype(GpuDType::BF16);
         // A multi-token-prediction head carries no embedding or lm_head: lend it the target's,
         // from the target store's refs (same mmap → no second upload).
-        if let Some(head) = scratchy_forward_compiler::draft_head(&draft_arch) {
+        let has_key = |key: &str| draft_hf_config.extra.contains_key(key);
+        if let Some(head) = scratchy_forward_compiler::draft_head(&draft_arch, &has_key) {
+            use ::scratchy_serving_engine::spec_decode::PastFirst;
+            // A parallel-drafting head's placeholder target hidden row is a tensor of its
+            // checkpoint its forward never binds: the worker lays it out for the rows that read it.
+            let past_first = match head.parallel {
+                None => PastFirst::Chained,
+                Some(parallel) => {
+                    let fail = |why: String| {
+                        ExecutorError::WorkerInit(format!(
+                            "MTP head: {}: {why}",
+                            parallel.mask_hidden
+                        ))
+                    };
+                    let (bytes, dtype, _) = (draft_weights.take_to_cpu_bytes(parallel.mask_hidden))
+                        .map_err(|e| fail(e.to_string()))?;
+                    if dtype != GpuDType::BF16 {
+                        return Err(fail(format!("{dtype:?}, not the head's bf16")));
+                    }
+                    self.mask_hidden = Some(bytes);
+                    PastFirst::Parallel {
+                        mask_token: parallel.mask_token,
+                    }
+                }
+            };
             self.mtp_drafter = Some(::scratchy_serving_engine::spec_decode::MtpDrafter {
                 budget: draft_budget(&head),
                 max_model_len: self.max_model_len(),
                 reads_target_kv: head.reads_target_kv,
+                past_first,
             });
             let (Some(target), Some(refs)) =
                 (self.model.as_deref(), self.target_tensor_refs.as_ref())
@@ -1782,6 +1811,13 @@ impl MetalWorker {
                 let from = target.lent_weight_prefix(w).ok_or_else(|| {
                     ExecutorError::WorkerInit(format!("MTP head: the target has no {w:?} to lend"))
                 })?;
+                let own = draft_weights.shadow(to);
+                if own > 0 {
+                    info!(
+                        "ScratchyWorker(metal): MTP head reads its target's {w:?}, not the {own} \
+                         tensors of its own under {to}"
+                    );
+                }
                 let lent = draft_weights
                     .lend(refs, from, to, head.rows(w))
                     .map_err(|e| {
@@ -1972,18 +2008,23 @@ impl MetalWorker {
         let model = (self.draft_model.as_deref()).ok_or_else(|| fail("no head"))?;
         let device = (self.gpu_device.as_ref()).ok_or_else(|| fail("no device"))?;
         let rope_bytes = model.metal_rope_rows(&[0]).map_or(0, |row| row.len());
-        // A head's hidden rows, read and exported, are its target's width.
-        let target = (self.model.as_deref()).ok_or_else(|| fail("no target"))?;
-        let layout = ChainLayout::of(Some(drafting), target.hidden_size() as usize, rope_bytes);
+        // A head's target hidden rows, read and exported: its target's width, or several of its
+        // target's hidden states side by side.
+        let width = model.target_hidden_width() as usize;
+        let layout = ChainLayout::of(Some(drafting), width, rope_bytes);
         let buffer = free_chain_buffer(
             &mut self.mtp_chain_buffers,
             &device.device,
             device.allocator.residency(),
             layout.bytes,
         );
-        layout.write(&drafting.chain, &buffer.0, |positions| {
-            model.metal_rope_rows(positions)
-        });
+        let rope_rows = |positions: &[u32]| model.metal_rope_rows(positions);
+        layout.write(
+            &drafting.chain,
+            &buffer.0,
+            rope_rows,
+            self.mask_hidden.as_deref(),
+        );
         Ok(Some((layout, buffer, behind)))
     }
 
@@ -3795,9 +3836,7 @@ impl MetalWorker {
                 let (layout, buffer, behind) = match self.pending_chain.take() {
                     Some((layout, buffer, behind)) => (layout, Some(buffer), behind),
                     None => {
-                        let target = (self.model.as_deref())
-                            .ok_or_else(|| BackendError::Backend("target not loaded".into()))?;
-                        let width = target.hidden_size() as usize;
+                        let width = model.target_hidden_width() as usize;
                         let drafting = passes.drafting.as_ref();
                         (ChainLayout::of(drafting, width, rope_bytes), None, false)
                     }
@@ -4134,8 +4173,10 @@ struct ChainLayout {
     n: usize,
     /// The head's most drafts each: a sequence's room in the next-pass tables and the drafts.
     k: usize,
-    /// Head passes: the drafts each gets.
+    /// Head passes: pass 1 and the chained ones.
     passes: usize,
+    /// The rows a sequence each chained pass runs (one a draft it makes).
+    rows: usize,
     hidden_bytes: usize,
     /// An MRoPE head's rotary cos/sin row (0: its rope reads positions).
     rope_bytes: usize,
@@ -4152,7 +4193,8 @@ impl ChainLayout {
     const SEQS: usize = 0;
     const DRAFTED: usize = 1;
     const NEXT: usize = 2;
-    /// Per argmax `batch`, then per chain pass its depth, then pass 1's window start.
+    /// Per argmax `batch`, then per chain pass its depth, then pass 1's window start, then the
+    /// rows a sequence a chained pass runs.
     const CONSTS: usize = 3;
     const PICKED: usize = 4;
     const ACCEPTED: usize = 5;
@@ -4180,33 +4222,41 @@ impl ChainLayout {
         let token_rows = drafting.map_or(&[][..], |d| &d.one.token_rows);
         let rows = token_rows.iter().map(|&(row, _)| row);
         let window = rows.clone().min().unwrap_or(0)..rows.max().map_or(0, |r| r + 1);
-        let (n, drafted, k, passes) = match drafting.map(|d| &d.chain) {
-            Some(c) => (c.num_seqs(), c.drafted.len(), c.drafts(), c.passes()),
-            None => (0, 0, 0, 0),
+        let (n, drafted, k, passes, rows) = match drafting.map(|d| &d.chain) {
+            Some(c) => (
+                c.num_seqs(),
+                c.drafted.len(),
+                c.drafts(),
+                c.passes(),
+                c.rows(),
+            ),
+            None => (0, 0, 0, 0, 1),
         };
         let hidden_bytes = hidden * 2;
-        let (rows, seqs) =
+        // A chained pass's rows; pass 1's, and its sequences.
+        let chained = n * rows;
+        let (one_rows, seqs) =
             drafting.map_or((0, 0), |d| (d.one.positions.len(), d.one.seqused_k.len()));
         let u32s = |count: usize| count * size_of::<u32>();
         let sizes = [
             u32s(3 * n),
             u32s(drafted),
-            u32s(passes * n * (k + 1) * 3),
-            u32s(2 * passes + 1),
-            u32s((window.len()).max(n)),
+            u32s(passes * n * (k + 1) * rows * 3),
+            u32s(2 * passes + 2),
+            u32s((window.len()).max(chained)),
             u32s(n),
+            u32s(chained),
+            u32s(chained),
+            u32s(chained),
             u32s(n),
-            u32s(n),
-            u32s(n),
-            u32s(n),
-            n * hidden_bytes,
+            chained * hidden_bytes,
             u32s(n * k),
             passes * n * (k + 1) * rope_bytes,
             n * rope_bytes,
-            u32s(rows),
-            u32s(rows),
+            u32s(one_rows),
+            u32s(one_rows),
             u32s(seqs),
-            rows * rope_bytes,
+            one_rows * rope_bytes,
         ];
         let mut at = [0; 18];
         let mut bytes = 0;
@@ -4218,6 +4268,7 @@ impl ChainLayout {
             n,
             k,
             passes,
+            rows,
             hidden_bytes,
             rope_bytes,
             window,
@@ -4227,13 +4278,15 @@ impl ChainLayout {
     }
 
     /// The host's tables: the chain's sequences, drafted tokens and next-pass tables — with an
-    /// MRoPE head's rope rows at each next pass's positions (`rope_rows`) — and the constants each
-    /// dispatch reads.
+    /// MRoPE head's rope rows at each next pass's positions (`rope_rows`) — its chained passes'
+    /// tokens, a parallel-drafting head's `placeholder` target hidden row under every row of its
+    /// pass, and the constants each dispatch reads.
     fn write(
         &self,
         chain: &::scratchy_serving_engine::spec_decode::Chain,
         buffer: &scratchy_target_metal::mtl4_dispatch::Buffer,
         rope_rows: impl Fn(&[u32]) -> Option<Vec<u8>>,
+        placeholder: Option<&[u8]>,
     ) {
         let put_bytes = |at: usize, bytes: &[u8]| {
             // SAFETY: the buffer holds `self.bytes`, every section sized for what it holds; no
@@ -4253,6 +4306,14 @@ impl ChainLayout {
         put(Self::SEQS, chain.seqs.as_flattened());
         put(Self::DRAFTED, &chain.drafted);
         put(Self::NEXT, &chain.next.concat());
+        // A chained head's tokens the device picks over these; a parallel head's are its mask
+        // token, and its rows' target hidden states its placeholder.
+        put(Self::IDS, &chain.input_ids);
+        if let Some(row) = placeholder {
+            for r in 0..self.n * self.rows {
+                put_bytes(self.at[Self::HIDDEN] + r * row.len(), row);
+            }
+        }
         if self.rope_bytes > 0 {
             let table = self.n * (self.k + 1) * self.rope_bytes;
             for (d, next) in chain.next.iter().enumerate() {
@@ -4262,9 +4323,10 @@ impl ChainLayout {
             }
         }
         let batches = std::iter::once(self.window.len() as u32)
-            .chain((1..self.passes).map(|_| self.n as u32));
+            .chain((1..self.passes).map(|_| (self.n * self.rows) as u32));
         let depths = 1..=self.passes as u32;
-        let consts: Vec<u32> = batches.chain(depths).chain([self.window.start]).collect();
+        let tail = [self.window.start, self.rows as u32];
+        let consts: Vec<u32> = batches.chain(depths).chain(tail).collect();
         put(Self::CONSTS, &consts);
     }
 
@@ -4370,31 +4432,35 @@ impl<'a> HeadPassesEncoder<'a> {
         creq.sliding_block_tables = &ctable_refs;
         creq.sliding_slot_mappings = &cslot_refs;
         let n = layout.n;
+        // A chained pass's rows: `rows` a sequence.
+        let chained = n * layout.rows;
         // An MRoPE head reads its rope rows in place of positions, which index them.
         let position = match layout.rope_bytes {
-            0 => layout.input(buffer, ChainLayout::POSITIONS, n * 4, Into::Positions),
+            0 => layout.input(buffer, ChainLayout::POSITIONS, chained * 4, Into::Positions),
             rope => layout.input(buffer, ChainLayout::NEXT_ROPE, n * rope, Into::RopeRows),
         };
         let inputs = [
-            layout.input(buffer, ChainLayout::IDS, n * 4, Into::InputIds),
+            layout.input(buffer, ChainLayout::IDS, chained * 4, Into::InputIds),
             position,
-            layout.input(buffer, ChainLayout::SLOTS, n * 4, Into::SlotMapping),
+            layout.input(buffer, ChainLayout::SLOTS, chained * 4, Into::SlotMapping),
             layout.input(buffer, ChainLayout::USED, n * 4, Into::SeqUsedK),
             layout.input(
                 buffer,
                 ChainLayout::HIDDEN,
-                n * row_bytes,
+                chained * row_bytes,
                 Into::TargetHidden,
             ),
         ];
         for depth in 1..=layout.passes {
             if depth > 1 {
-                let ctx = head_ctx(self.kv_cache, &creq, &inputs, false, Reads::Outputs);
+                // A pass of several rows a sequence drafts at every one of them.
+                let spec = creq.has_spec_tokens;
+                let ctx = head_ctx(self.kv_cache, &creq, &inputs, spec, Reads::Outputs);
                 // SAFETY: as pass 1's.
                 unsafe {
                     onto.then(
                         scratchy_target_metal::ForwardCtxHandle::new(&ctx),
-                        n as u64,
+                        chained as u64,
                         enc,
                     )
                 }?;
@@ -4403,7 +4469,11 @@ impl<'a> HeadPassesEncoder<'a> {
             let first = if depth == 1 { layout.window.start } else { 0 };
             let logits =
                 onto.logits().gpuAddress() + u64::from(first) * u64::from(onto.vocab()) * 2;
-            let batch = if depth == 1 { layout.window.len() } else { n };
+            let batch = if depth == 1 {
+                layout.window.len()
+            } else {
+                chained
+            };
             let consts = |i: usize| layout.address(buffer, ChainLayout::CONSTS) + (i * 4) as u64;
             let picked = layout.address(buffer, ChainLayout::PICKED);
             let argmax_table = argument_table(&self.device, &[logits, picked, consts(depth - 1)])?;
@@ -4416,7 +4486,7 @@ impl<'a> HeadPassesEncoder<'a> {
             .map_err(|e| format!("encode head argmax: {e:?}"))?;
             let at = |section| layout.address(buffer, section);
             let table = (depth - 1) * n * (layout.k + 1);
-            let next = at(ChainLayout::NEXT) + (table * 3 * 4) as u64;
+            let next = at(ChainLayout::NEXT) + (table * layout.rows * 3 * 4) as u64;
             let rope = at(ChainLayout::ROPE) + (table * layout.rope_bytes) as u64;
             let bindings = [
                 picked,
@@ -4436,6 +4506,7 @@ impl<'a> HeadPassesEncoder<'a> {
                 consts(2 * layout.passes),
                 rope,
                 at(ChainLayout::NEXT_ROPE),
+                consts(2 * layout.passes + 1),
             ];
             let chain_table = argument_table(&self.device, &bindings)?;
             let n = n as u32;

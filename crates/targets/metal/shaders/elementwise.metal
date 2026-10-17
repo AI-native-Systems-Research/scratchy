@@ -37,14 +37,15 @@ SCRATCHY_KERNEL(copy_rows_bf16, copy_rows<bfloat>)
 
 // ── Row concatenation: out[t] = a[t] ++ b[t] ────────────────────────────────
 //
-// `KernelId::ConcatRows`: two same-width activations side by side — an MTP head's
-// input fusion (`fc(concat(norm(embed), norm(hidden)))`). out @ buffer(0), a @ 1,
-// b @ 2; one thread per output element. `CONCAT_ROWS_N` (slot 6) is the output
-// element count (the m_scaling tail is a no-op), `CONCAT_ROWS_WIDTH` (slot 7) each
-// operand's row width.
-#if defined(SCRATCHY_CONSTANT_6) && defined(SCRATCHY_CONSTANT_7)
+// `KernelId::ConcatRows`: two activations side by side — an MTP head's input fusion
+// (`fc(concat(norm(embed), norm(hidden)))`), or a forward's exported hidden states,
+// each after the ones before it. out @ buffer(0), a @ 1, b @ 2; one thread per output
+// element. `CONCAT_ROWS_N` (slot 6) is the output element count (the m_scaling tail is
+// a no-op), `CONCAT_ROWS_WIDTH_A` / `_B` (slots 7, 8) the operands' row widths.
+#if defined(SCRATCHY_CONSTANT_6) && defined(SCRATCHY_CONSTANT_7) && defined(SCRATCHY_CONSTANT_8)
 SCRATCHY_CONSTANT(uint, CONCAT_ROWS_N, 6);
-SCRATCHY_CONSTANT(uint, CONCAT_ROWS_WIDTH, 7);
+SCRATCHY_CONSTANT(uint, CONCAT_ROWS_WIDTH_A, 7);
+SCRATCHY_CONSTANT(uint, CONCAT_ROWS_WIDTH_B, 8);
 
 template <typename T>
 [[kernel]] void concat_rows(
@@ -54,10 +55,12 @@ template <typename T>
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= CONCAT_ROWS_N) return;
-    uint row = gid / (2u * CONCAT_ROWS_WIDTH);
-    uint col = gid % (2u * CONCAT_ROWS_WIDTH);
-    out[gid] = col < CONCAT_ROWS_WIDTH ? a[row * CONCAT_ROWS_WIDTH + col]
-                                       : b[row * CONCAT_ROWS_WIDTH + col - CONCAT_ROWS_WIDTH];
+    const uint width = CONCAT_ROWS_WIDTH_A + CONCAT_ROWS_WIDTH_B;
+    uint row = gid / width;
+    uint col = gid % width;
+    out[gid] = col < CONCAT_ROWS_WIDTH_A
+        ? a[row * CONCAT_ROWS_WIDTH_A + col]
+        : b[row * CONCAT_ROWS_WIDTH_B + col - CONCAT_ROWS_WIDTH_A];
 }
 #endif
 
