@@ -2909,11 +2909,13 @@ impl GatherIndex {
     /// path reads it); tensor order `[INPUT, KERNEL, INDEX, OUTPUT]` with array position ==
     /// `ldsIdx_`.
     ///
-    /// ⛔ THE BAKE NEEDS `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1`. The exploration path
+    /// ⛔ ITS GROUP COMPILES WITH `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1`. The exploration path
     /// (`calculateFlopPerByte`) demands transfer users on the index's HBM alloc that only a pass
-    /// AFTER `addChunkDataStage` creates — a vendor ordering gap, not a gather prohibition; the env
-    /// skips it and does not affect plain bundles (control `RC=0` with and without). It is a BAKE-time
-    /// setting on the dxp invocation, never a target-crate behavior toggle.
+    /// AFTER `addChunkDataStage` creates — a vendor ordering gap, not a gather prohibition. The bake
+    /// reads this shape off the group's descriptors and sets the knob on THAT group's dxp child only
+    /// (`superdsc_bake::ChunkExplore`). ⚠️ "Does not affect plain bundles" was a compile verdict
+    /// (`RC=0` both ways), not a performance one: a plain group compiled with the explorer off is
+    /// valid and SLOWER — granite-2b fp16 TTFT 18.1 s vs 8.8 s at a 35300-token prompt.
     ///
     /// ⛔ THE WORK DIVISION MUST SPLIT `mb` ONLY. `skip_addr` is the pin (1) × the per-core extents
     /// of the UNPINNED dims, so one expert plane is `in·out` only while `in` and `out` stay whole —

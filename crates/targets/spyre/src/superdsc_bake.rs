@@ -53,6 +53,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+use crate::lower_subtile_tape_to_superdsc::SdscOp;
 use scratchy_spyre_bundle::correction;
 // The dxp-group descriptor ceiling — ONE const, owned by the leaf crate beside the window-chunk
 // split that targets it (re-exported from `lower_subtile_tape_to_superdsc` under this same name
@@ -598,6 +599,17 @@ fn substr(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// The dxp knobs one compile SETS, and so the ones whose silent non-read would change it (a knob
+/// whose absence fails loudly — `DEEPTOOLS_PATH` missing → dxp refuses to start; `DUMP_SPYRE_CODE`
+/// missing → no `spyreCodeDir/`, which the runtime's marker check catches — is not listed).
+fn knobs_for(explore: ChunkExplore) -> Vec<&'static str> {
+    let mut knobs = vec!["DT_PARALLEL_THREADS"];
+    if explore == ChunkExplore::Skip {
+        knobs.push(ChunkExplore::KNOB);
+    }
+    knobs
+}
+
 /// The pure form of [`DxpTool::env_knob_guard`]'s check: every knob name must appear as a
 /// literal in one of the toolchain's own artifacts (the binary or a library it loads), because a
 /// name `dtGetEnv` cannot match is a name the toolchain silently ignores. `artifacts` are read in
@@ -987,12 +999,77 @@ pub struct CompiledGroup {
     pub correction: Vec<u8>,
 }
 
+/// ⭐⭐⭐ WHETHER dxp's CHUNK-PARAMETER EXPLORER RUNS ON A GROUP — a fact of the group's own ops, read
+/// off the descriptors it is about to compile, never a setting of the bake.
+///
+/// `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1` (`L3DlOpsScheduler::run`, :9007-9012) sets
+/// `enableChunkExplore = false`, and ONE shape needs that: a KERNEL read through a gather index (the
+/// token-plane gathered expert gemm, `GatherIndex::of_expert_planes`). `calculateFlopPerByte`
+/// (L3DlOpsScheduler.cpp:2417) runs only inside the exploration and demands an LX `memOrg_` entry plus
+/// an LX allocate node for every HBM-pinned labeledDs, which an index never has (`allocAllMem` stages
+/// arithmetic operands only), so with the explorer on that group refuses
+/// (`Expect LX in labeledDs memOrg_.`, :2498).
+///
+/// ⛔⛔⛔ AND THE EXPLORER IS HOW EVERY OTHER GROUP GETS ITS LX CHUNKING. Setting the knob on every
+/// child — what this replaced — compiled every group of every model without it. MEASURED on
+/// granite-3.1-2b fp16 (cores 48-95, no cargo live, back to back), the knob dropped from every group
+/// vs set on every group: TTFT p64 154.9 → 113.0 ms, 3700 tokens 1092.9 → 672.0 ms, 35300 tokens
+/// 18100.6 → 8846.3 ms, ITL back to the pre-knob build's; on granite-3.1-8b fp16 at a 10,086-token
+/// prompt the decode step's score group went 97.4 → 43.3 ms and ITL p50 305.9 → 233.1 ms. Same
+/// descriptors in both builds — only dxp's schedule moved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ChunkExplore {
+    /// The explorer runs — dxp's default, and what every group without a gathered kernel compiles
+    /// under.
+    Run,
+    /// The explorer is off for this group's compile, and ONLY this group's.
+    Skip,
+}
+
+impl ChunkExplore {
+    /// The deeptools knob, spelled once. `env_knob_guard` checks the toolchain reads exactly this name.
+    pub const KNOB: &'static str = "DISABLE_ABOVE_LX_CHUNK_EXPLORE";
+
+    /// What this setting contributes to the group's [`GroupDigest`] — the knob as the child sees it.
+    /// `Run` is a tag too, not an absence, so every digest written before the setting was per group
+    /// (all compiled with the explorer off) misses for every group.
+    pub fn digest_tag(self) -> &'static str {
+        match self {
+            ChunkExplore::Run => "DISABLE_ABOVE_LX_CHUNK_EXPLORE=",
+            ChunkExplore::Skip => "DISABLE_ABOVE_LX_CHUNK_EXPLORE=1",
+        }
+    }
+
+    /// The group's answer: [`Self::Skip`] if ANY of its trips reads a KERNEL through a gather index,
+    /// else [`Self::Run`]. A group is ONE dxp compile, so one such trip decides for the whole group.
+    ///
+    /// Read off the emitted descriptor — the exact predicate `emit_sdsc`'s gathered-KERNEL guard
+    /// admits on (`primaryDsInfo_` carries a `KERNEL` and the op names an indirect-access index) —
+    /// because that is what dxp sees. A kernel-less gather (the vendor's `identity` copy, whose roles
+    /// are `{OUTPUT, KERNEL_IDX}`) is not this shape and schedules with the explorer on.
+    pub fn of_group<'a>(trips: impl IntoIterator<Item = &'a SdscOp>) -> ChunkExplore {
+        let gathers_a_kernel = |op: &SdscOp| {
+            op.dscs_.iter().flat_map(|m| m.values()).any(|d| {
+                d.primaryDsInfo_.contains_key("KERNEL")
+                    && d.computeOp_
+                        .iter()
+                        .any(|c| !c.indirectAccessIndexLabeledDs.is_empty())
+            })
+        };
+        if trips.into_iter().any(gathers_a_kernel) {
+            ChunkExplore::Skip
+        } else {
+            ChunkExplore::Run
+        }
+    }
+}
+
 /// A group whose json is fully written in STAGING and which is therefore ready to compile, together
 /// with the identity its compiled output is reported under.
 ///
 /// A newtype rather than a path and a name because submitting a HALF-WRITTEN group is the one mistake
 /// that yields a corrupt device binary instead of an error, and the only constructor is
-/// [`Self::sealed`], called at the single site that has just written the group's last file.
+/// [`Self::of_rendered`], called at the single site that has just written the group's last file.
 #[derive(Clone, Debug)]
 pub struct SealedGroup {
     stage: PathBuf,
@@ -1008,29 +1085,40 @@ pub struct SealedGroup {
     /// fused twin, so identical group content recurs constantly — 42% of dxp invocations were
     /// recompiling input they had already seen.
     key: GroupDigest,
+    /// Whether this group's dxp child runs the chunk-parameter explorer — part of what dxp reads, so
+    /// it is part of `key` too.
+    explore: ChunkExplore,
 }
 
 impl SealedGroup {
-    /// The caller asserts every `sdsc_*.json` AND `bundle.mlir` for this group is in `stage`, that
-    /// `staged_bytes` is what it reserved from the [`StageBudget`], and that `key` hashes exactly the
-    /// per-op json dxp will read (so equal keys really do mean equal compiler input).
-    /// `id` is what the compiled output is reported under.
-    pub fn sealed(
+    /// The caller asserts every one of `rendered.files` is written into `stage` and that
+    /// `rendered.bytes` is what it reserved from the [`StageBudget`]. `id` is what the compiled output
+    /// is reported under.
+    ///
+    /// ⭐ TAKEN WHOLE FROM THE RENDER, not field by field: the key, the byte count and the explorer
+    /// setting are one decision about one group's compiler input, and a constructor that took them
+    /// separately is how a call site would hand dxp one group's json under another's setting.
+    pub fn of_rendered(
         stage: PathBuf,
         id: GroupId,
-        staged_bytes: usize,
-        key: GroupDigest,
+        rendered: &crate::lower_subtile_tape_to_superdsc::GroupInput,
     ) -> SealedGroup {
         SealedGroup {
             stage,
             id,
-            staged_bytes,
-            key,
+            staged_bytes: rendered.bytes,
+            key: rendered.key,
+            explore: rendered.explore,
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.stage
+    }
+
+    /// Whether this group's compile runs the chunk-parameter explorer.
+    pub fn explore(&self) -> ChunkExplore {
+        self.explore
     }
 }
 
@@ -1085,29 +1173,12 @@ impl DxpTool {
     /// is instantaneous and a bursty pool would look the same. The 448 s vs 680 s above is the
     /// evidence that 1 is not slower here — not the thread count.
     ///
-    /// `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1`:
-    /// ⛔⛔⛔ THE TOKEN-PLANE GATHERED-KERNEL SHAPE ONLY SCHEDULES WITH THE CHUNK-PARAMETER
-    /// EXPLORER OFF. `calculateFlopPerByte` (L3DlOpsScheduler.cpp:2417) runs only inside
-    /// that exploration (its callers at :2695/:2792) and demands an LX `memOrg_` entry
-    /// plus a non-null LX allocate node for EVERY HBM-pinned labeledDs — the gather index
-    /// can satisfy neither, because `allocAllMem` stages arithmetic operands only (an
-    /// index is read into the IBR). `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1`
-    /// (`L3DlOpsScheduler::run`, :9007-9012) sets `enableChunkExplore = false` and the
-    /// explorer — and its check — never runs. This is the admission contract behind
-    /// `emit_sdsc`'s gathered-KERNEL guard: the ONE schedulable shape
-    /// (`GatherIndex::of_expert_planes`, the expert gemm's per-pair gather) was
-    /// probe-proven RC=0 with this knob set; tonight's 26b group_13 refusal
-    /// (`Expect LX in labeledDs memOrg_.`, :2498) was the SAME shape compiled with the
-    /// knob SILENTLY UNSET — the round scripts carried the drifted spelling
-    /// `…EXPLODE` (with a D), which this deeptools build ignores; the correctly-spelled
-    /// knob compiles the exact refusing group RC=0 (card-side dxp repro, 2026-10-13).
-    /// Set HERE, on the child, so no ambient script can forget or misspell it;
-    /// `env_knob_guard` refuses the bake if a toolchain build ever stops reading it.
-    const FIXED_ENV: [(&'static str, &'static str); 3] = [
-        ("DUMP_SPYRE_CODE", "1"),
-        ("DT_PARALLEL_THREADS", "1"),
-        ("DISABLE_ABOVE_LX_CHUNK_EXPLORE", "1"),
-    ];
+    /// ⛔ `DISABLE_ABOVE_LX_CHUNK_EXPLORE` IS NOT HERE, and must not come back: it is the GROUP's
+    /// ([`ChunkExplore`]), set on the one child whose group needs it and keyed into that group's
+    /// [`GroupDigest`]. Listing it here set it on every compile — every group of every model
+    /// compiled without the explorer, measured at 2× granite-2b's long-prompt TTFT.
+    const FIXED_ENV: [(&'static str, &'static str); 2] =
+        [("DUMP_SPYRE_CODE", "1"), ("DT_PARALLEL_THREADS", "1")];
 
     /// `$DXP_STANDALONE`, else the `bin` sibling of `$DEEPTOOLS_PATH`'s `share` dir, else the
     /// on-pod default — the SAME resolution order `scratchy-builder-spyre`'s `build.rs` uses, so
@@ -1155,44 +1226,53 @@ impl DxpTool {
     /// refused every bake on the second one. The loader's own trace
     /// ([`crate::dxp_cache::loaded_images`]) names wherever it really lives; the SDK path is the
     /// fallback for a host whose loader cannot be traced.
-    fn env_knob_guard(&self) -> Result<(), String> {
-        /// The knobs whose SILENT NON-READ changes what the bake validates (a knob whose absence
-        /// fails loudly — `DEEPTOOLS_PATH` missing → dxp refuses to start; `DUMP_SPYRE_CODE`
-        /// missing → no `spyreCodeDir/`, which the runtime's marker check catches — does not need
-        /// this guard).
-        const KNOBS: &[&str] = &["DT_PARALLEL_THREADS", "DISABLE_ABOVE_LX_CHUNK_EXPLORE"];
-        /// Memoized: the toolchain is fixed for the life of the process, and `compile` runs per
-        /// launch group — hundreds of times per bake.
-        static GUARD: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-        GUARD
-            .get_or_init(|| {
-                let mut paths = vec![self.bin.clone()];
-                match crate::dxp_cache::loaded_images(&self.bin, &self.deeptools, &Self::FIXED_ENV)
-                {
-                    Some(images) => paths.extend(images.into_iter().filter(|p| *p != self.bin)),
-                    None => paths.extend(
-                        self.deeptools
-                            .parent()
-                            .map(|sdk| sdk.join("lib").join("libL3DlOpsScheduler.so")),
-                    ),
-                }
-                let mut read_errors: Vec<String> = Vec::new();
-                let mut artifacts = paths.into_iter().filter_map(|p| match std::fs::read(&p) {
-                    Ok(b) => Some((p, b)),
-                    Err(e) => {
-                        read_errors.push(format!("reading {}: {e}", p.display()));
-                        None
-                    }
-                });
-                knobs_present(KNOBS, &mut artifacts).map_err(|e| {
-                    if read_errors.is_empty() {
-                        e
-                    } else {
-                        format!("{e} ({})", read_errors.join("; "))
-                    }
-                })
-            })
-            .clone()
+    ///
+    /// The knobs checked are the ones THIS compile sets ([`knobs_for`]): the explorer knob is
+    /// checked for a group that skips the explorer and only then, because only then does a silent
+    /// non-read change what the compile does.
+    fn env_knob_guard(&self, explore: ChunkExplore) -> Result<(), String> {
+        /// Memoized per knob set: the toolchain is fixed for the life of the process, and `compile`
+        /// runs per launch group — hundreds of times per bake.
+        static GUARD: std::sync::OnceLock<Mutex<HashMap<ChunkExplore, Result<(), String>>>> =
+            std::sync::OnceLock::new();
+        let memo = GUARD.get_or_init(Default::default);
+        if let Some(r) = memo.lock().ok().and_then(|m| m.get(&explore).cloned()) {
+            return r;
+        }
+        let r = self.toolchain_reads(&knobs_for(explore));
+        if let Ok(mut m) = memo.lock() {
+            m.insert(explore, r.clone());
+        }
+        r
+    }
+
+    /// `env_knob_guard`'s probe, unmemoized: is every one of `knobs` a string literal in some
+    /// artifact the dxp child loads?
+    fn toolchain_reads(&self, knobs: &[&str]) -> Result<(), String> {
+        let mut paths = vec![self.bin.clone()];
+        match crate::dxp_cache::loaded_images(&self.bin, &self.deeptools, &Self::FIXED_ENV) {
+            Some(images) => paths.extend(images.into_iter().filter(|p| *p != self.bin)),
+            None => paths.extend(
+                self.deeptools
+                    .parent()
+                    .map(|sdk| sdk.join("lib").join("libL3DlOpsScheduler.so")),
+            ),
+        }
+        let mut read_errors: Vec<String> = Vec::new();
+        let mut artifacts = paths.into_iter().filter_map(|p| match std::fs::read(&p) {
+            Ok(b) => Some((p, b)),
+            Err(e) => {
+                read_errors.push(format!("reading {}: {e}", p.display()));
+                None
+            }
+        });
+        knobs_present(knobs, &mut artifacts).map_err(|e| {
+            if read_errors.is_empty() {
+                e
+            } else {
+                format!("{e} ({})", read_errors.join("; "))
+            }
+        })
     }
 
     /// Compile ONE group dir in place. `Ok(())` leaves `spyreCodeDir/{init_binary.bin,
@@ -1202,12 +1282,14 @@ impl DxpTool {
     /// Runs under a [`ChildProc`] — this process's own process group, torn down by `Drop` — so a
     /// DIFFERENT worker's failure can reach and kill this child (via [`Reaper::fail`]) instead of leaving
     /// it to be orphaned when the build exits.
-    fn compile(&self, group: &Path, reaper: &Reaper) -> Result<(), String> {
+    fn compile(&self, group: &SealedGroup, reaper: &Reaper) -> Result<(), String> {
+        let explore = group.explore();
+        let group = group.path();
         // ⛔ THE SILENT-ENV-DRIFT GUARD runs before anything is spawned: a knob name the
         // toolchain cannot read must fail HERE, with the knob named — not silently at its
         // default, changing what the whole bake validates (see `env_knob_guard`'s doc for the
         // round that cost).
-        self.env_knob_guard()?;
+        self.env_knob_guard(explore)?;
         let mut cmd = std::process::Command::new(&self.bin);
         cmd.arg("--bundle")
             .arg("-d")
@@ -1216,7 +1298,19 @@ impl DxpTool {
             .arg("sentient")
             .env("DEEPTOOLS_PATH", &self.deeptools)
             .envs(Self::FIXED_ENV)
-            .stdout(Stdio::piped())
+            // ⛔⛔⛔ THE TOKEN-PLANE GATHERED-KERNEL SHAPE ONLY SCHEDULES WITH THE CHUNK-PARAMETER
+            // EXPLORER OFF — and EVERY OTHER group needs it ON (see [`ChunkExplore`] for both
+            // measurements). The 26b group_13 refusal (`Expect LX in labeledDs memOrg_.`, :2498)
+            // was that shape compiled with the explorer running; the correctly-spelled knob
+            // compiles the exact refusing group RC=0 (card-side dxp repro, 2026-10-13). So the
+            // knob is the GROUP's, set on its own child, and the ambient value is removed rather
+            // than inherited: an exported knob in the build's environment would otherwise switch
+            // the explorer off for every group again, which is the regression this replaced.
+            .env_remove(ChunkExplore::KNOB);
+        if explore == ChunkExplore::Skip {
+            cmd.env(ChunkExplore::KNOB, "1");
+        }
+        cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // What `Command::output()` did implicitly, and spawning by hand does NOT: dxp gets EOF
             // rather than the build's own stdin. Inheriting it would hand the same descriptor to all
@@ -1486,7 +1580,7 @@ impl Shared {
                     }
                     None => {
                         let fresh = tool
-                            .compile(job.path(), &self.reaper)
+                            .compile(&job, &self.reaper)
                             .and_then(|()| read_compiled(&job.stage, &job.id));
                         // Fresh output is the one thing worth persisting. Failures are NOT stored — a
                         // later build deserves its own refusal, not a cached one from a tree or tool it
@@ -1536,8 +1630,13 @@ impl BakeQueue {
             budget: StageBudget::new(),
             memo: Mutex::new(HashMap::new()),
             memo_hits: AtomicUsize::new(0),
-            cache: DxpIdentity::probe(&tool.bin, &tool.deeptools, &DxpTool::FIXED_ENV)
-                .and_then(DxpCache::for_build),
+            cache: DxpIdentity::probe(
+                &tool.bin,
+                &tool.deeptools,
+                &DxpTool::FIXED_ENV,
+                &[ChunkExplore::KNOB],
+            )
+            .and_then(DxpCache::for_build),
             disk_hits: AtomicUsize::new(0),
             queue: GroupQueue::default(),
             reaper,
@@ -1962,14 +2061,20 @@ mod tests {
 
     /// A staged group of `bytes` whose identity is its submission number.
     fn staged(n: u32, bytes: usize) -> SealedGroup {
-        SealedGroup::sealed(
+        let files = vec![(format!("g{n}"), String::new())];
+        SealedGroup::of_rendered(
             PathBuf::from(format!("group_{n}")),
             GroupId {
                 fp: "f".to_string(),
                 group: n,
             },
-            bytes,
-            GroupDigest::of(&[(format!("g{n}"), String::new())]),
+            &crate::lower_subtile_tape_to_superdsc::GroupInput {
+                group: n,
+                key: GroupDigest::of(&files),
+                files,
+                bytes,
+                explore: ChunkExplore::Run,
+            },
         )
     }
 
@@ -2008,7 +2113,8 @@ mod tests {
     /// without a real toolchain.
     #[test]
     fn a_knob_the_toolchain_cannot_read_refuses_the_bake_naming_it() {
-        let knobs = ["DT_PARALLEL_THREADS", "DISABLE_ABOVE_LX_CHUNK_EXPLORE"];
+        // The knob set a group that skips the explorer compiles under — the one the 26b lost to.
+        let knobs = knobs_for(ChunkExplore::Skip);
         // A toolchain that reads the REAL names — the drifted `EXPLODE` export is absent from it,
         // exactly like the pod's build.
         let bin: &[u8] = b"xxDT_PARALLEL_THREADSxx";
@@ -2037,6 +2143,33 @@ mod tests {
         assert!(
             err.contains("silently"),
             "the refusal must state the failure mode (silently at the knob's default): {err}"
+        );
+    }
+
+    /// ⭐ THE GUARD ONLY DEMANDS THE EXPLORER KNOB OF A COMPILE THAT SETS IT. A group that runs the
+    /// explorer leaves the knob unset, so a toolchain that cannot read it changes nothing there and
+    /// must not refuse that group's compile.
+    #[test]
+    fn a_group_that_runs_the_explorer_does_not_need_the_toolchain_to_read_its_knob() {
+        assert!(!knobs_for(ChunkExplore::Run).contains(&ChunkExplore::KNOB));
+        // A toolchain that reads the thread knob and NOT the explorer knob.
+        let arts = || {
+            vec![
+                (
+                    PathBuf::from("/fake/dxp_standalone"),
+                    b"xxDT_PARALLEL_THREADSxx".to_vec(),
+                ),
+                (
+                    PathBuf::from("/fake/libL3DlOpsScheduler.so"),
+                    b"xxnothing herexx".to_vec(),
+                ),
+            ]
+            .into_iter()
+        };
+        assert!(knobs_present(&knobs_for(ChunkExplore::Run), &mut arts()).is_ok());
+        assert!(
+            knobs_present(&knobs_for(ChunkExplore::Skip), &mut arts()).is_err(),
+            "the same toolchain must still refuse a group that needs the explorer off"
         );
     }
 

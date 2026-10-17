@@ -255,9 +255,10 @@ pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
         // lands wherever `mb` sits, and the mds the emitter derives would page a different axis.
         //
         // The same pairing law as the KV arm: the rank-3 kernel is sound ONLY WITH the gather, and
-        // this arm lives inside the gathered builder for exactly that reason. The bake needs
+        // this arm lives inside the gathered builder for exactly that reason. Its group compiles with
         // `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1` (the exploration path's flop-per-byte accounting is
-        // uninputtable for a gathered index — a vendor ordering gap, not a gather prohibition) and
+        // uninputtable for a gathered index — a vendor ordering gap, not a gather prohibition; the
+        // bake sets it per group, `superdsc_bake::ChunkExplore`) and
         // the plan splits `mb` only (enforced below), or `skip_addr` shrinks below one expert plane.
         if g.entry_dim == crate::superdsc_opspec::KernelAxis::Batch && g.per_position.is_none() {
             // ⭐⭐⭐⭐⭐ THE PLAN SPLITS `mb` ONLY, AT THE ENTRY AXIS'S OWN `core_split` —
