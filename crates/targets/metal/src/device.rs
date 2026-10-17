@@ -153,6 +153,46 @@ pub fn gpu_cores(device: &ProtocolObject<dyn MTLDevice>) -> Option<GpuCores> {
     u32::try_from(cores).ok().filter(|&n| n > 0).map(GpuCores)
 }
 
+/// The most memory the GPU driver wires at once, the whole system's GPU buffers together: the
+/// `iogpu.wired_limit_mb` sysctl where set, else macOS's default of it — 2/3 of physical memory
+/// up to 36 GiB, 3/4 above.
+///
+/// `recommendedMaxWorkingSetSize` reports the limit where the sysctl sets it, but overstates the
+/// default: 28.08 GiB on a 36 GiB M3 Pro, whose command buffers fault out of memory once the
+/// system's wired memory nears 24 GiB (and run at a 24 GiB sysctl, where it reports 24). `None`
+/// if the kernel answers neither sysctl.
+pub fn gpu_wired_limit_bytes() -> Option<u64> {
+    fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
+        let mut value = 0u64;
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: `value` is a `u64` of `len` bytes; a sysctl narrower than that writes fewer and
+        // says so in `len`, which zero-initialised `value` covers on little-endian Apple silicon.
+        let status = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (&raw mut value).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (status == 0).then_some(value)
+    }
+    match sysctl_u64(c"iogpu.wired_limit_mb") {
+        Some(mb) if mb > 0 => Some(mb << 20),
+        _ => sysctl_u64(c"hw.memsize").map(default_gpu_wired_limit),
+    }
+}
+
+/// macOS's GPU wired limit when `iogpu.wired_limit_mb` is unset: 2/3 of `memsize` up to 36 GiB,
+/// 3/4 above.
+fn default_gpu_wired_limit(memsize: u64) -> u64 {
+    match memsize <= 36 << 30 {
+        true => memsize / 3 * 2,
+        false => memsize / 4 * 3,
+    }
+}
+
 /// Whether the default Metal device can create an `MTL4Compiler` (a real
 /// Metal-4 GPU is present). Equivalent to `detect_device().is_some()` without
 /// building the profile; kept for call sites that only need the boolean.
@@ -168,6 +208,20 @@ pub fn metal4_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_gpu_wired_limit_is_two_thirds_up_to_36_gib_and_three_quarters_above() {
+        assert_eq!(default_gpu_wired_limit(36 << 30), 24 << 30);
+        assert_eq!(default_gpu_wired_limit(24 << 30), 16 << 30);
+        assert_eq!(default_gpu_wired_limit(64 << 30), 48 << 30);
+        assert_eq!(default_gpu_wired_limit(128 << 30), 96 << 30);
+    }
+
+    #[test]
+    fn the_gpu_wired_limit_is_read_from_the_kernel() {
+        let limit = gpu_wired_limit_bytes().expect("iogpu.wired_limit_mb or hw.memsize");
+        assert!(limit > 0);
+    }
 
     #[test]
     fn test_device_detection() {
