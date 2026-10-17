@@ -49,87 +49,87 @@
     },
     "layers.1.mlp.down_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.1.mlp.gate_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.1.mlp.up_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.1.self_attn.k_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.1.self_attn.o_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.1.self_attn.q_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.1.self_attn.v_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.2.mlp.down_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.2.mlp.gate_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.2.mlp.up_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.2.self_attn.k_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.2.self_attn.o_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.2.self_attn.q_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.2.self_attn.v_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.3.mlp.down_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.3.mlp.gate_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.3.mlp.up_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.3.self_attn.k_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.3.self_attn.o_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.3.self_attn.q_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.3.self_attn.v_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "lm_head": {
       "group_size": 64,
@@ -137,31 +137,31 @@
     },
     "midlayer.mlp.down_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "midlayer.mlp.gate_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "midlayer.mlp.up_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "midlayer.self_attn.k_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "midlayer.self_attn.o_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "midlayer.self_attn.q_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "midlayer.self_attn.v_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     }
   },
   "quantization_config": {
@@ -177,87 +177,87 @@
     },
     "layers.1.mlp.down_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.1.mlp.gate_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.1.mlp.up_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.1.self_attn.k_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.1.self_attn.o_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.1.self_attn.q_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.1.self_attn.v_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.2.mlp.down_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.2.mlp.gate_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.2.mlp.up_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.2.self_attn.k_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.2.self_attn.o_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.2.self_attn.q_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.2.self_attn.v_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.3.mlp.down_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.3.mlp.gate_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.3.mlp.up_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "layers.3.self_attn.k_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.3.self_attn.o_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.3.self_attn.q_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "layers.3.self_attn.v_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "lm_head": {
       "group_size": 64,
@@ -265,31 +265,31 @@
     },
     "midlayer.mlp.down_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "midlayer.mlp.gate_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "midlayer.mlp.up_proj": {
       "group_size": 64,
-      "bits": 4
+      "bits": 3
     },
     "midlayer.self_attn.k_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "midlayer.self_attn.o_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "midlayer.self_attn.q_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     },
     "midlayer.self_attn.v_proj": {
       "group_size": 64,
-      "bits": 8
+      "bits": 4
     }
   }
 }
