@@ -287,62 +287,7 @@ fn convert_body(module: &mut Module) -> Result<()> {
     convert_all(module, OpKind::TtTrans, convert_trans)?;
     convert_all(module, OpKind::TtSplat, convert_splat_of_argument)?;
     convert_all(module, OpKind::TtMakeRange, convert_make_range)?;
-    convert_all(module, OpKind::TtFpToFp, convert_fp_to_fp)?;
     expand_splat_of_scalar_argument(module)?;
-    Ok(())
-}
-
-/// `tt.fp_to_fp` -> `arith.truncf` (narrowing) or `arith.extf` (widening), at the SAME
-/// element types — the fp8 side stays `f8E4M3FN` on the value, so the cast keeps the one
-/// fact its consumers need: WHICH format the narrowed value lands in.
-///
-/// `tt.fp_to_fp` exists in Triton only because MLIR's `arith` truncation cannot spell a
-/// non-default rounding or the custom fp8 formats Triton targets; at KTIR the round trip the
-/// MoE kernel spells (`q.to(tl.float8e4nv).to(tl.float16)`, `moe.py`'s activation codes) is
-/// exactly a narrowing to e4m3 under round-to-nearest-even and a widening back, which are the
-/// two `arith` ops with the fp8 element type stated.
-///
-/// ⛔ ONLY RTNE, AND ONLY e4m3: a narrowing whose `rounding` is anything else, or an fp8
-/// format other than `f8E4M3FN`, is refused by name — no consumer rounds to it, and a cast
-/// silently retyped to the wrong rounding is a value that is wrong in the last bit only.
-fn convert_fp_to_fp(module: &mut Module, index: &DefIndex, path: &OpPath) -> Result<()> {
-    let op = walk::at(module, path).expect("path").clone();
-    let src = op
-        .operands
-        .first()
-        .and_then(|v| index.type_of(*v))
-        .and_then(|t| t.elem())
-        .ok_or_else(|| refuse("tt.fp_to_fp without a typed operand"))?;
-    let dst = op
-        .result_type()
-        .and_then(|t| t.elem())
-        .ok_or_else(|| refuse("tt.fp_to_fp without a typed result"))?;
-    let fp8 = |d: DType| d == DType::Fp8E4m3;
-    let kind = match (fp8(src), fp8(dst)) {
-        (false, true) => {
-            match op.attr(&AttrKey::Other("rounding".into())) {
-                Some(Attr::Str(r)) if r == "rtne" => {}
-                other => {
-                    return Err(refuse(format!(
-                        "tt.fp_to_fp narrowing to e4m3 with rounding {other:?}: only `rtne` \
-                         (Triton's default downcast, `semantic.py:826`) has a consumer"
-                    )));
-                }
-            }
-            OpKind::ArithTruncf
-        }
-        (true, false) => OpKind::ArithExtf,
-        _ => {
-            return Err(refuse(format!(
-                "tt.fp_to_fp from {src:?} to {dst:?}: only the e4m3 round trip (f16/f32 <-> \
-                 f8E4M3FN) is lowered"
-            )));
-        }
-    };
-    let op = walk::at_mut(module, path).expect("path");
-    op.kind = kind;
-    op.attrs
-        .retain(|(k, _)| *k != AttrKey::Other("rounding".into()));
     Ok(())
 }
 
