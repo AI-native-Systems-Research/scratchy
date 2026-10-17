@@ -131,6 +131,21 @@ pub(crate) struct LaunchSite {
     pub(crate) barrier: bool,
 }
 
+impl LaunchSite {
+    /// The staged-batch item this site becomes — ONE constructor shared by the
+    /// submit walk's collect branch and [`walk_items`], so the item's shape
+    /// cannot drift between the real walk and the parity gate's reference
+    /// side (a field added or dropped in one would be a compile error in the
+    /// other, not a silent divergence the gate cannot see).
+    pub(crate) fn batched_compute(&self) -> BatchedCompute {
+        BatchedCompute {
+            prog: self.prog.clone(),
+            tensor_allocs: self.ta.clone(),
+            bootstrap_offset: self.bootstrap,
+        }
+    }
+}
+
 /// `Ok(None)` = THIS (op, pass) DOES NOT LAUNCH — a page part ([`OpKv::slot_offset`]) whose
 /// page the request does not hold, a short last chunk's padding rows past the request's pages
 /// (#620). Its rows are never read, and the only base left to aim it at is the cursor's own
@@ -299,11 +314,7 @@ pub(crate) fn walk_items(
                 continue;
             };
             barrier |= site.barrier;
-            items.push(BatchedCompute {
-                prog: site.prog,
-                tensor_allocs: site.ta,
-                bootstrap_offset: site.bootstrap,
-            });
+            items.push(site.batched_compute());
         }
     }
     Ok((items, barrier))

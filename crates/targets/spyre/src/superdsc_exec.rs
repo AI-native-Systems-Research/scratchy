@@ -2723,13 +2723,12 @@ impl Executor {
                 if collect {
                     // STAGE, DON'T SUBMIT — the rung pays one doorbell at its end. The item OWNS
                     // its handles because the shifted bases and `ta` borrows above are rep-local.
+                    // ⭐ And it is built by `LaunchSite::batched_compute` — the ONE constructor
+                    // `cb_plan::walk_items` stages through too — so the item the real walk
+                    // submits and the item the parity gate renders cannot drift apart in shape.
                     let st0 = Instant::now();
                     pending.push(PendingLaunch {
-                        item: BatchedCompute {
-                            prog: prog.clone(),
-                            tensor_allocs: ta.iter().map(|a| (*a).clone()).collect(),
-                            bootstrap_offset: bootstrap,
-                        },
+                        item: site.batched_compute(),
                         op_index: oi,
                         rep,
                         off,
