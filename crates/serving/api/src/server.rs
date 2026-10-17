@@ -30,7 +30,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{Span, info};
 
-use crate::engine::{AsyncEngine, StreamDelta};
+use crate::engine::{AsyncEngine, StreamDelta, StreamUsage};
 use crate::protocol;
 
 // ---------------------------------------------------------------------------
@@ -765,6 +765,30 @@ fn attach_orca_header(_request_headers: &HeaderMap, response: Response) -> Respo
 // SSE streaming
 // ---------------------------------------------------------------------------
 
+/// The latest [`StreamUsage`] of each choice in a stream, for the usage chunk sent after the
+/// last delta.
+///
+/// The engine's counts are cumulative per choice, so the last delta of each choice carries its
+/// totals. Summing the deltas' `new_token_ids` instead undercounts: the steps a tool parser
+/// buffers send no delta, and a tool call's tokens are mostly those.
+#[derive(Default)]
+struct ChoiceUsage(std::sync::Mutex<std::collections::HashMap<u32, StreamUsage>>);
+
+impl ChoiceUsage {
+    fn record(&self, delta: &StreamDelta) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(delta.index, delta.usage);
+    }
+
+    /// Output tokens across every choice.
+    fn completion_tokens(&self) -> u32 {
+        let choices = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        choices.values().map(|u| u.completion_tokens).sum()
+    }
+}
+
 /// Build an SSE stream for chat completions.
 fn stream_chat_response(
     request_id: String,
@@ -901,14 +925,13 @@ fn stream_completion_response(
     rx: tokio::sync::mpsc::UnboundedReceiver<StreamDelta>,
     include_usage: bool,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    let total_completion_tokens = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let tc = total_completion_tokens.clone();
+    let usage = Arc::new(ChoiceUsage::default());
+    let recorder = usage.clone();
     let req_id = request_id.clone();
     let model2 = model.clone();
 
     let stream = UnboundedReceiverStream::new(rx).map(move |delta| {
-        let token_count = delta.new_token_ids.len() as u32;
-        tc.fetch_add(token_count, std::sync::atomic::Ordering::Relaxed);
+        recorder.record(&delta);
 
         let finish_reason_str = delta.finish_reason.map(|r| r.to_string());
 
@@ -948,8 +971,7 @@ fn stream_completion_response(
     > = if include_usage {
         let req_id2 = request_id.clone();
         Box::new(tokio_stream::once(()).map(move |()| {
-            let completion_tokens =
-                total_completion_tokens.load(std::sync::atomic::Ordering::Relaxed);
+            let completion_tokens = usage.completion_tokens();
             let usage = protocol::UsageInfo {
                 prompt_tokens: 0,
                 completion_tokens: Some(completion_tokens),
@@ -1942,5 +1964,49 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// The engine's deltas for a buffered tool call, once per choice index in `0..choices`, as
+    /// one receiver — with the tokens generated across all of them.
+    fn buffered_tool_call_rx(
+        choices: u32,
+    ) -> (tokio::sync::mpsc::UnboundedReceiver<StreamDelta>, u32) {
+        let (deltas, generated) = crate::engine::test_support::buffered_tool_call_deltas(false);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for index in 0..choices {
+            for delta in &deltas {
+                tx.send(StreamDelta {
+                    index,
+                    ..delta.clone()
+                })
+                .unwrap();
+            }
+        }
+        (rx, generated * choices)
+    }
+
+    /// The `data:` payloads of an SSE response, `[DONE]` excluded.
+    async fn sse_payloads(response: Response) -> Vec<serde_json::Value> {
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(body.to_vec())
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|d| *d != "[DONE]")
+            .map(|d| serde_json::from_str(d).unwrap())
+            .collect()
+    }
+
+    /// The steps a tool parser buffers send no delta, so a sum of the deltas' token ids drops
+    /// most of a tool call; the usage chunk reports the engine's count, summed across choices.
+    #[tokio::test]
+    async fn test_completion_stream_usage_counts_buffered_tokens() {
+        for choices in [1, 2] {
+            let (rx, generated) = buffered_tool_call_rx(choices);
+            let response = stream_completion_response("r".into(), "m".into(), rx, true);
+            let payloads = sse_payloads(response.into_response()).await;
+            let usage = &payloads.last().expect("usage chunk")["usage"];
+            assert_eq!(usage["completion_tokens"], generated, "n={choices}");
+        }
     }
 }
