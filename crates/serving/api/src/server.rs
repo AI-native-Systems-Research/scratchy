@@ -28,7 +28,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{Span, info};
+use tracing::{Span, error, info};
 
 use crate::engine::{AsyncEngine, StreamDelta, StreamUsage};
 use crate::protocol;
@@ -279,23 +279,35 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
         info!("Application startup complete.");
     }
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(Arc::clone(&state)))
         .await?;
-    Ok(())
+    // A server whose engine died serves nothing: it ends, and says so with an error, so whatever
+    // supervises it restarts it instead of finding it up and answering 500s on its port.
+    match state.engine.step_loop_end() {
+        Some(end) => Err(format!("the engine step loop {end}").into()),
+        None => Ok(()),
+    }
 }
 
 /// Resolve when the process receives a termination signal (Ctrl-C / SIGINT
-/// or SIGTERM). Used by [`serve`] as the `axum::serve` graceful-shutdown
-/// future so the server loop RETURNS on a catchable signal instead of being
-/// terminated by the default disposition — which lets the engine/worker
-/// teardown run (`InprocClient::Drop -> worker.shutdown()`), ending the Metal
+/// or SIGTERM), or when the engine's step loop ends, since a dead engine can
+/// answer nothing again (#587). Used by [`serve`] as the `axum::serve`
+/// graceful-shutdown future so the server loop RETURNS on a catchable signal
+/// instead of being terminated by the default disposition — which lets the
+/// engine/worker teardown run (`InprocClient::Drop -> worker.shutdown()`), ending the Metal
 /// residency set and releasing system-wired GPU memory deterministically.
 ///
 /// Note: `kill -9` (SIGKILL) is uncatchable and bypasses this entirely — the
 /// only mitigation there is to not `kill -9` a busy server.
-async fn shutdown_signal() {
-    crate::signal::termination_signal().await;
-    info!("Termination signal received — shutting down gracefully (releasing GPU residency)");
+async fn shutdown_signal(state: Arc<AppState>) {
+    tokio::select! {
+        () = crate::signal::termination_signal() => {
+            info!("Termination signal received — shutting down gracefully (releasing GPU residency)");
+        }
+        end = state.engine.step_loop_ended() => {
+            error!("The engine step loop {end}, so nothing can be served — shutting down");
+        }
+    }
 }
 
 /// Build a rustls [`axum_server::tls_rustls::RustlsConfig`] from PEM file paths.
