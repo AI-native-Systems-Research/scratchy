@@ -13,14 +13,20 @@
 // rotary cos/sin row — from the host's tables for the accepted count.
 //
 // A chained head (`MTP_PARALLEL` 0) runs one row a sequence a pass: the next pass's input token is
-// this pass's draft and its target hidden row this pass's final hidden state at the row. A
-// parallel-drafting head (P-EAGLE, `MTP_PARALLEL` 1) runs one pass after the first, every draft
-// past the first at once: its rows read placeholders the host laid out, so the chain picks their
-// positions alone.
+// this pass's draft and its target hidden row this pass's final hidden state at the row.
+//
+// A parallel-drafting head (P-EAGLE, `MTP_PARALLEL` 1) drafts every token in one pass, vLLM's
+// layout: a sequence's `token_rows + rows` rows sit at the positions from its first token row's,
+// the host's. Before the pass (`depth` 0) the chain finds the accepted count `a` and lays out what
+// the rows read: rows `0..=a` the target's token and hidden row at their step row, the newest
+// last; the rest — `rows` past the newest, then the verify rows the target rejected, whose outputs
+// nothing reads — the mask token the host wrote and `mask_hidden`. After it (`depth` 1) draft `d`
+// is the argmax at row `a + d`.
 //
 // Bindings:
 //   0  picked       uint  the pass's argmax: after pass 1 over its argmax window, else one a row
-//   1  hidden       2-byte elements, [rows, MTP_HIDDEN]: the pass's final hidden states
+//   1  hidden       2-byte elements, [rows, MTP_HIDDEN]: the pass's final hidden states (a
+//                   parallel-drafting head's layout: the target's, at the step's rows)
 //   2  target       uint  [step rows]: the target's token at each row of the step
 //   3  drafted      uint  [step rows]: the token each row's successor reads, the draft it verifies
 //   4  seqs         uint  [n, 3]: per sequence, its first token row in the step, its token rows,
@@ -28,18 +34,21 @@
 //   5  accepted     uint  [n]: written after pass 1, read after a later one
 //   6  next         uint  [n, MTP_DRAFTS + 1, rows, 3]: per sequence, accepted count and row, the
 //                         next pass's position, slot and used KV length
-//   7  next_ids     uint  [n * rows]
+//   7  next_ids     uint  [n * rows] (a parallel-drafting head: its pass's rows)
 //   8  next_pos     uint  [n * rows]
 //   9  next_slot    uint  [n * rows]
 //   10 next_used    uint  [n]
-//   11 next_hidden  2-byte elements, [n, MTP_HIDDEN]
+//   11 next_hidden  2-byte elements, [n, MTP_HIDDEN] (a parallel-drafting head: its pass's rows)
 //   12 drafts       uint  [n, MTP_DRAFTS]
 //   13 depth        uint
 //   14 window_start uint: the first of pass 1's rows its argmax ran
 //   15 rope         2-byte elements, [n, MTP_DRAFTS + 1, MTP_ROPE]: per sequence and accepted
 //                   count, the next pass's rotary cos/sin row (MTP_ROPE 0: none)
 //   16 next_rope    2-byte elements, [n, MTP_ROPE]
-//   17 rows         uint: the rows a sequence a pass after the first runs (1 for a chained head)
+//   17 rows         uint: the rows a sequence a pass after the first runs (1 for a chained head;
+//                   a parallel-drafting head's rows past its newest, its drafts past the first)
+//   18 mask_hidden  2-byte elements, [MTP_HIDDEN]: a parallel-drafting head's placeholder target
+//                   hidden row
 //
 // Dispatch: n threadgroups of 256 threads; thread 0 picks, every thread copies the rows.
 
@@ -71,12 +80,45 @@ kernel void mtp_chain(
     device const ushort* rope         [[buffer(15)]],
     device       ushort* next_rope    [[buffer(16)]],
     constant     uint&   rows         [[buffer(17)]],
+    device const ushort* mask_hidden  [[buffer(18)]],
     uint s   [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint tg  [[threads_per_threadgroup]])
 {
     threadgroup uint row_shared;
     threadgroup uint kept_shared;
+    if (MTP_PARALLEL == 1) {
+        const uint first = seqs[s * 3], token_rows = seqs[s * 3 + 1], base = seqs[s * 3 + 2];
+        if (depth == 0) {
+            if (tid == 0) {
+                uint kept = 0;
+                while (kept + 1 < token_rows && target[first + kept] == drafted[first + kept]) {
+                    ++kept;
+                }
+                accepted[s] = kept;
+                for (uint j = 0; j <= kept; ++j) {
+                    next_ids[base + j] = target[first + j];
+                }
+                kept_shared = kept;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint kept = kept_shared;
+            for (uint j = 0; j < token_rows + rows; ++j) {
+                device const ushort* from =
+                    j <= kept ? hidden + ulong(first + j) * MTP_HIDDEN : mask_hidden;
+                device ushort* to = next_hidden + ulong(base + j) * MTP_HIDDEN;
+                for (uint i = tid; i < MTP_HIDDEN; i += tg) {
+                    to[i] = from[i];
+                }
+            }
+        } else if (tid == 0) {
+            const uint kept = accepted[s];
+            for (uint d = 0; d <= rows; ++d) {
+                drafts[s * MTP_DRAFTS + d] = picked[base + kept + d - window_start];
+            }
+        }
+        return;
+    }
     if (tid == 0) {
         uint row;
         uint kept = 0;
@@ -102,19 +144,15 @@ kernel void mtp_chain(
             next_slot[s * rows + j] = at[j * 3 + 1];
         }
         next_used[s] = at[(rows - 1) * 3 + 2];
-        if (MTP_PARALLEL == 0) {
-            next_ids[s] = picked[depth == 1 ? row - window_start : row];
-        }
+        next_ids[s] = picked[depth == 1 ? row - window_start : row];
         row_shared = row;
         kept_shared = kept;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (MTP_PARALLEL == 0) {
-        device const ushort* from = hidden + ulong(row_shared) * MTP_HIDDEN;
-        device ushort* to = next_hidden + ulong(s) * MTP_HIDDEN;
-        for (uint i = tid; i < MTP_HIDDEN; i += tg) {
-            to[i] = from[i];
-        }
+    device const ushort* from = hidden + ulong(row_shared) * MTP_HIDDEN;
+    device ushort* to = next_hidden + ulong(s) * MTP_HIDDEN;
+    for (uint i = tid; i < MTP_HIDDEN; i += tg) {
+        to[i] = from[i];
     }
     device const ushort* rope_row = rope + ulong(s * (MTP_DRAFTS + 1) + kept_shared) * MTP_ROPE;
     for (uint i = tid; i < MTP_ROPE; i += tg) {

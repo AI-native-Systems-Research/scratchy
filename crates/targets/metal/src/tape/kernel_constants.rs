@@ -1427,8 +1427,8 @@ pub struct MtpChainConstants {
 pub enum DraftsPastFirst {
     /// A forward a draft, each reading the draft and final hidden state before it.
     Chained,
-    /// One forward of rows that read the head's placeholders, which the host lays out (P-EAGLE):
-    /// the chain picks their positions alone.
+    /// One forward drafts every token (P-EAGLE): the chain lays out its rows by the accepted
+    /// count before it, and picks its drafts after.
     Parallel,
 }
 
