@@ -12,20 +12,23 @@
 //! * [`request_queue`] -- Request queue implementations (FCFS and Priority).
 //! * [`core`] -- The main `Scheduler` struct and its scheduling algorithm.
 //! * `recurrent_state` -- The prefix cache's recurrent-state (GDN) snapshot index.
+//! * `shared_memory` -- The budget KV and those snapshots share.
 
 pub mod core;
 pub mod interface;
 pub mod output;
 mod recurrent_state;
 pub mod request_queue;
+mod shared_memory;
 
 // Re-export the key types for convenience.
 pub use self::core::Scheduler;
 pub use interface::{PauseState, SchedulerInterface};
 pub use output::{
-    CachedKvOp, CachedRequestData, NewRequestData, RecurrentStateOps, SchedulerOutput,
-    StateSnapshotOp,
+    CachedKvOp, CachedRequestData, KvGranule, NewRequestData, RecurrentStateOps, SchedulerOutput,
+    SharedMemoryOps, SnapshotUnit, StateSnapshotOp,
 };
+pub use recurrent_state::SnapshotBudget;
 pub use request_queue::{
     FCFSRequestQueue, PriorityRequestQueue, RequestQueue, SchedulingPolicy, create_request_queue,
 };

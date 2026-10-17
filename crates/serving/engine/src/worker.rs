@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 
 use crate::executor::ModelRunnerOutput;
+use scratchy_serving_scheduler::scheduler::SnapshotBudget;
 use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
 
 use crate::error::ExecutorResult;
@@ -207,12 +208,14 @@ pub trait Worker: Send {
     /// A Gated-DeltaNet or Mamba-2 hybrid (Qwen3.5 / Qwen3.6, Nemotron-H) carries a per-sequence
     /// scan state that a cached KV prefix cannot rebuild, so a prefix hit on it must also restore a
     /// snapshot of that state, and the scheduler — which owns the snapshots as it owns KV blocks —
-    /// needs to know how many slots exist. 0 (the default) means this worker cannot snapshot one:
-    /// every worker without recurrent state, and every backend whose recurrent kernels do not save
-    /// and restore snapshots (CUDA today). For a recurrent-hybrid model that keeps prefix caching
-    /// off, which is the only correct answer a backend without snapshots has.
-    fn recurrent_state_snapshots(&self) -> usize {
-        0
+    /// needs to know how they share the KV budget: how the worker maps and releases KV and
+    /// snapshot memory, and how many slots it can address. `None` (the default) means this worker
+    /// cannot snapshot one: every worker without recurrent state, and every backend whose
+    /// recurrent kernels do not save and restore snapshots (CUDA today). For a recurrent-hybrid
+    /// model that keeps prefix caching off, which is the only correct answer a backend without
+    /// snapshots has.
+    fn snapshot_budget(&self) -> Option<SnapshotBudget> {
+        None
     }
 
     /// Whether this worker's DECODE path implements the hybrid sliding-window

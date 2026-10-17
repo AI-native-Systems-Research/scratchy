@@ -277,13 +277,16 @@ impl EngineCore {
             // ⭐ AND HOW MANY SNAPSHOTS OF THE MODEL'S RECURRENT STATE IT KEEPS. A Gated-DeltaNet
             // hybrid's prefix hit must also restore one; with none, `initialize_core` already kept
             // prefix caching off for it.
-            let snapshots = executor.recurrent_state_snapshots();
-            if config.enable_prefix_caching && snapshots > 0 {
+            if config.enable_prefix_caching
+                && let Some(budget) = executor.snapshot_budget()
+            {
                 info!(
-                    "Prefix caching tracks recurrent state: {snapshots} snapshot slots — a hit \
-                     resumes only where a snapshot of the model's recurrent state exists"
+                    "Prefix caching tracks recurrent state: up to {} snapshot slots, sharing the KV \
+                     budget — a hit resumes only where a snapshot of the model's recurrent state \
+                     exists",
+                    budget.max_slots
                 );
-                tracker = tracker.with_state_snapshots(snapshots);
+                tracker = tracker.with_state_snapshots(budget);
             }
             Box::new(tracker)
         };
@@ -2693,8 +2696,15 @@ mod tests {
         fn is_sleeping(&self) -> bool {
             self.0.is_sleeping()
         }
-        fn recurrent_state_snapshots(&self) -> usize {
-            4
+        fn snapshot_budget(&self) -> Option<scratchy_serving_scheduler::scheduler::SnapshotBudget> {
+            // Four slots that take none of the KV budget: the test sees the snapshots alone.
+            Some(scratchy_serving_scheduler::scheduler::SnapshotBudget {
+                kv_block_bytes: 1,
+                kv_granule_blocks: std::num::NonZeroUsize::MIN,
+                slot_bytes: 0,
+                unit_slots: std::num::NonZeroUsize::MIN,
+                max_slots: 4,
+            })
         }
     }
 

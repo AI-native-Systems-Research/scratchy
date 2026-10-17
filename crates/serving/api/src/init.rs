@@ -1270,8 +1270,8 @@ fn requested_prefix_caching(config: &VllmConfig) -> bool {
 /// `requested` is [`requested_prefix_caching`]; a recurrent-hybrid model (see
 /// [`is_recurrent_hybrid_arch`]) additionally needs a worker that keeps `snapshots` of its
 /// recurrent state, because a hit that restores no state runs the model over the wrong span.
-fn effective_prefix_caching(requested: bool, recurrent_hybrid: bool, snapshots: usize) -> bool {
-    requested && (!recurrent_hybrid || snapshots > 0)
+fn effective_prefix_caching(requested: bool, recurrent_hybrid: bool, snapshots: bool) -> bool {
+    requested && (!recurrent_hybrid || snapshots)
 }
 
 /// Common initialization: worker → cache → executor → InprocClient → tokenizer.
@@ -1466,9 +1466,9 @@ fn initialize_core(
     // Same reason, same moment: the widest concurrency this backend can DECODE in one batched step, on a
     // backend whose decode-width ladder is fixed at bake time and so cannot grow to meet `max_num_seqs`.
     let worker_max_num_seqs = worker.max_num_seqs_override();
-    // And the snapshots of the model's recurrent state it allocated, which decide whether a
+    // And the snapshots of the model's recurrent state it can keep, which decide whether a
     // recurrent-hybrid model may be prefix cached at all.
-    let worker_state_snapshots = worker.recurrent_state_snapshots();
+    let worker_snapshots = worker.snapshot_budget();
 
     info!(
         "Available memory: {:.1} GB, memory_utilization={}, num_gpu_blocks={}",
@@ -1516,19 +1516,19 @@ fn initialize_core(
     // tokens would leave the recurrent state computed over the wrong span
     // (garbage output). A hit on one is correct only where a SNAPSHOT of that
     // state is restored with it, so caching stays off for these models unless
-    // the worker keeps snapshots (`Worker::recurrent_state_snapshots`) — see
+    // the worker keeps snapshots (`Worker::snapshot_budget`) — see
     // `effective_prefix_caching`. (Per-layer linear-attention is the marker;
     // detect by arch string.)
     let enable_prefix_caching = {
         let hybrid = is_recurrent_hybrid_arch(&hf_config.architectures);
         let requested = requested_prefix_caching(config);
         if hybrid && requested {
-            if worker_state_snapshots > 0 {
+            if let Some(budget) = worker_snapshots {
                 info!(
                     "Prefix caching on for {:?}, a recurrent/hybrid (Mamba/Gated-DeltaNet) \
-                     architecture: the worker keeps {worker_state_snapshots} snapshots of its \
-                     recurrent state, and a hit resumes only where one exists",
-                    hf_config.architectures
+                     architecture: the worker keeps up to {} snapshots of its recurrent state in \
+                     the KV budget, and a hit resumes only where one exists",
+                    hf_config.architectures, budget.max_slots
                 );
             } else {
                 info!(
@@ -1583,7 +1583,7 @@ fn initialize_core(
                 config.device
             );
         }
-        effective_prefix_caching(requested, hybrid, worker_state_snapshots)
+        effective_prefix_caching(requested, hybrid, worker_snapshots.is_some())
     };
 
     // Device-specific `max_num_batched_tokens` default — no flat constant on any
@@ -4223,16 +4223,16 @@ mod tests {
     #[test]
     fn a_recurrent_hybrid_is_prefix_cached_only_with_snapshots() {
         assert!(
-            effective_prefix_caching(true, false, 0),
+            effective_prefix_caching(true, false, false),
             "attention-only: as requested"
         );
         assert!(
-            !effective_prefix_caching(true, true, 0),
+            !effective_prefix_caching(true, true, false),
             "no snapshots: off"
         );
-        assert!(effective_prefix_caching(true, true, 32), "snapshots: on");
+        assert!(effective_prefix_caching(true, true, true), "snapshots: on");
         assert!(
-            !effective_prefix_caching(false, true, 32),
+            !effective_prefix_caching(false, true, true),
             "never past the request"
         );
     }

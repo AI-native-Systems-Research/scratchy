@@ -355,14 +355,14 @@ pub trait Executor: Send {
         scratchy_core_common::HybridKvStores::Shared
     }
 
-    /// ⭐ HOW MANY RECURRENT-STATE SNAPSHOTS THE WORKER KEEPS FOR THE PREFIX CACHE — asked once,
-    /// when the engine builds the block tracker, for the same reason as [`Self::kv_addressing`].
+    /// ⭐ HOW THE WORKER'S RECURRENT-STATE SNAPSHOTS SHARE THE KV BUDGET — asked once, when the
+    /// engine builds the block tracker, for the same reason as [`Self::kv_addressing`].
     ///
-    /// Forwarded from [`crate::worker::Worker::recurrent_state_snapshots`]. 0 (the default) for
-    /// every executor that does not forward it: the tracker then tracks no recurrent state, and
+    /// Forwarded from [`crate::worker::Worker::snapshot_budget`]. `None` (the default) for every
+    /// executor that does not forward it: the tracker then tracks no recurrent state, and
     /// `initialize_core` keeps prefix caching off for a recurrent-hybrid model.
-    fn recurrent_state_snapshots(&self) -> usize {
-        0
+    fn snapshot_budget(&self) -> Option<scratchy_serving_scheduler::scheduler::SnapshotBudget> {
+        None
     }
 
     /// Check whether the executor is healthy.
