@@ -1892,9 +1892,18 @@ pub fn lower_decode_to_wavefront(
                                      constant-folded before lowering",
                         })?;
                         let x = bx.input_at(tile, tensor_idx)?;
-                        let idx = bx.push_op(SubOp::ScalarMul { scale }, vec![x]);
-                        bx.produced.insert((tile.0, 0), Producer::Op(idx));
-                        result = Some(idx);
+                        // `x * 1.0` is `x` (the DSL's if/else passthrough): it names its operand,
+                        // as `export_hidden` does, adding no op — and no reader the folds count.
+                        let produced = match (scale, x) {
+                            (1.0, InputRef::Op(j)) => Producer::Op(j),
+                            (1.0, InputRef::Ext(e)) => Producer::Ext(e),
+                            _ => {
+                                let idx = bx.push_op(SubOp::ScalarMul { scale }, vec![x]);
+                                result = Some(idx);
+                                Producer::Op(idx)
+                            }
+                        };
+                        bx.produced.insert((tile.0, 0), produced);
                     }
                     None => {
                         let a = bx.input_at(tile, 0)?;

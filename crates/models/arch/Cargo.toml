@@ -326,8 +326,9 @@ all-arches = [
 "gemma-4-26b-a4b-it-assistant" = ["arch-gemma4-assistant"]
 "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant" = ["arch-gemma4-assistant"]
 
-# p-eagle (1 config)
+# p-eagle (2 configs)
 "gpt-oss-20b-p-eagle" = ["arch-p-eagle"]
+"gpt-oss-20b-p-eagle-mixed" = ["arch-p-eagle"]
 
 # qwen3-5-vl (2 configs)
 "qwen3.5-9b" = ["arch-qwen3-5-vl"]
@@ -544,6 +545,7 @@ all-arches = [
 ]
 "p-eagle" = [
     "gpt-oss-20b-p-eagle",
+    "gpt-oss-20b-p-eagle-mixed",
 ]
 "qwen3-5-vl" = [
     "qwen3.5-9b",
@@ -701,6 +703,7 @@ all = [
     "gemma-4-26b-a4b-it-assistant",
     "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant",
     "gpt-oss-20b-p-eagle",
+    "gpt-oss-20b-p-eagle-mixed",
     "qwen3.5-9b",
     "qwen3.5-9b-parity-tiny",
     "qwen3.6-27b",

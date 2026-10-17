@@ -1,20 +1,38 @@
 {
-  "_comment": "AWS's P-EAGLE drafters (arXiv 2602.01469): EAGLE-3 trained to draft every token of a step in one forward, its rows past the newest reading learned placeholders (the `ptd_token_id` token's embedding and `mask_hidden`, which vLLM's `parallel_drafting` loads the same way). It ships as its own checkpoint with its own config, whose `architectures` reads `LlamaForCausalLM`, so it names its target config (`head_targets`) and the repo its target drafts with by default (`published_as`). Its tensors sit at the file's top level (`decoder_safetensors_prefix` empty): its first layer as `midlayer.*`, the rest as `layers.<L>.*`. It borrows only its target's lm_head (`borrows`): AWS froze it in training, so the drafter's own copy is the target's bit for bit; its embedding it trained, so that one is its own. It drafts over its target vocabulary's first 65536 ids (`vocab_size`, the lm_head rows it reads), as Qwen3.5's head does; its embedding keeps every id (`embed_vocab_size`), the mask token's (201020) among them. `target_hidden_size` is the width of the three target hidden states `fc` fuses.",
-  "hf_architectures": ["LlamaForCausalLM"],
+  "_comment": "AWS's P-EAGLE drafters (arXiv 2602.01469): EAGLE-3 trained to draft every token of a step in one forward, its rows past the newest reading learned placeholders (the `ptd_token_id` token's embedding and `mask_hidden`, which vLLM's `parallel_drafting` loads the same way). It ships as its own checkpoint with its own config, whose `architectures` reads `LlamaForCausalLM`, so it names its target config (`head_targets`). It drafts only when `--speculative-model` names a checkpoint of it (`spec/mtp` compiles it): no published drafter of it beats its target alone on a base M5 yet (gpt-oss-20b at MLX 4-bit, one request: 57 tok/s alone; 42 drafting with AWS's bf16 drafter, which reads 1.4 GB a pass; 54.5 with its `-mixed` conversion — MLPs and `fc` at 4 bits, attention and embedding at 8 — at 2.38-2.46 tokens a step). Its tensors sit at the file's top level (`decoder_safetensors_prefix` empty): its first layer as `midlayer.*`, the rest as `layers.<L>.*`. The `-mixed` stem is that conversion: a 4-bit embedding loses most of the mask rows' acceptance (an MLX transcription of vLLM's drafter: 2.30 -> 1.80 tokens a step), the mix none. It borrows only its target's lm_head (`borrows`): AWS froze it in training, so the drafter's own copy is the target's bit for bit; its embedding it trained, so that one is its own. It drafts over its target vocabulary's first 65536 ids (`vocab_size`, the lm_head rows it reads), as Qwen3.5's head does; its embedding keeps every id (`embed_vocab_size`), the mask token's (201020) among them. `target_hidden_size` is the width of the three target hidden states `fc` fuses.",
+  "hf_architectures": [
+    "LlamaForCausalLM"
+  ],
   "head_targets": {
-    "gpt-oss-20b-p-eagle": "gpt-oss/gpt-oss-20b"
+    "gpt-oss-20b-p-eagle": "gpt-oss/gpt-oss-20b",
+    "gpt-oss-20b-p-eagle-mixed": "gpt-oss/gpt-oss-20b"
   },
-  "published_as": {
-    "gpt-oss-20b-p-eagle-mlx-affine-b4-g64-qembed": "amazon/GPT-OSS-20B-P-EAGLE"
+  "parallel_drafting": {
+    "mask_token": "ptd_token_id",
+    "mask_hidden": "mask_hidden"
   },
-  "parallel_drafting": { "mask_token": "ptd_token_id", "mask_hidden": "mask_hidden" },
-  "borrows": ["lm_head"],
+  "borrows": [
+    "lm_head"
+  ],
   "decoder_safetensors_prefix": "",
   "scale_dtype": "bf16",
-  "bound_defaults": { "spec_drafts": 3, "spec_verify_rows": 8 },
+  "bound_defaults": {
+    "spec_drafts": 3,
+    "spec_verify_rows": 8
+  },
   "params": [
-    { "name": "embed_vocab_size", "from": "vocab_size" },
-    { "name": "vocab_size", "value": 65536, "replaces": true },
-    { "name": "target_hidden_size", "expr": "3 * hidden_size" }
+    {
+      "name": "embed_vocab_size",
+      "from": "vocab_size"
+    },
+    {
+      "name": "vocab_size",
+      "value": 65536,
+      "replaces": true
+    },
+    {
+      "name": "target_hidden_size",
+      "expr": "3 * hidden_size"
+    }
   ]
 }

@@ -1124,9 +1124,15 @@ fn per_module_lookup(
     // A top-level module's key IS the bare role (`lm_head`, outside the decoder root), which
     // the dot-anchored candidate cannot match.
     let top_level = |k: &str| index.is_none() && (k == role || k.starts_with(&format!("{role}.")));
+    // Keys are anchored at the file's root, so a decoder stored there (a drafter's bare
+    // `layers.<L>.*`) matches the dot-anchored candidate as a `model.`-rooted one does.
+    let rooted = |k: &str| format!(".{k}");
     per_module
         .iter()
-        .find(|(k, _)| k.ends_with(&candidate) || k.contains(&subtree) || top_level(k))
+        .find(|(k, _)| {
+            let k_rooted = rooted(k);
+            k_rooted.ends_with(&candidate) || k_rooted.contains(&subtree) || top_level(k)
+        })
         .map(|&(_, v)| v)
 }
 
