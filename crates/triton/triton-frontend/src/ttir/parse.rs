@@ -750,6 +750,26 @@ fn parse_op_line(p: &mut Parser, no: usize, t: &str) -> Result<Option<Op>, Parse
             .to_string();
     }
 
+    // ---- tt.fp_to_fp's rounding keyword ---------------------------------------
+    //
+    //   %q = tt.fp_to_fp %x, rounding = rtne : tensor<..xf16> -> tensor<..xf8E4M3FN>
+    //
+    // The narrowing cast's `rounding = rtne` sits between the operand and the `:`; the
+    // generic operand scan would read `rtne` as noise, so it is lifted out here.
+    if name == "tt.fp_to_fp"
+        && let Some(at) = work.find(", rounding = ")
+    {
+        let rest = &work[at + ", rounding = ".len()..];
+        let mode = rest.split(&[' ', ':'][..]).next().unwrap_or("");
+        let mode: &'static str = match mode {
+            "rtne" => "rtne",
+            "rtz" => "rtz",
+            _ => bail!((no, t), "unknown fp_to_fp rounding mode {mode:?}"),
+        };
+        op.attrs.insert("rounding".to_string(), Attr::Pred(mode));
+        work = format!("{}{}", &work[..at], &rest[mode.len()..]);
+    }
+
     // ---- tt.get_program_id / num_programs axis ---------------------------------
     if name == "tt.get_program_id" || name == "tt.get_num_programs" {
         let ax = work.trim().split(&[' ', ':'][..]).next().unwrap_or("x");
@@ -1131,6 +1151,25 @@ fn infer_result_types(name: &str, work: &str, op: &Op, p: &Parser) -> Vec<Type> 
         }
         return Vec::new();
     }
+    // `tt.load %p : !tt.ptr<i32>` prints only the POINTER's type (`type($ptr)` in
+    // `TT_LoadOp`'s assembly format); the result is the POINTEE (`TypesMatchWith<"result
+    // matches ptr type", ..., "getPointeeType($_self)">`). Read through the generic arm, the
+    // golden side claimed the load returns a pointer.
+    if name == "tt.load" {
+        if let Some((i, skip)) = find_type_sep(work)
+            && let Some(ty) = parse_type(work[i + skip..].trim())
+        {
+            return vec![match ty {
+                Type::Ptr(e, _) => (*e).clone(),
+                Type::Tensor(s, e) => match &*e {
+                    Type::Ptr(pe, _) => Type::Tensor(s, pe.clone()),
+                    _ => Type::Tensor(s, e),
+                },
+                other => other,
+            }];
+        }
+        return Vec::new();
+    }
     // `A -> B`: the results are on the right.
     if let Some(i) = find_top(work, " -> ") {
         let mut rhs = work[i + 4..].trim();
@@ -1166,6 +1205,13 @@ fn infer_result_types(name: &str, work: &str, op: &Op, p: &Parser) -> Vec<Type> 
             .iter()
             .filter_map(|t| parse_type(t))
             .collect();
+        // `arith.select %c, %a, %b : <cond type>, <result type>` — the custom form prints the
+        // CONDITION's type first (`i1` or a tensor of it) and the result's last; reading the
+        // first type typed every select's result as its mask. (`: T` alone, a scalar
+        // condition over the same type, is the one-type form and falls through.)
+        if name == "arith.select" && tys.len() == 2 {
+            return vec![tys[1].clone()];
+        }
         // Comparisons narrow to i1 (or a tensor of i1).
         if name == "arith.cmpi" || name == "arith.cmpf" {
             return tys

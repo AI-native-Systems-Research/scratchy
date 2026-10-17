@@ -91,6 +91,7 @@ fn target_independent_cases() -> Vec<common::Case> {
         common::swiglu("swiglu_mlp_tiledk", 128, 256, 64),
         common::embedding("embedding", 512, 128),
         common::embedding("embedding_granite", 49159, 4096),
+        common::expert_slab(),
         common::rmsnorm("rmsnorm", 128),
         common::rmsnorm("rmsnorm_granite", 4096),
         common::rope("rope", 4),
@@ -144,6 +145,24 @@ fn embedding_matches_golden() {
 #[test]
 fn embedding_granite_matches_golden() {
     check_case(&common::embedding("embedding_granite", 49159, 4096));
+}
+
+/// One routed expert's projection: the expert axis of a RANK-3 descriptor offset by a value
+/// read from memory (`tl.load(desc_ids + p)`, a scalar `tt.addptr` + `tt.load`), the slab
+/// collapsed by `tt.reshape` into a rank-2 `tl.dot`. Upstream's MoE matmul idiom
+/// (`_p_matmul.py:423`); the golden is real Triton's `make_ir` of `expert_slab.py`.
+#[test]
+fn expert_slab_matches_golden() {
+    check_case(&common::expert_slab());
+}
+
+/// The fused gemma-4 MoE kernel, router + experts in one program (`kernels/moe.py`): the
+/// slab gather three times per pair, the fp8 activation quantize (`tl.abs`, `tl.minimum`, the
+/// `tt.fp_to_fp` round trip), and the round-form top-k. The golden is real Triton's
+/// `make_ir` of the shipped kernel file.
+#[test]
+fn moe_matches_golden() {
+    check_case(&common::moe());
 }
 
 /// Granite's RMSNorm: a `tl.sum` reduction (which brings in two generated `standard.*`

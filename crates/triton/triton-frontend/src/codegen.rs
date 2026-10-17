@@ -1295,6 +1295,31 @@ impl<'a> CodeGen<'a> {
             CmpKind::Gt => CmpOp::Gt,
             CmpKind::GtE => CmpOp::Ge,
         };
+        // ⭐ A TENSOR'S COMPARISON DUNDERS MATERIALIZE THE OTHER SIDE FIRST. `tensor.__eq__`
+        // and its five siblings (`core.py:1028-1084`) call `to_tensor(other)` BEFORE
+        // `equal`/`less_than`/…, so a Python number on the right reaches the promotion as an
+        // already-typed TENSOR (`i32` for an int), not as a scalar — and the promotion then
+        // CASTS it (`arith.sitofp` for `f16 == 3`) instead of folding it into an f16
+        // constant. The arithmetic dunders (`__add__` etc.) do NOT do this, which is why
+        // `x + 1.0` still folds. Only the tensor-on-the-left case: a number on the left is
+        // Python's reflected comparison, which flips to the tensor's own dunder.
+        let (l, r) = match (&l, &r) {
+            (Val::Ir(_), other) if other.is_number() => {
+                let t = self
+                    .sem
+                    .to_tensor(other)
+                    .map_err(|e| Self::located(e, pos))?;
+                (l, Val::Ir(t))
+            }
+            (other, Val::Ir(_)) if other.is_number() => {
+                let t = self
+                    .sem
+                    .to_tensor(other)
+                    .map_err(|e| Self::located(e, pos))?;
+                (Val::Ir(t), r)
+            }
+            _ => (l, r),
+        };
         self.sem
             .compare(&l, &r, cop)
             .map(Val::Ir)
@@ -2445,15 +2470,25 @@ impl<'a> CodeGen<'a> {
                     .map(Val::Ir)
                     .map_err(|e| Self::located(e, pos))
             }
-            "maximum" => {
+            "maximum" | "minimum" => {
+                let want_max = name == "maximum";
                 let a = get(0, "x").ok_or_else(|| {
-                    Error::new("tl.maximum needs two arguments", pos.line, pos.col)
+                    Error::new(format!("tl.{name} needs two arguments"), pos.line, pos.col)
                 })?;
                 let b = get(1, "y").ok_or_else(|| {
-                    Error::new("tl.maximum needs two arguments", pos.line, pos.col)
+                    Error::new(format!("tl.{name} needs two arguments"), pos.line, pos.col)
                 })?;
                 self.sem
-                    .max_min(&a, &b, true)
+                    .max_min(&a, &b, want_max)
+                    .map(Val::Ir)
+                    .map_err(|e| Self::located(e, pos))
+            }
+            // `tl.abs(x)` -> `math.absf` (`math.py:178`'s floating arm). Only the float form:
+            // the integer `math.absi` and fp8e4b15's bitmask arm have no kernel that uses them.
+            "abs" => {
+                let x = self.ir_arg(&get(0, "x"), "tl.abs", pos)?;
+                self.sem
+                    .abs(x)
                     .map(Val::Ir)
                     .map_err(|e| Self::located(e, pos))
             }
@@ -2474,6 +2509,49 @@ impl<'a> CodeGen<'a> {
                 })?;
                 self.sem
                     .select(&c, &x, &y)
+                    .map(Val::Ir)
+                    .map_err(|e| Self::located(e, pos))
+            }
+            // `tl.load(pointer, mask=None, other=None, ...)` -> `tt.load`. ONLY THE SCALAR
+            // FORM: a pointer that is not a block (`ids + p`), no mask, no other -- the routed
+            // expert id an MoE kernel reads (`_p_matmul.py`). `semantic.load` refuses the
+            // rest; the KTIR side refuses a TILE raw load by name (`refuse_raw_tile_access`).
+            "load" => {
+                let p = self.ir_arg(&get(0, "pointer"), "tl.load", pos)?;
+                for (i, k) in [(1, "mask"), (2, "other")] {
+                    if !matches!(get(i, k), None | Some(Val::None)) {
+                        return Err(Error::new(
+                            format!(
+                                "tl.load's `{k}` is not supported: only the scalar pointer read \
+                                 (`tl.load(ptr + offset)`) is lowered"
+                            ),
+                            pos.line,
+                            pos.col,
+                        ));
+                    }
+                }
+                self.sem
+                    .load(p)
+                    .map(Val::Ir)
+                    .map_err(|e| Self::located(e, pos))
+            }
+            // `tl.reshape(input, shape, can_reorder=False)` -> `tt.reshape`.
+            "reshape" => {
+                let x = self.ir_arg(&get(0, "input"), "tl.reshape", pos)?;
+                let shape = self.const_shape(&get(1, "shape"), "tl.reshape", pos)?;
+                if !matches!(
+                    get(2, "can_reorder"),
+                    None | Some(Val::None) | Some(Val::Bool(false))
+                ) {
+                    return Err(Error::new(
+                        "tl.reshape(can_reorder=True) is not supported: a reordering reshape \
+                         has no defined element order to lower",
+                        pos.line,
+                        pos.col,
+                    ));
+                }
+                self.sem
+                    .reshape(x, &shape)
                     .map(Val::Ir)
                     .map_err(|e| Self::located(e, pos))
             }

@@ -374,12 +374,27 @@ fn convert_access_ops(module: &mut Module) -> Result<()> {
         .collect();
     let index = module.def_index();
     let mut edits: Vec<(OpPath, Vec<Op>)> = Vec::with_capacity(paths.len());
+    // The scalar id reads (and their `tt.addptr`) a slab gather consumed: its indirect tile
+    // reads the ids VIEW, so the read itself has no consumer left. Erased below, here,
+    // because `tt.load` is read-only and DCE keeps it -- and an unconverted `tt` op is a
+    // `to_ktir` refusal.
+    let mut consumed: Vec<Ssa> = Vec::new();
     for path in paths {
         let op = walk::at(module, &path).expect("path").clone();
         if !matches!(
             op.kind,
             OpKind::TtDescriptorLoad | OpKind::TtDescriptorStore
         ) {
+            continue;
+        }
+        // ⭐ A LOAD WHOSE OFFSET IS DATA IS A SLAB GATHER, NOT A DIRECT TILE. See
+        // [`slab_gather`]: the offset traces to a scalar `tt.load`, so the block's address
+        // depends on memory and the access must be an indirect tile.
+        if op.kind == OpKind::TtDescriptorLoad
+            && let Some((replacement, read)) = slab_gather(module, &index, &op)?
+        {
+            edits.push((path, replacement));
+            consumed.push(read);
             continue;
         }
         let view = descriptor_mem_view(&index, &op)
@@ -439,7 +454,341 @@ fn convert_access_ops(module: &mut Module) -> Result<()> {
         edits.push((path, replacement));
     }
     walk::splice_many(module, edits);
+    erase_consumed_id_reads(module, &consumed);
     Ok(())
+}
+
+/// Erase each scalar id read a slab gather consumed, and the `tt.addptr` it read through,
+/// when nothing else uses it. A read with another user stays, and then reaches `to_ktir` as
+/// an unconverted `tt` op -- a refusal by name, never a dropped value.
+fn erase_consumed_id_reads(module: &mut Module, reads: &[Ssa]) {
+    if reads.is_empty() {
+        return;
+    }
+    let index = module.def_index();
+    let used = walk::used_values(module);
+    let mut dead: std::collections::HashSet<Ssa> = std::collections::HashSet::new();
+    for r in reads {
+        if used.contains(r) {
+            continue;
+        }
+        dead.insert(*r);
+        if let Some(ptr) = index.def_of(*r).and_then(|l| l.operands.first().copied())
+            && index
+                .def_of(ptr)
+                .map(|d| d.kind == OpKind::TtAddptr)
+                .unwrap_or(false)
+        {
+            dead.insert(ptr);
+        }
+    }
+    // An addptr is dead only when its only reader was an erased load.
+    let after: std::collections::HashSet<Ssa> = module
+        .ops_deep()
+        .into_iter()
+        .filter(|o| !o.results.iter().any(|v| dead.contains(v)))
+        .flat_map(|o| o.operands.iter().copied())
+        .collect();
+    dead.retain(|v| !after.contains(v));
+    let paths: Vec<OpPath> = walk::paths(module)
+        .into_iter()
+        .filter(|p| {
+            walk::at(module, p)
+                .map(|o| o.results.iter().any(|v| dead.contains(v)))
+                .unwrap_or(false)
+        })
+        .collect();
+    walk::splice_many(module, paths.into_iter().map(|p| (p, Vec::new())).collect());
+}
+
+/// ⭐⭐⭐ THE SLAB GATHER — a `tt.descriptor_load` one of whose offsets is DATA.
+///
+/// Upstream's mixture-of-experts matmul (`triton_kernels/matmul_details/_p_matmul.py:423`)
+/// reads a routed expert id as a SCALAR (`expt = tl.load(ids + p)`) and offsets the expert
+/// axis of a rank-3 bank by it: `W.load([expt, n0, k0])`. The block's address then depends on
+/// memory, so a DIRECT access tile with the loaded scalar as an `index` operand would be
+/// well-formed KTIR that no consumer can address: the card's gather reads its index from
+/// memory (`idx · skip_addr + base`), and the emulator's `indirect_load` reads it from an
+/// index VIEW. This lowers it to the same `ktdp.construct_indirect_access_tile` a
+/// `tt.descriptor_gather` becomes, in the same subscript-map form `gather_subscripts` builds,
+/// so `to_ktir_emit` and both consumers read it unchanged:
+///
+/// ```text
+///   index view   a [n] memref over the ids POINTER the scalar was read through
+///   capture 0    the element offset p of that read (`tt.addptr %ids, %p`; 0 for `%ids`)
+///   dim d        INDIRECT: ids[c_0 + d_d] -- the routed id; d_d ranges over the block's 1
+///   other dims   direct: c_j + d_j -- the load's own constant offsets
+/// ```
+///
+/// `None` when no offset is data -- the direct path then lowers the load as before. `Some`
+/// carries the replacement ops and the scalar read the tile now subsumes.
+///
+/// ⛔ REFUSED BY NAME, NEVER GUESSED: two data offsets (one index view per tile, the
+/// `to_ktir_emit` law); a data offset on a dim whose block extent is not 1 (the id selects ONE
+/// slab; a wider block would need an index per row, which is `tt.descriptor_gather`); a data
+/// offset that is not a direct `tt.load` of `ptr + constant` (arithmetic on a read value has
+/// no index view to point at); and a non-constant direct offset beside a data one.
+fn slab_gather(module: &mut Module, index: &DefIndex, op: &Op) -> Result<Option<(Vec<Op>, Ssa)>> {
+    let offsets = &op.operands[1..];
+    let data: Vec<usize> = offsets
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| {
+            index
+                .def_of(**v)
+                .map(|d| d.kind == OpKind::TtLoad)
+                .unwrap_or(false)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let Some(&dim) = data.first() else {
+        return Ok(None);
+    };
+    if data.len() > 1 {
+        return Err(Refusal::new(
+            PASS,
+            format!(
+                "a tt.descriptor_load has {} data-dependent offsets; an indirect access tile \
+                 reads ONE index view, so only one axis may be offset by a loaded value",
+                data.len()
+            ),
+        ));
+    }
+    let desc_ty = op
+        .operands
+        .first()
+        .and_then(|v| index.type_of(*v))
+        .ok_or_else(|| Refusal::new(PASS, "descriptor operand has no type"))?;
+    let block_shape = desc_ty.dims().map(|d| d.to_vec()).unwrap_or_default();
+    if block_shape.get(dim).copied() != Some(1) {
+        return Err(Refusal::new(
+            PASS,
+            format!(
+                "a tt.descriptor_load offsets axis {dim} by a loaded value, but the block is \
+                 {block_shape:?} on that axis. A loaded offset selects ONE slab (block extent \
+                 1); selecting several rows by data is tt.descriptor_gather"
+            ),
+        ));
+    }
+    // The scalar read: `tt.load %p` where `%p` is the ids argument or `tt.addptr %ids, %c`.
+    let read = index.def_of(offsets[dim]).expect("filtered on a def above");
+    let ptr = *read
+        .operands
+        .first()
+        .ok_or_else(|| Refusal::new(PASS, "tt.load with no pointer operand"))?;
+    let (ids, elem_off) = match index.def_of(ptr) {
+        Some(add) if add.kind == OpKind::TtAddptr => {
+            let off = add
+                .operands
+                .get(1)
+                .and_then(|v| super::dot_to_linalg::const_int_index(index, *v))
+                .ok_or_else(|| {
+                    Refusal::new(
+                        PASS,
+                        "the slab id is read through `tt.addptr` by a non-constant offset; the \
+                         index view's subscript must be a compile-time element offset",
+                    )
+                })?;
+            (add.operands[0], off)
+        }
+        _ => (ptr, 0),
+    };
+    let elem = match index.type_of(ids) {
+        Some(IrType::Ptr { elem }) => elem,
+        other => {
+            return Err(Refusal::new(
+                PASS,
+                format!(
+                    "the slab id is read through a {other:?}, not a kernel pointer argument; \
+                     there is no memory view to point the indirect tile at"
+                ),
+            ));
+        }
+    };
+    if index.def_of(ids).is_some() {
+        return Err(Refusal::new(
+            PASS,
+            "the slab id's pointer is computed, not a kernel argument; there is no memory view \
+             to point the indirect tile at",
+        ));
+    }
+    let mut consts: Vec<i64> = Vec::with_capacity(offsets.len());
+    for (i, v) in offsets.iter().enumerate() {
+        if i == dim {
+            consts.push(0);
+            continue;
+        }
+        consts.push(
+            super::dot_to_linalg::const_int_index(index, *v).ok_or_else(|| {
+                Refusal::new(
+                    PASS,
+                    format!(
+                        "a slab-gather tt.descriptor_load has a non-constant offset on axis {i} \
+                         beside its data-dependent one; the indirect tile's direct subscripts \
+                         are compile-time constants here"
+                    ),
+                )
+            })?,
+        );
+    }
+    let view = descriptor_mem_view(index, op)
+        .ok_or_else(|| Refusal::new(PASS, "descriptor operand was not lowered by walk 1"))?;
+    let hint = op
+        .result()
+        .map(|r| module.hint(r))
+        .unwrap_or_else(|| "slab".into());
+    let mut out: Vec<Op> = Vec::new();
+    // The ids memory view: `[elem_off + 1]` is the extent the read addresses; the index view
+    // is a view of STORAGE, so its extent only bounds the subscripts the tile states.
+    let n = elem_off + 1;
+    let ids_idx = module.fresh_named(&hint);
+    out.push(
+        Op::new(OpKind::UnrealizedConversionCast)
+            .with_result(ids_idx, IrType::Index)
+            .with_operands([ids]),
+    );
+    let ids_view = module.fresh_named(&hint);
+    out.push(
+        Op::new(OpKind::KtdpConstructMemoryView)
+            .with_result(
+                ids_view,
+                IrType::MemRef {
+                    dims: vec![n],
+                    elem,
+                },
+            )
+            .with_operands([ids_idx])
+            .with_attr(AttrKey::Shape, Attr::IntList(vec![n]))
+            .with_attr(AttrKey::Strides, Attr::IntList(vec![1]))
+            .with_attr(
+                AttrKey::CoordinateSet,
+                Attr::AffineSet(build_range_set_nd(&[n])),
+            )
+            .with_attr(AttrKey::MemorySpace, Attr::Str("HBM".into())),
+    );
+    // One `index` constant per capture: the read's element offset, then each direct offset.
+    let mut captures: Vec<Ssa> = Vec::with_capacity(offsets.len());
+    for c in std::iter::once(elem_off).chain(
+        consts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != dim)
+            .map(|(_, c)| *c),
+    ) {
+        let v = module.fresh_named(&hint);
+        out.push(
+            Op::new(OpKind::ArithConstant)
+                .with_result(v, IrType::Index)
+                .with_attr(AttrKey::Value, Attr::Int(c)),
+        );
+        captures.push(v);
+    }
+    // The subscript maps, captures first then one iteration variable per block dim -- the
+    // domain `gather_subscripts` builds and `to_ktir_emit::rebase_subscript` re-bases.
+    let rank = block_shape.len();
+    let n_cap = captures.len();
+    let domain: Vec<String> = (0..n_cap + rank).map(|i| format!("d{i}")).collect();
+    let domain = domain.join(", ");
+    let mut kinds: Vec<String> = Vec::with_capacity(rank);
+    let mut maps: Vec<String> = Vec::with_capacity(rank);
+    let mut next_direct = 1usize;
+    for d in 0..rank {
+        let it = n_cap + d;
+        if d == dim {
+            kinds.push("true".to_string());
+            maps.push(format!("({domain}) -> (d0 + d{it})"));
+        } else {
+            kinds.push("false".to_string());
+            maps.push(format!("({domain}) -> (d{next_direct} + d{it})"));
+            next_direct += 1;
+        }
+    }
+    let space_dims: Vec<String> = (0..rank).map(|i| format!("d{i}")).collect();
+    let space_dims = space_dims.join(", ");
+    let mut constraints: Vec<String> = Vec::with_capacity(2 * rank);
+    for (i, extent) in block_shape.iter().enumerate() {
+        constraints.push(format!("d{i} >= 0"));
+        constraints.push(format!("-d{i} + {} >= 0", extent - 1));
+    }
+    let mut operands = vec![view];
+    operands.extend(captures.iter().copied());
+    operands.push(ids_view);
+    let region_args: Vec<(Ssa, IrType)> = (0..n_cap)
+        .map(|_| (module.fresh(), IrType::Index))
+        .collect();
+    let tile_val = module.fresh_named(&hint);
+    out.push(
+        Op::new(OpKind::KtdpConstructIndirectAccessTile)
+            .with_result(
+                tile_val,
+                IrType::AccessTile {
+                    dims: block_shape.clone(),
+                },
+            )
+            .with_operands(operands)
+            .with_attr(
+                AttrKey::Other("per_dim_subscript_kinds".into()),
+                Attr::StrList(kinds),
+            )
+            .with_attr(
+                AttrKey::Other("per_dim_subscript_maps".into()),
+                Attr::AffineMapList(maps),
+            )
+            .with_attr(
+                AttrKey::Other("variables_space_order".into()),
+                Attr::AffineMap(format!("({space_dims}) -> ({space_dims})")),
+            )
+            .with_attr(
+                AttrKey::Other("variables_space_set".into()),
+                Attr::AffineSet(format!("({space_dims}) : ({})", constraints.join(", "))),
+            )
+            .with_region(Region {
+                args: region_args,
+                ops: Vec::new(),
+            }),
+    );
+    let res = op.result().expect("a descriptor_load defines a value");
+    let ty = op
+        .result_type()
+        .cloned()
+        .ok_or_else(|| Refusal::new(PASS, "tt.descriptor_load has no result type"))?;
+    // ⛔ THE GATHER YIELDS THE BLOCK'S OWN RANK. `ttir-combine`'s rank reduction re-typed the
+    // load to drop the unit expert axis (`RankedReduceDescriptorLoads`), but an indirect tile
+    // is `[1, N, K]` -- the emulator's `indirect_load` returns exactly the tile's shape -- so
+    // the reduction is stated as the op that performs it: a `tensor.collapse_shape` to the
+    // load's declared type, whose target shape `to_ktir_emit` pins from that type.
+    let declared = ty.dims().map(|d| d.to_vec()).unwrap_or_default();
+    if declared == block_shape {
+        out.push(
+            Op::new(OpKind::KtdpLoad)
+                .with_result(res, ty)
+                .with_operands([tile_val]),
+        );
+    } else {
+        let elem = ty
+            .elem()
+            .ok_or_else(|| Refusal::new(PASS, "a slab gather's result has no element type"))?;
+        let full = module.fresh_named(&hint);
+        out.push(
+            Op::new(OpKind::KtdpLoad)
+                .with_result(
+                    full,
+                    IrType::Tensor {
+                        dims: block_shape.clone(),
+                        elem,
+                    },
+                )
+                .with_operands([tile_val]),
+        );
+        let kept: Vec<i64> = (0..rank as i64).filter(|i| *i as usize != dim).collect();
+        out.push(
+            Op::new(OpKind::TensorCollapseShape)
+                .with_result(res, ty)
+                .with_operands([full])
+                .with_attr(AttrKey::Reassociation, Attr::IntList(kept)),
+        );
+    }
+    Ok(Some((out, offsets[dim])))
 }
 
 /// `buildDirectAccessTile`. The memory view describes the full tensor; the block

@@ -47,18 +47,33 @@ use crate::py::ast::{AssignTarget, Expr, FunctionDef, PyModule, Stmt};
 
 /// The `tl.*` surface the fixtures reach, by dotted name with the `tl.` prefix stripped.
 pub const TL_FUNCTIONS: &[&str] = &[
+    // Not in the five-fixture census: the MoE kernel's per-token fp8 activation scale,
+    // `amax(|x|)` (`moe.py`). The floating `math.absf` arm only.
+    "abs",
     "arange",
     "dot",
     "exp",
     "fdiv",
     "full",
+    // Not in the five-fixture census: the routed expert id of a mixture-of-experts kernel,
+    // read as ONE SCALAR through a pointer (`tl.load(ids + p)`, upstream `_p_matmul.py`'s
+    // idiom). Only the scalar form is lowered; a pointer TILE load is refused downstream
+    // (`refuse_raw_tile_access`), and here at the semantic layer.
+    "load",
     "make_tensor_descriptor",
     "math.exp2",
     "max",
     "maximum",
+    // Not in the five-fixture census: the MoE kernel's fp8 clamps (`moe.py`), `arith.minnumf`
+    // beside `maximum`'s `arith.maxnumf` (`semantic.py:366`'s PropagateNan.NONE arm).
+    "minimum",
     "multiple_of",
     "program_id",
     "range",
+    // Not in the five-fixture census: the size-1 expert axis of a rank-3 slab load dropped
+    // so the slab feeds a rank-2 `tl.dot` (`_p_matmul.py:423`'s `tl.reshape(W.load(...),
+    // W.block_shape[1:])`). `tt.reshape`, element count preserved, never reordering.
+    "reshape",
     "rsqrt",
     "math.rsqrt",
     "static_assert",
@@ -85,8 +100,22 @@ pub const BUILTINS: &[&str] = &["float", "range"];
 
 /// The dtype attributes reached as `tl.<name>`.
 pub const TL_DTYPES: &[&str] = &[
-    "float16", "float32", "bfloat16", "float64", "int1", "int8", "int16", "int32", "int64",
-    "uint8", "uint16", "uint32", "uint64",
+    "float16",
+    "float32",
+    "bfloat16",
+    "float64",
+    "int1",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    // e4m3, the one fp8 the card computes in: the MoE kernel's activation codes
+    // (`q.to(tl.float8e4nv)`, `moe.py`). `parse_dtype` already reads it from a signature.
+    "float8e4nv",
 ];
 
 /// Module aliases that mean "the triton language module".

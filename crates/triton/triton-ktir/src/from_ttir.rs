@@ -88,6 +88,9 @@ pub const OP_SET: &[&str] = &[
     "arith.divsi",
     "arith.remsi",
     "arith.maxnumf",
+    // The MoE kernel's fp8 clamps (`moe.py`): `tl.minimum` beside `tl.maximum`. `ArithMinnumf`
+    // is modelled one to one, as `ArithMaxnumf` is.
+    "arith.minnumf",
     "arith.extf",
     "arith.truncf",
     "arith.negf", // Other, on purpose
@@ -111,6 +114,13 @@ pub const OP_SET: &[&str] = &[
     "math.exp2",
     "math.rsqrt", // Other, on purpose
     "math.tanh",
+    // `tl.abs` on a float (`moe.py`'s per-token `amax(|x|)`). Rides `Other` like `rsqrt`:
+    // `to_ktir_emit`'s Other arm names `KOpKind::MathAbsf`.
+    "math.absf", // Other, on purpose
+    // `x.to(tl.float8e4nv)` and back (`semantic.py:840`): the fp8 weight widening and the
+    // MoE kernel's activation codes. [`fp_to_fp_as_arith`] admits it AS `arith.extf` /
+    // `arith.truncf` at the fp8 element type, so no `tt.fp_to_fp` exists past this adapter.
+    "tt.fp_to_fp",
     // triton
     "tt.get_program_id",
     // `tl.arange` -- the lane vector the router index kernels select with. Its
@@ -123,6 +133,14 @@ pub const OP_SET: &[&str] = &[
     "tt.descriptor_load",
     "tt.descriptor_store",
     "tt.descriptor_gather",
+    // The routed expert id of `expert_slab.ttir.mlir`: one SCALAR read through a pointer,
+    // `tt.addptr %ids, %p : !tt.ptr<i32>, i32` then `tt.load %ptr : !tt.ptr<i32>` -- no
+    // mask, no other, no attributes (the default `isVolatile` prints as nothing). Both
+    // types map one to one (`IrType::Ptr`, `IrType::Scalar`). `convert_ttir_to_ktdp`
+    // consumes the read as the INDIRECT offset of a slab load; a raw TILE load stays
+    // refused by name there (`refuse_raw_tile_access`).
+    "tt.addptr",
+    "tt.load",
     "tt.dot",
     "tt.trans",
     "tt.reduce",
@@ -259,6 +277,66 @@ fn func(m: &ttir::Module, f: &ttir::Func) -> Result<Op> {
     Ok(op)
 }
 
+/// `tt.fp_to_fp` AS THE `arith` CAST IT IS — `arith.extf` widening, `arith.truncf`
+/// narrowing — at the SAME element types, so the fp8 side stays `f8E4M3FN` on the value.
+///
+/// ⭐ AT THE ENTRY, NOT IN A LATER PASS. Before the fp8 cast had its own spelling, the
+/// front end emitted the fp8 weight's widening as `arith.extf`, and every pass between here
+/// and `to_ktir` keys on that op: `dot_to_linalg`'s fp8 peel, `legalize_types`, the fused
+/// segment planner's charge for the widened tile. Mapping `tt.fp_to_fp` here hands every one
+/// of them the op it already reads, so `matmul_fp8.py` / `expertmatmul.py` lower exactly as
+/// before (byte-identical descriptors) and nothing downstream needs a second spelling.
+///
+/// `tt.fp_to_fp` exists in Triton because MLIR's `arith` cannot spell a non-default
+/// rounding or the custom fp8 formats; at KTIR the cast the kernels spell is exactly an
+/// e4m3 narrowing under round-to-nearest-even and a widening back. ⛔ ONLY those: a
+/// narrowing whose `rounding` is anything but `rtne`, or an fp8 format other than
+/// `f8E4M3FN`, is refused by name — no consumer rounds to it.
+fn fp_to_fp_as_arith(m: &ttir::Module, o: &ttir::Op) -> Result<Option<OpKind>> {
+    if o.name != "tt.fp_to_fp" {
+        return Ok(None);
+    }
+    let elem = |v: ttir::ValueId| m.ty(v).scalar().clone();
+    let src = o
+        .operands
+        .first()
+        .map(|v| elem(*v))
+        .ok_or_else(|| Refusal::new(PASS, "tt.fp_to_fp without an operand"))?;
+    let dst = o
+        .results
+        .first()
+        .map(|v| elem(*v))
+        .ok_or_else(|| Refusal::new(PASS, "tt.fp_to_fp without a result"))?;
+    let fp8 = |t: &ttir::Type| matches!(t, ttir::Type::Float(ttir::FloatKind::F8E4M3FN));
+    let float = |t: &ttir::Type| matches!(t, ttir::Type::Float(_));
+    match (fp8(&src), fp8(&dst)) {
+        (false, true) if float(&src) => {
+            match o.attrs.get("rounding") {
+                Some(ttir::Attr::Pred("rtne")) => {}
+                other => {
+                    return Err(Refusal::new(
+                        PASS,
+                        format!(
+                            "tt.fp_to_fp narrowing to e4m3 with rounding {other:?}: only \
+                             `rtne` (Triton's default downcast, `semantic.py:826`) has a \
+                             consumer"
+                        ),
+                    ));
+                }
+            }
+            Ok(Some(OpKind::ArithTruncf))
+        }
+        (true, false) if float(&dst) => Ok(Some(OpKind::ArithExtf)),
+        _ => Err(Refusal::new(
+            PASS,
+            format!(
+                "tt.fp_to_fp from {src} to {dst}: only the e4m3 round trip (f16/f32 <-> \
+                 f8E4M3FN) is lowered"
+            ),
+        )),
+    }
+}
+
 fn operation(m: &ttir::Module, o: &ttir::Op) -> Result<Op> {
     if !OP_SET.contains(&o.name.as_str()) {
         return Err(Refusal::new(
@@ -274,7 +352,7 @@ fn operation(m: &ttir::Module, o: &ttir::Op) -> Result<Op> {
             ),
         ));
     }
-    let kind = OpKind::from_spelling(&o.name);
+    let kind = fp_to_fp_as_arith(m, o)?.unwrap_or_else(|| OpKind::from_spelling(&o.name));
     let mut out = Op::new(kind);
     out.operands = o.operands.iter().map(|v| Ssa(v.0)).collect();
     for r in &o.results {
@@ -294,6 +372,12 @@ fn operation(m: &ttir::Module, o: &ttir::Op) -> Result<Op> {
     // BTreeMap iterates in key order, which is the order the text reader sees them in a
     // printed dictionary, so the two sides' attribute lists agree without sorting here.
     for (k, v) in &o.attrs {
+        // `tt.fp_to_fp`'s `rounding` is CONSUMED by `fp_to_fp_as_arith`, which admitted only
+        // `rtne` — `arith.truncf`'s own semantics — so it carries nothing the cast's kind
+        // does not already state, and no later reader has a key for it.
+        if o.name == "tt.fp_to_fp" && k == "rounding" {
+            continue;
+        }
         if !ATTR_KEYS.contains(&k.as_str()) {
             return Err(Refusal::new(
                 PASS,
