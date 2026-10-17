@@ -261,8 +261,53 @@ impl AnthropicUsage {
 // Conversion: Anthropic request → ChatCompletionRequest
 // ---------------------------------------------------------------------------
 
+/// Where a request's last prompt-cache breakpoint is: a block of the `system` parameter, or a
+/// block of a conversation message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Breakpoint {
+    System(usize),
+    Message(usize, usize),
+}
+
+/// The last of the client's `cache_control` breakpoints in prompt order — the system parameter's
+/// blocks, then the conversation's: the furthest point it declares stable for its next request.
+fn last_breakpoint(req: &MessagesRequest) -> Option<Breakpoint> {
+    let marked = |b: &ContentBlock| match b {
+        ContentBlock::Text { cache_control, .. }
+        | ContentBlock::ToolResult { cache_control, .. } => cache_control.is_some(),
+        _ => false,
+    };
+    let in_conversation =
+        (req.messages.iter().enumerate().rev()).find_map(|(i, m)| match &m.content {
+            MessageContent::Blocks(blocks) => {
+                (blocks.iter().rposition(marked)).map(|j| Breakpoint::Message(i, j))
+            }
+            MessageContent::Text(_) => None,
+        });
+    in_conversation.or_else(|| match &req.system {
+        Some(SystemParam::Blocks(blocks)) => {
+            (blocks.iter().rposition(|b| b.cache_control.is_some())).map(Breakpoint::System)
+        }
+        _ => None,
+    })
+}
+
 fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
     let mut messages = Vec::new();
+
+    // ⭐ THE CLIENT'S LAST PROMPT-CACHE BREAKPOINT, marked at the end of its block's text
+    // (`CACHE_BREAKPOINT`): the chat path takes the mark out and keeps the prompt length that
+    // reaches it (`EngineCoreRequest::cache_breakpoints`), where a model with recurrent state
+    // snapshots it. Claude Code's permission classifier inserts each new transcript entry before a
+    // fixed tail, so its next request shares the prompt only through the breakpoint before that
+    // tail — never through the prompt's end, where every request is snapshotted.
+    let breakpoint = last_breakpoint(&req);
+    let mark = move |mut text: String, at: Breakpoint| {
+        if breakpoint == Some(at) {
+            text.push(crate::engine::CACHE_BREAKPOINT);
+        }
+        text
+    };
 
     // ⭐ ONE SYSTEM MESSAGE, FIRST, AND EVERY OTHER MESSAGE WHERE IT IS. Chat templates take a system
     // message only at the start (Qwen3.5/3.6's raises "System message must be at the beginning"),
@@ -275,11 +320,13 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
     // MESSAGE ENDS — ahead of the whole conversation — so no turn's prefix cache reached past it:
     // measured under Claude Code on Qwen3.6, every turn re-prefilled everything after the ~17k
     // tokens of system prompt and tools. In place, each turn extends the one before it.
-    let system_text = |content: &MessageContent| match content {
+    let system_text = |i: usize, content: &MessageContent| match content {
         MessageContent::Text(t) => t.clone(),
-        MessageContent::Blocks(blocks) => (blocks.iter())
-            .filter_map(|b| match b {
-                ContentBlock::Text { text, .. } => Some(text.clone()),
+        MessageContent::Blocks(blocks) => (blocks.iter().enumerate())
+            .filter_map(|(j, b)| match b {
+                ContentBlock::Text { text, .. } => {
+                    Some(mark(text.clone(), Breakpoint::Message(i, j)))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -291,13 +338,16 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
     let system: Vec<String> = match req.system {
         None => Vec::new(),
         Some(SystemParam::Text(t)) => vec![t],
-        Some(SystemParam::Blocks(blocks)) => blocks.into_iter().map(|b| b.text).collect(),
+        Some(SystemParam::Blocks(blocks)) => (blocks.into_iter().enumerate())
+            .map(|(j, b)| mark(b.text, Breakpoint::System(j)))
+            .collect(),
     }
     .into_iter()
     .chain(
         req.messages[..leading]
             .iter()
-            .map(|m| system_text(&m.content)),
+            .enumerate()
+            .map(|(i, m)| system_text(i, &m.content)),
     )
     .collect();
     if !system.is_empty() {
@@ -312,9 +362,9 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
     }
 
     // Convert messages
-    for msg in req.messages.into_iter().skip(leading) {
+    for (i, msg) in req.messages.into_iter().enumerate().skip(leading) {
         if msg.role == AnthropicRole::System {
-            let text = system_text(&msg.content);
+            let text = system_text(i, &msg.content);
             match messages.last_mut() {
                 Some(protocol::ChatCompletionMessageParam {
                     role,
@@ -352,9 +402,11 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
                 let mut tool_calls = Vec::new();
                 let mut tool_results: Vec<(String, String)> = Vec::new();
 
-                for block in blocks {
+                for (j, block) in blocks.into_iter().enumerate() {
                     match block {
-                        ContentBlock::Text { text, .. } => text_parts.push(text),
+                        ContentBlock::Text { text, .. } => {
+                            text_parts.push(mark(text, Breakpoint::Message(i, j)))
+                        }
                         ContentBlock::Image { .. } => {}
                         ContentBlock::Thinking { thinking, .. } => thinking_parts.push(thinking),
                         ContentBlock::ToolUse { id, name, input } => {
@@ -383,7 +435,7 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
                                     .join("\n"),
                                 None => String::new(),
                             };
-                            tool_results.push((tool_use_id, text));
+                            tool_results.push((tool_use_id, mark(text, Breakpoint::Message(i, j))));
                         }
                     }
                 }
@@ -1559,6 +1611,46 @@ mod tests {
                 ))
             ),
             "the reminder joins the tool result before it"
+        );
+    }
+
+    /// Claude Code's permission classifier marks its transcript entries as cache breakpoints, then
+    /// closes the transcript and adds its instructions. Only the LAST breakpoint is marked in the
+    /// converted text, at the end of its entry, ahead of the tail every next call re-sends after a
+    /// new entry.
+    #[test]
+    fn test_the_last_cache_breakpoint_is_marked_at_its_end() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "max_tokens": 50,
+            "system": [{"type": "text", "text": "Classify.", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "<transcript>"},
+                {"type": "text", "text": "entry 1", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "entry 2", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "</transcript>"},
+                {"type": "text", "text": "Answer <block> or <allow>."}
+            ]}]
+        }))
+        .expect("parses");
+        let chat = convert_request(req);
+        let text = |i: usize| {
+            chat.messages[i]
+                .content
+                .as_ref()
+                .and_then(Value::as_str)
+                .unwrap()
+        };
+        let mark = crate::engine::CACHE_BREAKPOINT;
+        assert_eq!(
+            text(0),
+            "Classify.",
+            "the system breakpoint is not the last"
+        );
+        assert_eq!(
+            text(1),
+            format!(
+                "<transcript>\nentry 1\nentry 2{mark}\n</transcript>\nAnswer <block> or <allow>."
+            )
         );
     }
 

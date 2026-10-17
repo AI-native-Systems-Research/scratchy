@@ -830,6 +830,7 @@ impl LLM {
                         block_annotations: prompt_data[p_idx].1.clone(),
                         seal,
                         volatile,
+                        cache_breakpoints: Vec::new(),
                     })
                     .map_err(|e| anyhow::anyhow!("add_request failed: {e}"))?;
 
@@ -1114,6 +1115,7 @@ impl LLM {
                 block_annotations: None,
                 seal: false,
                 volatile: false,
+                cache_breakpoints: Vec::new(),
             })
             .map_err(|e| anyhow::anyhow!("add_request failed: {e}"))?;
         let _d_submit = _t_submit.elapsed();

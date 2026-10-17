@@ -2413,19 +2413,32 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         // A pooling request finishes after one step and a volatile one is one-shot by contract:
         // nothing resumes from either, so neither takes a snapshot slot.
         if !request.is_pooling && !request.volatile {
-            // Two positions are worth a snapshot: the prompt's own end, short of the generation
-            // prompt the next turn re-renders, and — for a request that starts cold — where its
-            // KV match with an earlier prompt ends: a prefix two requests share with no state to
-            // show for it, where the next one to share it resumes. A request that restored a
-            // snapshot has state on its prefix; past it lies the conversation it continues, whose
-            // next turn its own end serves. A resumed request is planned from its PROMPT, not its
-            // output so far: the prompt end is the snapshot that it — and its next turn — can use.
+            // Three positions are worth a snapshot: the prompt's own end, short of the generation
+            // prompt the next turn re-renders; for a request that starts cold, where its KV match
+            // with an earlier prompt ends — a prefix two requests share with no state to show for
+            // it, where the next one to share it resumes; and the client's prompt-cache
+            // breakpoints (`Request::cache_breakpoints`), where it declares the prompt stable for
+            // the requests after it, wherever those diverge from this one. A request that restored
+            // a snapshot has state on its prefix; past it lies the conversation it continues,
+            // whose next turn its own end serves. A resumed request is planned from its PROMPT,
+            // not its output so far: the prompt end is the snapshot that it — and its next turn —
+            // can use.
             let end = (request.num_prompt_tokens as usize)
                 .saturating_sub(GENERATION_PROMPT_ALLOWANCE)
                 / bs;
             let junction = (tokens == 0).then_some(kv_blocks.min(end));
+            let breakpoints = (request.cache_breakpoints.iter())
+                .map(|&t| t as usize / bs)
+                .filter(|&b| b <= end);
+            let mut points: Vec<usize> = junction
+                .into_iter()
+                .chain(breakpoints)
+                .chain([end])
+                .collect();
+            points.sort_unstable();
+            points.dedup();
             let mut from = tokens as usize;
-            for b in junction.into_iter().chain([end]) {
+            for b in points {
                 let position = b * bs;
                 if position > from && !rec.snapshots.contains(hashes[b - 1]) {
                     save_points.push((position as u32, hashes[b - 1]));
@@ -8055,6 +8068,40 @@ mod tests {
             out.recurrent_state.memory.release_snapshots,
             vec![SnapshotUnit(other.slot as u32)],
             "the other snapshot's memory, not the restored one's"
+        );
+    }
+
+    /// A request's prompt-cache breakpoint is a snapshot of its own, beside its end: the request
+    /// after it shares the prompt only through the breakpoint (Claude Code's permission classifier
+    /// inserts each entry before a fixed tail) and resumes there.
+    #[test]
+    fn recurrent_a_cache_breakpoint_is_snapshotted_and_resumed_from() {
+        let mut sched = recurrent_scheduler(4, 4096);
+        let entries: Vec<u32> = (0..500).collect();
+        let tail: Vec<u32> = (9000..9100).collect();
+        let mut first = request_with("c1", entries.iter().chain(&tail).copied().collect());
+        first.cache_breakpoints = vec![500];
+        sched.add_request(first);
+        let out = run_step(&mut sched);
+        let saved: Vec<u32> = (out.recurrent_state.saves.iter())
+            .map(|op| op.position)
+            .collect();
+        // floor(500 / 16) * 16 = 496, and the end: floor((600 - 8) / 16) * 16 = 592.
+        assert_eq!(saved, vec![496, 592]);
+        prefill_and_finish(&mut sched, "c1");
+
+        // The next call: the same entries, a new one, then the tail again.
+        let next: Vec<u32> = (entries.iter())
+            .chain(&(5000..5040).collect::<Vec<u32>>())
+            .chain(&tail)
+            .copied()
+            .collect();
+        sched.add_request(request_with("c2", next));
+        let out = run_step(&mut sched);
+        assert_eq!(out.recurrent_state.restores.len(), 1);
+        assert_eq!(
+            out.recurrent_state.restores[0].position, 496,
+            "at the breakpoint"
         );
     }
 

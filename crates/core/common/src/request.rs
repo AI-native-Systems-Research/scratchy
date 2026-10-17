@@ -506,6 +506,13 @@ pub struct Request {
     #[serde(default)]
     pub volatile: bool,
 
+    /// The prompt lengths at the client's prompt-cache breakpoints (Anthropic `cache_control`):
+    /// where it declares the prompt stable for the requests after it. A model with recurrent state
+    /// snapshots its state there, so those requests resume at the breakpoint. Empty for every other
+    /// request.
+    #[serde(default)]
+    pub cache_breakpoints: Vec<u32>,
+
     /// ⭐ WHAT THE WORKER'S KV LOOKS LIKE FOR THIS REQUEST — reported back every step by backends whose
     /// keys do not sit at their token positions, and `None` for the ones where they do (cuda/metal).
     ///
@@ -567,6 +574,7 @@ impl Request {
             block_annotations: None,
             seal: false,
             volatile: false,
+            cache_breakpoints: Vec::new(),
             kv_extent: None,
         }
     }

@@ -165,6 +165,7 @@ mod tests {
             block_annotations: None,
             seal: false,
             volatile: false,
+            cache_breakpoints: Vec::new(),
         };
 
         let encoded = encode(&req).unwrap();
@@ -298,6 +299,7 @@ mod tests {
             block_annotations: None,
             seal: false,
             volatile: false,
+            cache_breakpoints: Vec::new(),
         };
 
         let encoded = encode(&req).unwrap();
@@ -329,6 +331,7 @@ mod tests {
             block_annotations: None,
             seal: false,
             volatile: false,
+            cache_breakpoints: Vec::new(),
         };
 
         let encoded = encode(&req).unwrap();

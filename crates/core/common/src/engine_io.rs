@@ -154,6 +154,13 @@ pub struct EngineCoreRequest {
     /// Deprioritize cached blocks for eviction after completion.
     #[serde(default)]
     pub volatile: bool,
+
+    /// The prompt lengths at the client's prompt-cache breakpoints (Anthropic `cache_control`):
+    /// where it declares the prompt stable for the requests after it. A model with recurrent state
+    /// snapshots its state there, so those requests resume at the breakpoint. Empty for every other
+    /// request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_breakpoints: Vec<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +410,7 @@ mod tests {
             block_annotations: None,
             seal: false,
             volatile: false,
+            cache_breakpoints: Vec::new(),
         };
         assert_eq!(req.request_id, "req-1");
         assert_eq!(req.prompt_token_ids.as_ref().unwrap().len(), 3);
@@ -428,6 +436,7 @@ mod tests {
             block_annotations: None,
             seal: false,
             volatile: false,
+            cache_breakpoints: Vec::new(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let req2: EngineCoreRequest = serde_json::from_str(&json).unwrap();
