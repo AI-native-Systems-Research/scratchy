@@ -59,9 +59,9 @@ fn only_an_unbatched_fp16_matmul_inside_the_ear_envelope_is_staged_by_dxp() {
     );
     // Past the envelope: a stated division whose slab is the 31b lm_head's measured 176.2
     // MB/core — the slab dxp refused with the EAR overflow. (The cost model's own division of
-    // that two-row form — `mb`×2 × `out`×16, `in` whole — is pinned by the wiring test below;
-    // this one states different factors to the same product, so the law does not lean on the
-    // cost model's choice.)
+    // that two-row form — `{in:2, mb:2, out:8}` — is pinned by the wiring test below; this one
+    // states different factors to the same product, so the law does not lean on the cost
+    // model's choice.)
     let over = slab_plan(2, 262144, 5376, &[("in", 2), ("out", 8)]);
     assert_eq!(
         KernelSlab::of_plan(&over, Df::Fp16).bytes(),
@@ -126,38 +126,78 @@ fn granite_8b_projections_emit_one_untiled_op_at_every_row_count() {
 }
 
 /// The gemma-4 lm_heads STRADDLE the whole-dxp EAR envelope, at the same 262144-wide vocabulary.
-/// The cost model divides the vocabulary `out`×16 and spends its other core factor on `in` at one
-/// row (`in`×2) or on `mb` itself at two (`mb`×2, leaving `in` WHOLE — the per-core KERNEL slab
-/// doubles with it): the 31b's two-row form is past the envelope (the slab dxp refused at bake,
-/// `MutableAddrSplitting.cpp:814`), its one-row form and the 12b's and 26b-A4B's forms at both row
-/// counts are inside it (the card-proven whole-dxp forms). The failing descriptor ran at mb=2.
+/// The cost model spends all 32 core-factors on the vocabulary at one row (`{in:1, mb:1,
+/// out:32}`) and splits `{in:2, mb:2, out:8}` at two — the divisions read off the BAKED
+/// descriptors (the 31b's killing sdsc on main and the 12b's accepted one both carried
+/// `{in:2, mb:2, out:8}` at two rows; both models' one-row suffix lm_heads carried
+/// `{in:1, mb:1, out:32}`). The per-core KERNEL slab doubles with the row count — per-core
+/// `in` halves while per-core `out` quadruples, and the `mb` split never divides the kernel to
+/// relieve it: the 31b's two-row form is past the envelope (the slab dxp refused at bake,
+/// `MutableAddrSplitting.cpp:814`), its one-row form and the 12b's and 26b-A4B's forms at both
+/// row counts are inside it (the card-proven whole-dxp forms). The failing descriptor ran at
+/// mb=2.
 #[test]
 fn gemma4_lm_heads_split_at_the_whole_dxp_ear_envelope() {
-    // (model, rows, hidden = K, expected per-core kernel slab, expected frontend trips)
+    // (model, rows, hidden = K, the measured division {in, mb, out}, expected per-core kernel
+    // slab, expected frontend trips)
     let heads = [
-        // 31b: mb=1 divides in×2 × out×16 ⇒ 2688×16384×2 = 88.1 MB/core (inside the envelope);
-        // mb=2 divides mb×2 × out×16 with `in` whole ⇒ 5376×16384×2 = 176.2 MB/core — the
+        // 31b: mb=1 spends all 32 core-factors on `out` ⇒ 5376×8192×2 = 88.1 MB/core (inside the
+        // envelope); mb=2 splits {in:2, mb:2, out:8} ⇒ 2688×32768×2 = 176.2 MB/core — the
         // refused slab (the failing bundle's input was 2×5376).
-        ("gemma-4-31b", 1u32, 5376u32, 2688u64 * 16384 * 2, false),
-        ("gemma-4-31b", 2, 5376, 5376 * 16384 * 2, true),
-        // 12b: 1920×16384×2 = 62.9 MB at mb=1; 3840×16384×2 = 125.8 MB at mb=2 — the largest
-        // slab any of its whole-dxp forms routes, card-proven coherent.
-        ("gemma-4-12b", 1, 3840, 1920 * 16384 * 2, false),
-        ("gemma-4-12b", 2, 3840, 3840 * 16384 * 2, false),
-        // 26b-A4B: 1408×16384×2 = 46.1 MB at mb=1; 2816×16384×2 = 92.3 MB at mb=2 — bakes green
+        (
+            "gemma-4-31b",
+            1u32,
+            5376u32,
+            (1u32, 1, 32),
+            5376u64 * 8192 * 2,
+            false,
+        ),
+        ("gemma-4-31b", 2, 5376, (2, 2, 8), 2688 * 32768 * 2, true),
+        // 12b: 3840×8192×2 = 62.9 MB at mb=1; 1920×32768×2 = 125.8 MB at mb=2 — the largest
+        // slab any of its whole-dxp forms routes, ONE descriptor in the dump, card-proven
+        // coherent.
+        ("gemma-4-12b", 1, 3840, (1, 1, 32), 3840 * 8192 * 2, false),
+        ("gemma-4-12b", 2, 3840, (2, 2, 8), 1920 * 32768 * 2, false),
+        // 26b-A4B: 2816×8192×2 = 46.1 MB at mb=1; 1408×32768×2 = 92.3 MB at mb=2 — bakes green
         // whole-dxp at both.
-        ("gemma-4-26b-a4b", 1, 2816, 1408 * 16384 * 2, false),
-        ("gemma-4-26b-a4b", 2, 2816, 2816 * 16384 * 2, false),
+        (
+            "gemma-4-26b-a4b",
+            1,
+            2816,
+            (1, 1, 32),
+            2816 * 8192 * 2,
+            false,
+        ),
+        (
+            "gemma-4-26b-a4b",
+            2,
+            2816,
+            (2, 2, 8),
+            1408 * 32768 * 2,
+            false,
+        ),
     ];
-    for (model, m, k, want_slab, want_trips) in heads {
+    for (model, m, k, want_split, want_slab, want_trips) in heads {
         let op = matmul_opspec(m, 262144, k, 1, "a", "w", "o")
             .unwrap_or_else(|e| panic!("{model} at {m} rows: {e}"));
+        // The DIVISION the bake ran, not just its product: at these shapes the slab bytes
+        // cannot tell `{in:2, mb:2, out:8}` apart from other factors to the same product, so
+        // the wiring is pinned on the split triple the baked descriptors carried.
+        assert_eq!(
+            (
+                op.iter.split_of("in"),
+                op.iter.split_of("mb"),
+                op.iter.split_of("out")
+            ),
+            want_split,
+            "{model} at {m} rows: the cost model's division of the lm_head moved, and the \
+             envelope's slab with it"
+        );
         let slab = KernelSlab::of_plan(&op.iter, Df::Fp16).bytes();
         assert_eq!(
             slab, want_slab,
-            "{model} at {m} rows: the per-core kernel slab is {} B, not the measured {} B — the \
-             cost model's division of the lm_head moved, and the envelope's boundary with it",
-            slab, want_slab
+            "{model} at {m} rows: the per-core kernel slab is {slab} B, not the measured \
+             {want_slab} B — the envelope's boundary moved with the division"
         );
         assert_eq!(
             op.time_tile.is_some(),

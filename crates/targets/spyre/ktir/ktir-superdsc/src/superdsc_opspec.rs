@@ -1190,31 +1190,36 @@ impl WorkPlan {
 /// [`MatmulStaging::Dxp`] matmul may route.
 ///
 /// MEASURED, one card, at the gemma-4 lm_heads (all `[m, hidden]·[hidden, 262144]`; the cost
-/// model divides the 262144-wide vocabulary `out`×16 and spends its other core factor on `in`
-/// at one row (`in`×2) or on `mb` itself at two (`mb`×2, leaving `in` WHOLE — the per-core
-/// KERNEL slab doubles with it, since the `mb` split never divides the kernel):
-///   * 31b (hidden 5376), the two-row decode form: `5376 × 16384 × 2 B = 176.2 MB/core` — dxp
+/// model spends all 32 core-factors on the vocabulary at one row (`{in:1, mb:1, out:32}`) and
+/// splits `{in:2, mb:2, out:8}` at two — the divisions read off the baked descriptors — so the
+/// per-core KERNEL slab doubles with the row count: per-core `in` halves while per-core `out`
+/// quadruples, and the `mb` split never divides the kernel to relieve it):
+///   * 31b (hidden 5376), the two-row decode form: `2688 × 32768 × 2 B = 176.2 MB/core` — dxp
 ///     REFUSES the whole-dxp descriptor, `DtException: EAR overflow detected,
 ///     MutableAddrSplitting.cpp:814`, at `sdsc_5` of the decode suffix's group (the failing
 ///     bundle's input is `2×5376`; the 31b bake dies there, 23 s in, first bundle write). The
-///     one-row form divides `in`×2 instead and its slab halves to `88.1 MB/core` — inside the
-///     envelope. The vendor's own predicate is
+///     one-row form spends all 32 core-factors on `out` and its slab halves to
+///     `5376 × 8192 × 2 B = 88.1 MB/core` — inside the envelope. The vendor's own predicate is
 ///     `max_mutable > 2^EAR_bits·bytesPerStick·8/elem_bits` with
 ///     `max_mutable = const_offset + Σ(num_iters−2)·coeff` (`initMASData` :714-745) — a reach
 ///     this crate cannot compute from its input schema, so the boundary is pinned by
 ///     measurement, not derived.
-///   * 12b (hidden 3840), the same two-row form: `3840 × 16384 × 2 B = 125.8 MB/core` — the
-///     largest slab any whole-dxp form of the 12b routes, and the 12b is card-proven coherent
-///     under whole-dxp staging.
-///   * 26b-A4B (hidden 2816), the same two-row form: `2816 × 16384 × 2 B = 92.3 MB/core` —
+///   * 12b (hidden 3840), the same two-row form — the SAME `{in:2, mb:2, out:8}` division, ONE
+///     whole-dxp descriptor in the dump: `1920 × 32768 × 2 B = 125.8 MB/core` — the largest
+///     slab any whole-dxp form of the 12b routes, and the 12b is card-proven coherent under
+///     whole-dxp staging.
+///   * 26b-A4B (hidden 2816), the same two-row form: `1408 × 32768 × 2 B = 92.3 MB/core` —
 ///     whole-dxp, bakes green.
 ///
 /// The probe that matters: flipping EVERY matmul to [`MatmulStaging::FrontendTrips`] baked the
 /// 31b `RC=0` and ran it coherent on card (greedy France, 64 tokens, fluent), so the trips are
 /// the known-good staging past the envelope — and the placement is DEAD as a discriminator (the
 /// 26b's layer matmuls run at the same ~80 GiB arena top where the 31b's lm_head overflows), so
-/// the slab SIZE is the fact this envelope reads. The limit sits between the measured pair with
-/// margin on both sides (25 % above the 12b's coherent slab, 11 % below the 31b's refused one).
+/// the slab SIZE is the fact this envelope reads. The limit sits inside the tightest measured
+/// bracket with margin on both sides: the 12b's two-row slab — the same division the 31b's
+/// refused descriptor rode — is accepted at 125.8 MB/core, 25 % below the line, and the 31b's is
+/// refused at 176.2 MB/core, 11 % above it. (The 31b's one-row form is also accepted, at
+/// 88.1 MB/core — consistent, but weaker evidence: a different division, farther from the line.)
 pub const WHOLE_DXP_EAR_KERNEL_SLAB_LIMIT: u64 = 150 * 1024 * 1024;
 
 /// The per-core KERNEL (weight) slab one whole-dxp matmul routes, in bytes:
