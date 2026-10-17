@@ -22,23 +22,24 @@
 //!   caller's obligation; the round only REPORTS what the racing read saw (old, new,
 //!   or torn) — it cannot assert it, by design.
 //!
-//! The park's magnitude is small, FIXED, and set by neither the transfer's size nor
-//! the DmaBufPool's depth — three card configurations measured the same ~1.6-1.7 ms:
-//! 64 MiB at the default 8-buffer pool, 512 MiB at 8, and 512 MiB at a 64-buffer
-//! (256 MiB-deep) pool via `FLEX_DATA_TRANSFER_BUFFER_COUNT`. The reason is in the
-//! ported `submitDma`: a multi-chunk H2D is STAGING-bound — the host pins and
-//! IOMMU-maps each 4 MiB chunk slower than the card drains them — so by the time the
-//! launch loop feeds the last chunk and returns, everything fed earlier has already
-//! completed, and the still-in-flight remainder is just the tail (its final chunks'
-//! completion plus response processing). The deep-pool run is the discriminator: a
-//! pool that could hold 256 MiB in flight left the park unchanged (1.74 ms) and made
-//! A's launch SLOWER, not faster — a completion-paced launch would have sped up — so
-//! the queue never backs up and the pool is not the bound. The edge still waits out
-//! exactly what is ACTUALLY outstanding at launch-return; on this card, at these
-//! sizes, that is simply small. The park mechanism — park, wake, poison — is what
-//! the flex-rs `hazard_edge_tests` pin; this leg asserts the ORDERING it buys (67M
-//! words) and reports the park honestly, including that a single tracked-vs-control
-//! pair can go noise-negative (B's own submission varies by several ms run to run).
+//! What the park costs is BOUNDED and RACY, not fixed — every earlier framing this
+//! file carried (transfer-proportional, then pool-determined, then staging-bound and
+//! pool-invariant) was refuted by the next card run, and the six recorded pairs are
+//! the reason. The bound is the DmaBufPool's depth (`FLEX_DATA_TRANSFER_BUFFER_COUNT`
+//! x `FLEX_DATA_TRANSFER_BUFFER_SIZE`, default 8 x 4 MiB = 32 MiB): that is the
+//! pipeline's in-flight cap, the most of A's write that can still be outstanding when
+//! its launch returns. Where the park lands between ~0 and that bound is a race
+//! between the host's per-chunk staging (pin + IOMMU map) and the card's drain
+//! during the launch — the queue backs up or stays near-empty depending on how the
+//! two rates fall out that run. Measured: at the default pool, +1.6 ms twice
+//! (near the 32 MiB bound draining) and two noise-negative pairs (B's own submission
+//! varies by several ms run to run, and `saturating_sub` prints that as 0); at a
+//! 64-buffer / 256 MiB-deep pool via `FLEX_DATA_TRANSFER_BUFFER_COUNT`, +1.7 ms
+//! (queue drained) and +10.4 ms (queue near full — ~256 MiB at ~25 GB/s). The ORDERING
+//! the edge buys is the leg's claim, asserted on every word, green in every run; the
+//! park print is an observation of a bounded race outcome, honestly reported. The
+//! park mechanism itself — park, wake, poison — is what the flex-rs
+//! `hazard_edge_tests` pin.
 //!
 //! Host buffers are byte slices end to end (the `Stream::h2d`/`d2h` slice-length law):
 //! patterns are built as `u64` words flattened to bytes, and the readback is compared
@@ -49,9 +50,10 @@ use std::time::{Duration, Instant};
 use anyhow::anyhow;
 use scratchy_target_spyre::runtime::{DevAddr, HwError, Stream};
 
-/// 512 MiB — see the module doc: the park B pays is the staging-bound tail
-/// (~1.6-1.7 ms, size- and pool-invariant), so the size buys assertion surface
-/// (67M words) and a B submission that dwarfs the park, not a longer park.
+/// 512 MiB — see the module doc: the park B pays is bounded by the DmaBufPool's
+/// in-flight cap and varies run to run with the staging-vs-drain race, so the size
+/// buys assertion surface (67M words) and a B submission that dwarfs the typical
+/// park, not a longer park.
 const SIZE_BYTES: usize = 512 * 1024 * 1024;
 
 fn pattern_bytes(xor: u64) -> Vec<u8> {
@@ -190,21 +192,20 @@ fn main() -> anyhow::Result<()> {
 
     // The number the leg exists to print: the tracked B's launch had to park out the
     // slice of A's write that was still in flight when A's launch returned, the
-    // control B's launch did not — the difference IS the park. Card runs measured a
-    // fixed ~1.6-1.7 ms across 64 MiB, 512 MiB, and a 256 MiB-deep pool (the module
-    // doc's staging-bound argument); a single pair can go noise-negative because B's
-    // own submission varies by several ms run to run, which `saturating_sub` reports
-    // as an honest zero rather than a panic. The pool depth is printed as run
-    // configuration — it is the knob the deep-pool discriminator turned
-    // (FLEX_DATA_TRANSFER_BUFFER_COUNT), and printing it keeps an env override
-    // visible instead of silently invalidating the framing.
+    // control B's launch did not — the difference IS the park, bounded by the pool
+    // depth and racy run to run (the module doc's six-pair record). A single pair
+    // can go noise-negative because B's own submission varies by several ms, which
+    // `saturating_sub` reports as an honest zero rather than a panic. The pool depth
+    // is printed as run configuration — it is the bound, and the knob the deep-pool
+    // discriminator turned (FLEX_DATA_TRANSFER_BUFFER_COUNT), so an env override
+    // shows up in the leg output instead of silently invalidating the framing.
     let park = b_launch_tracked.saturating_sub(b_launch_untracked);
     let pool_depth = flex_rs::flex_config::RuntimeConfig::data_transfer_buffer_count().value()
         * flex_rs::flex_config::RuntimeConfig::data_transfer_buffer_size().value();
     println!(
         "[hazard-concurrency] park delta: tracked B launch − control B launch = {park:?} \
-         (A's still-in-flight tail at launch-return; pool depth {pool_depth} bytes — \
-         the park is staging-bound and pool-invariant, see the module doc)"
+         (A's still-in-flight slice at launch-return; bounded by the pool depth \
+         {pool_depth} bytes — a staging-vs-drain race outcome, see the module doc)"
     );
 
     println!("[hazard-concurrency] LEG PASSED");
