@@ -183,7 +183,11 @@ for shape in ${SHAPES//,/ }; do
     sleep 3   # let graceful shutdown release GPU residency
     b=$(run_leg "$second" "$shape") || exit 1
     sleep 3
-    d=$(python3 -c "print(f'{($b - $a) * 1000:.1f}')")
+    if [ "$fl" = base ]; then
+      d=$(python3 -c "print(f'{($b - $a) * 1000:.1f}')")   # cand ran second
+    else
+      d=$(python3 -c "print(f'{($a - $b) * 1000:.1f}')")   # cand ran first
+    fi
     deltas+=("$d")
     echo "rep$i: $fl ${a}s $sl ${b}s delta(cand-base)=${d}ms"
   done
