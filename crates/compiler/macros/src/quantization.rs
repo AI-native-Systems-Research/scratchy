@@ -1144,23 +1144,40 @@ pub fn affine_role_bits(
     dotted_role: &str,
     index: Option<UnrollIndex>,
 ) -> Option<u32> {
+    affine_role_widths(program, method, dotted_role, index).map(|(_, b)| b)
+}
+
+/// The width AND group of an affine weight-role — the pair-valued twin of
+/// [`affine_role_bits`], for callers that need both (the Gemma4 router's
+/// `(group_size, bits)` load parameter) so the group is resolved by the
+/// same law instead of re-derived from a default. Identical precedence:
+/// the per-module map's own `(bits, group_size)` entry when the map is
+/// authoritative, else the suffix `bits_overrides` over the section bits
+/// with the section `group_size`. `None` for a non-affine method or a role
+/// the per-module map leaves dense.
+pub fn affine_role_widths(
+    program: &Program,
+    method: &QuantMethod,
+    dotted_role: &str,
+    index: Option<UnrollIndex>,
+) -> Option<(u32, u32)> {
     if let QuantMethod::Affine {
         bits,
+        group_size,
         bits_overrides,
         per_module,
         ..
     } = method
     {
         if !per_module.is_empty() {
-            return per_module_lookup(program, per_module, dotted_role, index).map(|(b, _)| b);
+            return per_module_lookup(program, per_module, dotted_role, index).map(|(b, g)| (g, b));
         }
-        return Some(
-            bits_overrides
-                .iter()
-                .find(|(suffix, _)| dotted_role.ends_with(suffix.as_str()))
-                .map(|&(_, b)| b)
-                .unwrap_or(*bits),
-        );
+        let b = bits_overrides
+            .iter()
+            .find(|(suffix, _)| dotted_role.ends_with(suffix.as_str()))
+            .map(|&(_, b)| b)
+            .unwrap_or(*bits);
+        return Some((*group_size, b));
     }
     None
 }

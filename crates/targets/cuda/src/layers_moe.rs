@@ -387,8 +387,10 @@ pub trait Gemma4RouterOps {
         prefix: &str,
         num_experts: usize,
         hidden_size: usize,
-        group_size: u32,
-        bits: u32,
+        // `Some((group_size, bits))` when `router.proj` is MLX-affine;
+        // `None` when the merged config leaves it dense — the fp8
+        // checkpoints that skip the router, and verbatim bf16.
+        affine: Option<(u32, u32)>,
     ) -> anyhow::Result<Self>
     where
         Self: Sized;
@@ -396,9 +398,16 @@ pub trait Gemma4RouterOps {
 
 #[cfg(feature = "cuda")]
 impl Gemma4RouterOps for GemmaRouterLayer {
-    /// Load the Gemma-4 router bundle from `{prefix}` (= `...layers.N.router`):
-    /// * `{prefix}.proj` — MLX-affine `[E, hidden]` at the caller-resolved
-    ///   `bits` (8 on every checkpoint shipped so far), dequantized to a dense
+    /// Load the Gemma-4 router bundle from `{prefix}` (= `...layers.N.router`),
+    /// in the layout the compiled variant's config resolved for `router.proj`
+    /// (through `affine_role_widths` on the accessor's `{prefix}.proj` role —
+    /// the same resolution the fingerprint's affine bit map uses, so the two
+    /// cannot disagree):
+    /// * `None` — plain bf16 `{prefix}.proj.weight` (the HF
+    ///   `google/gemma-4-26B-A4B-it` and RedHatAI FP8 checkpoints; no
+    ///   `.proj.scales`), cast to the model dtype.
+    /// * `Some` — MLX-affine `[E, hidden]` at the caller-resolved `bits` (8
+    ///   on every affine checkpoint shipped so far), dequantized to a dense
     ///   BF16 `gate` tensor at load (the router GEMM stays dense BF16).
     /// * `{prefix}.per_expert_scale` — `[E]` bf16, kept verbatim.
     /// * `{prefix}.scale` — `[hidden]` bf16 RMSNorm gain, kept verbatim.
@@ -407,16 +416,11 @@ impl Gemma4RouterOps for GemmaRouterLayer {
         prefix: &str,
         num_experts: usize,
         hidden_size: usize,
-        group_size: u32,
-        bits: u32,
+        affine: Option<(u32, u32)>,
     ) -> anyhow::Result<Self> {
         use crate::driver;
 
-        // HF (`google/gemma-4-26B-A4B-it`) checkpoint detection: the HF router is
-        // a plain bf16 `{prefix}.proj.weight` with NO `.proj.scales` (the MLX path
-        // ships 8-bit affine `proj.{weight,scales,biases}`). Detect by the ABSENCE
-        // of the scales tensor.
-        if !gw.contains(&format!("{prefix}.proj.scales")) {
+        let gate = match affine {
             // The cyankiwi compressed-tensors checkpoint ships the router tensors
             // as **FP16** (`scale`≈31, `proj`≈0.01, `per_expert_scale`≈1.0), while
             // the rest of the model — and every router kernel below
@@ -428,89 +432,85 @@ impl Gemma4RouterOps for GemmaRouterLayer {
             // collapsing the top-k softmax to a degenerate top-1. The magnitudes
             // (≈31, ≈0.01, ≈1.0) are all comfortably representable in BF16, so the
             // straightforward gain·proj math (no fold) matches the fp32 reference.
-            let gate = gw.take(&format!("{prefix}.proj.weight"))?;
-            let per_expert_scale = gw.take(&format!("{prefix}.per_expert_scale"))?;
-            let scale = gw.take(&format!("{prefix}.scale"))?;
-
-            // GUARD (inviolable rule): the silent FP16-as-BF16 misread above was a
-            // runtime correctness bug (degenerate routing, fluent-but-wrong output,
-            // no crash). Turn the dtype assumption these kernels rely on into a hard
-            // LOAD-TIME error: if a future checkpoint ships a dtype that `take` does
-            // not cast to BF16, fail loudly here instead of corrupting the routing.
-            for (name, t) in [
-                ("proj.weight", &gate),
-                ("per_expert_scale", &per_expert_scale),
-                ("scale", &scale),
-            ] {
-                anyhow::ensure!(
-                    t.dtype() == crate::dtype::DType::BF16,
-                    "GemmaRouterLayer: {prefix}.{name} must be BF16 after load (got \
-                     {:?}); the router rms_norm/GEMM/per_expert_scale kernels assume \
-                     BF16 and would misread any other dtype as BF16, degenerating \
-                     the top-k routing.",
-                    t.dtype()
-                );
+            None => {
+                let gate = gw.take(&format!("{prefix}.proj.weight"))?;
+                gate
             }
 
-            return Ok(GemmaRouterLayer {
-                gate,
-                per_expert_scale,
-                scale,
-                num_experts,
-                hidden_size,
-            });
-        }
-
-        let stream = gw.stream();
-        anyhow::ensure!(
-            hidden_size.is_multiple_of(group_size as usize),
-            "GemmaRouterLayer: hidden_size={hidden_size} not divisible by \
+            Some((group_size, bits)) => {
+                let stream = gw.stream();
+                anyhow::ensure!(
+                    hidden_size.is_multiple_of(group_size as usize),
+                    "GemmaRouterLayer: hidden_size={hidden_size} not divisible by \
              group_size={group_size}"
-        );
+                );
 
-        // router.proj: MLX-affine, packed `[E, hidden / (32 / bits)]` U32 on disk
-        // — `[E, hidden/4]` at the 8 bits every Gemma-4-MoE checkpoint ships. The
-        // width comes from the macro (resolved through `affine_role_bits` from the
-        // arch's declared `bits_overrides`) rather than being baked here, so this
-        // call and the fingerprint's bit map cannot disagree (#202).
-        let proj_w = gw.take(&format!("{prefix}.proj.weight"))?;
-        let proj_s = gw.take_keep_dtype(&format!("{prefix}.proj.scales"))?;
-        let proj_b = gw.take_keep_dtype(&format!("{prefix}.proj.biases"))?;
-        anyhow::ensure!(
-            matches!(proj_s.dtype(), crate::dtype::DType::BF16),
-            "GemmaRouterLayer: router.proj.scales must be BF16 (got {}); the \
+                // router.proj: MLX-affine, packed `[E, hidden / (32 / bits)]` U32 on disk
+                // — `[E, hidden/4]` at the 8 bits every Gemma-4-MoE checkpoint ships. The
+                // width comes from the macro (resolved through `affine_role_bits` from the
+                // arch's declared `bits_overrides`) rather than being baked here, so this
+                // call and the fingerprint's bit map cannot disagree (#202).
+                let proj_w = gw.take(&format!("{prefix}.proj.weight"))?;
+                let proj_s = gw.take_keep_dtype(&format!("{prefix}.proj.scales"))?;
+                let proj_b = gw.take_keep_dtype(&format!("{prefix}.proj.biases"))?;
+                anyhow::ensure!(
+                    matches!(proj_s.dtype(), crate::dtype::DType::BF16),
+                    "GemmaRouterLayer: router.proj.scales must be BF16 (got {}); the \
              affine_dequant kernel reads bf16 scales/biases",
-            proj_s.dtype()
-        );
+                    proj_s.dtype()
+                );
 
-        let gate = unsafe {
-            affine_dequant_weight_bf16(
-                gw,
-                proj_w,
-                proj_s,
-                proj_b,
-                num_experts,
-                hidden_size,
-                bits,
-                group_size as usize,
-                stream,
-            )?
+                let gate = unsafe {
+                    affine_dequant_weight_bf16(
+                        gw,
+                        proj_w,
+                        proj_s,
+                        proj_b,
+                        num_experts,
+                        hidden_size,
+                        bits,
+                        group_size as usize,
+                        stream,
+                    )?
+                };
+
+                // The packed proj weight + its scales/biases are scratch — the dense
+                // bf16 `gate` superseded them. Free them now (sync first so the
+                // in-flight dequant finished reading).
+                unsafe {
+                    driver::stream_synchronize(stream)?;
+                    gw.unrecord_alloc(proj_w.as_mut_ptr::<u8>());
+                    driver::mem_free(proj_w.as_mut_ptr::<u8>())?;
+                    gw.unrecord_alloc(proj_s.as_mut_ptr::<u8>());
+                    driver::mem_free(proj_s.as_mut_ptr::<u8>())?;
+                    gw.unrecord_alloc(proj_b.as_mut_ptr::<u8>());
+                    driver::mem_free(proj_b.as_mut_ptr::<u8>())?;
+                }
+                gate
+            }
         };
 
-        let per_expert_scale = gw.take_keep_dtype(&format!("{prefix}.per_expert_scale"))?;
-        let scale = gw.take_keep_dtype(&format!("{prefix}.scale"))?;
+        let per_expert_scale = gw.take(&format!("{prefix}.per_expert_scale"))?;
+        let scale = gw.take(&format!("{prefix}.scale"))?;
 
-        // The packed proj weight + its scales/biases are scratch — the dense
-        // bf16 `gate` superseded them. Free them now (sync first so the
-        // in-flight dequant finished reading).
-        unsafe {
-            driver::stream_synchronize(stream)?;
-            gw.unrecord_alloc(proj_w.as_mut_ptr::<u8>());
-            driver::mem_free(proj_w.as_mut_ptr::<u8>())?;
-            gw.unrecord_alloc(proj_s.as_mut_ptr::<u8>());
-            driver::mem_free(proj_s.as_mut_ptr::<u8>())?;
-            gw.unrecord_alloc(proj_b.as_mut_ptr::<u8>());
-            driver::mem_free(proj_b.as_mut_ptr::<u8>())?;
+        // GUARD (inviolable rule): the silent FP16-as-BF16 misread above was a
+        // runtime correctness bug (degenerate routing, fluent-but-wrong output,
+        // no crash). Turn the dtype assumption these kernels rely on into a hard
+        // LOAD-TIME error: if a future checkpoint ships a dtype that `take` does
+        // not cast to BF16, fail loudly here instead of corrupting the routing.
+        for (name, t) in [
+            ("proj.weight", &gate),
+            ("per_expert_scale", &per_expert_scale),
+            ("scale", &scale),
+        ] {
+            anyhow::ensure!(
+                t.dtype() == crate::dtype::DType::BF16,
+                "GemmaRouterLayer: {prefix}.{name} must be BF16 after load (got \
+                 {:?}); the router rms_norm/GEMM/per_expert_scale kernels assume \
+                 BF16 and would misread any other dtype as BF16, degenerating \
+                 the top-k routing.",
+                t.dtype()
+            );
         }
 
         Ok(GemmaRouterLayer {

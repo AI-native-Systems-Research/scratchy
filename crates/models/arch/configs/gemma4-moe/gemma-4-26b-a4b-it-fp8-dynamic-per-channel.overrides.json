@@ -1,0 +1,6 @@
+{
+  "_comment": "Per-(stem, preset) drift: `RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic` quantizes every Linear fp8-per-channel EXCEPT its routers — the checkpoint's own quantization_config.ignore says so, listing all 30 `model.language_model.layers.<l>.router.proj` (full paths; suffix-matched here as `router.proj`), which stay bf16. Without this the arch-wide preset claims fp8 for the router too, and the generated try_load fingerprint refuses the only cached 26b FP8 checkpoint ('no compiled model variant matches this checkpoint'). The checkpoint's ignore also lists the vision tower + `model.embed_vision.embedding_projection` + `lm_head`; the vision modules never enter the text build and the tied lm_head is already in the preset's own ignore, so only the router drift is declared here (deep_merge replaces the array, hence lm_head restated). A bf16 router bakes RouterLogits dense instead of fp8 — the per-op MoE doors' on-card baseline.",
+  "quantization_config": {
+    "ignore": ["lm_head", "router.proj"]
+  }
+}

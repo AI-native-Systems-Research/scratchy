@@ -164,8 +164,10 @@ pub trait Gemma4RouterOps {
         prefix: &str,
         num_experts: usize,
         hidden_size: usize,
-        group_size: u32,
-        bits: u32,
+        // `Some((group_size, bits))` when `router.proj` is MLX-affine;
+        // `None` when the merged config leaves it dense — the fp8
+        // checkpoints that skip the router, and verbatim bf16.
+        affine: Option<(u32, u32)>,
     ) -> anyhow::Result<Self>
     where
         Self: Sized;
@@ -174,78 +176,86 @@ pub trait Gemma4RouterOps {
 impl Gemma4RouterOps for GemmaRouterLayer {
     /// Macro-emitted load entry for the Gemma-4 router bundle (spyre).
     ///
-    /// Two on-disk layouts, picked by probing `{prefix}.proj.weight` — the SAME
-    /// detection cuda's loader uses:
+    /// Two on-disk layouts, picked by the layout the COMPILED VARIANT's
+    /// config resolved for `router.proj` (through `affine_role_widths` on
+    /// the accessor's `{prefix}.proj` role — the same resolution the
+    /// fingerprint's affine bit map uses, so the two cannot disagree):
     ///
-    /// * **fp8-dynamic-per-channel** (RedHatAI `gemma-4-26B-A4B-it-FP8-dynamic`):
-    ///   `router.proj.weight` is a DENSE BF16 `[E, hidden]` tensor (the router is
-    ///   never quantized on this checkpoint) plus `per_expert_scale` `[E]` and
+    /// * **dense bf16** (`None` — `RedHatAI gemma-4-26B-A4B-it-FP8-dynamic`:
+    ///   the router is never quantized on this checkpoint, its own
+    ///   `quantization_config.ignore` says so): `router.proj.weight` is a
+    ///   DENSE BF16 `[E, hidden]` tensor plus `per_expert_scale` `[E]` and
     ///   `scale` (the RMSNorm gain) `[hidden]`, all BF16. Everything is taken
-    ///   VERBATIM (`take_keep_dtype`) — the staging path narrows bf16→f16 and the
-    ///   launch binds it like every other gemm weight.
-    /// * **MLX-affine 8-bit** (mlx-community 4bit): `router.proj` is an affine
-    ///   `{weight, scales, biases}` triple, dequantized to dense `[E, hidden]`
-    ///   via the shared `affine_dequant_b4_to_dtype` (the same numerics metal's
-    ///   `take_affine_dequant_b4` uses) and packed from host.
+    ///   VERBATIM (`take_keep_dtype`) — the staging path narrows bf16→f16 and
+    ///   the launch binds it like every other gemm weight.
+    /// * **MLX-affine 8-bit** (`Some` — mlx-community 4bit): `router.proj` is
+    ///   an affine `{weight, scales, biases}` triple, dequantized to dense
+    ///   `[E, hidden]` via the shared `affine_dequant_b4_to_dtype` (the same
+    ///   numerics metal's `take_affine_dequant_b4` uses) and packed from
+    ///   host.
+    ///
+    /// A checkpoint whose disk layout disagrees with the compiled variant
+    /// refuses HERE, loudly: the dense branch's shape guard rejects an
+    /// affine-packed `[E, hidden/div]` weight, and the affine branch's
+    /// `.scales` take fails on a dense checkpoint. (The old runtime probe on
+    /// `{prefix}.proj.weight` could not tell the two apart — the packed
+    /// affine weight ships under the same name — so the layout now comes from
+    /// the config, which the fingerprint already verified against the disk.)
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
         num_experts: usize,
         hidden_size: usize,
-        group_size: u32,
-        bits: u32,
+        affine: Option<(u32, u32)>,
     ) -> anyhow::Result<Self> {
-        // fp8 checkpoint: dense bf16 gate, kept verbatim (the staging path narrows).
-        if gw.contains(&format!("{prefix}.proj.weight")) {
-            let gate = gw.take_keep_dtype(&format!("{prefix}.proj.weight"))?;
-            gemma_router_gate_check(&gate, num_experts, hidden_size, "fp8")?;
-            let per_expert_scale = gw.take_keep_dtype(&format!("{prefix}.per_expert_scale"))?;
-            let scale = gw.take_keep_dtype(&format!("{prefix}.scale"))?;
-            return Ok(GemmaRouterLayer {
-                gate,
-                per_expert_scale,
-                scale,
-                num_experts,
-                hidden_size,
-            });
-        }
-        // MLX-affine 8-bit: dequant {prefix}.proj to dense [E, hidden] bf16.
-        let (w_bytes, w_dt, _) = gw.take_to_cpu_bytes(&format!("{prefix}.proj.weight"))?;
-        let (s_bytes, s_dt, _) = gw.take_to_cpu_bytes(&format!("{prefix}.proj.scales"))?;
-        let (b_bytes, _, _) = gw.take_to_cpu_bytes(&format!("{prefix}.proj.biases"))?;
-        anyhow::ensure!(
-            matches!(
-                w_dt,
-                scratchy_tensors::DType::U32 | scratchy_tensors::DType::U8
-            ),
-            "GemmaRouterLayer (spyre): {prefix}.proj.weight must be packed U32/U8, got {w_dt:?}"
-        );
-        anyhow::ensure!(
-            matches!(
-                s_dt,
-                scratchy_tensors::DType::F16 | scratchy_tensors::DType::BF16
-            ),
-            "GemmaRouterLayer (spyre): {prefix}.proj.scales must be F16/BF16, got {s_dt:?}"
-        );
-        let dense = scratchy_quantizations::affine::affine_dequant_b4_to_dtype(
-            &w_bytes,
-            &s_bytes,
-            &b_bytes,
-            num_experts,
-            hidden_size,
-            group_size,
-            bits,
-            s_dt,
-            scratchy_tensors::DType::BF16,
-        )
-        .map_err(|e| {
-            anyhow::anyhow!("GemmaRouterLayer (spyre): {prefix}.proj dequant failed: {e}")
-        })?;
-        let gate = gw.alloc_packed_from_host(
-            &dense,
-            &[num_experts, hidden_size],
-            scratchy_tensors::DType::BF16,
-        )?;
+        let gate = match affine {
+            // fp8 checkpoint: dense bf16 gate, kept verbatim (the staging
+            // path narrows).
+            None => {
+                let gate = gw.take_keep_dtype(&format!("{prefix}.proj.weight"))?;
+                gemma_router_gate_check(&gate, num_experts, hidden_size, "fp8")?;
+                gate
+            }
+            // MLX-affine 8-bit: dequant {prefix}.proj to dense [E, hidden] bf16.
+            Some((group_size, bits)) => {
+                let (w_bytes, w_dt, _) = gw.take_to_cpu_bytes(&format!("{prefix}.proj.weight"))?;
+                let (s_bytes, s_dt, _) = gw.take_to_cpu_bytes(&format!("{prefix}.proj.scales"))?;
+                let (b_bytes, _, _) = gw.take_to_cpu_bytes(&format!("{prefix}.proj.biases"))?;
+                anyhow::ensure!(
+                    matches!(
+                        w_dt,
+                        scratchy_tensors::DType::U32 | scratchy_tensors::DType::U8
+                    ),
+                    "GemmaRouterLayer (spyre): {prefix}.proj.weight must be packed U32/U8, got {w_dt:?}"
+                );
+                anyhow::ensure!(
+                    matches!(
+                        s_dt,
+                        scratchy_tensors::DType::F16 | scratchy_tensors::DType::BF16
+                    ),
+                    "GemmaRouterLayer (spyre): {prefix}.proj.scales must be F16/BF16, got {s_dt:?}"
+                );
+                let dense = scratchy_quantizations::affine::affine_dequant_b4_to_dtype(
+                    &w_bytes,
+                    &s_bytes,
+                    &b_bytes,
+                    num_experts,
+                    hidden_size,
+                    group_size,
+                    bits,
+                    s_dt,
+                    scratchy_tensors::DType::BF16,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("GemmaRouterLayer (spyre): {prefix}.proj dequant failed: {e}")
+                })?;
+                gw.alloc_packed_from_host(
+                    &dense,
+                    &[num_experts, hidden_size],
+                    scratchy_tensors::DType::BF16,
+                )?
+            }
+        };
         let per_expert_scale = gw.take_keep_dtype(&format!("{prefix}.per_expert_scale"))?;
         let scale = gw.take_keep_dtype(&format!("{prefix}.scale"))?;
         Ok(GemmaRouterLayer {

@@ -471,18 +471,24 @@ enum FieldLoad {
         gate_bits: Option<u32>,
     },
     /// Gemma-4 router bundle (`GemmaMoe` op, base `router`). Dispatches to
-    /// `GemmaRouterLayer::load`. `group_size` is the model's affine group width
-    /// (64); `bits` is `router.proj`'s own on-disk width, resolved through
-    /// `affine_role_bits` like every other affine role rather than hardcoded in
-    /// the loader — the backends used to bake an 8 that no config stated, which
-    /// left the variant's bit map silently disagreeing with the tensor the
-    /// loader would read (#202).
+    /// `GemmaRouterLayer::load`. The router's storage is resolved through
+    /// `affine_role_widths` on the accessor's `{prefix}.proj` role — the same
+    /// law the fingerprint's affine bit map uses — never defaulted: the
+    /// backends used to bake an 8 no config stated, which left the variant's
+    /// bit map silently disagreeing with the tensor the loader would read
+    /// (#202), and the default kept fabricating an affine row for checkpoints
+    /// whose router is DENSE — the RedHatAI FP8 26b lists `router.proj` in
+    /// its own ignore list — so the fingerprint demanded `.scales` no such
+    /// checkpoint ships and refused the only cached 26b FP8 weights at load.
     GemmaRouter {
         prefix: String,
         num_experts: usize,
         hidden_size: usize,
-        group_size: u32,
-        bits: u32,
+        /// `Some((group_size, bits))` when `router.proj` is MLX-affine — see
+        /// [`FieldLoad::FusedMoe::affine`]. `None` when the merged config
+        /// leaves it dense (fp8 checkpoints that skip the router, verbatim
+        /// bf16): the loader takes the bf16 `router.proj.weight` verbatim.
+        affine: Option<(u32, u32)>,
     },
     /// Gemma-4 SwitchGLU experts bundle (`GemmaMoe` op, base
     /// `experts.switch_glu`). Dispatches to `SwitchGluExpertsLayer::load`
@@ -616,8 +622,7 @@ fn affine_tensors_of(fl: &FieldLoad) -> Vec<(String, u32, u32)> {
         }
         FieldLoad::GemmaRouter {
             prefix,
-            group_size,
-            bits,
+            affine: Some((group_size, bits)),
             ..
         } => one(&format!("{prefix}.proj"), *bits, *group_size),
         // gpt-oss router gate: `gate_bits` is what the load call dequantizes
@@ -1431,35 +1436,33 @@ fn plan_field_load(
         let prefix = prefixes.into_iter().next().unwrap();
         let num_experts = model.bounds.get("num_experts").copied().unwrap_or(128) as usize;
         let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2816) as usize;
-        // group_size from the affine quant config (gemma4-moe ships gs=64).
-        let group_size = match model.quantization.as_ref().map(|qc| &qc.method) {
-            Some(crate::quantization::QuantMethod::Affine { group_size, .. }) => *group_size,
-            _ => 64,
-        };
-        // `router.proj`'s own width, resolved exactly as the `FusedMoe` arm
-        // resolves its gate — the preset's `bits_overrides` (gemma4-moe declares
-        // `router.proj: 8`) or an MLX per-module entry. Defaults to 8, the width
-        // both backends hardcoded before this was threaded, so the dense/verbatim
-        // config that still has to codegen keeps its old values.
-        let only_idx = accessor.source_weights[0].1;
-        let bits = model
-            .quantization
-            .as_ref()
-            .and_then(|qc| {
-                crate::quantization::affine_role_bits(
-                    program,
-                    &qc.method,
-                    &format!("{prefix}.proj"),
-                    only_idx,
-                )
-            })
-            .unwrap_or(8);
+        // `router.proj`'s storage, resolved by the same law the fingerprint's
+        // affine bit map uses — `affine_role_widths` on the accessor's
+        // `{prefix}.proj` role, honoring the preset's `bits_overrides`
+        // (gemma4-moe's MLX drift declares `router.proj: 8` over a 4-bit
+        // model) and the MLX per-module map. The role form matters: the
+        // router WeightId's registry path does not carry the `.proj` leaf,
+        // so `storage_format_for_weight`'s suffix match cannot see the
+        // override and would answer the section default. `None` — a
+        // non-affine method (fp8), a per-module map that leaves the role
+        // dense, or a verbatim model — means NO affine row and a dense
+        // router load. Never defaulted: the old `unwrap_or(8)` fabricated
+        // an affine row for dense-router checkpoints, and the fingerprint's
+        // positive sniff then demanded `.scales` no such checkpoint ships.
+        let (_, router_idx) = accessor.source_weights[0];
+        let affine = model.quantization.as_ref().and_then(|qc| {
+            crate::quantization::affine_role_widths(
+                program,
+                &qc.method,
+                &format!("{prefix}.proj"),
+                router_idx,
+            )
+        });
         return FieldLoad::GemmaRouter {
             prefix,
             num_experts,
             hidden_size,
-            group_size,
-            bits,
+            affine,
         };
     }
 
@@ -5742,21 +5745,18 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             prefix,
             num_experts,
             hidden_size,
-            group_size,
-            bits,
+            affine,
         } => {
             let num_experts = *num_experts;
             let hidden_size = *hidden_size;
-            let group_size = *group_size;
-            let bits = *bits;
+            let affine = gemma_router_affine_ts(*affine);
             quote! {
                 let #name = crate::__gpu::layers_moe::GemmaRouterLayer::load(
                     gw,
                     #prefix,
                     #num_experts,
                     #hidden_size,
-                    #group_size,
-                    #bits,
+                    #affine,
                 )?;
             }
         }
@@ -5821,6 +5821,21 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 )?;
             }
         }
+    }
+}
+
+/// Quote a [`FieldLoad::GemmaRouter::affine`] `Option<(u32, u32)>` for the
+/// emitted load call — the full `::core` path so it survives whatever `use`
+/// the emitted module carries. Both load emissions (single and layered) take
+/// the SAME token stream.
+fn gemma_router_affine_ts(affine: Option<(u32, u32)>) -> TokenStream {
+    match affine {
+        Some((group_size, bits)) => {
+            let group_size = proc_macro2::Literal::u32_unsuffixed(group_size);
+            let bits = proc_macro2::Literal::u32_unsuffixed(bits);
+            quote! { ::core::option::Option::Some((#group_size, #bits)) }
+        }
+        None => quote! { ::core::option::Option::None },
     }
 }
 
@@ -6741,8 +6756,7 @@ fn emit_layered_load_body(
             prefix,
             num_experts,
             hidden_size,
-            group_size,
-            bits,
+            affine,
         } => {
             let p = layer_templated_prefix_expr(
                 prefix,
@@ -6751,8 +6765,7 @@ fn emit_layered_load_body(
             );
             let num_experts = *num_experts;
             let hidden_size = *hidden_size;
-            let group_size = *group_size;
-            let bits = *bits;
+            let affine = gemma_router_affine_ts(*affine);
             quote! {
                 (0u32..#n_lit)
                     .map(|layer: u32| -> ::anyhow::Result<_> {
@@ -6761,8 +6774,7 @@ fn emit_layered_load_body(
                             &#p,
                             #num_experts,
                             #hidden_size,
-                            #group_size,
-                            #bits,
+                            #affine,
                         )
                     })
                     .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
@@ -17645,13 +17657,22 @@ mod fingerprint_tests {
             prefix: "model.layers.0.router".to_string(),
             num_experts: 128,
             hidden_size: 2816,
-            group_size: 64,
-            bits: 8,
+            affine: Some((64, 8)),
         };
         assert_eq!(
             affine_tensors_of(&router),
             vec![("model.layers.0.router.proj.weight".to_string(), 8, 64)],
         );
+        // A dense router (the fp8 26b's `ignore`d `router.proj`, verbatim
+        // bf16) lists NOTHING — no fabricated width row, so the fingerprint's
+        // positive sniff cannot demand `.scales` the checkpoint never ships.
+        let dense_router = FieldLoad::GemmaRouter {
+            prefix: "model.layers.0.router".to_string(),
+            num_experts: 128,
+            hidden_size: 2816,
+            affine: None,
+        };
+        assert_eq!(affine_tensors_of(&dense_router), vec![]);
 
         let leaf = FieldLoad::LinearAffine {
             prefix: "model.layers.0.self_attn.q_proj".to_string(),
