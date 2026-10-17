@@ -555,6 +555,7 @@ fn init_cache(
     gpu_memory_utilization: f64,
     device: &str,
     kv_cache_dtype: &str,
+    declared_max_model_len: Option<usize>,
     max_model_len: usize,
 ) -> Result<(
     Box<dyn Worker>,
@@ -627,44 +628,57 @@ fn init_cache(
     worker
         .initialize_cache(num_gpu_blocks, 0)
         .context("failed to initialize cache")?;
-    // Cap `max_model_len` to the longest context the cache just built serves.
-    // The scheduler admits a prompt only if its blocks fit the whole pool
-    // (`num_gpu_blocks × block_size` tokens), and the backend's kernels address
-    // no further than `kv_max_addressable_tokens` (metal hybrid SWA: the sliding
-    // class's block-table row; spyre: what its pool funds and its mask baked).
-    // A longer `max_model_len` advertises a window no request can use: past the
-    // pool a prompt is finished unscheduled, past the kernels' reach it would
-    // index past the block table. Capped, an over-long prompt is rejected as
-    // too long up front.
-    //
-    // A warning, not an info line: the server now serves a shorter context than
-    // it was asked for, and a client sized to the ask (`scr launch claude`'s
-    // Claude Code) fails mid-session when it finds out.
+    // ⭐ THE CONTEXT LAW, ENGINE SIDE — the same ONE predicate the worker's pool sizing
+    // already ran ([`scratchy_serving_engine::gpu_budget::resolve_served_context`]): an
+    // explicit `--max-model-len` the cache just built cannot serve is REFUSED here —
+    // capping a stated ask is not validating it; a client sized to the ask (`scr launch
+    // claude`'s Claude Code) would fail mid-session when it found out. An UNSET flag
+    // resolves to `min(max_model_len, affordable)`, and that resolution is logged at
+    // info: it is the designed default, not a shortfall. The scheduler admits a prompt
+    // only if its blocks fit the whole pool (`num_gpu_blocks × block_size` tokens), and
+    // the backend's kernels address no further than `kv_max_addressable_tokens` (metal
+    // hybrid SWA: the sliding class's block-table row; spyre: what its pool funds and its
+    // mask baked) — the affordable is the narrower of the two.
     let pool_tokens = num_gpu_blocks * block_size;
-    let effective_max_model_len = match worker.kv_max_addressable_tokens() {
-        Some(reach) if reach < max_model_len.min(pool_tokens) => {
-            tracing::warn!(
-                "Capping max_model_len {} → {} (paged-attention addressable limit): \
-                 a prompt longer than {} tokens will be rejected",
-                max_model_len,
-                reach,
-                reach
-            );
-            reach
-        }
-        _ if pool_tokens < max_model_len => {
-            tracing::warn!(
-                "Capping max_model_len {} → {} (KV cache: {} blocks × {} tokens): \
-                 a prompt longer than {} tokens will be rejected",
-                max_model_len,
-                pool_tokens,
+    let reach = worker.kv_max_addressable_tokens();
+    let affordable = reach.unwrap_or(usize::MAX).min(pool_tokens);
+    let effective_max_model_len = match scratchy_serving_engine::gpu_budget::resolve_served_context(
+        declared_max_model_len,
+        max_model_len,
+        affordable,
+    ) {
+        scratchy_serving_engine::gpu_budget::ServedContext::Refused {
+            declared,
+            affordable,
+        } => {
+            anyhow::bail!(
+                "--max-model-len {declared} exceeds what this run can serve: the KV cache just built \
+                     holds {} block(s) × {} tokens = {} tokens{}, and the longest context it can serve is \
+                     {affordable} tokens. A request would fail mid-generation once the pool ran out, so the \
+                     run is refused here instead. Lower --max-model-len to about {affordable}, or raise \
+                     --gpu-memory-utilization to grow the cache.",
                 num_gpu_blocks,
                 block_size,
-                pool_tokens
-            );
-            pool_tokens
+                pool_tokens,
+                reach
+                    .map(|r| format!(", the backend's kernels address at most {r}"))
+                    .unwrap_or_default(),
+            )
         }
-        _ => max_model_len,
+        scratchy_serving_engine::gpu_budget::ServedContext::Tokens(served) => {
+            if served < max_model_len {
+                info!(
+                    "max_model_len unset: serving {served} of the model's {max_model_len} — what the KV \
+                         cache just built funds ({} block(s) × {} tokens{})",
+                    num_gpu_blocks,
+                    block_size,
+                    reach
+                        .map(|r| format!(", backend addressable to {r}"))
+                        .unwrap_or_default(),
+                );
+            }
+            served
+        }
     };
     Ok((
         worker,
@@ -1458,6 +1472,7 @@ fn initialize_core(
         config.gpu_memory_utilization,
         &config.device,
         &config.kv_cache_dtype,
+        config.max_model_len,
         max_model_len,
     )?;
     // Capture the target-reactive prefill-bucket cap before `worker` is moved

@@ -502,9 +502,15 @@ pub(crate) struct Loaded {
     ///
     /// `None` on the paths that never size a paged pool (KTIR emulator, non-paged sessions).
     pub(crate) kv_budget_bytes: Option<u64>,
-    /// ⭐ THE CONTEXT THIS RUN'S POOL CAN ACTUALLY SERVE, in tokens — `min(the declared context, what
-    /// the KV budget funds across the launch rows)`, decided once where budget, page stride and row
-    /// count first meet (the pool sizing in `load_model`).
+    /// ⭐ THE CONTEXT THIS RUN SERVES, in tokens — the ONE `--max-model-len` law's answer
+    /// ([`scratchy_serving_engine::gpu_budget::resolve_served_context`]), decided once where
+    /// budget, page stride and row count first meet (the pool sizing in `load_model`).
+    ///
+    /// The law has two branches and NO silent third: an explicit declaration the budget cannot
+    /// fund is REFUSED at load — capping a stated ask is not validating it — and an UNSET flag
+    /// resolves to `min(the model's max_position_embeddings, what the budget funds)`, logged at
+    /// info. So this field is either exactly what was declared or exactly the model's default
+    /// cut to the budget, never a clamp of what was asked.
     ///
     /// This is the MEMORY side of the context law: the bake's pmask covers every pool any card can
     /// express (its block count is `MAX_SEGMENT_BYTES / page_bytes`), so what actually binds a run is

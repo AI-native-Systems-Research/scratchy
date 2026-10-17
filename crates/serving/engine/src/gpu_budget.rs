@@ -123,6 +123,61 @@ pub fn resolve_default_max_num_seqs(facts: &MaxNumSeqsFacts, is_offline: bool) -
     if affordable < tier { affordable } else { tier }
 }
 
+/// The context one run will serve, as the ONE `--max-model-len` law decided it —
+/// see [`resolve_served_context`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServedContext {
+    /// Serve exactly this many tokens.
+    Tokens(usize),
+    /// The declaration cannot be funded. `declared` is what was asked (the flag, or the
+    /// model's own limit when no flag was given); `affordable` is the number to lower
+    /// to. Each call site states its own knobs around it — the spyre pool veto also
+    /// names `--max-num-seqs`, the engine's cap names its blocks.
+    Refused { declared: usize, affordable: usize },
+}
+
+/// ⭐ THE CONTEXT LAW — ONE predicate for every `--max-model-len` resolution in the stack.
+///
+/// An EXPLICIT flag is a contract: over `affordable` it is REFUSED, never capped
+/// (capping-is-not-validating — a capped server advertises a window no request can
+/// use, and a client sized to the ask fails mid-session when it finds out). An UNSET
+/// flag resolves to `min(max_pos, affordable)` — the width law's
+/// [`resolve_default_max_num_seqs`] twin: a default is sized by what the run funds,
+/// and the resolution is logged at INFO by the caller, because a default settling on
+/// the card's number is a decision, not a surprise (a WARN is for serving shorter
+/// than a client ASKED for — which the explicit branch now refuses instead).
+///
+/// `affordable` is what the calling site's own arithmetic funds: the spyre worker
+/// passes what its KV byte budget buys per request across the launch rows (the exact
+/// inverse of its pool demand, so a resolved default is veto-proof by construction),
+/// and the engine passes what the cache it just built serves (the scheduler's blocks
+/// capped by the backend's addressable reach). One law, each site's own number —
+/// the two can drift on the number, never on its meaning.
+///
+/// An `affordable` of `0` refuses every declaration, unset included: it funds not
+/// even the reserve plus one page per row, so there is no context to resolve down
+/// to and the refusal's advice is the only honest answer.
+pub fn resolve_served_context(
+    declared: Option<usize>,
+    max_pos: usize,
+    affordable: usize,
+) -> ServedContext {
+    if affordable == 0 {
+        return ServedContext::Refused {
+            declared: declared.unwrap_or(max_pos),
+            affordable,
+        };
+    }
+    match declared {
+        Some(d) if d > affordable => ServedContext::Refused {
+            declared: d,
+            affordable,
+        },
+        Some(d) => ServedContext::Tokens(d),
+        None => ServedContext::Tokens(max_pos.min(affordable)),
+    }
+}
+
 /// Compute KV cache budget matching Python vLLM's formula exactly:
 ///   requested = total_memory * gpu_memory_utilization
 ///   non_kv_cache = weights_and_overhead + peak_activations + 150 MiB
@@ -360,6 +415,86 @@ mod max_num_seqs_default_tests {
             false,
         );
         assert_eq!(w, BASE_MAX_NUM_SEQS);
+    }
+}
+
+#[cfg(test)]
+mod served_context_tests {
+    use super::{ServedContext, resolve_served_context};
+
+    /// granite-3.1-2b's own `max_position_embeddings` — the model whose unset default
+    /// this law was decided on (a 131072-token ask against a KV pool capped at one
+    /// 16 GiB region).
+    const GRANITE_2B_MAX_POS: usize = 131_072;
+
+    /// The law's every branch, on the granite-2b shape: the explicit ask over budget
+    /// refuses WITH the number (the advice is computed, never guessed), the ask at
+    /// exactly the number is served verbatim (the boundary is `>`, not `>=`), and the
+    /// unset default resolves down to what the site funds.
+    #[test]
+    fn an_unresolvable_ask_refuses_and_an_unset_default_resolves() {
+        // What a 16 GiB single-allocation KV budget funds for granite-3.1-2b at chat's
+        // two launch rows: 31,457,280 B/page, one reserve page, 256 slots per page —
+        // (16 GiB / stride − 1) / 2 × 256.
+        let affordable = 69_632;
+        assert_eq!(
+            resolve_served_context(None, GRANITE_2B_MAX_POS, affordable),
+            ServedContext::Tokens(affordable),
+            "the unset default resolves to what the site funds, not the model's limit"
+        );
+        assert_eq!(
+            resolve_served_context(Some(GRANITE_2B_MAX_POS), GRANITE_2B_MAX_POS, affordable),
+            ServedContext::Refused {
+                declared: GRANITE_2B_MAX_POS,
+                affordable
+            },
+            "an explicit over-budget ask is refused with the affordable number, never capped"
+        );
+        assert_eq!(
+            resolve_served_context(Some(affordable), GRANITE_2B_MAX_POS, affordable),
+            ServedContext::Tokens(affordable),
+            "asking for exactly what the site funds is served — the boundary is `>`, not `>=`"
+        );
+        assert_eq!(
+            resolve_served_context(Some(4096), GRANITE_2B_MAX_POS, affordable),
+            ServedContext::Tokens(4096),
+            "an explicit ask inside the budget is honoured verbatim"
+        );
+    }
+
+    /// A roomy site never resolves: the unset default is the model's own limit, whole.
+    #[test]
+    fn an_unset_default_survives_on_a_roomy_site() {
+        assert_eq!(
+            resolve_served_context(None, GRANITE_2B_MAX_POS, usize::MAX),
+            ServedContext::Tokens(GRANITE_2B_MAX_POS)
+        );
+        assert_eq!(
+            resolve_served_context(None, GRANITE_2B_MAX_POS, GRANITE_2B_MAX_POS),
+            ServedContext::Tokens(GRANITE_2B_MAX_POS),
+            "affordable == max_pos serves max_pos — min, not a forced cut"
+        );
+    }
+
+    /// A site that cannot fund even the reserve plus one page per row has no context
+    /// to resolve down to — unset included, the refusal is the only honest answer.
+    #[test]
+    fn a_zero_affordability_refuses_even_the_unset_default() {
+        assert_eq!(
+            resolve_served_context(None, GRANITE_2B_MAX_POS, 0),
+            ServedContext::Refused {
+                declared: GRANITE_2B_MAX_POS,
+                affordable: 0
+            },
+            "the refused `declared` names the model's limit when no flag was given"
+        );
+        assert_eq!(
+            resolve_served_context(Some(1), GRANITE_2B_MAX_POS, 0),
+            ServedContext::Refused {
+                declared: 1,
+                affordable: 0
+            }
+        );
     }
 }
 
