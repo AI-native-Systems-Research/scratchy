@@ -1638,9 +1638,11 @@ impl Executor {
         // A DEDICATED created stream (not the default), and PERSISTENT for the session: the
         // scheduler retires each op's fence from its per-stream deque at completion
         // (SchedulerState::retire_fence), so the deques hold only in-flight fences instead of
-        // one entry per launch forever (a ~34,680-launch request used to retain ~4.5 MB of
-        // resolved fences, ~2.57 GB over a ~550-forward request — the growth the old
-        // per-forward recreate-and-destroy workaround papered over). The resident
+        // one entry per launch forever. Unbounded, not large per step — ~200 launches per
+        // decode step (202 measured on 2b fp8) is tens of KB/forward, but a session stream
+        // never dies, so it accumulates for its whole life (the old per-forward
+        // recreate-and-destroy workaround papered over exactly this; the PR1 gate run retired
+        // 331,220 fences over 1,570 forwards with RSS flat to the kB). The resident
         // program/weight/KV allocations live on the runtime, not the stream.
         self.stream =
             Some(Stream::create().map_err(|e| anyhow!("prepare: could not create a stream: {e}"))?);
