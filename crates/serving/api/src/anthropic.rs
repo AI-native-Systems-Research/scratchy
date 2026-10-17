@@ -264,28 +264,41 @@ impl AnthropicUsage {
 fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
     let mut messages = Vec::new();
 
-    // One system message, first: the `system` parameter, then every `system` message of the
-    // conversation in order. Chat templates take a system message only at the start (Qwen3.5/3.6's
-    // raises "System message must be at the beginning").
-    let in_conversation = (req.messages.iter())
-        .filter(|m| m.role == AnthropicRole::System)
-        .map(|m| match &m.content {
-            MessageContent::Text(t) => t.clone(),
-            MessageContent::Blocks(blocks) => (blocks.iter())
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text, .. } => Some(text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        });
+    // ⭐ ONE SYSTEM MESSAGE, FIRST, AND EVERY OTHER MESSAGE WHERE IT IS. Chat templates take a system
+    // message only at the start (Qwen3.5/3.6's raises "System message must be at the beginning"),
+    // so the `system` parameter — and any `system` message before the conversation — is that one.
+    // A `system` message INSIDE the conversation (Claude Code's environment block, and the reminder
+    // it adds every turn) stays at its place, joining the user or tool message before it, as Claude
+    // Code itself puts its reminders inside tool results, or opening a user turn of its own.
+    //
+    // ⛔ HOISTED INTO THE SYSTEM MESSAGE, EACH TURN'S REMINDER CHANGED THE PROMPT WHERE THE SYSTEM
+    // MESSAGE ENDS — ahead of the whole conversation — so no turn's prefix cache reached past it:
+    // measured under Claude Code on Qwen3.6, every turn re-prefilled everything after the ~17k
+    // tokens of system prompt and tools. In place, each turn extends the one before it.
+    let system_text = |content: &MessageContent| match content {
+        MessageContent::Text(t) => t.clone(),
+        MessageContent::Blocks(blocks) => (blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    let leading = (req.messages.iter())
+        .take_while(|m| m.role == AnthropicRole::System)
+        .count();
     let system: Vec<String> = match req.system {
         None => Vec::new(),
         Some(SystemParam::Text(t)) => vec![t],
         Some(SystemParam::Blocks(blocks)) => blocks.into_iter().map(|b| b.text).collect(),
     }
     .into_iter()
-    .chain(in_conversation)
+    .chain(
+        req.messages[..leading]
+            .iter()
+            .map(|m| system_text(&m.content)),
+    )
     .collect();
     if !system.is_empty() {
         messages.push(protocol::ChatCompletionMessageParam {
@@ -299,8 +312,27 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
     }
 
     // Convert messages
-    for msg in req.messages {
+    for msg in req.messages.into_iter().skip(leading) {
         if msg.role == AnthropicRole::System {
+            let text = system_text(&msg.content);
+            match messages.last_mut() {
+                Some(protocol::ChatCompletionMessageParam {
+                    role,
+                    content: Some(Value::String(before)),
+                    ..
+                }) if role == "user" || role == "tool" => {
+                    before.push('\n');
+                    before.push_str(&text);
+                }
+                _ => messages.push(protocol::ChatCompletionMessageParam {
+                    role: "user".to_string(),
+                    content: Some(Value::String(text)),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning: None,
+                }),
+            }
             continue;
         }
         match msg.content {
@@ -1445,8 +1477,8 @@ mod tests {
     }
 
     /// Claude Code 2.1's first request: the `system` blocks, then a user turn and a `system`
-    /// message (its environment block). The chat request carries one system message, first, the
-    /// parameter's text and then the conversation's.
+    /// message (its environment block). The chat request carries one system message, first — the
+    /// parameter's text — and the environment block where it was, in the user turn before it.
     #[test]
     fn test_convert_system_messages_in_the_conversation() {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
@@ -1463,9 +1495,100 @@ mod tests {
         assert_eq!(roles, ["system", "user"]);
         assert_eq!(
             chat.messages[0].content,
-            Some(Value::String(
-                "You are Claude Code.\nBe concise.\n# Environment".into()
-            ))
+            Some(Value::String("You are Claude Code.\nBe concise.".into()))
+        );
+        assert_eq!(
+            chat.messages[1].content,
+            Some(Value::String("Read stack.py.\n# Environment".into()))
+        );
+    }
+
+    /// Claude Code's turns as it sends them: each repeats the last, then adds the assistant's tool
+    /// call, its result and a `system` reminder. Converted, each turn's messages extend the turn
+    /// before's exactly — what a prefix cache needs to reuse the conversation — and no system
+    /// message follows the first, which chat templates reject.
+    #[test]
+    fn test_a_claude_code_turn_extends_the_one_before_it() {
+        let turn = |n: usize| -> MessagesRequest {
+            let mut messages = vec![
+                serde_json::json!({"role": "user", "content": [{"type": "text", "text": "Read stack.py."}]}),
+                serde_json::json!({"role": "system", "content": [{"type": "text", "text": "# Environment"}]}),
+            ];
+            for i in 0..n {
+                messages.push(serde_json::json!({"role": "assistant", "content": [
+                    {"type": "tool_use", "id": format!("t{i}"), "name": "Read", "input": {"path": "stack.py"}}
+                ]}));
+                messages.push(serde_json::json!({"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": format!("t{i}"), "content": format!("line {i}")}
+                ]}));
+                messages.push(serde_json::json!({"role": "system", "content": format!("<total_tokens>{} tokens left</total_tokens>", 1000 - i)}));
+            }
+            serde_json::from_value(serde_json::json!({
+                "max_tokens": 50,
+                "system": [{"type": "text", "text": "You are Claude Code."}],
+                "messages": messages,
+            }))
+            .expect("parses")
+        };
+        let converted = |n: usize| -> Vec<Value> {
+            let chat = convert_request(turn(n));
+            assert!(
+                chat.messages.iter().skip(1).all(|m| m.role != "system"),
+                "a system message only first"
+            );
+            (chat.messages.iter())
+                .map(|m| serde_json::to_value(m).expect("serializes"))
+                .collect()
+        };
+        for n in 0..3 {
+            let (before, after) = (converted(n), converted(n + 1));
+            assert_eq!(
+                after[..before.len()],
+                before[..],
+                "turn {} extends turn {n}",
+                n + 1
+            );
+        }
+        let last = convert_request(turn(1));
+        assert_eq!(
+            (last.messages[3].role.as_str(), &last.messages[3].content),
+            (
+                "tool",
+                &Some(Value::String(
+                    "line 0\n<total_tokens>1000 tokens left</total_tokens>".into()
+                ))
+            ),
+            "the reminder joins the tool result before it"
+        );
+    }
+
+    /// A `system` message after an assistant turn opens a user turn of its own, and one before
+    /// the conversation joins the system message.
+    #[test]
+    fn test_a_system_message_after_the_assistant_opens_a_user_turn() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "max_tokens": 50,
+            "messages": [
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Hello."},
+                {"role": "system", "content": "The user is away."}
+            ]
+        }))
+        .expect("parses");
+        let chat = convert_request(req);
+        let got: Vec<(&str, &Option<Value>)> = (chat.messages.iter())
+            .map(|m| (m.role.as_str(), &m.content))
+            .collect();
+        let text = |t: &str| Some(Value::String(t.into()));
+        assert_eq!(
+            got,
+            [
+                ("system", &text("Be concise.")),
+                ("user", &text("Hi")),
+                ("assistant", &text("Hello.")),
+                ("user", &text("The user is away.")),
+            ]
         );
     }
 
