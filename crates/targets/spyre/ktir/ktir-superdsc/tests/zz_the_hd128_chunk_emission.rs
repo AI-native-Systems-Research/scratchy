@@ -59,6 +59,10 @@ fn emit(pages: u32, mq: u32) -> Vec<(String, serde_json::Value)> {
 /// `[mq, hd]` (the whole head dim, unbatched), owns a whole `[mq, slots]` score block, and contracts its
 /// probabilities against one slab of the slab-major V at a time — one stick of `out` per op, the fold's
 /// card-proven hd=128 value form. Nothing is a fold op.
+///
+/// This is the form with NO attention class registry (this fixture passes no layout) and every prompt
+/// chunk. A one-request decode whose bundle names its class re-lays its query group-major and attends a
+/// kv head's whole group instead — `zz_the_hd128_query_group_chunk`.
 #[test]
 fn an_hd128_chunk_scores_per_head_and_values_per_head_slab() {
     for mq in [1, PagedKvPool::PREFILL_CHUNK_SLOTS as u32] {

@@ -9756,6 +9756,7 @@ fn synth_role_tokens(
         R::ChunkSc => quote! { #b::ChunkSc },
         R::ChunkESub => quote! { #b::ChunkESub },
         R::ChunkExp => quote! { #b::ChunkExp },
+        R::ChunkQGroup => quote! { #b::ChunkQGroup },
         R::ChunkRed(i) => {
             let i = proc_macro2::Literal::u32_unsuffixed(*i);
             quote! { #b::ChunkRed(#i) }
