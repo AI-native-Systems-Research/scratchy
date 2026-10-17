@@ -479,7 +479,12 @@ fn is_print_mode(args: &[String]) -> bool {
 /// Split out and pure so each case is unit-testable without a server: this is
 /// the one check in `launch claude` that a benchmark relies on, and a
 /// provenance claim that reads the wrong way is worse than none.
-fn provenance_report(before: Option<u64>, after: Option<u64>, print_mode: bool) -> (String, bool) {
+fn provenance_report(
+    before: Option<u64>,
+    after: Option<u64>,
+    print_mode: bool,
+    claude_ok: bool,
+) -> (String, bool) {
     match (before, after) {
         (Some(b), Some(a)) if a > b => (
             format!(
@@ -487,6 +492,14 @@ fn provenance_report(before: Option<u64>, after: Option<u64>, print_mode: bool) 
                 a - b
             ),
             false,
+        ),
+        // Zero, and `claude` failed: it stopped before it sent anything — an argument or a
+        // startup error, which it reported itself — rather than sending elsewhere.
+        (Some(_), Some(_)) if !claude_ok => (
+            "scratchy: the server under test served 0 requests: `claude` failed before it sent \
+             one (its own error is above). This run measured nothing."
+                .to_string(),
+            print_mode,
         ),
         // Zero. In print mode this is never innocent, so it is an error and the
         // exit status carries it — a harness must not have to scrape stderr to
@@ -524,36 +537,47 @@ fn provenance_report(before: Option<u64>, after: Option<u64>, print_mode: bool) 
     }
 }
 
-/// How launch resolved the Claude Code session id and what to add to the
-/// `claude` command line for it (the store is keyed by the id in every case).
+/// What launch adds to the `claude` command line for the Claude Code session.
 #[derive(Debug, PartialEq, Eq)]
 enum SessionInject {
-    /// `--resume <id>` (first-class) → resume the session + key by id.
+    /// `--resume <id>` (first-class) → resume that session.
     Resume(String),
-    /// `--session-id <id>` (first-class, or a freshly minted id) → pin + key.
+    /// `--session-id <id>` (first-class, or a freshly minted id) → pin it.
     New(String),
     /// The id was found inside the forwarded `-- …` args, so it's already on the
-    /// claude command line — don't re-add it (just key the store by it).
+    /// claude command line — don't re-add it.
     AlreadyInArgs,
+    /// The forwarded args continue the latest session (`--continue` / `-c`): Claude Code picks
+    /// the session itself, and refuses a `--session-id` beside it (#579).
+    Continue,
 }
 
-/// Resolve which session id to key the KV store by, and how to tell `claude`
-/// about it, from the explicit flags + the forwarded claude args. `None` = no id
-/// anywhere → the caller mints a fresh one (kept out of here so this stays pure /
-/// unit-testable). Priority: first-class `--resume` > first-class `--session-id`
-/// > an id inside the passed-through `-- …` args.
+/// How to tell `claude` about the session, from the explicit flags + the forwarded claude
+/// args. `None` = nothing says → the caller mints a fresh id (kept out of here so this stays
+/// pure / unit-testable). Priority: first-class `--resume` > first-class `--session-id` > an
+/// id inside the passed-through `-- …` args > a passed-through `--continue`.
 fn resolve_session_inject(
     resume: Option<String>,
     session_id: Option<String>,
     claude_args: &[String],
-) -> Option<(String, SessionInject)> {
+) -> Option<SessionInject> {
     if let Some(id) = resume {
-        Some((id.clone(), SessionInject::Resume(id)))
+        Some(SessionInject::Resume(id))
     } else if let Some(id) = session_id {
-        Some((id.clone(), SessionInject::New(id)))
+        Some(SessionInject::New(id))
+    } else if session_id_from_args(claude_args).is_some() {
+        Some(SessionInject::AlreadyInArgs)
     } else {
-        session_id_from_args(claude_args).map(|id| (id, SessionInject::AlreadyInArgs))
+        continues_latest_session(claude_args).then_some(SessionInject::Continue)
     }
+}
+
+/// Whether the forwarded args continue the latest session, `--continue` or `-c`, without
+/// `--fork-session` — the one flag Claude Code takes beside them that makes a `--session-id`
+/// the fork's new id rather than a conflict.
+fn continues_latest_session(args: &[String]) -> bool {
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    (has("--continue") || has("-c")) && !has("--fork-session")
 }
 
 pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
@@ -610,15 +634,12 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     //      (already in claude_args — don't re-add).
     //   4. none → mint a fresh id, pin it via `--session-id`, and print the
     //      resume command on exit so start→Ctrl-C→resume is copy-paste.
-    let (_session_id, inject) = resolve_session_inject(
+    let inject = resolve_session_inject(
         args.resume.clone(),
         args.session_id.clone(),
         &args.claude_args,
     )
-    .unwrap_or_else(|| {
-        let id = gen_uuid_v4();
-        (id.clone(), SessionInject::New(id))
-    });
+    .unwrap_or_else(|| SessionInject::New(gen_uuid_v4()));
 
     // Either reuse a running server, or spawn one we own (and tear down on exit).
     let (base_url, server) = match args.server_url.clone() {
@@ -730,7 +751,7 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
         SessionInject::New(id) => {
             cmd.arg("--session-id").arg(id);
         }
-        SessionInject::AlreadyInArgs => {}
+        SessionInject::AlreadyInArgs | SessionInject::Continue => {}
     }
     cmd.args(&args.claude_args);
 
@@ -770,6 +791,7 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
         served_before,
         served_after,
         is_print_mode(&args.claude_args),
+        status.success(),
     );
 
     // Claude Code's own failure is reported first: if it exited non-zero, that
@@ -1398,20 +1420,44 @@ mod tests {
         // first-class --resume wins over everything (and resumes, not pins).
         assert_eq!(
             resolve_session_inject(Some("R".into()), Some("S".into()), &s(&["--resume", "A"])),
-            Some(("R".into(), SessionInject::Resume("R".into())))
+            Some(SessionInject::Resume("R".into()))
         );
         // then first-class --session-id (pins a new/known id).
         assert_eq!(
             resolve_session_inject(None, Some("S".into()), &s(&["--resume", "A"])),
-            Some(("S".into(), SessionInject::New("S".into())))
+            Some(SessionInject::New("S".into()))
         );
-        // then an id inside the forwarded `-- …` args — keyed but NOT re-added.
+        // then an id inside the forwarded `-- …` args — NOT re-added.
         assert_eq!(
             resolve_session_inject(None, None, &s(&["--resume", "A"])),
-            Some(("A".into(), SessionInject::AlreadyInArgs))
+            Some(SessionInject::AlreadyInArgs)
         );
         // nothing anywhere → None (caller mints a fresh id).
         assert_eq!(resolve_session_inject(None, None, &s(&["-p", "hi"])), None);
+    }
+
+    /// A forwarded `--continue` (or `-c`) lets Claude Code pick the session, and gets no
+    /// `--session-id` beside it, which Claude Code refuses (#579) — unless `--fork-session`
+    /// makes that id the fork's.
+    #[test]
+    fn a_forwarded_continue_gets_no_session_id() {
+        for flag in ["--continue", "-c"] {
+            assert_eq!(
+                resolve_session_inject(None, None, &s(&["-p", "next", flag])),
+                Some(SessionInject::Continue),
+                "{flag}"
+            );
+        }
+        assert_eq!(
+            resolve_session_inject(None, None, &s(&["--continue", "--fork-session"])),
+            None,
+            "a fork takes the minted id"
+        );
+        assert_eq!(
+            resolve_session_inject(None, Some("S".into()), &s(&["--continue"])),
+            Some(SessionInject::New("S".into())),
+            "an explicit --session-id still wins"
+        );
     }
 
     #[test]
@@ -1909,19 +1955,19 @@ mod tests {
     fn provenance_distinguishes_zero_from_cannot_say() {
         // Traffic arrived — never a failure, in either mode.
         for print_mode in [false, true] {
-            let (ok, void) = provenance_report(Some(0), Some(7), print_mode);
+            let (ok, void) = provenance_report(Some(0), Some(7), print_mode, true);
             assert!(ok.contains("served 7 request"), "{ok}");
             assert!(!void, "traffic arriving must never fail the command");
         }
 
         // A delta, not an absolute — --server-url may have prior traffic.
-        let (delta, _) = provenance_report(Some(100), Some(103), false);
+        let (delta, _) = provenance_report(Some(100), Some(103), false, true);
         assert!(delta.contains("served 3 request"), "{delta}");
 
         // Nothing arrived, interactively: names the likely innocent cause AND
         // the one that invalidates a measurement, and does NOT fail — a hard
         // error on every Ctrl-C would teach people to ignore it.
-        let (zero, void) = provenance_report(Some(4), Some(4), false);
+        let (zero, void) = provenance_report(Some(4), Some(4), false, true);
         assert!(zero.contains("0 requests"), "{zero}");
         assert!(zero.contains("without sending a prompt"), "{zero}");
         assert!(zero.contains("ANTHROPIC_BASE_URL"), "{zero}");
@@ -1934,7 +1980,7 @@ mod tests {
         // Nothing arrived in print mode: there WAS a prompt, so this is void
         // and the exit status has to carry it. A harness must not need to
         // scrape stderr to find out its measurement is worthless.
-        let (void_msg, void) = provenance_report(Some(4), Some(4), true);
+        let (void_msg, void) = provenance_report(Some(4), Some(4), true, true);
         assert!(void, "a non-interactive run that served nothing must fail");
         assert!(void_msg.contains("0 requests"), "{void_msg}");
         assert!(void_msg.contains("must not be published"), "{void_msg}");
@@ -1942,12 +1988,20 @@ mod tests {
         // No innocent explanation offered — there isn't one here.
         assert!(!void_msg.contains("without sending a prompt"), "{void_msg}");
 
+        // Nothing arrived because `claude` failed first (an argument error, #579): it never
+        // sent, so no endpoint is blamed, and the run is still void in print mode.
+        let (failed, void) = provenance_report(Some(4), Some(4), true, false);
+        assert!(failed.contains("0 requests"), "{failed}");
+        assert!(failed.contains("failed before it sent"), "{failed}");
+        assert!(!failed.contains("ANTHROPIC_BASE_URL"), "{failed}");
+        assert!(void, "it measured nothing");
+
         // Could not ask is NOT the same claim as zero: it must not accuse, must
         // not reassure, and must not fail even in print mode — the run may have
         // been served fine by a server too old to report a count.
         for print_mode in [false, true] {
             for (before, after) in [(None, Some(3)), (Some(3), None), (None, None)] {
-                let (report, void) = provenance_report(before, after, print_mode);
+                let (report, void) = provenance_report(before, after, print_mode, true);
                 assert!(report.contains("could not read"), "{report}");
                 assert!(!report.contains("must not be published"), "{report}");
                 assert!(!report.contains("served 3 request"), "{report}");
