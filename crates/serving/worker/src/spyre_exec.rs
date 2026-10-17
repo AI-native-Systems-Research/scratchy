@@ -353,16 +353,18 @@ impl Worker for SpyreWorker {
     /// `None` on the paths that never size a paged pool — the engine's estimate is all there is to
     /// divide by there.
     fn kv_block_bytes(&self, block_size: usize) -> Option<usize> {
-        self.model.as_ref().and_then(|m| m.pool_stride_bytes).map(|stride| {
-            // `PLANE_SLOTS` is how many tokens one page holds, so the stride prorated to
-            // `block_size` tokens is the block cost at ANY block size the engine picks. The
-            // path is fully qualified because the pool/slot vocabulary's imports are
-            // card-only (see this file's header) and the emu tier reaches here too, with
-            // `None` — no pool was ever sized.
-            let plane_slots =
-                scratchy_subtile::sdsc_abstract::PagedKvPool::PLANE_SLOTS as u64;
-            (stride / plane_slots * block_size as u64) as usize
-        })
+        self.model
+            .as_ref()
+            .and_then(|m| m.pool_stride_bytes)
+            .map(|stride| {
+                // `PLANE_SLOTS` is how many tokens one page holds, so the stride prorated to
+                // `block_size` tokens is the block cost at ANY block size the engine picks. The
+                // path is fully qualified because the pool/slot vocabulary's imports are
+                // card-only (see this file's header) and the emu tier reaches here too, with
+                // `None` — no pool was ever sized.
+                let plane_slots = scratchy_subtile::sdsc_abstract::PagedKvPool::PLANE_SLOTS as u64;
+                (stride / plane_slots * block_size as u64) as usize
+            })
     }
 
     /// ⭐ THE POOL'S PAGE COUNT, so every block id the scheduler hands out is a page this pool has.
