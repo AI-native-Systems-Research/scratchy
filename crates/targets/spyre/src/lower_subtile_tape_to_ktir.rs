@@ -520,6 +520,33 @@ pub(crate) fn oproj_edges<F: RopeForm>(ir: &SubtileIR<F>) -> Result<OprojEdges, 
     })
 }
 
+/// ⭐ THE HEAD-MAJOR o_proj COPY MINT — ONE implementation, TWO consumers: the placement pass
+/// (`compute_bundle_layout`) places each `to` tid one block after its companion, and
+/// [`graph_wiring`] bakes the SAME list into the generated wiring so the worker materializes
+/// each copy at load. A registry two consumers re-derive separately is a registry that can
+/// silently disagree — and did: #299's registry rewrite of `graph_wiring` left its copy of
+/// this list on `Default` (empty) while the placement pass kept minting it, so every
+/// head-major copy was placed-but-never-staged and the m=1 fp8 o matmul read never-written
+/// device windows (`Fr4 (oon`, granite-3.1-8b fp8, card-only — the emulator executes the KTIR
+/// program, not the staging). Same shared-helper law the wiring's other registries follow.
+/// Pure function of `ir`, keyed on the GEOMETRY ([`OprojEdges::geometry_applies`]), never the
+/// bundle's row count — every bundle of a model shares ONE staged weight segment, so a
+/// rows-gated mint would hand the single-row body addresses no other bundle staged.
+pub(crate) fn oproj_perm_copies<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<std::collections::BTreeMap<u32, u32>, SuperDscError> {
+    let oproj = oproj_edges(ir)?;
+    Ok(if oproj.geometry_applies {
+        oproj
+            .edges
+            .iter()
+            .map(|e| (e.w, oproj_headmajor_tid(e.w)))
+            .collect()
+    } else {
+        std::collections::BTreeMap::new()
+    })
+}
+
 /// ⭐ THE SPLIT-KV CHUNK THIS GRAPH'S ATTENTION CAN EXPRESS — `requested` when EVERY attention
 /// class's pool admits it, `None` otherwise.
 ///
@@ -1360,6 +1387,25 @@ pub struct NodeArgs {
     pub args: Vec<usize>,
 }
 
+/// ⭐ THE WIRING'S REGISTRIES — the layout facts [`graph_wiring`] rebuilds as pure functions of
+/// `ir`, in the wiring's own shapes. ⛔ NO `Default`, and the literal in `graph_wiring` is
+/// EXHAUSTIVE: a registry added to this struct (or to [`BundleWiring`]) is a MISSING FIELD at
+/// the one construction site — a build error, not a silent empty list on the card. This is
+/// the class #299's registry rewrite of `graph_wiring` dropped: `weight_copies` stayed on
+/// `BundleLayout::default()` while the placement pass kept minting it, so every head-major
+/// copy was placed-but-never-staged and the m=1 fp8 o matmul read never-written windows
+/// (`Fr4 (oon`, granite-3.1-8b fp8, card-only). Before that rewrite the wiring ran the whole
+/// placement pass for these five fields — a throwaway budget pass that refused models the
+/// re-rolled bake had accepted (the 26b MoE panic that motivated the rewrite) — so the
+/// registries stand alone here, exhaustively built.
+pub(crate) struct WiringRegistries {
+    pub scalarmul_scales: Vec<f32>,
+    pub weight_scale_folds: Vec<(u32, f32)>,
+    pub weight_copies: Vec<(u32, u32)>,
+    pub rope_class_hds: Vec<u32>,
+    pub attn_class_hds: Vec<u32>,
+}
+
 /// Lower `ir` for its WIRING alone — the same per-node arms a bake runs, read for the parameter
 /// pairings rather than for the programs.
 ///
@@ -1372,16 +1418,17 @@ pub fn graph_wiring<F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
 ) -> Result<BundleWiring, SuperDscError> {
     // ⛔ A REGISTRY, NOT A PLACEMENT — the wiring reads ONE kind of thing off the layout: the
-    // registries (`scalarmul_scales`, `weight_scale_folds`, the rope/identity class sets). The
-    // placement pass [`compute_bundle_layout`] computes here would be a THROWAWAY (the shipped
-    // layout is the re-rolled bake's), and it is the CARD's budget pass: it refuses a weight
-    // segment past one 16 GiB region with no layer classes to bank on — MEASURED on the old
-    // ladder, the 26b MoE under the fp8 preset wired fine through the banked re-rolled bake
-    // and then panicked HERE on a layout nobody reads. Every registry below is a pure function
-    // of `ir.nodes` (the same helpers the placement pass itself fills from), so that is what
-    // this builds.
+    // registries ([`WiringRegistries`]). The placement pass [`compute_bundle_layout`] computed
+    // here would be a THROWAWAY (the shipped layout is the re-rolled bake's), and it is the
+    // CARD's budget pass: it refuses a weight segment past one 16 GiB region with no layer
+    // classes to bank on — MEASURED on the old ladder, the 26b MoE under the fp8 preset wired
+    // fine through the banked re-rolled bake and then panicked HERE on a layout nobody reads.
+    // Every registry is a pure function of `ir.nodes` (the same helpers the placement pass
+    // itself fills from), so that is what [`WiringRegistries`] builds — exhaustively, so a
+    // registry added later is a missing field at the literal, not a silent `Default` on the
+    // card.
     let _ = weight_ids;
-    let layout = BundleLayout {
+    let registries = WiringRegistries {
         scalarmul_scales: scalar_registry(ir),
         // Same rule as the placement pass's own field: the fold list the worker applies to
         // staged bytes at load, keyed by weight tid (the `SubtileId` half is a placement-pass
@@ -1390,6 +1437,9 @@ pub fn graph_wiring<F: RopeForm>(
             .into_iter()
             .map(|(_, tid, scale)| (tid, scale))
             .collect(),
+        // ⭐ THE COPY MINT — [`oproj_perm_copies`], the placement pass's own helper, so the
+        // wiring's list and the layout's placements cannot disagree.
+        weight_copies: oproj_perm_copies(ir)?.into_iter().collect(),
         // ⭐ THE CLASS REGISTRIES, here too — the door resolves a rope/attn program's P/identity
         // class through these, and this pass lowers through the door. Same shared helper, same
         // tape, so the wiring's answer and the placement pass's cannot disagree.
@@ -1407,7 +1457,6 @@ pub fn graph_wiring<F: RopeForm>(
                 _ => None,
             },
         )),
-        ..Default::default()
     };
     let mut nodes = Vec::with_capacity(ir.nodes.len());
     let mut mask: Option<(u32, u32)> = None;
@@ -1478,14 +1527,14 @@ pub fn graph_wiring<F: RopeForm>(
         result_tensor: ir.result.index() as u32,
         tensor_shapes,
         attn_mask,
-        scalarmul_scales: layout.scalarmul_scales.clone(),
-        weight_scale_folds: layout.weight_scale_folds.clone(),
-        weight_copies: layout.weight_copies.clone(),
-        // The class sets, off the SAME layout registry the two lists above come from — the
+        scalarmul_scales: registries.scalarmul_scales,
+        weight_scale_folds: registries.weight_scale_folds,
+        weight_copies: registries.weight_copies,
+        // The class sets, off the SAME registries the two lists above come from — the
         // registry the door resolves class indices against, so the worker's table binds and
         // the emitter's class tids agree by construction (see the field's doc).
-        rope_class_hds: layout.rope_class_hds.clone(),
-        attn_class_hds: layout.attn_class_hds.clone(),
+        rope_class_hds: registries.rope_class_hds,
+        attn_class_hds: registries.attn_class_hds,
     })
 }
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`
@@ -3642,6 +3691,147 @@ mod attn_scale_weight_fold_tests {
             Some(8),
             "the canonical o_proj stays stated — a graph fact the door reads only under the \
              handoff, so the mixed model's door calls are the shipped emission's own"
+        );
+    }
+
+    /// The UNIFORM twin of [`two_class_fp8_oproj_graph`]: ONE attention class, multi-slab
+    /// (hd 128 > `POOL_STICK`), fp8 W8A8 o projection closed by exactly one matmul —
+    /// granite-8b's geometry at fixture size, and the exact shape every term of
+    /// [`OprojEdges::geometry_applies`] demands.
+    fn uniform_fp8_oproj_graph() -> SubtileIR {
+        let geom = ktir_superdsc::head_counts::ModelAttnGeometry::mint(
+            ktir_superdsc::head_counts::QueryHeads::new(2),
+            ktir_superdsc::head_counts::KvHeads::new(1),
+            ktir_superdsc::head_counts::HeadDim::new(128),
+        )
+        .expect("2 query heads over 1 kv head, head_dim 128, mints");
+        let hd = ktir_superdsc::head_counts::HeadDim::new(128);
+        let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
+        let sources = vec![
+            shape(1, 8),    // 0: x (hidden 8)
+            shape(8, 256),  // 1: W_q — q width 2·128
+            shape(8, 128),  // 2: W_k — kv width 1·128
+            shape(1, 128),  // 3: v
+            shape(32, 128), // 4: prefix_k cache
+            shape(32, 128), // 5: prefix_v cache
+            shape(1, 256),  // 6: cos (q side — one per q head pair)
+            shape(1, 256),  // 7: sin (q side)
+            shape(256, 16), // 8: W_o — fp8, k = 2·128
+            shape(1, 16),   // 9: o_scale
+            shape(1, 128),  // 10: cos (k side — kv width 1·128)
+            shape(1, 128),  // 11: sin (k side)
+        ];
+        let ops = vec![
+            // 0: q = x · W_q; 1: q_rot = rope_rotate(q, cos, sin)
+            OpDesc {
+                op: SubOp::MatmulTile {
+                    n: 256,
+                    weight: GemmWeight::Dense,
+                },
+                m: 1,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            },
+            OpDesc {
+                op: SubOp::rope_rotate(hd),
+                m: 1,
+                inputs: vec![InputRef::Op(0), InputRef::Ext(6), InputRef::Ext(7)],
+            },
+            // 2: k = x · W_k; 3: k_rot = rope_append(k, cos_k, sin_k, v, caches)
+            OpDesc {
+                op: SubOp::MatmulTile {
+                    n: 128,
+                    weight: GemmWeight::Dense,
+                },
+                m: 1,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(2)],
+            },
+            OpDesc {
+                op: SubOp::rope_append(
+                    hd,
+                    0,
+                    scratchy_subtile::subtile_ir::AttnMask::Causal,
+                    scratchy_subtile::subtile_ir::RopeFormTag::NeoX,
+                ),
+                m: 1,
+                inputs: vec![
+                    InputRef::Op(2),
+                    InputRef::Ext(10),
+                    InputRef::Ext(11),
+                    InputRef::Ext(3),
+                    InputRef::Ext(4),
+                    InputRef::Ext(5),
+                ],
+            },
+            // 4: attn = AttnDecode(q_rot, prefix_k, prefix_v, k_rot, v)
+            OpDesc {
+                op: SubOp::attn_decode(
+                    geom,
+                    0.015625,
+                    33,
+                    scratchy_subtile::subtile_ir::AttnMask::Causal,
+                ),
+                m: 1,
+                inputs: vec![
+                    InputRef::Op(1),
+                    InputRef::Ext(4),
+                    InputRef::Ext(5),
+                    InputRef::Op(3),
+                    InputRef::Ext(3),
+                ],
+            },
+            // 5: out = attn · W_o (fp8 W8A8, scale source 9)
+            OpDesc {
+                op: SubOp::MatmulTile {
+                    n: 16,
+                    weight: GemmWeight::Fp8Dynamic,
+                },
+                m: 1,
+                inputs: vec![InputRef::Op(4), InputRef::Ext(8), InputRef::Ext(9)],
+            },
+        ];
+        let input = LoweringInput {
+            sources,
+            ops,
+            result: 5,
+            exported: None,
+        };
+        let nb = std::num::NonZeroU32::new(8192).expect("8192 != 0");
+        scratchy_subtile::subtile_ir::lower_region(&input, nb)
+    }
+
+    /// ⭐ THE COPY MINT IS THE WIRING'S REGISTRY TOO — pinned after #299's registry rewrite of
+    /// [`graph_wiring`] left `weight_copies` on the layout's `Default` while the placement pass
+    /// kept minting it: every head-major copy placed-but-never-staged, and the m=1 fp8 o
+    /// matmul read never-written windows (`Fr4 (oon`, granite-3.1-8b fp8, card-only — the
+    /// emulator executes the KTIR program, not the staging). The wiring must carry EXACTLY the
+    /// placement pass's list, and a uniform multi-slab fp8 graph — granite-8b's shape — is the
+    /// fixture that states it. If this assertion ever fails, one side of the mint re-derived
+    /// its own list again.
+    #[test]
+    fn the_wiring_carries_the_oproj_copy_mint() {
+        let ir = uniform_fp8_oproj_graph();
+        let weight_ids: std::collections::HashSet<u32> = [1u32, 2, 8, 9].into_iter().collect();
+        let wiring =
+            graph_wiring(&ir, &weight_ids).expect("the uniform multi-slab fp8 graph wires");
+        let layout = crate::lower_subtile_tape_to_superdsc::compute_bundle_layout(
+            &ir,
+            &weight_ids,
+            false,
+            false,
+            &[],
+        )
+        .expect("the same graph lays out");
+        assert_eq!(
+            wiring.weight_copies, layout.weight_copies,
+            "the wiring's copy list is the placement pass's mint — the worker materializes each \
+             `to` tid from its `from` tid's bytes at load, and a list that disagrees with the \
+             placements stages nothing for a window the m=1 fp8 o matmul reads"
+        );
+        assert_eq!(
+            wiring.weight_copies,
+            vec![(8, oproj_headmajor_tid(8))],
+            "the uniform fixture mints exactly W_o t8's pair: one layer's o_proj weight gains \
+             its head-major copy"
         );
     }
 }

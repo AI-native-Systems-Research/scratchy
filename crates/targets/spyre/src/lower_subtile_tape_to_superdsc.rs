@@ -948,16 +948,12 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    addresses no other bundle staged. Only the door's emission gates on rows
     //    (`BundleAttnParams::headmajor_handoff`), and a bundle that never states the handoff
     //    simply never names its permuted copy — staged and unread, like any other resident weight.
-    let oproj = crate::lower_subtile_tape_to_ktir::oproj_edges(ir)?;
-    let oproj_perm_after: std::collections::BTreeMap<u32, u32> = if oproj.geometry_applies {
-        oproj
-            .edges
-            .iter()
-            .map(|e| (e.w, oproj_headmajor_tid(e.w)))
-            .collect()
-    } else {
-        std::collections::BTreeMap::new()
-    };
+    //    ⛔ AND ONE MINT SERVES THE WIRING TOO: [`crate::lower_subtile_tape_to_ktir::oproj_perm_copies`]
+    //    is the shared implementation, because a list the placement pass derives separately from
+    //    the wiring's is a list that can silently disagree — #299's registry rewrite of
+    //    `graph_wiring` dropped the wiring's copy while this pass kept placing, and every copy
+    //    sat never-staged while the m=1 fp8 o matmul read it.
+    let oproj_perm_after = crate::lower_subtile_tape_to_ktir::oproj_perm_copies(ir)?;
     for tid in 0..ir.num_sources {
         if prefix_kv_tids.contains(&tid) {
             continue; // re-placed into seg2 (Kv) below — no dead Activation slot / no per-step re-H2D
