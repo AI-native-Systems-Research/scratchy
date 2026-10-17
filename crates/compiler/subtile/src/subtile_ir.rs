@@ -1220,7 +1220,9 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     GateApply,
     /// Row concatenation: `out[t] = a[t] ++ b[t]`, output `cols` wide, `a` `left` of them (an MTP
     /// head's input fusion: two halves; a forward's exported hidden states side by side: each one
-    /// more after the ones before it). `inputs` = `[a, b]`.
+    /// more after the ones before it). `inputs` = `[a, b]`, or `[a]` — its copy, `left == cols`:
+    /// the first exported hidden state, kept apart from the residual stream the next in-place add
+    /// overwrites.
     Concat { left: u32, cols: u32 },
     /// Qwen3.5-MoE shared-expert combine: `out = routed + shared · σ(g)`, `g` a `[m, 1]`
     /// row-broadcast. `inputs` = `[routed, shared, g]`.
@@ -1800,14 +1802,22 @@ pub fn eval_node<F: RopeForm>(
         }
         SubOp::Concat { left, cols } => {
             let (a, ar, ac) = gather(&node.inputs[0], graph, bufs);
-            let (b, br, bc) = gather(&node.inputs[1], graph, bufs);
-            debug_assert_eq!((ar, ac + bc), (out_rows, out_cols), "concat shape");
-            debug_assert_eq!(br, ar, "concat operands share their rows");
-            debug_assert_eq!((ac, ac + bc), (left, cols), "concat widths");
-            a.chunks(ac as usize)
-                .zip(b.chunks(bc as usize))
-                .flat_map(|(ra, rb)| ra.iter().chain(rb).copied())
-                .collect()
+            match node.inputs.get(1) {
+                None => {
+                    debug_assert_eq!((ar, ac, left, cols), (out_rows, out_cols, ac, ac), "copy");
+                    a
+                }
+                Some(b) => {
+                    let (b, br, bc) = gather(b, graph, bufs);
+                    debug_assert_eq!((ar, ac + bc), (out_rows, out_cols), "concat shape");
+                    debug_assert_eq!(br, ar, "concat operands share their rows");
+                    debug_assert_eq!((ac, ac + bc), (left, cols), "concat widths");
+                    a.chunks(ac as usize)
+                        .zip(b.chunks(bc as usize))
+                        .flat_map(|(ra, rb)| ra.iter().chain(rb).copied())
+                        .collect()
+                }
+            }
         }
         SubOp::GateScale => {
             // `g` is `[m, 1]`, broadcast across the row.

@@ -21,6 +21,10 @@ pub struct HeadRegistration {
     /// of its own, its query sits at the position after the row it reads, and its chained drafts
     /// keep that position.
     pub reads_target_kv: bool,
+    /// It drafts every token past its first in one forward (P-EAGLE): that forward's rows sit at
+    /// the positions after a sequence's newest and read its placeholders. `None`: each draft past
+    /// the first is a forward of its own, on the one before it.
+    pub parallel: Option<ParallelDrafting>,
     /// The checkpoint architectures of the targets it drafts for: its config is its target's.
     pub drafts_for: &'static [&'static str],
     /// How its repo is named when published apart from its target's (an MLX conversion strips the
@@ -48,6 +52,18 @@ pub struct HeadRegistration {
     /// arch (`scratchy_serving_engine::spec_decode::mtp`'s module docs: what it is measured at,
     /// and what blocks it).
     pub verify_rows: u8,
+}
+
+/// The placeholders a parallel-drafting head's rows past a sequence's newest read
+/// ([`HeadRegistration::parallel`]): learned in training, where the rows a sequential drafter
+/// reads the token and target hidden state before them have neither yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParallelDrafting {
+    /// The token each such row embeds (P-EAGLE's `ptd_token_id`).
+    pub mask_token: u32,
+    /// The checkpoint tensor holding the target hidden states each such row reads
+    /// (`[target_hidden_size]`, P-EAGLE's `mask_hidden`).
+    pub mask_hidden: &'static str,
 }
 
 /// A drafter published as a checkpoint of its own that its target drafts with by default: no
@@ -159,6 +175,7 @@ mod tests {
             lm_head: None,
             lm_head_rows: 262_144,
             reads_target_kv: true,
+            parallel: None,
             drafts_for: &["Gemma4ForConditionalGeneration"],
             repo_infix: None,
             checkpoint_prefix: None,

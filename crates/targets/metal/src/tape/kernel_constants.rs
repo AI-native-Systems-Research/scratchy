@@ -1419,14 +1419,30 @@ pub struct MtpChainConstants {
     pub hidden: HiddenSize,
     pub drafts: crate::tape::ids::NumDrafts,
     pub rope: crate::tape::ids::RotDim,
+    pub past_first: DraftsPastFirst,
+}
+
+/// How a multi-token-prediction head drafts past its first draft (`mtp_chain.metal` slot 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftsPastFirst {
+    /// A forward a draft, each reading the draft and final hidden state before it.
+    Chained,
+    /// One forward of rows that read the head's placeholders, which the host lays out (P-EAGLE):
+    /// the chain picks their positions alone.
+    Parallel,
 }
 
 impl From<MtpChainConstants> for Vec<ConstantValue> {
     fn from(c: MtpChainConstants) -> Self {
+        let parallel = match c.past_first {
+            DraftsPastFirst::Chained => 0,
+            DraftsPastFirst::Parallel => 1,
+        };
         vec![
             ConstantValue::uint(ConstSlot(0), c.hidden.get()),
             ConstantValue::uint(ConstSlot(1), c.drafts.get()),
             ConstantValue::uint(ConstSlot(2), c.rope.get()),
+            ConstantValue::uint(ConstSlot(3), parallel),
         ]
     }
 }

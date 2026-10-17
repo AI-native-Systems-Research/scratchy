@@ -34,6 +34,8 @@ fn safetensors_dtype(dtype: safetensors::Dtype) -> Result<DType> {
         safetensors::Dtype::U32 => Ok(DType::U32),
         safetensors::Dtype::I32 => Ok(DType::I32),
         safetensors::Dtype::U8 => Ok(DType::U8),
+        // One byte an element, 0 or 1: an EAGLE-3 drafter's `t2d` vocabulary mask.
+        safetensors::Dtype::BOOL => Ok(DType::U8),
         safetensors::Dtype::F8_E4M3 => Ok(DType::Fp8E4m3),
         other => bail!("unsupported safetensors dtype: {:?}", other),
     }
@@ -519,6 +521,15 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         }
         anyhow::ensure!(lent > 0, "lend: no tensor under `{from_prefix}`");
         Ok(lent)
+    }
+
+    /// Drop this store's own tensors under `prefix` (`<prefix>.<suffix>`), uploading nothing: a
+    /// head borrowing a weight its own checkpoint carries too (P-EAGLE's frozen copy of its
+    /// target's lm_head) reads its target's, lent there after. The tensors it dropped.
+    pub fn shadow(&mut self, prefix: &str) -> usize {
+        let before = self.tensors.len();
+        (self.tensors).retain(|name, _| scratchy_core_model::weight::under_prefix(name, prefix).is_none());
+        before - self.tensors.len()
     }
 
     /// Construct an empty `GpuWeights` — used by the GGUF loader in

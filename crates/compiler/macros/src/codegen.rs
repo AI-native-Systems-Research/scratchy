@@ -7481,10 +7481,14 @@ struct CanonicalLowered {
 /// Gemm (tp=1) or its AllGather wrapper (tp>1) for decoders, the
 /// merger MLP's bias_add for vision encoders.
 fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
+    use crate::classified::OpKind;
+    // The tail's appended nodes belong where they read or are read: the splices and row loads
+    // near the Embed, a target's exported hidden states (`rows_lowering::chain_exports`) after
+    // their last concatenation.
     fuf.nodes.iter().rev().find(|n| {
         !matches!(
             n.op,
-            crate::classified::OpKind::MmEmbedSplice | crate::classified::OpKind::LoadRows(_)
+            OpKind::MmEmbedSplice | OpKind::LoadRows(_) | OpKind::ExportHidden
         )
     })
 }
@@ -7524,19 +7528,29 @@ enum BackboneLayout {
 fn metal_off_tape_tokens(
     width: u64,
     mc: &scratchy_target_metal::tape::model_consts::MetalModelConsts,
-    head: Option<(u32, u32)>,
+    head: Option<(u32, u32, bool)>,
 ) -> TokenStream {
     use scratchy_target_metal::off_tape::OffTape;
     use scratchy_target_metal::tape::ids::{BlockSize, HiddenSize, LogitsWidth, NumDrafts, RotDim};
-    use scratchy_target_metal::tape::kernel_constants::MtpChainConstants;
+    use scratchy_target_metal::tape::kernel_constants::{DraftsPastFirst, MtpChainConstants};
     let width = u32::try_from(width).expect("logits width fits u32");
     // The chain advances the full-context group's slots (KV group 0).
     let block_size = BlockSize(mc.global_block_size);
-    let head = head.map(|(drafts, hidden)| MtpChainConstants {
+    // The chain's rope tables hold one row a sequence a pass: a parallel pass's rows read
+    // positions.
+    assert!(
+        !(mc.mrope && head.is_some_and(|(_, _, parallel)| parallel)),
+        "a parallel-drafting head ropes by position, not by MRoPE rows"
+    );
+    let head = head.map(|(drafts, hidden, parallel)| MtpChainConstants {
         hidden: HiddenSize(hidden),
         drafts: NumDrafts(drafts),
         // An MRoPE head reads a cos/sin row a token in place of its position.
         rope: RotDim(if mc.mrope { mc.rot_dim } else { 0 }),
+        past_first: match parallel {
+            true => DraftsPastFirst::Parallel,
+            false => DraftsPastFirst::Chained,
+        },
     });
     let keys = OffTape::keys(
         LogitsWidth(width),
@@ -13741,9 +13755,10 @@ pub fn emit_model(
     > = BTreeMap::new();
     // `last_node_id` must be the lm_head Gemm (tp=1) or the post-lm_head
     // AllGather (tp>1), not one of the post-Embed `MmEmbedSplice` nodes
-    // that `tp_lowering::insert_mm_splices` appends. Those sit at fuf-
-    // array-tail but semantically belong near the Embed; walking past
-    // them with `last_non_splice_node` recovers the real terminal.
+    // that `tp_lowering::insert_mm_splices` appends, nor a target's
+    // appended export. Those sit at fuf-array-tail but semantically
+    // belong elsewhere; walking past them with `last_non_splice_node`
+    // recovers the real terminal.
     let last_node_id = last_non_splice_node(fuf)
         .expect("non-empty FUF expected")
         .id;
@@ -14930,7 +14945,7 @@ pub fn emit_model(
             let drafts =
                 u32::try_from(drafts.expect("an MTP head's spec_drafts")).expect("drafts fit u32");
             let hidden = u32::try_from(target_hidden_width).expect("hidden width fits u32");
-            (drafts, hidden)
+            (drafts, hidden, model.arch.parallel_drafting.is_some())
         });
         metal_arena_bytes_statics.push(metal_off_tape_tokens(logits_width, mc, head));
     }

@@ -7,6 +7,7 @@
   "published_as": {
     "gpt-oss-20b-p-eagle-mlx-affine-b4-g64-qembed": "amazon/GPT-OSS-20B-P-EAGLE"
   },
+  "parallel_drafting": { "mask_token": "ptd_token_id", "mask_hidden": "mask_hidden" },
   "borrows": ["lm_head"],
   "decoder_safetensors_prefix": "",
   "scale_dtype": "bf16",

@@ -324,7 +324,9 @@ pub mod arch_registry;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "spyre"))]
 pub use arch_registry::{ArchLoad, ArchTryLoadFn, ScratchyArchRegistration, try_load};
 pub mod heads;
-pub use heads::{HeadRegistration, PublishedDrafter, TargetShape, draft_head, head_of};
+pub use heads::{
+    HeadRegistration, ParallelDrafting, PublishedDrafter, TargetShape, draft_head, head_of,
+};
 // Read-only KTIR bundle resolver — spyre fetches its forward bundle without
 // consuming `GpuWeights` (so the worker keeps the live tensors for the runner).
 #[cfg(feature = "spyre")]

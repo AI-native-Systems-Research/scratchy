@@ -5417,16 +5417,16 @@ fn lower_one(
         // the first consumer reads. `n` = `eff_m * width` (LoadRows is a prelude op, so
         // eff_m == bucket_m); m_scaling shrinks the grid to live num_tokens and the kernel's
         // `gid >= n` guard caps the tail.
-        I::LoadRows(Slot(out_slot), source) => {
+        // The rows are the op's own width — a target's hidden states are its head's hidden size
+        // only when it reads one of them (P-EAGLE reads three side by side).
+        I::LoadRows(Slot(out_slot), source, width) => {
             use scratchy_ir::RowsExtern;
-            let (width, kind) = match source {
-                RowsExtern::Pixels => (p.vision_in_features, RuntimeBindingKind::Pixels),
-                // VISION_Q_SIZE (= vision_num_heads * vision_head_dim) is the residual-stream
-                // width the interpolated positional embedding is added to.
-                RowsExtern::PosEmbeds => (p.vision_q_size, RuntimeBindingKind::VisionPosEmbeds),
-                RowsExtern::TargetHidden => (p.hidden_size, RuntimeBindingKind::TargetHidden),
+            let kind = match source {
+                RowsExtern::Pixels => RuntimeBindingKind::Pixels,
+                RowsExtern::PosEmbeds => RuntimeBindingKind::VisionPosEmbeds,
+                RowsExtern::TargetHidden => RuntimeBindingKind::TargetHidden,
             };
-            let n_elems = eff_m * width as u32;
+            let n_elems = eff_m * width.get();
             LoweredCommand {
                 kernel: KernelId::LoadRows,
                 library: "elementwise",

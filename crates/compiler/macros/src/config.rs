@@ -2055,6 +2055,23 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
     spec.published_as = published_as;
     spec.checkpoint_prefix = as_str("checkpoint_prefix");
     spec.reads_target_kv = json.get("reads_target_kv").and_then(|v| v.as_bool()) == Some(true);
+    spec.parallel_drafting = match json.get("parallel_drafting") {
+        None => None,
+        Some(v) => {
+            let field = |key: &str| {
+                (v.get(key).and_then(|s| s.as_str()).map(str::to_string)).ok_or_else(|| {
+                    ConfigError::ArchJson {
+                        path: path.clone(),
+                        reason: format!("`parallel_drafting.{key}` must be a string"),
+                    }
+                })
+            };
+            Some(crate::arch_spec::ParallelDraftingSpec {
+                mask_token_key: field("mask_token")?,
+                mask_hidden: field("mask_hidden")?,
+            })
+        }
+    };
     let strings = |key: &str| -> Result<Option<Vec<String>>, ConfigError> {
         json.get(key)
             .map(|v| {
@@ -2131,6 +2148,7 @@ const ARCH_JSON_KEYS: &[&str] = &[
     "checkpoint_of",
     "checkpoint_prefix",
     "reads_target_kv",
+    "parallel_drafting",
     "borrows",
     "top_level_weights",
     "scale_dtype",

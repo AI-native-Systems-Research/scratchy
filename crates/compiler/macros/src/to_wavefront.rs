@@ -1532,9 +1532,13 @@ pub fn lower_decode_to_wavefront(
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
+            // One operand: its copy (`rows_lowering::chain_exports`' first export).
             OpKind::Concat => {
                 let a = bx.input_at(tile, 0)?;
-                let b = bx.input_at(tile, 1)?;
+                let operands = match node.inputs.len() {
+                    1 => vec![a],
+                    _ => vec![a, bx.input_at(tile, 1)?],
+                };
                 let cols = bx.out_cols(tile, 0, "concat cols")?;
                 let Some(&FufInput::Tile { id, slot }) = node.inputs.first() else {
                     return Err(BridgeError::MalformedOp {
@@ -1544,7 +1548,7 @@ pub fn lower_decode_to_wavefront(
                     });
                 };
                 let left = bx.out_cols(id, usize::from(slot), "concat left cols")?;
-                let idx = bx.push_op(SubOp::Concat { left, cols }, vec![a, b]);
+                let idx = bx.push_op(SubOp::Concat { left, cols }, operands);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }

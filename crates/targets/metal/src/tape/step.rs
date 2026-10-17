@@ -308,9 +308,9 @@ pub enum MetalStep {
     VarlenAttention(Slot, Slot, Slot, Slot, CuSeqlens),
     /// `(q, k, q_out, k_out)`: vision 2-D rope.
     VisionRope(Slot, Slot, Slot, Slot),
-    /// `(out, source)`: the host-staged rows of `source` (vision pixels, vision position
-    /// embeddings, a target model's hidden states).
-    LoadRows(Slot, scratchy_ir::RowsExtern),
+    /// `(out, source, width)`: the host-staged rows of `source` (vision pixels, vision position
+    /// embeddings, a target model's hidden states), each `width` wide.
+    LoadRows(Slot, scratchy_ir::RowsExtern, ActivationWidth),
     /// `(in, out, indices, width)`: row permutation by a runtime index buffer.
     EmbeddingGather(Slot, Slot, GatherIndices, ActivationWidth),
     /// `(qg, q, gate)`: split the doubled q projection into query and gate.

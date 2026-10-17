@@ -1879,6 +1879,8 @@ pub fn compile_carrier(
         struct HeadFacts {
             /// Its forward reads `target_hidden`: it is a head.
             reads_target_hidden: bool,
+            /// The width of the target hidden rows it reads (`target_hidden_size`).
+            target_hidden_width: u64,
             /// The on-disk prefixes of the weights a target lends it — every arch reports its own,
             /// so a TARGET's can be read off the loaded model.
             lent: [Option<String>; 2],
@@ -1893,16 +1895,26 @@ pub fn compile_carrier(
             /// Its `spec_drafts` and `spec_verify_rows`.
             spec: [u64; 2],
             reads_target_kv: bool,
+            /// A parallel-drafting head's mask token and the tensor of its mask rows' target
+            /// hidden states.
+            parallel: Option<(u64, String)>,
         }
         let head_facts: std::collections::BTreeMap<String, HeadFacts> = solved
             .iter()
             .map(|sm| {
+                let reads_target_hidden = sm.fuf.nodes.iter().any(|n| {
+                    n.op == classified::OpKind::LoadRows(
+                        scratchy_forward_compiler::RowsExtern::TargetHidden,
+                    )
+                });
+                let width = sm.model.bounds.get("target_hidden_size").copied();
                 let facts = HeadFacts {
-                    reads_target_hidden: sm.fuf.nodes.iter().any(|n| {
-                        n.op == classified::OpKind::LoadRows(
-                            scratchy_forward_compiler::RowsExtern::TargetHidden,
-                        )
-                    }),
+                    reads_target_hidden,
+                    target_hidden_width: match (reads_target_hidden, width) {
+                        (true, Some(w)) => w,
+                        (true, None) => panic!("{}: a head's target_hidden_size", sm.mod_name),
+                        (false, _) => 0,
+                    },
                     lent: scratchy_forward_compiler::LentWeight::ALL
                         .map(|w| codegen::lent_weight_prefix(&sm.prog, &sm.fuf, sm.model, w)),
                     lm_head_rows: sm.model.bounds.get("vocab_size").copied().unwrap_or(0),
@@ -1912,6 +1924,17 @@ pub fn compile_carrier(
                     spec: ["spec_drafts", "spec_verify_rows"]
                         .map(|b| sm.model.bounds.get(b).copied().unwrap_or(0)),
                     reads_target_kv: sm.model.arch.reads_target_kv,
+                    parallel: (sm.model.arch.parallel_drafting.as_ref()).map(|p| {
+                        let token = sm.model.bounds.get(&p.mask_token_key).copied();
+                        let token = token.unwrap_or_else(|| {
+                            panic!(
+                                "{}: a parallel-drafting head's config names its mask token \
+                                 (`{}`)",
+                                sm.mod_name, p.mask_token_key
+                            )
+                        });
+                        (token, p.mask_hidden.clone())
+                    }),
                 };
                 (sm.mod_name.clone(), facts)
             })
@@ -1922,6 +1945,21 @@ pub fn compile_carrier(
                 let variant_ident = pascal_case(&a.model_ident);
                 let reads = fact(a).reads_target_hidden;
                 quote! { Weights::#variant_ident(_) => #reads, }
+            });
+            // A head's width, read only for a head: every other model's is its hidden size.
+            let width_arms = arch_dispatch_arms.iter().map(|a| {
+                let variant_ident = pascal_case(&a.model_ident);
+                match fact(a) {
+                    HeadFacts {
+                        reads_target_hidden: true,
+                        target_hidden_width,
+                        ..
+                    } => quote! { Weights::#variant_ident(_) => #target_hidden_width, },
+                    _ => quote! {
+                        Weights::#variant_ident(_) =>
+                            ::scratchy_forward_compiler::ScratchyWeights::hidden_size(self),
+                    },
+                }
             });
             let lent_arms = arch_dispatch_arms.iter().flat_map(|a| {
                 let variant_ident = pascal_case(&a.model_ident);
@@ -1942,6 +1980,12 @@ pub fn compile_carrier(
                 fn reads_target_hidden(&self) -> bool {
                     match self {
                         #(#reads_arms)*
+                    }
+                }
+
+                fn target_hidden_width(&self) -> u64 {
+                    match self {
+                        #(#width_arms)*
                     }
                 }
 
@@ -1981,8 +2025,23 @@ pub fn compile_carrier(
                         checkpoint_prefix,
                         spec,
                         reads_target_kv,
+                        parallel,
                         ..
                     } = first;
+                    let parallel = match parallel {
+                        Some((token, hidden)) => {
+                            let token = u32::try_from(*token).expect("a mask token fits u32");
+                            quote! {
+                                ::core::option::Option::Some(
+                                    ::scratchy_forward_compiler::ParallelDrafting {
+                                        mask_token: #token,
+                                        mask_hidden: #hidden,
+                                    }
+                                )
+                            }
+                        }
+                        None => quote! { ::core::option::Option::None },
+                    };
                     let some = |v: &Option<String>| match v {
                         Some(v) => quote! { ::core::option::Option::Some(#v) },
                         None => quote! { ::core::option::Option::None },
@@ -2040,6 +2099,7 @@ pub fn compile_carrier(
                             lm_head: #lm_head,
                             lm_head_rows: #lm_head_rows,
                             reads_target_kv: #reads_target_kv,
+                            parallel: #parallel,
                             drafts_for: &[#(#drafts_for),*],
                             repo_infix: #repo_infix,
                             checkpoint_prefix: #checkpoint_prefix,
