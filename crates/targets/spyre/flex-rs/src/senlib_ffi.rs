@@ -82,6 +82,22 @@
 //! actually happens is the honest shape. The per-call-site citations for the
 //! deleted declarations live in `SENLIB_BOUNDARY.md`'s deletion record.
 //!
+//! ## The multi_device re-add (issue #550)
+//!
+//! #550 re-added the multi-device surface with REAL shim entrypoints. The
+//! five senlib-real declarations (the pin-and-map family and the wdone
+//! register pokes, restored below with their original names) are now
+//! implemented in `cxx-shim/senlib_ffi.cpp`; the eight mock-`RdmaShm`
+//! declarations were NOT restored — the rebuilt `multi_device` bottoms out
+//! on senlib's cross-port P2P IOMMU mapping instead
+//! (`flex_senlib_p2p_create_mapping`, senlib
+//! `vfio_backend::create_iommu_mapping_for_cross_port_p2p_rdma`) plus the
+//! BAR DMABuf export (`flex_senlib_get_dmabuf`). Every signature below that
+//! could not be checked against the on-pod SDK from this worktree carries a
+//! `FIXME(pod-verify)` at its declaration; the transport-layering rationale
+//! (why senlib's mapping primitive and not spyre-comms' collectives API) is
+//! in `SENLIB_BOUNDARY.md`'s multi-device section.
+//!
 //! ## The controlblocks phase: no declarations, on purpose
 //!
 //! The DMA/compute-params + control-blocks subsystem (`crate::dma`,
@@ -142,7 +158,7 @@
 
 use std::ffi::CStr;
 use std::ffi::c_void;
-use std::os::raw::{c_char, c_uint};
+use std::os::raw::{c_char, c_int, c_uint};
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
 //  Runtime bring-up, topology, and IOMMU
@@ -696,5 +712,371 @@ pub fn pcie_address_for_card(card_index: u32) -> String {
             return String::new();
         }
         CStr::from_ptr(ptr).to_string_lossy().into_owned()
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+//  Multi-device / cross-port P2P (re-added per issue #550)
+// ════════════════════════════════════════════════════════════════════════════════════════════
+//
+// `flex/multi_device`'s FFI bottom. #530 deleted this subsystem's thirteen
+// declarations because none of them had a shim implementation — eight were
+// written against flex-cxx's mock `RdmaShm` layer, and even the five
+// senlib-real ones (the pin-and-map family, the wdone register pokes)
+// linked to nothing. #550 re-adds the surface against the real transport:
+//
+//   - the five senlib-real declarations, restored under their original
+//     names and now implemented in `cxx-shim/senlib_ffi.cpp`;
+//   - the eight mock-RdmaShm declarations are NOT restored. Their roles are
+//     filled by the real cross-port P2P surface: address translation
+//     (`rdma_xseg_*`) is the IOMMU mapping itself (`p2p_create_mapping`
+//     below); the data movement (`rdma_copy_to_remote`) is an ordinary H2D
+//     DMA through the scheduler aimed at the mapped address; the
+//     write-done counters (`rdma_wdone_inc/check`) are the framed VSID
+//     instructions plus the wdone register pokes restored here.
+//
+// Peer ENUMERATION was already this module's surface: `sen_pci_card_count()`
+// above is the card count and `pcie_address_for_card(i)` names each peer;
+// `p2p_create_mapping(peer_card_index, ..)` is the piece that was missing.
+//
+// The transport-layering decision (see `SENLIB_BOUNDARY.md`): the vendor's
+// collectives library, spyre-comms, cannot be scratchy's seam — its
+// `initialize_library` demands live C++ `flex::RuntimeContext*`/
+// `flex::RuntimeStream*` objects (torch-spyre
+// `csrc/distributed/spyre_ccl.cpp:49-51`, `module.h:41-42`), exactly the
+// objects #512's fxa collapse removed. scratchy binds the senlib primitive
+// BELOW spyre-comms instead, and `multi_device.rs`'s restored native
+// sections are scratchy's counterpart of the comms layer above it.
+//
+// Everything in this section follows the scheduler section's sealed
+// pattern: the externs are module-private and the only way to reach them is
+// through the safe `Result`-returning wrappers below. Every signature that
+// could not be checked against the on-pod SDK from this worktree carries a
+// `FIXME(pod-verify)`.
+
+/// Opaque handle to a senlib-owned pinned host-memory region (the product of
+/// `PfWrapper::allocate_pin_and_map`, cited at flex-cxx `hdma_shm.cpp:903-914`
+/// — page-locked host memory mapped into the device's DMA address space,
+/// optionally backed by a named shm file so peer processes can attach to the
+/// same region). `handle == 0` is the failure sentinel, same shape as
+/// `SenlibAllocationHandle`.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SenlibPinnedMemoryHandle(pub u64);
+
+impl SenlibPinnedMemoryHandle {
+    /// The only way to turn a raw FFI return value into a handle this crate
+    /// will actually use: checks the `handle == 0` failure sentinel once,
+    /// here. Same shape as `SenlibAllocationHandle::into_live`.
+    pub fn into_live(self) -> Option<LivePinnedMemoryHandle> {
+        std::num::NonZeroU64::new(self.0).map(LivePinnedMemoryHandle)
+    }
+}
+
+/// A `SenlibPinnedMemoryHandle` KNOWN to be live (non-zero).
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LivePinnedMemoryHandle(std::num::NonZeroU64);
+
+impl LivePinnedMemoryHandle {
+    /// Widen back to the raw FFI type for `pinned_memory_release`, which
+    /// shares the ABI-level type with `flex_senlib_pin_and_map`'s return.
+    pub fn as_raw(self) -> SenlibPinnedMemoryHandle {
+        SenlibPinnedMemoryHandle(self.0.get())
+    }
+
+    pub fn as_u64(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// One entry of senlib `vfio_backend`'s public `peer_dev_info` vector
+/// (`std::vector<std::pair<int, void*>>`) after a cross-port P2P mapping is
+/// created — see `p2p_create_mapping`. `aux` is the `int` half of the pair,
+/// a senlib-side id for the mapped peer window; `addr` is the mapped
+/// address of the peer window (the cross-port target an ordinary H2D DMA
+/// can be aimed at, per the #550 experiment design).
+///
+/// FIXME(pod-verify): whether `aux` is a file descriptor, BAR index, or
+/// peer slot — and whether `addr` is DMA-targetable, host-mapped, or both —
+/// are exactly the facts the first pod run must establish by logging
+/// `peer_dev_info` raw; do not interpret either field before then.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SenlibP2pSegment {
+    pub aux: c_int,
+    pub addr: *mut c_void,
+}
+
+unsafe extern "C" {
+    /// Pin and map `num_bytes` of host memory for device DMA access,
+    /// optionally backed by a named shm file (`name`; null for anonymous) so
+    /// peer processes attach to the same pinned region. Cited:
+    /// hdma_shm.cpp:903 `this_pfw_->allocate_pin_and_map(shm_sz_instr)`,
+    /// hdma_shm.cpp:907 `allocate_pin_and_map(shm_sz_mgmt + world_size_,
+    /// shm_fname_mgmt)`, hdma_shm.cpp:914 `allocate_pin_and_map(
+    /// shm_sz_data_p2p, shm_fname_data)` — the HDMA instruction/mgmt/data
+    /// buffers cross-process P2P exchange is built on. Irreducible:
+    /// page-locking host memory plus IOMMU-mapping it is a senlib/kernel
+    /// operation that cannot be emulated in ordinary Rust heap allocation.
+    /// Returns a null-equivalent (`handle == 0`) on failure.
+    ///
+    /// FIXME(pod-verify): the exact post-reorg signature of
+    /// `PfWrapper::allocate_pin_and_map` (overload pair vs. defaulted
+    /// name parameter) and the concrete wrapper type it returns; the shim
+    /// stores the wrapper type-erased and captures `hptr()` at creation, so
+    /// only the shim's one construction line depends on the answer.
+    fn flex_senlib_pin_and_map(num_bytes: u64, name: *const c_char) -> SenlibPinnedMemoryHandle;
+
+    /// Releases a pinned-memory mapping obtained from `flex_senlib_pin_and_map`
+    /// (unpins + unmaps + drops senlib's wrapper). Cited: hdma_shm.hpp
+    /// lifetime of the `PinnedMemoryWrapperPtr` members, destructed in
+    /// `HdmaShmMgmt::~HdmaShmMgmt` (hdma_shm.hpp:479). Returns 0 on success,
+    /// -1 if the release did not reach senlib (unknown handle, or a throw).
+    fn flex_senlib_pinned_memory_release(handle: SenlibPinnedMemoryHandle) -> i32;
+
+    /// Returns the host-virtual pointer backing a pinned-memory region
+    /// (`PinnedMemoryWrapper::hptr()`, used throughout hdma_shm.cpp, e.g.
+    /// line 644). Non-null for any live handle — the allocation succeeded
+    /// when the handle was minted.
+    fn flex_senlib_pinned_memory_hptr(handle: SenlibPinnedMemoryHandle) -> *mut c_void;
+
+    /// Directly sets the on-device write-done counter for `sid` to `val`.
+    /// Cited: host_wdone.cpp:413 `pfw_->interface()->direct_set_wdone(
+    /// instr.sid, val)`. Irreducible: this pokes a device-side hardware
+    /// register through senlib's PF interface. Returns 0 on success, -1 if
+    /// the poke did not reach senlib.
+    ///
+    /// FIXME(pod-verify): `sid`/`val` parameter widths are taken from the
+    /// pre-#530 declaration's citation; check them against the pod's
+    /// `pf_interface.hpp` before relying on values beyond u8/i32 range.
+    fn flex_senlib_direct_set_wdone(sid: u8, val: i32) -> i32;
+
+    /// Atomically increments the on-device write-done counter for `sid`.
+    /// Cited: host_wdone.cpp:417 and host_wdone.cpp:1025
+    /// `pfw_->interface()->ainc_wdone(sid)`. Same width caveat as
+    /// `flex_senlib_direct_set_wdone` (FIXME(pod-verify)).
+    fn flex_senlib_ainc_wdone(sid: u8) -> i32;
+
+    /// Creates the cross-port P2P IOMMU mapping for peer card
+    /// `peer_card_index`, sized `len_bytes`: senlib
+    /// `vfio_backend::create_iommu_mapping_for_cross_port_p2p_rdma(
+    /// PciDevId peer_dev, size_t len)` — pod header
+    /// `/opt/ibm/spyre/senlib/include/vfio/1p0/vfio_backend.hpp:73`, mangled
+    /// on the pod .so as
+    /// `_ZN6senlib2v212vfio_backend44create_iommu_mapping_for_cross_port_
+    /// p2p_rdmaENS0_8PciDevIdEm`. The resulting segments land
+    /// in the vfio_backend's PUBLIC `peer_dev_info`
+    /// (`std::vector<std::pair<int, void*>>`); this call marshals up to
+    /// `max_segments` of them into `out_segments` and ALWAYS writes the
+    /// total count to `out_count`, so a too-small buffer is reported (retry
+    /// with a bigger one), never silently truncated. Idempotent per
+    /// (peer, len): the shim memoizes, because nothing above senlib calls
+    /// the mapping today and double-mapping a peer is undefined territory.
+    /// The peer's `PciDevId` comes from the same `SenPciShared::pf(index)`
+    /// lookup the shim's device bring-up and `senlib_senpci_pf_address`
+    /// use. Returns 0 on success, -1 on failure.
+    ///
+    /// FIXME(pod-verify): the vfio_backend's include path/namespace
+    /// post-reorg, its reachability from the public `PfInterface` this
+    /// shim holds, and whether `peer_dev_info` is per-peer or cumulative
+    /// across peers — see `SENLIB_BOUNDARY.md`'s ledger for the recorded
+    /// disassembly facts.
+    fn flex_senlib_p2p_create_mapping(
+        peer_card_index: c_uint,
+        len_bytes: u64,
+        out_segments: *mut SenlibP2pSegment,
+        max_segments: usize,
+        out_count: *mut usize,
+    ) -> i32;
+
+    /// Exports `size` bytes of the open card's `bar` at `offset` as a
+    /// DMABuf file descriptor: `PfInterface::get_dmabuf(int bar,
+    /// uint64_t offset, size_t size)` (pod `pf_interface.hpp:111` — the
+    /// same header this shim already includes for the interfaces above).
+    /// Returns the fd, or -1 on failure. Irreducible: turning a BAR region
+    /// into a dma-buf is a driver operation.
+    ///
+    /// FIXME(pod-verify): whether the real `get_dmabuf` returns the fd
+    /// directly or a wrapper object the shim must unwrap; the declaration
+    /// assumes the former.
+    fn flex_senlib_get_dmabuf(bar: c_int, offset: u64, size: u64) -> c_int;
+}
+
+/// Safe wrapper: pin and map `num_bytes` of host memory, optionally backed
+/// by the named shm file `name` (built by the caller as a `CString`; pass
+/// `None` for anonymous), for device DMA access.
+///
+/// # Errors
+/// Returns `Err` with the shim's message if the pin/map did not reach senlib
+/// or failed — the HDMA buffers cross-process exchange depends on are not
+/// constructible by silently proceeding.
+pub fn pin_and_map(
+    num_bytes: usize,
+    name: Option<&CStr>,
+) -> Result<LivePinnedMemoryHandle, String> {
+    // SAFETY: `name`, when present, is a valid NUL-terminated C string for
+    // the duration of this call; `num_bytes` is a plain byte count. The
+    // returned handle is checked for the 0 failure sentinel via `into_live`
+    // before anything stores it.
+    let handle = unsafe {
+        flex_senlib_pin_and_map(
+            num_bytes as u64,
+            name.map_or(std::ptr::null(), |n| n.as_ptr()),
+        )
+    };
+    handle.into_live().ok_or_else(last_shim_error)
+}
+
+/// Safe wrapper: the host-virtual pointer backing a live pinned-memory
+/// region. Non-null by construction (the handle was minted by a successful
+/// `pin_and_map`); the region stays valid for the handle's lifetime.
+pub fn pinned_memory_hptr(handle: LivePinnedMemoryHandle) -> *mut c_void {
+    // SAFETY: `handle` is live (non-zero, from `pin_and_map`'s success path)
+    // and has not been released; `hptr()` is a const accessor on senlib's
+    // wrapper.
+    unsafe { flex_senlib_pinned_memory_hptr(handle.as_raw()) }
+}
+
+/// Safe wrapper: release a pinned-memory mapping back to senlib.
+///
+/// # Errors
+/// Returns `Err` with the shim's message if the release did not reach
+/// senlib — a pinned region that silently stays mapped leaks page-locked
+/// memory, which is precisely the failure that must not be swallowed.
+pub fn pinned_memory_release(handle: SenlibPinnedMemoryHandle) -> Result<(), String> {
+    // SAFETY: `handle` is the raw FFI type by design (mirrors
+    // `flex_senlib_memory_free`'s shape): releasing an unknown/zero handle
+    // is senlib's error to report, not a memory-safety hazard — the shim's
+    // table rejects it before any senlib call.
+    let rc = unsafe { flex_senlib_pinned_memory_release(handle) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+/// Safe wrapper: set the on-device write-done counter for `sid` to `val`
+/// (`host_wdone.cpp:413`).
+///
+/// # Errors
+/// Returns `Err` with the shim's message if the register poke did not reach
+/// senlib.
+pub fn direct_set_wdone(sid: u8, val: i32) -> Result<(), String> {
+    // SAFETY: plain integer arguments; assumes the shim runtime was brought
+    // up (`flex_shim_init_runtime` succeeded), which the shim checks itself.
+    let rc = unsafe { flex_senlib_direct_set_wdone(sid, val) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+/// Safe wrapper: atomically increment the on-device write-done counter for
+/// `sid` (`host_wdone.cpp:417,1025`).
+///
+/// # Errors
+/// Returns `Err` with the shim's message if the register poke did not reach
+/// senlib.
+pub fn ainc_wdone(sid: u8) -> Result<(), String> {
+    // SAFETY: plain integer argument; same shim-runtime assumption as
+    // `direct_set_wdone`.
+    let rc = unsafe { flex_senlib_ainc_wdone(sid) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+/// Safe wrapper: create (or idempotently re-read) the cross-port P2P IOMMU
+/// mapping for peer card `peer_card_index`, sized `len_bytes`, returning the
+/// mapped segments senlib reported in `peer_dev_info`. Enumerate peers with
+/// `sen_pci_card_count()` + `pcie_address_for_card()`; the index passed here
+/// is the same PCI enumeration index.
+///
+/// The first pod run should LOG the returned segments before interpreting
+/// them — the `aux` field's meaning and the `addr` field's
+/// DMA-vs-host nature are the experiment's open questions.
+///
+/// # Errors
+/// Returns `Err` with the shim's message if the mapping call did not reach
+/// senlib or threw, or if the peer was already mapped with a different
+/// length.
+pub fn p2p_create_mapping(
+    peer_card_index: u32,
+    len_bytes: u64,
+) -> Result<Vec<SenlibP2pSegment>, String> {
+    let mut segments = vec![
+        SenlibP2pSegment {
+            aux: 0,
+            addr: std::ptr::null_mut()
+        };
+        8
+    ];
+    let mut count = 0usize;
+    // SAFETY: `segments` is a valid mutable slice of `max_segments` entries
+    // for the duration of the call; `out_count` is a valid out-pointer. The
+    // shim is memoized per (peer, len), so the retry below re-marshals the
+    // same mapping rather than creating a second one.
+    let rc = unsafe {
+        flex_senlib_p2p_create_mapping(
+            peer_card_index,
+            len_bytes,
+            segments.as_mut_ptr(),
+            segments.len(),
+            &mut count,
+        )
+    };
+    if rc != 0 {
+        return Err(last_shim_error());
+    }
+    if count > segments.len() {
+        // The mapping produced more segments than the first buffer held
+        // (`out_count` always carries the true total): re-marshal with an
+        // exactly-sized buffer — idempotent by the shim's memoization.
+        segments.resize(
+            count,
+            SenlibP2pSegment {
+                aux: 0,
+                addr: std::ptr::null_mut(),
+            },
+        );
+        // SAFETY: same as above, now sized for the reported count.
+        let rc = unsafe {
+            flex_senlib_p2p_create_mapping(
+                peer_card_index,
+                len_bytes,
+                segments.as_mut_ptr(),
+                segments.len(),
+                &mut count,
+            )
+        };
+        if rc != 0 {
+            return Err(last_shim_error());
+        }
+    }
+    segments.truncate(count);
+    Ok(segments)
+}
+
+/// Safe wrapper: export `size` bytes of the open card's `bar` at `offset`
+/// as a DMABuf file descriptor (`PfInterface::get_dmabuf`,
+/// `pf_interface.hpp:111`). The caller owns the returned fd (close it with
+/// `libc::close` when done).
+///
+/// # Errors
+/// Returns `Err` with the shim's message if the export did not reach senlib
+/// or failed.
+pub fn get_dmabuf(bar: i32, offset: u64, size: u64) -> Result<i32, String> {
+    // SAFETY: plain integer arguments; the returned fd is a process-owned
+    // descriptor the caller closes — no senlib lifetime attaches to it.
+    let fd = unsafe { flex_senlib_get_dmabuf(bar, offset, size) };
+    if fd >= 0 {
+        Ok(fd)
+    } else {
+        Err(last_shim_error())
     }
 }

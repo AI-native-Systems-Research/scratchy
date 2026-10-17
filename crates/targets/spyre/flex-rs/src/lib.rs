@@ -2,17 +2,20 @@
 //! scratchy's Spyre SDK ABI shim: 134 flex-owned types / 320 flex-owned
 //! functions across 17 ABI entrypoints, per CodeQL's class-hierarchy-aware
 //! transitive closure (see `/tmp/flex_scope_final.json` for the master
-//! scope this crate is checked against — the ORIGINAL closure, not a live
-//! count: the multi_device (RDMA/HDMA) slice was deleted wholesale in issue
-//! #530 (zero callers, zero shim-implemented declarations; see `senlib_ffi`'s
-//! module doc for the evidence). See `SENLIB_BOUNDARY.md` at the crate root
-//! for the FFI boundary rationale.
+//! scope this crate is checked against — the ORIGINAL closure, including
+//! the multi_device (RDMA/HDMA) slice that #530 deleted and #550 re-added
+//! against the real cross-port P2P surface; see `senlib_ffi`'s module doc
+//! and `SENLIB_BOUNDARY.md` for both records). See `SENLIB_BOUNDARY.md` at
+//! the crate root for the FFI boundary rationale.
 //!
 //! Module map:
 //! - `address`             — LogicalAddress, Chunk, CompositeAddress
 //! - `domain`               — MemoryDomain, PlacementPolicy
 //! - `topology`             — DeviceTopology
 //! - `memory_region`        — MemoryType, MemoryBlock, MemoryRegion, AllocationBackingStore
+//! - `multi_device`         — RDMA/HDMA peer-to-peer exchange, barrier/broadcast
+//!   rendezvous, bitmask/bitset bookkeeping, cross-port P2P mapping (#550
+//!   re-add; transport bottoms out on `senlib_ffi`'s multi-device section)
 //! - `device_memory_allocator` — DeviceMemoryAllocation, DeviceMemoryAllocator (senlib boundary)
 //! - `allocator`            — AllocationDirective, FlexAllocator
 //! - `runtime`              — RuntimeContext, initializeRuntime, getFlexRuntimeContext
@@ -53,6 +56,7 @@ pub mod flex_config;
 pub mod host_interface;
 pub mod iommu;
 pub mod memory_region;
+pub mod multi_device;
 pub mod rb_telemetry;
 pub mod runtime;
 pub mod scheduler;

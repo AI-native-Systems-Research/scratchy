@@ -7,8 +7,9 @@ for the master scope). flex's own logic — region/block bookkeeping, best-fit
 + coalescing, allocation-directive resolution, stream/scheduler state
 machines, in-flight counters, completion-callback lifecycle, control-block
 fixup/translation math, env/JSON config parsing, fp8/fp16 bit-twiddling —
-is ported natively into Rust. (The RDMA/HDMA rendezvous and bitmap
-bookkeeping slice was deleted wholesale in issue #530 — see its section
+is ported natively into Rust. (The RDMA/HDMA multi-device slice was deleted
+wholesale in issue #530 when its FFI bottom was mock-only, then re-added in
+issue #550 against the real cross-port P2P surface — see its section
 below.) Every point where that logic bottoms out into real hardware or
 firmware programming crosses through an `extern "C"` declaration in
 `src/senlib_ffi.rs`, and nowhere else: that module (plus a handful of
@@ -182,46 +183,103 @@ content of `senlib_ffi_controlblocks.rs`). The one real hardware-submission path
 stands in for as an alternative (`ResponseWorker::LaunchCbs`) belongs to the
 scheduler subsystem above, not duplicated here.
 
-### Multi-device / RDMA / HDMA — DELETED (issue #530)
+### Multi-device / RDMA / HDMA — deleted (#530), re-added with real entrypoints (#550)
 
-The former `multi_device.rs` (1928 lines: `BitmaskHelper`/`BitSetHelper`
-bit bookkeeping, `CollBufferAllocator_t`/`Hdma_Allocation_Manager`
-allocation algorithms, `HostWdone::make_instruction`/ring-counter
-bookkeeping, `RdmaRendezvousManager::Barrier`/`BarrierAndBcast` over a
-plain POSIX rendezvous file, `CollectiveIPC` over Unix-domain sockets,
-`AIUTopo`'s protocol-selection policy) and its thirteen FFI declarations
-(`senlib_ffi_multi_device.rs`) were deleted wholesale, on evidence:
+#530 deleted the former `multi_device.rs` (1928 lines) and its thirteen FFI
+declarations on evidence that was, and remains, correct:
 
 1. **No callers.** Nothing in the workspace referenced
    `flex_rs::multi_device` — only `lib.rs`'s module declaration and the
    FFI hub's re-export.
-2. **No link targets.** `cxx-shim/senlib_ffi.cpp` implements zero of the
+2. **No link targets.** `cxx-shim/senlib_ffi.cpp` implemented zero of the
    thirteen symbols; anything calling them would have failed at `ld` with
-   undefined references. They were written against flex-cxx's mock-device
+   undefined references. Eight were written against flex-cxx's mock-device
    shared-memory layer (`RdmaShm`), not even the real P2P surface.
 
-Git history preserves both files in full; the honest shape is to re-add
-the slice with real shim entrypoints when P2P wiring actually happens,
-not to keep a fully-shaped module whose FFI bottom links to nothing. The
-deleted declarations and their verified C++ call sites, for the record:
+That half-state was a trap for whoever wires P2P next, so #550 (TP prep)
+re-added the surface with a REAL transport bottom rather than restoring
+the trap:
 
-- **`flex_senlib_pin_and_map`/`_pinned_memory_release`/`_pinned_memory_hptr`** —
-  `PfWrapper`/`VfWrapper::allocate_pin_and_map` (`hdma_shm.cpp:903` etc.):
-  page-locking host memory and mapping it into the device's IOMMU/DMA
-  address space.
-- **`flex_senlib_direct_set_wdone`/`flex_senlib_ainc_wdone`** —
-  `pfw_->interface()->direct_set_wdone`/`ainc_wdone` (`host_wdone.cpp:413,417,1025`):
-  device-side hardware write-done register pokes.
-- **`flex_senlib_rdma_shm_open`/`_close`** — `RdmaShm` construction/teardown
-  (`rdma_unit.cpp:340`): the mock-device-memory-exchange layer standing in
-  for real RDMA hardware.
-- **`flex_senlib_rdma_copy_to_remote`** — the literal RDMA write
-  (`rdma_unit.cpp:415-416`, `memcpy` into a peer's mapped device memory).
-- **`flex_senlib_rdma_wdone_inc`/`_check`** — remote write-done counter
-  increment/poll (`rdma_unit.cpp:499,457`); `_check` is a mutating
-  read-and-consume (decrements when positive), not a pure read.
-- **`flex_senlib_rdma_xseg_bytes`/`_valid`/`_write`** — the address-translation
-  (Xseg) register backing the mock RDMA region (`rdma_unit.cpp:402,409,524`).
+- **Restored verbatim** (from `b4a34d57f`): the transport-AGNOSTIC native
+  port — `BitmaskHelper`/`BitSetHelper` bit bookkeeping,
+  `CollBufferAllocator_t`/`Hdma_Allocation_Manager` allocation algorithms,
+  the `hdma_op_t`/SID/VSID write-done instruction framing +
+  `InstructionQueue`, `RdmaRendezvousManager`'s 3-state POSIX-file
+  barrier/broadcast, `CollectiveIPC` over Unix-domain sockets, and
+  `AIUTopo`'s protocol-selection policy. None of these touches FFI; the
+  two `#[allow(dead_code)]`s the deleted copy carried did not come back
+  (the fields are read now — `world_size` bounds-checks peer ranks,
+  `bytes_per_chunk` has a parity accessor).
+- **Rebuilt**: `RdmaUnit`. The mock `RdmaShm` counters/Xseg registers are
+  gone; per-peer state is the cross-port IOMMU mapping, `transfer_window`
+  resolves the mapped address an ordinary scheduler-submitted H2D DMA is
+  aimed at, `send_write_done` frames a `VsidInstruction` instead of poking
+  a shm counter, and `wait_for_barrier` takes its counter reads through
+  the `WdoneCounterSource` trait (see the ledger below). The mock-era
+  `Xseg`/`write_xseg` register layer has no real counterpart — the mapping
+  IS the translation — and was not restored.
+- **Re-added with real shim implementations** (their original names): the
+  five senlib-real declarations —
+  `flex_senlib_pin_and_map`/`_pinned_memory_release`/`_pinned_memory_hptr`
+  (`PfWrapper::allocate_pin_and_map`, hdma_shm.cpp:903-914) and
+  `flex_senlib_direct_set_wdone`/`flex_senlib_ainc_wdone`
+  (`PfInterface::direct_set_wdone`/`ainc_wdone`,
+  host_wdone.cpp:413,417,1025).
+- **Not restored**: the eight mock-`RdmaShm` declarations. Their roles are
+  filled by the real surface: address translation (`rdma_xseg_*`) is
+  `flex_senlib_p2p_create_mapping` (senlib
+  `vfio_backend::create_iommu_mapping_for_cross_port_p2p_rdma`, pod header
+  `/opt/ibm/spyre/senlib/include/vfio/1p0/vfio_backend.hpp:73`); the data
+  movement (`rdma_copy_to_remote`) is an ordinary H2D DMA aimed at the
+  mapped address; the write-done counters (`rdma_wdone_inc`/`_check`) are
+  the framed VSID instructions plus the register pokes above.
+  `flex_senlib_get_dmabuf` (`PfInterface::get_dmabuf`,
+  pf_interface.hpp:111) is the BAR-export primitive the mock never had.
+  Peer enumeration was already this crate's surface
+  (`sen_pci_card_count`/`pcie_address_for_card`).
+
+**Why senlib's mapping primitive and not spyre-comms.** The vendor's real
+collectives library is spyre-comms (`libspyre_comms.so`: `Context`/
+`WorkSchedule`, barrier/broadcast/send/recv/allgather/allreduce/reduce),
+and #550's transport is nominally "spyre-comms/SenRDMA". But its entry
+point cannot be scratchy's seam:
+`spyre_comms::initialize_library(spyre::GlobalRuntime::get(),
+spyre::getDefaultStreamRuntimeHandle())` (torch-spyre
+`csrc/distributed/spyre_ccl.cpp:49-51`) takes a live C++
+`flex::RuntimeContext*` and `flex::RuntimeStream*` (`module.h:41-42`,
+`spyre_stream.h:137`) — exactly the objects #512's fxa collapse removed
+when flex-rs replaced the C++ flex runtime. scratchy therefore binds the
+senlib primitive BELOW spyre-comms (the IOMMU mapping every P2P DMA sits
+on), and the restored native sections above it are scratchy's counterpart
+of the comms layer. If a future scratchy ever hosts a real C++
+`flex::RuntimeContext`, binding spyre-comms directly becomes possible and
+this decision should be revisited.
+
+**FIXME(pod-verify) ledger** — every signature fact this re-add could not
+check against the on-pod SDK, each marked in place, each with a one-line
+fix:
+
+| # | Fact | Assumed | Fix if wrong |
+|---|---|---|---|
+| 1 | vfio_backend include path / namespace | `<senlib/vfio/1p0/vfio_backend.hpp>`, `senlib::v2` (the pod .so's mangled symbol still says `v2`) | adjust the include + namespace uses in `senlib_ffi.cpp` |
+| 2 | vfio_backend reachability from the public `PfInterface` | `PfInterface_impl` IS-A `vfio_backend`; `PfInterface` holds its impl at +0x18 (pod disassembly) | replace `p2p_vfio_backend()`'s body with the public accessor, if one exists |
+| 3 | `peer_dev_info` semantics | public `vector<pair<int,void*>>`; per-entry meaning (aux = fd? BAR? slot; addr = DMA-target? host-mapped?) UNKNOWN | none needed for the code; the first pod run LOGS the segments and this table gets the answers |
+| 4 | `PfWrapper::allocate_pin_and_map` signature/return | `(size_t, const char* name)` → shared_ptr-like wrapper with `hptr()` | branch on `name` for the overload pair; swap `static_pointer_cast` for `shared_ptr<void>(std::move(pm))` |
+| 5 | wdone register widths | `sid: u8`, `val: i32` (pre-#530 citation) | widen the extern + wrapper |
+| 6 | `PfInterface::get_dmabuf` return | the DMABuf fd itself | unwrap the wrapper object in the shim |
+| 7 | `SenPciShared::pf()`'s return type vs the `PciDevId` the mapping takes | same type (the shim's `senlib_senpci_pf_address` proves `pf()` exists) | construct the `PciDevId` explicitly |
+
+**Remaining wiring legs** (this re-add is the machinery; these are #550's
+closing criteria): the cross-card transfer experiment — create the mapping
+at attach, log `peer_dev_info` raw, aim an ordinary H2D DMA at the
+resulting address — verified on two cards (or the IOMMU-mapping leg on
+one); and the `WdoneCounterSource` binding for `wait_for_barrier`, which
+needs the real cross-card counter's read path (host_wdone monitor vs.
+direct register read) established on the pod. The P2P DMA itself carries a
+context id that must match (`SNT_DMA_DCR::DMO_CONFIG::P2P_TC`;
+`DMA_INTERRUPT_STATE::DMD_COMPDMO/DMD_COMPDMI_P2P_UNEXPCTXID`) — that is
+why the old hand-poked-window writes arrived but were refused — so the
+experiment must configure the context id, not just the address.
 
 ### Config/util (`flex_config.rs`, `util.rs`; FFI in `senlib_ffi.rs`)
 
@@ -303,7 +361,7 @@ and `device_types/pf_device/pf_device_handle.cpp` are likewise unported
 as belonging to "the device-interface phase's files," but no such module
 exists in this crate.
 
-## Coverage cross-check against the master scope (134 types / 320 functions — the ORIGINAL closure; the multi-device slice it counted was deleted in #530)
+## Coverage cross-check against the master scope (134 types / 320 functions — the ORIGINAL closure; the multi-device slice it counted was deleted in #530 and re-added per #550, rebuilt onto the real P2P surface)
 
 **The graph-compiler/whole-graph-execution mode is out of scope, confirmed
 by checking the real ABI shim, not assumed.** flex supports two distinct
@@ -381,7 +439,9 @@ control-block fixup/DMA/compute params, config/util,
 device-interface-misc's in-scope slice, telemetry) is accounted for either
 as a native port, an FFI wrapper documented above, or one of the
 reasoned/time-boxed stubs listed per subsystem — with the multi-device
-slice now deleted rather than ported (see its section above). The gaps
+slice re-added per #550, its transport-agnostic half restored verbatim and
+its `RdmaUnit` rebuilt onto the real cross-port P2P surface (see its
+section above). The gaps
 above should be picked up as a follow-on pass; none of them are on the
 allocator/runtime-core/scheduler-submission critical path this crate's
 existing tests exercise, but they are real entries in the 320-function
