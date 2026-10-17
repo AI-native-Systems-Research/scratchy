@@ -6498,7 +6498,11 @@ fn recurrent_conv(
         function: gdn_conv1d_varlen_static_name(dequant_dtype_for(p)),
         constants: baked(constants),
         dispatch: DispatchShape {
-            threadgroups: (1, conv_dim.div_ceil(tg_y), bucket_m.div_ceil(GDN_CONV_BLOCK)),
+            threadgroups: (
+                1,
+                conv_dim.div_ceil(tg_y),
+                bucket_m.div_ceil(GDN_CONV_BLOCK),
+            ),
             threads_per_threadgroup: (1, tg_y, 1),
             // Z scales with the step's tokens (one layer per GDN_CONV_BLOCK of them, always at
             // least any one sequence's blocks — blocks past a sequence's end early out); seq_axis
@@ -12028,9 +12032,8 @@ mod tests {
                 &crate::targets::M5_10CORE,
             )),
         };
-        let lower = |step| {
-            lower_moe_step(&p, &block, step, row(), at, &mut 0).expect("a W4A8 step lowers")
-        };
+        let lower =
+            |step| lower_moe_step(&p, &block, step, row(), at, &mut 0).expect("a W4A8 step lowers");
         let four = AffineBits(4);
         let gate = ExpertMatmul {
             rows: MoeRows::Tokens(Slot(1)),

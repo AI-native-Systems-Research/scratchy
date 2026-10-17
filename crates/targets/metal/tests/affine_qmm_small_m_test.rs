@@ -444,7 +444,11 @@ fn w4a8_act_quant_matches_the_separated_pair() {
                     false => experts as u32,
                 })
                 .collect();
-            let (g_buf, u_buf, i_buf) = (shared(device, &gate), shared(device, &up), shared(device, &indices));
+            let (g_buf, u_buf, i_buf) = (
+                shared(device, &gate),
+                shared(device, &up),
+                shared(device, &indices),
+            );
             let scratch_bytes = w4a8_scratch_bytes(m as u32, k as u32) as usize;
             let quant_consts = vec![
                 ConstantValue::int(0, k as i32),
