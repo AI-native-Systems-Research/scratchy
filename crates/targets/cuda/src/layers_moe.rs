@@ -432,10 +432,7 @@ impl Gemma4RouterOps for GemmaRouterLayer {
             // collapsing the top-k softmax to a degenerate top-1. The magnitudes
             // (≈31, ≈0.01, ≈1.0) are all comfortably representable in BF16, so the
             // straightforward gain·proj math (no fold) matches the fp32 reference.
-            None => {
-                let gate = gw.take(&format!("{prefix}.proj.weight"))?;
-                gate
-            }
+            None => gw.take(&format!("{prefix}.proj.weight"))?,
 
             Some((group_size, bits)) => {
                 let stream = gw.stream();
