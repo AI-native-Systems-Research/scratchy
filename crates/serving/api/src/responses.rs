@@ -569,7 +569,6 @@ fn stream_responses(
         let mut started = false;
         let mut text_started = false;
         let mut accumulated_text = String::new();
-        let mut output_tokens: u32 = 0;
         let mut func_call_items: Vec<Value> = Vec::new();
         let mut stream = UnboundedReceiverStream::new(rx);
 
@@ -589,7 +588,10 @@ fn stream_responses(
         };
 
         while let Some(delta) = stream.next().await {
-            output_tokens += delta.new_token_ids.len() as u32;
+            // The engine's running counts, so the finishing delta carries the totals — see
+            // `StreamUsage`. Not a sum of `new_token_ids`: the steps a tool parser buffers send
+            // no delta.
+            let usage = delta.usage;
 
             let has_tool_calls = delta.tool_call_deltas.is_some();
             let text = if has_tool_calls {
@@ -927,9 +929,9 @@ fn stream_responses(
                             "status": status,
                             "output": final_output,
                             "usage": {
-                                "input_tokens": delta.usage.prompt_tokens,
-                                "output_tokens": output_tokens,
-                                "total_tokens": delta.usage.prompt_tokens + output_tokens,
+                                "input_tokens": usage.prompt_tokens,
+                                "output_tokens": usage.completion_tokens,
+                                "total_tokens": usage.prompt_tokens + usage.completion_tokens,
                             },
                             "temperature": temperature,
                             "top_p": top_p,
@@ -1408,7 +1410,9 @@ mod tests {
         use http_body_util::BodyExt;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        for (text, finish) in [("Hello", None), (" there.", Some(FinishReason::Stop))] {
+        for (generated, text, finish) in
+            [(1, "Hello", None), (2, " there.", Some(FinishReason::Stop))]
+        {
             tx.send(StreamDelta {
                 index: 0,
                 new_token_ids: vec![1],
@@ -1421,6 +1425,7 @@ mod tests {
                 usage: crate::engine::StreamUsage {
                     prompt_tokens: 42,
                     cached_tokens: 0,
+                    completion_tokens: generated,
                 },
             })
             .unwrap();
@@ -1446,5 +1451,40 @@ mod tests {
         assert_eq!(usage["input_tokens"], 42);
         assert_eq!(usage["output_tokens"], 2);
         assert_eq!(usage["total_tokens"], 44);
+    }
+
+    /// The steps a tool parser buffers send no delta, so a sum of the deltas' token ids drops
+    /// most of a tool call; `response.completed` reports the engine's count.
+    #[tokio::test]
+    async fn test_stream_tool_call_reports_buffered_tokens() {
+        use http_body_util::BodyExt;
+
+        let (deltas, generated) = crate::engine::test_support::buffered_tool_call_deltas(false);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for delta in deltas {
+            tx.send(delta).unwrap();
+        }
+        drop(tx);
+        let req: ResponsesRequest =
+            serde_json::from_str(r#"{"input": "list the files", "stream": true}"#).unwrap();
+        let body = stream_responses("r".into(), "m".into(), req, rx)
+            .into_response()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let completed: Value = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str::<Value>(d).unwrap())
+            .find(|e| e["type"] == "response.completed")
+            .expect("response.completed");
+        let response = &completed["response"];
+        assert_eq!(response["output"][0]["type"], "function_call");
+        assert_eq!(response["usage"]["output_tokens"], generated);
+        assert_eq!(response["usage"]["input_tokens"], 5);
+        assert_eq!(response["usage"]["total_tokens"], 5 + generated);
     }
 }

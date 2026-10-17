@@ -1051,13 +1051,16 @@ impl AnthropicSseEncoder {
     /// Process one delta, returning the ordered `(event_name, payload)` pairs to emit.
     fn push(&mut self, delta: &StreamDelta) -> Vec<(&'static str, Value)> {
         let mut events = Vec::new();
-        self.output_tokens += delta.new_token_ids.len() as u32;
 
-        // Prompt-side usage, refreshed from every delta (last write wins) so a
-        // cache count that lands a step late still corrects itself. Split here
-        // rather than passed in, because `message_start` below is emitted on
-        // the first delta and must already carry the real numbers — this is the
-        // only path Claude Code exercises, and it reported a literal 0.
+        // Usage, refreshed from every delta (last write wins) so a cache count
+        // that lands a step late still corrects itself. The output count is the
+        // engine's running total, not a sum of `new_token_ids`: the steps a
+        // tool parser buffers send no delta, so a sum drops most of a tool
+        // call's tokens. The prompt side is split here rather than passed in,
+        // because `message_start` below is emitted on the first delta and must
+        // already carry the real numbers — this is the only path Claude Code
+        // exercises, and it reported a literal 0.
+        self.output_tokens = delta.usage.completion_tokens;
         self.cache_read_input_tokens = delta.usage.cached_tokens;
         self.input_tokens = delta
             .usage
@@ -2064,6 +2067,7 @@ mod tests {
         let usage = StreamUsage {
             prompt_tokens: 1000,
             cached_tokens: 960,
+            completion_tokens: 2,
         };
         let mut events = Vec::new();
         events.extend(enc.push(&mk_delta_usage(Some("hi"), None, None, usage)));
@@ -2092,10 +2096,40 @@ mod tests {
         let usage = StreamUsage {
             prompt_tokens: 512,
             cached_tokens: 0,
+            completion_tokens: 1,
         };
         let events = enc.push(&mk_delta_usage(Some("hi"), None, None, usage));
         let start = &events[0].1["message"]["usage"];
         assert_eq!(start["input_tokens"], 512);
         assert_eq!(start["cache_read_input_tokens"], 0);
+    }
+
+    /// The Claude Code smoke run that found this: `completion_tokens=33` in the server log,
+    /// `"output_tokens": 1` on the stream. The steps a tool parser buffers send no delta, so a
+    /// sum of the deltas' token ids drops them; `message_delta` reports the engine's count.
+    #[test]
+    fn test_stream_tool_call_reports_buffered_tokens() {
+        for reasoning in [false, true] {
+            let (deltas, generated) =
+                crate::engine::test_support::buffered_tool_call_deltas(reasoning);
+            let mut enc = AnthropicSseEncoder::new("r".into(), "m".into());
+            let events: Vec<_> = deltas.iter().flat_map(|d| enc.push(d)).collect();
+            assert!(
+                events
+                    .iter()
+                    .any(|(_, e)| e["content_block"]["type"] == "tool_use"),
+                "reasoning={reasoning}: a tool_use block"
+            );
+            let delta = &events
+                .iter()
+                .find(|(n, _)| *n == "message_delta")
+                .expect("message_delta")
+                .1;
+            assert_eq!(delta["delta"]["stop_reason"], "tool_use");
+            assert_eq!(
+                delta["usage"]["output_tokens"], generated,
+                "reasoning={reasoning}"
+            );
+        }
     }
 }
