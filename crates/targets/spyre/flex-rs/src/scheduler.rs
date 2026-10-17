@@ -4558,12 +4558,35 @@ impl SchedulerHandle for RuntimeScheduler {
         // `launch_compute`) never reached `maybeSetBarrier` at all.
         let requested_barrier = op.pipeline_barrier;
         match op.kind {
-            K::EventSignal | K::EventWait | K::HostCallback => {
-                // Events/host-callbacks do not target a hardware pipeline —
-                // `RuntimeStream` itself handles these (see
+            K::EventSignal | K::EventWait => {
+                // Events never cross this boundary: the vendor's scheduler
+                // thread routes EventSignalOp/EventWaitOp straight to
+                // processEventSignalOp/processEventWaitOp
+                // (runtime_scheduler_internal.cpp:342/348) — there is no
+                // schedule() path for them — and this crate executes the
+                // pair inside `RuntimeStream`
+                // (`launch_event_signal`/`launch_event_wait`; see
+                // `crate::event`'s module doc for the provenance). This arm
+                // was previously a silent no-op that "completed" the op with
+                // Ok: an event dropped here would strand a cross-stream
+                // waiter inside `Event::wait()` with no diagnostic. Now a
+                // hard, sticky refusal — reported through the completion
+                // path (so `in_flight`, already incremented by the caller,
+                // still drains) exactly like the wrong-payload arms below,
+                // never as a bare `Err` return.
+                completion(Err(mock_error(
+                    "schedule(): EventSignal/EventWait are executed by \
+                     RuntimeStream::launch_event_signal/launch_event_wait, \
+                     never by the scheduler",
+                )));
+                Ok(())
+            }
+            K::HostCallback => {
+                // Host callbacks do not target a hardware pipeline —
+                // `RuntimeStream` itself handles them (see
                 // `launch_operation_host_callback`); `RuntimeScheduler`'s
-                // event overloads just signal/wait then invoke `on_complete`
-                // with no fence/pipeline bookkeeping.
+                // host-callback path just invokes `on_complete` with no
+                // fence/pipeline bookkeeping.
                 completion(Ok(()));
                 Ok(())
             }
@@ -5685,6 +5708,46 @@ mod ported_cxx_tests {
             )
             .unwrap();
         assert!(fired.load(Ordering::SeqCst));
+    }
+
+    /// Events never cross `SchedulerHandle::schedule`: the vendor's scheduler
+    /// thread routes `EventSignalOp`/`EventWaitOp` straight to
+    /// `processEventSignalOp`/`processEventWaitOp`
+    /// (`runtime_scheduler_internal.cpp:342/348`) and this crate executes
+    /// them in `RuntimeStream::launch_event_signal`/`launch_event_wait`. The
+    /// `schedule()` arm for them was previously a silent no-op that completed
+    /// the op with `Ok` — a signal dropped there would strand a cross-stream
+    /// waiter inside `Event::wait()` with no diagnostic — so a direct
+    /// submission is now a hard, sticky refusal reported through the
+    /// completion path (so `in_flight`, already incremented by
+    /// `launch_operation`, still drains), exactly like the wrong-payload
+    /// arms in `schedule`.
+    #[test]
+    fn direct_event_submission_is_refused_stickily() {
+        let (_sched, stream) = mock_stream(RuntimeStreamMode::StrictOrdering);
+        stream
+            .launch_operation(
+                SubmittedOperation {
+                    kind: RuntimeOperationKind::EventSignal,
+                    pipeline_barrier: true,
+                    payload: Box::new(()),
+                },
+                None,
+            )
+            .expect("the refusal is reported through the completion path, not the return value");
+        assert!(
+            stream.needs_shutdown(),
+            "a mis-wired event submission must shut the stream down"
+        );
+        match stream.synchronize() {
+            Err(RuntimeStreamError::Deferred(e)) => {
+                assert!(
+                    e.to_string().contains("launch_event_signal"),
+                    "refusal must name the real execution site: {e}"
+                );
+            }
+            other => panic!("expected the deferred refusal, got {other:?}"),
+        }
     }
 
     /// Port of `StrictOrderingAutoBarrierOnPipelineSwitch`: switching from

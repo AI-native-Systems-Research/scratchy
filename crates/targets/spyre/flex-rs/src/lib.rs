@@ -52,6 +52,7 @@ pub mod control_blocks;
 pub mod device_memory_allocator;
 pub mod dma;
 pub mod domain;
+pub mod event;
 pub mod flex_config;
 pub mod host_interface;
 pub mod iommu;

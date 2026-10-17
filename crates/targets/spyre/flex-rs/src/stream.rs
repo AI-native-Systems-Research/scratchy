@@ -21,16 +21,21 @@
 //! relocate the trait itself into `crate::scheduler` during Assembly without
 //! changing its shape).
 //!
-//! Also not ported: `launchOperationEventSignal`/`launchOperationEventWait`
-//! (`runtime_stream.cpp:408-428`) and the two `fillAsync` overloads
-//! (`runtime_stream.cpp:432-454`). The event pair takes an
-//! `EventSignalOp*`/`EventWaitOp*` wrapping a shared `flex::Event`, and no
-//! `Event` type exists anywhere in this crate — writing one would be
-//! invented behavior rather than a port. `fillAsync`'s value+`DataFormats`
-//! overload needs `RuntimeOperationFill::valueToFillPattern`, which lives in
-//! the fill-params subsystem (`crate::dma`), not in `RuntimeStream`; once a
+//! `launchOperationEventSignal`/`launchOperationEventWait`
+//! (`runtime_stream.cpp:673-699`) are ported as `launch_event_signal`/
+//! `launch_event_wait` below: with `launch_operation_host_callback`, the
+//! three `launchOperation*`s that execute inside `RuntimeStream` rather
+//! than crossing `SchedulerHandle::schedule` — the vendor's scheduler
+//! thread routes `EventSignalOp`/`EventWaitOp` straight to
+//! `processEventSignalOp`/`processEventWaitOp`
+//! (`runtime_scheduler_internal.cpp:342/348`) with no `schedule()` call.
+//! The shared `flex::Event` they synchronize on is `crate::event::Event`.
+//! Still not ported: the two `fillAsync` overloads
+//! (`runtime_stream.cpp:432-454`) — the value+`DataFormats` overload needs
+//! `RuntimeOperationFill::valueToFillPattern`, which lives in the
+//! fill-params subsystem (`crate::dma`), not in `RuntimeStream`; once a
 //! caller has a `FillPattern` the pattern overload is exactly
-//! `launch_fill`. Every other `launchOperation*` is ported below.
+//! `launch_fill`.
 //!
 //! `RuntimeStream` never calls senlib directly in the C++ source — every
 //! `launchOperation*` validates parameters, builds a `RuntimeOperation`, and
@@ -146,8 +151,14 @@ pub enum RuntimeStreamError {
     /// The scheduler rejected/failed the submission itself.
     Scheduler(SchedulerError),
     /// A previously-deferred exception, re-thrown (and cleared) by
-    /// `synchronize()`.
-    Deferred(Box<RuntimeStreamError>),
+    /// `synchronize()`. Held by `Arc`, not `Box`: the deferred slot itself
+    /// is `Arc`-valued so a failed stream's error can be handed to every
+    /// stream waiting on one of its events without being moved out from
+    /// under the producer's own `synchronize()` — the Rust shape of the
+    /// scheduler hooks' `peekDeferredError`
+    /// (`runtime_scheduler_internal.cpp:76`) sharing one `exception_ptr`
+    /// between producer and waiters (see `peek_deferred_error`).
+    Deferred(Arc<RuntimeStreamError>),
     /// Port of the `std::invalid_argument` guard in the callback path when a
     /// required parameter (e.g. a host callback) is null.
     NullCallback(&'static str),
@@ -312,7 +323,13 @@ pub struct RuntimeStream {
     /// `SchedulerHandle::register_stream`), matching the C++ passing
     /// `&shutdown_` into `registerStream`.
     shutdown: Arc<AtomicBool>,
-    deferred_error: Mutex<Option<RuntimeStreamError>>,
+    /// `Arc`-valued rather than owned: `peek_deferred_error` clones the
+    /// handle so a dying stream can poison every event it owes with the SAME
+    /// error its own `synchronize()` will re-throw — the port of the
+    /// scheduler hooks' `peekDeferredError`
+    /// (`runtime_scheduler_internal.cpp:76`), which shares one
+    /// `exception_ptr` the same way.
+    deferred_error: Mutex<Option<Arc<RuntimeStreamError>>>,
     sync_count: AtomicI64,
     sync_mutex: Mutex<()>,
     sync_cv: Condvar,
@@ -402,8 +419,20 @@ impl RuntimeStream {
     pub fn set_error(&self, error: RuntimeStreamError) {
         let mut guard = self.deferred_error.lock().unwrap();
         if guard.is_none() {
-            *guard = Some(error);
+            *guard = Some(Arc::new(error));
         }
+    }
+
+    /// Port of the scheduler hooks' `peekDeferredError`
+    /// (`runtime_scheduler_internal.cpp:76` — `drainShutdownStream`'s
+    /// sharing side: when a shutdown stream abandons the ops it is queued
+    /// on, it poisons each EventSignal it still owes with a COPY of its
+    /// deferred exception, so the producer re-throws it from
+    /// `synchronize()` and every waiter re-throws the same thing). Clones
+    /// the handle rather than consuming it — the slot stays put for this
+    /// stream's own `synchronize()`.
+    pub fn peek_deferred_error(&self) -> Option<Arc<RuntimeStreamError>> {
+        self.deferred_error.lock().unwrap().clone()
     }
 
     /// Port of `makeCompletionCallback` (`runtime_stream.cpp:60-83`).
@@ -834,36 +863,179 @@ impl RuntimeStream {
         Ok(())
     }
 
+    /// Port of `launchOperationEventSignal` (`runtime_stream.cpp:673-685`).
+    /// With `launch_operation_host_callback` and `launch_event_wait`, one of
+    /// the three `launchOperation*`s that execute inside `RuntimeStream`
+    /// instead of crossing `SchedulerHandle::schedule` — the vendor's
+    /// scheduler thread routes `EventSignalOp` straight to
+    /// `processEventSignalOp` (`runtime_scheduler_internal.cpp:342`), and
+    /// this port moves that processing onto the caller thread:
+    ///
+    /// 1. `check_not_shutdown` — `launchOperationEventSignal`'s own
+    ///    `StreamInErrorState` guard (nothing is owed yet, so no poison).
+    /// 2. `wait_until_drained` — `headOpReady`'s `in_flight_ == 0` gate.
+    ///    The deadlock the vendor warns about in `processEventSignalOp`
+    ///    ("Do NOT call synchronize() here — it also waits on
+    ///    queued_in_flight_, drainable only by this thread → self-deadlock",
+    ///    :397-399) cannot occur in this shape: there is no scheduler thread
+    ///    to starve — completions arrive from the response worker, so the
+    ///    caller blocking here is not the only drainer.
+    /// 3. Re-check shutdown — a completion that FAILED during the drain
+    ///    flipped the flag after step 1's check. The vendor closes this
+    ///    window on the scheduler thread (`drainShutdownStream`, :70-76: a
+    ///    dying stream poisons every EventSignal it still owes with a copy
+    ///    of its deferred exception, so waiters re-throw the producer's
+    ///    error); the port does the same to THIS op's event — poison with a
+    ///    clone of the deferred error (or a bare `Shutdown` sentinel when
+    ///    shutdown was set without one, the analog of the C++
+    ///    null-exception_ptr poison), never signal.
+    /// 4. `signal()`, then the user callback — `processEventSignalOp`'s
+    ///    order (signal → notify → callback, :400-407). A panicking user
+    ///    callback takes `make_completion_callback`'s path (deferred error +
+    ///    sticky shutdown) rather than unwinding out of the launch.
+    pub fn launch_event_signal(
+        self: &Arc<Self>,
+        event: Arc<crate::event::Event>,
+        user_cb: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<(), RuntimeStreamError> {
+        self.check_not_shutdown()?;
+        self.wait_until_drained();
+        if self.needs_shutdown() {
+            if let Some(deferred) = self.peek_deferred_error() {
+                event.poison(Arc::new(crate::event::PoisonedEventError::new(deferred)));
+            } else {
+                event.poison(Arc::new(RuntimeStreamError::Shutdown));
+            }
+            return Err(RuntimeStreamError::Shutdown);
+        }
+        event.signal();
+        if let Some(cb) = user_cb {
+            // Same panic-safety contract as `make_completion_callback`'s Ok
+            // arm and `launch_event_wait` below: the vendor invokes the
+            // host callback after signal() with no catch of its own, and the
+            // enclosing processOperation catch converts a throw into the
+            // stream's error state — so a panicking callback must defer +
+            // shut down rather than unwind out of the launch.
+            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb)) {
+                let msg = panic_message(&panic);
+                tracing::error!("stream entering error state: user callback panicked: {msg}");
+                self.set_error(RuntimeStreamError::Scheduler(msg.into()));
+                self.set_shutdown(true);
+            }
+        }
+        Ok(())
+    }
+
+    /// Port of `launchOperationEventWait` (`runtime_stream.cpp:687-699`) —
+    /// same inline-execution provenance as `launch_event_signal`: the vendor
+    /// routes `EventWaitOp` to `processEventWaitOp`
+    /// (`runtime_scheduler_internal.cpp:348`), this port runs it on the
+    /// caller thread. `headOpReady`'s EventWait rule (:107-112 — ready iff
+    /// the event is signaled or poisoned) becomes the caller parking in
+    /// `Event::wait()`; program order on the stream is submission order by
+    /// construction, which is what the op's forced pipeline barrier
+    /// guarantees in the vendor.
+    ///
+    /// On a poisoned event, `processEventWaitOp`'s poison arm (:419-437) is
+    /// ported exactly: record the PRODUCER's error on the waiter stream
+    /// (`PoisonedEventError` carries it; the C++ hands the `exception_ptr`
+    /// straight to `hooks.setError`), flip sticky shutdown — unconditional,
+    /// matching the C++ note that a null-error poison still shuts down —
+    /// then fire the user callback AFTER the error state is set, and return
+    /// `Ok(())`: the failure is deferred for the waiter's own
+    /// `synchronize()` to re-throw, exactly like an on-device operation
+    /// failure. On a signaled event, just the callback.
+    pub fn launch_event_wait(
+        self: &Arc<Self>,
+        event: Arc<crate::event::Event>,
+        user_cb: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<(), RuntimeStreamError> {
+        self.check_not_shutdown()?;
+        event.wait();
+        if event.is_poisoned() {
+            // poison() stores the error before publishing `poisoned_`, so
+            // observing the flag implies the handle is there to take.
+            let producer_error = event
+                .get_error()
+                .expect("is_poisoned implies poison stored an error first");
+            tracing::error!(
+                "stream entering error state: waited event was poisoned: {producer_error}"
+            );
+            self.set_error(RuntimeStreamError::Scheduler(Box::new(
+                crate::event::PoisonedEventError::new(producer_error),
+            )));
+            self.set_shutdown(true);
+        }
+        if let Some(cb) = user_cb {
+            // Port of the C++ `try { ... user_cb(user_cb_data); } catch(...)
+            // { setError(...); setShutdown(true); }` wrapping the vendor's
+            // host-callback invocations (processEventSignalOp/
+            // processEventWaitOp call the callback outside any catch of
+            // their own; the enclosing processOperation catch converts a
+            // throw into the stream's error state): a panicking user
+            // callback must not unwind out of the launch — it takes the same
+            // deferred-error + sticky-shutdown path as an on-device failure,
+            // exactly like `make_completion_callback`'s Ok arm.
+            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb)) {
+                let msg = panic_message(&panic);
+                tracing::error!("stream entering error state: user callback panicked: {msg}");
+                self.set_error(RuntimeStreamError::Scheduler(msg.into()));
+                self.set_shutdown(true);
+            }
+        }
+        Ok(())
+    }
+
+    /// The drain half of `synchronize` — wait until `in_flight` reaches zero
+    /// — factored out because it is ALSO the readiness gate for a signal op.
+    /// Port of `headOpReady`'s `EventSignal` arm
+    /// (`runtime_scheduler_internal.cpp:113-116`: "FIFO means all prior ops
+    /// are already submitted (in in_flight_) by the time the signal reaches
+    /// the head, so in_flight_ == 0 is the 'prior work done' gate") — the
+    /// implicit barrier `EventSignalOp` forces (its `setPipelineBarrier`
+    /// refuses to clear it; the barrier is structural) is realized on this
+    /// side of the port as "the caller blocks until the stream drains".
+    ///
+    /// Unlike `synchronize`: does NOT consume the deferred error, and does
+    /// NOT skip on shutdown — `launch_event_signal` must drain even a
+    /// stream that failed mid-drain, so it can poison the event it owes
+    /// rather than signal it.
+    fn wait_until_drained(&self) {
+        let mut guard = self.sync_mutex.lock().unwrap();
+        let wait_start = std::time::Instant::now();
+        // Port of the C++ `wait_for(lock, 60s, predicate)` loop: wake up
+        // every 60s while still waiting and log, so a lost completion
+        // (ResponseWorker processed the hardware response but the completion
+        // callback never reached decrementInFlight()) is visible instead of
+        // the caller hanging silently forever.
+        while self.in_flight.load(Ordering::Acquire) > 0 {
+            let (new_guard, timeout_result) = self
+                .sync_cv
+                .wait_timeout_while(guard, std::time::Duration::from_secs(60), |_| {
+                    self.in_flight.load(Ordering::Acquire) > 0
+                })
+                .unwrap();
+            guard = new_guard;
+            if timeout_result.timed_out() {
+                let elapsed_ms = wait_start.elapsed().as_millis();
+                tracing::error!(
+                    "RuntimeStream drain still waiting after {elapsed_ms}ms: in_flight_={} device={:?} — possible lost completion",
+                    self.in_flight.load(Ordering::Acquire),
+                    self.device_id
+                );
+            }
+        }
+    }
+
     /// Port of `RuntimeStream::synchronize`. Skips the wait loop entirely
     /// once the stream is already in shutdown (matching the C++
     /// `if(!needsShutdown())` guard), then always consumes (swaps out) any
-    /// deferred error exactly once.
+    /// deferred error exactly once. The wait loop itself is
+    /// `wait_until_drained`, shared with `launch_event_signal`'s
+    /// `headOpReady` gate.
     pub fn synchronize(&self) -> Result<(), RuntimeStreamError> {
         if !self.needs_shutdown() {
-            let mut guard = self.sync_mutex.lock().unwrap();
-            let wait_start = std::time::Instant::now();
-            // Port of the C++ `wait_for(lock, 60s, predicate)` loop: wake up
-            // every 60s while still waiting and log, so a lost completion
-            // (ResponseWorker processed the hardware response but the
-            // completion callback never reached decrementInFlight()) is
-            // visible instead of synchronize() hanging silently forever.
-            while self.in_flight.load(Ordering::Acquire) > 0 {
-                let (new_guard, timeout_result) = self
-                    .sync_cv
-                    .wait_timeout_while(guard, std::time::Duration::from_secs(60), |_| {
-                        self.in_flight.load(Ordering::Acquire) > 0
-                    })
-                    .unwrap();
-                guard = new_guard;
-                if timeout_result.timed_out() {
-                    let elapsed_ms = wait_start.elapsed().as_millis();
-                    tracing::error!(
-                        "RuntimeStream::synchronize() still waiting after {elapsed_ms}ms: in_flight_={} device={:?} — possible lost completion",
-                        self.in_flight.load(Ordering::Acquire),
-                        self.device_id
-                    );
-                }
-            }
+            self.wait_until_drained();
             // Port of `runtime_stream.cpp:388-391`:
             //
             //     auto sync_id = sync_count_++;
@@ -877,12 +1049,11 @@ impl RuntimeStream {
             // on every `synchronize()`. If flex telemetry is ever wanted, this
             // is where the per-sync drain belongs.
             let _sync_id = self.sync_count.fetch_add(1, Ordering::Relaxed);
-            drop(guard);
         }
 
         let deferred = self.deferred_error.lock().unwrap().take();
         match deferred {
-            Some(err) => Err(RuntimeStreamError::Deferred(Box::new(err))),
+            Some(err) => Err(RuntimeStreamError::Deferred(err)),
             None => Ok(()),
         }
     }
@@ -927,11 +1098,14 @@ impl Drop for RuntimeStream {
 /// - `device_interface_factory_test.cpp` (1 test): SKIPPED — tests
 ///   `DeviceInterfaceFactory::createDevice()`, a device-bring-up type with no
 ///   Rust counterpart in this crate.
-/// - `event_primitives_test.cpp` (8 tests), `event_wait_test.cpp` (9 tests):
-///   SKIPPED — both test `flex::Event`/`EventWaitOp`/`EventSignalOp`, a
-///   synchronization-primitive class with no Rust counterpart; `stream.rs`
-///   only carries the `EventSignal`/`EventWait` *tag* in
-///   `RuntimeOperationKind`, not an `Event` object to test.
+/// - `event_primitives_test.cpp` (8 tests), `event_wait_test.cpp` (8 tests):
+///   PORTED — to `crate::event`'s own test suite (the primitive-level
+///   assertions, with the CPU-time-metric adaptation noted there), plus the
+///   stream-level pins of the launch pair (`launch_event_signal` /
+///   `launch_event_wait`) in this module below. (This entry previously
+///   recorded the pair as SKIPPED — "no `Event` type exists anywhere in
+///   this crate" — and counted `event_wait_test.cpp` at 9; both vendor
+///   files carry 8 `TEST` cases.)
 /// - `runtime_stream_api_test.cpp` (7 tests): 3 ported
 ///   (`create_default_stream_has_default_properties`,
 ///   `create_stream_with_parameters`,
@@ -1417,5 +1591,253 @@ mod tests {
 
         // The deferred error is consumed exactly once.
         assert!(stream.synchronize().is_ok());
+    }
+
+    // === launch_event_signal / launch_event_wait ===========================
+    //
+    // The vendor has no stream-level tests for the event launch pair — its
+    // `processEventSignalOp`/`processEventWaitOp` behavior is exercised only
+    // through scheduler-thread integration. This port executes the pair in
+    // `RuntimeStream`, so the gate sequence IS this class's own state machine
+    // and gets pinned here, against `MockScheduler`.
+
+    // Port of `processEventSignalOp`'s success order (signal → notify →
+    // callback, `runtime_scheduler_internal.cpp:400-407`) at the stream
+    // level: after a completed op, the signal fires and the user callback
+    // runs, without the scheduler ever seeing an event op (schedule_calls
+    // stays at the dummy op's 1).
+    #[test]
+    fn event_signal_signals_and_fires_user_callback() {
+        let scheduler = MockScheduler::new(true);
+        let stream = RuntimeStream::new(
+            scheduler.clone(),
+            DeviceId(0),
+            RuntimeStreamPriority::default(),
+            RuntimeStreamMode::default(),
+        );
+        stream
+            .launch_operation(dummy_op(RuntimeOperationKind::H2D), None)
+            .unwrap();
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let fired2 = fired.clone();
+        let event = Arc::new(crate::event::Event::new());
+        stream
+            .launch_event_signal(
+                event.clone(),
+                Some(Box::new(move || {
+                    fired2.fetch_add(1, Ordering::SeqCst);
+                })),
+            )
+            .unwrap();
+
+        assert!(event.is_signaled());
+        assert!(!event.is_poisoned());
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scheduler.schedule_calls.load(Ordering::SeqCst),
+            1,
+            "the event launch must not cross SchedulerHandle::schedule"
+        );
+        stream.synchronize().unwrap();
+    }
+
+    // Port of `launchOperationEventSignal`'s `StreamInErrorState` guard: a
+    // shut-down stream refuses the launch synchronously and owes the event
+    // nothing — no signal, no poison (nothing was queued in the vendor
+    // either).
+    #[test]
+    fn event_signal_refused_on_shutdown_leaves_event_untouched() {
+        let scheduler = MockScheduler::new(true);
+        let stream = RuntimeStream::new(
+            scheduler,
+            DeviceId(0),
+            RuntimeStreamPriority::default(),
+            RuntimeStreamMode::default(),
+        );
+        stream.set_shutdown(true);
+
+        let event = Arc::new(crate::event::Event::new());
+        let err = stream.launch_event_signal(event.clone(), None).unwrap_err();
+        assert!(matches!(err, RuntimeStreamError::Shutdown));
+        assert!(!event.is_signaled());
+        assert!(!event.is_poisoned());
+    }
+
+    // Port of `headOpReady`'s EventSignal gate (:113-116) plus the mid-drain
+    // failure window `drainShutdownStream` (:70-76) closes: a prior op still
+    // pending holds the signal back (in_flight != 0); when that op's
+    // completion FAILS, the owed event is poisoned with the producer's
+    // deferred error — never signaled — and the launch returns `Shutdown`.
+    #[test]
+    fn event_signal_poisons_the_owed_event_when_a_prior_op_fails() {
+        let scheduler = MockScheduler::new(false);
+        let stream = RuntimeStream::new(
+            scheduler.clone(),
+            DeviceId(0),
+            RuntimeStreamPriority::default(),
+            RuntimeStreamMode::default(),
+        );
+        stream
+            .launch_operation(dummy_op(RuntimeOperationKind::H2D), None)
+            .unwrap();
+
+        let event = Arc::new(crate::event::Event::new());
+        let signal_event = event.clone();
+        let signal_stream = stream.clone();
+        let signaler =
+            std::thread::spawn(move || signal_stream.launch_event_signal(signal_event, None));
+
+        // Still one op in flight: the signal must not fire while the prior
+        // op can still fail (headOpReady's gate).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!event.is_signaled());
+
+        scheduler.fire_next(Err("prior op failed".to_string().into()));
+        let result = signaler.join().unwrap();
+        assert!(matches!(result, Err(RuntimeStreamError::Shutdown)));
+
+        // The owed event is poisoned with the producer's error, and the
+        // producer's own synchronize() still re-throws the SAME error — the
+        // peekDeferredError sharing.
+        assert!(event.is_poisoned());
+        let poison = event.get_error().unwrap();
+        assert!(
+            poison.to_string().contains("prior op failed"),
+            "poison carries the producer's deferred error: {poison}"
+        );
+        match stream.synchronize() {
+            Err(RuntimeStreamError::Deferred(inner)) => {
+                assert!(inner.to_string().contains("prior op failed"));
+            }
+            other => panic!("expected the producer's deferred error, got {other:?}"),
+        }
+    }
+
+    // Port of `headOpReady`'s EventSignal gate at the stream level: while a
+    // prior op is pending, the signal does not fire; completing the op lets
+    // it through.
+    #[test]
+    fn event_signal_waits_for_prior_in_flight_ops() {
+        let scheduler = MockScheduler::new(false);
+        let stream = RuntimeStream::new(
+            scheduler.clone(),
+            DeviceId(0),
+            RuntimeStreamPriority::default(),
+            RuntimeStreamMode::default(),
+        );
+        stream
+            .launch_operation(dummy_op(RuntimeOperationKind::H2D), None)
+            .unwrap();
+
+        let event = Arc::new(crate::event::Event::new());
+        let signal_event = event.clone();
+        let signal_stream = stream.clone();
+        let signaler =
+            std::thread::spawn(move || signal_stream.launch_event_signal(signal_event, None));
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !event.is_signaled(),
+            "signal must wait for the in-flight op (headOpReady gate)"
+        );
+
+        scheduler.fire_next(Ok(()));
+        signaler.join().unwrap().unwrap();
+        assert!(event.is_signaled());
+        assert!(!event.is_poisoned());
+    }
+
+    // Port of `processEventWaitOp`'s signaled arm: the wait returns, the
+    // user callback fires, and the stream stays healthy.
+    #[test]
+    fn event_wait_on_signaled_event_runs_user_callback() {
+        let scheduler = MockScheduler::new(true);
+        let stream = RuntimeStream::new(
+            scheduler,
+            DeviceId(0),
+            RuntimeStreamPriority::default(),
+            RuntimeStreamMode::default(),
+        );
+        let event = Arc::new(crate::event::Event::new());
+        event.signal();
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let fired2 = fired.clone();
+        stream
+            .launch_event_wait(
+                event,
+                Some(Box::new(move || {
+                    fired2.fetch_add(1, Ordering::SeqCst);
+                })),
+            )
+            .unwrap();
+
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert!(!stream.needs_shutdown());
+        stream.synchronize().unwrap();
+    }
+
+    // Port of `processEventWaitOp`'s poison arm (:419-437): a poisoned wait
+    // does NOT fail the launch synchronously — the producer's error is
+    // recorded on the waiter stream (sticky shutdown), the user callback
+    // still fires AFTER the error state is set, and `synchronize()` re-throws
+    // the producer's error through the `PoisonedEventError` display chain.
+    #[test]
+    fn event_wait_on_poisoned_event_defers_the_producer_error() {
+        let scheduler = MockScheduler::new(true);
+        let stream = RuntimeStream::new(
+            scheduler,
+            DeviceId(0),
+            RuntimeStreamPriority::default(),
+            RuntimeStreamMode::default(),
+        );
+        let event = Arc::new(crate::event::Event::new());
+        event.poison(Arc::new(RuntimeStreamError::Scheduler(
+            "producer stream failed".into(),
+        )));
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let fired2 = fired.clone();
+        let wait_stream = stream.clone();
+        stream
+            .launch_event_wait(
+                event,
+                Some(Box::new(move || {
+                    // Runs after set_error/set_shutdown, per the C++ ordering —
+                    // the waiter stream the callback sees is the same one.
+                    assert!(wait_stream.needs_shutdown());
+                    fired2.fetch_add(1, Ordering::SeqCst);
+                })),
+            )
+            .expect("a poisoned wait defers its failure, it does not throw it");
+
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert!(stream.needs_shutdown());
+        match stream.synchronize() {
+            Err(RuntimeStreamError::Deferred(inner)) => {
+                let msg = inner.to_string();
+                assert!(msg.contains("poisoned by a failed producer stream"));
+                assert!(msg.contains("producer stream failed"));
+            }
+            other => panic!("expected the deferred producer error, got {other:?}"),
+        }
+    }
+
+    // Port of `launchOperationEventWait`'s `StreamInErrorState` guard.
+    #[test]
+    fn event_wait_refused_on_shutdown() {
+        let scheduler = MockScheduler::new(true);
+        let stream = RuntimeStream::new(
+            scheduler,
+            DeviceId(0),
+            RuntimeStreamPriority::default(),
+            RuntimeStreamMode::default(),
+        );
+        stream.set_shutdown(true);
+
+        let event = Arc::new(crate::event::Event::new());
+        let err = stream.launch_event_wait(event, None).unwrap_err();
+        assert!(matches!(err, RuntimeStreamError::Shutdown));
     }
 }
