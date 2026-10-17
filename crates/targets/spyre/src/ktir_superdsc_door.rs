@@ -175,26 +175,44 @@ pub fn lower(
         // &Vec<Region>` at `&r` — which reads as a problem with the regions rather than with where the
         // empty slice went. Measured that way: `cargo check -p scratchy-target-spyre` rc 101, against
         // rc 0 on main.
-        Program::Elementwise(ew) => elementwise(name, ew, &r, &[], sym_id_base, layout),
-        Program::SiluMul => silumul(name, &r, sym_id_base, layout),
-        Program::RmsNorm => rmsnorm(name, k, &r, sym_id_base, layout),
-        Program::RmsNormUnit => lk::rmsnorm_unit(name, k, &r, sym_id_base, layout),
+        // ⛔ EVERY POINTWISE KIND is held to the column windows its program states, on what it EMITS
+        // (`lk::column_windows_are_honoured`). The front end column-tiles only some of them
+        // (`subtile_ir.rs`'s set and the MoE path's gated act); for the rest the guard is a no-op at
+        // corner 0, and it makes a corner that ever reaches one a build error naming the op, not a
+        // piece written at the buffer base.
+        Program::Elementwise(ew) => windowed(
+            name,
+            &r,
+            elementwise(name, ew, &r, &[], sym_id_base, layout),
+        ),
+        Program::SiluMul => windowed(name, &r, silumul(name, &r, sym_id_base, layout)),
+        Program::RmsNorm => windowed(name, &r, rmsnorm(name, k, &r, sym_id_base, layout)),
+        Program::RmsNormUnit => {
+            windowed(name, &r, lk::rmsnorm_unit(name, k, &r, sym_id_base, layout))
+        }
         // The fused per-head norm sandwich — the door derives its geometry off the
-        // program's own views (one head's window is the output's first access tile).
+        // program's own views (one head's window is the output's first access tile), so its corners
+        // are per-head windows this guard does not describe.
         Program::WindowedRmsNorm { .. } => lk::windowed_rmsnorm(name, k, &r, sym_id_base, layout),
-        Program::TanhSoftCap => lk::tanhsoftcap(name, k, &r, sym_id_base, layout),
+        Program::TanhSoftCap => {
+            windowed(name, &r, lk::tanhsoftcap(name, k, &r, sym_id_base, layout))
+        }
         // The router's row softmax/renorm — no geometry door to cross, no registry
         // const to resolve: the whole chain is data-driven and the body is the
         // rmsnorm's structure with the softmax's primitives in it.
-        Program::RouteSoftmax => route_softmax(name, &r, sym_id_base, layout),
-        Program::RouteRenorm => route_renorm(name, &r, sym_id_base, layout),
+        Program::RouteSoftmax => windowed(name, &r, route_softmax(name, &r, sym_id_base, layout)),
+        Program::RouteRenorm => windowed(name, &r, route_renorm(name, &r, sym_id_base, layout)),
         // The expert MLP's gated activation — silumul's body with the act's own
         // device primitive (key `"silu"`/`"gelu"`, the wire `gelufwd` coming from
         // the OpFunc), over the pair rows the sort laid out.
-        Program::ExpertGatedAct(act) => lk::gated_act(name, act, &r, sym_id_base, layout),
-        Program::ScalarWeightMul => lk::scalarweightmul(name, &r, sym_id_base, layout),
+        Program::ExpertGatedAct(act) => {
+            windowed(name, &r, lk::gated_act(name, act, &r, sym_id_base, layout))
+        }
+        Program::ScalarWeightMul => {
+            windowed(name, &r, lk::scalarweightmul(name, &r, sym_id_base, layout))
+        }
         Program::Reshape => lk::reshape(name, &r, sym_id_base, layout),
-        Program::ScalarMul => scalarmul(name, k, &r, sym_id_base, layout),
+        Program::ScalarMul => windowed(name, &r, scalarmul(name, k, &r, sym_id_base, layout)),
         Program::Matmul => matmul(
             name,
             &r,
@@ -281,6 +299,19 @@ pub fn lower(
         // See the door's own doc for the five legs and the gather laws.
         Program::ExpertMatmul => lk::expert_matmul(name, &r, sym_id_base, layout, quantized),
     }
+}
+
+/// A column-tiled body's ops, held to the windows its program states
+/// ([`lk::column_windows_are_honoured`]): the bake fails naming the op rather than baking a piece
+/// that writes another piece's columns.
+fn windowed(
+    name: &str,
+    r: &[Region],
+    ops: Result<Vec<EmittedOp>, Error>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let ops = ops?;
+    lk::column_windows_are_honoured(name, r, &ops)?;
+    Ok(ops)
 }
 
 /// The orphan-rule carrier for [`lk::AttnAt`] — see the module header.

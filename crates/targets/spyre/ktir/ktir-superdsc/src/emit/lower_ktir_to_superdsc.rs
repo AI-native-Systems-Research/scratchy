@@ -1141,32 +1141,15 @@ pub fn elementwise(
             who.join(", "),
         ));
     }
-    let full_cols = out.c_start + out.c_len;
-    let out_off = crate::addr::col_of(
-        rows,
-        full_cols,
-        pointwise_chunk_out_offset(out.c_start),
-        Df::Fp16,
-    );
+    // Every operand sits at the output's corner (checked just above), so one corner serves all.
+    let out_off = chunk_corner(rows, &out);
     // HANDLE-FLOW, `silumul`'s own discipline: the handles are bound once and the operands
     // borrow them, because an `EwOperand` holds a `&Stk` that must outlive the builder call.
     let out_h = rb(&out.name(), rows, cols);
     let in_handles: Vec<_> = ins.iter().map(|x| rb(&x.name(), rows, cols)).collect();
     let ew: Vec<_> = in_handles
         .iter()
-        .zip(&ins)
-        .map(|(h, x)| {
-            In::sliced(
-                h,
-                crate::addr::col_of(
-                    rows,
-                    full_cols,
-                    pointwise_chunk_out_offset(x.c_start),
-                    Df::Fp16,
-                ),
-            )
-            .ew()
-        })
+        .map(|h| In::sliced(h, out_off).ew())
         .collect();
     let tile_op = pointwise_tile_op(rows, cols, arity as u32 + 1);
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
@@ -1181,6 +1164,83 @@ pub fn elementwise(
         sym_id_base,
         layout,
     )])
+}
+
+/// ⛔⛔⛔ EVERY OPERAND A COLUMN-BLOCKED PIECE NAMES IS ADDRESSED AT THAT PIECE's WINDOW — the class law,
+/// checked on what was EMITTED, not on what a body meant to emit.
+///
+/// The front end column-tiles a wide pointwise node into pieces that share one output tensor
+/// (`subtile_ir.rs`: `Elementwise(Silu | Mul | Add)`, `ScalarMul`, `SiluMul`; the MoE expert path's
+/// `ExpertGatedAct`). Each piece's [`Region`]s state their corner; a body that drops it emits every
+/// piece at the buffer base, and the columns past the first piece are never written. That happened
+/// twice: `elementwise` (the gemma-4 12b gated-act product, half zero) and `scalarmul_scaled` (granite's
+/// logits past column 8191, never written). Both bodies passed every test of their own, because each
+/// test asked the body and the body agreed with itself.
+///
+/// So this asks the emission. For every op of the node and every operand binding naming a tensor the
+/// program windows at a column corner, the binding's `offset_elems` must be that window's corner in
+/// the tensor's storage ([`chunk_corner`]); the node's ops must start at least one write at the
+/// output's corner. A body that ignores `c_start` cannot produce a bundle: the door returns this `Err`
+/// and the bake fails naming the op.
+///
+/// A whole-tensor node (every corner 0) passes without looking, so nothing that is not column-blocked
+/// pays for it.
+pub fn column_windows_are_honoured(
+    name: &str,
+    r: &[Region],
+    ops: &[EmittedOp],
+) -> Result<(), Error> {
+    let windowed: Vec<&Region> = r.iter().filter(|x| x.c_start != 0).collect();
+    if windowed.is_empty() {
+        return Ok(());
+    }
+    for x in windowed {
+        let rows = x.v_rows;
+        let want = chunk_corner(rows, x).into_raw_elems();
+        let buf = x.name();
+        let mut seen = false;
+        for op in ops {
+            for b in op.arg_bindings.iter().filter(|b| b.buffer == buf) {
+                seen = true;
+                if b.offset_elems != want {
+                    return err(format!(
+                        "{name}: op `{}` addresses t{} at element {} of its buffer, but the program \
+                         windows that tensor at column {} — element {want} of its `[{rows}, {}]` \
+                         storage. A column-blocked piece that does not address its own window \
+                         recomputes another piece's columns and leaves its own unwritten.",
+                        op.op_name,
+                        x.tid,
+                        b.offset_elems,
+                        x.c_start,
+                        x.c_start + x.c_len,
+                    ));
+                }
+            }
+        }
+        if x.is_out && !seen {
+            return err(format!(
+                "{name}: the program writes t{} at column window {}..{}, and no emitted op names it",
+                x.tid,
+                x.c_start,
+                x.c_start + x.c_len,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// ⭐ WHERE A COLUMN-BLOCKED PIECE's WINDOW STARTS in its stick-blocked `[rows, full]` storage — the
+/// device element offset of column `out.c_start`, `(c/64)·(rows·64)`, through the address nest. The ONE
+/// spelling for every pointwise body whose pieces share one output tensor (`elementwise`'s dense arm,
+/// `scalarmul_scaled`); `full` is the storage's width (`c_start + c_len`), because the nest's row
+/// stride is a property of the storage, not of this piece's view. Zero for a whole-tensor region.
+fn chunk_corner(rows: u32, out: &Region) -> crate::addr::DevOff {
+    crate::addr::col_of(
+        rows,
+        out.c_start + out.c_len,
+        pointwise_chunk_out_offset(out.c_start),
+        Df::Fp16,
+    )
 }
 
 /// ⭐⭐⭐ THE PER-ROW CLASS — `[rows, 1]` elementwise, the running-max/alpha/denominator chain of an
@@ -5683,6 +5743,142 @@ mod elementwise_tests {
         );
     }
 
+    /// The lowest per-core start address of each operand's allocate node, in operand order.
+    fn operand_bases(ops: &[EmittedOp]) -> Vec<u64> {
+        let dsc = ops[0].op.as_ref().expect("descriptor").dscs_[0]
+            .values()
+            .next()
+            .expect("one dsc");
+        dsc.scheduleTree_
+            .iter()
+            .filter(|n| n.nodeType_ == "allocate")
+            .map(|n| {
+                n.startAddressCoreCorelet_
+                    .data_
+                    .values()
+                    .map(|a| a.parse::<u64>().expect("decimal"))
+                    .min()
+                    .expect("a per-core address")
+            })
+            .collect()
+    }
+
+    /// ⛔⛔⛔ A COLUMN-CHUNKED SCALARMUL's PIECES TILE ITS ROW EXACTLY ONCE — the granite logits.
+    ///
+    /// `subtile_ir.rs` column-tiles granite's `logits_scaling` multiply over the lm_head's 49155
+    /// columns into `n_blocks(49155, 8192)`: six 8192-wide pieces and a 3-wide tail, sharing one
+    /// input and one output tensor. MEASURED on the card's baked suffix (granite-3.1-2b, every
+    /// granite suffix dump on the pod): all seven pieces are the SAME descriptor, field for field,
+    /// reading and writing columns `[0, 8192)` at one base. So logits `8192..49155` were never
+    /// written, and the card never emitted a token id at or above 8192 that a stale byte did not
+    /// happen to favour (0.60% of 130,572 emitted ids, against 25.9% of the fp32 references').
+    ///
+    /// Each piece's input and output must move by its own stick-block corner `(c/64)·(rows·64)`
+    /// from piece 0's, the scale must not move, and the corners must cover `[0, 49155)` once, at
+    /// the decode row count and at a prompt chunk's.
+    #[test]
+    fn a_column_chunked_scalarmul_pieces_tile_the_logits_row_once() {
+        const VOCAB: u32 = 49155;
+        const NB: u32 = 8192;
+        for rows in [1u32, 4] {
+            let mut pieces = Vec::new();
+            let mut c = 0;
+            while c < VOCAB {
+                let len = NB.min(VOCAB - c);
+                let r = vec![
+                    chunked(5, rows, c, len, VOCAB, false),
+                    chunked(7, rows, c, len, VOCAB, true),
+                ];
+                let mut sym = 0i64;
+                let ops = scalarmul_scaled(
+                    "scalarmul_s1",
+                    &ScaleSource::Bound { tid: 99 },
+                    None,
+                    &r,
+                    &mut sym,
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("piece at column {c} lowers: {}", e.message));
+                assert_eq!(ops.len(), 1, "one descriptor per piece");
+                pieces.push((c, len, operand_bases(&ops)));
+                c += len;
+            }
+            assert_eq!(pieces.len(), 7, "six 8192-wide pieces and the 3-wide tail");
+            let (_, _, base0) = &pieces[0];
+            let bytes_per_col = u64::from(rows) * 2;
+            let mut covered = 0u32;
+            for (c, len, bases) in &pieces {
+                let [x, scale, out] = bases[..] else {
+                    panic!("operands [x, scale, out], got {bases:?}")
+                };
+                let corner = u64::from(*c) * bytes_per_col;
+                assert_eq!(
+                    x - base0[0],
+                    corner,
+                    "rows {rows}: the piece at column {c} reads its own columns"
+                );
+                assert_eq!(scale, base0[1], "rows {rows}: the scale does not move");
+                assert_eq!(
+                    out - base0[2],
+                    corner,
+                    "rows {rows}: the piece at column {c} writes its own columns"
+                );
+                assert_eq!(
+                    ((out - base0[2]) / bytes_per_col) as u32,
+                    covered,
+                    "rows {rows}: each piece starts where the previous one ended"
+                );
+                covered += len;
+            }
+            assert_eq!(covered, VOCAB, "rows {rows}: the pieces cover the row once");
+        }
+    }
+
+    /// ⛔ THE CLASS GUARD SEES THE EMISSION. Every column-tiled body that honours its corner passes
+    /// `column_windows_are_honoured` (elementwise, silumul and scalarmul at the MLP chunk, scalarmul at
+    /// a logits piece), and the SAME ops with one operand moved back to the buffer base — the shape both
+    /// measured defects emitted — are refused naming the op and the tensor.
+    #[test]
+    fn the_column_window_guard_passes_honoured_pieces_and_refuses_a_piece_at_the_base() {
+        let (r, ..) = mlp_chunks();
+        let mut sym = 0i64;
+        let ew = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None).unwrap();
+        column_windows_are_honoured("mul_s23", &r, &ew).expect("elementwise honours its window");
+        let sm =
+            silumul("silumul_s23", &r, &mut sym, None).unwrap_or_else(|e| panic!("{}", e.message));
+        column_windows_are_honoured("silumul_s23", &r, &sm).expect("silumul honours its window");
+        let logits = vec![
+            chunked(5, 1, 8192, 8192, 49155, false),
+            chunked(7, 1, 8192, 8192, 49155, true),
+        ];
+        let mut ops = scalarmul_scaled(
+            "scalarmul_s1",
+            &ScaleSource::Bound { tid: 99 },
+            None,
+            &logits,
+            &mut sym,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{}", e.message));
+        column_windows_are_honoured("scalarmul_s1", &logits, &ops)
+            .expect("the logits piece honours its window");
+        // The old emission: the output written at the base.
+        let out = ops[0]
+            .arg_bindings
+            .iter_mut()
+            .find(|b| b.buffer == logits[1].name())
+            .expect("the output's binding");
+        out.offset_elems = 0;
+        let Err(e) = column_windows_are_honoured("scalarmul_s1", &logits, &ops) else {
+            panic!("a piece written at the buffer base must be refused")
+        };
+        assert!(
+            e.message.contains("t7") && e.message.contains("column 8192"),
+            "names the tensor and its window: {}",
+            e.message
+        );
+    }
+
     /// ⭐ THE CONTROL: chunk 0 — corner 0 on every operand — still takes the SEEDED emission,
     /// byte-identical to every whole-tensor program this crate has ever baked. The offset is the
     /// only thing the chunked arm adds, so a corner-free program must not change form. The
@@ -9298,6 +9494,21 @@ fn scalarmul_scaled(
     let x = ins[0].name();
     let out_name = out.name();
     let rows = node_rows(name, &out)?;
+    // ⛔⛔⛔ A COLUMN-BLOCKED PIECE READS AND WRITES ITS OWN COLUMNS — the granite logits. The front end
+    // column-tiles a wide ScalarMul (`subtile_ir.rs`'s tiling set) into pieces that share one input and
+    // one output tensor, and this body emitted every piece at the tensors' bases. MEASURED on the card's
+    // granite suffix: `logits_scaling` over the 49155-wide lm_head output is seven pieces, all one
+    // descriptor writing columns `[0, 8192)`, so logits `8192..` were never written and the card almost
+    // never sampled an id above 8191. The corner is `elementwise`'s, through the same helper.
+    if ins[0].c_start != out.c_start {
+        return err(format!(
+            "{name}: the output t{}'s window starts at column {} but its input t{} sits at {} — a \
+             column-blocked piece reads and writes ONE window, so unequal corners would scale one \
+             operand's columns into another's.",
+            out.tid, out.c_start, ins[0].tid, ins[0].c_start,
+        ));
+    }
+    let corner = chunk_corner(rows, &out);
     // DEVICE width (the padding invariant): a ScalarMul on the padded logits `[.,49159]` must use the SAME
     // device width its producer matmul emitted (49664), not the logical 49159 (whose sub-stick 7 the dxp
     // scheduler rejects). `for_pointwise` == the producer's `for_output` for macs≥2^20 producers. A no-op
@@ -9315,7 +9526,9 @@ fn scalarmul_scaled(
     let op_name = format!("scalarmul_o{}", out.tid);
     let x_h = rbo(&x);
     let scale_h = rbo(&scale_name);
-    let inputs = [In::full(&x_h).ew(), In::scalar(&scale_h).ew()];
+    // `In::sliced` at corner 0 is field for field `In::full`, so a whole-tensor ScalarMul (piece 0, and
+    // every node narrower than one tiling block) emits the bytes it always did.
+    let inputs = [In::sliced(&x_h, corner).ew(), In::scalar(&scale_h).ew()];
     // ⭐ THE SAME `TileOp` `node_to_tile_ops`' ScalarMul arm declares: `out` at the DEVICE width
     // computed above, `n_operands: 2` (the scalar rides in the op, not as a tiled operand).
     let mut tile_op = pointwise_tile_op(rows, cols, 2);
@@ -9332,6 +9545,16 @@ fn scalarmul_scaled(
     // than the node has rows would be described with an index vector of the WRONG LENGTH — and the
     // length is what the idx→address program iterates.
     if let Some(g) = gather {
+        // A gathered operand is addressed through its index from the table's BASE, so a column window
+        // has no place on it.
+        if out.c_start != 0 {
+            return err(format!(
+                "{name}: a gathered ScalarMul at column corner {} of its output t{} — the gather \
+                 addresses its table from the base, so a column-blocked piece cannot be gathered. \
+                 Give the gathered node a whole-tensor region.",
+                out.c_start, out.tid,
+            ));
+        }
         if g.value_tid != ins[0].tid {
             return err(format!(
                 "{name}: the program gathers t{} but this node's tile operand is t{} — the index \
@@ -9443,7 +9666,7 @@ fn scalarmul_scaled(
         cols,
         &inputs,
         &rbo(&out_name),
-        0,
+        corner.into_raw_elems(),
         sym_id_base,
         layout,
     )])

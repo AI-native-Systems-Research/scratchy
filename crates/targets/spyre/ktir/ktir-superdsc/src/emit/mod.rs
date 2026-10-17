@@ -1761,6 +1761,10 @@ pub struct ArgBinding {
     /// ⭐ WHICH bytes, as blocks — see [`TouchedBlocks`]. `footprint_bytes` answers "how many", a
     /// different question that stopped having the same answer once one op writes a strided region.
     pub touched: TouchedBlocks,
+    /// Where in its buffer this operand starts, in device elements (`ArgView::offset_elems`, 0 for a
+    /// whole tensor). What [`crate::emit::lower_ktir_to_superdsc::column_windows_are_honoured`] holds
+    /// a column-blocked piece's operands to.
+    pub offset_elems: u32,
 }
 
 /// ⭐⭐⭐ AN OPERAND'S MATERIALIZED FOOTPRINT IN BYTES — the ONE derivation, for every caller.
@@ -2197,6 +2201,7 @@ impl EmittedOp {
                     is_input: v.is_input,
                     footprint_bytes: materialized_bytes(&v, iter),
                     touched: touched_blocks(&v, iter),
+                    offset_elems: v.offset_elems,
                 }
             })
             .collect();
