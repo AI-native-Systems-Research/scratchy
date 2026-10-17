@@ -2,6 +2,7 @@
 //! and how each number is written.
 
 use super::data::{Cell, Model, Rep, Scenario};
+use crate::charts::{Better, Side};
 use crate::thousands_f;
 
 /// The engines a run compares, in page order. Every chart pairs scratchy
@@ -71,10 +72,13 @@ impl Engine {
         }
     }
 
-    /// Its series colour in a chart: every chart pairs scratchy (s1) with one
-    /// other engine (s2), so the colours never run out.
-    pub fn series(self) -> &'static str {
-        if self == Engine::Scratchy { "s1" } else { "s2" }
+    /// Its side of a comparison chart: its line's name, and its fill's where
+    /// it is the faster of two.
+    pub fn side(self) -> Side {
+        Side {
+            line: self.label(),
+            fill: self.ahead(),
+        }
     }
 
     /// Its key in the run file (`cache_ladder_<key>`, `engine_models`).
@@ -202,27 +206,6 @@ impl Metric {
     /// How many times faster scratchy is than another engine at this metric.
     pub fn faster(self, scratchy: Option<f64>, other: Option<f64>) -> Option<f64> {
         self.better().faster(scratchy, other)
-    }
-}
-
-/// Which way a measurement is better: higher for a rate, lower for a time.
-#[derive(Clone, Copy, PartialEq)]
-pub enum Better {
-    Higher,
-    Lower,
-}
-
-impl Better {
-    /// How many times better scratchy's value is than another engine's.
-    pub fn faster(self, scratchy: Option<f64>, other: Option<f64>) -> Option<f64> {
-        let (s, o) = (
-            scratchy.filter(|v| *v != 0.0)?,
-            other.filter(|v| *v != 0.0)?,
-        );
-        Some(match self {
-            Better::Higher => s / o,
-            Better::Lower => o / s,
-        })
     }
 }
 

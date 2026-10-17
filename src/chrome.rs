@@ -273,7 +273,7 @@ pub fn top_links(root: Root, active: Option<Tab>) -> Element {
 
 /// Pages under the Performance tab, in left-nav order. A new page joins the
 /// left nav by adding one row here, without touching the others.
-const PERFORMANCE: [(&str, &str); 1] = [("metal.html", "Metal")];
+const PERFORMANCE: [(&str, &str); 2] = [("metal.html", "Metal"), ("spyre.html", "Spyre")];
 
 /// The Performance left nav: the page being built expands to its own in-page
 /// sections, given as (anchor, label); every other page is a link.

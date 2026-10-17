@@ -4,6 +4,7 @@
 //!   /architectures.html every model architecture's DSL, diffable
 //!   /book/              docs/*.md + CONTRIBUTING.md, rendered client-side by zero-md
 //!   /metal.html         Metal benchmark runs from site/data/metal/
+//!   /spyre.html         Spyre A/B sweeps from site/data/spyre/
 //!
 //! Every page is rendered here, at build time, with Dioxus's server-side
 //! renderer: the browser gets HTML, Carbon's web components, and a few lines
@@ -19,11 +20,13 @@
 mod archs;
 mod book;
 mod carbon;
+mod charts;
 mod chrome;
 mod highlight;
 mod landing;
 mod metal;
 mod serve;
+mod spyre;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -107,6 +110,7 @@ fn build(site: &Site) -> Result<(), String> {
     book::build(site, &assets)?;
     println!("{}", archs::build(site, &assets)?);
     println!("{}", metal::build(site, &assets)?);
+    println!("{}", spyre::build(site, &assets)?);
 
     let broken = book::broken_links(site)?;
     if !broken.is_empty() {

@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "date": "2026-10-17",
+  "contexts": { "~123": 123, "~1k": 1051, "~10k": 10086 },
+  "torch_spyre": {
+    "measured": "2026-10-14",
+    "host": "nickm4",
+    "harness": "vllm bench serve, out=256, prompts 123/1083/10300"
+  },
+  "triton_scratchy": {
+    "measured": "2026-10-17",
+    "commit": "b7c4c8896",
+    "harness": "scr serve, greedy, 64-128 tokens, prompts 1051/10086"
+  },
+  "cells": [
+    { "model": "granite-3.1-2b", "dtype": "fp16", "metric": "itl_ms", "conc": 1, "context": "~123",  "torch": 61.0,   "scratchy": 45.6 },
+    { "model": "granite-3.1-2b", "dtype": "fp16", "metric": "itl_ms", "conc": 1, "context": "~1k",   "torch": 63.0,   "scratchy": 46.6 },
+    { "model": "granite-3.1-2b", "dtype": "fp16", "metric": "itl_ms", "conc": 1, "context": "~10k",  "torch": 75.0,   "scratchy": 60.8 },
+    { "model": "granite-3.1-8b", "dtype": "fp16", "metric": "itl_ms", "conc": 1, "context": "~123",  "torch": 143.0,  "scratchy": 143.4 },
+    { "model": "granite-3.1-8b", "dtype": "fp16", "metric": "itl_ms", "conc": 1, "context": "~1k",   "torch": 150.0,  "scratchy": 150.3 },
+    { "model": "granite-3.1-8b", "dtype": "fp16", "metric": "itl_ms", "conc": 1, "context": "~10k",  "torch": 164.0,  "scratchy": 192.4 },
+
+    { "model": "granite-3.1-2b", "dtype": "fp16", "metric": "ttft_ms", "conc": 1, "context": "~123", "torch": 111.0,  "scratchy": 111.0 },
+    { "model": "granite-3.1-2b", "dtype": "fp16", "metric": "ttft_ms", "conc": 1, "context": "~1k",  "torch": 458.0,  "scratchy": 678.0 },
+    { "model": "granite-3.1-2b", "dtype": "fp16", "metric": "ttft_ms", "conc": 1, "context": "~10k", "torch": 8227.0, "scratchy": 8896.0 },
+    { "model": "granite-3.1-8b", "dtype": "fp16", "metric": "ttft_ms", "conc": 1, "context": "~10k", "torch": 13035.0, "scratchy": 17000.0 },
+
+    { "model": "granite-3.1-2b", "dtype": "fp16", "metric": "tok_s", "conc": 8, "context": "~1k", "torch": 95.5, "scratchy": 77.2,
+      "note": "measured 16 Oct, before the 17 Oct fixes (#566-#583)" },
+    { "model": "granite-3.1-8b", "dtype": "fp16", "metric": "tok_s", "conc": 8, "context": "~1k", "torch": 44.9, "scratchy": 28.9,
+      "note": "measured 16 Oct, before the 17 Oct fixes (#566-#583)" },
+
+    { "model": "granite-3.1-2b", "dtype": "fp8", "metric": "itl_ms", "conc": 1, "context": "~123", "torch": 258.0, "scratchy": 27.9,
+      "note": "torch-spyre's fp8 path is broken past short context (~10k hangs, TTFT floor 32-55 s), so short context is the only fair cell" },
+    { "model": "granite-3.1-8b", "dtype": "fp8", "metric": "itl_ms", "conc": 1, "context": "~123", "torch": 257.0, "scratchy": 82.2,
+      "note": "torch-spyre's fp8 path is broken past short context (~10k hangs, TTFT floor 32-55 s), so short context is the only fair cell" },
+    { "model": "granite-3.1-8b", "dtype": "fp8", "metric": "ttft_ms", "conc": 1, "context": "~123", "torch": 41700.0, "scratchy": 132.0 }
+  ],
+
+  "since": "#563–#583",
+  "moved": [
+    { "pr": "#566–#568", "what": "granite coherent on main at 2b and 8b, fp16 and fp8 — logits ≥ 8192 are now written, the first decode step no longer panics, and 8b fp8 stops reading unwritten o_proj copies." },
+    { "pr": "#573", "what": "dxp chunk explorer restored (#299 had disabled it for every group): 2b 10k TTFT 18.1 → 8.9 s; 8b 10k ITL 305 → 233 ms." },
+    { "pr": "#569", "what": "K/V kept in LX for decode: 2b ITL −14–15% at 10k." },
+    { "pr": "#583", "what": "hd128 decode group attention: 8b 10k ITL 233.8 → 192.3 ms, past #502's 204–225 ms band." },
+    { "pr": "#563 + #570", "what": "2b fp8 bake now 407 s cold (was 1,185 s), with a guard against regression." }
+  ],
+  "levers": [
+    { "lever": "8b moonshot", "work": "at parity (143.4 vs 143 ms) — gate/up run on 25 cores and k/v on 16, at 126 and 89 GB/s; filling all 32 cores is measured at −12.8 ms/step, toward the ≈110 ms floor the card's 149 GB/s ceiling sets." },
+    { "lever": "8b 10k decode", "work": "torch-spyre 1.17× ahead — hd128 K/V gather kept in LX, projected 192 → ~165–170 ms." },
+    { "lever": "2b ~1k TTFT", "work": "torch-spyre 1.48× ahead — a 27-row tail chunk pays a whole 256-row program." },
+    { "lever": "8b 10k TTFT", "work": "torch-spyre 1.30× ahead — attention plus the MLP's pointwise glue: a wide elementwise op split across cores by rows runs at half rate, and splitting its columns instead is measured 2.05× faster; 512-row prompt chunks." },
+    { "lever": "conc-8", "work": "not re-measured since the fixes; a full matched re-sweep is pending a free pod." }
+  ],
+  "notes": {
+    "decode": [
+      "Short-context parity is a shared floor: both stacks stream 16.4 GB of fp16 weights per token. Measured on the card (17 Oct), one fp16 matmul streams at most ~149 GB/s, and only across all 32 cores — the cost model's 204.8 GB/s peak is not reachable — so fp16 at one request bottoms out near 110 ms/token. The next step toward it is filling the cores scratchy's 8b gate/up and k/v projections leave idle."
+    ],
+    "fp8": [
+      "2b fp8 conc-8, 15 Oct run: 56.4 vs 8.25 tok/s — 6.8× (6.8–9.9× across conc 1–8)."
+    ]
+  },
+  "target": {
+    "label": "8b moonshot · short-context ITL",
+    "model": "granite-3.1-8b", "dtype": "fp16", "metric": "itl_ms", "conc": 1, "context": "~123",
+    "value": 110.0,
+    "why": "the card's measured ceiling: 16.36 GB/token at 149 GB/s, one fp16 matmul across all 32 cores"
+  }
+}
