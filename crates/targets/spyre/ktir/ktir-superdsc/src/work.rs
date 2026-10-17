@@ -40,6 +40,50 @@ pub fn core_split(size: u32, max_cores: u32) -> u32 {
     1
 }
 
+/// ⭐⭐⭐ THE ONE-ROW MATMUL'S CORE FILL — `(out, in)` cores for a matmul whose `mb` is one row, both in
+/// WHOLE STICKS of their own axis: the most cores that fit `max_cores`, and among those the widest
+/// `out` (so the reduction fan-in is the smallest that fills the machine).
+///
+/// ⛔ WHY AN OUT-ONLY SPLIT IS NOT ENOUGH. At one row the matmul is a pure weight stream, and the card
+/// streams at its ~149 GB/s HBM read ceiling ONLY when all 32 cores read. MEASURED on the card, one
+/// granite-3.1-8b fp16 projection per launch, device exec cycles off the response blocks:
+///
+/// | weight `[k, n]`        | out-only split | GB/s  | this fill      | GB/s  |
+/// |------------------------|----------------|-------|----------------|-------|
+/// | gate/up `[4096,12800]` | out25 (25 c)   | 126.0 | in4·out8 (32)  | 147.2 |
+/// | k/v `[4096,1024]`      | out16 (16 c)   |  89.2 | in2·out16 (32) | 145.9 |
+/// | down `[12800,4096]`    | out32          | 149.0 | out32 (same)   | 149.0 |
+///
+/// and the per-core rate is ~4.7 GB/s at every split, so the stream scales with the cores reading.
+/// 200 sticks (12800) has no divisor in 26..=32 and 16 sticks (1024) none above 16, which is the
+/// whole of why those two are slow: the cost is the stick count's arithmetic, not the shape.
+///
+/// ⭐ THE PARTITION STAYS EXACT. `out` divides the output stick count and `in` divides the reduction
+/// stick count, so each axis is cut into equal whole-stick slices that tile it with no remainder; the
+/// output is DISJOINT over `out` and SHARED over `in`, which is the reduction split `emit_sdsc_tiled`
+/// already admits (its disjoint-write guard is relaxed exactly for a split `in` the output does not
+/// carry), dxp PSUM-accumulating the partials. Kani: `kani_proofs::the_one_row_fill_*`.
+///
+/// When `out` alone already fills `max_cores` (or nothing larger exists) this returns `(out, 1)` —
+/// the out-only split, byte-identical to what one row emitted before the fill.
+pub fn one_row_core_fill(out_sticks: u32, in_sticks: u32, max_cores: u32) -> (u32, u32) {
+    let mut best = (core_split(out_sticks, max_cores), 1u32);
+    let mut o = 1u32;
+    while o <= out_sticks.min(max_cores) {
+        if out_sticks.is_multiple_of(o) {
+            let mut i = 1u32;
+            while i <= in_sticks.min(max_cores / o) {
+                if in_sticks.is_multiple_of(i) && (o * i, o) > (best.0 * best.1, best.0) {
+                    best = (o, i);
+                }
+                i += 1;
+            }
+        }
+        o += 1;
+    }
+    best
+}
+
 /// Stick count for an extent on the stick axis: ceil(size / 64) for fp16.
 pub fn stick_count(elems: u32) -> u32 {
     elems.div_ceil(FP16_ELEMS_PER_STICK)
@@ -847,4 +891,192 @@ pub fn matmul_split_plan(
         }
     }
     best
+}
+
+#[cfg(test)]
+mod one_row_fill_tests {
+    use super::{DeviceWidth, one_row_core_fill};
+
+    /// granite-3.1-8b's decode projections, the shapes the table on [`one_row_core_fill`] measured —
+    /// stick counts at the fp16 64-lane basis (`n/64`, `k/64`).
+    #[test]
+    fn the_one_row_fill_reaches_every_core_on_granite_8b() {
+        // gate/up [4096 -> 12800]: 200 out-sticks have no divisor in 26..=32.
+        assert_eq!(one_row_core_fill(200, 64, 32), (8, 4));
+        // k/v [4096 -> 1024]: 16 out-sticks.
+        assert_eq!(one_row_core_fill(16, 64, 32), (16, 2));
+        // q/o [4096 -> 4096] and down [12800 -> 4096]: 64 out-sticks already fill 32.
+        assert_eq!(one_row_core_fill(64, 64, 32), (32, 1));
+        assert_eq!(one_row_core_fill(64, 200, 32), (32, 1));
+        // lm_head, padded to 800 sticks (32 * 25).
+        assert_eq!(one_row_core_fill(800, 64, 32), (32, 1));
+    }
+
+    /// granite-3.1-2b: k/v is 512 wide (8 sticks) — out8 alone is a quarter of the machine.
+    #[test]
+    fn the_one_row_fill_reaches_every_core_on_granite_2b() {
+        assert_eq!(one_row_core_fill(8, 32, 32), (8, 4));
+        assert_eq!(one_row_core_fill(32, 32, 32), (32, 1));
+        assert_eq!(one_row_core_fill(128, 32, 32), (32, 1));
+    }
+
+    /// A one-stick reduction has nothing to give: the out-only split stands exactly as it was.
+    #[test]
+    fn a_one_stick_reduction_keeps_the_out_only_split() {
+        assert_eq!(one_row_core_fill(16, 1, 32), (16, 1));
+        assert_eq!(one_row_core_fill(32, 1, 32), (32, 1));
+    }
+
+    /// The Kani harness's property — the assertions `cargo test` can run on every build.
+    fn assert_exact_fill(os: u32, is: u32) {
+        let (o, i) = one_row_core_fill(os, is, 32);
+        assert!(o >= 1 && i >= 1, "({os},{is})");
+        assert_eq!(
+            os % o,
+            0,
+            "({os},{is}): out factor {o} divides the output sticks"
+        );
+        assert_eq!(
+            is % i,
+            0,
+            "({os},{is}): in factor {i} divides the reduction sticks"
+        );
+        assert!(o * i <= 32, "({os},{is}): {o}x{i} within the core budget");
+        assert!(
+            o * i >= super::core_split(os, 32),
+            "({os},{is}): never fewer cores than the out-only split"
+        );
+    }
+
+    /// Every dense one-row projection's `(out_sticks, in_sticks)` in every checked-in model config —
+    /// q/k/v/o, gate/up/down (dense and MoE expert widths) and the lm_head at its device width —
+    /// at the fp16 64-lane basis and the fp8 128-lane reduction basis. Read from the configs, so a new
+    /// model's widths are covered the moment its config lands.
+    fn config_projection_sticks() -> Vec<(u32, u32)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../models/arch/configs");
+        let mut pairs = std::collections::BTreeSet::new();
+        let mut files = 0usize;
+        for arch in std::fs::read_dir(&root).expect("the model configs directory") {
+            let arch = arch.expect("a config dir entry").path();
+            if !arch.is_dir() {
+                continue;
+            }
+            for f in std::fs::read_dir(&arch).expect("a config arch dir") {
+                let f = f.expect("a config file entry").path();
+                if f.extension().is_none_or(|e| e != "json") {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(
+                    &std::fs::read_to_string(&f).expect("a readable config"),
+                ) else {
+                    continue;
+                };
+                // A multimodal config nests its language model; read both levels.
+                for c in [&v, &v["text_config"]] {
+                    let g = |k: &str| c[k].as_u64().map(|x| x as u32);
+                    let Some(h) = g("hidden_size") else { continue };
+                    files += 1;
+                    let heads = g("num_attention_heads").unwrap_or(1).max(1);
+                    let hd = g("head_dim").unwrap_or(h / heads);
+                    let kvh = g("num_key_value_heads").unwrap_or(heads);
+                    let mut outs_from_h = vec![heads * hd, kvh * hd];
+                    let mut ffn = Vec::new();
+                    for k in [
+                        "intermediate_size",
+                        "moe_intermediate_size",
+                        "shared_expert_intermediate_size",
+                    ] {
+                        if let Some(x) = g(k) {
+                            ffn.push(x);
+                        }
+                    }
+                    outs_from_h.extend(ffn.iter().copied());
+                    if let Some(vocab) = g("vocab_size") {
+                        outs_from_h.push(DeviceWidth::for_output(1, vocab, h).get());
+                    }
+                    let mut shapes: Vec<(u32, u32)> = outs_from_h.iter().map(|&n| (n, h)).collect(); // [h -> n]
+                    shapes.push((h, heads * hd)); // o_proj [heads*hd -> h]
+                    shapes.extend(ffn.iter().map(|&f| (h, f))); // down [ffn -> h]
+                    for (n, k) in shapes {
+                        if n == 0 || k == 0 {
+                            continue;
+                        }
+                        let os = n.div_ceil(super::FP16_ELEMS_PER_STICK);
+                        pairs.insert((os, k.div_ceil(64)));
+                        pairs.insert((os, k.div_ceil(128)));
+                    }
+                }
+            }
+        }
+        assert!(
+            files > 100,
+            "read {files} configs — the configs directory moved?"
+        );
+        pairs.into_iter().collect()
+    }
+
+    /// The fill's partition law over EVERY real one-row projection shape in the checked-in configs,
+    /// and over every stick-count pair up to the largest one those configs reach — so the bound is
+    /// the configs' own, not a hand-picked range.
+    #[test]
+    fn the_one_row_fill_partitions_both_axes_exhaustively() {
+        let pairs = config_projection_sticks();
+        for &(os, is) in &pairs {
+            assert_exact_fill(os, is);
+        }
+        // And the dense sweep around them: every output stick count up to the largest a config reaches
+        // (gemma's 262,144-wide vocab is 4096 sticks) against every reduction count up to 64 — the
+        // law reads `in_sticks` only through its divisors <= 32, so 1..=64 holds every distinct
+        // divisor set below the core budget, and the config pairs above hold the real large ones.
+        let max_os = pairs.iter().map(|p| p.0).max().unwrap_or(1);
+        assert!(
+            max_os >= 4096,
+            "largest output axis {max_os} sticks — the vocab widths are missing"
+        );
+        for os in 1..=max_os {
+            for is in 1..=64 {
+                assert_exact_fill(os, is);
+            }
+        }
+    }
+
+    /// MOST CORES FIRST, then the widest `out`: a prime reduction whose only divisor past 1 is itself
+    /// still beats a half-empty machine (31 cores reading against 16).
+    #[test]
+    fn most_cores_wins_before_the_widest_out() {
+        assert_eq!(one_row_core_fill(16, 31, 32), (1, 31));
+        // Ties on cores go to the wider `out` — the smaller reduction fan-in.
+        assert_eq!(one_row_core_fill(32, 64, 32), (32, 1));
+        assert_eq!(one_row_core_fill(8, 64, 32), (8, 4));
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::one_row_core_fill;
+
+    /// ⭐ THE FILL IS AN EXACT PARTITION OF BOTH AXES, AND NEVER WORSE THAN THE OUT-ONLY SPLIT.
+    ///
+    /// For every output and reduction stick count up to the bound: each factor divides its own stick
+    /// count (so the equal whole-stick slices tile the axis with no remainder — disjoint and covering on
+    /// `out`, covering on `in`), the product fits the core budget, and the fill uses at least as many
+    /// cores as the out-only split it replaces.
+    #[kani::proof]
+    #[kani::unwind(34)]
+    fn the_one_row_fill_partitions_both_axes() {
+        let os: u32 = kani::any();
+        let is: u32 = kani::any();
+        kani::assume((1..=32).contains(&os));
+        kani::assume((1..=32).contains(&is));
+        let (o, i) = one_row_core_fill(os, is, 32);
+        assert!(o >= 1 && i >= 1);
+        assert!(os % o == 0, "out factor divides the output stick count");
+        assert!(is % i == 0, "in factor divides the reduction stick count");
+        assert!(o * i <= 32, "within the core budget");
+        assert!(
+            o * i >= super::core_split(os, 32),
+            "never fewer cores than out-only"
+        );
+    }
 }

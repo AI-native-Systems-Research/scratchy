@@ -339,11 +339,31 @@ fn matmul_split_map_inner(
                     map.insert(InAxis::NAME, s.k);
                 }
             } else {
-                // DECODE (m=1): keep the proven OUT-split (byte-identical to the coherent decode path). The
-                // cost model must NOT touch decode — a K-split here would regress the working lm_head.
-                let out_split = core_split(out_sticks(out), max_cores);
+                // ONE ROW: not the cost model (it prices M-tile shapes a single row does not have), but
+                // [`crate::work::one_row_core_fill`] — the out-only split, filled to every core with a
+                // whole-stick `in` factor where the output's stick count leaves cores idle. A one-row
+                // matmul is a weight stream that reaches the card's read ceiling only on all 32 cores;
+                // the measured table is on the fill. Where `out` alone already fills the cores (q/o/
+                // down/lm_head at granite-8b) the fill returns `(out, 1)` and the split is unchanged.
+                //
+                // The reduction's stick basis is the `in` dim's OWN format (128 for an fp8 operand, 64
+                // for fp16) — the same rule the prefill branch's whole-stick clamp states — so an fp8
+                // `in` slice is whole fp8 sticks by construction.
+                let in_stick_elems = dims
+                    .iter()
+                    .find(|d| d.name == InAxis::NAME)
+                    .map(|d| d.df.elems_per_stick())
+                    .unwrap_or(FP16_ELEMS_PER_STICK);
+                let (out_split, in_split) = crate::work::one_row_core_fill(
+                    out_sticks(out),
+                    in_.div_ceil(in_stick_elems),
+                    max_cores,
+                );
                 if out_split > 1 {
                     map.insert(OutAxis::NAME, out_split);
+                }
+                if in_split > 1 {
+                    map.insert(InAxis::NAME, in_split);
                 }
             }
         } else {
