@@ -1635,12 +1635,13 @@ impl Executor {
 
         crate::runtime::init_runtime().map_err(|e| anyhow!("flex runtime init failed: {e}"))?;
         lap("runtime-init", &mut t0);
-        // A DEDICATED created stream (not the default): predict destroys and recreates it each
-        // forward to DRAIN the RuntimeScheduler's per-stream fence deques, which are otherwise
-        // cleared only on destroy. A resident session's single long-lived stream accumulates a
-        // promise per launch (~34,680 compute launches/forward) → ~2.57 GB/forward host leak.
-        // The resident program/weight/KV allocations live on the runtime, not the stream, so
-        // recreating it leaves them intact.
+        // A DEDICATED created stream (not the default), and PERSISTENT for the session: the
+        // scheduler retires each op's fence from its per-stream deque at completion
+        // (SchedulerState::retire_fence), so the deques hold only in-flight fences instead of
+        // one entry per launch forever (a ~34,680-launch request used to retain ~4.5 MB of
+        // resolved fences, ~2.57 GB over a ~550-forward request — the growth the old
+        // per-forward recreate-and-destroy workaround papered over). The resident
+        // program/weight/KV allocations live on the runtime, not the stream.
         self.stream =
             Some(Stream::create().map_err(|e| anyhow!("prepare: could not create a stream: {e}"))?);
         lap("stream-create", &mut t0);
@@ -3415,16 +3416,15 @@ impl Executor {
         }
         timers().rb_seq.clear();
 
-        // LEAK FIX: recreate the stream each forward so the destroy DRAINS the scheduler's
-        // per-stream fence deques (~2.57 GB/forward otherwise → 200 GB OOM). The previous forward
-        // already synchronized (destroy also implicitly syncs); the resident weight/KV/program
-        // allocations live on the runtime, so device state survives.
+        // The stream is PERSISTENT: the scheduler retires each op's fence from its per-stream
+        // deque the moment that fence resolves (SchedulerState::retire_fence), so nothing
+        // per-forward accumulates on it and the old recreate-to-drain-every-forward workaround
+        // is gone. The previous forward already synchronized before returning (the trailing
+        // `synchronize` below waits out every op, H2Ds included), so dropping the recreate's
+        // implicit destroy-sync changes no ordering; the resident weight/KV/program
+        // allocations live on the runtime either way.
         let t_stream0 = Instant::now();
-        self.stream = None; // drop = destroyStream
-        self.stream =
-            Some(Stream::create().map_err(|e| anyhow!("predict: stream recreate failed: {e}"))?);
-
-        let t0 = Instant::now();
+        let t0 = t_stream0;
         let (h2d_note, h2d_bytes) = self.refill_activations(d)?;
         let t0b = Instant::now();
         if d.phase_time {

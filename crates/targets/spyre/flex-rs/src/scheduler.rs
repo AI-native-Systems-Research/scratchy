@@ -296,6 +296,53 @@ impl SchedulerState {
         fence
     }
 
+    /// Pop ONE fence — `done`, by identity — from (pipeline, id)'s deque.
+    ///
+    /// ⛔ WITHOUT THIS THE DEQUE GROWS FOREVER. The vendor's
+    /// `RuntimeScheduler` has the same shape (`runtime_scheduler.cpp` pushes
+    /// one fence per op in every `schedule()` overload, `issueBarrier` drains
+    /// only OTHER pipelines' deques, and only stream destroy — `:1058`'s
+    /// `stream_*_fence_.erase(id)` — ever removes entries), so a resolved
+    /// fence is never popped from its OWN pipeline's deque. That is tolerable
+    /// for the vendor's job-shaped stream lifetimes; it is not for ours: a
+    /// serving session holds ONE stream for its whole life, and every resolved
+    /// fence the deque retains is memory only `destroyStream` could ever
+    /// return — the growth the per-forward stream recreate in
+    /// `superdsc_exec.rs` used to paper over (and which this retires, so the
+    /// stream can stay persistent).
+    ///
+    /// Called from the completion wrapper AFTER `Fence::resolve`, so the only
+    /// fences it can remove are ones whose `wait_polling` is already a no-op:
+    /// `issue_barrier` waits each fence individually, so removing a resolved
+    /// one cannot skip any wait. A fence `issue_barrier` already drained
+    /// (cross-pipeline), or a stream `release_stream` already erased, is
+    /// simply absent — the identity lookup misses and this is a no-op.
+    fn retire_fence(&self, pipeline: PipelineId, id: StreamId, done: &Arc<Fence>) {
+        let _l = self.stream_fence_mtx.lock().unwrap();
+        let mut deques = self.fence_deque(pipeline).lock().unwrap();
+        if let Some(q) = deques.get_mut(&id)
+            && let Some(pos) = q.iter().position(|f| Arc::ptr_eq(f, done))
+        {
+            q.remove(pos);
+        }
+    }
+
+    /// Test-only observation of the per-stream fence deques
+    /// [`Self::retire_fence`] keeps bounded: how many fences (pipeline, id)'s
+    /// deque still holds. Production code has no caller — the deques are the
+    /// scheduler's own bookkeeping, and the law this pins is an INVARIANT
+    /// (resolved fences leave), not an interface.
+    #[cfg(test)]
+    fn fence_deque_len(&self, pipeline: PipelineId, id: StreamId) -> usize {
+        let _l = self.stream_fence_mtx.lock().unwrap();
+        self.fence_deque(pipeline)
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|q| q.len())
+            .unwrap_or(0)
+    }
+
     /// Port of the `stream_last_pipeline_[id] = target;` block.
     fn record_last_pipeline(&self, id: StreamId, pipeline: RuntimeOperationKind) {
         self.stream_pipeline_mtx
@@ -5008,8 +5055,20 @@ impl RuntimeScheduler {
         self.state.record_last_pipeline(id, recorded_kind);
 
         let fence_for_cb = fence.clone();
+        // The fence's own retirement key: `retire_fence` needs the deque it
+        // landed on, which is exactly (pipeline, id) as pushed above.
+        let state_for_cb = self.state.clone();
+        let pipeline_for_cb = pipeline;
+        let id_for_cb = id;
         let wrapped: CompletionCallback = Box::new(move |result| {
             fence_for_cb.resolve();
+            // RESOLVE, THEN RETIRE: retiring first would let a concurrent
+            // `issue_barrier` miss a fence whose wait had not yet become a
+            // no-op — a real behavior change. This order keeps the barrier
+            // contract intact: a barrier either sees the fence (and its wait
+            // returns immediately, it is resolved) or does not (it was
+            // retired, so its wait would have been the same no-op).
+            state_for_cb.retire_fence(pipeline_for_cb, id_for_cb, &fence_for_cb);
             on_complete(result);
         });
 
@@ -6345,6 +6404,48 @@ mod ported_cxx_tests {
         assert!(stream.query());
         stream.set_shutdown(true);
         assert!(stream.needs_shutdown());
+    }
+
+    /// NOT a C++ port — the vendor has no counterpart because the vendor
+    /// leaks the deque this pins (see `SchedulerState::retire_fence`: real
+    /// `runtime_scheduler.cpp` never pops a resolved fence from its own
+    /// pipeline's deque; only stream destroy erases entries). The
+    /// scratchy-specific law: a COMPLETED op's fence leaves its deque, so a
+    /// resident session's long-lived stream holds only in-flight fences
+    /// instead of growing until `destroyStream` — the growth the per-forward
+    /// stream recreate used to paper over. Both pipelines are asserted: the
+    /// compute deque (the decode step's 42 launches) and DMAI (the preamble
+    /// H2D), and the submission-FAILURE path is exercised too, because the
+    /// wrapper retires on error completions as well.
+    #[test]
+    fn resolved_fences_leave_their_own_deque() {
+        let (sched, stream) = mock_stream(RuntimeStreamMode::StrictOrdering);
+        let id = stream.stream_id();
+        for _ in 0..3 {
+            stream.launch_compute(dummy_compute(), None).unwrap();
+        }
+        stream.launch_h2d(dummy_h2d(), None).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(
+            sched.state.fence_deque_len(PipelineId::Compute, id),
+            0,
+            "completed compute ops must not leave fences on the compute deque"
+        );
+        assert_eq!(
+            sched.state.fence_deque_len(PipelineId::AsyncDmaI, id),
+            0,
+            "a completed H2D must not leave its fence on the DMAI deque"
+        );
+        // The failure path resolves AND retires the fence (the wrapper runs
+        // on error completions), so a failed submission is not a leak either.
+        sched.mock_set_throw_on_dma(true);
+        stream.launch_h2d(dummy_h2d(), None).unwrap();
+        let _ = stream.synchronize();
+        assert_eq!(
+            sched.state.fence_deque_len(PipelineId::AsyncDmaI, id),
+            0,
+            "a failed H2D's fence must be retired with the error completion"
+        );
     }
 
     /// Port of `H2DFenceResolvedOnSubmitFailure`
