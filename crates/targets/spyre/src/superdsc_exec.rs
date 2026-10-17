@@ -322,8 +322,9 @@ struct Timers {
     repeat_ms: BTreeMap<usize, (f64, f64, u64, String)>,
     /// Per-op harvested RB cycles — keyed like `prefix_ms` (same rung-numbering hazard).
     rb_cycles: BTreeMap<(usize, usize), RbOpCycles>,
-    /// The async-DMA pipelines' harvested cycles: the preamble-H2D and logits-D2H crossings, which
-    /// no op owns.
+    /// The DMA crossings' harvested cycles — the preamble-H2D and logits-D2H, which no op owns.
+    /// Since #544 both ride the COMPUTE pipeline; `rb_attribute` routes them here by the
+    /// direction `RbTiming::dma` carries, so these totals keep their pre-#544 meaning.
     rb_dmai: RbCycles,
     rb_dmao: RbCycles,
     rb_steps: u64,
@@ -334,8 +335,8 @@ struct Timers {
     /// `SCRATCHY_SDSC_RB_TIME`'s launch sequence: one entry per compute launch this forward, in
     /// launch order — ((rung length, op index), label). Lives here, not on the executor, because
     /// the launch loop holds `self` immutably across the stream reference. Cleared at the start of
-    /// every `predict` and zipped against the telemetry ring's id-sorted compute entries after the
-    /// step's synchronize; see [`rb_attribute`].
+    /// every `predict` and zipped against the telemetry ring's id-sorted op entries (compute CBs
+    /// minus the DMA crossings) after the step's synchronize; see [`rb_attribute`].
     rb_seq: Vec<((usize, usize), String)>,
     forwards: i64,
 }
@@ -3281,32 +3282,46 @@ impl Executor {
     /// the same cadence `group_time` does. The completion thread records every CB's five device
     /// cycle counts as it completes (`flex_rs::rb_telemetry`), so after the step's `synchronize`
     /// — the one the step already performs, no extra drain — the ring holds exactly this
-    /// forward's CBs. Compute-pipeline entries sorted by submission id zip 1:1 against
-    /// [`Timers::rb_seq`], which the launch loop filled in the same order. This is the attribution
-    /// `group_time`/`prefix_time` pay ~11% of decode to estimate, read for free instead.
+    /// forward's CBs. Op compute entries (DMA crossings excluded by
+    /// [`flex_rs::rb_telemetry::RbTiming::dma`]) sorted by
+    /// submission id zip 1:1 against [`Timers::rb_seq`], which the launch loop filled in the same
+    /// order. This is the attribution `group_time`/`prefix_time` pay ~11% of decode to estimate,
+    /// read for free instead.
     fn rb_attribute(&mut self) {
         let seq = std::mem::take(&mut timers().rb_seq);
         let mut entries = flex_rs::rb_telemetry::drain();
         let mut t = timers();
         t.rb_steps += 1;
-        // The async-DMA pipelines belong to no op — the preamble-H2D and logits-D2H crossings —
-        // so they accumulate wherever they arrive, attribution-free.
+        // The DMA crossings belong to no op — the preamble-H2D and logits-D2H — so they
+        // accumulate wherever they arrive, attribution-free. Since #544 those two ride the
+        // COMPUTE pipeline (they used to take the async ones), so `pipeline` alone no longer
+        // routes them: a Compute entry carrying a direction is a crossing and goes to its
+        // direction's total, exactly where it lived before the move.
         for e in &entries {
-            match e.pipeline {
-                flex_rs::scheduler::PipelineId::AsyncDmaI => t.rb_dmai.add_dmai(e.rb),
-                flex_rs::scheduler::PipelineId::AsyncDmaO => t.rb_dmao.add_dmao(e.rb),
-                flex_rs::scheduler::PipelineId::Compute => {}
+            match (e.pipeline, e.dma) {
+                (flex_rs::scheduler::PipelineId::AsyncDmaI, _)
+                | (
+                    flex_rs::scheduler::PipelineId::Compute,
+                    Some(flex_rs::dma::DmaDirection::HostToDevice),
+                ) => t.rb_dmai.add_dmai(e.rb),
+                (flex_rs::scheduler::PipelineId::AsyncDmaO, _)
+                | (
+                    flex_rs::scheduler::PipelineId::Compute,
+                    Some(flex_rs::dma::DmaDirection::DeviceToHost),
+                ) => t.rb_dmao.add_dmao(e.rb),
+                (flex_rs::scheduler::PipelineId::Compute, None) => {}
             }
         }
         // PIN THE MAPPING ON-CARD: raw per-CB records for the first few forwards, verbatim. The
         // aggregates below blend forwards (prefill and decode CBs differ) and cannot decide the
         // slot-to-name mapping; these can — an H2D CB lights the dmai slots, a D2H the dmao
         // slots, a compute CB the rest, and only same-domain slot pairs difference to durations.
+        // The compute-pipeline DMA crossings print here too (a Compute line in this print IS one
+        // — no op entry reaches it), so their own slot mapping gets pinned the same way.
         if t.rb_steps <= 3 {
-            for e in entries
-                .iter()
-                .filter(|e| !matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute))
-            {
+            for e in entries.iter().filter(|e| {
+                !matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute) || e.dma.is_some()
+            }) {
                 eprintln!(
                     "[sdsc-rbtime] fwd {} {:?} id {} slots {:?} power {}",
                     t.rb_steps,
@@ -3317,13 +3332,19 @@ impl Executor {
                 );
             }
         }
-        entries.retain(|e| matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute));
+        // The op entries: compute CBs that are not DMA crossings. A crossing kept here would
+        // both break the 1:1 zip below and bill the preamble/readback to whichever op it
+        // happened to sort next to.
+        entries.retain(|e| {
+            matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute) && e.dma.is_none()
+        });
         entries.sort_unstable_by_key(|e| e.id);
         if entries.len() != seq.len() {
             // LOUD, NOT SILENT: a mismatch means per-op attribution would be WRONG, not merely
             // missing — `repeat_probe` launches computes that are in the ring but not in the
-            // sequence, and a rotated ring loses launches from its front. Skip the attribution
-            // entirely; the DMA totals above stay honest either way.
+            // sequence, and a rotated ring loses launches from its front. (The DMA crossings
+            // are NOT a mismatch source anymore: `dma` excludes them above.) Skip the
+            // attribution entirely; the DMA totals above stay honest either way.
             eprintln!(
                 "[sdsc-rbtime] sequence mismatch: {} completed compute CBs vs {} recorded \
                  launches — per-op attribution SKIPPED for this forward",
