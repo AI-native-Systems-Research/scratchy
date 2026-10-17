@@ -313,7 +313,12 @@ struct Timers {
     submit_ms: f64,
     prep_ms: f64,
     submit_calls: u64,
-    barrier_launches: u64,
+    /// Launches whose submission carried `pipeline_barrier` — a HOST fence call
+    /// (`issue_barrier` waits the OTHER pipelines' fences; a no-op for all-compute runs), NOT a
+    /// device barrier. Compute CBs are always built with the CTRL barrier bit clear
+    /// (`CtrlSection::new(tag, false)`); what orders the device is the ring FIFO
+    /// (STRICT_ORDERING) plus the always-set `cmpt.sync`. Pod-flex @ed96487 audit, 2026-10-17.
+    host_fence_launches: u64,
     /// 🛑 KEYED BY (RUNG LENGTH, INDEX), NOT INDEX ALONE. A forward calls the launch loop once per
     /// rung — the body, but also the prefix and suffix lists — and each restarts its numbering at 0,
     /// so a map keyed on the index alone averages a 20-op body's group 2 with a 3-op prefix's.
@@ -2722,7 +2727,7 @@ impl Executor {
                     t.prep_ms += (st0 - gt0).as_secs_f64() * 1e3;
                     t.submit_calls += 1;
                     if barrier {
-                        t.barrier_launches += 1;
+                        t.host_fence_launches += 1;
                     }
                 } else {
                     stream
@@ -2731,8 +2736,9 @@ impl Executor {
                 }
 
                 // DEFAULT-OFF: skipping the per-group drain removes the ~868-ops/layer
-                // serialization — pipeline_barrier + STRICT_ORDERING preserve the on-device
-                // dataflow (pod-confirmed coherent and ~11% faster).
+                // serialization — STRICT_ORDERING (ring FIFO) plus the always-set cmpt.sync
+                // preserve the on-device dataflow (pod-confirmed coherent and ~11% faster);
+                // `pipeline_barrier` itself is a host fence call, a no-op for all-compute runs.
                 if d.perop_sync {
                     let _ = stream.synchronize();
                 }
@@ -2837,7 +2843,7 @@ impl Executor {
                 t.submit_ms += (st1 - st0).as_secs_f64() * 1e3;
                 t.submit_calls += 1;
                 if batch_barrier {
-                    t.barrier_launches += 1;
+                    t.host_fence_launches += 1;
                 }
             }
         }
@@ -4569,10 +4575,10 @@ fn report_phase_timers(compute_ms: f64) {
     // cost.
     if d.submit_time && t.submit_calls > 0 {
         eprintln!(
-            "[sdsc-phase]   host: {} launches ({} with a device-wide barrier) | submit={:.2} ms \
+            "[sdsc-phase]   host: {} launches ({} with a host fence call) | submit={:.2} ms \
              ({:.1} us/ea) prep={:.2} ms ({:.1} us/ea) | = {:.0}% of compute",
             t.submit_calls,
-            t.barrier_launches,
+            t.host_fence_launches,
             t.submit_ms,
             1000.0 * t.submit_ms / t.submit_calls as f64,
             t.prep_ms,
@@ -4582,7 +4588,7 @@ fn report_phase_timers(compute_ms: f64) {
         t.submit_ms = 0.0;
         t.prep_ms = 0.0;
         t.submit_calls = 0;
-        t.barrier_launches = 0;
+        t.host_fence_launches = 0;
     }
     // THE HARVEST, DRAIN-FREE: per-op device cycles the response blocks carried all along. This
     // section rides the phase line (turn `SCRATCHY_SDSC_RB_TIME` on WITH `phase_time` for the
