@@ -543,6 +543,9 @@ fn gdn_conv1d_varlen_matches_reference() {
             ConstantValue::uint(0, conv_dim as u32),
             ConstantValue::uint(1, kernel as u32),
             ConstantValue::uint(5, 0),
+            // A 2-token block: three blocks for the 6 rows, the later ones seeding their
+            // windows from x — the blocked form's path past the sequence's head.
+            ConstantValue::uint(6, 2),
         ],
     );
     let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
@@ -564,8 +567,8 @@ fn gdn_conv1d_varlen_matches_reference() {
         MTLSize {
             width: 1,
             height: groups_y,
-            depth: 1,
-        }, // x = num_seqs
+            depth: t.div_ceil(2),
+        }, // x = num_seqs, z = token blocks
         MTLSize {
             width: 1,
             height: tg_y,
@@ -614,6 +617,8 @@ fn gdn_conv1d_varlen_continuity() {
             ConstantValue::uint(0, conv_dim as u32),
             ConstantValue::uint(1, kernel as u32),
             ConstantValue::uint(5, 0),
+            // A 2-token block: the 6-token run walks three blocks, the 1-token continuation one.
+            ConstantValue::uint(6, 2),
         ],
     );
     let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
@@ -636,7 +641,7 @@ fn gdn_conv1d_varlen_continuity() {
             MTLSize {
                 width: 1,
                 height: groups_y,
-                depth: 1,
+                depth: num_tokens.div_ceil(2),
             },
             MTLSize {
                 width: 1,
@@ -1367,6 +1372,7 @@ fn gdn_decode_is_the_conv_scan_norm() {
             ConstantValue::uint(0, conv_dim as u32),
             ConstantValue::uint(1, kernel as u32),
             ConstantValue::uint(5, u32::from(drafts)),
+            ConstantValue::uint(6, 1),
         ];
         let conv = build("gdn_conv1d_varlen", "gdn_conv1d_varlen_f32", conv_consts);
         let conv_out = buf_zero_f32(&device, t * conv_dim);
@@ -1546,6 +1552,9 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
             ConstantValue::uint(0, conv_dim as u32),
             ConstantValue::uint(1, kernel as u32),
             ConstantValue::uint(5, u32::from(rows.0)),
+            // A 2-token block: the verify and resumed runs walk more than one, the later blocks
+            // seeding their windows from x past the lane's checkpoint.
+            ConstantValue::uint(6, 2),
         ],
     );
     let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
@@ -1580,7 +1589,7 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
             MTLSize {
                 width: 1,
                 height: 1,
-                depth: 1,
+                depth: num_tokens.div_ceil(2),
             },
             MTLSize {
                 width: 1,
@@ -2435,6 +2444,8 @@ fn gdn_conv1d_varlen_saves_and_restores_snapshots() {
             ConstantValue::uint(0, conv_dim as u32),
             ConstantValue::uint(1, kernel as u32),
             ConstantValue::uint(5, u32::from(drafts)),
+            // A 2-token block: the saves land mid-block and on block boundaries alike.
+            ConstantValue::uint(6, 2),
         ];
         let width = match mamba {
             false => conv_dim,
@@ -2457,7 +2468,7 @@ fn gdn_conv1d_varlen_saves_and_restores_snapshots() {
             let [cu, si, code] = second_of_two(&device, n, seq, start);
             let mut bufs = vec![&out, &x_buf, &w_buf, &state, &cu, &si, &code, &bias_buf];
             bufs.extend((drafts > 0).then_some(&unread_lanes));
-            let (grid, threads) = (dims(2, 1, 1), dims(1, conv_dim, 1));
+            let (grid, threads) = (dims(2, 1, n.div_ceil(2)), dims(1, conv_dim, 1));
             common::dispatch_threadgroups(&device, &pipeline, &bufs, grid, threads).then(|| {
                 let after = vec![read_f32(&state, pools[0].len())];
                 (read_f32(&out, n * conv_dim), after)

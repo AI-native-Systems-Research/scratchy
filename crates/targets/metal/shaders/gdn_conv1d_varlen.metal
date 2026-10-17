@@ -5,11 +5,13 @@
 // ONE unified kernel subsuming both CUDA kernels (gdn_conv1d_kernels.cu):
 // `causal_conv1d_update_kernel` (decode, seqlen==1) and
 // `causal_conv1d_prefill_kernel` (prefill, seqlen large). One thread owns one
-// (sequence, channel) pair and walks that sequence's tokens *sequentially*,
-// keeping the causal window in registers — so there is NO cross-thread race on
-// `conv_state` (the CUDA prefill kernel races: it writes state while sibling
-// token-threads read it; here each thread reads old state once at the start and
-// writes new state once at the end).
+// (sequence, channel, GDN_CONV_BLOCK-token block) and walks its block's tokens
+// sequentially, keeping the causal window in registers — so there is NO
+// cross-thread race on `conv_state` (the CUDA prefill kernel races: it writes
+// state while sibling token-threads read it; here only the block running a
+// sequence's last row writes state, once, and only the first block reads the
+// seed). Blocks past a sequence's end early out: the grid's Z is the whole
+// step's rows over GDN_CONV_BLOCK, always at least any one sequence's blocks.
 //
 // The ring update is the CORRECT general shift (matches the decode kernel for
 // seqlen==1 and the prefill kernel for seqlen>=state_len): the new state is the
@@ -20,7 +22,10 @@
 //
 //   out[t,c] = SiLU( Σ_{j} w[c,j] · x_pad[t-(K-1)+j, c] )
 //
-// left-padded from the per-sequence `conv_state` ring (or zero when fresh).
+// left-padded from the per-sequence `conv_state` ring (or zero when fresh). A
+// block past the sequence's head seeds its window from `x` directly — the seed
+// and the rows before a block are one stream, `[seed ++ x]`, its window at row
+// t0 the last `state_len` entries before t0.
 //
 // State layout (cuda-symmetric): conv_state[slots, conv_dim, state_len], state_len =
 //   kernel-1, base = (slot*conv_dim + d)*state_len, oldest-first. `state_indices[seq]` is the
@@ -47,8 +52,10 @@
 //   GDN_CONV_HAS_BIAS  — optional: add `bias[c]` (buffer 7; unset: no bias, buffer 7 unread)
 //   GDN_CONV_DRAFTS    — the drafts each sequence of a verify step carries (`SPEC_DRAFTS`); 0:
 //                        `conv_lanes` (buffer 8) unread
+//   GDN_CONV_BLOCK     — the tokens a thread owns (the grid's Z is the step's rows over it)
 //
-// Dispatch: grid (num_seqs, ceil(conv_dim/tg), 1); one thread per (seq, channel).
+// Dispatch: grid (num_seqs[set via seq_axis=X], ceil(conv_dim/tg),
+// ceil(rows/GDN_CONV_BLOCK) [scaled by num_tokens]); one thread per (seq, channel, block).
 
 #include <metal_stdlib>
 #include "baked.h"
@@ -62,6 +69,7 @@ SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_CONV_IN_STRIDE, 2);
 SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_CONV_IN_OFFSET, 3);
 SCRATCHY_CONSTANT_OPTIONAL(bool, GDN_CONV_HAS_BIAS, 4);
 SCRATCHY_CONSTANT(uint, GDN_CONV_DRAFTS, 5);
+SCRATCHY_CONSTANT(uint, GDN_CONV_BLOCK, 6);
 
 constant constexpr uint GDN_CONV_X_STRIDE = GDN_CONV_IN_STRIDE_SET ? GDN_CONV_IN_STRIDE : GDN_CONV_DIM;
 
@@ -117,53 +125,68 @@ template <typename T>
     wlocal[ki] = float(w[d * kernel_size + ki]);
   }
 
-  // Seed the causal window from the slot, a restore's snapshot, or the lane's checkpoint at the
-  // last kept row (zero when fresh).
+  // The seed the sequence's first block walks in from: its slot, a restore's snapshot, or the
+  // lane's checkpoint at the last kept row (zero when fresh).
   device float* state_ptr = ring(seq_slots.slot);
   device float* lane_ptr =
       conv_lanes + ((code >> 17) * (GDN_CONV_DRAFTS + 1u) * conv_dim + d) * state_len;
   const device float* start_ptr =
       replays ? lane_ptr + (start - 2u) * entry_len : ring(gdn_start_slot(seq_slots, start));
+
+  // This thread's block; blocks past the sequence's end have nothing to do.
+  int t0 = int(tgid.z) * int(GDN_CONV_BLOCK);
+  if (t0 >= seqlen) {
+    return;
+  }
+  const int t_end = metal::min(t0 + int(GDN_CONV_BLOCK), seqlen);
+
+  // Seed the causal window: the last `state_len` entries of `[seed ++ x]` before row t0 — the
+  // seed's own entries while t0 still sits inside it, `x` rows past it.
   float window[GDN_CONV_KMAX];
   for (uint ki = 0; ki < state_len; ki++) {
-    window[ki] = start == 1u ? 0.0f : start_ptr[ki];
+    uint p = uint(t0) + ki;
+    window[ki] = p < state_len
+                     ? (start == 1u ? 0.0f : start_ptr[p])
+                     : float(x[(uint(base) + p - state_len) * GDN_CONV_X_STRIDE
+                               + GDN_CONV_IN_OFFSET + d]);
   }
 
-  // Walk the sequence's tokens; the window slides through registers — in stretches, a save's
-  // store of the window after each but the last (`gdn_state.h`).
+  // Walk the block's tokens; the window slides through registers, a save storing its snapshot
+  // after the row it runs through (`gdn_state.h`).
   const float b = GDN_CONV_HAS_BIAS ? float(bias[d]) : 0.0f;
-  int t = 0;
-  for (uint stretch = 0; stretch <= GDN_SAVES; stretch++) {
-    for (const int stop = gdn_stretch_end(saves_through, stretch, seqlen); t < stop; t++) {
-      float x_t = float(x[(uint(base + t)) * GDN_CONV_X_STRIDE + GDN_CONV_IN_OFFSET + d]);
-      float sum = b + x_t * wlocal[state_len];
-      for (uint ki = 0; ki < state_len; ki++) {
-        sum += window[ki] * wlocal[ki];
-      }
-      conv_out[(uint(base + t)) * conv_dim + d] = sum / (1.0f + exp(-sum));  // SiLU
-      // Shift window left, insert the new input.
-      for (uint ki = 0; ki + 1 < state_len; ki++) {
-        window[ki] = window[ki + 1];
-      }
-      if (state_len > 0) {
-        window[state_len - 1] = x_t;
-      }
-      for (uint ki = 0; uint(t) < checkpoint_rows && ki < state_len; ki++) {
-        lane_ptr[uint(t) * entry_len + ki] = window[ki];
-      }
+  for (int t = t0; t < t_end; t++) {
+    float x_t = float(x[(uint(base + t)) * GDN_CONV_X_STRIDE + GDN_CONV_IN_OFFSET + d]);
+    float sum = b + x_t * wlocal[state_len];
+    for (uint ki = 0; ki < state_len; ki++) {
+      sum += window[ki] * wlocal[ki];
     }
-    const int sv = gdn_stretch_save(saves_through, stretch, seqlen);
-    if (sv >= 0) {
-      device float* snap = ring(state_indices[seq].saves[sv].y);
-      for (uint ki = 0; ki < state_len; ki++) {
-        snap[ki] = window[ki];
+    conv_out[(uint(base + t)) * conv_dim + d] = sum / (1.0f + exp(-sum));  // SiLU
+    // Shift window left, insert the new input.
+    for (uint ki = 0; ki + 1 < state_len; ki++) {
+      window[ki] = window[ki + 1];
+    }
+    if (state_len > 0) {
+      window[state_len - 1] = x_t;
+    }
+    for (uint ki = 0; uint(t) < checkpoint_rows && ki < state_len; ki++) {
+      lane_ptr[uint(t) * entry_len + ki] = window[ki];
+    }
+    for (uint j = 0; j < GDN_SAVES; j++) {
+      if (gdn_saves_after(saves_through, j, t)) {
+        device float* snap = ring(seq_slots.saves[j].y);
+        for (uint ki = 0; ki < state_len; ki++) {
+          snap[ki] = window[ki];
+        }
       }
     }
   }
 
-  // Persist the last `state_len` inputs as the new ring (correct general shift).
-  for (uint ki = 0; ki < state_len; ki++) {
-    state_ptr[ki] = window[ki];
+  // The block that ran the sequence's last row persists the last `state_len` inputs as the new
+  // ring (correct general shift).
+  if (t_end == seqlen) {
+    for (uint ki = 0; ki < state_len; ki++) {
+      state_ptr[ki] = window[ki];
+    }
   }
 }
 

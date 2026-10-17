@@ -5122,6 +5122,7 @@ fn lower_one(
                 layer_id,
                 layout.conv_out,
                 None,
+                bucket_m,
             ));
 
             // 2. The gating and the delta-rule scan → o (f32 scratch).
@@ -5189,6 +5190,7 @@ fn lower_one(
                     },
                     weight(WeightTensor::GdnConvBias, 7),
                 )),
+                bucket_m,
             )];
             cmds.extend(recurrent_scan(
                 p,
@@ -6443,8 +6445,9 @@ impl ColumnSlice {
 
 /// A recurrent mixer's causal depthwise conv1d (+SiLU), varlen + stateful (`gdn_conv1d_varlen`),
 /// into the f32 scratch `conv_out`: over GDN's qkv rows, or over the `xBC` column slice of
-/// Mamba-2's in-projection rows with its conv bias (`sliced`). Grid (num_seqs[set via
-/// seq_axis=X], ceil(conv_dim/tg_y), 1).
+/// Mamba-2's in-projection rows with its conv bias (`sliced`). One thread a (sequence, channel,
+/// `GDN_CONV_BLOCK`-token block) — grid (num_seqs[set via seq_axis=X], ceil(conv_dim/tg_y),
+/// ceil(bucket_m/GDN_CONV_BLOCK) [scaled by num_tokens]; blocks past a sequence's end early out).
 fn recurrent_conv(
     p: &MetalModelConsts,
     input: Binding,
@@ -6452,6 +6455,7 @@ fn recurrent_conv(
     layer: super::ids::LayerId,
     conv_out: u32,
     sliced: Option<(ColumnSlice, Binding)>,
+    bucket_m: u32,
 ) -> LoweredCommand {
     use crate::tape::ids::BucketM;
     use crate::tape::lowered::{MScaleAxis, MScaling};
@@ -6486,6 +6490,7 @@ fn recurrent_conv(
         constants.push(ConstantValue::boolean(4, true));
         bindings.push(bias);
     }
+    constants.push(ConstantValue::uint(6, GDN_CONV_BLOCK));
     let tg_y = conv_dim.clamp(1, THREADS_PER_GROUP);
     LoweredCommand {
         kernel: KernelId::GatedDeltaNet,
@@ -6493,12 +6498,14 @@ fn recurrent_conv(
         function: gdn_conv1d_varlen_static_name(dequant_dtype_for(p)),
         constants: baked(constants),
         dispatch: DispatchShape {
-            threadgroups: (1, conv_dim.div_ceil(tg_y), 1),
+            threadgroups: (1, conv_dim.div_ceil(tg_y), bucket_m.div_ceil(GDN_CONV_BLOCK)),
             threads_per_threadgroup: (1, tg_y, 1),
-            // bucket_m=1 no-ops the token scale; seq_axis SETS X = num_seqs.
+            // Z scales with the step's tokens (one layer per GDN_CONV_BLOCK of them, always at
+            // least any one sequence's blocks — blocks past a sequence's end early out); seq_axis
+            // SETS X = num_seqs.
             m_scaling: Some(MScaling {
-                axis: MScaleAxis::X,
-                bucket_m: BucketM(1),
+                axis: MScaleAxis::Z,
+                bucket_m: BucketM(bucket_m),
                 seq_axis: Some(MScaleAxis::X),
             }),
         },
@@ -6506,6 +6513,11 @@ fn recurrent_conv(
         gemm_dims: None,
     }
 }
+
+/// The conv's tokens a thread owns (`GDN_CONV_BLOCK`, its baked constant slot 6): the token-block
+/// parallelism of `gdn_conv1d_varlen` — the grid's Z is the step's rows over it, each thread
+/// walking its block with the causal window in registers.
+const GDN_CONV_BLOCK: u32 = 32;
 
 /// The scans' constant slot of the drafts each sequence of a verify step carries
 /// (`GDN_SCAN_DRAFTS`): what a plain step's kernels, which keep no draft state, do not take.
@@ -9028,7 +9040,8 @@ mod tests {
                     C::uint(5, 0),
                     C::uint(2, 328),
                     C::uint(3, 128),
-                    C::boolean(4, true)
+                    C::boolean(4, true),
+                    C::uint(6, 32)
                 ]
             );
             let conv_out = "scratch 0".to_owned();
