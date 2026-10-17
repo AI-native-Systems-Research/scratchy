@@ -518,6 +518,125 @@ fn gdn_rms_norm_gated_sums_alike_at_every_covering_threadgroup() {
     }
 }
 
+/// `gdn_rms_norm_gated_simd_f32` — the simdgroup form the lowering picks for a power-of-two
+/// width in [32, 256] — is BIT-IDENTICAL to the threadgroup form at that width's covering
+/// threadgroup: the lane layout (a simdgroup a row, `width / 32` strided elements a lane)
+/// reproduces the covering threadgroup's reduction tree exactly, its top levels as register
+/// adds and its bottom five as simd shuffles. Both rows-a-threadgroup layouts the lowering
+/// chooses (four when a token's rows divide by four, else one), and the Mamba-2
+/// gate-before-norm form with its strided `z` and group-spanning weight.
+#[test]
+fn gdn_rms_norm_gated_simd_is_bit_identical_to_the_threadgroup_form() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
+
+    // (width, groups a token, rows-a-threadgroup layouts to try): the GDN form (one value head
+    // a row) at every dispatchable width, then the Mamba-2 form (gate before norm, `z` a
+    // strided column slice, weight spanning the token's rows) at the parity-tiny lowering's
+    // two-groups-a-token shape and at four.
+    let cases: &[(u32, u32, &[u32])] = &[
+        (32, 1, &[4, 1]),
+        (64, 1, &[4, 1]),
+        (128, 1, &[4, 1]),
+        (256, 1, &[4, 1]),
+        (64, 2, &[1]),
+        (128, 4, &[4]),
+    ];
+    let rows = 512usize;
+    let eps = 1e-6f32;
+    let shifted = |n: usize, by: usize| fill(n + by)[by..].to_vec();
+    for &(d, groups, rpts) in cases {
+        let mamba = groups > 1;
+        // The Mamba-2 `z`: `rows / groups` in-projection rows, each `stride` wide, the norm's
+        // columns a group slice of one — padding the stride catches a stride bug.
+        let stride = groups * d + 8;
+        let x = shifted(rows * d as usize, 7);
+        let z = if mamba {
+            shifted((rows / groups as usize) * stride as usize, 3)
+        } else {
+            shifted(rows * d as usize, 3)
+        };
+        let weight = shifted(groups as usize * d as usize, 5);
+        let base = vec![
+            ConstantValue::uint(0, d),
+            ConstantValue::uint(1, rows as u32),
+            ConstantValue::float(2, eps),
+        ];
+        let mamba_consts = || {
+            base.clone()
+                .into_iter()
+                .chain([
+                    ConstantValue::uint(3, stride),
+                    ConstantValue::uint(4, groups),
+                    ConstantValue::boolean(5, true),
+                ])
+                .collect::<Vec<_>>()
+        };
+        let (x_buf, z_buf, w_buf) = (
+            buf_f32(&device, &x),
+            buf_f32(&device, &z),
+            buf_f32(&device, &weight),
+        );
+        let run =
+            |function: &'static str, constants: Vec<ConstantValue>, grid: usize, tg: usize| {
+                let key = PipelineKey::new("gdn_rms_norm_gated", function, constants);
+                let pipeline = baked_build(&cache, &key).expect("norm pipeline");
+                let out = buf_zero_f32(&device, rows * d as usize);
+                let bufs = [&out, &x_buf, &z_buf, &w_buf];
+                common::dispatch_threadgroups(
+                    &device,
+                    &pipeline,
+                    &bufs,
+                    MTLSize {
+                        width: grid,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: tg,
+                        height: 1,
+                        depth: 1,
+                    },
+                )
+                .then(|| {
+                    read_f32(&out, rows * d as usize)
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
+                })
+            };
+        // The threadgroup form at the covering threadgroup is the oracle.
+        let consts = if mamba { mamba_consts() } else { base.clone() };
+        let Some(want) = run(
+            "gdn_rms_norm_gated_f32",
+            consts,
+            rows,
+            d.next_power_of_two() as usize,
+        ) else {
+            return;
+        };
+        for &rpt in rpts {
+            let mut simd_consts = if mamba { mamba_consts() } else { base.clone() };
+            simd_consts.push(ConstantValue::uint(6, rpt));
+            assert_eq!(
+                run(
+                    "gdn_rms_norm_gated_simd_f32",
+                    simd_consts,
+                    rows / rpt as usize,
+                    32 * rpt as usize
+                ),
+                Some(want.clone()),
+                "width {d}, groups {groups}, {rpt} rows a threadgroup"
+            );
+        }
+    }
+}
+
 /// `gdn_conv1d_varlen_f32`, single fresh sequence (is_fresh=1, zero left-pad):
 /// must match `cpu_golden::gdn_causal_conv1d`. Config conv_dim=32, kernel=4.
 #[test]

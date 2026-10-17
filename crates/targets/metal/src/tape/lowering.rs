@@ -5935,6 +5935,15 @@ fn gdn_rms_norm_gated_static_name(dtype: DequantDtype) -> &'static str {
     }
 }
 
+/// The simdgroup form of [`gdn_rms_norm_gated_static_name`]'s kernel (see
+/// [`recurrent_norm`] for when the lowering picks it).
+fn gdn_rms_norm_gated_simd_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "gdn_rms_norm_gated_simd_f16",
+        DequantDtype::Bf16 => "gdn_rms_norm_gated_simd_bf16",
+    }
+}
+
 /// Dtype the gain/bias buffers of a norm bundle actually hold on the
 /// device — the LOADER decides it, so it follows the bundle kind:
 ///
@@ -6716,6 +6725,16 @@ fn recurrent_scan(
 /// of two covering `width` (any power of two ≥ width sums in the same order); scales X. GDN
 /// norms per value head after the gate; Mamba-2 (`z_stride` = its in-projection row, `z` that
 /// row's leading columns) gates first and norms per group, its weight spanning the row.
+///
+/// A `width` that is a power of two in [32, 256] dispatches the simdgroup form
+/// (`gdn_rms_norm_gated_simd`, bit-identical — see the shader): one simdgroup a row,
+/// `width / 32` strided elements a lane, `rows_per_tg` rows a threadgroup. Four rows a
+/// threadgroup when `per_token` is a multiple of four, so the X-axis `m_scaling` (which scales
+/// the baked baseline by `ceil(baseline · n / bucket_m)`) covers exactly the live rows: the
+/// baseline `rows / 4` is exact, and `per_token · n` stays divisible by four. Otherwise one row
+/// a threadgroup — the baseline is the row count itself, exact as before. Anything else (a
+/// non-power-of-two width, or one outside [32, 256]) keeps the threadgroup form and its
+/// covering dispatch.
 fn recurrent_norm(
     p: &MetalModelConsts,
     (width, per_token): (u32, u32),
@@ -6739,14 +6758,36 @@ fn recurrent_norm(
             ConstantValue::boolean(5, true),
         ]);
     }
+    // The simdgroup form's eligibility and rows-a-threadgroup, as one decision
+    // the shader's layout contract rests on (see the doc above).
+    let simd_form = width.is_power_of_two() && (32..=256).contains(&width);
+    let rows_per_tg = if simd_form && per_token % 4 == 0 {
+        4
+    } else {
+        1
+    };
+    let (function, threadgroups_x, threads_x) = if simd_form {
+        constants.push(ConstantValue::uint(6, rows_per_tg));
+        (
+            gdn_rms_norm_gated_simd_static_name(dequant_dtype_for(p)),
+            rows / rows_per_tg,
+            32 * rows_per_tg,
+        )
+    } else {
+        (
+            gdn_rms_norm_gated_static_name(dequant_dtype_for(p)),
+            rows,
+            width.next_power_of_two().min(THREADS_PER_GROUP),
+        )
+    };
     LoweredCommand {
         kernel: KernelId::GatedDeltaNet,
         library: "gdn_rms_norm_gated",
-        function: gdn_rms_norm_gated_static_name(dequant_dtype_for(p)),
+        function,
         constants: baked(constants),
         dispatch: DispatchShape {
-            threadgroups: (rows, 1, 1),
-            threads_per_threadgroup: (width.next_power_of_two().min(THREADS_PER_GROUP), 1, 1),
+            threadgroups: (threadgroups_x, 1, 1),
+            threads_per_threadgroup: (threads_x, 1, 1),
             m_scaling: Some(MScaling {
                 axis: MScaleAxis::X,
                 bucket_m: BucketM(bucket_m),
@@ -8740,7 +8781,9 @@ mod tests {
         let (only, unless) = (Some(OnlyIfDecodeStep), Some(UnlessDecodeStep));
         let (decode, conv) = ("gdn_decode_bf16", "gdn_conv1d_varlen_bf16");
         let (simd, pipe) = ("gdn_scan_simd_bf16", "gdn_scan_pipelined_bf16");
-        let norm = "gdn_rms_norm_gated_bf16";
+        // head_v 128 (a power of two in [32, 256]) lowers the norm's simdgroup
+        // form; head_v 48 (not a power of two) its threadgroup form.
+        let (norm, norm_tg) = ("gdn_rms_norm_gated_simd_bf16", "gdn_rms_norm_gated_bf16");
         // qwen3.6-27b's geometry (nk=16, nv=48, hk=hv=128): both kernels cover it.
         let q27 = lowered((16, 48, 128, 128), 64);
         let want = [
@@ -8761,7 +8804,13 @@ mod tests {
             ((48 * 128 / 32, 1, 1), (128, 1, 1))
         );
         let d = &q27[3].command.dispatch;
-        assert_eq!(d.threads_per_threadgroup, (128, 1, 1));
+        // The simdgroup form: 48 value heads (divisible by four) pack four rows a
+        // threadgroup of four simdgroups — a quarter the threadgroups, the same
+        // 128 threads.
+        assert_eq!(
+            (d.threadgroups, d.threads_per_threadgroup),
+            ((64 * 48 / 4, 1, 1), (128, 1, 1))
+        );
         assert_eq!(shape(&lowered((16, 48, 128, 128), 1)), [(decode, None)]);
         // head_k 64: the decode command, then the chain with its simd scan.
         let want = [
@@ -8780,7 +8829,7 @@ mod tests {
         assert_eq!(twins[1].command.bindings, twins[2].command.bindings);
         // head_v 48: no decode command, and not a whole number of the pipelined scan's 32-row
         // threadgroups — the simd scan alone; neither kernel covers head_k 64 either.
-        let want = [(conv, None), (simd, None), (norm, None)];
+        let want = [(conv, None), (simd, None), (norm_tg, None)];
         assert_eq!(shape(&lowered((2, 4, 128, 48), 64)), want);
         assert_eq!(shape(&lowered((2, 4, 64, 48), 64)), want);
 
@@ -8890,7 +8939,7 @@ mod tests {
             (norm, None),
         ];
         assert_eq!(shape(&drafting((1, 8, 128, 128), 64, 2)), want);
-        let want = [(conv, None), (simd, None), (norm, None)];
+        let want = [(conv, None), (simd, None), (norm_tg, None)];
         assert_eq!(shape(&drafting((2, 4, 128, 48), 64, 2)), want);
         assert_eq!(shape(&drafting((2, 4, 64, 48), 64, 2)), want);
     }
@@ -9040,7 +9089,7 @@ mod tests {
                     ("gdn_conv1d_varlen_bf16", None),
                     ("gdn_gating_bf16", None),
                     ("gdn_scan_varlen_f32", None),
-                    ("gdn_rms_norm_gated_bf16", None),
+                    ("gdn_rms_norm_gated_simd_bf16", None),
                 ]
             );
             assert_eq!(
@@ -9115,7 +9164,10 @@ mod tests {
                     C::float(2, tp().rms_norm_eps),
                     C::uint(3, 328),
                     C::uint(4, 2),
-                    C::boolean(5, true)
+                    C::boolean(5, true),
+                    // Two groups a token is not a multiple of four: the simdgroup
+                    // form takes one row a threadgroup, its baseline exact.
+                    C::uint(6, 1)
                 ]
             );
             let norm = binds(&tiny[3]);
