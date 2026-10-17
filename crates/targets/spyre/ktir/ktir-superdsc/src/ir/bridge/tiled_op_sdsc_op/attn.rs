@@ -1778,6 +1778,17 @@ struct ChunkBufs {
     /// One-stick partial reductions: three for a row max / denominator cut into parts, one per probability
     /// part plus two accumulators for a prompt chunk's denominator. Declared only when used.
     red: Vec<String>,
+    /// ⭐ THE RE-LAID QUERY, where the row blocks are query groups ([`ChunkRowForm::QueryGroup`]): the
+    /// group-major block's name and the identity table its copies read. `None` for every other form.
+    ///
+    /// [`ChunkRowForm::QueryGroup`]: crate::sdsc_abstract::ChunkRowForm::QueryGroup
+    qgroup: Option<QGroupBufs>,
+}
+
+/// The re-laid query block and the `[hd, hd]` identity its stick copies read.
+struct QGroupBufs {
+    block: String,
+    ident: String,
 }
 
 /// ⭐⭐⭐ WHOSE HISTORY A CHUNK's ROWS ATTEND — the one fact that separates the batch chunk from the solo
@@ -1831,28 +1842,46 @@ fn row_block_query(
     nqh: u32,
     hd: u32,
     qs: &str,
-) -> (
-    MatM,
-    Stk<crate::sdsc_abstract::RowBlockedTag>,
-    crate::addr::DevOff,
-) {
-    use crate::sdsc_abstract::{OperandPlacement, QueryRowCount};
-    if blocks.per_kv_head() {
-        (
+) -> Result<
+    (
+        MatM,
+        Stk<crate::sdsc_abstract::RowBlockedTag>,
+        crate::addr::DevOff,
+    ),
+    SuperDscError,
+> {
+    use crate::sdsc_abstract::{ChunkRowForm, OperandPlacement, QueryRowCount};
+    Ok(match blocks.form() {
+        ChunkRowForm::OneSlabGroup => (
             MatM::of_head_major_rows(blocks.rows()),
             rb(qs, nqh * mq, hd),
             crate::addr::DevOff::from_view_step(
                 blocks.first_head(b) * mq * BlockCols::of_one_stick(Lanes::FP16).get(),
             ),
-        )
-    } else {
-        let rows = QueryRowCount::of_mq(mq);
-        (
-            MatM::of_query_rows(rows),
-            rb(qs, mq, hd),
-            OperandPlacement::of_token_stream(rows, nqh, hd, blocks.first_head(b), 0, 0).off(),
-        )
-    }
+        ),
+        ChunkRowForm::QueryHead => {
+            let rows = QueryRowCount::of_mq(mq);
+            (
+                MatM::of_query_rows(rows),
+                rb(qs, mq, hd),
+                OperandPlacement::of_token_stream(rows, nqh, hd, blocks.first_head(b), 0, 0).off(),
+            )
+        }
+        // ⭐ THE GROUP's WHOLE `[gqa, hd]` BLOCK of the re-laid query — a standalone RowBlocked block, so
+        // the score reads it as a tensor of exactly its own rows (never a row slice of a taller one).
+        // `qs` here is the re-laid buffer's name (the caller hands it in place of the stream's).
+        ChunkRowForm::QueryGroup(q) => (
+            MatM::of_head_major_rows(q.rows()),
+            rb(qs, q.rows(), hd),
+            q.block_off(blocks.kv_head(b)).ok_or_else(|| {
+                SuperDscError(format!(
+                    "row block {b}: kv head {} is past the re-laid query's {} groups",
+                    blocks.kv_head(b),
+                    q.nkvh()
+                ))
+            })?,
+        ),
+    })
 }
 
 /// ⭐ ROW BLOCK `b`'s VALUE LEG at feature slab `s` — one law for the split-KV chunk's PV and the
@@ -1874,10 +1903,12 @@ struct RowBlockValue {
 impl RowBlockValue {
     /// The value ops per row block: one at one slab, one per slab above it.
     fn slabs(blocks: crate::sdsc_abstract::ChunkRowBlocks, hd: u32) -> u32 {
-        if blocks.per_kv_head() {
-            1
-        } else {
-            hd / BlockCols::of_one_stick(Lanes::FP16).get()
+        use crate::sdsc_abstract::ChunkRowForm;
+        match blocks.form() {
+            ChunkRowForm::OneSlabGroup => 1,
+            ChunkRowForm::QueryHead | ChunkRowForm::QueryGroup(_) => {
+                hd / BlockCols::of_one_stick(Lanes::FP16).get()
+            }
         }
     }
 
@@ -1889,36 +1920,50 @@ impl RowBlockValue {
         q_rows: u32,
         hd: u32,
     ) -> RowBlockValue {
+        use crate::sdsc_abstract::ChunkRowForm;
         let stick = BlockCols::of_one_stick(Lanes::FP16).get();
         let h0 = blocks.first_head(b) * mq;
-        if blocks.per_kv_head() {
-            RowBlockValue {
+        // Slab `s`'s plane of the `[q_rows, hd]` output at the block's first row — every row of a
+        // one-stick output step is one stick, so a block's `rows` consecutive rows are one contiguous
+        // run of that plane.
+        let slab_rows = Nest::new(&["row", "feat"], &[q_rows, hd], Df::Fp16)
+            .view()
+            .at(Idx::<crate::addr::Row>::n(h0))
+            .slab(s)
+            .dev();
+        match blocks.form() {
+            ChunkRowForm::OneSlabGroup => RowBlockValue {
                 m: MatM::of_head_major_rows(blocks.rows()),
                 n: MatN::of_head_dim(hd),
                 v_cols: hd,
                 out_off: crate::addr::DevOff::from_view_step(h0 * stick),
-            }
-        } else {
-            RowBlockValue {
+            },
+            ChunkRowForm::QueryHead => RowBlockValue {
                 m: MatM::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
                 n: MatN::of_head_slab(FeatIdx::SLAB_FEATS),
                 v_cols: stick,
-                out_off: Nest::new(&["row", "feat"], &[q_rows, hd], Df::Fp16)
-                    .view()
-                    .at(Idx::<crate::addr::Row>::n(h0))
-                    .slab(s)
-                    .dev(),
-            }
+                out_off: slab_rows,
+            },
+            // ⭐ THE GROUP's `gqa` ROWS of slab `s` in ONE op — one stick of `out`, the fold's card-proven
+            // hd=128 width; only the row count grows, and the group's rows are contiguous in the plane.
+            ChunkRowForm::QueryGroup(q) => RowBlockValue {
+                m: MatM::of_head_major_rows(q.rows()),
+                n: MatN::of_head_slab(FeatIdx::SLAB_FEATS),
+                v_cols: stick,
+                out_off: slab_rows,
+            },
         }
     }
 }
 
-/// Row block `b`'s op-name stem: its kv head at one slab, its query head above it.
+/// Row block `b`'s op-name stem: its kv head when a block is a GQA group, its query head otherwise.
 fn row_block_name(blocks: crate::sdsc_abstract::ChunkRowBlocks, b: u32) -> String {
-    if blocks.per_kv_head() {
-        format!("g{}", blocks.kv_head(b))
-    } else {
-        format!("h{}", blocks.first_head(b))
+    use crate::sdsc_abstract::ChunkRowForm;
+    match blocks.form() {
+        ChunkRowForm::OneSlabGroup | ChunkRowForm::QueryGroup(_) => {
+            format!("g{}", blocks.kv_head(b))
+        }
+        ChunkRowForm::QueryHead => format!("h{}", blocks.first_head(b)),
     }
 }
 
@@ -2022,7 +2067,7 @@ fn assemble_new_block_chunk(
             row_block_name(blocks, b),
         );
         let blk = wide.block(b).dev();
-        let (m, q, q_off) = row_block_query(blocks, b, mq, nqh, hd, qs);
+        let (m, q, q_off) = row_block_query(blocks, b, mq, nqh, hd, qs)?;
         ops.push(assemble_matmul_off_with_epilogue(
             &format!("attn_ncsc_{bn}_o{t}"),
             m,
@@ -2257,7 +2302,19 @@ fn assemble_attn_chunk(
     // ⭐ THE ROW BLOCKS every wide op below is cut into: one per KV HEAD at one feature slab (a GQA
     // group's `gqa·mq` rows are contiguous in `qs`), one per QUERY HEAD above it (only a head's own rows
     // are) — see `ChunkRowBlocks`. At one slab every op, name and offset is the per-kv-head form.
-    let blocks = chunk.row_blocks(gqa, mq);
+    // ⭐ OR, FOR A ONE-REQUEST DECODE WHOSE QUERY IS RE-LAID (`cb.qgroup`), one per KV HEAD of its whole
+    // group — the caller decided, so the body only reads its decision back off the buffers it was handed.
+    let blocks = match &cb.qgroup {
+        Some(_) => crate::sdsc_abstract::QGroupBlock::of_decode(chunk.nkvh(), gqa, hd, mq)
+            .and_then(|q| chunk.row_blocks_of_query_groups(q))
+            .ok_or_else(|| {
+                SuperDscError(format!(
+                    "attention chunk o{t}: a re-laid query was handed to a chunk whose rows are not a \
+                     one-request decode above one slab ({mq} row(s) per head at head dim {hd})"
+                ))
+            })?,
+        None => chunk.row_blocks(gqa, mq),
+    };
     // ⛔ A BATCH CHUNK's LAW MUST DESCRIBE THIS VERY CHUNK AT THIS VERY WIDTH: the host stages the mask
     // block and the page list from it, so a law for another chunk or another request count is a mask
     // whose rows and runs are some other body's — fluent, wrong, and silent.
@@ -2341,6 +2398,55 @@ fn assemble_attn_chunk(
         }
     }
 
+    // ── (1′) THE QUERY, RE-LAID GROUP-MAJOR (`QGroupBlock`) where the row blocks are query groups: one
+    //    identity stick copy per (kv head, slab) — the KV cache write's own descriptor shape, `y` walking
+    //    the group's heads `nslab` stick planes apart in the stream and one row apart in the block. ──
+    let q_name: &str = match (&cb.qgroup, blocks.form()) {
+        (Some(qb), crate::sdsc_abstract::ChunkRowForm::QueryGroup(q)) => {
+            for kvh in 0..q.nkvh() {
+                for s in 0..q.slabs() {
+                    let missing = || {
+                        SuperDscError(format!(
+                            "attention chunk o{t}: no re-layout copy for kv head {kvh} slab {s}"
+                        ))
+                    };
+                    let src = q.copy_src(kvh, s).ok_or_else(missing)?;
+                    let dst = q.copy_dest(kvh, s).ok_or_else(missing)?;
+                    ops.push(super::matmul::assemble_matmul_placed(
+                        &format!("attn_cqg_g{kvh}s{s}_o{t}"),
+                        MatM::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
+                        MatN::one_stick(Lanes::FP16),
+                        MatK::one_stick(Lanes::FP16),
+                        MatY::of_gqa_group(q.gqa(), src, dst),
+                        SharedKernelBmmForm::of_query_group_copy(),
+                        &rb(qs, mq, nqh * hd),
+                        src,
+                        // I[64,64] — the class identity's first diagonal block, for every slab: an
+                        // identity copy needs exactly the shared 2-D kernel a `y` batch demands.
+                        &Stk::<KernelTag>::kernel(
+                            stick.get() as usize,
+                            stick.get() as usize,
+                            &qb.ident,
+                        ),
+                        DevOff::ZERO,
+                        &rb(&qb.block, q.nkvh() * q.rows(), hd),
+                        dst,
+                        sym_id_base,
+                        layout,
+                    ));
+                }
+            }
+            qb.block.as_str()
+        }
+        (None, crate::sdsc_abstract::ChunkRowForm::QueryGroup(_)) | (Some(_), _) => {
+            return Err(SuperDscError(format!(
+                "attention chunk o{t}: the row blocks and the re-laid query disagree about whether the \
+                 query is re-laid"
+            )));
+        }
+        (None, _) => qs,
+    };
+
     // ── (2) SCORE per row block, then each row's max over its whole chunk ──
     let mask_h = hm(pmask);
     // ⭐ HOW THE PREFIX VALIDITY IS READ. A shared history is one broadcast row (`mb` collapsed); a batch
@@ -2358,8 +2464,8 @@ fn assemble_attn_chunk(
         // `sc_b = Q_b · Kᵗ_kvh + mask` — the mask is the broadcast prefix-validity row over the chunk's
         // logical slots (head-independent, so `mb` collapses), added in the matmul's own epilogue; for a
         // batch chunk, the per-row block (`mask_dims` above). Q is the row block's own operand
-        // (`row_block_query`).
-        let (m, a, a_off) = row_block_query(blocks, b, mq, nqh, hd, qs);
+        // (`row_block_query`) — the re-laid group block where the query was re-laid above.
+        let (m, a, a_off) = row_block_query(blocks, b, mq, nqh, hd, q_name)?;
         let Some((keys, kt)) = cb.lx.as_ref().and_then(|lx| lx.keys.as_ref()) else {
             ops.push(assemble_matmul_off_with_epilogue(
                 &format!("attn_csc_{}_o{t}", blk_name(b)),
@@ -3913,9 +4019,29 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                  gather with no staged index reads block 0 for every page"
             ))
         })?;
+        // ⭐ THE ONE-REQUEST DECODE ABOVE ONE SLAB RE-LAYS ITS QUERY GROUP-MAJOR (`QGroupBlock`), so each kv
+        // head attends its whole GQA group in one score and one value op per slab — the reference's form
+        // (one `QKᵀ` per kv head's group). Minted only for a one-request decode above one slab; every other
+        // chunk keeps the stream's own row blocks. The copy reads the class's identity table, which a
+        // bundle without a layout (an emission fixture) does not have, and so keeps the per-head form.
+        let qgroup = if rows_are_requests {
+            None
+        } else {
+            crate::sdsc_abstract::QGroupBlock::of_decode(nkvh, nqh / nkvh, hd, mq)
+        }
+        .zip(layout.and_then(|l| l.identity_tid_of_class(hd)));
         // The row blocks the body cuts every wide op into (`ChunkRowBlocks`): a kv head's `gqa·mq` rows at
-        // one slab, a query head's `mq` above it.
-        let blocks = chunk.row_blocks(nqh / nkvh, mq);
+        // one slab, a query head's `mq` above it, a kv head's re-laid group where the query is re-laid.
+        let blocks = match qgroup {
+            Some((q, _)) => chunk.row_blocks_of_query_groups(q).ok_or_else(|| {
+                SuperDscError(format!(
+                    "attention o{t}: the re-laid query group block does not describe this chunk's {} kv \
+                     heads at head dim {hd}",
+                    chunk.nkvh()
+                ))
+            })?,
+            None => chunk.row_blocks(nqh / nkvh, mq),
+        };
         let b_rows = blocks.rows();
         // A PROMPT chunk keeps its probabilities in LX from `esub` through the PV (the body's step 4′);
         // decode keeps the form it has. ⛔ A batch chunk's `mq` is its request count, not a prompt's width:
@@ -3959,7 +4085,14 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             cesub: syn(R::ChunkESub),
             cexp: syn(R::ChunkExp),
             red: (0..n_red).map(|i| syn(R::ChunkRed(i))).collect(),
+            qgroup: qgroup.map(|(_, ident_tid)| QGroupBufs {
+                block: syn(R::ChunkQGroup),
+                ident: crate::place::act_name(ident_tid),
+            }),
         };
+        if let (Some(l), Some((q, _))) = (layout, qgroup) {
+            l.synth(out_id.synth(R::ChunkQGroup), &q.footprint_dims());
+        }
         if let Some(l) = layout {
             match &cb.lx {
                 None => {

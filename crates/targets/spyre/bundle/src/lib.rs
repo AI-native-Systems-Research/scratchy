@@ -1004,6 +1004,16 @@ mod place_id_tests {
             LAcc(0),
             GatherKtLx(0),
             GatherVLx(0),
+            GatherKt,
+            GatherV,
+            ChunkSc,
+            ChunkESub,
+            ChunkExp,
+            ChunkQGroup,
+            ChunkRed(0),
+            NewChunkSc,
+            NewChunkESub,
+            NewChunkExp,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for r in roles {

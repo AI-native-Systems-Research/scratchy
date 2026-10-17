@@ -445,6 +445,17 @@ impl BundleLayout {
         self.ids.borrow().get(name).copied()
     }
 
+    /// ⭐ THE `[hd, hd]` IDENTITY TABLE an attention class of head dim `hd` reads — its tid from this
+    /// bundle's [`Self::attn_class_hds`] registry, the one lookup every identity-kernel copy (krep/vrep,
+    /// the KV cache write, the query group re-layout) resolves through. `None` when `hd` is not one of
+    /// the tape's attention classes — a registry desync each caller refuses at build.
+    pub fn identity_tid_of_class(&self, hd: u32) -> Option<u32> {
+        self.attn_class_hds
+            .iter()
+            .position(|&h| h == hd)
+            .map(crate::reserved_tids::identity_class_tid)
+    }
+
     /// Declare a SYNTHETIC intermediate at its FULL shape (`dims`, outermost→innermost),
     /// reserving its true footprint in the Intermediate-segment allocator UP FRONT. The tensor
     /// then OWNS its shape: a later per-head write at offset h·stride cannot land on the next

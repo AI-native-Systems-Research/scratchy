@@ -218,6 +218,9 @@ pub enum SynthRole {
     ChunkSc,
     ChunkESub,
     ChunkExp,
+    // The one-request decode's query re-laid group-major above one slab (`QGroupBlock`):
+    // `[nkvh][gqa, hd]`, each kv head's group a whole block of its own.
+    ChunkQGroup,
     // One-stick partial reductions of a chunk whose row max / denominator is cut into parts (`[rows, 64]`,
     // like the online-softmax state), combined part after part. INDEXED: a prompt chunk's denominator
     // holds one partial per probability part.
@@ -320,6 +323,7 @@ impl fmt::Display for SynthRole {
             Self::ChunkSc => f.write_str("csc"),
             Self::ChunkESub => f.write_str("cesub"),
             Self::ChunkExp => f.write_str("cexp"),
+            Self::ChunkQGroup => f.write_str("cqg"),
             Self::ChunkRed(i) => write!(f, "cred{i}"),
             Self::NewChunkSc => f.write_str("ncsc"),
             Self::NewChunkESub => f.write_str("ncesub"),

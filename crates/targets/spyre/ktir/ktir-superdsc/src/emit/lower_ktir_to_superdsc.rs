@@ -3543,9 +3543,9 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // max-hd placement holding a base-hd table as ALL ZERO (dump-proven on gemma-4
     // tiny-allglobal: `newkrep` lanes 64..127 zero while lanes 0..63 equal the roped K).
     // A uniform model resolves class 0, which IS `IDENTITY_TID`, so its ops are unchanged.
-    let ident = crate::place::act_name({
-        let class = layout
-            .and_then(|l| l.attn_class_hds.iter().position(|&h| h == hd))
+    let ident = crate::place::act_name(
+        layout
+            .and_then(|l| l.identity_tid_of_class(hd))
             .ok_or_else(|| Error {
                 message: format!(
                     "AttnDecode t{t}: head_dim {hd} absent from BundleLayout.attn_class_hds {:?} \
@@ -3554,9 +3554,8 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                      fact either of them states)",
                     layout.map(|l| l.attn_class_hds.clone()).unwrap_or_default(),
                 ),
-            })?;
-        crate::reserved_tids::identity_class_tid(class)
-    });
+            })?,
+    );
 
     let mut ops: Vec<EmittedOp> = Vec::new();
 

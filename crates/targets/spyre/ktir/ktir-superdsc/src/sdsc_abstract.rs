@@ -7222,6 +7222,16 @@ impl ChunkScratch {
     pub const fn row_blocks(self, gqa: u32, mq: u32) -> ChunkRowBlocks {
         ChunkRowBlocks::of_group(self.nkvh(), gqa, mq, self.plane.slabs(), self.slots())
     }
+
+    /// The row blocks of this chunk's one-request decode once its query is re-laid group-major — one per
+    /// kv head ([`ChunkRowBlocks::of_query_groups`]). `None` when the block does not describe this
+    /// chunk's kv heads or head dim.
+    pub const fn row_blocks_of_query_groups(self, q: QGroupBlock) -> Option<ChunkRowBlocks> {
+        if q.nkvh() != self.nkvh() || q.slabs() != self.plane.slabs() {
+            return None;
+        }
+        Some(ChunkRowBlocks::of_query_groups(q, self.slots()))
+    }
 }
 
 /// ⭐ A CHUNK WHOSE VALUE LEG STAYS IN LX — minted only by [`ChunkScratch::lx_form`], so a copy or a
@@ -7450,6 +7460,23 @@ pub struct ChunkRowBlocks {
     heads: u32,
     gqa: u32,
     slots: u32,
+    form: ChunkRowForm,
+}
+
+/// ⭐ WHAT ONE CHUNK ROW BLOCK IS, AND WHERE ITS QUERY COMES FROM — the fact every per-block site
+/// (the score's query operand, the value leg's op count and width, the op names) branches on, so each of
+/// them matches it exhaustively and a new form cannot reach one of them unhandled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChunkRowForm {
+    /// A kv head's `gqa·mq` rows at ONE feature slab, contiguous in the token stream: one score and one
+    /// `hd`-wide value op per block.
+    OneSlabGroup,
+    /// ONE query head above one slab — its `[mq, hd]` is the only contiguous query operand in the stream:
+    /// one score and one value op per (head, slab).
+    QueryHead,
+    /// A kv head's whole GQA group above one slab, its query read from the group-major re-laid block
+    /// ([`QGroupBlock`]): one score and one value op per (kv head, slab). The one-request decode only.
+    QueryGroup(QGroupBlock),
 }
 
 impl ChunkRowBlocks {
@@ -7470,6 +7497,24 @@ impl ChunkRowBlocks {
             heads,
             gqa,
             slots,
+            form: if slabs == 1 {
+                ChunkRowForm::OneSlabGroup
+            } else {
+                ChunkRowForm::QueryHead
+            },
+        }
+    }
+
+    /// The row blocks of a one-request decode whose query is re-laid group-major ([`QGroupBlock`]): one
+    /// block per kv head of its `gqa` rows, each block `slots` columns wide.
+    pub const fn of_query_groups(q: QGroupBlock, slots: u32) -> ChunkRowBlocks {
+        ChunkRowBlocks {
+            blocks: q.nkvh(),
+            rows: q.rows(),
+            heads: q.gqa(),
+            gqa: q.gqa(),
+            slots,
+            form: ChunkRowForm::QueryGroup(q),
         }
     }
 
@@ -7480,9 +7525,9 @@ impl ChunkRowBlocks {
     pub const fn rows(self) -> u32 {
         self.rows
     }
-    /// Whether a block is a whole kv head's GQA group (one slab) rather than one query head.
-    pub const fn per_kv_head(self) -> bool {
-        self.heads == self.gqa
+    /// What a block is and where its query comes from — see [`ChunkRowForm`].
+    pub const fn form(self) -> ChunkRowForm {
+        self.form
     }
     /// The first query head of block `b` — its rows start at `first_head(b) * mq` in the head-major
     /// stream.
