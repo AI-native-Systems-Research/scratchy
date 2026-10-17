@@ -10349,7 +10349,9 @@ const SUB_BLOCKED_PREFILL_CEILING: u32 = 128;
 // not the chunk's real length, and `PagedKvPool::WRITE_SLACK` is exactly the amount by which that
 // write may overrun a page. Raise the ceiling without raising the slack and the overrun lands on
 // the next kv head's keys again: a correct first token, then fluent garbage, for every prompt
-// needing a third chunk. A `const` assertion makes that a `cargo build` error instead.
+// needing a third chunk. A `const` assertion makes that a `cargo build` error instead, in every
+// build that has the pool (`spyre`: its `sdsc_abstract` is the Spyre target's).
+#[cfg(feature = "spyre")]
 const _: () = assert!(
     PREFILL_RUNGS[PREFILL_RUNGS.len() - 1] as usize
         == scratchy_subtile::sdsc_abstract::PagedKvPool::PREFILL_CHUNK_SLOTS,
