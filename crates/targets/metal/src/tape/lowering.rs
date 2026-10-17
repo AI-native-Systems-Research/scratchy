@@ -46,10 +46,11 @@ fn attention_blocks_per_chunk(chunked: bool) -> u32 {
 use crate::op_abi::GuardRun;
 use crate::quantized::{
     DequantDtype, NaxDequant, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile,
-    W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Rows, W4a8Tile, pick_qmm_t_kernel, pick_qmv_kernel_wide,
-    qmm_t_dispatch_shape, qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute,
-    qmm_w4a8_static_name, qmv_dispatch_shape, qmv_kernel_static_name, small_m_kernel_static_name,
-    splitk_reduce_kernel_static_name, w4a8_quant_static_name, w4a8_scratch_bytes,
+    W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Act, W4a8Rows, W4a8Tile, pick_qmm_t_kernel,
+    pick_qmv_kernel_wide, qmm_t_dispatch_shape, qmm_t_kernel_static_name,
+    qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name, qmv_dispatch_shape,
+    qmv_kernel_static_name, small_m_kernel_static_name, splitk_reduce_kernel_static_name,
+    w4a8_act_quant_static_name, w4a8_quant_static_name, w4a8_scratch_bytes,
 };
 use crate::specialized_pipeline_cache::ConstantValue;
 
@@ -5121,6 +5122,7 @@ fn lower_one(
                 layer_id,
                 layout.conv_out,
                 None,
+                bucket_m,
             ));
 
             // 2. The gating and the delta-rule scan → o (f32 scratch).
@@ -5188,6 +5190,7 @@ fn lower_one(
                     },
                     weight(WeightTensor::GdnConvBias, 7),
                 )),
+                bucket_m,
             )];
             cmds.extend(recurrent_scan(
                 p,
@@ -6442,8 +6445,9 @@ impl ColumnSlice {
 
 /// A recurrent mixer's causal depthwise conv1d (+SiLU), varlen + stateful (`gdn_conv1d_varlen`),
 /// into the f32 scratch `conv_out`: over GDN's qkv rows, or over the `xBC` column slice of
-/// Mamba-2's in-projection rows with its conv bias (`sliced`). Grid (num_seqs[set via
-/// seq_axis=X], ceil(conv_dim/tg_y), 1).
+/// Mamba-2's in-projection rows with its conv bias (`sliced`). One thread a (sequence, channel,
+/// `GDN_CONV_BLOCK`-token block) — grid (num_seqs[set via seq_axis=X], ceil(conv_dim/tg_y),
+/// ceil(bucket_m/GDN_CONV_BLOCK) [scaled by num_tokens]; blocks past a sequence's end early out).
 fn recurrent_conv(
     p: &MetalModelConsts,
     input: Binding,
@@ -6451,6 +6455,7 @@ fn recurrent_conv(
     layer: super::ids::LayerId,
     conv_out: u32,
     sliced: Option<(ColumnSlice, Binding)>,
+    bucket_m: u32,
 ) -> LoweredCommand {
     use crate::tape::ids::BucketM;
     use crate::tape::lowered::{MScaleAxis, MScaling};
@@ -6480,11 +6485,21 @@ fn recurrent_conv(
     if p.spec_drafts > 0 {
         bindings.push(runtime(RuntimeBindingKind::GdnConvLanes { layer }, 8));
     }
+    // The no-race contract: the block must cover the seed window (kernel − 1 entries), so
+    // blocks past a sequence's head seed from `x` alone and never read the seed ring, and a
+    // verify step's rows (drafts + 1), so only the thread that reads the lane's checkpoint
+    // (a replay's seed) writes it.
+    assert!(
+        p.gdn_conv_kernel <= GDN_CONV_BLOCK + 1 && GDN_CONV_BLOCK > p.spec_drafts,
+        "the conv's token block must cover the seed window (kernel - 1) and a verify step's \
+         rows (drafts + 1)"
+    );
     if let Some((slice, bias)) = sliced {
         constants.extend(slice.constants(2));
         constants.push(ConstantValue::boolean(4, true));
         bindings.push(bias);
     }
+    constants.push(ConstantValue::uint(6, GDN_CONV_BLOCK));
     let tg_y = conv_dim.clamp(1, THREADS_PER_GROUP);
     LoweredCommand {
         kernel: KernelId::GatedDeltaNet,
@@ -6492,12 +6507,18 @@ fn recurrent_conv(
         function: gdn_conv1d_varlen_static_name(dequant_dtype_for(p)),
         constants: baked(constants),
         dispatch: DispatchShape {
-            threadgroups: (1, conv_dim.div_ceil(tg_y), 1),
+            threadgroups: (
+                1,
+                conv_dim.div_ceil(tg_y),
+                bucket_m.div_ceil(GDN_CONV_BLOCK),
+            ),
             threads_per_threadgroup: (1, tg_y, 1),
-            // bucket_m=1 no-ops the token scale; seq_axis SETS X = num_seqs.
+            // Z scales with the step's tokens (one layer per GDN_CONV_BLOCK of them, always at
+            // least any one sequence's blocks — blocks past a sequence's end early out); seq_axis
+            // SETS X = num_seqs.
             m_scaling: Some(MScaling {
-                axis: MScaleAxis::X,
-                bucket_m: BucketM(1),
+                axis: MScaleAxis::Z,
+                bucket_m: BucketM(bucket_m),
                 seq_axis: Some(MScaleAxis::X),
             }),
         },
@@ -6505,6 +6526,14 @@ fn recurrent_conv(
         gemm_dims: None,
     }
 }
+
+/// The conv's tokens a thread owns (`GDN_CONV_BLOCK`, its baked constant slot 6): the token-block
+/// parallelism of `gdn_conv1d_varlen` — the grid's Z is the step's rows over it, each thread
+/// walking its block with the causal window in registers. Locked per model in [`recurrent_conv`]
+/// to at least the seed window (`kernel − 1` entries) and a verify step's rows: block 0 is then
+/// the one thread that reads the seed ring and the one that writes the new ring, blocks past a
+/// sequence's head seed from `x` alone, and only block 0 touches the draft lanes.
+const GDN_CONV_BLOCK: u32 = 32;
 
 /// The scans' constant slot of the drafts each sequence of a verify step carries
 /// (`GDN_SCAN_DRAFTS`): what a plain step's kernels, which keep no draft state, do not take.
@@ -7330,12 +7359,67 @@ fn lower_moe_step(
         Some(program) if gathered && e <= threads => (Some(program), None),
         routing => (None, routing.map(S::Route)),
     };
+    // The grouped W4A8 bake's fused act+quant command — the ONE construction every act
+    // routes through (a gated expert's `act(gate) * up`, an ungated expert's `act(up)`
+    // with the up rows at `gate`): `act` quantized straight to the int8 scratch the down
+    // projection reads, the bf16 intermediate the elementwise act wrote and the pre-pass
+    // re-read — DRAM traffic at a prefill bucket's padded rows — never exists.
+    let fused_act_quant_command = |tag: W4a8Act,
+                                   gate: R,
+                                   bias_layer: Option<LayerId>|
+     -> Result<LoweredCommand, LoweringError> {
+        let mpad = s.l.mpad_max;
+        let mut bindings = vec![
+            s.at(0, gate),
+            s.at(1, R::ExpertUp),
+            scratch_at(2, s.l.grp_x_pad),
+            scratch_at(3, s.l.grp_indices_pad),
+        ];
+        let mut constants = vec![
+            C::int(0, inter as i32),
+            C::int(2, mpad as i32),
+            C::int(4, e as i32),
+        ];
+        if let Some(l) = bias_layer {
+            bindings.push(source(
+                router()?,
+                WeightTensor::MoeExpertGateUpLinearBias,
+                l,
+                4,
+            ));
+            constants.push(C::boolean(7, true));
+        }
+        Ok(cmd(
+            KernelId::AffineGatherW4a8ActQuant,
+            "quantized_qmm_nax",
+            w4a8_act_quant_static_name(tag, dtype),
+            constants,
+            grid(((inter / 64).div_ceil(16), mpad, 1), (128, 1, 1), None),
+            bindings,
+        ))
+    };
     // The act over the experts' gate/up rows, at `bias_layer` the gpt-oss pair's expert adding its
     // gate and up LINEAR biases first — the [E, 2·inter] concat the loader interleaves, at 4 with
     // the kernel's switch at slot 3; the grouped GEMMs cannot. Every other bundle's `None` leaves
     // both unset and the kernel const-folds the adds away.
     let gated_act_command =
         |act, bias_layer: Option<LayerId>| -> Result<Vec<LoweredCommand>, LoweringError> {
+            // A grouped W4A8 bake fuses the act into the quant pre-pass the down projection
+            // would run. The down projection then emits no quant of its own: the same
+            // `moe_w4a8` every step of the block runs decides both, so the pair cannot
+            // disagree.
+            if moe_w4a8(b, at, &s) {
+                let tag = match act {
+                    GatedAct::Silu => W4a8Act::Silu,
+                    GatedAct::Gelu => W4a8Act::Gelu,
+                    GatedAct::SwigluOai => W4a8Act::SwigluOai,
+                };
+                return Ok(vec![fused_act_quant_command(
+                    tag,
+                    R::ExpertGate,
+                    bias_layer,
+                )?]);
+            }
             let (kernel, symbol) = match act {
                 GatedAct::Silu => (KernelId::SiluMul, silu_mul_static_name(dtype)),
                 GatedAct::Gelu => (KernelId::GeluMul, gelu_mul_static_name(dtype)),
@@ -7889,29 +7973,12 @@ fn lower_moe_step(
             let w4a8_tile = moe_w4a8(b, at, &s).then_some(W4A8_GROUPED_TILE);
             if let Some(tile) = w4a8_tile {
                 // y[Mpad, n_out] = gather_qmm_w4a8(x_pad as int8 rows + scales, W, indices_pad):
-                // gate and up read the token rows the sort scattered as int8; down quantizes its
-                // activation over the padded rows into `x_pad` first (sentinel rows skipped).
+                // gate and up read the token rows the sort scattered as int8; down reads the
+                // rows the act quantized into `x_pad` as it fused into this pre-pass
+                // (`gated_act_command` / the relu2 arm — the same `moe_w4a8` decides), so it
+                // emits no quant of its own.
                 let mpad = s.l.mpad_max;
                 let x_pad = scratch_at(3, s.l.grp_x_pad);
-                let down_rows = rows_of(&s, 0, rows)?;
-                let quant = (proj == ExpertProj::Down).then(|| {
-                    cmd(
-                        KernelId::AffineGatherW4a8Quant,
-                        "quantized_qmm_nax",
-                        w4a8_quant_static_name(W4a8Rows::Grouped, dtype),
-                        vec![
-                            C::int(0, inter as i32),
-                            C::int(2, mpad as i32),
-                            C::int(4, e as i32),
-                        ],
-                        grid(((inter / 64).div_ceil(16), mpad, 1), (128, 1, 1), None),
-                        vec![
-                            down_rows,
-                            scratch_at(1, s.l.grp_x_pad),
-                            scratch_at(2, s.l.grp_indices_pad),
-                        ],
-                    )
-                });
                 let constants = [
                     C::int(0, k_in as i32),
                     C::int(1, n_out as i32),
@@ -7935,7 +8002,7 @@ fn lower_moe_step(
                     ),
                     bindings,
                 );
-                return Ok(quant.into_iter().chain([gemm]).collect());
+                return Ok(vec![gemm]);
             }
             if s.grouping == MoeGrouping::Grouped {
                 // y[Mpad, n_out] = gather_qmm(x_pad, W, indices_pad); the host padded to BM = 64.
@@ -8139,6 +8206,11 @@ fn lower_moe_step(
             gated_act_command(act, None)?
         }
         // `act(up)` over the up rows, in place; a bake that sorted runs every padded row.
+        S::Act(UngatedAct::Relu2) if moe_w4a8(b, at, &s) => {
+            // The grouped W4A8 twin of `gated_act_command`'s fusion: `relu(up)²` quantized
+            // straight to the int8 scratch, the up rows at the fused command's gate slot.
+            vec![fused_act_quant_command(W4a8Act::Relu2, R::ExpertUp, None)?]
+        }
         S::Act(UngatedAct::Relu2) => {
             let (rows, m_scaling) = match s.grouping {
                 MoeGrouping::Gathered => (pairs, ms(A::X)),
@@ -8979,7 +9051,8 @@ mod tests {
                     C::uint(5, 0),
                     C::uint(2, 328),
                     C::uint(3, 128),
-                    C::boolean(4, true)
+                    C::boolean(4, true),
+                    C::uint(6, 32)
                 ]
             );
             let conv_out = "scratch 0".to_owned();
@@ -11941,6 +12014,130 @@ mod tests {
                     which: WeightTensor::MoeExpertDownLinearBias,
                     layer: LayerId(0),
                     binding_index: 5,
+                },
+            ]
+        );
+    }
+
+    /// A grouped W4A8 bake — Qwen3.6-35B's uniform 4-bit g64 experts on M5's offset-8 codes —
+    /// fuses the act into the quant pre-pass: the gate/up GEMMs, then ONE
+    /// `affine_gather_w4a8_quant_silu_*` reading their rows and writing the int8 scratch
+    /// (no elementwise act, no bf16 intermediate), and the down projection reading that scratch
+    /// with no quant of its own. The same `moe_w4a8` decides both, so the pair cannot disagree.
+    #[test]
+    fn a_grouped_w4a8_bake_fuses_the_act_into_the_quant() {
+        use crate::tape::ids::{AffineBits, AffineGroupSize};
+        use crate::tape::step::{CombineEnds, ExpertMatmul, ExpertWidth, MoeRows, MoeStep};
+        use scratchy_subtile::subtile_ir::{ExpertProj, UngatedAct};
+        let (block, p) = (qwen_moe_block(256), tp());
+        let at = MoeBake {
+            bucket_m: 512,
+            layer_offset: 0,
+            is_nax: true,
+            f16_compute: false,
+            codes: super::super::kernel_constants::AffineCodesTarget::of(Some(
+                &crate::targets::M5_10CORE,
+            )),
+        };
+        let lower =
+            |step| lower_moe_step(&p, &block, step, row(), at, &mut 0).expect("a W4A8 step lowers");
+        let four = AffineBits(4);
+        let gate = ExpertMatmul {
+            rows: MoeRows::Tokens(Slot(1)),
+            layer: LayerId(0),
+            proj: ExpertProj::Gate,
+            group_size: AffineGroupSize(64),
+            width: ExpertWidth::OpUniform(four),
+        };
+
+        let commands = lower(MoeStep::GateUpAct(
+            gate,
+            ExpertWidth::OpUniform(four),
+            GatedAct::Silu,
+            None,
+        ));
+        let kernels: Vec<KernelId> = commands.iter().map(|c| c.kernel).collect();
+        assert_eq!(
+            kernels,
+            [
+                KernelId::AffineGatherQmmW4a8,
+                KernelId::AffineGatherQmmW4a8,
+                KernelId::AffineGatherW4a8ActQuant,
+            ],
+            "gate GEMM, up GEMM, the fused act+quant"
+        );
+        let (s, act) = (MoeScratch::of(&block, 512, &p, &mut 0), &commands[2]);
+        assert_eq!(
+            act.function,
+            w4a8_act_quant_static_name(W4a8Act::Silu, dequant_dtype_for(&p))
+        );
+        assert_eq!(
+            act.bindings,
+            vec![
+                s.at(0, MoeRegion::ExpertGate),
+                s.at(1, MoeRegion::ExpertUp),
+                Binding::MoeScratch {
+                    binding_index: 2,
+                    byte_offset: s.l.grp_x_pad,
+                },
+                Binding::MoeScratch {
+                    binding_index: 3,
+                    byte_offset: s.l.grp_indices_pad,
+                },
+            ]
+        );
+        let mpad = s.l.mpad_max;
+        assert_eq!(
+            act.constants,
+            vec![
+                ConstantValue::int(0, 512),
+                ConstantValue::int(2, mpad as i32),
+                ConstantValue::int(4, 256),
+            ]
+        );
+        assert_eq!(
+            act.dispatch.threadgroups,
+            ((512u32 / 64).div_ceil(16), mpad, 1),
+            "the pre-pass's own grid"
+        );
+
+        let down = ExpertMatmul {
+            rows: MoeRows::Scratch(MoeRegion::ExpertGate),
+            layer: LayerId(0),
+            proj: ExpertProj::Down,
+            group_size: AffineGroupSize(64),
+            width: ExpertWidth::OpUniform(four),
+        };
+        let commands = lower(MoeStep::DownCombine(down, Slot(2), CombineEnds::default()));
+        let kernels: Vec<KernelId> = commands.iter().map(|c| c.kernel).collect();
+        assert_eq!(
+            kernels,
+            [KernelId::AffineGatherQmmW4a8, KernelId::MoeWeightedSum],
+            "the down GEMM reads the act's scratch — no quant of its own"
+        );
+
+        // The ungated twin: Nemotron-H's relu² runs through the same fused command, the
+        // up rows at its gate slot (the up binding itself dead — the kernel never loads
+        // it for relu²).
+        let relu2 = lower(MoeStep::Act(UngatedAct::Relu2));
+        assert_eq!(relu2.len(), 1, "one fused command, no elementwise act");
+        assert_eq!(relu2[0].kernel, KernelId::AffineGatherW4a8ActQuant);
+        assert_eq!(
+            relu2[0].function,
+            w4a8_act_quant_static_name(W4a8Act::Relu2, dequant_dtype_for(&p))
+        );
+        assert_eq!(
+            relu2[0].bindings,
+            vec![
+                s.at(0, MoeRegion::ExpertUp),
+                s.at(1, MoeRegion::ExpertUp),
+                Binding::MoeScratch {
+                    binding_index: 2,
+                    byte_offset: s.l.grp_x_pad,
+                },
+                Binding::MoeScratch {
+                    binding_index: 3,
+                    byte_offset: s.l.grp_indices_pad,
                 },
             ]
         );

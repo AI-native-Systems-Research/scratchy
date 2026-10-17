@@ -416,6 +416,9 @@ impl Gpu {
                 ConstantValue::uint(3, inner as u32),
                 ConstantValue::boolean(4, true),
                 ConstantValue::uint(5, 0),
+                // A 3-token block — the lock's minimum (the seed window is 3 entries) — the
+                // grid's Z the tokens over it (blocks past a sequence's end early out).
+                ConstantValue::uint(6, 3),
             ],
         );
         let tg_y = conv_dim.min(THREADS);
@@ -434,7 +437,7 @@ impl Gpu {
             &[],
             &[],
             &[],
-            size(num_seqs, conv_dim.div_ceil(tg_y), 1),
+            size(num_seqs, conv_dim.div_ceil(tg_y), tokens.div_ceil(3)),
             size(1, tg_y, 1),
         );
         batch.barrier();

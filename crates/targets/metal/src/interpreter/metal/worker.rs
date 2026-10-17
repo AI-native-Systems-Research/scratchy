@@ -1234,7 +1234,9 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::GateSplit
         | K::ArgPartitionTopK
         | K::TakeAlongAxis => KernelKind::Moe,
-        K::FusedGateUpSiluMul | K::SiluMul | K::GeluMul => KernelKind::Mlp,
+        K::FusedGateUpSiluMul | K::SiluMul | K::GeluMul | K::AffineGatherW4a8ActQuant => {
+            KernelKind::Mlp
+        }
         K::GatherLastToken | K::ScatterFirstToLastRow | K::Softmax | K::SliceTrailingColsU32 => {
             KernelKind::Sample
         }
