@@ -510,29 +510,26 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .map_err(|_| WorkerError::BufferAlloc { what, bytes }),
             false => alloc(bytes, mode, what).map(Activation::Full),
         };
-        // Need `i`'s lent buffer, where one holds it; else it is allocated.
+        // Need `i`'s lent buffer, where one holds it and, for a need the host reads (`host`), the
+        // host can read it too (`lend_readable`: no sparse one); else it is allocated. The budget
+        // prices a borrower by the same rule.
         fn place<'a>(
             needs: &[u64],
             from: &'a [Activation],
+            host: impl Fn(usize) -> bool,
         ) -> impl Fn(usize) -> Option<Activation> + 'a {
             use crate::interpreter::metal::__re::MTLBuffer as _;
             let lengths: Vec<u64> = from.iter().map(|a| a.buffer().length() as u64).collect();
-            let lent = scratchy_core_common::lend::lend(needs, &lengths);
+            let readable = |j: usize| matches!(from[j], Activation::Full(_));
+            let lent = scratchy_core_common::lend::lend_readable(needs, &lengths, host, readable);
             move |i| lent[i].map(|j| from[j].clone())
         }
         // Shared storage so test code can seed/inspect arena contents without staging copies, and
         // so the host can read the slots it reads by pointer; dispatch-bound buffers are fine in
-        // shared on Apple silicon — the existing `MetalAllocator` uses the same mode. A slot the
-        // host reads takes no lent sparse buffer: the host cannot read one.
-        let lent_slot = place(arena_layout, &lent.arena);
+        // shared on Apple silicon — the existing `MetalAllocator` uses the same mode.
+        let lent_slot = place(arena_layout, &lent.arena, host_read);
         let arena_activation: Vec<Activation> = (arena_layout.iter().enumerate())
             .map(|(i, &size)| match lent_slot(i) {
-                Some(Activation::Sparse(_)) if host_read(i) => make(
-                    size,
-                    MTLResourceOptions::StorageModeShared,
-                    false,
-                    "arena slot",
-                ),
                 Some(activation) => Ok(activation),
                 None => make(
                     size,
@@ -569,7 +566,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .max();
             max.map_or(0, u64::from)
         });
-        let lent_scratch = place(&sizes, &lent.scratch);
+        let lent_scratch = place(&sizes, &lent.scratch, |_| false);
         let private = MTLResourceOptions::StorageModePrivate;
         let scratch = |i: usize, what| match lent_scratch(i) {
             Some(activation) => Ok(Some(activation)),
@@ -2524,6 +2521,85 @@ mod tests {
                 .all(|b| address(b) != address(&borrower.arena[2]))
         );
         assert_eq!(borrower.arena[2].length(), 128 * 1024);
+    }
+
+    /// With a residency set and a [`SparsePlan`], a lender's slots the host does not read are
+    /// sparse. A borrower's slot the host reads takes none of them: it gets a full buffer of its
+    /// own, while the slots it does not read take the lender's. What it allocates is what the
+    /// budget prices for the same layouts ([`unlent_readable_bytes`]).
+    ///
+    /// [`unlent_readable_bytes`]: scratchy_core_common::lend::unlent_readable_bytes
+    #[test]
+    fn a_host_read_slot_takes_no_lent_sparse_buffer_and_is_priced_as_allocated() {
+        use crate::interpreter::metal::__re::MTLBuffer as _;
+        use crate::interpreter::metal::__re::MTLDevice as _;
+        let Some(device) = crate::detect_device().filter(|_| crate::metal4_available()) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = Arc::new(device.device.clone());
+        let residency = crate::residency::MetalResidencySet::new(&device);
+        let tile = device.sparseTileSizeInBytesForSparsePageSize(crate::sparse_kv::PAGE) as u64;
+        let (weights, allocator) = build_test_weights();
+        let runtime = empty_runtime(&device, 1);
+        let tapes = vec![build_synthetic_tape(1)];
+        let pipelines =
+            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
+                .expect("pipelines");
+        let build = |layout: &ArenaLayout, host_slots: Vec<u32>, lent: &LentActivation| {
+            let plan = SparsePlan {
+                bucket_arena: vec![Box::leak(layout.clone().into_boxed_slice())],
+                host_slots,
+            };
+            MetalWorker::<TestWeights>::new_with_residency(
+                device.clone(),
+                layout,
+                &tapes,
+                &pipelines,
+                &sources(&weights, &allocator, &tapes),
+                &runtime,
+                Some(&residency),
+                None,
+                lent,
+                Some(&plan),
+            )
+            .expect("worker builds")
+        };
+        // The lender reads none of its slots on the host, so both are sparse.
+        let lender_layout = vec![4 * tile, tile];
+        let lender = build(&lender_layout, vec![], &LentActivation::default());
+        let lent = lender.activation();
+        assert!(
+            lent.arena
+                .iter()
+                .all(|a| matches!(a, Activation::Sparse(_)))
+        );
+        // The borrower reads slot 0 on the host. `lend` would pair it with the lender's 4-tile
+        // sparse slot; slot 1 fits the 1-tile one; slot 2 fits neither.
+        let borrower_layout = vec![4 * tile, tile, 2 * tile];
+        let borrower = build(&borrower_layout, vec![0], &lent);
+        let address = |b: &Buffer| b.gpuAddress();
+        let is_lent = |b: &Buffer| lender.arena.iter().any(|l| address(l) == address(b));
+        let mine = borrower.activation();
+        // The host-read slot: a full buffer of its own, not the lender's sparse one.
+        assert!(!is_lent(&borrower.arena[0]));
+        assert!(matches!(mine.arena[0], Activation::Full(_)));
+        assert_eq!(borrower.arena[0].length() as u64, 4 * tile);
+        // A slot the host does not read takes the lender's sparse buffer.
+        assert_eq!(address(&borrower.arena[1]), address(&lender.arena[1]));
+        // Bytes allocated == bytes priced.
+        let allocated: u64 = (borrower.arena.iter())
+            .filter(|b| !is_lent(b))
+            .map(|b| b.length() as u64)
+            .sum();
+        let priced = scratchy_core_common::lend::unlent_readable_bytes(
+            &borrower_layout,
+            &lender_layout,
+            |i| i == 0,
+            |j| matches!(lent.arena[j], Activation::Full(_)),
+        );
+        assert_eq!(allocated, priced);
+        assert_eq!(priced, 6 * tile);
     }
 
     #[test]

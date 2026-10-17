@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "metal")]
 use scratchy_core_common::SamplingParams;
 #[cfg(feature = "metal")]
-use scratchy_core_common::lend::unlent_bytes;
+use scratchy_core_common::lend::{unlent_bytes, unlent_readable_bytes};
 // Read only by the metal embeddings path below (it walks a
 // StorageModeShared arena slot via `buf.contents()`), so the import follows
 // that gate rather than being carried on every backend.
@@ -62,7 +62,14 @@ use scratchy_target_metal::dtype::DType as GpuDType;
 #[cfg(feature = "metal")]
 use scratchy_target_metal::gdn_state::{GdnSave, GdnSlot, GdnStatePool};
 #[cfg(feature = "metal")]
+use scratchy_target_metal::interpreter::metal::TerminalReads;
+#[cfg(feature = "metal")]
 use scratchy_target_metal::kv_cache::KvCachePool;
+
+/// Who reads an MTP head's logits: its argmax runs on the GPU, on the forward's own command buffer.
+/// Its device and its arena price both take it.
+#[cfg(feature = "metal")]
+const HEAD_TERMINAL_READS: TerminalReads = TerminalReads::Gpu;
 
 // The CUDA `Worker` lives in `scratchy-target-cuda`; re-exported here for
 // back-compat so callers naming `gpu_worker::{CudaWorker, CudaWorkerFactory}`
@@ -1324,12 +1331,19 @@ impl MetalWorker {
         (target.metal_bucket_arena_costs().iter())
             .map(|&(bucket_m, bytes)| {
                 let draft = match head {
+                    // The head's arena slots the target's hold, but where the head reads one on the
+                    // host, only a target slot the host reads too: the rest are sparse.
                     Some(head) => {
-                        let layout = |m: &dyn scratchy_forward_compiler::ScratchyWeights| {
-                            let rung = Self::metal_pick(m, dev, Some(bucket_m), 1)?;
-                            ExecutorResult::Ok(rung.arena_layout())
-                        };
-                        unlent_bytes(&layout(head)?, &layout(target)?)
+                        let pick = |m| Self::metal_pick(m, dev, Some(bucket_m), 1);
+                        let (h, t) = (pick(head)?, pick(target)?);
+                        let host = h.host_slots(HEAD_TERMINAL_READS);
+                        let readable = t.host_slots(dev.terminal_reads);
+                        unlent_readable_bytes(
+                            &h.arena_layout(),
+                            &t.arena_layout(),
+                            |i| host.contains(&(i as u32)),
+                            |j| readable.contains(&(j as u32)),
+                        )
                     }
                     None => (draft_costs.iter())
                         .find(|&&(m, _)| m >= bucket_m)
@@ -1486,8 +1500,7 @@ impl MetalWorker {
             kv_addressing: main.kv_addressing,
             max_decode_rows: main.max_decode_rows,
             lent,
-            // Its argmax runs on the GPU, on the forward's own command buffer.
-            terminal_reads: Default::default(),
+            terminal_reads: HEAD_TERMINAL_READS,
         })
     }
 
@@ -6761,7 +6774,7 @@ impl Worker for MetalWorker {
                             lent: Default::default(),
                             // Its verify seed is an argmax the host runs over the logits.
                             terminal_reads:
-                                scratchy_target_metal::interpreter::metal::TerminalReads::Host,
+                                TerminalReads::Host,
                         };
                         // Upload host slices into fresh shared
                         // MTLBuffers (thread-local, dropped at thread
