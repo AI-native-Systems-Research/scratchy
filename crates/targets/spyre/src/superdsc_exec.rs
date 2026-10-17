@@ -3473,10 +3473,17 @@ impl Executor {
             };
             d2h_bytes = b - a;
             let host = &mut self.seg_host[seg.get()][a as usize..b as usize];
+            // ON THE COMPUTE PIPELINE (#544): the logits readback is the LAST op of every
+            // step, right after the step's COMPUTE ops. Riding ASYNC_DMAO, its switch
+            // barrier drained the COMPUTE deque — the readback submission HOST-BLOCKED until
+            // the whole step's compute work completed. On COMPUTE the barrier drains the
+            // (empty) DMA deques instead, the readback submits immediately, and the queue's
+            // FIFO — readback CB behind the step's compute CBs on the same queue — carries
+            // the ordering the host-side wait used to.
             self.stream
                 .as_ref()
                 .unwrap()
-                .d2h(host, src)
+                .d2h_on_compute(host, src)
                 .map_err(|e| anyhow!("logits D2H: {e}"))?;
         }
         let t2b = Instant::now();
@@ -3682,9 +3689,17 @@ impl Executor {
                 note.push_str(&format!(" seg{i}={}KB", sent >> 10));
             }
             let stream = self.stream.as_ref().unwrap();
+            // ON THE COMPUTE PIPELINE (#544): the preamble is the FIRST op of every step with
+            // the step's COMPUTE ops right behind it. Riding ASYNC_DMAI made the compute
+            // submission HOST-BLOCK on the preamble's fence (its switch barrier drained the
+            // DMAI deque), and made the preamble itself block on the PREVIOUS step's readback
+            // (its own barrier drained the DMAO deque). On COMPUTE the junction isn't a
+            // switch at all, the remaining cross-step barrier drains deques that hold
+            // nothing, and the queue's own FIFO orders the preamble CB ahead of the step's
+            // compute CBs — the whole step submits with no host-side waits.
             if runs.is_empty() {
                 stream
-                    .h2d(whole_shadow(&self.seg_host[i], addr, i)?, addr)
+                    .h2d_on_compute(whole_shadow(&self.seg_host[i], addr, i)?, addr)
                     .map_err(|e| anyhow!("preamble H2D seg{i}: {e}"))?;
             } else {
                 for (a, b) in runs {
@@ -3692,7 +3707,7 @@ impl Executor {
                         .window(ByteOffset(a), ByteSize(b - a))
                         .ok_or_else(|| anyhow!("seg{i} window {a}..{b} unaddressable"))?;
                     stream
-                        .h2d(&self.seg_host[i][a as usize..b as usize], &win)
+                        .h2d_on_compute(&self.seg_host[i][a as usize..b as usize], &win)
                         .map_err(|e| anyhow!("preamble H2D seg{i} window: {e}"))?;
                 }
             }
