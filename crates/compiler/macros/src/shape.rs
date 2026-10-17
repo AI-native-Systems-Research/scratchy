@@ -1345,10 +1345,11 @@ pub fn extern_shape(kind: ExternKind) -> Shape {
             Dim::Bound("num_tokens".into()),
             Dim::Bound("vision_embed_dim".into()),
         ],
-        // A target model's final hidden states: one row per token of the target's residual width.
+        // A target model's hidden states: one row per token, `target_hidden_size` wide — its
+        // residual width, or several of its hidden states side by side (P-EAGLE's three).
         ExternKind::TargetHidden => vec![
             Dim::Bound("num_tokens".into()),
-            Dim::Bound("backbone_hidden_size".into()),
+            Dim::Bound("target_hidden_size".into()),
         ],
     }
 }

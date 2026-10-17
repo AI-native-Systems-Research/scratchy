@@ -258,7 +258,7 @@ mod tests {
     }
 
     /// Each source gets its own tile, shaped by its own extern: an MTP head reads its target's
-    /// hidden rows (`[num_tokens, backbone_hidden_size]`, its target's width) beside the token
+    /// hidden rows (`[num_tokens, target_hidden_size]`, its target's width) beside the token
     /// embedding.
     #[test]
     fn materialize_rows_gives_each_source_its_own_tile() {
@@ -287,7 +287,7 @@ mod tests {
         let (pos, _) = tile_of(RowsExtern::PosEmbeds);
         assert_eq!(
             hidden_shape,
-            vec![bound("num_tokens"), bound("backbone_hidden_size")]
+            vec![bound("num_tokens"), bound("target_hidden_size")]
         );
         let consumer = &fuf.nodes[0].inputs;
         assert!(matches!(consumer[0], FufInput::Tile { id, slot: 0 } if id == hidden));

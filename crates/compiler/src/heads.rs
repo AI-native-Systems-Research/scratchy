@@ -12,7 +12,8 @@ pub struct HeadRegistration {
     /// The architecture it registers under (its arch.json `hf_architectures`): what a loader
     /// dispatches it by, wherever its tensors are found.
     pub arch: &'static str,
-    pub embed_tokens: &'static str,
+    /// `None`: the head's embedding is its own (P-EAGLE's, which it trained).
+    pub embed_tokens: Option<&'static str>,
     /// `None`: the head's logits are its own (Gemma 4's assistant: its tied embedding).
     pub lm_head: Option<&'static str>,
     pub lm_head_rows: u32,
@@ -73,7 +74,7 @@ impl HeadRegistration {
     /// The on-disk prefix the head loads `w` from, when it borrows `w`.
     pub fn prefix(&self, w: crate::LentWeight) -> Option<&'static str> {
         match w {
-            crate::LentWeight::EmbedTokens => Some(self.embed_tokens),
+            crate::LentWeight::EmbedTokens => self.embed_tokens,
             crate::LentWeight::LmHead => self.lm_head,
         }
     }
@@ -154,7 +155,7 @@ mod tests {
         };
         let head = HeadRegistration {
             arch: "Gemma4AssistantForCausalLM",
-            embed_tokens: "model.target_embed_tokens",
+            embed_tokens: Some("model.target_embed_tokens"),
             lm_head: None,
             lm_head_rows: 262_144,
             reads_target_kv: true,

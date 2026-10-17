@@ -1,0 +1,5 @@
+{
+  "_comment": "The target this drafter reads (openai/gpt-oss-20b, the gpt-oss `gpt-oss-20b` config): its 24 layers, and the three whose input residual stream it fuses — vLLM's EAGLE-3 default for a config that names none, (2, n/2, n - 3), under vLLM's own key.",
+  "target_num_hidden_layers": 24,
+  "eagle_aux_hidden_state_layer_ids": [2, 12, 21]
+}

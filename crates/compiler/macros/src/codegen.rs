@@ -174,6 +174,7 @@ pub(crate) fn lent_weight_prefix(
         ))
     };
     match w {
+        LentWeight::EmbedTokens if !borrowed("embed_tokens") => None,
         LentWeight::LmHead if !borrowed("lm_head") => None,
         LentWeight::LmHead if !model.tie_word_embeddings => {
             let id = program.weights.find(&["lm_head"])?;
@@ -14215,15 +14216,19 @@ pub fn emit_model(
                 _ => None,
             }
         });
-        let fused_mlp = l.input.ops.iter().all(|od| {
-            !matches!(
-                od.op,
-                scratchy_subtile::subtile_ir::SubOp::MatmulTile {
-                    weight: scratchy_subtile::lower::GemmWeight::Affine { .. },
-                    ..
-                }
-            )
-        });
+        // Whether the MLP's gate/up projections are dense — the pairs, not every matmul: a dense
+        // drafter borrowing its target's affine lm_head (P-EAGLE) still packs its dense pairs.
+        let fused_mlp = (0..l.input.ops.len())
+            .filter_map(|i| crate::weight_bindings::gate_up_pair(&l, i))
+            .all(|(_, gate, _)| {
+                !matches!(
+                    l.input.ops[gate].op,
+                    scratchy_subtile::subtile_ir::SubOp::MatmulTile {
+                        weight: scratchy_subtile::lower::GemmWeight::Affine { .. },
+                        ..
+                    }
+                )
+            });
         let weight_paths: Vec<Vec<String>> = (0..program.weights.len())
             .map(|i| program.weights.path(WeightId(i as u32)).to_vec())
             .collect();
@@ -14689,12 +14694,12 @@ pub fn emit_model(
             scratchy_forward_compiler::RowsExtern::TargetHidden,
         )
     });
-    // The width of those rows (the `TargetHidden` extern's): its target's hidden size — which a
-    // drafter of its own width (Gemma 4's assistant) reads and exports at, its passes chained at.
+    // The width of those rows (the `TargetHidden` extern's, `target_hidden_size`): its target's
+    // hidden size — which a drafter of its own width (Gemma 4's assistant) reads and exports at,
+    // its passes chained at — or the width it declares (P-EAGLE's three target hidden states).
     let target_hidden_width: u64 = model
         .bounds
-        .get("backbone_hidden_size")
-        .or_else(|| model.bounds.get("hidden_size"))
+        .get("target_hidden_size")
         .copied()
         .unwrap_or(0);
     let (

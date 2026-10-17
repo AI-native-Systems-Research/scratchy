@@ -1971,7 +1971,7 @@ pub fn compile_carrier(
                         panic!("{arch_ident}: a head registers under one identity ({hf_arches:?})");
                     };
                     let HeadFacts {
-                        lent: [Some(embed_tokens), lm_head],
+                        lent: [embed_tokens, lm_head],
                         lm_head_rows,
                         drafts_for,
                         repo_infix,
@@ -1979,19 +1979,17 @@ pub fn compile_carrier(
                         spec,
                         reads_target_kv,
                         ..
-                    } = first
-                    else {
-                        panic!(
-                            "{arch_ident}: a head reading `target_hidden` must name embed_tokens \
-                             (it has {first:?})"
-                        );
-                    };
+                    } = first;
                     let some = |v: &Option<String>| match v {
                         Some(v) => quote! { ::core::option::Option::Some(#v) },
                         None => quote! { ::core::option::Option::None },
                     };
-                    let (lm_head, repo_infix, checkpoint_prefix) =
-                        (some(lm_head), some(repo_infix), some(checkpoint_prefix));
+                    let (embed_tokens, lm_head, repo_infix, checkpoint_prefix) = (
+                        some(embed_tokens),
+                        some(lm_head),
+                        some(repo_infix),
+                        some(checkpoint_prefix),
+                    );
                     let lm_head_rows = proc_macro2::Literal::u32_unsuffixed(*lm_head_rows as u32);
                     let [drafts, verify_rows] =
                         spec.map(|v| u8::try_from(v).expect("a head's spec facts fit a u8"));

@@ -2878,6 +2878,13 @@ fn apply_generic_bound_defaults(bounds: &mut BTreeMap<String, u64>) {
     {
         bounds.insert("backbone_hidden_size".to_string(), h);
     }
+    // The width of the target hidden rows a drafter reads: its target's residual width, unless it
+    // reads several of its target's hidden states side by side (P-EAGLE declares three).
+    if !bounds.contains_key("target_hidden_size")
+        && let Some(&h) = bounds.get("backbone_hidden_size")
+    {
+        bounds.insert("target_hidden_size".to_string(), h);
+    }
     // Per-class attention geometry defaults: uniform-geometry arches
     // never declare global_* keys, but the shape sigs anchor the
     // `attention()` (global-class) tile to `global_head_dim` /
