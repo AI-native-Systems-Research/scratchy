@@ -2845,6 +2845,142 @@ mod response_worker_tests {
         worker.shutdown();
     }
 
+    /// The #546 `submission_mtx` ceiling measurement: how much of
+    /// concurrent multi-stream submission does ONE mutex serialize?
+    /// `queue_cbs` holds `submission_mtx_` across Precheck + PrepareCbs +
+    /// LaunchCbs (`response_worker.cpp:488`) — ONE mutex for every
+    /// pipeline and every stream — so before per-session multi-stream
+    /// matters, the ceiling to know is the aggregate rate one
+    /// `ResponseWorker` admits through `queue_cbs` no matter how many
+    /// threads submit.
+    ///
+    /// MEASUREMENT, not a timing assertion: the test's assertion is the
+    /// same delivery accounting as `concurrent_queue_cbs_...` above (every
+    /// callback exactly once, pending back to zero); the timing is
+    /// PRINTED for the leg to capture (`--nocapture`), never asserted —
+    /// CI hosts vary too much for a wall-clock assert to mean anything.
+    /// The printed `serialized fraction` is the answer to the issue's
+    /// question: 1.0 means concurrent submitters bought nothing (the
+    /// mutex-protected section is the whole cost when the device submit
+    /// is free, which `LoopbackHardware` models), and the single-thread
+    /// rate is then the multi-stream submission ceiling.
+    #[test]
+    fn submission_mtx_ceiling_measurement() {
+        const THREADS: usize = 8;
+        const BATCHES: usize = 200;
+        const CBS_PER_BATCH: u64 = 8;
+        let tag = "[submission-mtx-ceiling]";
+
+        fn run_contended(worker: &Arc<ResponseWorker>) -> Duration {
+            let fired = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let mut submitters = Vec::new();
+            for _ in 0..THREADS {
+                let worker = worker.clone();
+                let fired = fired.clone();
+                submitters.push(std::thread::spawn(move || {
+                    for _ in 0..BATCHES {
+                        let fired = fired.clone();
+                        let cb_fn: CallbackFn = Arc::new(move |_pr: &PendingRequest| {
+                            fired.fetch_add(1, Ordering::Relaxed);
+                        });
+                        worker
+                            .queue_cbs(
+                                cb_fn,
+                                CBS_PER_BATCH,
+                                PipelineId::Compute,
+                                QueuingMode::Regular,
+                                |tags| Ok(tags.iter().map(|t| dummy_cb(*t)).collect()),
+                            )
+                            .expect("QueueCbs failed");
+                    }
+                }));
+            }
+            let start = Instant::now();
+            for s in submitters {
+                s.join().unwrap();
+            }
+            let elapsed = start.elapsed();
+            let total = THREADS * BATCHES * CBS_PER_BATCH as usize;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while (fired.load(Ordering::Relaxed) as usize) < total && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                fired.load(Ordering::Relaxed) as usize,
+                total,
+                "control blocks lost in submission: not every CB's completion callback fired"
+            );
+            assert_eq!(
+                worker.num_pending_requests(),
+                0,
+                "num_pending_requests_ did not return to zero"
+            );
+            elapsed
+        }
+
+        // Baseline: the SAME per-thread work on ONE thread — one
+        // `ResponseWorker` each so neither phase's tag pool starts
+        // drained, and so the contended phase measures a fresh worker's
+        // steady state, not one warmed by the baseline's backlog.
+        let hw = LoopbackHardware::new();
+        let single_worker = ResponseWorker::new(hw.clone() as Arc<dyn HardwareSubmit>);
+        let single_start = Instant::now();
+        {
+            let fired = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            for _ in 0..BATCHES {
+                let fired = fired.clone();
+                let cb_fn: CallbackFn = Arc::new(move |_pr: &PendingRequest| {
+                    fired.fetch_add(1, Ordering::Relaxed);
+                });
+                single_worker
+                    .queue_cbs(
+                        cb_fn,
+                        CBS_PER_BATCH,
+                        PipelineId::Compute,
+                        QueuingMode::Regular,
+                        |tags| Ok(tags.iter().map(|t| dummy_cb(*t)).collect()),
+                    )
+                    .expect("QueueCbs failed");
+            }
+            let total = BATCHES * CBS_PER_BATCH as usize;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while (fired.load(Ordering::Relaxed) as usize) < total && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(fired.load(Ordering::Relaxed) as usize, total);
+        }
+        let single = single_start.elapsed();
+        single_worker.shutdown();
+
+        let hw = LoopbackHardware::new();
+        let contended_worker = ResponseWorker::new(hw as Arc<dyn HardwareSubmit>);
+        let contended = run_contended(&contended_worker);
+        contended_worker.shutdown();
+
+        let single_per_batch_us = single.as_secs_f64() * 1e6 / BATCHES as f64;
+        let contended_per_batch_us = contended.as_secs_f64() * 1e6 / (THREADS * BATCHES) as f64;
+        let serialized_fraction = contended.as_secs_f64() / (THREADS as f64 * single.as_secs_f64());
+        let ceiling_batches_per_ms = (THREADS * BATCHES) as f64 / contended.as_secs_f64() / 1000.0;
+        eprintln!(
+            "{tag} threads={THREADS} batches_per_thread={BATCHES} cbs_per_batch={CBS_PER_BATCH}"
+        );
+        eprintln!(
+            "{tag} single-thread: {single_per_batch_us:.1} us/batch ({:.2} us/cb)",
+            single_per_batch_us / CBS_PER_BATCH as f64
+        );
+        eprintln!(
+            "{tag} contended: {contended_per_batch_us:.1} us/batch/thread over {THREADS} threads"
+        );
+        eprintln!(
+            "{tag} serialized fraction: {serialized_fraction:.2} \
+             (1.0 = concurrent submitters bought nothing; 1/{THREADS} = perfect scaling)"
+        );
+        eprintln!(
+            "{tag} ceiling: one ResponseWorker admits ~{ceiling_batches_per_ms:.1} batches/ms \
+             aggregate, however many streams submit"
+        );
+    }
+
     /// Every response makes it back through `ParseResponseBlocks`, which must
     /// return that pipeline's own count to `FreeResponses` — senlib's
     /// response-slot credit return (`response_worker.cpp:1141-1152`).
