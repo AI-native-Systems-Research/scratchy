@@ -140,6 +140,7 @@ fn identity(env: &[(&str, &str)]) -> DxpIdentity {
         &stand_in_compiler(),
         Path::new(env!("CARGO_TARGET_TMPDIR")),
         env,
+        &[],
     )
     .expect("the platform loader names the stand-in's images")
 }

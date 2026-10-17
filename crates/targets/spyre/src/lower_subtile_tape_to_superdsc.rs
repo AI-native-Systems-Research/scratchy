@@ -5865,8 +5865,12 @@ pub struct GroupInput {
     /// Total bytes, so the staging budget's reservation is exact rather than an estimate.
     pub bytes: usize,
     /// ⭐ CONTENT KEY over exactly what dxp will read, in read order — the bake queue's memo key and
-    /// the persistent cache's. Two groups with the same key compile to the same bytes.
+    /// the persistent cache's. Two groups with the same key compile to the same bytes. It covers
+    /// [`Self::explore`] too: the same json compiled with and without the explorer is different
+    /// output.
     pub key: crate::dxp_cache::GroupDigest,
+    /// Whether dxp runs its chunk-parameter explorer on this group — decided by the group's own trips.
+    pub explore: crate::superdsc_bake::ChunkExplore,
 }
 
 /// Render every launch group's dxp input.
@@ -5922,6 +5926,8 @@ pub fn render_dxp_input(ops: &[EmittedOp], fold: FoldGrouping) -> std::io::Resul
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
             );
         }
+        let explore =
+            crate::superdsc_bake::ChunkExplore::of_group((r.start..r.end).map(|ti| &trips[ti].1));
         let mut files: Vec<(String, String)> = Vec::with_capacity(group_json.len() + 1);
         let mut names: Vec<String> = Vec::with_capacity(group_json.len());
         for (li, j) in group_json.into_iter().enumerate() {
@@ -5934,11 +5940,18 @@ pub fn render_dxp_input(ops: &[EmittedOp], fold: FoldGrouping) -> std::io::Resul
         // order dxp reads them. Hashing anything else would let two different inputs collide, and
         // hashing the directory afterwards would re-read what we just wrote. SHA-256, because the
         // key also names a compiled group on disk across builds ([`crate::dxp_cache`]).
-        let key = crate::dxp_cache::GroupDigest::of(&files);
+        //
+        // ⛔ AND THE EXPLORER SETTING IS COMPILER INPUT — the same json compiles to a different
+        // program with and without it, and it is no longer a process-wide setting the cache's
+        // `DxpIdentity` can see. So it enters the group's own digest, for EVERY group: a store
+        // written before the setting was per group holds explorer-off programs, and a `Run` group
+        // keyed as before would read one back and keep the regression on every warm build.
+        let key = crate::dxp_cache::GroupDigest::of_compile(&files, explore.digest_tag());
         out.push(GroupInput {
             group: gi as u32,
             bytes: files.iter().map(|(_, c)| c.len()).sum(),
             key,
+            explore,
             files,
         });
     }
@@ -7521,11 +7534,10 @@ fn ktir_groups_via_superdsc(
                     std::fs::write(gdir.join(name), contents)
                         .map_err(|e| SuperDscError(e.to_string()))?;
                 }
-                bake.submit(crate::superdsc_bake::SealedGroup::sealed(
+                bake.submit(crate::superdsc_bake::SealedGroup::of_rendered(
                     gdir,
                     id.clone(),
-                    g.bytes,
-                    g.key,
+                    g,
                 ))
                 .map_err(SuperDscError)?;
             }

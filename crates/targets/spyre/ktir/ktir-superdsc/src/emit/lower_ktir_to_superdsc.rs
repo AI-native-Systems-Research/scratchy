@@ -7348,10 +7348,10 @@ pub fn expert_matmul(
     // scale gathers stage the per-channel scales at the OUTPUT's own
     // stick-major arrangement, and the dequant runs as two whole-tensor
     // stick-major legs. The m=1 body below is UNTOUCHED — every decode bundle
-    // is byte-identical. The bake of a bundle carrying this form needs
-    // `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1` (the probe's escape — ONE line in the
-    // bake script's dxp invocation, deliberately not a target-crate env
-    // toggle).
+    // is byte-identical. The group carrying this form compiles with
+    // `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1` (the probe's escape) — set by the
+    // bake on that group's dxp child alone, read off its descriptors
+    // (`superdsc_bake::ChunkExplore`).
     if rows > 1 {
         // The u32 index's stick width — `first_entry` is measured in index sticks, and the
         // per-slot runs start at u32 ELEMENT `s·m_pad`. `m_pad` is a 64-multiple (the pad

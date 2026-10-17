@@ -43,12 +43,29 @@ impl GroupDigest {
     /// Digest `files` in order. Each name and body is length-prefixed so no two different file lists
     /// share a byte stream.
     pub fn of(files: &[(String, String)]) -> GroupDigest {
+        Self::hash(files, None)
+    }
+
+    /// Digest `files` AND the per-group compile setting `tag` dxp is spawned with — what a group's
+    /// compile actually reads when part of its input is per group rather than process-wide (which
+    /// [`DxpIdentity`] covers). The tag is length-prefixed after a marker no file list can produce,
+    /// so a tagged digest never equals an untagged one.
+    pub fn of_compile(files: &[(String, String)], tag: &str) -> GroupDigest {
+        Self::hash(files, Some(tag))
+    }
+
+    fn hash(files: &[(String, String)], tag: Option<&str>) -> GroupDigest {
         let mut h = Sha256::new();
         for (name, body) in files {
             h.update((name.len() as u64).to_le_bytes());
             h.update(name.as_bytes());
             h.update((body.len() as u64).to_le_bytes());
             h.update(body.as_bytes());
+        }
+        if let Some(tag) = tag {
+            h.update(u64::MAX.to_le_bytes());
+            h.update((tag.len() as u64).to_le_bytes());
+            h.update(tag.as_bytes());
         }
         GroupDigest(h.finalize().into())
     }
@@ -166,10 +183,17 @@ pub struct DxpIdentity([u8; 32]);
 
 impl DxpIdentity {
     /// Identify `bin` as it runs under `deeptools`, with `fixed_env` being the variables the bake
-    /// sets on every compile (they replace whatever the build's own environment says).
+    /// sets on every compile (they replace whatever the build's own environment says) and
+    /// `per_group` the ones it sets or clears PER GROUP, whose ambient value no child ever sees — so
+    /// it is not part of the compiler's identity (each group's own value is in its [`GroupDigest`]).
     ///
     /// `None` when the loader trace names no image — the cache then stays off for this build.
-    pub fn probe(bin: &Path, deeptools: &Path, fixed_env: &[(&str, &str)]) -> Option<DxpIdentity> {
+    pub fn probe(
+        bin: &Path,
+        deeptools: &Path,
+        fixed_env: &[(&str, &str)],
+        per_group: &[&str],
+    ) -> Option<DxpIdentity> {
         let images = loaded_images(bin, deeptools, fixed_env)?;
         let mut h = Sha256::new();
         h.update(b"scratchy-dxp-identity-v1\0");
@@ -203,20 +227,7 @@ impl DxpIdentity {
             }
         }
         h.update(b"env\0");
-        let mut env: Vec<(String, String)> = std::env::vars()
-            .filter(|(k, _)| {
-                DEEPTOOLS_ENV.contains(&k.as_str())
-                    || DEEPTOOLS_ENV_PREFIXES.iter().any(|p| k.starts_with(p))
-            })
-            .filter(|(k, _)| !fixed_env.iter().any(|(f, _)| f == k))
-            .collect();
-        env.extend(
-            fixed_env
-                .iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
-        );
-        env.sort();
-        for (k, v) in &env {
+        for (k, v) in &identity_env(std::env::vars(), fixed_env, per_group) {
             h.update((k.len() as u64).to_le_bytes());
             h.update(k.as_bytes());
             h.update((v.len() as u64).to_le_bytes());
@@ -224,6 +235,31 @@ impl DxpIdentity {
         }
         Some(DxpIdentity(h.finalize().into()))
     }
+}
+
+/// The environment a compile runs under, as the identity hashes it: every deeptools variable in
+/// `ambient`, minus the ones the bake overrides (`fixed_env`, whose own values replace them) and the
+/// ones it sets or clears per group (`per_group`, whose ambient value no child sees), sorted.
+fn identity_env(
+    ambient: impl Iterator<Item = (String, String)>,
+    fixed_env: &[(&str, &str)],
+    per_group: &[&str],
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = ambient
+        .filter(|(k, _)| {
+            DEEPTOOLS_ENV.contains(&k.as_str())
+                || DEEPTOOLS_ENV_PREFIXES.iter().any(|p| k.starts_with(p))
+        })
+        .filter(|(k, _)| !fixed_env.iter().any(|(f, _)| f == k))
+        .filter(|(k, _)| !per_group.contains(&k.as_str()))
+        .collect();
+    env.extend(
+        fixed_env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+    );
+    env.sort();
+    env
 }
 
 /// Every file under `dir`, recursively; nothing when `dir` does not exist.
@@ -416,5 +452,41 @@ impl DxpIdentity {
     /// The full identity as hex — the store directory's name.
     pub fn hex(&self) -> String {
         hex32(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⭐ A PER-GROUP KNOB IS NOT THE COMPILER'S. The bake sets or clears
+    /// `DISABLE_ABOVE_LX_CHUNK_EXPLORE` on each child itself, so its ambient value reaches no compile —
+    /// and must not split the store either: the value each group compiled under is in that group's
+    /// own [`GroupDigest`]. Mutation: drop the `per_group` filter and an exported knob changes the
+    /// identity, which then WIPES the store on open.
+    #[test]
+    fn a_per_group_knob_is_left_out_of_the_identity_environment() {
+        let fixed = [("DT_PARALLEL_THREADS", "1")];
+        let knob = ["DISABLE_ABOVE_LX_CHUNK_EXPLORE"];
+        let ambient = |exported: bool| {
+            let mut v = vec![("DT_SOMETHING".to_string(), "x".to_string())];
+            if exported {
+                v.push((
+                    "DISABLE_ABOVE_LX_CHUNK_EXPLORE".to_string(),
+                    "1".to_string(),
+                ));
+            }
+            v.into_iter()
+        };
+        assert_eq!(
+            identity_env(ambient(false), &fixed, &knob),
+            identity_env(ambient(true), &fixed, &knob),
+            "an exported per-group knob must not change the identity"
+        );
+        assert_ne!(
+            identity_env(ambient(false), &fixed, &[]),
+            identity_env(ambient(true), &fixed, &[]),
+            "the knob is a deeptools variable, so without the exclusion it would"
+        );
     }
 }
