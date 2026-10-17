@@ -292,6 +292,265 @@ fn transposed_b_is_placeable(
     ))
 }
 
+/// ⭐ THE PROGRAM'S OWN DEF/USE, AS ONE INDEX — every value's DEFINER, every value's READERS in
+/// program order, and every op's POSITION in it.
+///
+/// # WHY THIS EXISTS, AND WHY IT IS NOT A FRAMEWORK
+///
+/// Until this index, every chain recogniser below rebuilt the same three walks as local
+/// closures: a `def_of` (a `find` per lookup), a `sole_reader` (a filter for exactly one
+/// consumer), and a `splat_value` (constant → splat → value). Three copies of one question
+/// asked of the same IR — the shape this crate refuses everywhere else — and the fused MoE
+/// kernel is the program that makes it untenable: its checked-in dump states ≈1,000 ops in one
+/// `func.func`, with K top-k rounds and K per-pair projections, and every recogniser of those
+/// chains asks the same def/reader/constant questions per link that the silu and rmsnorm
+/// readers already asked.
+///
+/// So this is those closures' ONE implementation, extended with the two facts the fused chains
+/// need and the closures never computed: a value's READERS AS A LIST (a scatter accumulator
+/// has SEVERAL readers, and the question is which one is the accumulator, not whether there is
+/// exactly one), and PROGRAM-ORDER POSITION (a gather must be proven to read a store that
+/// PRECEDES it — no extent or attribute says that; only the order the ops appear in does).
+///
+/// # THE ONE SEMANTIC CHOICE, STATED
+///
+/// The index is built over [`IRFunction::ops_deep`] — every op, regions included, in program
+/// order — which is the walk the silu reader's reader list and the rmsnorm `sole_reader`
+/// already take, for the reason their own comments state: fusing a chain DESTROYS its
+/// intermediates, so a reader hidden inside a region is exactly the consumer a fusion must not
+/// blind itself to. The `def_of` closures the silu, rmsnorm and scale readers each rebuilt
+/// searched the TOP LEVEL only; over the deep walk they answer identically for every value
+/// defined there (the deep walk visits top-level ops first and in order) and additionally
+/// resolve a value a REGION defines, which the top-level `find` silently could not. SSA names
+/// one definer, so the first definer in program order is THE definer.
+///
+/// An op that names the same operand twice (`mulf x, x`) is ONE reader of `x`, not two — the
+/// count every `contains`-based closure it replaced already reported, and the count the silu
+/// reader's more-than-one-reader refusal names.
+pub struct ProgramReads<'f> {
+    ops: Vec<&'f Operation<'static>>,
+    defs: std::collections::HashMap<Ssa, usize>,
+    readers: std::collections::HashMap<Ssa, Vec<usize>>,
+}
+
+/// Read the program's def/use index. ONE pass over [`IRFunction::ops_deep`].
+pub fn program_reads<'f>(f: &'f IRFunction<'static>) -> ProgramReads<'f> {
+    let ops = f.ops_deep();
+    let mut defs: std::collections::HashMap<Ssa, usize> =
+        std::collections::HashMap::with_capacity(ops.len());
+    let mut readers: std::collections::HashMap<Ssa, Vec<usize>> =
+        std::collections::HashMap::with_capacity(ops.len());
+    for (i, o) in ops.iter().enumerate() {
+        // `or_insert` keeps the FIRST definer in program order — the same answer the per-chain
+        // `find` closures gave. SSA makes a second definer unrepresentable, so this stays a
+        // no-op rather than becoming an assertion a malformed producer could trip.
+        if let Some(r) = o.result {
+            defs.entry(r).or_insert(i);
+        }
+        for (n, &v) in o.operands.iter().enumerate() {
+            // `operands[..n].contains`: an op naming `v` on both of its sides reads it ONCE,
+            // so the readers list holds the op once — the count a `contains` filter gives.
+            if !o.operands[..n].contains(&v) {
+                readers.entry(v).or_default().push(i);
+            }
+        }
+    }
+    ProgramReads { ops, defs, readers }
+}
+
+impl<'f> ProgramReads<'f> {
+    /// Every op in program order, regions included — the same list
+    /// [`IRFunction::ops_deep`] returns, held so a recogniser's iteration and this index's
+    /// positions name THE SAME ops.
+    pub fn ops(&self) -> &[&'f Operation<'static>] {
+        &self.ops
+    }
+
+    /// The op at `pos` — a position from [`readers_of`](Self::readers_of) or
+    /// [`pos_of_result`](Self::pos_of_result), turned back into the op it names.
+    pub fn op_at(&self, pos: usize) -> &'f Operation<'static> {
+        self.ops[pos]
+    }
+
+    /// The op that DEFINES `v`, or `None` when `v` is a function argument nothing defines.
+    /// First definer in program order.
+    pub fn def_of(&self, v: Ssa) -> Option<&'f Operation<'static>> {
+        self.defs.get(&v).copied().map(|i| self.ops[i])
+    }
+
+    /// The positions of the ops that READ `v`, in program order. An op naming `v` on both of
+    /// its sides appears once.
+    pub fn readers_of(&self, v: Ssa) -> &[usize] {
+        self.readers.get(&v).map_or(&[], Vec::as_slice)
+    }
+
+    /// `v`'s ONE reader, when exactly one op reads it — the exclusivity a fused chain's links
+    /// are proven by. `None` when none or several do.
+    pub fn sole_reader(&self, v: Ssa) -> Option<&'f Operation<'static>> {
+        match self.readers_of(v) {
+            [only] => Some(self.ops[*only]),
+            _ => None,
+        }
+    }
+
+    /// The POSITION of `v`'s defining op. Precedence questions — does the store that lands the
+    /// top-k ids precede the gather that reads them? — compare positions; no extent or
+    /// attribute can answer them.
+    pub fn pos_of_result(&self, v: Ssa) -> Option<usize> {
+        self.defs.get(&v).copied()
+    }
+
+    /// The position of `op` itself, for RESULTLESS ops (a `ktdp.store`) whose position no
+    /// result can name. ⛔ MATCHED BY ADDRESS: `op` must be a reference this index's own
+    /// storage backs — one taken from [`ops`](Self::ops) or from walking the same function —
+    /// not a copy. `Operation` is `Copy`, so a copied op is a different op even when it
+    /// compares equal: two identical resultless stores are two stores, and only the address
+    /// says which one a position names.
+    pub fn pos_of_op(&self, op: &Operation<'static>) -> Option<usize> {
+        self.ops.iter().position(|o| std::ptr::eq(*o, op))
+    }
+
+    /// A splatted compile-time FLOAT: `arith.constant` → `tensor.splat`, the one spelling this
+    /// crate's producers use and the one `program_scalarmul_scale` already read. The closure
+    /// three recognisers each rebuilt; one implementation now.
+    pub fn splat_value(&self, s: Ssa) -> Option<f64> {
+        let sp = self.def_of(s)?;
+        if sp.op_type != OpKind::TensorSplat {
+            return None;
+        }
+        let c = self.def_of(*sp.operands.first()?)?;
+        if c.op_type != OpKind::ArithConstant {
+            return None;
+        }
+        c.attributes.iter().find_map(|(k, v)| match (k, v) {
+            (AttrKey::Value, Attr::Float(x)) => Some(*x),
+            _ => None,
+        })
+    }
+
+    /// THE `Elementwise(Mul)` / `ScalarMul` TIEBREAK, read off ONE op rather than the whole
+    /// function.
+    ///
+    /// ⭐ THE DISCRIMINATOR IS THE CRATE'S OWN, NOT AN INVENTION. [`Program`]'s doc names it:
+    /// "Elementwise `Mul` and `ScalarMul` are the one pair that needs a tiebreak, and it
+    /// already exists: `program_scalarmul_scale` tells them apart by whether an operand is a
+    /// `tensor.splat`." So an `arith.mulf` with exactly one splatted-constant operand IS a
+    /// scalar multiply — there is no other kind it could be, because `Elementwise(Mul)` needs
+    /// two tensor operands and the splat is not one. Choosing it is applying a documented
+    /// rule, not picking a node kind on the producer's behalf.
+    ///
+    /// ⛔ AND IT MUST BE PER-OP, NOT PER-FUNCTION. `program_scalarmul_scale` reads every
+    /// `arith.mulf` and requires them all to agree, which is exact for a one-node function.
+    /// ONE decoder layer holds 21 `arith.mulf`: most have no splat, and the splatted ones
+    /// carry FOUR DIFFERENT constants — `INV_D` (the rmsnorm reduction divisor), `QK_SCALE`
+    /// (the score scale), and `RM` twice (the residual multipliers). The whole-function
+    /// reader returns `None` there by construction, so the scale has to be read from the op
+    /// that uses it.
+    ///
+    /// Returns `(scale, the tensor operand)`. `None` when this is not a scalar multiply at
+    /// all:
+    ///
+    /// * NEITHER operand is a splat — an ordinary two-tensor `Elementwise(Mul)`, which the
+    ///   1:1 map handles.
+    /// * BOTH are splats — a multiply of two compile-time constants. That is not a scalarmul
+    ///   (there is no tensor to scale) and emitting one would invent an operand; it belongs
+    ///   to constant folding upstream, so it falls through to be refused by name.
+    pub fn splat_scale_of(&self, op: &Operation<'static>) -> Option<(f32, Ssa)> {
+        let [a, b] = op.operands[..] else { return None };
+        match (self.splat_value(a), self.splat_value(b)) {
+            (Some(v), None) => Some((v as f32, b)),
+            (None, Some(v)) => Some((v as f32, a)),
+            // Both or neither: not a scalar multiply. See the doc above.
+            _ => None,
+        }
+    }
+
+    /// THE RUNG-3 BOUND SCALE: the `[1,1]` parameter a `tensor.splat` reads through its load,
+    /// and the tensor operand on the mulf's other side.
+    ///
+    /// `to_ktir`'s `expand_splat_of_scalar_argument` emits exactly that chain for a scalar
+    /// argument (the argument retyped `index`, a `[1,1]` fp16 HBM view, a `[1,1]` access tile
+    /// at corner (0,0), a load), and re-points the splat at the load. So the discriminator is
+    /// structural: a splat whose operand is a `ktdp.load` over a degenerate `[1,1]` view of a
+    /// parameter IS a launch-bound multiplier — the ATTN_SCALE mechanism with the value bound
+    /// per launch instead of baked.
+    ///
+    /// ⛔ FAIL CLOSED ON THE SHAPE: only a BOTH-AXES-DEGENERATE view qualifies (`[1,1]`). A
+    /// splat of a wider parameter (a row vector, a `[1, cols]` gamma — the mb-broadcast
+    /// defect shape) is NOT a bound scalar and must fall through to the 1:1 map and be
+    /// refused there, because emitting a scalarmul for it would address one value where the
+    /// program means a row.
+    ///
+    /// ⛔ AND ON THE PROVENANCE: the view's address operand must be a function ARGUMENT. A
+    /// `[1,1]` load of an intermediate has no binding and no launch spelling, so it is left
+    /// alone rather than misread as one.
+    ///
+    /// ⭐ TAKES THE NODE, not just the op, because the binding tid is the LAUNCH's fact: this
+    /// index answers what the program reads, and `k.bindings` says which slot that read lands
+    /// in. The index must be over `k.func` — one built from another function answers about the
+    /// wrong program.
+    pub fn bound_scale_of(
+        &self,
+        k: &KtirNode,
+        op: &Operation<'static>,
+    ) -> Result<Option<BoundScale>, Error> {
+        let f = &k.func;
+        // The `[1,1]` VIEW a splat-of-load reads, when it reads one: splat → load → tile →
+        // view. Every step is a `def_of` off this index — the same four steps
+        // `region_for_operand` walks.
+        let splat_view = |s: Ssa| -> Option<Ssa> {
+            let sp = self.def_of(s)?;
+            if sp.op_type != OpKind::TensorSplat {
+                return None;
+            }
+            let loaded = *sp.operands.first()?;
+            let ld = self.def_of(loaded)?;
+            if ld.op_type != OpKind::KtdpLoad {
+                return None;
+            }
+            let tile = *ld.operands.first()?;
+            let tl = self.def_of(tile)?;
+            if tl.op_type != OpKind::KtdpConstructAccessTile {
+                return None;
+            }
+            let view = *tl.operands.first()?;
+            let vw = self.def_of(view)?;
+            if vw.op_type != OpKind::KtdpConstructMemoryView {
+                return None;
+            }
+            Some(view)
+        };
+        let [a, b] = op.operands[..] else {
+            return Ok(None);
+        };
+        // Which operand is the splat, which the tensor — the splat may sit on either side. The
+        // TENSOR side is the mulf operand that is not the splat.
+        let (view, tensor) = match (splat_view(a), splat_view(b)) {
+            (Some(view), None) => (view, b),
+            (None, Some(view)) => (view, a),
+            // Both or neither: not a bound scalar multiply. Both-splat is constant folding's
+            // business; neither is an ordinary two-tensor `Elementwise(Mul)`.
+            _ => return Ok(None),
+        };
+        // ⛔ THE BOTH-AXES-DEGENERATE TEST: only a `[1,1]` view qualifies.
+        let vw = self.def_of(view).expect("splat_view found it");
+        let shape = super::lower_ktir_to_superdsc::shape_2d(vw);
+        if shape != Some((1, 1)) {
+            return Ok(None);
+        }
+        // ⛔ THE PARAMETER TEST: the view's address operand must be a function argument, and
+        // the binding tid is that argument's position.
+        let ptr = vw.operands.first().copied();
+        let Some(idx) = f.arguments.iter().position(|(s, _)| Some(*s) == ptr) else {
+            return Ok(None);
+        };
+        let Some(tid) = k.bindings.get(idx).map(|b| b.get()) else {
+            return Ok(None);
+        };
+        Ok(Some(BoundScale { tid, tensor }))
+    }
+}
+
 /// THE RMSNORM CHAIN, as the ONE fused op it is — `out = x · rsqrt(mean(x²) + eps) · gamma`.
 ///
 /// # WHY THIS IS THE FIX AND FILLING THE SCALE REGISTRY WAS NOT
@@ -345,13 +604,14 @@ pub struct RmsNormChain {
 ///
 /// One chain per `math.rsqrt`. An empty `Vec` means the program states none.
 pub fn program_rmsnorm_chains(f: &IRFunction<'static>) -> Result<Vec<RmsNormChain>, Error> {
+    let reads = program_reads(f);
     let mut out = Vec::new();
     for root in f
         .operations
         .iter()
         .filter(|o| o.op_type == OpKind::MathRsqrt)
     {
-        if let Some(c) = rmsnorm_chain_from(f, root)? {
+        if let Some(c) = rmsnorm_chain_from(&reads, f, root)? {
             out.push(c);
         }
     }
@@ -365,27 +625,13 @@ pub fn program_rmsnorm_chains(f: &IRFunction<'static>) -> Result<Vec<RmsNormChai
 /// map rather than be refused. `Err` where it is RECOGNISABLY an attempt at one and a link does not
 /// close, because then the 1:1 map would silently lower a mis-shaped normalisation as separate ops.
 fn rmsnorm_chain_from(
+    reads: &ProgramReads<'_>,
     f: &IRFunction<'static>,
     root: &ktir_core::ir::Operation<'static>,
 ) -> Result<Option<RmsNormChain>, Error> {
-    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
-    let splat_value = |s: Ssa| -> Option<f64> {
-        let sp = def_of(s)?;
-        if sp.op_type != OpKind::TensorSplat {
-            return None;
-        }
-        let c = def_of(*sp.operands.first()?)?;
-        if c.op_type != OpKind::ArithConstant {
-            return None;
-        }
-        c.attributes.iter().find_map(|(k, v)| match (k, v) {
-            (AttrKey::Value, Attr::Float(x)) => Some(*x),
-            _ => None,
-        })
-    };
     // `rsqrt(add)`. A root whose operand is not an `arith.addf` is not this shape and is not an
     // attempt at it — a plain `Elementwise(Rsqrt)`, so `Ok(None)`.
-    let Some(add) = root.operands.first().copied().and_then(def_of) else {
+    let Some(add) = root.operands.first().copied().and_then(|s| reads.def_of(s)) else {
         return Ok(None);
     };
     if add.op_type != OpKind::ArithAddf {
@@ -396,7 +642,7 @@ fn rmsnorm_chain_from(
         let mut e = None;
         let mut m = None;
         for &s in add.operands.iter() {
-            match splat_value(s) {
+            match reads.splat_value(s) {
                 Some(v) => e = Some(v),
                 None => m = Some(s),
             }
@@ -406,7 +652,7 @@ fn rmsnorm_chain_from(
         return Ok(None);
     };
     // `ms = <reduce> · INV_D`.
-    let Some(scale) = def_of(ms) else {
+    let Some(scale) = reads.def_of(ms) else {
         return Ok(None);
     };
     if scale.op_type != OpKind::ArithMulf {
@@ -416,7 +662,7 @@ fn rmsnorm_chain_from(
         let mut d = None;
         let mut r = None;
         for &s in scale.operands.iter() {
-            match splat_value(s) {
+            match reads.splat_value(s) {
                 Some(v) => d = Some(v),
                 None => r = Some(s),
             }
@@ -425,7 +671,7 @@ fn rmsnorm_chain_from(
     }) else {
         return Ok(None);
     };
-    let Some(red) = def_of(red_v) else {
+    let Some(red) = reads.def_of(red_v) else {
         return Ok(None);
     };
     if red.op_type != OpKind::LinalgReduce {
@@ -446,7 +692,7 @@ fn rmsnorm_chain_from(
     }
     // ⛔ THE SQUARE'S TWO OPERANDS MUST BE THE SAME VALUE. `mean(x²)` is `x·x`; `x·y` has the same op
     // kinds and is a different function.
-    let Some(sq) = red.operands.first().copied().and_then(def_of) else {
+    let Some(sq) = red.operands.first().copied().and_then(|s| reads.def_of(s)) else {
         return err(format!("{}: the rmsnorm reduce reads nothing", f.name));
     };
     if sq.op_type != OpKind::ArithMulf {
@@ -478,18 +724,12 @@ fn rmsnorm_chain_from(
         return err(format!("{}: `math.rsqrt` with no result", f.name));
     };
     consumed.push(root_v);
-    let deep = f.ops_deep();
-    let sole_reader = |v: Ssa| -> Option<&ktir_core::ir::Operation<'static>> {
-        let mut it = deep.iter().copied().filter(|o| o.operands.contains(&v));
-        let first = it.next()?;
-        it.next().is_none().then_some(first)
-    };
     // The rank walk is OPTIONAL in shape but its ops are consumed when present: a producer that
     // broadcasts `r` to `[rows, cols]` states expand/collapse/broadcast, and one that keeps it rank-2
     // states none of them.
     let mut cursor = root_v;
     for _ in 0..3 {
-        let Some(next) = sole_reader(cursor) else {
+        let Some(next) = reads.sole_reader(cursor) else {
             break;
         };
         if !matches!(
@@ -504,7 +744,7 @@ fn rmsnorm_chain_from(
     }
     // `x · r` — and ⛔ IT MUST READ THE SAME `x` THAT WAS SQUARED. That is what makes this a
     // normalisation of `x` rather than a scale by an unrelated reciprocal.
-    let Some(scale_mul) = sole_reader(cursor) else {
+    let Some(scale_mul) = reads.sole_reader(cursor) else {
         return err(format!(
             "{}: nothing reads the rmsnorm's `rsqrt` result (through its rank plumbing), so the \
              normalising multiply is missing",
@@ -533,7 +773,7 @@ fn rmsnorm_chain_from(
     };
     consumed.push(scaled);
     // `· gamma` — the learned gain, itself reached through its own rank plumbing.
-    let Some(gain_mul) = sole_reader(scaled) else {
+    let Some(gain_mul) = reads.sole_reader(scaled) else {
         return err(format!(
             "{}: nothing reads `x · rsqrt(...)`. `Program::RmsNorm` applies a learned gain; a \
              normalisation with none is not the shape this door lowers.",
@@ -555,7 +795,7 @@ fn rmsnorm_chain_from(
     // Walk BACK through the gain's rank plumbing to the value a `Region` can be found for.
     let mut gamma = gain_src;
     for _ in 0..3 {
-        let Some(d) = def_of(gamma) else { break };
+        let Some(d) = reads.def_of(gamma) else { break };
         if !matches!(
             d.op_type,
             OpKind::TensorExpandShape | OpKind::TensorCollapseShape | OpKind::LinalgBroadcast
@@ -636,54 +876,38 @@ fn rmsnorm_chain_from(
 /// the 1:1 map, because "`ArithNegf` has no `Program`" would send a reader looking for a missing
 /// `Elementwise` variant when the real answer is that a silu is mis-shaped.
 pub fn program_silu_mul_chains(f: &IRFunction<'static>) -> Result<Vec<SiluMulChain>, Error> {
+    let reads = program_reads(f);
     let mut out = Vec::new();
     for neg in f
         .operations
         .iter()
         .filter(|o| o.op_type == OpKind::ArithNegf)
     {
-        out.push(silu_mul_chain_from(f, neg)?);
+        out.push(silu_mul_chain_from(&reads, f, neg)?);
     }
     Ok(out)
 }
 
 /// The one chain headed by `neg`, proven link by link.
 fn silu_mul_chain_from(
+    reads: &ProgramReads<'_>,
     f: &IRFunction<'static>,
     neg: &ktir_core::ir::Operation<'static>,
 ) -> Result<SiluMulChain, Error> {
-    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
-    let splat_value = |s: Ssa| -> Option<f64> {
-        let sp = def_of(s)?;
-        if sp.op_type != OpKind::TensorSplat {
-            return None;
-        }
-        let c = def_of(*sp.operands.first()?)?;
-        if c.op_type != OpKind::ArithConstant {
-            return None;
-        }
-        c.attributes.iter().find_map(|(k, v)| match (k, v) {
-            (AttrKey::Value, Attr::Float(x)) => Some(*x),
-            _ => None,
-        })
-    };
     // Every op that reads `v`, so a link's exclusivity can be PROVEN rather than assumed.
     //
-    // ⛔⛔⛔ `ops_deep`, NOT `f.operations`, AND THAT IS A CORRECTNESS MATTER RATHER THAN A STYLE
-    // ONE. Fusing these five ops into one descriptor DESTROYS four intermediate values: the device
+    // ⛔⛔⛔ DEEP, NOT TOP-LEVEL, AND THAT IS A CORRECTNESS MATTER RATHER THAN A STYLE ONE.
+    // Fusing these five ops into one descriptor DESTROYS four intermediate values: the device
     // primitive never materialises `-g`, `e^-g`, `1+e^-g` or `silu(g)`. The exclusivity check below
     // is the only thing standing between that and a program where something ELSE reads one of them.
-    // Every other reader in this file walks `f.operations`, which is the TOP LEVEL only — and
-    // `regions()`'s own `deep > top` guard exists in this same file precisely because that blindness
-    // is real. A reader inside an `scf.for` body would be invisible to a top-level walk, the chain
-    // would fuse anyway, and the in-loop consumer would read a value nothing ever wrote. Free for a
-    // straight-line producer, where `ops_deep()` and `operations` are the same list.
-    let deep = f.ops_deep();
-    let readers = |v: Ssa| {
-        deep.iter()
-            .copied()
-            .filter(move |o: &&ktir_core::ir::Operation<'static>| o.operands.contains(&v))
-    };
+    // A reader inside an `scf.for` body would be invisible to a top-level walk, the chain would
+    // fuse anyway, and the in-loop consumer would read a value nothing ever wrote. Free for a
+    // straight-line producer, where the deep walk and `f.operations` are the same list.
+    //
+    // ⭐ THE INDEX IS THAT DEEP WALK: [`ProgramReads`] is built over `ops_deep`, so `readers_of`
+    // answers with the counting already done, and this law lives once — in the index's own doc —
+    // rather than being restated per closure.
+    let readers = |v: Ssa| reads.readers_of(v).iter().map(|&p| reads.op_at(p));
 
     let (Some(gate), Some(neg_v)) = (neg.operands.first().copied(), neg.result) else {
         return err(format!(
@@ -743,7 +967,7 @@ fn silu_mul_chain_from(
         .operands
         .iter()
         .filter(|&&s| s != exp_v)
-        .filter_map(|&s| splat_value(s))
+        .filter_map(|&s| reads.splat_value(s))
         .next();
     match one {
         // Spelled as an inequality rather than `Some(v) if v == 1.0 => {}` plus a catch-all: a
@@ -863,56 +1087,16 @@ enum Lowering {
     RmsNorm(f32),
 }
 
-/// THE `Elementwise(Mul)` / `ScalarMul` TIEBREAK, read off ONE op rather than the whole function.
-///
-/// ⭐ THE DISCRIMINATOR IS THE CRATE'S OWN, NOT AN INVENTION. [`Program`]'s doc names it: "Elementwise
-/// `Mul` and `ScalarMul` are the one pair that needs a tiebreak, and it already exists:
-/// `program_scalarmul_scale` tells them apart by whether an operand is a `tensor.splat`." So an
-/// `arith.mulf` with exactly one splatted-constant operand IS a scalar multiply — there is no other
-/// kind it could be, because `Elementwise(Mul)` needs two tensor operands and the splat is not one.
-/// Choosing it is applying a documented rule, not picking a node kind on the producer's behalf.
-///
-/// ⛔ AND IT MUST BE PER-OP, NOT PER-FUNCTION. `program_scalarmul_scale` reads every `arith.mulf` and
-/// requires them all to agree, which is exact for a one-node function. ONE decoder layer holds 21
-/// `arith.mulf`: most have no splat, and the splatted ones carry FOUR DIFFERENT constants — `INV_D`
-/// (the rmsnorm reduction divisor), `QK_SCALE` (the score scale), and `RM` twice (the residual
-/// multipliers). The whole-function reader returns `None` there by construction, so the scale has to
-/// be read from the op that uses it.
-///
-/// Returns `(scale, the tensor operand)`. `None` when this is not a scalar multiply at all:
-///
-/// * NEITHER operand is a splat — an ordinary two-tensor `Elementwise(Mul)`, which the 1:1 map handles.
-/// * BOTH are splats — a multiply of two compile-time constants. That is not a scalarmul (there is no
-///   tensor to scale) and emitting one would invent an operand; it belongs to constant folding
-///   upstream, so it falls through to be refused by name.
+/// THE `Elementwise(Mul)` / `ScalarMul` TIEBREAK — [`ProgramReads::splat_scale_of`] over a
+/// fresh index, for the callers that hold the function and not a walk's index
+/// (`triton-ktir-superdsc`'s `scales_for`). [`lower_function`]'s own walk calls the method on
+/// the ONE index it builds, so a mulf-heavy program pays for one def/use walk, not one per
+/// `arith.mulf`.
 pub fn splat_scale_of(
     f: &IRFunction<'static>,
     op: &ktir_core::ir::Operation<'static>,
 ) -> Option<(f32, Ssa)> {
-    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
-    // A splatted compile-time FLOAT. `arith.constant` → `tensor.splat` is the only spelling this
-    // crate's producers use, and it is the one `program_scalarmul_scale` already reads.
-    let splat_value = |s: Ssa| -> Option<f64> {
-        let sp = def_of(s)?;
-        if sp.op_type != OpKind::TensorSplat {
-            return None;
-        }
-        let c = def_of(*sp.operands.first()?)?;
-        if c.op_type != OpKind::ArithConstant {
-            return None;
-        }
-        c.attributes.iter().find_map(|(k, v)| match (k, v) {
-            (AttrKey::Value, Attr::Float(x)) => Some(*x),
-            _ => None,
-        })
-    };
-    let [a, b] = op.operands[..] else { return None };
-    match (splat_value(a), splat_value(b)) {
-        (Some(v), None) => Some((v as f32, b)),
-        (None, Some(v)) => Some((v as f32, a)),
-        // Both or neither: not a scalar multiply. See the doc above.
-        _ => None,
-    }
+    program_reads(f).splat_scale_of(op)
 }
 
 /// A rung-3 bound scale: the `[1,1]` parameter a `tensor.splat` reads through its load, and the
@@ -925,84 +1109,14 @@ pub struct BoundScale {
     pub tensor: Ssa,
 }
 
-/// THE RUNG-3 HALF OF THE TIEBREAK: a `tensor.splat` over a `ktdp.load` of a `[1,1]` view of a
-/// function ARGUMENT.
-///
-/// `to_ktir`'s `expand_splat_of_scalar_argument` emits exactly that chain for a scalar argument
-/// (the argument retyped `index`, a `[1,1]` fp16 HBM view, a `[1,1]` access tile at corner (0,0),
-/// a load), and re-points the splat at the load. So the discriminator is structural: a splat whose
-/// operand is a `ktdp.load` over a degenerate `[1,1]` view of a parameter IS a launch-bound
-/// multiplier — the ATTN_SCALE mechanism with the value bound per launch instead of baked.
-///
-/// ⛔ FAIL CLOSED ON THE SHAPE: only a BOTH-AXES-DEGENERATE view qualifies (`[1,1]`). A splat of a
-/// wider parameter (a row vector, a `[1, cols]` gamma — the mb-broadcast defect shape) is NOT a
-/// bound scalar and must fall through to the 1:1 map and be refused there, because emitting a
-/// scalarmul for it would address one value where the program means a row.
-///
-/// ⛔ AND ON THE PROVENANCE: the view's address operand must be a function ARGUMENT. A `[1,1]` load
-/// of an intermediate has no binding and no launch spelling, so it is left alone rather than
-/// misread as one.
+/// THE RUNG-3 BOUND-SCALE TIEBREAK — [`ProgramReads::bound_scale_of`] over a fresh index, for
+/// the callers that hold the node alone (the `zz_the_bound_scale_is_a_launch_binding` suite).
+/// [`lower_function`]'s walk calls the method on the ONE index it builds.
 pub fn bound_scale_of(
     k: &KtirNode,
     op: &ktir_core::ir::Operation<'static>,
 ) -> Result<Option<BoundScale>, Error> {
-    let f = &k.func;
-    // The `[1,1]` VIEW a splat-of-load reads, when it reads one: splat → load → tile → view.
-    // Every step is a `find` over the top level, the same walk `region_for_operand` takes.
-    let splat_view = |s: Ssa| -> Option<ktir_core::ir::Ssa> {
-        let sp = f.operations.iter().find(|o| o.result == Some(s))?;
-        if sp.op_type != OpKind::TensorSplat {
-            return None;
-        }
-        let loaded = *sp.operands.first()?;
-        let ld = f.operations.iter().find(|o| o.result == Some(loaded))?;
-        if ld.op_type != OpKind::KtdpLoad {
-            return None;
-        }
-        let tile = *ld.operands.first()?;
-        let tl = f.operations.iter().find(|o| o.result == Some(tile))?;
-        if tl.op_type != OpKind::KtdpConstructAccessTile {
-            return None;
-        }
-        let view = *tl.operands.first()?;
-        let vw = f.operations.iter().find(|o| o.result == Some(view))?;
-        if vw.op_type != OpKind::KtdpConstructMemoryView {
-            return None;
-        }
-        Some(view)
-    };
-    let [a, b] = op.operands[..] else {
-        return Ok(None);
-    };
-    // Which operand is the splat, which the tensor — the splat may sit on either side. The
-    // TENSOR side is the mulf operand that is not the splat.
-    let (view, tensor) = match (splat_view(a), splat_view(b)) {
-        (Some(view), None) => (view, b),
-        (None, Some(view)) => (view, a),
-        // Both or neither: not a bound scalar multiply. Both-splat is constant folding's
-        // business; neither is an ordinary two-tensor `Elementwise(Mul)`.
-        _ => return Ok(None),
-    };
-    // ⛔ THE BOTH-AXES-DEGENERATE TEST: only a `[1,1]` view qualifies.
-    let vw = f
-        .operations
-        .iter()
-        .find(|o| o.result == Some(view))
-        .expect("splat_view found it");
-    let shape = super::lower_ktir_to_superdsc::shape_2d(vw);
-    if shape != Some((1, 1)) {
-        return Ok(None);
-    }
-    // ⛔ THE PARAMETER TEST: the view's address operand must be a function argument, and the
-    // binding tid is that argument's position.
-    let ptr = vw.operands.first().copied();
-    let Some(idx) = f.arguments.iter().position(|(s, _)| Some(*s) == ptr) else {
-        return Ok(None);
-    };
-    let Some(tid) = k.bindings.get(idx).map(|b| b.get()) else {
-        return Ok(None);
-    };
-    Ok(Some(BoundScale { tid, tensor }))
+    program_reads(&k.func).bound_scale_of(k, op)
 }
 
 /// The [`ReduceKind`] a `linalg.reduce` states, read off its own `ReduceFn` attribute.
@@ -1123,9 +1237,9 @@ fn program_broadcast_chains(
 > {
     let mut map: std::collections::HashMap<Ssa, Bcast> = std::collections::HashMap::new();
     let mut consumed: std::collections::HashSet<Ssa> = std::collections::HashSet::new();
-    let deep = f.ops_deep();
-    let def_of = |v: Ssa| deep.iter().copied().find(|o| o.result == Some(v));
-    for bc in deep
+    let reads = program_reads(f);
+    for bc in reads
+        .ops()
         .iter()
         .copied()
         .filter(|o| o.op_type == OpKind::LinalgBroadcast)
@@ -1173,7 +1287,7 @@ fn program_broadcast_chains(
         let mut chain = vec![res];
         let mut saw_degenerate_expand = false;
         for _ in 0..3 {
-            let Some(d) = def_of(cursor) else { break };
+            let Some(d) = reads.def_of(cursor) else { break };
             match d.op_type {
                 OpKind::TensorExpandShape => {
                     // ⛔ THE DEGENERATE DIM IS WHAT MAKES THIS A BROADCAST. `TargetShape` states the
@@ -1476,6 +1590,13 @@ pub fn lower_function(
         .collect();
     let mut gather_carried = vec![false; gathers.len()];
 
+    // ⭐ THE PROGRAM'S DEF/USE, built ONCE for the walk below. The two scale tiebreaks ask
+    // def-of questions per `arith.mulf`, and a mulf-heavy fused kernel would pay for a fresh
+    // def/use walk per op — expansion cost this door refuses to add. The chain readers above
+    // each build their own index because their signatures are public and function-shaped; the
+    // walk is private to here.
+    let reads = program_reads(f);
+
     for op in f.operations.iter() {
         if is_plumbing(op.op_type) {
             continue;
@@ -1509,7 +1630,7 @@ pub fn lower_function(
         // different multipliers. Checked BEFORE the 1:1 map, which would otherwise route it to
         // `Elementwise(Mul)` and then fail on the splat operand having no `Region`.
         let scalar = (op.op_type == OpKind::ArithMulf)
-            .then(|| splat_scale_of(f, op))
+            .then(|| reads.splat_scale_of(op))
             .flatten();
         // ⭐ RUNG 3: a mulf by a splat of a LOADED `[1,1]` PARAMETER is the SAME tiebreak with the
         // multiplier bound at launch rather than baked. `to_ktir`'s `expand_splat_of_scalar_argument`
@@ -1519,7 +1640,7 @@ pub fn lower_function(
         // BEFORE the 1:1 map, which would otherwise route the op to `Elementwise(Mul)` — the
         // mb-broadcast defect shape, a `[1,1]` region against a full tile.
         let bound_scale = if op.op_type == OpKind::ArithMulf && scalar.is_none() {
-            bound_scale_of(k, op)?
+            reads.bound_scale_of(k, op)?
         } else {
             None
         };
@@ -2952,6 +3073,187 @@ mod silu_chain_tests {
             (cs[0].gate, cs[1].gate),
             (Ssa(0), Ssa(100)),
             "each chain's gate is its own negate's operand"
+        );
+    }
+}
+
+#[cfg(test)]
+mod program_reads_tests {
+    use super::*;
+    use ktir_core::arena::Arena;
+    use ktir_core::ir::Operation;
+    use ktir_core::irtype::IrType;
+
+    /// A constant → splat → mulf chain over one argument, with an optional second reader of the
+    /// splat so `readers_of` has both shapes to answer for. SSA ids are the ops' results.
+    fn probe(second_reader: bool) -> IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let (arg, c0, sp1, m2, m3) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let mut ops = vec![
+            Operation::new(a, Some(c0), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(0.5),
+            ),
+            Operation::new(a, Some(sp1), OpKind::TensorSplat, &[c0]),
+            Operation::new(a, Some(m2), OpKind::ArithMulf, &[sp1, arg]),
+        ];
+        if second_reader {
+            ops.push(Operation::new(a, Some(m3), OpKind::ArithMulf, &[sp1, m2]));
+        }
+        IRFunction {
+            name: "reads_probe",
+            arguments: a.args(vec![(arg, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    /// ⭐ CONTROL — def, readers, position, splat and the scale tiebreak all round-trip through
+    /// ONE index. Without this the corner laws below could all be a broken index rather than
+    /// working guards.
+    #[test]
+    fn defs_readers_positions_and_splats_round_trip() {
+        let f = probe(false);
+        let reads = program_reads(&f);
+        let (arg, c0, sp1, m2) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        // def_of: the splat's definer is the splat; an argument's is none.
+        assert_eq!(
+            reads.def_of(sp1).map(|o| o.op_type),
+            Some(OpKind::TensorSplat)
+        );
+        assert_eq!(
+            reads.def_of(arg),
+            None,
+            "an argument is defined by nothing in the body"
+        );
+        // readers_of / sole_reader: exactly one op reads the splat.
+        let rs = reads.readers_of(sp1);
+        assert_eq!(rs.len(), 1);
+        assert_eq!(reads.op_at(rs[0]).op_type, OpKind::ArithMulf);
+        assert_eq!(reads.sole_reader(sp1).map(|o| o.result), Some(Some(m2)));
+        // Positions: the reader sits AFTER the definer — the whole point of positions.
+        let (d, r) = (
+            reads.pos_of_result(sp1).unwrap(),
+            reads.pos_of_result(m2).unwrap(),
+        );
+        assert!(d < r, "the definer precedes its reader in program order");
+        // splat_value and the tiebreak, off the same index.
+        assert_eq!(reads.splat_value(sp1), Some(0.5));
+        assert_eq!(
+            reads.splat_scale_of(reads.op_at(r)),
+            Some((0.5, arg)),
+            "one splatted operand, the other the tensor: the ScalarMul tiebreak"
+        );
+        assert_eq!(
+            reads.splat_value(c0),
+            None,
+            "the constant itself is not a splat"
+        );
+    }
+
+    /// A second reader retires `sole_reader` without touching `readers_of`'s order — the
+    /// exclusivity a fused chain's links are proven by is a QUESTION, not a constant.
+    #[test]
+    fn a_second_reader_retires_sole_reader_but_keeps_the_list() {
+        let f = probe(true);
+        let reads = program_reads(&f);
+        let rs = reads.readers_of(Ssa(2));
+        assert_eq!(rs.len(), 2, "both mulfs read the splat");
+        assert!(rs[0] < rs[1], "readers are listed in program order");
+        assert_eq!(reads.sole_reader(Ssa(2)), None);
+    }
+
+    /// ⛔ AN OP NAMING THE SAME OPERAND ON BOTH SIDES IS ONE READER. The silu reader's
+    /// more-than-one-reader refusal counts READERS, not operand slots — `mulf x, x` is ONE op
+    /// reading `x`, not two — and the index's count must agree with the `contains`-based filter
+    /// it replaced, or that refusal's arithmetic changes under it.
+    #[test]
+    fn an_op_naming_both_sides_is_one_reader() {
+        let a: &'static Arena = Arena::global();
+        let arg = Ssa(0);
+        let f = IRFunction {
+            name: "square_probe",
+            arguments: a.args(vec![(arg, IrType::Index)]),
+            operations: a.ops(vec![Operation::new(
+                a,
+                Some(Ssa(1)),
+                OpKind::ArithMulf,
+                &[arg, arg],
+            )]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let reads = program_reads(&f);
+        assert_eq!(reads.readers_of(arg).len(), 1, "`mulf x, x` reads `x` once");
+        assert_eq!(
+            reads.sole_reader(arg).map(|o| o.op_type),
+            Some(OpKind::ArithMulf)
+        );
+    }
+
+    /// ⛔ THE DEEP LAW: a value a REGION defines resolves, where the top-level `find` closures
+    /// this index replaced were silently blind. That blindness is the silu reader's own stated
+    /// fear — a reader inside an `scf.for` body invisible to a top-level walk — and the index
+    /// is the one walk that cannot have it. Pinned on the smallest program that states it: a
+    /// loop body squaring the argument, a top-level op reading the square.
+    #[test]
+    fn a_region_defined_value_resolves() {
+        let a: &'static Arena = Arena::global();
+        let (arg, r4, r5, r6) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let body = vec![Operation::new(a, Some(r5), OpKind::ArithMulf, &[arg, arg])];
+        let forop = Operation {
+            regions: a.regions(vec![a.ops(body)]),
+            ..Operation::new(a, Some(r4), OpKind::ScfFor, &[])
+        };
+        let f = IRFunction {
+            name: "region_probe",
+            arguments: a.args(vec![(arg, IrType::Index)]),
+            operations: a.ops(vec![
+                forop,
+                Operation::new(a, Some(r6), OpKind::ArithAddf, &[r5, r5]),
+            ]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let reads = program_reads(&f);
+        // Deep order: the `scf.for` at 0, its body's mulf at 1, the top-level addf at 2.
+        assert_eq!(
+            reads.def_of(r5).map(|o| o.op_type),
+            Some(OpKind::ArithMulf),
+            "the region's mulf is r5's definer; a top-level-only find could not see it"
+        );
+        assert_eq!(reads.pos_of_result(r4), Some(0));
+        assert_eq!(
+            reads.pos_of_result(r5),
+            Some(1),
+            "the body op sits after its loop's own position"
+        );
+        assert_eq!(reads.sole_reader(r5).map(|o| o.result), Some(Some(r6)));
+        assert_eq!(reads.readers_of(arg).len(), 1);
+        assert_eq!(
+            reads.readers_of(arg)[0],
+            1,
+            "the body's `mulf arg, arg` is ONE reader"
+        );
+    }
+
+    /// ⛔ `pos_of_op` MATCHES BY ADDRESS, and a COPY is a different op. `Operation` is `Copy`,
+    /// so nothing stops a caller from holding a copy of an indexed op — and two identical
+    /// resultless stores are two stores, which only the address distinguishes. The copy must
+    /// answer `None` rather than the position of its equal.
+    #[test]
+    fn a_copied_op_is_not_the_indexed_op() {
+        let f = probe(false);
+        let reads = program_reads(&f);
+        let indexed = reads.ops()[0];
+        assert_eq!(reads.pos_of_op(indexed), Some(0));
+        let copy = *indexed;
+        assert_eq!(
+            reads.pos_of_op(&copy),
+            None,
+            "a copy compares equal but is not the op at any position"
         );
     }
 }
