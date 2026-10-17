@@ -18,6 +18,14 @@ pub fn crate_dir() -> PathBuf {
 }
 
 pub fn fixture_path(name: &str) -> PathBuf {
+    // A SHIPPED spyre kernel is diffed from the file the splice splices, not a test-local
+    // copy that could drift (the `triton-numeric` tests' `include_str!` law): its fixture
+    // name is `spyre/<kernel>`.
+    if let Some(kernel) = name.strip_prefix("spyre/") {
+        return crate_dir()
+            .join("../../targets/spyre/kernels")
+            .join(format!("{kernel}.py"));
+    }
     crate_dir()
         .join("../test-fixtures")
         .join(format!("{name}.py"))
@@ -193,6 +201,90 @@ pub fn embedding(name: &str, v: i128, d_model: i128) -> Case {
             ("D_MODEL", Val::Int(d_model)),
             ("BLOCK_M", Val::Int(64)),
             ("EMB_SCALE", Val::Float(12.0)),
+        ],
+    )
+}
+
+/// `expert_slab.py`'s `SIGNATURE`. The routed ids are `*i32` and read one SCALAR at a time
+/// (`tl.load(desc_ids + p)`), the offset of a rank-3 bank's expert axis.
+const EXPERT_SLAB: &[(&str, &str)] = &[
+    ("desc_ids", "*i32"),
+    ("desc_w", "*fp16"),
+    ("desc_x", "*fp16"),
+    ("desc_o", "*fp16"),
+    ("P", "constexpr"),
+    ("E", "constexpr"),
+    ("N", "constexpr"),
+    ("K", "constexpr"),
+];
+
+/// The one expert-slab configuration, matching `expert_slab.constexprs()`.
+pub fn expert_slab() -> Case {
+    build(
+        "expert_slab",
+        "expert_slab",
+        "expert_slab_fwd",
+        EXPERT_SLAB,
+        &[
+            ("P", Val::Int(8)),
+            ("E", Val::Int(8)),
+            ("N", Val::Int(64)),
+            ("K", Val::Int(128)),
+        ],
+    )
+}
+
+/// `kernels/moe.py`'s signature: the router's input, gain, projection and per-expert scale;
+/// the experts' input; the three fp8 banks and their scales; the output; the scratch.
+const MOE: &[(&str, &str)] = &[
+    ("desc_xr", "*fp16"),
+    ("desc_rg", "*fp16"),
+    ("desc_rw", "*fp16"),
+    ("desc_pes", "*fp16"),
+    ("desc_xe", "*fp16"),
+    ("desc_wg", "*fp8e4nv"),
+    ("desc_sg", "*fp16"),
+    ("desc_wu", "*fp8e4nv"),
+    ("desc_su", "*fp16"),
+    ("desc_wd", "*fp8e4nv"),
+    ("desc_sd", "*fp16"),
+    ("desc_o", "*fp16"),
+    ("desc_ids", "*i32"),
+    ("desc_rs", "*fp16"),
+    ("desc_act", "*fp16"),
+    ("M", "constexpr"),
+    ("H", "constexpr"),
+    ("I", "constexpr"),
+    ("E", "constexpr"),
+    ("K", "constexpr"),
+    ("EPS", "constexpr"),
+    ("INV_H", "constexpr"),
+    ("TEMP", "constexpr"),
+    ("INV_QMAX", "constexpr"),
+    ("SCALE_FLOOR", "constexpr"),
+];
+
+/// The fused MoE kernel at the smallest geometry the golden's real-Triton compile admits:
+/// one token, `E = 64` (the router dot's `N` at the M=1 dot floor `(1, 64, 64)`), `K = 8`
+/// (the `[M, K]` id and weight blocks need 16 bytes a row), `H = 128`, `I = 64`.
+pub fn moe() -> Case {
+    let h = 128.0f64;
+    build(
+        "moe",
+        "spyre/moe",
+        "moe_fwd",
+        MOE,
+        &[
+            ("M", Val::Int(1)),
+            ("H", Val::Int(128)),
+            ("I", Val::Int(64)),
+            ("E", Val::Int(64)),
+            ("K", Val::Int(8)),
+            ("EPS", Val::Float(1e-6)),
+            ("INV_H", Val::Float(1.0 / h)),
+            ("TEMP", Val::Float(h.powf(-0.5))),
+            ("INV_QMAX", Val::Float(1.0 / 448.0)),
+            ("SCALE_FLOOR", Val::Float(1.0 / 448.0 / 448.0)),
         ],
     )
 }

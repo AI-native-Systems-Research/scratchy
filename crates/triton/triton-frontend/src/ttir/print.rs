@@ -468,6 +468,20 @@ fn print_op(
             };
             format!("tt.get_program_id {ax} : {}", res_tys.join(", "))
         }
+        // `tt.fp_to_fp %x, rounding = rtne : <src> -> <dst>` — the rounding keyword only on a
+        // narrowing cast (`semantic.py:826`); a widening one prints bare.
+        "tt.fp_to_fp" => {
+            let r = match op.attrs.get("rounding") {
+                Some(Attr::Pred(p)) => format!(", rounding = {p}"),
+                _ => String::new(),
+            };
+            format!(
+                "tt.fp_to_fp {}{r} : {} -> {}",
+                operands.join(", "),
+                m.ty(op.operands[0]),
+                res_tys.join(", ")
+            )
+        }
         "arith.cmpi" | "arith.cmpf" => {
             let p = match op.attrs.get("predicate") {
                 Some(Attr::Pred(p)) => *p,

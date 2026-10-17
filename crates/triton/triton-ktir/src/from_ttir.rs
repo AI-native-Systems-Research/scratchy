@@ -88,6 +88,9 @@ pub const OP_SET: &[&str] = &[
     "arith.divsi",
     "arith.remsi",
     "arith.maxnumf",
+    // The MoE kernel's fp8 clamps (`moe.py`): `tl.minimum` beside `tl.maximum`. `ArithMinnumf`
+    // is modelled one to one, as `ArithMaxnumf` is.
+    "arith.minnumf",
     "arith.extf",
     "arith.truncf",
     "arith.negf", // Other, on purpose
@@ -111,6 +114,13 @@ pub const OP_SET: &[&str] = &[
     "math.exp2",
     "math.rsqrt", // Other, on purpose
     "math.tanh",
+    // `tl.abs` on a float (`moe.py`'s per-token `amax(|x|)`). Rides `Other` like `rsqrt`:
+    // `to_ktir_emit`'s Other arm names `KOpKind::MathAbsf`.
+    "math.absf", // Other, on purpose
+    // `x.to(tl.float8e4nv)` and back (`semantic.py:840`): the MoE kernel's activation codes.
+    // `to_ktir::convert_fp_to_fp` rewrites it to `arith.truncf`/`arith.extf` at the fp8
+    // element type, so no `tt.*` op reaches KTIR.
+    "tt.fp_to_fp",
     // triton
     "tt.get_program_id",
     // `tl.arange` -- the lane vector the router index kernels select with. Its
@@ -123,6 +133,14 @@ pub const OP_SET: &[&str] = &[
     "tt.descriptor_load",
     "tt.descriptor_store",
     "tt.descriptor_gather",
+    // The routed expert id of `expert_slab.ttir.mlir`: one SCALAR read through a pointer,
+    // `tt.addptr %ids, %p : !tt.ptr<i32>, i32` then `tt.load %ptr : !tt.ptr<i32>` -- no
+    // mask, no other, no attributes (the default `isVolatile` prints as nothing). Both
+    // types map one to one (`IrType::Ptr`, `IrType::Scalar`). `convert_ttir_to_ktdp`
+    // consumes the read as the INDIRECT offset of a slab load; a raw TILE load stays
+    // refused by name there (`refuse_raw_tile_access`).
+    "tt.addptr",
+    "tt.load",
     "tt.dot",
     "tt.trans",
     "tt.reduce",
@@ -158,6 +176,10 @@ pub const ATTR_KEYS: &[&str] = &[
     // `Attr::Str` verbatim and `to_ktir_emit` re-keys it `KAttrKey::Predicate`; the
     // emulator and the door both read it to pick the comparison.
     "predicate",
+    // `tt.fp_to_fp`'s `rounding = rtne` (the narrowing cast's keyword, printed bare like a
+    // predicate). Rides `AttrKey::Other`; `to_ktir::convert_fp_to_fp` reads it back by name
+    // and refuses any mode but `rtne`.
+    "rounding",
     // `tt.make_range`'s bounds (`start = 0 : i32`, `end = 64 : i32`), the two integers
     // that name the lane vector's extent. They have no `AttrKey` variant -- the
     // fingerprint-carrying enum stays untouched -- so they ride `AttrKey::Other`,

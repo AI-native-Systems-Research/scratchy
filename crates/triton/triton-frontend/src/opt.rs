@@ -82,7 +82,9 @@ pub fn make_ttir(m: &mut Module) -> Result<()> {
         changed |= fold_constant_arith(m);
         changed |= fold_int_identities(m);
         changed |= fold_constant_int_casts(m);
+        changed |= fold_constant_int_to_float(m);
         changed |= fold_splat_of_constant(m);
+        changed |= rank_reduce_descriptor_loads(m);
         changed |= sort_commutative_operands(m);
         changed |= promote_single_trip_loops(m);
         changed |= cse(m);
@@ -198,6 +200,11 @@ fn fold_int_ops(
                 }
             }
             "arith.divsi" if kb == Some(1) => Some(a),
+            // `tt.addptr %p, 0` -> `%p` (`AddPtrOp::fold`, upstream `Ops.cpp`): a scalar
+            // pointer read at offset 0 -- the first routed pair's expert id -- loads `%p`
+            // itself. MEASURED in `expert_slab.ttir.mlir`: the first `tt.load` reads
+            // `%desc_ids` directly while every later one reads its own `tt.addptr`.
+            "tt.addptr" if kb == Some(0) => Some(a),
             _ => None,
         };
         if let Some(k) = keep {
@@ -205,6 +212,130 @@ fn fold_int_ops(
         }
     }
     changed
+}
+
+//===----------------------------------------------------------------------===//
+// 3c. ttir-combine's rank-reducing descriptor load
+//===----------------------------------------------------------------------===//
+
+/// `tt.reshape (tt.descriptor_load %d[..])` that only DROPS LEADING UNIT DIMS -> the load,
+/// re-typed to the reshape's result (`RankedReduceDescriptorLoads`, upstream
+/// `lib/Dialect/Triton/Transforms/Combine.cpp`, one of `ttir-combine`'s patterns).
+///
+/// The same five conditions as the C++, in its order: the reshape does not allow reorder,
+/// its source is a `tt.descriptor_load` with exactly ONE use, the reshape's rank is lower,
+/// every dropped leading dim is 1, and the kept trailing dims equal the reshape's shape.
+///
+/// MEASURED: `expert_slab.ttir.mlir` has NO `tt.reshape` -- each slab load is
+/// `!tt.tensordesc<1x64x128xf16> -> tensor<64x128xf16>` directly -- while the raw form
+/// reshapes a `tensor<1x64x128xf16>` load. This is the first golden where `ttir-combine`
+/// changes anything, which is why the module header's "not ported" measurement held until
+/// now.
+pub fn rank_reduce_descriptor_loads(m: &mut Module) -> bool {
+    let mut uses: HashMap<ValueId, usize> = HashMap::new();
+    for f in &m.funcs {
+        for b in &f.body.blocks {
+            count_uses(&b.ops, &mut uses);
+        }
+    }
+    let mut defs: HashMap<ValueId, (String, Vec<i64>)> = HashMap::new();
+    for f in &m.funcs {
+        for b in &f.body.blocks {
+            collect_load_defs(&b.ops, &m.values, &mut defs);
+        }
+    }
+    let mut retype: HashMap<ValueId, Type> = HashMap::new();
+    let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
+    for f in &m.funcs {
+        for b in &f.body.blocks {
+            find_rank_reductions(&b.ops, &m.values, &defs, &uses, &mut retype, &mut subst);
+        }
+    }
+    if subst.is_empty() {
+        return false;
+    }
+    for (v, ty) in retype {
+        m.values[v.0 as usize].ty = ty;
+    }
+    // The reshapes are now unused; `dce` in the same fixed point removes them.
+    substitute(m, &subst);
+    true
+}
+
+fn count_uses(ops: &[Op], uses: &mut HashMap<ValueId, usize>) {
+    for op in ops {
+        for o in &op.operands {
+            *uses.entry(*o).or_insert(0) += 1;
+        }
+        for r in &op.regions {
+            for b in &r.blocks {
+                count_uses(&b.ops, uses);
+            }
+        }
+    }
+}
+
+fn collect_load_defs(
+    ops: &[Op],
+    values: &[crate::ttir::ValueInfo],
+    defs: &mut HashMap<ValueId, (String, Vec<i64>)>,
+) {
+    for op in ops {
+        if op.name == "tt.descriptor_load" && op.results.len() == 1 {
+            let r = op.results[0];
+            defs.insert(
+                r,
+                (op.name.clone(), values[r.0 as usize].ty.shape().to_vec()),
+            );
+        }
+        for r in &op.regions {
+            for b in &r.blocks {
+                collect_load_defs(&b.ops, values, defs);
+            }
+        }
+    }
+}
+
+fn find_rank_reductions(
+    ops: &[Op],
+    values: &[crate::ttir::ValueInfo],
+    defs: &HashMap<ValueId, (String, Vec<i64>)>,
+    uses: &HashMap<ValueId, usize>,
+    retype: &mut HashMap<ValueId, Type>,
+    subst: &mut HashMap<ValueId, ValueId>,
+) {
+    for op in ops {
+        for r in &op.regions {
+            for b in &r.blocks {
+                find_rank_reductions(&b.ops, values, defs, uses, retype, subst);
+            }
+        }
+        if op.name != "tt.reshape"
+            || op.attrs.contains_key("allow_reorder")
+            || op.operands.len() != 1
+            || op.results.len() != 1
+        {
+            continue;
+        }
+        let src = op.operands[0];
+        let Some((_, load_shape)) = defs.get(&src) else {
+            continue;
+        };
+        if uses.get(&src).copied() != Some(1) {
+            continue;
+        }
+        let out_ty = &values[op.results[0].0 as usize].ty;
+        let out_shape = out_ty.shape();
+        if out_shape.len() >= load_shape.len() {
+            continue;
+        }
+        let dropped = load_shape.len() - out_shape.len();
+        if load_shape[..dropped].iter().any(|d| *d != 1) || load_shape[dropped..] != *out_shape {
+            continue;
+        }
+        retype.insert(src, out_ty.clone());
+        subst.insert(op.results[0], src);
+    }
 }
 
 //===----------------------------------------------------------------------===//
@@ -278,6 +409,63 @@ pub fn fold_constant_int_casts(m: &mut Module) -> bool {
             op.operands.clear();
             op.attrs.clear();
             op.attrs.insert("value".to_string(), Attr::Int(v, ty));
+            *changed = true;
+        }
+    }
+    for f in &mut m.funcs {
+        for b in &mut f.body.blocks {
+            walk(&mut b.ops, &ints, &tys, &mut changed);
+        }
+    }
+    changed
+}
+
+/// `arith.sitofp` / `arith.uitofp` of an integer CONSTANT -> the float constant, at the
+/// result's own type (`arith::SIToFPOp::fold` / `UIToFPOp::fold`, the canonicalizer's
+/// `constFoldCastOp`).
+///
+/// MEASURED in `moe`: the round-form top-k compares its lane ids against each round's
+/// trace-time `j` (`koffs == j`); upstream's `tensor.__eq__` makes `j` an `i32` constant and
+/// the promotion casts it, so the raw has a `sitofp` of a constant then a `tt.splat` per
+/// round. The golden has neither — eight `dense<j.0> : tensor<8xf16>` constants. Folding the
+/// cast here leaves the splat to [`fold_splat_of_constant`], in the same fixed point.
+///
+/// A SCALAR result only; a tensor `sitofp` of a dense constant is not a form the front end
+/// builds (the tensor lanes come from `tt.make_range`, which is not a constant).
+pub fn fold_constant_int_to_float(m: &mut Module) -> bool {
+    let ints = int_constants(m);
+    if ints.is_empty() {
+        return false;
+    }
+    let tys: Vec<Type> = m.values.iter().map(|v| v.ty.clone()).collect();
+    let mut changed = false;
+    fn walk(ops: &mut [Op], ints: &HashMap<ValueId, i128>, tys: &[Type], changed: &mut bool) {
+        for op in ops.iter_mut() {
+            for r in &mut op.regions {
+                for b in &mut r.blocks {
+                    walk(&mut b.ops, ints, tys, changed);
+                }
+            }
+            if op.results.len() != 1
+                || op.operands.len() != 1
+                || !matches!(op.name.as_str(), "arith.sitofp" | "arith.uitofp")
+            {
+                continue;
+            }
+            let Some(v) = ints.get(&op.operands[0]).copied() else {
+                continue;
+            };
+            let ty = tys[op.results[0].0 as usize].clone();
+            if !ty.is_floating() || ty.is_tensor() {
+                continue;
+            }
+            op.name = "arith.constant".to_string();
+            op.operands.clear();
+            op.attrs.clear();
+            op.attrs.insert(
+                "value".to_string(),
+                Attr::Float(crate::ttir::F64Bits::rounded(v as f64, &ty), ty),
+            );
             *changed = true;
         }
     }
@@ -1179,6 +1367,8 @@ fn is_pure(op: &Op) -> bool {
             | "tt.expand_dims"
             | "tt.make_range"
             | "tt.trans"
+            // `TT_ReshapeOp : TT_Op<"reshape", [Pure, ...]>` (`TritonOps.td`).
+            | "tt.reshape"
             | "tt.addptr"
             | "tt.dot"
             | "tt.get_program_id"

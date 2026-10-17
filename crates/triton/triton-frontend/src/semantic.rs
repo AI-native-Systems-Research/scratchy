@@ -681,6 +681,20 @@ impl Semantic {
             _ => 0,
         };
 
+        // fp8 <=> any float is `tt.fp_to_fp` (`semantic.py:840`), checked BEFORE the
+        // bf16/fp16 route below exactly as upstream orders it. A narrowing cast carries the
+        // default round-to-nearest-even (`:826`), printed `rounding = rtne`; a widening one
+        // carries none.
+        let is_fp8 = |t: &Type| matches!(t, Type::Float(FloatKind::F8E4M3FN));
+        if (is_fp8(&src) && dst_sca.is_floating()) || (src.is_floating() && is_fp8(&dst_sca)) {
+            let attrs: &[(&str, Attr)] = if dw < sw {
+                &[("rounding", Attr::Pred("rtne"))]
+            } else {
+                &[]
+            };
+            return Ok(self.emit1("tt.fp_to_fp", &[v], dst_ty, attrs));
+        }
+
         // bf16 <=> (not fp32) routes through fp32 (`semantic.py:847`).
         let is_narrow_fp = |t: &Type| {
             matches!(
@@ -688,10 +702,10 @@ impl Semantic {
                 Type::Float(FloatKind::F16) | Type::Float(FloatKind::BF16)
             )
         };
-        if is_narrow_fp(&src)
-            && dst_sca.is_floating()
-            && !matches!(dst_sca, Type::Float(FloatKind::F32))
-        {
+        // ⛔ ANY non-f32 destination, not only a float one: upstream's test is
+        // `src.is_fp16() and not dst.is_fp32()`, so `f16 -> i32` (the MoE kernel's routed ids)
+        // is `extf` to f32 THEN `fptosi`, never a direct `fptosi` of the f16.
+        if is_narrow_fp(&src) && !matches!(dst_sca, Type::Float(FloatKind::F32)) {
             let mid = self.cast(v, &Type::f32())?;
             return self.cast(mid, &dst_sca);
         }
@@ -1751,6 +1765,57 @@ impl Semantic {
         Ok(self.emit1("tt.trans", &[v], out, &[("order", Attr::Array(items))]))
     }
 
+    /// `tl.load(ptr)` of a SCALAR pointer -> `tt.load` (`semantic.py`'s `load`, the
+    /// non-block, mask-free branch: "Load by de-referencing the pointer of scalar").
+    ///
+    /// ⛔ ONLY THE SCALAR. A block of pointers is upstream's tile load, which this front end
+    /// does not lower (every tile is read through a descriptor), so it is refused here by
+    /// name rather than emitted and refused three passes later. `isVolatile` keeps its
+    /// default, which `make_ir` prints as nothing.
+    pub fn load(&mut self, ptr: ValueId) -> Result<ValueId> {
+        let elem = match self.ty(ptr) {
+            Type::Ptr(e, _) => (*e).clone(),
+            Type::Tensor(s, e) if matches!(&*e, Type::Ptr(..)) => {
+                return Err(Error::new(
+                    format!(
+                        "tl.load of a [{}] block of pointers is a TILE load, which this front \
+                         end does not lower -- read tiles through tl.make_tensor_descriptor; \
+                         only a scalar pointer read (`tl.load(ptr + offset)`) is supported",
+                        join(&s)
+                    ),
+                    0,
+                    0,
+                ));
+            }
+            other => {
+                return Err(Error::new(
+                    format!("Unsupported ptr type {other} in `tl.load`"),
+                    0,
+                    0,
+                ));
+            }
+        };
+        Ok(self.emit1("tt.load", &[ptr], elem, &[]))
+    }
+
+    /// `tl.reshape(x, shape)` -> `tt.reshape` (`semantic.py`'s `reshape`, `can_reorder`
+    /// false, so no `allow_reorder` attribute). The element count must be preserved, which
+    /// is upstream's only check.
+    pub fn reshape(&mut self, v: ValueId, dst_shape: &[i64]) -> Result<ValueId> {
+        let ty = self.ty(v);
+        let numel: i64 = ty.shape().iter().product();
+        let want: i64 = dst_shape.iter().product();
+        if numel != want {
+            return Err(Error::new(
+                "reshape() cannot change total number of elements in tensor",
+                0,
+                0,
+            ));
+        }
+        let out = Type::Tensor(dst_shape.to_vec(), std::rc::Rc::new(ty.scalar().clone()));
+        Ok(self.emit1("tt.reshape", &[v], out, &[]))
+    }
+
     /// A unary math op on a float tensor: `math.exp`, `math.exp2`, `math.rsqrt`.
     ///
     /// # THE WIDTH GATE IS THE ORACLE'S, and leaving it out was a real gap.
@@ -1804,6 +1869,20 @@ impl Semantic {
     }
 
     /// `maximum` / `minimum` -> `arith.maxnumf` / `arith.minnumf` (or the integer forms).
+    /// `tl.abs` on a float -> `math.absf` at the operand's own type (`math.py:178`). Unlike
+    /// the `math_unary` family it carries no `@_check_dtype`, so an f16 operand stays f16.
+    pub fn abs(&mut self, v: ValueId) -> Result<ValueId> {
+        let ty = self.ty(v);
+        if !ty.is_floating() {
+            return Err(Error::new(
+                format!("tl.abs on {ty} is not lowered: only the floating `math.absf` arm is"),
+                0,
+                0,
+            ));
+        }
+        Ok(self.emit1("math.absf", &[v], ty, &[]))
+    }
+
     pub fn max_min(&mut self, lhs: &Val, rhs: &Val, want_max: bool) -> Result<ValueId> {
         let (l, r) = self.binary_op_type_checking(lhs, rhs, false, false, true, false)?;
         let lt = self.ty(l);

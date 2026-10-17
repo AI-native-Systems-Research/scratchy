@@ -609,20 +609,28 @@ fn truncf(
     ctx: &mut CoreContext,
     _env: &ExecutionEnv,
 ) -> Result<Option<Value>, String> {
-    // Narrow float (e.g. f32 -> f16). Round element values through f16.
+    // Narrow float (e.g. f32 -> f16). Round element values through the RESULT's format:
+    // f16 by default, e4m3 when the result is typed `f8E4M3FN` — the MoE kernel's activation
+    // codes (`tt.fp_to_fp` lowered by `to_ktir::convert_fp_to_fp`), which must round exactly
+    // as the card's `qfp8ch` does or the emulator computes a different W8A8 product.
+    let to_e4m3 = op.result_type.and_then(IrType::elem) == Some(DType::Fp8E4m3);
+    let round = |x: f32| {
+        if to_e4m3 {
+            ktir_core::codec::e4m3_to_f32(ktir_core::codec::f32_to_e4m3(x))
+        } else {
+            widen_f16(narrow_f16(x))
+        }
+    };
+    let dtype = if to_e4m3 { DType::Fp8E4m3 } else { DType::F16 };
     let v = unary_operand(op, ctx, "arith.truncf")?;
     match v {
         Value::Tile(t) => {
-            let data: Vec<f32> = t
-                .as_f32()
-                .iter()
-                .map(|&x| widen_f16(narrow_f16(x)))
-                .collect();
-            Ok(Some(Value::Tile(Tile::compute(data, DType::F16, t.shape))))
+            let data: Vec<f32> = t.as_f32().iter().map(|&x| round(x)).collect();
+            Ok(Some(Value::Tile(Tile::compute(data, dtype, t.shape))))
         }
         Value::Scalar(s) => {
             let x = s.as_f32().ok_or("arith.truncf: non-float scalar")?;
-            Ok(Some(Value::Scalar(Scalar::F32(widen_f16(narrow_f16(x))))))
+            Ok(Some(Value::Scalar(Scalar::F32(round(x)))))
         }
         other => Err(format!("arith.truncf: bad operand {other:?}")),
     }
