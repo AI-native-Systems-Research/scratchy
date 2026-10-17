@@ -171,7 +171,10 @@ fn a_continuation_chunk_takes_the_narrowest_rung_that_finishes_the_prompt() {
         PagedKvPool::prefix_rung_for(&[WINDOW], KvSlot::new(1536), 52),
         Some(0)
     );
-    assert_eq!(PagedKvPool::prefix_rung_for(&[], KvSlot::new(1536), 52), None);
+    assert_eq!(
+        PagedKvPool::prefix_rung_for(&[], KvSlot::new(1536), 52),
+        None
+    );
 }
 
 /// ⭐⭐ THE WORKER'S CHUNK LOOP ON THE PREFIX LADDER, transcribed: every continuation chunk chooses its rung

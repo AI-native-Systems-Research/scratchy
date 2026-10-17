@@ -5508,7 +5508,9 @@ impl PagedKvPool {
         widths
             .iter()
             .position(|&m| {
-                let at = Self::chunk_write_start(want, SlotCount::new(m)).slot().get();
+                let at = Self::chunk_write_start(want, SlotCount::new(m))
+                    .slot()
+                    .get();
                 rows_left + (want.get() - at) <= m
             })
             .or_else(|| widths.len().checked_sub(1))
