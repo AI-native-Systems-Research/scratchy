@@ -1646,7 +1646,7 @@ fn rope_plane_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
     let node = SubtileNode {
         id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
         op: SubOp::RopeRotate {
-            head_dim: ktir_superdsc::head_counts::HeadDim::new(hd),
+            head_dim: scratchy_subtile::model_geometry::HeadDim::new(hd),
             _form: std::marker::PhantomData,
         },
         inputs: vec![whole(0), whole(1), whole(2)],
