@@ -668,6 +668,21 @@ fn unique_producer<F: RopeForm>(
     it.next().is_none().then_some(p)
 }
 
+/// ⭐⭐⭐ THE COMPOSITE ARGMAX'S TABLE FACTS — what [`compute_bundle_layout`] needs about the
+/// recognized tail beyond the vocab: WHICH source tid is the tied lm_head table (the placement
+/// to extend for the NaN sentinel row) and the table's own hidden (that row's width). Built by
+/// the recognition that read them off the graph ([`crate::lower_subtile_tape_to_ktir`]'s
+/// `ArgmaxPlan`), so the layout never re-derives a fact the recognizer already proved.
+pub struct ArgmaxTable {
+    /// The table's row count — the gather's bank height, the ramp's width.
+    pub vocab: u32,
+    /// One embedding row's width in elements — the sentinel row's byte size is `hidden · 2`
+    /// (fp16, the gather's slab width).
+    pub hidden: u32,
+    /// The tied lm-head table's OWN source tid — the placement the sentinel row extends.
+    pub table_tid: u32,
+}
+
 pub fn compute_bundle_layout<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
@@ -689,13 +704,15 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // bundle, which has no layer boundary and therefore cannot bank. A uniform model is one class,
     // so a one-element slice is exactly the pre-class single map.
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
-    // ⭐⭐⭐ THE COMPOSITE ARGMAX'S VOCAB — `Some(vocab)` iff the rolled walk recognized a TIED
+    // ⭐⭐⭐ THE COMPOSITE ARGMAX'S TABLE FACTS — `Some` iff the rolled walk recognized a TIED
     // ONE-REQUEST lm-head tail (see [`crate::lower_subtile_tape_to_ktir::recognize_argmax`]'s
-    // law), so this layout must place the chain's two resident fp32 constants. `None` for every
-    // untied model, prefill bundle and batched rung — a bundle without the composite never
-    // places or stages them. The vocab is the TABLE's own row count (the gather's bank height,
-    // the ramp's width), handed down by the recognition that read it off the graph.
-    argmax_vocab: Option<u32>,
+    // law), so this layout must place the chain's two resident fp32 constants AND extend the
+    // table's placement by one zero row (the NaN sentinel — see the source loop). `None` for
+    // every untied model, prefill bundle and batched rung — a bundle without the composite
+    // never places or stages them, and its table keeps its bare size. The vocab is the TABLE's
+    // own row count (the gather's bank height, the ramp's width), handed down by the
+    // recognition that read it off the graph.
+    argmax: Option<ArgmaxTable>,
 ) -> Result<BundleLayout, SuperDscError> {
     // fp8 W8A8 weights (SEN143_FP8: 1-byte / 128-elem stick) are `input[1]` of any arity-3 MatmulTile.
     // Their device footprint is HALF the fp16 weight — this is the unfakeable 1-byte-read proxy: it is
@@ -989,6 +1006,33 @@ pub fn compute_bundle_layout<F: RopeForm>(
             SegRole::Activation
         };
         pack(tid, role, &mut seg_bytes, &mut placements);
+        // ⭐⭐⭐ THE COMPOSITE ARGMAX'S NaN SENTINEL ROW (#603 PR3a) — the chain's arithmetic
+        //    answers an ALL-NaN (or all-−inf) logits row with idx = V, ONE PAST the table's
+        //    last row, and the gather then reads `[V·H·2, (V+1)·H·2)` of the table's staging.
+        //    The placement covers only `V·H·2`, so an unextended table would make the sentinel
+        //    read PAST the placement — whatever tensor the layout packed next, or past the
+        //    segment itself. Extend the table's OWN placement by one fp16 row (`hidden · 2` B):
+        //    the staging writes exactly `V·H·2` bytes (its bind's own length — the over-bind
+        //    law keeps the tail free), the shadow is ZERO-filled before staging, so row V reads
+        //    ZEROS — in-bounds by construction, not by hoping the next placement is harmless.
+        //    The row is the device's NaN ANSWER (a zero embedding, never the host's token 0 —
+        //    a VALID token the detokenizer would happily emit); the host side treats idx ≥ V
+        //    as a loud step failure naming NaN logits, so the row exists to make the device
+        //    read defined, never to be served.
+        if let Some(argmax) = &argmax
+            && argmax.table_tid == tid
+            && role == SegRole::Weight
+        {
+            let extra = u64::from(argmax.hidden) * 2;
+            let e = placements
+                .get_mut(&tid)
+                .expect("pack inserted the table's placement one statement up");
+            e.size += extra;
+            let seg = role.segment();
+            // Bump the segment total too, or the NEXT pack in this segment would start
+            // inside the sentinel row (and the address audit would refuse the layout).
+            seg_bytes[seg] = seg_bytes[seg].max(align128(e.offset + e.size));
+        }
         // The companion insert — see `oproj_perm_after` above. Hand-built (NOT through `pack`,
         // which would index `ir.tensors[perm]` for a size a reserved tid has no tensor for): same
         // role, same segment, same BANK, same SIZE as the weight it permutes, one 128-aligned
@@ -1429,7 +1473,8 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // precedent), never the f32→sen const bind that narrows to fp16. Placed by the
     // LAYOUT because the door NAMES them by their reserved tids — the router-const law:
     // THE DOOR NAMES, THE LAYOUT PLACES.
-    if let Some(vocab) = argmax_vocab {
+    if let Some(argmax) = &argmax {
+        let vocab = argmax.vocab;
         let seg = SegRole::Activation.segment();
         let mut place_const32 = |tid: u32, rows: u64, cols: u64, seg_bytes: &mut [u64; 7]| {
             let off = seg_bytes[seg];

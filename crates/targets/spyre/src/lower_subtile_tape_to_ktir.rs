@@ -1842,9 +1842,13 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         // emitter's admission are one predicate.
         rows_are_requests || chunk_pages.is_some(),
         &per_layer_ext,
-        // The composite's ramp/V placements ride the same layout pass — placed iff the
-        // recognition fired.
-        argmax_plan.as_ref().map(|p| p.vocab),
+        // The composite's ramp/V placements AND the table's NaN sentinel row ride the same
+        // layout pass — placed iff the recognition fired, from the facts it proved.
+        argmax_plan.as_ref().map(|p| ArgmaxTable {
+            vocab: p.vocab,
+            hidden: p.hidden,
+            table_tid: p.table_tid,
+        }),
     )?;
     // ── THE TAPE'S SEGMENTS: prefix, ONE RANGE PER LOOP (an attention class's body), suffix ──
     // The rolled tape is `prefix; [OpenLoop(body₀) CloseLoop]…[OpenLoop(bodyₙ) CloseLoop]; suffix`

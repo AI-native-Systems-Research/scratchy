@@ -447,6 +447,65 @@ fn an_untied_rung_keeps_the_host_path() {
     );
 }
 
+/// ⭐⭐⭐ THE NaN SENTINEL ROW — the composite answers an all-NaN (or all-−inf) logits row
+/// with idx = V, ONE PAST the table's last row, and the gather then reads
+/// `[V·H·2, (V+1)·H·2)` of the table's staging. The layout extends the table's OWN
+/// placement by exactly one fp16 row (`hidden · 2` B): the staging writes only `V·H·2`
+/// bytes (its bind's own length — the over-bind law keeps the tail free) into a
+/// zero-filled shadow, so row V reads ZEROS — in-bounds by construction, never by hoping
+/// the next placement is harmless. The pinned fact is the DELTA against the SAME fixture
+/// walked untied (not a fixture-specific byte count), the extension never MOVES the table,
+/// and a layout that RETURNS has already passed `audit_layout_addresses` (it runs inside
+/// `compute_bundle_layout`), so the extended placement is proven inside its segment.
+#[test]
+fn the_table_carries_one_sentinel_row_when_the_composite_mints() {
+    let (tied_rolled, rg) = walk_tied(true, Some(tied()), ActiveCap::FULL);
+    let (plain_rolled, _) = walk_tied(true, None, ActiveCap::FULL);
+    let table_tid = lm_head_node(&rg).inputs[1].tensor.index() as u32;
+    let bare = plain_rolled
+        .layout
+        .placements
+        .get(&table_tid)
+        .expect("the table is placed on the untied walk too — the extension is the only delta");
+    let ext = tied_rolled
+        .layout
+        .placements
+        .get(&table_tid)
+        .expect("the table is placed");
+    assert_eq!(
+        ext.size,
+        bare.size + u64::from(H) * 2,
+        "the composite extends the table by EXACTLY one fp16 row — the idx=V gather's read"
+    );
+    assert_eq!(
+        ext.offset, bare.offset,
+        "the extension grows the placement's TAIL; it never moves the table"
+    );
+
+    // RUNG-STABLE, like the consts the composite states: every rung of the ladder mints
+    // the composite, so every rung carries the same sentinel row — a rung that forgot it
+    // would gather past its own table while the ceiling rung's bake stayed clean.
+    let mut rungs = ActiveCap::decode_ladder(256);
+    assert!(
+        rungs.len() >= 2,
+        "the fixture's cap admits interior rungs — else this assert is vacuous"
+    );
+    rungs.push(ActiveCap::FULL);
+    for cap in rungs {
+        let (rolled, _) = walk_tied(true, Some(tied()), cap);
+        let p = rolled
+            .layout
+            .placements
+            .get(&table_tid)
+            .unwrap_or_else(|| panic!("the table is placed at {cap:?}"));
+        assert_eq!(
+            (p.offset, p.size),
+            (ext.offset, ext.size),
+            "the sentinel row is rung-stable at {cap:?}"
+        );
+    }
+}
+
 /// A one-matmul graph — the lm-head ALONE. The recognition runs before the walk's loop
 /// scan, so the smallest graph that reaches it is the result's own producer; `weight`
 /// states the lm-head's staging form, and `m` its row count.
