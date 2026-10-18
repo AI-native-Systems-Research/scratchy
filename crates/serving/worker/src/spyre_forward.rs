@@ -921,6 +921,26 @@ fn chunk_index_table(
     })
 }
 
+/// ⭐ WHAT ONE CHUNK'S FORWARD PRODUCED (#603 PR3a) — the per-row logits the host sampler
+/// reads, or the DEVICE argmax's token. One enum and not `Vec<Vec<f32>>` plus an
+/// `Option<u32>`, because the two outs are mutually exclusive by construction (the flip's
+/// gate is per STEP, [`solo_step_flips_to_device_argmax`]) and a caller must not be able
+/// to hold both — a flipped step's logits never crossed to the host, and an unflipped
+/// step's token is the SAMPLER's to derive, not the forward's.
+pub(crate) enum ChunkOut {
+    /// Per-row logits, the last row last — the host sampler's input (today's only shape
+    /// before the flip; still the shape of every prefill chunk, every sampling step, every
+    /// unminted rung, and the whole emulator path).
+    Rows(Vec<Vec<f32>>),
+    /// The composite argmax's device-side token — one 256 B idx-stick readback, no logits
+    /// row, no host argmax. ⭐ CARD-ONLY BY CONSTRUCTION, and the cfg says so: only the
+    /// device readback mints it, and the emulator has no composite to read one from
+    /// (under `spyre-emu` the flip's gate answers 0, so the consuming arm compiles out
+    /// with the variant). A cfg here is not an env gate — the target is a build fact.
+    #[cfg(feature = "spyre-hw")]
+    Token(u32),
+}
+
 #[cfg(feature = "spyre-hw")]
 pub(crate) fn superdsc_forward_chunk(
     sh: &Shared<'_>,
@@ -952,7 +972,13 @@ pub(crate) fn superdsc_forward_chunk(
     // The pool's geometry, threaded from the model — `chunk_index_table`'s law, ONE spelling (built in
     // `run_request_step` off `Loaded`'s own two numbers).
     pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
-) -> ExecutorResult<Vec<Vec<f32>>> {
+    // ⭐ THE FLIP (#603 PR3a) — this step's token comes off the DEVICE. `run_request_step`
+    // derives it once per step ([`solo_step_flips_to_device_argmax`]: greedy, one token,
+    // a generated position, a rung that minted the composite) and the chunk honors it
+    // only in the decode loop below — the batched-prefill branch above returns `Rows`
+    // whatever the flag says, because a prompt chunk's tail belongs to a later sampler.
+    device_token: bool,
+) -> ExecutorResult<ChunkOut> {
     let n = toks.len();
     if n == 0 {
         return Err(werr("superdsc_forward_chunk: n=0".to_string()));
@@ -1395,7 +1421,7 @@ pub(crate) fn superdsc_forward_chunk(
             // re-forward zero tokens.
             let row = match prefill_logits {
                 Some(row) => row,
-                None if tok_end < tokens.prompt_len(id) => return Ok(Vec::new()),
+                None if tok_end < tokens.prompt_len(id) => return Ok(ChunkOut::Rows(Vec::new())),
                 None => {
                     return Err(werr(format!(
                         "superdsc batched prefill: covered {real_total} tokens but produced no \
@@ -1404,7 +1430,7 @@ pub(crate) fn superdsc_forward_chunk(
                     )));
                 }
             };
-            return Ok(vec![row]);
+            return Ok(ChunkOut::Rows(vec![row]));
         }
     }
     if n_entry > 1 {
@@ -1453,6 +1479,29 @@ pub(crate) fn superdsc_forward_chunk(
     // Per-position rotary row tiled across heads to a `[1, width]` source.
 
     let mut logits_rows: Vec<Vec<f32>> = Vec::with_capacity(n);
+    // The flipped step's token, when this chunk takes the device readback — set by the
+    // loop's ONE iteration (the decode loop only ever runs n == 1; a multi-token prompt
+    // returned from the batched branch above).
+    let mut device_tok: Option<u32> = None;
+    // The step's own timing line, shared by both readbacks so a flipped step is visible in
+    // the same instrument — print-only (`flags().timing`), changes nothing computed.
+    let step_timing = |pos: usize, t: std::time::Instant| {
+        if flags().timing {
+            let rss_gb = std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|s| {
+                    s.split_whitespace()
+                        .nth(1)
+                        .and_then(|p| p.parse::<f64>().ok())
+                })
+                .map(|pages| pages * 4096.0 / 1e9)
+                .unwrap_or(0.0);
+            tracing::debug!(
+                "[timing] forward pos={pos} took {:.2}s rss={rss_gb:.2}GB",
+                t.elapsed().as_secs_f64()
+            );
+        }
+    };
     for (i, &tok) in toks.iter().enumerate() {
         if tok >= vocab {
             return Err(werr(format!("token {tok} >= vocab {vocab}")));
@@ -1632,43 +1681,48 @@ pub(crate) fn superdsc_forward_chunk(
         // INCREMENTAL: write 1 new token at absolute slot `p`; KV stays device-resident.
         let _t_fwd = std::time::Instant::now();
         log_binds(&format!("decode pos={p}"), b.wiring, &acts, &acts_f16);
-        let logits = session
-            .run_step_i32(1, p, &acts, &acts_f16, &acts_i32, true)
-            .map_err(|e| werr(format!("superdsc run_step (pos {p}): {e}")))?
-            .unwrap_or_default();
-        if flags().timing {
-            let rss_gb = std::fs::read_to_string("/proc/self/statm")
-                .ok()
-                .and_then(|s| {
-                    s.split_whitespace()
-                        .nth(1)
-                        .and_then(|p| p.parse::<f64>().ok())
-                })
-                .map(|pages| pages * 4096.0 / 1e9)
-                .unwrap_or(0.0);
-            tracing::debug!(
-                "[timing] forward pos={p} took {:.2}s rss={rss_gb:.2}GB",
-                _t_fwd.elapsed().as_secs_f64()
-            );
+        // ⭐⭐⭐⭐⭐ THE FLIPPED READBACK (#603 PR3a) — a greedy decode step on a rung that
+        // minted the composite takes its token OFF THE DEVICE: the suffix ends at the
+        // gather's row, so `run_step_token` reads the [1, 64] idx stick back (one 256 B
+        // D2H) and the ~100 KB logits row + sen→IEEE convert + host argmax it replaces
+        // never run. Everything else about the step is UNCHANGED — same binds (the row
+        // this step READS is host-staged `embed[tok]`, same as ever: the gather's row
+        // write is the NEXT token's row, which the next step's bind re-uploads
+        // byte-identically from the same tied table), same page map, same KV record. A
+        // sampling step, a prompt-complete step and an unminted rung all take the `else`
+        // and keep today's path exactly — and the batched decode branch never reaches
+        // here with the flag set, because its rungs are m > 1 bundles that mint nothing.
+        if device_token {
+            let sampled = session
+                .run_step_token(1, p, &acts, &acts_f16, &acts_i32)
+                .map_err(|e| werr(format!("superdsc run_step_token (pos {p}): {e}")))?;
+            step_timing(p, _t_fwd);
+            device_tok = Some(sampled);
+        } else {
+            let logits = session
+                .run_step_i32(1, p, &acts, &acts_f16, &acts_i32, true)
+                .map_err(|e| werr(format!("superdsc run_step (pos {p}): {e}")))?
+                .unwrap_or_default();
+            step_timing(p, _t_fwd);
+            let row = logits.get(..vocab).unwrap_or(&logits).to_vec();
+            // ── KCACHE PROBE (SCRATCHY_KCACHE_PROBE): read the layer-0 K cache t9 (resident, Kᵀ [nqh,hd,cap])
+            //    and print per-slot K-vector norms for head 0 around the 64-slot STICK BOUNDARY. If slot 64
+            //    (start of stick 1) shows a discontinuity vs 62/63/65, the K WRITE/VALUE at the boundary is
+            //    wrong (the pos-64 divergence); if smooth, the residue is the device READ or fp16 accumulation.
+            // HOST lm_head ORACLE: recompute logits = t787 @ embed.T on the HOST from the
+            // ON-CARD final-norm output (t787) and the tied embedding (= the lm_head weight).
+            //   host_argmax == oncard t788 argmax ⇒ the on-card lm_head is FAITHFUL to t787,
+            //     so the bug is t787 (the residual DIRECTION the body produced);
+            //   host_argmax != oncard ⇒ the on-card (tiled) lm_head matmul itself is wrong.
+            // Also reveals what token the on-card t787 SHOULD produce under a correct lm_head.
+            // ATTENTION HOST ORACLE: verify layer-0 attention VALUES (the per-head fix made it
+            // finite + context-reading but never proved correct). After this step the K/V cache
+            // (t9/t10, natural [nqh,cap,hd], GQA-replicated) holds slots [0..=p] incl. the just-
+            // written new token, so host attention = softmax(q·kᵀ·scale)·v over [0..=p] — no
+            // separate new-token/GQA handling. cos(host, on-card t343)<1 ⇒ attention compute wrong
+            // (restickify/scores/softmax); cos≈1 ⇒ attention right → bug is MLP/accumulation.
+            logits_rows.push(row);
         }
-        let row = logits.get(..vocab).unwrap_or(&logits).to_vec();
-        // ── KCACHE PROBE (SCRATCHY_KCACHE_PROBE): read the layer-0 K cache t9 (resident, Kᵀ [nqh,hd,cap])
-        //    and print per-slot K-vector norms for head 0 around the 64-slot STICK BOUNDARY. If slot 64
-        //    (start of stick 1) shows a discontinuity vs 62/63/65, the K WRITE/VALUE at the boundary is
-        //    wrong (the pos-64 divergence); if smooth, the residue is the device READ or fp16 accumulation.
-        // HOST lm_head ORACLE: recompute logits = t787 @ embed.T on the HOST from the
-        // ON-CARD final-norm output (t787) and the tied embedding (= the lm_head weight).
-        //   host_argmax == oncard t788 argmax ⇒ the on-card lm_head is FAITHFUL to t787,
-        //     so the bug is t787 (the residual DIRECTION the body produced);
-        //   host_argmax != oncard ⇒ the on-card (tiled) lm_head matmul itself is wrong.
-        // Also reveals what token the on-card t787 SHOULD produce under a correct lm_head.
-        // ATTENTION HOST ORACLE: verify layer-0 attention VALUES (the per-head fix made it
-        // finite + context-reading but never proved correct). After this step the K/V cache
-        // (t9/t10, natural [nqh,cap,hd], GQA-replicated) holds slots [0..=p] incl. the just-
-        // written new token, so host attention = softmax(q·kᵀ·scale)·v over [0..=p] — no
-        // separate new-token/GQA handling. cos(host, on-card t343)<1 ⇒ attention compute wrong
-        // (restickify/scores/softmax); cos≈1 ⇒ attention right → bug is MLP/accumulation.
-        logits_rows.push(row);
     }
     tokens.set_tokens_in_pool(id, start + n);
     // The solo forward wrote its `n` keys at the slot `bind_request_pages` bound it at — this request's
@@ -1686,7 +1740,10 @@ pub(crate) fn superdsc_forward_chunk(
     // per-slot L2 norms for the first few slots. Compare BATCHED vs SEQUENTIAL (same prompt): the
     // sequential t9 is the golden KV. If the batched slot-0..(prompt-1) norms differ, the mq>1
     // prefill computed the wrong KV (H3); if they match, the KV is right and the bug is elsewhere.
-    Ok(logits_rows)
+    Ok(match device_tok {
+        Some(sampled) => ChunkOut::Token(sampled),
+        None => ChunkOut::Rows(logits_rows),
+    })
 }
 
 /// Run `b` ONCE for `toks` at absolute positions `start..start+toks.len()`
@@ -1713,7 +1770,10 @@ pub(crate) fn forward_chunk(
     // The pool's geometry, threaded from the model — one spelling, handed to
     // `superdsc_forward_chunk`'s chunk paths (see `run_request_step`, where it is built).
     pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
-) -> ExecutorResult<Vec<Vec<f32>>> {
+    // ⭐ THE FLIP (#603 PR3a) — `run_request_step`'s own derivation, threaded once; see
+    // `superdsc_forward_chunk`'s parameter of the same name.
+    device_token: bool,
+) -> ExecutorResult<ChunkOut> {
     {
         let SendnnSession::SuperDsc(sb) = session;
         // Split the borrow: the prompt runs through the m=N `prefill` session (if present),
@@ -1744,6 +1804,7 @@ pub(crate) fn forward_chunk(
             toks,
             ctx,
             pool,
+            device_token,
         );
     }
 }
@@ -1764,8 +1825,14 @@ pub(crate) fn forward_chunk(
     tokens: &mut scratchy_serving_engine::input_batch::InputBatch,
     start: usize,
     toks: &[usize],
-) -> ExecutorResult<Vec<Vec<f32>>> {
-    let _ = (prefill_meta, id); // the batched-prefill session pair is a sendnn-only shape
+    // ⭐ THE FLIP (#603 PR3a), the hw twin's parameter of the same name — present so the two
+    // `forward_chunk` definitions keep ONE call site, but UNREACHABLE-true here by construction:
+    // `run_request_step` derives it from `b.facts.argmax_vocab`, which is 0 under the emulator,
+    // so this twin always takes the rows path. (The KTIR emulator has no minted composite to
+    // read an idx stick from — the flip is a device-side question.)
+    device_token: bool,
+) -> ExecutorResult<ChunkOut> {
+    let _ = (prefill_meta, id, device_token); // the batched-prefill session pair is a sendnn-only shape; the token step is a device question
     let n = toks.len();
     // KTIR caps a forward at the baked m_cap. The sendnn paged prefill runs the
     // WHOLE prompt in one forward (s0 = padded bucket up to capacity), so its only
@@ -2023,7 +2090,8 @@ pub(crate) fn forward_chunk(
         // chose. It coincided with row 0 only at n == 1, which is why decode looked correct and a
         // prompt that fit ONE chunk looked correct. MEASURED: the result tensor comes back with
         // ~one row of `vocab` nonzeros and every argmax below `vocab`, i.e. in row 0.
-        Ok(vec![res[..vocab].to_vec()])
+        // `Rows`, never `Token`: the emulator has no minted composite (see `device_token` above).
+        Ok(ChunkOut::Rows(vec![res[..vocab].to_vec()]))
     }
 }
 
@@ -2036,6 +2104,35 @@ pub(crate) fn select_decode(buckets: &[BundleMeta], need: usize) -> &BundleMeta 
         .iter()
         .find(|b| b.capacity >= need)
         .unwrap_or_else(|| buckets.last().expect("at least one decode bucket"))
+}
+
+/// ⭐ DOES THIS SOLO STEP TAKE THE DEVICE TOKEN (#603 PR3a) — the flip's own gate,
+/// [`crate::spyre_exec::solo_step_is_decode`]'s sibling for the readback choice, a
+/// PURE fn (no cfg) so the emulator keeps the host path by answering it, not by
+/// compiling a different step. ALL FOUR conjuncts are load-bearing:
+///
+///   • `greedy` — the request's own params, captured at admission (`ReqState::greedy`).
+///     A sampling request needs the whole distribution, so it keeps the logits D2H
+///     whatever the bundle minted. Per-request by construction, never an env toggle.
+///   • `n == 1` — one token: the step the one-request rung serves. A continuation
+///     chunk (n > 1) is prefill-shaped and its tail belongs to a later sampler.
+///   • `start >= prompt_len` — the step's input row is a GENERATED token, the
+///     [`crate::spyre_exec::solo_step_is_decode`] law. The prompt-complete step (and a
+///     mid-prompt 1-token slice) keeps the host path: one extra logits read per
+///     REQUEST, not per token, and the control legs' semantics stay untouched.
+///   • `argmax_vocab != 0` — the rung THIS step launches minted the composite (the
+///     bake fact, asked of the rung's own layout). Untied models, non-stick vocabs and
+///     staged lm-heads answer 0 and keep the host argmax; the emulator passes 0 too
+///     (it has no device argmax), so the emulator keeps the host path by THIS
+///     predicate, not by a cfg.
+pub(crate) fn solo_step_flips_to_device_argmax(
+    greedy: bool,
+    n: usize,
+    start: usize,
+    prompt_len: usize,
+    argmax_vocab: usize,
+) -> bool {
+    greedy && n == 1 && start >= prompt_len && argmax_vocab != 0
 }
 
 /// Forward `n` positions from `start`, then greedily sample iff this completes
@@ -2100,6 +2197,21 @@ pub(crate) fn run_request_step(
     } else {
         select_decode(&model.decode, start + n)
     };
+    // ⭐ THE FLIP (#603 PR3a): this step's token comes off the DEVICE — one 256 B idx-stick D2H
+    // in place of the ~100 KB logits row, its sen→IEEE convert, and the host argmax — iff
+    // [`solo_step_flips_to_device_argmax`] says so: a GREEDY solo decode step on a rung whose
+    // mint carried the composite. Derived ONCE per step, off the rung actually selected above
+    // (the rung decides the flip, not the model), and threaded to `forward_chunk`, which honors
+    // it only in the decode loop — a prompt chunk's tail belongs to a later sampler. The
+    // emulator answers `argmax_vocab = 0` (no `facts` without a card): it keeps the host path
+    // by the predicate itself, not by a cfg, so the step's SHAPE is the same binary question
+    // on both targets.
+    #[cfg(feature = "spyre-hw")]
+    let argmax_vocab = b.facts.argmax_vocab;
+    #[cfg(not(feature = "spyre-hw"))]
+    let argmax_vocab = 0;
+    let device_token =
+        solo_step_flips_to_device_argmax(req.greedy, n, start, tokens.prompt_len(id), argmax_vocab);
     // OPT-IN (user-directed 2026-07-27): was unconditional on every single request -- pure log spam
     // for normal operation. Gate it behind SCRATCHY_SUPERDSC_DBG (the existing verbose-diagnostic
     // toggle this file already uses elsewhere) so it's there when actually debugging the prefill
@@ -2212,9 +2324,19 @@ pub(crate) fn run_request_step(
     // non-SuperDSC paths are unaffected; a batched prefill session (prefill.is_some) still takes the
     // fast prefill_m+1 chunk above.
     let mut last: Vec<f32> = Vec::new();
+    // ⭐ THE FLIP'S ANSWER, when this step took it: the composite's own token, sentinel-checked
+    // by `predict_token` before it ever got here. The flip implies n == 1, so exactly one chunk
+    // runs and at most one `Token` comes back; every non-flipped step (a prompt-complete step,
+    // a sampling request, the emulator, an unminted rung) sees `None` and host-argmaxes below.
+    // The `mut` rides the `Token` arm's cfg: under the emulator no step can flip, so the
+    // binding is never reassigned there.
+    #[cfg(feature = "spyre-hw")]
+    let mut device_tok: Option<u32> = None;
+    #[cfg(not(feature = "spyre-hw"))]
+    let device_tok: Option<u32> = None;
     let mut pos = start;
     for chunk in toks.chunks(chunk_w) {
-        let rows = forward_chunk(
+        match forward_chunk(
             &sh,
             &mut model.session,
             b,
@@ -2228,13 +2350,25 @@ pub(crate) fn run_request_step(
             ctx,
             #[cfg(feature = "spyre-hw")]
             pool,
-        )?;
-        last = rows.into_iter().next_back().unwrap_or_default();
+            device_token,
+        )? {
+            ChunkOut::Rows(rows) => last = rows.into_iter().next_back().unwrap_or_default(),
+            // The `Token` arm compiles out with its variant (see `ChunkOut`): under the
+            // emulator no construction site exists, so there is nothing to catch.
+            #[cfg(feature = "spyre-hw")]
+            ChunkOut::Token(t) => device_tok = Some(t),
+        }
         pos += chunk.len();
     }
     let p_last = start + n - 1;
     if p_last + 1 >= tokens.prompt_len(id) {
-        let tok = argmax(&last) as u32;
+        // ⭐ THE FLIP'S PAYOFF: when the device answered, its token IS the sample — no logits
+        // row was read back, so there is nothing to `argmax` here. The host `argmax` remains
+        // the sampler for every step that did not flip.
+        let tok = match device_tok {
+            Some(t) => t,
+            None => argmax(&last) as u32,
+        };
         // ⭐ THE SAME TOP-2 GAP AS THE BATCHED PATH, so a mixed run's steps are all visible in one log.
         //
         // Without this, `SCRATCHY_TOP2` covered only the batched sampling site — and a step with ONE live
@@ -2245,5 +2379,33 @@ pub(crate) fn run_request_step(
         Ok(Some(tok))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::solo_step_flips_to_device_argmax;
+
+    #[test]
+    fn every_conjunct_of_the_device_token_flip_is_load_bearing() {
+        // The all-true step: a greedy one-token step at a generated position on a rung
+        // whose mint carried the composite (the mechanism model's whole-stick vocab).
+        assert!(solo_step_flips_to_device_argmax(true, 1, 500, 500, 49152));
+        // A sampling request keeps the logits D2H for its whole life — the sampler
+        // needs the distribution, not the argmax.
+        assert!(!solo_step_flips_to_device_argmax(false, 1, 500, 500, 49152));
+        // A continuation wave (n > 1) is prefill-shaped; its tail belongs to a later
+        // sampler, and the batched branch never carries the flag anyway.
+        assert!(!solo_step_flips_to_device_argmax(true, 96, 96, 500, 49152));
+        // The prompt-complete step keeps the host path — one extra logits read per
+        // REQUEST, not per token, and the control legs stay untouched.
+        assert!(!solo_step_flips_to_device_argmax(true, 1, 499, 500, 49152));
+        // A mid-prompt 1-token slice is a continuation, not a decode step — the
+        // `solo_step_is_decode` law, restated at the flip.
+        assert!(!solo_step_flips_to_device_argmax(true, 1, 1, 500, 49152));
+        // An unminted rung — untied model, staged lm-head, or the emulator, which has
+        // no device argmax to read — answers 0 and keeps the host argmax. This is how
+        // the emulator stays on the host path: by the predicate, not by a cfg.
+        assert!(!solo_step_flips_to_device_argmax(true, 1, 500, 500, 0));
     }
 }
