@@ -233,10 +233,9 @@ async fn assert_reports_cached_tokens(client: &Client, device: &str) {
 /// build ("No backend available for device 'cpu'"), which is also why this
 /// file's older `start_cpu_server` tests cannot run.
 ///
-/// On the hosted `macos-26` CI runner this SKIPS — paravirtual GPU, no Metal 4.
-/// What CI gets from the matching workflow step is compile coverage of this
-/// file; the assertions execute on a real GPU locally and via
-/// `scripts/act-local.sh`.
+/// On the hosted `macos-26` CI runner this would SKIP — paravirtual GPU, no
+/// Metal 4 — so CI only lints this file; the assertions execute on a real GPU,
+/// run locally.
 ///
 /// Uses the DENSE checkpoint, not `TestModels::SMOLLM`: that constant is MLX
 /// 4-bit on metal and will not load without a `quant/<preset>` feature. This

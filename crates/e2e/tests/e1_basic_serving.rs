@@ -33,6 +33,7 @@ fn user_msg(content: &str) -> ChatCompletionMessageParam {
     }
 }
 
+#[cfg(feature = "cuda")]
 fn assistant_msg(content: &str) -> ChatCompletionMessageParam {
     ChatCompletionMessageParam {
         role: "assistant".to_string(),
