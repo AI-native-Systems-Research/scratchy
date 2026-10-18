@@ -1663,10 +1663,22 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // Spyre target does not have; with the check gone the builder's own condition
     // stands again, and the ladder's bottom rung takes the one-pass arm like main.)
     let one_pass = !mask_eff && prefix_len == 0 && new_len == mq && mq > 1;
+    // Every other multi-row shape is the whole-chunk continuation (`attn.py`'s
+    // `_attn_cont_head`), which states its causality in the mask rather than in per-row
+    // tile extents — so it always binds one.
+    let continuation = mq > 1 && !one_pass;
+    if continuation && (prefix_len == 0 || new_len < mq) {
+        return Err(format!(
+            "triton splice: AttnDecode t{}: a {mq}-row attention with a {prefix_len}-row prefix and \
+             a {new_len}-row new block — the whole-chunk continuation needs a live prefix and a new \
+             block covering every row, and a dead prefix with a full new block is the one-pass arm",
+            node.output.tensor.index()
+        ));
+    }
     // THE MASK IS BOUND WHEN A SEGMENT CONSUMES IT — the runtime length mask (decode,
-    // `[1, prefix_len]`) or the causal triangle (the one-pass, `[mq, mq]`). The builder
-    // mints the mask tile in exactly these two arms and no other.
-    let has_mask = mask_eff || one_pass;
+    // `[1, prefix_len]`), the causal triangle (the one-pass, `[mq, mq]`), or the
+    // continuation's `[mq, prefix_len + mq]` prefix-plus-new-block mask.
+    let has_mask = mask_eff || one_pass || continuation;
     // The scale, stated as the kernel's own constexpr so the program's `qk * SCALE` mulf
     // carries exactly the value `program_score_scale` reads back — the door resolves the
     // registry slot FROM that value, so the program and `scalarmul_scales` cannot disagree.

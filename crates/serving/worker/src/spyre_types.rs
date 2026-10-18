@@ -320,16 +320,16 @@ pub(crate) struct SuperDscBundle {
     //
     // If deferred rung building is ever wanted again, it must be built where the OTHER sessions are (at
     // load, serialized — see `runtime::Stream::create`), not from inside a forward.
-    /// `(mq, session)` for the ONE prefill bundle baked with a full resident-prefix sweep — the bundle
-    /// a CONTINUATION chunk (`start > 0`) must run on, because it has resident KV to attend.
+    /// The prefill bundles baked with a full resident-prefix sweep — what a CONTINUATION chunk
+    /// (`start > 0`) must run on, because it has resident KV to attend. See [`PrefixLadder`].
     ///
     /// Every entry in [`prefill_rungs`](Self::prefill_rungs) is baked PREFIX-FREE: at `start == 0`
     /// there is nothing resident, so those 4 prefix blocks would be masked out in full and their 308
     /// ops/layer (43% of the body, ~12,320 launches per forward) would compute nothing.
     ///
-    /// `None` ⇒ no prefix-capable bundle baked, so a continuation chunk cannot run and is refused
+    /// Empty ⇒ no prefix-capable bundle baked, so a continuation chunk cannot run and is refused
     /// rather than silently attending an unswept cache.
-    pub(crate) prefill_prefix: Option<(usize, SuperDscSession)>,
+    pub(crate) prefill_prefix: PrefixLadder,
     /// PAGED: how many pages the pool has. The pool is SHARED — every session above addresses the
     /// same seg2 — so a page belongs to at most one request at a time. This is what replaces "one
     /// cache, one sequence": concurrent requests get DISJOINT pages instead of both writing from
@@ -337,6 +337,75 @@ pub(crate) struct SuperDscBundle {
     ///
     /// Which pages are FREE is derived from the live requests, never stored: see `alloc_pages`.
     pub(crate) pool_pages: usize,
+}
+
+/// ⭐ THE PREFIX-CAPABLE PREFILL LADDER — the sessions a continuation chunk can run on, ascending by width,
+/// and the ONE place a continuation chunk's width is chosen.
+///
+/// The field is private and [`Self::of_built`] is its only mint, so the entries are exactly the sessions
+/// that were BUILT from baked bundles; [`Self::rung_for`] returns a [`PrefixRung`] naming one of them or
+/// nothing, so a chunk cannot be handed a width no bundle was baked at.
+///
+/// ⛔ IT WAS ONE BUNDLE AT THE WIDEST RUNG, and the tail paid for it: granite-3.1-2b's ~2k-token prompt
+/// ran its 52-row tail as a full 512-row chunk, 460 ms against 384 on the 256-row build.
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct PrefixLadder(Vec<(usize, SuperDscSession)>);
+
+/// ONE CHOICE OF [`PrefixLadder`] RUNG, made once per chunk and carried — the chunk's cap, its padded
+/// write, its session and the baked row count its K/V extent is proven against all read THIS value, so
+/// they cannot come from two choices. No public constructor: only [`PrefixLadder::rung_for`] mints one.
+#[cfg(feature = "spyre-hw")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PrefixRung {
+    index: usize,
+    width: usize,
+}
+
+#[cfg(feature = "spyre-hw")]
+impl PrefixRung {
+    pub(crate) fn width(self) -> usize {
+        self.width
+    }
+}
+
+#[cfg(feature = "spyre-hw")]
+impl PrefixLadder {
+    /// The ladder of the sessions that built, sorted ascending by width (the manifest's order already,
+    /// stated again here so a caller cannot hand it an unsorted list that `rung_for` would misread).
+    pub(crate) fn of_built(mut rungs: Vec<(usize, SuperDscSession)>) -> PrefixLadder {
+        rungs.sort_by_key(|(m, _)| *m);
+        PrefixLadder(rungs)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The baked widths, ascending.
+    pub(crate) fn widths(&self) -> Vec<usize> {
+        self.0.iter().map(|(m, _)| *m).collect()
+    }
+
+    /// ⭐ THE RUNG A CONTINUATION CHUNK AT SLOT `want` RUNS ON — `PagedKvPool::prefix_rung_for`'s choice
+    /// for the `rows_left` rows the prompt still has, over the widths that built. `None` only for an empty
+    /// ladder.
+    pub(crate) fn rung_for(&self, want: usize, rows_left: usize) -> Option<PrefixRung> {
+        let widths: Vec<u32> = self.0.iter().map(|(m, _)| *m as u32).collect();
+        let index = PagedKvPool::prefix_rung_for(
+            &widths,
+            scratchy_subtile::sdsc_abstract::KvSlot::new(want as u32),
+            rows_left as u32,
+        )?;
+        Some(PrefixRung {
+            index,
+            width: self.0[index].0,
+        })
+    }
+
+    /// The session of a rung THIS ladder chose.
+    pub(crate) fn session(&mut self, rung: PrefixRung) -> &mut SuperDscSession {
+        &mut self.0[rung.index].1
+    }
 }
 
 #[cfg(feature = "spyre-hw")]
@@ -592,6 +661,18 @@ impl ReqState {
     #[cfg(feature = "spyre-hw")]
     pub(crate) fn page_map(&self, ctx: PageMapCtx<'_>, want: RowPages) -> Option<BlockTable> {
         BlockTable::map_row(&self.kv_hist, ctx.host, want, ctx.part)
+    }
+
+    /// ⭐ THE MAP A PREFILL CHUNK BINDS — [`Self::page_map`] with every page the chunk's `write` lands in
+    /// backed by a host block (see [`BlockTable::map_chunk`]): a window wider than a page writes more
+    /// than the one page holding the history's next slot.
+    #[cfg(feature = "spyre-hw")]
+    pub(crate) fn chunk_page_map(
+        &self,
+        ctx: PageMapCtx<'_>,
+        write: scratchy_subtile::sdsc_abstract::ChunkWrite,
+    ) -> Option<BlockTable> {
+        BlockTable::map_chunk(&self.kv_hist, ctx.host, write, ctx.part)
     }
 
     /// ⭐ WHAT THE SCHEDULER MUST KNOW ABOUT THIS REQUEST'S KV, both halves at once — the slots to

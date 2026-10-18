@@ -118,80 +118,85 @@ def _attn_one_pass_head(h, desc_q, desc_o, desc_kd, desc_vd, desc_mask,  #
 
 
 @triton.jit
-def _attn_cont_row(qi, h, desc_kc, desc_vc, desc_kd, desc_vd, desc_mask,  #
-                   q_desc, o_desc,  #
-                   NQH: tl.constexpr, NKVH: tl.constexpr, HD: tl.constexpr,  #
-                   GQA: tl.constexpr, MQ: tl.constexpr, SWEPT: tl.constexpr,  #
-                   CAP: tl.constexpr, NEW_LEN: tl.constexpr,  #
-                   HAS_MASK: tl.constexpr, KC_ROW: tl.constexpr,  #
-                   KC_COL: tl.constexpr, KD_ROW: tl.constexpr,  #
-                   KD_COL: tl.constexpr, SCALE: tl.constexpr):
-    """One row of one head's continuation arm — the builder's per-(row, head) body,
-    called with `h = program_id(0)` at mq > 1 (one head per program) and from the
-    static head loop at decode. The per-row descriptors are constructed HERE, under
-    the same constexpr guards the inline form had, because a descriptor whose block
-    shape depends on the trace-time row `qi` is constructible only where `qi` is in
-    scope — and passing an undefined guard-conditional name as an argument would
-    evaluate it at trace time, so the raw pointers are the parameters instead."""
+def _attn_cont_head(h, desc_q, desc_o, desc_kc, desc_vc, desc_kd, desc_vd,  #
+                    desc_mask,  #
+                    NQH: tl.constexpr, NKVH: tl.constexpr, HD: tl.constexpr,  #
+                    GQA: tl.constexpr, MQ: tl.constexpr, SWEPT: tl.constexpr,  #
+                    CAP: tl.constexpr, NEW_LEN: tl.constexpr,  #
+                    KC_ROW: tl.constexpr, KC_COL: tl.constexpr,  #
+                    KD_ROW: tl.constexpr, KD_COL: tl.constexpr,  #
+                    SCALE: tl.constexpr):
+    """One head's continuation body, WHOLE-CHUNK: the resident prefix and the chunk's own
+    new block scored for all `MQ` rows at once, combined by one two-segment softmax.
+
+    ⛔ IT WAS A PER-ROW UNROLL, AND THAT WAS THE BAKE'S WIDEST COMPILE. The row loop was
+    `tl.static_range(0, MQ)` with each row's own `[qi + 1, HD]` causal tiles, so the
+    program held `MQ` row bodies whose new-block tiles summed to `MQ(MQ+1)/2` rows — its
+    size grew with `MQ²`. MEASURED, granite-2b: 94.7 s to lower at 256 rows, and at 512 a
+    build-script thread in `to_ktir_emit` for over 25 min at 102 GB without finishing.
+
+    The causality now rides the mask instead of the tile extents, exactly as the one-pass
+    arm's does: the mask parameter is ONE `[MQ, SWEPT + MQ]` additive tile, the prefix's
+    runtime length mask in its first `SWEPT` columns and the new block's row mask in the
+    rest — the causal triangle for a prompt chunk, the diagonal for a decode batch, staged
+    by the host either way (the device has no lane-wise integer compare to derive one,
+    attention_flash delta 10). The program's size is now flat in `MQ`.
+
+    Every fact the door reads off the program is the old arm's: q's first tile is still
+    `HD` columns wide (`[MQ, HD]`, the one-pass arm's own q tile), the cache tiles are
+    `[SWEPT, HD]` (the swept extent `param_read_rows` reads), and the scale is the same
+    immediate multiply on the score dot."""
+    # A continuation always has a live prefix: a chunk with none is the one-pass arm.
+    tl.static_assert(SWEPT > 0)
+    q_width = NQH * HD
     kv_width = NKVH * HD
-    if SWEPT > 0:
-        kc_desc = tl.make_tensor_descriptor(desc_kc, shape=[CAP, kv_width],
-                                            strides=[kv_width, 1],
-                                            block_shape=[SWEPT, HD])
-        vc_desc = tl.make_tensor_descriptor(desc_vc, shape=[CAP, kv_width],
-                                            strides=[kv_width, 1],
-                                            block_shape=[SWEPT, HD])
-    if HAS_MASK:
-        mask_desc = tl.make_tensor_descriptor(desc_mask, shape=[1, SWEPT],
-                                              strides=[SWEPT, 1],
-                                              block_shape=[1, SWEPT])
-    slen: tl.constexpr = qi + 1
-    kd_r = tl.make_tensor_descriptor(desc_kd, shape=[NEW_LEN, kv_width],
-                                     strides=[kv_width, 1],
-                                     block_shape=[slen, HD])
-    vd_r = tl.make_tensor_descriptor(desc_vd, shape=[NEW_LEN, kv_width],
-                                     strides=[kv_width, 1],
-                                     block_shape=[slen, HD])
+    q_wide = tl.make_tensor_descriptor(desc_q, shape=[MQ, q_width],
+                                       strides=[q_width, 1],
+                                       block_shape=[MQ, HD])
+    o_wide = tl.make_tensor_descriptor(desc_o, shape=[MQ, q_width],
+                                       strides=[q_width, 1],
+                                       block_shape=[MQ, HD])
+    kc_desc = tl.make_tensor_descriptor(desc_kc, shape=[CAP, kv_width],
+                                        strides=[kv_width, 1],
+                                        block_shape=[SWEPT, HD])
+    vc_desc = tl.make_tensor_descriptor(desc_vc, shape=[CAP, kv_width],
+                                        strides=[kv_width, 1],
+                                        block_shape=[SWEPT, HD])
+    kd_desc = tl.make_tensor_descriptor(desc_kd, shape=[NEW_LEN, kv_width],
+                                        strides=[kv_width, 1],
+                                        block_shape=[MQ, HD])
+    vd_desc = tl.make_tensor_descriptor(desc_vd, shape=[NEW_LEN, kv_width],
+                                        strides=[kv_width, 1],
+                                        block_shape=[MQ, HD])
+    width: tl.constexpr = SWEPT + MQ
+    mask_c = tl.make_tensor_descriptor(desc_mask, shape=[MQ, width],
+                                       strides=[width, 1],
+                                       block_shape=[MQ, SWEPT])
+    mask_d = tl.make_tensor_descriptor(desc_mask, shape=[MQ, width],
+                                       strides=[width, 1],
+                                       block_shape=[MQ, MQ])
     kvh = h // GQA
-    q = q_desc.load([qi, h * HD])  # [1, HD]
-    # Pass 1.
-    if SWEPT > 0:
-        kc = kc_desc.load([KC_ROW, KC_COL + kvh * HD])  # [SWEPT, HD]
-        qk_c = tl.dot(q, kc.T, out_dtype=tl.float16)  # [1, SWEPT]
-        qk_c = qk_c * SCALE
-        if HAS_MASK:
-            qk_c = qk_c + mask_desc.load([0, 0])
-        m_c = tl.max(qk_c, 1)  # [1]
-    kd = kd_r.load([KD_ROW, KD_COL + kvh * HD])  # [slen, HD]
-    qk_d = tl.dot(q, kd.T, out_dtype=tl.float16)  # [1, slen]
+    q = q_wide.load([0, h * HD])  # [MQ, HD]
+    # Pass 1: both segments' scores for every row, and the per-row global max.
+    kc = kc_desc.load([KC_ROW, KC_COL + kvh * HD])  # [SWEPT, HD]
+    qk_c = tl.dot(q, kc.T, out_dtype=tl.float16)  # [MQ, SWEPT]
+    qk_c = qk_c * SCALE
+    qk_c = qk_c + mask_c.load([0, 0])
+    kd = kd_desc.load([KD_ROW, KD_COL + kvh * HD])  # [MQ, HD]
+    qk_d = tl.dot(q, kd.T, out_dtype=tl.float16)  # [MQ, MQ]
     qk_d = qk_d * SCALE
-    m_d = tl.max(qk_d, 1)  # [1] over the causal rows only
-    if SWEPT > 0:
-        gmax = tl.maximum(m_c, m_d)
-    else:
-        gmax = m_d
-    # Pass 2.
-    if SWEPT > 0:
-        e_c = tl.exp((qk_c - gmax[:, None]).to(tl.float32)).to(tl.float16)
-        s_c = tl.sum(e_c, 1)
+    qk_d = qk_d + mask_d.load([0, SWEPT])
+    gmax = tl.maximum(tl.max(qk_c, 1), tl.max(qk_d, 1))  # [MQ]
+    # Pass 2: exp(score - gmax) and the per-row global sum.
+    e_c = tl.exp((qk_c - gmax[:, None]).to(tl.float32)).to(tl.float16)
     e_d = tl.exp((qk_d - gmax[:, None]).to(tl.float32)).to(tl.float16)
-    s_d = tl.sum(e_d, 1)
-    if SWEPT > 0:
-        gsum = s_c + s_d
-    else:
-        gsum = s_d
-    # Pass 3.
-    if SWEPT > 0:
-        w_c = e_c / gsum[:, None]
-        vc = vc_desc.load([KC_ROW, KC_COL + kvh * HD])  # [SWEPT, HD]
-        o = tl.dot(w_c, vc, out_dtype=tl.float16)  # [1, HD]
-    w_d = e_d / gsum[:, None]
-    vd = vd_r.load([KD_ROW, KD_COL + kvh * HD])  # [slen, HD]
-    o_d = tl.dot(w_d, vd, out_dtype=tl.float16)  # [1, HD]
-    if SWEPT > 0:
-        o_desc.store([qi, h * HD], o + o_d)
-    else:
-        o_desc.store([qi, h * HD], o_d)
+    gsum = tl.sum(e_c, 1) + tl.sum(e_d, 1)  # [MQ]
+    # Pass 3: weighted V, accumulated across the two segments.
+    vc = vc_desc.load([KC_ROW, KC_COL + kvh * HD])  # [SWEPT, HD]
+    vd = vd_desc.load([KD_ROW, KD_COL + kvh * HD])  # [MQ, HD]
+    o = tl.dot(e_c / gsum[:, None], vc, out_dtype=tl.float16)  # [MQ, HD]
+    o_d = tl.dot(e_d / gsum[:, None], vd, out_dtype=tl.float16)  # [MQ, HD]
+    o_wide.store([0, h * HD], o + o_d)
 
 
 @triton.jit
@@ -249,7 +254,7 @@ def attn_fwd(desc_q, desc_o,  #
     # Python `BoolOp` inside a @triton.jit kernel, and both selectors are constexpr so
     # each `if` resolves at trace time anyway.
     if HAS_MASK:
-        if not ONE_PASS:
+        if MQ == 1:
             mask_desc = tl.make_tensor_descriptor(desc_mask, shape=[1, SWEPT],
                                                   strides=[SWEPT, 1],
                                                   block_shape=[1, SWEPT])
@@ -321,26 +326,16 @@ def attn_fwd(desc_q, desc_o,  #
             else:
                 o_desc.store([0, h * HD], o_d)
     else:
-        # ⭐ CASE 3 — PREFILL CONTINUATION: per row, per head, the 3-pass loop over
-        # both segments, the new segment's causal extent `qi + 1`. Per-row causal
-        # tiles are CONSTRUCTIBLE at trace time — `tl.static_range` makes `qi` a
-        # compile-time int — so the row's own `[qi+1, HD]` descriptors spell the
-        # causal extent exactly as the builder does (`slen = qi + 1`), never a
-        # whole-row max.
-        #
-        # ⛔ THE PREFIX SEGMENT IS CONDITIONAL — the `if SWEPT > 0` guards exist for
-        # the `SWEPT == 0` shape (a first chunk baked `ActiveCap::NONE`): the swept
-        # descriptors stay addressed-nowhere and the row's loop over the one new
-        # segment is the causal extent in full. The builder's row loop is the same
-        # shape: its `live` segment list skips the dead prefix, and causality comes
-        # from `qi + 1` either way.
+        # ⭐ CASE 3 — PREFILL CONTINUATION (and a decode batch): both segments, every
+        # row at once, one two-segment softmax — see `_attn_cont_head`. The splice routes
+        # here only with a live prefix and its mask bound (`SWEPT > 0`, `HAS_MASK`); any
+        # other `MQ > 1` shape is the one-pass arm or a refusal.
         #
         # ⭐ THE HEAD AXIS IS THE PROGRAM ID — the builder's `head_pid` form: one
-        # head per program instance at mq > 1, so the op count is ONE head's body
-        # times the row count, not NQH heads' (granite: 32x fewer ops per program,
-        # which is the compile-time law this kernel follows). Decode keeps the
-        # static head loop — the builder loops all heads at mq == 1 too.
-        for qi in tl.static_range(0, MQ, 1):
-            _attn_cont_row(qi, pid, desc_kc, desc_vc, desc_kd, desc_vd, desc_mask,
-                           q_desc, o_desc, NQH, NKVH, HD, GQA, MQ, SWEPT, CAP,
-                           NEW_LEN, HAS_MASK, KC_ROW, KC_COL, KD_ROW, KD_COL, SCALE)
+        # head per program instance at mq > 1, so the op count is ONE head's body,
+        # not NQH heads' (granite: 32x fewer ops per program, which is the compile-time
+        # law this kernel follows). Decode keeps the static head loop — the builder loops
+        # all heads at mq == 1 too.
+        _attn_cont_head(pid, desc_q, desc_o, desc_kc, desc_vc, desc_kd, desc_vd,
+                        desc_mask, NQH, NKVH, HD, GQA, MQ, SWEPT, CAP, NEW_LEN,
+                        KC_ROW, KC_COL, KD_ROW, KD_COL, SCALE)

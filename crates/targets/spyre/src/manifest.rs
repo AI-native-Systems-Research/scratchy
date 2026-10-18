@@ -252,18 +252,23 @@ pub struct SengraphBundleGroup {
     ///
     /// EMPTY ⇒ no ladder; the worker decodes one request per forward, as it always did.
     pub decode_rungs: &'static [(RungSeqs, SweptCols, BundleSentinel)],
-    /// `(mq, sentinel)` of the ONE prefill bundle baked with a full resident-prefix sweep, for chunks
-    /// with `start > 0`. EMPTY string ⇒ absent.
+    /// PREFIX-CAPABLE PREFILL LADDER `[(mq, sentinel)]`, ascending — the bundles baked with a full
+    /// resident-prefix sweep, for chunks with `start > 0`. EMPTY ⇒ none baked.
     ///
     /// Every [`prefill_rungs`](Self::prefill_rungs) entry is baked PREFIX-FREE: a chunk at `start == 0`
     /// has no resident KV to attend, so its 4 prefix blocks would be masked out in full — 308 of the
     /// 710 ops in a prefill layer (43%), about 12,320 launches per forward, launched to compute
     /// nothing. Dropping them is what makes the ladder rungs 402 ops/layer instead of 710.
     ///
-    /// A CONTINUATION chunk does have resident KV and must attend it, so it needs this bundle instead.
-    /// It is baked at the WIDEST rung so one bundle covers every `start <= cap`; such a chunk pays some
-    /// padding, which is the right trade because it is the rarer case.
-    pub prefill_prefix: (u32, &'static str),
+    /// A CONTINUATION chunk does have resident KV and must attend it, so it runs here instead, on the
+    /// SMALLEST entry that holds the rows it has left. The top entry is the prefix-free ladder's top, so
+    /// every mid-prompt chunk is a full window; only the last one can be narrower.
+    ///
+    /// ⛔ ONE WIDTH WAS NOT ENOUGH, MEASURED. This was a single bundle at the widest rung, so a 52-row tail
+    /// ran a full 512-row chunk: granite-3.1-2b's ~2k-token prompt took 460 ms against 384 ms at 256 rows
+    /// (a 512-row continuation group runs 2.08 ms/launch against 1.62 at 256), the whole tail paid as a
+    /// window. A ladder lets the tail run at the page it fits.
+    pub prefill_prefix: &'static [(u32, &'static str)],
 }
 
 /// The per-model sendnn bundle. With the layer-group split it is a vector of

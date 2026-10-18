@@ -2018,6 +2018,16 @@ pub struct EmittedOp {
     /// 0 for every op of an unbatched bundle and for the first request of a batched one, so the
     /// single-request path is untouched.
     pub kv_request: u32,
+    /// ⭐ SLOTS PAST THE LAUNCH'S WRITE CURSOR WHERE THIS OP'S KV STARTS — a whole number of pages,
+    /// non-zero only for the later PAGE PARTS of a prefill chunk whose window spans more than one page.
+    ///
+    /// One launch resolves ONE page per op from the request's block table, at the page holding the op's
+    /// cursor. A window of `PREFILL_WINDOW_PAGES` pages therefore cannot be one write: the emitter cuts
+    /// each `(kv head, slab)` copy into parts of `PAGE_SLOTS` rows, and part `p` carries `p·PAGE_SLOTS`
+    /// here, so the runtime resolves ITS page at `cursor + offset` (`fold_plan::op_slot_pos`). A part
+    /// whose page the request does not hold (a short last chunk's padding) is SKIPPED, never aimed at
+    /// part 0's page. Ops with different offsets never share a group: one group is one page shift.
+    pub kv_slot_offset: u32,
     /// TRUE for a cache-write copy that writes a DISTINCT per-entry slot (the mq>1 PREFILL
     /// per-slot cachewr copies, baked at `qh·cap·hd + s·hd` for distinct `s`). Such copies
     /// MUST NOT be fused into a `GroupKind::Slot` group: the shim applies ONE `slot_pos`
@@ -2123,6 +2133,7 @@ impl EmittedOp {
             kv_fold_rows: Default::default(),
             kv_page_slots: 0,
             kv_request: 0,
+            kv_slot_offset: 0,
             host_kv_write: false,
             kv_n_skip: 0,
             kv_new_k_tid: 0,
@@ -2153,6 +2164,7 @@ impl EmittedOp {
             kv_fold_rows: self.kv_fold_rows,
             kv_page_slots: self.kv_page_slots,
             kv_request: self.kv_request,
+            kv_slot_offset: self.kv_slot_offset,
             slab_write: self.slab_write,
             slab_stride_bytes: self.slab_stride_bytes,
             slot_no_fuse: self.slot_no_fuse,
@@ -2230,6 +2242,7 @@ impl EmittedOp {
             kv_fold_rows: crate::sdsc_abstract::FoldRowRegime::WholeBatch,
             kv_page_slots: 0,
             kv_request: 0,
+            kv_slot_offset: 0,
             slab_write: false,
             slab_stride_bytes: 0,
             slot_no_fuse: false,

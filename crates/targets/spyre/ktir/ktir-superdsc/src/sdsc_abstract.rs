@@ -3002,7 +3002,8 @@ impl SlotRun {
 }
 
 /// ⭐ THE SLOT A PREFILL CHUNK WILL ACTUALLY WRITE AT — what [`PagedKvPool::chunk_write_start`] returns,
-/// which may be STEPPED BACK behind the request's own end so the chunk's padded window stays in one page.
+/// which may be STEPPED BACK behind the request's own end so the chunk's padded window stays inside its
+/// window: one page, or whole pages from a page boundary.
 ///
 /// A newtype rather than a bare [`KvSlot`], because the two slots in play were the same type and the
 /// write used one while the record used the other: the chunk wrote from the stepped-back start, and
@@ -3340,14 +3341,63 @@ impl BlockTable {
         want: RowPages,
         part: PoolPartition,
     ) -> Option<BlockTable> {
+        let write_page = want.write_page();
+        Self::map_pages(hist, host, want, |page| Some(page) == write_page, part)
+    }
+
+    /// ⭐ THE MAP A PREFILL CHUNK BINDS — [`map_row`](Self::map_row) with EVERY page the chunk's rows land
+    /// in backed by a host block, not only the one holding the history's next slot.
+    ///
+    /// A chunk wider than a page writes across up to [`PagedKvPool::PREFILL_WINDOW_PAGES`] pages, its
+    /// cache write cut into one part per page, each part resolving its OWN page through this map. Under
+    /// `map_row` a second page the chunk writes holds no key yet and is not the write page, so it would be
+    /// served the shared SCRATCH page — and every key the part wrote would land where nothing reads it
+    /// back. The map reaches the chunk's last REAL row and no further, so a part holding only padding past
+    /// it finds no page there and the launch skips it (`fold_plan::OpAim::UnheldPage`).
+    ///
+    /// A superset of `map_row`'s map for the same history (the write page is still backed), so the pages
+    /// holding keys get the same host blocks either way and a gather table built through `map_row` names
+    /// the pages this map installed.
+    pub fn map_chunk(
+        hist: &KvHistory,
+        host: &[usize],
+        write: ChunkWrite,
+        part: PoolPartition,
+    ) -> Option<BlockTable> {
+        let run = write.run();
+        let want = RowPages::holding(SlotCount::new(
+            run.end().get().max(hist.end().get().saturating_add(1)),
+        ));
+        let write_page = want.write_page();
+        Self::map_pages(
+            hist,
+            host,
+            want,
+            |page| {
+                let (first, past) = page.slot_bounds();
+                Some(page) == write_page
+                    || (run.start().get() < past.get() && run.end().get() > first.get())
+            },
+            part,
+        )
+    }
+
+    /// The walk both maps share: `written(page)` names the pages this launch writes, which need a host
+    /// block even though they hold no key yet.
+    fn map_pages(
+        hist: &KvHistory,
+        host: &[usize],
+        want: RowPages,
+        written: impl Fn(LogicalPage) -> bool,
+        part: PoolPartition,
+    ) -> Option<BlockTable> {
         let mut pages = Vec::with_capacity(want.get() as usize);
         let mut next_host = 0usize;
-        let write_page = want.write_page();
         for page in want.pages() {
             // A page holding no key is read fully-masked and never written: one scratch page serves them
             // all. The write page is the exception — the launch WILL write this step's key there, and the
             // row records it, so it needs storage of its own even though it holds nothing yet.
-            if !hist.touches(page) && Some(page) != write_page {
+            if !hist.touches(page) && !written(page) {
                 pages.push(part.scratch());
                 continue;
             }
@@ -5217,9 +5267,9 @@ const _: () = {
 // three wrong laws got written. The `[mask-cap]` line reports it; the REAL cause of the width-4 x 8-page
 // failure is still unknown and must be found before anything is asserted about it.
 
-// ⛔ A CHUNK MUST FIT A PAGE AT ALL, or `chunk_write_start` has no boundary to fall back to: skipping to
-// the next page would leave the same overrun there. So raising the prefill width past a page has to be a
-// `cargo build` error rather than a silent re-run of the corruption it replaced.
+// ⛔ A CHUNK MUST FIT A PAGE, OR BE A WHOLE NUMBER OF THEM, or `chunk_write_start` has no boundary to
+// fall back to: skipping to the next page would leave the same overrun there. So a prefill width that is
+// neither has to be a `cargo build` error rather than a silent re-run of the corruption it replaced.
 //
 // 🛑 **AT MODULE LEVEL, AND THE PLACEMENT IS THE ENTIRE GUARD.** This lived inside `impl PagedKvPool` as a
 // NAMED associated const (`const CHUNK_FITS_ONE_PAGE`), because `const _` is illegal in an impl — and a
@@ -5234,10 +5284,16 @@ const _: () = {
 // what `PrefixMaskShape::_COLS_IS_WHOLE_STICKS` and `BakeQueue::_BOUNDED` do (`let () = Self::_BOUNDED;` in
 // their constructors), and they have to: both are generic in the const they check, so neither can move out
 // here. This one is not generic, so it belongs at module level where the forcing cannot be forgotten.
+//
+// ⭐ A WINDOW WIDER THAN A PAGE IS A WHOLE NUMBER OF PAGES. Its cache write is cut into page parts, each
+// resolving its OWN page through the request's block table (`EmittedOp::kv_slot_offset`), so a window of
+// `PREFILL_WINDOW_PAGES` pages starting at a page boundary is as safe as one page was. A window that is not
+// a whole number of pages would leave a part straddling a page, which no part can address.
 const _: () = assert!(
-    PagedKvPool::PREFILL_CHUNK_SLOTS <= PagedKvPool::PAGE_SLOTS,
-    "a prefill chunk's padded write must fit inside ONE page — otherwise no write slot exists that keeps \
-     it off the next kv head's plane"
+    PagedKvPool::PREFILL_CHUNK_SLOTS <= PagedKvPool::PAGE_SLOTS
+        || PagedKvPool::PREFILL_CHUNK_SLOTS.is_multiple_of(PagedKvPool::PAGE_SLOTS),
+    "a prefill chunk's padded write must fit inside ONE page, or span a whole number of pages — \
+     otherwise a write part straddles a page boundary and lands on the next kv head's plane"
 );
 
 /// ⛔ THE LARGEST SINGLE dxp GROUP A BUNDLE MAY STAGE (descriptors) — the ONE ceiling the emitter's
@@ -5346,13 +5402,143 @@ impl PagedKvPool {
     /// Kept here rather than beside the prefill rung ladder because the POOL is what must make room for
     /// it; `codegen`'s `PREFILL_RUNGS` ceiling is asserted equal to it, so the two cannot drift.
     ///
-    /// ⭐ 256 — ONE WHOLE PAGE, the widest a padded write can be and stay inside one: a prompt chunked from
-    /// a page boundary starts every chunk at offset 0, so no padded write needs
+    /// ⭐ 512 — TWO WHOLE PAGES ([`PREFILL_WINDOW_PAGES`](Self::PREFILL_WINDOW_PAGES)). A window wider
+    /// than a page is cut, at emission, into one cache-write part per page, each resolving its own page
+    /// through the request's block table — so the window may span whole pages, never part of one. A
+    /// prompt chunked from a page boundary starts every chunk at offset 0, so no padded write needs
     /// [`chunk_write_start`](Self::chunk_write_start) to step back. It is the ceiling of the ladder, not
     /// every model's: a model whose causal block stays sub-blocked bakes to 128 (see `codegen`'s
     /// `PREFILL_RUNGS`), and the runtime writes at the bundle's own baked width either way. (At 96 the
-    /// third chunk of every page stepped back and re-processed the overlap.)
-    pub const PREFILL_CHUNK_SLOTS: usize = 256;
+    /// third chunk of every page stepped back and re-processed the overlap; at 256, one page, a 10k
+    /// prompt ran 40 chunks, each re-reading every weight once.)
+    pub const PREFILL_CHUNK_SLOTS: usize = 512;
+
+    /// ⭐ PAGES ONE PROMPT WINDOW MAY SPAN — the widest prefill chunk in whole pages (1 when it fits in
+    /// one). A window starting at a page boundary may fill all of them; one starting mid-page stays
+    /// inside that page (see [`chunk_room`](Self::chunk_room)).
+    pub const PREFILL_WINDOW_PAGES: usize = Self::PREFILL_CHUNK_SLOTS.div_ceil(Self::PAGE_SLOTS);
+
+    /// ⛔⛔⛔ A CHUNK-FORM MODEL'S **BAKED** PREFILL LADDER MUST REACH THE POOL'S WINDOW — the bake's proof,
+    /// panicked on by the macro.
+    ///
+    /// `codegen`'s const assert ties [`PREFILL_CHUNK_SLOTS`](Self::PREFILL_CHUNK_SLOTS) to the ceiling of
+    /// the CONST ladder, and the bake then lowers what it can of it: a rung that does not lower is
+    /// skipped, and the prefix-capable bundle is baked at the widest one that did. The host follows
+    /// whatever was baked, so a short ladder is never wrong — only silently slower. MEASURED: the
+    /// 512-row ladder baked to 256 behind a leftover resident-cache cap, loaded as `PREFILL ladder =
+    /// [..., 192, 256]`, and every TTFT cell matched the 256-row build to the millisecond.
+    ///
+    /// So the check is on what LOWERED. `chunk_form` says the model's causal block is chunk-formed at
+    /// the window's width (`NewBlockForm::of(PREFILL_CHUNK_SLOTS, hd, false) == Chunk`) — a model whose
+    /// block stays sub-blocked keeps its own shorter ladder by design. `baked` is every rung that
+    /// lowered, `refused` every rung that did not and why, and `attempted` the ceiling the ladder was
+    /// asked to reach. `Err` names the shortfall and each refusing rung's reason.
+    pub fn prefill_ladder_reaches_the_window(
+        chunk_form: bool,
+        attempted: u32,
+        baked: &[u32],
+        refused: &[(u32, String)],
+    ) -> Result<(), String> {
+        let window = Self::PREFILL_CHUNK_SLOTS as u32;
+        let top = baked.iter().copied().max().unwrap_or(0);
+        if !chunk_form || top >= window {
+            return Ok(());
+        }
+        let why = if refused.is_empty() {
+            format!(
+                "no rung above {top} was attempted: the ladder's ceiling was {attempted}, below the window"
+            )
+        } else {
+            refused
+                .iter()
+                .map(|(m, e)| format!("rung m={m} did not lower: {e}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        Err(format!(
+            "the baked prefill ladder tops out at {top} rows, below the pool's {window}-row prompt window \
+             (PagedKvPool::PREFILL_CHUNK_SLOTS) for a model whose causal block is chunk-formed at that \
+             width — {why}. The host would run {top}-row chunks with no error and none of the window's \
+             speed; lower the missing rungs, or narrow the window."
+        ))
+    }
+
+    /// ⭐ THE WIDTHS A PREFIX-CAPABLE PREFILL BUNDLE IS BAKED AT, out of the prefix-free widths that baked
+    /// (`baked`): the top, and one page when the top is wider than a page. Ascending.
+    ///
+    /// A continuation chunk is capped at the top width, and [`chunk_write_start`](Self::chunk_write_start)
+    /// leaves every mid-prompt chunk room for a whole window, so only a prompt's LAST chunk is ever
+    /// narrower — and a page is the narrowest a padded write can take without stepping back into slots an
+    /// earlier chunk owns. So a tail of at most one page runs one page wide, and anything longer runs a
+    /// full window. Nothing in between: a width that is neither would step its write back across the page
+    /// it starts in.
+    ///
+    /// ⛔ ONE WIDTH WAS THE MEASURED COST. Only the top was baked, so a 52-row tail ran a full 512-row
+    /// chunk: granite-3.1-2b at ~2k tokens took 460 ms against 384 ms on the 256-row build.
+    ///
+    /// Empty when nothing baked; just the top when the top fits one page (every model whose causal block
+    /// stays sub-blocked, so its bake is byte-for-byte unchanged).
+    pub fn prefix_rungs(baked: &[u32]) -> Vec<u32> {
+        let page = Self::PAGE_SLOTS as u32;
+        let Some(top) = baked.iter().copied().max() else {
+            return Vec::new();
+        };
+        if top > page && baked.contains(&page) {
+            vec![page, top]
+        } else {
+            vec![top]
+        }
+    }
+
+    /// ⭐ WHICH PREFIX RUNG A CONTINUATION CHUNK AT `want` RUNS ON — the index into `widths` (ascending, the
+    /// rungs that built) of the smallest width that holds the rest of the prompt AS PLACED at that width,
+    /// else the widest (the chunk is then capped at it and the prompt continues). `None` only for an empty
+    /// ladder.
+    ///
+    /// ⛔ AS PLACED, NOT AS ASKED. [`chunk_write_start`](Self::chunk_write_start) may step a padded write
+    /// back, and stepping back GROWS the rows the chunk must cover by the overlap it re-processes: 240 rows
+    /// asked at slot 300 are 284 rows from slot 256 on the 256-row rung, which no longer fits it. Choosing
+    /// on the asked count would put that tail on the narrow rung and split it into two chunks where the
+    /// wide rung runs one. So each width is tried at its own placement, and a narrow rung is chosen only
+    /// when it finishes the prompt in this chunk.
+    ///
+    /// The worker's `PrefixLadder::rung_for` is this over its built sessions, so the rule is one function
+    /// a test can drive without a card.
+    pub fn prefix_rung_for(widths: &[u32], want: KvSlot, rows_left: u32) -> Option<usize> {
+        widths
+            .iter()
+            .position(|&m| {
+                let at = Self::chunk_write_start(want, SlotCount::new(m))
+                    .slot()
+                    .get();
+                rows_left + (want.get() - at) <= m
+            })
+            .or_else(|| widths.len().checked_sub(1))
+    }
+
+    /// ⛔⛔⛔ THE PREFIX-CAPABLE LADDER THAT BAKED MUST TOP OUT AT THE PREFIX-FREE LADDER's TOP — the bake's
+    /// proof, panicked on by the macro.
+    ///
+    /// Every mid-prompt continuation chunk runs at the prefix-free ladder's top width (the cap, and the room
+    /// the step-back leaves). A prefix ladder that stops below it hands such a chunk a bundle narrower than its
+    /// rows, which the host refuses on the card. A prefix ladder that baked NOTHING while a prefix-free ladder
+    /// did is the same shortfall in full: every continuation chunk refused. `Err` names the gap.
+    pub fn prefix_ladder_tops_the_ladder(baked: &[u32], prefix: &[u32]) -> Result<(), String> {
+        let Some(top) = baked.iter().copied().max() else {
+            return Ok(());
+        };
+        match prefix.iter().copied().max() {
+            Some(p) if p == top => Ok(()),
+            Some(p) => Err(format!(
+                "the prefix-capable prefill ladder tops out at {p} rows, below the prefix-free ladder's {top} \
+                 — a mid-prompt continuation chunk runs {top} rows wide and would have no bundle to run on"
+            )),
+            None => Err(format!(
+                "no prefix-capable prefill bundle baked, though the prefix-free ladder reaches {top} rows — \
+                 every continuation chunk (start > 0) would be refused"
+            )),
+        }
+    }
 
     /// ⭐ SLOTS A PADDED CHUNK WRITE MAY OVERRUN ITS PAGE BY — the physical slack every plane carries
     /// past its addressable [`PAGE_SLOTS`](Self::PAGE_SLOTS) so that overrun lands in DEAD SPACE instead
@@ -5544,21 +5730,31 @@ impl PagedKvPool {
     /// This replaced `block_index(kvh) = kvh * ROWS` and `request_stride`. The head stride used to be
     /// `ROWS` request strides; it is now simply a head's own footprint, so there is no second quantity to
     /// drift against.
-    /// ⭐ HOW MANY SLOTS A PREFILL CHUNK STARTING AT `start` MAY CLAIM — the room left in its page.
+    /// ⭐ HOW MANY SLOTS A PREFILL CHUNK STARTING AT `start` MAY CLAIM — the room left in its window.
     ///
-    /// A chunk must not straddle a page: one launch resolves ONE page table, so the slots past the page
-    /// end belong to a page this launch cannot address, and writing its real rows there would put them
-    /// somewhere nothing reads them back from. Clipping to this makes chunk starts land on page offsets
-    /// 0, 96, 192 and then exactly on the next page boundary — no slots wasted, and the PADDED tail of
-    /// the last chunk in a page is what [`WRITE_SLACK`](Self::WRITE_SLACK) absorbs.
+    /// A chunk's cache write is cut into one part per PAGE, each part resolving its own page through the
+    /// request's block table (`EmittedOp::kv_slot_offset`) — so a chunk starting at a page boundary may
+    /// fill all [`PREFILL_WINDOW_PAGES`](Self::PREFILL_WINDOW_PAGES) pages of its window, and part `p`
+    /// lands at the start of the window's page `p`.
+    ///
+    /// ⛔ A CHUNK STARTING MID-PAGE STAYS INSIDE THAT PAGE. A part addresses the page its FIRST row's slot
+    /// falls in and writes its rows consecutively from there, so a part that begins mid-page cannot cross
+    /// the page end: the slots past it belong to a page that part does not address, and writing real rows
+    /// there would put them somewhere nothing reads them back from. Hence the room is the page remainder
+    /// whenever the offset is not zero. (A padded window wider than a page never starts mid-page —
+    /// [`chunk_write_start`](Self::chunk_write_start) steps it back to the page start.)
     ///
     /// Total, not fallible: every slot is inside some page, so there is always at least one slot of room.
     pub fn chunk_room(start: KvSlot) -> SlotCount {
         let page = Self::PAGE_SLOTS as u32;
-        SlotCount::new(page - start.get() % page)
+        match start.get() % page {
+            0 => SlotCount::new(Self::PREFILL_WINDOW_PAGES as u32 * page),
+            off => SlotCount::new(page - off),
+        }
     }
 
-    /// ⭐ WHERE A PREFILL CHUNK MUST START so its **PADDED** window stays inside ONE page.
+    /// ⭐ WHERE A PREFILL CHUNK MUST START so its **PADDED** window stays inside ONE page — or, wider than a
+    /// page, starts at one's boundary (⭐ A PADDED WINDOW WIDER THAN A PAGE, below).
     ///
     /// A continuation chunk runs on the ONE prefix-capable bundle, so its cache write covers that bundle's
     /// BAKED row count (`padded`) — not the chunk's real length. If that window leaves the page it lands in
@@ -5583,7 +5779,15 @@ impl PagedKvPool {
     /// created, and no stride moves. The cost is re-processing at most `padded - (PAGE_SLOTS % padded)`
     /// tokens per page boundary.
     ///
-    /// Total: `padded <= PAGE_SLOTS` (asserted by [`CHUNK_FITS_ONE_PAGE`]) guarantees a fitting start exists.
+    /// ⭐ A PADDED WINDOW WIDER THAN A PAGE STARTS AT A PAGE BOUNDARY. Its cache write is cut into
+    /// whole-page parts (part `p` writes slots `p·PAGE_SLOTS ..` of the window), so the window must begin
+    /// where a page does or part 0 would cross into a page it does not address. Such a window steps back
+    /// to the START of `want`'s page — re-processing the `want % PAGE_SLOTS` tokens before it, by the same
+    /// idempotence — and the module-level law that a wider window is a whole number of pages is what
+    /// makes every later part start at a page boundary too.
+    ///
+    /// Total: a padded window is at most one page or a whole number of pages (the module-level assert on
+    /// `PREFILL_CHUNK_SLOTS`), so a fitting start always exists.
     /// ⛔ RETURNS A [`ChunkStart`], NOT A [`KvSlot`] — so the slot the chunk writes at is the only slot its
     /// [`KvHistory::record_chunk`] can name. Handing back a bare `KvSlot` is what let the write step back
     /// while the record did not; see [`ChunkStart`] for the measurement.
@@ -5592,6 +5796,10 @@ impl PagedKvPool {
         let off = want.get() % page;
         if off + padded.get() <= page {
             return ChunkStart(want);
+        }
+        if padded.get() > page {
+            // A multi-page window: back to its page's start, so every part begins on a page boundary.
+            return ChunkStart(KvSlot::new(want.get() - off));
         }
         // The last offset in this page whose padded window still fits. `padded <= page` ⇒ no underflow.
         ChunkStart(KvSlot::new(want.get() - off + (page - padded.get())))

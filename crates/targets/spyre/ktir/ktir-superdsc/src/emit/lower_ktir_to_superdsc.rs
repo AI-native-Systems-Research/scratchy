@@ -2147,6 +2147,47 @@ pub fn attn_operands<const NQH: u32, const NKVH: u32, const HD: u32>(
     })
 }
 
+/// ⛔⛔⛔ AN ATTENTION PROGRAM'S SIZE MUST NOT GROW WITH ITS ROWS — the bake refuses a per-row unroll.
+///
+/// The continuation arm was a `tl.static_range(0, MQ)` of per-row bodies, each with its own `[qi + 1,
+/// HD]` causal tiles: `MQ` bodies whose tiles summed to `MQ²/2` rows. Its program, and every pass that
+/// walks it, grew with the rows: MEASURED on granite-2b, 94.7 s to lower at 256 rows (the bake's
+/// widest compile) and a build-script thread past 25 min at 102 GB without finishing at 512. The bundle
+/// was correct; only the build paid.
+///
+/// So the check is on the LOWERED program, at the door, for every multi-row attention: the number of
+/// windows it takes of its query `q` (parameter 0), regions included so a loop the front end failed to
+/// fold still counts its body. A whole-chunk head reads its query ONCE, so the program takes at most
+/// one window per head (`heads` — the grid is unrolled into the program, so every head's body is in
+/// it); a per-row form takes one per head PER ROW. That is the property a raw op-count bound cannot
+/// state, because a program's absolute size also scales with its heads and head dim. Decode
+/// (`mq == 1`) has one row, so the two forms coincide there.
+pub fn attn_program_is_flat_in_rows(
+    name: &str,
+    f: &IRFunction<'static>,
+    mq: u32,
+    heads: u32,
+) -> Result<(), Error> {
+    if mq <= 1 {
+        return Ok(());
+    }
+    let Some((q, _)) = f.arguments.first() else {
+        return err(format!(
+            "{name}: an attention program with no parameters — its query is parameter 0"
+        ));
+    };
+    let tiles = param_tiles_deep(f, q);
+    if tiles > heads as usize {
+        return err(format!(
+            "{name}: a {mq}-row attention program over {heads} head(s) takes {tiles} windows of its \
+             query, where a whole-chunk head takes one — it unrolls per row, so its size, its \
+             lowering and every pass over it grow with its rows. State the chunk whole: one score tile \
+             per segment and the causal triangle in the mask."
+        ));
+    }
+    Ok(())
+}
+
 /// The rows of one parameter's buffer the program actually READS — every `ktdp.construct_access_tile`
 /// over any view of it, as the widest row extent; `0` when it takes no window at all.
 ///
@@ -3360,11 +3401,11 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // the door this file's header describes — not a record the producer filled in beside it.
     let ops_in = attn_operands(_name, k, r, geom)?;
     let mq = ops_in.mq;
+    attn_program_is_flat_in_rows(_name, &k.func, mq, geom.nqh())?;
     let (k_id, v_id) = (ops_in.k_id, ops_in.v_id);
     let (nqh, nkvh, hd) = (geom.nqh(), geom.nkvh(), geom.hd());
     let cap = ops_in.cap;
     let stick = Fp16::ELEMS_PER_STICK; // 64
-    let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
     // ── PAGED-ATTENTION COMPUTE EXTENT, READ OFF THE PROGRAM ──
     //
     // ⭐⭐⭐ IT WAS `AttnAt::active_cap`, THE RUNG, RESOLVED HERE. The rung is a PRODUCER input: it
@@ -4013,18 +4054,85 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         layout,
     )?);
 
-    // ── (4) KV CACHE WRITE: append this step's new_k_scaled (nkvh-wide, dedup)/new_v_rep (nqh-wide)
-    // into the resident cache. K writes only the nkvh representative slots (kvh*gqa) — `kctpost`
-    // (below) only ever reads those; the other slots were always dead. V is UNCHANGED (nqh writes,
-    // genuinely all read via `vc`'s own nqh-replicated convention). Writes K ALREADY sqrt-scaled, so
-    // future steps' prefix scores need no further K scaling.
-    //
-    // REQUEST-MAJOR, so that one request's kv-head copies are CONSECUTIVE and fuse into a
-    // single launch. A group resolves one request's page table and write cursor, so the run
-    // breaks where the request changes (`GroupKind::Slot`'s `req`) — kv-head-major order would
-    // alternate requests every op and leave every copy its own launch, which is what made a
-    // batch of 8 slower than 8 separate forwards. One request ⇒ this loop runs once and the
-    // order is exactly what it was.
+    // ── (4) + (5): the KV cache write and the Kᵀ re-transpose — see [`kv_cache_write`].
+    ops.extend(kv_cache_write(
+        KvCacheWrite {
+            t,
+            mq,
+            nkvh,
+            hd,
+            rows_are_requests,
+            new_k: &new_k_scaled,
+            new_v: &new_v_rep,
+            kc: &kc,
+            vc: &vc,
+            kct: &kct,
+            ident: &ident,
+        },
+        sym_id_base,
+        layout,
+    )?);
+    Ok(ops)
+}
+
+/// What one step's KV cache write moves, and between which buffers — everything [`kv_cache_write`]
+/// reads off the attention it closes.
+pub struct KvCacheWrite<'a> {
+    /// The attention's output tensor, which every op's name is suffixed with.
+    pub t: u32,
+    /// The step's query rows: one decode token, a batch's requests, or a prompt chunk's positions.
+    pub mq: u32,
+    pub nkvh: u32,
+    pub hd: u32,
+    /// The rows are a decode batch's requests (one op per request), not one sequence's positions.
+    pub rows_are_requests: bool,
+    /// This step's new K (already √-scaled) and V, `[mq, nkvh·hd]` row-blocked.
+    pub new_k: &'a str,
+    pub new_v: &'a str,
+    /// The resident natural-K, V and Kᵀ planes.
+    pub kc: &'a str,
+    pub vc: &'a str,
+    pub kct: &'a str,
+    /// The `[64, 64]` identity the copies contract against.
+    pub ident: &'a str,
+}
+
+/// ── (4) KV CACHE WRITE: append this step's new_k_scaled (nkvh-wide, dedup)/new_v_rep (nqh-wide)
+/// into the resident cache, then (5) re-transpose the Kᵀ plane from it. K writes only the nkvh
+/// representative slots (kvh*gqa) — `kctpost` (below) only ever reads those; the other slots were
+/// always dead. V is UNCHANGED (nqh writes, genuinely all read via `vc`'s own nqh-replicated
+/// convention). Writes K ALREADY sqrt-scaled, so future steps' prefix scores need no further K scaling.
+///
+/// REQUEST-MAJOR, so that one request's kv-head copies are CONSECUTIVE and fuse into a
+/// single launch. A group resolves one request's page table and write cursor, so the run
+/// breaks where the request changes (`GroupKind::Slot`'s `req`) — kv-head-major order would
+/// alternate requests every op and leave every copy its own launch, which is what made a
+/// batch of 8 slower than 8 separate forwards. One request ⇒ this loop runs once and the
+/// order is exactly what it was.
+///
+/// Its own function, public, so the emitted parts of a wide prompt window are pinned off the op list
+/// this very code returns rather than off a copy of it.
+pub fn kv_cache_write(
+    w: KvCacheWrite<'_>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let KvCacheWrite {
+        t,
+        mq,
+        nkvh,
+        hd,
+        rows_are_requests,
+        new_k: new_k_scaled,
+        new_v: new_v_rep,
+        kc,
+        vc,
+        kct,
+        ident,
+    } = w;
+    let stick = Fp16::ELEMS_PER_STICK;
+    let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
+    let mut ops: Vec<EmittedOp> = Vec::new();
     let per_request = rows_are_requests && mq > 1;
     // ⛔⛔⛔ AND THE SLAB CANNOT JOIN THAT `y` AXIS — MEASURED ON CARD, NOT INFERRED. The pair
     // `(h, s)` linearizes as `h*nslab + s`, and that index steps exactly ONE STICK PLANE on BOTH
@@ -4050,6 +4158,29 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // ASKED OF THE SHAPE, once: the slab count reaches this write only through `slabs_of`, so there is
     // no `hd/64` in scope for the loop and the pitches to spell differently.
     let slabs = crate::addr::Shape::<0, 0, 0, 0>::slabs_of(hd, Df::Fp16);
+    // ⭐⭐⭐ A PROMPT WINDOW WIDER THAN A PAGE IS WRITTEN IN PAGE PARTS.
+    //
+    // One launch resolves ONE page per group (the page holding the group's cursor), and a page plane is
+    // `PAGE_SLOTS` slots of ONE kv head — so a single `[mq, hd]` copy of more rows than that would run off
+    // the page into the NEXT KV HEAD's block. Instead each `(kv head, slab)` copy is cut into parts of
+    // `PAGE_SLOTS` rows: part `p` reads the chunk's rows from `p·PAGE_SLOTS` and writes the SAME baked
+    // destination, carrying `kv_slot_offset = p·PAGE_SLOTS` so the runtime aims it at the page that slot
+    // falls in (`fold_plan::op_slot_pos`), and skips it when the request holds no such page (a short
+    // last chunk's padding). A window is a whole number of pages (`PREFILL_CHUNK_SLOTS`'s module law)
+    // and starts at a page boundary (`chunk_write_start`), so every part fills its page from slot 0.
+    //
+    // PART-MAJOR, so a part's copies are consecutive and fuse into one launch — the same reason the
+    // loop is request-major. A window that fits a page is ONE part with offset 0, and every name, row
+    // and op is exactly what it was.
+    let page = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+    let parts = if per_request { 1 } else { mq.div_ceil(page) };
+    let part_tag = |p: u32| {
+        if parts > 1 {
+            format!("_p{p}")
+        } else {
+            String::new()
+        }
+    };
     for req in 0..if per_request { mq } else { 1 } {
         // ⛔ NO REQUEST TERM IN THE ADDRESS. `req` here indexes a ROW OF THE ACTIVATION and nothing more:
         // which page that row's token lands in is the host's page map, applied as a per-launch shift. A page
@@ -4072,53 +4203,58 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         // up decodes fluent garbage (`'(\x03d. .exaggeret'` for a prompt whose answer is `Paris`).
         let rows_per_op = if per_request { 1 } else { mq };
         let heads_on_y = rows_per_op == 1;
-        for s in 0..slabs.get() {
-            for h in 0..if heads_on_y { 1 } else { nkvh } {
-                let a_place = if heads_on_y {
-                    crate::sdsc_abstract::OperandPlacement::of_plane_walk_by_head(
-                        &src_nest,
-                        crate::addr::Idx::<crate::addr::Row>::n(req),
-                        s,
-                        slabs,
-                    )
-                } else {
-                    crate::sdsc_abstract::OperandPlacement::at_head(
-                        &src_nest,
-                        crate::addr::Idx::<crate::addr::Row>::n(req),
-                        h,
-                        s,
-                        slabs,
-                    )
-                };
-                let o_place = if heads_on_y {
-                    crate::sdsc_abstract::OperandPlacement::of_plane_walk_by_head_block_base(
-                        &dst_nest, s, slabs,
-                    )
-                } else {
-                    crate::sdsc_abstract::OperandPlacement::at_block(
-                        &dst_nest,
-                        crate::sdsc_abstract::PagedKvPool::block_of(kv_head_of(h, nkvh)?),
-                        s,
-                        slabs,
-                    )
-                };
-                // K writes only the nkvh representative slots (`kctpost` only ever reads those); V is the
-                // nkvh-wide `new_v_rep`, whose reader is kv-head indexed too. Both sides of both writes are
-                // therefore kv-head indexed, which is what lets ONE `y` axis serve them.
-                for (base, src, dst) in [("kc", &new_k_scaled, &kc), ("vc", &new_v_rep, &vc)] {
-                    ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
+        for p in 0..parts {
+            // The part's first source row, and the rows it copies: the whole request row, or the chunk's
+            // rows from `p·PAGE_SLOTS` up to a page of them (the last part takes the remainder).
+            let (row0, part_rows) = if per_request {
+                (req, 1)
+            } else {
+                (p * page, (mq - p * page).min(page))
+            };
+            let pt = part_tag(p);
+            for s in 0..slabs.get() {
+                for h in 0..if heads_on_y { 1 } else { nkvh } {
+                    let a_place = if heads_on_y {
+                        crate::sdsc_abstract::OperandPlacement::of_plane_walk_by_head(
+                            &src_nest,
+                            crate::addr::Idx::<crate::addr::Row>::n(row0),
+                            s,
+                            slabs,
+                        )
+                    } else {
+                        crate::sdsc_abstract::OperandPlacement::at_head(
+                            &src_nest,
+                            crate::addr::Idx::<crate::addr::Row>::n(row0),
+                            h,
+                            s,
+                            slabs,
+                        )
+                    };
+                    let o_place = if heads_on_y {
+                        crate::sdsc_abstract::OperandPlacement::of_plane_walk_by_head_block_base(
+                            &dst_nest, s, slabs,
+                        )
+                    } else {
+                        crate::sdsc_abstract::OperandPlacement::at_block(
+                            &dst_nest,
+                            crate::sdsc_abstract::PagedKvPool::block_of(kv_head_of(h, nkvh)?),
+                            s,
+                            slabs,
+                        )
+                    };
+                    // K writes only the nkvh representative slots (`kctpost` only ever reads those); V is the
+                    // nkvh-wide `new_v_rep`, whose reader is kv-head indexed too. Both sides of both writes are
+                    // therefore kv-head indexed, which is what lets ONE `y` axis serve them.
+                    for (base, src, dst) in [("kc", new_k_scaled, kc), ("vc", new_v_rep, vc)] {
+                        ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
                         &if heads_on_y {
-                            format!("cachewr_{base}s{s}{rq}_o{t}")
+                            format!("cachewr_{base}s{s}{rq}{pt}_o{t}")
                         } else {
-                            format!("cachewr_{base}{h}s{s}{rq}_o{t}")
+                            format!("cachewr_{base}{h}s{s}{rq}{pt}_o{t}")
                         },
-                        // The kv stream's REAL rows this copy covers: one per request-copy, else the chunk's.
+                        // The kv stream's REAL rows this copy covers: one per request-copy, else the part's.
                         crate::sdsc_abstract::MatM::of_query_rows(
-                            crate::sdsc_abstract::QueryRowCount::of_mq(if per_request {
-                                1
-                            } else {
-                                mq
-                            }),
+                            crate::sdsc_abstract::QueryRowCount::of_mq(part_rows),
                         ),
                         crate::sdsc_abstract::MatN::one_stick(crate::sdsc_abstract::Lanes::FP16),
                         crate::sdsc_abstract::MatK::one_stick(crate::sdsc_abstract::Lanes::FP16),
@@ -4139,7 +4275,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                         a_place,
                         // I[64,64] — the identity for EVERY slab, so the shared 2-D kernel a `y` batch demands is
                         // exactly what an identity copy needs. Offset 0: see the residency argument above.
-                        &Stk::<KernelTag>::kernel(stick as usize, stick as usize, &ident),
+                        &Stk::<KernelTag>::kernel(stick as usize, stick as usize, ident),
                         crate::addr::DevOff::ZERO,
                         &Stk::<KernelTag>::kernel(
                             crate::sdsc_abstract::PagedKvPool::PLANE_SLOTS,
@@ -4150,16 +4286,19 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                         sym_id_base,
                         layout,
                     ));
-                    if let Some(o) = ops.last_mut() {
-                        o.slot_stride_bytes = stick * 2;
-                        // PAGED: the slot is the position WITHIN its page; the page comes from the block table.
-                        o.kv_page_slots = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
-                        // ⭐ TAGGED WITH ITS ROW, and it has to be. Untagged, this op took the page from the
-                        // LAUNCH's position — fine while the address carried a request term, because then the row
-                        // was already in the address. That term is gone: a page holds slots, so the ONLY thing that
-                        // says which page this row's token lands in is the tag, which `nonfold_page_delta` turns
-                        // into that row's page through the host's block table.
-                        o.kv_request = req;
+                        if let Some(o) = ops.last_mut() {
+                            o.slot_stride_bytes = stick * 2;
+                            // PAGED: the slot is the position WITHIN its page; the page comes from the block table.
+                            o.kv_page_slots = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+                            // ⭐ TAGGED WITH ITS ROW, and it has to be. Untagged, this op took the page from the
+                            // LAUNCH's position — fine while the address carried a request term, because then the row
+                            // was already in the address. That term is gone: a page holds slots, so the ONLY thing that
+                            // says which page this row's token lands in is the tag, which `nonfold_page_delta` turns
+                            // into that row's page through the host's block table.
+                            o.kv_request = req;
+                            // The page part: the runtime aims it `p` pages past the cursor's (see above).
+                            o.kv_slot_offset = p * page;
+                        }
                     }
                 }
             }
@@ -4180,29 +4319,38 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     //
     // Flat product loop (not nested) so the body below keeps the indentation — and the shape — of the
     // whole-page form it is otherwise unchanged from.
+    //
+    // ⭐ AND ONE PER PAGE PART, PART-MAJOR — the window's second page holds natural K the cache write
+    // just wrote, and its Kᵀ is as stale as the first page's was. A whole-page re-transpose is already
+    // the per-page form, so a part is the same op aimed `p` pages on (`kv_slot_offset`), skipped with
+    // its cache write when the request holds no such page.
     let kct_reqs = if per_request { mq } else { 1 };
-    for (req, kvh) in (0..kct_reqs).flat_map(|r| (0..nkvh).map(move |k| (r, k))) {
+    for (p, req, kvh) in (0..parts)
+        .flat_map(|p| (0..kct_reqs).map(move |r| (p, r)))
+        .flat_map(|(p, r)| (0..nkvh).map(move |k| (p, r, k)))
+    {
         let rq = if per_request {
             format!("_r{req}")
         } else {
             String::new()
         };
+        let pt = part_tag(p);
         // WHOLE-PAGE re-transpose, structurally the proven full-`cap` form with the page (equal to
         // that cap) substituted — NOT the slab-granular variant, whose on-card attempt regressed
         // decode. Source and destination take the identical `layer + page` shift, which is why
         // natural K lives in the page rather than a segment of its own.
         ops.push(assemble_restickify_kt_2d(
-            &format!("attn_kctpost{kvh}{rq}_o{t}"),
+            &format!("attn_kctpost{kvh}{rq}{pt}_o{t}"),
             crate::sdsc_abstract::KtTileSlots::of_page(),
             crate::sdsc_abstract::KtTileFeats::of_head_dim(hd),
-            &kc,
+            kc,
             // The two planes are the whole content of this op: it reads natural K and writes Kᵀ, both at
             // the same `(kv head)` block of the page the launch was shifted to.
             crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
                 crate::sdsc_abstract::KvPlane::Knat,
                 kv_head_of(kvh, nkvh)?,
             ))),
-            &kct,
+            kct,
             crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
                 crate::sdsc_abstract::KvPlane::Kt,
                 kv_head_of(kvh, nkvh)?,
@@ -4215,6 +4363,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         // thing that tells the runtime which page that is.
         if let Some(o) = ops.last_mut() {
             o.kv_request = req;
+            o.kv_slot_offset = p * page;
         }
     }
 

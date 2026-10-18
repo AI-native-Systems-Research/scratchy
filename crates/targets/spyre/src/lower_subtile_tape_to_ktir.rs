@@ -1482,23 +1482,35 @@ pub fn graph_wiring<F: RopeForm>(
                 for e in ops {
                     let Some(k) = e.ktir else { continue };
                     let mask = match k.mask {
-                        // ⭐ THE CAPACITY COMES OFF THE PROGRAM, not off the node. The mask parameter's
-                        // own `ktdp.construct_memory_view` states `[1, capacity]`, so the number this pass
-                        // needs to size the host buffer is read where every other extent is read. It
-                        // used to ride on `KtirNode::mask` as the second half of a pair the LOWERING
-                        // never looked at.
+                        // ⭐ THE CAPACITY COMES OFF THE PROGRAM, not off the node: the resident cache's
+                        // own `ktdp.construct_memory_view` states `[capacity, kv_width]`, so the number
+                        // this pass needs to size the host buffer is read where every other extent is
+                        // read. It used to ride on `KtirNode::mask` as the second half of a pair the
+                        // LOWERING never looked at.
+                        //
+                        // ⛔ THE CACHE'S VIEW, NOT THE MASK'S. The mask states `[1, capacity]` only at
+                        // decode; a multi-row continuation binds one `[mq, capacity + mq]` tile (the
+                        // prefix's length mask beside the new block's row mask), whose columns are not
+                        // the capacity. The resident K is the program's third parameter in every arm
+                        // (q, out, kc, kd, vc, vd — `attn_operands`'s order).
                         Some(mid) => {
                             let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(&k)
                                 .map_err(|e| SuperDscError(e.message))?;
+                            if !regs.iter().any(|r| r.tid == mid.get()) {
+                                return Err(SuperDscError(format!(
+                                    "the mask buffer t{mid} is not among this program's parameters \
+                                     — the attention bound a mask its own program never declares"
+                                )));
+                            }
                             let cap = regs
-                                .iter()
-                                .find(|r| r.tid == mid.get())
-                                .map(|r| r.v_cols)
+                                .get(2)
+                                .filter(|r| r.tid != mid.get())
+                                .map(|r| r.v_rows)
                                 .ok_or_else(|| {
                                     SuperDscError(format!(
-                                        "the mask buffer t{mid} is not among this program's \
-                                         parameters, so its `[1, capacity]` view states no capacity \
-                                         to size the host buffer with"
+                                        "the attention binding mask t{mid} states no resident-cache \
+                                         parameter at position 2, so there is no `[capacity, \
+                                         kv_width]` view to size the host buffer with"
                                     ))
                                 })?;
                             Some((mid.get(), cap))

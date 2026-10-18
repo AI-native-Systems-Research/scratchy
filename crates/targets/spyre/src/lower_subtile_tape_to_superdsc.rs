@@ -4997,6 +4997,11 @@ pub struct TripRequest(pub u32);
 pub struct Trip {
     pub kind: GroupKind,
     pub req: TripRequest,
+    /// ⭐ THE OP'S [`EmittedOp::kv_slot_offset`] — which PAGE PART of a multi-page prefill window it
+    /// addresses. Checked beside the request, for every kind, and for the same reason: a launch resolves
+    /// ONE page per group, so a cache-write part (a `Slot`) and a Kᵀ re-transpose part (a `Pure`) of the
+    /// window's second page cannot share a group with anything aimed at its first.
+    pub slot_offset: u32,
 }
 
 impl GroupKind {
@@ -5090,18 +5095,30 @@ impl GroupKind {
 }
 
 impl Trip {
+    /// A trip addressing its request's page at the write cursor — every trip but a page part's.
     pub fn new(kind: GroupKind, req: TripRequest) -> Trip {
-        Trip { kind, req }
+        Trip::at_slot_offset(kind, req, 0)
     }
 
-    /// THE ONE RULE THAT DECIDES EVERY GROUP BOUNDARY: same request, and kinds that fuse.
+    /// A trip addressing the page `slot_offset` slots past the write cursor (see [`Trip::slot_offset`]).
+    pub fn at_slot_offset(kind: GroupKind, req: TripRequest, slot_offset: u32) -> Trip {
+        Trip {
+            kind,
+            req,
+            slot_offset,
+        }
+    }
+
+    /// THE ONE RULE THAT DECIDES EVERY GROUP BOUNDARY: same request, same page part, and kinds that fuse.
     ///
     /// A group is one launch; a launch resolves one request's page table and one write cursor and
     /// shifts the segment base ONCE. Two requests therefore cannot share a group whatever their
     /// kinds — so the request test lives HERE, above the kind test, and applies to kinds that do not
-    /// exist yet.
+    /// exist yet. Two page parts cannot either: their pages differ, and the shift is one page.
     fn fusable_with(&self, other: &Trip) -> bool {
-        self.req == other.req && self.kind.fusable_kind_with(other.kind)
+        self.req == other.req
+            && self.slot_offset == other.slot_offset
+            && self.kind.fusable_kind_with(other.kind)
     }
 }
 
@@ -5480,7 +5497,11 @@ fn trip_kinds_and_owner(ops: &[EmittedOp]) -> (Vec<Trip>, Vec<usize>) {
             } else {
                 GroupKind::Pure
             };
-            kinds.push(Trip::new(k, TripRequest(e.kv_request)));
+            kinds.push(Trip::at_slot_offset(
+                k,
+                TripRequest(e.kv_request),
+                e.kv_slot_offset,
+            ));
             owner.push(oi);
         }
     }
@@ -5810,6 +5831,21 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
         } else {
             0
         };
+        // ONE PAGE PART per group, of ANY kind — the runtime resolves the group's page once, at the
+        // owner's offset, so an op of another part would land on the wrong page. `group_ranges` breaks a
+        // run where the offset changes (`Trip::fusable_with`), so this cannot fire; it is here because a
+        // part on the wrong page is a cache write nothing downstream can detect.
+        for t in r.clone() {
+            let o = &ops[owner[t]];
+            assert!(
+                o.kv_slot_offset == e.kv_slot_offset,
+                "group {gi}: op '{}' addresses slot offset {} but the group resolves {} — one group is \
+                 one page shift, so a page part must not share a group with another part",
+                o.op_name,
+                o.kv_slot_offset,
+                e.kv_slot_offset
+            );
+        }
         let fold_group = matches!(kinds[r.start].kind, GroupKind::PageFold { .. });
         let _ = gi; // launch order is the slice position now, not a field
         shifts.push(bundle::KvShifts {
@@ -5820,6 +5856,7 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
             // absolute-position shift and land past the page.
             page_slots: e.kv_page_slots,
             request: e.kv_request,
+            slot_offset: e.kv_slot_offset,
             // `page_fold` marks the group the runtime re-launches once per page.
             page_fold: fold_group,
             // ONE PASS PER PAGE INSTEAD OF PER (REQUEST, PAGE) — only when the fold's kernels actually

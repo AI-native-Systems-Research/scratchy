@@ -990,8 +990,49 @@ fn spliced_rope_executes_the_real_program() {
     // DECODE (mq=1, the shape every chat token runs, hd 64 = 2b's q plane) and a
     // PREFILL rung (mq=31, hd 128 = 8b's slab form) — both with heads > 1, because a
     // head-count of 1 cannot discriminate the token-major nest from the head-major one.
-    for (mq, heads, hd) in [(1u32, 32u32, 64u32), (31u32, 8u32, 128u32)] {
+    // ⭐ AND THE PROMPT CHUNK'S OWN WIDTHS, where the positions outnumber the heads and the rope loops
+    // over the HEADS (`rope.py`'s `_rope_per_head`): 2b's q plane at 256 rows and its kv plane at the
+    // 512-row window. (31, 8, 128) above is that form too.
+    for (mq, heads, hd) in [
+        (1u32, 32u32, 64u32),
+        (31, 8, 128),
+        (256, 32, 64),
+        (512, 8, 64),
+    ] {
         execute_one_spliced_rope(mq, heads, hd);
+    }
+}
+
+/// ⛔ A PROMPT CHUNK'S ROPE DOES NOT GROW WITH THE CHUNK. It looped over the positions, so a 512-row
+/// chunk's rope was 512 bodies. Where the positions outnumber the heads it now loops over the heads,
+/// so the program is the same size at every chunk width above the head count.
+#[test]
+fn a_prompt_chunks_rope_does_not_grow_with_its_rows() {
+    // The op count, and its three commonest kinds — what grew, if anything did. PRODUCTION'S node shape,
+    // the wide `[mq, heads·hd]` plane `to_wavefront` builds (the splice derives `H = total / hd` off
+    // it); `rope_ir`'s tall `[mq·heads, hd]` node states ONE head of `mq·heads` positions.
+    let ops_at = |mq: u32, heads: u32| {
+        let ir = rope_plane_ir(mq, heads, 64);
+        let spliced = scratchy_triton_splice::lower(&ir.nodes[0], &ir, false)
+            .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads}: {e}"));
+        let k = spliced.ktir.expect("spliced op carries its program");
+        let ops = k.func.ops_deep();
+        let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+        for o in &ops {
+            *kinds.entry(format!("{:?}", o.op_type)).or_default() += 1;
+        }
+        let mut top: Vec<(String, usize)> = kinds.into_iter().collect();
+        top.sort_by_key(|k| std::cmp::Reverse(k.1));
+        top.truncate(3);
+        (ops.len(), top)
+    };
+    for heads in [8u32, 32] {
+        let ((a, ka), (b, kb)) = (ops_at(64, heads), ops_at(512, heads));
+        assert_eq!(
+            a, b,
+            "{heads} heads: 64 rows {a} ops {ka:?}, 512 rows {b} ops {kb:?} — the rope grew with \
+             the chunk"
+        );
     }
 }
 
@@ -1000,7 +1041,11 @@ fn spliced_rope_executes_the_real_program() {
 fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
     use std::borrow::Cow;
 
-    let ir = rope_ir(mq, heads, hd);
+    // ⛔ PRODUCTION'S PLANE, NOT THE TALL NODE: `rope_ir` states `[mq·heads, hd]`, which the splice reads
+    // as ONE head of `mq·heads` positions (`H = total / hd = 1`), so a run over it never had more than one
+    // head. `rope_plane_ir` is `to_wavefront`'s `[mq, heads·hd]` — the SAME bytes (element (p, h·hd + d)
+    // is tall row p·heads + h, column d), so the staging below is unchanged.
+    let ir = rope_plane_ir(mq, heads, hd);
     let node = &ir.nodes[0];
     let spliced = scratchy_triton_splice::lower(node, &ir, false)
         .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}"));
@@ -1586,6 +1631,36 @@ fn spliced_rope_lowers_through_the_door() {
 /// address. The node kind is `RopeRotate` (the pure rotation); `RopeAppend`'s extra
 /// inputs are cache destinations that flow through graph edges, and the splice covers
 /// both kinds with the same row.
+/// [`rope_ir`] at PRODUCTION'S node shape: the wide `[mq, heads·hd]` plane `to_wavefront` builds for a
+/// rope (`out_cols` = the rope's full width), so the splice reads `H = heads` and `MQ = mq`.
+fn rope_plane_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
+    let plane = TensorShape {
+        rows: mq,
+        cols: heads * hd,
+    };
+    let tensors = vec![plane, plane, plane, plane];
+    let whole = |t: usize| TensorRegion {
+        tensor: TensorId::from_index(t),
+        region: tensors[t].whole(),
+    };
+    let node = SubtileNode {
+        id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
+        op: SubOp::RopeRotate {
+            head_dim: scratchy_subtile::model_geometry::HeadDim::new(hd),
+            _form: std::marker::PhantomData,
+        },
+        inputs: vec![whole(0), whole(1), whole(2)],
+        output: whole(3),
+    };
+    SubtileIR {
+        tensors,
+        num_sources: 3,
+        nodes: vec![node],
+        result: TensorId::from_index(3),
+        op_output: Vec::new(),
+    }
+}
+
 fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
     let tall = mq * heads;
     // t0 = x source (staged [mq*heads, hd], i.e. the [mq, heads*hd] plane reshaped),
@@ -2242,4 +2317,70 @@ fn rmsnormunit_ir(m: u32, c: u32) -> SubtileIR {
         result: TensorId::from_index(1),
         op_output: Vec::new(),
     }
+}
+
+/// ⛔⛔⛔ A CONTINUATION'S PROGRAM IS FLAT IN ITS ROWS — the whole-chunk form, pinned at the door's own
+/// guard and across row counts. The per-row arm it replaced held `mq` row bodies (granite-2b at 256
+/// rows: 94.7 s to lower; at 512, never finished). Eight times the rows must not grow the program, both
+/// widths must pass the door's guard, and a program that windows its query per row must be refused.
+#[test]
+fn a_continuation_programs_size_does_not_grow_with_its_rows() {
+    let ops_at = |mq: u32| {
+        let s = AttnShape {
+            geom: (32, 8, 64),
+            mq,
+            cap: 256,
+            rung: 0,
+            rope_appended: true,
+        };
+        let ir = attn_ir(s, 0.015625);
+        let node = ir.nodes.last().unwrap();
+        let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
+        let spliced = scratchy_triton_splice::lower_attn(node, &ir, cap, s.active_cap())
+            .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
+        let k = spliced.ktir.expect("spliced op carries its program");
+        assert!(k.mask.is_some(), "mq={mq}: the continuation binds its mask");
+        ktir_superdsc::emit::lower_ktir_to_superdsc::attn_program_is_flat_in_rows(
+            "continuation",
+            &k.func,
+            mq,
+            32,
+        )
+        .unwrap_or_else(|e| panic!("mq={mq}: {}", e.message));
+        k.func.ops_deep().len()
+    };
+    let (small, wide) = (ops_at(31), ops_at(256));
+    assert!(
+        wide <= small,
+        "8x the rows grew the program: 31 rows {small} ops, 256 rows {wide} ops"
+    );
+    // The door's refusal, on a REAL unrolled program: decode windows its query once for each of its 32
+    // heads, so the same program presented as ONE head over two rows windows its query 32 times for
+    // one head — exactly the shape a per-row unroll has, which the guard exists to refuse.
+    let decode = AttnShape {
+        geom: (32, 8, 64),
+        mq: 1,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    };
+    let ir = attn_ir(decode, 0.015625);
+    let node = ir.nodes.last().unwrap();
+    let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
+    let unrolled = scratchy_triton_splice::lower_attn(node, &ir, cap, decode.active_cap())
+        .expect("the decode splice compiles")
+        .ktir
+        .expect("spliced op carries its program");
+    use ktir_superdsc::emit::lower_ktir_to_superdsc::attn_program_is_flat_in_rows;
+    assert!(
+        attn_program_is_flat_in_rows("decode", &unrolled.func, 1, 32).is_ok(),
+        "decode's one row is exempt"
+    );
+    let refused = attn_program_is_flat_in_rows("unrolled", &unrolled.func, 2, 1)
+        .expect_err("32 query windows for one head over two rows must be refused");
+    assert!(
+        refused.message.contains("unrolls per row") && refused.message.contains("2-row"),
+        "names the row count and the cause: {}",
+        refused.message
+    );
 }
