@@ -56,12 +56,21 @@
 //!   A cycle through USER events (`launch_event_wait`) is still possible
 //!   and still blocks its caller threads, exactly like the vendor without
 //!   its detector; recorded rather than reimplemented.
-//! - **Address sets are derived, not vendor-literal.** The vendor's tracker
-//!   lives inside the SDK's scheduler (not in the shipped headers), so the
-//!   read/write sets per op kind are DERIVED here from what each params
-//!   struct addresses — see [`address_sets`]'s doc for the per-kind
-//!   choices. Over-edging only serializes; under-edging corrupts; every
-//!   ambiguous kind is chosen conservative.
+//! - **Address sets are derived, deliberately divergent from the vendor's
+//!   tracker.** Audit correction (pod flex @ed96487, 2026-10-17 — this doc
+//!   previously claimed the tracker was not shipped): it IS, at
+//!   `src/runtime_stream/scheduler/hazard_tracker.cpp`, and it differs from
+//!   this port in shape, not just in reach. The vendor keeps a
+//!   last-writer/reader HISTORY per range (not this port's outstanding-op
+//!   set) and records a compute op's footprint as READS ONLY — a hole (a
+//!   compute write does not edge against later readers of the same range)
+//!   this port deliberately does NOT copy: every kind here is read+write
+//!   conservative, derived from what each params struct addresses (see
+//!   [`address_sets`]'s doc for the per-kind choices, including the
+//!   vendor-untracked Fill). Over-edging only serializes; under-edging
+//!   corrupts. The vendor's tracker is also OFF unless
+//!   `SPYRE_HAZARD_TRACKER=1` (the `track_hazards` ctor param above
+//!   registers a stream with it); this port's tracker is always armed.
 //! - **Poison inheritance.** When a producer op fails, the vendor's
 //!   spliced `EventWait` hits a poisoned event and `processEventWaitOp`'s
 //!   poison arm records the producer's error on the WAITER's stream. Here
@@ -364,18 +373,27 @@ fn conflicts_with(reads: &[AddrRange], writes: &[AddrRange], other: &Outstanding
 }
 
 /// The per-kind read/write device-address sets of one submitted op,
-/// downcast from `SubmittedOperation`'s opaque payload. DERIVED, not
-/// vendor-literal (the SDK's tracker is not in the shipped headers) — the
-/// recorded choices, all biased toward over-edging (which serializes)
-/// rather than under-edging (which corrupts):
+/// downcast from `SubmittedOperation`'s opaque payload. DERIVED, deliberately
+/// divergent from the vendor's tracker — which IS shipped (pod flex @ed96487,
+/// `src/runtime_stream/scheduler/hazard_tracker.cpp`; this doc previously
+/// said it was not in the shipped headers) and differs from this port in
+/// exactly the ways recorded here. All choices biased toward over-edging
+/// (which serializes) rather than under-edging (which corrupts):
 ///
 /// - **H2D** writes its device address (host→device copy lands there);
 ///   **D2H** reads it.
-/// - **Fill** writes its device address.
+/// - **Fill** writes its device address. The vendor's tracker leaves Fill
+///   UNTRACKED entirely; this port tracks it — a fill's write conflicts
+///   with any concurrent read of the same range, and pretending otherwise
+///   is an under-edge.
 /// - **Compute** is conservative read+write on its program allocation AND
 ///   every tensor alloc: a kernel's true read/write split is not
 ///   expressible in `ComputeParams`, and the inputs/outputs distinction
-///   lives in kernel-land, not the submission params.
+///   lives in kernel-land, not the submission params. ⛔ The vendor's
+///   tracker records a compute op's footprint as READS ONLY — a hole (a
+///   compute op's writes do not edge against later readers of the same
+///   range). This port deliberately does NOT copy that; the divergence is
+///   the point, not a porting error.
 /// - **P2P** kinds that carry a device address (legacy data ops,
 ///   `P2PRdmaSend`) are conservative read+write on it: the local side of a
 ///   cross-port transfer is producer or consumer depending on direction,
@@ -384,6 +402,11 @@ fn conflicts_with(reads: &[AddrRange], writes: &[AddrRange], other: &Outstanding
 /// - A payload whose type does not match its kind (impossible through the
 ///   typed `launch_*` paths; the scheduler's own arms report those) yields
 ///   empty sets — untracked.
+///
+/// The vendor's tracker also keeps a last-writer/reader HISTORY per range
+/// rather than this port's outstanding-op set, and arms its RAS deadlock
+/// detector at `synchronize()`; both are recorded above in the module doc's
+/// divergences. It is OFF in the vendor unless `SPYRE_HAZARD_TRACKER=1`.
 fn address_sets(kind: RuntimeOperationKind, payload: &dyn Any) -> (Vec<AddrRange>, Vec<AddrRange>) {
     use RuntimeOperationKind as K;
     let chunks_of = |addr: &CompositeAddress| -> Vec<AddrRange> {

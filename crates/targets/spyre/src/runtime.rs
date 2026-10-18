@@ -33,10 +33,11 @@ use flex_rs::runtime::{RuntimeContext, RuntimeContextError};
 use flex_rs::scheduler::{
     DeviceAddressResolver, FlexAllocatorAddressResolver, HardwareSubmit, QueueCapacitySource,
     SchedulerBackendConfig, SchedulerFactoryError, SenlibHardwareSubmit, SenlibQueueCapacity,
-    create_scheduler,
+    build_compute_cb, create_scheduler,
 };
 use flex_rs::stream::{
-    RuntimeStream, RuntimeStreamError, RuntimeStreamMode, RuntimeStreamPriority, StreamId,
+    RuntimeStream, RuntimeStreamError, RuntimeStreamMode, RuntimeStreamPriority, SchedulerError,
+    StreamId,
 };
 use flex_rs::topology::populate_domain_topology;
 
@@ -298,6 +299,10 @@ pub enum HwError {
     Alloc(AllocError),
     /// `RuntimeContext::reset` refused.
     Reset(RuntimeContextError),
+    /// Rendering compute-CB wire images OFF the submit path refused — the CB
+    /// encoder cannot express an operand ([`Stream::render_compute_batch`]).
+    /// Never a submission: nothing was sent to the device.
+    CbRender(SchedulerError),
 }
 
 impl fmt::Display for HwError {
@@ -318,6 +323,7 @@ impl fmt::Display for HwError {
             Self::StreamCreate(e) => write!(f, "{e}"),
             Self::Alloc(e) => write!(f, "{e}"),
             Self::Reset(e) => write!(f, "{e}"),
+            Self::CbRender(e) => write!(f, "CB image render (no submission): {e}"),
         }
     }
 }
@@ -639,6 +645,69 @@ impl Stream {
             .launch_compute_batch(params, pipeline_barrier, None)
             .map_err(HwError::Stream)
     }
+
+    /// Render the wire bytes of a compute batch WITHOUT submitting it (#603
+    /// PR2's image-render door): the same `flex_rs::scheduler::build_compute_cb`
+    /// the submit path runs per CB, over the same resolver TYPE the Pf backend
+    /// resolves with (`FlexAllocatorAddressResolver` on the runtime's own
+    /// allocator — the very `Arc` `build_runtime` handed the backend, so the
+    /// region map both read is one map), at CALLER-chosen tags. Tags only
+    /// reach the CTRL section's tag field; a caller comparing two renders
+    /// feeds both sides the same `first_tag` and the field cancels — the
+    /// 2b patch stage stamps real pool-leased tags there.
+    ///
+    /// Nothing here rings a doorbell, leases a tag, or touches a queue: the
+    /// images are plain bytes until a caller submits them. The parity gate
+    /// (`superdsc_exec::Executor::prepare`) renders one step's batch both the
+    /// walk way and the CbPlan way THROUGH THIS ONE DOOR, so what it compares
+    /// is exactly what the device would be handed.
+    pub fn render_compute_batch(
+        &self,
+        launches: &[BatchedCompute],
+        first_tag: u32,
+    ) -> Result<Vec<ControlBlockWire>, HwError> {
+        let resolver = FlexAllocatorAddressResolver::new(
+            self.rt
+                .get_allocator()
+                .map_err(|e| HwError::Alloc(AllocError::Context(e)))?,
+        );
+        let mut cbs = Vec::with_capacity(launches.len());
+        for (i, l) in launches.iter().enumerate() {
+            let params = ComputeParams::new(
+                l.prog.0.clone(),
+                l.tensor_allocs.iter().map(|a| a.0.clone()).collect(),
+                KernelName(String::new()),
+                BootstrapOffset(l.bootstrap_offset),
+                Vec::new(),
+            );
+            cbs.push(
+                build_compute_cb(&resolver, &params, ResponseTag(first_tag + i as u32))
+                    .map_err(HwError::CbRender)?,
+            );
+        }
+        Ok(cbs)
+    }
+
+    /// #603 PR2's replay submit door — the write side of
+    /// [`Self::render_compute_batch`]'s images: submit a canvas the render
+    /// door produced (and the prepare gates proved) as ONE doorbell, with
+    /// the batch's stamp closure applying the step's patches and the
+    /// pool-leased tags to the copy the backend takes under the submission
+    /// lock. Same one-operation shape as [`Self::compute_batch`] — one
+    /// barrier decision (`pipeline_barrier` is the OR of the step's per-op
+    /// host fences), one fence, one capacity gate, in-flight accounting per
+    /// CB — so the step is ordered on the ring exactly as its per-rung
+    /// `compute_batch` calls were, with the same CBs in the same order.
+    pub fn compute_wires(
+        &self,
+        batch: ComputeWireBatch,
+        pipeline_barrier: bool,
+    ) -> Result<(), HwError> {
+        let stream = self.live()?;
+        stream
+            .launch_compute_wires(batch, pipeline_barrier, None)
+            .map_err(HwError::Stream)
+    }
 }
 
 impl Drop for Stream {
@@ -653,6 +722,11 @@ impl Drop for Stream {
 /// The byte types [`DevAddr`]'s signature speaks, re-exported so the player imports every device
 /// address type from this one module — the typed card surface hands out the types it takes.
 pub use flex_rs::address::{ByteOffset, ByteSize};
+/// The replay payload [`Stream::compute_wires`] takes and the wire it is made of — same re-export
+/// rule: the door hands out the types it takes, so the player names every submission type through
+/// this one module.
+pub use flex_rs::compute::ComputeWireBatch;
+pub use flex_rs::control_block_wire::{ControlBlockWire, ResponseTag};
 
 /// One entry of a [`Stream::compute_batch`] list — the owned handles one compute launch
 /// needs. The handles are owned (not borrowed) because a batch outlives the loop that

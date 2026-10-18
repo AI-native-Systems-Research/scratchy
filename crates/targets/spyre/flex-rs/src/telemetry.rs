@@ -1,17 +1,24 @@
 //! Port of flex's own `telemetry/` subsystem: `flex::FlexLogExtra`,
-//! `flex::FlexConfig` env-var slice, `flex::Histogram`, `flex::LatencyBreakdown`,
-//! `flex::HistTimer`, `flex::Profiler`/`flex::GlobalProfiler` (Chrome-trace
-//! event log), `flex::telemetry::UnifiedProfiler` (multi-backend dispatch),
-//! and the pure-math half of `flex::TimestampCalibrator` (linear regression +
-//! Kalman smoothing).
+//! `flex::FlexConfig` env-var slice, `flex::Profiler`/`flex::GlobalProfiler`
+//! (Chrome-trace event log), `flex::telemetry::UnifiedProfiler` (multi-backend
+//! dispatch), and the pure-math half of `flex::TimestampCalibrator` (linear
+//! regression + Kalman smoothing).
 //!
-//! The `aiupti::Profiler` half of this subsystem is NOT here and is not ported:
-//! it belongs to `libaiupti`, a separate library that already ships as
-//! `libaiupti.so` in the SDK with its own source tree. An earlier pass
-//! reimplemented its internals in this crate purely because that source was
-//! available locally; that was a scope error and has been removed. The only
-//! libaiupti-shaped things left here are the three wire types flex's own
-//! signatures mention — see [`CorrelationId`].
+//! ⛔ NOT PORTED (pod-flex @ed96487 audit, 2026-10-17 — this doc previously
+//! claimed otherwise): `flex::Histogram`, `flex::LatencyBreakdown`, and
+//! `flex::HistTimer`. Their section markers below stand where they would land;
+//! nothing uses them and nothing here implements them. Port them when a caller
+//! exists, not before — an empty section is honest, a doc claiming a port is
+//! not (`the module doc is not evidence`).
+//!
+//! The `aiupti::Profiler` half of this subsystem is NOT here and is not
+//! ported: on the pod it is NOT a separate `libaiupti` library but flex's own
+//! `src/telemetry/aiupti_profiler.cpp` (audit correction — this doc previously
+//! said it belonged to `libaiupti`, which ships in the SDK but is not where
+//! flex's profiler lives). An earlier pass reimplemented its internals in this
+//! crate purely because that source was available locally; that was a scope
+//! error and has been removed. The only aiupti-shaped things left here are the
+//! three wire types flex's own signatures mention — see [`CorrelationId`].
 //!
 //! `UnifiedProfiler::TIMING` backend (`hal::GlobalTimingProfile`) is a
 //! separate `hal`-owned subsystem outside this crate's flex-owned closure; it
@@ -262,15 +269,18 @@ impl FlexLogExtra {
 }
 
 // ---------------------------------------------------------------------------
-// Histogram — port of flex/src/telemetry/histogram.hpp
+// Histogram — NOT PORTED (marker only; see the module doc). flex's
+// src/telemetry/histogram.hpp has no consumer here.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// LatencyBreakdown — port of flex/src/telemetry/latency_breakdown.hpp
+// LatencyBreakdown — NOT PORTED (marker only; see the module doc). flex's
+// src/telemetry/latency_breakdown.hpp has no consumer here.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// HistTimer — port of flex/include/flex/telemetry/hist_timer.hpp
+// HistTimer — NOT PORTED (marker only; see the module doc). flex's
+// include/flex/telemetry/hist_timer.hpp has no consumer here.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -692,6 +702,8 @@ pub fn avg(x: &[f64]) -> f64 {
 /// original C++ (`std::deque<std::atomic<uint64_t>>`); exposed for parity
 /// with the header's use of `std::deque` rather than `std::vector` for
 /// `buckets_` (front/back growth semantics, not random reallocation).
+/// `HistTimer` itself is NOT ported (see the module doc) — this alias serves
+/// the ported call sites that borrowed the deque shape.
 pub type BucketDeque = VecDeque<u64>;
 
 #[cfg(test)]

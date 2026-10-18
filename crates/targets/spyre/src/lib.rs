@@ -62,6 +62,11 @@ pub mod tile_op {
 pub mod subtile_tape_to_tile_ir {
     pub use crate::ir::bridge::subtile_tape_tile_op::*;
 }
+/// #603 PR2 — one launch's compute CBs as data: the submit walk's arithmetic
+/// single-sourced (`launch_site`), the plan/render twin, and the prepare-time
+/// byte-identical parity gate. Behind `spyre-hw` with its consumers.
+#[cfg(feature = "spyre-hw")]
+pub(crate) mod cb_plan;
 /// THE FORWARD TAPE — one decode step as ordered steps rather than a function
 /// body: which host kernels run, what each fills, and where the single device
 /// launch sits. The LAUNCHER is the worker's (it owns the session).

@@ -784,6 +784,42 @@ impl ControlBlockWire {
         Self { bytes }
     }
 
+    /// The 128 wire bytes, read-only — for diagnostics that name the first
+    /// differing byte of two rendered images (#603 PR2's parity gate).
+    pub const fn bytes(&self) -> &[u8; CB_NUM_BYTES] {
+        &self.bytes
+    }
+
+    /// The 128 wire bytes, mutable — for the replay player's patch stage
+    /// (#603 PR2): an image copied into a ring slot is patched in place
+    /// (per-step word edits at prepare-derived offsets), never re-encoded.
+    /// The wire stays 128 bytes; the caller owns keeping the fields it does
+    /// not touch intact.
+    pub fn bytes_mut(&mut self) -> &mut [u8; CB_NUM_BYTES] {
+        &mut self.bytes
+    }
+
+    /// Replace the CTRL section's response tag in place (#603 PR2's replay
+    /// stage). An image is rendered once at caller-chosen tags; the submit
+    /// path then stamps the tags the `ResponseWorker` actually leased onto
+    /// its copy — the port of the vendor's `cbr->SpecializeTags(raw_tags)`
+    /// (`PrepareCbs`, `response_worker.cpp`), which the immutable
+    /// [`ControlBlockWire`] could not express, so this owns the same field
+    /// through the same [`BitField`] the constructor packs it with: one
+    /// derivation of "tag lives at bits 31:8", never a second.
+    ///
+    /// A mask-and-set, deliberately NOT an add: the canvas was rendered at
+    /// arbitrary tags, so what is being replaced is a baked-in value, not a
+    /// zero. Everything else in word 0 — the barrier bit included — is kept.
+    pub fn set_tag(&mut self, tag: ResponseTag) {
+        let mask = BitField::<31, 8>::MASK;
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&self.bytes[CTRL_SECTION..CTRL_SECTION + 8]);
+        let word = u64::from_le_bytes(w);
+        let word = (word & !mask) | BitField::<31, 8>::pack(tag.0 as u64);
+        self.bytes[CTRL_SECTION..CTRL_SECTION + 8].copy_from_slice(&word.to_le_bytes());
+    }
+
     /// Port of `ControlBlockStream::CreateGraphFreeCompute`: one compute CB
     /// with `xlat[i] = tensor_paddrs[i]` (RW) for each input/output tensor,
     /// `xlat[7] = prog_paddr` (RW), and `cmpt` pointing at `bootstrap_addr`

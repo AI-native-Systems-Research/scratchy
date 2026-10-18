@@ -19,7 +19,10 @@ pub const SEG_KV: usize = 2;
 /// can shift it without disturbing the running softmax state or any other activation.
 pub const SEG_MASK: usize = 3;
 /// Slots per slab in the incremental Kᵀ restickify — the fp16 stick, and the slab's slot count.
-const SLAB_SLOTS: i64 = 64;
+/// `pub(crate)`: the launch position's slab index `pos / SLAB_SLOTS` is one of the three per-step
+/// scalars the #603 replay player patches into a cached CB image, and that scalar must divide by
+/// THIS constant, not a second `64` that could drift from it.
+pub(crate) const SLAB_SLOTS: i64 = 64;
 
 /// WHICH ROW OF THIS LAUNCH — a tensor row, not a request identity.
 ///

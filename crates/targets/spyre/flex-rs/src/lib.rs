@@ -27,8 +27,9 @@
 //! - `host_interface`       — RaiiBuffer
 //! - `flex_config`          — FlexConfig, RuntimeConfig
 //! - `util`                 — sendnn::Status, generic numeric/env helpers
-//! - `telemetry`            — FlexLogExtra, FlexConfig subset, Histogram, LatencyBreakdown,
-//!   HistTimer, Profiler/GlobalProfiler, UnifiedProfiler, TimestampCalibrator math
+//! - `telemetry`            — FlexLogExtra, FlexConfig subset, Profiler/GlobalProfiler,
+//!   UnifiedProfiler, TimestampCalibrator math (Histogram/LatencyBreakdown/HistTimer NOT
+//!   ported — see that module's doc)
 //! - `senlib_ffi`           — THE senlib FFI boundary: every `extern "C"`
 //!   declaration against senlib in this crate (runtime bring-up, topology,
 //!   IOMMU, device-memory allocator, scheduler CBI/RBI submission +

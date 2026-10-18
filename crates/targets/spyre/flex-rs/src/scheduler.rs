@@ -74,7 +74,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::address::{ByteSize, Chunk, CompositeAddress};
-use crate::compute::ComputeParams;
+use crate::compute::{ComputeParams, ComputeWireBatch};
 use crate::control_block_wire::{
     AllocationTotalSize, ControlBlockWire, DevicePhysicalAddress, Flits, HostPhysicalAddress,
     ResponseTag, SegmentExtent, TransferSize, VirtualAddressSbf,
@@ -619,6 +619,27 @@ pub trait SchedulerBackend: Send + Sync {
         ops: &[ComputeParams],
         callback: CompletionCallback,
     );
+    /// The prebuilt-wire form of [`Self::submit_compute_batch`] (#603 PR2's
+    /// replay path; contract: the `ComputeWireBatch` doc): the same ONE
+    /// `submitToHardware` group — one capacity gate over `canvas.len()` CBs,
+    /// one grouped completion, one doorbell — but the CBs are NOT re-encoded
+    /// from `ComputeParams` per submission. The backend's build closure
+    /// clones the canvas, hands it to the batch's `patch` closure (leased
+    /// tags + the caller's per-step word edits), and returns the wires. The
+    /// CB sequence, and therefore the device-side order, is exactly what
+    /// `submit_compute_batch` over the same ops would have emitted — that
+    /// equivalence is what the caller's prepare-time parity gate proves.
+    ///
+    /// Deliberately a required method for the same reason
+    /// [`Self::submit_compute_batch`] is: the one-doorbell grouping and the
+    /// no-re-encode contract are the point, and a default that looped
+    /// `submit_compute` would silently break both.
+    fn submit_compute_wires(
+        &self,
+        state: &Arc<SchedulerState>,
+        batch: &ComputeWireBatch,
+        callback: CompletionCallback,
+    );
     fn submit_fill(
         &self,
         state: &Arc<SchedulerState>,
@@ -717,6 +738,10 @@ pub struct MockBackend {
     /// submission crossed the backend as ONE batch of N ops rather than N
     /// `submit_compute` calls.
     pub compute_batches: Mutex<Vec<usize>>,
+    /// CB counts of every `submit_compute_wires` call, in order — the
+    /// replay-path counterpart of `compute_batches`, so a test can assert a
+    /// wire batch crossed the backend as ONE submission of N CBs.
+    pub wire_batches: Mutex<Vec<usize>>,
     /// Manual-completion mode (the `hazard_edge_tests` lever): once set,
     /// `submit_dma` parks the completion in `pending_completions` instead
     /// of firing it, and the TEST decides when the op "finishes" — the
@@ -751,6 +776,7 @@ impl Default for MockBackend {
             throw_on_compute: Mutex::new(false),
             barrier_calls: Mutex::new(Vec::new()),
             compute_batches: Mutex::new(Vec::new()),
+            wire_batches: Mutex::new(Vec::new()),
             manual_complete: Mutex::new(false),
             pending_completions: Mutex::new(Vec::new()),
             no_capacity: NoCapacity,
@@ -768,6 +794,11 @@ impl MockBackend {
     /// The op counts of every `submit_compute_batch` call so far, in order.
     pub fn compute_batch_sizes(&self) -> Vec<usize> {
         self.compute_batches.lock().unwrap().clone()
+    }
+
+    /// The CB counts of every `submit_compute_wires` call so far, in order.
+    pub fn wire_batch_sizes(&self) -> Vec<usize> {
+        self.wire_batches.lock().unwrap().clone()
     }
 
     /// Switch the mock into manual-completion mode: from the next
@@ -870,6 +901,31 @@ impl SchedulerBackend for MockBackend {
             state.inc_in_flight(PipelineId::Compute);
         }
         for _ in ops {
+            state.dec_in_flight(PipelineId::Compute);
+        }
+        callback(Ok(()));
+    }
+
+    fn submit_compute_wires(
+        &self,
+        state: &Arc<SchedulerState>,
+        batch: &ComputeWireBatch,
+        callback: CompletionCallback,
+    ) {
+        if *self.throw_on_compute.lock().unwrap() {
+            callback(Err(mock_error(
+                "MockRuntimeScheduler: submitCompute configured to throw",
+            )));
+            return;
+        }
+        // The mock runs no wire bytes and no build closure; what it can
+        // observe is the submission's SHAPE — one group of `canvas.len()`
+        // CBs — which is what `wire_batch_sizes` records.
+        self.wire_batches.lock().unwrap().push(batch.canvas.len());
+        for _ in batch.canvas.iter() {
+            state.inc_in_flight(PipelineId::Compute);
+        }
+        for _ in batch.canvas.iter() {
             state.dec_in_flight(PipelineId::Compute);
         }
         callback(Ok(()));
@@ -1158,7 +1214,13 @@ fn build_fill_cb(
 /// operation. Port of `ControlBlockStream::CreateGraphFreeCompute`'s call
 /// shape: one xlat entry per tensor operand plus the program at segment 7,
 /// bootstrap pointing at `PROG_OFFSET_BASE + bootstrap_offset`.
-fn build_compute_cb(
+///
+/// `pub` because the vendor's `CreateGraphFreeCompute` is itself a public
+/// method on `ControlBlockStream` — the scheduler calls it internally, and so
+/// can a caller that wants wire images WITHOUT submitting them (#603 PR2's
+/// prepare-time CB-image render and its byte-identical parity gate, reached
+/// through `scratchy::runtime::Stream::render_compute_batch`).
+pub fn build_compute_cb(
     resolver: &dyn DeviceAddressResolver,
     op: &ComputeParams,
     tag: ResponseTag,
@@ -4425,6 +4487,33 @@ impl SchedulerBackend for PfBackend {
         );
     }
 
+    /// The prebuilt-wire form (contract: [`SchedulerBackend::submit_compute_wires`]
+    /// and [`ComputeWireBatch`]): same ONE `submitToHardware` group, but the
+    /// build stage is a canvas clone + the batch's stamp closure — no
+    /// resolver, no re-encode, no per-CB failure to attribute (a wire that
+    /// was going to fail to build already failed, or verified, at the render
+    /// door that produced the canvas).
+    fn submit_compute_wires(
+        &self,
+        state: &Arc<SchedulerState>,
+        batch: &ComputeWireBatch,
+        callback: CompletionCallback,
+    ) {
+        submit_to_hardware(
+            state,
+            self.response_worker(),
+            self.capacity.as_ref(),
+            SubmitShape::ops(PipelineId::Compute),
+            batch.canvas.len() as u64,
+            callback,
+            |tags| {
+                let mut cbs = batch.canvas.as_ref().clone();
+                (batch.patch)(tags, &mut cbs);
+                Ok(cbs)
+            },
+        );
+    }
+
     /// Port of `PfRuntimeScheduler::submitFill` (`pf_runtime_scheduler.cpp:261-276`):
     /// build a real fill CB and submit it on DMAI or DMAO per
     /// `fill.use_dmai`.
@@ -4652,6 +4741,29 @@ impl SchedulerBackend for VfBackend {
             },
         );
     }
+    /// The prebuilt-wire form — same shape as PF's for the same reason
+    /// (`submitToHardware` is shared); see
+    /// [`SchedulerBackend::submit_compute_wires`].
+    fn submit_compute_wires(
+        &self,
+        state: &Arc<SchedulerState>,
+        batch: &ComputeWireBatch,
+        callback: CompletionCallback,
+    ) {
+        submit_to_hardware(
+            state,
+            self.response_worker(),
+            self.capacity.as_ref(),
+            SubmitShape::ops(PipelineId::Compute),
+            batch.canvas.len() as u64,
+            callback,
+            |tags| {
+                let mut cbs = batch.canvas.as_ref().clone();
+                (batch.patch)(tags, &mut cbs);
+                Ok(cbs)
+            },
+        );
+    }
     /// Port of `VfRuntimeScheduler::submitFill`: same real fill CB as PF.
     fn submit_fill(
         &self,
@@ -4859,6 +4971,17 @@ impl RuntimeScheduler {
     pub fn mock_compute_batch_sizes(&self) -> Option<Vec<usize>> {
         match &self.backend {
             Backend::Mock(m) => Some(m.compute_batch_sizes()),
+            _ => None,
+        }
+    }
+
+    /// Test-only accessor: the CB counts of every `submit_compute_wires`
+    /// call, in order — only meaningful when this scheduler wraps
+    /// `Backend::Mock`.
+    #[cfg(test)]
+    pub fn mock_wire_batch_sizes(&self) -> Option<Vec<usize>> {
+        match &self.backend {
+            Backend::Mock(m) => Some(m.wire_batch_sizes()),
             _ => None,
         }
     }
@@ -5299,6 +5422,35 @@ impl SchedulerHandle for RuntimeScheduler {
                             &*ops,
                             completion,
                             |backend, state, ops, cb| backend.submit_compute_batch(state, ops, cb),
+                        );
+                        return Ok(());
+                    }
+                    // Hand the box back for the wire-batch downcast below.
+                    Err(payload) => payload,
+                };
+                // #603 PR2's replay form: a whole step's CBs as prebuilt
+                // wire bytes plus a stamp closure. Same one-operation shape
+                // as the batch above — one barrier decision (the one the
+                // first op of the step would get; an all-compute step has no
+                // pipeline switch inside it), one fence, one backend submit
+                // — so merging a step's per-rung batches into ONE submission
+                // changes neither the fence set nor the device-side order:
+                // the ring is FIFO and the step's CBs are consecutive.
+                let payload = match payload.downcast::<ComputeWireBatch>() {
+                    Ok(wires) => {
+                        self.schedule_pipelined(
+                            PipelinedOp {
+                                id: stream_id,
+                                mode,
+                                kind: op.kind,
+                                requested_barrier,
+                                pipeline_override: None,
+                            },
+                            &*wires,
+                            completion,
+                            |backend, state, batch, cb| {
+                                backend.submit_compute_wires(state, batch, cb)
+                            },
                         );
                         return Ok(());
                     }
@@ -6586,11 +6738,22 @@ mod factory_tests {
 /// * `launch_compute`'s per-op validation holds per element, with the failing element's
 ///   index wrapped ([`RuntimeStreamError::BatchElement`]);
 /// * an empty batch is refused before anything is scheduled.
+///
+/// The prebuilt-wire form ([`ComputeWireBatch`]) gets the same treatment one level over:
+/// it must cross the backend through its OWN one-call entry point
+/// (`submit_compute_wires`) with the same barrier decision and the same discharged
+/// in-flight budget — the `K::Compute` dispatch is a downcast chain, so a wire payload
+/// that fell through to another arm would vanish silently, and a refusal or a thrown
+/// backend must surface exactly like the params form's.
 #[cfg(test)]
 mod compute_batch_tests {
     use super::*;
     use crate::address::{ByteOffset, ByteSize, LogicalAddress, RegionId};
-    use crate::compute::{BootstrapOffset, ComputeParams, KernelName};
+    use crate::compute::{BootstrapOffset, ComputeParams, ComputeWireBatch, KernelName};
+    use crate::control_block_wire::{
+        AllocationTotalSize, ControlBlockWire, DevicePhysicalAddress, Flits, ResponseTag,
+        VirtualAddressSbf,
+    };
     use crate::memory_region::DomainId;
     use crate::stream::{
         DeviceId, RuntimeStream, RuntimeStreamError, RuntimeStreamMode, RuntimeStreamPriority,
@@ -6755,6 +6918,125 @@ mod compute_batch_tests {
             "expected EmptyBatch, got {err:?}"
         );
         assert_eq!(sched.mock_barrier_count(), Some(0));
+        assert_eq!(sched.mock_compute_batch_sizes(), Some(Vec::new()));
+        // The refusal never incremented the stream's in-flight count: nothing to wait for.
+        stream.synchronize().unwrap();
+    }
+
+    /// A prebuilt wire with a distinct tag, built through the same
+    /// `ControlBlockWire::compute` the real render path runs — the wiring
+    /// under test starts at the payload, so the bytes themselves are the
+    /// parity-gate's job, not this module's.
+    fn dummy_wire(tag: u32) -> ControlBlockWire {
+        let bootstrap = VirtualAddressSbf::new(7, Flits::from_bytes(0));
+        let prog = (
+            DevicePhysicalAddress(0x1_0000_0000),
+            AllocationTotalSize(4096),
+        );
+        let tensors = [(
+            DevicePhysicalAddress(0x2_0000_0000 + tag as u64 * 0x1000),
+            AllocationTotalSize(65536),
+        )];
+        ControlBlockWire::compute(ResponseTag(tag), &tensors, prog, bootstrap).unwrap()
+    }
+
+    /// THE WIRE FORM'S EQUIVALENCE: the same three CBs as a `ComputeWireBatch`
+    /// and as a `Vec<ComputeParams>` batch drive the same scheduler state —
+    /// same barrier count for the same `pipeline_barrier`, in-flight budget
+    /// fully discharged — but through the wire form's OWN entry point: one
+    /// `submit_compute_wires(3)` call, with the params-batch entry point
+    /// untouched. This pins the `K::Compute` downcast chain: a wire payload
+    /// that fell through to another arm would record nothing here.
+    #[test]
+    fn wire_batch_crosses_backend_as_one_call() {
+        let (sched_b, stream_b) = mock_stream(RuntimeStreamMode::StrictOrdering);
+        let ops: Vec<ComputeParams> = (0..3).map(dummy_compute).collect();
+        stream_b.launch_compute_batch(ops, true, None).unwrap();
+        stream_b.synchronize().unwrap();
+
+        let (sched_w, stream_w) = mock_stream(RuntimeStreamMode::StrictOrdering);
+        let canvas: Vec<ControlBlockWire> = (0..3).map(|i| dummy_wire(42 + i)).collect();
+        let batch = ComputeWireBatch {
+            canvas: Arc::new(canvas),
+            patch: Box::new(|tags, cbs| {
+                for (cb, tag) in cbs.iter_mut().zip(tags.iter()) {
+                    cb.set_tag(*tag);
+                }
+            }),
+        };
+        stream_w.launch_compute_wires(batch, true, None).unwrap();
+        stream_w.synchronize().unwrap();
+
+        assert_eq!(
+            sched_w.mock_barrier_count(),
+            sched_b.mock_barrier_count(),
+            "the same pipeline_barrier must drive the same barrier count"
+        );
+        assert_eq!(
+            sched_w.mock_wire_batch_sizes(),
+            Some(vec![3]),
+            "the whole canvas must cross the backend as ONE wire call"
+        );
+        assert_eq!(
+            sched_w.mock_compute_batch_sizes(),
+            Some(Vec::new()),
+            "a wire payload must not be mistaken for a Vec<ComputeParams> batch"
+        );
+        for sched in [&sched_b, &sched_w] {
+            assert_eq!(
+                sched.state.current_in_flight(PipelineId::Compute),
+                0,
+                "the in-flight budget must be fully discharged"
+            );
+        }
+    }
+
+    /// A thrown wire submission routes through the completion callback,
+    /// exactly like the params batch: no synchronous error, the stream enters
+    /// its error state, `synchronize()` rethrows the deferred error, and
+    /// nothing is recorded as submitted.
+    #[test]
+    fn wire_batch_submit_failure_surfaces_at_synchronize() {
+        let (sched, stream) = mock_stream(RuntimeStreamMode::StrictOrdering);
+        sched.mock_set_throw_on_compute(true);
+        let batch = ComputeWireBatch {
+            canvas: Arc::new((0..3).map(|i| dummy_wire(42 + i)).collect()),
+            patch: Box::new(|_, _| {}),
+        };
+        stream.launch_compute_wires(batch, false, None).unwrap();
+        let err = stream.synchronize().unwrap_err();
+        assert!(
+            matches!(err, RuntimeStreamError::Deferred(_)),
+            "expected a deferred error, got {err:?}"
+        );
+        assert_eq!(
+            sched.mock_wire_batch_sizes(),
+            Some(Vec::new()),
+            "a thrown wire batch must not be recorded as submitted"
+        );
+    }
+
+    /// An empty canvas is refused before anything is scheduled, exactly like
+    /// an empty params batch — it would ring no doorbell and complete nothing.
+    #[test]
+    fn empty_wire_batch_is_refused() {
+        let (sched, stream) = mock_stream(RuntimeStreamMode::StrictOrdering);
+        let err = stream
+            .launch_compute_wires(
+                ComputeWireBatch {
+                    canvas: Arc::new(Vec::new()),
+                    patch: Box::new(|_, _| {}),
+                },
+                false,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeStreamError::EmptyBatch(_)),
+            "expected EmptyBatch, got {err:?}"
+        );
+        assert_eq!(sched.mock_barrier_count(), Some(0));
+        assert_eq!(sched.mock_wire_batch_sizes(), Some(Vec::new()));
         assert_eq!(sched.mock_compute_batch_sizes(), Some(Vec::new()));
         // The refusal never incremented the stream's in-flight count: nothing to wait for.
         stream.synchronize().unwrap();

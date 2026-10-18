@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use crate::address::{ByteOffset, CompositeAddress};
+use crate::control_block_wire::{ControlBlockWire, ResponseTag};
 
 /// Name of the kernel to execute. Newtype over the C++ `std::string
 /// kernel_name`; empty string in C++ has no special meaning documented in
@@ -132,4 +133,43 @@ impl ComputeParams {
     pub fn pipeline_barrier(&self) -> bool {
         self.pipeline_barrier
     }
+}
+
+/// The stamp a replay submission runs on the backend's canvas copy: given
+/// the tags the `ResponseWorker` leased (one per CB, in CB order) and the
+/// mutable copy, write this step's bytes — see
+/// [`ComputeWireBatch::patch`] for the contract.
+pub type WireStamp = dyn Fn(&[ResponseTag], &mut [ControlBlockWire]) + Send;
+
+/// A compute batch submitted as PREBUILT wire bytes — #603 PR2's replay
+/// payload, scratchy's own extension on top of the vendor surface (no C++
+/// analog: the vendor re-encodes every CB from `ComputeParams` per
+/// submission; this crate's `ControlBlockWire` made the bytes portable, and
+/// the parity gate made them provable, which is what lets a whole step's
+/// CBs travel as data).
+///
+/// * `canvas` — the image: one `ControlBlockWire` per CB, rendered once
+///   through the same `build_compute_cb` the `Vec<ComputeParams>` path runs
+///   per CB per submission. An `Arc` because the rendering is shared with
+///   the caller's image cache: the submit path takes its copy from HERE
+///   (one memcpy per step), never from the cache directly.
+/// * `patch` — stamps one step onto that copy: the tags the
+///   `ResponseWorker` leased (`ControlBlockWire::set_tag`) plus whatever
+///   else moves with the step, at offsets the caller derived once. Runs
+///   inside `prepare_cbs`, under the submission lock, between the tag
+///   lease and the pending-slot publish — on the launching thread, never a
+///   completion thread — so it must be cheap, deterministic and
+///   side-effect-free: it is the last host code that touches these bytes
+///   before the doorbell.
+///
+/// Submitted through `RuntimeStream::launch_compute_wires`, which carries
+/// the barrier decision the same way `launch_compute_batch` does (the OR
+/// of what the caller would have passed per op). The hazard tracker sees
+/// this payload exactly as it sees the `Vec<ComputeParams>` batch it
+/// replaces — no `ComputeParams` to read addresses from, so no addresses,
+/// the same "neither checked against nor recorded as" disposition that
+/// batch already has (see `scheduler::hazards::address_sets`).
+pub struct ComputeWireBatch {
+    pub canvas: Arc<Vec<ControlBlockWire>>,
+    pub patch: Box<WireStamp>,
 }
