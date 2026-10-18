@@ -626,8 +626,8 @@ pub fn pointwise_untiled_slice_bytes(rows: u32, cols: u32, n_inputs: u32) -> Opt
 /// scale along the tiled dim is not `Active`, so its address never advances per trip
 /// (pinned by `time_tiled_broadcast_operand_is_address_stable`).
 /// `df` is `Df::Fp16` (the 64-stick default) for every caller but the torch-spyre fp32 RMSNorm.
-/// `layout` is the bundle's, so the division can see which operands are core-local LX pins (see
-/// [`crate::work::EwDivision`]).
+/// `layout` is the bundle's, so the division can see which operands are core-local LX pins, and
+/// `division` is [`crate::work::EwDivision::Law`] for every shipped op (see there).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pointwise_broadcast_opspec_df(
     op: OpFunc,
@@ -639,6 +639,7 @@ pub(crate) fn pointwise_broadcast_opspec_df(
     head_major: bool,
     df: Df,
     layout: Option<&BundleLayout>,
+    division: crate::work::EwDivision,
 ) -> Result<OpSpec, String> {
     // fp16 (default) keeps the proven 64-stick basis; Df::Fp32 (the torch-spyre fp32 rmsnorm) uses a
     // 32-elem/4-byte stick. The stick extent MUST be the ACTUAL dtype's (fp32 = 32-stick) — a per-row
@@ -678,16 +679,7 @@ pub(crate) fn pointwise_broadcast_opspec_df(
         df,
     };
     pointwise_broadcast_opspec_from_tile(
-        &tile_op,
-        rows,
-        cols,
-        op,
-        inputs,
-        o_name,
-        out_offset,
-        head_major,
-        layout,
-        crate::work::EwDivision::Law,
+        &tile_op, rows, cols, op, inputs, o_name, out_offset, head_major, layout, division,
     )
 }
 
@@ -1537,6 +1529,59 @@ pub fn assemble_pointwise_broadcast_off<O: KindTag>(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
+    assemble_pointwise_broadcast_divided(
+        PointwiseDivided {
+            op_name,
+            op_func,
+            rows,
+            cols,
+            inputs,
+            o,
+            out_offset,
+            division: crate::work::EwDivision::Law,
+        },
+        sym_id_base,
+        layout,
+    )
+}
+
+/// The parameter list of [`assemble_pointwise_broadcast_divided`], carried as a struct — the
+/// [`PointwiseGather`] / `RopeAt` shape, which adds no `#[allow(clippy::too_many_arguments)]`. Every field
+/// but `division` is [`assemble_pointwise_broadcast_off`]'s, with the same contract.
+pub struct PointwiseDivided<'a, O: KindTag> {
+    pub op_name: &'a str,
+    pub op_func: &'static str,
+    pub rows: crate::sdsc_abstract::RowCount,
+    pub cols: crate::sdsc_abstract::BlockCols,
+    pub inputs: &'a [EwOperand<'a>],
+    pub o: &'a Stk<O>,
+    pub out_offset: crate::addr::DevOff,
+    /// The work division the op is assembled under. [`crate::work::EwDivision::Law`] is what the shipped
+    /// door ([`assemble_pointwise_broadcast_off`]) states.
+    pub division: crate::work::EwDivision,
+}
+
+/// [`assemble_pointwise_broadcast_off`] under a STATED work division instead of the law's. No shipped op
+/// takes this door: every one is assembled under [`crate::work::EwDivision::Law`]. It exists for a claim
+/// about the emission MACHINERY that holds under one named division — torch-spyre's descriptor parity
+/// (`element_torchspyre_parity.rs`) is a claim about the bytes torch-spyre emits, and torch-spyre divides
+/// every elementwise op rows-first, so that claim is stated under [`crate::work::EwDivision::RowsFirst`]
+/// while the law, measured faster on card, ships a different division for the same shape.
+pub fn assemble_pointwise_broadcast_divided<O: KindTag>(
+    p: PointwiseDivided<'_, O>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> EmittedOp {
+    let PointwiseDivided {
+        op_name,
+        op_func,
+        rows,
+        cols,
+        inputs,
+        o,
+        out_offset,
+        division,
+    } = p;
     let rows = rows.get();
     let cols = cols.get();
     let out_offset = out_offset.into_raw_elems();
@@ -1582,6 +1627,7 @@ pub fn assemble_pointwise_broadcast_off<O: KindTag>(
         head_major,
         Df::Fp16,
         layout,
+        division,
     )
     .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
     apply_lx_residency(&mut op, layout);
@@ -1617,6 +1663,7 @@ pub fn assemble_pointwise_broadcast_df(
         true,
         df,
         layout,
+        crate::work::EwDivision::Law,
     )
     .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast_df {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());

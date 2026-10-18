@@ -12,7 +12,9 @@
 //!  • maxDimSizes_ = -1 for EVERY non-indirect tensor (card reconstructs device_size from N_/layout/stick).
 
 use emit::In;
+use ktir_superdsc::addr::DevOff;
 use ktir_superdsc::emit;
+use ktir_superdsc::work::EwDivision;
 use scratchy_subtile::sdsc_abstract::{
     BlockCols, KernelTag, RowBlockedTag, RowCount, SpyreTensorLayout, Staged, StickKind,
     StickLayout, Stk, stage_2d,
@@ -33,23 +35,49 @@ fn dsc(op: &emit::EmittedOp, name: &str) -> serde_json::Value {
     serde_json::to_value(&op.op).unwrap()["dscs_"][0][name].clone()
 }
 
-#[test]
-fn pointwise_31x2048_matches_torchspyre() {
+/// The `[31, 2048]` fp16 multiply, assembled through the shipped door under `division`.
+fn pw_31x2048(division: EwDivision) -> emit::EmittedOp {
     let (rows, cols) = (31u32, 2048u32);
     let mut sid = 0i64;
-    let op = emit::assemble_pointwise_broadcast(
-        "pw",
-        "multiply",
-        RowCount::of_token_rows(rows),
-        BlockCols::of_feature_cols(cols),
-        &[
-            In::full(&mm_a("x", rows, cols)).ew(),
-            In::scalar(&mm_a("scale", 1, 64)).ew(),
-        ],
-        &mm_a("out", rows, cols),
+    let (x, scale, out) = (
+        mm_a("x", rows, cols),
+        mm_a("scale", 1, 64),
+        mm_a("out", rows, cols),
+    );
+    let inputs = [In::full(&x).ew(), In::scalar(&scale).ew()];
+    emit::assemble_pointwise_broadcast_divided(
+        emit::PointwiseDivided {
+            op_name: "pw",
+            op_func: "multiply",
+            rows: RowCount::of_token_rows(rows),
+            cols: BlockCols::of_feature_cols(cols),
+            inputs: &inputs,
+            o: &out,
+            out_offset: DevOff::ZERO,
+            division,
+        },
         &mut sid,
         None,
-    );
+    )
+}
+
+/// The last schedule node (the OUTPUT's) of the `pw` op.
+fn pw_out_node(op: &emit::EmittedOp) -> serde_json::Value {
+    dsc(op, "pw")["scheduleTree_"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone()
+}
+
+/// TORCH-SPYRE PARITY: given torch-spyre's division, our emission machinery produces torch-spyre's
+/// bytes. torch-spyre divides this op ROWS-FIRST (W = 31 cores, one row each), so the claim is stated
+/// under [`EwDivision::RowsFirst`]. The shipped law divides it differently, on purpose — see
+/// `the_shipped_division_of_the_torchspyre_shape_is_sticks_first`.
+#[test]
+fn pointwise_31x2048_matches_torchspyre() {
+    let op = pw_31x2048(EwDivision::RowsFirst);
     let d = dsc(&op, "pw");
     let out_node = d["scheduleTree_"].as_array().unwrap().last().unwrap();
 
@@ -284,86 +312,79 @@ fn stage_2d_is_the_worker_emitter_layout_firewall() {
     }
 }
 
+/// The shipped door's work split of the `pw` op: `(mb, out)` slices, read off `numWkSlicesPerDim_`.
+fn split_of(op: &emit::EmittedOp) -> (i64, i64) {
+    let v = serde_json::to_value(&op.op).unwrap();
+    let s = &v["numWkSlicesPerDim_"];
+    (
+        s["mb"].as_i64().unwrap_or(1),
+        s["out"].as_i64().unwrap_or(1),
+    )
+}
+
 #[test]
 fn per_core_start_derives_from_spyre_layout() {
-    // THE SINGLE-SOURCE PROOF. The emitted per-core START must equal the SpyreTensorLayout's DENSE row
-    // stride (torch-spyre `_calculate_device_stride`), so per_core_addr is provably derived from the ONE
-    // SpyreTensorLayout — not an independent flat/RowBlocked choice that could silently diverge.
+    // THE SINGLE-SOURCE PROOF, on the SHIPPED division. The emitted per-core START must step by the
+    // SpyreTensorLayout's DENSE stride (torch-spyre `_calculate_device_stride`) along whichever device dim
+    // the cores are split on, so per_core_addr is provably derived from the ONE SpyreTensorLayout — not an
+    // independent flat/RowBlocked choice that could silently diverge. Core 1's start is core 0's plus one
+    // slice of the split axis: (rows per core) × the row stride on a row split, (sticks per core) × the
+    // feat-group stride on a stick split. Both strides come from `stl`.
     let stl = SpyreTensorLayout::standard(&[31, 2048], Df::Fp16);
     assert_eq!(
         stl.device_size,
         vec![32, 31, 64],
         "SpyreTensorLayout device_size"
     );
-    let row_stride_elems = stl.dense_strides()[stl.row_device_dim()]; // dense row stride = 64
+    let strides = stl.dense_strides();
+    let row_dim = stl.row_device_dim(); // [feat-groups, rows, lanes]: rows is 1, feat-groups is 0
+    let row_stride_elems = strides[row_dim];
     assert_eq!(
         row_stride_elems, 64,
         "dense row stride (RowBlocked) = 64, NOT cols=2048"
     );
-    let want_delta_bytes = row_stride_elems * 2; // fp16 = 2 bytes/elem
+    let feat_group_stride_elems = strides[0];
 
-    let (rows, cols) = (31u32, 2048u32);
-    let mut sid = 0i64;
-    let op = emit::assemble_pointwise_broadcast(
-        "pw",
-        "multiply",
-        RowCount::of_token_rows(rows),
-        BlockCols::of_feature_cols(cols),
-        &[
-            In::full(&mm_a("x", rows, cols)).ew(),
-            In::scalar(&mm_a("scale", 1, 64)).ew(),
-        ],
-        &mm_a("out", rows, cols),
-        &mut sid,
-        None,
-    );
-    let out_node = dsc(&op, "pw")["scheduleTree_"]
-        .as_array()
-        .unwrap()
-        .last()
-        .unwrap()
-        .clone();
+    let op = pw_31x2048(EwDivision::Law);
+    let (mb_split, out_split) = split_of(&op);
+    let want_delta_elems = if out_split > 1 {
+        // A stick split: core 1 starts one core's run of feat-groups in.
+        (stl.device_size[0] / out_split) * feat_group_stride_elems
+    } else {
+        // A row split: core 1 starts one core's run of rows in.
+        (stl.device_size[row_dim] / mb_split) * row_stride_elems
+    };
+    let want_delta_bytes = want_delta_elems * 2; // fp16 = 2 bytes/elem
+    let out_node = pw_out_node(&op);
     assert_eq!(
         start_delta(&out_node),
         want_delta_bytes,
-        "per-core start delta {} must equal SpyreTensorLayout dense row stride {} elems * 2 = {} B — \
-         proves the emitted start derives from the single SpyreTensorLayout (RowBlocked), not the removed \
-         flat r*cols hack (which would give {} B)",
+        "per-core start delta {} must equal one core's slice along the split axis (mb {mb_split} × out \
+         {out_split}) in SpyreTensorLayout dense strides = {} B — proves the emitted start derives from the \
+         single SpyreTensorLayout (RowBlocked)",
         start_delta(&out_node),
-        row_stride_elems,
         want_delta_bytes,
-        cols * 2
+    );
+    // ⛔ And it is NOT the removed flat r*cols hack, which steps one row of `cols` elements per core.
+    assert_ne!(
+        start_delta(&out_node),
+        2048 * 2,
+        "per-core start delta must not be the removed flat r*cols hack ({} B)",
+        2048 * 2
     );
 }
 
 #[test]
 fn coordinfo_reconstructs_spyre_device_size() {
-    // SINGLE-SOURCE PROOF #2: build_coordinates' fold factors must reconstruct the SAME device_size the
-    // SpyreTensorLayout holds — so the coordInfo (path 2) derives from the one layout, not independently.
-    // device_size [feat-groups, rows, lanes] = [32, 31, 64] for [31,2048] fp16.
+    // SINGLE-SOURCE PROOF #2, on the SHIPPED division: build_coordinates' fold factors must reconstruct
+    // the SAME device_size the SpyreTensorLayout holds, so the coordInfo (path 2) derives from the one
+    // layout, not independently. device_size [feat-groups, rows, lanes] = [32, 31, 64] for [31,2048]
+    // fp16. Each split dim's PER-CORE fold is the device dim divided by that dim's split (`numWkSlices`).
     let stl = SpyreTensorLayout::standard(&[31, 2048], Df::Fp16);
     let ds = &stl.device_size;
-    let (rows, cols) = (31u32, 2048u32);
-    let mut sid = 0i64;
-    let op = emit::assemble_pointwise_broadcast(
-        "pw",
-        "multiply",
-        RowCount::of_token_rows(rows),
-        BlockCols::of_feature_cols(cols),
-        &[
-            In::full(&mm_a("x", rows, cols)).ew(),
-            In::scalar(&mm_a("scale", 1, 64)).ew(),
-        ],
-        &mm_a("out", rows, cols),
-        &mut sid,
-        None,
-    );
-    let out_node = dsc(&op, "pw")["scheduleTree_"]
-        .as_array()
-        .unwrap()
-        .last()
-        .unwrap()
-        .clone();
+    let op = pw_31x2048(EwDivision::Law);
+    let (mb_split, out_split) = split_of(&op);
+    let out_node = pw_out_node(&op);
     let ci = &out_node["coordinates_"]["coordInfo"];
     let attr = |dim: &str| -> Vec<i64> {
         ci[dim]["folds"]["dim_prop_attr"]
@@ -373,11 +394,13 @@ fn coordinfo_reconstructs_spyre_device_size() {
             .map(|a| a["factor_"].as_i64().unwrap())
             .collect()
     };
-    // OUT (stick) dim: elem_arr_1 = feat-groups = device_size[0]; elem_arr_0 = lanes = device_size[2].
+    // OUT (stick) dim: elem_arr_1 = one core's feat-groups = device_size[0] / out split; elem_arr_0 =
+    // lanes = device_size[2]; and core_fold × elem_arr_1 reconstructs every feat-group.
     let out = attr("out"); // [core_fold, corelet, row_fold, elem_arr_1, elem_arr_0]
     assert_eq!(
-        out[3], ds[0],
-        "coordInfo[out] elem_arr_1 must == device_size[feat-groups]={}",
+        out[3],
+        ds[0] / out_split,
+        "coordInfo[out] elem_arr_1 must == device_size[feat-groups]={} / out split {out_split}",
         ds[0]
     );
     assert_eq!(
@@ -385,13 +408,55 @@ fn coordinfo_reconstructs_spyre_device_size() {
         "coordInfo[out] elem_arr_0 must == device_size[lanes]={}",
         ds[2]
     );
-    // MB (row) dim: core_fold * elem_arr_0 = total rows = device_size[1].
+    assert_eq!(
+        out[0] * out[3],
+        ds[0],
+        "coordInfo[out] core_fold*elem_arr_1 must == device_size[feat-groups]={}",
+        ds[0]
+    );
+    // MB (row) dim: elem_arr_0 = one core's rows = device_size[1] / mb split; core_fold * elem_arr_0 =
+    // total rows = device_size[1].
     let mb = attr("mb"); // [core_fold, corelet, row_fold, elem_arr_0]
+    assert_eq!(
+        mb[3],
+        ds[1] / mb_split,
+        "coordInfo[mb] elem_arr_0 must == device_size[rows]={} / mb split {mb_split}",
+        ds[1]
+    );
     assert_eq!(
         mb[0] * mb[3],
         ds[1],
         "coordInfo[mb] core_fold*elem_arr_0 must == device_size[rows]={}",
         ds[1]
+    );
+}
+
+/// ⭐ THE SHIPPED DIVISION OF THE TORCH-SPYRE SHAPE IS NOT TORCH-SPYRE'S, ON PURPOSE. torch-spyre divides
+/// this `[31, 2048]` fp16 multiply rows-first (W = 31 cores, one row each); the elementwise law
+/// (`EwDivision::Law`) divides a stick-major rank-2 op across its STICKS first, because a core holding
+/// every row of a run of sticks reads one contiguous block of the `[out/64][mb][64]` layout, while a core
+/// holding one row reads `cols/64` strided one-row bursts. Measured in isolation (#549's (e) cells, the
+/// real `mulsilu` descriptor and placement, one CB, 32 cores): `[256, 2048]` 50.0 → 30.3 µs and
+/// `[256, 8192]` 249.8 → 121.8 µs, sticks-first against rows-first. The descriptor PARITY claim
+/// (`pointwise_31x2048_matches_torchspyre`) is stated under torch-spyre's own division; this pins that
+/// the shipped one differs from it, and how.
+#[test]
+fn the_shipped_division_of_the_torchspyre_shape_is_sticks_first() {
+    let shipped = split_of(&pw_31x2048(EwDivision::Law));
+    let torchspyre = split_of(&pw_31x2048(EwDivision::RowsFirst));
+    assert_eq!(
+        shipped,
+        (1, 32),
+        "the law splits the [31, 2048] stick-major multiply out:32 — one 64-lane stick of all 31 rows per core"
+    );
+    assert_eq!(
+        torchspyre,
+        (31, 1),
+        "torch-spyre's division of the same op is mb:31 — one row of all 32 sticks per core"
+    );
+    assert_ne!(
+        shipped, torchspyre,
+        "the shipped division is not torch-spyre's"
     );
 }
 
