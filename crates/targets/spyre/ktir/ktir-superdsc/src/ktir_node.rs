@@ -41,6 +41,7 @@
 
 // `DataFormat` is in scope for its `ELEMS_PER_STICK` associated const, which
 // `ActiveCap::decode_ladder` aligns each rung to; `Fp16` is the format that answers it.
+use crate::emit::argmax::TiedLmHeadEmbedding;
 use crate::superdsc_opspec::{DataFormat, Fp16};
 
 /// Which elementwise function a program computes — see [`Program::Elementwise`].
@@ -313,6 +314,16 @@ pub enum Program {
     /// dense path's own. FOUR tensor parameters at fp8 (rows, routing,
     /// weights, scales).
     ExpertMatmul,
+    /// THE COMPOSITE DEVICE ARGMAX — the loop-closure group (#603 PR3a): first
+    /// max over the logits row, then the tied embedding row gathered ON DEVICE,
+    /// so the next step's input activation never crosses to the host. THREE
+    /// tensor parameters in the mint order `[logits, table, row]` — the lm_head
+    /// output, the tied lm_head weight bank (the gather's table, in place), and
+    /// the next step's input-activation slot the gathered row lands in. The
+    /// [`TiedLmHeadEmbedding`] token is the tie fact as a type: the variant is
+    /// only constructible through `from_tied_config`, so an untied model cannot
+    /// reach this arm. See [`crate::emit::argmax`] for the chain and its laws.
+    Argmax(TiedLmHeadEmbedding),
 }
 
 /// The activation an expert gates its up projection with — this crate's OWN copy of

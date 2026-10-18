@@ -162,7 +162,7 @@ pub struct ArgmaxSlots<'a> {
 /// model with the named reason — so an untied model (llama) cannot take this path until
 /// its staging fallback exists; the refusal is a build failure, never a silent gather of
 /// the wrong bank. (granite-3.3 2b and 8b both tie; the PR3a gates are granite.)
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TiedLmHeadEmbedding {
     _private: (),
 }
@@ -349,4 +349,233 @@ pub fn assemble_argmax(
 ) -> Vec<EmittedOp> {
     try_assemble_argmax(geom, s, tied, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_argmax: {e}"))
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//  THE WALK MINT — the same computation as a KTIR program
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE BINDING CONVENTION, stated once for both expressions of the computation.
+///
+/// The composite is ONE computation with TWO bodies: this KTIR program (which the EMULATOR
+/// executes — the interpreter runs the ops directly, so the parity gate can check the chain
+/// against the host argmax on the same logits) and the descriptor group
+/// [`try_assemble_argmax`] mints (which the CARD runs). The two agree by construction, not
+/// by convention-matching: they read the same three boundary buffers, in the same order —
+///
+/// * **parameter 0 — `logits`**: the lm_head's output, the graph result, viewed `[1, V]`.
+///   The program loads it WHOLE (one access tile at the origin) and reduces over both axes.
+/// * **parameter 1 — `table`**: the tied lm_head weight, the gather's bank, viewed `[V, H]`
+///   row-major. The program's only access tile over it carries the RUNTIME index (`%idx`,
+///   the chain's own output) as its row corner, so `regions()` falls back to the whole-view
+///   window for it — exactly the geometry the descriptors state.
+/// * **parameter 2 — `row`**: the next step's input-activation slot, viewed `[1, H]`. The
+///   program's ONE store writes through a `[1, H]` tile at the origin, which is the
+///   `written_args` chain the emulator's output readback and the door's `is_out` both key
+///   on — the row IS the program's output.
+///
+/// The scratch and the two constants never cross this boundary: the descriptors place them
+/// as synthetics keyed off the row tid and `argmax_const` reserved tids (the door's own
+/// mint), and the program needs neither — the ramp is COMPUTED in-func (`linalg.index`
+/// arithmetic), because an emulator source binds fp16 and the fp32 `[1, V]` ramp is past
+/// fp16's exact-integer range at every real vocab.
+///
+/// ⭐ THE NAME KEYS ON THE ROW, not a node index: every other program is `<kind>_s<node
+/// index>`, but the composite is minted by the WALK over the graph's result — there is no
+/// node. `argmax_o{row_tid}` follows the door's own op-name law (`<kind>_o{output
+/// tensor}`), which also makes it rung-stable: the ladder's cap rungs share the row tid, so
+/// the program interns once and every rung's launch binds the same one.
+pub fn mint_argmax_node(
+    vocab: u32,
+    hidden: u32,
+    logits_tid: u32,
+    table_tid: u32,
+    row_tid: u32,
+    tied: TiedLmHeadEmbedding,
+) -> crate::ktir_node::KtirNode {
+    use ktir_core::arena::Arena;
+    use ktir_core::attrkey::AttrKey;
+    use ktir_core::dtypes::DType;
+    use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
+    use ktir_core::irtype::IrType;
+    use ktir_core::opkind::OpKind;
+
+    let a = Arena::global();
+    // SSA numbering: the three pointer parameters first (the `arguments` list references
+    // them), then one fresh id per program value, in mint order.
+    let (lg_ptr, tb_ptr, row_ptr) = (Ssa(0), Ssa(1), Ssa(2));
+    let mut next = 3u32;
+    let mut fresh = || {
+        let s = Ssa(next);
+        next += 1;
+        s
+    };
+    let il = |v: Vec<i64>| Attr::IntList(a.ints(v));
+
+    // ── the three boundary views, one per parameter (the every-parameter-states-its-width
+    //    contract the door's `regions()` enforces) ──
+    let view = |ptr: Ssa, rows: i64, cols: i64, res: Ssa| -> Operation<'static> {
+        Operation::new(a, Some(res), OpKind::KtdpConstructMemoryView, &[ptr])
+            .with_attr(a, AttrKey::Shape, il(vec![rows, cols]))
+            .with_attr(a, AttrKey::Strides, il(vec![cols, 1]))
+            .with_attr(a, AttrKey::MemorySpace, Attr::Str("HBM"))
+            .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::F16))
+    };
+    let lg_v = fresh();
+    let tb_v = fresh();
+    let row_v = fresh();
+
+    // ── the corner zero, shared by every const-cornered tile ──
+    let c0 = fresh();
+    let c0_op = Operation::new(a, Some(c0), OpKind::ArithConstant, &[]).with_attr(
+        a,
+        AttrKey::Value,
+        Attr::Int(0),
+    );
+
+    // ── the logits, loaded whole at the origin ──
+    let lg_t = fresh();
+    let lg_t_op = Operation::new(
+        a,
+        Some(lg_t),
+        OpKind::KtdpConstructAccessTile,
+        &[lg_v, c0, c0],
+    )
+    .with_attr(a, AttrKey::Shape, il(vec![1, i64::from(vocab)]));
+    let lg = fresh();
+    let lg_load = Operation::new(a, Some(lg), OpKind::KtdpLoad, &[lg_t]);
+
+    // 1. m = max(logits) — both axes reduced, so the result is a SCALAR.
+    let m = fresh();
+    let m_red = Operation::new(a, Some(m), OpKind::LinalgReduce, &[lg])
+        .with_attr(a, AttrKey::ReduceFn, Attr::Op(OpKind::ArithMaxnumf))
+        .with_attr(a, AttrKey::Dimensions, il(vec![0, 1]));
+    // 2. mask = (logits == m) — `oeq`, the #631 law's compare; the scalar broadcasts.
+    let eq = fresh();
+    let eq_op = Operation::new(a, Some(eq), OpKind::ArithCmpf, &[lg, m]).with_attr(
+        a,
+        AttrKey::Predicate,
+        Attr::Str("oeq"),
+    );
+    // The scalar V and the ramp's zero seed.
+    let vc = fresh();
+    let vc_op = Operation::new(a, Some(vc), OpKind::ArithConstant, &[]).with_attr(
+        a,
+        AttrKey::Value,
+        Attr::Float(f64::from(vocab)),
+    );
+    let seed = fresh();
+    let seed_op = Operation::new(a, Some(seed), OpKind::ArithConstant, &[])
+        .with_attr(a, AttrKey::IsTensor, Attr::Bool(true))
+        .with_attr(a, AttrKey::Shape, il(vec![1, i64::from(vocab)]))
+        .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::F32))
+        .with_attr(a, AttrKey::Value, Attr::Float(0.0));
+    // 3–4. the ramp, COMPUTED: `V − iota` over `[1, V]` fp32. The generic runs once,
+    //    vectorized over the seed's shape; `linalg.index {dim: 1}` is the column index, and
+    //    the bb0 name list names the (unused) outs accumulator so the region's argument
+    //    names are stated — the first body op (`linalg.index`) has no operands to infer
+    //    them from.
+    let acc = fresh();
+    let ramp = fresh();
+    let ramp_gen = {
+        let i = fresh();
+        let if_ = fresh();
+        let r = fresh();
+        let index_op = Operation::new(a, Some(i), OpKind::LinalgIndex, &[]).with_attr(
+            a,
+            AttrKey::Dim,
+            Attr::Int(1),
+        );
+        let sitofp_op = Operation::new(a, Some(if_), OpKind::ArithSitofp, &[i]);
+        let subf_op = Operation::new(a, Some(r), OpKind::ArithSubf, &[vc, if_]);
+        let yield_op = Operation::new(a, None, OpKind::LinalgYield, &[r]);
+        let body = a.ops(vec![index_op, sitofp_op, subf_op, yield_op]);
+        Operation {
+            regions: a.regions(vec![body]),
+            ..Operation::new(a, Some(ramp), OpKind::LinalgGeneric, &[seed])
+                .with_attr(a, AttrKey::NIns, Attr::Int(0))
+                .with_attr(a, AttrKey::Bb0Names, Attr::Ssas(a.ssa(vec![acc])))
+        }
+    };
+    // 4. w = mask · ramp — the Bool tile widens through the f32 multiply
+    //    (`result_float_dtype`: neither operand is fp16, so the landing is fp32).
+    let w = fresh();
+    let w_op = Operation::new(a, Some(w), OpKind::ArithMulf, &[eq, ramp]);
+    // 5. j = max(w) — the first maximum's weight, UNIQUE by the ramp's construction.
+    let j = fresh();
+    let j_red = Operation::new(a, Some(j), OpKind::LinalgReduce, &[w])
+        .with_attr(a, AttrKey::ReduceFn, Attr::Op(OpKind::ArithMaxnumf))
+        .with_attr(a, AttrKey::Dimensions, il(vec![0, 1]));
+    // 6. idx32 = V − j — the FIRST maximal index, exactly (every value ≤ V < 2²⁴).
+    let idx32 = fresh();
+    let idx32_op = Operation::new(a, Some(idx32), OpKind::ArithSubf, &[vc, j]);
+    // 7. idx = fp32toint32(idx32) — the scalar truncation, the access tile's row index.
+    let idx = fresh();
+    let idx_op = Operation::new(a, Some(idx), OpKind::ArithFptosi, &[idx32]);
+    // 8. row = gather(table, idx) — the tied bank read AT THE RUNTIME ROW: one access tile
+    //    over the table view whose row corner is `%idx` (bounds-checked against `[V, H]`
+    //    by the interpreter), loaded and stored through the row's own origin tile.
+    let src_t = fresh();
+    let src_t_op = Operation::new(
+        a,
+        Some(src_t),
+        OpKind::KtdpConstructAccessTile,
+        &[tb_v, idx, c0],
+    )
+    .with_attr(a, AttrKey::Shape, il(vec![1, i64::from(hidden)]));
+    let row_val = fresh();
+    let row_load = Operation::new(a, Some(row_val), OpKind::KtdpLoad, &[src_t]);
+    let row_t = fresh();
+    let row_t_op = Operation::new(
+        a,
+        Some(row_t),
+        OpKind::KtdpConstructAccessTile,
+        &[row_v, c0, c0],
+    )
+    .with_attr(a, AttrKey::Shape, il(vec![1, i64::from(hidden)]));
+    let store = Operation::new(a, None, OpKind::KtdpStore, &[row_val, row_t]);
+
+    let operations = a.ops(vec![
+        c0_op,
+        view(lg_ptr, 1, i64::from(vocab), lg_v),
+        view(tb_ptr, i64::from(vocab), i64::from(hidden), tb_v),
+        view(row_ptr, 1, i64::from(hidden), row_v),
+        lg_t_op,
+        lg_load,
+        m_red,
+        eq_op,
+        vc_op,
+        seed_op,
+        ramp_gen,
+        w_op,
+        j_red,
+        idx32_op,
+        idx_op,
+        src_t_op,
+        row_load,
+        row_t_op,
+        store,
+    ]);
+    let func = IRFunction {
+        name: a.str(format!("argmax_o{row_tid}")),
+        arguments: a.args(vec![
+            (lg_ptr, IrType::Index),
+            (tb_ptr, IrType::Index),
+            (row_ptr, IrType::Index),
+        ]),
+        operations,
+        grid: (1, 1, 1),
+        return_type: None,
+    };
+    crate::ktir_node::KtirNode {
+        func,
+        program: crate::ktir_node::Program::Argmax(tied),
+        bindings: vec![
+            crate::ktir_node::BufferId::new(logits_tid),
+            crate::ktir_node::BufferId::new(table_tid),
+            crate::ktir_node::BufferId::new(row_tid),
+        ],
+        mask: None,
+        node_out_tid: None,
+    }
 }

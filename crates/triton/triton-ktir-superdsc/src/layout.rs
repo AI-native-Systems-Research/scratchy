@@ -652,7 +652,8 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         | Program::ExpertUnsort
         | Program::ExpertCombine
         | Program::ExpertMatmul
-        | Program::WindowedRmsNorm { .. } => None,
+        | Program::WindowedRmsNorm { .. }
+        | Program::Argmax(_) => None,
     }
 }
 
@@ -893,6 +894,7 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         | Program::ExpertUnsort
         | Program::ExpertCombine
         | Program::ExpertMatmul
-        | Program::WindowedRmsNorm { .. } => Vec::new(),
+        | Program::WindowedRmsNorm { .. }
+        | Program::Argmax(_) => Vec::new(),
     }
 }

@@ -8899,6 +8899,130 @@ pub fn route_topk(
     Ok(ops)
 }
 
+/// The per-`Program` door for [`crate::ktir_node::Program::Argmax`] — the composite
+/// device argmax, the loop-closure group: `row = embed(argmax(logits))` computed on
+/// device over the TIED lm_head bank, so the next step's input activation never
+/// crosses to the host. The body is [`crate::emit::argmax`]'s mint — this arm is the
+/// thin half: resolve the three boundary names the program's own views state, name
+/// the two resident constants by their reserved tids, declare the scratch synthetics
+/// at their full footprints (keyed off the ROW tid, the top-k door's own "key off
+/// the landing" law), and hand the geometry to the chain's one assembly.
+///
+/// ⭐ THE DESCRIPTORS ARE THE SAME COMPUTATION THE PROGRAM STATES — the parity gate
+/// (`zz_the_argmax_walk_parity`-class tests) executes the program's ops against the
+/// host argmax on the same logits, so a door that minted a different chain than the
+/// func states is a test failure, not a card surprise.
+///
+/// ⛔ THE TIE TOKEN IS THE ARM'S OWN GUARD. `Program::Argmax(tied)` carries the
+/// `TiedLmHeadEmbedding` the producer could only have minted through
+/// `from_tied_config`, so an untied model cannot reach this arm — the token is
+/// threaded to the assembly, which restates the refusal for any hand-built caller.
+pub fn argmax(
+    name: &str,
+    r: &[Region],
+    tied: crate::emit::argmax::TiedLmHeadEmbedding,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::emit::argmax::{ArgmaxGeom, ArgmaxSlots};
+    // THE MINT ORDER — positional, the whole contract (see `mint_argmax_node`'s doc):
+    // [logits, table, row].
+    let [lg, table, row] = r else {
+        return err(format!(
+            "Argmax {name}: {} parameter(s) against the mint's 3-slot order [logits, table, \
+             row] — the chain reads the lm_head output, the tied weight bank, and the next \
+             step's input-activation slot, in that order",
+            r.len()
+        ));
+    };
+    let rows = lg.v_rows;
+    let vocab = lg.v_cols;
+    let hidden = row.v_cols;
+    if table.v_rows != vocab || table.v_cols != hidden || row.v_rows != rows || row.v_cols != hidden
+    {
+        return err(format!(
+            "Argmax {name}: the logits t{} [{rows}, {vocab}], the table t{} [{}, {}], and the \
+             row t{} [{}, {}] — the gather reads the table as [vocab, hidden] rows and lands \
+             one [rows, hidden] row, so all three extents must agree",
+            lg.tid, table.tid, table.v_rows, table.v_cols, row.tid, row.v_rows, row.v_cols
+        ));
+    }
+    let lg_s = lg.name();
+    let table_s = table.name();
+    let row_s = row.name();
+    // ⭐ THE TWO RESIDENT CONSTANTS, named by their reserved tids — the descending fp32
+    // ramp and the scalar V. Placed by the layout (the `router_const` law: the door
+    // names, the layout places), so a bundle without the composite never stages them.
+    let ramp_s = crate::place::act_name(crate::reserved_tids::argmax_ramp_tid());
+    let v_s = crate::place::act_name(crate::reserved_tids::argmax_v_tid());
+    // The scratch synthetics, keyed off the ROW tid — the chain's own landing.
+    let row_id = PlaceId::Act(row.tid);
+    use crate::place::SynthRole as R;
+    let syn = |role: R| crate::placement::syn(layout, row_id.synth(role));
+    let m_s = syn(R::AmMax);
+    let mask_s = syn(R::AmMask);
+    let mask32_s = syn(R::AmMask32);
+    let w_s = syn(R::AmW);
+    let j_s = syn(R::AmJ);
+    let idx32_s = syn(R::AmIdx32);
+    let idx_u32_s = syn(R::AmIdxU32);
+    if let Some(l) = layout {
+        // The full footprints, at the chain's own formats — the [rows, vocab] mask pair
+        // dominates; everything else is one-stick tail scratch.
+        l.synth_df(
+            row_id.synth(R::AmMax),
+            &[rows, FP16_ELEMS_PER_STICK],
+            Df::Fp16,
+        );
+        l.synth_df(row_id.synth(R::AmMask), &[rows, vocab], Df::Fp16);
+        l.synth_df(row_id.synth(R::AmMask32), &[rows, vocab], Df::Fp32);
+        l.synth_df(row_id.synth(R::AmW), &[rows, vocab], Df::Fp32);
+        l.synth_df(
+            row_id.synth(R::AmJ),
+            &[rows, Df::Fp32.elems_per_stick()],
+            Df::Fp32,
+        );
+        l.synth_df(
+            row_id.synth(R::AmIdx32),
+            &[rows, FP16_ELEMS_PER_STICK],
+            Df::Fp32,
+        );
+        l.synth_df(
+            row_id.synth(R::AmIdxU32),
+            &[rows, FP16_ELEMS_PER_STICK],
+            Df::SenUint32,
+        );
+    }
+    let s = ArgmaxSlots {
+        logits: &lg_s,
+        m: &m_s,
+        mask: &mask_s,
+        mask32: &mask32_s,
+        ramp: &ramp_s,
+        v_const: &v_s,
+        w: &w_s,
+        j: &j_s,
+        idx32: &idx32_s,
+        idx_u32: &idx_u32_s,
+        table: &table_s,
+        row: &row_s,
+    };
+    crate::emit::argmax::try_assemble_argmax(
+        ArgmaxGeom {
+            rows,
+            vocab,
+            hidden,
+        },
+        &s,
+        tied,
+        sym_id_base,
+        layout,
+    )
+    .map_err(|e| Error {
+        message: format!("Argmax {name}: {e}"),
+    })
+}
+
 /// The per-`Program` door for [`crate::ktir_node::Program::RouteGatherScores`] —
 /// the scores at the chosen indices, `out[i, j] = scores[i, idx[i, j]]`
 /// (`take_along_axis` at axis −1, metal's `gather_scores`).

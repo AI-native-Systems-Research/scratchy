@@ -503,7 +503,7 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
 }
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 8] = [
+pub const RESERVED_REGIONS: [TidRegion; 9] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -564,10 +564,20 @@ pub const RESERVED_REGIONS: [TidRegion; 8] = [
         slots: 1_000_000,
     },
     // ⛔ THE REMAINING GAP (from `oproj_headmajor`'s floor at MAX-1_000_146 down to `kct_resident`'s
-    // base at MAX-1_000_171) IS DELIBERATELY LEFT EMPTY. It held the K-split
-    // block/zero/down_proj regions, which are gone with the K-split itself. `kct_resident` keeps
-    // its ABSOLUTE base rather than sliding up into the hole: every reserved id is a number that
-    // has been baked into artifacts, and moving one to tidy the map would silently repoint it.
+    // base at MAX-1_000_171) IS DELIBERATELY LEFT EMPTY — save the two slots the argmax consts take
+    // at its TOP, below. It held the K-split block/zero/down_proj regions, which are gone with the
+    // K-split itself. `kct_resident` keeps its ABSOLUTE base rather than sliding up into the hole:
+    // every reserved id is a number that has been baked into artifacts, and moving one to tidy the
+    // map would silently repoint it.
+    // ⭐ THE ARGMAX CONSTS take the top of that gap (the `kv_block_index` precedent — the top of a
+    // deliberately-empty hole, so nothing baked moves): the fp32 ramp `V − iota` and the scalar `V`
+    // the composite argmax chain's descriptors read. Two slots, placed only when a bundle carries
+    // `Program::Argmax` — every other model's wire stays byte-identical.
+    TidRegion {
+        name: "argmax_const",
+        base: u32::MAX - 1_000_147,
+        slots: 2,
+    },
     // ⛔ BOUNDED, WHERE IT USED TO BE OPEN-ENDED. `kct_resident_tid(k_id) = BASE - k_id` had no
     // floor at all: a model with enough tensors walked it downward without limit. One million
     // slots is far past any real tid count and is now a REFUSAL rather than a wrap.
@@ -639,6 +649,7 @@ pub const EVERY_NAMED_REGION_RESOLVES: () = {
     assert!(reserved_region("identity_class").base == IDENTITY_CLASS_BASE);
     assert!(reserved_region("router_const").base == ROUTER_CONST_BASE);
     assert!(reserved_region("router_const").floor() < ROUTER_CONST_BASE);
+    assert!(reserved_region("argmax_const").base == ARGMAX_CONST_BASE);
     assert!(reserved_region("kct_resident").slots > 0);
 };
 
@@ -725,6 +736,27 @@ pub fn oproj_headmajor_tid(w_id: u32) -> u32 {
     reserved_region("oproj_headmajor").at(w_id)
 }
 
+/// Base of the RESERVED tid block for the composite argmax chain's two resident constants —
+/// the top of the deliberately-empty gap below `oproj_headmajor` (see the region row's own doc;
+/// the `kv_block_index` precedent). Placed only when a bundle carries `Program::Argmax`, so every
+/// model without the composite keeps a byte-identical wire.
+pub const ARGMAX_CONST_BASE: u32 = u32::MAX - 1_000_147;
+
+/// The fp32 `[1, vocab]` DESCENDING RAMP `V − iota` — the composite argmax chain's
+/// first-max-by-arithmetic weight: the FIRST maximal index gets the LARGEST value, so the
+/// chain's second maximum is unique and no tie probe exists (see
+/// [`crate::emit::argmax`], link 4). Host-staged fp32, bound through the RAW channel (a
+/// raw bind cannot be a weight, so it rides the per-step activation path).
+pub fn argmax_ramp_tid() -> u32 {
+    reserved_region("argmax_const").at(0)
+}
+
+/// The fp32 `[1,1]` scalar `V` — the vocab count as f32, the subtract leg's constant
+/// (`idx32 = V − j`, link 6). Same staging law as the ramp.
+pub fn argmax_v_tid() -> u32 {
+    reserved_region("argmax_const").at(1)
+}
+
 /// ⛔⛔⛔ THE REGRESSION THAT ADDING A REGION CAUSED, PINNED — a resident Kᵗ kernel and the gather's
 /// index tensor must not be one tid.
 ///
@@ -765,6 +797,23 @@ fn a_named_region_survives_an_insertion_above_it() {
         reserved_region("kv_block_index").at(0),
         KV_BLOCK_INDEX_TID,
         "the kv_block_index region's only slot is not KV_BLOCK_INDEX_TID"
+    );
+    // The argmax consts: two DISTINCT tids inside their own region, below the gap's top and above
+    // `kct_resident` — the two constants a composite-carrying bundle stages, never one tid.
+    assert_ne!(
+        argmax_ramp_tid(),
+        argmax_v_tid(),
+        "the argmax ramp and the scalar V are one tid — the descending ramp and the vocab count \
+         would share one placement and one bind"
+    );
+    assert!(
+        argmax_v_tid() > reserved_region("kct_resident").base,
+        "the argmax consts walked below the empty gap into kct_resident's base"
+    );
+    assert_eq!(
+        ARGMAX_CONST_BASE,
+        reserved_region("argmax_const").base,
+        "ARGMAX_CONST_BASE names a different region than argmax_ramp_tid does"
     );
 }
 
