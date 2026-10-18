@@ -30,14 +30,20 @@ THE NUMERICS ARE THE CARD'S, SPELLED HERE. A W8A8 projection on the card is
     raw   = q @ W_codes.T                                f16
     out   = (raw · s) · w_scale                          two f16 roundings
 
-and the card's expert door quantizes a token's PAIR ROWS with ONE scale over all K
-pairs' lanes (`fp8_quantize_descriptors(rows, k·in, pairs = k)`): the gate/up rows are the
-token's input replicated per pair, so their scale is the input's own; the down rows are
-the K activations side by side, so the down scale is the amax over ALL K activations. The
-down projection therefore runs in two passes over the slots — the activations first, then
-the shared scale, then the projections. Writing the quantize in the program is what makes
-the emulator compute what the card computes; before this kernel the emulator ran these
-projections W8A16.
+and the scale's ROW is the unit the projection's activation actually has:
+
+* gate/up read the TOKEN's input, so the token row `[1, H]` takes one scale, shared by all
+  K pairs (quantized once — every pair's two gemms read the same codes);
+* down reads each PAIR's own activation, so each `(token, slot)` row `[1, I]` takes its
+  own scale — the `[K, I]` activation matrix quantized in one `quantscalepertokenfp8` op,
+  one scale per row.
+
+Per pair, and not one scale over all K activations, because a prompt's experts are swept
+densely and its down activations are natively per `(token, expert)` rows; the decode
+kernel quantizes at the same grain so the same token computes the same numbers on either
+path (a prefix cached by one must be reusable by the other). Writing the quantize in the
+program is what makes the emulator compute what the card computes; before this kernel the
+emulator ran these projections W8A16.
 
 THE SPLICE'S OWN CONTRACT:
 
@@ -56,8 +62,8 @@ THE SPLICE'S OWN CONTRACT:
 ⛔ WHY THE SCRATCH IS MEMORY. The slab gather reads its index through a POINTER (the
 indirect tile's index view is a kernel argument — `convert_ttir_to_ktdp::slab_gather`), so
 the routed ids are stored as i32 before any slab is read; the route weights ride with them;
-and the down projection's shared scale needs every pair's activation before any is
-quantized, so the activations are held between the two passes.
+and each pair's activation is staged at its own window of `desc_act`, the `[K, I]` rows the
+card's down quantize reads as one matrix.
 
 ⛔ WHY THE TOP-K IS ROUND-BASED, NOT `routetopk.py`'s RIPPLE. The ripple reads the logits
 one `[M, 1]` column at a time, and a descriptor block must carry at least 16 bytes in its
@@ -210,8 +216,9 @@ def moe_fwd(desc_xr, desc_rg, desc_rw, desc_pes,  #
         xe = xe_desc.load([m, 0])
         sx = _fp8_scale(tl.max(tl.abs(xe), 1).to(tl.float16), INV_QMAX, SCALE_FLOOR)
         qx = _fp8_codes(xe, tl.fdiv(tl.full([1], 1.0, tl.float16), sx), H)
-        # Pass 1: every pair's activation, and their shared amax.
-        amax = tl.zeros([1], dtype=tl.float16)
+        # Per routed pair: gate/up at the token's scale, gelu·up, then down at the PAIR's own
+        # activation scale, weighted into the f16 accumulator.
+        acc = tl.zeros([1, H], dtype=tl.float16)
         for j in tl.static_range(0, K):
             e = tl.load(desc_ids + (m * K + j))
             wg = tl.reshape(wg_desc.load([e, 0, 0]), [I, H]).to(tl.float16)
@@ -219,15 +226,12 @@ def moe_fwd(desc_xr, desc_rg, desc_rw, desc_pes,  #
             gate = _w8a8(qx, sx, wg, sg_desc.load([e, 0]), 1, I)
             up = _w8a8(qx, sx, wu, su_desc.load([e, 0]), 1, I)
             act = _gelu_tanh(gate, I) * up
+            # The pair's activation is staged in `desc_act` at its own window: the card
+            # quantizes the `[K, I]` activation rows in one op, one scale per row.
             act_desc.store([m, j * I], act)
-            amax = tl.maximum(amax, tl.max(tl.abs(act), 1).to(tl.float16))
-        # Pass 2: the down projections at the shared scale, weighted and summed.
-        sa = _fp8_scale(amax, INV_QMAX, SCALE_FLOOR)
-        inv_a = tl.fdiv(tl.full([1], 1.0, tl.float16), sa)
-        acc = tl.zeros([1, H], dtype=tl.float16)
-        for j in tl.static_range(0, K):
-            e = tl.load(desc_ids + (m * K + j))
-            qa = _fp8_codes(act_desc.load([m, j * I]), inv_a, I)
+            a = act_desc.load([m, j * I])
+            sa = _fp8_scale(tl.max(tl.abs(a), 1).to(tl.float16), INV_QMAX, SCALE_FLOOR)
+            qa = _fp8_codes(a, tl.fdiv(tl.full([1], 1.0, tl.float16), sa), I)
             wd = tl.reshape(wd_desc.load([e, 0, 0]), [H, I]).to(tl.float16)
             down = _w8a8(qa, sa, wd, sd_desc.load([e, 0]), 1, H)
             w = tl.sum(tl.where(koffs[None, :] == j, wrow, tl.zeros([1, K], tl.float16)), 1)
