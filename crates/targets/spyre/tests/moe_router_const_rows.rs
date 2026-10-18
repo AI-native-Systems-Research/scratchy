@@ -115,6 +115,8 @@ fn layout_of(ir: &SubtileIR<NeoX>) -> ktir_superdsc::placement::BundleLayout {
         false,
         false,
         &[],
+        // No composite argmax: the router tape is neither tied nor one-request.
+        None,
     )
     .unwrap_or_else(|e| panic!("compute_bundle_layout: {e:?}"))
 }

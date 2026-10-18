@@ -199,6 +199,17 @@ pub struct BakeFacts {
     /// fine gather reading an UNSTAGED index — zero, a VALID entry, so every pair gathers
     /// expert 0's sub-page 0 with a clean bake. One artifact-derived question answers both.
     pub subpage_bank_e: usize,
+    /// ⭐⭐⭐ THE COMPOSITE ARGMAX'S VOCAB — the bundle placed `argmax_ramp_tid` (the rolled
+    /// walk recognized a TIED ONE-REQUEST lm-head tail and minted the composite group), so
+    /// the launch must stage the descending `V − iota` ramp and the scalar-V stick, fp32,
+    /// through the RAW bind channel — never the f32→sen const bind, which narrows to fp16
+    /// and whose exact integers stop at 2048, far below every real vocab (the mint's own
+    /// reason for computing the ramp in-func; `emit::argmax`). Read off the ramp's OWN
+    /// placement (`[1, vocab]` fp32 ⇒ `size / 4`) — the same artifact-derived law as
+    /// `ones_reduce_len`: the placement and the staging answer ONE question, so they cannot
+    /// desync into a placed-but-unstaged ramp or a staged-but-unread one. 0 when unplaced —
+    /// every untied model, prefill bundle and batched rung keeps the host readback path.
+    pub argmax_vocab: usize,
 }
 
 impl BakeFacts {
@@ -211,6 +222,7 @@ impl BakeFacts {
         scalarmul_scales: &[],
         gathers_kv: false,
         subpage_bank_e: 0,
+        argmax_vocab: 0,
         router: (0, 0),
         router_k: 0,
         router_argsort: false,
@@ -254,6 +266,12 @@ impl BakeFacts {
                 })
                 .filter(|&e| e > 0)
                 .unwrap_or(0),
+            // The composite argmax's vocab — the ramp's own rows (`[1, vocab]` fp32 ⇒
+            // `size / 4`), asked of the artifact the placement pass minted. Same
+            // one-question-one-answer law as `subpage_bank_e` above.
+            argmax_vocab: layout
+                .place_of_tid(sd::argmax_ramp_tid())
+                .map_or(0, |p| (p.size / 4) as usize),
             router,
             router_k,
             // The bare-argsort corner and the fused top-k's pad row, both asked of the

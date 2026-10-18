@@ -17,8 +17,10 @@
 
 use crate::lower_subtile_tape_to_superdsc::*;
 use ktir_superdsc::emit::EmittedOp;
+use ktir_superdsc::emit::argmax::{TiedLmHeadEmbedding, mint_argmax_node};
 use ktir_superdsc::ktir_node::ActiveCap;
 use ktir_superdsc::sdsc_abstract::POOL_STICK;
+use scratchy_subtile::lower::GemmWeight;
 use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
 use scratchy_subtile::superdsc_opspec::{DataFormat, DeviceTileLayout};
 
@@ -1189,8 +1191,18 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // layer boundary to split the weight segment on. An empty map is what tells the layout that
     // banking is not expressible here, leaving the tail spill as the only lever (`&Default::default()`
     // rather than a bool, so there is one spelling of "the layer structure" and not two).
-    let bundle_layout =
-        compute_bundle_layout(ir, weight_ids, rows_are_requests, rows_are_requests, &[])?;
+    let bundle_layout = compute_bundle_layout(
+        ir,
+        weight_ids,
+        rows_are_requests,
+        rows_are_requests,
+        &[],
+        // No composite argmax on the unrolled walk: the emulator's decode twin is unrolled
+        // FROM the rolled bundle (`unroll_layers`), so it inherits the composite's op
+        // there; this direct entry serves prefill (never one-request) and the emu-only
+        // graphs, neither of which carries the tie token.
+        None,
+    )?;
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(ir.nodes.len());
     // Collect EVERY distinct unhandled op kind (the full worklist) in one pass —
     // reconnaissance, not a silent skip: a non-empty set is a HARD error so a
@@ -1579,6 +1591,178 @@ pub fn graph_wiring<F: RopeForm>(
         attn_class_hds: registries.attn_class_hds,
     })
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ⭐⭐⭐ THE COMPOSITE ARGMAX — the walk-side recognition (#603 PR3a loop closure)
+//
+// The suffix already ends at the logits (`ir.result`, past the lm-head tail). On a TIED
+// ONE-REQUEST rung the next token needs only `argmax(logits)` — the host reads the whole
+// `[1, vocab]` row back to compute what an eight-link device chain can compute in place,
+// and the gathered embedding row is one `gather(table, V − max((V − iota)·(logits==max)))`
+// away, first-max by arithmetic (#631's law made structural). The composite itself is
+// minted by the walk below as ONE KTIR-first op appended to the suffix; this recognition
+// is the fact-finding half — run BEFORE the layout (the layout must place the chain's
+// two resident fp32 constants) and decided from the graph's OWN result tail, never from
+// a shape:
+//
+//   result ← ScalarMul(logits scaling, granite) / TanhSoftCap(gemma) ← MatmulTile(Dense)
+//
+// The single-input column-preserving tail ops are exactly the set the splice calls
+// row-local; the walk stops at the first producer that is not one, and the MATMUL it
+// stops at is the lm-head by construction (it produces the logits). The TABLE is the
+// authority for the composite's geometry — the gather reads its rows at width `hidden` —
+// so vocab/hidden come off the table's own tensor shape, cross-checked against the
+// matmul's `n`, the contraction K, and the result's cols. Arity-2 `GemmWeight::Dense`
+// only: a STAGED lm-head (fp8 W8A8, arity-3, or MLX-affine) is a boundary this first cut
+// refuses LOUDLY, never a silent host fallback — the model declared tied, so a quiet host
+// round-trip here would hide a broken emission behind a working one.
+struct ArgmaxPlan {
+    /// The tie token the expansion minted from the model's own config.
+    tied: TiedLmHeadEmbedding,
+    /// The logits — `ir.result` itself, the tensor the composite reads (post tail).
+    logits_tid: u32,
+    /// The lm-head weight — the Dense matmul's B operand, the table the gather reads.
+    table_tid: u32,
+    /// The table's OUT count (the matmul's `n`) — the gather's bank height, and the
+    /// ramp's width. The IR spells the weight `[K, N]` = `[hidden, vocab]`; the mint's
+    /// `[vocab, hidden]` view is the tied bank's own OUT-MAJOR staging form (see
+    /// `emit::argmax`'s module doc — token v's embedding is out-slot v, one contiguous
+    /// stick range), so this is the SAME bytes the matmul reads, never a second staging.
+    vocab: u32,
+    /// The table's K (the contraction width) — the gather's slab, and the row the
+    /// composite writes.
+    hidden: u32,
+    /// Every node of the recognized tail (the tail ops AND the lm-head matmul), by node
+    /// id — validated as SUFFIX nodes after the walk: the lm-head runs once, after the
+    /// last layer, never inside a rolled body.
+    chain_nodes: Vec<u32>,
+}
+
+/// Walk the result tail backward to the lm-head, and state the composite's facts.
+///
+/// ⛔ NEVER A SILENT HOST FALLBACK: this returns `Err` — a build failure naming what it
+/// found — for every tail it cannot recognize. The caller gates on the tie token, so an
+/// `Err` here means a TIED model's emission changed shape; hiding that behind the host
+/// readback would pin the regression in place.
+fn recognize_argmax<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    tied: TiedLmHeadEmbedding,
+    weight_ids: &std::collections::HashSet<u32>,
+) -> Result<ArgmaxPlan, SuperDscError> {
+    // k=1 first cut: one request, one row of logits. The expansion gates the tie token
+    // on `one_request`; a multi-row result reaching here is a wiring inconsistency, and
+    // the composite has no batched form to fall back to.
+    let result_rows = ir.tensors[ir.result.index()].rows;
+    if result_rows != 1 {
+        return Err(SuperDscError(format!(
+            "reroll-superdsc: the composite argmax was handed a {result_rows}-row result — it \
+             is a k=1 first cut (one request, one row of logits), so the tie token must not \
+             reach a multi-row rung"
+        )));
+    }
+    let mut chain_nodes = Vec::new();
+    let mut t = ir.result;
+    let node =
+        loop {
+            let node = ir.nodes.iter().find(|n| n.output.tensor == t).ok_or_else(|| {
+            SuperDscError(format!(
+                "reroll-superdsc: the composite argmax walked the result tail back to tensor \
+                 {}, which no node produces — the graph is not one this walk built",
+                t.index()
+            ))
+        })?;
+            chain_nodes.push(node.id.index() as u32);
+            match &node.op {
+                // The single-input column-preserving tail ops — granite's logits-scaling
+                // ScalarMul, gemma's TanhSoftCap. Their output still feeds the result
+                // readback; the composite reads THROUGH them (a positive scaling cannot move
+                // an argmax), so they stay exactly where they are.
+                SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. } if node.inputs.len() == 1 => {
+                    t = node.inputs[0].tensor;
+                }
+                SubOp::MatmulTile { .. } => break node,
+                other => {
+                    return Err(SuperDscError(format!(
+                        "reroll-superdsc: the composite argmax cannot recognize the lm-head tail: \
+                     the result's producer chain reaches {other:?}, which is neither the \
+                     single-input tail op set (ScalarMul, TanhSoftCap) nor the lm-head \
+                     MatmulTile — the tied one-request emission needs a new recognizer, \
+                     never a silent host fallback"
+                    )));
+                }
+            }
+        };
+    let SubOp::MatmulTile { n, weight } = &node.op else {
+        unreachable!("the loop broke on a MatmulTile");
+    };
+    if node.inputs.len() != 2 || !matches!(weight, GemmWeight::Dense) {
+        return Err(SuperDscError(format!(
+            "reroll-superdsc: the composite argmax found the lm-head matmul at arity {} with a \
+             {:?} weight — the tied gather reads a Dense [vocab, hidden] table in place, and a \
+             staged lm-head (fp8 W8A8 carries its scale as a third operand; MLX-affine packs \
+             the table) is a boundary this first cut refuses loudly",
+            node.inputs.len(),
+            weight.kind()
+        )));
+    }
+    let table_tid = node.inputs[1].tensor.index() as u32;
+    if !weight_ids.contains(&table_tid) {
+        return Err(SuperDscError(format!(
+            "reroll-superdsc: the composite argmax's table tensor {table_tid} is not in the \
+             weight set — the lm-head B operand must be the staged weight the gather reads"
+        )));
+    }
+    let table = &ir.tensors[table_tid as usize];
+    // The IR spells the matmul's weight `[K, N]` — rows are the contraction width,
+    // cols the out count. The composite's own `[vocab, hidden]` view is the tied bank's
+    // out-major staging form over the same placement (see `ArgmaxPlan::vocab`).
+    let (hidden, vocab) = (table.rows, table.cols);
+    // THE CROSS-CHECKS — the matmul's own `n`, the contraction K and the result's cols
+    // are three more spellings of the table's geometry; a mismatch is a graph
+    // inconsistency, not a recognizer miss, and it is named as one.
+    let result_cols = ir.tensors[ir.result.index()].cols;
+    let k = ir.tensors[node.inputs[0].tensor.index()].cols;
+    if vocab != *n || vocab != result_cols || k != hidden {
+        return Err(SuperDscError(format!(
+            "reroll-superdsc: the composite argmax's geometry is inconsistent — the lm-head \
+             table is [{vocab}, {hidden}], the matmul states n={n} over K={k}, and the result \
+             is [1, {result_cols}]; four spellings of one geometry must agree"
+        )));
+    }
+    Ok(ArgmaxPlan {
+        tied,
+        logits_tid: ir.result.index() as u32,
+        table_tid,
+        vocab,
+        hidden,
+        chain_nodes,
+    })
+}
+
+/// What the ladder driver states about THE RUNG being lowered — the compile-time facts
+/// that distinguish this bundle from its siblings on the same ladder. Grouped (not
+/// positional) because the signature was at the argument-count law's ceiling the moment
+/// the composite's tie token arrived, and because these three travel together: every
+/// one of them is a fact ABOUT THE RUNG, stated by the driver that named it, explicit
+/// at every call site (no `Default`, no silent facts — the `set_rows_are_requests`
+/// ambient-state deletion's own law: a bundle fact belongs in a type).
+pub struct RungFacts {
+    /// The decode ladder's ONE-REQUEST rung — see [`attn_bundle_params`]. The `#[forward]`
+    /// emission states it as `!is_prefill && decode_rows == 1 && seq_sym.is_none()`.
+    pub one_request: bool,
+    /// The split-KV chunk this rung bakes — see `BundleAttnParams::chunk_pages` (a
+    /// one-request or prompt-chunk rung; `None` for the whole-cap rungs).
+    pub chunk_pages: Option<u32>,
+    /// ⭐⭐⭐ THE COMPOSITE ARGMAX'S TIE TOKEN — `Some` only on a TIED ONE-REQUEST rung:
+    /// the expansion mints it from the model's own `tie_word_embeddings` under
+    /// `one_request`, so batched rungs, prefill and every untied model keep the host
+    /// readback path unchanged. The token itself is the guard
+    /// (`TiedLmHeadEmbedding::from_tied_config` refuses an untied model), and a tied
+    /// graph whose tail this walk cannot recognize is a LOUD error — never a silent
+    /// host fallback (see `recognize_argmax`).
+    pub argmax: Option<TiedLmHeadEmbedding>,
+}
+
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`
 /// for SuperDSC (the fix for the 40-min unrolled-bundle compile). Walks the rerolled
 /// `tape` (`subtile_tape::reroll_subtile_tape`): pre-loop Computes → `prefix`; the
@@ -1596,13 +1780,16 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     active_cap: ActiveCap,
     // See main's `lower_attn_node`. Prefill callers pass false.
     rows_are_requests: bool,
-    // The decode ladder's ONE-REQUEST rung — see [`attn_bundle_params`]. The `#[forward]`
-    // emission states it as `!is_prefill && decode_rows == 1 && seq_sym.is_none()`.
-    one_request_decode: bool,
-    // The split-KV chunk this one-request rung bakes — see `BundleAttnParams::chunk_pages`.
-    chunk_pages: Option<u32>,
+    // The rung's own facts — the one-request flag, the chunk it bakes, and the
+    // composite argmax's tie token. See [`RungFacts`].
+    rung: RungFacts,
 ) -> Result<RolledSuperDsc, SuperDscError> {
     use scratchy_subtile::subtile_tape::{ComputeInput, Instr, LoopBound};
+    let RungFacts {
+        one_request: one_request_decode,
+        chunk_pages,
+        argmax,
+    } = rung;
     let _pc = crate::pc::Pc::start("producer");
     // ⛔⭐ THE ADDRESSING LOCKDOWN RUNS FIRST — the same graph-half sweep
     // `lower_graph_to_ktir` states for the unrolled walk, run here for the tape's
@@ -1632,6 +1819,17 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // ONE MAP PER ATTENTION CLASS: a class-split roll's loops carry different-length per-layer
     // tables, and the layout needs to know which class a tensor belongs to before it can pack.
     let per_layer_ext = per_layer_external_tids(tape);
+    // ⭐⭐⭐ THE COMPOSITE ARGMAX'S RECOGNITION — BEFORE the layout, because the layout must
+    // place the chain's two resident fp32 constants (the ramp `[1, vocab]` and the
+    // scalar-V stick), and from the graph's own result tail, because that is the only
+    // place the fact lives. `argmax` is `Some` only on a TIED ONE-REQUEST rung, so a tied
+    // graph this walk cannot recognize is a LOUD error here — never a silent host
+    // fallback (the model declared tied; a quiet host round-trip would hide a broken
+    // emission behind a working one).
+    let argmax_plan = match argmax {
+        Some(tied) => Some(recognize_argmax(ir, tied, weight_ids)?),
+        None => None,
+    };
     // The layout's budget passes (spill/bank) take the per-loop maps directly: the spill reasons
     // over WHICH tids are per-layer at all (flattened internally), and the BANK needs the class
     // boundaries to know which (class, iteration) launches must stay in one bank.
@@ -1644,6 +1842,9 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         // emitter's admission are one predicate.
         rows_are_requests || chunk_pages.is_some(),
         &per_layer_ext,
+        // The composite's ramp/V placements ride the same layout pass — placed iff the
+        // recognition fired.
+        argmax_plan.as_ref().map(|p| p.vocab),
     )?;
     // ── THE TAPE'S SEGMENTS: prefix, ONE RANGE PER LOOP (an attention class's body), suffix ──
     // The rolled tape is `prefix; [OpenLoop(body₀) CloseLoop]…[OpenLoop(bodyₙ) CloseLoop]; suffix`
@@ -1711,6 +1912,12 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // machine routes ops to the prefix until the first OpenLoop flips it, so only the
     // suffix's start (the pre-pass below reads it) is named here.
     let suffix_start = loops[loops.len() - 1].0.end + 1;
+    // ⭐ THE FIRST BODY'S hidden-in IS THE EMBEDDING-SOURCE SLOT — the graph's input
+    // activation, where the runtime lands the gathered embedding row at the start of
+    // every step. The composite argmax writes ITS row (the next token's embedding) into
+    // the same placement, which the pre-pass below makes the shared residual buffer.
+    // Declared here (not inside the pre-pass) because the mint reads it after the walk.
+    let mut embed_row_tid: Option<u32> = None;
     // ⛔ `iters` per body, from the loop bounds — NOT the count of instrs in the range.
     debug_assert_eq!(loops.len(), per_layer_ext.len()); // one map per sibling loop, by construction
     // ── The walk: prefix, each body, suffix, with per-segment lowering context ──
@@ -1730,6 +1937,9 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                 break;
             }
         }
+        // ⭐ THE FIRST BODY'S hidden-in IS THE EMBEDDING-SOURCE SLOT — captured here
+        // (see the declaration above the block); the composite argmax's row binding is
+        // this tid.
         for (range, _) in &loops {
             let first = instrs[range.clone()]
                 .iter()
@@ -1747,6 +1957,9 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                 })
                 .expect("a loop body holds at least one Compute");
             let hin = ir.nodes[first.index()].inputs[0].tensor.index() as u32;
+            if embed_row_tid.is_none() {
+                embed_row_tid = Some(hin);
+            }
             let hout = ir.nodes[last.index()].output.tensor.index() as u32;
             let p = hidden_placement
                 .take()
@@ -1807,6 +2020,11 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // body→suffix seam must thread hidden_out → suffix_in at runtime (else the suffix
     // reads an unwritten slot = 0 → rmsnorm(0)=inf → garbage logits).
     let mut first_suffix_node: Option<u32> = None;
+    // Every SUFFIX Compute node id — the composite argmax's recognized tail must live
+    // wholly in the suffix (the lm-head runs once, after the last layer, never inside a
+    // rolled body). Collected during the walk because only the walk knows which nodes
+    // the roll put there.
+    let mut suffix_node_ids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     // Matmul KERNEL weights (layer-0 tid, in=k, out=n) for the device re-tile manifest.
     let mut kernel0: Vec<(u32, u32, u32)> = Vec::new();
     // The CURRENT body's first/last Compute node, reset at each OpenLoop and folded into that
@@ -2044,8 +2262,11 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                             })
                             .collect();
                     }
-                } else if seg == n_groups - 1 && first_suffix_node.is_none() {
-                    first_suffix_node = Some(node.index() as u32);
+                } else if seg == n_groups - 1 {
+                    if first_suffix_node.is_none() {
+                        first_suffix_node = Some(node.index() as u32);
+                    }
+                    suffix_node_ids.insert(node.index() as u32);
                 }
                 // ⭐ THE WEIGHT BANK THIS OP'S GROUP NEEDS. Recorded per group as the ops are emitted
                 // because it is a property of the OPERANDS, which only the node knows; a launch binds
@@ -2087,6 +2308,75 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
             unhandled.len(),
             unhandled.into_iter().collect::<Vec<_>>().join(", "),
         )));
+    }
+    // ⭐⭐⭐ THE COMPOSITE ARGMAX — the loop-closure group, minted into the suffix HERE:
+    // AFTER the walk (so the whole tail is collected and the residual pre-pass has named
+    // the embedding-source slot) and BEFORE the declare pass below (so the chain's seven
+    // scratch synthetics are declared in the shared plan's own order — the ⭐seg0-overrun
+    // ordering law). KTIR-first by construction: `op: None, ktir: Some`; the descriptors
+    // arrive through the door arm in the consumer, and the emulator binds `func` directly.
+    //
+    // THE BINDING CONVENTION (mint_argmax_node's, mirrored by the door arm): three
+    // parameters over the graph's own slots — [logits = ir.result, table = the lm-head
+    // weight, row = the first body's hidden-in, which IS the embedding-source slot]. The
+    // composite runs LAST in the suffix, after every op that reads the residual buffer,
+    // so its row write is WAR-safe within the step. (The next step's embedding staging
+    // still overwrites the row on the host path — the executor flip that makes the
+    // suffix end at the gather's row is PR3's stage 3, deliberately not this PR's.)
+    if let Some(plan) = argmax_plan {
+        // The tail must live wholly in the suffix: the lm-head runs once, after the last
+        // layer. A chain node inside a rolled body would mean the recognition grabbed a
+        // per-layer projection; the weight-set check already refuses that, and this
+        // structural fact is checked where only the walk can see it.
+        if let Some(&nid) = plan
+            .chain_nodes
+            .iter()
+            .find(|nid| !suffix_node_ids.contains(nid))
+        {
+            return Err(SuperDscError(format!(
+                "reroll-superdsc: the composite argmax's tail includes node {nid}, which the \
+                 roll placed OUTSIDE the suffix — the lm-head must run once, after the last \
+                 layer, never inside a rolled body"
+            )));
+        }
+        // The row slot: the first body's hidden-in (the embedding source), whose placement
+        // the residual pre-pass already aliased every body and the suffix input onto. Its
+        // width must state the same hidden the table's rows do — the gather's slab and the
+        // residual buffer are the same width or the write would not fit.
+        let row_tid = embed_row_tid.expect(
+            "the residual pre-pass named the first body's hidden-in — a loop body holds at \
+             least one Compute, so the first body's hin exists",
+        );
+        let row_cols = ir.tensors[row_tid as usize].cols;
+        if row_cols != plan.hidden {
+            return Err(SuperDscError(format!(
+                "reroll-superdsc: the composite argmax's row slot is [1, {row_cols}] but the \
+                 lm-head table's rows are {} wide — the gather's slab and the residual buffer \
+                 must be the same width",
+                plan.hidden
+            )));
+        }
+        let k = mint_argmax_node(
+            plan.vocab,
+            plan.hidden,
+            plan.logits_tid,
+            plan.table_tid,
+            row_tid,
+            plan.tied,
+        );
+        let mut e = EmittedOp::bare(k.func.name.to_string());
+        e.ktir = Some(k);
+        suffix.push(e);
+        // The composite's gather READS the lm-head table — a weight — so the table's bank
+        // joins the SUFFIX group's set (a launch binds ONE base per segment; the
+        // single-member law is checked below with every other group's). Redundant with the
+        // matmul's own read in every real graph, and stated anyway: the composite's
+        // operands are its own fact, not an inference from its neighbors.
+        if let Some(p) = bundle_layout.placements.get(&plan.table_tid)
+            && matches!(p.role, SegRole::Weight)
+        {
+            group_weight_banks[n_groups - 1].insert(p.bank);
+        }
     }
     for (bi, b) in bodies.iter().enumerate() {
         if b.layer_ids.len() != b.iters as usize {
@@ -3850,6 +4140,7 @@ mod attn_scale_weight_fold_tests {
             false,
             false,
             &[],
+            None,
         )
         .expect("the same graph lays out");
         assert_eq!(

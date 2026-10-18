@@ -9845,6 +9845,15 @@ fn synth_role_tokens(
         R::XSScratch => quote! { #b::XSScratch },
         R::XRaw => quote! { #b::XRaw },
         R::XDqA => quote! { #b::XDqA },
+        // The composite argmax's seven scratch synthetics (#603 PR3a) — keyed off the ROW
+        // tid by the door, declared in the walk's own declare pass.
+        R::AmMax => quote! { #b::AmMax },
+        R::AmMask => quote! { #b::AmMask },
+        R::AmMask32 => quote! { #b::AmMask32 },
+        R::AmW => quote! { #b::AmW },
+        R::AmJ => quote! { #b::AmJ },
+        R::AmIdx32 => quote! { #b::AmIdx32 },
+        R::AmIdxU32 => quote! { #b::AmIdxU32 },
         R::GatherKtLx(i) => {
             let i = proc_macro2::Literal::u32_unsuffixed(*i);
             quote! { #b::GatherKtLx(#i) }
@@ -11082,6 +11091,21 @@ fn dump_wavefront_mega(
                             )
                         })
                     };
+                    // ⭐⭐⭐ THE COMPOSITE ARGMAX'S TIE FACT, read ONCE from the model's own
+                    // config (`tie_word_embeddings`) and gated on the one-request rung — the
+                    // only rung whose next token needs just `argmax(logits)`. Batched rungs,
+                    // prefill and every untied model keep the host readback path unchanged.
+                    // `TiedLmHeadEmbedding::from_tied_config` is the guard itself: an untied
+                    // model cannot mint the token, so the walk can never gather the wrong
+                    // bank — and a tied graph whose tail the walk cannot recognize is a LOUD
+                    // build error, never a silent host fallback.
+                    let argmax_tied = if one_request && tie_word_embeddings(model) {
+                        Some(superdsc::TiedLmHeadEmbedding::from_tied_config(true).unwrap_or_else(
+                            |e| panic!("[spyre-superdsc] {base}: the composite argmax's tie token: {e}"),
+                        ))
+                    } else {
+                        None
+                    };
                     match ValidatedGraph::new(&krg) {
                         Ok(valid) => {
                             let tape_unrolled = lower_dag_to_tape(&valid);
@@ -11103,8 +11127,12 @@ fn dump_wavefront_mega(
                                 // are one token each of the running requests once it is baked wider than
                                 // a single row.
                                 !is_prefill && decode_rows > 1,
-                                one_request,
-                                chunk_ceiling,
+                                superdsc::RungFacts {
+                                    one_request,
+                                    chunk_pages: chunk_ceiling,
+                                    // The composite argmax's tie token — see its mint above.
+                                    argmax: argmax_tied,
+                                },
                             ) {
                                 Ok(rolled) => {
                                     // `iters` counts LOOP ITERATIONS, not layers: a welded body can
@@ -11479,8 +11507,14 @@ fn dump_wavefront_mega(
                                                         &weight_ids,
                                                         rung,
                                                         !is_prefill && decode_rows > 1,
-                                                        one_request,
-                                                        rung_chunk,
+                                                        superdsc::RungFacts {
+                                                            one_request,
+                                                            chunk_pages: rung_chunk,
+                                                            // The composite argmax's tie
+                                                            // token — Copy, captured from
+                                                            // the mint above.
+                                                            argmax: argmax_tied,
+                                                        },
                                                     ) {
                                                         // Same device split as the ceiling rung above: the
                                                         // card bakes the ROLLED body, the emulator the

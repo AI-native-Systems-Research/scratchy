@@ -186,17 +186,27 @@ const _: () = assert!(bundle::MAX_SEGMENT_BYTES == SEGMENT_SIZE);
 // invents or requires and the caller binds, so a third-party KTIR producer has to agree with these
 // numbers to bind anything at all. Re-exported so every path in the tree resolves unchanged.
 pub use ktir_superdsc::reserved_tids::{
-    ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_SCALE_TID, ATTN_ZERO_TID, FP8_INV448_TID, FP8_NEG448_TID,
-    FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE, KV_BLOCK_INDEX_TID, LAST_HIDDEN_TID,
-    NEW_V_PROBE_TID, ONES_REDUCE_TID, OPROJ_HEADMAJOR_BASE, RESERVED_REGIONS,
-    RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID, RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID,
-    RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID,
-    SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion,
-    expert_subpage_bank_tid, identity_class_tid, is_kernel_table_class_tid, kct_resident_tid,
-    oproj_headmajor_tid, reserved_region, rope_p_class_hds, rope_p_class_tid, router_identity_tid,
-    router_pad_mask_tid, router_rank_tie_tid, router_sm_mask_tid, router_topk_iota_tid,
-    router_topk_pad_tid, scalarmul_scale_tid,
+    ARGMAX_CONST_BASE, ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_SCALE_TID, ATTN_ZERO_TID,
+    FP8_INV448_TID, FP8_NEG448_TID, FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE,
+    KV_BLOCK_INDEX_TID, LAST_HIDDEN_TID, NEW_V_PROBE_TID, ONES_REDUCE_TID, OPROJ_HEADMAJOR_BASE,
+    RESERVED_REGIONS, RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID, RMS_INVCOLS_TID,
+    RMS_RSQRT_PROBE_TID, RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, SCALARMUL_SCALE_BASE,
+    SEL_HEADMAJOR_TID, SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION,
+    TidRegion, argmax_ramp_tid, argmax_v_tid, expert_subpage_bank_tid, identity_class_tid,
+    is_kernel_table_class_tid, kct_resident_tid, oproj_headmajor_tid, reserved_region,
+    rope_p_class_hds, rope_p_class_tid, router_identity_tid, router_pad_mask_tid,
+    router_rank_tie_tid, router_sm_mask_tid, router_topk_iota_tid, router_topk_pad_tid,
+    scalarmul_scale_tid,
 };
+
+// ⭐ THE COMPOSITE ARGMAX'S TIE TOKEN — re-exported so the `#[forward]` expansion (which
+// aliases this module as `superdsc`) can mint it at the walk's call site from the model's
+// own `tie_word_embeddings`, with no second spelling of the type between the macro and
+// the walk that consumes it.
+pub use ktir_superdsc::emit::argmax::TiedLmHeadEmbedding;
+// The rung facts the walk takes as one explicit struct — same re-export law as the tie
+// token above: the expansion constructs it, so it spells through this module's path.
+pub use crate::lower_subtile_tape_to_ktir::RungFacts;
 
 // ⭐⭐⭐ THE MEMORY PLAN LIVES IN `ktir_superdsc::placement` — `SegRole`, `TensorPlacement`,
 // `RetileDescriptor`, `BundleLayout` and its whole impl, `SynthAlloc`, `align128`, `syn`.
@@ -679,6 +689,13 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // bundle, which has no layer boundary and therefore cannot bank. A uniform model is one class,
     // so a one-element slice is exactly the pre-class single map.
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
+    // ⭐⭐⭐ THE COMPOSITE ARGMAX'S VOCAB — `Some(vocab)` iff the rolled walk recognized a TIED
+    // ONE-REQUEST lm-head tail (see [`crate::lower_subtile_tape_to_ktir::recognize_argmax`]'s
+    // law), so this layout must place the chain's two resident fp32 constants. `None` for every
+    // untied model, prefill bundle and batched rung — a bundle without the composite never
+    // places or stages them. The vocab is the TABLE's own row count (the gather's bank height,
+    // the ramp's width), handed down by the recognition that read it off the graph.
+    argmax_vocab: Option<u32>,
 ) -> Result<BundleLayout, SuperDscError> {
     // fp8 W8A8 weights (SEN143_FP8: 1-byte / 128-elem stick) are `input[1]` of any arity-3 MatmulTile.
     // Their device footprint is HALF the fp16 weight — this is the unfakeable 1-byte-read proxy: it is
@@ -1398,6 +1415,45 @@ pub fn compute_bundle_layout<F: RopeForm>(
             // the pair's ids scan positions `0..E−1` (in-range by construction).
             place_const(router_topk_pad_tid(), 1, w, &mut seg_bytes);
         }
+    }
+
+    // ── THE COMPOSITE ARGMAX'S TWO RESIDENT CONSTANTS (#603 PR3a loop closure) ──
+    // ⭐⭐ PLACED IFF THE ROLLED WALK RECOGNIZED A TIED ONE-REQUEST LM-HEAD TAIL — the
+    // walk's own recognition hands the vocab here, decided from the graph's result tail.
+    // The descending fp32 ramp `V − iota` `[1, vocab]` and the scalar-V stick `[1, 32]`
+    // are ACTIVATION-segment consts like the router's, but fp32 (4 bytes/elem): the
+    // composite's FIRST-MAX arithmetic needs the ramp's values to reach V exactly, and
+    // fp16's exact-integer range stops at 2048 — far below every real vocab, which is
+    // the mint's own documented reason for computing the ramp in-func (`emit::argmax`).
+    // They stage through the RAW bind channel (`bind_input_raw`, the subpage-bank
+    // precedent), never the f32→sen const bind that narrows to fp16. Placed by the
+    // LAYOUT because the door NAMES them by their reserved tids — the router-const law:
+    // THE DOOR NAMES, THE LAYOUT PLACES.
+    if let Some(vocab) = argmax_vocab {
+        let seg = SegRole::Activation.segment();
+        let mut place_const32 = |tid: u32, rows: u64, cols: u64, seg_bytes: &mut [u64; 7]| {
+            let off = seg_bytes[seg];
+            let sz = rows * cols * 4; // fp32 — see the block comment
+            placements.insert(
+                tid,
+                TensorPlacement {
+                    tid,
+                    bank: 0,
+                    role: SegRole::Activation,
+                    segment: seg,
+                    offset: off,
+                    size: sz,
+                },
+            );
+            seg_bytes[seg] = align128(off + sz);
+        };
+        place_const32(argmax_ramp_tid(), 1, u64::from(vocab), &mut seg_bytes);
+        place_const32(
+            argmax_v_tid(),
+            1,
+            ktir_superdsc::superdsc_opspec::Fp32::ELEMS_PER_STICK as u64,
+            &mut seg_bytes,
+        );
     }
 
     // ── THE SUB-PAGE INDEX BANK (the fine expert gather's const table) ──
@@ -7608,9 +7664,9 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
-    one_request_decode: bool,
-    // The split-KV chunk a one-request ladder rung bakes — see `BundleAttnParams::chunk_pages`.
-    chunk_pages: Option<u32>,
+    // The rung's own facts — the one-request flag, the chunk it bakes, and the composite
+    // argmax's tie token. See [`RungFacts`].
+    rung: RungFacts,
 ) -> Result<RolledSuperDsc, SuperDscError> {
     crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
         tape,
@@ -7618,8 +7674,7 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
         weight_ids,
         active_cap,
         rows_are_requests,
-        one_request_decode,
-        chunk_pages,
+        rung,
     )
 }
 
@@ -7997,7 +8052,7 @@ mod tests {
             op_output: Vec::new(),
         };
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None)
             .expect("a layout for a plain matmul bundle");
 
         // ⭐ ROLES AND PACKING, ASSERTED AS THE RULES — not as magic numbers. This test pinned
@@ -8366,7 +8421,7 @@ mod tests {
         // the extraction program and the door must Err naming it.
         let (node, ir) = build(mq);
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None)
             .expect("the tail's layout mints");
         let mut programs = scratchy_triton_splice::lower_all(&node, &ir, false)
             .expect("the splice's fold mints the tail");
@@ -8446,7 +8501,7 @@ mod tests {
         // fp8 (arity-3): the placement reserves the PADDED extent — 2176·2816·1 B, the exact
         // bytes the matmul's tile read addresses (the refusal's access side).
         let ir = build(GemmWeight::Fp8Dynamic);
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None)
             .expect("the fp8 layout mints");
         let p = layout.placements.get(&1).expect("the fp8 weight is placed");
         assert_eq!(
@@ -8455,7 +8510,7 @@ mod tests {
         );
         // fp16 (arity-2), SAME shape: raw rows — 2112 = 33 whole fp16 sticks, no pad.
         let ir = build(GemmWeight::Dense);
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None)
             .expect("the fp16 layout mints");
         let p = layout
             .placements
@@ -9153,7 +9208,7 @@ mod tests {
         let weight_ids: std::collections::HashSet<u32> = [0u32].into_iter().collect();
         // The budget pass refuses the same fixture the wiring accepts — on the UNROLLED graph,
         // with no layer classes, an over-cap weight segment is un-bankable and un-spillable.
-        let err = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let err = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None)
             .expect_err("the placement pass is the budget law and must refuse 32 GiB in seg1");
         assert!(
             err.0.contains("one device region can hold"),

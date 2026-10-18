@@ -715,10 +715,13 @@ fn the_router_projection_w_is_a_retiled_kernel_weight() {
         &weight_ids,
         superdsc::ActiveCap::FULL,
         false,
-        // The router head walks at m=3 — three rows, not a one-request decode.
-        false,
-        // …and so attends no split-KV chunk.
-        None,
+        // The router head walks at m=3 — three rows, not a one-request decode, no
+        // split-KV chunk, and no composite argmax (neither tied nor one-request).
+        superdsc::RungFacts {
+            one_request: false,
+            chunk_pages: None,
+            argmax: None,
+        },
     )
     .unwrap_or_else(|e| panic!("lower the router head: {e:?}"));
     // The POINTWISE floor, not the m-conditional matmul width: at m=3 the
