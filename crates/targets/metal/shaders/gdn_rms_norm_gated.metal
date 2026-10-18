@@ -33,6 +33,8 @@
 //   GDN_RMS_GROUPS      — optional: rows a token has (with GDN_RMS_Z_STRIDE); the weight then spans
 //                         all of them (`[groups * d]`) instead of one (`[d]`)
 //   GDN_RMS_GATE_BEFORE — optional: the Mamba-2 order above
+//   GDN_RMS_ROWS_PER_TG — the simdgroup form's rows a threadgroup (one per simdgroup); the
+//                         threadgroup form's keys carry no slot 6
 //
 // Dispatch: one threadgroup per row, a power of two of threads; threadgroup
 // reduction over d. Every power of two ≥ d sums in the same order (its extra
@@ -124,7 +126,7 @@ INST_GDN_RMS_NORM_GATED(f32,  float)
 //   - every level with `s <= 16` pairs lanes of one simdgroup, so the bottom
 //     five levels are simd shuffles — every lane folds (as `gdn_decode`
 //     reduces), and lane 0's chain — the only one read — draws solely
-//     in-range sources, so it is the threadgroup form's `sdata[0] tree. The
+//     in-range sources, so it is the threadgroup form's `sdata[0]` tree. The
 //     sums agree BIT FOR BIT, and `inv` (broadcast lane 0's sum, then the
 //     same rsqrt) and the per-element output formula are the threadgroup
 //     form's own.
@@ -134,8 +136,9 @@ INST_GDN_RMS_NORM_GATED(f32,  float)
 // strided `z` fold in exactly as above.
 //
 // `GDN_RMS_ROWS_PER_TG` is optional only because the threadgroup form's keys
-// carry no slot 6: the simd form is baked only through the lowering, which
-// always sets it (the test sets it directly).
+// carry no slot 6; the simd form's own static_assert below refuses a bake that
+// leaves it unset or zero (a zero would make every threadgroup recompute the
+// first rows instead of striding past them).
 SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_RMS_ROWS_PER_TG, 6);
 
 template <typename T>
@@ -154,7 +157,18 @@ template <typename T>
     return;
   }
   uint lane = tid % 32;
-  constexpr uint e = GDN_RMS_D / 32;  // a lane's strided elements; d = 32·2^k ≤ 256 here
+  // A lane's strided elements. The clamp keeps this template parseable in the threadgroup
+  // form's own bakes — clang checks its non-template-dependent code there too, where slot 6
+  // is unset and `GDN_RMS_D` can be below 32 — and is the identity wherever the static_assert
+  // below lets it instantiate.
+  constexpr uint e = GDN_RMS_D < 32u ? 1u : GDN_RMS_D / 32u;
+  // Checked where this kernel is baked (`sizeof(T)` defers to its instantiation): the lane
+  // layout above rests on the width being a power of two in [32, 256] and the rows a
+  // threadgroup being set — anything else sums the wrong elements or strides rows wrong.
+  static_assert(sizeof(T) && GDN_RMS_ROWS_PER_TG_SET && GDN_RMS_ROWS_PER_TG > 0u &&
+                    GDN_RMS_D >= 32u && GDN_RMS_D <= 256u &&
+                    (GDN_RMS_D & (GDN_RMS_D - 1u)) == 0u,
+                "one simdgroup a row, a power-of-two width in [32, 256]");
   const uint group = row % GDN_RMS_TOKEN_ROWS;
   const device float* x_row = x + row * d;
   const device T*     z_row = GDN_RMS_Z_STRIDE_SET
@@ -174,7 +188,7 @@ template <typename T>
   float v;
   {
 #pragma clang fp contract(off)
-    float p[8];
+    float p[e];
     _Pragma("unroll") for (uint j = 0; j < e; j++) {
       float vj = x_row[lane + 32 * j];
       if (GDN_RMS_GATE_BEFORE) {
@@ -203,8 +217,11 @@ template <typename T>
   // The store loop is the threadgroup form's own shape — a runtime stride off
   // the thread id (here the lane, strided by the simdgroup width, a runtime
   // quotient of `tg_size`) — so the compiler lowers its `exp`, division and
-  // multiply chain exactly as the threadgroup form's, bit for bit.
-  uint simdw = tg_size / GDN_RMS_ROWS_PER_TG;
+  // multiply chain exactly as the threadgroup form's, bit for bit. The clamp
+  // is the identity wherever the static_assert lets this kernel instantiate;
+  // it only keeps the never-instantiated parse (slot 6 unset) free of a
+  // division-by-zero.
+  uint simdw = tg_size / (GDN_RMS_ROWS_PER_TG < 1u ? 1u : GDN_RMS_ROWS_PER_TG);
   for (uint i = lane; i < d; i += simdw) {
     float zi = float(z_row[i]);
     float silu_z = zi / (1.0f + exp(-zi));  // SiLU(z) = z * sigmoid(z)

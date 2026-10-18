@@ -14,6 +14,7 @@
 
 mod common;
 
+use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
@@ -44,6 +45,18 @@ fn buf_f32(device: &Device, data: &[f32]) -> Buffer {
             buf.contents().as_ptr() as *mut u8,
             std::mem::size_of_val(data),
         );
+    }
+    buf
+}
+
+/// A buffer holding `bytes` as written (a dtype-packed tensor the f32 helpers don't cover).
+fn buf_bytes(device: &Device, bytes: &[u8]) -> Buffer {
+    let len = bytes.len().max(4);
+    let buf = device
+        .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+        .expect("newBuffer");
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.contents().as_ptr() as *mut u8, len);
     }
     buf
 }
@@ -518,13 +531,19 @@ fn gdn_rms_norm_gated_sums_alike_at_every_covering_threadgroup() {
     }
 }
 
-/// `gdn_rms_norm_gated_simd_f32` — the simdgroup form the lowering picks for a power-of-two
+/// `gdn_rms_norm_gated_simd` — the simdgroup form the lowering picks for a power-of-two
 /// width in [32, 256] — is BIT-IDENTICAL to the threadgroup form at that width's covering
 /// threadgroup: the lane layout (a simdgroup a row, `width / 32` strided elements a lane)
 /// reproduces the covering threadgroup's reduction tree exactly, its top levels as register
 /// adds and its bottom five as simd shuffles. Both rows-a-threadgroup layouts the lowering
 /// chooses (four when a token's rows divide by four, else one), and the Mamba-2
-/// gate-before-norm form with its strided `z` and group-spanning weight.
+/// gate-before-norm form with its strided `z` and group-spanning weight. Every dtype the
+/// lowering lowers the form for — the store loop keeps the threadgroup form's runtime-strided
+/// shape, a codegen workaround that can behave differently per instantiation — plus f32,
+/// whose output bits a ULP of sum drift shows in directly. The negative control is the
+/// threadgroup form at a QUARTER-width threadgroup (four squares a thread, summed in turn —
+/// a different association), which differs at f32: the bit equality can actually fail, where
+/// a 16-bit output rounds a ULP of sum drift away.
 #[test]
 fn gdn_rms_norm_gated_simd_is_bit_identical_to_the_threadgroup_form() {
     let Some(di) = detect_device() else {
@@ -534,6 +553,55 @@ fn gdn_rms_norm_gated_simd_is_bit_identical_to_the_threadgroup_form() {
     let device = di.device.clone();
     let cache =
         SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
+
+    /// The dtype a `gdn_rms_norm_gated` instantiation reads its `z` in and writes its `out`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Dtype {
+        F32,
+        F16,
+        Bf16,
+    }
+    impl Dtype {
+        fn tag(self) -> &'static str {
+            match self {
+                Self::F32 => "f32",
+                Self::F16 => "f16",
+                Self::Bf16 => "bf16",
+            }
+        }
+        /// The threadgroup and simdgroup forms' kernel symbols at this dtype.
+        fn symbols(self) -> (&'static str, &'static str) {
+            match self {
+                Self::F32 => ("gdn_rms_norm_gated_f32", "gdn_rms_norm_gated_simd_f32"),
+                Self::F16 => ("gdn_rms_norm_gated_f16", "gdn_rms_norm_gated_simd_f16"),
+                Self::Bf16 => ("gdn_rms_norm_gated_bf16", "gdn_rms_norm_gated_simd_bf16"),
+            }
+        }
+        /// `xs` as this dtype holds it.
+        fn bytes(self, xs: &[f32]) -> Vec<u8> {
+            match self {
+                Self::F32 => xs.iter().flat_map(|x| x.to_le_bytes()).collect(),
+                Self::F16 => xs
+                    .iter()
+                    .flat_map(|&x| f16::from_f32(x).to_bits().to_le_bytes())
+                    .collect(),
+                Self::Bf16 => xs
+                    .iter()
+                    .flat_map(|&x| bf16::from_f32(x).to_bits().to_le_bytes())
+                    .collect(),
+            }
+        }
+        /// The output buffer's raw bit patterns, widened — equal iff the outputs are.
+        fn bits(self, buf: &Buffer, n: usize) -> Vec<u32> {
+            match self {
+                Self::F32 => read_f32(buf, n).iter().map(|v| v.to_bits()).collect(),
+                _ => {
+                    let raw = buf.contents().as_ptr() as *const u16;
+                    (0..n).map(|i| unsafe { *raw.add(i) } as u32).collect()
+                }
+            }
+        }
+    }
 
     // (width, groups a token, rows-a-threadgroup layouts to try): the GDN form (one value head
     // a row) at every dispatchable width, then the Mamba-2 form (gate before norm, `z` a
@@ -550,91 +618,133 @@ fn gdn_rms_norm_gated_simd_is_bit_identical_to_the_threadgroup_form() {
     let rows = 512usize;
     let eps = 1e-6f32;
     let shifted = |n: usize, by: usize| fill(n + by)[by..].to_vec();
-    for &(d, groups, rpts) in cases {
-        let mamba = groups > 1;
-        // The Mamba-2 `z`: `rows / groups` in-projection rows, each `stride` wide, the norm's
-        // columns a group slice of one — padding the stride catches a stride bug.
-        let stride = groups * d + 8;
-        let x = shifted(rows * d as usize, 7);
-        let z = if mamba {
-            shifted((rows / groups as usize) * stride as usize, 3)
-        } else {
-            shifted(rows * d as usize, 3)
-        };
-        let weight = shifted(groups as usize * d as usize, 5);
-        let base = vec![
-            ConstantValue::uint(0, d),
-            ConstantValue::uint(1, rows as u32),
-            ConstantValue::float(2, eps),
-        ];
-        let mamba_consts = || {
-            base.clone()
-                .into_iter()
-                .chain([
-                    ConstantValue::uint(3, stride),
-                    ConstantValue::uint(4, groups),
-                    ConstantValue::boolean(5, true),
-                ])
-                .collect::<Vec<_>>()
-        };
-        let (x_buf, z_buf, w_buf) = (
-            buf_f32(&device, &x),
-            buf_f32(&device, &z),
-            buf_f32(&device, &weight),
-        );
-        let run =
-            |function: &'static str, constants: Vec<ConstantValue>, grid: usize, tg: usize| {
-                let key = PipelineKey::new("gdn_rms_norm_gated", function, constants);
-                let pipeline = baked_build(&cache, &key).expect("norm pipeline");
-                let out = buf_zero_f32(&device, rows * d as usize);
-                let bufs = [&out, &x_buf, &z_buf, &w_buf];
-                common::dispatch_threadgroups(
-                    &device,
-                    &pipeline,
-                    &bufs,
-                    MTLSize {
-                        width: grid,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: tg,
-                        height: 1,
-                        depth: 1,
-                    },
-                )
-                .then(|| {
-                    read_f32(&out, rows * d as usize)
-                        .iter()
-                        .map(|v| v.to_bits())
-                        .collect::<Vec<_>>()
-                })
+    for dt in [Dtype::F32, Dtype::F16, Dtype::Bf16] {
+        let (threadgroup_sym, simd_sym) = dt.symbols();
+        for &(d, groups, rpts) in cases {
+            let mamba = groups > 1;
+            // The Mamba-2 `z`: `rows / groups` in-projection rows, each `stride` wide, the norm's
+            // columns a group slice of one — padding the stride catches a stride bug.
+            let stride = groups * d + 8;
+            let x = shifted(rows * d as usize, 7);
+            let z = if mamba {
+                shifted((rows / groups as usize) * stride as usize, 3)
+            } else {
+                shifted(rows * d as usize, 3)
             };
-        // The threadgroup form at the covering threadgroup is the oracle.
-        let consts = if mamba { mamba_consts() } else { base.clone() };
-        let Some(want) = run(
-            "gdn_rms_norm_gated_f32",
-            consts,
-            rows,
-            d.next_power_of_two() as usize,
-        ) else {
-            return;
-        };
-        for &rpt in rpts {
-            let mut simd_consts = if mamba { mamba_consts() } else { base.clone() };
-            simd_consts.push(ConstantValue::uint(6, rpt));
-            assert_eq!(
-                run(
-                    "gdn_rms_norm_gated_simd_f32",
-                    simd_consts,
-                    rows / rpt as usize,
-                    32 * rpt as usize
-                ),
-                Some(want.clone()),
-                "width {d}, groups {groups}, {rpt} rows a threadgroup"
+            let weight = shifted(groups as usize * d as usize, 5);
+            let base = vec![
+                ConstantValue::uint(0, d),
+                ConstantValue::uint(1, rows as u32),
+                ConstantValue::float(2, eps),
+            ];
+            let mamba_consts = || {
+                base.clone()
+                    .into_iter()
+                    .chain([
+                        ConstantValue::uint(3, stride),
+                        ConstantValue::uint(4, groups),
+                        ConstantValue::boolean(5, true),
+                    ])
+                    .collect::<Vec<_>>()
+            };
+            let (x_buf, z_buf, w_buf) = (
+                buf_f32(&device, &x),
+                // `z` is read at `T`'s precision: both forms see this dtype's rounding of it.
+                buf_bytes(&device, &dt.bytes(&z)),
+                buf_f32(&device, &weight),
             );
+            let run =
+                |function: &'static str, constants: Vec<ConstantValue>, grid: usize, tg: usize| {
+                    let key = PipelineKey::new("gdn_rms_norm_gated", function, constants);
+                    let pipeline = baked_build(&cache, &key).expect("norm pipeline");
+                    // f32-sized whatever the dtype: 16-bit outputs just use half of it.
+                    let out = buf_zero_f32(&device, rows * d as usize);
+                    let bufs = [&out, &x_buf, &z_buf, &w_buf];
+                    common::dispatch_threadgroups(
+                        &device,
+                        &pipeline,
+                        &bufs,
+                        MTLSize {
+                            width: grid,
+                            height: 1,
+                            depth: 1,
+                        },
+                        MTLSize {
+                            width: tg,
+                            height: 1,
+                            depth: 1,
+                        },
+                    )
+                    .then(|| dt.bits(&out, rows * d as usize))
+                };
+            // The threadgroup form at the covering threadgroup is the oracle.
+            let consts = if mamba { mamba_consts() } else { base.clone() };
+            let Some(want) = run(
+                threadgroup_sym,
+                consts.clone(),
+                rows,
+                d.next_power_of_two() as usize,
+            ) else {
+                return;
+            };
+            // The control: a quarter-width threadgroup sums four squares a thread in turn —
+            // a different association — and must NOT match (at f32, whose bits show it).
+            if dt == Dtype::F32 {
+                assert_ne!(
+                    run(threadgroup_sym, consts, rows, d as usize / 4),
+                    Some(want.clone()),
+                    "the control itself: width {d}, groups {groups} — the quarter-width \
+                     threadgroup sums like the covering one after all"
+                );
+            }
+            for &rpt in rpts {
+                let mut simd_consts = if mamba { mamba_consts() } else { base.clone() };
+                simd_consts.push(ConstantValue::uint(6, rpt));
+                assert_eq!(
+                    run(
+                        simd_sym,
+                        simd_consts,
+                        rows / rpt as usize,
+                        32 * rpt as usize
+                    ),
+                    Some(want.clone()),
+                    "width {d}, groups {groups}, {rpt} rows a threadgroup"
+                );
+                eprintln!(
+                    "gdn norm bit-identity: {} width {d}, groups {groups}, {rpt} rows a tg: ok",
+                    dt.tag()
+                );
+            }
         }
     }
+}
+
+/// The simdgroup form's layout contract is a BAKE REFUSAL, not a convention: a key with a
+/// width the lane layout can't reduce (here 48 — not a power of two; the kernel's
+/// `static_assert` fires the same way on an unset rows-a-threadgroup) fails the bake's
+/// `xcrun metal`, instead of silently summing the wrong elements.
+#[test]
+#[should_panic(expected = "bake: `xcrun metal` failed")]
+fn gdn_rms_norm_gated_simd_refuses_an_ineligible_width() {
+    let Some(di) = detect_device() else {
+        // No Metal device (e.g. CI's paravirtual runner): the bake this test means to
+        // watch refuse can't run, so panic with the expected message to keep it green
+        // (effectively skipped) rather than failing "did not panic".
+        panic!("bake: `xcrun metal` failed — skipped: no Metal device");
+    };
+    let cache =
+        SpecializedPipelineCache::new(di.device.clone(), &[]).expect("compile standard shaders");
+    let key = PipelineKey::new(
+        "gdn_rms_norm_gated",
+        "gdn_rms_norm_gated_simd_f32",
+        vec![
+            ConstantValue::uint(0, 48),
+            ConstantValue::uint(1, 512),
+            ConstantValue::float(2, 1e-6),
+            ConstantValue::uint(6, 4),
+        ],
+    );
+    baked_build(&cache, &key).expect("the bake must refuse a width the lane layout can't reduce");
 }
 
 /// `gdn_conv1d_varlen_f32`, single fresh sequence (is_fresh=1, zero left-pad):

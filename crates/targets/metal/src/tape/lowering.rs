@@ -6722,6 +6722,10 @@ fn recurrent_scan(
 
 /// A recurrent mixer's gated RMSNorm (`gdn_rms_norm_gated`) of the f32 scratch `o` into the
 /// model-dtype `out` (bindings `[out, z, weight]`): rows of `width` (`per_token` a token), one threadgroup a row of the power
+/// The simdgroup form's rows a threadgroup: the simdgroups a 128-thread covering threadgroup
+/// holds, and the divisor that keeps the X-axis `m_scaling` exact (see [`recurrent_norm`]).
+const NORM_ROWS_PER_TG: u32 = 4;
+
 /// of two covering `width` (any power of two ≥ width sums in the same order); scales X. GDN
 /// norms per value head after the gate; Mamba-2 (`z_stride` = its in-projection row, `z` that
 /// row's leading columns) gates first and norms per group, its weight spanning the row.
@@ -6759,10 +6763,12 @@ fn recurrent_norm(
         ]);
     }
     // The simdgroup form's eligibility and rows-a-threadgroup, as one decision
-    // the shader's layout contract rests on (see the doc above).
-    let simd_form = width.is_power_of_two() && (32..=256).contains(&width);
-    let rows_per_tg = if simd_form && per_token % 4 == 0 {
-        4
+    // the shader's layout contract rests on (see the doc above). The width's
+    // bound is the covering threadgroup's own size cap: past it the form's
+    // bit-identity argument has no covering dispatch to be identical to.
+    let simd_form = width.is_power_of_two() && (32..=THREADS_PER_GROUP).contains(&width);
+    let rows_per_tg = if simd_form && per_token % NORM_ROWS_PER_TG == 0 {
+        NORM_ROWS_PER_TG
     } else {
         1
     };
