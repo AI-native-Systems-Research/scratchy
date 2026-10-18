@@ -62,11 +62,29 @@ struct BitField<const HI: u32, const LO: u32>;
 impl<const HI: u32, const LO: u32> BitField<HI, LO> {
     const _ASSERT_RANGE: () = assert!(HI >= LO && HI < 64, "BitField: HI must be >= LO and < 64");
     const WIDTH: u32 = HI - LO + 1;
+    /// The field's width mask, UNshifted (bits WIDTH-1:0 of a VALUE) — the
+    /// operand for masking a field value before it is packed or after it is
+    /// unpacked. NEVER the clear operand against a word: a word's copy of
+    /// this field sits at bits HI:LO, so clearing it wants
+    /// [`Self::IN_POSITION_MASK`] (#655: `set_tag` cleared with `!MASK` and
+    /// wiped the wrong byte range).
     const MASK: u64 = if Self::WIDTH == 64 {
         u64::MAX
     } else {
         (1u64 << Self::WIDTH) - 1
     };
+
+    /// This field's width mask shifted into its word position — the mask
+    /// that selects exactly this field's bits WITHIN a 64-bit word. `MASK`
+    /// is the UNshifted width mask, so a clear written as `word & !MASK`
+    /// hits the wrong bit range whenever `LO != 0`: #655 shipped exactly
+    /// that in `set_tag`, where `!BitField::<31, 8>::MASK` (bits 23:0)
+    /// zeroed the CTRL cancel byte (bits 7:0) while KEEPING the tag field's
+    /// own top byte (bits 31:24) — the reverse of the intent on both sides.
+    /// Every mask-and-set field edit clears with `!IN_POSITION_MASK` and
+    /// sets with [`Self::pack`], so the unshifted-`MASK` clear has no
+    /// remaining spelling.
+    const IN_POSITION_MASK: u64 = Self::pack(Self::MASK);
 
     /// Mask `value` to this field's width and shift it into position — the
     /// only shift used anywhere in this file is `LO`, derived here, never a
@@ -828,13 +846,20 @@ impl ControlBlockWire {
     ///
     /// A mask-and-set, deliberately NOT an add: the canvas was rendered at
     /// arbitrary tags, so what is being replaced is a baked-in value, not a
-    /// zero. Everything else in word 0 — the barrier bit included — is kept.
+    /// zero. The clear is IN POSITION (#655): clearing with the unshifted
+    /// `BitField::MASK` (bits 23:0) did the reverse of the intent — it kept
+    /// the tag field's own top byte (bits 31:24), so a canvas rendered at a
+    /// high tag kept its stale top byte through every patch, and it zeroed
+    /// the CTRL cancel byte (bits 7:0) that [`Self::cancelled`] stamps, so a
+    /// tag-patched cancelled twin would read back un-cancelled. Everything
+    /// else in word 0 — the barrier bit and the cancel byte included — is
+    /// kept.
     pub fn set_tag(&mut self, tag: ResponseTag) {
-        let mask = BitField::<31, 8>::MASK;
+        let in_position = BitField::<31, 8>::IN_POSITION_MASK;
         let mut w = [0u8; 8];
         w.copy_from_slice(&self.bytes[CTRL_SECTION..CTRL_SECTION + 8]);
         let word = u64::from_le_bytes(w);
-        let word = (word & !mask) | BitField::<31, 8>::pack(tag.0 as u64);
+        let word = (word & !in_position) | BitField::<31, 8>::pack(tag.0 as u64);
         self.bytes[CTRL_SECTION..CTRL_SECTION + 8].copy_from_slice(&word.to_le_bytes());
     }
 
@@ -1665,7 +1690,7 @@ mod tests {
         assert_ne!(cmpt_word0 & (1 << 63), 0, "valid_ must be set");
         assert_eq!(cmpt_word0 & (1 << 62), 0, "sync_ must be clear");
         assert_eq!(
-            cmpt_word0 & BitField::<36, 7>::MASK,
+            cmpt_word0 & BitField::<36, 7>::IN_POSITION_MASK,
             0,
             "bootstrap must be null"
         );
@@ -1738,6 +1763,96 @@ mod tests {
         )
         .unwrap();
         assert!(!fill.ctrl_cancelled());
+    }
+
+    /// Regression test for #655: `set_tag`'s clear must be the tag field's
+    /// IN-POSITION mask (CTRL bits 31:8), not the unshifted width mask
+    /// (bits 23:0). The unshifted mask failed in BOTH directions at once —
+    /// it KEPT the tag field's own top byte (bits 31:24) and CLEARED the
+    /// CTRL cancel byte (bits 7:0, #611's `cancelled` stamp):
+    ///
+    /// - canvas-at-high-tag → small-tag patch: the stale top byte survived
+    ///   every patch, so the patched CB correlated to a tag the
+    ///   `ResponseWorker` never leased;
+    /// - tag-patching a cancelled CB silently un-cancelled it — the forward
+    ///   hazard #655 was filed over (PR3b's overrun-discard twin): a
+    ///   tag-patched cancelled twin would read back un-cancelled, and
+    ///   `process_crb` would route it as a normal compute CB instead of
+    ///   `Cancelled`.
+    ///
+    /// Literal bit patterns, not the `BitField` the setter uses — a reader
+    /// bug must not be able to mask a writer bug.
+    #[test]
+    fn set_tag_clears_in_position_keeping_ctrl_neighbors() {
+        let word0 = |cb: &ControlBlockWire| {
+            u64::from_le_bytes(
+                cb.to_bytes()[CTRL_SECTION..CTRL_SECTION + 8]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+
+        // Direction 1 — the tag field's own top byte must CLEAR: a CB
+        // patched to a tag with bits 31:24 set, then patched to a small
+        // tag, must read back as exactly the small tag.
+        let dmva = VirtualAddressSbf::new(2, Flits::from_bytes(0x1000));
+        let mut cb = ControlBlockWire::dma_immediate(
+            ResponseTag(0x11),
+            true,
+            DmaTransfer {
+                dmva,
+                host_addr: HostPhysicalAddress::from_raw_for_tests(0x7f00_0000),
+                size_bytes: TransferSize(256),
+            },
+            XlatWindow {
+                region_paddr: DevicePhysicalAddress(0x2_0000_0000),
+                length: SegmentExtent(0x1000 + 256),
+            },
+            true, // barrier — must survive the patch
+        )
+        .unwrap();
+        cb.set_tag(ResponseTag(0xAB_CDEF)); // top byte 0xAB into bits 31:24
+        assert_eq!(
+            (word0(&cb) >> 8) & 0xFF_FFFF,
+            0xAB_CDEF,
+            "the high tag must land in the field first"
+        );
+        cb.set_tag(ResponseTag(0x42));
+        assert_eq!(
+            (word0(&cb) >> 8) & 0xFF_FFFF,
+            0x42,
+            "the whole 24-bit tag field must be replaced, top byte included"
+        );
+        assert_eq!(
+            (word0(&cb) >> 24) & 0xFF,
+            0,
+            "no stale high tag byte may survive the patch"
+        );
+        assert_eq!(
+            (word0(&cb) >> 32) & 1,
+            1,
+            "barrier bit must survive the tag patch"
+        );
+        assert_eq!(cb.tag(), ResponseTag(0x42));
+
+        // Direction 2 — the CTRL cancel byte must SURVIVE a tag patch: a
+        // tag-patched cancelled CB must still read cancelled.
+        let mut cancelled = ControlBlockWire::cancelled(ResponseTag(7));
+        cancelled.set_tag(ResponseTag(9));
+        assert_eq!(
+            (word0(&cancelled) >> 8) & 0xFF_FFFF,
+            9,
+            "the patch must land"
+        );
+        assert_eq!(
+            word0(&cancelled) & 0xFF,
+            1,
+            "#655: the tag patch must not eat the cancel byte"
+        );
+        assert!(
+            cancelled.ctrl_cancelled(),
+            "#655: a tag-patched cancelled CB must still read cancelled"
+        );
     }
 
     /// Regression test for CRITICAL FIX #1: the real functions these wire
