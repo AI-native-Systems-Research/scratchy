@@ -234,8 +234,21 @@ fn route(x: &Inputs, m: usize) -> (Vec<usize>, Vec<f64>) {
     (ids, w)
 }
 
+/// The down projection's activation-scale grain: the PAIR's own row (what the kernel
+/// computes), or one scale over all K activations (the control: a kernel that shared one
+/// down scale across the pairs must be told apart from one that does not).
+#[derive(Clone, Copy, PartialEq)]
+enum DownScale {
+    PerPair,
+    SharedOverK,
+}
+
 /// `out[m]`, the card's W8A8 numerics op by op.
 fn reference(x: &Inputs, ids_override: Option<&[usize]>) -> Vec<f64> {
+    reference_at(x, ids_override, DownScale::PerPair)
+}
+
+fn reference_at(x: &Inputs, ids_override: Option<&[usize]>, grain: DownScale) -> Vec<f64> {
     let mut out = vec![0.0; M * H];
     for m in 0..M {
         let (mut ids, w) = route(x, m);
@@ -258,11 +271,16 @@ fn reference(x: &Inputs, ids_override: Option<&[usize]>) -> Vec<f64> {
                 (0..I).map(|c| f16(gelu(gate[c]) * up[c])).collect()
             })
             .collect();
-        let amax = acts.iter().flatten().fold(0.0f64, |a, v| a.max(v.abs()));
-        let sa = fp8_scale(f16(amax));
-        let inv_a = f16(1.0 / sa);
+        let amax = |row: &[f64]| row.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+        let shared = acts.iter().map(|r| amax(r)).fold(0.0f64, f64::max);
         let mut acc = vec![0.0f64; H];
         for (j, &e) in ids.iter().enumerate() {
+            // The PAIR's own activation scale: one row of the `[K, I]` matrix.
+            let sa = fp8_scale(f16(match grain {
+                DownScale::PerPair => amax(&acts[j]),
+                DownScale::SharedOverK => shared,
+            }));
+            let inv_a = f16(1.0 / sa);
             let qa: Vec<f64> = acts[j]
                 .iter()
                 .map(|v| e4m3(f16(v * inv_a).clamp(-448.0, 448.0)))
@@ -376,6 +394,22 @@ fn the_executed_kernel_computes_the_cards_w8a8_moe() {
         control_err > 1e-1,
         "the shifted-expert model agrees with the kernel to {control_err:.3e}, so this \
          comparison cannot see which experts the kernel read"
+    );
+
+    // THE SCALE-GRAIN CONTROL: the same routing with ONE down scale over all K activations
+    // must differ from what ran by more than the comparison's own bar, or the per-pair
+    // claim above is untested — a kernel at either grain would pass it.
+    let shared = reference_at(&x, None, DownScale::SharedOverK);
+    let grain_err = got
+        .iter()
+        .zip(&shared)
+        .map(|(g, c)| (g - c).abs() / scale)
+        .fold(0.0f64, f64::max);
+    println!("moe  shared-down-scale control err {grain_err:.3e}");
+    assert!(
+        grain_err > worst * 4.0 && grain_err > 2e-3,
+        "the shared-down-scale model agrees with the kernel to {grain_err:.3e} (the per-pair \
+         reference to {worst:.3e}), so this comparison cannot tell the down scale's grain"
     );
 }
 
