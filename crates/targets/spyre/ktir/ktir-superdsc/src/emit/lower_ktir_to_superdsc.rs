@@ -6058,11 +6058,17 @@ mod elementwise_tests {
 
     /// ⭐ THE CONTROL: chunk 0 — corner 0 on every operand — still takes the SEEDED emission,
     /// byte-identical to every whole-tensor program this crate has ever baked. The offset is the
-    /// only thing the chunked arm adds, so a corner-free program must not change form. The
-    /// discriminator is the allocate nodes' `layoutDimOrder_`: the seeded path's `rows > 1` op
-    /// takes the rank-2 stick-major form (no `y`), while the offset path's column corner is not
-    /// block-aligned so it presents rank-3 flat (`y` present) — `pointwise_broadcast_opspec_
-    /// from_tile`'s own `stickmajor` predicate decides, and the two arms land on opposite sides.
+    /// only thing the chunked arm adds, so a corner-free program must not change form: the seeded
+    /// path's `rows > 1` op takes the rank-2 stick-major form (no `y` in any allocate's
+    /// `layoutDimOrder_`).
+    ///
+    /// ⭐ AND SINCE #622 THE CHUNKED PIECE IS RANK-2 TOO. Its corner (column 8192 of 15360) is not a
+    /// whole-BLOCK shift, which used to present it rank-3 flat (`y` present) and leave the
+    /// work-division law out of reach. It is a whole-STICK column window of a same-rows stick-major
+    /// tensor — a stick-major tensor of its own (`tests/zz_a_whole_stick_column_window_is_stick_major.rs`)
+    /// — and `elementwise` states it as a `ColWindow`, so it is presented rank-2 as well. What still
+    /// tells the two pieces apart is the corner every binding carries, pinned by
+    /// `a_column_blocked_chunk_reads_its_inputs_at_the_same_corner`.
     #[test]
     fn a_chunk_at_corner_zero_keeps_the_seeded_emission() {
         let orders = |ops: &Vec<EmittedOp>| -> Vec<Vec<&'static str>> {
@@ -6087,18 +6093,23 @@ mod elementwise_tests {
                 "a corner-free chunk keeps the seeded rank-2 stick-major form (got {o:?})"
             );
         }
-        // And the chunked op — the SAME regions at corner 8192 — takes the offset form.
+        // And the chunked op — the SAME regions at corner 8192 — is a whole-stick column window, so it
+        // is presented rank-2 stick-major too (#622), at its own corner.
         let (r1, ..) = mlp_chunks();
         let mut sym1 = 0i64;
         let ops1 = elementwise("mul_s23", Elementwise::Mul, &r1, &[], &mut sym1, None)
             .expect("chunk 1 lowers");
         for o in orders(&ops1) {
-            assert!(
-                o.contains(&"y"),
-                "the offset form presents rank-3 flat — a column corner is not block-aligned, so \
-                 the stickmajor predicate keeps it flat (got {o:?})"
+            assert_eq!(
+                o,
+                vec!["mb", "out"],
+                "a whole-stick column window presents rank-2 stick-major (got {o:?})"
             );
         }
+        assert!(
+            ops1[0].arg_bindings.iter().all(|b| b.offset_elems != 0),
+            "every binding of the chunked piece sits at its window's corner"
+        );
     }
 }
 
