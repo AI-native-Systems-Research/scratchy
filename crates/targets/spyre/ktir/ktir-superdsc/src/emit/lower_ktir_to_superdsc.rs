@@ -6744,15 +6744,26 @@ pub fn gated_act(
     let gate_off = pointwise_chunk_out_offset(gate_r.c_start);
     let up_off = pointwise_chunk_out_offset(up_r.c_start);
     let out_off = pointwise_chunk_out_offset(o.c_start);
-    let full_cols = o.c_start + o.c_len;
-    // `silumul`'s corners, verbatim: each is a [`crate::addr::ColWindow`], so the door presents every
-    // column piece stick-major (#622).
-    let window = |c: u32| {
-        crate::addr::col_window_of(rows, full_cols, c, Df::Fp16).map_err(|e| Error {
+    // ⭐ EACH CORNER AGAINST THE STORAGE ITS OWN REGION WINDOWS — `silumul`'s law ("a column
+    // corner must be taken against the storage that actually holds it"), stated PER OPERAND.
+    // The per-`Program` door's `gatedact.py` descriptors are whole `[M, N]` — no column
+    // window — so its regions arrive at `c_start` 0 and the old single `o.c_start + o.c_len`
+    // already equalled each operand's own end; the whole-function walk does NOT — its gate/up
+    // are windows of the fused W8A8 projections' `[1, K·I]` minted outputs (corner `pair·I`)
+    // while the product is a fresh `[1, I]` mint at corner 0, and sizing gate's nest by the
+    // product's end put corner 64 outside a 64-wide nest (the addr guard). The corner OFFSET
+    // itself is storage-width-independent (`col_of`'s plane math), so only the guard's nest
+    // moves.
+    let window = |reg: Region, c: u32| {
+        crate::addr::col_window_of(rows, reg.c_start + reg.c_len, c, Df::Fp16).map_err(|e| Error {
             message: format!("GatedAct {name}: {e}"),
         })
     };
-    let (gate_w, up_w, out_w) = (window(gate_off)?, window(up_off)?, window(out_off)?);
+    let (gate_w, up_w, out_w) = (
+        window(gate_r, gate_off)?,
+        window(up_r, up_off)?,
+        window(o, out_off)?,
+    );
     let gate = rb(&gate, rows, cols);
     let up = rb(&up, rows, cols);
     let tmp = rb(&tmp, rows, cols);
@@ -6765,7 +6776,14 @@ pub fn gated_act(
             crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
             &[In::col_window(&gate, gate_w).ew()],
             &tmp,
-            gate_w,
+            // `silumul`'s write corner, verbatim: `tmp` is written at the OUTPUT window's
+            // corner (where the multiply below reads it back), not the gate's read corner —
+            // equal on the per-`Program` door (its `gatedact.py` descriptors are whole
+            // `[M, N]`, so every corner is 0), DIFFERENT on the whole-function walk (the gate
+            // is a window of the W8A8 projection's output; `tmp` is this chain's own mint at
+            // corner 0, and writing it at the gate's corner ran off its footprint). The same
+            // nest law `silu_mul_at`'s own comment states.
+            out_w,
             sym_id_base,
             layout,
         ),
