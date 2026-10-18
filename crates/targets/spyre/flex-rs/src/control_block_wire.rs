@@ -1068,6 +1068,85 @@ impl ControlBlockWire {
         ))
     }
 
+    /// Port of `ControlBlockStream::CreateNullCb`
+    /// (`flex/src/control_blocks/control_block_stream.cpp:375-388`, declared
+    /// at `control_block_stream.hpp:252-257`, pod C++ @65ad807bb): a control
+    /// block that carries no work, only ordering. The real creator allocates
+    /// a fresh CB template — a default-constructed `ControlBlockSBF`, whose
+    /// constructor leaves both DMA sections `SKIP` and the CMPT section
+    /// invalid — and, when `pipeline_barrier` is set, sets the CTRL barrier
+    /// bit and nothing else. No DMA in either slot, no compute, no XLAT
+    /// entries: below the CTRL word the bytes are exactly the SBF defaults.
+    ///
+    /// The vendor's sole construction site is
+    /// `RuntimeScheduler::buildNullControlBlocks`
+    /// (`runtime_scheduler.cpp:1267-1276`): a single-CB stream over an EMPTY
+    /// segment table (so `CreateCbTemplate`'s per-segment XLAT loop installs
+    /// nothing), `Finalize()`d like any stream. That makes the null CB the
+    /// stream's first CB, so the vendor's first-CB EDEP stamp lands on it at
+    /// submission time — in this crate that stamp belongs to the submission
+    /// choke (#608, PR #656), not to any constructor: `null` stays EDEP0 at
+    /// build time like every other constructor here.
+    ///
+    /// VERIFIED CONTRACT (pod C++, issue #607):
+    ///
+    /// - **The barrier bit is the payload.** `pipeline_barrier` is
+    ///   `CtrlSectionSBF::SetBarrier` (bit 32), which the vendor header's
+    ///   own parameter doc describes as the device-wide pipeline barrier.
+    ///   `CreateNullCb` is one of only three `SetBarrier` sites in the
+    ///   vendor's `control_block_stream.cpp` — alongside
+    ///   `CreateComputeDataTransfer`'s own `pipeline_barrier` parameter
+    ///   (this crate's `dma_immediate`) and the `FLEX_FORCE_CB_BARRIER`
+    ///   debug loop in `Optimize` — and the only one that can set the bit
+    ///   on a CB carrying no other work: the vendor's cheapest device-side
+    ///   fence.
+    ///
+    /// - **It consumes a ring slot and retires like any submitted CB.**
+    ///   `PfRuntimeScheduler::submitNullOp` (`pf_runtime_scheduler.cpp:509-520`)
+    ///   submits the single-CB stream through the same `submitToHardware`
+    ///   COMPUTE-pipeline path as a compute CB, the caller's completion
+    ///   callback attached; the scheduler's null-op `schedule`
+    ///   (`runtime_scheduler.cpp:1025-1058`) wraps that callback in the
+    ///   per-op compute fence, so the fence resolves exactly when the null
+    ///   CB's own completion fires — the one-completion-signal property
+    ///   #603's one-RB-per-step shape is after.
+    ///
+    /// - **The host-side half of the barrier already exists here.** Before
+    ///   submitting a barrier-bearing null op, the vendor's `schedule` calls
+    ///   `issueBarrier(Compute, stream)` (`runtime_scheduler.cpp:433-530`),
+    ///   waiting out every OTHER pipeline's outstanding per-op fences for
+    ///   the stream. The vendor routes null ops over `PipelineId::COMPUTE`,
+    ///   so the equivalent submission in this crate is the existing
+    ///   `launch_compute_wires` door (`RuntimeOperationKind::Compute`) with
+    ///   the operation's `pipeline_barrier` flag set — the same
+    ///   `maybe_set_barrier`/`issue_barrier` machinery every barrier-bearing
+    ///   op already crosses.
+    ///
+    /// - **Not settled by any readable source:** the null CB's barrier
+    ///   interaction with the ring (issue #607's own open question) is a
+    ///   card measurement, not a source fact — it lands in #603 PR2's
+    ///   cell, with a real consumer driving it.
+    ///
+    /// Nothing in tree calls this yet. Like `cancelled` (#611) this is a
+    /// prerequisite port: #603 PR2's decode-rung player wants exactly one
+    /// completion signal per step, and a trailing null CB with barrier=1 is
+    /// the candidate end-of-step marker — cheaper than attaching the fence
+    /// to the last real CB, and it keeps the step's real CBs bit-identical
+    /// to today's.
+    // The real creator takes a debug label and defaults `pipeline_barrier`
+    // to false; `tag` is this crate's lease parameter, as with every other
+    // constructor here.
+    pub fn null(tag: ResponseTag, pipeline_barrier: bool) -> Self {
+        Self::assemble(
+            CtrlSection::new(tag, pipeline_barrier),
+            R5Section::none(),
+            DmaSection::skip(),
+            DmaSection::skip(),
+            ComputeSection::skip(),
+            [XlatEntry::invalid(); 8],
+        )
+    }
+
     /// Port of `ControlBlockStream::CreateCancelledCb`
     /// (`flex/src/control_blocks/control_block_stream.cpp:390-398`, pod C++
     /// @ed96487): a zero-work compute CB whose CTRL word carries the cancel
@@ -1155,6 +1234,20 @@ impl ControlBlockWire {
         let mut word = [0u8; 8];
         word.copy_from_slice(&self.bytes[CTRL_SECTION..CTRL_SECTION + 8]);
         BitField::<34, 33>::unpack(u64::from_le_bytes(word))
+    }
+
+    /// This CB's own `CtrlSectionSBF::GetBarrier` (bit 32 of the CTRL word)
+    /// — the device-wide pipeline barrier flag, and the only work a
+    /// [`ControlBlockWire::null`] CB carries. Set by that constructor (the
+    /// `CreateNullCb` port, one of the vendor's three `SetBarrier` sites)
+    /// and by [`ControlBlockWire::dma_immediate`] when its
+    /// `pipeline_barrier` parameter is true (the `CreateComputeDataTransfer`
+    /// port, the vendor's other `SetBarrier` site on a real CB); clear on
+    /// every other constructor.
+    pub fn ctrl_barrier(&self) -> bool {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&self.bytes[CTRL_SECTION..CTRL_SECTION + 8]);
+        BitField::<32, 32>::unpack(u64::from_le_bytes(word)) != 0
     }
 }
 
@@ -2011,6 +2104,183 @@ mod tests {
             cancelled.ctrl_cancelled(),
             "#655: a tag-patched cancelled CB must still read cancelled"
         );
+    }
+
+    /// The wire facts of a `CreateNullCb` port (`control_block_stream.cpp:375-388`):
+    /// the CTRL word carries the tag and NOTHING else — no cancel byte, no
+    /// barrier, no EDEP, no timers — and every section below it is exactly the
+    /// `ControlBlockSBF` constructor default: R5 zero, both DMA slots SKIP with
+    /// zero payloads, CMPT invalid (all-zero — the creator never touches it),
+    /// every XLAT entry invalid (the vendor's sole construction site builds the
+    /// stream over an empty segment table). A CB that is "no work, only
+    /// ordering" must be indistinguishable from a freshly default-constructed
+    /// one below the CTRL word, or it would be carrying work after all.
+    #[test]
+    fn null_cb_carries_no_work_only_the_ctrl_word() {
+        let cb = ControlBlockWire::null(ResponseTag(0x0BAD), false);
+        let bytes = cb.to_bytes();
+
+        // CTRL word: tag at bits 31:8 and nothing else.
+        let ctrl = u64::from_le_bytes(bytes[CTRL_SECTION..CTRL_SECTION + 8].try_into().unwrap());
+        assert_eq!(
+            ctrl,
+            0x0BADu64 << 8,
+            "CTRL must be the tag and nothing else"
+        );
+        assert_eq!(cb.tag(), ResponseTag(0x0BAD));
+        assert!(!cb.ctrl_cancelled());
+        assert!(!cb.ctrl_barrier());
+
+        // R5: zero.
+        assert_eq!(
+            u64::from_le_bytes(bytes[R5_SECTION..R5_SECTION + 8].try_into().unwrap()),
+            R5Section::none().to_word()
+        );
+
+        // Both DMA slots: SKIP with zero payloads — the SBF constructor default.
+        for section in [DMI_SECTION, DMO_SECTION] {
+            assert_eq!(
+                u64::from_le_bytes(bytes[section..section + 8].try_into().unwrap()),
+                0,
+                "DMA word0 must be zero"
+            );
+            assert_eq!(
+                u64::from_le_bytes(bytes[section + 8..section + 16].try_into().unwrap()),
+                DmaType::Skip.bits(),
+                "DMA word1 must be exactly the SKIP cbtype"
+            );
+        }
+
+        // CMPT: invalid — all-zero. This is what separates the null CB from
+        // the cancelled marker (#611), whose CMPT is a VALID compute section.
+        for i in 0..2 {
+            assert_eq!(
+                u64::from_le_bytes(
+                    bytes[CMPT_SECTION + i * 8..CMPT_SECTION + i * 8 + 8]
+                        .try_into()
+                        .unwrap()
+                ),
+                0,
+                "CMPT must be all-zero (invalid)"
+            );
+        }
+
+        // Every XLAT entry invalid.
+        for i in 0..8 {
+            assert_eq!(
+                u64::from_le_bytes(
+                    bytes[XLAT_SECTION + i * 8..XLAT_SECTION + i * 8 + 8]
+                        .try_into()
+                        .unwrap()
+                ),
+                XlatEntry::invalid().word,
+                "xlat[{i}] must be invalid"
+            );
+        }
+    }
+
+    /// `pipeline_barrier` is the null CB's entire payload: setting it must move
+    /// EXACTLY CTRL bit 32 (`SetBarrier`) and nothing else in the 128 bytes —
+    /// the cheapest device-side fence is cheap precisely because the barrier
+    /// bit is the only thing it adds over an idle CB.
+    #[test]
+    fn null_cb_barrier_sets_exactly_ctrl_bit_32() {
+        let plain = ControlBlockWire::null(ResponseTag(0x11), false);
+        let fenced = ControlBlockWire::null(ResponseTag(0x11), true);
+        assert!(fenced.ctrl_barrier());
+        assert!(!plain.ctrl_barrier());
+
+        // Bit 32 of the CTRL word is byte 4, bit 0 (little-endian).
+        let mut diff = Vec::new();
+        for (i, (a, b)) in plain
+            .to_bytes()
+            .into_iter()
+            .zip(fenced.to_bytes())
+            .enumerate()
+        {
+            if a != b {
+                diff.push(i);
+            }
+        }
+        assert_eq!(diff, vec![CTRL_SECTION + 4], "only CTRL byte 4 may differ");
+        assert_eq!(
+            fenced.to_bytes()[CTRL_SECTION + 4],
+            0x01,
+            "the differing byte must be exactly bit 32 set"
+        );
+    }
+
+    /// The vendor's two zero-work markers are NOT interchangeable on the wire:
+    /// `CreateNullCb` leaves the CMPT section INVALID (it never touches the
+    /// template) and can carry the barrier bit, while `CreateCancelledCb`
+    /// builds a VALID-but-unsynced compute section and carries the cancel
+    /// byte. A future caller that swaps one for the other changes what the
+    /// device sees below the CTRL word, so the distinction is pinned here.
+    #[test]
+    fn null_and_cancelled_are_distinct_zero_work_markers() {
+        let null = ControlBlockWire::null(ResponseTag(5), true);
+        let cancelled = ControlBlockWire::cancelled(ResponseTag(5));
+
+        let cmpt_valid = |cb: &ControlBlockWire| {
+            (u64::from_le_bytes(
+                cb.to_bytes()[CMPT_SECTION..CMPT_SECTION + 8]
+                    .try_into()
+                    .unwrap(),
+            ) >> 63)
+                & 1
+        };
+        assert_eq!(cmpt_valid(&null), 0, "null CB's CMPT is invalid");
+        assert_eq!(cmpt_valid(&cancelled), 1, "cancelled CB's CMPT is valid");
+
+        assert!(null.ctrl_barrier(), "the fence is the null CB's payload");
+        assert!(!cancelled.ctrl_barrier());
+        assert!(!null.ctrl_cancelled());
+        assert!(cancelled.ctrl_cancelled());
+    }
+
+    /// `ctrl_barrier` reads the same bit the constructors pack: true only for
+    /// `null(tag, true)` and for `dma_immediate` with `pipeline_barrier = true`
+    /// (the vendor's `CreateComputeDataTransfer` — the other `SetBarrier` site
+    /// on a real CB); false for every other constructor, which never set it.
+    #[test]
+    fn ctrl_barrier_reads_the_bit_the_constructors_pack() {
+        let dmva = VirtualAddressSbf::new(2, Flits::from_bytes(0x1000));
+        let transfer = DmaTransfer {
+            dmva,
+            host_addr: HostPhysicalAddress::from_raw_for_tests(0x7f00_0000),
+            size_bytes: TransferSize(256),
+        };
+        let window = XlatWindow {
+            region_paddr: DevicePhysicalAddress(0x2_0000_0000),
+            length: SegmentExtent(0x1000 + 256),
+        };
+        let dma_fenced =
+            ControlBlockWire::dma_immediate(ResponseTag(1), true, transfer, window, true).unwrap();
+        let dma_plain =
+            ControlBlockWire::dma_immediate(ResponseTag(2), true, transfer, window, false).unwrap();
+        assert!(dma_fenced.ctrl_barrier());
+        assert!(!dma_plain.ctrl_barrier());
+
+        let bootstrap = VirtualAddressSbf::new(7, Flits::from_bytes(0));
+        let prog = (
+            DevicePhysicalAddress(0x1_0000_0000),
+            AllocationTotalSize(4096),
+        );
+        let compute = ControlBlockWire::compute(ResponseTag(3), &[], prog, bootstrap).unwrap();
+        assert!(!compute.ctrl_barrier());
+
+        let fill = ControlBlockWire::fill(
+            ResponseTag(4),
+            dmva,
+            TransferSize(4096),
+            0xDEAD_BEEF,
+            true,
+            DevicePhysicalAddress(0x3_0000_0000),
+            SegmentExtent(4096),
+        )
+        .unwrap();
+        assert!(!fill.ctrl_barrier());
+        assert!(!ControlBlockWire::cancelled(ResponseTag(6)).ctrl_barrier());
     }
 
     /// Regression test for CRITICAL FIX #1: the real functions these wire
