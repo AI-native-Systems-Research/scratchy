@@ -24,6 +24,10 @@
     { "model": "granite-3.1-2b", "dtype": "fp16", "metric": "ttft_ms", "conc": 1, "context": "~1k", "torch": 458.0, "scratchy": 636 },
     { "model": "granite-3.1-2b", "dtype": "fp16", "metric": "ttft_ms", "conc": 1, "context": "~10k", "torch": 8227.0, "scratchy": 8150 },
     { "model": "granite-3.1-8b", "dtype": "fp16", "metric": "ttft_ms", "conc": 1, "context": "~10k", "torch": 13035.0, "scratchy": 12803 },
+    { "model": "granite-3.1-2b", "dtype": "fp16", "metric": "tok_s", "conc": 8, "context": "~1k", "torch": 95.5, "scratchy": 60.76,
+      "note": "vllm bench serve (the torch side's own client and settings: in 1024, out 256, 16 requests, 2 warmups), scr serve --max-num-seqs 8 --max-model-len 8704, measured on nickm4 at this commit." },
+    { "model": "granite-3.1-8b", "dtype": "fp16", "metric": "tok_s", "conc": 8, "context": "~1k", "torch": 44.9, "scratchy": 24.10,
+      "note": "vllm bench serve (the torch side's own client and settings: in 1024, out 256, 16 requests, 2 warmups), scr serve --max-num-seqs 8 --max-model-len 8704, measured on nickm4 at this commit." },
     { "model": "granite-3.1-2b", "dtype": "fp8", "metric": "itl_ms", "conc": 1, "context": "~123", "torch": 258.0, "scratchy": 26.19 },
     { "model": "granite-3.1-8b", "dtype": "fp8", "metric": "itl_ms", "conc": 1, "context": "~123", "torch": 257.0, "scratchy": 72.61 },
     { "model": "granite-3.1-8b", "dtype": "fp8", "metric": "ttft_ms", "conc": 1, "context": "~123", "torch": 41700.0, "scratchy": 190,
@@ -42,9 +46,13 @@
     { "lever": "8b 10k decode", "work": "torch-spyre 1.10× ahead — the hd128 K/V gather kept in LX, projected −23 ms/step (≈156 ms)." },
     { "lever": "2b ~1k TTFT", "work": "torch-spyre 1.39× ahead — wide elementwise ops split by rows run at half rate; splitting their sticks is measured 2.05× faster on the op (PR in validation), and #622 extends it to column windows." },
     { "lever": "per-token overhead", "work": "~10% of 2b fp8 short-context ITL is host time between steps — compile-time CB replay with the next token chosen on the device (#603)." },
-    { "lever": "8b fp8 prefill", "work": "at 128 prompt rows fp8 is no faster than fp16 — the per-token activation quantize chain grows with rows and eats the halved weight stream; fusing the quantize into the matmul (the device's fused per-token quantize) is the lever." }
+    { "lever": "8b fp8 prefill", "work": "at 128 prompt rows fp8 is no faster than fp16 — the per-token activation quantize chain grows with rows and eats the halved weight stream; fusing the quantize into the matmul (the device's fused per-token quantize) is the lever." },
+    { "lever": "conc-8", "work": "torch-spyre 1.57× ahead at 2b, 1.86× at 8b — batched decode TPOT 117 ms (2b) against torch-spyre's 82; the stick-axis elementwise split now in validation covers the batched rungs, and compile-time CB replay (#603) removes the per-step host gap." }
   ],
   "notes": {
+    "conc": [
+      "The previous sweep's conc-8 cells (77.2 / 28.9 tok/s) have no recoverable harness record. The last fully recorded run, 2026-10-13, measured 2b at 52.0 tok/s, TPOT p50 147.7 ms; this sweep measures 60.8 tok/s, TPOT p50 117.4 ms."
+    ],
     "decode": [
       "Short-context parity is a shared floor: both stacks stream 16.4 GB of fp16 weights per token. Measured on the card (17 Oct), one fp16 matmul streams at most ~149 GB/s, and only across all 32 cores — the cost model's 204.8 GB/s peak is not reachable — so fp16 at one request bottoms out near 110 ms/token.",
       "This sweep's harness differs from 2026-10-17's (64–128 output tokens, 1051/10086-token prompts, prefix caching not stated): prefix caching is now disabled, prompts are server-recorded at 128/1061/10091 tokens, and every cell takes 128 output tokens with ignore_eos. Cross-sweep deltas no PR accounts for — 2b fp16 ITL 45.6 → 42.2 ms at ~123 — are the harness, not code; TTFT cells compare the same way, prompt lengths differing sweep to sweep."
