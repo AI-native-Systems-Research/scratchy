@@ -216,12 +216,56 @@ fn emitted_split(rows: u32, cols: u32, full_cols: u32, c_start: u32) -> (u64, u6
     )
 }
 
+/// [`emitted_split`] with every operand and the output at a [`ktir_superdsc::addr::ColWindow`] — the corner
+/// the column-chunk bodies (`silumul`, `gated_act`, `elementwise`, `scalarmul_scaled`) state since #622 —
+/// returning the `(mb, out)` split and the output's `layoutDimOrder_`.
+fn emitted_window_split(
+    rows: u32,
+    cols: u32,
+    full_cols: u32,
+    c_start: u32,
+) -> ((u64, u64), serde_json::Value) {
+    let a = rb("t_a", rows, cols);
+    let b = rb("t_b", rows, cols);
+    let o = rb("t_o", rows, cols);
+    let w = ktir_superdsc::addr::col_window_of(rows, full_cols, c_start, Df::Fp16)
+        .expect("a whole-stick corner");
+    let mut sid = 0i64;
+    let op = assemble_pointwise_broadcast_off(
+        "mul",
+        "multiply",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(cols),
+        &[In::col_window(&a, w).ew(), In::col_window(&b, w).ew()],
+        &o,
+        w,
+        &mut sid,
+        None,
+    );
+    let v = serde_json::to_value(op.op.as_ref().expect("a descriptor")).unwrap();
+    let s = &v["numWkSlicesPerDim_"];
+    let key = v["dscs_"][0]
+        .as_object()
+        .and_then(|m| m.keys().next().cloned())
+        .expect("a dsc");
+    (
+        (
+            s["mb"].as_u64().unwrap_or(1),
+            s["out"].as_u64().unwrap_or(1),
+        ),
+        v["dscs_"][0][&key]["primaryDsInfo_"]["OUTPUT"]["layoutDimOrder_"].clone(),
+    )
+}
+
 /// ⭐ THE WIRING, through the door every dense elementwise op is assembled at:
 ///   * a stick-major rank-2 op (granite-2b's mulsilu, `[256, 8192]` whole) emits out:32;
 ///   * a column window that is a WHOLE-BLOCK shift (columns `[8192, 16384)` of a 16384-wide tensor — its
 ///     corner is `rows·cols` elements in) is still stick-major, so it takes the law too;
 ///   * a column window that is NOT a whole-block shift — granite-3.1-8b's second MLP chunk, 4608 wide at
-///     column 8192 of 12800 — is presented rank-3 flat by the door, and stays rows-first;
+///     column 8192 of 12800 — stated as a bare offset is presented rank-3 flat by the door, and stays
+///     rows-first (the control: an offset is never taken for a window by its value), while stated as a
+///     `ColWindow` (#622) it is a stick-major tensor of its own and takes the law — see
+///     `a_whole_stick_column_window_takes_the_law`;
 ///   * a one-row op (decode) is untouched: rows-first and sticks-first agree there.
 #[test]
 fn the_pointwise_door_splits_a_stick_major_op_by_its_sticks() {
@@ -238,11 +282,49 @@ fn the_pointwise_door_splits_a_stick_major_op_by_its_sticks() {
     assert_eq!(
         emitted_split(256, 4608, 12800, 8192),
         (32, 1),
-        "a non-block column window is flat: rows first"
+        "a non-block column window stated as a bare offset is flat: rows first"
     );
     assert_eq!(
         emitted_split(1, 8192, 8192, 0),
         (1, 32),
+        "one row: unchanged"
+    );
+}
+
+/// ⭐⭐⭐ #622: A WHOLE-STICK COLUMN WINDOW TAKES THE LAW. granite-3.1-8b's second MLP piece, `[m, 4608]` at
+/// column 8192 of the 12800-wide intermediate, stated as a [`ktir_superdsc::addr::ColWindow`], is
+/// presented rank-2 stick-major (`layoutDimOrder_ [mb, out]`) and divided by the law: its 72 sticks give
+/// `out:8 × mb:4` at the prefill rungs and at a 4-request decode rung (the pinned 72-stick tie-break). Its
+/// first piece (column 0, a whole-block shift) is unchanged, and so is a one-row piece.
+#[test]
+fn a_whole_stick_column_window_takes_the_law() {
+    let rank2 = serde_json::json!(["mb", "out"]);
+    for rows in [256u32, 512] {
+        let (split, order) = emitted_window_split(rows, 4608, 12800, 8192);
+        assert_eq!(order, rank2, "[{rows}, 4608] @ 8192: presented stick-major");
+        assert_eq!(
+            split,
+            (4, 8),
+            "[{rows}, 4608] @ 8192: 72 sticks, out:8 × mb:4"
+        );
+        let (first, order0) = emitted_window_split(rows, 8192, 12800, 0);
+        assert_eq!(order0, rank2, "[{rows}, 8192] @ 0: stick-major as before");
+        assert_eq!(first, (1, 32), "[{rows}, 8192] @ 0: out:32 as before");
+    }
+    // A batched-decode rung: 4 rows cannot take more than a 4-way mb split, so the stick axis takes 8.
+    let (split, order) = emitted_window_split(4, 4608, 12800, 8192);
+    assert_eq!(order, rank2, "[4, 4608] @ 8192: presented stick-major");
+    assert_eq!(split, (4, 8), "[4, 4608] @ 8192: out:8 × mb:4");
+    // One row: `stickmajor` needs rows > 1, so a decode piece keeps its rank-3 form and its division.
+    let (one, order1) = emitted_window_split(1, 4608, 12800, 8192);
+    assert_eq!(
+        order1,
+        serde_json::json!(["mb", "out", "y"]),
+        "one row: rank-3 as before"
+    );
+    assert_eq!(
+        one,
+        emitted_split(1, 4608, 12800, 8192),
         "one row: unchanged"
     );
 }

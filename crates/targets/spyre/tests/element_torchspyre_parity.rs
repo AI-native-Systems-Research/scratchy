@@ -12,7 +12,7 @@
 //!  • maxDimSizes_ = -1 for EVERY non-indirect tensor (card reconstructs device_size from N_/layout/stick).
 
 use emit::In;
-use ktir_superdsc::addr::DevOff;
+use ktir_superdsc::addr::OutCorner;
 use ktir_superdsc::emit;
 use ktir_superdsc::work::EwDivision;
 use scratchy_subtile::sdsc_abstract::{
@@ -53,7 +53,7 @@ fn pw_31x2048(division: EwDivision) -> emit::EmittedOp {
             cols: BlockCols::of_feature_cols(cols),
             inputs: &inputs,
             o: &out,
-            out_offset: DevOff::ZERO,
+            out_offset: OutCorner::ZERO,
             division,
         },
         &mut sid,

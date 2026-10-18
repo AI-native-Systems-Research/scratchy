@@ -352,7 +352,7 @@ fn the_same_op_without_a_gather_declares_none() {
         superdsc::op_func_from_str("multiply"),
         &inputs,
         out.name(),
-        0,
+        ktir_superdsc::addr::OutCorner::ZERO,
         false,
         None,
         ktir_superdsc::work::EwDivision::Law,

@@ -374,6 +374,95 @@ pub fn col_of(rows: u32, cols: u32, c: u32, df: Df) -> DevOff {
         .dev()
 }
 
+/// ⭐ THE CORNER OF A WHOLE-STICK COLUMN WINDOW of a stick-major `[rows, full]` tensor — a [`DevOff`] that
+/// also carries what it is.
+///
+/// A window starting at a whole-stick column `c` is the parent's planes `c/64 ..`, each a whole `[rows, 64]`
+/// plane at the parent's plane stride `rows·64` — a stick-major tensor in its own right, which a `[rows, w]`
+/// view addressed stick-major from this corner reaches byte for byte (proven exhaustively against
+/// [`Nest`] in `tests/zz_a_whole_stick_column_window_is_stick_major.rs`). So an elementwise op whose
+/// operands are all whole-tensor or at a `ColWindow` corner of a same-rows tensor can be presented rank-2
+/// stick-major, and the work-division law reaches it (#622). The type is how the door knows: the only
+/// constructor is [`col_window_of`], which refuses a corner that is not a whole stick, so "is this offset a
+/// column corner" is never re-derived from an integer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ColWindow {
+    corner: DevOff,
+    rows: u32,
+}
+
+impl ColWindow {
+    /// The corner as a device offset — the same element [`col_of`] gives.
+    pub fn dev(self) -> DevOff {
+        self.corner
+    }
+
+    /// Whether a `[rows, ·]` view from this corner is the window's stick-major tensor: the parent's plane
+    /// stride is `parent_rows · lanes`, and a view of `rows` rows strides its planes by `rows · lanes`, so
+    /// the two agree only when the row counts do. The door asks this rather than assuming it.
+    pub fn is_stick_major_for(self, rows: u32) -> bool {
+        self.rows == rows
+    }
+}
+
+/// The [`ColWindow`] at column `c` of a stick-major `[rows, full]` tensor. `Err` when `c` is not a whole
+/// stick: a sub-stick corner sits mid-plane, so a `[rows, w]` view from it straddles two of the parent's
+/// planes, and no stick-major presentation reaches its bytes.
+pub fn col_window_of(rows: u32, full: u32, c: u32, df: Df) -> Result<ColWindow, String> {
+    let lanes = df.elems_per_stick();
+    if !c.is_multiple_of(lanes) {
+        return Err(format!(
+            "column window at {c} of a [{rows}, {full}] tensor is not a whole {lanes}-lane stick — a \
+             sub-stick corner sits mid-plane, so the window is not a stick-major tensor of its own"
+        ));
+    }
+    Ok(ColWindow {
+        corner: col_of(rows, full, c, df),
+        rows,
+    })
+}
+
+/// Where an elementwise op WRITES its output — the output twin of an input's `In::sliced` /
+/// `In::col_window`. Either a plain [`DevOff`] (a whole-tensor corner, a per-head block, a RoPE half) or a
+/// [`ColWindow`] (a whole-stick column window of a same-rows stick-major tensor). Built only from those two,
+/// so whether the door may present the op stick-major is carried by type, not by testing the offset.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OutCorner {
+    At(DevOff),
+    Window(ColWindow),
+}
+
+impl OutCorner {
+    /// The whole-tensor corner.
+    pub const ZERO: OutCorner = OutCorner::At(DevOff::ZERO);
+
+    /// The device element offset — the same number either way.
+    pub fn elems(self) -> u32 {
+        match self {
+            OutCorner::At(d) => d.into_raw_elems(),
+            OutCorner::Window(w) => w.dev().into_raw_elems(),
+        }
+    }
+
+    /// Whether this corner is a [`ColWindow`] whose `[rows, ·]` view is stick-major
+    /// ([`ColWindow::is_stick_major_for`]).
+    pub fn is_stick_major_window_for(self, rows: u32) -> bool {
+        matches!(self, OutCorner::Window(w) if w.is_stick_major_for(rows))
+    }
+}
+
+impl From<DevOff> for OutCorner {
+    fn from(d: DevOff) -> OutCorner {
+        OutCorner::At(d)
+    }
+}
+
+impl From<ColWindow> for OutCorner {
+    fn from(w: ColWindow) -> OutCorner {
+        OutCorner::Window(w)
+    }
+}
+
 /// Row+column corner of a rank-2 `[row, feat]` tensor.
 pub fn rc_of(rows: u32, cols: u32, r: u32, c: u32, df: Df) -> DevOff {
     Nest::new(&["row", "feat"], &[rows, cols], df)

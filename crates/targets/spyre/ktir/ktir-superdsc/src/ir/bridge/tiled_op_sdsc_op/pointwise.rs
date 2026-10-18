@@ -3,6 +3,7 @@
 //! and broadcast pointwise ops. See `super`'s module doc for why this is its own small file rather
 //! than folded into a bigger one.
 
+use crate::addr::OutCorner;
 use crate::emit::{EmittedOp, EwOperand, op_func_from_str};
 use crate::ir::island::tile_op::TileOp;
 use crate::placement::BundleLayout;
@@ -489,21 +490,30 @@ pub fn pointwise_broadcast_opspec_from_tile(
     op: OpFunc,
     inputs: &[EwOperand<'_>],
     o_name: &str,
-    out_offset: u32,
+    out_offset: OutCorner,
     head_major: bool,
     layout: Option<&BundleLayout>,
     division: EwDivision,
 ) -> Result<OpSpec, String> {
+    let (out_window, out_offset) = (
+        out_offset.is_stick_major_window_for(rows),
+        out_offset.elems(),
+    );
     let df = tile_op.df;
     let block = (rows as u64) * (cols as u64);
     let block_aligned = |off: u32| block != 0 && (off as u64).is_multiple_of(block);
+    // ⭐ A WHOLE-STICK COLUMN WINDOW IS A STICK-MAJOR CORNER TOO (#622) — admitted by its TYPE
+    // ([`crate::addr::ColWindow`], carried as `EwOperand::col_window` / `out_window`), never by testing the
+    // integer: the window's planes are whole `[rows, 64]` planes of the parent at the parent's plane stride,
+    // so the `[rows, cols]` stick-major view from its corner reaches the parent's bytes
+    // (`tests/zz_a_whole_stick_column_window_is_stick_major.rs`).
     let stickmajor = !head_major
         && rows > 1
         && cols > Fp16::ELEMS_PER_STICK
-        && block_aligned(out_offset)
-        && inputs
-            .iter()
-            .all(|i| i.out_broadcast() || block_aligned(i.col_offset()));
+        && (out_window || block_aligned(out_offset))
+        && inputs.iter().all(|i| {
+            i.out_broadcast() || i.is_stick_major_window_for(rows) || block_aligned(i.col_offset())
+        });
     // ⭐ THE DIVISION FOLLOWS THE LAYOUT JUST DECIDED — the same `stickmajor`, so the operands' rank and the
     // cores' cut are one decision. See `EwDivision`.
     let core_local = layout.is_some_and(|l| {
@@ -647,10 +657,11 @@ pub fn assemble_pointwise_broadcast_off_from_tile<O: KindTag>(
     cols: u32,
     inputs: &[EwOperand<'_>],
     o: &Stk<O>,
-    out_offset: u32,
+    out_offset: impl Into<OutCorner>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
+    let out_offset = out_offset.into();
     let o_name = o.name();
     let head_major = O::kind() == StickKind::Flat;
     // ⛔ ONE SHARED LIST, NOT A SECOND COPY. This was a verbatim duplicate of the `const` in

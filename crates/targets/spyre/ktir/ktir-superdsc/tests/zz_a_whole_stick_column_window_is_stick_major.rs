@@ -13,37 +13,57 @@
 //! emitter does not compute: [`Nest`] (the ported dxp `SpyreTensorLayout` law, `addr::Nest::new`) for the
 //! parent, and the `StickLayout` the emitter's own `per_core_addr` reads a `[rows, w]` view through.
 
-use ktir_superdsc::addr::{Feat, Idx, Nest, Row, col_of};
+use ktir_superdsc::addr::{Feat, Idx, Nest, Row, col_of, col_window_of};
 use ktir_superdsc::sdsc_abstract::{StickKind, StickLayout};
 use ktir_superdsc::superdsc_opspec::Df;
 
 const STICK: u32 = 64;
 
-/// The element offset of `(r, c)` in a stick-major `[rows, cols]` tensor, read off the dxp law.
-fn parent_off(rows: u32, full: u32, r: u32, c: u32) -> i64 {
-    let nest = Nest::new(&["row", "feat"], &[rows, full], Df::Fp16);
-    let v = nest.view().at(Idx::<Row>::n(r)).at(Idx::<Feat>::n(c));
-    v.off()
+/// The element offset of `(r, c)` in the stick-major tensor `nest` declares, read off the dxp law.
+fn parent_off(nest: &Nest, r: u32, c: u32) -> i64 {
+    nest.view().at(Idx::<Row>::n(r)).at(Idx::<Feat>::n(c)).off()
 }
 
-/// ⭐⭐⭐ THE IDENTITY. For every row count a column-chunked elementwise op takes, every 64-multiple parent
-/// width to 32768, every whole-stick corner and every whole-stick window width that fits: the window's
-/// `[rows, w]` stick-major view, based at the window's corner (`col_of`, the address the door already
-/// emits), reaches the parent's `(r, c + j)` for every `(r, j)` of the window.
+/// ⭐⭐⭐ THE IDENTITY: the window's `[rows, w]` stick-major view, based at the window's corner (`col_of`, the
+/// address the door already emits), reaches the parent's `(r, c + j)`.
 ///
-/// Checked at every plane boundary and both ends of each row rather than every lane — inside one plane the
-/// offset is `+ j % 64` on both sides by construction of the law, so the plane corners and the last lane are
-/// where the two could disagree.
+/// THE GRID (≈ 0.5 M windows × 12 address checks ≈ 6 M; a floor of 400 k windows is asserted):
+///   * rows: every count 2..=64 (prefill tails, batched-decode rungs) and 71, 128, 256, 512 — 67 values;
+///   * parent width: every whole-stick width to 64 sticks (4096), and 128, 200, 240, 336, 512 sticks —
+///     granite-2b 8192, granite-8b 12800, gemma-4-12b 15360, gemma-4-31b 21504, granite-4.1-30b 32768;
+///   * corner: EVERY whole stick of a parent to 64 sticks, from stick 0; on a wider parent the first two,
+///     the last, the middle, and every tiler block boundary (multiples of 128 sticks = 8192 columns) ± 1;
+///   * width at each corner: one stick, two, half the rest, and the rest — so a window ending at the
+///     parent's last column and a one-stick window at the parent's last stick are always in the set.
+///
+/// Each window is checked at its first, middle and last plane, at the first and last lane of the first and
+/// last row. Inside one plane both sides are `+ r·64 + j % 64` by the law's own construction, so the plane
+/// corners are where the two could disagree; every lane of the shipped window is checked by
+/// `the_granite_8b_remainder_piece_is_its_parents_bytes`. The parent [`Nest`] is built once per
+/// `(rows, width)` and reused for every corner and width.
 #[test]
 fn every_whole_stick_window_addresses_its_parent_stick_major() {
     let rows_set: Vec<u32> = (2u32..=64).chain([71, 128, 256, 512]).collect();
+    let fulls: Vec<u32> = (2u32..=64).chain([128, 200, 240, 336, 512]).collect();
+    let corners_of = |full_sticks: u32| -> Vec<u32> {
+        if full_sticks <= 64 {
+            return (0..full_sticks).collect();
+        }
+        let mut cs = vec![0, 1, full_sticks / 2, full_sticks - 1];
+        for b in (128..full_sticks).step_by(128) {
+            cs.extend([b - 1, b, b + 1]);
+        }
+        cs.retain(|&c| c < full_sticks);
+        cs.sort_unstable();
+        cs.dedup();
+        cs
+    };
     let mut cases = 0u64;
     for &rows in &rows_set {
-        for full_sticks in 2u32..=512 {
+        for &full_sticks in &fulls {
             let full = full_sticks * STICK;
-            // Corners and widths are sampled on a stride that still hits every remainder class of the
-            // shipped widths (8192-block pieces of 12800, 15360, 21504) — the corners the front end makes.
-            for c_stick in (1..full_sticks).step_by(if full_sticks > 64 { 7 } else { 1 }) {
+            let nest = Nest::new(&["row", "feat"], &[rows, full], Df::Fp16);
+            for c_stick in corners_of(full_sticks) {
                 let c = c_stick * STICK;
                 let base = col_of(rows, full, c, Df::Fp16).into_raw_elems() as i64;
                 // The window's corner is a whole number of the parent's planes.
@@ -52,24 +72,28 @@ fn every_whole_stick_window_addresses_its_parent_stick_major() {
                     i64::from(c_stick) * i64::from(rows) * i64::from(STICK),
                     "[{rows}, {full}] corner {c}: base {base}"
                 );
-                for w_stick in
-                    (1..=full_sticks - c_stick).step_by(if full_sticks > 64 { 5 } else { 1 })
-                {
+                let rest = full_sticks - c_stick;
+                let mut widths = vec![1, rest, rest.div_ceil(2)];
+                if rest >= 2 {
+                    widths.push(2);
+                }
+                widths.sort_unstable();
+                widths.dedup();
+                for w_stick in widths {
                     let w = w_stick * STICK;
                     let view = StickLayout::row_blocked(rows as usize, w as usize);
                     assert_eq!(view.kind, StickKind::RowBlocked, "[{rows}, {w}] view kind");
-                    for r in [0, rows / 2, rows - 1] {
-                        for j in (0..w_stick)
-                            .flat_map(|p| [p * STICK, p * STICK + STICK - 1])
-                            .filter(|&j| j < w)
-                        {
-                            let window = base + view.dev_off(r as usize, j as usize) as i64;
-                            let parent = parent_off(rows, full, r, c + j);
-                            assert_eq!(
-                                window, parent,
-                                "[{rows}, {full}] window c={c} w={w}: (r={r}, j={j}) window {window} \
-                                 parent {parent}"
-                            );
+                    for p in [0, w_stick / 2, w_stick - 1] {
+                        for r in [0, rows - 1] {
+                            for j in [p * STICK, p * STICK + STICK - 1] {
+                                let window = base + view.dev_off(r as usize, j as usize) as i64;
+                                let parent = parent_off(&nest, r, c + j);
+                                assert_eq!(
+                                    window, parent,
+                                    "[{rows}, {full}] window c={c} w={w}: (r={r}, j={j}) window \
+                                     {window} parent {parent}"
+                                );
+                            }
                         }
                     }
                     cases += 1;
@@ -77,7 +101,7 @@ fn every_whole_stick_window_addresses_its_parent_stick_major() {
             }
         }
     }
-    assert!(cases > 100_000, "the grid shrank to {cases} windows");
+    assert!(cases > 400_000, "the grid shrank to {cases} windows");
 }
 
 /// ⛔ THE SHIPPED WINDOW, every lane: granite-3.1-8b's second MLP piece, `[m, 4608]` at column 8192 of the
@@ -87,17 +111,42 @@ fn every_whole_stick_window_addresses_its_parent_stick_major() {
 fn the_granite_8b_remainder_piece_is_its_parents_bytes() {
     let (full, c, w) = (12800u32, 8192u32, 4608u32);
     for rows in [4u32, 256, 512] {
+        let nest = Nest::new(&["row", "feat"], &[rows, full], Df::Fp16);
         let base = col_of(rows, full, c, Df::Fp16).into_raw_elems() as i64;
         let view = StickLayout::row_blocked(rows as usize, w as usize);
         for r in 0..rows {
             for j in 0..w {
                 assert_eq!(
                     base + view.dev_off(r as usize, j as usize) as i64,
-                    parent_off(rows, full, r, c + j),
+                    parent_off(&nest, r, c + j),
                     "rows {rows}: (r={r}, j={j})"
                 );
             }
         }
+    }
+}
+
+/// ⭐ THE TYPE'S DOOR: [`col_window_of`] mints a window at a whole-stick corner — at the same element
+/// [`col_of`] gives — and refuses a sub-stick one, so a [`ktir_superdsc::addr::ColWindow`] is a whole-stick
+/// window by construction.
+#[test]
+fn a_col_window_is_minted_only_at_a_whole_stick() {
+    let (rows, full) = (512u32, 12800u32);
+    let w = col_window_of(rows, full, 8192, Df::Fp16).expect("a whole-stick corner");
+    assert_eq!(w.dev(), col_of(rows, full, 8192, Df::Fp16));
+    assert!(
+        w.is_stick_major_for(rows),
+        "same rows: the window's planes are the view's"
+    );
+    assert!(
+        !w.is_stick_major_for(rows / 2),
+        "a view with other rows strides its planes differently from the parent"
+    );
+    for c in [1, 32, 8191, 8193] {
+        assert!(
+            col_window_of(rows, full, c, Df::Fp16).is_err(),
+            "corner {c} is not a whole stick and must be refused"
+        );
     }
 }
 
@@ -107,14 +156,15 @@ fn the_granite_8b_remainder_piece_is_its_parents_bytes() {
 #[test]
 fn a_sub_stick_corner_is_not_a_window_of_whole_planes() {
     let (rows, full) = (256u32, 12800u32);
+    let nest = Nest::new(&["row", "feat"], &[rows, full], Df::Fp16);
     let view = StickLayout::row_blocked(rows as usize, 128);
     // c = 32: the window's lane 32 is the parent's column 64, the first lane of the NEXT plane.
     let c = 32u32;
-    let base = parent_off(rows, full, 0, c);
+    let base = parent_off(&nest, 0, c);
     let window = base + view.dev_off(0, 32) as i64;
     assert_ne!(
         window,
-        parent_off(rows, full, 0, c + 32),
+        parent_off(&nest, 0, c + 32),
         "a sub-stick corner addresses within one plane where the parent has crossed to the next"
     );
 }

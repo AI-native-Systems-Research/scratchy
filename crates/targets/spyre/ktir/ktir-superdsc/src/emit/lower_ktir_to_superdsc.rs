@@ -1141,15 +1141,16 @@ pub fn elementwise(
             who.join(", "),
         ));
     }
-    // Every operand sits at the output's corner (checked just above), so one corner serves all.
-    let out_off = chunk_corner(rows, &out);
+    // Every operand sits at the output's corner (checked just above), so one corner serves all — a
+    // [`crate::addr::ColWindow`], so the piece is presented stick-major (#622).
+    let out_off = chunk_window(name, rows, &out)?;
     // HANDLE-FLOW, `silumul`'s own discipline: the handles are bound once and the operands
     // borrow them, because an `EwOperand` holds a `&Stk` that must outlive the builder call.
     let out_h = rb(&out.name(), rows, cols);
     let in_handles: Vec<_> = ins.iter().map(|x| rb(&x.name(), rows, cols)).collect();
     let ew: Vec<_> = in_handles
         .iter()
-        .map(|h| In::sliced(h, out_off).ew())
+        .map(|h| In::col_window(h, out_off).ew())
         .collect();
     let tile_op = pointwise_tile_op(rows, cols, arity as u32 + 1);
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
@@ -1160,7 +1161,7 @@ pub fn elementwise(
         cols,
         &ew,
         &out_h,
-        out_off.into_raw_elems(),
+        out_off,
         sym_id_base,
         layout,
     )])
@@ -1241,6 +1242,22 @@ fn chunk_corner(rows: u32, out: &Region) -> crate::addr::DevOff {
         pointwise_chunk_out_offset(out.c_start),
         Df::Fp16,
     )
+}
+
+/// [`chunk_corner`] as a [`crate::addr::ColWindow`] — the same element, carrying the fact that a
+/// column-blocked piece is a whole-stick window of its stick-major storage, so the door presents it
+/// rank-2 stick-major and the work-division law reaches it (#622). `Err`, naming the op, when the
+/// piece's corner is not a whole stick.
+fn chunk_window(name: &str, rows: u32, out: &Region) -> Result<crate::addr::ColWindow, Error> {
+    crate::addr::col_window_of(
+        rows,
+        out.c_start + out.c_len,
+        pointwise_chunk_out_offset(out.c_start),
+        Df::Fp16,
+    )
+    .map_err(|e| Error {
+        message: format!("{name}: {e}"),
+    })
 }
 
 /// ⭐⭐⭐ THE PER-ROW CLASS — `[rows, 1]` elementwise, the running-max/alpha/denominator chain of an
@@ -1430,7 +1447,7 @@ fn elementwise_broadcast(
         // here (a broadcast/per-row operand is addressed at its own extent or the buffer base,
         // neither of which can place a column window), so the offset is 0 by proof, not by
         // default.
-        0,
+        crate::addr::DevOff::ZERO,
         sym_id_base,
         layout,
     )])
@@ -1488,6 +1505,17 @@ pub fn silumul(
     // tensor's storage" the address module exists to stop, committed inside that module's own
     // migration.
     let full_cols = o.c_start + o.c_len;
+    // ⭐ EACH CORNER IS A [`crate::addr::ColWindow`] (#622): the column pieces of one `[rows, full]`
+    // stick-major tensor start on whole sticks (the tiler cuts at `nb = 8192`), so each piece is a
+    // stick-major tensor of its own and the door presents it rank-2 — the work-division law then reaches
+    // the remainder piece too (granite-3.1-8b's `[m, 4608]` at column 8192). Same element offsets as
+    // `col_of`; a sub-stick corner is a build error naming the op.
+    let window = |c: u32| {
+        crate::addr::col_window_of(rows, full_cols, c, Df::Fp16).map_err(|e| Error {
+            message: format!("SiluMul {name}: {e}"),
+        })
+    };
+    let (gate_w, up_w, out_w) = (window(gate_off)?, window(up_off)?, window(out_off)?);
     // HANDLE-FLOW: bind gate/up/tmp/out once; `tmp` flows from the silu output INTO the mul input.
     let gate = rb(&gate, rows, cols);
     let up = rb(&up, rows, cols);
@@ -1499,17 +1527,13 @@ pub fn silumul(
             "silu",
             crate::sdsc_abstract::RowCount::of_token_rows(rows),
             crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
-            &[In::sliced(
-                &gate,
-                crate::addr::col_of(rows, full_cols, gate_off, Df::Fp16),
-            )
-            .ew()],
+            &[In::col_window(&gate, gate_w).ew()],
             &tmp,
             // The WRITE needs the same nest the READS above go through. A raw `cols_start` is the
             // flat element index; in the stick-blocked output, column `c` of a `[rows, cols]` tensor
             // starts at `(c/64)*(rows*64)`. Equal only at rows == 1, so decode was right and prefill
             // wrote every later column block on top of the first one.
-            crate::addr::col_of(rows, full_cols, out_off, Df::Fp16),
+            out_w,
             sym_id_base,
             layout,
         ),
@@ -1519,15 +1543,11 @@ pub fn silumul(
             crate::sdsc_abstract::RowCount::of_token_rows(rows),
             crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
             &[
-                In::sliced(
-                    &tmp,
-                    crate::addr::col_of(rows, full_cols, out_off, Df::Fp16),
-                )
-                .ew(),
-                In::sliced(&up, crate::addr::col_of(rows, full_cols, up_off, Df::Fp16)).ew(),
+                In::col_window(&tmp, out_w).ew(),
+                In::col_window(&up, up_w).ew(),
             ],
             &out,
-            crate::addr::col_of(rows, full_cols, out_off, Df::Fp16),
+            out_w,
             sym_id_base,
             layout,
         ),
@@ -2771,7 +2791,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 In::sliced(&rbo(b), boff).ew(),
             ],
             o,
-            ooff.into_raw_elems(),
+            ooff.into(),
             false, // RoPE per-(row,head) [1,hd] block (rows==1): rank-3 flat
             Df::Fp16,
             layout,
@@ -2942,7 +2962,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                     In::sliced(&rbo(b), boff).ew(),
                 ],
                 o,
-                ooff.into_raw_elems(),
+                ooff.into(),
                 // cols == stk, and `stickmajor` needs cols > 64, so it cannot fire either way — this
                 // is the same rank-3 flat form regardless of the row count.
                 true,
@@ -3196,7 +3216,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                     In::sliced(&rbo(b), boff).ew(),
                 ],
                 o,
-                ooff.into_raw_elems(),
+                ooff.into(),
                 // cols == hd == stick, so `stickmajor` cannot fire (it needs cols>64) and this stays
                 // the SAME rank-3 flat form the per-row path used — only the row count differs.
                 false,
@@ -6638,6 +6658,14 @@ pub fn gated_act(
     let up_off = pointwise_chunk_out_offset(up_r.c_start);
     let out_off = pointwise_chunk_out_offset(o.c_start);
     let full_cols = o.c_start + o.c_len;
+    // `silumul`'s corners, verbatim: each is a [`crate::addr::ColWindow`], so the door presents every
+    // column piece stick-major (#622).
+    let window = |c: u32| {
+        crate::addr::col_window_of(rows, full_cols, c, Df::Fp16).map_err(|e| Error {
+            message: format!("GatedAct {name}: {e}"),
+        })
+    };
+    let (gate_w, up_w, out_w) = (window(gate_off)?, window(up_off)?, window(out_off)?);
     let gate = rb(&gate, rows, cols);
     let up = rb(&up, rows, cols);
     let tmp = rb(&tmp, rows, cols);
@@ -6648,13 +6676,9 @@ pub fn gated_act(
             act_func,
             crate::sdsc_abstract::RowCount::of_token_rows(rows),
             crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
-            &[In::sliced(
-                &gate,
-                crate::addr::col_of(rows, full_cols, gate_off, Df::Fp16),
-            )
-            .ew()],
+            &[In::col_window(&gate, gate_w).ew()],
             &tmp,
-            crate::addr::col_of(rows, full_cols, gate_off, Df::Fp16),
+            gate_w,
             sym_id_base,
             layout,
         ),
@@ -6664,15 +6688,11 @@ pub fn gated_act(
             crate::sdsc_abstract::RowCount::of_token_rows(rows),
             crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
             &[
-                In::sliced(
-                    &tmp,
-                    crate::addr::col_of(rows, full_cols, out_off, Df::Fp16),
-                )
-                .ew(),
-                In::sliced(&up, crate::addr::col_of(rows, full_cols, up_off, Df::Fp16)).ew(),
+                In::col_window(&tmp, out_w).ew(),
+                In::col_window(&up, up_w).ew(),
             ],
             &out,
-            crate::addr::col_of(rows, full_cols, out_off, Df::Fp16),
+            out_w,
             sym_id_base,
             layout,
         ),
@@ -9665,7 +9685,9 @@ fn scalarmul_scaled(
             out.tid, out.c_start, ins[0].tid, ins[0].c_start,
         ));
     }
-    let corner = chunk_corner(rows, &out);
+    // A [`crate::addr::ColWindow`], `elementwise`'s corner: a column-blocked piece is presented stick-major
+    // (#622).
+    let corner = chunk_window(name, rows, &out)?;
     // DEVICE width (the padding invariant): a ScalarMul on the padded logits `[.,49159]` must use the SAME
     // device width its producer matmul emitted (49664), not the logical 49159 (whose sub-stick 7 the dxp
     // scheduler rejects). `for_pointwise` == the producer's `for_output` for macs≥2^20 producers. A no-op
@@ -9683,9 +9705,10 @@ fn scalarmul_scaled(
     let op_name = format!("scalarmul_o{}", out.tid);
     let x_h = rbo(&x);
     let scale_h = rbo(&scale_name);
-    // `In::sliced` at corner 0 is field for field `In::full`, so a whole-tensor ScalarMul (piece 0, and
-    // every node narrower than one tiling block) emits the bytes it always did.
-    let inputs = [In::sliced(&x_h, corner).ew(), In::scalar(&scale_h).ew()];
+    // `In::col_window` at corner 0 is field for field `In::full` in what it emits (corner 0 is a whole-block
+    // shift, stick-major either way), so a whole-tensor ScalarMul (piece 0, and every node narrower than one
+    // tiling block) emits the bytes it always did.
+    let inputs = [In::col_window(&x_h, corner).ew(), In::scalar(&scale_h).ew()];
     // ⭐ THE SAME `TileOp` `node_to_tile_ops`' ScalarMul arm declares: `out` at the DEVICE width
     // computed above, `n_operands: 2` (the scalar rides in the op, not as a tiled operand).
     let mut tile_op = pointwise_tile_op(rows, cols, 2);
@@ -9823,7 +9846,7 @@ fn scalarmul_scaled(
         cols,
         &inputs,
         &rbo(&out_name),
-        corner.into_raw_elems(),
+        corner,
         sym_id_base,
         layout,
     )])
