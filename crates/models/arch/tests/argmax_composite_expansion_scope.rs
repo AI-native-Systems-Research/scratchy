@@ -19,11 +19,14 @@
 //!     registry holds minting bundles whose ramp width is 49152 under the quant line
 //!     too, which is what "keys on structure, not preset name" means when the
 //!     preset leaves the lm-head alone;
-//!   • granite-3.1-2b-instruct (tied, NON-stick 49155 = 768·64 + 3) mints in
-//!     NEITHER scope — the geometry boundary, not the preset, is what keeps the card
-//!     gate's own cell model on the host argmax;
-//!   • every minting bundle carries its scalar-V stick (the pairing law), and no
-//!     bundle anywhere mints at a vocab that is not a whole fp16 stick.
+//!   • granite-3.1-2b-instruct (tied, NON-stick 49155 = 768·64 + 3) mints in BOTH
+//!     scopes too — through the PAD-LANE form: the staged fp16 bias owns the 61
+//!     lanes from the vocab to the padded stick, so the sub-stick vocab is served
+//!     by GEOMETRY and the card gate's own cell model is a composite cell in
+//!     every scope;
+//!   • every minting bundle carries its scalar-V stick (the pairing law), its ramp
+//!     at the stick-padded staging width, and — when the vocab is sub-stick — the
+//!     fp16 pad-lane bias at that same padded width.
 //!
 //! Attribution note: this gate line compiles exactly the granite family
 //! (3.3-2b-base, 3.1-2b-instruct, micro-g3.3-8b-instruct-1b), so registry-wide
@@ -38,16 +41,24 @@
 ))]
 
 use scratchy_target_spyre::bundle_code::{BundleCode, inventory};
-use scratchy_target_spyre::lower_subtile_tape_to_superdsc::argmax_v_tid;
+use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
+    argmax_bias_tid, argmax_ramp_tid, argmax_v_tid,
+};
 use scratchy_target_spyre::wiring::BakeFacts;
 
 /// granite-3.3-2b-base's vocab — the one TIED, stick-aligned model this gate line
-/// compiles, so the one whose mint the asserts expect.
+/// compiles, so the whole-stick half of the mint set the asserts expect.
 const GRANITE_3_3_VOCAB: usize = 49152;
 
 /// granite-3.1-2b-instruct's vocab — the card gate's own cell model, and NOT a whole
-/// fp16 stick: 49155 = 768·64 + 3, three lanes past the last one.
+/// fp16 stick: 49155 = 768·64 + 3, three lanes past the last one — the PAD-LANE
+/// form's own cell (61 pad lanes to the padded stick 49216).
 const GRANITE_3_1_VOCAB: usize = 49155;
+
+/// The fp16 stick width (`Fp16::ELEMS_PER_STICK`, pinned against the constant itself
+/// by the spyre-crate tests) — the staging width the composite's `[1, vocab]` links
+/// run at, pad lanes included.
+const FP16_STICK: usize = 64;
 
 /// Which quant scope this build carried — named in every message. Never branched on
 /// for the LAW (the law is scope-invariant); the emission half uses it only to pick
@@ -100,8 +111,10 @@ fn link_anchor() {
 /// ⭐⭐⭐ THE SCOPE LAW, REGISTRY SIDE — walk every bundle this build linked (the
 /// same `BundleCode`s `bundle(fp)` resolves, taken whole) and state the mint set:
 /// granite-3.3 mints (in BOTH scopes — the fp8 preset ignores the lm_head, so the
-/// dense tail persists and the gate admits it), every minting bundle pairs its ramp
-/// with the scalar-V stick, and granite-3.1's non-stick vocab mints NOWHERE.
+/// dense tail persists and the gate admits it), granite-3.1 mints through the
+/// PAD-LANE form (its sub-stick vocab is served, not refused), and every minting
+/// bundle pairs its ramp with the scalar-V stick and carries the fp16 bias iff
+/// its vocab is sub-stick.
 #[test]
 fn the_composite_follows_structure_across_quant_scopes() {
     link_anchor();
@@ -121,12 +134,31 @@ fn the_composite_follows_structure_across_quant_scopes() {
                  {scope} scope)",
                 code.fp
             );
+            let vocab = facts.argmax_vocab;
+            let v_pad = (vocab as u64).next_multiple_of(FP16_STICK as u64);
             assert_eq!(
-                facts.argmax_vocab % 64,
-                0,
-                "a minting bundle's vocab is a whole fp16 stick ({}, {scope} scope)",
+                code.layout.place_of_tid(argmax_ramp_tid()).map(|p| p.size),
+                Some(v_pad * 4),
+                "a minting bundle's ramp is fp32 at the stick-padded staging width \
+                 {v_pad} ({}, {scope} scope)",
                 code.fp
             );
+            let bias = code.layout.place_of_tid(argmax_bias_tid()).map(|p| p.size);
+            if v_pad > vocab as u64 {
+                assert_eq!(
+                    bias,
+                    Some(v_pad * 2),
+                    "a sub-stick vocab takes the PAD-LANE form: the fp16 bias is placed \
+                     at the padded stick ({}, {scope} scope)",
+                    code.fp
+                );
+            } else {
+                assert!(
+                    bias.is_none(),
+                    "a whole-stick vocab needs no pad-lane bias ({}, {scope} scope)",
+                    code.fp
+                );
+            }
         }
     }
     assert!(
@@ -136,29 +168,31 @@ fn the_composite_follows_structure_across_quant_scopes() {
          every assert below is vacuous"
     );
     assert!(
-        !minted.is_empty(),
+        minted.contains(&GRANITE_3_3_VOCAB),
         "granite-3.3-2b-base mints in the {scope} scope too — the fp8 preset IGNORES \
          the lm_head, so the dense tail persists and the gate admits it: the composite \
          follows STRUCTURE, never a preset's name"
     );
     assert!(
-        minted.iter().all(|v| *v == GRANITE_3_3_VOCAB),
-        "every minting bundle is granite-3.3's own vocab (49152, the only tied \
-         stick-aligned model this line compiles) — minted set: {minted:?} ({scope} scope)"
+        minted.contains(&GRANITE_3_1_VOCAB),
+        "granite-3.1-2b-instruct mints in the {scope} scope — its vocab 49155 is three \
+         lanes past the last fp16 stick (768·64 + 3) and the PAD-LANE form's staged \
+         bias owns them: the card gate's own cell model is a composite cell by \
+         GEOMETRY, in every scope"
     );
     assert!(
-        !minted.contains(&GRANITE_3_1_VOCAB),
-        "granite-3.1-2b-instruct mints nowhere: its vocab 49155 is three lanes past \
-         the last fp16 stick (768·64 + 3), and the [1, vocab] links run at the stick — \
-         the card gate's own cell model keeps the host argmax by GEOMETRY, in every \
-         scope ({scope} scope)"
+        minted
+            .iter()
+            .all(|v| *v == GRANITE_3_3_VOCAB || *v == GRANITE_3_1_VOCAB),
+        "every minting bundle is one of this line's two tied granites' own vocabs \
+         (49152 stick-aligned, 49155 sub-stick) — minted set: {minted:?} ({scope} scope)"
     );
 }
 
 /// ⭐ THE SCOPE LAW, EMISSION SIDE — per VARIANT module, by name, in the emission
 /// this build produced: the mint's own footprint (`argmax_o` op names — the walk
-/// mints them, and only the walk) is present in granite-3.3's variant and absent
-/// from granite-3.1's, under the dense spelling AND the preset spelling. This is
+/// mints them, and only the walk) is present in granite-3.3's AND granite-3.1's
+/// variants, under the dense spelling AND the preset spelling. This is
 /// the attribution half (which model minted), and the non-vacuity half (the preset
 /// build really carries the `<stem>_<preset>` variants the registry asserts ran
 /// over).
@@ -187,10 +221,10 @@ fn the_mint_follows_the_variant_not_the_scope() {
         "granite-3.3's variant carries the composite's op names ({scope} scope) — the \
          fp8 preset ignores the lm_head, so the mint survives it"
     );
-    assert_eq!(
-        mints(g31),
-        0,
-        "granite-3.1's variant carries no composite op name ({scope} scope) — its \
-         non-stick vocab keeps it on the host argmax whatever the scope"
+    assert!(
+        mints(g31) > 0,
+        "granite-3.1's variant carries the composite's op names ({scope} scope) — the \
+         PAD-LANE form serves its sub-stick vocab, and the fp8 preset ignores the \
+         lm_head so the mint survives it there too"
     );
 }

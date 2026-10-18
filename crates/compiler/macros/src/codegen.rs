@@ -12000,6 +12000,16 @@ fn dump_wavefront_mega(
                                                         }
                                                     },
                                                 );
+                                                // The composite argmax's minted facts, in the
+                                                // gate's own shape — `None` when this rung
+                                                // minted no composite (the row exemption and
+                                                // the sentinel row's staging, one fact:
+                                                // `RolledSuperDsc::argmax`).
+                                                let gate_argmax = rolled.argmax.as_ref();
+                                                // The rung under test, one fact — see
+                                                // `superdsc::GateRung`.
+                                                let gate_rung =
+                                                    superdsc::GateRung { fp: &bfp, cap };
                                                 let run_gate =
                                                     |prefill: Option<&superdsc::PrefillGate>| {
                                                         // The twin's own groups, fresh from the
@@ -12022,10 +12032,10 @@ fn dump_wavefront_mega(
                                                                     &twin_groups,
                                                                     &krg,
                                                                     &weight_ids,
-                                                                    cap,
-                                                                    &bfp,
+                                                                    &gate_rung,
                                                                     prefill,
                                                                     Some(&trunc),
+                                                                    gate_argmax,
                                                                 ) {
                                                                     Ok(()) => {}
                                                                     Err(e) => panic!(
@@ -12043,10 +12053,10 @@ fn dump_wavefront_mega(
                                                                             groups,
                                                                             &krg,
                                                                             &weight_ids,
-                                                                            cap,
-                                                                            &bfp,
+                                                                            &gate_rung,
                                                                             prefill,
                                                                             None,
+                                                                            gate_argmax,
                                                                         )
                                                                     },
                                                                 ) {

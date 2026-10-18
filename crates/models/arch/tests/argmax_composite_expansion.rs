@@ -6,8 +6,8 @@
 //! side, the way `spyre_weight_folds.rs` does: granite-3.3-2b-base — TIED, the
 //! model the loop-closure front targets — mints the composite in its real
 //! expansion, and an UNTIED granite (micro-g3.3-8b-instruct-1b, the 8b shape at
-//! micro scale, `tie_word_embeddings: false`) compiles its whole ladder without
-//! placing either constant.
+//! micro scale, `tie_word_embeddings: false`) compiles its whole ladder placing
+//! none of the composite's constants.
 //!
 //! The observable is [`BakeFacts::argmax_vocab`] — the registry law's emission
 //! half: read off the ramp's own placement in the bundle the expansion baked
@@ -22,16 +22,17 @@
 //!
 //! The mint-site gate, PINNED FROM BOTH SIDES: the expansion's gate
 //! (`lm_head_admits_the_composite`, keyed on the lm-head's STRUCTURE, never on a
-//! preset's name) mints the tie token only behind the form the first cut can SERVE —
-//! an arity-2 DENSE lm-head at whole-fp16-stick vocab and hidden. The boundary this
-//! file's models actually sit on is GEOMETRY: granite-3.1-2b-instruct — the card
-//! gate's OWN cell model — carries vocab 49155, three lanes past the last fp16
-//! stick (768·64 + 3), and the composite's `[1, vocab]` links run at the stick (the
-//! dxp scheduler rejects sub-stick tiles), so it keeps the HOST argmax by
-//! construction while stick-aligned tied granite-3.3-2b-base mints rung by rung.
-//! BOTH the fp16 and fp8 card cells are host-argmax cells — by that GEOMETRY, not
-//! by quant staging: granite's fp8 preset (`fp8-dynamic-per-channel`) IGNORES the
-//! lm_head, so the dense tail persists under it and 3.3 keeps minting. That
+//! preset's name) mints the tie token behind the two facts the composite needs —
+//! an arity-2 DENSE lm-head and a whole-fp16-stick HIDDEN. The vocab needs no
+//! conjunct of its own: a sub-stick vocab takes the PAD-LANE form, whose staged
+//! fp16 bias (0 on the real lanes, the fp16 floor −65504 on the pads) owns the
+//! lanes past the vocab so garbage there can never win the max. granite-3.1
+//! — the card gate's OWN cell model, vocab 49155 = 768·64 + 3 — is that form's
+//! own cell: it mints rung by rung exactly like stick-aligned granite-3.3, with
+//! the bias placed alongside the ramp. BOTH the fp16 and fp8 card cells take the
+//! composite by GEOMETRY, not by quant staging: granite's fp8 preset
+//! (`fp8-dynamic-per-channel`) IGNORES the lm_head, so the dense tail persists
+//! under it and both keep minting. That
 //! scope-side law is pinned by `argmax_composite_expansion_scope.rs`, which runs
 //! under the quant line too (preset builds RENAME the variant modules
 //! `<stem>_<preset>`, so this file's module paths are the dense line's alone). A
@@ -55,12 +56,18 @@ use scratchy_target_spyre::wiring::BakeFacts;
 /// granite-3.3-2b-base's config `vocab_size` — the width the ramp must carry.
 const GRANITE_VOCAB: usize = 49152;
 
+/// The fp16 stick width (`Fp16::ELEMS_PER_STICK`, pinned against the constant
+/// itself by the spyre-crate tests) — the staging width every `[1, vocab]` link of
+/// the composite runs at, pad lanes included.
+const FP16_STICK: usize = 64;
+
 /// granite-3.1-2b-instruct's config `vocab_size` — the CARD GATE's own cell model
 /// (the 2b fp16 / 2b fp8 legs run this stem), and NOT a whole fp16 stick:
-/// 49155 = 768·64 + 3, three lanes past the last one. The composite's `[1, vocab]`
-/// links run at the stick, so this model keeps the host argmax in EVERY scope — the
-/// geometry test below pins the boundary by its arithmetic, so a config edit that
-/// moves the vocab moves the expectation with it.
+/// 49155 = 768·64 + 3, three lanes past the last one — the PAD-LANE form's own
+/// cell: the staged fp16 bias owns the 61 lanes from the vocab to the padded
+/// stick, so the sub-stick vocab is served by GEOMETRY. The arithmetic test
+/// below pins the shape, so a config edit that moves the vocab moves the
+/// expectation with it.
 const GRANITE_3_1_VOCAB: usize = 49155;
 
 /// Every decode bundle of one model's ladder: the anchor `KTIR_BUNDLE::decode`
@@ -91,29 +98,22 @@ fn decode_bundles(kb: &KtirBundle) -> Vec<&'static BundleCode<'static>> {
     out
 }
 
-/// A model's decode-ladder expectation:
-///
-/// * [`Expect::Ramp`] — every rung places the composite's ramp at the model's own
-///   vocab, with the scalar-V stick alongside it;
-/// * [`Expect::HostPath`] — no rung mints the composite; the ladder keeps the HOST
-///   argmax, for the boundary the variant carries (stated in every assert message).
+/// A model's decode-ladder expectation: [`Expect::Ramp`] — every rung places the
+/// composite's ramp at the model's own vocab with the scalar-V stick alongside
+/// it, and, when that vocab is sub-stick, the fp16 pad-lane bias at the padded
+/// stick (the PAD-LANE form's own footprint).
 #[derive(Clone, Copy)]
 enum Expect {
     Ramp(usize),
-    HostPath(&'static str),
 }
 
-/// granite-3.1's own boundary, the dense line's string: the geometry the first cut
-/// cannot serve.
-const NON_STICK_WHY: &str = "its vocab 49155 is three lanes past the last fp16 stick \
-     (768·64 + 3), and the composite's [1, vocab] links run at the stick";
-
 /// ⭐⭐⭐ THE MINT-SITE GATE'S MODEL-SIDE LAW — the composite follows the lm-head's
-/// STRUCTURE, never a preset's name: granite-3.3-2b-base (tied, stick-aligned) mints
-/// on every rung of its real ladder, while granite-3.1-2b-instruct (tied, non-stick
-/// vocab) mints nothing and keeps the host argmax. The scope-side half of the law —
-/// what survives a quant preset — is `argmax_composite_expansion_scope.rs`'s own;
-/// this file runs on the DENSE gate line (`spyre,granite-3.3-2b-base,
+/// STRUCTURE, never a preset's name: granite-3.3-2b-base (tied, stick-aligned) and
+/// granite-3.1-2b-instruct (tied, vocab three lanes past the last fp16 stick) BOTH
+/// mint on every rung of their real ladders — the latter through the PAD-LANE
+/// form, whose staged bias owns the lanes past the vocab. The scope-side half of
+/// the law — what survives a quant preset — is `argmax_composite_expansion_scope.rs`'s
+/// own; this file runs on the DENSE gate line (`spyre,granite-3.3-2b-base,
 /// granite-3.1-2b-instruct,micro-g3.3-8b-instruct-1b`), because preset builds rename
 /// the variant modules and this file names them by path.
 fn assert_composite_follows_lm_head_structure(kb: &KtirBundle, expect: Expect, what: &str) {
@@ -138,23 +138,41 @@ fn assert_composite_follows_lm_head_structure(kb: &KtirBundle, expect: Expect, w
                     "the scalar-V stick is [1, 32] fp32 alongside it ({})",
                     code.fp
                 );
-            }
-            Expect::HostPath(why) => {
+                let v_pad = (vocab as u64).next_multiple_of(FP16_STICK as u64);
                 assert_eq!(
-                    facts.argmax_vocab, 0,
-                    "{what}: {why}, so no tie token is minted and the rung keeps the \
-                     host argmax ({})",
-                    code.fp
-                );
-                assert!(
                     code.layout
                         .place_of_tid(
-                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::argmax_v_tid()
+                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::argmax_ramp_tid(
+                            )
                         )
-                        .is_none(),
-                    "{what}: no scalar-V stick either ({})",
+                        .map(|p| p.size),
+                    Some(v_pad * 4),
+                    "the ramp is fp32 at the stick-padded staging width {v_pad} ({}, {what})",
                     code.fp
                 );
+                let bias = code
+                    .layout
+                    .place_of_tid(
+                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::argmax_bias_tid(),
+                    )
+                    .map(|p| p.size);
+                if v_pad > vocab as u64 {
+                    let pads = v_pad - vocab as u64;
+                    assert_eq!(
+                        bias,
+                        Some(v_pad * 2),
+                        "a sub-stick vocab takes the PAD-LANE form: the fp16 bias (0 on the \
+                         real lanes, the fp16 floor on the {pads} pads) is placed at the \
+                         padded stick ({}, {what})",
+                        code.fp
+                    );
+                } else {
+                    assert!(
+                        bias.is_none(),
+                        "a whole-stick vocab needs no pad-lane bias ({}, {what})",
+                        code.fp
+                    );
+                }
             }
         }
     }
@@ -172,29 +190,35 @@ fn tied_granite_mints_the_composite_in_the_real_expansion() {
 }
 
 /// The CARD GATE's own cell model — granite-3.1-2b-instruct, the stem the 2b fp16 and
-/// 2b fp8 legs run — sits on the gate's GEOMETRY boundary: its vocab is three lanes
-/// past the last fp16 stick, so the expansion mints NO tie token and every rung of its
-/// real ladder keeps the host argmax — in BOTH quant scopes (under the fp8 preset the
-/// arity-3 boundary refuses it too). Both card cells are therefore host-argmax
-/// controls by construction; the composite's card evidence needs a stick-aligned tied
-/// granite (3.3-2b-base) or the pad-lane follow-up. The arithmetic is pinned FIRST, so
-/// a config edit that moves granite-3.1's vocab moves this expectation with it.
+/// 2b fp8 legs run — is the PAD-LANE form's own cell: its vocab is three lanes past
+/// the last fp16 stick, and the staged bias owns the 61 lanes from the vocab to the
+/// padded stick, so every rung of its real ladder mints the composite exactly like
+/// stick-aligned granite-3.3 — in BOTH quant scopes (granite's fp8 preset ignores the
+/// lm_head, so the dense tail persists under it). Both card cells are therefore
+/// composite cells by GEOMETRY. The arithmetic is pinned FIRST, so a config edit that
+/// moves granite-3.1's vocab moves this expectation with it.
 #[test]
-fn the_card_gates_own_granite_keeps_the_host_path_by_geometry() {
+fn the_card_gates_own_granite_takes_the_pad_lane_form() {
     assert_eq!(
         GRANITE_3_1_VOCAB,
         768 * 64 + 3,
-        "the boundary this test pins is the non-stick vocab itself"
+        "the shape this test pins is the sub-stick vocab itself"
+    );
+    assert_eq!(
+        GRANITE_3_1_VOCAB.next_multiple_of(64) - GRANITE_3_1_VOCAB,
+        61,
+        "61 pad lanes from the vocab to the padded stick"
     );
     assert_composite_follows_lm_head_structure(
         &scratchy_models::granite::granite_3_1_2b_instruct::KTIR_BUNDLE,
-        Expect::HostPath(NON_STICK_WHY),
+        Expect::Ramp(GRANITE_3_1_VOCAB),
         "granite-3.1-2b-instruct",
     );
 }
 
 /// The PREFILL bundle (m > 1) keeps the host readback path: the one-request
-/// gate means no composite, and the bundle says so by placing no ramp.
+/// gate means no composite, and the bundle says so by placing none of the
+/// composite's constants.
 #[test]
 fn granites_prefill_places_no_composite() {
     let kb = &scratchy_models::granite::granite_3_3_2b_base::KTIR_BUNDLE;
@@ -208,12 +232,24 @@ fn granites_prefill_places_no_composite() {
         0,
         "prefill is m > 1 — the composite is the one-request rung's alone"
     );
+    assert!(
+        code.layout
+            .place_of_tid(scratchy_target_spyre::lower_subtile_tape_to_superdsc::argmax_ramp_tid())
+            .is_none(),
+        "no ramp placement either"
+    );
+    assert!(
+        code.layout
+            .place_of_tid(scratchy_target_spyre::lower_subtile_tape_to_superdsc::argmax_bias_tid())
+            .is_none(),
+        "no pad-lane bias placement either"
+    );
 }
 
-/// UNTIED granite stays untouched: its whole decode ladder compiles and places
-/// NEITHER constant — the host readback path is the untied model's own, and the
-/// tie token (`TiedLmHeadEmbedding::from_tied_config`) is the guard that keeps
-/// it there.
+/// UNTIED granite stays untouched: its whole decode ladder compiles placing NONE
+/// of the composite's constants — the host readback path is the untied model's
+/// own, and the tie token (`TiedLmHeadEmbedding::from_tied_config`) is the guard
+/// that keeps it there.
 #[test]
 fn an_untied_model_places_no_composite() {
     let kb = &scratchy_models::granite::micro_g3_3_8b_instruct_1b::KTIR_BUNDLE;
@@ -234,6 +270,15 @@ fn an_untied_model_places_no_composite() {
                 .place_of_tid(scratchy_target_spyre::lower_subtile_tape_to_superdsc::argmax_v_tid())
                 .is_none(),
             "no scalar-V stick either ({})",
+            code.fp
+        );
+        assert!(
+            code.layout
+                .place_of_tid(
+                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::argmax_bias_tid()
+                )
+                .is_none(),
+            "no pad-lane bias either ({})",
             code.fp
         );
     }

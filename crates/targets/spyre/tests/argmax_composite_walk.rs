@@ -588,10 +588,11 @@ fn a_staged_lm_head_refuses_loudly() {
 /// packs the table) is a boundary, so the expansion mints no tie token and the model
 /// keeps the HOST argmax — by construction, which is how a future preset cannot slip
 /// past a name list. The dense arity-2 stick-aligned form — granite-3.3's own tail
-/// shape, with the logits-scaling tail op and without it — is served. And the
-/// GEOMETRY boundary that bit granite-3.1 (vocab 49155, three lanes past the last
-/// fp16 stick) keeps that model on the host path too — the chain's `[1, vocab]`
-/// links run at the stick, and the dxp scheduler rejects sub-stick tiles.
+/// shape, with the logits-scaling tail op and without it — is served. And a SUB-STICK
+/// vocab (granite-3.1's 49155, three lanes past the last fp16 stick) is served TOO:
+/// the pad-lane form stages one bias before the max and clamps the ramp at zero
+/// (`emit::argmax`'s module doc), so the vocab conjunct is gone — only the HIDDEN
+/// stick law remains (the gather's slab is one-stick sub-rows).
 #[test]
 fn the_mint_gate_keys_on_structure_not_preset() {
     let lowered = |scale_tail: bool| {
@@ -617,10 +618,13 @@ fn the_mint_gate_keys_on_structure_not_preset() {
         "MLX-affine — arity-2, but the packed table is not the Dense bank the gather reads"
     );
 
-    // THE GEOMETRY BOUNDARY — one-matmul graphs at a NON-STICK vocab/hidden, the exact
-    // shape granite-3.1-2b/8b-instruct sits on (49155 = 768·64 + 3; here 130 = 2·64 + 2
-    // and hidden 250 = 3·64 + 58): the first cut cannot serve them, so no token is
-    // minted and the model keeps the host path instead of failing to build.
+    // THE PAD-LANE ADMISSION — one-matmul graphs at a NON-STICK vocab, the exact shape
+    // granite-3.1-2b/8b-instruct sits on (49155 = 768·64 + 3; here 130 = 2·64 + 2): the
+    // pad-lane form serves it (the links run at the stick-padded staging width, the
+    // staged bias owns the pad lanes), so the token IS minted — both granite-3.1 card
+    // cells (fp16 and fp8, whose preset ignores the lm_head) take the composite by
+    // GEOMETRY. The hidden law stays: 250 = 3·64 + 58 is not servable, and the
+    // stick-aligned control of the same builder keeps the two legs honest.
     let non_stick = |rows: u32, cols: u32| {
         let input = LoweringInput {
             sources: vec![
@@ -644,16 +648,16 @@ fn the_mint_gate_keys_on_structure_not_preset() {
         lower_region(&input, std::num::NonZeroU32::new(8192).unwrap())
     };
     assert!(
-        !lm_head_admits_the_composite(&non_stick(H, 130)),
-        "a non-stick VOCAB (granite-3.1's own boundary) is not servable — the [1, vocab] \
-         links run at the fp16 stick"
+        lm_head_admits_the_composite(&non_stick(H, 130)),
+        "a sub-stick VOCAB (granite-3.1's own shape) takes the PAD-LANE FORM — the \
+         staged bias owns the pad lanes, so the token is minted"
     );
     assert!(
         !lm_head_admits_the_composite(&non_stick(250, VOCAB)),
         "a non-stick HIDDEN is not servable — the gather's slab is one-stick sub-rows"
     );
     // And the control for the geometry legs: the same builder at stick-aligned
-    // geometry IS served, so the two refusals above pin the stick law, not the builder.
+    // geometry IS served, so the refusal above pins the hidden-stick law, not the builder.
     assert!(
         lm_head_admits_the_composite(&non_stick(H, VOCAB)),
         "the stick-aligned control of the same builder is served"

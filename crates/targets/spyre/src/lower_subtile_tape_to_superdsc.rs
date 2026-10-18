@@ -673,6 +673,7 @@ fn unique_producer<F: RopeForm>(
 /// to extend for the NaN sentinel row) and the table's own hidden (that row's width). Built by
 /// the recognition that read them off the graph ([`crate::lower_subtile_tape_to_ktir`]'s
 /// `ArgmaxPlan`), so the layout never re-derives a fact the recognizer already proved.
+#[derive(Clone)]
 pub struct ArgmaxTable {
     /// The table's row count — the gather's bank height. The ramp's own width is this
     /// vocab's stick-padded form (the pad-lane form's law); the REAL vocab rides the
@@ -683,6 +684,44 @@ pub struct ArgmaxTable {
     pub hidden: u32,
     /// The tied lm-head table's OWN source tid — the placement the sentinel row extends.
     pub table_tid: u32,
+}
+
+/// ⭐⭐⭐ THE COMPOSITE ARGMAX'S MINTED FACTS — the recognition's output-side truth,
+/// carried on [`RolledSuperDsc::argmax`] for the numeric gate. ONE struct for both
+/// laws the mint adds to the gate, so they can never disagree about whether a
+/// composite exists (and the gate sits at clippy's argument budget — the mint's
+/// facts cannot arrive as loose parameters):
+///
+/// * **`row_tid`** — the loop closure's write target, EXEMPT from the gate's
+///   comparison. The composite runs LAST in the suffix and writes the next token's
+///   embedding into the first body's hidden-in place: WAR-safe by construction
+///   (every reader of that place ran earlier), but the gate's readback is an
+///   END-OF-RUN snapshot keyed by tid, so this tid's observable is the GATHER'S
+///   ROW, not the producing op's own value (measured: granite-3.1-8b's gate
+///   refusal at rel 1.0 — the row was the embedding scale's output, read back as
+///   the argmax'd token's table row, with the first RmsNorm and residual Add
+///   convicted locally off the overlay). The exemption drops the tid from the
+///   READBACK list itself, so the walk's golden stands in for it; the row's own
+///   correctness is the KTIR parity gate's (`argmax_composite_parity.rs`, both
+///   forms at both widths), and the producing op's value stays judged through its
+///   consumers, which read the place BEFORE the composite runs.
+/// * **`table`** — the sentinel row's staging fact. The layout extends the table's
+///   PLACEMENT by `hidden · 2` and the card's staging writes its own `V·H·2` bytes
+///   into it — the zero-filled shadow behind them IS the row the `idx = V` gather
+///   reads. The gate has no shadow: its session's HBM allocation is exactly
+///   `max(derived-shape bytes, staged bytes)`, and the derived shape is a
+///   FIRST-VIEW race (`derive_shapes` records the first `construct_memory_view`
+///   that names a tensor — the composite's `[V + 1, H]` view does not reliably win
+///   it over the matmul's `[V, H]`), so the gate's staged bytes must carry the
+///   sentinel row's `hidden · 2` ZERO bytes themselves.
+#[derive(Clone)]
+pub struct ArgmaxMint {
+    /// The first body's hidden-in (the embedding-source slot) — the place the
+    /// loop closure's gather writes the next token's embedding into.
+    pub row_tid: u32,
+    /// The tied lm-head table's own facts — the placement the sentinel row
+    /// extends, and the row's width.
+    pub table: ArgmaxTable,
 }
 
 pub fn compute_bundle_layout<F: RopeForm>(
@@ -4244,20 +4283,60 @@ pub struct PrefillGate {
     pub rotary_sin: Vec<(u32, crate::wiring::RotaryKind)>,
 }
 
+/// ⭐ THE RUNG UNDER TEST — the bundle's fingerprint and its KV capacity, ONE
+/// param because they are one fact: every gate message names the rung by both,
+/// and the refusal dump's own directory is `{fp}_cap{cap}` (the pair
+/// [`write_refusal_dump`]'s signature already states). The gate sits at
+/// clippy's argument budget, so the rung's identity crosses as this struct,
+/// not as two loose parameters.
+#[cfg(feature = "spyre-emu")]
+pub struct GateRung<'a> {
+    /// The bundle's fingerprint — the message half of the rung's identity.
+    pub fp: &'a str,
+    /// The rung's KV capacity — the decode length mask's width, and the dump's
+    /// directory half.
+    pub cap: u32,
+}
+
 #[cfg(feature = "spyre-emu")]
 pub fn numeric_gate<F: RopeForm>(
     groups: &[bundle::LaunchGroup<'static>],
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
-    cap: u32,
-    fp: &str,
+    // ⭐ THE RUNG UNDER TEST — see [`GateRung`]: the fingerprint every message
+    // names and the capacity the decode mask stages, one fact.
+    rung: &GateRung,
     prefill: Option<&PrefillGate>,
     // The class-covering truncation this gate run judges (`None` = full
     // depth). `groups` must already BE the truncated bundle's groups when
     // this is `Some` — the twin `covering_twin_groups` mints.
     trunc: Option<&GateTrunc>,
+    // ⭐ THE COMPOSITE ARGMAX'S MINT (`RolledSuperDsc::argmax`) — the two laws the
+    // mint adds to this gate, in one param because they are one fact (see
+    // [`ArgmaxMint`]'s doc for both, and for why they cannot travel as loose
+    // parameters). The ROW half: the loop closure's write target, EXEMPT from
+    // comparison — the gate's readback is an END-OF-RUN snapshot keyed by tid, so
+    // that tid's observable is the GATHER'S ROW, and comparing it against the
+    // producing op's golden would refuse every minted bundle at rel ≈ 1 (measured:
+    // granite-3.1-8b — t447, the embedding scale's output, read back as the
+    // argmax'd token's table row, with the first RmsNorm and residual Add
+    // convicted locally off the same overlay). The TABLE half: the sentinel row's
+    // staging fact — this gate has no zero-filled shadow behind its staging (the
+    // session's HBM allocation is exactly `max(derived-shape bytes, staged
+    // bytes)`, and the derived shape is a FIRST-VIEW race the composite's
+    // `[V + 1, H]` view does not reliably win), so the staged bytes themselves
+    // carry the sentinel row's `hidden · 2` ZERO bytes (measured:
+    // granite-3.3-2b cap256 — the matmul-scale view won the race, the allocation
+    // came out exactly `V·H·2`, and the view guard refused the composite's view
+    // 4096 bytes past it; granite-3.1-8b passed the same guard only because its
+    // derived shape happened to carry the composite's view). `None` when no
+    // composite minted.
+    argmax: Option<&ArgmaxMint>,
 ) -> Result<(), String> {
     use scratchy_subtile::lower::GemmWeight;
+    // The rung's identity, named for the body: the messages say `{fp}`, the
+    // decode mask stages `cap` — both off the ONE param that carried them in.
+    let (fp, cap) = (rung.fp, rung.cap);
     // ⛔ KEEP IN STEP with `eval_node`'s no-host-reference arms: an op listed
     // here that gains a reference makes the gate skip a graph it could check;
     // one missing here PANICS inside `eval_golden_buffers` with eval's own
@@ -4438,10 +4517,31 @@ pub fn numeric_gate<F: RopeForm>(
     //    ~12 GB of codes, its 7-of-48 covering slice ~1.75 GB); the clone is
     //    the one transient double, and the slice keeps both sides small. ──
     let StagedWeights {
-        bytes: emu_weights,
+        bytes: mut emu_weights,
         gemm,
         scale_rows,
     } = stage_synth_weights(ir, weight_ids, covering);
+    // ⭐⭐⭐ THE COMPOSITE'S SENTINEL ROW RIDES THE STAGED BYTES — the table's pad,
+    //    stated at the staging because the session's allocation IS these bytes (see
+    //    `argmax`'s param doc for the measured refusal this prevents: no rounding
+    //    anywhere in the emulator's allocator can cover the row — the allocation is
+    //    exactly the staged length when the derived shape is matmul-scale). The
+    //    zeros are the row's own contract — the SAME zeros the card's zero-filled
+    //    shadow holds — so the `idx = V` gather reads a defined zero row on both
+    //    paths, never the next placement's first bytes. The reference legs share
+    //    the padded staging (ONE product, both legs — the law above) and never
+    //    read the tail: `materialize` decodes each node's weight at the node's
+    //    own logical shape, which for the table is `V·H` elements.
+    if let Some(a) = argmax {
+        let (_, bytes, _, _) = emu_weights
+            .iter_mut()
+            .find(|(tid, ..)| *tid as u64 == u64::from(a.table.table_tid))
+            .expect(
+                "the composite's table is a staged weight — the recognition read it off the \
+                 graph, and every launch that binds it survives the covering slice",
+            );
+        bytes.resize(bytes.len() + a.table.hidden as usize * 2, 0);
+    }
     let weights_ref = emu_weights.clone();
     let view = StagedWeightView {
         bytes: &weights_ref,
@@ -4621,9 +4721,16 @@ pub fn numeric_gate<F: RopeForm>(
     let mut session = crate::runner::SpyreSession::new_multi(&refs, emu_weights)
         .map_err(|e| format!("gate session: {e}"))?;
     let observables = session.observable_tids(0);
+    // ⭐ THE ROW'S EXEMPTION APPLIES TO THE READBACK LIST — dropping the composite's
+    //    row tid here (not from `results`, which states the fusion's exchange
+    //    modelling and must keep the place a stored edge) removes it from `out` too,
+    //    so the teacher-forced walk's per-node overlay leaves the GOLDEN value in its
+    //    seat and the row's consumers are judged on the value they actually read.
+    let argmax_row_tid = argmax.map(|a| u64::from(a.row_tid));
     let compare: Vec<(u64, usize)> = golden_tids
         .iter()
         .filter(|t| observables.contains(t))
+        .filter(|t| Some(**t) != argmax_row_tid)
         .map(|t| (*t, 0))
         .collect();
     if compare.is_empty() {
@@ -7069,6 +7176,13 @@ pub struct RolledSuperDsc {
     /// `suffix_in_tid`, so the placement aliases them — the body→suffix seam threads
     /// in place like the per-iter residual. `u32::MAX` if there is no suffix.
     pub suffix_in_tid: u32,
+    /// ⭐ THE COMPOSITE ARGMAX'S MINT — [`ArgmaxMint`], the recognition's
+    /// output-side facts for the numeric gate: the loop closure's row (EXEMPT
+    /// from the gate's comparison) and the table's sentinel row (the ZERO bytes
+    /// the gate's staging must carry). `None` when no composite minted — every
+    /// untied model, prefill bundle and batched rung — set from the one
+    /// recognition that read both facts off the graph, never re-derived here.
+    pub argmax: Option<ArgmaxMint>,
     /// ⭐ THE FOUR ATTENTION FACTS NO KTIR PROGRAM STATES — `ibm/main`'s own `lower_one_node`
     /// parameters, published from the walk that had them to the bundle emit that needs them.
     ///

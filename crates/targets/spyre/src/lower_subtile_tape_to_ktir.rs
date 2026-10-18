@@ -1684,7 +1684,7 @@ fn result_tail_lm_head<F: RopeForm>(
 
 /// ⭐⭐⭐⭐⭐ CAN THE COMPOSITE'S FIRST CUT SERVE THIS LM-HEAD? — the expansion's
 /// mint-site gate, keyed on the STRUCTURE the graph itself states, never on a quant
-/// preset's NAME (so a future preset cannot slip past a name list). Three facts, all
+/// preset's NAME (so a future preset cannot slip past a name list). Two facts, all
 /// read off the result tail:
 ///
 /// 1. ARITY-2 DENSE — fp8 W8A8 stages the per-channel scale as the matmul's THIRD
@@ -1694,20 +1694,24 @@ fn result_tail_lm_head<F: RopeForm>(
 ///    fp8-dynamic-per-channel IGNORES the lm_head, so the dense tail persists
 ///    under it and the token survives the preset (pinned by
 ///    `argmax_composite_expansion_scope.rs`, which runs under the quant line too).
-/// 2. VOCAB a whole fp16 stick — the chain's max/equal links run `[1, vocab]` at the
-///    64-elem SEN169_FP16 stick, and the dxp scheduler rejects sub-stick tiles.
-///    granite-3.1's 49155 is THREE LANES past the last stick (768·64 + 3), so both
-///    3.1 card cells stay on the host path by GEOMETRY; a pad-lane form (force the
-///    pad to −inf, extend the logits read) is second-wave work, filed — never a TODO.
-/// 3. HIDDEN a whole fp16 stick — the gather's slab is one-stick sub-rows
+/// 2. HIDDEN a whole fp16 stick — the gather's slab is one-stick sub-rows
 ///    (`try_assemble_argmax`'s own law, restated at the mint so an inexpressible
 ///    model keeps the host path instead of failing the build).
+///
+/// The vocab needs no conjunct of its own: a sub-stick vocab (granite-3.1's 49155 =
+/// 768·64 + 3) takes the PAD-LANE FORM — the chain's links run at the stick-padded
+/// staging width with ONE staged bias (0 on the real lanes, −65504 on the pad ones)
+/// before the max and the ramp clamped at zero, so a pad lane can win only what an
+/// all-floor real row could and both land exactly on the sentinel row (`emit::argmax`'s
+/// module doc). The old whole-stick vocab conjunct was that form's placeholder; the
+/// form landed, so the conjunct is gone — both granite-3.1 card cells (fp16 and fp8,
+/// whose preset ignores the lm_head) take the composite by GEOMETRY now.
 ///
 /// ⛔ AN UNRECOGNIZABLE TAIL STILL MINTS. `true` there hands the token to the walk,
 /// whose own recognition ([`recognize_argmax`]) refuses LOUDLY — the
 /// never-a-silent-host-fallback law survives this gate exactly where it existed
 /// before it. The gate silences only the forms the first cut documents as
-/// boundaries: staged tables and non-stick geometry.
+/// boundaries: staged tables and non-stick hidden.
 pub fn lm_head_admits_the_composite<F: RopeForm>(ir: &SubtileIR<F>) -> bool {
     let Ok((node, _)) = result_tail_lm_head(ir) else {
         return true;
@@ -1721,10 +1725,10 @@ pub fn lm_head_admits_the_composite<F: RopeForm>(ir: &SubtileIR<F>) -> bool {
     // The IR spells the matmul's weight `[K, N]` — rows the contraction width, cols the
     // out count — the same derivation [`recognize_argmax`] cross-checks four ways.
     let table = &ir.tensors[node.inputs[1].tensor.index()];
-    let (hidden, vocab) = (table.rows, table.cols);
+    let (hidden, _vocab) = (table.rows, table.cols);
     use ktir_superdsc::superdsc_opspec::DataFormat;
     let stick = <ktir_superdsc::superdsc_opspec::Fp16 as DataFormat>::ELEMS_PER_STICK;
-    vocab.is_multiple_of(stick) && hidden.is_multiple_of(stick)
+    hidden.is_multiple_of(stick)
 }
 
 /// `Err` here means a TIED model's emission changed shape; hiding that behind the host
@@ -1887,6 +1891,16 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // The layout's budget passes (spill/bank) take the per-loop maps directly: the spill reasons
     // over WHICH tids are per-layer at all (flattened internally), and the BANK needs the class
     // boundaries to know which (class, iteration) launches must stay in one bank.
+    // ⭐ THE COMPOSITE'S TABLE FACTS, CONSTRUCTED ONCE — the layout pass consumes them
+    // below (the ramp/V placements, the table's NaN sentinel row), and the rolled output
+    // carries them out for the numeric gate (`RolledSuperDsc::argmax`): one
+    // construction from the recognition's own plan, so the two consumers can never
+    // disagree about a fact neither re-derives.
+    let argmax_table = argmax_plan.as_ref().map(|p| ArgmaxTable {
+        vocab: p.vocab,
+        hidden: p.hidden,
+        table_tid: p.table_tid,
+    });
     let mut bundle_layout = compute_bundle_layout(
         ir,
         weight_ids,
@@ -1898,11 +1912,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         &per_layer_ext,
         // The composite's ramp/V placements AND the table's NaN sentinel row ride the same
         // layout pass — placed iff the recognition fired, from the facts it proved.
-        argmax_plan.as_ref().map(|p| ArgmaxTable {
-            vocab: p.vocab,
-            hidden: p.hidden,
-            table_tid: p.table_tid,
-        }),
+        argmax_table.clone(),
     )?;
     // ── THE TAPE'S SEGMENTS: prefix, ONE RANGE PER LOOP (an attention class's body), suffix ──
     // The rolled tape is `prefix; [OpenLoop(body₀) CloseLoop]…[OpenLoop(bodyₙ) CloseLoop]; suffix`
@@ -2381,6 +2391,11 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // so its row write is WAR-safe within the step. (The next step's embedding staging
     // still overwrites the row on the host path — the executor flip that makes the
     // suffix end at the gather's row is PR3's stage 3, deliberately not this PR's.)
+    // The composite's minted facts — row and table together, one `Option` so the
+    // numeric gate's two mint-laws (the row exemption, the sentinel row's staging)
+    // cannot disagree about whether a composite exists — carried out on
+    // [`RolledSuperDsc::argmax`]. See [`ArgmaxMint`]'s doc for both laws.
+    let mut argmax_minted: Option<ArgmaxMint> = None;
     if let Some(plan) = argmax_plan {
         // The tail must live wholly in the suffix: the lm-head runs once, after the last
         // layer. A chain node inside a rolled body would mean the recognition grabbed a
@@ -2405,6 +2420,13 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
             "the residual pre-pass named the first body's hidden-in — a loop body holds at \
              least one Compute, so the first body's hin exists",
         );
+        argmax_minted = Some(ArgmaxMint {
+            row_tid,
+            table: argmax_table.clone().expect(
+                "the recognition's table facts exist — they were constructed from the same \
+                 plan that minted this composite, one construction shared with the layout pass",
+            ),
+        });
         let row_cols = ir.tensors[row_tid as usize].cols;
         if row_cols != plan.hidden {
             return Err(SuperDscError(format!(
@@ -3065,6 +3087,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         suffix_weight_bank,
         kv_request_stride,
         suffix_in_tid,
+        argmax: argmax_minted,
         attn_params,
     })
 }
