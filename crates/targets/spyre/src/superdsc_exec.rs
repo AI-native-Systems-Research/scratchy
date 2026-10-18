@@ -4220,7 +4220,10 @@ impl Executor {
             .map(|row| row.plan.sites())
             .sum::<usize>() as u64;
         t.replay_submit_ms += (t2 - t1).as_secs_f64() * 1e3;
-        if t.replay_steps.is_multiple_of(256) {
+        // First step AND the 256 cadence: the canonical gate cell is 64 tokens,
+        // so a cadence-only marker would stay silent in exactly the run that
+        // must prove replay happened — the line IS the liveness proof.
+        if t.replay_steps == 1 || t.replay_steps.is_multiple_of(256) {
             report_replay(&t);
         }
         Ok(Some(()))
