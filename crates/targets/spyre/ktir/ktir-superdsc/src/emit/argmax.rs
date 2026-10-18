@@ -19,6 +19,35 @@
 //!   values are pairwise distinct, so op 5's maximum is UNIQUE — a tie cannot exist in this
 //!   chain, which is why it needs neither `topk.ddl`'s tie convention nor its probe. This is
 //!   the #631 law (host, device, metal all first-max) made structural instead of tested.
+//!
+//! # THE PAD-LANE FORM (opus, 2026-10-18) — sub-stick vocab SERVED, not fenced
+//!
+//! granite-3.1's vocab is 49155 = 768·64 + 3 — three lanes past the last fp16 stick — but
+//! its logits do not live in a 49155-lane buffer: the lm_head's out axis is STICK-PADDED
+//! (49155 real lanes in a 49216-lane staging), so the chain runs at the padded width over
+//! ONE staged constant bias:
+//!
+//!   • **link 0 (new, before the max): `biased = logits + bias`** — fp16, the bias
+//!     mb-broadcast exactly the way the ramp is: `[1, stick_pad(V)]` with 0 on the real
+//!     lanes and −65504 (the fp16 floor — `manifest::argmax`'s own running-max init, the
+//!     device's `0xFFFE`) on the pad lanes. The real lanes add 0 EXACTLY, so first-max
+//!     semantics and NaN handling are unchanged (a NaN pad stays NaN through `+bias` and
+//!     never wins the maxnumf); a pad lane can win the max only what an all-floor real row
+//!     could.
+//!   • **links 1–5 run at `stick_pad(V)` reading `biased`**, and the ramp is staged over
+//!     the SAME padded width as `max(V − i, 0)`. The clamp is VACUOUS on real lanes
+//!     (`V − i ≥ 1` — the landed `V − iota` verbatim) and ZERO on pad lanes, which is the
+//!     form's index-boundedness law: `w ≥ 0` on every lane, so `j ≥ 0` and
+//!     `idx = V − j ≤ V` — a pad lane that beat every real one AND the all-NaN row both
+//!     land EXACTLY on the sentinel row V, never past it (an unclamped pad winner at
+//!     `i > V` would gather past the sentinel, out of the table's view).
+//!   • **the subtract's constant stays the REAL V**, and the table view states
+//!     `[V + 1, H]` — the sentinel row is the first zero row of the stick-padded staging,
+//!     so the extension the whole-stick form already reserves covers it: no extra bytes.
+//!   • **a whole-stick vocab (granite-3.3's 49152) pads to itself** and assembles the
+//!     eight landed links VERBATIM — byte-identical descriptors, the content-key law; the
+//!     bias tid is NAMED by the door but never placed, declared, or staged, so those
+//!     bundles' wires stay byte-identical too.
 //! • **Exact end to end.** The fp16 max value and the eq are exact (both operands are input
 //!   elements); every fp32 value is ≤ V < 2²⁴, so `V − j` recovers the index exactly. The
 //!   LOGITS ARE NEVER CONVERTED — only the {0,1} mask widens (98→196 KB at granite), which is
@@ -106,7 +135,10 @@ pub struct ArgmaxGeom {
     /// The batch width — the decode bundle's `mb` axis. ONE row per in-flight request.
     /// The first cut emits 1 only; the w>1 packing is the second wave.
     pub rows: u32,
-    /// The vocab axis V — the lm_head's sticked `out` axis (49152 at granite).
+    /// The vocab axis V — the REAL vocab count (49155 at granite-3.1, 49152 at
+    /// granite-3.3). The chain's links run at its STICK PADDING (the lm_head's out axis
+    /// is stick-padded; a whole-stick vocab pads to itself), derived inside — and a
+    /// sub-stick vocab selects the pad-lane form (the module doc's pad-lane section).
     pub vocab: u32,
     /// The hidden axis — one embedding row's width in elements (2048 at granite-2b). The
     /// gather's slab; must be a whole fp16-stick multiple (it is, everywhere we ship).
@@ -128,8 +160,17 @@ impl ArgmaxGeom {
 /// scratch the caller places (at rung-independent fixed addresses — the content-key law).
 #[derive(Clone, Copy, Debug)]
 pub struct ArgmaxSlots<'a> {
-    /// INPUT — the lm_head output slot, `[rows, vocab]` vocab-sticked (the staging form).
+    /// INPUT — the lm_head output slot, `[rows, stick_pad(vocab)]` vocab-sticked (the
+    /// staging form; at a whole-stick vocab the padding IS the vocab).
     pub logits: &'a str,
+    /// PAD-LANE FORM ONLY — link 0's output, the bias-applied logits row (fp16, the
+    /// stick-padded width). The whole-stick arm never reads this slot.
+    pub biased: &'a str,
+    /// RESIDENT CONSTANT (pad-lane form only) — the fp16 `[1, stick_pad(vocab)]` lane
+    /// bias: 0 on the real lanes, −65504 (the fp16 floor) on the pad ones. Named by the
+    /// door at [`crate::reserved_tids::argmax_bias_tid`]; placed and staged only by a
+    /// pad-lane bundle.
+    pub bias: &'a str,
     /// scratch — the per-row max (the reduce's RedStick accum).
     pub m: &'a str,
     /// scratch — the {0,1} fp16 mask.
@@ -223,32 +264,70 @@ pub fn try_assemble_argmax(
     let rows = geom.rows;
     let vocab = geom.vocab;
     let hidden = geom.hidden;
+    // ⭐ THE STAGING WIDTH and the form flag — the lm_head's out axis is stick-padded, so
+    //    the chain runs at `stick_pad(V)`; a whole-stick vocab pads to itself and the
+    //    eight landed links below are assembled VERBATIM (byte-identical descriptors —
+    //    the content-key law). A sub-stick vocab (granite-3.1's 49155 → 49216) takes the
+    //    NINE-link pad-lane form: link 0 adds the staged bias BEFORE the max, and links
+    //    1–5 read the biased row at the padded width (the module doc's pad-lane section).
+    let pad_lanes = !vocab.is_multiple_of(Fp16::ELEMS_PER_STICK);
+    let v_pad = if pad_lanes {
+        vocab.div_ceil(Fp16::ELEMS_PER_STICK) * Fp16::ELEMS_PER_STICK
+    } else {
+        vocab
+    };
     // The typed handles. `rb` mints RowBlocked handles (annotation-only — the builders read
     // the name and the kind); the eq's `m` and the sub's `V` ride the broadcast `In` doors.
-    let logits_h = rb(s.logits, rows, vocab);
+    let logits_h = rb(s.logits, rows, v_pad);
+    let biased_h = rb(s.biased, rows, v_pad);
+    let bias_h = rb(s.bias, 1, v_pad);
     let m_h = rb(s.m, rows, Fp16::ELEMS_PER_STICK);
-    let mask_h = rb(s.mask, rows, vocab);
-    let mask32_h = rb(s.mask32, rows, vocab);
-    let ramp_h = rb(s.ramp, 1, vocab);
+    let mask_h = rb(s.mask, rows, v_pad);
+    let mask32_h = rb(s.mask32, rows, v_pad);
+    let ramp_h = rb(s.ramp, 1, v_pad);
     let v_h = rb(s.v_const, 1, Df::Fp32.elems_per_stick());
     let j_h = rb(s.j, rows, Df::Fp32.elems_per_stick());
     let idx32_h = rb(s.idx32, rows, Fp16::ELEMS_PER_STICK);
     let idx_u32_h = rb(s.idx_u32, rows, Fp16::ELEMS_PER_STICK);
-    let mut ops = Vec::with_capacity(8);
+    let mut ops = Vec::with_capacity(9);
+    // Links 1–2 read the BIASED row in the pad-lane form, the logits themselves in the
+    // whole-stick one — one operand name, chosen once here.
+    let (read, read_h) = if pad_lanes {
+        (s.biased, &biased_h)
+    } else {
+        (s.logits, &logits_h)
+    };
 
-    // 1. m = max(logits) — the fp16 stick-family max over the vocab-sticked staging.
-    let max16 = reduce_opspec(OpFunc::Max, rows, vocab, s.logits, s.m, false)?;
+    // 0 (pad-lane form only). biased = logits + bias — fp16, the resident bias
+    //    mb-broadcast (the ramp's own form). The real lanes add 0 EXACTLY; the pad lanes
+    //    add the fp16 floor `manifest::argmax` itself initializes its running max at, so
+    //    a pad lane wins only what an all-floor real row could.
+    if pad_lanes {
+        ops.push(assemble_pointwise_broadcast_df(
+            "argmax_bias",
+            "add",
+            rows,
+            v_pad,
+            &[In::full(&logits_h).ew(), In::mb(&bias_h).ew()],
+            s.biased,
+            Df::Fp16,
+            sym_id_base,
+            layout,
+        ));
+    }
+    // 1. m = max(biased) — the fp16 stick-family max over the vocab-sticked staging.
+    let max16 = reduce_opspec(OpFunc::Max, rows, v_pad, read, s.m, false)?;
     let folds = SdscFoldSet::new(max16.iter.cores_used());
     ops.push(
         emit_sdsc_tiled("argmax_max16", &max16, &folds, sym_id_base, layout).map_err(|e| e.0)?,
     );
-    // 2. mask = (logits == m) — fp16, `m` out-broadcast (the inv_rms column form).
+    // 2. mask = (biased == m) — fp16, `m` out-broadcast (the inv_rms column form).
     ops.push(assemble_pointwise_broadcast_df(
         "argmax_eq",
         "equal",
         rows,
-        vocab,
-        &[In::full(&logits_h).ew(), In::col(&m_h).ew()],
+        v_pad,
+        &[In::full(read_h).ew(), In::col(&m_h).ew()],
         s.mask,
         Df::Fp16,
         sym_id_base,
@@ -260,7 +339,7 @@ pub fn try_assemble_argmax(
         "argmax_cvt",
         "dl16tofp32",
         rows,
-        vocab,
+        v_pad,
         &mask_h,
         &mask32_h,
         sym_id_base,
@@ -271,7 +350,7 @@ pub fn try_assemble_argmax(
         "argmax_mul",
         "multiply",
         rows,
-        vocab,
+        v_pad,
         &[In::full(&mask32_h).ew(), In::mb(&ramp_h).ew()],
         s.w,
         Df::Fp32,
@@ -279,7 +358,7 @@ pub fn try_assemble_argmax(
         layout,
     ));
     // 5. j = max(w) — the fp32 sibling's stick-family max.
-    let max32 = reduce_opspec_df(OpFunc::Max, rows, vocab, s.w, s.j, false, Df::Fp32)?;
+    let max32 = reduce_opspec_df(OpFunc::Max, rows, v_pad, s.w, s.j, false, Df::Fp32)?;
     let folds = SdscFoldSet::new(max32.iter.cores_used());
     ops.push(
         emit_sdsc_tiled("argmax_max32", &max32, &folds, sym_id_base, layout).map_err(|e| e.0)?,
@@ -363,22 +442,27 @@ pub fn assemble_argmax(
 /// [`try_assemble_argmax`] mints (which the CARD runs). The two agree by construction, not
 /// by convention-matching: they read the same three boundary buffers, in the same order —
 ///
-/// * **parameter 0 — `logits`**: the lm_head's output, the graph result, viewed `[1, V]`.
-///   The program loads it WHOLE (one access tile at the origin) and reduces over both axes.
-/// * **parameter 1 — `table`**: the tied lm_head weight, the gather's bank, viewed `[V, H]`
-///   row-major. The program's only access tile over it carries the RUNTIME index (`%idx`,
-///   the chain's own output) as its row corner, so `regions()` falls back to the whole-view
-///   window for it — exactly the geometry the descriptors state.
+/// * **parameter 0 — `logits`**: the lm_head's output, the graph result, viewed `[1,
+///   stick_pad(V)]` — the STAGING width (V itself when the vocab is stick-aligned). The
+///   program loads it WHOLE (one access tile at the origin) and reduces over both axes;
+///   in the pad-lane form the reduce reads the bias-applied row, link 0 below.
+/// * **parameter 1 — `table`**: the tied lm_head weight, the gather's bank, viewed
+///   `[V + 1, H]` row-major — the `+1` is the SENTINEL row, the zero row the `idx = V`
+///   gather reads when nothing real won (the all-NaN row, or a pad lane that beat every
+///   real one; the staging's zero-filled shadow IS that row, so no extra bytes). The
+///   program's only access tile over it carries the RUNTIME index (`%idx`, the chain's
+///   own output) as its row corner, so `regions()` falls back to the whole-view window
+///   for it — exactly the geometry the descriptors state.
 /// * **parameter 2 — `row`**: the next step's input-activation slot, viewed `[1, H]`. The
 ///   program's ONE store writes through a `[1, H]` tile at the origin, which is the
 ///   `written_args` chain the emulator's output readback and the door's `is_out` both key
 ///   on — the row IS the program's output.
 ///
-/// The scratch and the two constants never cross this boundary: the descriptors place them
+/// The scratch and the three constants never cross this boundary: the descriptors place them
 /// as synthetics keyed off the row tid and `argmax_const` reserved tids (the door's own
-/// mint), and the program needs neither — the ramp is COMPUTED in-func (`linalg.index`
-/// arithmetic), because an emulator source binds fp16 and the fp32 `[1, V]` ramp is past
-/// fp16's exact-integer range at every real vocab.
+/// mint), and the program needs neither — the ramp and the pad-lane bias are COMPUTED
+/// in-func (`linalg.index` arithmetic), because an emulator source binds fp16 and the fp32
+/// `[1, V]` ramp is past fp16's exact-integer range at every real vocab.
 ///
 /// ⭐ THE NAME KEYS ON THE ROW, not a node index: every other program is `<kind>_s<node
 /// index>`, but the composite is minted by the WALK over the graph's result — there is no
@@ -412,6 +496,17 @@ pub fn mint_argmax_node(
     };
     let il = |v: Vec<i64>| Attr::IntList(a.ints(v));
 
+    // ⭐ THE FORM — a sub-stick vocab (granite-3.1's 49155) takes the pad-lane form: the
+    //    views state the STICK-PADDED staging width, link 0 applies an in-func bias
+    //    before the max, and the ramp clamps at zero (the module doc's pad-lane section).
+    //    A whole-stick vocab pads to itself and the program is the landed eight-link one.
+    let pad_lanes = !vocab.is_multiple_of(Fp16::ELEMS_PER_STICK);
+    let v_pad = if pad_lanes {
+        vocab.div_ceil(Fp16::ELEMS_PER_STICK) * Fp16::ELEMS_PER_STICK
+    } else {
+        vocab
+    };
+
     // ── the three boundary views, one per parameter (the every-parameter-states-its-width
     //    contract the door's `regions()` enforces) ──
     let view = |ptr: Ssa, rows: i64, cols: i64, res: Ssa| -> Operation<'static> {
@@ -433,7 +528,7 @@ pub fn mint_argmax_node(
         Attr::Int(0),
     );
 
-    // ── the logits, loaded whole at the origin ──
+    // ── the logits, loaded whole at the origin, at the STICK-PADDED staging width ──
     let lg_t = fresh();
     let lg_t_op = Operation::new(
         a,
@@ -441,55 +536,143 @@ pub fn mint_argmax_node(
         OpKind::KtdpConstructAccessTile,
         &[lg_v, c0, c0],
     )
-    .with_attr(a, AttrKey::Shape, il(vec![1, i64::from(vocab)]));
+    .with_attr(a, AttrKey::Shape, il(vec![1, i64::from(v_pad)]));
     let lg = fresh();
     let lg_load = Operation::new(a, Some(lg), OpKind::KtdpLoad, &[lg_t]);
 
-    // 1. m = max(logits) — both axes reduced, so the result is a SCALAR.
-    let m = fresh();
-    let m_red = Operation::new(a, Some(m), OpKind::LinalgReduce, &[lg])
-        .with_attr(a, AttrKey::ReduceFn, Attr::Op(OpKind::ArithMaxnumf))
-        .with_attr(a, AttrKey::Dimensions, il(vec![0, 1]));
-    // 2. mask = (logits == m) — `oeq`, the #631 law's compare; the scalar broadcasts.
-    let eq = fresh();
-    let eq_op = Operation::new(a, Some(eq), OpKind::ArithCmpf, &[lg, m]).with_attr(
-        a,
-        AttrKey::Predicate,
-        Attr::Str("oeq"),
-    );
-    // The scalar V and the ramp's zero seed.
+    // The scalar V — constructed here (before the bias link, whose compare reads it) and
+    // listed with the ramp seed below; an SSA id is a name, not a position.
     let vc = fresh();
     let vc_op = Operation::new(a, Some(vc), OpKind::ArithConstant, &[]).with_attr(
         a,
         AttrKey::Value,
         Attr::Float(f64::from(vocab)),
     );
+
+    // 0 (pad-lane form only). the bias, COMPUTED in-func — the ramp's own law (the
+    //    program is self-contained; the descriptors' copy is the staged fp16 const):
+    //    `(i ≥ V) · (−65504)` over `[1, v_pad]` fp32, the Bool widened through the f32
+    //    multiply — 0 on the real lanes, the fp16 floor (manifest::argmax's own
+    //    running-max init, the device's 0xFFFE) on the pad ones.
+    let bias_link =
+        if pad_lanes {
+            let seed = fresh();
+            let seed_op = Operation::new(a, Some(seed), OpKind::ArithConstant, &[])
+                .with_attr(a, AttrKey::IsTensor, Attr::Bool(true))
+                .with_attr(a, AttrKey::Shape, il(vec![1, i64::from(v_pad)]))
+                .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::F32))
+                .with_attr(a, AttrKey::Value, Attr::Float(0.0));
+            let acc = fresh();
+            let bias = fresh();
+            let bias_gen =
+                {
+                    let i = fresh();
+                    let if_ = fresh();
+                    let ge = fresh();
+                    let neg = fresh();
+                    let b = fresh();
+                    let index_op = Operation::new(a, Some(i), OpKind::LinalgIndex, &[]).with_attr(
+                        a,
+                        AttrKey::Dim,
+                        Attr::Int(1),
+                    );
+                    let sitofp_op = Operation::new(a, Some(if_), OpKind::ArithSitofp, &[i]);
+                    // `i ≥ V` — true exactly on the pad lanes (the column index runs 0..v_pad).
+                    let cmp_op = Operation::new(a, Some(ge), OpKind::ArithCmpf, &[if_, vc])
+                        .with_attr(a, AttrKey::Predicate, Attr::Str("oge"));
+                    // The −65504 is a TENSOR constant (the seeds' own form), not a scalar:
+                    // a Bool tile × f32 SCALAR lands on the Bool grid (binary_float's mixed
+                    // arm keeps the tile's dtype — 0/1, the magnitude destroyed), while
+                    // tile × tile lands `result_float_dtype(Bool, F32)` = F32 — the Bool
+                    // widens through the f32 multiply only when the other operand is a
+                    // tile. This is the same law the landed `w = mask · ramp` multiply
+                    // already rides (Bool tile × F32 tile → F32).
+                    let neg_op = Operation::new(a, Some(neg), OpKind::ArithConstant, &[])
+                        .with_attr(a, AttrKey::IsTensor, Attr::Bool(true))
+                        .with_attr(a, AttrKey::Shape, il(vec![1, i64::from(v_pad)]))
+                        .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::F32))
+                        .with_attr(a, AttrKey::Value, Attr::Float(-65504.0));
+                    let mul_op = Operation::new(a, Some(b), OpKind::ArithMulf, &[ge, neg]);
+                    let yield_op = Operation::new(a, None, OpKind::LinalgYield, &[b]);
+                    let body = a.ops(vec![index_op, sitofp_op, cmp_op, neg_op, mul_op, yield_op]);
+                    Operation {
+                        regions: a.regions(vec![body]),
+                        ..Operation::new(a, Some(bias), OpKind::LinalgGeneric, &[seed])
+                            .with_attr(a, AttrKey::NIns, Attr::Int(0))
+                            .with_attr(a, AttrKey::Bb0Names, Attr::Ssas(a.ssa(vec![acc])))
+                    }
+                };
+            // biased = logits + bias — fp16 (one fp16 operand: `result_float_dtype`), the
+            // SAME IEEE fp16 sum the descriptor chain's pointwise link computes, so the two
+            // bodies of one computation round identically.
+            let biased = fresh();
+            let add_op = Operation::new(a, Some(biased), OpKind::ArithAddf, &[lg, bias]);
+            Some((seed_op, bias_gen, add_op, biased))
+        } else {
+            None
+        };
+    // Links 1–2 read the BIASED row in the pad-lane form, the logits themselves in the
+    // whole-stick one.
+    let read = bias_link.as_ref().map_or(lg, |l| l.3);
+
+    // 1. m = max(read) — both axes reduced, so the result is a SCALAR.
+    let m = fresh();
+    let m_red = Operation::new(a, Some(m), OpKind::LinalgReduce, &[read])
+        .with_attr(a, AttrKey::ReduceFn, Attr::Op(OpKind::ArithMaxnumf))
+        .with_attr(a, AttrKey::Dimensions, il(vec![0, 1]));
+    // 2. mask = (read == m) — `oeq`, the #631 law's compare; the scalar broadcasts.
+    let eq = fresh();
+    let eq_op = Operation::new(a, Some(eq), OpKind::ArithCmpf, &[read, m]).with_attr(
+        a,
+        AttrKey::Predicate,
+        Attr::Str("oeq"),
+    );
+    // The ramp's zero seed, at the same stick-padded width.
     let seed = fresh();
     let seed_op = Operation::new(a, Some(seed), OpKind::ArithConstant, &[])
         .with_attr(a, AttrKey::IsTensor, Attr::Bool(true))
-        .with_attr(a, AttrKey::Shape, il(vec![1, i64::from(vocab)]))
+        .with_attr(a, AttrKey::Shape, il(vec![1, i64::from(v_pad)]))
         .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::F32))
         .with_attr(a, AttrKey::Value, Attr::Float(0.0));
-    // 3–4. the ramp, COMPUTED: `V − iota` over `[1, V]` fp32. The generic runs once,
-    //    vectorized over the seed's shape; `linalg.index {dim: 1}` is the column index, and
-    //    the bb0 name list names the (unused) outs accumulator so the region's argument
-    //    names are stated — the first body op (`linalg.index`) has no operands to infer
-    //    them from.
+    // 3–4. the ramp, COMPUTED: `max(V − iota, 0)` over `[1, v_pad]` fp32. On the real
+    //    lanes the clamp is VACUOUS (`V − i ≥ 1` — the landed `V − iota` verbatim); on
+    //    the pad lanes it is ZERO — the pad-lane form's index-boundedness law: `w ≥ 0` on
+    //    every lane, so `j ≥ 0` and `idx = V − j ≤ V`, and nothing-real-won lands EXACTLY
+    //    on the sentinel row V, never past it. The generic runs once, vectorized over the
+    //    seed's shape; `linalg.index {dim: 1}` is the column index, and the bb0 name list
+    //    names the (unused) outs accumulator so the region's argument names are stated —
+    //    the first body op (`linalg.index`) has no operands to infer them from.
     let acc = fresh();
     let ramp = fresh();
     let ramp_gen = {
         let i = fresh();
         let if_ = fresh();
-        let r = fresh();
+        let d = fresh();
         let index_op = Operation::new(a, Some(i), OpKind::LinalgIndex, &[]).with_attr(
             a,
             AttrKey::Dim,
             Attr::Int(1),
         );
         let sitofp_op = Operation::new(a, Some(if_), OpKind::ArithSitofp, &[i]);
-        let subf_op = Operation::new(a, Some(r), OpKind::ArithSubf, &[vc, if_]);
+        let subf_op = Operation::new(a, Some(d), OpKind::ArithSubf, &[vc, if_]);
+        let (r, clamp) = if pad_lanes {
+            let z = fresh();
+            let r = fresh();
+            let zero_op = Operation::new(a, Some(z), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(0.0),
+            );
+            let maxf_op = Operation::new(a, Some(r), OpKind::ArithMaxf, &[d, z]);
+            (r, vec![zero_op, maxf_op])
+        } else {
+            (d, Vec::new())
+        };
         let yield_op = Operation::new(a, None, OpKind::LinalgYield, &[r]);
-        let body = a.ops(vec![index_op, sitofp_op, subf_op, yield_op]);
+        let mut body = vec![index_op, sitofp_op, subf_op];
+        body.extend(clamp);
+        body.push(yield_op);
+        let body = a.ops(body);
         Operation {
             regions: a.regions(vec![body]),
             ..Operation::new(a, Some(ramp), OpKind::LinalgGeneric, &[seed])
@@ -513,8 +696,10 @@ pub fn mint_argmax_node(
     let idx = fresh();
     let idx_op = Operation::new(a, Some(idx), OpKind::ArithFptosi, &[idx32]);
     // 8. row = gather(table, idx) — the tied bank read AT THE RUNTIME ROW: one access tile
-    //    over the table view whose row corner is `%idx` (bounds-checked against `[V, H]`
-    //    by the interpreter), loaded and stored through the row's own origin tile.
+    //    over the table view whose row corner is `%idx` (bounds-checked against `[V+1, H]`
+    //    by the interpreter — the sentinel row is IN the view, so the nothing-real-won
+    //    gather is in-bounds by construction), loaded and stored through the row's own
+    //    origin tile.
     let src_t = fresh();
     let src_t_op = Operation::new(
         a,
@@ -535,27 +720,23 @@ pub fn mint_argmax_node(
     .with_attr(a, AttrKey::Shape, il(vec![1, i64::from(hidden)]));
     let store = Operation::new(a, None, OpKind::KtdpStore, &[row_val, row_t]);
 
-    let operations = a.ops(vec![
+    let mut ops = vec![
         c0_op,
-        view(lg_ptr, 1, i64::from(vocab), lg_v),
-        view(tb_ptr, i64::from(vocab), i64::from(hidden), tb_v),
+        view(lg_ptr, 1, i64::from(v_pad), lg_v),
+        view(tb_ptr, i64::from(vocab) + 1, i64::from(hidden), tb_v),
         view(row_ptr, 1, i64::from(hidden), row_v),
         lg_t_op,
         lg_load,
-        m_red,
-        eq_op,
         vc_op,
-        seed_op,
-        ramp_gen,
-        w_op,
-        j_red,
-        idx32_op,
-        idx_op,
-        src_t_op,
-        row_load,
-        row_t_op,
-        store,
+    ];
+    if let Some((seed_op, bias_gen, add_op, _)) = bias_link {
+        ops.extend([seed_op, bias_gen, add_op]);
+    }
+    ops.extend([
+        m_red, eq_op, seed_op, ramp_gen, w_op, j_red, idx32_op, idx_op, src_t_op, row_load,
+        row_t_op, store,
     ]);
+    let operations = a.ops(ops);
     let func = IRFunction {
         name: a.str(format!("argmax_o{row_tid}")),
         arguments: a.args(vec![

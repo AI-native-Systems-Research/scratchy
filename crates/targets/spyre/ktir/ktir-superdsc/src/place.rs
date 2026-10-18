@@ -260,8 +260,11 @@ pub enum SynthRole {
     //    holds. Every buffer is rows == 1 (the k=1 first cut); the formats follow the chain's
     //    links (see `emit::argmax`): the {0,1} mask stays fp16 until the dl16tofp32 convert,
     //    the weighted mask and the index arithmetic are fp32, and the index slot the gather
-    //    reads is SENUINT32. The ramp and the scalar V are NOT here — they are reserved-tid
-    //    consts (`reserved_tids::argmax_const`), placed by the layout, not synthetics.
+    //    reads is SENUINT32. `AmBiased` is the PAD-LANE form's own link-0 output (the
+    //    bias-applied logits row, fp16 at the stick-padded width); the whole-stick form never
+    //    declares it. The ramp, the scalar V, and the pad-lane bias are NOT here — they are
+    //    reserved-tid consts (`reserved_tids::argmax_const`), placed by the layout, not
+    //    synthetics.
     AmMax,
     AmMask,
     AmMask32,
@@ -269,6 +272,7 @@ pub enum SynthRole {
     AmJ,
     AmIdx32,
     AmIdxU32,
+    AmBiased,
 }
 
 impl fmt::Display for SynthRole {
@@ -369,6 +373,7 @@ impl fmt::Display for SynthRole {
             Self::AmJ => f.write_str("amj"),
             Self::AmIdx32 => f.write_str("amidx32"),
             Self::AmIdxU32 => f.write_str("amidxu32"),
+            Self::AmBiased => f.write_str("ambiased"),
         }
     }
 }

@@ -28,13 +28,17 @@ use ktir_superdsc::emit::argmax::{
     ArgmaxGeom, ArgmaxSlots, TiedLmHeadEmbedding, assemble_argmax, try_assemble_argmax,
 };
 
-/// granite-3.3-2b's own vocab/hidden — the PR3a gate model's geometry.
+/// granite-3.3-2b's own vocab/hidden — the PR3a gate model's geometry. granite-3.1's
+/// 49155 (`PAD_VOCAB` below) is the pad-lane leg's: three lanes past the last stick.
 const VOCAB: u32 = 49152;
 const HIDDEN: u32 = 2048;
+const PAD_VOCAB: u32 = 49155;
 
 fn slots() -> ArgmaxSlots<'static> {
     ArgmaxSlots {
         logits: "s550_logits",
+        biased: "s559_biased",
+        bias: "c_argmax_bias",
         m: "s551_m",
         mask: "s552_mask",
         mask32: "s553_mask32",
@@ -54,6 +58,22 @@ fn chain() -> Vec<serde_json::Value> {
     let tied = TiedLmHeadEmbedding::from_tied_config(true).expect("granite ties");
     assemble_argmax(
         ArgmaxGeom::k1(VOCAB, HIDDEN),
+        &slots(),
+        tied,
+        &mut sid,
+        None,
+    )
+    .into_iter()
+    .map(|e| serde_json::to_value(&e.op).expect("serializable"))
+    .collect()
+}
+
+/// The pad-lane form's chain — the same assembly at granite-3.1's own vocab.
+fn pad_chain() -> Vec<serde_json::Value> {
+    let mut sid = -1i64;
+    let tied = TiedLmHeadEmbedding::from_tied_config(true).expect("granite ties");
+    assemble_argmax(
+        ArgmaxGeom::k1(PAD_VOCAB, HIDDEN),
         &slots(),
         tied,
         &mut sid,
@@ -104,6 +124,80 @@ fn the_chain_is_eight_ops_in_dependency_order() {
             "identity",
         ],
         "the composite argmax is exactly opus's chain; any other order or member is a bug"
+    );
+}
+
+/// The PAD-LANE form at granite-3.1's own vocab (49155 = 768·64 + 3): NINE ops, the add
+/// first, every later link at the stick-padded staging width (49216), the whole-stick
+/// chain's kernels otherwise unchanged.
+#[test]
+fn the_pad_lane_chain_is_nine_ops_with_the_add_first() {
+    let chain = pad_chain();
+    let names: Vec<&str> = chain.iter().map(op_func_name).collect();
+    assert_eq!(
+        names,
+        vec![
+            "add",
+            "max",
+            "equal",
+            "dl16tofp32",
+            "mul",
+            "max",
+            "sub",
+            "fp32toint32",
+            "identity",
+        ],
+        "the pad-lane composite is the landed chain with the bias-add as link 0"
+    );
+    // The whole chain runs at the stick-padded staging width — the reduce's own N_
+    // states 49216, never the real 49155 (the dxp scheduler rejects sub-stick tiles).
+    let out = body(&chain[1])
+        .get("N_")
+        .and_then(|n| n.get("out_"))
+        .and_then(|v| v.as_u64())
+        .expect("out_ in N_ of the pad-lane max");
+    assert_eq!(
+        out,
+        u64::from(PAD_VOCAB.div_ceil(64) * 64),
+        "the pad-lane links run at the stick-padded staging width"
+    );
+    // And the add's own width: fp16 at the padded staging width — the mb-broadcast
+    // operand form the mul's ramp rides, at the link's own stick extent.
+    let add_out = body(&chain[0])
+        .get("N_")
+        .and_then(|n| n.get("out_"))
+        .and_then(|v| v.as_u64())
+        .expect("out_ in N_ of the add");
+    assert_eq!(
+        add_out,
+        u64::from(PAD_VOCAB.div_ceil(64) * 64),
+        "the bias-add runs at the stick-padded staging width too"
+    );
+}
+
+/// The two chains differ ONLY by the pad-lane links: the pad-lane form's links 1..8
+/// resolve the SAME vendor kernels as the whole-stick chain's eight (the landed chain,
+/// kernel for kernel — only the widths move to the padded staging), and the whole-stick
+/// chain's own widths are the real vocab (the `N_` asserts above pin each side's).
+#[test]
+fn the_whole_stick_chain_is_the_pad_lane_one_minus_the_add() {
+    let plain = chain();
+    let pad = pad_chain();
+    assert_eq!(
+        plain.len() + 1,
+        pad.len(),
+        "the pad-lane form adds exactly link 0"
+    );
+    let kernels = |c: &[serde_json::Value]| {
+        c.iter()
+            .map(|d| op_func_name(d).to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        kernels(&plain),
+        kernels(&pad)[1..],
+        "the landed kernels, verbatim, in both forms — the pad-lane form adds the add and \
+         widens the links; it changes no other member"
     );
 }
 
@@ -197,23 +291,32 @@ fn a_wide_geometry_is_refused_as_second_wave() {
 
 #[test]
 fn stage_the_probe_jsons_for_the_pod() {
-    // Stage the probe GROUP — the dump's own dir contract, which is what `dxp_standalone
-    // -d <dir>` (the real bake's compile driver) reads: `bundle.mlir`, one
-    // `sdscbundle.sdsc_execute` per link in dependency order, plus one `sdsc_N.json` per
-    // link in the dump's own wire form — the sdsc WRAPPED IN ITS DSC'S NAME
-    // (`importJsonObj` demands every top-level key's value carry `dscs_`; the bare sdsc
-    // object is refused as "No dsc in sdsc input") and WITHOUT `target_` (the driver's
-    // `-b`/default supplies the target; none of the real dump files carry it). The pod leg
-    // runs `dxp_standalone -d <dir>` on the whole group — rc=0 is the gate, which is
-    // strictly stronger than `ddc_standalone -s`'s selection: ddc_standalone demands the
-    // hand-written FIXTURE form (chip descriptors `B_`/`ChipD_`/`CoreD_`/… that the real
-    // pipeline fills in code), so even the real dump files abort there with a `map::at`
-    // — reproduced and pinned during this leg. The run logs the pod's compile load first
-    // (the quiet-pod law).
-    let dir = std::env::temp_dir().join("argmax-probes");
+    stage_group("argmax-probes", &chain());
+    // The pad-lane group too — the NINE-link form at granite-3.1's own vocab. The pod
+    // leg runs `dxp_standalone -d <dir>` over both groups; rc=0 on the pad-lane one is
+    // the new link's own gate (the add is the pointwise family's fp16 mb-broadcast form,
+    // the mul's shape at fp16 precision — the one descriptor this form adds).
+    stage_group("argmax-probes-padlane", &pad_chain());
+}
+
+/// Stage one probe GROUP — the dump's own dir contract, which is what `dxp_standalone
+/// -d <dir>` (the real bake's compile driver) reads: `bundle.mlir`, one
+/// `sdscbundle.sdsc_execute` per link in dependency order, plus one `sdsc_N.json` per
+/// link in the dump's own wire form — the sdsc WRAPPED IN ITS DSC'S NAME
+/// (`importJsonObj` demands every top-level key's value carry `dscs_`; the bare sdsc
+/// object is refused as "No dsc in sdsc input") and WITHOUT `target_` (the driver's
+/// `-b`/default supplies the target; none of the real dump files carry it). The pod leg
+/// runs `dxp_standalone -d <dir>` on the whole group — rc=0 is the gate, which is
+/// strictly stronger than `ddc_standalone -s`'s selection: ddc_standalone demands the
+/// hand-written FIXTURE form (chip descriptors `B_`/`ChipD_`/`CoreD_`/… that the real
+/// pipeline fills in code), so even the real dump files abort there with a `map::at`
+/// — reproduced and pinned during this leg. The run logs the pod's compile load first
+/// (the quiet-pod law).
+fn stage_group(dir_name: &str, chain: &[serde_json::Value]) {
+    let dir = std::env::temp_dir().join(dir_name);
     std::fs::create_dir_all(&dir).expect("probe dir");
     let mut bundle = String::from("module {\n  func.func @sdsc_bundle() {\n");
-    for (i, op) in chain().into_iter().enumerate() {
+    for (i, op) in chain.iter().enumerate() {
         let sdsc = op;
         let dsc_name = sdsc["dscs_"][0]
             .as_object()
@@ -223,7 +326,7 @@ fn stage_the_probe_jsons_for_the_pod() {
             .expect("the dsc's own name")
             .clone();
         let mut wrapped = serde_json::Map::new();
-        wrapped.insert(dsc_name, sdsc);
+        wrapped.insert(dsc_name, sdsc.clone());
         let path = dir.join(format!("sdsc_{i}.json"));
         std::fs::write(
             &path,

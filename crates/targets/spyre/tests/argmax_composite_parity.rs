@@ -41,12 +41,23 @@ use scratchy_target_spyre::runner::SpyreSession;
 /// the probes hold granite's 49152-wide geometry on the assembly side).
 const VOCAB: usize = 128;
 const HIDDEN: usize = 128;
+/// The two PAD-LANE vocabs, granite's own shapes scaled: 131 = 2·64 + 3 (61 pad lanes in
+/// the 192-wide staging — granite-3.1's 49155 = 768·64 + 3) and 135 = 2·64 + 7 (57 pad
+/// lanes — granite-3.3-2b-instruct's 49159 = 768·64 + 7). Two widths, because a preset
+/// name would have missed that the pad count is the only thing that differs.
+const PAD_VOCAB_A: usize = 131;
+const PAD_VOCAB_B: usize = 135;
 /// The three boundary tids — distinct, as a real bundle's are. The table rides the
 /// resident-tensor channel (the session's `weights`), the logits the per-step source
 /// channel (which narrows to f16 — the images are pinned first), the row is the output.
 const LOGITS_TID: u64 = 2;
 const TABLE_TID: usize = 1;
 const ROW_TID: u64 = 3;
+
+/// The staging width a vocab pads to — the lm_head's own out-axis law.
+fn stick_pad(vocab: usize) -> usize {
+    vocab.div_ceil(64) * 64
+}
 
 /// f16 round-trip through the emulator's storage: the value an f16 element holds after
 /// `Tile::compute`'s single rounding — the moe chain test's own helper.
@@ -55,27 +66,32 @@ fn f16(v: f32) -> f32 {
     ktir_emulator::codec::decode(&bits, 1, ktir_emulator::dtypes::DType::F16)[0]
 }
 
-/// The tied embedding table, row-major `[vocab, hidden]` — the orientation the mint's
-/// table VIEW states (out-major: token v's embedding is out-slot v). Row `v` is
-/// `(131·v + 17·h) mod 251 − 125`: every value f16-exact, and rows pairwise DISTINCT
-/// (131 is invertible mod 251, so `v ≠ v'` differ at every lane — a wrong gather index
-/// cannot pass as a right one).
-fn table() -> Vec<f32> {
-    (0..VOCAB)
-        .flat_map(|v| {
-            (0..HIDDEN).map(move |h| {
-                let x = (131 * v + 17 * h) % 251;
-                f16(x as f32 - 125.0)
-            })
-        })
-        .collect()
+/// The tied embedding table, row-major `[vocab + 1, hidden]` — the orientation the mint's
+/// table VIEW states (out-major: token v's embedding is out-slot v), with the LAST row
+/// the ZERO SENTINEL the `idx = V` gather reads when nothing real won (the staging's
+/// zero-filled shadow, mirrored here). Row `v < V` is `(131·v + 17·h) mod 251 − 125`:
+/// every value f16-exact, and rows pairwise DISTINCT (131 is invertible mod 251, so
+/// `v ≠ v'` differ at every lane — a wrong gather index cannot pass as a right one, and
+/// neither can the sentinel pass as token 0's row).
+fn table(vocab: usize) -> Vec<f32> {
+    let mut t = Vec::with_capacity((vocab + 1) * HIDDEN);
+    for v in 0..vocab {
+        for h in 0..HIDDEN {
+            let x = (131 * v + 17 * h) % 251;
+            t.push(f16(x as f32 - 125.0));
+        }
+    }
+    t.resize((vocab + 1) * HIDDEN, 0.0);
+    t
 }
 
-/// Execute the walk-mint composite over one logits row and return the gathered row.
-fn composite_row(logits: &[f32], table: &[f32]) -> Vec<f32> {
+/// Execute the walk-mint composite over one logits row and return the gathered row. The
+/// logits slice is the FULL stick-padded staging row (the caller owns the pad lanes);
+/// the table carries its sentinel row.
+fn composite_row(vocab: usize, logits: &[f32], table: &[f32]) -> Vec<f32> {
     let tied = TiedLmHeadEmbedding::from_tied_config(true).expect("granite ties");
     let k = mint_argmax_node(
-        VOCAB as u32,
+        vocab as u32,
         HIDDEN as u32,
         LOGITS_TID as u32,
         TABLE_TID as u32,
@@ -87,7 +103,8 @@ fn composite_row(logits: &[f32], table: &[f32]) -> Vec<f32> {
     e.ktir = Some(k);
     let ops = vec![e];
     let groups = ktir_groups(&ops, FoldGrouping::Split).expect("bind the composite's program");
-    // The table as ONE resident f16 tensor, row-major [vocab, hidden] LE.
+    // The table as ONE resident f16 tensor, row-major [vocab + 1, hidden] LE — the
+    // sentinel row included, zeros, exactly what the staging's shadow holds.
     let table_bytes: Vec<u8> = table
         .iter()
         .flat_map(|v| ktir_emulator::codec::encode(&[*v], ktir_emulator::dtypes::DType::F16))
@@ -96,27 +113,28 @@ fn composite_row(logits: &[f32], table: &[f32]) -> Vec<f32> {
         TABLE_TID,
         table_bytes,
         scratchy_tensors::DType::F16,
-        vec![VOCAB, HIDDEN],
+        vec![vocab + 1, HIDDEN],
     )];
     let mut session = SpyreSession::new_multi(&[(&groups, &[ROW_TID])], weights)
         .expect("build the composite's session");
     let out = session
         .run_step(
             0,
-            vec![(LOGITS_TID, logits.to_vec(), vec![1, VOCAB])],
+            vec![(LOGITS_TID, logits.to_vec(), vec![1, stick_pad(vocab)])],
             &[(ROW_TID, 0)],
         )
         .expect("run the composite");
     out[&ROW_TID].clone()
 }
 
-/// One parity leg: run the composite, run `manifest::argmax` over the SAME images, and
-/// demand the gathered row IS the oracle's index's row — the index itself is never read
-/// back (the composite's output is the ROW), so a wrong index can only pass by gathering
-/// a row that happens to equal the right one, and the table's rows are pairwise distinct.
-fn assert_parity(what: &str, logits: &[f32], table: &[f32]) {
-    let got = composite_row(logits, table);
-    let want_idx = manifest::argmax(logits);
+/// One parity leg: run the composite, run `manifest::argmax` over the SAME REAL images
+/// (the host never sees the pad lanes — its row is the unpadded one), and demand the
+/// gathered row IS the oracle's index's row — the index itself is never read back (the
+/// composite's output is the ROW), so a wrong index can only pass by gathering a row
+/// that happens to equal the right one, and the table's rows are pairwise distinct.
+fn assert_parity(what: &str, vocab: usize, logits: &[f32], table: &[f32]) {
+    let got = composite_row(vocab, logits, table);
+    let want_idx = manifest::argmax(&logits[..vocab]);
     let want = &table[want_idx * HIDDEN..(want_idx + 1) * HIDDEN];
     assert_eq!(
         got.len(),
@@ -136,12 +154,12 @@ fn assert_parity(what: &str, logits: &[f32], table: &[f32]) {
 /// row would expose an init above the data.
 #[test]
 fn a_unique_maximum_gathers_its_own_row() {
-    let table = table();
+    let table = table(VOCAB);
     let mut logits: Vec<f32> = (-100..(VOCAB as i64 - 100))
         .map(|i| f16(i as f32))
         .collect();
     logits[41] = f16(500.0); // strictly above every other lane
-    assert_parity("the unique maximum", &logits, &table);
+    assert_parity("the unique maximum", VOCAB, &logits, &table);
 }
 
 /// TIED MAXIMA at i < j — the EARLIER index wins. This is the ramp arithmetic's whole
@@ -150,7 +168,7 @@ fn a_unique_maximum_gathers_its_own_row() {
 /// here EXECUTED, exactly the way `manifest::argmax`'s strict `>` keeps index 7.
 #[test]
 fn tied_maxima_take_the_earlier_index() {
-    let table = table();
+    let table = table(VOCAB);
     let mut logits: Vec<f32> = (0..VOCAB).map(|i| f16((i % 13) as f32)).collect();
     logits[7] = f16(99.0);
     logits[90] = f16(99.0); // the tie: equal in fp16, and 7 < 90
@@ -159,15 +177,128 @@ fn tied_maxima_take_the_earlier_index() {
         7,
         "the host oracle agrees: first wins"
     );
-    assert_parity("the tied maximum", &logits, &table);
+    assert_parity("the tied maximum", VOCAB, &logits, &table);
 }
 
 /// An ALL-EQUAL row — every lane ties with every other, index 0 must win. The mask is
 /// all-ones, so `w` IS the ramp and its maximum is `V` at lane 0, giving `idx = V − V = 0`.
 #[test]
 fn an_all_equal_row_gathers_token_zero() {
-    let table = table();
+    let table = table(VOCAB);
     let logits: Vec<f32> = (0..VOCAB).map(|_| f16(5.0)).collect();
     assert_eq!(manifest::argmax(&logits), 0);
-    assert_parity("the all-equal row", &logits, &table);
+    assert_parity("the all-equal row", VOCAB, &logits, &table);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//  THE PAD-LANE FORM — opus's ruling, executed: ONE staged bias (0 real / −65504 pad)
+//  before the max, pinned at BOTH granite pad widths (61 lanes and 57).
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ⭐⭐⭐ OPUS'S PINNED TEST — garbage in the pad lanes EXCEEDING the real maximum must
+/// still pick a real lane. Without the bias, the pad lanes (unwritten staging, whatever
+/// the buffer held) would own the max and the gather would answer a pad row; with it,
+/// a pad lane holds `garbage − 65504` — at or below the fp16 floor for any garbage the
+/// buffer can carry — and the real maximum wins. granite-3.1's own shape scaled: 61 pad
+/// lanes in the 192-wide staging, the garbage pinned at f16's max finite (the worst a
+/// pad lane can hold short of inf).
+#[test]
+fn garbage_pad_lanes_exceeding_the_real_max_still_pick_a_real_lane() {
+    let vocab = PAD_VOCAB_A;
+    let table = table(vocab);
+    let mut logits: Vec<f32> = (-100..(vocab as i64 - 100))
+        .map(|i| f16(i as f32))
+        .collect();
+    logits[41] = f16(500.0); // the real maximum
+    logits.resize(stick_pad(vocab), f16(65504.0)); // 61 pad lanes of the WORST garbage
+    assert_parity("the garbage-padded row", vocab, &logits, &table);
+    // The control: the host oracle over the REAL lanes picks 41, so the leg above demands
+    // the composite does too — against pads that beat 500 by two orders of magnitude.
+    assert_eq!(manifest::argmax(&logits[..vocab]), 41);
+}
+
+/// The SAME form at the SECOND pad width — 135 = 2·64 + 7, granite-3.3-2b-instruct's
+/// 49159 scaled: 57 pad lanes instead of 61. TIED maxima on the real lanes, garbage
+/// pads: the earlier index still wins — first-max semantics are the bias's OWN promise
+/// ("unchanged"), and this leg pins that the promise holds at a second pad count (the
+/// structural difference a preset-name list would have missed).
+#[test]
+fn the_second_pad_width_keeps_first_max_semantics() {
+    let vocab = PAD_VOCAB_B;
+    let table = table(vocab);
+    let mut logits: Vec<f32> = (0..vocab).map(|i| f16((i % 13) as f32)).collect();
+    logits[7] = f16(99.0);
+    logits[90] = f16(99.0); // the tie: equal in fp16, and 7 < 90
+    assert_eq!(manifest::argmax(&logits), 7, "the host oracle: first wins");
+    logits.resize(stick_pad(vocab), f16(-30000.0)); // 57 pad lanes of garbage
+    assert_parity("the tied maximum at 57 pad lanes", vocab, &logits, &table);
+}
+
+/// ⭐ THE NaN SENTINEL, executed — an all-NaN REAL row (the host's own refusal shape:
+/// `manifest::argmax` floors to token 0) gathers the ZERO row at index V, both forms.
+/// The device's answer is the sentinel row, which the executor REFUSES (`idx ≥ vocab`)
+/// — the host answers token 0; that host/device divergence is the filed follow-up, and
+/// this test pins the device's half: the gathered row is the sentinel, NOT token 0's
+/// row (the table's rows are pairwise distinct, so zeros cannot pass as token 0).
+#[test]
+fn an_all_nan_row_lands_on_the_sentinel_row_not_token_zero() {
+    // The pad-lane form, the harsher leg: NaN real lanes AND finite garbage pads, so the
+    // biased max is a PAD value — only the clamped ramp's zero weight keeps the index at
+    // the sentinel instead of walking past it.
+    let vocab = PAD_VOCAB_A;
+    let tab = table(vocab);
+    let mut logits: Vec<f32> = vec![f32::NAN; vocab];
+    logits.resize(stick_pad(vocab), f16(30000.0));
+    let got = composite_row(vocab, &logits, &tab);
+    assert_eq!(
+        got,
+        vec![0.0; HIDDEN],
+        "the all-NaN row gathers the ZERO sentinel"
+    );
+    assert_ne!(
+        got,
+        tab[..HIDDEN].to_vec(),
+        "the sentinel is NOT token 0's row — the divergence the follow-up issue owns"
+    );
+    assert_eq!(
+        manifest::argmax(&logits[..vocab]),
+        0,
+        "the host floors to token 0"
+    );
+
+    // The whole-stick form's own leg: all-NaN everywhere, the mask all-false, `w ≡ 0`,
+    // `idx = V − 0 = V` — the sentinel row the landed extension reserved, now IN the
+    // view (the [V, H] view made this gather out-of-bounds; [V + 1, H] is the fix).
+    let whole_table = table(VOCAB);
+    let logits: Vec<f32> = vec![f32::NAN; VOCAB];
+    let got = composite_row(VOCAB, &logits, &whole_table);
+    assert_eq!(
+        got,
+        vec![0.0; HIDDEN],
+        "the whole-stick all-NaN row gathers the ZERO sentinel too"
+    );
+}
+
+/// The residual hole, pinned as the sentinel's own: every real lane at the fp16 floor
+/// (the only row where a biased pad lane — `garbage − 65504` — can strictly beat every
+/// real one) also lands on the sentinel. The host floors such a row to token 0; the
+/// device refuses it. That is the bias's stated boundary — "a pad lane can win only
+/// what an all-floor real row could" — made executable.
+#[test]
+fn an_all_floor_row_with_winning_garbage_lands_on_the_sentinel_too() {
+    let vocab = PAD_VOCAB_A;
+    let table = table(vocab);
+    let mut logits: Vec<f32> = vec![f16(-65504.0); vocab];
+    logits.resize(stick_pad(vocab), f16(65504.0)); // biased pads = 0 > the all-floor reals
+    let got = composite_row(vocab, &logits, &table);
+    assert_eq!(
+        got,
+        vec![0.0; HIDDEN],
+        "the all-floor row gathers the ZERO sentinel — the executor refuses it"
+    );
+    assert_eq!(
+        manifest::argmax(&logits[..vocab]),
+        0,
+        "the host floors the same row to token 0 — the documented divergence"
+    );
 }

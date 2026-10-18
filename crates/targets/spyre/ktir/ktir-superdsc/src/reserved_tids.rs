@@ -570,13 +570,15 @@ pub const RESERVED_REGIONS: [TidRegion; 9] = [
     // every reserved id is a number that has been baked into artifacts, and moving one to tidy the
     // map would silently repoint it.
     // ⭐ THE ARGMAX CONSTS take the top of that gap (the `kv_block_index` precedent — the top of a
-    // deliberately-empty hole, so nothing baked moves): the fp32 ramp `V − iota` and the scalar `V`
-    // the composite argmax chain's descriptors read. Two slots, placed only when a bundle carries
+    // deliberately-empty hole, so nothing baked moves): the fp32 ramp `V − iota`, the scalar `V`,
+    // and the fp16 pad-lane bias the composite argmax chain's descriptors read. Three slots — the
+    // third grows DOWN into the hole the region's own doc keeps empty, so the absolute base (and
+    // the two ids already baked into artifacts) never moves — placed only when a bundle carries
     // `Program::Argmax` — every other model's wire stays byte-identical.
     TidRegion {
         name: "argmax_const",
         base: u32::MAX - 1_000_147,
-        slots: 2,
+        slots: 3,
     },
     // ⛔ BOUNDED, WHERE IT USED TO BE OPEN-ENDED. `kct_resident_tid(k_id) = BASE - k_id` had no
     // floor at all: a model with enough tensors walked it downward without limit. One million
@@ -757,6 +759,18 @@ pub fn argmax_v_tid() -> u32 {
     reserved_region("argmax_const").at(1)
 }
 
+/// The fp16 `[1, stick_pad(V)]` PAD-LANE BIAS — the sub-stick vocab form's link-0
+/// constant (opus, 2026-10-18): 0 on the real lanes and −65504 (the fp16 floor —
+/// `manifest::argmax`'s own running-max init, the device's `0xFFFE`) on the pad lanes,
+/// added to the logits BEFORE the max so a pad lane can win only what an all-floor real
+/// row could. The slot is read by the chain's descriptors only in the pad-lane form —
+/// a whole-stick vocab (granite-3.3's 49152) never places or stages it, keeping those
+/// bundles byte-identical. fp16, so it stages through the weight channel's
+/// IEEE-f16→SEN convert, not the raw fp32 const bind the ramp and V ride.
+pub fn argmax_bias_tid() -> u32 {
+    reserved_region("argmax_const").at(2)
+}
+
 /// ⛔⛔⛔ THE REGRESSION THAT ADDING A REGION CAUSED, PINNED — a resident Kᵗ kernel and the gather's
 /// index tensor must not be one tid.
 ///
@@ -798,17 +812,30 @@ fn a_named_region_survives_an_insertion_above_it() {
         KV_BLOCK_INDEX_TID,
         "the kv_block_index region's only slot is not KV_BLOCK_INDEX_TID"
     );
-    // The argmax consts: two DISTINCT tids inside their own region, below the gap's top and above
-    // `kct_resident` — the two constants a composite-carrying bundle stages, never one tid.
+    // The argmax consts: three DISTINCT tids inside their own region, below the gap's top and
+    // above `kct_resident` — the three constants a composite-carrying bundle stages, never
+    // one tid.
     assert_ne!(
         argmax_ramp_tid(),
         argmax_v_tid(),
         "the argmax ramp and the scalar V are one tid — the descending ramp and the vocab count \
          would share one placement and one bind"
     );
+    assert_ne!(
+        argmax_bias_tid(),
+        argmax_ramp_tid(),
+        "the pad-lane bias and the ramp are one tid — an fp16 lane bias and an fp32 column ramp \
+         would share one placement and one bind"
+    );
+    assert_ne!(
+        argmax_bias_tid(),
+        argmax_v_tid(),
+        "the pad-lane bias and the scalar V are one tid — the bias would read the vocab count's \
+         bytes as fp16 lanes"
+    );
     assert!(
-        argmax_v_tid() > reserved_region("kct_resident").base,
-        "the argmax consts walked below the empty gap into kct_resident's base"
+        argmax_bias_tid() > reserved_region("kct_resident").base,
+        "the argmax consts (bias included) walked below the empty gap into kct_resident's base"
     );
     assert_eq!(
         ARGMAX_CONST_BASE,

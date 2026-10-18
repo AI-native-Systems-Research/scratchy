@@ -8904,7 +8904,8 @@ pub fn route_topk(
 /// device over the TIED lm_head bank, so the next step's input activation never
 /// crosses to the host. The body is [`crate::emit::argmax`]'s mint — this arm is the
 /// thin half: resolve the three boundary names the program's own views state, name
-/// the two resident constants by their reserved tids, declare the scratch synthetics
+/// the resident constants by their reserved tids (the fp32 ramp, the scalar V, and
+/// the pad-lane form's fp16 bias), declare the scratch synthetics
 /// at their full footprints (keyed off the ROW tid, the top-k door's own "key off
 /// the landing" law), and hand the geometry to the chain's one assembly.
 ///
@@ -8936,25 +8937,63 @@ pub fn argmax(
         ));
     };
     let rows = lg.v_rows;
-    let vocab = lg.v_cols;
     let hidden = row.v_cols;
-    if table.v_rows != vocab || table.v_cols != hidden || row.v_rows != rows || row.v_cols != hidden
-    {
+    // ⭐ THE REAL VOCAB, off the TABLE's own view — `[V + 1, H]` in BOTH forms: the `+1`
+    // is the SENTINEL row, the zero row the `idx = V` gather reads when nothing real
+    // won (the all-NaN row; a pad lane that beat every real one — the pad-lane form's
+    // clamped ramp makes that the only alternative to a real lane). The LOGITS view
+    // states the STAGING width — `V` when the vocab is stick-aligned, `stick_pad(V)`
+    // when it is not — cross-checked below, so a hand-minted node cannot state a
+    // mismatched pair.
+    let Some(vocab) = table.v_rows.checked_sub(1) else {
         return err(format!(
-            "Argmax {name}: the logits t{} [{rows}, {vocab}], the table t{} [{}, {}], and the \
-             row t{} [{}, {}] — the gather reads the table as [vocab, hidden] rows and lands \
-             one [rows, hidden] row, so all three extents must agree",
-            lg.tid, table.tid, table.v_rows, table.v_cols, row.tid, row.v_rows, row.v_cols
+            "Argmax {name}: the table t{} states {} row(s) — a zero-row table carries no \
+             real vocab lane and no sentinel row",
+            table.tid, table.v_rows
+        ));
+    };
+    if table.v_cols != hidden || row.v_rows != rows || row.v_cols != hidden {
+        return err(format!(
+            "Argmax {name}: the logits t{} [{rows}, {}], the table t{} [{}, {}], and the \
+             row t{} [{}, {}] — the gather reads the table as [vocab + 1, hidden] rows (the \
+             +1 the sentinel) and lands one [rows, hidden] row, so all three extents must \
+             agree",
+            lg.tid,
+            lg.v_cols,
+            table.tid,
+            table.v_rows,
+            table.v_cols,
+            row.tid,
+            row.v_rows,
+            row.v_cols
         ));
     }
+    // The staging-width law: the logits view must state the real vocab's stick padding —
+    // `V` at a whole-stick vocab (granite-3.3's 49152), `stick_pad(V)` at a sub-stick one
+    // (granite-3.1's 49155 → 49216).
+    let v_pad = vocab.div_ceil(FP16_ELEMS_PER_STICK) * FP16_ELEMS_PER_STICK;
+    if lg.v_cols != v_pad {
+        return err(format!(
+            "Argmax {name}: the logits t{} states [{rows}, {}] against the table t{}'s \
+             vocab {} — the logits view must state the vocab's stick-padded staging width \
+             [{rows}, {}]",
+            lg.tid, lg.v_cols, table.tid, vocab, v_pad
+        ));
+    }
+    // The pad-lane form flag — a sub-stick vocab takes the nine-link chain (link 0 adds
+    // the staged bias); a whole-stick one the landed eight links, verbatim.
+    let pad_lanes = !vocab.is_multiple_of(FP16_ELEMS_PER_STICK);
     let lg_s = lg.name();
     let table_s = table.name();
     let row_s = row.name();
-    // ⭐ THE TWO RESIDENT CONSTANTS, named by their reserved tids — the descending fp32
-    // ramp and the scalar V. Placed by the layout (the `router_const` law: the door
-    // names, the layout places), so a bundle without the composite never stages them.
+    // ⭐ THE RESIDENT CONSTANTS, named by their reserved tids — the descending fp32
+    // ramp, the scalar V, and (pad-lane form only) the fp16 lane bias. Placed by the
+    // layout (the `router_const` law: the door names, the layout places), so a bundle
+    // without the composite never stages them — and a whole-stick one never stages the
+    // bias.
     let ramp_s = crate::place::act_name(crate::reserved_tids::argmax_ramp_tid());
     let v_s = crate::place::act_name(crate::reserved_tids::argmax_v_tid());
+    let bias_s = crate::place::act_name(crate::reserved_tids::argmax_bias_tid());
     // The scratch synthetics, keyed off the ROW tid — the chain's own landing.
     let row_id = PlaceId::Act(row.tid);
     use crate::place::SynthRole as R;
@@ -8966,17 +9005,26 @@ pub fn argmax(
     let j_s = syn(R::AmJ);
     let idx32_s = syn(R::AmIdx32);
     let idx_u32_s = syn(R::AmIdxU32);
+    // The pad-lane form's biased row: the NAME is stated for the slot struct either way
+    // (the whole-stick arm never reads it), but it is REGISTERED only in the pad-lane
+    // form — a whole-stick bundle's layout stays byte-identical to before the form
+    // existed.
+    let biased_s = if pad_lanes {
+        syn(R::AmBiased)
+    } else {
+        row_id.synth(R::AmBiased).to_string()
+    };
     if let Some(l) = layout {
-        // The full footprints, at the chain's own formats — the [rows, vocab] mask pair
+        // The full footprints, at the chain's own formats — the [rows, v_pad] mask pair
         // dominates; everything else is one-stick tail scratch.
         l.synth_df(
             row_id.synth(R::AmMax),
             &[rows, FP16_ELEMS_PER_STICK],
             Df::Fp16,
         );
-        l.synth_df(row_id.synth(R::AmMask), &[rows, vocab], Df::Fp16);
-        l.synth_df(row_id.synth(R::AmMask32), &[rows, vocab], Df::Fp32);
-        l.synth_df(row_id.synth(R::AmW), &[rows, vocab], Df::Fp32);
+        l.synth_df(row_id.synth(R::AmMask), &[rows, lg.v_cols], Df::Fp16);
+        l.synth_df(row_id.synth(R::AmMask32), &[rows, lg.v_cols], Df::Fp32);
+        l.synth_df(row_id.synth(R::AmW), &[rows, lg.v_cols], Df::Fp32);
         l.synth_df(
             row_id.synth(R::AmJ),
             &[rows, Df::Fp32.elems_per_stick()],
@@ -8992,9 +9040,14 @@ pub fn argmax(
             &[rows, FP16_ELEMS_PER_STICK],
             Df::SenUint32,
         );
+        if pad_lanes {
+            l.synth_df(row_id.synth(R::AmBiased), &[rows, lg.v_cols], Df::Fp16);
+        }
     }
     let s = ArgmaxSlots {
         logits: &lg_s,
+        biased: &biased_s,
+        bias: &bias_s,
         m: &m_s,
         mask: &mask_s,
         mask32: &mask32_s,

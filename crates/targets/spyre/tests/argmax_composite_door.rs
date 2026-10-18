@@ -39,7 +39,7 @@ use ktir_superdsc::place::{PlaceId, SynthRole, act_name};
 use ktir_superdsc::placement::{
     BundleLayout, SegRole, TensorPlacement, align128, syn, synth_footprint_bytes,
 };
-use ktir_superdsc::reserved_tids::{argmax_ramp_tid, argmax_v_tid};
+use ktir_superdsc::reserved_tids::{argmax_bias_tid, argmax_ramp_tid, argmax_v_tid};
 use ktir_superdsc::superdsc_opspec::{DataFormat, Df, Fp16};
 use scratchy_target_spyre::ktir_superdsc_door;
 
@@ -47,6 +47,11 @@ use scratchy_target_spyre::ktir_superdsc_door;
 /// the differential leg's vocab.
 const VOCAB: u32 = 128;
 const WIDER_VOCAB: u32 = 192;
+/// The PAD-LANE leg's vocab — 131 = 2·64 + 3, granite-3.1's own shape scaled: THREE lanes
+/// past the last stick, 61 pad lanes in the 192-wide staging. (The 57-lane width —
+/// granite-3.3-2b-instruct's 49159 scaled — is pinned on the parity side, where the
+/// numbers live.)
+const PAD_VOCAB: u32 = 131;
 const HIDDEN: u32 = 128;
 /// The three boundary tids. Distinct, as a real bundle's are; the table is a
 /// weight id, the row an activation-source id — the door never asks.
@@ -54,7 +59,13 @@ const LOGITS_TID: u32 = 2;
 const TABLE_TID: u32 = 1;
 const ROW_TID: u32 = 3;
 
-/// The eight links, in dependency order — the door's own naming.
+/// The staging width a vocab pads to — the lm_head's own out-axis law.
+fn stick_pad(vocab: u32) -> u32 {
+    vocab.div_ceil(Fp16::ELEMS_PER_STICK) * Fp16::ELEMS_PER_STICK
+}
+
+/// The eight links, in dependency order — the door's own naming. The pad-lane form's
+/// nine-link chain (link 0 first) is [`PAD_CHAIN`].
 const CHAIN: [&str; 8] = [
     "argmax_max16",
     "argmax_eq",
@@ -79,6 +90,32 @@ const CHAIN_FUNCS: [&str; 8] = [
     "identity",
 ];
 
+/// The pad-lane form's NINE links — link 0 applies the staged bias before the max.
+const PAD_CHAIN: [&str; 9] = [
+    "argmax_bias",
+    "argmax_max16",
+    "argmax_eq",
+    "argmax_cvt",
+    "argmax_mul",
+    "argmax_max32",
+    "argmax_sub",
+    "argmax_cvt_idx",
+    "argmax_gather",
+];
+
+/// The pad-lane chain's vendor kernels — the add is the pointwise family's own.
+const PAD_CHAIN_FUNCS: [&str; 9] = [
+    "add",
+    "max",
+    "equal",
+    "dl16tofp32",
+    "mul",
+    "max",
+    "sub",
+    "fp32toint32",
+    "identity",
+];
+
 fn tied() -> TiedLmHeadEmbedding {
     TiedLmHeadEmbedding::from_tied_config(true).expect("granite ties")
 }
@@ -88,13 +125,18 @@ fn node_at(vocab: u32) -> KtirNode {
     mint_argmax_node(vocab, HIDDEN, LOGITS_TID, TABLE_TID, ROW_TID, tied())
 }
 
-/// The layout the declare pass would share: every boundary tensor and both
-/// reserved-tid constants REGISTERED (name → identity, via `syn`) and PLACED
-/// (segment, offset, true footprint), which is what the walk's layout pass owns
-/// before any door runs — the router-const law: THE DOOR NAMES, THE LAYOUT
-/// PLACES. The door itself never places a boundary tensor or a constant; a test
-/// that skipped this setup would be testing the door against a layout no real
-/// bundle can present.
+/// The layout the declare pass would share: every boundary tensor and the reserved-tid
+/// constants REGISTERED (name → identity, via `syn`) and PLACED (segment, offset, true
+/// footprint), which is what the walk's layout pass owns before any door runs — the
+/// router-const law: THE DOOR NAMES, THE LAYOUT PLACES. The door itself never places a
+/// boundary tensor or a constant; a test that skipped this setup would be testing the
+/// door against a layout no real bundle can present.
+///
+/// The placements mirror the layout's own laws at the vocab given: the logits at the
+/// STICK-PADDED staging width; the table at `max(stick_pad(V), V + 1)` rows — the
+/// sentinel row's coverage, the whole-stick extension and the pad-lane stick padding in
+/// ONE formula; the ramp at the staging width; and the fp16 BIAS at the staging width,
+/// PAD-LANE FORMS ONLY (a whole-stick bundle never places it — the byte-identity law).
 fn layout_ready_for(vocab: u32) -> BundleLayout {
     let mut l = BundleLayout::default();
     let mut offs = [0u64; 7];
@@ -116,13 +158,15 @@ fn layout_ready_for(vocab: u32) -> BundleLayout {
             },
         );
     };
-    place(LOGITS_TID, SegRole::Activation, &[1, vocab], Df::Fp16);
-    place(TABLE_TID, SegRole::Weight, &[vocab, HIDDEN], Df::Fp16);
+    let staged = stick_pad(vocab);
+    place(LOGITS_TID, SegRole::Activation, &[1, staged], Df::Fp16);
+    let table_rows = staged.max(vocab + 1);
+    place(TABLE_TID, SegRole::Weight, &[table_rows, HIDDEN], Df::Fp16);
     place(ROW_TID, SegRole::Activation, &[1, HIDDEN], Df::Fp16);
     place(
         argmax_ramp_tid(),
         SegRole::Activation,
-        &[1, vocab],
+        &[1, staged],
         Df::Fp32,
     );
     place(
@@ -131,6 +175,14 @@ fn layout_ready_for(vocab: u32) -> BundleLayout {
         &[1, Df::Fp32.elems_per_stick()],
         Df::Fp32,
     );
+    if !vocab.is_multiple_of(Fp16::ELEMS_PER_STICK) {
+        place(
+            argmax_bias_tid(),
+            SegRole::Activation,
+            &[1, staged],
+            Df::Fp16,
+        );
+    }
     l
 }
 
@@ -168,6 +220,7 @@ fn direct_at(vocab: u32, layout: &BundleLayout) -> Vec<String> {
     let row = act_name(ROW_TID);
     let ramp = act_name(ktir_superdsc::reserved_tids::argmax_ramp_tid());
     let v = act_name(ktir_superdsc::reserved_tids::argmax_v_tid());
+    let bias = act_name(ktir_superdsc::reserved_tids::argmax_bias_tid());
     let row_id = PlaceId::Act(ROW_TID);
     let m = row_id.synth(SynthRole::AmMax).to_string();
     let mask = row_id.synth(SynthRole::AmMask).to_string();
@@ -176,8 +229,11 @@ fn direct_at(vocab: u32, layout: &BundleLayout) -> Vec<String> {
     let j = row_id.synth(SynthRole::AmJ).to_string();
     let idx32 = row_id.synth(SynthRole::AmIdx32).to_string();
     let idx_u32 = row_id.synth(SynthRole::AmIdxU32).to_string();
+    let biased = row_id.synth(SynthRole::AmBiased).to_string();
     let s = ArgmaxSlots {
         logits: &lg,
+        biased: &biased,
+        bias: &bias,
         m: &m,
         mask: &mask,
         mask32: &mask32,
@@ -337,7 +393,9 @@ fn the_door_declares_the_scratch_at_the_chains_own_formats() {
 /// The mint's binding convention, read back through the door's own region walk:
 /// three parameters, three bindings, in the order `[logits, table, row]` — and
 /// the ROW is the one the program's store writes (the `written_args` chain),
-/// which is what makes the emulator read it back as the output.
+/// which is what makes the emulator read it back as the output. The table view
+/// states `[V + 1, H]` — the sentinel row is IN the view, both forms — and the
+/// pad-lane form's logits view states the STICK-PADDED staging width.
 #[test]
 fn the_mints_binding_order_is_logits_table_row() {
     let k = node_at(VOCAB);
@@ -350,15 +408,108 @@ fn the_mints_binding_order_is_logits_table_row() {
     assert!(!regions[0].is_out, "the logits are read, not written");
     assert!(!regions[1].is_out, "the table is read, not written");
     assert!(regions[2].is_out, "the row is the program's output");
-    assert_eq!(regions[0].v_cols, VOCAB, "logits view states the vocab");
+    assert_eq!(
+        regions[0].v_cols, VOCAB,
+        "a whole-stick logits view states the vocab itself"
+    );
     assert_eq!(
         (regions[1].v_rows, regions[1].v_cols),
-        (VOCAB, HIDDEN),
-        "table view states [vocab, hidden]"
+        (VOCAB + 1, HIDDEN),
+        "table view states [vocab + 1, hidden] — the sentinel row is in the view"
     );
     assert_eq!(
         (regions[2].v_rows, regions[2].v_cols),
         (1, HIDDEN),
         "row view states [1, hidden]"
+    );
+    // The pad-lane form's own views: the logits at the padded width, the table still
+    // [V + 1, H] — the sentinel row is the FIRST pad row, not the last.
+    let pad = node_at(PAD_VOCAB);
+    let pad_regions = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(&pad)
+        .unwrap_or_else(|e| panic!("pad regions: {e:?}"));
+    assert_eq!(
+        pad_regions[0].v_cols,
+        stick_pad(PAD_VOCAB),
+        "the pad-lane logits view states the stick-padded staging width"
+    );
+    assert_eq!(
+        (pad_regions[1].v_rows, pad_regions[1].v_cols),
+        (PAD_VOCAB + 1, HIDDEN),
+        "the pad-lane table view states [vocab + 1, hidden]"
+    );
+}
+
+/// The pad-lane form's door arm: the NINE-link chain (link 0 first, the add), the
+/// vendor kernels of the probes' own family, and byte-identity against the direct
+/// assembly — the arm stays thin in the form that carries granite-3.1's vocab.
+#[test]
+fn the_pad_lane_door_mints_the_nine_link_chain_byte_identically() {
+    let (door, names, layout) = through_the_door_at(PAD_VOCAB);
+    assert_eq!(
+        names, PAD_CHAIN,
+        "the pad-lane door emits the nine links in dependency order, the bias first"
+    );
+    let funcs: Vec<String> = door.iter().map(|d| op_func_name(d)).collect();
+    assert_eq!(
+        funcs, PAD_CHAIN_FUNCS,
+        "the pad-lane links resolve the pointwise family's add and the probes' own kernels"
+    );
+    let direct = direct_at(PAD_VOCAB, &layout);
+    assert_eq!(door.len(), direct.len(), "nine ops both ways");
+    for (i, (d, s)) in door.iter().zip(direct.iter()).enumerate() {
+        assert_eq!(
+            d, s,
+            "link {i} differs between the pad-lane door and the direct mint"
+        );
+    }
+    // The add reads the STAGING width — the reduce's own N_ states the padded 192, not
+    // the real 131, pinning that the chain runs the whole-stick buffer.
+    let out = body(&door[1])
+        .get("N_")
+        .and_then(|n| n.get("out_"))
+        .and_then(|v| v.as_u64())
+        .expect("out_ in N_ of the pad-lane max");
+    assert_eq!(
+        out,
+        u64::from(stick_pad(PAD_VOCAB)),
+        "the pad-lane max's stick axis is the padded staging width"
+    );
+}
+
+/// The door declared the pad-lane form's EIGHTH scratch — the biased row, fp16 at the
+/// staging width — and did NOT declare it (nor place the bias const) at a whole-stick
+/// vocab: the whole-stick layout stays byte-identical to before the form existed.
+#[test]
+fn the_biased_scratch_exists_only_in_the_pad_lane_form() {
+    let (_, _, pad_layout) = through_the_door_at(PAD_VOCAB);
+    let row_id = PlaceId::Act(ROW_TID);
+    let name = row_id.synth(SynthRole::AmBiased).to_string();
+    let got = pad_layout
+        .synth
+        .borrow()
+        .sizes
+        .get(&name)
+        .unwrap_or_else(|| panic!("'{name}' was not declared by the pad-lane door"))
+        .to_owned();
+    assert_eq!(
+        got,
+        align128(synth_footprint_bytes(&[1, stick_pad(PAD_VOCAB)], Df::Fp16)),
+        "'{name}' footprint — fp16 at the stick-padded width"
+    );
+    assert_eq!(
+        pad_layout.id_of(&name),
+        Some(row_id.synth(SynthRole::AmBiased)),
+        "'{name}' identity"
+    );
+    // The whole-stick control: no biased scratch, no bias placement — the wire is the
+    // landed eight-link one, byte for byte.
+    let (_, _, plain_layout) = through_the_door_at(VOCAB);
+    assert!(
+        !plain_layout.synth.borrow().map.contains_key(&name),
+        "a whole-stick door declares no biased scratch"
+    );
+    assert!(
+        !plain_layout.placements.contains_key(&argmax_bias_tid()),
+        "a whole-stick layout places no bias const"
     );
 }
