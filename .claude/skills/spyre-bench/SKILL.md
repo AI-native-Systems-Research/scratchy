@@ -56,12 +56,17 @@ compares ratios, not absolutes. Until there is one shared harness:
 
 What a full sweep measures, per model and dtype:
 
-- **decode:** inter-token latency in ms (the median), one request at a time,
+- **decode:** inter-token latency in ms (the median), one request at a time
+  (batch 1), at every bucket;
+- **prefill:** time to first token in ms, one request at a time (batch 1),
   at every bucket;
-- **prefill:** time to first token in ms, one request at a time, at every
-  bucket;
-- **concurrency:** decoded tokens per second at more than one request at once
-  (conc 8 so far), at `~1k`.
+- **batch scaling:** the same cells at the other batch rungs the page rows
+  its grids by — 4 and 8 requests decoded at once (16 and up corrupt on
+  this stack, so 8 is the cap). Past batch 1, decode is measured as
+  throughput — decoded tokens per second at that batch, at `~1k` so far —
+  and the page lights a decode grid's squares at that rung from those
+  `tok_s` cells. `conc` in the file is the batch: the offered concurrency,
+  both stacks serving that many requests at once.
 
 A cell needs both sides, measured in this sweep. When one side can't run a
 cell (torch-spyre's fp8 path past short context, say), leave the cell out:
@@ -86,7 +91,7 @@ Start from a copy of the newest file in `site/data/spyre/`, then replace
 | `contexts` | each bucket and the prompt tokens it means on scratchy's side: `{ "~123": 123, "~1k": 1051, "~10k": 10086 }` |
 | `torch_spyre` | `measured` (date), `host` (optional), `harness` (step 2) |
 | `triton_scratchy` | `measured` (date), `commit` (the full commit as run), `harness` |
-| `cells` | one per measured point: `model`, `dtype` (`fp16` or `fp8`), `metric` (`itl_ms`, `ttft_ms` or `tok_s`), `conc` (1 if left out), `context` (a `contexts` key), `torch`, `scratchy`, and an optional `note` the page prints under the cell's section |
+| `cells` | one per measured point: `model`, `dtype` (`fp16` or `fp8`), `metric` (`itl_ms`, `ttft_ms` or `tok_s`), `conc` (the batch: requests decoded at once; 1 if left out), `context` (a `contexts` key), `torch`, `scratchy`, and an optional `note` the page prints under the cell's section |
 | `since` | the PRs merged on scratchy's side since the previous sweep: `"#563–#583"` (leave out for a first sweep) |
 | `moved` | one row per change: `{ "pr": "#573", "what": "dxp chunk explorer restored: 2b 10k TTFT 18.1 → 8.9 s" }` |
 | `levers` | where torch-spyre still leads, and the work: `{ "lever": "8b 10k decode", "work": "torch-spyre 1.17× ahead — …" }` |
@@ -134,7 +139,8 @@ Check the page against the file:
 
 - the intro names the new date, commit and `since`;
 - the headline tiles and the "At a glance" heat maps show every model you
-  measured (a striped square is a cell you left out, and only those);
+  measured, each grid running the batch rungs 1, 4, 8 down (a striped
+  square is a cell you left out, and only those);
 - "What moved" and "Open levers" read as this sweep's, not the last one's;
 - the About table lists the new sweep at the top and the older ones below it.
 

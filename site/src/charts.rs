@@ -520,7 +520,8 @@ pub fn glance_mini(
 }
 
 /// A glance's heat maps beside their ratio scale: a row per `rows` (a
-/// machine), its name, then a cell per `columns` (a model), each the column's
+/// machine on metal.html, a dtype on spyre.html), its name, then a cell per
+/// `columns` (a model), each the column's
 /// name over `cell(row, column)`, that row's grids of that model as
 /// glance_minis. The cells are one width, 11.5rem (two 88px grids and the 8px
 /// between them), and on a narrow screen shrink together rather than wrap, as
