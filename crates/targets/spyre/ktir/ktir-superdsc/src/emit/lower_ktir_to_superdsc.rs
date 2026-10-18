@@ -2773,6 +2773,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             o,
             ooff.into_raw_elems(),
             false, // RoPE per-(row,head) [1,hd] block (rows==1): rank-3 flat
+            layout,
         )
         .map_err(|e| Error { message: e })?;
         ops.push(emit_sdsc_tiled(
@@ -2943,6 +2944,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 // cols == stk, and `stickmajor` needs cols > 64, so it cannot fire either way — this
                 // is the same rank-3 flat form regardless of the row count.
                 true,
+                layout,
             )
             .map_err(|e| Error { message: e })?;
             ops.push(emit_sdsc_tiled(
@@ -3194,6 +3196,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 // cols == hd == stick, so `stickmajor` cannot fire (it needs cols>64) and this stays
                 // the SAME rank-3 flat form the per-row path used — only the row count differs.
                 false,
+                layout,
             )
             .map_err(|e| Error { message: e })?;
             ops.push(emit_sdsc_tiled(

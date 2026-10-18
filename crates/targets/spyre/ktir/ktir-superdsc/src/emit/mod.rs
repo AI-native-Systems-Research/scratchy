@@ -450,6 +450,7 @@ fn pointwise_opspec(
     in_names: &[&str],
     o_name: &str,
     head_major: bool,
+    layout: Option<&BundleLayout>,
 ) -> Result<OpSpec, String> {
     let cols_ext = StickExtent::<Fp16>::new(cols)?;
     let dims = vec![
@@ -481,7 +482,7 @@ fn pointwise_opspec(
         dims,
         df: Df::Fp16,
     };
-    pointwise_opspec_from_tile(&tile_op, op, in_names, o_name, head_major)
+    pointwise_opspec_from_tile(&tile_op, op, in_names, o_name, head_major, layout)
 }
 
 /// How one elementwise operand maps onto the `[mb, out, y]` iteration space — its
@@ -545,6 +546,7 @@ impl<'a> EwOperand<'a> {
 /// (pinned by `time_tiled_broadcast_operand_is_address_stable`).
 /// fp16 wrapper (the 64-stick default): every existing caller. fp32 (the torch-spyre RMSNorm) uses
 /// [`pointwise_broadcast_opspec_df`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pointwise_broadcast_opspec(
     op: OpFunc,
     rows: u32,
@@ -553,6 +555,7 @@ pub(crate) fn pointwise_broadcast_opspec(
     o_name: &str,
     out_offset: u32,
     head_major: bool,
+    layout: Option<&BundleLayout>,
 ) -> Result<OpSpec, String> {
     pointwise_broadcast_opspec_df(
         op,
@@ -563,6 +566,7 @@ pub(crate) fn pointwise_broadcast_opspec(
         out_offset,
         head_major,
         Df::Fp16,
+        layout,
     )
 }
 
@@ -657,6 +661,7 @@ fn pointwise_broadcast_opspec_df(
     out_offset: u32,
     head_major: bool,
     df: Df,
+    layout: Option<&BundleLayout>,
 ) -> Result<OpSpec, String> {
     // fp16 (default) keeps the proven 64-stick basis; Df::Fp32 (the torch-spyre fp32 rmsnorm) uses a
     // 32-elem/4-byte stick. The stick extent MUST be the ACTUAL dtype's (fp32 = 32-stick) — a per-row
@@ -696,7 +701,7 @@ fn pointwise_broadcast_opspec_df(
         df,
     };
     pointwise_broadcast_opspec_from_tile(
-        &tile_op, rows, cols, op, inputs, o_name, out_offset, head_major,
+        &tile_op, rows, cols, op, inputs, o_name, out_offset, head_major, layout,
     )
 }
 
@@ -1204,6 +1209,10 @@ fn one_gathered_leg(
         // so passing it here would drop the leg to the rank-3 flat presentation.
         0,
         head_major,
+        layout,
+        // ⛔ ROWS FIRST, STATED: the gather's index enumerates `mb` in whole entries
+        // (`attach_gather_index` refuses a plan with no `mb` split to enumerate), so `mb` takes the cores.
+        crate::work::EwDivision::RowsFirst,
     )
     .map_err(SuperDscError)?;
     // ⭐⭐⭐ THE ROW WINDOW: THE ONLY BYTE OF THE OUTPUT OPERAND THE CUT MOVES.
@@ -1585,6 +1594,7 @@ pub fn assemble_pointwise_broadcast_off<O: KindTag>(
         o_name,
         out_offset,
         head_major,
+        layout,
     )
     .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
     apply_lx_residency(&mut op, layout);
@@ -1619,6 +1629,7 @@ pub fn assemble_pointwise_broadcast_df(
         0,
         true,
         df,
+        layout,
     )
     .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast_df {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -4394,6 +4405,7 @@ pub fn assemble_pointwise_seeded(
         in_names,
         o_name,
         false,
+        layout,
     )
     .unwrap_or_else(|e| panic!("assemble_pointwise {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());

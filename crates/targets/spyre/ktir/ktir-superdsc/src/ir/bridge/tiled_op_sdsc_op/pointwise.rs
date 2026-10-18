@@ -11,7 +11,7 @@ use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, DataFormat, Df, Fp16, MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec,
     Role, Scale, SdscFoldSet, TensorArg,
 };
-use crate::work::distribute_cores;
+use crate::work::EwDivision;
 
 /// ⭐⭐⭐⭐⭐ THE GATHER'S OWN OP — a KERNEL-LESS `identity` that copies a PAGED source through an int32
 /// index into a CONTIGUOUS destination. This is the only op shape deeptools will schedule a gather on.
@@ -345,20 +345,33 @@ pub fn assemble_gather_copy(
         .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"))
 }
 
+/// `layout` decides only the work division ([`EwDivision`]), exactly as for
+/// [`pointwise_broadcast_opspec_from_tile`]: `None` has no core-local pins.
 pub fn pointwise_opspec_from_tile(
     tile_op: &TileOp,
     op: OpFunc,
     in_names: &[&str],
     o_name: &str,
     head_major: bool,
+    layout: Option<&BundleLayout>,
 ) -> Result<OpSpec, String> {
+    let rows = tile_op
+        .dims
+        .iter()
+        .find(|d| d.name == "mb")
+        .map(|d| d.size)
+        .unwrap_or(1);
+    // The builder's own rank-2 decision (`stickmajor` below) — the division follows it.
+    let stick_major = !head_major && rows > 1;
+    let core_local = layout
+        .is_some_and(|l| l.lx_core_local(o_name) || in_names.iter().any(|n| l.lx_core_local(n)));
     pointwise_opspec_from_tile_split(
         tile_op,
         op,
         in_names,
         o_name,
         head_major,
-        distribute_cores,
+        EwDivision::Law.resolve(stick_major, core_local).splitter(),
         // Whole-tensor output — every caller but the gather copy, whose runs land at a base.
         0,
     )
@@ -366,7 +379,7 @@ pub fn pointwise_opspec_from_tile(
 
 /// [`pointwise_opspec_from_tile`] with the WORK DIVISION as a parameter — for the one op whose entry
 /// unit is a function of which dims got split (see [`gather_copy_cores`]). Every other caller takes
-/// [`distribute_cores`] through the wrapper above and is byte-identical.
+/// the [`EwDivision`] law through the wrapper above.
 fn pointwise_opspec_from_tile_split(
     tile_op: &TileOp,
     op: OpFunc,
@@ -463,6 +476,11 @@ fn pointwise_opspec_from_tile_split(
 /// `rows`/`cols` stay EXPLICIT parameters (not re-derived from `tile_op.dims`) because this
 /// builder's `stickmajor`/block-alignment logic needs the untouched `rows·cols` product, not the
 /// stick-rounded `out` extent `TileOp` carries.
+///
+/// `division` is [`EwDivision::Law`] for every caller but one, and the law reads `layout`: an op none of
+/// whose operands is a core-local LX pin takes the division its operands' layout calls for (`None`, every
+/// unit test without a layout, has no pins). The gathered-row leg passes [`EwDivision::RowsFirst`]: its
+/// index enumerates `mb` in whole entries, so `mb` must take the cores.
 #[allow(clippy::too_many_arguments)]
 pub fn pointwise_broadcast_opspec_from_tile(
     tile_op: &TileOp,
@@ -473,10 +491,30 @@ pub fn pointwise_broadcast_opspec_from_tile(
     o_name: &str,
     out_offset: u32,
     head_major: bool,
+    layout: Option<&BundleLayout>,
+    division: EwDivision,
 ) -> Result<OpSpec, String> {
     let df = tile_op.df;
+    let block = (rows as u64) * (cols as u64);
+    let block_aligned = |off: u32| block != 0 && (off as u64).is_multiple_of(block);
+    let stickmajor = !head_major
+        && rows > 1
+        && cols > Fp16::ELEMS_PER_STICK
+        && block_aligned(out_offset)
+        && inputs
+            .iter()
+            .all(|i| i.out_broadcast() || block_aligned(i.col_offset()));
+    // ⭐ THE DIVISION FOLLOWS THE LAYOUT JUST DECIDED — the same `stickmajor`, so the operands' rank and the
+    // cores' cut are one decision. See `EwDivision`.
+    let core_local = layout.is_some_and(|l| {
+        l.lx_core_local(o_name) || inputs.iter().any(|i| l.lx_core_local(i.name()))
+    });
     let tiled = tile_op
-        .tile(MaxCores::<MAX_CORES>, distribute_cores, "out")
+        .tile(
+            MaxCores::<MAX_CORES>,
+            division.resolve(stickmajor, core_local).splitter(),
+            "out",
+        )
         .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
     let device_dims = plan.iter_syms(["mb", "out", "y"]);
@@ -494,9 +532,8 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // per-head row-block offset (e.g. rc's h·rows·stick) is compatible regardless of alignment to
     // rows·cols. A NON-block-aligned COLUMN slice (RoPE rotate-half `half`; an MLP column chunk
     // `cols_start`) is NOT a whole-block shift — a column slice of a stick-major tensor is NOT
-    // contiguous — so it stays rank-3 flat.
-    let block = (rows as u64) * (cols as u64);
-    let block_aligned = |off: u32| block != 0 && (off as u64).is_multiple_of(block);
+    // contiguous — so it stays rank-3 flat. (`stickmajor` is computed above, before the division.)
+    //
     // `cols > 64` (one fp16 stick) is the OTHER half of this fn's own documented precondition —
     // the comment above says outright "byte-identical at rows==1, scrambled at rows>1 AND
     // cols>64" — but the condition below never checked `cols`, so it dropped to rank-2 for EVERY
@@ -510,13 +547,6 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // `cols > 64` — the ONLY regime the introducing comment claims needs it — leaves every
     // `cols<=64` op (every per-head attention op here) at the already-proven rank-3 form, while
     // preserving the real fix for wide (`cols>64`) ops it was actually written for.
-    let stickmajor = !head_major
-        && rows > 1
-        && cols > Fp16::ELEMS_PER_STICK
-        && block_aligned(out_offset)
-        && inputs
-            .iter()
-            .all(|i| i.out_broadcast() || block_aligned(i.col_offset()));
     let device_dims_r2 = plan.iter_syms(["mb", "out"]);
 
     // ⛔ INVARIANT (was a refusal — see the exemption note in `rewrite_op_for_time_tile`): a
@@ -650,6 +680,8 @@ pub fn assemble_pointwise_broadcast_off_from_tile<O: KindTag>(
         o_name,
         out_offset,
         head_major,
+        layout,
+        EwDivision::Law,
     )
     .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -671,9 +703,15 @@ pub fn assemble_pointwise_seeded_from_tile(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
-    let op =
-        pointwise_opspec_from_tile(tile_op, op_func_from_str(op_func), in_names, o_name, false)
-            .unwrap_or_else(|e| panic!("assemble_pointwise {op_name}: {e}"));
+    let op = pointwise_opspec_from_tile(
+        tile_op,
+        op_func_from_str(op_func),
+        in_names,
+        o_name,
+        false,
+        layout,
+    )
+    .unwrap_or_else(|e| panic!("assemble_pointwise {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_pointwise {op_name}: {e}"))
