@@ -21,24 +21,27 @@
 //! Driving the kernel itself means every rung of the recogniser ladder is measured
 //! against the live artifact, not a transcription of one.
 //!
-//! # RUNG ZERO, AND THE LADDER LAW
+//! # RUNG ONE, AND THE LADDER LAW
 //!
-//! Today the door recognises NOTHING of the fused MoE: an op with no 1:1 `Program` and
+//! The door recognises the kernel's EIGHT gelu-tanh longhands (the tanh form through
+//! the sigmoid identity, claimed by `program_gelu_mul_chains` before the silu reader
+//! it fronts for) and NOTHING ELSE of the fused MoE: an op with no 1:1 `Program` and
 //! no chain proof is refused BY NAME, and the whole-function door refuses the WHOLE
 //! function rather than emitting part of it (a bundle short a program computes
-//! something else). This test pins the FIRST refusal — the op the walk names when it
-//! stops. Each recogniser that lands (W8A8 slab gemm → router → gelu → combine) moves
-//! that first refusal FORWARD through program order, and this test's assertion moves
-//! with it, ON PURPOSE: the pinned refusal is the recogniser campaign's work queue
-//! made executable. When the last recogniser lands, the same drive must BAKE, and the
-//! refusal-pinning arms are replaced by the op-list assertion — the matmul_fp8
-//! contract's positive control is the shape of that final state.
+//! something else). This test pins the FIRST refusal — the stage the door stops at.
+//! Each recogniser that lands (gelu ✅ → W8A8 slab gemm → router → combine) moves
+//! that first refusal FORWARD through the pre-reads and program order, and this
+//! test's assertion moves with it, ON PURPOSE: the pinned refusal is the recogniser
+//! campaign's work queue made executable. When the last recogniser lands, the same
+//! drive must BAKE, and the refusal-pinning arms are replaced by the op-list
+//! assertion — the matmul_fp8 contract's positive control is the shape of that final
+//! state.
 //!
 //! The node's `program` label is INERT under this door — `lower_function` derives every
 //! op's kind from its `OpKind` and never reads `node.program` — so it is minted with
-//! `Program::ExpertMatmul`, the variant the W8A8 recogniser (the ladder's first rung)
-//! emits its legs under. The splice fold will name the fused kind when it lands; the
-//! label changes with it, one word.
+//! `Program::ExpertMatmul`, the variant the W8A8 recogniser (the heaviest rung still
+//! ahead) emits its legs under. The splice fold will name the fused kind when it lands;
+//! the label changes with it, one word.
 
 use ktir_superdsc::ktir_node::Program;
 use std::collections::HashMap;
@@ -124,15 +127,16 @@ fn drive() -> Result<Vec<String>, String> {
     Ok(ops.into_iter().map(|o| o.op_name.clone()).collect())
 }
 
-/// RUNG ZERO: the fused MoE kernel is REFUSED at the door, naming the op the walk
-/// stopped on — pinned so every recogniser that lands must move it FORWARD, and a
-/// recogniser that leaves it where it was bought nothing.
+/// RUNG ONE: the fused MoE kernel is REFUSED at the door, naming the stage the
+/// pre-reads stop at — pinned so every recogniser that lands must move it FORWARD, and
+/// a recogniser that leaves it where it was bought nothing.
 #[test]
 fn the_fused_moe_kernel_is_refused_at_the_door_naming_the_first_unrecognised_op() {
     let err = match drive() {
         Ok(names) => panic!(
             "BAKED ({} ops) — the fused MoE kernel lowered through the whole-function door \
-             with NO MoE recogniser landed; something is recognising chains it should not",
+             with the W8A8/router/combine recognisers unlanded; something is recognising \
+             chains it should not",
             names.len()
         ),
         Err(msg) => msg,
@@ -143,23 +147,22 @@ fn the_fused_moe_kernel_is_refused_at_the_door_naming_the_first_unrecognised_op(
         err.starts_with("door:"),
         "the refusal came from a ladder stage, not the door: {err:?}"
     );
-    // ⚠️ PINNED OBSERVATION (rung zero, 2026-10-18, moe-door @ 6244a069f): the door's
-    // FIRST refusal is the SILU-CHAIN pre-read refusing the kernel's GELU-TANH — moe.py
-    // spells gelu through the sigmoid identity (`g / (1 + exp(-1.596·(g + 0.0447·g³)))`,
-    // the cubic in an f32 island), which shares the silu longhand's five op kinds with a
-    // DIFFERENT numerator (the divf divides `g`, the exp's chain head is the cubic `v`),
-    // and the chains reader refuses the whole function rather than misread one as the
-    // other. That refusal is CORRECT BY DESIGN — gelu is not silu, and a near-miss silu
-    // is exactly the misrecognition the reader's fail-closed discriminator exists for —
-    // and it is the recogniser campaign's queue head made executable: the pre-reads gate
-    // the per-op walk, so NO recogniser is reachable while this stands. The gelu step of
-    // the landing order (or a silu-reader refinement that distinguishes the two
-    // longhands) is what moves it. The needles are SUBSTRINGs so wording survives but
-    // meaning does not.
+    // ⚠️ PINNED OBSERVATION (rung one, 2026-10-18, moe-door @ the gelu recogniser):
+    // the gelu step moved the door's first refusal PAST the pre-reads' chain readers —
+    // all eight gelu-tanh longhands are claimed (`program_gelu_mul_chains` runs before
+    // the silu reader, which skips the claims), so the silu/rmsnorm/broadcast readers
+    // pass — and it now stops at the GATHERS pre-read: `gathers_of`'s same-pair
+    // discriminator refusing the experts' slab tiles (the full observed message names
+    // 48 `ktdp.construct_indirect_access_tile` ops over 2 different index/value
+    // parameter pairs). That refusal is CORRECT BY DESIGN for the door as it stands —
+    // one descriptor carries one index operand, and the fused kernel's per-pair slab
+    // gathers are exactly the multi-tile shape the W8A8 recogniser's own MoE pre-read
+    // (which must run BEFORE this call) exists to read. The needles are SUBSTRINGs so
+    // wording survives but meaning does not.
     assert!(
-        err.contains("is not the value the `arith.negf` consumed")
-            && err.contains("refused rather than lowered as `OpFunc::Silu`"),
-        "rung zero: the door's first refusal moved or changed shape — update this pin \
+        err.contains("different index/value parameter pairs")
+            && err.contains("one descriptor carries ONE index operand"),
+        "rung one: the door's first refusal moved or changed shape — update this pin \
          DELIBERATELY (it is the recogniser campaign's work queue), do not delete it: {err:?}"
     );
 }

@@ -47,7 +47,7 @@ use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
 use ktir_core::opkind::OpKind;
 
 use super::lower_ktir_to_superdsc::{Error, Gather, Region, err, gathers_of, regions};
-use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind};
+use crate::ktir_node::{Elementwise, GatedAct, KtirNode, Program, ReduceKind};
 // The broadcast AXIS is the emission door's own vocabulary — `elementwise` selects the `In` builder
 // from it — so it lives beside that door and this recogniser names the same type rather than a
 // parallel one that would have to be mapped across the boundary.
@@ -915,6 +915,23 @@ fn rmsnorm_chain_from(
 /// the 1:1 map, because "`ArithNegf` has no `Program`" would send a reader looking for a missing
 /// `Elementwise` variant when the real answer is that a silu is mis-shaped.
 pub fn program_silu_mul_chains(f: &IRFunction<'static>) -> Result<Vec<SiluMulChain>, Error> {
+    silu_mul_chains(f, &program_gelu_mul_chains(f)?)
+}
+
+/// The silu reader over the negfs the gelu reader has NOT claimed.
+///
+/// ⭐ THE SKIP IS THE COOPERATION, NOT A RELAXATION. The gelu longhand shares the silu
+/// longhand's five op kinds with a different numerator, and the discriminator inside
+/// [`silu_mul_chain_from`] refuses that near-miss on purpose — a gelu misread as a silu
+/// is exactly the wrong function the fail-closed law exists for. Running the gelu reader
+/// FIRST and skipping its claims here divides the negfs between the two readers exactly
+/// once each, and every negf NEITHER claims is still refused by the discriminator: a
+/// mangled gelu is a refusal either way, with the message of whichever reader can see
+/// it.
+fn silu_mul_chains(
+    f: &IRFunction<'static>,
+    gelus: &[GeluMulChain],
+) -> Result<Vec<SiluMulChain>, Error> {
     let reads = program_reads(f);
     let mut out = Vec::new();
     for neg in f
@@ -922,6 +939,11 @@ pub fn program_silu_mul_chains(f: &IRFunction<'static>) -> Result<Vec<SiluMulCha
         .iter()
         .filter(|o| o.op_type == OpKind::ArithNegf)
     {
+        // A claimed gelu's negf is not a silu head — the walk below lowers the one fused
+        // op the gelu reader proved, so this reader has nothing to say about it.
+        if neg.result.is_some_and(|r| gelus.iter().any(|c| c.neg == r)) {
+            continue;
+        }
         out.push(silu_mul_chain_from(&reads, f, neg)?);
     }
     Ok(out)
@@ -1070,6 +1092,409 @@ fn silu_mul_chain_from(
         mul: mul_v,
         consumed: [neg_v, exp_v, add_v, div_v],
     })
+}
+
+/// THE TANH-GELU LONGHAND, as the ONE fused op it is — `out = gelu(gate) · up`.
+///
+/// # WHY THIS RECOGNISER EXISTS, AND WHY IT RUNS **BEFORE** THE SILU READER
+///
+/// `kernels/moe.py` — gemma-4's whole sparse block as one Triton program — spells its
+/// experts' activation as the tanh-form gelu through the sigmoid identity,
+/// `g / (1 + exp(-c₁·(g + c₂·g³)))`, the cubic in an f32 island the ladder narrows back
+/// to the tile's f16. That longhand SHARES the silu longhand's five op kinds — negate,
+/// exp, add, divide, multiply — with a DIFFERENT numerator (the divide divides `g`; the
+/// exp's chain head is the cubic `v`), so the silu reader's fail-closed discriminator
+/// refuses it, and because the pre-reads gate the whole per-op walk, NOTHING downstream
+/// is reachable while it stands. This reader claims those chains first, so the silu
+/// reader sees only the negfs that are genuinely its own.
+///
+/// # IT PROVES THE MATCH; IT DOES NOT PATTERN-GUESS — AND THE PROOF IS THE CONSTANTS
+///
+/// The silu reader's discriminators carry over, and three more do the real work here,
+/// every one READ from the program rather than assumed:
+///
+/// * **the divide's numerator is the cubic's base `g`**, and the exp's chain head is
+///   exactly `v = c₁·(g + c₂·g³)` — that association, link by link, each link unique;
+/// * **c₁ is `2·√(2/π)` and c₂ is `0.044715`**, each checked as the value the f16 grid
+///   states (the island is narrowed back, so the splats are f16 images: `1.595703125`
+///   and `0.044708251953125`, measured off the live moe.py artifact). Any other
+///   constants are a different function with the same op kinds;
+/// * **every op of the chain states f16** — the f32 island the kernel's own comment
+///   describes (an f16 `x³` overflows at |x| ≥ 41) narrowed back at both ends. A chain
+///   the ladder left at f32 would have `OpFunc::Gelu` compute it in the tensor's f16
+///   storage, substituting one arithmetic for the other.
+///
+/// A chain that almost matches is REFUSED BY NAME, never lowered as the nearest thing —
+/// and a chain that fails BEFORE the numerator discriminator (a broken exp link, a
+/// missing divide) is left to the silu reader, which refuses it with the message that
+/// names the link: this reader claims a chain only whole.
+#[derive(Clone, Copy, Debug)]
+pub struct GeluMulChain {
+    /// The cubic's base AND the divide's numerator — gelu's argument.
+    pub gate: Ssa,
+    /// The other factor of the terminal multiply.
+    pub up: Ssa,
+    /// The terminal `arith.mulf`'s result: the value the ONE fused op produces, and the
+    /// value the rest of the program consumes.
+    pub mul: Ssa,
+    /// The chain's `arith.negf` result — the key the silu reader skips on, so the two
+    /// readers cannot claim one negf.
+    pub neg: Ssa,
+    /// The cubic's three products and its sum, the e-argument, and the four spine
+    /// results — every intermediate the fused op never materialises, so
+    /// [`lower_function`] must lower NOTHING for them. The terminal multiply is
+    /// deliberately not in here: it is the op that BECOMES the fused program.
+    pub consumed: [Ssa; 9],
+}
+
+/// Read every tanh-gelu longhand off the program, or say why one of them is not one.
+///
+/// ⭐ ONE CHAIN PER `arith.negf`, the silu reader's own law: the fused MoE kernel spells
+/// one gelu per expert pair — eight in one `func.func` at top-8 — and what has to be
+/// unique is each LINK, checked per chain. A negf this reader returns no chain for is a
+/// silu (claimed by the silu reader, which runs after this one over the remainder) or a
+/// near-miss the silu reader refuses; `Err` means a chain that divides something OTHER
+/// than the negated value by `1+e^-x` — recognisably a gated-act longhand that is
+/// neither silu nor the tanh gelu — and refusing it is the fail-closed law.
+pub fn program_gelu_mul_chains(f: &IRFunction<'static>) -> Result<Vec<GeluMulChain>, Error> {
+    let reads = program_reads(f);
+    // The tanh gelu's two constants, as the f16 grid states them. The island is narrowed
+    // back (checked per chain below), so an f16 splat is the only spelling the program
+    // can carry, and the grid's image of the exact constant is the one value that is
+    // that constant at f16 precision — a producer's decimal within half an ulp of
+    // 0.044715 rounds to the same image, and one further away is a different constant.
+    // Both f64 -> f32 -> f16 double roundings land on the f16 the direct rounding
+    // picks, measured: 1.595703125 and 0.044708251953125, the values the live moe.py
+    // artifact states.
+    let f16_image = |x: f64| {
+        ktir_core::codec::f16_units_to_f32(&ktir_core::codec::f32_to_f16_units(&[x as f32]))[0]
+            as f64
+    };
+    let (c1, c2) = (
+        f16_image(2.0 * (2.0 / std::f64::consts::PI).sqrt()),
+        f16_image(0.044715),
+    );
+    let mut out = Vec::new();
+    for neg in f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::ArithNegf)
+    {
+        if let Some(chain) = gelu_mul_chain_from(&reads, f, neg, c1, c2)? {
+            out.push(chain);
+        }
+    }
+    Ok(out)
+}
+
+/// The one chain headed by `neg`, proven link by link — or `Ok(None)` when the chain is
+/// not this reader's to claim.
+fn gelu_mul_chain_from(
+    reads: &ProgramReads<'_>,
+    f: &IRFunction<'static>,
+    neg: &Operation<'static>,
+    c1: f64,
+    c2: f64,
+) -> Result<Option<GeluMulChain>, Error> {
+    // THE SHARED SPINE, in the silu reader's own link law but SILENT: negate -> exp ->
+    // 1+ -> divide, each link exactly one reader of the right kind. A break here is a
+    // near-miss of BOTH longhands — the two spellings share these four ops — and the
+    // silu reader, which runs after this one over the negfs this reader did not claim,
+    // refuses it with the message that names the link. Skipping rather than duplicating
+    // that refusal keeps ONE message per defect.
+    let sole = |v: Ssa, want: OpKind| -> Option<&Operation<'static>> {
+        match reads.readers_of(v) {
+            [p] if reads.op_at(*p).op_type == want => Some(reads.op_at(*p)),
+            _ => None,
+        }
+    };
+    let (Some(v), Some(neg_v)) = (neg.operands.first().copied(), neg.result) else {
+        return Ok(None);
+    };
+    let Some(exp) = sole(neg_v, OpKind::MathExp) else {
+        return Ok(None);
+    };
+    let Some(exp_v) = exp.result else {
+        return Ok(None);
+    };
+    let Some(add) = sole(exp_v, OpKind::ArithAddf) else {
+        return Ok(None);
+    };
+    let Some(add_v) = add.result else {
+        return Ok(None);
+    };
+    let Some(div) = sole(add_v, OpKind::ArithDivf) else {
+        return Ok(None);
+    };
+    let Some(div_v) = div.result else {
+        return Ok(None);
+    };
+
+    // ⭐ THE DISCRIMINATOR, the silu reader's own: the divide's numerator. `g/(1+e^-g)`
+    // is silu — this reader's `Ok(None)`, the silu reader's claim. The numerator is the
+    // operand BESIDE the denominator rather than `operands.first()`, so a divide with
+    // its sides spelled the other way round cannot hand this reader the denominator as
+    // a gate.
+    let Some(gate) = div.operands.iter().copied().find(|&s| s != add_v) else {
+        return err(format!(
+            "{}: the gelu longhand's `arith.divf` divides `1+exp(-x)` by itself",
+            f.name
+        ));
+    };
+    if gate == v {
+        return Ok(None);
+    }
+    // FROM HERE THE CHAIN IS CLAIMED, and every failure is a refusal by name: a chain
+    // that divides a cubic base by `1+e^-v` is recognisably a gated-act longhand, and
+    // lowering a near-miss as `OpFunc::Gelu` would compute a different function.
+
+    // The denominator's added constant must be 1.0 — `1/(1+e^-x)`, the sigmoid identity
+    // the silu reader's own law states. A candidate that divides a cubic base by
+    // `c + e^-v` for any other `c` is a different function, refused here rather than
+    // rounded into the gelu. Spelled as an inequality rather than a float literal
+    // pattern, the silu reader's own way: the refusal keeps `x` to name the constant
+    // the program actually states.
+    let one = add
+        .operands
+        .iter()
+        .copied()
+        .filter(|&s| s != exp_v)
+        .find_map(|s| reads.splat_value(s));
+    match one {
+        Some(x) if x != 1.0 => {
+            return err(format!(
+                "{}: the gelu longhand's `arith.addf` adds {x}, not 1.0. `g/(1+e^-v)` is \
+                 the sigmoid identity, so any other constant is a DIFFERENT function and \
+                 lowering it as `OpFunc::Gelu` would compute something the program does \
+                 not state.",
+                f.name
+            ));
+        }
+        Some(_) => {}
+        None => {
+            return err(format!(
+                "{}: the gelu longhand's `arith.addf` adds a value that is not a splatted \
+                 constant, so nothing proves it is the 1 of `1+e^-v`",
+                f.name
+            ));
+        }
+    }
+
+    // `v = c₁·(g + c₂·g³)`, walked from the negf's operand DOWN to the cubic's base —
+    // each step the op that DEFINES the value, each link checked for the association
+    // the tanh form states. ⛔ THE ASSOCIATION IS FIXED, LEFT-DEEP IN THE CUBIC:
+    // `c₂·g` first, then `·g` twice, then `g + ·`, then `·c₁` — the spelling the ladder
+    // produces, and a different association over the same ops states a different
+    // program, refused rather than re-associating on the producer's behalf.
+    let def_of_kind = |x: Ssa, want: OpKind, what: &str| -> Result<&Operation<'static>, Error> {
+        match reads.def_of(x) {
+            Some(d) if d.op_type == want => Ok(d),
+            Some(d) => err(format!(
+                "{}: the gelu longhand's {what} is defined by `{:?}`, but the tanh form \
+                 `c₁·(g + c₂·g³)` states `{:?}`",
+                f.name, d.op_type, want
+            )),
+            None => err(format!(
+                "{}: the gelu longhand's {what} is not computed by this function — the \
+                 tanh form states the cubic inline",
+                f.name
+            )),
+        }
+    };
+    // `x = <tile> · <splatted constant>`: the multiply's ONE splatted operand, and the
+    // other operand. Refuses when the constant is missing (two tiles multiplied where
+    // the tanh form states a constant) and when there are two (a constant-times-constant
+    // the ladder folds before this door).
+    let mul_by_const = |d: &Operation<'static>, what: &str| -> Result<(Ssa, f64), Error> {
+        let mut splats = d
+            .operands
+            .iter()
+            .copied()
+            .filter_map(|s| reads.splat_value(s).map(|x| (s, x)));
+        let Some((splat_ssa, splat_v)) = splats.next() else {
+            return err(format!(
+                "{}: the gelu longhand's {what} multiplies two tiles, but the tanh form \
+                 `c₁·(g + c₂·g³)` states a splatted constant there",
+                f.name
+            ));
+        };
+        if let Some((_, second)) = splats.next() {
+            return err(format!(
+                "{}: the gelu longhand's {what} multiplies two splatted constants \
+                 ({splat_v} and {second}), a constant fold the ladder performs before \
+                 this door",
+                f.name
+            ));
+        }
+        let other = d
+            .operands
+            .iter()
+            .copied()
+            .find(|&s| s != splat_ssa)
+            .expect("a binary multiply has an operand beside the splat");
+        Ok((other, splat_v))
+    };
+    // The operand BESIDE the cubic's base, so the association is proven rather than
+    // positional. Refuses when the op does not read `g` — `c₁·(g + c₂·g³)` reads it once
+    // per factor — and when it reads it twice (`g·g` is a square, not the cubic).
+    let beside_gate = |d: &Operation<'static>, what: &str| -> Result<Ssa, Error> {
+        let n = d.operands.iter().filter(|&&s| s == gate).count();
+        if n != 1 {
+            return err(format!(
+                "{}: the gelu longhand's {what} reads the divide's numerator {n} times, \
+                 but the tanh cubic `c₁·(g + c₂·g³)` reads it exactly once per factor",
+                f.name
+            ));
+        }
+        Ok(d.operands
+            .iter()
+            .copied()
+            .find(|&s| s != gate)
+            .expect("one operand is the numerator, so the other is beside it"))
+    };
+
+    // v = c₁ · (g + c₂·g³) — c₁ READ off the splat, not assumed.
+    let dv = def_of_kind(v, OpKind::ArithMulf, "e-argument")?;
+    let (t4, found_c1) = mul_by_const(dv, "e-argument")?;
+    if found_c1 != c1 {
+        return err(format!(
+            "{}: the gelu longhand scales `(g + c₂·g³)` by {found_c1}, not the tanh \
+             gelu's c₁ = 2·√(2/π) = 1.5957691216057308 (the f16 grid's {c1}). Any other \
+             constant is a different function with the same op kinds, so it is refused \
+             rather than lowered as `OpFunc::Gelu`.",
+            f.name
+        ));
+    }
+    // t4 = g + c₂·g³
+    let dt4 = def_of_kind(t4, OpKind::ArithAddf, "cubic's sum")?;
+    let t3 = beside_gate(dt4, "cubic's sum")?;
+    // t3 = t2 · g
+    let dt3 = def_of_kind(t3, OpKind::ArithMulf, "cubic's third factor")?;
+    let t2 = beside_gate(dt3, "cubic's third factor")?;
+    // t2 = t1 · g
+    let dt2 = def_of_kind(t2, OpKind::ArithMulf, "cubic's second factor")?;
+    let t1 = beside_gate(dt2, "cubic's second factor")?;
+    // t1 = g · c₂ — the base beside the constant must be THE divide's numerator, or the
+    // fused op would gate one tile and divide another.
+    let dt1 = def_of_kind(t1, OpKind::ArithMulf, "cubic's first factor")?;
+    let (t1_base, found_c2) = mul_by_const(dt1, "cubic's first factor")?;
+    if t1_base != gate {
+        return err(format!(
+            "{}: the gelu longhand's cubic starts from a value that is not the divide's \
+             numerator — `c₁·(g + c₂·g³)` and `g/(1+e^-v)` must state the SAME g, or the \
+             fused `OpFunc::Gelu` would gate one tile and divide another",
+            f.name
+        ));
+    }
+    if found_c2 != c2 {
+        return err(format!(
+            "{}: the gelu longhand's cubic multiplies g by {found_c2}, not the tanh \
+             gelu's c₂ = 0.044715 (the f16 grid's {c2}). Any other constant is a \
+             different function with the same op kinds, so it is refused rather than \
+             lowered as `OpFunc::Gelu`.",
+            f.name
+        ));
+    }
+
+    // ⛔ EACH CUBIC INTERMEDIATE HAS EXACTLY ONE READER — the same destruction law the
+    // spine's `sole` enforces above. The fused `OpFunc::Gelu` never materialises
+    // `t1`..`v`, so a second reader would be reading a value nothing writes. The one
+    // reader is the next link by construction (each definer reads its operand), so the
+    // check is a count, not an identity hunt.
+    for (x, what) in [
+        (t1, "the cubic's first factor"),
+        (t2, "the cubic's second factor"),
+        (t3, "the cubic's third factor"),
+        (t4, "the cubic's sum"),
+        (v, "the e-argument"),
+    ] {
+        if reads.readers_of(x).len() != 1 {
+            return err(format!(
+                "{}: {what} is read by {} ops, and this fusion DESTROYS it — the device's \
+                 `OpFunc::Gelu` never materialises the longhand's intermediates, so a \
+                 second reader would be reading a value nothing writes. Exactly one \
+                 reader is required.",
+                f.name,
+                reads.readers_of(x).len()
+            ));
+        }
+    }
+
+    // gelu -> multiply by `up`. The silu reader's terminal law, refusing in this
+    // reader's own name: `OpFunc::Gelu` is `gelu(g)·up`, and a bare gelu with no
+    // multiply is a different program this door has no arm for.
+    let mul = match reads.readers_of(div_v) {
+        [p] if reads.op_at(*p).op_type == OpKind::ArithMulf => reads.op_at(*p),
+        [] => {
+            return err(format!(
+                "{}: nothing reads the gelu longhand's quotient, so the gated product \
+                 does not continue there",
+                f.name
+            ));
+        }
+        [p] => {
+            return err(format!(
+                "{}: the gelu longhand's quotient is read by `{:?}`, but the gated \
+                 product reads it with `ArithMulf`",
+                f.name,
+                reads.op_at(*p).op_type
+            ));
+        }
+        rs => {
+            return err(format!(
+                "{}: the gelu longhand's quotient is read by {} ops, and this fusion \
+                 DESTROYS it — exactly one reader, `ArithMulf`, is required",
+                f.name,
+                rs.len()
+            ));
+        }
+    };
+    let Some(up) = mul.operands.iter().copied().find(|&s| s != div_v) else {
+        return err(format!(
+            "{}: the gelu's `arith.mulf` squares it rather than multiplying by an `up` tile",
+            f.name
+        ));
+    };
+    let Some(mul_v) = mul.result else {
+        return err(format!("{}: `arith.mulf` with no result", f.name));
+    };
+
+    // ⛔ THE f32 ISLAND NARROWED BACK, checked on EVERY op the chain claims. The
+    // kernel's own comment states why the island exists (an f16 `x³` overflows at
+    // |x| ≥ 41) and the ladder narrows it to the tile's f16 when both ends are f16 —
+    // measured on the live artifact, every op states f16. `OpFunc::Gelu` computes in
+    // the tensor's storage format, so lowering a chain the ladder left at f32 would
+    // substitute f16 arithmetic for the program's f32 — a different function, silently.
+    for (op, what) in [
+        (dv, "the e-argument's product"),
+        (dt4, "the cubic's sum"),
+        (dt3, "the cubic's third factor"),
+        (dt2, "the cubic's second factor"),
+        (dt1, "the cubic's first factor"),
+        (neg, "the negation"),
+        (exp, "the exponential"),
+        (add, "the denominator's sum"),
+        (div, "the quotient"),
+        (mul, "the gated product"),
+    ] {
+        if op.result_type.and_then(|t| t.elem()) != Some(ktir_core::dtypes::DType::F16) {
+            return err(format!(
+                "{}: {what} of the gelu longhand does not state f16 — the tanh form's f32 \
+                 island must be narrowed back before this door, or `OpFunc::Gelu` would \
+                 compute it in the tensor's storage format instead of the program's \
+                 arithmetic",
+                f.name
+            ));
+        }
+    }
+
+    Ok(Some(GeluMulChain {
+        gate,
+        up,
+        mul: mul_v,
+        neg: neg_v,
+        consumed: [t1, t2, t3, t4, v, neg_v, exp_v, add_v, div_v],
+    }))
 }
 
 /// The `Program` an op names, where the naming is 1:1 and needs no inference.
@@ -1590,11 +2015,20 @@ pub fn lower_function(
         .map_or(0, |m| m + 1);
     let mut inter: std::collections::HashMap<Ssa, Region> = std::collections::HashMap::new();
 
+    // THE TANH-GELU LONGHANDS, read BEFORE the silu reader they front for. The gelu
+    // shares the silu longhand's five op kinds with a different numerator, so the silu
+    // reader's fail-closed discriminator refuses it — and the pre-reads gate the whole
+    // per-op walk, so nothing downstream is reachable while a gelu stands unclaimed.
+    // [`program_gelu_mul_chains`] claims each chain only after proving it exactly
+    // (constants read off the splats, cubic association, island narrowed back), and the
+    // silu reader below skips the claims, so a mangled gelu is still a refusal — the
+    // silu reader's, naming the link.
+    let gelus = program_gelu_mul_chains(f)?;
     // THE ONE FUSED CHAIN THIS DOOR READS, before the 1:1 walk rather than inside it. See
     // [`program_silu_mul_chain`] for why the module header's "recognises NOTHING" survives this: the
     // device has `OpFunc::Silu` and KTIR has no op for it, so the longhand is the only spelling a
     // producer HAS — and lowering it op-by-op computes a different algorithm, not a slower one.
-    let silus = program_silu_mul_chains(f)?;
+    let silus = silu_mul_chains(f, &gelus)?;
     // THE RMSNORM CHAINS, read before the walk for the same reason the silus are. ⭐ AND THIS ONE IS
     // LOAD-BEARING FOR MORE THAN FUSION: its `ms = sum(x²)·INV_D` would otherwise be classified as a
     // `ScalarMul` and ask for `1/cols`'s registry slot — the exact divergence
@@ -1646,6 +2080,9 @@ pub fn lower_function(
         // `arith.negf` for having no 1:1 mapping (correctly, in isolation).
         if op.result.is_some_and(|r| {
             silus.iter().any(|c| c.consumed.contains(&r))
+                // The gelu chain's interior — the cubic's three products and sum, the e-argument,
+                // and the same four spine results — same law, one fused `Program::ExpertGatedAct`.
+                || gelus.iter().any(|c| c.consumed.contains(&r))
                 || rmsnorms.iter().any(|c| c.consumed.contains(&r))
                 // The expand/collapse/broadcast chain itself: no descriptor, the consumer states it.
                 || bcast_consumed.contains(&r)
@@ -1656,6 +2093,10 @@ pub fn lower_function(
         // rather than its own operands (which are `silu(gate)` and up). Everything else keeps the
         // 1:1 map exactly as before.
         let terminal = silus.iter().copied().find(|c| op.result == Some(c.mul));
+        // A gelu chain's terminal `arith.mulf`, same rule: the fused program's inputs are the
+        // recognised gate and up, not the mulf's own operands (`gelu(g)` is destroyed by the
+        // fusion).
+        let gated = gelus.iter().find(|c| op.result == Some(c.mul));
         // A `linalg.reduce`'s combiner is an ATTRIBUTE, not its op kind, so the kind is read off the op
         // beside the 1:1 map rather than from it — and it is carried HERE rather than as a `Program`
         // variant, because `Program` is matched exhaustively by consumers outside this crate and a bare
@@ -1688,6 +2129,11 @@ pub fn lower_function(
         let rms = rmsnorms.iter().find(|c| op.result == Some(c.out));
         let Some(program) = terminal
             .map(|_| Lowering::Silu)
+            // The claimed gelu's fused kind — the SAME `Program` a per-op producer states for a
+            // gated act, so `emit_one` dispatches to the one `gated_act` body both doors share
+            // and they cannot drift about what a gelu emits.
+            .or(gated
+                .map(|_| Lowering::Node(Program::ExpertGatedAct(GatedAct::Gelu))))
             .or(rms.map(|c| Lowering::RmsNorm(c.eps)))
             .or(reduce.map(Lowering::Reduce))
             .or(scalar.map(|(v, _)| Lowering::ScalarMul(v)))
@@ -1726,6 +2172,10 @@ pub fn lower_function(
             // x and gamma; the epsilon and `1/cols` are the fused body's own.
             Lowering::RmsNorm(_) => 2,
             Lowering::Node(Program::Matmul) => 2,
+            // The gated act's two inputs are the chain's gate and up, which the recogniser
+            // proved — the terminal mulf's own operands are `gelu(g)` and up, and the first is
+            // DESTROYED by the fusion.
+            Lowering::Node(Program::ExpertGatedAct(_)) => 2,
             Lowering::Node(Program::Elementwise(e)) => {
                 match super::lower_ktir_to_superdsc::elementwise_op_func(f.name, e) {
                     Ok((_, arity)) => arity,
@@ -1745,6 +2195,13 @@ pub fn lower_function(
                 vec![c.x, c.gamma]
             }
             (Some(c), _, _) => vec![c.gate, c.up],
+            // The gelu chain's two tensors, same rule as the silu's: the terminal mulf's own
+            // first operand is `gelu(g)` — destroyed by the fusion — so the recognised gate and
+            // up are what the emission takes.
+            _ if gated.is_some() => {
+                let c = gated.expect("just matched");
+                vec![c.gate, c.up]
+            }
             // The TENSOR operand the recogniser proved, not operand 0 — the splat sits on either side
             // (`ms * INV_D` has it second, and nothing obliges a producer to put it there).
             (None, Some((_, tensor)), _) => vec![tensor],
@@ -2389,6 +2846,13 @@ fn emit_one(
         Program::Transpose => {
             super::lower_ktir_to_superdsc::transpose(name, per_op, sym_id_base, layout)?
         }
+        // THE GELU LONGHAND'S FUSED KIND — the SAME body the per-`Program` door reaches, so
+        // the two doors cannot drift about what a gated act emits. Reached only through
+        // [`program_gelu_mul_chains`], which PROVED the longhand; `per_op` is
+        // `[gate, up, out]`, the parameter order `gated_act`'s own `split_out(.., 2)` reads.
+        Program::ExpertGatedAct(act) => {
+            super::lower_ktir_to_superdsc::gated_act(name, act, per_op, sym_id_base, layout)?
+        }
         other => {
             return err(format!(
                 "{name}: `{other:?}` is not reachable from this door — it is a fused kind the \
@@ -3009,13 +3473,37 @@ mod silu_chain_tests {
     /// ⛔⛔⛔ THE DISCRIMINATOR. `g/(1+e^-g)` is `g·sigmoid(g)` = silu(g). The same five op kinds in
     /// the same order with any other numerator are a different function, and this is the ONLY thing
     /// that tells them apart.
+    ///
+    /// ⭐ DRIVEN THROUGH THE PRIVATE READER, NOT THE PUB WRAPPER: the wrapper fronts the gelu
+    /// reader, which CLAIMS every wrong-numerator chain as a gelu candidate and refuses it on the
+    /// cubic verification (the companion test below pins that composed order). This discriminator
+    /// is the silu reader's own backstop — reachable whenever a negf reaches it unclaimed — and is
+    /// pinned here directly so the two readers' division of the negfs cannot drift silently.
     #[test]
     fn a_divide_whose_numerator_is_not_the_negated_value_is_refused() {
-        let e = program_silu_mul_chains(&chain(1.0, Num::Up, true))
+        let e = silu_mul_chains(&chain(1.0, Num::Up, true), &[])
             .expect_err("dividing something other than the gate by 1+e^-g is not a silu");
         assert!(
             e.message.contains("NUMERATOR"),
             "the refusal must name the numerator as the thing that failed; got: {}",
+            e.message
+        );
+    }
+
+    /// ⭐ THE COMPOSED ORDER: the same wrong-numerator chain through the PUB wrapper is refused
+    /// by the GELU reader instead — the gelu reader runs first, the numerator is not the negated
+    /// value, so the chain is a gelu candidate, and the e-argument (here a bare function
+    /// argument, not a cubic) fails the tanh form's verification. A chain that is neither silu
+    /// nor gelu is a refusal EITHER WAY; this pins WHICH reader owns it at the pub door, so a
+    /// reorder of the pre-reads fails here rather than silently rerouting the message.
+    #[test]
+    fn a_wrong_numerator_chain_is_refused_by_the_gelu_reader_at_the_pub_door() {
+        let e = program_silu_mul_chains(&chain(1.0, Num::Up, true))
+            .expect_err("a chain that is neither silu nor gelu must not lower");
+        assert!(
+            e.message.contains("gelu longhand's e-argument"),
+            "the pub wrapper fronts the gelu reader, so a wrong-numerator chain is refused \
+             as a gelu candidate; got: {}",
             e.message
         );
     }
