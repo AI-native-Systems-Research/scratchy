@@ -224,6 +224,52 @@ struct StepImageKey {
     signature: Vec<i64>,
 }
 
+/// The image cache WITH its accounting. The counters live on the two arms
+/// that fire them — not inlined at the executor's lookup site — because the
+/// executor cannot be built without a card, and the accounting is exactly
+/// what a cardless test must reach: the cadence line's
+/// `% from cached` is `replay_hits` over `replay_steps`, and it read
+/// structurally zero from the day the player landed — the hit arm timed the
+/// lookup without counting the hit, so a card replaying 256 steps off 4
+/// derivations still printed `0.0% from cached`. The cache worked; the
+/// counter was the defect. Two methods rather than one lookup-or-derive
+/// closure because the derive path needs `&mut self`, which a closure over
+/// the cache's own borrow cannot capture.
+#[derive(Default)]
+struct StepImageCache {
+    map: std::collections::HashMap<StepImageKey, StepImage>,
+}
+
+impl StepImageCache {
+    /// ⭐ THE HIT ARM — lookup, timing, AND THE COUNT: `replay_hits` is the
+    /// numerator of the cadence line's `% from cached`, and the hit arm never
+    /// counted it — no line of code ever incremented it. Timed as the player
+    /// always timed a hit — around the get+clone, guard acquisition included.
+    fn lookup_cached(&mut self, key: &StepImageKey) -> Option<StepImage> {
+        let t0 = Instant::now();
+        let hit = self.map.get(key).cloned();
+        if hit.is_some() {
+            let mut t = timers();
+            t.replay_hits += 1;
+            t.replay_lookup_ms += t0.elapsed().as_secs_f64() * 1e3;
+        }
+        hit
+    }
+
+    /// The MISS arm — count the derivation and what it cost, then keep the
+    /// image for every later step on this key. The cost window is the derive
+    /// alone (`started` predates it, and the insert sits outside both the
+    /// window and the guard), matching the player's original accounting.
+    fn note_derived(&mut self, key: StepImageKey, image: StepImage, started: Instant) {
+        {
+            let mut t = timers();
+            t.replay_derives += 1;
+            t.replay_derive_ms += started.elapsed().as_secs_f64() * 1e3;
+        }
+        self.map.insert(key, image);
+    }
+}
+
 struct Diag {
     /// `SCRATCHY_SDSC_PEROP_SYNC`: re-enable the per-group host drain. DEFAULT-OFF —
     /// pipeline_barrier + the stream's STRICT_ORDERING guarantee the dataflow, and the drain cost
@@ -812,7 +858,7 @@ pub struct Executor {
     /// [`StepImageKey`]. EMPTY until the first eligible decode step derives
     /// one; every batched or instrumented step takes the walk instead, so
     /// nothing here is consulted (or populated) off the player's own path.
-    step_images: std::collections::HashMap<StepImageKey, StepImage>,
+    step_images: StepImageCache,
 }
 
 /// Per-session state for the card-side tensordump — see [`Diag::tensordump`].
@@ -970,7 +1016,7 @@ impl Executor {
             staged_host: false,
             n_weights_staged: 0,
             dump: None,
-            step_images: std::collections::HashMap::new(),
+            step_images: StepImageCache::default(),
         };
 
         // ── RE-ROLLED mode: a re-roll meta ⇒ this bundle is the BODY (one layer); the prefix (embed)
@@ -4235,21 +4281,12 @@ impl Executor {
             n_fold_pages: n,
             signature: fold_signature(&self.fold, n),
         };
-        let t0 = Instant::now();
-        let image = match self.step_images.get(&key) {
-            Some(image) => {
-                let hit = image.clone();
-                let mut t = timers();
-                t.replay_lookup_ms += t0.elapsed().as_secs_f64() * 1e3;
-                hit
-            }
+        let image = match self.step_images.lookup_cached(&key) {
+            Some(hit) => hit,
             None => {
                 let t1 = Instant::now();
                 let image = self.derive_step_image(sel, n, pos_c, page_c)?;
-                let mut t = timers();
-                t.replay_derives += 1;
-                t.replay_derive_ms += t1.elapsed().as_secs_f64() * 1e3;
-                self.step_images.insert(key, image.clone());
+                self.step_images.note_derived(key, image.clone(), t1);
                 image
             }
         };
@@ -5368,4 +5405,41 @@ mod tests {
     /// `Seg::known` is const-evaluated, so this is a compile-time proof rather than a test — the
     /// value exists only if the assert held.
     const _SEG6: SegIdx = SegIdx::known::<6>();
+
+    /// Two steps on ONE image key: the first derives, the second hits the cache —
+    /// and the hit arm must COUNT it. The cadence line's "% from cached" read 0.0
+    /// forever because it didn't: 256 replayed steps off 4 derivations
+    /// printed "0.0% from cached" on a live card.
+    #[test]
+    fn replay_image_cache_counts_its_hits() {
+        let (hits, derives) = {
+            let t = timers();
+            (t.replay_hits, t.replay_derives)
+        };
+        let mut cache = StepImageCache::default();
+        let key = StepImageKey {
+            sel: BodySel::RungFused(0),
+            n_fold_pages: 1,
+            signature: vec![7],
+        };
+        let dummy = StepImage {
+            data: std::sync::Arc::new(StepImageData {
+                canvas: std::sync::Arc::new(Vec::new()),
+                rows: Vec::new(),
+            }),
+            barrier: false,
+        };
+        assert!(
+            cache.lookup_cached(&key).is_none(),
+            "an empty cache has no image: the first step derives"
+        );
+        cache.note_derived(key.clone(), dummy, Instant::now());
+        assert!(
+            cache.lookup_cached(&key).is_some(),
+            "the second step on the same key must hit the cache"
+        );
+        let t = timers();
+        assert_eq!(t.replay_hits, hits + 1, "the hit arm counted it");
+        assert_eq!(t.replay_derives, derives + 1);
+    }
 }
