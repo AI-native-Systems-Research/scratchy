@@ -201,14 +201,17 @@ pub struct BakeFacts {
     pub subpage_bank_e: usize,
     /// ⭐⭐⭐ THE COMPOSITE ARGMAX'S VOCAB — the bundle placed `argmax_ramp_tid` (the rolled
     /// walk recognized a TIED ONE-REQUEST lm-head tail and minted the composite group), so
-    /// the launch must stage the descending `V − iota` ramp and the scalar-V stick, fp32,
-    /// through the RAW bind channel — never the f32→sen const bind, which narrows to fp16
-    /// and whose exact integers stop at 2048, far below every real vocab (the mint's own
-    /// reason for computing the ramp in-func; `emit::argmax`). Read off the ramp's OWN
-    /// placement (`[1, vocab]` fp32 ⇒ `size / 4`) — the same artifact-derived law as
-    /// `ones_reduce_len`: the placement and the staging answer ONE question, so they cannot
-    /// desync into a placed-but-unstaged ramp or a staged-but-unread one. 0 when unplaced —
-    /// every untied model, prefill bundle and batched rung keeps the host readback path.
+    /// the session constructor must stage the descending `V − iota` ramp and the scalar-V
+    /// stick, fp32, ONCE AT LOAD through `superdsc_exec::Executor::bind_const_fp32`
+    /// ([`Self::argmax_const_binds`]) — never the per-step raw channel (a raw id bound
+    /// before prepare is exactly the raw+weight combination the staging loop refuses), and
+    /// never the f32→sen const bind, which narrows to fp16 and whose exact integers stop at
+    /// 2048, far below every real vocab (the mint's own reason for computing the ramp
+    /// in-func; `emit::argmax`). Read off the ramp's OWN placement (`[1, vocab]` fp32 ⇒
+    /// `size / 4`) — the same artifact-derived law as `ones_reduce_len`: the placement and
+    /// the staging answer ONE question, so they cannot desync into a placed-but-unstaged
+    /// ramp or a staged-but-unread one. 0 when unplaced — every untied model, prefill
+    /// bundle and batched rung keeps the host readback path.
     pub argmax_vocab: usize,
 }
 
@@ -286,6 +289,44 @@ impl BakeFacts {
                 std::borrow::Cow::Owned(_) => &[],
             },
         }
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE COMPOSITE ARGMAX'S TWO RESIDENT CONSTANTS AS DEVICE BYTES — the ramp and
+    /// the V stick that [`Self::argmax_vocab`] gates. `None` when the bundle placed no
+    /// composite (vocab 0), so the session constructor's bind is one `if let` with no second
+    /// gate to drift from the first.
+    ///
+    /// THE RAMP is the descending `V − iota` row, `[1, vocab]` fp32 LE: lane `i` carries
+    /// `V − i`, so the first maximal index's product `mask · ramp` is strictly unique — the
+    /// composite's first-max arithmetic (`emit::argmax`). THE V STICK is the scalar V, one
+    /// fp32 stick with EVERY lane carrying V — splatted, not lane-0-only: the subtract reads
+    /// it through `out_broadcast` (a RedStick read), which resolves the value at LANE 0 of
+    /// the stick (the card-proven broadcast law in `route_argsort`'s doc), so lane 0 is the
+    /// only lane the arithmetic needs; the splat keeps the bytes correct under a lane-WISE
+    /// read too, so no future reader can turn "which lanes matter" into a defect.
+    ///
+    /// Host LE f32 bytes ARE the device encoding (`Df::Fp32` is IEEE_FP32), which is the
+    /// whole reason `superdsc_exec::Executor::bind_const_fp32` stages them verbatim. The
+    /// stick width is the SAME constant the layout's `place_const32` sized the placement
+    /// from, so the bind is exactly as long as its own placement.
+    ///
+    /// ⛔ STAGED AT LOAD, ONCE — the door records them as weights, so `refill_activations`
+    /// never re-uploads them and no per-step bind ever names them.
+    pub fn argmax_const_binds(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        let vocab = self.argmax_vocab;
+        if vocab == 0 {
+            return None;
+        }
+        let ramp = (0..vocab)
+            .flat_map(|i| ((vocab - i) as f32).to_le_bytes())
+            .collect();
+        // One fp32 stick — the same width the layout's `place_const32` sized the placement at.
+        use ktir_superdsc::superdsc_opspec::DataFormat;
+        let lanes = <ktir_superdsc::superdsc_opspec::Fp32 as DataFormat>::ELEMS_PER_STICK as usize;
+        let v_stick = (0..lanes)
+            .flat_map(|_| (vocab as f32).to_le_bytes())
+            .collect();
+        Some((ramp, v_stick))
     }
 
     /// ⛔ REFUSE a decode bundle with no identity. Every model with attention references `ident`
@@ -1596,6 +1637,52 @@ mod constant_tape_tests {
         );
         // ⛔ Zero is not a launch: it is also the value this hardware reads as a maximum.
         assert!(StagedRows::of_launch(0).is_none());
+    }
+
+    /// ⭐⭐⭐ THE COMPOSITE ARGMAX'S CONST BYTES ARE A LAW, NOT A CONVENTION — the ramp's lane
+    /// values are the first-max arithmetic itself (`w = mask · (V − iota)` must make the FIRST
+    /// maximal index's weight unique), and the V stick's splat is what keeps the subtract's
+    /// RedStick read correct under a lane-wise reader too. A drift in either byte string is a
+    /// wrong token with a clean bake, so the byte law is pinned here where no card is needed.
+    #[test]
+    fn argmax_const_binds_pin_the_ramp_and_the_splat() {
+        // No composite ⇒ no binds — the gate and the values answer ONE question.
+        assert!(
+            BakeFacts::NONE.argmax_const_binds().is_none(),
+            "vocab 0 (no composite) must bind nothing"
+        );
+
+        let facts = BakeFacts {
+            argmax_vocab: 300,
+            ..BakeFacts::NONE
+        };
+        let (ramp, v_stick) = facts
+            .argmax_const_binds()
+            .expect("a placed composite binds its consts");
+
+        // The ramp: `[1, 300]` fp32 LE, lane i = V − i — descending from V to exactly 1, so
+        // the LAST lane is 1 (not 0: a zero lane would let a tied maximum at the last index
+        // collide with an untied one at weight 0… and the mint computes the same string).
+        assert_eq!(ramp.len(), 300 * 4, "one fp32 per vocab lane");
+        let lane = |b: &[u8], i: usize| f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(lane(&ramp, 0), 300.0, "lane 0 carries V");
+        assert_eq!(lane(&ramp, 299), 1.0, "the last lane carries 1, never 0");
+        assert_eq!(lane(&ramp, 41), 259.0, "lane i carries V − i");
+        // Descending with unit stride — the uniqueness the arithmetic rests on.
+        for i in 1..300 {
+            assert!(lane(&ramp, i - 1) > lane(&ramp, i));
+        }
+
+        // The V stick: one fp32 stick (32 lanes — the same width `place_const32` sized the
+        // placement at), EVERY lane carrying V, LE.
+        assert_eq!(v_stick.len(), 32 * 4, "exactly one fp32 stick");
+        for l in 0..32 {
+            assert_eq!(
+                lane(&v_stick, l),
+                300.0,
+                "lane {l} — the splat, not lane 0 alone"
+            );
+        }
     }
 
     use scratchy_subtile::host_tape::{HostTape, KernelId, Launcher, TensorId, play};

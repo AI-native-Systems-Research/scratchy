@@ -269,6 +269,23 @@ impl SuperDscSession {
             t_bind.elapsed().as_secs_f64()
         );
 
+        // ⭐ THE COMPOSITE ARGMAX'S TWO RESIDENT FP32 CONSTS (#603 PR3a) — bound at LOAD, iff
+        // this bundle's own layout placed them (the one-request rung that minted the composite;
+        // `BakeFacts::of` reads the vocab off the ramp's own placement, so the bind and the mint
+        // answer one question and cannot drift into a placed-but-unstaged ramp). The consts are
+        // ACTIVATION-segment residents this session's own forwards read, so they cannot ride an
+        // alias: `bind_const_fp32` records them as weights, staging copies them verbatim into
+        // the shadow exactly once, and no per-step bind ever names them again.
+        let facts = crate::wiring::BakeFacts::of(&code.layout);
+        let n_consts = if let Some((ramp, v_stick)) = facts.argmax_const_binds() {
+            use crate::lower_subtile_tape_to_superdsc::{argmax_ramp_tid, argmax_v_tid};
+            exec.bind_const_fp32(crate::bundle_code::PlaceId::Act(argmax_ramp_tid()), ramp)?;
+            exec.bind_const_fp32(crate::bundle_code::PlaceId::Act(argmax_v_tid()), v_stick)?;
+            2
+        } else {
+            0
+        };
+
         // Convert + stage the bound weights into host staging NOW, on this thread, while the
         // background device prewarm is still bringing the card up — this takes the ~1s parallel
         // IEEE→SEN convert off the prepare critical path. Bytes reaching the device are identical;
@@ -276,7 +293,7 @@ impl SuperDscSession {
         //
         // NOTHING BOUND is the same situation as BORROWED: with no weights this call only zero-fills
         // a host shadow of a segment that is about to be replaced by an alias.
-        if !borrowed.is_empty() || n_bound == 0 {
+        if !borrowed.is_empty() || n_bound + n_consts == 0 {
             debug!(
                 "[timing] weight bind + stage SKIPPED ({})",
                 if borrowed.is_empty() {

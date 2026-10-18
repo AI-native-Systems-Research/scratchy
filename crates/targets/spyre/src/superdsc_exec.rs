@@ -903,6 +903,14 @@ pub struct Executor {
     /// Disjoint from `bound` by construction: every bind door removes its id from the other map, so
     /// one id has one source of bytes.
     staged: BTreeMap<bundle::PlaceId, u64>,
+    /// ⭐⭐⭐⭐⭐ IDS BOUND THROUGH [`Executor::bind_const_fp32`] — fp32 constants whose LE host
+    /// bytes ARE the device encoding (`Df::Fp32` is IEEE_FP32), so staging copies them VERBATIM:
+    /// no IEEE→SEN re-encode, no tile walk. The composite argmax's descending ramp and scalar-V
+    /// stick (#603 PR3a), and nothing else today.
+    ///
+    /// A set for the same reason [`Self::raw_ids`] is one: the staging loop consults it, and a
+    /// flag remembered by the bind call alone is a flag the loop can forget.
+    const_fp32_ids: BTreeSet<bundle::PlaceId>,
 
     // ── KV / fold ──
     kv: KvGeometry,
@@ -1078,6 +1086,7 @@ impl Executor {
             raw_ids: BTreeSet::new(),
             keyed: BTreeMap::new(),
             staged: BTreeMap::new(),
+            const_fp32_ids: BTreeSet::new(),
             kv: KvGeometry::default(),
             fold: SessionKv::default(),
             block_table_set: false,
@@ -1725,6 +1734,58 @@ impl Executor {
         self.bound.insert(b.id, b.bytes);
     }
 
+    /// ⭐⭐⭐⭐⭐ Bind a RESIDENT FP32 CONSTANT at load — staged VERBATIM, once, never re-bound.
+    /// The composite argmax's descending ramp and scalar-V stick (#603 PR3a), and nothing else
+    /// today.
+    ///
+    /// ⛔ THIS IS NOT [`Self::bind_input_raw`], AND NOT A LAZIER [`Self::bind_weight`]. The raw
+    /// channel is PER-STEP (a raw id bound before prepare is exactly the raw+weight combination
+    /// the staging loop refuses); the weight channel re-encodes every byte through
+    /// `ieee_to_sen_bytes`, which reads a 4-byte fp32 as two fp16s and rewrites both mantissas.
+    /// A const bound here is a WEIGHT — resident, skipped by every per-step refill — whose bytes
+    /// need no conversion at all, because `Df::Fp32` IS IEEE fp32 and the host's LE bytes are
+    /// the device's own.
+    ///
+    /// Validated the way [`Self::place_raw`] validates its one product: a whole number of f32
+    /// entries, and no longer than the const's own placement (`>` not `!=` — the over-bind law;
+    /// a short bind leaves the placement's tail zero, which is a valid constant image).
+    pub fn bind_const_fp32(&mut self, id: bundle::PlaceId, bytes: Vec<u8>) -> Result<()> {
+        if self.prepared {
+            bail!(
+                "bind_const_fp32({id}): session ALREADY PREPARED — a resident constant must be \
+                 bound before prepare, where staging copies it into the shadow the H2D ships \
+                 once at load"
+            );
+        }
+        let Some(p) = self.places.get(&id) else {
+            bail!(
+                "bind_const_fp32({id}): NO placement in this bundle — the layout did not place \
+                 this const, so the caller's bind and the bundle's layout disagree about the \
+                 composite argmax. REFUSING"
+            );
+        };
+        if !bytes.len().is_multiple_of(4) {
+            bail!(
+                "bind_const_fp32({id}): {} B is not a whole number of fp32 entries",
+                bytes.len()
+            );
+        }
+        if bytes.len() as u64 > p.size {
+            bail!(
+                "bind_const_fp32({id}): {} B exceeds its own {} B placement (seg{} off {}) — \
+                 REFUSING, this would corrupt the following tensors",
+                bytes.len(),
+                p.size,
+                p.segment,
+                p.offset
+            );
+        }
+        self.weight_ids.insert(id);
+        self.const_fp32_ids.insert(id);
+        self.bound.insert(id, bytes);
+        Ok(())
+    }
+
     /// Declare, BEFORE prepare, that `seg` will be BORROWED from another session via
     /// [`Executor::alias_seg_from`]: prepare gives it a 128 B placeholder, skips its host staging
     /// and skips its H2D, so the session never builds the copy the alias immediately discards.
@@ -1856,6 +1917,20 @@ impl Executor {
         }
 
         // ── Collect the weight placements, validating each against its own extent. ──
+        // One bound tensor's staging transform — what the parallel stage loop does to its bytes.
+        // ⭐ VERBATIM IS A THIRD THING, NOT THE ABSENCE OF THE SECOND: this used to be
+        // `Option<(&KernelWeight, Element)>`, where `None` meant "convert", so an fp32 const
+        // had no honest spelling — its bytes are neither retiled nor IEEE-fp16-to-SEN
+        // re-encoded, they are already the device's own (`Df::Fp32` = IEEE_FP32).
+        #[derive(Clone, Copy)]
+        enum StageMode<'a> {
+            /// IEEE f16 → SEN169 f16 — the default for every magnitude the card holds in fp16.
+            Convert,
+            /// Retile into the device tile layout this matmul kernel reads.
+            Retile(&'a KernelWeight<'a>, Element),
+            /// Copy VERBATIM — a resident fp32 constant ([`Executor::bind_const_fp32`]).
+            Verbatim,
+        }
         struct Item<'a> {
             /// The SHADOW SLOT this weight stages into — a segment, or a weight bank beyond bank 0.
             /// See [`Executor::slot_of`]: banking gives one segment several regions, so the segment
@@ -1863,7 +1938,7 @@ impl Executor {
             slot: usize,
             offset: usize,
             src: &'a [u8],
-            walk: Option<(&'a KernelWeight<'a>, Element)>,
+            mode: StageMode<'a>,
         }
         let mut items: Vec<Item<'_>> = Vec::new();
         for (nm, src) in &self.bound {
@@ -1926,32 +2001,40 @@ impl Executor {
                     self.shadow(slot).len()
                 );
             }
-            let walk = match self.kernel_weights.get(nm) {
-                Some(k) => {
-                    let dev_elems: u64 = k.device_size.iter().product();
-                    if dev_elems as usize * k.word_length as usize != src.len() {
-                        bail!(
-                            "stage: kernel weight '{nm}' host size {} B != \
-                             prod(device_size)*word_length ({} B) — manifest/shape mismatch",
-                            src.len(),
-                            dev_elems as usize * k.word_length as usize
-                        );
+            let mode = if self.const_fp32_ids.contains(nm) {
+                // A resident fp32 const — its LE bytes are the device encoding, so nothing
+                // here may touch them. Checked FIRST so the kernel-weight lookup below can
+                // never hand a const a tile walk (it has no KernelWeight, but the ordering
+                // makes that a structural fact rather than a happy one).
+                StageMode::Verbatim
+            } else {
+                match self.kernel_weights.get(nm) {
+                    Some(&k) => {
+                        let dev_elems: u64 = k.device_size.iter().product();
+                        if dev_elems as usize * k.word_length as usize != src.len() {
+                            bail!(
+                                "stage: kernel weight '{nm}' host size {} B != \
+                                 prod(device_size)*word_length ({} B) — manifest/shape mismatch",
+                                src.len(),
+                                dev_elems as usize * k.word_length as usize
+                            );
+                        }
+                        let Some(elem) = Element::from_word_length(k.word_length) else {
+                            bail!(
+                                "stage: kernel weight '{nm}' word_length {} has no tile walk",
+                                k.word_length
+                            );
+                        };
+                        StageMode::Retile(k, elem)
                     }
-                    let Some(elem) = Element::from_word_length(k.word_length) else {
-                        bail!(
-                            "stage: kernel weight '{nm}' word_length {} has no tile walk",
-                            k.word_length
-                        );
-                    };
-                    Some((*k, elem))
+                    None => StageMode::Convert,
                 }
-                None => None,
             };
             items.push(Item {
                 slot,
                 offset: p.offset as usize,
                 src,
-                walk,
+                mode,
             });
         }
 
@@ -1959,13 +2042,9 @@ impl Executor {
         //    is what makes the parallel stage safe with no unsafe at all — and it PROVES the
         //    placements are disjoint (an overlap shows up as a backwards cursor, which is a
         //    refusal, where the C++ would simply have raced).
-        /// One weight's staging work: its source bytes, its OWN destination sub-slice, and the
-        /// tile walk (None = a plain IEEE→SEN convert).
-        type StageTask<'a> = (
-            &'a [u8],
-            &'a mut [u8],
-            Option<(&'a KernelWeight<'a>, Element)>,
-        );
+        /// One weight's staging work: its source bytes, its OWN destination sub-slice, and its
+        /// staging transform ([`StageMode`]).
+        type StageTask<'a> = (&'a [u8], &'a mut [u8], StageMode<'a>);
         let n_items = items.len();
         items.sort_by_key(|i| (i.slot, i.offset));
         let mut tasks: Vec<StageTask<'_>> = Vec::with_capacity(n_items);
@@ -1996,7 +2075,7 @@ impl Executor {
                 let (dst, r2) = r.split_at_mut(it.src.len());
                 rests[it.slot] = r2;
                 cursor[it.slot] = it.offset + it.src.len();
-                tasks.push((it.src, dst, it.walk));
+                tasks.push((it.src, dst, it.mode));
             }
         }
 
@@ -2015,9 +2094,9 @@ impl Executor {
         std::thread::scope(|scope| {
             for bucket in buckets {
                 scope.spawn(move || {
-                    for (src, dst, walk) in bucket {
-                        match walk {
-                            Some((k, elem)) => stage_weight_tiled(
+                    for (src, dst, mode) in bucket {
+                        match mode {
+                            StageMode::Retile(k, elem) => stage_weight_tiled(
                                 src,
                                 dst,
                                 RetileWalk {
@@ -2026,7 +2105,8 @@ impl Executor {
                                 },
                                 elem,
                             ),
-                            None => sen_convert::ieee_to_sen_bytes(src, dst),
+                            StageMode::Convert => sen_convert::ieee_to_sen_bytes(src, dst),
+                            StageMode::Verbatim => dst.copy_from_slice(src),
                         }
                     }
                 });
