@@ -865,6 +865,38 @@ pub(crate) struct RowImage {
     pub(crate) plan: PatchPlan,
 }
 
+/// One launch row's canvas with NO patch table — what a step-CONSTANT row
+/// (prefix/suffix, the player's `follows_step == false` rows) replays from,
+/// in full. A constant `where_` makes every step-differential zero, so such
+/// a row's patch table is empty BY CONSTRUCTION — deriving one anyway would
+/// probe a counterfactual no replay executes (measured on the first real
+/// bundle: the page differential walks the row's write base a full stride
+/// past where any launch of that row ever puts it, the render returns a
+/// structurally different allocation, and the affine solve refuses). Parity
+/// at the constant `where_` is the row's whole correctness statement; the
+/// player copies this canvas verbatim and never consults the empty plan.
+pub(crate) fn render_row(
+    ops: &Ops,
+    fold: &SessionKv,
+    seg: &[Option<DevAddr>; NUM_SEGMENTS],
+    banks: &[Option<DevAddr>],
+    where_: &LaunchWhere,
+    stream: &Stream,
+) -> Result<RowImage> {
+    let plan = build_cb_plan(ops, fold, seg, banks, where_)?;
+    let (items, barrier) = plan.render(fold, where_)?;
+    let canvas = stream.render_compute_batch(&items, 1)?;
+    let per = fold.page_slots.get().max(1);
+    Ok(RowImage {
+        canvas,
+        plan: PatchPlan {
+            reference: step_scalars(fold.paged, per, where_.slot_pos.0, where_.kv_page_base.0),
+            patches: Vec::new(),
+            barrier,
+        },
+    })
+}
+
 /// ⭐ THE 2b GATE — the patch table proven off-sample, at prepare. Builds the
 /// patch plan for one launch's image and then VERIFIES it against fresh walk
 /// renders at steps neither the canvas nor the differentials visited: the

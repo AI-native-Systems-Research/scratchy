@@ -2095,8 +2095,11 @@ impl Executor {
     ///
     /// ⭐ STAGE 2b rides along: per context, `cb_plan::patch_check` proves the IMAGE MODEL itself
     /// — canvas + affine patches ≡ a fresh walk render, at off-sample steps — under the decode
-    /// player's own single-request shape. A geometry too narrow to sample around a mid-page
-    /// canvas (fewer than ~65 slots past it) skips that leg loudly; every shipped bundle's page
+    /// player's own single-request shape, and ONLY over the body-class lists: those are the
+    /// lists the player launches at a step-following `where_` (prefix/suffix launch at a
+    /// constant one, so their patch table is empty by construction and their proof is the
+    /// parity leg alone). A geometry too narrow to sample around a mid-page canvas (fewer
+    /// than ~65 slots past it) skips that leg loudly; every shipped bundle's page
     /// is 2048 slots.
     ///
     /// ⛔ NOT A PER-STEP CHECK — a step never pays for this. It runs at [`Self::prepare`] (every
@@ -2286,7 +2289,17 @@ impl Executor {
                 )?;
                 contexts += 1;
             }
-            if patch_room {
+            // ⭐ THE PLAYER'S ROW LAW, read here as the gate's scope: only the
+            // four body-class lists are ever launched at a step-following
+            // `where_` — prefix/suffix launch at a constant one (see
+            // `derive_step_image`), so their patch table is empty by
+            // construction and there is nothing for this leg to prove.
+            // Probing them at this leg's mid-pool `where_` measures a
+            // counterfactual no replay executes (measured on the first real
+            // bundle: the page differential's render returns a structurally
+            // different allocation and the affine solve refuses).
+            let step_following = !matches!(sel, ListSel::Prefix | ListSel::Suffix);
+            if patch_room && step_following {
                 for (tag, bank, off) in &rows {
                     let label = format!("{sel:?}/{tag}");
                     let (row_sites, _) = cb_plan::patch_check(
@@ -2312,6 +2325,16 @@ impl Executor {
             bail!(
                 "[cbplan] parity gate REFUSED: no (list × launch-row) context was checkable — \
                  every bank was skipped or no list is allocated"
+            );
+        }
+        if patch_room && patch_contexts == 0 {
+            // Not a refusal: the rungs allocate lazily, so a session whose every body-class
+            // list is still deferred legitimately has nothing to patch-prove here — each
+            // rung runs this same gate at its own allocation. Said loudly because a silent
+            // zero is indistinguishable from a broken enumeration.
+            debug!(
+                "[sdsc-cbplan] patch gate verified ZERO images: no body-class list is allocated \
+                 yet (deferred rungs gate at their own allocation)"
             );
         }
         debug!(
@@ -4337,13 +4360,15 @@ impl Executor {
                 )?;
                 (img.canvas, img.plan)
             } else {
-                // A fixed row: its replay target is its own canvas,
-                // unchanged, every step — the walk launches it at this SAME
-                // `where_` forever. Parity at that `where_` is the whole
-                // correctness statement, so the patch machinery is derived
-                // (the same builder renders the canvas) but its off-sample
-                // leg is not run: it would test a semantics no replay uses
-                // and could refuse an image over it.
+                // A fixed row: the walk launches it at this SAME `where_`
+                // every step, so its replay target is its own canvas,
+                // unchanged — parity at that `where_` is the whole
+                // correctness statement. Its patch table is empty BY
+                // CONSTRUCTION (a constant `where_` makes every
+                // step-differential zero), so none is derived: probing one
+                // would measure a counterfactual no replay executes — the
+                // measured failure mode the prepare gate's scope law also
+                // encodes (its patch leg skips the prefix/suffix lists).
                 cb_plan::parity_check(
                     ops,
                     &self.fold,
@@ -4353,7 +4378,7 @@ impl Executor {
                     &label,
                     stream,
                 )?;
-                let (c, p) = cb_plan::build_patch_plan(
+                let img = cb_plan::render_row(
                     ops,
                     &self.fold,
                     &self.seg_addr,
@@ -4361,7 +4386,7 @@ impl Executor {
                     &where_,
                     stream,
                 )?;
-                (c, p)
+                (img.canvas, img.plan)
             };
             barrier |= plan.barrier;
             sites += plan.sites();
