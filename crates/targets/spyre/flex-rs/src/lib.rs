@@ -25,6 +25,8 @@
 //! - `control_blocks`       — control-block construction/fixup layer (SBF translation)
 //! - `scheduler`            — RuntimeScheduler and its Pf/Vf/Mock backends
 //! - `host_interface`       — RaiiBuffer
+//! - `shared_host_pool`     — pinned, index-addressed host slots behind one
+//!   IOMMU mapping (#606; the stable-IOVA half of #603 PR3b's per-step DMA)
 //! - `flex_config`          — FlexConfig, RuntimeConfig
 //! - `util`                 — sendnn::Status, generic numeric/env helpers
 //! - `telemetry`            — FlexLogExtra, FlexConfig subset, Profiler/GlobalProfiler,
@@ -63,6 +65,7 @@ pub mod rb_telemetry;
 pub mod runtime;
 pub mod scheduler;
 pub mod senlib_ffi;
+pub mod shared_host_pool;
 pub mod stream;
 pub mod telemetry;
 pub mod topology;
