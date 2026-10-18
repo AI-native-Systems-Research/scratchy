@@ -10002,6 +10002,7 @@ fn layout_tokens(
         weight_copies,
         router_experts,
         router_k,
+        argmax_vocab,
         kv_request_stride_bytes,
     } = l;
     let segs = segment_bytes
@@ -10049,6 +10050,9 @@ fn layout_tokens(
     // The router top-k width — the softmax's k-boundary mask row's own bind fact,
     // 0 when the tape has no top-k (the field's own doc beside `router_experts`).
     let rk = proc_macro2::Literal::u32_unsuffixed(*router_k);
+    // The composite argmax's REAL vocab — the sentinel threshold the wiring reads off the
+    // registry (the pad-lane ramp placement's own size is the stick-padded width, not V).
+    let avocab = proc_macro2::Literal::u32_unsuffixed(*argmax_vocab);
     quote! {
         ::scratchy_target_spyre::bundle_code::BundleLayout {
             segment_bytes: [#(#segs),*],
@@ -10061,6 +10065,7 @@ fn layout_tokens(
             weight_copies: ::std::borrow::Cow::Borrowed(&[#(#copies),*]),
             router_experts: #rexperts,
             router_k: #rk,
+            argmax_vocab: #avocab,
             kv_request_stride_bytes: #krs,
         }
     }

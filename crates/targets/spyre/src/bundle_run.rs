@@ -432,6 +432,9 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         // No MoE router in a single-kernel Triton bundle.
         router_experts: 0,
         router_k: 0,
+        // No composite argmax either: this runner lowers Triton kernels, never the
+        // spyre-bundle lm-head tail that mints one.
+        argmax_vocab: 0,
         // No paged KV: a single-kernel bundle has no per-request cache stride.
         kv_request_stride_bytes: 0,
     };

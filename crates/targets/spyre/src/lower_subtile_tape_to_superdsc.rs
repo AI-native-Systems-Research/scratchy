@@ -192,9 +192,9 @@ pub use ktir_superdsc::reserved_tids::{
     RESERVED_REGIONS, RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID, RMS_INVCOLS_TID,
     RMS_RSQRT_PROBE_TID, RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, SCALARMUL_SCALE_BASE,
     SEL_HEADMAJOR_TID, SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION,
-    TidRegion, argmax_ramp_tid, argmax_v_tid, expert_subpage_bank_tid, identity_class_tid,
-    is_kernel_table_class_tid, kct_resident_tid, oproj_headmajor_tid, reserved_region,
-    rope_p_class_hds, rope_p_class_tid, router_identity_tid, router_pad_mask_tid,
+    TidRegion, argmax_bias_tid, argmax_ramp_tid, argmax_v_tid, expert_subpage_bank_tid,
+    identity_class_tid, is_kernel_table_class_tid, kct_resident_tid, oproj_headmajor_tid,
+    reserved_region, rope_p_class_hds, rope_p_class_tid, router_identity_tid, router_pad_mask_tid,
     router_rank_tie_tid, router_sm_mask_tid, router_topk_iota_tid, router_topk_pad_tid,
     scalarmul_scale_tid,
 };
@@ -674,7 +674,9 @@ fn unique_producer<F: RopeForm>(
 /// the recognition that read them off the graph ([`crate::lower_subtile_tape_to_ktir`]'s
 /// `ArgmaxPlan`), so the layout never re-derives a fact the recognizer already proved.
 pub struct ArgmaxTable {
-    /// The table's row count — the gather's bank height, the ramp's width.
+    /// The table's row count — the gather's bank height. The ramp's own width is this
+    /// vocab's stick-padded form (the pad-lane form's law); the REAL vocab rides the
+    /// layout's `argmax_vocab` registry.
     pub vocab: u32,
     /// One embedding row's width in elements — the sentinel row's byte size is `hidden · 2`
     /// (fp16, the gather's slab width).
@@ -1476,6 +1478,20 @@ pub fn compute_bundle_layout<F: RopeForm>(
     if let Some(argmax) = &argmax {
         let vocab = argmax.vocab;
         let seg = SegRole::Activation.segment();
+        // ⭐ THE PAD-LANE FORM — a sub-stick vocab (granite-3.1's 49155) pads its staging to
+        //    whole sticks (the dxp scheduler rejects sub-stick tiles), so the chain's links
+        //    run at the PADDED width: the ramp is placed `[1, stick_pad(V)]` with its pad
+        //    lanes CLAMPED to zero (`max(V − i, 0)` — the mint's own law), and the form's
+        //    THIRD const — the fp16 bias, 0 on the real lanes and −65504 on the pad ones —
+        //    is placed beside them, through the same fp16 law the router consts place at.
+        //    A whole-stick vocab pads to itself: the ramp's placement and its bytes are
+        //    byte-identical to the landed form's, and NO bias is placed (the door registers
+        //    the AmBiased scratch only in the pad-lane form, so a whole-stick layout cannot
+        //    drift). The REAL vocab rides the `argmax_vocab` registry — the ramp's own
+        //    placement can no longer carry it by size alone.
+        let v_pad = u64::from(
+            vocab.next_multiple_of(ktir_superdsc::superdsc_opspec::Fp16::ELEMS_PER_STICK),
+        );
         let mut place_const32 = |tid: u32, rows: u64, cols: u64, seg_bytes: &mut [u64; 7]| {
             let off = seg_bytes[seg];
             let sz = rows * cols * 4; // fp32 — see the block comment
@@ -1492,13 +1508,34 @@ pub fn compute_bundle_layout<F: RopeForm>(
             );
             seg_bytes[seg] = align128(off + sz);
         };
-        place_const32(argmax_ramp_tid(), 1, u64::from(vocab), &mut seg_bytes);
+        place_const32(argmax_ramp_tid(), 1, v_pad, &mut seg_bytes);
         place_const32(
             argmax_v_tid(),
             1,
             ktir_superdsc::superdsc_opspec::Fp32::ELEMS_PER_STICK as u64,
             &mut seg_bytes,
         );
+        if v_pad > u64::from(vocab) {
+            // The BIAS — fp16 (the add's mb operand reads it at Df::Fp16), so 2 bytes/elem:
+            // the router-const placement law at the argmax const's own width. It stages
+            // through the WEIGHT channel's IEEE-f16→SEN convert (its values — 0 and the
+            // fp16 floor −65504 — are exact in both grids), never `bind_const_fp32`, which
+            // is fp32-verbatim only.
+            let off = seg_bytes[seg];
+            let sz = v_pad * 2;
+            placements.insert(
+                argmax_bias_tid(),
+                TensorPlacement {
+                    tid: argmax_bias_tid(),
+                    bank: 0,
+                    role: SegRole::Activation,
+                    segment: seg,
+                    offset: off,
+                    size: sz,
+                },
+            );
+            seg_bytes[seg] = align128(off + sz);
+        }
     }
 
     // ── THE SUB-PAGE INDEX BANK (the fine expert gather's const table) ──
@@ -2377,6 +2414,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
         // k-dependent and the old seat (the targets table's placement) died with the
         // rank-inversion door the fused pair replaced.
         router_k: router_k.unwrap_or(0),
+        // The composite argmax's REAL vocab — the one geometry fact the const placements
+        // cannot carry by size alone (the pad-lane ramp is placed at the stick-padded
+        // width). 0 for a tape that minted no composite.
+        argmax_vocab: argmax.as_ref().map_or(0, |a| a.vocab),
     })
 }
 
@@ -6166,6 +6207,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         attn_class_hds: _,
         router_experts,
         router_k,
+        argmax_vocab,
     } = l;
 
     let mut places: Vec<bundle::Placement> = placements
@@ -6263,6 +6305,9 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // The router's top-k width, the same law — the softmax mask's bind builds its
         // k-boundary from it.
         router_k: *router_k,
+        // The composite argmax's REAL vocab, baked for the wiring's sentinel threshold and
+        // const binds (the pad-lane ramp placement's own size is the padded width, not V).
+        argmax_vocab: *argmax_vocab,
         kv_request_stride_bytes: *kv_request_stride_bytes,
     }
 }

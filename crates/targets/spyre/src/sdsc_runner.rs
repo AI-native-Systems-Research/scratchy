@@ -269,22 +269,32 @@ impl SuperDscSession {
             t_bind.elapsed().as_secs_f64()
         );
 
-        // ⭐ THE COMPOSITE ARGMAX'S TWO RESIDENT FP32 CONSTS (#603 PR3a) — bound at LOAD, iff
+        // ⭐ THE COMPOSITE ARGMAX'S RESIDENT FP32 CONSTS (#603 PR3a) — bound at LOAD, iff
         // this bundle's own layout placed them (the one-request rung that minted the composite;
-        // `BakeFacts::of` reads the vocab off the ramp's own placement, so the bind and the mint
+        // `BakeFacts::of` reads the vocab off the layout's own registry, so the bind and the mint
         // answer one question and cannot drift into a placed-but-unstaged ramp). The consts are
         // ACTIVATION-segment residents this session's own forwards read, so they cannot ride an
         // alias: `bind_const_fp32` records them as weights, staging copies them verbatim into
         // the shadow exactly once, and no per-step bind ever names them again.
+        //
+        // The pad-lane form's third const — the fp16 BIAS — rides `bind_weight` instead: its
+        // placement is fp16, and `bind_const_fp32` is fp32-VERBATIM only. The weight channel
+        // re-encodes through the IEEE-f16→SEN convert, where both of the bias's values (0 and
+        // the fp16 floor −65504) are exact, so the staged bytes are the device's own fp16 —
+        // the same channel every real f16 weight rides.
         let facts = crate::wiring::BakeFacts::of(&code.layout);
-        let n_consts = if let Some((ramp, v_stick)) = facts.argmax_const_binds() {
+        let mut n_consts = 0;
+        if let Some(c) = facts.argmax_const_binds() {
             use crate::lower_subtile_tape_to_superdsc::{argmax_ramp_tid, argmax_v_tid};
-            exec.bind_const_fp32(crate::bundle_code::PlaceId::Act(argmax_ramp_tid()), ramp)?;
-            exec.bind_const_fp32(crate::bundle_code::PlaceId::Act(argmax_v_tid()), v_stick)?;
-            2
-        } else {
-            0
-        };
+            exec.bind_const_fp32(crate::bundle_code::PlaceId::Act(argmax_ramp_tid()), c.ramp)?;
+            exec.bind_const_fp32(crate::bundle_code::PlaceId::Act(argmax_v_tid()), c.v_stick)?;
+            n_consts = 2;
+            if let Some(bias) = c.bias {
+                use crate::lower_subtile_tape_to_superdsc::argmax_bias_tid;
+                exec.bind_weight(crate::bundle_code::PlaceId::Act(argmax_bias_tid()), bias);
+                n_consts += 1;
+            }
+        }
 
         // Convert + stage the bound weights into host staging NOW, on this thread, while the
         // background device prewarm is still bringing the card up — this takes the ~1s parallel

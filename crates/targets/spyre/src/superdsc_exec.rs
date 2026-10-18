@@ -1008,17 +1008,19 @@ pub struct RawBind {
 /// ⭐ THE COMPOSITE ARGMAX'S READBACK TARGET (#603 PR3a) — the idx stick's placement id
 /// and the vocab the sentinel is measured against.
 ///
-/// The vocab is [`crate::wiring::BakeFacts::argmax_vocab`] — the RAMP's own width, read
-/// off the ramp's own placement at load — and not the model-wide `Vocab` the caller
-/// hands `Executor::load`: the sentinel's meaning ("idx ≥ V ⇒ every lane was NaN") is a
-/// fact of the chain's own arithmetic (`w = (logits == m) · (V − iota)`; all-NaN ⇒ mask
-/// all-zero ⇒ `w` all-zero ⇒ idx = V), so V is whatever the ramp was minted at. The two
-/// spellings agree for every model that mints (the lm-head's N is the config vocab), but
-/// the chain's own number is the one the check can never drift from.
+/// The vocab is [`crate::wiring::BakeFacts::argmax_vocab`] — the chain's own V, read off
+/// the layout's `argmax_vocab` registry at load (the `router_experts` law: the pad-lane
+/// form's ramp is placed at the stick-padded width, so the placement's size is NOT V) —
+/// and not the model-wide `Vocab` the caller hands `Executor::load`: the sentinel's
+/// meaning ("idx ≥ V ⇒ every lane was NaN") is a fact of the chain's own arithmetic
+/// (`w = (logits == m) · max(V − iota, 0)`; all-NaN ⇒ mask all-zero ⇒ `w` all-zero ⇒
+/// idx = V), so V is whatever the chain was minted at. The two spellings agree for every
+/// model that mints (the lm-head's N is the config vocab), but the chain's own number is
+/// the one the check can never drift from.
 struct AmIdxReadback {
     /// The `[1, 64]` SenUint32 synthetic's placement id (`SynthRole::AmIdxU32`).
     id: bundle::PlaceId,
-    /// The ramp's width — the sentinel's V.
+    /// The chain's own V — the sentinel's threshold.
     vocab: usize,
 }
 
