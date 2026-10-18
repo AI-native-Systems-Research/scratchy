@@ -33,17 +33,6 @@ fn user_msg(content: &str) -> ChatCompletionMessageParam {
     }
 }
 
-fn assistant_msg(content: &str) -> ChatCompletionMessageParam {
-    ChatCompletionMessageParam {
-        role: "assistant".to_string(),
-        content: Some(serde_json::Value::String(content.to_string())),
-        name: None,
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning: None,
-    }
-}
-
 fn simple_chat_request(content: &str, max_tokens: Option<u32>) -> ChatCompletionRequest {
     ChatCompletionRequest {
         messages: vec![user_msg(content)],
