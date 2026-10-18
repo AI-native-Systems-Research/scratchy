@@ -7518,18 +7518,25 @@ impl ChunkScratch {
     ///   * every pin the form declares fits the frontend's LX window ([`ChunkLx::pinned_bytes_per_core`]
     ///     from [`crate::placement::LX_PIN_BASE`] up to [`crate::superdsc_opspec::FRONTEND_LX_END`]),
     ///     TOGETHER WITH the op-local pin slots the rung already placed above the window's top
-    ///     (`op_local_bytes`) — one budget, [`crate::placement::lx_window_fits`], the same function the
-    ///     allocator's own guard asserts. At granite-8b that refuses the 48-, 56- and 64-page rungs
-    ///     (1.5–2 MiB of pins), which keep the HBM scratch. The 12-page rung has neither a whole V part
-    ///     nor whole Kᵗ parts, so it keeps the HBM scratch too.
+    ///     (`op_local_bytes`) and the probability-part pins the form mints beside its gathers
+    ///     (`prob_pin_bytes`, summed by [`crate::ir::bridge::tiled_op_sdsc_op::attn::chunk_prob_pins`])
+    ///     — one budget, [`crate::placement::lx_window_fits`], the same function the allocator's own
+    ///     guard asserts. At granite-8b that refuses the 48-, 56- and 64-page rungs (1.5–2 MiB of
+    ///     pins), which keep the HBM scratch. The 12-page rung has neither a whole V part nor whole
+    ///     Kᵗ parts, so it keeps the HBM scratch too.
     ///
     /// Everything else keeps the HBM scratch. `None` is the existing form, not a refusal. The bake
     /// proves per op that the copy's and the consumer's divisions agree (`emit`'s core-local read law),
     /// and the pin allocator refuses a bundle whose pins leave the window. The host reads the entry order
-    /// from this same value ([`chunk_gather_index_table`]), passing the op-local term it read off the
-    /// baked artifact — the SAME number the bake threaded here, so neither arm can budget against
-    /// another rung's pins.
-    pub const fn lx_form(self, rows: ChunkRowKind, op_local_bytes: u64) -> Option<ChunkLx> {
+    /// from this same value ([`chunk_gather_index_table`]), passing the op-local term and the
+    /// probability-part term it read off the baked artifact — the SAME numbers the bake threaded
+    /// here, so neither arm can budget against another rung's pins.
+    pub const fn lx_form(
+        self,
+        rows: ChunkRowKind,
+        op_local_bytes: u64,
+        prob_pin_bytes: u64,
+    ) -> Option<ChunkLx> {
         let one_stick = CopyDims::ENTRIES_PER_OP;
         let (eph, slabs) = (self.entries_per_head_page(), self.plane.slabs());
         if matches!(rows, ChunkRowKind::Prompt)
@@ -7549,7 +7556,10 @@ impl ChunkScratch {
         // the existing form, so that is `None`.
         if (self.pages < lx.part_pages() && lx.keys().is_none())
             || !(self.nkvh() * lx.tail_pages() * eph).is_multiple_of(one_stick)
-            || !crate::placement::lx_window_fits(lx.pinned_bytes_per_core(), op_local_bytes)
+            || !crate::placement::lx_window_fits(
+                lx.pinned_bytes_per_core() + prob_pin_bytes,
+                op_local_bytes,
+            )
         {
             return None;
         }
@@ -8236,8 +8246,8 @@ impl ChunkPart {
 /// own run: part-major ([`ChunkKeysLx::entry_coord`]) where Kᵗ stays in LX, head-major where it does
 /// not. At one slab with Kᵗ in LX the two orders agree and the table is ONE run for both legs. The
 /// copies read the same orders. The bake and this table take the form from the same `(chunk, rows)`
-/// AND the same op-local pin budget (`op_local_bytes` — the bake from the layout, the host from the
-/// baked artifact), so neither can pick another.
+/// AND the same pin budget (`op_local_bytes` + `prob_pin_bytes` — the bake from the layout, the host
+/// from the baked artifact), so neither can pick another.
 ///
 /// `None` on an empty page list or an entry that leaves `i32`.
 pub fn chunk_gather_index_table(
@@ -8246,13 +8256,14 @@ pub fn chunk_gather_index_table(
     pages: &[i64],
     per_page: EntriesPerPage,
     op_local_bytes: u64,
+    prob_pin_bytes: u64,
 ) -> Option<Vec<GatherEntry>> {
     let last = *pages.last()?;
     let entry = |(kvh, page, q): (u32, u32, u32)| {
         let phys = *pages.get(page as usize).unwrap_or(&last);
         GatherEntry::of_page_block(per_page, phys, scratch.source_block(kvh, q)?)
     };
-    if let Some(lx) = scratch.lx_form(rows, op_local_bytes) {
+    if let Some(lx) = scratch.lx_form(rows, op_local_bytes, prob_pin_bytes) {
         let values = (0..scratch.entries()).map(|e| entry(lx.entry_coord(e)));
         if lx.index_base() == 0 {
             return values.collect();
@@ -8543,6 +8554,7 @@ pub fn batch_chunk_index_table(
     maps: &[Vec<i64>],
     per_page: EntriesPerPage,
     op_local_bytes: u64,
+    prob_pin_bytes: u64,
 ) -> Option<Vec<GatherEntry>> {
     chunk_gather_index_table(
         bc.chunk(),
@@ -8550,6 +8562,7 @@ pub fn batch_chunk_index_table(
         &bc.page_list(maps)?,
         per_page,
         op_local_bytes,
+        prob_pin_bytes,
     )
 }
 

@@ -2271,6 +2271,69 @@ fn softmax_part_pages(
         .unwrap_or(1)
 }
 
+/// One core-local pin the chunk form mints beside its gathers: its synth role, its producer's
+/// input count, and one core's slice of it in bytes.
+pub type ChunkProbPin = (crate::place::SynthRole, u32, u64);
+
+/// ⭐⭐ THE CHUNK FORM'S CORE-LOCAL PINS BEYOND ITS GATHERS — the probability-part scratches:
+/// `cesub` always, and a prompt chunk's `cexp` beside it, each one row block's per-core slice
+/// of one probability part under its own producer's division. Returns `(part pages, one row
+/// per pin)`; the pins are `None` when a probability part is time-tiled, so no untiled
+/// per-core slice exists to pin.
+///
+/// ⭐ ONE ENUMERATION FOR BOTH SIDES OF THE WINDOW BUDGET (#645): the chunk's `lx_form`
+/// admission sums these bytes into its core-local term — beside the gather pins
+/// `ChunkLx::pinned_bytes_per_core` counts — and the mint in `assemble_attn` declares exactly
+/// these rows, so the witness and the pin allocator read ONE footprint. Before this, the
+/// witness's term counted the gathers only while the emission also pinned the probability
+/// parts, so a band of op-local class sizes was admitted by the witness and then PANICKED the
+/// allocator where the contract wants the graceful HBM fall. A NEW core-local pin the chunk
+/// form mints belongs HERE, or the gap reopens.
+///
+/// ⭐ AND #692's DIVISION RIDES THE SAME ENUMERATION: `sm_division` is the chunk's own
+/// (`ChunkBufs::sm_division_of`), and it sizes a decode part's pages and slice exactly as it
+/// divides the ops that produce them — the sticks-first batch law included — while a prompt
+/// chunk's parts keep the law its row-divided PV demands. ONE value, so the pin the witness
+/// budgets, the pin the mint declares, and the ops' own division can never disagree.
+pub fn chunk_prob_pins(
+    chunk: crate::sdsc_abstract::ChunkScratch,
+    b_rows: u32,
+    prompt: bool,
+    sm_division: crate::work::EwDivision,
+) -> (u32, Option<Vec<ChunkProbPin>>) {
+    let page_slots = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+    let part_pages = if prompt {
+        prompt_lx_part_pages(chunk, b_rows)
+    } else {
+        softmax_part_pages(chunk, b_rows, sm_division)
+    };
+    let cols = part_pages * page_slots;
+    let division = if prompt {
+        crate::work::EwDivision::Law
+    } else {
+        sm_division
+    };
+    let roles: &[(crate::place::SynthRole, u32)] = if prompt {
+        &[
+            (crate::place::SynthRole::ChunkESub, 2),
+            (crate::place::SynthRole::ChunkExp, 1),
+        ]
+    } else {
+        &[(crate::place::SynthRole::ChunkESub, 2)]
+    };
+    let pins = roles
+        .iter()
+        .map(|&(r, inputs)| {
+            Some((
+                r,
+                inputs,
+                crate::emit::pointwise_untiled_slice_bytes_divided(b_rows, cols, inputs, division)?,
+            ))
+        })
+        .collect::<Option<Vec<_>>>();
+    (part_pages, pins)
+}
+
 /// ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK — EVERY resident page of ONE request attended in ONE pass, folded onto the
 /// new-token seed: the reference's decode structure (`spyre_inference`'s
 /// `batched_decode_head_major_kernel`: gather the chunk's pages, ONE score and ONE value matmul over the
@@ -4141,8 +4204,25 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // pass ran, so the slot map is complete — the FINAL sum, never a mid-walk projection. `0` when
         // no layout is in scope (a layout-less emission mints no pins at all).
         let op_local_bytes = layout.map(|l| l.lx_op_local_slot_bytes()).unwrap_or(0);
+        // ⭐ AND THE PROBABILITY-PART TERM, from the ONE enumeration the mint below also declares
+        // (`chunk_prob_pins`): the witness's core-local sum is the gathers PLUS these pins — the sum
+        // the allocator bumps — so a geometry the window cannot hold falls to HBM HERE instead of
+        // panicking the mint. `0` when the part is time-tiled: that emission refuses at the mint
+        // regardless, so the admission's sum there is moot. Recorded on the layout so the artifact
+        // carries the term the host's own budget read has to match (the bake/host agreement law).
+        // The chunk's own division (`ChunkBufs::sm_division_of` — #692's sticks-first batch law)
+        // sizes the parts HERE too, so the witness's term and the ops' own division read one value.
+        let sm_division = ChunkBufs::sm_division_of(rows_are_requests);
+        let (prob_part_pages, prob_pins) = chunk_prob_pins(chunk, b_rows, prompt, sm_division);
+        let prob_pin_bytes = prob_pins
+            .as_ref()
+            .map(|pins| pins.iter().map(|&(_, _, bytes)| bytes).sum())
+            .unwrap_or(0);
+        if let Some(l) = layout {
+            l.note_chunk_prob_pin_bytes(prob_pin_bytes);
+        }
         let lx = chunk
-            .lx_form(chunk_rows, op_local_bytes)
+            .lx_form(chunk_rows, op_local_bytes, prob_pin_bytes)
             .map(|form| ChunkLxBufs {
                 form,
                 keys: form.keys().map(|keys| {
@@ -4160,7 +4240,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             csc: syn(R::ChunkSc),
             cesub: syn(R::ChunkESub),
             cexp: syn(R::ChunkExp),
-            sm_division: ChunkBufs::sm_division_of(rows_are_requests),
+            sm_division,
             red: (0..n_red).map(|i| syn(R::ChunkRed(i))).collect(),
             qgroup: qgroup.map(|(_, ident_tid)| QGroupBufs {
                 block: syn(R::ChunkQGroup),
@@ -4226,36 +4306,22 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             }
             // ⭐ CORE-LOCAL LX, each pin one core's slice of one row block's probability part under its own
             // producer's division — `esub`'s always, and a one-slab prompt chunk's `exp` too. See the body's
-            // step 4. A decode chunk's parts and its `cesub` slice are sized under the division its `esub`
-            // and `exp` state (`ChunkBufs::sm_division_of`).
-            let part_pages = if prompt {
-                prompt_lx_part_pages(chunk, b_rows)
-            } else {
-                softmax_part_pages(chunk, b_rows, cb.sm_division)
-            };
-            let cols = part_pages * crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
-            let pins: &[(R, u32)] = if prompt {
-                &[(R::ChunkESub, 2), (R::ChunkExp, 1)]
-            } else {
-                &[(R::ChunkESub, 2)]
-            };
-            // A prompt chunk's pins are its `esub`/`exp`/row-sum/PV division: the law's, rows first.
-            let division = if prompt {
-                crate::work::EwDivision::Law
-            } else {
-                cb.sm_division
-            };
-            for &(r, inputs) in pins {
-                let slice = crate::emit::pointwise_untiled_slice_bytes_divided(
-                    b_rows, cols, inputs, division,
-                )
-                .ok_or_else(|| {
-                    SuperDscError(format!(
-                        "attention o{t}: a {part_pages}-page probability part of {b_rows} rows is \
+            // step 4. The rows are `chunk_prob_pins`' — the SAME enumeration the admission summed into
+            // the window budget above, each pin already sized under the chunk's own division (#692's
+            // sticks-first batch law included) — so what the witness budgets is exactly what this mint
+            // declares.
+            match &prob_pins {
+                None => {
+                    return Err(SuperDscError(format!(
+                        "attention o{t}: a {prob_part_pages}-page probability part of {b_rows} rows is \
                          time-tiled, so it has no core-local slice to pin in LX"
-                    ))
-                })?;
-                l.synth_lx_core_local(out_id.synth(r), slice);
+                    )));
+                }
+                Some(pins) => {
+                    for &(r, _inputs, slice) in pins {
+                        l.synth_lx_core_local(out_id.synth(r), slice);
+                    }
+                }
             }
         }
         // ⭐ WHOSE HISTORY THE ROWS ATTEND — from the same `rows_are_requests` the per-page fold reads its

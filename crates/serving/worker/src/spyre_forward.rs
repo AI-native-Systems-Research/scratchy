@@ -914,6 +914,9 @@ fn chunk_index_table(
         // The body's own baked op-local pin budget — the same term the bake's `lx_form` witness
         // read off the layout, so the host refuses exactly the chunks the bake refused.
         step.lx_op_local_bytes(),
+        // And the chunk form's probability-part pins — the second core-local term the same
+        // witness summed beside the gathers, so the two arms cannot drift.
+        step.lx_prob_pin_bytes(),
     )
     .map(Some)
     .ok_or_else(|| {

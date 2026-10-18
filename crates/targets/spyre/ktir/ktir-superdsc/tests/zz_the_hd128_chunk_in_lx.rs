@@ -14,11 +14,12 @@
 //! Every pin is one 16 KiB entry per core. All of them must fit `[LX_PIN_BASE, LX_PIN_END)`, the
 //! frontend's share of LX (`FRONTEND_LX_END`), which refuses the 48-, 56- and 64-page rungs.
 
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::attn::chunk_prob_pins;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_attn, assemble_rmsnorm};
 use ktir_superdsc::place::{PlaceId, SynthRole};
 use ktir_superdsc::placement::{BundleLayout, LX_PIN_BASE, LX_PIN_END, SegRole, TensorPlacement};
 use ktir_superdsc::sdsc_abstract::{
-    AttnGeometry, ChunkRowKind, ChunkScratch, PagedKvPool, attn_bundle_rows,
+    AttnGeometry, ChunkRowKind, ChunkScratch, PagedKvPool, QGroupBlock, attn_bundle_rows,
 };
 
 const NQH: u32 = 32;
@@ -151,14 +152,18 @@ fn the_hd128_lx_form_covers_exactly_the_rungs_its_pins_fit() {
     let mut admitted = Vec::new();
     for &j in &ChunkScratch::LADDER {
         let chunk = ChunkScratch::of_chunk(pool(), j).unwrap();
+        // Both budget terms 0: this ladder is the GATHER law alone (which rungs have a whole leg
+        // and what the gather pins weigh). The full core-local budget — gathers plus the
+        // probability-part pins — is `the_op_local_pin_slots_refuse_a_chunk_the_window_no_longer_holds`
+        // below.
         assert!(
-            chunk.lx_form(ChunkRowKind::Prompt, 0).is_none(),
+            chunk.lx_form(ChunkRowKind::Prompt, 0, 0).is_none(),
             "{j} page(s), prompt"
         );
         // A decode batch's chunk takes the same LX form: the law reads only the chunk's pages.
         assert_eq!(
-            chunk.lx_form(ChunkRowKind::Batch, 0),
-            chunk.lx_form(ChunkRowKind::OneRequest, 0),
+            chunk.lx_form(ChunkRowKind::Batch, 0, 0),
+            chunk.lx_form(ChunkRowKind::OneRequest, 0, 0),
             "{j} page(s), batch"
         );
         // Kᵗ: one 16 KiB tensor per (8-page part, kv head). V: one per (16-page part, kv head, slab).
@@ -167,7 +172,7 @@ fn the_hd128_lx_form_covers_exactly_the_rungs_its_pins_fit() {
         let v_pages = j / 16 * 16;
         let pinned = u64::from(k_pages + v_pages) * u64::from(NKVH) * ENTRY_BYTES / 8;
         let fits = (v_pages > 0 || k_pages > 0) && pinned <= window;
-        let Some(lx) = chunk.lx_form(ChunkRowKind::OneRequest, 0) else {
+        let Some(lx) = chunk.lx_form(ChunkRowKind::OneRequest, 0, 0) else {
             assert!(!fits, "{j} page(s): {pinned} B of pins fit, but no LX form");
             continue;
         };
@@ -187,39 +192,80 @@ fn the_hd128_lx_form_covers_exactly_the_rungs_its_pins_fit() {
     assert_eq!(admitted, [8, 16, 20, 24, 28, 32, 36, 40, 44, 52, 60]);
 }
 
-/// ⭐⭐ THE OP-LOCAL TERM OF THE ONE WINDOW BUDGET — `lx_window_fits`, the same function the pin
-/// allocator's own guard asserts, from the WITNESS's side: the widest admitted rung (40 pages,
-/// Kᵗ whole plus two V parts = 1,179,648 B of core-local pins) is admitted while its op-local pin
-/// slots leave room, admitted AT the boundary, and refused one byte past it. The bake reads the
-/// term off the layout (`lx_op_local_slot_bytes`), the host off the baked artifact
-/// (`bundle::BundleLayout::lx_op_local_bytes`) — both meet at this one function, so neither arm
-/// can budget against another rung's pins.
+/// ⭐⭐ THE CORE-LOCAL TERMS OF THE ONE WINDOW BUDGET — `lx_window_fits`, the same function the pin
+/// allocator's own guard asserts, from the WITNESS's side, with BOTH terms the emission mints: the
+/// gather pins (`pinned_bytes_per_core`) and the probability-part pins beside them
+/// (`chunk_prob_pins`, the `cesub` slice the mint declares). The widest admitted rung (40 pages,
+/// 1,179,648 B of gather pins + 2,560 B of probability parts) is admitted while its op-local pin
+/// slots leave room, admitted AT the boundary, and refused one byte past it. The bake reads both
+/// terms off the layout (`lx_op_local_slot_bytes` + `lx_prob_pin_bytes`), the host off the baked
+/// artifact — both meet at this one function, so neither arm can budget against another rung's
+/// pins.
 #[test]
 fn the_op_local_pin_slots_refuse_a_chunk_the_window_no_longer_holds() {
     let chunk = ChunkScratch::of_chunk(pool(), 40).unwrap();
+    // The emission's own derivation of the probability part's rows: the one-request decode's
+    // re-laid query-group block (assemble_attn's `b_rows` at this rung, mq 1). Its division is
+    // the law (`ChunkBufs::sm_division_of` of a solo chunk — only the batch runs sticks first).
+    let q = QGroupBlock::of_decode(NKVH, NQH / NKVH, HD, 1).unwrap();
+    let b_rows = chunk.row_blocks_of_query_groups(q).unwrap().rows();
+    let (part_pages, pins) =
+        chunk_prob_pins(chunk, b_rows, false, ktir_superdsc::work::EwDivision::Law);
+    assert_eq!(
+        part_pages, 40,
+        "the whole 40-page chunk is one probability part at these rows"
+    );
+    let pins =
+        pins.expect("the 40-page part is untiled at these rows, so it has a core-local slice");
+    assert_eq!(
+        pins,
+        vec![(SynthRole::ChunkESub, 2, 2_560u64)],
+        "the decode form's one probability-part pin: 4 rows x 10,240 cols fp16, one core's slice"
+    );
+    let prob_pin_bytes = pins.iter().map(|&(_, _, bytes)| bytes).sum::<u64>();
     let pinned = chunk
-        .lx_form(ChunkRowKind::OneRequest, 0)
+        .lx_form(ChunkRowKind::OneRequest, 0, 0)
         .expect("the 40-page rung fits with no op-local slots")
         .pinned_bytes_per_core();
     assert_eq!(pinned, 1_179_648);
-    let headroom = LX_PIN_END - LX_PIN_BASE - pinned;
-    assert_eq!(headroom, 314_624);
+    let headroom = LX_PIN_END - LX_PIN_BASE - pinned - prob_pin_bytes;
+    assert_eq!(headroom, 312_064);
     // At the boundary exactly, the form still admits (`lx_window_fits` is `<=`); one byte of
     // op-local slots past it refuses.
-    assert!(chunk.lx_form(ChunkRowKind::OneRequest, headroom).is_some());
     assert!(
         chunk
-            .lx_form(ChunkRowKind::OneRequest, headroom + 1)
+            .lx_form(ChunkRowKind::OneRequest, headroom, prob_pin_bytes)
+            .is_some()
+    );
+    assert!(
+        chunk
+            .lx_form(ChunkRowKind::OneRequest, headroom + 1, prob_pin_bytes)
             .is_none(),
         "one byte of op-local slots past the headroom must refuse the rung"
+    );
+    // ⭐ AND THE PROBABILITY-PART TERM ALONE REFUSES — the gap band the gather-only witness used
+    // to admit (op-local classes of 312,192..=314,624 B, norm rows 2439..=2458 at 128 B a row):
+    // a class the gathers leave room for but the probability parts do not is the HBM fall now,
+    // never a mint-time panic.
+    let gap = headroom + 128;
+    assert!(
+        chunk
+            .lx_form(ChunkRowKind::OneRequest, gap, prob_pin_bytes)
+            .is_none(),
+        "a class the probability parts do not leave room for must refuse the rung"
+    );
+    assert!(
+        chunk.lx_form(ChunkRowKind::OneRequest, gap, 0).is_some(),
+        "the same class with the probability-part term dropped would admit it — the term the \
+         witness must not forget"
     );
     // A rung the core-local pins alone refuse stays refused at every op-local term — the terms
     // compose, never trade.
     let refused = ChunkScratch::of_chunk(pool(), 48).unwrap();
-    assert!(refused.lx_form(ChunkRowKind::OneRequest, 0).is_none());
+    assert!(refused.lx_form(ChunkRowKind::OneRequest, 0, 0).is_none());
     assert!(
         refused
-            .lx_form(ChunkRowKind::OneRequest, headroom)
+            .lx_form(ChunkRowKind::OneRequest, headroom, prob_pin_bytes)
             .is_none()
     );
 }
@@ -250,25 +296,19 @@ fn lx_kt_copies(ops: &[(String, serde_json::Value)]) -> (usize, usize) {
 /// never a mid-walk projection. Pinned at the widest admitted rung — 40 pages, 1,179,648 B of
 /// gather pins plus a 2,560 B probability-part pin — where a trailing norm's `[2438, 64]`
 /// rinv class is EXACTLY the rung's true remaining window: the chunk still admits and keeps
-/// Kᵗ in LX, while the same norm at 2459 rows (past the witness's own headroom) refuses the
-/// rung to HBM. Nothing differs between the two legs but the trailing norm's class size, so
-/// the refusal IS the proof the chunk's admission read the trailing norm's slot. If the
-/// declare pass were ever skipped for a rung, the chunk would admit against too small a sum —
+/// Kᵗ in LX, while the same norm at 2439 rows (one stick of class past that window) refuses
+/// the rung to HBM — the GRACEFUL fall, at the witness, of the geometry the allocator alone
+/// would have panicked on. Nothing differs between the two legs but the trailing norm's class
+/// size, so the refusal IS the proof the chunk's admission read the trailing norm's slot. If
+/// the declare pass were ever skipped for a rung, the chunk would admit against too small a sum —
 /// the companion test below shows that world fails LOUDLY, in the pin allocator's own window
 /// assert, at build.
 ///
-/// ⚠️ KNOWN BLIND SPOT BETWEEN THE TWO BOUNDARIES (found by this test, reported to the lead;
-/// deliberately NOT pinned as a `should_panic` — a green panic test would pin the divergence
-/// as correct): the witness's core-local term counts the GATHER pins only, while the emission
-/// also core-locally pins the probability-part scratch (`ChunkESub`, 2,560 B at this rung —
-/// attn.rs's `synth_lx_core_local` after the gathers). So for classes in
-/// (312,064 ..= 314,624] B — rows 2439..=2458 — the witness ADMITS the LX form but the
-/// allocator's `cesub` mint then PANICS past the window: a hard build failure where the
-/// design contract ("this chunk form being refused there instead is the designed
-/// alternative, not this panic") wants the graceful HBM fall. No model's real geometry sits
-/// in that 20-row band today (the 26b's rinv classes are 64 KiB at mq=512, far below it);
-/// closing it means threading the probability-part slice into `lx_form`'s budget the way
-/// commit 2 threaded the op-local term — the lead's ruling.
+/// ⭐ THE PROBABILITY-PART TERM IS BUDGETED BY THE SAME ADMISSION (`chunk_prob_pins`, the one
+/// enumeration the mint also declares): before it, the witness counted the gathers only, so
+/// classes of 312,192..=314,624 B (rows 2439..=2458) were admitted and the allocator's `cesub`
+/// mint then PANICKED past the window — found by this test, closed in the same PR. The 2439
+/// leg below is the first row of that old gap band, and it now refuses to HBM here.
 #[test]
 fn a_trailing_norms_slot_still_bounds_the_chunk_that_precedes_it() {
     // Control: with no op-local slots declared, the 40-page rung keeps Kᵗ whole in LX —
@@ -285,7 +325,7 @@ fn a_trailing_norms_slot_still_bounds_the_chunk_that_precedes_it() {
     fn declared_chunk(rows: u32) -> (BundleLayout, Vec<String>, Vec<(String, serde_json::Value)>) {
         let (mut l, names) = hd_layout();
         // The trailing norm's operands: its out and its eps const, placed beside the chunk's.
-        for (tid, size) in [(901u32, 2459 * 576 * 2), (902, 64 * 2)] {
+        for (tid, size) in [(901u32, 2439 * 576 * 2), (902, 64 * 2)] {
             l.ids
                 .borrow_mut()
                 .insert(PlaceId::Act(tid).to_string(), PlaceId::Act(tid));
@@ -357,12 +397,15 @@ fn a_trailing_norms_slot_still_bounds_the_chunk_that_precedes_it() {
         "the real pass finds the pin already declared — same name, same class, same slot"
     );
 
-    // PAST the witness's own headroom (314,624 B — the gather pins alone): the chunk's
-    // admission refuses the rung — every Kᵗ copy falls to the HBM scratch. This leg differs
-    // from the admitted one only in the trailing norm's row count, so the refusal is the
-    // admission reading THAT term.
-    let (l_past, _, ops_past) = declared_chunk(2459);
-    assert_eq!(l_past.lx_op_local_slot_bytes(), 314_752);
+    // PAST the window the admission budgets (one stick of class past the rung's true remaining
+    // window — the FIRST row of the gap band the gather-only witness used to admit): the
+    // chunk's admission refuses the rung — every Kᵗ copy falls to the HBM scratch, and the
+    // probability-part mint that follows is quiet (its 2,560 B pins against the empty
+    // core-local region the refused gathers left). This leg differs from the admitted one
+    // only in the trailing norm's row count, so the refusal is the admission reading THAT
+    // term — the graceful HBM fall where the allocator alone would have panicked.
+    let (l_past, _, ops_past) = declared_chunk(2439);
+    assert_eq!(l_past.lx_op_local_slot_bytes(), 312_192);
     assert_eq!(
         lx_kt_copies(&ops_past),
         (0, 40),
@@ -409,7 +452,7 @@ fn every_hd128_lx_copy_and_its_consumer_meet_at_one_pin() {
     for &j in &ChunkScratch::LADDER {
         let lx = ChunkScratch::of_chunk(pool(), j)
             .unwrap()
-            .lx_form(ChunkRowKind::OneRequest, 0);
+            .lx_form(ChunkRowKind::OneRequest, 0, 0);
         let ops = emit(j);
         let mut all_pins = std::collections::BTreeSet::new();
         for (copy, consumer) in [("attn_cgkt_", "attn_csc_g"), ("attn_cgv_", "attn_cov_g")] {
@@ -504,7 +547,7 @@ fn the_hd128_lx_table_is_each_legs_part_major_run() {
     .unwrap();
     for &j in &ChunkScratch::LADDER {
         let chunk = ChunkScratch::of_chunk(pool(), j).unwrap();
-        let Some(lx) = chunk.lx_form(ChunkRowKind::OneRequest, 0) else {
+        let Some(lx) = chunk.lx_form(ChunkRowKind::OneRequest, 0, 0) else {
             continue;
         };
         let n = chunk.entries();
@@ -568,13 +611,14 @@ fn the_hd128_lx_table_is_each_legs_part_major_run() {
             (chunk.index_sticks()..2 * chunk.index_sticks()).collect::<Vec<_>>(),
             "{j} page(s)"
         );
-        // The host's table is Kᵗ's run, then V's.
+        // The host's table is Kᵗ's run, then V's. Both budget terms 0: the run law in isolation.
         let pages: Vec<i64> = (0..j as i64).collect();
         let table = ktir_superdsc::sdsc_abstract::chunk_gather_index_table(
             chunk,
             ChunkRowKind::OneRequest,
             &pages,
             per_page,
+            0,
             0,
         )
         .unwrap();
@@ -611,7 +655,7 @@ fn the_hd128_lx_table_is_each_legs_part_major_run() {
 fn a_hd128_value_tail_part_reads_its_own_slab_of_the_tail_scratch() {
     for &j in &ChunkScratch::LADDER {
         let chunk = ChunkScratch::of_chunk(pool(), j).unwrap();
-        let Some(lx) = chunk.lx_form(ChunkRowKind::OneRequest, 0) else {
+        let Some(lx) = chunk.lx_form(ChunkRowKind::OneRequest, 0, 0) else {
             continue;
         };
         if lx.tail_pages() == 0 {

@@ -754,6 +754,124 @@ fn the_walk_carries_run_state_across_launch_groups() {
     assert!(err.contains("t7_rinv"), "names the returning pin: {err}");
 }
 
+// ── THE DIRECTION GUARD: every op-local pin this bundle TOUCHES is touched in BOTH directions —
+//    ≥1 write and ≥1 read, both through NAMED arg bindings (the only consult the walk has).
+//    A read with no write is a producer the emission lost, or one addressing the pin through a
+//    RAW OFFSET no walk over arg_bindings can see; a write with no read is dead scratch minted
+//    against the window budget. Both are build failures here, never card-time stale bytes.
+#[test]
+fn the_walk_refuses_a_pin_no_program_writes() {
+    let l = two_norm_layout();
+    let mut sym = 0i64;
+    // A's chain with its WRITER dropped — `rmrsqrt`, the op whose OUTPUT binding is the pin's
+    // one write. The pin is still declared (the chain's own mint), and `rmxn` still READS it
+    // by name, so the walk sees a read-only touch.
+    let a: Vec<emit::EmittedOp> = norm(&l, "a", 7, &mut sym)
+        .into_iter()
+        .filter(|e| e.op_name != "rmrsqrt_a")
+        .collect();
+    assert_eq!(a.len(), 4, "the writer dropped, the reader kept");
+    let b = norm(&l, "b", 17, &mut sym);
+    let mut ops = a.clone();
+    ops.extend(b.iter().cloned());
+    let per_prog = vec![
+        ("rms_a".to_string(), a.len()),
+        ("rms_b".to_string(), b.len()),
+    ];
+    let err = superdsc::walk_lx_slot_alternation(
+        &ops,
+        &per_prog,
+        superdsc::FoldGrouping::Fused,
+        Some(&l),
+    )
+    .unwrap_err();
+    assert!(err.contains("no program WRITES it"), "{err}");
+    assert!(err.contains("t7_rinv"), "names the orphaned pin: {err}");
+    assert!(
+        !err.contains("t17_rinv"),
+        "B's intact chain is not the refusal's subject: {err}"
+    );
+}
+
+#[test]
+fn the_walk_refuses_a_pin_no_program_reads() {
+    let l = two_norm_layout();
+    let mut sym = 0i64;
+    // A's chain with its READER dropped — `rmxn`, the op whose INPUT binding (the `col_at`
+    // view of the pin) is the pin's one read. The writer still declares it, so the walk sees
+    // a write-only touch: dead scratch against the LX window.
+    let a: Vec<emit::EmittedOp> = norm(&l, "a", 7, &mut sym)
+        .into_iter()
+        .filter(|e| e.op_name != "rmxn_a")
+        .collect();
+    assert_eq!(a.len(), 4, "the reader dropped, the writer kept");
+    let b = norm(&l, "b", 17, &mut sym);
+    let mut ops = a.clone();
+    ops.extend(b.iter().cloned());
+    let per_prog = vec![
+        ("rms_a".to_string(), a.len()),
+        ("rms_b".to_string(), b.len()),
+    ];
+    let err = superdsc::walk_lx_slot_alternation(
+        &ops,
+        &per_prog,
+        superdsc::FoldGrouping::Fused,
+        Some(&l),
+    )
+    .unwrap_err();
+    assert!(err.contains("no program READS it"), "{err}");
+    assert!(err.contains("t7_rinv"), "names the dead pin: {err}");
+    assert!(
+        !err.contains("t17_rinv"),
+        "B's intact chain is not the refusal's subject: {err}"
+    );
+}
+
+// ── THE CARVE-OUT the guard's scoping owes its safety to: the layout is RUNG-shared (the
+//    declare pass pre-declares prefix, bodies and suffix alike), so ANOTHER bundle's pins sit
+//    untouched in this bundle's table. They carry empty ledger rows and are not this walk's
+//    to judge — a guard over every pin in the table would refuse every bundle that shares a
+//    rung with a norm it never runs.
+#[test]
+fn the_walk_leaves_a_pin_this_bundle_never_touches_alone() {
+    use ktir_superdsc::place::SynthRole;
+    use scratchy_target_spyre::bundle_code::PlaceId;
+
+    let l = two_norm_layout();
+    // A third pin of the SAME class, minted straight into the shared layout the way the
+    // declare pass mints another bundle's norm — declared there, never touched here.
+    l.synth_lx_op_local(PlaceId::Act(27).synth(SynthRole::Rinv), &[64, 64]);
+    let mut sym = 0i64;
+    let mut ops = norm(&l, "a", 7, &mut sym);
+    ops.extend(norm(&l, "b", 17, &mut sym));
+    let per_prog = vec![("rms_a".to_string(), 5), ("rms_b".to_string(), 5)];
+    let ledger = superdsc::walk_lx_slot_alternation(
+        &ops,
+        &per_prog,
+        superdsc::FoldGrouping::Fused,
+        Some(&l),
+    )
+    .unwrap();
+    assert_eq!(
+        ledger.len(),
+        3,
+        "one ledger row per pin in the table, touched or not"
+    );
+    let orphan = ledger
+        .iter()
+        .find(|r| r.name == PlaceId::Act(27).synth(SynthRole::Rinv).to_string())
+        .unwrap();
+    assert_eq!(
+        orphan.touched_by,
+        Vec::<(String, bool)>::new(),
+        "the untouched pin carries an empty row — not a refusal"
+    );
+    assert_eq!(
+        orphan.class_bytes, 8192,
+        "the same class as the touched pins, sharing their slot"
+    );
+}
+
 // ── THE REAL BUNDLE SHAPE the walk guards: an attention chunk's program followed by a
 //    trailing norm's — the #645 fix (a) emission order (declare pass first, chunk second,
 //    norm's real pass third). The chunk's pins are CORE-LOCAL (per-core scratch), never

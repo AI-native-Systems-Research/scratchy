@@ -133,6 +133,7 @@ fn batch_part_slots(pool: PagedKvPool, pages: u32) -> (Vec<u32>, Vec<u32>) {
     match chunk.lx_form(
         ktir_superdsc::sdsc_abstract::ChunkRowKind::Batch,
         /* no op-local pins: geometry only */ 0,
+        /* no probability-part pins: geometry only */ 0,
     ) {
         None => (vec![pages * 256], vec![pages * 256]),
         Some(lx) => (

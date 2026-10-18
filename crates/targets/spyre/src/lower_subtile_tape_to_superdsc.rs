@@ -5921,6 +5921,12 @@ pub struct LxSlotRow {
 ///     ACROSS the bundle's launch groups: the groups launch in order on one stream, so a
 ///     sibling in an earlier group poisons a later group's re-read exactly as an intra-group
 ///     one does.
+///   * **both directions, by name** — every pin this bundle TOUCHES is written by ≥1 program
+///     and read by ≥1 program, both through named `arg_bindings`. A read with no named write
+///     is a producer the emission lost, or one that addresses the pin through a RAW OFFSET no
+///     walk over `arg_bindings` can see; a write with no read is dead scratch against the
+///     window. Scoped to touched pins — the layout is rung-shared, so other bundles' pins sit
+///     untouched in this bundle's table and are not this walk's to judge.
 ///
 /// The ORDER this walk guards is the EMITTED order — the order of `sdsc_ops` as lowered, cut
 /// into programs by `per_prog` and into launch groups by the SAME partition [`launch_index`]
@@ -6072,6 +6078,36 @@ pub fn walk_lx_slot_alternation(
                     }
                 }
             }
+        }
+    }
+    // ⭐ THE DIRECTION GUARD — every op-local pin THIS BUNDLE touches is touched in BOTH
+    // directions: at least one program WRITES it and at least one READS it, both through named
+    // arg bindings (the only consult this walk has). A pin read but never written is a producer
+    // the emission lost — or one that addresses the pin through a RAW OFFSET instead of a named
+    // binding, which no walk over `arg_bindings` can see; this refusal turns both into a build
+    // failure instead of a card-time read of stale slot bytes. A pin written but never read is
+    // dead scratch minted against the window budget. Scoped to the pins this bundle TOUCHES,
+    // not every pin in the table: the layout is RUNG-shared (the declare pass pre-declares
+    // prefix, bodies and suffix alike), so other bundles' pins sit untouched in this bundle's
+    // table and are not this walk's to judge.
+    for (&name, touches) in &touched_by {
+        let (fp, slot) = pins[name];
+        if !touches.iter().any(|(_, is_input)| !is_input) {
+            return Err(format!(
+                "op-local LX pin '{name}' of the {fp}-byte class (slot {slot}) is READ by this \
+                 bundle but no program WRITES it: its producer is missing, or it addresses the pin \
+                 through a raw offset instead of a named arg binding this walk can see. Every pin \
+                 this bundle touches must have one producer and one consumer, both by name."
+            ));
+        }
+        if !touches.iter().any(|(_, is_input)| *is_input) {
+            return Err(format!(
+                "op-local LX pin '{name}' of the {fp}-byte class (slot {slot}) is WRITTEN by this \
+                 bundle but no program READS it: its consumer is missing, or it addresses the pin \
+                 through a raw offset instead of a named arg binding this walk can see — dead \
+                 scratch minted against the LX window. Every pin this bundle touches must have one \
+                 producer and one consumer, both by name."
+            ));
         }
     }
     Ok(pins
@@ -6374,6 +6410,11 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // any bundle was emitted), and shared by every bundle of the rung, so whichever bundle the
         // host reads it from carries the same budget.
         lx_op_local_bytes: lx.borrow().op_local_bytes,
+        // The probability-part pins the chunk form minted beside its gathers — the witness's
+        // second core-local term, recorded at the chunk's admission. The host's
+        // `chunk_gather_index_table` read passes it beside `lx_op_local_bytes`, so it refuses
+        // exactly what the bake refused.
+        lx_prob_pin_bytes: lx.borrow().prob_pin_bytes,
     }
 }
 
