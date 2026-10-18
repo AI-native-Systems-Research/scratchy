@@ -40,6 +40,11 @@ use crate::wire::{
 use crate::work::{FP16_ELEMS_PER_STICK, core_to_wk_slice, distribute_cores};
 use std::collections::BTreeMap;
 
+/// THE COMPOSITE DEVICE ARGMAX — #603 PR3a's loop-closure group: max + equal + ramp-mul +
+/// max + fp32toint32 + the tied embedding gather, first-max by arithmetic. Every link rides
+/// an existing builder; the module states the laws (the unpadded staging form, the
+/// content-key law, the tied refusal). See its own header.
+pub mod argmax;
 /// main's `lower_matmul_node` arity-3 branch — the W8A8 fp8 matmul descriptors, reached from the
 /// facts the KTIR states. See its own header.
 pub mod ktir_matmul_fp8;
