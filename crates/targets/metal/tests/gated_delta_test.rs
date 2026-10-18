@@ -49,22 +49,6 @@ fn buf_f32(device: &Device, data: &[f32]) -> Buffer {
     buf
 }
 
-/// A buffer holding `bytes` as written (a dtype-packed tensor the f32 helpers don't cover).
-fn buf_bytes(device: &Device, bytes: &[u8]) -> Buffer {
-    let len = bytes.len().max(4);
-    let buf = device
-        .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
-        .expect("newBuffer");
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            buf.contents().as_ptr() as *mut u8,
-            bytes.len(),
-        );
-    }
-    buf
-}
-
 fn buf_zero_f32(device: &Device, n: usize) -> Buffer {
     let bytes = (n * 4).max(4);
     let buf = device
@@ -608,7 +592,7 @@ fn gdn_rms_norm_gated_simd_is_bit_identical_to_the_threadgroup_form() {
             let (x_buf, z_buf, w_buf) = (
                 buf_f32(&device, &x),
                 // `z` is read at `T`'s precision: both forms see this dtype's rounding of it.
-                buf_bytes(&device, &dt.bytes(&z)),
+                common::shared_bytes(&device, &dt.bytes(&z)),
                 buf_f32(&device, &weight),
             );
             let run =

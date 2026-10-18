@@ -163,7 +163,10 @@ impl Dtype {
 
     /// A kernel output's tolerance against reference `reference`: the dtype's own
     /// rounding of the output, plus the f32 reassociation a reduction may do.
-    /// f16 keeps eleven significand bits, bf16 eight.
+    /// f16 keeps eleven significand bits, bf16 eight. The f16 arm is derived
+    /// (bf16's scaled by 2⁻³), and no current caller exercises it — mamba2 tests
+    /// f32 and bf16, the bit-identity test compares bits — so the first f16
+    /// tolerance test is what validates it.
     pub fn tol(self, reference: f32) -> f32 {
         match self {
             Self::F32 => 2e-4 * (1.0 + reference.abs()),
