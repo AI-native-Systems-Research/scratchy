@@ -11,6 +11,7 @@
 //! Scalars that the classic path passed via `setBytes` become tiny
 //! address-bound `StorageModeShared` buffers (see [`shared_u32`]).
 
+use half::{bf16, f16};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_metal::{
@@ -92,6 +93,108 @@ pub fn shared_slice<T: Copy>(device: &Device, data: &[T]) -> Buffer {
 /// Read `n` `Copy` elements back out of a `StorageModeShared` buffer.
 pub fn read_slice<T: Copy>(buf: &Buffer, n: usize) -> Vec<T> {
     unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const T, n) }.to_vec()
+}
+
+/// The dtype a kernel instantiation reads its activations and `T` weights in: f32 the
+/// reference tests' own (the fine-grained bits a ULP of drift shows in), f16 and bf16 what
+/// the lowerings lower. One enum for every out-of-band caller that packs a kernel's
+/// inputs, decodes its outputs and compares them, so all of them treat a dtype the same
+/// way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dtype {
+    /// 32-bit float — the golden tests' reference dtype.
+    F32,
+    /// 16-bit float (`half::f16`) — eleven significand bits.
+    F16,
+    /// bfloat16 (`half::bf16`) — eight significand bits.
+    Bf16,
+}
+
+impl Dtype {
+    /// The dtype's kernel-suffix tag, as the `INST_*` macros spell it (`f32`/`f16`/`bf16`).
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::Bf16 => "bf16",
+        }
+    }
+
+    /// `x` as this dtype holds it: an f16/bf16 store-and-reload, identity at f32.
+    pub fn round(self, x: f32) -> f32 {
+        match self {
+            Self::F32 => x,
+            Self::F16 => f16::from_f32(x).to_f32(),
+            Self::Bf16 => bf16::from_f32(x).to_f32(),
+        }
+    }
+
+    /// `xs` packed little-endian as this dtype holds them, ready for
+    /// [`shared_bytes`].
+    pub fn bytes(self, xs: &[f32]) -> Vec<u8> {
+        match self {
+            Self::F32 => xs.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Self::F16 => xs
+                .iter()
+                .flat_map(|&x| f16::from_f32(x).to_bits().to_le_bytes())
+                .collect(),
+            Self::Bf16 => xs
+                .iter()
+                .flat_map(|&x| bf16::from_f32(x).to_bits().to_le_bytes())
+                .collect(),
+        }
+    }
+
+    /// `n` elements of `buf` as this dtype holds them, widened to f32 (the
+    /// inverse of [`bytes`](Self::bytes)).
+    pub fn decode(self, buf: &Buffer, n: usize) -> Vec<f32> {
+        match self {
+            Self::F32 => read_slice::<f32>(buf, n),
+            Self::F16 => read_slice::<u16>(buf, n)
+                .into_iter()
+                .map(|b| f16::from_bits(b).to_f32())
+                .collect(),
+            Self::Bf16 => read_slice::<u16>(buf, n)
+                .into_iter()
+                .map(|b| bf16::from_bits(b).to_f32())
+                .collect(),
+        }
+    }
+
+    /// A kernel output's tolerance against reference `reference`: the dtype's own
+    /// rounding of the output, plus the f32 reassociation a reduction may do.
+    /// f16 keeps eleven significand bits, bf16 eight. The f16 arm is derived
+    /// (bf16's scaled by 2⁻³), and no current caller exercises it — mamba2 tests
+    /// f32 and bf16, the bit-identity test compares bits — so the first f16
+    /// tolerance test is what validates it.
+    pub fn tol(self, reference: f32) -> f32 {
+        match self {
+            Self::F32 => 2e-4 * (1.0 + reference.abs()),
+            Self::F16 => 1.2e-3 * reference.abs() + 2.4e-4,
+            Self::Bf16 => 1e-2 * reference.abs() + 2e-3,
+        }
+    }
+
+    /// `<kernel>_<tag>`: the dtype's instantiation symbol, as the specialized
+    /// pipeline cache keys it. Leaks its string — a handful per caller.
+    pub fn symbol(self, kernel: &str) -> &'static str {
+        Box::leak(format!("{kernel}_{}", self.tag()).into_boxed_str())
+    }
+
+    /// The output buffer's first `n` raw bit patterns, widened to `u32` (an
+    /// f16/bf16 pattern zero-extends): two outputs are equal iff these are.
+    pub fn bits(self, buf: &Buffer, n: usize) -> Vec<u32> {
+        match self {
+            Self::F32 => read_slice::<f32>(buf, n)
+                .iter()
+                .map(|v| v.to_bits())
+                .collect(),
+            _ => read_slice::<u16>(buf, n)
+                .into_iter()
+                .map(u32::from)
+                .collect(),
+        }
+    }
 }
 
 /// Dispatch one compute kernel on MTL4. `buffers[i].gpuAddress()` is

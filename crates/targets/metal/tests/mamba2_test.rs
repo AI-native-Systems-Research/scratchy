@@ -13,7 +13,9 @@
 //! per-thread scan (state 16, the parity-tiny geometry) and the simd scan (state 128, the real
 //! checkpoints'). The tests take turns on the GPU ([`gpu_turn`]).
 
-use half::bf16;
+mod common;
+
+use common::Dtype;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
@@ -42,62 +44,6 @@ static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn gpu_turn() -> std::sync::MutexGuard<'static, ()> {
     GPU.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// The model dtype a kernel instantiation reads its activations and `T` weights in.
-#[derive(Clone, Copy, Debug)]
-enum Dtype {
-    F32,
-    Bf16,
-}
-
-impl Dtype {
-    fn tag(self) -> &'static str {
-        match self {
-            Self::F32 => "f32",
-            Self::Bf16 => "bf16",
-        }
-    }
-
-    /// `x` as this dtype holds it.
-    fn round(self, x: f32) -> f32 {
-        match self {
-            Self::F32 => x,
-            Self::Bf16 => bf16::from_f32(x).to_f32(),
-        }
-    }
-
-    fn bytes(self, xs: &[f32]) -> Vec<u8> {
-        match self {
-            Self::F32 => xs.iter().flat_map(|x| x.to_le_bytes()).collect(),
-            Self::Bf16 => xs
-                .iter()
-                .flat_map(|&x| bf16::from_f32(x).to_bits().to_le_bytes())
-                .collect(),
-        }
-    }
-
-    fn decode(self, buf: &Buffer, n: usize) -> Vec<f32> {
-        match self {
-            Self::F32 => read::<f32>(buf, n),
-            Self::Bf16 => read::<u16>(buf, n)
-                .into_iter()
-                .map(|b| bf16::from_bits(b).to_f32())
-                .collect(),
-        }
-    }
-
-    /// The output's tolerance: its rounding to this dtype, plus f32 reassociation.
-    fn tol(self, reference: f32) -> f32 {
-        match self {
-            Self::F32 => 2e-4 * (1.0 + reference.abs()),
-            Self::Bf16 => 1e-2 * reference.abs() + 2e-3,
-        }
-    }
-
-    fn symbol(self, kernel: &str) -> &'static str {
-        Box::leak(format!("{kernel}_{}", self.tag()).into_boxed_str())
-    }
 }
 
 /// A Mamba-2 mixer's geometry, in the GDN state pool's terms: groups as key heads, heads as
