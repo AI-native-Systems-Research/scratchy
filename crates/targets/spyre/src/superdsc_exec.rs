@@ -804,6 +804,19 @@ pub struct Executor {
     kernel_weights: BTreeMap<bundle::PlaceId, &'static KernelWeight<'static>>,
     /// The role-`Logits` tensor — read back each step.
     logits_id: bundle::PlaceId,
+    /// ⭐⭐⭐⭐⭐ THE COMPOSITE ARGMAX'S IDX STICK (#603 PR3a) — WHERE the device-side
+    /// argmax's answer lands and the vocab it is indexed against, resolved at load the
+    /// same way [`Self::logits_id`] is: asked of the layout's own places. The mint's
+    /// chain ends in a `[rows, 64]` SenUint32 synthetic keyed off the ROW tid
+    /// (`SynthRole::AmIdxU32` — never host-bindable, only ever device-written), and the
+    /// greedy token step ([`Executor::predict_token`]) reads its row-0 word back as one
+    /// 256 B D2H instead of the ~100 KB logits row + host argmax it replaces.
+    ///
+    /// `None` for every bundle that minted no composite — untied models, prefill bundles,
+    /// batched rungs — and the token step REFUSES on `None` (loudly, never a logits
+    /// fallback: the serving side gates on `BakeFacts::argmax_vocab` before calling, so a
+    /// miss here is a wiring bug, not a sampling decision).
+    am_idx: Option<AmIdxReadback>,
     /// Ids `0..num_sources` are CALLER-FILLED every forward, EXCEPT the device-resident ones in
     /// [`Self::resident_sources`]. Set by [`Executor::declare_sources`]; `None` means nothing has
     /// told this executor how many, and the pre-launch completeness check cannot run.
@@ -992,6 +1005,37 @@ pub struct RawBind {
     bytes: Vec<u8>,
 }
 
+/// ⭐ THE COMPOSITE ARGMAX'S READBACK TARGET (#603 PR3a) — the idx stick's placement id
+/// and the vocab the sentinel is measured against.
+///
+/// The vocab is [`crate::wiring::BakeFacts::argmax_vocab`] — the RAMP's own width, read
+/// off the ramp's own placement at load — and not the model-wide `Vocab` the caller
+/// hands `Executor::load`: the sentinel's meaning ("idx ≥ V ⇒ every lane was NaN") is a
+/// fact of the chain's own arithmetic (`w = (logits == m) · (V − iota)`; all-NaN ⇒ mask
+/// all-zero ⇒ `w` all-zero ⇒ idx = V), so V is whatever the ramp was minted at. The two
+/// spellings agree for every model that mints (the lm-head's N is the config vocab), but
+/// the chain's own number is the one the check can never drift from.
+struct AmIdxReadback {
+    /// The `[1, 64]` SenUint32 synthetic's placement id (`SynthRole::AmIdxU32`).
+    id: bundle::PlaceId,
+    /// The ramp's width — the sentinel's V.
+    vocab: usize,
+}
+
+/// The timers and H2D accounting of a step's FORWARD HALF — everything upstream of the
+/// readback that [`Executor::predict`] (logits D2H) and [`Executor::predict_token`] (the
+/// composite's idx stick D2H) share, held in one struct so the two tails print from the
+/// SAME numbers and cannot drift on anything the step did before its readback.
+struct ForwardHalf {
+    t_stream0: Instant,
+    t0: Instant,
+    t0b: Instant,
+    t1: Instant,
+    t2: Instant,
+    h2d_note: String,
+    h2d_bytes: u64,
+}
+
 impl Executor {
     // ──────────────────────────────────────────────────────────────────────────────────────────
     //  Create
@@ -1038,6 +1082,35 @@ impl Executor {
             .logits()
             .ok_or_else(|| anyhow!("bundle {} places no Logits tensor", code.fp))?
             .id;
+        // ⭐ THE COMPOSITE'S IDX STICK, resolved the same way `logits_id` is: ONE scan of
+        // the layout's own places for the AmIdxU32 synthetic, and the vocab asked of
+        // `BakeFacts` (the ramp's own placement — see `AmIdxReadback` for why not
+        // `vocab`). The two must AGREE on presence: a bundle that placed the stick but
+        // not the ramp (or vice versa) is a mint that wrote half of itself, and the
+        // `else` arm refuses rather than guessing which half is real.
+        let am_idx = match code.layout.places.iter().find(|p| {
+            matches!(
+                p.id,
+                bundle::PlaceId::Synth {
+                    role: bundle::SynthRole::AmIdxU32,
+                    ..
+                }
+            )
+        }) {
+            Some(p) => {
+                let vocab = crate::wiring::BakeFacts::of(&code.layout).argmax_vocab;
+                if vocab == 0 {
+                    bail!(
+                        "bundle {} places the composite's idx stick but no ramp — a mint \
+                         that wrote half of itself; refusing rather than serve a token off \
+                         an unsized sentinel",
+                        code.fp
+                    );
+                }
+                Some(AmIdxReadback { id: p.id, vocab })
+            }
+            None => None,
+        };
         let kernel_weights = code
             .layout
             .kernel_weights
@@ -1054,6 +1127,7 @@ impl Executor {
             segment_bytes: code.layout.segment_bytes,
             kernel_weights,
             logits_id,
+            am_idx,
             num_sources: None,
             resident_sources: std::collections::BTreeSet::new(),
             rolled: None,
@@ -4078,22 +4152,15 @@ impl Executor {
         }
     }
 
-    /// Run ONE forward over `n_new` NEW positions appended at `[seq_pos..seq_pos+n_new)`: refill
-    /// the bound activations, launch prefix → body×iters → suffix, and copy the logits row back.
-    /// `out_logits` is `None` for a chunk whose logits nobody reads (every prefill chunk but the
-    /// last), which skips the read-back entirely.
-    pub fn predict(
-        &mut self,
-        n_new: NewTokens,
-        seq_pos: SeqPos,
-        out_logits: Option<&mut [u8]>,
-    ) -> Result<()> {
+    /// The shared FORWARD HALF of a step: the prepared/source gates, the RB window reset, the
+    /// activation refill, and the replay-or-launch decision — extracted from `predict` when
+    /// `predict_token` (#603 PR3a) needed the same body, so the refill law, the replay gate and
+    /// the launch are ONE behavior the two readbacks ride, never two copies.
+    fn forward_half(&mut self, n_new: NewTokens, seq_pos: SeqPos, d: &Diag) -> Result<ForwardHalf> {
         if !self.prepared {
             bail!("predict before prepare");
         }
         self.require_sources_filled()?;
-        let d = Diag::get();
-        let n_new = NewTokens(n_new.0.max(1));
 
         // RB timing: start the forward's window empty. The previous forward drained its own
         // entries at its synchronize; what is left in the ring now is pre-forward history
@@ -4135,6 +4202,104 @@ impl Executor {
             let _ = self.stream_ref()?.synchronize();
         }
         let t2 = Instant::now();
+        Ok(ForwardHalf {
+            t_stream0,
+            t0,
+            t0b,
+            t1,
+            t2,
+            h2d_note,
+            h2d_bytes,
+        })
+    }
+
+    /// The `[sdsc-phase]` block both readback tails print — one renderer, parameterized only by
+    /// WHICH readback ran (`"logits"` / `"idx"`), so the token step's line set cannot drift from
+    /// the logits step's. The rbgap and phase harnesses grep these lines.
+    fn print_step_phase(
+        half: &ForwardHalf,
+        d2h_name: &str,
+        d2h_seg: i64,
+        d2h_bytes: u64,
+        t2b: Instant,
+        t3: Instant,
+        n_new: i64,
+    ) {
+        let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
+        let ForwardHalf {
+            t_stream0,
+            t0,
+            t0b,
+            t1,
+            t2,
+            h2d_note,
+            h2d_bytes,
+        } = half;
+        eprintln!(
+            "[sdsc-phase] stream_recreate={:.2}  preamble_h2d={:.2}  compute={:.2}  \
+             {d2h_name}_d2h={:.2}  predict_total={:.2} ms  (n_new={})\n\
+             [sdsc-phase]   h2d: {}KB over{} | enqueue={:.2} sync={:.2}\n\
+             [sdsc-phase]   d2h: seg{} {}KB | enqueue={:.2} sync={:.2}",
+            ms(*t_stream0, *t0),
+            ms(*t0, *t1),
+            ms(*t1, *t2),
+            ms(*t2, t3),
+            ms(*t_stream0, t3),
+            n_new,
+            h2d_bytes >> 10,
+            if h2d_note.is_empty() {
+                " (nothing)".to_string()
+            } else {
+                h2d_note.clone()
+            },
+            ms(*t0, *t0b),
+            ms(*t0b, *t1),
+            d2h_seg,
+            d2h_bytes >> 10,
+            ms(*t2, t2b),
+            ms(t2b, t3),
+        );
+    }
+
+    /// The shared post-readback tail: RB attribution and the one-shot flex-leak probe — the
+    /// two things every step does after its synchronize, extracted with `forward_half` so the
+    /// token step keeps them by construction rather than by copy.
+    fn step_epilogue(&mut self, d: &Diag) {
+        if d.rb_time {
+            self.rb_attribute();
+        }
+
+        // FLEX-LEAK PROBE (one-shot): after the N-th forward, tear the stream + the whole runtime
+        // down. This BREAKS the session (no re-prepare) — measure, then stop the serve.
+        if let Some(n) = d.reset_probe {
+            let mut t = timers();
+            t.forwards += 1;
+            if t.forwards == n {
+                let before = vmrss_kb();
+                self.stream = None;
+                let _ = crate::runtime::runtime_reset();
+                let after = vmrss_kb();
+                eprintln!(
+                    "[sdsc-leak-probe] fwd={n} VmRSS {before} -> {after} kB (freed {} kB)",
+                    before - after
+                );
+            }
+        }
+    }
+
+    /// Run ONE forward over `n_new` NEW positions appended at `[seq_pos..seq_pos+n_new)`: refill
+    /// the bound activations, launch prefix → body×iters → suffix, and copy the logits row back.
+    /// `out_logits` is `None` for a chunk whose logits nobody reads (every prefill chunk but the
+    /// last), which skips the read-back entirely.
+    pub fn predict(
+        &mut self,
+        n_new: NewTokens,
+        seq_pos: SeqPos,
+        out_logits: Option<&mut [u8]>,
+    ) -> Result<()> {
+        let d = Diag::get();
+        let n_new = NewTokens(n_new.0.max(1));
+        let half = self.forward_half(n_new, seq_pos, d)?;
 
         // ── D2H the logits' segment, sen→IEEE the logits slice at its baked offset. ──
         // Skipped entirely when the caller wants no logits: only the LAST prefill chunk asks for
@@ -4217,38 +4382,11 @@ impl Executor {
             .synchronize()
             .map_err(|e| anyhow!("predict: sync: {e}"))?;
 
-        if d.rb_time {
-            self.rb_attribute();
-        }
-
         if d.phase_time {
             let t3 = Instant::now();
+            Self::print_step_phase(&half, "logits", d2h_seg, d2h_bytes, t2b, t3, n_new.0);
             let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
-            eprintln!(
-                "[sdsc-phase] stream_recreate={:.2}  preamble_h2d={:.2}  compute={:.2}  \
-                 logits_d2h={:.2}  predict_total={:.2} ms  (n_new={})\n\
-                 [sdsc-phase]   h2d: {}KB over{} | enqueue={:.2} sync={:.2}\n\
-                 [sdsc-phase]   d2h: seg{} {}KB | enqueue={:.2} sync={:.2}",
-                ms(t_stream0, t0),
-                ms(t0, t1),
-                ms(t1, t2),
-                ms(t2, t3),
-                ms(t_stream0, t3),
-                n_new.0,
-                h2d_bytes >> 10,
-                if h2d_note.is_empty() {
-                    " (nothing)".to_string()
-                } else {
-                    h2d_note
-                },
-                ms(t0, t0b),
-                ms(t0b, t1),
-                d2h_seg,
-                d2h_bytes >> 10,
-                ms(t2, t2b),
-                ms(t2b, t3),
-            );
-            report_phase_timers(ms(t1, t2));
+            report_phase_timers(ms(half.t1, half.t2));
         }
 
         if let Some(out) = out_logits {
@@ -4258,23 +4396,130 @@ impl Executor {
             sen_convert::sen_to_ieee_bytes(&src[..elems * 2], &mut out[..elems * 2]);
         }
 
-        // FLEX-LEAK PROBE (one-shot): after the N-th forward, tear the stream + the whole runtime
-        // down. This BREAKS the session (no re-prepare) — measure, then stop the serve.
-        if let Some(n) = d.reset_probe {
-            let mut t = timers();
-            t.forwards += 1;
-            if t.forwards == n {
-                let before = vmrss_kb();
-                self.stream = None;
-                let _ = crate::runtime::runtime_reset();
-                let after = vmrss_kb();
-                eprintln!(
-                    "[sdsc-leak-probe] fwd={n} VmRSS {before} -> {after} kB (freed {} kB)",
-                    before - after
-                );
-            }
-        }
+        self.step_epilogue(d);
         Ok(())
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE FLIPPED STEP (#603 PR3a) — `predict`'s forward with the readback turned
+    /// around: the bundle minted the composite argmax, so the suffix ends at the gather's
+    /// row and the token is already a device-side integer. The host's whole per-token serial
+    /// tail — the ~100 KB logits D2H, the sen→IEEE convert, the host argmax — collapses to
+    /// ONE 256 B D2H of the `[1, 64]` SenUint32 idx stick and a little-endian word read.
+    ///
+    /// ⛔ ONE D2H PER STEP, BY DESIGN. A readback call is not free — the enqueue alone is
+    /// ~0.45 ms p50, FLAT across models (measured on the hoststeps cells, 10-18; the
+    /// earlier model-scaled reading was first-decode-step samples plus a ~1.4% TS-counter
+    /// rate error, since corrected) — so a second per-step readback (e.g. refreshing the
+    /// row's host shadow to keep the gather's write resident) would cost ~half a
+    /// millisecond to save a ~4 KB row H2D that rides the preamble's merged runs anyway.
+    /// The row stays HOST-STAGED instead: the next step's bind re-uploads
+    /// `embed_tokens[idx]`, byte-identical to what the gather wrote (the tied table's own
+    /// row through the same f32→f16→sen pipeline — granite's tie carries no scale, which
+    /// the mint gate's arity-2-Dense conjunct is the proof of), so the gather's row write
+    /// is redundant, not load-bearing, and no shadow state needs to be true.
+    ///
+    /// ⛔ THE SYNC STAYS IN-STEP. The trailing-drain shape (return a resolver, let the
+    /// engine drain on its own clock) buys nothing while `engine_core` resolves
+    /// `ModelRunnerOutput` immediately after `execute_model` — that half is PR3b's.
+    ///
+    /// The sentinel: the chain's arithmetic answers `V` exactly when every logit lane was
+    /// NaN (all-NaN ⇒ the equality mask is all-zero ⇒ `w` all-zero ⇒ idx = V), and the
+    /// table's row `V` is the RESERVED ZERO ROW — so the device never reads out of bounds,
+    /// and the HOST refuses the token LOUDLY rather than feed a NaN-born index to the
+    /// detokenizer. The host's own argmax over the same row would have answered token 0
+    /// (its running max never sees a strict `>`); that divergence is recorded as a
+    /// follow-up, not reconciled here.
+    pub fn predict_token(&mut self, n_new: NewTokens, seq_pos: SeqPos) -> Result<u32> {
+        let d = Diag::get();
+        let n_new = NewTokens(n_new.0.max(1));
+        let half = self.forward_half(n_new, seq_pos, d)?;
+
+        // ── D2H the idx stick — the logits read's own window discipline (placement, not
+        // segment; align128 length; window-or-whole-region fallback), because the same
+        // guards make it safe: `audit_layout_addresses` pins the offset 128-aligned and
+        // the length inside the region, and `Flits::from_bytes` truncation is why the
+        // length rounds UP. 256 B for the one-request rung's [1, 64] stick.
+        let am = self.am_idx.as_ref().ok_or_else(|| {
+            anyhow!(
+                "predict_token: this bundle minted no composite argmax — the caller gates on \
+                 BakeFacts::argmax_vocab before the token step, so reaching this refusal is a \
+                 wiring bug, never a sampling decision"
+            )
+        })?;
+        let lp = self
+            .places
+            .get(&am.id)
+            .cloned()
+            .ok_or_else(|| anyhow!("the composite's idx stick {} has no placement", am.id))?;
+        // ⛔ THE ONE-REQUEST RUNG'S OWN SHAPE — `[1, 64]` SenUint32, 256 B. The mint is
+        // gated on the ONE-REQUEST tail (the lm-head folded to m=1), so a wider stick here
+        // is a bundle this step was never meant to serve; word 0 of row 0 is the only lane
+        // the flipped path has a meaning for, and refusing beats guessing which row is
+        // ours.
+        if lp.size != 256 {
+            bail!(
+                "predict_token: the idx stick is {} B, not the one-request rung's [1, 64] \
+                 256 B — this bundle's composite was minted at more than one row, and the \
+                 token step serves exactly the one-request shape",
+                lp.size
+            );
+        }
+        let seg = SegIdx::checked(lp.segment as i64)
+            .ok_or_else(|| anyhow!("the idx stick's segment {} is out of range", lp.segment))?;
+        let addr = self.seg_addr[seg.get()]
+            .as_ref()
+            .ok_or_else(|| anyhow!("the idx stick's seg{} has no region", lp.segment))?;
+        let tot = addr.total_size().as_u64();
+        let lo = lp.offset;
+        let len = crate::lower_subtile_tape_to_superdsc::align128(lp.size).min(tot - lo);
+        let win = (len < tot)
+            .then(|| addr.window(ByteOffset(lo), ByteSize(len)))
+            .flatten();
+        let (src, a, b) = match win.as_ref() {
+            Some(w) => (w, lo, lo + len),
+            None => (addr, 0, tot),
+        };
+        let d2h_bytes = b - a;
+        let host = &mut self.seg_host[seg.get()][a as usize..b as usize];
+        // ON THE COMPUTE PIPELINE, for the same reason the logits read rides it (#544):
+        // the readback is the step's LAST op, FIFO-behind the step's compute CBs, and its
+        // barrier drains the (empty) DMA deques instead of host-blocking on compute.
+        self.stream
+            .as_ref()
+            .unwrap()
+            .d2h_on_compute(host, src)
+            .map_err(|e| anyhow!("idx D2H: {e}"))?;
+        let t2b = Instant::now();
+        self.stream_ref()?
+            .synchronize()
+            .map_err(|e| anyhow!("predict_token: sync: {e}"))?;
+
+        if d.phase_time {
+            let t3 = Instant::now();
+            Self::print_step_phase(&half, "idx", lp.segment as i64, d2h_bytes, t2b, t3, n_new.0);
+            let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
+            report_phase_timers(ms(half.t1, half.t2));
+        }
+
+        // ⭐ THE TOKEN — word 0 of the stick, LE. SenUint32 is the raw-copy format on both
+        // directions of the DMA door (the block table binds through it verbatim), so the
+        // host word IS the device word.
+        let word = self.seg_host[seg.get()][lp.offset as usize..][..4]
+            .try_into()
+            .expect("the D2H above landed at least the placement's own 256 B");
+        let idx = u32::from_le_bytes(word);
+        if idx as usize >= am.vocab {
+            bail!(
+                "predict_token: the composite's answer is {idx} against a vocab of {} — the \
+                 sentinel row, which the chain reaches exactly when EVERY logit lane was NaN. \
+                 The step REFUSES rather than feed a NaN-born token to the detokenizer (the \
+                 host argmax would have answered token 0 over the same row — that divergence \
+                 is the recorded follow-up, not this step's decision)",
+                am.vocab
+            );
+        }
+        self.step_epilogue(d);
+        Ok(idx)
     }
 
     /// Refill per-step ACTIVATIONS into their segment's host staging at the baked offset

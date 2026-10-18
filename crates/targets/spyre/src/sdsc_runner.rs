@@ -593,18 +593,41 @@ impl SuperDscSession {
         self.exec.stage_keyed(id, key, f32_to_f16_le(vals))
     }
 
-    fn run_step_inner(
+    /// ⭐⭐⭐ [`run_step_i32`](Self::run_step_i32) WITH THE READBACK FLIPPED (#603 PR3a): the
+    /// same bind loop over the same three channels, then
+    /// [`Executor::predict_token`](crate::superdsc_exec::Executor::predict_token) instead of
+    /// `predict` — ONE 256 B D2H of the composite's idx stick, no logits row, no host argmax.
+    ///
+    /// ⛔ REFUSES ON A BUNDLE THAT MINTED NO COMPOSITE (the executor's own loud refusal), so
+    /// the CALLER gates on the bake fact first — `BakeFacts::argmax_vocab != 0` for the rung
+    /// this step launches — and reaching the refusal is a wiring bug, never a sampling
+    /// decision. The three bind channels are the full set the solo decode step stages today
+    /// (`run_step_i32`'s own call site), so a future fourth channel fails BOTH steps' compile,
+    /// not just the logits one.
+    pub fn run_step_token(
         &mut self,
         n_new: usize,
         seq_pos: usize,
         activations: &[crate::wiring::Bind],
-        // Already in the device's format — bound as-is, never re-narrowed.
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
-        // ⭐ RAW LE int32 bytes — bound through `bind_input_raw`, so the shadow write COPIES them
-        // instead of re-encoding them as fp16. A gather's index table, and nothing else today.
         activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
-        want_logits: bool,
-    ) -> Result<Option<Vec<f32>>> {
+    ) -> Result<u32> {
+        self.bind_activations(activations, activations_f16, activations_i32)?;
+        self.exec
+            .predict_token(NewTokens(n_new as i64), SeqPos(seq_pos as i64))
+    }
+
+    /// The bind loop every step runs before its forward — the three channels
+    /// (`run_step_inner`'s own, extracted when the token step needed the identical body):
+    /// f32 narrowed to f16 at the boundary, already-f16 bytes as-is, and RAW LE int32
+    /// through `bind_input_raw`. One body, so a new channel or a new guard cannot land on
+    /// one step shape and skip the other.
+    fn bind_activations(
+        &mut self,
+        activations: &[crate::wiring::Bind],
+        activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
+        activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
+    ) -> Result<()> {
         // BIND-LOOP TIMING (SCRATCHY_SDSC_PHASE_TIME, the same flag as the executor's phase
         // breakdown): this loop runs BEFORE predict, so it is invisible to the
         // preamble_h2d/compute/logits_d2h split. For batched prefill it converts ~300k f32
@@ -655,6 +678,22 @@ impl SuperDscSession {
                 activations_f16.len(),
             );
         }
+        Ok(())
+    }
+
+    fn run_step_inner(
+        &mut self,
+        n_new: usize,
+        seq_pos: usize,
+        activations: &[crate::wiring::Bind],
+        // Already in the device's format — bound as-is, never re-narrowed.
+        activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
+        // ⭐ RAW LE int32 bytes — bound through `bind_input_raw`, so the shadow write COPIES them
+        // instead of re-encoding them as fp16. A gather's index table, and nothing else today.
+        activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
+        want_logits: bool,
+    ) -> Result<Option<Vec<f32>>> {
+        self.bind_activations(activations, activations_f16, activations_i32)?;
         let mut logits = if want_logits {
             vec![0u8; self.vocab * 2]
         } else {
