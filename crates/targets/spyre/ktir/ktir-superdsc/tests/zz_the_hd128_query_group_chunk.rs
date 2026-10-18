@@ -119,6 +119,11 @@ fn count(ops: &[(String, serde_json::Value)], stem: &str) -> u32 {
 /// chunk part each, unless its gather stays in LX (`ChunkScratch::lx_form`). Then Kᵗ is cut into 8-page
 /// parts when it has no tail of its own, and V into 16-page parts plus its tail.
 fn part_slots(pages: u32) -> (Vec<u32>, Vec<u32>) {
+    part_slots_of(pages, ChunkRowKind::OneRequest)
+}
+
+/// [`part_slots`] for a chunk whose rows are `rows`.
+fn part_slots_of(pages: u32, rows: ChunkRowKind) -> (Vec<u32>, Vec<u32>) {
     let chunk =
         ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages).unwrap();
     let cut = |per: u32| -> Vec<u32> {
@@ -126,7 +131,7 @@ fn part_slots(pages: u32) -> (Vec<u32>, Vec<u32>) {
             .map(|i| per.min(pages - i * per) * 256)
             .collect()
     };
-    match chunk.lx_form(ChunkRowKind::OneRequest) {
+    match chunk.lx_form(rows) {
         None => (vec![pages * 256], vec![pages * 256]),
         Some(lx) => (
             lx.keys().map_or(vec![pages * 256], |k| cut(k.part_pages())),
@@ -315,19 +320,22 @@ fn a_decode_batch_attends_each_kv_heads_whole_group() {
         for t in ChunkScratch::ladder_for(pool, seqs) {
             let ops = emit_batch(t, seqs);
             let ctx = format!("seqs={seqs} t={t}");
+            // The batch chunk's gather stays in LX where `lx_form` admits it (the same law as one
+            // request's), which cuts the score and the PV into that form's parts.
+            let (k_parts, v_parts) = part_slots_of(t, ChunkRowKind::Batch);
             assert_eq!(count(&ops, "attn_cqg_g"), NKVH * NSLAB, "{ctx}: copies");
             for stem in ["attn_csc_h", "attn_cbmax_h", "attn_cov_h"] {
                 assert_eq!(count(&ops, stem), 0, "{ctx}: no per-query-head {stem}*");
             }
             assert_eq!(
                 count(&ops, "attn_csc_g"),
-                NKVH,
-                "{ctx}: one score per kv head"
+                NKVH * k_parts.len() as u32,
+                "{ctx}: one score per (kv head, Kᵗ part)"
             );
             assert_eq!(
                 count(&ops, "attn_cov_g"),
-                NKVH * NSLAB,
-                "{ctx}: one PV per (kv head, slab)"
+                NKVH * NSLAB * v_parts.len() as u32,
+                "{ctx}: one PV per (kv head, slab, V part)"
             );
             for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_csc_g")) {
                 let n = n_of(name, v);
@@ -341,7 +349,7 @@ fn a_decode_batch_attends_each_kv_heads_whole_group() {
                     (
                         Some(u64::from(GQA * seqs)),
                         Some(u64::from(HD)),
-                        Some(u64::from(t * 256)),
+                        Some(u64::from(k_parts[part_of(name)])),
                         None
                     ),
                     "{name} {ctx}: N_ = {n}"
@@ -354,7 +362,7 @@ fn a_decode_batch_attends_each_kv_heads_whole_group() {
                     (
                         Some(u64::from(GQA * seqs)),
                         Some(64),
-                        Some(u64::from(t * 256))
+                        Some(u64::from(v_parts[part_of(name)]))
                     ),
                     "{name} {ctx}: N_ = {n}"
                 );

@@ -120,14 +120,35 @@ fn the_batch_ladder_round_trips_through_its_swept_key() {
     assert!(ChunkScratch::ladder_for(pool, 8).contains(&48));
 }
 
-/// ⭐⭐⭐ THE BATCH CHUNK IS THE SOLO CHUNK's OPS AT `mq = B`: one score per kv head over its group's
-/// `gqa·B` contiguous head-major rows and the whole chunk, the mask read PER ROW (no broadcast scale on
-/// the epilogue operand, where the shared-history chunk's mask is the broadcast row), the value leg's
-/// contraction divided across the cores in ONE part, and nothing a fold op.
+/// The slots of each score part and each value part a batch chunk of `pages` pages emits: one whole chunk
+/// part each, unless its gather stays in LX (`ChunkScratch::lx_form` at `ChunkRowKind::Batch`). Then each
+/// leg is cut into its own parts (8 pages at one slab), plus V's tail.
+fn batch_part_slots(pool: PagedKvPool, pages: u32) -> (Vec<u32>, Vec<u32>) {
+    let chunk = ChunkScratch::of_chunk(pool, pages).unwrap();
+    let cut = |per: u32| -> Vec<u32> {
+        (0..pages.div_ceil(per))
+            .map(|i| per.min(pages - i * per) * 256)
+            .collect()
+    };
+    match chunk.lx_form(ktir_superdsc::sdsc_abstract::ChunkRowKind::Batch) {
+        None => (vec![pages * 256], vec![pages * 256]),
+        Some(lx) => (
+            lx.keys().map_or(vec![pages * 256], |k| cut(k.part_pages())),
+            cut(lx.part_pages()),
+        ),
+    }
+}
+
+/// ⭐⭐⭐ THE BATCH CHUNK IS THE SOLO CHUNK's OPS AT `mq = B`: one score per kv head (and Kᵗ part, where
+/// the gather stays in LX) over its group's `gqa·B` contiguous head-major rows, the mask read PER ROW (no
+/// broadcast scale on the epilogue operand, where the shared-history chunk's mask is the broadcast row),
+/// the value leg's contraction divided across the cores (one part, or one per V part in LX), and nothing a
+/// fold op.
 #[test]
 fn a_batch_chunk_scores_every_request_row_against_the_whole_chunk_with_a_per_row_mask() {
     for seqs in PagedKvPool::BATCH_RUNGS {
         for t in ChunkScratch::ladder_for(pool_2b(), seqs) {
+            let (k_parts, v_parts) = batch_part_slots(pool_2b(), t);
             let ops = emit_batch::<32, 8, 64>(seqs, t);
             for e in &ops {
                 assert!(
@@ -140,18 +161,27 @@ fn a_batch_chunk_scores_every_request_row_against_the_whole_chunk_with_a_per_row
                 assert_eq!(e.kv_gathered, copy, "{} seqs={seqs} t={t}", e.op_name);
             }
             let ops = named(ops);
-            let slots = u64::from(t * 256);
             let rows = u64::from(4 * seqs);
+            let part_of = |name: &str| -> usize {
+                name.split("_k")
+                    .nth(1)
+                    .and_then(|s| s.split('_').next())
+                    .map_or(0, |p| p.parse().unwrap())
+            };
             let sc: Vec<&(String, serde_json::Value)> = ops
                 .iter()
                 .filter(|(n, _)| n.starts_with("attn_csc_g"))
                 .collect();
-            assert_eq!(sc.len(), 8, "seqs={seqs} t={t}: one score per kv head");
+            assert_eq!(
+                sc.len(),
+                8 * k_parts.len(),
+                "seqs={seqs} t={t}: one score per (kv head, Kᵗ part)"
+            );
             for (name, v) in sc {
                 let n = &v["dscs_"][0][name]["N_"];
                 assert_eq!(
                     (n["mb_"].as_u64(), n["out_"].as_u64()),
-                    (Some(rows), Some(slots)),
+                    (Some(rows), Some(u64::from(k_parts[part_of(name)]))),
                     "{name} seqs={seqs} t={t}: N_ = {n}"
                 );
                 assert_eq!(
@@ -164,13 +194,17 @@ fn a_batch_chunk_scores_every_request_row_against_the_whole_chunk_with_a_per_row
                 .iter()
                 .filter(|(n, _)| n.starts_with("attn_cov_g"))
                 .collect();
-            assert_eq!(pv.len(), 8, "seqs={seqs} t={t}: one value part per kv head");
-            let sticks = u64::from(t * 256 / 64);
-            let most = (1..=32u64.min(sticks))
-                .rev()
-                .find(|s| sticks.is_multiple_of(*s))
-                .unwrap_or(1);
+            assert_eq!(
+                pv.len(),
+                8 * v_parts.len(),
+                "seqs={seqs} t={t}: one value op per (kv head, V part)"
+            );
             for (name, v) in pv {
+                let sticks = u64::from(v_parts[part_of(name)] / 64);
+                let most = (1..=32u64.min(sticks))
+                    .rev()
+                    .find(|s| sticks.is_multiple_of(*s))
+                    .unwrap_or(1);
                 let s = &v["numWkSlicesPerDim_"];
                 assert_eq!(
                     (s["in"].as_u64().unwrap_or(1), s["mb"].as_u64().unwrap_or(1)),
@@ -231,17 +265,31 @@ fn an_hd128_batch_chunk_scores_per_query_head_over_its_request_rows() {
     let pool = PagedKvPool::new(8, 128);
     for seqs in PagedKvPool::BATCH_RUNGS {
         for t in ChunkScratch::ladder_for(pool, seqs) {
+            let (k_parts, v_parts) = batch_part_slots(pool, t);
             let ops = named(emit_batch::<32, 8, 128>(seqs, t));
+            let part_of = |name: &str| -> usize {
+                name.split("_k")
+                    .nth(1)
+                    .and_then(|s| s.split('_').next())
+                    .map_or(0, |p| p.parse().unwrap())
+            };
             let sc: Vec<&(String, serde_json::Value)> = ops
                 .iter()
                 .filter(|(n, _)| n.starts_with("attn_csc_h"))
                 .collect();
-            assert_eq!(sc.len(), 32, "seqs={seqs} t={t}: one score per query head");
+            assert_eq!(
+                sc.len(),
+                32 * k_parts.len(),
+                "seqs={seqs} t={t}: one score per (query head, Kᵗ part)"
+            );
             for (name, v) in sc {
                 let n = &v["dscs_"][0][name]["N_"];
                 assert_eq!(
                     (n["mb_"].as_u64(), n["out_"].as_u64()),
-                    (Some(u64::from(seqs)), Some(u64::from(t * 256))),
+                    (
+                        Some(u64::from(seqs)),
+                        Some(u64::from(k_parts[part_of(name)]))
+                    ),
                     "{name} seqs={seqs} t={t}: N_ = {n}"
                 );
             }
@@ -249,8 +297,8 @@ fn an_hd128_batch_chunk_scores_per_query_head_over_its_request_rows() {
                 ops.iter()
                     .filter(|(n, _)| n.starts_with("attn_cov_h"))
                     .count(),
-                64,
-                "seqs={seqs} t={t}: one value op per (query head, slab)"
+                64 * v_parts.len(),
+                "seqs={seqs} t={t}: one value op per (query head, slab, V part)"
             );
         }
     }
