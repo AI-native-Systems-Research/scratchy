@@ -46,11 +46,12 @@ use ktir_superdsc::place::{PlaceId, SynthRole, act_name};
 use ktir_superdsc::placement::SegRole;
 use ktir_superdsc::reserved_tids::{argmax_ramp_tid, argmax_v_tid};
 use scratchy_subtile::fixtures;
-use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
+use scratchy_subtile::lower::{AffineInt4, GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{
     NeoX, SourceShape, SubOp, SubtileIR, ValidatedGraph, lower_region,
 };
 use scratchy_subtile::subtile_tape::{lower_dag_to_tape, reroll_subtile_tape};
+use scratchy_target_spyre::lower_subtile_tape_to_ktir::lm_head_admits_the_composite;
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
     ActiveCap, RolledSuperDsc, RungFacts, lower_subtile_tape_to_superdsc,
 };
@@ -578,6 +579,84 @@ fn a_staged_lm_head_refuses_loudly() {
     assert!(
         err.contains("Dense [vocab, hidden] table"),
         "the refusal names what the tied gather reads: {err}"
+    );
+}
+
+/// ⭐⭐⭐ THE MINT-SITE GATE — `lm_head_admits_the_composite` keys the tie token on
+/// the lm-head's STRUCTURE, never on a quant preset's name: an arity-3 matmul (fp8
+/// W8A8: the scale rides as the third operand) or a non-Dense arity-2 one (MLX-affine
+/// packs the table) is a boundary, so the expansion mints no tie token and the model
+/// keeps the HOST argmax — by construction, which is how a future preset cannot slip
+/// past a name list. The dense arity-2 stick-aligned form — granite-3.3's own tail
+/// shape, with the logits-scaling tail op and without it — is served. And the
+/// GEOMETRY boundary that bit granite-3.1 (vocab 49155, three lanes past the last
+/// fp16 stick) keeps that model on the host path too — the chain's `[1, vocab]`
+/// links run at the stick, and the dxp scheduler rejects sub-stick tiles.
+#[test]
+fn the_mint_gate_keys_on_structure_not_preset() {
+    let lowered = |scale_tail: bool| {
+        let (input, _) = n_layer_tied(LAYERS, scale_tail);
+        lower_region(&input, std::num::NonZeroU32::new(8192).unwrap())
+    };
+    assert!(
+        lm_head_admits_the_composite(&lowered(true)),
+        "the dense arity-2 stick-aligned tail (granite-3.3's own, ScalarMul tail op and \
+         all) is served"
+    );
+    assert!(
+        lm_head_admits_the_composite(&lowered(false)),
+        "the tailless dense form (qwen's) is served too"
+    );
+    assert!(
+        !lm_head_admits_the_composite(&lm_head_only(1, GemmWeight::Fp8Dynamic, true)),
+        "fp8 W8A8 — the THIRD OPERAND is the boundary, never a preset's name"
+    );
+    let affine = AffineInt4::mint(4, 32, H).expect("4-bit groups of 32 tile the fixture's H=256");
+    assert!(
+        !lm_head_admits_the_composite(&lm_head_only(1, GemmWeight::Affine { affine }, false)),
+        "MLX-affine — arity-2, but the packed table is not the Dense bank the gather reads"
+    );
+
+    // THE GEOMETRY BOUNDARY — one-matmul graphs at a NON-STICK vocab/hidden, the exact
+    // shape granite-3.1-2b/8b-instruct sits on (49155 = 768·64 + 3; here 130 = 2·64 + 2
+    // and hidden 250 = 3·64 + 58): the first cut cannot serve them, so no token is
+    // minted and the model keeps the host path instead of failing to build.
+    let non_stick = |rows: u32, cols: u32| {
+        let input = LoweringInput {
+            sources: vec![
+                SourceShape {
+                    rows: 1,
+                    cols: rows,
+                },
+                SourceShape { rows, cols },
+            ],
+            result: 0,
+            exported: None,
+            ops: vec![OpDesc {
+                op: SubOp::MatmulTile {
+                    n: cols,
+                    weight: GemmWeight::Dense,
+                },
+                m: 1,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            }],
+        };
+        lower_region(&input, std::num::NonZeroU32::new(8192).unwrap())
+    };
+    assert!(
+        !lm_head_admits_the_composite(&non_stick(H, 130)),
+        "a non-stick VOCAB (granite-3.1's own boundary) is not servable — the [1, vocab] \
+         links run at the fp16 stick"
+    );
+    assert!(
+        !lm_head_admits_the_composite(&non_stick(250, VOCAB)),
+        "a non-stick HIDDEN is not servable — the gather's slab is one-stick sub-rows"
+    );
+    // And the control for the geometry legs: the same builder at stick-aligned
+    // geometry IS served, so the two refusals above pin the stick law, not the builder.
+    assert!(
+        lm_head_admits_the_composite(&non_stick(H, VOCAB)),
+        "the stick-aligned control of the same builder is served"
     );
 }
 

@@ -1638,10 +1638,95 @@ struct ArgmaxPlan {
     chain_nodes: Vec<u32>,
 }
 
-/// Walk the result tail backward to the lm-head, and state the composite's facts.
+/// ⭐⭐⭐⭐⭐ THE RESULT TAIL'S LM-HEAD, AS ONE WALK — back through the single-input
+/// column-preserving tail ops (granite's logits-scaling ScalarMul, gemma's TanhSoftCap;
+/// their output still feeds the result readback, and the composite reads THROUGH them,
+/// so they stay exactly where they are) to the MatmulTile that produces the logits.
 ///
-/// ⛔ NEVER A SILENT HOST FALLBACK: this returns `Err` — a build failure naming what it
-/// found — for every tail it cannot recognize. The caller gates on the tie token, so an
+/// ONE implementation for the two consumers that must never drift:
+/// [`recognize_argmax`] (the walk's own recognition — its refusal is the pinned second
+/// half of the fp8 boundary) and [`lm_head_admits_the_composite`] (the expansion's
+/// tie-token gate — the first half). Returns the lm-head node and every tail node id
+/// (the tail ops AND the matmul), in walk order.
+fn result_tail_lm_head<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<(&SubtileNode<F>, Vec<u32>), SuperDscError> {
+    let mut chain_nodes = Vec::new();
+    let mut t = ir.result;
+    let node =
+        loop {
+            let node = ir.nodes.iter().find(|n| n.output.tensor == t).ok_or_else(|| {
+            SuperDscError(format!(
+                "reroll-superdsc: the composite argmax walked the result tail back to tensor \
+                 {}, which no node produces — the graph is not one this walk built",
+                t.index()
+            ))
+        })?;
+            chain_nodes.push(node.id.index() as u32);
+            match &node.op {
+                SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. } if node.inputs.len() == 1 => {
+                    t = node.inputs[0].tensor;
+                }
+                SubOp::MatmulTile { .. } => break node,
+                other => {
+                    return Err(SuperDscError(format!(
+                        "reroll-superdsc: the composite argmax cannot recognize the lm-head tail: \
+                     the result's producer chain reaches {other:?}, which is neither the \
+                     single-input tail op set (ScalarMul, TanhSoftCap) nor the lm-head \
+                     MatmulTile — the tied one-request emission needs a new recognizer, \
+                     never a silent host fallback"
+                    )));
+                }
+            }
+        };
+    Ok((node, chain_nodes))
+}
+
+/// ⭐⭐⭐⭐⭐ CAN THE COMPOSITE'S FIRST CUT SERVE THIS LM-HEAD? — the expansion's
+/// mint-site gate, keyed on the STRUCTURE the graph itself states, never on a quant
+/// preset's NAME (so a future preset cannot slip past a name list). Three facts, all
+/// read off the result tail:
+///
+/// 1. ARITY-2 DENSE — fp8 W8A8 stages the per-channel scale as the matmul's THIRD
+///    operand and MLX-affine packs the table; the tied gather reads a Dense
+///    `[vocab, hidden]` bank in place, so a staged lm-head keeps the HOST argmax.
+///    The boundary is the STAGING, never the preset's PRESENCE: granite's own
+///    fp8-dynamic-per-channel IGNORES the lm_head, so the dense tail persists
+///    under it and the token survives the preset (pinned by
+///    `argmax_composite_expansion_scope.rs`, which runs under the quant line too).
+/// 2. VOCAB a whole fp16 stick — the chain's max/equal links run `[1, vocab]` at the
+///    64-elem SEN169_FP16 stick, and the dxp scheduler rejects sub-stick tiles.
+///    granite-3.1's 49155 is THREE LANES past the last stick (768·64 + 3), so both
+///    3.1 card cells stay on the host path by GEOMETRY; a pad-lane form (force the
+///    pad to −inf, extend the logits read) is second-wave work, filed — never a TODO.
+/// 3. HIDDEN a whole fp16 stick — the gather's slab is one-stick sub-rows
+///    (`try_assemble_argmax`'s own law, restated at the mint so an inexpressible
+///    model keeps the host path instead of failing the build).
+///
+/// ⛔ AN UNRECOGNIZABLE TAIL STILL MINTS. `true` there hands the token to the walk,
+/// whose own recognition ([`recognize_argmax`]) refuses LOUDLY — the
+/// never-a-silent-host-fallback law survives this gate exactly where it existed
+/// before it. The gate silences only the forms the first cut documents as
+/// boundaries: staged tables and non-stick geometry.
+pub fn lm_head_admits_the_composite<F: RopeForm>(ir: &SubtileIR<F>) -> bool {
+    let Ok((node, _)) = result_tail_lm_head(ir) else {
+        return true;
+    };
+    let SubOp::MatmulTile { weight, .. } = &node.op else {
+        unreachable!("the tail walk broke on a MatmulTile");
+    };
+    if node.inputs.len() != 2 || !matches!(weight, GemmWeight::Dense) {
+        return false;
+    }
+    // The IR spells the matmul's weight `[K, N]` — rows the contraction width, cols the
+    // out count — the same derivation [`recognize_argmax`] cross-checks four ways.
+    let table = &ir.tensors[node.inputs[1].tensor.index()];
+    let (hidden, vocab) = (table.rows, table.cols);
+    use ktir_superdsc::superdsc_opspec::DataFormat;
+    let stick = <ktir_superdsc::superdsc_opspec::Fp16 as DataFormat>::ELEMS_PER_STICK;
+    vocab.is_multiple_of(stick) && hidden.is_multiple_of(stick)
+}
+
 /// `Err` here means a TIED model's emission changed shape; hiding that behind the host
 /// readback would pin the regression in place.
 fn recognize_argmax<F: RopeForm>(
@@ -1660,40 +1745,9 @@ fn recognize_argmax<F: RopeForm>(
              reach a multi-row rung"
         )));
     }
-    let mut chain_nodes = Vec::new();
-    let mut t = ir.result;
-    let node =
-        loop {
-            let node = ir.nodes.iter().find(|n| n.output.tensor == t).ok_or_else(|| {
-            SuperDscError(format!(
-                "reroll-superdsc: the composite argmax walked the result tail back to tensor \
-                 {}, which no node produces — the graph is not one this walk built",
-                t.index()
-            ))
-        })?;
-            chain_nodes.push(node.id.index() as u32);
-            match &node.op {
-                // The single-input column-preserving tail ops — granite's logits-scaling
-                // ScalarMul, gemma's TanhSoftCap. Their output still feeds the result
-                // readback; the composite reads THROUGH them (a positive scaling cannot move
-                // an argmax), so they stay exactly where they are.
-                SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. } if node.inputs.len() == 1 => {
-                    t = node.inputs[0].tensor;
-                }
-                SubOp::MatmulTile { .. } => break node,
-                other => {
-                    return Err(SuperDscError(format!(
-                        "reroll-superdsc: the composite argmax cannot recognize the lm-head tail: \
-                     the result's producer chain reaches {other:?}, which is neither the \
-                     single-input tail op set (ScalarMul, TanhSoftCap) nor the lm-head \
-                     MatmulTile — the tied one-request emission needs a new recognizer, \
-                     never a silent host fallback"
-                    )));
-                }
-            }
-        };
+    let (node, chain_nodes) = result_tail_lm_head(ir)?;
     let SubOp::MatmulTile { n, weight } = &node.op else {
-        unreachable!("the loop broke on a MatmulTile");
+        unreachable!("the tail walk broke on a MatmulTile");
     };
     if node.inputs.len() != 2 || !matches!(weight, GemmWeight::Dense) {
         return Err(SuperDscError(format!(

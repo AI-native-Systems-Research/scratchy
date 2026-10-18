@@ -11099,7 +11099,30 @@ fn dump_wavefront_mega(
                     // model cannot mint the token, so the walk can never gather the wrong
                     // bank — and a tied graph whose tail the walk cannot recognize is a LOUD
                     // build error, never a silent host fallback.
-                    let argmax_tied = if one_request && tie_word_embeddings(model) {
+                    //
+                    // ⭐ AND THE fp8/GEOMETRY BOUNDARIES, KEYED ON STRUCTURE NEVER PRESET:
+                    // the token is minted only when the composite's first cut can SERVE
+                    // the result tail's lm-head — an arity-2 DENSE matmul at a whole-
+                    // fp16-stick vocab and hidden (the chain's [1, vocab] links run at
+                    // the stick; granite-3.1's 49155 is three lanes past the last one,
+                    // so the 3.1 cells keep the host argmax by GEOMETRY). A quant preset
+                    // that STAGES the lm-head (fp8 W8A8: the scale rides as a THIRD
+                    // operand; MLX-affine: the table is packed) makes it arity-3/non-
+                    // Dense, so no token is minted and the model keeps the HOST argmax —
+                    // by construction, so a future preset cannot slip past a name list.
+                    // The boundary is the staging, never the preset's presence:
+                    // granite's own fp8-dynamic-per-channel IGNORES the lm_head, so the
+                    // dense tail persists and stick-aligned granite keeps minting under
+                    // it (pinned across both quant scopes by the expansion-scope test).
+                    // The walk's own refusal stays as the second half (pinned by the
+                    // spyre-crate walk test); the staged dense fp16 table and the
+                    // pad-lane form are filed follow-ups, not TODOs.
+                    let argmax_tied = if one_request
+                        && tie_word_embeddings(model)
+                        && scratchy_target_spyre::lower_subtile_tape_to_ktir::lm_head_admits_the_composite(
+                            &krg,
+                        )
+                    {
                         Some(superdsc::TiedLmHeadEmbedding::from_tied_config(true).unwrap_or_else(
                             |e| panic!("[spyre-superdsc] {base}: the composite argmax's tie token: {e}"),
                         ))
