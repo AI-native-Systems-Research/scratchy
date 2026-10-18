@@ -85,9 +85,10 @@ fn the_chunk_op_count_is_independent_of_its_width() {
         .iter()
         .map(|&j| {
             let ops = emit_chunk(j);
-            let lx = ChunkScratch::of_chunk(pool, j)
-                .unwrap()
-                .lx_form(ChunkRowKind::OneRequest);
+            let lx = ChunkScratch::of_chunk(pool, j).unwrap().lx_form(
+                ChunkRowKind::OneRequest,
+                /* no op-local pins: geometry only */ 0,
+            );
             let parts = lx.map_or(1, |v| v.lx_parts() + u32::from(v.tail_pages() > 0));
             let values = ops.iter().filter(|(n, _)| value_leg(n)).count();
             assert_eq!(
@@ -237,7 +238,7 @@ fn the_decode_score_parts_divide_their_columns_alone() {
     let keys_in_lx = |j: u32| {
         ChunkScratch::of_chunk(pool, j)
             .unwrap()
-            .lx_form(ChunkRowKind::OneRequest)
+            .lx_form(ChunkRowKind::OneRequest, 0)
             .is_some_and(|v| v.keys().is_some())
     };
     for &j in ChunkScratch::LADDER.iter().filter(|&&j| keys_in_lx(j)) {
@@ -696,7 +697,7 @@ fn the_decode_gather_legs_read_each_part_kernel_from_lx() {
             ChunkRowKind::Prompt
         };
         for &j in &ChunkScratch::LADDER {
-            let vlx = ChunkScratch::of_chunk(pool, j).unwrap().lx_form(rows);
+            let vlx = ChunkScratch::of_chunk(pool, j).unwrap().lx_form(rows, 0);
             assert_eq!(vlx.is_some(), mq == 1 && j >= 8, "{j} page(s), mq {mq}");
             let (parts, tail) = vlx.map_or((0, 0), |v| (v.lx_parts(), v.tail_pages()));
             if let Some(v) = vlx {
@@ -797,7 +798,7 @@ fn the_lx_form_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
     let pool = PagedKvPool::new(NKVH as usize, HD as usize);
     for &j in ChunkScratch::LADDER.iter().filter(|&&j| j >= 8) {
         let chunk = ChunkScratch::of_chunk(pool, j).unwrap();
-        let vlx = chunk.lx_form(ChunkRowKind::OneRequest).unwrap();
+        let vlx = chunk.lx_form(ChunkRowKind::OneRequest, 0).unwrap();
         let eph = chunk.entries_per_head_page();
         let mut seen = std::collections::BTreeSet::new();
         for e in 0..chunk.entries() {
@@ -852,6 +853,7 @@ fn the_lx_form_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
             ChunkRowKind::OneRequest,
             &pages,
             per_page,
+            0,
         )
         .unwrap();
         let prompt = ktir_superdsc::sdsc_abstract::chunk_gather_index_table(
@@ -859,6 +861,7 @@ fn the_lx_form_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
             ChunkRowKind::Prompt,
             &pages,
             per_page,
+            0,
         )
         .unwrap();
         assert_eq!(prompt.len() as u32, chunk.entries(), "{j} page(s)");
@@ -900,7 +903,7 @@ fn a_tail_rung_cannot_mint_keys_in_lx() {
     for &j in &ChunkScratch::LADDER {
         let Some(lx) = ChunkScratch::of_chunk(pool, j)
             .unwrap()
-            .lx_form(ChunkRowKind::OneRequest)
+            .lx_form(ChunkRowKind::OneRequest, 0)
         else {
             continue;
         };

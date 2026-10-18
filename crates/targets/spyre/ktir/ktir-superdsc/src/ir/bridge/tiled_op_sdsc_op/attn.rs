@@ -4136,16 +4136,23 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         } else {
             crate::sdsc_abstract::ChunkRowKind::Prompt
         };
-        let lx = chunk.lx_form(chunk_rows).map(|form| ChunkLxBufs {
-            form,
-            keys: form.keys().map(|keys| {
-                let names = (0..keys.tensors()).map(|i| syn(R::GatherKtLx(i))).collect();
-                (keys, names)
-            }),
-            v: (0..form.lx_tensors())
-                .map(|i| syn(R::GatherVLx(i)))
-                .collect(),
-        });
+        // The op-local term of the window budget: the rung's pin slots, read off the layout. The declare
+        // pass has already walked prefix, every body and the suffix against THIS layout before any real
+        // pass ran, so the slot map is complete — the FINAL sum, never a mid-walk projection. `0` when
+        // no layout is in scope (a layout-less emission mints no pins at all).
+        let op_local_bytes = layout.map(|l| l.lx_op_local_slot_bytes()).unwrap_or(0);
+        let lx = chunk
+            .lx_form(chunk_rows, op_local_bytes)
+            .map(|form| ChunkLxBufs {
+                form,
+                keys: form.keys().map(|keys| {
+                    let names = (0..keys.tensors()).map(|i| syn(R::GatherKtLx(i))).collect();
+                    (keys, names)
+                }),
+                v: (0..form.lx_tensors())
+                    .map(|i| syn(R::GatherVLx(i)))
+                    .collect(),
+            });
         let cb = ChunkBufs {
             gkt: syn(R::GatherKt),
             gv: syn(R::GatherV),

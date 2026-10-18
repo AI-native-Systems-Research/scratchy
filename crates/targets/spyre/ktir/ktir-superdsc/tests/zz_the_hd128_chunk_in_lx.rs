@@ -131,13 +131,13 @@ fn the_hd128_lx_form_covers_exactly_the_rungs_its_pins_fit() {
     for &j in &ChunkScratch::LADDER {
         let chunk = ChunkScratch::of_chunk(pool(), j).unwrap();
         assert!(
-            chunk.lx_form(ChunkRowKind::Prompt).is_none(),
+            chunk.lx_form(ChunkRowKind::Prompt, 0).is_none(),
             "{j} page(s), prompt"
         );
         // A decode batch's chunk takes the same LX form: the law reads only the chunk's pages.
         assert_eq!(
-            chunk.lx_form(ChunkRowKind::Batch),
-            chunk.lx_form(ChunkRowKind::OneRequest),
+            chunk.lx_form(ChunkRowKind::Batch, 0),
+            chunk.lx_form(ChunkRowKind::OneRequest, 0),
             "{j} page(s), batch"
         );
         // Kᵗ: one 16 KiB tensor per (8-page part, kv head). V: one per (16-page part, kv head, slab).
@@ -146,7 +146,7 @@ fn the_hd128_lx_form_covers_exactly_the_rungs_its_pins_fit() {
         let v_pages = j / 16 * 16;
         let pinned = u64::from(k_pages + v_pages) * u64::from(NKVH) * ENTRY_BYTES / 8;
         let fits = (v_pages > 0 || k_pages > 0) && pinned <= window;
-        let Some(lx) = chunk.lx_form(ChunkRowKind::OneRequest) else {
+        let Some(lx) = chunk.lx_form(ChunkRowKind::OneRequest, 0) else {
             assert!(!fits, "{j} page(s): {pinned} B of pins fit, but no LX form");
             continue;
         };
@@ -166,6 +166,43 @@ fn the_hd128_lx_form_covers_exactly_the_rungs_its_pins_fit() {
     assert_eq!(admitted, [8, 16, 20, 24, 28, 32, 36, 40, 44, 52, 60]);
 }
 
+/// ⭐⭐ THE OP-LOCAL TERM OF THE ONE WINDOW BUDGET — `lx_window_fits`, the same function the pin
+/// allocator's own guard asserts, from the WITNESS's side: the widest admitted rung (40 pages,
+/// Kᵗ whole plus two V parts = 1,179,648 B of core-local pins) is admitted while its op-local pin
+/// slots leave room, admitted AT the boundary, and refused one byte past it. The bake reads the
+/// term off the layout (`lx_op_local_slot_bytes`), the host off the baked artifact
+/// (`bundle::BundleLayout::lx_op_local_bytes`) — both meet at this one function, so neither arm
+/// can budget against another rung's pins.
+#[test]
+fn the_op_local_pin_slots_refuse_a_chunk_the_window_no_longer_holds() {
+    let chunk = ChunkScratch::of_chunk(pool(), 40).unwrap();
+    let pinned = chunk
+        .lx_form(ChunkRowKind::OneRequest, 0)
+        .expect("the 40-page rung fits with no op-local slots")
+        .pinned_bytes_per_core();
+    assert_eq!(pinned, 1_179_648);
+    let headroom = LX_PIN_END - LX_PIN_BASE - pinned;
+    assert_eq!(headroom, 314_624);
+    // At the boundary exactly, the form still admits (`lx_window_fits` is `<=`); one byte of
+    // op-local slots past it refuses.
+    assert!(chunk.lx_form(ChunkRowKind::OneRequest, headroom).is_some());
+    assert!(
+        chunk
+            .lx_form(ChunkRowKind::OneRequest, headroom + 1)
+            .is_none(),
+        "one byte of op-local slots past the headroom must refuse the rung"
+    );
+    // A rung the core-local pins alone refuse stays refused at every op-local term — the terms
+    // compose, never trade.
+    let refused = ChunkScratch::of_chunk(pool(), 48).unwrap();
+    assert!(refused.lx_form(ChunkRowKind::OneRequest, 0).is_none());
+    assert!(
+        refused
+            .lx_form(ChunkRowKind::OneRequest, headroom)
+            .is_none()
+    );
+}
+
 /// ⭐⭐⭐ EVERY LX COPY AND ITS CONSUMER MEET AT ONE PIN, read off the emitted descriptors at every rung.
 /// Each Kᵗ copy writes one (part, kv head) tensor that exactly one score part reads, and each V copy one
 /// (part, kv head, slab) tensor that exactly one PV reads. Every pin is one 16 KiB entry per core, every
@@ -178,7 +215,7 @@ fn every_hd128_lx_copy_and_its_consumer_meet_at_one_pin() {
     for &j in &ChunkScratch::LADDER {
         let lx = ChunkScratch::of_chunk(pool(), j)
             .unwrap()
-            .lx_form(ChunkRowKind::OneRequest);
+            .lx_form(ChunkRowKind::OneRequest, 0);
         let ops = emit(j);
         let mut all_pins = std::collections::BTreeSet::new();
         for (copy, consumer) in [("attn_cgkt_", "attn_csc_g"), ("attn_cgv_", "attn_cov_g")] {
@@ -273,7 +310,7 @@ fn the_hd128_lx_table_is_each_legs_part_major_run() {
     .unwrap();
     for &j in &ChunkScratch::LADDER {
         let chunk = ChunkScratch::of_chunk(pool(), j).unwrap();
-        let Some(lx) = chunk.lx_form(ChunkRowKind::OneRequest) else {
+        let Some(lx) = chunk.lx_form(ChunkRowKind::OneRequest, 0) else {
             continue;
         };
         let n = chunk.entries();
@@ -344,6 +381,7 @@ fn the_hd128_lx_table_is_each_legs_part_major_run() {
             ChunkRowKind::OneRequest,
             &pages,
             per_page,
+            0,
         )
         .unwrap();
         assert_eq!(table.len() as u32, 2 * n, "{j} page(s)");
@@ -379,7 +417,7 @@ fn the_hd128_lx_table_is_each_legs_part_major_run() {
 fn a_hd128_value_tail_part_reads_its_own_slab_of_the_tail_scratch() {
     for &j in &ChunkScratch::LADDER {
         let chunk = ChunkScratch::of_chunk(pool(), j).unwrap();
-        let Some(lx) = chunk.lx_form(ChunkRowKind::OneRequest) else {
+        let Some(lx) = chunk.lx_form(ChunkRowKind::OneRequest, 0) else {
             continue;
         };
         if lx.tail_pages() == 0 {

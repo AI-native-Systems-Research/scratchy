@@ -434,6 +434,9 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         router_k: 0,
         // No paged KV: a single-kernel bundle has no per-request cache stride.
         kv_request_stride_bytes: 0,
+        // No op-local LX pin slots: this runner lowers Triton kernels — no rmsnorm decomposition
+        // ever declares an `rinv` pin — so the rung's slot sum is zero.
+        lx_op_local_bytes: 0,
     };
 
     println!("  parsed segment_bytes {:?}", segment_bytes);

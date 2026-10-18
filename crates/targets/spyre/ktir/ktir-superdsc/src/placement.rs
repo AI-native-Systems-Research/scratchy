@@ -433,7 +433,7 @@ impl Default for LxAlloc {
 /// `ChunkScratch::lx_form` admission witness with the chunk's would-be bytes — so the
 /// witness can never admit a form the allocator would refuse: one law, two readers,
 /// zero drift (#645's ruling 4).
-pub fn lx_window_fits(core_local_bytes: u64, op_local_slot_bytes: u64) -> bool {
+pub const fn lx_window_fits(core_local_bytes: u64, op_local_slot_bytes: u64) -> bool {
     LX_PIN_BASE + core_local_bytes + op_local_slot_bytes <= LX_PIN_END
 }
 

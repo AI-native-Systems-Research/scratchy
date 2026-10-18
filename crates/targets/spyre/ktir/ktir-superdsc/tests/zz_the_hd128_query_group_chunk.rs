@@ -131,7 +131,7 @@ fn part_slots_of(pages: u32, rows: ChunkRowKind) -> (Vec<u32>, Vec<u32>) {
             .map(|i| per.min(pages - i * per) * 256)
             .collect()
     };
-    match chunk.lx_form(rows) {
+    match chunk.lx_form(rows, 0) {
         None => (vec![pages * 256], vec![pages * 256]),
         Some(lx) => (
             lx.keys().map_or(vec![pages * 256], |k| cut(k.part_pages())),

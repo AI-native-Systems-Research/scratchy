@@ -911,6 +911,9 @@ fn chunk_index_table(
         rows,
         &map.as_i64(),
         per_page,
+        // The body's own baked op-local pin budget — the same term the bake's `lx_form` witness
+        // read off the layout, so the host refuses exactly the chunks the bake refused.
+        step.lx_op_local_bytes(),
     )
     .map(Some)
     .ok_or_else(|| {

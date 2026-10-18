@@ -6052,11 +6052,13 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // otherwise). Its verdict is that the bundle compiled; there is nothing for the runtime to do
         // with the table.
         arrangements: _,
-        // EMIT-ONLY, deliberately not baked: pinned-LX intermediates have no HBM placement by
-        // construction (their `memOrg_` is lx-only and no L3 movement is generated for them), so
-        // there is no address for the runtime to stage — the pin lives in the compiled sdsc
-        // allocates.
-        lx: _,
+        // EMIT-ONLY, deliberately not baked AS PLACEMENTS: pinned-LX intermediates have no HBM
+        // placement by construction (their `memOrg_` is lx-only and no L3 movement is generated for
+        // them), so there is no address for the runtime to stage — the pin lives in the compiled
+        // sdsc allocates. The pin SUM is a different fact and IS baked (`lx_op_local_bytes` below):
+        // it is the host's term of the one `lx_window_fits` budget, and the host cannot re-derive
+        // it — the slot map is this layout's, gone when the bake returns.
+        lx,
         kv_request_stride_bytes,
         // EMIT-ONLY too: the class registries are build-time facts the door and the load-time bind
         // resolve through; the baked artifact carries each class's PLACEMENT (in `places` above),
@@ -6163,6 +6165,10 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // k-boundary from it.
         router_k: *router_k,
         kv_request_stride_bytes: *kv_request_stride_bytes,
+        // The rung's op-local pin slots — final by now (the declare pass minted every pin before
+        // any bundle was emitted), and shared by every bundle of the rung, so whichever bundle the
+        // host reads it from carries the same budget.
+        lx_op_local_bytes: lx.borrow().op_local_bytes,
     }
 }
 
