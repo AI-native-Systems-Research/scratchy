@@ -30,7 +30,10 @@ use crate::cb_plan;
 use crate::fold_plan::{
     self, Bytes, OpKv, PerClass, RowCursors, RowIdx, RowPage, SessionKv, SlotPos, fused_rungs,
 };
-use crate::runtime::{BatchedCompute, ByteOffset, ByteSize, DevAddr, HwError, Stream};
+use crate::runtime::{
+    BatchedCompute, ByteOffset, ByteSize, ComputeWireBatch, ControlBlockWire, DevAddr, HwError,
+    Stream,
+};
 use crate::sen_convert;
 use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
 
@@ -156,6 +159,71 @@ struct PendingLaunch {
     off: [u64; NUM_SEGMENTS],
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  #603 PR2 2c — the replay player's cached step images
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// One launch row inside a step image: where the row's canvas sits in the
+/// concatenated step canvas, whether the row's render FOLLOWS the step
+/// scalars, and its patch plan.
+///
+/// `follows_step` is a law of [`Executor::launch_forward`], read here as
+/// data: the body rows launch at the STEP's position/page/count (their
+/// bytes move with the step — patched), while the prefix and suffix launch
+/// at slot 0 / page 0 / one page WHATEVER the step is (their bytes are the
+/// same every step — copied, never patched). A row that is fixed replayed
+/// through its plan would be wrong twice over: the plan was never verified
+/// for the step's slots, and the walk never renders it there.
+struct RowReplay {
+    base: usize,
+    len: usize,
+    follows_step: bool,
+    plan: cb_plan::PatchPlan,
+}
+
+/// The immutable half of a cached image — `Arc`'d because TWO handles must
+/// share it: the cache keeps one, and every step's `ComputeWireBatch` carries
+/// the canvas (one more `Arc`, to the same allocation) plus a stamp closure
+/// holding this whole struct for the row table. All plain data, so the
+/// closure is `Send` for free.
+struct StepImageData {
+    canvas: std::sync::Arc<Vec<ControlBlockWire>>,
+    rows: Vec<RowReplay>,
+}
+
+/// One cached step image — the whole forward (prefix + every body row +
+/// suffix) as ONE canvas, the row table that patches it, and the host-fence
+/// OR the step's single submission carries (the walk's per-row ORs collapse
+/// into it; see the flush at the end of `launch_ops_inner`).
+#[derive(Clone)]
+struct StepImage {
+    data: std::sync::Arc<StepImageData>,
+    barrier: bool,
+}
+
+/// What an image is keyed by — everything the render reads that is not
+/// per-step: WHICH body the ladder picks for this context, how many pages
+/// the resident prefix spans, and the fold shape (below).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct StepImageKey {
+    sel: BodySel,
+    n_fold_pages: i64,
+    /// The fold state the canvas was rendered under: the geometry and
+    /// request count, plus row 0's first `n_fold_pages` page ids. Those ids
+    /// are the ONE fold mutation that can invalidate an image: append-only
+    /// within a request's life (the prefix the fold sweeps is stable), but
+    /// a NEW request reuses the row with different pages.
+    ///
+    /// ⛔ NO ROW CURSORS IN THE KEY, ON PURPOSE. They advance every step —
+    /// keying on them would derive a fresh image per token. A single-request
+    /// launch is `LaunchWidth::Single`, and `RequestSlot::resolve`'s Single
+    /// arm answers the launch's own position without reading any cursor, so
+    /// the render genuinely does not depend on them. `fold_requests != 1`
+    /// never reaches the player (it takes the walk), which is what makes
+    /// that true for every image in this cache.
+    signature: Vec<i64>,
+}
+
 struct Diag {
     /// `SCRATCHY_SDSC_PEROP_SYNC`: re-enable the per-group host drain. DEFAULT-OFF —
     /// pipeline_barrier + the stream's STRICT_ORDERING guarantee the dataflow, and the drain cost
@@ -252,6 +320,50 @@ impl Diag {
             }
         })
     }
+
+    /// Whether EVERY instrument is off — the production configuration. The replay player
+    /// (#603 PR2 2c) requires this: each knob above reads state the walk produces (per-op
+    /// marks, per-op readbacks, per-op rb_seq entries, per-op dump files, mid-rung drains),
+    /// so rather than reason per knob about which are batch-safe one level up, ANY instrument
+    /// falls back to the walk bit for bit — the same discipline the collect path already
+    /// applies to its five mid-rung knobs ("a drain between ops of an unflushed rung observes
+    /// nothing"), extended to the player's whole surface. A knob run therefore measures the
+    /// walk, never a half-player; the player's own phase timers (`Timers::replay_*`) carry
+    /// its decomposition instead.
+    fn is_quiet(&self) -> bool {
+        let Diag {
+            perop_sync,
+            group_time,
+            submit_time,
+            prefix_time,
+            rb_time,
+            repeat_probe,
+            body_trace,
+            segaddr,
+            prog_verify,
+            phase_time,
+            prep_time,
+            optrace,
+            tensordump,
+            launch_mark,
+            reset_probe,
+        } = self;
+        !(*perop_sync
+            || *group_time
+            || *submit_time
+            || *prefix_time
+            || *rb_time
+            || *repeat_probe
+            || *body_trace
+            || *segaddr
+            || *prog_verify
+            || *phase_time
+            || *prep_time
+            || *optrace
+            || *launch_mark)
+            && tensordump.is_none()
+            && reset_probe.is_none()
+    }
 }
 
 /// One pipeline's harvested TS-phase durations plus a CB count, NAMED per the card-measured slot
@@ -345,6 +457,30 @@ struct Timers {
     /// minus the DMA crossings) after the step's synchronize; see [`rb_attribute`].
     rb_seq: Vec<((usize, usize), String)>,
     forwards: i64,
+    // ── #603 PR2 2c — the replay player's own decomposition. Recorded
+    // UNCONDITIONALLY (a handful of Instants and counters per STEP, not per
+    // op) because every Diag knob forces the walk: these are the only
+    // numbers that describe the player, reported on the cadence in
+    // `report_replay` — they are also the player's liveness marker (a
+    // benchmark whose stderr never shows [sdsc-replay] did not replay).
+    /// Steps replayed from an image, and how many found their image already
+    /// derived (the rest paid a derivation, counted below).
+    replay_steps: u64,
+    replay_hits: u64,
+    /// Images derived (first use of a (body, page-count, fold-shape) key)
+    /// and what those derivations cost — amortized over every step that
+    /// reuses the image.
+    replay_derives: u64,
+    replay_derive_ms: f64,
+    /// CBs replayed per step and moving-word patch sites carried by the
+    /// derived images — the player's per-step payload.
+    replay_cbs: u64,
+    replay_sites: u64,
+    /// The per-step host work: image lookup (key + fold-signature build +
+    /// map hit) and the submit call (canvas memcpy + patches + tag stamps +
+    /// ONE doorbell, all inside it).
+    replay_lookup_ms: f64,
+    replay_submit_ms: f64,
 }
 
 fn timers() -> std::sync::MutexGuard<'static, Timers> {
@@ -670,6 +806,13 @@ pub struct Executor {
     /// tensor, its program index (per-fingerprint, first-dumped order — see [`Diag::tensordump`]),
     /// and its own op counter. `None` unless the env gate is set.
     dump: Option<TensorDump>,
+
+    // ── #603 PR2 2c — the replay player ──
+    /// Cached step images, keyed by (body, resident page count, fold shape) —
+    /// [`StepImageKey`]. EMPTY until the first eligible decode step derives
+    /// one; every batched or instrumented step takes the walk instead, so
+    /// nothing here is consulted (or populated) off the player's own path.
+    step_images: std::collections::HashMap<StepImageKey, StepImage>,
 }
 
 /// Per-session state for the card-side tensordump — see [`Diag::tensordump`].
@@ -827,6 +970,7 @@ impl Executor {
             staged_host: false,
             n_weights_staged: 0,
             dump: None,
+            step_images: std::collections::HashMap::new(),
         };
 
         // ── RE-ROLLED mode: a re-roll meta ⇒ this bundle is the BODY (one layer); the prefix (embed)
@@ -2059,16 +2203,17 @@ impl Executor {
             .collect();
 
         // ⭐ 2b — THE PATCH GATE'S SESSION: the PLAYER's shape, not the batched fold's. ONE
-        // request, three resident pages. The canvas slot is picked to leave the differentials
-        // and the off-sample steps room on both sides: mid-page, off every slab boundary
-        // (`pos % SLAB_SLOTS == 5`), with 65+ slots of page past it.
-        let r_patch = (5 - 2 * per).rem_euclid(fold_plan::SLAB_SLOTS);
+        // request, three resident pages. The canvas slot is `cb_plan::canvas_slot` — the ONE
+        // recipe, shared with the player, that picks a slot with room on both sides for the
+        // differentials and the off-sample steps: mid-page, off every slab boundary, never
+        // slot 0 of a page.
+        let r_patch = cb_plan::canvas_slot(per, self.kv.paged);
         let fold1 = SessionKv {
             paged: self.kv.paged,
             page_slots: fold_plan::PageSlots::per_page(per),
             page_stride_bytes: Bytes(self.kv.page_stride_bytes.max(1)),
             block_tables: vec![vec![0, 1, 2]],
-            request_positions: RowCursors::bound(vec![2 * per + r_patch]),
+            request_positions: RowCursors::bound(vec![2 * per + r_patch.unwrap_or(1)]),
             fold_requests: 1,
             mask_rep_stride_bytes: 0,
             mask_blocks: 64,
@@ -2083,19 +2228,19 @@ impl Executor {
         let page_c = Bytes(2 * self.kv.page_stride_bytes.max(1));
         let mk1 = |bank: usize, off: [u64; NUM_SEGMENTS]| LaunchWhere {
             byte_off: off,
-            slot_pos: SeqPos(2 * per + r_patch),
+            slot_pos: SeqPos(2 * per + r_patch.unwrap_or(1)),
             kv_page_base: page_c,
             n_fold_pages: 3,
             weight_bank: bank,
         };
         // The patch gate needs one image's worth of sampling room around its canvas (65+ slots
-        // of page past it; `r_patch ≤ 63`). A page too narrow for that skips the leg loudly —
-        // every shipped bundle's page is 2048 slots.
-        let patch_room = !self.kv.paged || r_patch + 65 <= per;
+        // of page past it; `r_patch ≤ 62`). A page too narrow for that — or one no canvas slot
+        // fits at all — skips the leg loudly; every shipped bundle's page is 2048 slots.
+        let patch_room = r_patch.is_some_and(|r| !self.kv.paged || r + 65 <= per);
         if !patch_room {
             debug!(
-                "[sdsc-cbplan] patch gate SKIPPED: a page holds {per} slot(s), leaving no \
-                 sampling room around a mid-page canvas. The parity gate above still ran."
+                "[sdsc-cbplan] patch gate SKIPPED: no canvas slot with sampling room fits a \
+                 {per}-slot page. The parity gate above still ran."
             );
         }
         // Every list the session could launch — the class dimension is enumerated whole here, so
@@ -2144,7 +2289,7 @@ impl Executor {
             if patch_room {
                 for (tag, bank, off) in &rows {
                     let label = format!("{sel:?}/{tag}");
-                    sites += cb_plan::patch_check(
+                    let (row_sites, _) = cb_plan::patch_check(
                         ops,
                         &fold1,
                         &self.seg_addr,
@@ -2153,6 +2298,7 @@ impl Executor {
                         &label,
                         stream,
                     )?;
+                    sites += row_sites;
                     patch_contexts += 1;
                 }
             }
@@ -3570,7 +3716,17 @@ impl Executor {
         }
         let t1 = Instant::now();
 
-        self.launch_forward(seq_pos)?;
+        // ⭐ #603 PR2 2c — a ONE-TOKEN step on a quiet diag replays from a cached image
+        // (canvas copy + patches + ONE doorbell); everything else takes the walk.
+        // `n_new == 1` is the step's own shape, not a toggle: a chunked-prefill step
+        // (n_new > 1) sweeps a fresh page count per chunk and would pay a derivation
+        // per chunk — PR4's rungs, not the player's. `try_replay_forward` states its
+        // own other refusals (batched fold, instruments) and hands back `None` for
+        // the walk.
+        let replayed = n_new.0 == 1 && self.try_replay_forward(seq_pos)?.is_some();
+        if !replayed {
+            self.launch_forward(seq_pos)?;
+        }
 
         if d.phase_time {
             let _ = self.stream_ref()?.synchronize();
@@ -3939,6 +4095,300 @@ impl Executor {
         // emitter placement aliasing (hidden_out/suffix_in aliased onto hidden_in's resident
         // buffer). No D2H/memcpy/H2D — the residual lives on-device across iterations.
         self.launch_ops(ListSel::Suffix, zero, SeqPos(0), Bytes(0), 1, suf_bank)
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    //  #603 PR2 2c — the replay player: one decode step as canvas-copy + patches + ONE doorbell
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /// ⭐ THE PLAYER — the decode step's whole forward from a cached image:
+    /// select the image by (body, page count, fold shape), let the submit
+    /// path copy the canvas and stamp it (the step's patches + the
+    /// pool-leased tags), and ring ONE doorbell for the step. The per-step
+    /// host work is a memcpy, K word patches, N tag stamps and one
+    /// submission — no per-op `launch_site`, no `BatchedCompute` build, no
+    /// per-rung flush. Everything the image is keyed by, and everything the
+    /// stamp writes, was proven at the image's derivation:
+    /// `cb_plan::patch_check` per body row (canvas ≡ walk, patched canvas ≡
+    /// fresh walk at steps the derivation never visited) and
+    /// `cb_plan::parity_check` per fixed row.
+    ///
+    /// Returns `Ok(None)` — the caller takes the walk — for every step that
+    /// is not the player's regime, with the reason stated once per process
+    /// per reason (a per-step debug line would be noise at decode rate):
+    /// a BATCHED step (two or more requests installed — PR4's images), any
+    /// Diag instrument on ([`Diag::is_quiet`] — each one reads walk state),
+    /// or a page no canvas slot fits. There is no third path and no toggle:
+    /// the production configuration (quiet diag, one request) is the player.
+    fn try_replay_forward(&mut self, seq_pos: SeqPos) -> Result<Option<()>> {
+        if !Diag::get().is_quiet() || fold_plan::fold_requests(&self.fold) != 1 {
+            return Ok(None);
+        }
+        let per = self.kv.page_slots.0.max(1);
+        let n = self.n_fold_pages(seq_pos);
+        let sel = self.step_body(seq_pos)?.sel;
+        let Some(r) = cb_plan::canvas_slot(per, self.kv.paged) else {
+            debug!(
+                "[sdsc-replay] walking every step: no canvas slot fits a {per}-slot page, so no \
+                 image can be derived for this session"
+            );
+            return Ok(None);
+        };
+        // The canvas position: inside THIS image's page span (`(n-1)·per` is
+        // the image's first page; `r ≥ 1` keeps off the boundary), or any
+        // position at all for an unpaged session, whose one image covers
+        // them all. The write base is the page holding it — a RESIDENT page,
+        // unlike the boundary step's brand-new one, so the reference always
+        // reads a page the block table already names.
+        let pos_c = if self.kv.paged { (n - 1) * per + r } else { r };
+        let page_c = self.page_base_for_write(SeqPos(pos_c));
+        let key = StepImageKey {
+            sel,
+            n_fold_pages: n,
+            signature: fold_signature(&self.fold, n),
+        };
+        let t0 = Instant::now();
+        let image = match self.step_images.get(&key) {
+            Some(image) => {
+                let hit = image.clone();
+                let mut t = timers();
+                t.replay_lookup_ms += t0.elapsed().as_secs_f64() * 1e3;
+                hit
+            }
+            None => {
+                let t1 = Instant::now();
+                let image = self.derive_step_image(sel, n, pos_c, page_c)?;
+                let mut t = timers();
+                t.replay_derives += 1;
+                t.replay_derive_ms += t1.elapsed().as_secs_f64() * 1e3;
+                self.step_images.insert(key, image.clone());
+                image
+            }
+        };
+        // The step's scalars — the three values every moving word of the
+        // body rows is affine in, measured at the position this step writes
+        // and the page it writes into (row 0's page at `seq_pos / per`,
+        // which the host appended before the step for a boundary one).
+        let scalars = cb_plan::step_scalars(
+            self.kv.paged,
+            per,
+            seq_pos.0,
+            self.page_base_for_write(seq_pos).0,
+        );
+        // The stamp closure: patches the body rows onto the backend's canvas
+        // copy, then stamps the leased tags over the render-time ones. The
+        // fixed rows are skipped by `follows_step` — see `RowReplay`.
+        let data = std::sync::Arc::clone(&image.data);
+        let batch = ComputeWireBatch {
+            canvas: std::sync::Arc::clone(&data.canvas),
+            patch: Box::new(move |tags, cbs| {
+                for row in &data.rows {
+                    if row.follows_step {
+                        row.plan
+                            .apply(&mut cbs[row.base..row.base + row.len], &scalars);
+                    }
+                }
+                for (cb, tag) in cbs.iter_mut().zip(tags.iter()) {
+                    cb.set_tag(*tag);
+                }
+            }),
+        };
+        let stream = self.stream_ref()?;
+        let t1 = Instant::now();
+        let cbs = image.data.canvas.len();
+        let r = stream.compute_wires(batch, image.barrier);
+        let t2 = Instant::now();
+        if let Err(e) = r {
+            // The image itself was proven at derivation (per-row gates above);
+            // a refused submit here is capacity or shutdown, not addressing —
+            // so the refusal names the image and the step, not an op site.
+            return Err(anyhow::Error::new(e).context(format!(
+                "replay submit refused: {cbs} CB(s) over {} launch row(s), barrier={}, \
+                 sel={sel:?}, n_fold_pages={n}, step at {}",
+                image.data.rows.len(),
+                image.barrier,
+                seq_pos.0
+            )));
+        }
+        let mut t = timers();
+        t.replay_steps += 1;
+        t.replay_cbs += cbs as u64;
+        t.replay_sites += image
+            .data
+            .rows
+            .iter()
+            .map(|row| row.plan.sites())
+            .sum::<usize>() as u64;
+        t.replay_submit_ms += (t2 - t1).as_secs_f64() * 1e3;
+        if t.replay_steps.is_multiple_of(256) {
+            report_replay(&t);
+        }
+        Ok(Some(()))
+    }
+
+    /// Derive one step image at its first use — the row sequence is
+    /// EXACTLY `launch_forward`'s (that is the merge's one law: the step's
+    /// CBs, in the order the walk would submit them), each row rendered
+    /// through the gates that prove it, concatenated into one canvas.
+    ///
+    /// The body rows render at the CANVAS position (`pos_c`/`page_c`, inside
+    /// the image's own page span), not at the calling step's — the patch
+    /// model's reference can be any step of the image, and a fixed reference
+    /// keeps the derivation off the slab and page boundaries the calling
+    /// step might sit on. The fixed rows render at their own constant
+    /// `where_` (slot 0, page 0, one page), which is where the walk launches
+    /// them every step whatever the body is doing.
+    fn derive_step_image(
+        &self,
+        sel: BodySel,
+        n: i64,
+        pos_c: i64,
+        page_c: Bytes,
+    ) -> Result<StepImage> {
+        let stream = self.stream_ref()?;
+        // (list, where, follows-step) per launch row, mirroring
+        // `launch_forward` arm by arm. An empty list launches nothing in the
+        // walk (its flush stages zero CBs), so it contributes no row here.
+        let mut specs: Vec<(ListSel, LaunchWhere, bool)> = Vec::new();
+        let zero = [0u64; NUM_SEGMENTS];
+        match self.rolled.as_ref() {
+            Some(r) => {
+                specs.push((
+                    ListSel::Prefix,
+                    LaunchWhere {
+                        byte_off: zero,
+                        slot_pos: SeqPos(0),
+                        kv_page_base: Bytes(0),
+                        n_fold_pages: 1,
+                        weight_bank: r.prefix_weight_bank,
+                    },
+                    false,
+                ));
+                for (class, wbank, woff, kvoff) in r.launches.clone() {
+                    let mut off = [0u64; NUM_SEGMENTS];
+                    off[SEG_WEIGHT.get()] = woff;
+                    off[SEG_KV.get()] = kvoff;
+                    specs.push((
+                        self.list_sel_for(sel, class),
+                        LaunchWhere {
+                            byte_off: off,
+                            slot_pos: SeqPos(pos_c),
+                            kv_page_base: page_c,
+                            n_fold_pages: n,
+                            weight_bank: wbank as usize,
+                        },
+                        true,
+                    ));
+                }
+                specs.push((
+                    ListSel::Suffix,
+                    LaunchWhere {
+                        byte_off: zero,
+                        slot_pos: SeqPos(0),
+                        kv_page_base: Bytes(0),
+                        n_fold_pages: 1,
+                        weight_bank: r.suffix_weight_bank,
+                    },
+                    false,
+                ));
+            }
+            None => {
+                // Unrolled: one body over the whole model, bank 0, no seams.
+                specs.push((
+                    self.list_sel_for(sel, 0),
+                    LaunchWhere {
+                        byte_off: zero,
+                        slot_pos: SeqPos(pos_c),
+                        kv_page_base: page_c,
+                        n_fold_pages: n,
+                        weight_bank: 0,
+                    },
+                    true,
+                ));
+            }
+        }
+        let mut canvas: Vec<ControlBlockWire> = Vec::new();
+        let mut rows: Vec<RowReplay> = Vec::new();
+        let mut barrier = false;
+        let mut sites = 0usize;
+        for (ls, where_, follows_step) in specs {
+            let ops = self.list(ls);
+            if ops.is_empty() {
+                continue;
+            }
+            let label = format!("{ls:?}/replay-canvas");
+            let (row_canvas, plan) = if follows_step {
+                // A body row: the FULL gate — parity at the canvas position,
+                // the patch table, and the off-sample proof that patched
+                // canvas ≡ fresh walk at steps the derivation never visited.
+                // This is the exact check the prepare gate ran under a
+                // synthetic session, now under the live one.
+                let (_, img) = cb_plan::patch_check(
+                    ops,
+                    &self.fold,
+                    &self.seg_addr,
+                    &self.weight_bank_addr,
+                    &where_,
+                    &label,
+                    stream,
+                )?;
+                (img.canvas, img.plan)
+            } else {
+                // A fixed row: its replay target is its own canvas,
+                // unchanged, every step — the walk launches it at this SAME
+                // `where_` forever. Parity at that `where_` is the whole
+                // correctness statement, so the patch machinery is derived
+                // (the same builder renders the canvas) but its off-sample
+                // leg is not run: it would test a semantics no replay uses
+                // and could refuse an image over it.
+                cb_plan::parity_check(
+                    ops,
+                    &self.fold,
+                    &self.seg_addr,
+                    &self.weight_bank_addr,
+                    &where_,
+                    &label,
+                    stream,
+                )?;
+                let (c, p) = cb_plan::build_patch_plan(
+                    ops,
+                    &self.fold,
+                    &self.seg_addr,
+                    &self.weight_bank_addr,
+                    &where_,
+                    stream,
+                )?;
+                (c, p)
+            };
+            barrier |= plan.barrier;
+            sites += plan.sites();
+            rows.push(RowReplay {
+                base: canvas.len(),
+                len: row_canvas.len(),
+                follows_step,
+                plan,
+            });
+            canvas.extend(row_canvas);
+        }
+        if canvas.is_empty() {
+            bail!(
+                "replay image derivation REFUSED: sel={sel:?} n_fold_pages={n} produced zero \
+                 CBs — the walk it mirrors launches nothing, which no body selection can do"
+            );
+        }
+        debug!(
+            "[sdsc-replay] derived image sel={sel:?} n_fold_pages={n}: {} CB(s) over {} \
+             launch row(s), {sites} patch site(s), barrier={barrier}",
+            canvas.len(),
+            rows.len()
+        );
+        Ok(StepImage {
+            data: std::sync::Arc::new(StepImageData {
+                canvas: std::sync::Arc::new(canvas),
+                rows,
+            }),
+            barrier,
+        })
     }
 
     /// How many pages the RESIDENT PREFIX `[0, seq_pos)` spans.
@@ -4494,7 +4944,7 @@ impl Executor {
 /// fold-fused); the launch table then names the CLASS whose list runs it. Splitting the two is
 /// what keeps a hybrid model's selector identical to a single-class one: a rung is one extent
 /// shared by every class, so "which body serves this context" never needs a class argument.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 enum BodySel {
     Body,
     BodyFused,
@@ -4672,6 +5122,54 @@ fn report_rb_time(t: &Timers) {
         t.rb_dmao.tail,
         t.rb_dmao.tail / t.rb_dmao.cbs.max(1),
     );
+}
+
+/// The fold shape an image was derived under, as one comparable value: every
+/// `SessionKv` field the render reads that is not per-step, plus row 0's
+/// first `n_fold_pages` page ids (see [`StepImageKey::signature`] for why
+/// those, and why no row cursors). Cheap to build and compare — a dozen
+/// i64s against a cached key — against a step whose device time is
+/// milliseconds.
+fn fold_signature(fold: &SessionKv, n_fold_pages: i64) -> Vec<i64> {
+    let mut s = vec![
+        fold.paged as i64,
+        fold.page_slots.get(),
+        fold.page_stride_bytes.0 as i64,
+        fold_plan::fold_requests(fold),
+        fold.mask_rep_stride_bytes as i64,
+        fold.mask_blocks as i64,
+        fold.fold_pages as i64,
+        fold.int_rep_stride_bytes as i64,
+    ];
+    if let Some(row0) = fold.block_tables.first() {
+        s.extend(row0.iter().take(n_fold_pages.max(0) as usize).copied());
+    }
+    s
+}
+
+/// The replay player's decomposition — cumulative since process start, on a
+/// 256-step cadence. ⛔ ONE WRITE: the same single-`format!` discipline as
+/// `[progverify]` — an abort from senlib's monitor thread takes the process
+/// down with no unwinding, so a buffered line is a line that never existed.
+/// This line is also the player's LIVENESS MARKER: a run whose stderr never
+/// shows it replayed nothing.
+fn report_replay(t: &Timers) {
+    let steps = t.replay_steps.max(1);
+    let derives = t.replay_derives.max(1);
+    let one = format!(
+        "[sdsc-replay] {} step(s) replayed: {:.1}% from cached image(s) | {:.1} CB(s)/step, {} \
+         patch site(s)/image | lookup {:.1} us/step, submit {:.3} ms/step | {} derivation(s) at \
+         {:.1} ms each\n",
+        t.replay_steps,
+        100.0 * t.replay_hits as f64 / steps as f64,
+        t.replay_cbs as f64 / steps as f64,
+        t.replay_sites / derives,
+        1000.0 * t.replay_lookup_ms / steps as f64,
+        t.replay_submit_ms / steps as f64,
+        t.replay_derives,
+        t.replay_derive_ms / derives as f64,
+    );
+    eprint!("{one}");
 }
 
 /// The submit / prefix-ladder / repeat-probe reports, emitted with the phase line.

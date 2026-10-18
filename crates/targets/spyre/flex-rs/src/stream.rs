@@ -768,6 +768,51 @@ impl RuntimeStream {
         self.launch_operation(op, user_cb)
     }
 
+    /// #603 PR2's replay door: a compute batch as PREBUILT wire bytes (see
+    /// [`crate::compute::ComputeWireBatch`] — scratchy's own extension, no
+    /// vendor analog). One submitted operation, ONE doorbell for the whole
+    /// canvas, exactly the multi-CB submission shape
+    /// [`Self::launch_compute_batch`] gives the vendor's batch path — same
+    /// `maybe_set_barrier` decision (the one the first op would get), same
+    /// fence, same in-flight accounting per CB — so an all-compute step
+    /// submitted through this door is ordered on the ring exactly as its
+    /// per-rung `launch_compute_batch` calls were.
+    ///
+    /// BARRIER SEMANTICS: as [`Self::launch_compute_batch`] — the caller
+    /// passes the OR of the per-op barriers the step's ops would have
+    /// requested; for an all-compute step one head barrier is equivalent to
+    /// the per-rung ones (`issue_barrier` drains the OTHER pipelines'
+    /// fences; the first true barrier drains them and later ones wait on
+    /// nothing, which is also why merging the step's rungs into one
+    /// submission moves that drain EARLIER, to the step head, and changes
+    /// nothing: no DMA op is submitted inside a step).
+    ///
+    /// No per-element validation, deliberately: the canvas was rendered by
+    /// the same `build_compute_cb` the validated paths run, through a door
+    /// the caller's prepare-time parity gate proved byte-identical to the
+    /// real walk — re-validating opaque wire bytes here would re-derive
+    /// nothing that gate has not already proven. An empty canvas is refused
+    /// outright, matching the batch door ([`RuntimeStreamError::EmptyBatch`]).
+    pub fn launch_compute_wires(
+        self: &Arc<Self>,
+        batch: crate::compute::ComputeWireBatch,
+        pipeline_barrier: bool,
+        user_cb: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<(), RuntimeStreamError> {
+        if batch.canvas.is_empty() {
+            return Err(RuntimeStreamError::EmptyBatch(
+                "RuntimeOperationCompute(wires)",
+            ));
+        }
+        let op = SubmittedOperation {
+            kind: RuntimeOperationKind::Compute,
+            pipeline_barrier,
+            skip_hazard: false,
+            payload: Box::new(batch),
+        };
+        self.launch_operation(op, user_cb)
+    }
+
     /// Port of `RuntimeStream::launchOperationFill` (`runtime_stream.cpp:456-471`).
     /// Note the C++ passes `makeCompletionCallback(nullptr, nullptr)` — a fill
     /// carries no user callback (`FillParams` does not derive from

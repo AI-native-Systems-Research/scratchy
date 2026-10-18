@@ -599,6 +599,7 @@ pub(crate) fn parity_check(
 /// intermediate rep strides — are per-rep CONSTANTS of the image: baked into
 /// the canvas, never patched. The block tables are append-only within a row's
 /// life, so a page base baked into an image stays valid for that row.
+#[derive(Clone, Copy)]
 pub(crate) struct StepScalars {
     pub(crate) slot_in_page: u64,
     pub(crate) slab: u64,
@@ -625,6 +626,27 @@ pub(crate) fn step_scalars(paged: bool, per: i64, pos: i64, write_page_base: u64
     }
 }
 
+/// The canvas position's slot-within-page — ONE recipe shared by the
+/// prepare gate's synthetic session and 2c's player, so the image the gate
+/// proved and the image the player replays are cut the same way. It must
+/// leave room for the +1 slot differential (≤ `per − 2` when paged, so the
+/// step never crosses a page wrap) and the +1 slab differential (≤ 62, so
+/// it never crosses a slab boundary), and it must not be slot 0 of a page
+/// (a page boundary belongs to the PREVIOUS image's last step). 5 — the
+/// gate's historical pick — whenever it fits; `None` when no slot of the
+/// page can host a canvas (a page of ≤ 2 slots), which the caller treats
+/// as "no image for this shape", never as a wrong-coefficient derivation.
+pub(crate) fn canvas_slot(per: i64, paged: bool) -> Option<i64> {
+    let hi = if paged { per - 2 } else { 62 }.min(62);
+    if hi >= 5 {
+        Some(5)
+    } else if hi >= 1 {
+        Some(1)
+    } else {
+        None
+    }
+}
+
 /// One 8-byte word of one CB image that moves with the step: where it sits,
 /// and the addend per unit of each scalar — MEASURED by finite differences
 /// through the render door, never read off the wire layout by hand. The XLAT
@@ -647,16 +669,28 @@ pub(crate) struct Patch {
 }
 
 /// The patches that turn one image into any step's CBs: the scalars the
-/// canvas was rendered at, and every moving word's affine addend. Built by
-/// [`build_patch_plan`] — at prepare for the gate, at an image's first use
-/// for 2c's player — and applied by copying the canvas and calling
-/// [`PatchPlan::apply`].
+/// canvas was rendered at, every moving word's affine addend, and the
+/// launch's host-fence OR — the one `pipeline_barrier` the player submits
+/// the whole image with (the walk's per-op ORs collapse to it; see
+/// `Stream::compute_batch`'s flush). Built by [`build_patch_plan`] — at
+/// prepare for the gate, at an image's first use for 2c's player — and
+/// applied by copying the canvas and calling [`PatchPlan::apply`].
 pub(crate) struct PatchPlan {
     reference: StepScalars,
     patches: Vec<Patch>,
+    /// The OR of every entry's host-fence flag — a constant of the plan
+    /// (entry-keyed, position-independent), so one value serves every step
+    /// this image replays.
+    pub(crate) barrier: bool,
 }
 
 impl PatchPlan {
+    /// How many moving words the plan patches — the player's per-step patch
+    /// workload, reported by its timers.
+    pub(crate) fn sites(&self) -> usize {
+        self.patches.len()
+    }
+
     /// Patch a copied canvas in place for one step's scalars. The addend is
     /// computed in i128 and wrapped to u64: slot wrap and a reclaimable page
     /// make deltas negative, and the wire's arithmetic is two's-complement
@@ -731,7 +765,12 @@ pub(crate) fn build_patch_plan(
         let (items, _) = plan.render(fold, w)?;
         Ok(stream.render_compute_batch(&items, 1)?)
     };
-    let canvas = render(where_)?;
+    // The canvas, rendered once — and the host-fence OR with it: a constant
+    // of the plan (entry-keyed, the same for every render of this plan), so
+    // the canvas render's value is the image's, what the player submits
+    // every step of this image with.
+    let (items, barrier) = plan.render(fold, where_)?;
+    let canvas = stream.render_compute_batch(&items, 1)?;
     // The three differentials. Each moves exactly one scalar's worth of
     // arithmetic — the others held — so each moving word's measured difference
     // is one equation in that word's coefficients.
@@ -807,7 +846,23 @@ pub(crate) fn build_patch_plan(
         }
     }
     let reference = step_scalars(fold.paged, per, pos, page);
-    Ok((canvas, PatchPlan { reference, patches }))
+    Ok((
+        canvas,
+        PatchPlan {
+            reference,
+            patches,
+            barrier,
+        },
+    ))
+}
+
+/// One launch row's replay image — what 2c's player caches per row and
+/// concatenates into a step image: the canvas it copies, and the patch plan
+/// that turns the copy into any step of the same image key. The plan's
+/// `barrier` is the row's host-fence OR; the player ORs the rows it merges.
+pub(crate) struct RowImage {
+    pub(crate) canvas: Vec<ControlBlockWire>,
+    pub(crate) plan: PatchPlan,
 }
 
 /// ⭐ THE 2b GATE — the patch table proven off-sample, at prepare. Builds the
@@ -817,12 +872,15 @@ pub(crate) fn build_patch_plan(
 /// refuses. This is the whole correctness statement of 2c's player — replay
 /// (canvas + patches) ≡ re-derive (the walk) — proven at prepare under a
 /// synthetic session of the player's own shape, so no step ever pays for it.
+/// The player runs this SAME check per image at the image's first use, under
+/// the live session — and keeps the verified image it returns.
 ///
 /// The off-sample steps deliberately include the page-boundary slot: an
 /// image's last step writes slot 0 of the NEXT page (negative slot delta,
 /// positive page delta, slab jump — all at once), which is also where a
 /// bundle whose ops disagree about the page modulus would first diverge (see
-/// [`step_scalars`]). Returns the number of patch sites verified.
+/// [`step_scalars`]). Returns the number of patch sites verified and the
+/// verified image itself.
 pub(crate) fn patch_check(
     ops: &Ops,
     fold: &SessionKv,
@@ -831,7 +889,7 @@ pub(crate) fn patch_check(
     where_: &LaunchWhere,
     label: &str,
     stream: &Stream,
-) -> Result<usize> {
+) -> Result<(usize, RowImage)> {
     // The canvas the patches are measured against is itself proven against
     // the walk at this exact `where_` — patching a canvas that already
     // disagreed with the walk would verify nothing.
@@ -922,5 +980,11 @@ pub(crate) fn patch_check(
             }
         }
     }
-    Ok(patch_plan.patches.len())
+    Ok((
+        patch_plan.patches.len(),
+        RowImage {
+            canvas,
+            plan: patch_plan,
+        },
+    ))
 }

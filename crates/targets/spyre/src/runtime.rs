@@ -25,7 +25,6 @@ use flex_rs::allocator::{
     FlexAllocatorInit,
 };
 use flex_rs::compute::{BootstrapOffset, ComputeParams, KernelName};
-use flex_rs::control_block_wire::{ControlBlockWire, ResponseTag};
 use flex_rs::device_memory_allocator::DeviceMemoryAllocator;
 use flex_rs::dma::{DmaDirection, DmaParams, DmaPipelineShape, DmaShaping, HostVirtualAddress};
 use flex_rs::flex_config::DeviceKind;
@@ -688,6 +687,27 @@ impl Stream {
         }
         Ok(cbs)
     }
+
+    /// #603 PR2's replay submit door — the write side of
+    /// [`Self::render_compute_batch`]'s images: submit a canvas the render
+    /// door produced (and the prepare gates proved) as ONE doorbell, with
+    /// the batch's stamp closure applying the step's patches and the
+    /// pool-leased tags to the copy the backend takes under the submission
+    /// lock. Same one-operation shape as [`Self::compute_batch`] — one
+    /// barrier decision (`pipeline_barrier` is the OR of the step's per-op
+    /// host fences), one fence, one capacity gate, in-flight accounting per
+    /// CB — so the step is ordered on the ring exactly as its per-rung
+    /// `compute_batch` calls were, with the same CBs in the same order.
+    pub fn compute_wires(
+        &self,
+        batch: ComputeWireBatch,
+        pipeline_barrier: bool,
+    ) -> Result<(), HwError> {
+        let stream = self.live()?;
+        stream
+            .launch_compute_wires(batch, pipeline_barrier, None)
+            .map_err(HwError::Stream)
+    }
 }
 
 impl Drop for Stream {
@@ -702,6 +722,11 @@ impl Drop for Stream {
 /// The byte types [`DevAddr`]'s signature speaks, re-exported so the player imports every device
 /// address type from this one module — the typed card surface hands out the types it takes.
 pub use flex_rs::address::{ByteOffset, ByteSize};
+/// The replay payload [`Stream::compute_wires`] takes and the wire it is made of — same re-export
+/// rule: the door hands out the types it takes, so the player names every submission type through
+/// this one module.
+pub use flex_rs::compute::ComputeWireBatch;
+pub use flex_rs::control_block_wire::{ControlBlockWire, ResponseTag};
 
 /// One entry of a [`Stream::compute_batch`] list — the owned handles one compute launch
 /// needs. The handles are owned (not borrowed) because a batch outlives the loop that

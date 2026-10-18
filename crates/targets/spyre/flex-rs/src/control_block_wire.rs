@@ -799,6 +799,27 @@ impl ControlBlockWire {
         &mut self.bytes
     }
 
+    /// Replace the CTRL section's response tag in place (#603 PR2's replay
+    /// stage). An image is rendered once at caller-chosen tags; the submit
+    /// path then stamps the tags the `ResponseWorker` actually leased onto
+    /// its copy — the port of the vendor's `cbr->SpecializeTags(raw_tags)`
+    /// (`PrepareCbs`, `response_worker.cpp`), which the immutable
+    /// [`ControlBlockWire`] could not express, so this owns the same field
+    /// through the same [`BitField`] the constructor packs it with: one
+    /// derivation of "tag lives at bits 31:8", never a second.
+    ///
+    /// A mask-and-set, deliberately NOT an add: the canvas was rendered at
+    /// arbitrary tags, so what is being replaced is a baked-in value, not a
+    /// zero. Everything else in word 0 — the barrier bit included — is kept.
+    pub fn set_tag(&mut self, tag: ResponseTag) {
+        let mask = BitField::<31, 8>::MASK;
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&self.bytes[CTRL_SECTION..CTRL_SECTION + 8]);
+        let word = u64::from_le_bytes(w);
+        let word = (word & !mask) | BitField::<31, 8>::pack(tag.0 as u64);
+        self.bytes[CTRL_SECTION..CTRL_SECTION + 8].copy_from_slice(&word.to_le_bytes());
+    }
+
     /// Port of `ControlBlockStream::CreateGraphFreeCompute`: one compute CB
     /// with `xlat[i] = tensor_paddrs[i]` (RW) for each input/output tensor,
     /// `xlat[7] = prog_paddr` (RW), and `cmpt` pointing at `bootstrap_addr`
