@@ -456,6 +456,23 @@ impl Stream {
         self.live()?.synchronize().map_err(HwError::Stream)
     }
 
+    /// Teardown drain — port of the vendor's `drainForTeardown`
+    /// (`runtime_stream.cpp:893`), exposed because it is the safety
+    /// prerequisite for recycling memory a stream's outstanding operations
+    /// still reference (#609): `synchronize` does NOT wait on a stream that
+    /// took a device error (its `needsShutdown` guard returns without
+    /// waiting), so "synchronize said it was idle" is not evidence a failed
+    /// stream's pinned slots are free. This sets shutdown, waits for
+    /// in-flight unconditionally, and surfaces the deferred error exactly
+    /// once. The teardown paths (`RuntimeContext::destroy_stream`, `reset`,
+    /// `RuntimeStream`'s drop) already call it; it is public for callers
+    /// that recycle pinned slots after an errored step and need the same
+    /// guarantee before the stream leaves their hands (#603 PR3's
+    /// in-flight ring).
+    pub fn drain_for_teardown(&self) -> Result<(), HwError> {
+        self.live()?.drain_for_teardown().map_err(HwError::Stream)
+    }
+
     /// ⛔⛔⛔ ASYNC H2D OF `bytes` INTO `addr`. THE LENGTH IS THE HOST SLICE'S — THERE IS NO OTHER FORM.
     ///
     /// A slice is the only form of door — `h2d` and `h2d_on_compute` differ only in which
@@ -712,9 +729,12 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        // `destroy_stream` synchronizes (draining whatever in-flight fences the stream still
-        // owes — resolved ones leave their deque at completion now, `retire_fence`) and itself
-        // logs-and-swallows any deferred error.
+        // `destroy_stream` teardown-drains (`drain_for_teardown`: set
+        // shutdown, wait for in-flight unconditionally — including on a
+        // stream that took a device error, where `synchronize` returns
+        // without waiting — resolved fences leave their deque at
+        // completion now, `retire_fence`) and itself logs-and-swallows any
+        // deferred error.
         let _ = self.rt.destroy_stream(self.id);
     }
 }
