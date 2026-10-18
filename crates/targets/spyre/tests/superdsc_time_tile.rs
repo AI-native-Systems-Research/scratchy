@@ -507,6 +507,412 @@ fn rmsnorm_rinv_is_pinned_lx() {
     );
 }
 
+// ── #645 fix (a), STEP 3: THE OP-LOCAL SLOT ALTERNATION WALK ───────────────────
+//    Two norms of ONE footprint class share ONE top-down slot (pinned above: every
+//    same-class rinv resolves to the same address below LX_PIN_END), so a name's bytes
+//    survive exactly until the next same-class name's program runs. The walk proves the
+//    touching names form CONTIGUOUS RUNS over the bundle's emitted order — per launch
+//    group over its programs, with the run state carried ACROSS groups (a bundle's
+//    launches are ordered on one stream). Every test here drives it the way
+//    `ktir_groups_via_superdsc` does: real `assemble_rmsnorm` chains against one
+//    layout, `per_prog` one (program, descriptor-count) entry per chain, the SAME
+//    partition (`trip_kinds_for` + `group_ranges`) the launch index uses.
+
+/// The walk tests' fixture: one layout holding both norms' operands — x/gamma/eps shared
+/// (placed tensors; the pins are keyed on the OUT), outs `t7` and `t17` — so two real
+/// chains mint two DIFFERENT rinv pins of ONE footprint class ([64, 64] f16 = 8192 B)
+/// into ONE shared slot.
+fn two_norm_layout() -> ktir_superdsc::placement::BundleLayout {
+    use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
+    use scratchy_target_spyre::bundle_code::PlaceId;
+
+    let mut l = BundleLayout::default();
+    let place = |l: &mut BundleLayout, tid: u32, size: u64| {
+        l.ids
+            .borrow_mut()
+            .insert(format!("t{tid}"), PlaceId::Act(tid));
+        l.placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                role: SegRole::Intermediate,
+                segment: 0,
+                bank: 0,
+                offset: 0,
+                size,
+            },
+        );
+    };
+    let xy = 64u64 * 576 * FP16_BYTES;
+    place(&mut l, 1, xy); // x
+    place(&mut l, 2, 576 * FP16_BYTES); // gamma [1, cols]
+    place(&mut l, 3, 64 * FP16_BYTES); // eps [1, stick]
+    place(&mut l, 7, xy); // norm A's out
+    place(&mut l, 17, xy); // norm B's out
+    l
+}
+
+/// One real rmsnorm chain against the fixture's layout: `out` selects the pin (A on `t7`,
+/// B on `t17`), and the SAME out again (with a fresh prefix) is the RETURNING name of the
+/// interleave tests — `synth_lx_op_local` is idempotent per name, so A′'s chain touches
+/// A's pin.
+fn norm(
+    l: &ktir_superdsc::placement::BundleLayout,
+    prefix: &str,
+    out: u32,
+    sym: &mut i64,
+) -> Vec<emit::EmittedOp> {
+    assemble_rmsnorm(
+        prefix,
+        64,
+        576,
+        "t1",
+        "t2",
+        scratchy_target_spyre::bundle_code::PlaceId::Act(out),
+        "t3",
+        None,
+        sym,
+        Some(l),
+    )
+}
+
+#[test]
+fn two_norms_of_one_class_alternate_the_one_shared_slot() {
+    use ktir_superdsc::placement::LX_PIN_END;
+
+    let l = two_norm_layout();
+    let mut sym = 0i64;
+    let a = norm(&l, "a", 7, &mut sym);
+    let b = norm(&l, "b", 17, &mut sym);
+    assert_eq!((a.len(), b.len()), (5, 5), "two five-op chains");
+    // The fixture's own promise: two pin names, ONE footprint class, ONE slot address.
+    let pins = l.lx_op_local_pins();
+    assert_eq!(pins.len(), 2);
+    let pin_of = |n: &str| pins.iter().find(|p| p.0 == n).unwrap();
+    assert_eq!(pin_of("t7_rinv").1, 8192, "the [64, 64] f16 class");
+    assert_eq!(
+        pin_of("t17_rinv").1,
+        pin_of("t7_rinv").1,
+        "one footprint class"
+    );
+    assert_eq!(
+        pin_of("t17_rinv").2,
+        pin_of("t7_rinv").2,
+        "one shared top-down slot"
+    );
+    assert_eq!(pin_of("t7_rinv").2, LX_PIN_END - 8192);
+    // The walk: two programs in order, one name per class each — the accepting shape.
+    let mut ops = a.clone();
+    ops.extend(b.iter().cloned());
+    let per_prog = vec![("rms_a".to_string(), 5), ("rms_b".to_string(), 5)];
+    let ledger = superdsc::walk_lx_slot_alternation(
+        &ops,
+        &per_prog,
+        superdsc::FoldGrouping::Fused,
+        Some(&l),
+    )
+    .unwrap();
+    assert_eq!(ledger.len(), 2, "one ledger row per pin");
+    let row_of = |n: &str| ledger.iter().find(|r| r.name == n).unwrap();
+    for (pin, prog) in [("t7_rinv", "rms_a"), ("t17_rinv", "rms_b")] {
+        let row = row_of(pin);
+        assert_eq!(row.class_bytes, 8192);
+        assert_eq!(row.slot, pin_of(pin).2);
+        assert_eq!(
+            row.touched_by,
+            vec![(prog.to_string(), false), (prog.to_string(), true)],
+            "{pin}: its own program writes it (rmrsqrt) then reads it (rmxn) — no other \
+             program touches it"
+        );
+    }
+    // The walk keys strictly off the layout's pin table: the same ops against no layout (a
+    // layout-less emission mints no pins) and against a layout that declared none both walk
+    // clean and empty.
+    assert!(
+        superdsc::walk_lx_slot_alternation(&ops, &per_prog, superdsc::FoldGrouping::Fused, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        superdsc::walk_lx_slot_alternation(
+            &ops,
+            &per_prog,
+            superdsc::FoldGrouping::Fused,
+            Some(&two_norm_layout())
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+#[test]
+fn the_walk_refuses_one_program_touching_two_same_class_pins() {
+    let l = two_norm_layout();
+    let mut sym = 0i64;
+    let mut ops = norm(&l, "a", 7, &mut sym);
+    ops.extend(norm(&l, "b", 17, &mut sym));
+    // ONE program owning both chains' ops — the shape a collapsed lowering would produce.
+    // Within one program dxp's own scheduler sequences the nodes under no contract we can
+    // cite, so intra-program sharing is not ours to assume: refused outright, both pins named.
+    let per_prog = vec![("rms_pair".to_string(), 10)];
+    let err = superdsc::walk_lx_slot_alternation(
+        &ops,
+        &per_prog,
+        superdsc::FoldGrouping::Fused,
+        Some(&l),
+    )
+    .unwrap_err();
+    assert!(err.contains("same-class op-local LX pins"), "{err}");
+    assert!(err.contains("'rms_pair'"), "{err}");
+    assert!(
+        err.contains("t7_rinv") && err.contains("t17_rinv"),
+        "names both pins of the class: {err}"
+    );
+}
+
+#[test]
+fn the_walk_refuses_a_name_returning_after_its_sibling_took_the_slot() {
+    let l = two_norm_layout();
+    let mut sym = 0i64;
+    let mut ops = norm(&l, "a", 7, &mut sym);
+    ops.extend(norm(&l, "b", 17, &mut sym));
+    ops.extend(norm(&l, "a2", 7, &mut sym)); // A′: A's pin again, a THIRD program
+    let per_prog = vec![
+        ("rms_a".to_string(), 5),
+        ("rms_b".to_string(), 5),
+        ("rms_a2".to_string(), 5),
+    ];
+    let err = superdsc::walk_lx_slot_alternation(
+        &ops,
+        &per_prog,
+        superdsc::FoldGrouping::Fused,
+        Some(&l),
+    )
+    .unwrap_err();
+    assert!(err.contains("touched again"), "{err}");
+    assert!(err.contains("'rms_a2'"), "{err}");
+    assert!(err.contains("t7_rinv"), "names the RETURNING pin: {err}");
+    assert!(
+        err.contains("t17_rinv"),
+        "names the sibling that took the slot: {err}"
+    );
+}
+
+#[test]
+fn the_walk_carries_run_state_across_launch_groups() {
+    let l = two_norm_layout();
+    let mut sym = 0i64;
+    let a = norm(&l, "a", 7, &mut sym);
+    let b = norm(&l, "b", 17, &mut sym);
+    let a2 = norm(&l, "a2", 7, &mut sym);
+    // A trip of ANOTHER kind between the runs — a distinct-slot KV cachewr
+    // (`slot_stride_bytes` = 128, the decode write's head_dim·2) — cuts the partition:
+    // [A's 5 Pure] [the Slot singleton] [B's and A′'s 10 Pure] are THREE launch groups.
+    // The clone binds no op-local pin (A's reduce reads x and writes its mean synth), so it
+    // contributes no touch — only its trip KIND matters.
+    let mut slot = a[0].clone();
+    slot.op_name = "cachewr_slot".to_string();
+    slot.slot_stride_bytes = 128;
+    let mut ops = a.clone();
+    ops.push(slot);
+    ops.extend(b.iter().cloned());
+    let per_prog = vec![
+        ("rms_a".to_string(), 5),
+        ("cachewr".to_string(), 1),
+        ("rms_b".to_string(), 5),
+    ];
+    // Without the returning name, the group boundary alone is NOT a refusal: A's run simply
+    // stays open across the Slot's group and B closes it in the third.
+    let ledger = superdsc::walk_lx_slot_alternation(
+        &ops,
+        &per_prog,
+        superdsc::FoldGrouping::Fused,
+        Some(&l),
+    )
+    .unwrap();
+    assert_eq!(ledger.len(), 2, "A | Slot | B walks clean");
+    // With A′ following B in the LAST group, the refusal fires ONLY because A's run — opened
+    // in the FIRST group — was closed and remembered ACROSS the Slot boundary: were the run
+    // state reset per group, the third group would start empty and A′'s touch would merely
+    // close B's run, with no refusal.
+    ops.extend(a2);
+    let per_prog = vec![
+        ("rms_a".to_string(), 5),
+        ("cachewr".to_string(), 1),
+        ("rms_b".to_string(), 5),
+        ("rms_a2".to_string(), 5),
+    ];
+    let err = superdsc::walk_lx_slot_alternation(
+        &ops,
+        &per_prog,
+        superdsc::FoldGrouping::Fused,
+        Some(&l),
+    )
+    .unwrap_err();
+    assert!(err.contains("touched again"), "{err}");
+    assert!(err.contains("'rms_a2'"), "{err}");
+    assert!(err.contains("t7_rinv"), "names the returning pin: {err}");
+}
+
+// ── THE REAL BUNDLE SHAPE the walk guards: an attention chunk's program followed by a
+//    trailing norm's — the #645 fix (a) emission order (declare pass first, chunk second,
+//    norm's real pass third). The chunk's pins are CORE-LOCAL (per-core scratch), never
+//    op-local, so the op-local ledger carries exactly the trailing norm's rinv; the walk's
+//    acceptance here is the green test that the guard does not refuse the very bundle the
+//    fix exists to enable. The ADMISSION side of the same bundle — the chunk's `lx_form`
+//    budgeting against the declared trailing norm — is pinned in ktir-superdsc's
+//    `zz_the_hd128_chunk_in_lx.rs` (`a_trailing_norms_slot_still_bounds_the_chunk_that_precedes_it`).
+#[test]
+fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
+    use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
+    use ktir_superdsc::place::{PlaceId, SynthRole};
+    use ktir_superdsc::placement::{SegRole, TensorPlacement};
+    use ktir_superdsc::sdsc_abstract::{AttnGeometry, ChunkScratch, PagedKvPool, attn_bundle_rows};
+
+    const NQH: u32 = 32;
+    const NKVH: u32 = 8;
+    const HD: u32 = 128;
+    // The hd128 one-request decode layout (zz_the_hd128_chunk_in_lx's shape): eight placed
+    // activation names for the attention operands, plus the trailing norm's out and eps.
+    let mut layout = ktir_superdsc::placement::BundleLayout {
+        attn_class_hds: vec![HD],
+        ..ktir_superdsc::placement::BundleLayout::default()
+    };
+    let mut names = Vec::new();
+    let ident = ktir_superdsc::reserved_tids::identity_class_tid(0);
+    for (i, tid) in (1..=8u32).chain([900, ident]).enumerate() {
+        let name = PlaceId::Act(tid).to_string();
+        layout
+            .ids
+            .borrow_mut()
+            .insert(name.clone(), PlaceId::Act(tid));
+        names.push(name);
+        layout.placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                role: SegRole::Activation,
+                segment: 3,
+                bank: 0,
+                offset: (i as u64) << 30,
+                size: 1 << 30,
+            },
+        );
+    }
+    let place = |l: &mut ktir_superdsc::placement::BundleLayout, tid: u32, size: u64| {
+        l.ids
+            .borrow_mut()
+            .insert(PlaceId::Act(tid).to_string(), PlaceId::Act(tid));
+        l.placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                role: SegRole::Activation,
+                segment: 3,
+                bank: 0,
+                offset: 40 << 30,
+                size,
+            },
+        );
+    };
+    place(&mut layout, 901, 64 * 576 * FP16_BYTES); // the trailing norm's out
+    place(&mut layout, 902, 64 * FP16_BYTES); // its eps const
+    // ⭐ THE DECLARE PASS'S ACTION, one program EARLY: the trailing norm's whole public
+    //    lowering runs against the shared layout first — throwaway symbols, ops dropped —
+    //    so its rinv pin is in the table before the chunk's admission consults the slot sum.
+    let mut declare_syms = 0i64;
+    let _ = assemble_rmsnorm(
+        "tail",
+        64,
+        576,
+        &names[0],
+        &names[1],
+        PlaceId::Act(901),
+        "t902",
+        None,
+        &mut declare_syms,
+        Some(&layout),
+    );
+    // The chunk: 40 pages, the widest rung the hd128 one-request form admits.
+    let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
+    let rows = attn_bundle_rows(geom, 1, true).expect("the one-request decode rung");
+    let chunk =
+        ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), 40).expect("a chunk");
+    let mut sym = 0i64;
+    let attn_ops = assemble_attn(
+        0,
+        geom,
+        rows,
+        256,
+        256,
+        &names[0],
+        &names[1],
+        &names[2],
+        &names[3],
+        &names[4],
+        &names[5],
+        &names[6],
+        Some(&names[7]),
+        Some(chunk),
+        PlaceId::Act(900),
+        false,
+        false,
+        &mut sym,
+        Some(&layout),
+    )
+    .unwrap_or_else(|e| panic!("assemble_attn refused: {}", e.0));
+    assert!(
+        attn_ops.iter().any(|e| e.op_name.starts_with("attn_cgkt_")),
+        "the chunk's Kᵗ gather copies are present"
+    );
+    // The trailing norm's REAL pass: the same public lowering, its pin already declared.
+    let tail = assemble_rmsnorm(
+        "tail",
+        64,
+        576,
+        &names[0],
+        &names[1],
+        PlaceId::Act(901),
+        "t902",
+        None,
+        &mut sym,
+        Some(&layout),
+    );
+    // THE BUNDLE: the chunk's program, then the norm's — the norm FOLLOWS the chunk in
+    // program order, exactly as the rung lowers.
+    let mut ops = attn_ops.clone();
+    ops.extend(tail.iter().cloned());
+    let per_prog = vec![
+        ("attn_chunk".to_string(), attn_ops.len()),
+        ("rmsnorm_tail".to_string(), tail.len()),
+    ];
+    let ledger = superdsc::walk_lx_slot_alternation(
+        &ops,
+        &per_prog,
+        superdsc::FoldGrouping::Fused,
+        Some(&layout),
+    )
+    .unwrap();
+    assert_eq!(
+        ledger.len(),
+        1,
+        "the chunk's pins are core-local, not op-local"
+    );
+    assert_eq!(
+        ledger[0].name,
+        PlaceId::Act(901).synth(SynthRole::Rinv).to_string(),
+        "the one op-local pin is the trailing norm's rinv"
+    );
+    assert_eq!(
+        ledger[0].touched_by,
+        vec![
+            ("rmsnorm_tail".to_string(), false),
+            ("rmsnorm_tail".to_string(), true)
+        ],
+        "touched only by the norm's own program — the chunk's program never appears"
+    );
+}
+
 // ── SLICE operand (RoPE prerequisite, proven on-card SLICE_RC=0 2026-06-25): a
 //    `.with_offset(n)` operand reads `x[n:]` — its AllocNode startAddr is bumped by
 //    `n·2` bytes. Pins that the offset reaches the emitted startAddr.

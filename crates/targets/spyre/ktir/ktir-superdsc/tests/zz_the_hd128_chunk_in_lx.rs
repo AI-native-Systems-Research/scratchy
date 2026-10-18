@@ -14,8 +14,8 @@
 //! Every pin is one 16 KiB entry per core. All of them must fit `[LX_PIN_BASE, LX_PIN_END)`, the
 //! frontend's share of LX (`FRONTEND_LX_END`), which refuses the 48-, 56- and 64-page rungs.
 
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use ktir_superdsc::place::PlaceId;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_attn, assemble_rmsnorm};
+use ktir_superdsc::place::{PlaceId, SynthRole};
 use ktir_superdsc::placement::{BundleLayout, LX_PIN_BASE, LX_PIN_END, SegRole, TensorPlacement};
 use ktir_superdsc::sdsc_abstract::{
     AttnGeometry, ChunkRowKind, ChunkScratch, PagedKvPool, attn_bundle_rows,
@@ -32,7 +32,11 @@ fn pool() -> PagedKvPool {
     PagedKvPool::new(NKVH as usize, HD as usize)
 }
 
-fn emit(pages: u32) -> Vec<(String, serde_json::Value)> {
+/// The names-and-placements half of [`emit`]: the layout every hd128 emission in this file
+/// starts from, and the placed activation names `assemble_attn` binds. Factored out so the
+/// declare-pass tests can declare op-local pins into the SAME layout before the chunk's
+/// admission runs.
+fn hd_layout() -> (BundleLayout, Vec<String>) {
     let mut layout = BundleLayout {
         attn_class_hds: vec![HD],
         ..BundleLayout::default()
@@ -58,6 +62,18 @@ fn emit(pages: u32) -> Vec<(String, serde_json::Value)> {
             },
         );
     }
+    (layout, names)
+}
+
+/// The emission half of [`emit`]: one 40-page-class chunk against a caller-supplied layout,
+/// whose op-local pin slots the caller may already have declared. The chunk's `lx_form`
+/// admission reads the layout's FINAL slot sum (`lx_op_local_slot_bytes`), so what this
+/// returns is the verdict of that budget.
+fn emit_chunk(
+    layout: &BundleLayout,
+    names: &[String],
+    pages: u32,
+) -> Vec<(String, serde_json::Value)> {
     let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
     let rows = attn_bundle_rows(geom, 1, true).expect("the one-request decode rung");
     let chunk = ChunkScratch::of_chunk(pool(), pages).expect("a chunk granite-8b admits");
@@ -81,7 +97,7 @@ fn emit(pages: u32) -> Vec<(String, serde_json::Value)> {
         false,
         false,
         &mut sym,
-        Some(&layout),
+        Some(layout),
     )
     .unwrap_or_else(|e| panic!("pages={pages}: assemble_attn refused: {}", e.0))
     .iter()
@@ -94,6 +110,11 @@ fn emit(pages: u32) -> Vec<(String, serde_json::Value)> {
         (name, v)
     })
     .collect()
+}
+
+fn emit(pages: u32) -> Vec<(String, serde_json::Value)> {
+    let (l, names) = hd_layout();
+    emit_chunk(&l, &names, pages)
 }
 
 fn lx_only(v: &serde_json::Value) -> bool {
@@ -201,6 +222,179 @@ fn the_op_local_pin_slots_refuse_a_chunk_the_window_no_longer_holds() {
             .lx_form(ChunkRowKind::OneRequest, headroom)
             .is_none()
     );
+}
+
+/// How many of the chunk's Kᵗ gather copies stayed in LX, and how many fell to the HBM
+/// scratch — the emission-level verdict of the chunk's `lx_form` admission (an admitted
+/// rung's copies write core-local pins; a refused rung's copies all land in HBM).
+fn lx_kt_copies(ops: &[(String, serde_json::Value)]) -> (usize, usize) {
+    let mut lx = 0;
+    let mut hbm = 0;
+    for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_cgkt_")) {
+        let body = &v["dscs_"][0][name];
+        let out = body["labeledDs_"].as_array().unwrap().last().unwrap();
+        if lx_only(out) {
+            lx += 1;
+        } else {
+            hbm += 1;
+        }
+    }
+    (lx, hbm)
+}
+
+/// ⭐⭐ THE DECLARE PASS'S PROMISE, FROM THE CHUNK'S SIDE OF IT (#645 fix (a)'s commit 2
+/// reliance): a norm whose program FOLLOWS the chunk in program order is ALREADY in the
+/// layout when the chunk's `lx_form` admission runs. The declare pass lowers every op of the
+/// rung against the shared layout BEFORE any real pass (`lower_subtile_tape_to_ktir`: "this
+/// declares, it does not emit"), so the chunk budgets against the FINAL op-local slot sum,
+/// never a mid-walk projection. Pinned at the widest admitted rung — 40 pages, 1,179,648 B of
+/// gather pins plus a 2,560 B probability-part pin — where a trailing norm's `[2438, 64]`
+/// rinv class is EXACTLY the rung's true remaining window: the chunk still admits and keeps
+/// Kᵗ in LX, while the same norm at 2459 rows (past the witness's own headroom) refuses the
+/// rung to HBM. Nothing differs between the two legs but the trailing norm's class size, so
+/// the refusal IS the proof the chunk's admission read the trailing norm's slot. If the
+/// declare pass were ever skipped for a rung, the chunk would admit against too small a sum —
+/// the companion test below shows that world fails LOUDLY, in the pin allocator's own window
+/// assert, at build.
+///
+/// ⚠️ KNOWN BLIND SPOT BETWEEN THE TWO BOUNDARIES (found by this test, reported to the lead;
+/// deliberately NOT pinned as a `should_panic` — a green panic test would pin the divergence
+/// as correct): the witness's core-local term counts the GATHER pins only, while the emission
+/// also core-locally pins the probability-part scratch (`ChunkESub`, 2,560 B at this rung —
+/// attn.rs's `synth_lx_core_local` after the gathers). So for classes in
+/// (312,064 ..= 314,624] B — rows 2439..=2458 — the witness ADMITS the LX form but the
+/// allocator's `cesub` mint then PANICS past the window: a hard build failure where the
+/// design contract ("this chunk form being refused there instead is the designed
+/// alternative, not this panic") wants the graceful HBM fall. No model's real geometry sits
+/// in that 20-row band today (the 26b's rinv classes are 64 KiB at mq=512, far below it);
+/// closing it means threading the probability-part slice into `lx_form`'s budget the way
+/// commit 2 threaded the op-local term — the lead's ruling.
+#[test]
+fn a_trailing_norms_slot_still_bounds_the_chunk_that_precedes_it() {
+    // Control: with no op-local slots declared, the 40-page rung keeps Kᵗ whole in LX —
+    // forty (part, kv head) copies (5 parts × 8 kv heads), no HBM leg.
+    assert_eq!(
+        lx_kt_copies(&emit(40)),
+        (40, 0),
+        "the control: no op-local term"
+    );
+
+    // One leg of the boundary: the trailing norm's whole public lowering against the shared
+    // layout FIRST — the declare pass's own action, throwaway symbols, ops dropped (only the
+    // layout is wanted) — then the chunk whose admission must budget against it.
+    fn declared_chunk(rows: u32) -> (BundleLayout, Vec<String>, Vec<(String, serde_json::Value)>) {
+        let (mut l, names) = hd_layout();
+        // The trailing norm's operands: its out and its eps const, placed beside the chunk's.
+        for (tid, size) in [(901u32, 2459 * 576 * 2), (902, 64 * 2)] {
+            l.ids
+                .borrow_mut()
+                .insert(PlaceId::Act(tid).to_string(), PlaceId::Act(tid));
+            l.placements.insert(
+                tid,
+                TensorPlacement {
+                    tid,
+                    role: SegRole::Activation,
+                    segment: 3,
+                    bank: 0,
+                    offset: 40 << 30,
+                    size,
+                },
+            );
+        }
+        let mut declare_syms = 0i64;
+        let _ = assemble_rmsnorm(
+            "tail",
+            rows,
+            576,
+            &names[0],
+            &names[1],
+            PlaceId::Act(901),
+            "t902",
+            None,
+            &mut declare_syms,
+            Some(&l),
+        );
+        let ops = emit_chunk(&l, &names, 40);
+        (l, names, ops)
+    }
+
+    // AT the allocator's boundary: the class is exactly the window left past the chunk's
+    // FULL core-local footprint (1,179,648 B of gathers + the 2,560 B probability-part pin),
+    // and the chunk's admission still holds — Kᵗ stays in LX with the trailing norm's slot
+    // fully present in the budget.
+    let (l_at, names_at, ops_at) = declared_chunk(2438);
+    assert_eq!(
+        l_at.lx_op_local_slot_bytes(),
+        312_064,
+        "the [2438, 64] rinv class is exactly the window past the chunk's full core-local \
+         footprint"
+    );
+    assert_eq!(
+        lx_kt_copies(&ops_at),
+        (40, 0),
+        "the chunk kept Kᵗ in LX with the trailing norm's slot in the budget"
+    );
+    // The trailing norm's REAL pass, after the chunk: its pin is already declared, so the
+    // pin table is unchanged — first-one-wins, the same address the declare pass fixed.
+    let pins_before = l_at.lx_op_local_pins();
+    let mut real_syms = 0i64;
+    let tail = assemble_rmsnorm(
+        "tail",
+        2438,
+        576,
+        &names_at[0],
+        &names_at[1],
+        PlaceId::Act(901),
+        "t902",
+        None,
+        &mut real_syms,
+        Some(&l_at),
+    );
+    assert_eq!(tail.len(), 5, "the trailing norm's real pass lowers");
+    assert_eq!(
+        l_at.lx_op_local_pins(),
+        pins_before,
+        "the real pass finds the pin already declared — same name, same class, same slot"
+    );
+
+    // PAST the witness's own headroom (314,624 B — the gather pins alone): the chunk's
+    // admission refuses the rung — every Kᵗ copy falls to the HBM scratch. This leg differs
+    // from the admitted one only in the trailing norm's row count, so the refusal is the
+    // admission reading THAT term.
+    let (l_past, _, ops_past) = declared_chunk(2459);
+    assert_eq!(l_past.lx_op_local_slot_bytes(), 314_752);
+    assert_eq!(
+        lx_kt_copies(&ops_past),
+        (0, 40),
+        "Kᵗ whole in the HBM scratch — the rung the trailing norm refused"
+    );
+}
+
+/// The declare-pass-SKIPPED world, made loud: with the chunk's core-local pins minted first
+/// (the chunk admitted against an EMPTY op-local term), the trailing norm's own pin mint
+/// meets them inside the frontend's LX window. At the boundary the mint still fits — the
+/// allocator's guard reads the same `lx_window_fits` `<=` the witness does — and one stick of
+/// class past it PANICS, at build. `#[should_panic]` is the honest shape here (the same class
+/// as `reserved_tids`' overflow guard): the assert is a `cargo build` gate the bake hits, so
+/// a rung whose declare pass was skipped cannot ship silently and collide on card.
+#[test]
+#[should_panic(expected = "op-local LX slots meet the core-local pins")]
+fn a_norm_minted_after_the_chunk_fails_loudly_not_on_card() {
+    // The boundary's quiet side, from the allocator's own guard: with the chunk's full
+    // core-local footprint minted first (1,179,648 B of gathers + the 2,560 B
+    // probability-part pin — the chunk admitted against an EMPTY op-local term, the
+    // declare-pass-skipped world), the [2438, 64] class fits EXACTLY past it — no panic,
+    // the same `lx_window_fits` `<=` the witness reads.
+    let (l, names) = hd_layout();
+    let _ = emit_chunk(&l, &names, 40);
+    l.synth_lx_op_local(PlaceId::Act(901).synth(SynthRole::Rinv), &[2438, 64]);
+    // One stick of class past it, in the same world on a fresh layout (so the overage is the
+    // class's own 128 B, not the first leg's): the op-local slot meets the core-local pins
+    // inside the window and the mint PANICS here — the loud failure that makes the declare
+    // pass's ordering a build-time law rather than a card-time hope.
+    let (l2, names2) = hd_layout();
+    let _ = emit_chunk(&l2, &names2, 40);
+    l2.synth_lx_op_local(PlaceId::Act(903).synth(SynthRole::Rinv), &[2439, 64]);
 }
 
 /// ⭐⭐⭐ EVERY LX COPY AND ITS CONSUMER MEET AT ONE PIN, read off the emitted descriptors at every rung.

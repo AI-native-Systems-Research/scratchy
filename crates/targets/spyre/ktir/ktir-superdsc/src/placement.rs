@@ -640,6 +640,23 @@ impl BundleLayout {
         self.lx.borrow().core_local.contains(name)
     }
 
+    /// ⭐ THE OP-LOCAL PIN TABLE — one row per shared-slot pin, `(name, class bytes, slot address)`,
+    /// name-sorted. THE alternation walk's and the dump ledger's whole view of the op-local family:
+    /// the class is the row's `bytes` (the footprint IS the class key, [`LxAlloc::op_local_slots`]),
+    /// and every name of one class carries the same slot address. Empty for a bundle that declares
+    /// no op-local pins — the walk's own no-op case.
+    pub fn lx_op_local_pins(&self) -> Vec<(String, u64, u64)> {
+        let a = self.lx.borrow();
+        a.op_local
+            .iter()
+            .map(|name| {
+                let fp = a.sizes[name];
+                let slot = a.map[name];
+                (name.clone(), fp, slot)
+            })
+            .collect()
+    }
+
     /// ⛔ THE CORE-LOCAL READ LAW, at build: the FIRST op to touch core-local `name` records its work
     /// division (`signature`); every later op must present the same one, or this is an `Err` naming both.
     /// A different division hands core `c` a slice core `c`'s producer never wrote — fluent garbage on
