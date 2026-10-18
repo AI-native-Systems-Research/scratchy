@@ -8880,22 +8880,29 @@ mod tests {
 
     #[test]
     fn tiled_matmul_concrete_unrolls() {
-        // 64×16384×2048 at TWO kernel batches overflows LX → time-tiled. A `y`-batched matmul keeps
-        // the frontend's LX trips (`MatmulStaging::FrontendTrips`); the same shape UNBATCHED is handed
-        // to dxp whole, in one descriptor, which this asserts first.
+        // A `y`-batched matmul keeps the frontend's LX trips (`MatmulStaging::FrontendTrips`), and the
+        // only one the build admits contracts ONE stick (`matmul_opspec_split`'s refusal). So this is
+        // the card-validated batched form of the (ii) bmm, `in = 64` at 16 kernel batches, widened in N
+        // until its per-core kernel slab (`in · out · batch`) overflows LX: at most 32 cores leave
+        // every core ≥ 1024 `out` columns, 2 MiB of kernel. The same shape UNBATCHED is handed to dxp
+        // whole, in one descriptor, which this asserts first.
+        let (m, n, k, batch) = (64, 32768, 64, 16);
         let whole = assemble_matmul(
             "matmul_o7",
-            64,
-            16384,
-            2048,
+            m,
+            n,
+            k,
             1,
-            &rb("a", 64, 2048),
-            &Stk::<KernelTag>::kernel(2048, 16384, "w"),
-            &rb("o", 64, 16384),
+            &rb("a", m, k),
+            &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
+            &rb("o", m, n),
             None,
         );
         assert_eq!(whole.time, 1, "an unbatched fp16 matmul is staged by dxp");
-        let emitted = assemble_matmul(
+        // The shape this test drove before the refusal, 64×16384×2048 at two kernel batches: a
+        // 32-stick contraction under a `y` batch, the form measured incoherent on granite-3.1-8b.
+        // It is a build error now, and the error names why.
+        let refused = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::try_assemble_matmul_seeded(
             "matmul_o7",
             64,
             16384,
@@ -8904,6 +8911,26 @@ mod tests {
             &rb("a", 64, 2048),
             &Stk::<KernelTag>::kernel(2048, 16384, "w"),
             &rb("o", 64, 16384),
+            &mut 0,
+            None,
+        )
+        .err()
+        .expect("a y-batched multi-stick contraction must be refused");
+        assert!(
+            refused.contains(
+                "a y-batched (batch 2) shared-kernel matmul contracts 2048 elements, 32 sticks"
+            ) && refused.contains("card-validated only at a one-stick contraction"),
+            "the refusal names the shape and the reason: {refused}"
+        );
+        let emitted = assemble_matmul(
+            "matmul_o7",
+            m,
+            n,
+            k,
+            batch,
+            &rb("a", m, k),
+            &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
+            &rb("o", m, n),
             None,
         );
         let n = emitted.time;

@@ -3,7 +3,11 @@
 //!
 //! ⭐ An unbatched fp16 matmul is now handed to dxp whole (`MatmulStaging::Dxp`), so the dense
 //! `down_proj` is ONE descriptor and has no trips. The advance below is the one every matmul that KEEPS
-//! the frontend's LX trips (a `y`-batched one, an fp8 one) runs, checked at the same K=12800 contraction.
+//! the frontend's LX trips runs, checked on the shipped one that does at this K=12800 contraction: the
+//! fp8 `down_proj` (`MatmulStaging::FrontendTrips` for fp8 operands), emitted exactly as the fp8
+//! lowering emits it (`ktir_matmul_fp8`'s `fq_mm`). A `y`-batched fp16 matmul at this contraction is no
+//! longer a form the build admits — 200 sticks under a `y` batch is the shape measured incoherent on
+//! granite-3.1-8b — and that refusal is pinned here too, so the old fixture cannot quietly return.
 //! A wrong advance writes trips on top of each other or past the tensor, and the symptom would be a
 //! partially-correct output every layer — output that stays fluent and drifts.
 //!
@@ -20,27 +24,62 @@
 //! a DIFFERENT dataspace and reported every trip starting at 0. Keying on the output's `ldsIdx_` is
 //! what makes it a gate rather than a false alarm.)
 
-use ktir_superdsc::emit::rb;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_matmul;
-use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
+use ktir_superdsc::emit::{EmittedOp, emit_sdsc_tiled, rb};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
+    SharedKernelBmmForm, assemble_matmul, matmul_opspec_off_operands, try_assemble_matmul_seeded,
+};
+use scratchy_subtile::sdsc_abstract::{KernelTag, MatK, MatM, MatN, MatY, QueryRowCount, Stk};
+use scratchy_subtile::superdsc_opspec::{Df, Fp16, Role, SdscFoldSet};
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::concrete_trips;
 
-/// Core-0 start address of each trip's OUTPUT dataspace, in elements, for the shape at `batch` kernel
-/// batches. Unbatched, an fp16 matmul is handed to dxp whole (`MatmulStaging::Dxp`), so it is ONE trip;
-/// a `y`-batched one keeps the frontend's LX trips — the only fp16 matmuls whose advance still runs.
-fn trip_output_starts(m: u32, n: u32, k: u32, batch: u32) -> Vec<i64> {
-    let e = assemble_matmul(
+/// The fp16 `down_proj` at `m × n × k`, unbatched — handed to dxp whole (`MatmulStaging::Dxp`).
+fn fp16_down_proj(m: u32, n: u32, k: u32) -> EmittedOp {
+    assemble_matmul(
         "dp",
         m,
         n,
         k,
-        batch,
+        1,
         &rb("a", m, k),
         &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
         &rb("o", m, n),
         None,
-    );
-    concrete_trips(&e)
+    )
+}
+
+/// The fp8 `down_proj` at `m × n × k`, built the way the fp8 lowering builds its `fq_mm`: the fp16
+/// geometry with both operands' LX residency charged one byte (`operand_df`), the non-output operands
+/// then stamped `Df::Fp8` on the wire, and the op emitted on its own plan's cores. fp8 keeps the
+/// frontend's LX trips (`MatmulStaging::of`), so this is the shipped matmul whose advance runs.
+fn fp8_down_proj(m: u32, n: u32, k: u32) -> EmittedOp {
+    let mut spec = matmul_opspec_off_operands::<Fp16>(
+        MatM::of_token_rows(m),
+        MatN::of_out_features(n),
+        MatK::of_in_features(k),
+        MatY::unbatched(),
+        // Token rows, never a request batch: the row-kind boundary yields the proven walk.
+        SharedKernelBmmForm::of_attn_rows(false, QueryRowCount::of_mq(1)),
+        "a",
+        "w",
+        "o",
+        0,
+        0,
+        0,
+        Df::Fp8,
+    )
+    .expect("the fp8 down_proj is emittable");
+    for arg in &mut spec.args {
+        if !matches!(arg.view().role, Role::Output) {
+            arg.set_df(Df::Fp8);
+        }
+    }
+    let folds = SdscFoldSet::new(spec.iter.cores_used());
+    emit_sdsc_tiled("dp", &spec, &folds, &mut 0, None).expect("the fp8 down_proj emits")
+}
+
+/// Core-0 start address of each trip's OUTPUT dataspace, in elements.
+fn trip_output_starts(e: &EmittedOp) -> Vec<i64> {
+    concrete_trips(e)
         .iter()
         .filter_map(|op| {
             op.dscs_.iter().find_map(|dm| {
@@ -65,10 +104,35 @@ fn trip_output_starts(m: u32, n: u32, k: u32, batch: u32) -> Vec<i64> {
 /// silently-wrong output the emitter's own comment warns about at "design risk #4".
 #[test]
 fn the_8b_down_proj_trips_advance_and_do_not_alias() {
-    // Unbatched it is dxp-staged, one descriptor: nothing to advance.
-    assert_eq!(trip_output_starts(31, 4096, 12800, 1).len(), 1);
-    // At two kernel batches the same K=12800 contraction takes the reduction-split repair AND trips.
-    let starts = trip_output_starts(31, 4096, 12800, 2);
+    // fp16 and unbatched it is dxp-staged, one descriptor: nothing to advance.
+    assert_eq!(
+        trip_output_starts(&fp16_down_proj(31, 4096, 12800)).len(),
+        1
+    );
+    // The same K=12800 contraction at two kernel batches, the shape this test drove before the
+    // one-stick refusal: 200 sticks under a `y` batch. It is a build error now, naming why.
+    let refused = try_assemble_matmul_seeded(
+        "dp",
+        31,
+        4096,
+        12800,
+        2,
+        &rb("a", 31, 12800),
+        &Stk::<KernelTag>::kernel(12800, 4096, "w"),
+        &rb("o", 31, 4096),
+        &mut 0,
+        None,
+    )
+    .err()
+    .expect("a y-batched multi-stick contraction must be refused");
+    assert!(
+        refused.contains(
+            "a y-batched (batch 2) shared-kernel matmul contracts 12800 elements, 200 sticks"
+        ) && refused.contains("card-validated only at a one-stick contraction"),
+        "the refusal names the shape and the reason: {refused}"
+    );
+    // The fp8 down_proj keeps the frontend's trips, and it is the shipped one at this contraction.
+    let starts = trip_output_starts(&fp8_down_proj(31, 4096, 12800));
     assert!(
         starts.len() > 1,
         "this shape must be multi-trip, got {} trip(s)",
@@ -100,5 +164,6 @@ fn the_8b_down_proj_trips_advance_and_do_not_alias() {
 /// not a comment that can drift.
 #[test]
 fn the_2b_down_proj_is_a_single_trip() {
-    assert_eq!(trip_output_starts(31, 2048, 8192, 1).len(), 1);
+    assert_eq!(trip_output_starts(&fp16_down_proj(31, 2048, 8192)).len(), 1);
+    assert_eq!(trip_output_starts(&fp8_down_proj(31, 2048, 8192)).len(), 1);
 }
