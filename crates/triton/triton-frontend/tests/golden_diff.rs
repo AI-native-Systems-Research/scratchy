@@ -165,6 +165,14 @@ fn moe_matches_golden() {
     check_case(&common::moe());
 }
 
+/// The PROMPT MoE kernel (`kernels/moe_prefill.py`): `moe.py`'s router over a token tile,
+/// a dense `[T, E]` route, and every expert swept with direct slab loads. The golden is
+/// real Triton's `make_ir` of the shipped kernel file.
+#[test]
+fn moe_prefill_matches_golden() {
+    check_case(&common::moe_prefill());
+}
+
 /// Granite's RMSNorm: a `tl.sum` reduction (which brings in two generated `standard.*`
 /// functions and a `tt.reduce` region), the `math.rsqrt` inside its f32 island, and a
 /// broadcast of a 1D weight along the rows -- `tt.expand_dims` on BOTH axes, which no earlier

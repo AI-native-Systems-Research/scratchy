@@ -289,6 +289,57 @@ pub fn moe() -> Case {
     )
 }
 
+/// `kernels/moe_prefill.py`'s signature: `moe.py`'s first twelve, then the dense route.
+const MOE_PREFILL: &[(&str, &str)] = &[
+    ("desc_xr", "*fp16"),
+    ("desc_rg", "*fp16"),
+    ("desc_rw", "*fp16"),
+    ("desc_pes", "*fp16"),
+    ("desc_xe", "*fp16"),
+    ("desc_wg", "*fp8e4nv"),
+    ("desc_sg", "*fp16"),
+    ("desc_wu", "*fp8e4nv"),
+    ("desc_su", "*fp16"),
+    ("desc_wd", "*fp8e4nv"),
+    ("desc_sd", "*fp16"),
+    ("desc_o", "*fp16"),
+    ("desc_dense", "*fp16"),
+    ("T", "constexpr"),
+    ("H", "constexpr"),
+    ("I", "constexpr"),
+    ("E", "constexpr"),
+    ("K", "constexpr"),
+    ("EPS", "constexpr"),
+    ("INV_H", "constexpr"),
+    ("TEMP", "constexpr"),
+    ("INV_QMAX", "constexpr"),
+    ("SCALE_FLOOR", "constexpr"),
+];
+
+/// The prompt MoE kernel at the golden's geometry: 16 prompt rows, `E = 64`, `K = 8`,
+/// `H = 128`, `I = 64` — `moe()`'s widths with a token tile in place of one token.
+pub fn moe_prefill() -> Case {
+    let h = 128.0f64;
+    build(
+        "moe_prefill",
+        "spyre/moe_prefill",
+        "moe_prefill_fwd",
+        MOE_PREFILL,
+        &[
+            ("T", Val::Int(16)),
+            ("H", Val::Int(128)),
+            ("I", Val::Int(64)),
+            ("E", Val::Int(64)),
+            ("K", Val::Int(8)),
+            ("EPS", Val::Float(1e-6)),
+            ("INV_H", Val::Float(1.0 / h)),
+            ("TEMP", Val::Float(h.powf(-0.5))),
+            ("INV_QMAX", Val::Float(1.0 / 448.0)),
+            ("SCALE_FLOOR", Val::Float(1.0 / 448.0 / 448.0)),
+        ],
+    )
+}
+
 /// `rmsnorm.py`'s `SIGNATURE`.
 const RMSNORM: &[(&str, &str)] = &[
     ("desc_x", "*fp16"),
