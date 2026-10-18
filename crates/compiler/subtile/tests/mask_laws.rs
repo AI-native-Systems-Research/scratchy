@@ -590,8 +590,16 @@ fn padding_row_replicates_live_0(real: usize) {
     }
 
     // ── THE NEW-BLOCK (CAUSAL) MASK ROW ───────────────────────────────────────────────────────────
-    // `[mq, mq_pad]` row-major, exactly as the worker stages it and the emitter reads it.
-    let cmask = rows.new_block_mask(mask_neg);
+    // `[mq, mq_pad]` row-major, exactly as the worker stages it and the emitter reads it — built from
+    // the launch's KEY, the only door the worker stages it through.
+    let cmask = scratchy_subtile::sdsc_abstract::CausalKey::batch(&rows)
+        .expect("a live batch has a key")
+        .mask();
+    assert_eq!(
+        scratchy_subtile::sdsc_abstract::ATTN_MASK_NEG.to_bits(),
+        mask_neg.to_bits(),
+        "the key's mask carries this test's -inf"
+    );
     let mq_pad = mq.div_ceil(64) * 64;
     assert_eq!(cmask.len(), mq * mq_pad, "one row per bound slot");
     for pad in real..mq {

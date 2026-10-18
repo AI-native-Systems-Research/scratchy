@@ -114,8 +114,13 @@ pub struct ForwardInputs<'a, Valid: Fn(usize) -> bool> {
     /// ABSOLUTE rotary position per row — a row's real position in ITS sequence, which for a
     /// decode batch is not its row index.
     pub positions: &'a [u32],
-    /// `[rows, mq_pad]` causal validity from the regime's own `new_block_mask`.
-    pub causal: &'a [f32],
+    /// ⭐ WHICH new-block causal mask this launch runs — the KEY, not the mask. The mask is
+    /// [`CausalKey::mask`]'s, built from the key alone, so no fact the key leaves out can reach it;
+    /// and a session whose staged mask already has this key re-binds nothing
+    /// ([`ForwardKernel::CausalMask`]'s step is skipped by the launcher).
+    ///
+    /// [`CausalKey::mask`]: scratchy_subtile::sdsc_abstract::CausalKey::mask
+    pub causal: scratchy_subtile::sdsc_abstract::CausalKey,
     /// Prefix validity. `None` when the bundle placed no mask at all, in which case the shape
     /// carries no `PrefixMask` step either.
     pub prefix: Option<PrefixSource<'a, Valid>>,
@@ -287,13 +292,26 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
                 col
             }
         }
-        ForwardKernel::CausalMask => causal_tiled(
-            inp.causal,
-            rows,
-            inp.mq_pad,
-            inp.num_q_heads,
-            inp.causal_heads_per_block,
-        ),
+        ForwardKernel::CausalMask => {
+            // The key names its own rows; a key for another rung would tile a mask the placement
+            // was not sized for.
+            if inp.causal.rows() != rows || inp.causal.rows_pad() != inp.mq_pad {
+                return Err(format!(
+                    "causal mask keyed {:?} ({} x {}) for a {rows}-row launch read {} wide",
+                    inp.causal,
+                    inp.causal.rows(),
+                    inp.causal.rows_pad(),
+                    inp.mq_pad
+                ));
+            }
+            causal_tiled(
+                &inp.causal.mask(),
+                rows,
+                inp.mq_pad,
+                inp.num_q_heads,
+                inp.causal_heads_per_block,
+            )
+        }
         ForwardKernel::PrefixMask => unreachable!("served above, where its dtype is decided"),
         ForwardKernel::Const(_) => unreachable!("served above, where it is borrowed not built"),
         ForwardKernel::KvBlockIndex => unreachable!("served above, where it stays an INTEGER"),
@@ -812,13 +830,19 @@ mod tests {
             embed_tokens: &[],
             tokens: &[],
             positions: &[],
-            causal: &[],
+            causal: one_row_key(),
             prefix: None,
             consts: &[],
             mask_neg: -1.0,
             stick_major: false,
             kv_blocks: None,
         }
+    }
+
+    /// The one-row, one-real-row chunk key a solo decode step binds.
+    fn one_row_key() -> scratchy_subtile::sdsc_abstract::CausalKey {
+        use scratchy_subtile::sdsc_abstract::{CausalKey, RungWidth};
+        CausalKey::chunk(RungWidth::of_baked_rows(1).expect("a width"), 1).expect("a key")
     }
 
     /// ⭐ THE ORDER IS THE CONTRACT. A forward binds the embedding row, then
@@ -994,7 +1018,7 @@ mod tests {
             embed_tokens: &[0.0; 64],
             tokens: &[0],
             positions: &[0],
-            causal: &[0.0; 64],
+            causal: one_row_key(),
             prefix: Some(PrefixSource::Broadcast {
                 cap: 8,
                 holds: |c: usize| c < 3,
@@ -1069,9 +1093,87 @@ mod tests {
         assert_eq!(by_history[5], neg, "the hole is NOT");
     }
 
+    /// ⭐⭐⭐ THE KEY IS THE WHOLE MASK. `CausalKey::mask` replaced both laws' builders — the prompt
+    /// chunk's clamped triangle (`row_logical_pos` composed with `prefill_causal_col_valid`) and
+    /// the decode batch's diagonal with padding at live 0's column — so it must reproduce each, BYTE
+    /// FOR BYTE, at every (rows, real) and (rows, live) a rung runs. Each `want` below is the law as
+    /// it was written before the key existed, inline; equal to it everywhere is what makes "the
+    /// session already holds this key" mean "the device already holds this mask".
+    #[test]
+    fn the_causal_key_reproduces_both_new_block_laws_byte_for_byte() {
+        use scratchy_subtile::sdsc_abstract::{
+            ATTN_MASK_NEG, CausalKey, ChunkRows, RungWidth, decode_batch_causal_col_valid,
+            prefill_causal_col_valid,
+        };
+        let neg = -(half::f16::MAX.to_f32() / 2.0);
+        assert_eq!(
+            ATTN_MASK_NEG.to_bits(),
+            neg.to_bits(),
+            "the const is the staged value"
+        );
+        // Rung widths across both ladders and both sides of a stick, plus the one-row decode key.
+        for rows in [1u32, 7, 35, 63, 64, 65, 128, 192, 256, 512] {
+            let w = RungWidth::of_baked_rows(rows).expect("a width");
+            let (mq, mq_pad) = (rows as usize, (rows as usize).div_ceil(64) * 64);
+            let chunk = ChunkRows::chunk(w.rows());
+            for real in [1usize, mq / 2 + 1, mq.saturating_sub(1).max(1), mq] {
+                let key = CausalKey::chunk(w, real).expect("1 <= real <= rows");
+                let mut want = vec![neg; mq * mq_pad];
+                for r in 0..mq {
+                    let pos = chunk.row_logical_pos(r, real);
+                    for c in 0..mq_pad {
+                        if prefill_causal_col_valid(c, pos) {
+                            want[r * mq_pad + c] = 0.0;
+                        }
+                    }
+                }
+                assert_eq!(key.mask(), want, "chunk rows {rows} real {real}");
+                // A batch over the same rows is the diagonal; padding slots take live 0's column.
+                let live = real;
+                let mut want = vec![neg; mq * mq_pad];
+                for r in 0..mq {
+                    let col = if r < live { r } else { 0 };
+                    for c in 0..mq_pad {
+                        if decode_batch_causal_col_valid(c, col) {
+                            want[r * mq_pad + c] = 0.0;
+                        }
+                    }
+                }
+                let key = CausalKey::Batch {
+                    rows: w,
+                    live: std::num::NonZeroU32::new(live as u32).expect("live >= 1"),
+                };
+                assert_eq!(key.mask(), want, "batch rows {rows} live {live}");
+            }
+            assert!(CausalKey::chunk(w, 0).is_none(), "no real row is no launch");
+            assert!(
+                CausalKey::chunk(w, mq + 1).is_none(),
+                "more real rows than the rung"
+            );
+        }
+    }
+
+    /// ⭐⭐ A HELD KEY STAGES NOTHING, A NEW KEY STAGES ITS MASK. Two keys that differ only in
+    /// `real` are different masks (the last baked row's extent moves), which is why a session keys
+    /// by both facts and never by the rung alone.
+    #[test]
+    fn a_partial_chunk_is_a_different_key_and_a_different_mask() {
+        use scratchy_subtile::sdsc_abstract::{CausalKey, RungWidth};
+        let w = RungWidth::of_baked_rows(512).expect("a width");
+        let full = CausalKey::chunk(w, 512).expect("a key");
+        let partial = CausalKey::chunk(w, 400).expect("a key");
+        assert_ne!(full, partial);
+        assert_ne!(full.mask(), partial.mask());
+        assert_eq!(
+            full,
+            CausalKey::chunk(w, 512).expect("a key"),
+            "keys compare by value"
+        );
+    }
+
     /// ⭐⭐ THE SECOND LEMMA. The decode binder built its causal mask as its own `[nqh, mq_pad]`
     /// loop over `prefill_causal_col_valid(col, 0)`; prefill builds a `[mq, mq_pad]` block via
-    /// `ChunkRows::new_block_mask` and tiles it block-major. This pins that the first is the
+    /// `CausalKey::mask` and tiles it block-major. This pins that the first is the
     /// second at one row — so the decode loop is deletable rather than a convention to maintain.
     #[test]
     fn the_decode_causal_buffer_is_the_general_tiling_at_one_row() {

@@ -278,10 +278,20 @@ pub(crate) fn run_prefill_batch(
     // whole attention is live 0's. The chunk clamp is the wrong law for a padding request row: it hands
     // it column `real - 1`, the LAST live request's new token, which makes it a different computation
     // from live 0 and therefore a different set of bytes into live 0's cell.
-    let cmask = match &per_request {
-        Some((rows, _)) => rows.new_block_mask(mask_neg),
-        None => chunk.new_block_mask(real, mask_neg),
-    };
+    //
+    // ⭐ AND THE LAW IS NOW A KEY, NOT A BUFFER: the mask is a function of (rung, real) for a chunk and
+    // (rung, live) for a batch and of nothing else, so `CausalKey` names it and `CausalKey::mask` is
+    // its one builder. A session that holds this key already holds this mask (`keyed_holds`), and the
+    // launch builds and binds nothing for it.
+    let causal = match &per_request {
+        Some((rows, _)) => scratchy_subtile::sdsc_abstract::CausalKey::batch(rows),
+        None => scratchy_subtile::sdsc_abstract::CausalKey::chunk(prefill_m, real),
+    }
+    .ok_or_else(|| {
+        werr(format!(
+            "run_prefill_batch: no causal key for {real} of {mq} rows"
+        ))
+    })?;
     // TILED PER HEAD (2026-07-28, STAGE 2 of the batched-over-heads attention rewrite,
     // ir::bridge::tiled_op_sdsc_op::attn): the unified emitter now reads cmask batched over ALL
     // `nqh*mq` rows in one op (rows=nqh*mq), not per-head — unlike pmask (prefix validity), cmask
@@ -433,7 +443,7 @@ pub(crate) fn run_prefill_batch(
         embed_tokens: sh.embed_tokens,
         tokens: &tokens,
         positions: &positions,
-        causal: &cmask,
+        causal,
         prefix: prefix_src,
         consts: &consts,
         mask_neg,
@@ -455,6 +465,10 @@ pub(crate) fn run_prefill_batch(
         acts: Vec::with_capacity(fsteps.len()),
         acts_f16: Vec::new(),
         acts_i32: Vec::new(),
+        causal_held: pf.keyed_holds(scratchy_target_spyre::bundle_code::PlaceId::Act(
+            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID,
+        )),
+        causal_keyed: None,
         launched: false,
     };
     scratchy_subtile::host_tape::play(
@@ -466,6 +480,10 @@ pub(crate) fn run_prefill_batch(
     acts.extend(launcher.acts);
     acts_f16.extend(launcher.acts_f16);
     acts_i32.extend(launcher.acts_i32);
+    if let Some((id, key, vals)) = launcher.causal_keyed {
+        pf.bind_keyed(id, key, &vals)
+            .map_err(|e| werr(format!("prefill: keyed causal bind: {e}")))?;
+    }
 
     // Prefix validity mask [cap]: 0 on valid resident prefix [0..start), mask_neg else -- SAME shared
     // formula decode uses (decode_prefix_col_valid), generalized with `start` (the resident prefix
@@ -693,6 +711,17 @@ pub(crate) struct ForwardLauncher<'a, V: Fn(usize) -> bool> {
     /// [`Self::acts_f16`] because the two need DIFFERENT shadow writes: an f16 bind is still
     /// re-encoded (`ieee_to_sen_bytes`), an index must be copied verbatim.
     pub(crate) acts_i32: Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)>,
+    /// ⭐ THE CAUSAL KEY THE SESSION ALREADY HOLDS — `SuperDscSession::keyed_holds`, read before the
+    /// tape plays. When it equals `inputs.causal`, the causal step builds nothing and binds nothing:
+    /// the device keeps that key's mask.
+    pub(crate) causal_held: Option<scratchy_subtile::sdsc_abstract::CausalKey>,
+    /// The causal mask to bind KEYED, when the session did not already hold this launch's key —
+    /// bound through `SuperDscSession::bind_keyed`, never through the per-step [`Self::acts`].
+    pub(crate) causal_keyed: Option<(
+        scratchy_target_spyre::bundle_code::PlaceId,
+        scratchy_subtile::sdsc_abstract::CausalKey,
+        std::borrow::Cow<'static, [f32]>,
+    )>,
     /// Set when the tape's device step runs; the caller reads the logits from there.
     pub(crate) launched: bool,
 }
@@ -706,6 +735,15 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
             .steps
             .get(k.0 as usize)
             .ok_or_else(|| format!("no forward kernel {}", k.0))?;
+        // ⭐ A HELD KEY BUILDS NOTHING. The mask is a function of its key alone, so a session that
+        // already holds this launch's key already holds this launch's mask, and the step stages
+        // nothing for `h2d` to bind.
+        if step.kernel == scratchy_target_spyre::forward_tape::ForwardKernel::CausalMask
+            && self.causal_held == Some(self.inputs.causal)
+        {
+            self.staged = None;
+            return Ok(());
+        }
         let staged =
             scratchy_target_spyre::forward_tape::kernel_values(step, self.shape, self.inputs)?;
         // A `Const` step's TENSOR comes from the constant list the kernel index addresses, not
@@ -726,13 +764,22 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
         Ok(())
     }
 
-    fn h2d(&mut self, _t: scratchy_subtile::host_tape::TensorId) -> Result<(), Self::Error> {
-        let (tensor, staged) = self
-            .staged
-            .take()
-            .ok_or_else(|| "h2d with nothing staged".to_string())?;
+    fn h2d(&mut self, t: scratchy_subtile::host_tape::TensorId) -> Result<(), Self::Error> {
+        let causal_tid = scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID;
+        let Some((tensor, staged)) = self.staged.take() else {
+            // The one step that stages nothing: the causal mask, when the session holds its key.
+            return if t.0 == causal_tid && self.causal_held == Some(self.inputs.causal) {
+                Ok(())
+            } else {
+                Err("h2d with nothing staged".to_string())
+            };
+        };
         // The KERNEL decided the format; the transfer just honours it.
         match staged {
+            // A NEW causal key: bound keyed, so it is uploaded once and not re-sent per step.
+            scratchy_target_spyre::forward_tape::Staged::F32(v) if tensor.tid() == causal_tid => {
+                self.causal_keyed = Some((tensor, self.inputs.causal, v));
+            }
             scratchy_target_spyre::forward_tape::Staged::F32(v) => {
                 // `Staged::F32` already carries the borrow/own distinction — a computed kernel
                 // output is Owned, a constant table is Borrowed — so it passes straight through.
@@ -1494,13 +1541,14 @@ pub(crate) fn superdsc_forward_chunk(
         // spec-derived from `half::f16::MAX`, so `exp(score + mask)` underflows to 0 and stays
         // finite.
         let mask_neg = -(half::f16::MAX.to_f32() / 2.0);
-        // The new token's causal block: ONE row of the same triu law a prompt chunk takes per row.
-        let mut causal = vec![mask_neg; 64];
-        for (col, v) in causal.iter_mut().enumerate() {
-            if scratchy_subtile::sdsc_abstract::prefill_causal_col_valid(col, 0) {
-                *v = 0.0;
-            }
-        }
+        // The new token's causal block: the one-row, one-real-row prompt-chunk key — row 0 attends
+        // column 0, the same triu law a prompt chunk takes per row. One key for every solo step, so
+        // the mask is bound once per session and never again.
+        let causal = scratchy_subtile::sdsc_abstract::CausalKey::chunk(
+            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1).expect("1 is a width"),
+            1,
+        )
+        .expect("one real row of a one-row rung");
         // ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK'S INDEX — the one-request body attends EVERY resident page in one
         // pass (see `chunk_index_table`): positions `0..p` are resident, and the map holds the new
         // token's page too.
@@ -1533,7 +1581,7 @@ pub(crate) fn superdsc_forward_chunk(
             embed_tokens: sh.embed_tokens,
             tokens: &[tok],
             positions: &[p as u32],
-            causal: &causal,
+            causal,
             prefix: prefix_src,
             consts: &consts,
             mask_neg,
@@ -1558,6 +1606,10 @@ pub(crate) fn superdsc_forward_chunk(
             acts: Vec::with_capacity(fsteps.len()),
             acts_f16: Vec::new(),
             acts_i32: Vec::new(),
+            causal_held: session.keyed_holds(scratchy_target_spyre::bundle_code::PlaceId::Act(
+                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID,
+            )),
+            causal_keyed: None,
             launched: false,
         };
         scratchy_subtile::host_tape::play(
@@ -1578,9 +1630,16 @@ pub(crate) fn superdsc_forward_chunk(
             acts,
             acts_f16,
             acts_i32,
+            causal_held: _,
+            causal_keyed,
             launched,
         } = launcher;
         debug_assert!(launched, "the tape must reach its device step");
+        if let Some((id, key, vals)) = causal_keyed {
+            session
+                .bind_keyed(id, key, &vals)
+                .map_err(|e| werr(format!("decode: keyed causal bind: {e}")))?;
+        }
 
         // INCREMENTAL: write 1 new token at absolute slot `p`; KV stays device-resident.
         let _t_fwd = std::time::Instant::now();
@@ -1902,7 +1961,7 @@ pub(crate) fn forward_chunk(
             // fp8 (23-token prompt on the m=31 rung): first sampled token was EOS
             // (id 106), `LAST_HIDDEN` ≈ final-norm ROW 0, pad-row logits 0.
             //
-            // ⛔ NOT `ChunkRows::new_block_mask`: that returns the CARD's
+            // ⛔ NOT `CausalKey::mask`: that returns the CARD's
             // `[mq, mq_pad]` stick-padded layout (`mq_pad = mq.div_ceil(64)*64`),
             // and this view is `[mq, mq]` — a 31-row chunk would bind row stride
             // 64 into a 31-stride view and misalign every row past the first.
