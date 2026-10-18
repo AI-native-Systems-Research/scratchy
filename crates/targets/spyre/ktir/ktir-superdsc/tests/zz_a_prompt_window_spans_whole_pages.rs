@@ -146,6 +146,31 @@ fn a_prefix_ladder_short_of_the_ladder_top_refuses() {
     assert!(PagedKvPool::prefix_ladder_tops_the_ladder(&[], &[]).is_ok());
 }
 
+/// ⛔ A PREFIX RUNG THE LADDER ASKED FOR AND DID NOT BAKE REFUSES THE BUILD, naming the rung and why. It is
+/// not enough for the top to bake: a missing narrower rung leaves its tails on a wider one, which runs with
+/// no error and pays that width.
+#[test]
+fn a_prefix_rung_that_did_not_bake_refuses() {
+    let asked = PagedKvPool::prefix_rungs(&[7, 63, 128, 192, 256, 384, 512]);
+    assert!(PagedKvPool::prefix_ladder_bakes_every_rung(&asked, &[PAGE, WINDOW], &[]).is_ok());
+    let refused = vec![(PAGE, "LX overflow at m=256".to_string())];
+    let page =
+        PagedKvPool::prefix_ladder_bakes_every_rung(&asked, &[WINDOW], &refused).unwrap_err();
+    assert!(page.contains("m=256 did not lower"), "{page}");
+    assert!(page.contains("LX overflow at m=256"), "{page}");
+    // A rung that lowered and registered nothing is missing too, with its own reason.
+    let lost = PagedKvPool::prefix_ladder_bakes_every_rung(&asked, &[WINDOW], &[]).unwrap_err();
+    assert!(
+        lost.contains("m=256 was asked for and never baked"),
+        "{lost}"
+    );
+    // A sub-blocked model asks for its top alone, and its top baking is the whole ladder.
+    let sub = PagedKvPool::prefix_rungs(&[7, 63, 128]);
+    assert!(PagedKvPool::prefix_ladder_bakes_every_rung(&sub, &[128], &[]).is_ok());
+    // Nothing asked, nothing owed.
+    assert!(PagedKvPool::prefix_ladder_bakes_every_rung(&[], &[], &[]).is_ok());
+}
+
 /// ⭐ A CONTINUATION CHUNK RUNS ON THE NARROWEST RUNG THAT FINISHES THE PROMPT AS PLACED — and a narrow
 /// rung that would need a second chunk (because its placement re-processes overlap) loses to the window.
 #[test]

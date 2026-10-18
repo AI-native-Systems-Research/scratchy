@@ -12982,7 +12982,9 @@ fn dump_wavefront_mega(
                 .iter()
                 .map(|(m, _)| *m)
                 .collect();
-            for m in scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_rungs(&baked) {
+            let asked = scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_rungs(&baked);
+            let mut refused_prefix: Vec<(u32, String)> = Vec::new();
+            for &m in &asked {
                 match crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,
                     decode_asn_check,
@@ -13003,10 +13005,7 @@ fn dump_wavefront_mega(
                             1, // a prompt chunk is one request
                         );
                     }
-                    Err(e) => eprintln!(
-                        "[spyre-superdsc] {stem}: prefix-capable prefill bundle (m={m}) NOT LOWERED \
-                         — {e}. Continuation chunks will run on a wider prefix rung, if one baked."
-                    ),
+                    Err(e) => refused_prefix.push((m, e.to_string())),
                 }
             }
             // ⛔⛔⛔ THE PREFIX LADDER MUST TOP OUT AT THE PREFIX-FREE LADDER's TOP. A mid-prompt continuation
@@ -13021,6 +13020,17 @@ fn dump_wavefront_mega(
             if let Err(e) =
                 scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_ladder_tops_the_ladder(
                     &baked, &prefix,
+                )
+            {
+                panic!("[spyre-superdsc] {stem}: {e}");
+            }
+            // ⛔⛔⛔ AND EVERY RUNG BELOW THE TOP THAT WAS ASKED FOR MUST HAVE BAKED. A missing one is silent:
+            // its chunks run on the next wider rung. See `PagedKvPool::prefix_ladder_bakes_every_rung`.
+            if let Err(e) =
+                scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_ladder_bakes_every_rung(
+                    &asked,
+                    &prefix,
+                    &refused_prefix,
                 )
             {
                 panic!("[spyre-superdsc] {stem}: {e}");
