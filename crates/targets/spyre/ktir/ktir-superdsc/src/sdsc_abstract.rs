@@ -5540,6 +5540,48 @@ impl PagedKvPool {
         }
     }
 
+    /// ⛔⛔⛔ EVERY PREFIX RUNG THE LADDER ASKED FOR MUST HAVE BAKED. This is the bake's proof, and the macro
+    /// panics on it.
+    ///
+    /// A prefix rung that does not lower used to be logged and skipped. The host then runs the chunk on the
+    /// next wider rung that did bake (`prefix_rung_for` over what was built), so the build stays green and
+    /// every tail that rung was for pays the wider width. Nothing says so: the log line is build-script
+    /// stderr, which cargo swallows on a successful build. MEASURED, the cost of the one rung this ladder
+    /// adds: without the page rung, granite-3.1-2b's ~2k-token prompt ran its 52-row tail on the window,
+    /// 460 ms against 384.
+    ///
+    /// [`prefix_ladder_tops_the_ladder`](Self::prefix_ladder_tops_the_ladder) proves the TOP baked, which
+    /// mid-prompt chunks need to run at all. This proves the rungs BELOW it, which only cost speed when
+    /// missing, so their absence is otherwise silent. `asked` is [`prefix_rungs`](Self::prefix_rungs) of
+    /// the prefix-free ladder, `baked` the prefix rungs that lowered, `refused` each that did not and why.
+    pub fn prefix_ladder_bakes_every_rung(
+        asked: &[u32],
+        baked: &[u32],
+        refused: &[(u32, String)],
+    ) -> Result<(), String> {
+        let missing: Vec<u32> = asked
+            .iter()
+            .copied()
+            .filter(|m| !baked.contains(m))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let why = missing
+            .iter()
+            .map(|m| match refused.iter().find(|(r, _)| r == m) {
+                Some((_, e)) => format!("rung m={m} did not lower: {e}"),
+                None => format!("rung m={m} was asked for and never baked"),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(format!(
+            "the prefix-capable prefill ladder asked for {asked:?} rows and baked {baked:?} — {why}. A \
+             continuation chunk the missing rung was for would run, with no error, on the next wider rung \
+             and pay its width; lower the missing rung, or take it out of the ladder."
+        ))
+    }
+
     /// ⭐ SLOTS A PADDED CHUNK WRITE MAY OVERRUN ITS PAGE BY — the physical slack every plane carries
     /// past its addressable [`PAGE_SLOTS`](Self::PAGE_SLOTS) so that overrun lands in DEAD SPACE instead
     /// of the next kv head's keys.
