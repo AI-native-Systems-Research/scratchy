@@ -536,40 +536,6 @@ impl<'a> EwOperand<'a> {
     }
 }
 
-/// Build the typed [`OpSpec`] for ONE elementwise op over `[rows, cols]` with
-/// PER-OPERAND broadcast (the generalization of [`pointwise_opspec`], which is the
-/// all-`full` case). Inputs may broadcast over `mb` or `out` ([`EwOperand`]); the
-/// output spans full `[mb,out,y]`. `out` is the 64-stick axis. Broadcast over the
-/// stick (`out`) is proven on-card (RedStick `alpha_=0` fold). A TIME-TILED op MAY
-/// carry a broadcast operand: [`rewrite_op_for_time_tile`] exempts any operand whose
-/// scale along the tiled dim is not `Active`, so its address never advances per trip
-/// (pinned by `time_tiled_broadcast_operand_is_address_stable`).
-/// fp16 wrapper (the 64-stick default): every existing caller. fp32 (the torch-spyre RMSNorm) uses
-/// [`pointwise_broadcast_opspec_df`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn pointwise_broadcast_opspec(
-    op: OpFunc,
-    rows: u32,
-    cols: u32,
-    inputs: &[EwOperand<'_>],
-    o_name: &str,
-    out_offset: u32,
-    head_major: bool,
-    layout: Option<&BundleLayout>,
-) -> Result<OpSpec, String> {
-    pointwise_broadcast_opspec_df(
-        op,
-        rows,
-        cols,
-        inputs,
-        o_name,
-        out_offset,
-        head_major,
-        Df::Fp16,
-        layout,
-    )
-}
-
 /// Whether a `[rows, cols]` fp16 pointwise op over `n_inputs` operands runs WITHOUT time-tiling — the
 /// very tile op and tiler [`pointwise_broadcast_opspec_df`] builds, asked before the op is. A caller
 /// cuts an op this answers `false` for, because a time-tiled op with a broadcast operand is refused
@@ -651,8 +617,19 @@ pub fn pointwise_untiled_slice_bytes(rows: u32, cols: u32, n_inputs: u32) -> Opt
         })
 }
 
+/// Build the typed [`OpSpec`] for ONE elementwise op over `[rows, cols]` with
+/// PER-OPERAND broadcast (the generalization of [`pointwise_opspec`], which is the
+/// all-`full` case). Inputs may broadcast over `mb` or `out` ([`EwOperand`]); the
+/// output spans full `[mb,out,y]`. `out` is the 64-stick axis. Broadcast over the
+/// stick (`out`) is proven on-card (RedStick `alpha_=0` fold). A TIME-TILED op MAY
+/// carry a broadcast operand: [`rewrite_op_for_time_tile`] exempts any operand whose
+/// scale along the tiled dim is not `Active`, so its address never advances per trip
+/// (pinned by `time_tiled_broadcast_operand_is_address_stable`).
+/// `df` is `Df::Fp16` (the 64-stick default) for every caller but the torch-spyre fp32 RMSNorm.
+/// `layout` is the bundle's, so the division can see which operands are core-local LX pins (see
+/// [`crate::work::EwDivision`]).
 #[allow(clippy::too_many_arguments)]
-fn pointwise_broadcast_opspec_df(
+pub(crate) fn pointwise_broadcast_opspec_df(
     op: OpFunc,
     rows: u32,
     cols: u32,
@@ -714,7 +691,7 @@ fn pointwise_broadcast_opspec_df(
     )
 }
 
-/// [`pointwise_broadcast_opspec`] → [`EmittedOp`].
+/// [`pointwise_broadcast_opspec_df`] → [`EmittedOp`].
 /// RANK-1 SFP op over a SINGLE 64-stick dim `"mb"` — matching torch-spyre's REAL
 /// emitted rmsnorm rsqrt SDSC (`N_={mb:64}`, `layoutDimOrder=stickDimOrder=["mb"]`,
 /// scale `[1]`). The rmsnorm reduced scalar (mean+eps) is byte-identical whether the
@@ -1595,7 +1572,7 @@ pub fn assemble_pointwise_broadcast_off<O: KindTag>(
             Fp16::ELEMS_PER_STICK,
         );
     }
-    let mut op = pointwise_broadcast_opspec(
+    let mut op = pointwise_broadcast_opspec_df(
         op_func_from_str(op_func),
         rows,
         cols,
@@ -1603,6 +1580,7 @@ pub fn assemble_pointwise_broadcast_off<O: KindTag>(
         o_name,
         out_offset,
         head_major,
+        Df::Fp16,
         layout,
     )
     .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));

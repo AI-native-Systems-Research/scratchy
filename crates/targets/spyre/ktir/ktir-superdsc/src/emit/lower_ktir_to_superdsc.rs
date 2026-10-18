@@ -35,7 +35,7 @@
 
 use super::{
     EmittedOp, In, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, bmm_site,
-    check_pointwise_cols, emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec,
+    check_pointwise_cols, emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec_df,
     pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
@@ -2762,7 +2762,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         // by a `[1, hd]` matmul, so reading it as `[1, stick]` slices declares a second arrangement for
         // one tensor and the arrangement authority rejects the bundle. Making decode stick-wide means
         // making the P matmul stick-wide too, which is a different rotate formulation, not a slice.
-        let op = pointwise_broadcast_opspec(
+        let op = pointwise_broadcast_opspec_df(
             op_func_from_str(f),
             1,
             hd,
@@ -2773,6 +2773,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             o,
             ooff.into_raw_elems(),
             false, // RoPE per-(row,head) [1,hd] block (rows==1): rank-3 flat
+            Df::Fp16,
             layout,
         )
         .map_err(|e| Error { message: e })?;
@@ -2931,7 +2932,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                        ooff: crate::addr::DevOff,
                        sib: &mut i64|
          -> Result<(), Error> {
-            let op = pointwise_broadcast_opspec(
+            let op = pointwise_broadcast_opspec_df(
                 op_func_from_str(f),
                 mq,
                 stk,
@@ -2944,6 +2945,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 // cols == stk, and `stickmajor` needs cols > 64, so it cannot fire either way — this
                 // is the same rank-3 flat form regardless of the row count.
                 true,
+                Df::Fp16,
                 layout,
             )
             .map_err(|e| Error { message: e })?;
@@ -3183,7 +3185,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                        ooff: crate::addr::DevOff,
                        sib: &mut i64|
          -> Result<(), Error> {
-            let op = pointwise_broadcast_opspec(
+            let op = pointwise_broadcast_opspec_df(
                 op_func_from_str(f),
                 rows,
                 hd,
@@ -3196,6 +3198,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 // cols == hd == stick, so `stickmajor` cannot fire (it needs cols>64) and this stays
                 // the SAME rank-3 flat form the per-row path used — only the row count differs.
                 false,
+                Df::Fp16,
                 layout,
             )
             .map_err(|e| Error { message: e })?;
