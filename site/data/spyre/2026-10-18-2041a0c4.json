@@ -27,7 +27,7 @@
     { "model": "granite-3.1-2b", "dtype": "fp8", "metric": "itl_ms", "conc": 1, "context": "~123", "torch": 258.0, "scratchy": 26.19 },
     { "model": "granite-3.1-8b", "dtype": "fp8", "metric": "itl_ms", "conc": 1, "context": "~123", "torch": 257.0, "scratchy": 72.61 },
     { "model": "granite-3.1-8b", "dtype": "fp8", "metric": "ttft_ms", "conc": 1, "context": "~123", "torch": 41700.0, "scratchy": 190,
-      "note": "up from 132 ms in the 2026-10-17 sweep; that sweep's harness did not disable prefix caching, this one does — under investigation" }
+      "note": "Measured at a 128-token prompt. The previous sweep's 132 ms was a 21-token prompt (`scr chat --bench`), which measures 116 ms on this commit. At 128 rows fp8 prefill runs within 3% of fp16 (158 vs 163 ms of device compute): the per-row activation quantize offsets the halved weight bytes." }
   ],
   "since": "#584–#620",
   "moved": [
@@ -41,7 +41,8 @@
     { "lever": "8b decode floor", "work": "131 ms at ~123 against the card's ≈110 ms floor (16.4 GB/token at 149 GB/s) — the rest is attention and elementwise glue." },
     { "lever": "8b 10k decode", "work": "torch-spyre 1.10× ahead — the hd128 K/V gather kept in LX, projected −23 ms/step (≈156 ms)." },
     { "lever": "2b ~1k TTFT", "work": "torch-spyre 1.39× ahead — wide elementwise ops split by rows run at half rate; splitting their sticks is measured 2.05× faster on the op (PR in validation), and #622 extends it to column windows." },
-    { "lever": "per-token overhead", "work": "~10% of 2b fp8 short-context ITL is host time between steps — compile-time CB replay with the next token chosen on the device (#603)." }
+    { "lever": "per-token overhead", "work": "~10% of 2b fp8 short-context ITL is host time between steps — compile-time CB replay with the next token chosen on the device (#603)." },
+    { "lever": "8b fp8 prefill", "work": "at 128 prompt rows fp8 is no faster than fp16 — the per-token activation quantize chain grows with rows and eats the halved weight stream; fusing the quantize into the matmul (the device's fused per-token quantize) is the lever." }
   ],
   "notes": {
     "decode": [
