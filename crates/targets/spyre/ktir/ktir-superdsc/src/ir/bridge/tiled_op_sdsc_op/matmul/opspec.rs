@@ -374,6 +374,23 @@ where
     // stick basis is the operand format's (fp8 ⇒ 128) by TYPE, not a hand-picked 64.
     let n_ext = StickExtent::<DF>::new(n)?;
     let k_ext = StickExtent::<DF>::new(k)?;
+    // ⛔⛔⛔ A `y`-BATCHED SHARED-KERNEL MATMUL CONTRACTS ONE STICK, OR IT IS REFUSED. MEASURED on
+    // granite-3.1-8b (hd 128): with the score leg `y`-batched over `in = hd = 128`, two sticks, every
+    // per-core address was correct and decode was incoherent from the second token
+    // (`hd128-gate-protects-the-batched-decode-arm`). The dxp-validated batched form has one stick on
+    // the contraction ("`y` indexes successive sticks"), and nothing has run another. A wider
+    // contraction is either split by slab (`OneStickContraction::by_slab_split`, one stick per op) or
+    // runs unbatched (`y = 1`, the per-head and query-group scores), and anything else is this build
+    // failure rather than fluent garbage on card.
+    if batch > 1 && k_ext.stick_count() > 1 {
+        return Err(format!(
+            "matmul_opspec_split('{a_name}' x '{w_name}' -> '{o_name}'): a y-batched (batch {batch}) \
+             shared-kernel matmul contracts {k} elements, {} sticks. The batched form is card-validated \
+             only at a one-stick contraction; a multi-stick contraction under a y batch measured \
+             incoherent on granite-3.1-8b. Split the contraction by slab, or run it unbatched.",
+            k_ext.stick_count()
+        ));
+    }
     let mut dims = matmul_dims::<DF>(m, &n_ext, &k_ext, batch);
     // ⭐⭐⭐ THE REDUCTION'S STICK BASIS IS THE **OPERAND'S**, PER AXIS — and this line is the whole
     // difference between "N and K share one format" and what the machine actually does.

@@ -668,12 +668,31 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
     assert!(r.is_ok(), "the untiled matmul's bundle builds: {r:?}");
 }
 
-#[test]
-fn tiled_matmul_trips_do_not_alias_and_advance() {
-    // A `y`-batched matmul keeps the frontend's LX trips (`MatmulStaging::FrontendTrips`): at two
-    // kernel batches 64×16384×2048 is time>1 (proven tiled in tiled_bundle_mlir test). Its trips must
-    // be addressable — advancing instead of aliasing.
-    let e = superdsc::assemble_matmul(
+/// The LX-overflowing `y`-batched matmul the trip tests drive: the card-validated batched form (a
+/// ONE-stick contraction, `in = 64`, at 16 kernel batches: the (ii) bmm) widened in N until its per-core
+/// kernel slab overflows LX — at most 32 cores leave every core ≥ 1024 `out` columns, 2 MiB of kernel.
+/// A `y`-batched matmul keeps the frontend's LX trips (`MatmulStaging::FrontendTrips`), and a one-stick
+/// contraction is the only `y`-batched form the build admits.
+fn batched_lx_overflowing_matmul() -> emit::EmittedOp {
+    let (m, n, k, batch) = (64, 32768, 64, 16);
+    superdsc::assemble_matmul(
+        "matmul_o7",
+        m,
+        n,
+        k,
+        batch,
+        &emit::rb("a", m, k),
+        &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
+        &emit::rb("o", m, n),
+        None,
+    )
+}
+
+/// The `y`-batched shape the trip tests drove before the one-stick refusal, 64×16384×2048 at two kernel
+/// batches: a 32-stick contraction under a `y` batch, the form measured incoherent on granite-3.1-8b.
+/// It must stay a build error, and the error must name why.
+fn assert_the_multi_stick_batched_matmul_is_refused() {
+    let refused = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::try_assemble_matmul_seeded(
         "matmul_o7",
         64,
         16384,
@@ -682,8 +701,25 @@ fn tiled_matmul_trips_do_not_alias_and_advance() {
         &emit::rb("a", 64, 2048),
         &Stk::<KernelTag>::kernel(2048_usize, 16384_usize, "w"),
         &emit::rb("o", 64, 16384),
+        &mut 0,
         None,
+    )
+    .err()
+    .expect("a y-batched multi-stick contraction must be refused");
+    assert!(
+        refused.contains(
+            "a y-batched (batch 2) shared-kernel matmul contracts 2048 elements, 32 sticks"
+        ) && refused.contains("card-validated only at a one-stick contraction"),
+        "the refusal names the shape and the reason: {refused}"
     );
+}
+
+#[test]
+fn tiled_matmul_trips_do_not_alias_and_advance() {
+    // The LX-overflowing batched matmul is time>1 (proven tiled in the tiled_bundle_mlir test). Its
+    // trips must be addressable — advancing instead of aliasing.
+    assert_the_multi_stick_batched_matmul_is_refused();
+    let e = batched_lx_overflowing_matmul();
     let e = &e;
     assert!(e.time > 1);
     // Concrete trips: every OUTPUT per-core address is UNIQUE across all trips
@@ -858,27 +894,20 @@ fn impossibly_large_matmul_is_build_err() {
 
 // (iv-a) ── a tiled op's bundle.mlir is a concrete unroll ──
 //
-// 64×16384×2048 at TWO kernel batches: a `y`-batched matmul keeps the frontend's LX
-// trips (`MatmulStaging::FrontendTrips`), and its per-core resident set (the batch
-// factor included) overflows the 1.68 MiB usable LX → MUST time-tile. The same
-// shape unbatched is handed to dxp whole (`an_unbatched_fp16_matmul_is_one_descriptor`).
+// 64×32768×64 at 16 kernel batches (`batched_lx_overflowing_matmul`): a `y`-batched
+// matmul keeps the frontend's LX trips (`MatmulStaging::FrontendTrips`), and its
+// per-core resident set (the batch factor included) overflows the 1.68 MiB usable
+// LX → MUST time-tile. Its contraction is one stick, the only `y`-batched form the
+// build admits. An unbatched fp16 matmul is handed to dxp whole
+// (`an_unbatched_fp16_matmul_is_one_descriptor`).
 #[test]
 fn tiled_bundle_mlir_is_concrete_unroll() {
     // CONCRETE-UNROLL (task #53): a time=N tiled op pre-unrolls into N FLAT
     // sdsc_execute (no scf.for, no symbols), and N per-trip SdscOps whose tiled-
     // tensor start addresses advance by t·stride. Sidesteps dxp's always-on
     // LoopUnroll (which cloned identical symbol_ids → DtException).
-    let emitted = superdsc::assemble_matmul(
-        "matmul_o7",
-        64,
-        16384,
-        2048,
-        2,
-        &emit::rb("a", 64, 2048),
-        &Stk::<KernelTag>::kernel(2048_usize, 16384_usize, "w"),
-        &emit::rb("o", 64, 16384),
-        None,
-    );
+    assert_the_multi_stick_batched_matmul_is_refused();
+    let emitted = batched_lx_overflowing_matmul();
     let n = emitted.time;
     assert!(n > 1, "this matmul must time-tile, got time={n}");
     let mlir = superdsc::emit_bundle_mlir(std::slice::from_ref(&emitted));

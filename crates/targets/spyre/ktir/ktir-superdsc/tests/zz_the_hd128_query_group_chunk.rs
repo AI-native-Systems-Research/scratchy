@@ -26,6 +26,20 @@ const NSLAB: u32 = 2;
 const CAP: u32 = 256;
 
 fn emit(pages: u32, mq: u32, classes: &[u32]) -> Vec<(String, serde_json::Value)> {
+    emit_rows(pages, mq, classes, false)
+}
+
+/// [`emit`] for a decode BATCH of `seqs` request rows (`rows_are_requests`).
+fn emit_batch(pages: u32, seqs: u32) -> Vec<(String, serde_json::Value)> {
+    emit_rows(pages, seqs, &[HD], true)
+}
+
+fn emit_rows(
+    pages: u32,
+    mq: u32,
+    classes: &[u32],
+    requests: bool,
+) -> Vec<(String, serde_json::Value)> {
     let mut layout = BundleLayout {
         attn_class_hds: classes.to_vec(),
         ..BundleLayout::default()
@@ -53,7 +67,9 @@ fn emit(pages: u32, mq: u32, classes: &[u32]) -> Vec<(String, serde_json::Value)
         );
     }
     let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
-    let rows = if mq == 1 {
+    let rows = if requests {
+        attn_bundle_rows(geom, mq, true).expect("a decode batch rung")
+    } else if mq == 1 {
         attn_bundle_rows(geom, 1, true).expect("the one-request decode rung")
     } else {
         attn_bundle_rows(geom, mq, false).expect("a prompt chunk's rows")
@@ -77,7 +93,7 @@ fn emit(pages: u32, mq: u32, classes: &[u32]) -> Vec<(String, serde_json::Value)
         Some(&names[7]),
         Some(chunk),
         PlaceId::Act(900),
-        false,
+        requests,
         false,
         &mut sym,
         Some(&layout),
@@ -275,14 +291,114 @@ fn every_group_score_reads_the_relaid_query_after_its_copies() {
     );
 }
 
-/// Without the class registry (an emission fixture) or above one row per head, the chunk keeps the
+/// Without the class registry (an emission fixture) or for a prompt chunk's rows, the chunk keeps the
 /// per-query-head form exactly — no copy, no group score.
 #[test]
-fn the_group_form_needs_the_registry_and_a_one_request_decode() {
+fn the_group_form_needs_the_registry_and_a_decode() {
     let no_registry = emit(8, 1, &[]);
     assert_eq!(count(&no_registry, "attn_cqg_g"), 0);
     assert_eq!(count(&no_registry, "attn_csc_h"), NQH);
     let prompt = emit(8, PagedKvPool::PREFILL_CHUNK_SLOTS as u32, &[HD]);
     assert_eq!(count(&prompt, "attn_cqg_g"), 0);
     assert_eq!(count(&prompt, "attn_csc_h"), NQH);
+}
+
+/// ⭐⭐⭐ A DECODE BATCH ATTENDS EACH KV HEAD's WHOLE GROUP TOO, at every rung of every batch width: the
+/// query re-laid by the same one-stick copy at `M = B` (16 copies, `[B, 64]·[64, 64]` with `y` = the
+/// group's heads), then per kv head ONE score `[gqa·B, hd]·[hd, slots]` (unbatched, the whole head dim)
+/// and one PV per slab `gqa·B` rows × one stick. No per-query-head op anywhere, and no op is `y`-batched
+/// over a contraction wider than one stick.
+#[test]
+fn a_decode_batch_attends_each_kv_heads_whole_group() {
+    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    for seqs in PagedKvPool::BATCH_RUNGS {
+        for t in ChunkScratch::ladder_for(pool, seqs) {
+            let ops = emit_batch(t, seqs);
+            let ctx = format!("seqs={seqs} t={t}");
+            assert_eq!(count(&ops, "attn_cqg_g"), NKVH * NSLAB, "{ctx}: copies");
+            for stem in ["attn_csc_h", "attn_cbmax_h", "attn_cov_h"] {
+                assert_eq!(count(&ops, stem), 0, "{ctx}: no per-query-head {stem}*");
+            }
+            assert_eq!(
+                count(&ops, "attn_csc_g"),
+                NKVH,
+                "{ctx}: one score per kv head"
+            );
+            assert_eq!(
+                count(&ops, "attn_cov_g"),
+                NKVH * NSLAB,
+                "{ctx}: one PV per (kv head, slab)"
+            );
+            for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_csc_g")) {
+                let n = n_of(name, v);
+                assert_eq!(
+                    (
+                        n["mb_"].as_u64(),
+                        n["in_"].as_u64(),
+                        n["out_"].as_u64(),
+                        n["y_"].as_u64()
+                    ),
+                    (
+                        Some(u64::from(GQA * seqs)),
+                        Some(u64::from(HD)),
+                        Some(u64::from(t * 256)),
+                        None
+                    ),
+                    "{name} {ctx}: N_ = {n}"
+                );
+            }
+            for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_cov_g")) {
+                let n = n_of(name, v);
+                assert_eq!(
+                    (n["mb_"].as_u64(), n["out_"].as_u64(), n["in_"].as_u64()),
+                    (
+                        Some(u64::from(GQA * seqs)),
+                        Some(64),
+                        Some(u64::from(t * 256))
+                    ),
+                    "{name} {ctx}: N_ = {n}"
+                );
+            }
+            for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_cqg_g")) {
+                let n = n_of(name, v);
+                assert_eq!(
+                    (
+                        n["y_"].as_u64(),
+                        n["mb_"].as_u64(),
+                        n["in_"].as_u64(),
+                        n["out_"].as_u64()
+                    ),
+                    (
+                        Some(u64::from(GQA)),
+                        Some(u64::from(seqs)),
+                        Some(64),
+                        Some(64)
+                    ),
+                    "{name} {ctx}: N_ = {n}"
+                );
+            }
+        }
+    }
+}
+
+/// ⭐ THE BATCH MASK's ROW LAW HOLDS FOR THE RE-LAID BLOCK: the host's mask block is the group block's
+/// `gqa·B` rows, and row `g·B + r` of every kv head's block is request `r` — the copy's destination order.
+#[test]
+fn the_batch_mask_rows_are_the_relaid_group_rows() {
+    use ktir_superdsc::sdsc_abstract::BatchChunk;
+    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    for seqs in PagedKvPool::BATCH_RUNGS {
+        let t = ChunkScratch::ladder_for(pool, seqs)[0];
+        let bc = BatchChunk::of(ChunkScratch::of_chunk(pool, t).unwrap(), seqs, GQA).unwrap();
+        assert_eq!(bc.mask_rows(), GQA * seqs, "seqs={seqs}");
+        for g in 0..GQA {
+            for r in 0..seqs {
+                assert_eq!(
+                    bc.row_request(g * seqs + r),
+                    r,
+                    "seqs={seqs} head {g} request {r}"
+                );
+            }
+        }
+    }
 }
