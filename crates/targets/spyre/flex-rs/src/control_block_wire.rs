@@ -332,6 +332,24 @@ impl CtrlSection {
         Self { word }
     }
 
+    /// `SetCancelled` (`cancel_`, bits 7:0 — the CTRL word's low byte, per
+    /// the `hal/snt1p0/ctrl_section_sbf.hpp` bitfield table). Applied after
+    /// construction, exactly where the vendor applies it: the real
+    /// `CreateCancelledCb` builds the whole CB first and only then sets the
+    /// flag. The field is 8 bits wide, but the vendor's setter only ever
+    /// writes the boolean (`true` ⇒ `1`), so this packs `1` and takes no
+    /// argument.
+    pub const fn with_cancel(mut self) -> Self {
+        self.word |= BitField::<7, 0>::pack(1);
+        self
+    }
+
+    /// `GetCancel` — the same low-byte field, read back. The vendor's
+    /// readers test it as a boolean, so any nonzero value reads cancelled.
+    pub const fn is_cancelled(self) -> bool {
+        BitField::<7, 0>::unpack(self.word) != 0
+    }
+
     pub const fn to_word(self) -> u64 {
         self.word
     }
@@ -994,6 +1012,53 @@ impl ControlBlockWire {
         ))
     }
 
+    /// Port of `ControlBlockStream::CreateCancelledCb`
+    /// (`flex/src/control_blocks/control_block_stream.cpp:390-398`, pod C++
+    /// @ed96487): a zero-work compute CB whose CTRL word carries the cancel
+    /// byte. The real creator delegates to `CreateComputeVirtual` with a
+    /// null program address and an empty segment table — i.e. a CMPT section
+    /// that is valid with `sync=false` and a zero bootstrap address, no DMA
+    /// in either slot, and every XLAT entry left invalid — and only then
+    /// sets the CTRL cancel flag. The vendor's sole construction site
+    /// (`response_worker.cpp:326-328`) builds one per stream, at
+    /// construction, as the shutdown wake-up marker.
+    ///
+    /// VERIFIED CONTRACT (pod C++, issue #611): a cancelled CB carries no
+    /// work by construction, consumes its ring slot, and still produces an
+    /// RB — the vendor's shutdown path queues it and waits on its
+    /// completion (with a 5 s timeout for hardware stuck after a page
+    /// fault). Two boundaries on what a design may lean on, both from the
+    /// vendor's own sources:
+    ///
+    /// (a) the device skipping the WORK of a cancelled CB that carries ops
+    ///     is NOT established — the vendor's mock models the skip at every
+    ///     unit but carries its own FIXME at `mock_compute_pipeline.cpp:62`
+    ///     (the mock still lets the CB pass through each pipeline stage),
+    ///     and no readable source ever constructs a work-carrying cancelled
+    ///     CB. Callers must swap in this zero-work form rather than
+    ///     cancelling a CB that already has work in it.
+    ///
+    /// (b) the vendor runtime treats a cancel RB as an ERROR on the normal
+    ///     queuing path (`EvalResponseBlockStatus`,
+    ///     `response_worker.cpp:128-135`) — only `QueuingMode::STOP_THREADS`
+    ///     accepts it as the graceful-shutdown signal. A caller using this
+    ///     for overrun discard therefore defines its own completion policy;
+    ///     the mock-port side of the skip is
+    ///     [`crate::control_blocks::process_crb`]'s `Cancelled` outcome.
+    // The real creator takes no arguments (the vendor leases tags at its
+    // stream layer); `tag` is this crate's lease parameter, as with every
+    // other constructor here.
+    pub fn cancelled(tag: ResponseTag) -> Self {
+        Self::assemble(
+            CtrlSection::new(tag, false).with_cancel(),
+            R5Section::none(),
+            DmaSection::skip(),
+            DmaSection::skip(),
+            ComputeSection::new(VirtualAddressSbf::new(0, Flits(0)), false),
+            [XlatEntry::invalid(); 8],
+        )
+    }
+
     /// Raw bytes ready to hand to `senlib_ffi::SenlibControlBlockSbf`
     /// (which is byte-for-byte this same 128-byte layout).
     pub const fn to_bytes(&self) -> [u8; CB_NUM_BYTES] {
@@ -1011,6 +1076,18 @@ impl ControlBlockWire {
         word.copy_from_slice(&self.bytes[CTRL_SECTION..CTRL_SECTION + 8]);
         let word = u64::from_le_bytes(word);
         ResponseTag(BitField::<31, 8>::unpack(word) as u32)
+    }
+
+    /// This CB's own `CtrlSectionSBF::GetCancel` (bits 7:0 of the CTRL
+    /// word) — true for a CB built by [`ControlBlockWire::cancelled`], false
+    /// for every work-carrying constructor. This is the flag
+    /// [`crate::control_blocks::process_crb`] consumes as `cancelled`: the
+    /// mock-port's early-return branch, which skips processing entirely and
+    /// reports the RB cancel bit instead of a status byte.
+    pub fn ctrl_cancelled(&self) -> bool {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&self.bytes[CTRL_SECTION..CTRL_SECTION + 8]);
+        BitField::<7, 0>::unpack(u64::from_le_bytes(word)) != 0
     }
 }
 
@@ -1554,6 +1631,113 @@ mod tests {
             u64::from_le_bytes(bytes[DMI_SECTION + 8..DMI_SECTION + 16].try_into().unwrap());
         assert_eq!(dmi_word1 & 0xF, DmaType::MemoryFill.bits());
         assert_eq!((dmi_word1 >> 32) & 0xFFFF_FFFF, 0xDEAD_BEEFu64);
+    }
+
+    /// The wire facts of a `CreateCancelledCb` port: the CTRL cancel byte is
+    /// set (and only that byte — tag preserved, barrier clear), the CMPT
+    /// section is a valid-but-unsynced zero-bootstrap compute section, both
+    /// DMA slots are SKIP, and every XLAT entry is invalid. These are the
+    /// bytes the vendor's shutdown marker puts on the ring, pinned so the
+    /// port cannot silently drift from the verified shape.
+    #[test]
+    fn cancelled_cb_ports_the_vendor_shutdown_marker_shape() {
+        let cb = ControlBlockWire::cancelled(ResponseTag(7));
+        let bytes = cb.to_bytes();
+
+        // CTRL word: cancel_ (bits 7:0) == 1 exactly — the vendor's setter
+        // writes the boolean, not an arbitrary byte; tag at bits 31:8
+        // preserved for RB correlation; barrier (bit 32) clear.
+        let ctrl = u64::from_le_bytes(bytes[CTRL_SECTION..CTRL_SECTION + 8].try_into().unwrap());
+        assert_eq!(ctrl & 0xFF, 1, "cancel_ (bits 7:0) must be exactly 1");
+        assert_eq!(
+            (ctrl >> 8) & 0xFF_FFFF,
+            7,
+            "tag must survive the cancel set"
+        );
+        assert_eq!((ctrl >> 32) & 1, 0, "barrier must be clear");
+        assert!(cb.ctrl_cancelled());
+
+        // CMPT word0: valid_ set (CreateComputeVirtual sets it
+        // unconditionally), sync_ clear, bootstrap_address_ (bits 36:7)
+        // zero — the null program address.
+        let cmpt_word0 =
+            u64::from_le_bytes(bytes[CMPT_SECTION..CMPT_SECTION + 8].try_into().unwrap());
+        assert_ne!(cmpt_word0 & (1 << 63), 0, "valid_ must be set");
+        assert_eq!(cmpt_word0 & (1 << 62), 0, "sync_ must be clear");
+        assert_eq!(
+            cmpt_word0 & BitField::<36, 7>::MASK,
+            0,
+            "bootstrap must be null"
+        );
+
+        // Both DMA slots SKIP — the marker carries no DMA work.
+        for section in [DMI_SECTION, DMO_SECTION] {
+            let word1 = u64::from_le_bytes(bytes[section + 8..section + 16].try_into().unwrap());
+            assert_eq!(
+                word1 & 0xF,
+                DmaType::Skip.bits(),
+                "both DMA slots must be SKIP"
+            );
+        }
+
+        // Every XLAT entry invalid — the vendor's sole construction site
+        // builds it on a stream with an empty segment table.
+        for i in 0..8 {
+            let xlat = u64::from_le_bytes(
+                bytes[XLAT_SECTION + i * 8..XLAT_SECTION + i * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(xlat, XlatEntry::invalid().word, "xlat[{i}] must be invalid");
+        }
+    }
+
+    /// Negative control: only the cancelled constructor sets the CTRL cancel
+    /// byte — a work-carrying CB must never read back cancelled, or the
+    /// discard mechanism would drop live work.
+    #[test]
+    fn only_a_cancelled_cb_reads_cancelled() {
+        let bootstrap = VirtualAddressSbf::new(7, Flits::from_bytes(0));
+        let prog = (
+            DevicePhysicalAddress(0x1_0000_0000),
+            AllocationTotalSize(4096),
+        );
+        let tensors = [(
+            DevicePhysicalAddress(0x2_0000_0000),
+            AllocationTotalSize(65536),
+        )];
+        let compute = ControlBlockWire::compute(ResponseTag(1), &tensors, prog, bootstrap).unwrap();
+        assert!(!compute.ctrl_cancelled());
+
+        let dmva = VirtualAddressSbf::new(2, Flits::from_bytes(0x1000));
+        let dma = ControlBlockWire::dma_immediate(
+            ResponseTag(2),
+            true,
+            DmaTransfer {
+                dmva,
+                host_addr: HostPhysicalAddress::from_raw_for_tests(0x7f00_0000),
+                size_bytes: TransferSize(256),
+            },
+            XlatWindow {
+                region_paddr: DevicePhysicalAddress(0x2_0000_0000),
+                length: SegmentExtent(0x1000 + 256),
+            },
+            false,
+        )
+        .unwrap();
+        assert!(!dma.ctrl_cancelled());
+
+        let fill = ControlBlockWire::fill(
+            ResponseTag(3),
+            dmva,
+            TransferSize(4096),
+            0xDEAD_BEEF,
+            true,
+            DevicePhysicalAddress(0x3_0000_0000),
+            SegmentExtent(4096),
+        )
+        .unwrap();
+        assert!(!fill.ctrl_cancelled());
     }
 
     /// Regression test for CRITICAL FIX #1: the real functions these wire

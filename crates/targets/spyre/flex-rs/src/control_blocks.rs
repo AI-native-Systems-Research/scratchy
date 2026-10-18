@@ -900,6 +900,32 @@ where
 #[cfg(test)]
 mod process_crb_tests {
     use super::*;
+    use crate::control_block_wire::{ControlBlockWire, ResponseTag};
+
+    /// THE WIRING, not the children: `process_crb` takes the cancel flag as
+    /// a parameter, and the parameter's producer is
+    /// `ControlBlockWire::ctrl_cancelled()`. A CB built by the cancelled
+    /// constructor must reach the `Cancelled` outcome through that reader —
+    /// skip processing entirely, no status byte — and a work-carrying CB's
+    /// reader must let processing run. This is the seam issue #611's
+    /// overrun-discard mechanism leans on: swap the image's CB for a
+    /// zero-work cancelled twin, and the drain path sees exactly this.
+    #[test]
+    fn ctrl_cancelled_reader_drives_process_crbs_cancelled_outcome() {
+        let cancelled = ControlBlockWire::cancelled(ResponseTag(3));
+        let mut called = false;
+        let outcome = process_crb(cancelled.ctrl_cancelled(), 0, || {
+            called = true;
+            Ok(())
+        });
+        assert_eq!(outcome, CbOutcome::Cancelled);
+        assert!(!called, "the wire-read cancel flag must skip ProcessCB");
+        assert_eq!(
+            outcome.status_byte(),
+            None,
+            "cancelled skip must not write a status byte"
+        );
+    }
 
     #[test]
     fn cancelled_skips_processing_entirely() {
