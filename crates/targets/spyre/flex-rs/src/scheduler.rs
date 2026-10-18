@@ -1748,6 +1748,12 @@ impl HardwareSubmit for SenlibHardwareSubmit {
 // and are NOT ported; every member that decides control flow is.
 
 /// Port of `flex::QueuingMode` (`response_worker.hpp:228-235`).
+///
+/// `Calibration` is the timestamp calibrator's mode: its submit is the
+/// lock-free single-producer fast path in [`ResponseWorker::queue_cbs`]
+/// (see there for the isolation contract that makes skipping
+/// `submission_mtx_` sound, and for the #500 TODO 7 caveat recorded
+/// against it per #610).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueuingMode {
     Regular,
@@ -1991,7 +1997,12 @@ pub struct ResponseWorker {
     skip_launch: bool,
     hw: Arc<dyn HardwareSubmit>,
     /// `submission_mtx_` — ONE mutex for every pipeline, held across
-    /// `Precheck` + `PrepareCbs` + `LaunchCbs` (`response_worker.cpp:488`).
+    /// `Precheck` + `PrepareCbs` + `LaunchCbs` (`response_worker.cpp:488`)
+    /// — EXCEPT on the CALIBRATION fast path, which skips it entirely (see
+    /// [`ResponseWorker::queue_cbs`]). Being one mutex for every pipeline
+    /// and every stream is the #500 TODO 7 caveat: it serializes
+    /// multi-stream submission too, which is what
+    /// `submission_mtx_ceiling_measurement` measures.
     submission_mtx: Mutex<()>,
     stop_threads: AtomicBool,
     force_shutdown: AtomicBool,
@@ -2121,6 +2132,34 @@ impl ResponseWorker {
     /// telemetry phase attributed by pipeline alone, which stopped
     /// separating ops from DMA crossings when the crossings moved onto the
     /// compute pipeline.
+    ///
+    /// The CALIBRATION fast path (`response_worker.cpp:485-510`, the
+    /// "Calibration Fast Path" block at the top of the C++ body; the newer
+    /// vendor tree wraps that body in `QueueCbsImpl`, same branch at
+    /// `:501-528` there): a `Calibration` submit runs this same
+    /// Precheck + PrepareCbs + LaunchCbs WITHOUT taking `submission_mtx_`.
+    /// That is the vendor's lock-free single-producer submit — its
+    /// timestamp calibrator builds its CBs once
+    /// (`timestamp_calibrator.cpp:304`) and resubmits the same set every
+    /// round (`:773`), which is exactly replay's shape (#500 TODO 18,
+    /// #610). What makes the skip sound in the vendor is the
+    /// `calibration_window_active_` guard: REGULAR submissions on
+    /// ASYNC_DMAI release the mutex and wait for the calibration window to
+    /// close, so while a calibration round runs its submitter is the only
+    /// producer on that pipeline, and everything else these three steps
+    /// touch is per-tag or atomic. Neither the guard nor the calibrator is
+    /// ported (telemetry phase — see this file's module doc), so here the
+    /// single-producer guarantee is a CALLER contract: nothing else may
+    /// submit through this `ResponseWorker` while a `Calibration` submit is
+    /// in flight. That is also the #500 TODO 7 caveat, recorded against
+    /// this path per #610: `submission_mtx_` is ONE mutex across all
+    /// pipelines and serializes multi-stream submission too (the ceiling
+    /// `submission_mtx_ceiling_measurement` measures), and this branch is
+    /// the vendor's own single-producer escape from it — the shape #603's
+    /// replay player measures at k>1. The vendor additionally skips its
+    /// profiler on this path (`qm != CALIBRATION` gating `PROFILER_START`
+    /// and the response-side profiler copy); the profiler is one of the
+    /// not-ported telemetry members, so that skip is vacuous here.
     pub fn queue_cbs(
         &self,
         cb_fn: CallbackFn,
@@ -2130,6 +2169,31 @@ impl ResponseWorker {
         dma: Option<DmaDirection>,
         build: impl FnOnce(&[ResponseTag]) -> Result<Vec<ControlBlockWire>, SchedulerError>,
     ) -> Result<(), SchedulerError> {
+        // "Calibration Fast Path" (`response_worker.cpp:485-510`): the same
+        // three steps as the regular path below, minus `submission_mtx_` —
+        // see the doc comment above for the single-producer contract that
+        // replaces the lock. `LaunchCbs`' submit is as unguarded here as it
+        // is on the regular path (see the `launch_result?` note below): the
+        // error propagates and the already-published `pending_requests_`
+        // slots are left for `CheckPendingJobTimeouts`.
+        if qm == QueuingMode::Calibration {
+            self.precheck(num_cbs, qm)?;
+            let batch = self.prepare_cbs(&cb_fn, num_cbs, pipeline, qm, dma, build)?;
+            debug_assert_eq!(batch.len() as u64, num_cbs);
+            self.launch_cbs(batch)?;
+            // "Single-threaded mode: poll synchronously until all responses
+            // received" — the fast path carries its own copy of the poll,
+            // identical to the regular path's below (which by then has
+            // already dropped the lock).
+            if self.single_thread_optimized && !self.skip_launch {
+                let mut scratch = DrainScratch::new(self.max_pending_requests);
+                while self.num_pending_requests.load(Ordering::Acquire) > 0 {
+                    self.fetch_and_parse_response_blocks(&mut scratch);
+                }
+            }
+            return Ok(());
+        }
+
         let submission_lock = self
             .submission_mtx
             .lock()
@@ -3203,6 +3267,211 @@ mod response_worker_tests {
         );
         await_pending_zero(&worker);
         worker.shutdown();
+    }
+
+    /// #610: the CALIBRATION fast path submits WITHOUT `submission_mtx_`
+    /// (`response_worker.cpp:485-510`), so a CALIBRATION submit that arrives
+    /// while the mutex is already held must still go through — on the
+    /// regular path it would block on the lock. The test thread holds the
+    /// mutex across the whole submit, standing in for any other producer
+    /// mid-`QueueCbs` (the vendor's `calibration_window_active_` guard is
+    /// what rules that producer out in the real C++; here the isolation is
+    /// the caller contract documented on `queue_cbs`, and the lock being
+    /// held is precisely the situation the contract says cannot happen —
+    /// which is why the fast path must not care).
+    ///
+    /// The submit runs on its own thread under a deadline rather than inline
+    /// so a regression back to the locked path FAILS the assert instead of
+    /// deadlocking the test binary waiting for the test's own guard.
+    #[test]
+    fn calibration_submit_does_not_take_submission_mtx() {
+        let hw = LoopbackHardware::new();
+        let worker = ResponseWorker::new(hw as Arc<dyn HardwareSubmit>);
+
+        const CBS: u64 = 4;
+        let fired = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let submit_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        {
+            let _held = worker
+                .submission_mtx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            let submitter = {
+                let worker = worker.clone();
+                let fired = fired.clone();
+                let submit_done = submit_done.clone();
+                std::thread::spawn(move || {
+                    let cb_fn: CallbackFn = Arc::new(move |_pr: &PendingRequest| {
+                        fired.fetch_add(1, Ordering::Relaxed);
+                    });
+                    worker
+                        .queue_cbs(
+                            cb_fn,
+                            CBS,
+                            PipelineId::Compute,
+                            QueuingMode::Calibration,
+                            None,
+                            |tags| Ok(tags.iter().map(|t| dummy_cb(*t)).collect()),
+                        )
+                        .expect("CALIBRATION QueueCbs failed");
+                    submit_done.store(true, Ordering::Release);
+                })
+            };
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !submit_done.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                submit_done.load(Ordering::Acquire),
+                "CALIBRATION submit did not complete while submission_mtx_ was held — the fast \
+                 path took the lock"
+            );
+            submitter.join().expect("CALIBRATION submitter panicked");
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fired.load(Ordering::Relaxed) < CBS && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            fired.load(Ordering::Relaxed),
+            CBS,
+            "CALIBRATION submit lost control blocks: not every CB's completion callback fired"
+        );
+        await_pending_zero(&worker);
+        worker.shutdown();
+    }
+
+    /// #610: the fast path runs the SAME three steps as the regular path
+    /// minus the lock, so a CALIBRATION batch must be indistinguishable from
+    /// a REGULAR one on the completion side: every callback fires exactly
+    /// once, on unique tags, with the mode visible in the `PendingRequest`
+    /// the callback receives — and a REGULAR batch submitted afterward on
+    /// the same worker still completes (the two modes share the tag pool and
+    /// the slot table; only the lock differs).
+    #[test]
+    fn calibration_submit_completes_like_regular() {
+        let hw = LoopbackHardware::new();
+        let worker = ResponseWorker::new(hw as Arc<dyn HardwareSubmit>);
+
+        const CAL_CBS: u64 = 3;
+        const REG_CBS: u64 = 2;
+
+        let fired = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let calibration_modes = Arc::new(Mutex::new(Vec::<QueuingMode>::new()));
+        let seen_tags = Arc::new(Mutex::new(Vec::<u32>::new()));
+
+        let cb_fn: CallbackFn = {
+            let fired = fired.clone();
+            let calibration_modes = calibration_modes.clone();
+            let seen_tags = seen_tags.clone();
+            Arc::new(move |pr: &PendingRequest| {
+                fired.fetch_add(1, Ordering::Relaxed);
+                calibration_modes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(pr.queuing_mode);
+                if let Some(rb) = pr.response_block {
+                    seen_tags
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(rb.tag().0);
+                }
+            })
+        };
+
+        worker
+            .queue_cbs(
+                cb_fn.clone(),
+                CAL_CBS,
+                PipelineId::AsyncDmaI,
+                QueuingMode::Calibration,
+                None,
+                |tags| Ok(tags.iter().map(|t| dummy_cb(*t)).collect()),
+            )
+            .expect("CALIBRATION QueueCbs failed");
+        worker
+            .queue_cbs(
+                cb_fn,
+                REG_CBS,
+                PipelineId::Compute,
+                QueuingMode::Regular,
+                None,
+                |tags| Ok(tags.iter().map(|t| dummy_cb(*t)).collect()),
+            )
+            .expect("REGULAR QueueCbs failed");
+
+        let total = CAL_CBS + REG_CBS;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fired.load(Ordering::Relaxed) < total && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            fired.load(Ordering::Relaxed),
+            total,
+            "control blocks lost in submission: not every CB's completion callback fired"
+        );
+        let modes = calibration_modes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(
+            modes
+                .iter()
+                .filter(|m| **m == QueuingMode::Calibration)
+                .count() as u64,
+            CAL_CBS,
+            "the CALIBRATION batch's completions did not carry their queuing mode"
+        );
+        assert_eq!(
+            modes.iter().filter(|m| **m == QueuingMode::Regular).count() as u64,
+            REG_CBS,
+            "the REGULAR batch's completions did not carry their queuing mode"
+        );
+        let mut tags = seen_tags.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        tags.sort_unstable();
+        let unique = {
+            let mut t = tags.clone();
+            t.dedup();
+            t.len()
+        };
+        assert_eq!(
+            unique,
+            tags.len(),
+            "a tag was delivered to more than one callback (clobbered pending-request slot)"
+        );
+        await_pending_zero(&worker);
+        worker.shutdown();
+    }
+
+    /// #610: the fast path does not skip `Precheck` — the vendor's
+    /// calibration branch runs it first (`response_worker.cpp:498`), so a
+    /// CALIBRATION submit during teardown is refused exactly like a REGULAR
+    /// one ("handle case when trying to offload while tearing down"), rather
+    /// than the lock-free path becoming a hole in the shutdown protocol.
+    #[test]
+    fn calibration_submit_is_refused_during_shutdown() {
+        let hw = LoopbackHardware::new();
+        let worker = ResponseWorker::new(hw as Arc<dyn HardwareSubmit>);
+        worker.shutdown();
+
+        let err = worker
+            .queue_cbs(
+                Arc::new(|_pr: &PendingRequest| {}),
+                1,
+                PipelineId::Compute,
+                QueuingMode::Calibration,
+                None,
+                |tags| Ok(tags.iter().map(|t| dummy_cb(*t)).collect()),
+            )
+            .expect_err("CALIBRATION QueueCbs must be refused while shutting down");
+        assert!(
+            err.to_string().contains("Shutdown in process"),
+            "CALIBRATION submit during teardown failed with the wrong error: {err}"
+        );
     }
 
     /// The #546 `submission_mtx` ceiling measurement: how much of
