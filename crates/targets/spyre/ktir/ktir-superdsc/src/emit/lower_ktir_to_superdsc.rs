@@ -245,156 +245,264 @@ pub fn gather_of(k: &KtirNode) -> Result<Option<Gather>, Error> {
 /// A gather the walk below does not carry is still the silent-direct-read hazard `gather_of`'s
 /// comment names, so callers refuse an uncarried one exactly as before.
 pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
+    gathers_of_excluding(k, &[])
+}
+
+/// ⛔ [`gathers_of`] MINUS THE TILES A RECOGNISER HAS CLAIMED — and nothing else.
+///
+/// A claimed tile is CONSUMED, not forgiven: the claim's owner took responsibility for
+/// lowering everything that tile's gather feeds (its loads are interiors of the recognised
+/// chain), so the tile is not the discriminator's to judge — but everything that REMAINS is
+/// judged exactly as [`gathers_of`] judges it, the same-pair discriminator included. An
+/// exclusion can only turn a mixed-pair refusal into a pass by removing the tiles of every
+/// pair but one; the claim set is the only thing that differs. Claims are tile RESULT ssas
+/// ([`Gather::tile`]) — the identity the claiming reader proved its facts under, never a
+/// position in an enumeration.
+pub fn gathers_of_excluding(k: &KtirNode, claimed: &[Ssa]) -> Result<Vec<Gather>, Error> {
     let f = &k.func;
-    let consts = index_constants(&k.func);
     let tiles: Vec<&Operation<'_>> = f
         .operations
         .iter()
         .filter(|o| o.op_type == OpKind::KtdpConstructIndirectAccessTile)
+        .filter(|o| match o.result {
+            Some(r) => !claimed.contains(&r),
+            None => true,
+        })
         .collect();
-    let mut out: Vec<Gather> = Vec::with_capacity(tiles.len());
-    let tile_count = tiles.len();
-    for tile in &tiles {
-        // The SAME param walk `gather_of` runs, per tile — a closure over this tile's operands so
-        // the two readings cannot disagree about which parameter a tile's view names.
-        let param_tid = |slot: usize, what: &str| -> Result<u32, Error> {
-            let view_v = tile.operands.get(slot).copied().ok_or_else(|| Error {
-                message: format!(
-                    "{}: the indirect access tile states no {what} operand — a gather needs both the \
-                     tensor it reads and the index vector that chooses the rows",
-                    f.name
-                ),
-            })?;
-            let view = f
-                .operations
-                .iter()
-                .find(|o| o.result == Some(view_v) && o.op_type == OpKind::KtdpConstructMemoryView)
-                .ok_or_else(|| Error {
-                    message: format!(
-                        "{}: the indirect access tile's {what} operand is not a \
-                         `ktdp.construct_memory_view`, so no parameter can be named for it",
-                        f.name
-                    ),
-                })?;
-            let ptr = view.operands.first().copied();
-            let i = f
-                .arguments
-                .iter()
-                .position(|(a, _)| Some(*a) == ptr)
-                .ok_or_else(|| Error {
-                    message: format!(
-                        "{}: the indirect access tile's {what} view does not reinterpret a PARAMETER, \
-                         so the buffer it names has no binding and no placement",
-                        f.name
-                    ),
-                })?;
-            k.bindings.get(i).map(|b| b.get()).ok_or_else(|| Error {
-                message: format!("{}: parameter {i} has no bound buffer", f.name),
-            })
-        };
-        let value_tid = param_tid(0, "gathered")?;
-        let index_tid = param_tid(1, "index")?;
-        if value_tid == index_tid {
-            return err(format!(
-                "{}: the gather's index view and the tensor it gathers are the SAME parameter \
-                 (t{value_tid}) — one HBM allocation cannot be both this gather's `index_tensor` and \
-                 its `value_tensor`, which is the bidirectional `relatedIndirectAccessAlloc_` pair dbo \
-                 follows in both directions.",
-                f.name
-            ));
-        }
-        let (entries, _) = shape_2d(tile).ok_or_else(|| Error {
+    gathers_over_tiles(k, &tiles)
+}
+
+/// ⭐ ONE INDIRECT TILE'S RAW GATHER FACTS — the parameters, the entries, the RAW anchor,
+/// the tile and its load — none of the set-level or descriptor-level judgement.
+///
+/// ⛔ THE ANCHOR IS STATED RAW, NOT AS AN [`crate::superdsc_opspec::EntryBase`]. The stick
+/// law is a DESCRIPTOR-level fact — the set reader applies it where descriptors are built —
+/// because a program can legitimately STATE an anchor no descriptor can carry directly: the
+/// fused MoE kernel's per-pair tiles anchor at index WORDS 0..7, all inside the first
+/// `SenUint32` stick, and the per-op door's m=1 body emits them by RE-STAGING the ids into
+/// its own replicated stick-aligned index. A recogniser that claims such a tile must verify
+/// the raw anchor (this reader's `first_entry`) and do its own re-staging at emission; the
+/// stick refusal belongs to the reader that would have emitted a descriptor at the raw
+/// anchor. The whole-function door's recognisers read their claims through this fn so a
+/// claim is proven on the same reading [`gathers_of`] judges under — two readings of one
+/// tile is the drift issue 201 item 3 exists to prevent.
+#[derive(Clone, Copy, Debug)]
+pub struct GatherFacts {
+    /// The parameter holding the index vector — `crate::place::act_name(index_tid)` is its
+    /// operand name.
+    pub index_tid: u32,
+    /// The parameter being gathered FROM (the table).
+    pub value_tid: u32,
+    /// Entries the gather takes: the gathered tile's SLOW extent, one index per gathered row.
+    pub entries: u32,
+    /// ⭐ WHERE THIS TILE'S RUN STARTS IN THE INDEX BUFFER, AS THE PROGRAM STATES IT — a raw
+    /// entry word. [`gathers_over_tiles`] is the reader that folds it into an
+    /// [`crate::superdsc_opspec::EntryBase`] and refuses a non-stick anchor; a claim reader
+    /// takes it raw.
+    pub first_entry: i64,
+    /// ⭐ THE TILE'S OWN RESULT — the `ktdp.construct_indirect_access_tile` value these
+    /// facts were read from, the identity a claim set carries ([`Gather::tile`]).
+    pub tile: Ssa,
+    /// ⭐ THE GATHERED LOAD — the `ktdp.load` over [`GatherFacts::tile`] whose result
+    /// carries the gathered rows ([`Gather::load`]).
+    pub load: Ssa,
+}
+
+/// One tile's [`GatherFacts`] — the per-tile walk every gather reader runs, alone here so
+/// the set readers and the claiming readers cannot disagree about what one tile states.
+pub fn gather_facts_at_tile(k: &KtirNode, tile: &Operation<'_>) -> Result<GatherFacts, Error> {
+    let f = &k.func;
+    let consts = index_constants(&k.func);
+    // The SAME param walk `gather_of` runs, per tile — a closure over this tile's operands so
+    // the two readings cannot disagree about which parameter a tile's view names.
+    let param_tid = |slot: usize, what: &str| -> Result<u32, Error> {
+        let view_v = tile.operands.get(slot).copied().ok_or_else(|| Error {
             message: format!(
-                "{}: the indirect access tile states no 2-D `shape`, so the number of gathered \
-                 entries is unknown",
+                "{}: the indirect access tile states no {what} operand — a gather needs both the \
+                     tensor it reads and the index vector that chooses the rows",
                 f.name
             ),
         })?;
-        // ⭐⭐⭐ THE TRIP'S ANCHOR — where this tile's run of entries starts in the index buffer.
-        // `dim_kinds[0]` is `"indirect"` and its `dim_subs[0]` is `Add(Sym(0), Dim(0))`: enumeration
-        // row `Dim(0)` reads index word `Sym(0) + row`, with `Sym(0)` named by `intermediate_vars[0]`.
-        // A one-block program states 0 (folded away or cast, both of which `index_constants`
-        // resolves); an unrolled sweep's trip `b` states `b · BLOCK_N`, and this walk refuses a
-        // tile whose anchor is NOT a constant by name rather than gathering from index word 0 —
-        // the silent wrong-row shape `EntryBase` exists to make unrepresentable at the emitter.
-        let first_entry = {
-            let kinds = tile.attr(AttrKey::DimKinds);
-            let vars = tile.attr(AttrKey::IntermediateVars);
-            let subs = tile.attr(AttrKey::DimSubs);
-            let (
-                Some(Attr::StrList(kinds)),
-                Some(Attr::Ssas(vars)),
-                Some(Attr::AffineMapList(subs)),
-            ) = (kinds, vars, subs)
-            else {
-                return err(format!(
-                    "{}: an indirect access tile states no `dim_kinds`/`intermediate_vars`/`dim_subs` \
+        let view = f
+            .operations
+            .iter()
+            .find(|o| o.result == Some(view_v) && o.op_type == OpKind::KtdpConstructMemoryView)
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{}: the indirect access tile's {what} operand is not a \
+                         `ktdp.construct_memory_view`, so no parameter can be named for it",
+                    f.name
+                ),
+            })?;
+        let ptr = view.operands.first().copied();
+        let i = f
+            .arguments
+            .iter()
+            .position(|(a, _)| Some(*a) == ptr)
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{}: the indirect access tile's {what} view does not reinterpret a PARAMETER, \
+                         so the buffer it names has no binding and no placement",
+                    f.name
+                ),
+            })?;
+        k.bindings.get(i).map(|b| b.get()).ok_or_else(|| Error {
+            message: format!("{}: parameter {i} has no bound buffer", f.name),
+        })
+    };
+    let value_tid = param_tid(0, "gathered")?;
+    let index_tid = param_tid(1, "index")?;
+    if value_tid == index_tid {
+        return err(format!(
+            "{}: the gather's index view and the tensor it gathers are the SAME parameter \
+                 (t{value_tid}) — one HBM allocation cannot be both this gather's `index_tensor` and \
+                 its `value_tensor`, which is the bidirectional `relatedIndirectAccessAlloc_` pair dbo \
+                 follows in both directions.",
+            f.name
+        ));
+    }
+    let (entries, _) = shape_2d(tile).ok_or_else(|| Error {
+        message: format!(
+            "{}: the indirect access tile states no 2-D `shape`, so the number of gathered \
+                 entries is unknown",
+            f.name
+        ),
+    })?;
+    // ⭐⭐⭐ THE TRIP'S ANCHOR — where this tile's run of entries starts in the index buffer.
+    // `dim_kinds[0]` is `"indirect"` and its `dim_subs[0]` is `Add(Sym(0), Dim(0))`: enumeration
+    // row `Dim(0)` reads index word `Sym(0) + row`, with `Sym(0)` named by `intermediate_vars[0]`.
+    // A one-block program states 0 (folded away or cast, both of which `index_constants`
+    // resolves); an unrolled sweep's trip `b` states `b · BLOCK_N`, and this walk refuses a
+    // tile whose anchor is NOT a constant by name rather than gathering from index word 0 —
+    // the silent wrong-row shape `EntryBase` exists to make unrepresentable at the emitter.
+    let first_entry = {
+        let kinds = tile.attr(AttrKey::DimKinds);
+        let vars = tile.attr(AttrKey::IntermediateVars);
+        let subs = tile.attr(AttrKey::DimSubs);
+        let (Some(Attr::StrList(kinds)), Some(Attr::Ssas(vars)), Some(Attr::AffineMapList(subs))) =
+            (kinds, vars, subs)
+        else {
+            return err(format!(
+                "{}: an indirect access tile states no `dim_kinds`/`intermediate_vars`/`dim_subs` \
                      triple, so where its run of entries starts in the index buffer is unknown — the \
                      gather would read index word 0 by default",
-                    f.name
-                ));
-            };
-            let Some(d) = kinds.iter().position(|k| *k == "indirect") else {
-                return err(format!(
-                    "{}: an indirect access tile states no `indirect` dim, so no subscript names the \
+                f.name
+            ));
+        };
+        let Some(d) = kinds.iter().position(|k| *k == "indirect") else {
+            return err(format!(
+                "{}: an indirect access tile states no `indirect` dim, so no subscript names the \
                      index buffer it reads",
-                    f.name
-                ));
-            };
-            let Some(sub) = subs.get(d) else {
-                return err(format!(
-                    "{}: the indirect access tile's dim {d} carries no `dim_subs` map",
-                    f.name
-                ));
-            };
-            // ⛔ THE SUBSCRIPT MUST BE `Sym(0) + Dim(0)` AND NOTHING ELSE — the one form
-            // `gather_subscripts` builds and the one this reading can fold into an entry base. A
-            // tile with a scaled or second-symbol subscript names a different addressing program,
-            // and guessing its constant is an address; refusing names the map.
-            let anchor = match sub.exprs.first() {
-                Some(AffineExpr::Add(a, b)) => match (a, b) {
-                    (AffineExpr::Sym(i), AffineExpr::Dim(j)) if *i < vars.len() && *j == 0 => {
-                        consts.get(&vars[*i]).copied()
-                    }
-                    (AffineExpr::Dim(j), AffineExpr::Sym(i)) if *i < vars.len() && *j == 0 => {
-                        consts.get(&vars[*i]).copied()
-                    }
-                    _ => None,
-                },
-                Some(AffineExpr::Dim(j)) if *j == 0 => Some(0),
+                f.name
+            ));
+        };
+        let Some(sub) = subs.get(d) else {
+            return err(format!(
+                "{}: the indirect access tile's dim {d} carries no `dim_subs` map",
+                f.name
+            ));
+        };
+        // ⛔ THE SUBSCRIPT MUST BE `Sym(0) + Dim(0)` AND NOTHING ELSE — the one form
+        // `gather_subscripts` builds and the one this reading can fold into an entry base. A
+        // tile with a scaled or second-symbol subscript names a different addressing program,
+        // and guessing its constant is an address; refusing names the map.
+        let anchor = match sub.exprs.first() {
+            Some(AffineExpr::Add(a, b)) => match (a, b) {
+                (AffineExpr::Sym(i), AffineExpr::Dim(j)) if *i < vars.len() && *j == 0 => {
+                    consts.get(&vars[*i]).copied()
+                }
+                (AffineExpr::Dim(j), AffineExpr::Sym(i)) if *i < vars.len() && *j == 0 => {
+                    consts.get(&vars[*i]).copied()
+                }
                 _ => None,
-            };
-            let Some(anchor) = anchor else {
-                return err(format!(
-                    "{}: the indirect access tile's subscript for dim {d} is not the form this \
+            },
+            Some(AffineExpr::Dim(j)) if *j == 0 => Some(0),
+            _ => None,
+        };
+        let Some(anchor) = anchor else {
+            return err(format!(
+                "{}: the indirect access tile's subscript for dim {d} is not the form this \
                      reader folds (`Sym(0) + Dim(0)` with `Sym(0)` a constant, or a bare `Dim(0)`), so \
                      where this gather's entries start in the index buffer is unknown — the gather \
                      would read index word 0 by default. State the trip's anchor as a constant.",
-                    f.name
-                ));
-            };
-            if anchor < 0 || anchor > u32::MAX as i64 {
-                return err(format!(
-                    "{}: the indirect access tile's index anchor is {anchor}, which is not a u32 \
-                     entry count",
-                    f.name
-                ));
-            }
-            // The constructor IS the stick-alignment check (issue 201 item 1): an anchor that is
-            // not a whole `SenUint32` stick into the index buffer refuses HERE, at the walk,
-            // before any descriptor exists — on both the uncut and the cut arm.
-            crate::superdsc_opspec::EntryBase::of_entries(anchor as u32).map_err(|msg| Error {
-                message: format!("{}: {msg}", f.name),
-            })?
+                f.name
+            ));
         };
-        // ⛔ THE ONE NEW DISCRIMINATOR: every tile must name the SAME parameter pair. A second
+        if anchor < 0 || anchor > u32::MAX as i64 {
+            return err(format!(
+                "{}: the indirect access tile's index anchor is {anchor}, which is not a u32 \
+                     entry count",
+                f.name
+            ));
+        }
+        anchor
+    };
+    // ⭐ THIS TILE'S GATHERED LOAD — the `ktdp.load` over the tile, found HERE so the value
+    // travels with the gather. Exactly one load per tile: the tile IS the statement "the row
+    // index is data", and a tile with no load states a gather nothing reads (refused below as
+    // uncarried) while two loads over one tile would be two gathers on one descriptor shape.
+    let Some(tv) = tile.result else {
+        return err(format!(
+            "{}: an indirect access tile states no result, so no `ktdp.load` can read it and \
+                 the gather it describes never happens",
+            f.name,
+        ));
+    };
+    let loads: Vec<&Operation<'_>> = f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::KtdpLoad && o.operands.first() == Some(&tv))
+        .collect();
+    let [load] = loads[..] else {
+        return err(format!(
+            "{}: {} `ktdp.load` op(s) over one indirect access tile — one tile is ONE gather \
+                 (one index operand per descriptor, DSC2ToDataflowIR.cpp:51), and its rows reach \
+                 consumers through one value",
+            f.name,
+            loads.len(),
+        ));
+    };
+    let Some(load) = load.result else {
+        return err(format!(
+            "{}: the indirect access tile's `ktdp.load` states no result, so the gathered rows \
+                 have no identity to join by",
+            f.name,
+        ));
+    };
+    Ok(GatherFacts {
+        index_tid,
+        value_tid,
+        entries,
+        first_entry,
+        tile: tv,
+        load,
+    })
+}
+
+/// Every tile in `tiles`'s `Gather` — the facts read once per tile through
+/// [`gather_facts_at_tile`], then the descriptor-level stick law and the set-level
+/// same-pair discriminator, so the per-tile joins, the stick law, and the discriminator
+/// cannot drift apart.
+fn gathers_over_tiles(k: &KtirNode, tiles: &[&Operation<'_>]) -> Result<Vec<Gather>, Error> {
+    let f = &k.func;
+    let mut out: Vec<Gather> = Vec::with_capacity(tiles.len());
+    let tile_count = tiles.len();
+    for tile in tiles {
+        let facts = gather_facts_at_tile(k, tile)?;
+        // The constructor IS the stick-alignment check (issue 201 item 1): an anchor that is
+        // not a whole `SenUint32` stick into the index buffer refuses HERE, at the walk,
+        // before any descriptor exists — on both the uncut and the cut arm.
+        let first_entry = crate::superdsc_opspec::EntryBase::of_entries(facts.first_entry as u32)
+            .map_err(|msg| Error {
+            message: format!("{}: {msg}", f.name),
+        })?;
+        // ⛔ THE ONE DISCRIMINATOR: every tile must name the SAME parameter pair. A second
         // pair really is two gathers on one descriptor-shaped program — the shape `gather_of`
         // exists to refuse — and refusing it HERE names the pair instead of letting the walk
         // half-materialize one of them.
-        if out
-            .first()
-            .is_some_and(|first| first.index_tid != index_tid || first.value_tid != value_tid)
-        {
+        if out.first().is_some_and(|first| {
+            first.index_tid != facts.index_tid || first.value_tid != facts.value_tid
+        }) {
             return err(format!(
                 "{}: {} `ktdp.construct_indirect_access_tile` op(s) over {} different \
                  index/value parameter pairs — one descriptor carries ONE index operand \
@@ -405,45 +513,13 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
                 out.len() + 1
             ));
         }
-        // ⭐ THIS TILE'S GATHERED LOAD — the `ktdp.load` over the tile, found HERE so the value
-        // travels with the gather. Exactly one load per tile: the tile IS the statement "the row
-        // index is data", and a tile with no load states a gather nothing reads (refused below as
-        // uncarried) while two loads over one tile would be two gathers on one descriptor shape.
-        let Some(tv) = tile.result else {
-            return err(format!(
-                "{}: an indirect access tile states no result, so no `ktdp.load` can read it and \
-                 the gather it describes never happens",
-                f.name,
-            ));
-        };
-        let loads: Vec<&Operation<'_>> = f
-            .operations
-            .iter()
-            .filter(|o| o.op_type == OpKind::KtdpLoad && o.operands.first() == Some(&tv))
-            .collect();
-        let [load] = loads[..] else {
-            return err(format!(
-                "{}: {} `ktdp.load` op(s) over one indirect access tile — one tile is ONE gather \
-                 (one index operand per descriptor, DSC2ToDataflowIR.cpp:51), and its rows reach \
-                 consumers through one value",
-                f.name,
-                loads.len(),
-            ));
-        };
-        let Some(load) = load.result else {
-            return err(format!(
-                "{}: the indirect access tile's `ktdp.load` states no result, so the gathered rows \
-                 have no identity to join by",
-                f.name,
-            ));
-        };
         out.push(Gather {
-            index_tid,
-            value_tid,
-            entries,
+            index_tid: facts.index_tid,
+            value_tid: facts.value_tid,
+            entries: facts.entries,
             first_entry,
-            tile: tv,
-            load,
+            tile: facts.tile,
+            load: facts.load,
         });
     }
     Ok(out)

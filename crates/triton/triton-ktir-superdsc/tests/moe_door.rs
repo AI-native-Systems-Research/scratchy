@@ -43,7 +43,12 @@
 //! ahead) emits its legs under. The splice fold will name the fused kind when it lands;
 //! the label changes with it, one word.
 
-use ktir_superdsc::ktir_node::Program;
+use ktir_core::ir::Ssa;
+use ktir_core::opkind::OpKind;
+use ktir_superdsc::emit::lower_ktir_to_superdsc::{
+    gather_facts_at_tile, gathers_of, gathers_of_excluding,
+};
+use ktir_superdsc::ktir_node::{KtirNode, Program};
 use std::collections::HashMap;
 use triton_frontend::codegen::{self, ArgSpec, KernelSpec};
 use triton_frontend::opt;
@@ -116,15 +121,20 @@ fn spec() -> KernelSpec {
 /// The whole ladder, value-level: `.py` → TTIR → KTIR → the node the door takes. `Err`
 /// carries the first stage's refusal text, so a ladder-stage break and a door refusal
 /// are distinguishable in the assertion message.
-fn drive() -> Result<Vec<String>, String> {
+fn drive_node() -> Result<KtirNode, String> {
     let mut tt =
         codegen::compile(SRC, &spec(), Target::spyre()).map_err(|e| format!("codegen: {e}"))?;
     opt::make_ttir(&mut tt).map_err(|e| format!("make_ttir: {e}"))?;
     let mut m = triton_ktir::from_ttir::convert(&tt).map_err(|e| format!("from_ttir: {e}"))?;
     triton_ktir::make_ktir(&mut m, &[1]).map_err(|e| format!("make_ktir: {e}"))?;
     triton_ktir::passes::to_ktir::run(&mut m, &[1]).map_err(|e| format!("to_ktir: {e}"))?;
-    let node = triton_ktir_superdsc::node_for(&m, Program::ExpertMatmul)
-        .map_err(|e| format!("handoff: {}", e.message))?;
+    triton_ktir_superdsc::node_for(&m, Program::ExpertMatmul)
+        .map_err(|e| format!("handoff: {}", e.message))
+}
+
+/// The node through the door: the op names a full recognition would emit.
+fn drive() -> Result<Vec<String>, String> {
+    let node = drive_node()?;
     let ops = triton_ktir_superdsc::emit_whole(&node, None)
         .map_err(|e| format!("door: {}", e.message))?;
     Ok(ops.into_iter().map(|o| o.op_name.clone()).collect())
@@ -167,5 +177,127 @@ fn the_fused_moe_kernel_is_refused_at_the_door_naming_the_first_unrecognised_op(
             && err.contains("one descriptor carries ONE index operand"),
         "rung one: the door's first refusal moved or changed shape — update this pin \
          DELIBERATELY (it is the recogniser campaign's work queue), do not delete it: {err:?}"
+    );
+}
+
+/// ⛔ THE EXCLUSION CONTRACT — rung one's reader called DIRECTLY, pinning the seam the W8A8
+/// pre-read will claim its gate/up tiles through before that recogniser exists:
+///
+/// * the UNCLAIMED read refuses the fused kernel's 48 tiles (rung one's door pin, stated at
+///   the reader itself);
+/// * claiming ONE tile moves the count, never the verdict — a claim cannot merge two banks
+///   into one pair;
+/// * the per-tile FACTS reader carries no set judgement and no stick law: every one of the
+///   48 tiles reads clean, and every expert pair's tiles anchor at their own index WORD
+///   (0..7), all inside `desc_ids`'s first `SenUint32` stick — the raw-anchor fact the
+///   W8A8 pre-read verifies per tile and re-stages at emission (the m=1 body's minted,
+///   replicated, stick-aligned index);
+/// * claiming ONE BANK (one descriptor's 8 tiles) still refuses — five pairs remain, and
+///   only the count moves with the claim; claiming ALL BANKS BUT ONE leaves ONE pair, the
+///   discriminator goes silent, and the refusal moves to the law that was next in line
+///   all along: the stick law, on the non-stick anchors of the pairs beyond the first.
+///   That is the refusal the recogniser takes over by claiming its tiles — the exclusion
+///   ends where the recogniser's own verification begins.
+///
+/// A claimed tile is CONSUMED, not forgiven. If this seam ever lets a mixed-pair set through
+/// without a whole bank claimed, the W8A8 step's exclusion is a discriminator relaxation
+/// wearing a claim's clothes.
+#[test]
+fn claimed_tiles_are_consumed_not_forgiven_by_the_gather_discriminator() {
+    let node = drive_node().expect("the ladder drive is rung one's own green path");
+    let unclaimed =
+        gathers_of(&node).expect_err("48 tiles over 2 parameter pairs is the rung-one refusal");
+    assert!(
+        unclaimed.message.contains("48")
+            && unclaimed
+                .message
+                .contains("different index/value parameter pairs"),
+        "the unclaimed read changed shape: {}",
+        unclaimed.message
+    );
+
+    // The census: 6 descriptors x 8 expert pairs. Claims are tile RESULT ssas — the
+    // identity `Gather::tile` carries, never a position in this enumeration.
+    let tiles: Vec<&_> = node
+        .func
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::KtdpConstructIndirectAccessTile)
+        .collect();
+    assert_eq!(
+        tiles.len(),
+        48,
+        "the census the rung-one pin was measured on"
+    );
+
+    // The FACTS: every tile reads through the per-tile walk alone — no stick law, no set
+    // judgement — the reading the W8A8 pre-read composes. Pin the raw anchors: every
+    // expert pair's tiles start at their own index word, all inside the first stick.
+    let facts: Vec<_> = tiles
+        .iter()
+        .map(|t| {
+            gather_facts_at_tile(&node, t)
+                .expect("every tile of the fused kernel reads clean through the per-tile walk")
+        })
+        .collect();
+    let mut anchors: Vec<i64> = facts.iter().map(|g| g.first_entry).collect();
+    anchors.sort_unstable();
+    anchors.dedup();
+    assert_eq!(
+        anchors,
+        (0..8).collect::<Vec<i64>>(),
+        "every expert pair's tiles anchor at its own index word in desc_ids"
+    );
+
+    // ONE claim: the count moves (48 -> 47 in the refusal), the verdict does not.
+    let first = facts[0];
+    let one = gathers_of_excluding(&node, &[first.tile])
+        .expect_err("one claimed tile cannot merge two banks into one pair");
+    assert!(
+        one.message.contains("47")
+            && one
+                .message
+                .contains("different index/value parameter pairs"),
+        "a single claim must move the count without softening the discriminator: {}",
+        one.message
+    );
+
+    // ONE BANK: one descriptor's tiles — 8 of them, one per expert pair. The census is
+    // 6 descriptors x 8 pairs (the rung-one message's "2 pairs" is pairs seen at the
+    // refusal, not the bank count), so a bank is one descriptor, not a weights/scales
+    // half, and claiming one leaves five pairs for the discriminator to judge.
+    let bank: Vec<Ssa> = facts
+        .iter()
+        .filter(|g| g.value_tid == first.value_tid)
+        .map(|g| g.tile)
+        .collect();
+    assert_eq!(bank.len(), 8, "one descriptor's tiles: one per expert pair");
+    let one_bank = gathers_of_excluding(&node, &bank)
+        .expect_err("one bank claimed leaves five banks over five pairs");
+    assert!(
+        one_bank.message.contains("40")
+            && one_bank
+                .message
+                .contains("different index/value parameter pairs"),
+        "one bank claimed must leave the discriminator judging the five remaining banks: {}",
+        one_bank.message
+    );
+
+    // ALL BANKS BUT ONE: five descriptors claimed, ONE pair left — the discriminator is
+    // silent, and the refusal moves to the stick law on the non-stick anchors (every
+    // pair but the first anchors at words 1..7). This is the refusal the W8A8 pre-read
+    // takes over: the recogniser verifies those raw anchors itself and re-stages them.
+    let other_banks: Vec<Ssa> = facts
+        .iter()
+        .filter(|g| g.value_tid != first.value_tid)
+        .map(|g| g.tile)
+        .collect();
+    assert_eq!(other_banks.len(), 40, "the other five descriptors' tiles");
+    let rest = gathers_of_excluding(&node, &other_banks)
+        .expect_err("one pair left must meet the stick law on its non-stick anchors");
+    assert!(
+        rest.message.contains("not a whole 32-entry"),
+        "with the discriminator silent, the stick law must fire on the non-stick pairs: {}",
+        rest.message
     );
 }
