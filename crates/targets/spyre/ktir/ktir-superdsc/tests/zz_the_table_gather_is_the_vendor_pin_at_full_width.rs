@@ -354,6 +354,8 @@ fn the_same_op_without_a_gather_declares_none() {
         out.name(),
         0,
         false,
+        None,
+        ktir_superdsc::work::EwDivision::Law,
     )
     .expect("the ungathered op builds");
     assert!(

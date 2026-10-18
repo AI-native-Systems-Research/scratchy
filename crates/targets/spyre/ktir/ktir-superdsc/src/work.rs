@@ -512,6 +512,122 @@ pub fn distribute_cores(dims: &[ItDim], max_cores: u32) -> BTreeMap<&'static str
     splits
 }
 
+/// ⭐⭐⭐ HOW AN ELEMENTWISE OP's CORES ARE SPENT — rows first or sticks first, decided by the op's operand
+/// layout and nothing else. See [`EwDivision::of`].
+///
+/// [`distribute_cores`] spends its cores on `mb` first, and for a FLAT row-major operand that is a
+/// correctness law (its own note: an out-split core mis-walks the rows, measured `nz=3968`). A STICK-MAJOR
+/// rank-2 operand is the other way round: its bytes are `[out/64][mb][64]`, so a core holding ALL rows of
+/// a run of sticks reads one CONTIGUOUS block, while a core holding a run of rows reads `cols/64` strided
+/// one-row bursts. MEASURED in isolation (#549's sweep, the real `mulsilu_o461` descriptor and placement,
+/// one CB, 32 cores): a `[256, 8192]` mul ran 249.8 µs at 50.4 GB/s rows-first and 121.8 µs at 103.3 GB/s
+/// sticks-first, flat across width at the copy band; `[256, 2048]` 50.0 → 30.3 µs. `out:8 × mb:4` lands on
+/// the `out:32` line, so it is the stick axis taking its share first that matters, not `mb` going unsplit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EwDivision {
+    /// THE LAW: whichever of the two below the op's operands call for ([`Self::resolve`]). Every
+    /// elementwise door passes this.
+    Law,
+    /// [`distribute_cores`]: `mb` first, then the other output dims largest-first. Stated outright only by
+    /// an op whose own addressing is keyed on `mb` being the split axis (the gathered-row leg, whose index
+    /// enumerates `mb` in whole entries).
+    RowsFirst,
+    /// [`distribute_cores_sticks_first`]: the stick dim's whole-stick split first, then `mb`.
+    SticksFirst,
+}
+
+impl EwDivision {
+    /// The concrete division. [`Self::Law`] resolves on the operands: `stick_major` is the builder's own
+    /// rank-2 stick-major presentation decision — the SAME value that picks the operands' layout, so the
+    /// layout and the division cannot disagree — and `core_local` is whether any operand is a core-local
+    /// LX pin. Such a tensor's division is its PRODUCER's, held by `emit_sdsc_tiled`'s read law and sized
+    /// by [`crate::emit::pointwise_untiled_slice_bytes`], so an op touching one keeps the rows-first
+    /// division those were laid out under. The two concrete divisions resolve to themselves.
+    pub const fn resolve(self, stick_major: bool, core_local: bool) -> EwDivision {
+        match self {
+            EwDivision::Law if stick_major && !core_local => EwDivision::SticksFirst,
+            EwDivision::Law => EwDivision::RowsFirst,
+            concrete => concrete,
+        }
+    }
+
+    /// The splitter this division names, in the shape [`WorkPlan::divide`] takes. [`Self::Law`] is not a
+    /// splitter until it is resolved, so it names the rows-first one — the law's answer when there is
+    /// nothing to resolve it on — and every door resolves before asking.
+    pub fn splitter(self) -> fn(&[ItDim], u32) -> BTreeMap<&'static str, u32> {
+        match self {
+            EwDivision::Law | EwDivision::RowsFirst => distribute_cores,
+            EwDivision::SticksFirst => distribute_cores_sticks_first,
+        }
+    }
+}
+
+/// [`distribute_cores`] with the STICK dim served FIRST — for a stick-major rank-2 elementwise op
+/// ([`EwDivision::SticksFirst`]). Reductions are never split, for [`distribute_cores`]' own reason.
+///
+/// The stick dim takes the LARGEST whole-stick split that, with `mb` splitting the cores it leaves, fills
+/// the most cores; then any other output dim splits what remains, largest first. Each core holds whole
+/// sticks (the basis is the stick COUNT at the dim's own format, as there).
+///
+/// ⛔ NOT "the stick dim's largest split, then `mb`". That greedy order strands cores whenever the stick
+/// count has no divisor near `max_cores`: granite-3.1-8b's second MLP column chunk is 72 sticks, whose
+/// largest divisor ≤ 32 is 24 — and `32 / 24` leaves `mb` one core, so the op would run on 24 cores where
+/// rows-first ran 32. Searching the stick split for the most cores gives `out:8 × mb:4`, which is on the
+/// `out:32` line in #549's sweep. It is also why this can never use FEWER cores than [`distribute_cores`]:
+/// that plan's stick split is one of the candidates, and `mb` given at least as many cores splits at
+/// least as far.
+pub fn distribute_cores_sticks_first(
+    dims: &[ItDim],
+    max_cores: u32,
+) -> BTreeMap<&'static str, u32> {
+    let mut splits: BTreeMap<&'static str, u32> = BTreeMap::new();
+    let outs: Vec<&ItDim> = dims.iter().filter(|d| !d.is_reduction).collect();
+    let stick = outs.iter().copied().find(|d| d.is_stick);
+    let mb = outs.iter().copied().find(|d| d.name == "mb" && !d.is_stick);
+    let mut remaining = max_cores;
+    if let Some(s) = stick {
+        let sticks = s.size.div_ceil(s.df.elems_per_stick());
+        let mb_size = mb.map_or(1, |d| d.size);
+        // The stick split filling the most cores with `mb`; ON A TIE, THE WIDER STICK SPLIT — the most
+        // contiguous sticks per core is what #549's (e) cells measured as the win, so among equal core
+        // counts the plan leans to `out`. 1 is always a candidate (it divides everything), so the search is
+        // never empty. Pinned against the whole candidate set by the exhaustive test.
+        let (ss, ms) = (1..=sticks.min(max_cores))
+            .filter(|c| sticks.is_multiple_of(*c))
+            .map(|c| (c, core_split(mb_size, max_cores / c)))
+            .max_by_key(|&(c, m)| (c * m, c))
+            .unwrap_or((1, 1));
+        if ss > 1 {
+            splits.insert(s.name, ss);
+        }
+        if ms > 1
+            && let Some(d) = mb
+        {
+            splits.insert(d.name, ms);
+        }
+        remaining = max_cores / (ss * ms);
+    }
+    // Then the other output dims (and `mb`, when there is no stick dim), largest first.
+    let mut rest: Vec<&ItDim> = outs
+        .into_iter()
+        .filter(|d| {
+            !splits.contains_key(d.name) && !d.is_stick && !(stick.is_some() && d.name == "mb")
+        })
+        .collect();
+    rest.sort_by_key(|d| std::cmp::Reverse(d.size));
+    for d in rest {
+        if remaining <= 1 {
+            break;
+        }
+        let split = core_split(d.size, remaining);
+        if split > 1 {
+            splits.insert(d.name, split);
+            remaining /= split;
+        }
+    }
+    splits
+}
+
 /// Per-core slice index along each split dim, for `coreIdToWkSlice_`. Cores are
 /// numbered row-major over the split dims in `splits` insertion order: for
 /// `{out:2, mb:16}`, core c → out = c/16, mb = c%16 (matches the real fixture:
