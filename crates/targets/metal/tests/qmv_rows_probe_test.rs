@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The affine matvec at 1-4 rows, plain and normalizing its input on load (`QmvEnds::norm`), at
-//! decode shapes of Qwen3.6-35B-A3B (4-bit) and GLM-4.5-Air (3-bit). This is the sweep
+//! decode shapes of Qwen3.6-35B-A3B (4-bit), GLM-4.5-Air (3-bit), gpt-oss (4-bit) and its P-EAGLE
+//! drafter (3-bit MLP), and past one row the fast kernel's fold twin beside the wide pick. On a
+//! base M5 gpt-oss's 4-bit shapes cost at 4 rows what one row costs (q_proj 72.9 vs 72.8 µs), the
+//! drafter's 3-bit MLP 35% more (gate/up 151 → 206 µs), the fold twin more again. This is the sweep
 //! `ModelFoldFacts::matvec_norms` (the norm folds on the one-row bucket alone) was measured on:
 //! base M5, the plain wide matvec at 3-4 rows costs what one row costs, while normalizing on load
 //! makes it ALU-bound (Qwen3.6's 248k-row lm_head at 4 rows 2137 vs 3302 µs; one row 2131 vs
@@ -58,6 +61,13 @@ const SHAPES: &[Shape] = &[
     shape("qwen3.6 q+gate", 8192, 2048, 4),
     shape("glm lm_head", 151552, 4096, 3),
     shape("glm q_proj", 12288, 4096, 3),
+    shape("gpt-oss lm_head", 201088, 2880, 4),
+    shape("gpt-oss q_proj", 4096, 2880, 4),
+    shape("gpt-oss k/v_proj", 512, 2880, 4),
+    shape("gpt-oss o_proj", 2880, 4096, 4),
+    shape("p-eagle mid q_proj", 4096, 5760, 4),
+    shape("p-eagle mlp gate/up", 14336, 2880, 3),
+    shape("p-eagle mlp down", 2880, 14336, 3),
 ];
 
 fn bf16_row(len: usize, v: f32) -> Vec<u16> {
@@ -91,7 +101,10 @@ fn qmv_rows_plain_and_normalizing_on_load() {
         }),
         ..QmvEnds::default()
     };
-    println!("µs a dispatch: rows 1-4, plain (p) and normalizing on load (n)");
+    println!(
+        "µs a dispatch: rows 1-4, plain (p), normalizing on load (n), and past one row the fast \
+         kernel's fold twin (f)"
+    );
     for s in SHAPES {
         let (n, k) = (s.n as usize, s.k as usize);
         let bytes = n * k * s.bits as usize / 8;
@@ -114,10 +127,16 @@ fn qmv_rows_plain_and_normalizing_on_load() {
         let y = shared_zeroed(&device, 4 * n * 2);
         let mut line = format!("{:<20}", s.name);
         for m in 1..=4u32 {
-            for ends in [QmvEnds::default(), normed] {
+            // Past one row, the fast kernel's fold twin (`wide_ok` false, every row streaming
+            // the weights) beside the wide matvec the gen-15 pick makes.
+            let twin = (m > 1).then_some((QmvEnds::default(), false));
+            for (ends, wide_ok) in [(QmvEnds::default(), true), (normed, true)]
+                .into_iter()
+                .chain(twin)
+            {
                 let kernel = match m {
                     1 => pick_qmv_kernel(s.n, s.k, s.bits),
-                    _ => pick_qmv_kernel_wide(s.n, s.k, s.bits, m, true),
+                    _ => pick_qmv_kernel_wide(s.n, s.k, s.bits, m, wide_ok),
                 };
                 let name = qmv_kernel_static_name(
                     kernel,
@@ -169,7 +188,11 @@ fn qmv_rows_plain_and_normalizing_on_load() {
                 // Warm-up batch (first-run pipeline + residency), then best of 3.
                 time();
                 let best = (0..3).map(|_| time()).fold(f64::MAX, f64::min);
-                let tag = if ends.norm.is_some() { 'n' } else { 'p' };
+                let tag = match (ends.norm.is_some(), wide_ok) {
+                    (true, _) => 'n',
+                    (false, true) => 'p',
+                    (false, false) => 'f',
+                };
                 line += &format!("  {m}{tag} {best:7.1}");
             }
         }
