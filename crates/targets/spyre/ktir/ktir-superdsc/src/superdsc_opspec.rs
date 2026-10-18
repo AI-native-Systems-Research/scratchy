@@ -110,6 +110,43 @@ const _: () = assert!(
     "vendor LX scheduler budget: (2 MiB - 64 KiB) * 0.8 = 406,323 B"
 );
 
+/// LX the dxp memory tracker manages per core: the 2 MiB scratchpad less the 64 KiB the toolchain keeps
+/// for program and debug data (`sys-arch-spec/sysdef.cpp:211`, `lxCapacity = lxCap - 64 * 1024`).
+/// `reserveFrontendLx` reads its `memCapacity`.
+pub const LX_TRACKER_CAPACITY_BYTES: u64 = LX_CAPACITY_BYTES - 64 * 1024;
+
+/// dxp's allocation granularity, in bytes. The tracker is built at `bytesPerStick` (128), and every
+/// reservation is rounded up to it.
+pub const LX_ALLOCATION_GRANULARITY_BYTES: u64 = 128;
+
+/// ⭐⭐⭐ WHERE THE FRONTEND's LX ENDS AND dxp's BEGINS, on every core: an exclusive upper bound, in bytes.
+///
+/// dbo's `reserveFrontendLx` (`dbo/src/Transforms/ProgramLayout.cpp:81-98`) marks
+/// `int64_t reserved = memCapacity * (1 - lx_avail_frac)` bytes of each core's LX tracker taken, from
+/// address 0, before it places any op. `lx_avail_frac` is `DXP_LX_FRAC_AVAIL`, default 0.2. The tracker
+/// rounds the reservation up to its 128-byte granularity. dxp then allocates every landing, staging
+/// buffer and spill AT OR ABOVE this address. torch-spyre computes the same boundary for its own LX
+/// planning (`scratchpad/allocator.py`, `_lx_planning_size`).
+///
+/// So `[0, FRONTEND_LX_END)` is the only LX a pinned intermediate may occupy. A pin past it shares bytes
+/// with whatever dxp places there, and dxp cannot see it. Measured: every landing in a real granite
+/// bundle sits in sticks `[12698, 14778]`, and stick 12698 is exactly this address.
+///
+/// ⛔ IT IS A CONTRACT CONSTANT, NOT A PER-BUNDLE VALUE. Its inputs are the scratchpad size, the 64 KiB
+/// program reservation, the granularity and `DXP_LX_FRAC_AVAIL`. The bake removes that knob from every
+/// dxp child (`DxpTool::compile`), so dxp always runs at the default this constant is computed from.
+/// `FRONTEND_LX_END == 1_625_344` is pinned by `the_frontend_lx_end_is_dbos_reservation`, which
+/// recomputes it from dbo's own formula.
+pub const FRONTEND_LX_END: u64 = {
+    let reserved = (LX_TRACKER_CAPACITY_BYTES as f64 * (1.0 - DXP_LX_FRAC_AVAIL)) as u64;
+    reserved.div_ceil(LX_ALLOCATION_GRANULARITY_BYTES) * LX_ALLOCATION_GRANULARITY_BYTES
+};
+
+const _: () = assert!(
+    FRONTEND_LX_END == 1_625_344,
+    "the frontend LX end: round_up_128(trunc((2 MiB - 64 KiB) * (1 - 0.2))) = 1,625,344 B"
+);
+
 /// fp16 = 2 bytes / element. The emitter is fp16-only ([`Fp16::WORD_LENGTH`]);
 /// this alias documents the residency-byte arithmetic in [`WorkPlan::time_tile_for_lx`].
 pub const FP16_BYTES: u64 = 2;
@@ -3471,6 +3508,31 @@ impl OpSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⭐ THE FRONTEND's LX END IS dbo's OWN RESERVATION, recomputed from the formula's named inputs rather
+    /// than read back from the constant. `reserveFrontendLx` (`dbo/src/Transforms/ProgramLayout.cpp:81-98`)
+    /// reserves `int64_t(memCapacity * (1 - DXP_LX_FRAC_AVAIL))` per core, where `memCapacity` is
+    /// `sysdef.cpp:211`'s `lxCap - 64 * 1024` and `DXP_LX_FRAC_AVAIL` defaults to 0.2. The tracker rounds it
+    /// up to 128 bytes. That boundary is the LX landing floor measured on card: stick 12698.
+    #[test]
+    fn the_frontend_lx_end_is_dbos_reservation() {
+        let lx_cap: u64 = 2 * 1024 * 1024;
+        let program_and_debug: u64 = 64 * 1024;
+        let lx_avail_frac = 0.2f64;
+        let granularity: u64 = 128;
+        let mem_capacity = lx_cap - program_and_debug;
+        // `int64_t reserved = lx_tracker.memCapacity * (1 - lx_avail_frac);` — truncation toward zero.
+        let reserved = (mem_capacity as f64 * (1.0 - lx_avail_frac)).trunc() as u64;
+        let end = reserved.div_ceil(granularity) * granularity;
+        assert_eq!(end, FRONTEND_LX_END);
+        assert_eq!(end, 1_625_344);
+        assert_eq!(end / 128, 12_698, "the measured landing floor, in sticks");
+        // The named inputs are the constants the formula uses, so a change to either side shows here.
+        assert_eq!(LX_CAPACITY_BYTES, lx_cap);
+        assert_eq!(LX_TRACKER_CAPACITY_BYTES, mem_capacity);
+        assert_eq!(DXP_LX_FRAC_AVAIL, lx_avail_frac);
+        assert_eq!(LX_ALLOCATION_GRANULARITY_BYTES, granularity);
+    }
 
     #[test]
     fn stick_extent_rejects_sub_stick() {

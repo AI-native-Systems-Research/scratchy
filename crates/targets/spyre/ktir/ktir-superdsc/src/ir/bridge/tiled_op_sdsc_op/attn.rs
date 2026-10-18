@@ -1745,9 +1745,9 @@ fn assemble_attn_block(
 }
 
 /// The split-KV chunk's own buffer NAMES — the gather scratches and the per-kv-head wide blocks.
-/// The LX-resident gather's tensors: the law, and each leg's core-local tensor names by
-/// [`crate::sdsc_abstract::ChunkLx::lx_tensor`]. Kᵗ's exist only with its witness
-/// ([`crate::sdsc_abstract::ChunkLx::keys`], a chunk with no tail).
+/// The LX-resident gather's tensors: the law, and each leg's core-local tensor names — V's by
+/// [`crate::sdsc_abstract::ChunkLx::lx_tensor`], Kᵗ's by [`crate::sdsc_abstract::ChunkKeysLx::tensor`].
+/// Kᵗ's exist only with its witness ([`crate::sdsc_abstract::ChunkLx::keys`], a chunk with no Kᵗ tail).
 struct ChunkLxBufs {
     form: crate::sdsc_abstract::ChunkLx,
     keys: Option<(crate::sdsc_abstract::ChunkKeysLx, Vec<String>)>,
@@ -1768,9 +1768,9 @@ struct ChunkBufs {
     gkt: String,
     gv: String,
     // ⭐ THE GATHER IN LX, where the chunk's geometry lets the copies' division be the score's and PV's
-    // (`ChunkScratch::lx_form`): one core-local tensor per (part, kv head) per leg, indexed by
-    // `ChunkLx::lx_tensor`. `gkt` and `gv` then hold only the tail's pages, if there is a tail. `None`
-    // keeps the HBM scratches for the whole chunk.
+    // (`ChunkScratch::lx_form`): one core-local tensor per (part, kv head) for Kᵗ and per (part, kv head,
+    // slab) for V. `gkt` and `gv` then hold only what stays in HBM: Kᵗ whole when it has a tail, V's
+    // tail pages. `None` keeps the HBM scratches for the whole chunk.
     lx: Option<ChunkLxBufs>,
     csc: String,
     cesub: String,
@@ -2350,8 +2350,8 @@ fn assemble_attn_chunk(
 
     // ── (1) THE GATHER: every page's Kᵗ and V blocks, kv-head-major, into the two scratches. V's copies
     //    read V's own slab-major index run above one slab (`ChunkScratch::value_copies`). Where the gather
-    //    stays in LX (`cb.lx`), both legs read ONE part-major run: a whole part's copy lands in its leg's
-    //    (part, kv head) core-local tensor, and a tail copy in its leg's tail HBM scratch. ──
+    //    stays in LX (`cb.lx`), each leg reads its part-major run (ONE shared run at one slab): a whole
+    //    part's copy lands in its own core-local tensor, and a V tail copy in V's tail HBM scratch. ──
     type Copies<'c> = Vec<(&'c str, crate::sdsc_abstract::GatherCopy)>;
     let (k_copies, v_copies): (Copies<'_>, Copies<'_>) = match &cb.lx {
         None => (
@@ -2490,14 +2490,13 @@ fn assemble_attn_chunk(
             ));
             continue;
         };
-        // ⭐ WHERE Kᵗ STAYS IN LX, ONE SCORE PER (row block, part). Each fills its part's columns of the
-        // block's score row block and adds its part's columns of the mask, reading its (part, kv head)
+        // ⭐ WHERE Kᵗ STAYS IN LX, ONE SCORE PER (row block, Kᵗ part). Each fills its part's columns of
+        // the block's score row block and adds its part's columns of the mask, reading its (part, kv head)
         // core-local Kᵗ at the pin. Each part's slots are divided across the cores one stick each,
         // exactly as its copy delivered them (`emit`'s core-local read law proves it per op). Kᵗ stays
-        // in LX only with its witness (`ChunkLx::keys`, a chunk with no tail), so every part is whole.
-        let form = keys.form();
-        for (p, part) in chunk.slot_parts(form.part_pages()).enumerate() {
-            let k_name = kt[form.lx_tensor(p as u32, kvh) as usize].as_str();
+        // in LX only with its witness (`ChunkLx::keys`, a chunk with no Kᵗ tail), so every part is whole.
+        for (p, part) in chunk.slot_parts(keys.part_pages()).enumerate() {
+            let k_name = kt[keys.tensor(p as u32, kvh) as usize].as_str();
             let pc = corner(part.probs_corner(blocks, b), "a row block's score part")?;
             ops.push(assemble_matmul_off_with_epilogue(
                 &format!("attn_csc_{}_k{p}_o{t}", blk_name(b)),
@@ -2793,8 +2792,8 @@ fn assemble_attn_chunk(
     // only a prompt chunk's rows-divided PV is cut.
     let decode_values = mq == 1 || matches!(history, ChunkHistory::Requests(_));
     // ⭐ AN LX-RESIDENT V IS CUT INTO ITS OWN PARTS (`ChunkLx::part_pages`), one copy per (part, kv
-    // head): each whole part's PV reads that part's core-local tensor, and the tail reads the HBM scratch.
-    // The parts fold through the same ping-pong.
+    // head, slab): each whole part's PV reads that part's core-local tensor for its slab, and the tail
+    // reads the HBM scratch. The parts fold through the same ping-pong.
     let parts: Vec<crate::sdsc_abstract::ChunkPart> = match &cb.lx {
         None => chunk.value_parts(!decode_values).collect(),
         Some(lx) => chunk.slot_parts(lx.form.part_pages()).collect(),
@@ -2817,20 +2816,20 @@ fn assemble_attn_chunk(
             let v = RowBlockValue::of(blocks, b, s, mq, q_rows, hd);
             let o_off = v.out_off;
             for (p, part) in parts.iter().enumerate() {
-                // An LX-resident part is its (part, kv head) core-local tensor, read at its pin (no
-                // corner). The tail is kv head `kvh`'s block of the tail's HBM scratch.
+                // An LX-resident part is its (part, kv head, slab) core-local tensor, read at its pin (no
+                // corner). The tail is kv head `kvh`'s slab `s` of the tail's HBM scratch.
                 let (v_name, kc) = match &cb.lx {
                     None => (
                         cb.gv.as_str(),
                         corner(part.value_corner(kvh, s), "a kv head's value block")?,
                     ),
                     Some(lx) if (p as u32) < lx.form.lx_parts() => (
-                        lx.v[lx.form.lx_tensor(p as u32, kvh) as usize].as_str(),
+                        lx.v[lx.form.lx_tensor(p as u32, kvh, s) as usize].as_str(),
                         DevOff::ZERO,
                     ),
                     Some(lx) => (
                         cb.gv.as_str(),
-                        corner(lx.form.tail_corner(kvh), "a kv head's tail value block")?,
+                        corner(lx.form.tail_corner(kvh, s), "a kv head's tail value block")?,
                     ),
                 };
                 let rc = corner(
@@ -4068,9 +4067,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         let lx = chunk.lx_form(chunk_rows).map(|form| ChunkLxBufs {
             form,
             keys: form.keys().map(|keys| {
-                let names = (0..form.lx_tensors())
-                    .map(|i| syn(R::GatherKtLx(i)))
-                    .collect();
+                let names = (0..keys.tensors()).map(|i| syn(R::GatherKtLx(i))).collect();
                 (keys, names)
             }),
             v: (0..form.lx_tensors())
@@ -4101,15 +4098,24 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     }
                 }
                 Some(lx) => {
-                    // One core-local pin per (part, kv head) per LX leg, each one entry per core:
-                    // `lx_bytes_per_core` a leg, 1 MiB for both at granite-2b's 64-page rung. A chunk
-                    // with a tail keeps Kᵗ whole in HBM (`ChunkLx::keys`) and V's tail in HBM.
-                    for i in 0..lx.form.lx_tensors() {
-                        l.synth_lx_core_local(
-                            out_id.synth(R::GatherVLx(i)),
-                            lx.form.per_core_bytes(),
-                        );
-                        if lx.keys.is_some() {
+                    // One core-local pin per LX tensor, each one entry per core: V's per (part, kv head,
+                    // slab), Kᵗ's per (part, kv head). `ChunkLx::pinned_bytes_per_core` in all, which
+                    // `lx_form` already held to the frontend's LX window: 1 MiB at granite-2b's 64-page
+                    // rung, 1.125 MiB at granite-8b's 40-page rung. A chunk with a Kᵗ tail keeps Kᵗ
+                    // whole in HBM (`ChunkLx::keys`), and V's tail stays in HBM.
+                    //
+                    // Declared interleaved, V's tensor `i` then Kᵗ's: the pins are bump-allocated in
+                    // declaration order, and at one slab this is the order (and so the addresses) the
+                    // form has always had.
+                    let k_tensors = lx.keys.as_ref().map_or(0, |(keys, _)| keys.tensors());
+                    for i in 0..lx.form.lx_tensors().max(k_tensors) {
+                        if i < lx.form.lx_tensors() {
+                            l.synth_lx_core_local(
+                                out_id.synth(R::GatherVLx(i)),
+                                lx.form.per_core_bytes(),
+                            );
+                        }
+                        if i < k_tensors {
                             l.synth_lx_core_local(
                                 out_id.synth(R::GatherKtLx(i)),
                                 lx.form.per_core_bytes(),

@@ -1180,6 +1180,26 @@ impl DxpTool {
     const FIXED_ENV: [(&'static str, &'static str); 2] =
         [("DUMP_SPYRE_CODE", "1"), ("DT_PARALLEL_THREADS", "1")];
 
+    /// ⛔ THE AMBIENT KNOBS NO dxp CHILD MAY INHERIT, because the emission has already decided them.
+    ///
+    /// `DXP_LX_FRAC_AVAIL` sets where dbo's `reserveFrontendLx` puts the boundary between the frontend's
+    /// LX and dxp's own (`dbo/src/Transforms/ProgramLayout.cpp:81-98`). The emitter pins LX
+    /// intermediates up to [`ktir_superdsc::superdsc_opspec::FRONTEND_LX_END`], which is computed at the
+    /// knob's default (0.2). An exported value would move dxp's floor under those pins: lower, and dxp
+    /// lands on them; higher, and an op that fits today stops fitting. Either way the bake would compile
+    /// a different contract than the one the emission was laid out for. So the bake removes the knob from
+    /// every child, and dxp always runs at its default.
+    ///
+    /// The cache identity drops these too ([`Self::UNINHERITED_ENV`]): an ambient value no child sees
+    /// cannot change a compile.
+    const CLEARED_ENV: [&'static str; 1] = ["DXP_LX_FRAC_AVAIL"];
+
+    /// Every ambient knob no child inherits as-is: the explorer knob, which [`Self::compile`] removes and
+    /// then sets per group ([`ChunkExplore`], keyed into that group's [`GroupDigest`]), and
+    /// [`Self::CLEARED_ENV`], which it removes outright. The cache identity leaves all of them out
+    /// ([`crate::dxp_cache::DxpIdentity::probe`]'s `per_group`).
+    const UNINHERITED_ENV: [&'static str; 2] = [ChunkExplore::KNOB, Self::CLEARED_ENV[0]];
+
     /// `$DXP_STANDALONE`, else the `bin` sibling of `$DEEPTOOLS_PATH`'s `share` dir, else the
     /// on-pod default — the SAME resolution order `scratchy-builder-spyre`'s `build.rs` uses, so
     /// the two cannot disagree about which compiler ran. `None` when either piece is missing, which
@@ -1275,6 +1295,28 @@ impl DxpTool {
         })
     }
 
+    /// The environment ONE group's dxp child runs under, over the build's own: the toolchain path,
+    /// [`Self::FIXED_ENV`], the group's explorer setting, and [`Self::CLEARED_ENV`] removed.
+    fn child_env(&self, cmd: &mut std::process::Command, explore: ChunkExplore) {
+        cmd.env("DEEPTOOLS_PATH", &self.deeptools)
+            .envs(Self::FIXED_ENV)
+            // ⛔⛔⛔ THE TOKEN-PLANE GATHERED-KERNEL SHAPE ONLY SCHEDULES WITH THE CHUNK-PARAMETER
+            // EXPLORER OFF — and EVERY OTHER group needs it ON (see [`ChunkExplore`] for both
+            // measurements). The 26b group_13 refusal (`Expect LX in labeledDs memOrg_.`, :2498)
+            // was that shape compiled with the explorer running; the correctly-spelled knob
+            // compiles the exact refusing group RC=0 (card-side dxp repro, 2026-10-13). So the
+            // knob is the GROUP's, set on its own child, and the ambient value is removed rather
+            // than inherited: an exported knob in the build's environment would otherwise switch
+            // the explorer off for every group again, which is the regression this replaced.
+            .env_remove(ChunkExplore::KNOB);
+        for knob in Self::CLEARED_ENV {
+            cmd.env_remove(knob);
+        }
+        if explore == ChunkExplore::Skip {
+            cmd.env(ChunkExplore::KNOB, "1");
+        }
+    }
+
     /// Compile ONE group dir in place. `Ok(())` leaves `spyreCodeDir/{init_binary.bin,
     /// spyrecode.json}` beside the json; `Err` carries dxp's own message, which is the only useful
     /// thing about a scheduler refusal.
@@ -1295,21 +1337,8 @@ impl DxpTool {
             .arg("-d")
             .arg(group)
             .arg("-b")
-            .arg("sentient")
-            .env("DEEPTOOLS_PATH", &self.deeptools)
-            .envs(Self::FIXED_ENV)
-            // ⛔⛔⛔ THE TOKEN-PLANE GATHERED-KERNEL SHAPE ONLY SCHEDULES WITH THE CHUNK-PARAMETER
-            // EXPLORER OFF — and EVERY OTHER group needs it ON (see [`ChunkExplore`] for both
-            // measurements). The 26b group_13 refusal (`Expect LX in labeledDs memOrg_.`, :2498)
-            // was that shape compiled with the explorer running; the correctly-spelled knob
-            // compiles the exact refusing group RC=0 (card-side dxp repro, 2026-10-13). So the
-            // knob is the GROUP's, set on its own child, and the ambient value is removed rather
-            // than inherited: an exported knob in the build's environment would otherwise switch
-            // the explorer off for every group again, which is the regression this replaced.
-            .env_remove(ChunkExplore::KNOB);
-        if explore == ChunkExplore::Skip {
-            cmd.env(ChunkExplore::KNOB, "1");
-        }
+            .arg("sentient");
+        self.child_env(&mut cmd, explore);
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // What `Command::output()` did implicitly, and spawning by hand does NOT: dxp gets EOF
@@ -1634,7 +1663,7 @@ impl BakeQueue {
                 &tool.bin,
                 &tool.deeptools,
                 &DxpTool::FIXED_ENV,
-                &[ChunkExplore::KNOB],
+                &DxpTool::UNINHERITED_ENV,
             )
             .and_then(DxpCache::for_build),
             disk_hits: AtomicUsize::new(0),
@@ -2171,6 +2200,37 @@ mod tests {
             knobs_present(&knobs_for(ChunkExplore::Skip), &mut arts()).is_err(),
             "the same toolchain must still refuse a group that needs the explorer off"
         );
+    }
+
+    /// ⛔ NO dxp CHILD INHERITS `DXP_LX_FRAC_AVAIL`. The emitter's LX pins end at
+    /// `FRONTEND_LX_END`, which is dbo's frontend reservation at the knob's default; an exported value
+    /// would move dxp's own LX floor under them. The child's env removes the knob for every group, and
+    /// the cache identity leaves it out, so an exported value changes neither the compile nor its key.
+    #[test]
+    fn no_dxp_child_inherits_the_lx_split_knob() {
+        let tool = DxpTool {
+            bin: PathBuf::from("/fake/dxp_standalone"),
+            deeptools: PathBuf::from("/fake/deeptools/share"),
+        };
+        for explore in [ChunkExplore::Run, ChunkExplore::Skip] {
+            let mut cmd = std::process::Command::new(&tool.bin);
+            tool.child_env(&mut cmd, explore);
+            let envs: Vec<(String, Option<String>)> = cmd
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect();
+            assert!(
+                envs.contains(&("DXP_LX_FRAC_AVAIL".to_string(), None)),
+                "{explore:?}: the child must REMOVE the knob, not inherit it: {envs:?}"
+            );
+        }
+        assert!(DxpTool::UNINHERITED_ENV.contains(&"DXP_LX_FRAC_AVAIL"));
+        assert!(DxpTool::UNINHERITED_ENV.contains(&ChunkExplore::KNOB));
     }
 
     /// ⛔⭐ THE TEST THAT WOULD HAVE CAUGHT THIS ON DAY ONE, and the one no previous attempt wrote.

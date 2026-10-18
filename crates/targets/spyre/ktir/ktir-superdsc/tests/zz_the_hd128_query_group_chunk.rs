@@ -14,7 +14,9 @@
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
 use ktir_superdsc::place::PlaceId;
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
-use ktir_superdsc::sdsc_abstract::{AttnGeometry, ChunkScratch, PagedKvPool, attn_bundle_rows};
+use ktir_superdsc::sdsc_abstract::{
+    AttnGeometry, ChunkRowKind, ChunkScratch, PagedKvPool, attn_bundle_rows,
+};
 
 const NQH: u32 = 32;
 const NKVH: u32 = 8;
@@ -97,16 +99,46 @@ fn count(ops: &[(String, serde_json::Value)], stem: &str) -> u32 {
     ops.iter().filter(|(n, _)| n.starts_with(stem)).count() as u32
 }
 
+/// The slots of each score part and each value part of a `pages`-page one-request decode chunk: one whole
+/// chunk part each, unless its gather stays in LX (`ChunkScratch::lx_form`). Then Kᵗ is cut into 8-page
+/// parts when it has no tail of its own, and V into 16-page parts plus its tail.
+fn part_slots(pages: u32) -> (Vec<u32>, Vec<u32>) {
+    let chunk =
+        ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages).unwrap();
+    let cut = |per: u32| -> Vec<u32> {
+        (0..pages.div_ceil(per))
+            .map(|i| per.min(pages - i * per) * 256)
+            .collect()
+    };
+    match chunk.lx_form(ChunkRowKind::OneRequest) {
+        None => (vec![pages * 256], vec![pages * 256]),
+        Some(lx) => (
+            lx.keys().map_or(vec![pages * 256], |k| cut(k.part_pages())),
+            cut(lx.part_pages()),
+        ),
+    }
+}
+
+/// The part an op's `_k{p}` suffix names, part 0 when its leg is one part.
+fn part_of(name: &str) -> usize {
+    name.split("_k")
+        .nth(1)
+        .and_then(|s| s.split('_').next())
+        .map_or(0, |p| p.parse().unwrap())
+}
+
 fn n_of<'a>(name: &str, v: &'a serde_json::Value) -> &'a serde_json::Value {
     &v["dscs_"][0][name]["N_"]
 }
 
-/// ⭐ THE OP COUNTS PER LAYER, AT EVERY RUNG: 16 copies, 8 scores, one softmax op of each kind per kv head,
-/// 16 value ops — and no per-query-head op anywhere in the chunk.
+/// ⭐ THE OP COUNTS PER LAYER, AT EVERY RUNG: 16 copies, one score per (kv head, Kᵗ part), one softmax op of
+/// each kind per kv head, one value op per (kv head, slab, V part) — and no per-query-head op anywhere in
+/// the chunk. A rung whose gather stays in HBM is one part of each: 8 scores and 16 value ops.
 #[test]
 fn an_hd128_decode_chunk_attends_each_kv_heads_whole_group() {
     for &j in &ChunkScratch::LADDER {
         let ops = emit(j, 1, &[HD]);
+        let (k_parts, v_parts) = part_slots(j);
         assert_eq!(
             count(&ops, "attn_cqg_g"),
             NKVH * NSLAB,
@@ -128,8 +160,8 @@ fn an_hd128_decode_chunk_attends_each_kv_heads_whole_group() {
         }
         assert_eq!(
             count(&ops, "attn_csc_g"),
-            NKVH,
-            "{j} page(s): one score per kv head"
+            NKVH * k_parts.len() as u32,
+            "{j} page(s): one score per (kv head, Kᵗ part)"
         );
         assert_eq!(
             count(&ops, "attn_cbmax_g"),
@@ -155,18 +187,20 @@ fn an_hd128_decode_chunk_attends_each_kv_heads_whole_group() {
         );
         assert_eq!(
             count(&ops, "attn_cov_g"),
-            NKVH * NSLAB,
-            "{j} page(s): one value op per (kv head, slab)"
+            NKVH * NSLAB * v_parts.len() as u32,
+            "{j} page(s): one value op per (kv head, slab, V part)"
         );
     }
 }
 
-/// The score contracts the WHOLE head dim over the group's rows and the whole chunk, unbatched; each value
-/// op writes the group's `gqa` rows one stick wide with its contraction divided across the cores.
+/// The score contracts the WHOLE head dim over the group's rows and its Kᵗ part (the whole chunk where Kᵗ
+/// stays in HBM), unbatched; each value op writes the group's `gqa` rows one stick wide with its V part's
+/// contraction divided across the cores.
 #[test]
 fn the_group_score_and_value_ops_have_the_reference_shape() {
     for &j in &ChunkScratch::LADDER {
         let ops = emit(j, 1, &[HD]);
+        let (k_parts, v_parts) = part_slots(j);
         for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_csc_g")) {
             let n = n_of(name, v);
             assert_eq!(
@@ -179,22 +213,23 @@ fn the_group_score_and_value_ops_have_the_reference_shape() {
                 (
                     Some(u64::from(GQA)),
                     Some(u64::from(HD)),
-                    Some(u64::from(j * 256)),
+                    Some(u64::from(k_parts[part_of(name)])),
                     None
                 ),
                 "{name} at {j} page(s): N_ = {n}"
             );
         }
-        let sticks = u64::from(j * 256 / 64);
-        let most = (1..=32u64.min(sticks))
-            .rev()
-            .find(|s| sticks.is_multiple_of(*s))
-            .unwrap_or(1);
         for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_cov_g")) {
+            let slots = v_parts[part_of(name)];
+            let sticks = u64::from(slots / 64);
+            let most = (1..=32u64.min(sticks))
+                .rev()
+                .find(|s| sticks.is_multiple_of(*s))
+                .unwrap_or(1);
             let n = n_of(name, v);
             assert_eq!(
                 (n["mb_"].as_u64(), n["out_"].as_u64(), n["in_"].as_u64()),
-                (Some(u64::from(GQA)), Some(64), Some(u64::from(j * 256))),
+                (Some(u64::from(GQA)), Some(64), Some(u64::from(slots))),
                 "{name} at {j} page(s): N_ = {n}"
             );
             assert_eq!(
