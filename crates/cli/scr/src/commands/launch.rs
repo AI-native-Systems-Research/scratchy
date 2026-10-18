@@ -83,6 +83,15 @@ fn launch_env(
         ("ANTHROPIC_DEFAULT_SONNET_MODEL", model.to_string()),
         ("ANTHROPIC_DEFAULT_HAIKU_MODEL", model.to_string()),
         ("CLAUDE_CODE_SUBAGENT_MODEL", model.to_string()),
+        // Turn off the attribution block Claude Code puts first in the system
+        // prompt: `x-anthropic-billing-header: cc_version=<version>.<suffix>;
+        // cc_entrypoint=…;`. The suffix follows the user's prompt (claude
+        // 2.1.302: two launches asked "say hi" both sent `.3c1`, one asked
+        // "what is 2+2" sent `.4c4`), so two sessions differ from the very
+        // first block, ahead of the system prompt and tool schemas they share,
+        // and a prefix cache can reuse none of it. It is billing telemetry for
+        // Anthropic's API, which a local server has no use for.
+        ("CLAUDE_CODE_ATTRIBUTION_HEADER", "0".to_string()),
     ]
     .into_iter()
     .chain(
@@ -1549,6 +1558,33 @@ mod tests {
             let got = env.iter().find(|(k, _)| *k == key).map(|(_, v)| v.as_str());
             assert_eq!(got, Some("m"), "{key}");
         }
+    }
+
+    /// The attribution block is off through `--settings` too, or a settings file
+    /// can turn it back on and put a per-prompt block ahead of every prefix.
+    #[test]
+    fn launch_env_turns_off_the_attribution_block_everywhere() {
+        let env = launch_env(
+            "http://x",
+            "tok",
+            "m",
+            &ClaudeCodeLimits {
+                context_window: None,
+                output_budget: None,
+            },
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&claude_settings_json(&env)).expect("valid JSON");
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| *k == "CLAUDE_CODE_ATTRIBUTION_HEADER")
+                .map(|(_, v)| v.as_str()),
+            Some("0")
+        );
+        assert_eq!(
+            json["env"]["CLAUDE_CODE_ATTRIBUTION_HEADER"].as_str(),
+            Some("0")
+        );
     }
 
     /// Claude Code compacts at the window it is told, so the window the server
