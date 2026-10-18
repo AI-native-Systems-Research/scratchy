@@ -227,7 +227,7 @@ struct StepImageKey {
 /// The image cache WITH its accounting. The counters live on the two arms
 /// that fire them — not inlined at the executor's lookup site — because the
 /// executor cannot be built without a card, and the accounting is exactly
-/// what a cardless test must reach (#646): the cadence line's
+/// what a cardless test must reach: the cadence line's
 /// `% from cached` is `replay_hits` over `replay_steps`, and it read
 /// structurally zero from the day the player landed — the hit arm timed the
 /// lookup without counting the hit, so a card replaying 256 steps off 4
@@ -242,9 +242,9 @@ struct StepImageCache {
 
 impl StepImageCache {
     /// ⭐ THE HIT ARM — lookup, timing, AND THE COUNT: `replay_hits` is the
-    /// numerator of the cadence line's `% from cached`, and until #646 no
-    /// line of code ever incremented it. Timed as the player always timed a
-    /// hit — around the get+clone, guard acquisition included.
+    /// numerator of the cadence line's `% from cached`, and the hit arm never
+    /// counted it — no line of code ever incremented it. Timed as the player
+    /// always timed a hit — around the get+clone, guard acquisition included.
     fn lookup_cached(&mut self, key: &StepImageKey) -> Option<StepImage> {
         let t0 = Instant::now();
         let hit = self.map.get(key).cloned();
@@ -5408,7 +5408,7 @@ mod tests {
 
     /// Two steps on ONE image key: the first derives, the second hits the cache —
     /// and the hit arm must COUNT it. The cadence line's "% from cached" read 0.0
-    /// forever because it didn't (#646): 256 replayed steps off 4 derivations
+    /// forever because it didn't: 256 replayed steps off 4 derivations
     /// printed "0.0% from cached" on a live card.
     #[test]
     fn replay_image_cache_counts_its_hits() {
@@ -5439,7 +5439,7 @@ mod tests {
             "the second step on the same key must hit the cache"
         );
         let t = timers();
-        assert_eq!(t.replay_hits, hits + 1, "the hit arm counted it (#646)");
+        assert_eq!(t.replay_hits, hits + 1, "the hit arm counted it");
         assert_eq!(t.replay_derives, derives + 1);
     }
 }
