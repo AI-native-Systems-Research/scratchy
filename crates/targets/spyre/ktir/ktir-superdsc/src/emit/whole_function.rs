@@ -2132,8 +2132,7 @@ pub fn lower_function(
             // The claimed gelu's fused kind — the SAME `Program` a per-op producer states for a
             // gated act, so `emit_one` dispatches to the one `gated_act` body both doors share
             // and they cannot drift about what a gelu emits.
-            .or(gated
-                .map(|_| Lowering::Node(Program::ExpertGatedAct(GatedAct::Gelu))))
+            .or(gated.map(|_| Lowering::Node(Program::ExpertGatedAct(GatedAct::Gelu))))
             .or(rms.map(|c| Lowering::RmsNorm(c.eps)))
             .or(reduce.map(Lowering::Reduce))
             .or(scalar.map(|(v, _)| Lowering::ScalarMul(v)))

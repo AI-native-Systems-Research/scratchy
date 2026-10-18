@@ -125,11 +125,7 @@ fn sig() -> HashMap<String, ArgSpec> {
 /// The node's `program` label is INERT under this door (`lower_function` derives every
 /// op's kind from its `OpKind` and never reads `node.program`), so it is minted with
 /// the fused kind the kernel's chain lowers as.
-fn drive_src(
-    src: &str,
-    kernel: &str,
-    program: Program,
-) -> Result<Vec<String>, String> {
+fn drive_src(src: &str, kernel: &str, program: Program) -> Result<Vec<String>, String> {
     let mut signature = sig();
     signature.insert("N".into(), ArgSpec::parse("constexpr").expect("constexpr"));
     let kspec = KernelSpec {
@@ -144,7 +140,8 @@ fn drive_src(
     let mut m = triton_ktir::from_ttir::convert(&tt).map_err(|e| format!("from_ttir: {e}"))?;
     triton_ktir::make_ktir(&mut m, &[1]).map_err(|e| format!("make_ktir: {e}"))?;
     triton_ktir::passes::to_ktir::run(&mut m, &[1]).map_err(|e| format!("to_ktir: {e}"))?;
-    let node = triton_ktir_superdsc::node_for(&m, program).map_err(|e| format!("handoff: {}", e.message))?;
+    let node = triton_ktir_superdsc::node_for(&m, program)
+        .map_err(|e| format!("handoff: {}", e.message))?;
     let ops = triton_ktir_superdsc::emit_whole(&node, None)
         .map_err(|e| format!("door: {}", e.message))?;
     Ok(ops.into_iter().map(|o| o.op_name.clone()).collect())
@@ -247,8 +244,7 @@ fn a_planted_wrong_c1_is_refused_naming_the_constant() {
 /// misroutes the other reader's chains and computes the wrong activation.
 #[test]
 fn a_planted_silu_stays_silu() {
-    let names =
-        drive_src(SILU_SRC, "silu_fwd", Program::SiluMul).expect("the silu kernel bakes");
+    let names = drive_src(SILU_SRC, "silu_fwd", Program::SiluMul).expect("the silu kernel bakes");
     assert!(
         names.len() == 2,
         "the silu multiply is 2 ops (silu→mulsilu); got {}: {names:?}",

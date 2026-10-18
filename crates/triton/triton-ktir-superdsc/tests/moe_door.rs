@@ -99,7 +99,10 @@ fn spec() -> KernelSpec {
     ];
     let mut constexprs = HashMap::new();
     for (k, v) in ces {
-        signature.insert(k.to_string(), ArgSpec::parse("constexpr").expect("constexpr"));
+        signature.insert(
+            k.to_string(),
+            ArgSpec::parse("constexpr").expect("constexpr"),
+        );
         constexprs.insert(k.to_string(), v);
     }
     KernelSpec {
@@ -114,8 +117,8 @@ fn spec() -> KernelSpec {
 /// carries the first stage's refusal text, so a ladder-stage break and a door refusal
 /// are distinguishable in the assertion message.
 fn drive() -> Result<Vec<String>, String> {
-    let mut tt = codegen::compile(SRC, &spec(), Target::spyre())
-        .map_err(|e| format!("codegen: {e}"))?;
+    let mut tt =
+        codegen::compile(SRC, &spec(), Target::spyre()).map_err(|e| format!("codegen: {e}"))?;
     opt::make_ttir(&mut tt).map_err(|e| format!("make_ttir: {e}"))?;
     let mut m = triton_ktir::from_ttir::convert(&tt).map_err(|e| format!("from_ttir: {e}"))?;
     triton_ktir::make_ktir(&mut m, &[1]).map_err(|e| format!("make_ktir: {e}"))?;
