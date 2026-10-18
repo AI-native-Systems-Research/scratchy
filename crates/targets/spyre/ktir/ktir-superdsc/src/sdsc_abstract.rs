@@ -6622,6 +6622,11 @@ impl PagePlaneExtent {
         self.nkvh
     }
 
+    /// The head dim one kv head's block carries.
+    pub const fn hd(self) -> u32 {
+        self.hd
+    }
+
     /// Offset of kv head `kvh`'s block within the plane, or `None` past the head count.
     pub const fn head_off(self, kvh: u32) -> Option<u64> {
         if kvh >= self.nkvh {
@@ -7847,6 +7852,10 @@ impl ChunkRowBlocks {
     pub const fn rows(self) -> u32 {
         self.rows
     }
+    /// The slots (columns) each block spans — the chunk's.
+    pub const fn slots(self) -> u32 {
+        self.slots
+    }
     /// What a block is and where its query comes from — see [`ChunkRowForm`].
     pub const fn form(self) -> ChunkRowForm {
         self.form
@@ -7884,24 +7893,63 @@ impl ChunkRowBlocks {
 /// `[nkvh][gqa, hd]`, each kv head's `[gqa, hd]` a WHOLE RowBlocked block of its own — never a row slice
 /// of a taller multi-stick buffer, which dxp reads with the wrong group stride.
 ///
-/// Minted only by [`Self::of_decode`], which admits exactly the one-request decode (one row per head)
-/// above one slab: a prompt chunk or a decode batch has `mq > 1` rows per head and keeps the per-head form,
-/// and at one slab a group's rows are contiguous in the stream already.
+/// ⭐ AND A DECODE BATCH's TOO. A batched decode frames its rows head-major (`h·B + r`), so query head
+/// `h`'s slab `s` holds its `B` request rows as `B` consecutive one-stick rows of the plane. The same
+/// one-stick copy, with `M = B` instead of 1, lands them as rows `g·B + r` of kv head `kvh`'s block (head
+/// `g` of the group, request `r`). That is the order [`BatchChunk::row_request`]'s law (`row % B`) reads,
+/// so the batch mask serves the re-laid blocks unchanged.
+///
+/// Minted only by [`Self::of_decode`] and [`Self::of_batch`], which admit exactly a decode (one row per
+/// head per request) above one slab: a prompt chunk's rows are positions of one sequence and keep the
+/// per-head form, and at one slab a group's rows are contiguous in the stream already.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct QGroupBlock {
     nkvh: u32,
     gqa: u32,
     hd: u32,
+    /// Rows each query head carries: 1 for a one-request decode, the batch width for a decode batch.
+    requests: u32,
 }
 
 impl QGroupBlock {
     /// The group-major query block for a one-request decode, or `None` where the stream already has it
     /// (one slab) or a head has more than one row (a prompt chunk, a decode batch).
     pub const fn of_decode(nkvh: u32, gqa: u32, hd: u32, mq: u32) -> Option<QGroupBlock> {
-        if mq != 1 || nkvh == 0 || gqa == 0 || hd <= POOL_STICK || !hd.is_multiple_of(POOL_STICK) {
+        if mq != 1 {
             return None;
         }
-        Some(QGroupBlock { nkvh, gqa, hd })
+        Self::of_rows(nkvh, gqa, hd, 1)
+    }
+
+    /// The group-major query block for a decode batch of `requests` rows per head (head-major `h·B + r`),
+    /// or `None` at one slab or a degenerate geometry.
+    pub const fn of_batch(nkvh: u32, gqa: u32, hd: u32, requests: u32) -> Option<QGroupBlock> {
+        if requests < 2 {
+            return None;
+        }
+        Self::of_rows(nkvh, gqa, hd, requests)
+    }
+
+    const fn of_rows(nkvh: u32, gqa: u32, hd: u32, requests: u32) -> Option<QGroupBlock> {
+        if requests == 0
+            || nkvh == 0
+            || gqa == 0
+            || hd <= POOL_STICK
+            || !hd.is_multiple_of(POOL_STICK)
+        {
+            return None;
+        }
+        Some(QGroupBlock {
+            nkvh,
+            gqa,
+            hd,
+            requests,
+        })
+    }
+
+    /// Rows each query head carries in the stream and in its block: 1, or the batch width.
+    pub const fn requests(self) -> u32 {
+        self.requests
     }
 
     pub const fn nkvh(self) -> u32 {
@@ -7917,23 +7965,23 @@ impl QGroupBlock {
     pub const fn slabs(self) -> u32 {
         self.hd / POOL_STICK
     }
-    /// Query rows of one block — a whole GQA group, one row a head.
+    /// Query rows of one block — a whole GQA group, `requests` rows a head (`g·B + r`).
     pub const fn rows(self) -> u32 {
-        self.gqa
+        self.gqa * self.requests
     }
-    /// The reservation's shape — `[nkvh·gqa, hd]`, every block end to end.
+    /// The reservation's shape — `[nkvh·gqa·B, hd]`, every block end to end.
     pub const fn footprint_dims(self) -> [u32; 2] {
-        [self.nkvh * self.gqa, self.hd]
+        [self.nkvh * self.rows(), self.hd]
     }
 
-    /// kv head `kvh`'s block, as the `[gqa, hd]` nest it is and the repeat index it sits at.
+    /// kv head `kvh`'s block, as the `[gqa·B, hd]` nest it is and the repeat index it sits at.
     pub fn block_nest(self) -> crate::addr::Nest {
-        crate::addr::Nest::new(&["row", "feat"], &[self.gqa, self.hd], Df::Fp16)
+        crate::addr::Nest::new(&["row", "feat"], &[self.rows(), self.hd], Df::Fp16)
     }
 
     /// WHERE THE RE-LAYOUT COPY FOR (kv head `kvh`, slab `s`) WRITES: block `kvh`, slab `s`, `y` walking
-    /// the group's `gqa` rows ONE ROW apart (a stick-blocked row step is one stick), so the plane pitch is
-    /// the block's own `gqa` rows and the copy is the token stream's GQA-group walk landing in one plane.
+    /// the group's heads `B` rows apart (a stick-blocked row step is one stick), and `M = B` request rows
+    /// one row apart inside each head. At one request it is the solo copy exactly: `y` one row apart.
     /// `None` past the head or slab count.
     pub fn copy_dest(self, kvh: u32, s: u32) -> Option<OperandPlacement> {
         if kvh >= self.nkvh || s >= self.slabs() {
@@ -7942,10 +7990,10 @@ impl QGroupBlock {
         let nest = self.block_nest();
         Some(OperandPlacement {
             off: nest.block(kvh).slab(s).dev(),
-            pitch: PhysM(1),
+            pitch: PhysM(self.requests),
             head_stride: nest.span(
                 crate::addr::Idx::<crate::addr::Row>::n(0),
-                crate::addr::Idx::<crate::addr::Row>::n(1),
+                crate::addr::Idx::<crate::addr::Row>::n(self.requests),
             ),
         })
     }
@@ -7959,13 +8007,14 @@ impl QGroupBlock {
     }
 
     /// Where the re-layout copy for (kv head `kvh`, slab `s`) READS: the token stream at the group's
-    /// first query head, slab `s`, `y` walking the group's heads `nslab` planes apart.
+    /// first query head, slab `s`, `y` walking the group's heads `nslab` planes apart, each plane holding
+    /// the head's `B` request rows.
     pub fn copy_src(self, kvh: u32, s: u32) -> Option<OperandPlacement> {
         if kvh >= self.nkvh || s >= self.slabs() {
             return None;
         }
         Some(OperandPlacement::of_token_stream_by_slab(
-            QueryRowCount::of_mq(1),
+            QueryRowCount::of_mq(self.requests),
             self.nkvh * self.gqa,
             self.hd,
             kvh * self.gqa,
@@ -8149,10 +8198,38 @@ impl BatchChunk {
         if chunk.pages() < requests {
             return None;
         }
+        // ⭐ ABOVE ONE SLAB THE QUERY IS RE-LAID GROUP-MAJOR ([`QGroupBlock::of_batch`]), so a row block
+        // is a kv head's whole group, `gqa·B` rows `g·B + r`. At one slab the stream's own group rows are
+        // that block already. This is the SHIPPED form: every bundle the host runs carries the attention
+        // class registry the re-layout copy reads. The emitter states its law from its OWN blocks
+        // ([`Self::of_blocks`]) and the host stages from this one, so the bake's mask rows equal these
+        // exactly where the bundle re-lays (a registry-less fixture keeps the per-head form).
+        let blocks = match QGroupBlock::of_batch(chunk.nkvh(), gqa, chunk.plane.hd(), requests) {
+            Some(q) => ChunkRowBlocks::of_query_groups(q, chunk.slots()),
+            None => chunk.row_blocks(gqa, requests),
+        };
+        Self::of_blocks(chunk, requests, blocks)
+    }
+
+    /// The batch law for a body whose row blocks are `blocks`, so the mask block it sizes and the blocks
+    /// the body reads at offset 0 are one value. `None` on a chunk that is not a whole number of pages
+    /// per request, or blocks that do not span this chunk's slots.
+    pub const fn of_blocks(
+        chunk: ChunkScratch,
+        requests: u32,
+        blocks: ChunkRowBlocks,
+    ) -> Option<BatchChunk> {
+        if requests == 0
+            || !chunk.pages().is_multiple_of(requests)
+            || chunk.pages() < requests
+            || blocks.slots() != chunk.slots()
+        {
+            return None;
+        }
         Some(BatchChunk {
             chunk,
             requests,
-            blocks: chunk.row_blocks(gqa, requests),
+            blocks,
         })
     }
 

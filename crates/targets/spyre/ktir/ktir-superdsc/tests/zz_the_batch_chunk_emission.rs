@@ -222,8 +222,10 @@ fn the_one_request_chunk_keeps_its_broadcast_mask_row() {
     }
 }
 
-/// ⭐ AT hd=128 THE BATCH CHUNK's ROW BLOCKS ARE QUERY HEADS — one score per head over its `B` rows, one
-/// value op per (head, slab) — and every one emits at every rung of every batch width.
+/// ⭐ AT hd=128 WITHOUT THE CLASS REGISTRY (an emission fixture, no identity table to re-lay with) THE
+/// BATCH CHUNK's ROW BLOCKS ARE QUERY HEADS — one score per head over its `B` rows, one value op per
+/// (head, slab) — and every one emits at every rung of every batch width. With the registry the batch
+/// takes the query-group form instead (`zz_the_hd128_query_group_chunk`).
 #[test]
 fn an_hd128_batch_chunk_scores_per_query_head_over_its_request_rows() {
     let pool = PagedKvPool::new(8, 128);

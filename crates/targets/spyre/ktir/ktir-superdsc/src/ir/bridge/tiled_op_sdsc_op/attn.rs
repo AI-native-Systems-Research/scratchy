@@ -2305,14 +2305,21 @@ fn assemble_attn_chunk(
     // ⭐ OR, FOR A ONE-REQUEST DECODE WHOSE QUERY IS RE-LAID (`cb.qgroup`), one per KV HEAD of its whole
     // group — the caller decided, so the body only reads its decision back off the buffers it was handed.
     let blocks = match &cb.qgroup {
-        Some(_) => crate::sdsc_abstract::QGroupBlock::of_decode(chunk.nkvh(), gqa, hd, mq)
-            .and_then(|q| chunk.row_blocks_of_query_groups(q))
-            .ok_or_else(|| {
-                SuperDscError(format!(
-                    "attention chunk o{t}: a re-laid query was handed to a chunk whose rows are not a \
-                     one-request decode above one slab ({mq} row(s) per head at head dim {hd})"
-                ))
-            })?,
+        Some(_) => match history {
+            ChunkHistory::Requests(_) => {
+                crate::sdsc_abstract::QGroupBlock::of_batch(chunk.nkvh(), gqa, hd, mq)
+            }
+            ChunkHistory::Shared => {
+                crate::sdsc_abstract::QGroupBlock::of_decode(chunk.nkvh(), gqa, hd, mq)
+            }
+        }
+        .and_then(|q| chunk.row_blocks_of_query_groups(q))
+        .ok_or_else(|| {
+            SuperDscError(format!(
+                "attention chunk o{t}: a re-laid query was handed to a chunk whose rows are not a \
+                 decode above one slab ({mq} row(s) per head at head dim {hd})"
+            ))
+        })?,
         None => chunk.row_blocks(gqa, mq),
     };
     // ⛔ A BATCH CHUNK's LAW MUST DESCRIBE THIS VERY CHUNK AT THIS VERY WIDTH: the host stages the mask
@@ -4023,8 +4030,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // (one `QKᵀ` per kv head's group). Minted only for a one-request decode above one slab; every other
         // chunk keeps the stream's own row blocks. The copy reads the class's identity table, which a
         // bundle without a layout (an emission fixture) does not have, and so keeps the per-head form.
+        // ⭐ AND A DECODE BATCH TOO: its rows are head-major (`h·B + r`), so the same one-stick copy at
+        // `M = B` re-lays each kv head's `gqa·B` rows into one block, rows `g·B + r` — the batch mask's own
+        // `row % B` law. A prompt chunk keeps the stream's row blocks.
         let qgroup = if rows_are_requests {
-            None
+            crate::sdsc_abstract::QGroupBlock::of_batch(nkvh, nqh / nkvh, hd, mq)
         } else {
             crate::sdsc_abstract::QGroupBlock::of_decode(nkvh, nqh / nkvh, hd, mq)
         }
@@ -4174,14 +4184,15 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // staging (which reads the same law off the selected body's swept extent) cannot describe a
         // different layout; a chunk that is not a whole number of pages per request is a build failure.
         let history = if rows_are_requests {
-            let bc =
-                crate::sdsc_abstract::BatchChunk::of(chunk, mq, nqh / nkvh).ok_or_else(|| {
-                    SuperDscError(format!(
-                        "attention o{t}: a {}-page batch chunk is not a whole number of pages for each \
-                         of its {mq} request row(s)",
-                        chunk.pages()
-                    ))
-                })?;
+            // The law of THIS body's own row blocks: the query-group blocks where the query is re-laid,
+            // the stream's per-head blocks where it is not (a registry-less fixture).
+            let bc = crate::sdsc_abstract::BatchChunk::of_blocks(chunk, mq, blocks).ok_or_else(|| {
+                SuperDscError(format!(
+                    "attention o{t}: a {}-page batch chunk is not a whole number of pages for each of \
+                     its {mq} request row(s)",
+                    chunk.pages()
+                ))
+            })?;
             // ⛔ AND THE MASK BLOCK MUST LIE INSIDE THE MASK's OWN PLACEMENT. Every row block reads it at
             // offset 0, so a block past the placement reads the next activation's bytes as validity — an
             // additive mask, where an unstaged zero is VALID. The placement is the bundle's, so this is a
