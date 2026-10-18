@@ -422,15 +422,37 @@ fn bars(
     chart(&spec, label, "width: 100%", None)
 }
 
-/// One model's sparkline panel: its cells as steps along the context axis.
+/// One model's sparkline panel at one batch: its cells as steps along the
+/// context axis.
 struct Panel<'a> {
     model: String,
     cells: Vec<&'a Cell>,
     steps: Vec<Step>,
 }
 
-/// Every model's values along the context buckets, scratchy against
-/// torch-spyre, the gap filled blue ahead and red behind.
+/// One model's cells at one batch, as a sparkline's steps.
+fn panel<'a>(sweep: &'a Sweep, model: &str, dtype: Dtype, metric: Metric, conc: u32) -> Panel<'a> {
+    let cs = cells(sweep, model, dtype, metric, conc);
+    let steps = cs
+        .iter()
+        .map(|c| Step {
+            x: tokens(sweep, c.context.as_deref().unwrap_or("")),
+            scratchy: Some(c.scratchy),
+            rival: Some(c.torch),
+            highlight: false,
+        })
+        .collect();
+    Panel {
+        model: model.to_string(),
+        cells: cs,
+        steps,
+    }
+}
+
+/// The sparkline small multiple: every batch rung's models along the context
+/// buckets, scratchy against torch-spyre — a row per batch, a column per
+/// model, the gap filled blue ahead and red behind. The columns are headed
+/// as the heat maps head theirs; a rung the sweep left unmeasured says so.
 fn spark_panel(sweep: &Sweep, dtype: Dtype, metric: Metric) -> Element {
     let value = match metric {
         Metric::Itl => "ITL ms",
@@ -442,35 +464,39 @@ fn spark_panel(sweep: &Sweep, dtype: Dtype, metric: Metric) -> Element {
         along: "context tokens",
         value,
     };
-    let mut panels: Vec<Panel> = models(sweep)
-        .into_iter()
-        .map(|m| {
-            let cs = cells(sweep, &m, dtype, metric, 1);
-            let steps = cs
+    let models = models(sweep);
+    let rungs: Vec<(u32, Vec<Panel>)> = BATCHES
+        .iter()
+        .map(|&b| {
+            let mut ps: Vec<Panel> = models
                 .iter()
-                .map(|c| Step {
-                    x: tokens(sweep, c.context.as_deref().unwrap_or("")),
-                    scratchy: Some(c.scratchy),
-                    rival: Some(c.torch),
-                    highlight: false,
-                })
+                .map(|m| panel(sweep, m, dtype, metric, b))
                 .collect();
-            Panel {
-                model: m,
-                cells: cs,
-                steps,
+            for p in &mut ps {
+                highlight(p.steps.iter_mut().map(|st| (metric.better(), st)));
             }
+            (b, ps)
         })
         .collect();
-    for p in &mut panels {
-        highlight(p.steps.iter_mut().map(|st| (metric.better(), st)));
-    }
+    let grid = format!(
+        "display: grid; grid-template-columns: 5.5rem repeat({}, minmax(0, 16rem)); \
+         column-gap: 1.5rem; row-gap: 1.25rem; align-items: start",
+        models.len()
+    );
     rsx! {
-        div { style: "display: flex; flex-wrap: wrap; gap: 1rem 1.5rem",
-            for p in &panels {
-                div { style: "flex: 1 1 16rem; min-width: 16rem",
-                    Stack { gap: 1,
-                        strong { "{size_name(&p.model)}" }
+        div { style: "{grid}",
+            div {}
+            for m in &models {
+                div { style: "text-align: center", "{m}" }
+            }
+            for (rung, ps) in &rungs {
+                div { "batch {rung}" }
+                if ps.iter().all(|p| p.cells.is_empty()) {
+                    div { style: "grid-column: 2 / -1; font-size: 0.875rem; color: var(--cds-text-secondary)",
+                        "not yet measured at this batch"
+                    }
+                } else {
+                    for p in ps {
                         if p.steps.len() >= 2 {
                             {sparkline(
                                 &p.steps,
@@ -480,7 +506,7 @@ fn spark_panel(sweep: &Sweep, dtype: Dtype, metric: Metric) -> Element {
                                 Some(p.cells.iter().map(|c| c.context.clone().unwrap_or_default()).collect()),
                                 "5rem",
                                 &format!(
-                                    "{}, {} by context, triton-scratchy against torch-spyre",
+                                    "{}, {} by context at batch {rung}, triton-scratchy against torch-spyre",
                                     p.model, metric.label()
                                 ),
                             )}
@@ -490,6 +516,10 @@ fn spark_panel(sweep: &Sweep, dtype: Dtype, metric: Metric) -> Element {
                                  {fmt_value(metric, only.torch)} at \
                                  {only.context.as_deref().unwrap_or(DASH)} — \
                                  ×{only.ratio():.2}. Rest of the curve pending re-measure."
+                            }
+                        } else {
+                            p { style: "font-size: 0.875rem; color: var(--cds-text-secondary)",
+                                "not yet measured at this batch"
                             }
                         }
                     }
@@ -529,41 +559,55 @@ const HEAT_MAPS: &str = "Heat maps";
 const DECODE_SPARKS: &str = "Decode by context";
 const PREFILL_SPARKS: &str = "Prefill by context";
 
-/// The glance's one row: the card every sweep ran on, as metal.html's rows
-/// are its machines.
-const CARD: &str = "IBM Spyre";
+/// The batch rungs the grids and sparklines row by: the requests a cell
+/// decodes at once. Sixteen and up corrupt on this stack, so eight is the
+/// cap; a rung a sweep leaves unmeasured draws striped squares (heat maps)
+/// or a pending line (sparklines).
+const BATCHES: [u32; 4] = [1, 2, 4, 8];
 
-/// The glance's heat maps as metal.html draws its own: a cell per model, its
-/// prefill grid then its decode grid, each its dtypes down and the context
-/// buckets across, one request at a time.
+/// The glance's heat maps as metal.html draws its own: a row per dtype, a
+/// column per model, each cell the model's prefill grid then its decode
+/// grid — the batch rungs down, the context buckets across.
 fn glance(sweep: &Sweep) -> Element {
     let (models, contexts) = (models(sweep), contexts(sweep));
-    let dtypes: BTreeSet<Dtype> = sweep
-        .cells
-        .iter()
-        .filter(|c| c.conc == 1)
-        .map(|c| c.dtype)
-        .collect();
+    let dtypes: BTreeSet<Dtype> = sweep.cells.iter().map(|c| c.dtype).collect();
     let stems: Vec<&str> = models.iter().map(String::as_str).collect();
+    let rows: Vec<&str> = dtypes.iter().map(|d| d.label()).collect();
     let metrics = [(Metric::Ttft, "Prefill"), (Metric::Itl, "Decode")];
-    let mini = |model: &str, metric: Metric, name: &str| -> Element {
+    // glance_maps hands a row back as its label; the dtypes' labels are the
+    // only labels a row can be.
+    let dtype_of = |row: &str| {
+        if row == Dtype::Fp8.label() {
+            Dtype::Fp8
+        } else {
+            Dtype::Fp16
+        }
+    };
+    let mini = |model: &str, dtype: Dtype, metric: Metric, name: &str| -> Element {
         let grid = TableAxes {
             across: ("context", contexts.clone()),
-            down: (
-                "dtype",
-                dtypes.iter().map(|d| d.label().to_string()).collect(),
-            ),
+            down: ("batch", BATCHES.iter().map(|b| b.to_string()).collect()),
         };
-        let squares = dtypes
+        let squares = BATCHES
             .iter()
-            .flat_map(|&dtype| {
-                contexts.iter().map(move |c| RatioSquare {
-                    across: c.clone(),
-                    down: dtype.label().to_string(),
-                    ratio: cell(sweep, model, dtype, metric, 1, c)
-                        .map(Cell::ratio)
-                        .filter(|r| r.is_finite()),
-                    highlight: false,
+            .flat_map(|&b| {
+                contexts.iter().map(move |c| {
+                    // Batched decode is measured as throughput, so a decode
+                    // grid lights a square the sweep has no ITL cell for
+                    // from its tok/s cell at the same batch and context.
+                    let found = cell(sweep, model, dtype, metric, b, c).or_else(|| {
+                        if metric == Metric::Itl {
+                            cell(sweep, model, dtype, Metric::TokS, b, c)
+                        } else {
+                            None
+                        }
+                    });
+                    RatioSquare {
+                        across: c.clone(),
+                        down: b.to_string(),
+                        ratio: found.map(Cell::ratio).filter(|r| r.is_finite()),
+                        highlight: false,
+                    }
                 })
             })
             .collect();
@@ -572,7 +616,7 @@ fn glance(sweep: &Sweep) -> Element {
             squares,
             format!("scratchy/{}", TORCH.line),
             name,
-            &format!("{model} {}", metric.label()),
+            &format!("{model} {} {}", dtype.label(), metric.label()),
         )
     };
     rsx! {
@@ -583,43 +627,53 @@ fn glance(sweep: &Sweep) -> Element {
                     Stack { gap: 5,
                         ContentSwitcher { selected: slug(HEAT_MAPS),
                             ContentSwitcherItem { target: slug(HEAT_MAPS), selected: true, "{HEAT_MAPS}" }
-                            ContentSwitcherItem { target: slug(DECODE_SPARKS), selected: false, "{DECODE_SPARKS}" }
                             ContentSwitcherItem { target: slug(PREFILL_SPARKS), selected: false, "{PREFILL_SPARKS}" }
+                            ContentSwitcherItem { target: slug(DECODE_SPARKS), selected: false, "{DECODE_SPARKS}" }
                         }
                         div {
                             ContentPanel { id: slug(HEAT_MAPS), shown: true,
                                 Stack { gap: 5,
                                     p { style: "contain: inline-size",
-                                        "Every model's dtype × context grid: in each cell, the model's prefill \
-                                         (time to first token) grid, then its decode (inter-token latency) \
-                                         grid (rows: fp16 over fp8; columns: context, short to long), one \
-                                         request at a time. Colour is how many times faster triton-scratchy is \
-                                         than torch-spyre. Blue faster, red slower, the middle step within \
-                                         noise. Hover a square for its ratio; a striped square is a cell the \
-                                         sweep did not measure."
+                                        "Each model and dtype block holds the model's prefill (time to \
+                                         first token) grid, then its decode (inter-token latency) grid — \
+                                         a row per dtype, a column per model — on one IBM Spyre card. \
+                                         Inside a grid, rows are batch, the requests decoded at once (1, \
+                                         2, 4, 8), and columns context, short to long. Colour is how \
+                                         many times faster triton-scratchy is than torch-spyre. Blue \
+                                         faster, red slower, the middle step within noise. Hover a \
+                                         square for its ratio; a striped square is a cell the sweep did \
+                                         not measure. The batch rows past one are new and still filling \
+                                         in; a decode grid's batch-8 square comes from the sweep's \
+                                         throughput (tok/s) cell there, the unit batched decode measures."
                                     }
-                                    {glance_maps(&[CARD], &stems, |_, model| rsx! {
-                                        for (metric, name) in metrics { {mini(model, metric, name)} }
+                                    {glance_maps(&rows, &stems, |row, model| rsx! {
+                                        for (metric, name) in metrics {
+                                            {mini(model, dtype_of(row), metric, name)}
+                                        }
                                     })}
-                                }
-                            }
-                            ContentPanel { id: slug(DECODE_SPARKS), shown: false,
-                                div { style: "contain: inline-size",
-                                    Stack { gap: 4,
-                                        p { "triton-scratchy against torch-spyre as context grows, fp16, one \
-                                             request at a time. Blue fill where triton-scratchy is ahead, red \
-                                             where it is behind; each fill carries its × factor." }
-                                        {spark_panel(sweep, Dtype::Fp16, Metric::Itl)}
-                                    }
                                 }
                             }
                             ContentPanel { id: slug(PREFILL_SPARKS), shown: false,
                                 div { style: "contain: inline-size",
                                     Stack { gap: 4,
-                                        p { "Time to first token as prompts grow, fp16, one request at a \
-                                             time. Blue fill where triton-scratchy is ahead, red where it is \
-                                             behind; each fill carries its × factor." }
+                                        p { "Time to first token as prompts grow, fp16: a row per \
+                                             batch, the requests decoded at once (1, 2, 4, 8). Blue \
+                                             fill where triton-scratchy is ahead, red where it is \
+                                             behind; each fill carries its × factor. Batches past one \
+                                             are not yet measured." }
                                         {spark_panel(sweep, Dtype::Fp16, Metric::Ttft)}
+                                    }
+                                }
+                            }
+                            ContentPanel { id: slug(DECODE_SPARKS), shown: false,
+                                div { style: "contain: inline-size",
+                                    Stack { gap: 4,
+                                        p { "triton-scratchy against torch-spyre as context grows, \
+                                             fp16: a row per batch, the requests decoded at once (1, \
+                                             2, 4, 8). Blue fill where triton-scratchy is ahead, red \
+                                             where it is behind; each fill carries its × factor. \
+                                             Batches past one are not yet measured." }
+                                        {spark_panel(sweep, Dtype::Fp16, Metric::Itl)}
                                     }
                                 }
                             }
@@ -1147,9 +1201,9 @@ fn about(sweeps: &[(PathBuf, Sweep)]) -> Element {
                 }
                 p {
                     code { "ITL" } " inter-token latency · " code { "TTFT" } " time to first \
-                     token · " code { "conc" } " concurrent requests · " code { "tok/s" } " \
-                     decoded tokens per second · " code { "÷ perfect" } " triton-scratchy's \
-                     ratio to its own ideal: short-context ITL held flat (decode), the \
+                     token · " code { "conc" } " concurrent requests, the batch the heat maps \
+                     row by · " code { "tok/s" } " decoded tokens per second · " code { "÷ perfect" } " \
+                     triton-scratchy's ratio to its own ideal: short-context ITL held flat (decode), the \
                      second-shortest cell's TTFT scaled by prompt length (prefill)."
                 }
                 Table { headers: headers(["sweep", "triton-scratchy", "torch-spyre", "harnesses", "data"]),
