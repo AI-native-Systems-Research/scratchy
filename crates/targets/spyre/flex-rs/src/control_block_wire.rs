@@ -1639,6 +1639,68 @@ mod tests {
         assert_eq!(word0(&cb), before);
     }
 
+    /// #611 + #608 in ONE CTRL word: the cancel byte (`cancel_`, bits 7:0,
+    /// stamped by the `cancelled` constructor) and EDEP (`edep_`, bits
+    /// 34:33, stamped by the first-CB rule) are disjoint fields of the same
+    /// 64-bit word, written by independent setters. This is the exact CTRL
+    /// word a #611 cancelled twin occupying a stream's first-CB slot would
+    /// carry across #608's `prepare_cbs` stamp — the combined-field case
+    /// #603 PR3b's overrun discard is shaped like — so both fields must
+    /// read back and each setter's mask-and-set must leave the other's
+    /// field untouched.
+    #[test]
+    fn cancel_byte_and_edep_coexist_in_one_ctrl_word() {
+        // The cancel constructor alone leaves EDEP0 — neither side's
+        // constructor sets the other's field.
+        let mut cb = ControlBlockWire::cancelled(ResponseTag(0xABC));
+        assert_eq!(cb.edep(), 0, "the cancelled constructor stamps no EDEP");
+        assert!(cb.ctrl_cancelled());
+
+        // BOTH stamps on one CB: the constructor's cancel byte, then the
+        // first-CB rule's EDEP1.
+        cb.set_edep(1);
+
+        // BOTH read back through their own readers.
+        assert!(
+            cb.ctrl_cancelled(),
+            "the cancel byte survives the EDEP stamp"
+        );
+        assert_eq!(cb.edep(), 1, "the EDEP stamp survives on a cancelled CB");
+
+        // And on the wire as literal bits (not through either field's own
+        // BitField): cancel byte exactly 1 at bits 7:0, EDEP exactly 0b01
+        // at bits 34:33, tag preserved at bits 31:8, barrier clear at 32.
+        let ctrl = u64::from_le_bytes(
+            cb.to_bytes()[CTRL_SECTION..CTRL_SECTION + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(ctrl & 0xFF, 1, "cancel_ (bits 7:0) is exactly 1");
+        assert_eq!(
+            ctrl >> 33 & 0b11,
+            0b01,
+            "edep_ (bits 34:33) is exactly EDEP1"
+        );
+        assert_eq!((ctrl >> 8) & 0xFF_FFFF, 0xABC, "tag survives both stamps");
+        assert_eq!(ctrl >> 32 & 1, 0, "barrier stays clear");
+
+        // Disjointness in the clear direction too: `set_edep`'s in-position
+        // clear (back to EDEP0) must not disturb the cancel byte.
+        cb.set_edep(0);
+        assert_eq!(cb.edep(), 0);
+        assert!(
+            cb.ctrl_cancelled(),
+            "clearing EDEP leaves the cancel byte set — the fields are disjoint"
+        );
+        let ctrl_after = u64::from_le_bytes(
+            cb.to_bytes()[CTRL_SECTION..CTRL_SECTION + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(ctrl_after & !(0b11u64 << 33), ctrl & !(0b11u64 << 33));
+        assert_eq!(ctrl_after & 0xFF, 1);
+    }
+
     #[test]
     fn compute_cb_sets_valid_and_bootstrap_and_xlats() {
         let bootstrap = VirtualAddressSbf::new(7, Flits::from_bytes(0));
