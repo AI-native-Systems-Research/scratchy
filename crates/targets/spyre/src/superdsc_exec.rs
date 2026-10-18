@@ -2098,8 +2098,8 @@ impl Executor {
     /// player's own single-request shape, and ONLY over the body-class lists: those are the
     /// lists the player launches at a step-following `where_` (prefix/suffix launch at a
     /// constant one, so their patch table is empty by construction and their proof is the
-    /// parity leg alone). A geometry too narrow to sample around a mid-page canvas (fewer
-    /// than ~65 slots past it) skips that leg loudly; every shipped bundle's page
+    /// parity leg alone). A geometry too narrow to host the off-sample proof around a mid-page
+    /// canvas (`canvas_room`) skips that leg loudly; every shipped bundle's page
     /// is 2048 slots.
     ///
     /// ⛔ NOT A PER-STEP CHECK — a step never pays for this. It runs at [`Self::prepare`] (every
@@ -2225,9 +2225,12 @@ impl Executor {
             // the decode player's own value, not a skipped dimension.
             int_rep_stride_bytes: 0,
         };
-        // The canvas write base is a SYNTHETIC mid-pool page (2·stride): high enough that the
-        // negative-delta sample stays above zero, and never a page the block tables name, so
-        // the page differential measures the caller-base path alone.
+        // The canvas write base is a SYNTHETIC mid-pool page (2·stride): a
+        // stand-in for the table-sourced base the player's own canvas renders
+        // at, far enough from either end of the address range that no render
+        // clips. Nothing probes past it anymore — the patch model has no page
+        // term (the boundary step walks; see `StepScalars`), so this base is
+        // only where the canvas and every off-sample render sit.
         let page_c = Bytes(2 * self.kv.page_stride_bytes.max(1));
         let mk1 = |bank: usize, off: [u64; NUM_SEGMENTS]| LaunchWhere {
             byte_off: off,
@@ -2236,10 +2239,12 @@ impl Executor {
             n_fold_pages: 3,
             weight_bank: bank,
         };
-        // The patch gate needs one image's worth of sampling room around its canvas (65+ slots
-        // of page past it; `r_patch ≤ 62`). A page too narrow for that — or one no canvas slot
-        // fits at all — skips the leg loudly; every shipped bundle's page is 2048 slots.
-        let patch_room = r_patch.is_some_and(|r| !self.kv.paged || r + 65 <= per);
+        // The patch gate needs one image's worth of sampling room around its canvas: the
+        // `slot+65` off-sample (the slab-coefficient proof) must land strictly inside the
+        // image's page span. `canvas_room` is the ONE law, shared with the player — a page
+        // too narrow for it (or one no canvas slot fits at all) skips the leg loudly; every
+        // shipped bundle's page is 2048 slots.
+        let patch_room = r_patch.is_some_and(|r| cb_plan::canvas_room(per, self.kv.paged, r));
         if !patch_room {
             debug!(
                 "[sdsc-cbplan] patch gate SKIPPED: no canvas slot with sampling room fits a \
@@ -4137,17 +4142,41 @@ impl Executor {
     /// `cb_plan::parity_check` per fixed row.
     ///
     /// Returns `Ok(None)` — the caller takes the walk — for every step that
-    /// is not the player's regime, with the reason stated once per process
-    /// per reason (a per-step debug line would be noise at decode rate):
-    /// a BATCHED step (two or more requests installed — PR4's images), any
-    /// Diag instrument on ([`Diag::is_quiet`] — each one reads walk state),
-    /// or a page no canvas slot fits. There is no third path and no toggle:
-    /// the production configuration (quiet diag, one request) is the player.
+    /// is not the player's regime, with the reason stated where it fires (a
+    /// per-step debug line would be noise at decode rate; the boundary reason
+    /// fires once per page): a BATCHED step (two or more requests installed —
+    /// PR4's images), any Diag instrument on ([`Diag::is_quiet`] — each one
+    /// reads walk state), a page boundary (slot 0 of a new page — a
+    /// write-base move, not a patchable one), or a page no canvas slot or
+    /// off-sample room fits. There is no third path and no toggle: the
+    /// production configuration (quiet diag, one request) is the player,
+    /// minus one step per page.
     fn try_replay_forward(&mut self, seq_pos: SeqPos) -> Result<Option<()>> {
         if !Diag::get().is_quiet() || fold_plan::fold_requests(&self.fold) != 1 {
             return Ok(None);
         }
         let per = self.kv.page_slots.0.max(1);
+        // ⭐ THE PAGE-BOUNDARY STEP WALKS. `pos % per == 0` writes slot 0 of a
+        // page no image of this key ever rendered — a WRITE-BASE move, and a
+        // moved write base is not affine in the patch model's scalars: a
+        // shifted write target's extent is END-PINNED (`DevAddr::shifted`
+        // returns the bytes remaining past the shift), so its XLAT word's
+        // paddr and length fields move together and no per-byte addend
+        // expresses the pair — measured on the first real bundle, where the
+        // page differential's render moved paddr `+stride/2` flits and
+        // length `-stride/2` flits for a one-stride base move and the solve
+        // refused. That includes pos 0 — slot 0 of page 0, whose image key
+        // (n = 0) has no page behind it. One step per page takes the walk;
+        // every step between boundaries writes the image's own page and
+        // replays.
+        if self.kv.paged && seq_pos.0 % per == 0 {
+            debug!(
+                "[sdsc-replay] page-boundary step {} walks: slot 0 of a new page is a \
+                 write-base move, not a patchable one",
+                seq_pos.0
+            );
+            return Ok(None);
+        }
         let n = self.n_fold_pages(seq_pos);
         let sel = self.step_body(seq_pos)?.sel;
         let Some(r) = cb_plan::canvas_slot(per, self.kv.paged) else {
@@ -4157,6 +4186,13 @@ impl Executor {
             );
             return Ok(None);
         };
+        if !cb_plan::canvas_room(per, self.kv.paged, r) {
+            debug!(
+                "[sdsc-replay] walking every step: a {per}-slot page leaves no off-sample room \
+                 around canvas slot {r}, so no slab-crossing proof fits — no image is derived"
+            );
+            return Ok(None);
+        }
         // The canvas position: inside THIS image's page span (`(n-1)·per` is
         // the image's first page; `r ≥ 1` keeps off the boundary), or any
         // position at all for an unpaged session, whose one image covers
@@ -4188,16 +4224,12 @@ impl Executor {
                 image
             }
         };
-        // The step's scalars — the three values every moving word of the
-        // body rows is affine in, measured at the position this step writes
-        // and the page it writes into (row 0's page at `seq_pos / per`,
-        // which the host appended before the step for a boundary one).
-        let scalars = cb_plan::step_scalars(
-            self.kv.paged,
-            per,
-            seq_pos.0,
-            self.page_base_for_write(seq_pos).0,
-        );
+        // The step's scalars — the two values every moving word of the body
+        // rows is affine in, measured at the position this step writes. The
+        // write page is not among them and cannot move between two replayed
+        // steps of one image: both write the image's own page (the boundary
+        // step that would move it walked, above).
+        let scalars = cb_plan::step_scalars(self.kv.paged, per, seq_pos.0);
         // The stamp closure: patches the body rows onto the backend's canvas
         // copy, then stamps the leased tags over the render-time ones. The
         // fixed rows are skipped by `follows_step` — see `RowReplay`.

@@ -30,24 +30,31 @@
 //! non-fold page resolution and the per-request intermediate shift.
 //!
 //! ⭐ 2b — THE PATCH TABLE. Within one image key the ONLY per-step inputs are
-//! the write position and the write page's base, and every address term they
-//! move is affine in three scalars ([`StepScalars`]): the write slot within
-//! its page, the slab index, and the write page's base — the fold terms are
-//! per-rep constants baked into the image. A step is therefore canvas +
-//! patches: copy the image, add each moving word's affine addend
+//! the write position's SLOT IN ITS PAGE and its SLAB, and every address term
+//! they move is affine in those two scalars ([`StepScalars`]) — the fold
+//! terms are per-rep constants baked into the image, and the write PAGE never
+//! moves inside an image's replayed span: every step between two page
+//! boundaries writes the page its canvas was rendered on, and the boundary
+//! step itself (slot 0 of the next page) is not replayed at all — it takes
+//! the walk (see `try_replay_forward`; a moved write base is not affine in
+//! any per-byte scalar, because a shifted write target's extent is END-PINNED
+//! — `DevAddr::shifted` keeps the allocation's end and gives back the bytes
+//! remaining, so the XLAT word's paddr and length fields move together and no
+//! per-byte coefficient can express the pair). A replayed step is therefore
+//! canvas + patches: copy the image, add each moving word's affine addend
 //! ([`PatchPlan::apply`]). The coefficients are not read off the wire layout
 //! by hand; they are MEASURED at prepare by finite differences through the
 //! same render door ([`build_patch_plan`]) and then proven off-sample
 //! ([`patch_check`]): at steps neither the canvas nor the differentials
 //! visited, the patched canvas must equal the walk's fresh render byte for
 //! byte, or the load refuses. A bundle whose movement is not affine in the
-//! three scalars refuses there — loudly, at prepare, never as a wrong token.
+//! two scalars refuses there — loudly, at prepare, never as a wrong token.
 
 use anyhow::{Result, anyhow, bail};
 use flex_rs::control_block_wire::{CB_NUM_BYTES, ControlBlockWire};
 
 use crate::bundle_code::NUM_SEGMENTS;
-use crate::fold_plan::{self, Bytes, OpKv, SessionKv, SlotPos, UniformPages};
+use crate::fold_plan::{self, OpKv, SessionKv, SlotPos, UniformPages};
 use crate::runtime::{BatchedCompute, ByteSize, DevAddr, Stream, prog_offset_base};
 use crate::superdsc_exec::{
     LaunchWhere, Ops, SEG_INTERMEDIATE, SEG_KV, SEG_MASK, SEG_WEIGHT, SeqPos,
@@ -586,14 +593,24 @@ pub(crate) fn parity_check(
 
 /// The per-step scalars — the WHOLE of what varies between two steps that
 /// share an image key. Every address term the step moves is affine in these
-/// three and nothing else:
+/// two and nothing else:
 ///
 /// * `slot_in_page` — `slot_write_delta`'s term: the write cursor's slot
 ///   within its page (`pos % page_slots`; the ABSOLUTE position for an
 ///   unpaged bundle, whose ops carry `page_slots == 0` and never wrap);
-/// * `slab` — `slab_delta`'s index, `pos / SLAB_SLOTS`;
-/// * `write_page_base` — `nonfold_page_delta`'s caller base (row 0's page;
-///   always zero for an unpaged session, whose non-fold page term is zero).
+/// * `slab` — `slab_delta`'s index, `pos / SLAB_SLOTS`.
+///
+/// The write PAGE is deliberately not one of them. Every step an image
+/// replays writes the page its canvas was rendered on; the one step that
+/// would move it — `pos == n·per`, slot 0 of the next page — is a page
+/// BOUNDARY, and the player routes it to the walk, one step per page,
+/// because a moved write base is not affine in any per-byte scalar: a
+/// shifted write target's extent is END-PINNED (`DevAddr::shifted` returns
+/// the bytes remaining past the shift), so its XLAT word's paddr and length
+/// fields move together and no single per-byte addend expresses the pair —
+/// measured on the first real bundle, where the page differential's render
+/// moved paddr `+stride/2` flits and length `-stride/2` flits for a
+/// one-stride base move and the solve refused.
 ///
 /// The fold terms — per-pass page bases from the block tables, the mask and
 /// intermediate rep strides — are per-rep CONSTANTS of the image: baked into
@@ -603,7 +620,6 @@ pub(crate) fn parity_check(
 pub(crate) struct StepScalars {
     pub(crate) slot_in_page: u64,
     pub(crate) slab: u64,
-    pub(crate) write_page_base: u64,
 }
 
 /// The scalar rule the player runs per step — ONE implementation shared by
@@ -611,10 +627,12 @@ pub(crate) struct StepScalars {
 /// applied there cannot disagree about what "slot" and "slab" mean.
 ///
 /// The slot term divides by the SESSION's page count here and by the OP's in
-/// `slot_write_delta`; they agree in every bundle, and [`patch_check`]'s
-/// page-boundary sample is where a bundle that broke that agreement would be
-/// caught (the two moduli disagree first at a page wrap).
-pub(crate) fn step_scalars(paged: bool, per: i64, pos: i64, write_page_base: u64) -> StepScalars {
+/// `slot_write_delta`; they agree in every bundle, and [`build_patch_plan`]
+/// checks that DIRECTLY — every slot-writing op's `page_slots` against the
+/// session's — because an op that wrapped at a different modulus would put a
+/// wrap inside an image's replayed span, where the patch model would replay
+/// linearly across it. Refused by name, never probed for.
+pub(crate) fn step_scalars(paged: bool, per: i64, pos: i64) -> StepScalars {
     StepScalars {
         slot_in_page: (if paged {
             pos.rem_euclid(per.max(1))
@@ -622,7 +640,6 @@ pub(crate) fn step_scalars(paged: bool, per: i64, pos: i64, write_page_base: u64
             pos
         }) as u64,
         slab: (pos / fold_plan::SLAB_SLOTS) as u64,
-        write_page_base,
     }
 }
 
@@ -632,9 +649,10 @@ pub(crate) fn step_scalars(paged: bool, per: i64, pos: i64, write_page_base: u64
 /// leave room for the +1 slot differential (≤ `per − 2` when paged, so the
 /// step never crosses a page wrap) and the +1 slab differential (≤ 62, so
 /// it never crosses a slab boundary), and it must not be slot 0 of a page
-/// (a page boundary belongs to the PREVIOUS image's last step). 5 — the
-/// gate's historical pick — whenever it fits; `None` when no slot of the
-/// page can host a canvas (a page of ≤ 2 slots), which the caller treats
+/// (a page boundary is the one step of the span the player does NOT replay —
+/// it walks; see [`StepScalars`]). 5 — the gate's historical pick — whenever
+/// it fits; `None` when no slot of the page can host a canvas (a page of
+/// ≤ 2 slots), which the caller treats
 /// as "no image for this shape", never as a wrong-coefficient derivation.
 pub(crate) fn canvas_slot(per: i64, paged: bool) -> Option<i64> {
     let hi = if paged { per - 2 } else { 62 }.min(62);
@@ -647,14 +665,28 @@ pub(crate) fn canvas_slot(per: i64, paged: bool) -> Option<i64> {
     }
 }
 
+/// Whether a canvas at slot `r` leaves the OFF-SAMPLE ROOM the patch gate
+/// needs: the `slot+65` sample — the one that crosses a slab boundary, and
+/// so the only off-sample proof of the slab coefficient — must land strictly
+/// inside the image's page span (the open interval `(n−1)·per < p < n·per`
+/// the player replays), so `r + 66 ≤ per`. An unpaged session has no page
+/// bound (its one image covers every position). ONE law, shared by the
+/// prepare gate (without it, its patch leg skips loudly) and the player
+/// (without it, every step walks): a page too narrow to host the proof
+/// degrades to the walk, never to an unverified coefficient. Every shipped
+/// bundle's page is 2048 slots, so this never fires in practice.
+pub(crate) fn canvas_room(per: i64, paged: bool, r: i64) -> bool {
+    !paged || r + 66 <= per
+}
+
 /// One 8-byte word of one CB image that moves with the step: where it sits,
 /// and the addend per unit of each scalar — MEASURED by finite differences
 /// through the render door, never read off the wire layout by hand. The XLAT
 /// word packs paddr, mode and length in disjoint bit ranges, so a step's
 /// movement is an additive delta within the word; these are that delta per
-/// scalar unit, and [`PatchPlan::apply`] adds them with two's-complement wrap
-/// (a page's last slot wraps to slot 0 of the next, so slot deltas go
-/// NEGATIVE).
+/// scalar unit, and [`PatchPlan::apply`] adds them with two's-complement
+/// wrap (an image's early steps sit at slots BELOW the canvas's, so slot
+/// deltas go NEGATIVE).
 pub(crate) struct Patch {
     /// Which CB of the image — an index into the rendered batch.
     cb: usize,
@@ -663,9 +695,6 @@ pub(crate) struct Patch {
     dst: usize,
     a_slot: i64,
     b_slab: i64,
-    /// Per BYTE of write-page base — the per-stride measurement divided by
-    /// the stride; a remainder is a refusal, not a rounding.
-    c_page: i64,
 }
 
 /// The patches that turn one image into any step's CBs: the scalars the
@@ -692,17 +721,14 @@ impl PatchPlan {
     }
 
     /// Patch a copied canvas in place for one step's scalars. The addend is
-    /// computed in i128 and wrapped to u64: slot wrap and a reclaimable page
-    /// make deltas negative, and the wire's arithmetic is two's-complement
-    /// addition.
+    /// computed in i128 and wrapped to u64: an image's early steps sit below
+    /// the canvas slot, so slot deltas go negative, and the wire's arithmetic
+    /// is two's-complement addition.
     pub(crate) fn apply(&self, image: &mut [ControlBlockWire], s: &StepScalars) {
         let d_slot = s.slot_in_page as i128 - self.reference.slot_in_page as i128;
         let d_slab = s.slab as i128 - self.reference.slab as i128;
-        let d_page = s.write_page_base as i128 - self.reference.write_page_base as i128;
         for p in &self.patches {
-            let addend = (p.a_slot as i128 * d_slot
-                + p.b_slab as i128 * d_slab
-                + p.c_page as i128 * d_page) as u64;
+            let addend = (p.a_slot as i128 * d_slot + p.b_slab as i128 * d_slab) as u64;
             let b = image[p.cb].bytes_mut();
             let mut w = [0u8; 8];
             w.copy_from_slice(&b[p.dst..p.dst + 8]);
@@ -725,7 +751,7 @@ fn word_at(image: &[ControlBlockWire], cb: usize, dst: usize) -> u64 {
 /// [`patch_check`] does), render three differentials, and read every moving
 /// word's coefficients off the differences. Finite differences through the
 /// door: there is no second analysis of the wire layout to drift, and
-/// anything that moves but is not affine in the three scalars refuses here or
+/// anything that moves but is not affine in the two scalars refuses here or
 /// mismatches in [`patch_check`]'s off-sample verification.
 ///
 /// The canvas position must leave room for the differentials: the +1 step may
@@ -745,8 +771,6 @@ pub(crate) fn build_patch_plan(
 ) -> Result<(Vec<ControlBlockWire>, PatchPlan)> {
     let per = fold.page_slots.get().max(1);
     let pos = where_.slot_pos.0;
-    let page = where_.kv_page_base.0;
-    let stride = fold.page_stride_bytes.0.max(1);
     if pos % fold_plan::SLAB_SLOTS >= fold_plan::SLAB_SLOTS - 1 {
         bail!(
             "cb_plan patch: canvas position {pos} sits on a slab boundary — the +1 differential \
@@ -758,6 +782,26 @@ pub(crate) fn build_patch_plan(
             "cb_plan patch: canvas position {pos} sits on a page boundary — the +1 differential \
              cannot isolate the slot term from the page wrap"
         );
+    }
+    // The op-vs-session page-modulus law, checked DIRECTLY (this is the canary
+    // the boundary sample used to carry): the slot scalar wraps at the
+    // SESSION's modulus, `slot_write_delta` at the OP'S, and an op that
+    // disagreed would wrap INSIDE an image's replayed span — steps the patch
+    // model would replay linearly across the wrap. The bake emits the
+    // session's page size into every op, so this agrees in every bundle; a
+    // bundle that broke it refuses here, by name.
+    let session_modulus = if fold.paged { per } else { 0 };
+    for o in ops {
+        if o.kv.slot_write && o.kv.page_slots as i64 != session_modulus {
+            bail!(
+                "cb_plan patch: a slot-writing op wraps at {} slots but the session wraps at {} — \
+                 the two moduli disagree, so a page wrap could fall inside an image's replayed \
+                 span and the patch model would replay straight across it. Refusing to patch a \
+                 bundle whose ops disagree with the session about the page.",
+                o.kv.page_slots,
+                session_modulus
+            );
+        }
     }
 
     let plan = build_cb_plan(ops, fold, seg, banks, where_)?;
@@ -771,9 +815,12 @@ pub(crate) fn build_patch_plan(
     // every step of this image with.
     let (items, barrier) = plan.render(fold, where_)?;
     let canvas = stream.render_compute_batch(&items, 1)?;
-    // The three differentials. Each moves exactly one scalar's worth of
-    // arithmetic — the others held — so each moving word's measured difference
-    // is one equation in that word's coefficients.
+    // The two differentials. Each moves exactly one scalar's worth of
+    // arithmetic — the other held — so each moving word's measured difference
+    // is one equation in that word's coefficients. There is NO page
+    // differential: the write page never moves inside an image's replayed
+    // span (the boundary step walks; see [`StepScalars`]), so no coefficient
+    // for it exists to measure.
     let img_slot = render(&LaunchWhere {
         slot_pos: SeqPos(pos + 1),
         ..*where_
@@ -782,15 +829,7 @@ pub(crate) fn build_patch_plan(
         slot_pos: SeqPos(pos + fold_plan::SLAB_SLOTS),
         ..*where_
     })?;
-    let img_page = render(&LaunchWhere {
-        kv_page_base: Bytes(page + stride),
-        ..*where_
-    })?;
-    for (name, img) in [
-        ("slot", &img_slot),
-        ("slab", &img_slab),
-        ("page", &img_page),
-    ] {
+    for (name, img) in [("slot", &img_slot), ("slab", &img_slab)] {
         if img.len() != canvas.len() {
             bail!(
                 "cb_plan patch: the {name} differential renders {} CB(s) but the canvas holds {} \
@@ -816,8 +855,7 @@ pub(crate) fn build_patch_plan(
             let c = word_at(&canvas, cb, dst);
             let d_slot = word_at(&img_slot, cb, dst).wrapping_sub(c) as i64;
             let d_slab = word_at(&img_slab, cb, dst).wrapping_sub(c) as i64;
-            let d_page = word_at(&img_page, cb, dst).wrapping_sub(c) as i64;
-            if d_slot == 0 && d_slab == 0 && d_page == 0 {
+            if d_slot == 0 && d_slab == 0 {
                 continue;
             }
             // Δslot = +1 with the slab held ⇒ the slot coefficient is the raw difference.
@@ -825,27 +863,15 @@ pub(crate) fn build_patch_plan(
             // Δslab = +1 with the slot moving `dslot_slab` ⇒ the slab coefficient is what
             // remains after the slot's contribution is subtracted.
             let b_slab = d_slab.wrapping_sub(a_slot.wrapping_mul(dslot_slab));
-            // Δpage = +stride ⇒ a per-byte coefficient; a remainder is a REFUSAL — the word
-            // would not be affine in the write base at all.
-            if d_page % stride as i64 != 0 {
-                bail!(
-                    "cb_plan patch: CB {cb}'s word at +{dst} moves {d_page:#x} for one page \
-                     stride ({stride:#x} bytes) — not a whole number of per-byte steps, so the \
-                     word is not affine in the write-page base. Refusing to patch what was not \
-                     measured."
-                );
-            }
-            let c_page = d_page / stride as i64;
             patches.push(Patch {
                 cb,
                 dst,
                 a_slot,
                 b_slab,
-                c_page,
             });
         }
     }
-    let reference = step_scalars(fold.paged, per, pos, page);
+    let reference = step_scalars(fold.paged, per, pos);
     Ok((
         canvas,
         PatchPlan {
@@ -890,7 +916,7 @@ pub(crate) fn render_row(
     Ok(RowImage {
         canvas,
         plan: PatchPlan {
-            reference: step_scalars(fold.paged, per, where_.slot_pos.0, where_.kv_page_base.0),
+            reference: step_scalars(fold.paged, per, where_.slot_pos.0),
             patches: Vec::new(),
             barrier,
         },
@@ -907,11 +933,14 @@ pub(crate) fn render_row(
 /// The player runs this SAME check per image at the image's first use, under
 /// the live session — and keeps the verified image it returns.
 ///
-/// The off-sample steps deliberately include the page-boundary slot: an
-/// image's last step writes slot 0 of the NEXT page (negative slot delta,
-/// positive page delta, slab jump — all at once), which is also where a
-/// bundle whose ops disagree about the page modulus would first diverge (see
-/// [`step_scalars`]). Returns the number of patch sites verified and the
+/// The sampled steps are the image's own OPEN span `(n−1)·per < p < n·per` —
+/// exactly the steps the player replays this image over. The page BOUNDARY
+/// (`p == n·per`, slot 0 of the next page) is deliberately not sampled: the
+/// player routes it to the walk (see [`StepScalars`]), so there is no patched
+/// render of it to prove — and an op that disagreed with the session about
+/// the page modulus is refused outright by [`build_patch_plan`], by name,
+/// rather than caught at a boundary probe.
+/// Returns the number of patch sites verified and the
 /// verified image itself.
 pub(crate) fn patch_check(
     ops: &Ops,
@@ -930,57 +959,45 @@ pub(crate) fn patch_check(
         .map_err(|e| anyhow!("[cbpatch] {label}: patch-table derivation REFUSED — {e:#}"))?;
     let per = fold.page_slots.get().max(1);
     let pos = where_.slot_pos.0;
-    let page = where_.kv_page_base.0;
-    let stride = fold.page_stride_bytes.0.max(1);
     let n = where_.n_fold_pages;
     // A paged step belongs to the image keyed by ceil(pos/per) — sample only
-    // within the canvas's own key, which is the range the player replays this
-    // image over. An unpaged bundle has one image for every position.
-    let in_image = |p: i64| !fold.paged || (p > (n - 1) * per && p <= n * per);
-    let mut samples: Vec<(i64, u64, &str)> = vec![
-        (pos + 5, page, "slot+5"),
-        (pos + 33, page, "slot+33"),
-        (pos + 65, page, "slot+65/slab+1"),
-        (pos + 130, page, "slot+130/slab+2"),
-        (pos + 69, page + stride, "slot+69/slab+1/page+1"),
-        (pos, page + stride, "page+1"),
+    // within the canvas's own key AND off its page boundary, which is the
+    // OPEN span the player replays this image over (the boundary step walks).
+    // An unpaged bundle has one image for every position.
+    let in_image = |p: i64| !fold.paged || (p > (n - 1) * per && p < n * per);
+    let mut samples: Vec<(i64, &str)> = vec![
+        (pos + 5, "slot+5"),
+        (pos + 33, "slot+33"),
+        (pos + 65, "slot+65/slab+1"),
+        (pos + 130, "slot+130/slab+2"),
     ];
     if pos >= 3 {
-        samples.push((pos - 3, page, "slot-3 (negative delta)"));
+        samples.push((pos - 3, "slot-3 (negative delta)"));
     }
-    if page >= stride {
-        samples.push((pos, page - stride, "page-1 (negative delta)"));
-    }
-    if fold.paged {
-        // The image's last step: slot 0 of the NEXT page — still image `n`
-        // (ceil(n·per/per) = n; the boundary slot belongs to this image), and
-        // the write page advances with it.
-        samples.push((
-            n * per,
-            page + stride,
-            "page-boundary slot 0 of the next page",
-        ));
-    }
-    let samples: Vec<_> = samples
-        .into_iter()
-        .filter(|(p, _, _)| in_image(*p))
-        .collect();
+    let samples: Vec<_> = samples.into_iter().filter(|(p, _)| in_image(*p)).collect();
     if samples.is_empty() {
         bail!(
             "[cbpatch] {label} REFUSED: no off-sample step fits this image's position range — \
              the gate would pass vacuously"
         );
     }
-    let walk_render = |w: &LaunchWhere| -> Result<Vec<ControlBlockWire>> {
-        let (items, _) = walk_items(ops, fold, seg, banks, w)?;
+    // Every sample renders the walk at the canvas's OWN page base — the base
+    // every replayed step of this image writes at.
+    let walk_render = |spos: i64| -> Result<Vec<ControlBlockWire>> {
+        let (items, _) = walk_items(
+            ops,
+            fold,
+            seg,
+            banks,
+            &LaunchWhere {
+                slot_pos: SeqPos(spos),
+                ..*where_
+            },
+        )?;
         Ok(stream.render_compute_batch(&items, 1)?)
     };
-    for (spos, spage, what) in samples {
-        let expected = walk_render(&LaunchWhere {
-            slot_pos: SeqPos(spos),
-            kv_page_base: Bytes(spage),
-            ..*where_
-        })?;
+    for (spos, what) in samples {
+        let expected = walk_render(spos)?;
         if expected.len() != canvas.len() {
             bail!(
                 "[cbpatch] {label} REFUSED at sample `{what}`: the walk renders {} CB(s) but the \
@@ -991,7 +1008,7 @@ pub(crate) fn patch_check(
             );
         }
         let mut got = canvas.clone();
-        patch_plan.apply(&mut got, &step_scalars(fold.paged, per, spos, spage));
+        patch_plan.apply(&mut got, &step_scalars(fold.paged, per, spos));
         for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
             if a != b {
                 let (mut at, mut wb, mut pb) = (0, 0u8, 0u8);
