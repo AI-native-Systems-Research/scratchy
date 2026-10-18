@@ -90,6 +90,19 @@ fn one_layer_roped() -> LoweringInput {
     // The K-side append (op 5) reads its own-width pair — inputs 1, 2 are its cos, sin.
     input.ops[5].inputs[1] = InputRef::Ext(14);
     input.ops[5].inputs[2] = InputRef::Ext(15);
+    // The prefix caches at ONE PAGE (256 rows) — production's own resident-cache cap
+    // (`prefix_cap_default`, the golden file's law). The shared fixture's stock 8 rows
+    // would clamp every legal rung to the same sweep (`swept.min(tensor rows)` with the
+    // 64-row rung stick), making the ladder assert below vacuous; at a page the
+    // interior rungs 64/128 genuinely sweep less than the ceiling.
+    input.sources[7] = SourceShape {
+        rows: 256,
+        cols: KV,
+    };
+    input.sources[8] = SourceShape {
+        rows: 256,
+        cols: KV,
+    };
     input
 }
 
@@ -235,10 +248,12 @@ fn n_layer_tied(n: u32, scale_tail: bool) -> (LoweringInput, HashSet<u32>) {
 /// The production chain over the fixture — the codegen's own four steps (region →
 /// validate → tape → reroll) and the rolled walk, at the ONE-REQUEST rung's own
 /// argument values (`rows_are_requests = false`, no chunk), with the tie token the
-/// expansion would mint.
+/// expansion would mint — at the cap rung given (FULL for the single-bundle legs; the
+/// ladder assert passes the interior rungs).
 fn walk_tied(
     scale_tail: bool,
     argmax: Option<TiedLmHeadEmbedding>,
+    cap: ActiveCap,
 ) -> (RolledSuperDsc, SubtileIR<NeoX>) {
     let (input, weight_ids) = n_layer_tied(LAYERS, scale_tail);
     let rg = lower_region(&input, std::num::NonZeroU32::new(8192).unwrap());
@@ -249,7 +264,7 @@ fn walk_tied(
         &rolled_tape,
         &rg,
         &weight_ids,
-        ActiveCap::FULL,
+        cap,
         false,
         RungFacts {
             one_request: true,
@@ -286,7 +301,7 @@ fn prologue_node(rg: &SubtileIR<NeoX>) -> &scratchy_subtile::subtile_ir::Subtile
 /// declared the seven scratch synthetics at the row.
 #[test]
 fn the_walk_mints_the_composite_behind_the_granite_tail() {
-    let (rolled, rg) = walk_tied(true, Some(tied()));
+    let (rolled, rg) = walk_tied(true, Some(tied()), ActiveCap::FULL);
     let last = rolled
         .suffix
         .last()
@@ -379,7 +394,7 @@ fn the_walk_mints_the_composite_behind_the_granite_tail() {
 /// recognition walks the tail it finds, and zero tail ops is a tail.
 #[test]
 fn the_walk_mints_the_composite_for_a_tailless_tied_head() {
-    let (rolled, rg) = walk_tied(false, Some(tied()));
+    let (rolled, rg) = walk_tied(false, Some(tied()), ActiveCap::FULL);
     let last = rolled
         .suffix
         .last()
@@ -405,8 +420,8 @@ fn the_walk_mints_the_composite_for_a_tailless_tied_head() {
 /// scale), never one op more.
 #[test]
 fn an_untied_rung_keeps_the_host_path() {
-    let (tied_rolled, _) = walk_tied(true, Some(tied()));
-    let (plain_rolled, _) = walk_tied(true, None);
+    let (tied_rolled, _) = walk_tied(true, Some(tied()), ActiveCap::FULL);
+    let (plain_rolled, _) = walk_tied(true, None, ActiveCap::FULL);
     assert_eq!(
         plain_rolled.suffix.len() + 1,
         tied_rolled.suffix.len(),
@@ -516,5 +531,122 @@ fn a_multi_row_result_refuses_the_k1_composite() {
     assert!(
         err.contains("3-row result"),
         "the refusal names the row count: {err}"
+    );
+}
+
+/// ⭐ THE LADDER-SIDE CONTENT-KEY ASSERT (#603 PR3a) — every cap rung is its own
+/// lowering of the same tape, and the composite must mint IDENTICALLY at every one:
+/// same op name, same program, same bindings, and its two resident consts at the same
+/// segment/bank/offset/size. That is the content-key law made testable — "rung-
+/// independent by construction, asserted not conventions" (`emit::argmax`): the bake's
+/// content key ("a hash of exactly what dxp will read") collapses the composite across
+/// the whole ladder, so the group costs ONE dxp compile, not one per rung. The
+/// emission-side half of the guard is the door's byte-identity test (a descriptor for
+/// this op is a pure function of exactly the content compared here); this is the
+/// ladder-side half.
+///
+/// The ladder is the macro's own construction — the interior decode rungs
+/// `ActiveCap::decode_ladder` admits below the storage cap, with the FULL ceiling
+/// appended (the rung any context ≤ cap falls back to) — and NON-VACUITY is pinned
+/// alongside: the lowest interior rung's attention program is NOT the ceiling's (the
+/// swept extent is baked into it), so the rungs are genuinely different lowerings and
+/// the composite's identity is a real property of the composite, not of a fixture that
+/// lowers the same bytes at every rung.
+#[test]
+fn every_cap_rung_mints_the_identical_composite() {
+    // The ladder is the macro's own construction at the fixture's own resident-cache
+    // cap — one page, `decode_ladder(256)`'s interior rungs {64, 128}, the rungs the
+    // golden file names as production's bake set.
+    let mut rungs = ActiveCap::decode_ladder(256);
+    assert!(
+        rungs.len() >= 2,
+        "the fixture's cap admits interior rungs — else this assert is vacuous"
+    );
+    // The ceiling LAST: every interior rung compares against it, as the design doc
+    // states ("each rung's rendered composite against the ceiling rung's").
+    rungs.push(ActiveCap::FULL);
+
+    let rolled_at: Vec<RolledSuperDsc> = rungs
+        .iter()
+        .map(|&cap| walk_tied(true, Some(tied()), cap).0)
+        .collect();
+
+    // The composite's whole content: the mint (op name + KTIR node) and the two
+    // resident consts' placements. `TensorPlacement` carries no `PartialEq`, so the
+    // placement compares as the tuple a descriptor bakes: role, segment, bank, offset,
+    // size — offset included, because a moved const is a moved address.
+    let composite_of = |rolled: &RolledSuperDsc| {
+        let last = rolled
+            .suffix
+            .last()
+            .expect("the suffix holds the composite at every rung");
+        assert!(
+            last.op_name.starts_with("argmax_o"),
+            "the suffix's last op is the composite at every rung: {}",
+            last.op_name
+        );
+        let placement = |tid: u32| {
+            let p = rolled
+                .layout
+                .placements
+                .get(&tid)
+                .unwrap_or_else(|| panic!("tid {tid} is placed at every rung"));
+            (p.role, p.segment, p.bank, p.offset, p.size)
+        };
+        (
+            last.op_name.clone(),
+            last.ktir
+                .clone()
+                .expect("the composite carries its program"),
+            placement(argmax_ramp_tid()),
+            placement(argmax_v_tid()),
+        )
+    };
+
+    let ceiling = composite_of(rolled_at.last().expect("the ceiling rung lowered"));
+    for (rung, rolled) in rungs.iter().zip(&rolled_at).take(rungs.len() - 1) {
+        let here = composite_of(rolled);
+        assert_eq!(here.0, ceiling.0, "the op name is rung-stable at {rung:?}");
+        assert_eq!(
+            here.1.func, ceiling.1.func,
+            "the func is rung-independent at {rung:?} — no per-rung offset may enter it"
+        );
+        assert_eq!(here.1.program, ceiling.1.program, "the program at {rung:?}");
+        assert_eq!(
+            here.1.bindings, ceiling.1.bindings,
+            "the bindings at {rung:?}"
+        );
+        assert_eq!(here.1.mask, ceiling.1.mask, "the mask binding at {rung:?}");
+        assert_eq!(
+            here.1.node_out_tid, ceiling.1.node_out_tid,
+            "the node output binding at {rung:?}"
+        );
+        assert_eq!(
+            here.2, ceiling.2,
+            "the ramp's placement is rung-independent at {rung:?}"
+        );
+        assert_eq!(
+            here.3, ceiling.3,
+            "the V stick's placement is rung-independent at {rung:?}"
+        );
+    }
+
+    // NON-VACUITY — the rungs ARE different lowerings of the same tape: some body
+    // program at the lowest interior rung differs from the ceiling's (the attention's
+    // swept extent enters its program — `lower_attn`'s `param_read_rows` law).
+    let body_funcs = |rolled: &RolledSuperDsc| {
+        rolled
+            .bodies
+            .iter()
+            .flat_map(|b| b.ops.iter().filter_map(|e| e.ktir.as_ref().map(|k| k.func)))
+            .collect::<Vec<_>>()
+    };
+    let low = body_funcs(&rolled_at[0]);
+    let ceil = body_funcs(rolled_at.last().expect("the ceiling rung lowered"));
+    assert_eq!(low.len(), ceil.len(), "the ladder lowers the same tape");
+    assert!(
+        low.iter().zip(&ceil).any(|(a, b)| a != b),
+        "the lowest interior rung's attention program differs from the ceiling's — the \
+         rungs are genuinely different lowerings, or this assert pins nothing"
     );
 }
