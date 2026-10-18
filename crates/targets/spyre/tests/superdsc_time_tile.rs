@@ -652,8 +652,9 @@ fn the_walk_refuses_one_program_touching_two_same_class_pins() {
     let mut ops = norm(&l, "a", 7, &mut sym);
     ops.extend(norm(&l, "b", 17, &mut sym));
     // ONE program owning both chains' ops — the shape a collapsed lowering would produce.
-    // Within one program dxp's own scheduler sequences the nodes under no contract we can
-    // cite, so intra-program sharing is not ours to assume: refused outright, both pins named.
+    // One program's descriptors are one SDSC phase (the citations schedule per node, one
+    // phase each), so both pins live in the SAME phase with no phase boundary between
+    // their touches for a shared slot to alternate across: refused outright, both named.
     let per_prog = vec![("rms_pair".to_string(), 10)];
     let err = superdsc::walk_lx_slot_alternation(
         &ops,

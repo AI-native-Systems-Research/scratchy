@@ -5911,11 +5911,12 @@ pub struct LxSlotRow {
 /// launch group over its programs in order:
 ///
 ///   * **one program, one name per class** — a program touching two same-class pins is
-///     refused outright. Program order is the boundary the phase argument covers; WITHIN a
-///     program dxp's own scheduler sequences its SDSC nodes under no contract we can cite,
-///     so intra-program sharing is not ours to assume. (Impossible in every emission today —
-///     each rmsnorm's `rinv` is touched only by its own program — guarded generically so a
-///     future op that reads two norms' pins in one program refuses here, not on card.)
+///     refused outright. One program's descriptors are ONE SDSC phase, and the citation
+///     pack schedules per node, one phase each — so two same-class pins in one program
+///     live in the SAME phase, with no phase boundary between their touches for a shared
+///     slot to alternate across. (Impossible in every emission today — each rmsnorm's
+///     `rinv` is touched only by its own program — guarded generically so a future op
+///     that reads two norms' pins in one program refuses here, not on card.)
 ///   * **per-name contiguity** — once a name's run has been closed by a same-class sibling,
 ///     touching it again is a refusal naming both names and the class. The run state carries
 ///     ACROSS the bundle's launch groups: the groups launch in order on one stream, so a
