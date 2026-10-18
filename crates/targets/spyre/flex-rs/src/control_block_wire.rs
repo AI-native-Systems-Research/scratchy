@@ -838,6 +838,37 @@ impl ControlBlockWire {
         self.bytes[CTRL_SECTION..CTRL_SECTION + 8].copy_from_slice(&word.to_le_bytes());
     }
 
+    /// Set the CTRL section's error-dependency mode (`CtrlSectionSBF::edep_`,
+    /// bits 34:33, four-valued EDEP0..EDEP3 — `ctrl_section_sbf.hpp:45-49`).
+    ///
+    /// The vendor's `ControlBlockStream::Finalize` (`control_block_stream.cpp:423`)
+    /// stamps EDEP1 on the first CB of EVERY submitted stream, unconditionally —
+    /// the only `SetEdep` in the vendor tree, and purely device-facing (no
+    /// software path reads it back). The device consumes the field: EDEP is a
+    /// named CB-kill cause in the response block's app-data "CB KILL" enum
+    /// (`app_data_sbf.hpp:163-171`, alongside LATE_CANCEL/TIMEOUT/CONTEXT_FENCE),
+    /// so a stream that never carries the vendor's value sits outside the
+    /// error-dependency behavior every real submission exercises.
+    /// [`CtrlSection::new`] packs only tag+barrier, so bits 34:33 default to
+    /// EDEP0 — this method is how the first-CB stamp reaches the wire.
+    ///
+    /// Same mask-and-set discipline as [`Self::set_tag`], with one
+    /// correction that discipline needs here: the field is cleared IN
+    /// POSITION before the new value is OR'd in (`MASK` is the unshifted
+    /// width mask, so `pack(MASK)` is what puts it at bits 34:33). The
+    /// stamp must be able to CLEAR the field too — a re-stamp that could
+    /// only set bits would leave a stale EDEP1 on every CB after the
+    /// first. Everything else in word 0 — the tag, the barrier bit,
+    /// `completion_interrupt_` (bit 35) — is kept.
+    pub fn set_edep(&mut self, edep: u64) {
+        let in_position = BitField::<34, 33>::pack(BitField::<34, 33>::MASK);
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&self.bytes[CTRL_SECTION..CTRL_SECTION + 8]);
+        let word = u64::from_le_bytes(w);
+        let word = (word & !in_position) | BitField::<34, 33>::pack(edep);
+        self.bytes[CTRL_SECTION..CTRL_SECTION + 8].copy_from_slice(&word.to_le_bytes());
+    }
+
     /// Port of `ControlBlockStream::CreateGraphFreeCompute`: one compute CB
     /// with `xlat[i] = tensor_paddrs[i]` (RW) for each input/output tensor,
     /// `xlat[7] = prog_paddr` (RW), and `cmpt` pointing at `bootstrap_addr`
@@ -1088,6 +1119,17 @@ impl ControlBlockWire {
         let mut word = [0u8; 8];
         word.copy_from_slice(&self.bytes[CTRL_SECTION..CTRL_SECTION + 8]);
         BitField::<7, 0>::unpack(u64::from_le_bytes(word)) != 0
+    }
+
+    /// This CB's own `CtrlSectionSBF::edep_` (bits 34:33 of the CTRL word,
+    /// same encoding [`Self::set_edep`] stamps) — the error-dependency mode.
+    /// EDEP0 on every CB the constructors build; EDEP1 on the first CB of a
+    /// submitted stream, where `ResponseWorker::prepare_cbs` (the `Finalize`
+    /// port) and the replay image derivation both stamp it.
+    pub fn edep(&self) -> u64 {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&self.bytes[CTRL_SECTION..CTRL_SECTION + 8]);
+        BitField::<34, 33>::unpack(u64::from_le_bytes(word))
     }
 }
 
@@ -1541,6 +1583,122 @@ mod tests {
         let va = VirtualAddressSbf::new(7, Flits::from_bytes(1 << 20));
         assert_eq!(va.segment(), 7);
         assert_eq!(va.offset().to_bytes(), 1 << 20);
+    }
+
+    /// #608: EDEP occupies CTRL bits 34:33 exactly, and stamping it moves
+    /// nothing else — the encoding-level half of the first-CB rule. The
+    /// constructors pack only tag+barrier, so a freshly built CB is EDEP0:
+    /// before #608 every CB we submitted carried EDEP0 where the vendor's
+    /// `Finalize` (`control_block_stream.cpp:423`) stamps EDEP1 on the first
+    /// CB of each stream.
+    #[test]
+    fn edep_occupies_ctrl_bits_34_33_and_leaves_neighbors_intact() {
+        let dmva = VirtualAddressSbf::new(3, Flits::from_bytes(0));
+        let mut cb = ControlBlockWire::fill(
+            ResponseTag(0xABC),
+            dmva,
+            TransferSize(4096),
+            0xDEAD_BEEF,
+            true,
+            DevicePhysicalAddress(0x3_0000_0000),
+            SegmentExtent(4096),
+        )
+        .unwrap();
+        let word0 = |cb: &ControlBlockWire| {
+            u64::from_le_bytes(
+                cb.to_bytes()[CTRL_SECTION..CTRL_SECTION + 8]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+
+        let before = word0(&cb);
+        assert_eq!(cb.edep(), 0, "constructors leave EDEP0 (bits 34:33 zero)");
+        assert_eq!(before >> 33 & 0b11, 0);
+
+        cb.set_edep(1);
+        let stamped = word0(&cb);
+        assert_eq!(cb.edep(), 1);
+        // EXACT bit pattern, asserted as literal bits (not through the same
+        // BitField the setter uses): bit 33 set, bit 34 clear — EDEP1, not
+        // some other neighbor.
+        assert_eq!(stamped >> 33 & 0b11, 0b01);
+        // The mask-and-set kept every other bit of word 0: tag (31:8),
+        // barrier (32), completion_interrupt (35) included.
+        assert_eq!(stamped & !(0b11u64 << 33), before);
+
+        // The replay-image agreement case, both directions: re-stamping the
+        // same value is a no-op (derivation and submit path both stamp
+        // EDEP1), and the mask-and-set can CLEAR — the reverse of the
+        // stale-image case — so a stamp can never leave a stale EDEP1
+        // behind on a non-first CB.
+        cb.set_edep(1);
+        assert_eq!(word0(&cb), stamped);
+        cb.set_edep(0);
+        assert_eq!(cb.edep(), 0);
+        assert_eq!(word0(&cb), before);
+    }
+
+    /// #611 + #608 in ONE CTRL word: the cancel byte (`cancel_`, bits 7:0,
+    /// stamped by the `cancelled` constructor) and EDEP (`edep_`, bits
+    /// 34:33, stamped by the first-CB rule) are disjoint fields of the same
+    /// 64-bit word, written by independent setters. This is the exact CTRL
+    /// word a #611 cancelled twin occupying a stream's first-CB slot would
+    /// carry across #608's `prepare_cbs` stamp — the combined-field case
+    /// #603 PR3b's overrun discard is shaped like — so both fields must
+    /// read back and each setter's mask-and-set must leave the other's
+    /// field untouched.
+    #[test]
+    fn cancel_byte_and_edep_coexist_in_one_ctrl_word() {
+        // The cancel constructor alone leaves EDEP0 — neither side's
+        // constructor sets the other's field.
+        let mut cb = ControlBlockWire::cancelled(ResponseTag(0xABC));
+        assert_eq!(cb.edep(), 0, "the cancelled constructor stamps no EDEP");
+        assert!(cb.ctrl_cancelled());
+
+        // BOTH stamps on one CB: the constructor's cancel byte, then the
+        // first-CB rule's EDEP1.
+        cb.set_edep(1);
+
+        // BOTH read back through their own readers.
+        assert!(
+            cb.ctrl_cancelled(),
+            "the cancel byte survives the EDEP stamp"
+        );
+        assert_eq!(cb.edep(), 1, "the EDEP stamp survives on a cancelled CB");
+
+        // And on the wire as literal bits (not through either field's own
+        // BitField): cancel byte exactly 1 at bits 7:0, EDEP exactly 0b01
+        // at bits 34:33, tag preserved at bits 31:8, barrier clear at 32.
+        let ctrl = u64::from_le_bytes(
+            cb.to_bytes()[CTRL_SECTION..CTRL_SECTION + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(ctrl & 0xFF, 1, "cancel_ (bits 7:0) is exactly 1");
+        assert_eq!(
+            ctrl >> 33 & 0b11,
+            0b01,
+            "edep_ (bits 34:33) is exactly EDEP1"
+        );
+        assert_eq!((ctrl >> 8) & 0xFF_FFFF, 0xABC, "tag survives both stamps");
+        assert_eq!(ctrl >> 32 & 1, 0, "barrier stays clear");
+
+        // Disjointness in the clear direction too: `set_edep`'s in-position
+        // clear (back to EDEP0) must not disturb the cancel byte.
+        cb.set_edep(0);
+        assert_eq!(cb.edep(), 0);
+        assert!(
+            cb.ctrl_cancelled(),
+            "clearing EDEP leaves the cancel byte set — the fields are disjoint"
+        );
+        let ctrl_after = u64::from_le_bytes(
+            cb.to_bytes()[CTRL_SECTION..CTRL_SECTION + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(ctrl_after & !(0b11u64 << 33), ctrl & !(0b11u64 << 33));
+        assert_eq!(ctrl_after & 0xFF, 1);
     }
 
     #[test]
