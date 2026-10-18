@@ -1856,6 +1856,51 @@ fn program_broadcast_chains(
 /// row count off the OUTPUT, which is the only place it can honestly come from. So the parameter's
 /// own region is exact here, and the one thing that would be wrong on it — a row corner — is what
 /// `base_addressed` refuses downstream.
+/// ⭐ The window one `ktdp.construct_access_tile` states — its corner constants
+/// (operands 1/2) and its own `shape` — read with exactly the code `regions()` reads
+/// them (`shape_2d` and `index_constants`), so every reader of a tile's window agrees.
+///
+/// `Ok(None)` when the tile is not the corner form (`operands.len() != 3`): the caller
+/// keeps the region it already holds. ⛔ A tile whose corners are NOT constants names a
+/// window no descriptor can carry, and is refused by name rather than silently falling
+/// back to the parameter's first tile — the same discipline as `regions()`'s in-loop
+/// guard. ONE function because its two callers — the load arm of
+/// [`region_for_operand`] and the walk's store arm — are two readers of ONE fact about
+/// one tile, and two readings of a tile is the drift the own-tile law exists to
+/// prevent (issue 201 item 3's shape).
+fn tile_window(
+    f: &IRFunction<'static>,
+    tile: &Operation<'_>,
+    whose: &str,
+) -> Result<Option<(u32, u32, u32, u32)>, Error> {
+    if tile.operands.len() != 3 {
+        return Ok(None);
+    }
+    let consts = super::lower_ktir_to_superdsc::index_constants(f);
+    let Some(shape) = super::lower_ktir_to_superdsc::shape_2d(tile) else {
+        return err(format!(
+            "{}: the access tile {whose} states no 2-D `shape`, so its window is unknown",
+            f.name
+        ));
+    };
+    let (rs, cs) = match (
+        tile.operands.get(1).and_then(|s| consts.get(s).copied()),
+        tile.operands.get(2).and_then(|s| consts.get(s).copied()),
+    ) {
+        (Some(rs), Some(cs)) => (rs as u32, cs as u32),
+        _ => {
+            return err(format!(
+                "{}: the access tile {whose} states a window whose corner is not a constant \
+                 (`ktdp.construct_access_tile` operands 1/2), so the descriptor cannot carry the \
+                 offset. A loop-carried or computed corner needs hoisting or unrolling before the \
+                 whole-function door can address it.",
+                f.name
+            ));
+        }
+    };
+    Ok(Some((rs, cs, shape.0, shape.1)))
+}
+
 pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error> {
     // The parameter-rooted walk already computes every field of a `Region` correctly; the only
     // thing wrong for a multi-op function is WHICH parameter and WHICH tile. So find the parameter
@@ -1905,34 +1950,11 @@ pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error>
     // walks cannot disagree about one tile. A tile whose corners are NOT constants names a window
     // no descriptor can carry, and is refused by name rather than silently falling back to the
     // parameter's first tile — the same discipline as `regions()`'s in-loop guard.
-    if tile.operands.len() == 3 {
-        let consts = super::lower_ktir_to_superdsc::index_constants(&k.func);
-        let Some(shape) = super::lower_ktir_to_superdsc::shape_2d(tile) else {
-            return err(format!(
-                "{}: the access tile feeding this load states no 2-D `shape`, so its window is \
-                 unknown",
-                f.name
-            ));
-        };
-        let (rs, cs) = match (
-            tile.operands.get(1).and_then(|s| consts.get(s).copied()),
-            tile.operands.get(2).and_then(|s| consts.get(s).copied()),
-        ) {
-            (Some(rs), Some(cs)) => (rs as u32, cs as u32),
-            _ => {
-                return err(format!(
-                    "{}: the access tile feeding this load states a window whose corner is not a \
-                     constant (`ktdp.construct_access_tile` operands 1/2), so the descriptor cannot \
-                     carry the offset. A loop-carried or computed corner needs hoisting or unrolling \
-                     before the whole-function door can address it.",
-                    f.name
-                ));
-            }
-        };
+    if let Some((rs, cs, r_len, c_len)) = tile_window(f, tile, "feeding this load")? {
         r.r_start = rs;
         r.c_start = cs;
-        r.r_len = shape.0;
-        r.c_len = shape.1;
+        r.r_len = r_len;
+        r.c_len = c_len;
     }
     Ok(Some(r))
 }
@@ -2632,11 +2654,11 @@ pub fn lower_function(
             continue;
         };
         let out_tile = store.operands.get(1).copied();
-        let out_view = f
+        let out_tile_op = f
             .operations
             .iter()
-            .find(|o| o.op_type == OpKind::KtdpConstructAccessTile && o.result == out_tile)
-            .and_then(|t| t.operands.first().copied());
+            .find(|o| o.op_type == OpKind::KtdpConstructAccessTile && o.result == out_tile);
+        let out_view = out_tile_op.and_then(|t| t.operands.first().copied());
         let out_ptr = f
             .operations
             .iter()
@@ -2651,6 +2673,24 @@ pub fn lower_function(
         };
         let all = regions(k)?;
         let mut o = all[out_idx];
+        // ⭐⭐⭐⭐⭐ THE WINDOW IS THE STORE'S OWN TILE, NOT THE PARAMETER'S FIRST — the store
+        // arm of the law [`region_for_operand`]'s load arm has enforced since the unblocked
+        // SwiGLU measurement (MEASURED there: every trip's matmul read the weight through
+        // trip 0's tile, corr 0.999996 against the doubled-window product). `regions()`
+        // keeps the FIRST access tile over each parameter's view, so a function that stores
+        // SEVERAL windows of one buffer — the MoE gate/up act rows, pair j's `[1, I]` window
+        // at column `j·I` of the `[1, K·I]` act buffer — would otherwise write EVERY pair's
+        // activation through pair 0's tile: right shape, right dtype, every pair landed on
+        // the first pair's columns. The store in hand is THIS op's own (found by result
+        // identity above), so its tile is the window this emission must write.
+        if let Some(tile) = out_tile_op
+            && let Some((rs, cs, r_len, c_len)) = tile_window(f, tile, "this store writes through")?
+        {
+            o.r_start = rs;
+            o.c_start = cs;
+            o.r_len = r_len;
+            o.c_len = c_len;
+        }
         o.is_out = true;
         per_op.push(o);
 
@@ -3853,5 +3893,157 @@ mod program_reads_tests {
         };
         let reads = program_reads(&f);
         assert_eq!(reads.through_plumbing(e4), e1, "three steps up, not four");
+    }
+}
+
+/// THE OWN-TILE WINDOW READER'S FAIL-CLOSED HALF — each refusal has a control that
+/// isolates it, the door suite's own law.
+///
+/// [`tile_window`] is the ONE reading of a `ktdp.construct_access_tile`'s window, shared by
+/// [`region_for_operand`]'s load arm and the walk's store arm. The accepting path is pinned
+/// end-to-end by the MoE door tests (moe.py's per-pair act stores, each with its own tile on
+/// the shared act buffer); what only a unit test can isolate is the reader's own contract:
+/// two constant-corner tiles over one view state two windows, a computed corner is REFUSED
+/// BY NAME rather than silently falling back to the parameter's first tile, and a tile that
+/// is not the corner form states no window at all so the caller keeps what it holds.
+#[cfg(test)]
+mod tile_window_tests {
+    use super::*;
+    use ktir_core::arena::Arena;
+    use ktir_core::ir::Operation;
+    use ktir_core::irtype::IrType;
+
+    /// moe.py's own spelling of the shared act buffer: TWO tiles over ONE view — pair 0's at
+    /// column 0, pair 1's at column `I` — each stating its own `[1, 64]` shape (the attribute
+    /// `shape_2d` reads). `second_col` is `Some(v)` for the constant corner every shipped
+    /// config states, or `None` to wire pair 1's corner to an ARGUMENT no constant defines: a
+    /// loop-carried or computed corner, the one thing the reader must refuse rather than guess.
+    fn pairs_fn(second_col: Option<i64>) -> IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let (view, rc, c0, c1, t0, t1) = (Ssa(8), Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let mut ops = vec![
+            Operation::new(a, Some(rc), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(0),
+            ),
+            Operation::new(a, Some(c0), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(0),
+            ),
+            Operation::new(
+                a,
+                Some(t0),
+                OpKind::KtdpConstructAccessTile,
+                &[view, rc, c0],
+            )
+            .with_attr(a, AttrKey::Shape, Attr::IntList(&[1i64, 64])),
+        ];
+        let second = match second_col {
+            Some(v) => {
+                ops.push(
+                    Operation::new(a, Some(c1), OpKind::ArithConstant, &[]).with_attr(
+                        a,
+                        AttrKey::Value,
+                        Attr::Int(v),
+                    ),
+                );
+                c1
+            }
+            None => Ssa(9),
+        };
+        ops.push(
+            Operation::new(
+                a,
+                Some(t1),
+                OpKind::KtdpConstructAccessTile,
+                &[view, rc, second],
+            )
+            .with_attr(a, AttrKey::Shape, Attr::IntList(&[1i64, 64])),
+        );
+        IRFunction {
+            name: "tile_probe",
+            arguments: a.args(vec![(view, IrType::Index), (Ssa(9), IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    /// The tile defining `res` — the probe's ops are addressed by result, the way the walk
+    /// itself finds a tile.
+    fn tile_of(f: &IRFunction<'static>, res: Ssa) -> &'static Operation<'static> {
+        f.operations
+            .iter()
+            .find(|o| o.result == Some(res))
+            .expect("the probe states the tile")
+    }
+
+    /// ⭐ CONTROL — the accepting path, stated as the defect's own shape: TWO tiles over ONE
+    /// view must state TWO windows. The parameter-rooted `regions()` join can only offer the
+    /// FIRST tile's window, which is exactly the collapse the store arm used to inherit —
+    /// pair 1's column must not come from pair 0's tile.
+    #[test]
+    fn two_tiles_over_one_view_state_two_windows() {
+        let f = pairs_fn(Some(64));
+        assert_eq!(
+            tile_window(&f, tile_of(&f, Ssa(3)), "pair 0's tile").expect("constant corners"),
+            Some((0, 0, 1, 64)),
+            "pair 0's window is its own tile's"
+        );
+        assert_eq!(
+            tile_window(&f, tile_of(&f, Ssa(4)), "pair 1's tile").expect("constant corners"),
+            Some((0, 64, 1, 64)),
+            "pair 1's window is ITS OWN tile's — pair 0's column 0 must not leak into it"
+        );
+    }
+
+    /// ⛔ A COMPUTED CORNER IS REFUSED BY NAME — the fail-closed half. Before the store arm
+    /// read its own tile, a computed corner meant a silent write through the parameter's
+    /// FIRST tile (right shape, wrong window); now it is a build error naming the corner, the
+    /// same discipline `regions()`'s in-loop guard holds. The refusal is per-tile: pair 0's
+    /// constant tile still states its window while pair 1's is refused.
+    #[test]
+    fn a_computed_corner_is_refused_by_name_and_only_on_its_tile() {
+        let f = pairs_fn(None);
+        let e = tile_window(&f, tile_of(&f, Ssa(4)), "pair 1's tile")
+            .expect_err("a computed corner names a window no descriptor can carry")
+            .message;
+        assert!(
+            e.contains("corner is not a constant"),
+            "the refusal must name the corner, not fall back to window 0: {e}"
+        );
+        assert_eq!(
+            tile_window(&f, tile_of(&f, Ssa(3)), "pair 0's tile").expect("constant corners"),
+            Some((0, 0, 1, 64)),
+            "pair 0's constant tile still states its window"
+        );
+    }
+
+    /// A tile that is not the corner form — no corner operands to read — states NO window,
+    /// and the caller keeps the region it already holds: the reader must not invent one.
+    #[test]
+    fn a_tile_without_corners_states_no_window() {
+        let a: &'static Arena = Arena::global();
+        let (view, tile) = (Ssa(8), Ssa(1));
+        let f = IRFunction {
+            name: "bare_tile_probe",
+            arguments: a.args(vec![(view, IrType::Index)]),
+            operations: a.ops(vec![Operation::new(
+                a,
+                Some(tile),
+                OpKind::KtdpConstructAccessTile,
+                &[view],
+            )]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        assert_eq!(
+            tile_window(&f, tile_of(&f, Ssa(1)), "the bare tile")
+                .expect("a tile that is not the corner form is not an error"),
+            None,
+            "no corners to read, so no window to state"
+        );
     }
 }
