@@ -46,7 +46,9 @@ use ktir_core::attrkey::AttrKey;
 use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
 use ktir_core::opkind::OpKind;
 
-use super::lower_ktir_to_superdsc::{Error, Gather, Region, err, gathers_of, regions};
+use super::lower_ktir_to_superdsc::{
+    Error, Gather, Region, err, gather_facts_at_tile, gathers_of_excluding, regions,
+};
 use crate::ktir_node::{Elementwise, GatedAct, KtirNode, Program, ReduceKind};
 // The broadcast AXIS is the emission door's own vocabulary — `elementwise` selects the `In` builder
 // from it — so it lives beside that door and this recogniser names the same type rather than a
@@ -1497,6 +1499,973 @@ fn gelu_mul_chain_from(
     }))
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  THE W8A8 GATE/UP SLAB GEMMS — the fused MoE kernel's expert projections.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// One claimed gate/up gemm: the links the fusion destroys, and the two tiles it
+/// claims out of the gathers census.
+///
+/// ⭐ THE TERMINAL IS NOT CONSUMED — it is the value the REST of the program
+/// reads (pair `p`'s `[1, n]` projection row, the gated act's gate input), so the
+/// walk records it as a WINDOW of the projection's output intermediate and every
+/// consumer resolves it there. The same law the gelu reader states for its
+/// terminal multiply.
+#[derive(Clone, Copy, Debug)]
+pub struct W8a8Chain {
+    /// The pair this chain serves — its anchor word in the index buffer, proven
+    /// one of `0..k` by the projection's anchors check.
+    pub pair: u32,
+    /// The weight tile — this chain's claim out of [`gathers_of`]'s census
+    /// (`GatherFacts::tile`'s identity, never a position).
+    pub weight_tile: Ssa,
+    /// The `tensor.collapse_shape` that flattens the gathered slab to `[n, inn]`.
+    pub collapsed: Ssa,
+    /// The `linalg.matmul` — the fp8 contraction the fused emission replaces.
+    pub dot: Ssa,
+    /// The dequant's first leg: `dot · broadcast(sx)`.
+    pub mul_s: Ssa,
+    /// The dequant's terminal: `mul_s · the pair's gathered router scale` — the
+    /// chain's OUTPUT value.
+    pub terminal: Ssa,
+    /// The router-scale tile — the chain's second claim out of the census.
+    pub scale_tile: Ssa,
+}
+
+/// One gate/up projection: every pair's chain over one `(weight, scale)` bank
+/// pair, plus the shared facts the emission needs.
+#[derive(Clone, Debug)]
+pub struct W8a8Projection {
+    /// The expert input's tensor id — the shared quantize's `Fp8Facts::a_tid`.
+    pub a_tid: u32,
+    /// The routing parameter's tensor id — the XIdx landing is keyed off it.
+    pub idx_tid: u32,
+    /// The weight bank's tensor id (the `[E, n, inn]` fp8 parameter).
+    pub weight_tid: u32,
+    /// The scale bank's tensor id (the `[E, n]` f16 parameter).
+    pub scale_tid: u32,
+    /// The top-k width — one chain per index word, proven `0..k` complete.
+    pub k: u32,
+    /// The contraction width (`inn`, the expert input's row width).
+    pub inn: u32,
+    /// The projection's output width per pair.
+    pub n: u32,
+    /// The experts the bank holds (`E`).
+    pub e_count: u32,
+    /// The spine's codes and per-token scale — the cross-projection consistency
+    /// facts: gate and up are two projections over ONE expert input, so these
+    /// must be the SAME values in both.
+    pub qx: Ssa,
+    pub sx: Ssa,
+    /// The chains, sorted by pair.
+    pub chains: Vec<W8a8Chain>,
+    /// The FIRST terminal in program order — the op the walk meets first and
+    /// lowers the whole projection at.
+    pub emit_at: Ssa,
+    /// Everything the fusion destroys: the spine's eleven compute ops (shared by
+    /// every chain, so stated once) and each chain's three interior links. The
+    /// terminals are deliberately absent — they are the projection's output
+    /// windows.
+    pub consumed: Vec<Ssa>,
+}
+
+/// The per-chain claim, before grouping — the recogniser's working state.
+struct W8a8Claim {
+    chain: W8a8Chain,
+    weight_tid: u32,
+    scale_tid: u32,
+    a_load: Ssa,
+    a_tid: u32,
+    qx: Ssa,
+    sx: Ssa,
+    idx_tid: u32,
+    anchor: i64,
+    e_count: u32,
+    n: u32,
+    inn: u32,
+    /// The spine's eleven destroyed compute ops: abs, the amax reduce, its
+    /// scaling, the floor, the scale itself, the reciprocal, the codes' scaling
+    /// and two clamps, the truncation, and the codes. `(a_load, qx, sx)`
+    /// equality across chains proves this is ONE set of ops by SSA, so the
+    /// group's first claim carries it for the projection.
+    spine_consumed: [Ssa; 11],
+}
+
+/// The W8A8 spine's constants, as the f16 grid states them — computed once per
+/// program, measured off the live moe.py artifact (`_fp8_scale`/`_fp8_codes`):
+/// the splats are f16 images `0.002231597900390625` (1/448) and
+/// `5.0067901611328125e-6` (1/448²), the ±448 clamps, and the reciprocal's 1.
+struct W8a8Consts {
+    inv_qmax: f64,
+    floor: f64,
+    cap: f64,
+    one: f64,
+    lo: f64,
+    hi: f64,
+}
+
+/// The PARAMETER a `ktdp.store` writes — its tile's view's own pointer argument.
+/// `None` for a store whose tile is not a plain view over a function argument.
+///
+/// ⛔ THIS IS THE DOWN DISCRIMINATOR'S RAW MATERIAL: the parameters in the set
+/// this builds are the program's SCRATCH (the fused MoE kernel round-trips its
+/// gelu output through `desc_act`), and a quantize spine rooting at a load of
+/// one is a RELOAD, not an expert input.
+fn store_param_ptr(reads: &ProgramReads<'_>, store: &Operation<'static>) -> Option<Ssa> {
+    let tile = reads.def_of(*store.operands.get(1)?)?;
+    if tile.op_type != OpKind::KtdpConstructAccessTile {
+        return None;
+    }
+    let view = reads.def_of(*tile.operands.first()?)?;
+    if view.op_type != OpKind::KtdpConstructMemoryView {
+        return None;
+    }
+    view.operands.first().copied()
+}
+
+/// The PARAMETER a plain `ktdp.load` reads — load → access tile → memory view →
+/// the pointer argument. `None` for a gathered load (an INDIRECT tile: the A side
+/// of a gathered gemm is not this form) and for a computed value: neither states
+/// one parameter to name.
+fn plain_load_param_ptr(reads: &ProgramReads<'_>, load: &Operation<'static>) -> Option<Ssa> {
+    let tile = reads.def_of(*load.operands.first()?)?;
+    if tile.op_type != OpKind::KtdpConstructAccessTile {
+        return None;
+    }
+    let view = reads.def_of(*tile.operands.first()?)?;
+    if view.op_type != OpKind::KtdpConstructMemoryView {
+        return None;
+    }
+    view.operands.first().copied()
+}
+
+/// THE W8A8 GATE/UP SLAB GEMMS, as the ONE fused emission they are — the card's
+/// own `quantscalepertokenfp8` + gathered `matmulfp8` + two-multiply dequant.
+///
+/// # WHY THIS RECOGNISER EXISTS
+///
+/// `kernels/moe.py` — gemma-4's whole sparse block as one Triton program — spells
+/// each pair's gate/up projection as the longhand the card's W8A8 primitive
+/// replaces: ONE per-token quantize of the expert input
+/// (`abs → amax → ·INV_QMAX → max(SCALE_FLOOR) → min(448)` = `sx`;
+/// `x·(1/sx)` clamped to ±448, truncated to fp8, widened back = the codes `qx`),
+/// then per pair a gathered fp8 slab gemm `qx @ wᵀ` whose product is dequantised
+/// in two multiplies (`raw · broadcast(sx) · the pair's gathered router scale`).
+/// Lowered op-by-op that is eleven pointwise ops and a PLAIN FP16 MATMUL per
+/// pair — a different algorithm, not a slower one (the fp8 contraction and its
+/// per-token scale are the card's own W8A8 numerics) — and at the whole-function
+/// door the per-pair slab gathers refuse the gathers census besides. This reader
+/// claims the chains whole, so [`lower_function`] emits each projection as one
+/// [`super::lower_ktir_to_superdsc::expert_matmul_fused_m1`].
+///
+/// # THE PROOF, EVERY FACT READ FROM THE PROGRAM
+///
+/// * **B is a collapsed gathered slab** — `tensor.collapse_shape` of a
+///   `ktdp.load` over a `ktdp.construct_indirect_access_tile`, its facts read
+///   through the same per-tile walk [`gathers_of`] uses, so the two readings of
+///   one tile cannot drift. The router's matmul (a plain load) fails here and is
+///   not this reader's;
+/// * **TransposeB** — the W8A8 form contracts over the slab's own `[n, inn]`
+///   view. A plain-B gathered gemm is a different program, left to the walk;
+/// * **the spine's constants** — `INV_QMAX = 1/448`, `SCALE_FLOOR = 1/448²`, the
+///   `448` cap, the reciprocal's `1.0` numerator and the codes' `±448` clamps,
+///   each checked as the value the f16 grid states (the island is narrowed
+///   back, so the splats are f16 images — measured off the live artifact). Any
+///   other constants are a different function with the same op kinds;
+/// * **the amax reduce is `Max` over `abs(a)` seeded `−inf`**, its result `[1]`
+///   f16 — the `quantscalepertokenfp8` primitive's own semantics (a Max seeded
+///   any higher clamps every-negative rows and is a different function);
+/// * **the spine is over ONE row** — the amax's `abs` reads the SAME value the
+///   codes multiply reads, and the codes every dot contracts are ONE shared
+///   value read only by claimed dots (checked across ALL projections after
+///   grouping: gate and up share one spine);
+/// * **destruction is exclusive** — every destroyed link has exactly the one
+///   reader the chain states, `sx` is read only by the reciprocal and rank
+///   plumbing, and no `ktdp.store` reads a terminal (the fusion writes the
+///   projection's output intermediate; a stored terminal is a write the walk's
+///   hook would silently drop);
+/// * **the anchors are exactly `0..k`** — every pair's two tiles anchor at its
+///   own index word, the whole top-k and nothing else;
+/// * **the island is narrowed back** — the truncation states `Fp8E4m3` and the
+///   widening `F16`, the boundaries of the one fp8 island the codes are.
+///
+/// # ⛔ THE DOWN DISCRIMINATOR IS PROVENANCE, NOT SHAPE
+///
+/// The down projection's spine is the SAME eleven ops over a RELOAD of the act
+/// scratch the program round-trips (store then load, pair by pair). What
+/// separates gate/up from down is where the spine ROOTS: gate/up at a load of
+/// the EXPERT INPUT — a parameter nothing in the program stores to — down at a
+/// load of a parameter the program stores to. That fact survives the down leg's
+/// own recogniser and does not depend on `M` (a tile-shape proxy would misfire
+/// the day `M > 1` is admitted: the `xe` tile `[1, H]` is its view at `M = 1`
+/// only). A spine rooting at a STORED parameter returns `Ok(None)` — not this
+/// reader's, not a refusal.
+///
+/// A chain that almost matches is REFUSED BY NAME, never lowered as the nearest
+/// thing — and a chain that fails BEFORE the provenance check (a broken spine
+/// link, a plain-B orientation, a non-gathered B) is left to the walk, which
+/// refuses it with the message that names the link: this reader claims a chain
+/// only whole.
+pub fn program_w8a8_gemm_chains(k: &KtirNode) -> Result<Vec<W8a8Projection>, Error> {
+    let f = &k.func;
+    let reads = program_reads(f);
+    // The constants, as the f16 grid states them — the gelu reader's own law:
+    // the island is narrowed back, so an f16 splat is the only spelling the
+    // program can carry, and the grid's image of the exact constant is the one
+    // value that is that constant at f16 precision.
+    let f16_image = |x: f64| {
+        ktir_core::codec::f16_units_to_f32(&ktir_core::codec::f32_to_f16_units(&[x as f32]))[0]
+            as f64
+    };
+    let consts = W8a8Consts {
+        inv_qmax: f16_image(1.0 / 448.0),
+        floor: f16_image(1.0 / 448.0 / 448.0),
+        cap: f16_image(448.0),
+        one: 1.0,
+        lo: f16_image(-448.0),
+        hi: f16_image(448.0),
+    };
+    // ⛔ THE PARAMETERS THIS PROGRAM STORES TO ARE ITS SCRATCH — the provenance
+    // the down discriminator keys on.
+    let stored: std::collections::HashSet<Ssa> = reads
+        .ops()
+        .iter()
+        .copied()
+        .filter(|o| o.op_type == OpKind::KtdpStore)
+        .filter_map(|s| store_param_ptr(&reads, s))
+        .collect();
+    let mut claims: Vec<W8a8Claim> = Vec::new();
+    for op in reads
+        .ops()
+        .iter()
+        .copied()
+        .filter(|o| o.op_type == OpKind::LinalgMatmul)
+    {
+        if let Some(claim) = w8a8_chain_from(k, &reads, &stored, op, &consts)? {
+            claims.push(claim);
+        }
+    }
+    if claims.is_empty() {
+        return Ok(Vec::new());
+    }
+    // `qx` is read only by claimed dots — across ALL projections, because gate
+    // and up share one spine. A stray reader would read a value the fusion
+    // destroys (the fp8 contraction reads the codes on the card).
+    let dots: std::collections::HashSet<Ssa> = claims.iter().map(|c| c.chain.dot).collect();
+    for c in &claims {
+        for &p in reads.readers_of(c.qx) {
+            let r = reads.op_at(p);
+            let claimed =
+                r.op_type == OpKind::LinalgMatmul && r.result.is_some_and(|d| dots.contains(&d));
+            if !claimed {
+                return err(format!(
+                    "{}: the W8A8 quantize spine's codes {:?} are read by `{:?}` — the fusion \
+                     DESTROYS the codes (the fp8 contraction reads them on the card), so exactly \
+                     the claimed gemms may read them",
+                    f.name, c.qx, r.op_type
+                ));
+            }
+        }
+    }
+    // Group by (weight, scale) bank pair — gate and up are two projections over
+    // one expert input, and the anchors law is stated per projection.
+    let mut groups: Vec<((u32, u32), Vec<&W8a8Claim>)> = Vec::new();
+    for c in &claims {
+        let key = (c.weight_tid, c.scale_tid);
+        match groups.iter_mut().find(|(g, _)| *g == key) {
+            Some((_, v)) => v.push(c),
+            None => groups.push((key, vec![c])),
+        }
+    }
+    let mut out = Vec::with_capacity(groups.len());
+    for ((weight_tid, scale_tid), group) in groups {
+        // ⭐ ONE SPINE PER PROJECTION: every chain's quantize is the SAME eleven
+        // ops. `(a_load, qx, sx)` equality proves the whole spine is one set of
+        // ops by SSA (one definer per value), so the first claim's spine list IS
+        // the projection's.
+        let first = group[0];
+        for c in &group[1..] {
+            if (c.a_load, c.qx, c.sx, c.idx_tid)
+                != (first.a_load, first.qx, first.sx, first.idx_tid)
+            {
+                return err(format!(
+                    "{}: two gemm chains over the weight bank t{weight_tid} root at DIFFERENT \
+                     quantize spines — the W8A8 form states ONE quantize of the expert input, \
+                     shared by every pair's gemm",
+                    f.name
+                ));
+            }
+        }
+        // ⛔ THE ANCHORS ARE EXACTLY `0..k` — the whole top-k, one gemm per
+        // index word. A gap is a routing shape this door cannot address (the
+        // landing tiles results `0..k-1`); a repeat is two gemms on one pair.
+        let mut anchors: Vec<i64> = group.iter().map(|c| c.anchor).collect();
+        anchors.sort_unstable();
+        let k = anchors.len() as u32;
+        if anchors != (0..k as i64).collect::<Vec<_>>() {
+            return err(format!(
+                "{}: the gemm chains over the weight bank t{weight_tid} anchor at {anchors:?} — \
+                 the pairs of one projection are the whole top-k, one gemm per index word 0..k, \
+                 and a gap or a repeat is a routing shape this door cannot address",
+                f.name
+            ));
+        }
+        // The geometry agrees across the group (each chain read its own views).
+        for c in &group[1..] {
+            if (c.e_count, c.n, c.inn) != (first.e_count, first.n, first.inn) {
+                return err(format!(
+                    "{}: two gemm chains over the weight bank t{weight_tid} state DIFFERENT \
+                     bank geometries — one projection is one bank",
+                    f.name
+                ));
+            }
+        }
+        let mut chains: Vec<W8a8Chain> = group.iter().map(|c| c.chain).collect();
+        chains.sort_by_key(|c| c.pair);
+        // The emission hangs on the group's FIRST terminal in program order —
+        // the op the walk meets before any of the group's other chain ops.
+        let mut emit_at = chains[0].terminal;
+        let mut emit_pos = usize::MAX;
+        for c in &chains {
+            let Some(p) = reads.pos_of_result(c.terminal) else {
+                return err(format!(
+                    "{}: a claimed W8A8 terminal has no defining position — the claim walked it \
+                     from its own definer, so this is not reachable",
+                    f.name
+                ));
+            };
+            if p < emit_pos {
+                emit_pos = p;
+                emit_at = c.terminal;
+            }
+        }
+        // The spine's eleven compute ops (one set — proven above) plus each
+        // chain's three destroyed links. The terminals are deliberately absent:
+        // they are the projection's output windows.
+        let mut consumed = first.spine_consumed.to_vec();
+        for c in &chains {
+            consumed.extend([c.collapsed, c.dot, c.mul_s]);
+        }
+        out.push(W8a8Projection {
+            a_tid: first.a_tid,
+            idx_tid: first.idx_tid,
+            weight_tid,
+            scale_tid,
+            k,
+            inn: first.inn,
+            n: first.n,
+            e_count: first.e_count,
+            qx: first.qx,
+            sx: first.sx,
+            chains,
+            emit_at,
+            consumed,
+        });
+    }
+    // ⭐ ONE EXPERT INPUT, ONE SPINE, ONE GEOMETRY — gate and up are two
+    // projections over the SAME facts. A disagreement is two different inputs
+    // wearing one form, refused rather than adjudicated.
+    for p in out.iter().skip(1) {
+        let first = &out[0];
+        if (p.a_tid, p.qx, p.sx, p.inn, p.n, p.e_count, p.k, p.idx_tid)
+            != (
+                first.a_tid,
+                first.qx,
+                first.sx,
+                first.inn,
+                first.n,
+                first.e_count,
+                first.k,
+                first.idx_tid,
+            )
+        {
+            return err(format!(
+                "{}: the W8A8 projections over banks t{} and t{} disagree about the expert \
+                 input or the routing — gate and up are two projections over the SAME input, \
+                 and a disagreement is two functions wearing one form",
+                f.name, first.weight_tid, p.weight_tid
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// The one chain headed by this `linalg.matmul`, proven link by link — or
+/// `Ok(None)` when the gemm is not this reader's to claim.
+fn w8a8_chain_from(
+    k: &KtirNode,
+    reads: &ProgramReads<'_>,
+    stored: &std::collections::HashSet<Ssa>,
+    op: &Operation<'static>,
+    consts: &W8a8Consts,
+) -> Result<Option<W8a8Claim>, Error> {
+    let f = &k.func;
+    // The definer of `v`, when it is a `want`-kind op — the link-walk idiom.
+    let def_kind = |v: Ssa, want: OpKind| -> Option<&Operation<'static>> {
+        let d = reads.def_of(v)?;
+        (d.op_type == want).then_some(d)
+    };
+    // A two-operand clamp/multiply's `(chain link, splatted constant)` halves,
+    // whichever way round the producer spelled them. `None` when an operand is
+    // missing or neither side is a splat — a computed bound is a different
+    // form, not this reader's.
+    let halves = |ops: &[Ssa]| -> Option<(Ssa, Ssa)> {
+        match ops {
+            [a, b] => match (
+                reads.splat_value(*a).is_some(),
+                reads.splat_value(*b).is_some(),
+            ) {
+                (false, true) => Some((*a, *b)),
+                (true, false) => Some((*b, *a)),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let Some(dot) = op.result else {
+        return Ok(None);
+    };
+    // `linalg.matmul`'s own operand law: `[A, B, init]`.
+    let [a, b, init] = op.operands[..] else {
+        return Ok(None);
+    };
+    // The accumulator is the zero splat — a W8A8 gemm starts from scratch.
+    if reads.splat_value(init) != Some(0.0) {
+        return Ok(None);
+    }
+    // B is a COLLAPSED GATHERED SLAB: `tensor.collapse_shape` of a `ktdp.load`
+    // over a `ktdp.construct_indirect_access_tile`. The router's matmul reads a
+    // plain load and fails here — not this reader's, not a refusal.
+    let Some(b_collapse) = def_kind(b, OpKind::TensorCollapseShape) else {
+        return Ok(None);
+    };
+    let Some(b_load) = b_collapse
+        .operands
+        .first()
+        .copied()
+        .and_then(|v| def_kind(v, OpKind::KtdpLoad))
+    else {
+        return Ok(None);
+    };
+    let Some(b_tile) = b_load
+        .operands
+        .first()
+        .copied()
+        .and_then(|v| def_kind(v, OpKind::KtdpConstructIndirectAccessTile))
+    else {
+        return Ok(None);
+    };
+    let wf = gather_facts_at_tile(k, b_tile)?;
+    // TransposeB — the W8A8 contraction is over the slab's own `[n, inn]` view.
+    // A neither-form maps is every reader's refusal, propagated.
+    if matmul_b_orientation(f, op)? != BOrient::TransposeB {
+        return Ok(None);
+    }
+    // A is the spine's CODES half, kinds only — a break is a near-miss of every
+    // reader (the walk refuses it, naming the link).
+    let Some(ext) = def_kind(a, OpKind::ArithExtf) else {
+        return Ok(None);
+    };
+    let Some(trunc) = ext
+        .operands
+        .first()
+        .copied()
+        .and_then(|v| def_kind(v, OpKind::ArithTruncf))
+    else {
+        return Ok(None);
+    };
+    let Some(codes_min) = trunc
+        .operands
+        .first()
+        .copied()
+        .and_then(|v| def_kind(v, OpKind::ArithMinnumf))
+    else {
+        return Ok(None);
+    };
+    let Some((codes_max_v, hi_c)) = halves(codes_min.operands) else {
+        return Ok(None);
+    };
+    let Some(codes_max) = def_kind(codes_max_v, OpKind::ArithMaxnumf) else {
+        return Ok(None);
+    };
+    let Some((codes_mul_v, lo_c)) = halves(codes_max.operands) else {
+        return Ok(None);
+    };
+    let Some(codes_mul) = def_kind(codes_mul_v, OpKind::ArithMulf) else {
+        return Ok(None);
+    };
+    // The codes multiply: one operand resolves through rank plumbing to the
+    // RECIPROCAL (a divf), the other is the row being quantized.
+    let inv_side = |v: Ssa| -> bool {
+        reads
+            .def_of(reads.through_plumbing(v))
+            .is_some_and(|d| d.op_type == OpKind::ArithDivf)
+    };
+    let (row, codes_bcast) = match (
+        inv_side(codes_mul.operands[0]),
+        inv_side(codes_mul.operands[1]),
+    ) {
+        (true, false) => (codes_mul.operands[1], codes_mul.operands[0]),
+        (false, true) => (codes_mul.operands[0], codes_mul.operands[1]),
+        _ => return Ok(None),
+    };
+    let Some(inv_op) = reads.def_of(reads.through_plumbing(codes_bcast)) else {
+        return Ok(None);
+    };
+    // The reciprocal `1.0 / sx`: one operand the splatted 1, the other the scale.
+    let Some((sx, num)) = halves(inv_op.operands) else {
+        return Ok(None);
+    };
+    // The scale's clamp pair: `min(max(amax · INV_QMAX, floor), cap)`.
+    let Some(sx_min) = def_kind(sx, OpKind::ArithMinnumf) else {
+        return Ok(None);
+    };
+    let Some((sx_max_v, cap_c)) = halves(sx_min.operands) else {
+        return Ok(None);
+    };
+    let Some(sx_max) = def_kind(sx_max_v, OpKind::ArithMaxnumf) else {
+        return Ok(None);
+    };
+    let Some((sx_mul_v, floor_c)) = halves(sx_max.operands) else {
+        return Ok(None);
+    };
+    let Some(sx_mul) = def_kind(sx_mul_v, OpKind::ArithMulf) else {
+        return Ok(None);
+    };
+    // The amax leg: one operand the reduce, the other the INV_QMAX splat.
+    let Some((red_v, amax_c)) = halves(sx_mul.operands) else {
+        return Ok(None);
+    };
+    let Some(reduce) = def_kind(red_v, OpKind::LinalgReduce) else {
+        return Ok(None);
+    };
+    let [red_data, red_seed] = reduce.operands[..] else {
+        return Ok(None);
+    };
+    let Some(abs) = def_kind(red_data, OpKind::MathAbsf) else {
+        return Ok(None);
+    };
+    // ⭐ ONE SPINE, ONE ROW: the amax's `abs` reads the SAME value the codes
+    // multiply reads — the identity that makes the scale the row's own. A
+    // mismatch is two different activations wearing one chain: not this
+    // reader's, not a refusal.
+    if abs.operands.first() != Some(&row) {
+        return Ok(None);
+    }
+    // ⛔⛔⛔ CLAIM POINT — PROVENANCE. The spine's root must be a load of a
+    // parameter the program never stores to: the EXPERT INPUT. A spine rooting
+    // at a STORED parameter is the down projection's reload — not this reader's
+    // (its own recogniser is pending, and the discriminator must not depend on
+    // shapes that change at M > 1); a root that is not a plain parameter load
+    // at all is a computed activation this form does not state.
+    let Some(row_load) = def_kind(row, OpKind::KtdpLoad) else {
+        return Ok(None);
+    };
+    let Some(ptr) = plain_load_param_ptr(reads, row_load) else {
+        return Ok(None);
+    };
+    if stored.contains(&ptr) {
+        return Ok(None);
+    }
+    let Some(arg_pos) = f.arguments.iter().position(|(p, _)| *p == ptr) else {
+        return Ok(None);
+    };
+    let a_tid = k.bindings[arg_pos].get();
+    // FROM HERE THE CHAIN IS CLAIMED, and every failure is a refusal by name:
+    // recognisably a W8A8 gate/up longhand, and lowering a near-miss would
+    // compute a different function.
+
+    // ⛔ THE CONSTANTS, as the f16 grid states them — any other values are a
+    // different quantize law with the same op kinds.
+    let want_splat = |v: Ssa, want: f64, what: &str| -> Result<(), Error> {
+        match reads.splat_value(v) {
+            Some(got) if got == want => Ok(()),
+            Some(got) => err(format!(
+                "{}: the W8A8 quantize spine's {what} is {got}, not {want} — the card's own \
+                 `quantscalepertokenfp8` constant family (the f16 images of 1/448 and 1/448², \
+                 the ±448 clamps), and any other value is a different quantize law, refused \
+                 rather than fused",
+                f.name
+            )),
+            None => err(format!(
+                "{}: the W8A8 quantize spine's {what} is not a splatted constant — nothing \
+                 proves it is the constant the primitive states",
+                f.name
+            )),
+        }
+    };
+    want_splat(amax_c, consts.inv_qmax, "amax scaling (1/448)")?;
+    want_splat(floor_c, consts.floor, "scale floor (1/448²)")?;
+    want_splat(cap_c, consts.cap, "scale cap (448)")?;
+    want_splat(num, consts.one, "reciprocal numerator (1.0)")?;
+    want_splat(lo_c, consts.lo, "codes lower clamp (−448)")?;
+    want_splat(hi_c, consts.hi, "codes upper clamp (+448)")?;
+
+    // The amax: Max combiner, −inf seed, `[1]` f16 result — the primitive's own
+    // semantics. A Max seeded any higher clamps every-negative rows; a Sum is a
+    // different reduce entirely.
+    if reduce_kind_of(reduce) != Some(ReduceKind::Max) {
+        return err(format!(
+            "{}: the W8A8 spine's amax reduce is not a Max — the card's \
+             `quantscalepertokenfp8` computes the row's maximum magnitude, and any other \
+             combiner is a different scale",
+            f.name
+        ));
+    }
+    match reads.splat_value(red_seed) {
+        Some(f64::NEG_INFINITY) => {}
+        got => {
+            return err(format!(
+                "{}: the W8A8 spine's amax reduce seeds {got:?}, not −inf — a Max seeded any \
+                 higher clamps every-negative row's scale and is a different function than the \
+                 primitive's",
+                f.name
+            ));
+        }
+    }
+    let red_ok = match reduce.result_type {
+        Some(ktir_core::irtype::IrType::Tensor { dims, elem }) => {
+            dims.len() == 1 && dims[0] == 1 && elem == ktir_core::dtypes::DType::F16
+        }
+        _ => false,
+    };
+    if !red_ok {
+        return err(format!(
+            "{}: the W8A8 spine's amax reduce does not state a `[1]` f16 result — one scale \
+             per token row is the primitive's own shape",
+            f.name
+        ));
+    }
+    // ⛔ THE ISLAND'S TWO BOUNDARIES: the truncation states `Fp8E4m3` and the
+    // widening `F16`. A spine the ladder left at f32 would hand the fused
+    // emission constants the card's own primitive never states.
+    if trunc.result_type.and_then(|t| t.elem()) != Some(ktir_core::dtypes::DType::Fp8E4m3) {
+        return err(format!(
+            "{}: the W8A8 spine's codes truncation does not state Fp8E4m3 — the codes are the \
+             values the fp8 contraction reads, and any other element type is a different \
+             function",
+            f.name
+        ));
+    }
+    if ext.result_type.and_then(|t| t.elem()) != Some(ktir_core::dtypes::DType::F16) {
+        return err(format!(
+            "{}: the W8A8 spine's codes widening does not state f16 — the island is narrowed \
+             back before this door, or the contraction would read a different precision than \
+             the card's own W8A8",
+            f.name
+        ));
+    }
+
+    // ⛔ DESTRUCTION IS EXCLUSIVE — every destroyed link has exactly the one
+    // reader the chain states.
+    let sole = |v: Ssa, want: OpKind, what: &str| -> Result<(), Error> {
+        match reads.readers_of(v) {
+            [p] if reads.op_at(*p).op_type == want => Ok(()),
+            [p] => err(format!(
+                "{}: the W8A8 quantize spine's {what} is read by `{:?}` — the fusion destroys \
+                 it, so exactly the chain's next link may read it",
+                f.name,
+                reads.op_at(*p).op_type
+            )),
+            rs => err(format!(
+                "{}: the W8A8 quantize spine's {what} is read by {} ops — the fusion destroys \
+                 it, so exactly the chain's next link may read it",
+                f.name,
+                rs.len()
+            )),
+        }
+    };
+    let (Some(abs_v), Some(trunc_v), Some(ext_v), Some(codes_min_v)) =
+        (abs.result, trunc.result, ext.result, codes_min.result)
+    else {
+        return err(format!(
+            "{}: a W8A8 spine link states no result — not reachable through the def/use index",
+            f.name
+        ));
+    };
+    let Some(inv_v) = inv_op.result else {
+        return err(format!(
+            "{}: a W8A8 spine link states no result — not reachable through the def/use index",
+            f.name
+        ));
+    };
+    sole(abs_v, OpKind::LinalgReduce, "absolute value")?;
+    sole(red_v, OpKind::ArithMulf, "amax")?;
+    sole(sx_mul_v, OpKind::ArithMaxnumf, "amax scaling")?;
+    sole(sx_max_v, OpKind::ArithMinnumf, "scale floor")?;
+    sole(codes_mul_v, OpKind::ArithMaxnumf, "codes scaling")?;
+    sole(codes_max_v, OpKind::ArithMinnumf, "codes lower clamp")?;
+    sole(codes_min_v, OpKind::ArithTruncf, "codes upper clamp")?;
+    sole(trunc_v, OpKind::ArithExtf, "fp8 codes")?;
+    sole(b, OpKind::LinalgMatmul, "collapsed slab")?;
+    // `sx` SURVIVES as a value the chain never materialises (the emission's
+    // quantize recomputes the scale as the primitive's own output), so its
+    // readers are the reciprocal and rank plumbing only.
+    for &p in reads.readers_of(sx) {
+        let r = reads.op_at(p);
+        let ok = (r.op_type == OpKind::ArithDivf && r.result == Some(inv_v))
+            || matches!(
+                r.op_type,
+                OpKind::TensorExpandShape | OpKind::TensorCollapseShape | OpKind::LinalgBroadcast
+            );
+        if !ok {
+            return err(format!(
+                "{}: the W8A8 spine's per-token scale is read by `{:?}` — the fusion keeps it \
+                 only as the dequant's broadcast and the reciprocal's denominator",
+                f.name, r.op_type
+            ));
+        }
+    }
+    // The reciprocal's readers: rank plumbing only (the codes' broadcast chain).
+    for &p in reads.readers_of(inv_v) {
+        let r = reads.op_at(p);
+        if !matches!(
+            r.op_type,
+            OpKind::TensorExpandShape | OpKind::TensorCollapseShape | OpKind::LinalgBroadcast
+        ) {
+            return err(format!(
+                "{}: the W8A8 spine's reciprocal is read by `{:?}` — the fusion destroys it in \
+                 the codes, and only the broadcast chain may carry it there",
+                f.name, r.op_type
+            ));
+        }
+    }
+
+    // The dequant's first leg: the dot's ONE reader, an `arith.mulf` whose other
+    // operand resolves through rank plumbing to `sx`.
+    let Some(mul_s_op) = reads
+        .sole_reader(dot)
+        .filter(|o| o.op_type == OpKind::ArithMulf)
+    else {
+        return err(format!(
+            "{}: the W8A8 gemm's product {dot:?} is not read by exactly one `arith.mulf` — the \
+             chain's dequant leg (`raw · broadcast(sx)`) is the only form this fusion states",
+            f.name
+        ));
+    };
+    let Some(mul_s_v) = mul_s_op.result else {
+        return err(format!(
+            "{}: a W8A8 chain link states no result — not reachable through the def/use index",
+            f.name
+        ));
+    };
+    let Some(ms_bcast) = mul_s_op.operands.iter().copied().find(|&v| v != dot) else {
+        return err(format!(
+            "{}: the W8A8 gemm's dequant multiply names no operand beside its product",
+            f.name
+        ));
+    };
+    if reads.through_plumbing(ms_bcast) != sx {
+        return err(format!(
+            "{}: the W8A8 gemm's dequant multiplies the product by a value that is not the \
+             spine's per-token scale — the W8A8 form dequantises with `sx` (the quantize's own \
+             scale), and any other factor is a different function",
+            f.name
+        ));
+    }
+    // The terminal: the first leg's ONE reader, an `arith.mulf` whose other
+    // operand is the pair's gathered ROUTER scale.
+    let Some(term_op) = reads
+        .sole_reader(mul_s_v)
+        .filter(|o| o.op_type == OpKind::ArithMulf)
+    else {
+        return err(format!(
+            "{}: the W8A8 gemm's scaled product is not read by exactly one `arith.mulf` — the \
+             chain's terminal (`· the pair's router scale`) is the only form this fusion states",
+            f.name
+        ));
+    };
+    let Some(terminal) = term_op.result else {
+        return err(format!(
+            "{}: a W8A8 chain link states no result — not reachable through the def/use index",
+            f.name
+        ));
+    };
+    // ⛔ NO STORE READS A TERMINAL. The fusion writes the projection's output
+    // intermediate and the walk hands consumers the terminal as a window of it;
+    // a `ktdp.store` of a terminal is a write the walk's hook would silently
+    // drop, so it is refused rather than dropped.
+    if reads
+        .readers_of(terminal)
+        .iter()
+        .any(|&p| reads.op_at(p).op_type == OpKind::KtdpStore)
+    {
+        return err(format!(
+            "{}: the W8A8 gemm's output {terminal:?} is stored by the program — the fusion \
+             writes its projection's output intermediate, and a stored terminal is a write the \
+             walk would silently drop",
+            f.name
+        ));
+    }
+    let Some(scale_operand) = term_op.operands.iter().copied().find(|&v| v != mul_s_v) else {
+        return err(format!(
+            "{}: the W8A8 gemm's terminal multiply names no operand beside its scaled product",
+            f.name
+        ));
+    };
+    let Some(scale_load) = def_kind(scale_operand, OpKind::KtdpLoad) else {
+        return err(format!(
+            "{}: the W8A8 gemm's terminal multiplies by a value that is not a load — the \
+             router's per-pair scale is a gathered load, and a computed factor is a different \
+             function",
+            f.name
+        ));
+    };
+    let Some(scale_tile) = scale_load
+        .operands
+        .first()
+        .copied()
+        .and_then(|v| def_kind(v, OpKind::KtdpConstructIndirectAccessTile))
+    else {
+        return err(format!(
+            "{}: the W8A8 gemm's router scale is not gathered — the pair's scale is selected by \
+             the same index that selects its slab, and a plain load is a different program",
+            f.name
+        ));
+    };
+    let sf = gather_facts_at_tile(k, scale_tile)?;
+    // Same index parameter, same anchor — the pair's OWN scale, not another
+    // pair's.
+    if sf.index_tid != wf.index_tid || sf.first_entry != wf.first_entry {
+        return err(format!(
+            "{}: the W8A8 gemm's dequant reads its pair's router scale through a different \
+             index anchor than its weight slab — one pair's two gathers anchor at ONE index word",
+            f.name
+        ));
+    }
+
+    // The geometry, read off the two views the program states. The weight bank is
+    // the RAW `[E, n, inn]` fp8 parameter (the emission's own refusal guards the
+    // staging forms it cannot address); the scale bank is `[E, n]` f16.
+    let Some(w_view) = b_tile
+        .operands
+        .first()
+        .copied()
+        .and_then(|v| reads.def_of(v))
+    else {
+        return err(format!(
+            "{}: the W8A8 gemm's weight tile names a view nothing defines",
+            f.name
+        ));
+    };
+    let (e_count, n, inn) = match w_view.result_type {
+        Some(ktir_core::irtype::IrType::MemRef { dims, elem })
+            if elem == ktir_core::dtypes::DType::Fp8E4m3
+                && dims.len() == 3
+                && dims.iter().all(|&d| d > 0) =>
+        {
+            (dims[0] as u32, dims[1] as u32, dims[2] as u32)
+        }
+        _ => {
+            return err(format!(
+                "{}: the W8A8 gemm's weight bank t{} is not an `[E, n, in]` Fp8E4m3 view — the \
+                 fused door reads the program's own expert-major bank, and any other layout is \
+                 the staged-bank machinery it refuses by name",
+                f.name, wf.value_tid
+            ));
+        }
+    };
+    let Some(s_view) = scale_tile
+        .operands
+        .first()
+        .copied()
+        .and_then(|v| reads.def_of(v))
+    else {
+        return err(format!(
+            "{}: the W8A8 gemm's scale tile names a view nothing defines",
+            f.name
+        ));
+    };
+    let s_ok = match s_view.result_type {
+        Some(ktir_core::irtype::IrType::MemRef { dims, elem }) => {
+            elem == ktir_core::dtypes::DType::F16 && dims == [e_count as i64, n as i64]
+        }
+        _ => false,
+    };
+    if !s_ok {
+        return err(format!(
+            "{}: the W8A8 gemm's scale bank t{} is not the weight bank's own `[E, n]` f16 view \
+             — the per-output-channel scales ride the same expert count and projection width",
+            f.name, sf.value_tid
+        ));
+    }
+    let dot_ok = match op.result_type {
+        Some(ktir_core::irtype::IrType::Tensor { dims, elem }) => {
+            elem == ktir_core::dtypes::DType::F16 && dims == [1, n as i64]
+        }
+        _ => false,
+    };
+    if !dot_ok {
+        return err(format!(
+            "{}: the W8A8 gemm's product does not state a `[1, n]` f16 result at the bank's own \
+             n={n}",
+            f.name
+        ));
+    }
+    // ⛔ M=1 ONLY — the expert input's own row count. The fused W8A8 is the
+    // decode form; M > 1 is the per-`Program` door's gathered prefill body and
+    // is refused here by name rather than lowered as the nearest thing.
+    let Some(a_region) = region_for_operand(k, row)? else {
+        return err(format!(
+            "{}: the W8A8 gemm's expert input does not resolve to a parameter region — the \
+             spine rooted at a plain parameter load, so the region walk that refused it is the \
+             defect to read",
+            f.name
+        ));
+    };
+    if a_region.c_len != inn {
+        return err(format!(
+            "{}: the W8A8 gemm's expert input t{} is {} columns wide but the weight bank t{} \
+             contracts {inn} — the activation's `in` must match the bank's",
+            f.name, a_region.tid, a_region.c_len, wf.value_tid
+        ));
+    }
+    if a_region.v_rows != 1 {
+        return err(format!(
+            "{}: the W8A8 gemm chain's expert input t{} is {} rows wide — this door's fused \
+             W8A8 is the M=1 (decode) form, and M > 1 is refused by name rather than lowered as \
+             the nearest thing (the per-`Program` expert door's gathered m>1 body is the \
+             prefill form)",
+            f.name, a_region.tid, a_region.v_rows
+        ));
+    }
+    Ok(Some(W8a8Claim {
+        chain: W8a8Chain {
+            pair: wf.first_entry as u32,
+            weight_tile: wf.tile,
+            collapsed: b,
+            dot,
+            mul_s: mul_s_v,
+            terminal,
+            scale_tile: sf.tile,
+        },
+        weight_tid: wf.value_tid,
+        scale_tid: sf.value_tid,
+        a_load: row,
+        a_tid,
+        qx: a,
+        sx,
+        idx_tid: wf.index_tid,
+        anchor: wf.first_entry,
+        e_count,
+        n,
+        inn,
+        spine_consumed: [
+            abs_v,
+            red_v,
+            sx_mul_v,
+            sx_max_v,
+            sx,
+            inv_v,
+            codes_mul_v,
+            codes_max_v,
+            codes_min_v,
+            trunc_v,
+            ext_v,
+        ],
+    }))
+}
+
 /// The `Program` an op names, where the naming is 1:1 and needs no inference.
 ///
 /// `None` means "not a compute op" (a view, a tile, a load, a store, a constant) — those are
@@ -2061,6 +3030,37 @@ pub fn lower_function(
     // THE BROADCAST PLUMBING, read before the walk for the same reason: these ops lower to NOTHING and
     // the consumer carries the broadcast as an operand mode. See [`program_broadcast_chains`].
     let (bcasts, bcast_consumed) = program_broadcast_chains(f)?;
+    // ⭐⭐⭐ THE W8A8 GATE/UP SLAB GEMMS, read BEFORE the gathers census they claim out of.
+    // [`program_w8a8_gemm_chains`] proves each bank's whole top-k of chains — ONE quantize
+    // spine, per-pair gathered fp8 slab gemms, the two-multiply dequant — and the walk below
+    // lowers each projection as ONE `expert_matmul_fused_m1`. The claims are the chains'
+    // tiles: consumed by the fusion, not forgiven by the census (the law
+    // [`gathers_of_excluding`] states), so the discriminator still judges every bank no
+    // recogniser claimed — the down projection's, until its own reader lands.
+    let w8a8s = program_w8a8_gemm_chains(k)?;
+    let w8a8_claims: Vec<Ssa> = w8a8s
+        .iter()
+        .flat_map(|p| p.chains.iter().flat_map(|c| [c.weight_tile, c.scale_tile]))
+        .collect();
+    // Everything the fusions destroy — the spine's eleven compute ops (ONE set: gate and up
+    // are two projections over one expert input, proven by `(a_load, qx, sx)` equality) and
+    // each chain's three interior links. The terminals are deliberately absent: they are the
+    // projections' output windows.
+    let w8a8_consumed: std::collections::HashSet<Ssa> = w8a8s
+        .iter()
+        .flat_map(|p| p.consumed.iter().copied())
+        .collect();
+    // Every chain's terminal, keyed to its projection — the value the REST of the program
+    // reads (the gelu chains' gate and up), resolved through the window the hook records.
+    let w8a8_terminals: std::collections::HashMap<Ssa, usize> = w8a8s
+        .iter()
+        .enumerate()
+        .flat_map(|(pi, p)| p.chains.iter().map(move |c| (c.terminal, pi)))
+        .collect();
+    // The fp8 activation-quantize dedup set is per-BUNDLE: gate and up are two projections
+    // over ONE expert input, so the emission's quantize is emitted once and named once —
+    // the same dedup law the per-`Program` door's fp8 matmul states across its ops.
+    let mut quantized: std::collections::HashSet<String> = std::collections::HashSet::new();
     // ⭐⭐⭐ THE GATHERS THE PROGRAM STATES, read ONCE and from [`gathers_of`] — the same joins the
     // per-`Program` door's `gather_of` makes, so the two doors cannot disagree about which parameter
     // is the table or which is the index. A program with ONE indirect tile reads identically to
@@ -2072,7 +3072,11 @@ pub fn lower_function(
     // tile. A gather the program states and no descriptor declares is a silently DIRECT read of the
     // table's first rows — well formed, the right shape and dtype, and nothing else in the pipeline
     // compares an emitted descriptor against the program's indirect tile.
-    let gathers = gathers_of(k)?;
+    //
+    // ⭐ MINUS THE W8A8 CLAIMS, so a projection the recogniser proved whole is not also held to the
+    // single-pair census law its per-pair tiles would break — the claimed tiles are this door's to
+    // lower, not the discriminator's to judge.
+    let gathers = gathers_of_excluding(k, &w8a8_claims)?;
     // The gathered LOAD each tile's `ktdp.load` produced — the value an op's input must BE (by
     // identity) for that tile's gather to be the one it reads. Read straight off [`Gather::load`]:
     // the tile walk in `gathers_of` already found each tile's load, so this is a lookup, not a
@@ -2108,7 +3112,82 @@ pub fn lower_function(
                 || rmsnorms.iter().any(|c| c.consumed.contains(&r))
                 // The expand/collapse/broadcast chain itself: no descriptor, the consumer states it.
                 || bcast_consumed.contains(&r)
+                // The W8A8 projections' interiors — the shared quantize spine and each chain's
+                // collapsed slab, dot, and scale multiply — same law, one fused
+                // `expert_matmul_fused_m1` per projection.
+                || w8a8_consumed.contains(&r)
         }) {
+            continue;
+        }
+        // ⭐⭐⭐ A W8A8 PROJECTION'S TERMINAL — the op the fused emission stands for. Every chain's
+        // terminal names its pair's `[1, n]` row of the projection's output; the walk lowers the
+        // WHOLE projection at the FIRST terminal in program order and every other terminal is
+        // lowered by nothing at all — its value is a WINDOW of the output the emission already
+        // wrote, recorded in `inter` for the consumers (the gelu chains' gate and up), the same
+        // law the mint arm states for a chain's interior.
+        if let Some(r) = op.result
+            && let Some(&pi) = w8a8_terminals.get(&r)
+        {
+            let p = &w8a8s[pi];
+            if r != p.emit_at {
+                continue;
+            }
+            // The projection's output intermediate, minted at its LOGICAL `[1, k·n]` — the width
+            // the pointwise dequant (`emo`) writes, so this is the POINTWISE arm's own mint law,
+            // not the matmul arm's device-width reservation: the fused emission's `matmulfp8`
+            // products land in the scratch the emission itself reserves, and only the dequant's
+            // output reaches this buffer.
+            let Some(layout) = layout else {
+                return err(format!(
+                    "{}: the W8A8 projection over t{} is an intermediate product, which needs \
+                     a `BundleLayout` to hold its buffer -- `layout: None` is the unit-test arm \
+                     and cannot place one",
+                    f.name, p.weight_tid
+                ));
+            };
+            let out_tid = next_tid;
+            next_tid += 1;
+            layout.synth(crate::place::PlaceId::Act(out_tid), &[1, p.k * p.n]);
+            for c in &p.chains {
+                // Each pair's terminal resolves to its OWN window of the output — the `[1, n]`
+                // columns the emission's dequant wrote for that pair — so a consumer naming the
+                // terminal addresses the rows it names, not the projection's whole width.
+                inter.insert(
+                    c.terminal,
+                    Region {
+                        tid: out_tid,
+                        v_rows: 1,
+                        v_cols: p.k * p.n,
+                        r_start: 0,
+                        r_len: 1,
+                        c_start: c.pair * p.n,
+                        c_len: p.n,
+                        r_cover: (0, 1),
+                        c_cover: (c.pair * p.n, (c.pair + 1) * p.n),
+                        is_out: true,
+                        is_fp8: false,
+                    },
+                );
+            }
+            let mut emitted = super::lower_ktir_to_superdsc::expert_matmul_fused_m1(
+                &super::lower_ktir_to_superdsc::W8a8FusedFacts {
+                    name: f.name,
+                    a_tid: p.a_tid,
+                    idx_tid: p.idx_tid,
+                    w_tid: p.weight_tid,
+                    s_tid: p.scale_tid,
+                    k: p.k,
+                    inn: p.inn,
+                    n: p.n,
+                    e_count: p.e_count,
+                },
+                out_tid,
+                sym_id_base,
+                Some(layout),
+                &mut quantized,
+            )?;
+            out.append(&mut emitted);
+            lowered += 1;
             continue;
         }
         // The terminal `arith.mulf` IS the fused program, and its inputs are the chain's gate and up

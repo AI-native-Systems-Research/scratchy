@@ -21,27 +21,29 @@
 //! Driving the kernel itself means every rung of the recogniser ladder is measured
 //! against the live artifact, not a transcription of one.
 //!
-//! # RUNG ONE, AND THE LADDER LAW
+//! # RUNG TWO, AND THE LADDER LAW
 //!
 //! The door recognises the kernel's EIGHT gelu-tanh longhands (the tanh form through
 //! the sigmoid identity, claimed by `program_gelu_mul_chains` before the silu reader
-//! it fronts for) and NOTHING ELSE of the fused MoE: an op with no 1:1 `Program` and
-//! no chain proof is refused BY NAME, and the whole-function door refuses the WHOLE
-//! function rather than emitting part of it (a bundle short a program computes
-//! something else). This test pins the FIRST refusal — the stage the door stops at.
-//! Each recogniser that lands (gelu ✅ → W8A8 slab gemm → router → combine) moves
-//! that first refusal FORWARD through the pre-reads and program order, and this
-//! test's assertion moves with it, ON PURPOSE: the pinned refusal is the recogniser
-//! campaign's work queue made executable. When the last recogniser lands, the same
-//! drive must BAKE, and the refusal-pinning arms are replaced by the op-list
-//! assertion — the matmul_fp8 contract's positive control is the shape of that final
-//! state.
+//! it fronts for) and its gate/up W8A8 projections (`program_w8a8_gemm_chains`: the
+//! per-token quantize, the per-pair gathered fp8 slab gemms, the two-multiply
+//! dequant, claimed only when proven and only at `M=1`), and NOTHING ELSE of the
+//! fused MoE: an op with no 1:1 `Program` and no chain proof is refused BY NAME, and
+//! the whole-function door refuses the WHOLE function rather than emitting part of
+//! it (a bundle short a program computes something else). This test pins the FIRST
+//! refusal — the stage the door stops at. Each recogniser that lands (gelu ✅ → W8A8
+//! gate/up ✅ → down slab gemm → router → combine) moves that first refusal FORWARD
+//! through the pre-reads and program order, and this test's assertion moves with it,
+//! ON PURPOSE: the pinned refusal is the recogniser campaign's work queue made
+//! executable. When the last recogniser lands, the same drive must BAKE, and the
+//! refusal-pinning arms are replaced by the op-list assertion — the W8A8 half's
+//! contract (`w8a8_door.rs`) is the shape of that final state.
 //!
 //! The node's `program` label is INERT under this door — `lower_function` derives every
 //! op's kind from its `OpKind` and never reads `node.program` — so it is minted with
-//! `Program::ExpertMatmul`, the variant the W8A8 recogniser (the heaviest rung still
-//! ahead) emits its legs under. The splice fold will name the fused kind when it lands;
-//! the label changes with it, one word.
+//! `Program::ExpertMatmul`, the variant the W8A8 recogniser emits its legs under. The
+//! splice fold will name the fused kind when it lands; the label changes with it, one
+//! word.
 
 use ktir_core::ir::Ssa;
 use ktir_core::opkind::OpKind;
@@ -160,22 +162,25 @@ fn the_fused_moe_kernel_is_refused_at_the_door_naming_the_first_unrecognised_op(
         err.starts_with("door:"),
         "the refusal came from a ladder stage, not the door: {err:?}"
     );
-    // ⚠️ PINNED OBSERVATION (rung one, 2026-10-18, moe-door @ the gelu recogniser):
-    // the gelu step moved the door's first refusal PAST the pre-reads' chain readers —
-    // all eight gelu-tanh longhands are claimed (`program_gelu_mul_chains` runs before
-    // the silu reader, which skips the claims), so the silu/rmsnorm/broadcast readers
-    // pass — and it now stops at the GATHERS pre-read: `gathers_of`'s same-pair
-    // discriminator refusing the experts' slab tiles (the full observed message names
-    // 48 `ktdp.construct_indirect_access_tile` ops over 2 different index/value
-    // parameter pairs). That refusal is CORRECT BY DESIGN for the door as it stands —
-    // one descriptor carries one index operand, and the fused kernel's per-pair slab
-    // gathers are exactly the multi-tile shape the W8A8 recogniser's own MoE pre-read
-    // (which must run BEFORE this call) exists to read. The needles are SUBSTRINGs so
-    // wording survives but meaning does not.
+    // ⚠️ PINNED OBSERVATION (rung two, 2026-10-18, moe-door @ the W8A8 recogniser):
+    // the W8A8 pre-read claims the kernel's gate/up projections — both slab banks
+    // and both scale banks, 32 of the 48 tiles — so the door's first refusal is
+    // STILL the GATHERS pre-read (the W8A8 pre-read runs before it and passes),
+    // but the count has halved twice over: it now names 16
+    // `ktdp.construct_indirect_access_tile` ops over 2 different index/value
+    // parameter pairs — the DOWN projection's two banks, unclaimed BY DESIGN:
+    // their spine roots at the STORED act parameter (the round-trip scratch),
+    // the provenance the down discriminator keys on and the next rung's own
+    // pre-read exists to read. That refusal is CORRECT BY DESIGN for the door as
+    // it stands — one descriptor carries one index operand, and the fused
+    // kernel's per-pair slab gathers are exactly the multi-tile shape a
+    // recogniser's pre-read must claim tile by tile before the door will lower
+    // them. The needles are SUBSTRINGs so wording survives but meaning does not.
     assert!(
-        err.contains("different index/value parameter pairs")
+        err.contains("16 `ktdp.construct_indirect_access_tile`")
+            && err.contains("different index/value parameter pairs")
             && err.contains("one descriptor carries ONE index operand"),
-        "rung one: the door's first refusal moved or changed shape — update this pin \
+        "rung two: the door's first refusal moved or changed shape — update this pin \
          DELIBERATELY (it is the recogniser campaign's work queue), do not delete it: {err:?}"
     );
 }
