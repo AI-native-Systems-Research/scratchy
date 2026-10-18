@@ -4096,6 +4096,39 @@ impl Executor {
                 );
             }
         }
+        // The inter-step device-idle gap's raw material, one line EVERY forward (the raw
+        // per-CB probe above stops at three): each class's device-clock window. The
+        // post-processor differences fwd N's `last` into fwd N+1's `first` — wrap-exact at
+        // any real step gap, the counter is free-running u32 — and decomposes the window by
+        // class: last compute end → D2H span → host tail → H2D span → first compute start.
+        // Classes mirror the routing above: crossings by direction on whichever pipeline
+        // carried them, non-crossing async/fill CBs as `other`, op CBs as `compute`.
+        {
+            use flex_rs::dma::DmaDirection;
+            use flex_rs::scheduler::PipelineId;
+            let compute = rb_class_window(&entries, |e| {
+                matches!(e.pipeline, PipelineId::Compute) && e.dma.is_none()
+            });
+            let h2d = rb_class_window(&entries, |e| e.dma == Some(DmaDirection::HostToDevice));
+            let d2h = rb_class_window(&entries, |e| e.dma == Some(DmaDirection::DeviceToHost));
+            let other = rb_class_window(&entries, |e| {
+                e.dma.is_none() && !matches!(e.pipeline, PipelineId::Compute)
+            });
+            let all = rb_class_window(&entries, |_| true);
+            let fmt = |w: &Option<RbClassWindow>| match w {
+                Some(w) => format!("[{},{},{}]", w.first, w.last, w.n),
+                None => "-".to_string(),
+            };
+            eprintln!(
+                "[sdsc-rbgap] fwd {} all{} compute{} h2d{} d2h{} other{}",
+                t.rb_steps,
+                fmt(&all),
+                fmt(&compute),
+                fmt(&h2d),
+                fmt(&d2h),
+                fmt(&other)
+            );
+        }
         // The op entries: compute CBs that are not DMA crossings. A crossing kept here would
         // both break the 1:1 zip below and bill the preamble/readback to whichever op it
         // happened to sort next to.
@@ -5803,6 +5836,56 @@ fn report_group_time(t: &Timers) {
     }
 }
 
+/// One CB class's device-clock window inside one forward: the extreme WRITTEN timestamp snapshots
+/// over that class's CBs. The five TS words are snapshots of one free-running u32 counter
+/// ([`flex_rs::control_block_wire::ResponseBlockWire::timestamps`]'s measured layout: ~1012
+/// cyc/µs, ~4.2 s wrap; a slot a CB does not write reads zero), so `first`/`last` are raw ticks —
+/// consecutive forwards' windows difference wrap-exactly into the inter-step device-idle gap
+/// (fwd N `last` → fwd N+1 `first`), the number #603's loop closure exists to move.
+struct RbClassWindow {
+    first: u32,
+    last: u32,
+    n: usize,
+}
+
+/// The window of every entry matching `class`, over written (nonzero) TS slots only: a CB
+/// hardware left unwritten cannot bound the window, and a class with no CBs is `None` — absent,
+/// never zero-bounded, so a missing class cannot swallow the gap being measured.
+fn rb_class_window(
+    entries: &[flex_rs::rb_telemetry::RbTiming],
+    class: impl Fn(&flex_rs::rb_telemetry::RbTiming) -> bool,
+) -> Option<RbClassWindow> {
+    let mut window: Option<RbClassWindow> = None;
+    for e in entries.iter().filter(|e| class(e)) {
+        let mut cb_first: Option<u32> = None;
+        let mut cb_last = 0u32;
+        for &ts in &e.rb.timestamps() {
+            if ts != 0 {
+                cb_first = Some(cb_first.map_or(ts, |f: u32| f.min(ts)));
+                cb_last = cb_last.max(ts);
+            }
+        }
+        let Some(cb_first) = cb_first else {
+            continue;
+        };
+        match &mut window {
+            Some(w) => {
+                w.first = w.first.min(cb_first);
+                w.last = w.last.max(cb_last);
+                w.n += 1;
+            }
+            None => {
+                window = Some(RbClassWindow {
+                    first: cb_first,
+                    last: cb_last,
+                    n: 1,
+                })
+            }
+        }
+    }
+    window
+}
+
 /// The RB-timestamp report: per-op device cycles, harvested from the response blocks at
 /// completion (no drain), cumulative across the run. Phases are named per the card-measured slot
 /// semantics ([`flex_rs::control_block_wire::ResponseBlockWire::exec_cmpt_cycles`] and siblings):
@@ -6114,5 +6197,57 @@ mod tests {
         let t = timers();
         assert_eq!(t.replay_hits, hits + 1, "the hit arm counted it");
         assert_eq!(t.replay_derives, derives + 1);
+    }
+
+    /// The rbgap window takes the extreme WRITTEN TS slots per class: a CB whose slots hardware
+    /// left zero never bounds it, and a class with no CBs is absent rather than zero-bounded —
+    /// the inter-step gap differences consecutive forwards' windows, so a bogus zero would
+    /// swallow the very window being measured.
+    #[test]
+    fn rbgap_window_bounds_only_written_slots() {
+        use flex_rs::control_block_wire::{RB_NUM_BYTES, ResponseBlockWire, TS_SECTION};
+        use flex_rs::dma::DmaDirection;
+        use flex_rs::rb_telemetry::RbTiming;
+        use flex_rs::scheduler::PipelineId;
+
+        let rb = |ts: [u32; 5]| {
+            let mut b = [0u8; RB_NUM_BYTES];
+            for (i, w) in ts.iter().enumerate() {
+                b[TS_SECTION + i * 4..TS_SECTION + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            ResponseBlockWire::from_bytes(&b)
+        };
+        let entry =
+            |id: u64, pipeline: PipelineId, dma: Option<DmaDirection>, ts: [u32; 5]| RbTiming {
+                id,
+                pipeline,
+                dma,
+                rb: rb(ts),
+            };
+        // A compute CB writes all five words (word1 == word0 per the measured layout); a D2H
+        // crossing writes only words 3-4; one pathological CB writes nothing at all.
+        let entries = vec![
+            entry(1, PipelineId::Compute, None, [100, 100, 120, 200, 210]),
+            entry(
+                2,
+                PipelineId::Compute,
+                Some(DmaDirection::DeviceToHost),
+                [0, 0, 0, 300, 340],
+            ),
+            entry(3, PipelineId::AsyncDmaI, None, [0; 5]),
+        ];
+        let all = rb_class_window(&entries, |_| true).unwrap();
+        assert_eq!((all.first, all.last, all.n), (100, 340, 2));
+        let compute = rb_class_window(&entries, |e| {
+            matches!(e.pipeline, PipelineId::Compute) && e.dma.is_none()
+        })
+        .unwrap();
+        assert_eq!((compute.first, compute.last, compute.n), (100, 210, 1));
+        let d2h = rb_class_window(&entries, |e| e.dma == Some(DmaDirection::DeviceToHost)).unwrap();
+        assert_eq!((d2h.first, d2h.last, d2h.n), (300, 340, 1));
+        assert!(
+            rb_class_window(&entries, |e| e.dma == Some(DmaDirection::HostToDevice)).is_none(),
+            "an absent class is absent, not zero-bounded"
+        );
     }
 }
