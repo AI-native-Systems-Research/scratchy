@@ -1154,14 +1154,62 @@ impl RuntimeStream {
     pub fn query(&self) -> bool {
         self.in_flight.load(Ordering::SeqCst) == 0
     }
+
+    /// Port of `RuntimeStream::drainForTeardown` (`runtime_stream.cpp:893`).
+    ///
+    /// ⭐ THE TEARDOWN DRAIN — the contract `synchronize()` cannot offer: on a
+    /// stream that took a device error, `synchronize()` returns WITHOUT
+    /// waiting for the operations it already submitted (its
+    /// `if(!needsShutdown())` guard, faithfully ported above), so memory a
+    /// failed stream still references must not be freed or recycled on its
+    /// say-so. The vendor's own `shared_host_pool.md` documents the hole and
+    /// this function as its plug (`WaitForPoolTransfers`: try `synchronize()`,
+    /// then `if(stream->needsShutdown()) drainForTeardown()`).
+    ///
+    /// Three steps, matching the C++:
+    /// 1. `set_shutdown(true)` — makes the scheduler abandon this stream's
+    ///    still-queued work (the abandon consults: `check_not_shutdown`,
+    ///    `issue_barrier`'s early return, `fence.wait_polling`'s unblock) and
+    ///    refuses any new launch. The C++ also calls `notifyScheduler()` to
+    ///    wake its scheduler THREAD; this port has no central loop to wake —
+    ///    op dispatch is synchronous and completions arrive from the response
+    ///    workers, which notify `sync_cv` themselves on decrement.
+    /// 2. Wait for `in_flight == 0` UNCONDITIONALLY (no shutdown
+    ///    short-circuit) — `wait_until_drained`'s 60 s diagnostic loop, so a
+    ///    lost completion is visible rather than a silent teardown hang.
+    /// 3. Consume the deferred error exactly once, like `synchronize()`.
+    ///    A failed `synchronize()` already delivered it, so the canonical
+    ///    sequence (try `synchronize`, catch, then this) ends with `Ok` —
+    ///    exactly-once across the pair, never a double throw.
+    ///
+    /// Idempotent and state-preserving where the vendor's is: setting
+    /// shutdown on an already-shut-down stream changes nothing
+    /// (`shared_host_pool.md`: "waits even on a shut-down stream, and does
+    /// not change the state of a stream that is already shut down"), and a
+    /// second call on an idle stream passes through the same wait (fast) and
+    /// finds the deferred slot empty. This is the slot-reuse safety
+    /// prerequisite for #603 PR3's in-flight ring: an errored step's pinned
+    /// slots are not recycled until this returns (#609).
+    pub fn drain_for_teardown(&self) -> Result<(), RuntimeStreamError> {
+        self.set_shutdown(true);
+        self.wait_until_drained();
+        let deferred = self.deferred_error.lock().unwrap().take();
+        match deferred {
+            Some(err) => Err(RuntimeStreamError::Deferred(err)),
+            None => Ok(()),
+        }
+    }
 }
 
 impl Drop for RuntimeStream {
-    /// Port of `~RuntimeStream`: best-effort drain (errors are logged and
-    /// suppressed, never propagated from a destructor) followed by
-    /// `scheduler_->releaseStream(streamId())`.
+    /// Port of `~RuntimeStream` (`runtime_stream.cpp:157-162`): the
+    /// destructor drains via `drainForTeardown()`, NOT `synchronize()` —
+    /// synchronize on a shut-down (errored) stream returns without waiting,
+    /// so it must not be the last word before the stream's memory goes away.
+    /// A destructor cannot propagate the deferred error, so it is logged and
+    /// suppressed, exactly like the C++ try/catch.
     fn drop(&mut self) {
-        if let Err(e) = self.synchronize() {
+        if let Err(e) = self.drain_for_teardown() {
             tracing::warn!(
                 "RuntimeStream::drop: deferred error suppressed while draining stream for device {:?}: {e}",
                 self.device_id
@@ -1696,6 +1744,176 @@ mod tests {
 
         // The deferred error is consumed exactly once.
         assert!(stream.synchronize().is_ok());
+    }
+
+    // #609 — the teardown drain, against the mid-ring error shape #603
+    // PR3's in-flight ring cares about: a step fails while later steps are
+    // still outstanding, and the pinned slots those outstanding steps
+    // reference must not be recycled until they land. Two tests pin the
+    // two halves:
+    //
+    // 1. THE HOLE + THE CANONICAL PLUG SEQUENCE: `synchronize` on a
+    //    stream that took an error returns WITHOUT waiting for the
+    //    operations it already submitted (its `needs_shutdown` guard —
+    //    the vendor's own `shared_host_pool.md` hole), delivering the
+    //    deferred error exactly once. The vendor's canonical caller then
+    //    reaches for `drainForTeardown`, which must still WAIT for those
+    //    operations — and, the error already delivered, return `Ok`:
+    //    exactly-once across the pair, never a double throw.
+    // 2. THE DRAIN AS FIRST CONSUMER: called without a preceding
+    //    `synchronize`, the drain both waits and re-throws the deferred
+    //    error once itself.
+    //
+    // No sleeps and no races: with `auto_complete = false` only the test
+    // and its helper thread can fire completions, so a waiting call that
+    // should not have waited is a hang, and a call that should have
+    // waited but didn't returns before the helper fires — both
+    // deterministic failures, never flakes.
+    #[test]
+    fn drain_for_teardown_waits_where_synchronize_short_circuits() {
+        let scheduler = MockScheduler::new(false);
+        let stream = RuntimeStream::new(
+            scheduler.clone(),
+            DeviceId(0),
+            RuntimeStreamPriority::default(),
+            RuntimeStreamMode::default(),
+            false,
+        );
+
+        // Two ops mid-ring: A's completion will fail; B stays in flight.
+        // B's user callback records its landing — the observable the
+        // drain must wait for.
+        let b_completed = Arc::new(AtomicBool::new(false));
+        let b_completed2 = b_completed.clone();
+        let user_cb: Box<dyn FnOnce() + Send> = Box::new(move || {
+            b_completed2.store(true, Ordering::SeqCst);
+        });
+        stream
+            .launch_operation(dummy_op(RuntimeOperationKind::H2D), None)
+            .unwrap();
+        stream
+            .launch_operation(dummy_op(RuntimeOperationKind::D2H), Some(user_cb))
+            .unwrap();
+        assert_eq!(scheduler.pending_count(), 2);
+        assert!(!stream.query());
+
+        // Mid-ring error: A fails → deferred error + sticky shutdown; A's
+        // decrement lands, B is still owed.
+        scheduler.fire_next(Err("ring step 0 failed".into()));
+        assert!(stream.needs_shutdown());
+        assert!(!stream.query(), "B is still in flight after the error");
+
+        // THE HOLE, pinned: `synchronize` re-throws the deferred error
+        // immediately, without waiting for B. Deterministic: only this
+        // thread can fire B, so a `synchronize` that waited would hang
+        // the test — its return with B still pending is the proof.
+        match stream.synchronize() {
+            Err(RuntimeStreamError::Deferred(inner)) => {
+                assert_eq!(
+                    inner.to_string(),
+                    "scheduler rejected submission: ring step 0 failed"
+                );
+            }
+            other => panic!("expected synchronize() to re-throw the deferred error, got {other:?}"),
+        }
+        assert!(
+            !stream.query(),
+            "synchronize must not have waited: B is still in flight"
+        );
+        assert!(!b_completed.load(Ordering::SeqCst));
+
+        // THE PLUG — the vendor's canonical sequence (`try synchronize,
+        // catch, then drainForTeardown`): a helper thread owns B's
+        // completion (the drain blocks this one) behind a channel
+        // handoff, and the drain must block until B lands. If the drain
+        // short-circuited like `synchronize`, it would return before the
+        // helper fires B and the `b_completed` assert below fails. Both
+        // orderings of (helper fires, drain parks) end green only if the
+        // drain actually waited — no timing involved.
+        let firer_scheduler = scheduler.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let firer = std::thread::spawn(move || {
+            rx.recv().unwrap();
+            firer_scheduler.fire_next(Ok(()));
+        });
+        tx.send(()).unwrap();
+        stream.drain_for_teardown().expect(
+            "the deferred error was already delivered by the failed synchronize; \
+                    exactly-once means the drain must not re-throw it",
+        );
+        firer.join().unwrap();
+        assert!(
+            b_completed.load(Ordering::SeqCst),
+            "the drain must have waited for B's completion"
+        );
+        assert!(stream.query(), "the stream is idle after the drain");
+
+        // Idempotent: the stream is idle and the deferred slot is empty,
+        // so the second drain — the one `Drop` will run when this test
+        // ends — is a fast `Ok`.
+        stream.drain_for_teardown().unwrap();
+    }
+
+    // #609, second half: `drain_for_teardown` as the FIRST (and only)
+    // consumer of the deferred error — the shape a teardown path hits
+    // when nobody synchronized after the failure. Same mid-ring error
+    // setup; the drain must wait for the outstanding op AND re-throw the
+    // deferred error exactly once.
+    #[test]
+    fn drain_for_teardown_surfaces_deferred_error_when_first_consumer() {
+        let scheduler = MockScheduler::new(false);
+        let stream = RuntimeStream::new(
+            scheduler.clone(),
+            DeviceId(0),
+            RuntimeStreamPriority::default(),
+            RuntimeStreamMode::default(),
+            false,
+        );
+
+        let b_completed = Arc::new(AtomicBool::new(false));
+        let b_completed2 = b_completed.clone();
+        let user_cb: Box<dyn FnOnce() + Send> = Box::new(move || {
+            b_completed2.store(true, Ordering::SeqCst);
+        });
+        stream
+            .launch_operation(dummy_op(RuntimeOperationKind::H2D), None)
+            .unwrap();
+        stream
+            .launch_operation(dummy_op(RuntimeOperationKind::D2H), Some(user_cb))
+            .unwrap();
+
+        // Mid-ring error: A fails, B stays owed, and nobody synchronizes.
+        scheduler.fire_next(Err("ring step 0 failed".into()));
+        assert!(stream.needs_shutdown());
+        assert!(!stream.query());
+
+        let firer_scheduler = scheduler.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let firer = std::thread::spawn(move || {
+            rx.recv().unwrap();
+            firer_scheduler.fire_next(Ok(()));
+        });
+        tx.send(()).unwrap();
+        match stream.drain_for_teardown() {
+            Err(RuntimeStreamError::Deferred(inner)) => {
+                assert_eq!(
+                    inner.to_string(),
+                    "scheduler rejected submission: ring step 0 failed"
+                );
+            }
+            other => panic!(
+                "expected drain_for_teardown() to re-throw the deferred error, got {other:?}"
+            ),
+        }
+        firer.join().unwrap();
+        assert!(
+            b_completed.load(Ordering::SeqCst),
+            "the drain must have waited for B's completion"
+        );
+        assert!(stream.query(), "the stream is idle after the drain");
+
+        // Exactly-once: the slot was consumed by the drain itself.
+        stream.drain_for_teardown().unwrap();
     }
 
     // === launch_event_signal / launch_event_wait ===========================

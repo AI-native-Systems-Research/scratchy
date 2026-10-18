@@ -390,16 +390,18 @@ impl RuntimeContext {
         let Some(ctx) = slot.take() else {
             return Err(RuntimeContextError::NotCreated);
         };
-        // Port of `RuntimeContextImpl::~RuntimeContextImpl`'s unconditional
-        // per-stream drain before the stream map is cleared
-        // (`runtime_context.cpp:263-288`): every registered stream is
-        // `synchronize()`d, with any deferred error logged and swallowed —
-        // never propagated out of `reset()` — exactly like
-        // `destroy_stream`'s existing suppress-and-log pattern below.
+        // Port of `RuntimeContextImpl::~RuntimeContextImpl`'s per-stream
+        // teardown drain before the stream map is cleared
+        // (`runtime_context.cpp:207-210`): every registered stream is
+        // `drainForTeardown()`d — set shutdown, wait for in-flight
+        // unconditionally, so a stream that took a device error still
+        // waits out the operations it already submitted — with any
+        // deferred error logged and swallowed, never propagated out of
+        // `reset()` (#609).
         {
             let streams = ctx.streams.lock().unwrap();
             for (id, stream) in streams.iter() {
-                if let Err(e) = stream.synchronize() {
+                if let Err(e) = stream.drain_for_teardown() {
                     tracing::error!(
                         "RuntimeContext::reset: deferred error suppressed while draining stream {id:?} during teardown: {e}"
                     );
@@ -501,10 +503,15 @@ impl RuntimeContext {
         let Some(stream) = self.streams.lock().unwrap().remove(&id) else {
             return Ok(());
         };
-        // Explicit synchronize (matching the C++ blocking contract) rather
+        // Explicit teardown drain (matching the C++ blocking contract) rather
         // than relying solely on `Drop::drop`'s best-effort drain, since
         // other `Arc<RuntimeStream>` clones (e.g. held by in-flight
         // completion callbacks) may keep the stream alive past this point.
+        // `drain_for_teardown`, not `synchronize` (#609): synchronize
+        // returns without waiting on a stream that took a device error,
+        // and a stream being destroyed must not release memory its
+        // outstanding operations still reference on such a stream's
+        // say-so.
         //
         // Matches `~RuntimeStream`'s try/catch (invoked when C++'s
         // `streams_.erase(handle)` drops the owning `unique_ptr`): any
@@ -513,7 +520,7 @@ impl RuntimeContext {
         // here mapped a real deferred error (e.g. a DMA failure) into a
         // misleading `UnknownStream` error and surfaced it to the caller,
         // which the real C++ never does.
-        if let Err(e) = stream.synchronize() {
+        if let Err(e) = stream.drain_for_teardown() {
             tracing::warn!(
                 "RuntimeContext::destroy_stream: deferred error suppressed while draining stream {id:?}: {e}"
             );
