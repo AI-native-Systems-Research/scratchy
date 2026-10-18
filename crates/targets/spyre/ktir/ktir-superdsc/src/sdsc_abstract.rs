@@ -7383,12 +7383,16 @@ impl ChunkScratch {
     ///     granite-2b) or 128 (granite-8b, whose 16 KiB Kᵗ entry under a two-stick score contraction dxp
     ///     accepts);
     ///   * `ENTRIES_PER_OP == MAX_CORES`, and each leg's part is a whole number of pages;
-    ///   * there is at least one whole V part;
+    ///   * at least one leg has a whole part in LX: a whole V part, or Kᵗ alone when the chunk is a
+    ///     whole number of Kᵗ parts. That second case is granite-8b's 8-page rung (~1k tokens), whose V
+    ///     part would be 16 pages: Kᵗ is one 8-page part in LX, and V is all tail, which is main's HBM
+    ///     V leg op for op. At one slab the two parts are the same pages, so it never arises;
     ///   * the V tail is a whole number of index sticks across the kv heads;
     ///   * every pin the form declares fits the frontend's LX window ([`ChunkLx::pinned_bytes_per_core`]
     ///     from [`crate::placement::LX_PIN_BASE`] up to [`crate::superdsc_opspec::FRONTEND_LX_END`]).
     ///     At granite-8b that refuses the 48-, 56- and 64-page rungs (1.5–2 MiB of pins), which keep
-    ///     the HBM scratch.
+    ///     the HBM scratch. The 12-page rung has neither a whole V part nor whole Kᵗ parts, so it keeps
+    ///     the HBM scratch too.
     ///
     /// Everything else keeps the HBM scratch. `None` is the existing form, not a refusal. The bake
     /// proves per op that the copy's and the consumer's divisions agree (`emit`'s core-local read law),
@@ -7409,7 +7413,10 @@ impl ChunkScratch {
             return None;
         }
         let lx = ChunkLx { chunk: self };
-        if self.pages < lx.part_pages()
+        // A chunk below one whole V part still keeps Kᵗ in LX where Kᵗ is whole parts: V is then all
+        // tail, i.e. main's HBM V leg exactly (one part, the flat slab-major run). Neither leg in LX is
+        // the existing form, so that is `None`.
+        if (self.pages < lx.part_pages() && lx.keys().is_none())
             || !(self.nkvh() * lx.tail_pages() * eph).is_multiple_of(one_stick)
             || crate::placement::LX_PIN_BASE + lx.pinned_bytes_per_core()
                 > crate::placement::LX_PIN_END

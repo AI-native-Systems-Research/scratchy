@@ -121,7 +121,8 @@ fn pin(body: &serde_json::Value, lds: &serde_json::Value) -> Option<u64> {
 /// ⭐ WHICH RUNGS KEEP WHICH LEG IN LX, from the form's own law. Kᵗ is in LX on every rung that is a whole
 /// number of 8-page parts, V on every rung with at least one 16-page part whose tail is whole sticks, and
 /// both only while their pins fit the frontend's window. The 48-, 56- and 64-page rungs would pin 1.5,
-/// 1.75 and 2 MiB; the window is 1,494,272 B.
+/// 1.75 and 2 MiB; the window is 1,494,272 B. The 8-page rung keeps Kᵗ alone in LX (V is all tail, main's
+/// HBM V leg); the 2-, 4- and 12-page rungs have neither leg whole.
 #[test]
 fn the_hd128_lx_form_covers_exactly_the_rungs_its_pins_fit() {
     let window = LX_PIN_END - LX_PIN_BASE;
@@ -137,7 +138,7 @@ fn the_hd128_lx_form_covers_exactly_the_rungs_its_pins_fit() {
         let k_pages = if j % 8 == 0 { j } else { 0 };
         let v_pages = j / 16 * 16;
         let pinned = u64::from(k_pages + v_pages) * u64::from(NKVH) * ENTRY_BYTES / 8;
-        let fits = v_pages > 0 && pinned <= window;
+        let fits = (v_pages > 0 || k_pages > 0) && pinned <= window;
         let Some(lx) = chunk.lx_form(ChunkRowKind::OneRequest) else {
             assert!(!fits, "{j} page(s): {pinned} B of pins fit, but no LX form");
             continue;
@@ -155,7 +156,7 @@ fn the_hd128_lx_form_covers_exactly_the_rungs_its_pins_fit() {
             assert_eq!(k.tensors(), j / 8 * NKVH);
         }
     }
-    assert_eq!(admitted, [16, 20, 24, 28, 32, 36, 40, 44, 52, 60]);
+    assert_eq!(admitted, [8, 16, 20, 24, 28, 32, 36, 40, 44, 52, 60]);
 }
 
 /// ⭐⭐⭐ EVERY LX COPY AND ITS CONSUMER MEET AT ONE PIN, read off the emitted descriptors at every rung.
