@@ -879,14 +879,15 @@ impl ControlBlockWire {
     ///
     /// Same mask-and-set discipline as [`Self::set_tag`], with one
     /// correction that discipline needs here: the field is cleared IN
-    /// POSITION before the new value is OR'd in (`MASK` is the unshifted
-    /// width mask, so `pack(MASK)` is what puts it at bits 34:33). The
+    /// POSITION before the new value is OR'd in
+    /// ([`BitField::IN_POSITION_MASK`] is the width mask already shifted to
+    /// bits 34:33). The
     /// stamp must be able to CLEAR the field too — a re-stamp that could
     /// only set bits would leave a stale EDEP1 on every CB after the
     /// first. Everything else in word 0 — the tag, the barrier bit,
     /// `completion_interrupt_` (bit 35) — is kept.
     pub fn set_edep(&mut self, edep: u64) {
-        let in_position = BitField::<34, 33>::pack(BitField::<34, 33>::MASK);
+        let in_position = BitField::<34, 33>::IN_POSITION_MASK;
         let mut w = [0u8; 8];
         w.copy_from_slice(&self.bytes[CTRL_SECTION..CTRL_SECTION + 8]);
         let word = u64::from_le_bytes(w);
