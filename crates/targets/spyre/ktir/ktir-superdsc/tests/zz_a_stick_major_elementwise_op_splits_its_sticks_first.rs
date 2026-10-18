@@ -148,8 +148,10 @@ fn the_measured_shapes_split_their_sticks_first() {
     assert_eq!(split(512, 8192), (1, 32));
     // the 2048-wide residual stream, 32 sticks: out:32.
     assert_eq!(split(256, 2048), (1, 32));
-    // granite-8b: hidden 4096 (64 sticks) out:32; the MLP's second column chunk 72 sticks — no divisor in
-    // 25..=32, so the search takes out:8 × mb:4 rather than strand cores at out:24.
+    // granite-8b: hidden 4096 (64 sticks) out:32; a 72-stick shape has no divisor in 25..=32, so the
+    // search takes out:8 × mb:4 rather than strand cores at out:24. (8b's own 72-stick op — its second MLP
+    // column chunk — is a non-block window, so the door presents it flat and it stays rows-first; see the
+    // wiring test. The law's arithmetic is pinned here regardless.)
     assert_eq!(split(512, 4096), (1, 32));
     assert_eq!(split(512, 4608), (4, 8));
     // a 4-request decode rung on the 2b MLP: out:32, where rows-first made mb:4 × out:8.
@@ -187,39 +189,25 @@ fn rb(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
     Stk::<RowBlockedTag>::new(name, StickLayout::row_blocked(rows as usize, cols as usize)).unwrap()
 }
 
-/// `(mb, out)` splits the descriptor the shipped pointwise door emits, read off `numWkSlicesPerDim_`.
-fn emitted_split(rows: u32, cols: u32, rank3_flat_out: bool) -> (u64, u64) {
+/// `(mb, out)` splits of the descriptor the shipped pointwise door emits for a `[rows, cols]` multiply
+/// whose output is the column window starting at `c_start` of a `full_cols`-wide tensor, read off
+/// `numWkSlicesPerDim_`.
+fn emitted_split(rows: u32, cols: u32, full_cols: u32, c_start: u32) -> (u64, u64) {
     let a = rb("t_a", rows, cols);
     let b = rb("t_b", rows, cols);
     let o = rb("t_o", rows, cols);
     let mut sid = 0i64;
-    let op = if rank3_flat_out {
-        // A column-sliced output is not a whole-block shift, so the door keeps it rank-3 flat — the
-        // stick-major predicate does not hold and the op stays rows-first.
-        assemble_pointwise_broadcast_off(
-            "mul_flat",
-            "multiply",
-            RowCount::of_token_rows(rows),
-            BlockCols::of_feature_cols(cols),
-            &[In::full(&a).ew(), In::full(&b).ew()],
-            &o,
-            ktir_superdsc::addr::col_of(rows, 2 * cols, cols, Df::Fp16),
-            &mut sid,
-            None,
-        )
-    } else {
-        assemble_pointwise_broadcast_off(
-            "mul_sm",
-            "multiply",
-            RowCount::of_token_rows(rows),
-            BlockCols::of_feature_cols(cols),
-            &[In::full(&a).ew(), In::full(&b).ew()],
-            &o,
-            ktir_superdsc::addr::col_of(rows, cols, 0, Df::Fp16),
-            &mut sid,
-            None,
-        )
-    };
+    let op = assemble_pointwise_broadcast_off(
+        "mul",
+        "multiply",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(cols),
+        &[In::full(&a).ew(), In::full(&b).ew()],
+        &o,
+        ktir_superdsc::addr::col_of(rows, full_cols, c_start, Df::Fp16),
+        &mut sid,
+        None,
+    );
     let v = serde_json::to_value(op.op.as_ref().expect("a descriptor")).unwrap();
     let s = &v["numWkSlicesPerDim_"];
     (
@@ -228,16 +216,33 @@ fn emitted_split(rows: u32, cols: u32, rank3_flat_out: bool) -> (u64, u64) {
     )
 }
 
-/// ⭐ THE WIRING, through the door every dense elementwise op is assembled at: a stick-major rank-2 op
-/// (granite-2b's mulsilu, `[256, 8192]`) emits out:32; the same op with a rank-3 flat output stays
-/// rows-first; and a one-row op (decode) is untouched — rows-first and sticks-first agree there.
+/// ⭐ THE WIRING, through the door every dense elementwise op is assembled at:
+///   * a stick-major rank-2 op (granite-2b's mulsilu, `[256, 8192]` whole) emits out:32;
+///   * a column window that is a WHOLE-BLOCK shift (columns `[8192, 16384)` of a 16384-wide tensor — its
+///     corner is `rows·cols` elements in) is still stick-major, so it takes the law too;
+///   * a column window that is NOT a whole-block shift — granite-3.1-8b's second MLP chunk, 4608 wide at
+///     column 8192 of 12800 — is presented rank-3 flat by the door, and stays rows-first;
+///   * a one-row op (decode) is untouched: rows-first and sticks-first agree there.
 #[test]
 fn the_pointwise_door_splits_a_stick_major_op_by_its_sticks() {
     assert_eq!(
-        emitted_split(256, 8192, false),
+        emitted_split(256, 8192, 8192, 0),
         (1, 32),
         "stick-major: out first"
     );
-    assert_eq!(emitted_split(256, 8192, true), (32, 1), "flat: rows first");
-    assert_eq!(emitted_split(1, 8192, false), (1, 32), "one row: unchanged");
+    assert_eq!(
+        emitted_split(256, 8192, 16384, 8192),
+        (1, 32),
+        "a whole-block column window is stick-major"
+    );
+    assert_eq!(
+        emitted_split(256, 4608, 12800, 8192),
+        (32, 1),
+        "a non-block column window is flat: rows first"
+    );
+    assert_eq!(
+        emitted_split(1, 8192, 8192, 0),
+        (1, 32),
+        "one row: unchanged"
+    );
 }
