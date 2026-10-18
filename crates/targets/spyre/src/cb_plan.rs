@@ -748,7 +748,7 @@ fn word_at(image: &[ControlBlockWire], cb: usize, dst: usize) -> u64 {
 
 /// Derive one image's patch table: render the canvas (the plan's own render —
 /// the caller proves it byte-identical to the walk at this `where_`, which
-/// [`patch_check`] does), render three differentials, and read every moving
+/// [`patch_check`] does), render two differentials, and read every moving
 /// word's coefficients off the differences. Finite differences through the
 /// door: there is no second analysis of the wire layout to drift, and
 /// anything that moves but is not affine in the two scalars refuses here or
@@ -896,9 +896,9 @@ pub(crate) struct RowImage {
 /// in full. A constant `where_` makes every step-differential zero, so such
 /// a row's patch table is empty BY CONSTRUCTION — deriving one anyway would
 /// probe a counterfactual no replay executes (measured on the first real
-/// bundle: the page differential walks the row's write base a full stride
-/// past where any launch of that row ever puts it, the render returns a
-/// structurally different allocation, and the affine solve refuses). Parity
+/// bundle: the gate's page probe walked the row's write base a full stride
+/// past where any launch of that row ever puts it, the render returned a
+/// structurally different allocation, and the solve refused). Parity
 /// at the constant `where_` is the row's whole correctness statement; the
 /// player copies this canvas verbatim and never consults the empty plan.
 pub(crate) fn render_row(
