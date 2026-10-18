@@ -502,6 +502,9 @@ pub struct EwOperand<'a> {
     mb_broadcast: bool,
     out_broadcast: bool,
     col_offset: u32,
+    /// The [`crate::addr::ColWindow`] `col_offset` came from — set only by [`In::col_window`], so a
+    /// stick-major presentation of a column window is admitted by type, never by testing the integer.
+    col_window: Option<crate::addr::ColWindow>,
 }
 impl<'a> EwOperand<'a> {
     pub(crate) fn scale(&self) -> [Scale; 3] {
@@ -533,6 +536,10 @@ impl<'a> EwOperand<'a> {
     }
     pub(crate) fn col_offset(&self) -> u32 {
         self.col_offset
+    }
+    /// Whether this operand is a [`crate::addr::ColWindow`] whose `[rows, ·]` view is stick-major.
+    pub(crate) fn is_stick_major_window_for(&self, rows: u32) -> bool {
+        self.col_window.is_some_and(|w| w.is_stick_major_for(rows))
     }
 }
 
@@ -635,7 +642,7 @@ pub(crate) fn pointwise_broadcast_opspec_df(
     cols: u32,
     inputs: &[EwOperand<'_>],
     o_name: &str,
-    out_offset: u32,
+    out_offset: crate::addr::OutCorner,
     head_major: bool,
     df: Df,
     layout: Option<&BundleLayout>,
@@ -1185,7 +1192,7 @@ fn one_gathered_leg(
         // `AnyTensorArg::set_offset_elems`: this builder reads `out_offset` to decide the operand
         // RANK, and a row window is not the whole-block shift its stick-major (rank-2) form requires,
         // so passing it here would drop the leg to the rank-3 flat presentation.
-        0,
+        crate::addr::OutCorner::ZERO,
         head_major,
         layout,
         // ⛔ ROWS FIRST, STATED: the gather's index enumerates `mb` in whole entries
@@ -1525,7 +1532,9 @@ pub fn assemble_pointwise_broadcast_off<O: KindTag>(
     // bare `u32` a caller could pass a flat column index, and one did -- the split MLP intermediate
     // wrote its second column block at element 8192 instead of `(8192/64)*(rows*64)`, correct at one
     // row and wrong at every prefill. The reads were already typed and were already right.
-    out_offset: crate::addr::DevOff,
+    // A [`crate::addr::ColWindow`] (a whole-stick column window, #622) converts too, and carries the fact
+    // that the window is a stick-major tensor of its own.
+    out_offset: impl Into<crate::addr::OutCorner>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
@@ -1537,7 +1546,7 @@ pub fn assemble_pointwise_broadcast_off<O: KindTag>(
             cols,
             inputs,
             o,
-            out_offset,
+            out_offset: out_offset.into(),
             division: crate::work::EwDivision::Law,
         },
         sym_id_base,
@@ -1555,7 +1564,7 @@ pub struct PointwiseDivided<'a, O: KindTag> {
     pub cols: crate::sdsc_abstract::BlockCols,
     pub inputs: &'a [EwOperand<'a>],
     pub o: &'a Stk<O>,
-    pub out_offset: crate::addr::DevOff,
+    pub out_offset: crate::addr::OutCorner,
     /// The work division the op is assembled under. [`crate::work::EwDivision::Law`] is what the shipped
     /// door ([`assemble_pointwise_broadcast_off`]) states.
     pub division: crate::work::EwDivision,
@@ -1584,7 +1593,6 @@ pub fn assemble_pointwise_broadcast_divided<O: KindTag>(
     } = p;
     let rows = rows.get();
     let cols = cols.get();
-    let out_offset = out_offset.into_raw_elems();
     // The OUTPUT type drives the layout: a `Stk<FlatTag>` output IS a head-major (per-head attention)
     // op — rank-3 flat; a `Stk<RowBlockedTag>` output is the residual token stream (rank-2 stick-major).
     // So `head_major` is DERIVED from the output kind (no redundant bool that could disagree with it).
@@ -1659,7 +1667,7 @@ pub fn assemble_pointwise_broadcast_df(
         cols,
         inputs,
         o_name,
-        0,
+        crate::addr::OutCorner::ZERO,
         true,
         df,
         layout,
@@ -3815,6 +3823,7 @@ pub struct In<'a, K: KindTag> {
     mb_broadcast: bool,
     out_broadcast: bool,
     col_offset: u32,
+    col_window: Option<crate::addr::ColWindow>,
 }
 #[allow(dead_code)] // ctors are used as the pointwise builders migrate to handle-flow (rmsnorm first)
 impl<'a, K: KindTag> In<'a, K> {
@@ -3824,6 +3833,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: false,
             col_offset: 0,
+            col_window: None,
         }
     }
     pub fn scalar(h: &'a Stk<K>) -> Self {
@@ -3832,6 +3842,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: true,
             out_broadcast: true,
             col_offset: 0,
+            col_window: None,
         }
     }
     pub fn col(h: &'a Stk<K>) -> Self {
@@ -3840,6 +3851,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: true,
             col_offset: 0,
+            col_window: None,
         }
     }
     pub fn sliced(h: &'a Stk<K>, col_offset: crate::addr::DevOff) -> Self {
@@ -3848,6 +3860,20 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: false,
             col_offset: col_offset.into_raw_elems(),
+            col_window: None,
+        }
+    }
+    /// [`sliced`](Self::sliced) at a [`crate::addr::ColWindow`] — a whole-stick column window of a
+    /// stick-major tensor with the op's own row count. The same offset `sliced` would carry; what it adds is
+    /// the FACT that the window is a stick-major tensor of its own, so the door may present the op rank-2
+    /// stick-major and the work-division law reaches it (#622).
+    pub fn col_window(h: &'a Stk<K>, w: crate::addr::ColWindow) -> Self {
+        In {
+            h,
+            mb_broadcast: false,
+            out_broadcast: false,
+            col_offset: w.dev().into_raw_elems(),
+            col_window: Some(w),
         }
     }
     /// [`col`] (per-row scalar, out-broadcast over the stick) PLUS a base `col_offset` — the per-head-block
@@ -3858,6 +3884,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: true,
             col_offset: col_offset.into_raw_elems(),
+            col_window: None,
         }
     }
     /// Broadcast a `[1,cols]` const/gain over rows (the rmsnorm gamma / a mb-broadcast operand).
@@ -3867,6 +3894,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: true,
             out_broadcast: false,
             col_offset: 0,
+            col_window: None,
         }
     }
     /// [`mb`] PLUS a base `col_offset` — the per-block prefix-mask slice (`pmask[.., b*stick..]`,
@@ -3877,6 +3905,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: true,
             out_broadcast: false,
             col_offset: col_offset.into_raw_elems(),
+            col_window: None,
         }
     }
     pub fn ew(&self) -> EwOperand<'a> {
@@ -3885,6 +3914,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: self.mb_broadcast,
             out_broadcast: self.out_broadcast,
             col_offset: self.col_offset,
+            col_window: self.col_window,
         }
     }
 }
