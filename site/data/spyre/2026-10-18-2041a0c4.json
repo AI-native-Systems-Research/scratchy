@@ -31,8 +31,8 @@
   ],
   "since": "#584–#620",
   "moved": [
-    { "pr": "#619", "what": "32-core decode fill: each one-row projection streams on all 32 cores, measured −14 ms/step at 8b — ITL 143.4 → 131.2 ms at ~123 (now ahead of torch-spyre's 143), 192.4 → 179.7 ms at ~10k." },
-    { "pr": "#620", "what": "512-row prompt chunks, each continuation on the narrowest prefix rung that finishes it: 8b ~10k TTFT 17.0 → 12.8 s and 2b ~10k TTFT 8.90 → 8.15 s — both now ahead of torch-spyre (13.0 / 8.23 s)." },
+    { "pr": "#619", "what": "32-core decode fill: each one-row projection streams on all 32 cores — measured in a same-binary A/B at 8b fp16, ITL −13.9 ms at ~123 (143.2 → 129.3), −13.9 at ~1k, −14.5 at ~10k. This sweep's 8b cells (131.2 / 138.7 / 179.7 ms) put short-context decode ahead of torch-spyre's 143." },
+    { "pr": "#620", "what": "512-row prompt chunks, each continuation on the narrowest prefix rung that finishes it: 8b ~10k TTFT −24.1% (17.29 → 13.13 s, byte-identical replies), 2b −3.3% at ~10k and −6.8% at ~2k; this sweep's 12.80 s and 8.15 s are both ahead of torch-spyre (13.04 / 8.23 s)." },
     { "pr": "#613", "what": "one persistent stream per session (resolved fences retire at completion; no per-token stream recreate) — RSS flat over 1,506 decode steps." },
     { "pr": "#605", "what": "one --max-model-len law: a default granite `scr chat` loads again; an over-budget ask is refused with the number that fits." },
     { "pr": "#598", "what": "whole-dxp matmuls past a measured 150 MiB per-core kernel slab take frontend trips, so gemma-4 31b bakes (it died at dxp's EAR overflow)." }
