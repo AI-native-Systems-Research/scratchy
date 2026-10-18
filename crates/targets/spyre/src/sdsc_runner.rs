@@ -543,6 +543,28 @@ impl SuperDscSession {
         )
     }
 
+    /// The [`CausalKey`] this session's staged activation `id` was last bound under, if it was
+    /// bound keyed. A forward whose key equals it has nothing to bind for `id`.
+    ///
+    /// [`CausalKey`]: scratchy_subtile::sdsc_abstract::CausalKey
+    pub fn keyed_holds(
+        &self,
+        id: crate::bundle_code::PlaceId,
+    ) -> Option<scratchy_subtile::sdsc_abstract::CausalKey> {
+        self.exec.keyed_holds(id)
+    }
+
+    /// Bind `id` as a function of `key` alone, narrowed to f16 here. The next step uploads it, and
+    /// no later step re-uploads it until another key is bound (see `Executor::bind_input_keyed`).
+    pub fn bind_keyed(
+        &mut self,
+        id: crate::bundle_code::PlaceId,
+        key: scratchy_subtile::sdsc_abstract::CausalKey,
+        vals: &[f32],
+    ) -> Result<()> {
+        self.exec.bind_input_keyed(id, key, f32_to_f16_le(vals))
+    }
+
     fn run_step_inner(
         &mut self,
         n_new: usize,

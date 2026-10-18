@@ -654,6 +654,24 @@ fn whole_shadow<'a>(shadow: &'a [u8], addr: &DevAddr, seg: usize) -> Result<&'a 
     })
 }
 
+/// One keyed activation's state: the [`CausalKey`] its staged bytes are a function of, and whether
+/// the current step re-bound it (so `refill_activations` converts and uploads it this step, and only
+/// this step). See [`Executor::keyed`].
+///
+/// [`CausalKey`]: scratchy_subtile::sdsc_abstract::CausalKey
+#[derive(Clone, Copy, Debug)]
+struct Keyed {
+    key: scratchy_subtile::sdsc_abstract::CausalKey,
+    fresh: bool,
+}
+
+/// Whether `refill_activations` sends bound activation `id` this step: every unkeyed activation, every
+/// step (today's re-upload, unchanged), and a keyed one only in the step that bound it. The one rule
+/// both refill loops ask, so they cannot disagree about which binds go out.
+fn refill_sends(keyed: &BTreeMap<bundle::PlaceId, Keyed>, id: &bundle::PlaceId) -> bool {
+    keyed.get(id).is_none_or(|k| k.fresh)
+}
+
 /// ⛔⛔⛔ EVERY WAY A SOURCE TENSOR'S BYTES CAN GET THERE — THE COMPLETE LIST.
 ///
 /// The device cannot report an unfilled source: it reads whatever the segment happens to hold, or it
@@ -836,6 +854,17 @@ pub struct Executor {
     /// (`stage_weights`, `predict`) and a per-call flag would have to be remembered by both anyway.
     /// One set, consulted by both, is the only arrangement in which they cannot disagree.
     raw_ids: BTreeSet<bundle::PlaceId>,
+    /// ⭐ ACTIVATIONS STAGED BY KEY — the key their bytes are a function of, and whether this
+    /// step re-bound them. Today exactly one: the new-block causal mask
+    /// ([`scratchy_subtile::sdsc_abstract::CausalKey`]).
+    ///
+    /// A keyed bind is written to the shadow and uploaded in the step that binds it, and NOT
+    /// re-uploaded by a step that does not: segment 3, where every activation lives, is written by
+    /// no device op (measured over every compute op of the 252 granite-2b bundles), so the device
+    /// keeps the bytes of the last bind. Every UNKEYED activation is re-uploaded every step exactly
+    /// as before. That arrangement is deliberate: an input someone forgets to re-bind must still be
+    /// caught by today's path, not hidden by this one.
+    keyed: BTreeMap<bundle::PlaceId, Keyed>,
 
     // ── KV / fold ──
     kv: KvGeometry,
@@ -1009,6 +1038,7 @@ impl Executor {
             bound: BTreeMap::new(),
             weight_ids: BTreeSet::new(),
             raw_ids: BTreeSet::new(),
+            keyed: BTreeMap::new(),
             kv: KvGeometry::default(),
             fold: SessionKv::default(),
             block_table_set: false,
@@ -1460,7 +1490,43 @@ impl Executor {
         // A previously-raw id re-bound as fp16 must stop being raw, or the shadow would take an
         // unconverted fp16 buffer. Cleared here rather than left to the caller.
         self.raw_ids.remove(&id);
+        // An id re-bound UNKEYED goes back to the per-step re-upload, so a keyed bind can never
+        // shadow a later plain one.
+        self.keyed.remove(&id);
         self.bound.insert(id, bytes);
+    }
+
+    /// The key this session's KEYED activation `id` holds — the [`CausalKey`] the bytes on the
+    /// device are a function of — or `None` when `id` was never bound keyed. A launch whose key
+    /// equals this binds nothing for `id`.
+    ///
+    /// [`CausalKey`]: scratchy_subtile::sdsc_abstract::CausalKey
+    pub fn keyed_holds(
+        &self,
+        id: bundle::PlaceId,
+    ) -> Option<scratchy_subtile::sdsc_abstract::CausalKey> {
+        self.keyed.get(&id).map(|k| k.key)
+    }
+
+    /// ⭐ Bind an ACTIVATION whose bytes are a function of `key` alone (IEEE-fp16 bytes). It is
+    /// converted and uploaded by the NEXT predict and not again: until a launch re-binds it under a
+    /// different key, the device keeps these bytes (segment 3 is never written on card). Every
+    /// other activation stays on [`Self::bind_input`]'s per-step re-upload.
+    pub fn bind_input_keyed(
+        &mut self,
+        id: bundle::PlaceId,
+        key: scratchy_subtile::sdsc_abstract::CausalKey,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        if !self.prepared {
+            bail!(
+                "bind_input_keyed('{id}') before prepare — a keyed activation is a per-step bind"
+            );
+        }
+        self.raw_ids.remove(&id);
+        self.keyed.insert(id, Keyed { key, fresh: true });
+        self.bound.insert(id, bytes);
+        Ok(())
     }
 
     /// ⭐⭐⭐⭐⭐ MINT THE ONLY VALUE [`Self::bind_input_raw`] ACCEPTS — the payload measured against
@@ -3996,6 +4062,9 @@ impl Executor {
             if self.weight_ids.contains(nm) {
                 continue; // weight, resident
             }
+            if !refill_sends(&self.keyed, nm) {
+                continue; // keyed, and the device already holds this key's bytes
+            }
             let Some(p) = self.places.get(nm) else {
                 continue; // no placement → not a program input, skip
             };
@@ -4044,6 +4113,9 @@ impl Executor {
             if self.weight_ids.contains(nm) {
                 continue;
             }
+            if !refill_sends(&self.keyed, nm) {
+                continue;
+            }
             let Some(p) = self.places.get(nm) else {
                 continue;
             };
@@ -4061,6 +4133,11 @@ impl Executor {
             }
         }
         self.bound = bound;
+        // This step's keyed binds are in the shadow and in the runs below; the next step that does
+        // not re-bind them sends nothing for them.
+        for k in self.keyed.values_mut() {
+            k.fresh = false;
+        }
 
         let mut note = String::new();
         let mut total = 0u64;
@@ -5415,6 +5492,38 @@ mod tests {
     /// `Seg::known` is const-evaluated, so this is a compile-time proof rather than a test — the
     /// value exists only if the assert held.
     const _SEG6: SegIdx = SegIdx::known::<6>();
+
+    /// ⭐ ONLY A KEYED BIND IS SPARED THE PER-STEP RE-UPLOAD, AND ONLY AFTER ITS FIRST STEP. An
+    /// unkeyed activation is sent every step (an input someone forgets to re-bind must keep being
+    /// caught by today's path); a keyed one is sent in the step that bound it and not again until a
+    /// new key re-binds it.
+    #[test]
+    fn a_keyed_bind_goes_out_once_and_an_unkeyed_one_every_step() {
+        use scratchy_subtile::sdsc_abstract::{CausalKey, RungWidth};
+        let key =
+            CausalKey::chunk(RungWidth::of_baked_rows(512).expect("a width"), 512).expect("a key");
+        let (mask, rope) = (bundle::PlaceId::Act(7), bundle::PlaceId::Act(8));
+        let mut keyed = BTreeMap::new();
+        assert!(refill_sends(&keyed, &rope), "unkeyed: sent");
+        keyed.insert(mask, Keyed { key, fresh: true });
+        assert!(refill_sends(&keyed, &mask), "keyed, bound this step: sent");
+        assert!(
+            refill_sends(&keyed, &rope),
+            "a keyed neighbour changes nothing for the rest"
+        );
+        // What `refill_activations` does after the convert: every keyed bind is now on the device.
+        for k in keyed.values_mut() {
+            k.fresh = false;
+        }
+        assert!(
+            !refill_sends(&keyed, &mask),
+            "keyed, already uploaded: not sent"
+        );
+        assert!(
+            refill_sends(&keyed, &rope),
+            "unkeyed: still sent every step"
+        );
+    }
 
     /// Two steps on ONE image key: the first derives, the second hits the cache —
     /// and the hit arm must COUNT it. The cadence line's "% from cached" read 0.0

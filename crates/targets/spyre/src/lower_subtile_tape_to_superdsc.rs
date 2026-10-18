@@ -4382,7 +4382,7 @@ pub fn numeric_gate<F: RopeForm>(
         // `[MQ, MQ]` mask descriptor states) — at a FULL chunk: every row
         // real, so the clamp is the identity and the golden, which has no
         // pad-row law, sees exactly the rows the program reads. ⛔ NOT
-        // `new_block_mask`: that is the card's `[mq, mq_pad]` stick-padded
+        // `CausalKey::mask`: that is the card's `[mq, mq_pad]` stick-padded
         // layout — a different tensor than the one-pass kernel consumes.
         let mq = pg.mq as usize;
         let chunk = scratchy_subtile::sdsc_abstract::ChunkRows::chunk(

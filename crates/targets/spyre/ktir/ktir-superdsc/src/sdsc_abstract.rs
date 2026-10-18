@@ -4868,6 +4868,108 @@ pub fn decode_batch_causal_col_valid(col: usize, row: usize) -> bool {
     col == row
 }
 
+/// The fp16-safe additive "-inf" every staged attention mask carries: half the largest finite fp16
+/// magnitude, negated, so `exp(score + mask)` underflows to 0 and the sum stays finite. A named
+/// constant because [`CausalKey::mask`] has no other input: the value the mask carries can no more
+/// come from a caller than its rows can.
+pub const ATTN_MASK_NEG: f32 = -(half::f16::MAX.to_f32_const() / 2.0);
+
+/// ⭐⭐⭐ EVERY FACT A LAUNCH'S NEW-BLOCK CAUSAL MASK IS A FUNCTION OF, AS ONE VALUE — and
+/// [`Self::mask`] takes nothing else, so the mask cannot depend on a fact this key leaves out.
+///
+/// The mask is `[rows, rows_pad]` additive (0 where row `r` may attend new-block column `c`), and it
+/// is a function of TWO facts on each path, never of the tokens, the positions or the prefix:
+///
+/// * a prompt chunk — the rung's rows and how many of them are `real` (pad rows clamp to the last real
+///   row, [`ChunkRows::row_logical_pos`]: the lm_head reads the LAST baked row, which must attend
+///   exactly `[0, real)`). A FULL chunk (`real == rows`) is the plain triangle, so every full chunk of
+///   a rung binds the same mask;
+/// * a decode batch — the rung's rows and how many are `live` (live slot `s` attends its own column;
+///   a padding slot is live 0 complete, [`PadRowReplica`], so it attends column 0).
+///
+/// ⭐ SO IT IS A STAGED CONSTANT, KEYED. A session holds the mask of ONE key at a time. A launch whose
+/// key matches what the session holds re-binds nothing: the host never wrote anything else to that
+/// placement, and the device never writes segment 3 (measured: no compute op of the 252 granite-2b
+/// bundles names a seg3 dataspace among its outputs). One equality on two small integers decides it:
+/// no content compare and no per-step rebuild of a 16 MB tile. That rebuild was 26–28 ms of host work
+/// per 512-row chunk on granite-3.1-2b, measured.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CausalKey {
+    /// A prompt chunk: `real` genuine rows of a `rows`-row rung.
+    Chunk { rows: RungWidth, real: NonZeroU32 },
+    /// A decode batch: `live` requests on a `rows`-row rung.
+    Batch { rows: RungWidth, live: NonZeroU32 },
+}
+
+impl CausalKey {
+    /// A prompt chunk's key. `None` unless `1 <= real <= rows`: a chunk with no real row, or more
+    /// real rows than its rung, is not a launch.
+    pub fn chunk(rows: RungWidth, real: usize) -> Option<CausalKey> {
+        let real = NonZeroU32::new(u32::try_from(real).ok()?)?;
+        (real.get() <= rows.get()).then_some(CausalKey::Chunk { rows, real })
+    }
+
+    /// A decode batch's key, read off the rows the launch binds.
+    pub fn batch(rows: &LaunchRows<'_>) -> Option<CausalKey> {
+        Some(CausalKey::Batch {
+            rows: rows.width(),
+            live: NonZeroU32::new(u32::try_from(rows.live()).ok()?)?,
+        })
+    }
+
+    /// The rows the mask has, and the stick-padded column count the emitter reads it at
+    /// (`rows.div_ceil(64) * 64`), so the buffer cannot be built at one width and read at another.
+    pub fn rows(self) -> usize {
+        match self {
+            CausalKey::Chunk { rows, .. } | CausalKey::Batch { rows, .. } => rows.count(),
+        }
+    }
+
+    pub fn rows_pad(self) -> usize {
+        self.rows().div_ceil(64) * 64
+    }
+
+    /// The new-block column row `row` attends up to (a chunk's clamped position) or exactly (a
+    /// batch's column).
+    fn row_col(self, row: usize) -> usize {
+        match self {
+            CausalKey::Chunk { rows, .. } => {
+                ChunkRows::chunk(rows.rows()).row_logical_pos(row, self.real_or_live())
+            }
+            CausalKey::Batch { .. } if row < self.real_or_live() => row,
+            CausalKey::Batch { .. } => LaunchSlot::solo().index(),
+        }
+    }
+
+    fn real_or_live(self) -> usize {
+        match self {
+            CausalKey::Chunk { real, .. } => real.get() as usize,
+            CausalKey::Batch { live, .. } => live.get() as usize,
+        }
+    }
+
+    /// THE `[rows, rows_pad]` NEW-BLOCK MASK, additive and row-major, from this key alone: the
+    /// [`prefill_causal_col_valid`] triangle for a chunk, the [`decode_batch_causal_col_valid`]
+    /// diagonal for a batch, `0` where valid and [`ATTN_MASK_NEG`] elsewhere.
+    pub fn mask(self) -> Vec<f32> {
+        let (mq, mq_pad) = (self.rows(), self.rows_pad());
+        let mut cmask = vec![ATTN_MASK_NEG; mq * mq_pad];
+        for row in 0..mq {
+            let at = self.row_col(row);
+            for col in 0..mq_pad {
+                let valid = match self {
+                    CausalKey::Chunk { .. } => prefill_causal_col_valid(col, at),
+                    CausalKey::Batch { .. } => decode_batch_causal_col_valid(col, at),
+                };
+                if valid {
+                    cmask[row * mq_pad + col] = 0.0;
+                }
+            }
+        }
+        cmask
+    }
+}
+
 /// THE HEAD-MAJOR SELECTOR (mq>1 prefill: turn row-major `q[mq, nqh·hd]` into per-head-contiguous
 /// `[nqh, mq, hd]` so the per-head attention ops read a contiguous `[mq,hd]` slice). For head `h`,
 /// `q_h[mq,hd] = q[mq, nqh·hd] @ Sel_h`, where `Sel_h` is a one-hot `[nqh·hd, hd]` column-selector:
@@ -5055,35 +5157,11 @@ impl ChunkRows {
     ///
     /// IDENTITY WHEN `real == mq`: the map is `min(row, mq-1) == row`, so a chunk that fills its rung
     /// binds byte-identical rotary and mask data to the pre-fold path. SINGLE SOURCE OF TRUTH for the
-    /// worker's rope-position staging AND its causal-mask fill ([`Self::new_block_mask`] composes it
+    /// worker's rope-position staging AND its causal-mask fill ([`CausalKey::mask`] composes it
     /// with [`prefill_causal_col_valid`]), pinned by the Kani proof
     /// `prefill_pad_row_holds_last_real_token`.
     pub fn row_logical_pos(self, row: usize, real: usize) -> usize {
         row.min(real - 1)
-    }
-
-    /// THE `[mq, mq_pad]` NEW-BLOCK CAUSAL MASK OF A PROMPT CHUNK, additive and row-major: 0 where row
-    /// `r` may attend new-block column `c`, `mask_neg` elsewhere.
-    ///
-    /// The rows are consecutive positions of ONE prompt, so the extent is [`prefill_causal_col_valid`]'s
-    /// TRIANGLE taken at the row's clamped position — a row attends itself and every earlier row.
-    ///
-    /// `mq_pad` is the stick-padded row count the emitter reads the mask at (`mq.div_ceil(64)*64`),
-    /// derived here from the row count rather than passed, so the buffer cannot be built at one width
-    /// and read at another.
-    pub fn new_block_mask(self, real: usize, mask_neg: f32) -> Vec<f32> {
-        let mq = self.count().get() as usize;
-        let mq_pad = mq.div_ceil(64) * 64;
-        let mut cmask = vec![mask_neg; mq * mq_pad];
-        for row in 0..mq {
-            let pos = self.row_logical_pos(row, real);
-            for col in 0..mq_pad {
-                if prefill_causal_col_valid(col, pos) {
-                    cmask[row * mq_pad + col] = 0.0;
-                }
-            }
-        }
-        cmask
     }
 }
 
@@ -9551,31 +9629,6 @@ impl<'a> LaunchRows<'a> {
                 hist: &self.pad.hist,
             },
         })
-    }
-
-    /// THE `[mq, mq_pad]` NEW-BLOCK MASK OF A DECODE BATCH, additive and row-major: 0 where row `r` may
-    /// attend new-block column `c`, `mask_neg` elsewhere.
-    ///
-    /// The rows are INDEPENDENT REQUESTS, so the extent is [`decode_batch_causal_col_valid`]'s
-    /// DIAGONAL — a row attends its own column and no other. A PADDING row's column is live 0's, from
-    /// the same [`Self::row`] every other aspect comes from, so its mask row is byte-identical to live
-    /// 0's and its attention is live 0's attention.
-    ///
-    /// `mq_pad` is derived from the rung width here (`mq.div_ceil(64)*64`), matching the emitter, so the
-    /// buffer cannot be built at one width and read at another.
-    pub fn new_block_mask(&self, mask_neg: f32) -> Vec<f32> {
-        let mq = self.width.count();
-        let mq_pad = mq.div_ceil(64) * 64;
-        let mut cmask = vec![mask_neg; mq * mq_pad];
-        for row in 0..mq {
-            let inputs = self.row(row).expect("row < width");
-            for col in 0..mq_pad {
-                if decode_batch_causal_col_valid(col, inputs.new_block_col().index()) {
-                    cmask[row * mq_pad + col] = 0.0;
-                }
-            }
-        }
-        cmask
     }
 
     /// THE PREFIX HISTORY OF EVERY BOUND ROW, in slot order — what [`decode_batch_prefix_mask_f16`]
