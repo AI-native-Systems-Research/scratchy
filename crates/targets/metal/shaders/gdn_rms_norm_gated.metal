@@ -138,7 +138,13 @@ INST_GDN_RMS_NORM_GATED(f32,  float)
 // `GDN_RMS_ROWS_PER_TG` is optional only because the threadgroup form's keys
 // carry no slot 6; the simd form's own static_assert below refuses a bake that
 // leaves it unset or zero (a zero would make every threadgroup recompute the
-// first rows instead of striding past them).
+// first rows instead of striding past them). The `SCRATCHY_COMPILES` wrapper
+// takes that further: the threadgroup form's bakes never parse this form at
+// all, so its constant, its layout arithmetic and its assert are checked only
+// where they hold.
+#if SCRATCHY_COMPILES(gdn_rms_norm_gated_simd_f16) || \
+    SCRATCHY_COMPILES(gdn_rms_norm_gated_simd_bf16) || \
+    SCRATCHY_COMPILES(gdn_rms_norm_gated_simd_f32)
 SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_RMS_ROWS_PER_TG, 6);
 
 template <typename T>
@@ -157,15 +163,11 @@ template <typename T>
     return;
   }
   uint lane = tid % 32;
-  // A lane's strided elements. The clamp keeps this template parseable in the threadgroup
-  // form's own bakes — clang checks its non-template-dependent code there too, where slot 6
-  // is unset and `GDN_RMS_D` can be below 32 — and is the identity wherever the static_assert
-  // below lets it instantiate.
-  constexpr uint e = GDN_RMS_D < 32u ? 1u : GDN_RMS_D / 32u;
-  // Checked where this kernel is baked (`sizeof(T)` defers to its instantiation): the lane
-  // layout above rests on the width being a power of two in [32, 256] and the rows a
-  // threadgroup being set — anything else sums the wrong elements or strides rows wrong.
-  static_assert(sizeof(T) && GDN_RMS_ROWS_PER_TG_SET && GDN_RMS_ROWS_PER_TG > 0u &&
+  constexpr uint e = GDN_RMS_D / 32;  // a lane's strided elements
+  // The lane layout above rests on the width being a power of two in [32, 256]
+  // and the rows a threadgroup being set — anything else sums the wrong
+  // elements or strides rows wrong, and refuses the bake here.
+  static_assert(GDN_RMS_ROWS_PER_TG_SET && GDN_RMS_ROWS_PER_TG > 0u &&
                     GDN_RMS_D >= 32u && GDN_RMS_D <= 256u &&
                     (GDN_RMS_D & (GDN_RMS_D - 1u)) == 0u,
                 "one simdgroup a row, a power-of-two width in [32, 256]");
@@ -217,11 +219,8 @@ template <typename T>
   // The store loop is the threadgroup form's own shape — a runtime stride off
   // the thread id (here the lane, strided by the simdgroup width, a runtime
   // quotient of `tg_size`) — so the compiler lowers its `exp`, division and
-  // multiply chain exactly as the threadgroup form's, bit for bit. The clamp
-  // is the identity wherever the static_assert lets this kernel instantiate;
-  // it only keeps the never-instantiated parse (slot 6 unset) free of a
-  // division-by-zero.
-  uint simdw = tg_size / (GDN_RMS_ROWS_PER_TG < 1u ? 1u : GDN_RMS_ROWS_PER_TG);
+  // multiply chain exactly as the threadgroup form's, bit for bit.
+  uint simdw = tg_size / GDN_RMS_ROWS_PER_TG;
   for (uint i = lane; i < d; i += simdw) {
     float zi = float(z_row[i]);
     float silu_z = zi / (1.0f + exp(-zi));  // SiLU(z) = z * sigmoid(z)
@@ -236,3 +235,4 @@ template <typename T>
 INST_GDN_RMS_NORM_GATED_SIMD(f16,  half)
 INST_GDN_RMS_NORM_GATED_SIMD(bf16, bfloat)
 INST_GDN_RMS_NORM_GATED_SIMD(f32,  float)
+#endif

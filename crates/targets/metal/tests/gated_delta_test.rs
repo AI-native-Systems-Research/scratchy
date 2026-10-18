@@ -14,9 +14,9 @@
 
 mod common;
 
-use half::{bf16, f16};
+use common::Dtype;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
-use scratchy_target_metal::aot::baked_build;
+use scratchy_target_metal::aot::{bake, baked_build};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::gdn_state::{
     CheckpointRows, DraftLane, DraftLanes, GDN_SAVES, GdnSave, GdnSeqSlots, GdnSlot, GdnStart,
@@ -56,7 +56,11 @@ fn buf_bytes(device: &Device, bytes: &[u8]) -> Buffer {
         .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
         .expect("newBuffer");
     unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.contents().as_ptr() as *mut u8, len);
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            buf.contents().as_ptr() as *mut u8,
+            bytes.len(),
+        );
     }
     buf
 }
@@ -554,55 +558,6 @@ fn gdn_rms_norm_gated_simd_is_bit_identical_to_the_threadgroup_form() {
     let cache =
         SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
 
-    /// The dtype a `gdn_rms_norm_gated` instantiation reads its `z` in and writes its `out`.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum Dtype {
-        F32,
-        F16,
-        Bf16,
-    }
-    impl Dtype {
-        fn tag(self) -> &'static str {
-            match self {
-                Self::F32 => "f32",
-                Self::F16 => "f16",
-                Self::Bf16 => "bf16",
-            }
-        }
-        /// The threadgroup and simdgroup forms' kernel symbols at this dtype.
-        fn symbols(self) -> (&'static str, &'static str) {
-            match self {
-                Self::F32 => ("gdn_rms_norm_gated_f32", "gdn_rms_norm_gated_simd_f32"),
-                Self::F16 => ("gdn_rms_norm_gated_f16", "gdn_rms_norm_gated_simd_f16"),
-                Self::Bf16 => ("gdn_rms_norm_gated_bf16", "gdn_rms_norm_gated_simd_bf16"),
-            }
-        }
-        /// `xs` as this dtype holds it.
-        fn bytes(self, xs: &[f32]) -> Vec<u8> {
-            match self {
-                Self::F32 => xs.iter().flat_map(|x| x.to_le_bytes()).collect(),
-                Self::F16 => xs
-                    .iter()
-                    .flat_map(|&x| f16::from_f32(x).to_bits().to_le_bytes())
-                    .collect(),
-                Self::Bf16 => xs
-                    .iter()
-                    .flat_map(|&x| bf16::from_f32(x).to_bits().to_le_bytes())
-                    .collect(),
-            }
-        }
-        /// The output buffer's raw bit patterns, widened — equal iff the outputs are.
-        fn bits(self, buf: &Buffer, n: usize) -> Vec<u32> {
-            match self {
-                Self::F32 => read_f32(buf, n).iter().map(|v| v.to_bits()).collect(),
-                _ => {
-                    let raw = buf.contents().as_ptr() as *const u16;
-                    (0..n).map(|i| unsafe { *raw.add(i) } as u32).collect()
-                }
-            }
-        }
-    }
-
     // (width, groups a token, rows-a-threadgroup layouts to try): the GDN form (one value head
     // a row) at every dispatchable width, then the Mamba-2 form (gate before norm, `z` a
     // strided column slice, weight spanning the token's rows) at the parity-tiny lowering's
@@ -619,7 +574,10 @@ fn gdn_rms_norm_gated_simd_is_bit_identical_to_the_threadgroup_form() {
     let eps = 1e-6f32;
     let shifted = |n: usize, by: usize| fill(n + by)[by..].to_vec();
     for dt in [Dtype::F32, Dtype::F16, Dtype::Bf16] {
-        let (threadgroup_sym, simd_sym) = dt.symbols();
+        let (threadgroup_sym, simd_sym) = (
+            dt.symbol("gdn_rms_norm_gated"),
+            dt.symbol("gdn_rms_norm_gated_simd"),
+        );
         for &(d, groups, rpts) in cases {
             let mamba = groups > 1;
             // The Mamba-2 `z`: `rows / groups` in-projection rows, each `stride` wide, the norm's
@@ -720,31 +678,28 @@ fn gdn_rms_norm_gated_simd_is_bit_identical_to_the_threadgroup_form() {
 }
 
 /// The simdgroup form's layout contract is a BAKE REFUSAL, not a convention: a key with a
-/// width the lane layout can't reduce (here 48 — not a power of two; the kernel's
-/// `static_assert` fires the same way on an unset rows-a-threadgroup) fails the bake's
-/// `xcrun metal`, instead of silently summing the wrong elements.
+/// width the lane layout can't reduce (here 48 — not a power of two) fails the bake's
+/// `xcrun metal` on the kernel's `static_assert`, instead of silently summing the wrong
+/// elements. The same key at an eligible width bakes first, so only the width refuses.
+/// `bake` only runs the offline compilers — no device — so this runs wherever the shaders
+/// build, CI's macOS runners included.
 #[test]
 #[should_panic(expected = "bake: `xcrun metal` failed")]
 fn gdn_rms_norm_gated_simd_refuses_an_ineligible_width() {
-    let Some(di) = detect_device() else {
-        // No Metal device (e.g. CI's paravirtual runner): the bake this test means to
-        // watch refuse can't run, so panic with the expected message to keep it green
-        // (effectively skipped) rather than failing "did not panic".
-        panic!("bake: `xcrun metal` failed — skipped: no Metal device");
+    let key = |d: u32| {
+        PipelineKey::new(
+            "gdn_rms_norm_gated",
+            "gdn_rms_norm_gated_simd_f32",
+            vec![
+                ConstantValue::uint(0, d),
+                ConstantValue::uint(1, 512),
+                ConstantValue::float(2, 1e-6),
+                ConstantValue::uint(6, 4),
+            ],
+        )
     };
-    let cache =
-        SpecializedPipelineCache::new(di.device.clone(), &[]).expect("compile standard shaders");
-    let key = PipelineKey::new(
-        "gdn_rms_norm_gated",
-        "gdn_rms_norm_gated_simd_f32",
-        vec![
-            ConstantValue::uint(0, 48),
-            ConstantValue::uint(1, 512),
-            ConstantValue::float(2, 1e-6),
-            ConstantValue::uint(6, 4),
-        ],
-    );
-    baked_build(&cache, &key).expect("the bake must refuse a width the lane layout can't reduce");
+    bake(&[key(64)]);
+    bake(&[key(48)]);
 }
 
 /// `gdn_conv1d_varlen_f32`, single fresh sequence (is_fresh=1, zero left-pad):

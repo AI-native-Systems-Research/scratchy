@@ -6720,12 +6720,12 @@ fn recurrent_scan(
     ]
 }
 
-/// A recurrent mixer's gated RMSNorm (`gdn_rms_norm_gated`) of the f32 scratch `o` into the
-/// model-dtype `out` (bindings `[out, z, weight]`): rows of `width` (`per_token` a token), one threadgroup a row of the power
 /// The simdgroup form's rows a threadgroup: the simdgroups a 128-thread covering threadgroup
 /// holds, and the divisor that keeps the X-axis `m_scaling` exact (see [`recurrent_norm`]).
 const NORM_ROWS_PER_TG: u32 = 4;
 
+/// A recurrent mixer's gated RMSNorm (`gdn_rms_norm_gated`) of the f32 scratch `o` into the
+/// model-dtype `out` (bindings `[out, z, weight]`): rows of `width` (`per_token` a token), one threadgroup a row of the power
 /// of two covering `width` (any power of two ≥ width sums in the same order); scales X. GDN
 /// norms per value head after the gate; Mamba-2 (`z_stride` = its in-projection row, `z` that
 /// row's leading columns) gates first and norms per group, its weight spanning the row.
