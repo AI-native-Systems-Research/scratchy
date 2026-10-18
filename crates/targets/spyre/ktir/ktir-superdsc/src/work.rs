@@ -588,8 +588,10 @@ pub fn distribute_cores_sticks_first(
     if let Some(s) = stick {
         let sticks = s.size.div_ceil(s.df.elems_per_stick());
         let mb_size = mb.map_or(1, |d| d.size);
-        // The stick split filling the most cores with `mb`, the larger stick split on a tie. 1 is always a
-        // candidate (it divides everything), so the search is never empty.
+        // The stick split filling the most cores with `mb`; ON A TIE, THE WIDER STICK SPLIT — the most
+        // contiguous sticks per core is what #549's (e) cells measured as the win, so among equal core
+        // counts the plan leans to `out`. 1 is always a candidate (it divides everything), so the search is
+        // never empty. Pinned against the whole candidate set by the exhaustive test.
         let (ss, ms) = (1..=sticks.min(max_cores))
             .filter(|c| sticks.is_multiple_of(*c))
             .map(|c| (c, core_split(mb_size, max_cores / c)))

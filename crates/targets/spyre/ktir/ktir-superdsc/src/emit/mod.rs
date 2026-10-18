@@ -701,7 +701,16 @@ fn pointwise_broadcast_opspec_df(
         df,
     };
     pointwise_broadcast_opspec_from_tile(
-        &tile_op, rows, cols, op, inputs, o_name, out_offset, head_major, layout,
+        &tile_op,
+        rows,
+        cols,
+        op,
+        inputs,
+        o_name,
+        out_offset,
+        head_major,
+        layout,
+        crate::work::EwDivision::Law,
     )
 }
 

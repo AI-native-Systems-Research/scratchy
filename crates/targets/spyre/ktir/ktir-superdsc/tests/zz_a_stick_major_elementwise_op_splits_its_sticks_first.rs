@@ -102,6 +102,25 @@ fn the_sticks_first_plan_tiles_every_shape_on_at_least_as_many_cores() {
             );
         }
         assert_eq!(seen.len() as u32, sm * so, "[{rows}, {cols}]: blocks owned");
+        // ⭐ THE TIE-BREAK: of every legal (out, mb) pair, the plan uses the MOST cores, and among the pairs
+        // that tie on cores it takes the WIDEST out — the most contiguous sticks per core, which is the
+        // win #549's (e) cells measured. Checked against the whole candidate set, not against the code's
+        // own search.
+        let sticks = cols / STICK;
+        let best = (1..=sticks.min(MAX_CORES))
+            .filter(|c| sticks.is_multiple_of(*c))
+            .flat_map(|c| {
+                (1..=(MAX_CORES / c).min(rows))
+                    .filter(move |m| rows.is_multiple_of(*m))
+                    .map(move |m| (c * m, c))
+            })
+            .max()
+            .unwrap();
+        assert_eq!(
+            (cores, so),
+            best,
+            "[{rows}, {cols}]: (cores, out) = ({cores}, {so}); the most cores, widest out on a tie, is {best:?}"
+        );
         cases += 1;
     }
     assert!(cases > 10_000, "the grid shrank to {cases} cases");
