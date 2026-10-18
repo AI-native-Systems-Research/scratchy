@@ -591,9 +591,8 @@ fn load_dir_mode(
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default();
-        let target = compiled_head_targets(spec, mtp).find(|(s, _)| s == stem);
         mtp_heads
-            && target.is_some_and(|(_, target)| {
+            && (compiled_head_targets(spec, mtp).filter(|(s, _)| s == stem)).any(|(_, target)| {
                 let (arch, stem) = target.split_once('/').unwrap_or_default();
                 model_feature_enabled(arch, stem)
             })
@@ -1697,6 +1696,10 @@ fn model_params_from_json(
     let mut layer_sets = derive_layer_sets(json, &mut bounds).map_err(layer_err)?;
     let aux = eagle_aux_layers(json, &bounds).map_err(layer_err)?;
     layer_sets.insert(EAGLE_AUX_LAYERS.to_string(), aux);
+    layer_sets.insert(
+        ATTENTION_BIAS_LAYERS.to_string(),
+        attention_bias_layers(json, &bounds),
+    );
     if let Some(limit) = binding_time_step_limit(json) {
         return Err(ConfigError::TimeStepLimit {
             path: source_path.to_path_buf(),
@@ -2014,7 +2017,7 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
     }
     spec.vision_norm_eps = json.get("vision_norm_eps").and_then(|v| v.as_f64());
     spec.tie_default = json.get("tie_default").and_then(|v| v.as_bool());
-    spec.head_targets = str_str_pairs(&path, &json, "head_targets")?;
+    spec.head_targets = head_target_pairs(&path, &json)?;
     // A variant is its config's stem (dense) or `<config>-<preset>`, as the variant loop of
     // `load_dir_mode` names it.
     let presets = declared_preset_names(&dir.join("quantizations.json"))?;
@@ -2262,6 +2265,38 @@ fn str_str_pairs(
         out.push((k.clone(), s.to_string()));
     }
     out.sort();
+    Ok(out)
+}
+
+/// `head_targets`: each head config's target config, or a list of them, as `(config, target)`
+/// pairs — a config of several targets a pair each, in the list's order.
+fn head_target_pairs(
+    path: &Path,
+    json: &serde_json::Value,
+) -> Result<Vec<(String, String)>, ConfigError> {
+    let Some(obj) = json.get("head_targets") else {
+        return Ok(Vec::new());
+    };
+    let fail = |reason: String| ConfigError::ArchJson {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let obj = (obj.as_object()).ok_or_else(|| fail("`head_targets` must be an object".into()))?;
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (config, targets) in obj {
+        let targets: Vec<&serde_json::Value> = match targets {
+            serde_json::Value::Array(list) if !list.is_empty() => list.iter().collect(),
+            target => vec![target],
+        };
+        for target in targets {
+            let target = target.as_str().ok_or_else(|| {
+                fail(format!(
+                    "`head_targets.{config}` must be a target config or a list of them"
+                ))
+            })?;
+            out.push((config.clone(), target.to_string()));
+        }
+    }
     Ok(out)
 }
 
@@ -2825,6 +2860,20 @@ fn eagle_aux_layers(
     members.sort_unstable();
     members.dedup();
     Ok(LayerSet(members))
+}
+
+/// The layer set whose attention projections carry biases (`if layer in attention_bias_layers:`):
+/// every layer of a config with `attention_bias: true` (a Llama-family config's flag), none
+/// otherwise — so one DSL serves both (AWS's P-EAGLE drafters: 120B's has them, 20B's not).
+const ATTENTION_BIAS_LAYERS: &str = "attention_bias_layers";
+
+fn attention_bias_layers(json: &serde_json::Value, bounds: &BTreeMap<String, u64>) -> LayerSet {
+    let biased = json.get("attention_bias").and_then(|b| b.as_bool()) == Some(true);
+    let layers = match biased {
+        true => bounds.get("num_hidden_layers").copied().unwrap_or(0),
+        false => 0,
+    };
+    LayerSet((0..layers).collect())
 }
 
 fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
@@ -3648,6 +3697,38 @@ mod tests {
             read_json_file(&repo_model_archs("gemma4").join("gemma-4-31b-it.json")).expect("json");
         assert_eq!(big["architectures"][0], "Gemma4ForConditionalGeneration");
         assert_ne!(big["text_config"]["hidden_size"], 2816);
+    }
+
+    /// AWS's 120B P-EAGLE drafters draft for both gpt-oss-120b configs (the quant presets' base and
+    /// the self-contained 3-bit), 20B's for gpt-oss-20b; only 120B's attention carries biases, on
+    /// every one of its layers.
+    #[test]
+    fn the_p_eagle_drafters_name_their_targets_and_their_attention_biases() {
+        let dir = repo_model_archs("p-eagle");
+        let spec = load_arch_json(&dir).expect("arch.json");
+        let targets = |head: &str| -> Vec<&str> {
+            (spec.head_targets.iter())
+                .filter(|(stem, _)| stem == head)
+                .map(|(_, target)| target.as_str())
+                .collect()
+        };
+        let biased = |stem: &str| -> Vec<u64> {
+            let path = dir.join(format!("{stem}.json"));
+            let (_, mut json) = read_json_file(&path).expect("json");
+            apply_overrides_file(&dir, stem, &mut json, &mut Vec::new()).expect("overrides");
+            let head =
+                model_params_from_json(&json, stem, &path, Vec::new(), &spec).expect("parse");
+            head.layer_sets[ATTENTION_BIAS_LAYERS].members().to_vec()
+        };
+        for stem in ["gpt-oss-120b-p-eagle", "gpt-oss-120b-p-eagle-mixed"] {
+            let both = ["gpt-oss/gpt-oss-120b", "gpt-oss/gpt-oss-120b-3bit"];
+            assert_eq!(targets(stem), both, "{stem}");
+            assert_eq!(biased(stem), [0, 1, 2, 3], "{stem}");
+        }
+        for stem in ["gpt-oss-20b-p-eagle", "gpt-oss-20b-p-eagle-mixed"] {
+            assert_eq!(targets(stem), ["gpt-oss/gpt-oss-20b"], "{stem}");
+            assert_eq!(biased(stem), [] as [u64; 0], "{stem}");
+        }
     }
 
     /// The parity-tiny configs keep every property the carrier gate

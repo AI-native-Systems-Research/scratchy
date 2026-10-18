@@ -1,0 +1,7 @@
+{
+  "_comment": "Under its target's MLX preset the drafter's own weights stay as AWS ships them (bf16): only the lm_head its target lends it is the target's MLX 4-bit/g64 triple. A per-module entry makes the map authoritative — every weight it does not list is dense, its own embedding among them.",
+  "quantization_config": {
+    "quant_embed": false,
+    "lm_head": { "bits": 4, "group_size": 64 }
+  }
+}

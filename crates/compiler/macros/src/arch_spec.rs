@@ -98,10 +98,12 @@ pub struct DeclaredArchSpec {
     /// inserted before its last `-`-delimited token (MLX: `org/X-4bit` → `org/X-MTP-4bit`).
     pub drafter_repo_infix: Option<String>,
     /// A head published as its own checkpoint, with a config of its own (Gemma 4's assistant):
-    /// each config stem's target config, `<arch>/<stem>`. It compiles when that target is selected
-    /// under `spec/mtp` (under `mtp-heads` too, for the config `published_as` names), the target's
-    /// verify steps carry its drafts, and it drafts for the target's architectures. Empty for a
-    /// head that ships inside its target's checkpoint (`checkpoint_of`).
+    /// each config stem's target configs, `<arch>/<stem>` — one, or several of one shape (an
+    /// arch.json list: P-EAGLE's 120B drafter drafts for gpt-oss-120b's quant presets and for its
+    /// self-contained 3-bit stem), a pair each. It compiles when one of those targets is selected
+    /// under `spec/mtp` (under `mtp-heads` too, for the config `published_as` names), each
+    /// target's verify steps carry its drafts, and it drafts for the targets' architectures (its
+    /// first's). Empty for a head that ships inside its target's checkpoint (`checkpoint_of`).
     pub head_targets: Vec<(String, String)>,
     /// The Hub repos the `head_targets` config its target drafts with by default is published
     /// as, one a compiled variant of it (a drafter checkpoint loads only into the variant of its

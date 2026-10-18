@@ -8,7 +8,10 @@
 # embedding and `mask_hidden` — so one forward drafts every token at once. `fc` fuses the three
 # hidden states into one, the residual its first layer adds to. That layer (`midlayer`) attends
 # over [its embedding's norm | the fused hidden state's norm]; three plain Llama decoder layers
-# follow, each with its own KV. The logits are its target's lm_head's, which it borrows.
+# follow, each with its own KV. The logits are its target's lm_head's, which it borrows. Its
+# attention projections carry biases where its config's `attention_bias` says
+# (`attention_bias_layers`: 120B's drafter has them, 20B's not); without, the `* 1.0`
+# passthrough (the if/else merge-carry rule) runs no command.
 import torch
 import torch.nn.functional as F
 
@@ -23,17 +26,41 @@ def p_eagle():
             q = gemm(x, midlayer.self_attn.q_proj)
             k = gemm(x, midlayer.self_attn.k_proj)
             v = gemm(x, midlayer.self_attn.v_proj)
+            if layer in attention_bias_layers:
+                q = bias_add(q, midlayer.self_attn.q_proj.bias)
+                k = bias_add(k, midlayer.self_attn.k_proj.bias)
+                v = bias_add(v, midlayer.self_attn.v_proj.bias)
+            else:
+                q = q * 1.0
+                k = k * 1.0
+                v = v * 1.0
         else:
             normed = rmsnorm(hidden_states, input_layernorm[layer])
             q = gemm(normed, self_attn.q_proj[layer])
             k = gemm(normed, self_attn.k_proj[layer])
             v = gemm(normed, self_attn.v_proj[layer])
+            if layer in attention_bias_layers:
+                q = bias_add(q, self_attn.q_proj.bias[layer])
+                k = bias_add(k, self_attn.k_proj.bias[layer])
+                v = bias_add(v, self_attn.v_proj.bias[layer])
+            else:
+                q = q * 1.0
+                k = k * 1.0
+                v = v * 1.0
         (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer])
         attn = attention(q, k, v, kv_cache[layer], block_table)
         if layer < 1:
             oproj = gemm(attn, midlayer.self_attn.o_proj)
+            if layer in attention_bias_layers:
+                oproj = bias_add(oproj, midlayer.self_attn.o_proj.bias)
+            else:
+                oproj = oproj * 1.0
         else:
             oproj = gemm(attn, self_attn.o_proj[layer])
+            if layer in attention_bias_layers:
+                oproj = bias_add(oproj, self_attn.o_proj.bias[layer])
+            else:
+                oproj = oproj * 1.0
         hidden_states = add(oproj, hidden_states)
 
         if layer < 1:
