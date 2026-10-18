@@ -152,6 +152,9 @@ pub struct ForwardInputs<'a> {
     pub device_inputs: &'a [DeviceInput],
     /// `Some`: the host does not wait for this forward ([`Deferral`]).
     pub deferred: Option<&'a Deferral>,
+    /// `Some`: work after this forward, in a command buffer the host does not wait for
+    /// ([`ForwardAfter`]).
+    pub after: Option<&'a dyn AfterForward>,
     /// What the caller reads of this forward.
     pub reads: ForwardReads,
 }
@@ -194,6 +197,69 @@ impl Deferral {
     /// The command buffer this forward was committed in; `None` if it never was.
     pub fn take_in_flight(&mut self) -> Option<InFlight> {
         self.in_flight.take()
+    }
+}
+
+/// Work a forward's command buffer is followed by — an MTP head's passes after its target, which
+/// read what the target left — in a command buffer of its own the host does not wait for: the
+/// forward returns once its own is done, its outputs ready to read, while this runs on. It starts
+/// once the forward is done; nothing may write what it reads until it is ([`Self::take_in_flight`]).
+pub struct ForwardAfter<'a> {
+    /// What the command buffer encodes, onto its compute encoder.
+    encode: std::cell::RefCell<Option<ForwardAfterEncode<'a>>>,
+    in_flight: std::sync::OnceLock<InFlight>,
+}
+
+/// [`ForwardAfter`]'s work, encoded onto its command buffer's compute encoder.
+pub type ForwardAfterEncode<'a> = Box<
+    dyn FnOnce(
+            &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        ) -> Result<(), String>
+        + 'a,
+>;
+
+impl<'a> ForwardAfter<'a> {
+    pub fn new(encode: ForwardAfterEncode<'a>) -> Self {
+        Self {
+            encode: std::cell::RefCell::new(Some(encode)),
+            in_flight: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The command buffer the work was committed in, to wait for before anything writes what it
+    /// reads; `None` if it never was.
+    pub fn take_in_flight(&mut self) -> Option<InFlight> {
+        self.in_flight.take()
+    }
+}
+
+/// What a forward's pool runs after it ([`ForwardAfter`]), as its inputs carry it: a reference to
+/// a trait object, so the inputs' lifetime is not the work's.
+pub trait AfterForward {
+    /// Encode the work onto the command buffer committed after the forward's — once.
+    fn encode(
+        &self,
+        enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+    ) -> Result<(), String>;
+
+    /// Record the command buffer the work was committed in.
+    fn committed(&self, in_flight: InFlight);
+}
+
+impl AfterForward for ForwardAfter<'_> {
+    fn encode(
+        &self,
+        enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+    ) -> Result<(), String> {
+        let work = (self.encode.borrow_mut().take()).ok_or("a forward's work after it, again")?;
+        work(enc)
+    }
+
+    fn committed(&self, in_flight: InFlight) {
+        assert!(
+            self.in_flight.set(in_flight).is_ok(),
+            "a forward's work after it is committed once"
+        );
     }
 }
 

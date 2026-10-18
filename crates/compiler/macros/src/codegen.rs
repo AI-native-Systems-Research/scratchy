@@ -15715,6 +15715,7 @@ pub fn emit_model(
                 mrope_cos_sin,
                 device_inputs: ctx.device_inputs,
                 deferred: ctx.deferred,
+                after: ctx.after,
                 reads: ctx.reads,
             };
             run(&inputs)

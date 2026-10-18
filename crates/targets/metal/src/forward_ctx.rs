@@ -140,6 +140,9 @@ pub struct ForwardCtx<'a> {
     /// `Some`: the host does not wait for this forward
     /// ([`crate::interpreter::metal::Deferral`]).
     pub deferred: Option<&'a crate::interpreter::metal::Deferral>,
+    /// `Some`: work after this forward, in a command buffer the host does not wait for
+    /// ([`crate::interpreter::metal::ForwardAfter`]).
+    pub after: Option<&'a dyn crate::interpreter::metal::AfterForward>,
     /// What the caller reads of this forward.
     pub reads: crate::interpreter::metal::ForwardReads,
 }

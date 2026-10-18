@@ -117,13 +117,19 @@
 //!   (`gdn_scan_simd_resumes_from_checkpoint`): two loops calling one inlined row lost the
 //!   bit-exactness (the varlen scan's replay 1 ULP off), the compiler contracting each copy apart.
 //!   Without a head both compile to the plain kernels (`GDN_SCAN_DRAFTS`, `GDN_CONV_DRAFTS` 0).
-//! - TODO: time to first token pays the head's prime over the prompt — what its KV write needs
-//!   over every prompt row — then its newest row whole and the chain. Per-dispatch GPU time on a
-//!   1588-row prompt chunk (base M5): 5.2 ms (prime 3.1, newest row 1.1, chain 1.0), from 34.2 ms
-//!   when every row ran the whole head; first token on a ~5.6k-token prompt +0.7% against main.
-//!   The prompt's last chunk drafts, so it is not deferred, and waits for the chunk still in
-//!   flight before its own inputs are written (~5 ms idle on the base M5): writing them on the
-//!   device, as a deferred step does, would let it queue behind that chunk.
+//! - TODO: time to first token pays the head's prime over a prompt's chunks before its last — what
+//!   their KV writes need over each row. The step that gives a request its first token runs its
+//!   head's passes after it, in a command buffer the host does not wait for (the worker's
+//!   `head_in_flight`), and drafts nothing: that token is the target's alone, and the next step,
+//!   which decodes without drafts, waits for the passes instead. An earlier chunk's prime runs in
+//!   its own step, before the next chunk overwrites the target hidden states it reads; moving it
+//!   past the first token means keeping them (a P-EAGLE target's 8640 wide, 17 KB a token). On a
+//!   base M5, gpt-oss-20b with P-EAGLE's 4 dense layers, the prime is 0.11 ms a prompt row
+//!   against the target's 0.47: first token +0% at 1920 tokens (one chunk), +12% at 5864 (three).
+//!   Qwen3.6's one-layer head: 5.2 ms of GPU time a 1588-row chunk (prime 3.1, newest row 1.1,
+//!   chain 1.0). The prompt's last chunk drafts, so it is not deferred, and waits for the chunk
+//!   still in flight before its own inputs are written (~5 ms idle on the base M5): writing them
+//!   on the device, as a deferred step does, would let it queue behind that chunk.
 //! - TODO: the next step is scheduled once the host has read this one's tokens and drafts (#240:
 //!   pipelined cycles). Its inputs are on the device already.
 //! - TODO: choose `k` per bucket. `spec_drafts` is one constant for every bucket, because the
