@@ -2259,7 +2259,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
             .collect(),
         synth,
         // Pinned-LX registry starts empty (stick 1024 base): it fills only when a
-        // decomposition declares an intermediate via `BundleLayout::synth_lx` (the
+        // decomposition declares an intermediate via `BundleLayout::synth_lx_op_local` (the
         // exx2 rmsnorm `rinv` stick) — every other bundle leaves it untouched.
         lx: Default::default(),
         arrangements: std::cell::RefCell::new(std::collections::BTreeMap::new()),

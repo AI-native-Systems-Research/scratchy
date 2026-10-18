@@ -77,7 +77,7 @@ pub fn assemble_rmsnorm(
         ] {
             l.synth(out_id.synth(r), &dims);
         }
-        // `rinv` is PINNED-LX, not seg3-HBM (`synth_lx`): its consumer reads a SUB-STICK lane
+        // `rinv` is PINNED-LX, not seg3-HBM (`synth_lx_op_local`): its consumer reads a SUB-STICK lane
         // (element 8 of the exx2 pair — see step 4 below), and a sub-stick read offset survives
         // the compile chain only on the LX path. On HBM the +16B is floored away twice over —
         // the L3 EBR is stick-granular (the reader's allocate carries the offset but the
@@ -92,7 +92,7 @@ pub fn assemble_rmsnorm(
         // The producer side of the pin: LX is per-core private, so `apply_lx_residency`
         // replicates `rmrsqrt` across all cores (each computes the whole [rows, stk] stick into
         // its own scratchpad) and the reader's own slice corner selects its rows there.
-        l.synth_lx(out_id.synth(R::Rinv), &[rows, stk]);
+        l.synth_lx_op_local(out_id.synth(R::Rinv), &[rows, stk]);
         if ones_const.is_some() {
             l.synth(out_id.synth(R::Gw), &[1, cols]);
         }
@@ -183,7 +183,7 @@ pub fn assemble_rmsnorm(
     //    saturated, degenerate generation. The half-stick map is the DDL's, not a guess.
     //    The +8 elements (= +16 B, one fp16 word past the pair's first slot) rides the reader's
     //    allocate through the ordinary slice-offset machinery — and because `rinv` is LX-pinned,
-    //    that byte lands BYTE-exact in the reader's lxlu address (see the `synth_lx` note above
+    //    that byte lands BYTE-exact in the reader's lxlu address (see the `synth_lx_op_local` note above
     //    for why the same offset on HBM is silently floored to element 0).
     ops.push(pw2(
         &format!("rmxn_{prefix}"),

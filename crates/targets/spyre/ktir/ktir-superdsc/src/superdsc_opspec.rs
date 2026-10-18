@@ -1612,7 +1612,7 @@ pub enum OpFunc {
     /// half's first element with a one-element view step ([`crate::emit::In::col_at`] +
     /// `DevOff::from_view_step(8)`): `rsqrt(E[x²]+eps)·γ` is RMS norm's exact math either way.
     /// ⚠ THAT VIEW STEP IS LX-ONLY: a sub-stick offset on a collapsed stick dim survives the
-    /// compile chain only when the operand is LX-pinned (`BundleLayout::synth_lx`) — on HBM the
+    /// compile chain only when the operand is LX-pinned (`BundleLayout::synth_lx_op_local`) — on HBM the
     /// L3 EBR floors it to the stick base and the reader's 2bsplat reads element 0 instead
     /// (silently wrong, green bake — the failure mode this chain's first three card runs hit).
     /// See [`crate::placement::LxAlloc`] for the measured details.

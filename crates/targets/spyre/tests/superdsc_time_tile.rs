@@ -345,14 +345,14 @@ fn reduce_and_multiop_invariants() {
 }
 
 // ── PINNED-LX rinv — the residency half of the lane-read contract. The `+16B` element-8 read
-//    only survives the compile chain when rinv is LX-pinned (`BundleLayout::synth_lx`): on HBM
+//    only survives the compile chain when rinv is LX-pinned (`BundleLayout::synth_lx_op_local`): on HBM
 //    the L3 EBR floors a sub-stick offset to the stick base and the reader's 2bsplat reads
 //    element 0 (rsqrt(E[x]+eps), a saturated constant — the green-bake garbage of the first
 //    three card runs). An LX allocate is byte-granular end-to-end, so the offset lands
 //    BYTE-exact. This pins the wire shape that mechanism emits.
 #[test]
 fn rmsnorm_rinv_is_pinned_lx() {
-    use ktir_superdsc::placement::{BundleLayout, LX_PIN_BASE, SegRole, TensorPlacement};
+    use ktir_superdsc::placement::{BundleLayout, LX_PIN_END, SegRole, TensorPlacement};
     use scratchy_target_spyre::bundle_code::PlaceId;
 
     // A minimal layout holding the chain's real operands (x / gamma / eps / out), so
@@ -434,18 +434,22 @@ fn rmsnorm_rinv_is_pinned_lx() {
             .all(|v| v.as_u64() == Some(1)),
         "a replicated plan carries NO work-division splits"
     );
-    // The allocate: an `lx` component at the PIN, same byte on every core.
+    // The allocate: an `lx` component at the PIN, same byte on every core. The pin is a
+    // TOP-DOWN op-local slot (#645): the rinv's footprint class reserves
+    // [LX_PIN_END − fp, LX_PIN_END), so every norm of the class shares this one address.
     let node = alloc(&wj, "rmrsqrt_g", 1);
     assert_eq!(node["name_"], "allocate-Tensor1_lx");
     assert_eq!(node["component_"], "lx");
+    let rinv_fp = 64u64 * 64 * FP16_BYTES; // [rows=64, stick=64] f16 — the class footprint
     for (k, v) in node["startAddressCoreCorelet_"]["data_"]
         .as_object()
         .unwrap()
     {
         assert_eq!(
             v.as_str(),
-            Some(LX_PIN_BASE.to_string().as_str()),
-            "rmrsqrt's rinv pin must be the LX base on every core ({k})"
+            Some((LX_PIN_END - rinv_fp).to_string().as_str()),
+            "rmrsqrt's rinv pin must be the top-down op-local slot's start, below {LX_PIN_END}, \
+             on every core ({k})"
         );
     }
     // The lds: lx-ONLY residency — no HBM copy exists, so no L3 movement is generated.
@@ -464,14 +468,15 @@ fn rmsnorm_rinv_is_pinned_lx() {
     let rnode = alloc(&rj, "rmxn_g", 1);
     assert_eq!(rnode["component_"], "lx");
     let pin_str = |s: u64| s.to_string();
+    let pin = LX_PIN_END - rinv_fp; // the class slot's start (top-down, below LX_PIN_END)
     assert_eq!(
         rnode["startAddressCoreCorelet_"]["data_"]["[0, 0, 0]"].as_str(),
-        Some(pin_str(LX_PIN_BASE + 8 * FP16_BYTES).as_str()),
+        Some(pin_str(pin + 8 * FP16_BYTES).as_str()),
         "rmxn reads rinv at pin + element-8 byte offset (the E[x²] lane)"
     );
     assert_eq!(
         rnode["startAddressCoreCorelet_"]["data_"]["[1, 0, 0]"].as_str(),
-        Some(pin_str(LX_PIN_BASE + 8 * FP16_BYTES + 2 * 64 * FP16_BYTES).as_str()),
+        Some(pin_str(pin + 8 * FP16_BYTES + 2 * 64 * FP16_BYTES).as_str()),
         "core 1's rinv corner = its 2-row work slice (2 rows × one stick) past the pin"
     );
 
@@ -480,13 +485,16 @@ fn rmsnorm_rinv_is_pinned_lx() {
     let ops1 = run(1);
     let (_, rj1) = json_of(&ops1[3]);
     let rnode1 = alloc(&rj1, "rmxn_g", 1);
+    // The m=1 run lowers under its OWN layout: the [1,64] class slots at its own top-down
+    // address, one stick below the boundary.
+    let pin1 = LX_PIN_END - 64 * FP16_BYTES;
     for (k, v) in rnode1["startAddressCoreCorelet_"]["data_"]
         .as_object()
         .unwrap()
     {
         assert_eq!(
             v.as_str(),
-            Some(pin_str(LX_PIN_BASE + 8 * FP16_BYTES).as_str()),
+            Some(pin_str(pin1 + 8 * FP16_BYTES).as_str()),
             "at m=1 every reader core reads the SAME pinned lane ({k})"
         );
     }
