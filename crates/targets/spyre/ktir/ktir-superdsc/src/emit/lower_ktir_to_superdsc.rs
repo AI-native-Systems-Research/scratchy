@@ -7175,6 +7175,73 @@ pub fn expert_combine(
     Ok(ops)
 }
 
+/// ⭐ THE EXPERT LANDING'S ONE HEAD-SLOT LAW, IN STICKS — pair `s`'s replica-run head.
+///
+/// [`route_topk`]'s landing is the REPLICA law, not compact ids: result `r` is
+/// written replicated at slots `[r·rep, (r+1)·rep)` of the ring's 64 slot-words
+/// (`rep = 64/k`, the slots-per-core form — at `k = 8`, slots 0..7 all hold
+/// `r0`), and the door-minted flat u32 index `XIdx` `[64, m_pad]` carries the
+/// same law transposed: result `s`'s run of `rep·m_pad` elements starts at flat
+/// element `(s·rep)·m_pad` and holds `r_s` throughout. A single `k`-entry run
+/// from entry 0 over that landing reads `r0` `k` times (the W30 `expert-99×4`
+/// defect class), so every gather that wants pair `s`'s result addresses its
+/// run's HEAD instead — `(s·rep)·m_pad` elements in, which is `s·rep·m_pad/32`
+/// sticks in (exact: `m_pad` is a 64-multiple). That stick is this function's
+/// return.
+///
+/// ⛔ ONE LAW, EVERY READER — the per-op expert door's weight, scale and
+/// fine-index gathers and the whole-function door's W8A8 emission ALL address
+/// `route_topk`'s landing through this function, so no two doors can disagree
+/// about where pair `s`'s expert id lives. `rep` arrives pre-guarded (`k`
+/// divides 64 at every caller), so the arithmetic here is total. A compact-ids
+/// landing (fewer gather ops) is a measured proposal of its own — never a
+/// silent change at any of this function's callers.
+fn expert_head_slot_sticks(s: u32, rep: u32, m_pad: u32) -> u32 {
+    s * rep * m_pad / Df::SenUint32.elems_per_stick()
+}
+
+#[cfg(test)]
+mod expert_head_slot_tests {
+    use super::*;
+
+    /// The landing law, at the shapes the doors state it: `rep = 64/k` and the
+    /// head slots are `s·rep·m_pad/32` sticks. Two facts are pinned per shape,
+    /// not the arithmetic alone:
+    ///   · INTEGRALITY — pair `s`'s head ELEMENT base `(s·rep)·m_pad` is exactly
+    ///     the returned stick's first entry (`stick·32 == element base`), so no
+    ///     gather ever lands mid-stick;
+    ///   · TILING — pair `s`'s run is `rep·m_pad` elements and the `k` pairs'
+    ///     runs tile the whole `[64, m_pad]` index exactly once, so two pairs
+    ///     can never share a head stick's run and no slot of the landing is
+    ///     left unaddressed.
+    /// `k ∈ {2, 4, 8}` sweeps the shipped top-k forms; `m_pad ∈ {64, 128}`
+    /// covers both the m=1 recognizer shape and the m>1 gathered walks'.
+    #[test]
+    fn head_slots_are_integral_and_tile_the_replica_landing() {
+        for k in [2u32, 4, 8] {
+            let rep = crate::work::FP16_ELEMS_PER_STICK / k;
+            for m_pad in [64u32, 128] {
+                for s in 0..k {
+                    let sticks = expert_head_slot_sticks(s, rep, m_pad);
+                    let element_base = s * rep * m_pad;
+                    assert_eq!(
+                        sticks * Df::SenUint32.elems_per_stick(),
+                        element_base,
+                        "k={k} m_pad={m_pad}: pair {s}'s head stick must START its element run"
+                    );
+                }
+                // The k runs are disjoint and cover the flat index exactly: the
+                // last pair's run END is the whole tensor's element count.
+                assert_eq!(
+                    k * rep * m_pad,
+                    crate::work::FP16_ELEMS_PER_STICK * m_pad,
+                    "k={k} m_pad={m_pad}: the pairs' runs must tile the whole [64, m_pad] landing"
+                );
+            }
+        }
+    }
+}
+
 /// The per-`Program` door for [`crate::ktir_node::Program::ExpertMatmul`] —
 /// one projection of each `(token, slot)` pair's expert over the stacked
 /// `[E·out, in]` fp8 weight bank, the gathered form of the dense W8A8 body.
@@ -7690,8 +7757,10 @@ pub fn expert_matmul(
                         None,
                         Some(crate::superdsc_opspec::GatherIndex::of_expert_planes(
                             xidx_s.clone(),
+                            // Result s's head slot — the one landing law
+                            // ([`expert_head_slot_sticks`]).
                             crate::superdsc_opspec::EntryBase::of_sticks(
-                                s * rep * m_pad / idx_stick,
+                                expert_head_slot_sticks(s, rep, m_pad),
                             ),
                         )),
                     )
@@ -7752,9 +7821,11 @@ pub fn expert_matmul(
                 // 32-entry u32 stick): a copy op names at most one index stick, so the slot's
                 // m-entry run is split into `cap`-entry runs, the same `step_by` the m=1 walks
                 // state. Run `r` covers u32 elements `s·rep·m_pad + first .. +entries` — result
-                // s's HEAD SLOT's run (the landing's replica law), the same base P3 reads;
-                // `m_pad` is a 64-multiple and `first` steps by 32, so the run's index stick
-                // `(s·rep·m_pad + first)/32` is integral by arithmetic.
+                // s's HEAD SLOT's run (the landing's replica law, the same base P3 reads through
+                // [`expert_head_slot_sticks`]) advanced by `first` entries. The stick base
+                // decomposes exactly — the head slot and `first` are both 32-multiples (`m_pad`
+                // is a 64-multiple; `first` steps by 32) — so head sticks + `first/32` is the
+                // run's index stick by arithmetic.
                 for (r, first) in (0..rows).step_by(cap as usize).enumerate() {
                     let entries = cap.min(rows - first);
                     ops.push(
@@ -7767,7 +7838,7 @@ pub fn expert_matmul(
                             crate::superdsc_opspec::GatherIndex::of_expert_planes(
                                 xidx_s.clone(),
                                 crate::superdsc_opspec::EntryBase::of_sticks(
-                                    (s * rep * m_pad + first) / idx_stick,
+                                    expert_head_slot_sticks(s, rep, m_pad) + first / idx_stick,
                                 ),
                             ),
                             crate::superdsc_opspec::GatherRun::split(
@@ -7853,8 +7924,6 @@ pub fn expert_matmul(
     // so this door only READS the u32 index — no convert of its own, and the
     // fp16→u32 slice-equality law (unary_parallel.ddl:59, the two-leg chain the
     // trio states) is the door's, not this body's.
-    // The u32 index's own stick width — every head-stick base below is stated in sticks.
-    let idx_stick = Df::SenUint32.elems_per_stick();
     // ── 1b. THE FINE INDEX (sub > 1 only) ────────────────────────────────
     // One gather of the `[E, sub]` const bank BY THE RAW INDEX mints the fine index `xsub`:
     // entry `i` of index stick `s` is the expert id `e`; the page is ONE u32 stick (bank row
@@ -7875,9 +7944,10 @@ pub fn expert_matmul(
         // `rep·m_pad` u32 elements apart, so no contiguous run covers two of them
         // (the old contiguous run read the staged `[1, W]` window, whose halved
         // convert + replica content staged the top-2 experts ×4 — card-measured).
-        // Pair p's entry is the FIRST entry of stick `(p·rep)·m_pad/32` — element
-        // `(p·rep)·m_pad`, result p's head — which the m=1 token broadcast holds
-        // at pair p's expert id for the stick's whole 32 entries.
+        // Pair p's entry is the FIRST entry of its head stick
+        // ([`expert_head_slot_sticks`]) — element `(p·rep)·m_pad`, result p's
+        // head — which the m=1 token broadcast holds at pair p's expert id for
+        // the stick's whole 32 entries.
         for p in 0..pairs {
             ops.push(
                 crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
@@ -7892,7 +7962,7 @@ pub fn expert_matmul(
                         page: crate::superdsc_opspec::PageExtent::single_position(),
                         per_position: None,
                         first_entry: crate::superdsc_opspec::EntryBase::of_sticks(
-                            p * rep * m_pad / idx_stick,
+                            expert_head_slot_sticks(p, rep, m_pad),
                         ),
                     },
                     // Dest entry `p` covers `sub` words at `p·sub` — pair `p`'s own
@@ -7957,10 +8027,10 @@ pub fn expert_matmul(
     };
     if sub == 1 {
         // ⭐ THE UNCUT WALK — one op per (chunk, PAIR), the raw expert-id index, ONE ENTRY
-        // per op: pair p's head stick `(p·rep)·m_pad/32` of the door-minted flat index, the
-        // whole page per entry. The replica-run heads are strided `rep·m_pad` elements apart,
-        // so no contiguous run covers two of them — the same per-pair law the fine gather
-        // states, at the uncut page unit.
+        // per op: pair p's head stick ([`expert_head_slot_sticks`]) of the door-minted flat
+        // index, the whole page per entry. The replica-run heads are strided `rep·m_pad`
+        // elements apart, so no contiguous run covers two of them — the same per-pair law
+        // the fine gather states, at the uncut page unit.
         for c in 0..chunks {
             for p in 0..pairs {
                 // Chunk 0 keeps the shipped name (the attn chunk-cut's own law:
@@ -7980,7 +8050,7 @@ pub fn expert_matmul(
                         page: crate::superdsc_opspec::PageExtent::of_positions(page_w),
                         per_position: None,
                         first_entry: crate::superdsc_opspec::EntryBase::of_sticks(
-                            p * rep * m_pad / idx_stick,
+                            expert_head_slot_sticks(p, rep, m_pad),
                         ),
                     },
                     // ⛔ THE DESTINATION IS CHUNK-MAJOR: entry `c·pairs + p`
@@ -8050,8 +8120,9 @@ pub fn expert_matmul(
     // arithmetic the weight gather states at its own format.
     let page_s = n / stk16;
     // ⭐ ONE OP PER PAIR, ONE ENTRY PER OP — the same head-stick law the weight
-    // walks state: pair p's entry is stick `(p·rep)·m_pad/32`'s first entry of the
-    // door-minted flat index (result p's expert id), staged at dest entry `p`.
+    // walks state through [`expert_head_slot_sticks`]: pair p's entry is the
+    // first entry of its head stick of the door-minted flat index (result p's
+    // expert id), staged at dest entry `p`.
     for p in 0..pairs {
         // The scale gather needs no chunk base: the scale bank stays EXPERT-major (its
         // `page·64 = n` fp16-element `skip_addr` is one bank row of the `[E·n]` stack —
@@ -8069,7 +8140,7 @@ pub fn expert_matmul(
                     page: crate::superdsc_opspec::PageExtent::of_positions(page_s),
                     per_position: None,
                     first_entry: crate::superdsc_opspec::EntryBase::of_sticks(
-                        p * rep * m_pad / idx_stick,
+                        expert_head_slot_sticks(p, rep, m_pad),
                     ),
                 },
                 // The scale bank is expert-major and its entries are whole bank rows —
@@ -8647,7 +8718,10 @@ pub fn route_argsort(
 ///   EVERY `m`: the decode arm's own staged converts are DEAD (their widening
 ///   halved the element stream and their `[1, W]` window read replica runs —
 ///   the 26b's top-2×4 staging), so this trio is the only index mint and the
-///   m=1 gathers read entries `0..k` of the head-slot runs.
+///   m=1 gathers read entries `0..k` of the head-slot runs. This landing is
+///   the WRITER of the head-slot law; [`expert_head_slot_sticks`] is its one
+///   reader-side spelling — every gather that addresses a pair's run goes
+///   through it, so writer and readers cannot drift.
 /// • THE LANDING TRANSPOSES re-orient the pair's slot-major outputs
 ///   token-major `[m_pad, 64]` — the form every consumer already reads: the
 ///   softmax's `rb[x, m, k_pad]`, the scalarmul, the combine, and the mint's
