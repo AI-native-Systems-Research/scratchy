@@ -7423,9 +7423,11 @@ impl ChunkScratch {
     /// part. Kᵗ stays in LX only with no tail of its own ([`ChunkLx::keys`]).
     ///
     /// `Some` exactly where:
-    ///   * the rows are ONE REQUEST's decode ([`ChunkRowKind::OneRequest`]). Only that PV divides its
-    ///     contraction across the cores; a prompt chunk divides its rows, and a batch chunk's rows are
-    ///     other requests;
+    ///   * the rows are a DECODE's: one request's ([`ChunkRowKind::OneRequest`]) or a decode batch's
+    ///     ([`ChunkRowKind::Batch`]). Both PVs divide their contraction across the cores (the batch's
+    ///     `gqa·B` rows are a few dozen against a contraction `B·J` pages deep), so core `c` reads the
+    ///     same run of slots under either. A prompt chunk divides its rows instead, and keeps the HBM
+    ///     scratch;
     ///   * the chunk has ONE or TWO feature slabs ([`Self::LX_SLABS`]): head dim 64 (card-proven,
     ///     granite-2b) or 128 (granite-8b, whose 16 KiB Kᵗ entry under a two-stick score contraction dxp
     ///     accepts);
@@ -7448,7 +7450,7 @@ impl ChunkScratch {
     pub const fn lx_form(self, rows: ChunkRowKind) -> Option<ChunkLx> {
         let one_stick = CopyDims::ENTRIES_PER_OP;
         let (eph, slabs) = (self.entries_per_head_page(), self.plane.slabs());
-        if !matches!(rows, ChunkRowKind::OneRequest)
+        if matches!(rows, ChunkRowKind::Prompt)
             || slabs == 0
             || slabs > Self::LX_SLABS
             || one_stick != crate::superdsc_opspec::MAX_CORES

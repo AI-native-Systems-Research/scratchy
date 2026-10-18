@@ -130,9 +130,16 @@ fn the_hd128_lx_form_covers_exactly_the_rungs_its_pins_fit() {
     let mut admitted = Vec::new();
     for &j in &ChunkScratch::LADDER {
         let chunk = ChunkScratch::of_chunk(pool(), j).unwrap();
-        for rows in [ChunkRowKind::Prompt, ChunkRowKind::Batch] {
-            assert!(chunk.lx_form(rows).is_none(), "{j} page(s), {rows:?}");
-        }
+        assert!(
+            chunk.lx_form(ChunkRowKind::Prompt).is_none(),
+            "{j} page(s), prompt"
+        );
+        // A decode batch's chunk takes the same LX form: the law reads only the chunk's pages.
+        assert_eq!(
+            chunk.lx_form(ChunkRowKind::Batch),
+            chunk.lx_form(ChunkRowKind::OneRequest),
+            "{j} page(s), batch"
+        );
         // Kᵗ: one 16 KiB tensor per (8-page part, kv head). V: one per (16-page part, kv head, slab).
         // Both come to `pages * nkvh / 8` entries a core.
         let k_pages = if j % 8 == 0 { j } else { 0 };

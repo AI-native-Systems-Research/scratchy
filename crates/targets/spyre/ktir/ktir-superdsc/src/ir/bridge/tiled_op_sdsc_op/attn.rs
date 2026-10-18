@@ -2505,6 +2505,15 @@ fn assemble_attn_chunk(
         for (p, part) in chunk.slot_parts(keys.part_pages()).enumerate() {
             let k_name = kt[keys.tensor(p as u32, kvh) as usize].as_str();
             let pc = corner(part.probs_corner(blocks, b), "a row block's score part")?;
+            // The part's columns of the mask. A shared history is one broadcast row, so they start
+            // `first_slot` in. A batch's per-row block is RowBlocked `[rows, slots]` like the score block it
+            // clones, so they start `first_slot · rows` in: row block 0's own part corner.
+            let mask_off = match history {
+                ChunkHistory::Shared => DevOff::of_chunk_corner(part.row_corner()),
+                ChunkHistory::Requests(_) => {
+                    corner(part.probs_corner(blocks, 0), "the batch mask's score part")?
+                }
+            };
             ops.push(assemble_matmul_off_with_epilogue(
                 &format!("attn_csc_{}_k{p}_o{t}", blk_name(b)),
                 m,
@@ -2521,7 +2530,7 @@ fn assemble_attn_chunk(
                 &rb(&cb.csc, b_rows, slots),
                 pc,
                 &mask_h,
-                DevOff::of_chunk_corner(part.row_corner()),
+                mask_off,
                 EpilogueOpFunc::StridedAdd,
                 mask_dims,
                 true,
