@@ -677,29 +677,42 @@ fn gdn_rms_norm_gated_simd_is_bit_identical_to_the_threadgroup_form() {
     }
 }
 
+/// The simdgroup form's pipeline key at width `d` (512 rows, eps 1e-6, 4 rows a
+/// threadgroup) — the key both bake tests below share, so the refusal is the width
+/// and nothing else.
+fn gdn_rms_norm_gated_simd_key(d: u32) -> PipelineKey {
+    PipelineKey::new(
+        "gdn_rms_norm_gated",
+        "gdn_rms_norm_gated_simd_f32",
+        vec![
+            ConstantValue::uint(0, d),
+            ConstantValue::uint(1, 512),
+            ConstantValue::float(2, 1e-6),
+            ConstantValue::uint(6, 4),
+        ],
+    )
+}
+
+/// The simdgroup form bakes at an eligible width (64 — a power of two in [32, 256],
+/// rows a threadgroup set): the refusal test's own key with only the width changed,
+/// so a refusal there is the width's `static_assert` and not a shader that fails to
+/// compile. `bake` only runs the offline compilers — no device — so this runs wherever
+/// the shaders build, CI's macOS runners included.
+#[test]
+fn gdn_rms_norm_gated_simd_bakes_an_eligible_width() {
+    bake(&[gdn_rms_norm_gated_simd_key(64)]);
+}
+
 /// The simdgroup form's layout contract is a BAKE REFUSAL, not a convention: a key with a
 /// width the lane layout can't reduce (here 48 — not a power of two) fails the bake's
 /// `xcrun metal` on the kernel's `static_assert`, instead of silently summing the wrong
-/// elements. The same key at an eligible width bakes first, so only the width refuses.
-/// `bake` only runs the offline compilers — no device — so this runs wherever the shaders
-/// build, CI's macOS runners included.
+/// elements. The eligible-width bake above proves the same key compiles, so only the
+/// width refuses here. `bake` only runs the offline compilers — no device — so this runs
+/// wherever the shaders build, CI's macOS runners included.
 #[test]
 #[should_panic(expected = "bake: `xcrun metal` failed")]
 fn gdn_rms_norm_gated_simd_refuses_an_ineligible_width() {
-    let key = |d: u32| {
-        PipelineKey::new(
-            "gdn_rms_norm_gated",
-            "gdn_rms_norm_gated_simd_f32",
-            vec![
-                ConstantValue::uint(0, d),
-                ConstantValue::uint(1, 512),
-                ConstantValue::float(2, 1e-6),
-                ConstantValue::uint(6, 4),
-            ],
-        )
-    };
-    bake(&[key(64)]);
-    bake(&[key(48)]);
+    bake(&[gdn_rms_norm_gated_simd_key(48)]);
 }
 
 /// `gdn_conv1d_varlen_f32`, single fresh sequence (is_fresh=1, zero left-pad):
