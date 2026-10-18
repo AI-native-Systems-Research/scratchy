@@ -62,11 +62,14 @@ What a full sweep measures, per model and dtype:
   at every bucket;
 - **batch scaling:** the same cells at the other batch rungs the page rows
   its grids by — 4 and 8 requests decoded at once (16 and up corrupt on
-  this stack, so 8 is the cap). Past batch 1, decode is measured as
-  throughput — decoded tokens per second at that batch, at `~1k` so far —
-  and the page lights a decode grid's squares at that rung from those
-  `tok_s` cells. `conc` in the file is the batch: the offered concurrency,
-  both stacks serving that many requests at once.
+  this stack, so 8 is the cap). Past batch 1, record both where the
+  harnesses give both: decode as `itl_ms` (each request's median
+  inter-token latency under that batch, TPOT — the like-for-like metric,
+  which the page prefers for a decode square) and as `tok_s` (decoded
+  tokens per second at that batch, for the concurrency blocks); a decode
+  square with no `itl_ms` cell lights from its `tok_s` cell. `conc` in the
+  file is the batch: the offered concurrency, both stacks serving that many
+  requests at once.
 
 A cell needs both sides, measured in this sweep. When one side can't run a
 cell (torch-spyre's fp8 path past short context, say), leave the cell out:
