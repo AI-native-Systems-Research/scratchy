@@ -343,10 +343,20 @@ pub struct SynthAlloc {
     pub sizes: std::collections::BTreeMap<String, u64>,
 }
 
-/// LX scratchpad size per core: 2 MiB (`sysdef.cpp:587`, `lxSize = 2L*1024*1024`). The hard
-/// ceiling every pinned LX address + footprint must fit under — a build-time fact, so the
-/// pin allocator's overflow is a `cargo build` panic and never an on-card wraparound.
+/// LX scratchpad size per core: 2 MiB (`sysdef.cpp:587`, `lxSize = 2L*1024*1024`).
 pub const LX_SIZE: u64 = 2 * 1024 * 1024;
+
+/// ⭐ THE CEILING EVERY PINNED LX ADDRESS + FOOTPRINT MUST FIT UNDER — the frontend's end of the LX
+/// split, [`crate::superdsc_opspec::FRONTEND_LX_END`] (1,625,344 B), not the 2 MiB scratchpad. dxp
+/// allocates its own landings and staging from that address up (dbo's `reserveFrontendLx`), and it
+/// does not know about our pins. A pin past it would share bytes with them on card. The pin allocator's
+/// overflow is a `cargo build` panic, never an on-card overlap.
+pub const LX_PIN_END: u64 = crate::superdsc_opspec::FRONTEND_LX_END;
+
+const _: () = assert!(
+    LX_PIN_BASE < LX_PIN_END && LX_PIN_END <= LX_SIZE,
+    "the pinning window [LX_PIN_BASE, LX_PIN_END) lies inside the scratchpad"
+);
 
 /// Where PINNED LX-resident intermediates start: stick 1024. The runtime's own L3 landing
 /// allocator demonstrably never touches the low region — every landing in a real 128-dsc
@@ -486,9 +496,9 @@ impl BundleLayout {
     /// lifetimes would allow sharing, so correctness never leans on emission order. Idempotent
     /// per name.
     ///
-    /// ⛔ PANICS on overflow past [`LX_SIZE`] — this runs at `#[forward]` expansion, so the
+    /// ⛔ PANICS on overflow past [`LX_PIN_END`] — this runs at `#[forward]` expansion, so the
     /// panic IS the cargo-build guard: a bundle whose pinned intermediates do not fit the
-    /// 2 MiB scratchpad is unbuildable, not silently wrapping into unmapped LX.
+    /// frontend's LX window is unbuildable, not silently overlapping dxp's own LX allocations.
     pub fn synth_lx(&self, id: PlaceId, dims: &[u32]) {
         let name = id.to_string();
         self.ids.borrow_mut().insert(name.clone(), id);
@@ -501,12 +511,12 @@ impl BundleLayout {
         a.next = o + fp;
         let end = a.next;
         assert!(
-            end <= LX_SIZE,
-            "pinned-LX intermediates overflow the 2 MiB per-core scratchpad: '{name}' pins at \
-             {o} with footprint {fp}, pushing the region to {end} > {LX_SIZE}. LX-resident \
-             intermediates are for small per-row scalars (the rmsnorm rinv stick); a tensor \
-             this large belongs in the HBM Intermediate segment (declare it with \
-             `BundleLayout::synth` instead)."
+            end <= LX_PIN_END,
+            "pinned-LX intermediates overflow the frontend's LX window: '{name}' pins at {o} with \
+             footprint {fp}, pushing the region to {end} > {LX_PIN_END}, where dxp's own LX \
+             allocations begin. LX-resident intermediates are for small per-row scalars (the \
+             rmsnorm rinv stick); a tensor this large belongs in the HBM Intermediate segment \
+             (declare it with `BundleLayout::synth` instead)."
         );
         a.map.insert(name.clone(), o);
         a.sizes.insert(name, fp);
@@ -522,7 +532,7 @@ impl BundleLayout {
     /// whatever core `c`'s producer pass wrote. The emitter records the first op's division and refuses
     /// every op that differs, at build ([`Self::record_lx_division`]).
     ///
-    /// ⛔ PANICS past [`LX_SIZE`], the same `cargo build` guard as [`Self::synth_lx`].
+    /// ⛔ PANICS past [`LX_PIN_END`], the same `cargo build` guard as [`Self::synth_lx`].
     pub fn synth_lx_core_local(&self, id: PlaceId, per_core_bytes: u64) {
         let name = id.to_string();
         self.ids.borrow_mut().insert(name.clone(), id);
@@ -535,11 +545,11 @@ impl BundleLayout {
         a.next = o + fp;
         let end = a.next;
         assert!(
-            end <= LX_SIZE,
-            "a core-local LX intermediate overflows the 2 MiB per-core scratchpad: '{name}' pins at \
-             {o} with a {fp}-byte per-core slice, pushing the region to {end} > {LX_SIZE}. Cut the op \
-             into smaller parts so one core's slice fits, or keep the tensor in HBM \
-             (`BundleLayout::synth`)."
+            end <= LX_PIN_END,
+            "a core-local LX intermediate overflows the frontend's LX window: '{name}' pins at {o} \
+             with a {fp}-byte per-core slice, pushing the region to {end} > {LX_PIN_END}, where dxp's \
+             own LX allocations begin. Cut the op into smaller parts so one core's slice fits, or keep \
+             the tensor in HBM (`BundleLayout::synth`)."
         );
         a.map.insert(name.clone(), o);
         a.sizes.insert(name.clone(), fp);

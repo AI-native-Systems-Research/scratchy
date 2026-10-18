@@ -2,13 +2,40 @@
 //! The split-KV chunk body at head dim 128 (granite-3.1-8b's geometry), from the shipped `assemble_attn`.
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use ktir_superdsc::sdsc_abstract::{AttnGeometry, ChunkScratch, PagedKvPool, attn_bundle_rows};
+use ktir_superdsc::sdsc_abstract::{
+    AttnGeometry, ChunkRowKind, ChunkScratch, PagedKvPool, attn_bundle_rows,
+};
 
 const NQH: u32 = 32;
 const NKVH: u32 = 8;
 const HD: u32 = 128;
 const CAP: u32 = 256;
 const NSLAB: u32 = 2;
+
+/// The slots of each score part and each value part a `pages`-page chunk at `mq` rows emits: one whole
+/// chunk part each, unless the one-request decode keeps its gather in LX (`ChunkScratch::lx_form`). Then
+/// Kᵗ is cut into 8-page parts when it has no tail of its own, and V into 16-page parts plus its tail.
+fn part_slots(pages: u32, mq: u32) -> (Vec<u32>, Vec<u32>) {
+    let rows = if mq == 1 {
+        ChunkRowKind::OneRequest
+    } else {
+        ChunkRowKind::Prompt
+    };
+    let chunk =
+        ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages).unwrap();
+    let cut = |per: u32| -> Vec<u32> {
+        (0..pages.div_ceil(per))
+            .map(|i| per.min(pages - i * per) * 256)
+            .collect()
+    };
+    match chunk.lx_form(rows) {
+        None => (vec![pages * 256], vec![pages * 256]),
+        Some(lx) => (
+            lx.keys().map_or(vec![pages * 256], |k| cut(k.part_pages())),
+            cut(lx.part_pages()),
+        ),
+    }
+}
 
 fn emit(pages: u32, mq: u32) -> Vec<(String, serde_json::Value)> {
     let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
@@ -69,13 +96,19 @@ fn an_hd128_chunk_scores_per_head_and_values_per_head_slab() {
         for &j in &ChunkScratch::LADDER {
             let ops = emit(j, mq);
             let count = |stem: &str| ops.iter().filter(|(n, _)| n.starts_with(stem)).count() as u32;
-            for stem in ["attn_csc_h", "attn_cbmax_h"] {
-                assert_eq!(
-                    count(stem),
-                    NQH,
-                    "{stem}* at {j} page(s), mq {mq}: one per query head"
-                );
-            }
+            // A decode rung whose gather stays in LX cuts its score into Kᵗ parts and its value leg into
+            // V parts (`part_slots`); every other chunk is one part of each.
+            let (k_parts, v_parts) = part_slots(j, mq);
+            assert_eq!(
+                count("attn_csc_h"),
+                NQH * k_parts.len() as u32,
+                "attn_csc_h* at {j} page(s), mq {mq}: one per (query head, Kᵗ part)"
+            );
+            assert_eq!(
+                count("attn_cbmax_h"),
+                NQH,
+                "attn_cbmax_h* at {j} page(s), mq {mq}: one per query head"
+            );
             assert_eq!(
                 count("attn_csc_g"),
                 0,
@@ -106,11 +139,19 @@ fn an_hd128_chunk_scores_per_head_and_values_per_head_slab() {
                     "attn_cbsum_h* at {j} page(s), decode: one per query head"
                 );
             }
+            let value_parts = if mq > 1 { parts } else { v_parts.len() as u32 };
             assert_eq!(
                 count("attn_cov_h"),
-                NQH * NSLAB * parts,
+                NQH * NSLAB * value_parts,
                 "{j} page(s), mq {mq}: one value op per (query head, slab, part)"
             );
+            // The part an op's `_k{p}` suffix names (part 0 when the leg is one part).
+            let part_of = |name: &str| -> usize {
+                name.split("_k")
+                    .nth(1)
+                    .and_then(|s| s.split('_').next())
+                    .map_or(0, |p| p.parse().unwrap())
+            };
             for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_cov_h")) {
                 let n = &v["dscs_"][0][name]["N_"];
                 assert_eq!(
@@ -119,10 +160,14 @@ fn an_hd128_chunk_scores_per_head_and_values_per_head_slab() {
                     "{name} at {j} page(s): one head's rows, one stick of out — N_ = {n}"
                 );
                 // At decode the head's one row cannot be divided, so the CONTRACTION is — as many cores as
-                // the chunk's `4·pages` whole sticks allow (within 32), where the planner alone ran each
-                // value op on ONE core.
+                // the part's whole sticks allow (within 32), where the planner alone ran each value op on
+                // ONE core.
                 let k_split = v["numWkSlicesPerDim_"]["in"].as_u64().unwrap_or(1);
-                let sticks = u64::from(j * 256 / 64);
+                let sticks = if mq == 1 {
+                    u64::from(v_parts[part_of(name)] / 64)
+                } else {
+                    u64::from(j * 256 / 64)
+                };
                 let most = (1..=32u64.min(sticks))
                     .rev()
                     .find(|s| sticks.is_multiple_of(*s))
@@ -145,9 +190,9 @@ fn an_hd128_chunk_scores_per_head_and_values_per_head_slab() {
                     (
                         Some(u64::from(mq)),
                         Some(u64::from(HD)),
-                        Some(u64::from(j * 256))
+                        Some(u64::from(k_parts[part_of(name)]))
                     ),
-                    "{name} at {j} page(s): one head, the whole head dim, the whole chunk — N_ = {n}"
+                    "{name} at {j} page(s): one head, the whole head dim, its Kᵗ part — N_ = {n}"
                 );
             }
         }

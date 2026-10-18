@@ -785,16 +785,7 @@ fn the_decode_gather_legs_read_each_part_kernel_from_lx() {
             );
         }
     }
-    // granite-8b's two feature slabs keep the HBM scratch at every rung.
-    let pool8 = PagedKvPool::new(8, 128);
-    for &j in &ChunkScratch::LADDER {
-        assert!(
-            ChunkScratch::of_chunk(pool8, j)
-                .unwrap()
-                .lx_form(ChunkRowKind::OneRequest)
-                .is_none()
-        );
-    }
+    // granite-8b's LX form is pinned rung by rung in `zz_the_hd128_chunk_in_lx`.
 }
 
 /// ⭐ THE RUN's ORDER IS ONE LAW FOR BOTH LEGS' COPIES AND THE HOST. Word `c` of a whole part's stick
@@ -822,7 +813,7 @@ fn the_lx_form_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
             if e < vlx.lx_tensors() * 32 {
                 let (op, c) = (e / 32, e % 32);
                 let (part, h) = (op / NKVH, op % NKVH);
-                assert_eq!(vlx.lx_tensor(part, h), op);
+                assert_eq!(vlx.lx_tensor(part, h, 0), op);
                 assert_eq!(
                     (kvh, page * eph + block),
                     (h, part * 8 * eph + c),
