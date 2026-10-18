@@ -563,7 +563,7 @@ const PREFILL_SPARKS: &str = "Prefill by context";
 /// decodes at once. Sixteen and up corrupt on this stack, so eight is the
 /// cap; a rung a sweep leaves unmeasured draws striped squares (heat maps)
 /// or a pending line (sparklines).
-const BATCHES: [u32; 4] = [1, 2, 4, 8];
+const BATCHES: [u32; 3] = [1, 4, 8];
 
 /// The glance's heat maps as metal.html draws its own: a row per dtype, a
 /// column per model, each cell the model's prefill grid then its decode
@@ -638,7 +638,7 @@ fn glance(sweep: &Sweep) -> Element {
                                          first token) grid, then its decode (inter-token latency) grid — \
                                          a row per dtype, a column per model — on one IBM Spyre card. \
                                          Inside a grid, rows are batch, the requests decoded at once (1, \
-                                         2, 4, 8), and columns context, short to long. Colour is how \
+                                         4, 8), and columns context, short to long. Colour is how \
                                          many times faster triton-scratchy is than torch-spyre. Blue \
                                          faster, red slower, the middle step within noise. Hover a \
                                          square for its ratio; a striped square is a cell the sweep did \
@@ -657,7 +657,7 @@ fn glance(sweep: &Sweep) -> Element {
                                 div { style: "contain: inline-size",
                                     Stack { gap: 4,
                                         p { "Time to first token as prompts grow, fp16: a row per \
-                                             batch, the requests decoded at once (1, 2, 4, 8). Blue \
+                                             batch, the requests decoded at once (1, 4, 8). Blue \
                                              fill where triton-scratchy is ahead, red where it is \
                                              behind; each fill carries its × factor. Batches past one \
                                              are not yet measured." }
@@ -670,7 +670,7 @@ fn glance(sweep: &Sweep) -> Element {
                                     Stack { gap: 4,
                                         p { "triton-scratchy against torch-spyre as context grows, \
                                              fp16: a row per batch, the requests decoded at once (1, \
-                                             2, 4, 8). Blue fill where triton-scratchy is ahead, red \
+                                             4, 8). Blue fill where triton-scratchy is ahead, red \
                                              where it is behind; each fill carries its × factor. \
                                              Batches past one are not yet measured." }
                                         {spark_panel(sweep, Dtype::Fp16, Metric::Itl)}

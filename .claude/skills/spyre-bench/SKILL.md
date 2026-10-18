@@ -61,7 +61,7 @@ What a full sweep measures, per model and dtype:
 - **prefill:** time to first token in ms, one request at a time (batch 1),
   at every bucket;
 - **batch scaling:** the same cells at the other batch rungs the page rows
-  its grids by — 2, 4 and 8 requests decoded at once (16 and up corrupt on
+  its grids by — 4 and 8 requests decoded at once (16 and up corrupt on
   this stack, so 8 is the cap). Past batch 1, decode is measured as
   throughput — decoded tokens per second at that batch, at `~1k` so far —
   and the page lights a decode grid's squares at that rung from those
@@ -139,7 +139,7 @@ Check the page against the file:
 
 - the intro names the new date, commit and `since`;
 - the headline tiles and the "At a glance" heat maps show every model you
-  measured, each grid running the batch rungs 1, 2, 4, 8 down (a striped
+  measured, each grid running the batch rungs 1, 4, 8 down (a striped
   square is a cell you left out, and only those);
 - "What moved" and "Open levers" read as this sweep's, not the last one's;
 - the About table lists the new sweep at the top and the older ones below it.
