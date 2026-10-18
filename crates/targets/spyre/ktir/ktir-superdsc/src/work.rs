@@ -54,9 +54,11 @@ pub fn core_split(size: u32, max_cores: u32) -> u32 {
 /// | k/v `[4096,1024]`      | out16 (16 c)   |  89.2 | in2·out16 (32) | 145.9 |
 /// | down `[12800,4096]`    | out32          | 149.0 | out32 (same)   | 149.0 |
 ///
-/// and the per-core rate is ~4.7 GB/s at every split, so the stream scales with the cores reading.
-/// 200 sticks (12800) has no divisor in 26..=32 and 16 sticks (1024) none above 16, which is the
-/// whole of why those two are slow: the cost is the stick count's arithmetic, not the shape.
+/// and the rate does not scale linearly with the cores reading: 8 and 16 cores both plateau near
+/// 88 GB/s, and only all 32 reach the ~149 GB/s ceiling (`T = 4.7 µs + bytes / 148.1 GB/s` over
+/// 18 32-core streams). So the fill aims at all 32. 200 sticks (12800) has no divisor in 26..=32 and
+/// 16 sticks (1024) none above 16, which is the whole of why those two are slow: the cost is the
+/// stick count's arithmetic, not the shape.
 ///
 /// ⭐ THE PARTITION STAYS EXACT. `out` divides the output stick count and `in` divides the reduction
 /// stick count, so each axis is cut into equal whole-stick slices that tile it with no remainder; the
