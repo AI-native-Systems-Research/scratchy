@@ -2223,12 +2223,27 @@ impl ResponseWorker {
         // `cbr->SpecializeTags(raw_tags)` — wrapped so a failure becomes
         // `RAS::RESPONSEWORKER::SpecializeTagsFailed`. `leases` is still
         // owned here, so an early return returns every tag to the pool.
-        let cbs = build(&tags)?;
+        let mut cbs = build(&tags)?;
         if cbs.len() as u64 != num_cbs {
             return Err(mock_error(&format!(
                 "ResponseWorker::PrepareCbs: builder produced {} control blocks for {num_cbs} tags",
                 cbs.len()
             )));
+        }
+        // `ControlBlockStream::Finalize` (`control_block_stream.cpp:423`):
+        // the vendor stamps EDEP1 on the first CB of every submitted stream,
+        // unconditionally, as the last step of submission prep — the only
+        // `SetEdep` in the vendor tree, purely device-facing (EDEP is a named
+        // CB-kill cause in the RB app-data, `app_data_sbf.hpp:163-171`). Port
+        // the same rule at the same stage: the first CB of THIS batch carries
+        // EDEP1 at CTRL bits 34:33, every other CB keeps the constructors'
+        // EDEP0. This is the choke every submission crosses — walk renders
+        // AND the replay player's canvas copies — so even a cached image
+        // holding a stale EDEP0 goes out vendor-true; the image derivation
+        // (`superdsc_exec::derive_step_image`) stamps its canvas too, so the
+        // two agree rather than only the submit path being right.
+        if let Some(first) = cbs.first_mut() {
+            first.set_edep(1);
         }
 
         for (i, lease) in leases.into_iter().enumerate() {
@@ -7253,6 +7268,256 @@ mod compute_pipeline_submission_tests {
             ],
             "vf submitDma: same ternary as PF (vf_runtime_scheduler.cpp:83-84)"
         );
+    }
+}
+
+/// The #608 first-CB rule: the vendor's `ControlBlockStream::Finalize`
+/// (`control_block_stream.cpp:423`) stamps EDEP1 — CTRL bits 34:33 — on the
+/// first CB of EVERY submitted stream, the only `SetEdep` in the vendor tree
+/// and purely device-facing (EDEP is a named CB-kill cause in the RB
+/// app-data, `app_data_sbf.hpp:163-171`). Our port stamps the same value at
+/// `ResponseWorker::prepare_cbs`, the stage `Finalize` occupies in the
+/// vendor's submission prep. These tests pin the rule where it is real: on
+/// the wire `queue_control_blocks` would hand the card — per submission, not
+/// per process — for the walk path AND the replay player's canvas.
+#[cfg(test)]
+mod edep_first_cb_tests {
+    use super::*;
+    use crate::compute::ComputeWireBatch;
+    use crate::control_block_wire::{AllocationTotalSize, RB_NUM_BYTES, ResponseBlockWire};
+    use crate::iommu::PfIommuMapper;
+    use crate::stream::{DeviceId, RuntimeStream, RuntimeStreamMode, RuntimeStreamPriority};
+
+    /// A `HardwareSubmit` that records every CB of every submitted batch AND
+    /// answers each with a `Good` response — the `RecordingHardware` pattern
+    /// from `compute_pipeline_submission_tests`, plus the CBs themselves (the
+    /// fact these tests exist to observe).
+    struct WireCapturingHardware {
+        submitted: Mutex<Vec<Vec<ControlBlockWire>>>,
+        queued: Mutex<VecDeque<ResponseBlockWire>>,
+    }
+
+    impl WireCapturingHardware {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                submitted: Mutex::new(Vec::new()),
+                queued: Mutex::new(VecDeque::new()),
+            })
+        }
+
+        /// Every batch's CBs, in submission order.
+        fn submitted(&self) -> Vec<Vec<ControlBlockWire>> {
+            self.submitted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    /// A `Good`-status response block carrying `tag` — same encoding as
+    /// `compute_pipeline_submission_tests::good_response`: tag at bits
+    /// [31:8], status (`Good` = 0b00) at bits [6:5].
+    fn good_response(tag: ResponseTag) -> ResponseBlockWire {
+        let word = (tag.0 as u64) << 8;
+        let mut bytes = [0u8; RB_NUM_BYTES];
+        bytes[0..8].copy_from_slice(&word.to_le_bytes());
+        ResponseBlockWire::from_bytes(&bytes)
+    }
+
+    impl HardwareSubmit for WireCapturingHardware {
+        fn queue_control_blocks(
+            &self,
+            _pipeline: PipelineId,
+            cbs: &[ControlBlockWire],
+        ) -> Result<(), SchedulerError> {
+            self.submitted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(cbs.to_vec());
+            let mut queued = self.queued.lock().unwrap_or_else(|e| e.into_inner());
+            for cb in cbs {
+                queued.push_back(good_response(cb.tag()));
+            }
+            Ok(())
+        }
+
+        fn receive_responses(
+            &self,
+            out: &mut [ResponseBlockWire],
+            _min_count: usize,
+        ) -> (u64, ResponseCredit) {
+            let mut queued = self.queued.lock().unwrap_or_else(|e| e.into_inner());
+            let n = queued.len().min(out.len());
+            for slot in out.iter_mut().take(n) {
+                *slot = queued.pop_front().expect("checked above");
+            }
+            (n as u64, ResponseCredit::received(n as u64))
+        }
+
+        fn free_responses(&self, _pipeline: PipelineId, _credit: PipelineCredit) {}
+    }
+
+    /// A prebuilt compute wire with a distinct tag — the shape a replay
+    /// canvas holds, built through the same `ControlBlockWire::compute` the
+    /// render path runs.
+    fn step_wire(tag: u32) -> ControlBlockWire {
+        let bootstrap = VirtualAddressSbf::new(7, Flits::from_bytes(0));
+        let prog = (
+            DevicePhysicalAddress(0x1_0000_0000),
+            AllocationTotalSize(4096),
+        );
+        let tensors = [(
+            DevicePhysicalAddress(0x2_0000_0000 + tag as u64 * 0x1000),
+            AllocationTotalSize(65536),
+        )];
+        ControlBlockWire::compute(ResponseTag(tag), &tensors, prog, bootstrap).unwrap()
+    }
+
+    /// Resolves every chunk to the same device address — the backend needs
+    /// one to exist; the wire path under test never consults it (the CBs are
+    /// prebuilt).
+    struct FixedResolver;
+
+    impl DeviceAddressResolver for FixedResolver {
+        fn resolve(&self, _chunk: &Chunk) -> Option<(u8, DevicePhysicalAddress, ByteSize)> {
+            Some((0, DevicePhysicalAddress(0x1000_0000), ByteSize(4096)))
+        }
+    }
+
+    /// Word 0 of a CB's wire bytes — the CTRL section (`CTRL_SECTION == 0`,
+    /// pinned by `control_block_wire`'s own section test).
+    fn ctrl_word0(cb: &ControlBlockWire) -> u64 {
+        u64::from_le_bytes(cb.bytes()[0..8].try_into().unwrap())
+    }
+
+    /// The choke, per submission: TWO separate `queue_cbs` calls (two
+    /// streams, two doorbells), so the rule is pinned PER STREAM — each
+    /// batch's own first CB is the one stamped EDEP1, every other CB stays
+    /// at the constructors' EDEP0, and the exact bits on the wire are bit 33
+    /// set / bit 34 clear with the rest of word 0 (tag, barrier) intact.
+    #[test]
+    fn first_cb_of_each_submitted_stream_carries_edep1() {
+        let hw = WireCapturingHardware::new();
+        let worker = ResponseWorker::new(hw.clone() as Arc<dyn HardwareSubmit>);
+        let cb_fn: CallbackFn = Arc::new(|_pr: &PendingRequest| {});
+
+        for n in [3usize, 2] {
+            worker
+                .queue_cbs(
+                    cb_fn.clone(),
+                    n as u64,
+                    PipelineId::Compute,
+                    QueuingMode::Regular,
+                    None,
+                    |tags| Ok(tags.iter().map(|t| step_wire(t.0)).collect()),
+                )
+                .expect("QueueCbs failed");
+        }
+
+        let batches = hw.submitted();
+        assert_eq!(
+            batches.len(),
+            2,
+            "two queue_cbs calls are two submitted streams"
+        );
+        for (i, cbs) in batches.iter().enumerate() {
+            assert_eq!(cbs.len(), [3, 2][i], "batch {i} keeps its own CB count");
+            let first = &cbs[0];
+            assert_eq!(
+                first.edep(),
+                1,
+                "batch {i}: the FIRST CB of the stream carries EDEP1"
+            );
+            assert_eq!(
+                ctrl_word0(first) >> 33 & 0b11,
+                0b01,
+                "batch {i}: EDEP1 is exactly bit 33 set, bit 34 clear"
+            );
+            // The stamp is a mask-and-set: the same wire built at the same
+            // tag differs ONLY in bits 34:33.
+            let control = step_wire(first.tag().0);
+            assert_eq!(
+                ctrl_word0(first) & !(0b11u64 << 33),
+                ctrl_word0(&control) & !(0b11u64 << 33),
+                "batch {i}: nothing but the EDEP bits moved"
+            );
+            for (j, cb) in cbs.iter().enumerate().skip(1) {
+                assert_eq!(
+                    cb.edep(),
+                    0,
+                    "batch {i} CB {j}: every non-first CB stays EDEP0"
+                );
+            }
+        }
+    }
+
+    /// The replay-path trap: a derived step image carries its own first CB,
+    /// and the submit path must not miss it. Two canvases cross the REAL PF
+    /// backend's `submit_compute_wires` — the #624 replay player's exact
+    /// submission shape (canvas clone + tag patch + one doorbell):
+    ///
+    ///  - `stale = false`: the canvas was stamped at derivation time
+    ///    (`superdsc_exec::derive_step_image` applies the same first-CB
+    ///    rule), and
+    ///  - `stale = true`: the canvas still holds its rendered EDEP0 — an
+    ///    image derived before #608, or a derivation regression.
+    ///
+    /// Both must read EDEP1 on the wire: the choke covers a stale image, so
+    /// the derivation stamp and the submit stamp AGREE rather than either
+    /// being load-bearing (a double-set of the same value is fine; a miss is
+    /// the defect).
+    #[test]
+    fn replay_canvas_first_cb_carries_edep1_on_the_wire() {
+        for stale in [false, true] {
+            let hw = WireCapturingHardware::new();
+            let backend = Backend::Pf(PfBackend::new(
+                hw.clone(),
+                Arc::new(NoCapacity),
+                Arc::new(FixedResolver),
+                PfIommuMapper::new(),
+            ));
+            let sched = RuntimeScheduler::new(backend);
+            let stream = RuntimeStream::new(
+                sched,
+                DeviceId(0),
+                RuntimeStreamPriority::Normal,
+                RuntimeStreamMode::OpOrdering,
+                false,
+            );
+
+            let mut canvas: Vec<ControlBlockWire> = (0..3).map(|i| step_wire(40 + i)).collect();
+            if !stale {
+                canvas[0].set_edep(1); // what derive_step_image stamps
+            }
+            let batch = ComputeWireBatch {
+                canvas: Arc::new(canvas),
+                patch: Box::new(|tags, cbs| {
+                    for (cb, tag) in cbs.iter_mut().zip(tags.iter()) {
+                        cb.set_tag(*tag);
+                    }
+                }),
+            };
+            stream.launch_compute_wires(batch, true, None).unwrap();
+            stream.synchronize().unwrap();
+
+            let batches = hw.submitted();
+            assert_eq!(batches.len(), 1, "one canvas, one doorbell");
+            let cbs = &batches[0];
+            assert_eq!(cbs.len(), 3, "the whole canvas crossed as one batch");
+            assert_eq!(
+                cbs[0].edep(),
+                1,
+                "stale={stale}: the image's first CB reads EDEP1 on the wire"
+            );
+            assert_eq!(
+                ctrl_word0(&cbs[0]) >> 33 & 0b11,
+                0b01,
+                "stale={stale}: exactly CTRL bits 34:33 = 1 on the wire"
+            );
+            for (j, cb) in cbs.iter().enumerate().skip(1) {
+                assert_eq!(cb.edep(), 0, "stale={stale} CB {j}: non-first stays EDEP0");
+            }
+        }
     }
 }
 

@@ -4502,6 +4502,16 @@ impl Executor {
                  CBs — the walk it mirrors launches nothing, which no body selection can do"
             );
         }
+        // The image's own first CB carries the same EDEP1 the submit path
+        // stamps (`ResponseWorker::prepare_cbs`, the vendor `Finalize` port at
+        // control_block_stream.cpp:423): the replay patch rewrites tags in
+        // place and never touches the CTRL mode bits, so what derivation
+        // stores is what every replay of this image submits — a cached image
+        // must not hold the EDEP0 its rows were rendered with. The
+        // submit-side stamp makes the two agree rather than this one being
+        // load-bearing (a double-set of the same value is fine; a miss is the
+        // defect).
+        canvas[0].set_edep(1);
         debug!(
             "[sdsc-replay] derived image sel={sel:?} n_fold_pages={n}: {} CB(s) over {} \
              launch row(s), {sites} patch site(s), barrier={barrier}",
