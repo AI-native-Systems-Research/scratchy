@@ -1382,6 +1382,17 @@ impl Executor {
             .is_some_and(|seg| self.seg_aliased[seg.get()])
     }
 
+    /// Does this session still owe an alias for a segment it declared borrowed? While
+    /// true, that segment holds its 128 B placeholder, so no CB may be rendered through
+    /// it — the parity gate waits (see [`Executor::prepare`]) and runs at the alias that
+    /// completes the set ([`Executor::alias_seg_from`]).
+    fn borrow_set_pending(&self) -> bool {
+        self.seg_borrowed
+            .iter()
+            .zip(self.seg_aliased.iter())
+            .any(|(borrowed, aliased)| *borrowed && !*aliased)
+    }
+
     /// Bind a WEIGHT by name, taking ownership of its bytes. Weights are bound before
     /// [`Executor::prepare`], staged once into the resident segments, and their host bytes are
     /// reclaimed there.
@@ -2032,7 +2043,23 @@ impl Executor {
         lap("sync", &mut t0);
         // ⭐ #603 PR2 2a — THE CB PARITY GATE, before the session becomes loadable: a plan twin
         // that disagrees with the walk refuses the LOAD here, never a step.
-        self.check_cb_plan_parity()?;
+        //
+        // A BORROWING session cannot be gated here: its borrowed segments still hold the
+        // 128 B placeholders `mark_borrowed` left them, and a placeholder has no renderable
+        // address BY DESIGN (`alias_seg_from` replaces it with the owner's region only after
+        // prepare returns — rendering through it is exactly the un-aliased-read the
+        // placeholder exists to poison). Such a session is gated at the alias that
+        // completes its borrowed set instead; one that never completes its aliases can
+        // never launch (the un-aliased placeholder guard refuses its fold), so no session
+        // escapes the gate.
+        if self.borrow_set_pending() {
+            debug!(
+                "[sdsc-cbplan] parity gate DEFERRED: borrowed segment(s) still on placeholders — \
+                 it runs at the alias that completes the borrowed set"
+            );
+        } else {
+            self.check_cb_plan_parity()?;
+        }
         lap("cb-parity", &mut t0);
         self.prepared = true;
 
@@ -2103,8 +2130,10 @@ impl Executor {
     /// is 2048 slots.
     ///
     /// ⛔ NOT A PER-STEP CHECK — a step never pays for this. It runs at [`Self::prepare`] (every
-    /// list that exists by then) and once more at [`Self::ensure_split_bodies`] (the deferred
-    /// rungs, at the one event that makes them exist).
+    /// list that exists by then), at [`Self::alias_seg_from`] (a borrowing session's segments are
+    /// placeholder-poisoned at its prepare, so ITS gate waits for the alias that completes the
+    /// borrowed set — the rungs and the prefix-capable prefill session), and once more at
+    /// [`Self::ensure_split_bodies`] (the deferred rungs, at the one event that makes them exist).
     ///
     /// Both step shapes are SYNTHETIC, not the live session's. The parity gate's: 2 requests × 3
     /// resident pages, a mid-page write slot, request 0's page 2 as the write base — the shape
@@ -4874,6 +4903,16 @@ impl Executor {
                 self.weight_bank_addr[b] = Some(DevAddr::from_chunk(bc0));
                 self.weight_bank_aliased[b] = true;
             }
+        }
+        // ⭐ #603 PR2 2a — A BORROWING SESSION'S PARITY GATE runs HERE, at the alias that
+        // completes its borrowed set: the first moment every segment it declared borrowed
+        // holds a real, renderable address (prepare had to defer it — the placeholders it
+        // rendered through then are poison by contract). A disagreement refuses the
+        // ADOPTION, which the caller already treats as fatal-for-this-session, never a
+        // step. A session with NO borrowed segments gated at prepare and is not re-gated
+        // here (the batched-prefill top rung aliases seg2 post-prepare without borrowing).
+        if self.seg_borrowed.iter().any(|b| *b) && !self.borrow_set_pending() {
+            self.check_cb_plan_parity()?;
         }
         Ok(())
     }

@@ -170,6 +170,8 @@ impl SuperDscSession {
     /// The caller MUST [`alias_seg_from`](Self::alias_seg_from) every listed segment immediately
     /// after this returns — a borrowed segment left un-aliased holds ONLY the placeholder, so a
     /// failed alias must be fatal for this session, never a warning that leaves it on a stub.
+    /// The CB parity gate also waits for that alias: it cannot render through a placeholder,
+    /// so it runs at the [`alias_seg_from`](Self::alias_seg_from) that completes the borrowed set.
     pub fn new_borrowing(
         code: &'static crate::bundle_code::BundleCode<'static>,
         vocab: usize,
