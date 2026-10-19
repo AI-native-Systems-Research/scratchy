@@ -85,7 +85,12 @@ fn emit<const HD: u32>(pages: u32, rows: Rows) -> Vec<(String, serde_json::Value
         &mut sym,
         Some(&layout),
     )
-    .unwrap_or_else(|e| panic!("hd {HD}, {pages} pages, {rows:?}: assemble_attn refused: {}", e.0))
+    .unwrap_or_else(|e| {
+        panic!(
+            "hd {HD}, {pages} pages, {rows:?}: assemble_attn refused: {}",
+            e.0
+        )
+    })
     .iter()
     .map(|e| {
         let v = serde_json::to_value(&e.op).unwrap();
@@ -108,7 +113,10 @@ fn division(name: &str, v: &serde_json::Value) -> ((u64, u64), u64, (u64, u64)) 
             s["out"].as_u64().unwrap_or(1),
         ),
         v["numCoresUsed_"].as_u64().unwrap_or(0),
-        (n["mb_"].as_u64().unwrap_or(0), n["out_"].as_u64().unwrap_or(0)),
+        (
+            n["mb_"].as_u64().unwrap_or(0),
+            n["out_"].as_u64().unwrap_or(0),
+        ),
     )
 }
 
@@ -162,8 +170,15 @@ fn every_batch_rung_divides_its_probabilities_sticks_first() {
                 let ops = emit::<HD>(pages, Rows::Batch(seqs));
                 let ps = probs(&ops);
                 assert!(!ps.is_empty(), "hd {HD} B={seqs} {pages}p: no esub/exp");
-                let esubs = ps.iter().filter(|(n, _)| n.starts_with("attn_cesub_")).count();
-                assert_eq!(esubs * 2, ps.len(), "hd {HD} B={seqs} {pages}p: one exp per esub");
+                let esubs = ps
+                    .iter()
+                    .filter(|(n, _)| n.starts_with("attn_cesub_"))
+                    .count();
+                assert_eq!(
+                    esubs * 2,
+                    ps.len(),
+                    "hd {HD} B={seqs} {pages}p: one exp per esub"
+                );
                 let mut covered = 0u64;
                 let mut blocks = std::collections::BTreeSet::new();
                 for (name, v) in ps {
@@ -223,7 +238,10 @@ fn the_canonical_conc8_cell_runs_out32() {
 #[test]
 fn the_one_request_and_prompt_chunks_keep_rows_first() {
     fn rows_first(rows: u64, cols: u64) -> (u64, u64) {
-        let sm = (1..=rows.min(32)).rev().find(|m| rows.is_multiple_of(*m)).unwrap();
+        let sm = (1..=rows.min(32))
+            .rev()
+            .find(|m| rows.is_multiple_of(*m))
+            .unwrap();
         let sticks = cols / 64;
         let rest = 32 / sm;
         let so = (1..=sticks.min(rest))
