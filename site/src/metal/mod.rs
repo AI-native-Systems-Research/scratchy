@@ -1104,7 +1104,12 @@ fn glance_users(m: &Model, run: &Run) -> u32 {
     }
 }
 
-/// A run's grid answer lengths, longest first.
+/// The answer length the overview's heat maps show every grid at: a
+/// typical reply's.
+const GLANCE_ANSWER: u32 = 128;
+
+/// A run's grid answer lengths: the overview's first, then the rest,
+/// shortest first.
 fn grid_answers(run: &Run) -> Vec<u32> {
     let mut os = run
         .config
@@ -1112,17 +1117,9 @@ fn grid_answers(run: &Run) -> Vec<u32> {
         .as_ref()
         .and_then(|s| s.grid_output.clone())
         .unwrap_or_default();
-    os.sort_unstable_by(|a, b| b.cmp(a));
+    os.sort_unstable_by_key(|&o| (o != GLANCE_ANSWER, o));
     os.dedup();
     os
-}
-
-/// The answer length the overview's heat maps show a run's grids at: its
-/// longest, where throughput is most nearly decode (the decode map's
-/// subject), and time to first token includes waiting behind the other
-/// users' answers, as on a busy server.
-fn glance_answer(run: &Run) -> Option<u32> {
-    grid_answers(run).first().copied()
 }
 
 impl<'a> ShapeGrid<'a> {
@@ -1653,11 +1650,10 @@ struct Square<'a> {
     prompt: u32,
 }
 
-/// One overview heat map's ratios: the answer length it is at, its prompt
-/// lengths, the rival, and each square's (users, prompt, how many times
-/// faster scratchy is).
+/// One overview heat map's ratios, at GLANCE_ANSWER: its prompt lengths, the
+/// rival, and each square's (users, prompt, how many times faster scratchy
+/// is).
 struct GlanceGrid {
-    answer: u32,
     prompts: Vec<u32>,
     rival: Engine,
     cells: Vec<(u32, u32, Option<f64>)>,
@@ -1673,8 +1669,7 @@ impl GlanceGrid {
         users: &[u32],
     ) -> Result<Self, &'static str> {
         let Entry { run, m } = mr.latest(stem).ok_or("not run")?;
-        let answer = glance_answer(run).ok_or("no grid")?;
-        let g = ShapeGrid::of(m, run, Slice::Answer(answer)).ok_or("no grid")?;
+        let g = ShapeGrid::of(m, run, Slice::Answer(GLANCE_ANSWER)).ok_or("no grid")?;
         let rival = g.rival.ok_or("nothing to compare")?;
         let cells = users
             .iter()
@@ -1682,7 +1677,6 @@ impl GlanceGrid {
             .map(|(u, i)| (u, i, g.versus(metric, (u, i), rival).0))
             .collect();
         Ok(GlanceGrid {
-            answer,
             prompts: g.across,
             rival,
             cells,
@@ -1729,13 +1723,6 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             }
         }
     }
-    let answers = grids
-        .values()
-        .filter_map(|g| Some(g.as_ref().ok()?.answer.to_string()))
-        .collect::<BTreeSet<String>>()
-        .into_iter()
-        .collect::<Vec<_>>()
-        .join(" or ");
     let squares: BTreeMap<Square, f64> = grids
         .iter()
         .filter_map(|(&(chip, stem, name), g)| Some((chip, stem, name, g.as_ref().ok()?)))
@@ -1844,7 +1831,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             })
             .collect();
         glance_mini(
-            Slice::Answer(g.answer).axes(&users, &g.prompts),
+            Slice::Answer(GLANCE_ANSWER).axes(&users, &g.prompts),
             squares,
             format!("scratchy/{}", g.rival.label()),
             name,
@@ -1875,9 +1862,9 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                             ContentPanel { id: slug(HEAT_MAPS), shown: true,
                                 Stack { gap: 5,
                                     p { style: "contain: inline-size",
-                                        "Every model's users × prompt size grid on every machine, at the grid's longest answers \
-                                         ({answers} tokens), where throughput is mostly decode: in each cell, the model's prefill (time to \
-                                         first token) grid, then its decode (throughput) grid (rows: users at once, fewest first; columns: \
+                                        "Every model's users × prompt size grid on every machine, at {GLANCE_ANSWER}-token answers: in \
+                                         each cell, the model's prefill (time to first token) grid, then its decode (throughput) grid \
+                                         (rows: users at once, fewest first; columns: \
                                          prompt, short to long). A blank square has no ratio: scratchy or the engine it is compared with \
                                          was not measured there, or never streamed an answer (the model's own grids below say which); runs \
                                          from before the grid had its own users counts measured it at the base count only. \
