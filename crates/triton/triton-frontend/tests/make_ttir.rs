@@ -436,6 +436,55 @@ fn nested_calls_are_inlined_to_a_fixed_point() {
     );
 }
 
+/// A callee cloned MID-ROUND must see the round's pending substitutions, not its own
+/// pre-repair operand ids.
+///
+/// `attn_fwd_noncausal` is the deepest call chain in any fixture: wrapper → `attn_fwd` →
+/// `_attn_fwd_inner` → the reduction helpers. The inliner splices in batched rounds and
+/// applies each round's operand substitutions once, at the round's end. A splice into a
+/// callee EARLIER in the same round (an `fi` that put a call inside `_attn_fwd_inner`)
+/// mints a pending substitution; when a LATER splice in the same round clones that callee
+/// wholesale, the clone copied its PRE-repair operand ids verbatim — the clone map had no
+/// entry for values the callee defined before the splice — and the round-end substitute
+/// then pointed every copy at the ORIGINAL callee's replacement: a cross-function
+/// reference that dangles once symbol-dce drops the helpers.
+///
+/// The dangling reference surfaced one bridge later, as a refusal rather than a
+/// miscompile: `triton-ktir`'s `to_ktir` saw a `tt.reduce` whose combiner region resolved
+/// to nothing ("got 0 ops") and refused the module. The golden set cannot catch this —
+/// its attention rows bottom out at `attn_fwd` (three levels), one level above the wrapper
+/// the case table launches, and a golden diff of a refused module has nothing to diff.
+/// This test pins the defect where it is minted: the
+/// four-pointer non-causal configuration — the exact spec `bake_py` compiles for
+/// `cases.rs`'s `attention_flash_noncausal` row — must leave `make_ttir` at the spyre
+/// target with no call left, one function left, and no operand that escapes the function
+/// that defines it (the printer spells those `<undef:>`).
+#[test]
+fn a_mid_round_clone_sees_the_rounds_pending_substitutions() {
+    let case = common::attention_noncausal();
+    let src = common::fixture_src(&case.fixture);
+    let mut m = codegen::compile(&src, &case.spec, Target::spyre()).expect("compiles");
+    // THE REGRESSION: before the fix, the module this returns carried the dangling
+    // cross-function reference that `to_ktir` then refused as "tt.reduce combiner must be
+    // exactly one associative op with a known identity; got 0 ops".
+    opt::make_ttir(&mut m).unwrap_or_else(|e| panic!("`{}`: make_ttir refused: {e}", case.name));
+    let (_, calls) = opt::measure(&m);
+    assert_eq!(calls, 0, "{calls} tt.call(s) survived make_ttir");
+    assert_eq!(
+        m.funcs.len(),
+        1,
+        "{} function(s) survived symbol-dce, and triton_ktir::ir::Module::kernel() refuses \
+         anything but exactly one",
+        m.funcs.len()
+    );
+    let printed = ttir::print::print_module(&m);
+    assert!(
+        !printed.contains("<undef:"),
+        "an operand escaped the function that defines it -- a cross-function reference \
+         survived make_ttir:\n{printed}"
+    );
+}
+
 /// FAIL CLOSED: a call to a symbol that is not there must be a named refusal, not a
 /// module with a dangling call left in it.
 #[test]

@@ -802,7 +802,7 @@ pub fn promote_single_trip_loops(m: &mut Module) -> bool {
                     .collect();
                 continue;
             }
-            cloned.push(clone_op(m, op, &mut map));
+            cloned.push(clone_op(m, op, &mut map, &HashMap::new()));
         }
         let ops = ops_at_mut(m, &site);
         ops.splice(site.index..site.index + 1, cloned);
@@ -1052,12 +1052,17 @@ fn calls_cycle(m: &Module) -> bool {
 /// they are skipped this round and picked up by the next -- that is the depth counting.
 /// The callee is looked up and cloned BEFORE the ops borrow is taken (`clone_op` mints its
 /// fresh values in the ARENA, which is a separate field from `funcs`).
+///
+/// ONE result-rewrite sweep for the whole round: per-site `substitute` calls are what
+/// made this pass quadratic at kernel scale (every sweep is the whole module). The
+/// chain-chasing `substitute` resolves same-round sequences, and the backwards walk
+/// guarantees a site's operands are already final (SSA: a use follows its definition).
+/// Deferring the sweep is sound for every operand that STAYS PUT -- the sweep reaches it
+/// wherever it sits -- but not for an operand a later clone COPIES OUT of a callee the
+/// round has not yet repaired, which is why the round's map is handed to `expand_call`
+/// and composed into every cloned use (see its doc for the case that measured it).
 fn inline_one_round(m: &mut Module) -> Result<bool> {
     let mut inlined_any = false;
-    // ONE result-rewrite sweep for the whole round: per-site `substitute` calls are what
-    // made this pass quadratic at kernel scale (every sweep is the whole module). The
-    // chain-chasing `substitute` resolves same-round sequences, and the backwards walk
-    // guarantees a site's operands are already final (SSA: a use follows its definition).
     let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
     let n_funcs = m.funcs.len();
     for fi in 0..n_funcs {
@@ -1075,7 +1080,7 @@ fn inline_one_round(m: &mut Module) -> Result<bool> {
                     continue;
                 }
                 let call = m.funcs[fi].body.blocks[bi].ops[i].clone();
-                let (cloned, returned) = expand_call(m, &call)?;
+                let (cloned, returned) = expand_call(m, &call, &subst)?;
                 for (r, v) in call.results.iter().zip(returned.iter()) {
                     subst.insert(*r, *v);
                 }
@@ -1117,7 +1122,7 @@ fn inline_in_regions(
                     continue;
                 }
                 let call = op_at_path(m, fi, bi, path).regions[ri].blocks[bl].ops[i].clone();
-                let (cloned, returned) = expand_call(m, &call)?;
+                let (cloned, returned) = expand_call(m, &call, subst)?;
                 for (r, v) in call.results.iter().zip(returned.iter()) {
                     subst.insert(*r, *v);
                 }
@@ -1158,7 +1163,35 @@ fn op_at_path_mut<'m>(m: &'m mut Module, fi: usize, bi: usize, path: &[usize]) -
 /// Clone the callee's body under the call's operands, returning the ops to splice and the
 /// values the call's results become. The callee is resolved and cloned HERE so no caller
 /// holds an ops borrow across the lookup.
-fn expand_call(m: &mut Module, call: &Op) -> Result<(Vec<Op>, Vec<ValueId>)> {
+///
+/// # THE ROUND'S PENDING REWRITES, COMPOSED INTO THE CLONE
+///
+/// `subst` is the round's deferred result-rewrite map, still unapplied. A CALLEE cloned
+/// mid-round can carry operands that map has not repaired yet: round 0 of
+/// `attn_fwd_noncausal` (the four-pointer wrapper) splices `_elementwise_max` into
+/// `standard.max`'s reduce combiner and then -- still inside the same round -- expands
+/// `_attn_fwd_inner`'s call to `standard.max`. The helper's `tt.reduce.return` operand is
+/// at that moment the pre-repair id of the spliced call's result, and a clone that maps
+/// only fresh-and-argument values copies it VERBATIM. The round-end `substitute` then
+/// points every copy at the ORIGINAL helper's replacement -- a value defined in a
+/// function the copy is not in. `symbol_dce` removes that function at the end of
+/// `make_ttir`, the reference dangles, and bridge two refuses the module as
+/// "tt.reduce combiner must be exactly one associative op ...; got 0 ops". The
+/// `attn_fwd` entry never hits it (three call levels: its reduce is cloned from the
+/// fully-repaired helper in round 1), which is why the goldens stayed green.
+///
+/// So every value the clone USES is resolved through `subst` FIRST and the clone map
+/// SECOND. The order is forced: a pending replacement is always minted by a splice into
+/// the SAME function as the value it replaces, so `chase` lands on a value the cloned
+/// body itself defines and the clone map then localizes to the copy's own fresh result.
+/// The call's OWN operands need no chase -- the backwards walk guarantees they are final
+/// (a use's definition is at a lower, not-yet-visited index) -- and the argument map
+/// states them as they are.
+fn expand_call(
+    m: &mut Module,
+    call: &Op,
+    subst: &HashMap<ValueId, ValueId>,
+) -> Result<(Vec<Op>, Vec<ValueId>)> {
     let callee_name = match call.attrs.get("callee") {
         Some(Attr::Str(s)) => s.clone(),
         _ => {
@@ -1208,15 +1241,20 @@ fn expand_call(m: &mut Module, call: &Op) -> Result<(Vec<Op>, Vec<ValueId>)> {
     let mut returned: Option<Vec<ValueId>> = None;
     for op in &entry.ops {
         if op.name == "tt.return" {
+            // Chased, for the same reason as every cloned operand: a helper's return can
+            // name a result the round has not yet repaired.
             returned = Some(
                 op.operands
                     .iter()
-                    .map(|v| *map.get(v).unwrap_or(v))
+                    .map(|v| {
+                        let resolved = chase(subst, *v);
+                        *map.get(&resolved).unwrap_or(&resolved)
+                    })
                     .collect(),
             );
             continue;
         }
-        cloned.push(clone_op(m, op, &mut map));
+        cloned.push(clone_op(m, op, &mut map, subst));
     }
     let returned = returned.ok_or_else(|| {
         Error::new(
@@ -1266,14 +1304,25 @@ fn op_at<'m>(m: &'m Module, s: &Site) -> &'m Op {
 }
 
 /// Deep-clone `op`, minting a fresh arena value for every value it DEFINES (results and
-/// nested block arguments) and mapping every value it USES through `map`.
-fn clone_op(m: &mut Module, op: &Op, map: &mut HashMap<ValueId, ValueId>) -> Op {
+/// nested block arguments) and mapping every value it USES through `map` -- each use
+/// resolved through the round's pending `subst` first, for the reason `expand_call`
+/// records: a mid-round callee can still carry pre-repair ids, and the clone map alone
+/// has no spelling for them.
+fn clone_op(
+    m: &mut Module,
+    op: &Op,
+    map: &mut HashMap<ValueId, ValueId>,
+    subst: &HashMap<ValueId, ValueId>,
+) -> Op {
     let mut out = Op::new(op.name.clone(), op.loc.clone());
     out.attrs = op.attrs.clone();
     out.operands = op
         .operands
         .iter()
-        .map(|v| *map.get(v).unwrap_or(v))
+        .map(|v| {
+            let resolved = chase(subst, *v);
+            *map.get(&resolved).unwrap_or(&resolved)
+        })
         .collect();
     for r in &op.results {
         let info = m.values[r.0 as usize].clone();
@@ -1294,7 +1343,7 @@ fn clone_op(m: &mut Module, op: &Op, map: &mut HashMap<ValueId, ValueId>) -> Op 
                 nb.args.push(fresh);
             }
             for inner in &b.ops {
-                let c = clone_op(m, inner, map);
+                let c = clone_op(m, inner, map, subst);
                 nb.ops.push(c);
             }
             nr.blocks.push(nb);
@@ -1316,20 +1365,27 @@ fn substitute(m: &mut Module, subst: &HashMap<ValueId, ValueId>) {
     }
 }
 
+/// Resolve `v` through `subst`, chasing chains: a value replaced by a value that is
+/// itself replaced resolves to the end of the chain. A mapping to itself, or a chain
+/// longer than 64 (which no round builds -- a splice's replacement is always a fresh
+/// value, never itself a key), stops the chase rather than looping.
+fn chase(subst: &HashMap<ValueId, ValueId>, v: ValueId) -> ValueId {
+    let mut cur = v;
+    let mut guard = 0;
+    while let Some(next) = subst.get(&cur) {
+        if *next == cur || guard > 64 {
+            break;
+        }
+        cur = *next;
+        guard += 1;
+    }
+    cur
+}
+
 fn subst_ops(ops: &mut [Op], subst: &HashMap<ValueId, ValueId>) {
     for op in ops {
         for o in &mut op.operands {
-            // Chase, so a chain built over several rounds resolves.
-            let mut cur = *o;
-            let mut guard = 0;
-            while let Some(next) = subst.get(&cur) {
-                if *next == cur || guard > 64 {
-                    break;
-                }
-                cur = *next;
-                guard += 1;
-            }
-            *o = cur;
+            *o = chase(subst, *o);
         }
         for r in &mut op.regions {
             for b in &mut r.blocks {
