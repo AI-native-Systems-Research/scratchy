@@ -1,0 +1,172 @@
+{
+  "schema": 1,
+  "pr": 698,
+  "title": "feat(spyre): the composite device argmax token step \u2014 greedy solo decode closes its loop (#603 PR3a)",
+  "head": "1c378c2662ed73b7f001669023b25b89250c8f8a",
+  "base": "c879b73a451877d2053798ceee7376816969d4f9",
+  "merged": "2026-10-19",
+  "pod": "nickm2-55c9495fc8-89nfw",
+  "harness": "scripts/spyre_pr_cells.sh: rung-1 via the length-calibrated streaming client (3 streamed requests, medians, the serve's request-finished lines the length gate) and conc-8 via vllm bench serve (16 prompts, 256 output tokens) on the shared datasets; 2 back-to-back runs a side on one boot each, headline = the last run; serve and client pinned to cores 48-95",
+  "cells": [
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~1k",
+      "note": "conc-8: vllm bench serve on the shared ~1k dataset, 16 prompts, out 256",
+      "main": 91.46492381023207,
+      "pr": 91.68010921555333,
+      "reps": {
+        "main": [
+          102.09708148796184,
+          91.46492381023207
+        ],
+        "pr": [
+          101.92908261327402,
+          91.68010921555333
+        ]
+      }
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~1k",
+      "note": "conc-8: vllm bench serve on the shared ~1k dataset, 16 prompts, out 256",
+      "main": 83.60469150031122,
+      "pr": 83.46714820100473,
+      "reps": {
+        "main": [
+          70.06477248411709,
+          83.60469150031122
+        ],
+        "pr": [
+          70.19033313726169,
+          83.46714820100473
+        ]
+      }
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~1k",
+      "note": "conc-8: vllm bench serve on the shared ~1k dataset, 16 prompts, out 256",
+      "main": 203.56190904481886,
+      "pr": 203.19804723931512,
+      "reps": {
+        "main": [
+          235.74807151202475,
+          203.56190904481886
+        ],
+        "pr": [
+          235.1156537411917,
+          203.19804723931512
+        ]
+      }
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~1k",
+      "note": "conc-8: vllm bench serve on the shared ~1k dataset, 16 prompts, out 256",
+      "main": 37.731495695962984,
+      "pr": 37.673897705776554,
+      "reps": {
+        "main": [
+          31.19906539942556,
+          37.731495695962984
+        ],
+        "pr": [
+          31.075634115031825,
+          37.673897705776554
+        ]
+      }
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~10k",
+      "note": "rung-1: the length-calibrated streaming client, median of 3",
+      "main": 59.09730400890112,
+      "pr": 59.6410830039531,
+      "reps": {
+        "main": [
+          59.14836679585278,
+          59.09730400890112
+        ],
+        "pr": [
+          59.62858512066305,
+          59.6410830039531
+        ]
+      }
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~10k",
+      "note": "rung-1: the length-calibrated streaming client, median of 3",
+      "main": 7907.937162090093,
+      "pr": 7947.402199963108,
+      "reps": {
+        "main": [
+          7914.527409942821,
+          7907.937162090093
+        ],
+        "pr": [
+          7941.679649986327,
+          7947.402199963108
+        ]
+      }
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~1k",
+      "note": "rung-1: the length-calibrated streaming client, median of 3",
+      "main": 44.97109306976199,
+      "pr": 45.13541702181101,
+      "reps": {
+        "main": [
+          44.92636490613222,
+          44.97109306976199
+        ],
+        "pr": [
+          45.09851802140474,
+          45.13541702181101
+        ]
+      }
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~1k",
+      "note": "rung-1: the length-calibrated streaming client, median of 3",
+      "main": 527.5901118293405,
+      "pr": 537.1492451522499,
+      "reps": {
+        "main": [
+          530.272328061983,
+          527.5901118293405
+        ],
+        "pr": [
+          539.0521378722042,
+          537.1492451522499
+        ]
+      }
+    }
+  ]
+}
