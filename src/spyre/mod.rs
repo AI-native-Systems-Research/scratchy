@@ -1291,7 +1291,7 @@ fn progress_timelines(
         }
         sources.sort_by(|a, b| a.order.cmp(&b.order));
         if sources.len() >= 2 {
-            let steps = sources
+            let mut steps: Vec<Step> = sources
                 .iter()
                 .enumerate()
                 .map(|(k, s)| Step {
@@ -1301,6 +1301,19 @@ fn progress_timelines(
                     highlight: false,
                 })
                 .collect();
+            // The fill between the lines carries its ×-factor at the first
+            // and the last source where both stacks were measured — where
+            // the cell started against torch, and the newest like-for-like
+            // anchor, the sweep a PR's value pairs with; the metal
+            // sparklines label their chosen steps the same way. A PR step
+            // never carries one: torch has no value there to factor against.
+            let both = |s: &Step| s.scratchy.is_some() && s.rival.is_some();
+            if let Some(first) = steps.iter().position(both) {
+                steps[first].highlight = true;
+            }
+            if let Some(last) = steps.iter().rposition(both) {
+                steps[last].highlight = true;
+            }
             let names = sources.into_iter().map(|s| s.name).collect();
             out.insert(key, (steps, names));
         }
@@ -1498,7 +1511,11 @@ fn progress_section(progress: &[(PathBuf, Progress)], sweeps: &[(PathBuf, Sweep)
                             "Every source that measured a moved cell, oldest first — a \
                              sweep with both stacks' values, a PR with its own — so the \
                              line shows what the PRs are closing. Torch-spyre's line \
-                             breaks wherever a PR sits, because no PR re-measures torch."
+                             breaks wherever a PR sits, because no PR re-measures torch. \
+                             The fill between the lines is labelled with its ×-factor at \
+                             the first and the newest sweep, where both stacks were \
+                             measured: where the cell started against torch, and the \
+                             anchor a PR's value pairs with."
                         },
                         rsx! {
                             div { style: "{grid}",
@@ -2184,6 +2201,10 @@ mod tests {
         // Torch's line breaks at the PR: no PR re-measures torch.
         let torch: Vec<Option<f64>> = steps.iter().map(|s| s.rival).collect();
         assert_eq!(torch, vec![Some(45.0), Some(45.0), None]);
+        // The ×-factor labels ride the first and the last steps where both
+        // stacks were measured; the PR step, torch breaking there, gets none.
+        let highlights: Vec<bool> = steps.iter().map(|s| s.highlight).collect();
+        assert_eq!(highlights, vec![true, true, false]);
     }
 
     #[test]
