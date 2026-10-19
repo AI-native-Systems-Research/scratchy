@@ -27,12 +27,22 @@
 #   scripts/spyre_pr_cells.sh --pr 683 \
 #       --title "perf(spyre): ..." --head <40-hex> --base <40-hex> \
 #       --2b <main-scr> <pr-scr> --8b <main-scr> <pr-scr> \
-#       [--out site/data/spyre/progress] [--runs 2] [--port 8079]
+#       [--cells rung1-2b,conc8-2b,conc8-8b] \
+#       [--out site/data/spyre/progress] [--runs 2] [--port 8079] \
+#       [--self-test]
 #
 # Environment:
 #   DS_1K   required: the shared conc-8 ~1k dataset (16 prompts), the same
 #           file the sweep's batched cells ran
 #   CORES   the cores serve and client are pinned to (default 48-95)
+#
+# --cells selects a subset of the cell groups to measure: rung1-2b (the two
+#   rung-1 cells), conc8-2b, conc8-8b — comma-separated, default all three.
+#   A group's binary pair is only required when its group is selected, so a
+#   2b-only PR runs --cells rung1-2b,conc8-2b with no --8b pair. The
+#   assembler enforces exactly the selected cells, no more, no less.
+# --self-test runs the argument parser and the binary-pair guard on dummy
+#   paths and exits — no pod, no card; run it anywhere.
 #
 # Exits non-zero on any refusal; a failed cell fails the whole run — the
 # gate is complete or it did not happen. Writes <out>/<pr>.json (atomically)
@@ -45,26 +55,133 @@ REPO="$(dirname "$HERE")"
 # ---- arguments ---------------------------------------------------------------
 PR="" TITLE="" HEAD="" BASE="" OUT="" RUNS=2 PORT=8079
 B2_MAIN="" B2_PR="" B8_MAIN="" B8_PR=""
+CELLS="rung1-2b,conc8-2b,conc8-8b" SELF_TEST=no
 usage() { awk 'NR == 1 { next } /^#/ { print substr($0, 3); next } { exit }' "$0" >&2; exit 64; }
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --pr) PR=$2; shift 2 ;;
-    --title) TITLE=$2; shift 2 ;;
-    --head) HEAD=$2; shift 2 ;;
-    --base) BASE=$2; shift 2 ;;
-    --2b) B2_MAIN=$2; B2_PR=$2; shift 3 ;;
-    --8b) B8_MAIN=$2; B8_PR=$2; shift 3 ;;
-    --out) OUT=$2; shift 2 ;;
-    --runs) RUNS=$2; shift 2 ;;
-    --port) PORT=$2; shift 2 ;;
-    *) echo "REFUSING: unknown argument '$1'" >&2; usage ;;
-  esac
-done
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pr) PR=$2; shift 2 ;;
+      --title) TITLE=$2; shift 2 ;;
+      --head) HEAD=$2; shift 2 ;;
+      --base) BASE=$2; shift 2 ;;
+      --2b) B2_MAIN=$2; B2_PR=$3; shift 3 ;;
+      --8b) B8_MAIN=$2; B8_PR=$3; shift 3 ;;
+      --cells) CELLS=$2; shift 2 ;;
+      --out) OUT=$2; shift 2 ;;
+      --runs) RUNS=$2; shift 2 ;;
+      --port) PORT=$2; shift 2 ;;
+      --self-test) SELF_TEST=yes; shift ;;
+      *) echo "REFUSING: unknown argument '$1'" >&2; usage ;;
+    esac
+  done
+}
+parse_args "$@"
+
+# The cell groups --cells selected. A group's binary pair is only required
+# when its group is selected.
+WANT_R1_2B=no WANT_C8_2B=no WANT_C8_8B=no
+select_cells() {
+  WANT_R1_2B=no WANT_C8_2B=no WANT_C8_8B=no
+  for G in ${CELLS//,/ }; do
+    case "$G" in
+      rung1-2b) WANT_R1_2B=yes ;;
+      conc8-2b) WANT_C8_2B=yes ;;
+      conc8-8b) WANT_C8_8B=yes ;;
+      *) echo "REFUSING: unknown cell group '$G' in --cells '$CELLS' — known: rung1-2b, conc8-2b, conc8-8b" >&2; return 64 ;;
+    esac
+  done
+  if [ "$WANT_R1_2B$WANT_C8_2B$WANT_C8_8B" = nonono ]; then
+    echo "REFUSING: --cells '$CELLS' selects nothing — the gate is complete or it did not happen" >&2
+    return 64
+  fi
+}
+
+# A main/PR pair that is the same file (same bytes, so the same md5) would
+# run a same-binary ABAB and write a file that compares main with main —
+# vacuous, and it looks valid. Refuse it up front, per pair actually used.
+refuse_identical() {  # refuse_identical <label> <main-bin> <pr-bin>
+  if cmp -s "$2" "$3"; then
+    echo "REFUSING: the $1 main and PR binaries are identical (same bytes, so the same md5) — a same-binary ABAB is a vacuous gate" >&2
+    exit 65
+  fi
+}
+
+# ---- self-test: the parser and the guards, on dummy paths --------------------
+# No pod, no card: catches argument bugs before any card time. The P0 in #690
+# — both --2b paths landing in the main slot, so every file the script wrote
+# would have compared main with main — shipped because nothing checked the
+# parse.
+self_test() {
+  local fails=0 T1 T2
+  check() {  # check <what> <got> <want>
+    if [ "$2" = "$3" ]; then
+      echo "ok: $1"
+    else
+      echo "FAIL: $1: got '$2', want '$3'" >&2
+      fails=$((fails + 1))
+    fi
+  }
+  # Two full 40-hex shas, the shape --head/--base refuse to miss.
+  local H40=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  local B40=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  parse_args --pr 42 --title t --head "$H40" --base "$B40" \
+    --2b /dummy/main-2b /dummy/pr-2b --8b /dummy/main-8b /dummy/pr-8b
+  check '--2b keeps the main binary' "$B2_MAIN" /dummy/main-2b
+  check '--2b keeps the PR binary' "$B2_PR" /dummy/pr-2b
+  check '--8b keeps the main binary' "$B8_MAIN" /dummy/main-8b
+  check '--8b keeps the PR binary' "$B8_PR" /dummy/pr-8b
+  CELLS=rung1-2b
+  select_cells
+  check '--cells rung1-2b keeps the rung-1 cells' "$WANT_R1_2B" yes
+  check '--cells rung1-2b drops the 2b conc-8 cells' "$WANT_C8_2B" no
+  check '--cells rung1-2b drops the 8b conc-8 cells' "$WANT_C8_8B" no
+  CELLS=bogus
+  if select_cells 2>/dev/null; then
+    echo "FAIL: --cells bogus was not refused" >&2; fails=$((fails + 1))
+  else
+    echo "ok: --cells bogus is refused"
+  fi
+  CELLS=""
+  if select_cells 2>/dev/null; then
+    echo "FAIL: an empty --cells was not refused" >&2; fails=$((fails + 1))
+  else
+    echo "ok: an empty --cells is refused"
+  fi
+  T1=$(mktemp); T2=$(mktemp)
+  printf 'same' > "$T1"; cp "$T1" "$T2"
+  if ( refuse_identical selftest "$T1" "$T2" ) 2>/dev/null; then
+    echo "FAIL: the identical-binary guard accepted identical binaries" >&2; fails=$((fails + 1))
+  else
+    echo "ok: the identical-binary guard refuses identical binaries"
+  fi
+  printf 'other' > "$T2"
+  if ( refuse_identical selftest "$T1" "$T2" ) 2>/dev/null; then
+    echo "ok: the identical-binary guard accepts differing binaries"
+  else
+    echo "FAIL: the identical-binary guard refused differing binaries" >&2; fails=$((fails + 1))
+  fi
+  rm -f "$T1" "$T2"
+  if [ "$fails" -gt 0 ]; then
+    echo "self-test: $fails check(s) FAILED" >&2
+    return 1
+  fi
+  echo "self-test: ok"
+}
+if [ "$SELF_TEST" = yes ]; then
+  self_test && exit 0
+  exit 1
+fi
+
+select_cells || exit $?
 refuse_blank() { [ -n "$2" ] || { echo "REFUSING: $1 is required" >&2; exit 64; }; }
 refuse_blank --pr "$PR"; refuse_blank --title "$TITLE"
 refuse_blank --head "$HEAD"; refuse_blank --base "$BASE"
-refuse_blank "--2b main binary" "$B2_MAIN"; refuse_blank "--2b pr binary" "$B2_PR"
-refuse_blank "--8b main binary" "$B8_MAIN"; refuse_blank "--8b pr binary" "$B8_PR"
+if [ "$WANT_R1_2B" = yes ] || [ "$WANT_C8_2B" = yes ]; then
+  refuse_blank "--2b main binary" "$B2_MAIN"; refuse_blank "--2b pr binary" "$B2_PR"
+fi
+if [ "$WANT_C8_8B" = yes ]; then
+  refuse_blank "--8b main binary" "$B8_MAIN"; refuse_blank "--8b pr binary" "$B8_PR"
+fi
 case "$PR" in ''|*[!0-9]*) echo "REFUSING: --pr must be a number" >&2; exit 64 ;; esac
 sha40() { [ ${#1} -eq 40 ] && case "$1" in *[!0-9a-fA-F]*) false ;; *) true ;; esac; }
 sha40 "$HEAD" || { echo "REFUSING: --head is not a full 40-hex commit sha" >&2; exit 64; }
@@ -101,9 +218,18 @@ for PB in p400.txt q3700-1.txt n10k-1.txt; do
 done
 refuse_blank 'DS_1K (the shared conc-8 ~1k dataset)' "${DS_1K:-}"
 [ -f "$DS_1K" ] || { echo "REFUSING: dataset '$DS_1K' not found on this pod" >&2; exit 65; }
-for B in "$B2_MAIN" "$B2_PR" "$B8_MAIN" "$B8_PR"; do
-  [ -x "$B" ] || { echo "REFUSING: '$B' is not an executable scr binary" >&2; exit 69; }
-done
+if [ "$WANT_R1_2B" = yes ] || [ "$WANT_C8_2B" = yes ]; then
+  for B in "$B2_MAIN" "$B2_PR"; do
+    [ -x "$B" ] || { echo "REFUSING: '$B' is not an executable scr binary" >&2; exit 69; }
+  done
+  refuse_identical --2b "$B2_MAIN" "$B2_PR"
+fi
+if [ "$WANT_C8_8B" = yes ]; then
+  for B in "$B8_MAIN" "$B8_PR"; do
+    [ -x "$B" ] || { echo "REFUSING: '$B' is not an executable scr binary" >&2; exit 69; }
+  done
+  refuse_identical --8b "$B8_MAIN" "$B8_PR"
+fi
 
 # A process counts only if it is NOT a zombie: the pods' PID 1 does not reap,
 # so zombie cargo piles up and a naive pgrep sees it forever. Match the
@@ -337,10 +463,21 @@ measure_cell() {  # measure_cell <cell> <kind> <main-bin> <pr-bin> <extra...>
   done
 }
 
-measure_cell r1-2b-16-1k  rung1 "$B2_MAIN" "$B2_PR" 1061
-measure_cell r1-2b-16-10k rung1 "$B2_MAIN" "$B2_PR" 10091
-measure_cell c8-2b-16-1k  conc8 "$B2_MAIN" "$B2_PR" "$M2B"  8 12288
-measure_cell c8-8b-16-1k  conc8 "$B8_MAIN" "$B8_PR" "$M8B"  8 8704
+# ---- run the selected cells, each main's boot then the PR's, back to back -----
+SELECTED=""  # the cell ids that ran, in grid order — the assembler's expected set
+if [ "$WANT_R1_2B" = yes ]; then
+  measure_cell r1-2b-16-1k  rung1 "$B2_MAIN" "$B2_PR" 1061
+  measure_cell r1-2b-16-10k rung1 "$B2_MAIN" "$B2_PR" 10091
+  SELECTED="$SELECTED r1-2b-16-1k r1-2b-16-10k"
+fi
+if [ "$WANT_C8_2B" = yes ]; then
+  measure_cell c8-2b-16-1k  conc8 "$B2_MAIN" "$B2_PR" "$M2B"  8 12288
+  SELECTED="$SELECTED c8-2b-16-1k"
+fi
+if [ "$WANT_C8_8B" = yes ]; then
+  measure_cell c8-8b-16-1k  conc8 "$B8_MAIN" "$B8_PR" "$M8B"  8 8704
+  SELECTED="$SELECTED c8-8b-16-1k"
+fi
 
 # ---- assemble the progress entry, enforcing the site's own laws ---------------
 # The cell ids above carry the sweep grid's coordinates; this maps them to
@@ -348,15 +485,16 @@ measure_cell c8-8b-16-1k  conc8 "$B8_MAIN" "$B8_PR" "$M8B"  8 8704
 # its side's LAST run; every side needs RUNS runs; both sides the same
 # count — the same laws the site's loader enforces, so a file this script
 # writes cannot be one the page refuses.
-python3 - "$PR" "$TITLE" "$HEAD" "$BASE" "$RUNS_JSONL" "$DEST" "$(hostname)" "$RUNS" "$CORES" <<'PY'
+python3 - "$PR" "$TITLE" "$HEAD" "$BASE" "$RUNS_JSONL" "$DEST" "$(hostname)" "$RUNS" "$CORES" "$SELECTED" <<'PY'
 import collections
 import datetime
 import json
 import os
 import sys
 
-pr, title, head, base, runs_path, dest, pod, runs, cores = sys.argv[1:10]
+pr, title, head, base, runs_path, dest, pod, runs, cores, selected = sys.argv[1:11]
 pr = int(pr)
+selected = selected.split()
 
 # cell id -> (model, dtype, conc, context, note)
 GRID = {
@@ -370,6 +508,22 @@ GRID = {
                      "conc-8: vllm bench serve on the shared ~1k dataset, 16 prompts, out 256"),
 }
 
+# The metrics each cell id carries: the rung-1 client reports TTFT and ITL,
+# the conc-8 bench reports tok/s and TPOT.
+CELL_METRICS = {
+    "r1-2b-16-1k": ("ttft_ms", "itl_ms"),
+    "r1-2b-16-10k": ("ttft_ms", "itl_ms"),
+    "c8-2b-16-1k": ("tok_s", "itl_ms"),
+    "c8-8b-16-1k": ("tok_s", "itl_ms"),
+}
+if not selected:
+    print("pr_cells: REFUSED: no cells were selected -- verdict over nothing "
+          "must fail", file=sys.stderr)
+    sys.exit(1)
+# Exactly the selected cells, no more, no less — a subset gate is a subset
+# file, and a dropped cell still fails the run.
+expected = {(cell, metric) for cell in selected for metric in CELL_METRICS[cell]}
+
 runs_needed = int(runs)
 by = collections.defaultdict(list)  # (cell, metric, side) -> [(run, value)]
 with open(runs_path) as f:
@@ -381,6 +535,9 @@ cells = {}
 problems = []
 for (cell_id, metric, side), got in sorted(by.items()):
     key = (cell_id, metric)
+    if cell_id not in GRID:
+        problems.append(f"unknown cell id '{cell_id}' in the runs")
+        continue
     model, dtype, conc, context, note = GRID[cell_id]
     got.sort()
     values = [v for _, v in got]
@@ -402,10 +559,6 @@ for key, c in sorted(cells.items()):
     if len(c["reps"]["main"]) != len(c["reps"]["pr"]):
         problems.append(f"{key[0]} {key[1]}: main and pr run counts differ")
 
-expected = {("r1-2b-16-1k", "ttft_ms"), ("r1-2b-16-1k", "itl_ms"),
-            ("r1-2b-16-10k", "ttft_ms"), ("r1-2b-16-10k", "itl_ms"),
-            ("c8-2b-16-1k", "tok_s"), ("c8-2b-16-1k", "itl_ms"),
-            ("c8-8b-16-1k", "tok_s"), ("c8-8b-16-1k", "itl_ms")}
 if set(cells) != expected:
     missing = expected - set(cells)
     extra = set(cells) - expected
