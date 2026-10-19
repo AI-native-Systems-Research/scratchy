@@ -86,7 +86,6 @@ fn load(site: &Site) -> Result<Vec<Run>, String> {
                 m.model_id
             ));
         }
-        run.mark_dead();
         run.file = f;
         runs.push(run);
     }
@@ -2476,8 +2475,9 @@ mod tests {
 
     /// The published runs' cells a dead server measured (#413) are marked, and no other: the
     /// glm-4.5-air and qwen3.6-35b-a3b cells of the M1 Max run in #472, and the M3 Pro's gemma
-    /// 4096-token cells after its OOM (#412), while every engine that stops at EOS early (ollama,
-    /// oMLX) keeps its numbers.
+    /// 4096-token cells from the one its OOM struck in (#412), 4096x16, which still streamed a
+    /// few tokens, on. Every engine that stops at EOS early (ollama, oMLX) keeps its numbers, and
+    /// so does scratchy's f378699e gemma cell at 16 users, live at 99% of its tokens.
     #[test]
     fn the_published_cells_of_a_dead_server_and_only_those_are_marked() {
         use super::numbers::{Engine, Metric, timing};
@@ -2501,10 +2501,10 @@ mod tests {
             }
         }
         let want = [
-            ("649ebce2", "gemma-4-26b-a4b-it", "scratchy", 2),
+            ("649ebce2", "gemma-4-26b-a4b-it", "scratchy", 3),
             ("c8860b1d", "glm-4.5-air", "scratchy", 22),
             ("c8860b1d", "qwen3.6-35b-a3b", "scratchy", 10),
-            ("cc51e0d8", "gemma-4-26b-a4b-it", "scratchy", 2),
+            ("cc51e0d8", "gemma-4-26b-a4b-it", "scratchy", 3),
         ];
         let want: std::collections::BTreeMap<_, _> = (want.iter())
             .map(|&(sha, stem, e, n)| ((sha.to_string(), stem, e), n))

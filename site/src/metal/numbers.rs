@@ -125,22 +125,6 @@ impl Engine {
         .unwrap_or_default()
     }
 
-    /// [`Engine::cells`], to mark them ([`super::data::Run::mark_dead`]).
-    pub fn cells_mut(self, m: &mut Model) -> &mut [Cell] {
-        match self {
-            Engine::Scratchy => &mut m.scaling,
-            Engine::OmlxTq => &mut m.scaling_omlx_tq,
-            Engine::Omlx => &mut m.scaling_omlx,
-            Engine::MlxLm => &mut m.scaling_mlx_lm,
-            Engine::VllmMetal => &mut m.scaling_vllm_metal,
-            Engine::Ollama => &mut m.scaling_ollama,
-            Engine::LlamaCpp => &mut m.scaling_llama_cpp,
-            Engine::Mistralrs => &mut m.scaling_mistralrs,
-        }
-        .as_deref_mut()
-        .unwrap_or_default()
-    }
-
     /// Whether this run measured the engine for this model at all.
     pub fn ran(self, m: &Model) -> bool {
         !self.ladder(m).is_empty() || !self.cells(m).is_empty()

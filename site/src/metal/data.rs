@@ -9,55 +9,75 @@ use std::path::PathBuf;
 use serde::{Deserialize, Deserializer};
 
 #[derive(Deserialize)]
+#[serde(try_from = "RawRun")]
 pub struct Run {
-    #[serde(rename = "schema")]
-    _schema: Schema,
     pub generated_utc: Utc,
-    #[serde(rename = "generator")]
-    _generator: NonEmpty,
     pub machine: Machine,
     pub repo: Repo,
     pub config: Config,
     pub models: Vec<Model>,
     /// Models the runner left out on this machine, and why (memory).
-    #[serde(default)]
     pub skipped_models: Option<Vec<Skipped>>,
     /// The file it was read from, for the link to it.
-    #[serde(skip)]
     pub file: PathBuf,
 }
 
-/// A cell whose requests delivered less than this share of the answer tokens they asked for
-/// measured a server that had stopped answering: a dead scratchy server answers at once, or after
-/// its 60 s watchdog, with 0–22 tokens of thousands (#413). Every engine's real cells deliver
-/// 14% or more, as an engine that stops at EOS despite `ignore_eos` does (ollama; oMLX, #479).
-const DEAD_BELOW: f64 = 0.05;
+#[derive(Deserialize)]
+struct RawRun {
+    #[serde(rename = "schema")]
+    _schema: Schema,
+    generated_utc: Utc,
+    #[serde(rename = "generator")]
+    _generator: NonEmpty,
+    machine: Machine,
+    repo: Repo,
+    config: Config,
+    models: Vec<Model>,
+    #[serde(default)]
+    skipped_models: Option<Vec<Skipped>>,
+}
 
-impl Run {
-    /// Mark each cell whose server had stopped answering ([`DEAD_BELOW`]), so the page shows no
-    /// number from it. Runs from before the bench counted those requests as failed published them
-    /// as measured.
-    pub fn mark_dead(&mut self) {
-        let base = self.config.base().and_then(|b| b.output);
-        for m in &mut self.models {
-            for e in super::numbers::Engine::ALL {
-                for c in e.cells_mut(m) {
-                    let asked = match c.at {
-                        At::Grid { output, .. } | At::Output(output) => Some(output),
-                        At::Conc(_) | At::Input(_) => base,
-                    };
-                    let asked = asked
-                        .zip(c.completed)
-                        .map(|(n, k)| u64::from(n) * u64::from(k));
-                    c.dead = match (c.total_output_tokens, asked) {
-                        (Some(got), Some(asked)) if asked > 0 => {
-                            (got as f64) < DEAD_BELOW * asked as f64
-                        }
-                        _ => false,
-                    };
+/// The least share of the answer tokens a cell's requests asked for that a live server delivers,
+/// below which the cell measured one that had stopped answering (#413): `(scratchy, every other
+/// engine)`. scratchy honours `ignore_eos`, so a live scratchy server delivers all of them (440 of
+/// its 479 published cells exactly, the rest 99% or more), and a dying one 0–20%. The others stop
+/// at EOS on their own, at as little as 14.6% of them (ollama; oMLX 35.7%, #479), so only a share
+/// under any of theirs marks one of their cells.
+const LIVE_SHARE: (f64, f64) = (0.5, 0.05);
+
+impl TryFrom<RawRun> for Run {
+    type Error = String;
+    fn try_from(r: RawRun) -> Result<Self, String> {
+        let mut models = r.models;
+        let base = r.config.base().and_then(|b| b.output);
+        let (scratchy, others) = LIVE_SHARE;
+        for m in &mut models {
+            let rivals = [
+                &mut m.scaling_omlx_tq,
+                &mut m.scaling_omlx,
+                &mut m.scaling_mlx_lm,
+                &mut m.scaling_vllm_metal,
+                &mut m.scaling_ollama,
+                &mut m.scaling_llama_cpp,
+                &mut m.scaling_mistralrs,
+            ];
+            let judged = std::iter::once((&mut m.scaling, scratchy))
+                .chain(rivals.into_iter().map(|cells| (cells, others)));
+            for (cells, live) in judged {
+                for c in cells.iter_mut().flatten() {
+                    c.dead = c.delivered(base).is_some_and(|share| share < live);
                 }
             }
         }
+        Ok(Run {
+            generated_utc: r.generated_utc,
+            machine: r.machine,
+            repo: r.repo,
+            config: r.config,
+            models,
+            skipped_models: r.skipped_models,
+            file: PathBuf::new(),
+        })
     }
 }
 
@@ -428,8 +448,23 @@ pub struct Cell {
     /// The answer tokens its requests delivered; None in runs from before
     /// the run file kept it.
     pub total_output_tokens: Option<u64>,
-    /// Whether the server it measured had stopped answering (`Run::mark_dead`).
+    /// Whether the server it measured had stopped answering ([`LIVE_SHARE`]), decided as its run
+    /// loads.
     pub dead: bool,
+}
+
+impl Cell {
+    /// The share of the answer tokens its completed requests asked for that they delivered: its
+    /// answer length is its rung's, or the run's `base` one. None where the run file kept no count.
+    fn delivered(&self, base: Option<u32>) -> Option<f64> {
+        let asked = match self.at {
+            At::Grid { output, .. } | At::Output(output) => Some(output),
+            At::Conc(_) | At::Input(_) => base,
+        };
+        let asked = u64::from(asked?) * u64::from(self.completed?);
+        let got = self.total_output_tokens?;
+        (asked > 0).then(|| got as f64 / asked as f64)
+    }
 }
 
 #[derive(Deserialize)]
