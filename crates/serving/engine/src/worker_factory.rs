@@ -164,8 +164,9 @@ pub trait WorkerFactory: Sync {
         None
     }
 
-    /// Recommended max working-set size (bytes) for the active backend, if the
-    /// backend exposes one (e.g. Metal's `recommendedMaxWorkingSetSize`).
+    /// The working set (bytes) the active backend's budgets size from, if the
+    /// backend exposes one (Metal: the smaller of `recommendedMaxWorkingSetSize`
+    /// and the GPU wired limit).
     fn recommended_working_set_size(&self) -> Option<u64> {
         None
     }

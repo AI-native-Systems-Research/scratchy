@@ -153,34 +153,60 @@ pub fn gpu_cores(device: &ProtocolObject<dyn MTLDevice>) -> Option<GpuCores> {
     u32::try_from(cores).ok().filter(|&n| n > 0).map(GpuCores)
 }
 
-/// The most memory the GPU driver wires at once, the whole system's GPU buffers together: the
-/// `iogpu.wired_limit_mb` sysctl where set, else macOS's default of it — 2/3 of physical memory
-/// up to 36 GiB, 3/4 above.
+/// The most memory the GPU driver wires at once, the whole system's GPU buffers together, in
+/// bytes ([`gpu_wired_limit`]).
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct GpuWiredLimit(pub u64);
+
+impl GpuWiredLimit {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// The GPU wired limit: the `iogpu.wired_limit_mb` sysctl where set, else macOS's default of it,
+/// 2/3 of physical memory up to 36 GiB and 3/4 above.
 ///
 /// `recommendedMaxWorkingSetSize` reports the limit where the sysctl sets it, but overstates the
 /// default: 28.08 GiB on a 36 GiB M3 Pro, whose command buffers fault out of memory once the
 /// system's wired memory nears 24 GiB (and run at a 24 GiB sysctl, where it reports 24). `None`
 /// if the kernel answers neither sysctl.
-pub fn gpu_wired_limit_bytes() -> Option<u64> {
-    fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
-        let mut value = 0u64;
-        let mut len = std::mem::size_of::<u64>();
-        // SAFETY: `value` is a `u64` of `len` bytes; a sysctl narrower than that writes fewer and
-        // says so in `len`, which zero-initialised `value` covers on little-endian Apple silicon.
-        let status = unsafe {
-            libc::sysctlbyname(
-                name.as_ptr(),
-                (&raw mut value).cast(),
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        (status == 0).then_some(value)
-    }
-    match sysctl_u64(c"iogpu.wired_limit_mb") {
-        Some(mb) if mb > 0 => Some(mb << 20),
-        _ => sysctl_u64(c"hw.memsize").map(default_gpu_wired_limit),
+pub fn gpu_wired_limit() -> Option<GpuWiredLimit> {
+    let bytes = match sysctl_uint(c"iogpu.wired_limit_mb") {
+        Some(mb) if mb > 0 => mb << 20,
+        _ => default_gpu_wired_limit(sysctl_uint(c"hw.memsize")?),
+    };
+    Some(GpuWiredLimit(bytes))
+}
+
+/// The working set a budget on `device` sizes from: the smaller of what Metal recommends and the
+/// GPU wired limit ([`gpu_wired_limit`]). Every Metal budget reads this one figure, so a default
+/// sized against it never trips a guard sized against another.
+pub fn usable_working_set(device: &ProtocolObject<dyn MTLDevice>) -> u64 {
+    let recommended = device.recommendedMaxWorkingSetSize();
+    gpu_wired_limit().map_or(recommended, |limit| recommended.min(limit.get()))
+}
+
+/// An unsigned integer sysctl, 4 or 8 bytes wide (`iogpu.wired_limit_mb` is an `int`,
+/// `hw.memsize` a `uint64_t`). `None` if the kernel does not answer, or answers another width.
+fn sysctl_uint(name: &std::ffi::CStr) -> Option<u64> {
+    let mut buf = [0u8; 8];
+    let mut len = buf.len();
+    // SAFETY: `buf` holds `len` bytes; the kernel writes at most that many and sets `len` to the
+    // count it wrote, which the match below decodes by width.
+    let status = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    match (status, len) {
+        (0, 4) => Some(u64::from(u32::from_ne_bytes(buf[..4].try_into().ok()?))),
+        (0, 8) => Some(u64::from_ne_bytes(buf)),
+        _ => None,
     }
 }
 
@@ -217,10 +243,19 @@ mod tests {
         assert_eq!(default_gpu_wired_limit(128 << 30), 96 << 30);
     }
 
+    /// Both sysctls the limit reads answer on a Mac, each at its own width:
+    /// `iogpu.wired_limit_mb` (an `int`, 0 where unset) and `hw.memsize` (a `uint64_t`). The
+    /// limit is the sysctl where it is set, else the default from memory.
     #[test]
     fn the_gpu_wired_limit_is_read_from_the_kernel() {
-        let limit = gpu_wired_limit_bytes().expect("iogpu.wired_limit_mb or hw.memsize");
-        assert!(limit > 0);
+        let mb = sysctl_uint(c"iogpu.wired_limit_mb").expect("iogpu.wired_limit_mb answers");
+        let memsize = sysctl_uint(c"hw.memsize").expect("hw.memsize answers");
+        assert!(memsize >= 8 << 30, "hw.memsize {memsize}");
+        let limit = gpu_wired_limit().expect("a limit").get();
+        match mb {
+            0 => assert_eq!(limit, default_gpu_wired_limit(memsize)),
+            mb => assert_eq!(limit, mb << 20),
+        }
     }
 
     #[test]

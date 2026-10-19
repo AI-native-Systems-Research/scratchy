@@ -985,7 +985,7 @@ fn published_head(
 ///     (the cheapest "same tokenizer" assertion that survives metadata
 ///     differences like padding-token whitespace).
 ///   * On metal builds: weight bytes + a coarse KV estimate fit under
-///     `recommendedMaxWorkingSetSize`.
+///     the usable working set (`recommended_working_set_size`).
 ///
 /// Files that don't exist locally trigger `resolve_model_path`'s normal
 /// HF download path — so a misconfigured draft URL surfaces here, not
@@ -1180,7 +1180,7 @@ fn spec_decode_memory_budget_check(
     if total_w > weight_budget {
         anyhow::bail!(
             "estimated combined weight footprint {} > {} (60% of \
-             recommendedMaxWorkingSetSize × gpu_memory_utilization={:.2}). \
+             the working set × gpu_memory_utilization={:.2}). \
              Breakdown: target_weights={}, draft_weights={}. \
              Either pick a smaller draft, reduce --gpu-memory-utilization, \
              or run on a machine with more unified memory.",

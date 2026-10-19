@@ -247,8 +247,8 @@ pub struct MetalWorker {
     // Metal-only state (Phase F: cfg-mutex extension).
     // ---------------------------------------------------------------
     /// Shared `MetalDevice` handle. Set in `init_device`; carries
-    /// `recommended_max_working_set_size` / `current_allocated_size`
-    /// for `determine_available_memory`'s pre-load profile path.
+    /// its usable working set / `current_allocated_size` for
+    /// `determine_available_memory`'s pre-load profile path.
     metal_device: Option<std::sync::Arc<scratchy_target_metal::device::MetalDevice>>,
     /// Device + command queue + caching allocator. Built lazily in
     /// `load_model` from `metal_device.device.clone()` once we know we
@@ -1290,7 +1290,7 @@ impl MetalWorker {
                     .as_ref()
                     .map(|dev| {
                         (
-                            (dev.device.recommendedMaxWorkingSetSize() as f64
+                            (scratchy_target_metal::device::usable_working_set(&dev.device) as f64
                                 * self.config.gpu_memory_utilization)
                                 as usize,
                             dev.device.currentAllocatedSize(),
@@ -1397,7 +1397,7 @@ impl MetalWorker {
             let device = self.metal_device.as_ref();
             MetalBudget {
                 total: device.map_or(0, |dev| {
-                    (dev.device.recommendedMaxWorkingSetSize() as f64
+                    (scratchy_target_metal::device::usable_working_set(&dev.device) as f64
                         * self.config.gpu_memory_utilization) as usize
                 }),
                 resident: device.map_or(0, |dev| dev.device.currentAllocatedSize()),
@@ -6174,14 +6174,15 @@ impl Worker for MetalWorker {
         // only to the working-set term and then floor at `maxBufferLength`:
         // applying util to maxBufferLength too would push the budget below
         // the weight footprint on this box and falsely trip the OOM guard.
-        // ...and Apple's figure overstates what the GPU driver wires at its default limit
-        // (`gpu_wired_limit_bytes`): gemma-4-26b on a 36 GiB M3 Pro budgeted 25.3 GiB of a
-        // reported 28.08 GiB, and its first 8×4096-token batch faulted out of memory once the
-        // system's wired memory neared 24 GiB, the limit macOS sets there. Size from the smaller.
+
+        // Apple's figure also overstates what the GPU driver wires at its default limit: gemma-4-26b
+        // on a 36 GiB M3 Pro budgeted 25.3 GiB of a reported 28.08 GiB, and its first 8×4096-token
+        // batch faulted out of memory once the system's wired memory neared 24 GiB, the limit macOS
+        // sets there. Every Metal budget sizes from the smaller (`usable_working_set`); this one,
+        // read once per load, says when the limit binds.
         let recommended = metal_device.device.recommendedMaxWorkingSetSize() as usize;
-        let wired_limit = scratchy_target_metal::device::gpu_wired_limit_bytes()
-            .and_then(|b| usize::try_from(b).ok());
-        let working_set = recommended.min(wired_limit.unwrap_or(usize::MAX));
+        let working_set =
+            scratchy_target_metal::device::usable_working_set(&metal_device.device) as usize;
         if working_set < recommended {
             info!(
                 "ScratchyWorker(metal): working set {:.2} GiB, the GPU wired limit, below the \
@@ -8270,7 +8271,7 @@ impl crate::worker_factory::WorkerFactory for MetalWorkerFactory {
     }
 
     fn recommended_working_set_size(&self) -> Option<u64> {
-        crate::metal_info::recommended_max_working_set_size()
+        crate::metal_info::usable_working_set()
     }
 }
 
