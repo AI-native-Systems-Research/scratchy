@@ -424,22 +424,10 @@ pub(crate) fn run_prefill_batch(
         num_q_heads: nqh,
         mq_pad,
         // The causal mask laid out as the emitter's new-token block reads it — the SAME law, on the same
-        // three facts the bake keyed it on: the rung's rows, the head dim, and whether rows are requests.
-        // The head dim and the kv-head count come off the SAME baked geometry the head count above did
-        // (`nqh`, off `b.wiring`): the emitter keyed the form on the program's own head dim, and the
-        // chunk form's slab ceiling (≤ 2 slabs, i.e. head dim ≤ 128) is a UNIFORM model's one head dim —
-        // a hybrid-attention arch's every class exceeds it, so the sub-block count (`nqh`) is what all
-        // of its classes read.
-        causal_heads_per_block: scratchy_subtile::sdsc_abstract::NewBlockForm::of(
-            mq as u32,
-            b.wiring.geometry.head_dim,
-            per_request.is_some(),
-        )
-        .mask_heads_per_block(
-            nqh as u32,
-            b.wiring.geometry.kv_dim / b.wiring.geometry.head_dim,
-            b.wiring.geometry.head_dim,
-        ) as usize,
+        // three facts the bake keyed it on (the rung's rows and whether rows are requests, both carried
+        // by the key; the head dim), off the SAME baked geometry the head count above came from. The
+        // session's load-time staging of its full-chunk mask reads this one law too.
+        causal_heads_per_block: b.wiring.causal_heads_per_block(causal),
         embed_tokens: sh.embed_tokens,
         tokens: &tokens,
         positions: &positions,
@@ -1577,7 +1565,7 @@ pub(crate) fn superdsc_forward_chunk(
             // One row: always the sub-blocked form (`NewBlockForm::of(1, …)`), whose block is every
             // head — the SAME baked count as `num_q_heads` above, never the `h / hd` quotient (that is
             // the head count only for a square Q projection; see the site above).
-            causal_heads_per_block: b.wiring.geometry.nqh as usize,
+            causal_heads_per_block: b.wiring.causal_heads_per_block(causal),
             embed_tokens: sh.embed_tokens,
             tokens: &[tok],
             positions: &[p as u32],

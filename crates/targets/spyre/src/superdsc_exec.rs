@@ -1529,6 +1529,45 @@ impl Executor {
         Ok(())
     }
 
+    /// ⭐ [`Self::bind_input_keyed`], UPLOADED NOW — a session's load-time staging of the keyed
+    /// activation its first launch would otherwise bind. The upload is the refill a predict runs
+    /// first, so a launch under `key` then finds it held ([`Self::keyed_holds`]) and sends nothing for
+    /// `id`, and a launch under any other key re-binds over it exactly as it would over a key a
+    /// previous launch left.
+    ///
+    /// ⛔ A STAGED CONSTANT FILLS ITS PLACEMENT EXACTLY. The refill guard refuses only OVER-binds,
+    /// because several per-step activations bind less than they reserve; an under-bind of an ADDITIVE
+    /// mask leaves a tail the ops read as ZERO, i.e. as "no mask". Staging is done once, at load, for
+    /// a buffer whose size is a law of the rung, so a size that is not the placement's is a
+    /// wiring/layout desync, refused here rather than served.
+    ///
+    /// Returns the bytes the upload sent.
+    pub fn stage_keyed(
+        &mut self,
+        id: bundle::PlaceId,
+        key: scratchy_subtile::sdsc_abstract::CausalKey,
+        bytes: Vec<u8>,
+    ) -> Result<u64> {
+        let placed = self
+            .places
+            .get(&id)
+            .ok_or_else(|| anyhow!("stage_keyed('{id}'): this bundle places no such tensor"))?
+            .size;
+        if bytes.len() as u64 != placed {
+            bail!(
+                "stage_keyed('{id}', {key:?}): {} B staged into a {placed} B placement — a staged \
+                 constant must fill its placement exactly",
+                bytes.len()
+            );
+        }
+        self.bind_input_keyed(id, key, bytes)?;
+        let (_, sent) = self.refill_activations(Diag::get())?;
+        self.stream_ref()?
+            .synchronize()
+            .map_err(|e| anyhow!("stage_keyed('{id}'): sync: {e}"))?;
+        Ok(sent)
+    }
+
     /// ⭐⭐⭐⭐⭐ MINT THE ONLY VALUE [`Self::bind_input_raw`] ACCEPTS — the payload measured against
     /// the placement it will be written into, in one step, by the session that owns both.
     ///

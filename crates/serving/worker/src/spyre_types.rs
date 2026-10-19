@@ -406,6 +406,12 @@ impl PrefixLadder {
     pub(crate) fn session(&mut self, rung: PrefixRung) -> &mut SuperDscSession {
         &mut self.0[rung.index].1
     }
+
+    /// Every rung's baked width and session, ascending — for load-time staging, which visits each
+    /// session once and chooses none.
+    pub(crate) fn rungs_mut(&mut self) -> impl Iterator<Item = (usize, &mut SuperDscSession)> {
+        self.0.iter_mut().map(|(m, s)| (*m, s))
+    }
 }
 
 #[cfg(feature = "spyre-hw")]

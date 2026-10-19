@@ -457,6 +457,33 @@ impl Wiring {
         }
     }
 
+    /// ⭐ QUERY HEADS PER STAGED CAUSAL-MASK BLOCK for a launch under `key` — the emitter's
+    /// [`NewBlockForm`] law on the three facts the bake keyed it on: the rows, the head dim and
+    /// whether the rows are requests. The key carries the first and the third (a
+    /// [`CausalKey::Batch`]'s rows are requests, a [`CausalKey::Chunk`]'s are one prompt's); the head
+    /// dim and the kv-head count are this wiring's baked geometry, the same the head count is. The
+    /// emitter keyed the form on the program's own head dim, and the chunk form's slab ceiling (≤ 2
+    /// slabs, i.e. head dim ≤ 128) is a UNIFORM model's one head dim — a hybrid-attention arch's every
+    /// class exceeds it, so the sub-block count (`nqh`) is what all of its classes read.
+    ///
+    /// The ONE answer for every staging site — a prompt chunk's launch, a decode step's, and a
+    /// session's load-time staging of its full-chunk mask — so a mask staged at load is blocked the
+    /// way the launch that finds it held would have blocked it.
+    ///
+    /// [`NewBlockForm`]: scratchy_subtile::sdsc_abstract::NewBlockForm
+    /// [`CausalKey::Batch`]: scratchy_subtile::sdsc_abstract::CausalKey::Batch
+    /// [`CausalKey::Chunk`]: scratchy_subtile::sdsc_abstract::CausalKey::Chunk
+    pub fn causal_heads_per_block(&self, key: scratchy_subtile::sdsc_abstract::CausalKey) -> usize {
+        use scratchy_subtile::sdsc_abstract::{CausalKey, NewBlockForm};
+        let g = &self.geometry;
+        let rows_are_requests = matches!(key, CausalKey::Batch { .. });
+        NewBlockForm::of(key.rows() as u32, g.head_dim, rows_are_requests).mask_heads_per_block(
+            g.nqh,
+            g.kv_dim / g.head_dim,
+            g.head_dim,
+        ) as usize
+    }
+
     /// The query-row CAPACITY this bundle was baked at — the embedding activation's placement rows.
     ///
     /// ⛔⛔⛔ THIS IS A CAPACITY, NOT THE ROW COUNT OF A LAUNCH, AND IT IS NOT WHAT THE TAPE
@@ -1864,6 +1891,129 @@ mod constant_tape_tests {
                 .verify_causal_placement(&lay_missing, mq, width)
                 .is_err(),
             "a wiring whose layout never placed the causal mask must refuse"
+        );
+    }
+
+    /// ⭐⭐⭐ THE MASK A SESSION STAGES AT LOAD IS THE MASK ITS FIRST FULL LAUNCH WOULD HAVE BUILT —
+    /// at every rung either prompt ladder bakes, on both head-blocking forms.
+    ///
+    /// The launch side is played, not restated: the rung's `ForwardShape` from
+    /// [`Wiring::forward_shape_within`] (the prefill launch's own call), its `CausalMask` step, and
+    /// `kernel_values` on the inputs the prefill launch builds — the key `Chunk { rows, rows }` of a
+    /// full chunk, the baked head count, the `div_ceil(64)·64` pad, the wiring's head blocking. The
+    /// staged side is [`causal_full_chunk`] at the rung's width. Equal bytes is what makes "the
+    /// session already holds this key" at the first full chunk mean "the device already holds this
+    /// launch's mask".
+    ///
+    /// And the staged buffer is exactly the placement the load-time cross-check
+    /// ([`Wiring::verify_causal_placement`]) admits, since `stage_keyed` refuses any other size.
+    ///
+    /// Not vacuous: on the chunk-formed rungs (granite's hd 64 and 128 past one stick) the head
+    /// blocking is NOT all heads, and the all-heads tiling is a different buffer — so a staging that
+    /// took the sub-block count, or a launch that did, would fail here.
+    ///
+    /// [`causal_full_chunk`]: crate::forward_tape::causal_full_chunk
+    #[test]
+    fn a_load_staged_causal_mask_is_the_first_full_launchs_mask_at_every_rung() {
+        use crate::forward_tape::{
+            ForwardInputs, ForwardKernel, Staged, causal_full_chunk, causal_tiled, kernel_values,
+        };
+        use crate::lower_subtile_tape_to_superdsc as sd;
+        use scratchy_subtile::sdsc_abstract::{CausalKey, NewBlockForm, RungWidth};
+        // (hidden, head dim, query heads, kv dim): granite-3.1-2b, granite-3.1-8b, a gemma-4 class.
+        let models = [
+            (2048u32, 64u32, 32u32, 512u32),
+            (4096, 128, 32, 1024),
+            (3840, 256, 16, 2048),
+        ];
+        let mut chunk_formed_checked = 0;
+        for (hidden, head_dim, nqh, kv_dim) in models {
+            let w = Wiring {
+                geometry: Geometry {
+                    hidden,
+                    kv_dim,
+                    head_dim,
+                    nqh,
+                    ..uniform_wiring().geometry
+                },
+                ..uniform_wiring()
+            };
+            // Both ladders' widths (the prefix-free ladder's, the prefix ladder's 256/512), both sides
+            // of a stick, and the solo decode session's one row.
+            for rows in [1u32, 7, 35, 63, 64, 65, 128, 192, 256, 384, 512] {
+                let width = RungWidth::of_baked_rows(rows).expect("a width");
+                let (id, key, staged) = causal_full_chunk(&w, width);
+                assert_eq!(id, bundle::PlaceId::Act(sd::ATTN_CAUSAL_TID));
+                // THE LAUNCH, played: the shape the prefill launch asks for at this rung, its causal
+                // step, and the inputs a full chunk of it builds.
+                let shape = w.forward_shape_within(
+                    RowCapacity::of_baked_rung(width),
+                    StagedRows::of_launch(rows as usize).expect("rows > 0"),
+                    false,
+                    GathersKv::of(&BakeFacts::NONE),
+                    StagesSubpageBank::of(&BakeFacts::NONE),
+                    0,
+                );
+                let step = shape
+                    .steps()
+                    .into_iter()
+                    .find(|s| s.kernel == ForwardKernel::CausalMask)
+                    .expect("every forward stages the causal mask");
+                let causal = CausalKey::chunk(width, rows as usize).expect("a full chunk");
+                let mq_pad = (rows as usize).div_ceil(64) * 64;
+                let inp = ForwardInputs::<fn(usize) -> bool> {
+                    hidden: hidden as usize,
+                    num_q_heads: nqh as usize,
+                    mq_pad,
+                    causal_heads_per_block: w.causal_heads_per_block(causal),
+                    embed_tokens: &[],
+                    tokens: &[],
+                    positions: &[],
+                    causal,
+                    prefix: None,
+                    consts: &[],
+                    mask_neg: scratchy_subtile::sdsc_abstract::ATTN_MASK_NEG,
+                    stick_major: true,
+                    kv_blocks: None,
+                };
+                let launched = match kernel_values(&step, &shape, &inp).expect("a causal mask") {
+                    Staged::F32(v) => v.into_owned(),
+                    _ => panic!("the causal mask stages as f32"),
+                };
+                let at = format!("hd {head_dim} nqh {nqh} rows {rows}");
+                assert_eq!(key, causal, "{at}: the staged key is the full chunk's");
+                assert!(staged == launched, "{at}: staged bytes != first launch's");
+                // The placement the load-time cross-check admits is exactly the staged buffer.
+                let mut lay = class_layout(&[]);
+                lay.places.to_mut().push(bundle::Placement {
+                    id,
+                    segment: 3,
+                    bank: 0,
+                    offset: 0,
+                    size: staged.len() as u64 * 2,
+                    is_logits: false,
+                });
+                w.verify_causal_placement(&lay, rows, mq_pad as u32)
+                    .unwrap_or_else(|e| panic!("{at}: {e}"));
+                // Non-vacuity: where the bake chunk-forms the new block past one stick, the blocking
+                // is per kv head (or per query head) and the all-heads tiling is a different buffer.
+                if NewBlockForm::of(rows, head_dim, false) == NewBlockForm::Chunk && mq_pad > 64 {
+                    assert_ne!(w.causal_heads_per_block(causal), nqh as usize, "{at}");
+                    let all_heads = causal_tiled(
+                        &causal.mask(),
+                        rows as usize,
+                        mq_pad,
+                        nqh as usize,
+                        nqh as usize,
+                    );
+                    assert!(staged != all_heads, "{at}: the blocking must matter here");
+                    chunk_formed_checked += 1;
+                }
+            }
+        }
+        assert!(
+            chunk_formed_checked >= 10,
+            "the chunk-formed rungs must be exercised, got {chunk_formed_checked}"
         );
     }
 

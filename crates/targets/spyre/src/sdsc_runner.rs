@@ -565,6 +565,18 @@ impl SuperDscSession {
         self.exec.bind_input_keyed(id, key, f32_to_f16_le(vals))
     }
 
+    /// [`Self::bind_keyed`], uploaded NOW rather than by the next step — a session's load-time
+    /// staging of what its first launch would bind (see `Executor::stage_keyed`). Returns the bytes
+    /// sent.
+    pub fn stage_keyed(
+        &mut self,
+        id: crate::bundle_code::PlaceId,
+        key: scratchy_subtile::sdsc_abstract::CausalKey,
+        vals: &[f32],
+    ) -> Result<u64> {
+        self.exec.stage_keyed(id, key, f32_to_f16_le(vals))
+    }
+
     fn run_step_inner(
         &mut self,
         n_new: usize,
