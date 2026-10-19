@@ -497,7 +497,7 @@ fn assemble_from_opspec(
 /// `OpSpec::attach_fused_epilogue`), not a
 /// one-off for any single caller. `epi` is a typed operand handle (its OWN tag is irrelevant here —
 /// only its device NAME is read; `attach_fused_epilogue` clones THIS op's own output shape/layout
-/// onto it, matching `bmm.ddl`'s bnA/bnB/bias/resadd convention exactly) at device offset `epi_off`.
+/// onto it, matching `bmm.ddl`'s bias/resadd convention exactly) at device offset `epi_off`.
 ///
 /// PANICS if `op.time() != 1` (a tiled matmul) — the epilogue operand is not threaded through
 /// `rewrite_op_for_time_tile`'s per-trip affine-stride machinery, so fusing onto a tiled matmul would
@@ -521,15 +521,15 @@ fn assemble_from_opspec_with_epilogue<E: crate::sdsc_abstract::KindTag>(
         "assemble_matmul {op_name}: a fused epilogue needs an untiled (time=1) matmul — got time={}",
         op.time()
     );
-    op.attach_fused_epilogue(crate::superdsc_opspec::EpilogueSpecs::One(
-        crate::superdsc_opspec::EpilogueSpec {
+    op.attach_fused_epilogue(crate::superdsc_opspec::EpilogueSpecs {
+        one: crate::superdsc_opspec::EpilogueSpec {
             operand_name: epi.name().to_string(),
             offset_elems: epi_off.into_raw_elems(),
             op_func: epi_op_func,
             broadcast_dims,
             broadcast_batch,
         },
-    ));
+    });
     assemble_from_opspec(op_name, op, sym_id_base, layout)
 }
 

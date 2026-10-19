@@ -3006,13 +3006,9 @@ pub fn emit_sdsc(
     // The fused-epilogue's extra operand (if any): its Tensor{i} still gets a labeledDs_/primaryDsInfo_
     // entry below (it is a real tensor the on-card walk must address), but it is NOT one of THIS op's own
     // inputLabeledDs/outputLabeledDs — it belongs to the SECOND computeOp_ entry built after the loop.
-    let epilogue_arg_idx: Vec<usize> = match op.op_info {
-        OpInfo::FusedEpilogue {
-            arg_idx, second, ..
-        } => core::iter::once(arg_idx)
-            .chain(second.map(|s| s.arg_idx))
-            .collect(),
-        _ => Vec::new(),
+    let epilogue_arg_idx: Option<usize> = match op.op_info {
+        OpInfo::FusedEpilogue { arg_idx, .. } => Some(arg_idx),
+        _ => None,
     };
 
     // ── labeledDs_ + primaryDsInfo_ (one entry per distinct Role). ──
@@ -3096,7 +3092,7 @@ pub fn emit_sdsc(
         });
         // computeOp_ wiring: `Tensor{i}-idx{i}`; the LAST arg is the output. The epilogue's own
         // operand is excluded here — the SECOND computeOp_ entry references it explicitly below.
-        if epilogue_arg_idx.contains(&i) {
+        if epilogue_arg_idx == Some(i) {
             continue;
         }
         // ⛔⛔ THE INDEX OPERAND IS NOT AN ARITHMETIC INPUT, AND THE VENDOR FIXTURE IS EXPLICIT.
@@ -3715,14 +3711,11 @@ pub fn emit_sdsc(
     // `MatMul_122` golden — it reads THIS op's own output plus the extra operand, and writes back
     // to the SAME output in place (no new HBM tensor, no separate trip). Built before `dsc` so both
     // entries share one `computeOp_` vec.
-    // ⛔ ONE ENTRY PER STAGE, and each stage reads the PRIOR stage's own output — which is the same
-    // labeled-ds in every case, since every stage writes the output in place. So the chain composes
-    // by construction: stage 2 sees stage 1's sum without either naming the other.
-    let epilogue_stage_compute_op =
-        |arg_idx: usize, op_func: crate::superdsc_opspec::EpilogueOpFunc| {
+    let epilogue_compute_ops: Vec<ComputeOp> = match op.op_info {
+        OpInfo::FusedEpilogue { arg_idx, op_func } => {
             let out_ref = format!("Tensor{out_idx}-idx{out_idx}");
             let epi_ref = format!("Tensor{arg_idx}-idx{arg_idx}");
-            ComputeOp {
+            vec![ComputeOp {
                 exUnit: "sfp",
                 opFuncName: op_func.name().to_string(),
                 // Matches the golden's biasadd entry exactly: plain fp16, regular fidelity — the
@@ -3743,16 +3736,8 @@ pub fn emit_sdsc(
                 interimLabeledDs: vec![],
                 outputLabeledDs: vec![out_ref],
                 indirectAccessIndexLabeledDs: vec![],
-            }
-        };
-    let epilogue_compute_ops: Vec<ComputeOp> = match op.op_info {
-        OpInfo::FusedEpilogue {
-            arg_idx,
-            op_func,
-            second,
-        } => core::iter::once(epilogue_stage_compute_op(arg_idx, op_func))
-            .chain(second.map(|s| epilogue_stage_compute_op(s.arg_idx, s.op_func)))
-            .collect(),
+            }]
+        }
         _ => Vec::new(),
     };
 

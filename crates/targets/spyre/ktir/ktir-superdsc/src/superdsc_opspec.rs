@@ -2174,8 +2174,8 @@ impl AnyTensorArg {
 
     /// Rank-erased device-buffer NAME setter — for cloning an EXISTING arg's whole shape (scale/
     /// device_dims/layout/stick/allocation/df) onto a DIFFERENT device buffer. The intended use is a
-    /// fused epilogue's extra operand (mask/bias/residual): `bmm.ddl` declares `bnA`/`bnB`/`bias`/
-    /// `resadd`/`resadd2` with the SAME layout as `%outtensor` (not a fresh shape), so cloning the
+    /// fused epilogue's extra operand (mask/bias/residual): `bmm.ddl` declares `bias`/`resadd`
+    /// with the SAME layout as `%outtensor` (not a fresh shape), so cloning the
     /// real OUTPUT arg and renaming it is the correct construction, not a shortcut around one.
     pub fn set_name(&mut self, name: String) {
         match self {
@@ -2221,7 +2221,7 @@ impl AnyTensorArg {
     }
 
     /// Rank-erased ROLE setter. The epilogue's extra operand is tagged [`Role::Output`] to match
-    /// `bmm.ddl`'s own convention (bias/bnA/bnB/resadd share the OUTPUT dsType/layout bucket, not
+    /// `bmm.ddl`'s own convention (bias/resadd share the OUTPUT dsType/layout bucket, not
     /// INPUT) — confirmed against the golden `sdsc_bmm_lxopt.json` fixture, whose bias arg carries
     /// `dsType_: "OUTPUT"`.
     pub fn set_role(&mut self, role: Role) {
@@ -2412,7 +2412,7 @@ pub enum OpInfo {
     /// mirroring IBM's own golden fixture (`sdsc_bmm_lxopt.json`'s `MatMul_122`: `batchmatmul` +
     /// `biasadd`, the second reading AND writing the first's own output labeled-ds in place).
     /// `arg_idx` names the extra operand ALREADY inserted into
-    /// `OpSpec.args` (its own shape/layout cloned from the real output's, per `bmm.ddl`'s bnA/bnB/
+    /// `OpSpec.args` (its own shape/layout cloned from the real output's, per `bmm.ddl`'s
     /// bias/resadd declaring the SAME layout as `%outtensor` — this is not a fresh addressing
     /// derivation, it reuses the output's own proven placement with a different device name). The
     /// epilogue reads `[this op's own output, args[arg_idx]]` and writes back to the SAME output —
@@ -2420,24 +2420,12 @@ pub enum OpInfo {
     FusedEpilogue {
         arg_idx: usize,
         op_func: EpilogueOpFunc,
-        /// The SECOND chained stage, when the op has one — `bmm.ddl`'s `stradd2_op`. `None` is the
-        /// single-stage form every shipped fusion uses today.
-        second: Option<EpilogueStage>,
     },
 }
 
-/// One chained epilogue stage: the aux operand's slot in [`OpSpec::args`] and which DDL aux op reads
-/// it. Built ONLY by [`OpSpec::attach_fused_epilogue`], which records `arg_idx` as it inserts the
-/// operand — never re-derived from the arg list afterwards.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EpilogueStage {
-    pub arg_idx: usize,
-    pub op_func: EpilogueOpFunc,
-}
-
-/// What ONE epilogue stage needs from its caller. The aux operand's shape/layout is NOT here: it is
-/// cloned from the real output's proven placement (`bmm.ddl` declares `bnA`/`bnB`/`bias`/`resadd` with
-/// the SAME layout as `%outtensor`), so a stage contributes a name, an offset, and a broadcast
+/// What the fused epilogue needs from its caller. The aux operand's shape/layout is NOT here: it is
+/// cloned from the real output's proven placement (`bmm.ddl` declares `bias`/`resadd` with
+/// the SAME layout as `%outtensor`), so the caller contributes a name, an offset, and a broadcast
 /// pattern — never a fresh addressing derivation.
 pub struct EpilogueSpec<'a> {
     pub operand_name: String,
@@ -2447,14 +2435,13 @@ pub struct EpilogueSpec<'a> {
     pub broadcast_batch: bool,
 }
 
-/// ⭐⭐⭐ THE CHAIN LENGTH `bmm.ddl` PHYSICALLY HAS, AS A TYPE. The DDL exposes exactly TWO
-/// `stridedadd` registers (`stradd_op`, `stradd2_op`); a third stage has nowhere to live, so it is
-/// UNREPRESENTABLE here rather than rejected at runtime. Equally, there is no empty variant — an op
-/// with no epilogue does not call [`OpSpec::attach_fused_epilogue`] at all, so "attached an epilogue
-/// with zero stages" is not a state the emitter can reach.
-pub enum EpilogueSpecs<'a> {
-    One(EpilogueSpec<'a>),
-    Two(EpilogueSpec<'a>, EpilogueSpec<'a>),
+/// ⭐⭐⭐ ONE EPILOGUE, AS A TYPE — not a `Vec` of stages. Every shipped fusion chains exactly one
+/// `stridedadd` onto its matmul (`bmm.ddl`'s `stradd_op`); the never-built second register
+/// (`stradd2_op`) has no constructor here. Equally, there is no empty form — an op with no epilogue
+/// does not call [`OpSpec::attach_fused_epilogue`] at all, so "attached an epilogue with zero
+/// stages" is not a state the emitter can reach.
+pub struct EpilogueSpecs<'a> {
+    pub one: EpilogueSpec<'a>,
 }
 
 /// The DDL `opFuncName` a fused epilogue selects — SEALED to the menu `bmm.ddl` actually exposes
@@ -2466,9 +2453,7 @@ pub enum EpilogueSpecs<'a> {
 pub enum EpilogueOpFunc {
     /// `bmm.ddl`'s `stridedadd`: `sfp_output_lrf += operand` in place, SFP-resident, one PE/SFP-LRF
     /// register — the shape a full-tensor (never broadcast) second operand needs, per the DDL's own
-    /// `bnA`/`bnB`/`bias`/`resadd`/`resadd2` declaring the SAME layout as `%outtensor`. `bmm.ddl` allows
-    /// TWO independent `stridedadd` instances (`stradd_op`/`stradd2_op`) chained onto one matmul; this
-    /// variant carries one at a time — nothing has needed a second yet.
+    /// `bias`/`resadd` declaring the SAME layout as `%outtensor`.
     StridedAdd,
 }
 
@@ -3120,7 +3105,7 @@ impl OpSpec {
     /// Attach a fused pointwise epilogue (mask-add / bias-add / residual-add) to THIS matmul, mirroring
     /// `sdsc_bmm_lxopt.json`'s `MatMul_122` golden: the extra operand is inserted as a CLONE of this
     /// op's own output arg (same scale/device_dims/layout/stick/allocation/df — `bmm.ddl` declares
-    /// `bnA`/`bnB`/`bias`/`resadd`/`resadd2` with the output's own layout, not a fresh shape), renamed
+    /// `bias`/`resadd` with the output's own layout, not a fresh shape), renamed
     /// to `operand_name` and offset to `offset_elems`, then inserted immediately BEFORE the real output
     /// so `out_idx` (always "the last arg") still resolves correctly. Marks it `is_input=true` (read-only
     /// — the epilogue mutates the output in place, not this operand) and `Role::Output` (the golden's own
@@ -3149,49 +3134,30 @@ impl OpSpec {
     /// through `rewrite_op_for_time_tile`'s per-trip affine-stride machinery, so a tiled matmul must not
     /// call this (the caller decides; this method does not check, since `OpSpec` alone cannot see whether
     /// `emit_sdsc_tiled` will time-tile it).
-    /// ⛔ TAKES THE WHOLE CHAIN AT ONCE, NEVER ONE STAGE PER CALL. The old one-stage-per-call form
-    /// assigned `self.op_info` outright, so a second call SILENTLY DISCARDED the first stage — the
-    /// caller got one epilogue where it asked for two and nothing said so. Handing the chain over in
-    /// one call removes the sequence in which that could happen: there is no "already has a stage"
-    /// state to clobber, and [`EpilogueSpecs`] makes a third stage (which `bmm.ddl` does not have a
-    /// register for) unrepresentable rather than runtime-rejected.
-    pub fn attach_fused_epilogue(&mut self, stages: EpilogueSpecs<'_>) {
-        // Each stage's operand is inserted BEFORE the output, so the output keeps sliding right and
-        // stage `i` lands at `out_idx + i` — recorded as it is built, never re-derived afterwards.
-        let mut insert = |spec: &EpilogueSpec<'_>| -> EpilogueStage {
-            let out_idx = self.args.len().saturating_sub(1);
-            let mut operand = self.args[out_idx].clone();
-            operand.set_name(spec.operand_name.clone());
-            operand.set_offset_elems(spec.offset_elems);
-            operand.set_is_input(true);
-            operand.set_role(Role::Output);
-            for &(dim, scale) in spec.broadcast_dims {
-                operand.set_scale_for_dim(dim, scale);
-            }
-            if spec.broadcast_batch
-                && let Some(batch_dim) = self.batch_dim_name()
-            {
-                operand.set_scale_for_dim(batch_dim, Scale::RedNonStick);
-            }
-            self.args.insert(out_idx, operand);
-            EpilogueStage {
-                arg_idx: out_idx,
-                op_func: spec.op_func,
-            }
-        };
-        // Destructured, not iterated: the first stage is present BY TYPE, so there is no empty case
-        // to `expect` away.
-        let (first, second) = match stages {
-            EpilogueSpecs::One(a) => (insert(&a), None),
-            EpilogueSpecs::Two(a, b) => {
-                let fa = insert(&a);
-                (fa, Some(insert(&b)))
-            }
-        };
+    /// ⛔ TAKES THE WHOLE EPILOGUE AT ONCE. Assigning `self.op_info` here is the ONLY write —
+    /// there is no "already has a stage" state to clobber, and [`EpilogueSpecs`] makes a second
+    /// stage (which nothing has ever shipped) unrepresentable rather than runtime-rejected.
+    pub fn attach_fused_epilogue(&mut self, spec: EpilogueSpecs<'_>) {
+        // The operand is inserted BEFORE the output, so the output slides one slot right —
+        // `arg_idx` is recorded as it is built, never re-derived afterwards.
+        let out_idx = self.args.len().saturating_sub(1);
+        let mut operand = self.args[out_idx].clone();
+        operand.set_name(spec.one.operand_name.clone());
+        operand.set_offset_elems(spec.one.offset_elems);
+        operand.set_is_input(true);
+        operand.set_role(Role::Output);
+        for &(dim, scale) in spec.one.broadcast_dims {
+            operand.set_scale_for_dim(dim, scale);
+        }
+        if spec.one.broadcast_batch
+            && let Some(batch_dim) = self.batch_dim_name()
+        {
+            operand.set_scale_for_dim(batch_dim, Scale::RedNonStick);
+        }
+        self.args.insert(out_idx, operand);
         self.op_info = OpInfo::FusedEpilogue {
-            arg_idx: first.arg_idx,
-            op_func: first.op_func,
-            second,
+            arg_idx: out_idx,
+            op_func: spec.one.op_func,
         };
     }
 

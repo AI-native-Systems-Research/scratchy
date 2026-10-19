@@ -8471,15 +8471,15 @@ mod tests {
             Some("y"),
             "a batch=16 matmul must carry a real y dim"
         );
-        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs::One(
-            scratchy_subtile::superdsc_opspec::EpilogueSpec {
+        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs {
+            one: scratchy_subtile::superdsc_opspec::EpilogueSpec {
                 operand_name: "mask".to_string(),
                 offset_elems: 0,
                 op_func: scratchy_subtile::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                 broadcast_dims: &[("mb", scratchy_subtile::superdsc_opspec::Scale::RedNonStick)],
                 broadcast_batch: true,
             },
-        ));
+        });
         // The epilogue operand is the one inserted BEFORE the real output (see
         // `attach_fused_epilogue`'s own doc) — for this 3-arg-input matmul (a,w,o) that is index 2.
         let epi_idx = 2;
@@ -8543,15 +8543,15 @@ mod tests {
             "a batch=1 matmul must carry no y dim at all"
         );
         // broadcast_batch: true must NOT panic despite there being no "y" to mark.
-        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs::One(
-            scratchy_subtile::superdsc_opspec::EpilogueSpec {
+        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs {
+            one: scratchy_subtile::superdsc_opspec::EpilogueSpec {
                 operand_name: "mask".to_string(),
                 offset_elems: 0,
                 op_func: scratchy_subtile::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                 broadcast_dims: &[("mb", scratchy_subtile::superdsc_opspec::Scale::RedNonStick)],
                 broadcast_batch: true,
             },
-        ));
+        });
         let epi_idx = 2;
         let view = op.args[epi_idx].view();
         assert_eq!(
@@ -8575,15 +8575,15 @@ mod tests {
             1,
             "test assumes an untiled matmul (attach_fused_epilogue's precondition)"
         );
-        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs::One(
-            scratchy_subtile::superdsc_opspec::EpilogueSpec {
+        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs {
+            one: scratchy_subtile::superdsc_opspec::EpilogueSpec {
                 operand_name: "mask".to_string(),
                 offset_elems: 0,
                 op_func: scratchy_subtile::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                 broadcast_dims: &[],
                 broadcast_batch: false,
             },
-        ));
+        });
         let folds = SdscFoldSet::new(op.iter.cores_used());
         let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
         let ops = &sdsc.dscs_[0]["MatMul_0"].computeOp_;
@@ -8606,7 +8606,7 @@ mod tests {
         assert_eq!(ops[1].outputLabeledDs, vec!["Tensor3-idx3"]);
 
         // The mask tensor still gets its OWN labeledDs_ entry (the on-card walk must address it), typed
-        // OUTPUT to match `bmm.ddl`'s bias/bnA/bnB/resadd convention (same layout bucket as the real
+        // OUTPUT to match `bmm.ddl`'s bias/resadd convention (same layout bucket as the real
         // output, not INPUT).
         let labeled = &sdsc.dscs_[0]["MatMul_0"].labeledDs_;
         assert_eq!(
