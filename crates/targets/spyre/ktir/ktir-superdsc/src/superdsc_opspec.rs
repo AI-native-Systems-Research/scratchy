@@ -1949,6 +1949,27 @@ impl OpFunc {
         }
     }
 
+    /// ⭐⭐⭐ WHETHER THIS OP's DDL TEMPLATE COMBINES A CORE-SPLIT REDUCED AXIS ITSELF — the template
+    /// binds `genericpartialreduction` (`%psum_op`) and rings each core's partial over a
+    /// `core_to_core_communication` on the reduced dims, the last core writing the result. Only then may
+    /// the work division split the axis the op reduces while every core addresses ONE shared accum: the
+    /// template, not the emitter, merges the partials. Every other op, split that way, is 32 cores writing
+    /// one address — the collision `emit_sdsc`'s disjoint-output guard exists to refuse.
+    ///
+    /// A target-ABI fact read off the pod's templates (deeptools `share/ddc/ddl_templates`), as a const
+    /// table:
+    ///   * `summeanmaxexx2.ddl` — `sum`, `max` (also `mean`, `min`, `absmax`, `exx2`, unused here):
+    ///     `%psum_op = ddl.operation_bind(.., {opFuncName="genericpartialreduction"})`, and the
+    ///     dataflow's `psum_start`/`psum_end` ring combines with FMA16 (sum) and FMAX (max);
+    ///   * the matmul's `bmm.ddl` binds the same op. That is the K-split PV's path, admitted separately
+    ///     by its own split-`in` rule.
+    ///
+    /// `mean` is deliberately absent: its `1/N` scaling const is applied per core, so a split mean is a
+    /// sum of per-core means. Not a combine this crate has a use for or a test of.
+    pub fn template_combines_a_core_split_reduction(self) -> bool {
+        matches!(self, OpFunc::Sum | OpFunc::Max)
+    }
+
     /// ⭐⭐⭐ THE ONE OP PAIR WHOSE SHIPPED `constantInfo_` IS NOT THE GENERIC FORM. Both
     /// vendor fixtures (`ddc/ddl_templates/test/sdsc_topKIndex.json` / `sdsc_topKValue.json`
     /// — the only descriptors anywhere that name either opFunc) carry the FALSY empty OBJECT,

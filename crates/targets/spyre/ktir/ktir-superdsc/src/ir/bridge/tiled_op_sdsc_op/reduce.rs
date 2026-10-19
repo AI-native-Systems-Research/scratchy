@@ -485,6 +485,64 @@ pub fn reduce_opspec_off(
     accum_off: u32,
     head_major: bool,
 ) -> Result<OpSpec, String> {
+    reduce_opspec_off_divided(ReduceOffSpec {
+        op,
+        rows,
+        cols,
+        data_name,
+        accum_name,
+        data_off,
+        accum_off,
+        head_major,
+        division: ReduceDivision::Rows,
+    })
+}
+
+/// ⭐ HOW A SEEDED REDUCE's CORES ARE SPENT — the reduce family's twin of
+/// [`crate::work::EwDivision`]. Every reduce takes [`Self::Rows`] unless its caller states otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReduceDivision {
+    /// [`distribute_cores`]: the output dims only (`mb` first); the reduced axis is never split, so
+    /// every core reduces its own rows' whole extent. The division every reduce has always had.
+    Rows,
+    /// ⭐ THE REDUCED AXIS ACROSS THE CORES, rows whole: every core reduces a whole-stick run of every
+    /// row, and the op's template rings the per-core partials into the one accum
+    /// ([`OpFunc::template_combines_a_core_split_reduction`], which the emitter's shared-output guard
+    /// holds the op to). For a stick-major `[rows, cols]` block, core `c` reads ONE contiguous run of
+    /// sticks; [`Self::Rows`] hands each core its rows as `cols/64` strided one-row bursts.
+    ReducedAxis,
+}
+
+/// The parameter list of [`reduce_opspec_off_divided`], carried as a struct. Every field but
+/// `division` is [`reduce_opspec_off`]'s argument of the same name, with the same contract.
+pub struct ReduceOffSpec<'a> {
+    pub op: OpFunc,
+    pub rows: u32,
+    pub cols: u32,
+    pub data_name: &'a str,
+    pub accum_name: &'a str,
+    pub data_off: u32,
+    pub accum_off: u32,
+    pub head_major: bool,
+    /// How the cores are spent. [`ReduceDivision::Rows`] is [`reduce_opspec_off`] byte for byte.
+    pub division: ReduceDivision,
+}
+
+/// [`reduce_opspec_off`] under a STATED [`ReduceDivision`]. A [`ReduceDivision::ReducedAxis`] reduce
+/// of an op whose template cannot combine the cores' partials is a build `Err` here, before the
+/// emitter's own guard would refuse its shared output.
+pub fn reduce_opspec_off_divided(r: ReduceOffSpec<'_>) -> Result<OpSpec, String> {
+    let ReduceOffSpec {
+        op,
+        rows,
+        cols,
+        data_name,
+        accum_name,
+        data_off,
+        accum_off,
+        head_major,
+        division,
+    } = r;
     // LOWER to TileIR: same pattern as `reduce_opspec_df` — the per-head/offset reduce variant
     // over the SAME shared declaration, kind picked off the DDL arity ([`reduce_tile_kind`]).
     let (dims, kind) = reduce_dims_kind(op, rows, cols, Df::Fp16)?;
@@ -493,9 +551,25 @@ pub fn reduce_opspec_off(
         dims: dims.clone(),
         df: Df::Fp16,
     };
-    let tiled = tile_op
-        .tile(MaxCores::<MAX_CORES>, distribute_cores, "out")
-        .map_err(|e| e.0)?;
+    let tiled = match division {
+        ReduceDivision::Rows => tile_op.tile(MaxCores::<MAX_CORES>, distribute_cores, "out"),
+        ReduceDivision::ReducedAxis => {
+            if !op.template_combines_a_core_split_reduction() {
+                return Err(format!(
+                    "reduce `{accum_name}` ({}): a split of the reduced axis needs a template that \
+                     combines the cores' partials (`OpFunc::template_combines_a_core_split_reduction`), \
+                     and this op's does not — 32 cores would write one accum",
+                    op.name()
+                ));
+            }
+            tile_op.tile(
+                MaxCores::<MAX_CORES>,
+                crate::work::distribute_cores_reduced_axis,
+                "out",
+            )
+        }
+    }
+    .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
     let device_dims = plan.iter_syms(["mb", "out", "y"]);
     // ── STICK-MAJOR RESIDUAL ── flip ONLY the DATA input to rank-2
@@ -663,6 +737,57 @@ pub fn assemble_reduce_off<D: KindTag, A: KindTag>(
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_reduce_off {op_name}: {e}"))
+}
+
+/// The parameter list of [`assemble_reduce_off_divided`], carried as a struct (the `PointwiseDivided`
+/// shape). Every field but `division` is [`assemble_reduce_off`]'s, with the same contract.
+pub struct ReduceDivided<'a, D: KindTag, A: KindTag> {
+    pub op_name: &'a str,
+    pub op_func: &'static str,
+    pub rows: crate::sdsc_abstract::RowCount,
+    pub cols: crate::sdsc_abstract::BlockCols,
+    pub data: &'a Stk<D>,
+    pub data_off: crate::addr::DevOff,
+    pub accum: &'a Stk<A>,
+    pub accum_off: crate::addr::DevOff,
+    /// How the cores are spent. [`ReduceDivision::Rows`] is [`assemble_reduce_off`] byte for byte.
+    pub division: ReduceDivision,
+}
+
+/// [`assemble_reduce_off`] under a STATED [`ReduceDivision`] — the decode batch chunk's row max and row
+/// sum take [`ReduceDivision::ReducedAxis`] (`attn`'s `ChunkBufs::red_division_of` says why).
+pub fn assemble_reduce_off_divided<D: KindTag, A: KindTag>(
+    r: ReduceDivided<'_, D, A>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> EmittedOp {
+    let ReduceDivided {
+        op_name,
+        op_func,
+        rows,
+        cols,
+        data,
+        data_off,
+        accum,
+        accum_off,
+        division,
+    } = r;
+    let head_major = D::kind() == StickKind::Flat;
+    let op = reduce_opspec_off_divided(ReduceOffSpec {
+        op: op_func_from_str(op_func),
+        rows: rows.get(),
+        cols: cols.get(),
+        data_name: data.name(),
+        accum_name: accum.name(),
+        data_off: data_off.into_raw_elems(),
+        accum_off: accum_off.into_raw_elems(),
+        head_major,
+        division,
+    })
+    .unwrap_or_else(|e| panic!("assemble_reduce_off_divided {op_name}: {e}"));
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .unwrap_or_else(|e| panic!("assemble_reduce_off_divided {op_name}: {e}"))
 }
 
 #[cfg(test)]

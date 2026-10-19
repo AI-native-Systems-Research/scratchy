@@ -3449,7 +3449,27 @@ pub fn emit_sdsc(
         // legitimate ONLY when a dim the op REDUCES — split, and absent from THIS output's layout (`in`
         // for a matmul, whose output is `[mb,out]`) — is the one split. An `mb`/`out` shared output is
         // still a real collision, so the guard stays for every non-reduction split.
-        let reduction_split = op.iter.split_of("in") > 1 && !v.layout.contains(&"in");
+        //
+        // ⭐ AND A SEEDED REDUCE SPLIT ALONG THE AXIS IT REDUCES — the same law for the reduce family's
+        // own cross-core combine: `summeanmaxexx2.ddl` binds `genericpartialreduction` and rings each
+        // core's partial over its `core_to_core_communication(%reduce_dim…)` (FMAX for max, FMA16 for
+        // sum), the last core writing the row's result. The reduced dim is present in the accum's layout
+        // but COLLAPSED there (`Scale::RedStick`), so every core addresses the same accum stick — the
+        // shared output the ring writes. Admitted only for that exact shape AND only for an op whose
+        // template provably carries the combine (`OpFunc::template_combines_a_core_split_reduction`, a
+        // const table), never because "it is a reduce".
+        let collapsed_reduction_split = op.is_reduction
+            && op.op.template_combines_a_core_split_reduction()
+            && op.iter.dims().iter().any(|d| {
+                d.is_reduction
+                    && op.iter.split_of(d.name) > 1
+                    && v.layout
+                        .iter()
+                        .position(|&l| l == d.name)
+                        .is_some_and(|li| v.scale.get(li).is_some_and(|s| s.is_stick_reduction()))
+            });
+        let reduction_split =
+            (op.iter.split_of("in") > 1 && !v.layout.contains(&"in")) || collapsed_reduction_split;
         if matches!(v.role, Role::Output)
             && !v.is_input
             && !v.allocation.is_lx()
