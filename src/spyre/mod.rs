@@ -614,6 +614,7 @@ fn spark_panel(sweep: &Sweep, dtype: Dtype, metric: Metric) -> Element {
         better: metric.better(),
         along: "context tokens",
         value,
+        carry: false,
     };
     let models = models(sweep);
     let rungs: Vec<(u32, Vec<Panel>)> = BATCHES
@@ -1254,9 +1255,10 @@ struct TimelineSource {
 
 /// Each moved cell's timeline: every source that measured it, oldest first —
 /// a sweep with both stacks' values, a PR with its own — one evenly spaced
-/// step per source on the sparkline's log axis, torch's line breaking
-/// wherever a PR sits. A cell only one source measured has no timeline: one
-/// point is not a line, and the table already carries it.
+/// step per source on the sparkline's log axis. Where a PR sits past
+/// torch's newest sweep, the chart carries torch's line forward from that
+/// sweep, dotted, and the fill follows it. A cell only one source measured
+/// has no timeline: one point is not a line, and the table already carries it.
 fn progress_timelines(
     progress: &[(PathBuf, Progress)],
     sweeps: &[(PathBuf, Sweep)],
@@ -1302,16 +1304,17 @@ fn progress_timelines(
                 })
                 .collect();
             // The fill between the lines carries its ×-factor at the first
-            // and the last source where both stacks were measured — where
-            // the cell started against torch, and the newest like-for-like
-            // anchor, the sweep a PR's value pairs with; the metal
-            // sparklines label their chosen steps the same way. A PR step
-            // never carries one: torch has no value there to factor against.
-            let both = |s: &Step| s.scratchy.is_some() && s.rival.is_some();
-            if let Some(first) = steps.iter().position(both) {
+            // and the last source where scratchy was measured. At the first,
+            // both stacks were measured; at the last — a PR's step, past
+            // torch's newest sweep — the chart carries torch's line dotted
+            // from that sweep, and the factor pairs the PR's value with that
+            // carried level: the same pairing the table above and the heat
+            // maps make.
+            let measured = |s: &Step| s.scratchy.is_some();
+            if let Some(first) = steps.iter().position(measured) {
                 steps[first].highlight = true;
             }
-            if let Some(last) = steps.iter().rposition(both) {
+            if let Some(last) = steps.iter().rposition(measured) {
                 steps[last].highlight = true;
             }
             let names = sources.into_iter().map(|s| s.name).collect();
@@ -1432,6 +1435,7 @@ fn timeline_chart(key: &CellKey, steps: &[Step], names: &[String]) -> Element {
             better: key.2.better(),
             along: "measured",
             value,
+            carry: true,
         },
         SCRATCHY,
         TORCH,
@@ -1510,12 +1514,13 @@ fn progress_section(progress: &[(PathBuf, Progress)], sweeps: &[(PathBuf, Sweep)
                         rsx! {
                             "Every source that measured a moved cell, oldest first — a \
                              sweep with both stacks' values, a PR with its own — so the \
-                             line shows what the PRs are closing. Torch-spyre's line \
-                             breaks wherever a PR sits, because no PR re-measures torch. \
-                             The fill between the lines is labelled with its ×-factor at \
-                             the first and the newest sweep, where both stacks were \
-                             measured: where the cell started against torch, and the \
-                             anchor a PR's value pairs with."
+                             line shows what the PRs are closing. Where a PR sits past \
+                             torch-spyre's newest sweep, torch's line continues dotted, \
+                             carried flat from that sweep's measurement — the level the \
+                             PR's value is paired with everywhere on this page — and the \
+                             fill between the lines follows it. That fill is labelled \
+                             with its ×-factor at the first source and the newest: where \
+                             the cell started against torch, and where it stands now."
                         },
                         rsx! {
                             div { style: "{grid}",
@@ -2198,13 +2203,15 @@ mod tests {
         assert_eq!(xs, vec![1.0, 2.0, 4.0]);
         let scratchy: Vec<f64> = steps.iter().filter_map(|s| s.scratchy).collect();
         assert_eq!(scratchy, vec![80.0, 84.5, 94.62]);
-        // Torch's line breaks at the PR: no PR re-measures torch.
+        // Torch's own value stops at the PR: no PR re-measures torch — the
+        // chart carries its line forward from the newest sweep, dotted.
         let torch: Vec<Option<f64>> = steps.iter().map(|s| s.rival).collect();
         assert_eq!(torch, vec![Some(45.0), Some(45.0), None]);
-        // The ×-factor labels ride the first and the last steps where both
-        // stacks were measured; the PR step, torch breaking there, gets none.
+        // The ×-factor labels ride the first and the last steps where
+        // scratchy was measured — the newest being the PR's step, whose
+        // factor pairs its value with the torch level carried to it.
         let highlights: Vec<bool> = steps.iter().map(|s| s.highlight).collect();
-        assert_eq!(highlights, vec![true, true, false]);
+        assert_eq!(highlights, vec![true, false, true]);
     }
 
     #[test]

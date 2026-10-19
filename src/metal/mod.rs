@@ -1253,6 +1253,7 @@ impl Trend {
             } else {
                 metric.unit()
             },
+            carry: false,
         }
     }
 
@@ -2008,6 +2009,7 @@ const STARTUP_COLUMNS: [StartupColumn; 3] = [
             better: Better::Lower,
             along: "model size, GB",
             value: "launch to first token, s",
+            carry: false,
         },
     },
     StartupColumn {
@@ -2019,6 +2021,7 @@ const STARTUP_COLUMNS: [StartupColumn; 3] = [
             better: Better::Lower,
             along: "model size, GB",
             value: "launch to first token, s",
+            carry: false,
         },
     },
     StartupColumn {
@@ -2030,6 +2033,7 @@ const STARTUP_COLUMNS: [StartupColumn; 3] = [
             better: Better::Lower,
             along: "model size, GB",
             value: "request to first token, ms",
+            carry: false,
         },
     },
 ];

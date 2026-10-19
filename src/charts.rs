@@ -701,7 +701,22 @@ pub struct Step {
 /// The lines' points, and the two fills' points: each fill present where its
 /// side is ahead, the two meeting where the lines cross (found on the log
 /// x axis, on which the chart draws straight segments).
-pub fn spark_points(pts: &[Step], better: Better, scratchy: Side, rival: Side) -> Vec<SparkPoint> {
+///
+/// Carrying (`carried`, a timeline): through steps only scratchy was measured
+/// at, the rival's value carries forward from its last measurement — not a
+/// new one. The rival's own line still breaks there; its carried level draws
+/// as a second line dataset under `carried`'s name (dashed by charts.js,
+/// which Carbon's options cannot ask for), bridging the measured steps either
+/// side, and the fills and the highlights' factors follow it, so a step past
+/// the rival's newest measurement still pairs with the level it is compared
+/// against everywhere else on the page.
+pub fn spark_points(
+    pts: &[Step],
+    better: Better,
+    scratchy: Side,
+    rival: Side,
+    carried: Option<&'static str>,
+) -> Vec<SparkPoint> {
     let line = |group, key, value| SparkPoint {
         group,
         key,
@@ -731,16 +746,48 @@ pub fn spark_points(pts: &[Step], better: Better, scratchy: Side, rival: Side) -
         Better::Higher => s - r,
         Better::Lower => r - s,
     };
+    // The rival's value at each step, carried forward where only scratchy was
+    // measured: the level of its last measurement, not a new one.
+    let eff: Vec<Option<f64>> = {
+        let mut last = None;
+        pts.iter()
+            .map(|st| {
+                if st.rival.is_some() {
+                    last = st.rival;
+                }
+                match (carried, st.scratchy, st.rival) {
+                    (Some(_), Some(_), None) => last,
+                    (_, _, rv) => rv,
+                }
+            })
+            .collect()
+    };
+    // A step whose rival value is carried, not measured.
+    let is_carried = |j: usize| carried.is_some() && pts[j].rival.is_none() && eff[j].is_some();
     let mut out: Vec<SparkPoint> = Vec::new();
-    for &Step {
-        x,
-        scratchy: sv,
-        rival: rv,
-        ..
-    } in pts
+    for (
+        k,
+        &Step {
+            x,
+            scratchy: sv,
+            rival: rv,
+            ..
+        },
+    ) in pts.iter().enumerate()
     {
         out.push(line(scratchy.line, x, sv));
         out.push(line(rival.line, x, rv));
+        if let Some(id) = carried {
+            if is_carried(k) {
+                out.push(line(id, x, eff[k]));
+            } else if rv.is_some()
+                && ((k > 0 && is_carried(k - 1)) || k + 1 < pts.len() && is_carried(k + 1))
+            {
+                // The measured step beside a carried one: the dotted line
+                // starts at, and comes back to, the line it continues.
+                out.push(line(id, x, rv));
+            }
+        }
     }
     let mut fills: Vec<SparkPoint> = Vec::new();
     for (
@@ -748,11 +795,12 @@ pub fn spark_points(pts: &[Step], better: Better, scratchy: Side, rival: Side) -
         &Step {
             x,
             scratchy: sv,
-            rival: rv,
             highlight,
+            ..
         },
     ) in pts.iter().enumerate()
     {
+        let rv = eff[k];
         match (sv, rv) {
             (Some(sv), Some(rv)) => {
                 let d = lead(sv, rv);
@@ -779,15 +827,12 @@ pub fn spark_points(pts: &[Step], better: Better, scratchy: Side, rival: Side) -
                 });
                 // Where the next step's lead has the other sign, the lines
                 // cross between: both fills end there, at no width.
-                if let Some(&Step {
-                    x: x1,
-                    scratchy: Some(s1),
-                    rival: Some(r1),
-                    ..
-                }) = pts.get(k + 1)
+                if k + 1 < pts.len()
+                    && let (Some(s1), Some(r1)) = (pts[k + 1].scratchy, eff[k + 1])
                 {
                     let d1 = lead(s1, r1);
                     if d * d1 < 0.0 {
+                        let x1 = pts[k + 1].x;
                         let t = d / (d - d1);
                         let xc = x * (x1 / x).powf(t);
                         let yc = sv + t * (s1 - sv);
@@ -806,17 +851,23 @@ pub fn spark_points(pts: &[Step], better: Better, scratchy: Side, rival: Side) -
     out
 }
 
-/// What a sparkline follows: which way its values are better, and its axes'
-/// titles, which are the tooltip's labels.
+/// What a sparkline follows: which way its values are better, its axes'
+/// titles, which are the tooltip's labels — and whether the rival's line
+/// carries forward, dotted, through steps only scratchy was measured at
+/// (a timeline: no PR re-measures torch, so its newest measurement is the
+/// level a newer scratchy value pairs with).
 #[derive(Clone, Copy)]
 pub struct SparkAxes {
     pub better: Better,
     pub along: &'static str,
     pub value: &'static str,
+    pub carry: bool,
 }
 
 /// A sparkline: scratchy's and its rival's values along one dimension, the gap
 /// between them filled blue where scratchy is ahead and red where it is behind.
+/// Carrying (SparkAxes), the rival's line continues dotted past its last
+/// measurement through steps only scratchy was measured at.
 pub fn sparkline(
     pts: &[Step],
     axes: SparkAxes,
@@ -826,6 +877,13 @@ pub fn sparkline(
     height: &str,
     label: &str,
 ) -> Element {
+    // The rival's carried continuation is its own line dataset — Carbon has
+    // no way to dash part of one series, so charts.js dashes this one by its
+    // name — in the rival's own colour. The id must live as long as the
+    // spec; the build is a one-shot process, so one leak a chart is sound.
+    let carried: Option<&'static str> = axes
+        .carry
+        .then(|| Box::leak(format!("{} (carried)", rival.line).into_boxed_str()) as &'static str);
     let xs: Vec<f64> = pts.iter().map(|p| p.x).collect();
     // From the power of two at or below the first step to the one at or above
     // the last: users and lengths are powers of two already, so they span the
@@ -861,7 +919,7 @@ pub fn sparkline(
         domain: None,
     };
     let spec = Chart::Combo {
-        data: spark_points(pts, axes.better, scratchy, rival),
+        data: spark_points(pts, axes.better, scratchy, rival, carried),
         options: ChartOptions {
             title: String::new(),
             // Users, both lengths and model sizes grow by a factor per step:
@@ -876,6 +934,7 @@ pub fn sparkline(
                     (rival.fill, Ramp::Red.at::<50>()),
                 ]
                 .into_iter()
+                .chain(carried.map(|id| (id, colour("s2"))))
                 .collect(),
             }),
             heatmap: None,
@@ -895,7 +954,10 @@ pub fn sparkline(
                 },
                 ComboLayer {
                     kind: "line",
-                    corresponding_datasets: vec![scratchy.line, rival.line],
+                    corresponding_datasets: match carried {
+                        Some(id) => vec![scratchy.line, rival.line, id],
+                        None => vec![scratchy.line, rival.line],
+                    },
                 },
             ]),
             bounds: Some(Bounds {
@@ -963,7 +1025,7 @@ mod tests {
                 highlight: false,
             },
         ];
-        let pts = spark_points(&steps, Better::Higher, SCRATCHY, RIVAL);
+        let pts = spark_points(&steps, Better::Higher, SCRATCHY, RIVAL, None);
         let fill = |group| -> Vec<(f64, Option<(f64, f64)>)> {
             pts.iter()
                 .filter(|p| p.group == group)
@@ -988,10 +1050,94 @@ mod tests {
             ]
         );
         // For time, less is ahead: the same numbers swap the fills.
-        let ttft = spark_points(&steps, Better::Lower, SCRATCHY, RIVAL);
+        let ttft = spark_points(&steps, Better::Lower, SCRATCHY, RIVAL, None);
         assert!(
             ttft.iter()
                 .any(|p| p.group == RIVAL.fill && p.key == 1.0 && p.upper.is_some())
+        );
+    }
+
+    #[test]
+    fn carrying_extends_the_rival_dotted_and_the_fill() {
+        // Both stacks measured, then two steps only scratchy was: the rival's
+        // line breaks, its carried level draws dotted from the last measured
+        // point, and the fill and the highlight's factor follow that level.
+        let mut steps = [
+            Step {
+                x: 1.0,
+                scratchy: Some(10.0),
+                rival: Some(5.0),
+                highlight: false,
+            },
+            Step {
+                x: 2.0,
+                scratchy: Some(12.0),
+                rival: None,
+                highlight: false,
+            },
+            Step {
+                x: 4.0,
+                scratchy: Some(14.0),
+                rival: None,
+                highlight: true,
+            },
+        ];
+        let pts = spark_points(
+            &steps,
+            Better::Higher,
+            SCRATCHY,
+            RIVAL,
+            Some("mlx-lm (carried)"),
+        );
+        let at = |group| -> Vec<(f64, Option<f64>)> {
+            pts.iter()
+                .filter(|p| p.group == group)
+                .map(|p| (p.key, p.value))
+                .collect()
+        };
+        // The rival's own line breaks at the steps it was not measured at.
+        assert_eq!(at(RIVAL.line), [(1.0, Some(5.0)), (2.0, None), (4.0, None)]);
+        // The carried line: a bridge at the last measured point, then the
+        // carried level at each step past it.
+        assert_eq!(
+            at("mlx-lm (carried)"),
+            [(1.0, Some(5.0)), (2.0, Some(5.0)), (4.0, Some(5.0))]
+        );
+        // The fill continues over the carried steps, against that level.
+        let fill = |group| -> Vec<(f64, Option<(f64, f64)>)> {
+            pts.iter()
+                .filter(|p| p.group == group)
+                .map(|p| (p.key, p.lower.zip(p.upper)))
+                .collect()
+        };
+        assert_eq!(
+            fill(SCRATCHY.fill),
+            [
+                (1.0, Some((5.0, 10.0))),
+                (2.0, Some((5.0, 12.0))),
+                (4.0, Some((5.0, 14.0)))
+            ]
+        );
+        // The highlight's factor pairs the newest value with the carried
+        // level — the same pairing the page makes everywhere else.
+        assert_eq!(
+            pts.iter()
+                .find(|p| p.group == SCRATCHY.fill && p.key == 4.0)
+                .and_then(|p| p.factor),
+            Some(14.0 / 5.0)
+        );
+        // Without carrying, the same steps leave the fill broken and no
+        // carried line at all.
+        steps[2].highlight = false;
+        let plain = spark_points(&steps, Better::Higher, SCRATCHY, RIVAL, None);
+        assert!(plain.iter().all(|p| p.group != "mlx-lm (carried)"));
+        assert_eq!(
+            plain
+                .iter()
+                .filter(|p| p.group == SCRATCHY.fill)
+                .map(|p| (p.key, p.lower.zip(p.upper)))
+                .collect::<Vec<_>>(),
+            [(1.0, Some((5.0, 10.0))), (2.0, None), (4.0, None)]
         );
     }
 

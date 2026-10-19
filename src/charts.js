@@ -88,7 +88,11 @@
     if (scale) highlightSteps(chart, spec, scale);
     if (spec.kind === 'combo') {
       labelGaps(el, chart, spec.data);
-      chart.services.events.addEventListener('render-finished', function () { labelGaps(el, chart, spec.data); });
+      dashCarried(el);
+      chart.services.events.addEventListener('render-finished', function () {
+        labelGaps(el, chart, spec.data);
+        dashCarried(el);
+      });
     }
     if (spec.ratio) {
       labelFactors(el, spec.data);
@@ -153,6 +157,19 @@
       text.style.fontSize = '9px';
       text.style.fontWeight = 'bold';
       text.style.fill = 'var(--cds-text-primary)';
+    });
+  }
+  // Dashes the rival's carried line — the dotted continuation of its line
+  // past its last measurement, on a timeline whose PRs outrun torch's
+  // sweeps. Carbon has no dashed-line option, so this finds its paths by
+  // their dataset's name ("… (carried)", the id the build gave the carried
+  // series) and dashes them, again after every draw.
+  function dashCarried(el) {
+    el.querySelectorAll('path.line').forEach(function (path) {
+      var name = path.__data__ && path.__data__.name;
+      if (typeof name === 'string' && name.slice(-11) === ' (carried)') {
+        path.setAttribute('stroke-dasharray', '4, 3');
+      }
     });
   }
   // The relative luminance of an "rgb(r, g, b)" colour, 0 black to 1 white.
