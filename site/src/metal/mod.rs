@@ -633,15 +633,6 @@ struct Series {
     pts: Vec<(u32, Option<f64>)>,
 }
 
-/// A grid's heatmap axes, read like a table: answer tokens across, prompt
-/// tokens down, each smallest first, so the smallest prompt is on top.
-fn grid_axes(ins: &[u32], outs: &[u32]) -> TableAxes<'static> {
-    TableAxes {
-        across: ("answer tokens", outs.iter().map(u32::to_string).collect()),
-        down: ("prompt tokens", ins.iter().map(u32::to_string).collect()),
-    }
-}
-
 /// What a sweep's charts put on x.
 #[derive(Clone, Copy, PartialEq)]
 enum Sweep {
@@ -763,18 +754,19 @@ fn bar_chart(
 /// scratchy's own values on Carbon's sequential palette.
 fn grid_heatmap(
     title: String,
-    (ins, outs): (&[u32], &[u32]),
+    grid: TableAxes,
     data: Vec<HeatPoint>,
     total_label: String,
     ratio: bool,
     label: &str,
     scale: Option<&str>,
 ) -> Element {
+    let (rows, columns) = (grid.down.1.len(), grid.across.1.len());
     let spec = Chart::Heatmap {
         data,
         options: ChartOptions {
             title,
-            axes: grid_axes(ins, outs).axes(None),
+            axes: grid.axes(None),
             color: ratio.then_some(Colour::Gradient {
                 gradient: Gradient {
                     colors: &RATIO_STEPS,
@@ -790,8 +782,8 @@ fn grid_heatmap(
             }),
             // Room for the axes (and Carbon's legend when it shows), then
             // about 64px a cell. Carbon sets its box to this width.
-            height: format!("{}px", if ratio { 100 } else { 160 } + 56 * ins.len()),
-            width: Some(format!("{}px", 140 + 72 * outs.len())),
+            height: format!("{}px", if ratio { 100 } else { 160 } + 56 * rows),
+            width: Some(format!("{}px", 140 + 72 * columns)),
             legend: ratio.then_some(Enabled { enabled: false }),
             locale: Locale::total(total_label),
             combo: None,
@@ -1030,15 +1022,54 @@ fn sweep_part<'a>(m: &'a Model, run: &Run, prev: Option<Entry<'a>>, sweep: Sweep
     )
 }
 
-/// One engine's grid cells, by (prompt, answer) tokens.
+/// One engine's cells in one slice of the grid, by (row, column).
 type ByShape<'a> = BTreeMap<(u32, u32), &'a Cell>;
 
-/// A model's prompt-by-answer grid at one users count: the axes, each
-/// engine's cells, and the engines scratchy is compared against.
+/// One slice of a model's grid (users × prompt × answer tokens): one
+/// dimension held at one value, the other two read like a table.
+#[derive(Clone, Copy, PartialEq)]
+enum Slice {
+    /// Users at once down, prompt tokens across, at one answer length: the
+    /// heat maps, read like spyre.html's batch by context.
+    Answer(u32),
+    /// Prompt tokens down, answer tokens across, at one users count: what the
+    /// prompt and answer sparklines average over.
+    Users(u32),
+}
+
+impl Slice {
+    /// Where a cell sits in this slice, (row, column), if it is in it. Cells
+    /// from before the grid had its own users count ran at `base`.
+    fn place(self, c: &Cell, base: u32) -> Option<(u32, u32)> {
+        let At::Grid { input, output } = c.at else {
+            return None;
+        };
+        let users = c.users.unwrap_or(base);
+        match self {
+            Slice::Answer(a) => (output == a).then_some((users, input)),
+            Slice::Users(u) => (users == u).then_some((input, output)),
+        }
+    }
+
+    /// Its rows and columns, each smallest first: the smallest on top.
+    fn axes(self, down: &[u32], across: &[u32]) -> TableAxes<'static> {
+        let (d, a) = match self {
+            Slice::Answer(_) => ("users at once", "prompt tokens"),
+            Slice::Users(_) => ("prompt tokens", "answer tokens"),
+        };
+        TableAxes {
+            across: (a, across.iter().map(u32::to_string).collect()),
+            down: (d, down.iter().map(u32::to_string).collect()),
+        }
+    }
+}
+
+/// A model's grid at one slice: its rows and columns, each engine's cells,
+/// and the engines scratchy is compared against.
 struct ShapeGrid<'a> {
-    ins: &'a [u32],
-    outs: &'a [u32],
-    users: u32,
+    slice: Slice,
+    down: Vec<u32>,
+    across: Vec<u32>,
     have: Vec<(Engine, ByShape<'a>)>,
     /// The headline comparison: the first of Engine::RIVALS the run has.
     rival: Option<Engine>,
@@ -1061,9 +1092,9 @@ fn grid_users(m: &Model, run: &Run) -> Vec<u32> {
     us
 }
 
-/// The users count the overview shows a model's grid at: one user at a time
-/// when its grid ran at 1 (#349), else the count it ran at (the base count,
-/// in runs from before the grid had its own).
+/// The users count the prompt and answer sparklines follow a model's grid
+/// at: one user at a time when its grid ran at 1 (#349), else the count it
+/// ran at (the base count, in runs from before the grid had its own).
 fn glance_users(m: &Model, run: &Run) -> u32 {
     let us = grid_users(m, run);
     if us.contains(&1) {
@@ -1073,50 +1104,60 @@ fn glance_users(m: &Model, run: &Run) -> u32 {
     }
 }
 
-fn users_text(n: u32) -> String {
-    if n == 1 {
-        "1 user at a time".to_string()
-    } else {
-        format!("{n} users at once")
-    }
+/// A run's grid answer lengths, longest first.
+fn grid_answers(run: &Run) -> Vec<u32> {
+    let mut os = run
+        .config
+        .scaling
+        .as_ref()
+        .and_then(|s| s.grid_output.clone())
+        .unwrap_or_default();
+    os.sort_unstable_by(|a, b| b.cmp(a));
+    os.dedup();
+    os
+}
+
+/// The answer length the overview's heat maps show a run's grids at: its
+/// longest, where throughput is most nearly decode (the decode map's
+/// subject), and time to first token includes waiting behind the other
+/// users' answers, as on a busy server.
+fn glance_answer(run: &Run) -> Option<u32> {
+    grid_answers(run).first().copied()
 }
 
 impl<'a> ShapeGrid<'a> {
-    /// None when scratchy has no grid at that users count.
-    fn of(m: &'a Model, run: &'a Run, users: u32) -> Option<Self> {
+    /// None when scratchy has no cells in that slice.
+    fn of(m: &'a Model, run: &'a Run, slice: Slice) -> Option<Self> {
         let base = base_of(run, m).2.unwrap_or(0);
         let sc = run.config.scaling.as_ref()?;
         let (ins, outs) = (
-            sc.grid_input.as_deref().unwrap_or_default(),
-            sc.grid_output.as_deref().unwrap_or_default(),
+            sc.grid_input.clone().unwrap_or_default(),
+            sc.grid_output.clone().unwrap_or_default(),
         );
+        let (down, across) = match slice {
+            Slice::Answer(_) => (grid_users(m, run), ins),
+            Slice::Users(_) => (ins, outs),
+        };
         let have: Vec<_> = Engine::ALL
             .iter()
             .map(|&e| {
                 let cs = e
                     .cells(m)
                     .iter()
-                    .filter(|c| c.users.unwrap_or(base) == users)
-                    .filter_map(|c| {
-                        if let At::Grid { input, output } = c.at {
-                            Some(((input, output), c))
-                        } else {
-                            None
-                        }
-                    })
+                    .filter_map(|c| Some((slice.place(c, base)?, c)))
                     .collect();
                 (e, cs)
             })
             .collect();
         let g = ShapeGrid {
-            ins,
-            outs,
-            users,
+            slice,
+            down,
+            across,
             have,
             rival: None,
             present: Vec::new(),
         };
-        if g.cells(Engine::Scratchy).is_empty() || ins.is_empty() || outs.is_empty() {
+        if g.cells(Engine::Scratchy).is_empty() || g.down.is_empty() || g.across.is_empty() {
             return None;
         }
         let present: Vec<Engine> = Engine::RIVALS
@@ -1137,6 +1178,17 @@ impl<'a> ShapeGrid<'a> {
             .find(|(h, _)| *h == e)
             .expect("every engine has an entry")
             .1
+    }
+
+    fn axes(&self) -> TableAxes<'static> {
+        self.slice.axes(&self.down, &self.across)
+    }
+
+    /// Every (row, column), row by row.
+    fn rungs(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.down
+            .iter()
+            .flat_map(|&d| self.across.iter().map(move |&a| (d, a)))
     }
 
     fn at(&self, e: Option<Engine>, rung: (u32, u32)) -> Option<&'a Cell> {
@@ -1232,13 +1284,13 @@ impl Trend {
                 Some((rival, pts))
             }
             Trend::PromptPrefill | Trend::AnswerDecode => {
-                let g = ShapeGrid::of(m, run, glance_users(m, run))?;
+                let g = ShapeGrid::of(m, run, Slice::Users(glance_users(m, run)))?;
                 let rival = g.rival?;
                 let prompt = self == Trend::PromptPrefill;
                 let (along, across) = if prompt {
-                    (g.ins, g.outs)
+                    (&g.down, &g.across)
                 } else {
-                    (g.outs, g.ins)
+                    (&g.across, &g.down)
                 };
                 let pts = along
                     .iter()
@@ -1346,23 +1398,20 @@ fn why(c: Option<&Cell>, name: &str) -> String {
 
 /// One model's grid for one metric, coloured by scratchy against its rival.
 fn heat_map(g: &ShapeGrid, metric: Metric, title: &str, scale: &str) -> Element {
-    let mut data = Vec::new();
-    for &i in g.ins {
-        for &o in g.outs {
-            let value = match g.rival {
-                Some(rival) => g.versus(metric, (i, o), rival).0.map(log2_ratio),
+    let data = g
+        .rungs()
+        .map(|(d, a)| HeatPoint {
+            x: a.to_string(),
+            y: d.to_string(),
+            value: match g.rival {
+                Some(rival) => g.versus(metric, (d, a), rival).0.map(log2_ratio),
                 // Nothing to compare against: scratchy's own value.
-                None => timing(g.at(Some(Engine::Scratchy), (i, o)), metric),
-            };
-            data.push(HeatPoint {
-                x: o.to_string(),
-                y: i.to_string(),
-                value,
-                // A ratio grid has room for every square's factor.
-                highlight: g.rival.is_some(),
-            });
-        }
-    }
+                None => timing(g.at(Some(Engine::Scratchy), (d, a)), metric),
+            },
+            // A ratio grid has room for every square's factor.
+            highlight: g.rival.is_some(),
+        })
+        .collect();
     let (heading, total_label) = match g.rival {
         Some(r) => (
             format!("{title}, scratchy vs {}", r.label()),
@@ -1375,7 +1424,7 @@ fn heat_map(g: &ShapeGrid, metric: Metric, title: &str, scale: &str) -> Element 
     };
     grid_heatmap(
         heading,
-        (g.ins, g.outs),
+        g.axes(),
         data,
         total_label,
         g.rival.is_some(),
@@ -1384,35 +1433,36 @@ fn heat_map(g: &ShapeGrid, metric: Metric, title: &str, scale: &str) -> Element 
     )
 }
 
-/// The grid's numbers for one metric, dense: per prompt size one row per
-/// engine scratchy is compared with, each cell the ratio and its marks; just
+/// The grid's numbers for one metric, dense: per row one row per engine
+/// scratchy is compared with, each cell the ratio and its marks; just
 /// scratchy's values with none.
 fn heat_table(g: &ShapeGrid, metric: Metric, title: &str) -> Element {
-    let mut cols = vec![format!("{title}: prompt ↓ / answer →")];
-    cols.extend(g.outs.iter().map(u32::to_string));
+    let axes = g.axes();
+    let mut cols = vec![format!("{title}: {} ↓ / {} →", axes.down.0, axes.across.0)];
+    cols.extend(axes.across.1);
     rsx! {
         Table { headers: cols,
-            for &i in g.ins {
+            for &d in &g.down {
                 if g.present.is_empty() {
                     TableRow {
-                        TableCell { "{i}" }
-                        for &o in g.outs { TableCell { {table_value(g.at(Some(Engine::Scratchy), (i, o)), metric)} } }
+                        TableCell { "{d}" }
+                        for &a in &g.across { TableCell { {table_value(g.at(Some(Engine::Scratchy), (d, a)), metric)} } }
                     }
                 }
                 for &e in &g.present {
                     TableRow {
-                        TableCell { "{i} · vs {e.label()}" }
-                        for &o in g.outs {
+                        TableCell { "{d} · vs {e.label()}" }
+                        for &a in &g.across {
                             {
                                 // The ratio, then what its marks mean, side by side.
                                 let notes: Vec<String> = [(Engine::Scratchy, "scratchy"), (e, e.label())]
                                     .into_iter()
                                     .filter_map(|(who, name)| {
-                                        let n = marks_note(g.at(Some(who), (i, o)), metric);
+                                        let n = marks_note(g.at(Some(who), (d, a)), metric);
                                         (!n.is_empty()).then(|| format!("{name}: {n}"))
                                     })
                                     .collect();
-                                let text = g.versus(metric, (i, o), e).1;
+                                let text = g.versus(metric, (d, a), e).1;
                                 rsx! { TableCell { if notes.is_empty() { "{text}" } else { "{text} ({notes.join(\"; \")})" } } }
                             }
                         }
@@ -1426,21 +1476,19 @@ fn heat_table(g: &ShapeGrid, metric: Metric, title: &str) -> Element {
 /// scratchy against one engine as a tiny ratio map, named under it: the
 /// small multiples beside the full maps, one per other engine.
 fn versus_mini(g: &ShapeGrid, metric: Metric, e: Engine, label: &str) -> Element {
-    let mut data = Vec::new();
-    for &i in g.ins {
-        for &o in g.outs {
-            data.push(HeatPoint {
-                x: o.to_string(),
-                y: i.to_string(),
-                value: g.versus(metric, (i, o), e).0.map(log2_ratio),
-                highlight: false,
-            });
-        }
-    }
+    let data = g
+        .rungs()
+        .map(|(d, a)| HeatPoint {
+            x: a.to_string(),
+            y: d.to_string(),
+            value: g.versus(metric, (d, a), e).0.map(log2_ratio),
+            highlight: false,
+        })
+        .collect();
     rsx! {
         div { style: "flex: 0 0 7rem; width: 7rem",
             Stack { gap: 1,
-                {mini_heatmap(grid_axes(g.ins, g.outs), data, format!("scratchy/{}", e.label()), label)}
+                {mini_heatmap(g.axes(), data, format!("scratchy/{}", e.label()), label)}
                 div { style: "text-align: center; font-size: 0.75rem", "vs {e.label()}" }
             }
         }
@@ -1448,19 +1496,19 @@ fn versus_mini(g: &ShapeGrid, metric: Metric, e: Engine, label: &str) -> Element
 }
 
 fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
-    let grids: Vec<ShapeGrid> = grid_users(m, run)
+    let grids: Vec<(u32, ShapeGrid)> = grid_answers(run)
         .into_iter()
-        .filter_map(|u| ShapeGrid::of(m, run, u))
+        .filter_map(|a| Some((a, ShapeGrid::of(m, run, Slice::Answer(a))?)))
         .collect();
     if grids.is_empty() {
         return rsx! {};
     }
-    let counts = grids
+    let answers = grids
         .iter()
-        .map(|g| users_text(g.users))
+        .map(|(a, _)| a.to_string())
         .collect::<Vec<_>>()
         .join(", then ");
-    let one = |g: &ShapeGrid| -> Element {
+    let one = |a: u32, g: &ShapeGrid| -> Element {
         let note = match g.rival {
             None => {
                 "scratchy's own values; this run has no other engine to compare against".to_string()
@@ -1479,23 +1527,23 @@ fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
         let others: Vec<Engine> = g.present.iter().copied().skip(1).collect();
         rsx! {
             Stack { gap: 3,
-                strong { "{users_text(g.users)}" }
+                strong { "{a}-token answers" }
                 p { "{note}." }
                 div { style: "display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: flex-start",
-                    for (metric, title) in GRID_METRICS { {heat_map(g, metric, title, &format!("scale-{mid}-{}", g.users))} }
-                    if g.rival.is_some() { {ratio_scale(ScaleFit::Fixed, &format!("scale-{mid}-{}", g.users))} }
+                    for (metric, title) in GRID_METRICS { {heat_map(g, metric, title, &format!("scale-{mid}-{a}"))} }
+                    if g.rival.is_some() { {ratio_scale(ScaleFit::Fixed, &format!("scale-{mid}-{a}"))} }
                 }
                 if !others.is_empty() {
                     for (metric, title) in GRID_METRICS {
                         Stack { gap: 1,
                             span { "{title}, vs every engine" }
                             div { style: "display: flex; flex-wrap: wrap; gap: 1rem",
-                                for e in &others { {versus_mini(g, metric, *e, &format!("{title}, scratchy vs {}, {}", e.label(), users_text(g.users)))} }
+                                for e in &others { {versus_mini(g, metric, *e, &format!("{title}, scratchy vs {}, {a}-token answers", e.label()))} }
                             }
                         }
                     }
                 }
-                Fold { title: "Table view, {users_text(g.users)}",
+                Fold { title: "Table view, {a}-token answers",
                     Stack { gap: 4,
                         for (metric, title) in GRID_METRICS { {heat_table(g, metric, title)} }
                     }
@@ -1504,11 +1552,14 @@ fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
         }
     };
     part(
-        "Prompt size × answer size",
-        rsx! { "Prompt size down the side, answer size across the bottom, measured at {counts}." },
+        "Users × prompt size",
+        rsx! {
+            "Users at once down the side, fewest first; prompt size across the bottom, shortest first. One grid \
+             per answer length: {answers} tokens."
+        },
         rsx! {
             Stack { gap: 6,
-                for g in &grids { {one(g)} }
+                for (a, g) in &grids { {one(*a, g)} }
             }
         },
     )
@@ -1592,47 +1643,54 @@ fn runs_table(runs: &[&Run]) -> Element {
 const HEAT_LABELS: usize = 12;
 
 /// Where an overview heat map square is: machine, model, metric, and its
-/// prompt and answer lengths.
+/// users count and prompt length.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Square<'a> {
     chip: &'a str,
     stem: &'a str,
     metric: &'a str,
+    users: u32,
     prompt: u32,
-    answer: u32,
 }
 
-/// One overview heat map's ratios: its grid's lengths, the rival, and each
-/// square's (prompt, answer, how many times faster scratchy is).
-struct GlanceGrid<'a> {
-    ins: &'a [u32],
-    outs: &'a [u32],
+/// One overview heat map's ratios: the answer length it is at, its prompt
+/// lengths, the rival, and each square's (users, prompt, how many times
+/// faster scratchy is).
+struct GlanceGrid {
+    answer: u32,
+    prompts: Vec<u32>,
     rival: Engine,
     cells: Vec<(u32, u32, Option<f64>)>,
 }
 
-impl<'a> GlanceGrid<'a> {
-    /// A model's grid at a metric on a machine's latest run, or why none.
-    fn of(mr: &'a MachineRuns, stem: &str, metric: Metric) -> Result<Self, &'static str> {
+impl GlanceGrid {
+    /// A model's grid at a metric on a machine's latest run, with a row per
+    /// `users` count (those it did not run at left blank), or why none.
+    fn of(
+        mr: &MachineRuns,
+        stem: &str,
+        metric: Metric,
+        users: &[u32],
+    ) -> Result<Self, &'static str> {
         let Entry { run, m } = mr.latest(stem).ok_or("not run")?;
-        let g = ShapeGrid::of(m, run, glance_users(m, run)).ok_or("no grid")?;
+        let answer = glance_answer(run).ok_or("no grid")?;
+        let g = ShapeGrid::of(m, run, Slice::Answer(answer)).ok_or("no grid")?;
         let rival = g.rival.ok_or("nothing to compare")?;
-        let cells = g
-            .ins
+        let cells = users
             .iter()
-            .flat_map(|&i| g.outs.iter().map(move |&o| (i, o)))
-            .map(|(i, o)| (i, o, g.versus(metric, (i, o), rival).0))
+            .flat_map(|&u| g.across.iter().map(move |&i| (u, i)))
+            .map(|(u, i)| (u, i, g.versus(metric, (u, i), rival).0))
             .collect();
         Ok(GlanceGrid {
-            ins: g.ins,
-            outs: g.outs,
+            answer,
+            prompts: g.across,
             rival,
             cells,
         })
     }
 }
 
-/// Every model's prompt-by-answer grid on every machine as small multiples,
+/// Every model's users-by-prompt grid on every machine as small multiples,
 /// one table per metric: a machine per row, a model per column, each cell that
 /// model's grid as a tiny heatmap coloured like the full ones.
 fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
@@ -1648,6 +1706,16 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
         return rsx! {};
     }
     let metrics = [(Metric::Ttft, "Prefill"), (Metric::Throughput, "Decode")];
+    // Every users count any shown grid ran at: every heat map rows by all of
+    // them, so the maps are one shape, and a run that measured fewer shows
+    // the rest blank, as not measured.
+    let users: Vec<u32> = machines
+        .values()
+        .flat_map(|mr| stems.iter().filter_map(|&stem| mr.latest(stem)))
+        .flat_map(|Entry { run, m }| grid_users(m, run))
+        .collect::<BTreeSet<u32>>()
+        .into_iter()
+        .collect();
     // Every grid's ratios first, keyed by machine, model and metric, or why
     // the grid has none: the highlights are picked from all of them.
     let mut grids: BTreeMap<(&str, &str, &str), Result<GlanceGrid, &str>> = BTreeMap::new();
@@ -1656,22 +1724,29 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             for (metric, name) in metrics {
                 grids.insert(
                     (chip, stem, name),
-                    GlanceGrid::of(&machines[chip], stem, metric),
+                    GlanceGrid::of(&machines[chip], stem, metric, &users),
                 );
             }
         }
     }
+    let answers = grids
+        .values()
+        .filter_map(|g| Some(g.as_ref().ok()?.answer.to_string()))
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(" or ");
     let squares: BTreeMap<Square, f64> = grids
         .iter()
         .filter_map(|(&(chip, stem, name), g)| Some((chip, stem, name, g.as_ref().ok()?)))
         .flat_map(|(chip, stem, name, g)| {
-            g.cells.iter().filter_map(move |&(i, o, r)| {
+            g.cells.iter().filter_map(move |&(u, i, r)| {
                 let at = Square {
                     chip,
                     stem,
                     metric: name,
+                    users: u,
                     prompt: i,
-                    answer: o,
                 };
                 Some((at, r?))
             })
@@ -1755,21 +1830,21 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
         let squares = g
             .cells
             .iter()
-            .map(|&(i, o, r)| RatioSquare {
-                across: o.to_string(),
-                down: i.to_string(),
+            .map(|&(u, i, r)| RatioSquare {
+                across: i.to_string(),
+                down: u.to_string(),
                 ratio: r,
                 highlight: highlights.contains(&Square {
                     chip,
                     stem,
                     metric: name,
+                    users: u,
                     prompt: i,
-                    answer: o,
                 }),
             })
             .collect();
         glance_mini(
-            grid_axes(g.ins, g.outs),
+            Slice::Answer(g.answer).axes(&users, &g.prompts),
             squares,
             format!("scratchy/{}", g.rival.label()),
             name,
@@ -1800,10 +1875,13 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                             ContentPanel { id: slug(HEAT_MAPS), shown: true,
                                 Stack { gap: 5,
                                     p { style: "contain: inline-size",
-                                        "Every model's prompt size × answer size grid on every machine: in each cell, the model's \
-                                         prefill (time to first token) grid, then its decode (throughput) grid (rows: prompt, short to \
-                                         long; columns: answer, short to long), one user at a time where the grid ran at 1 (the base users count \
-                                         in runs from before). Colour is how many times faster scratchy is than the engine named under the \
+                                        "Every model's users × prompt size grid on every machine, at the grid's longest answers \
+                                         ({answers} tokens), where throughput is mostly decode: in each cell, the model's prefill (time to \
+                                         first token) grid, then its decode (throughput) grid (rows: users at once, fewest first; columns: \
+                                         prompt, short to long). A blank square has no ratio: scratchy or the engine it is compared with \
+                                         was not measured there, or never streamed an answer (the model's own grids below say which); runs \
+                                         from before the grid had its own users counts measured it at the base count only. \
+                                         Colour is how many times faster scratchy is than the engine named under the \
                                          grid: oMLX TurboQuant where the run has it, else the next of oMLX, mlx-lm, vllm-metal, ollama, \
                                          llama.cpp, mistral.rs. Blue faster, red slower, the middle step within noise. \
                                          Hover a square for its ratio."
