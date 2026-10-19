@@ -96,9 +96,20 @@ fn the_batch_ladder_round_trips_through_its_swept_key() {
         assert!(
             ladder
                 .iter()
-                .all(|&t| t.is_multiple_of(seqs) && t / seqs >= 2 && t <= ChunkScratch::PAGES_MAX),
+                .all(|&t| t.is_multiple_of(seqs)
+                    && t / seqs >= 2
+                    && t <= ChunkScratch::BATCH_PAGES_MAX),
             "seqs={seqs}: {ladder:?}"
         );
+        // Past the short ladder's 64-page ceiling, only the long-context rungs — and only at the widths
+        // that bake them.
+        for &t in ladder.iter().filter(|&&t| t > ChunkScratch::PAGES_MAX) {
+            assert!(
+                seqs >= BatchChunk::LONG_MIN_REQUESTS
+                    && BatchChunk::LONG_PAGES_PER_REQUEST.contains(&(t / seqs)),
+                "seqs={seqs} t={t}: a chunk past 64 pages is a long-context rung"
+            );
+        }
         assert!(
             ladder.windows(2).all(|w| w[0] < w[1]),
             "seqs={seqs}: ascending"
@@ -118,6 +129,28 @@ fn the_batch_ladder_round_trips_through_its_swept_key() {
     // request; both are exact rungs, so no request pads a page.
     assert!(ChunkScratch::ladder_for(pool, 8).contains(&40));
     assert!(ChunkScratch::ladder_for(pool, 8).contains(&48));
+    // ⭐ AND THE ~10k CELLS (41-42 pages per request, `--max-model-len 12288` = 48) RUN A CHUNK at the
+    // widths the sweep serves, instead of the per-page fold: J = 48 at width 4 and 8.
+    assert_eq!(
+        ChunkScratch::ladder_for(pool, 4)
+            .into_iter()
+            .filter(|&t| t > 64)
+            .collect::<Vec<_>>(),
+        vec![96, 128, 192]
+    );
+    assert_eq!(
+        ChunkScratch::ladder_for(pool, 8)
+            .into_iter()
+            .filter(|&t| t > 64)
+            .collect::<Vec<_>>(),
+        vec![128, 192, 256, 384]
+    );
+    assert!(
+        ChunkScratch::ladder_for(pool, 2).iter().all(|&t| t <= 64),
+        "width 2 bakes no long-context rung"
+    );
+    // One request keeps the solo ladder, whose top is the 64-page chunk.
+    assert!(ChunkScratch::LADDER.iter().all(|&t| t <= ChunkScratch::PAGES_MAX));
 }
 
 /// The slots of each score part and each value part a batch chunk of `pages` pages emits: one whole chunk

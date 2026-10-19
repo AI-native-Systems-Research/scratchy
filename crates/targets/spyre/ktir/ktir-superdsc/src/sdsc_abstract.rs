@@ -7274,6 +7274,21 @@ impl ChunkScratch {
     /// reaches the same depth with a chunk of 32 smaller pages walked over several in-program trips.
     pub const PAGES_MAX: u32 = 64;
 
+    /// ⭐ THE WIDEST CHUNK THE DOOR ADMITS — a decode batch's long-context rung, the widest BAKED batch
+    /// rung times its deepest long `J` ([`BatchChunk::LONG_PAGES_PER_REQUEST`]): 8 × 48 = 384 pages. One
+    /// request's chunk still tops out at [`Self::PAGES_MAX`] (the solo ladder).
+    ///
+    /// Everything such a chunk reserves is sized by the chunk itself and refused at bake on overrun: its
+    /// gather scratches and score blocks are placed at the chunk's own footprint
+    /// (`cover_ladder_allocation` lifts the session to every sibling's high-water, and a segment past one
+    /// region is a build error), its LX form declines past the pin window, its mask block is checked
+    /// against the mask's placement, and its index table against its own. MEASURED cardless at granite-2b
+    /// on nickm4: the 384-page batch body bakes (dxp rc=0, every op untiled, gather scratches 96 MiB).
+    pub const BATCH_PAGES_MAX: u32 = {
+        let widest_long = BatchChunk::LONG_PAGES_PER_REQUEST[BatchChunk::LONG_PAGES_PER_REQUEST.len() - 1];
+        PagedKvPool::ADMITTED_BATCH_WIDTH * widest_long
+    };
+
     /// ⭐ THE ONE-REQUEST DECODE LADDER — one baked body per chunk width, in pages, ascending. The
     /// runtime picks the smallest rung covering the live context (`select_body`'s own law over each
     /// rung's swept `pages * PAGE_SLOTS`), and the chunk's tail pages repeat the last real page under a
@@ -7316,7 +7331,7 @@ impl ChunkScratch {
         let Some(plane) = PagePlaneExtent::of_pool(pool) else {
             return None;
         };
-        if pages == 0 || pages > Self::PAGES_MAX {
+        if pages == 0 || pages > Self::BATCH_PAGES_MAX {
             return None;
         }
         // One slab's V entries per page must be whole runs of that slab — see the type's doc.
@@ -8368,6 +8383,27 @@ impl BatchChunk {
     /// prompts, 256 out) crosses 5 → 6 pages per request, which a power-of-two step would round to 8.
     pub const PAGES_PER_REQUEST: [u32; 15] = [2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32];
 
+    /// ⭐ THE LONG-CONTEXT RUNGS — `J` pages per request for a batch chunk WIDER than
+    /// [`ChunkScratch::PAGES_MAX`], baked only at widths of [`Self::LONG_MIN_REQUESTS`] and up.
+    ///
+    /// Past `B × J = 64` pages the batch rung used to have no chunk, and every step ran the per-page
+    /// fold: `B × pages` passes per layer at ~65 µs each. MEASURED on the 2026-10-19 sweep at ~10k
+    /// tokens (41 pages per request), granite-2b fp16: a 456 ms step at width 4 and 965 ms at width 8
+    /// (TPOT 538 / 1179 ms against torch-spyre's 208 / 370). The chunk costs ~20 µs per request-page-layer
+    /// (the ~1k cells' own slope, 0.81 ms per chunk page per step), so the same context is ~180-380 ms.
+    ///
+    /// ⭐ GEOMETRIC, NOT LINEAR. Every rung is a whole-model lowering against the 2b fp8 bake budget, so
+    /// the steps are wide: 16 → 24 → 32 → 48. The padding that buys is at most a third of a rung (41
+    /// pages on the 48-page rung pads 7 per request, ~12% of a ~10k step). 48 is `--max-model-len 12288`
+    /// over 256-slot pages, the depth the sweep serves at width 4 and 8; a deeper batch falls back to the
+    /// fold, which serves any length (`RerollMeta::fallback_rung`, proved at bake).
+    pub const LONG_PAGES_PER_REQUEST: [u32; 4] = [16, 24, 32, 48];
+
+    /// The narrowest width the long-context rungs bake at. A 2-row batch past 64 pages is the drain of a
+    /// wider wave, not a width a serve holds, and its fold costs half a 4-row one, so it does not buy a
+    /// whole-model lowering.
+    pub const LONG_MIN_REQUESTS: u32 = 4;
+
     /// THE ONE DOOR. `None` unless the chunk is a whole number of pages per request (at least one) —
     /// the layout [`Self::page_list`] and [`Self::slot_of`] read.
     pub const fn of(chunk: ChunkScratch, requests: u32, gqa: u32) -> Option<BatchChunk> {
@@ -8505,11 +8541,20 @@ impl ChunkScratch {
         let widths: Vec<u32> = if requests <= 1 {
             Self::LADDER.to_vec()
         } else {
-            BatchChunk::PAGES_PER_REQUEST
+            let short = BatchChunk::PAGES_PER_REQUEST
                 .iter()
                 .map(|&j| j * requests)
-                .filter(|&t| t <= Self::PAGES_MAX)
-                .collect()
+                .filter(|&t| t <= Self::PAGES_MAX);
+            // Past the short ladder's ceiling, the long-context rungs — at the widths that bake them.
+            let long = BatchChunk::LONG_PAGES_PER_REQUEST
+                .iter()
+                .map(|&j| j * requests)
+                .filter(|&t| {
+                    t > Self::PAGES_MAX
+                        && requests >= BatchChunk::LONG_MIN_REQUESTS
+                        && t <= Self::BATCH_PAGES_MAX
+                });
+            short.chain(long).collect()
         };
         widths
             .into_iter()
