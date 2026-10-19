@@ -202,6 +202,33 @@ pub fn sen_to_ieee_bytes(src: &[u8], dst: &mut [u8]) {
     }
 }
 
+/// f32 → little-endian IEEE-f16 bytes — the narrowing every f32 host buffer takes at the bind
+/// boundary (`half`'s own round-to-nearest-even conversion).
+pub fn f32_to_f16_le(vals: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() * 2);
+    for &v in vals {
+        out.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+    }
+    out
+}
+
+/// ⭐ f32 → SEN169 BYTES IN ONE PASS — [`f32_to_f16_le`] then [`ieee_to_sen_bytes`], element by
+/// element, with no intermediate buffer. The f32 is narrowed by the same `half` conversion
+/// `f32_to_f16_le` uses, and its IEEE bits index the same compile-time table, so the bytes are the
+/// two-pass form's by construction; [`tests::one_pass_f32_to_sen_is_the_two_pass_form`] pins it.
+///
+/// What it saves is the buffer between the passes: a 2 B/element `Vec` per bind per step, written
+/// once and read once. At a 512-row prompt chunk that is millions of elements, and a fresh
+/// allocation that size is page-faulted in on every step.
+///
+/// `dst` must hold exactly `2 * src.len()` bytes.
+pub fn f32_to_sen_bytes(src: &[f32], dst: &mut [u8]) {
+    assert_eq!(dst.len(), src.len() * 2);
+    for (d, &v) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src) {
+        *d = SEN_TABLE[half::f16::from_f32(v).to_bits() as usize].to_le_bytes();
+    }
+}
+
 /// sen bits → f32, for the executor's debug/optrace dumps (sen→IEEE table, then the standard
 /// IEEE half→single widening).
 pub fn sen_to_f32(v: SenF16) -> f32 {
@@ -266,6 +293,63 @@ mod tests {
                 SenF16(v),
                 "sen {v:#06x} → ieee {:#06x} did not round-trip",
                 ieee.0
+            );
+        }
+    }
+
+    /// ⭐ THE ONE-PASS BIND IS THE TWO-PASS BIND, BYTE FOR BYTE: `f32_to_sen_bytes` against
+    /// `ieee_to_sen_bytes ∘ f32_to_f16_le` over
+    /// - every f16 value widened to f32 (exact),
+    /// - every midpoint between neighbouring finite f16 values (the round-to-nearest-even
+    ///   boundary), and one f32 ulp either side of it,
+    /// - the overflow edge,
+    /// - the staged mask constant,
+    /// - a pseudo-random sweep of raw f32 bit patterns (NaN payloads, f32 subnormals, magnitudes
+    ///   past f16's range).
+    #[test]
+    fn one_pass_f32_to_sen_is_the_two_pass_form() {
+        let mut vals: Vec<f32> = Vec::new();
+        for b in 0u16..=u16::MAX {
+            let x = half::f16::from_bits(b).to_f32();
+            vals.push(x);
+            let y = half::f16::from_bits(b.wrapping_add(1)).to_f32();
+            if x.is_finite() && y.is_finite() && (b & 0x7FFF) != 0x7FFF {
+                // A midpoint of two f16 values needs 12 significand bits; f32 holds it exactly.
+                let m = ((x as f64 + y as f64) / 2.0) as f32;
+                vals.extend([
+                    m,
+                    f32::from_bits(m.to_bits().wrapping_add(1)),
+                    f32::from_bits(m.to_bits().wrapping_sub(1)),
+                ]);
+            }
+        }
+        vals.extend([
+            65504.0,
+            65519.99,
+            65520.0,
+            -65520.0,
+            1.0e-8,
+            -1.0e-8,
+            f32::MAX,
+        ]);
+        vals.push(scratchy_subtile::sdsc_abstract::ATTN_MASK_NEG);
+        let mut s: u32 = 0x9E37_79B9;
+        for _ in 0..(1 << 20) {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            vals.push(f32::from_bits(s));
+        }
+        let mut one = vec![0u8; vals.len() * 2];
+        f32_to_sen_bytes(&vals, &mut one);
+        let mut two = vec![0u8; vals.len() * 2];
+        ieee_to_sen_bytes(&f32_to_f16_le(&vals), &mut two);
+        if let Some(i) = (0..vals.len()).find(|&i| one[2 * i..2 * i + 2] != two[2 * i..2 * i + 2]) {
+            panic!(
+                "element {i} (f32 bits {:#010x}): one pass {:02x?} != two pass {:02x?}",
+                vals[i].to_bits(),
+                &one[2 * i..2 * i + 2],
+                &two[2 * i..2 * i + 2],
             );
         }
     }
