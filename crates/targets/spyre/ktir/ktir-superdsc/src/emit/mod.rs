@@ -2467,10 +2467,9 @@ fn rewrite_op_for_time_tile(
         // coordinate is correct as written), so without a stride of its own both trips
         // would write the SAME HBM byte — the silently-wrong alias the bake's
         // `tiled_trips_alias` guard refuses, and the exact collision gemma-4's 262144-wide
-        // max32 produced under the old over-charge. The law demands the opsec was built in
-        // the PARTIALS FORM: the accum's device extent along the tiled dim is EXACTLY one
-        // stick per trip (`reduce_opspec_partials` states it). A time-tiled seeded reduce
-        // whose accum is a plain single stick is a build Err naming the remedy — the
+        // max32 produced under the old over-charge. No generic builder emits that form
+        // any more — the single-trip row is the only seeded form — so a time-tiled seeded
+        // reduce whose accum is a plain single stick is a build Err naming the law: the
         // alternative is the alias, caught here at the emission rather than at the bake.
         if op.is_reduction
             && !v.allocation.is_lx()
@@ -2489,10 +2488,11 @@ fn rewrite_op_for_time_tile(
                      the partials form — its device extent along '{tiled_dim}' is {phys:?}, and \
                      the law demands EXACTLY one stick per trip ({want_sticks} elems at {}). \
                      Without it, every trip writes the SAME one-stick accum (the #50 \
-                     `tiled_trips_alias` alias). Build the partials form — \
-                     `reduce_opspec_partials`: per-trip partials into a [{time} × {one_stick}]-elem \
-                     buffer plus ONE combine reduce — or let the row fit a single trip (the true \
-                     accum charge bills the accum at one stick per row).",
+                     `tiled_trips_alias` alias). The single-trip row is the only seeded form \
+                     this emitter has: let the row fit a single trip (the true accum charge \
+                     bills the accum at one stick per row), or split the reduce yourself — \
+                     per-slice single-shot reduces plus a combine, the fp8 qspt path's own \
+                     pattern (emit/ktir_matmul_fp8.rs).",
                     v.name,
                     v.df.elems_per_stick(),
                 )));
