@@ -2428,19 +2428,25 @@ fn rewrite_op_for_time_tile(
     let _ = (cores, sym_id_base, folds); // (no longer mints symbols; kept for sig parity)
     let mut affine_strides: Vec<BTreeMap<&'static str, i64>> = vec![BTreeMap::new(); views.len()];
     // Which tensors are tiled: HBM tensors that RANGE over `tiled_dim` — their layout
-    // contains it AND its scale is `Active`. Two operands are thereby exempt:
+    // contains it AND its scale is `Active` there. Two operands are thereby exempt:
     //   • an op whose layout lacks the dim (a matmul's INPUT/A does not carry `out`);
-    //   • ⭐ a BROADCAST/REDUCED operand, collapsed along the tiled dim (`out_broadcast`
-    //     → RedStick, `mb_broadcast` → RedNonStick — the tanhsoftcap cap const, the
-    //     rmsnorm eps). Its coordInfo is ALREADY the collapsed one-stick/one-row fold
-    //     `build_coordinates` wrote, and its address must NOT advance per trip: every
-    //     trip's out-window reads the SAME broadcast value. The old predicate
-    //     (`layout.contains(tiled_dim)` alone) handed such an operand a per-trip stride
-    //     AND re-derived its collapsed coordinate as a FULL per-time fold
-    //     (`divide_out_coordinate`) — silently-wrong on both counts, which the
-    //     pointwise_broadcast builder refused outright. The exemption IS the fix: the
-    //     operand is left byte-identical to what `emit_sdsc` wrote, and `concrete_trips`
-    //     keeps its base (an empty stride map is its no-bump path).
+    //   • ⭐ an operand COLLAPSED ALONG THE TILED DIM — its scale there is RedStick or
+    //     RedNonStick (`out_broadcast` → RedStick on `out`: the tanhsoftcap cap const,
+    //     the rmsnorm eps; a reduce's RedStick accum on its reduced dim). Its coordInfo
+    //     is ALREADY the collapsed one-stick/one-row fold `build_coordinates` wrote, and
+    //     its address must NOT advance per trip: every trip's out-window reads the SAME
+    //     broadcast value. The old predicate (`layout.contains(tiled_dim)` alone) handed
+    //     such an operand a per-trip stride AND re-derived its collapsed coordinate as a
+    //     FULL per-time fold (`divide_out_coordinate`) — silently-wrong on both counts,
+    //     which the pointwise_broadcast builder refused outright. The exemption IS the
+    //     fix: the operand is left byte-identical to what `emit_sdsc` wrote, and
+    //     `concrete_trips` keeps its base (an empty stride map is its no-bump path).
+    //     The collapse must be along the TILED dim: an operand collapsed along a
+    //     DIFFERENT dim still RANGES this one and MUST advance per trip. `In::mb` (the
+    //     rmsnorm gamma, a `[1,cols]` row vector) is RedNonStick on `mb` but ACTIVE on
+    //     `out` — in an op tiled over `out` it takes the per-trip stride below and each
+    //     trip reads its own out-window of that row (pinned: the mb operand's trip-start
+    //     advances; a strideless ranging operand is the 2b guard's build Err).
     for (ti, v) in views.iter().enumerate() {
         // ── 2a. THE SEEDED REDUCE'S ACCUM — THE PARTIALS LAW (#603) ─────────────────
         // A seeded reduce that time-tiles writes each trip's partial into its OWN stick
@@ -2606,6 +2612,46 @@ fn rewrite_op_for_time_tile(
                     divide_out_coordinate(&mut node.coordinates_, tiled_dim, out_per_time, eps);
                 }
             }
+        }
+    }
+
+    // ── 2b. INPUT-SIDE NO-ADVANCE GUARD ────────────────────────────────────────
+    // The bake's `tiled_trips_alias` guard covers the OUTPUT side only (per-trip
+    // OUTPUT allocations must be pairwise disjoint). The INPUT side had no guard: an
+    // HBM operand that RANGES the tiled dim — Active scale there, more than one
+    // trip's worth of physical extent — but carries NO per-trip advance would
+    // silently re-read trip 0's window in every later trip: wrong output, no
+    // refusal anywhere (the #53 class). Every such operand MUST carry a nonzero
+    // stride along the tiled dim; the loop above gives each one exactly that, so
+    // this guard is the belt-and-suspenders that makes a strideless ranging
+    // operand a build Err instead of a silent re-read.
+    for (ti, v) in views.iter().enumerate() {
+        if v.allocation.is_lx() {
+            continue; // on-chip: per-core private, outside the HBM stride path
+        }
+        let Some(si) = v.layout.iter().position(|&d| d == tiled_dim) else {
+            continue; // does not range the tiled dim (a matmul's A): re-read is correct
+        };
+        if !v.scale.get(si).is_none_or(|s| matches!(s, Scale::Active)) {
+            continue; // collapsed along the tiled dim: the broadcast exemption above
+        }
+        let phys = v
+            .device_extent
+            .get(si)
+            .copied()
+            .flatten()
+            .map(|p| p as i64)
+            .unwrap_or_else(|| op.iter.extent(tiled_dim) as i64);
+        if phys > out_per_time && affine_strides[ti].get(tiled_dim).copied().unwrap_or(0) == 0 {
+            return Err(SuperDscError(format!(
+                "{op_name}: operand {ti} ('{}') RANGES the tiled dim '{tiled_dim}' ({phys} \
+                 elems > the {out_per_time}-elem per-trip window) but carries NO per-trip \
+                 advance — every trip after the first would re-read trip 0's window, \
+                 silently wrong. An operand that must NOT advance is collapsed along the \
+                 tiled dim (RedStick/RedNonStick there), which the tiled predicate exempts; \
+                 this one is not.",
+                v.name
+            )));
         }
     }
 
@@ -7774,5 +7820,105 @@ mod time_tiled_broadcast_operand_is_address_stable {
                  a zero stride would re-read trip 0's window"
             );
         }
+    }
+}
+
+/// ⛔ THE COMPLEMENT OF THE BROADCAST LAW: an operand collapsed along a dim OTHER than
+/// the tiled one still RANGES the tiled dim and MUST ADVANCE per trip.
+///
+/// `In::mb` — a `[1, cols]` row vector broadcast over rows (the rmsnorm gamma's own
+/// form; `EwOperand::scale()` maps it to `mb` = RedNonStick with `out` staying ACTIVE) —
+/// is NOT one of the address-stable broadcasts: in an op time-tiled over `out`, each
+/// trip's window must read THAT trip's slice of the row, so the operand takes the
+/// per-trip affine stride and its start address moves. Only the scale AT the tiled dim
+/// decides exemption; a RedNonStick on `mb` exempts nothing when tiling `out`. Pinned on
+/// the same door and geometry as the address-stable module, alongside the input-side
+/// no-advance guard (2b) that makes a strideless ranging operand a build Err.
+#[cfg(test)]
+mod time_tiled_mb_operand_advances_per_trip {
+    use super::*;
+    use crate::sdsc_abstract::{BlockCols, RowCount};
+
+    /// The same gemma-4 tanhsoftcap prefill geometry as the address-stable module:
+    /// vocab-wide cols, few rows — the tiler lands on `time > 1`.
+    const ROWS: u32 = 35;
+    const COLS: u32 = 262144;
+
+    /// realdiv(x, gamma): x full `[rows, cols]`, gamma an `In::mb` `[1, cols]` row
+    /// vector — broadcast over ROWS, ACTIVE over cols (the rmsnorm-gamma form).
+    fn mbdiv() -> EmittedOp {
+        let x = rb("mb_x", ROWS, COLS);
+        let gamma = rb("mb_gamma", 1, COLS);
+        let out = rb("mb_o", ROWS, COLS);
+        assemble_pointwise_broadcast_off(
+            "mbdiv_t2326",
+            "realdiv",
+            RowCount::of_token_rows(ROWS),
+            BlockCols::of_feature_cols(COLS),
+            &[In::full(&x).ew(), In::mb(&gamma).ew()],
+            &out,
+            crate::addr::DevOff::ZERO,
+            &mut 0i64,
+            None,
+        )
+    }
+
+    /// The first start address of operand `lds` in trip `t`, as `concrete_trips` expanded it.
+    fn trip_start(e: &EmittedOp, t: usize, lds: u32) -> u64 {
+        let trips = e.concrete_trips();
+        let node = trips.get(t).expect("a trip per time").dscs_[0]
+            .values()
+            .next()
+            .expect("one dsc")
+            .scheduleTree_
+            .iter()
+            .find(|n| n.nodeType_ == "allocate" && n.ldsIdx_ == lds)
+            .expect("an allocate node per operand");
+        node.startAddressCoreCorelet_
+            .data_
+            .values()
+            .next()
+            .expect("a per-core address")
+            .parse()
+            .expect("a decimal address")
+    }
+
+    #[test]
+    fn the_op_time_tiles_and_keeps_the_row_vector_at_full_width() {
+        let e = mbdiv();
+        assert!(
+            e.time > 1,
+            "vocab-wide op must time-tile, got time={}",
+            e.time
+        );
+        assert_eq!(e.arg_bindings.len(), 3, "x, gamma, out — in door order");
+        assert_eq!(
+            e.arg_bindings[1].footprint_bytes,
+            COLS as u64 * 2,
+            "the mb operand's materialized footprint is the FULL row (one stick would mean \
+             it was collapsed along `out` — the scalar form, not the gamma form)"
+        );
+    }
+
+    #[test]
+    fn the_mb_operand_takes_a_nonzero_stride_along_out() {
+        let e = mbdiv();
+        assert!(
+            e.affine_strides[1].get("out").copied().unwrap_or(0) > 0,
+            "the mb operand RANGES `out` at Active scale — it must carry a per-trip stride \
+             (empty like the scalar cap's would re-read trip 0's window of the row)"
+        );
+    }
+
+    #[test]
+    fn across_trips_the_mb_operand_advances() {
+        let e = mbdiv();
+        let g0 = trip_start(&e, 0, 1);
+        let g1 = trip_start(&e, 1, 1);
+        assert!(
+            g1 > g0,
+            "the mb operand moved {g0:#x} → {g1:#x}: it must ADVANCE — each trip reads its \
+             own out-window of the row, unlike the address-stable scalar broadcast"
+        );
     }
 }
