@@ -37,7 +37,9 @@
 # prompt x answer x users and the separate users sweep (conc) is not needed;
 # one user at a time is what most Macs see (#349). input sweeps prompt length
 # up to each model's context. --scale-axes conc,grid,input adds the old users
-# sweep back.
+# sweep back. A cell sends --scale-rounds rounds of its users count (4), and
+# at least --scale-num-prompts requests (12): 12 at 1 to 2 users, 64 at 16, so
+# its medians are of the users count kept full, not one ramp-up and drain.
 #
 # With mlx-lm, a blocking parity gate runs first: `scr chat` vs mlx_lm.generate,
 # greedy, CLI mode (the ladder is server mode, so the gate is its own call). A
@@ -210,7 +212,8 @@ SCALE_GRID_CONC="1,2,4,8,16"   # the grid's users dimension; empty: 1 and the ba
 SCALE_BASE_INPUT=512
 SCALE_BASE_OUTPUT=128
 SCALE_BASE_CONC=8
-SCALE_NUM_PROMPTS=12
+SCALE_NUM_PROMPTS=12     # a cell's requests: at least this many,
+SCALE_ROUNDS=4           # and at least this many rounds of its users count
 SCALE_WARMUPS=2
 SCALE_SEED_BASE=20260927
 
@@ -246,6 +249,7 @@ while [[ $# -gt 0 ]]; do
         --scale-grid-output) SCALE_GRID_OUTPUT="$2"; shift 2 ;;
         --scale-grid-conc)   SCALE_GRID_CONC="$2"; shift 2 ;;
         --scale-num-prompts) SCALE_NUM_PROMPTS="$2"; shift 2 ;;
+        --scale-rounds)      SCALE_ROUNDS="$2"; shift 2 ;;
         --scale-warmups)     SCALE_WARMUPS="$2"; shift 2 ;;
         --scale-base-input)  SCALE_BASE_INPUT="$2"; shift 2 ;;
         --scale-base-output) SCALE_BASE_OUTPUT="$2"; shift 2 ;;
@@ -466,7 +470,7 @@ done
 PIN_PROBLEMS="$(printf '%s\n' ${pin_problems[@]+"${pin_problems[@]}"})"
 export ENGINE_INFO PIN_PROBLEMS UNPINNED
 export STARTED_UTC PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
-       SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS \
+       SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS \
        MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S MODELS_FULL
 python3 - "${JSON}" "${chip}" <<'PY'
 import json, os, subprocess, sys
@@ -515,7 +519,8 @@ json.dump({
                  "grid_conc": ints("SCALE_GRID_CONC") or sorted({1, int(e["SCALE_BASE_CONC"])}),
                  "base": {"input": int(e["SCALE_BASE_INPUT"]), "output": int(e["SCALE_BASE_OUTPUT"]),
                           "conc": int(e["SCALE_BASE_CONC"])},
-                 "num_prompts_per_cell": int(e["SCALE_NUM_PROMPTS"]),
+                 "min_prompts_per_cell": int(e["SCALE_NUM_PROMPTS"]),
+                 "min_rounds_per_cell": int(e["SCALE_ROUNDS"]),
                  "concurrency_is": "offered (--max-concurrency), not the effective decode batch"},
              "comparison": {row.split("|")[0]: row.split("|")[2] == "1"
                             for row in e["ENGINE_INFO"].splitlines()[1:]},
@@ -735,6 +740,9 @@ PY
 run_cell() { # prefix axis rung input output conc
     (( cells_hung )) && return 0
     local out_json="$1.$2-$3.json" seed rc=0
+    # Enough requests that the users count is kept full: one round alone is
+    # a ramp-up and a drain, and fewer requests than users never fill it.
+    local n=$(( $6 * SCALE_ROUNDS > SCALE_NUM_PROMPTS ? $6 * SCALE_ROUNDS : SCALE_NUM_PROMPTS ))
     seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:$2:$3" | cksum | cut -d' ' -f1)
     printf '    %-16s in %-5s out %-5s conc %-3s ' "$2=$3" "$4" "$5" "$6"
     local mem="${out_json%.json}.mem" sampler=""
@@ -745,7 +753,7 @@ run_cell() { # prefix axis rung input output conc
     { perl -e 'alarm shift; exec @ARGV' "${CELL_TIMEOUT_S}" \
         "${BIN}" bench serve --base-url "http://127.0.0.1:${PORT}" --model "${cell_model:-${id}}" \
         ${cell_tok:+--tokenizer "${cell_tok}"} \
-        --num-prompts "${SCALE_NUM_PROMPTS}" --input-len "$4" --output-len "$5" \
+        --num-prompts "${n}" --input-len "$4" --output-len "$5" \
         --max-concurrency "$6" --temperature 0 --seed "${seed}" --num-warmups "${SCALE_WARMUPS}" \
         --percentile-metrics ttft,tpot,e2el --metric-percentiles 50,99 \
         --output-json "${out_json}" --disable-tqdm >>"${RAW}/cells-${stem}.log" 2>&1; } 2>/dev/null || rc=$?
