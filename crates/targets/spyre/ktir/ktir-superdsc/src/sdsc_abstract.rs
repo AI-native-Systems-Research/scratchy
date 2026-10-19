@@ -7285,7 +7285,8 @@ impl ChunkScratch {
     /// against the mask's placement, and its index table against its own. MEASURED cardless at granite-2b
     /// on nickm4: the 384-page batch body bakes (dxp rc=0, every op untiled, gather scratches 96 MiB).
     pub const BATCH_PAGES_MAX: u32 = {
-        let widest_long = BatchChunk::LONG_PAGES_PER_REQUEST[BatchChunk::LONG_PAGES_PER_REQUEST.len() - 1];
+        let widest_long =
+            BatchChunk::LONG_PAGES_PER_REQUEST[BatchChunk::LONG_PAGES_PER_REQUEST.len() - 1];
         PagedKvPool::ADMITTED_BATCH_WIDTH * widest_long
     };
 

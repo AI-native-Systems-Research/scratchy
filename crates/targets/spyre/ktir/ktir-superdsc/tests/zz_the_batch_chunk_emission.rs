@@ -94,11 +94,9 @@ fn the_batch_ladder_round_trips_through_its_swept_key() {
     for seqs in PagedKvPool::BATCH_RUNGS {
         let ladder = ChunkScratch::ladder_for(pool, seqs);
         assert!(
-            ladder
-                .iter()
-                .all(|&t| t.is_multiple_of(seqs)
-                    && t / seqs >= 2
-                    && t <= ChunkScratch::BATCH_PAGES_MAX),
+            ladder.iter().all(|&t| t.is_multiple_of(seqs)
+                && t / seqs >= 2
+                && t <= ChunkScratch::BATCH_PAGES_MAX),
             "seqs={seqs}: {ladder:?}"
         );
         // Past the short ladder's 64-page ceiling, only the long-context rungs — and only at the widths
@@ -150,7 +148,11 @@ fn the_batch_ladder_round_trips_through_its_swept_key() {
         "width 2 bakes no long-context rung"
     );
     // One request keeps the solo ladder, whose top is the 64-page chunk.
-    assert!(ChunkScratch::LADDER.iter().all(|&t| t <= ChunkScratch::PAGES_MAX));
+    assert!(
+        ChunkScratch::LADDER
+            .iter()
+            .all(|&t| t <= ChunkScratch::PAGES_MAX)
+    );
 }
 
 /// The slots of each score part and each value part a batch chunk of `pages` pages emits: one whole chunk
