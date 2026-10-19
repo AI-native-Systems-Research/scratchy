@@ -32,7 +32,7 @@
 //! the whole-function door refuses the WHOLE function rather than emitting part of
 //! it (a bundle short a program computes something else). This test pins the FIRST
 //! refusal — the stage the door stops at. Each recogniser that lands (gelu ✅ → W8A8
-//! gate/up ✅ → down slab gemm → router → combine) moves that first refusal FORWARD
+//! gate/up ✅ → down slab gemm ✅ → router → combine) moves that first refusal FORWARD
 //! through the pre-reads and program order, and this test's assertion moves with it,
 //! ON PURPOSE: the pinned refusal is the recogniser campaign's work queue made
 //! executable. When the last recogniser lands, the same drive must BAKE, and the
@@ -162,25 +162,24 @@ fn the_fused_moe_kernel_is_refused_at_the_door_naming_the_first_unrecognised_op(
         err.starts_with("door:"),
         "the refusal came from a ladder stage, not the door: {err:?}"
     );
-    // ⚠️ PINNED OBSERVATION (rung two, 2026-10-18, moe-door @ the W8A8 recogniser):
-    // the W8A8 pre-read claims the kernel's gate/up projections — both slab banks
-    // and both scale banks, 32 of the 48 tiles — so the door's first refusal is
-    // STILL the GATHERS pre-read (the W8A8 pre-read runs before it and passes),
-    // but the count has halved twice over: it now names 16
-    // `ktdp.construct_indirect_access_tile` ops over 2 different index/value
-    // parameter pairs — the DOWN projection's two banks, unclaimed BY DESIGN:
-    // their spine roots at the STORED act parameter (the round-trip scratch),
-    // the provenance the down discriminator keys on and the next rung's own
-    // pre-read exists to read. That refusal is CORRECT BY DESIGN for the door as
-    // it stands — one descriptor carries one index operand, and the fused
-    // kernel's per-pair slab gathers are exactly the multi-tile shape a
-    // recogniser's pre-read must claim tile by tile before the door will lower
-    // them. The needles are SUBSTRINGs so wording survives but meaning does not.
+    // ⚠️ PINNED OBSERVATION (rung three, 2026-10-19, moe-door @ the DOWN recogniser):
+    // `program_w8a8_down_chains` claims the kernel's DOWN projection — the last 16
+    // tiles (2 banks × 8 pairs) — so EVERY pre-read now passes (gelu, silu, rmsnorm,
+    // bcast, W8A8 gate/up, W8A8 down) and the walk descends into the body for the
+    // FIRST time. The first refusal is no longer a pre-read's: it is the ROUTER
+    // NORM's `xr·xr` (`moe_fwd`'s first compute op, ahead of even the router
+    // matmul) — an `ArithMulf` whose intermediate result needs a `BundleLayout`
+    // the unit-test arm (`layout: None`) cannot mint. The router (top-K, route
+    // weights) and the combine are the remaining rungs; a layout-carrying drive
+    // is what descends past this one — and at this file's golden `I=64` the next
+    // stop would be the down door's own staged-bank law (`in=64 pads to 128`,
+    // pinned in `down_door.rs`), the worker-manifest pad the splice fold owns.
+    // The needles are SUBSTRINGs so wording survives but meaning does not.
     assert!(
-        err.contains("16 `ktdp.construct_indirect_access_tile`")
-            && err.contains("different index/value parameter pairs")
-            && err.contains("one descriptor carries ONE index operand"),
-        "rung two: the door's first refusal moved or changed shape — update this pin \
+        err.starts_with("door:")
+            && err.contains("`ArithMulf`'s result is an intermediate")
+            && err.contains("`layout: None` is the unit-test arm"),
+        "rung three: the door's first refusal moved or changed shape — update this pin \
          DELIBERATELY (it is the recogniser campaign's work queue), do not delete it: {err:?}"
     );
 }

@@ -9729,6 +9729,15 @@ fn synth_role_tokens(
         R::FqChi => quote! { #b::FqChi },
         R::FqCl => quote! { #b::FqCl },
         R::FqInvS => quote! { #b::FqInvS },
+        // The down door's per-pair scale sticks (the `FqAmaxP` shape: one per pair).
+        R::FqAscaleP(p) => {
+            let p = proc_macro2::Literal::u32_unsuffixed(*p);
+            quote! { #b::FqAscaleP(#p) }
+        }
+        R::FqInvSP(p) => {
+            let p = proc_macro2::Literal::u32_unsuffixed(*p);
+            quote! { #b::FqInvSP(#p) }
+        }
         R::FqSc => quote! { #b::FqSc },
         R::FqDqA => quote! { #b::FqDqA },
         R::FqMm => quote! { #b::FqMm },

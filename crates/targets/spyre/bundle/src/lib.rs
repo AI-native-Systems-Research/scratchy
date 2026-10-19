@@ -998,6 +998,10 @@ mod place_id_tests {
             FqMm,
             FqRaw,
             FqAmaxP(0),
+            // The down door's per-pair scale sticks — distinct spellings from their
+            // shared dense twins (`fq_ascale`/`fq_invs`).
+            FqAscaleP(0),
+            FqInvSP(0),
             Sq16,
             Mean,
             Meps,

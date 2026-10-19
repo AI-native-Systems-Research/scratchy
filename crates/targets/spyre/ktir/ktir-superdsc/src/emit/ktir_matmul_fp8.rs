@@ -1257,4 +1257,213 @@ mod tests {
             "no per-pair convert at an aligned inn, prefill included"
         );
     }
+
+    /// ⭐⭐⭐⭐⭐ THE DOWN DOOR'S EQUIVALENCE PIN — at k=1 the per-pair quantize legs ARE
+    /// the dense chain's, descriptor for descriptor.
+    ///
+    /// The whole-function door's W8A8 DOWN emission
+    /// ([`crate::emit::lower_ktir_to_superdsc::expert_down_fused_m1`]) quantizes each
+    /// pair's `[1, inn]` window of the round-tripped act through the SAME five legs this
+    /// chain emits over a whole activation (`qspt`, `invs`, `sc`, `clip`, `afp8`). The
+    /// ruling's condition: at k=1, aligned `inn`, the down legs must equal this chain's
+    /// over the same `[1, inn]` activation — same op funcs, same constant tids, same
+    /// operand shapes, same order — with only names and the out-window address allowed
+    /// to differ. At k=1 pair 0 every window corner is ZERO (the windows are the whole
+    /// buffers), so even the out-window address coincides; and the wire render is
+    /// index-keyed (`Tensor{i}`, `allocate-Tensor{i}`), so names do not appear in the
+    /// descriptor JSON at all. What CAN differ is the per-core HBM ADDRESS each leg's
+    /// schedule tree carries, resolved from the layout at emit time — so the two layouts
+    /// below are built identically except that the two scale-stick pairs TRADE PLACES:
+    /// the dense side references `FqAscale`/`FqInvS`, the down side its per-pair
+    /// `FqAscaleP(0)`/`FqInvSP(0)`, and the pair each side references sits at the SAME
+    /// byte offset in its layout. After that the renders must be EXACTLY equal —
+    /// stricter than the ruling's allowance, and the numeric gate it asked for: a down
+    /// leg that drifted from the dense quantize law would compute a different quantize,
+    /// silently.
+    #[test]
+    fn the_down_doors_quantize_legs_equal_the_dense_chain_at_k1() {
+        use crate::emit::lower_ktir_to_superdsc::{W8a8DownFacts, expert_down_fused_m1};
+        let (inn, n, e_count) = (128u32, 128u32, 64u32);
+        // The tids both doors share: the activation t7 (this module's own template
+        // numbering), the down door's weight t8 / scale t9 / routing t11, the out t10.
+        // The five quantize legs reference ONLY the activation and the Fq synth family
+        // — the bank params never enter a quantize descriptor — but every placement is
+        // identical across the two layouts so no address can drift through them.
+        let pin_layout = |swapped: bool| -> BundleLayout {
+            let mut l = BundleLayout::default();
+            let place = |tid: u32, rows: u32, cols: u32, role: SegRole, l: &mut BundleLayout| {
+                l.ids.borrow_mut().insert(act_name(tid), PlaceId::Act(tid));
+                let seg = role.segment();
+                let off = l.segment_bytes[seg];
+                let size = crate::placement::synth_footprint_bytes(&[rows, cols], Df::Fp16);
+                l.placements.insert(
+                    tid,
+                    TensorPlacement {
+                        tid,
+                        role,
+                        segment: seg,
+                        bank: 0,
+                        offset: off,
+                        size,
+                    },
+                );
+                l.segment_bytes[seg] = crate::placement::align128(off + size);
+            };
+            place(7, 1, inn, SegRole::Activation, &mut l); // the act both chains quantize
+            place(8, n, inn, SegRole::Weight, &mut l); // the down weight bank
+            place(9, 1, n, SegRole::Activation, &mut l); // the down scale bank
+            place(10, 1, n, SegRole::Activation, &mut l); // the out
+            place(11, 64, 64, SegRole::Activation, &mut l); // the routing
+            for tid in [FP8_POS448_TID, FP8_NEG448_TID, FP8_INV448_TID] {
+                place(tid, 1, Fp16::ELEMS_PER_STICK, SegRole::Activation, &mut l);
+            }
+            // The synth UNION both doors reserve, in ONE canonical order so every shared
+            // key lands at the same offset in both layouts. The shared family's dims are
+            // the two doors' own at this geometry — `cl_reach == k_pad == inn` at k=1
+            // aligned — so each door's idempotent re-reservation is a no-op.
+            let a = PlaceId::Act(7);
+            l.synth(a.synth(SynthRole::FqAbsX), &[1, inn]);
+            l.synth(a.synth(SynthRole::FqSc), &[1, inn]);
+            l.synth(a.synth(SynthRole::FqChi), &[1, inn]);
+            l.synth(a.synth(SynthRole::FqCl), &[1, inn]);
+            l.synth_df(a.synth(SynthRole::FqAfp8), &[1, inn], Df::Fp8);
+            l.synth(a.synth(SynthRole::FqAmax), &[1, Fp16::ELEMS_PER_STICK]);
+            l.synth(a.synth(SynthRole::FqAmaxFl), &[1, Fp16::ELEMS_PER_STICK]);
+            // THE SWAP: the scale sticks each side references sit at the same two
+            // offsets — the dense side's `FqAscale`/`FqInvS` where the down side's
+            // `FqAscaleP(0)`/`FqInvSP(0)` sit, and vice versa.
+            let sticks = if swapped {
+                [
+                    a.synth(SynthRole::FqAscaleP(0)),
+                    a.synth(SynthRole::FqInvSP(0)),
+                    a.synth(SynthRole::FqAscale),
+                    a.synth(SynthRole::FqInvS),
+                ]
+            } else {
+                [
+                    a.synth(SynthRole::FqAscale),
+                    a.synth(SynthRole::FqInvS),
+                    a.synth(SynthRole::FqAscaleP(0)),
+                    a.synth(SynthRole::FqInvSP(0)),
+                ]
+            };
+            for s in sticks {
+                l.synth(s, &[1, Fp16::ELEMS_PER_STICK]);
+            }
+            // The down door's scratch — referenced only by the non-quantize legs, but
+            // reserved here so the union is total and the emission's own idempotent
+            // reservations cannot shift anything.
+            l.synth_df(
+                PlaceId::Act(11).synth(SynthRole::XIdx),
+                &[64, 64],
+                Df::SenUint32,
+            );
+            l.synth_df(
+                PlaceId::Act(10).synth(SynthRole::XWScratch),
+                &[64, 256],
+                Df::Fp8,
+            );
+            l.synth(PlaceId::Act(10).synth(SynthRole::XSScratch), &[1, n]);
+            l.synth(PlaceId::Act(10).synth(SynthRole::XRaw), &[1, n]);
+            l.synth(PlaceId::Act(10).synth(SynthRole::XDqA), &[1, n]);
+            l
+        };
+
+        // ── THE DENSE SIDE: this chain over the same [1, inn] activation. ──
+        let dense_layout = pin_layout(false);
+        let mut quantized = std::collections::HashSet::new();
+        let dense = fp8_quantize_descriptors(
+            &facts(),
+            1,
+            inn,
+            1,
+            &mut 0,
+            Some(&dense_layout),
+            &mut quantized,
+        )
+        .expect("the dense chain emits at the pin geometry");
+        let dense_names: Vec<&str> = dense.iter().map(|o| o.op_name.as_str()).collect();
+        assert_eq!(
+            dense_names,
+            vec![
+                "t10_fq_qspt_op",
+                "t10_fq_invs_op",
+                "t10_fq_sc_op",
+                "t10_fq_clip_op",
+                "t10_fq_afp8_op",
+            ],
+            "the dense side is the five-leg chain, in the dense order (no zfpad, no \
+             partials, at k=1 aligned)"
+        );
+
+        // ── THE DOWN SIDE: pair 0 of a k=1 projection, same activation, same out. ──
+        let down_layout = pin_layout(true);
+        let down_facts = W8a8DownFacts {
+            name: "pin",
+            a_tid: 7,
+            idx_tid: 11,
+            w_tid: 8,
+            s_tid: 9,
+            k: 1,
+            inn,
+            n,
+            e_count,
+        };
+        let down = expert_down_fused_m1(&down_facts, 10, 0, &mut 0, Some(&down_layout))
+            .expect("the down door emits its ten legs at the pin geometry");
+        let want = [
+            "emqs_p0_o10",
+            "emiv_p0_o10",
+            "emsc_p0_o10",
+            "emcl_p0_o10",
+            "emcv_p0_o10",
+        ];
+        let legs: Vec<&crate::emit::EmittedOp> = down
+            .iter()
+            .filter(|o| want.contains(&o.op_name.as_str()))
+            .collect();
+        let got: Vec<&str> = legs.iter().map(|o| o.op_name.as_str()).collect();
+        assert_eq!(
+            got, want,
+            "the down door's quantize legs, in the projection's own order"
+        );
+
+        // ── THE PIN: rendered descriptors, leg for leg, EXACTLY equal. ──
+        assert_eq!(dense.len(), legs.len(), "five legs against five legs");
+        for (d, u) in dense.iter().zip(legs.iter()) {
+            let dv =
+                serde_json::to_value(d.op.as_ref().expect("the dense leg carries a descriptor"))
+                    .expect("the dense descriptor serializes");
+            let mut uv =
+                serde_json::to_value(u.op.as_ref().expect("the down leg carries a descriptor"))
+                    .expect("the down descriptor serializes");
+            // The ONE difference the render can carry: `dscs_[0]`'s single key is
+            // the op's own name — the ruling's allowance (its spelling is pinned
+            // by the name assertions above). Rename the down leg's key to the
+            // dense leg's so the comparison below is over everything else, EXACTLY.
+            {
+                let dscs = uv
+                    .get_mut("dscs_")
+                    .and_then(|v| v.as_array_mut())
+                    .and_then(|a| a.first_mut())
+                    .unwrap_or_else(|| panic!("the down leg {} carries one dsc", u.op_name));
+                let map = dscs.as_object_mut().unwrap();
+                assert_eq!(map.len(), 1, "one dsc per op: {}", u.op_name);
+                assert_eq!(
+                    map.keys().next().unwrap(),
+                    &u.op_name,
+                    "the dscs_ key is the op's own name"
+                );
+                let val = map.values().next().unwrap().clone();
+                map.clear();
+                map.insert(d.op_name.clone(), val);
+            }
+            assert_eq!(
+                dv, uv,
+                "the down leg {} must be the dense leg {}'s descriptor, exactly (op \
+                 funcs, constants, operand shapes, addresses, order)",
+                u.op_name, d.op_name
+            );
+        }
+    }
 }

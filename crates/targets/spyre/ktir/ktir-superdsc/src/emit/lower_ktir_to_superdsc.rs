@@ -34,10 +34,11 @@
 //! branch, unchanged, reached from facts the KTIR states — and the fp8 arm below calls it.
 
 use super::{
-    EmittedOp, In, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, bmm_site,
-    check_pointwise_cols, emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec_df,
-    pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
+    EmittedOp, In, assemble_convert_off, assemble_pointwise_broadcast_off,
+    assemble_restickify_kt_2d, bmm_site, check_pointwise_cols, emit_sdsc_tiled, fl,
+    op_func_from_str, pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
 };
+use crate::ir::bridge::tiled_op_sdsc_op::reduce::{assemble_reduce_off, reduce_opspec};
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_attn, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
 };
@@ -8752,6 +8753,508 @@ pub fn expert_matmul_fused_m1(
         In::full(&xdqa),
         In::col(&ascale),
         &out_h,
+        sym_id_base,
+        layout,
+    ));
+    Ok(ops)
+}
+
+/// The facts one DOWN projection states — the whole-function door's own twin of
+/// [`W8a8FusedFacts`], read at the projection whose quantize spines root at the
+/// ROUND-TRIPPED ACT (the recogniser's inverted provenance).
+#[derive(Clone, Copy)]
+pub struct W8a8DownFacts<'a> {
+    /// The function's own name — the word every refusal below prefixes.
+    pub name: &'a str,
+    /// The ACT SCRATCH's tensor id — the round-tripped gelu output whose per-pair
+    /// `[1, inn]` windows the per-pair quantizes read; the `Fq*` synth family is
+    /// keyed off it.
+    pub a_tid: u32,
+    /// The routing parameter's tensor id — the XIdx landing is keyed off it (the
+    /// SAME landing [`expert_matmul_fused_m1`] reserves: one routing, one landing).
+    pub idx_tid: u32,
+    /// The weight bank's tensor id (the `[E, n, in]` fp8 parameter).
+    pub w_tid: u32,
+    /// The scale bank's tensor id (the `[E, n]` f16 parameter).
+    pub s_tid: u32,
+    /// The top-k width — one chain per index word.
+    pub k: u32,
+    /// The contraction width (`inn`, the gated act's per-pair width).
+    pub inn: u32,
+    /// The projection's output width per pair (`n`, the model hidden).
+    pub n: u32,
+    /// The experts the bank holds (`E`).
+    pub e_count: u32,
+}
+
+/// ⭐⭐⭐ THE WHOLE-FUNCTION DOOR'S W8A8 DOWN EMISSION — ONE PAIR's leg set of the
+/// fused MoE kernel's down projection at m=1, emitted at that pair's own terminal.
+///
+/// Called by [`super::whole_function::lower_function`] at EVERY chain terminal of a
+/// projection [`super::whole_function::program_w8a8_down_chains`] claimed — once per
+/// pair, in program order, into the ONE output intermediate the walk minted at the
+/// projection's first terminal. This is the PER-POSITION LAW itself: the unrolled
+/// kernel interleaves `gelu_j → down_j → combine_j` per pair (program order is tape
+/// order is execution order), so pair `j`'s legs are emitted at pair `j`'s terminal —
+/// after its gelu's act store, before its combine's read — and no leg set is shared,
+/// hoisted, or reordered across pairs.
+///
+/// # THE TEN LEGS, per pair
+///
+/// `emwd` (the pair's uncut weight-slab gather), `emsd` (its scale gather),
+/// `emqs`/`emiv`/`emsc`/`emcl`/`emcv` (ITS OWN quantize: the per-window amax reduce,
+/// the reciprocal, the scale multiply, the clip, the fp8 convert), `emmm` (its fp8
+/// contraction at its own `a_off = pair·inn_pad`), `emds`/`emdo` (its two-multiply
+/// dequant into its own `[1, n]` window of the output). Versus a single-fire form
+/// (one shared `sc`/`clip`/`convert` over all pairs) that is 3·(k−1) = 21 MORE ops
+/// at the door geometry k=8 — and, at the interleaved program order, not even a
+/// legal program: the shared clip would need every pair's scaled act before it and
+/// every matmul after it, but pair 0's matmul precedes pair 1's gelu.
+///
+/// # THE EQUIVALENCE PIN, AND WHY THE LEGS LOOK LIKE THE DENSE CHAIN'S
+///
+/// Each pair's quantize legs are the DENSE chain's five (`qspt`, `invs`, `sc`,
+/// `clip`, `afp8`) over that pair's `[1, inn]` window, windowed: the reads and
+/// writes carry [`crate::addr::col_of`] column offsets into the SHARED `[1, k·inn]`
+/// family buffers (`FqSc`/`FqCl`/`FqAfp8`, reserved once per projection and written
+/// one window per pair), and the scale sticks are the pair's OWN (`FqAscaleP(pair)`,
+/// `FqInvSP(pair)` — one `[1, 64]` each, the per-(token, slot) scale law the kernel
+/// file itself states). At k=1 the windows are the whole buffers and the offsets are
+/// zero, where the windowed forms render BYTE-IDENTICAL to the dense chain over the
+/// same activation — the equivalence the test module's pin asserts leg by leg
+/// (rendered descriptors equal; only the two scale-stick names may differ). The
+/// pin is the numeric gate: a leg that drifted from the dense law would compute a
+/// different quantize, silently.
+///
+/// # ⛔ WHAT IT REFUSES, BY NAME
+///
+/// Every guard [`expert_matmul_fused_m1`] states — the staged-bank cuts
+/// (`inn_pad != inn`, `chunks > 1`, `sub > 1`), the landing's whole-slot law, the
+/// bank's expert count — plus the pair's own bounds, and the tiler's time-tiled
+/// reduce (the dense chain's partials+combine remedy is not carried per pair; a
+/// time-tiled fused reduce here would leave the LAST slice's scale standing, so it
+/// is refused rather than silently aliased). `M > 1` never reaches here — the
+/// recogniser refuses it by name first.
+pub fn expert_down_fused_m1(
+    facts: &W8a8DownFacts<'_>,
+    out_tid: u32,
+    pair: u32,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // The facts, as locals — the body below reads them by the same names the
+    // projection's own proof states.
+    let W8a8DownFacts {
+        name,
+        a_tid,
+        idx_tid,
+        w_tid,
+        s_tid,
+        k,
+        inn,
+        n,
+        e_count,
+    } = *facts;
+    let stk16 = crate::work::FP16_ELEMS_PER_STICK;
+    let stk8 = Df::Fp8.elems_per_stick();
+    // ⛔ THE PAIR IS ONE OF THE PROJECTION'S OWN — the recogniser proved the chains
+    // are exactly pairs `0..k`; a pair outside that is a routing shape this door
+    // cannot address.
+    if pair >= k {
+        return err(format!(
+            "the fused W8A8 DOWN {name}: pair {pair} is outside the projection's 0..{k} — the \
+             recogniser proved the chains are exactly the whole top-k, so this is not reachable"
+        ));
+    }
+    // P1's bank-side twin: the bank holds k experts.
+    if k > e_count {
+        return err(format!(
+            "the fused W8A8 DOWN {name}: the routing t{idx_tid} is k={k} wide but the weight bank \
+             t{w_tid} holds only {e_count} experts — the top-k that minted these ids could not \
+             have stayed inside the bank, so the gather would compose an address past its end \
+             and fault the card's FETCH"
+        ));
+    }
+    // The landing's replica runs (P1's own refusal, the shared head-slot law).
+    if !stk16.is_multiple_of(k) {
+        return err(format!(
+            "the fused W8A8 DOWN {name}: the routing t{idx_tid} states k={k}, which does not \
+             divide the {stk16}-slot landing — every gather below addresses the run heads at \
+             slot s·64/k, which is not a whole slot for this k"
+        ));
+    }
+    let rep = stk16 / k;
+    if !inn.is_multiple_of(stk16) {
+        return err(format!(
+            "the fused W8A8 DOWN {name}: in={inn} is not a whole {stk16}-fp16 stick — the \
+             activation quantize reads whole fp16 sticks"
+        ));
+    }
+    let inn_pad = crate::work::fp8_k_pad(inn);
+    if !n.is_multiple_of(stk16) {
+        return err(format!(
+            "the fused W8A8 DOWN {name}: out={n} is not a whole {stk16}-fp16 stick — the scale \
+             gather's page and the dequant window both address whole sticks"
+        ));
+    }
+    // m=1 by the recogniser's own refusal; the landing's pad is the stick itself.
+    let m_pad = stk16;
+    // The chunk law, stated exactly as the gate/up emission states it — the cuts the
+    // guards below refuse are the ones this door cannot address at the raw bank.
+    let groups = n / stk16;
+    if groups == 0 {
+        return err(format!(
+            "the fused W8A8 DOWN {name}: out={n} is under one 64-column N-stick group — the \
+             chunk cut needs at least one"
+        ));
+    }
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    let run_entries = cap.min(k);
+    let chunk_groups = crate::work::expert_slab_chunks(groups, inn_pad / 2, run_entries, e_count);
+    let chunks = groups / chunk_groups;
+    let chunk_n = chunk_groups * stk16;
+    let chunk_elems = chunk_n * inn_pad;
+    let page_w = chunk_elems / stk8;
+    let sub = crate::work::expert_slab_subpages(page_w);
+    // ⛔ THE FUSED DOOR READS THE PROGRAM'S OWN PARAMETERS — the same law the gate/up
+    // emission states, with the same refusals: every staging-dependent cut is refused
+    // BY NAME rather than addressed at a layout the program never declared. This is
+    // also the guard that keeps the per-pair quantize legs windowless-pad: at an
+    // aligned `inn` the padded layout IS the logical one, no zero-fill leg exists, and
+    // the ten legs are complete.
+    if inn_pad != inn {
+        return err(format!(
+            "the fused W8A8 DOWN {name}: in={inn} pads to {inn_pad} fp8 elements — the padded K \
+             rows are the per-`Program` door's staged-bank law (the worker's manifest pads them), \
+             and no whole-function program states that bank"
+        ));
+    }
+    if chunks > 1 {
+        return err(format!(
+            "the fused W8A8 DOWN {name}: out={n} cuts into {chunks} chunk-major bank slices — \
+             the chunk-major re-tile is the per-`Program` door's staged-bank law (the worker's \
+             manifest retiles it), and no whole-function program states that bank"
+        ));
+    }
+    if sub > 1 {
+        return err(format!(
+            "the fused W8A8 DOWN {name}: the slab's {page_w} one-stick sub-rows need the \
+             fine-index sub-page cut — the per-`Program` door's const-bank machinery, which the \
+             fused door does not carry"
+        ));
+    }
+    // The per-pair quantize family's widths, stated exactly as the dense chain states
+    // them at `pairs = k`: the tail tensors are per-pair PADDED (`k_pad`), `cl` reaches
+    // to the last pair's convert overhang (`cl_reach`), and `sc` stays LOGICAL.
+    let k_pad = k * inn_pad;
+    let cl_reach = (k - 1) * inn + inn_pad;
+    // ── The scratch reservations, keyed off the OUTPUT's tid (the per-matmul law),
+    // the XIdx landing off the ROUTING's tid (idempotent with the gate/up emission's
+    // — one routing, one landing), and the quantize family off the ACT SCRATCH's tid
+    // (the shared buffers once per projection — every call reserves the same keys at
+    // the same dims, so the k calls are idempotent — and the per-pair scale sticks
+    // keyed by the pair in the role itself).
+    let out_id = PlaceId::Act(out_tid);
+    let idx_id = PlaceId::Act(idx_tid);
+    let a_id = PlaceId::Act(a_tid);
+    use crate::place::SynthRole as R;
+    let a_s = crate::place::act_name(a_tid);
+    let w_s = crate::place::act_name(w_tid);
+    let s_s = crate::place::act_name(s_tid);
+    let xidx_s = crate::placement::syn(layout, idx_id.synth(R::XIdx));
+    let xw_s = crate::placement::syn(layout, out_id.synth(R::XWScratch));
+    let xs_s = crate::placement::syn(layout, out_id.synth(R::XSScratch));
+    let xraw_s = crate::placement::syn(layout, out_id.synth(R::XRaw));
+    let xdqa_s = crate::placement::syn(layout, out_id.synth(R::XDqA));
+    let sc_s = crate::placement::syn(layout, a_id.synth(R::FqSc));
+    let cl_s = crate::placement::syn(layout, a_id.synth(R::FqCl));
+    let afp8_s = crate::placement::syn(layout, a_id.synth(R::FqAfp8));
+    let ascale_p_s = crate::placement::syn(layout, a_id.synth(R::FqAscaleP(pair)));
+    let invs_p_s = crate::placement::syn(layout, a_id.synth(R::FqInvSP(pair)));
+    if let Some(l) = layout {
+        l.synth_df(idx_id.synth(R::XIdx), &[stk16, m_pad], Df::SenUint32);
+        l.synth_df(
+            out_id.synth(R::XWScratch),
+            &[k * (n * inn_pad / stk8), stk8],
+            Df::Fp8,
+        );
+        l.synth_df(out_id.synth(R::XSScratch), &[k, n], Df::Fp16);
+        l.synth_df(out_id.synth(R::XRaw), &[k, n], Df::Fp16);
+        l.synth_df(out_id.synth(R::XDqA), &[k, n], Df::Fp16);
+        // The quantize family's shared buffers — ONE set for the whole projection,
+        // each pair's legs addressing its own window; the same keys and dims on every
+        // call, so the reservations are idempotent across the k firings.
+        l.synth(a_id.synth(R::FqSc), &[1, k * inn]);
+        l.synth(a_id.synth(R::FqCl), &[1, cl_reach]);
+        l.synth_df(a_id.synth(R::FqAfp8), &[1, k_pad], Df::Fp8);
+        // The pair's OWN scale sticks — the per-(token, slot) scale law.
+        l.synth(a_id.synth(R::FqAscaleP(pair)), &[1, stk16]);
+        l.synth(a_id.synth(R::FqInvSP(pair)), &[1, stk16]);
+    }
+    // The window corners this pair's legs read and write — the RowBlocked group-corner
+    // law [`crate::addr::col_of`] renders, which at one row degenerates to the flat
+    // column index (the decode form).
+    let a_off = crate::addr::col_of(1, k * inn, pair * inn, Df::Fp16);
+    let sc_out = crate::addr::col_of(1, k * inn, pair * inn, Df::Fp16);
+    let cl_out = crate::addr::col_of(1, cl_reach, pair * inn, Df::Fp16);
+    let dq_off = crate::addr::col_of(1, k * n, pair * n, Df::Fp16);
+    let mut ops: Vec<EmittedOp> = Vec::new();
+    // ── 1. THE PAIR'S WEIGHT GATHER — the uncut walk's own law, pair `pair`'s entry
+    // the first entry of its head stick of the flat index, dest at its own offset.
+    ops.push(
+        crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
+            &w_s,
+            &xw_s,
+            page_w,
+            stk8,
+            Df::Fp8,
+            crate::superdsc_opspec::GatherIndex {
+                name: xidx_s.clone(),
+                entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+                page: crate::superdsc_opspec::PageExtent::of_positions(page_w),
+                per_position: None,
+                first_entry: crate::superdsc_opspec::EntryBase::of_sticks(expert_head_slot_sticks(
+                    pair, rep, m_pad,
+                )),
+            },
+            crate::superdsc_opspec::GatherRun::split(
+                crate::superdsc_opspec::DestEntry::of_entries(pair),
+                0,
+            ),
+        )
+        .map_err(|e| Error {
+            message: format!("the fused W8A8 DOWN {name}: pair {pair}'s weight gather: {e}"),
+        })
+        .and_then(|op| {
+            let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+            crate::emit::emit_sdsc_tiled(
+                &format!("emwd_p{pair}_o{out_tid}"),
+                &op,
+                &folds,
+                sym_id_base,
+                layout,
+            )
+            .map_err(|e| Error {
+                message: format!(
+                    "the fused W8A8 DOWN {name}: pair {pair}'s weight gather emit: {}",
+                    e.0
+                ),
+            })
+        })?,
+    );
+    // ── 2. THE PAIR'S SCALE GATHER — the m=1 arm's own leg ────────────────────────
+    let page_s = n / stk16;
+    ops.push(
+        crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
+            &s_s,
+            &xs_s,
+            page_s,
+            stk16,
+            Df::Fp16,
+            crate::superdsc_opspec::GatherIndex {
+                name: xidx_s.clone(),
+                entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+                page: crate::superdsc_opspec::PageExtent::of_positions(page_s),
+                per_position: None,
+                first_entry: crate::superdsc_opspec::EntryBase::of_sticks(expert_head_slot_sticks(
+                    pair, rep, m_pad,
+                )),
+            },
+            crate::superdsc_opspec::GatherRun::split(
+                crate::superdsc_opspec::DestEntry::of_entries(pair),
+                0,
+            ),
+        )
+        .map_err(|e| Error {
+            message: format!("the fused W8A8 DOWN {name}: pair {pair}'s scale gather: {e}"),
+        })
+        .and_then(|op| {
+            let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+            crate::emit::emit_sdsc_tiled(
+                &format!("emsd_p{pair}_o{out_tid}"),
+                &op,
+                &folds,
+                sym_id_base,
+                layout,
+            )
+            .map_err(|e| Error {
+                message: format!(
+                    "the fused W8A8 DOWN {name}: pair {pair}'s scale gather emit: {}",
+                    e.0
+                ),
+            })
+        })?,
+    );
+    // ── 3. THE PAIR'S OWN QUANTIZE — the dense chain's five legs over ITS window ──
+    // ⛔ ASK THE TILER FIRST — the same `reduce_opspec` the emission below builds,
+    // never a second LX formula. A time-tiled reduce is UNEMITTABLE for this op class
+    // (the DDL's accumulator has OVERWRITE semantics — the dense chain's own law), and
+    // the dense chain's remedy there (partials + a `maximum` combine) is not carried
+    // per pair: refused by name rather than silently aliased.
+    let single = reduce_opspec(
+        op_func_from_str("quantscalepertokenfp8"),
+        1,
+        inn,
+        &a_s,
+        &ascale_p_s,
+        false,
+    )
+    .map_err(|e| Error {
+        message: format!("the fused W8A8 DOWN {name}: pair {pair}'s scale reduce probe: {e}"),
+    })?;
+    if single.time() > 1 && single.iter.split_of("out") <= 1 {
+        return err(format!(
+            "the fused W8A8 DOWN {name}: pair {pair}'s {inn}-column scale reduce time-tiles into \
+             {} slices — the fused op's accumulator has OVERWRITE semantics, so the surviving \
+             scale would be the last slice's, and the dense chain's partials+combine remedy is \
+             not carried per pair",
+            single.time()
+        ));
+    }
+    let a_h = rb(&a_s, 1, k * inn);
+    let ascale_p_h = rb(&ascale_p_s, 1, stk16);
+    ops.push(assemble_reduce_off(
+        &format!("emqs_p{pair}_o{out_tid}"),
+        "quantscalepertokenfp8",
+        crate::sdsc_abstract::RowCount::of_token_rows(1),
+        crate::sdsc_abstract::BlockCols::of_feature_cols(inn),
+        &a_h,
+        a_off,
+        &ascale_p_h,
+        crate::addr::DevOff::ZERO,
+        sym_id_base,
+        layout,
+    ));
+    // The reciprocal of the pair's own scale.
+    let invs_p_h = rb(&invs_p_s, 1, stk16);
+    ops.push(pw1(
+        &format!("emiv_p{pair}_o{out_tid}"),
+        "reciprocal",
+        crate::sdsc_abstract::RowCount::of_token_rows(1),
+        crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+        In::full(&ascale_p_h),
+        &invs_p_h,
+        sym_id_base,
+        layout,
+    ));
+    // The pair's scaled act: its window of the act buffer times the reciprocal,
+    // written to its window of the shared `sc`.
+    let sc_h = rb(&sc_s, 1, k * inn);
+    ops.push(assemble_pointwise_broadcast_off(
+        &format!("emsc_p{pair}_o{out_tid}"),
+        "mul",
+        crate::sdsc_abstract::RowCount::of_token_rows(1),
+        crate::sdsc_abstract::BlockCols::of_feature_cols(inn),
+        &[In::sliced(&a_h, a_off).ew(), In::col(&invs_p_h).ew()],
+        &sc_h,
+        sc_out,
+        sym_id_base,
+        layout,
+    ));
+    // The pair's clip, into its window of the shared `cl`.
+    let cl_h = rb(&cl_s, 1, cl_reach);
+    ops.push(assemble_pointwise_broadcast_off(
+        &format!("emcl_p{pair}_o{out_tid}"),
+        "clip",
+        crate::sdsc_abstract::RowCount::of_token_rows(1),
+        crate::sdsc_abstract::BlockCols::of_feature_cols(inn),
+        &[In::sliced(&sc_h, sc_out).ew()],
+        &cl_h,
+        cl_out,
+        sym_id_base,
+        layout,
+    ));
+    // The pair's fp8 convert — the dense chain's own per-slot m=1 arm verbatim, at
+    // slot `pair`: read `cl` at column `pair·inn` (an fp16 stick boundary), write
+    // `afp8` at column `pair·inn_pad` (an fp8 stick boundary).
+    ops.push(assemble_convert_off(
+        &format!("emcv_p{pair}_o{out_tid}"),
+        "qfp8ch",
+        1,
+        inn_pad,
+        &rb(&cl_s, 1, inn_pad),
+        pair * inn,
+        &rb(&afp8_s, 1, inn_pad),
+        pair * inn_pad,
+        sym_id_base,
+        layout,
+    ));
+    // ── 4. THE PAIR'S MATMUL — the m=1 arm's leg at ITS OWN codes row ────────────
+    let w_off = pair * chunk_elems;
+    let o_off = pair * n;
+    let mut spec = crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off_operands::<
+        crate::superdsc_opspec::Fp16,
+    >(
+        crate::sdsc_abstract::MatM::of_token_rows(1),
+        crate::sdsc_abstract::MatN::of_out_features(chunk_n),
+        crate::sdsc_abstract::MatK::of_in_features(inn_pad),
+        crate::sdsc_abstract::MatY::unbatched(),
+        crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
+            super::bmm_site::TapeLoweringSite::witness(),
+        ),
+        &afp8_s,
+        &xw_s,
+        &xraw_s,
+        // `a_off`: THIS pair's codes window — the per-pair quantize's own output,
+        // the one law that differs from the gate/up emission (whose codes are one
+        // shared row).
+        pair * inn_pad,
+        w_off,
+        o_off,
+        Df::Fp8,
+    )
+    .map_err(|e| Error {
+        message: format!("the fused W8A8 DOWN {name}: pair {pair}'s matmulfp8: {e}"),
+    })?;
+    for arg in &mut spec.args {
+        if !matches!(arg.view().role, crate::superdsc_opspec::Role::Output) {
+            arg.set_df(Df::Fp8);
+        }
+    }
+    let folds = crate::superdsc_opspec::SdscFoldSet::new(spec.iter.cores_used());
+    ops.push(
+        crate::emit::emit_sdsc_tiled(
+            &format!("emmm_p{pair}_o{out_tid}"),
+            &spec,
+            &folds,
+            sym_id_base,
+            layout,
+        )
+        .map_err(|e| Error {
+            message: format!(
+                "the fused W8A8 DOWN {name}: pair {pair}'s matmulfp8 emit: {}",
+                e.0
+            ),
+        })?,
+    );
+    // ── 5. THE PAIR'S DEQUANT, ONE WINDOWED ROW — the m=1 arm's own legs at the
+    // pair's `[1, n]` windows of the shared scratches and the output ─────────────
+    let xraw_h = rb(&xraw_s, 1, k * n);
+    let xdqa_h = rb(&xdqa_s, 1, k * n);
+    let xs_h = rb(&xs_s, 1, k * n);
+    let out_h = rb(&crate::place::act_name(out_tid), 1, k * n);
+    ops.push(assemble_pointwise_broadcast_off(
+        &format!("emds_p{pair}_o{out_tid}"),
+        "mul",
+        crate::sdsc_abstract::RowCount::of_token_rows(1),
+        crate::sdsc_abstract::BlockCols::of_feature_cols(n),
+        &[
+            In::sliced(&xraw_h, dq_off).ew(),
+            In::sliced(&xs_h, dq_off).ew(),
+        ],
+        &xdqa_h,
+        dq_off,
+        sym_id_base,
+        layout,
+    ));
+    ops.push(assemble_pointwise_broadcast_off(
+        &format!("emdo_p{pair}_o{out_tid}"),
+        "mul",
+        crate::sdsc_abstract::RowCount::of_token_rows(1),
+        crate::sdsc_abstract::BlockCols::of_feature_cols(n),
+        &[In::sliced(&xdqa_h, dq_off).ew(), In::col(&ascale_p_h).ew()],
+        &out_h,
+        dq_off,
         sym_id_base,
         layout,
     ));

@@ -52,6 +52,21 @@ pub enum SynthRole {
     /// before the `maximum` combine folds them into [`FqAmax`]. Indexed (like `Blk`) because the number
     /// of partials is the reduce's own time-tile count, known only at bake.
     FqAmaxP(u32),
+    /// ⭐ ONE PAIR'S OWN SCALE SLOT — the `[1, 64]` stick the per-pair quantize (the fused MoE
+    /// DOWN projection's `quantscalepertokenfp8` over pair `p`'s `[1, inn]` window of the stored
+    /// act) lands its scale at LANE 0 of, and the pair's dequant leg reads back with `In::col`
+    /// at offset zero. Indexed per PAIR rather than one `[pairs, 64]` buffer with offsets for
+    /// the SAME reason [`Self::HeadRinv`] is: a reduce's accum must sit at a whole-block shift
+    /// of its own slab for the stick-major rank-2 path, and every read of the scale is then the
+    /// card-true lane-0 broadcast — never a mid-stick `col_at` (the route-argsort law). The
+    /// splice's `m = K` form collapses these into one `[K, 64]` bank when the act buffer lands
+    /// group-major; that relayout is the splice's own law, not this door's.
+    FqAscaleP(u32),
+    /// The reciprocal `1 / FqAscaleP(p)` — the same pair's own `[1, 64]` stick, read by the
+    /// pair's `sc` leg as its `In::col` broadcast. Per-pair for the same reason as
+    /// [`Self::FqAscaleP`]: the reciprocal of stick `p` is one `[1, stick]` op at offset zero,
+    /// the exact shape the per-token form states at `m = 1`.
+    FqInvSP(u32),
     // ── rmsnorm scratch ──
     Sq16,
     Mean,
@@ -283,6 +298,8 @@ impl fmt::Display for SynthRole {
             Self::FqMm => f.write_str("fq_mm"),
             Self::FqRaw => f.write_str("fq_raw"),
             Self::FqAmaxP(j) => write!(f, "fq_amaxp{j}"),
+            Self::FqAscaleP(p) => write!(f, "fq_ascalep{p}"),
+            Self::FqInvSP(p) => write!(f, "fq_invsp{p}"),
             Self::Sq16 => f.write_str("sq16"),
             Self::Mean => f.write_str("mean"),
             Self::Meps => f.write_str("meps"),
