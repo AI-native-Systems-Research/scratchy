@@ -526,3 +526,53 @@ pub fn attention(name: &str, stage: i128) -> Case {
         ],
     )
 }
+
+/// `attention_flash.py`'s FOUR-pointer signature: `attn_fwd_noncausal`, the `@triton.jit`
+/// wrapper the non-causal configuration launches. The five-pointer `attn_fwd` leaves the
+/// mask parameter addressed by nothing in that configuration (the inner never loads it at
+/// `4 - STAGE == 3`), so the wrapper exists to state the launch that actually happens.
+const ATTENTION_NONCAUSAL: &[(&str, &str)] = &[
+    ("desc_q", "*fp16"),
+    ("desc_k", "*fp16"),
+    ("desc_v", "*fp16"),
+    ("desc_o", "*fp16"),
+    ("sm_scale", "constexpr"),
+    ("Z", "constexpr"),
+    ("H", "constexpr"),
+    ("N_CTX", "constexpr"),
+    ("HEAD_DIM", "constexpr"),
+    ("BLOCK_M", "constexpr"),
+    ("BLOCK_N", "constexpr"),
+    ("GQA", "constexpr"),
+    ("STAGE", "constexpr"),
+];
+
+/// The non-causal flash-attention configuration the case table launches: the four-pointer
+/// wrapper at `attn_ce(1)`'s geometry — `triton_ktir_superdsc::cases`'
+/// `attention_flash_noncausal` row, whose spec this mirrors so a frontend test and the bake
+/// driver state ONE configuration rather than two that could drift.
+///
+/// ⛔ NOT a `make_ttir.rs` `cases()` entry: the golden set's `attention_flash_noncausal`
+/// is the FIVE-POINTER `attn_fwd` compile (the C++ oracle's own configuration), and this
+/// spec would diff against it structurally — loudly, by function name and parameter count,
+/// but pointlessly. This builder exists for tests that assert on the pipeline's behavior
+/// rather than on an oracle.
+pub fn attention_noncausal() -> Case {
+    build(
+        "attention_flash_noncausal",
+        "attention_flash",
+        "attn_fwd_noncausal",
+        ATTENTION_NONCAUSAL,
+        &[
+            ("sm_scale", Val::Float(1.0)),
+            ("Z", Val::Int(1)),
+            ("H", Val::Int(4)),
+            ("N_CTX", Val::Int(256)),
+            ("HEAD_DIM", Val::Int(128)),
+            ("BLOCK_M", Val::Int(64)),
+            ("BLOCK_N", Val::Int(64)),
+            ("GQA", Val::Int(2)),
+            ("STAGE", Val::Int(1)),
+        ],
+    )
+}
