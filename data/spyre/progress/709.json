@@ -1,0 +1,92 @@
+{
+  "schema": 1,
+  "pr": 709,
+  "title": "perf(spyre): keep a prompt chunk's causal score and probabilities in core-local LX",
+  "head": "76f294c881cdfd8690ae1ad95145663205f7ba8f",
+  "base": "6c59d539c3821b3438ef0163a827b87a2e76a22e",
+  "merged": "2026-10-19",
+  "pod": "nickm3-548bd5647f-jnddw",
+  "harness": "scripts/spyre_pr_cells.sh: rung-1 via the length-calibrated streaming client (3 streamed requests, medians, the serve's request-finished lines the length gate) and conc-8 via vllm bench serve (16 prompts, 256 output tokens) on the shared datasets; 2 back-to-back runs a side on one boot each, headline = the last run; serve and client pinned to cores 48-95",
+  "cells": [
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~10k",
+      "note": "rung-1: the length-calibrated streaming client, median of 3",
+      "main": 59.19661303050816,
+      "pr": 58.42281598597765,
+      "reps": {
+        "main": [
+          59.0579598210752,
+          59.19661303050816
+        ],
+        "pr": [
+          58.46664705313742,
+          58.42281598597765
+        ]
+      }
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~10k",
+      "note": "rung-1: the length-calibrated streaming client, median of 3",
+      "main": 7907.502623973414,
+      "pr": 7325.249245157465,
+      "reps": {
+        "main": [
+          7898.723742924631,
+          7907.502623973414
+        ],
+        "pr": [
+          7339.65639793314,
+          7325.249245157465
+        ]
+      }
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~1k",
+      "note": "rung-1: the length-calibrated streaming client, median of 3",
+      "main": 44.92052202112973,
+      "pr": 44.61976094171405,
+      "reps": {
+        "main": [
+          44.911279110237956,
+          44.92052202112973
+        ],
+        "pr": [
+          44.63362996466458,
+          44.61976094171405
+        ]
+      }
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~1k",
+      "note": "rung-1: the length-calibrated streaming client, median of 3",
+      "main": 522.204098990187,
+      "pr": 460.96658310852945,
+      "reps": {
+        "main": [
+          523.0068920645863,
+          522.204098990187
+        ],
+        "pr": [
+          463.2040439173579,
+          460.96658310852945
+        ]
+      }
+    }
+  ]
+}
