@@ -9242,7 +9242,7 @@ mod tests {
 
     #[test]
     fn tiled_matmul_concrete_unrolls() {
-        // A `y`-batched matmul keeps the frontend's LX trips (`MatmulStaging::FrontendTrips`), and the
+        // A `y`-batched matmul keeps the frontend's LX-fit time trips, and the
         // only one the build admits contracts ONE stick (`matmul_opspec_split`'s refusal). So this is
         // the card-validated batched form of the (ii) bmm, `in = 64` at 16 kernel batches, widened in N
         // until its per-core kernel slab (`in · out · batch`) overflows LX: at most 32 cores leave

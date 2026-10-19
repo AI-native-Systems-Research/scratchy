@@ -306,7 +306,7 @@ impl<'a> BundleLayout<'a> {
     ///
     /// The twin of the producer-side `lower_subtile_tape_to_superdsc::weight_seg_record`, which
     /// reads the SAME numbers off the ktir-side plan the bake just built. The bake's parity ledger
-    /// compares that one; the model-side test (`argmax_composite_expansion.rs`) compares THIS one
+    /// compares that one; the model-side expansion tests compare THIS one
     /// back off the `inventory` registry, off the bundles that actually shipped — so the two
     /// readings cannot drift apart, because this crate's one-type-family law is exactly what
     /// forbids a field-for-field conversion between them.
