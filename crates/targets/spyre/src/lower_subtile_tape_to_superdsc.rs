@@ -186,26 +186,21 @@ const _: () = assert!(bundle::MAX_SEGMENT_BYTES == SEGMENT_SIZE);
 // invents or requires and the caller binds, so a third-party KTIR producer has to agree with these
 // numbers to bind anything at all. Re-exported so every path in the tree resolves unchanged.
 pub use ktir_superdsc::reserved_tids::{
-    ARGMAX_CONST_BASE, ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_SCALE_TID, ATTN_ZERO_TID,
-    FP8_INV448_TID, FP8_NEG448_TID, FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE,
-    KV_BLOCK_INDEX_TID, LAST_HIDDEN_TID, NEW_V_PROBE_TID, ONES_REDUCE_TID, OPROJ_HEADMAJOR_BASE,
-    RESERVED_REGIONS, RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID, RMS_INVCOLS_TID,
-    RMS_RSQRT_PROBE_TID, RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, SCALARMUL_SCALE_BASE,
-    SEL_HEADMAJOR_TID, SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION,
-    TidRegion, argmax_bias_tid, argmax_ramp_tid, argmax_v_tid, expert_subpage_bank_tid,
-    identity_class_tid, is_kernel_table_class_tid, kct_resident_tid, oproj_headmajor_tid,
-    reserved_region, rope_p_class_hds, rope_p_class_tid, router_identity_tid, router_pad_mask_tid,
-    router_rank_tie_tid, router_sm_mask_tid, router_topk_iota_tid, router_topk_pad_tid,
-    scalarmul_scale_tid,
+    ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_SCALE_TID, ATTN_ZERO_TID, FP8_INV448_TID, FP8_NEG448_TID,
+    FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE, KV_BLOCK_INDEX_TID, LAST_HIDDEN_TID,
+    NEW_V_PROBE_TID, ONES_REDUCE_TID, OPROJ_HEADMAJOR_BASE, RESERVED_REGIONS,
+    RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID, RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID,
+    RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID,
+    SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion,
+    expert_subpage_bank_tid, identity_class_tid, is_kernel_table_class_tid, kct_resident_tid,
+    oproj_headmajor_tid, reserved_region, rope_p_class_hds, rope_p_class_tid, router_identity_tid,
+    router_pad_mask_tid, router_rank_tie_tid, router_sm_mask_tid, router_topk_iota_tid,
+    router_topk_pad_tid, scalarmul_scale_tid,
 };
 
-// ⭐ THE COMPOSITE ARGMAX'S TIE TOKEN — re-exported so the `#[forward]` expansion (which
-// aliases this module as `superdsc`) can mint it at the walk's call site from the model's
-// own `tie_word_embeddings`, with no second spelling of the type between the macro and
-// the walk that consumes it.
-pub use ktir_superdsc::emit::argmax::TiedLmHeadEmbedding;
-// The rung facts the walk takes as one explicit struct — same re-export law as the tie
-// token above: the expansion constructs it, so it spells through this module's path.
+// The rung facts the walk takes as one explicit struct — the `#[forward]` expansion
+// (which aliases this module as `superdsc`) constructs it, so it spells through this
+// module's path.
 pub use crate::lower_subtile_tape_to_ktir::RungFacts;
 
 // ⭐⭐⭐ THE MEMORY PLAN LIVES IN `ktir_superdsc::placement` — `SegRole`, `TensorPlacement`,
@@ -477,14 +472,9 @@ pub fn weight_seg_record(layout: &BundleLayout) -> (u64, Vec<u64>) {
 /// ladder rung, every batch rung, every prefill width — and calls this once, after the last
 /// bake. The first entry is the reference; any later entry that disagrees is a BUILD error,
 /// never a card failure: the runtime's alias guard compares exactly these numbers when a
-/// session takes another's resident weights, so a skew here is a load-time refusal there. The
-/// KNOWN first offender is the composite argmax's NaN sentinel row: the first PR3a cut reserved
-/// it on the one-request rung alone (`argmax`), the decode session's seg1 grew `hidden · 2`
-/// bytes over the prefill session's, and every PR card cell died at load with
-/// `alias_seg(seg1): SIZE MISMATCH dst(packed=…) src(packed=…)` — +4096 B at 2b (hidden 2048),
-/// +8192 B at 8b (hidden 4096). The reservation is model-scoped now
-/// ([`RungFacts::tied_table`], threaded from the first bake's recognition); this ledger is the
-/// guard that keeps the NEXT skew a build error instead of a card failure.
+/// session takes another's resident weights, so a skew here is a load-time refusal there.
+/// This ledger is the guard that keeps the NEXT skew a build error instead of a card
+/// failure.
 ///
 /// An empty ledger is `Ok` — a bake that recorded nothing (KTIR-only, no superdsc section)
 /// has no bundles to disagree.
@@ -498,10 +488,7 @@ pub fn weight_segment_parity(ledger: &[(String, u64, Vec<u64>)]) -> Result<(), S
                 "two bundles of one model pack different resident weight segments — every bundle \
                  shares ONE weight segment (the sessions alias it outright, and the alias guard \
                  refuses on these very numbers at card load): {first_base} packs bank0 {first_bank0} \
-                 B + {} bank(s) {:?}, {base} packs bank0 {bank0} B + {} bank(s) {:?}. The composite \
-                 argmax's NaN sentinel row is the known first offender — it is a MODEL-scoped \
-                 reservation (RungFacts::tied_table, threaded from the first bake's recognition), \
-                 never the composite's own rung alone",
+                 B + {} bank(s) {:?}, {base} packs bank0 {bank0} B + {} bank(s) {:?}",
                 first_banks.len(),
                 first_banks,
                 banks.len(),
@@ -729,62 +716,6 @@ fn unique_producer<F: RopeForm>(
     it.next().is_none().then_some(p)
 }
 
-/// ⭐⭐⭐ THE COMPOSITE ARGMAX'S TABLE FACTS — what [`compute_bundle_layout`] needs about the
-/// recognized tail beyond the vocab: WHICH source tid is the tied lm_head table (the placement
-/// to extend for the NaN sentinel row) and the table's own hidden (that row's width). Built by
-/// the recognition that read them off the graph ([`crate::lower_subtile_tape_to_ktir`]'s
-/// `ArgmaxPlan`), so the layout never re-derives a fact the recognizer already proved.
-#[derive(Clone)]
-pub struct ArgmaxTable {
-    /// The table's row count — the gather's bank height. The ramp's own width is this
-    /// vocab's stick-padded form (the pad-lane form's law); the REAL vocab rides the
-    /// layout's `argmax_vocab` registry.
-    pub vocab: u32,
-    /// One embedding row's width in elements — the sentinel row's byte size is `hidden · 2`
-    /// (fp16, the gather's slab width).
-    pub hidden: u32,
-    /// The tied lm-head table's OWN source tid — the placement the sentinel row extends.
-    pub table_tid: u32,
-}
-
-/// ⭐⭐⭐ THE COMPOSITE ARGMAX'S MINTED FACTS — the recognition's output-side truth,
-/// carried on [`RolledSuperDsc::argmax`] for the numeric gate. ONE struct for both
-/// laws the mint adds to the gate, so they can never disagree about whether a
-/// composite exists (and the gate sits at clippy's argument budget — the mint's
-/// facts cannot arrive as loose parameters):
-///
-/// * **`row_tid`** — the loop closure's write target, EXEMPT from the gate's
-///   comparison. The composite runs LAST in the suffix and writes the next token's
-///   embedding into the first body's hidden-in place: WAR-safe by construction
-///   (every reader of that place ran earlier), but the gate's readback is an
-///   END-OF-RUN snapshot keyed by tid, so this tid's observable is the GATHER'S
-///   ROW, not the producing op's own value (measured: granite-3.1-8b's gate
-///   refusal at rel 1.0 — the row was the embedding scale's output, read back as
-///   the argmax'd token's table row, with the first RmsNorm and residual Add
-///   convicted locally off the overlay). The exemption drops the tid from the
-///   READBACK list itself, so the walk's golden stands in for it; the row's own
-///   correctness is the KTIR parity gate's (`argmax_composite_parity.rs`, both
-///   forms at both widths), and the producing op's value stays judged through its
-///   consumers, which read the place BEFORE the composite runs.
-/// * **`table`** — the sentinel row's staging fact. The layout extends the table's
-///   PLACEMENT by `hidden · 2` and the card's staging writes its own `V·H·2` bytes
-///   into it — the zero-filled shadow behind them IS the row the `idx = V` gather
-///   reads. The gate has no shadow: its session's HBM allocation is exactly
-///   `max(derived-shape bytes, staged bytes)`, and the derived shape is a
-///   FIRST-VIEW race (`derive_shapes` records the first `construct_memory_view`
-///   that names a tensor — the composite's `[V + 1, H]` view does not reliably win
-///   it over the matmul's `[V, H]`), so the gate's staged bytes must carry the
-///   sentinel row's `hidden · 2` ZERO bytes themselves.
-#[derive(Clone)]
-pub struct ArgmaxMint {
-    /// The first body's hidden-in (the embedding-source slot) — the place the
-    /// loop closure's gather writes the next token's embedding into.
-    pub row_tid: u32,
-    /// The tied lm-head table's own facts — the placement the sentinel row
-    /// extends, and the row's width.
-    pub table: ArgmaxTable,
-}
-
 pub fn compute_bundle_layout<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
@@ -806,29 +737,6 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // bundle, which has no layer boundary and therefore cannot bank. A uniform model is one class,
     // so a one-element slice is exactly the pre-class single map.
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
-    // ⭐⭐⭐ THE COMPOSITE ARGMAX'S OWN-RUNG FACTS — `Some` iff the rolled walk recognized a TIED
-    // ONE-REQUEST lm-head tail (see [`crate::lower_subtile_tape_to_ktir::recognize_argmax`]'s
-    // law), so this layout must place the chain's resident fp32 constants (the ramp, the
-    // scalar-V stick, the pad-lane bias) and register the real vocab on
-    // [`BundleLayout::argmax_vocab`]. `None` for every untied model, prefill bundle and batched
-    // rung — a bundle without the composite never places or stages them. The vocab is the
-    // TABLE's own row count (the gather's bank height, the ramp's width), handed down by the
-    // recognition that read it off the graph.
-    argmax: Option<ArgmaxTable>,
-    // ⭐⭐⭐ THE TIED TABLE'S SENTINEL ROW, AS A MODEL-SCOPED RESERVATION — `Some` for EVERY
-    // bundle of a model whose one-request rung minted the composite, `None` for every model
-    // that minted none. This is what extends the tied lm-head table's placement by one zero
-    // row (the NaN sentinel — see the source loop), and it is deliberately NOT the composite's
-    // own `argmax` fact above: the row must be reserved IDENTICALLY by prefill, by every
-    // batched rung and by the one-request rung itself, because every bundle of a model packs
-    // ONE shared resident weight segment — the sessions alias it outright
-    // (`Executor::alias_seg_from`), and its guard refuses on a packed-size mismatch. The
-    // first PR3a cut keyed the extension on the composite alone, so the one-request rung's
-    // seg1 grew `hidden · 2` bytes over its prefill and batched siblings (MEASURED on the
-    // card: +4096 B at 2b, +8192 B at 8b — every PR cell refused at load with
-    // `alias_seg(seg1): SIZE MISMATCH`); the facts thread model-wide from the ONE recognition
-    // that proved them (the first bake's), so the layout never re-derives them per sibling.
-    tied_table: Option<ArgmaxTable>,
 ) -> Result<BundleLayout, SuperDscError> {
     // fp8 W8A8 weights (SEN143_FP8: 1-byte / 128-elem stick) are `input[1]` of any arity-3 MatmulTile.
     // Their device footprint is HALF the fp16 weight — this is the unfakeable 1-byte-read proxy: it is
@@ -1122,41 +1030,6 @@ pub fn compute_bundle_layout<F: RopeForm>(
             SegRole::Activation
         };
         pack(tid, role, &mut seg_bytes, &mut placements);
-        // ⭐⭐⭐ THE COMPOSITE ARGMAX'S NaN SENTINEL ROW (#603 PR3a) — the chain's arithmetic
-        //    answers an ALL-NaN (or all-−inf) logits row with idx = V, ONE PAST the table's
-        //    last row, and the gather then reads `[V·H·2, (V+1)·H·2)` of the table's staging.
-        //    The placement covers only `V·H·2`, so an unextended table would make the sentinel
-        //    read PAST the placement — whatever tensor the layout packed next, or past the
-        //    segment itself. Extend the table's OWN placement by one fp16 row (`hidden · 2` B):
-        //    the staging writes exactly `V·H·2` bytes (its bind's own length — the over-bind
-        //    law keeps the tail free), the shadow is ZERO-filled before staging, so row V reads
-        //    ZEROS — in-bounds by construction, not by hoping the next placement is harmless.
-        //    The row is the device's NaN ANSWER (a zero embedding, never the host's token 0 —
-        //    a VALID token the detokenizer would happily emit); the host side treats idx ≥ V
-        //    as a loud step failure naming NaN logits, so the row exists to make the device
-        //    read defined, never to be served.
-        //
-        //    ⛔ KEYED ON THE MODEL-SCOPED `tied_table`, NEVER ON THE COMPOSITE'S OWN `argmax`:
-        //    every bundle of the model packs ONE shared resident weight segment, so the row
-        //    must move the packing of prefill and every batched rung by the same bytes or the
-        //    sessions' `alias_seg(seg1)` refuses at card load. The first PR3a cut keyed this
-        //    site on the composite alone — the one-request rung reserved the row and its
-        //    siblings did not, and every PR card cell died at load on the packed-size
-        //    mismatch; `tied_table` is the same fact threaded model-wide.
-        if let Some(argmax) = &tied_table
-            && argmax.table_tid == tid
-            && role == SegRole::Weight
-        {
-            let extra = u64::from(argmax.hidden) * 2;
-            let e = placements
-                .get_mut(&tid)
-                .expect("pack inserted the table's placement one statement up");
-            e.size += extra;
-            let seg = role.segment();
-            // Bump the segment total too, or the NEXT pack in this segment would start
-            // inside the sentinel row (and the address audit would refuse the layout).
-            seg_bytes[seg] = seg_bytes[seg].max(align128(e.offset + e.size));
-        }
         // The companion insert — see `oproj_perm_after` above. Hand-built (NOT through `pack`,
         // which would index `ir.tensors[perm]` for a size a reserved tid has no tensor for): same
         // role, same segment, same BANK, same SIZE as the weight it permutes, one 128-aligned
@@ -1582,81 +1455,6 @@ pub fn compute_bundle_layout<F: RopeForm>(
             // forces the producer's zero pad lanes to lose every strict compare, keeping
             // the pair's ids scan positions `0..E−1` (in-range by construction).
             place_const(router_topk_pad_tid(), 1, w, &mut seg_bytes);
-        }
-    }
-
-    // ── THE COMPOSITE ARGMAX'S TWO RESIDENT CONSTANTS (#603 PR3a loop closure) ──
-    // ⭐⭐ PLACED IFF THE ROLLED WALK RECOGNIZED A TIED ONE-REQUEST LM-HEAD TAIL — the
-    // walk's own recognition hands the vocab here, decided from the graph's result tail.
-    // The descending fp32 ramp `V − iota` `[1, vocab]` and the scalar-V stick `[1, 32]`
-    // are ACTIVATION-segment consts like the router's, but fp32 (4 bytes/elem): the
-    // composite's FIRST-MAX arithmetic needs the ramp's values to reach V exactly, and
-    // fp16's exact-integer range stops at 2048 — far below every real vocab, which is
-    // the mint's own documented reason for computing the ramp in-func (`emit::argmax`).
-    // They stage through the RAW bind channel (`bind_input_raw`, the subpage-bank
-    // precedent), never the f32→sen const bind that narrows to fp16. Placed by the
-    // LAYOUT because the door NAMES them by their reserved tids — the router-const law:
-    // THE DOOR NAMES, THE LAYOUT PLACES.
-    if let Some(argmax) = &argmax {
-        let vocab = argmax.vocab;
-        let seg = SegRole::Activation.segment();
-        // ⭐ THE PAD-LANE FORM — a sub-stick vocab (granite-3.1's 49155) pads its staging to
-        //    whole sticks (the dxp scheduler rejects sub-stick tiles), so the chain's links
-        //    run at the PADDED width: the ramp is placed `[1, stick_pad(V)]` with its pad
-        //    lanes CLAMPED to zero (`max(V − i, 0)` — the mint's own law), and the form's
-        //    THIRD const — the fp16 bias, 0 on the real lanes and −65504 on the pad ones —
-        //    is placed beside them, through the same fp16 law the router consts place at.
-        //    A whole-stick vocab pads to itself: the ramp's placement and its bytes are
-        //    byte-identical to the landed form's, and NO bias is placed (the door registers
-        //    the AmBiased scratch only in the pad-lane form, so a whole-stick layout cannot
-        //    drift). The REAL vocab rides the `argmax_vocab` registry — the ramp's own
-        //    placement can no longer carry it by size alone.
-        let v_pad = u64::from(
-            vocab.next_multiple_of(ktir_superdsc::superdsc_opspec::Fp16::ELEMS_PER_STICK),
-        );
-        let mut place_const32 = |tid: u32, rows: u64, cols: u64, seg_bytes: &mut [u64; 7]| {
-            let off = seg_bytes[seg];
-            let sz = rows * cols * 4; // fp32 — see the block comment
-            placements.insert(
-                tid,
-                TensorPlacement {
-                    tid,
-                    bank: 0,
-                    role: SegRole::Activation,
-                    segment: seg,
-                    offset: off,
-                    size: sz,
-                },
-            );
-            seg_bytes[seg] = align128(off + sz);
-        };
-        place_const32(argmax_ramp_tid(), 1, v_pad, &mut seg_bytes);
-        place_const32(
-            argmax_v_tid(),
-            1,
-            ktir_superdsc::superdsc_opspec::Fp32::ELEMS_PER_STICK as u64,
-            &mut seg_bytes,
-        );
-        if v_pad > u64::from(vocab) {
-            // The BIAS — fp16 (the add's mb operand reads it at Df::Fp16), so 2 bytes/elem:
-            // the router-const placement law at the argmax const's own width. It stages
-            // through the WEIGHT channel's IEEE-f16→SEN convert (its values — 0 and the
-            // fp16 floor −65504 — are exact in both grids), never `bind_const_fp32`, which
-            // is fp32-verbatim only.
-            let off = seg_bytes[seg];
-            let sz = v_pad * 2;
-            placements.insert(
-                argmax_bias_tid(),
-                TensorPlacement {
-                    tid: argmax_bias_tid(),
-                    bank: 0,
-                    role: SegRole::Activation,
-                    segment: seg,
-                    offset: off,
-                    size: sz,
-                },
-            );
-            seg_bytes[seg] = align128(off + sz);
         }
     }
 
@@ -2536,10 +2334,6 @@ pub fn compute_bundle_layout<F: RopeForm>(
         // k-dependent and the old seat (the targets table's placement) died with the
         // rank-inversion door the fused pair replaced.
         router_k: router_k.unwrap_or(0),
-        // The composite argmax's REAL vocab — the one geometry fact the const placements
-        // cannot carry by size alone (the pad-lane ramp is placed at the stick-padded
-        // width). 0 for a tape that minted no composite.
-        argmax_vocab: argmax.as_ref().map_or(0, |a| a.vocab),
     })
 }
 
@@ -4394,27 +4188,6 @@ pub fn numeric_gate<F: RopeForm>(
     // depth). `groups` must already BE the truncated bundle's groups when
     // this is `Some` — the twin `covering_twin_groups` mints.
     trunc: Option<&GateTrunc>,
-    // ⭐ THE COMPOSITE ARGMAX'S MINT (`RolledSuperDsc::argmax`) — the two laws the
-    // mint adds to this gate, in one param because they are one fact (see
-    // [`ArgmaxMint`]'s doc for both, and for why they cannot travel as loose
-    // parameters). The ROW half: the loop closure's write target, EXEMPT from
-    // comparison — the gate's readback is an END-OF-RUN snapshot keyed by tid, so
-    // that tid's observable is the GATHER'S ROW, and comparing it against the
-    // producing op's golden would refuse every minted bundle at rel ≈ 1 (measured:
-    // granite-3.1-8b — t447, the embedding scale's output, read back as the
-    // argmax'd token's table row, with the first RmsNorm and residual Add
-    // convicted locally off the same overlay). The TABLE half: the sentinel row's
-    // staging fact — this gate has no zero-filled shadow behind its staging (the
-    // session's HBM allocation is exactly `max(derived-shape bytes, staged
-    // bytes)`, and the derived shape is a FIRST-VIEW race the composite's
-    // `[V + 1, H]` view does not reliably win), so the staged bytes themselves
-    // carry the sentinel row's `hidden · 2` ZERO bytes (measured:
-    // granite-3.3-2b cap256 — the matmul-scale view won the race, the allocation
-    // came out exactly `V·H·2`, and the view guard refused the composite's view
-    // 4096 bytes past it; granite-3.1-8b passed the same guard only because its
-    // derived shape happened to carry the composite's view). `None` when no
-    // composite minted.
-    argmax: Option<&ArgmaxMint>,
 ) -> Result<(), String> {
     use scratchy_subtile::lower::GemmWeight;
     // The rung's identity, named for the body: the messages say `{fp}`, the
@@ -4600,31 +4373,10 @@ pub fn numeric_gate<F: RopeForm>(
     //    ~12 GB of codes, its 7-of-48 covering slice ~1.75 GB); the clone is
     //    the one transient double, and the slice keeps both sides small. ──
     let StagedWeights {
-        bytes: mut emu_weights,
+        bytes: emu_weights,
         gemm,
         scale_rows,
     } = stage_synth_weights(ir, weight_ids, covering);
-    // ⭐⭐⭐ THE COMPOSITE'S SENTINEL ROW RIDES THE STAGED BYTES — the table's pad,
-    //    stated at the staging because the session's allocation IS these bytes (see
-    //    `argmax`'s param doc for the measured refusal this prevents: no rounding
-    //    anywhere in the emulator's allocator can cover the row — the allocation is
-    //    exactly the staged length when the derived shape is matmul-scale). The
-    //    zeros are the row's own contract — the SAME zeros the card's zero-filled
-    //    shadow holds — so the `idx = V` gather reads a defined zero row on both
-    //    paths, never the next placement's first bytes. The reference legs share
-    //    the padded staging (ONE product, both legs — the law above) and never
-    //    read the tail: `materialize` decodes each node's weight at the node's
-    //    own logical shape, which for the table is `V·H` elements.
-    if let Some(a) = argmax {
-        let (_, bytes, _, _) = emu_weights
-            .iter_mut()
-            .find(|(tid, ..)| *tid as u64 == u64::from(a.table.table_tid))
-            .expect(
-                "the composite's table is a staged weight — the recognition read it off the \
-                 graph, and every launch that binds it survives the covering slice",
-            );
-        bytes.resize(bytes.len() + a.table.hidden as usize * 2, 0);
-    }
     let weights_ref = emu_weights.clone();
     let view = StagedWeightView {
         bytes: &weights_ref,
@@ -4804,16 +4556,9 @@ pub fn numeric_gate<F: RopeForm>(
     let mut session = crate::runner::SpyreSession::new_multi(&refs, emu_weights)
         .map_err(|e| format!("gate session: {e}"))?;
     let observables = session.observable_tids(0);
-    // ⭐ THE ROW'S EXEMPTION APPLIES TO THE READBACK LIST — dropping the composite's
-    //    row tid here (not from `results`, which states the fusion's exchange
-    //    modelling and must keep the place a stored edge) removes it from `out` too,
-    //    so the teacher-forced walk's per-node overlay leaves the GOLDEN value in its
-    //    seat and the row's consumers are judged on the value they actually read.
-    let argmax_row_tid = argmax.map(|a| u64::from(a.row_tid));
     let compare: Vec<(u64, usize)> = golden_tids
         .iter()
         .filter(|t| observables.contains(t))
-        .filter(|t| Some(**t) != argmax_row_tid)
         .map(|t| (*t, 0))
         .collect();
     if compare.is_empty() {
@@ -6641,7 +6386,6 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         attn_class_hds: _,
         router_experts,
         router_k,
-        argmax_vocab,
     } = l;
 
     let mut places: Vec<bundle::Placement> = placements
@@ -6739,9 +6483,6 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // The router's top-k width, the same law — the softmax mask's bind builds its
         // k-boundary from it.
         router_k: *router_k,
-        // The composite argmax's REAL vocab, baked for the wiring's sentinel threshold and
-        // const binds (the pad-lane ramp placement's own size is the padded width, not V).
-        argmax_vocab: *argmax_vocab,
         kv_request_stride_bytes: *kv_request_stride_bytes,
         // The rung's op-local pin slots — final by now (the declare pass minted every pin before
         // any bundle was emitted), and shared by every bundle of the rung, so whichever bundle the
@@ -7512,13 +7253,6 @@ pub struct RolledSuperDsc {
     /// `suffix_in_tid`, so the placement aliases them — the body→suffix seam threads
     /// in place like the per-iter residual. `u32::MAX` if there is no suffix.
     pub suffix_in_tid: u32,
-    /// ⭐ THE COMPOSITE ARGMAX'S MINT — [`ArgmaxMint`], the recognition's
-    /// output-side facts for the numeric gate: the loop closure's row (EXEMPT
-    /// from the gate's comparison) and the table's sentinel row (the ZERO bytes
-    /// the gate's staging must carry). `None` when no composite minted — every
-    /// untied model, prefill bundle and batched rung — set from the one
-    /// recognition that read both facts off the graph, never re-derived here.
-    pub argmax: Option<ArgmaxMint>,
     /// ⭐ THE FOUR ATTENTION FACTS NO KTIR PROGRAM STATES — `ibm/main`'s own `lower_one_node`
     /// parameters, published from the walk that had them to the bundle emit that needs them.
     ///
@@ -8237,8 +7971,8 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
-    // The rung's own facts — the one-request flag, the chunk it bakes, and the composite
-    // argmax's tie token. See [`RungFacts`].
+    // The rung's own facts — the one-request flag and the chunk it bakes.
+    // See [`RungFacts`].
     rung: RungFacts,
 ) -> Result<RolledSuperDsc, SuperDscError> {
     crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
@@ -8625,7 +8359,7 @@ mod tests {
             op_output: Vec::new(),
         };
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None, None)
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
             .expect("a layout for a plain matmul bundle");
 
         // ⭐ ROLES AND PACKING, ASSERTED AS THE RULES — not as magic numbers. This test pinned
@@ -8994,7 +8728,7 @@ mod tests {
         // the extraction program and the door must Err naming it.
         let (node, ir) = build(mq);
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None, None)
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
             .expect("the tail's layout mints");
         let mut programs = scratchy_triton_splice::lower_all(&node, &ir, false)
             .expect("the splice's fold mints the tail");
@@ -9074,7 +8808,7 @@ mod tests {
         // fp8 (arity-3): the placement reserves the PADDED extent — 2176·2816·1 B, the exact
         // bytes the matmul's tile read addresses (the refusal's access side).
         let ir = build(GemmWeight::Fp8Dynamic);
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None, None)
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
             .expect("the fp8 layout mints");
         let p = layout.placements.get(&1).expect("the fp8 weight is placed");
         assert_eq!(
@@ -9083,7 +8817,7 @@ mod tests {
         );
         // fp16 (arity-2), SAME shape: raw rows — 2112 = 33 whole fp16 sticks, no pad.
         let ir = build(GemmWeight::Dense);
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None, None)
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
             .expect("the fp16 layout mints");
         let p = layout
             .placements
@@ -9781,7 +9515,7 @@ mod tests {
         let weight_ids: std::collections::HashSet<u32> = [0u32].into_iter().collect();
         // The budget pass refuses the same fixture the wiring accepts — on the UNROLLED graph,
         // with no layer classes, an over-cap weight segment is un-bankable and un-spillable.
-        let err = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None, None)
+        let err = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
             .expect_err("the placement pass is the budget law and must refuse 32 GiB in seg1");
         assert!(
             err.0.contains("one device region can hold"),

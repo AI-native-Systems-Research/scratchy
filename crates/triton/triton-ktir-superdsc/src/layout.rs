@@ -530,9 +530,6 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // points on this ladder (refused by name at the door), so there is no expert count to state.
         router_experts: 0,
         router_k: 0,
-        // No composite argmax either: the lm-head tail that mints one is a spyre-bundle
-        // graph fact, not a single Triton kernel's parameter list.
-        argmax_vocab: 0,
         synth,
         // No pinned-LX intermediates: the triton shim emits no rmsnorm-style scratchpad
         // tensors, so the per-core pin registry starts empty — same role as `synth` above.
@@ -655,8 +652,7 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         | Program::ExpertUnsort
         | Program::ExpertCombine
         | Program::ExpertMatmul
-        | Program::WindowedRmsNorm { .. }
-        | Program::Argmax(_) => None,
+        | Program::WindowedRmsNorm { .. } => None,
     }
 }
 
@@ -897,7 +893,6 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         | Program::ExpertUnsort
         | Program::ExpertCombine
         | Program::ExpertMatmul
-        | Program::WindowedRmsNorm { .. }
-        | Program::Argmax(_) => Vec::new(),
+        | Program::WindowedRmsNorm { .. } => Vec::new(),
     }
 }

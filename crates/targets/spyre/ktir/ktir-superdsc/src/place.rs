@@ -255,28 +255,6 @@ pub enum SynthRole {
     //    cannot share one tensor at offsets ──
     GatherKtLx(u32),
     GatherVLx(u32),
-    // ── THE COMPOSITE ARGMAX's scratch (#603 PR3a), keyed off the ROW tensor's tid — the
-    //    chain's own landing, the same "key the synthetics off the output" law the top-k door
-    //    holds. Every buffer is rows == 1 (the k=1 first cut); the formats follow the chain's
-    //    links (see `emit::argmax`): the {0,1} mask stays fp16 until the dl16tofp32 convert,
-    //    the weighted mask and the index arithmetic are fp32, and the index slot the gather
-    //    reads is SENUINT32. `AmBiased` is the PAD-LANE form's own link-0 output (the
-    //    bias-applied logits row, fp16 at the stick-padded width); the whole-stick form never
-    //    declares it. `AmPartials` is the PARTIALS+COMBINE form's own max32 output — the
-    //    per-trip partial maxima, `[rows, trips × one fp32 stick]`, one stick per trip; only
-    //    a vocab wide enough to tile the reduce even under the true accum charge declares it.
-    //    The ramp, the scalar V, and the pad-lane bias are NOT here — they are
-    //    reserved-tid consts (`reserved_tids::argmax_const`), placed by the layout, not
-    //    synthetics.
-    AmMax,
-    AmMask,
-    AmMask32,
-    AmW,
-    AmJ,
-    AmIdx32,
-    AmIdxU32,
-    AmBiased,
-    AmPartials,
 }
 
 impl fmt::Display for SynthRole {
@@ -370,15 +348,6 @@ impl fmt::Display for SynthRole {
             Self::LAcc(i) => write!(f, "lacc{i}"),
             Self::GatherKtLx(i) => write!(f, "gktlx{i}"),
             Self::GatherVLx(h) => write!(f, "gvlx{h}"),
-            Self::AmMax => f.write_str("ammax"),
-            Self::AmMask => f.write_str("ammask"),
-            Self::AmMask32 => f.write_str("ammask32"),
-            Self::AmW => f.write_str("amw"),
-            Self::AmJ => f.write_str("amj"),
-            Self::AmIdx32 => f.write_str("amidx32"),
-            Self::AmIdxU32 => f.write_str("amidxu32"),
-            Self::AmBiased => f.write_str("ambiased"),
-            Self::AmPartials => f.write_str("ampartials"),
         }
     }
 }

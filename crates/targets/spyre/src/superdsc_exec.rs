@@ -804,19 +804,6 @@ pub struct Executor {
     kernel_weights: BTreeMap<bundle::PlaceId, &'static KernelWeight<'static>>,
     /// The role-`Logits` tensor — read back each step.
     logits_id: bundle::PlaceId,
-    /// ⭐⭐⭐⭐⭐ THE COMPOSITE ARGMAX'S IDX STICK (#603 PR3a) — WHERE the device-side
-    /// argmax's answer lands and the vocab it is indexed against, resolved at load the
-    /// same way [`Self::logits_id`] is: asked of the layout's own places. The mint's
-    /// chain ends in a `[rows, 64]` SenUint32 synthetic keyed off the ROW tid
-    /// (`SynthRole::AmIdxU32` — never host-bindable, only ever device-written), and the
-    /// greedy token step ([`Executor::predict_token`]) reads its row-0 word back as one
-    /// 256 B D2H instead of the ~100 KB logits row + host argmax it replaces.
-    ///
-    /// `None` for every bundle that minted no composite — untied models, prefill bundles,
-    /// batched rungs — and the token step REFUSES on `None` (loudly, never a logits
-    /// fallback: the serving side gates on `BakeFacts::argmax_vocab` before calling, so a
-    /// miss here is a wiring bug, not a sampling decision).
-    am_idx: Option<AmIdxReadback>,
     /// Ids `0..num_sources` are CALLER-FILLED every forward, EXCEPT the device-resident ones in
     /// [`Self::resident_sources`]. Set by [`Executor::declare_sources`]; `None` means nothing has
     /// told this executor how many, and the pre-launch completeness check cannot run.
@@ -1005,28 +992,9 @@ pub struct RawBind {
     bytes: Vec<u8>,
 }
 
-/// ⭐ THE COMPOSITE ARGMAX'S READBACK TARGET (#603 PR3a) — the idx stick's placement id
-/// and the vocab the sentinel is measured against.
-///
-/// The vocab is [`crate::wiring::BakeFacts::argmax_vocab`] — the chain's own V, read off
-/// the layout's `argmax_vocab` registry at load (the `router_experts` law: the pad-lane
-/// form's ramp is placed at the stick-padded width, so the placement's size is NOT V) —
-/// and not the model-wide `Vocab` the caller hands `Executor::load`: the sentinel's
-/// meaning ("idx ≥ V ⇒ every lane was NaN") is a fact of the chain's own arithmetic
-/// (`w = (logits == m) · max(V − iota, 0)`; all-NaN ⇒ mask all-zero ⇒ `w` all-zero ⇒
-/// idx = V), so V is whatever the chain was minted at. The two spellings agree for every
-/// model that mints (the lm-head's N is the config vocab), but the chain's own number is
-/// the one the check can never drift from.
-struct AmIdxReadback {
-    /// The `[1, 64]` SenUint32 synthetic's placement id (`SynthRole::AmIdxU32`).
-    id: bundle::PlaceId,
-    /// The chain's own V — the sentinel's threshold.
-    vocab: usize,
-}
-
 /// The timers and H2D accounting of a step's FORWARD HALF — everything upstream of the
-/// readback that [`Executor::predict`] (logits D2H) and [`Executor::predict_token`] (the
-/// composite's idx stick D2H) share, held in one struct so the two tails print from the
+/// readback that [`Executor::predict`] (logits D2H) shares, held in one struct so the
+/// step's tails print from the
 /// SAME numbers and cannot drift on anything the step did before its readback.
 struct ForwardHalf {
     t_stream0: Instant,
@@ -1084,35 +1052,6 @@ impl Executor {
             .logits()
             .ok_or_else(|| anyhow!("bundle {} places no Logits tensor", code.fp))?
             .id;
-        // ⭐ THE COMPOSITE'S IDX STICK, resolved the same way `logits_id` is: ONE scan of
-        // the layout's own places for the AmIdxU32 synthetic, and the vocab asked of
-        // `BakeFacts` (the ramp's own placement — see `AmIdxReadback` for why not
-        // `vocab`). The two must AGREE on presence: a bundle that placed the stick but
-        // not the ramp (or vice versa) is a mint that wrote half of itself, and the
-        // `else` arm refuses rather than guessing which half is real.
-        let am_idx = match code.layout.places.iter().find(|p| {
-            matches!(
-                p.id,
-                bundle::PlaceId::Synth {
-                    role: bundle::SynthRole::AmIdxU32,
-                    ..
-                }
-            )
-        }) {
-            Some(p) => {
-                let vocab = crate::wiring::BakeFacts::of(&code.layout).argmax_vocab;
-                if vocab == 0 {
-                    bail!(
-                        "bundle {} places the composite's idx stick but no ramp — a mint \
-                         that wrote half of itself; refusing rather than serve a token off \
-                         an unsized sentinel",
-                        code.fp
-                    );
-                }
-                Some(AmIdxReadback { id: p.id, vocab })
-            }
-            None => None,
-        };
         let kernel_weights = code
             .layout
             .kernel_weights
@@ -1129,7 +1068,6 @@ impl Executor {
             segment_bytes: code.layout.segment_bytes,
             kernel_weights,
             logits_id,
-            am_idx,
             num_sources: None,
             resident_sources: std::collections::BTreeSet::new(),
             rolled: None,
@@ -4194,9 +4132,9 @@ impl Executor {
     }
 
     /// The shared FORWARD HALF of a step: the prepared/source gates, the RB window reset, the
-    /// activation refill, and the replay-or-launch decision — extracted from `predict` when
-    /// `predict_token` (#603 PR3a) needed the same body, so the refill law, the replay gate and
-    /// the launch are ONE behavior the two readbacks ride, never two copies. `suffix` is
+    /// activation refill, and the replay-or-launch decision — extracted from `predict`, so
+    /// the refill law, the replay gate and
+    /// the launch are ONE behavior the readback rides, never a copy. `suffix` is
     /// [`SuffixLaunch::Skipped`] only for a forward whose logits are discarded ([`Logits`]).
     fn forward_half(
         &mut self,
@@ -4449,129 +4387,6 @@ impl Executor {
 
         self.step_epilogue(d);
         Ok(())
-    }
-
-    /// ⭐⭐⭐⭐⭐ THE FLIPPED STEP (#603 PR3a) — `predict`'s forward with the readback turned
-    /// around: the bundle minted the composite argmax, so the suffix ends at the gather's
-    /// row and the token is already a device-side integer. The host's whole per-token serial
-    /// tail — the ~100 KB logits D2H, the sen→IEEE convert, the host argmax — collapses to
-    /// ONE 256 B D2H of the `[1, 64]` SenUint32 idx stick and a little-endian word read.
-    ///
-    /// ⛔ ONE D2H PER STEP, BY DESIGN. A readback call is not free — the enqueue alone is
-    /// ~0.45 ms p50, FLAT across models (measured on the hoststeps cells, 10-18; the
-    /// earlier model-scaled reading was first-decode-step samples plus a ~1.4% TS-counter
-    /// rate error, since corrected) — so a second per-step readback (e.g. refreshing the
-    /// row's host shadow to keep the gather's write resident) would cost ~half a
-    /// millisecond to save a ~4 KB row H2D that rides the preamble's merged runs anyway.
-    /// The row stays HOST-STAGED instead: the next step's bind re-uploads
-    /// `embed_tokens[idx]`, byte-identical to what the gather wrote (the tied table's own
-    /// row through the same f32→f16→sen pipeline — granite's tie carries no scale, which
-    /// the mint gate's arity-2-Dense conjunct is the proof of), so the gather's row write
-    /// is redundant, not load-bearing, and no shadow state needs to be true.
-    ///
-    /// ⛔ THE SYNC STAYS IN-STEP. The trailing-drain shape (return a resolver, let the
-    /// engine drain on its own clock) buys nothing while `engine_core` resolves
-    /// `ModelRunnerOutput` immediately after `execute_model` — that half is PR3b's.
-    ///
-    /// The sentinel: the chain's arithmetic answers `V` exactly when every logit lane was
-    /// NaN (all-NaN ⇒ the equality mask is all-zero ⇒ `w` all-zero ⇒ idx = V), and the
-    /// table's row `V` is the RESERVED ZERO ROW — so the device never reads out of bounds,
-    /// and the HOST refuses the token LOUDLY rather than feed a NaN-born index to the
-    /// detokenizer. The host's own argmax over the same row would have answered token 0
-    /// (its running max never sees a strict `>`); that divergence is recorded as a
-    /// follow-up, not reconciled here.
-    pub fn predict_token(&mut self, n_new: NewTokens, seq_pos: SeqPos) -> Result<u32> {
-        let d = Diag::get();
-        let n_new = NewTokens(n_new.0.max(1));
-        // The composite argmax IS the suffix's tail, so the token step always launches it.
-        let half = self.forward_half(n_new, seq_pos, SuffixLaunch::Launched, d)?;
-
-        // ── D2H the idx stick — the logits read's own window discipline (placement, not
-        // segment; align128 length; window-or-whole-region fallback), because the same
-        // guards make it safe: `audit_layout_addresses` pins the offset 128-aligned and
-        // the length inside the region, and `Flits::from_bytes` truncation is why the
-        // length rounds UP. 256 B for the one-request rung's [1, 64] stick.
-        let am = self.am_idx.as_ref().ok_or_else(|| {
-            anyhow!(
-                "predict_token: this bundle minted no composite argmax — the caller gates on \
-                 BakeFacts::argmax_vocab before the token step, so reaching this refusal is a \
-                 wiring bug, never a sampling decision"
-            )
-        })?;
-        let lp = self
-            .places
-            .get(&am.id)
-            .cloned()
-            .ok_or_else(|| anyhow!("the composite's idx stick {} has no placement", am.id))?;
-        // ⛔ THE ONE-REQUEST RUNG'S OWN SHAPE — `[1, 64]` SenUint32, 256 B. The mint is
-        // gated on the ONE-REQUEST tail (the lm-head folded to m=1), so a wider stick here
-        // is a bundle this step was never meant to serve; word 0 of row 0 is the only lane
-        // the flipped path has a meaning for, and refusing beats guessing which row is
-        // ours.
-        if lp.size != 256 {
-            bail!(
-                "predict_token: the idx stick is {} B, not the one-request rung's [1, 64] \
-                 256 B — this bundle's composite was minted at more than one row, and the \
-                 token step serves exactly the one-request shape",
-                lp.size
-            );
-        }
-        let seg = SegIdx::checked(lp.segment as i64)
-            .ok_or_else(|| anyhow!("the idx stick's segment {} is out of range", lp.segment))?;
-        let addr = self.seg_addr[seg.get()]
-            .as_ref()
-            .ok_or_else(|| anyhow!("the idx stick's seg{} has no region", lp.segment))?;
-        let tot = addr.total_size().as_u64();
-        let lo = lp.offset;
-        let len = crate::lower_subtile_tape_to_superdsc::align128(lp.size).min(tot - lo);
-        let win = (len < tot)
-            .then(|| addr.window(ByteOffset(lo), ByteSize(len)))
-            .flatten();
-        let (src, a, b) = match win.as_ref() {
-            Some(w) => (w, lo, lo + len),
-            None => (addr, 0, tot),
-        };
-        let d2h_bytes = b - a;
-        let host = &mut self.seg_host[seg.get()][a as usize..b as usize];
-        // ON THE COMPUTE PIPELINE, for the same reason the logits read rides it (#544):
-        // the readback is the step's LAST op, FIFO-behind the step's compute CBs, and its
-        // barrier drains the (empty) DMA deques instead of host-blocking on compute.
-        self.stream
-            .as_ref()
-            .unwrap()
-            .d2h_on_compute(host, src)
-            .map_err(|e| anyhow!("idx D2H: {e}"))?;
-        let t2b = Instant::now();
-        self.stream_ref()?
-            .synchronize()
-            .map_err(|e| anyhow!("predict_token: sync: {e}"))?;
-
-        if d.phase_time {
-            let t3 = Instant::now();
-            Self::print_step_phase(&half, "idx", lp.segment as i64, d2h_bytes, t2b, t3, n_new.0);
-            let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
-            report_phase_timers(ms(half.t1, half.t2));
-        }
-
-        // ⭐ THE TOKEN — word 0 of the stick, LE. SenUint32 is the raw-copy format on both
-        // directions of the DMA door (the block table binds through it verbatim), so the
-        // host word IS the device word.
-        let word = self.seg_host[seg.get()][lp.offset as usize..][..4]
-            .try_into()
-            .expect("the D2H above landed at least the placement's own 256 B");
-        let idx = u32::from_le_bytes(word);
-        if idx as usize >= am.vocab {
-            bail!(
-                "predict_token: the composite's answer is {idx} against a vocab of {} — the \
-                 sentinel row, which the chain reaches exactly when EVERY logit lane was NaN. \
-                 The step REFUSES rather than feed a NaN-born token to the detokenizer (the \
-                 host argmax would have answered token 0 over the same row — that divergence \
-                 is the recorded follow-up, not this step's decision)",
-                am.vocab
-            );
-        }
-        self.step_epilogue(d);
-        Ok(idx)
     }
 
     /// Refill per-step ACTIVATIONS into their segment's host staging at the baked offset

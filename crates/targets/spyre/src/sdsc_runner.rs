@@ -281,33 +281,6 @@ impl SuperDscSession {
             t_bind.elapsed().as_secs_f64()
         );
 
-        // ⭐ THE COMPOSITE ARGMAX'S RESIDENT FP32 CONSTS (#603 PR3a) — bound at LOAD, iff
-        // this bundle's own layout placed them (the one-request rung that minted the composite;
-        // `BakeFacts::of` reads the vocab off the layout's own registry, so the bind and the mint
-        // answer one question and cannot drift into a placed-but-unstaged ramp). The consts are
-        // ACTIVATION-segment residents this session's own forwards read, so they cannot ride an
-        // alias: `bind_const_fp32` records them as weights, staging copies them verbatim into
-        // the shadow exactly once, and no per-step bind ever names them again.
-        //
-        // The pad-lane form's third const — the fp16 BIAS — rides `bind_weight` instead: its
-        // placement is fp16, and `bind_const_fp32` is fp32-VERBATIM only. The weight channel
-        // re-encodes through the IEEE-f16→SEN convert, where both of the bias's values (0 and
-        // the fp16 floor −65504) are exact, so the staged bytes are the device's own fp16 —
-        // the same channel every real f16 weight rides.
-        let facts = crate::wiring::BakeFacts::of(&code.layout);
-        let mut n_consts = 0;
-        if let Some(c) = facts.argmax_const_binds() {
-            use crate::lower_subtile_tape_to_superdsc::{argmax_ramp_tid, argmax_v_tid};
-            exec.bind_const_fp32(crate::bundle_code::PlaceId::Act(argmax_ramp_tid()), c.ramp)?;
-            exec.bind_const_fp32(crate::bundle_code::PlaceId::Act(argmax_v_tid()), c.v_stick)?;
-            n_consts = 2;
-            if let Some(bias) = c.bias {
-                use crate::lower_subtile_tape_to_superdsc::argmax_bias_tid;
-                exec.bind_weight(crate::bundle_code::PlaceId::Act(argmax_bias_tid()), bias);
-                n_consts += 1;
-            }
-        }
-
         // Convert + stage the bound weights into host staging NOW, on this thread, while the
         // background device prewarm is still bringing the card up — this takes the ~1s parallel
         // IEEE→SEN convert off the prepare critical path. Bytes reaching the device are identical;
@@ -315,7 +288,7 @@ impl SuperDscSession {
         //
         // NOTHING BOUND is the same situation as BORROWED: with no weights this call only zero-fills
         // a host shadow of a segment that is about to be replaced by an alias.
-        if !borrowed.is_empty() || n_bound + n_consts == 0 {
+        if !borrowed.is_empty() || n_bound == 0 {
             debug!(
                 "[timing] weight bind + stage SKIPPED ({})",
                 if borrowed.is_empty() {
@@ -632,35 +605,10 @@ impl SuperDscSession {
         self.exec.stage_keyed(id, key, f32_to_f16_le(vals))
     }
 
-    /// ⭐⭐⭐ [`run_step_i32`](Self::run_step_i32) WITH THE READBACK FLIPPED (#603 PR3a): the
-    /// same bind loop over the same three channels, then
-    /// [`Executor::predict_token`](crate::superdsc_exec::Executor::predict_token) instead of
-    /// `predict` — ONE 256 B D2H of the composite's idx stick, no logits row, no host argmax.
-    ///
-    /// ⛔ REFUSES ON A BUNDLE THAT MINTED NO COMPOSITE (the executor's own loud refusal), so
-    /// the CALLER gates on the bake fact first — `BakeFacts::argmax_vocab != 0` for the rung
-    /// this step launches — and reaching the refusal is a wiring bug, never a sampling
-    /// decision. The three bind channels are the full set the solo decode step stages today
-    /// (`run_step_i32`'s own call site), so a future fourth channel fails BOTH steps' compile,
-    /// not just the logits one.
-    pub fn run_step_token(
-        &mut self,
-        n_new: usize,
-        seq_pos: usize,
-        activations: &[crate::wiring::Bind],
-        activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
-        activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
-    ) -> Result<u32> {
-        self.bind_activations(activations, activations_f16, activations_i32)?;
-        self.exec
-            .predict_token(NewTokens(n_new as i64), SeqPos(seq_pos as i64))
-    }
-
     /// The bind loop every step runs before its forward — the three channels
-    /// (`run_step_inner`'s own, extracted when the token step needed the identical body):
-    /// f32 narrowed to f16 at the boundary, already-f16 bytes as-is, and RAW LE int32
-    /// through `bind_input_raw`. One body, so a new channel or a new guard cannot land on
-    /// one step shape and skip the other.
+    /// (`run_step_inner`'s own): f32 narrowed to f16 at the boundary, already-f16
+    /// bytes as-is, and RAW LE int32 through `bind_input_raw`. One body, so a new
+    /// channel or a new guard cannot land on one step shape and skip the other.
     fn bind_activations(
         &mut self,
         activations: &[crate::wiring::Bind],
