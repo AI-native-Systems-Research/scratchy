@@ -10302,13 +10302,17 @@ pub fn router_fused_m1(
             layout,
         ));
         if j == 0 {
+            // The seed's destination: `out` when the seed IS the whole chain
+            // (k=1 — top-1 routing; the combine door's own law), the
+            // accumulator when the adds that follow carry it to `out`.
+            let seed_h = if k == 1 { &out } else { &acc };
             ops.push(pw1(
                 &format!("reseed_o{out_tid}"),
                 "identity",
                 t_rows,
                 c_cols,
                 In::full(&sel),
-                &acc,
+                seed_h,
                 sym_id_base,
                 layout,
             ));
@@ -10483,7 +10487,8 @@ pub fn route_gather_scores(
         ));
         // 4-6. lane j of the output = val_j · ident_row_j, accumulated — the
         //      combine chain's own shape (slot 0 seeds the accumulator, the
-        //      last add writes `out` directly).
+        //      last add writes `out` directly — and at k=1 the SEED writes
+        //      `out`: top-1, the product IS the result).
         ops.push(pw2(
             &format!("rgprd_j{j}_o{out_tid}"),
             "multiply",
@@ -10496,13 +10501,17 @@ pub fn route_gather_scores(
             layout,
         ));
         if j == 0 {
+            // The seed's destination: `out` when the seed IS the whole chain
+            // (k=1 — top-1 routing; the combine door's own law), the
+            // accumulator when the adds that follow carry it to `out`.
+            let seed_h = if k == 1 { &out } else { &acc };
             ops.push(pw1(
                 &format!("rgseed_o{out_tid}"),
                 "identity",
                 t_rows,
                 f_cols,
                 In::full(&sel),
-                &acc,
+                seed_h,
                 sym_id_base,
                 layout,
             ));
@@ -10762,7 +10771,8 @@ pub fn route_expert_scale(
         //      products' surviving lanes are 0..k ≤ 64; the ident row's first
         //      64 lanes carry the one-hot, the same corner the W-wide legs
         //      read). Slot 0 seeds the accumulator, the last add writes
-        //      `out` directly.
+        //      `out` directly — and at k=1 the SEED writes `out` (top-1: the
+        //      product IS the result, the combine door's own law).
         ops.push(pw2(
             &format!("reout_j{j}_o{out_tid}"),
             "multiply",
@@ -10775,13 +10785,17 @@ pub fn route_expert_scale(
             layout,
         ));
         if j == 0 {
+            // The seed's destination: `out` when the seed IS the whole chain
+            // (k=1 — top-1 routing; the combine door's own law), the
+            // accumulator when the adds that follow carry it to `out`.
+            let seed_h = if k == 1 { &out } else { &acc };
             ops.push(pw1(
                 &format!("reseed_o{out_tid}"),
                 "identity",
                 t_rows,
                 c_cols,
                 In::full(&sel),
-                &acc,
+                seed_h,
                 sym_id_base,
                 layout,
             ));

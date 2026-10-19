@@ -4969,10 +4969,42 @@ fn router_onehot_of(
         reads.def_of(a).map(|x| x.op_type),
         reads.def_of(b).map(|x| x.op_type),
     ) {
-        (Some(OpKind::TensorExpandShape), Some(OpKind::TensorExpandShape)) => err(format!(
-            "{name}: the router's {what} reads a widened one-hot on BOTH sides — the round \
-             form is `x · onehot`"
-        )),
+        (Some(OpKind::TensorExpandShape), Some(OpKind::TensorExpandShape)) => {
+            // ⭐ TOP-1: at k=1 the value's `[:, None]` widening is an expand
+            // too — the `[1, 1]` one-hot needs no `linalg.broadcast` of its
+            // own, so the multiply's own broadcasting absorbs the value's —
+            // and both sides of the update are expands. The one-hot is still
+            // exact ONE LINK DOWN: its expand widens the one-hot select
+            // (`where(koffs == j, 1, 0)`), the value's widens the round's
+            // reduce — never a select.
+            let widens_the_onehot = |v: Ssa| {
+                reads.def_of(v).is_some_and(|x| {
+                    x.operands.first().is_some_and(|&u| {
+                        reads
+                            .def_of(u)
+                            .is_some_and(|d| d.op_type == OpKind::ArithSelect)
+                    })
+                })
+            };
+            let input_kind = |v: Ssa| {
+                reads
+                    .def_of(v)
+                    .and_then(|x| x.operands.first().copied())
+                    .and_then(|u| reads.def_of(u))
+                    .map(|d| d.op_type)
+            };
+            match (widens_the_onehot(a), widens_the_onehot(b)) {
+                (true, false) => Ok((a, b)),
+                (false, true) => Ok((b, a)),
+                _ => err(format!(
+                    "{name}: the router's {what} reads a widened one-hot on BOTH sides — the \
+                     round form is `x · onehot`, and at the top-1 width the two widens root at \
+                     {:?} and {:?}, not the one-hot select and the round's reduce",
+                    input_kind(a),
+                    input_kind(b)
+                )),
+            }
+        }
         (Some(OpKind::TensorExpandShape), _) => Ok((a, b)),
         (_, Some(OpKind::TensorExpandShape)) => Ok((b, a)),
         _ => err(format!(

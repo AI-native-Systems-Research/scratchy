@@ -652,6 +652,47 @@ fn the_composed_kernel_bakes_as_both_sections_own_forms() {
     }
 }
 
+/// ⭐ TOP-1: at k=1 the seed's product IS the route weights — the chain writes its
+/// output at the weights-out mint, and no accumulating add follows. The unfixed
+/// chain seeded the accumulator and never wrote the output at all (top-1 routing
+/// is a real geometry — Llama-4-class and Switch-style MoEs — and 1 divides the
+/// landing's 64 slots, so the shape is spellable). The seed's name carries the
+/// weights-out tid (`reseed_o{tid}`); its output binding must BE that tensor, not
+/// the accumulator synth.
+#[test]
+fn the_top_1_route_writes_its_weights_at_the_output() {
+    let ops = drive_src(SRC, TEMP, 1, &[], &[("K", Val::Int(1))]).expect("the top-1 kernel bakes");
+    let names: Vec<&str> = ops.iter().map(|o| o.op_name.as_str()).collect();
+    assert_eq!(
+        names.iter().filter(|n| n.starts_with("reseed_")).count(),
+        1,
+        "one seed leg: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with("reacc_")),
+        "no accumulating adds at top-1: {names:?}"
+    );
+    let seed = ops
+        .iter()
+        .find(|o| o.op_name.starts_with("reseed_"))
+        .expect("the seed leg");
+    let tid: u32 = seed
+        .op_name
+        .strip_prefix("reseed_o")
+        .and_then(|s| s.parse().ok())
+        .expect("the seed's name carries the weights-out tid");
+    let out_binding = seed
+        .arg_bindings
+        .iter()
+        .find(|b| !b.is_input)
+        .expect("the seed states an output");
+    assert_eq!(
+        out_binding.buffer,
+        act_name(tid),
+        "the top-1 seed writes the weights-out mint itself, not the accumulator synth"
+    );
+}
+
 /// The layout-less arm — the unit-test arm's own limit: the walk's first intermediate
 /// mint — the walk head's leading `ArithMulf` (the norm's `xr · xr`) — refuses without
 /// a `BundleLayout` to hold its buffer, before any fused emission fires. Pinned so the

@@ -50,18 +50,22 @@ const M: u32 = 5;
 /// chain (`to_wavefront`'s MoE arm verbatim): the smallest tape that reaches
 /// the scale door through the honest wiring, with every const placement
 /// minted. t8/t9 sit AFTER the result so every `_o{tid}` pin keeps its id.
-fn scale_ir() -> SubtileIR<NeoX> {
+/// `k` is the top-k width — the honest chain's own K for the existing arms,
+/// 1 for the top-1 arm (the Triton front end refuses a `[·,1]` score-side
+/// block — the 16-byte row floor — so this per-op wiring is the drive that
+/// reaches the chain at top-1).
+fn scale_ir(k: u32) -> SubtileIR<NeoX> {
     let tensors = vec![
         TensorShape { rows: M, cols: 64 }, // t0 x (the matmul's input)
         TensorShape { rows: E, cols: 64 }, // t1 the [E, hidden] gate buffer
         TensorShape { rows: M, cols: E },  // t2 logits (argsort's input)
         TensorShape { rows: M, cols: E },  // t3 rank vector (argsort out)
-        TensorShape { rows: M, cols: K },  // t4 top-k indices
-        TensorShape { rows: M, cols: K },  // t5 gathered scores (the pair's vals landing)
+        TensorShape { rows: M, cols: k },  // t4 top-k indices
+        TensorShape { rows: M, cols: k },  // t5 gathered scores (the pair's vals landing)
         TensorShape { rows: 1, cols: E },  // t6 the [1,E] scale row
-        TensorShape { rows: M, cols: K },  // t7 scaled scores (out)
-        TensorShape { rows: M, cols: K },  // t8 the temperature-scaled scores
-        TensorShape { rows: M, cols: K },  // t9 the softmax's output (the door's scores)
+        TensorShape { rows: M, cols: k },  // t7 scaled scores (out)
+        TensorShape { rows: M, cols: k },  // t8 the temperature-scaled scores
+        TensorShape { rows: M, cols: k },  // t9 the softmax's output (the door's scores)
     ];
     let tr = |t: usize| TensorRegion {
         tensor: TensorId::from_index(t),
@@ -86,7 +90,7 @@ fn scale_ir() -> SubtileIR<NeoX> {
         SubtileNode {
             id: SubtileId::from_index(2),
             op: SubOp::RouteTopK {
-                k: TopK::new(std::num::NonZeroU32::new(K).unwrap()),
+                k: TopK::new(std::num::NonZeroU32::new(k).unwrap()),
             },
             inputs: vec![tr(3)],
             output: tr(4),
@@ -139,11 +143,11 @@ fn scale_ir() -> SubtileIR<NeoX> {
 }
 
 /// Lower through the REAL door path and return the emitted ops.
-fn door_ops() -> Vec<ktir_superdsc::emit::EmittedOp> {
+fn door_ops(k: u32) -> Vec<ktir_superdsc::emit::EmittedOp> {
     let weight_ids = std::collections::HashSet::new();
     let (ops, _layout) =
         scratchy_target_spyre::lower_subtile_tape_to_ktir::lower_graph_to_superdsc(
-            &scale_ir(),
+            &scale_ir(k),
             &weight_ids,
             ktir_superdsc::ktir_node::ActiveCap::FULL,
             false,
@@ -209,7 +213,7 @@ fn input_start_bytes(o: &ktir_superdsc::emit::EmittedOp, which: usize) -> u64 {
 /// product, and the accumulate leg (`identity` seed at j=0, `add` after).
 #[test]
 fn the_scale_emits_the_seven_k_chain() {
-    let ops = door_ops();
+    let ops = door_ops(K);
     let names = opfunc_names(&ops);
     let expect: Vec<&str> = (0..K)
         .flat_map(|j| {
@@ -231,7 +235,7 @@ fn the_scale_emits_the_seven_k_chain() {
 /// per slot (lane j of the scores buffer).
 #[test]
 fn the_select_reads_the_scale_row_and_lane_j_of_the_scores() {
-    let ops = door_ops();
+    let ops = door_ops(K);
     let names = opfunc_names(&ops);
     // The LAST 6k ops are the scale door's chain: find the tail 6k window,
     // then index within it.
@@ -289,4 +293,146 @@ fn the_select_reads_the_scale_row_and_lane_j_of_the_scores() {
             "score leg {j} reads lane {j}·{rep} of the scores buffer — the head of result {j}"
         );
     }
+}
+
+/// ⭐ TOP-1: at k=1 the seed's product IS the result — the chain writes its
+/// output at the OUT tensor and no accumulating add follows. The unfixed
+/// chain seeded the accumulator and never wrote `out` at all (top-1 routing
+/// is a real geometry — Llama-4-class and Switch-style MoEs — and 1 divides
+/// the landing's 64 slots, so only the write, never the shape, was wrong).
+/// The seed's name carries the out tid (`reseed_o{tid}`); its output binding
+/// must BE that tensor, not the accumulator synth. The gather one node
+/// upstream never runs in this chain at ANY k — `lower_all` folds it into
+/// the fused top-k pair whenever the pair's logits are the gather's source
+/// (the wall-11 fold; `rtkvl_o4` IS the gather) — so this arm pins the fold,
+/// and the gather door's own top-1 write is pinned one test down, at the
+/// fold's leftover corner.
+#[test]
+fn the_chain_writes_its_output_at_top_1() {
+    let ops = door_ops(1);
+    let seed = ops
+        .iter()
+        .find(|o| o.op_name.starts_with("reseed_"))
+        .unwrap_or_else(|| {
+            panic!(
+                "one seed leg at top-1: {:?}",
+                ops.iter().map(|o| &o.op_name).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        !ops.iter().any(|o| o.op_name.starts_with("reacc_")),
+        "no accumulating adds at top-1"
+    );
+    assert!(
+        !ops.iter()
+            .any(|o| o.op_name.starts_with("rgseed_") || o.op_name.starts_with("rgacc_")),
+        "the gather is folded into the fused pair at every k — rtkvl IS the gather"
+    );
+    let tid: u32 = seed
+        .op_name
+        .strip_prefix("reseed_o")
+        .and_then(|s| s.parse().ok())
+        .expect("the seed's name carries the out tid");
+    let out_binding = seed
+        .arg_bindings
+        .iter()
+        .find(|b| !b.is_input)
+        .expect("the seed states an output");
+    assert_eq!(
+        out_binding.buffer,
+        ktir_superdsc::place::act_name(tid),
+        "the top-1 seed writes the out tensor itself, not the accumulator"
+    );
+}
+
+/// The gather door's LEFTOVER CORNER — a gather whose indices arrive from
+/// anywhere but a RouteTopK over the same source (the only shape that
+/// reaches `route_gather_scores`; in the router chain the fused pair lands
+/// the values itself and this door never runs). The indices are a SOURCE,
+/// and the RouterLogits head exists to gate the router-const block (the
+/// identity table and the iota row the door reads are placed only for a
+/// tape that carries a logits node — a source-only tape would refuse at the
+/// undeclared-synth guard).
+fn gather_ir(k: u32) -> SubtileIR<NeoX> {
+    let tensors = vec![
+        TensorShape { rows: M, cols: 64 }, // t0 x (the logits matmul's input)
+        TensorShape { rows: E, cols: 64 }, // t1 the [E, hidden] gate buffer
+        TensorShape { rows: M, cols: E },  // t2 logits (the gather's scores)
+        TensorShape { rows: M, cols: k },  // t3 the indices (a source — not a top-k landing)
+        TensorShape { rows: M, cols: k },  // t4 the gather's out
+    ];
+    let tr = |t: usize| TensorRegion {
+        tensor: TensorId::from_index(t),
+        region: tensors[t].whole(),
+    };
+    let nodes = vec![
+        SubtileNode {
+            id: SubtileId::from_index(0),
+            op: SubOp::RouterLogits {
+                experts: NumExperts::new(std::num::NonZeroU32::new(E).unwrap()),
+                router: RouterBundle::Gemma,
+            },
+            inputs: vec![tr(0), tr(1)],
+            output: tr(2),
+        },
+        SubtileNode {
+            id: SubtileId::from_index(1),
+            op: SubOp::RouteGatherScores,
+            inputs: vec![tr(2), tr(3)],
+            output: tr(4),
+        },
+    ];
+    let num_sources = tensors.len() as u32;
+    SubtileIR {
+        result: TensorId::from_index(4),
+        tensors,
+        num_sources,
+        nodes,
+        op_output: Vec::new(),
+    }
+}
+
+/// ⭐ THE GATHER'S OWN TOP-1 LAW — the same fix's other door: at k=1 the
+/// gather's seed writes the OUT tensor (`rgseed_o{tid}`'s output binding),
+/// no accumulating add follows, and the unfixed chain never wrote `out` at
+/// all.
+#[test]
+fn the_gather_writes_its_output_at_top_1() {
+    let weight_ids = std::collections::HashSet::new();
+    let (ops, _layout) =
+        scratchy_target_spyre::lower_subtile_tape_to_ktir::lower_graph_to_superdsc(
+            &gather_ir(1),
+            &weight_ids,
+            ktir_superdsc::ktir_node::ActiveCap::FULL,
+            false,
+        )
+        .unwrap_or_else(|e| panic!("lower the leftover-corner gather at k=1: {e:?}"));
+    let seed = ops
+        .iter()
+        .find(|o| o.op_name.starts_with("rgseed_"))
+        .unwrap_or_else(|| {
+            panic!(
+                "one gather seed leg at top-1: {:?}",
+                ops.iter().map(|o| &o.op_name).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        !ops.iter().any(|o| o.op_name.starts_with("rgacc_")),
+        "no gather accumulating adds at top-1"
+    );
+    let tid: u32 = seed
+        .op_name
+        .strip_prefix("rgseed_o")
+        .and_then(|s| s.parse().ok())
+        .expect("the gather seed's name carries the out tid");
+    let out_binding = seed
+        .arg_bindings
+        .iter()
+        .find(|b| !b.is_input)
+        .expect("the gather seed states an output");
+    assert_eq!(
+        out_binding.buffer,
+        ktir_superdsc::place::act_name(tid),
+        "the top-1 gather seed writes the out tensor itself, not the accumulator"
+    );
 }
