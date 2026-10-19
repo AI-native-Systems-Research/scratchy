@@ -57,25 +57,9 @@ impl Tab {
     }
 }
 
-/// Which Carbon theme class the page carries.
-#[derive(Clone, Copy, PartialEq)]
-pub enum Theme {
-    /// Carbon's g100 or white, following the reader's system setting.
-    FollowSystem,
-    /// Always Carbon's light theme: for pages whose colours are chosen and
-    /// checked against it.
-    AlwaysLight,
-}
-
-impl Theme {
-    fn script(self) -> &'static str {
-        match self {
-            Theme::FollowSystem => FOLLOW_SYSTEM_JS,
-            Theme::AlwaysLight => ALWAYS_LIGHT_JS,
-        }
-    }
-}
-
+/// Puts Carbon's g100 or white theme class on <html>, following the reader's
+/// system setting as it changes. Every page carries one; charts.js redraws
+/// the charts in it.
 const FOLLOW_SYSTEM_JS: &str = "
 (function () {
   var mq = window.matchMedia('(prefers-color-scheme: dark)');
@@ -86,12 +70,6 @@ const FOLLOW_SYSTEM_JS: &str = "
   apply(mq.matches);
   mq.addEventListener('change', function (e) { apply(e.matches); });
 })();
-";
-
-const ALWAYS_LIGHT_JS: &str = "
-// Always Carbon's light theme: the heat-map steps and series colours are
-// chosen and checked against it, whatever the reader's system setting.
-document.documentElement.classList.add('cds--white');
 ";
 
 /// Carbon Design System tokens: defines the --cds-* custom properties per
@@ -158,7 +136,6 @@ pub struct Head<'a> {
     pub og: Option<OpenGraph>,
     pub root: Root,
     pub libraries: &'a [Library],
-    pub theme: Theme,
 }
 
 fn head(h: &Head, modules: &[Module]) -> Element {
@@ -188,7 +165,7 @@ fn head(h: &Head, modules: &[Module]) -> Element {
         for (src, module) in h.libraries.iter().map(|l| l.script()) {
             script { r#type: if module { "module" }, src }
         }
-        script { dangerous_inner_html: h.theme.script() }
+        script { dangerous_inner_html: FOLLOW_SYSTEM_JS }
     }
 }
 

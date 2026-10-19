@@ -28,7 +28,7 @@ use crate::charts::{
     SparkAxes, Step, TableAxes, chart, colour, glance_maps, glance_mini, highlight, log2_ratio,
     mini_heatmap, ratio_scale, ratio_step, sparkline,
 };
-use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab, Theme};
+use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
 use data::{At, Bytes, Cell, Model, Run, Scenario};
 use numbers::{
     DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, Startup, cfmt, failed, fmt, lfmt, marks,
@@ -752,7 +752,6 @@ fn bar_chart(
             locale: None,
             combo: None,
             bounds: None,
-            theme: "white",
             toolbar: Enabled { enabled: false },
         },
     };
@@ -797,7 +796,6 @@ fn grid_heatmap(
             locale: Locale::total(total_label),
             combo: None,
             bounds: None,
-            theme: "white",
             toolbar: Enabled { enabled: false },
         },
         ratio,
@@ -2356,7 +2354,6 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
             og: None,
             root: Root(0),
             libraries: &[Library::CarbonCharts],
-            theme: Theme::AlwaysLight,
         },
         page,
     )?;

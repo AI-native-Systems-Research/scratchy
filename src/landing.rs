@@ -6,7 +6,7 @@ use crate::carbon::{
     Button, ButtonKind, ClickableTile, CodeSnippet, Column, Grid, Gutter, Heading, Link,
     Orientation, Page, Section, SideNav, Span, Stack, Tile,
 };
-use crate::chrome::{self, Content, Head, OpenGraph, Published, REPO, Root, Theme};
+use crate::chrome::{self, Content, Head, OpenGraph, Published, REPO, Root};
 use crate::{highlight, repo};
 
 /// The opening of crates/models/arch/dsl/llama.py, as the landing page quotes it.
@@ -346,7 +346,6 @@ pub fn page(assets: &Published) -> Result<String, String> {
             }),
             root: Root(0),
             libraries: &[],
-            theme: Theme::FollowSystem,
         },
         body,
     )
