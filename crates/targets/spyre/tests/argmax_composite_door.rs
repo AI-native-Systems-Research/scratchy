@@ -31,6 +31,7 @@
 //! node's own views, so a small faithful node pins the arm as well as granite's
 //! 49152-wide one (which the probes hold on the assembly side).
 
+use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::argmax::{
     ArgmaxGeom, ArgmaxSlots, TiedLmHeadEmbedding, mint_argmax_node, try_assemble_argmax,
 };
@@ -207,6 +208,24 @@ fn through_the_door_at(vocab: u32) -> (Vec<String>, Vec<String>, BundleLayout) {
         .map(|o| serde_json::to_string(&o.op).expect("serializable"))
         .collect();
     (rendered, names, layout)
+}
+
+/// The door's ops KEPT, not rendered — the wide-vocab legs' harness. Their claim is
+/// about `EmittedOp::time` (the trip count the tiler set) and the per-trip addresses
+/// `concrete_trips` unrolls, which the rendered-string comparators cannot see; the
+/// door path itself is the same one `through_the_door_at` walks.
+fn door_ops_at(vocab: u32) -> Vec<EmittedOp> {
+    let layout = layout_ready_for(vocab);
+    let mut syms = 0i64;
+    let mut quantized = std::collections::HashSet::new();
+    ktir_superdsc_door::lower(
+        &node_at(vocab),
+        &mut syms,
+        Some(&layout),
+        &mut quantized,
+        None,
+    )
+    .unwrap_or_else(|e| panic!("the argmax door at vocab {vocab}: {e:?}"))
 }
 
 /// The direct assembly at the same geometry, SHARING the door's layout: both
@@ -512,4 +531,42 @@ fn the_biased_scratch_exists_only_in_the_pad_lane_form() {
         !plain_layout.placements.contains_key(&argmax_bias_tid()),
         "a whole-stick layout places no bias const"
     );
+}
+
+/// ⭐⭐⭐ THE GEMMA-WIDTH COMPOSITE RUNS SINGLE-TRIP (262144) — the vocab that forced
+/// the time-tiled-reduce fix, pinned at the seam where the tiler actually runs. The
+/// walk mints the composite whatever the width; it is HERE, in the door's lowering,
+/// that the fp32 max32 meets the residency charge — and the charge once billed the
+/// link's SEEDED RedStick accum OUT-SIZED (`n_operands · per_core_mb · out · word` =
+/// 2·262144·4 B, past the 1,677,721-B usable LX), so the tiler split the reduce into
+/// time=2 and BOTH trips wrote the SAME address-stable accum stick: measured on the
+/// pre-fix tree, the data operand advanced 1572992 → 2097280 while the accum (lds 1)
+/// stayed at 2621568 in trip 0 and trip 1 alike. Two trips writing one HBM byte is
+/// silently wrong, and it is exactly the alias the bake's `tiled_trips_alias` guard
+/// refuses — the pod-side refusal that opened this branch. The fix bills the accum at
+/// its TRUE one-stick-per-row size (the reduce's own doc precedent: the `[m, stick]`
+/// scale output is not charged), the row then fits ONE trip, and the whole composite
+/// runs single-trip at gemma's width — the form that actually ships. The
+/// partials+combine law for a reduce that GENUINELY tiles even under the true charge
+/// is pinned by the past-the-budget leg (524288) in this same file.
+#[test]
+fn the_gemmas_width_composite_runs_single_trip() {
+    let ops = door_ops_at(262_144);
+    // NON-VACUITY — 262144 is stick-aligned, so the chain is the whole-stick eight
+    // links with the max32 among them; a renamed or reshaped chain fails HERE, not
+    // quietly through a time assert that no longer looks at the max.
+    let names: Vec<&str> = ops.iter().map(|o| o.op_name.as_str()).collect();
+    assert_eq!(
+        names, CHAIN,
+        "gemma's width is stick-aligned — the whole-stick eight-link chain"
+    );
+    for o in &ops {
+        assert_eq!(
+            o.time, 1,
+            "{} runs time={} at gemma's width — the composite's shipping form is \
+             SINGLE-TRIP (the max32's over-charged accum once split it into time=2, and \
+             both trips wrote the same accum stick)",
+            o.op_name, o.time
+        );
+    }
 }

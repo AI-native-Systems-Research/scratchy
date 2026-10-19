@@ -120,6 +120,12 @@ fn one_layer_roped() -> LoweringInput {
 /// global input, the rotary tables are layer-invariant), then `n` blocks of eleven
 /// per-layer sources, then the lm-head table LAST.
 fn n_layer_tied(n: u32, scale_tail: bool) -> (LoweringInput, HashSet<u32>) {
+    n_layer_tied_at(n, scale_tail, VOCAB)
+}
+
+/// [`n_layer_tied`] at a named vocab — the wide-vocab legs' builder (gemma-4's own
+/// 262144, and the past-the-budget width that exercises the partials+combine form).
+fn n_layer_tied_at(n: u32, scale_tail: bool, vocab: u32) -> (LoweringInput, HashSet<u32>) {
     let base = one_layer_roped();
     let body = base.ops.clone();
     let ops_per_layer = body.len();
@@ -146,7 +152,7 @@ fn n_layer_tied(n: u32, scale_tail: bool) -> (LoweringInput, HashSet<u32>) {
     // same placement (the embedding orientation, `emit::argmax`'s module law).
     sources.push(SourceShape {
         rows: H,
-        cols: VOCAB,
+        cols: vocab,
     });
     let lm_table = sources.len() - 1;
     let map_ext = |e: usize, layer: usize| -> usize {
@@ -216,7 +222,7 @@ fn n_layer_tied(n: u32, scale_tail: bool) -> (LoweringInput, HashSet<u32>) {
     let lm = ops.len();
     ops.push(OpDesc {
         op: SubOp::MatmulTile {
-            n: VOCAB,
+            n: vocab,
             weight: GemmWeight::Dense,
         },
         m: 1,
@@ -544,11 +550,18 @@ fn the_table_carries_one_sentinel_row_when_the_composite_mints() {
 /// scan, so the smallest graph that reaches it is the result's own producer; `weight`
 /// states the lm-head's staging form, and `m` its row count.
 fn lm_head_only(m: u32, weight: GemmWeight, with_scale: bool) -> SubtileIR<NeoX> {
+    lm_head_only_at(VOCAB, m, weight, with_scale)
+}
+
+/// [`lm_head_only`] at a named vocab — the wide-vocab legs' builder: gemma-4's own
+/// 262144 (the vocab that forced the time-tiled-reduce fix) and the past-the-budget
+/// width that exercises the partials+combine form both ride this.
+fn lm_head_only_at(vocab: u32, m: u32, weight: GemmWeight, with_scale: bool) -> SubtileIR<NeoX> {
     let mut sources = vec![
         SourceShape { rows: m, cols: H }, // x
         SourceShape {
             rows: H,
-            cols: VOCAB,
+            cols: vocab,
         }, // the lm-head table, IR spelling [K, N]
     ];
     let mut inputs = vec![InputRef::Ext(0), InputRef::Ext(1)];
@@ -557,7 +570,7 @@ fn lm_head_only(m: u32, weight: GemmWeight, with_scale: bool) -> SubtileIR<NeoX>
         // staged lm-head recognizable by its ARITY, never by a shape.
         sources.push(SourceShape {
             rows: 1,
-            cols: VOCAB,
+            cols: vocab,
         });
         inputs.push(InputRef::Ext(2));
     }
@@ -566,7 +579,7 @@ fn lm_head_only(m: u32, weight: GemmWeight, with_scale: bool) -> SubtileIR<NeoX>
         result: 0,
         exported: None,
         ops: vec![OpDesc {
-            op: SubOp::MatmulTile { n: VOCAB, weight },
+            op: SubOp::MatmulTile { n: vocab, weight },
             m,
             inputs,
         }],
@@ -598,6 +611,36 @@ fn walk_refuses(ir: &SubtileIR<NeoX>) -> String {
         // `RolledSuperDsc` is not `Debug`, so the Ok arm states its own refusal.
         Ok(_) => panic!("a tied graph the walk cannot recognize must refuse, not fall back"),
     }
+}
+
+/// [`walk_refuses`]'s minting twin — the full n-layer walk over the tie token,
+/// expecting SUCCESS and returning the roll (the wide-vocab legs' harness: their
+/// claim is that the walk MINTS at gemma's own 262144, and at the past-the-budget
+/// width that exercises the partials+combine form — the trip invariant is the DOOR
+/// test's, one seam later, where the tiler runs). The n-layer fixture, not the
+/// one-matmul graph: a minting walk needs the layer loop the reroll demands
+/// (`walk_refuses` gets away with one matmul only because its refusals fire in the
+/// recognition, before the loop scan).
+fn walk_mints_at(vocab: u32) -> RolledSuperDsc {
+    let (input, weight_ids) = n_layer_tied_at(LAYERS, false, vocab);
+    let ir = lower_region(&input, std::num::NonZeroU32::new(8192).unwrap());
+    let valid = ValidatedGraph::new(&ir).expect("the wide tied two-layer graph validates");
+    let tape = lower_dag_to_tape(&valid);
+    let rolled_tape = reroll_subtile_tape(&tape, &ir);
+    lower_subtile_tape_to_superdsc(
+        &rolled_tape,
+        &ir,
+        &weight_ids,
+        ActiveCap::FULL,
+        false,
+        RungFacts {
+            one_request: true,
+            chunk_pages: None,
+            argmax: Some(tied()),
+            tied_table: None,
+        },
+    )
+    .unwrap_or_else(|e| panic!("the vocab-{vocab} tied one-request walk mints: {e:?}"))
 }
 
 /// A STAGED lm-head (fp8 W8A8 — the scale rides as the matmul's third operand) on a
@@ -709,6 +752,37 @@ fn a_multi_row_result_refuses_the_k1_composite() {
     assert!(
         err.contains("3-row result"),
         "the refusal names the row count: {err}"
+    );
+}
+
+/// ⭐⭐⭐ THE GEMMA-WIDTH WALK (262144) — the vocab that forced the time-tiled-reduce
+/// fix, at the walk's own seam. The walk mints the composite whatever the width —
+/// the mint is KTIR-first, and the chain's descriptors are the DOOR's to lower — so
+/// this leg pins the mint facts at gemma's own width (the recognition fires, the
+/// ramp is placed, the composite is the KTIR-first suffix op; the same asserts the
+/// granite-width legs carry). The TRIP invariant — the fix's own target — lives one
+/// seam later, where the tiler runs: the door's `the_gemmas_width_composite_runs_
+/// single_trip` (in `argmax_composite_door.rs`) holds it, with the pre-fix evidence
+/// (the max32 at time=2, both trips writing the same address-stable accum stick).
+#[test]
+fn a_vocab_262144_tied_head_walks_green() {
+    let rolled = walk_mints_at(262_144);
+    let last = rolled
+        .suffix
+        .last()
+        .expect("the suffix holds the composite at gemma's width");
+    assert!(
+        last.op_name.starts_with("argmax_o"),
+        "the composite is minted at the wide vocab: {}",
+        last.op_name
+    );
+    assert!(
+        last.ktir.is_some() && last.op.is_none(),
+        "KTIR-first, no producer-built descriptor — the only legal bundle op"
+    );
+    assert!(
+        rolled.layout.placements.contains_key(&argmax_ramp_tid()),
+        "the ramp const is placed at gemma's width"
     );
 }
 
