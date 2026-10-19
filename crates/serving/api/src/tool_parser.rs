@@ -647,7 +647,7 @@ fn arguments_text(value: PartialValue<'_>) -> Option<Cow<'_, str>> {
     // Drop a trailing unfinished escape. The longest is a surrogate pair missing
     // its last digit, `\uXXXX\uXXX` (11 bytes): a lone high surrogate doesn't
     // decode either, so the whole pair waits.
-    (0..=value.raw.len().min(12)).find_map(|cut| {
+    (0..=value.raw.len().min(11)).find_map(|cut| {
         let head = value.raw.get(..value.raw.len() - cut)?;
         serde_json::from_str(&format!("{head}\""))
             .ok()
@@ -3170,16 +3170,21 @@ mod tests {
         assert_streamed(&calls[0], "f", serde_json::json!({"a": 1}));
     }
 
-    /// Every parser fed one character at a time: each cut lands inside a
-    /// name, a key, a `\u` escape (one of them half of a surrogate pair), a
-    /// multi-byte character, and a string holding `}` and `]`.
+    /// Every parser fed one character at a time, so each cut lands inside a
+    /// name, a key, and a string holding `}` and `]`. The object arguments
+    /// carry `é`, `😀` and `ü` as plain UTF-8, so cuts land inside multi-byte
+    /// characters; the string-encoded ones carry them as `\u` escapes, so
+    /// cuts land inside those, `😀`'s surrogate pair included.
     #[test]
     fn test_json_parsers_stream_one_char_at_a_time() {
         let args = r#"{"q": "café 😀 ü }]", "n": [1, {"k": null}]}"#;
         let expected = serde_json::json!({"q": "café 😀 ü }]", "n": [1, {"k": null}]});
-        // As a JSON-encoded string too, written by hand: `serde_json::to_string`
-        // leaves non-ASCII as plain UTF-8, so it would carry no `\u` escape.
-        let encoded = r#""{\"q\": \"café 😀 ü }]\", \"n\": [1, {\"k\": null}]}""#;
+        // Written by hand: `serde_json::to_string(args)` leaves non-ASCII as
+        // plain UTF-8, so it would carry no `\u` escape.
+        let encoded =
+            r#""{\"q\": \"caf\u00e9 \ud83d\ude00 \u00fc }]\", \"n\": [1, {\"k\": null}]}""#;
+        // ASCII only, so `é`, `😀` and `ü` can only be there as escapes.
+        assert!(encoded.is_ascii(), "{encoded}");
         let cases: [(&dyn ToolCallParser, String); 4] = [
             (
                 &LlamaJsonToolParser::new(),
