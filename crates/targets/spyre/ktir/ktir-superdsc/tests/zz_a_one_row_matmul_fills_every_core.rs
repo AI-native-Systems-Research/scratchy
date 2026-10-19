@@ -78,7 +78,7 @@ fn every_granite_8b_fp8_decode_contraction_runs_on_all_32_cores() {
         SharedKernelBmmForm, matmul_opspec_off_operands,
     };
     use ktir_superdsc::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
-    use ktir_superdsc::superdsc_opspec::Fp16;
+    use ktir_superdsc::superdsc_opspec::{Df, Fp16};
     for (name, k, n, want, trips) in [
         ("k_proj", 4096u32, 1024u32, (1u32, 16u32, 2u32), 1u32),
         ("gate_proj", 4096, 12800, (1, 8, 4), 1),

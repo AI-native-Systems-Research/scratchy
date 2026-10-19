@@ -429,9 +429,6 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         // No head-major o_proj copies: the restructure is a spyre-bundle fact, and this runner
         // lowers Triton kernels — no permuted copy exists to materialize.
         weight_copies: std::borrow::Cow::Owned(Vec::new()),
-        // No MoE router in a single-kernel Triton bundle.
-        router_experts: 0,
-        router_k: 0,
         // No paged KV: a single-kernel bundle has no per-request cache stride.
         kv_request_stride_bytes: 0,
         // No op-local LX pin slots: this runner lowers Triton kernels — no rmsnorm decomposition

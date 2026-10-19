@@ -284,7 +284,7 @@ fn func(m: &ttir::Module, f: &ttir::Func) -> Result<Op> {
 /// front end emitted the fp8 weight's widening as `arith.extf`, and every pass between here
 /// and `to_ktir` keys on that op: `dot_to_linalg`'s fp8 peel, `legalize_types`, the fused
 /// segment planner's charge for the widened tile. Mapping `tt.fp_to_fp` here hands every one
-/// of them the op it already reads, so `matmul_fp8.py` / `expertmatmul.py` lower exactly as
+/// of them the op it already reads, so `matmul_fp8.py` lowers exactly as
 /// before (byte-identical descriptors) and nothing downstream needs a second spelling.
 ///
 /// `tt.fp_to_fp` exists in Triton because MLIR's `arith` cannot spell a non-default

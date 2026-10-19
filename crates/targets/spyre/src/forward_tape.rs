@@ -49,18 +49,6 @@ pub enum Staged {
     /// [`GatherEntry`]: scratchy_subtile::sdsc_abstract::GatherEntry
     /// [`GatherEntry::of_page_block`]: scratchy_subtile::sdsc_abstract::GatherEntry::of_page_block
     I32(std::borrow::Cow<'static, [scratchy_subtile::sdsc_abstract::GatherEntry]>),
-    /// ⭐ RAW LE u32 BYTES — the SUB-PAGE INDEX BANK's contents (`e·S + s`), already encoded
-    /// for the raw-i32 bind channel.
-    ///
-    /// ⛔ A SIBLING OF [`Staged::I32`], NOT A MEMBER OF IT. The bank's words are fine gather
-    /// entries (the composition `e·S + s` the sub-paged weight gather addresses by), but they
-    /// are NOT [`GatherEntry`]s: that type's one composition is a KV POOL's
-    /// `phys · entries_per_page + block`, minted from the session's own page stride, and the
-    /// bank's factor is the DOOR'S CUT (`S = CopyDims::ENTRIES_PER_OP`), a bundle constant.
-    /// Forcing the bank through the pool's door would be a type lie with a real address on the
-    /// other side; carrying pre-encoded bytes keeps the wire channel (raw int32, copied
-    /// verbatim by `bind_input_raw`) while letting each law state its own composition.
-    SubpageBank(Vec<u8>),
 }
 
 /// Where prefix validity comes from — the one genuinely two-regime input.
@@ -215,24 +203,6 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
         })?;
         return Ok(Staged::I32(std::borrow::Cow::Owned(blocks.to_vec())));
     }
-    // ⭐⭐ THE FINE-INDEX BANK, served beside the block index: its words are int32 entries the
-    // device's gather converts to addresses, so they take the SAME raw channel — but they are a
-    // BUNDLE CONSTANT (a pure function of the placed row count), not a session input, which is
-    // why the values come from the shared layout law (`expert_subpage_index_bank`) rather than
-    // `ForwardInputs`: the emitter's placement and this staging derive one table from one E.
-    if let ForwardKernel::SubpageBank = step.kernel {
-        let e = shape.subpage_bank_e;
-        if e == 0 {
-            return Err(
-                "SubpageBank step on a bundle whose shape states no bank — the step gate and the \
-                 shape field have desynced"
-                    .to_string(),
-            );
-        }
-        return Ok(Staged::SubpageBank(
-            scratchy_subtile::sdsc_abstract::expert_subpage_index_bank(e as u32),
-        ));
-    }
     // ⭐ SERVED BEFORE THE OWNED TAIL, because a constant is not COMPUTED here — it is a table
     // the macro put in the binary, and the arms below all build their rows. Routing it through
     // them cost a copy of `2·hd²` floats per token for the identity and rope-P kernels alone.
@@ -309,7 +279,6 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
         ForwardKernel::PrefixMask => unreachable!("served above, where its dtype is decided"),
         ForwardKernel::Const(_) => unreachable!("served above, where it is borrowed not built"),
         ForwardKernel::KvBlockIndex => unreachable!("served above, where it stays an INTEGER"),
-        ForwardKernel::SubpageBank => unreachable!("served above, where it stays raw int32"),
         ForwardKernel::Decode => {
             return Err("Decode is a device step, not a host call".to_string());
         }
@@ -492,13 +461,6 @@ pub enum ForwardKernel {
     /// `addr = idx * skip_addr + base_addr` and `skip_addr` is the score leg's own entry, measured at
     /// 4096 elements. See [`KV_BLOCK_INDEX_TID`](crate::lower_subtile_tape_to_superdsc::KV_BLOCK_INDEX_TID).
     KvBlockIndex,
-    /// ⭐⭐⭐ THE SUB-PAGE INDEX BANK — the `[E, 32]` u32 const table the fine expert gather's
-    /// index is minted from. Present only when the bundle placed it (an expert door's
-    /// `expert_slab_subpages` cut fired — the vendor-scheduler LX law), and staged through the
-    /// RAW-I32 bind channel, never the f32 one: the values reach 4095, past fp16's
-    /// exact-integer range, and `ieee_to_sen_bytes` would corrupt every word. See
-    /// [`expert_subpage_bank_tid`](crate::lower_subtile_tape_to_superdsc::expert_subpage_bank_tid).
-    SubpageBank,
     /// Baked constant `i` (see [`crate::wiring::synthetic_constants`]).
     Const(usize),
     /// The device program itself.
@@ -547,14 +509,6 @@ pub struct ForwardShape {
     /// — which reads as ZERO, and block 0 is a VALID address, so every row would attend row 0's keys.
     /// One artifact-derived question answers both.
     pub kv_block_index: bool,
-    /// ⭐⭐⭐ THIS BUNDLE'S EXPERT GATHER IS SUB-PAGED, so the tape has a
-    /// [`ForwardKernel::SubpageBank`] step and the launch must stage the `[E, 32]` fine-index
-    /// table. The count is the bank's OWN placed row count — 0 when unplaced (every model
-    /// before the 26b), which is the step's gate. Same artifact-derived law as
-    /// [`Self::kv_block_index`]: the door's `embi` gather and this staging are the two halves
-    /// of one fine index, and the unstaged half reads as ZERO — a valid entry — so every pair
-    /// would gather expert 0's sub-page 0, fluently and wrongly.
-    pub subpage_bank_e: usize,
     pub n_consts: usize,
 }
 
@@ -597,16 +551,6 @@ impl ForwardShape {
             v.push(ForwardStep {
                 kernel: ForwardKernel::KvBlockIndex,
                 tensor: PlaceId::Act(sd::KV_BLOCK_INDEX_TID),
-            });
-        }
-        // ⭐⭐⭐ THE FINE-INDEX BANK — a step iff the bundle placed the table (the shape's own
-        // `subpage_bank_e`, off the placement). Same gate law as the KV block index above: the
-        // door's gather exists iff the placement does, so neither half can exist without the
-        // other answering for it.
-        if self.subpage_bank_e > 0 {
-            v.push(ForwardStep {
-                kernel: ForwardKernel::SubpageBank,
-                tensor: PlaceId::Act(sd::expert_subpage_bank_tid()),
             });
         }
         for i in 0..self.n_consts {
@@ -714,8 +658,6 @@ mod tests {
             // The shipped non-gathering shape, so the ORDER assertion below stays the order every
             // existing bundle plays. The gathering variant is asserted separately.
             kv_block_index: false,
-            // The shipped non-sub-paged shape — every model before the 26b places no bank.
-            subpage_bank_e: 0,
             n_consts: 3,
         }
     }
@@ -852,9 +794,6 @@ mod tests {
             ),
             Staged::F32(_) | Staged::F16(_) => {
                 panic!("an index table staged as a FLOAT — 65,280 is not representable in f16")
-            }
-            Staged::SubpageBank(_) => {
-                panic!("a kv index table is GatherEntry i32s, not an expert sub-page bank")
             }
         }
     }
@@ -1074,7 +1013,6 @@ mod tests {
             }
             Staged::F16(_) => panic!("a broadcast row is f32; the bind loop narrows it"),
             Staged::I32(_) => panic!("a broadcast row is a MASK, not an index tensor"),
-            Staged::SubpageBank(_) => panic!("a broadcast row is a MASK, not an expert bank"),
         }
         let _ = sa::POOL_STICK; // the Blocks variant's shape params come from here
     }

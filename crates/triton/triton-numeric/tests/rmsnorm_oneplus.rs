@@ -143,8 +143,8 @@ fn windowed_spec(m: usize, heads: usize, d: usize) -> KernelSpec {
     }
 }
 
-/// The whole chain to THEIR `IRFunction`, in the process-wide arena (the
-/// routeargsort gate's own ladder, verbatim). Panics rather than returning an
+/// The whole chain to THEIR `IRFunction`, in the process-wide arena (the kernel
+/// gates' own ladder, verbatim). Panics rather than returning an
 /// error: a kernel that cannot reach the handoff is measuring nothing.
 fn lowered(src: &str, spec: &KernelSpec) -> IRFunction<'static> {
     let mut tt = codegen::compile(src, spec, Target::spyre())
@@ -329,7 +329,7 @@ fn execute(
     (f, out.data.iter().map(|&v| v as f64).collect())
 }
 
-/// The f16 encoding of an f64 operand, the routeargsort gate's own hop.
+/// The f16 encoding of an f64 operand, the kernel gates' own hop.
 fn encode_f16(v: &[f64]) -> Vec<u8> {
     ktir_core::codec::encode(&v.iter().map(|&a| a as f32).collect::<Vec<_>>(), DType::F16)
 }

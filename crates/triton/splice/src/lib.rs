@@ -97,19 +97,11 @@ use ktir_core::arena::Arena;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::{BufferId, Elementwise, KtirNode, Program};
 use scratchy_subtile::lower::GemmWeight;
-use scratchy_subtile::subtile_ir::{
-    EwKind, GainConvention, GatedAct, SubOp, SubtileIR, SubtileNode,
-};
+use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SubOp, SubtileIR, SubtileNode};
 
 use triton_frontend::codegen::{ArgSpec, KernelSpec};
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
-
-/// THE ADDRESSING WELL-FORMEDNESS PASS — the general compile-time lockdown every
-/// bake runs under. See [`addressing`] for the layering (this crate's binding-time
-/// guard, the door's bank guard, and this pass's graph sweep) and the closed class
-/// tables an index-minted tensor's readers must appear in.
-pub mod addressing;
 
 /// One registry row: the kernel's SOURCE TEXT and entry, and the STATED classification —
 /// declared data, not logic. Adding a kernel is a row; nothing else in this crate changes.
@@ -343,169 +335,28 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         // binding, and the dead-prefix view injection that no pure-Triton program can
         // state).
         SubOp::AttnDecode { .. } => attn_row(),
-        // ── THE GEMMA-4 / MoE-2a KINDS — one row each, the same four facts the families
-        // above state. Their door arms already exist (they were written against the
-        // builder path on the gemma-4 branch), so the splice's whole job is minting a
-        // program whose views state what those arms read. ──
-        //
-        // ⭐ ROUTERNORM IS RMSNORM, VERBATIM (branch: `lower_router_norm_node`). The
-        // router's gain is a dense `[1, hidden]` row the host stages like every other
-        // norm gain, and gemma's router gain is the SCALE convention (the loader stores
-        // `router.scale` verbatim, no `+1`) — the one `Program::RmsNorm` multiplies by —
-        // so the node's program is the rmsnorm family's own, unmodified. The `routernorm`
-        // STEM (the builder's naming law) is stated in `program_stem`.
-        SubOp::RouterNorm { .. } => rmsnorm_row(GainConvention::Scale),
-        // ⭐ ROUTERLOGITS IS A DENSE MATMUL, VERBATIM (branch:
-        // `lower_router_logits_node`). The router gate is a dense weight the loader
-        // staged `[hidden, experts]` (the FUF `[k, n]` convention), exactly the form
-        // every dense `MatmulTile` reads; the router weights are staged dense fp16 —
-        // quantizing them would change the routing decision every expert downstream
-        // consumes. Same `Program::Matmul` the dense row states; `routerlogits` stem in
-        // `program_stem`.
-        SubOp::RouterLogits { .. } => matmul_row(&GemmWeight::Dense),
-        // ⭐ ROUTESCALE IS SCALARMUL, VERBATIM — a scores-times-constant is the
-        // ScalarMul computation with the value read off the `RouteScale` payload,
-        // so the row is the scalarmul family's own (SCALE stated from the payload
-        // in `kernel_spec`). ⛔ BUT THE WIDTH IS THE ROUTER'S OWN LAW, NOT THE
-        // FAMILY'S: the scores ride the LOGICAL `[m, k]` storage, not a padded
-        // one. The family's device-width law exists because a ScalarMul on the
-        // lm-head logits follows a MATMUL that emitted `for_matmul`-padded
-        // columns with the layout reserving exactly that — the router's scores
-        // follow a GATHER that writes the logical width with nobody reserving
-        // any pad, so `for_pointwise(k=8)`'s util-floor pad to 512 is fictional
-        // and the view faults the fused segment (measured: `view [m, 512]
-        // strides [512, 1] spans 2048 bytes but the tensor allocated … holds
-        // only [m·k·2]`). `kernel_spec` states the logical width; the door's
-        // `scalarmul_scaled` re-derives its own device width off the REGION and
-        // caps it at the placement, so the descriptor is the same either way —
-        // `routesoftmax`'s own law ("it reads k off the output view's own
-        // v_cols — the LOGICAL count — and pads the device width itself").
-        // `scalarmul` stem automatic via the program.
-        SubOp::RouteScale { .. } => TritonKernelRow::Spliced {
-            src: include_str!("../../../targets/spyre/kernels/scalarmul.py"),
-            file: "scalarmul.py",
-            entry: "scalarmul_fwd",
-            program: Program::ScalarMul,
-        },
-        SubOp::RouteSoftmax => TritonKernelRow::Spliced {
-            src: include_str!("../../../targets/spyre/kernels/routesoftmax.py"),
-            file: "routesoftmax.py",
-            entry: "routesoftmax_fwd",
-            program: Program::RouteSoftmax,
-        },
-        SubOp::RouteRenorm => TritonKernelRow::Spliced {
-            src: include_str!("../../../targets/spyre/kernels/routerenorm.py"),
-            file: "routerenorm.py",
-            entry: "routerenorm_fwd",
-            program: Program::RouteRenorm,
-        },
-        // ⭐ THE 2b ROUTER-INDEX ROWS BEGIN HERE — the rank vector first. The
-        // kernel is the LANE-FREE count form (`routeargsort.py`'s header
-        // states the law: `tl.arange` refuses the chain fixture's `E = 5`,
-        // and the door's own per-`j` compare needs no lanes), so the body
-        // compiles on the compare/select/cast extension M2b step 2 landed
-        // plus `tl.zeros`/`tl.sum` the norm family already exercises. The
-        // door re-derives its `9W + 1` chain from the minted views (the
-        // full-tile `x` view first, the `[M, 1]` column stores over the
-        // output), never walking this body's ops. ⭐ THIS ROW IS THE
-        // BARE-ARGSORT CORNER'S OWN: `lower_all` folds the argsort away
-        // (emits nothing) when every consumer of its rank vector is a
-        // RouteTopK — the fused top-k reads the LOGITS, not the ranks — so
-        // this kernel runs only for an argsort whose ranks feed anything
-        // else, exactly the tapes the argsort door's own tests construct.
-        SubOp::RouteArgsort => TritonKernelRow::Spliced {
-            src: include_str!("../../../targets/spyre/kernels/routeargsort.py"),
-            file: "routeargsort.py",
-            entry: "routeargsort_fwd",
-            program: Program::RouteArgsort,
-        },
-        // ⭐ THE FUSED PAIR — the vendor `topkindex`/`topkvalue` selection as
-        // ONE kernel over the RAW LOGITS (the argsort and the score gather
-        // are folded into it: `lower_all` silences both when the argsort's
-        // only consumers are RouteTopKs and the gather's ids come from a
-        // RouteTopK). The measured stick law — the reduction dim may not
-        // ride the stick, and the `[m, W]` logits put the experts ON it —
-        // sends the pair through the Kᵀ-restickify door first (`topk.ddl`'s
-        // own orientation: `[W, m]` sticked on the token axis), which is the
-        // door's work, never this body's. The kernel is the ripple mirror
-        // (`routetopk.py`'s header states the law — the K running registers
-        // live in the OUTPUT buffers, the grammar's own no-subscript-store
-        // law), and it lands BOTH the ids and the values: `desc_v` IS the
-        // old gather's output, so the fold removes that program whole.
-        SubOp::RouteTopK { .. } => TritonKernelRow::Spliced {
-            src: include_str!("../../../targets/spyre/kernels/routetopk.py"),
-            file: "routetopk.py",
-            entry: "routetopk_fwd",
-            program: Program::RouteTopK,
-        },
-        // ⭐ THE TRUE GATHER — `take_along_axis` at the last axis over
-        // whatever indices the node states, the door's own one-hot select
-        // chain's exact function (no top-k re-derivation: the chain fixture
-        // feeds hand-set indices, so a value-recomputing substitute would
-        // fail it by construction). The kernel is the LANE-FREE column-scan
-        // form (`routegather.py`'s header states the law). ⭐ THIS ROW IS
-        // THE NON-ROUTER GATHER'S OWN: `lower_all` folds the gather away
-        // when its indices come from a RouteTopK over the same source — the
-        // fused top-k lands the values itself — so this kernel runs only
-        // for a gather whose ids arrive from anywhere else.
-        SubOp::RouteGatherScores => TritonKernelRow::Spliced {
-            src: include_str!("../../../targets/spyre/kernels/routegather.py"),
-            file: "routegather.py",
-            entry: "routegather_fwd",
-            program: Program::RouteGatherScores,
-        },
-        // ⭐ THE PER-EXPERT SCALE — each score times its expert's learned
-        // scale, the same one-hot select as the gather with the LOADED
-        // `[1, E]` scale row as the gather parent (`routeexpertscale.py`'s
-        // header states the law). ⛔ THE BINDING IS THE DOOR'S MINT ORDER,
-        // NOT THE NODE'S: the door reads `[scale, idx, scores, out]`
-        // positionally (`tensors[0]` IS the scale row — the recorded m=8
-        // mis-read law), so the kernel's parameters and the splice's binding
-        // row both reorder the node's `[scores, idx, scale]` (see
-        // `bindings_for`'s RouteExpertScale arm).
-        SubOp::RouteExpertScale { .. } => TritonKernelRow::Spliced {
-            src: include_str!("../../../targets/spyre/kernels/routeexpertscale.py"),
-            file: "routeexpertscale.py",
-            entry: "routeexpertscale_fwd",
-            program: Program::RouteExpertScale,
-        },
-        SubOp::ExpertGatedAct { act } => gated_act_row(*act),
-        SubOp::ExpertSort { .. } => TritonKernelRow::Spliced {
-            src: include_str!("../../../targets/spyre/kernels/expertsort.py"),
-            file: "expertsort.py",
-            entry: "expertsort_fwd",
-            program: Program::ExpertSort,
-        },
-        SubOp::ExpertUnsort => TritonKernelRow::Spliced {
-            src: include_str!("../../../targets/spyre/kernels/expertunsort.py"),
-            file: "expertunsort.py",
-            entry: "expertunsort_fwd",
-            program: Program::ExpertUnsort,
-        },
-        // ⛔ A SHARED EXPERT IS A BUNDLE-CONTRACT REFUSAL, NOT A SILENT DROP —
-        // checked in [`lower_all`], the last place the bound is visible before a
-        // program is minted (`Program::ExpertCombine` carries no payload, so the
-        // door cannot re-state the guard the branch's builder fn carried).
-        SubOp::ExpertCombine { .. } => TritonKernelRow::Spliced {
-            src: include_str!("../../../targets/spyre/kernels/expertcombine.py"),
-            file: "expertcombine.py",
-            entry: "expertcombine_fwd",
-            program: Program::ExpertCombine,
-        },
-        // ⭐ THE EXPERT BANK'S OWN PROJECTION — the one-hot-over-E ladder form
-        // (`expertmatmul.py`'s header states the law). The node's `inputs[1]`
-        // is the SORT's output, wired for the PRODUCER WALK only: the splice
-        // resolves the sort's index input and binds it as the program's
-        // `desc_idx`, the branch's own builder walk (`mint`'s binding law
-        // below). The program's parameters are mint-ordered `[w, s, idx,
-        // rows]`, which the door resolves by extent — the same views this
-        // kernel's descriptors state.
-        SubOp::ExpertMatmul { .. } => TritonKernelRow::Spliced {
-            src: include_str!("../../../targets/spyre/kernels/expertmatmul.py"),
-            file: "expertmatmul.py",
-            entry: "expertmatmul_fwd",
-            program: Program::ExpertMatmul,
-        },
+        // ⛔ THE MoE SUB-OPS ARE NOT SPLICED KINDS ANY MORE — the MoE lowers
+        // only from `kernels/moe.py` through KTIR, and
+        // `lower_subtile_tape_to_ktir` refuses every MoE SubOp before the
+        // splice (its one Unhandled arm). A node reaching this row means the
+        // routing changed; the fix is a kernel plus a KTIR path, never a
+        // per-op row.
+        SubOp::RouterNorm { .. }
+        | SubOp::RouterLogits { .. }
+        | SubOp::RouteScale { .. }
+        | SubOp::RouteSoftmax
+        | SubOp::RouteRenorm
+        | SubOp::RouteArgsort
+        | SubOp::RouteTopK { .. }
+        | SubOp::RouteGatherScores
+        | SubOp::RouteExpertScale { .. }
+        | SubOp::ExpertGatedAct { .. }
+        | SubOp::ExpertSort { .. }
+        | SubOp::ExpertUnsort
+        | SubOp::ExpertCombine { .. }
+        | SubOp::ExpertMatmul { .. } => TritonKernelRow::Refused(
+            "the MoE lowers only from kernels/moe.py through KTIR — no per-op MoE row exists",
+        ),
         SubOp::TanhSoftCap { .. } => TritonKernelRow::Spliced {
             src: include_str!("../../../targets/spyre/kernels/tanhsoftcap.py"),
             file: "tanhsoftcap.py",
@@ -576,34 +427,6 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
     }
 }
 
-/// `SubOp::ExpertGatedAct`'s acts — an exhaustive match over the act vocabulary, the
-/// family-function law. Silu and gelu are real DDL primitives (`silumul`'s two-op body
-/// with the act's primitive in place of `"silu"`); `SwigluOai`'s ±7-clamped
-/// `min`/`max`/`sigmoid` chain needs compare/select primitives the ladder has not
-/// landed (the Phase-2b compare/select extension names them), and substituting silu or
-/// gelu would run a different function and report success — the refusal states it.
-fn gated_act_row(act: scratchy_subtile::subtile_ir::GatedAct) -> TritonKernelRow {
-    use scratchy_subtile::subtile_ir::GatedAct as Sub;
-    let ktir_act = match act {
-        Sub::Silu => ktir_superdsc::ktir_node::GatedAct::Silu,
-        Sub::Gelu => ktir_superdsc::ktir_node::GatedAct::Gelu,
-        Sub::SwigluOai => {
-            return TritonKernelRow::Refused(
-                "gpt-oss's SwiGLU-OAI act: `min(g,7)`, `clamp(u,±7)` and `sigmoid` need the \
-                 compare/select primitives the ladder has not landed (the Phase-2b \
-                 compare/select extension), and neither `silu` nor `gelu` is that function — \
-                 substituting one would run the wrong model and report success",
-            );
-        }
-    };
-    TritonKernelRow::Spliced {
-        src: include_str!("../../../targets/spyre/kernels/gatedact.py"),
-        file: "gatedact.py",
-        entry: "gatedact_fwd",
-        program: Program::ExpertGatedAct(ktir_act),
-    }
-}
-
 /// THE SPLICE — the ONLY producer for a spliced kind. Compile the kernel the registry
 /// names for this node and hand back the [`EmittedOp`]: `EmittedOp::bare(name)` with
 /// `ktir` set.
@@ -661,29 +484,6 @@ pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> Result<Vec<EmittedOp>, String> {
-    // ⛔ A SHARED EXPERT IS REFUSED HERE — the LAST place the bound is visible
-    // before a program is minted (branch: `lower_expert_combine_node`; the port's
-    // `Program::ExpertCombine` carries no payload, so the door cannot re-state
-    // it). The chain this kernel spells has no term for a shared expert's
-    // contribution (the emu's own doc: "a shared expert's contribution would be
-    // an extra `fma` term on the same accumulator"), so a bundle that declares
-    // one cannot be lowered — the refusal names the bound, per the no-refusals
-    // law that a missing capability is a named error, not a silent drop. The
-    // loader-level gate (to_wavefront's Qwen path) is the FIRST line; this is
-    // the second.
-    if let SubOp::ExpertCombine {
-        shared: scratchy_subtile::subtile_ir::SharedExpertBound(Some(shared_inter)),
-        ..
-    } = &node.op
-    {
-        return Err(format!(
-            "ExpertCombine t{} declares a shared expert (intermediate width {shared_inter}): the \
-             KTIR combine is the k-slot fma chain over the routed pair rows, and a shared expert's \
-             contribution is an extra term that chain does not state — shared-expert models are \
-             the loader's worklist, not a silent drop",
-            node.output.tensor.index() as u32
-        ));
-    }
     // ── THE HEAD-NORM SANDWICH'S THREE SEATS — the split (head) is where the fused
     // program is emitted; the flatten-back (tail) and the middle (norm) self-identify
     // as fused-away and emit NOTHING. The match is dataflow-based
@@ -737,53 +537,6 @@ pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
     {
         let at_m1 = node_at_one_row(node);
         return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
-    }
-    // ⭐ THE ROUTER'S ARGSORT FOLDS INTO THE TOP-K — the fused pair reads the RAW
-    // LOGITS (the argsort's own input, one producer up: `bindings_for`'s RouteTopK
-    // walk), so when every consumer of the rank vector is a RouteTopK the argsort's
-    // program is dead weight: its `9W + 1` per-row-scalar chain was also the
-    // wall-11 culprit (its rank targets could DUPLICATE at ties — the one-hot
-    // match then summed TWO expert ids into one slot, and the gather read past
-    // the bank, faulting the card's FETCH — measured on the 26b card run). The
-    // pair's ids are scan positions, unique by construction, so the fold is the
-    // fix, not an optimization. ⛔ TWO CORNER GUARDS: the ranks must have a
-    // consumer at all (zero consumers is the vacuous-`all` trap — an argsort
-    // whose output is the tape's RESULT has no node consumer, and folding it
-    // would leave the result buffer unwritten), and the ranks must not BE the
-    // result (same trap one level up: the pair writes the LOGITS' consumers, so
-    // a result rank vector would return garbage). The BARE-ARGSORT CORNER
-    // (ranks feeding anything but a RouteTopK — the argsort door's own tapes)
-    // still emits: the row stays registered for exactly those.
-    if let SubOp::RouteArgsort = &node.op
-        && node.output.tensor != ir.result
-        && {
-            let consumers = consumers_of(ir, node.output.tensor);
-            !consumers.is_empty()
-                && consumers
-                    .iter()
-                    .all(|c| matches!(c.op, SubOp::RouteTopK { .. }))
-        }
-    {
-        return Ok(Vec::new());
-    }
-    // ⭐ AND THE SCORE GATHER FOLDS WITH IT — the fused pair lands the VALUES in
-    // the gather's own output (its K running value-registers ARE the top-k
-    // scores), so the chain's gather emits nothing. ⛔ CHAIN MEMBERSHIP, NOT
-    // PROVENANCE ALONE: the fold fires only when the gather's ids come from a
-    // RouteTopK whose logits (its argsort producer's input) are THIS gather's
-    // source — a gather reading the same ids over a DIFFERENT source keeps its
-    // own program (the pair lands values only in its own chain's gather, and
-    // the top-k walk refuses a second gather by name).
-    if let SubOp::RouteGatherScores = &node.op
-        && producer_of(ir, node.inputs[1].tensor).is_some_and(|topk| {
-            matches!(topk.op, SubOp::RouteTopK { .. })
-                && producer_of(ir, topk.inputs[0].tensor).is_some_and(|sort| {
-                    matches!(sort.op, SubOp::RouteArgsort)
-                        && node.inputs[0].tensor == sort.inputs[0].tensor
-                })
-        })
-    {
-        return Ok(Vec::new());
     }
     lower_one(node, ir, rows_are_requests).map(|e| vec![e])
 }
@@ -1379,42 +1132,12 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
         SubOp::Elementwise(_) => 2,
         SubOp::ScalarMul { .. } => 1,
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => 3,
-        // ── THE 2a KINDS' OWN ARITIES, the registry's `arity_ok` rows stated here so
-        // the splice and the front end cannot disagree (the builder arm's check is
-        // identical). ⭐ EXPERT SORT/UNSORT CARRY A SECOND INPUT (the routing) THE
-        // KERNEL DOES NOT BIND — `mint` binds operand 0 only, because the routing
-        // rides in the GRAPH (the door's `split_out(.., 1)` count) exactly as the
-        // builder's program did; the arity here still demands the node STATE it.
-        SubOp::RouterNorm { .. }
-        | SubOp::RouterLogits { .. }
-        | SubOp::ScalarWeightMul
-        | SubOp::ExpertGatedAct { .. }
-        | SubOp::ExpertSort { .. }
-        | SubOp::ExpertUnsort
-        | SubOp::ExpertCombine { .. } => 2,
-        // ⭐ THE EXPERT MATMUL'S FOUR COMPUTE INPUTS: `[rows, pairs, w, s]` —
-        // the fp8 expert-bank form the wavefront wires (the branch's own
-        // `lower_expert_matmul_node` refuses anything else). `pairs` is
-        // stated but not BOUND: the mint resolves the sort's index input
-        // through it, the same graph-edge law the sort/unsort's routing
-        // follows.
-        SubOp::ExpertMatmul { .. } => 4,
-        SubOp::RouteSoftmax
-        | SubOp::RouteScale { .. }
-        | SubOp::RouteRenorm
-        | SubOp::TanhSoftCap { .. }
-        | SubOp::RmsNormUnit { .. }
-        | SubOp::Reshape { .. } => 1,
-        // ── THE 2b ROUTER-INDEX KINDS — the rank vector's own family: the
-        // argsort and the top-k take the scores/ranks in and write one
-        // index-shaped vector out; the gather takes the source AND the
-        // indices (two inputs the door's `split_out(.., 2)` counts and the
-        // kernel binds both); the expert-scale takes the scores, the indices
-        // AND the [1, E] scale row (three inputs, which the door counts
-        // positionally in its OWN mint order — see `bindings_for`). ──
-        SubOp::RouteArgsort | SubOp::RouteTopK { .. } => 1,
-        SubOp::RouteGatherScores => 2,
-        SubOp::RouteExpertScale { .. } => 3,
+        // ⭐ SCALAR-WEIGHT MUL IS ARITY-2 (`[act, weight]`, the builder's own
+        // binding). The MoE sub-ops have NO arity here any more: the registry
+        // refuses them before the splice — the MoE lowers only from
+        // `kernels/moe.py` through KTIR.
+        SubOp::ScalarWeightMul => 2,
+        SubOp::TanhSoftCap { .. } | SubOp::RmsNormUnit { .. } | SubOp::Reshape { .. } => 1,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
         _ => {
@@ -1433,7 +1156,7 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
     }
     let spec = kernel_spec(node, ir, file, entry)?;
     let m = compile_kernel(src, &spec, &grid(node, ir)?)?;
-    let k = mint(node, m, program, bindings_for(node, ir)?)?;
+    let k = mint(node, m, program, default_bindings(node))?;
     let name = format!("{}_s{}", program_stem(node, program), node.id.index());
     let mut e = EmittedOp::bare(name);
     e.ktir = Some(k);
@@ -2092,10 +1815,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
     match (&node.op, entry) {
-        // ⭐ ROUTERNORM SHARES THE RMSNORM ARM — the router's gain is the SCALE
-        // convention (the loader stores `router.scale` verbatim), so the node's
-        // constants are the rmsnorm family's own, weight from input 1.
-        (SubOp::RmsNorm { eps, .. } | SubOp::RouterNorm { eps, .. }, "rmsnorm_fwd") => {
+        (SubOp::RmsNorm { eps, .. }, "rmsnorm_fwd") => {
             // The fixture's own parameter spellings: desc_x, desc_w, desc_o, then the
             // constexprs M / D_MODEL / BLOCK_M / EPS / INV_D. Every constexpr is BOTH a
             // signature entry (`ArgSpec::Constexpr`) and a binding, exactly as the case
@@ -2347,63 +2067,6 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("C_START", Val::Int(i128::from(c_start)))?;
             ce("N_BLOCKS", Val::Int(i128::from(n_blocks)))?;
             ce("TAIL_H", Val::Int(i128::from(tail_h)))?;
-        }
-        // ⭐ ROUTESCALE SHARES THE SCALARMUL ARM — a scores-times-constant is the
-        // ScalarMul computation with the value read off the `RouteScale` payload, so
-        // it states the SAME facts (device width, storage window, the registry-bound
-        // SCALE) the logits scale states.
-        (SubOp::RouteScale { scale }, "scalarmul_fwd") => {
-            for p in ["desc_x", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            let (n_total, c_start) = window_of(node, ir)?;
-            // ⛔ THE ROUTER'S SCORES STATE THE LOGICAL WIDTH — WINDOW AND STORAGE
-            // BOTH. The scalarmul family's device-width law (the arm below) pads
-            // through `for_pointwise` on the strength of a PRECONDITION this
-            // node does not meet: that the producer is a matmul which emitted
-            // `for_matmul`-padded columns and the layout reserved exactly that
-            // footprint. The scores' producer is `RouteGatherScores` — a gather
-            // writing the logical `[m, k]` — and nobody reserved any pad, so the
-            // util floor's `for_pointwise(8) = 512` is a width that exists
-            // nowhere: MEASURED as the fused segment's refusal `view [m, 512]
-            // strides [512, 1] spans 2048 bytes but the tensor allocated at byte
-            // … holds only 32` (the [m, k] allocation) at every router geometry.
-            //
-            // The door needs no pad stated here: its `scalarmul_scaled` derives
-            // the device width from the REGION's own `c_len` and caps it at what
-            // the placement holds (`pointwise_width_the_output_holds`), so it
-            // emits the same descriptor whether the program states 8 or 512 —
-            // the cap does the door's work, and the program's views name the
-            // storage that actually exists. This is `routesoftmax`'s own law
-            // (its door "reads k off the output view's own v_cols — the LOGICAL
-            // count — and pads the device width itself").
-            //
-            // ⚠️ THE FRONT-END FLOOR PASSES AT THE MODEL'S k: a block whose last
-            // dim is under 16 bytes is refused by the Triton front end
-            // (`semantic.py`), and `k = 8` fp16 is exactly 16 — legal. A router
-            // with `k < 8` would state a sub-floor block and be refused by name
-            // there; `routesoftmax` carries the same exposure, and no such model
-            // exists in scope today.
-            let (block_m, n_blocks, tail_h) = blocks_of(m, c, 3);
-            ce("M", Val::Int(i128::from(m)))?;
-            ce("N", Val::Int(i128::from(c)))?;
-            ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
-            ce("BLOCK_N", Val::Int(i128::from(c)))?;
-            ce("N_TOTAL", Val::Int(i128::from(n_total)))?;
-            ce("C_START", Val::Int(i128::from(c_start)))?;
-            ce("N_BLOCKS", Val::Int(i128::from(n_blocks)))?;
-            ce("TAIL_H", Val::Int(i128::from(tail_h)))?;
-            // THE SCALE, from the node's own payload — the same registry-slot
-            // agreement the family's arm states below.
-            ce("SCALE", Val::Float(f64::from(*scale)))?;
         }
         (SubOp::ScalarMul { scale }, "scalarmul_fwd") => {
             for p in ["desc_x", "desc_o"] {
@@ -2677,498 +2340,6 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("C_OUT", Val::Int(i128::from(c_out)))?;
             ce("N_STICKS", Val::Int(i128::from(elems_in / u64::from(stk))))?;
         }
-        (SubOp::RouterLogits { experts, .. }, "matmul_fwd") => {
-            // The dense matmul arm's constants with the Linear's width read off the
-            // `experts` payload: A is [M, K] (K from A's own columns), W the router
-            // gate staged `[hidden, experts]` (the FUF `[k, n]` convention), N the
-            // expert count. ⛔ N IS THE LOGICAL COUNT, NOT THE DOOR'S DEVICE WIDTH:
-            // the door re-derives `n_dev = for_matmul(m, n, k)` off the REGION
-            // itself (`matmul_oriented`'s own law — "the SubtileIR/manifest LOGICAL
-            // shape stays n; ONLY the on-device layout uses n_dev"), so stating the
-            // padded width here changed NOTHING on the card but built a `[m, n_dev]`
-            // out view in the emulator that DISAGREED with every consumer's logical
-            // `[m, e]` view (argsort/gather read stride `e`, the matmul wrote stride
-            // `n_dev`) — MEASURED as the prefill router e2e's row-0-only-correct
-            // divergence at m=64, where `for_output`'s `macs ≥ 2^20` bump pads
-            // e=128 to 512 (at m=2 the MACs stay under the floor and the widths
-            // coincidentally agree, which is why whole/decode were green). The
-            // routesoftmax row below states the same law for the same reason.
-            let k = node.inputs[0].region.cols.len;
-            for p in ["desc_a", "desc_w", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            let (m_total, _a_total) = matmul_window_of(node, ir)?;
-            let n = experts.get();
-            ce("M", Val::Int(i128::from(m)))?;
-            ce("K", Val::Int(i128::from(k)))?;
-            ce("N", Val::Int(i128::from(n)))?;
-            ce("BLOCK_M", Val::Int(i128::from(m)))?;
-            ce("BLOCK_K", Val::Int(i128::from(k)))?;
-            ce("BLOCK_N", Val::Int(i128::from(n)))?;
-            ce("M_TOTAL", Val::Int(i128::from(m_total)))?;
-        }
-        (SubOp::RouteSoftmax, "routesoftmax_fwd") => {
-            // desc_x, desc_o, then M / N — the LOGICAL score width: the door pads
-            // the whole chain to the stick itself (`route_softmax`'s own sanitize
-            // law), so the program states what the node states and the door derives
-            // the padded width from it.
-            for p in ["desc_x", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            ce("M", Val::Int(i128::from(m)))?;
-            ce("N", Val::Int(i128::from(c)))?;
-        }
-        (SubOp::RouteRenorm, "routerenorm_fwd") => {
-            // desc_x, desc_o, then M / N — the LOGICAL width, the branch's own
-            // mirror (the door's `check_pointwise_cols` is the width law here, as
-            // it is for the builder's program).
-            for p in ["desc_x", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            ce("M", Val::Int(i128::from(m)))?;
-            ce("N", Val::Int(i128::from(c)))?;
-        }
-        (SubOp::ExpertGatedAct { act }, "gatedact_fwd") => {
-            // desc_gate, desc_up, desc_o, then M / N / BLOCK_M / BLOCK_N / ACT /
-            // N_BLOCKS / TAIL_H — eight live tiles (SILU_MUL_LIVE_TILES' own count:
-            // gate, up, the act's temporaries, the result), the same row-blocking
-            // law the silumul row states. `ACT` folds at codegen (`if` on a
-            // constexpr), so a program carries exactly one act's chain.
-            let act_code = match act {
-                GatedAct::Silu => 0,
-                GatedAct::Gelu => 1,
-                // ⛔ NOT REACHED THROUGH A ROW: `gated_act_row` refuses this act by
-                // name, so arriving here means the routing changed.
-                GatedAct::SwigluOai => {
-                    return Err(format!(
-                        "triton splice: gatedact t{} states the SwiGLU-OAI act — the registry \
-                         row refuses it (the ladder's compare/select extension is the \
-                         Phase-2b worklist); reaching this signature means the routing changed",
-                        node.output.tensor.index()
-                    ));
-                }
-            };
-            for p in ["desc_gate", "desc_up", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            let (block_m, n_blocks, tail_h) =
-                blocks_of(m, c, ktir_superdsc::superdsc_opspec::SILU_MUL_LIVE_TILES);
-            ce("M", Val::Int(i128::from(m)))?;
-            ce("N", Val::Int(i128::from(c)))?;
-            ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
-            ce("BLOCK_N", Val::Int(i128::from(c)))?;
-            ce("ACT", Val::Int(i128::from(act_code)))?;
-            ce("N_BLOCKS", Val::Int(i128::from(n_blocks)))?;
-            ce("TAIL_H", Val::Int(i128::from(tail_h)))?;
-        }
-        (SubOp::ExpertSort { k, .. }, "expertsort_fwd") => {
-            // desc_x, desc_o, then M / W / K — W the input's own width, K the
-            // payload's top-k, and the agreement law the door derives for itself
-            // (`full / w`): the output is `[m, k·w]`.
-            let w = node.inputs[0].region.cols.len;
-            let full = c;
-            let k = k.get();
-            if u64::from(full) != u64::from(w) * u64::from(k) {
-                return Err(format!(
-                    "triton splice: expertsort t{}: the output is [{m}, {full}] but the input \
-                     t{} is {w}-wide over k={k} — the pair-row layout is `[m, k·w]` over the \
-                     SAME `w` the projections contract",
-                    node.output.tensor.index(),
-                    node.inputs[0].tensor.index()
-                ));
-            }
-            for p in ["desc_x", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            ce("M", Val::Int(i128::from(m)))?;
-            ce("W", Val::Int(i128::from(w)))?;
-            ce("K", Val::Int(i128::from(k)))?;
-        }
-        (SubOp::ExpertUnsort, "expertunsort_fwd") => {
-            // desc_rows, desc_o, then M / COLS — the identity copy's own extents
-            // (the door's `pointwise_extents_agree` demands the input region and
-            // the output agree; the kernel states both at the same [M, COLS]).
-            for p in ["desc_rows", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            ce("M", Val::Int(i128::from(m)))?;
-            ce("COLS", Val::Int(i128::from(c)))?;
-        }
-        (SubOp::ExpertCombine { hidden, .. }, "expertcombine_fwd") => {
-            // desc_rows, desc_scores, desc_o, then M / W / K — W the `hidden`
-            // payload, K the scores' own width, and the agreement law the door
-            // derives by extent: the pair rows are `[m, k·w]`, the scores `[m, k]`,
-            // the output `[m, w]`.
-            let w = *hidden;
-            let k = node.inputs[1].region.cols.len;
-            let full = node.inputs[0].region.cols.len;
-            if u64::from(full) != u64::from(w) * u64::from(k) || c != w {
-                return Err(format!(
-                    "triton splice: expertcombine t{}: the output is [{m}, {c}] but the pair \
-                     rows t{} are {full}-wide over scores t{} of k={k} — the combine reads the \
-                     `[m, k·w]` layout the sort wrote (w = {w}), so these must agree",
-                    node.output.tensor.index(),
-                    node.inputs[0].tensor.index(),
-                    node.inputs[1].tensor.index()
-                ));
-            }
-            for p in ["desc_rows", "desc_scores", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            ce("M", Val::Int(i128::from(m)))?;
-            ce("W", Val::Int(i128::from(w)))?;
-            ce("K", Val::Int(i128::from(k)))?;
-        }
-        (SubOp::ExpertMatmul { k, .. }, "expertmatmul_fwd") => {
-            // desc_w, desc_s, desc_idx, desc_x, desc_o — the MINT ORDER (the
-            // row's own note): the door resolves each parameter by extent, so
-            // the kernel's parameter order IS the binding order and both state
-            // the bank pair first. The constants are the door's own extent
-            // laws read off the node's regions: `IN = rows.v_cols / K`,
-            // `N = out.v_cols / K`, `E = w.v_rows / N` — the door re-derives
-            // every one from the minted views, so a disagreement between this
-            // reading and the graph is the door's refusal, never a silent
-            // second reading. ⛔ THE STICK AND CHUNK LAWS STAY THE DOOR'S —
-            // the extent guards here are only the ones the constexpr
-            // derivations need to be integral; the 64-fp16/128-fp8 stick law
-            // and the sub-page chunk cut are card-side facts the door owns
-            // (the chunk-cut test pins its refusal by name).
-            let k = k.get();
-            let rows = &node.inputs[0];
-            let w = &node.inputs[2];
-            let rows_cols = rows.region.cols.len;
-            let w_rows = w.region.rows.len;
-            let w_cols = w.region.cols.len;
-            if k == 0 || !rows_cols.is_multiple_of(k) || !c.is_multiple_of(k) {
-                return Err(format!(
-                    "triton splice: expertmatmul t{}: the pair rows t{} are {rows_cols}-wide and \
-                     the output is {c}-wide over k={k} — both are `[m, k·w]` layouts, so k must \
-                     divide them",
-                    node.output.tensor.index(),
-                    rows.tensor.index()
-                ));
-            }
-            let inn = rows_cols / k;
-            let n = c / k;
-            if !w_rows.is_multiple_of(n) || w_cols != inn {
-                return Err(format!(
-                    "triton splice: expertmatmul t{}: the weight bank t{} is [{w_rows}, {w_cols}] \
-                     but the projection contracts {inn} columns at width {n} — the stacked bank is \
-                     `[E·N, IN]`, so N must divide its rows and its columns are the activation's \
-                     per-pair width",
-                    node.output.tensor.index(),
-                    w.tensor.index()
-                ));
-            }
-            signature.insert(
-                "desc_w".to_string(),
-                ArgSpec::parse("*fp8e4nv").map_err(|e| e.to_string())?,
-            );
-            for p in ["desc_s", "desc_idx", "desc_x", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            ce("M", Val::Int(i128::from(m)))?;
-            ce("K", Val::Int(i128::from(k)))?;
-            ce("E", Val::Int(i128::from(w_rows / n)))?;
-            ce("IN", Val::Int(i128::from(inn)))?;
-            ce("N", Val::Int(i128::from(n)))?;
-        }
-        (SubOp::RouteArgsort, "routeargsort_fwd") => {
-            // desc_x, desc_o — the node's own operand order, the plain `[input,
-            // output]` binding (no reorder: the door resolves its ONE input and its
-            // output positionally, and the parameters are minted in first-use order
-            // with `desc_x`'s view opening first). The constants are the door's own
-            // extent laws read off the node's regions: `M` the output's rows, `E`
-            // the output's cols — guarded SHAPE-PRESERVING against the scores' own
-            // `[M, E]` (the door's law: out is `[m, E]` like x; a disagreement is
-            // refused here rather than minting a view that lies about the input).
-            // ⛔ THE PAD-WIDTH LAW STAYS THE DOOR'S — `W = E.next_multiple_of(64)`
-            // and the pad-lane ranks the door writes are card-side facts this
-            // kernel's logical-`E` body does not state, exactly as the stick and
-            // chunk laws are the expertmatmul door's.
-            let scores = &node.inputs[0];
-            if scores.region.rows.len != m || scores.region.cols.len != c {
-                return Err(format!(
-                    "triton splice: routeargsort t{}: the scores t{} are [{}, {}] but the rank \
-                     vector is [{m}, {c}] — the argsort is shape-preserving (the door's own \
-                     law: out is `[m, E]` like x), so these must agree",
-                    node.output.tensor.index(),
-                    scores.tensor.index(),
-                    scores.region.rows.len,
-                    scores.region.cols.len,
-                ));
-            }
-            for p in ["desc_x", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            ce("M", Val::Int(i128::from(m)))?;
-            ce("E", Val::Int(i128::from(c)))?;
-        }
-        (SubOp::RouteTopK { k: topk }, "routetopk_fwd") => {
-            // desc_l, desc_v, desc_o — the FUSED PAIR's own order (the logits,
-            // the values output, the ids output), resolved by `bindings_for`'s
-            // RouteTopK walk: the argsort and the score gather are folded into
-            // this kernel, so `desc_l` is the rank vector's ARGSORT producer's
-            // input (the raw logits), `desc_v` is the GATHER consumer's output
-            // (this kernel lands the values — the old gather's whole job), and
-            // `desc_o` is the node's own `[m, k]` ids output. THREE pointer
-            // parameters where the node states ONE input: the fold re-points
-            // the top-k at the head of its own chain. The constants are the
-            // door's own extent laws: `M` the output's rows, `K` the output's
-            // cols, `E` the rank vector's cols (the argsort is
-            // shape-preserving, so the rank's E IS the logits' E — and the
-            // binding walk cross-checks the two regions) — guarded so the
-            // chain is row-preserving over a non-empty expert axis, the
-            // stated `k` IS the output's width (the node's own payload and
-            // its region must agree), and `k ≤ E` (the door's own law at
-            // `route_topk`: a wider top-k than the expert count reads pad
-            // lanes the logits never wrote). ⛔ THE PAD-WIDTH LAW STAYS THE
-            // DOOR'S — `W = E.next_multiple_of(64)` and the pad-lane
-            // sanitize the door's staging folds in are card-side facts this
-            // kernel's logical-`E` body does not state, exactly as the
-            // argsort row's.
-            let ranks = &node.inputs[0];
-            let k = topk.get();
-            if ranks.region.rows.len != m || ranks.region.cols.len == 0 {
-                return Err(format!(
-                    "triton splice: routetopk t{}: the rank vector t{} is [{}, {}] but the \
-                     top-k indices are [{m}, {k}] — the selection is row-preserving over a \
-                     non-empty expert axis, so the rows must agree",
-                    node.output.tensor.index(),
-                    ranks.tensor.index(),
-                    ranks.region.rows.len,
-                    ranks.region.cols.len,
-                ));
-            }
-            if c != k {
-                return Err(format!(
-                    "triton splice: routetopk t{}: the node states k = {k} but its output t{} \
-                     is [{m}, {c}] — the payload and the region must agree",
-                    node.output.tensor.index(),
-                    node.output.tensor.index(),
-                ));
-            }
-            let e = ranks.region.cols.len;
-            if k > e {
-                return Err(format!(
-                    "triton splice: routetopk t{}: k = {k} over E = {e} — the door's own law: \
-                     a top-k wider than the expert count reads pad lanes the logits \
-                     never wrote",
-                    node.output.tensor.index(),
-                ));
-            }
-            for p in ["desc_l", "desc_v", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            ce("M", Val::Int(i128::from(m)))?;
-            ce("E", Val::Int(i128::from(e)))?;
-            ce("K", Val::Int(i128::from(k)))?;
-        }
-        (SubOp::RouteGatherScores, "routegather_fwd") => {
-            // desc_x, desc_i, desc_o — the node's own operand order (the
-            // source, the indices, the output), the plain binding. The
-            // constants are the door's own extent laws read off the node's
-            // regions: `M` the output's rows, `K` the output's cols, `E` the
-            // source's cols — guarded so the indices' `[m, k]` matches the
-            // output's and every view shares one row count (the door's
-            // `split_out(.., 2)` resolves these same two inputs by extent:
-            // the source carries E, the indices carry k).
-            // ⛔ THE PAD-WIDTH LAW STAYS THE DOOR'S — `W =
-            // E.next_multiple_of(64)` and the pad-lane inertness the door's
-            // one-hot chain states are card-side facts this kernel's
-            // logical-`E` body does not state, exactly as the argsort row's.
-            let src = &node.inputs[0];
-            let idx = &node.inputs[1];
-            let e = src.region.cols.len;
-            for (view, role) in [(src, "the source"), (idx, "the indices")] {
-                if view.region.rows.len != m {
-                    return Err(format!(
-                        "triton splice: routegather t{}: {role} t{} is [{}, {}] but the \
-                         gathered output is [{m}, {c}] — the gather is row-preserving, so \
-                         every view must share one row count",
-                        node.output.tensor.index(),
-                        view.tensor.index(),
-                        view.region.rows.len,
-                        view.region.cols.len,
-                    ));
-                }
-            }
-            if idx.region.cols.len != c || e == 0 || c == 0 {
-                return Err(format!(
-                    "triton splice: routegather t{}: the source t{} is [{m}, {e}] and the \
-                     indices t{} [{}, {}] but the output is [{m}, {c}] — the indices' width \
-                     is the output's, and both widths must be positive",
-                    node.output.tensor.index(),
-                    src.tensor.index(),
-                    idx.tensor.index(),
-                    idx.region.rows.len,
-                    idx.region.cols.len,
-                ));
-            }
-            for p in ["desc_x", "desc_i", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            ce("M", Val::Int(i128::from(m)))?;
-            ce("E", Val::Int(i128::from(e)))?;
-            ce("K", Val::Int(i128::from(c)))?;
-        }
-        (SubOp::RouteExpertScale { .. }, "routeexpertscale_fwd") => {
-            // desc_p, desc_i, desc_s, desc_o — ⛔ THE DOOR'S MINT ORDER, NOT the
-            // node's operand order `[scores, idx, scale]`: the door reads its
-            // parameters positionally with `tensors[0]` THE SCALE ROW (the
-            // recorded m=8 mis-read law — the old door bound the scores there
-            // and every descriptor computed the wrong function), so the scale
-            // descriptor is parameter 0 and `bindings_for` reorders the node's
-            // inputs to feed it. The constants are the door's own extent laws
-            // read off the node's regions: `M` the output's rows, `K` the
-            // output's cols, `E` the scale row's cols — guarded so the scores'
-            // and indices' `[m, k]` match the output's (the select is
-            // row-preserving over one slot width) and the scale row is ONE row
-            // (the kernel loads `[0, h]` of a `[1, E]` view; a multi-row scale
-            // is a different function the kernel would silently truncate).
-            // ⛔ THE PAD-WIDTH LAW STAYS THE DOOR'S — `W =
-            // E.next_multiple_of(64)` and the pad-lane inertness the door's
-            // one-hot chain states are card-side facts this kernel's
-            // logical-`E` body does not state, exactly as the argsort row's.
-            let scores = &node.inputs[0];
-            let idx = &node.inputs[1];
-            let scale = &node.inputs[2];
-            for (view, role) in [(scores, "the scores"), (idx, "the indices")] {
-                if view.region.rows.len != m || view.region.cols.len != c {
-                    return Err(format!(
-                        "triton splice: routeexpertscale t{}: {role} t{} is [{}, {}] but the \
-                         scaled scores are [{m}, {c}] — the select is row-preserving over one \
-                         slot width, so these must agree",
-                        node.output.tensor.index(),
-                        view.tensor.index(),
-                        view.region.rows.len,
-                        view.region.cols.len,
-                    ));
-                }
-            }
-            if scale.region.rows.len != 1 {
-                return Err(format!(
-                    "triton splice: routeexpertscale t{}: the scale row t{} is [{}, {}] — the \
-                     per-expert scale is ONE row of E lanes (the door's own `[1, W]` gather \
-                     parent), and a multi-row scale is a different function",
-                    node.output.tensor.index(),
-                    scale.tensor.index(),
-                    scale.region.rows.len,
-                    scale.region.cols.len,
-                ));
-            }
-            let e = scale.region.cols.len;
-            if e == 0 || c == 0 {
-                return Err(format!(
-                    "triton splice: routeexpertscale t{}: the scale row t{} is [1, {e}] and the \
-                     scaled scores are [{m}, {c}] — the widths must be positive",
-                    node.output.tensor.index(),
-                    scale.tensor.index(),
-                ));
-            }
-            for p in ["desc_p", "desc_i", "desc_s", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            ce("M", Val::Int(i128::from(m)))?;
-            ce("E", Val::Int(i128::from(e)))?;
-            ce("K", Val::Int(i128::from(c)))?;
-        }
         (op, entry) => {
             return Err(format!(
                 "triton splice: no kernel signature for {op:?} at entry `{entry}` — the row is \
@@ -3314,31 +2485,13 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
         // kernel, unrolled by the ladder (`to_ktir::unroll_constant_trip_loops`), so the
         // spliced program is straight-line like the builder's — no grid axis at all.
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => Ok(vec![1]),
-        // ── THE 2a KINDS — every one a `(1, 1)` launch like the pointwise family:
-        // the head/slot/stick loops are constant-trip `tl.range`s the ladder
-        // unrolls, and the row blocks are in-kernel tiles. ──
-        SubOp::RouterNorm { .. }
-        | SubOp::RouterLogits { .. }
-        | SubOp::RouteSoftmax
-        | SubOp::RouteScale { .. }
-        | SubOp::RouteRenorm
-        | SubOp::ExpertGatedAct { .. }
-        | SubOp::ExpertSort { .. }
-        | SubOp::ExpertUnsort
-        | SubOp::ExpertCombine { .. }
-        | SubOp::ExpertMatmul { .. }
-        | SubOp::TanhSoftCap { .. }
+        // The same one-work-item law: the row blocks are in-kernel tiles. The MoE
+        // sub-ops have no grid row any more — the registry refuses them before the
+        // splice (the MoE lowers only from `kernels/moe.py` through KTIR).
+        SubOp::TanhSoftCap { .. }
         | SubOp::RmsNormUnit { .. }
         | SubOp::ScalarWeightMul
         | SubOp::Reshape { .. } => Ok(vec![1]),
-        // ── THE 2b ROUTER-INDEX KINDS — the same one-work-item law: the per-expert
-        // and per-slot loops are constant-trip `tl.static_range`s the trace unrolls
-        // (the inner bound is the outer's own induction variable), so the program is
-        // straight-line. ──
-        SubOp::RouteArgsort
-        | SubOp::RouteTopK { .. }
-        | SubOp::RouteGatherScores
-        | SubOp::RouteExpertScale { .. } => Ok(vec![1]),
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without a grid here is
         // an unreachable — the same discipline the arity match holds.
         _ => Err("triton splice: no grid for this op kind — the row is incomplete".to_string()),
@@ -3508,10 +2661,7 @@ fn compile_kernel_uncached(
 
 /// ⛔ THE DEFAULT BINDING LAW — the node's operand prefix, the output LAST. Rope binds
 /// three (a `RopeAppend`'s V and KV-cache destinations flow through GRAPH edges, so the
-/// kernel consumes x, cos, sin only); the sort and unsort bind their DATA operand only
-/// (the routing rides in the graph exactly as the rope's cache destinations do, because
-/// every projection reads it through this node's output routing; the door's
-/// `split_out(.., 1)` count states the same law at the descriptor half).
+/// kernel consumes x, cos, sin only).
 fn default_bindings<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
 ) -> Vec<BufferId> {
@@ -3519,7 +2669,6 @@ fn default_bindings<F: scratchy_subtile::subtile_ir::RopeForm>(
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
     let n_bound = match &node.op {
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => 3,
-        SubOp::ExpertSort { .. } | SubOp::ExpertUnsort => 1,
         _ => node.inputs.len(),
     };
     let mut bindings: Vec<BufferId> = node.inputs.iter().take(n_bound).map(&t).collect();
@@ -3527,219 +2676,9 @@ fn default_bindings<F: scratchy_subtile::subtile_ir::RopeForm>(
     bindings
 }
 
-/// ⛔ THE BINDINGS A MINTED PROGRAM TAKES — one `BufferId` per kernel parameter, the
-/// tape's tensor indices with the output LAST — the exact law `KtirFunc::finish_shaped`
-/// states. `regions()` reads `bindings[i]` for `arguments[i]`, so the kernel's parameter
-/// order must be the binding order (the registry row's contract, checked at the
-/// signature above). Every kind but one follows [`default_bindings`].
-///
-/// ⭐⭐ EXPERTMATMUL IS THE ONE REORDER — and the resolution is the branch's own
-/// builder walk, verbatim. `KtirFunc::expert_matmul` mints `w` and `s` FIRST (their
-/// `arg_for`s open the bank views), then `idx`, then `rows`, so the parameters
-/// arrive as `[w, s, idx, rows]` and NO position names a node operand. And `idx` is
-/// not the node's own `inputs[1]` at all: that input is the SORT's output (the pair
-/// routing), wired so this walk can follow it one producer up and bind the sort's
-/// OTHER input — the `[m, k]` expert-id tensor — the exact walk
-/// `lower_expert_matmul_node` performed, refusal text included. A pairs tensor with
-/// no two-input `ExpertSort` producer is refused BY NAME: a projection without its
-/// indices would read slab 0 for every pair.
-fn bindings_for<F: scratchy_subtile::subtile_ir::RopeForm>(
-    node: &SubtileNode<F>,
-    ir: &SubtileIR<F>,
-) -> Result<Vec<BufferId>, String> {
-    let t =
-        |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
-    if let SubOp::ExpertMatmul { .. } = &node.op {
-        let pairs = &node.inputs[1];
-        // ⛔⭐ P1's GRAPH HALF — the ids' PROVENANCE, the addressing lockdown's own
-        // door-side twin (the BANK-side half is `expert_matmul`'s k ≤ e_count
-        // refusal in the ktir-superdsc door). The sort's index input must be the
-        // router's `RouteTopK` output with k ≤ the sort's expert count:
-        // `RouteTopK` is the ONLY mint of in-range ids (the argsort's +inf pad
-        // lanes sort last, so the top-k never selects one), while a source
-        // tensor or any other producer can hold an out-of-range id — and the
-        // weight gather would read past the bank and fault the card's FETCH.
-        // Refused HERE, at the last place the producer chain is visible before
-        // a program is minted; the five acceptance tapes that hand-fed an idx
-        // source are migrated to a constructed RouteTopK (their rank vectors
-        // invert to the same idx), so the refusal and the honest tapes landed
-        // together.
-        let idx = match producer_of(ir, pairs.tensor) {
-            Some(sort) if matches!(sort.op, SubOp::ExpertSort { .. }) && sort.inputs.len() == 2 => {
-                let SubOp::ExpertSort { experts, .. } = &sort.op else {
-                    unreachable!("the arm above matched ExpertSort")
-                };
-                match producer_of(ir, sort.inputs[1].tensor) {
-                    Some(topk) => match &topk.op {
-                        SubOp::RouteTopK { k } if k.get() <= experts.get() => &sort.inputs[1],
-                        SubOp::RouteTopK { k } => {
-                            return Err(format!(
-                                "triton splice: ExpertMatmul t{} routes its pairs through a \
-                                 top-k of {} over {} experts — the top-k would have to include \
-                                 the argsort's +inf pad lanes, and a pad lane's id runs past the \
-                                 bank and faults the card's FETCH. The routing is only in range \
-                                 while k <= the expert count",
-                                node.output.tensor.index() as u32,
-                                k.get(),
-                                experts.get()
-                            ));
-                        }
-                        _ => {
-                            return Err(format!(
-                                "triton splice: ExpertMatmul t{} reads its expert ids from t{} \
-                                 whose producer is not the router's RouteTopK — RouteTopK is the \
-                                 only mint of in-range ids (the argsort's +inf pad lanes sort \
-                                 last), so anything else can put an out-of-range id in the gather \
-                                 and fault the card's FETCH",
-                                node.output.tensor.index() as u32,
-                                sort.inputs[1].tensor.index() as u32
-                            ));
-                        }
-                    },
-                    None => {
-                        return Err(format!(
-                            "triton splice: ExpertMatmul t{} reads its expert ids from t{} which \
-                             no node produces — a source tensor is not the router's RouteTopK, \
-                             the only mint of in-range ids, so the gather would read whatever it \
-                             holds past the bank",
-                            node.output.tensor.index() as u32,
-                            sort.inputs[1].tensor.index() as u32
-                        ));
-                    }
-                }
-            }
-            _ => {
-                return Err(format!(
-                    "triton splice: ExpertMatmul t{} reads its routing from t{} whose producer \
-                     is not a two-input ExpertSort — the expert indices cannot be bound, and a \
-                     projection without them would read slab 0 for every pair",
-                    node.output.tensor.index() as u32,
-                    pairs.tensor.index() as u32
-                ));
-            }
-        };
-        return Ok(vec![
-            t(&node.inputs[2]),
-            t(&node.inputs[3]),
-            t(idx),
-            t(&node.inputs[0]),
-            t(&node.output),
-        ]);
-    }
-    // ⭐⭐ ROUTEEXPERTSCALE IS THE SECOND REORDER — and the ONLY one that is a
-    // pure permutation of the node's own operands (no producer walk): the door
-    // reads its parameters positionally as `[scale, idx, scores, out]` with
-    // `tensors[0]` THE SCALE ROW, while the node's inputs are `[scores, idx,
-    // scale]` (the chain fixture's and the door test's own order). The kernel
-    // declares `desc_p` first to match (`routeexpertscale.py`'s header states
-    // the law), so the bindings permute `[0, 1, 2]` → `[2, 1, 0]`. ⛔ THE
-    // MIS-ORDER IS NOT A BENIGN SWAP: the door's own ⛔ note records the old
-    // door binding the scores into `tensors[0]` — the col_at lane read then
-    // materialized `m` rows out of the ONE-ROW scale tensor, passing at m ≤ 4
-    // only because the mis-read fit the bumped footprint, until the placement
-    // guard refused at m=8 — and every descriptor the m=1 bake shipped
-    // computed the WRONG function (the score rode the scale row's lanes).
-    if let SubOp::RouteExpertScale { .. } = &node.op {
-        return Ok(vec![
-            t(&node.inputs[2]),
-            t(&node.inputs[1]),
-            t(&node.inputs[0]),
-            t(&node.output),
-        ]);
-    }
-    // ⭐⭐ ROUTETOPK IS THE THIRD REORDER — the FOLD'S OWN WALK, re-pointing the
-    // top-k at the head of its chain. The argsort and the score gather are folded
-    // into the top-k's kernel (`lower_all`'s two router folds), so no position
-    // names a node operand: `desc_l` is the rank vector's producer's input — walk
-    // `inputs[0]` (the ranks) up to its `RouteArgsort`, then take the argsort's
-    // OWN input, the raw logits — `desc_v` is the GATHER consumer's output (the
-    // fused kernel lands the values, the old gather's whole job, so the values
-    // region is the gather's), and `desc_o` is the node's own ids output, LAST
-    // per the tape's own law. ⛔ EVERY STEP IS REFUSED BY NAME, NOT FALLEN BACK:
-    // the old per-row-scalar top-k path is replaced wholesale (wall-11 — its
-    // ids could alias at ties and sum expert ids past the bank, faulting the
-    // card's FETCH), so a chain this walk cannot resolve is a naming error, not
-    // a shape to lower some other way.
-    if let SubOp::RouteTopK { k } = &node.op {
-        let ranks = &node.inputs[0];
-        let k = k.get();
-        let m = node.output.region.rows.len;
-        let sort = match producer_of(ir, ranks.tensor) {
-            Some(sort) if matches!(sort.op, SubOp::RouteArgsort) => sort,
-            _ => {
-                return Err(format!(
-                    "triton splice: routetopk t{} reads its ranks from t{} whose producer is \
-                     not a RouteArgsort — the fused top-k reads the RAW LOGITS (the argsort's \
-                     own input, one producer up), so the chain must state the argsort to name \
-                     them",
-                    node.output.tensor.index() as u32,
-                    ranks.tensor.index() as u32
-                ));
-            }
-        };
-        let lg = &sort.inputs[0];
-        if lg.region.rows.len != m
-            || lg.region.cols.len != ranks.region.cols.len
-            || lg.region.cols.len == 0
-        {
-            return Err(format!(
-                "triton splice: routetopk t{}'s logits t{} are [{}, {}] but its ranks t{} are \
-                 [{m}, {}] — the argsort is shape-preserving over the rows (the fused pair \
-                 selects per token), so the chain must agree",
-                node.output.tensor.index() as u32,
-                lg.tensor.index() as u32,
-                lg.region.rows.len,
-                lg.region.cols.len,
-                ranks.tensor.index() as u32,
-                ranks.region.cols.len,
-            ));
-        }
-        // The gather: the chain's own consumer, reading the SAME logits the pair
-        // selects over (`g.inputs[0] == lg`) with this node's ids (`g.inputs[1]`)
-        // — its output is the values landing.
-        let gathers = consumers_of(ir, node.output.tensor)
-            .into_iter()
-            .filter(|g| matches!(g.op, SubOp::RouteGatherScores))
-            .collect::<Vec<_>>();
-        let [g] = gathers.as_slice() else {
-            return Err(format!(
-                "triton splice: routetopk t{} has {} RouteGatherScores consumers — the fused \
-                 top-k lands the pair's VALUES in the gather's output (desc_v), so the chain \
-                 must state exactly one",
-                node.output.tensor.index() as u32,
-                gathers.len()
-            ));
-        };
-        if g.inputs[1].tensor != node.output.tensor || g.inputs[0].tensor != lg.tensor {
-            return Err(format!(
-                "triton splice: routetopk t{}'s gather t{} reads t{} and t{} — it must read \
-                 this node's ids and the SAME logits t{} the pair selects over (the chain's \
-                 own law: the values are the logits gathered at the ids)",
-                node.output.tensor.index() as u32,
-                g.output.tensor.index() as u32,
-                g.inputs[0].tensor.index() as u32,
-                g.inputs[1].tensor.index() as u32,
-                lg.tensor.index() as u32
-            ));
-        }
-        if g.output.region.rows.len != m || g.output.region.cols.len != k {
-            return Err(format!(
-                "triton splice: routetopk t{}'s values t{} are [{}, {}] but the ids are \
-                 [{m}, {k}] — the pair lands one value per id, so the regions must agree",
-                node.output.tensor.index() as u32,
-                g.output.tensor.index() as u32,
-                g.output.region.rows.len,
-                g.output.region.cols.len,
-            ));
-        }
-        return Ok(vec![t(lg), t(&g.output), t(&node.output)]);
-    }
-    Ok(default_bindings(node))
-}
-
 /// Mint the [`KtirNode`]: the adapter's `node_for` compilation, then RE-STATE the fields
 /// the tape owns — the name (the builder's naming law), the bindings (resolved by
-/// [`bindings_for`]: the tape's tensor indices, the output LAST), `mask` (none for
+/// [`default_bindings`]: the tape's tensor indices, the output LAST), `mask` (none for
 /// rmsnorm), and `node_out_tid` (None — the program writes its own node's output).
 ///
 /// ⛔ THE RE-STATE IS THE WHOLE POINT. `node_for` mints positional `BufferId`s
@@ -3804,15 +2743,8 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         };
     }
     // ⭐ THE 2a KINDS THAT SHARE ANOTHER FAMILY'S PROGRAM but keep their OWN builder
-    // names (main's naming law: `routernorm_s{id}`, `routerlogits_s{id}`) — read off
-    // the NODE, like the elementwise stems above, because the program match below
-    // would answer the shared family's name.
-    if let SubOp::RouterNorm { .. } = &node.op {
-        return "routernorm";
-    }
-    if let SubOp::RouterLogits { .. } = &node.op {
-        return "routerlogits";
-    }
+    // names — read off the NODE, like the elementwise stems above, because the
+    // program match below would answer the shared family's name.
     match program {
         Program::RmsNorm => "rmsnorm",
         Program::SiluMul => "silumul",
@@ -3826,17 +2758,6 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::TanhSoftCap => "tanhsoftcap",
         Program::ScalarWeightMul => "scalarwmul",
         Program::Reshape => "reshape",
-        Program::RouteSoftmax => "routesoftmax",
-        Program::RouteRenorm => "routerenorm",
-        Program::RouteArgsort => "routeargsort",
-        Program::RouteTopK => "routetopk",
-        Program::RouteGatherScores => "routegather",
-        Program::RouteExpertScale => "routeexpertscale",
-        Program::ExpertGatedAct(_) => "gatedact",
-        Program::ExpertSort => "expertsort",
-        Program::ExpertUnsort => "expertunsort",
-        Program::ExpertCombine => "expertcombine",
-        Program::ExpertMatmul => "expertmatmul",
         _ => "triton",
     }
 }

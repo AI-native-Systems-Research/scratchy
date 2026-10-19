@@ -264,106 +264,11 @@ pub const FP8_PACKED_KERNEL_OUT_GRAN: u32 = 64;
 /// The packed kernel's K (in) axis granularity — 2-packed fp8 per fp16-width slot.
 pub const FP8_PACKED_KERNEL_IN_GRAN: u32 = 2;
 
-/// ⭐⭐⭐⭐⭐ THE N-STICK CHUNKS ONE EXPERT SLAB IS CUT INTO — the LX-fit unit of the MoE weight
-/// gather, stated ONCE for both of its readers so the door and the staging manifest cannot
-/// disagree.
-///
-/// ## The wall this answers
-/// A gather entry stages its WHOLE page into per-core LX (`pointwise_lx_resident`:
-/// `n_operands · per_core_mb · out_per_time`), and the copy's work division splits `mb` by whole
-/// ENTRIES only (`gather_copy_cores`), so the only lever on the residency is the ENTRY'S OWN
-/// SIZE. One whole 26b gate/up slab is `704·2816 = 1,982,464` fp8 — one entry per core is
-/// `2·slab ≈ 3.96 MB` against the `1,677,721`-B budget, and `time_tile_for_lx` cannot help
-/// (`out` is already ONE stick, the RowBlocked-scatter law). The packed slab's retile is
-/// `[N/64, K/2, 64, 2]`, so a whole number of 64-column N-stick groups is ONE CONTIGUOUS device
-/// range (the bank-contiguity law `stage_weight.rs` pins, `the_expert_banks_packed_slabs_are_
-/// device_contiguous`) and a legal standalone `[chunk_n, in]` kernel — the chunk is the unit
-/// the cut can name with no relayout and no on-device index remap.
-///
-/// ## The law, in one sentence
-/// The bank is staged CHUNK-MAJOR: expert `e`'s chunk `χ` sits at `(χ·E + e)·chunk_elems`, so
-/// the gather's RAW expert-id index (`skip_addr = chunk_elems`) and per-chunk source base
-/// (`χ·E·chunk_elems`) compose to that address exactly — the index is the router's own
-/// converted output, UNTOUCHED, and the chunk is a compile-time baked base. `chunks == 1`
-/// (every slab that fits LX whole — all of tiny26, granite and every earlier model) is the
-/// expert-major stack itself: byte-identical bank, byte-identical descriptor.
-///
-/// ## The contract (same shape as [`fp8_k_pad`]'s)
-/// the expert door's gather loop and the manifest's expert-bank RetileDescriptor BOTH take
-/// their chunk count from this one function — the staged bank's byte order and the offsets the
-/// gather addresses cannot drift. The scratch reservation and the per-(pair, chunk) matmul
-/// windows follow the same `[CHUNKS][pairs][chunk]` order this function's chunk count states.
-///
-/// `n_groups` = `n / 64` (the retile's `N/64` axis count); `entries` = the live pairs the
-/// gather serves per run; `e_count` = the bank's expert count (the chunk-major stride's `E`,
-/// carried for the law's statement and the door's source base — not for the cut itself).
-pub fn expert_slab_chunks(
-    // Whole 64-column N-stick groups in one expert's slab.
-    n_groups: u32,
-    // The one-stick sub-rows of ONE 64-column group: `in / 2` (the retile's `K/2` axis at one
-    // n-stick) — the K-half of the packed chunk, in `out`-stick rows.
-    group_sub_rows: u32,
-    // Live gather entries per run (≤ 32, the index stick).
-    entries: u32,
-    // The bank's expert count.
-    e_count: u32,
-) -> u32 {
-    let _ = e_count;
-    // The per-core entry count the copy's own work division lands on (`gather_copy_cores`
-    // splits by whole entries via `core_split`).
-    let split = core_split(entries, crate::superdsc_opspec::MAX_CORES).max(1);
-    let per_core = entries / split;
-    // DESCENDING whole-group divisors: the LARGEST chunk that fits per-core LX, i.e. the
-    // FEWEST chunks (each chunk is a per-chunk gather op per index stick and a per-(pair,
-    // chunk) matmul — the descriptor count is the cost, and the residency only has to fit,
-    // not be minimized). `2` value operands (source + destination), `128`-elem fp8 sticks —
-    // the product `pointwise_lx_resident` states, evaluated at the division the copy takes.
-    // `n_groups` itself (no cut) is the default answer, so a slab that fits whole — every
-    // model before the 26b — is one chunk: the expert-major bank, byte-identical.
-    for g in (1..=n_groups).rev() {
-        if !n_groups.is_multiple_of(g) {
-            continue;
-        }
-        let chunk_pw = g * group_sub_rows;
-        if 2 * per_core as u64 * chunk_pw as u64 * 128 <= crate::superdsc_opspec::USABLE_LX_BYTES {
-            return g;
-        }
-    }
-    // Even a single 64-column group does not fit — unreachable at every real geometry (one
-    // group of in=2816 is 1408 sub-rows ≈ 360 KB × 2 operands; the budget is 1.68 MB), but a
-    // 1-group return keeps the type total where the caller's own guards then refuse loudly.
-    1
-}
-
-/// ⭐⭐ SUB-PAGE CUT for the expert slab gather — the VENDOR-SCHEDULER half of [`expert_slab_chunks`]'s
-/// contract. `expert_slab_chunks` sizes a chunk against the FRONTEND planning budget
-/// ([`crate::superdsc_opspec::USABLE_LX_BYTES`], 0.8 × 2 MiB); the vendor's own `allocAllMem`
-/// (L3DlOpsScheduler.cpp:6455) then charges the scheduled op **4 × one page** (2 buffers × value
-/// capacity + 2 × output capacity, at the one-page minimum chunk candidate) against the
-/// post-`reserveFrontendLx` free pool ([`crate::superdsc_opspec::VENDOR_LX_SCHED_BYTES`] = 406,323 B)
-/// — a budget `2 · per_core · chunk_pw · 128` never consults. When a whole page exceeds it, the
-/// gather must cut the PAGE itself, not the chunk: sub-page the value page `S` ways so one gather
-/// entry moves `page_w / S` sticks.
-///
-/// `S == 1` (every page ≤ 793 sticks — all of tiny26, granite and every earlier model) is the
-/// uncut page: byte-identical descriptor, byte-identical bank. The cut value is
-/// [`crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP`] — ONE u32 index stick — because the fine
-/// index the cut needs is minted by GATHERING a `[E, 32]` const bank one stick at a time, and a
-/// gather copies whole sticks (see the door's `emwg` loop for the composition).
-///
-/// Divisibility (`32 | page_w`) is INHERITED, not checked here: `page_w = chunk_groups · inn_pad/2`
-/// and [`fp8_k_pad`]'s law pins `inn_pad ≡ 0 (mod 128)`, so `64 | page_w`. The door refuses loudly
-/// if a future geometry ever breaks that proof.
-pub fn expert_slab_subpages(
-    // One chunk page's fp8 out-stick rows — `chunk_elems / 128`, the `mb`-axis extent ONE index
-    // entry of the uncut gather moves.
-    page_w: u32,
-) -> u32 {
-    if 4 * page_w as u64 * 128 <= crate::superdsc_opspec::VENDOR_LX_SCHED_BYTES {
-        return 1;
-    }
-    crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP
-}
+// ⛔ THE EXPERT SLAB CUT IS GONE — `expert_slab_chunks`/`expert_slab_subpages` (the LX-fit
+// chunk and sub-page sizing of the MoE weight gather) existed only for the hand-written
+// per-op MoE card lowering, which is deleted: the MoE lowers only from `kernels/moe.py`
+// through KTIR. The chunk-major bank law they stated lives on where the token-plane
+// descriptor states it (`superdsc_opspec`'s token-plane form doc).
 
 /// ⭐ THE UTIL-FLOOR CORE COUNT — the minimum cores a FLOP-heavy matmul (`macs ≥ 2^20`) may be
 /// split onto. One constant for every reader: `DeviceWidth::for_matmul`'s windowed drop test,

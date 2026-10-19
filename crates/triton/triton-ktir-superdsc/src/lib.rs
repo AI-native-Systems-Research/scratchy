@@ -237,26 +237,12 @@ fn emit_regions(
         // row on this ladder: the splice's registry produces none of them (its by-name refusals
         // stop their SubOps at the producer), so a node carrying one here is a ROUTING CHANGE, not
         // a missing arm — the day the splice learns to produce one, its arm moves out of this
-        // group and takes a real entry point with it. (The gemma-4 campaign's vocabulary: the MoE
-        // router and expert programs, TanhSoftCap, RmsNormUnit, ScalarWeightMul, Reshape,
-        // WindowedRmsNorm. ⛔ And the old ladder's argsort/topk doors stand CONVICTED at prefill
-        // m>1 — duplicate ranks per row — so the router rows that eventually land here are new
-        // work, not a port of that emission.)
+        // group and takes a real entry point with it. (The MoE programs are no longer variants at
+        // all — the MoE lowers only from `kernels/moe.py` through KTIR.)
         Program::RmsNormUnit
         | Program::TanhSoftCap
         | Program::ScalarWeightMul
         | Program::Reshape
-        | Program::RouteSoftmax
-        | Program::RouteRenorm
-        | Program::RouteArgsort
-        | Program::RouteTopK
-        | Program::RouteGatherScores
-        | Program::RouteExpertScale
-        | Program::ExpertGatedAct(_)
-        | Program::ExpertSort
-        | Program::ExpertUnsort
-        | Program::ExpertCombine
-        | Program::ExpertMatmul
         | Program::WindowedRmsNorm { .. } => {
             return Err(Error {
                 stage: "program",

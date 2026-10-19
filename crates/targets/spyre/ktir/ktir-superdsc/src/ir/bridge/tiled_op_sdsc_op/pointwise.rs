@@ -472,8 +472,7 @@ fn pointwise_opspec_from_tile_split(
 }
 
 /// TileIR → SdscOp for the [`EwOperand`]-broadcast pointwise family: takes an ALREADY-LOWERED
-/// `TileOp` (from `pointwise_broadcast_opspec_df` in the live emitter, or directly from a live
-/// per-node lowering via `node_to_single_tile_op`) and runs the tiler + TensorArg assembly.
+/// `TileOp` (from `pointwise_broadcast_opspec_df` in the live emitter) and runs the tiler + TensorArg assembly.
 /// `rows`/`cols` stay EXPLICIT parameters (not re-derived from `tile_op.dims`) because this
 /// builder's `stickmajor`/block-alignment logic needs the untouched `rows·cols` product, not the
 /// stick-rounded `out` extent `TileOp` carries.
@@ -643,8 +642,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
 }
 
 /// `assemble_pointwise_broadcast_off` TAKING AN ALREADY-LOWERED `TileOp` — the TileIR→SdscOp entry
-/// point for a live per-node caller that built its `TileOp` via `node_to_single_tile_op` (straight
-/// off the `SubtileNode`) instead of re-deriving `rows`/`cols` first. `rows`/`cols` stay explicit
+/// point for a caller that already built its `TileOp` instead of re-deriving `rows`/`cols` first. `rows`/`cols` stay explicit
 /// params (needed for the SFP-transcendental guard and the stickmajor block-alignment calc — see
 /// [`pointwise_broadcast_opspec_from_tile`]'s doc for why they are not re-derived from
 /// `tile_op.dims`).
@@ -701,10 +699,8 @@ pub fn assemble_pointwise_broadcast_off_from_tile<O: KindTag>(
 }
 
 /// `assemble_pointwise_seeded` TAKING AN ALREADY-LOWERED `TileOp` instead of raw `rows`/`cols` — the
-/// real TileIR→SdscOp entry point for the live per-node path: a caller that already built its
-/// `TileOp` via `subtile_tape_to_tile_ir::node_to_single_tile_op` (straight off the
-/// `SubtileNode`, no re-derivation of shape) hands it here instead of unpacking it back into
-/// `rows`/`cols` first.
+/// TileIR→SdscOp entry point for a caller that already built its `TileOp` (no re-derivation of
+/// shape) hands it here instead of unpacking it back into `rows`/`cols` first.
 pub fn assemble_pointwise_seeded_from_tile(
     op_name: &str,
     tile_op: &TileOp,

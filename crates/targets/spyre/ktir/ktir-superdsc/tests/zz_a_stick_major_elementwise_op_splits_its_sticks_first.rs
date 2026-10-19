@@ -217,7 +217,7 @@ fn emitted_split(rows: u32, cols: u32, full_cols: u32, c_start: u32) -> (u64, u6
 }
 
 /// [`emitted_split`] with every operand and the output at a [`ktir_superdsc::addr::ColWindow`] — the corner
-/// the column-chunk bodies (`silumul`, `gated_act`, `elementwise`, `scalarmul_scaled`) state since #622 —
+/// the column-chunk bodies (`silumul`, `elementwise`, `scalarmul_scaled`) state since #622 —
 /// returning the `(mb, out)` split and the output's `layoutDimOrder_`.
 fn emitted_window_split(
     rows: u32,

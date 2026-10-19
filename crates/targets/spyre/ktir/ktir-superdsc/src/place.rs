@@ -81,122 +81,10 @@ pub enum SynthRole {
     /// `tanh(x/cap)` — the divided half of `cap·tanh(x/cap)`, one `[rows, cols]`
     /// buffer reused as its own tanh's destination.
     Tanhc,
-    // ── row-softmax scratch (the MoE router's RouteSoftmax / RouteRenorm) ──
-    /// `rowmax(x)` — one `[rows, stick]` reduce, the softmax's stability subtractend.
-    RMax,
-    /// `x − rowmax(x)` — the shifted scores, one `[rows, cols]` buffer.
-    RSub,
-    /// `rowsum(exp(x − rowmax(x)))` — one `[rows, stick]` reduce, the softmax's denominator.
-    RDen,
-    // ── expert-combine scratch (the MoE pair-row weighted sum) ──
-    // The combine is `out[n, d] = Σ_k rows[n, k, d] · scores[n, k]` with the
-    // accumulator in f32 (metal's `moe_weighted_sum` keeps `float acc` and narrows
-    // once). Indexed per SLOT like `Blk`: each slot's `[m, hidden]` product is a
-    // distinct buffer, so the fold legs cannot overlap them.
-    /// Slot `j`'s `rows_j · score_j` product, one `[m, hidden]` f32 buffer.
-    ECombP(u32),
-    /// The running f32 accumulator, one `[m, hidden]` buffer.
-    ECombAcc,
-    // ── route-argsort scratch (the rank vector's compare/reduce chain) ──
-    // One `[m, W]` buffer each (W = the padded expert width), shared across the
-    // per-j legs: nothing reads a leg's output after its consumer leg, so the
-    // chain reuses two scratches rather than minting E of them.
-    /// The sanitized scores `maximum(x, pad_mask)` — pad lanes forced to +inf.
-    AXSan,
-    /// The per-j `lesserthan` / one-hot product scratch.
-    ALt,
-    /// The per-j `equal·tie + lt` count scratch (the reduce's data operand).
-    ACnt,
-    /// The per-j reduce accum `[m, stick]` (the per-row rank scalar at lane 0).
-    ARank,
-    /// The one-hot product accumulator `[m, W]` (the combine chain's shape).
-    AAcc,
-    /// The top-k per-slot match mask `𝟙[rank == E−k+j]` `[m, W]`.
-    AMatch,
-    /// The top-k per-slot selector `match · iota` `[m, W]` (the reduce's data).
-    ASel,
-    /// The top-k per-slot reduce accum `[m, stick]` (the expert index at lane 0).
-    AIdx,
-    // ── expert-matmul scratch (the gathered expert projection) ──
-    // One per PAIR p = n_tok·k + slot, which is a COMPILE-TIME CONSTANT at
-    // this door (m and k are graph constants), so the per-pair windows are
-    // baked offsets into per-NODE buffers rather than indexed operands — the
-    // whole reason the door needs no `y`-batch and no runtime index.
-    /// The router indices staged in fp32 — the MIDDLE leg of the index
-    /// convert chain (`dl16tofp32` → `fp32toint32`), at 4-byte/32-stick.
-    /// At `m > 1` the fused-pair door declares it `[64, m_pad]` FLAT (the
-    /// narrow leg's input); at `m == 1` the mint's decode arm shadows the ids
-    /// placement at `[rows, w_pad]`. ⛔ `fp32toint32`'s DDL bind
-    /// (`unary_parallel.ddl:59`) constrains the input and output SLICE sizes
-    /// equal, and the slice is measured in ELEMENTS: an fp16 input's 64-elem
-    /// stick yields slice 8 against the u32 output's 32-elem stick slice 4 —
-    /// NEVER equal, so the direct fp16→u32 convert is dxp-refused by
-    /// constraint (ddl_conversion.cpp:2728 "slice size does not match"). The
-    /// fp32 input's 32-elem stick carries slice 4, the match the vendor
-    /// `sdsc_fp32toint32.json` fixture states.
-    XF32,
-    /// The router indices `fp32toint32`-converted to SENUINT32 — the gather's
-    /// index tensor, at 4-byte/32-stick. At `m > 1` the fused-pair door
-    /// declares it `[64, m_pad]` FLAT, slot s's u32 run at elements `s·m_pad`
-    /// — the contiguous run every per-slot `GatherIndex::of_expert_planes`
-    /// reads; at `m == 1` the mint's decode arm shadows the ids placement at
-    /// `[rows, w_pad]` and the gathers read entries `0..k` of row 0.
-    XIdx,
-    /// The FINE index the sub-paged expert gather addresses its cut pages by —
-    /// `[m, k·32]` SENUINT32, minted by gathering the `[E, 32]` const bank
-    /// ([`crate::reserved_tids::expert_subpage_bank_tid`]) by the RAW `XIdx`
-    /// index: dest lane `j` = `e_{j/32}·32 + j%32`, i.e. pair p's sub-page `s`
-    /// address. Reserved ONLY when `expert_slab_subpages` fired (S > 1) — the
-    /// uncut door has no fine index and no synth for it.
-    XSub,
-    /// THE ROUTER LOGITS STAGED at the top-k door's Kᵀ input contract —
-    /// `[m_pad, W]` fp16 (column-group g at `g·m_pad·64` words). Reserved by
-    /// the fused-pair door ONLY when the logits buffer is not already that
-    /// contract: `m_pad ≠ m ∨ lgw ≠ W ∨ W ≠ E` — a row pad, the writer's
-    /// bumped width, or the sanitize the add-form pad row carries at `W > E`
-    /// (the producer's zero pad lanes must lose every strict compare, so they
-    /// are re-written `−inf` on the way through). At
-    /// `m_pad == m ∧ lgw == W ∧ W == E` the Kᵀ restickify reads the logits
-    /// buffer directly and this synth is never reserved.
-    XP,
-    /// THE TRANSPOSED LOGITS — `[W, m_pad]` fp16, the Kᵀ restickify's output
-    /// and the vendor top-k pair's INPUT contract (`[candidates, tokens]`,
-    /// sticked on the token axis). Reserved at EVERY m by the fused-pair door —
-    /// the pair runs at every bucket, decode included.
-    XT,
-    /// THE PAIR'S 64-SLOT INDEX OUTPUT — `[64, m_pad]` fp16, slot-major (slot
-    /// s's run at elements `s·m_pad`), `OpFunc::TopKIndex`'s direct output.
-    /// Read by the flat restickify (m>1) and the rerouted transpose that lands
-    /// the ids token-major (every m).
-    TopKIdx,
-    /// THE PAIR'S 64-SLOT VALUE OUTPUT — `[64, m_pad]` fp16, slot-major, the
-    /// `OpFunc::TopKValue` twin of [`Self::TopKIdx`]. TWO ROLES, NOT ONE: the
-    /// index and value legs are different ops with different consumers (the
-    /// converts vs the score-side transpose), the `GatherKt`/`GatherV` law.
-    TopKVal,
-    /// THE PAIR'S INDEX FLATTENED — `[64, m_pad]` fp16 FLAT row-major (stick on
-    /// dim 0), the flat-restickify's output and the `dl16tofp32` leg's input.
-    /// `dl16tofp32`'s DDL bind (`quantization_double_pad.ddl`) SHARES its
-    /// `%stick_dim` between both operands — input via `%slice_layout_in`,
-    /// output via `%padded_dim_out`'s `nonPaddedDim` — so both must stick the
-    /// SAME-NAMED dim, and the pair's token-sticked output cannot feed the leg
-    /// directly (the flat-tail spelling died at `ddl_conversion.cpp:2539`).
-    /// The flat restickify exists to produce this buffer. Reserved ONLY at
-    /// `m > 1` — at `m == 1` the mint's plain converts read the token-major
-    /// landing directly.
-    XFl,
-    /// The pair-indexed fp8 WEIGHT scratch — expert slab of pair p at flat
-    /// elements `[p·(n·in), (p+1)·(n·in))`, `[m·k·(n·64), 128]` fp8.
-    XWScratch,
-    /// The pair-indexed SCALE scratch — expert scales of pair p at `[p·n,
-    /// (p+1)·n)` bf16, the bank's `[E·n]` row sequence gathered per pair.
-    XSScratch,
-    /// The per-pair RAW matmul product `[m·k·n]` fp16 (the dense body's FqRaw
-    /// at the pair-major flattening), before the dequant multiplies.
-    XRaw,
-    /// The `a_scale`-folded intermediate `[m·k·n]` fp16 (the dense body's
-    /// FqDqA), before the per-channel w_scale multiply.
-    XDqA,
+    // ⛔ THE MoE ROLES ARE GONE — the row-softmax, expert-combine, route-argsort and
+    // expert-matmul scratches (RMax..XDqA) existed only for the hand-written per-op
+    // MoE card lowering, which is deleted: the MoE lowers only from `kernels/moe.py`
+    // through KTIR.
     // ── the HARDWARE GATHER's contiguous destinations ──
     //
     // ⭐⭐⭐ THE TWO SCRATCHES THAT GIVE THE FOLD A REQUEST AXIS. A fold pass reads the paged KV pool,
@@ -293,31 +181,6 @@ impl fmt::Display for SynthRole {
             Self::HeadMeps(h) => write!(f, "hmeps{h}"),
             Self::HeadRinv(h) => write!(f, "hrinv{h}"),
             Self::Tanhc => f.write_str("tanhc"),
-            Self::RMax => f.write_str("rmax"),
-            Self::RSub => f.write_str("rsub"),
-            Self::RDen => f.write_str("rden"),
-            Self::ECombP(j) => write!(f, "ecombp{j}"),
-            Self::ECombAcc => f.write_str("ecombacc"),
-            Self::AXSan => f.write_str("axsan"),
-            Self::ALt => f.write_str("alt"),
-            Self::ACnt => f.write_str("acnt"),
-            Self::ARank => f.write_str("arank"),
-            Self::AAcc => f.write_str("aacc"),
-            Self::AMatch => f.write_str("amatch"),
-            Self::ASel => f.write_str("asel"),
-            Self::AIdx => f.write_str("aidx"),
-            Self::XIdx => f.write_str("xidx"),
-            Self::XSub => f.write_str("xsub"),
-            Self::XP => f.write_str("xp"),
-            Self::XT => f.write_str("xt"),
-            Self::TopKIdx => f.write_str("topkidx"),
-            Self::TopKVal => f.write_str("topkval"),
-            Self::XFl => f.write_str("xfl"),
-            Self::XF32 => f.write_str("xf32"),
-            Self::XWScratch => f.write_str("xwscratch"),
-            Self::XSScratch => f.write_str("xsscratch"),
-            Self::XRaw => f.write_str("xraw"),
-            Self::XDqA => f.write_str("xdqa"),
             Self::GatherKt => f.write_str("gkt"),
             Self::GatherV => f.write_str("gv"),
             Self::ChunkSc => f.write_str("csc"),

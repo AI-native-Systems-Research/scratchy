@@ -93,8 +93,7 @@ pub use scratchy_subtile::superdsc_opspec::{Df, Fp8, Fp16, Fp32, SenInt8};
 pub use ktir_superdsc::work::{
     CORELETS_PER_CORE, CoreSplit, DeviceWidth, FP16_ELEMS_PER_STICK, MAX_SPAN_BYTES, MatmulSplit,
     STICK_BYTES, bump_sticks_to_splittable, core_split, core_to_wk_slice, distribute_cores,
-    expert_slab_chunks, expert_slab_subpages, fp8_k_pad, matmul_cost_split, matmul_split_plan,
-    stick_count,
+    fp8_k_pad, matmul_cost_split, matmul_split_plan, stick_count,
 };
 
 // ⭐ THE DXP-GROUP DESCRIPTOR CEILING LIVES IN THE LEAF CRATE — in `sdsc_abstract`, beside the
@@ -192,10 +191,8 @@ pub use ktir_superdsc::reserved_tids::{
     RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID, RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID,
     RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID,
     SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion,
-    expert_subpage_bank_tid, identity_class_tid, is_kernel_table_class_tid, kct_resident_tid,
-    oproj_headmajor_tid, reserved_region, rope_p_class_hds, rope_p_class_tid, router_identity_tid,
-    router_pad_mask_tid, router_rank_tie_tid, router_sm_mask_tid, router_topk_iota_tid,
-    router_topk_pad_tid, scalarmul_scale_tid,
+    identity_class_tid, is_kernel_table_class_tid, kct_resident_tid, oproj_headmajor_tid,
+    reserved_region, rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
 };
 
 // The rung facts the walk takes as one explicit struct — the `#[forward]` expansion
@@ -599,12 +596,9 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
             }
             // The gemma-4 vocabulary registers through the SAME registry, each a `[1,1]`
             // worker-bound const its door reads by `scale_slot` exactly like the arms above:
-            // RmsNormUnit's epsilon, TanhSoftCap's cap, the router norm's epsilon and the
-            // route scale.
+            // RmsNormUnit's epsilon, TanhSoftCap's cap.
             SubOp::RmsNormUnit { eps } => push_scale(*eps, &mut scalarmul_scales),
             SubOp::TanhSoftCap { cap } => push_scale(*cap, &mut scalarmul_scales),
-            SubOp::RouterNorm { eps, .. } => push_scale(*eps, &mut scalarmul_scales),
-            SubOp::RouteScale { scale } => push_scale(*scale, &mut scalarmul_scales),
             _ => {}
         }
     }
@@ -676,14 +670,6 @@ fn stage_registry_scalars<F: RopeForm>(op: &mut SubOp<F>) -> bool {
             stage(cap);
             true
         }
-        SubOp::RouterNorm { eps, .. } => {
-            stage(eps);
-            true
-        }
-        SubOp::RouteScale { scale } => {
-            stage(scale);
-            true
-        }
         _ => false,
     }
 }
@@ -703,19 +689,6 @@ fn stage_registry_scalars<F: RopeForm>(op: &mut SubOp<F>) -> bool {
 /// All sizes are f16 bytes (`rows*cols*2`), 128 B aligned. A build-time disjointness
 /// guard ([`bundle_layout_aliases`]) asserts no two SIMULTANEOUSLY-LIVE tensors in a
 /// segment overlap — a silent on-card aliasing write is a `cargo build` Err.
-/// The node whose OUTPUT is `t`, if exactly one — the splice's `producer_of` law, mirrored
-/// here so the router-width carve-outs below key on the SAME chain facts the splice's fold
-/// keyed on (a tensor two nodes write is not a chain, and the splice refuses it before the
-/// placement pass ever runs).
-fn unique_producer<F: RopeForm>(
-    ir: &SubtileIR<F>,
-    t: scratchy_subtile::subtile_ir::TensorId,
-) -> Option<&scratchy_subtile::subtile_ir::SubtileNode<F>> {
-    let mut it = ir.nodes.iter().filter(|n| n.output.tensor == t);
-    let p = it.next()?;
-    it.next().is_none().then_some(p)
-}
-
 pub fn compute_bundle_layout<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
@@ -747,132 +720,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
         .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
         .map(|n| n.inputs[1].tensor.index() as u32)
         .collect();
-    // ── THE ROUTER-WIDTH CARVE-OUT — the issue-201 law ("the buffer the mint reserves and the
-    //    width the emitter writes cannot disagree") extended to the per-Program path. The
-    //    router's LOGITS buffer is written by the RouterLogits matmul at ITS own device width
-    //    (`DeviceWidth::for_matmul(m, E, kh)` — 128 at m≤2 on the 26b, 512 at m≥3: the macs
-    //    threshold), and the fused top-k's staging reads it back at exactly that width (the
-    //    `pointwise_width_the_output_holds` cap fires per bucket off THIS reservation). The
-    //    plain `nbytes` below would bump the 128-wide row to the 8-stick util floor (512) at
-    //    every m, so at m≤2 the cap could not fire and the staging would read 512-wide rows
-    //    of which only the first 128 lanes were ever written — the reader/writer disagreement
-    //    the carve-out exists to close. Reserved at the WRITER's own width, BYPASSING the
-    //    bump (the bump is a core-split preference, not a correctness law; the m≥3 width 512
-    //    is byte-identical to the bumped reservation, so only the m≤2 rows tighten, and they
-    //    tighten to exactly what the matmul wrote).
-    let router_lg_bytes: std::collections::BTreeMap<u32, u64> = ir
-        .nodes
-        .iter()
-        .filter(|n| matches!(n.op, SubOp::RouterLogits { .. }))
-        .map(|n| {
-            let rows = n.output.region.rows.len;
-            let e = n.output.region.cols.len;
-            // The contraction width — the ACTIVATION input's cols (the hidden size; the
-            // router weight is input 1). The RouterLogits matmul is never windowed (the
-            // router reads the whole hidden state), so the Staged origin's `false` is the
-            // writer's own fact.
-            let kh = n.inputs[0].region.cols.len;
-            let width = ktir_superdsc::work::DeviceWidth::for_matmul(rows, e, kh, false).get();
-            (
-                n.output.tensor.index() as u32,
-                u64::from(rows) * u64::from(width) * u64::from(Df::Fp16.word_length()),
-            )
-        })
-        .collect();
-    // ── THE ROUTER LANDINGS — the fused pair's token-major outputs. The top-k door lands the
-    //    ids and the values through the rerouted restickify transposes at `[m_pad, 64]`
-    //    (slots = 64, the transpose door's stick law), which at m < m_pad is m_pad/m times
-    //    the logical `[m, k]` footprint — the plain `nbytes` would under-reserve and the
-    //    footprint guard would refuse the transpose (correctly). The values landing is the
-    //    CHAIN GATHER's output (the splice folds the gather into the top-k; the walk below
-    //    mirrors that fold's chain-membership predicate — the ids from a RouteTopK whose
-    //    argsort producer's input is this gather's source — so a non-router gather keeps the
-    //    plain reservation its own one-hot door writes).
-    let mut router_landing_bytes: std::collections::BTreeMap<u32, u64> = Default::default();
-    for n in &ir.nodes {
-        let landing = |out: &scratchy_subtile::subtile_ir::TensorRegion| {
-            let m_pad = (out.region.rows.len as u64).next_multiple_of(64);
-            // ⭐ THE col_at TAIL — the readers' lane shift, funded. The consumer
-            //    doors (the expert-scale's per-slot select, the bare gather, the
-            //    combine) read a k-wide column through `In::col_at`: a ONE-STICK
-            //    window BASE-SHIFTED to the column's own element offset, so the
-            //    walk's reach is `lane + rows·64` elements with `lane ≤ k−1` —
-            //    (k−1) elements PAST the landing's padded last element. The
-            //    pair's own transposes stop at `m_pad·64`; the tail funds only
-            //    the lane shift (at m < m_pad the pad rows hid it; at m = m_pad
-            //    even the ids landing over-reads without this tail).
-            let k = out.region.cols.len as u64;
-            u64::from(Df::Fp16.word_length()) * (m_pad * 64 + k.saturating_sub(1))
-        };
-        match &n.op {
-            SubOp::RouteTopK { .. } => {
-                router_landing_bytes.insert(n.output.tensor.index() as u32, landing(&n.output));
-            }
-            SubOp::RouteGatherScores
-                if unique_producer(ir, n.inputs[1].tensor).is_some_and(|topk| {
-                    matches!(topk.op, SubOp::RouteTopK { .. })
-                        && unique_producer(ir, topk.inputs[0].tensor).is_some_and(|sort| {
-                            matches!(sort.op, SubOp::RouteArgsort)
-                                && n.inputs[0].tensor == sort.inputs[0].tensor
-                        })
-                }) =>
-            {
-                router_landing_bytes.insert(n.output.tensor.index() as u32, landing(&n.output));
-            }
-            _ => {}
-        }
-    }
-    // ── THE SCORE-SIDE COLUMNS — every post-top-k score tensor at `[m, k_pad]`. The score
-    //    doors run at their `for_pointwise` widths and the cap narrows them to what the
-    //    OUTPUT's placement holds; with the plain `nbytes` (the util-floor bump to 512) the
-    //    cap cannot fire and the scalarmul would write 512-wide rows the softmax then reads
-    //    at 64 — the stride break the old chain's m>1 corruption measured. One carve for the
-    //    whole score side (scale, softmax, expert-scale) puts every reader and writer on the
-    //    same 64-lane rows the token-major landing already wrote.
-    let router_score_bytes: std::collections::BTreeMap<u32, u64> = ir
-        .nodes
-        .iter()
-        .filter(|n| {
-            matches!(
-                &n.op,
-                SubOp::RouteScale { .. } | SubOp::RouteSoftmax | SubOp::RouteExpertScale { .. }
-            )
-        })
-        .map(|n| {
-            let rows = n.output.region.rows.len as u64;
-            let k = n.output.region.cols.len as u64;
-            let k_pad = k.next_multiple_of(64);
-            // ⭐ THE col_at TAIL — the landing carve's own law, on the score
-            //    side: the expert-scale reads the softmax's output and the
-            //    combine reads the expert-scale's output through `In::col_at`
-            //    lane walks whose reach is `(k−1) + rows·64` elements — one
-            //    lane-shifted stick per row, (k−1) elements past the last row's
-            //    end. MEASURED: without the tail the honest chain refuses at
-            //    EVERY m (tiny26's m=1 decode, `reprd_j1_o203`, `2B + 128B >
-            //    128B` — the guard was right, the reservation was short); with
-            //    it the reach equals the reservation exactly, and the width cap
-            //    is untouched (the tail is under one stick, so a row's byte
-            //    count never crosses the stick boundary the cap divides by).
-            (
-                n.output.tensor.index() as u32,
-                u64::from(Df::Fp16.word_length()) * (rows * k_pad + k.saturating_sub(1)),
-            )
-        })
-        .collect();
     let nbytes = |tid: u32| -> u64 {
-        // The carve-outs first: a router buffer the doors address at a width the plain
-        // formula cannot derive (the writer's own device width, the pair's landings, the
-        // score side's shared columns). Every carve is a fact about the DOOR that writes
-        // the tensor, restated here because the reservation must precede the emission.
-        if let Some(&b) = router_lg_bytes.get(&tid) {
-            return b;
-        }
-        if let Some(&b) = router_landing_bytes.get(&tid) {
-            return b;
-        }
-        if let Some(&b) = router_score_bytes.get(&tid) {
-            return b;
-        }
         let s = ir.tensors[tid as usize];
         // Reserve the DEVICE footprint: a stick-last tensor pads its innermost stick dim up to a whole
         // stick on-device — fp16 is a 64-elem / 2-byte stick, fp8 is a 128-elem / 1-byte stick (HALF the
@@ -1336,222 +1184,6 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // SCRATCHY_SUPERDSC_KV_MATMUL has nothing to do for such a model — already a no-op, not a case that
     // needs handling here.)
 
-    // ── ROUTER CONST ROWS (the MoE router doors' token-independent factors) ──
-    // The identity table `[W,W]`, the iota row and the softmax mask the router doors read,
-    // worker-bound like the rope-P tables above (see `ROUTER_CONST_BASE`'s own doc in
-    // reserved_tids.rs for the full law). GEOMETRY OFF THE TAPE'S OWN NODES:
-    // `experts` off a RouterLogits — E ALONE gates the E-sized consts (the argsort
-    // reads one identity row per RANKED expert) — or, when the tape has no router
-    // head at all, off the `ExpertSort` itself: the spliced expert tapes carry E
-    // on the sort, and the sort's own `RouteTopK` producer (P1's provenance law,
-    // the splice's `bindings_for`) reads these same consts through its door — a
-    // sort with no topk places them inert. `k` off a RouteTopK/ExpertSort gates the
-    // k-boundary softmax mask (placed only when the tape has a top-k). W = the
-    // padded stick width `next_multiple_of(64, E)`, the same pad the router
-    // buffers' own views carry (the narrow-tensor law: lanes E..W are pad, forced
-    // inert by the sanitize rows). ⛔ OUTSIDE the attention-class guard: a router
-    // tape with no AttnDecode node still needs its consts placed — the guard is
-    // the tape's own router nodes, nothing else. A tape with no MoE router binds
-    // nothing here (byte-identical bundles for every non-MoE model).
-    //
-    // ⭐⭐ THE FOLD'S OWN GATE — the argsort-family consts (the `[W,W]` tie table and the
-    // argsort's maximum-form pad mask) are placed ONLY for the BARE-ARGSORT CORNER: an
-    // argsort whose rank vector feeds anything but a RouteTopK. The splice folds every
-    // other argsort into the fused top-k (which reads the RAW LOGITS, never the ranks, and
-    // selects by the pair's scan positions — no tie table, no rank pad), so placing them
-    // for a folded tape would reserve rows no door ever reads. The predicate mirrors the
-    // splice's fold EXACTLY (all-RouteTopK consumers ⇒ folded), stated here as its
-    // complement: SOME consumer of the ranks is not a RouteTopK ⇒ bare.
-    //
-    // ⛔ THE OLD TOP-K'S OWN ROWS DIE WITH ITS DOOR: the `[k,W]` targets table and the two
-    // uniform sanitize rows (`pad_hi`/`pad_lo`) had the one-hot rank-inversion as their
-    // only door readers — the fused pair replaces that chain wholesale, and the new
-    // top-k's own sanitize (the add-form pad row below) is a DIFFERENT row with a
-    // DIFFERENT law. The topk pad row itself is W-GATED: placed only when a RouteTopK
-    // exists AND `W > E` — at every real router (the logits written at full stick width,
-    // W == E) the row is inert and never placed, so the 26b/tiny26 wires stay
-    // byte-identical.
-    let router_experts = ir.nodes.iter().find_map(|n| match &n.op {
-        SubOp::RouterLogits { experts, .. } | SubOp::ExpertSort { experts, .. } => {
-            Some(experts.get())
-        }
-        _ => None,
-    });
-    let router_k = ir
-        .nodes
-        .iter()
-        .filter_map(|n| match &n.op {
-            SubOp::RouteTopK { k } | SubOp::ExpertSort { k, .. } => Some(k.get()),
-            _ => None,
-        })
-        .max();
-    let has_route_topk = ir
-        .nodes
-        .iter()
-        .any(|n| matches!(&n.op, SubOp::RouteTopK { .. }));
-    // ⛔ THE BARE-ARGSORT CORNER IS THE SPLICE FOLD'S EXACT COMPLEMENT, stated
-    // here as the fold's negation (never as a second derivation of "bare"):
-    // the splice silences an argsort whose ranks have consumers, every one a
-    // RouteTopK, and whose output is not the tape's result — anything else
-    // (a non-topk consumer, ZERO consumers, or the ranks BEING the result)
-    // keeps the argsort's program, and its door reads this corner's consts.
-    // The two halves answer ONE question, so they cannot desync into a
-    // placed-but-unread table or a read-but-unplaced one.
-    let bare_argsort = ir.nodes.iter().any(|n| {
-        let SubOp::RouteArgsort = &n.op else {
-            return false;
-        };
-        let foldable = n.output.tensor != ir.result && {
-            let consumers: Vec<&_> = ir
-                .nodes
-                .iter()
-                .filter(|c| c.inputs.iter().any(|r| r.tensor == n.output.tensor))
-                .collect();
-            !consumers.is_empty()
-                && consumers
-                    .iter()
-                    .all(|c| matches!(&c.op, SubOp::RouteTopK { .. }))
-        };
-        !foldable
-    });
-    if let Some(e) = router_experts {
-        let stk = ktir_superdsc::superdsc_opspec::Fp16::ELEMS_PER_STICK as u64; // 64
-        let w = e.next_multiple_of(stk as u32) as u64; // padded expert width, whole sticks
-        let seg = SegRole::Activation.segment();
-        // ONE placement per const row/table: the argsort corner's `[W,W]` tie table and
-        // `[1,W]` pad mask, the `[W,W]` identity table, the `[1,W]` iota row, the softmax's
-        // `[1,W]` k-boundary mask, and the top-k's `[1,W]` add-form pad row. All fp16 (the
-        // router tensors' own dtype), all bound at load by `wiring::synthetic_constants`.
-        let mut place_const = |tid: u32, rows: u64, cols: u64, seg_bytes: &mut [u64; 7]| {
-            let off = seg_bytes[seg];
-            let sz = rows * cols * 2; // fp16
-            placements.insert(
-                tid,
-                TensorPlacement {
-                    tid,
-                    bank: 0,
-                    role: SegRole::Activation,
-                    segment: seg,
-                    offset: off,
-                    size: sz,
-                },
-            );
-            seg_bytes[seg] = align128(off + sz);
-        };
-        if bare_argsort {
-            place_const(router_rank_tie_tid(), w, w, &mut seg_bytes);
-            place_const(router_pad_mask_tid(), 1, w, &mut seg_bytes);
-        }
-        place_const(router_identity_tid(), w, w, &mut seg_bytes);
-        place_const(router_topk_iota_tid(), 1, w, &mut seg_bytes);
-        if router_k.is_some() {
-            // The softmax's k-boundary mask row (0 below k, −inf above) — the
-            // row that makes the padded-width softmax's denominator ignore the
-            // pad lanes.
-            place_const(router_sm_mask_tid(), 1, w, &mut seg_bytes);
-        }
-        if has_route_topk && w > e as u64 {
-            // The fused top-k's add-form pad row (0 below E, −inf above) — the row that
-            // forces the producer's zero pad lanes to lose every strict compare, keeping
-            // the pair's ids scan positions `0..E−1` (in-range by construction).
-            place_const(router_topk_pad_tid(), 1, w, &mut seg_bytes);
-        }
-    }
-
-    // ── THE SUB-PAGE INDEX BANK (the fine expert gather's const table) ──
-    // ⭐⭐ PLACED IFF AN EXPERT DOOR'S SUB-PAGE CUT FIRES: the door's own
-    // `expert_slab_subpages(page_w)` — the THIRD reader of the one chunk law (the door's
-    // gather offsets, the manifest's chunk-major bank staging, and now this placement) —
-    // restated from the node's own `n`/`k` and the input regions, the same facts the ktir-side
-    // `expert_banks` census reads. A firing door means the vendor dxp scheduler would refuse
-    // the uncut page (4 × page > `VENDOR_LX_SCHED_BYTES`, the wall-#6 law), so the door mints a
-    // FINE index `e·S + s` by gathering this `[E, S]` u32 bank — and the two halves of that
-    // gather are this placement and the door's `embi` op, which fail in OPPOSITE directions
-    // exactly like the KV block index: a bank with no gather is inert bytes, while a gather
-    // with no bank reads an UNSTAGED index — zero, a VALID entry, so every pair would gather
-    // expert 0's sub-page 0 with a clean bake. One law, both halves.
-    // u32, NOT fp16: the values reach `E·S − 1` = 4095 at E=128, past fp16's exact-integer
-    // range — so this is the ONE router-region const placed at 4 bytes/elem and bound through
-    // the worker's raw-i32 channel, never the f32→sen const bind.
-    // Byte-identical for every model whose pages fit the vendor budget (page_w ≤ 793 —
-    // granite, tiny26, and everything before the 26b): nothing is placed, nothing is bound.
-    {
-        let mut firing: Option<u32> = None; // the bank's E, from the FIRST firing door
-        for n in &ir.nodes {
-            let SubOp::ExpertMatmul {
-                n: node_n,
-                k: node_k,
-                ..
-            } = &n.op
-            else {
-                continue;
-            };
-            if n.inputs.len() != 4 {
-                continue;
-            }
-            // ⭐ THE PREFILL (m>1) DOOR HAS NO FINE INDEX — its matmuls gather the BANK
-            // directly through the kernel index (`GatherIndex::of_expert_planes`, the
-            // probe-proven token-plane form), so the sub-page cut — the COPY gather's LX
-            // law — is not that regime's law at all: a rows>1 door neither mints an `xsub`
-            // nor reads this bank, and letting it fire here would place (and bind) a const
-            // table nothing gathers. Skipped on the door's OWN row count, the same fact the
-            // ktir-side census carries.
-            if n.inputs[0].region.rows.len > 1 {
-                continue;
-            }
-            // The door's own resolution, from the same facts its Region walk states: `inn` off
-            // the rows input's width over k, `e_count` off the bank's rows over n. `entries`
-            // is the door's `run_entries` at this door's `rows == 1` regime — the rows>1
-            // door is skipped above, so every door that reaches this law has pairs == k
-            // (the same note the ktir-side census carries).
-            let inn = n.inputs[0].region.cols.len / node_k.get();
-            let inn_pad = fp8_k_pad(inn);
-            let groups = node_n / ktir_superdsc::superdsc_opspec::Fp16::ELEMS_PER_STICK;
-            if groups == 0 || inn == 0 {
-                continue;
-            }
-            let e_count = n.inputs[2].region.rows.len / node_n;
-            let run_entries =
-                ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP.min(node_k.get());
-            let chunk_groups = expert_slab_chunks(groups, inn_pad / 2, run_entries, e_count);
-            let page_w =
-                chunk_groups * ktir_superdsc::superdsc_opspec::Fp16::ELEMS_PER_STICK * inn_pad
-                    / 128;
-            if expert_slab_subpages(page_w) > 1 {
-                match firing {
-                    Some(e) if e != e_count => {
-                        return Err(SuperDscError(format!(
-                            "the sub-page index bank: two expert doors fired the sub-page cut at \
-                             DIFFERENT expert counts ({e} and {e_count}) — one [E, S] bank cannot \
-                             serve both, and the wrong E gathers another expert's sub-pages"
-                        )));
-                    }
-                    _ => firing = Some(e_count),
-                }
-            }
-        }
-        if let Some(e) = firing {
-            let a = SegRole::Activation.segment();
-            // `[E, S]` u32 — S = `CopyDims::ENTRIES_PER_OP` (the door's cut value whenever it
-            // fires), 4 bytes/elem: `E·S·4` = `E·128` B.
-            let sub = ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
-            let off = seg_bytes[a];
-            let sz = e as u64 * sub as u64 * 4;
-            placements.insert(
-                expert_subpage_bank_tid(),
-                TensorPlacement {
-                    tid: expert_subpage_bank_tid(),
-                    bank: 0,
-                    role: SegRole::Activation,
-                    segment: a,
-                    offset: off,
-                    size: sz,
-                },
-            );
-            seg_bytes[a] = align128(off + sz);
-        }
-    }
-
     // ── RMSNorm Newton const [1,stick] ── If the tape has any RmsNorm, place `RMS_HALF_TID` in seg0
     // (ACTIVATION, re-bound per step like ATTN_SCALE — a seg1 weight would only be H2D'd at prepare).
     // The worker binds 0.5 (EXACT in fp16); the rmsnorm derives 1.0/1.5/−1.0 on-card from it. The old
@@ -1597,15 +1229,13 @@ pub fn compute_bundle_layout<F: RopeForm>(
 
     // ── fp8 W8A8 activation-quant consts [1,stick] (seg0, worker-bound like RMS_HALF) ── E4M3 clamp
     // bounds ±448 + 1/448 for `qfp8ch` (per-token amax → a_scale). Placed iff the tape has an fp8
-    // (arity-3) MatmulTile OR an ExpertMatmul — the expert doors quantize their activations through
-    // the same chain, so an expert-only tape needs the clamp bounds just as much (an unplaced const
-    // here is the expert door's quantize reading an undeclared synthetic). Unplaced (and thus
-    // value-0) was the "clamp consts default 0 → wrong quant" gap; placing them here + binding in
-    // the worker gives the real E4M3 bounds.
-    if ir.nodes.iter().any(|n| {
-        matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3
-            || matches!(n.op, SubOp::ExpertMatmul { .. })
-    }) {
+    // (arity-3) MatmulTile. Unplaced (and thus value-0) was the "clamp consts default 0 → wrong
+    // quant" gap; placing them here + binding in the worker gives the real E4M3 bounds.
+    if ir
+        .nodes
+        .iter()
+        .any(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
+    {
         let a = SegRole::Activation.segment();
         let sz = Fp16::ELEMS_PER_STICK as u64 * 2; // [1, stick] fp16
         for tid in [FP8_POS448_TID, FP8_NEG448_TID, FP8_INV448_TID] {
@@ -2328,12 +1958,6 @@ pub fn compute_bundle_layout<F: RopeForm>(
         // ONE source of truth for all three. Empty for a tape with no rope/attention nodes.
         rope_class_hds,
         attn_class_hds,
-        // The MoE router's expert count, off the tape's own RouterLogits — 0 for a dense tape.
-        router_experts: router_experts.unwrap_or(0),
-        // The router's top-k width, the same registry law — the softmax mask's value is
-        // k-dependent and the old seat (the targets table's placement) died with the
-        // rank-inversion door the fused pair replaced.
-        router_k: router_k.unwrap_or(0),
     })
 }
 
@@ -3157,12 +2781,6 @@ fn stage_synth_weights<F: RopeForm>(
                 fp8_payloads.insert(node.inputs[1].tensor.index() as u32);
                 scale_rows.insert(node.inputs[2].tensor.index() as u32);
             }
-            // `[rows, routing, experts(, w_scale)]` — the 4th operand marks the
-            // 8-bit expert bank (the gathered matmulfp8 the K-pair law names).
-            SubOp::ExpertMatmul { .. } if node.inputs.len() == 4 => {
-                fp8_payloads.insert(node.inputs[2].tensor.index() as u32);
-                scale_rows.insert(node.inputs[3].tensor.index() as u32);
-            }
             // `[rows, over, weight(, w_scale)]` — same law for the all-rows form.
             SubOp::AllRowsMatmul if node.inputs.len() == 4 => {
                 fp8_payloads.insert(node.inputs[2].tensor.index() as u32);
@@ -3189,7 +2807,7 @@ fn stage_synth_weights<F: RopeForm>(
     };
     // ── The GEMM weight classification — the SAME law the manifest's
     //    `gemm_weight` set stamps (`codegen.rs`: the source a MatmulTile binds
-    //    as `inputs[1]`; bundle codes for the expert forms) and
+    //    as `inputs[1]`) and
     //    `spyre_load.rs`'s emulator branch stages by: a GEMM weight's Arg is
     //    bound with the SWAPPED shape `[cols, rows]` and bytes in the on-disk
     //    `[n, k]` order the kernel's transpose-B indexing maps read ("the KTIR
@@ -3205,7 +2823,7 @@ fn stage_synth_weights<F: RopeForm>(
             SubOp::MatmulTile { .. } => {
                 gemm_weights.insert(node.inputs[1].tensor.index() as u32);
             }
-            SubOp::ExpertMatmul { .. } | SubOp::AllRowsMatmul => {
+            SubOp::AllRowsMatmul => {
                 gemm_weights.insert(node.inputs[2].tensor.index() as u32);
             }
             _ => {}
@@ -4211,22 +3829,6 @@ pub fn numeric_gate<F: RopeForm>(
                 | SubOp::KvStage { .. }
                 | SubOp::RotateRows { .. }
                 | SubOp::AttnPackedKv
-                | SubOp::RouterNorm { .. }
-                | SubOp::RouterLogits { .. }
-                | SubOp::RouteSoftmax
-                | SubOp::RouteSigmoidBias { .. }
-                | SubOp::RouteBias { .. }
-                | SubOp::RouteArgsort
-                | SubOp::RouteTopK { .. }
-                | SubOp::RouteGatherScores
-                | SubOp::RouteScale { .. }
-                | SubOp::RouteRenorm
-                | SubOp::RouteExpertScale { .. }
-                | SubOp::ExpertSort { .. }
-                | SubOp::ExpertMatmul { .. }
-                | SubOp::ExpertGatedAct { .. }
-                | SubOp::ExpertUnsort
-                | SubOp::ExpertCombine { .. }
                 | SubOp::SampleRowsGather
                 | SubOp::SampleRowsScatter
         )
@@ -4234,7 +3836,7 @@ pub fn numeric_gate<F: RopeForm>(
     if let Some(n) = unref_op {
         eprintln!(
             "[spyre-superdsc] NUMERIC GATE SKIP {fp}: t{} is {} — eval_node has no host \
-             reference for that family yet (the MoE/KV-codec reference arms are the next \
+             reference for that family yet (the KV-codec reference arms are the next \
              rung); this bundle's numbers are UNCHECKED",
             n.output.tensor.index(),
             n.op.name()
@@ -4311,7 +3913,7 @@ pub fn numeric_gate<F: RopeForm>(
         let crosses = matches!(&node.op,
             SubOp::MatmulTile { weight, .. } if matches!(weight, GemmWeight::Fp8Dynamic))
             || matches!(&node.op,
-            SubOp::ExpertMatmul { .. } | SubOp::AllRowsMatmul if node.inputs.len() == 4)
+            SubOp::AllRowsMatmul if node.inputs.len() == 4)
             || node
                 .inputs
                 .iter()
@@ -6384,8 +5986,6 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // which is all the runtime needs.
         rope_class_hds: _,
         attn_class_hds: _,
-        router_experts,
-        router_k,
     } = l;
 
     let mut places: Vec<bundle::Placement> = placements
@@ -6477,12 +6077,6 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         scalarmul_scales: std::borrow::Cow::Owned(scalarmul_scales.clone()),
         weight_scale_folds: std::borrow::Cow::Owned(weight_scale_folds.clone()),
         weight_copies: std::borrow::Cow::Owned(weight_copies.clone()),
-        // The MoE router's expert count, baked for the wiring's load-time const binds (the
-        // router const rows' widths derive from it).
-        router_experts: *router_experts,
-        // The router's top-k width, the same law — the softmax mask's bind builds its
-        // k-boundary from it.
-        router_k: *router_k,
         kv_request_stride_bytes: *kv_request_stride_bytes,
         // The rung's op-local pin slots — final by now (the declare pass minted every pin before
         // any bundle was emitted), and shared by every bundle of the rung, so whichever bundle the

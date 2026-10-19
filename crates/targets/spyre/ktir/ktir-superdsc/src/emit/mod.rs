@@ -441,8 +441,7 @@ fn pointwise_lx_resident(plan: &WorkPlan, n_operands: u64, out_per_time: u32, df
 ///
 /// Thin wrapper: builds the `[mb,out,y]` `TileOp` (the TileIR declaration for this shape) and hands
 /// it to [`pointwise_opspec_from_tile`] — the SAME two-step split every other caller of that function
-/// goes through, whether their `TileOp` came from here or from
-/// `subtile_tape_to_tile_ir::node_to_single_tile_op` (the live per-node path).
+/// goes through, whether their `TileOp` came from here or from a caller that built its own.
 fn pointwise_opspec(
     op: OpFunc,
     rows: u32,
@@ -4118,15 +4117,20 @@ fn convert_dtypes(op: OpFunc) -> (Df, Df) {
         // entry on `%inptensor`'s type list (:20) serves the OTHER ops bound to
         // that tensor; the cast's own bind (:50) is fp32-mode and its vendor
         // fixture (`test/sdsc_fp32toint32.json`) states the legal form: an
-        // IEEE_FP32 wordLength-4 input. Callers stage the fp16 routing buffer
-        // through `dl16tofp32` FIRST — the expert door's own two-leg chain
-        // (`dl16tofp32` → `fp32toint32`), the widening convert carrying no
-        // slice constraint of its own (quantization_double_pad.ddl:58).
+        // IEEE_FP32 wordLength-4 input. A caller with an fp16 source stages it
+        // through `dl16tofp32` FIRST — the widening convert carries no slice
+        // constraint of its own (quantization_double_pad.ddl:58).
         OpFunc::Fp32ToInt32 => (Df::Fp32, Df::SenUint32),
         _ => (Df::Fp16, Df::Fp16),
     }
 }
 
+/// A dtype-convert's opspec: both operands keep their stick on `out`, addressed RowBlocked
+/// at rows>1 — the rank-3 `[mb,out,1]` staging every residual-style consumer reads.
+///
+/// (The FLAT per-operand arrangement — BOTH operands stick `mb`, the DDL-equality form the
+/// deleted per-expert index-table chain needed — is gone with that chain; the probe record
+/// for its two DDL laws survives in this file's history.)
 fn convert_opspec(
     op: OpFunc,
     rows: u32,
@@ -4134,87 +4138,6 @@ fn convert_opspec(
     in_name: &str,
     o_name: &str,
 ) -> Result<OpSpec, String> {
-    convert_opspec_arranged(op, rows, cols, in_name, o_name, ConvertArrangement::Staged)
-}
-
-/// The per-operand stick arrangement of a dtype-convert (see [`convert_opspec_arranged`]).
-///
-/// The STAGED form is every legacy caller's byte-identical default: input AND output keep
-/// their stick on `out`, addressed RowBlocked at rows>1 — the rank-3 `[mb,out,1]` staging
-/// every residual-style consumer reads. The FLAT form is the prefill-m>1 ExpertMatmul
-/// mint's two-leg chain, FORCED by the vendors' DDL arithmetic — TWO independent laws,
-/// one per leg:
-///  • `unary_parallel.ddl:59-60` binds `fp32toint32`'s input and output slice AND stick
-///    `(dim,size)` vectors EQUAL (`ddl_conversion.cpp:2715-2729` compares the vectors
-///    `getStickSizes` returns, whose dim component is the `PrimaryDimTypes` enum, so
-///    INPUT `["out"]` vs OUTPUT `["mb"]` is the `UNREACHABLE` "slice size does not match"
-///    the round-1 spelling hit on the pod) — the u32 index table's `mb`-sticked output
-///    demands an `mb`-sticked fp32 input too.
-///  • `quantization_double_pad.ddl` SHARES `%stick_dim` between `dl16tofp32`'s two
-///    operands — the input reaches it via `%slice_layout_in = layout(%stick_dim)`, the
-///    output via `%padded_dim_out`'s `nonPaddedDim` (the pad stripped at
-///    `ddl_conversion.cpp:2422-2426`), both order-fixed at sliceDims position 0 — so the
-///    leg's input and output sticks must name the SAME dim. The round-2 FLAT-TAIL
-///    spelling (input stick `out`, output stick `mb`) emptied the binding intersection
-///    and died at `ddl_conversion.cpp:2539` ("Could not find any suitable dimension
-///    mapping", measured at tiny26 sdsc_9 = the emxf leg); the probe falsified the
-///    shortcut of resting the Kᵀ-restickify's own output dim-0-sticked too (its input
-///    and output would stick the SAME axis, the same-dim class the probe's silent form
-///    refused at :2539). So the mint carries a SECOND restickify — the flat door
-///    [`restickify_flat_opspec_2d`], probe-validated on the pod — that re-sticks the
-///    Kᵀ door's m_pad-sticked output into the FLAT `[W, m_pad]` fp16 table this leg
-///    reads with BOTH sticks on `mb`.
-/// So the mint's chain is: emrt (Kᵀ restickify, RowBlocked fp16) → emfl (flat
-/// restickify) → emxf (`Flat`: flat read, flat write) → emidx (`Flat`: flat read, flat
-/// write — the equality) → the per-slot gathers' rank-1 u32 stream.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ConvertArrangement {
-    /// Byte-identical legacy: both operands stick-on-`out`, RowBlocked at rows>1.
-    Staged,
-    /// The mint's two legs (`dl16tofp32` and `fp32toint32`): input AND output stick `mb`
-    /// — the shared-`%stick_dim` law and the DDL equality, both satisfied by construction.
-    Flat,
-}
-
-/// [`convert_opspec`] with the per-operand arrangement chosen. The STAGED form (every
-/// existing caller, byte-identical) keeps both sticks on `out`, which the
-/// ONE classifier reads RowBlocked post-fold — the rank-3 `[mb,out,1]` staging every
-/// residual-style consumer addresses. The FLAT form (design N1 — the prefill-m>1
-/// ExpertMatmul mint's two legs, `fp32toint32` and its `dl16tofp32` feeder) puts a stick
-/// on `mb` instead: NOT the last non-unit dim, so [`view_stick_layout`] classifies the
-/// view **Flat** (row-major `[W, m_pad]`) and slot s's token-run lands at u32 ELEMENTS
-/// `s·m_pad .. +m` — the ONE contiguous run the gather's rank-1 index view reads
-/// (`GatherIndexConversion`: one run in, one run out; per-slot `first_entry = s·m_pad`,
-/// stick-aligned because `cols` is a whole-stick multiple, so every row is whole words
-/// and ANY `mb` split is word-safe). `Flat` sticks BOTH operands there — the
-/// `fp32toint32` equality AND the `dl16tofp32` shared-`%stick_dim` law both demand the
-/// same-named dim on both sides (see [`ConvertArrangement`]); the flat-restickify
-/// [`restickify_flat_opspec_2d`] exists to produce the flat fp16 input. The
-/// V-restickify's input is the card-proven precedent for a stick-on-dim-0 Flat view.
-fn convert_opspec_arranged(
-    op: OpFunc,
-    rows: u32,
-    cols: u32,
-    in_name: &str,
-    o_name: &str,
-    arrangement: ConvertArrangement,
-) -> Result<OpSpec, String> {
-    // ⛔ P1: the flat form is the mint's two legs and nothing else — every other convert's
-    // output is consumed stick-major (residual / fp8 activation), so a flat output for them is
-    // on-card garbage; a typed build `Err` here, never a silent emit.
-    match arrangement {
-        ConvertArrangement::Staged => {}
-        ConvertArrangement::Flat if !matches!(op, OpFunc::Fp32ToInt32 | OpFunc::Dl16ToFp32) => {
-            return Err(format!(
-                "convert {in_name}->{o_name}: the flat arrangement (BOTH operands stick 'mb', \
-                 flat consecutive rows) is the mint's two legs — fp32toint32 (the gather-index \
-                 leg) and dl16tofp32 (its feeder, whose quantization_double_pad.ddl bind shares \
-                 %stick_dim between operands); this convert's output is consumed stick-major \
-                 and has no reader for it"
-            ));
-        }
-        _ => {}
-    }
     let (in_df, out_df) = convert_dtypes(op);
     // A dtype-CONVERT touches BOTH its input and output dataspaces per core, so the stick-axis split
     // must keep each core's slab a whole stick of the WIDER of the two formats (max elems/stick):
@@ -4229,43 +4152,14 @@ fn convert_opspec_arranged(
     // Validate `cols` against the WIDER stick (128 for the fp8 output), not just fp16's 64: an fp8
     // convert whose cols is a 64- but not 128-multiple is a typed `Err` here, never a sub-stick fault.
     assert_df_stick_multiple(cols, stick_df)?;
-    // ⭐ N1: in the FLAT form a stick rides `mb` (`stickDimOrder_: ["mb"]`,
-    // `stickSize_: [32]` — the same u32 stick the gather's KERNEL_IDX view declares), so `rows`
-    // is a stick extent of the OUTPUT exactly as `cols` is of the staged form: it must tile
-    // whole sticks or the declaration itself is malformed — a typed `Err`, never a bake fault.
-    if arrangement != ConvertArrangement::Staged {
-        assert_df_stick_multiple(rows, out_df)?;
-    }
     let cols_ext = StickExtent::<Fp16>::new(cols)?;
     let dims = vec![
         ItDim {
             name: "mb",
             size: rows,
             is_reduction: false,
-            // ⭐ N1 WORK DIVISION — in the index-rows form `mb` CARRIES the output's stick, so it
-            // is a STICK dim of the division at the output's df (SenUint32 = 32 elems). The
-            // mb-first branch of `distribute_cores` splits `mb` to the hilt by ELEMENT count
-            // (its own doc: flat row-major activations, `!is_stick`), which at the mint's
-            // `[W, m_pad]` hands each core a SUB-STICK `mb` (tiny26 `[64, 64]`: 32 cores ⇒
-            // per-core mb 2). Each core's slab is still whole u32 WORDS — the collision guard
-            // passes, and that weaker property is exactly what let the division reach the pod —
-            // but the vendor's chunk-param walk demands more: every chunk param along a dim
-            // must be a multiple of that dim's stick size in EVERY non-index lds
-            // (`isDimensionParamMultipleOfStickSize`, L3DlOpsScheduler.cpp:1429; `getStickSize`
-            // :447 answers the stick size for a stick dim and 1 otherwise), so with the output
-            // sticked on `mb` at 32, `param % 32 != 0` for every `param ≤ 2` — the EMPTY
-            // candidate set the whole bundle is refused with (`DtException: There must be at
-            // least one valid candidate.`, :1535; measured ×2 deterministic at 26b and tiny26).
-            // Declaring the dim a stick keeps that branch off it (the out loop splits by STICK
-            // COUNT, never below one whole stick per core), and `WorkPlan::divide`'s
-            // whole-stick clause makes any sub-stick `mb` division a `cargo` `Err` naming the
-            // dim — the same law `out` has always had.
-            is_stick: arrangement != ConvertArrangement::Staged,
-            df: if arrangement != ConvertArrangement::Staged {
-                out_df
-            } else {
-                Df::Fp16
-            },
+            is_stick: false,
+            df: Df::Fp16,
         },
         ItDim {
             name: "out",
@@ -4302,8 +4196,8 @@ fn convert_opspec_arranged(
     // rank-2 collapse drops the `y` dim dxp's buffer walk indexes (the `getBufferCapacityForNode`
     // crash recorded above). Kept a SEPARATE flag from `is_fp32_convert` because that one also
     // drives the RowBlocked arrangement pair, and the u32 output is a GATHER INDEX whose rows are
-    // consecutive u32 entries — the arrangement the index's own declaration states, not a residual's
-    // (and which [`convert_opspec_arranged`]'s index-rows form now EMITS for the mint's leg).
+    // consecutive u32 entries — the arrangement the index's own declaration states, not a
+    // residual's.
     let is_narrowing_convert = is_fp32_convert || matches!(op, OpFunc::Fp32ToInt32);
     let stickmajor = rows > 1 && !is_narrowing_convert;
     let time_tile = plan
@@ -4314,23 +4208,10 @@ fn convert_opspec_arranged(
     // side reads RowBlocked x; the fp32 side writes RowBlocked x32). Only for multi-row fp32 converts.
     let rb = is_fp32_convert && rows > 1;
     let mk = |is_input: bool, name: &str, role: Role, df: Df| -> Result<AnyTensorArg, String> {
-        // ⭐ N1: the FLAT form puts a stick on `mb` — dim 0 of `[mb,out,y]`, NOT the last
-        // non-unit dim — so the ONE classifier folds the trailing `y` and classifies the
-        // view FLAT (`dev_off(s, t) = s·cols + t`). `Flat` sticks BOTH operands there
-        // (the fp32toint32 DDL equality, unary_parallel.ddl:59-60, AND the dl16tofp32
-        // shared-%stick_dim law — see [`ConvertArrangement`]); the flat-restickify
-        // produces the flat fp16 input the arrangement reads. The staged form keeps
-        // stick-on-`out` on both sides.
-        let stick = match arrangement {
-            ConvertArrangement::Staged => "out",
-            ConvertArrangement::Flat => "mb",
-        };
-        // RowBlocked addressing: the staged pair at rows>1 (the fp32 residual seam). The
-        // flat views are Flat by construction (their stick rides dim 0).
-        let rb_arg = match arrangement {
-            ConvertArrangement::Staged => rb,
-            ConvertArrangement::Flat => false,
-        };
+        // Both operands keep their stick on `out`; the pair addresses RowBlocked at rows>1
+        // for the fp32 residual seam (`rb` below).
+        let stick = "out";
+        let rb_arg = rb;
         if stickmajor {
             Ok(AnyTensorArg::R2(
                 TensorArg::<2>::new(
@@ -4400,72 +4281,6 @@ pub fn assemble_convert(
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"))
-}
-
-/// Assemble the mint's `dl16tofp32` leg — the FLAT convert ([`ConvertArrangement`]):
-/// reads the FLAT-restickify's fp16 output and writes the fp32 index table, BOTH
-/// stick `mb` — the shared-`%stick_dim` law (`quantization_double_pad.ddl` binds the
-/// leg's input and output sticks to the SAME dim; the flat-tail spelling that read the
-/// Kᵀ-restickify's `out`-sticked output died at `ddl_conversion.cpp:2539`, which is why
-/// the flat-restickify exists) and the arrangement the `fp32toint32` leg's DDL equality
-/// (`unary_parallel.ddl:59-60`) demands of its input. The op is FIXED to `dl16tofp32`
-/// (the P1 gate names the two legal legs), so it takes no `op_func` string. Emit-time
-/// panic on a malformed spec = a `cargo build` error (guard-every-crash), same as the
-/// other `assemble_*`.
-pub fn assemble_convert_index_rows_widen(
-    op_name: &str,
-    rows: u32,
-    cols: u32,
-    in_: &Stk<RowBlockedTag>,
-    o: &Stk<RowBlockedTag>,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> EmittedOp {
-    let op = convert_opspec_arranged(
-        OpFunc::Dl16ToFp32,
-        rows,
-        cols,
-        in_.name(),
-        o.name(),
-        ConvertArrangement::Flat,
-    )
-    .unwrap_or_else(|e| panic!("assemble_convert_index_rows_widen {op_name}: {e}"));
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_convert_index_rows_widen {op_name}: {e}"))
-}
-
-/// Assemble the mint's `fp32toint32` leg — a dtype-convert whose OUTPUT is the gather's INDEX
-/// TABLE at the TRANSPOSED shape `[rows=W, cols=m_pad]` (W = padded slot count, m_pad = padded
-/// token count): [`convert_opspec_arranged`] with the FLAT arrangement, so slot s's u32
-/// run lands at elements `s·m_pad` — the contiguous run the per-slot `GatherIndex::of_expert_planes`
-/// view reads at `first_entry = s·m_pad` — and the INPUT carries the SAME `mb` stick, the DDL
-/// equality (`unary_parallel.ddl:59-60`) both operands must share. The op is FIXED to
-/// `fp32toint32` (the form has no other legal op — the P1 gate in
-/// [`convert_opspec_arranged`]), so it takes no `op_func` string. The input is the
-/// `dl16tofp32` leg's fp32 output, read flat (the same declaration). Emit-time panic on a
-/// malformed spec = a `cargo build` error (guard-every-crash), same as the other `assemble_*`.
-pub fn assemble_convert_index_rows(
-    op_name: &str,
-    rows: u32,
-    cols: u32,
-    in_: &Stk<RowBlockedTag>,
-    o: &Stk<RowBlockedTag>,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> EmittedOp {
-    let op = convert_opspec_arranged(
-        OpFunc::Fp32ToInt32,
-        rows,
-        cols,
-        in_.name(),
-        o.name(),
-        ConvertArrangement::Flat,
-    )
-    .unwrap_or_else(|e| panic!("assemble_convert_index_rows {op_name}: {e}"));
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_convert_index_rows {op_name}: {e}"))
 }
 
 /// Assemble a dtype-convert op over an OFFSET SLICE of its operands (see [`convert_opspec`]):
@@ -5015,14 +4830,15 @@ mod transpose_tests {
     /// output at the golden's shape. At `[256, 128]`: 16 atomic 8-blocks, 2 input sticks; the
     /// max-product candidates are `(out 1, mb 32)` and `(out 2, mb 16)`, both 32 cores, both
     /// perfectly balanced in atomic units — key (3) (the larger out split, the golden's `(8, 4)`
-    /// over the mirrored `(4, 8)`) is what picks `(2, 16)`. And the MINT's own shapes land on whole
-    /// blocks with cores left over: `[128, 128]` — the padded token count the prefill-m>1 index mint
-    /// transposes — takes `{"out": 2, "mb": 16}` (per-core mb 8 = one whole block), and `[64, 64]`
-    /// takes `{"mb": 8}` (out is a single stick; per-core mb 8).
+    /// over the mirrored `(4, 8)`) is what picks `(2, 16)`. And the square shapes land on whole
+    /// blocks with cores left over: `[128, 128]` takes `{"out": 2, "mb": 16}` (per-core mb 8 =
+    /// one whole block), and `[64, 64]` takes `{"mb": 8}` (out is a single stick; per-core
+    /// mb 8).
     #[test]
-    fn the_choice_rule_breaks_its_ties_on_balance_then_the_stick_axis_and_covers_the_mint_shapes() {
+    fn the_choice_rule_breaks_its_ties_on_balance_then_the_stick_axis_and_covers_the_square_shapes()
+    {
         let square_128 = transpose_opspec(128, 128, "t1", "t2")
-            .expect("the mint's padded token count is a whole-block division");
+            .expect("a [128,128] transpose is a whole-block division");
         assert_eq!(
             square_128.iter.splits(),
             &BTreeMap::from([("mb", 16), ("out", 2)])
@@ -6189,145 +6005,14 @@ pub fn try_assemble_restickify_transpose_2d(
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
 }
 
-/// ⭐ THE FLAT RESTICKIFY — the mint's SECOND restickify, and it is FORCED (wall 3 of the
-/// prefill-m>1 ExpertMatmul mint chain): the `dl16tofp32` leg's DDL bind
-/// (`quantization_double_pad.ddl`) SHARES `%stick_dim` between its two operands — input
-/// via `%slice_layout_in = layout(%stick_dim)`, output via `%padded_dim_out`'s
-/// `nonPaddedDim` — so the leg's input and output sticks must name the SAME dim, and its
-/// flat fp32 output therefore demands a FLAT fp16 input. The Kᵀ restickify's output is
-/// `[W, m_pad]` sticked on `m_pad` (dim 1, the card-proven `kcache_kt_write_offset`
-/// re-tile `[m_pad/64, W, 64]`) — NOT flat at `m_pad > 64` — and re-sticking the
-/// Kᵀ door's own output to dim 0 is IMPOSSIBLE: its input and output would then stick
-/// the SAME axis (the staging's W-sticked read and a W-sticked flat write), the
-/// same-dim binding the standalone probe measured REFUSED at
-/// `ddl_conversion.cpp:2539` ("Could not find any suitable dimension mapping" — the
-/// restickify DDL requires the two ports' stick dims to be DISTINCT actual dims). So the
-/// chain is TWO doors: the Kᵀ restickify (staging's W-stick → K-form's m_pad-stick,
-/// unchanged) then THIS door (K-form's m_pad-stick → flat W-stick):
-///   • INPUT  logical `[rows=W, cols=m_pad]`, stick = `out` (dim 1 = LAST) ⇒ stick-blocked
-///     `[m_pad/64, W, 64]` — reads the K-form at ANY `m_pad`, exactly the bytes the Kᵀ
-///     door wrote (that seam is byte-identical).
-///   • OUTPUT logical `[rows=W, cols=m_pad]`, stick = `mb` (dim 0, NOT last) ⇒ device_size
-///     FLAT row-major `w·m_pad + t` — the V-door's card-proven stick-on-dim-0 declaration,
-///     mirrored onto the write side; the buffer the `dl16tofp32` Flat leg reads.
-/// The binding (input stick `out` ≠ output stick `mb`, both dims shared across ports) is
-/// PROBE-VALIDATED on the pod (`dxp_standalone --bundle`: exit 0 with the real tiny26
-/// emrt sdsc re-dimensioned to exactly this form; the same-dim "silent" control refuses
-/// at :2539, proving the check discriminates). The physical forms are pinned by the two
-/// card-proven laws the whole stack already runs on: stick-on-last ⇒
-/// `[stickdim/64, other, 64]` (`kcache_kt_write_offset` at cap≫64) and stick-on-dim-0 ⇒
-/// flat row-major (the V-door read) — which coincide at the probe's 64×64, explaining its
-/// byte-identical control binary without vacuity.
-fn restickify_flat_opspec_2d(
-    rows: u32,
-    cols: u32,
-    in_name: &str,
-    o_name: &str,
-) -> Result<OpSpec, String> {
-    // Both extents must be whole 64-sticks: `cols` (m_pad) is the Kᵀ door's own output
-    // stick, `rows` (W) is the staging contract's stick-group axis — both already 64s by
-    // the mint's pad laws; stated here so a violation is a typed `Err`, never a bake fault.
-    let _rows_ext = StickExtent::<Fp16>::new(rows)?;
-    let _cols_ext = StickExtent::<Fp16>::new(cols)?;
-    // Canonical dim names (`mb`/`out`) — `set_iter_dim_i` drops non-slot names from `N_`,
-    // and the converts this door feeds name the SAME axes `mb`(W)/`out`(m_pad), so the
-    // seam's vocabulary is shared, not merely compatible. Both marked stick (the Kᵀ door's
-    // pattern) so the splitter finds a valid stick-multiple candidate on each operand.
-    let dims = vec![
-        ItDim {
-            name: "mb",
-            size: rows,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-        ItDim {
-            name: "out",
-            size: cols,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-    ];
-    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores)?;
-    // INPUT: K-form view `[mb=W, out=m_pad]` sticked on `out` (dim 1 = LAST, the
-    // dxp-friendly position the Kᵀ door's own input requires) ⇒ stick-blocked
-    // `[m_pad/64, W, 64]` — the Kᵀ door's output bytes, read correctly at ANY `m_pad`.
-    let input = TensorArg::<2>::new(
-        true,
-        in_name.to_string(),
-        Role::Input,
-        [Scale::Active, Scale::Active],
-        plan.iter_syms(["mb", "out"]),
-        ["mb", "out"],
-        "out",
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?;
-    // OUTPUT: flat view `[mb=W, out=m_pad]` sticked on `mb` (dim 0, NOT last) ⇒ FLAT
-    // row-major `w·m_pad + t` — the V-door's card-proven dim-0-stick declaration on the
-    // write side, the buffer the `dl16tofp32` Flat leg's shared-%stick_dim bind demands.
-    let output = TensorArg::<2>::new(
-        false,
-        o_name.to_string(),
-        Role::Output,
-        [Scale::Active, Scale::Active],
-        plan.iter_syms(["mb", "out"]),
-        ["mb", "out"],
-        "mb",
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?;
-    Ok(OpSpec {
-        op: OpFunc::Restickify,
-        is_reduction: false,
-        iter: plan,
-        args: vec![AnyTensorArg::R2(input), AnyTensorArg::R2(output)],
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-    })
-}
-
-/// [`restickify_flat_opspec_2d`] assembled — the fallible form, because the mint's caller
-/// maps the LX refusal into its own named build error (the `try_assemble_restickify_transpose_2d`
-/// pattern). ⛔ MUST FAIL CLOSED ON LX for the same reason the transpose door does: this
-/// restickify carries `time_tile: None` — the output stick rides `mb`, and dividing `mb` in
-/// time would split an output stick — so a resident set that overflows the scratchpad is a
-/// NAMED REFUSAL, never a descriptor that addresses past LX and dies on card as a
-/// `DtException`.
-pub fn try_assemble_restickify_flat_2d(
-    op_name: &str,
-    rows: u32,
-    cols: u32,
-    in_name: &str,
-    o_name: &str,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
-    let op = restickify_flat_opspec_2d(rows, cols, in_name, o_name)?;
-    // The resident set is the 1 input + 1 output per-core tile, which for a relayout are
-    // the same extents on both sides (the swap is in the addressing, not the size).
-    let (per_mb, per_out) = (
-        op.iter.per_core_extent("mb"),
-        op.iter.per_core_extent("out"),
-    );
-    let resident = 2 * u64::from(per_mb) * u64::from(per_out) * u64::from(Fp16::WORD_LENGTH);
-    if resident > USABLE_LX_BYTES {
-        return Err(format!(
-            "flat restickify [{rows}, {cols}]: the per-core tile is (mb {per_mb}, out {per_out}) \
-             on {} cores, so the resident input+output set is {resident} B against the \
-             {USABLE_LX_BYTES}-B LX scratchpad. This door carries `time_tile: None` and cannot be \
-             time-tiled instead — its output stick rides `mb`, so dividing `mb` in time would \
-             split an output stick. Flatten a narrower column block and loop, which keeps each \
-             descriptor's resident set inside LX.",
-            op.iter.cores_used().get(),
-        ));
-    }
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
-}
+// ⛔ THE FLAT RESTICKIFY IS GONE — `restickify_flat_opspec_2d` /
+// `try_assemble_restickify_flat_2d` (the second restickify of the per-expert index-table
+// chain: the K-form's m_pad-stick re-laid flat W-stick for the `dl16tofp32` leg's
+// shared-`%stick_dim` bind) existed only for the hand-written per-op MoE card lowering,
+// which is deleted: the MoE lowers only from `kernels/moe.py` through KTIR. The probe
+// record (the same-dim "silent" control refusing at `ddl_conversion.cpp:2539`, the
+// two-distinct-stick-dims law the restackify DDL demands) survives in this file's
+// history.
 
 /// PATH B (V side): a RANK-2 per-head restickify that RE-STICKS the natural V cache `[cap,hd]` (flat
 /// row-major, the on-card `[1,hd]`-per-slot write) into the hd-sticked `[cap,hd]` KERNEL the value bmm
@@ -7379,169 +7064,8 @@ mod fp32toint32_convert_law {
     fn the_ex_unit_is_sfp() {
         assert_eq!(OpFunc::Fp32ToInt32.ex_unit().as_str(), "sfp");
     }
-}
 
-/// ⭐ N1 — the prefill-m>1 mint's convert chain: the CONSECUTIVE-ROWS output arrangement.
-/// The router's top-k table is transposed to `[W, m_pad]` (W padded slots × m_pad padded
-/// tokens), flattened by the SECOND restickify (the K-form's m_pad stick → the flat
-/// table's `mb` stick), then staged fp16→fp32 (the FLAT `dl16tofp32` leg) and minted
-/// into the gather's index table by the FLAT `fp32toint32` leg (both legs' operands
-/// `mb`-sticked — the shared-%stick_dim law and the DDL equality
-/// unary_parallel.ddl:59-60): slot s's u32 run must land at elements `s·m_pad .. +m` —
-/// ONE contiguous run per slot, exactly what the per-slot
-/// `GatherIndex::of_expert_planes` rank-1 index view reads at `first_entry = s·m_pad`.
-/// 26b: `[W=128, m_pad=128]`; tiny26: `[64, 64]`.
-#[cfg(test)]
-mod convert_index_rows_law {
-    use super::*;
-
-    fn op(rows: u32, cols: u32) -> OpSpec {
-        convert_opspec_arranged(
-            OpFunc::Fp32ToInt32,
-            rows,
-            cols,
-            "em_t32",
-            "em_idx",
-            ConvertArrangement::Flat,
-        )
-        .expect("the index-rows convert emits")
-    }
-
-    fn widen(rows: u32, cols: u32) -> OpSpec {
-        convert_opspec_arranged(
-            OpFunc::Dl16ToFp32,
-            rows,
-            cols,
-            "em_t",
-            "em_t32",
-            ConvertArrangement::Flat,
-        )
-        .expect("the flat widen convert emits")
-    }
-
-    fn out_arg(op: &OpSpec) -> &AnyTensorArg {
-        op.args
-            .iter()
-            .find(|a| !a.view().is_input)
-            .expect("an output arg")
-    }
-
-    fn in_arg(op: &OpSpec) -> &AnyTensorArg {
-        op.args
-            .iter()
-            .find(|a| a.view().is_input)
-            .expect("an input arg")
-    }
-
-    /// ⭐ THE OUTPUT IS FLAT AND ROW s LANDS AT ELEMENT s·m_pad — the whole point of the form:
-    /// the stick rides `mb` (NOT the last non-unit dim), the ONE classifier folds the trailing
-    /// `y` and classifies the view row-major, and `dev_off` — the SAME function the per-core
-    /// start and the on-card walk derive from — places element (s, t) at `s·m_pad + t`. The
-    /// staged form (stick on `out`) would place it at `(t/32)·W + s`: the gather's run would
-    /// straddle every token-group — the scramble this form exists to kill.
-    #[test]
-    fn the_output_is_flat_and_row_s_lands_at_s_times_m_pad() {
-        let (w, m_pad) = (128u32, 128u32);
-        let o = op(w, m_pad);
-        let out = out_arg(&o);
-        assert_eq!(out.view().stick, "mb", "the stick rides the row axis");
-        let sl = view_stick_layout(&out.view(), &o.iter);
-        assert!(
-            matches!(sl.addressing(), crate::sdsc_abstract::Addressing::RowMajor),
-            "flat row-major, not stick-major"
-        );
-        assert_eq!(sl.dev_off(0, 0), 0);
-        assert_eq!(
-            sl.dev_off(1, 0),
-            m_pad as usize,
-            "slot 1's run starts at m_pad"
-        );
-        assert_eq!(
-            sl.dev_off(3, 96),
-            3 * m_pad as usize + 96,
-            "element (s, t) at s·m_pad + t"
-        );
-        assert_eq!(
-            m_pad % out.view().df.elems_per_stick(),
-            0,
-            "every row is whole u32 sticks — the per-slot run is stick-aligned"
-        );
-    }
-
-    /// ⭐ THE INPUT CARRIES THE SAME `mb` STICK — the DDL equality
-    /// (`unary_parallel.ddl:59-60`: the fp32toint32 operands' slice AND stick
-    /// `(dim,size)` vectors must be EQUAL; `ddl_conversion.cpp:2715-2729` compares them and
-    /// the round-1 spelling — input `["out"]` vs output `["mb"]` — died in the
-    /// `UNREACHABLE` "slice size does not match"). The input reads the FLAT
-    /// `dl16tofp32` leg's fp32 output: same classifier, df, extents ⇒ `addr_eq`, the
-    /// arrangement authority's demand (a divergence is the producer/consumer scramble).
-    #[test]
-    fn the_input_still_reads_the_dl16tofp32_table_arrangement() {
-        let (w, m_pad) = (128u32, 128u32);
-        let o = op(w, m_pad);
-        let inp = in_arg(&o);
-        assert_eq!(inp.view().stick, "mb", "the DDL equality's dim component");
-        let reader = view_stick_layout(&inp.view(), &o.iter);
-        let writer = widen(w, m_pad);
-        let writer_out = out_arg(&writer);
-        assert_eq!(writer_out.view().stick, "mb");
-        assert!(
-            reader.addr_eq(&view_stick_layout(&writer_out.view(), &writer.iter)),
-            "the mint's fp32toint32 input and the dl16tofp32 output address the SAME bytes"
-        );
-    }
-
-    /// ⭐ THE WIDEN LEG — the mint's `dl16tofp32`: BOTH operands stick `mb` (the
-    /// shared-`%stick_dim` law `quantization_double_pad.ddl` binds on the leg — the
-    /// round-2 flat-TAIL spelling stuck the input on `out` and died at
-    /// `ddl_conversion.cpp:2539`), reading the FLAT-restickify's fp16 output and writing
-    /// the fp32 table the `fp32toint32` leg reads.
-    #[test]
-    fn the_widen_leg_reads_and_writes_flat() {
-        let (w, m_pad) = (128u32, 128u32);
-        let s = widen(w, m_pad);
-        let (inp, out) = (in_arg(&s), out_arg(&s));
-        assert_eq!(inp.view().stick, "mb", "the flat fp16 table's stick");
-        assert!(!inp.view().row_blocked, "flat read — the stick rides dim 0");
-        assert_eq!(out.view().stick, "mb", "the flat fp32 table's stick");
-        assert!(
-            !out.view().row_blocked,
-            "flat write — the stick rides dim 0"
-        );
-        let sl = view_stick_layout(&out.view(), &s.iter);
-        assert!(
-            matches!(sl.addressing(), crate::sdsc_abstract::Addressing::RowMajor),
-            "the fp32 table is flat row-major"
-        );
-        assert_eq!(
-            sl.dev_off(1, 0),
-            m_pad as usize,
-            "row 1 of the fp32 table starts at m_pad — the flat stride"
-        );
-        // The division keeps both axes whole sticks: `mb` (a stick dim in this form) rides
-        // unsplit, `out` takes one core per fp16 stick of the WIDER basis.
-        let per_mb = s.iter.per_core_extent("mb");
-        assert_eq!(per_mb, w, "`mb` — the output's stick axis — rides unsplit");
-        assert_eq!(per_mb % out.view().df.elems_per_stick(), 0);
-    }
-
-    /// ⛔ THE FLAT FORM IS THE MINT'S TWO LEGS (P1) — every other convert's output is
-    /// consumed stick-major, so a flat output for them is on-card garbage; each
-    /// combination is a typed build `Err`, never a silent emit. `fp32toint32` is the
-    /// gather-index leg and `dl16tofp32` its feeder — the only two the DDL laws license.
-    #[test]
-    fn the_form_is_the_mint_legs_only() {
-        for bad in [OpFunc::Fp32ToDl16, OpFunc::Qfp8ch] {
-            let err = convert_opspec_arranged(bad, 128, 128, "x", "y", ConvertArrangement::Flat)
-                .unwrap_err();
-            assert!(
-                err.contains("mint's two legs"),
-                "the law names the legs: {err}"
-            );
-        }
-    }
-
-    /// The STAGED default is unchanged: `convert_opspec` (every existing caller, the m=1 chain)
+    /// The STAGED default: `convert_opspec` (every existing caller, the m=1 chain)
     /// still emits stick-on-`out` and classifies stick-major at rows>1.
     #[test]
     fn the_staged_default_is_unchanged() {
@@ -7555,159 +7079,6 @@ mod convert_index_rows_law {
             ),
             "the staged output stays stick-major at rows>1"
         );
-    }
-
-    /// The MINT SHAPES emit, and the division is WHOLE STICKS on both axes — the vendor's
-    /// chunk-param law, not merely the collision guard's whole words. ⛔ The pin this replaces
-    /// ("any `mb` split keeps each core's slab whole words", 32 cores at every shape) was
-    /// FALSIFIED on the pod: whole u32 WORDS per core is the collision guard's precondition,
-    /// but the vendor's `isValidChunkParamForDim` demands every chunk param along a dim be a
-    /// multiple of that dim's stick size in EVERY non-index lds (L3DlOpsScheduler.cpp:1429),
-    /// and this form's output stick rides `mb` at 32 — the 32-way split's per-core `mb = 2`
-    /// left `param % 32 != 0` for every candidate ≤ 2, the EMPTY set the whole bundle was
-    /// refused with (`DtException: There must be at least one valid candidate.`, :1535;
-    /// deterministic ×2 at 26b and tiny26). The division now splits STICK COUNTS: `mb` (a
-    /// stick dim in this form) rides unsplit and `out` takes one core per fp32 stick.
-    #[test]
-    fn the_mint_shapes_emit_and_split_whole_sticks() {
-        for (w, m_pad) in [(64u32, 64u32), (128, 128)] {
-            let o = op(w, m_pad);
-            let u32_stick = out_arg(&o).view().df.elems_per_stick();
-            let fp32_stick = in_arg(&o).view().df.elems_per_stick();
-            let per_mb = o.iter.per_core_extent("mb");
-            let per_out = o.iter.per_core_extent("out");
-            assert_eq!(per_mb, w, "`mb` — the output's stick axis — rides unsplit");
-            assert_eq!(
-                per_mb % u32_stick,
-                0,
-                "per-core `mb` is whole u32 sticks — the vendor's chunk-param multiple"
-            );
-            assert_eq!(
-                per_out % fp32_stick,
-                0,
-                "per-core `out` is whole sticks of the division's fp32-wide basis"
-            );
-            assert_eq!(
-                o.iter.cores_used().get(),
-                (m_pad / fp32_stick).max(1),
-                "one core per `out` stick at [{w}, {m_pad}]"
-            );
-            assert_eq!(
-                per_mb * per_out * o.iter.cores_used().get(),
-                w * m_pad,
-                "the division covers the whole table — no idle rows, no double-writes"
-            );
-        }
-    }
-
-    /// The emit path itself: the assembler runs the real `emit_sdsc_tiled` — the collision
-    /// guard (disjoint per-core output bytes), the Flat `maxDimSizes_` walk, and the
-    /// `stickDimOrder_ ["mb"]` serialization — at the 26b mint shape.
-    #[test]
-    fn the_mint_leg_emits_through_the_collision_guard() {
-        let t32 = rb("em_t32", 128, 128);
-        let idx = rb("em_idx", 128, 128);
-        let mut sym = 0i64;
-        let emitted = assemble_convert_index_rows("emidx_o1", 128, 128, &t32, &idx, &mut sym, None);
-        assert!(
-            !emitted.dsc().dscs_.is_empty(),
-            "a descriptor was emitted for the flat-output convert"
-        );
-    }
-
-    /// ⭐ THE FULL MINT CHAIN COMPOSES — every seam `addr_eq`-checked, the strongest proof
-    /// available short of a senulator run. The chain: the router's padded top-k table
-    /// `[m_pad, W]` (RowBlocked — the staging contract the door wiring must satisfy: a
-    /// `device_extent`-padded router write lands element (t, s) at `(s/64)·m_pad + t`,
-    /// EXACTLY the transpose input's classification below) → the Kᵀ restickify
-    /// (stick-major↔stick-major, card-proven door, unchanged) → the FLAT restickify
-    /// (K-form's m_pad-stick → flat W-stick, probe-validated binding) → `dl16tofp32`
-    /// → `fp32toint32` index-rows. Each producer's output arrangement equals its
-    /// consumer's input arrangement — the arrangement authority's demand at every seam,
-    /// so no producer/consumer scramble is constructible in this composition.
-    #[test]
-    fn the_transpose_legs_output_is_the_convert_legs_input() {
-        let (w, m_pad) = (128u32, 128u32);
-        // The transpose leg at the mint geometry: input `[y=m_pad, out=W]` stick-on-`out`,
-        // output `[out=W, y=m_pad]` stick-on-`y` — the card-proven Kᵀ form.
-        let tr = restickify_kt_opspec_2d(m_pad, w, "em_xp", "em_t", 0, 0)
-            .expect("the mint's transpose leg emits");
-        let (tr_in, tr_out) = (
-            tr.args.iter().find(|a| a.view().is_input).unwrap(),
-            tr.args.iter().find(|a| !a.view().is_input).unwrap(),
-        );
-        // The staging contract: the transpose INPUT is the router's RowBlocked table —
-        // slot-group g's base at g·m_pad WORDS (the padded stride), one word per token
-        // within a group (dev_off is in ELEMENTS of the re-tiled [W/64, m_pad, 64]).
-        let x = view_stick_layout(&tr_in.view(), &tr.iter);
-        assert!(matches!(
-            x.addressing(),
-            crate::sdsc_abstract::Addressing::StickBlocked
-        ));
-        assert_eq!(
-            x.dev_off(0, 64),
-            m_pad as usize * 64,
-            "slot-group 1's base at m_pad words — the padded RowBlocked stride"
-        );
-        assert_eq!(
-            x.dev_off(1, 0) - x.dev_off(0, 0),
-            64,
-            "one word per token within a slot-group"
-        );
-        // Seam 1: the Kᵀ transpose's OUTPUT is the FLAT restickify's INPUT (same bytes) —
-        // the K-form read, stick-blocked on `m_pad` at ANY m_pad.
-        let fl = restickify_flat_opspec_2d(w, m_pad, "em_t", "em_tfl")
-            .expect("the mint's flat restickify emits");
-        let (fl_in, fl_out) = (
-            fl.args.iter().find(|a| a.view().is_input).unwrap(),
-            fl.args.iter().find(|a| !a.view().is_input).unwrap(),
-        );
-        assert_eq!(
-            fl_in.view().stick,
-            "out",
-            "the flat door reads the K-form on its own stick dim"
-        );
-        assert!(
-            view_stick_layout(&tr_out.view(), &tr.iter)
-                .addr_eq(&view_stick_layout(&fl_in.view(), &fl.iter)),
-            "the Kᵀ restickify output and the flat restickify input address the SAME bytes"
-        );
-        // ⭐ THE FLAT OUTPUT: stick `mb` (dim 0, NOT last) ⇒ FLAT row-major — the V-door's
-        // card-proven declaration mirrored onto the write side. Element (w, t) at
-        // `w·m_pad + t`, NOT the K-form's `(t/64)·W·64 + w·64 + t%64` re-tile.
-        assert_eq!(fl_out.view().stick, "mb");
-        let fl_sl = view_stick_layout(&fl_out.view(), &fl.iter);
-        assert!(matches!(
-            fl_sl.addressing(),
-            crate::sdsc_abstract::Addressing::RowMajor
-        ));
-        assert_eq!(
-            fl_sl.dev_off(1, 0),
-            m_pad as usize,
-            "flat row 1 starts at m_pad — the flat stride"
-        );
-        // Seam 2: the flat restickify's OUTPUT is the dl16tofp32 leg's INPUT (same bytes).
-        let cv = widen(w, m_pad);
-        let (cv_in, cv_out) = (
-            cv.args.iter().find(|a| a.view().is_input).unwrap(),
-            cv.args.iter().find(|a| !a.view().is_input).unwrap(),
-        );
-        assert_eq!(cv_in.view().stick, "mb", "the widen leg reads flat");
-        assert!(
-            fl_sl.addr_eq(&view_stick_layout(&cv_in.view(), &cv.iter)),
-            "the flat restickify output and the dl16tofp32 input address the SAME bytes"
-        );
-        // Seam 3: the dl16tofp32 leg's FLAT output is the fp32toint32 leg's input (same
-        // bytes) — the DDL-equality pair, both `mb`-sticked.
-        let idx = op(w, m_pad);
-        let idx_in = idx.args.iter().find(|a| a.view().is_input).unwrap();
-        assert!(
-            view_stick_layout(&cv_out.view(), &cv.iter)
-                .addr_eq(&view_stick_layout(&idx_in.view(), &idx.iter)),
-            "the dl16tofp32 output and the fp32toint32 input address the SAME bytes"
-        );
-        // Seam 4 (the flat index-rows output, row s at s·m_pad) is pinned by this module's
-        // tests above — with these seams, the whole chain is arrangement-checked end to end.
     }
 }
 

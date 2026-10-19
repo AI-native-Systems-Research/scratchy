@@ -623,119 +623,77 @@ pub(crate) fn stage_bound_weights(
             // whole pass over the model -- 4.4s of the 6.94s `load_weights` on granite-3.1-8b, plus
             // the full second copy it wrote.
             let t = bytes;
-            // ⭐ THE EXPERT BANK ARM — BEFORE either dense pad, because a bank takes NEITHER:
-            // its baked pair is `[rows = E·out, cols = in]` (the expert-major stack), so the
-            // DeviceWidth N-pad below would pad the bank's K axis (`for_output(1, cols=in, …)`)
-            // — bumping e.g. the 26b DOWN's 704 to 1024 sticks and appending bytes that make
-            // the retile's `prod(device_size)` staging guard refuse — and the dense K-pad
-            // would widen the bank's N axis (`rows`, the E·out side). The bank's own pad is
-            // the IN axis (its COLS, inner in the on-disk row-major order): the same
-            // `fp8_k_pad` the manifest's expert retile and the door's contraction K take, as
-            // a STRIDED REBUILD (each of the E·out rows copies its `in` real elements and
-            // zero-fills its `in_pad − in` tail — the dense K-pad's own inner-axis law, at
-            // the bank's own orientation). UNFILTERED membership: an ALIGNED bank must take
-            // this arm too (it re-stages at the same width, byte-identical content) or it
-            // would fall into the N-pad and mis-stage; the pad lanes are ZERO, inert to the
-            // contraction (0·w contributes nothing).
-            match wiring
-                .expert_k_pads
-                .iter()
-                .find(|&&(id, _)| id as usize == s_id)
             {
-                Some(&(_, in_pad)) => {
-                    let (in_, bank_rows) = (cols, rows);
-                    if (in_pad as usize) < in_ {
-                        return Err(werr(format!(
-                            "sendnn load_weights: expert bank source {s_id} says in_pad={in_pad} \
-                             but the wiring declares in={in_} — the pad must widen, never narrow \
-                             (wiring/manifest desync)."
-                        )));
-                    }
-                    let mut padded = vec![0u8; bank_rows * in_pad as usize * elem];
-                    for r in 0..bank_rows {
-                        let src_off = r * in_ * elem;
-                        let dst_off = r * in_pad as usize * elem;
-                        padded[dst_off..dst_off + in_ * elem]
-                            .copy_from_slice(&t[src_off..src_off + in_ * elem]);
-                    }
-                    (padded, vec![bank_rows, in_pad as usize])
-                }
-                None => {
-                    // DEVICE stick padding — the shared `bump_sticks_to_splittable` rule: round to a
-                    // whole 64-stick, then bump a prime/awkward stick count (granite lm_head
-                    // 49216/64=769 ⇒ <8 cores) to a multiple of 8 (→ 49664). Zero-pad this GEMM
-                    // weight's N columns to the SAME width so the staged host buffer equals the
-                    // kernel RetileDescriptor's device_size; the shim's `prod(device_size)` staging
-                    // guard then matches. The pad columns are ZERO logits the host never reads (the
-                    // read uses the LOGICAL `vocab = n`). No-op for every already-splittable weight.
-                    // TYPE-SAFE shared device width: `DeviceWidth` is the SOLE padding rule (the same
-                    // law as the emitter's kernel0 manifest and the slot reservation), so the staged
-                    // buffer width == the emitted device width by construction — no shim mismatch
-                    // possible.
-                    //
-                    // ⭐ `for_pointwise`, NOT `for_output(1,·)`: this buffer is ONE per model — it must
-                    // satisfy the OWNING session's manifest, and the owner is the prefill (m = the
-                    // chunk width), never m=1. For every weight crossing the util floor at m=1 (all
-                    // dense weights) the two laws are IDENTICAL — both bump. The router's `[E,hidden]`
-                    // projection is the one real weight below the floor at m=1 (E=128, k=2816 → 360K
-                    // macs): `for_output(1,·)` left it at 128 while its slot and every m≥3 gemm read
-                    // 512, so the checkpoint's row-major bytes staged VERBATIM into the stick-tiled
-                    // slot and the card computed `A @ perm(W)` — wrong experts, junk output (26b).
-                    // The pointwise floor (512) is the max any bucket reads; each bucket's gemm takes
-                    // its own stick-prefix of the one buffer.
-                    let n_dev =
-                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::DeviceWidth::for_pointwise(
-                            cols as u32,
-                        )
-                        .get() as usize;
-                    let n_padded = if n_dev != cols {
-                        // In `[n, k]` the padded axis `n` is the OUTER one, so widening it is appending
-                        // zero rows at the end -- `resize`, not a strided rebuild. (Transposed it was the
-                        // inner axis and every row had to be copied to a wider stride.) Same padded bytes,
-                        // and the only weight that needs any is lm_head.
-                        let mut padded = t;
-                        padded.resize(n_dev * rows * elem, 0);
-                        padded
-                    } else {
-                        t
-                    };
-                    // ⭐ THE DENSE fp8 K-PAD (gemma-4-26b's GeGLU DOWN, k=2112 → 2176): the quantize
-                    // chain and the packed fp8 retile both run at `fp8_k_pad(k)` — a whole 128-elem
-                    // SEN143_FP8 stick, the convert's own law — so the staged buffer's INNER axis (the
-                    // contraction k, `rows` in the manifest's `[k, n]` pair) must widen to match
-                    // `prod(device_size)` or the retile's staging guard refuses. Unlike the N-pad above,
-                    // the K axis is INNER in the on-disk `[n, k]` order: a `resize` would only append
-                    // zeros after the LAST row, so this is a STRIDED REBUILD — each of the `n_dev` rows
-                    // copies its `k` real elements and zero-fills its `k_pad − k` tail. The pad rows are
-                    // ZERO, which the contraction makes inert (0·w contributes nothing); the amax never
-                    // sees them (it reads the activation's logical width). Baked in the wiring because
-                    // WHICH axis is k is a bake fact (an expert bank's N axis is its ROWS).
-                    match wiring
-                        .fp8_k_pads
-                        .iter()
-                        .find(|&&(id, _)| id as usize == s_id)
-                    {
-                        Some(&(_, k_pad)) => {
-                            let k = rows;
-                            if k_pad as usize <= k {
-                                return Err(werr(format!(
-                                    "sendnn load_weights: fp8 K-pad for source {s_id} says k_pad={k_pad} \
+                // DEVICE stick padding — the shared `bump_sticks_to_splittable` rule: round to a
+                // whole 64-stick, then bump a prime/awkward stick count (granite lm_head
+                // 49216/64=769 ⇒ <8 cores) to a multiple of 8 (→ 49664). Zero-pad this GEMM
+                // weight's N columns to the SAME width so the staged host buffer equals the
+                // kernel RetileDescriptor's device_size; the shim's `prod(device_size)` staging
+                // guard then matches. The pad columns are ZERO logits the host never reads (the
+                // read uses the LOGICAL `vocab = n`). No-op for every already-splittable weight.
+                // TYPE-SAFE shared device width: `DeviceWidth` is the SOLE padding rule (the same
+                // law as the emitter's kernel0 manifest and the slot reservation), so the staged
+                // buffer width == the emitted device width by construction — no shim mismatch
+                // possible.
+                //
+                // ⭐ `for_pointwise`, NOT `for_output(1,·)`: this buffer is ONE per model — it must
+                // satisfy the OWNING session's manifest, and the owner is the prefill (m = the
+                // chunk width), never m=1. For every weight crossing the util floor at m=1 (all
+                // dense weights) the two laws are IDENTICAL — both bump. The pointwise floor
+                // (512) is the max any bucket reads; each bucket's gemm takes
+                // its own stick-prefix of the one buffer.
+                let n_dev =
+                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::DeviceWidth::for_pointwise(
+                        cols as u32,
+                    )
+                    .get() as usize;
+                let n_padded = if n_dev != cols {
+                    // In `[n, k]` the padded axis `n` is the OUTER one, so widening it is appending
+                    // zero rows at the end -- `resize`, not a strided rebuild. (Transposed it was the
+                    // inner axis and every row had to be copied to a wider stride.) Same padded bytes,
+                    // and the only weight that needs any is lm_head.
+                    let mut padded = t;
+                    padded.resize(n_dev * rows * elem, 0);
+                    padded
+                } else {
+                    t
+                };
+                // ⭐ THE DENSE fp8 K-PAD (gemma-4-26b's GeGLU DOWN, k=2112 → 2176): the quantize
+                // chain and the packed fp8 retile both run at `fp8_k_pad(k)` — a whole 128-elem
+                // SEN143_FP8 stick, the convert's own law — so the staged buffer's INNER axis (the
+                // contraction k, `rows` in the manifest's `[k, n]` pair) must widen to match
+                // `prod(device_size)` or the retile's staging guard refuses. Unlike the N-pad above,
+                // the K axis is INNER in the on-disk `[n, k]` order: a `resize` would only append
+                // zeros after the LAST row, so this is a STRIDED REBUILD — each of the `n_dev` rows
+                // copies its `k` real elements and zero-fills its `k_pad − k` tail. The pad rows are
+                // ZERO, which the contraction makes inert (0·w contributes nothing); the amax never
+                // sees them (it reads the activation's logical width). Baked in the wiring because
+                // WHICH axis is k is a bake fact.
+                match wiring
+                    .fp8_k_pads
+                    .iter()
+                    .find(|&&(id, _)| id as usize == s_id)
+                {
+                    Some(&(_, k_pad)) => {
+                        let k = rows;
+                        if k_pad as usize <= k {
+                            return Err(werr(format!(
+                                "sendnn load_weights: fp8 K-pad for source {s_id} says k_pad={k_pad} \
                                      but the manifest declares k={rows} — the pad must widen, never narrow \
                                      (wiring/manifest desync)."
-                                )));
-                            }
-                            // Post-N-pad the buffer is `[n_dev, k]` row-major (k inner, `rows` = k).
-                            let mut padded = vec![0u8; n_dev * k_pad as usize * elem];
-                            for n_row in 0..n_dev {
-                                let src_off = n_row * k * elem;
-                                let dst_off = n_row * k_pad as usize * elem;
-                                padded[dst_off..dst_off + k * elem]
-                                    .copy_from_slice(&n_padded[src_off..src_off + k * elem]);
-                            }
-                            (padded, vec![k_pad as usize, n_dev])
+                            )));
                         }
-                        None => (n_padded, vec![rows, n_dev]),
+                        // Post-N-pad the buffer is `[n_dev, k]` row-major (k inner, `rows` = k).
+                        let mut padded = vec![0u8; n_dev * k_pad as usize * elem];
+                        for n_row in 0..n_dev {
+                            let src_off = n_row * k * elem;
+                            let dst_off = n_row * k_pad as usize * elem;
+                            padded[dst_off..dst_off + k * elem]
+                                .copy_from_slice(&n_padded[src_off..src_off + k * elem]);
+                        }
+                        (padded, vec![k_pad as usize, n_dev])
                     }
+                    None => (n_padded, vec![rows, n_dev]),
                 }
             }
         } else {
@@ -1880,9 +1838,6 @@ impl SpyreWorker {
                         // asking `true` here would report `KV_BLOCK_INDEX_TID` unplaced for every
                         // non-gathering bundle and refuse to serve every model.
                         scratchy_target_spyre::wiring::GathersKv::of_layout(&code.layout),
-                        // ⭐ THE SAME QUESTION FOR THE FINE-INDEX BANK — the layout's own placement,
-                        // the widest-tensor-set law the mask's `true` states.
-                        scratchy_target_spyre::wiring::StagesSubpageBank::of_layout(&code.layout),
                         n_consts,
                     )
                     .unplaced(&code.layout);

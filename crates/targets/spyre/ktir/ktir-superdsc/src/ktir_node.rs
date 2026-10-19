@@ -221,22 +221,6 @@ pub enum Program {
     /// REFUSES that shape by name rather than emitting it; the shipped attention's answer — pad the
     /// row count to a stick multiple and loop whole 64×64 tiles — is named in the refusal.
     Transpose,
-    /// A ROW SOFTMAX over `[rows, cols]` — `exp(x − rowmax(x)) / rowsum(exp(x − rowmax(x)))`,
-    /// written longhand as max-reduce → broadcast-sub → exp → sum-reduce → broadcast-div.
-    /// The MoE router's `RouteSoftmax` (gemma: softmax over the scaled top-k scores)
-    /// and `RouteRenorm` (mixtral: scores / rowsum(scores), the same chain minus the
-    /// exp) lower to it. ONE tensor parameter (the scores); the row-max and row-sum
-    /// live in one-stick synthetics, exactly as rmsnorm's mean does.
-    RouteSoftmax,
-    /// `x / rowsum(x, dim=-1)` — mixtral's renormalised top-k scores, the softmax
-    /// chain minus the stability subtract and the exp. ONE tensor parameter.
-    RouteRenorm,
-    /// `act(gate) · up` over the MoE pair rows — the gated activation of the expert
-    /// MLP, the SiluMul computation with the act the block declares (gemma-4: gelu).
-    /// TWO tensor parameters (gate and up). The pair rows fold into `[m, k·w]`
-    /// columns, so the computation is pointwise over whatever layout the sort
-    /// produced — no pair structure is read here.
-    ExpertGatedAct(GatedAct),
     /// `Reshape{Times(H>1)} → RmsNorm{eps, gain}/RmsNormUnit{eps} →
     /// Reshape{Times(1)}` — the per-head q/k norm SANDWICH, fused to per-head
     /// windows over the ORIGINAL tensor. The flatten-back restores exactly the
@@ -271,58 +255,6 @@ pub enum Program {
     WindowedRmsNorm {
         unit: bool,
     },
-    // ── THE MoE ROUTING + EXPERT OPS, in program order ──────────────────
-    // Each names what it computes so the card track can REFUSE IT BY NAME: the
-    // routing permutation and the gathered expert weights need the vendor
-    // `topk.ddl` / gather vocabulary, a separate worklist item, and a silent
-    // nearest-primitive substitution would run a different function.
-    /// Each row's expert indices sorted by ascending score, as the RANK VECTOR
-    /// `rank[i,j] = |{h : x[i,h] < x[i,j]}| + |{h : x[i,h] == x[i,j] ∧ h < j}|`
-    /// — a compare/reduce form of the sort, no permutation emitted. ONE tensor
-    /// parameter (the scores `[m, E]`); the output holds f16 indices.
-    RouteArgsort,
-    /// The last `k` sorted indices of each row — its top-k experts. ONE tensor
-    /// parameter (the sorted indices `[m, E]`); output `[m, k]`.
-    RouteTopK,
-    /// The scores at the chosen indices, `[m, k]` — a row gather by the top-k
-    /// index tensor. TWO tensor parameters (scores `[m, E]`, indices `[m, k]`).
-    RouteGatherScores,
-    /// Each score times its expert's learned scale (`per_expert_scale[idx]`).
-    /// THREE tensor parameters (scores `[m, k]`, indices `[m, k]`, the router
-    /// bundle's per-expert scale row `[E]`).
-    RouteExpertScale,
-    /// The (token, expert) pair rows the expert projections read. GATHERED
-    /// (decode) semantics: a blockwise copy `[m, w] → [m, k·w]` whose output
-    /// column block `j` is the input row — exactly the `[N, top_k, out]` layout
-    /// metal's gathered kernels write, numerically identical, no data-dependent
-    /// permutation. TWO tensor parameters (x, indices — the copy itself is
-    /// data-independent; the indices ride along because every projection reads
-    /// them through the routing).
-    ExpertSort,
-    /// The pair rows back in token order — the identity copy in the same
-    /// (token, slot) layout the sort wrote. TWO tensor parameters.
-    ExpertUnsort,
-    /// Each token's pair rows summed by its scores: `out[n, d] =
-    /// Σ_k rows[n, k, d] · scores[n, k]`. TWO tensor parameters (rows
-    /// `[m·k, hidden]`, scores `[m, k]`).
-    ExpertCombine,
-    /// One projection of each pair's expert over the stacked `[E·out, in]`
-    /// weight bank — the gathered form of `Program::Matmul`'s W8A8 body: the
-    /// weight row each pair reads is selected by its expert index (an
-    /// `indirect` access-tile dim), and the fp8 dequant scale multiply is the
-    /// dense path's own. FOUR tensor parameters at fp8 (rows, routing,
-    /// weights, scales).
-    ExpertMatmul,
-}
-
-/// The activation an expert gates its up projection with — this crate's OWN copy of
-/// the front end's `GatedAct`, because the leaf crate depends on nothing upstream
-/// (a third-party producer states its act the same way). [`Program::ExpertGatedAct`]
-/// carries it, and the door dispatches on it to pick the device primitive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum GatedAct {
-    Silu,
-    Gelu,
 }
 
 /// One buffer of a bundle, as the CALLER numbers it.
