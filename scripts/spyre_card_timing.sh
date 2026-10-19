@@ -16,6 +16,18 @@
 #                             torch ratio, because at 64 output tokens it
 #                             is prefill-diluted (a proof run read 51.3 vs
 #                             torch's 86.4 tok/s — not comparable).
+# An opt-in group, --cells long (2b only), adds the batched ~10k cells —
+# conc-4 and conc-8 at ~10k, the sweep's 0.39x/0.31x TPOT cells — each as
+# ONE wave of `conc` requests on the shared ~10k dataset (its first conc
+# rows), 64 output tokens, one warm-up, on its own boot at the sweep's own
+# shapes (conc-4: mns 4; conc-8: mns 8; both mml 12288). TPOT p50 is each
+# cell's torch ratio row; TTFT p99 is reported alongside with NO torch
+# ratio — the sweep's torch TTFT cells are medians, and the p99 tail is
+# where #701's wave-admission fix shows. These cells are prefill-heavy (a
+# wave is conc x ~7 s of prefill before any decode), so the group is not
+# fast and the wall is stated, not trimmed: expect roughly 5-6 min beyond
+# the base run (two more boots; conc-4 bench ~1.5 min, conc-8 ~2.5-3 min).
+#
 # Each measured run is preceded by exactly one warm-up request (a streamed
 # curl with filler text for the solo cells, vllm bench's own --num-warmups
 # for the batched cell) and is the only run — no reps, no medians across
@@ -44,13 +56,16 @@
 #
 # Usage:
 #   scripts/spyre_card_timing.sh <candidate-scr> <reference-scr> \
-#       [--model 2b|8b] [--port N]
+#       [--model 2b|8b] [--cells long] [--port N]
 #   scripts/spyre_card_timing.sh --self-test
 #
 # Environment:
 #   DS_1K   the shared conc-8 ~1k dataset (default
 #           /work/fronts/ab/ds/conc-1024.jsonl, md5-pinned to the sweep's
 #           own file — the batched cell runs its first 8 rows)
+#   DS_10K  the shared ~10k dataset, needed only for --cells long (default
+#           /work/fronts/ab/ds/conc-10300.jsonl, md5-pinned to the sweep's
+#           own file — the long cells run its first conc rows)
 #   CORES   the cores serve and client are pinned to (default 48-95)
 #
 # Exits non-zero on any refusal; a failed cell fails the whole run. On the
@@ -61,12 +76,13 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
 
-CAND="" REF="" PORT=8079 MODEL_KIND="" SELF_TEST=no
+CAND="" REF="" PORT=8079 MODEL_KIND="" CELLS="" SELF_TEST=no
 usage() { awk 'NR == 1 { next } /^#/ { print substr($0, 3); next } { exit }' "$0" >&2; exit 64; }
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --model) MODEL_KIND=$2; shift 2 ;;
+      --cells) CELLS=$2; shift 2 ;;
       --port) PORT=$2; shift 2 ;;
       --self-test) SELF_TEST=yes; shift ;;
       -*) echo "REFUSING: unknown argument '$1'" >&2; usage ;;
@@ -83,6 +99,14 @@ parse_args() {
     2b|8b) ;;
     *) echo "REFUSING: --model must be 2b or 8b, got '$MODEL_KIND'" >&2; exit 64 ;;
   esac
+  case "$CELLS" in
+    ""|long) ;;
+    *) echo "REFUSING: --cells must be long, got '$CELLS'" >&2; exit 64 ;;
+  esac
+  if [ "$CELLS" = long ] && [ "$MODEL_KIND" = 8b ]; then
+    echo "REFUSING: --cells long is 2b-only — the sweep has no 8b ~10k conc torch cells to pair (its KV budget at ~10k fits ≤2 concurrent seqs), and mml 12288 at mns 8 exceeds the 8b pool" >&2
+    exit 64
+  fi
 }
 parse_args "$@"
 
@@ -149,23 +173,31 @@ PY
 # (TPOT); the tok/s line carries no torch ratio (prefill-diluted at 64 out).
 # Refuses over a missing metric or a missing torch cell — never half a
 # report. Stdout only.
-emit_report() {  # emit_report <runs.jsonl> <sweep.json> <model-short> <serve-shapes> <cand> <cand-md5> <ref> <ref-md5> <host> <date> <boot-s> <boots> <w1k-s> <m1k-s> <w10k-s> <m10k-s> <bench-s> <total-s>
+emit_report() {  # emit_report <runs.jsonl> <sweep.json> <model-short> <serve-shapes> <cand> <cand-md5> <ref> <ref-md5> <host> <date> <boot-s> <boots> <w1k-s> <m1k-s> <w10k-s> <m10k-s> <bench-s> <c4-10k-s> <c8-10k-s> <total-s>
   python3 - "$@" <<'PY'
 import json, math, sys
 
 (runs_path, sweep_path, short, shapes, cand, cand_md5, ref, ref_md5, host,
- date_s, boot_s, boots, w1k_s, m1k_s, w10k_s, m10k_s, bench_s,
- total_s) = sys.argv[1:19]
+ date_s, boot_s, boots, w1k_s, m1k_s, w10k_s, m10k_s, bench_s, c4_s, c8_s,
+ total_s) = sys.argv[1:21]
 
 DTYPE = "fp16"
 # cell -> (conc, context); the metric comes from each run line.
-GRID = {"r1-1k": (1, "~1k"), "r1-10k": (1, "~10k"), "c8-1k": (8, "~1k")}
+GRID = {"r1-1k": (1, "~1k"), "r1-10k": (1, "~10k"), "c8-1k": (8, "~1k"),
+        "c4-10k": (4, "~10k"), "c8-10k": (8, "~10k")}
 ROWS = [  # the ratio rows, in print order — the report is complete or it refuses
     ("r1-1k", "ttft_ms", "TTFT  ~1k   solo", "ms"),
     ("r1-1k", "itl_ms", "ITL   ~1k   solo", "ms"),
     ("r1-10k", "ttft_ms", "TTFT  ~10k  solo", "ms"),
     ("r1-10k", "itl_ms", "ITL   ~10k  solo", "ms"),
     ("c8-1k", "itl_ms", "ITL   ~1k  conc-8", "ms"),
+]
+# The opt-in long group (--cells long): per cell, the TPOT ratio row and the
+# unpaired TTFT p99 line. Present only in a long run; all four metrics or
+# none — the report refuses a half-measured group.
+LONG_ROWS = [
+    ("c4-10k", "ITL   ~10k conc-4", "TTFT  ~10k conc-4 p99"),
+    ("c8-10k", "ITL   ~10k conc-8", "TTFT  ~10k conc-8 p99"),
 ]
 
 def refuse(msg):
@@ -184,6 +216,10 @@ with open(runs_path) as f:
             refuse(f"{key} is {v!r} -- never a number over nothing")
         runs[key] = float(v)
 expected = {(c, m) for c, m, _, _ in ROWS} | {("c8-1k", "tok_s")}
+long_present = any(c in ("c4-10k", "c8-10k") for c, _ in runs)
+if long_present:
+    expected |= {("c4-10k", "itl_ms"), ("c4-10k", "ttft_p99_ms"),
+                 ("c8-10k", "itl_ms"), ("c8-10k", "ttft_p99_ms")}
 if set(runs) != expected:
     refuse(f"the measured set is {sorted(runs)}, need exactly {sorted(expected)}")
 
@@ -196,7 +232,10 @@ torch = {}
 for c in sweep.get("cells", []):
     if c.get("model") == short and c.get("dtype") == DTYPE:
         torch[(c.get("conc", 1), c["context"], c["metric"])] = c["torch"]
-for cell, metric, _, _ in ROWS:
+ratio_rows = [(c, m) for c, m, _, _ in ROWS]
+if long_present:
+    ratio_rows += [(c, "itl_ms") for c, _, _ in LONG_ROWS]
+for cell, metric in ratio_rows:
     if (GRID[cell][0], GRID[cell][1], metric) not in torch:
         refuse(f"the sweep file {sweep_path} has no torch cell for "
                f"{short} {DTYPE} {GRID[cell]} {metric} -- cannot print its ratio")
@@ -219,17 +258,32 @@ for cell, metric, label, unit in ROWS:
 tok = runs[("c8-1k", "tok_s")]
 print(f"tok/s ~1k  conc-8: {tok:>10.2f}       (no torch ratio: at 64 out it is "
       "prefill-diluted against torch's 256-out cell)")
+if long_present:
+    print()
+    for cell, itl_label, p99_label in LONG_ROWS:
+        conc, context = GRID[cell]
+        v = runs[(cell, "itl_ms")]
+        t = torch[(conc, context, "itl_ms")]
+        ratio = t / v
+        ahead = ("scratchy ahead" if ratio >= 1.02 else
+                 "torch ahead" if ratio <= 0.98 else "near parity")
+        print(f"{itl_label}: {v:>10.2f} ms    torch {t:>10.2f}   {ratio:.2f}x ({ahead})")
+        p99 = runs[(cell, "ttft_p99_ms")]
+        print(f"{p99_label}: {p99:>10.2f} ms    (no torch ratio: torch's cell is "
+              "the median TTFT — the p99 tail is where #701's fix shows)")
 print()
 print(f"timings: {'boots' if boots != '1' else 'boot'} {boot_s}s ({boots}) | "
       f"warm ~1k {w1k_s}s | ~1k run {m1k_s}s | "
       f"warm ~10k {w10k_s}s | ~10k run {m10k_s}s | conc-8 bench {bench_s}s | "
       f"total {total_s}s")
+if long_present:
+    print(f"long cells: c4-10k bench {c4_s}s | c8-10k bench {c8_s}s")
 print()
 print(f"rules: {shapes}, prefix caching off, 64 output")
 print("  tokens, one warm-up request + one measured run per cell, every")
 print("  measured request's serve-recorded prompt_tokens gated to 2% (1061")
 print("  / 10091 / 1083); the reference binary was compared by bytes only.")
-if boots != "1":
+if short.endswith("-8b"):
     print("  (8b's two boots: the KV pool is 273 pages of 60 MB — mml 12288 at")
     print("  mns 8 needs 384 pages, and the mml 8704 that mns 8 fits cannot host")
     print("  the ~10k prompt, so each cell takes the boot where it fits; the")
@@ -243,6 +297,13 @@ print("  34816), and conc-8 = the first 8 of the shared 16 rows. The conc-8")
 print("  ratio row is ITL p50 (TPOT) — a per-token measure, comparable against")
 print("  torch's 256-out cell; the tok/s line carries no torch ratio because at")
 print("  64 out it is prefill-diluted. A triage baseline, not a gate cell.")
+if long_present:
+    print("the ~10k conc cells pair with the sweep's 16-prompt cells: one wave")
+    print("  of conc (not 16 prompts), out 64 (they ran 256), one warm-up (they")
+    print("  ran two), each on its own boot at the sweep's own shapes (mns 4 /")
+    print("  mns 8, mml 12288); their TTFT p99 lines carry no torch ratio — the")
+    print("  sweep's torch TTFT cells are medians, and the p99 tail is where")
+    print("  #701's wave-admission fix shows")
 PY
 }
 
@@ -274,6 +335,20 @@ self_test() {
   else
     echo "ok: --model 7b is refused"
   fi
+  CAND=""; REF=""
+  parse_args /bin/cand /bin/ref --cells long
+  check '--cells long is kept' "$CELLS" long
+  if ( parse_args --cells bogus ) 2>/dev/null; then
+    echo "FAIL: --cells bogus was not refused" >&2; fails=$((fails + 1))
+  else
+    echo "ok: --cells bogus is refused"
+  fi
+  if ( parse_args --model 8b --cells long ) 2>/dev/null; then
+    echo "FAIL: --model 8b --cells long was not refused" >&2; fails=$((fails + 1))
+  else
+    echo "ok: --model 8b --cells long is refused (2b-only group)"
+  fi
+  CELLS=""
   if ( parse_args --bogus ) 2>/dev/null; then
     echo "FAIL: an unknown flag was not refused" >&2; fails=$((fails + 1))
   else
@@ -357,7 +432,9 @@ self_test() {
   {"model": "granite-3.1-2b", "dtype": "fp16", "metric": "itl_ms", "conc": 1, "context": "~1k", "torch": 63.0},
   {"model": "granite-3.1-2b", "dtype": "fp16", "metric": "ttft_ms", "conc": 1, "context": "~10k", "torch": 8227.0},
   {"model": "granite-3.1-2b", "dtype": "fp16", "metric": "itl_ms", "conc": 1, "context": "~10k", "torch": 75.0},
-  {"model": "granite-3.1-2b", "dtype": "fp16", "metric": "itl_ms", "conc": 8, "context": "~1k", "torch": 88.88}
+  {"model": "granite-3.1-2b", "dtype": "fp16", "metric": "itl_ms", "conc": 8, "context": "~1k", "torch": 88.88},
+  {"model": "granite-3.1-2b", "dtype": "fp16", "metric": "itl_ms", "conc": 4, "context": "~10k", "torch": 208.216346245186},
+  {"model": "granite-3.1-2b", "dtype": "fp16", "metric": "itl_ms", "conc": 8, "context": "~10k", "torch": 370.1270589299098}
  ]}
 JSON
   cat > "$FIX/runs-2b.jsonl" <<'JSONL'
@@ -369,7 +446,7 @@ JSON
 {"cell": "c8-1k", "metric": "tok_s", "value": 51.30}
 JSONL
   OUT=$(emit_report "$FIX/runs-2b.jsonl" "$FIX/sweep-2b.json" granite-3.1-2b \
-    "one boot (mns 8, mml 12288)" /bin/cand abc /bin/ref def host 2026-10-19 41 1 4 11 12 19 28 118)
+    "one boot (mns 8, mml 12288)" /bin/cand abc /bin/ref def host 2026-10-19 41 1 4 11 12 19 28 0 0 118)
   check 'the 2b report carries the ~1k TTFT ratio' \
     "$(printf '%s\n' "$OUT" | grep -c 'TTFT  ~1k   solo: .*458\.00.*0\.82x (torch ahead)')" 1
   check 'the 2b report carries the ~1k ITL ratio' \
@@ -382,6 +459,8 @@ JSONL
     "$(printf '%s\n' "$OUT" | grep -c 'tok/s ~1k  conc-8: .*51\.30.*no torch ratio')" 1
   check 'the report carries the total' \
     "$(printf '%s\n' "$OUT" | grep -c 'total 118s')" 1
+  check 'the base report carries no long rows' \
+    "$(printf '%s\n' "$OUT" | grep -c 'conc-4')" 0
   # The report, 8b: the same sweep's 8b torch cells and the two-boot footer.
   cat > "$FIX/sweep-8b.json" <<'JSON'
 {"schema": 1, "torch_spyre": {"measured": "2026-10-19"},
@@ -402,7 +481,7 @@ JSON
 {"cell": "c8-1k", "metric": "tok_s", "value": 38.43}
 JSONL
   OUT=$(emit_report "$FIX/runs-8b.jsonl" "$FIX/sweep-8b.json" granite-3.1-8b \
-    "two boots (solo: mns 2, mml 12288; conc-8: mns 8, mml 8704)" /bin/cand abc /bin/ref def host 2026-10-19 96 2 9 20 22 40 55 198)
+    "two boots (solo: mns 2, mml 12288; conc-8: mns 8, mml 8704)" /bin/cand abc /bin/ref def host 2026-10-19 96 2 9 20 22 40 55 0 0 198)
   check 'the 8b report names the model' \
     "$(printf '%s\n' "$OUT" | grep -c 'spyre card timing -- granite-3.1-8b fp16')" 1
   check 'the 8b report carries the ~1k ITL ratio' \
@@ -413,8 +492,62 @@ JSONL
     "$(printf '%s\n' "$OUT" | grep -c 'boots 96s (2)')" 1
   check 'the 8b footer carries the pool arithmetic' \
     "$(printf '%s\n' "$OUT" | grep -c '8b.s two boots: the KV pool is 273 pages')" 1
+  # The report, 2b + the long group: the conc-4/conc-8 ~10k TPOT ratio rows
+  # (the sweep's 0.39x/0.31x cells), the unpaired TTFT p99 lines, the long
+  # walls, and the refusals.
+  cat > "$FIX/runs-2b-long.jsonl" <<'JSONL'
+{"cell": "r1-1k", "metric": "ttft_ms", "value": 561.31}
+{"cell": "r1-1k", "metric": "itl_ms", "value": 43.56}
+{"cell": "r1-10k", "metric": "ttft_ms", "value": 7755.62}
+{"cell": "r1-10k", "metric": "itl_ms", "value": 57.57}
+{"cell": "c8-1k", "metric": "itl_ms", "value": 91.14}
+{"cell": "c8-1k", "metric": "tok_s", "value": 51.30}
+{"cell": "c4-10k", "metric": "itl_ms", "value": 531.20}
+{"cell": "c4-10k", "metric": "ttft_p99_ms", "value": 29850.0}
+{"cell": "c8-10k", "metric": "itl_ms", "value": 1160.40}
+{"cell": "c8-10k", "metric": "ttft_p99_ms", "value": 63210.0}
+JSONL
+  OUT=$(emit_report "$FIX/runs-2b-long.jsonl" "$FIX/sweep-2b.json" granite-3.1-2b \
+    "one boot (mns 8, mml 12288) + long boots (c4-10k: mns 4, mml 12288; c8-10k: mns 8, mml 12288)" \
+    /bin/cand abc /bin/ref def host 2026-10-19 41 3 4 11 12 19 28 76 149 298)
+  check 'the long report carries the conc-4 ~10k TPOT ratio' \
+    "$(printf '%s\n' "$OUT" | grep -c 'ITL   ~10k conc-4: .*208\.22.*0\.39x (torch ahead)')" 1
+  check 'the long report carries the conc-8 ~10k TPOT ratio' \
+    "$(printf '%s\n' "$OUT" | grep -c 'ITL   ~10k conc-8: .*370\.13.*0\.32x (torch ahead)')" 1
+  check 'the conc-4 TTFT p99 line is unpaired' \
+    "$(printf '%s\n' "$OUT" | grep -c 'TTFT  ~10k conc-4 p99: .*29850\.00.*no torch ratio')" 1
+  check 'the conc-8 TTFT p99 line is unpaired' \
+    "$(printf '%s\n' "$OUT" | grep -c 'TTFT  ~10k conc-8 p99: .*63210\.00.*no torch ratio')" 1
+  check 'the long cells print their own walls' \
+    "$(printf '%s\n' "$OUT" | grep -c 'long cells: c4-10k bench 76s | c8-10k bench 149s')" 1
+  check 'the long report states three boots' \
+    "$(printf '%s\n' "$OUT" | grep -c 'boots 41s (3)')" 1
+  check 'the long footer states the pairing diffs' \
+    "$(printf '%s\n' "$OUT" | grep -c 'the ~10k conc cells pair with the sweep.s 16-prompt cells')" 1
+  grep -v '"cell": "c8-10k"' "$FIX/runs-2b-long.jsonl" > "$FIX/runs-half-long.jsonl"
+  if ( emit_report "$FIX/runs-half-long.jsonl" "$FIX/sweep-2b.json" granite-3.1-2b "one boot" /bin/cand abc /bin/ref def host 2026-10-19 1 1 1 1 1 1 1 0 0 1 ) 2>/dev/null; then
+    echo "FAIL: the report accepted a half-measured long group" >&2; fails=$((fails + 1))
+  else
+    echo "ok: the report refuses a half-measured long group"
+  fi
+  python3 - "$FIX/sweep-2b.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+with open(p) as f:
+    s = json.load(f)
+s["cells"] = [c for c in s["cells"]
+              if not (c["metric"] == "itl_ms" and c.get("conc") == 4
+                      and c["context"] == "~10k")]
+with open(p + ".nolongtorch", "w") as f:
+    json.dump(s, f)
+PY
+  if ( emit_report "$FIX/runs-2b-long.jsonl" "$FIX/sweep-2b.json.nolongtorch" granite-3.1-2b "one boot" /bin/cand abc /bin/ref def host 2026-10-19 1 1 1 1 1 1 1 0 0 1 ) 2>/dev/null; then
+    echo "FAIL: the report accepted a long row with no torch cell" >&2; fails=$((fails + 1))
+  else
+    echo "ok: the report refuses a long row with no torch cell"
+  fi
   grep -v '"cell": "c8-1k", "metric": "itl_ms"' "$FIX/runs-2b.jsonl" > "$FIX/runs-missing.jsonl"
-  if ( emit_report "$FIX/runs-missing.jsonl" "$FIX/sweep-2b.json" granite-3.1-2b "one boot" /bin/cand abc /bin/ref def host 2026-10-19 1 1 1 1 1 1 1 1 ) 2>/dev/null; then
+  if ( emit_report "$FIX/runs-missing.jsonl" "$FIX/sweep-2b.json" granite-3.1-2b "one boot" /bin/cand abc /bin/ref def host 2026-10-19 1 1 1 1 1 1 1 0 0 1 ) 2>/dev/null; then
     echo "FAIL: the report accepted a missing metric" >&2; fails=$((fails + 1))
   else
     echo "ok: the report refuses a missing metric"
@@ -429,12 +562,12 @@ s["cells"] = [c for c in s["cells"]
 with open(p + ".notorch", "w") as f:
     json.dump(s, f)
 PY
-  if ( emit_report "$FIX/runs-2b.jsonl" "$FIX/sweep-2b.json.notorch" granite-3.1-2b "one boot" /bin/cand abc /bin/ref def host 2026-10-19 1 1 1 1 1 1 1 1 ) 2>/dev/null; then
+  if ( emit_report "$FIX/runs-2b.jsonl" "$FIX/sweep-2b.json.notorch" granite-3.1-2b "one boot" /bin/cand abc /bin/ref def host 2026-10-19 1 1 1 1 1 1 1 0 0 1 ) 2>/dev/null; then
     echo "FAIL: the report accepted a missing torch cell" >&2; fails=$((fails + 1))
   else
     echo "ok: the report refuses a missing torch cell"
   fi
-  if ( emit_report "$FIX/runs-2b.jsonl" "$FIX/no-such-sweep.json" granite-3.1-2b "one boot" /bin/cand abc /bin/ref def host 2026-10-19 1 1 1 1 1 1 1 1 ) 2>/dev/null; then
+  if ( emit_report "$FIX/runs-2b.jsonl" "$FIX/no-such-sweep.json" granite-3.1-2b "one boot" /bin/cand abc /bin/ref def host 2026-10-19 1 1 1 1 1 1 1 0 0 1 ) 2>/dev/null; then
     echo "FAIL: the report accepted a missing sweep file" >&2; fails=$((fails + 1))
   else
     echo "ok: the report refuses a missing sweep file"
@@ -493,6 +626,14 @@ DS_1K="${DS_1K:-/work/fronts/ab/ds/conc-1024.jsonl}"
 # conc-8 ~1k dataset): the batched cell pairs with the sweep's cells only on
 # that exact file.
 refuse_md5 "$DS_1K" 1f1653aeac61b307ab876c6c4397818c "DS_1K (the sweep's conc-1024.jsonl)"
+# The long group's ~10k dataset, pinned the same way — checked only when the
+# group is opted into, so a base run never demands it.
+DS_10K=""
+if [ "$CELLS" = long ]; then
+  DS_10K="${DS_10K:-/work/fronts/ab/ds/conc-10300.jsonl}"
+  [ -f "$DS_10K" ] || { echo "REFUSING: dataset '$DS_10K' not found on this pod (set DS_10K)" >&2; exit 65; }
+  refuse_md5 "$DS_10K" 68c030b68dbbf93c80a40e7e5aa28766 "DS_10K (the sweep's conc-10300.jsonl)"
+fi
 
 # A process counts only if it is NOT a zombie: the pods' PID 1 does not reap,
 # so zombie cargo piles up and a naive pgrep sees it forever. Match the
@@ -704,19 +845,22 @@ PY
   LAST_RUN_S=$RUN_S
 }
 
-# ---- one measured batched run: vllm bench serve, one wave of 8 -----------------
-# The legs' client line with the tool's own counts: the first 8 of the shared
-# 16 rows (one clean conc-8 wave), 1 warm-up, 64 output tokens.
-bench_run() {
-  local CELL=c8-1k
+# ---- one measured batched run: vllm bench serve, one wave ----------------------
+# The legs' client line with the tool's own counts: the first <np> of the
+# shared 16 rows (one clean wave of <conc>), 1 warm-up, 64 output tokens.
+# The cell name picks the metric set: c8-1k reports TPOT p50 + tok/s; the
+# ~10k long cells report TPOT p50 + TTFT p99 (the tail where #701's fix
+# shows).
+bench_run() {  # bench_run <cell> <dataset> <num-prompts> <max-conc> <gate-want> <gate-target>
+  local CELL=$1 DS=$2 NP=$3 CONC=$4 GW=$5 GT=$6
   local RAW="$WORK/$CELL.json" RUNLOG="$WORK/$CELL.log"
   T0=$SECONDS
   ( cd /work/spyre-inference && TORCH_DEVICE_BACKEND_AUTOLOAD=0 taskset -c "$CORES" \
       uv run --no-sync vllm bench serve \
       --backend openai --base-url "http://127.0.0.1:$PORT" \
       --model "$SERVED" --tokenizer "$M" \
-      --dataset-name custom --dataset-path "$DS_1K" \
-      --num-prompts 8 --num-warmups 1 --max-concurrency 8 \
+      --dataset-name custom --dataset-path "$DS" \
+      --num-prompts "$NP" --num-warmups 1 --max-concurrency "$CONC" \
       --custom-output-len 64 \
       --temperature 0 --ignore-eos --seed 0 \
       --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,99 \
@@ -729,10 +873,10 @@ bench_run() {
     }
   local BENCH_S=$((SECONDS - T0))
   echo "== $CELL: bench ${BENCH_S}s" >&2
-  # Everything this run sent (1 warmup + 8 prompts) must have arrived within
-  # 2% of the dataset's recorded scale (1083, torch-scale — the file's rows,
-  # not the site's 1061 bucket).
-  length_gate "$CELL" 9 1083
+  # Everything this run sent (1 warmup + <np> prompts) must have arrived
+  # within 2% of the dataset's recorded scale (1083 for the ~1k set, 10300
+  # for the ~10k set — the files' rows, not the site's buckets).
+  length_gate "$CELL" "$GW" "$GT"
   python3 - "$CELL" "$RAW" >> "$RUNS_JSONL" <<'PY'
 import json, math, sys
 cell, path = sys.argv[1:3]
@@ -743,8 +887,8 @@ except (OSError, ValueError) as e:
     raise SystemExit(f"card_timing: FAILED: {cell}: bench result is not JSON ({e})")
 # vllm's key spellings move between versions: try the known ones, fail loudly
 # listing the file's own keys — never guess a key. TPOT p50 is the ratio row;
-# tok/s is reported alongside (request_throughput is req/s, ~256x off — never
-# emit it as tok/s).
+# the c8-1k cell reports tok/s alongside (request_throughput is req/s, ~256x
+# off — never emit it as tok/s); the ~10k long cells report TTFT p99 instead.
 def first(keys, what):
     for k in keys:
         v = result.get(k)
@@ -753,13 +897,19 @@ def first(keys, what):
     raise SystemExit(
         f"card_timing: FAILED: {cell}: no {what} in keys {sorted(result)}; "
         "add the spelling this vllm version uses and re-run")
-for metric, keys, what in [
+specs = [
     ("itl_ms", ["median_tpot_ms", "p50_tpot_ms", "mean_tpot_ms",
                 "median_itl_ms", "p50_itl_ms", "mean_itl_ms", "tpot_ms"],
      "TPOT/ITL (ms)"),
-    ("tok_s", ["output_throughput", "mean_output_throughput",
-               "total_output_throughput"], "output throughput (tok/s)"),
-]:
+]
+if cell == "c8-1k":
+    specs.append(("tok_s", ["output_throughput", "mean_output_throughput",
+                            "total_output_throughput"],
+                  "output throughput (tok/s)"))
+else:  # the ~10k long cells: TTFT p99, where #701's wave admission shows
+    specs.append(("ttft_p99_ms", ["p99_ttft_ms", "ttft_p99_ms",
+                                  "99_percentile_ttft_ms"], "TTFT p99 (ms)"))
+for metric, keys, what in specs:
     print(json.dumps({"cell": cell, "metric": metric, "value": first(keys, what)}))
 PY
   LAST_BENCH_S=$BENCH_S
@@ -767,20 +917,35 @@ PY
 
 # ---- measure: the model's pinned boot plan -------------------------------------
 LAST_WARM_S=0 LAST_RUN_S=0 LAST_BENCH_S=0
-W1K_S=0 M1K_S=0 W10K_S=0 M10K_S=0 BENCH_S=0
+W1K_S=0 M1K_S=0 W10K_S=0 M10K_S=0 BENCH_S=0 C4_S=0 C8_S=0
 case "$MODEL_KIND" in
   2b)
-    # One boot hosts every cell — validated on the card (solo cells matched
-    # the sweep within ~3%).
+    # One boot hosts every base cell — validated on the card (solo cells
+    # matched the sweep within ~3%).
     serve_up 8 12288
     rung1_run r1-1k 1061
     W1K_S=$LAST_WARM_S; M1K_S=$LAST_RUN_S
     rung1_run r1-10k 10091
     W10K_S=$LAST_WARM_S; M10K_S=$LAST_RUN_S
-    bench_run
+    bench_run c8-1k "$DS_1K" 8 8 9 1083
     BENCH_S=$LAST_BENCH_S
     serve_down
     SHAPES="one boot (mns 8, mml 12288)"
+    if [ "$CELLS" = long ]; then
+      # The long group, each cell on its own boot at the sweep's own shapes
+      # (cells.tsv's s4/s8-2b-16-10k). The waves are prefill-heavy (conc x
+      # ~7 s before any decode) — the wall is stated in the header, not
+      # trimmed.
+      serve_up 4 12288
+      bench_run c4-10k "$DS_10K" 4 4 5 10300
+      C4_S=$LAST_BENCH_S
+      serve_down
+      serve_up 8 12288
+      bench_run c8-10k "$DS_10K" 8 8 9 10300
+      C8_S=$LAST_BENCH_S
+      serve_down
+      SHAPES="$SHAPES + long boots (c4-10k: mns 4, mml 12288; c8-10k: mns 8, mml 12288)"
+    fi
     ;;
   8b)
     # Two boots: mml 12288 at mns 8 needs 384 KV pages against the 273-page
@@ -807,5 +972,6 @@ MD5_CAND=$(md5_of "$CAND")
 MD5_REF=$(md5_of "$REF")
 emit_report "$RUNS_JSONL" "$SWEEP" "$SHORT" "$SHAPES" "$CAND" "$MD5_CAND" "$REF" "$MD5_REF" \
   "$(hostname)" "$(date -u +%Y-%m-%d)" \
-  "$BOOT_S_TOTAL" "$BOOTS" "$W1K_S" "$M1K_S" "$W10K_S" "$M10K_S" "$BENCH_S" "$TOTAL_S"
+  "$BOOT_S_TOTAL" "$BOOTS" "$W1K_S" "$M1K_S" "$W10K_S" "$M10K_S" "$BENCH_S" \
+  "$C4_S" "$C8_S" "$TOTAL_S"
 echo "OK: card timing complete ($(date -u +%H:%M:%SZ))" >&2
