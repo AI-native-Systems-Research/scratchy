@@ -159,6 +159,9 @@ pub fn matmul_opspec_off_operands_phys<DF: DataFormat>(
             (_, crate::sdsc_abstract::OutputSplit::ColumnsAcrossCores) => {
                 super::dims::matmul_split_map_columns
             }
+            (_, crate::sdsc_abstract::OutputSplit::RowsAcrossCores) => {
+                super::dims::matmul_split_map_rows
+            }
             _ => matmul_split_map_for(form),
         },
     )

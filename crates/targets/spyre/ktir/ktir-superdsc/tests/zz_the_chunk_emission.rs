@@ -582,7 +582,14 @@ fn an_hd128_prompt_chunk_is_cut_per_query_head_and_keeps_its_probabilities_in_lx
                 "{ctx}: no sub-blocked new-block score"
             );
             for (stem, at) in [
+                ("attn_ncsc_h", "out"),
+                ("attn_ncbmax_h", "in"),
+                ("attn_ncesub_h", "in"),
                 ("attn_ncesub_h", "out"),
+                ("attn_ncexp_h", "in"),
+                ("attn_ncexp_h", "out"),
+                ("attn_ncbsum_h", "in"),
+                ("attn_ncov_h", "in"),
                 ("attn_cesub_h", "out"),
                 ("attn_cexp_h", "in"),
                 ("attn_cexp_h", "out"),
@@ -629,17 +636,32 @@ fn a_whole_stick_prompt_chunk_forms_its_causal_block_per_kv_head() {
             "{name}: one kv head's rows over the whole block, N_ = {n}"
         );
     }
-    for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_ncesub_g")) {
-        let out = v["dscs_"][0][name]["labeledDs_"]
-            .as_array()
-            .and_then(|a| a.last())
-            .expect("an output");
+    // ⭐ THE WHOLE BLOCK STAYS IN LX: the score, `esub` and `exp` are each written to and read from a
+    // core-local pin by every op on them — none touches HBM.
+    for (stem, at) in [
+        ("attn_ncsc_g", "out"),
+        ("attn_ncbmax_g", "in"),
+        ("attn_ncesub_g", "in"),
+        ("attn_ncesub_g", "out"),
+        ("attn_ncexp_g", "in"),
+        ("attn_ncexp_g", "out"),
+        ("attn_ncbsum_g", "in"),
+        ("attn_ncov_g", "in"),
+    ] {
+        assert_core_local_lx(&ops, stem, at, "the 128-row causal block");
+    }
+    // ⭐ AND THE SCORE DIVIDES ITS ROWS ALONE, as every consumer of its core-local slice does: the planner's
+    // `{mb, out}` split would hand core `c` columns no consumer on core `c` reads.
+    for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_ncsc_g")) {
+        let split = &v["numWkSlicesPerDim_"];
         assert_eq!(
-            out["memOrg_"]
-                .as_object()
-                .map(|m| m.keys().cloned().collect::<Vec<_>>()),
-            Some(vec!["lx".to_string()]),
-            "{name}: the causal block's esub output stays in LX"
+            (split["out"].as_u64(), split["in"].as_u64()),
+            (Some(1), Some(1)),
+            "{name}: the causal score divides rows only, split = {split}"
+        );
+        assert!(
+            split["mb"].as_u64().is_some_and(|m| m > 1),
+            "{name}: the causal score's rows are divided, split = {split}"
         );
     }
     let narrow = emit_chunk_in_layout(2, 96);
