@@ -29,6 +29,9 @@ runs everything else.
   for glm-4.5-air) plus prompt length; the grid's users replace the old
   separate users sweep. `--engines all` adds every other installed engine
   (much longer), and `--scale-axes conc,grid,input` adds the users sweep back.
+  Each cell sends at least 4 rounds of its users count (64 requests at 16
+  users, 32 at 8), so the sweep takes up to twice as long as it did with a
+  flat 12 per cell: about 2.6 h on an M5 Max, 12 h on an M1 Max.
 - A **smoke run** checks the setup. It runs gemma-4-26b-a4b-it only, the
   smallest model left, with one rep, no scaling and output in `/tmp`. Its
   JSON never goes on the site, so after step 4 you're done.
