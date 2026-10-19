@@ -5288,6 +5288,23 @@ const _: () = {
     );
 };
 
+// ⛔⛔⛔ EVERY WIDTH THE SERVE CAN ADMIT HAS A BAKED RUNG. Admission is capped at
+// `ADMITTED_BATCH_WIDTH` and `decode_rung_for` picks the smallest baked rung holding the live count, so
+// every live count 2..=cap must find one — which holds iff the cap itself is a ladder rung that bakes
+// (the baked rungs are a prefix of the ascending ladder). A missing one is THIS build error, never a
+// runtime fall-through to the one-at-a-time path, which measures as silent garbage (see above).
+const _: () = {
+    assert!(
+        PagedKvPool::bakes_batch_rung(PagedKvPool::ADMITTED_BATCH_WIDTH),
+        "ADMITTED_BATCH_WIDTH must be a rung of BATCH_RUNGS that bakes — a live count the serve admits \
+         would otherwise find no baked rung"
+    );
+    assert!(
+        PagedKvPool::bakes_batch_rung(PagedKvPool::NARROWEST_BATCH_RUNG),
+        "the narrowest rung must bake — a batch of two runs on it"
+    );
+};
+
 // ⛔⛔⛔ THE FOLD'S PASS CEILING, AND IT IS A COMPILE-TIME RELATION — NOT A RUNTIME CHECK.
 //
 // One mask block per fold pass (`MaskBlocks::of(grid)`), and `passes = pages_per_row * batch_width`. The
@@ -5755,6 +5772,30 @@ impl PagedKvPool {
     /// launch-side `MaskBlocks::fits` check refuses such a step loudly rather than letting it read
     /// unstaged mask bytes.
     pub const BATCH_RUNGS: [u32; 5] = [2, 4, 8, 16, 32];
+
+    /// ⭐ THE WIDEST BATCH THE SERVE ADMITS — and therefore the widest rung it can select. The worker's
+    /// cap (`spyre_exec.rs`, `CORRECT_BATCH_WIDTH`, read by `max_num_seqs_override`) IS this const, and
+    /// the bake loop bakes only the ladder's rungs at or under it ([`Self::bakes_batch_rung`]).
+    ///
+    /// Rungs 16 and 32 stay in [`Self::BATCH_RUNGS`] — the `Rung<MQ>` type and the rung-16 descriptor
+    /// diagnostics still name them, because the per-core row fold past 8 that corrupts them on card is
+    /// open — but they are not BAKED: the scheduler is held to this cap (`resolve_max_num_seqs`) and
+    /// `decode_rung_for` picks the smallest rung holding the live count, so a 16- or 32-row rung was
+    /// baked and loaded at every boot and never ran. Its bake was the ladder's costliest (the 32-row
+    /// per-page fold alone ~2,156 ops of dxp work). The day the fold past 8 is fixed, this moves.
+    pub const ADMITTED_BATCH_WIDTH: u32 = 8;
+
+    /// Is batch rung `seqs` baked? Exactly the ladder's rungs the serve can select.
+    pub const fn bakes_batch_rung(seqs: u32) -> bool {
+        let mut i = 0;
+        while i < Self::BATCH_RUNGS.len() {
+            if Self::BATCH_RUNGS[i] == seqs {
+                return seqs <= Self::ADMITTED_BATCH_WIDTH;
+            }
+            i += 1;
+        }
+        false
+    }
 
     /// THE WIDEST BAKED RUNG, as a const — how many ROWS a pool must be able to give a page each.
     ///

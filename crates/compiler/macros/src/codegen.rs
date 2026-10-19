@@ -12865,9 +12865,12 @@ fn dump_wavefront_mega(
             // ops at 32 requests, ~4 minutes alone), and dxp compiles groups in submission order, so
             // emitted last it started ~200 s into a granite-2b bake and WAS the bake's tail. Order is
             // free here: `decode_rung_lits` sorts the ladder by width before baking it.
+            // ⛔ ONLY THE RUNGS THE SERVE CAN SELECT (`PagedKvPool::bakes_batch_rung`): admission is
+            // capped at `ADMITTED_BATCH_WIDTH`, so a wider rung would be baked, loaded and never run.
             for seqs in scratchy_subtile::sdsc_abstract::PagedKvPool::BATCH_RUNGS
                 .into_iter()
                 .rev()
+                .filter(|&s| scratchy_subtile::sdsc_abstract::PagedKvPool::bakes_batch_rung(s))
             {
                 match crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,

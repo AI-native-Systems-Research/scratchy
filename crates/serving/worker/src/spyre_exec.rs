@@ -187,8 +187,12 @@ use crate::worker::Worker;
 ///
 /// ⭐ AND 16/32 ARE NOT EVEN A THROUGHPUT WIN, so the cap still forbids nothing worth having: 32 was
 /// 297 ms/step against rung 8's 47 ms for four times the rows — SLOWER in aggregate as well as wrong.
+///
+/// ⭐ ONE CONST WITH THE BAKE: [`PagedKvPool::ADMITTED_BATCH_WIDTH`] decides both this cap and which
+/// rungs the bake bakes, so the serve can never admit a width it has no baked rung for.
 #[cfg(feature = "spyre-hw")]
-const CORRECT_BATCH_WIDTH: usize = 8;
+const CORRECT_BATCH_WIDTH: usize =
+    scratchy_subtile::sdsc_abstract::PagedKvPool::ADMITTED_BATCH_WIDTH as usize;
 
 /// One scheduled token of a cached request is a DECODE step only when the request's
 /// prompt is already fully computed — the token this step runs sits at a GENERATED
