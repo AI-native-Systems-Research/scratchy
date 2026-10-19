@@ -109,8 +109,19 @@
 //!    fallback if refused: a `[1, vocab]` splat-copy, +2 µs).
 //! 3. dl16tofp32 with the stick SHARED on vocab both sides (probe: `argmax_cvt.json`) —
 //!    the probed form in the ExpertMatmul mint was flat/dim-0; same-dim, different
-//!    position.
-//! 4. mul in fp32, the ramp mb-broadcast (probe: `argmax_mul.json`).
+//!    position. ⭐ The upcast writes its fp32 result in the DL16_TO_FP32 STAGGERED
+//!    element arrangement (each fp16 stick's logical element L at physical lane D(L) of
+//!    its 64-element window — torch-spyre stamps this EA on every upcast result); the
+//!    mul below reads it LANE-ALIGNED, so the ramp CONST is staged pre-staggered by the
+//!    same law (scratchy-target-spyre `wiring.rs` — `dl16_to_fp32_stagger_lane`), which
+//!    realigns the product with ZERO added ops. Everything past the mul is value-based
+//!    (the max reduce is order-insensitive), so the stagger is invisible downstream.
+//!    The cardless replay that pins both the stagger (the recorded #603 FACT-1 pins:
+//!    flat ramp ⇒ argmax 723 → idx 715, 45600 → 45584) and the fix (staged ramp ⇒ the
+//!    idx IS the argmax at every lane) is `wiring.rs`'s
+//!    `the_argmax_chain_replay_reproduces_the_card_and_the_fix`.
+//! 4. mul in fp32, the ramp mb-broadcast (probe: `argmax_mul.json`) — against the
+//!    pre-staggered ramp, per link 3's law.
 //! 5. max32 — the fp32 sibling's stick family (probe: `argmax_max32.json`).
 //! 6. subtract at the one-fp16-stick tail width (64 elems = two fp32 sticks), the V
 //!    scalar broadcast (probe: `argmax_sub.json`).
