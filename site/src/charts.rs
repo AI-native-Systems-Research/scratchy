@@ -556,22 +556,29 @@ pub fn mini_heatmap(
 }
 
 /// One of a glance's small multiples: `squares` as a mini_heatmap, `name`
-/// over the range of its ratios under it. Half its cell (glance_maps), however
-/// wide the cell is. `about` says whose grid it is.
+/// over the range of its ratios under it, or over `none` when no square has
+/// one: so a grid with nothing to show keeps its place and its shape, every
+/// square blank. Half its cell (glance_maps), however wide the cell is.
+/// `about` says whose grid it is.
 pub fn glance_mini(
     grid: TableAxes,
     squares: Vec<RatioSquare>,
     total_label: String,
     name: &str,
+    none: &str,
     about: &str,
 ) -> Element {
     let ratios: Vec<f64> = squares.iter().filter_map(|s| s.ratio).collect();
-    let range = match (
+    let (range, label) = match (
         ratios.iter().copied().reduce(f64::min),
         ratios.iter().copied().reduce(f64::max),
     ) {
-        (Some(lo), Some(hi)) => format!("×{lo:.2}–×{hi:.2}"),
-        _ => "no ratios".to_string(),
+        (Some(lo), Some(hi)) => {
+            let range = format!("×{lo:.2}–×{hi:.2}");
+            let label = format!("{about}: scratchy {range}");
+            (range, label)
+        }
+        _ => (none.to_string(), format!("{about}: {none}")),
     };
     let data = squares
         .into_iter()
@@ -585,7 +592,7 @@ pub fn glance_mini(
     rsx! {
         div { style: "flex: 1 1 0; min-width: 0",
             Stack { gap: 2,
-                {mini_heatmap(grid, data, total_label, &format!("{about}: scratchy {range}"))}
+                {mini_heatmap(grid, data, total_label, &label)}
                 // Name over range, centred under the grid.
                 div { style: "text-align: center",
                     div { strong { "{name}" } }
