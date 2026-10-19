@@ -636,19 +636,6 @@ pub(crate) struct ReqState {
     /// WHICH KV SLOTS THIS REQUEST'S KEYS OCCUPY. Its own `[0, prompt)` until it shares a step with a
     /// longer request, after which it holds a masked hole and its slot count exceeds `n_computed`.
     pub(crate) kv_hist: scratchy_subtile::sdsc_abstract::KvHistory,
-    /// ⭐ IS THIS REQUEST GREEDY — captured ONCE at admission, from the scheduler's
-    /// `NewRequestData::sampling_params`, the one step that carries them (cached and resumed
-    /// requests never repeat their params — the metal worker's `sampling_params_map` is the same
-    /// capture spelled as a side map). `is_none_or(SamplingParams::is_greedy)`: absent params
-    /// mean greedy, which is what this path has always done (argmax, no sampling), so the
-    /// default IS today's behavior.
-    ///
-    /// Read by the solo decode step (#603 PR3a): a greedy step on a bundle that minted the
-    /// composite argmax takes the DEVICE token — one 256 B idx-stick readback — while a
-    /// sampling step keeps the logits D2H, because the sampler needs the whole distribution.
-    /// Per-request by construction, never an env toggle. NOT reset by `reset_for_resume`: a
-    /// preempted request is the same request with the same params; only its KV is gone.
-    pub(crate) greedy: bool,
     /// ⛔ A HOST MIRROR OF THE KV — and it does not exist on the sendnn path at all.
     ///
     /// Per-layer, row-major `[n_computed, kv_dim]`, grown one row per step by the KTIR EMULATOR's

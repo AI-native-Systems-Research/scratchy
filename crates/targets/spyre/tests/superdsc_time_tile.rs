@@ -1161,11 +1161,11 @@ fn per_core_addresses_use_distinct_segments_and_disjoint_cores() {
     );
 }
 
-/// ⭐ THROUGH THE REAL CHAIN, A DENSE MATMUL NODE IS ONE UNTILED DESCRIPTOR — `MatmulStaging::Dxp`.
+/// ⭐ THROUGH THE REAL CHAIN, A DENSE MATMUL NODE IS ONE UNTILED DESCRIPTOR — dxp stages it.
 ///
 /// `rows_are_requests` is TRUE: 64 rows that are 64 separate requests may NOT fold to the last row
 /// (every row's logits are sampled), so this vocab-wide tail is the widest unbatched matmul a decode
-/// batch emits. It used to time-tile at m=64; dxp now stages it whole, and the bundle still builds.
+/// batch emits. Every dense matmul is handed to dxp whole, and the bundle still builds.
 #[test]
 fn an_unbatched_fp16_matmul_is_one_descriptor() {
     // ⛔ THROUGH THE REAL CHAIN, BECAUSE A HAND-BUILT DESCRIPTOR IS NO LONGER A BUNDLE: after the
@@ -1204,7 +1204,7 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
 /// The LX-overflowing `y`-batched matmul the trip tests drive: the card-validated batched form (a
 /// ONE-stick contraction, `in = 64`, at 16 kernel batches: the (ii) bmm) widened in N until its per-core
 /// kernel slab overflows LX — at most 32 cores leave every core ≥ 1024 `out` columns, 2 MiB of kernel.
-/// A `y`-batched matmul keeps the frontend's LX trips (`MatmulStaging::FrontendTrips`), and a one-stick
+/// A `y`-batched matmul keeps the frontend's LX trips, and a one-stick
 /// contraction is the only `y`-batched form the build admits.
 fn batched_lx_overflowing_matmul() -> emit::EmittedOp {
     let (m, n, k, batch) = (64, 32768, 64, 16);
@@ -1428,10 +1428,10 @@ fn impossibly_large_matmul_is_build_err() {
 // (iv-a) ── a tiled op's bundle.mlir is a concrete unroll ──
 //
 // 64×32768×64 at 16 kernel batches (`batched_lx_overflowing_matmul`): a `y`-batched
-// matmul keeps the frontend's LX trips (`MatmulStaging::FrontendTrips`), and its
-// per-core resident set (the batch factor included) overflows the 1.68 MiB usable
-// LX → MUST time-tile. Its contraction is one stick, the only `y`-batched form the
-// build admits. An unbatched fp16 matmul is handed to dxp whole
+// matmul keeps the frontend's LX trips, and its per-core resident set (the batch
+// factor included) overflows the 1.68 MiB usable LX → MUST time-tile. Its
+// contraction is one stick, the only `y`-batched form the build admits. An
+// unbatched fp16 matmul is handed to dxp whole
 // (`an_unbatched_fp16_matmul_is_one_descriptor`).
 #[test]
 fn tiled_bundle_mlir_is_concrete_unroll() {

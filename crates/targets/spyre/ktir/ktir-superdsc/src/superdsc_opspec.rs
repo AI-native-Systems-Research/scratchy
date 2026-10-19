@@ -61,7 +61,7 @@ pub const ACTIVE_CORELETS: u32 = 1;
 // op it tiles inside `USABLE_LX_BYTES`, and the typed [`TimeTile`] witness makes a
 // shape that cannot fit a `cargo build` `Err` BEFORE the bundle is ever baked.
 // ⛔ It is NOT a law that every op's per-core slab must fit: an unbatched fp16
-// matmul is handed to dxp whole and dxp stages it ([`MatmulStaging`], measured).
+// matmul is handed to dxp whole and dxp stages it (measured).
 // ───────────────────────────────────────────────────────────────────────────
 
 /// LX scratchpad bytes PER CORE on dd2 = 2 MiB. Confirmed against torch-spyre
@@ -1223,121 +1223,6 @@ impl WorkPlan {
     }
 }
 
-/// ⭐⭐⭐ THE WHOLE-DXP EAR ENVELOPE — the largest per-core KERNEL slab (bytes) a
-/// [`MatmulStaging::Dxp`] matmul may route.
-///
-/// MEASURED, one card, at the gemma-4 lm_heads (all `[m, hidden]·[hidden, 262144]`; the cost
-/// model spends all 32 core-factors on the vocabulary at one row (`{in:1, mb:1, out:32}`) and
-/// splits `{in:2, mb:2, out:8}` at two — the divisions read off the baked descriptors — so the
-/// per-core KERNEL slab doubles with the row count: per-core `in` halves while per-core `out`
-/// quadruples, and the `mb` split never divides the kernel to relieve it):
-///   * 31b (hidden 5376), the two-row decode form: `2688 × 32768 × 2 B = 176.2 MB/core` — dxp
-///     REFUSES the whole-dxp descriptor, `DtException: EAR overflow detected,
-///     MutableAddrSplitting.cpp:814`, at `sdsc_5` of the decode suffix's group (the failing
-///     bundle's input is `2×5376`; the 31b bake dies there, 23 s in, first bundle write). The
-///     one-row form spends all 32 core-factors on `out` and its slab halves to
-///     `5376 × 8192 × 2 B = 88.1 MB/core` — inside the envelope. The vendor's own predicate is
-///     `max_mutable > 2^EAR_bits·bytesPerStick·8/elem_bits` with
-///     `max_mutable = const_offset + Σ(num_iters−2)·coeff` (`initMASData` :714-745) — a reach
-///     this crate cannot compute from its input schema, so the boundary is pinned by
-///     measurement, not derived.
-///   * 12b (hidden 3840), the same two-row form — the SAME `{in:2, mb:2, out:8}` division, ONE
-///     whole-dxp descriptor in the dump: `1920 × 32768 × 2 B = 125.8 MB/core` — the largest
-///     slab any whole-dxp form of the 12b routes, and the 12b is card-proven coherent under
-///     whole-dxp staging.
-///   * 26b-A4B (hidden 2816), the same two-row form: `1408 × 32768 × 2 B = 92.3 MB/core` —
-///     whole-dxp, bakes green.
-///
-/// The probe that matters: flipping EVERY matmul to [`MatmulStaging::FrontendTrips`] baked the
-/// 31b `RC=0` and ran it coherent on card (greedy France, 64 tokens, fluent), so the trips are
-/// the known-good staging past the envelope — and the placement is DEAD as a discriminator (the
-/// 26b's layer matmuls run at the same ~80 GiB arena top where the 31b's lm_head overflows), so
-/// the slab SIZE is the fact this envelope reads. The limit sits inside the tightest measured
-/// bracket with margin on both sides: the 12b's two-row slab — the same division the 31b's
-/// refused descriptor rode — is accepted at 125.8 MB/core, 25 % below the line, and the 31b's is
-/// refused at 176.2 MB/core, 11 % above it. (The 31b's one-row form is also accepted, at
-/// 88.1 MB/core — consistent, but weaker evidence: a different division, farther from the line.)
-pub const WHOLE_DXP_EAR_KERNEL_SLAB_LIMIT: u64 = 150 * 1024 * 1024;
-
-/// The per-core KERNEL (weight) slab one whole-dxp matmul routes, in bytes:
-/// `per_core_extent("in") · per_core_extent("out") · batch · operand word` — the KERNEL term of
-/// `matmul_lx_resident_generic`, the operand the `mb` split never divides. SEALED (private
-/// field, no public constructor): the only mint is [`KernelSlab::of_plan`], so the formula lives
-/// in one place and [`MatmulStaging::of`] compares a value that cannot be hand-multiplied into
-/// existence at a call site.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct KernelSlab(u64);
-
-impl KernelSlab {
-    /// Read the slab off the division the whole-dxp form would run. `df` is the OPERAND
-    /// residency format (an fp8 W8A8 matmul hands 1 byte here), not the stick basis.
-    pub fn of_plan(plan: &WorkPlan, df: Df) -> KernelSlab {
-        let k = plan.per_core_extent("in") as u64;
-        let out = plan.per_core_extent("out") as u64;
-        let batch = plan.extent("x").max(plan.extent("y")).max(1) as u64;
-        KernelSlab(k * out * batch * df.word_length() as u64)
-    }
-
-    /// The slab, in bytes.
-    pub const fn bytes(self) -> u64 {
-        self.0
-    }
-}
-
-/// ⭐⭐⭐ WHO STAGES A MATMUL's OPERANDS THROUGH LX — dxp itself, or this frontend's LX-fit time trips.
-///
-/// torch-spyre never time-tiles a dense matmul in its frontend. It hands DeepTools ONE SuperDSC per matmul
-/// over the cost model's whole per-core slab, with HBM operands and a time factor of 1, and lets dxp stage
-/// the slab through the fifth of LX it keeps for itself ("DeepTools handles the actual scheduling of data
-/// movement between DDR and the scratchpad, including double-buffering"). This frontend instead cut every
-/// projection whose per-core slab overflowed [`USABLE_LX_BYTES`] into `out` trips
-/// ([`WorkPlan::time_tile_for_lx`]) and pre-unrolled each trip into its own descriptor
-/// (`concrete_trips`). The activation carries no `out`, so EVERY trip re-staged the same activation slab
-/// from HBM: granite-3.1-8b's gate at 256 prompt rows was 14 trips, each re-reading its core's
-/// 64 × 4096 slab (512 KiB). The o_proj + MLP group ran 5.9 ms per layer per chunk, about half of the
-/// prompt's time.
-///
-/// MEASURED, one card, ABAB, `scr serve --no-prefix-caching`, docs prompts, greedy, frontend trips →
-/// [`MatmulStaging::Dxp`]:
-///   * granite-3.1-8b fp16: TTFT −9 % at ~10k tokens (20.57 → 18.67 s) to −14 % at 137; decode ITL p50
-///     −6.8 % at ~10k (272.0 → 253.5 ms); the short chat's ITL −11.5 % (178.4 → 157.8 ms). Replies are
-///     byte-identical on every natural prompt from ~200 to ~10k tokens.
-///   * granite-3.1-2b fp16: TTFT −3 … −6 % at every length, decode at parity. Where a reply moved, the
-///     true model (HF fp32, teacher-forced) scores the two equally: mean NLL change +0.02 nats/token over
-///     the moved cells.
-///   * dxp baked every shape of both models — none needed the frontend's fit.
-///
-/// ⛔ ONLY AN UNBATCHED fp16 MATMUL TAKES IT, AND ONLY INSIDE THE EAR ENVELOPE. A `y`-batched matmul
-/// keeps the frontend trips: its kernel is per batch and its forms are the card-proven ones. fp8 keeps
-/// them too, because its untiled form has not been measured on card. And an unbatched fp16 matmul whose
-/// per-core KERNEL slab ([`KernelSlab`]) passes [`WHOLE_DXP_EAR_KERNEL_SLAB_LIMIT`] keeps them as well:
-/// dxp refuses the whole-dxp descriptor there with the EAR overflow (`MutableAddrSplitting.cpp:814`,
-/// the 31b lm_head's measured 176.2 MB/core), and the trips are the staging the flip-everything probe
-/// baked `RC=0` and ran coherent on card for the same shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MatmulStaging {
-    /// ONE descriptor over the whole per-core slab, HBM operands, no frontend trips; dxp stages it.
-    Dxp,
-    /// The frontend's LX-fit time trips ([`WorkPlan::divide_and_time_tile_for_lx`]).
-    FrontendTrips,
-}
-
-impl MatmulStaging {
-    /// The staging a matmul of `batch` kernel batches over `df` operands takes, when its whole-dxp
-    /// form would route a per-core KERNEL slab of `slab`.
-    ///
-    /// ⛔ THE EAR ENVELOPE: `batch <= 1` and fp16 admit dxp staging only INSIDE
-    /// [`WHOLE_DXP_EAR_KERNEL_SLAB_LIMIT`] — past it the whole-dxp descriptor is refused at dxp's
-    /// mutable-address split, so the matmul takes the frontend's LX-fit time trips instead.
-    pub const fn of(batch: u32, df: Df, slab: KernelSlab) -> MatmulStaging {
-        if batch <= 1 && matches!(df, Df::Fp16) && slab.bytes() <= WHOLE_DXP_EAR_KERNEL_SLAB_LIMIT {
-            MatmulStaging::Dxp
-        } else {
-            MatmulStaging::FrontendTrips
-        }
-    }
-}
-
 /// A validated TIME-TILE count for the LX-fit (coarse_tile) pass — the
 /// **TimeTile** witness. SEALED (private `_seal` field, no public ctor): the SOLE
 /// producer is [`WorkPlan::time_tile_for_lx`], which only mints a `TimeTile` whose
@@ -2289,8 +2174,8 @@ impl AnyTensorArg {
 
     /// Rank-erased device-buffer NAME setter — for cloning an EXISTING arg's whole shape (scale/
     /// device_dims/layout/stick/allocation/df) onto a DIFFERENT device buffer. The intended use is a
-    /// fused epilogue's extra operand (mask/bias/residual): `bmm.ddl` declares `bnA`/`bnB`/`bias`/
-    /// `resadd`/`resadd2` with the SAME layout as `%outtensor` (not a fresh shape), so cloning the
+    /// fused epilogue's extra operand (mask/bias/residual): `bmm.ddl` declares `bias`/`resadd`
+    /// with the SAME layout as `%outtensor` (not a fresh shape), so cloning the
     /// real OUTPUT arg and renaming it is the correct construction, not a shortcut around one.
     pub fn set_name(&mut self, name: String) {
         match self {
@@ -2336,7 +2221,7 @@ impl AnyTensorArg {
     }
 
     /// Rank-erased ROLE setter. The epilogue's extra operand is tagged [`Role::Output`] to match
-    /// `bmm.ddl`'s own convention (bias/bnA/bnB/resadd share the OUTPUT dsType/layout bucket, not
+    /// `bmm.ddl`'s own convention (bias/resadd share the OUTPUT dsType/layout bucket, not
     /// INPUT) — confirmed against the golden `sdsc_bmm_lxopt.json` fixture, whose bias arg carries
     /// `dsType_: "OUTPUT"`.
     pub fn set_role(&mut self, role: Role) {
@@ -2527,7 +2412,7 @@ pub enum OpInfo {
     /// mirroring IBM's own golden fixture (`sdsc_bmm_lxopt.json`'s `MatMul_122`: `batchmatmul` +
     /// `biasadd`, the second reading AND writing the first's own output labeled-ds in place).
     /// `arg_idx` names the extra operand ALREADY inserted into
-    /// `OpSpec.args` (its own shape/layout cloned from the real output's, per `bmm.ddl`'s bnA/bnB/
+    /// `OpSpec.args` (its own shape/layout cloned from the real output's, per `bmm.ddl`'s
     /// bias/resadd declaring the SAME layout as `%outtensor` — this is not a fresh addressing
     /// derivation, it reuses the output's own proven placement with a different device name). The
     /// epilogue reads `[this op's own output, args[arg_idx]]` and writes back to the SAME output —
@@ -2535,24 +2420,12 @@ pub enum OpInfo {
     FusedEpilogue {
         arg_idx: usize,
         op_func: EpilogueOpFunc,
-        /// The SECOND chained stage, when the op has one — `bmm.ddl`'s `stradd2_op`. `None` is the
-        /// single-stage form every shipped fusion uses today.
-        second: Option<EpilogueStage>,
     },
 }
 
-/// One chained epilogue stage: the aux operand's slot in [`OpSpec::args`] and which DDL aux op reads
-/// it. Built ONLY by [`OpSpec::attach_fused_epilogue`], which records `arg_idx` as it inserts the
-/// operand — never re-derived from the arg list afterwards.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EpilogueStage {
-    pub arg_idx: usize,
-    pub op_func: EpilogueOpFunc,
-}
-
-/// What ONE epilogue stage needs from its caller. The aux operand's shape/layout is NOT here: it is
-/// cloned from the real output's proven placement (`bmm.ddl` declares `bnA`/`bnB`/`bias`/`resadd` with
-/// the SAME layout as `%outtensor`), so a stage contributes a name, an offset, and a broadcast
+/// What the fused epilogue needs from its caller. The aux operand's shape/layout is NOT here: it is
+/// cloned from the real output's proven placement (`bmm.ddl` declares `bias`/`resadd` with
+/// the SAME layout as `%outtensor`), so the caller contributes a name, an offset, and a broadcast
 /// pattern — never a fresh addressing derivation.
 pub struct EpilogueSpec<'a> {
     pub operand_name: String,
@@ -2562,14 +2435,13 @@ pub struct EpilogueSpec<'a> {
     pub broadcast_batch: bool,
 }
 
-/// ⭐⭐⭐ THE CHAIN LENGTH `bmm.ddl` PHYSICALLY HAS, AS A TYPE. The DDL exposes exactly TWO
-/// `stridedadd` registers (`stradd_op`, `stradd2_op`); a third stage has nowhere to live, so it is
-/// UNREPRESENTABLE here rather than rejected at runtime. Equally, there is no empty variant — an op
-/// with no epilogue does not call [`OpSpec::attach_fused_epilogue`] at all, so "attached an epilogue
-/// with zero stages" is not a state the emitter can reach.
-pub enum EpilogueSpecs<'a> {
-    One(EpilogueSpec<'a>),
-    Two(EpilogueSpec<'a>, EpilogueSpec<'a>),
+/// ⭐⭐⭐ ONE EPILOGUE, AS A TYPE — not a `Vec` of stages. Every shipped fusion chains exactly one
+/// `stridedadd` onto its matmul (`bmm.ddl`'s `stradd_op`); the never-built second register
+/// (`stradd2_op`) has no constructor here. Equally, there is no empty form — an op with no epilogue
+/// does not call [`OpSpec::attach_fused_epilogue`] at all, so "attached an epilogue with zero
+/// stages" is not a state the emitter can reach.
+pub struct EpilogueSpecs<'a> {
+    pub one: EpilogueSpec<'a>,
 }
 
 /// The DDL `opFuncName` a fused epilogue selects — SEALED to the menu `bmm.ddl` actually exposes
@@ -2581,9 +2453,7 @@ pub enum EpilogueSpecs<'a> {
 pub enum EpilogueOpFunc {
     /// `bmm.ddl`'s `stridedadd`: `sfp_output_lrf += operand` in place, SFP-resident, one PE/SFP-LRF
     /// register — the shape a full-tensor (never broadcast) second operand needs, per the DDL's own
-    /// `bnA`/`bnB`/`bias`/`resadd`/`resadd2` declaring the SAME layout as `%outtensor`. `bmm.ddl` allows
-    /// TWO independent `stridedadd` instances (`stradd_op`/`stradd2_op`) chained onto one matmul; this
-    /// variant carries one at a time — nothing has needed a second yet.
+    /// `bias`/`resadd` declaring the SAME layout as `%outtensor`.
     StridedAdd,
 }
 
@@ -3235,7 +3105,7 @@ impl OpSpec {
     /// Attach a fused pointwise epilogue (mask-add / bias-add / residual-add) to THIS matmul, mirroring
     /// `sdsc_bmm_lxopt.json`'s `MatMul_122` golden: the extra operand is inserted as a CLONE of this
     /// op's own output arg (same scale/device_dims/layout/stick/allocation/df — `bmm.ddl` declares
-    /// `bnA`/`bnB`/`bias`/`resadd`/`resadd2` with the output's own layout, not a fresh shape), renamed
+    /// `bias`/`resadd` with the output's own layout, not a fresh shape), renamed
     /// to `operand_name` and offset to `offset_elems`, then inserted immediately BEFORE the real output
     /// so `out_idx` (always "the last arg") still resolves correctly. Marks it `is_input=true` (read-only
     /// — the epilogue mutates the output in place, not this operand) and `Role::Output` (the golden's own
@@ -3264,49 +3134,30 @@ impl OpSpec {
     /// through `rewrite_op_for_time_tile`'s per-trip affine-stride machinery, so a tiled matmul must not
     /// call this (the caller decides; this method does not check, since `OpSpec` alone cannot see whether
     /// `emit_sdsc_tiled` will time-tile it).
-    /// ⛔ TAKES THE WHOLE CHAIN AT ONCE, NEVER ONE STAGE PER CALL. The old one-stage-per-call form
-    /// assigned `self.op_info` outright, so a second call SILENTLY DISCARDED the first stage — the
-    /// caller got one epilogue where it asked for two and nothing said so. Handing the chain over in
-    /// one call removes the sequence in which that could happen: there is no "already has a stage"
-    /// state to clobber, and [`EpilogueSpecs`] makes a third stage (which `bmm.ddl` does not have a
-    /// register for) unrepresentable rather than runtime-rejected.
-    pub fn attach_fused_epilogue(&mut self, stages: EpilogueSpecs<'_>) {
-        // Each stage's operand is inserted BEFORE the output, so the output keeps sliding right and
-        // stage `i` lands at `out_idx + i` — recorded as it is built, never re-derived afterwards.
-        let mut insert = |spec: &EpilogueSpec<'_>| -> EpilogueStage {
-            let out_idx = self.args.len().saturating_sub(1);
-            let mut operand = self.args[out_idx].clone();
-            operand.set_name(spec.operand_name.clone());
-            operand.set_offset_elems(spec.offset_elems);
-            operand.set_is_input(true);
-            operand.set_role(Role::Output);
-            for &(dim, scale) in spec.broadcast_dims {
-                operand.set_scale_for_dim(dim, scale);
-            }
-            if spec.broadcast_batch
-                && let Some(batch_dim) = self.batch_dim_name()
-            {
-                operand.set_scale_for_dim(batch_dim, Scale::RedNonStick);
-            }
-            self.args.insert(out_idx, operand);
-            EpilogueStage {
-                arg_idx: out_idx,
-                op_func: spec.op_func,
-            }
-        };
-        // Destructured, not iterated: the first stage is present BY TYPE, so there is no empty case
-        // to `expect` away.
-        let (first, second) = match stages {
-            EpilogueSpecs::One(a) => (insert(&a), None),
-            EpilogueSpecs::Two(a, b) => {
-                let fa = insert(&a);
-                (fa, Some(insert(&b)))
-            }
-        };
+    /// ⛔ TAKES THE WHOLE EPILOGUE AT ONCE. Assigning `self.op_info` here is the ONLY write —
+    /// there is no "already has a stage" state to clobber, and [`EpilogueSpecs`] makes a second
+    /// stage (which nothing has ever shipped) unrepresentable rather than runtime-rejected.
+    pub fn attach_fused_epilogue(&mut self, spec: EpilogueSpecs<'_>) {
+        // The operand is inserted BEFORE the output, so the output slides one slot right —
+        // `arg_idx` is recorded as it is built, never re-derived afterwards.
+        let out_idx = self.args.len().saturating_sub(1);
+        let mut operand = self.args[out_idx].clone();
+        operand.set_name(spec.one.operand_name.clone());
+        operand.set_offset_elems(spec.one.offset_elems);
+        operand.set_is_input(true);
+        operand.set_role(Role::Output);
+        for &(dim, scale) in spec.one.broadcast_dims {
+            operand.set_scale_for_dim(dim, scale);
+        }
+        if spec.one.broadcast_batch
+            && let Some(batch_dim) = self.batch_dim_name()
+        {
+            operand.set_scale_for_dim(batch_dim, Scale::RedNonStick);
+        }
+        self.args.insert(out_idx, operand);
         self.op_info = OpInfo::FusedEpilogue {
-            arg_idx: first.arg_idx,
-            op_func: first.op_func,
-            second,
+            arg_idx: out_idx,
+            op_func: spec.one.op_func,
         };
     }
 

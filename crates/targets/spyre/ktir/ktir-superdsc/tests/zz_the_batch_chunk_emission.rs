@@ -62,7 +62,7 @@ fn pool_2b() -> PagedKvPool {
 }
 
 /// The per-dim `scale_` of the score op's fused epilogue operand — the mask. It is inserted just BEFORE
-/// the output (`OpSpec::attach_fused_epilogue`), so with one stage it is the second-to-last labeled
+/// the output (`OpSpec::attach_fused_epilogue`), so it is the second-to-last labeled
 /// operand; a dim the read BROADCASTS carries `-1` (`Scale::RedNonStick`), a dim it walks `1`.
 fn mask_scale(v: &serde_json::Value, name: &str) -> Vec<i64> {
     let body = &v["dscs_"][0][name];

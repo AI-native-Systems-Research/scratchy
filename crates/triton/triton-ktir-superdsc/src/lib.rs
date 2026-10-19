@@ -257,8 +257,7 @@ fn emit_regions(
         | Program::ExpertUnsort
         | Program::ExpertCombine
         | Program::ExpertMatmul
-        | Program::WindowedRmsNorm { .. }
-        | Program::Argmax(_) => {
+        | Program::WindowedRmsNorm { .. } => {
             return Err(Error {
                 stage: "program",
                 message: format!(

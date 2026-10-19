@@ -716,14 +716,10 @@ fn the_router_projection_w_is_a_retiled_kernel_weight() {
         superdsc::ActiveCap::FULL,
         false,
         // The router head walks at m=3 — three rows, not a one-request decode, no
-        // split-KV chunk, and no composite argmax (neither tied nor one-request).
+        // split-KV chunk.
         superdsc::RungFacts {
             one_request: false,
             chunk_pages: None,
-            argmax: None,
-            // No tied table to reserve for: the router head is neither tied nor
-            // one-request, so no rung of it mints the composite.
-            tied_table: None,
         },
     )
     .unwrap_or_else(|e| panic!("lower the router head: {e:?}"));

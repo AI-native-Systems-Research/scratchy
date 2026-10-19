@@ -40,11 +40,6 @@ use crate::wire::{
 use crate::work::{FP16_ELEMS_PER_STICK, core_to_wk_slice, distribute_cores};
 use std::collections::BTreeMap;
 
-/// THE COMPOSITE DEVICE ARGMAX — #603 PR3a's loop-closure group: max + equal + ramp-mul +
-/// max + fp32toint32 + the tied embedding gather, first-max by arithmetic. Every link rides
-/// an existing builder; the module states the laws (the unpadded staging form, the
-/// content-key law, the tied refusal). See its own header.
-pub mod argmax;
 /// main's `lower_matmul_node` arity-3 branch — the W8A8 fp8 matmul descriptors, reached from the
 /// facts the KTIR states. See its own header.
 pub mod ktir_matmul_fp8;
@@ -2472,10 +2467,9 @@ fn rewrite_op_for_time_tile(
         // coordinate is correct as written), so without a stride of its own both trips
         // would write the SAME HBM byte — the silently-wrong alias the bake's
         // `tiled_trips_alias` guard refuses, and the exact collision gemma-4's 262144-wide
-        // max32 produced under the old over-charge. The law demands the opsec was built in
-        // the PARTIALS FORM: the accum's device extent along the tiled dim is EXACTLY one
-        // stick per trip (`reduce_opspec_partials` states it). A time-tiled seeded reduce
-        // whose accum is a plain single stick is a build Err naming the remedy — the
+        // max32 produced under the old over-charge. No generic builder emits that form
+        // any more — the single-trip row is the only seeded form — so a time-tiled seeded
+        // reduce whose accum is a plain single stick is a build Err naming the law: the
         // alternative is the alias, caught here at the emission rather than at the bake.
         if op.is_reduction
             && !v.allocation.is_lx()
@@ -2494,10 +2488,11 @@ fn rewrite_op_for_time_tile(
                      the partials form — its device extent along '{tiled_dim}' is {phys:?}, and \
                      the law demands EXACTLY one stick per trip ({want_sticks} elems at {}). \
                      Without it, every trip writes the SAME one-stick accum (the #50 \
-                     `tiled_trips_alias` alias). Build the partials form — \
-                     `reduce_opspec_partials`: per-trip partials into a [{time} × {one_stick}]-elem \
-                     buffer plus ONE combine reduce — or let the row fit a single trip (the true \
-                     accum charge bills the accum at one stick per row).",
+                     `tiled_trips_alias` alias). The single-trip row is the only seeded form \
+                     this emitter has: let the row fit a single trip (the true accum charge \
+                     bills the accum at one stick per row), or split the reduce yourself — \
+                     per-slice single-shot reduces plus a combine, the fp8 qspt path's own \
+                     pattern (emit/ktir_matmul_fp8.rs).",
                     v.name,
                     v.df.elems_per_stick(),
                 )));
@@ -3011,13 +3006,9 @@ pub fn emit_sdsc(
     // The fused-epilogue's extra operand (if any): its Tensor{i} still gets a labeledDs_/primaryDsInfo_
     // entry below (it is a real tensor the on-card walk must address), but it is NOT one of THIS op's own
     // inputLabeledDs/outputLabeledDs — it belongs to the SECOND computeOp_ entry built after the loop.
-    let epilogue_arg_idx: Vec<usize> = match op.op_info {
-        OpInfo::FusedEpilogue {
-            arg_idx, second, ..
-        } => core::iter::once(arg_idx)
-            .chain(second.map(|s| s.arg_idx))
-            .collect(),
-        _ => Vec::new(),
+    let epilogue_arg_idx: Option<usize> = match op.op_info {
+        OpInfo::FusedEpilogue { arg_idx, .. } => Some(arg_idx),
+        _ => None,
     };
 
     // ── labeledDs_ + primaryDsInfo_ (one entry per distinct Role). ──
@@ -3101,7 +3092,7 @@ pub fn emit_sdsc(
         });
         // computeOp_ wiring: `Tensor{i}-idx{i}`; the LAST arg is the output. The epilogue's own
         // operand is excluded here — the SECOND computeOp_ entry references it explicitly below.
-        if epilogue_arg_idx.contains(&i) {
+        if epilogue_arg_idx == Some(i) {
             continue;
         }
         // ⛔⛔ THE INDEX OPERAND IS NOT AN ARITHMETIC INPUT, AND THE VENDOR FIXTURE IS EXPLICIT.
@@ -3720,14 +3711,11 @@ pub fn emit_sdsc(
     // `MatMul_122` golden — it reads THIS op's own output plus the extra operand, and writes back
     // to the SAME output in place (no new HBM tensor, no separate trip). Built before `dsc` so both
     // entries share one `computeOp_` vec.
-    // ⛔ ONE ENTRY PER STAGE, and each stage reads the PRIOR stage's own output — which is the same
-    // labeled-ds in every case, since every stage writes the output in place. So the chain composes
-    // by construction: stage 2 sees stage 1's sum without either naming the other.
-    let epilogue_stage_compute_op =
-        |arg_idx: usize, op_func: crate::superdsc_opspec::EpilogueOpFunc| {
+    let epilogue_compute_ops: Vec<ComputeOp> = match op.op_info {
+        OpInfo::FusedEpilogue { arg_idx, op_func } => {
             let out_ref = format!("Tensor{out_idx}-idx{out_idx}");
             let epi_ref = format!("Tensor{arg_idx}-idx{arg_idx}");
-            ComputeOp {
+            vec![ComputeOp {
                 exUnit: "sfp",
                 opFuncName: op_func.name().to_string(),
                 // Matches the golden's biasadd entry exactly: plain fp16, regular fidelity — the
@@ -3748,16 +3736,8 @@ pub fn emit_sdsc(
                 interimLabeledDs: vec![],
                 outputLabeledDs: vec![out_ref],
                 indirectAccessIndexLabeledDs: vec![],
-            }
-        };
-    let epilogue_compute_ops: Vec<ComputeOp> = match op.op_info {
-        OpInfo::FusedEpilogue {
-            arg_idx,
-            op_func,
-            second,
-        } => core::iter::once(epilogue_stage_compute_op(arg_idx, op_func))
-            .chain(second.map(|s| epilogue_stage_compute_op(s.arg_idx, s.op_func)))
-            .collect(),
+            }]
+        }
         _ => Vec::new(),
     };
 

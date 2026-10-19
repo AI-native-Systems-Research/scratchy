@@ -9,8 +9,8 @@ use super::walk::{
 use crate::ir::island::tile_op::TileOp;
 use crate::sdsc_abstract::{MatK, MatM, MatN, MatY, PhysM};
 use crate::superdsc_opspec::{
-    Allocation, AnyTensorArg, DataFormat, Df, Fp16, KernelSlab, MAX_CORES, MatmulStaging, MaxCores,
-    OpFunc, OpInfo, OpSpec, Role, Scale, StickExtent, TensorArg, WorkPlan,
+    Allocation, AnyTensorArg, DataFormat, Df, Fp16, MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec,
+    Role, Scale, StickExtent, TensorArg, WorkPlan,
 };
 
 /// Build the typed [`OpSpec`] for ONE matmul `A[m,k]·W[k,n]→O[m,n]` (batch `b`).
@@ -330,9 +330,7 @@ pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
 /// [`matmul_opspec_off`] with an INJECTABLE work-division `splitter` — the SEAM the Kani-verified tower
 /// (`scratchy-sdsc`) drives: it passes a `CoreSplit`-derived splitter so the emitted SDSC uses the PROVEN
 /// 32-core partition (disjoint+covering, #50-free by proof), while this fn keeps owning the ABI OpSpec /
-/// TensorArg assembly. `splitter` matches `WorkPlan::divide`'s: `(dims, max_cores) -> {name → >1 split}` —
-/// and it is `Fn`, not `FnOnce`, because the staging decision divides FIRST to read the EAR envelope's
-/// slab off the candidate plan ([`MatmulStaging::of`]) and the trips arm re-divides inside the tiler.
+/// TensorArg assembly. `splitter` matches `WorkPlan::divide`'s: `(dims, max_cores) -> {name → >1 split}`.
 #[allow(clippy::too_many_arguments)]
 pub fn matmul_opspec_split<DF: DataFormat, S>(
     m: u32,
@@ -431,31 +429,25 @@ where
         dims: dims.clone(),
         df: operand_df,
     };
-    // ── LX-fit TIME-TILING (the coarse_tile pass), for the matmuls that keep it ──
-    // After the spatial work-division, decide whether the per-core resident set
-    // (A + W + O, fp16=2 B, INCLUDING the batch/x factor — KERNEL `w` dominates
-    // and is NOT divided by the mb split) fits the USABLE_LX scratchpad. If not,
-    // tile the OUTPUT stick dim `out` in TIME. "doesn't fit even when tiled" is a
-    // build `Err`, NOT an on-card crash.
-    // ⭐ WHO STAGES IT THROUGH LX ([`MatmulStaging`]): an unbatched fp16 matmul is handed to dxp WHOLE —
-    // the cost model's split and nothing more, torch-spyre's form — and every other one takes the
-    // frontend's LX-fit time trips. The whole-dxp CANDIDATE division runs first, by reference, because
-    // the EAR envelope is a fact about the division it would route: the per-core KERNEL slab
-    // ([`KernelSlab::of_plan`]), read off the plan before the staging is chosen. The trips arm
-    // re-derives the same division from the same splitter inside the tiler (`run_tiler` divides before
-    // it tiles), so this up-front divide emits no byte either arm would not have emitted on its own —
-    // it only makes the slab available to the decision that refuses it.
-    let whole = WorkPlan::divide(&tile_op.dims, MaxCores::<MAX_CORES>, &splitter)?;
-    let (plan, time_tile) =
-        match MatmulStaging::of(batch, operand_df, KernelSlab::of_plan(&whole, operand_df)) {
-            MatmulStaging::Dxp => (whole, None),
-            MatmulStaging::FrontendTrips => {
-                let tiled = tile_op
-                    .tile(MaxCores::<MAX_CORES>, splitter, OutAxis::NAME)
-                    .map_err(|e| e.0)?;
-                (tiled.plan, tiled.time_tile)
-            }
-        };
+    // ── WHO STAGES THE OPERANDS THROUGH LX ──
+    // An UNBATCHED dense matmul is handed to dxp WHOLE — torch-spyre's form: ONE descriptor over
+    // the cost model's split, HBM operands, no frontend LX-fit time trips; dxp stages the slab
+    // through the fifth of LX it keeps for itself. A shape whose descriptor dxp refuses (the EAR
+    // overflow at the mutable-address split) is refused by the bake, loudly — there is no
+    // frontend tiling to fall back to.
+    // A `y`-BATCHED matmul keeps the frontend's LX-fit time trips: its kernel is per batch and
+    // its forms are the card-proven ones (the rope-rotate and attention score doors route here).
+    let (plan, time_tile) = if batch > 1 {
+        let tiled = tile_op
+            .tile(MaxCores::<MAX_CORES>, splitter, OutAxis::NAME)
+            .map_err(|e| e.0)?;
+        (tiled.plan, tiled.time_tile)
+    } else {
+        (
+            WorkPlan::divide(&tile_op.dims, MaxCores::<MAX_CORES>, &splitter)?,
+            None,
+        )
+    };
 
     // The CANONICAL matmul dim set is EXACTLY {mb(M), in(K), out(N), x(batch)} — NO
     // phantom `y` (verified against torch-spyre's own test_coarse_tiling.py:1330-1343:
