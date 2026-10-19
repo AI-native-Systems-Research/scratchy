@@ -1164,16 +1164,13 @@ struct ProgressRow {
     note: Option<String>,
 }
 
-/// The Progress table's rows: one per cell any progress entry measured — the
-/// cells the perf PRs are moving, nothing else. The newest value wins — a
-/// PR's over a sweep's when it merged later, a sweep's over an older PR's —
-/// and torch's value comes from the newest sweep that has the cell, never a
-/// PR (no PR re-measures torch).
-fn progress_rows(
-    progress: &[(PathBuf, Progress)],
-    sweeps: &[(PathBuf, Sweep)],
-) -> BTreeMap<(String, Dtype, Metric, u32, String), ProgressRow> {
-    let moved: BTreeSet<(String, Dtype, Metric, u32, String)> = progress
+/// A cell's place on the sweep grid: model, dtype, metric, concurrency and
+/// context bucket — the key of every progress table row and timeline.
+type CellKey = (String, Dtype, Metric, u32, String);
+
+/// The cells the perf PRs are moving: every key any progress entry measured.
+fn moved_keys(progress: &[(PathBuf, Progress)]) -> BTreeSet<CellKey> {
+    progress
         .iter()
         .flat_map(|(_, p)| {
             p.cells.iter().map(|c| {
@@ -1186,8 +1183,20 @@ fn progress_rows(
                 )
             })
         })
-        .collect();
-    let mut rows: BTreeMap<_, ProgressRow> = BTreeMap::new();
+        .collect()
+}
+
+/// The Progress table's rows: one per cell any progress entry measured — the
+/// cells the perf PRs are moving, nothing else. The newest value wins — a
+/// PR's over a sweep's when it merged later, a sweep's over an older PR's —
+/// and torch's value comes from the newest sweep that has the cell, never a
+/// PR (no PR re-measures torch).
+fn progress_rows(
+    progress: &[(PathBuf, Progress)],
+    sweeps: &[(PathBuf, Sweep)],
+) -> BTreeMap<CellKey, ProgressRow> {
+    let moved = moved_keys(progress);
+    let mut rows: BTreeMap<CellKey, ProgressRow> = BTreeMap::new();
     // Sweeps load oldest first: each one with the cell supersedes the last.
     for (_, s) in sweeps {
         for c in &s.cells {
@@ -1212,13 +1221,7 @@ fn progress_rows(
     // newer than, and carries torch's sweep value forward untouched.
     for (_, p) in progress {
         for c in &p.cells {
-            let key = (
-                c.model.clone(),
-                c.dtype,
-                c.metric,
-                c.conc,
-                c.context.clone(),
-            );
+            let key = cell_key(c);
             let order = (p.merged.clone(), true, p.pr);
             let newer = rows.get(&key).is_none_or(|row| order > row.order);
             if newer {
@@ -1237,6 +1240,72 @@ fn progress_rows(
         }
     }
     rows
+}
+
+/// One source that measured a moved cell: its place in order, its tick's
+/// name on a timeline's axis, scratchy's value there, and torch's — a
+/// sweep's, never a PR's.
+struct TimelineSource {
+    order: (String, bool, u32),
+    name: String,
+    scratchy: f64,
+    torch: Option<f64>,
+}
+
+/// Each moved cell's timeline: every source that measured it, oldest first —
+/// a sweep with both stacks' values, a PR with its own — one evenly spaced
+/// step per source on the sparkline's log axis, torch's line breaking
+/// wherever a PR sits. A cell only one source measured has no timeline: one
+/// point is not a line, and the table already carries it.
+fn progress_timelines(
+    progress: &[(PathBuf, Progress)],
+    sweeps: &[(PathBuf, Sweep)],
+) -> BTreeMap<CellKey, (Vec<Step>, Vec<String>)> {
+    let mut out = BTreeMap::new();
+    for key in moved_keys(progress) {
+        let mut sources: Vec<TimelineSource> = Vec::new();
+        for (_, s) in sweeps {
+            for c in &s.cells {
+                let Some(context) = &c.context else { continue };
+                if (c.model.clone(), c.dtype, c.metric, c.conc, context.clone()) == key {
+                    sources.push(TimelineSource {
+                        order: (s.date.clone(), false, 0),
+                        name: s.date[5..].to_string(),
+                        scratchy: c.scratchy,
+                        torch: Some(c.torch),
+                    });
+                }
+            }
+        }
+        for (_, p) in progress {
+            for c in &p.cells {
+                if cell_key(c) == key {
+                    sources.push(TimelineSource {
+                        order: (p.merged.clone(), true, p.pr),
+                        name: format!("#{}", p.pr),
+                        scratchy: c.pr,
+                        torch: None,
+                    });
+                }
+            }
+        }
+        sources.sort_by(|a, b| a.order.cmp(&b.order));
+        if sources.len() >= 2 {
+            let steps = sources
+                .iter()
+                .enumerate()
+                .map(|(k, s)| Step {
+                    x: 2f64.powi(k as i32),
+                    scratchy: Some(s.scratchy),
+                    rival: s.torch,
+                    highlight: false,
+                })
+                .collect();
+            let names = sources.into_iter().map(|s| s.name).collect();
+            out.insert(key, (steps, names));
+        }
+    }
+    out
 }
 
 /// A progress cell must land on the page's grid: its model and its context
@@ -1271,33 +1340,73 @@ fn progress_vocabulary(
     out
 }
 
+/// A progress cell's place on the sweep grid.
+fn cell_key(c: &data::ProgressCell) -> CellKey {
+    (
+        c.model.clone(),
+        c.dtype,
+        c.metric,
+        c.conc,
+        c.context.clone(),
+    )
+}
+
+/// A cell's name in the Progress section's tables and timelines: model size,
+/// dtype, metric, concurrency and context bucket.
+fn cell_name(key: &CellKey) -> String {
+    let (model, dtype, metric, conc, context) = key;
+    let base = format!(
+        "{} · {} · {}",
+        size_name(model),
+        dtype.label(),
+        metric.short()
+    );
+    if *conc > 1 {
+        format!("{base} · conc {conc} · {context}")
+    } else {
+        format!("{base} · {context}")
+    }
+}
+
+/// One cell's timeline as a sparkline: its steps and tick names against
+/// torch, the axis titles from the cell's metric.
+fn timeline_chart(key: &CellKey, steps: &[Step], names: &[String]) -> Element {
+    let value = match key.2 {
+        Metric::Itl => "ITL ms",
+        Metric::Ttft => "TTFT ms",
+        Metric::TokS => "tok/s",
+    };
+    sparkline(
+        steps,
+        SparkAxes {
+            better: key.2.better(),
+            along: "measured",
+            value,
+        },
+        SCRATCHY,
+        TORCH,
+        Some(names.to_vec()),
+        "5rem",
+        &format!(
+            "{}, over time, triton-scratchy against torch-spyre",
+            cell_name(key)
+        ),
+    )
+}
+
 /// The Progress section: every perf PR's gate cells on the page. The sweeps
 /// stay the record; this is the newest measurement of each cell the PRs are
 /// moving, with its source, beside torch's newest sweep value there — one
-/// row per cell, so the next perf PR lands with its data visible.
+/// row per cell, so the next perf PR lands with its data visible. Under the
+/// table: each cell over time, then every entry's cells against their main.
 fn progress_section(progress: &[(PathBuf, Progress)], sweeps: &[(PathBuf, Sweep)]) -> Element {
     if progress.is_empty() {
         return rsx! {};
     }
     let rows = progress_rows(progress, sweeps);
-    let cell_name = |key: &(String, Dtype, Metric, u32, String)| {
-        let (model, dtype, metric, conc, context) = key;
-        if *conc > 1 {
-            format!(
-                "{} · {} · {} · conc {conc} · {context}",
-                size_name(model),
-                dtype.label(),
-                metric.short()
-            )
-        } else {
-            format!(
-                "{} · {} · {} · {context}",
-                size_name(model),
-                dtype.label(),
-                metric.short()
-            )
-        }
-    };
+    let timelines = progress_timelines(progress, sweeps);
+    let grid = "display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); \
+                column-gap: 1.5rem; row-gap: 1.25rem; align-items: start";
     rsx! {
         Section { id: "progress", level: 2,
             Stack { gap: 4,
@@ -1345,6 +1454,71 @@ fn progress_section(progress: &[(PathBuf, Progress)], sweeps: &[(PathBuf, Sweep)
                         p { "{cell_name(key)}: {note}" }
                     }
                 }
+                if !timelines.is_empty() {
+                    {part(
+                        "Each cell, over time",
+                        rsx! {
+                            "Every source that measured a moved cell, oldest first — a \
+                             sweep with both stacks' values, a PR with its own — so the \
+                             line shows what the PRs are closing. Torch-spyre's line \
+                             breaks wherever a PR sits, because no PR re-measures torch."
+                        },
+                        rsx! {
+                            div { style: "{grid}",
+                                for (key, (steps, names)) in &timelines {
+                                    div {
+                                        p { style: "font-size: 0.875rem; margin: 0 0 0.25rem",
+                                            "{cell_name(key)}"
+                                        }
+                                        {timeline_chart(key, steps, names)}
+                                    }
+                                }
+                            }
+                        },
+                    )}
+                }
+                {part(
+                    "What each PR moved",
+                    rsx! {
+                        "Every progress entry's cells, the PR against the main it ran on, \
+                         newest first — the file's own sides, main and pr. Δ is how far \
+                         the PR moved the cell in the better direction: above ×1 improved \
+                         it, below ×1 regressed it. A gate's no-regression cells land here \
+                         beside its wins."
+                    },
+                    rsx! {
+                        Tile {
+                          Layer { level: 1,
+                            Table { headers: headers([
+                                    "PR · merged", "title", "cell", "main", "PR", "Δ",
+                                ]),
+                                for (_, p) in progress.iter().rev() {
+                                    for c in &p.cells {
+                                        TableRow {
+                                            TableCell { {format!("#{} · {}", p.pr, p.merged)} }
+                                            TableCell { "{p.title}" }
+                                            TableCell { "{cell_name(&cell_key(c))}" }
+                                            TableCell { "{fmt_value(c.metric, c.main)}" }
+                                            TableCell { "{fmt_value(c.metric, c.pr)}" }
+                                            TableCell {
+                                                {
+                                                    c.metric.better().faster(Some(c.pr), Some(c.main))
+                                                        .map_or_else(|| DASH.to_string(), |r| format!("×{r:.2}"))
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                          }
+                        }
+                        for (_, p) in progress.iter().rev() {
+                            p { style: "font-size: 0.875rem",
+                                {format!("#{} measured on {} — {}", p.pr, p.pod, p.harness)}
+                            }
+                        }
+                    },
+                )}
             }
         }
     }
@@ -1727,7 +1901,7 @@ mod tests {
 
     use super::{
         Dtype, Metric, Progress, Sweep, problems, progress_problems, progress_rows,
-        progress_vocabulary,
+        progress_timelines, progress_vocabulary,
     };
 
     /// A sweep of `cells`, with `extra` fields after them.
@@ -1913,5 +2087,49 @@ mod tests {
         // Torch comes from the sweep, whichever PR is newer.
         assert_eq!(row.torch, Some((45.0, "2026-10-17".to_string())));
         assert_eq!(row.note.as_deref(), Some("rep 2 of a back-to-back boot"));
+    }
+
+    #[test]
+    fn progress_timelines_step_the_sources_and_break_torch_at_prs() {
+        // Two sweeps measured the cell, then a PR after both; a second cell
+        // only the PR measured grows no timeline — one point is not a line.
+        let older = sweep(
+            r#"{ "model": "granite-3.1-2b", "dtype": "fp16", "metric": "tok_s",
+                "conc": 8, "context": "~1k", "torch": 45.0, "scratchy": 80.0 }"#,
+            "",
+        )
+        .expect("parses");
+        let mut newer = sweep(
+            r#"{ "model": "granite-3.1-2b", "dtype": "fp16", "metric": "tok_s",
+                "conc": 8, "context": "~1k", "torch": 45.0, "scratchy": 84.5 }"#,
+            "",
+        )
+        .expect("parses");
+        newer.date = "2026-10-18".to_string();
+        // Sweeps oldest first, as load() returns them.
+        let sweeps = vec![(PathBuf::new(), older), (PathBuf::new(), newer)];
+        let p = progress(
+            &format!("{PCELL}, {}", PCELL.replace(r#""conc": 8"#, r#""conc": 4"#)),
+            "",
+        )
+        .expect("parses");
+        let timelines = progress_timelines(&[(PathBuf::new(), p)], &sweeps);
+        assert_eq!(timelines.len(), 1, "a one-source cell has no timeline");
+        let key = (
+            "granite-3.1-2b".to_string(),
+            Dtype::Fp16,
+            Metric::TokS,
+            8,
+            "~1k".to_string(),
+        );
+        let (steps, names) = timelines.get(&key).expect("the moved cell has a timeline");
+        assert_eq!(*names, ["10-17", "10-18", "#682"]);
+        let xs: Vec<f64> = steps.iter().map(|s| s.x).collect();
+        assert_eq!(xs, vec![1.0, 2.0, 4.0]);
+        let scratchy: Vec<f64> = steps.iter().filter_map(|s| s.scratchy).collect();
+        assert_eq!(scratchy, vec![80.0, 84.5, 94.62]);
+        // Torch's line breaks at the PR: no PR re-measures torch.
+        let torch: Vec<Option<f64>> = steps.iter().map(|s| s.rival).collect();
+        assert_eq!(torch, vec![Some(45.0), Some(45.0), None]);
     }
 }
