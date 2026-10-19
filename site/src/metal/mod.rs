@@ -1809,15 +1809,37 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
         let at = SparkAt { chip, stem, trend };
         trend_spark(at, &sparks[&at], "4.5rem")
     };
+    // Every prompt length any shown grid has: a grid with none of its own
+    // (the model not run on that machine, say) keeps its place as a map of
+    // blank squares this wide, over why it has nothing to show.
+    let prompts: Vec<u32> = grids
+        .values()
+        .filter_map(|g| g.as_ref().ok())
+        .flat_map(|g| g.prompts.iter().copied())
+        .collect::<BTreeSet<u32>>()
+        .into_iter()
+        .collect();
     let mini = |chip: &str, stem: &str, name: &str| -> Element {
-        let g = match &grids[&(chip, stem, name)] {
-            Ok(g) => g,
-            Err(why) => return rsx! { "{why}" },
+        let (ins, cells, total_label, none) = match &grids[&(chip, stem, name)] {
+            Ok(g) => (
+                &g.prompts,
+                g.cells.clone(),
+                format!("scratchy/{}", g.rival.label()),
+                "no ratios",
+            ),
+            Err(why) => (
+                &prompts,
+                users
+                    .iter()
+                    .flat_map(|&u| prompts.iter().map(move |&i| (u, i, None)))
+                    .collect(),
+                "scratchy".to_string(),
+                *why,
+            ),
         };
-        let squares = g
-            .cells
-            .iter()
-            .map(|&(u, i, r)| RatioSquare {
+        let squares = cells
+            .into_iter()
+            .map(|(u, i, r)| RatioSquare {
                 across: i.to_string(),
                 down: u.to_string(),
                 ratio: r,
@@ -1831,10 +1853,11 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             })
             .collect();
         glance_mini(
-            Slice::Answer(GLANCE_ANSWER).axes(&users, &g.prompts),
+            Slice::Answer(GLANCE_ANSWER).axes(&users, ins),
             squares,
-            format!("scratchy/{}", g.rival.label()),
+            total_label,
             name,
+            none,
             &format!("{stem} on {chip}"),
         )
     };
