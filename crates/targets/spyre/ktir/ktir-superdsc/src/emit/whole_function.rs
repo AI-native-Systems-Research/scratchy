@@ -3943,6 +3943,1419 @@ fn region_of_view_operand(
     Ok(Some(r))
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  THE ROUTER — the round-form top-k, the temperature softmax, and the per-expert scale.
+//
+// `kernels/moe.py`'s router section is ONE fused product — `lg = xn @ rw.T`, then K rounds of
+// (max → lane-select → argmax-reduce → one-hot accumulate → mask-out), then
+// `softmax(vals · H^-0.5) · psel` — spelled as ≈50·K ops the 1:1 walk cannot lower (`arith.cmpf`,
+// `arith.select`, `tensor.generate`, `arith.fptosi` have no `Program`). Lowering it op-by-op is
+// not a slower answer but a different one: the round form's tie-break (`reduce_max` over
+// `select(cmp, offs, −1)`) and the replicated top-k pair's slot law are the SELECTION semantics,
+// and the door's fused legs (`RouteTopK`, `ScalarMul`, `RouteSoftmax`, `RouteExpertScale`) are
+// the only spelling of them the card has. So the section is recognised WHOLE, claimed from the
+// ids store backward, and emitted at ONE fire point.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE ROUTER CHAIN, as the ONE fused emission it is.
+///
+/// # THE CLAIM, AND THE TWO VALUES IT DELIBERATELY DOES NOT CONSUME
+///
+/// The proof walks every link of every round and the whole softmax tail, and each value it
+/// touches lands in [`RouterChain::consumed`] — the interior-skip arm's law, same as every
+/// other chain this door reads. TWO values are walked but NOT consumed, because other arms own
+/// them:
+///
+/// * `lg` — the dot's own result. The 1:1 walk's matmul arm lowers it and mints its region,
+///   which the fire point reads through `inter` (the dot PRECEDES the fire point in program
+///   order: the rounds read it).
+/// * `emit_at` — the lane-offset identity generate. It is the FIRE POINT itself: the walk
+///   reaches it unclaimed and the fire arm below claims the whole chain there.
+#[derive(Clone, Debug)]
+pub struct RouterChain {
+    /// The logits — the router projection's `linalg.matmul` result. Not consumed; see above.
+    pub lg: Ssa,
+    /// The per-expert scale row's LOAD result — the one-hot select's sprayed operand. The fire
+    /// point resolves it to the parameter's region with [`region_for_operand`].
+    pub pes: Ssa,
+    /// `desc_ids`' binding tid — the scratch synth key [`route_topk_legs`] and the expert
+    /// doors' `XIdx` reservation share, so the fused router and the per-pair projections land
+    /// on ONE scratch.
+    pub ids_tid: u32,
+    /// `desc_rs`' binding tid — the route-weights scratch. The emission never writes it; the
+    /// scratch census proves every read of it is a claimed chain's.
+    pub rs_tid: u32,
+    /// Every DIRECT load of the route-weights scratch (the combine's `wrow` read; empty in a
+    /// router-only kernel). Checked by the scratch census; resolved to the minted
+    /// route-weights product at the fire point, so the combine rung's hook reads the
+    /// emission's own buffer through the map every cross-chain handoff uses.
+    pub rs_loads: Vec<Ssa>,
+    /// The softmax temperature, read off the `·TEMP` multiply's own splat (the f16 image of
+    /// the source constant — `scale_slot`'s f16-image fallback resolves it to the registry
+    /// slot).
+    pub temp: f32,
+    /// The top-k width — the round count the accumulation walk proved, cross-checked against
+    /// the `koffs` generate's width and the ids store's own view.
+    pub k: u32,
+    /// The fire point: the lane-offset identity generate's result. Not consumed; see above.
+    pub emit_at: Ssa,
+    /// Everything else the proof touched: the rounds' three accumulators and their update
+    /// multiplies, the lane/one-hot/mask compares and selects, the reduces, the converts, and
+    /// the tail's softmax chain. The two stores' VALUES ride in here — the emission writes
+    /// minted landings, never the scratch parameters (the write-dead law).
+    pub consumed: Vec<Ssa>,
+}
+
+/// ⭐⭐⭐ THE ROUTER CHAINS THIS FUNCTION HOLDS.
+///
+/// THE ROOT is the program's INTEGER-valued store: the slab gather reads expert indices as
+/// i32, so the ids land through an `arith.fptosi` — the one store in a router whose value is
+/// an integer convert. No such store ⇒ no router here (the expert-only door kernels lower
+/// untouched); every such store ⇒ a full proof or a refusal naming the link.
+/// `ArithFptosi` has no 1:1 `Program`, so a function that reached the walk with one already
+/// refused — rooting here is purely additive.
+pub fn program_router_chains(k: &KtirNode) -> Result<Vec<RouterChain>, Error> {
+    let f = &k.func;
+    let reads = program_reads(f);
+    let mut chains = Vec::new();
+    for store in f
+        .operations
+        .iter()
+        .filter(|s| s.op_type == OpKind::KtdpStore)
+    {
+        let is_router_root = store
+            .operands
+            .first()
+            .and_then(|&v| reads.def_of(v))
+            .is_some_and(|d| d.op_type == OpKind::ArithFptosi);
+        if is_router_root {
+            chains.push(router_chain_at(k, &reads, store)?);
+        }
+    }
+    Ok(chains)
+}
+
+/// THE ROUTER CHAIN AT ONE IDS STORE — the whole proof, from the store's value backward.
+///
+/// # WHY THE WALK RUNS BACKWARD, AND WHY IT IS EXACT
+///
+/// The only value the program PINS is the store (everything else has several plausible
+/// spellings), so the proof starts there and unwinds: the store's value is the fptosi of the
+/// ids accumulator; the accumulators update through one SHARED one-hot, which names the other
+/// two; each round's one-hot names its round compare, its k-offset vector and its round index;
+/// the three updates' value sides name the round's three reduces; the reduces' data names the
+/// lane select and the one-hot select; those selects' compares name the logits, the lane
+/// offsets, and each other. Every step is a def/use question this index answers, every
+/// constant is read off its own splat, and every disagreement is a REFUSAL naming the link —
+/// never a guess past it. The mask select is found FROM the lane-match compare (its reader),
+/// so the walk never searches forward: the compare's readers are exactly the one-hot select
+/// and — at every round but the last — the mask.
+///
+/// The round indices read off the one-hot compares self-verify the count (they must descend by
+/// exactly one), and `k` is cross-checked three ways at the end: the walk, the `koffs`
+/// generate's width, and the ids landing's own columns.
+fn router_chain_at(
+    k: &KtirNode,
+    reads: &ProgramReads<'_>,
+    ids_store: &Operation<'static>,
+) -> Result<RouterChain, Error> {
+    let f = &k.func;
+    let name = f.name;
+    let mut consumed: Vec<Ssa> = Vec::new();
+
+    // ── THE IDS STORE: `desc_ids` ← `arith.fptosi`(the ids accumulator) ──
+    let (ids_tid, rows, k_view) = store_param(k, reads, ids_store, name, "the routed ids")?;
+    let Some(&ids_i32) = ids_store.operands.first() else {
+        return err(format!("{name}: the router's ids store states no value"));
+    };
+    let fptosi = reads.def_of(ids_i32).ok_or_else(|| Error {
+        message: format!("{name}: the router's ids store value is a function argument"),
+    })?;
+    if fptosi.op_type != OpKind::ArithFptosi {
+        return err(format!(
+            "{name}: the router's ids store value is defined by `{:?}` — the slab gather reads \
+             INTEGER expert indices, so the ids accumulator lands through an `arith.fptosi`",
+            fptosi.op_type
+        ));
+    }
+    let [idsf] = fptosi.operands[..] else {
+        return err(format!("{name}: the router's ids convert is not unary"));
+    };
+    consumed.push(ids_i32);
+
+    // ── THE FINAL ROUND'S THREE ACCUMULATORS, recovered from the ONE-HOT the updates share ──
+    //
+    // Every round updates THREE `[rows, k]` accumulators — the selected maxima, the selected
+    // ids, the selected per-expert scales — each as `acc + x·onehot` (round 0 folded to
+    // `x·onehot`). The ids accumulator is the store's own value; the other two are recovered
+    // from the one-hot: EVERY reader of the one-hot broadcast is one of the three updates, so
+    // the ids update's one-hot names the other two. A reader outside the three is an op this
+    // proof has no account of, and the fusion would skip a value it reads — refused, not
+    // skipped.
+    let (_, ids_mulf) = router_acc_update(reads, name, idsf, "the ids")?;
+    let (oh_b, _) = router_onehot_of(reads, name, ids_mulf, "the ids update")?;
+    let mut updates: Vec<Ssa> = Vec::with_capacity(3);
+    for o in reads.readers_of(oh_b).iter().map(|&p| reads.op_at(p)) {
+        if o.op_type != OpKind::ArithMulf {
+            return err(format!(
+                "{name}: the router's one-hot has a reader `{:?}` that is not a round update — \
+                 the round form updates exactly the three accumulators through one shared \
+                 one-hot, and anything else reading it is an op this door does not recognise",
+                o.op_type
+            ));
+        }
+        let Some(r) = o.result else {
+            return err(format!(
+                "{name}: the router's one-hot update states no result"
+            ));
+        };
+        updates.push(r);
+    }
+    if updates.len() != 3 || !updates.contains(&ids_mulf) {
+        return err(format!(
+            "{name}: the router's one-hot has {} update readers — the round form updates \
+             exactly THREE accumulators (the selected maxima, the ids, the per-expert scales) \
+             through one shared one-hot",
+            updates.len()
+        ));
+    }
+    // Each update's accumulator at the final round: the update's own result (a single-round
+    // kernel, where round 0 IS the final round) or the RUNNING add that reads it. An update
+    // read by two adds is ambiguous and refused.
+    let acc_of_update = |m: Ssa| -> Result<Ssa, Error> {
+        let adds: Vec<&Operation<'static>> = reads
+            .readers_of(m)
+            .iter()
+            .map(|&p| reads.op_at(p))
+            .filter(|o| o.op_type == OpKind::ArithAddf)
+            .collect();
+        match adds.as_slice() {
+            [] => Ok(m),
+            [only] => only.result.ok_or_else(|| Error {
+                message: format!("{name}: the router's running accumulator add states no result"),
+            }),
+            _ => err(format!(
+                "{name}: the router's round update is read by two running adds — the round form \
+                 feeds ONE accumulator per update"
+            )),
+        }
+    };
+    // WHICH UPDATE IS WHICH — by the reduce each update's value side resolves to: the maxima
+    // update to a MAX reduce, the scales update to a SUM reduce. (The loop below re-proves all
+    // three spines per round; this is the assignment, not the proof.)
+    let mut classify = |m: Ssa| -> Result<OpKind, Error> {
+        let (_, x) = router_onehot_of(reads, name, m, "a round update")?;
+        let src = plumbing_source(reads, x, &mut consumed);
+        let Some(d) = reads.def_of(src) else {
+            return err(format!(
+                "{name}: the router's round update value is a function argument"
+            ));
+        };
+        d.attributes
+            .iter()
+            .find_map(|(kk, vv)| match (kk, vv) {
+                (AttrKey::ReduceFn, Attr::Op(o)) => Some(*o),
+                _ => None,
+            })
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{name}: the router's round update value resolves to `{:?}`, not a \
+                         `linalg.reduce` — each update's value side is the round's reduce, \
+                         resticked to the accumulator's width",
+                    d.op_type
+                ),
+            })
+    };
+    let others: Vec<Ssa> = updates.iter().copied().filter(|&u| u != ids_mulf).collect();
+    let [ma, mb] = others[..] else {
+        return err(format!(
+            "{name}: the router's one-hot recovery found no second update"
+        ));
+    };
+    let (mut vals, mut psel) = match (classify(ma)?, classify(mb)?) {
+        (OpKind::ArithMaxnumf, OpKind::ArithAddf) => (acc_of_update(ma)?, acc_of_update(mb)?),
+        (OpKind::ArithAddf, OpKind::ArithMaxnumf) => (acc_of_update(mb)?, acc_of_update(ma)?),
+        (a, b) => {
+            return err(format!(
+                "{name}: the router's round updates resolve to `{a:?}` and `{b:?}` reduces — the \
+                 three accumulators are a MAX over the logits (the selected maxima), a MAX over \
+                 the lane select (the ids), and a SUM over the one-hot select (the scales)"
+            ));
+        }
+    };
+    let vals_final = vals;
+    let psel_final = psel;
+    let mut idsf = idsf;
+
+    // ── THE LOCKSTEP WALK, from the final round down to round 0 ──
+    //
+    // Per round j (descending from K−1): the three updates share one one-hot
+    // `oh_j = select(koffs == j, 1, 0)`; the maxima spine is `mx_j = reduce_max(lg_j, −inf)`;
+    // the ids spine is `idx_j = reduce_max(select(lg_j == mx_j, offs, −1), −inf)`; the scales
+    // spine is `pj_j = reduce_sum(select(offs == idx_j, pes, 0), 0)`; and — at every round but
+    // the last — the lane-match compare ALSO feeds the mask select
+    // `lg_{j+1} = select(offs == idx_j, −inf, lg_j)` that burns the chosen lane out of the
+    // logits for the round above. Every resolution goes through `plumbing_source`, so no link
+    // the proof walked is left for the 1:1 walk to refuse.
+    let mut expect_j: Option<u32> = None;
+    let mut prev_lg: Option<Ssa> = None;
+    let mut rounds: u32 = 0;
+    let mut offs: Option<(Ssa, Ssa, u32)> = None; // (the sitofp, the generate, E)
+    let mut pes: Option<Ssa> = None;
+    let mut koffs_w: Option<u32> = None;
+    loop {
+        if rounds >= k_view {
+            return err(format!(
+                "{name}: the router's accumulation walk found {} rounds against an ids landing \
+                 of {k_view} slots — the walk counts one round per top-k slot and cannot run \
+                 past the landing's own width",
+                rounds + 1
+            ));
+        }
+        let (ids_prev, ids_mulf) = router_acc_update(reads, name, idsf, "the ids")?;
+        let (vals_prev, vals_mulf) = router_acc_update(reads, name, vals, "the selected maxima")?;
+        let (psel_prev, psel_mulf) = router_acc_update(reads, name, psel, "the selected scales")?;
+        // ⛔ THE FORM AGREES: round 0's updates are FOLDED (`x·onehot`, the zero init folded
+        // away) and every deeper round's are RUNNING (`acc + x·onehot`) — all three together,
+        // or not a router.
+        let folded = ids_prev.is_none();
+        if folded != vals_prev.is_none() || folded != psel_prev.is_none() {
+            return err(format!(
+                "{name}: the router's round {rounds} mixes a folded round-0 update with a running \
+                 one — the three accumulators fold or run TOGETHER (round 0 is `x·onehot`, the \
+                 rest `acc + x·onehot`)"
+            ));
+        }
+        consumed.push(idsf);
+        consumed.push(vals);
+        consumed.push(psel);
+        consumed.push(ids_mulf);
+        consumed.push(vals_mulf);
+        consumed.push(psel_mulf);
+        // THE SHARED ONE-HOT: the same widened one-hot at all three updates.
+        let (oh_b, _) = router_onehot_of(reads, name, ids_mulf, "the ids update")?;
+        for (m, what) in [
+            (vals_mulf, "the selected maxima"),
+            (psel_mulf, "the selected scales"),
+        ] {
+            let (their_oh, _) = router_onehot_of(reads, name, m, what)?;
+            if their_oh != oh_b {
+                return err(format!(
+                    "{name}: the router's round {rounds} updates read two different one-hots — \
+                     the three accumulators share ONE round compare"
+                ));
+            }
+        }
+        // oh = select(koffs == j, 1, 0), widened to [1, k] by a BARE expand (no
+        // `linalg.broadcast` roots at it, so the broadcast-chain reader claims none of it —
+        // this walk does).
+        let oh = plumbing_source(reads, oh_b, &mut consumed);
+        let oh_d = reads.def_of(oh).ok_or_else(|| Error {
+            message: format!("{name}: the router's one-hot is a function argument"),
+        })?;
+        if oh_d.op_type != OpKind::ArithSelect {
+            return err(format!(
+                "{name}: the router's one-hot is `{:?}` — the round compare's one-hot is an \
+                 `arith.select` of two splats",
+                oh_d.op_type
+            ));
+        }
+        let [oh_cond, oh_one, oh_zero] = oh_d.operands[..] else {
+            return err(format!(
+                "{name}: the router's one-hot select is not ternary"
+            ));
+        };
+        if !router_splat_is(reads, oh_one, 1.0) || !router_splat_is(reads, oh_zero, 0.0) {
+            return err(format!(
+                "{name}: the router's one-hot select reads splats other than 1.0/0.0 — the round \
+                 compare's one-hot is exactly `select(koffs == j, 1, 0)`"
+            ));
+        }
+        consumed.push(oh);
+        consumed.push(oh_cond);
+        // THE ROUND INDEX, off the compare's own splat — and the k-offset vector on its other
+        // side. The j values must descend by exactly one per round: the count the walk
+        // cross-checks against the landing and the k-offset generate at the end.
+        let (ka, kb) = router_oeq(reads, name, oh_cond, "the one-hot's round compare")?;
+        let (j_splat, koffs_v) = match (reads.splat_value(ka), reads.splat_value(kb)) {
+            (Some(_), None) => (ka, kb),
+            (None, Some(_)) => (kb, ka),
+            _ => {
+                return err(format!(
+                    "{name}: the router's round compare reads no integer-valued round splat — the \
+                     one-hot is `koffs == j` with j the round's own index"
+                ));
+            }
+        };
+        let Some(jf) = reads.splat_value(j_splat) else {
+            return err(format!(
+                "{name}: the router's round splat is not a constant"
+            ));
+        };
+        if jf < 0.0 || jf.fract() != 0.0 || jf > 255.0 {
+            return err(format!(
+                "{name}: the router's round compare states j = {jf} — the round index is a small \
+                 non-negative integer"
+            ));
+        }
+        let j = jf as u32;
+        match expect_j {
+            None => expect_j = Some(j),
+            Some(e) if e == j + 1 => expect_j = Some(j),
+            _ => {
+                return err(format!(
+                    "{name}: the router's rounds state j = {j} where {} was next — the rounds run \
+                     0..K−1 and the accumulation walk reads them descending",
+                    expect_j.unwrap_or(0)
+                ));
+            }
+        }
+        // KOFFS: the k-offset identity vector, the SAME at every round.
+        let koffs = plumbing_source(reads, koffs_v, &mut consumed);
+        let koffs_d = reads.def_of(koffs).ok_or_else(|| Error {
+            message: format!("{name}: the router's k-offset vector is a function argument"),
+        })?;
+        if koffs_d.op_type != OpKind::ArithSitofp {
+            return err(format!(
+                "{name}: the router's k-offset vector is `{:?}` — `tl.arange(0, K)` lands as a \
+                 `tensor.generate` widened by `arith.sitofp`",
+                koffs_d.op_type
+            ));
+        }
+        let [koffs_gen] = koffs_d.operands[..] else {
+            return err(format!(
+                "{name}: the router's k-offset convert is not unary"
+            ));
+        };
+        let Some(this_koffs_w) = router_identity_generate(reads, koffs_gen) else {
+            return err(format!(
+                "{name}: the router's k-offset generate is not the identity `tl.arange` — the \
+                 round compare reads `koffs == j` with koffs the offset vector itself"
+            ));
+        };
+        match koffs_w {
+            None => koffs_w = Some(this_koffs_w),
+            Some(w) if w == this_koffs_w => {}
+            Some(_) => {
+                return err(format!(
+                    "{name}: the router's rounds read two different k-offset vectors — one \
+                     `tl.arange(0, K)` serves every round compare"
+                ));
+            }
+        }
+        consumed.push(koffs);
+        consumed.push(koffs_gen);
+
+        // ── THE THREE SPINES ──
+        // THE MAXIMA: mx_j = reduce_max(lg_j, −inf), resticked to [1, k].
+        let (_, vals_x) = router_onehot_of(reads, name, vals_mulf, "the selected maxima")?;
+        let mx = plumbing_source(reads, vals_x, &mut consumed);
+        let mx_data = router_seeded_reduce(
+            reads,
+            name,
+            mx,
+            OpKind::ArithMaxnumf,
+            f64::NEG_INFINITY,
+            "the round's maxima reduce",
+        )?;
+        // THE IDS: idx_j = reduce_max(lanes_j, −inf) over the lane select.
+        let (_, ids_x) = router_onehot_of(reads, name, ids_mulf, "the ids")?;
+        let idx = plumbing_source(reads, ids_x, &mut consumed);
+        let lanes = router_seeded_reduce(
+            reads,
+            name,
+            idx,
+            OpKind::ArithMaxnumf,
+            f64::NEG_INFINITY,
+            "the round's lane reduce",
+        )?;
+        // THE SCALES: pj_j = reduce_sum(pj_sel, 0) over the one-hot select.
+        let (_, psel_x) = router_onehot_of(reads, name, psel_mulf, "the selected scales")?;
+        let pj = plumbing_source(reads, psel_x, &mut consumed);
+        let pj_sel = router_seeded_reduce(
+            reads,
+            name,
+            pj,
+            OpKind::ArithAddf,
+            0.0,
+            "the round's scale reduce",
+        )?;
+        consumed.push(mx);
+        consumed.push(idx);
+        consumed.push(pj);
+
+        // THE LANE SELECT: lanes_j = select(lg_j == mx_j, offs, −1). The mask-out must be
+        // −1.0 — the tie-break law: `reduce_max` over `select(cmp, offs, −1)` takes the LAST
+        // lane holding the maximum (scan order), so any other mask-out is a different
+        // selection rule on ties.
+        let lanes_d = reads.def_of(lanes).ok_or_else(|| Error {
+            message: format!("{name}: the router's lane select is a function argument"),
+        })?;
+        if lanes_d.op_type != OpKind::ArithSelect {
+            return err(format!(
+                "{name}: the router's lane reduce's data is `{:?}` — the ids spine reduces a LANE \
+                 SELECT (`select(lg == mx, offs, −1)`), whose max is the argmax lane",
+                lanes_d.op_type
+            ));
+        }
+        let [lanes_cmp, lanes_true, lanes_false] = lanes_d.operands[..] else {
+            return err(format!("{name}: the router's lane select is not ternary"));
+        };
+        if !router_splat_is(reads, lanes_false, -1.0) {
+            return err(format!(
+                "{name}: the router's lane select masks the unselected lanes with a splat other \
+                 than −1.0 — the tie-break law: `reduce_max` over `select(cmp, offs, −1)` takes \
+                 the LAST lane of the maximum, and any other mask-out selects a different expert \
+                 on ties"
+            ));
+        }
+        consumed.push(lanes);
+        consumed.push(lanes_cmp);
+        // THE LANE OFFSETS: `tl.arange(0, E)` widened to f16. ⛔ The generate itself is NOT
+        // consumed — it is the op the walk's fire arm anchors at.
+        let offs_v = plumbing_source(reads, lanes_true, &mut consumed);
+        let offs_d = reads.def_of(offs_v).ok_or_else(|| Error {
+            message: format!("{name}: the router's lane offsets are a function argument"),
+        })?;
+        if offs_d.op_type != OpKind::ArithSitofp {
+            return err(format!(
+                "{name}: the router's lane offsets are `{:?}` — `tl.arange(0, E)` lands as a \
+                 `tensor.generate` widened by `arith.sitofp`",
+                offs_d.op_type
+            ));
+        }
+        let [offs_gen] = offs_d.operands[..] else {
+            return err(format!(
+                "{name}: the router's lane-offset convert is not unary"
+            ));
+        };
+        let Some(offs_w) = router_identity_generate(reads, offs_gen) else {
+            return err(format!(
+                "{name}: the router's lane-offset generate is not the identity `tl.arange` — the \
+                 lane select compares the logits against the OFFSET VECTOR, so the offsets are \
+                 the identity generate's own values"
+            ));
+        };
+        match offs {
+            None => offs = Some((offs_v, offs_gen, offs_w)),
+            Some((_, _, w)) if w == offs_w => {}
+            Some(_) => {
+                return err(format!(
+                    "{name}: the router's rounds read two different lane-offset vectors — one \
+                     `tl.arange(0, E)` serves every round's lane select"
+                ));
+            }
+        }
+        consumed.push(offs_v);
+        // THE LANE COMPARE: lg_j == mx_j (widened). The lg operand is the side that does not
+        // resolve to this round's maxima reduce; the maxima reduce's own data must then BE
+        // that lg — two independent facts about one value, checked against each other.
+        let (la, lb) = router_oeq(reads, name, lanes_cmp, "the lane compare")?;
+        let la_src = plumbing_source(reads, la, &mut consumed);
+        let lb_src = plumbing_source(reads, lb, &mut consumed);
+        let lg_j = if la_src == mx {
+            lb
+        } else if lb_src == mx {
+            la
+        } else {
+            return err(format!(
+                "{name}: the router's lane compare reads neither side against the round's maxima \
+                 reduce — the lane select is `select(lg == mx, offs, −1)`"
+            ));
+        };
+        if mx_data != lg_j {
+            return err(format!(
+                "{name}: the router's maxima reduce reads a different logits value than the lane \
+                 compare — the round's max and the round's lane select read ONE logits value"
+            ));
+        }
+
+        // THE SCALE SELECT: pj_sel = select(offs == idx_j, pes, 0) — the one-hot over the
+        // CHOSEN lane, spraying the per-expert scale row.
+        let pj_d = reads.def_of(pj_sel).ok_or_else(|| Error {
+            message: format!("{name}: the router's scale select is a function argument"),
+        })?;
+        if pj_d.op_type != OpKind::ArithSelect {
+            return err(format!(
+                "{name}: the router's scale reduce's data is `{:?}` — the scales spine reduces a \
+                 ONE-HOT SELECT (`select(offs == idx, pes, 0)`), whose sum is the chosen lane's \
+                 scale",
+                pj_d.op_type
+            ));
+        }
+        let [sel2, pj_true, pj_false] = pj_d.operands[..] else {
+            return err(format!("{name}: the router's scale select is not ternary"));
+        };
+        if !router_splat_is(reads, pj_false, 0.0) {
+            return err(format!(
+                "{name}: the router's scale select masks the unselected lanes with a splat other \
+                 than 0.0 — the one-hot's sum must pick exactly the chosen lane's scale"
+            ));
+        }
+        consumed.push(pj_sel);
+        consumed.push(sel2);
+        // THE PER-EXPERT SCALE ROW: the select's true side, a LOAD of the pes parameter (the
+        // fire point resolves it to the parameter's region).
+        let pes_row = plumbing_source(reads, pj_true, &mut consumed);
+        let pes_d = reads.def_of(pes_row).ok_or_else(|| Error {
+            message: format!("{name}: the router's per-expert scale row is a function argument"),
+        })?;
+        if pes_d.op_type != OpKind::KtdpLoad {
+            return err(format!(
+                "{name}: the router's per-expert scale operand is `{:?}` — the one-hot select \
+                 sprays the pes parameter's own row, read once per round",
+                pes_d.op_type
+            ));
+        }
+        match pes {
+            None => pes = Some(pes_row),
+            Some(p) if p == pes_row => {}
+            Some(_) => {
+                return err(format!(
+                    "{name}: the router's rounds read two different per-expert scale rows — one \
+                     pes parameter serves every round's one-hot"
+                ));
+            }
+        }
+        // THE LANE-MATCH COMPARE: offs == idx_j (widened). One side resolves to the lane
+        // offsets; the other to THIS round's ids reduce.
+        let (sa, sb) = router_oeq(reads, name, sel2, "the lane-match compare")?;
+        let sa_src = plumbing_source(reads, sa, &mut consumed);
+        let sb_src = plumbing_source(reads, sb, &mut consumed);
+        if !((sa_src == offs_v && sb_src == idx) || (sb_src == offs_v && sa_src == idx)) {
+            return err(format!(
+                "{name}: the router's lane-match compare does not read the lane offsets against \
+                 this round's ids reduce — the one-hot is `offs == idx`"
+            ));
+        }
+
+        // THE MASK SELECT — sel2's second reader (every round but the last):
+        // `lg_{j+1} = select(sel2, −inf, lg_j)`. Found FROM the scale select's condition, so
+        // the walk never searches forward: the compare's readers are exactly the one-hot
+        // select and — when the next round exists — the mask.
+        let mut mask: Option<Ssa> = None;
+        for o in reads.readers_of(sel2).iter().map(|&p| reads.op_at(p)) {
+            if o.result == Some(pj_sel) {
+                continue; // the scale select, proven above
+            }
+            if o.op_type == OpKind::ArithSelect {
+                let [m_cond, m_true, m_false] = o.operands[..] else {
+                    return err(format!("{name}: the router's mask select is not ternary"));
+                };
+                if m_cond == sel2
+                    && router_splat_is(reads, m_true, f64::NEG_INFINITY)
+                    && m_false == lg_j
+                {
+                    let Some(mr) = o.result else {
+                        return err(format!("{name}: the router's mask select states no result"));
+                    };
+                    consumed.push(mr);
+                    mask = Some(mr);
+                    continue;
+                }
+            }
+            return err(format!(
+                "{name}: the router's lane-match compare has a reader `{:?}` this door does not \
+                 recognise — the compare feeds exactly the one-hot select and (at every round but \
+                 the last) the mask select that burns the chosen lane out of the logits",
+                o.op_type
+            ));
+        }
+        // The final round's mask is DCE'd (no next round reads its result); every deeper round
+        // MUST carry one, and its result must be the logits the round ABOVE reads — the walk's
+        // own continuity check, which is what makes "the same logits value" a proven fact
+        // rather than an assumption at every round.
+        if rounds == 0 {
+            if mask.is_some() {
+                return err(format!(
+                    "{name}: the router's final round carries a live mask select — the mask burns \
+                     the chosen lane out of the logits for the NEXT round, and the final round has \
+                     none, so a live one here is a different shape"
+                ));
+            }
+        } else {
+            let Some(p) = prev_lg else {
+                return err(format!(
+                    "{name}: the router's walk lost the round above's logits"
+                ));
+            };
+            if mask != Some(p) {
+                return err(format!(
+                    "{name}: the router's round {j} mask select does not write the logits the \
+                     round above reads — the mask burns the chosen lane out of the SAME logits \
+                     the next round's lane compare reads"
+                ));
+            }
+        }
+        prev_lg = Some(lg_j);
+
+        // Round 0 is the folded form — the walk ends here.
+        if folded {
+            if expect_j != Some(0) {
+                return err(format!(
+                    "{name}: the router's folded round states j = {} — the folded update is \
+                     round 0's (the zero init folded away), so the round count and the j values \
+                     disagree",
+                    expect_j.unwrap_or(0)
+                ));
+            }
+            break;
+        }
+        idsf = ids_prev.expect("the running form's previous accumulator");
+        vals = vals_prev.expect("the running form's previous accumulator");
+        psel = psel_prev.expect("the running form's previous accumulator");
+        rounds += 1;
+    }
+    // (Named `topk` because `k` is the node, matching every other recogniser in this file.)
+    let topk = rounds + 1;
+
+    // ── K, CROSS-CHECKED THREE WAYS: the walk, the k-offset generate, the ids landing ──
+    let Some((_, offs_gen, e_gen)) = offs else {
+        return err(format!("{name}: the router's walk proved no rounds"));
+    };
+    let Some(koffs_width) = koffs_w else {
+        return err(format!(
+            "{name}: the router's walk proved no k-offset vector"
+        ));
+    };
+    let Some(pes) = pes else {
+        return err(format!(
+            "{name}: the router's walk proved no per-expert scale row"
+        ));
+    };
+    if topk != koffs_width || topk != k_view {
+        return err(format!(
+            "{name}: the router's top-k is k = {topk} by the accumulation walk, {koffs_width} by \
+             the k-offset generate's width, and {k_view} by the ids landing's own columns — the \
+             three must agree, or the walk proved a different selection than the program stored"
+        ));
+    }
+
+    // ── ROUND 0'S LOGITS: the projection dot, `[rows, E]` ──
+    let lg = prev_lg.expect("set at every round");
+    let lg_d = reads.def_of(lg).ok_or_else(|| Error {
+        message: format!("{name}: the router's round-0 logits are a function argument"),
+    })?;
+    if lg_d.op_type != OpKind::LinalgMatmul {
+        return err(format!(
+            "{name}: the router's round-0 logits are `{:?}` — the selection runs over the ROUTER \
+             PROJECTION's own dot (`lg = xn @ rwᵀ`), which the 1:1 walk lowers and the fused \
+             emission reads through its minted region",
+            lg_d.op_type
+        ));
+    }
+    let dot_dims = match lg_d.result_type {
+        Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() == 2 => {
+            [dims[0] as u32, dims[1] as u32]
+        }
+        _ => {
+            return err(format!(
+                "{name}: the router's logits dot states no 2-D tensor type, so its extents are \
+                 unknown"
+            ));
+        }
+    };
+    if dot_dims[0] != rows {
+        return err(format!(
+            "{name}: the router's logits dot is [{}, {}] against an ids landing of {rows} rows — \
+             the selection is row-preserving",
+            dot_dims[0], dot_dims[1]
+        ));
+    }
+    let e = dot_dims[1];
+    if e_gen != e {
+        return err(format!(
+            "{name}: the router's lane offsets span {e_gen} experts against a logits dot of {e} \
+             columns — the lane select compares the logits against the offset vector, so the two \
+             must name the same expert count"
+        ));
+    }
+
+    // ── THE TAIL: `·TEMP` → the row softmax → `·psel` → the rs store ──
+    //
+    // `sv = vals·TEMP`; `ex = exp(sv − max(sv))`; `rs = (ex / Σex)·psel` — all f16 (the
+    // program's `.to(f32)` legalized away; the door's softmax legs compute the same chain).
+    // The values accumulator's one reader outside the rounds is the temperature multiply, and
+    // every link after it is proven by a sole-reader check.
+    let sv_op = sole_reader_matching(reads, name, vals_final, "temperature multiply", |o| {
+        o.op_type == OpKind::ArithMulf
+    })?;
+    let [sv_a, sv_b] = sv_op.operands[..] else {
+        return err(format!(
+            "{name}: the router's temperature multiply is not binary"
+        ));
+    };
+    let (temp, sv_tensor) = match (reads.splat_value(sv_a), reads.splat_value(sv_b)) {
+        (Some(t), None) => (t, sv_b),
+        (None, Some(t)) => (t, sv_a),
+        _ => {
+            return err(format!(
+                "{name}: the router's temperature multiply reads no splatted constant — the \
+                 softmax's temperature is `vals · TEMP` with TEMP the router's own constant"
+            ));
+        }
+    };
+    if sv_tensor != vals_final {
+        return err(format!(
+            "{name}: the router's temperature multiply reads a value other than the selected \
+             maxima accumulator"
+        ));
+    }
+    let Some(sv) = sv_op.result else {
+        return err(format!(
+            "{name}: the router's temperature multiply states no result"
+        ));
+    };
+    consumed.push(sv);
+    let rmax_op = sole_reader_matching(reads, name, sv, "softmax maxima reduce", |o| {
+        o.op_type == OpKind::LinalgReduce
+    })?;
+    let Some(rmax) = rmax_op.result else {
+        return err(format!(
+            "{name}: the router's softmax maxima reduce states no result"
+        ));
+    };
+    let rmax_data = router_seeded_reduce(
+        reads,
+        name,
+        rmax,
+        OpKind::ArithMaxnumf,
+        f64::NEG_INFINITY,
+        "the softmax's maxima reduce",
+    )?;
+    if rmax_data != sv {
+        return err(format!(
+            "{name}: the router's softmax maxima reduce reads a value other than the temperature \
+             product"
+        ));
+    }
+    consumed.push(rmax);
+    let sub_op = sole_reader_matching(reads, name, sv, "softmax subtract", |o| {
+        o.op_type == OpKind::ArithSubf
+    })?;
+    let [sub_a, sub_b] = sub_op.operands[..] else {
+        return err(format!(
+            "{name}: the router's softmax subtract is not binary"
+        ));
+    };
+    let sub_other = if sub_a == sv {
+        sub_b
+    } else if sub_b == sv {
+        sub_a
+    } else {
+        return err(format!(
+            "{name}: the router's softmax subtract reads the temperature product on neither side"
+        ));
+    };
+    let rmax_b_src = plumbing_source(reads, sub_other, &mut consumed);
+    if rmax_b_src != rmax {
+        return err(format!(
+            "{name}: the router's softmax subtract reads a value other than the maxima reduce's \
+             broadcast — the softmax is `exp(sv − max(sv))`"
+        ));
+    }
+    let Some(sub) = sub_op.result else {
+        return err(format!(
+            "{name}: the router's softmax subtract states no result"
+        ));
+    };
+    consumed.push(sub);
+    let ex_op = sole_reader_matching(reads, name, sub, "softmax exp", |o| {
+        o.op_type == OpKind::MathExp
+    })?;
+    let Some(ex) = ex_op.result else {
+        return err(format!("{name}: the router's softmax exp states no result"));
+    };
+    consumed.push(ex);
+    let den_op = sole_reader_matching(reads, name, ex, "softmax sum reduce", |o| {
+        o.op_type == OpKind::LinalgReduce
+    })?;
+    let Some(den) = den_op.result else {
+        return err(format!(
+            "{name}: the router's softmax sum reduce states no result"
+        ));
+    };
+    let den_data = router_seeded_reduce(
+        reads,
+        name,
+        den,
+        OpKind::ArithAddf,
+        0.0,
+        "the softmax's sum reduce",
+    )?;
+    if den_data != ex {
+        return err(format!(
+            "{name}: the router's softmax sum reduce reads a value other than the exp product"
+        ));
+    }
+    consumed.push(den);
+    let div_op = sole_reader_matching(reads, name, ex, "softmax divide", |o| {
+        o.op_type == OpKind::ArithDivf
+    })?;
+    let [div_a, div_b] = div_op.operands[..] else {
+        return err(format!("{name}: the router's softmax divide is not binary"));
+    };
+    let div_other = if div_a == ex {
+        div_b
+    } else if div_b == ex {
+        div_a
+    } else {
+        return err(format!(
+            "{name}: the router's softmax divide reads the exp product on neither side"
+        ));
+    };
+    let den_b_src = plumbing_source(reads, div_other, &mut consumed);
+    if den_b_src != den {
+        return err(format!(
+            "{name}: the router's softmax divide reads a value other than the sum reduce's \
+             broadcast — the softmax is `exp / Σexp`"
+        ));
+    }
+    let Some(div) = div_op.result else {
+        return err(format!(
+            "{name}: the router's softmax divide states no result"
+        ));
+    };
+    consumed.push(div);
+    let rs_op = sole_reader_matching(reads, name, div, "route-weights multiply", |o| {
+        o.op_type == OpKind::ArithMulf
+    })?;
+    let [rs_a, rs_b] = rs_op.operands[..] else {
+        return err(format!(
+            "{name}: the router's route-weights multiply is not binary"
+        ));
+    };
+    let psel_side = if rs_a == div {
+        rs_b
+    } else if rs_b == div {
+        rs_a
+    } else {
+        return err(format!(
+            "{name}: the router's route-weights multiply reads the softmax's probabilities on \
+             neither side"
+        ));
+    };
+    if psel_side != psel_final {
+        return err(format!(
+            "{name}: the router's route-weights multiply reads a value other than the selected \
+             per-expert scales — the weights are `softmax(vals·TEMP) · psel`"
+        ));
+    }
+    let Some(rs_val) = rs_op.result else {
+        return err(format!(
+            "{name}: the router's route-weights multiply states no result"
+        ));
+    };
+    consumed.push(rs_val);
+    let rs_store_op = sole_reader_matching(reads, name, rs_val, "route-weights store", |o| {
+        o.op_type == OpKind::KtdpStore
+    })?;
+    let (rs_tid, rs_rows, rs_cols) = store_param(k, reads, rs_store_op, name, "the route weights")?;
+    if rs_tid == ids_tid {
+        return err(format!(
+            "{name}: the router's route weights and routed ids land on ONE parameter t{rs_tid} — \
+             they are two scratch buffers"
+        ));
+    }
+    if rs_rows != rows || rs_cols != topk {
+        return err(format!(
+            "{name}: the router's route-weights landing is [{rs_rows}, {rs_cols}] against the ids \
+             landing [{rows}, {topk}] — the two landings carry the same rows and slot count"
+        ));
+    }
+
+    Ok(RouterChain {
+        lg,
+        pes,
+        ids_tid,
+        rs_tid,
+        rs_loads: direct_loads_of(k, reads, rs_tid),
+        temp: temp as f32,
+        k: topk,
+        emit_at: offs_gen,
+        consumed,
+    })
+}
+
+/// ONE ACCUMULATOR UPDATE — the folded round-0 form (`acc = x·onehot`, the zero init folded
+/// away) or the running form (`acc = acc + x·onehot`). Returns `(the previous accumulator,
+/// when running; the update multiply's result)`. Order is not trusted on either side of the
+/// add, and an add reading a multiply on BOTH sides is refused — that is a different function
+/// than the round form.
+fn router_acc_update(
+    reads: &ProgramReads<'_>,
+    name: &str,
+    acc: Ssa,
+    what: &str,
+) -> Result<(Option<Ssa>, Ssa), Error> {
+    let Some(d) = reads.def_of(acc) else {
+        return err(format!(
+            "{name}: the router's {what} accumulator is a function argument, not a computed value"
+        ));
+    };
+    match d.op_type {
+        OpKind::ArithMulf => Ok((None, acc)),
+        OpKind::ArithAddf => {
+            let [a, b] = d.operands[..] else {
+                return err(format!(
+                    "{name}: the router's {what} accumulator's running add is not binary"
+                ));
+            };
+            match (
+                reads.def_of(a).map(|x| x.op_type),
+                reads.def_of(b).map(|x| x.op_type),
+            ) {
+                // ⭐ ROUND 1'S ADD READS THE FOLDED ROUND-0 UPDATE ON ITS PREV SIDE —
+                // `acc_0 = x·onehot_0` has no add of its own, so both sides of that ONE add
+                // are multiplies. The ROUND INDEX tells them apart: the update's one-hot
+                // states j, the folded prev's states j−1, and the gap must be exactly one.
+                // (Deeper rounds' prevs are adds, so this is the only place two multiplies
+                // meet; a shape that puts them anywhere else does not survive the gap check.)
+                (Some(OpKind::ArithMulf), Some(OpKind::ArithMulf)) => {
+                    match (router_round_splat(reads, a), router_round_splat(reads, b)) {
+                        (Some(ja), Some(jb)) if ja == jb + 1 => Ok((Some(b), a)),
+                        (Some(ja), Some(jb)) if jb == ja + 1 => Ok((Some(a), b)),
+                        _ => err(format!(
+                            "{name}: the router's {what} accumulator's add reads two \
+                             multiplies whose one-hots state round indices that are not one \
+                             apart — the round form is `acc + x·onehot` with round 0 folded, \
+                             so round 1's add is the only place two multiplies meet and their \
+                             one-hots state j and j−1"
+                        )),
+                    }
+                }
+                (Some(OpKind::ArithMulf), _) => Ok((Some(b), a)),
+                (_, Some(OpKind::ArithMulf)) => Ok((Some(a), b)),
+                _ => err(format!(
+                    "{name}: the router's {what} accumulator's add reads no multiply update — \
+                     the round form is `acc + x·onehot`"
+                )),
+            }
+        }
+        other => err(format!(
+            "{name}: the router's {what} accumulator is `{other:?}` — neither the folded \
+             round-0 multiply (`x·onehot`) nor the running add (`acc + x·onehot`)"
+        )),
+    }
+}
+
+/// AN UPDATE'S ONE-HOT OPERAND — the operand defined DIRECTLY by a `tensor.expand_shape`,
+/// against the value operand (the round's reduce, resticked through a `linalg.broadcast`).
+/// Returns `(the one-hot, the value)`. The discriminator is exact at every round: the one-hot
+/// is a `[k]` vector the program widens with a BARE expand — no `linalg.broadcast` roots at
+/// it, so the broadcast-chain reader claims none of it and this walk does — while the value
+/// side always rides a broadcast.
+fn router_onehot_of(
+    reads: &ProgramReads<'_>,
+    name: &str,
+    mulf: Ssa,
+    what: &str,
+) -> Result<(Ssa, Ssa), Error> {
+    let Some(d) = reads.def_of(mulf) else {
+        return err(format!(
+            "{name}: the router's {what} is a function argument"
+        ));
+    };
+    if d.op_type != OpKind::ArithMulf {
+        return err(format!(
+            "{name}: the router's {what} is `{:?}`, not a multiply",
+            d.op_type
+        ));
+    }
+    let [a, b] = d.operands[..] else {
+        return err(format!("{name}: the router's {what} is not binary"));
+    };
+    match (
+        reads.def_of(a).map(|x| x.op_type),
+        reads.def_of(b).map(|x| x.op_type),
+    ) {
+        (Some(OpKind::TensorExpandShape), Some(OpKind::TensorExpandShape)) => err(format!(
+            "{name}: the router's {what} reads a widened one-hot on BOTH sides — the round \
+             form is `x · onehot`"
+        )),
+        (Some(OpKind::TensorExpandShape), _) => Ok((a, b)),
+        (_, Some(OpKind::TensorExpandShape)) => Ok((b, a)),
+        _ => err(format!(
+            "{name}: the router's {what} reads no widened one-hot — the round form multiplies \
+             the round's value by the one-hot `select(koffs == j, 1, 0)` widened to `[1, k]`"
+        )),
+    }
+}
+
+/// A splatted constant BY BITS — `splat_value` with the exact-value reading this proof needs:
+/// the round constants (−inf, −1.0, 0.0, 1.0) are exact in f16, so the f64 the splat carries
+/// names them exactly — and −0.0 ≠ 0.0 (a masked-out lane of −0.0 is a different tie-break
+/// input, and fails closed).
+fn router_splat_is(reads: &ProgramReads<'_>, v: Ssa, want: f64) -> bool {
+    reads
+        .splat_value(v)
+        .is_some_and(|x| x.to_bits() == want.to_bits())
+}
+
+/// THE ROUND INDEX an update multiply's one-hot states — `onehot(mulf) → select → cmpf → the
+/// j splat`, read WITHOUT the rest of the round proof. The loop re-proves every link; this
+/// answers ONE question, and it is the discriminator for the one place two multiplies meet
+/// (round 1's add, whose prev side is round 0's FOLDED update — see
+/// [`router_acc_update`]): which of the two is this round's update.
+fn router_round_splat(reads: &ProgramReads<'_>, mulf: Ssa) -> Option<u32> {
+    let d = reads.def_of(mulf)?;
+    if d.op_type != OpKind::ArithMulf {
+        return None;
+    }
+    let oh_b = d.operands.iter().copied().find(|&v| {
+        reads
+            .def_of(v)
+            .is_some_and(|x| x.op_type == OpKind::TensorExpandShape)
+    })?;
+    let oh = reads.def_of(oh_b)?.operands.first().copied()?;
+    let sel = reads.def_of(oh)?;
+    if sel.op_type != OpKind::ArithSelect {
+        return None;
+    }
+    let cond = sel.operands.first().copied()?;
+    let cmpf = reads.def_of(cond)?;
+    if cmpf.op_type != OpKind::ArithCmpf {
+        return None;
+    }
+    let j = cmpf.operands.iter().find_map(|&v| reads.splat_value(v))?;
+    if j < 0.0 || j.fract() != 0.0 || j > 255.0 {
+        return None;
+    }
+    Some(j as u32)
+}
+
+/// An `arith.cmpf` with the ORDERED-EQUAL predicate — the round compares' own. Returns the
+/// two operands; order is not trusted.
+fn router_oeq(
+    reads: &ProgramReads<'_>,
+    name: &str,
+    v: Ssa,
+    what: &str,
+) -> Result<(Ssa, Ssa), Error> {
+    let Some(d) = reads.def_of(v) else {
+        return err(format!(
+            "{name}: the router's {what} is a function argument"
+        ));
+    };
+    if d.op_type != OpKind::ArithCmpf {
+        return err(format!(
+            "{name}: the router's {what} is `{:?}`, not an `arith.cmpf`",
+            d.op_type
+        ));
+    }
+    let oeq = d
+        .attributes
+        .iter()
+        .any(|(k, w)| matches!((k, w), (AttrKey::Predicate, Attr::Str("oeq"))));
+    if !oeq {
+        return err(format!(
+            "{name}: the router's {what} is not an ordered-equal compare — the round form \
+             compares lane values with `oeq`"
+        ));
+    }
+    let [a, b] = d.operands[..] else {
+        return err(format!("{name}: the router's {what} is not binary"));
+    };
+    Ok((a, b))
+}
+
+/// A `linalg.reduce` BY COMBINER AND SEED — the round ops' own law, one place. Proves the
+/// kind, the `ReduceFn` combiner, the `[1]` reduction dims, and the seed splat's VALUE;
+/// returns the reduce's DATA operand (the init is the seed splat, identified by value, order
+/// not trusted).
+fn router_seeded_reduce(
+    reads: &ProgramReads<'_>,
+    name: &str,
+    v: Ssa,
+    combiner: OpKind,
+    seed: f64,
+    what: &str,
+) -> Result<Ssa, Error> {
+    let Some(d) = reads.def_of(v) else {
+        return err(format!(
+            "{name}: the router's {what} is a function argument"
+        ));
+    };
+    if d.op_type != OpKind::LinalgReduce {
+        return err(format!(
+            "{name}: the router's {what} is `{:?}`, not a `linalg.reduce`",
+            d.op_type
+        ));
+    }
+    let stated = d.attributes.iter().find_map(|(k, w)| match (k, w) {
+        (AttrKey::ReduceFn, Attr::Op(o)) => Some(*o),
+        _ => None,
+    });
+    if stated != Some(combiner) {
+        return err(format!(
+            "{name}: the router's {what} reduces with `{:?}` — the round form states `{:?}`",
+            stated, combiner
+        ));
+    }
+    let dims = d.attributes.iter().find_map(|(k, w)| match (k, w) {
+        (AttrKey::Dimensions, Attr::IntList(x)) => Some(*x),
+        _ => None,
+    });
+    if !matches!(dims, Some([1])) {
+        return err(format!(
+            "{name}: the router's {what} reduces over dims {dims:?} — the round form reduces \
+             over the lane axis `[1]`, one value per token"
+        ));
+    }
+    let [a, b] = d.operands[..] else {
+        return err(format!("{name}: the router's {what} is not binary"));
+    };
+    // The seed is the splat; the data is the other side. A seed on both sides is a different
+    // function (a reduce of a constant), and no seed at all is not this form.
+    if router_splat_is(reads, a, seed) && !router_splat_is(reads, b, seed) {
+        Ok(b)
+    } else if router_splat_is(reads, b, seed) && !router_splat_is(reads, a, seed) {
+        Ok(a)
+    } else {
+        err(format!(
+            "{name}: the router's {what} reads no lone seed splat {seed} — the round form seeds \
+             the reduce with a splatted constant and reduces the data on the other side"
+        ))
+    }
+}
+
+/// `tl.arange`'s landing: a rank-1 `tensor.generate` whose region yields its own block
+/// argument — the IDENTITY function, so the result IS the offset vector. Proven, not assumed:
+/// a generate is the one op in this body that could carry ANY region, and the round compares
+/// mean "lane offset", not "any `[n]` vector". Returns the generate's width.
+fn router_identity_generate(reads: &ProgramReads<'_>, v: Ssa) -> Option<u32> {
+    let d = reads.def_of(v)?;
+    if d.op_type != OpKind::TensorGenerate {
+        return None;
+    }
+    let region = d.regions.first()?;
+    if region.len() != 2 {
+        return None;
+    }
+    let [bb0, yld] = [*region.first()?, *region.get(1)?];
+    if bb0.op_type != OpKind::RegionBb0Args || yld.op_type != OpKind::TensorYield {
+        return None;
+    }
+    let names = bb0.attributes.iter().find_map(|(k, w)| match (k, w) {
+        (AttrKey::Names, Attr::Ssas(xs)) => Some(*xs),
+        _ => None,
+    })?;
+    let [x] = names else {
+        return None;
+    };
+    if yld.operands.len() != 1 || yld.operands[0] != *x {
+        return None;
+    }
+    match d.result_type {
+        Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() == 1 => {
+            u32::try_from(dims[0]).ok()
+        }
+        _ => None,
+    }
+}
+
+/// [`ProgramReads::through_plumbing`] THAT COLLECTS — the same bounded (≤3 steps) back-walk
+/// over `tensor.expand_shape`/`tensor.collapse_shape`/`linalg.broadcast`, pushing every link
+/// it passes through into `consumed`. The chain reader answers IDENTITY; a composite
+/// recogniser also owes consumption for its own interior, and the bare `expand_shape` the
+/// one-hot rides is claimed by no other reader. Every resolution this proof makes goes
+/// through here, so no link the proof walked is left for the 1:1 walk to refuse.
+fn plumbing_source(reads: &ProgramReads<'_>, v: Ssa, consumed: &mut Vec<Ssa>) -> Ssa {
+    let mut cursor = v;
+    for _ in 0..3 {
+        let Some(d) = reads.def_of(cursor) else { break };
+        if !matches!(
+            d.op_type,
+            OpKind::TensorExpandShape | OpKind::TensorCollapseShape | OpKind::LinalgBroadcast
+        ) {
+            break;
+        }
+        let Some(src) = d.operands.first().copied() else {
+            break;
+        };
+        consumed.push(cursor);
+        cursor = src;
+    }
+    cursor
+}
+
+/// The ONE reader of `v` matching `pred` — the tail's finder. Zero or several matches are
+/// both refusals: the softmax tail is a single-consumer chain, and a second matching reader
+/// is a different function than the one the fused emission computes.
+fn sole_reader_matching<'f>(
+    reads: &ProgramReads<'f>,
+    name: &str,
+    v: Ssa,
+    what: &str,
+    pred: impl Fn(&Operation<'static>) -> bool,
+) -> Result<&'f Operation<'static>, Error> {
+    let mut hits = reads
+        .readers_of(v)
+        .iter()
+        .map(|&p| reads.op_at(p))
+        .filter(|o| pred(o));
+    let Some(only) = hits.next() else {
+        return err(format!(
+            "{name}: the router's {what} — no reader matches; the softmax tail is a \
+             single-consumer chain"
+        ));
+    };
+    if hits.next().is_some() {
+        return err(format!(
+            "{name}: the router's {what} — SEVERAL readers match; the softmax tail is a \
+             single-consumer chain and a second one is a different function"
+        ));
+    }
+    Ok(only)
+}
+
+/// The PARAMETER a store writes — `ktdp.store` ← `ktdp.construct_access_tile` ←
+/// `ktdp.construct_memory_view` ← argument → binding, plus the view's own `[rows, cols]`.
+/// The same walk [`region_for_operand`] takes for loads, read here for the two stores the
+/// router replaces: their parameters go WRITE-DEAD (the emission lands its own minted
+/// buffers), so this is the only place their bindings are ever named.
+fn store_param(
+    k: &KtirNode,
+    reads: &ProgramReads<'_>,
+    store: &Operation<'static>,
+    name: &str,
+    what: &str,
+) -> Result<(u32, u32, u32), Error> {
+    let f = &k.func;
+    let tile_v = store.operands.get(1).copied().ok_or_else(|| Error {
+        message: format!("{name}: the router's {what} store states no tile"),
+    })?;
+    let tile = reads.def_of(tile_v).ok_or_else(|| Error {
+        message: format!("{name}: the router's {what} store's tile is a function argument"),
+    })?;
+    if tile.op_type != OpKind::KtdpConstructAccessTile {
+        return err(format!(
+            "{name}: the router's {what} store writes through `{:?}`, not an access tile",
+            tile.op_type
+        ));
+    }
+    let view_v = tile.operands.first().copied().ok_or_else(|| Error {
+        message: format!("{name}: the router's {what} store's tile states no view"),
+    })?;
+    let view = reads.def_of(view_v).ok_or_else(|| Error {
+        message: format!("{name}: the router's {what} store's view is a function argument"),
+    })?;
+    if view.op_type != OpKind::KtdpConstructMemoryView {
+        return err(format!(
+            "{name}: the router's {what} store's tile reinterprets `{:?}`, not a memory view",
+            view.op_type
+        ));
+    }
+    let ptr = view.operands.first().copied().ok_or_else(|| Error {
+        message: format!("{name}: the router's {what} store's view states no pointer"),
+    })?;
+    let idx = f
+        .arguments
+        .iter()
+        .position(|(a, _)| *a == ptr)
+        .ok_or_else(|| Error {
+            message: format!(
+                "{name}: the router's {what} store's view addresses no function argument — \
+                     the scratch parameters are the kernel's own"
+            ),
+        })?;
+    let tid = k.bindings.get(idx).map(|b| b.get()).ok_or_else(|| Error {
+        message: format!("{name}: the router's {what} store's parameter has no binding"),
+    })?;
+    let Some((rows, cols)) = super::lower_ktir_to_superdsc::shape_2d(view) else {
+        return err(format!(
+            "{name}: the router's {what} store's view states no 2-D shape, so the landing's \
+             extents are unknown"
+        ));
+    };
+    Ok((tid, rows, cols))
+}
+
+/// Every DIRECT load of the parameter bound to `tid` — a `ktdp.load` over a plain
+/// `ktdp.construct_access_tile` (NOT the indirect form; the gathers census owns those) whose
+/// view reinterprets `tid`'s argument. The scratch census's iteration set.
+fn direct_loads_of(k: &KtirNode, reads: &ProgramReads<'_>, tid: u32) -> Vec<Ssa> {
+    let f = &k.func;
+    f.operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::KtdpLoad)
+        .filter_map(|o| {
+            let res = o.result?;
+            let tile = reads.def_of(*o.operands.first()?)?;
+            if tile.op_type != OpKind::KtdpConstructAccessTile {
+                return None;
+            }
+            let view = reads.def_of(*tile.operands.first()?)?;
+            if view.op_type != OpKind::KtdpConstructMemoryView {
+                return None;
+            }
+            let ptr = view.operands.first().copied()?;
+            let idx = f.arguments.iter().position(|(a, _)| *a == ptr)?;
+            (k.bindings.get(idx)?.get() == tid).then_some(res)
+        })
+        .collect()
+}
+
+/// ⭐⭐⭐ THE SCRATCH CENSUS — the write-dead law's soundness obligation, stated at the door.
+///
+/// The fused router writes its own minted landings and NEVER the scratch parameters
+/// `desc_ids`/`desc_rs`: the program's stores into them lower to nothing (write-dead), so a
+/// reader that is not a chain this door recognises would read a buffer nothing wrote. The
+/// claim therefore owes the program a proof: EVERY direct load of either parameter is
+/// consumed by a recognised chain — its result, or the value it feeds through rank plumbing,
+/// is in the claimed set. A reader outside the claimed set is refused BY NAME, because the
+/// alternative is a well-formed bundle computing garbage. Gathered reads need no census here:
+/// an indirect tile is the gathers census's own iteration set, and the w8a8 claims already
+/// joined theirs.
+fn router_scratch_census(
+    k: &KtirNode,
+    reads: &ProgramReads<'_>,
+    routers: &[RouterChain],
+    claimed: &std::collections::HashSet<Ssa>,
+) -> Result<(), Error> {
+    let f = &k.func;
+    for c in routers {
+        for (tid, what) in [
+            (c.ids_tid, "the routed ids"),
+            (c.rs_tid, "the route weights"),
+        ] {
+            for load in direct_loads_of(k, reads, tid) {
+                // Forward through rank plumbing; every COMPUTE reader must be claimed. A load
+                // nothing reads lowers to nothing (loads are plumbing) and owes no proof.
+                let mut stack = vec![load];
+                while let Some(v) = stack.pop() {
+                    for &p in reads.readers_of(v) {
+                        let r = reads.op_at(p);
+                        if r.result.is_some_and(|res| claimed.contains(&res)) {
+                            continue;
+                        }
+                        if matches!(
+                            r.op_type,
+                            OpKind::TensorExpandShape
+                                | OpKind::TensorCollapseShape
+                                | OpKind::LinalgBroadcast
+                        ) {
+                            if let Some(res) = r.result {
+                                stack.push(res);
+                            }
+                            continue;
+                        }
+                        return err(format!(
+                            "{}: {what} (t{tid}) is read by `{:?}`, which no recognised chain \
+                             claims — the fused router writes its own minted landings and never \
+                             the scratch parameter, so this read would address a buffer nothing \
+                             wrote. The combine rung is the recogniser for the route-weights read; \
+                             any other reader is a shape this door refuses",
+                            f.name, r.op_type
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Lower a function holding MANY ops, one `Program` per op, in program order.
 ///
 /// Each op is handed only its own operands' regions, so the existing bodies apply unchanged.
@@ -4077,6 +5490,17 @@ pub fn lower_function(
     // over ONE expert input, so the emission's quantize is emitted once and named once —
     // the same dedup law the per-`Program` door's fp8 matmul states across its ops.
     let mut quantized: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // ⭐⭐⭐ THE ROUTER CHAINS — the round-form top-k, the temperature softmax, and the
+    // per-expert scale, claimed WHOLE from the ids store backward. [`program_router_chains`]
+    // proves every link (the rounds' shared one-hot, the three spines, the mask continuity,
+    // the tail), and the walk below lowers the whole chain at ONE fire point: the lane-offset
+    // identity generate. The claims are the chain's interior — consumed by the fusion, so the
+    // 1:1 walk skips them (the body's compares/selects/generates have no `Program` anyway).
+    let routers = program_router_chains(k)?;
+    let router_consumed: std::collections::HashSet<Ssa> = routers
+        .iter()
+        .flat_map(|c| c.consumed.iter().copied())
+        .collect();
     // ⭐⭐⭐ THE GATHERS THE PROGRAM STATES, read ONCE and from [`gathers_of`] — the same joins the
     // per-`Program` door's `gather_of` makes, so the two doors cannot disagree about which parameter
     // is the table or which is the index. A program with ONE indirect tile reads identically to
@@ -4112,6 +5536,23 @@ pub fn lower_function(
     // walk is private to here.
     let reads = program_reads(f);
 
+    // ⭐⭐⭐ THE SCRATCH CENSUS — the write-dead law's soundness obligation, BEFORE the walk:
+    // the fused router writes its own minted landings and never the `desc_ids`/`desc_rs`
+    // parameters, so every direct load of either must be consumed by a chain this door
+    // recognises. The claimed set is the union of every chain reader's — one proof, so no
+    // reader can be judged against a set its own chain did not join. See
+    // [`router_scratch_census`].
+    if !routers.is_empty() {
+        let mut claimed = bcast_consumed.clone();
+        claimed.extend(silus.iter().flat_map(|c| c.consumed.iter().copied()));
+        claimed.extend(gelus.iter().flat_map(|c| c.consumed.iter().copied()));
+        claimed.extend(rmsnorms.iter().flat_map(|c| c.consumed.iter().copied()));
+        claimed.extend(w8a8_consumed.iter().copied());
+        claimed.extend(down_consumed.iter().copied());
+        claimed.extend(router_consumed.iter().copied());
+        router_scratch_census(k, &reads, &routers, &claimed)?;
+    }
+
     for op in f.operations.iter() {
         if is_plumbing(op.op_type) {
             continue;
@@ -4136,6 +5577,10 @@ pub fn lower_function(
                 // shared) plus its three links — same law, one `expert_down_fused_m1` leg set
                 // per pair, at that pair's own terminal.
                 || down_consumed.contains(&r)
+                // The ROUTER'S interior — the rounds, the converts, and the softmax tail —
+                // same law, one fused emission at the lane-offset generate (the fire arm
+                // below).
+                || router_consumed.contains(&r)
         }) {
             continue;
         }
@@ -4288,6 +5733,121 @@ pub fn lower_function(
                 },
                 out_tid,
                 chain.pair,
+                sym_id_base,
+                Some(layout),
+            )?;
+            out.append(&mut emitted);
+            lowered += 1;
+            continue;
+        }
+        // ⭐⭐⭐ A ROUTER CHAIN'S FIRE POINT — the lane-offset identity generate the rounds'
+        // compares read. Everything the emission needs is already in hand at this op: the
+        // dot's region (the matmul arm minted it — the dot PRECEDES this generate in program
+        // order, because the rounds read it), the pes parameter, and the proofs. The FIVE
+        // products are minted HERE — the two `[m_pad, 64]` landings, the `·TEMP` output, the
+        // softmax output, and the route weights the combine rung reads — and every direct
+        // load of the rs scratch is resolved to the route-weights product in `inter`, so the
+        // combine's hook will find the emission's own buffer through the same map every
+        // cross-chain handoff uses.
+        if let Some(r) = op.result
+            && let Some(chain) = routers.iter().find(|c| c.emit_at == r)
+        {
+            let Some(layout) = layout else {
+                return err(format!(
+                    "{}: the router over t{} is an intermediate product, which needs a \
+                     `BundleLayout` to hold its buffers -- `layout: None` is the unit-test arm \
+                     and cannot place one",
+                    f.name, chain.ids_tid
+                ));
+            };
+            let lg = inter.get(&chain.lg).copied().ok_or_else(|| Error {
+                message: format!(
+                    "{}: the router's logits dot (s{}) has no intermediate region — the \
+                             matmul that computes it must precede the lane-offset generate this \
+                             fire point anchors at, and the walk reads program order",
+                    f.name, chain.lg.0
+                ),
+            })?;
+            let rows = lg.v_rows;
+            let m_pad = rows.next_multiple_of(crate::work::FP16_ELEMS_PER_STICK);
+            // The five products, in mint order: the landings at the legs' own `[m_pad, 64]`
+            // law (the pair's transposed output, one stick per token), the three softmax-chain
+            // products at `[rows, 64]` (the ·TEMP output, the softmax out, the route weights —
+            // the width every consumer addresses, head slots included).
+            let ids_out_tid = next_tid;
+            next_tid += 1;
+            layout.synth(
+                crate::place::PlaceId::Act(ids_out_tid),
+                &[m_pad, crate::work::FP16_ELEMS_PER_STICK],
+            );
+            let vals_out_tid = next_tid;
+            next_tid += 1;
+            layout.synth(
+                crate::place::PlaceId::Act(vals_out_tid),
+                &[m_pad, crate::work::FP16_ELEMS_PER_STICK],
+            );
+            let temp_out_tid = next_tid;
+            next_tid += 1;
+            layout.synth(
+                crate::place::PlaceId::Act(temp_out_tid),
+                &[rows, crate::work::FP16_ELEMS_PER_STICK],
+            );
+            let smax_out_tid = next_tid;
+            next_tid += 1;
+            layout.synth(
+                crate::place::PlaceId::Act(smax_out_tid),
+                &[rows, crate::work::FP16_ELEMS_PER_STICK],
+            );
+            let weights_out_tid = next_tid;
+            next_tid += 1;
+            layout.synth(
+                crate::place::PlaceId::Act(weights_out_tid),
+                &[rows, crate::work::FP16_ELEMS_PER_STICK],
+            );
+            // The combine's handoff: every direct rs load resolves to the route-weights
+            // product. The census proved each is a claimed chain's read; this records WHERE
+            // the emission actually put the weights, so the combine rung's hook reads the
+            // emission's own buffer and never the write-dead scratch parameter.
+            for l in &chain.rs_loads {
+                inter.insert(
+                    *l,
+                    Region {
+                        tid: weights_out_tid,
+                        v_rows: rows,
+                        v_cols: crate::work::FP16_ELEMS_PER_STICK,
+                        r_start: 0,
+                        r_len: rows,
+                        c_start: 0,
+                        c_len: crate::work::FP16_ELEMS_PER_STICK,
+                        r_cover: (0, rows),
+                        c_cover: (0, crate::work::FP16_ELEMS_PER_STICK),
+                        is_out: false,
+                        is_fp8: false,
+                    },
+                );
+            }
+            let Some(pes) = region_for_operand(k, chain.pes)? else {
+                return err(format!(
+                    "{}: the router's per-expert scale row (s{}) resolved to no parameter — the \
+                     recogniser proved it is a load of a parameter, so this is a walk/recogniser \
+                     disagreement and not a producer shape",
+                    f.name, chain.pes.0
+                ));
+            };
+            let mut emitted = super::lower_ktir_to_superdsc::router_fused_m1(
+                &super::lower_ktir_to_superdsc::RouterFusedFacts {
+                    name: f.name,
+                    lg,
+                    pes,
+                    ids_tid: chain.ids_tid,
+                    ids_out_tid,
+                    vals_out_tid,
+                    temp_out_tid,
+                    smax_out_tid,
+                    weights_out_tid,
+                    k: chain.k,
+                    temp: chain.temp,
+                },
                 sym_id_base,
                 Some(layout),
             )?;

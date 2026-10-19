@@ -9672,14 +9672,81 @@ pub fn route_topk(
     };
     let rows = node_rows(name, ids)?;
     let k = ids.v_cols;
+    // ⛔ THE PER-OP PARAMETER LAW ONLY — the chain is row-preserving and the two landings
+    // carry the same slot count. Every EMISSION law (the width and divisibility checks, the
+    // stage, the Kᵀ, the pair, the convert trio, the landing transposes) lives in
+    // [`route_topk_legs`] ONCE, so the whole-function router door and this door cannot
+    // disagree about what a top-k emits.
+    if vals.v_rows != rows || ids.v_rows != rows || lg.v_rows != rows || vals.v_cols != k {
+        return err(format!(
+            "RouteTopK {name}: the logits t{} [{}, {}], the values t{} [{}, {}], and the ids \
+             t{} [{rows}, {k}] — the chain is row-preserving and the two landings carry the \
+             same slot count",
+            lg.tid, lg.v_rows, lg.v_cols, vals.tid, vals.v_rows, vals.v_cols, ids.tid
+        ));
+    }
+    route_topk_legs(
+        name,
+        ids.tid,
+        lg,
+        TopkLanding {
+            ids: &ids.name(),
+            vals: &vals.name(),
+            rows,
+            k,
+        },
+        sym_id_base,
+        layout,
+    )
+}
+
+/// The landing the top-k's legs write — the two `[m_pad, 64]` buffers' names, the token
+/// count, and the top-k width. The parameters' own names on the per-op path, the walk's
+/// minted intermediates on the fused path — the write-dead law, made mechanical.
+pub struct TopkLanding<'a> {
+    /// The ids landing's buffer name (the `[m_pad, 64]` stick the convert trio reads).
+    pub ids: &'a str,
+    /// The selected-maxima landing's buffer name (the temperature multiply's input).
+    pub vals: &'a str,
+    /// The token count (`rows`).
+    pub rows: u32,
+    /// The top-k width (`k`).
+    pub k: u32,
+}
+
+/// ⭐⭐⭐ ROUTE_TOPK'S LEGS — the emission both doors share. The per-`Program` door
+/// ([`route_topk`]) reaches them through its parameter law; the whole-function router door
+/// ([`router_fused_m1`]) reaches them with the LOGITS REGION the 1:1 walk minted for the dot
+/// and the MINTED landings the walk reserved — the same legs, keyed off `ids_tid` either way,
+/// so the scratch law (every synth off `PlaceId::Act(ids_tid)`, the expert doors' `XIdx`
+/// reservation included) stays ONE law, not two that can drift.
+///
+/// The landing's two buffers are the parameters' own names on the per-op path and the
+/// walk's minted intermediates on the fused path — the write-dead law, made mechanical
+/// (the fused door never writes the scratch parameters themselves; their stores lower to
+/// nothing, and the census proves every read of them is a claimed chain's).
+pub fn route_topk_legs(
+    name: &str,
+    ids_tid: u32,
+    lg: &Region,
+    landing: TopkLanding<'_>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let TopkLanding {
+        ids: ids_s,
+        vals: vals_s,
+        rows,
+        k,
+    } = landing;
     let e = lg.v_cols;
     let w = e.next_multiple_of(FP16_ELEMS_PER_STICK);
     if w == 0 || e == 0 || k == 0 || k > e {
         return err(format!(
-            "RouteTopK {name}: the logits t{} [{}, {}] and the ids t{} [{rows}, {k}] — the \
+            "RouteTopK {name}: the logits t{} [{}, {}] and the ids t{ids_tid} [{rows}, {k}] — the \
              expert count and top-k must be positive with k ≤ E, and E's padded width a whole \
              64-stick (got {w})",
-            lg.tid, lg.v_rows, lg.v_cols, ids.tid
+            lg.tid, lg.v_rows, lg.v_cols
         ));
     }
     if k > FP16_ELEMS_PER_STICK {
@@ -9709,19 +9776,8 @@ pub fn route_topk(
             FP16_ELEMS_PER_STICK, FP16_ELEMS_PER_STICK
         ));
     }
-    if vals.v_rows != rows || ids.v_rows != rows || lg.v_rows != rows || vals.v_cols != k {
-        return err(format!(
-            "RouteTopK {name}: the logits t{} [{}, {}], the values t{} [{}, {}], and the ids \
-             t{} [{rows}, {k}] — the chain is row-preserving and the two landings carry the \
-             same slot count",
-            lg.tid, lg.v_rows, lg.v_cols, vals.tid, vals.v_rows, vals.v_cols, ids.tid
-        ));
-    }
-    check_pointwise_cols(w, "RouteTopK", ids.tid)?;
-    let ids_tid = ids.tid;
+    check_pointwise_cols(w, "RouteTopK", ids_tid)?;
     let lg_s = lg.name();
-    let vals_s = vals.name();
-    let ids_s = ids.name();
     let m_pad = rows.next_multiple_of(FP16_ELEMS_PER_STICK);
     // The logits buffer's own held width — the writer's (the RouterLogits
     // matmul pads E to W and bump-splits at macs ≥ 2^20, so lgw ≥ W always);
@@ -9937,7 +9993,7 @@ pub fn route_topk(
             FP16_ELEMS_PER_STICK,
             m_pad,
             &six_s,
-            &ids_s,
+            ids_s,
             sym_id_base,
             layout,
         )
@@ -9951,7 +10007,7 @@ pub fn route_topk(
             FP16_ELEMS_PER_STICK,
             m_pad,
             &svl_s,
-            &vals_s,
+            vals_s,
             sym_id_base,
             layout,
         )
@@ -9959,6 +10015,317 @@ pub fn route_topk(
             message: format!("{name}: the values landing transpose: {e}"),
         })?,
     );
+    Ok(ops)
+}
+
+/// ⭐⭐⭐ THE WHOLE-FUNCTION ROUTER'S FACTS — what [`crate::emit::whole_function::program_router_chains`]
+/// proved, handed to the one fused emission. The door's hook (the walk's fire point at the lane-offset
+/// `tensor.generate`) mints the five product buffers BEFORE calling [`router_fused_m1`], so this struct
+/// carries their tids and the two parameter facts the proof resolved — everything else the emission
+/// derives from the regions, exactly as the per-`Program` doors derive theirs from `split_out`.
+#[derive(Clone, Copy)]
+pub struct RouterFusedFacts<'a> {
+    pub name: &'a str,
+    /// The logits — the dot's own region, lowered 1:1 by the matmul arm AHEAD of the fire point and
+    /// recorded in the walk's intermediate map. `[rows, E]`.
+    pub lg: Region,
+    /// The per-expert scale row `[1, E]` — the `pes` parameter's own region, resolved by the hook.
+    pub pes: Region,
+    /// `desc_ids`' parameter tid — the scratch synth key [`route_topk_legs`] and the expert doors'
+    /// `XIdx` law share, so the fused router and the expert projections land on ONE scratch.
+    pub ids_tid: u32,
+    /// The walk's five minted products, in mint order: the ids landing `[m_pad, 64]`, the values
+    /// landing `[m_pad, 64]`, the ·TEMP output `[rows, 64]`, the softmax output `[rows, 64]`, and
+    /// the route weights `[rows, 64]` — the combine rung's read.
+    pub ids_out_tid: u32,
+    pub vals_out_tid: u32,
+    pub temp_out_tid: u32,
+    pub smax_out_tid: u32,
+    pub weights_out_tid: u32,
+    /// The top-k width, proven by the round walk and cross-checked against the `koffs` generate and
+    /// the ids store's own view.
+    pub k: u32,
+    /// The softmax temperature, read off the program's own splat and resolved to a registry slot by
+    /// BITS — the `scale_slot` law, f16-image fallback included.
+    pub temp: f32,
+}
+
+/// ⭐⭐⭐ THE FUSED ROUTER, AT THE WHOLE-FUNCTION DOOR — the round-based top-k, the temperature
+/// scale, the row softmax, and the per-expert scale, as the FOUR per-`Program` emissions the crate
+/// already names (`RouteTopK`, `ScalarMul`, `RouteSoftmax`, `RouteExpertScale`), chained over the
+/// walk's minted products:
+///
+/// ```text
+///   lg ──route_topk_legs──▶ ids_landing [m_pad,64] + vals_landing [m_pad,64]  (+ XIdx, external)
+///   vals_landing ──·TEMP──▶ temp_out [rows,64]
+///   temp_out ──sanitize+row softmax──▶ smax_out [rows,64]
+///   ids_landing + smax_out + pes ──route_expert_scale chain──▶ weights_out [rows,64] (external)
+/// ```
+///
+/// The legs are the per-`Program` doors' own, called through their shared bodies — never re-spelled —
+/// with two substitutions the fused form owns: every scratch synth keys off `PlaceId::Act(ids_tid)`
+/// (the parameter, not a landing), and the two landings are the walk's minted intermediates (the
+/// write-dead law: the program's own `ktdp.store`s into `desc_ids`/`desc_rs` lower to NOTHING, and
+/// the scratch census in [`crate::emit::whole_function`] proves every other read of those parameters
+/// belongs to a claimed chain). The router consts (the sanitize mask, the iota row, the identity
+/// table) are read BY RESERVED TID exactly as `route_softmax`/`route_expert_scale` read them — no
+/// second placement law lives here; the layout that lacks them is refused where every other router
+/// emission is.
+pub fn router_fused_m1(
+    facts: &RouterFusedFacts<'_>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let name = facts.name;
+    let rows = facts.lg.v_rows;
+    let e = facts.lg.v_cols;
+    let k = facts.k;
+    // The softmax width: the top-k's own padded stick. k ≤ 64 and k | 64 are route_topk_legs' own
+    // refusals, so this is 64 for every k the legs accept.
+    let w_k = k.next_multiple_of(FP16_ELEMS_PER_STICK);
+    let ids_s = crate::place::act_name(facts.ids_out_tid);
+    let vals_s = crate::place::act_name(facts.vals_out_tid);
+    // 1. THE TOP-K — route_topk's own legs over the dot's region, landing at the minted tids and
+    //    keying every scratch synth (XIdx included) off the ids parameter.
+    let mut ops = route_topk_legs(
+        name,
+        facts.ids_tid,
+        &facts.lg,
+        TopkLanding {
+            ids: &ids_s,
+            vals: &vals_s,
+            rows,
+            k,
+        },
+        sym_id_base,
+        layout,
+    )?;
+    // 2. THE ·TEMP LEG — `scalarmul_scaled`'s own from-tile form (the non-gathered arm), verbatim:
+    //    the scale rides IN the op (`n_operands: 2`), so a pw2 spelling would declare three tiled
+    //    operands for a two-operand descriptor — the wrong op, not a slower one.
+    // ⭐ AND THE FULL-ROW READ IS SAFE BY CONSTRUCTION, NOT BY LUCK (#565's head-slot law): the
+    //    window spans all 64 lanes of each token's row — replica lanes and init lanes alike — and
+    //    on card the pair writes only the replica-run HEADS (`route_topk_legs`' replication law),
+    //    the rest zero, while its slots `k..64` hold the `(−inf, −1)` init registers (route_topk's
+    //    pair doc). So every non-head lane this multiply touches is `0` or `−inf`, never NaN or
+    //    +inf, and the sanitize that follows adds the `sm_mask` row — `−inf` on every non-head
+    //    lane — where `−inf + garbage` is `−inf` for every finite garbage value. The one hazard
+    //    the mask cannot absorb is NaN or +inf in a non-head lane, and the pair's own init law
+    //    rules that out. The same read the per-`Program` ScalarMul door makes over its
+    //    `[m, k_pad]` window.
+    let temp_idx = scale_slot(layout, facts.temp).ok_or_else(|| Error {
+        message: format!(
+            "{name}: the router's temperature {}, read off the program's own splat, is absent \
+             from `BundleLayout::scalarmul_scales` — the descriptor multiplies by a bound `[1,1]` \
+             const, so the value the program uses must have a registry slot (registry desync)",
+            facts.temp
+        ),
+    })?;
+    let scale_h = rbo(&crate::place::act_name(scalarmul_scale_tid(temp_idx)));
+    let temp_out = crate::place::act_name(facts.temp_out_tid);
+    let x_h = rbo(&vals_s);
+    let inputs = [
+        In::col_window(
+            &x_h,
+            crate::addr::col_window_of(rows, w_k, 0, Df::Fp16).map_err(|e| Error {
+                message: format!("{name}: the router's temperature multiply: {e}"),
+            })?,
+        )
+        .ew(),
+        In::scalar(&scale_h).ew(),
+    ];
+    // ⭐ THE SAME `TileOp` `scalarmul_scaled` declares: `n_operands: 2` — the scalar rides in
+    // the op, not as a tiled operand (a pw2 spelling would set it to 3 and emit the wrong op).
+    let tile_op = pointwise_tile_op(rows, w_k, 2);
+    ops.push(assemble_pointwise_broadcast_off_from_tile(
+        &format!("rttemp_o{}", facts.temp_out_tid),
+        &tile_op,
+        "multiply",
+        rows,
+        w_k,
+        &inputs,
+        &rbo(&temp_out),
+        crate::addr::col_window_of(rows, w_k, 0, Df::Fp16).map_err(|e| Error {
+            message: format!("{name}: the router's temperature multiply: {e}"),
+        })?,
+        sym_id_base,
+        layout,
+    ));
+    // 3. THE SOFTMAX — route_softmax's own chain (the sanitize against the k-boundary mask row,
+    //    then `assemble_row_softmax`), keyed off the softmax-out tid.
+    use crate::place::SynthRole as R;
+    let smax_id = PlaceId::Act(facts.smax_out_tid);
+    let xsan_s = crate::placement::syn(layout, smax_id.synth(R::AXSan));
+    if let Some(l) = layout {
+        l.synth_like(
+            smax_id.synth(R::AXSan),
+            facts.smax_out_tid,
+            &[rows, w_k],
+            Df::Fp16,
+        );
+    }
+    let sm_mask = rb(
+        &crate::place::act_name(crate::reserved_tids::router_sm_mask_tid()),
+        1,
+        w_k,
+    );
+    let x = rb(&temp_out, rows, w_k);
+    let xsan = rb(&xsan_s, rows, w_k);
+    let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(rows);
+    let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(w_k);
+    ops.push(pw2(
+        &format!("rssan_o{}", facts.smax_out_tid),
+        "add",
+        t_rows,
+        f_cols,
+        In::full(&x),
+        In::mb(&sm_mask),
+        &xsan,
+        sym_id_base,
+        layout,
+    ));
+    ops.extend(assemble_row_softmax(
+        &format!("o{}", facts.smax_out_tid),
+        rows,
+        w_k,
+        &xsan_s,
+        smax_id,
+        sym_id_base,
+        layout,
+    ));
+    // 4. THE ROUTE WEIGHTS — route_expert_scale's own chain: the ids landing and the softmax out
+    //    read at each result's replica-run HEAD (lane j·rep), the pes row sprayed mb-wise, the
+    //    one-hot identity writing COMPACT at lane j — the combine rung reads lane j of this
+    //    product. Synths key off the weights-out tid (the door's own, so the names never collide
+    //    with the per-`Program` door's).
+    let w_e = e.next_multiple_of(FP16_ELEMS_PER_STICK);
+    let rep = FP16_ELEMS_PER_STICK / k;
+    let out_tid = facts.weights_out_tid;
+    let out_id = PlaceId::Act(out_tid);
+    let syn = |role: R| crate::placement::syn(layout, out_id.synth(role));
+    let m_s = syn(R::AMatch);
+    let sel_s = syn(R::ASel);
+    let val_s = syn(R::AIdx);
+    let acc_s = syn(R::AAcc);
+    if let Some(l) = layout {
+        l.synth_df(out_id.synth(R::AMatch), &[rows, w_e], Df::Fp16);
+        l.synth_df(out_id.synth(R::ASel), &[rows, w_e], Df::Fp16);
+        l.synth_df(out_id.synth(R::AIdx), &[rows, w_e], Df::Fp16);
+        l.synth_like(
+            out_id.synth(R::AAcc),
+            out_tid,
+            &[rows, FP16_ELEMS_PER_STICK],
+            Df::Fp16,
+        );
+    }
+    let iota = rb(
+        &crate::place::act_name(crate::reserved_tids::router_topk_iota_tid()),
+        1,
+        w_e,
+    );
+    let ident = rb(
+        &crate::place::act_name(crate::reserved_tids::router_identity_tid()),
+        w_e,
+        w_e,
+    );
+    let scores = rb(
+        &crate::place::act_name(facts.smax_out_tid),
+        rows,
+        FP16_ELEMS_PER_STICK,
+    );
+    let idx = rb(&ids_s, rows, FP16_ELEMS_PER_STICK);
+    let scale = rb(&facts.pes.name(), 1, w_e);
+    let out = rb(&crate::place::act_name(out_tid), rows, FP16_ELEMS_PER_STICK);
+    let m_ = rb(&m_s, rows, w_e);
+    let sel = rb(&sel_s, rows, w_e);
+    let val = rb(&val_s, rows, w_e);
+    let acc = rb(&acc_s, rows, FP16_ELEMS_PER_STICK);
+    let f_cols_e = crate::sdsc_abstract::BlockCols::of_feature_cols(w_e);
+    let c_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(FP16_ELEMS_PER_STICK);
+    for j in 0..k {
+        let lane = crate::addr::col_of(rows, FP16_ELEMS_PER_STICK, j * rep, Df::Fp16);
+        let ident_row = crate::addr::rc_of(w_e, w_e, j, 0, Df::Fp16);
+        ops.push(pw2(
+            &format!("remtc_j{j}_o{out_tid}"),
+            "equal",
+            t_rows,
+            f_cols_e,
+            In::col_at(&idx, lane),
+            In::mb(&iota),
+            &m_,
+            sym_id_base,
+            layout,
+        ));
+        ops.push(pw2(
+            &format!("resel_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            f_cols_e,
+            In::full(&m_),
+            In::mb(&scale),
+            &sel,
+            sym_id_base,
+            layout,
+        ));
+        ops.push(pw2(
+            &format!("reprd_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            f_cols_e,
+            In::full(&sel),
+            In::col_at(&scores, lane),
+            &m_,
+            sym_id_base,
+            layout,
+        ));
+        ops.push(assemble_reduce_off(
+            &format!("reval_j{j}_o{out_tid}"),
+            "sum",
+            t_rows,
+            f_cols_e,
+            &m_,
+            crate::addr::DevOff::ZERO,
+            &val,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        ops.push(pw2(
+            &format!("reout_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            c_cols,
+            In::col(&val),
+            In::mb_at(&ident, ident_row),
+            &sel,
+            sym_id_base,
+            layout,
+        ));
+        if j == 0 {
+            ops.push(pw1(
+                &format!("reseed_o{out_tid}"),
+                "identity",
+                t_rows,
+                c_cols,
+                In::full(&sel),
+                &acc,
+                sym_id_base,
+                layout,
+            ));
+        } else {
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("reacc_j{j}_o{out_tid}"),
+                "add",
+                t_rows,
+                c_cols,
+                &[In::full(&acc).ew(), In::full(&sel).ew()],
+                if j + 1 == k { &out } else { &acc },
+                crate::addr::DevOff::ZERO,
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
     Ok(ops)
 }
 

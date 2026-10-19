@@ -265,41 +265,39 @@ fn the_fused_moe_kernel_is_refused_at_the_door_naming_the_first_unrecognised_op(
         err.starts_with("door:"),
         "the refusal came from a ladder stage, not the door: {err:?}"
     );
-    // ⚠️ PINNED OBSERVATION (rung three, 2026-10-19, moe-door @ the DOWN recogniser):
-    // `program_w8a8_down_chains` claims the kernel's DOWN projection — the last 16
-    // tiles (2 banks × 8 pairs) — so EVERY pre-read now passes (gelu, silu, rmsnorm,
-    // bcast, W8A8 gate/up, W8A8 down) and the walk descends into the body for the
-    // FIRST time. The first refusal is no longer a pre-read's: the ROUTER NORM is
-    // CLAIMED (`program_rmsnorm_chains` fires at the chain's TERMINAL gain multiply,
-    // `xn = xr·r·rg`), and it is that claimed emission's OUTPUT-intermediate mint
-    // that refuses — an `ArithMulf` whose result needs a `BundleLayout` the
-    // unit-test arm (`layout: None`) cannot mint. The layout-carrying twin below is
-    // the drive that descends past it (first stop: the router rung's own head,
-    // `TensorGenerate`), and at this file's golden `I=64` the down door's own
-    // staged-bank law (`in=64 pads to 128`, pinned in `down_door.rs`) is the
-    // worker-manifest pad the splice fold owns.
+    // ⚠️ PINNED OBSERVATION (rung five, 2026-10-19, moe-door @ the ROUTER recogniser):
+    // `program_router_chains` now claims the whole router body — the eight rounds, the
+    // ids/rs converts and stores, the temperature softmax — proved backward from the ids
+    // store, and the SCRATCH CENSUS (the write-dead law's obligation) runs BEFORE the
+    // walk, so the full kernel's first refusal is no longer the walk's at all: the
+    // COMBINE's `wrow` read — a DIRECT `KtdpLoad` of the route-weights scratch (t13)
+    // feeding an `ArithSelect` no recognised chain claims — is refused BY NAME at the
+    // census. The layout-less arm meets the same refusal because the census is a
+    // pre-read; the router-only kernel (no combine) is `router_door.rs`'s own green
+    // drive. The COMBINE rung is the work queue this pin hands to.
     // The needles are SUBSTRINGs so wording survives but meaning does not.
     assert!(
         err.starts_with("door:")
-            && err.contains("`ArithMulf`'s result is an intermediate")
-            && err.contains("`layout: None` is the unit-test arm"),
-        "rung three: the door's first refusal moved or changed shape — update this pin \
+            && err.contains("the route weights (t13) is read by `ArithSelect`")
+            && err.contains("combine rung is the recogniser for the route-weights read"),
+        "rung five: the door's first refusal moved or changed shape — update this pin \
          DELIBERATELY (it is the recogniser campaign's work queue), do not delete it: {err:?}"
     );
 }
 
-/// RUNG THREE, THE LAYOUT-CARRYING HALF — the router rung's measurement. With
-/// a REAL layout the claimed router norm's fused emission mints (the epsilon
-/// registry above is its one demand) and the walk descends into the router's
-/// body, past the norm and the f16 logits dot; this pin names the first op the
-/// 1:1 walk cannot express, which is the router rung's own head.
+/// RUNG FIVE, THE LAYOUT-CARRYING HALF — the census's refusal is LAYOUT-BLIND. With a real
+/// layout the fused RmsNorm emission fires on the router norm, the walk emits the
+/// router-weight load and the f16 logits dot 1:1, and the router chain's own fire arm would
+/// mint the five products — but the walk never reaches it: the scratch census runs in the
+/// pre-reads and refuses the COMBINE's route-weights read first, so the full kernel refuses
+/// identically with or without a layout until the combine rung claims that read.
 #[test]
 fn the_full_kernel_with_a_layout_refuses_at_the_first_unexpressible_op() {
     let err = match drive_laid_out() {
         Ok(names) => panic!(
             "BAKED ({} ops) — the full fused MoE kernel lowered through the door with a \
-             layout; the router and combine rungs are both unlanded, so something is \
-             recognising chains it should not",
+             layout; the combine rung is unlanded, so something is recognising chains it \
+             should not",
             names.len()
         ),
         Err(msg) => msg,
@@ -309,29 +307,22 @@ fn the_full_kernel_with_a_layout_refuses_at_the_first_unexpressible_op() {
         "the refusal came from a ladder stage, not the door: {err:?}"
     );
     assert!(
-        err.contains("has no 1:1 `Program`"),
-        "the walk refused, but not at an unexpressible op — measure again before pinning: \
+        err.contains("the route weights (t13) is read by `ArithSelect`"),
+        "the walk refused, but not at the scratch census — measure again before pinning: \
          {err:?}"
     );
-    // ⚠️ PINNED OBSERVATION (rung four's head, 2026-10-19, moe-door @ the DOWN
-    // recogniser, router unlanded): with the epsilon in `scalarmul_scales` (and
-    // its reserved scale-slot placed — `full_layout`'s registry block) the fused
-    // RmsNorm emission FIRES on the router norm, the walk emits the router-weight
-    // load `[64,128]` and the f16 logits dot 1:1 (`LinalgMatmul [1,64]`, op 107 —
-    // the dot is EXPRESSIBLE unclaimed), and the first op the 1:1 walk cannot
-    // express is `TensorGenerate` — op 108 of 1111, shape `[64]`:
-    // `offs = tl.arange(0, E).to(tl.float16)`, the round-form top-K's
-    // lane-offset vector (`moe.py:148`). The router section the rung must claim
-    // runs ops 108–465: eight rounds of (max-reduce → lane select → idx-reduce →
-    // one-hot accumulate into `vals`/`idsf`/`psel` → mask select), the ids store
-    // (`ArithFptosi` + `KtdpStore`, op 444), the softmax (`·TEMP` → max → sub →
-    // exp → sum → div → `·psel`, ops 445–463), and the rs store (op 465). The
-    // experts (claimed: gelu/silu/W8A8 gate/up/down) begin at op 466; the COMBINE
-    // rung's head is what the router rung's landing exposes next.
+    // ⚠️ PINNED OBSERVATION (rung five, 2026-10-19, moe-door @ the ROUTER recogniser):
+    // the router body is claimed whole (ops 108–465: the rounds, the converts, the
+    // softmax, the two stores) and the census holds the full kernel at the COMBINE's
+    // `wrow` read — a direct load of `desc_rs` (t13) over the shared rs view, feeding
+    // the combine's lane select. The combine rung (the LAST rung) is the recogniser
+    // that claims it; after it lands, the full kernel BAKES and this pin is the one
+    // that goes green-to-gone.
     assert!(
-        err.contains("`TensorGenerate` has no 1:1 `Program`"),
-        "rung four: the door's first layout-carrying refusal moved or changed shape — update \
-         this pin DELIBERATELY (it is the router rung's work queue), do not delete it: {err:?}"
+        err.contains("combine rung is the recogniser for the route-weights read"),
+        "rung five: the door's first layout-carrying refusal moved or changed shape — update \
+         this pin DELIBERATELY (it is the recogniser campaign's work queue), do not delete it: \
+         {err:?}"
     );
 }
 
