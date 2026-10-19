@@ -587,6 +587,20 @@ pub fn reduce_fits_untiled(rows: u32, cols: u32) -> bool {
 /// division — what a core-local LX pin for it must hold ([`BundleLayout::synth_lx_core_local`]). `None`
 /// when the op would be time-tiled, which a core-local tensor cannot be.
 pub fn pointwise_untiled_slice_bytes(rows: u32, cols: u32, n_inputs: u32) -> Option<u64> {
+    pointwise_untiled_slice_bytes_divided(rows, cols, n_inputs, crate::work::EwDivision::Law)
+}
+
+/// [`pointwise_untiled_slice_bytes`] for ops assembled under a STATED `division`
+/// ([`assemble_pointwise_broadcast_divided`]), so a core-local pin is sized under the division its ops
+/// state. The pinned tensor is core-local by definition, so the division resolves as it does for every op
+/// touching one ([`crate::work::EwDivision::resolve`]): the law gives rows first, and a stated division
+/// gives itself.
+pub fn pointwise_untiled_slice_bytes_divided(
+    rows: u32,
+    cols: u32,
+    n_inputs: u32,
+    division: crate::work::EwDivision,
+) -> Option<u64> {
     let stick = StickExtent::<Fp16>::new(cols).ok()?;
     let dim = |name: &'static str, size: u32, is_stick: bool| ItDim {
         name,
@@ -609,7 +623,7 @@ pub fn pointwise_untiled_slice_bytes(rows: u32, cols: u32, n_inputs: u32) -> Opt
     tile_op
         .tile(
             crate::superdsc_opspec::MaxCores::<{ crate::superdsc_opspec::MAX_CORES }>,
-            crate::work::distribute_cores,
+            division.resolve(true, true).splitter(),
             "out",
         )
         .ok()
@@ -1570,12 +1584,15 @@ pub struct PointwiseDivided<'a, O: KindTag> {
     pub division: crate::work::EwDivision,
 }
 
-/// [`assemble_pointwise_broadcast_off`] under a STATED work division instead of the law's. No shipped op
-/// takes this door: every one is assembled under [`crate::work::EwDivision::Law`]. It exists for a claim
-/// about the emission MACHINERY that holds under one named division — torch-spyre's descriptor parity
-/// (`element_torchspyre_parity.rs`) is a claim about the bytes torch-spyre emits, and torch-spyre divides
-/// every elementwise op rows-first, so that claim is stated under [`crate::work::EwDivision::RowsFirst`]
-/// while the law, measured faster on card, ships a different division for the same shape.
+/// [`assemble_pointwise_broadcast_off`] under a STATED work division instead of the law's. Two callers
+/// take this door:
+///   * a decode batch chunk's `esub` and `exp`, whose shared core-local `cesub` is laid out sticks first
+///     (`attn`'s `ChunkBufs::sm_division_of` says why). The law alone would divide them rows first,
+///     because every op touching a core-local pin keeps the division its pin was sized under;
+///   * torch-spyre's descriptor parity (`element_torchspyre_parity.rs`). That claim is about the bytes
+///     torch-spyre emits, and torch-spyre divides every elementwise op rows-first, so it is stated under
+///     [`crate::work::EwDivision::RowsFirst`]. The law, measured faster on card, ships a different division
+///     for the same shape.
 pub fn assemble_pointwise_broadcast_divided<O: KindTag>(
     p: PointwiseDivided<'_, O>,
     sym_id_base: &mut i64,

@@ -63,7 +63,8 @@ use super::matmul::{
 use super::reduce::assemble_reduce_off;
 use crate::addr::{Head, Idx, Nest};
 use crate::emit::{
-    EmittedOp, In, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, fl, rb,
+    EmittedOp, In, PointwiseDivided, assemble_pointwise_broadcast_divided,
+    assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, fl, rb,
 };
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{
@@ -1775,6 +1776,10 @@ struct ChunkBufs {
     csc: String,
     cesub: String,
     cexp: String,
+    /// ⭐ HOW `esub` AND `exp` DIVIDE THEIR WORK, and so how the core-local `cesub` between them is laid
+    /// out. The caller sizes the pin under this same value ([`ChunkBufs::sm_division_of`]), and the body
+    /// assembles both ops under it.
+    sm_division: crate::work::EwDivision,
     /// One-stick partial reductions: three for a row max / denominator cut into parts, one per probability
     /// part plus two accumulators for a prompt chunk's denominator. Declared only when used.
     red: Vec<String>,
@@ -1783,6 +1788,36 @@ struct ChunkBufs {
     ///
     /// [`ChunkRowForm::QueryGroup`]: crate::sdsc_abstract::ChunkRowForm::QueryGroup
     qgroup: Option<QGroupBufs>,
+}
+
+impl ChunkBufs {
+    /// ⭐⭐⭐ A DECODE BATCH's PROBABILITIES ARE DIVIDED STICKS FIRST — every core takes ALL of a row block's
+    /// rows over a run of whole sticks. Every other chunk keeps the law, which gives rows first.
+    ///
+    /// A row block's `[rows, part]` score block is stick-major (`[part/64][rows][64]`). Rows first, each core
+    /// reads its rows as `part/64` strided 128-byte bursts. Sticks first, each core reads one contiguous run
+    /// of whole sticks. MEASURED (granite-3.1-2b fp16, conc-8, ~1k-token prompts: a probe that cut the batch
+    /// chunk's softmax into launch groups of its own): at 8 requests the 8 `esub`+`exp` pairs, two HBM passes
+    /// over each kv head's `[32, 10240]` block, took 12.38 ms/step, and the row sum, one pass, took 6.70 ms.
+    /// That is 31–34 GB/s per pass: the strided rate, with `exp`'s transcendental costing nothing past its
+    /// pass. The same law on the stick-major MLP ops measured 50.4 → 103.3 GB/s (`work::EwDivision`).
+    ///
+    /// ⛔ WHY ONLY THE BATCH. The law already gives sticks first to a stick-major op, but not to one touching
+    /// a core-local pin: such an op keeps the division its pin was laid out under, and the pin was sized rows
+    /// first. So the batch states its division outright, and this one value sizes the pin and divides both
+    /// ops. The other chunks stay as they are:
+    ///   * the one-request decode's softmax shares a launch group with its score, so it was not measured
+    ///     apart, and its forms are card-proven as they stand. This leaves its bundles byte-identical;
+    ///   * a prompt chunk keeps `cexp` core-local through its row sum and PV (`prompt_probabilities_in_lx`),
+    ///     whose PV divides its ROWS. A sticks-first `cexp` would hand the PV's cores slices they never
+    ///     wrote, and the read law would refuse it.
+    fn sm_division_of(rows_are_requests: bool) -> crate::work::EwDivision {
+        if rows_are_requests {
+            crate::work::EwDivision::SticksFirst
+        } else {
+            crate::work::EwDivision::Law
+        }
+    }
 }
 
 /// The re-laid query block and the `[hd, hd]` identity its stick copies read.
@@ -2216,15 +2251,23 @@ fn reduction_part_pages(chunk: crate::sdsc_abstract::ChunkScratch, g_rows: u32) 
 }
 
 /// Pages per probability part of a chunk whose row blocks carry `b_rows` query rows each: the fewest
-/// EQUAL whole-page parts whose `[b_rows, part]` pointwise op runs untiled (asked of the builder's own
-/// tiler), one page at worst. ONE place, so the caller that sizes the core-local `cesub` pin and the body
-/// that cuts the parts read the same number.
-fn softmax_part_pages(chunk: crate::sdsc_abstract::ChunkScratch, b_rows: u32) -> u32 {
+/// EQUAL whole-page parts whose `[b_rows, part]` pointwise op runs untiled under `division` (asked of the
+/// builder's own tiler), one page at worst. ONE place, so the caller that sizes the core-local `cesub` pin
+/// and the body that cuts the parts read the same number. `division` is the chunk's own
+/// ([`ChunkBufs::sm_division_of`]).
+fn softmax_part_pages(
+    chunk: crate::sdsc_abstract::ChunkScratch,
+    b_rows: u32,
+    division: crate::work::EwDivision,
+) -> u32 {
     let page_slots = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
     (1..=chunk.pages())
         .filter(|n| chunk.pages().is_multiple_of(*n))
         .map(|n| chunk.pages() / n)
-        .find(|&pp| crate::emit::pointwise_fits_untiled(b_rows, pp * page_slots, 2))
+        .find(|&pp| {
+            crate::emit::pointwise_untiled_slice_bytes_divided(b_rows, pp * page_slots, 2, division)
+                .is_some()
+        })
         .unwrap_or(1)
 }
 
@@ -2718,7 +2761,11 @@ fn assemble_attn_chunk(
     // (both are the tiler's own `[gqa·mq, part]` pointwise op; `emit`'s core-local read law proves it at
     // build). That is the reference's form for every softmax intermediate, and it removes the `cesub`
     // write and read from HBM: two of the chunk's eight passes over its score block.
-    let sm_pages = softmax_part_pages(chunk, b_rows);
+    //
+    // ⭐ BOTH OPS UNDER THE CHUNK's OWN DIVISION (`ChunkBufs::sm_division_of`): sticks first for a decode
+    // batch, the law for every other chunk. The caller sized the `cesub` pin and these parts under the same
+    // value, and the read law holds `exp` to `esub`'s slices at build.
+    let sm_pages = softmax_part_pages(chunk, b_rows, cb.sm_division);
     let sm_parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk.slot_parts(sm_pages).collect();
     for b in 0..blocks.count() {
         let (h0, bn) = (blocks.first_head(b) * mq, blk_name(b));
@@ -2733,28 +2780,34 @@ fn assemble_attn_chunk(
             };
             // `esub` and `exp` write DIFFERENT buffers — an exp must never read and write one buffer.
             // `cesub` is core-local LX, so both address it at its pin (no corner).
-            ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_cesub_{bn}{suffix}_o{t}"),
-                "subtract",
-                blk_rows,
-                pw,
-                &[
-                    In::sliced(&rb(&cb.csc, b_rows, ps), pc).ew(),
-                    In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
-                ],
-                &rb(&cb.cesub, b_rows, ps),
-                DevOff::ZERO,
+            ops.push(assemble_pointwise_broadcast_divided(
+                PointwiseDivided {
+                    op_name: &format!("attn_cesub_{bn}{suffix}_o{t}"),
+                    op_func: "subtract",
+                    rows: blk_rows,
+                    cols: pw,
+                    inputs: &[
+                        In::sliced(&rb(&cb.csc, b_rows, ps), pc).ew(),
+                        In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
+                    ],
+                    o: &rb(&cb.cesub, b_rows, ps),
+                    out_offset: DevOff::ZERO.into(),
+                    division: cb.sm_division,
+                },
                 sym_id_base,
                 layout,
             ));
-            ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_cexp_{bn}{suffix}_o{t}"),
-                "exp",
-                blk_rows,
-                pw,
-                &[In::sliced(&rb(&cb.cesub, b_rows, ps), DevOff::ZERO).ew()],
-                &rb(&cb.cexp, b_rows, ps),
-                pc,
+            ops.push(assemble_pointwise_broadcast_divided(
+                PointwiseDivided {
+                    op_name: &format!("attn_cexp_{bn}{suffix}_o{t}"),
+                    op_func: "exp",
+                    rows: blk_rows,
+                    cols: pw,
+                    inputs: &[In::sliced(&rb(&cb.cesub, b_rows, ps), DevOff::ZERO).ew()],
+                    o: &rb(&cb.cexp, b_rows, ps),
+                    out_offset: pc.into(),
+                    division: cb.sm_division,
+                },
                 sym_id_base,
                 layout,
             ));
@@ -4100,6 +4153,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             csc: syn(R::ChunkSc),
             cesub: syn(R::ChunkESub),
             cexp: syn(R::ChunkExp),
+            sm_division: ChunkBufs::sm_division_of(rows_are_requests),
             red: (0..n_red).map(|i| syn(R::ChunkRed(i))).collect(),
             qgroup: qgroup.map(|(_, ident_tid)| QGroupBufs {
                 block: syn(R::ChunkQGroup),
@@ -4165,11 +4219,12 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             }
             // ⭐ CORE-LOCAL LX, each pin one core's slice of one row block's probability part under its own
             // producer's division — `esub`'s always, and a one-slab prompt chunk's `exp` too. See the body's
-            // step 4.
+            // step 4. A decode chunk's parts and its `cesub` slice are sized under the division its `esub`
+            // and `exp` state (`ChunkBufs::sm_division_of`).
             let part_pages = if prompt {
                 prompt_lx_part_pages(chunk, b_rows)
             } else {
-                softmax_part_pages(chunk, b_rows)
+                softmax_part_pages(chunk, b_rows, cb.sm_division)
             };
             let cols = part_pages * crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
             let pins: &[(R, u32)] = if prompt {
@@ -4177,14 +4232,22 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             } else {
                 &[(R::ChunkESub, 2)]
             };
+            // A prompt chunk's pins are its `esub`/`exp`/row-sum/PV division: the law's, rows first.
+            let division = if prompt {
+                crate::work::EwDivision::Law
+            } else {
+                cb.sm_division
+            };
             for &(r, inputs) in pins {
-                let slice = crate::emit::pointwise_untiled_slice_bytes(b_rows, cols, inputs)
-                    .ok_or_else(|| {
-                        SuperDscError(format!(
-                            "attention o{t}: a {part_pages}-page probability part of {b_rows} rows is \
-                             time-tiled, so it has no core-local slice to pin in LX"
-                        ))
-                    })?;
+                let slice = crate::emit::pointwise_untiled_slice_bytes_divided(
+                    b_rows, cols, inputs, division,
+                )
+                .ok_or_else(|| {
+                    SuperDscError(format!(
+                        "attention o{t}: a {part_pages}-page probability part of {b_rows} rows is \
+                         time-tiled, so it has no core-local slice to pin in LX"
+                    ))
+                })?;
                 l.synth_lx_core_local(out_id.synth(r), slice);
             }
         }
