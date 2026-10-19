@@ -51,6 +51,9 @@ use ktir_superdsc::emit::lower_ktir_to_superdsc::{
     gather_facts_at_tile, gathers_of, gathers_of_excluding,
 };
 use ktir_superdsc::ktir_node::{KtirNode, Program};
+use ktir_superdsc::place::{PlaceId, act_name};
+use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
+use ktir_superdsc::reserved_tids::{FP8_INV448_TID, FP8_NEG448_TID, FP8_POS448_TID};
 use std::collections::HashMap;
 use triton_frontend::codegen::{self, ArgSpec, KernelSpec};
 use triton_frontend::opt;
@@ -142,6 +145,106 @@ fn drive() -> Result<Vec<String>, String> {
     Ok(ops.into_iter().map(|o| o.op_name.clone()).collect())
 }
 
+/// A REAL layout for the full kernel: all 15 parameters at their true byte
+/// sizes (an fp16-sized reservation is fine — only the byte extent matters to
+/// the footprint checks; the ids' 4-byte i32s and the banks' 1-byte fp8s are
+/// sized directly in bytes), the three E4M3 clamp consts, the router norm's
+/// epsilon registry slot, and nothing else — the walk's own mints reserve their
+/// intermediates into it as it descends. This is the drive the router rung
+/// measures with: at `layout: None` the walk stops minting the CLAIMED router
+/// norm chain's output intermediate (the fused RmsNorm emission's own mint),
+/// which measures the unit-test arm's limit, not the door's.
+fn full_layout(node: &KtirNode) -> BundleLayout {
+    // True bytes, in signature order: x_r [M,H]·2, rg [H]·2, rw [E,H]·2,
+    // pes [E]·2, xe [M,H]·2, wg [E,I,H]·1, sg [E,I]·2, wu [E,I,H]·1,
+    // su [E,I]·2, wd [E,H,I]·1, sd [E,H]·2, o [M,H]·2, ids [M,K]·4,
+    // rs [M,K]·2, act [M,K·I]·2.
+    let bytes: [u64; 15] = [
+        (M * H * 2) as u64,
+        (H * 2) as u64,
+        (E * H * 2) as u64,
+        (E * 2) as u64,
+        (M * H * 2) as u64,
+        (E * I * H) as u64,
+        (E * I * 2) as u64,
+        (E * I * H) as u64,
+        (E * I * 2) as u64,
+        (E * H * I) as u64,
+        (E * H * 2) as u64,
+        (M * H * 2) as u64,
+        (M * K * 4) as u64,
+        (M * K * 2) as u64,
+        (M * K * I * 2) as u64,
+    ];
+    let mut l = BundleLayout::default();
+    for (i, b) in node.bindings.iter().enumerate() {
+        let tid = b.get();
+        l.ids.borrow_mut().insert(act_name(tid), PlaceId::Act(tid));
+        // Distinct 2 MiB slots — the widest parameter (a 512 KiB fp8 bank)
+        // fits with room to spare.
+        l.placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                role: SegRole::Activation,
+                segment: SegRole::Activation.segment(),
+                bank: 0,
+                offset: i as u64 * 0x20_0000,
+                size: bytes[i],
+            },
+        );
+    }
+    for (i, tid) in [FP8_POS448_TID, FP8_NEG448_TID, FP8_INV448_TID]
+        .into_iter()
+        .enumerate()
+    {
+        l.ids.borrow_mut().insert(act_name(tid), PlaceId::Act(tid));
+        l.placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                role: SegRole::Activation,
+                segment: SegRole::Activation.segment(),
+                bank: 0,
+                offset: 15 * 0x20_0000 + i as u64 * 0x1000,
+                size: 128,
+            },
+        );
+    }
+    // The router norm's epsilon — the `scalarmul_scales` registry law the fused
+    // RmsNorm emission resolves its `[1,1]` const by. The program states EPS as
+    // its f16 IMAGE (`0.000001013279`, the legalization's rounding of `1e-6`),
+    // which is why the registry holds the f32 constant and `scale_slot`'s f16
+    // fallback is what reconciles them — the exact case its doc names.
+    l.scalarmul_scales = vec![1e-6];
+    let eps_tid = ktir_superdsc::reserved_tids::scalarmul_scale_tid(0);
+    l.ids
+        .borrow_mut()
+        .insert(act_name(eps_tid), PlaceId::Act(eps_tid));
+    l.placements.insert(
+        eps_tid,
+        TensorPlacement {
+            tid: eps_tid,
+            role: SegRole::Activation,
+            segment: SegRole::Activation.segment(),
+            bank: 0,
+            offset: 15 * 0x20_0000 + 3 * 0x1000,
+            size: 2,
+        },
+    );
+    l
+}
+
+/// The full kernel through the door WITH a layout — the router rung's own
+/// measurement drive. `Err` carries the first stage's refusal text.
+fn drive_laid_out() -> Result<Vec<String>, String> {
+    let node = drive_node()?;
+    let layout = full_layout(&node);
+    let ops = triton_ktir_superdsc::emit_whole(&node, Some(&layout))
+        .map_err(|e| format!("door: {}", e.message))?;
+    Ok(ops.into_iter().map(|o| o.op_name.clone()).collect())
+}
+
 /// RUNG ONE: the fused MoE kernel is REFUSED at the door, naming the stage the
 /// pre-reads stop at — pinned so every recogniser that lands must move it FORWARD, and
 /// a recogniser that leaves it where it was bought nothing.
@@ -166,14 +269,15 @@ fn the_fused_moe_kernel_is_refused_at_the_door_naming_the_first_unrecognised_op(
     // `program_w8a8_down_chains` claims the kernel's DOWN projection — the last 16
     // tiles (2 banks × 8 pairs) — so EVERY pre-read now passes (gelu, silu, rmsnorm,
     // bcast, W8A8 gate/up, W8A8 down) and the walk descends into the body for the
-    // FIRST time. The first refusal is no longer a pre-read's: it is the ROUTER
-    // NORM's `xr·xr` (`moe_fwd`'s first compute op, ahead of even the router
-    // matmul) — an `ArithMulf` whose intermediate result needs a `BundleLayout`
-    // the unit-test arm (`layout: None`) cannot mint. The router (top-K, route
-    // weights) and the combine are the remaining rungs; a layout-carrying drive
-    // is what descends past this one — and at this file's golden `I=64` the next
-    // stop would be the down door's own staged-bank law (`in=64 pads to 128`,
-    // pinned in `down_door.rs`), the worker-manifest pad the splice fold owns.
+    // FIRST time. The first refusal is no longer a pre-read's: the ROUTER NORM is
+    // CLAIMED (`program_rmsnorm_chains` fires at the chain's TERMINAL gain multiply,
+    // `xn = xr·r·rg`), and it is that claimed emission's OUTPUT-intermediate mint
+    // that refuses — an `ArithMulf` whose result needs a `BundleLayout` the
+    // unit-test arm (`layout: None`) cannot mint. The layout-carrying twin below is
+    // the drive that descends past it (first stop: the router rung's own head,
+    // `TensorGenerate`), and at this file's golden `I=64` the down door's own
+    // staged-bank law (`in=64 pads to 128`, pinned in `down_door.rs`) is the
+    // worker-manifest pad the splice fold owns.
     // The needles are SUBSTRINGs so wording survives but meaning does not.
     assert!(
         err.starts_with("door:")
@@ -181,6 +285,53 @@ fn the_fused_moe_kernel_is_refused_at_the_door_naming_the_first_unrecognised_op(
             && err.contains("`layout: None` is the unit-test arm"),
         "rung three: the door's first refusal moved or changed shape — update this pin \
          DELIBERATELY (it is the recogniser campaign's work queue), do not delete it: {err:?}"
+    );
+}
+
+/// RUNG THREE, THE LAYOUT-CARRYING HALF — the router rung's measurement. With
+/// a REAL layout the claimed router norm's fused emission mints (the epsilon
+/// registry above is its one demand) and the walk descends into the router's
+/// body, past the norm and the f16 logits dot; this pin names the first op the
+/// 1:1 walk cannot express, which is the router rung's own head.
+#[test]
+fn the_full_kernel_with_a_layout_refuses_at_the_first_unexpressible_op() {
+    let err = match drive_laid_out() {
+        Ok(names) => panic!(
+            "BAKED ({} ops) — the full fused MoE kernel lowered through the door with a \
+             layout; the router and combine rungs are both unlanded, so something is \
+             recognising chains it should not",
+            names.len()
+        ),
+        Err(msg) => msg,
+    };
+    assert!(
+        err.starts_with("door:"),
+        "the refusal came from a ladder stage, not the door: {err:?}"
+    );
+    assert!(
+        err.contains("has no 1:1 `Program`"),
+        "the walk refused, but not at an unexpressible op — measure again before pinning: \
+         {err:?}"
+    );
+    // ⚠️ PINNED OBSERVATION (rung four's head, 2026-10-19, moe-door @ the DOWN
+    // recogniser, router unlanded): with the epsilon in `scalarmul_scales` (and
+    // its reserved scale-slot placed — `full_layout`'s registry block) the fused
+    // RmsNorm emission FIRES on the router norm, the walk emits the router-weight
+    // load `[64,128]` and the f16 logits dot 1:1 (`LinalgMatmul [1,64]`, op 107 —
+    // the dot is EXPRESSIBLE unclaimed), and the first op the 1:1 walk cannot
+    // express is `TensorGenerate` — op 108 of 1111, shape `[64]`:
+    // `offs = tl.arange(0, E).to(tl.float16)`, the round-form top-K's
+    // lane-offset vector (`moe.py:148`). The router section the rung must claim
+    // runs ops 108–465: eight rounds of (max-reduce → lane select → idx-reduce →
+    // one-hot accumulate into `vals`/`idsf`/`psel` → mask select), the ids store
+    // (`ArithFptosi` + `KtdpStore`, op 444), the softmax (`·TEMP` → max → sub →
+    // exp → sum → div → `·psel`, ops 445–463), and the rs store (op 465). The
+    // experts (claimed: gelu/silu/W8A8 gate/up/down) begin at op 466; the COMBINE
+    // rung's head is what the router rung's landing exposes next.
+    assert!(
+        err.contains("`TensorGenerate` has no 1:1 `Program`"),
+        "rung four: the door's first layout-carrying refusal moved or changed shape — update \
+         this pin DELIBERATELY (it is the router rung's work queue), do not delete it: {err:?}"
     );
 }
 
