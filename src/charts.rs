@@ -396,11 +396,30 @@ pub struct Enabled {
     pub enabled: bool,
 }
 
-/// A chart's mount point, styled by `mount`: charts.js draws `spec` into it.
+impl Chart<'_> {
+    fn options(&self) -> &ChartOptions<'_> {
+        match self {
+            Chart::GroupedBar { options, .. }
+            | Chart::Heatmap { options, .. }
+            | Chart::Combo { options, .. } => options,
+        }
+    }
+}
+
+/// A chart's mount point, styled by `mount`: charts.js draws `spec` into it
+/// once it nears the screen. Sized already as Carbon sizes it, to the
+/// options' height and any width, so a chart drawn late moves nothing.
 /// `scale` is the id of the ratio scale a heatmap's squares highlight on hover.
 pub fn chart(spec: &Chart, label: &str, mount: &str, scale: Option<&str>) -> Element {
+    let options = spec.options();
+    let width = options
+        .width
+        .as_deref()
+        .map(|w| format!("; width: {w}"))
+        .unwrap_or_default();
+    let height = &options.height;
     rsx! {
-        div { role: "img", "aria-label": label, style: "{mount}", "data-scale": scale,
+        div { role: "img", "aria-label": label, style: "{mount}{width}; height: {height}", "data-scale": scale,
             "data-chart": serde_json::to_string(spec).unwrap_or_default(),
         }
     }
