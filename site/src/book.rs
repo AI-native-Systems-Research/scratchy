@@ -11,7 +11,7 @@ use std::path::Path;
 use dioxus::prelude::*;
 
 use crate::carbon::{Column, Grid, SideNav, SideNavLink, SideNavMenu, Span};
-use crate::chrome::{self, Content, Head, Library, Published, Root, Tab, Theme};
+use crate::chrome::{self, Content, Head, Library, Published, Root, Tab};
 use crate::{Site, repo};
 
 pub struct Chapter {
@@ -139,7 +139,6 @@ fn build_chapter(site: &Site, c: &Chapter, assets: &Published) -> Result<(), Str
             og: None,
             root,
             libraries: &[Library::ZeroMd],
-            theme: Theme::FollowSystem,
         },
         body,
     )?;

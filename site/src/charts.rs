@@ -6,6 +6,7 @@
 //! knows a page's own numbers.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use dioxus::prelude::*;
 use serde::Serialize;
@@ -14,6 +15,80 @@ use crate::carbon::{Alignment, Definition, Stack};
 
 /// Draws every chart from its rendered spec.
 pub const CHARTS_JS: &str = include_str!("charts.js");
+
+/// A colour in each of the two Carbon themes a page follows the reader's
+/// system setting between, white and g100 (chrome.rs). charts.js hands Carbon
+/// Charts the one the page is in; in CSS it is `light-dark()`, which follows
+/// the `color-scheme` Carbon's theme classes set.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Themed {
+    pub light: &'static str,
+    pub dark: &'static str,
+}
+
+impl Themed {
+    /// The same colour in both themes.
+    pub const fn both(colour: &'static str) -> Self {
+        Themed {
+            light: colour,
+            dark: colour,
+        }
+    }
+}
+
+impl fmt::Display for Themed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "light-dark({}, {})", self.light, self.dark)
+    }
+}
+
+/// One of Carbon's colour ramps, its grades 10 (lightest) to 100 (darkest).
+#[derive(Clone, Copy)]
+pub enum Ramp {
+    Red,
+    Cyan,
+    Gray,
+}
+
+impl Ramp {
+    const fn grades(self) -> [&'static str; 10] {
+        match self {
+            Ramp::Red => [
+                "#fff1f1", "#ffd7d9", "#ffb3b8", "#ff8389", "#fa4d56", "#da1e28", "#a2191f",
+                "#750e13", "#520408", "#2d0709",
+            ],
+            Ramp::Cyan => [
+                "#e5f6ff", "#bae6ff", "#82cfff", "#33b1ff", "#1192e8", "#0072c3", "#00539a",
+                "#003a6d", "#012749", "#061727",
+            ],
+            Ramp::Gray => [
+                "#f4f4f4", "#e0e0e0", "#c6c6c6", "#a8a8a8", "#8d8d8d", "#6f6f6f", "#525252",
+                "#393939", "#262626", "#161616",
+            ],
+        }
+    }
+
+    /// The ramp at GRADE on white, and at the mirrored grade, 100 − GRADE, on
+    /// g100, the way Carbon's g100 mirrors white: a colour that stands out
+    /// from white by its darkness stands out from g100 by its lightness. On
+    /// g100 never lighter than 20: red and cyan 10 are all but white, too
+    /// alike to tell faster from slower (OKLab ΔE 3.6, where red and cyan
+    /// 100, white's darkest, are 9.4 apart and 20s are 9.7).
+    pub const fn at<const GRADE: usize>(self) -> Themed {
+        const {
+            assert!(
+                matches!(GRADE, 10 | 20 | 30 | 40 | 50 | 60 | 70 | 80 | 90 | 100),
+                "Carbon's grades are 10, 20, … 100"
+            )
+        };
+        let dark = if GRADE >= 80 { 20 } else { 100 - GRADE };
+        let grades = self.grades();
+        Themed {
+            light: grades[GRADE / 10 - 1],
+            dark: grades[dark / 10 - 1],
+        }
+    }
+}
 
 /// Which way a measurement is better: higher for a rate, lower for a time.
 #[derive(Clone, Copy, PartialEq)]
@@ -38,15 +113,16 @@ impl Better {
 
 /// A series' colour, fixed per role: blue, orange, aqua from the data-viz
 /// reference palette, validated as a set (all pairs, CVD and normal vision)
-/// against Carbon's white and g100 surfaces. Aqua is under 3:1 on white, so
-/// every chart has a legend and a table view. A previous run is a light grey
-/// so it reads as behind.
-pub fn colour(class: &str) -> &'static str {
+/// against Carbon's white and g100 surfaces, so the same in both themes. Aqua
+/// is under 3:1 on white, so every chart has a legend and a table view. A
+/// previous run is a grey nearer the page than the series, so it reads as
+/// behind.
+pub fn colour(class: &str) -> Themed {
     match class {
-        "s1" => "#2a78d6",
-        "s2" => "#d95926",
-        "s3" => "#1baf7a",
-        _ => "#a8a8a8",
+        "s1" => Themed::both("#2a78d6"),
+        "s2" => Themed::both("#d95926"),
+        "s3" => Themed::both("#1baf7a"),
+        _ => Ramp::Gray.at::<40>(),
     }
 }
 
@@ -131,8 +207,6 @@ pub struct ChartOptions<'a> {
     pub combo: Option<Vec<ComboLayer>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<Bounds>,
-    // The page is always Carbon's light theme.
-    pub theme: &'static str,
     pub toolbar: Enabled,
 }
 
@@ -200,21 +274,18 @@ pub struct Ticks {
 }
 
 /// Carbon Charts' colour options: a colour per series, or the steps of a
-/// heatmap's quantized scale.
+/// heatmap's quantized scale. Each colour is Themed: charts.js gives Carbon
+/// the page's.
 #[derive(Serialize)]
 #[serde(untagged)]
 pub enum Colour<'a> {
-    Scale {
-        scale: BTreeMap<&'a str, &'static str>,
-    },
-    Gradient {
-        gradient: Gradient,
-    },
+    Scale { scale: BTreeMap<&'a str, Themed> },
+    Gradient { gradient: Gradient },
 }
 
 #[derive(Serialize)]
 pub struct Gradient {
-    pub colors: &'static [&'static str],
+    pub colors: &'static [Themed],
 }
 
 /// The widest speedup the ratio heatmaps tell apart, either way: ×4 faster
@@ -233,43 +304,50 @@ pub const RATIO_RANGE: Domain = Domain {
 /// noise band) in the gray 40 middle step. Carbon's own diverging palette
 /// fades to white in the middle, down to 1.0:1 against the page and tiles, so
 /// the cells near ×1, most of them, vanish; here the steps past the middle
-/// start at red/cyan 40 and darken outward to 100, every one at least 2.37:1
-/// on white and 2.15:1 on the grey tile (#f4f4f4).
-pub const RATIO_STEPS: [&str; 33] = [
-    "#2d0709", // red 100: ×0.25 or slower
-    "#520408", // red 90
-    "#520408", // red 90
-    "#750e13", // red 80
-    "#750e13", // red 80
-    "#a2191f", // red 70
-    "#a2191f", // red 70
-    "#a2191f", // red 70
-    "#da1e28", // red 60
-    "#da1e28", // red 60
-    "#da1e28", // red 60
-    "#fa4d56", // red 50
-    "#fa4d56", // red 50
-    "#fa4d56", // red 50
-    "#ff8389", // red 40
-    "#ff8389", // red 40
-    "#a8a8a8", // gray 40: ×0.96 to ×1.04, within noise
-    "#33b1ff", // cyan 40
-    "#33b1ff", // cyan 40
-    "#1192e8", // cyan 50
-    "#1192e8", // cyan 50
-    "#1192e8", // cyan 50
-    "#0072c3", // cyan 60
-    "#0072c3", // cyan 60
-    "#0072c3", // cyan 60
-    "#00539a", // cyan 70
-    "#00539a", // cyan 70
-    "#00539a", // cyan 70
-    "#003a6d", // cyan 80
-    "#003a6d", // cyan 80
-    "#012749", // cyan 90
-    "#012749", // cyan 90
-    "#061727", // cyan 100: ×4 or faster
-];
+/// start at red/cyan 40 and darken outward to 100, every one at least 2.36:1
+/// on white and 2.15:1 on the grey tile (#f4f4f4). On g100 each grade is
+/// mirrored (Ramp::at): the middle is gray 60, and the steps past it start at
+/// red/cyan 60 and lighten outward to 20, every step from ×2.5 out (80 to 100
+/// on white) 20, every one at least 3.6:1 on g100's page (#161616) and 3.0:1
+/// on its tile (#262626).
+pub const RATIO_STEPS: [Themed; 33] = {
+    use Ramp::{Cyan, Gray, Red};
+    [
+        Red.at::<100>(), // ×0.25 or slower
+        Red.at::<90>(),
+        Red.at::<90>(),
+        Red.at::<80>(),
+        Red.at::<80>(),
+        Red.at::<70>(),
+        Red.at::<70>(),
+        Red.at::<70>(),
+        Red.at::<60>(),
+        Red.at::<60>(),
+        Red.at::<60>(),
+        Red.at::<50>(),
+        Red.at::<50>(),
+        Red.at::<50>(),
+        Red.at::<40>(),
+        Red.at::<40>(),
+        Gray.at::<40>(), // ×0.96 to ×1.04, within noise
+        Cyan.at::<40>(),
+        Cyan.at::<40>(),
+        Cyan.at::<50>(),
+        Cyan.at::<50>(),
+        Cyan.at::<50>(),
+        Cyan.at::<60>(),
+        Cyan.at::<60>(),
+        Cyan.at::<60>(),
+        Cyan.at::<70>(),
+        Cyan.at::<70>(),
+        Cyan.at::<70>(),
+        Cyan.at::<80>(),
+        Cyan.at::<80>(),
+        Cyan.at::<90>(),
+        Cyan.at::<90>(),
+        Cyan.at::<100>(), // ×4 or faster
+    ]
+};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -465,7 +543,6 @@ pub fn mini_heatmap(
             locale: Locale::total(total_label),
             combo: None,
             bounds: None,
-            theme: "white",
             toolbar: Enabled { enabled: false },
         },
         ratio: true,
@@ -769,8 +846,8 @@ pub fn sparkline(
                     (scratchy.line, colour("s1")),
                     (rival.line, colour("s2")),
                     // The heat maps' cyan and red 50.
-                    (scratchy.fill, "#1192e8"),
-                    (rival.fill, "#fa4d56"),
+                    (scratchy.fill, Ramp::Cyan.at::<50>()),
+                    (rival.fill, Ramp::Red.at::<50>()),
                 ]
                 .into_iter()
                 .collect(),
@@ -799,7 +876,6 @@ pub fn sparkline(
                 upper_bound_maps_to: "upper",
                 lower_bound_maps_to: "lower",
             }),
-            theme: "white",
             toolbar: Enabled { enabled: false },
         },
     };
@@ -831,8 +907,8 @@ pub fn highlight<'s>(steps: impl Iterator<Item = (Better, &'s mut Step)>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Axis, AxisDomain, Better, RATIO_RANGE, RATIO_SPAN, RATIO_STEPS, Side, Step, TableAxes,
-        ratio_step, spark_points,
+        Axis, AxisDomain, Better, RATIO_RANGE, RATIO_SPAN, RATIO_STEPS, Ramp, Side, Step,
+        TableAxes, ratio_step, spark_points,
     };
 
     const SCRATCHY: Side = Side {
@@ -917,7 +993,41 @@ mod tests {
     fn ratio_steps_mirror_around_a_gray_middle() {
         let n = RATIO_STEPS.len();
         assert_eq!(n % 2, 1);
-        assert_eq!(RATIO_STEPS[n / 2], "#a8a8a8");
+        assert_eq!(RATIO_STEPS[n / 2], Ramp::Gray.at::<40>());
+        assert_eq!(RATIO_STEPS[n / 2].dark, "#6f6f6f");
+    }
+
+    /// WCAG's contrast ratio of two "#rrggbb" colours.
+    fn contrast(a: &str, b: &str) -> f64 {
+        let luminance = |hex: &str| {
+            let channel = |at: usize| {
+                let v = f64::from(u8::from_str_radix(&hex[at..at + 2], 16).unwrap()) / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5)
+        };
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn every_ratio_step_stands_out_from_its_themes_page_and_tile() {
+        for step in RATIO_STEPS {
+            assert!(contrast(step.light, "#ffffff") >= 2.36, "{step:?} on white");
+            assert!(
+                contrast(step.light, "#f4f4f4") >= 2.15,
+                "{step:?} on white's tile"
+            );
+            assert!(contrast(step.dark, "#161616") >= 3.6, "{step:?} on g100");
+            assert!(
+                contrast(step.dark, "#262626") >= 3.0,
+                "{step:?} on g100's tile"
+            );
+        }
     }
 
     #[test]

@@ -23,7 +23,7 @@ use crate::charts::{
     Axes, Axis, AxisDomain, BarPoint, Chart, ChartOptions, Colour, Enabled, RatioSquare, Side,
     SparkAxes, Step, TableAxes, chart, colour, glance_maps, glance_mini, highlight, sparkline,
 };
-use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab, Theme};
+use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
 use crate::thousands_f;
 use data::{Cell, Dtype, Metric, Notes, Provenance, Sweep};
 
@@ -415,7 +415,6 @@ fn bars(
             locale: None,
             combo: None,
             bounds: None,
-            theme: "white",
             toolbar: Enabled { enabled: false },
         },
     };
@@ -1319,7 +1318,6 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
             og: None,
             root: Root(0),
             libraries: &[Library::CarbonCharts],
-            theme: Theme::AlwaysLight,
         },
         page,
     )?;
