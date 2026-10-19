@@ -304,13 +304,7 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
                     inp.mq_pad
                 ));
             }
-            causal_tiled(
-                &inp.causal.mask(),
-                rows,
-                inp.mq_pad,
-                inp.num_q_heads,
-                inp.causal_heads_per_block,
-            )
+            causal_bind(inp.causal, inp.num_q_heads, inp.causal_heads_per_block)
         }
         ForwardKernel::PrefixMask => unreachable!("served above, where its dtype is decided"),
         ForwardKernel::Const(_) => unreachable!("served above, where it is borrowed not built"),
@@ -408,6 +402,51 @@ pub fn causal_tiled(
         }
     }
     out
+}
+
+/// ⭐ THE CAUSAL MASK A LAUNCH UNDER `key` BINDS — the key's `[rows, rows_pad]` mask tiled per head as
+/// the emitter reads it. The ONE builder of the bound bytes: the launch's [`ForwardKernel::CausalMask`]
+/// step and a session's load-time staging ([`causal_full_chunk`]) both call it, so the mask a session
+/// stages before any request is, by construction, the mask its first full chunk would have bound.
+pub fn causal_bind(
+    key: scratchy_subtile::sdsc_abstract::CausalKey,
+    nqh: usize,
+    heads_per_block: usize,
+) -> Vec<f32> {
+    causal_tiled(
+        &key.mask(),
+        key.rows(),
+        key.rows_pad(),
+        nqh,
+        heads_per_block,
+    )
+}
+
+/// ⭐ THE CAUSAL MASK A `rows`-ROW SESSION'S FULL LAUNCH BINDS, and the key it binds it under — what a
+/// session can stage at LOAD, before any request, because both are compile-time facts of the rung:
+/// `rows` is the width the session's bundle was baked at (the ladder entry the launch selects the
+/// session by, and runs it at), the key is `Chunk { rows, rows }` (every full chunk of a prompt-chunk
+/// rung; every step of a one-row decode session), and the head count and blocking are the wiring's
+/// baked geometry through [`Wiring::causal_heads_per_block`] — the launch's own law.
+///
+/// [`Wiring::causal_heads_per_block`]: crate::wiring::Wiring::causal_heads_per_block
+pub fn causal_full_chunk(
+    w: &crate::wiring::Wiring,
+    rows: scratchy_subtile::sdsc_abstract::RungWidth,
+) -> (
+    PlaceId,
+    scratchy_subtile::sdsc_abstract::CausalKey,
+    Vec<f32>,
+) {
+    let key = scratchy_subtile::sdsc_abstract::CausalKey::Chunk {
+        rows,
+        real: rows.rows(),
+    };
+    (
+        PlaceId::Act(sd::ATTN_CAUSAL_TID),
+        key,
+        causal_bind(key, w.geometry.nqh as usize, w.causal_heads_per_block(key)),
+    )
 }
 
 /// Tile one rotary row across a source's full column width.

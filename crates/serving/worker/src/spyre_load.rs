@@ -86,6 +86,36 @@ fn adopt_from_owner(
     Ok(())
 }
 
+/// ⭐ STAGE A SESSION'S FULL-CHUNK CAUSAL MASK AT LOAD, so its first full launch finds the key held
+/// and builds, converts and uploads nothing for it.
+///
+/// The mask is a function of its key alone, and a `rows`-row session's full key — `Chunk { rows, rows }`
+/// — is a compile-time fact of the rung: `rows` is the ladder entry the launch selects this session by
+/// and runs it at, and the bytes are [`causal_full_chunk`]'s, i.e. [`causal_bind`] under the wiring's
+/// own head law, the same function the launch's `CausalMask` step calls. MEASURED before this, on
+/// granite-3.1-2b fp16 at ~1k tokens: the first request paid each 512-row session's mask build as
+/// +49.7 ms (prefix-free) and +40.0 ms (prefix) over the warm request.
+///
+/// A launch under any OTHER key (a prompt's partial tail) re-binds over the staged one, as it would
+/// over a key a previous launch left; the next full chunk then re-binds the full key once.
+///
+/// [`causal_full_chunk`]: scratchy_target_spyre::forward_tape::causal_full_chunk
+/// [`causal_bind`]: scratchy_target_spyre::forward_tape::causal_bind
+#[cfg(feature = "spyre-hw")]
+fn stage_full_chunk_causal(
+    sess: &mut SuperDscSession,
+    wiring: &scratchy_target_spyre::wiring::Wiring,
+    rows: usize,
+) -> Result<u64, String> {
+    let width = u32::try_from(rows)
+        .ok()
+        .and_then(scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows)
+        .ok_or_else(|| format!("a {rows}-row session has no rung width"))?;
+    let (id, key, vals) = scratchy_target_spyre::forward_tape::causal_full_chunk(wiring, width);
+    sess.stage_keyed(id, key, &vals)
+        .map_err(|e| format!("the {rows}-row session's full-chunk causal mask: {e}"))
+}
+
 /// The segments this bundle spilled weights into and HOW MANY BYTES of each the spill occupies —
 /// [`adopt_from_owner`]'s work list, empty for every model whose weights fit one segment.
 ///
@@ -2394,7 +2424,7 @@ impl SpyreWorker {
                         ),
                     }
                 }
-                let prefill_prefix = PrefixLadder::of_built(prefix_built);
+                let mut prefill_prefix = PrefixLadder::of_built(prefix_built);
                 if prefill_prefix.is_empty() {
                     warn!(
                         "[spyre-worker] sendnn: no prefix-capable prefill session built — continuation \
@@ -2597,6 +2627,55 @@ impl SpyreWorker {
                     }
                 }
                 decode_ladder.sort_by_key(|r| r.seqs);
+                // ── STAGE EVERY CHUNK SESSION'S FULL-CHUNK CAUSAL MASK, ONCE, HERE ── so no request's
+                // first full chunk pays the build (see `stage_full_chunk_causal`). Each session under
+                // the wiring its launches run under: the prefill meta's for both prompt ladders, the
+                // decode meta's for the solo decode session, whose every step is the one-row key. The
+                // decode BATCH rungs key by how many requests are live, which no load-time fact knows,
+                // so they still bind at first use.
+                //
+                // ⭐ AND FAULT THE SAME SESSIONS' ACTIVATION SHADOWS IN FIRST, so a request's first
+                // binds write into pages already mapped (see `materialize_activation_shadow`). The
+                // same set and for the same reason: these are what a first request runs on. A decode
+                // batch rung's activation segment reserves `nqh · rows` prefix-mask rows for every page
+                // a pool can hold (the `pmbytes` law), of which a step writes only its live blocks, so
+                // it keeps faulting in only what it writes rather than committing the reservation.
+                {
+                    let _t = std::time::Instant::now();
+                    let pw = wirings.prefill.as_ref().unwrap_or(&wirings.decode);
+                    let mut staged = (0usize, 0u64);
+                    let (mut shadow_bytes, mut shadow_s) = (0u64, 0f64);
+                    let mut stage = |sess: &mut SuperDscSession,
+                                     w: &scratchy_target_spyre::wiring::Wiring,
+                                     rows: usize|
+                     -> ExecutorResult<()> {
+                        let t = std::time::Instant::now();
+                        shadow_bytes += sess.materialize_activation_shadow().map_err(|e| {
+                            werr(format!("the {rows}-row session's activation shadow: {e}"))
+                        })?;
+                        shadow_s += t.elapsed().as_secs_f64();
+                        staged.1 += stage_full_chunk_causal(sess, w, rows).map_err(werr)?;
+                        staged.0 += 1;
+                        Ok(())
+                    };
+                    for (rows, sess) in prefill_ladder.iter_mut() {
+                        stage(sess, pw, *rows)?;
+                    }
+                    for (rows, sess) in prefill_prefix.rungs_mut() {
+                        stage(sess, pw, rows)?;
+                    }
+                    stage(&mut ss, &wirings.decode, 1)?;
+                    info!(
+                        "[spyre-worker] sendnn: staged {} session(s)' full-chunk causal mask at load \
+                         ({} KB sent, {:.0} ms in all) — a full chunk's first launch binds nothing \
+                         for it; their activation shadows faulted in first ({} KB, {:.0} ms)",
+                        staged.0,
+                        staged.1 >> 10,
+                        _t.elapsed().as_secs_f64() * 1e3,
+                        shadow_bytes >> 10,
+                        shadow_s * 1e3,
+                    );
+                }
                 let sb = SuperDscBundle {
                     // Every page starts free: no request holds one yet.
                     pool_pages: num_blocks,

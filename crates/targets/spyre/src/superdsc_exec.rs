@@ -654,6 +654,35 @@ fn whole_shadow<'a>(shadow: &'a [u8], addr: &DevAddr, seg: usize) -> Result<&'a 
     })
 }
 
+/// ⭐ THE H2D WINDOW AN ACTIVATION AT `[offset, offset + len)` GOES OUT IN — `offset` down and the end
+/// up to [`H2D_ALIGN`]. Slicing to a bind's EXACT range was tried and tripped a DMA
+/// sub-address/alignment error; any alignment coarser than the hardware's is also legal, so this needs
+/// no knowledge of the exact requirement. The one law both refill sources take — a `bound` activation
+/// converted at the refill and one `bind_input_f32` converted at bind — so they go out alike.
+fn h2d_run(offset: u64, len: u64) -> (u64, u64) {
+    (
+        (offset / H2D_ALIGN) * H2D_ALIGN,
+        (offset + len).div_ceil(H2D_ALIGN) * H2D_ALIGN,
+    )
+}
+
+/// The H2D window alignment [`h2d_run`] rounds to.
+const H2D_ALIGN: u64 = 4096;
+
+/// The smallest page a host maps. One write per this many bytes faults in every page of a buffer,
+/// whatever page size the host actually uses.
+const HOST_PAGE: usize = 4096;
+
+/// ⭐ FAULT EVERY PAGE OF `buf` IN, LEAVING ITS BYTES AS THEY ARE: each page is written with the byte
+/// it already holds. A zeroed allocation is mapped on first WRITE (a read maps the shared zero page
+/// and commits nothing), so this is what moves those faults to the caller's moment. The value goes
+/// through `black_box`, so the store cannot be proven redundant and dropped.
+fn fault_in(buf: &mut [u8]) {
+    for b in buf.iter_mut().step_by(HOST_PAGE) {
+        *b = std::hint::black_box(*b);
+    }
+}
+
 /// One keyed activation's state: the [`CausalKey`] its staged bytes are a function of, and whether
 /// the current step re-bound it (so `refill_activations` converts and uploads it this step, and only
 /// this step). See [`Executor::keyed`].
@@ -865,6 +894,14 @@ pub struct Executor {
     /// as before. That arrangement is deliberate: an input someone forgets to re-bind must still be
     /// caught by today's path, not hidden by this one.
     keyed: BTreeMap<bundle::PlaceId, Keyed>,
+    /// ⭐ ACTIVATIONS ALREADY IN THE SHADOW — the byte length of each f32 activation that
+    /// [`Self::bind_input_f32`] converted straight into its placement's slot of `seg_host`. The
+    /// refill sends that range exactly as it sends a [`Self::bound`] one, without converting it a
+    /// second time: the bytes are already the device's.
+    ///
+    /// Disjoint from `bound` by construction: every bind door removes its id from the other map, so
+    /// one id has one source of bytes.
+    staged: BTreeMap<bundle::PlaceId, u64>,
 
     // ── KV / fold ──
     kv: KvGeometry,
@@ -1039,6 +1076,7 @@ impl Executor {
             weight_ids: BTreeSet::new(),
             raw_ids: BTreeSet::new(),
             keyed: BTreeMap::new(),
+            staged: BTreeMap::new(),
             kv: KvGeometry::default(),
             fold: SessionKv::default(),
             block_table_set: false,
@@ -1435,7 +1473,7 @@ impl Executor {
         // bytes. Any of them ⇒ filled, so the order changes only the label, never the verdict.
         if self.weight_ids.contains(id) {
             SourceFiller::WeightLoader
-        } else if self.bound.contains_key(id) {
+        } else if self.bound.contains_key(id) || self.staged.contains_key(id) {
             SourceFiller::TapeStep
         } else if self.resident_sources.contains(&id.tid()) {
             SourceFiller::DeclaredResident
@@ -1493,7 +1531,54 @@ impl Executor {
         // An id re-bound UNKEYED goes back to the per-step re-upload, so a keyed bind can never
         // shadow a later plain one.
         self.keyed.remove(&id);
+        self.staged.remove(&id);
         self.bound.insert(id, bytes);
+    }
+
+    /// ⭐ Bind an f32 ACTIVATION by converting it STRAIGHT INTO ITS SLOT OF THE SHADOW — f32 →
+    /// SEN169 in one pass ([`sen_convert::f32_to_sen_bytes`]), the same bytes
+    /// `bind_input(f32_to_f16_le(vals))` and the refill's `ieee_to_sen_bytes` produce between them,
+    /// without the IEEE-f16 buffer in between or the refill's second convert pass. Re-bound every
+    /// step, and the refill sends its range every step, exactly like [`Self::bind_input`]: only
+    /// WHERE the conversion happens moves.
+    ///
+    /// The placement checks the refill makes for a `bound` activation are made here instead, where
+    /// the write happens: a name this bundle never placed is skipped (as the refill skips it), and a
+    /// bind longer than its own placement, or past its segment's shadow, is refused.
+    pub fn bind_input_f32(&mut self, id: bundle::PlaceId, vals: &[f32]) -> Result<()> {
+        if !self.prepared {
+            bail!("bind_input_f32('{id}') before prepare — the shadow is sized at prepare");
+        }
+        // A RESIDENT WEIGHT is never re-sent by a step (the refill skips it), so a per-step bind of
+        // one writes nothing — as before, where the refill skipped its `bound` entry.
+        if self.weight_ids.contains(&id) {
+            return Ok(());
+        }
+        let Some(p) = self.places.get(&id) else {
+            return Ok(()); // no placement → not a program input, as the refill treats it
+        };
+        let Some(seg) = SegIdx::checked(p.segment as i64) else {
+            return Ok(());
+        };
+        let len = vals.len() as u64 * 2;
+        if len > p.size {
+            bail!(
+                "bind: activation '{id}' binds {len} B into a {} B placement (seg{} off {}) — \
+                 REFUSING, this would corrupt the following tensors",
+                p.size,
+                p.segment,
+                p.offset
+            );
+        }
+        let dst = self.seg_host[seg.get()]
+            .get_mut(p.offset as usize..(p.offset + len) as usize)
+            .ok_or_else(|| anyhow!("bind: activation '{id}' overflows seg{}", p.segment))?;
+        sen_convert::f32_to_sen_bytes(vals, dst);
+        self.raw_ids.remove(&id);
+        self.keyed.remove(&id);
+        self.bound.remove(&id);
+        self.staged.insert(id, len);
+        Ok(())
     }
 
     /// The key this session's KEYED activation `id` holds — the [`CausalKey`] the bytes on the
@@ -1524,9 +1609,76 @@ impl Executor {
             );
         }
         self.raw_ids.remove(&id);
+        self.staged.remove(&id);
         self.keyed.insert(id, Keyed { key, fresh: true });
         self.bound.insert(id, bytes);
         Ok(())
+    }
+
+    /// ⭐ [`Self::bind_input_keyed`], UPLOADED NOW — a session's load-time staging of the keyed
+    /// activation its first launch would otherwise bind. The upload is the refill a predict runs
+    /// first, so a launch under `key` then finds it held ([`Self::keyed_holds`]) and sends nothing for
+    /// `id`, and a launch under any other key re-binds over it exactly as it would over a key a
+    /// previous launch left.
+    ///
+    /// ⛔ A STAGED CONSTANT FILLS ITS PLACEMENT EXACTLY. The refill guard refuses only OVER-binds,
+    /// because several per-step activations bind less than they reserve; an under-bind of an ADDITIVE
+    /// mask leaves a tail the ops read as ZERO, i.e. as "no mask". Staging is done once, at load, for
+    /// a buffer whose size is a law of the rung, so a size that is not the placement's is a
+    /// wiring/layout desync, refused here rather than served.
+    ///
+    /// Returns the bytes the upload sent.
+    pub fn stage_keyed(
+        &mut self,
+        id: bundle::PlaceId,
+        key: scratchy_subtile::sdsc_abstract::CausalKey,
+        bytes: Vec<u8>,
+    ) -> Result<u64> {
+        let placed = self
+            .places
+            .get(&id)
+            .ok_or_else(|| anyhow!("stage_keyed('{id}'): this bundle places no such tensor"))?
+            .size;
+        if bytes.len() as u64 != placed {
+            bail!(
+                "stage_keyed('{id}', {key:?}): {} B staged into a {placed} B placement — a staged \
+                 constant must fill its placement exactly",
+                bytes.len()
+            );
+        }
+        self.bind_input_keyed(id, key, bytes)?;
+        let (_, sent) = self.refill_activations(Diag::get())?;
+        self.stream_ref()?
+            .synchronize()
+            .map_err(|e| anyhow!("stage_keyed('{id}'): sync: {e}"))?;
+        Ok(sent)
+    }
+
+    /// ⭐ MATERIALIZE THE ACTIVATION SEGMENT'S HOST SHADOW — fault every page of it in now, at load,
+    /// so a request's first bind into it does not.
+    ///
+    /// The ACTIVATION segment is the one segment the host writes on a step: the placement pass puts
+    /// every per-step input there (`SegRole::Activation` — embeddings, rotary tables, both masks, the
+    /// gather index, the constants), and the same law names it here. Prepare allocates its shadow
+    /// zeroed, which the allocator satisfies with pages mapped on first write, so before this the
+    /// first request faulted in every page its binds touched, inside its TTFT. The other segments'
+    /// shadows are left alone: the intermediates are device-written and the host never touches them,
+    /// so committing them would be RSS for nothing.
+    ///
+    /// Contents unchanged ([`fault_in`]): bytes already staged there, such as a causal mask
+    /// `stage_keyed` put in, stay exactly as they are, and the device is not touched. Only WHERE the
+    /// faults land moves. Returns the shadow's length — the RSS this commits.
+    pub fn materialize_activation_shadow(&mut self) -> Result<u64> {
+        if !self.prepared {
+            bail!("materialize_activation_shadow before prepare — the shadow is sized at prepare");
+        }
+        let seg = crate::lower_subtile_tape_to_superdsc::SegRole::Activation.segment();
+        let shadow = self
+            .seg_host
+            .get_mut(seg)
+            .ok_or_else(|| anyhow!("the activation segment {seg} is not a tensor segment"))?;
+        fault_in(shadow);
+        Ok(shadow.len() as u64)
     }
 
     /// ⭐⭐⭐⭐⭐ MINT THE ONLY VALUE [`Self::bind_input_raw`] ACCEPTS — the payload measured against
@@ -1568,6 +1720,7 @@ impl Executor {
             self.weight_ids.insert(b.id);
         }
         self.raw_ids.insert(b.id);
+        self.staged.remove(&b.id);
         self.bound.insert(b.id, b.bytes);
     }
 
@@ -3944,8 +4097,16 @@ impl Executor {
             //     is not a multiple of 128 would transfer a short row and lose the tail logits.
             // The destination is the SAME `[lp.offset, …)` window of the shadow the sen→IEEE convert
             // below reads from, so the row lands where the caller already looks for it.
+            //
+            // ⭐ AND ONLY THE ROW THE CONVERT BELOW READS. The convert takes `vocab` elements at
+            // `lp.offset` — the folded tail's one `[1, vocab]` row — but a prefill rung's logits
+            // PLACEMENT is `[rows, vocab]` wide: 25.6 MB at granite-2b's 256-row rung, read back to
+            // convert 100 KB of it (15.1 ms on a fresh session, 3.6 ms warm, measured). The window
+            // is the row, so the bytes converted are the same bytes; decode's placement already is
+            // one row, so it is unchanged.
             let lo = lp.offset;
-            let len = crate::lower_subtile_tape_to_superdsc::align128(lp.size).min(tot - lo);
+            let row = (self.vocab.0 as u64 * 2).min(lp.size);
+            let len = crate::lower_subtile_tape_to_superdsc::align128(row).min(tot - lo);
             // A multi-chunk region has no addressable sub-window (`chunk0` fails); fall back to the
             // whole-region read, which is what this always did.
             let win = (len < tot)
@@ -4044,12 +4205,9 @@ impl Executor {
         // ~1.5 ms no amount of shrinking the mask could reach, because the transfer is sized by the
         // SEGMENT and not by the content.
         //
-        // Slicing to the bound input's EXACT [offset, size) was tried and tripped a DMA
-        // sub-address/alignment error. This sends an ALIGNED COVERING WINDOW instead — `lo` down and
-        // `hi` up to `H2D_ALIGN` — which needs no knowledge of the hardware's exact requirement,
-        // since any alignment coarser than it is also legal. It degrades to the whole segment
-        // whenever a window cannot be formed, so the worst case is exactly the old behaviour.
-        const H2D_ALIGN: u64 = 4096;
+        // Each bind goes out in its own ALIGNED COVERING WINDOW ([`h2d_run`]). It degrades to the
+        // whole segment whenever a window cannot be formed, so the worst case is exactly the old
+        // behaviour.
         let mut seg_dirty = [false; NUM_SEGMENTS];
         // ⛔ ONE COVERING WINDOW IS NOT ENOUGH — MEASURED. The bound tensors are SCATTERED across
         // seg3 (model constants low, masks high), so min-to-max spanned the whole 8425 KB and
@@ -4093,16 +4251,34 @@ impl Executor {
             }
             writes.push((seg.get(), p.offset, src.as_slice()));
             seg_dirty[seg.get()] = true;
-            let a = (p.offset / H2D_ALIGN) * H2D_ALIGN;
-            let e = p.offset + src.len() as u64;
-            let b = e.div_ceil(H2D_ALIGN) * H2D_ALIGN;
-            seg_runs[seg.get()].push((a, b));
+            seg_runs[seg.get()].push(h2d_run(p.offset, src.len() as u64));
             if d.phase_time {
                 eprintln!(
                     "[sdsc-bind] '{nm}' -> seg{} off={} inputsize={:.3} MB",
                     p.segment,
                     p.offset,
                     src.len() as f64 / 1048576.0
+                );
+            }
+        }
+        // ⭐ AND EVERY ACTIVATION ALREADY CONVERTED INTO THE SHADOW (`bind_input_f32`): its range
+        // goes out this step exactly as a `bound` one's does — same window law, every step — and
+        // nothing converts it again. Its placement was checked where it was written.
+        for (nm, &len) in &self.staged {
+            let Some(p) = self.places.get(nm) else {
+                continue;
+            };
+            let Some(seg) = SegIdx::checked(p.segment as i64) else {
+                continue;
+            };
+            seg_dirty[seg.get()] = true;
+            seg_runs[seg.get()].push(h2d_run(p.offset, len));
+            if d.phase_time {
+                eprintln!(
+                    "[sdsc-bind] '{nm}' -> seg{} off={} inputsize={:.3} MB (converted at bind)",
+                    p.segment,
+                    p.offset,
+                    len as f64 / 1048576.0
                 );
             }
         }
@@ -5523,6 +5699,61 @@ mod tests {
             refill_sends(&keyed, &rope),
             "unkeyed: still sent every step"
         );
+    }
+
+    /// ⭐ A BIND CONVERTED AT BIND GOES OUT EXACTLY AS ONE CONVERTED AT THE REFILL: the same window
+    /// (one [`h2d_run`] law for both sources), and the same bytes in it — the shadow slot
+    /// `bind_input_f32` writes in one pass is the slot the refill's `ieee_to_sen_bytes` wrote from
+    /// `f32_to_f16_le`'s buffer. Over offsets on and off the 4 KiB grid and lengths on both sides
+    /// of it, so the window's round-down and round-up both move.
+    #[test]
+    fn a_bind_converted_at_bind_goes_out_as_one_converted_at_refill() {
+        let vals: Vec<f32> = (0..3000).map(|i| (i as f32 - 1500.0) * 0.37).collect();
+        for (offset, n) in [
+            (0u64, 1usize),
+            (128, 2048),
+            (4096, 2048),
+            (4224, 3000),
+            (8064, 64),
+        ] {
+            let len = n as u64 * 2;
+            let (a, b) = h2d_run(offset, len);
+            assert!(
+                a <= offset && offset + len <= b,
+                "the window covers the bind"
+            );
+            assert!(a % H2D_ALIGN == 0 && b % H2D_ALIGN == 0, "on the grid");
+            assert!(
+                b - a < len + 2 * H2D_ALIGN,
+                "and no wider than the grid forces"
+            );
+            // The two shadows: the refill's two-pass write, and the one-pass write at bind.
+            let mut two = vec![0u8; b as usize];
+            let ieee = sen_convert::f32_to_f16_le(&vals[..n]);
+            sen_convert::ieee_to_sen_bytes(&ieee, &mut two[offset as usize..][..ieee.len()]);
+            let mut one = vec![0u8; b as usize];
+            sen_convert::f32_to_sen_bytes(&vals[..n], &mut one[offset as usize..][..len as usize]);
+            assert!(
+                one[a as usize..b as usize] == two[a as usize..b as usize],
+                "offset {offset} n {n}: the window's bytes differ"
+            );
+        }
+    }
+
+    /// ⭐ FAULTING A SHADOW IN CHANGES NONE OF ITS BYTES — the property that lets the load-time
+    /// materialize run after `stage_keyed` (or in any order with it): the keyed bytes already in
+    /// the shadow are the ones a later aligned H2D window may re-send. Over a length that is not a
+    /// whole number of pages, so the last partial page is covered too.
+    #[test]
+    fn faulting_a_shadow_in_changes_none_of_its_bytes() {
+        let n = 5 * HOST_PAGE + 123;
+        let want: Vec<u8> = (0..n).map(|i| (i * 31 % 251) as u8).collect();
+        let mut got = want.clone();
+        fault_in(&mut got);
+        assert!(got == want, "a byte moved");
+        let mut zeros = vec![0u8; n];
+        fault_in(&mut zeros);
+        assert!(zeros.iter().all(|&b| b == 0), "a zeroed shadow stays zero");
     }
 
     /// Two steps on ONE image key: the first derives, the second hits the cache —

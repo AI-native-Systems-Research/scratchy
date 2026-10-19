@@ -21,14 +21,7 @@ use tracing::debug;
 
 use crate::manifest::bytes_to_f32;
 
-/// f32 → little-endian f16 bytes (the device tensor dtype at the bind boundary).
-fn f32_to_f16_le(vals: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vals.len() * 2);
-    for &v in vals {
-        out.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
-    }
-    out
-}
+use crate::sen_convert::f32_to_f16_le;
 
 /// The three model extents every constructor here forwards unchanged — one value because they are
 /// always read from the same parse and passed together, and separately they pushed `new_inner` past the
@@ -565,6 +558,24 @@ impl SuperDscSession {
         self.exec.bind_input_keyed(id, key, f32_to_f16_le(vals))
     }
 
+    /// Fault the activation segment's host shadow in now, at load, so a request's first bind does
+    /// not (see `Executor::materialize_activation_shadow`). Returns the shadow's bytes.
+    pub fn materialize_activation_shadow(&mut self) -> Result<u64> {
+        self.exec.materialize_activation_shadow()
+    }
+
+    /// [`Self::bind_keyed`], uploaded NOW rather than by the next step — a session's load-time
+    /// staging of what its first launch would bind (see `Executor::stage_keyed`). Returns the bytes
+    /// sent.
+    pub fn stage_keyed(
+        &mut self,
+        id: crate::bundle_code::PlaceId,
+        key: scratchy_subtile::sdsc_abstract::CausalKey,
+        vals: &[f32],
+    ) -> Result<u64> {
+        self.exec.stage_keyed(id, key, f32_to_f16_le(vals))
+    }
+
     fn run_step_inner(
         &mut self,
         n_new: usize,
@@ -584,9 +595,12 @@ impl SuperDscSession {
         // budget never accounted for.
         let t_bind = std::time::Instant::now();
         let mut bind_elems = 0usize;
+        // ⭐ ONE PASS, STRAIGHT INTO THE SHADOW: f32 → SEN169 at the activation's own slot, the bytes
+        // `f32_to_f16_le` then the refill's `ieee_to_sen_bytes` made between them — with no IEEE-f16
+        // `Vec` per bind per step in between and no second convert pass at the refill.
         for (id, vals) in activations {
             bind_elems += vals.len();
-            self.exec.bind_input(*id, f32_to_f16_le(vals));
+            self.exec.bind_input_f32(*id, vals)?;
         }
         let mut bind_f16_bytes = 0usize;
         for (id, bytes) in activations_f16 {
@@ -617,7 +631,7 @@ impl SuperDscSession {
         }
         if std::env::var_os("SCRATCHY_SDSC_PHASE_TIME").is_some() {
             eprintln!(
-                "[sdsc-host] bind_loop={:.2} ms  ({} acts, {bind_elems} f32->f16, {} f16 acts, \
+                "[sdsc-host] bind_loop={:.2} ms  ({} acts, {bind_elems} f32->sen, {} f16 acts, \
                  {bind_f16_bytes} f16 bytes as-is)",
                 t_bind.elapsed().as_secs_f64() * 1e3,
                 activations.len(),
