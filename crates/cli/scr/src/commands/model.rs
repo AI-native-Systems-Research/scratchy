@@ -210,8 +210,12 @@ pub(crate) fn compiled_variant_stems() -> Vec<String> {
 
 /// No backend or no model scope compiled in means no backbones were emitted, so
 /// there are no stems to report (`scr model info` does not exist in such a
-/// build either).
-#[cfg(not(all(feature = "model", any(feature = "cuda", feature = "metal"))))]
+/// build either). Compiled only where a caller is: `scr model names` (`model`)
+/// and `launch claude --auto-mode` (`claude`).
+#[cfg(all(
+    any(feature = "model", feature = "claude"),
+    not(all(feature = "model", any(feature = "cuda", feature = "metal")))
+))]
 pub(crate) fn compiled_variant_stems() -> Vec<String> {
     Vec::new()
 }
