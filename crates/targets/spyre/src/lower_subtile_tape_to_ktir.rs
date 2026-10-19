@@ -547,116 +547,13 @@ pub(crate) fn oproj_perm_copies<F: RopeForm>(
     })
 }
 
-/// ⭐ THE SPLIT-KV CHUNK THIS GRAPH'S ATTENTION CAN EXPRESS — `requested` when EVERY attention
-/// class's pool admits it, `None` otherwise.
-///
-/// ⛔ `None` IS THE PER-PAGE FOLD, WHICH IS THE SHIPPED AND CORRECT DECODE — not a silently degraded
-/// one. The chunk is refused where its V gather has no slab-major order (a head dim past one page's stick
-/// blocks — `ChunkScratch::of_chunk`; hd 64, 128 and 256 are admitted), and a model there keeps exactly
-/// the emission it had. Asked of the GRAPH — a CONJUNCTION over every `AttnDecode` geometry, never one
-/// class's answer in another's place (#554: the ladder was admitted off the sliding class alone and the
-/// door refused the global class's hd=512 at bake) — so a third-party producer's geometry decides for
-/// itself; a graph with no attention node has nothing to chunk.
-pub fn admitted_chunk<F: RopeForm>(ir: &SubtileIR<F>, requested: Option<u32>) -> Option<u32> {
-    let pools = attn_pools(ir);
-    requested.filter(|&pages| admits_chunk(&pools, pages))
-}
-
-/// The paged KV pools this graph's attention reads — one per DISTINCT `AttnDecode` geometry, in
-/// first-appearance order. ⛔ EVERY CLASS, NOT THE FIRST: a hybrid model (gemma-4's sliding layers
-/// plus every-sixth global ones) carries two geometries in one graph, and a chunk is lowered at
-/// EVERY class's attention, so an admission read off one class speaks for a class that never
-/// offered it (#554). Empty for a graph with no attention node.
-fn attn_pools<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<ktir_superdsc::sdsc_abstract::PagedKvPool> {
-    let mut pools = Vec::new();
-    for n in &ir.nodes {
-        if let SubOp::AttnDecode { geom, .. } = &n.op {
-            let pool = ktir_superdsc::sdsc_abstract::PagedKvPool::new(
-                geom.nkvh().get() as usize,
-                geom.hd().get() as usize,
-            );
-            if !pools.contains(&pool) {
-                pools.push(pool);
-            }
-        }
-    }
-    pools
-}
-
-/// ⭐ THE ONE ADMISSION PREDICATE — a chunk width this graph's attention can express is a width
-/// EVERY class's pool expresses ([`ChunkScratch::of_chunk`] at each). Both doors into the bake —
-/// the ladder that mints a rung ([`admitted_chunk_ladder`]) and the bundle that narrows one
-/// ([`admitted_chunk`]) — ask THIS, so a rung can never name a width some class's own door
-/// refuses (#554: the two answers were read off different classes, and the bake panicked between
-/// them).
-fn admits_chunk(pools: &[ktir_superdsc::sdsc_abstract::PagedKvPool], pages: u32) -> bool {
-    !pools.is_empty()
-        && pools.iter().all(|pool| {
-            ktir_superdsc::sdsc_abstract::ChunkScratch::of_chunk(*pool, pages).is_some()
-        })
-}
-
-/// ⭐ THE CHUNK LADDER THIS GRAPH's GEOMETRY ADMITS for a body of `requests` request rows, ascending —
-/// [`ktir_superdsc::sdsc_abstract::ChunkScratch::ladder_for`] at the graph's pools (one request for a
-/// body whose rows share a history, the batch width for a decode batch). The rung widths are
-/// pool-independent (`ChunkScratch::LADDER`; `B × J` for a batch), so one class's ladder enumerates
-/// them and [`admits_chunk`] — the ONE predicate — admits each at EVERY class's pool: a graph whose
-/// classes disagree offers no rung at all, which keeps the per-page fold, as [`admitted_chunk`]'s
-/// `None` does.
-pub fn admitted_chunk_ladder<F: RopeForm>(ir: &SubtileIR<F>, requests: u32) -> Vec<u32> {
-    let pools = attn_pools(ir);
-    pools
-        .first()
-        .map_or_else(Vec::new, |&pool| {
-            ktir_superdsc::sdsc_abstract::ChunkScratch::ladder_for(pool, requests)
-        })
-        .into_iter()
-        .filter(|&pages| admits_chunk(&pools, pages))
-        .collect()
-}
-
-/// ⭐ A LADDER CHUNK's SWEPT EXTENT PER REQUEST — the rung key the body selector compares the live
-/// context against ([`ktir_superdsc::sdsc_abstract::ChunkScratch::swept_per_request`]). `pages` comes off
-/// [`admitted_chunk_ladder`] at the same `requests`; `None` for a chunk some class of this graph's
-/// attention refuses, which the bake turns into a build failure (a rung its own ladder never
-/// offered), never a guessed extent.
-pub fn chunk_swept_per_request<F: RopeForm>(
-    ir: &SubtileIR<F>,
-    pages: u32,
-    requests: u32,
-) -> Option<u32> {
-    let pools = attn_pools(ir);
-    if !admits_chunk(&pools, pages) {
-        return None;
-    }
-    // `swept_per_request` counts PAGES (`pages × PAGE_SLOTS` at one request, `J × PAGE_SLOTS` for a
-    // batch) — no pool's geometry enters it — so any admitting pool's scratch states it and the law
-    // stays in ONE place.
-    ktir_superdsc::sdsc_abstract::ChunkScratch::of_chunk(pools[0], pages)
-        .map(|chunk| chunk.swept_per_request(requests))
-}
-
 /// ⭐⭐⭐ THE BUNDLE'S ATTENTION PARAMETERS, READ WHERE MAIN READ THEM.
 ///
-/// `ibm/main`'s `lower_one_node` lowered each node during the tape walk, so `SubOp::AttnDecode`'s
-/// `geom` and `scale` were in its hand and `active_cap` / `rows_are_requests` were its own walk
-/// parameters. This split lowers KTIR → SuperDSC one pass later, per BUNDLE, so the same facts
-/// are read HERE — off the graph's own `AttnDecode` nodes, off this walk's parameters, and off the
-/// fold recognition's own node set (the `scale` main read became TWO things downstream: the value
-/// the program states when there is one to apply, and the in-weights fact when the weights carry
-/// it — the fold's rewrite to 1.0, or a unit scale the model itself states) —
-/// and travel to the door as [`crate::ktir_superdsc_door::BundleAttnParams`], an argument of the
-/// call.
-///
-/// ⛔ THE MODEL FACTS MUST BE THE MODEL'S, SO A DISAGREEMENT IS AN ERROR AND NOT A CHOICE — for
-/// the facts that ARE one-per-bundle. The geometry is no longer one of them: a hybrid model
-/// (gemma-4's sliding + every-sixth global layers) carries TWO attention classes in one graph,
-/// and the door mints each program's geometry from its own views, exactly as it mints rope's
-/// head dim — so this function states no geometry at all. The in-weights fact keeps the law: one
-/// `#[forward]` expansion is one model, every `AttnDecode` node in one graph must agree that its
-/// score scale is carried by the staged weights (folded into them, or a unit multiplier) or that
-/// the program states it, and a graph carrying both would refuse at the door's first attention
-/// either way — so this refuses instead, naming both nodes while both are in hand.
+/// `ibm/main`'s `lower_one_node` lowered each node during the tape walk, so `rows_are_requests`
+/// was its own walk parameter. This split lowers KTIR → SuperDSC one pass later, per BUNDLE, so
+/// the same facts are read HERE — off the graph's own `AttnDecode` nodes and off this walk's
+/// parameters — and travel to the door as
+/// [`crate::ktir_superdsc_door::BundleAttnParams`], an argument of the call.
 ///
 /// `None` when the graph has no attention node: there is then nothing for the facts to be facts
 /// of, and an attention program arriving at the door without them is that door's own build error.
@@ -667,26 +564,10 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
     // (`!is_prefill && decode_rows == 1 && seq_sym.is_none()` in the `#[forward]` emission):
     // a CONCRETE single-row decode, never a symbolic batch template and never a prefill chunk.
     one_request_decode: bool,
-    // The split-KV chunk this rung bakes — the ladder's own bake fact: the one-request decode rung, a
-    // prompt chunk's prefix, or a decode BATCH, whose chunk holds every request's pages end to end
-    // (`ktir_superdsc::sdsc_abstract::BatchChunk`; see `BundleAttnParams::chunk_pages`).
-    chunk_pages: Option<u32>,
 ) -> Result<Option<crate::ktir_superdsc_door::BundleAttnParams>, SuperDscError> {
-    // The fold's node set, taken once: a node's scale is in the staged weights iff the
-    // attention-fold recognition named it, OR the node states a UNIT scale — `√1.0` leaves the
-    // weights carrying the whole scale with nothing folded, which is the gemma-4 arch's own
-    // default (`attention_multiplier` 1.0). The two are disjoint by the recognition's own skip
-    // (a node at scale 1.0 folds nothing), which is also why the door's `scale_in_weights` is a
-    // fact about what the program cannot state, not a restatement of one of its values — see
-    // `BundleAttnParams::scale_in_weights`.
-    let folded: std::collections::HashSet<SubtileId> = attn_scale_weight_folds(ir)
-        .into_iter()
-        .map(|(id, ..)| id)
-        .collect();
     let mut found: Option<(u32, u32)> = None;
-    let mut first_in_weights: Option<bool> = None;
     for n in &ir.nodes {
-        let SubOp::AttnDecode { scale, .. } = &n.op else {
+        let SubOp::AttnDecode { .. } = &n.op else {
             continue;
         };
         let t = n.output.tensor.index() as u32;
@@ -694,31 +575,8 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
         // the request count (`lower_attn` reads this same `region.rows.len` as its `mq`). The
         // head-major handoff is minted exactly where this is ONE row.
         let rows = n.output.region.rows.len;
-        let n_in_weights = folded.contains(&n.id) || *scale == 1.0;
-        match (found, first_in_weights) {
-            (None, _) => {
-                found = Some((t, rows));
-                first_in_weights = Some(n_in_weights);
-            }
-            (Some((t0, _r0)), Some(f0)) => {
-                // ⛔ THE GEOMETRY CHECK IS GONE, AND THE HYBRID MODEL IS THE REASON: gemma-4's
-                // sliding layers and every-sixth global layer carry TWO attention classes in one
-                // graph, and the door MINTS each program's geometry from its own views (the same
-                // reading rope takes for its head dim) — so no per-bundle geometry exists to agree
-                // on, and two classes in one graph is legitimate. The in-weights fact below keeps
-                // the one-value-per-bundle law.
-                if f0 != n_in_weights {
-                    return Err(SuperDscError(format!(
-                        "AttnDecode t{t0} carries its attention scale in its staged weights while \
-                         AttnDecode t{t} states a device score multiply. One bundle is one model, \
-                         and the door takes ONE such fact for the whole bundle; a graph carrying \
-                         both cannot lower one attention without mislowering the other, so this \
-                         refuses instead of choosing."
-                    )));
-                }
-            }
-            // `found` and `first_in_weights` are set in the same arm and never apart.
-            (Some(_), None) => unreachable!("first_in_weights tracks found"),
+        if found.is_none() {
+            found = Some((t, rows));
         }
     }
     let oproj = oproj_edges(ir)?;
@@ -785,12 +643,6 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
     let headmajor_handoff = one_request_decode && oproj.geometry_applies;
     Ok(Some(crate::ktir_superdsc_door::BundleAttnParams {
         rows_are_requests,
-        // ⭐ GATHERED AT THE BATCHED RUNGS (per page) AND AT A CHUNKED ONE-REQUEST RUNG — never a
-        // one-request body on the per-page gather, whose per-row mask read the broadcast staging
-        // cannot feed (see `BundleAttnParams::gathers_kv`).
-        gathers_kv: rows_are_requests || chunk_pages.is_some(),
-        chunk_pages,
-        scale_in_weights: first_in_weights.unwrap_or(false),
         headmajor_handoff,
         // The CANONICAL o_proj — the first edge's weight, the rolled body's layer-0
         // representative. `Some` whenever the dataflow found the o matmul, whatever the
@@ -1094,8 +946,7 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // layer boundary to split the weight segment on. An empty map is what tells the layout that
     // banking is not expressible here, leaving the tail spill as the only lever (`&Default::default()`
     // rather than a bool, so there is one spelling of "the layer structure" and not two).
-    let bundle_layout =
-        compute_bundle_layout(ir, weight_ids, rows_are_requests, rows_are_requests, &[])?;
+    let bundle_layout = compute_bundle_layout(ir, weight_ids, rows_are_requests, &[])?;
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(ir.nodes.len());
     // Collect EVERY distinct unhandled op kind (the full worklist) in one pass —
     // reconnaissance, not a silent skip: a non-empty set is a HARD error so a
@@ -1166,7 +1017,7 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
     // restructure is a rolled-body fact — see the codegen's `unrolled_params`, the same seal on the
     // bake's cardless arm. `one_request_decode` is false for the same reason: the unrolled body is
     // never the bake the fact names.
-    let mut attn_params = attn_bundle_params(ir, rows_are_requests, false, None)?;
+    let mut attn_params = attn_bundle_params(ir, rows_are_requests, false)?;
     if let Some(p) = attn_params.as_mut() {
         p.headmajor_handoff = false;
     }
@@ -1495,9 +1346,6 @@ pub struct RungFacts {
     /// The decode ladder's ONE-REQUEST rung — see [`attn_bundle_params`]. The `#[forward]`
     /// emission states it as `!is_prefill && decode_rows == 1 && seq_sym.is_none()`.
     pub one_request: bool,
-    /// The split-KV chunk this rung bakes — see `BundleAttnParams::chunk_pages` (a
-    /// one-request or prompt-chunk rung; `None` for the whole-cap rungs).
-    pub chunk_pages: Option<u32>,
 }
 
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`
@@ -1517,20 +1365,20 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     active_cap: ActiveCap,
     // See main's `lower_attn_node`. Prefill callers pass false.
     rows_are_requests: bool,
-    // The rung's own facts — the one-request flag, the chunk it bakes, and the
-    // composite argmax's tie token. See [`RungFacts`].
+    // The rung's own facts — the one-request flag. See [`RungFacts`].
     rung: RungFacts,
 ) -> Result<RolledSuperDsc, SuperDscError> {
     use scratchy_subtile::subtile_tape::{ComputeInput, Instr, LoopBound};
     let RungFacts {
         one_request: one_request_decode,
-        chunk_pages,
     } = rung;
     let _pc = crate::pc::Pc::start("producer");
-    // ⭐ THE CHUNK THIS GRAPH'S EVERY ATTENTION CLASS CAN EXPRESS, decided ONCE for both of its
-    // consumers — the index placement (`compute_bundle_layout`'s `gathers_kv`) and the door's
-    // `BundleAttnParams` — so an index is reserved exactly where a chunk gathers through it.
-    let chunk_pages = admitted_chunk(ir, chunk_pages);
+    // ⛔⭐ THE ADDRESSING LOCKDOWN RUNS FIRST — the same graph-half sweep
+    // `lower_graph_to_ktir` states for the unrolled walk, run here for the tape's
+    // re-rolled one: the whole graph's index→address compositions proven BEFORE the
+    // segment walk mints a program. One implementation (the splice's `addressing`
+    // module), two bake heads.
+    scratchy_triton_splice::addressing::verify_addressing(ir).map_err(SuperDscError)?;
     // ⛔ THE `set_rows_are_requests` / `RestoreRar` DANCE IS DELETED. It pushed the row KIND into a
     // thread-local for the duration of one bundle's lowering, with a `Drop` guard to restore it, purely
     // so the matmul splitter would not need the fact in its signature. That made the kind ambient: no
@@ -1556,10 +1404,6 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         ir,
         weight_ids,
         rows_are_requests,
-        // The SAME fact `attn_bundle_params` mints `BundleAttnParams::gathers_kv` from — the batched
-        // rungs' per-page gather, or a chunked one-request rung — so the index placement and the
-        // emitter's admission are one predicate.
-        rows_are_requests || chunk_pages.is_some(),
         &per_layer_ext,
     )?;
     // ── THE TAPE'S SEGMENTS: prefix, ONE RANGE PER LOOP (an attention class's body), suffix ──
@@ -2072,7 +1916,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // throwaways because only the layout is wanted; the descriptors are dropped.
     // The SAME four facts the real consumer pass is handed — read once here, off the graph's own
     // `AttnDecode` nodes and this walk's own parameters. See [`attn_bundle_params`].
-    let attn_params = attn_bundle_params(ir, rows_are_requests, one_request_decode, chunk_pages)?;
+    let attn_params = attn_bundle_params(ir, rows_are_requests, one_request_decode)?;
     // The declare pass walks prefix → EVERY body → suffix, the same order the tape walk
     // declared them in, so every synthetic's first-one-wins offset is fixed identically.
     let body_op_lists: Vec<&Vec<EmittedOp>> = bodies.iter().map(|b| &b.ops).collect();
@@ -3221,236 +3065,6 @@ mod attn_scale_weight_fold_tests {
         );
     }
 
-    /// ⭐ THE UNIT SCALE IS THE FOLD'S OTHER WAY TO A MULTIPLIER-LESS PROGRAM. The gemma-4 arch
-    /// defaults `attention_multiplier` to 1.0, the fold correctly multiplies nothing (`√1.0`),
-    /// and the splice mints at 1.0 — which the triton→ktir pipeline folds away entirely, so the
-    /// program TRUTHFULLY states no multiplier and lands in the door's skip arm. The bundle fact
-    /// must state that case too, or the first unit-scale model is a build error at the very door
-    /// whose skip arm is its correct lowering (tiny26's bake, 2026-10-10).
-    #[test]
-    fn a_unit_scale_attention_carries_the_door_fact() {
-        let ir = attn_graph(1.0, false, false, false, false, false);
-        let p = attn_bundle_params(&ir, false, false, None)
-            .expect("the bundle states its attention params")
-            .expect("the graph has an attention node");
-        assert!(
-            p.scale_in_weights,
-            "a unit scale is carried by the weights trivially — √1.0 — so the program states \
-             no multiplier and the door must take the skip arm"
-        );
-    }
-
-    /// The fold's own case keeps the same fact: √scale went into W_q/W_k at load, so the node is
-    /// rewritten to 1.0 where it is lowered and the program states no multiplier — at an
-    /// UP-multiplier (√4.0 = 2.0), the f16 floor gate's permitted class.
-    #[test]
-    fn a_folded_attention_carries_the_door_fact() {
-        let ir = attn_graph(4.0, false, false, false, false, false);
-        let p = attn_bundle_params(&ir, false, false, None)
-            .expect("the bundle states its attention params")
-            .expect("the graph has an attention node");
-        assert!(
-            p.scale_in_weights,
-            "the fold puts √scale into W_q/W_k — no device multiply is left to state"
-        );
-    }
-
-    /// A scale the fold refused STRUCTURALLY (here: an unroped query — the gate permits the
-    /// up-multiplier, so the refusal is the chain's own) must state its multiplier in the
-    /// program — the weights carry none of it, so the door fact stays false.
-    #[test]
-    fn an_unfolded_real_scale_states_no_door_fact() {
-        let ir = attn_graph(4.0, true, false, false, false, false);
-        let p = attn_bundle_params(&ir, false, false, None)
-            .expect("the bundle states its attention params")
-            .expect("the graph has an attention node");
-        assert!(
-            !p.scale_in_weights,
-            "an unfolded node at a real scale must have its multiplier stated by the program"
-        );
-    }
-
-    /// Two INDEPENDENT attention chains over one hidden — the disagreement fixture: each chain is
-    /// `attn_graph`'s own (q projection → rope, k projection → rope_append writing its own paged
-    /// cache, attention), with its own sources throughout, so the only facts the two
-    /// `AttnDecode` nodes differ on are the ones handed in (the scales, and whether the second
-    /// chain's query is roped — its foldability lever).
-    fn two_attn_graph(a_scale: f32, b_scale: f32, b_unroped: bool) -> SubtileIR {
-        let geom = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
-            scratchy_subtile::model_geometry::QueryHeads::new(2),
-            scratchy_subtile::model_geometry::KvHeads::new(1),
-            scratchy_subtile::model_geometry::HeadDim::new(8),
-        )
-        .expect("2 query heads over 1 kv head, head_dim 8, mints");
-        let hd = scratchy_subtile::model_geometry::HeadDim::new(8);
-        let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
-        let sources = vec![
-            shape(1, 8),  // 0: x (hidden 8)
-            shape(8, 16), // 1: W_q (chain A)
-            shape(8, 8),  // 2: W_k (chain A)
-            shape(1, 8),  // 3: v (chain A)
-            shape(32, 8), // 4: prefix_k cache (A)
-            shape(32, 8), // 5: prefix_v cache (A)
-            shape(1, 16), // 6: cos (A)
-            shape(1, 16), // 7: sin (A)
-            shape(8, 16), // 8: W_q (chain B)
-            shape(8, 8),  // 9: W_k (chain B)
-            shape(1, 8),  // 10: v (chain B)
-            shape(32, 8), // 11: prefix_k cache (B)
-            shape(32, 8), // 12: prefix_v cache (B)
-            shape(1, 16), // 13: cos (B)
-            shape(1, 16), // 14: sin (B)
-        ];
-        let b_q_ref = if b_unroped {
-            InputRef::Op(5)
-        } else {
-            InputRef::Op(6)
-        };
-        let ops = vec![
-            // 0: q_a = x · W_q_a; 1: q_a_rot = rope_rotate(q_a, cos_a, sin_a)
-            OpDesc {
-                op: SubOp::MatmulTile {
-                    n: 16,
-                    weight: GemmWeight::Dense,
-                },
-                m: 1,
-                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
-            },
-            OpDesc {
-                op: SubOp::rope_rotate(hd),
-                m: 1,
-                inputs: vec![InputRef::Op(0), InputRef::Ext(6), InputRef::Ext(7)],
-            },
-            // 2: k_a = x · W_k_a; 3: k_a_rot = rope_append(k_a, cos_a, sin_a, v_a, caches)
-            OpDesc {
-                op: SubOp::MatmulTile {
-                    n: 8,
-                    weight: GemmWeight::Dense,
-                },
-                m: 1,
-                inputs: vec![InputRef::Ext(0), InputRef::Ext(2)],
-            },
-            OpDesc {
-                op: SubOp::rope_append(
-                    hd,
-                    0,
-                    scratchy_subtile::subtile_ir::AttnMask::Causal,
-                    scratchy_subtile::subtile_ir::RopeFormTag::NeoX,
-                ),
-                m: 1,
-                inputs: vec![
-                    InputRef::Op(2),
-                    InputRef::Ext(6),
-                    InputRef::Ext(7),
-                    InputRef::Ext(3),
-                    InputRef::Ext(4),
-                    InputRef::Ext(5),
-                ],
-            },
-            // 4: attn_a = AttnDecode(q_a_rot, prefix_k_a, prefix_v_a, k_a_rot, v_a) at a_scale
-            OpDesc {
-                op: SubOp::attn_decode(
-                    geom,
-                    a_scale,
-                    33,
-                    scratchy_subtile::subtile_ir::AttnMask::Causal,
-                ),
-                m: 1,
-                inputs: vec![
-                    InputRef::Op(1),
-                    InputRef::Ext(4),
-                    InputRef::Ext(5),
-                    InputRef::Op(3),
-                    InputRef::Ext(3),
-                ],
-            },
-            // 5: q_b = x · W_q_b; 6: q_b_rot = rope_rotate(q_b, cos_b, sin_b)
-            OpDesc {
-                op: SubOp::MatmulTile {
-                    n: 16,
-                    weight: GemmWeight::Dense,
-                },
-                m: 1,
-                inputs: vec![InputRef::Ext(0), InputRef::Ext(8)],
-            },
-            OpDesc {
-                op: SubOp::rope_rotate(hd),
-                m: 1,
-                inputs: vec![InputRef::Op(5), InputRef::Ext(13), InputRef::Ext(14)],
-            },
-            // 7: k_b = x · W_k_b; 8: k_b_rot = rope_append(k_b, cos_b, sin_b, v_b, caches)
-            OpDesc {
-                op: SubOp::MatmulTile {
-                    n: 8,
-                    weight: GemmWeight::Dense,
-                },
-                m: 1,
-                inputs: vec![InputRef::Ext(0), InputRef::Ext(9)],
-            },
-            OpDesc {
-                op: SubOp::rope_append(
-                    hd,
-                    0,
-                    scratchy_subtile::subtile_ir::AttnMask::Causal,
-                    scratchy_subtile::subtile_ir::RopeFormTag::NeoX,
-                ),
-                m: 1,
-                inputs: vec![
-                    InputRef::Op(7),
-                    InputRef::Ext(13),
-                    InputRef::Ext(14),
-                    InputRef::Ext(10),
-                    InputRef::Ext(11),
-                    InputRef::Ext(12),
-                ],
-            },
-            // 9: attn_b = AttnDecode(b_q_ref, prefix_k_b, prefix_v_b, k_b_rot, v_b) at b_scale
-            OpDesc {
-                op: SubOp::attn_decode(
-                    geom,
-                    b_scale,
-                    33,
-                    scratchy_subtile::subtile_ir::AttnMask::Causal,
-                ),
-                m: 1,
-                inputs: vec![
-                    b_q_ref,
-                    InputRef::Ext(11),
-                    InputRef::Ext(12),
-                    InputRef::Op(8),
-                    InputRef::Ext(10),
-                ],
-            },
-        ];
-        let input = LoweringInput {
-            sources,
-            ops,
-            result: 9,
-            exported: None,
-        };
-        let nb = std::num::NonZeroU32::new(8192).expect("8192 != 0");
-        scratchy_subtile::subtile_ir::lower_region(&input, nb)
-    }
-
-    /// ⭐ THE DISAGREEMENT, WIDENED: one graph whose attentions disagree about WHERE the score
-    /// scale lives — one carries it in its staged weights (here: a unit multiplier), the other
-    /// states a device score multiply — is a build error at the recognition, naming both nodes,
-    /// because the door takes ONE such fact per bundle and either choice mislowers one layer.
-    #[test]
-    fn a_graph_mixing_in_weights_and_stated_scales_refuses_to_choose() {
-        let ir = two_attn_graph(1.0, 4.0, true);
-        let err = attn_bundle_params(&ir, false, false, None).expect_err("a mixed graph refuses");
-        assert!(
-            err.0
-                .contains("carries its attention scale in its staged weights"),
-            "the refusal names the in-weights side: {err:?}"
-        );
-        assert!(
-            err.0.contains("states a device score multiply"),
-            "the refusal names the stated side: {err:?}"
-        );
-    }
-
     /// Two attention chains at DIFFERENT geometries — hd 128 beside hd 256, the gemma-4
     /// sliding/global shape scaled to fixture size — each closed by an fp8 W8A8 o projection
     /// (`attn → o_proj`, the one clean consumer the edge walk demands). Every term of
@@ -3617,7 +3231,7 @@ mod attn_scale_weight_fold_tests {
     #[test]
     fn a_hybrid_geometry_model_keeps_the_shipped_finalize() {
         let ir = two_class_fp8_oproj_graph();
-        let p = attn_bundle_params(&ir, false, true, None)
+        let p = attn_bundle_params(&ir, false, true)
             .expect("a mixed-geometry model is not a refusal — it keeps the shipped emission")
             .expect("the graph has attention nodes");
         assert!(
@@ -3759,7 +3373,6 @@ mod attn_scale_weight_fold_tests {
         let layout = crate::lower_subtile_tape_to_superdsc::compute_bundle_layout(
             &ir,
             &weight_ids,
-            false,
             false,
             &[],
         )

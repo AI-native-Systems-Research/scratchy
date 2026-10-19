@@ -56,7 +56,7 @@ fn spliced_rmsnorm_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles the kernel for this node. Every width is
@@ -106,7 +106,7 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
         // collected the convention's own 1.0 alongside the epsilon, or the door's
         // slot lookup fails as a registry desync (the test's own control on the
         // wiring, not an assertion here: the door refuses below).
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
         assert!(
             layout
@@ -171,7 +171,7 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
         // push is gated on the node's own convention, so a Scale-only model's
         // registry is byte-identical to the form before the row existed.
         let scale_ir = rmsnorm_ir(m, c, GainConvention::Scale);
-        let scale_layout = compute_bundle_layout(&scale_ir, &weight_ids, false, false, &[])
+        let scale_layout = compute_bundle_layout(&scale_ir, &weight_ids, false, &[])
             .unwrap_or_else(|e| panic!("scale layout minted m={m} c={c}: {e}"));
         assert!(
             !scale_layout
@@ -228,7 +228,7 @@ fn spliced_silumul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles the kernel for this node, at EVERY rung: a
@@ -314,7 +314,7 @@ fn a_column_chunked_silumul_splices_through_the_door() {
     chunked.nodes[0].output = window(2);
 
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-    let layout = compute_bundle_layout(&chunked, &weight_ids, false, false, &[])
+    let layout = compute_bundle_layout(&chunked, &weight_ids, false, &[])
         .unwrap_or_else(|e| panic!("layout minted for the chunked node: {e}"));
 
     // The splice — the chunked node compiles (the kernels state `C_START`).
@@ -399,7 +399,7 @@ fn spliced_elementwise_lowers_through_the_door() {
             let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
             // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+            let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
                 .unwrap_or_else(|e| panic!("layout minted {kind:?} m={m} c={c}: {e}"));
 
             // The splice — the row compiles the kernel for this node at every
@@ -502,7 +502,7 @@ fn spliced_dense_matmul_lowers_through_the_door() {
 
         // The layout the tape walk computes for this graph (`rows_are_requests:
         // true` is the decode/batched shape).
-        let layout = compute_bundle_layout(&ir, &weight_ids, true, true, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, true, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
         // The splice — the row compiles the kernel for this node.
@@ -845,7 +845,7 @@ fn spliced_scalarmul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles `scalarmul.py` for this node.
@@ -894,7 +894,7 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
     let scale = 0.022_097_087f32;
     let ir = scalarmul_ir(1, LOGITS_COLS, scale);
     let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
-    let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+    let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
         .unwrap_or_else(|e| panic!("layout minted for the chunked logits: {e}"));
 
     // ONE symbol counter across the bundle, the way the bake threads it — chunk k's
@@ -1161,7 +1161,7 @@ fn batched_decode_odd_vocab_lm_head_splices() {
     let ir = matmul_ir(m, k, n);
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
-    let layout = compute_bundle_layout(&ir, &weight_ids, true, true, &[])
+    let layout = compute_bundle_layout(&ir, &weight_ids, true, &[])
         .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
     // The splice — the odd vocab must compile at ANY row count (PlanCorelets'
@@ -1210,7 +1210,7 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
     for &(mq, k, n) in &[(31u32, 2048u32, 49_155u32), (8u32, 2048u32, 49_155u32)] {
         let ir = matmul_ir(mq, k, n);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
             .unwrap_or_else(|e| panic!("layout minted mq={mq} k={k} n={n}: {e}"));
 
         // The splice — `lower_all` takes the fold route for this shape.
@@ -1272,7 +1272,7 @@ fn spliced_fp8_matmul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, true, true, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, true, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
         // The splice — the Fp8Dynamic row compiles the kernel for this node.
@@ -1549,7 +1549,6 @@ fn spliced_rope_lowers_through_the_door() {
                 &ir,
                 &weight_ids,
                 rows_are_requests,
-                rows_are_requests,
                 &[],
             )
             .unwrap_or_else(|e| {
@@ -1578,14 +1577,6 @@ fn spliced_rope_lowers_through_the_door() {
             // per-bundle geometry exists to state here).
             let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
                 rows_are_requests,
-                // The production mint's value for a batched-shape fixture with no one-request
-                // rung to widen it: the gather follows the row kind here.
-                gathers_kv: rows_are_requests,
-                chunk_pages: None,
-                // Not in weights: this fixture's q/k are Ext sources with no projection
-                // matmuls, so the program states its real scale and the door emits the score
-                // multiplies.
-                scale_in_weights: false,
                 // No handoff: this fixture's rope program has no o matmul at all, and a stated
                 // handoff without one is the door's own refusal.
                 headmajor_handoff: false,
@@ -1688,472 +1679,6 @@ fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
         nodes: vec![node],
         result: TensorId::from_index(3),
         op_output: Vec::new(),
-    }
-}
-
-// ══════════════════════════════════════════════════════════════════════════════════════════════
-// THE ATTENTION GOLDEN
-// ══════════════════════════════════════════════════════════════════════════════════════════════
-
-/// One attention shape the golden compares: everything the spliced `attn.py` derives its program
-/// from — geometry, rung, cache producer — so a shape here is one (arm × geometry × rung ×
-/// producer) cell of the delivery scope.
-#[derive(Clone, Copy)]
-struct AttnShape {
-    /// (nqh, nkvh, hd) — granite 2b is 32/8/64, 8b is 32/8/128.
-    geom: (u32, u32, u32),
-    /// Query rows: 1 = decode; >1 = a prefill chunk.
-    mq: u32,
-    /// The resident cache TENSOR's row extent (`cap`).
-    cap: u32,
-    /// The swept rung the bundle was baked for (`ActiveCap`, raw — 0 = FULL, u32::MAX = NONE).
-    rung: u32,
-    /// The cache's producer: `true` = `SameForwardRopeAppend` (the masked prefix law — read
-    /// from row 0 to `swept.min(cache tensor rows)`, runtime length mask), `false` =
-    /// `PrePopulatedExt` (read at the region's own rows and corner).
-    rope_appended: bool,
-}
-
-impl AttnShape {
-    fn active_cap(self) -> ktir_superdsc::ktir_node::ActiveCap {
-        ktir_superdsc::ktir_node::ActiveCap::new(self.rung)
-    }
-}
-
-/// The attention shapes that matter for the delivery scope — granite 2b/8b, every arm of the
-/// attention splice's own split, both cache producers, and the rungs the bake iterates.
-///
-/// ⛔ THE CAP IS THE RESIDENT CACHE'S, WHICH PRODUCTION CAPS AT ONE PAGE. The bake's prefix
-/// capacity is `min(max_position_embeddings, 256)` (`codegen.rs`'s `prefix_cap_default`), and the
-/// door's mask-block law refuses any sweep past `PAGE_MASK_COLS = 256` — one fold pass is one
-/// page, so a pass that swept further would read the NEXT page's validity rows. Every shape here
-/// keeps `swept <= cap <= 256`, exactly what every production bake satisfies by construction:
-///
-/// * decode (`mq == 1`, rope-appended — the MASKED prefix): `ActiveCap::FULL` (sweep the whole
-///   cache tensor = one page) and the interior ladder rungs `decode_ladder(256)` bakes — 64, 128;
-/// * decode, PRE-POPULATED producer (the emulator's host-threaded cache): the prefix is read at
-///   its own region rows — a different tile shape and no runtime mask;
-/// * prefill ONE-PASS (`ActiveCap::NONE`, `mq > 1`, new block == the whole chunk): the dead
-///   prefix's injected views + the additive `[mq, mq]` causal triangle — 2b at the m=31 rung and
-///   8b at the m=96 rung (the rung the card bakes), plus the ladder's own bottom rung m=7 and
-///   the descriptor-law boundary m=8: below 8 the triangle is unstated through any descriptor
-///   (a 7-wide f16 block is 14 bytes, under Triton's 16-byte floor) and the shape takes the
-///   per-row arm; at 8 it stays one-pass;
-/// * prefill CONTINUATION (`swept > 0`, `mq > 1`): per-row causal `qi+1` tiles over the new
-///   block beside the swept prefix, at `ActiveCap::FULL` — the prefix-capable bundle's own bake.
-const ATTN_SHAPES: &[AttnShape] = &[
-    // 2b decode, rope-appended, FULL sweep (the whole one-page resident cache).
-    AttnShape {
-        geom: (32, 8, 64),
-        mq: 1,
-        cap: 256,
-        rung: 0,
-        rope_appended: true,
-    },
-    // 2b decode, rope-appended, the interior ladder rungs `decode_ladder(256)` bakes.
-    AttnShape {
-        geom: (32, 8, 64),
-        mq: 1,
-        cap: 256,
-        rung: 64,
-        rope_appended: true,
-    },
-    AttnShape {
-        geom: (32, 8, 64),
-        mq: 1,
-        cap: 256,
-        rung: 128,
-        rope_appended: true,
-    },
-    // 2b decode, PRE-POPULATED cache (the emulator path).
-    AttnShape {
-        geom: (32, 8, 64),
-        mq: 1,
-        cap: 256,
-        rung: 0,
-        rope_appended: false,
-    },
-    // 8b decode (hd 128), rope-appended, FULL + one interior rung.
-    AttnShape {
-        geom: (32, 8, 128),
-        mq: 1,
-        cap: 256,
-        rung: 0,
-        rope_appended: true,
-    },
-    AttnShape {
-        geom: (32, 8, 128),
-        mq: 1,
-        cap: 256,
-        rung: 128,
-        rope_appended: true,
-    },
-    // 2b prefill ONE-PASS: first chunk, no prefix, m=31 rung.
-    AttnShape {
-        geom: (32, 8, 64),
-        mq: 31,
-        cap: 256,
-        rung: u32::MAX,
-        rope_appended: true,
-    },
-    // 2b prefill, the ladder's OWN BOTTOM RUNG: m=7. The one-pass arm's causal
-    // triangle is a `[7, 7]` f16 ADD, and Triton's descriptor law demands 16 bytes in
-    // the last block dim (7 * 2 = 14 < 16) — so this shape MUST take the per-row
-    // continuation arm, which states causality by `qi + 1` slice and binds NO mask.
-    // The card bake's first rung is exactly this shape; a regression to the one-pass
-    // arm here is the build-time refusal the ladder law below exists to make a test
-    // failure instead.
-    AttnShape {
-        geom: (32, 8, 64),
-        mq: 7,
-        cap: 256,
-        rung: u32::MAX,
-        rope_appended: true,
-    },
-    // The descriptor law's own boundary: MQ=8 (8 * 2 = 16 bytes) is the FLOOR the
-    // one-pass arm accepts, and must stay on it — not fall through to the per-row
-    // arm — so the boundary is pinned from both sides.
-    AttnShape {
-        geom: (32, 8, 64),
-        mq: 8,
-        cap: 256,
-        rung: u32::MAX,
-        rope_appended: true,
-    },
-    // 8b prefill ONE-PASS at the card's own m=96 rung.
-    AttnShape {
-        geom: (32, 8, 128),
-        mq: 96,
-        cap: 256,
-        rung: u32::MAX,
-        rope_appended: true,
-    },
-    // 2b prefill CONTINUATION: the full one-page swept prefix + causal new block — the
-    // prefix-capable bundle's own bake (`ActiveCap::FULL`, the widest rung).
-    AttnShape {
-        geom: (32, 8, 64),
-        mq: 31,
-        cap: 256,
-        rung: 0,
-        rope_appended: true,
-    },
-    // 8b prefill CONTINUATION.
-    AttnShape {
-        geom: (32, 8, 128),
-        mq: 96,
-        cap: 256,
-        rung: 0,
-        rope_appended: true,
-    },
-];
-
-/// The attention fixture's decode-position model: how many positions the mask says are valid
-/// this step (`= decode_position + 1`). For a rope-appended cache the prefix segment is
-/// `valid_len - 1` rows (the new row arrives through the separate new-k/new-v segments); for a
-/// pre-populated cache the whole region is valid. 33 keeps the rope-appended prefix region
-/// non-degenerate (`lower_region` slices it to 32 rows).
-const ATTN_VALID_LEN: u32 = 33;
-
-/// One attention node (plus its RopeAppend producer when the shape wants one) as a
-/// `lower_region`-bound `SubtileIR` — the ONLY construction that can mint the Tiled stage's
-/// `KvCacheLayout`/`KvCacheProducer`/`SoftmaxStateId` witnesses, because their constructors are
-/// `pub(crate)`.
-///
-/// The graph mirrors `to_wavefront`'s production binding exactly (`fixtures.rs`'s decode layer):
-/// `[q, Ext(pk), Ext(pv), k, v]` for the attention, and — when `rope_appended` — a `RopeAppend`
-/// op before it writing the SAME cache sources, which is what makes `lower_region` bind
-/// `KvCacheProducer::SameForwardRopeAppend` (its `k_cache_producer_node` map). `valid_len`
-/// rides the op (`SubOp::attn_decode`'s own field) at the value production threads.
-fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
-    let (nqh, nkvh, hd) = s.geom;
-    let q_width = nqh * hd;
-    let kv_width = nkvh * hd;
-    let mq = s.mq;
-    // The pre-populated prefix's own region rows (the emulator-threaded extent main's
-    // builder read directly); the rope-appended one is sliced by `lower_region` below.
-    const PREPOP_ROWS: u32 = 32;
-    let valid_len = ATTN_VALID_LEN;
-    // The new block's rows: at decode the one new row; at prefill the chunk's own `mq` rows
-    // (the one-pass condition `seq_len == mq`).
-    let new_len = if mq > 1 { mq } else { 1 };
-    // Sources: q, the two caches (TENSOR rows = `cache_rows` — the capacity the door reads back
-    // off the view), new_k, new_v, cos, sin.
-    let sources = |cache_rows: u32| {
-        vec![
-            scratchy_subtile::subtile_ir::SourceShape {
-                rows: mq,
-                cols: q_width,
-            }, // 0: q
-            scratchy_subtile::subtile_ir::SourceShape {
-                rows: cache_rows,
-                cols: kv_width,
-            }, // 1: prefix_k
-            scratchy_subtile::subtile_ir::SourceShape {
-                rows: cache_rows,
-                cols: kv_width,
-            }, // 2: prefix_v
-            scratchy_subtile::subtile_ir::SourceShape {
-                rows: new_len,
-                cols: kv_width,
-            }, // 3: new_k
-            scratchy_subtile::subtile_ir::SourceShape {
-                rows: new_len,
-                cols: kv_width,
-            }, // 4: new_v
-            scratchy_subtile::subtile_ir::SourceShape {
-                rows: mq,
-                cols: q_width,
-            }, // 5: cos
-            scratchy_subtile::subtile_ir::SourceShape {
-                rows: mq,
-                cols: q_width,
-            }, // 6: sin
-        ]
-    };
-    // The attention op desc. The prefix region binding comes from `lower_region`'s own slice
-    // law; `valid_len` is threaded as production threads it.
-    let attn_op = scratchy_subtile::lower::OpDesc {
-        op: scratchy_subtile::subtile_ir::SubOp::attn_decode(
-            attn_geometry(s.geom).expect("granite's geometry mints"),
-            scale,
-            valid_len,
-            scratchy_subtile::subtile_ir::AttnMask::Causal,
-        ),
-        m: mq,
-        inputs: vec![
-            scratchy_subtile::lower::InputRef::Ext(0),
-            scratchy_subtile::lower::InputRef::Ext(1),
-            scratchy_subtile::lower::InputRef::Ext(2),
-            scratchy_subtile::lower::InputRef::Ext(3),
-            scratchy_subtile::lower::InputRef::Ext(4),
-        ],
-    };
-    let nb = std::num::NonZeroU32::new(8192).expect("8192 != 0");
-    if s.rope_appended {
-        // The rope-appended cache: the K-side rope_append — rotate new_k and write it (with
-        // new_v) into the cache sources 1/2. THIS op is what binds SameForwardRopeAppend for
-        // the attention below (`k_cache_producer_node`). The cache SOURCES are declared at the
-        // full `cap` rows — the capacity the door reads — while `lower_region` slices the
-        // attention's prefix REGION to `valid_len - 1` (the door's masked-segment read is
-        // `swept.min(tensor rows)`; the region's rows never bound it).
-        let input = scratchy_subtile::lower::LoweringInput {
-            sources: sources(s.cap),
-            ops: vec![
-                // 0: k' = rope_append(k, cos, sin, v, prefix_k, prefix_v)
-                scratchy_subtile::lower::OpDesc {
-                    op: scratchy_subtile::subtile_ir::SubOp::rope_append(
-                        scratchy_subtile::model_geometry::HeadDim::new(hd),
-                        0,
-                        scratchy_subtile::subtile_ir::AttnMask::Causal,
-                        scratchy_subtile::subtile_ir::RopeFormTag::NeoX,
-                    ),
-                    m: new_len,
-                    inputs: vec![
-                        scratchy_subtile::lower::InputRef::Ext(3),
-                        scratchy_subtile::lower::InputRef::Ext(5),
-                        scratchy_subtile::lower::InputRef::Ext(6),
-                        scratchy_subtile::lower::InputRef::Ext(4),
-                        scratchy_subtile::lower::InputRef::Ext(1),
-                        scratchy_subtile::lower::InputRef::Ext(2),
-                    ],
-                },
-                // 1: attn = AttnDecode(q, prefix_k, prefix_v, new_k, new_v)
-                attn_op,
-            ],
-            result: 1,
-            exported: None,
-        };
-        scratchy_subtile::subtile_ir::lower_region(&input, nb)
-    } else {
-        // The pre-populated shape: no rope op in scope (the map stays empty and `lower_region`
-        // binds PrePopulatedExt), the caches declared at the emulator's threaded extent.
-        let input = scratchy_subtile::lower::LoweringInput {
-            sources: sources(PREPOP_ROWS),
-            ops: vec![attn_op],
-            result: 0,
-            exported: None,
-        };
-        scratchy_subtile::subtile_ir::lower_region(&input, nb)
-    }
-}
-
-/// granite's geometry, through the same mint the config path uses.
-fn attn_geometry(
-    geom: (u32, u32, u32),
-) -> Option<scratchy_subtile::model_geometry::ModelAttnGeometry> {
-    scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
-        scratchy_subtile::model_geometry::QueryHeads::new(geom.0),
-        scratchy_subtile::model_geometry::KvHeads::new(geom.1),
-        scratchy_subtile::model_geometry::HeadDim::new(geom.2),
-    )
-}
-
-/// ⛔ ONE SESSION STAGES ONE LAYOUT — placing the KV block index moves no other staged activation.
-///
-/// The one-request ladder runs per-page bodies that gather nothing under a split-KV chunk ceiling that
-/// gathers, and the host stages every step at the CEILING's placements. Each fixture's attention
-/// registers its scale (and √scale) after the attention's own placements — exactly the tail an index
-/// placed beside the mask used to push down, so that a non-gathering body read its constants out of the
-/// index's bytes. The macro holds every baked rung to `ladder_stages_one_layout`; this holds the layout.
-#[test]
-fn the_kv_block_index_moves_no_other_staged_activation() {
-    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
-        KV_BLOCK_INDEX_TID, ladder_stages_one_layout,
-    };
-    for s in ATTN_SHAPES.iter().filter(|s| s.mq == 1) {
-        let scale = if s.geom.2 == 64 { 0.015625 } else { 0.0078125 };
-        let ir = attn_ir(*s, scale);
-        let weight_ids: HashSet<u32> = HashSet::new();
-        // The one-request rows (`rows_are_requests = false`) at both gather facts: the chunk ceiling's
-        // call and the per-page body's.
-        let layout = |gathers_kv: bool| {
-            compute_bundle_layout(&ir, &weight_ids, false, gathers_kv, &[]).unwrap_or_else(|e| {
-                panic!(
-                    "layout minted geom={:?} gathers_kv={gathers_kv}: {e}",
-                    s.geom
-                )
-            })
-        };
-        let (plain, gathering) = (layout(false), layout(true));
-        assert!(
-            !plain.placements.contains_key(&KV_BLOCK_INDEX_TID),
-            "geom={:?}: a bundle that does not gather placed the index",
-            s.geom
-        );
-        let index = *gathering
-            .placements
-            .get(&KV_BLOCK_INDEX_TID)
-            .unwrap_or_else(|| panic!("geom={:?}: a gathering bundle placed no index", s.geom));
-        ladder_stages_one_layout(&gathering, &plain)
-            .unwrap_or_else(|e| panic!("geom={:?}: {e}", s.geom));
-        let behind: Vec<u32> = gathering
-            .placements
-            .values()
-            .filter(|p| p.segment == index.segment && p.tid != KV_BLOCK_INDEX_TID)
-            .filter(|p| p.role == index.role && p.offset >= index.offset)
-            .map(|p| p.tid)
-            .collect();
-        assert!(
-            behind.is_empty(),
-            "geom={:?}: tensor(s) {behind:?} sit behind the index in its segment — the index must be \
-             the LAST activation, or its presence moves them",
-            s.geom
-        );
-    }
-}
-
-#[test]
-fn spliced_attn_lowers_through_the_door() {
-    for &s in ATTN_SHAPES {
-        // ⛔ ROWS-ARE-REQUESTS IS A DECODE-BUNDLE FACT: the bake states it per
-        // bundle — a decode batch's rows are requests, a prefill chunk's rows are
-        // positions of one sequence. The gate states it the way the bake does:
-        // decode (mq == 1) tries BOTH kinds (the door's GQA-replicate and
-        // kv_block_index arms differ), prefill only `false`.
-        let row_kinds: &[bool] = if s.mq == 1 { &[false, true] } else { &[false] };
-        for &rows_are_requests in row_kinds {
-            // granite's attention_multiplier, the config value (NOT a recomputed 1/sqrt(hd)):
-            // 2b (hd 64) 0.015625, 8b (hd 128) 0.0078125 — the f16-exact ones.
-            let scale = if s.geom.2 == 64 { 0.015625 } else { 0.0078125 };
-            let ir = attn_ir(s, scale);
-            // The weight-id census is EMPTY: every source this fixture declares is an
-            // activation or a KV cache (the layout walk re-places the caches into seg2 itself).
-            let weight_ids: HashSet<u32> = HashSet::new();
-
-            // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout(
-                &ir,
-                &weight_ids,
-                rows_are_requests,
-                rows_are_requests,
-                &[],
-            )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "layout minted geom={:?} mq={} cap={} rung={} r_ar={rows_are_requests}: {e}",
-                    s.geom, s.mq, s.cap, s.rung
-                )
-            });
-            let node = ir.nodes.last().unwrap();
-            let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
-
-            // The splice — `lower_attn` compiles attn.py for this node's geometry and rung.
-            let spliced = scratchy_triton_splice::lower_attn(node, &ir, cap, s.active_cap())
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "splice compiled geom={:?} mq={} rung={} r_ar={rows_are_requests}: {e}",
-                        s.geom, s.mq, s.rung
-                    )
-                });
-
-            // ⛔ THE NAME LAW — `attn_s{id}`.
-            assert_eq!(
-                spliced.op_name,
-                format!("attn_s{}", node.id.index()),
-                "op_name (geom={:?} mq={} rung={})",
-                s.geom,
-                s.mq,
-                s.rung
-            );
-
-            // ⛔ THE ARM THE SHAPE TOOK, PINNED BY THE MASK SLOT — at `rung == NONE`
-            // (a first-chunk prefill, no runtime length mask) every `MQ > 1` shape
-            // takes the causal one-pass arm and binds the `[mq, mq]` triangle (a
-            // mask parameter); the per-row continuation arm states causality by
-            // slice and binds none. The mq=7 row pins the FRONT END'S OWN LAW: the
-            // TMA 16-byte floor was a GPU validation removed from this target, so
-            // the ladder's bottom rung takes the one-pass arm exactly as the
-            // builder's did — a re-introduced floor would flip this row. Decode and
-            // continuation shapes bind the runtime length mask instead, so they are
-            // outside this pin.
-            if s.rung == u32::MAX {
-                let ktir = spliced
-                    .ktir
-                    .as_ref()
-                    .expect("spliced op carries its program");
-                let one_pass_mask = ktir.mask.is_some();
-                let want_one_pass = s.mq > 1;
-                assert_eq!(
-                    one_pass_mask, want_one_pass,
-                    "the arm the causal one-pass condition picked (geom={:?} mq={}): \
-                     the mask slot is bound exactly when the one-pass arm runs",
-                    s.geom, s.mq
-                );
-            }
-
-            // The program lowers through the production door under the walk's own
-            // layout, with the bundle facts stated exactly as the tape walk states
-            // them (`attn_at` reads the swept extent, the scale, the span guard and
-            // the row laws off the program).
-            let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
-                rows_are_requests,
-                // The production mint's value for a batched-shape fixture with no one-request
-                // rung to widen it: the gather follows the row kind here.
-                gathers_kv: rows_are_requests,
-                chunk_pages: None,
-                // Not in weights: same as the rope door's fixture — the program states its real
-                // scale.
-                scale_in_weights: false,
-                // No handoff: this fixture's attention output is the graph RESULT (no o matmul
-                // consumes it), so the dataflow the handoff keys on finds no edge — stated here
-                // exactly as `attn_bundle_params` would state it for such a graph.
-                headmajor_handoff: false,
-                oproj_wtid: None,
-            };
-            let mut sym = 0i64;
-            let _emitted = door_lower(
-                spliced.ktir.as_ref().expect("spliced op carries its program"),
-                &mut sym,
-                Some(&layout),
-                Some(attn_params),
-            )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "spliced program lowered (geom={:?} mq={} rung={} r_ar={rows_are_requests}): {}",
-                    s.geom, s.mq, s.rung, e.message
-                )
-            });
-        }
     }
 }
 
@@ -2301,70 +1826,4 @@ fn rmsnormunit_ir(m: u32, c: u32) -> SubtileIR {
         result: TensorId::from_index(1),
         op_output: Vec::new(),
     }
-}
-
-/// ⛔⛔⛔ A CONTINUATION'S PROGRAM IS FLAT IN ITS ROWS — the whole-chunk form, pinned at the door's own
-/// guard and across row counts. The per-row arm it replaced held `mq` row bodies (granite-2b at 256
-/// rows: 94.7 s to lower; at 512, never finished). Eight times the rows must not grow the program, both
-/// widths must pass the door's guard, and a program that windows its query per row must be refused.
-#[test]
-fn a_continuation_programs_size_does_not_grow_with_its_rows() {
-    let ops_at = |mq: u32| {
-        let s = AttnShape {
-            geom: (32, 8, 64),
-            mq,
-            cap: 256,
-            rung: 0,
-            rope_appended: true,
-        };
-        let ir = attn_ir(s, 0.015625);
-        let node = ir.nodes.last().unwrap();
-        let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
-        let spliced = scratchy_triton_splice::lower_attn(node, &ir, cap, s.active_cap())
-            .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
-        let k = spliced.ktir.expect("spliced op carries its program");
-        assert!(k.mask.is_some(), "mq={mq}: the continuation binds its mask");
-        ktir_superdsc::emit::lower_ktir_to_superdsc::attn_program_is_flat_in_rows(
-            "continuation",
-            &k.func,
-            mq,
-            32,
-        )
-        .unwrap_or_else(|e| panic!("mq={mq}: {}", e.message));
-        k.func.ops_deep().len()
-    };
-    let (small, wide) = (ops_at(31), ops_at(256));
-    assert!(
-        wide <= small,
-        "8x the rows grew the program: 31 rows {small} ops, 256 rows {wide} ops"
-    );
-    // The door's refusal, on a REAL unrolled program: decode windows its query once for each of its 32
-    // heads, so the same program presented as ONE head over two rows windows its query 32 times for
-    // one head — exactly the shape a per-row unroll has, which the guard exists to refuse.
-    let decode = AttnShape {
-        geom: (32, 8, 64),
-        mq: 1,
-        cap: 256,
-        rung: 0,
-        rope_appended: true,
-    };
-    let ir = attn_ir(decode, 0.015625);
-    let node = ir.nodes.last().unwrap();
-    let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
-    let unrolled = scratchy_triton_splice::lower_attn(node, &ir, cap, decode.active_cap())
-        .expect("the decode splice compiles")
-        .ktir
-        .expect("spliced op carries its program");
-    use ktir_superdsc::emit::lower_ktir_to_superdsc::attn_program_is_flat_in_rows;
-    assert!(
-        attn_program_is_flat_in_rows("decode", &unrolled.func, 1, 32).is_ok(),
-        "decode's one row is exempt"
-    );
-    let refused = attn_program_is_flat_in_rows("unrolled", &unrolled.func, 2, 1)
-        .expect_err("32 query windows for one head over two rows must be refused");
-    assert!(
-        refused.message.contains("unrolls per row") && refused.message.contains("2-row"),
-        "names the row count and the cause: {}",
-        refused.message
-    );
 }

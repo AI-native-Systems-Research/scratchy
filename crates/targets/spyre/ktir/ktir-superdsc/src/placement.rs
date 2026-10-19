@@ -392,12 +392,6 @@ pub struct LxAlloc {
     /// Sum of the op-local slot footprints reserved so far — the [`lx_window_fits`] term the
     /// allocator guard and the `lx_form` witness both read (one number, two consults).
     pub op_local_bytes: u64,
-    /// The probability-part pins the chunk form mints BESIDE its gathers — the other
-    /// core-local term of the `lx_form` witness's budget, recorded at the chunk's admission
-    /// ([`BundleLayout::note_chunk_prob_pin_bytes`]) so the baked artifact carries it to the
-    /// host's own `chunk_gather_index_table` read. RECORDED, not bumped: the mint itself bumps
-    /// `next`; this is the number the ADMISSION budgeted, noted so the two arms cannot drift.
-    pub prob_pin_bytes: u64,
     /// The shared slot's start address per footprint class (bytes) — one slot per class,
     /// every op-local pin of that class resolving to the same address ([`LxAlloc::next_down`]).
     pub op_local_slots: std::collections::BTreeMap<u64, u64>,
@@ -423,7 +417,6 @@ impl Default for LxAlloc {
             next: LX_PIN_BASE,
             next_down: LX_PIN_END,
             op_local_bytes: 0,
-            prob_pin_bytes: 0,
             op_local_slots: std::collections::BTreeMap::new(),
             op_local: std::collections::BTreeSet::new(),
             map: std::collections::BTreeMap::new(),
@@ -438,10 +431,8 @@ impl Default for LxAlloc {
 /// regions of the pin window are summed here and nowhere else: core-local chunk pins bump
 /// UP from [`LX_PIN_BASE`], op-local shared slots bump DOWN from [`LX_PIN_END`], and the
 /// window holds exactly when the two never meet. Every guard consults THIS function — the
-/// allocator's per-declaration asserts (below) with the live cursor state, and the
-/// `ChunkScratch::lx_form` admission witness with the chunk's would-be bytes — so the
-/// witness can never admit a form the allocator would refuse: one law, two readers,
-/// zero drift (#645's ruling 4).
+/// allocator's per-declaration asserts (below) with the live cursor state — so no arm of the
+/// emission can admit a form the allocator would refuse: one law, one reader, zero drift.
 pub const fn lx_window_fits(core_local_bytes: u64, op_local_slot_bytes: u64) -> bool {
     LX_PIN_BASE + core_local_bytes + op_local_slot_bytes <= LX_PIN_END
 }
@@ -799,24 +790,6 @@ impl BundleLayout {
     /// quantity through [`lx_window_fits`].
     pub fn lx_op_local_slot_bytes(&self) -> u64 {
         self.lx.borrow().op_local_bytes
-    }
-
-    /// Record the probability-part pins the chunk form mints beside its gathers
-    /// ([`crate::ir::bridge::tiled_op_sdsc_op::attn::chunk_prob_pins`]) — the second core-local
-    /// term of the `lx_form` witness's budget, summed with the gather pins at the chunk's
-    /// admission. Noted so the baked artifact carries the term to the host's own
-    /// `chunk_gather_index_table` read — the bake/host agreement law: the host must refuse
-    /// exactly what the bake refused. REPLACEMENT, not a sum: one bundle mints one attention
-    /// op's probability parts, so re-emitting the same chunk (the declare pass, then the real
-    /// one) notes the same number.
-    pub fn note_chunk_prob_pin_bytes(&self, bytes: u64) {
-        self.lx.borrow_mut().prob_pin_bytes = bytes;
-    }
-
-    /// The recorded probability-part term ([`Self::note_chunk_prob_pin_bytes`]) — `0` for a
-    /// bundle whose chunk form mints none.
-    pub fn lx_prob_pin_bytes(&self) -> u64 {
-        self.lx.borrow().prob_pin_bytes
     }
 
     /// The core-local pin bytes declared so far (the up-cursor's distance from

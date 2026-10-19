@@ -9909,8 +9909,6 @@ fn layout_tokens(
         weight_scale_folds,
         weight_copies,
         kv_request_stride_bytes,
-        lx_op_local_bytes,
-        lx_prob_pin_bytes,
     } = l;
     let segs = segment_bytes
         .iter()
@@ -9937,14 +9935,6 @@ fn layout_tokens(
         quote! { (#from, #to) }
     });
     let krs = proc_macro2::Literal::u64_unsuffixed(*kv_request_stride_bytes);
-    // The rung's op-local LX pin slots — the host's term of the one `lx_window_fits` budget. The
-    // pin PLACEMENTS stay emit-only (compiled sdsc allocates); the SUM is baked here so the host
-    // budgets against the same pins the bake did. Same number for every bundle of the rung.
-    let lxol = proc_macro2::Literal::u64_unsuffixed(*lx_op_local_bytes);
-    // The chunk form's probability-part pins — the host's SECOND core-local term of the same
-    // budget, summed beside the gathers at the bake's `lx_form` admission. 0 for a bundle whose
-    // chunk form mints none.
-    let lxpp = proc_macro2::Literal::u64_unsuffixed(*lx_prob_pin_bytes);
     // The segment budget's verdict, as a variant: every reader matches on it.
     let tail = match weight_tail {
         scratchy_target_spyre::bundle_code::WeightTail::InPlace => {
@@ -9972,8 +9962,6 @@ fn layout_tokens(
             weight_scale_folds: ::std::borrow::Cow::Borrowed(&[#(#folds),*]),
             weight_copies: ::std::borrow::Cow::Borrowed(&[#(#copies),*]),
             kv_request_stride_bytes: #krs,
-            lx_op_local_bytes: #lxol,
-            lx_prob_pin_bytes: #lxpp,
         }
     }
 }
@@ -10835,13 +10823,6 @@ fn dump_wavefront_mega(
                 // one-request rung (it gates the batched-decode emission, and the single-row bake
                 // keeps the shipped values) and is true of rungs the handoff cannot apply to.
                 let one_request = !is_prefill && decode_rows == 1 && seq_sym.is_none();
-                // ⭐ THE PREFIX-CAPABLE PROMPT CHUNK — ONE request's consecutive positions over that
-                // request's resident prefix, the other bake whose rows share ONE history, so its prefix
-                // takes the split-KV chunk too. `FULL` is the continuation bundle; a start==0 rung bakes
-                // `NONE` and has no prefix to attend.
-                let prompt_chunk_prefix = is_prefill
-                    && active_cap
-                        == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL;
                 // ⛔ THE WIRING MUST NOT DESCRIBE A PROGRAM THAT DID NOT SHIP. A prefill
                 // rung whose reroll fails is SKIPPED per the rung contract ("a narrower
                 // rung still covers this width"), but this closure's KTIR emission and
@@ -10972,58 +10953,10 @@ fn dump_wavefront_mega(
                     use scratchy_subtile::subtile_tape::{
                         lower_dag_to_tape, reroll_layer_classes, reroll_subtile_tape,
                     };
-                    // ⭐⭐⭐⭐⭐ THE ONE-REQUEST RUNG ATTENDS ITS WHOLE CONTEXT IN ONE PASS — a split-KV
-                    // chunk (`ChunkScratch`), the reference's decode structure, instead of the
-                    // per-page fold that relaunched once per resident page at ~108 ops a page. The
-                    // ceiling body is the WIDEST chunk; the ladder below bakes the narrower ones.
-                    // Asked of the graph's own geometry (`admitted_chunk`): a model the chunk cannot
-                    // express (a head dim past one page's stick blocks, see `ChunkScratch`) keeps its
-                    // per-page fold AND its sweep ladder.
-                    //
-                    // ⛔ AND ONLY ON THE CARD — the chunk ladder is a card feature, like the prefill
-                    // width ladder. The one reader of its rungs is `superdsc_exec`'s selector, which
-                    // compiles under `spyre-hw` alone, and off-card no launch group carries the
-                    // `page_fold` the fallback proof reads (`emitted_bundle_folds`), so an emulator
-                    // ladder with a chunk in it cannot prove a fallback and its bake panics:
-                    // granite-8b under `spyre-emu` did, the moment hd=128 was admitted. Off-card the
-                    // body stays the per-page fold, as it was.
-                    //
-                    // ⭐⭐⭐ AND A DECODE BATCH RUNG ATTENDS EVERY REQUEST's CONTEXT IN ONE PASS TOO: one
-                    // chunk holding the requests' pages end to end, each row masked to its own run
-                    // (`BatchChunk`). Its ladder is `B × J` pages (`ChunkScratch::ladder_for`), so its
-                    // ceiling is the widest `B × J` within `PAGES_MAX` — and past it the per-page fold
-                    // keeps serving, as the fallback proof below requires.
-                    let batch_rows = !is_prefill && decode_rows > 1 && seq_sym.is_none();
-                    // The requests a chunk's rows are: the batch width, or ONE for a body whose rows
-                    // share a history (the one-request decode, a prompt chunk's positions).
-                    let chunk_requests = if batch_rows { decode_rows } else { 1 };
-                    let chunk_ladder: Vec<u32> = if cfg!(feature = "spyre-hw")
-                        && (one_request || prompt_chunk_prefix || batch_rows)
-                    {
-                        scratchy_target_spyre::lower_subtile_tape_to_ktir::admitted_chunk_ladder(
-                            &krg,
-                            chunk_requests,
-                        )
-                    } else {
-                        Vec::new()
-                    };
-                    let chunk_ceiling: Option<u32> = chunk_ladder.last().copied();
-                    // A chunk rung's swept extent PER REQUEST — what `select_body` compares the live
-                    // context against. The whole chunk at one request; `J` pages for a batch.
-                    let chunk_swept = |pages: u32| -> u32 {
-                        scratchy_target_spyre::lower_subtile_tape_to_ktir::chunk_swept_per_request(
-                            &krg,
-                            pages,
-                            chunk_requests,
-                        )
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "[spyre-superdsc] {base}: a {pages}-page chunk rung at \
-                                 {chunk_requests} request row(s) is not a chunk this graph's attention \
-                                 admits — the ladder named a rung `admitted_chunk_ladder` did not offer"
-                            )
-                        })
-                    };
+                    // ⛔⛔⛔ THE CHUNK LADDER IS DELETED WITH THE HAND-WRITTEN ATTENTION. A
+                    // one-pass "split-KV chunk" rung was a fact of the deleted decomposer —
+                    // the per-page sweep ladder below is the whole ladder now, and every
+                    // body is the per-page fold it always was off-card.
                     match ValidatedGraph::new(&krg) {
                         Ok(valid) => {
                             let tape_unrolled = lower_dag_to_tape(&valid);
@@ -11047,7 +10980,6 @@ fn dump_wavefront_mega(
                                 !is_prefill && decode_rows > 1,
                                 superdsc::RungFacts {
                                     one_request,
-                                    chunk_pages: chunk_ceiling,
                                 },
                             ) {
                                 Ok(rolled) => {
@@ -11208,15 +11140,13 @@ fn dump_wavefront_mega(
                                     // re-launched. The runtime picks this one whenever the context fits
                                     // a single page, which is the case that has to stay at the
                                     // baseline's cost.
-                                    // ⛔⛔⛔ AND THE FOLD PASS DOES HAVE A KTIR COUNTERPART — this
-                                    // read "NO FUSED TWIN … a fold pass with no KTIR counterpart",
-                                    // which is false. `assemble_attn` still stamps
-                                    // `kv_page_fold = true` on its prefix-fold ops (one file, shared
-                                    // by both paths), so `trip_kinds_for` still has `PageFold` trips
-                                    // to reclassify. MEASURED, smollm2-135m under `-Fspyre-hw`: the
-                                    // ladder rungs — whose twin was never removed — report `5
-                                    // group(s)` split against `3 group(s)` fused for the same 75
-                                    // trips. Two launches per layer, on the path the runtime prefers.
+                                    // ⛔⛔⛔ AND THE FOLD PASS HAS NO STAMPER ANYMORE — the deleted
+                                    // `assemble_attn` was the one op family that stamped
+                                    // `kv_page_fold = true` on its prefix-fold ops, so no launch
+                                    // group carries a fold to reclassify and the fused "twin" is
+                                    // the same program under a second name. The twin machinery
+                                    // stays for the follow-up generic path; when the generic
+                                    // lowering grows a fold of its own it will stamp it.
                                     //
                                     // ⭐ THE TWIN IS A LAUNCH-*GROUPING* VARIANT, SO IT IS THE CARD'S.
                                     // Off-card `ktir_groups` takes `_fold` and never reads it — one
@@ -11229,17 +11159,8 @@ fn dump_wavefront_mega(
                                     // emit failure is logged and left `none()` — silent at runtime
                                     // only in the sense the selector documented: it falls through
                                     // to the split body, one launch per layer dearer.
-                                    // ⛔ NOT FOR A CHUNK CEILING, like no chunk rung: a chunk body has
-                                    // no fold to fuse, so its "twin" is the same program again — and
-                                    // the selector's single-page arm takes the first FUSED rung that
-                                    // covers the context, which past the per-page bodies was this one.
-                                    // A prompt chunk whose prefix is exactly one page (`valid_len` 257,
-                                    // `n_fold_pages` 1) ran the 64-page chunk: ~0.45 s against ~0.1 s
-                                    // for its neighbours, on every request (granite-2b, 96 and 128
-                                    // rows). Without the twin it falls to the split ladder's 2-page
-                                    // chunk. The ladder proves it (`no_chunk_has_a_fused_twin`).
                                     let bodies_fused: Vec<superdsc::bundle::SiblingFp<'static>> =
-                                        if card && chunk_ceiling.is_none() {
+                                        if card {
                                             rolled
                                                 .bodies
                                                 .iter()
@@ -11314,12 +11235,7 @@ fn dump_wavefront_mega(
                                             let mut decode_rungs: Vec<
                                                 superdsc::bundle::LadderRung<'static>,
                                             > = vec![superdsc::bundle::LadderRung {
-                                                // A chunk body sweeps its whole chunk, so its rung
-                                                // is the chunk's slots PER REQUEST — what
-                                                // `select_body` compares the live context against.
-                                                active_cap: superdsc::bundle::SweptCols::new(
-                                                    chunk_ceiling.map_or(cap, chunk_swept),
-                                                ),
+                                                active_cap: superdsc::bundle::SweptCols::new(cap),
                                                 bodies: rung_fps(&body_fps),
                                                 bodies_fused: std::borrow::Cow::Owned(
                                                     bodies_fused.clone(),
@@ -11347,7 +11263,6 @@ fn dump_wavefront_mega(
                                                     // EVERY class body: a rung serves any length only
                                                     // if each of its classes' attentions folds.
                                                     folds: body_fps.iter().all(|fp| folds_of(fp)),
-                                                    chunk: chunk_ceiling.is_some(),
                                                     fused_twin: decode_rungs[0]
                                                         .bodies_fused
                                                         .iter()
@@ -11355,57 +11270,20 @@ fn dump_wavefront_mega(
                                                 },
                                             )];
                                             // The per-page sweep rungs below one page — every decode
-                                            // bake's ladder. A prompt chunk never had them (its
-                                            // prefix bundle sweeps whole pages), so it keeps none.
-                                            let sweep = if is_prefill {
+                                            // bake's ladder. A prompt bake keeps none (its prefix
+                                            // bundle sweeps whole pages).
+                                            let ladder: Vec<(
+                                                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
+                                                u32,
+                                            )> = if is_prefill {
                                                 Vec::new()
                                             } else {
                                                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::decode_ladder(cap)
-                                            }
-                                            .into_iter()
-                                            .map(|r| (r, None, r.get()));
-                                            // ⭐ PAST ONE PAGE, THE LADDER IS CHUNK WIDTHS: every chunk
-                                            // rung lowers the program at its one-page sweep (`FULL`) and
-                                            // differs only in the chunk it attends, so its swept extent
-                                            // is the chunk's slots per request (`chunk_swept`). Within one
-                                            // page it keeps the sweep rungs AND the per-page body at the
-                                            // page itself (`FULL`, no chunk, `cap` slots) — the canonical
-                                            // short chat's bodies, byte for byte (`ChunkScratch::LADDER`
-                                            // says why the chunk starts at two pages) — and on a batch
-                                            // rung that per-page body is the FOLD every context past the
-                                            // widest chunk falls back to.
-                                            let ladder: Vec<(
-                                                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
-                                                Option<u32>,
-                                                u32,
-                                            )> = if chunk_ceiling.is_some() {
-                                                sweep
-                                                    .chain(std::iter::once((
-                                                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                                                        None,
-                                                        cap,
-                                                    )))
-                                                    .chain(
-                                                        chunk_ladder
-                                                            .iter()
-                                                            .copied()
-                                                            .filter(|&pages| Some(pages) != chunk_ceiling)
-                                                            .map(|pages| {
-                                                                (
-                                                                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                                                                    Some(pages),
-                                                                    chunk_swept(pages),
-                                                                )
-                                                            }),
-                                                    )
+                                                    .into_iter()
+                                                    .map(|r| (r, r.get()))
                                                     .collect()
-                                            } else {
-                                                sweep.collect()
                                             };
-                                            // A prompt chunk's ladder is its chunk rungs (and the
-                                            // per-page body under them); every other prefill bake
-                                            // keeps its single body.
-                                            if !is_prefill || chunk_ceiling.is_some() {
+                                            if !is_prefill {
                                                 // ⭐ EVERY RUNG IS ITS OWN LOWERING of the same tape at
                                                 // its own sweep/chunk, reading nothing another rung
                                                 // writes — so they lower in parallel and are recorded in
@@ -11421,7 +11299,6 @@ fn dump_wavefront_mega(
                                                     ),
                                                     (
                                                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
-                                                        Option<u32>,
                                                         superdsc::BundleLayout,
                                                     ),
                                                 );
@@ -11429,7 +11306,7 @@ fn dump_wavefront_mega(
                                                     use rayon::prelude::*;
                                                     ladder
                                                         .into_par_iter()
-                                                        .map(|(rung, rung_chunk, rung_swept)| -> Option<RungRecord> {
+                                                        .map(|(rung, rung_swept)| -> Option<RungRecord> {
                                                     match superdsc::lower_subtile_tape_to_superdsc(
                                                         &tape_rolled,
                                                         &krg,
@@ -11438,7 +11315,6 @@ fn dump_wavefront_mega(
                                                         !is_prefill && decode_rows > 1,
                                                         superdsc::RungFacts {
                                                             one_request,
-                                                            chunk_pages: rung_chunk,
                                                         },
                                                     ) {
                                                         // Same device split as the ceiling rung above: the
@@ -11509,17 +11385,7 @@ fn dump_wavefront_mega(
                                                                         // this is `&b.ops`, so the
                                                                         // "twin" was named after a
                                                                         // bundle nothing else emitted.
-                                                                        // ⛔ NOT FOR A CHUNK RUNG: a chunk body
-                                                                        // has no fold group, so its "fused" twin
-                                                                        // is the same program under a second
-                                                                        // name — a whole extra bake per rung —
-                                                                        // and the selector's one-pass arm keys
-                                                                        // on a one-page PREFIX, which a prompt
-                                                                        // chunk past one page has. Proven below
-                                                                        // (`no_chunk_has_a_fused_twin`).
-                                                                        rfused.push(if card
-                                                                            && rung_chunk.is_none()
-                                                                        {
+                                                                        rfused.push(if card {
                                                                         superdsc::emit_bundle(
                                                                             &b.ops,
                                                                             Some(&rr.layout),
@@ -11545,8 +11411,7 @@ fn dump_wavefront_mega(
                                                                     Err(e) => {
                                                                         eprintln!(
                                                                             "[spyre-superdsc] {base}: \
-                                                                         ladder rung {} chunk={rung_chunk:?} \
-                                                                         body class {ci} emit \
+                                                                         ladder rung {} body class {ci} emit \
                                                                          failed: {e}",
                                                                             rung.get()
                                                                         );
@@ -11557,7 +11422,7 @@ fn dump_wavefront_mega(
                                                             if ok {
                                                                 eprintln!(
                                                                     "[spyre-superdsc] {base}: ladder rung \
-                                                                 active_cap={} chunk={rung_chunk:?} baked",
+                                                                 active_cap={} baked",
                                                                     rung.get()
                                                                 );
                                                                 let rung_folds = rfps
@@ -11579,11 +11444,10 @@ fn dump_wavefront_mega(
                                                                         superdsc::bundle::SweptCols::new(rung_swept),
                                                                         scratchy_target_spyre::fold_plan::RungReach {
                                                                             folds: rung_folds,
-                                                                            chunk: rung_chunk.is_some(),
                                                                             fused_twin,
                                                                         },
                                                                     ),
-                                                                    (rung, rung_chunk, rr.layout),
+                                                                    (rung, rr.layout),
                                                                 ))
                                                             } else {
                                                                 None
@@ -11600,7 +11464,7 @@ fn dump_wavefront_mega(
                                                         })
                                                         .collect()
                                                 };
-                                                for (rec, reach, (rung, rung_chunk, layout)) in
+                                                for (rec, reach, (rung, layout)) in
                                                     per_rung.into_iter().flatten()
                                                 {
                                                     // ⛔ ONE SESSION STAGES ONE LAYOUT: a rung reading a
@@ -11613,7 +11477,7 @@ fn dump_wavefront_mega(
                                                         )
                                                     {
                                                         panic!(
-                                                            "[spyre-superdsc] {base}: ladder rung active_cap={} chunk={rung_chunk:?}: {e}",
+                                                            "[spyre-superdsc] {base}: ladder rung active_cap={}: {e}",
                                                             rung.get()
                                                         );
                                                     }
@@ -11627,7 +11491,7 @@ fn dump_wavefront_mega(
                                                             superdsc::weight_seg_record(&layout);
                                                         fx.push(BakeEffect::WeightSeg {
                                                             base: format!(
-                                                                "{base} (rung cap {} chunk {rung_chunk:?})",
+                                                                "{base} (rung cap {})",
                                                                 rung.get()
                                                             ),
                                                             bank0,
@@ -11658,16 +11522,6 @@ fn dump_wavefront_mega(
                                                     Ok(at) => at as u32,
                                                     Err(e) => panic!("[spyre-superdsc] {base}: {e}"),
                                                 };
-                                            // ⛔ AND NO CHUNK RUNG BAKES A FOLD-FUSED TWIN: the
-                                            // selector's one-pass arm would run it for a prompt chunk
-                                            // over a one-page prefix (see the twins' bake above).
-                                            if let Err(e) =
-                                                scratchy_target_spyre::fold_plan::no_chunk_has_a_fused_twin(
-                                                    &reach,
-                                                )
-                                            {
-                                                panic!("[spyre-superdsc] {base}: {e}");
-                                            }
                                             // ⭐ THE LAYER LOOP, ATTACHED TO THE BODY IT DESCRIBES.
                                             // Every fingerprint in it is a sibling the registry
                                             // resolves at load, and `RerollMeta::siblings` walks the

@@ -837,16 +837,13 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         Program::RmsNorm => L::program_rmsnorm_eps(f).into_iter().collect(),
         // `scalarmul` resolves ONE value: `scale_slot(layout, program_scalarmul_scale(&k.func))`.
         Program::ScalarMul => L::program_scalarmul_scale(f).into_iter().collect(),
-        // `attn_at` resolves TWO — the score scale AND its square root, in that order:
-        // `scale_idx` on `scale_val`, then `sqrt_scale_idx` on `scale_val.sqrt()`, because
-        // "torch-spyre splits into sqrt_scale on both Q and K". `compute_bundle_layout` pushes the
-        // same pair for `SubOp::AttnDecode` (`push_scale(*scale)` then `push_scale(scale.sqrt())`).
-        // Unreachable today — `for_regions` refuses `Attn` at the reserved-const door above — but
-        // stated here so the registry is not a second place the pair could go missing.
-        Program::Attn => match L::program_score_scale(f) {
-            Some(v) => vec![v, v.sqrt()],
-            None => Vec::new(),
-        },
+        // `attn` registers NOTHING — the hand-written `attn_at` that resolved the score scale and
+        // its square root is deleted, and the generic whole-function lowering reads whatever
+        // multiplier the program states as an op of its own, not out of the reserved-const
+        // registry. Unreachable today anyway — `for_regions` refuses `Attn` at the reserved-const
+        // door above — but stated here so the registry is not a second place a scale could go
+        // missing.
+        Program::Attn => Vec::new(),
         // ⭐ EMPTY, AND THAT IS THE ANSWER FOR THESE. None of these bodies calls `scale_slot` or
         // indexes `scalarmul_scales` — grep over the file: the only readers are `rmsnorm`,
         // `scalarmul`, `attn_at` and `scale_idx_of` (which only recognises a RESERVED tid among the
