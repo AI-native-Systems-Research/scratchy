@@ -55,7 +55,7 @@ use crate::reserved_tids::{
     ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_ZERO_TID, LAST_HIDDEN_TID, kct_resident_tid,
     scalarmul_scale_tid,
 };
-use crate::sdsc_abstract::{KernelTag, Stk};
+use crate::sdsc_abstract::{KernelTag, RowBlockedTag, Stk};
 use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{DataFormat, Df, Fp16, ItDim, SdscFoldSet};
 use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES};
@@ -7124,6 +7124,81 @@ pub fn expert_combine(
     // in the `In::col` mode, at the column offset of its own lane.
     let scores = rb(&scores_s, rows, crate::work::FP16_ELEMS_PER_STICK);
     let out = rb(&out_s, rows, w);
+    // The `2k−1` legs, ONE implementation shared with the whole-function door's
+    // combine rung ([`expert_combine_pair_legs`]) — slot 0's product seeds the
+    // accumulator, every later slot is a product leg then an add leg, and the
+    // FINAL add writes `out` directly. The two doors cannot drift about what a
+    // combine emits; this door states the operands and the rung states the
+    // per-pair position.
+    let mut ops = Vec::with_capacity(2 * k as usize - 1);
+    let legs = ExpertCombineLegs {
+        rows,
+        w,
+        full,
+        k,
+        out_tid,
+        pair: &pair,
+        scores: &scores,
+        out: &out,
+    };
+    for j in 0..k {
+        ops.extend(expert_combine_pair_legs(&legs, j, sym_id_base, layout));
+    }
+    Ok(ops)
+}
+
+/// ⭐ THE EXPERT COMBINE'S LEG FACTS — the geometry and handles ONE pair's legs need, the
+/// shared core of the two doors. The per-`Program` door ([`expert_combine`]) fills this
+/// after identifying its operands by extent; the whole-function door's combine rung fills
+/// it per PAIR from the `inter`-resolved handoffs (the router's route-weights product, the
+/// down projection's output window, the o parameter).
+#[derive(Clone, Copy)]
+pub struct ExpertCombineLegs<'a> {
+    /// The token count (`m`) — the door's m=1 law.
+    pub rows: u32,
+    /// The output width (`n`, the down projection's own width).
+    pub w: u32,
+    /// The pair rows' full width (`k·w`).
+    pub full: u32,
+    /// The pair count.
+    pub k: u32,
+    /// The output parameter's tid — the acc/P(j) synths' key.
+    pub out_tid: u32,
+    /// The `[rows, full]` pair-rows handle — the per-op door's `[m, k·w]` input; the fused
+    /// door's down intermediate.
+    pub pair: &'a Stk<RowBlockedTag>,
+    /// The `[rows, 64]` scores handle — the per-op door's scores; the fused door's
+    /// route-weights product (slot j compact at lane j).
+    pub scores: &'a Stk<RowBlockedTag>,
+    /// The `[rows, w]` output handle.
+    pub out: &'a Stk<RowBlockedTag>,
+}
+
+/// ⭐ ONE PAIR'S LEGS of the expert combine — the shared core of the two doors.
+///
+/// The per-`Program` door ([`expert_combine`]) calls this per slot after identifying its
+/// operands by extent; the whole-function door's combine rung calls it per PAIR at that
+/// pair's own product position — the per-position law: the unrolled kernel interleaves
+/// `gelu_j → down_j → combine_j`, so pair `j`'s legs are emitted at pair `j`'s product,
+/// after the down emission's `emdo_p{j}` wrote its window and before pair `j+1`'s gelu.
+/// ONE implementation of the `2k−1` legs, so the two doors cannot drift about what a
+/// combine emits — the sharing the per-op door's own op-list pin holds
+/// behavior-preserving.
+///
+/// The accumulator synth is reserved on EVERY call — idempotent at the same key and dims
+/// (the `Fq*` family's law), so the per-pair calls reserve in the same order the
+/// single-call form did: the acc at pair 0, each `P(j)` at its own pair.
+pub fn expert_combine_pair_legs(
+    f: &ExpertCombineLegs<'_>,
+    j: u32,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Vec<EmittedOp> {
+    let rows = f.rows;
+    let w = f.w;
+    let full = f.full;
+    let k = f.k;
+    let out_tid = f.out_tid;
     let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(rows);
     let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(w);
     // The running [m, w] sum and each slot's [m, w] product — synths declared
@@ -7137,61 +7212,57 @@ pub fn expert_combine(
         l.synth_like(acc_id, out_tid, &[rows, w], Df::Fp16);
     }
     let acc = rb(&acc_s, rows, w);
-    let mut ops = Vec::with_capacity(2 * k as usize - 1);
-    for j in 0..k {
-        // The pair block's stick-aligned corner in the [m, k·w] rows, and the
-        // score column's lane in the [m, k] scores — both through the view's
-        // own address laws.
-        let block_off =
-            crate::addr::col_of(rows, full, pointwise_chunk_out_offset(j * w), Df::Fp16);
-        let col_off = crate::addr::col_of(rows, crate::work::FP16_ELEMS_PER_STICK, j, Df::Fp16);
-        let block = In::sliced(&pair, block_off).ew();
-        let score = In::col_at(&scores, col_off).ew();
-        // The product leg's destination: `out` when the product IS the whole
-        // combine (k=1), the accumulator when it seeds the chain (j=0), a
-        // per-slot synth otherwise.
-        let prod_owned;
-        let prod_h = if k == 1 {
-            &out
-        } else if j == 0 {
-            &acc
-        } else {
-            let p_id = PlaceId::Act(out_tid).synth(SynthRole::ECombP(j));
-            let p_s = syn(layout, p_id);
-            if let Some(l) = layout {
-                l.synth_like(p_id, out_tid, &[rows, w], Df::Fp16);
-            }
-            prod_owned = rb(&p_s, rows, w);
-            &prod_owned
-        };
+    // The pair block's stick-aligned corner in the [m, k·w] rows, and the score
+    // column's lane in the [m, k] scores — both through the view's own address laws.
+    let block_off = crate::addr::col_of(rows, full, pointwise_chunk_out_offset(j * w), Df::Fp16);
+    let col_off = crate::addr::col_of(rows, crate::work::FP16_ELEMS_PER_STICK, j, Df::Fp16);
+    let block = In::sliced(f.pair, block_off).ew();
+    let score = In::col_at(f.scores, col_off).ew();
+    // The product leg's destination: `out` when the product IS the whole
+    // combine (k=1), the accumulator when it seeds the chain (j=0), a
+    // per-slot synth otherwise.
+    let prod_owned;
+    let prod_h = if k == 1 {
+        f.out
+    } else if j == 0 {
+        &acc
+    } else {
+        let p_id = PlaceId::Act(out_tid).synth(SynthRole::ECombP(j));
+        let p_s = syn(layout, p_id);
+        if let Some(l) = layout {
+            l.synth_like(p_id, out_tid, &[rows, w], Df::Fp16);
+        }
+        prod_owned = rb(&p_s, rows, w);
+        &prod_owned
+    };
+    let mut ops = Vec::with_capacity(2);
+    ops.push(assemble_pointwise_broadcast_off(
+        &format!("ecombmul_j{j}_o{out_tid}"),
+        "multiply",
+        t_rows,
+        f_cols,
+        &[block, score],
+        prod_h,
+        crate::addr::DevOff::ZERO,
+        sym_id_base,
+        layout,
+    ));
+    // The add legs start at slot 1 — slot 0's product already IS the
+    // accumulator — and the LAST one writes `out` directly.
+    if j > 0 {
         ops.push(assemble_pointwise_broadcast_off(
-            &format!("ecombmul_j{j}_o{out_tid}"),
-            "multiply",
+            &format!("ecombadd_j{j}_o{out_tid}"),
+            "add",
             t_rows,
             f_cols,
-            &[block, score],
-            prod_h,
+            &[In::full(&acc).ew(), In::full(prod_h).ew()],
+            if j + 1 == k { f.out } else { &acc },
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
         ));
-        // The add legs start at slot 1 — slot 0's product already IS the
-        // accumulator — and the LAST one writes `out` directly.
-        if j > 0 {
-            ops.push(assemble_pointwise_broadcast_off(
-                &format!("ecombadd_j{j}_o{out_tid}"),
-                "add",
-                t_rows,
-                f_cols,
-                &[In::full(&acc).ew(), In::full(prod_h).ew()],
-                if j + 1 == k { &out } else { &acc },
-                crate::addr::DevOff::ZERO,
-                sym_id_base,
-                layout,
-            ));
-        }
     }
-    Ok(ops)
+    ops
 }
 
 /// ⭐ THE EXPERT LANDING'S ONE HEAD-SLOT LAW, IN STICKS — pair `s`'s replica-run head.

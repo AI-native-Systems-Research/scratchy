@@ -4064,7 +4064,8 @@ fn router_chain_at(
     let mut consumed: Vec<Ssa> = Vec::new();
 
     // ── THE IDS STORE: `desc_ids` ← `arith.fptosi`(the ids accumulator) ──
-    let (ids_tid, rows, k_view) = store_param(k, reads, ids_store, name, "the routed ids")?;
+    let (ids_tid, rows, k_view) =
+        store_param(k, reads, ids_store, name, "the router's", "the routed ids")?;
     let Some(&ids_i32) = ids_store.operands.first() else {
         return err(format!("{name}: the router's ids store states no value"));
     };
@@ -4850,7 +4851,14 @@ fn router_chain_at(
     let rs_store_op = sole_reader_matching(reads, name, rs_val, "route-weights store", |o| {
         o.op_type == OpKind::KtdpStore
     })?;
-    let (rs_tid, rs_rows, rs_cols) = store_param(k, reads, rs_store_op, name, "the route weights")?;
+    let (rs_tid, rs_rows, rs_cols) = store_param(
+        k,
+        reads,
+        rs_store_op,
+        name,
+        "the router's",
+        "the route weights",
+    )?;
     if rs_tid == ids_tid {
         return err(format!(
             "{name}: the router's route weights and routed ids land on ONE parameter t{rs_tid} — \
@@ -5243,43 +5251,46 @@ fn sole_reader_matching<'f>(
 
 /// The PARAMETER a store writes — `ktdp.store` ← `ktdp.construct_access_tile` ←
 /// `ktdp.construct_memory_view` ← argument → binding, plus the view's own `[rows, cols]`.
-/// The same walk [`region_for_operand`] takes for loads, read here for the two stores the
-/// router replaces: their parameters go WRITE-DEAD (the emission lands its own minted
-/// buffers), so this is the only place their bindings are ever named.
+/// The same walk [`region_for_operand`] takes for loads, read here for the stores the fused
+/// chains replace (the router's two scratch stores, the combine's o): their parameters go
+/// WRITE-DEAD or write-direct (the emission lands its own minted buffers or writes the output
+/// itself), so this is the only place their bindings are ever named. `whose` spells the door
+/// in the refusals, so each chain's wording stays its own.
 fn store_param(
     k: &KtirNode,
     reads: &ProgramReads<'_>,
     store: &Operation<'static>,
     name: &str,
+    whose: &str,
     what: &str,
 ) -> Result<(u32, u32, u32), Error> {
     let f = &k.func;
     let tile_v = store.operands.get(1).copied().ok_or_else(|| Error {
-        message: format!("{name}: the router's {what} store states no tile"),
+        message: format!("{name}: {whose} {what} store states no tile"),
     })?;
     let tile = reads.def_of(tile_v).ok_or_else(|| Error {
-        message: format!("{name}: the router's {what} store's tile is a function argument"),
+        message: format!("{name}: {whose} {what} store's tile is a function argument"),
     })?;
     if tile.op_type != OpKind::KtdpConstructAccessTile {
         return err(format!(
-            "{name}: the router's {what} store writes through `{:?}`, not an access tile",
+            "{name}: {whose} {what} store writes through `{:?}`, not an access tile",
             tile.op_type
         ));
     }
     let view_v = tile.operands.first().copied().ok_or_else(|| Error {
-        message: format!("{name}: the router's {what} store's tile states no view"),
+        message: format!("{name}: {whose} {what} store's tile states no view"),
     })?;
     let view = reads.def_of(view_v).ok_or_else(|| Error {
-        message: format!("{name}: the router's {what} store's view is a function argument"),
+        message: format!("{name}: {whose} {what} store's view is a function argument"),
     })?;
     if view.op_type != OpKind::KtdpConstructMemoryView {
         return err(format!(
-            "{name}: the router's {what} store's tile reinterprets `{:?}`, not a memory view",
+            "{name}: {whose} {what} store's tile reinterprets `{:?}`, not a memory view",
             view.op_type
         ));
     }
     let ptr = view.operands.first().copied().ok_or_else(|| Error {
-        message: format!("{name}: the router's {what} store's view states no pointer"),
+        message: format!("{name}: {whose} {what} store's view states no pointer"),
     })?;
     let idx = f
         .arguments
@@ -5287,16 +5298,16 @@ fn store_param(
         .position(|(a, _)| *a == ptr)
         .ok_or_else(|| Error {
             message: format!(
-                "{name}: the router's {what} store's view addresses no function argument — \
+                "{name}: {whose} {what} store's view addresses no function argument — \
                      the scratch parameters are the kernel's own"
             ),
         })?;
     let tid = k.bindings.get(idx).map(|b| b.get()).ok_or_else(|| Error {
-        message: format!("{name}: the router's {what} store's parameter has no binding"),
+        message: format!("{name}: {whose} {what} store's parameter has no binding"),
     })?;
     let Some((rows, cols)) = super::lower_ktir_to_superdsc::shape_2d(view) else {
         return err(format!(
-            "{name}: the router's {what} store's view states no 2-D shape, so the landing's \
+            "{name}: {whose} {what} store's view states no 2-D shape, so the landing's \
              extents are unknown"
         ));
     };
@@ -5386,6 +5397,641 @@ fn router_scratch_census(
         }
     }
     Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  THE EXPERT COMBINE — the fused kernel's last section, rooted at the route-weights read.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ⭐⭐⭐ ONE EXPERT-COMBINE CHAIN — the weighted sum that folds the pairs' down outputs back
+/// into the token stream, `o = Σ_j down_j·w_j`, claimed whole from the router's
+/// route-weights read.
+///
+/// # THE ROOT IS THE ROUTE-WEIGHTS READ
+///
+/// The kernel's combine RELOADS the route weights the router stored (`wrow = rw1_desc.load`) —
+/// one of [`RouterChain::rs_loads`], the scratch census's own iteration entries — extracts each
+/// pair's weight with a ONE-HOT select-sum (`where(koffs == j, wrow, 0)`, reduced over the k
+/// lanes), and multiplies it into that pair's down output. The router's fire point already
+/// registered every rs load in `inter` → the minted route-weights product (slot j compact at
+/// lane j, the `re*` legs' law), so the combine's fire resolves the read to the emission's own
+/// buffer through the map every cross-chain handoff uses — never the write-dead scratch
+/// parameter.
+///
+/// # THE ACCUMULATION ORDER, AND WHY THE EMISSION KEEPS IT
+///
+/// moe.py seeds `acc` with `tl.zeros` and adds per pair in slot order — but the TTIR FOLDS the
+/// zero seed (measured, the checked-in dump): `k−1` adds, LEFT-DEEP in slot order, pair 0's
+/// product seeding the running sum. torch-spyre consumes the same `make_ttir` fold, so the
+/// folded form IS the reference semantics. The emission states the same chain — slot 0's
+/// product seeds the accumulator, every later slot is a product leg then an add leg, the final
+/// add writes the output — through [`super::lower_ktir_to_superdsc::expert_combine_pair_legs`],
+/// the ONE leg implementation the per-`Program` door shares, so the f16 op sequence is the
+/// TTIR's own, operand for operand.
+///
+/// The one spelling difference, stated: the kernel EXTRACTS the weight as a zero-seeded
+/// select-sum; the emission reads LANE j of the router's minted product. Value-identical for
+/// route weights: softmax outputs are ≥ 0 (never −0.0), and the only divergence class of a
+/// zero-init sum vs a lane read is the SIGN OF ZERO — unreachable here, and it washes out in
+/// the add regardless (`s + ±0.0 = s` for `s ≠ 0`). The per-`Program` door already made this
+/// exact choice.
+#[derive(Clone, Debug)]
+pub struct ExpertCombineChain {
+    /// The route-weights read — ONE of [`RouterChain::rs_loads`], resolved to the minted
+    /// route-weights product through `inter` at the fire point. Not consumed: a load is
+    /// plumbing, and the proof claims its READERS.
+    pub wrow: Ssa,
+    /// The pair count — the one-hot select count, cross-checked against the router's own `k`,
+    /// the read's own width, and the down projection's.
+    pub k: u32,
+    /// The ONE shared `koffs` widen — `[k] → [1, k]`, the combine's OWN expand (CSE does not
+    /// merge it with the router's unexpanded `[k]` form — measured). Claimed by this chain.
+    pub koffs: Ssa,
+    /// The `desc_o` parameter's binding — the function's OUTPUT, which the final add's leg
+    /// writes directly (the store folds into the producing add, the same law the act store
+    /// and the rs/ids stores ride).
+    pub o_tid: u32,
+    /// The o tile's row count — `1`, the door's m=1 law (the read, the products, and the o
+    /// view all state it; a wider m refuses by name).
+    pub rows: u32,
+    /// The combine's output width — the down projection's own `n`.
+    pub n: u32,
+    /// Per pair `j`: the product `mulf` — the FIRE ANCHOR. The walk lowers pair `j`'s legs at
+    /// this op's own position (the per-position law: the unrolled kernel interleaves
+    /// `gelu_j → down_j → combine_j`, so the emitted op sequence is the kernel's own
+    /// interleaving).
+    pub products: Vec<Ssa>,
+    /// Per pair `j`: the down chain terminal the product reads — resolved to its window
+    /// `Region` through `inter` (the down fire registers every terminal at the projection's
+    /// mint).
+    pub terminals: Vec<Ssa>,
+    /// Everything else the proof touched: the `k` lane compares, `k` selects, `k` extraction
+    /// reduces, `k−1` accumulating adds, and the ONE koffs widen. The read, the zero splats,
+    /// the j splats, the reduce seeds, and the o store are `is_plumbing`; the weight's
+    /// expand/collapse/broadcast spray is `bcast_consumed` (the broadcast chains reader's own
+    /// claim); the products are the fire anchors.
+    pub consumed: Vec<Ssa>,
+}
+
+/// ⭐⭐⭐ THE EXPERT COMBINE CHAINS THIS FUNCTION HOLDS — one per route-weights read that has
+/// compute readers, proved WHOLE or refused BY NAME.
+///
+/// THE ROOT SET is [`RouterChain::rs_loads`] — the scratch census's own iteration set. A load
+/// nothing reads lowers to nothing and owes no proof (the census's own law); a load whose
+/// compute readers are not exactly one combine's one-hot selects is a reader outside every
+/// recognised chain — the census would refuse it, and this proof refuses FIRST, naming the
+/// link. A router-only kernel holds no rs reads and therefore no combine: the composed
+/// router kernel lowers unchanged.
+pub fn program_expert_combine_chains(
+    k: &KtirNode,
+    reads: &ProgramReads<'_>,
+    routers: &[RouterChain],
+    downs: &[W8a8DownProjection],
+) -> Result<Vec<ExpertCombineChain>, Error> {
+    let mut out = Vec::new();
+    for c in routers {
+        for &wrow in &c.rs_loads {
+            // The read's compute readers, forwarding through rank plumbing — the census's own
+            // walk. Each is carried WITH the value it was reached through, so the select proof
+            // can state the TRUE side by identity even under forwarding. Everything else must
+            // be the combine's one-hot select.
+            let mut selects: Vec<(&Operation<'static>, Ssa)> = Vec::new();
+            let mut stack = vec![wrow];
+            while let Some(v) = stack.pop() {
+                for &p in reads.readers_of(v) {
+                    let r = reads.op_at(p);
+                    match r.op_type {
+                        OpKind::ArithSelect => selects.push((r, v)),
+                        OpKind::TensorExpandShape
+                        | OpKind::TensorCollapseShape
+                        | OpKind::LinalgBroadcast => {
+                            if let Some(res) = r.result {
+                                stack.push(res);
+                            }
+                        }
+                        _ => {
+                            return err(format!(
+                                "{}: the route weights (t{}) is read by `{:?}`, which no \
+                                 recognised chain claims — the expert combine is the recogniser \
+                                 for the route-weights read, and this reader is not its form",
+                                k.func.name, c.rs_tid, r.op_type
+                            ));
+                        }
+                    }
+                }
+            }
+            if selects.is_empty() {
+                // A load nothing reads lowers to nothing (loads are plumbing) and owes no
+                // proof — the census's own law.
+                continue;
+            }
+            out.push(expert_combine_chain_at(
+                k, reads, wrow, c.k, selects, downs,
+            )?);
+        }
+    }
+    Ok(out)
+}
+
+/// Prove ONE combine chain at a route-weights read whose compute readers are the one-hot
+/// selects — the whole proof, from the read forward. Every fact is read from the program;
+/// every disagreement is a refusal naming the link, never a guess past it.
+///
+/// The walk runs FORWARD from the read (the router's runs backward from its store — the only
+/// value the combine PINS is the read itself): the read's compute readers are exactly the `k`
+/// one-hot selects; each select's sole consumer is the extraction reduce; the reduce's spray
+/// feeds the pair's product multiply; the product's other side is that pair's OWN down
+/// terminal (the per-pair agreement); the products accumulate left-deep in slot order; and
+/// the final add's (at `k=1` the single product's) sole consumer is the o store, whose
+/// parameter the last leg writes directly.
+fn expert_combine_chain_at(
+    k: &KtirNode,
+    reads: &ProgramReads<'_>,
+    wrow: Ssa,
+    router_k: u32,
+    selects: Vec<(&Operation<'static>, Ssa)>,
+    downs: &[W8a8DownProjection],
+) -> Result<ExpertCombineChain, Error> {
+    let f = &k.func;
+    let name = f.name;
+    let mut consumed: Vec<Ssa> = Vec::new();
+
+    // ── THE READ'S OWN SHAPE: `[1, k]`, the one token's row the m=1 door lowers ──
+    let load = reads.def_of(wrow).ok_or_else(|| Error {
+        message: format!("{name}: the combine's route-weights read is a function argument"),
+    })?;
+    let Some((m, lk)) = super::lower_ktir_to_superdsc::shape_2d(load) else {
+        return err(format!(
+            "{name}: the combine's route-weights read states no 2-D shape, so its extents are \
+             unknown"
+        ));
+    };
+    if m != 1 || lk != router_k {
+        return err(format!(
+            "{name}: the combine's route-weights read is [{m}, {lk}] — the router proved \
+             k={router_k}, and the read is the one token's `[1, k]` row (the door lowers the \
+             m=1 decode form)"
+        ));
+    }
+    if selects.len() != router_k as usize {
+        return err(format!(
+            "{name}: the combine's route-weights read has {} one-hot selects — the router \
+             proved k={router_k}, and one select per pair is the combine's own form",
+            selects.len()
+        ));
+    }
+
+    // ── THE ONE-HOT SELECTS, one per pair, each proving its own lane ──
+    let mut lanes: Vec<(u32, Ssa)> = Vec::with_capacity(selects.len());
+    let mut koffs: Option<Ssa> = None;
+    for (s, v) in &selects {
+        let Some(sel_res) = s.result else {
+            return err(format!(
+                "{name}: the combine's one-hot select states no result"
+            ));
+        };
+        let [cond, hit, miss] = s.operands[..] else {
+            return err(format!(
+                "{name}: the combine's one-hot select is not ternary"
+            ));
+        };
+        // The select MASKS the read: `where(lane == j, wrow, 0)`. The TRUE side is the weights
+        // row THIS chain roots at (the reader walk reached the select through it, forwarding
+        // included); the FALSE side is a zero splat. An inverted mask is a different function
+        // and refuses here.
+        if hit != *v {
+            return err(format!(
+                "{name}: the combine's one-hot select reads the route weights on its FALSE \
+                 side — the mask is inverted, a different function than the one-hot this door \
+                 lowers"
+            ));
+        }
+        if !router_splat_is(reads, miss, 0.0) {
+            return err(format!(
+                "{name}: the combine's one-hot select's miss side is not a zero splat — the \
+                 one-hot zeroes every lane but the pair's own"
+            ));
+        }
+        // The lane compare: `oeq` over (the koffs widen, the j splat).
+        let (a, b) = combine_lane_compare(reads, name, cond)?;
+        let (j, ko) = match (combine_splat_index(reads, a), combine_splat_index(reads, b)) {
+            (Some(j), None) => (j, b),
+            (None, Some(j)) => (j, a),
+            _ => {
+                return err(format!(
+                    "{name}: the combine's one-hot compare states no lone lane-index splat \
+                     against the koffs vector — the pair index is read off the splat's VALUE \
+                     (the compiler CSEs pair 0's zero with the zeros splat itself), so both \
+                     sides carrying indices, or neither, is not this form"
+                ));
+            }
+        };
+        match koffs {
+            None => koffs = Some(ko),
+            Some(prev) if prev == ko => {}
+            Some(prev) => {
+                return err(format!(
+                    "{name}: the combine's one-hot compares read two koffs vectors (s{} and \
+                     s{}) — the combine widens the router's lane vector ONCE and every pair's \
+                     compare reads it",
+                    prev.0, ko.0
+                ));
+            }
+        }
+        lanes.push((j, sel_res));
+        consumed.push(cond);
+        consumed.push(sel_res);
+    }
+    // The lanes are the pairs, exactly once each: a repeated lane is two pairs wearing one
+    // slot, a missing one a pair with no weight.
+    lanes.sort_by_key(|(j, _)| *j);
+    if !lanes.iter().map(|(j, _)| *j).eq(0..router_k) {
+        return err(format!(
+            "{name}: the combine's one-hot selects state lanes {:?} — one select per pair \
+             0..{router_k} is the combine's own form",
+            lanes.iter().map(|(j, _)| *j).collect::<Vec<_>>()
+        ));
+    }
+
+    // ── THE ONE KOFFS WIDEN every compare shares ──
+    let koffs = koffs.expect("a combine with selects named its koffs widen");
+    let ko_def = reads.def_of(koffs).ok_or_else(|| Error {
+        message: format!("{name}: the combine's koffs vector is a function argument"),
+    })?;
+    if ko_def.op_type != OpKind::TensorExpandShape {
+        return err(format!(
+            "{name}: the combine's koffs vector is `{:?}`, not a `tensor.expand_shape` — the \
+             combine widens the router's `[k]` lane vector to `[1, k]` for the one-hot mask",
+            ko_def.op_type
+        ));
+    }
+    let Some((km, kk)) = super::lower_ktir_to_superdsc::shape_2d(ko_def) else {
+        return err(format!(
+            "{name}: the combine's koffs widen states no 2-D shape, so its extents are unknown"
+        ));
+    };
+    if km != 1 || kk != router_k {
+        return err(format!(
+            "{name}: the combine's koffs widen is [{km}, {kk}] — the router proved \
+             k={router_k}, and the one-hot mask is the `[1, k]` widen of its lane vector"
+        ));
+    }
+    consumed.push(koffs);
+
+    // ── PER PAIR: the extraction reduce → the spray → the product → the terminal ──
+    //
+    // Every down terminal, keyed to its projection and chain — the per-pair agreement's map.
+    let down_terminal_of: std::collections::HashMap<Ssa, (usize, usize)> = downs
+        .iter()
+        .enumerate()
+        .flat_map(|(pi, p)| {
+            p.chains
+                .iter()
+                .enumerate()
+                .map(move |(ci, c)| (c.terminal, (pi, ci)))
+        })
+        .collect();
+    let mut products: Vec<Ssa> = Vec::with_capacity(router_k as usize);
+    let mut terminals: Vec<Ssa> = Vec::with_capacity(router_k as usize);
+    let mut down_pi: Option<usize> = None;
+    for (j, sel_res) in &lanes {
+        let j = *j;
+        // The extraction: the select's sole consumer is the zero-seeded addf reduce.
+        let Some(red) = reads.sole_reader(*sel_res) else {
+            return err(format!(
+                "{name}: the combine's pair-{j} one-hot select is not read by exactly one op — \
+                 the extraction reduce is its only consumer"
+            ));
+        };
+        let Some(r_res) = red.result else {
+            return err(format!(
+                "{name}: the combine's pair-{j} extraction states no result"
+            ));
+        };
+        let data = combine_weight_reduce(reads, name, r_res)?;
+        if data != *sel_res {
+            return err(format!(
+                "{name}: the combine's pair-{j} extraction reduces s{}, not the one-hot \
+                 select's own row — the extraction sums the masked weights row and nothing else",
+                data.0
+            ));
+        }
+        consumed.push(r_res);
+        // The spray: the extracted weight's sole consumers forward through the rank plumbing
+        // (the broadcast chains reader claims the links) to the pair's product multiply — the
+        // THIRD multiply of the kernel's per-pair dequant chain, the one the combine owns.
+        // SSA is acyclic, so the forward walk terminates; a spray deeper than the chains
+        // reader recognises is refused by ITS claim, at the walk.
+        let mut cursor = r_res;
+        let product = loop {
+            let Some(r) = reads.sole_reader(cursor) else {
+                return err(format!(
+                    "{name}: the combine's pair-{j} extracted weight is not read by exactly \
+                     one op — the spray to the pair's product multiply is single-consumer"
+                ));
+            };
+            match r.op_type {
+                OpKind::TensorExpandShape
+                | OpKind::TensorCollapseShape
+                | OpKind::LinalgBroadcast => {
+                    let Some(res) = r.result else {
+                        return err(format!(
+                            "{name}: the combine's pair-{j} weight spray link states no result"
+                        ));
+                    };
+                    cursor = res;
+                }
+                OpKind::ArithMulf => break r,
+                other => {
+                    return err(format!(
+                        "{name}: the combine's pair-{j} extracted weight is consumed by \
+                         `{other:?}`, not the pair's product multiply — the weight scales the \
+                         pair's own down output and nothing else"
+                    ));
+                }
+            }
+        };
+        let Some(p_res) = product.result else {
+            return err(format!(
+                "{name}: the combine's pair-{j} product states no result"
+            ));
+        };
+        let [a, b] = product.operands[..] else {
+            return err(format!(
+                "{name}: the combine's pair-{j} product is not binary"
+            ));
+        };
+        // The weight side is the spray this walk just walked; the expert side is the other —
+        // ROLES, not positions: fp multiply is commutative to the bit, so the operand order
+        // the producer chose is not a fact the proof owes.
+        let e_side = if a == cursor {
+            b
+        } else if b == cursor {
+            a
+        } else {
+            return err(format!(
+                "{name}: the combine's pair-{j} product does not read the extracted weight — \
+                 the weight scales the pair's own down output, and a product over anything \
+                 else is an op this door does not recognise"
+            ));
+        };
+        let Some(&(pi, ci)) = down_terminal_of.get(&e_side) else {
+            return err(format!(
+                "{name}: the combine's pair-{j} product's expert side (s{}) is not a down \
+                 projection's terminal — the combine weights the pair's OWN down output, and a \
+                 product over anything else is an op this door does not recognise",
+                e_side.0
+            ));
+        };
+        // The per-pair agreement: the terminal's pair IS the lane the one-hot states. A
+        // mismatch is two pairs wearing one chain — pair `p`'s down output weighted by slot
+        // `q`'s score.
+        let pair = downs[pi].chains[ci].pair;
+        if pair != j {
+            return err(format!(
+                "{name}: the combine's lane {j} weights pair {pair}'s down output — the \
+                 one-hot's lane and the terminal's pair must agree, and a mismatch is pair \
+                 {pair}'s output weighted by slot {j}'s score"
+            ));
+        }
+        match down_pi {
+            None => down_pi = Some(pi),
+            Some(prev) if prev == pi => {}
+            Some(prev) => {
+                return err(format!(
+                    "{name}: the combine's pairs read down projections {prev} and {pi} — one \
+                     combine folds ONE projection's pairs"
+                ));
+            }
+        }
+        // The product's own shape: `[1, n]`, the m=1 law at the projection's own width.
+        let Some((pm, pn)) = super::lower_ktir_to_superdsc::shape_2d(product) else {
+            return err(format!(
+                "{name}: the combine's pair-{j} product states no 2-D shape, so its extents \
+                 are unknown"
+            ));
+        };
+        let n = downs[pi].n;
+        if pm != 1 || pn != n {
+            return err(format!(
+                "{name}: the combine's pair-{j} product is [{pm}, {pn}] — the door lowers the \
+                 m=1 decode form, at the down projection's own width {n}"
+            ));
+        }
+        products.push(p_res);
+        terminals.push(e_side);
+    }
+    let Some(pi) = down_pi else {
+        return err(format!(
+            "{name}: the combine proved no pairs — unreachable: a combine with selects holds \
+             at least one"
+        ));
+    };
+    if downs[pi].k != router_k {
+        return err(format!(
+            "{name}: the combine holds {router_k} pairs but its down projection holds {} — one \
+             combine folds ONE projection's whole top-k",
+            downs[pi].k
+        ));
+    }
+    let n = downs[pi].n;
+
+    // ── THE LEFT-DEEP SLOT-ORDER SUM: pair 0's product seeds the running value (the TTIR
+    // folds moe.py's zero seed — measured), every later pair's product is read by exactly one
+    // add whose other side is the running value, and the running value's own sole reader is
+    // that SAME add — so no add feeds anything but the next, and no product feeds anything
+    // but its add. The INTRA-ADD operand order is not trusted: fp add is commutative to the
+    // bit, so the order the producer chose is not a fact the proof owes. A right-deep or
+    // permuted sum is a different ACCUMULATION ORDER, and f16 is not associative — refused
+    // rather than silently re-associated. ──
+    let mut running = products[0];
+    for j in 1..router_k {
+        let p = products[j as usize];
+        let Some(add) = reads.sole_reader(p) else {
+            return err(format!(
+                "{name}: the combine's pair-{j} product is not read by exactly one op — each \
+                 product feeds the accumulator and nothing else"
+            ));
+        };
+        if add.op_type != OpKind::ArithAddf {
+            return err(format!(
+                "{name}: the combine's pair-{j} product is consumed by `{:?}`, not the \
+                 accumulating add — each product feeds the accumulator and nothing else",
+                add.op_type
+            ));
+        }
+        let Some(add_pos) = reads.pos_of_op(add) else {
+            return err(format!(
+                "{name}: the combine's pair-{j} add is not in the program's own walk — a \
+                 walk/recogniser disagreement, not a producer shape"
+            ));
+        };
+        if reads.readers_of(running) != [add_pos] {
+            return err(format!(
+                "{name}: the combine's accumulator is not read by exactly pair {j}'s add — the \
+                 sum is left-deep in slot order (pair 0's product seeds it), and a branching or \
+                 reordered accumulation is a different function than the one this door lowers"
+            ));
+        }
+        let [a, b] = add.operands[..] else {
+            return err(format!("{name}: the combine's pair-{j} add is not binary"));
+        };
+        if !((a == running && b == p) || (b == running && a == p)) {
+            return err(format!(
+                "{name}: the combine's pair-{j} add reads s{}/s{}, not the running sum and \
+                 pair {j}'s product — the sum is left-deep in slot order (pair 0's product \
+                 seeds it), and any other accumulation order is a different function than the \
+                 one this door lowers",
+                a.0, b.0
+            ));
+        }
+        let Some(r) = add.result else {
+            return err(format!(
+                "{name}: the combine's pair-{j} add states no result"
+            ));
+        };
+        consumed.push(r);
+        running = r;
+    }
+
+    // ── THE FOLDED STORE: the final add's (at k=1 the single product's) sole consumer is
+    // the `desc_o` store, whose parameter the last leg writes directly. ──
+    let Some(store) = reads.sole_reader(running) else {
+        return err(format!(
+            "{name}: the combine's result is not read by exactly one op — the o store is its \
+             only consumer"
+        ));
+    };
+    if store.op_type != OpKind::KtdpStore {
+        return err(format!(
+            "{name}: the combine's result is consumed by `{:?}`, not the o store — the \
+             weighted sum is the function's output and nothing else's input",
+            store.op_type
+        ));
+    }
+    if store.operands.first() != Some(&running) {
+        return err(format!(
+            "{name}: the combine's o store does not read the weighted sum as its value — the \
+             store's VALUE is the final add, and anything else in its place is not this form"
+        ));
+    }
+    let (o_tid, o_rows, o_cols) = store_param(k, reads, store, name, "the expert combine's", "o")?;
+    if o_rows != 1 {
+        return err(format!(
+            "{name}: the combine's o tile is [{o_rows}, {o_cols}] — the door lowers the m=1 \
+             decode form, one token's row"
+        ));
+    }
+    if o_cols != n {
+        return err(format!(
+            "{name}: the combine's o tile is [{o_rows}, {o_cols}] but the down projection's \
+             width is {n} — the combine writes the projection's own output width"
+        ));
+    }
+
+    Ok(ExpertCombineChain {
+        wrow,
+        k: router_k,
+        koffs,
+        o_tid,
+        rows: o_rows,
+        n,
+        products,
+        terminals,
+        consumed,
+    })
+}
+
+/// The one-hot's LANE COMPARE — `arith.cmpf oeq` over (the koffs widen, the j splat), the
+/// combine's own form. Returns the two operands; order is not trusted. The router's
+/// [`router_oeq`] asks the same question with the router's wording; the combine states its
+/// own so each door's refusals name their own links.
+fn combine_lane_compare(reads: &ProgramReads<'_>, name: &str, v: Ssa) -> Result<(Ssa, Ssa), Error> {
+    let Some(d) = reads.def_of(v) else {
+        return err(format!(
+            "{name}: the combine's one-hot compare is a function argument"
+        ));
+    };
+    if d.op_type != OpKind::ArithCmpf {
+        return err(format!(
+            "{name}: the combine's one-hot select is driven by `{:?}`, not an `arith.cmpf`",
+            d.op_type
+        ));
+    }
+    let oeq = d
+        .attributes
+        .iter()
+        .any(|(k, w)| matches!((k, w), (AttrKey::Predicate, Attr::Str("oeq"))));
+    if !oeq {
+        return err(format!(
+            "{name}: the combine's one-hot compare is not an ordered-equal — the one-hot \
+             matches the pair's lane with `oeq`"
+        ));
+    }
+    let [a, b] = d.operands[..] else {
+        return err(format!(
+            "{name}: the combine's one-hot compare is not binary"
+        ));
+    };
+    Ok((a, b))
+}
+
+/// A splatted LANE INDEX — an integral splat value in `0..=255`, the one-hot's `j`. Pure
+/// predicate; `None` when `v` is not a splat or not an index.
+fn combine_splat_index(reads: &ProgramReads<'_>, v: Ssa) -> Option<u32> {
+    let j = reads.splat_value(v)?;
+    (j >= 0.0 && j.fract() == 0.0 && j <= 255.0).then_some(j as u32)
+}
+
+/// The one-hot's EXTRACTED WEIGHT — `linalg.reduce addf` over the lane axis `[1]`, seeded by
+/// a zero splat (`tl.sum` of the masked row). Returns the reduce's DATA operand; the seed is
+/// identified by value, order not trusted.
+fn combine_weight_reduce(reads: &ProgramReads<'_>, name: &str, v: Ssa) -> Result<Ssa, Error> {
+    let Some(d) = reads.def_of(v) else {
+        return err(format!(
+            "{name}: the combine's extracted weight is a function argument"
+        ));
+    };
+    if d.op_type != OpKind::LinalgReduce {
+        return err(format!(
+            "{name}: the combine's one-hot select is consumed by `{:?}`, not a `linalg.reduce`",
+            d.op_type
+        ));
+    }
+    let stated = d.attributes.iter().find_map(|(k, w)| match (k, w) {
+        (AttrKey::ReduceFn, Attr::Op(o)) => Some(*o),
+        _ => None,
+    });
+    if stated != Some(OpKind::ArithAddf) {
+        return err(format!(
+            "{name}: the combine's extraction reduces with `{:?}` — the one-hot sum is an \
+             `addf` reduce",
+            stated
+        ));
+    }
+    let dims = d.attributes.iter().find_map(|(k, w)| match (k, w) {
+        (AttrKey::Dimensions, Attr::IntList(x)) => Some(*x),
+        _ => None,
+    });
+    if !matches!(dims, Some([1])) {
+        return err(format!(
+            "{name}: the combine's extraction reduces over dims {dims:?} — the one-hot sums \
+             over the lane axis `[1]`, one weight per pair"
+        ));
+    }
+    let [a, b] = d.operands[..] else {
+        return err(format!("{name}: the combine's extraction is not binary"));
+    };
+    if router_splat_is(reads, a, 0.0) && !router_splat_is(reads, b, 0.0) {
+        Ok(b)
+    } else if router_splat_is(reads, b, 0.0) && !router_splat_is(reads, a, 0.0) {
+        Ok(a)
+    } else {
+        err(format!(
+            "{name}: the combine's extraction reads no lone zero seed — the one-hot sum seeds \
+             the reduce with a splatted zero and reduces the masked row on the other side"
+        ))
+    }
 }
 
 /// Lower a function holding MANY ops, one `Program` per op, in program order.
@@ -5568,6 +6214,32 @@ pub fn lower_function(
     // walk is private to here.
     let reads = program_reads(f);
 
+    // ⭐⭐⭐ THE EXPERT COMBINE CHAINS — the weighted sum that folds the pairs' down outputs
+    // back into the token stream, claimed whole from the router's route-weights reads (the
+    // scratch census's own iteration set). [`program_expert_combine_chains`] proves every
+    // link — the one-hot selects, the extraction reduces, the per-pair agreement with the
+    // down terminals, the left-deep slot-order sum, the folded o store — and the walk below
+    // lowers each PAIR's legs at that pair's own product: the per-position law, the same
+    // `gelu_j → down_j → combine_j` interleaving the unrolled kernel states. A router-only
+    // kernel holds no rs reads and therefore no combine; the composed kernel lowers
+    // unchanged.
+    let combines = program_expert_combine_chains(k, &reads, &routers, &downs)?;
+    let combine_consumed: std::collections::HashSet<Ssa> = combines
+        .iter()
+        .flat_map(|c| c.consumed.iter().copied())
+        .collect();
+    // Every chain's product, keyed to its chain and pair — the walk's fire anchors.
+    let combine_products: std::collections::HashMap<Ssa, (usize, u32)> = combines
+        .iter()
+        .enumerate()
+        .flat_map(|(ci, c)| {
+            c.products
+                .iter()
+                .enumerate()
+                .map(move |(j, &p)| (p, (ci, j as u32)))
+        })
+        .collect();
+
     // ⭐⭐⭐ THE SCRATCH CENSUS — the write-dead law's soundness obligation, BEFORE the walk:
     // the fused router writes its own minted landings and never the `desc_ids`/`desc_rs`
     // parameters, so every direct load of either must be consumed by a chain this door
@@ -5582,6 +6254,7 @@ pub fn lower_function(
         claimed.extend(w8a8_consumed.iter().copied());
         claimed.extend(down_consumed.iter().copied());
         claimed.extend(router_consumed.iter().copied());
+        claimed.extend(combine_consumed.iter().copied());
         router_scratch_census(k, &reads, &routers, &claimed)?;
     }
 
@@ -5613,6 +6286,11 @@ pub fn lower_function(
                 // same law, one fused emission at the lane-offset generate (the fire arm
                 // below).
                 || router_consumed.contains(&r)
+                // The EXPERT COMBINE'S interior — the one-hot compares, selects, and
+                // extraction reduces, the accumulating adds, and the ONE koffs widen — same
+                // law, one legs-per-pair emission at each pair's own product (the fire arm
+                // below).
+                || combine_consumed.contains(&r)
         }) {
             continue;
         }
@@ -5884,6 +6562,104 @@ pub fn lower_function(
                 Some(layout),
             )?;
             out.append(&mut emitted);
+            lowered += 1;
+            continue;
+        }
+        // ⭐⭐⭐ AN EXPERT-COMBINE PRODUCT — the PER-POSITION firing, the down arm's own law:
+        // the walk lowers THAT PAIR'S legs at the pair's own product multiply, so the emitted
+        // op sequence is the kernel's own interleaving `gelu_j → down_j → combine_j` — after
+        // the down emission's `emdo_p{j}` wrote its window, before pair `j+1`'s gelu. The
+        // legs themselves are [`super::lower_ktir_to_superdsc::expert_combine_pair_legs`] —
+        // the ONE implementation the per-`Program` door shares, so the two doors cannot drift
+        // about what a combine emits.
+        if let Some(r) = op.result
+            && let Some(&(ci, j)) = combine_products.get(&r)
+        {
+            let chain = &combines[ci];
+            let Some(layout) = layout else {
+                return err(format!(
+                    "{}: the expert combine over t{} is an intermediate product, which needs \
+                     a `BundleLayout` to hold its buffers -- `layout: None` is the unit-test \
+                     arm and cannot place one",
+                    f.name, chain.o_tid
+                ));
+            };
+            // The two handoffs, through `inter` — the map every cross-chain handoff uses. The
+            // router's fire registered the route-weights read; the down fire registered every
+            // terminal at its projection's mint. Both PRECEDE this product in program order
+            // (the router's generate stands at the function's head; the mint terminal
+            // precedes the first product — measured), so a miss is a walk/recogniser
+            // disagreement, not a producer shape.
+            let weights = inter.get(&chain.wrow).copied().ok_or_else(|| Error {
+                message: format!(
+                    "{}: the combine's route-weights read (s{}) has no intermediate region — \
+                     the router's fire point must precede the combine's products, and the walk \
+                     reads program order",
+                    f.name, chain.wrow.0
+                ),
+            })?;
+            let window = inter
+                .get(&chain.terminals[j as usize])
+                .copied()
+                .ok_or_else(|| Error {
+                    message: format!(
+                        "{}: the combine's pair-{j} down terminal (s{}) has no intermediate \
+                         region — the down projection's mint terminal must precede the \
+                         combine's products, and the walk reads program order",
+                        f.name, chain.terminals[j as usize].0
+                    ),
+                })?;
+            // The corner agreement: the legs' own block corner (`col_of(rows, full, j·n)`)
+            // must be the window the down emission recorded for this terminal — the same
+            // corner the down door's `dq_off` states. A disagreement is a walk/recogniser
+            // drift, refused rather than silently re-windowed.
+            if window.v_rows != chain.rows
+                || window.v_cols != chain.k * chain.n
+                || window.c_start != j * chain.n
+                || window.c_len != chain.n
+                || weights.v_rows != chain.rows
+            {
+                return err(format!(
+                    "{}: the combine's pair-{j} window is [{}:{}] of a [{}, {}] intermediate \
+                     and the route weights are [{}, {}] — the recogniser proved {} rows over a \
+                     [{}, {}] down output, so this is a walk/recogniser disagreement and not a \
+                     producer shape",
+                    f.name,
+                    window.c_start,
+                    window.c_start + window.c_len,
+                    window.v_rows,
+                    window.v_cols,
+                    weights.v_rows,
+                    weights.v_cols,
+                    chain.rows,
+                    chain.k * chain.n,
+                    chain.n
+                ));
+            }
+            let pair_h = crate::emit::rb(&window.name(), chain.rows, chain.k * chain.n);
+            let scores_h = crate::emit::rb(
+                &weights.name(),
+                chain.rows,
+                crate::work::FP16_ELEMS_PER_STICK,
+            );
+            let o_h = crate::emit::rb(&crate::place::act_name(chain.o_tid), chain.rows, chain.n);
+            let legs = super::lower_ktir_to_superdsc::ExpertCombineLegs {
+                rows: chain.rows,
+                w: chain.n,
+                full: chain.k * chain.n,
+                k: chain.k,
+                out_tid: chain.o_tid,
+                pair: &pair_h,
+                scores: &scores_h,
+                out: &o_h,
+            };
+            let emitted = super::lower_ktir_to_superdsc::expert_combine_pair_legs(
+                &legs,
+                j,
+                sym_id_base,
+                Some(layout),
+            );
+            out.extend(emitted);
             lowered += 1;
             continue;
         }

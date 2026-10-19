@@ -844,15 +844,19 @@ fn an_unfolded_round_zero_is_refused_naming_the_round_form() {
     );
 }
 
-/// A PLANTED UNCLAIMED SCRATCH READER — a copy of the route-weights scratch through a
-/// fresh parameter, spelled exactly as the combine's read (a direct load over a plain
-/// tile feeding a lane select). The scratch census runs BEFORE the walk: the fused
-/// router writes its own minted landings and never the scratch parameter, so this read
-/// would address a buffer nothing wrote, and the census refuses it BY NAME — the same
-/// refusal the full kernel's door pin holds the combine rung at, reproduced here in
-/// miniature.
+/// A PLANTED PARTIAL COMBINE READ — a copy of the route-weights scratch through a
+/// fresh parameter, spelled exactly as the combine's read (a direct load over a
+/// plain tile feeding a lane select) but with ONE select, not one per pair. The
+/// combine rung roots at every route-weights read and claims it ahead of the walk:
+/// the read must be the combine's own form, and this one holds a single one-hot
+/// select against the router's proved k, so the recognizer refuses it BY NAME at
+/// the pair-count cross-check. The write-dead hazard this mutant first exercised
+/// is unchanged — the fused router writes its own minted landings and never the
+/// scratch parameter — but the read is now the combine recognizer's to judge, and
+/// its refusal is the stronger one: no compute reader of the route weights falls
+/// through to the census anymore.
 #[test]
-fn an_unclaimed_reader_of_the_route_weights_is_refused_by_the_scratch_census() {
+fn a_partial_combine_read_of_the_route_weights_is_refused_naming_the_pair_count_law() {
     let src = src_with(&[
         ("desc_ids, desc_rs,  #", "desc_ids, desc_rs, desc_leak,  #"),
         (
@@ -867,17 +871,18 @@ fn an_unclaimed_reader_of_the_route_weights_is_refused_by_the_scratch_census() {
     ]);
     let err = match drive_src(&src, TEMP, K as u64, &[("desc_leak", "*fp16")], &[]) {
         Ok(ops) => panic!(
-            "BAKED ({} ops) — an unclaimed reader of the route-weights scratch lowered \
-             through the door; the census did not hold the write-dead law",
+            "BAKED ({} ops) — a partial combine read of the route-weights scratch lowered \
+             through the door; the recognizer did not hold the pair-count law",
             ops.len()
         ),
         Err(msg) => msg,
     };
     assert!(
         err.starts_with("door:")
-            && err.contains("is read by `ArithSelect`")
-            && err.contains("no recognised chain claims"),
-        "refused, but not for the reason this test pins. Expected the census to refuse the \
-         unclaimed scratch read by name, got: {err:?}"
+            && err.contains("has 1 one-hot selects")
+            && err.contains("the router proved k=8")
+            && err.contains("one select per pair is the combine's own form"),
+        "refused, but not for the reason this test pins. Expected the partial combine read \
+         to be refused at the pair-count cross-check, got: {err:?}"
     );
 }
