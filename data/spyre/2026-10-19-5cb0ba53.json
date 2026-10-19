@@ -8,16 +8,46 @@
   },
   "torch_spyre": {
     "measured": "2026-10-19",
-    "host": "nickm4 (every torch leg that ran: rung-1 8b fp16 and all fp16 batched; the five fp8 legs moved onto it are pending re-run), nickm2/nickm3 (their torch legs refused at serve boot \u2014 image libflex too old \u2014 and moved to nickm4)",
+    "host": "nickm4 (every torch leg that ran: rung-1 8b fp16, all fp16 batched, and the 2b fp8 legs \u2014 rung 1 and conc 4/8; the two 8b fp8 legs' serve boots exceed the harness's 900 s ready window, attention-graph recording alone took 429 s, and stay striped), nickm2/nickm3 (their torch legs refused at serve boot \u2014 image libflex too old \u2014 and moved to nickm4)",
     "harness": "vllm bench serve, out=256, from /work/spyre-inference. Rung 1: 10 prompts of len-64/1024/10240 (123/1083/10300 on vllm bench's scale), --max-concurrency 1. Batched: 16 prompts of the shared conc-* sets (123/1024/10300), --max-concurrency 4/8, 2 reps per back-to-back boot, cell = rep 2 (steady state). serve: vllm serve --max-num-seqs 2 (rung 1) / the rung (batched), --max-model-len 12288, --max-num-batched-tokens 512, --dtype float16 (fp16) / auto (fp8). Torch serves run only on nickm4: it is the only pod whose image libflex (2a4ac955) matches the reference venv's torch_spyre/_C.so; nickm/nickm2/nickm3 carry 68bb1ad2, which lacks flex::destroyHostComputeBuffer \u2014 the five fp8 torch legs originally split to nickm3/nickm2 moved to nickm4. Cells marked in their notes as carried from the 2026-10-18 sweep are its 2026-10-14 measurements."
   },
   "triton_scratchy": {
     "measured": "2026-10-19",
     "commit": "5cb0ba5398b7533eccd7fd9514b8ec22cf4eb688",
-    "host": "nickm (fp16), nickm2 (fp8 batched), nickm3 (fp8 rung 1, card 122 pinned to 1c:00.0)",
-    "harness": "built from a git archive of the frozen sweep sha 5cb0ba5398b7533eccd7fd9514b8ec22cf4eb688 (one binary per model\u00d7dtype; fp8 = quant/fp8-dynamic-per-channel on the RedHatAI FP8-dynamic checkpoints; pod image libflex 68bb1ad2 on nickm/nickm2/nickm3). scr serve --device spyre, taskset -c 48-95, port 8079. Rung 1: --no-prefix-caching --max-num-seqs 2 --max-model-len 34816, streaming /v1/chat/completions, empty system message, greedy, 128 output tokens with ignore_eos, 3 reps on distinct prompts, medians (ITL = median of each request's p50). This sweep's rung-1 prompts recorded 1.5\u00d7 their parameters server-side (207/1614/15209 tokens for parameters 128/1061/10091), so every rung-1 square is left out pending re-measurement with the client calibrated so the server records the bucket's length (#677). Batched: --max-num-seqs 4/8, --max-model-len 8704 (8b) / 12288 (2b; 8b ~10k keeps 34816), vllm bench serve on the shared conc-* sets (123/1024/10300), 16 prompts, 2 reps per back-to-back boot, cell = rep 2 (steady state)."
+    "host": "nickm (fp16, including the fp16 rung-1 re-measure), nickm2 (fp8 batched and the fp8 rung-1 re-measure), nickm3 (fp8 rung 1 first pass, card 122 pinned to 1c:00.0 \u2014 its prompts recorded 1.5\u00d7 the bucket, #677, discarded)",
+    "harness": "built from a git archive of the frozen sweep sha 5cb0ba5398b7533eccd7fd9514b8ec22cf4eb688 (one binary per model\u00d7dtype; fp8 = quant/fp8-dynamic-per-channel on the RedHatAI FP8-dynamic checkpoints; pod image libflex 68bb1ad2 on nickm/nickm2/nickm3). scr serve --device spyre, taskset -c 48-95, port 8079. Rung 1: --no-prefix-caching --max-num-seqs 2 --max-model-len 34816, streaming /v1/chat/completions, empty system message, greedy, 128 output tokens with ignore_eos, 3 reps on distinct prompts, medians (ITL = median of each request's p50). The prompts are the 10-18 sweep's own base texts (scripts/spyre_rung1_prompts/), one per bucket with a distinct leading run-number line per rep, sent by scripts/bench_spyre_rung1.py, length-calibrated so the serve records the bucket's length (128/1061/10091; a cell whose serve-recorded prompt_tokens is off the bucket by >2% is refused). The fp16 rung-1 cells are the calibrated re-measure: the first pass recorded 1.5\u00d7 its buckets server-side (207/1614/15209) \u2014 a client words-per-token heuristic, not code (#677) \u2014 and was discarded. The fp8 rung-1 squares are that same re-measure (2b and 8b at ~123, on nickm2). Batched: --max-num-seqs 4/8, --max-model-len 8704 (8b) / 12288 (2b; 8b ~10k keeps 34816), vllm bench serve on the shared conc-* sets (123/1024/10300), 16 prompts, 2 reps per back-to-back boot, cell = rep 2 (steady state)."
   },
   "cells": [
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 61.0,
+      "scratchy": 42.90519212372601,
+      "note": "torch value carried from the 2026-10-18 sweep (measured 2026-10-14)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~1k",
+      "torch": 63.0,
+      "scratchy": 43.56076288968325,
+      "note": "torch value carried from the 2026-10-18 sweep (measured 2026-10-14)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~10k",
+      "torch": 75.0,
+      "scratchy": 57.56552005186677,
+      "note": "torch value carried from the 2026-10-18 sweep (measured 2026-10-14)."
+    },
     {
       "model": "granite-3.1-2b",
       "dtype": "fp16",
@@ -82,6 +112,34 @@
       "model": "granite-3.1-8b",
       "dtype": "fp16",
       "metric": "itl_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 143.5340106021613,
+      "scratchy": 131.12214813008904
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~1k",
+      "torch": 148.92181495441963,
+      "scratchy": 135.8591380994767
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~10k",
+      "torch": 164.0,
+      "scratchy": 154.6126778703183,
+      "note": "torch value carried from the 2026-10-18 sweep (measured 2026-10-14)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
       "conc": 4,
       "context": "~123",
       "torch": 144.39078664735837,
@@ -107,6 +165,36 @@
       "torch": 173.89633859023817,
       "scratchy": 199.3140734745847,
       "note": "two back-to-back reps on one boot \u2014 scratchy rep 1 231.657, rep 2 199.314 ms; torch rep 1 181.449, rep 2 173.896 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 111.0,
+      "scratchy": 67.50076892785728,
+      "note": "torch value carried from the 2026-10-18 sweep (measured 2026-10-14)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~1k",
+      "torch": 458.0,
+      "scratchy": 561.310307122767,
+      "note": "torch value carried from the 2026-10-18 sweep (measured 2026-10-14)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~10k",
+      "torch": 8227.0,
+      "scratchy": 7755.620501935482,
+      "note": "torch value carried from the 2026-10-18 sweep (measured 2026-10-14)."
     },
     {
       "model": "granite-3.1-2b",
@@ -167,6 +255,34 @@
       "torch": 12152.477052994072,
       "scratchy": 27615.9056276083,
       "note": "two back-to-back reps on one boot \u2014 scratchy rep 1 27764.7, rep 2 27615.9 ms; torch rep 1 11726.6, rep 2 12152.5 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 256.4256329787895,
+      "scratchy": 168.17617416381836
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~1k",
+      "torch": 946.2668369524181,
+      "scratchy": 1057.141387835145
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~10k",
+      "torch": 13035.0,
+      "scratchy": 12329.604053171352,
+      "note": "torch value carried from the 2026-10-18 sweep (measured 2026-10-14)."
     },
     {
       "model": "granite-3.1-8b",
@@ -287,21 +403,133 @@
       "torch": 44.96561118621276,
       "scratchy": 38.429517087377384,
       "note": "two back-to-back reps on one boot \u2014 scratchy rep 1 31.5547, rep 2 38.4295 tok/s; torch rep 1 41.8904, rep 2 44.9656 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 260.0923891024043,
+      "scratchy": 27.196462615393102
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "itl_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 441.8666422020133,
+      "scratchy": 36.07930136506683,
+      "note": "two back-to-back reps on one boot \u2014 scratchy rep 1 36.1535, rep 2 36.0793 ms; torch rep 1 439.315, rep 2 441.867 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 781.3521216491091,
+      "scratchy": 52.928415360842266,
+      "note": "two back-to-back reps on one boot \u2014 scratchy rep 1 52.9564, rep 2 52.9284 ms; torch rep 1 771.007, rep 2 781.352 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp8",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 257.0,
+      "scratchy": 73.966184980236,
+      "note": "torch value carried from the 2026-10-18 sweep (measured 2026-10-14)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 18845.162497018464,
+      "scratchy": 67.89839593693614
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "ttft_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 36613.71065303683,
+      "scratchy": 318.27117095235735,
+      "note": "two back-to-back reps on one boot \u2014 scratchy rep 1 320.576, rep 2 318.271 ms; torch rep 1 38195.8, rep 2 36613.7 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "ttft_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 37016.674472019076,
+      "scratchy": 580.1420034840703,
+      "note": "two back-to-back reps on one boot \u2014 scratchy rep 1 583.672, rep 2 580.142 ms; torch rep 1 37117.6, rep 2 37016.7 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp8",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 41700.0,
+      "scratchy": 149.90546717308462,
+      "note": "torch value carried from the 2026-10-18 sweep (measured 2026-10-14)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "tok_s",
+      "conc": 4,
+      "context": "~123",
+      "torch": 6.854060344913208,
+      "scratchy": 107.56466710513959,
+      "note": "two back-to-back reps on one boot \u2014 scratchy rep 1 107.406, rep 2 107.565 tok/s; torch rep 1 6.77922, rep 2 6.85406 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~123",
+      "torch": 8.58975543433008,
+      "scratchy": 145.64433932097884,
+      "note": "two back-to-back reps on one boot \u2014 scratchy rep 1 145.389, rep 2 145.644 tok/s; torch rep 1 8.57179, rep 2 8.58976 tok/s; the cell is each side's rep 2 (steady state)."
     }
   ],
   "since": "#621\u2013#668",
+  "target": {
+    "label": "8b moonshot \u00b7 short-context ITL",
+    "model": "granite-3.1-8b",
+    "dtype": "fp16",
+    "metric": "itl_ms",
+    "conc": 1,
+    "context": "~123",
+    "value": 110.0,
+    "why": "the card's measured ceiling: 16.36 GB/token at 149 GB/s, one fp16 matmul across all 32 cores"
+  },
   "moved": [
+    {
+      "pr": "#677",
+      "what": "rung-1 prompts re-measured at calibrated length. The first pass's prompts recorded 1.5\u00d7 their buckets server-side (207/1614/15209 for 128/1061/10091) \u2014 a client words-per-token heuristic, not code \u2014 and those cells are discarded. The re-measured cells (the 10-18 prompt texts; serve-recorded 128/1061/10091 per rep) show no rung-1 regression: see #667 and #641. The fp8 rung-1 squares land with them (8b fp8 TTFT 190 \u2192 149.9 ms)."
+    },
     {
       "pr": "#653\u2013#663, #647, #664",
       "what": "CB-submission ports, batch-chunk query groups and batch K/V gather in LX make the batch rungs measurable: this sweep adds the page's first fp16 batched cells. Conc 4 lands at parity with torch-spyre (2b ~1k ITL 64.8 vs 67.7 ms; 8b ~1k 161.3 vs 160.1 ms); conc 8 runs behind (8b ~1k 199.3 vs 173.9 ms; 38.4 vs 45.0 tok/s)."
     },
     {
       "pr": "#667",
-      "what": "prefill causal mask staged once per key. The rung-1 TTFT cells that would carry its claim are pending calibrated re-measurement \u2014 this sweep's rung-1 prompts recorded 1.5\u00d7 their bucket (#677) \u2014 so no cell claim."
+      "what": "prefill causal mask staged once per key. The re-measured rung-1 TTFT cells improved at every bucket on the same harness (2b 81 \u2192 67.5 ms at ~123, 636 \u2192 561 ms at ~1k, 8.15 \u2192 7.76 s at ~10k; 8b 12.8 \u2192 12.3 s at ~10k) \u2014 the sweep-over-sweep delta across #621\u2013#668, not this PR alone."
     },
     {
       "pr": "#641",
-      "what": "8b K\u1d57 kept in LX on the 8-page rung: the 10-18 lever projected \u2248\u221223 ms/step at 8b ~10k; the rung-1 cell that would test it is pending calibrated re-measurement (#677), so no cell claim this sweep."
+      "what": "8b K\u1d57 kept in LX on the 8-page rung: the 10-18 lever projected \u2248\u221223 ms/step at 8b ~10k; the re-measured cell is 154.6 ms against 10-18's 179.7 on the same harness \u2014 \u221225.0 ms/step, on the projection (sweep-over-sweep across #621\u2013#668)."
     },
     {
       "pr": "#648",
@@ -314,29 +542,41 @@
   ],
   "levers": [
     {
+      "lever": "8b decode floor",
+      "work": "131.1 ms at ~123 against the card's \u2248110 ms floor (16.4 GB/token at 149 GB/s) \u2014 the rest is attention and elementwise glue."
+    },
+    {
       "lever": "batched ~10k decode",
       "work": "2b conc-8 ~10k ITL 1178.9 ms vs torch 370.1 (3.2\u00d7); the 8b batched ~10k cells are absent by design \u2014 the KV budget at max-model-len 34816 fits \u22642 concurrent seqs."
     },
     {
       "lever": "conc-8",
       "work": "8b ~1k: torch-spyre 1.15\u00d7 ahead (ITL 173.9 vs 199.3 ms; 45.0 vs 38.4 tok/s); 2b near parity (88.9 vs 91.1 ms; 86.4 vs 84.1 tok/s). Batched TTFT is the wider gap: 2b conc-8 ~1k 1170 vs 464 ms, 8b 2546 vs 790 ms."
+    },
+    {
+      "lever": "8b fp8 prefill",
+      "work": "149.9 ms at ~123 \u2014 11% under this sweep's fp16 (168.2) and 21% under 10-18's fp8 (190): the halved weight bytes now beat the per-row quantize overhead, but only just; fusing the quantize into the matmul is still the work."
+    },
+    {
+      "lever": "per-token overhead",
+      "work": "2b fp8 short-context ITL is 27.2 ms; ~10% of it is host time between steps \u2014 compile-time CB replay with the next token chosen on the device (#603)."
     }
   ],
   "notes": {
     "decode": [
       "Short-context parity is a shared floor: both stacks stream 16.4 GB of fp16 weights per token. Measured on the card (17 Oct), one fp16 matmul streams at most ~149 GB/s, and only across all 32 cores \u2014 the cost model's 204.8 GB/s peak is not reachable \u2014 so fp16 at one request bottoms out near 110 ms/token.",
-      "Every rung-1 (single-request) scratchy cell is pending calibrated re-measurement: the rung-1 prompts recorded 1.5\u00d7 their bucket server-side (207/1614/15209 tokens for parameters 128/1061/10091), so their squares are left out rather than showing values taken at the wrong length (#677). The batched cells are unaffected \u2014 both stacks ran vllm bench on the same conc-* sets. The rung-1 squares return in a follow-up, with the client calibrated so the server records 128/1061/10091."
+      "The fp16 rung-1 (single-request) cells are the calibrated re-measure (#677): the first pass's prompts recorded 1.5\u00d7 their buckets server-side (207/1614/15209 for 128/1061/10091 \u2014 a client words-per-token heuristic, not code), so those cells were discarded and the legs re-run with the tokenizer-calibrated client sending the 10-18 sweep's own prompt texts; the serve recorded 128/1061/10091 per rep, gated to \u00b12%. The fp8 rung-1 squares are that same re-measure, run on nickm2: 2b ITL 27.20 ms (10-18: 26.19) and 8b 73.97 (72.61) \u2014 flat. The batched cells are unaffected \u2014 both stacks ran vllm bench on the same conc-* sets."
     ],
     "prefill": [
-      "The rung-1 TTFT squares are pending for the reason in the decode note: this sweep's rung-1 prompts recorded 1.5\u00d7 their bucket (207/1614/15209 server-side), which is also why this sweep states no rung-1 TTFT deltas against 2026-10-18 (#677). The batched TTFT cells stand \u2014 both sides ran the same conc-* sets."
+      "The fp16 rung-1 TTFT squares are the calibrated re-measure (#677; serve-recorded 128/1061/10091 per rep). Against 2026-10-18 on the same harness they improved at every bucket \u2014 2b 81 \u2192 67.5 ms at ~123, 636 \u2192 561 ms at ~1k, 8.15 \u2192 7.76 s at ~10k; 8b 12.8 \u2192 12.3 s at ~10k \u2014 so the first pass's apparent prefill regression was the prompt-length artifact, not code. The fp8 rung-1 TTFT squares are the same re-measure on nickm2: 8b fp8 149.9 ms (10-18: 190) \u2014 21% better and 11% under this sweep's fp16 168.2 \u2014 and the first 2b fp8 TTFT cell, 67.9 ms. The batched TTFT cells stand \u2014 both sides ran the same conc-* sets."
     ],
     "conc": [
       "Every batched cell is the second of two back-to-back reps on one server boot (rep 1 is reliably the slow rep \u2014 TTFT ~6\u20137 s vs ~2.6 s, a property of the harness); both reps are recorded in each cell's note. Decode squares prefer itl_ms (per-request median TPOT under that batch); tok_s is recorded alongside for the concurrency view. The 2026-10-18 conc-8 cells recorded no rep convention (a single bench after two warmups), so this sweep's conc-8 ~1k cells are stated against torch, never as cross-sweep deltas.",
       "The 8b fp16 batched ~10k squares are unmeasured by design: the serve refuses at boot \u2014 max-model-len 34816 \u00d7 max-num-seqs 4 needs 545 KV pages (32700 MB at 60 MB per page) against the 16384 MB budget (273 pages); at max-num-seqs 8 it needs 1089 pages (65340 MB). 8b ~10k at this max-model-len fits \u22642 concurrent seqs; left absent rather than re-run at a smaller max-model-len, which would make the cell non-like-for-like with its row.",
-      "Pending re-runs, left out rather than carrying old numbers: the five torch fp8 legs moved onto nickm4 (t1/t4/t8-2b-8-123, t4/t8-8b-8-123 \u2014 nickm3/nickm2's image libflex cannot boot torch serves; only nickm4's image matches the reference venv) and t8-8b-16-123, whose first boot died to a PCIe bus fence (RAS::PCI::BusFence 0xa35e; the card recovered and the following leg booted clean); plus every rung-1 scratchy leg \u2014 the rung-1 prompts recorded 1.5\u00d7 their bucket (207/1614/15209 server-side; #677), so those squares await calibrated re-measurement rather than carrying values taken at the wrong length. All land in a follow-up to this same file (same sha, same harness \u2014 one sweep)."
+      "Three legs are left out rather than carrying old numbers, all on the torch side. t4/t8-8b-8-123 (8b fp8 conc): the serve boot exceeds the harness's 900 s ready window \u2014 attention-graph recording alone took 428.7 s and the serve was healthy, just slow \u2014 so both stripe pending a re-run with a longer window. t8-8b-16-123: the re-run died to RAS::VFIO::DeviceOpenFail 0x332b (\"Device or resource busy\" \u2014 Failed to open the IBM Spyre VFIO device) because the timed-out 8b fp8 serve had not released /dev/vfio/54 when this serve opened it; its first attempt died to a PCIe bus fence (RAS::PCI::BusFence 0xa35e; the card recovered and the following leg booted clean). The 2b fp8 torch legs landed on nickm4 (t1/t4/t8-2b-8-123). All land in a follow-up to this same file (same sha, same harness \u2014 one sweep)."
     ],
     "fp8": [
-      "The fp8 rung-1 squares (2b/8b at ~123) sit in the rung-1 pending set \u2014 their prompts recorded ~1.5\u00d7 the bucket, so they await calibrated re-measurement (#677); the fp8 conc squares sit in the concurrency notes' pending set (the five torch fp8 legs moved to nickm4)."
+      "The fp8 rung-1 squares (2b/8b at ~123) are the #677 calibrated re-measure on nickm2 (serve-recorded 128 per rep): 2b 27.20 ms ITL / 67.9 ms TTFT (the first 2b fp8 TTFT cell), 8b 73.97 / 149.9. On the torch side the 2b fp8 legs landed on nickm4 \u2014 rung-1 ITL 260.1 ms, ~9.6\u00d7 scratchy's 27.2 \u2014 while the 8b fp8 conc squares sit in the concurrency notes' pending set (serve boots exceed the ready window)."
     ]
   }
 }
