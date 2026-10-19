@@ -451,6 +451,67 @@ pub fn ladder_stages_one_layout(ceiling: &BundleLayout, rung: &BundleLayout) -> 
     ))
 }
 
+/// ⭐⭐⭐ ONE MODEL PACKS ONE RESIDENT WEIGHT SEGMENT — this bundle's packed size for it, as the
+/// runtime's own alias guard reads it: bank 0's bytes ([`BundleLayout::segment_bytes`] at the
+/// weight segment) plus the extra banks ([`BundleLayout::weight_bank_bytes`]).
+///
+/// The sessions a model serves share the weight segment OUTRIGHT (`Executor::alias_seg_from`
+/// points a borrowing session's descriptor at the owner's region), and that guard refuses on a
+/// packed-size mismatch BEFORE it ever compares a placement — so a bundle that reserves bytes a
+/// sibling does not is a card-load refusal waiting to happen, whatever the bake thought it was
+/// doing. This is the record the expansion's parity ledger ([`weight_segment_parity`]) holds one
+/// of per baked bundle; factored so the macro never spells a segment index. The SHIPPED side's
+/// twin — `BundleLayout::weight_seg_record` in `scratchy-spyre-bundle` — reads the same numbers
+/// off the artifact the runtime loads, and the model-side test compares that one.
+pub fn weight_seg_record(layout: &BundleLayout) -> (u64, Vec<u64>) {
+    (
+        layout.segment_bytes[SegRole::Weight.segment()],
+        layout.weight_bank_bytes.clone(),
+    )
+}
+
+/// ⛔⛔⛔ THE WEIGHT-SEGMENT PARITY LEDGER'S LAW — every bundle one model bakes must report the
+/// SAME [`weight_seg_record`], or the build refuses naming both bundles.
+///
+/// The expansion records one entry per superdsc bundle it lowers — the decode ceiling, every
+/// ladder rung, every batch rung, every prefill width — and calls this once, after the last
+/// bake. The first entry is the reference; any later entry that disagrees is a BUILD error,
+/// never a card failure: the runtime's alias guard compares exactly these numbers when a
+/// session takes another's resident weights, so a skew here is a load-time refusal there. The
+/// KNOWN first offender is the composite argmax's NaN sentinel row: the first PR3a cut reserved
+/// it on the one-request rung alone (`argmax`), the decode session's seg1 grew `hidden · 2`
+/// bytes over the prefill session's, and every PR card cell died at load with
+/// `alias_seg(seg1): SIZE MISMATCH dst(packed=…) src(packed=…)` — +4096 B at 2b (hidden 2048),
+/// +8192 B at 8b (hidden 4096). The reservation is model-scoped now
+/// ([`RungFacts::tied_table`], threaded from the first bake's recognition); this ledger is the
+/// guard that keeps the NEXT skew a build error instead of a card failure.
+///
+/// An empty ledger is `Ok` — a bake that recorded nothing (KTIR-only, no superdsc section)
+/// has no bundles to disagree.
+pub fn weight_segment_parity(ledger: &[(String, u64, Vec<u64>)]) -> Result<(), String> {
+    let Some((first_base, first_bank0, first_banks)) = ledger.first() else {
+        return Ok(());
+    };
+    for (base, bank0, banks) in ledger.iter().skip(1) {
+        if bank0 != first_bank0 || banks != first_banks {
+            return Err(format!(
+                "two bundles of one model pack different resident weight segments — every bundle \
+                 shares ONE weight segment (the sessions alias it outright, and the alias guard \
+                 refuses on these very numbers at card load): {first_base} packs bank0 {first_bank0} \
+                 B + {} bank(s) {:?}, {base} packs bank0 {bank0} B + {} bank(s) {:?}. The composite \
+                 argmax's NaN sentinel row is the known first offender — it is a MODEL-scoped \
+                 reservation (RungFacts::tied_table, threaded from the first bake's recognition), \
+                 never the composite's own rung alone",
+                first_banks.len(),
+                first_banks,
+                banks.len(),
+                banks,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// ⭐ THE SCALAR REGISTRY, factored out of [`compute_bundle_layout`] so a pass that needs only
 /// the registry can build it WITHOUT a placement: the distinct config-derived on-device scalar
 /// VALUES, content-dedup'd by BITS, in node-walk order. Index `i` ↔ reserved const TID
@@ -745,15 +806,29 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // bundle, which has no layer boundary and therefore cannot bank. A uniform model is one class,
     // so a one-element slice is exactly the pre-class single map.
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
-    // ⭐⭐⭐ THE COMPOSITE ARGMAX'S TABLE FACTS — `Some` iff the rolled walk recognized a TIED
+    // ⭐⭐⭐ THE COMPOSITE ARGMAX'S OWN-RUNG FACTS — `Some` iff the rolled walk recognized a TIED
     // ONE-REQUEST lm-head tail (see [`crate::lower_subtile_tape_to_ktir::recognize_argmax`]'s
-    // law), so this layout must place the chain's two resident fp32 constants AND extend the
-    // table's placement by one zero row (the NaN sentinel — see the source loop). `None` for
-    // every untied model, prefill bundle and batched rung — a bundle without the composite
-    // never places or stages them, and its table keeps its bare size. The vocab is the TABLE's
-    // own row count (the gather's bank height, the ramp's width), handed down by the
+    // law), so this layout must place the chain's resident fp32 constants (the ramp, the
+    // scalar-V stick, the pad-lane bias) and register the real vocab on
+    // [`BundleLayout::argmax_vocab`]. `None` for every untied model, prefill bundle and batched
+    // rung — a bundle without the composite never places or stages them. The vocab is the
+    // TABLE's own row count (the gather's bank height, the ramp's width), handed down by the
     // recognition that read it off the graph.
     argmax: Option<ArgmaxTable>,
+    // ⭐⭐⭐ THE TIED TABLE'S SENTINEL ROW, AS A MODEL-SCOPED RESERVATION — `Some` for EVERY
+    // bundle of a model whose one-request rung minted the composite, `None` for every model
+    // that minted none. This is what extends the tied lm-head table's placement by one zero
+    // row (the NaN sentinel — see the source loop), and it is deliberately NOT the composite's
+    // own `argmax` fact above: the row must be reserved IDENTICALLY by prefill, by every
+    // batched rung and by the one-request rung itself, because every bundle of a model packs
+    // ONE shared resident weight segment — the sessions alias it outright
+    // (`Executor::alias_seg_from`), and its guard refuses on a packed-size mismatch. The
+    // first PR3a cut keyed the extension on the composite alone, so the one-request rung's
+    // seg1 grew `hidden · 2` bytes over its prefill and batched siblings (MEASURED on the
+    // card: +4096 B at 2b, +8192 B at 8b — every PR cell refused at load with
+    // `alias_seg(seg1): SIZE MISMATCH`); the facts thread model-wide from the ONE recognition
+    // that proved them (the first bake's), so the layout never re-derives them per sibling.
+    tied_table: Option<ArgmaxTable>,
 ) -> Result<BundleLayout, SuperDscError> {
     // fp8 W8A8 weights (SEN143_FP8: 1-byte / 128-elem stick) are `input[1]` of any arity-3 MatmulTile.
     // Their device footprint is HALF the fp16 weight — this is the unfakeable 1-byte-read proxy: it is
@@ -1060,7 +1135,15 @@ pub fn compute_bundle_layout<F: RopeForm>(
         //    a VALID token the detokenizer would happily emit); the host side treats idx ≥ V
         //    as a loud step failure naming NaN logits, so the row exists to make the device
         //    read defined, never to be served.
-        if let Some(argmax) = &argmax
+        //
+        //    ⛔ KEYED ON THE MODEL-SCOPED `tied_table`, NEVER ON THE COMPOSITE'S OWN `argmax`:
+        //    every bundle of the model packs ONE shared resident weight segment, so the row
+        //    must move the packing of prefill and every batched rung by the same bytes or the
+        //    sessions' `alias_seg(seg1)` refuses at card load. The first PR3a cut keyed this
+        //    site on the composite alone — the one-request rung reserved the row and its
+        //    siblings did not, and every PR card cell died at load on the packed-size
+        //    mismatch; `tied_table` is the same fact threaded model-wide.
+        if let Some(argmax) = &tied_table
             && argmax.table_tid == tid
             && role == SegRole::Weight
         {
@@ -8256,7 +8339,7 @@ mod tests {
             op_output: Vec::new(),
         };
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None)
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None, None)
             .expect("a layout for a plain matmul bundle");
 
         // ⭐ ROLES AND PACKING, ASSERTED AS THE RULES — not as magic numbers. This test pinned
@@ -8625,7 +8708,7 @@ mod tests {
         // the extraction program and the door must Err naming it.
         let (node, ir) = build(mq);
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None)
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None, None)
             .expect("the tail's layout mints");
         let mut programs = scratchy_triton_splice::lower_all(&node, &ir, false)
             .expect("the splice's fold mints the tail");
@@ -8705,7 +8788,7 @@ mod tests {
         // fp8 (arity-3): the placement reserves the PADDED extent — 2176·2816·1 B, the exact
         // bytes the matmul's tile read addresses (the refusal's access side).
         let ir = build(GemmWeight::Fp8Dynamic);
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None)
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None, None)
             .expect("the fp8 layout mints");
         let p = layout.placements.get(&1).expect("the fp8 weight is placed");
         assert_eq!(
@@ -8714,7 +8797,7 @@ mod tests {
         );
         // fp16 (arity-2), SAME shape: raw rows — 2112 = 33 whole fp16 sticks, no pad.
         let ir = build(GemmWeight::Dense);
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None)
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None, None)
             .expect("the fp16 layout mints");
         let p = layout
             .placements
@@ -9412,7 +9495,7 @@ mod tests {
         let weight_ids: std::collections::HashSet<u32> = [0u32].into_iter().collect();
         // The budget pass refuses the same fixture the wiring accepts — on the UNROLLED graph,
         // with no layer classes, an over-cap weight segment is un-bankable and un-spillable.
-        let err = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None)
+        let err = compute_bundle_layout(&ir, &weight_ids, false, false, &[], None, None)
             .expect_err("the placement pass is the budget law and must refuse 32 GiB in seg1");
         assert!(
             err.0.contains("one device region can hold"),

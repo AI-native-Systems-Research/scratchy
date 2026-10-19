@@ -292,6 +292,23 @@ impl<'a> BundleLayout<'a> {
             Some(i) => self.weight_bank_bytes.get(i).copied(),
         }
     }
+
+    /// ⭐⭐⭐ ONE MODEL PACKS ONE RESIDENT WEIGHT SEGMENT — this SHIPPED layout's packed size for
+    /// it, as the runtime's own alias guard reads it: bank 0's bytes ([`Self::segment_bytes`] at
+    /// `SegRole::Weight`) plus the extra banks ([`Self::weight_bank_bytes`]).
+    ///
+    /// The twin of the producer-side `lower_subtile_tape_to_superdsc::weight_seg_record`, which
+    /// reads the SAME numbers off the ktir-side plan the bake just built. The bake's parity ledger
+    /// compares that one; the model-side test (`argmax_composite_expansion.rs`) compares THIS one
+    /// back off the `inventory` registry, off the bundles that actually shipped — so the two
+    /// readings cannot drift apart, because this crate's one-type-family law is exactly what
+    /// forbids a field-for-field conversion between them.
+    pub fn weight_seg_record(&self) -> (u64, Vec<u64>) {
+        (
+            self.segment_bytes[ktir_superdsc::placement::SegRole::Weight.segment()],
+            self.weight_bank_bytes.to_vec(),
+        )
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════

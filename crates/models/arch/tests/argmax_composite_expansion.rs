@@ -287,3 +287,72 @@ fn an_untied_model_places_no_composite() {
         assert_eq!(BakeFacts::of(&code.layout).argmax_vocab, 0);
     }
 }
+
+/// ⭐⭐⭐ ONE MODEL PACKS ONE RESIDENT WEIGHT SEGMENT — the seg1 parity law, read off
+/// the REAL baked layouts: every decode rung AND the prefill bundle of a tied model
+/// must report the SAME packed weight segment (bank 0 bytes + extra banks), because
+/// the card's prefill session takes the decode session's resident weights at load
+/// and `Executor::alias_seg_from` refuses on exactly these numbers.
+///
+/// This is #603 PR3a's card lesson made a test: the first cut reserved the composite
+/// argmax's NaN sentinel row on the one-request rung ALONE (`argmax`), the decode
+/// session's seg1 grew `hidden · 2` bytes over the prefill session's (+4096 B at 2b,
+/// +8192 B at 8b), and every PR card cell died at load with
+/// `alias_seg(seg1): SIZE MISMATCH dst(packed=…) src(packed=…)` — a skew no
+/// cardless gate could see, because only a real two-session load aliases seg1. The
+/// reservation is MODEL-scoped now (`RungFacts::tied_table`, threaded from the first
+/// bake's recognition), the bake refuses a mixed ledger at expansion time
+/// (`weight_segment_parity`), and THIS test reads the equality back off the bundles
+/// that actually shipped — the model-side half of the spyre-crate walk test
+/// (`argmax_composite_walk.rs`'s `every_bundle_of_a_tied_model_packs_one_weight_segment`).
+fn assert_one_weight_segment(kb: &KtirBundle, what: &str) {
+    let mut bundles = decode_bundles(kb);
+    if let Some(p) = kb.prefill.as_ref() {
+        let anchor = bundle(p.fp).unwrap_or_else(|| panic!("the prefill anchor {} resolves", p.fp));
+        // The prefill anchor's own reroll rungs, resolved the same way the decode
+        // ladder's are — every loadable bundle of the model is in the comparison.
+        if let Some(meta) = &anchor.reroll {
+            for rung in meta.rungs.iter() {
+                for fp in rung
+                    .bodies
+                    .iter()
+                    .chain(rung.bodies_fused.iter())
+                    .filter(|s| !s.is_none())
+                {
+                    bundles.push(bundle(fp.as_str()).unwrap_or_else(|| {
+                        panic!("the prefill rung body {} resolves", fp.as_str())
+                    }));
+                }
+            }
+        }
+        bundles.push(anchor);
+    }
+    assert!(!bundles.is_empty(), "{what} bakes bundles to compare");
+    let first = bundles[0].layout.weight_seg_record();
+    for code in &bundles[1..] {
+        let here = code.layout.weight_seg_record();
+        assert_eq!(
+            first, here,
+            "{what}: the bundle {} packs a weight segment apart from {}'s — the card's \
+             prefill session aliases the decode session's resident weights, and the alias \
+             guard refuses on exactly these numbers",
+            code.fp, bundles[0].fp,
+        );
+    }
+}
+
+/// Both TIED granites — the card gate's own cell models — pack one weight segment
+/// across their whole ladders: every decode rung (which reserves the sentinel row
+/// through its own recognition or the threaded facts) and the prefill bundle (which
+/// has no composite, and reserves the row through the threaded facts alone).
+#[test]
+fn tied_granites_pack_one_weight_segment_across_their_ladders() {
+    assert_one_weight_segment(
+        &scratchy_models::granite::granite_3_3_2b_base::KTIR_BUNDLE,
+        "granite-3.3-2b-base",
+    );
+    assert_one_weight_segment(
+        &scratchy_models::granite::granite_3_1_2b_instruct::KTIR_BUNDLE,
+        "granite-3.1-2b-instruct",
+    );
+}

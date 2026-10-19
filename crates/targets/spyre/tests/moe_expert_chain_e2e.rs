@@ -721,6 +721,9 @@ fn the_router_projection_w_is_a_retiled_kernel_weight() {
             one_request: false,
             chunk_pages: None,
             argmax: None,
+            // No tied table to reserve for: the router head is neither tied nor
+            // one-request, so no rung of it mints the composite.
+            tied_table: None,
         },
     )
     .unwrap_or_else(|e| panic!("lower the router head: {e:?}"));

@@ -53,7 +53,8 @@ use scratchy_subtile::subtile_ir::{
 use scratchy_subtile::subtile_tape::{lower_dag_to_tape, reroll_subtile_tape};
 use scratchy_target_spyre::lower_subtile_tape_to_ktir::lm_head_admits_the_composite;
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
-    ActiveCap, RolledSuperDsc, RungFacts, lower_subtile_tape_to_superdsc,
+    ActiveCap, ArgmaxTable, RolledSuperDsc, RungFacts, lower_subtile_tape_to_superdsc,
+    weight_seg_record, weight_segment_parity,
 };
 
 /// Small stick-legal geometry: hidden/kv/intermediate 256 (four sticks), head_dim 64
@@ -271,10 +272,42 @@ fn walk_tied(
             one_request: true,
             chunk_pages: None,
             argmax,
+            // The one-request rung is the recognition's OWN source — the model-scoped
+            // reservation derives from its walk (the driver threads the cache, `None`
+            // on the first bake, exactly as here).
+            tied_table: None,
         },
     )
     .unwrap_or_else(|e| panic!("the tied one-request walk: {e:?}"));
     (rolled, rg)
+}
+
+/// A SIBLING bundle's walk over the same tied graph — the shape the expansion bakes
+/// for every bundle of a tied model that is NOT the one-request rung: no composite
+/// token (a prefill width or batch rung is never one-request), and the model's cached
+/// table threaded through `RungFacts::tied_table` when `Some`. This is the walk whose
+/// seg1 skew killed every PR3a card cell: the sibling MUST reserve the sentinel row
+/// from the threaded facts, never from a recognition of its own (it has none).
+fn walk_tied_sibling(table: Option<ArgmaxTable>) -> RolledSuperDsc {
+    let (input, weight_ids) = n_layer_tied(LAYERS, true);
+    let rg = lower_region(&input, std::num::NonZeroU32::new(8192).unwrap());
+    let valid = ValidatedGraph::new(&rg).expect("the tied two-layer graph validates");
+    let tape = lower_dag_to_tape(&valid);
+    let rolled_tape = reroll_subtile_tape(&tape, &rg);
+    lower_subtile_tape_to_superdsc(
+        &rolled_tape,
+        &rg,
+        &weight_ids,
+        ActiveCap::FULL,
+        false,
+        RungFacts {
+            one_request: false,
+            chunk_pages: None,
+            argmax: None,
+            tied_table: table,
+        },
+    )
+    .unwrap_or_else(|e| panic!("the tied sibling walk: {e:?}"))
 }
 
 /// The lm-head matmul node — the ONLY matmul at the vocab width (every layer
@@ -556,6 +589,9 @@ fn walk_refuses(ir: &SubtileIR<NeoX>) -> String {
             one_request: true,
             chunk_pages: None,
             argmax: Some(tied()),
+            // The refusal under test fires in the recognition, before any layout
+            // fact is read — no reservation threads into it.
+            tied_table: None,
         },
     ) {
         Err(e) => e.0,
@@ -790,5 +826,188 @@ fn every_cap_rung_mints_the_identical_composite() {
         low.iter().zip(&ceil).any(|(a, b)| a != b),
         "the lowest interior rung's attention program differs from the ceiling's — the \
          rungs are genuinely different lowerings, or this assert pins nothing"
+    );
+}
+
+// ── THE SEG1 PARITY LAW (#603 PR3a's card lesson) ──────────────────────────────────────────
+//
+// The sentinel row is a MODEL-scoped reservation, and these three tests pin the law
+// from the walk's own side, cardless: the equality the runtime's `alias_seg` guard
+// demands at load, the ledger that refuses a mixed ladder at bake, and the refusal
+// that keeps the threaded facts and a rung's own recognition from ever disagreeing
+// quietly. The model-side half (a real granite expansion's prefill and decode
+// bundles packing equal weight segments) lives in `argmax_composite_expansion.rs`.
+
+/// ⭐⭐⭐ EVERY BUNDLE OF A TIED MODEL PACKS ONE WEIGHT SEGMENT — the card-load
+/// equality, tested where it is minted. The one-request rung reserves the sentinel
+/// row through its own recognition; a sibling (prefill width, batch rung — never
+/// one-request, no recognition of its own) reserves THE SAME row through the
+/// model's threaded facts, so the two bundles' packed weight segments are
+/// IDENTICAL — the exact numbers `Executor::alias_seg_from` compares when the
+/// prefill session takes the decode session's resident weights at load.
+///
+/// The first PR3a cut reserved the row on the composite's rung ALONE: the decode
+/// session's seg1 grew `hidden · 2` bytes over the prefill session's (+4096 B at
+/// 2b, +8192 B at 8b — hidden 2048 and 4096) and every PR card cell refused at
+/// load with `alias_seg(seg1): SIZE MISMATCH`. The bare-sibling assert below is
+/// the non-vacuity half: without the threaded reservation the segments really do
+/// differ, so the equality assert is pinning the reservation, not a tautology.
+#[test]
+fn every_bundle_of_a_tied_model_packs_one_weight_segment() {
+    // The one-request rung — the composite's own bundle, its recognition the facts'
+    // one source.
+    let (rung, _) = walk_tied(true, Some(tied()), ActiveCap::FULL);
+    let mint = rung
+        .argmax
+        .as_ref()
+        .expect("the composite minted on the one-request rung");
+    let rung_seg = weight_seg_record(&rung.layout);
+
+    // NON-VACUITY — the reservation is real: the composite's own rung packs MORE
+    // weight-segment bytes than a bare sibling, by exactly the sentinel row.
+    let bare = weight_seg_record(&walk_tied_sibling(None).layout);
+    assert!(
+        rung_seg.0 > bare.0,
+        "the one-request rung reserves the sentinel row: {} B > the bare sibling's {} B",
+        rung_seg.0,
+        bare.0,
+    );
+    assert_eq!(
+        rung_seg.0 - bare.0,
+        u64::from(mint.table.hidden) * 2,
+        "the difference is EXACTLY one fp16 sentinel row (hidden {} · 2)",
+        mint.table.hidden
+    );
+
+    // THE EQUALITY — the sibling with the model's threaded table packs the SAME
+    // weight segment as the composite's own rung: same bank 0 bytes, same banks.
+    // This is the pair the card loads and aliases.
+    let sibling = weight_seg_record(&walk_tied_sibling(Some(mint.table.clone())).layout);
+    assert_eq!(
+        rung_seg, sibling,
+        "the one-request rung and a threaded sibling pack the same resident weight \
+         segment — the numbers alias_seg compares at load"
+    );
+
+    // And the sibling's TABLE PLACEMENT itself carries the row: same offset, same
+    // EXTENDED size as the rung's — the runtime's per-tensor placement check (the
+    // one past the packed-size guard) reads these too.
+    let sibling_layout = &walk_tied_sibling(Some(mint.table.clone())).layout;
+    let rung_table = rung.layout.placements[&mint.table.table_tid];
+    let sibling_table = sibling_layout.placements[&mint.table.table_tid];
+    assert_eq!(
+        (rung_table.offset, rung_table.size),
+        (sibling_table.offset, sibling_table.size),
+        "the tied table's placement (offset, size) is identical across the rung and its \
+         sibling — the alias guard compares placements, not just totals"
+    );
+}
+
+/// ⛔ THE PARITY LEDGER REFUSES A MIXED LADDER — the bake-time half of the runtime's
+/// alias guard: one bundle reserving bytes a sibling does not is a BUILD error
+/// naming both, never a card-load refusal. An agreeing (or empty) ledger passes.
+#[test]
+fn the_parity_ledger_refuses_a_mixed_ladder_and_passes_one_that_agrees() {
+    assert!(
+        weight_segment_parity(&[]).is_ok(),
+        "an empty ledger (nothing baked a superdsc section) is trivially fine"
+    );
+    assert!(
+        weight_segment_parity(&[
+            ("decode (ceiling)".into(), 5075443712, Vec::new()),
+            (
+                "decode (rung cap 2048 chunk None)".into(),
+                5075443712,
+                Vec::new()
+            ),
+            ("ktir_prefill_m31".into(), 5075443712, Vec::new()),
+        ])
+        .is_ok(),
+        "a ledger whose bundles agree passes"
+    );
+    // The PR3a card failure's own numbers — 2b fp16: the decode session's seg1 was
+    // +4096 B over the prefill session's (dst 5075439616 vs src 5075443712).
+    let err = weight_segment_parity(&[
+        ("decode (ceiling)".into(), 5075443712, Vec::new()),
+        ("ktir_prefill_m31".into(), 5075439616, Vec::new()),
+    ])
+    .expect_err("a mixed ledger refuses");
+    assert!(
+        err.contains("decode (ceiling)") && err.contains("ktir_prefill_m31"),
+        "the refusal names both bundles: {err}"
+    );
+    assert!(
+        err.contains("5075443712") && err.contains("5075439616"),
+        "the refusal names both packed sizes: {err}"
+    );
+    // A banked model's skew — the extra banks are part of the record, so a skew
+    // that lands past bank 0 is caught too (the 8b's borrowed-segment shape: a
+    // 128 B placeholder's packed expectation still must match).
+    let err = weight_segment_parity(&[
+        (
+            "decode (ceiling)".into(),
+            8_000_000_000,
+            vec![4_000_000_000],
+        ),
+        (
+            "ktir_prefill_m31".into(),
+            8_000_000_000,
+            vec![4_000_008_192],
+        ),
+    ])
+    .expect_err("a bank-level skew refuses");
+    assert!(
+        err.contains("bank"),
+        "the refusal states the bank counts: {err}"
+    );
+}
+
+/// ⛔ A CACHED TABLE THAT DISAGREES WITH THE RUNG'S OWN RECOGNITION REFUSES — one
+/// model has ONE lm-head table; the threaded facts and a rung's own walk naming
+/// different tensors is a wiring inconsistency, named loudly at the walk, never a
+/// quiet pick of one side (which would reserve the row on the wrong placement).
+#[test]
+fn a_cached_table_that_disagrees_with_the_recognition_refuses() {
+    let (rung, _) = walk_tied(true, Some(tied()), ActiveCap::FULL);
+    let mut wrong = rung
+        .argmax
+        .as_ref()
+        .expect("the composite minted on the one-request rung")
+        .table
+        .clone();
+    // A DIFFERENT table: another row width — not this model's geometry.
+    wrong.hidden += 64;
+    let (input, weight_ids) = n_layer_tied(LAYERS, true);
+    let rg = lower_region(&input, std::num::NonZeroU32::new(8192).unwrap());
+    let valid = ValidatedGraph::new(&rg).expect("the tied two-layer graph validates");
+    let tape = lower_dag_to_tape(&valid);
+    let rolled_tape = reroll_subtile_tape(&tape, &rg);
+    let err = match lower_subtile_tape_to_superdsc(
+        &rolled_tape,
+        &rg,
+        &weight_ids,
+        ActiveCap::FULL,
+        false,
+        RungFacts {
+            one_request: true,
+            chunk_pages: None,
+            argmax: Some(tied()),
+            // The "cache" from a first bake that recognized a DIFFERENT table.
+            tied_table: Some(wrong),
+        },
+    ) {
+        Err(e) => e.0,
+        // `RolledSuperDsc` is not `Debug`, so the Ok arm states its own refusal.
+        Ok(_) => panic!("a disagreeing cache must refuse, not pick a side"),
+    };
+    assert!(
+        err.contains("disagrees with the table the model's first bake cached"),
+        "the refusal names the disagreement: {}",
+        err
+    );
+    assert!(
+        err.contains("one model has ONE table"),
+        "the refusal states the law: {}",
+        err
     );
 }

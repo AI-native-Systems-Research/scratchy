@@ -1202,6 +1202,11 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
         // there; this direct entry serves prefill (never one-request) and the emu-only
         // graphs, neither of which carries the tie token.
         None,
+        // And no model-scoped sentinel row: the unrolled walk's bundles are the
+        // EMULATOR's (in-process, no two-session aliasing of a resident weight
+        // segment), so the parity law the reservation serves has no reader here. The
+        // card's bundles all come through the rolled walk above.
+        None,
     )?;
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(ir.nodes.len());
     // Collect EVERY distinct unhandled op kind (the full worklist) in one pass —
@@ -1819,6 +1824,18 @@ pub struct RungFacts {
     /// graph whose tail this walk cannot recognize is a LOUD error — never a silent
     /// host fallback (see `recognize_argmax`).
     pub argmax: Option<TiedLmHeadEmbedding>,
+    /// ⭐⭐⭐ THE TIED TABLE'S SENTINEL ROW, AS A MODEL-SCOPED RESERVATION — `Some` for
+    /// EVERY bundle of a model whose one-request rung minted the composite, whatever
+    /// this rung is: the facts ([`ArgmaxTable`]) come from the FIRST bake's own
+    /// recognition, threaded by the expansion to every sibling, so each bundle's
+    /// [`compute_bundle_layout`](crate::lower_subtile_tape_to_superdsc::compute_bundle_layout)
+    /// reserves the table's NaN sentinel row and the resident weight segment packs
+    /// IDENTICALLY across the whole ladder. `None` when no rung of the model minted
+    /// the composite (untied, staged lm-head, non-stick hidden) and on this crate's
+    /// direct test entries, which state the fact they are testing. When this rung's
+    /// own recognition fires too (`argmax` also `Some`), the two must agree — one
+    /// model has ONE table — and a disagreement is a loud error, never a quiet pick.
+    pub tied_table: Option<ArgmaxTable>,
 }
 
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`
@@ -1847,6 +1864,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         one_request: one_request_decode,
         chunk_pages,
         argmax,
+        tied_table,
     } = rung;
     let _pc = crate::pc::Pc::start("producer");
     // ⛔⭐ THE ADDRESSING LOCKDOWN RUNS FIRST — the same graph-half sweep
@@ -1901,6 +1919,40 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         hidden: p.hidden,
         table_tid: p.table_tid,
     });
+    // ⭐⭐⭐ THE SENTINEL ROW'S MODEL-SCOPED RESERVATION — this rung's OWN recognition when it
+    // fired (the first bake: the one-request rung is the recognition's source), else the
+    // threaded cache (`rung.tied_table`, what the expansion handed every sibling of a tied
+    // model). Both present must name the SAME table — one model has ONE lm-head, and the
+    // weight segment every bundle shares is packed from it — so a disagreement is a wiring
+    // inconsistency named loudly, never a quiet pick of one side. This is the half that
+    // repairs the first PR3a cut's card failure: the reservation moved from the composite's
+    // own rung (which alone grew seg1 by `hidden · 2` over its prefill and batched siblings,
+    // and every PR cell died at `alias_seg(seg1): SIZE MISMATCH`) to the whole ladder.
+    let tied_table = match (&tied_table, &argmax_table) {
+        (Some(cached), Some(own)) => {
+            if cached.table_tid == own.table_tid
+                && cached.hidden == own.hidden
+                && cached.vocab == own.vocab
+            {
+                Some(own.clone())
+            } else {
+                return Err(SuperDscError(format!(
+                    "reroll-superdsc: the tied lm-head table, as this rung's own walk recognized it \
+                     ([vocab {}, hidden {}, t{}]), disagrees with the table the model's first bake \
+                     cached ([vocab {}, hidden {}, t{}]) — one model has ONE table, and the resident \
+                     weight segment every bundle shares is packed from it; a disagreement is a wiring \
+                     inconsistency, not a policy choice",
+                    own.vocab,
+                    own.hidden,
+                    own.table_tid,
+                    cached.vocab,
+                    cached.hidden,
+                    cached.table_tid
+                )));
+            }
+        }
+        (cached, own) => cached.clone().or_else(|| own.clone()),
+    };
     let mut bundle_layout = compute_bundle_layout(
         ir,
         weight_ids,
@@ -1910,9 +1962,13 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         // emitter's admission are one predicate.
         rows_are_requests || chunk_pages.is_some(),
         &per_layer_ext,
-        // The composite's ramp/V placements AND the table's NaN sentinel row ride the same
-        // layout pass — placed iff the recognition fired, from the facts it proved.
+        // The composite's ramp/V/bias placements AND the real-vocab registry ride the layout
+        // pass — placed iff the recognition fired, from the facts it proved.
         argmax_table.clone(),
+        // The sentinel row's MODEL-scoped reservation — every bundle of a tied model, from
+        // the first bake's recognition, so the weight segment packs identically across the
+        // ladder (the sessions alias it; see `compute_bundle_layout`'s `tied_table` law).
+        tied_table,
     )?;
     // ── THE TAPE'S SEGMENTS: prefix, ONE RANGE PER LOOP (an attention class's body), suffix ──
     // The rolled tape is `prefix; [OpenLoop(body₀) CloseLoop]…[OpenLoop(bodyₙ) CloseLoop]; suffix`
@@ -4221,6 +4277,8 @@ mod attn_scale_weight_fold_tests {
             false,
             false,
             &[],
+            None,
+            // No tied table: the fp8 fixture is untied, so no rung mints the composite.
             None,
         )
         .expect("the same graph lays out");

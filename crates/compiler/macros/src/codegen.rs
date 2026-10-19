@@ -10840,6 +10840,42 @@ fn dump_wavefront_mega(
         // `manifest::SengraphBundleGroup::prefill_prefix`.
         let superdsc_prefill_prefix_rungs: std::cell::RefCell<Vec<(u32, String)>> =
             std::cell::RefCell::new(Vec::new());
+        // ⭐⭐⭐ THE MODEL'S TIED LM-HEAD TABLE, AS THE FIRST BAKE RECOGNIZED IT — the
+        // model-scoped half of the composite argmax's table facts. The one-request rung
+        // (the FIRST `emit_bundle` call — decode at `primary_m`, default 1) recognizes the
+        // tied tail and its `RolledSuperDsc::argmax` carries the table's facts out; that
+        // recognition is the ONE source, and every LATER bundle of the same model — the
+        // ActiveCap ladder rungs inside the first call, the batch rungs, every prefill
+        // width — receives the SAME facts through `RungFacts::tied_table`, so each one's
+        // layout reserves the table's NaN sentinel row and the resident weight segment
+        // packs IDENTICALLY across the ladder. The first PR3a cut reserved the row on the
+        // composite's own rung alone: the decode session's seg1 grew `hidden · 2` bytes
+        // over the prefill session's and EVERY PR card cell refused at load
+        // (`alias_seg(seg1): SIZE MISMATCH dst(packed=…) src(packed=…)` — +4096 B at 2b,
+        // +8192 B at 8b), because only a real two-session load aliases seg1. A `RefCell`
+        // because the bake closure is `Fn` and thread-agnostic: it takes the cache as a
+        // PARAMETER (a plain value, read here at each serial call site), and only
+        // `commit_bake` — the serial effect applier — writes it.
+        let tied_table_cache: std::cell::RefCell<
+            Option<scratchy_target_spyre::lower_subtile_tape_to_superdsc::ArgmaxTable>,
+        > = std::cell::RefCell::new(None);
+        // ⭐ THE WEIGHT-SEGMENT PARITY LEDGER — one `(bundle label, bank0 bytes, extra
+        // banks)` per superdsc bundle this model baked (decode ceiling, every ladder
+        // rung, every batch rung, every prefill width), fed by `BakeEffect::WeightSeg`
+        // and judged ONCE after the last bake by
+        // `lower_subtile_tape_to_superdsc::weight_segment_parity` — the build-time half
+        // of the runtime's `alias_seg` size guard, so the next bundle skew is a BUILD
+        // error, never a card-load refusal.
+        let weight_seg_ledger: std::cell::RefCell<Vec<(String, u64, Vec<u64>)>> =
+            std::cell::RefCell::new(Vec::new());
+        // THE CACHE READ, AS A VALUE-RETURNING CLOSURE — ⛔ never spell
+        // `tied_table_cache.borrow().clone()` as a call ARGUMENT: the temporary `Ref`
+        // lives to the end of the whole call statement, and `emit_bundle` commits the
+        // bake's effects (including `TiedTable`'s `borrow_mut`) INSIDE that same
+        // statement — a RefCell double-borrow panic in the middle of the first
+        // granite expansion (MEASURED, not hypothetical). The closure ends its borrow
+        // before returning the cloned value, so every call site is immune.
+        let cached_table = || tied_table_cache.borrow().clone();
         // ⭐ WHAT ONE BAKE DOES TO THE EXPANSION'S SHARED STATE, recorded in the order it happens and
         // applied by `commit_bake` — so the heavy part of a bake (`emit_bundle_deferred`) touches no
         // shared state at all, and can run on any thread, while the expansion still sees exactly the
@@ -10870,6 +10906,20 @@ fn dump_wavefront_mega(
                 decode_position: u32,
                 man: String,
             },
+            // ⭐ THE MODEL'S TIED LM-HEAD TABLE, out of the first bake that recognized it
+            // (the one-request rung) — committed into `tied_table_cache` so every LATER
+            // bundle of the model reserves the table's sentinel row and the weight
+            // segment packs identically across the ladder. See the cache's declaration.
+            TiedTable(scratchy_target_spyre::lower_subtile_tape_to_superdsc::ArgmaxTable),
+            // ⭐ ONE WEIGHT-SEGMENT PARITY LEDGER ENTRY — this bundle's packed weight
+            // segment (bank 0 bytes + extra banks), exactly as the runtime's alias guard
+            // reads it, labelled by the bake that produced it. Judged once, after the
+            // last bake, by `weight_segment_parity`.
+            WeightSeg {
+                base: String,
+                bank0: u64,
+                banks: Vec<u64>,
+            },
         }
         /// What one bake returns: its manifest, nodes, sengraph json and launch groups.
         type BakeOut = (String, Vec<(String, String)>, String, GroupGraphs);
@@ -10897,7 +10947,17 @@ fn dump_wavefront_mega(
              // The row count THIS bundle is baked at. Not `primary_m`: a batch-ladder
              // rung is a wider bake of the same tape, and reading the env knob here
              // would tell every rung it was one row.
-             decode_rows: u32|
+             decode_rows: u32,
+             // ⭐ THE MODEL'S TIED LM-HEAD TABLE, as the last committed bake recognized
+             // it — `None` until the first bake (the one-request rung) commits its
+             // recognition, the SAME facts for every bundle of the model after that.
+             // A plain VALUE, not the `RefCell` itself: this closure must run on any
+             // thread (the prefill ladder bakes through `rayon`), so it reads the
+             // cache only through what the serial call site hands it, and writes only
+             // through the effects it returns.
+             tied_table: Option<
+                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ArgmaxTable,
+            >|
              -> (BakeOut, Vec<BakeEffect>) {
                 let mut fx: Vec<BakeEffect> = Vec::new();
                 let is_prefill = prefill_mq.is_some();
@@ -11162,9 +11222,43 @@ fn dump_wavefront_mega(
                                     chunk_pages: chunk_ceiling,
                                     // The composite argmax's tie token — see its mint above.
                                     argmax: argmax_tied,
+                                    // The model-scoped reservation, as the last committed
+                                    // bake stated it — `None` for this first call (the
+                                    // cache is still empty), the cached facts for every
+                                    // later bundle of the model.
+                                    tied_table: tied_table.clone(),
                                 },
                             ) {
                                 Ok(rolled) => {
+                                    // ⭐⭐⭐ THE MODEL'S TIED TABLE, OUT OF THE RECOGNITION THAT
+                                    // PROVED IT — when this ceiling is the one-request rung
+                                    // (the first bake, the default m=1 decode), its walk is the
+                                    // ONE source of the sentinel row's facts: commit them for
+                                    // every LATER bundle (prefill, batch rungs), and hand them
+                                    // to THIS call's own ladder rungs below (`rung_tied_table`)
+                                    // — the rungs bake in parallel inside this call, before any
+                                    // effect could commit. A later ceiling that recognizes again
+                                    // goes through the same effect, which asserts it names the
+                                    // SAME table.
+                                    if let Some(mint) = &rolled.argmax {
+                                        fx.push(BakeEffect::TiedTable(mint.table.clone()));
+                                    }
+                                    let rung_tied_table = tied_table.clone().or_else(|| {
+                                        rolled.argmax.as_ref().map(|m| m.table.clone())
+                                    });
+                                    // ⭐ AND THE PARITY LEDGER'S ENTRY FOR THIS BUNDLE — the
+                                    // ceiling's packed weight segment, as the runtime's alias
+                                    // guard reads it. One entry per baked bundle; the ledger is
+                                    // judged once, after the last bake.
+                                    {
+                                        let (bank0, banks) =
+                                            superdsc::weight_seg_record(&rolled.layout);
+                                        fx.push(BakeEffect::WeightSeg {
+                                            base: format!("{base} (ceiling)"),
+                                            bank0,
+                                            banks,
+                                        });
+                                    }
                                     // `iters` counts LOOP ITERATIONS, not layers: a welded body can
                                     // be a multi-layer cell (tiny26's (S,F) pair, ×3 = all 6
                                     // layers), and the runtime load line reports this same sum as
@@ -11544,6 +11638,14 @@ fn dump_wavefront_mega(
                                                             // token — Copy, captured from
                                                             // the mint above.
                                                             argmax: argmax_tied,
+                                                            // The model-scoped reservation,
+                                                            // threaded from the ceiling's
+                                                            // recognition (this call's own,
+                                                            // or the committed cache) — the
+                                                            // rungs bake in parallel, so
+                                                            // they read the value captured
+                                                            // here, never a shared cell.
+                                                            tied_table: rung_tied_table.clone(),
                                                         },
                                                     ) {
                                                         // Same device split as the ceiling rung above: the
@@ -11721,6 +11823,23 @@ fn dump_wavefront_mega(
                                                             "[spyre-superdsc] {base}: ladder rung active_cap={} chunk={rung_chunk:?}: {e}",
                                                             rung.get()
                                                         );
+                                                    }
+                                                    // ⭐ THE PARITY LEDGER'S ENTRY FOR THIS RUNG —
+                                                    // one entry per baked bundle, labelled by its
+                                                    // sweep, so a rung that packs its weight segment
+                                                    // apart from the ceiling's is a build error here,
+                                                    // not an `alias_seg` refusal on the card.
+                                                    {
+                                                        let (bank0, banks) =
+                                                            superdsc::weight_seg_record(&layout);
+                                                        fx.push(BakeEffect::WeightSeg {
+                                                            base: format!(
+                                                                "{base} (rung cap {} chunk {rung_chunk:?})",
+                                                                rung.get()
+                                                            ),
+                                                            bank0,
+                                                            banks,
+                                                        });
                                                     }
                                                     decode_rungs.push(rec);
                                                     rung_reach.push(reach);
@@ -12560,6 +12679,37 @@ fn dump_wavefront_mega(
                             None => {}
                         }
                     }
+                    // ⭐ THE TIED TABLE, COMMITTED AS THE MODEL'S ONE FACT — a later bake
+                    // that recognizes it again (a rebake of a one-request shape) must
+                    // name the SAME table, or the model's bundles would be reserving
+                    // sentinel rows for two different tensors. One model, one table.
+                    BakeEffect::TiedTable(table) => {
+                        let mut c = tied_table_cache.borrow_mut();
+                        match &*c {
+                            Some(seen)
+                                if seen.table_tid == table.table_tid
+                                    && seen.hidden == table.hidden
+                                    && seen.vocab == table.vocab => {}
+                            Some(seen) => panic!(
+                                "[spyre-superdsc] {stem}: two bakes recognized DIFFERENT tied \
+                                 lm-head tables — [vocab {}, hidden {}, t{}] then [vocab {}, \
+                                 hidden {}, t{}]. One model has one table; the sentinel row \
+                                 every bundle reserves is threaded from it",
+                                seen.vocab,
+                                seen.hidden,
+                                seen.table_tid,
+                                table.vocab,
+                                table.hidden,
+                                table.table_tid
+                            ),
+                            None => *c = Some(table),
+                        }
+                    }
+                    // ⭐ ONE LEDGER ENTRY per baked bundle — the parity law judges the
+                    // whole ledger once, after the last bake.
+                    BakeEffect::WeightSeg { base, bank0, banks } => {
+                        weight_seg_ledger.borrow_mut().push((base, bank0, banks));
+                    }
                 }
             }
         };
@@ -12570,7 +12720,10 @@ fn dump_wavefront_mega(
              seq_sym: Option<(&'static str, u32)>,
              prefill_mq: Option<u32>,
              active_cap: scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
-             decode_rows: u32| {
+             decode_rows: u32,
+             tied_table: Option<
+                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ArgmaxTable,
+            >| {
                 let (r, fx) = emit_bundle_deferred(
                     lwd,
                     base,
@@ -12579,6 +12732,7 @@ fn dump_wavefront_mega(
                     prefill_mq,
                     active_cap,
                     decode_rows,
+                    tied_table,
                 );
                 commit_bake(lwd, fx);
                 r
@@ -12600,6 +12754,9 @@ fn dump_wavefront_mega(
                 None, // decode path (Store + PagedAttnCompute) -- no prefill width
                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                 primary_m,
+                // The cache is EMPTY here by construction — this first bake is the
+                // recognition's own source; its effect commits on return.
+                cached_table(),
             );
 
         // ── DECODE CAP BUCKETS (KTIR emulator path) ───────────────────────────────────────────────
@@ -12645,6 +12802,9 @@ fn dump_wavefront_mega(
                     None,
                     scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                     primary_m,
+                    // KTIR-only cap buckets (this loop is `!sendnn_superdsc`): no
+                    // superdsc bundle bakes here, so the cache is empty regardless.
+                    cached_table(),
                 );
                 decode_bundles.push((m, n));
             }
@@ -12714,6 +12874,10 @@ fn dump_wavefront_mega(
                             None,
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                             seqs,
+                            // A batch rung mints no composite of its own (never
+                            // one-request), so it takes the model's cached table —
+                            // this is exactly the bundle the reservation exists for.
+                            cached_table(),
                         );
                     }
                     Err(e) => eprintln!(
@@ -12926,6 +13090,12 @@ fn dump_wavefront_mega(
         // ascending order at commit — what the window guard below names when the baked ladder stops
         // short.
         type RungBake = (to_wavefront::LoweredDecode, PrefillPick, Vec<BakeEffect>);
+        // ⭐ THE MODEL'S TIED TABLE, READ ONCE BEFORE THE PARALLEL LADDER — the rung bakes
+        // run on rayon threads, so they take the cache as a captured VALUE (plain data,
+        // `Send`), never the `RefCell` itself; nothing commits between the rungs anyway
+        // (commit_bake runs after the join), and a prefill rung mints no recognition of
+        // its own, so the value cannot go stale mid-ladder.
+        let tied_table_now = cached_table();
         let per_rung: Vec<Result<RungBake, (u32, String)>> = {
             use rayon::prelude::*;
             prefill_rung_widths.par_iter().map(|&pl| -> Result<RungBake, (u32, String)> {
@@ -12989,6 +13159,11 @@ fn dump_wavefront_mega(
                         // together; that combination is not what this flag selects.
                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE,
                         1, // a prompt chunk is one request however many positions it spans
+                        // The model's cached tied table, captured above the parallel
+                        // ladder — a prefill bundle never recognizes the composite
+                        // itself (never one-request), so this cache IS its only source
+                        // for the sentinel row's reservation.
+                        tied_table_now.clone(),
                     );
                     Ok((lwd_p, r, fx))
                 }
@@ -13077,6 +13252,12 @@ fn dump_wavefront_mega(
                             Some(m),
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                             1, // a prompt chunk is one request
+                            // THE CELL FAILURE'S OWN BUNDLE: the prefix-capable prefill
+                            // session takes the DECODE session's resident weights at
+                            // load (`alias_seg(seg1)`), so its packed weight segment
+                            // must reserve the sentinel row exactly like the decode
+                            // bundles do — the cached table is that reservation.
+                            cached_table(),
                         );
                     }
                     Err(e) => refused_prefix.push((m, e.to_string())),
@@ -13109,6 +13290,24 @@ fn dump_wavefront_mega(
             {
                 panic!("[spyre-superdsc] {stem}: {e}");
             }
+        }
+
+        // ⛔⛔⛔ ONE MODEL PACKS ONE RESIDENT WEIGHT SEGMENT — the parity ledger's verdict,
+        // judged ONCE here, after the last superdsc bake of this model. Every bundle that
+        // lowered recorded its packed weight segment (bank 0 + extra banks), exactly as the
+        // runtime's `alias_seg` guard reads it when a session takes another's resident
+        // weights; a bundle that reserves bytes a sibling does not is a card-load refusal
+        // there, so it is a BUILD error here, naming both bundles. The KNOWN first offender
+        // was the composite argmax's NaN sentinel row, reserved on the one-request rung
+        // alone in PR3a's first cut — every PR card cell died at load on exactly this
+        // mismatch (+4096 B at 2b, +8192 B at 8b); the reservation is model-scoped now
+        // (`RungFacts::tied_table`), and this ledger holds the NEXT skew to the same
+        // standard: a build error, never a card failure. Empty ledger (nothing baked a
+        // superdsc section) is trivially fine.
+        if let Err(e) = scratchy_target_spyre::lower_subtile_tape_to_superdsc::weight_segment_parity(
+            &weight_seg_ledger.borrow(),
+        ) {
+            panic!("[spyre-superdsc] {stem}: {e}");
         }
 
         // ── CB decode sengraph (the baked `--target sendnn` decode graph). The
@@ -13173,6 +13372,10 @@ fn dump_wavefront_mega(
                         // The CB sengraph's rows are a batch SYMBOL the DEM resolves at runtime, not
                         // a baked request count.
                         1,
+                        // A SYMBOLIC bundle — its superdsc section is gated off
+                        // (`seq_sym.is_none()`), so this value is never read; passed
+                        // for the signature's one shape.
+                        cached_table(),
                     );
                     (sg, groups)
                 }

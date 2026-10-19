@@ -271,6 +271,9 @@ fn walk_at_8b() -> (RolledSuperDsc, SubtileIR<NeoX>, HashSet<u32>) {
             one_request: true,
             chunk_pages: None,
             argmax: None,
+            // No tied table to reserve for: this fixture's head is untied, so no
+            // rung of it mints the composite whose row the reservation carries.
+            tied_table: None,
         },
     )
     .expect("the 8b-shaped two-layer graph lowers with the head-major handoff");
@@ -471,7 +474,7 @@ fn the_headmajor_oproj_handoff_runs_the_whole_walk() {
     // bundle's row count, because every bundle of a model shares ONE staged weight
     // segment. (The empty class slice is the unbanked mint — no layer structure stated,
     // so no banking; the copies mint from the geometry alone.)
-    let layout_prefill = compute_bundle_layout(&rg, &weight_ids, false, false, &[], None)
+    let layout_prefill = compute_bundle_layout(&rg, &weight_ids, false, false, &[], None, None)
         .expect("the mint runs for the prefill row kind");
     assert_eq!(
         layout_prefill.weight_copies,
