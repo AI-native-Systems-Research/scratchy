@@ -1,0 +1,70 @@
+# Benchmarking scratchy against other frameworks
+
+Methodology for the head-to-head comparisons, and the metric definitions they
+report.
+
+| harness | question | scenarios |
+|---|---|---|
+| [`scripts/bench_serve_compare.sh`](../scripts/bench_serve_compare.sh) | steady-state serving throughput and latency under load | input × output × concurrency sweep |
+| `scr bench startup --exec` | how long from `exec` until the user sees a word | frozen / cold / warm cache ladder |
+| `scr bench startup` (no `--exec`) | in-process engine construction cost | cold / warm iterations |
+
+## `--exec` vs plain `bench startup` — two different measurements
+
+`scr bench startup` without `--exec` mirrors
+[vLLM's `bench startup`](https://docs.vllm.ai/en/latest/cli/bench/startup/) down to
+`--num-iters-cold` / `--num-iters-warmup` / `--num-iters-warm`. The two modes are
+not interchangeable:
+
+| | plain `bench startup` | `bench startup --exec` |
+|---|---|---|
+| timed region | `LLMBuilder::build()`, in-process (`crates/benches/src/startup.rs`) | `exec` → first content byte of the first token |
+| process | one process, N engine constructions | fresh `fork`/`exec` per measurement |
+| generates tokens | no — never sends a request, so **there is no TTFT to report** | yes; the clock stops on the first token byte |
+| what "cold" means | a fresh engine object; the HF cache is explicitly *not* wiped and the page cache is untouched | the FROZEN/COLD rungs below, with the eviction *verified* |
+| sees `exec`, dyld, first-touch faults | no, by construction | yes — these dominate a real first launch |
+| other frameworks | no; it constructs scratchy's own `LLM` | yes, via `--child-cmd` |
+
+They are complementary. Plain `bench startup` is the cheap, repeatable way to
+watch engine-init cost for regressions — no sudo, no second framework,
+percentiles over iterations in one process. `--exec` is what a *user-perceived*
+or *cross-framework* claim requires.
+
+**Do not put their numbers in the same table.** Plain `bench startup` will always
+look faster, for the uninteresting reason that it is measuring less.
+
+---
+
+## 1. The cache ladder
+
+"Cold start" is not one thing — it is a stack of caches, each independently warm.
+Naming a single "cold" number without saying which were populated is how startup
+benchmarks become unfalsifiable. So the ladder is explicit:
+
+| surface | FROZEN | COLD | WARM |
+|---|---|---|---|
+| OS page cache (weights, binary, dylibs) | evicted | warm | warm |
+| derived on-disk caches (`--remove-path`) | **removed** | present | present |
+| checkpoint on disk | present | present | present |
+| process | fresh `exec` | fresh `exec` | resident, ≥1 request served |
+| pipelines / KV pool / warmup | rebuilt | rebuilt | done |
+
+- **FROZEN** — first run ever on this machine, short of downloading weights.
+- **COLD** — the honest everyday case: you ran it before, the machine has been
+  busy but not enough to evict the weights, and you launch again.
+- **WARM** — a server already up and serving. Isolates request latency from all
+  startup cost.
+
+COLD and WARM say "you ran this before", so when nothing has run yet the harness
+performs **one throwaway priming launch** and discards it. Without that, the
+first repetition of a fresh run measures FROZEN while being labelled COLD — on a
+Metal run before priming existed, COLD rep 0 took 7.935 s with ~31,570 major
+faults and rep 1 took 1.218 s with ~0, and the rung's median averaged the two. A
+FROZEN repetition earlier in the list already populates the caches, so priming is
+skipped in that case.
+
+### Eviction is platform-specific, and one obvious choice is wrong
+
+`--evict purge` (macOS) drops the whole unified buffer cache
+
+Summarize the document above in three sentences. (variant 1)

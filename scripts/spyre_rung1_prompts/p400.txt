@@ -1,0 +1,11 @@
+# Benchmarking scratchy against other frameworks
+
+Methodology for the head-to-head comparisons, and the metric definitions they
+report.
+
+| harness | question | scenarios |
+|---|---|---|
+| [`scripts/bench_serve_compare.sh`](../scripts/bench_serve_compare.sh) | steady-state serving throughput and latency under load | input × output × concurrency sweep |
+| `scr bench startup --exec` | how long from
+
+Summarize the document above in three sentences.
