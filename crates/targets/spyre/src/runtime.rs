@@ -17,6 +17,7 @@
 //!   [`DevAddr::alloc`], over the real senlib scheduler.
 
 use std::fmt;
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use flex_rs::address::{Chunk, CompositeAddress, LogicalAddress, RegionId};
@@ -844,6 +845,25 @@ impl DevAddr {
         })
     }
 
+    /// The WHOLE region as single-chunk windows of at most `step` bytes, chunk by chunk in the
+    /// region's chunk order — one chunk for a Bind allocation, one per stripe for an interleaved one.
+    /// Every window lies inside one chunk and together they cover each chunk's bytes exactly once.
+    /// [`Self::window`] cannot build this walk: it addresses chunk 0 only, so past chunk 0's end it
+    /// names bytes the region does not own.
+    pub fn windows(&self, step: NonZeroU64) -> impl Iterator<Item = DevAddr> {
+        let step = step.get();
+        self.0.chunks().iter().flat_map(move |c| {
+            (0..c.size.0).step_by(step as usize).map(move |off| {
+                DevAddr::from_chunk(Chunk0 {
+                    region: c.addr.region_id,
+                    offset: ByteOffset(c.addr.offset.0 + off),
+                    size: ByteSize(step.min(c.size.0 - off)),
+                    domain: c.domain_id,
+                })
+            })
+        })
+    }
+
     /// A shifted single-chunk window `sh` bytes into this region — size = the bytes remaining
     /// past `sh`, or the whole chunk when `sh` is beyond it.
     pub fn shifted(&self, sh: ByteSize) -> Option<DevAddr> {
@@ -870,5 +890,79 @@ impl DevAddr {
             size: len,
             domain: c0.domain,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(region: u64, offset: u64, size: u64, domain: u32) -> Chunk {
+        Chunk::new(
+            LogicalAddress::new(RegionId(region), ByteOffset(offset)),
+            ByteSize(size),
+            DomainId(domain),
+        )
+    }
+
+    fn walk(addr: &DevAddr, step: u64) -> Vec<(u64, u64, u64, u32)> {
+        addr.windows(NonZeroU64::new(step).expect("a nonzero step"))
+            .map(|w| {
+                assert!(w.is_single_chunk(), "a window is one chunk");
+                let c = w.chunk0().expect("a window has a chunk");
+                (c.region.0, c.offset.0, c.size.0, c.domain.0)
+            })
+            .collect()
+    }
+
+    /// ⭐ THE ZERO-FILL WALK OVER AN INTERLEAVED REGION (#672). `zero_seg` H2Ds exactly these
+    /// windows, so this is the address half of zeroing a multi-chunk KV pool — the half a card is
+    /// not needed for. Each chunk is cut at the step in its OWN region/offset/domain, a short tail
+    /// stays short, a zero-length chunk sends nothing, and the bytes sum to the region's size.
+    #[test]
+    fn windows_cover_each_chunk_of_an_interleaved_region_once() {
+        let addr = DevAddr(Arc::new(CompositeAddress::from_chunks(vec![
+            chunk(7, 4096, 20, 0),
+            chunk(9, 0, 8, 1),
+            chunk(3, 64, 0, 1),
+            chunk(7, 1 << 20, 13, 0),
+        ])));
+        assert!(!addr.is_single_chunk());
+        let got = walk(&addr, 8);
+        assert_eq!(
+            got,
+            vec![
+                (7, 4096, 8, 0),
+                (7, 4104, 8, 0),
+                (7, 4112, 4, 0),
+                (9, 0, 8, 1),
+                (7, 1 << 20, 8, 0),
+                (7, (1 << 20) + 8, 5, 0),
+            ]
+        );
+        assert_eq!(
+            got.iter().map(|w| w.2).sum::<u64>(),
+            addr.total_size().as_u64()
+        );
+    }
+
+    /// The Bind shape — the only one `alloc` makes today — walks exactly as `zero_seg`'s old
+    /// `window(off, min(step, total - off))` loop did, so the change moves no transfer on the card.
+    #[test]
+    fn windows_of_a_single_chunk_region_match_the_offset_loop() {
+        let addr = DevAddr(Arc::new(CompositeAddress::from_chunk(chunk(5, 256, 17, 0))));
+        let mut old = Vec::new();
+        let mut off = 0;
+        while off < 17 {
+            let sz = 8.min(17 - off);
+            let c = addr
+                .window(ByteOffset(off), ByteSize(sz))
+                .and_then(|w| w.chunk0())
+                .expect("window builds a value");
+            old.push((c.region.0, c.offset.0, c.size.0, c.domain.0));
+            off += sz;
+        }
+        assert_eq!(walk(&addr, 8), old);
+        assert_eq!(old.len(), 3);
     }
 }

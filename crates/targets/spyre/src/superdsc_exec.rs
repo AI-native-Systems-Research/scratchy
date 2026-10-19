@@ -18,6 +18,7 @@
 //! order, with which base.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
@@ -4811,35 +4812,30 @@ impl Executor {
     /// through the arithmetic as denormals and NaN. The old route (read_seg → write_seg) addressed a
     /// host allocation the size of the entire pool: 960 MB, and 3.84 GB at a 1024-slot page. This
     /// walks the segment with an 8 MB buffer, and the device sees the same zeros.
+    ///
+    /// The walk is [`DevAddr::windows`], so a multi-chunk (interleaved) region is zeroed chunk by
+    /// chunk with the same 8 MB windows — every byte the region owns, none it does not.
     pub fn zero_seg(&mut self, seg: SegIdx) -> Result<()> {
         let i = seg.get();
         let addr = self.seg_addr[i]
             .as_ref()
             .ok_or_else(|| anyhow!("seg{i} has no region"))?;
-        if !addr.is_single_chunk() {
-            bail!("zero_seg(seg{i}): region is multi-chunk");
-        }
         let total = addr.total_size().as_u64();
         if total == 0 {
             return Ok(());
         }
-        const CHUNK: u64 = 8 << 20;
-        let zeros = vec![0u8; CHUNK.min(total) as usize];
+        const CHUNK: NonZeroU64 = NonZeroU64::new(8 << 20).unwrap();
+        let zeros = vec![0u8; CHUNK.get().min(total) as usize];
         let stream = self.stream_ref()?;
-        let mut off = 0u64;
-        while off < total {
-            let sz = CHUNK.min(total - off);
-            let win = addr
-                .window(ByteOffset(off), ByteSize(sz))
-                .ok_or_else(|| anyhow!("seg{i} window unaddressable"))?;
+        for win in addr.windows(CHUNK) {
+            let sz = win.total_size().as_u64() as usize;
             stream
-                .h2d(&zeros[..sz as usize], &win)
-                .map_err(|e| anyhow!("zero H2D: {e}"))?;
+                .h2d(&zeros[..sz], &win)
+                .map_err(|e| anyhow!("zero H2D (seg{i}): {e}"))?;
             // The window must outlive the transfer.
             stream
                 .synchronize()
-                .map_err(|e| anyhow!("zero sync: {e}"))?;
-            off += sz;
+                .map_err(|e| anyhow!("zero sync (seg{i}): {e}"))?;
         }
         Ok(())
     }
