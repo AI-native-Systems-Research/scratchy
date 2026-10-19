@@ -11,6 +11,13 @@
 // resized. `load` waits for those modules and the stylesheets; the fonts can
 // still move text, so wait for them too.
 //
+// Then each chart is drawn when it comes within a screen of the viewport, not
+// all at once: a performance page carries hundreds, and drawing them in one
+// go held the first paint back by the cost of all of them. The build sizes
+// every mount as Carbon will (charts.rs), so a chart drawn late moves nothing.
+// A chart in a hidden switcher panel is clipped to nothing (styles.css), so it
+// is drawn when its panel is shown, at its real size.
+//
 // The page follows the reader's system theme, Carbon's white or g100 class on
 // <html> (chrome.rs), and so does every chart: the build gives each colour
 // for both, and when the class changes the charts redraw in the new one.
@@ -35,50 +42,59 @@
     }
     return out;
   }
-  function draw() {
-    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart };
+  function drawNear() {
     var drawn = [];
     var current = theme();
-    document.querySelectorAll('[data-chart]').forEach(function (el) {
-      var spec = JSON.parse(el.getAttribute('data-chart'));
-      if (spec.ratio) {
-        var total = spec.options.locale.translations.total;
-        spec.options.tooltip = {
-          valueFormatter: function (value, label) {
-            return label === total ? '×' + Math.pow(2, value).toFixed(2) : value;
-          },
-        };
-      }
-      // A log axis's ticks are the measured steps: print them as they are,
-      // not in d3's SI style (4096 as "4.096k"), or as the build named them
-      // (model sizes as "2b"). Carbon takes a formatter only as a function,
-      // which the JSON cannot carry.
-      var bottom = spec.options.axes && spec.options.axes.bottom;
-      if (bottom && bottom.scaleType === 'log' && bottom.ticks) {
-        var at = bottom.ticks.values, names = bottom.ticks.labels;
-        bottom.ticks.formatter = names
-          ? function (v) { var k = at.indexOf(v); return k >= 0 ? names[k] : String(v); }
-          : String;
-      }
-      var chart = new charts[spec.kind](el, { data: spec.data, options: themed(spec.options, current) });
-      drawn.push({ chart: chart, options: spec.options });
-      var scale = el.dataset.scale && document.getElementById(el.dataset.scale);
-      if (scale) highlightSteps(chart, spec, scale);
-      if (spec.kind === 'combo') {
-        labelGaps(el, chart, spec.data);
-        chart.services.events.addEventListener('render-finished', function () { labelGaps(el, chart, spec.data); });
-      }
-      if (spec.ratio) {
-        labelFactors(el, spec.data);
-        chart.services.events.addEventListener('render-finished', function () { labelFactors(el, spec.data); });
-      }
-    });
+    var near = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.intersectionRatio === 0) return;
+        near.unobserve(e.target);
+        drawn.push(draw(e.target, current));
+      });
+    }, { rootMargin: '100% 0px' });
+    document.querySelectorAll('[data-chart]').forEach(function (el) { near.observe(el); });
     new MutationObserver(function () {
       var t = theme();
       if (t.key === current.key) return;
       current = t;
       drawn.forEach(function (d) { d.chart.model.setOptions(themed(d.options, t)); });
     }).observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+  }
+  // Draws one chart in the theme `t`.
+  function draw(el, t) {
+    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart };
+    var spec = JSON.parse(el.getAttribute('data-chart'));
+    if (spec.ratio) {
+      var total = spec.options.locale.translations.total;
+      spec.options.tooltip = {
+        valueFormatter: function (value, label) {
+          return label === total ? '×' + Math.pow(2, value).toFixed(2) : value;
+        },
+      };
+    }
+    // A log axis's ticks are the measured steps: print them as they are,
+    // not in d3's SI style (4096 as "4.096k"), or as the build named them
+    // (model sizes as "2b"). Carbon takes a formatter only as a function,
+    // which the JSON cannot carry.
+    var bottom = spec.options.axes && spec.options.axes.bottom;
+    if (bottom && bottom.scaleType === 'log' && bottom.ticks) {
+      var at = bottom.ticks.values, names = bottom.ticks.labels;
+      bottom.ticks.formatter = names
+        ? function (v) { var k = at.indexOf(v); return k >= 0 ? names[k] : String(v); }
+        : String;
+    }
+    var chart = new charts[spec.kind](el, { data: spec.data, options: themed(spec.options, t) });
+    var scale = el.dataset.scale && document.getElementById(el.dataset.scale);
+    if (scale) highlightSteps(chart, spec, scale);
+    if (spec.kind === 'combo') {
+      labelGaps(el, chart, spec.data);
+      chart.services.events.addEventListener('render-finished', function () { labelGaps(el, chart, spec.data); });
+    }
+    if (spec.ratio) {
+      labelFactors(el, spec.data);
+      chart.services.events.addEventListener('render-finished', function () { labelFactors(el, spec.data); });
+    }
+    return { chart: chart, options: spec.options };
   }
   // Writes the factor, "×2.4", in each square the build marked a highlight,
   // to two figures so it fits the overview's small squares; a quarter of the
@@ -167,7 +183,7 @@
     chart.services.events.addEventListener('heatmap-mouseout', clear);
   }
   function whenLaidOut() {
-    document.fonts.ready.then(draw);
+    document.fonts.ready.then(drawNear);
   }
   if (document.readyState === 'complete') whenLaidOut();
   else window.addEventListener('load', whenLaidOut, { once: true });
