@@ -219,7 +219,7 @@ pub(crate) struct DecodeRung {
 
 #[cfg(feature = "spyre-hw")]
 pub(crate) enum LogitsWanted<'a> {
-    /// Nothing — every prompt chunk but the last, which skips the whole-segment D2H.
+    /// Nothing — every prompt chunk but the last, which launches no suffix and reads nothing back.
     None,
     /// The FOLDED `[1, vocab]` tail: one row at placement offset 0, whatever `m` the bundle ran at.
     /// This is a prompt's tail, where only the last row's logits are ever sampled.

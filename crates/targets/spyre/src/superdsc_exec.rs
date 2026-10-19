@@ -4196,8 +4196,15 @@ impl Executor {
     /// The shared FORWARD HALF of a step: the prepared/source gates, the RB window reset, the
     /// activation refill, and the replay-or-launch decision — extracted from `predict` when
     /// `predict_token` (#603 PR3a) needed the same body, so the refill law, the replay gate and
-    /// the launch are ONE behavior the two readbacks ride, never two copies.
-    fn forward_half(&mut self, n_new: NewTokens, seq_pos: SeqPos, d: &Diag) -> Result<ForwardHalf> {
+    /// the launch are ONE behavior the two readbacks ride, never two copies. `suffix` is
+    /// [`SuffixLaunch::Skipped`] only for a forward whose logits are discarded ([`Logits`]).
+    fn forward_half(
+        &mut self,
+        n_new: NewTokens,
+        seq_pos: SeqPos,
+        suffix: SuffixLaunch,
+        d: &Diag,
+    ) -> Result<ForwardHalf> {
         if !self.prepared {
             bail!("predict before prepare");
         }
@@ -4234,9 +4241,12 @@ impl Executor {
         // per chunk — PR4's rungs, not the player's. `try_replay_forward` states its
         // own other refusals (batched fold, instruments) and hands back `None` for
         // the walk.
-        let replayed = n_new.0 == 1 && self.try_replay_forward(seq_pos)?.is_some();
+        // The player's images all carry the suffix, so a forward that skips it takes the walk.
+        let replayed = n_new.0 == 1
+            && suffix == SuffixLaunch::Launched
+            && self.try_replay_forward(seq_pos)?.is_some();
         if !replayed {
-            self.launch_forward(seq_pos)?;
+            self.launch_forward(seq_pos, suffix)?;
         }
 
         if d.phase_time {
@@ -4330,17 +4340,17 @@ impl Executor {
 
     /// Run ONE forward over `n_new` NEW positions appended at `[seq_pos..seq_pos+n_new)`: refill
     /// the bound activations, launch prefix → body×iters → suffix, and copy the logits row back.
-    /// `out_logits` is `None` for a chunk whose logits nobody reads (every prefill chunk but the
-    /// last), which skips the read-back entirely.
-    pub fn predict(
-        &mut self,
-        n_new: NewTokens,
-        seq_pos: SeqPos,
-        out_logits: Option<&mut [u8]>,
-    ) -> Result<()> {
+    /// `logits` says what the caller does with this forward's logits ([`Logits`]): a prompt chunk
+    /// whose logits nobody reads skips the suffix and the read-back both.
+    pub fn predict(&mut self, n_new: NewTokens, seq_pos: SeqPos, logits: Logits<'_>) -> Result<()> {
+        let (suffix, out_logits) = match logits {
+            Logits::Discarded => (SuffixLaunch::Skipped, None),
+            Logits::ReadBack(out) => (SuffixLaunch::Launched, Some(out)),
+            Logits::LeftOnDevice => (SuffixLaunch::Launched, None),
+        };
         let d = Diag::get();
         let n_new = NewTokens(n_new.0.max(1));
-        let half = self.forward_half(n_new, seq_pos, d)?;
+        let half = self.forward_half(n_new, seq_pos, suffix, d)?;
 
         // ── D2H the logits' segment, sen→IEEE the logits slice at its baked offset. ──
         // Skipped entirely when the caller wants no logits: only the LAST prefill chunk asks for
@@ -4473,7 +4483,8 @@ impl Executor {
     pub fn predict_token(&mut self, n_new: NewTokens, seq_pos: SeqPos) -> Result<u32> {
         let d = Diag::get();
         let n_new = NewTokens(n_new.0.max(1));
-        let half = self.forward_half(n_new, seq_pos, d)?;
+        // The composite argmax IS the suffix's tail, so the token step always launches it.
+        let half = self.forward_half(n_new, seq_pos, SuffixLaunch::Launched, d)?;
 
         // ── D2H the idx stick — the logits read's own window discipline (placement, not
         // segment; align128 length; window-or-whole-region fallback), because the same
@@ -4753,8 +4764,9 @@ impl Executor {
         Ok((note, total))
     }
 
-    /// The forward itself: prefix → body×iters → suffix (rolled), or the single body.
-    fn launch_forward(&mut self, seq_pos: SeqPos) -> Result<()> {
+    /// The forward itself: prefix → body×iters → suffix (rolled), or the single body. `suffix` is
+    /// [`SuffixLaunch::Skipped`] only for a forward whose logits are discarded ([`Logits`]).
+    fn launch_forward(&mut self, seq_pos: SeqPos, suffix: SuffixLaunch) -> Result<()> {
         let zero = [0u64; NUM_SEGMENTS];
         let Some(rolled) = self.rolled.as_ref() else {
             // Not rolled: one body over the whole model. Pages the RESIDENT PREFIX spans; the
@@ -4817,7 +4829,19 @@ impl Executor {
         // NO HOST ROUTING: the loop-carried residual + the body→suffix seam thread IN-PLACE via
         // emitter placement aliasing (hidden_out/suffix_in aliased onto hidden_in's resident
         // buffer). No D2H/memcpy/H2D — the residual lives on-device across iterations.
-        self.launch_ops(ListSel::Suffix, zero, SeqPos(0), Bytes(0), 1, suf_bank)
+        //
+        // ⭐ A DISCARDED FORWARD STOPS HERE. The suffix (final norm → lm-head → logits scaling) only
+        // READS the residual the last layer left in that shared buffer and writes the suffix's own
+        // tensors, which only the logits read-back consumes: the KV every later chunk attends was
+        // written by the bodies above. MEASURED (granite-2b fp16, RB_TIME): 2.73 ms per prompt
+        // chunk at 512 rows, 2.11 at 256, run on every chunk though only the last chunk's logits
+        // are ever sampled — 53 ms of a ~10k prompt's 20 chunks.
+        match suffix {
+            SuffixLaunch::Launched => {
+                self.launch_ops(ListSel::Suffix, zero, SeqPos(0), Bytes(0), 1, suf_bank)
+            }
+            SuffixLaunch::Skipped => Ok(()),
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -5221,7 +5245,7 @@ impl Executor {
             return Ok(false);
         }
         self.refill_activations(Diag::get())?;
-        self.launch_forward(SeqPos(0))?;
+        self.launch_forward(SeqPos(0), SuffixLaunch::Launched)?;
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("run_full sync: {e}"))?;
@@ -5728,6 +5752,32 @@ enum ListSel {
     BodyFused(usize),
     Rung(usize, usize),
     RungFused(usize, usize),
+}
+
+/// ⭐ WHAT A FORWARD'S CALLER DOES WITH ITS LOGITS — the one fact that decides both whether the suffix
+/// runs and whether its row comes back, so the two cannot be asked separately and disagree.
+///
+/// ⛔ THREE STATES, NOT A `bool`. A decode batch passes no host buffer and still READS the logits: it
+/// pulls the whole `[rows, vocab]` tensor itself afterwards (`read_tensor`), because the read-back here
+/// converts one row. "No buffer" therefore cannot mean "skip the suffix" — only [`Logits::Discarded`]
+/// does, and only a caller that never looks at the tensor can name it.
+pub enum Logits<'a> {
+    /// The suffix runs and its `[1, vocab]` row is converted into this buffer — decode, and a prompt's
+    /// last chunk.
+    ReadBack(&'a mut [u8]),
+    /// The suffix runs and its output stays on the device for the caller to read itself — a decode
+    /// batch's `[rows, vocab]` logits.
+    LeftOnDevice,
+    /// Nobody reads this forward's logits — every prompt chunk but the last — so the suffix (final
+    /// norm → lm-head → logits scaling) is not launched at all.
+    Discarded,
+}
+
+/// Whether [`Executor::launch_forward`] launches the suffix — read off [`Logits`] in one place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SuffixLaunch {
+    Launched,
+    Skipped,
 }
 
 /// ⭐⭐⭐⭐⭐ THE BODY ONE STEP RUNS, AND THE PER-BODY FACTS THE HOST MUST DECIDE FROM — as ONE value,
