@@ -615,6 +615,7 @@ fn glance(sweep: &Sweep) -> Element {
             squares,
             format!("scratchy/{}", TORCH.line),
             name,
+            "no ratios",
             &format!("{model} {} {}", dtype.label(), metric.label()),
         )
     };
