@@ -123,7 +123,9 @@ use crate::emit::{
     rb,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::pointwise::gather_copy_opspec;
-use crate::ir::bridge::tiled_op_sdsc_op::reduce::{reduce_opspec, reduce_opspec_df};
+use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
+    reduce_opspec, reduce_opspec_df, reduce_opspec_partials, reduce_trip_count,
+};
 use crate::superdsc_opspec::{
     DataFormat, Df, EntryBase, Fp16, GatherIndex, GatherRun, OpFunc, PageExtent,
 };
@@ -186,6 +188,12 @@ pub struct ArgmaxSlots<'a> {
     pub w: &'a str,
     /// scratch — the per-row max of `w` (the fp32 reduce's RedStick accum).
     pub j: &'a str,
+    /// PARTIALS+COMBINE FORM ONLY — the fp32 max32's per-trip partial maxima,
+    /// `[rows, trips × one fp32 stick]`, one stick per trip (the partials law). A vocab
+    /// that fits one trip — every shipping one, gemma's 262144 included — never reads
+    /// this slot; the whole-stick arm's chain is byte-identical to before the form
+    /// existed.
+    pub partials: &'a str,
     /// scratch — the fp32 index `[rows, one fp32 stick]`.
     pub idx32: &'a str,
     /// OUTPUT — the SENUINT32 index slot the next step's gather reads.
@@ -357,12 +365,51 @@ pub fn try_assemble_argmax(
         sym_id_base,
         layout,
     ));
-    // 5. j = max(w) — the fp32 sibling's stick-family max.
-    let max32 = reduce_opspec_df(OpFunc::Max, rows, v_pad, s.w, s.j, false, Df::Fp32)?;
-    let folds = SdscFoldSet::new(max32.iter.cores_used());
-    ops.push(
-        emit_sdsc_tiled("argmax_max32", &max32, &folds, sym_id_base, layout).map_err(|e| e.0)?,
-    );
+    // 5. j = max(w) — the fp32 sibling's stick-family max, in the form the row's own width
+    //    demands. ONE trip whenever the true accum charge fits the usable LX (every
+    //    shipping vocab — gemma's 262144 included, the charge fix's own case); the
+    //    PARTIALS+COMBINE form at a width whose DATA operand alone overruns the budget.
+    //    The two-trip form writes each trip's partial into its OWN stick of the partials
+    //    scratch (the partials law: a seeded reduce never time-tiles onto one aliased
+    //    accum stick), then ONE combine reduce maxes the per-trip partials into `j` —
+    //    max-of-maxes is max(w) by associativity, and each trip's partial maxes exactly
+    //    the w-slice the tiler handed it (the slices partition the row).
+    let trips = reduce_trip_count(OpFunc::Max, rows, v_pad, Df::Fp32)?;
+    if trips == 1 {
+        let max32 = reduce_opspec_df(OpFunc::Max, rows, v_pad, s.w, s.j, false, Df::Fp32)?;
+        let folds = SdscFoldSet::new(max32.iter.cores_used());
+        ops.push(
+            emit_sdsc_tiled("argmax_max32", &max32, &folds, sym_id_base, layout)
+                .map_err(|e| e.0)?,
+        );
+    } else {
+        // 5a. partials = per-trip max(w-slice) — the seeded reduce with its accum declared
+        //     at ONE STICK PER TRIP (`reduce_opspec_partials`), which the partials law in
+        //     `rewrite_op_for_time_tile` strides one stick per trip. The builder returns
+        //     the trips count off its own tiler — the combine spans exactly those sticks.
+        let (partials, trips) =
+            reduce_opspec_partials(OpFunc::Max, rows, v_pad, s.w, s.partials, false, Df::Fp32)?;
+        let folds = SdscFoldSet::new(partials.iter.cores_used());
+        ops.push(
+            emit_sdsc_tiled("argmax_max32", &partials, &folds, sym_id_base, layout)
+                .map_err(|e| e.0)?,
+        );
+        // 5b. j = max(partials) — the combine, over exactly the sticks the trips wrote.
+        let combine = reduce_opspec_df(
+            OpFunc::Max,
+            rows,
+            trips * Df::Fp32.elems_per_stick(),
+            s.partials,
+            s.j,
+            false,
+            Df::Fp32,
+        )?;
+        let folds = SdscFoldSet::new(combine.iter.cores_used());
+        ops.push(
+            emit_sdsc_tiled("argmax_max32c", &combine, &folds, sym_id_base, layout)
+                .map_err(|e| e.0)?,
+        );
+    }
     // 6. idx32 = V − j — the tail runs ONE FP16-STICK wide (64 elems = the shared width the
     //    mixed-format legs can all tile: two fp32 sticks, two u32 sticks, one fp16 stick).
     //    `V` is the scalar broadcast and `j` rides the SAME lane-0 column broadcast the eq's

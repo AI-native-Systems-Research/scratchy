@@ -262,7 +262,10 @@ pub enum SynthRole {
     //    the weighted mask and the index arithmetic are fp32, and the index slot the gather
     //    reads is SENUINT32. `AmBiased` is the PAD-LANE form's own link-0 output (the
     //    bias-applied logits row, fp16 at the stick-padded width); the whole-stick form never
-    //    declares it. The ramp, the scalar V, and the pad-lane bias are NOT here — they are
+    //    declares it. `AmPartials` is the PARTIALS+COMBINE form's own max32 output — the
+    //    per-trip partial maxima, `[rows, trips × one fp32 stick]`, one stick per trip; only
+    //    a vocab wide enough to tile the reduce even under the true accum charge declares it.
+    //    The ramp, the scalar V, and the pad-lane bias are NOT here — they are
     //    reserved-tid consts (`reserved_tids::argmax_const`), placed by the layout, not
     //    synthetics.
     AmMax,
@@ -273,6 +276,7 @@ pub enum SynthRole {
     AmIdx32,
     AmIdxU32,
     AmBiased,
+    AmPartials,
 }
 
 impl fmt::Display for SynthRole {
@@ -374,6 +378,7 @@ impl fmt::Display for SynthRole {
             Self::AmIdx32 => f.write_str("amidx32"),
             Self::AmIdxU32 => f.write_str("amidxu32"),
             Self::AmBiased => f.write_str("ambiased"),
+            Self::AmPartials => f.write_str("ampartials"),
         }
     }
 }

@@ -786,6 +786,34 @@ fn a_vocab_262144_tied_head_walks_green() {
     );
 }
 
+/// ⭐ THE PAST-THE-BUDGET WALK (524288) — the width whose DATA operand alone overruns
+/// the usable LX, so the composite's max32 GENUINELY time-tiles and takes the
+/// partials+combine form (pinned at the door: `the_past_budget_width_mints_the_
+/// partials_and_combine_form`). The walk's own claim is just that the mint fires at
+/// that width too — the recognition, the ramp placement, and the KTIR-first suffix op
+/// — so the widest vocab the form serves is walked, not only assembled.
+#[test]
+fn the_past_budget_width_walks_green_too() {
+    let rolled = walk_mints_at(524_288);
+    let last = rolled
+        .suffix
+        .last()
+        .expect("the suffix holds the composite at the past-budget width");
+    assert!(
+        last.op_name.starts_with("argmax_o"),
+        "the composite is minted at the past-budget width: {}",
+        last.op_name
+    );
+    assert!(
+        last.ktir.is_some() && last.op.is_none(),
+        "KTIR-first, no producer-built descriptor — the only legal bundle op"
+    );
+    assert!(
+        rolled.layout.placements.contains_key(&argmax_ramp_tid()),
+        "the ramp const is placed at the past-budget width"
+    );
+}
+
 /// ⭐ THE LADDER-SIDE CONTENT-KEY ASSERT (#603 PR3a) — every cap rung is its own
 /// lowering of the same tape, and the composite must mint IDENTICALLY at every one:
 /// same op name, same program, same bindings, and its two resident consts at the same

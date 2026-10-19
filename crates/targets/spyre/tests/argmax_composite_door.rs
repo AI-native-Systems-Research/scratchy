@@ -249,6 +249,7 @@ fn direct_at(vocab: u32, layout: &BundleLayout) -> Vec<String> {
     let idx32 = row_id.synth(SynthRole::AmIdx32).to_string();
     let idx_u32 = row_id.synth(SynthRole::AmIdxU32).to_string();
     let biased = row_id.synth(SynthRole::AmBiased).to_string();
+    let partials = row_id.synth(SynthRole::AmPartials).to_string();
     let s = ArgmaxSlots {
         logits: &lg,
         biased: &biased,
@@ -260,6 +261,7 @@ fn direct_at(vocab: u32, layout: &BundleLayout) -> Vec<String> {
         v_const: &v,
         w: &w,
         j: &j,
+        partials: &partials,
         idx32: &idx32,
         idx_u32: &idx_u32,
         table: &table,
@@ -569,4 +571,143 @@ fn the_gemmas_width_composite_runs_single_trip() {
             o.op_name, o.time
         );
     }
+}
+
+/// ⭐⭐⭐ THE PAST-THE-BUDGET WIDTH (524288) — the partials+combine form, the law that
+/// applies whenever a reduce GENUINELY tiles even under the true accum charge (here the
+/// DATA operand alone is 2,097,152 B against the 1,677,721-B usable LX). The chain keeps
+/// its landed links and splits link 5 in two: the max32 reduce time-tiles with each trip's
+/// partial landing in its OWN stick of the partials scratch, and ONE combine reduce maxes
+/// the per-trip sticks into `j` (max-of-maxes = max by associativity; each trip maxes
+/// exactly the w-slice the tiler handed it, and the slices partition the row). The pin is
+/// the PARTIALS LAW itself, read where the bake's `tiled_trips_alias` guard reads it: the
+/// per-trip OUTPUT addresses of the two-trip max32 are DISJOINT — the exact predicate that
+/// the pre-fix over-charge violated (both trips on one accum stick) and that would refuse
+/// the bundle at bake.
+#[test]
+fn the_past_budget_width_mints_the_partials_and_combine_form() {
+    let (door, names, layout) = through_the_door_at(524_288);
+    assert_eq!(
+        names,
+        vec![
+            "argmax_max16",
+            "argmax_eq",
+            "argmax_cvt",
+            "argmax_mul",
+            "argmax_max32",
+            "argmax_max32c",
+            "argmax_sub",
+            "argmax_cvt_idx",
+            "argmax_gather",
+        ],
+        "the past-the-budget chain is the landed eight links with link 5 split into the \
+         partials reduce and the combine"
+    );
+    // The two-trip max32 and the single-trip combine, by name.
+    let ops = door_ops_at(524_288);
+    let max32 = ops
+        .iter()
+        .find(|o| o.op_name == "argmax_max32")
+        .expect("the partials reduce");
+    let combine = ops
+        .iter()
+        .find(|o| o.op_name == "argmax_max32c")
+        .expect("the combine reduce");
+    assert_eq!(max32.time, 2, "the partials reduce genuinely time-tiles");
+    assert_eq!(
+        combine.time, 1,
+        "the combine runs over two sticks — single-trip by construction"
+    );
+    // THE PARTIALS LAW — the max32's per-trip OUTPUT addresses are pairwise disjoint,
+    // read the way the bake's guard reads them (the OUTPUT-labeled lds allocate nodes of
+    // each concrete trip).
+    let out_lds_of = |op: &ktir_superdsc::emit::EmittedOp| -> std::collections::BTreeSet<u32> {
+        op.dsc()
+            .dscs_
+            .iter()
+            .flat_map(|m| m.values())
+            .flat_map(|d| d.labeledDs_.iter().filter(|l| l.dsType_ == "OUTPUT"))
+            .map(|l| l.ldsIdx_)
+            .collect()
+    };
+    let out_lds = out_lds_of(max32);
+    assert!(
+        !out_lds.is_empty(),
+        "the reduce names its OUTPUT tensors — else this assert pins nothing"
+    );
+    let mut per_trip: Vec<std::collections::BTreeSet<(u32, u64)>> = Vec::new();
+    for trip in max32.concrete_trips() {
+        let mut addrs = std::collections::BTreeSet::new();
+        for dsc_map in &trip.dscs_ {
+            for dsc in dsc_map.values() {
+                for node in &dsc.scheduleTree_ {
+                    if node.component_ != "hbm" || !out_lds.contains(&node.ldsIdx_) {
+                        continue;
+                    }
+                    for v in node.startAddressCoreCorelet_.data_.values() {
+                        if let Ok(a) = v.parse::<u64>() {
+                            addrs.insert((node.ldsIdx_, a));
+                        }
+                    }
+                }
+            }
+        }
+        per_trip.push(addrs);
+    }
+    assert_eq!(per_trip.len(), 2, "one address set per concrete trip");
+    assert!(
+        per_trip[0].is_disjoint(&per_trip[1]),
+        "the two trips' OUTPUT addresses must be disjoint — the pre-fix form wrote the \
+         same accum stick in both trips ({:?} vs {:?})",
+        per_trip[0],
+        per_trip[1]
+    );
+    // And the arm stays thin in this form too: the door's descriptors are byte-identical
+    // to the direct assembly's over the SAME layout.
+    let direct = direct_at(524_288, &layout);
+    assert_eq!(door.len(), direct.len(), "nine ops both ways");
+    for (i, (d, s)) in door.iter().zip(direct.iter()).enumerate() {
+        assert_eq!(
+            d, s,
+            "link {i} differs between the partials-form door and the direct mint"
+        );
+    }
+}
+
+/// The partials scratch exists ONLY in the two-trip form — `[rows, trips × one fp32
+/// stick]`, declared by the door at exactly the sticks the trips write and the combine
+/// reads. A single-trip vocab (gemma's own 262144, the charge fix's case) declares
+/// NOTHING: its layout stays byte-identical to before the form existed.
+#[test]
+fn the_partials_scratch_exists_only_in_the_two_trip_form() {
+    let (_, _, wide_layout) = through_the_door_at(524_288);
+    let row_id = PlaceId::Act(ROW_TID);
+    let name = row_id.synth(SynthRole::AmPartials).to_string();
+    let got = wide_layout
+        .synth
+        .borrow()
+        .sizes
+        .get(&name)
+        .unwrap_or_else(|| panic!("'{name}' was not declared by the two-trip door"))
+        .to_owned();
+    assert_eq!(
+        got,
+        align128(synth_footprint_bytes(
+            &[1, 2 * Df::Fp32.elems_per_stick()],
+            Df::Fp32
+        )),
+        "'{name}' footprint — one fp32 stick per trip, two trips"
+    );
+    assert_eq!(
+        wide_layout.id_of(&name),
+        Some(row_id.synth(SynthRole::AmPartials)),
+        "'{name}' identity"
+    );
+    // The single-trip control at gemma's own width: no partials scratch — the wire is
+    // the landed eight-link one, byte for byte.
+    let (_, _, plain_layout) = through_the_door_at(262_144);
+    assert!(
+        !plain_layout.synth.borrow().map.contains_key(&name),
+        "a single-trip door declares no partials scratch"
+    );
 }

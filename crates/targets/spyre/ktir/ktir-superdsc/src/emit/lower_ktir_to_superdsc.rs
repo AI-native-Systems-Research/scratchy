@@ -9014,6 +9014,30 @@ pub fn argmax(
     } else {
         row_id.synth(R::AmBiased).to_string()
     };
+    // The partials+combine form's per-trip maxima: the max32's own trip count at this
+    // vocab (the SAME probe the assembly's link 5 runs) decides the form. ONE trip at
+    // every shipping vocab — gemma's 262144 included, the true-accum-charge fix's own
+    // case — so the scratch is named for the slot struct but REGISTERED only when the
+    // reduce genuinely tiles: a single-trip bundle's layout stays byte-identical to
+    // before the form existed.
+    let trips = match crate::ir::bridge::tiled_op_sdsc_op::reduce::reduce_trip_count(
+        crate::superdsc_opspec::OpFunc::Max,
+        rows,
+        v_pad,
+        crate::superdsc_opspec::Df::Fp32,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return err(format!(
+                "Argmax {name}: the max32's trip count at vocab {vocab}: {e}"
+            ));
+        }
+    };
+    let partials_s = if trips > 1 {
+        syn(R::AmPartials)
+    } else {
+        row_id.synth(R::AmPartials).to_string()
+    };
     if let Some(l) = layout {
         // The full footprints, at the chain's own formats — the [rows, v_pad] mask pair
         // dominates; everything else is one-stick tail scratch.
@@ -9043,6 +9067,15 @@ pub fn argmax(
         if pad_lanes {
             l.synth_df(row_id.synth(R::AmBiased), &[rows, lg.v_cols], Df::Fp16);
         }
+        if trips > 1 {
+            // The partials form's max32 output: ONE STICK PER TRIP, fp32 — exactly the
+            // sticks the trips write and the combine reduce reads.
+            l.synth_df(
+                row_id.synth(R::AmPartials),
+                &[rows, trips * Df::Fp32.elems_per_stick()],
+                Df::Fp32,
+            );
+        }
     }
     let s = ArgmaxSlots {
         logits: &lg_s,
@@ -9055,6 +9088,7 @@ pub fn argmax(
         v_const: &v_s,
         w: &w_s,
         j: &j_s,
+        partials: &partials_s,
         idx32: &idx32_s,
         idx_u32: &idx_u32_s,
         table: &table_s,

@@ -93,6 +93,60 @@ pub fn reduce_trip_count(op: OpFunc, rows: u32, cols: u32, df: Df) -> Result<u32
     Ok(tiled.time_tile.map(|t| t.count()).unwrap_or(1))
 }
 
+/// The PARTIALS+COMBINE form's first half — a seeded reduce that GENUINELY time-tiles
+/// (its data operand alone overruns the usable LX even under the true accum charge),
+/// writing each trip's partial into its OWN stick of a `[rows, trips × stick]` accum.
+/// The trips count is read off the BUILT spec's own tiler and RETURNED — one tiler run,
+/// so the caller's combine spans exactly the sticks the trips write (a probe that could
+/// disagree with the emission cannot exist; the caller passes no trips in). The caller
+/// follows with ONE combine reduce over the returned `trips` sticks
+/// (`reduce_opspec_df` at `cols = trips · elems_per_stick`) — max-of-maxes is max by
+/// associativity, sum-of-sums is sum; mean composes the same way at fixed N.
+pub fn reduce_opspec_partials(
+    op: OpFunc,
+    rows: u32,
+    cols: u32,
+    data_name: &str,
+    accum_name: &str,
+    head_major: bool,
+    df: Df,
+) -> Result<(OpSpec, u32), String> {
+    let mut spec = reduce_opspec_df(op, rows, cols, data_name, accum_name, head_major, df)?;
+    let trips = spec.time();
+    if trips < 2 {
+        return Err(format!(
+            "reduce `{accum_name}`: the partials form demands trips ≥ 2, got {trips} — a \
+             single-trip row takes the PLAIN seeded reduce (the true accum charge fits the \
+             row; the partials stride and the combine link would be dead weight)"
+        ));
+    }
+    // Rebuild the accum in place — args = [data, accum], the reduce's own construction —
+    // at its TRUE physical extent along `out`: ONE STICK PER TRIP, the buffer the
+    // partials law's per-trip stride walks and the combine reads back.
+    let accum = spec
+        .args
+        .pop()
+        .expect("the seeded reduce's accum is its last arg");
+    let rebuilt = match accum {
+        AnyTensorArg::R2(t) => AnyTensorArg::R2(
+            t.with_device_extent("out", trips * df.elems_per_stick())
+                .map_err(|e| e.0)?,
+        ),
+        AnyTensorArg::R3(t) => AnyTensorArg::R3(
+            t.with_device_extent("out", trips * df.elems_per_stick())
+                .map_err(|e| e.0)?,
+        ),
+        AnyTensorArg::R1(_) | AnyTensorArg::R4(_) => {
+            return Err(format!(
+                "reduce `{accum_name}`: the partials form declares its accum at ranks 2/3 \
+                 (the reduce's own two forms), not the rank this builder produced"
+            ));
+        }
+    };
+    spec.args.push(rebuilt);
+    Ok((spec, trips))
+}
+
 /// `cols` axis. Two operands: `data` (all active) + `accum` (the accumulator,
 /// both `inputLabeledDs[1]` and the sole output, `out`-axis stick-reduction
 /// `[Active, RedStick, Active]`).
@@ -666,5 +720,61 @@ mod seeded_reduce_trip_counts {
                 "({rows}, {cols}, {df:?}) was single-trip before the charge fix and must stay so"
             );
         }
+    }
+
+    /// ⛔ THE PARTIALS LAW'S REFUSAL — a seeded reduce that time-tiles WITHOUT the
+    /// partials form is a build Err naming the remedy, never an emitted op whose trips
+    /// alias on one accum stick (the #50 collision, and exactly what gemma's 262144
+    /// produced under the old over-charge before the charge fix made it single-trip).
+    #[test]
+    fn a_time_tiled_seeded_reduce_without_the_partials_form_refuses() {
+        let op = reduce_opspec_df(OpFunc::Max, 1, 524_288, "w", "j", false, Df::Fp32)
+            .expect("the bare opspec assembles");
+        assert_eq!(op.time(), 2, "the past-the-budget row genuinely tiles");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let err = match crate::emit::emit_sdsc_tiled("max32_bare", &op, &folds, &mut 0i64, None) {
+            Err(e) => e,
+            // `EmittedOp` is not `Debug`, so the Ok arm states its own refusal.
+            Ok(_) => panic!("the bare two-trip seeded reduce must refuse at the emission"),
+        };
+        assert!(
+            err.0.contains("not in the partials form"),
+            "the refusal names the law: {}",
+            err.0
+        );
+        assert!(
+            err.0.contains("reduce_opspec_partials"),
+            "the refusal names the remedy: {}",
+            err.0
+        );
+    }
+
+    /// The partials form's own emission: the accum carries the ONE-STICK per-trip
+    /// stride (each trip's partial lands in its own stick — the disjointness the bake's
+    /// `tiled_trips_alias` guard demands, pinned end-to-end at the door), and the
+    /// builder RETURNS the trips the combine must span — read off the built spec's own
+    /// tiler, so a probe that could disagree with the emission cannot exist.
+    #[test]
+    fn the_partials_form_strides_the_accum_one_stick_per_trip() {
+        let (op, trips) =
+            reduce_opspec_partials(OpFunc::Max, 1, 524_288, "w", "p", false, Df::Fp32)
+                .expect("the partials form assembles");
+        assert_eq!(trips, 2, "the returned trips is the tiler's own count");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let e = crate::emit::emit_sdsc_tiled("max32_partials", &op, &folds, &mut 0i64, None)
+            .expect("the partials form emits");
+        assert_eq!(e.time, 2);
+        assert_eq!(
+            e.affine_strides[1].get("out").copied(),
+            Some(Df::Fp32.elems_per_stick() as i64 * Df::Fp32.word_length() as i64),
+            "the accum (args[1]) advances EXACTLY one fp32 stick per trip"
+        );
+        // And the form itself demands trips ≥ 2 — a single-trip row takes the plain form.
+        let err = reduce_opspec_partials(OpFunc::Max, 1, 262_144, "w", "p", false, Df::Fp32)
+            .expect_err("a single-trip row must refuse the partials form");
+        assert!(
+            err.contains("trips ≥ 2"),
+            "the refusal states the precondition: {err}"
+        );
     }
 }

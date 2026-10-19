@@ -27,6 +27,7 @@
 use ktir_superdsc::emit::argmax::{
     ArgmaxGeom, ArgmaxSlots, TiedLmHeadEmbedding, assemble_argmax, try_assemble_argmax,
 };
+use ktir_superdsc::superdsc_opspec::Df;
 
 /// granite-3.3-2b's own vocab/hidden — the PR3a gate model's geometry. granite-3.1's
 /// 49155 (`PAD_VOCAB` below) is the pad-lane leg's: three lanes past the last stick.
@@ -46,6 +47,7 @@ fn slots() -> ArgmaxSlots<'static> {
         v_const: "c_argmax_v",
         w: "s554_w",
         j: "s555_j",
+        partials: "s560_partials",
         idx32: "s556_idx32",
         idx_u32: "s557_idx",
         table: "w_lm_head_emb",
@@ -172,6 +174,58 @@ fn the_pad_lane_chain_is_nine_ops_with_the_add_first() {
         add_out,
         u64::from(PAD_VOCAB.div_ceil(64) * 64),
         "the bias-add runs at the stick-padded staging width too"
+    );
+}
+
+/// ⭐⭐⭐ THE PARTIALS+COMBINE FORM at the past-the-budget width (524288 = 2 × gemma's
+/// 262144 — the fp32 data operand ALONE is 2,097,152 B against the 1,677,721-B usable
+/// LX, so the max32 GENUINELY time-tiles even under the true accum charge): NINE ops,
+/// the landed kernels with link 5 split in two — the partials reduce (a `max`) and the
+/// combine reduce (a `max` over the two per-trip sticks). This is the assembly-side
+/// pin of the form the door test holds end-to-end (per-trip OUTPUT disjointness,
+/// byte-identity); here it is the CHAIN's own membership and the combine's width.
+#[test]
+fn the_past_budget_chain_is_nine_ops_with_the_combine() {
+    let mut sid = -1i64;
+    let tied = TiedLmHeadEmbedding::from_tied_config(true).expect("granite ties");
+    let chain: Vec<serde_json::Value> = assemble_argmax(
+        ArgmaxGeom::k1(524_288, HIDDEN),
+        &slots(),
+        tied,
+        &mut sid,
+        None,
+    )
+    .into_iter()
+    .map(|e| serde_json::to_value(&e.op).expect("serializable"))
+    .collect();
+    let names: Vec<&str> = chain.iter().map(op_func_name).collect();
+    assert_eq!(
+        names,
+        vec![
+            "max",
+            "equal",
+            "dl16tofp32",
+            "mul",
+            "max",
+            "max",
+            "sub",
+            "fp32toint32",
+            "identity",
+        ],
+        "the past-the-budget composite is the landed chain with link 5 split into the \
+         partials reduce and the combine — both `max`, the combine over the per-trip sticks"
+    );
+    // The combine's own width: TWO fp32 sticks (trips × 32 elems) — exactly the sticks
+    // the trips wrote, never the vocab.
+    let combine_out = body(&chain[5])
+        .get("N_")
+        .and_then(|n| n.get("out_"))
+        .and_then(|v| v.as_u64())
+        .expect("out_ in N_ of the combine");
+    assert_eq!(
+        combine_out,
+        u64::from(2 * Df::Fp32.elems_per_stick()),
+        "the combine maxes the two per-trip partial sticks"
     );
 }
 
