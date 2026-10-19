@@ -9845,9 +9845,11 @@ fn synth_role_tokens(
         R::XSScratch => quote! { #b::XSScratch },
         R::XRaw => quote! { #b::XRaw },
         R::XDqA => quote! { #b::XDqA },
-        // The composite argmax's seven scratch synthetics (#603 PR3a) — keyed off the ROW
+        // The composite argmax's eight scratch synthetics (#603 PR3a) — keyed off the ROW
         // tid by the door, declared in the walk's own declare pass. `AmBiased` is the
-        // pad-lane form's link-0 output, declared only when the vocab is sub-stick.
+        // pad-lane form's link-0 output, declared only when the vocab is sub-stick;
+        // `AmPartials` is the partials+combine form's per-trip scratch, declared only
+        // when the row genuinely time-tiles (the true accum charge's second form).
         R::AmMax => quote! { #b::AmMax },
         R::AmMask => quote! { #b::AmMask },
         R::AmMask32 => quote! { #b::AmMask32 },
@@ -9856,6 +9858,7 @@ fn synth_role_tokens(
         R::AmIdx32 => quote! { #b::AmIdx32 },
         R::AmIdxU32 => quote! { #b::AmIdxU32 },
         R::AmBiased => quote! { #b::AmBiased },
+        R::AmPartials => quote! { #b::AmPartials },
         R::GatherKtLx(i) => {
             let i = proc_macro2::Literal::u32_unsuffixed(*i);
             quote! { #b::GatherKtLx(#i) }
