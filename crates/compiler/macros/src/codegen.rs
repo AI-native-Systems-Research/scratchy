@@ -9992,6 +9992,8 @@ fn layout_tokens(
         router_experts,
         router_k,
         kv_request_stride_bytes,
+        lx_op_local_bytes,
+        lx_prob_pin_bytes,
     } = l;
     let segs = segment_bytes
         .iter()
@@ -10018,6 +10020,14 @@ fn layout_tokens(
         quote! { (#from, #to) }
     });
     let krs = proc_macro2::Literal::u64_unsuffixed(*kv_request_stride_bytes);
+    // The rung's op-local LX pin slots — the host's term of the one `lx_window_fits` budget. The
+    // pin PLACEMENTS stay emit-only (compiled sdsc allocates); the SUM is baked here so the host
+    // budgets against the same pins the bake did. Same number for every bundle of the rung.
+    let lxol = proc_macro2::Literal::u64_unsuffixed(*lx_op_local_bytes);
+    // The chunk form's probability-part pins — the host's SECOND core-local term of the same
+    // budget, summed beside the gathers at the bake's `lx_form` admission. 0 for a bundle whose
+    // chunk form mints none.
+    let lxpp = proc_macro2::Literal::u64_unsuffixed(*lx_prob_pin_bytes);
     // The segment budget's verdict, as a variant: every reader matches on it.
     let tail = match weight_tail {
         scratchy_target_spyre::bundle_code::WeightTail::InPlace => {
@@ -10051,6 +10061,8 @@ fn layout_tokens(
             router_experts: #rexperts,
             router_k: #rk,
             kv_request_stride_bytes: #krs,
+            lx_op_local_bytes: #lxol,
+            lx_prob_pin_bytes: #lxpp,
         }
     }
 }

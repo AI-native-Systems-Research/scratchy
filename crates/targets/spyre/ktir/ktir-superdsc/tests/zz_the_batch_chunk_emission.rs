@@ -130,7 +130,11 @@ fn batch_part_slots(pool: PagedKvPool, pages: u32) -> (Vec<u32>, Vec<u32>) {
             .map(|i| per.min(pages - i * per) * 256)
             .collect()
     };
-    match chunk.lx_form(ktir_superdsc::sdsc_abstract::ChunkRowKind::Batch) {
+    match chunk.lx_form(
+        ktir_superdsc::sdsc_abstract::ChunkRowKind::Batch,
+        /* no op-local pins: geometry only */ 0,
+        /* no probability-part pins: geometry only */ 0,
+    ) {
         None => (vec![pages * 256], vec![pages * 256]),
         Some(lx) => (
             lx.keys().map_or(vec![pages * 256], |k| cut(k.part_pages())),

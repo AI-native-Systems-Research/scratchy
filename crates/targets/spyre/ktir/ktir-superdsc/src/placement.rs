@@ -297,7 +297,7 @@ pub struct BundleLayout {
     /// it looks up a `t{id}`'s.
     pub synth: std::cell::RefCell<SynthAlloc>,
     /// ⭐ PINNED-LX INTERMEDIATES — the residency twin of [`Self::synth`]. A tensor declared
-    /// here (via [`Self::synth_lx`]) is addressed in the per-core LX scratchpad at a pinned
+    /// here (via [`Self::synth_lx_op_local`]) is addressed in the per-core LX scratchpad at a pinned
     /// byte address instead of the Intermediate HBM segment: its producer replicates across
     /// all cores ([`crate::superdsc_opspec::WorkPlan::replicate`]) and its consumers read
     /// their own core's copy. Empty for every bundle that declares none (all models before
@@ -369,7 +369,7 @@ const _: () = assert!(
 pub const LX_PIN_BASE: u64 = 128 * 1024;
 
 /// The pinned-LX twin of [`SynthAlloc`]: byte-granular addresses in the per-core LX
-/// scratchpad for intermediates declared via [`BundleLayout::synth_lx`]. LX residency
+/// scratchpad for intermediates declared via [`BundleLayout::synth_lx_op_local`]. LX residency
 /// exists for ONE measured reason: a SUB-STICK read offset on a collapsed stick dim (the
 /// rmsnorm `rinv` lane read at element 8 of the exx2 pair) survives the whole compile chain
 /// only on the LX path — the HBM path floors it away (the L3 EBR is stick-granular, and the
@@ -380,9 +380,29 @@ pub const LX_PIN_BASE: u64 = 128 * 1024;
 /// every HBM leg for the tensor vanishes.
 #[derive(Clone, Debug)]
 pub struct LxAlloc {
-    /// Next free pin byte (starts at [`LX_PIN_BASE`]; bumps by each tensor's
-    /// 128-aligned footprint so pinned tensors never overlap each other).
+    /// Next free pin byte for CORE-LOCAL pins (starts at [`LX_PIN_BASE`]; bumps by each
+    /// tensor's 128-aligned footprint so pinned tensors never overlap each other).
     pub next: u64,
+    /// Next free byte for OP-LOCAL shared slots, bumping DOWN from [`LX_PIN_END`]. The two
+    /// cursors are independent by construction — only [`lx_window_fits`] asserts they never
+    /// meet — so a chunk pin landing later in walk order can never eat a slot reserved earlier.
+    pub next_down: u64,
+    /// Sum of the op-local slot footprints reserved so far — the [`lx_window_fits`] term the
+    /// allocator guard and the `lx_form` witness both read (one number, two consults).
+    pub op_local_bytes: u64,
+    /// The probability-part pins the chunk form mints BESIDE its gathers — the other
+    /// core-local term of the `lx_form` witness's budget, recorded at the chunk's admission
+    /// ([`BundleLayout::note_chunk_prob_pin_bytes`]) so the baked artifact carries it to the
+    /// host's own `chunk_gather_index_table` read. RECORDED, not bumped: the mint itself bumps
+    /// `next`; this is the number the ADMISSION budgeted, noted so the two arms cannot drift.
+    pub prob_pin_bytes: u64,
+    /// The shared slot's start address per footprint class (bytes) — one slot per class,
+    /// every op-local pin of that class resolving to the same address ([`LxAlloc::next_down`]).
+    pub op_local_slots: std::collections::BTreeMap<u64, u64>,
+    /// The names declared OP-LOCAL ([`BundleLayout::synth_lx_op_local`]): short-lived scratch
+    /// whose def and use both live inside one assembly call, so same-class names share a slot
+    /// under the per-group alternation walk's proof.
+    pub op_local: std::collections::BTreeSet<String>,
     /// Pinned byte address per synth name.
     pub map: std::collections::BTreeMap<String, u64>,
     /// Declared footprint (bytes) per name — the resolve-time window guard's bound. For a
@@ -399,12 +419,29 @@ impl Default for LxAlloc {
     fn default() -> Self {
         LxAlloc {
             next: LX_PIN_BASE,
+            next_down: LX_PIN_END,
+            op_local_bytes: 0,
+            prob_pin_bytes: 0,
+            op_local_slots: std::collections::BTreeMap::new(),
+            op_local: std::collections::BTreeSet::new(),
             map: std::collections::BTreeMap::new(),
             sizes: std::collections::BTreeMap::new(),
             core_local: std::collections::BTreeSet::new(),
             divisions: std::collections::BTreeMap::new(),
         }
     }
+}
+
+/// ⭐⭐ THE ONE PIN-WINDOW BUDGET — the single place the window's arithmetic lives. Both
+/// regions of the pin window are summed here and nowhere else: core-local chunk pins bump
+/// UP from [`LX_PIN_BASE`], op-local shared slots bump DOWN from [`LX_PIN_END`], and the
+/// window holds exactly when the two never meet. Every guard consults THIS function — the
+/// allocator's per-declaration asserts (below) with the live cursor state, and the
+/// `ChunkScratch::lx_form` admission witness with the chunk's would-be bytes — so the
+/// witness can never admit a form the allocator would refuse: one law, two readers,
+/// zero drift (#645's ruling 4).
+pub const fn lx_window_fits(core_local_bytes: u64, op_local_slot_bytes: u64) -> bool {
+    LX_PIN_BASE + core_local_bytes + op_local_slot_bytes <= LX_PIN_END
 }
 
 /// Footprint (bytes) of a synth tensor with shape `dims` (outermost→innermost; the inner dim
@@ -487,52 +524,78 @@ impl BundleLayout {
         self.synth_bytes(id, synth_footprint_bytes(dims, df));
     }
 
-    /// Declare a synthetic intermediate LX-RESIDENT at its FULL shape (`dims`, outermost→
-    /// innermost), pinned at the next free byte of the per-core LX scratchpad. This REPLACES
-    /// the seg3 HBM slot [`Self::synth`] would reserve — an LX-resident tensor has no HBM
-    /// copy at all (its `memOrg_` is lx-only, so the runtime generates no L3 movement for it).
+    /// Declare a SYNTHETIC intermediate LX-RESIDENT and OP-LOCAL at its FULL shape (`dims`,
+    /// outermost→innermost): short-lived scratch whose DEF and USE both live inside one
+    /// assembly call (the rmsnorm `rinv`: rsqrt produces it, apply consumes it, nothing else
+    /// touches it). Like [`Self::synth`] this REPLACES the seg3 HBM slot — an LX-resident
+    /// tensor has no HBM copy at all — and like [`Self::synth_lx_core_local`] it pins in the
+    /// per-core scratchpad. Idempotent per name.
     ///
-    /// The pin is per-tensor (each name gets its own 128-aligned footprint slot) even where
-    /// lifetimes would allow sharing, so correctness never leans on emission order. Idempotent
-    /// per name.
+    /// ⭐ SAME-CLASS PINS SHARE ONE SLOT. The class is the 128-aligned footprint, and every
+    /// name of one class resolves to the SAME address — one 64-KiB slot serves every norm in
+    /// the group, so a bundle's pin demand is the number of CLASSES, not of norms (#645: a
+    /// rung's ~23 stacked `[rows,64]` rinvs refused the window; as ~3 classes they fit with
+    /// room for the chunk forms). This is sound because each name's live range is confined to
+    /// its own assembly call: the per-group alternation walk
+    /// (`lower_subtile_tape_to_superdsc::walk_lx_slot_alternation`) proves at build, per launch
+    /// group over its programs in order, that no same-class def lands inside another's live
+    /// range — so sharing is checked, never assumed, and the fallback on a refusal is to split
+    /// the conflicting class, never to un-share globally.
     ///
-    /// ⛔ PANICS on overflow past [`LX_PIN_END`] — this runs at `#[forward]` expansion, so the
-    /// panic IS the cargo-build guard: a bundle whose pinned intermediates do not fit the
+    /// Slots bump DOWN from [`LX_PIN_END`] so the two pin families are independent by
+    /// construction: a chunk core-local pin declared later in walk order (bumping up from
+    /// [`LX_PIN_BASE`]) can never eat a slot reserved earlier — the only place the two regions
+    /// are compared is [`lx_window_fits`].
+    ///
+    /// ⛔ PANICS when the two regions would meet — computed by [`lx_window_fits`], the same
+    /// one-function budget the `lx_form` admission witness reads — so this runs at
+    /// `#[forward]` expansion AS the cargo-build guard: a bundle whose pins do not fit the
     /// frontend's LX window is unbuildable, not silently overlapping dxp's own LX allocations.
-    pub fn synth_lx(&self, id: PlaceId, dims: &[u32]) {
+    pub fn synth_lx_op_local(&self, id: PlaceId, dims: &[u32]) {
         let name = id.to_string();
         self.ids.borrow_mut().insert(name.clone(), id);
         let mut a = self.lx.borrow_mut();
         if a.map.contains_key(&name) {
             return;
         }
-        let o = a.next;
         let fp = align128(synth_footprint_bytes(dims, Df::Fp16).max(1));
-        a.next = o + fp;
-        let end = a.next;
+        let (slot, added) = match a.op_local_slots.get(&fp) {
+            Some(&s) => (s, 0),
+            None => (a.next_down - fp, fp),
+        };
         assert!(
-            end <= LX_PIN_END,
-            "pinned-LX intermediates overflow the frontend's LX window: '{name}' pins at {o} with \
-             footprint {fp}, pushing the region to {end} > {LX_PIN_END}, where dxp's own LX \
-             allocations begin. LX-resident intermediates are for small per-row scalars (the \
-             rmsnorm rinv stick); a tensor this large belongs in the HBM Intermediate segment \
-             (declare it with `BundleLayout::synth` instead)."
+            lx_window_fits(a.next - LX_PIN_BASE, a.op_local_bytes + added),
+            "op-local LX slots meet the core-local pins inside the frontend's LX window: the \
+             {fp}-byte class of '{name}' slots at {slot}, with core-local pins through {} and \
+             {} B of op-local slots against the {LX_PIN_END} boundary. The op-local classes are \
+             per-FOOTPRINT, so this is one class too many at this geometry — either the norm \
+             rows shrank a class away, or a chunk form this bundle also declares leaves no room \
+             for it. The `lx_form` witness reads the same budget (`lx_window_fits`), so it \
+             refusing a chunk form here is the designed alternative, not this panic.",
+            a.next,
+            a.op_local_bytes + added
         );
-        a.map.insert(name.clone(), o);
-        a.sizes.insert(name, fp);
+        if added > 0 {
+            a.next_down = slot;
+            a.op_local_bytes += added;
+            a.op_local_slots.insert(fp, slot);
+        }
+        a.map.insert(name.clone(), slot);
+        a.sizes.insert(name.clone(), fp);
+        a.op_local.insert(name);
     }
 
     /// Declare a synthetic intermediate LX-resident CORE-LOCALLY: every core holds only ITS OWN work
     /// slice, `per_core_bytes` of it, at one pinned address shared by all cores — the reference's form
     /// for every softmax intermediate (`allocate … component_ lx`, one `startAddressCoreCorelet_` value
-    /// on all 32 cores). Like [`Self::synth_lx`] it REPLACES the seg3 HBM slot: the tensor never leaves
+    /// on all 32 cores). Like [`Self::synth_lx_op_local`] it REPLACES the seg3 HBM slot: the tensor never leaves
     /// LX. Idempotent per name.
     ///
     /// ⛔ ONLY AN OP THAT DIVIDES THE WORK EXACTLY AS THE PRODUCER DID CAN READ IT — core `c`'s slice is
     /// whatever core `c`'s producer pass wrote. The emitter records the first op's division and refuses
     /// every op that differs, at build ([`Self::record_lx_division`]).
     ///
-    /// ⛔ PANICS past [`LX_PIN_END`], the same `cargo build` guard as [`Self::synth_lx`].
+    /// ⛔ PANICS past [`LX_PIN_END`], the same `cargo build` guard as [`Self::synth_lx_op_local`].
     pub fn synth_lx_core_local(&self, id: PlaceId, per_core_bytes: u64) {
         let name = id.to_string();
         self.ids.borrow_mut().insert(name.clone(), id);
@@ -542,23 +605,81 @@ impl BundleLayout {
         }
         let o = a.next;
         let fp = align128(per_core_bytes.max(1));
-        a.next = o + fp;
-        let end = a.next;
         assert!(
-            end <= LX_PIN_END,
+            lx_window_fits(a.next + fp - LX_PIN_BASE, a.op_local_bytes),
             "a core-local LX intermediate overflows the frontend's LX window: '{name}' pins at {o} \
-             with a {fp}-byte per-core slice, pushing the region to {end} > {LX_PIN_END}, where dxp's \
-             own LX allocations begin. Cut the op into smaller parts so one core's slice fits, or keep \
-             the tensor in HBM (`BundleLayout::synth`)."
+             with a {fp}-byte per-core slice, meeting the {} B of op-local slots already reserved \
+             against the {LX_PIN_END} boundary. Cut the op into smaller parts so one core's slice \
+             fits, or keep the tensor in HBM (`BundleLayout::synth`). The `lx_form` witness reads \
+             the same budget (`lx_window_fits`), so this chunk form being refused there instead is \
+             the designed alternative, not this panic.",
+            a.op_local_bytes
         );
+        a.next = o + fp;
         a.map.insert(name.clone(), o);
         a.sizes.insert(name.clone(), fp);
         a.core_local.insert(name);
     }
 
+    /// The op-local slot bytes reserved so far — one slot per footprint class
+    /// ([`Self::synth_lx_op_local`]). THE `lx_form` witness's op-local term: by the time the
+    /// consumer pass runs, the declare pass has already declared every op-local pin of the
+    /// rung, so this number is final and the witness and the allocator's guard read the same
+    /// quantity through [`lx_window_fits`].
+    pub fn lx_op_local_slot_bytes(&self) -> u64 {
+        self.lx.borrow().op_local_bytes
+    }
+
+    /// Record the probability-part pins the chunk form mints beside its gathers
+    /// ([`crate::ir::bridge::tiled_op_sdsc_op::attn::chunk_prob_pins`]) — the second core-local
+    /// term of the `lx_form` witness's budget, summed with the gather pins at the chunk's
+    /// admission. Noted so the baked artifact carries the term to the host's own
+    /// `chunk_gather_index_table` read — the bake/host agreement law: the host must refuse
+    /// exactly what the bake refused. REPLACEMENT, not a sum: one bundle mints one attention
+    /// op's probability parts, so re-emitting the same chunk (the declare pass, then the real
+    /// one) notes the same number.
+    pub fn note_chunk_prob_pin_bytes(&self, bytes: u64) {
+        self.lx.borrow_mut().prob_pin_bytes = bytes;
+    }
+
+    /// The recorded probability-part term ([`Self::note_chunk_prob_pin_bytes`]) — `0` for a
+    /// bundle whose chunk form mints none.
+    pub fn lx_prob_pin_bytes(&self) -> u64 {
+        self.lx.borrow().prob_pin_bytes
+    }
+
+    /// The core-local pin bytes declared so far (the up-cursor's distance from
+    /// [`LX_PIN_BASE`]) — the other [`lx_window_fits`] term.
+    pub fn lx_core_local_bytes(&self) -> u64 {
+        self.lx.borrow().next - LX_PIN_BASE
+    }
+
+    /// Whether `name` was declared OP-LOCAL ([`Self::synth_lx_op_local`]) — a same-class
+    /// shared-slot pin, as opposed to a core-local one.
+    pub fn lx_op_local(&self, name: &str) -> bool {
+        self.lx.borrow().op_local.contains(name)
+    }
+
     /// Whether `name` is LX-resident CORE-LOCALLY ([`Self::synth_lx_core_local`]).
     pub fn lx_core_local(&self, name: &str) -> bool {
         self.lx.borrow().core_local.contains(name)
+    }
+
+    /// ⭐ THE OP-LOCAL PIN TABLE — one row per shared-slot pin, `(name, class bytes, slot address)`,
+    /// name-sorted. THE alternation walk's and the dump ledger's whole view of the op-local family:
+    /// the class is the row's `bytes` (the footprint IS the class key, [`LxAlloc::op_local_slots`]),
+    /// and every name of one class carries the same slot address. Empty for a bundle that declares
+    /// no op-local pins — the walk's own no-op case.
+    pub fn lx_op_local_pins(&self) -> Vec<(String, u64, u64)> {
+        let a = self.lx.borrow();
+        a.op_local
+            .iter()
+            .map(|name| {
+                let fp = a.sizes[name];
+                let slot = a.map[name];
+                (name.clone(), fp, slot)
+            })
+            .collect()
     }
 
     /// ⛔ THE CORE-LOCAL READ LAW, at build: the FIRST op to touch core-local `name` records its work

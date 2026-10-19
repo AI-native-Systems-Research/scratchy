@@ -1389,7 +1389,7 @@ pub fn pointwise_chunk_out_offset(cols_start: u32) -> u32 {
 
 /// ⭐ THE NAME-KEYED LX-RESIDENCY CONSULT — the pointwise door's residency rewrite, run on the
 /// freshly-built [`OpSpec`] before emission. A tensor's residency is a property of the TENSOR
-/// (decided where its name is minted, `BundleLayout::synth_lx`), not of any one op view, so the
+/// (decided where its name is minted, `BundleLayout::synth_lx_op_local`), not of any one op view, so the
 /// consult is by NAME against the layout — the SAME authority that resolves its address — rather
 /// than a builder parameter every pointwise caller would have to thread and agree on.
 ///
@@ -2681,7 +2681,7 @@ fn resolve_seg_base(
     if let Some(l) = layout {
         // 0. PINNED-LX residency — the name-keyed consult, before any HBM placement. An
         //    LX-resident intermediate's address is its PIN (byte-granular, allocated by
-        //    `BundleLayout::synth_lx`), so resolve to segment 0 + pin and let
+        //    `BundleLayout::synth_lx_op_local`), so resolve to segment 0 + pin and let
         //    `per_core_addr` fold the per-core slice corner on top. This arm is the ONLY
         //    place a sub-stick offset on a collapsed stick dim (the `rinv` lane read at
         //    element 8) survives to the wire BYTE-exact: the HBM path's L3 staging is
@@ -2707,7 +2707,7 @@ fn resolve_seg_base(
                     "lx-resident '{name}': access window end {window_end}B (offset {slice}B, \
                      operand {arg_bytes}B) exceeds its pinned-LX footprint {fp}B — shape \
                      mismatch (the access would run past the pin into the next pinned \
-                     intermediate). Fix the declared shape (BundleLayout::synth_lx) or the \
+                     intermediate). Fix the declared shape (BundleLayout::synth_lx_op_local) or the \
                      op's view/offset."
                 )));
             }

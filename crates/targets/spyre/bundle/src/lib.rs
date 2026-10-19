@@ -247,6 +247,20 @@ pub struct BundleLayout<'a> {
     /// Bytes between two requests' KV inside one page+layer, or 0 for an unpaged bundle. The
     /// EMITTER's number, travelling to the runtime rather than being re-derived there.
     pub kv_request_stride_bytes: u64,
+    /// ⭐ THE RUNG'S OP-LOCAL LX PIN SLOTS, in bytes — the top-down footprint-class slots the
+    /// emitter placed below [`LX_PIN_END`]. The HOST's term of the one window budget
+    /// (`lx_window_fits`): `chunk_gather_index_table` refuses a chunk whose core-local pins plus
+    /// THIS number leave the frontend window, so the host budgets against the same pins the bake
+    /// did. The pin PLACEMENTS stay emit-only (they live in the compiled sdsc allocates); this is
+    /// the SUM, which is all the budget asks. Every bundle of one rung carries the same number —
+    /// the slot map is the rung layout's, shared by prefix, bodies and suffix alike.
+    pub lx_op_local_bytes: u64,
+    /// ⭐ THE CHUNK FORM'S PROBABILITY-PART LX PINS, in bytes — the `cesub` (and a prompt chunk's
+    /// `cexp`) per-core slices the emission pins beside its gathers. The HOST's SECOND core-local
+    /// term of the same window budget: the bake's `lx_form` admission summed it beside the gather
+    /// pins, and `chunk_gather_index_table` passes it beside [`Self::lx_op_local_bytes`] so the
+    /// host refuses exactly what the bake refused. 0 for a bundle whose chunk form mints none.
+    pub lx_prob_pin_bytes: u64,
 }
 
 impl<'a> BundleLayout<'a> {

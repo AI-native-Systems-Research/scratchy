@@ -1448,7 +1448,8 @@ impl Worker for SpyreWorker {
                         })?;
                         Some(
                             scratchy_subtile::sdsc_abstract::batch_chunk_index_table(
-                                bc, &page_maps, per_page,
+                                bc, &page_maps, per_page, step.lx_op_local_bytes(),
+                                step.lx_prob_pin_bytes(),
                             )
                             .ok_or_else(|| {
                                 werr(format!(
