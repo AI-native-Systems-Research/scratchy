@@ -528,13 +528,15 @@ pub fn distribute_cores(dims: &[ItDim], max_cores: u32) -> BTreeMap<&'static str
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EwDivision {
     /// THE LAW: whichever of the two below the op's operands call for ([`Self::resolve`]). Every
-    /// elementwise door passes this.
+    /// elementwise door passes this, except for the two ops below that state their division outright.
     Law,
     /// [`distribute_cores`]: `mb` first, then the other output dims largest-first. Stated outright only by
     /// an op whose own addressing is keyed on `mb` being the split axis (the gathered-row leg, whose index
     /// enumerates `mb` in whole entries).
     RowsFirst,
-    /// [`distribute_cores_sticks_first`]: the stick dim's whole-stick split first, then `mb`.
+    /// [`distribute_cores_sticks_first`]: the stick dim's whole-stick split first, then `mb`. Stated
+    /// outright by a decode batch chunk's `esub` and `exp`. Their shared core-local `cesub` is sized under
+    /// it, so both ops keep it (`attn`'s `ChunkBufs::sm_division_of`).
     SticksFirst,
 }
 
@@ -543,8 +545,10 @@ impl EwDivision {
     /// rank-2 stick-major presentation decision — the SAME value that picks the operands' layout, so the
     /// layout and the division cannot disagree — and `core_local` is whether any operand is a core-local
     /// LX pin. Such a tensor's division is its PRODUCER's, held by `emit_sdsc_tiled`'s read law and sized
-    /// by [`crate::emit::pointwise_untiled_slice_bytes`], so an op touching one keeps the rows-first
-    /// division those were laid out under. The two concrete divisions resolve to themselves.
+    /// by [`crate::emit::pointwise_untiled_slice_bytes`], so an op touching one under the law keeps the
+    /// rows-first division those were laid out under. A pin laid out under a stated division is sized
+    /// under that division instead ([`crate::emit::pointwise_untiled_slice_bytes_divided`]), and its ops
+    /// state it. The two concrete divisions resolve to themselves.
     pub const fn resolve(self, stick_major: bool, core_local: bool) -> EwDivision {
         match self {
             EwDivision::Law if stick_major && !core_local => EwDivision::SticksFirst,
