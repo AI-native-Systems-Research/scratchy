@@ -2633,14 +2633,27 @@ impl SpyreWorker {
                 // decode meta's for the solo decode session, whose every step is the one-row key. The
                 // decode BATCH rungs key by how many requests are live, which no load-time fact knows,
                 // so they still bind at first use.
+                //
+                // ⭐ AND FAULT THE SAME SESSIONS' ACTIVATION SHADOWS IN FIRST, so a request's first
+                // binds write into pages already mapped (see `materialize_activation_shadow`). The
+                // same set and for the same reason: these are what a first request runs on. A decode
+                // batch rung's activation segment reserves `nqh · rows` prefix-mask rows for every page
+                // a pool can hold (the `pmbytes` law), of which a step writes only its live blocks, so
+                // it keeps faulting in only what it writes rather than committing the reservation.
                 {
                     let _t = std::time::Instant::now();
                     let pw = wirings.prefill.as_ref().unwrap_or(&wirings.decode);
                     let mut staged = (0usize, 0u64);
+                    let (mut shadow_bytes, mut shadow_s) = (0u64, 0f64);
                     let mut stage = |sess: &mut SuperDscSession,
                                      w: &scratchy_target_spyre::wiring::Wiring,
                                      rows: usize|
                      -> ExecutorResult<()> {
+                        let t = std::time::Instant::now();
+                        shadow_bytes += sess.materialize_activation_shadow().map_err(|e| {
+                            werr(format!("the {rows}-row session's activation shadow: {e}"))
+                        })?;
+                        shadow_s += t.elapsed().as_secs_f64();
                         staged.1 += stage_full_chunk_causal(sess, w, rows).map_err(werr)?;
                         staged.0 += 1;
                         Ok(())
@@ -2654,10 +2667,13 @@ impl SpyreWorker {
                     stage(&mut ss, &wirings.decode, 1)?;
                     info!(
                         "[spyre-worker] sendnn: staged {} session(s)' full-chunk causal mask at load \
-                         ({} KB sent, {:.0} ms) — a full chunk's first launch binds nothing for it",
+                         ({} KB sent, {:.0} ms in all) — a full chunk's first launch binds nothing \
+                         for it; their activation shadows faulted in first ({} KB, {:.0} ms)",
                         staged.0,
                         staged.1 >> 10,
                         _t.elapsed().as_secs_f64() * 1e3,
+                        shadow_bytes >> 10,
+                        shadow_s * 1e3,
                     );
                 }
                 let sb = SuperDscBundle {

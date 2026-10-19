@@ -558,6 +558,12 @@ impl SuperDscSession {
         self.exec.bind_input_keyed(id, key, f32_to_f16_le(vals))
     }
 
+    /// Fault the activation segment's host shadow in now, at load, so a request's first bind does
+    /// not (see `Executor::materialize_activation_shadow`). Returns the shadow's bytes.
+    pub fn materialize_activation_shadow(&mut self) -> Result<u64> {
+        self.exec.materialize_activation_shadow()
+    }
+
     /// [`Self::bind_keyed`], uploaded NOW rather than by the next step — a session's load-time
     /// staging of what its first launch would bind (see `Executor::stage_keyed`). Returns the bytes
     /// sent.

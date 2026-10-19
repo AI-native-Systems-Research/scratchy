@@ -669,6 +669,20 @@ fn h2d_run(offset: u64, len: u64) -> (u64, u64) {
 /// The H2D window alignment [`h2d_run`] rounds to.
 const H2D_ALIGN: u64 = 4096;
 
+/// The smallest page a host maps. One write per this many bytes faults in every page of a buffer,
+/// whatever page size the host actually uses.
+const HOST_PAGE: usize = 4096;
+
+/// ⭐ FAULT EVERY PAGE OF `buf` IN, LEAVING ITS BYTES AS THEY ARE: each page is written with the byte
+/// it already holds. A zeroed allocation is mapped on first WRITE (a read maps the shared zero page
+/// and commits nothing), so this is what moves those faults to the caller's moment. The value goes
+/// through `black_box`, so the store cannot be proven redundant and dropped.
+fn fault_in(buf: &mut [u8]) {
+    for b in buf.iter_mut().step_by(HOST_PAGE) {
+        *b = std::hint::black_box(*b);
+    }
+}
+
 /// One keyed activation's state: the [`CausalKey`] its staged bytes are a function of, and whether
 /// the current step re-bound it (so `refill_activations` converts and uploads it this step, and only
 /// this step). See [`Executor::keyed`].
@@ -1638,6 +1652,33 @@ impl Executor {
             .synchronize()
             .map_err(|e| anyhow!("stage_keyed('{id}'): sync: {e}"))?;
         Ok(sent)
+    }
+
+    /// ⭐ MATERIALIZE THE ACTIVATION SEGMENT'S HOST SHADOW — fault every page of it in now, at load,
+    /// so a request's first bind into it does not.
+    ///
+    /// The ACTIVATION segment is the one segment the host writes on a step: the placement pass puts
+    /// every per-step input there (`SegRole::Activation` — embeddings, rotary tables, both masks, the
+    /// gather index, the constants), and the same law names it here. Prepare allocates its shadow
+    /// zeroed, which the allocator satisfies with pages mapped on first write, so before this the
+    /// first request faulted in every page its binds touched, inside its TTFT. The other segments'
+    /// shadows are left alone: the intermediates are device-written and the host never touches them,
+    /// so committing them would be RSS for nothing.
+    ///
+    /// Contents unchanged ([`fault_in`]): bytes already staged there, such as a causal mask
+    /// `stage_keyed` put in, stay exactly as they are, and the device is not touched. Only WHERE the
+    /// faults land moves. Returns the shadow's length — the RSS this commits.
+    pub fn materialize_activation_shadow(&mut self) -> Result<u64> {
+        if !self.prepared {
+            bail!("materialize_activation_shadow before prepare — the shadow is sized at prepare");
+        }
+        let seg = crate::lower_subtile_tape_to_superdsc::SegRole::Activation.segment();
+        let shadow = self
+            .seg_host
+            .get_mut(seg)
+            .ok_or_else(|| anyhow!("the activation segment {seg} is not a tensor segment"))?;
+        fault_in(shadow);
+        Ok(shadow.len() as u64)
     }
 
     /// ⭐⭐⭐⭐⭐ MINT THE ONLY VALUE [`Self::bind_input_raw`] ACCEPTS — the payload measured against
@@ -5697,6 +5738,22 @@ mod tests {
                 "offset {offset} n {n}: the window's bytes differ"
             );
         }
+    }
+
+    /// ⭐ FAULTING A SHADOW IN CHANGES NONE OF ITS BYTES — the property that lets the load-time
+    /// materialize run after `stage_keyed` (or in any order with it): the keyed bytes already in
+    /// the shadow are the ones a later aligned H2D window may re-send. Over a length that is not a
+    /// whole number of pages, so the last partial page is covered too.
+    #[test]
+    fn faulting_a_shadow_in_changes_none_of_its_bytes() {
+        let n = 5 * HOST_PAGE + 123;
+        let want: Vec<u8> = (0..n).map(|i| (i * 31 % 251) as u8).collect();
+        let mut got = want.clone();
+        fault_in(&mut got);
+        assert!(got == want, "a byte moved");
+        let mut zeros = vec![0u8; n];
+        fault_in(&mut zeros);
+        assert!(zeros.iter().all(|&b| b == 0), "a zeroed shadow stays zero");
     }
 
     /// Two steps on ONE image key: the first derives, the second hits the cache —
