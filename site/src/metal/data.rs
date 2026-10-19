@@ -27,6 +27,40 @@ pub struct Run {
     pub file: PathBuf,
 }
 
+/// A cell whose requests delivered less than this share of the answer tokens they asked for
+/// measured a server that had stopped answering: a dead scratchy server answers at once, or after
+/// its 60 s watchdog, with 0–22 tokens of thousands (#413). Every engine's real cells deliver
+/// 14% or more, as an engine that stops at EOS despite `ignore_eos` does (ollama; oMLX, #479).
+const DEAD_BELOW: f64 = 0.05;
+
+impl Run {
+    /// Mark each cell whose server had stopped answering ([`DEAD_BELOW`]), so the page shows no
+    /// number from it. Runs from before the bench counted those requests as failed published them
+    /// as measured.
+    pub fn mark_dead(&mut self) {
+        let base = self.config.base().and_then(|b| b.output);
+        for m in &mut self.models {
+            for e in super::numbers::Engine::ALL {
+                for c in e.cells_mut(m) {
+                    let asked = match c.at {
+                        At::Grid { output, .. } | At::Output(output) => Some(output),
+                        At::Conc(_) | At::Input(_) => base,
+                    };
+                    let asked = asked
+                        .zip(c.completed)
+                        .map(|(n, k)| u64::from(n) * u64::from(k));
+                    c.dead = match (c.total_output_tokens, asked) {
+                        (Some(got), Some(asked)) if asked > 0 => {
+                            (got as f64) < DEAD_BELOW * asked as f64
+                        }
+                        _ => false,
+                    };
+                }
+            }
+        }
+    }
+}
+
 /// The only schema this page reads.
 #[derive(Deserialize)]
 #[serde(try_from = "u32")]
@@ -391,6 +425,11 @@ pub struct Cell {
     /// A grid cell's users at once; None in runs from before the grid had its
     /// own, which ran it at the base users count.
     pub users: Option<u32>,
+    /// The answer tokens its requests delivered; None in runs from before
+    /// the run file kept it.
+    pub total_output_tokens: Option<u64>,
+    /// Whether the server it measured had stopped answering (`Run::mark_dead`).
+    pub dead: bool,
 }
 
 #[derive(Deserialize)]
@@ -424,6 +463,8 @@ struct RawCell {
     server_mem_peak_mib: Option<f64>,
     #[serde(default)]
     conc: Option<u32>,
+    #[serde(default)]
+    total_output_tokens: Option<u64>,
 }
 
 impl TryFrom<RawCell> for Cell {
@@ -458,6 +499,8 @@ impl TryFrom<RawCell> for Cell {
             failed: c.failed,
             server_mem_peak_mib: c.server_mem_peak_mib,
             users: c.conc,
+            total_output_tokens: c.total_output_tokens,
+            dead: false,
         })
     }
 }

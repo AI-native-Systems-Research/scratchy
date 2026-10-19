@@ -86,6 +86,7 @@ fn load(site: &Site) -> Result<Vec<Run>, String> {
                 m.model_id
             ));
         }
+        run.mark_dead();
         run.file = f;
         runs.push(run);
     }
@@ -2471,5 +2472,43 @@ mod tests {
         assert_eq!(size_name("qwen2.5-7b").as_deref(), Some("7b"));
         assert_eq!(size_name("gemma-4-26b-a4b-it").as_deref(), Some("26b"));
         assert_eq!(size_name("smollm2-135m"), None);
+    }
+
+    /// The published runs' cells a dead server measured (#413) are marked, and no other: the
+    /// glm-4.5-air and qwen3.6-35b-a3b cells of the M1 Max run in #472, and the M3 Pro's gemma
+    /// 4096-token cells after its OOM (#412), while every engine that stops at EOS early (ollama,
+    /// oMLX) keeps its numbers.
+    #[test]
+    fn the_published_cells_of_a_dead_server_and_only_those_are_marked() {
+        use super::numbers::{Engine, Metric, timing};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let site = crate::Site {
+            root: root.to_path_buf(),
+            repo: root.join(".."),
+            out: root.join("_site"),
+        };
+        let runs = super::load(&site).expect("the published runs load");
+        let mut dead = std::collections::BTreeMap::<(String, &str, &str), usize>::new();
+        for r in &runs {
+            for m in &r.models {
+                for e in Engine::ALL {
+                    for c in e.cells(m).iter().filter(|c| c.dead) {
+                        assert_eq!(timing(Some(c), Metric::Throughput), None);
+                        let key = (r.repo.sha8().to_string(), m.stem.as_str(), e.key());
+                        *dead.entry(key).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let want = [
+            ("649ebce2", "gemma-4-26b-a4b-it", "scratchy", 2),
+            ("c8860b1d", "glm-4.5-air", "scratchy", 22),
+            ("c8860b1d", "qwen3.6-35b-a3b", "scratchy", 10),
+            ("cc51e0d8", "gemma-4-26b-a4b-it", "scratchy", 2),
+        ];
+        let want: std::collections::BTreeMap<_, _> = (want.iter())
+            .map(|&(sha, stem, e, n)| ((sha.to_string(), stem, e), n))
+            .collect();
+        assert_eq!(dead, want);
     }
 }
