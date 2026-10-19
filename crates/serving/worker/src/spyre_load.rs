@@ -2230,11 +2230,13 @@ impl SpyreWorker {
                 //
                 // Zeros are the right fill, not merely a safe one: 0.0 is a normal float, and a
                 // masked-off slot contributes exp(-inf)=0 either way, so this changes no result.
-                if let Err(e) = ss.zero_seg(2) {
-                    warn!("[spyre-worker] sendnn: KV pool zero-fill failed: {e}");
-                } else {
-                    info!("[spyre-worker] sendnn: KV pool zeroed on-device (no host mirror)");
-                }
+                ss.zero_seg(2).map_err(|e| {
+                    werr(format!(
+                        "zeroing the KV pool (seg2) on-device: {e} — refusing to serve over \
+                         uninitialized KV pages"
+                    ))
+                })?;
+                info!("[spyre-worker] sendnn: KV pool zeroed on-device (no host mirror)");
                 debug!(
                     "[timing] SuperDscSession::new (bind weights + prepare) took {:.2}s",
                     _t_sess.elapsed().as_secs_f64()
