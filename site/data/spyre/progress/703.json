@@ -1,0 +1,132 @@
+{
+  "schema": 1,
+  "pr": 703,
+  "title": "perf(spyre): split a decode batch chunk's row max and row sum along their reduced axis",
+  "head": "fe5f877bf0037b903846d79c3a7a46db607ac40e",
+  "base": "057ff2ab87ce056dc88c7fdfc76063727564d215",
+  "merged": "2026-10-19",
+  "pod": "nickm",
+  "harness": "nickm cores 48-95, no cargo live, main and PR baked warm at the same base (057ff2ab8); head is the measured tree (fe5f877bf: 3d885b65a's bakes, which differ from it in whitespace only), the PR's later commits are a no-byte-change refactor and data; scripts/spyre_pr_cells.sh: rung-1 via the length-calibrated streaming client (3 streamed requests, medians, the serve's request-finished lines the length gate) and conc-8 via vllm bench serve (16 prompts, 256 output tokens) on the shared datasets; 2 back-to-back runs a side on one boot each, headline = the last run; serve and client pinned to cores 48-95",
+  "cells": [
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~1k",
+      "note": "conc-8: vllm bench serve on the shared ~1k dataset, 16 prompts, out 256",
+      "main": 80.81121615490274,
+      "pr": 70.59363131411372,
+      "reps": {
+        "main": [
+          89.82698196618288,
+          80.81121615490274
+        ],
+        "pr": [
+          77.82269495301972,
+          70.59363131411372
+        ]
+      }
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~1k",
+      "note": "conc-8: vllm bench serve on the shared ~1k dataset, 16 prompts, out 256",
+      "main": 94.46980707975273,
+      "pr": 107.06547787935074,
+      "reps": {
+        "main": [
+          78.98251970991018,
+          94.46980707975273
+        ],
+        "pr": [
+          89.08089728623038,
+          107.06547787935074
+        ]
+      }
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~10k",
+      "note": "rung-1: the length-calibrated streaming client, median of 3",
+      "main": 57.35103297047317,
+      "pr": 57.37499985843897,
+      "reps": {
+        "main": [
+          57.61103890836239,
+          57.35103297047317
+        ],
+        "pr": [
+          57.34009598381817,
+          57.37499985843897
+        ]
+      }
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~10k",
+      "note": "rung-1: the length-calibrated streaming client, median of 3",
+      "main": 7639.772969996557,
+      "pr": 7640.50534600392,
+      "reps": {
+        "main": [
+          7685.87159505114,
+          7639.772969996557
+        ],
+        "pr": [
+          7644.056195160374,
+          7640.50534600392
+        ]
+      }
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~1k",
+      "note": "rung-1: the length-calibrated streaming client, median of 3",
+      "main": 42.843384901061654,
+      "pr": 43.46815194003284,
+      "reps": {
+        "main": [
+          42.944183107465506,
+          42.843384901061654
+        ],
+        "pr": [
+          43.29371894709766,
+          43.46815194003284
+        ]
+      }
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~1k",
+      "note": "rung-1: the length-calibrated streaming client, median of 3",
+      "main": 530.3198238834739,
+      "pr": 529.8153590410948,
+      "reps": {
+        "main": [
+          519.273323006928,
+          530.3198238834739
+        ],
+        "pr": [
+          535.0462768692523,
+          529.8153590410948
+        ]
+      }
+    }
+  ]
+}
