@@ -3944,8 +3944,16 @@ impl Executor {
             //     is not a multiple of 128 would transfer a short row and lose the tail logits.
             // The destination is the SAME `[lp.offset, …)` window of the shadow the sen→IEEE convert
             // below reads from, so the row lands where the caller already looks for it.
+            //
+            // ⭐ AND ONLY THE ROW THE CONVERT BELOW READS. The convert takes `vocab` elements at
+            // `lp.offset` — the folded tail's one `[1, vocab]` row — but a prefill rung's logits
+            // PLACEMENT is `[rows, vocab]` wide: 25.6 MB at granite-2b's 256-row rung, read back to
+            // convert 100 KB of it (15.1 ms on a fresh session, 3.6 ms warm, measured). The window
+            // is the row, so the bytes converted are the same bytes; decode's placement already is
+            // one row, so it is unchanged.
             let lo = lp.offset;
-            let len = crate::lower_subtile_tape_to_superdsc::align128(lp.size).min(tot - lo);
+            let row = (self.vocab.0 as u64 * 2).min(lp.size);
+            let len = crate::lower_subtile_tape_to_superdsc::align128(row).min(tot - lo);
             // A multi-chunk region has no addressable sub-window (`chunk0` fails); fall back to the
             // whole-region read, which is what this always did.
             let win = (len < tot)
