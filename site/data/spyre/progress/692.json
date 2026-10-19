@@ -1,12 +1,12 @@
 {
   "schema": 1,
-  "pr": 0,
+  "pr": 692,
   "title": "perf(spyre): divide a decode batch chunk's esub and exp sticks first",
   "head": "f0719394964072fb0299f1b2ea4701c9eda3d5bb",
   "base": "8a8fd1ebfa948caad36f0d23e39a12a277120a68",
   "merged": "2026-10-19",
   "pod": "nickm",
-  "harness": "nickm cores 48-95, no cargo live, main and PR baked warm at the same base; conc 8: the sweep's conc-8 cell (vllm bench serve, in 1024 / out 256, 16 requests, 2 warmups, greedy, ignore_eos), one serve per leg, ABAB, rep2 of each serve; conc 1: scripts/bench_spyre_rung1.py, 3 reps, 128 out, --no-prefix-caching --max-num-seqs 2 --max-model-len 34816, ABAB",
+  "harness": "nickm cores 48-95, no cargo live, main and PR baked warm at the same base; head is the measured tree (f07193949), the PR's later commits are data-only; conc 8: the sweep's conc-8 cell (vllm bench serve, in 1024 / out 256, 16 requests, 2 warmups, greedy, ignore_eos), one serve per leg, ABAB, rep2 of each serve; conc 1: scripts/bench_spyre_rung1.py, 3 reps, 128 out, --no-prefix-caching --max-num-seqs 2 --max-model-len 34816, ABAB",
   "cells": [
     {"model": "granite-3.1-2b", "dtype": "fp16", "metric": "ttft_ms", "conc": 1, "context": "~1k", "main": 515.2, "pr": 523.7, "reps": {"main": [542.1, 515.2], "pr": [529.3, 523.7]}},
     {"model": "granite-3.1-2b", "dtype": "fp16", "metric": "itl_ms", "conc": 1, "context": "~1k", "main": 42.91, "pr": 43.41, "reps": {"main": [43.26, 42.91], "pr": [42.96, 43.41]}},
