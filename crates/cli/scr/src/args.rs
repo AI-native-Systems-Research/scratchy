@@ -107,6 +107,18 @@ pub struct LaunchClaudeArgs {
     #[arg(short = 'm', long, env = "VLLM_MODEL")]
     pub model: Option<String>,
 
+    /// Pick the model for this Mac (metal only): the biggest quantized MLX
+    /// checkpoint its memory class fits and this binary compiles in, served with
+    /// the widest context its KV cache holds. Prints the build line when the
+    /// pick is not compiled in.
+    #[arg(short = 'A', long, conflicts_with_all = ["model_tag", "model"])]
+    pub auto_mode: bool,
+
+    /// Auto mode, serving this model instead of the pick: `-a
+    /// mlx-community/Qwen3.5-9B-4bit` or `-a=<MODEL>`. Implies --auto-mode.
+    #[arg(short = 'a', value_name = "MODEL", conflicts_with_all = ["model_tag", "model"])]
+    pub auto_model: Option<String>,
+
     /// Device: "cpu", "cuda:N", "metal", or "auto" (auto-detect best GPU).
     #[arg(long, default_value = "auto")]
     pub device: String,

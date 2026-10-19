@@ -590,11 +590,14 @@ fn continues_latest_session(args: &[String]) -> bool {
 }
 
 pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
-    let model = args
-        .model_tag
-        .clone()
-        .or_else(|| args.model.clone())
-        .context("a model is required: `scr launch claude <MODEL>`")?;
+    let model = match super::launch_auto::resolve(&args)? {
+        Some(model) => model,
+        None => args
+            .model_tag
+            .clone()
+            .or_else(|| args.model.clone())
+            .context("a model is required: `scr launch claude <MODEL>`, or `--auto-mode`/`-A`")?,
+    };
 
     // Launch owns `--settings`: it is how the server under test is made to
     // outrank the user's own settings files, so a second occurrence could put
@@ -1229,6 +1232,31 @@ mod tests {
         let mut argv = vec!["claude", "my-model"];
         argv.extend_from_slice(extra);
         LaunchClaudeArgs::try_parse_from(argv).expect("launch args should parse")
+    }
+
+    /// `-A` and `-a <MODEL>` / `-a=<MODEL>` parse with no positional model, and
+    /// both refuse one: auto mode picks the model, so a second source is a typo.
+    #[test]
+    fn auto_mode_flags_parse_without_a_model() {
+        use clap::Parser as _;
+        let parse = |argv: &[&str]| LaunchClaudeArgs::try_parse_from(argv);
+
+        assert!(parse(&["claude", "-A"]).unwrap().auto_mode);
+        assert!(parse(&["claude", "--auto-mode"]).unwrap().auto_mode);
+        for argv in [
+            &["claude", "-a", "mlx-community/Qwen3.5-9B-4bit"][..],
+            &["claude", "-a=mlx-community/Qwen3.5-9B-4bit"][..],
+        ] {
+            let args = parse(argv).unwrap();
+            assert_eq!(
+                args.auto_model.as_deref(),
+                Some("mlx-community/Qwen3.5-9B-4bit")
+            );
+            assert_eq!(args.model_tag, None);
+        }
+
+        assert!(parse(&["claude", "my-model", "-A"]).is_err());
+        assert!(parse(&["claude", "-m", "my-model", "-a", "other"]).is_err());
     }
 
     /// The value after the LAST occurrence of `flag` — clap's own
