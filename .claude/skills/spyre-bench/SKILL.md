@@ -38,17 +38,24 @@ nothing, or the user has said to measure this commit anyway.
 Measure on the Spyre card only. Numbers from the emulator or the cost model
 never go in a cell; a cost-model number can go in `target` (step 3).
 
-**The harness is not checked in yet.** The two sides have been measured by
-different harnesses. The 2026-10-17 sweep recorded these:
-
-- torch-spyre: `vllm bench serve`, 256 output tokens, prompts of 123, 1083
-  and 10300 tokens.
-- triton-scratchy: `scr serve`, greedy, 64–128 output tokens, prompts of
-  1051 and 10086 tokens.
-
-They are not matched (different prompt lengths and output lengths), which is
-why the page sorts cells into context buckets (`~123`, `~1k`, `~10k`) and
-compares ratios, not absolutes. Until there is one shared harness:
+The two sides are separate harnesses. The rung-1 triton-scratchy client
+is checked in:
+[`scripts/bench_spyre_rung1.py`](../../../scripts/bench_spyre_rung1.py).
+It sends the sweep's own base prompts
+(`scripts/spyre_rung1_prompts/`, one per bucket) as `Run {r}.\n{base}`
+per rep, takes as its length argument the number of tokens the SERVER
+must record (the bucket's `contexts` value), and a cell whose
+serve-recorded `prompt_tokens` is off the bucket by more than 2% is
+REFUSED — check the serve's request-finished lines and never emit a cell
+over a prompt measured at the wrong length (#677: the 2026-10-19 sweep's
+precursor client sized prompts by a words-per-token heuristic, its
+prompts recorded 1.5× the buckets, and every rung-1 cell had to be
+re-measured). It imports transformers for the tokenizer, so run it under
+the same venv as the torch side's client. The torch side is
+`vllm bench serve` (256 output tokens). The sides are matched on prompt
+buckets but not output lengths, which is why the page sorts cells into
+context buckets (`~123`, `~1k`, `~10k`) and compares ratios, not
+absolutes:
 
 - keep each side's harness, prompt lengths and buckets as in the newest
   sweep, so this sweep's ratios compare with the last one's;

@@ -1,0 +1,646 @@
+# Benchmarking scratchy against other frameworks
+
+Methodology for the head-to-head comparisons, and the metric definitions they
+report.
+
+| harness | question | scenarios |
+|---|---|---|
+| [`scripts/bench_serve_compare.sh`](../scripts/bench_serve_compare.sh) | steady-state serving throughput and latency under load | input × output × concurrency sweep |
+| `scr bench startup --exec` | how long from `exec` until the user sees a word | frozen / cold / warm cache ladder |
+| `scr bench startup` (no `--exec`) | in-process engine construction cost | cold / warm iterations |
+
+## `--exec` vs plain `bench startup` — two different measurements
+
+`scr bench startup` without `--exec` mirrors
+[vLLM's `bench startup`](https://docs.vllm.ai/en/latest/cli/bench/startup/) down to
+`--num-iters-cold` / `--num-iters-warmup` / `--num-iters-warm`. The two modes are
+not interchangeable:
+
+| | plain `bench startup` | `bench startup --exec` |
+|---|---|---|
+| timed region | `LLMBuilder::build()`, in-process (`crates/benches/src/startup.rs`) | `exec` → first content byte of the first token |
+| process | one process, N engine constructions | fresh `fork`/`exec` per measurement |
+| generates tokens | no — never sends a request, so **there is no TTFT to report** | yes; the clock stops on the first token byte |
+| what "cold" means | a fresh engine object; the HF cache is explicitly *not* wiped and the page cache is untouched | the FROZEN/COLD rungs below, with the eviction *verified* |
+| sees `exec`, dyld, first-touch faults | no, by construction | yes — these dominate a real first launch |
+| other frameworks | no; it constructs scratchy's own `LLM` | yes, via `--child-cmd` |
+
+They are complementary. Plain `bench startup` is the cheap, repeatable way to
+watch engine-init cost for regressions — no sudo, no second framework,
+percentiles over iterations in one process. `--exec` is what a *user-perceived*
+or *cross-framework* claim requires.
+
+**Do not put their numbers in the same table.** Plain `bench startup` will always
+look faster, for the uninteresting reason that it is measuring less.
+
+---
+
+## 1. The cache ladder
+
+"Cold start" is not one thing — it is a stack of caches, each independently warm.
+Naming a single "cold" number without saying which were populated is how startup
+benchmarks become unfalsifiable. So the ladder is explicit:
+
+| surface | FROZEN | COLD | WARM |
+|---|---|---|---|
+| OS page cache (weights, binary, dylibs) | evicted | warm | warm |
+| derived on-disk caches (`--remove-path`) | **removed** | present | present |
+| checkpoint on disk | present | present | present |
+| process | fresh `exec` | fresh `exec` | resident, ≥1 request served |
+| pipelines / KV pool / warmup | rebuilt | rebuilt | done |
+
+- **FROZEN** — first run ever on this machine, short of downloading weights.
+- **COLD** — the honest everyday case: you ran it before, the machine has been
+  busy but not enough to evict the weights, and you launch again.
+- **WARM** — a server already up and serving. Isolates request latency from all
+  startup cost.
+
+COLD and WARM say "you ran this before", so when nothing has run yet the harness
+performs **one throwaway priming launch** and discards it. Without that, the
+first repetition of a fresh run measures FROZEN while being labelled COLD — on a
+Metal run before priming existed, COLD rep 0 took 7.935 s with ~31,570 major
+faults and rep 1 took 1.218 s with ~0, and the rung's median averaged the two. A
+FROZEN repetition earlier in the list already populates the caches, so priming is
+skipped in that case.
+
+### Eviction is platform-specific, and one obvious choice is wrong
+
+`--evict purge` (macOS) drops the whole unified buffer cache. It is symmetric: it
+evicts CPython and a framework's dylibs exactly as it evicts the scratchy binary,
+which is what makes a cross-framework FROZEN fair. **`purge` requires root**, so
+it runs as `sudo -n purge` — cache the credential with `sudo -v` before starting.
+The `-n` is deliberate: a benchmark must not block on a password prompt partway
+through, and a FROZEN run is checked for the credential up front rather than
+failing after it has already disturbed the cache state it needed.
+
+`--evict fadvise` (Linux) calls `posix_fadvise(POSIX_FADV_DONTNEED)` over
+`--evict-path`. It is deliberately **not** `drop_caches`: that file is not
+namespaced, so writing it from a container evicts the *host's* entire page cache
+and perturbs every other workload on a shared node. fadvise is unprivileged and
+surgical, and read-only mmap'd weight shards are exactly the clean-page case
+where `DONTNEED` is reliable. It needs `--evict-path`, and says so rather than
+silently evicting nothing.
+
+`--evict none` leaves the page cache alone; FROZEN then collapses toward COLD.
+
+## 2. Metrics
+
+One external stopwatch, held by the benchmark process, with **the same code for
+every backend**. That single shared implementation is the fairness guarantee:
+nothing is self-reported.
+
+- **`ttft_exec`** — seconds from `exec` to the first token byte. The headline.
+  Spans process init, weight load, pipeline compile, KV allocation, warmup,
+  prefill and the first sample as one measured span, because that is what a user
+  experiences.
+- **`t_ready`** — `exec` until `GET /v1/models` answers 200. Splits `ttft_exec`
+  into "getting ready" and "doing the work". Note this is an HTTP 200, not a TCP
+  accept: a listener can bind before the model is resident.
+  `--poll-interval-ms` (default 20) is the only quantization and is reported
+  alongside.
+- **`TTFT`** — first token measured from **request send** against a running
+  server: TTFT in the usual sense, and the startup-independent half of
+  `ttft_exec`.
+- **`tpot`** — per-token decode interval over N−1 intervals, matching
+  `crates/benches/src/serve.rs`. `decode tok/s` is `1000/tpot`. N is the
+  server's own token count (`usage.completion_tokens`), never the number of
+  stream chunks, so TPOT holds when a chunk carries several tokens, as it does
+  under multi-token prediction or speculative decoding. ITL, the gap between
+  chunks, does not: one gap then spans several tokens, so it reads slow. The
+  Metal matrix neither asks `bench serve` for ITL nor keeps it.
+- **`peak_rss`** / **`major_faults`** — the child's own `ru_maxrss` /
+  `ru_majflt`, read via `wait4(2)` when it is reaped, same call for every
+  backend. It has to be `wait4` rather than `getrusage(RUSAGE_CHILDREN)`: the
+  latter's `ru_maxrss` is a high-water mark over *every* child the process has
+  reaped, so per-repetition figures silently break after the first one — a Metal
+  run reported a live WARM server at 1 MiB because an earlier COLD repetition had
+  already pushed the mark to ~270 MiB.
+- **`evicted`** — KiB that left the page cache when a FROZEN repetition's
+  eviction ran, from `/proc/meminfo` `Cached` sampled either side of it.
+
+### Proving the eviction happened
+
+A FROZEN number is worthless unless the eviction demonstrably took effect, so the
+run asserts it and exits non-zero on failure. **Where `evicted` is available it is
+the evidence, and `major_faults` is not gated on.** That ordering is deliberate:
+
+`ru_majflt` only counts faults on *memory-mapped* pages, and on Linux readahead
+plus fault-around will satisfy a sequential scan of a fully-evicted mmap'd file
+from within a single major fault. Measured on an H100 node: a `Cached` drop of
+511,560 kB for a 512,000 kB file — a 99.9% eviction — produced `majflt=1`, against
+`majflt=0` warm. Gating on `1 > 0` would be gating on noise, and tightening the
+threshold instead would reject correctly-evicted Linux runs.
+
+On macOS there is no `/proc/meminfo`, so the fault delta carries the argument —
+and there it is strong, because `purge` drops everything and a real loader's
+access pattern defeats readahead: 11,426 faults against 0 on a real checkpoint.
+`read()`-based children never produce major faults at all, whatever the cache
+state, so a FROZEN rung measured with `cat`/`dd`/`wc` is not measuring anything.
+
+Cells are reported as `median (p10–p90) ×reps`, never a bare mean — a mean hid a
+bimodal ITL distribution in this repo for a week
+(`crates/cli/scr/src/commands/chat.rs`).
+
+## 3. Fairness rules
+
+1. **Unique prompt per request.** A shared prefix lets a prefix cache serve the
+   repeat and TTFT collapses. Prompts are seeded: identical across backends,
+   unique per rep. This is not hypothetical — a `bench serve` run against a
+   shared-prefix dataset reported a 98% prefix-cache hit rate, which inflated
+   throughput 1.84× and understated TTFT 11× before it was caught. Pass
+   `--no-prefix-caching` to the server under test as well. `scr bench serve`
+   sends its pre-flight and warmup requests throwaway prompts from a seed
+   disjoint from `--seed`, for every dataset, so no measured prompt is cached
+   before it is timed.
+2. **Pin the sampling params.** Every request is greedy (`temperature 0`).
+   Leaving temperature *unset* is the trap: the field is omitted, each **server**
+   applies its own default, and the backends get timed on different sampling
+   paths. Measured on scratchy:
+
+   | | TTFT p50 | TPOT p50 |
+   |---|---|---|
+   | `temperature 0` (argmax) | 44.3 ms | 12.96 ms |
+   | `temperature 1.0` | 47.0 ms | 15.81 ms |
+   | unset (server default) | 71.2 ms | 15.81 ms |
+
+   That spread is larger than most differences anyone would report, and it is
+   pure measurement artifact. Greedy also matches what the parity gate verifies,
+   so what is timed is what was checked.
+3. **Parity gate, blocking** (`--parity-cmd`). A broken dequant path can be
+   *fast*, so timing a wrong computation is worse than not timing at all. The
+   gate enforces exact agreement on short high-confidence prompts and does not
+   gate on drift deep inside open-ended generations: greedy argmax legitimately
+   splits at near-ties between two kernel stacks. For real numerical fidelity
+   work use the golden-reference tooling (`scripts/generate_mlx_goldens.py`,
+   `tools/vision_parity/`) instead. The gate only means "same load path" if
+   both sides render the *same* prompt: `scr chat` follows the checkpoint
+   template's declared defaults, while `mlx_lm.generate` forces
+   `enable_thinking` on for any vocab with think tokens — gemma-4's template
+   defaults it off and prefills an empty thought channel — so the matrix gives
+   the mlx-lm side a per-model `--chat-template-config`
+   (`mlx_parity_config` in `scripts/bench_metal_matrix.sh`) wherever the two
+   disagree. The two sides also run **different KV caches by design** on
+   metal: scratchy's build carries TurboQuant 4-bit KV, the reference fp16.
+   That difference is real quantization noise, not a load-path error — on
+   GLM-4.5-Air-3bit it flips a 0.25-logit near-tie inside the model's own
+   thought preamble (a no-TurboQuant build is byte-identical to mlx-lm on the
+   same 40 tokens), so that model gates on prompts chosen so the noise cannot
+   reach the argmax: its set swaps the count prompt, whose procedural
+   preamble ties at 0.0–0.5 logits at 3 bits, for a third short factual one
+   with a 1.25-logit minimum margin (`parity_prompts` in
+   `crates/benches/src/startup_exec/mod.rs`). Every model keeps the exact-match
+   comparison; only the questions are chosen per model.
+4. **Same weights, matching preset.** scratchy must be built with the preset
+   matching the checkpoint's `config.json`.
+5. **One model resident at a time**, and `HF_HUB_OFFLINE=1` for both — left
+   online, some frameworks make a hub round trip per launch and network jitter
+   lands inside the measurement.
+6. **A settle delay before WARM** (`--settle-s`), so lazy post-ready
+   initialization does not land in the steady-state sample.
+
+## 4. Known asymmetries — disclose, do not hide
+
+These favour one side or the other and must travel with any published number.
+
+- **scratchy compiles the model at build time.** `#[forward]` expands the whole
+  forward pass during `cargo build`, so work other engines do at runtime is
+  already in the binary. A real engineering advantage, and also why startup
+  numbers flatter scratchy. The build cost is a one-off; record it as a footnote
+  rather than folding it into a scenario.
+- **Derived on-disk caches have no cross-framework equivalent.** scratchy can
+  keep an aligned-weights sidecar; `--remove-path` puts it on the FROZEN rung so
+  it is neither charged per launch nor hidden. Measured caveat: for
+  `Llama-3.2-3B-Instruct-4bit` the sidecar is neither needed nor rebuilt —
+  scratchy writes it only from the realign-*copy* path
+  (`crates/targets/metal/src/metal_allocator.rs`) and that checkpoint loads
+  648/648 tensors zero-copy from the HF mmap. For that model FROZEN→COLD is a
+  page-cache delta only. It is *not* inert for checkpoints needing realignment
+  (the code cites Qwen3.5-35B at 18.99 GiB). **Re-check per model.**
+- **KV-cache dtype is not matched by default.** A default metal build stores
+  KV as TurboQuant codes (3-bit for the Llama family, 4-bit otherwise; the
+  `turboquant` feature) while mlx-lm uses an uncompressed cache — a *quality*
+  difference as well as a perf one. It is fixed at build time, so match it with
+  a build without the feature, not a runtime flag. The Metal matrix runs oMLX
+  both ways for this reason: **oMLX TurboQuant** (4-bit KV, set per model in
+  its `model_settings.json`) is the like-for-like rival for a default
+  scratchy build, and **oMLX** as shipped (FP16 KV) the like-for-like one for
+  mlx-lm.
+- **oMLX is the Metal matrix's default rival, run as it ships.** Its own
+  caching stays on (the SSD cache kept in the run's output, a fresh one per
+  variant, so nothing carries between runs), because `--no-cache` drops it to
+  plain mlx-lm batching. Its memory guard stays at its default tier and
+  rejects a prompt it estimates will not fit. The guard is not raised:
+  requests it refuses inside a cell count as failed (‡ on the page, and the
+  cell's numbers cover only the rest), and a cell it refuses outright has no
+  numbers. The guard can also refuse the *model* itself, before any weights
+  move: each load is planned against a dynamic ceiling derived from
+  system-reclaimable memory minus a reserve — not the Metal cap, so raising
+  `iogpu.wired_limit_mb` does not move it — and a model near the size of the
+  Mac's memory is admitted only on a near-idle machine. Measured on
+  GLM-4.5-Air-3bit (45.75 GB) on a 64 GB M5 Max with normal residents: HTTP
+  507, "does not fit under the dynamic memory ceiling" (43.2 GB at the
+  time). A refusal like that is not a cell failure: preparing the engine
+  sends one tiny request first, and a refusal is recorded as
+  `engine_declined` with the engine's own message and that engine's cells
+  skipped for the model — the page says "Declined before serving" instead of
+  ‡'d cells that never ran. `--engines all` adds mlx-lm,
+  vllm-metal, ollama, llama.cpp and mistral.rs.
+- **Not every engine serves the same files.** oMLX, mlx-lm and vllm-metal load
+  the same mlx-community checkpoint as scratchy; ollama's `-mlx` tags are
+  ollama's own MLX builds (`gemma4:26b-mlx` is NVFP4, not 4-bit affine); llama.cpp
+  and mistral.rs run a Q4_K_M GGUF. The run records each engine's quantization
+  and file revision, and the page names them on its row.
+- **Prefix caching differs by engine and model**, so `bench serve` warms up
+  and checks connectivity with prompts outside the measured set: replaying a
+  measured prompt let an engine with a prefix cache serve it as a full hit
+  (#344). scratchy turns prefix caching off for Gated-DeltaNet hybrids
+  (Qwen3.5/3.6), as vLLM does.
+- **Process shape differs.** scratchy is one static binary; mlx-lm is a CPython
+  interpreter plus imports. FROZEN evicts both, which is the real-world cost, but
+  it is not a like-for-like measurement of model loading alone.
+- **Weight download is out of scope.** The checkpoint is on disk in all three
+  scenarios.
+- **An agentic workload adds asymmetries of its own**, and resolves the
+  quantization rungs to concrete per-engine artifacts: see
+  [`CLAUDE_CODE_BENCH.md`](CLAUDE_CODE_BENCH.md), which carries the Claude Code
+  comparison's pins, disclosures and blocked cells. Its method is promoted into
+  this file as a §7 once that epic's phase 5 lands.
+
+## 5. Running it
+
+Any backend is named by `--child-cmd`, using the same shell-words convention as
+`scr sweep --serve-cmd`, so nothing here is scratchy-specific.
+
+```bash
+# scratchy, cold + warm, 3 reps each
+scr bench startup --exec -m "$MODEL" \
+    --child-cmd "scr serve $MODEL --device cuda:0 --port 8731 --no-prefix-caching" \
+    --scenarios cold,warm --reps 3 --output-json out/scratchy.json
+
+# the same measurement against vLLM — no new code, just a different child
+scr bench startup --exec -m "$MODEL" \
+    --child-cmd "python -m vllm.entrypoints.openai.api_server --model $MODEL --port 8731 --no-enable-prefix-caching" \
+    --scenarios cold,warm --reps 3 --output-json out/vllm.json
+
+# FROZEN on Linux: evict the weights and the binary, and prove it happened
+scr bench startup --exec -m "$MODEL" \
+    --child-cmd "scr serve $MODEL --device cuda:0 --port 8731" \
+    --scenarios frozen,cold --reps 3 \
+    --evict fadvise \
+    --evict-path "$HF_HOME/hub/models--org--name/snapshots" \
+    --evict-path target/release/scr
+
+# FROZEN on macOS: `sudo -v` first, or the up-front check refuses to start
+sudo -v
+scr bench startup --exec -m "$MODEL" \
+    --child-cmd "target/release/scr serve $MODEL --device metal --port 8731 --no-prefix-caching" \
+    --scenarios frozen,cold --reps 2 --evict purge
+
+# CLI mode needs {prompt}; add a blocking parity gate against mlx-lm.
+# Thinking models: pin mlx-lm to the checkpoint template's own default
+# (scr chat renders it; mlx_lm.generate turns thinking on) — e.g. gemma-4
+# needs --chat-template-config '{"enable_thinking":false}'.
+sudo -v
+scr bench startup --exec -m "$MODEL" --mode cli \
+    --child-cmd "target/release/scr chat -m $MODEL --device metal -q {prompt} --max-tokens {output_len}" \
+    --parity-cmd "python -m mlx_lm.generate --model $MODEL --prompt {prompt} --max-tokens {output_len}" \
+    --scenarios frozen,cold --evict purge
+```
+
+A run whose validity checks fail prints them and exits non-zero. That is
+intentional: a FROZEN rep that faulted no more than COLD did not measure a frozen
+start, and reporting it would be worse than reporting nothing.
+
+## 6. Reproducing without a GPU
+
+Everything above assumes real hardware, but the harness itself is process
+management, not inference: it spawns a child, waits for a port or a line of
+stdout, samples `getrusage`, and tears the process group down afterwards. None of
+that needs a backend, and the crate is built so that it doesn't — `default = []`,
+`cuda`/`metal` are pure pass-throughs to `scratchy-serving-api`, and there is no
+backend `cfg` in the crate. So the full test suite and the `scr` binary carrying
+`bench startup --exec` both build on any Linux or macOS box:
+
+```bash
+cargo test -p scratchy-bench --features datasets   # the whole suite; no GPU
+cargo build -p scratchy-cli --no-default-features --features bench
+./target/debug/scr bench startup --help   # renders the `--exec` section
+```
+
+`datasets` is the optional feature behind the parquet-backed
+`hotpotqa`/`multihop`/`msmarco` subcommands, and it needs no GPU either.
+Featureless (`cargo test -p scratchy-bench`) drops only the tests of their
+parquet readers — nothing that touches the startup harness, whose process
+handling these tests are the only executable coverage of. `linux-cuda` in
+`.github/workflows/rust.yml` runs the same test command and lints the crate
+both with and without `datasets`, so reviewing the harness on a laptop runs the
+same gate CI does.
+Don't add `--locked`; the featureless resolution differs from the committed
+lockfile.
+
+**What this does not give you is a measurement.** Reviewing the harness's
+behaviour and publishing a number are different activities:
+
+- **A fake child measures nothing.** Per [Proving the eviction
+  happened](#proving-the-eviction-happened), a `read()`-based child never
+  produces major faults whatever the cache state — so a FROZEN rung driven by
+  `cat`/`dd`/`wc` is not measuring page-cache eviction, it is measuring `cat`.
+  Standing up a stub OpenAI server would validate the plumbing and nothing past
+  it.
+- **`--evict fadvise` is Linux-only** (`crates/benches/src/startup_exec/mod.rs`).
+  On macOS, FROZEN needs `--evict purge` and a live `sudo` ticket.
+- **Which rungs a GPU-less box may publish: none.** COLD and WARM still want a
+  real loader touching real weights, and FROZEN additionally wants the eviction
+  to have demonstrably taken effect. The reference figures stay the runs recorded
+  on real hardware — an H100 node for CUDA, an M5 Max for Metal.
+# Building scratchy
+
+How to build `scratchy-cli` (binary `scr`) — backend selection, and the
+`-Fmodel/`/`-Fquant/` feature landscape that scopes which models and
+quantization variants actually compile in. For adding a *new* model
+architecture (DSL carrier, `configs/`, weight shapes), see
+[`MODELS.md`](MODELS.md) instead — this doc is about building what already
+exists, not adding to it.
+
+## Quickstart
+
+```bash
+cargo build -p scratchy-cli --release --features metal,model/llama-3.2-3b
+```
+
+`cuda` and `metal` are mutually exclusive. **On cuda this one-liner is not
+enough** — the kernels are a separate cargo invocation that has to run first;
+see [CUDA: build the kernels first](#cuda-build-the-kernels-first). Add
+`serve` for the HTTP server
+(`chat` — the in-process engine — is on by default), `multimodal` for the
+image-decode stack, `bench` for `scr bench serve`. Tab completion over real
+HuggingFace model ids is on by default (`hf-completions`); pass
+`--no-default-features` to build with no network access at all. TurboQuant KV
+compression is on with `metal` (and off for cuda and spyre), fixed at build time — see
+[`turboquant`](#turboquant--kv-cache-compression-fixed-at-build-time).
+
+## CUDA: build the kernels first
+
+A cuda build is **two cargo invocations, in this order**:
+
+```bash
+export SCRATCHY_GPU=h100 CUDA_ARCH=90 CUDA_COMPUTE_CAP=90   # see the table below
+
+# 1. nvcc kernels -> .a files in ~/.cache/cudaforge/scratchy-serving-cuda/
+#    No model or quant scope: nothing in forward expansion emits .cu, so the
+#    kernel set is scope-independent. Tens of minutes, several GB of RAM.
+cargo build --release -p scratchy-builder-cuda --features cuda
+
+# 2. the binary, which links those .a files
+cargo build --release -p scratchy-cli \
+    --features cuda,serve,bench,model/qwen2.5-14b,quant/fp8-dynamic-per-tensor
+```
+
+Step 1 cannot be folded into step 2. `scratchy-target-cuda`'s `build.rs` emits
+`rustc-link-lib=static=` for eleven archives that `scratchy-builder-cuda`'s
+`build.rs` produces, and rustc *bundles* static natives into an rlib — so those
+`.a` files must already exist when the rlib is built. There is no Cargo edge to
+order that: `scratchy-models` depends on `scratchy-target-cuda`, so an edge back
+from `target-cuda` to the builder would cycle. Skipping step 1 fails with
+`could not find native static library`, and it fails nondeterministically —
+whichever archive rustc reaches first.
+
+Three environment variables, none of them optional on a build host without a
+GPU:
+
+| var | read by | if unset |
+|---|---|---|
+| `SCRATCHY_GPU` | `#[forward]`, at expansion | probes `nvidia-smi`, else build error listing valid values |
+| `CUDA_ARCH` | kernel build + FA3 gating + the FA3 link | probes `nvidia-smi`, else **defaults to 89 and silently drops FlashAttention-3** |
+| `CUDA_COMPUTE_CAP` | `cudarc`'s build script | probes the local GPU |
+
+`CUDA_ARCH` is the one that bites: unset on a GPU-less builder it yields a
+binary that links and runs on Hopper with no FA3 decode path and no warning.
+Set it explicitly whenever you are not building on the target GPU.
+
+`git` must be on `PATH` at build time — `cudaforge` clones NVIDIA/cutlass at a
+pinned commit while compiling the scaled_mm kernels.
+
+`SCRATCHY_SKIP_CUDA_KERNELS=1` skips step 1's nvcc work for `cargo
+check`/`clippy` (this is what CI's cuda gate sets). Never set it for anything
+that links a binary.
+
+## There is no default model, quant or drafter scope
+
+`scratchy-models`, `scratchy-quantizations` and `scratchy-spec` all ship
+`default = []`.
+Naming zero models is a **build-time panic**, not a silently-empty binary —
+`scratchy-forwards.rs` checks `total_models_emitted()` after every arch is
+processed and fails loudly, telling you to name at least one. This means
+every build — dev, CI, or deployment — names its own scope explicitly; there
+is no `--no-default-features` dance to first strip away a default you don't
+want.
+
+## Model, quant and drafter scope: three crates, three CLI aliases
+
+Model *scope* (`crates/models/arch/`, crate `scratchy-models`) and quant
+*scope* (`crates/models/quantization/`, crate `scratchy-quantizations`) are
+Cargo features on two **different** crates — not because picking a model and
+picking a quantization are conceptually different (both are just "pick a
+JSON file by name": model configs from `configs/<arch>/*.json`, quant
+presets from `quantization/presets/*.json`), but because **Cargo forbids
+aliasing one crate under two different local names**, and
+`crates/cli/scr/Cargo.toml` needs two distinct short aliases reachable from
+the CLI build line: `model` and `quant`. Speculative-decoding drafters are a
+third alias, `spec`, on a third crate (`crates/models/spec/`, crate
+`scratchy-spec`) for the same reason; its features forward to
+`scratchy-models`, whose build script compiles the drafters.
+
+```toml
+# crates/cli/scr/Cargo.toml
+model = { package = "scratchy-models", ... }
+spec = { package = "scratchy-spec", ... }
+quant = { package = "scratchy-quantizations", ... }
+```
+
+Cargo's `pkg/feature` CLI syntax resolves against these local names and
+activates the (optional) dependency itself, so every feature below is
+reachable directly from `scr`'s own build line as `model/<feature>` or
+`quant/<feature>` — no hand-maintained passthrough feature list to keep in
+sync (a guard test, `crates/cli/scr/tests/arch_feature_passthrough.rs`,
+fails loudly if one ever creeps back in).
+
+## `-Fmodel/<...>` — which models compile in
+
+One Cargo feature per checked-in `configs/<arch>/<stem>.json`, named
+`<stem>` — no `model-` text prefix; the `model` alias already says that.
+
+```bash
+cargo build -p scratchy-cli --features metal,model/qwen2.5-7b
+```
+
+- **`model/<stem>`** — exactly one model + variant, e.g.
+  `model/granite-3.1-2b-instruct`. Disabled means the file is never even
+  opened (the gate runs on the filename alone, before the JSON is parsed),
+  so this is both the selection mechanism and a compile-time win — an
+  unselected model costs nothing, not even a parse.
+- **`model/<arch>`** — every config in one arch, e.g. `model/granite` is
+  shorthand for "all granite models".
+- **`model/all`** — every checked-in config, every arch. This is CI's
+  full-scope case: slow (minutes) and RAM-heavy. Don't reach for it to test
+  one thing.
+- A handful of stems are byte-identical files checked into two arch dirs at
+  once (the same checkpoint, loadable via a vision arch or its non-vision
+  base arch — e.g. `gemma-3-12b-it` under both `gemma3/` and `gemma3-mm/`).
+  The vision arch keeps the bare stem; the base arch's copy is
+  `<stem>-text-only`.
+
+`arch-<name>` (which architecture's Rust module + DSL carrier compiles at
+all) is implied automatically by any of that arch's `<stem>` features — you
+essentially never name it directly.
+
+## `-Fquant/<...>` — which quantization a model compiles as
+
+One Cargo feature per preset, named `<preset>` — no `quant-` text prefix,
+same reasoning as `<stem>`.
+
+```bash
+cargo build -p scratchy-cli --features metal,model/granite-3.1-2b-instruct,quant/mlx
+# → granite-3.1-2b-instruct compiles as its MLX affine variants, not dense
+```
+
+**A selected quant preset REPLACES a model's dense/bf16 emission — it does
+not add to it.** If any preset both survives Cargo-feature scoping and is
+claimable on the active backend (metal only claims `mlx-affine-*`/`nvfp4`;
+cuda is the mirror — see `quant_preset_active` in
+`crates/compiler/macros/src/config.rs`), every selected model in that arch
+gets its quant variant(s) *instead of* dense. A preset that wouldn't
+actually synthesize on the active backend can never suppress dense, so a
+model never ends up with zero compiled variants.
+
+- **`quant/<preset>`** — one specific preset, e.g. `quant/fp8-dynamic-per-channel`.
+- **`quant/mlx`** — shorthand for every MLX affine (int4) preset at once —
+  the dominant use case on metal, but still opt-in (neither `metal` nor
+  `cuda` defaults any preset on; a default-on preset would silently kill
+  dense on every build using that backend).
+
+No `quant/*` feature named at all = every selected model compiles dense only.
+
+## `-Fspec/<...>` — which drafters compile with the selected models
+
+```bash
+cargo build -p scratchy-cli --features metal,serve,model/qwen3.6-35b-a3b,quant/mlx-affine-b4-g64-qembed
+# → Qwen3.6-35B-A3B plus its multi-token-prediction head; serving it drafts with the head
+cargo build -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,spec/mtp,quant/mlx-affine-b4-g64
+# → Gemma 4 26B-A4B plus its assistant; serving it drafts with `--speculative-model <assistant>`
+```
+
+- **`metal`** turns on scratchy-models' **`mtp-heads`**: every selected model
+  whose checkpoint carries a multi-token-prediction head compiles that head
+  too. Such a head has no config of its own: its `arch.json` names the arches
+  whose checkpoints carry it (`checkpoint_of`), and it compiles on each
+  selected config of theirs that declares its layers, that config verbatim
+  (`crates/compiler/macros/src/config.rs`). Serving drafts with the head from
+  the target's own checkpoint when that carries it (its weight map holds
+  `language_model.mtp.*`: `scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp`) or
+  names the sidecar file an MLX conversion stripped it into (`mtp_file`:
+  Nemotron-3 Super OptiQ keeps its head in `optiq/mtp.safetensors`, under the
+  same `mtp.*` prefix), else from the repo it is published under when that
+  resolves (`mlx-community/Qwen3.6-35B-A3B-MTP-4bit`), else it serves without
+  drafting and says why. `--num-speculative-tokens 0` serves without drafting.
+- **`spec/mtp`** — adds the drafters published as models of their own, which
+  name their targets (`head_targets`) and draft only when
+  `--speculative-model` names them (Gemma 4's assistant).
+
+No `spec/*` feature named = only the heads inside their targets' checkpoints
+compile (with `metal`); a cuda or spyre build compiles none.
+
+## `turboquant` — KV cache compression, fixed at build time
+
+On metal, a model's KV cache is either dense (the model's own dtype) or
+TurboQuant codes (3-bit for the Llama family, 4-bit otherwise), and the build
+decides which: nothing chooses at runtime. `scratchy-cli`'s `metal` feature
+turns `turboquant` **on**; a cuda or spyre build does not have it.
+
+With it on, every selected model whose geometry the codec takes is emitted with
+`KV_CODEC = TurboQuant`; the rest stay dense and the build names each one and
+why:
+
+```
+warning: scratchy-models@0.1.0: turboquant: qwen2.5-0.5b keeps a dense KV cache: its KV row is 12 KiB/token, below the 24 KiB TurboQuant threshold
+```
+
+A model stays dense when it has no KV cache, when its KV cache is an MLA
+latent, when a head_dim is not a power of two no wider than 512, or when its
+fp16 KV row is under 24 KiB/token — too small for the capacity to be worth the
+fidelity. The rule is `scratchy_layers::turboquant::codec_for`. The
+server logs the loaded model's codec at start (`KV cache codec: TurboQuant
+3-bit (built in)`).
+
+`--kv-cache-dtype` on metal takes the codec by default (`auto`) and can only
+*assert* it: `fp16` or `turboquant` refuses to start if the binary stores the
+model's KV cache the other way.
+
+## `hf-completions` — shell tab completion over real model ids
+
+`scr completions bash` / `scr completions zsh` print a completion script for
+this binary. Install it once, either by hand:
+
+```bash
+scr completions zsh  > ~/.zsh/completions/_scr        # dir must be on $fpath
+scr completions bash > /usr/local/etc/bash_completion.d/scr
+```
+
+or let `scr` do it — `--install` writes the script to the standard per-shell
+location AND wires up the shell rc file so it actually loads:
+
+```bash
+scr completions bash --install   # writes ~/.local/share/scr/completions.bash,
+                                  # sources it from ~/.bashrc
+scr completions zsh  --install   # writes ~/.zsh/completions/_scr,
+                                  # adds it to $fpath in ~/.zshrc
+```
+
+`--install` is idempotent (marked block, safe to re-run after a rebuild) and
+never clobbers the rest of the rc file. For zsh specifically, it inserts the
+`fpath` entry *before* the first existing `compinit` call rather than
+appending — zsh's completion system only picks up an autoloadable `#compdef`
+function from a directory that was already on `$fpath` when `compinit` ran, so
+appending after an existing `compinit` call would silently install a script
+that never actually completes anything. If no `compinit` call exists yet,
+`--install` adds one.
+
+Subcommands, flags and enum values in that script come from the binary's own
+clap command tree, so they always match the feature set it was built with —
+a `chat`-only build never offers `serve`. Re-run `--install` (or regenerate by
+hand) after rebuilding with different features.
+
+**Model names come from `hf-completions`, which is on by default.** The build
+asks huggingface.co which repos carry each compiled arch's family
+tag, then fetches each candidate's `config.json` and keeps only those whose
+shape (`hidden_size`, `num_hidden_layers`, expert count) matches a compiled
+config AND whose `quantization_config` matches a compiled quant preset. So the
+completions obey `-Fmodel/<stem>` and `-Fquant/<preset>` exactly: an
+`mlx-affine-b4-g64` build completes 4-bit g64 MLX repos and not their 8-bit
+siblings, and a dense build completes only unquantized repos. The result is
+baked into the binary as a `&'static [&'static str]` — **tab completion itself
+never touches the network.**
+
+```bash
+cargo build -p scratchy-cli --features metal,model/llama-3.2-1b
+scr model names --source compiled      # what this build resolved to
+```
+
+- **On by default, opt out for an air-gapped build.** Verifying candidates
+  costs one HTTP request each — ~160 for a single small arch, and hundreds per
+  arch at `model/all` scope, which a clean build pays in full. To make no
+  network requests at all, drop the feature:
+
+  ```bash
+  cargo build -p scratchy-cli --no-default-features \
+      --features chat,metal,model/llama-3.2-1b
+  ```
+
+  `ureq` is then not even linked into the build script, so the build cannot
+  reach the Hub by accident. The feature rides `scratchy-cli`'s default
+  features via a weak `model?/hf-completions` edge, so it activates only when
+  a `-Fmodel/<stem>` is named; building `-p scratchy-models` directly does not
+  turn it on (its own `default` stays empty, which is what keeps CI's
+  `--workspace` and `met
+
+Summarize the document above in three sentences.
