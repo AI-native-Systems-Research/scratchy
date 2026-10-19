@@ -41,8 +41,11 @@ profiling = ["cuda"]
 # `--cublas-analysis` flag is gated on the `cuda` feature inside
 # `commands/model_info.rs`. Backends enable the ENGINE (via scratchy-serving-api/
 # <backend>), not the HTTP server — a backend is only meaningful with local
-# inference.
-metal = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/metal", "turboquant", "mtp-heads"]
+# inference. `metal` is `metal-base` with TurboQuant KV and MTP drafting on;
+# `metal-base` alone builds the same engine with a dense KV cache and no MTP
+# heads (add `mtp-heads` back for drafting over a dense cache).
+metal-base = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/metal"]
+metal = ["metal-base", "turboquant", "mtp-heads"]
 # IBM Spyre, BASE tier: the target crate and the `SubtileIR -> KTIR` producer, no
 # GPU toolchain and NO device — neither a card nor the host emulator. On its own it
 # builds and type-checks the whole lowering; pick `spyre-emu` or a card tier below to

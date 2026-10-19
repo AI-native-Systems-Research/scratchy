@@ -217,7 +217,14 @@ spyre build compiles none.
 On metal, a model's KV cache is either dense (the model's own dtype) or
 TurboQuant codes (3-bit for the Llama family, 4-bit otherwise), and the build
 decides which: nothing chooses at runtime. `scratchy-cli`'s `metal` feature
-turns `turboquant` **on**; a cuda or spyre build does not have it.
+turns `turboquant` **on**; a cuda or spyre build does not have it. To build
+metal with a dense KV cache, name `metal-base` instead of `metal`: the same
+engine without `turboquant` or `mtp-heads` (add `mtp-heads` back to keep MTP
+drafting):
+
+```bash
+cargo build --release -p scratchy-cli --features metal-base,model/llama-3.2-1b
+```
 
 With it on, every selected model whose geometry the codec takes is emitted with
 `KV_CODEC = TurboQuant`; the rest stay dense and the build names each one and
