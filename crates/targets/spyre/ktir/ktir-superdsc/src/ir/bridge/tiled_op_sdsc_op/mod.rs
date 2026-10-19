@@ -48,8 +48,9 @@ pub use pointwise::{
     pointwise_opspec_from_tile,
 };
 pub use reduce::{
-    assemble_reduce, assemble_reduce_df, assemble_reduce_off, assemble_reduce_seeded,
-    reduce_opspec, reduce_opspec_df, reduce_opspec_off,
+    ReduceDivided, ReduceDivision, ReduceOffSpec, assemble_reduce, assemble_reduce_df,
+    assemble_reduce_off, assemble_reduce_off_divided, assemble_reduce_seeded, reduce_opspec,
+    reduce_opspec_df, reduce_opspec_off, reduce_opspec_off_divided,
 };
 pub use rmsnorm::{assemble_rmsnorm, assemble_rmsnorm_unit, assemble_tanhsoftcap};
 pub use softmax::{assemble_row_renorm, assemble_row_softmax};

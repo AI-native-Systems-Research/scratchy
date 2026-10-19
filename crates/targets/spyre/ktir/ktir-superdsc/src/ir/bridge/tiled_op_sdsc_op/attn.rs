@@ -60,7 +60,7 @@ use super::matmul::{
     assemble_matmul_off_phys_m_maybe_epilogue, assemble_matmul_off_phys_m_with_epilogue,
     assemble_matmul_off_with_epilogue,
 };
-use super::reduce::assemble_reduce_off;
+use super::reduce::{ReduceDivided, assemble_reduce_off, assemble_reduce_off_divided};
 use crate::addr::{Head, Idx, Nest};
 use crate::emit::{
     EmittedOp, In, PointwiseDivided, assemble_pointwise_broadcast_divided,
@@ -1780,6 +1780,9 @@ struct ChunkBufs {
     /// out. The caller sizes the pin under this same value ([`ChunkBufs::sm_division_of`]), and the body
     /// assembles both ops under it.
     sm_division: crate::work::EwDivision,
+    /// ⭐ HOW THE ROW MAX AND THE ROW SUM SPEND THEIR CORES ([`ChunkBufs::red_division_of`]): the reduced
+    /// axis across the cores for a decode batch, rows first for every other chunk.
+    red_division: super::reduce::ReduceDivision,
     /// One-stick partial reductions: three for a row max / denominator cut into parts, one per probability
     /// part plus two accumulators for a prompt chunk's denominator. Declared only when used.
     red: Vec<String>,
@@ -1816,6 +1819,28 @@ impl ChunkBufs {
             crate::work::EwDivision::SticksFirst
         } else {
             crate::work::EwDivision::Law
+        }
+    }
+
+    /// ⭐⭐⭐ A DECODE BATCH's ROW MAX AND ROW SUM SPLIT THE AXIS THEY REDUCE ACROSS THE CORES — every core
+    /// reduces a contiguous run of whole sticks of every row of the `[rows, slots]` block, and the reduce
+    /// template's own `genericpartialreduction` ring merges the 32 partials into the row's one result
+    /// (`ReduceDivision::ReducedAxis`). Every other chunk keeps rows first.
+    ///
+    /// MEASURED (granite-3.1-2b fp16, conc-8, ~1k-token prompts, each in a launch group of its own): at 8
+    /// requests the 8 row maxes took 6.72 ms/step and the 8 row sums 6.72 ms/step, 21 µs per kv head over
+    /// `[32, 10240]`. That is 31 GB/s: rows first, each core reads its one row as 160 strided 128-byte
+    /// bursts, the same rate `esub`/`exp` ran at before they went sticks first (31 → 127 GB/s).
+    ///
+    /// ⛔ WHY ONLY THE BATCH: the same reasons as [`Self::sm_division_of`]. The one-request decode's
+    /// reductions share a launch group with its score and are card-proven as they stand, and a prompt
+    /// chunk's row sum reads a core-local `cexp` laid out for its row-divided PV. Its row max reads the
+    /// HBM score block, but it is left as it is, so every non-batch bundle stays byte-identical.
+    fn red_division_of(rows_are_requests: bool) -> super::reduce::ReduceDivision {
+        if rows_are_requests {
+            super::reduce::ReduceDivision::ReducedAxis
+        } else {
+            super::reduce::ReduceDivision::Rows
         }
     }
 }
@@ -2723,15 +2748,20 @@ fn assemble_attn_chunk(
         for b in 0..blocks.count() {
             let h0 = blocks.first_head(b) * mq;
             let rc = corner(blocks.corner(b), "a row block's score block")?;
-            ops.push(assemble_reduce_off(
-                &format!("attn_cbmax_{}_o{t}", blk_name(b)),
-                "max",
-                blk_rows,
-                width,
-                &rb(&cb.csc, b_rows, slots),
-                rc,
-                &hm(&bufs.bmax),
-                row_step(h0),
+            // The chunk's own division (`ChunkBufs::red_division_of`): the reduced axis across the
+            // cores for a decode batch, rows first for every other chunk, byte for byte.
+            ops.push(assemble_reduce_off_divided(
+                ReduceDivided {
+                    op_name: &format!("attn_cbmax_{}_o{t}", blk_name(b)),
+                    op_func: "max",
+                    rows: blk_rows,
+                    cols: width,
+                    data: &rb(&cb.csc, b_rows, slots),
+                    data_off: rc,
+                    accum: &hm(&bufs.bmax),
+                    accum_off: row_step(h0),
+                    division: cb.red_division,
+                },
                 sym_id_base,
                 layout,
             ));
@@ -2879,15 +2909,18 @@ fn assemble_attn_chunk(
         // `rows > 1 × cols > one stick`, the cell `Sum` combines correctly (prefill's RMS sums run it).
         // In parts below instead, after every block's probabilities, when one trip cannot hold it.
         if red_parts.len() == 1 {
-            ops.push(assemble_reduce_off(
-                &format!("attn_cbsum_{bn}_o{t}"),
-                "sum",
-                blk_rows,
-                width,
-                &rb(&cb.cexp, b_rows, slots),
-                rc,
-                &hm(&bufs.bsum),
-                row_step(h0),
+            ops.push(assemble_reduce_off_divided(
+                ReduceDivided {
+                    op_name: &format!("attn_cbsum_{bn}_o{t}"),
+                    op_func: "sum",
+                    rows: blk_rows,
+                    cols: width,
+                    data: &rb(&cb.cexp, b_rows, slots),
+                    data_off: rc,
+                    accum: &hm(&bufs.bsum),
+                    accum_off: row_step(h0),
+                    division: cb.red_division,
+                },
                 sym_id_base,
                 layout,
             ));
@@ -4241,6 +4274,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             cesub: syn(R::ChunkESub),
             cexp: syn(R::ChunkExp),
             sm_division,
+            red_division: ChunkBufs::red_division_of(rows_are_requests),
             red: (0..n_red).map(|i| syn(R::ChunkRed(i))).collect(),
             qgroup: qgroup.map(|(_, ident_tid)| QGroupBufs {
                 block: syn(R::ChunkQGroup),

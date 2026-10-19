@@ -514,6 +514,25 @@ pub fn distribute_cores(dims: &[ItDim], max_cores: u32) -> BTreeMap<&'static str
     splits
 }
 
+/// ⭐ A REDUCE's REDUCED STICK AXIS ACROSS THE CORES, every other dim whole — the largest divisor of
+/// the reduced axis's stick count within the core budget, so every core's run is whole sticks. Reached
+/// only through `reduce::ReduceDivision::ReducedAxis`, whose op's template combines the per-core
+/// partials. A reduction with no reduced stick axis takes no split.
+pub fn distribute_cores_reduced_axis(
+    dims: &[ItDim],
+    max_cores: u32,
+) -> BTreeMap<&'static str, u32> {
+    let mut splits = BTreeMap::new();
+    if let Some(d) = dims.iter().find(|d| d.is_reduction && d.is_stick) {
+        let sticks = d.size.div_ceil(d.df.elems_per_stick()).max(1);
+        let split = core_split(sticks, max_cores);
+        if split > 1 {
+            splits.insert(d.name, split);
+        }
+    }
+    splits
+}
+
 /// ⭐⭐⭐ HOW AN ELEMENTWISE OP's CORES ARE SPENT — rows first or sticks first, decided by the op's operand
 /// layout and nothing else. See [`EwDivision::of`].
 ///
