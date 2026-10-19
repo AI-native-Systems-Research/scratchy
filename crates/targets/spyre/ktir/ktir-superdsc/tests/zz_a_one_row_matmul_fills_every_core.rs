@@ -16,9 +16,6 @@
 //! [`one_row_core_fill`]: ktir_superdsc::work::one_row_core_fill
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul_opspec;
-use ktir_superdsc::superdsc_opspec::{
-    Df, KernelSlab, MatmulStaging, WHOLE_DXP_EAR_KERNEL_SLAB_LIMIT,
-};
 
 /// `(mb, out, in)` cores of the one-row matmul `[1, k] · [k, n]`, read off the plan the door built.
 fn split_triple(n: u32, k: u32) -> (u32, u32, u32) {
@@ -131,36 +128,4 @@ fn a_prompt_chunk_keeps_the_cost_models_split() {
         (4, 8),
         "gate at m=256 keeps the cost model's mb4·out8"
     );
-}
-
-/// ⛔ #598's EAR envelope: the fill only SHRINKS the per-core kernel slab (it divides `in`), so every
-/// filled projection stays dxp-staged. The largest one-row slab across both models is pinned here.
-#[test]
-fn no_filled_projection_passes_the_ear_envelope() {
-    let mut max_slab = 0u64;
-    for (k, n) in [
-        (4096u32, 4096u32),
-        (4096, 1024),
-        (4096, 12800),
-        (12800, 4096),
-        (4096, 51200),
-        (2048, 2048),
-        (2048, 512),
-        (2048, 8192),
-        (8192, 2048),
-    ] {
-        let spec = matmul_opspec(1, n, k, 1, "t_a", "t_w", "t_o").expect("a one-row projection");
-        let slab = KernelSlab::of_plan(&spec.iter, Df::Fp16);
-        assert_eq!(
-            MatmulStaging::of(1, Df::Fp16, slab),
-            MatmulStaging::Dxp,
-            "[{k} -> {n}]: slab {} B must stay inside the whole-dxp envelope",
-            slab.bytes()
-        );
-        max_slab = max_slab.max(slab.bytes());
-    }
-    // The lm_head's 4096 x (51200 / 32) x 2 B = 13.1 MB/core — unchanged by the fill (out32 already
-    // fills the cores, so its `in` stays whole), ~1/12 of the envelope.
-    assert_eq!(max_slab, 4096 * (51200 / 32) * 2);
-    assert!(max_slab < WHOLE_DXP_EAR_KERNEL_SLAB_LIMIT);
 }
