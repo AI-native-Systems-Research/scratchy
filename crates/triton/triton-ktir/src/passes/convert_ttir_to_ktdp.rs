@@ -440,11 +440,52 @@ fn convert_access_ops(module: &mut Module) -> Result<()> {
                 .result_type()
                 .cloned()
                 .ok_or_else(|| Refusal::new(PASS, "tt.descriptor_load has no result type"))?;
-            replacement.push(
-                Op::new(OpKind::KtdpLoad)
-                    .with_result(res, ty)
-                    .with_operands([tile]),
-            );
+            // ⛔ THE LOAD YIELDS THE BLOCK'S OWN RANK — the slab gather's law above, for a direct
+            // tile. `ttir-combine`'s rank reduction re-typed a `[1, N, K]` block's load to
+            // `[N, K]`, but a `ktdp.load` returns exactly its tile's shape (the emulator's
+            // `direct_load` does), so a dot reading it met a rank-3 operand. The prompt MoE
+            // kernel's every slab (`W.load([e, 0, 0])` at a trace-time expert) is this shape.
+            // The reduction is stated as the op that performs it: a `tensor.collapse_shape`
+            // over the unit axes, whose target `to_ktir_emit` pins from the declared type.
+            let declared = ty.dims().map(|d| d.to_vec()).unwrap_or_default();
+            if declared == block_shape {
+                replacement.push(
+                    Op::new(OpKind::KtdpLoad)
+                        .with_result(res, ty)
+                        .with_operands([tile]),
+                );
+            } else {
+                let kept = rank_reduced_axes(&block_shape, &declared).ok_or_else(|| {
+                    Refusal::new(
+                        PASS,
+                        format!(
+                            "a tt.descriptor_load of block {block_shape:?} is typed {declared:?}, \
+                             which is not that block with unit axes dropped"
+                        ),
+                    )
+                })?;
+                let elem = ty.elem().ok_or_else(|| {
+                    Refusal::new(PASS, "a direct load's result has no element type")
+                })?;
+                let full = module.fresh_named(&hint);
+                replacement.push(
+                    Op::new(OpKind::KtdpLoad)
+                        .with_result(
+                            full,
+                            IrType::Tensor {
+                                dims: block_shape.clone(),
+                                elem,
+                            },
+                        )
+                        .with_operands([tile]),
+                );
+                replacement.push(
+                    Op::new(OpKind::TensorCollapseShape)
+                        .with_result(res, ty)
+                        .with_operands([full])
+                        .with_attr(AttrKey::Reassociation, Attr::IntList(kept)),
+                );
+            }
         } else {
             replacement.push(
                 Op::new(OpKind::KtdpStore)
@@ -789,6 +830,23 @@ fn slab_gather(module: &mut Module, index: &DefIndex, op: &Op) -> Result<Option<
         );
     }
     Ok(Some((out, offsets[dim])))
+}
+
+/// The axes a rank-reduced load KEEPS, when `declared` is `block` with some unit axes dropped
+/// (`ttir-combine`'s `RankedReduceDescriptorLoads` drops only size-1 axes, in order). `None`
+/// when `declared` is not such a reduction — a reshape that moves elements is not this.
+fn rank_reduced_axes(block: &[i64], declared: &[i64]) -> Option<Vec<i64>> {
+    let mut kept = Vec::with_capacity(declared.len());
+    let mut d = declared.iter().peekable();
+    for (i, &b) in block.iter().enumerate() {
+        if d.peek() == Some(&&b) {
+            kept.push(i as i64);
+            d.next();
+        } else if b != 1 {
+            return None;
+        }
+    }
+    (d.next().is_none() && kept.len() == declared.len()).then_some(kept)
 }
 
 /// `buildDirectAccessTile`. The memory view describes the full tensor; the block

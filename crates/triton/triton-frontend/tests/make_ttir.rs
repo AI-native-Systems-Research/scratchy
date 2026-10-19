@@ -76,6 +76,7 @@ fn cases() -> Vec<(Case, Target)> {
         (common::rmsnorm("rmsnorm", 128), Target::spyre()),
         (common::rmsnorm("rmsnorm_granite", 4096), Target::spyre()),
         (common::moe(), Target::spyre()),
+        (common::moe_prefill(), Target::spyre()),
         (common::rope("rope", 4), Target::spyre()),
         (common::rope("rope_granite_q", 32), Target::spyre()),
         (common::rope("rope_granite_kv", 8), Target::spyre()),
