@@ -11,7 +11,7 @@
 //! caller: the worker routes every sendnn bundle to `SuperDsc`. Under `sendnn` the only bundle that
 //! runs is the dxp-compiled SuperDSC bundle.
 
-use crate::superdsc_exec::{Executor, KvDim, NewTokens, PoolPages, SegIdx, SeqPos, Vocab};
+use crate::superdsc_exec::{Executor, KvDim, Logits, NewTokens, PoolPages, SegIdx, SeqPos, Vocab};
 use anyhow::{Result, anyhow, bail};
 use scratchy_subtile::sdsc_abstract::{
     FoldPages, FoldRowRegime, FoldWalker, MaskBlocks, PrefixMaskShape,
@@ -22,6 +22,18 @@ use tracing::debug;
 use crate::manifest::bytes_to_f32;
 
 use crate::sen_convert::f32_to_f16_le;
+
+/// What a step's caller does with its logits — the session-level spelling of [`Logits`], minus the
+/// buffer the session owns. See [`Logits`] for why this is three states and not a `bool`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StepLogits {
+    /// Convert the `[1, vocab]` row and return it.
+    ReadBack,
+    /// Run the suffix and leave its output on the device; the caller reads the tensor itself.
+    LeftOnDevice,
+    /// Nobody reads them: the suffix does not run.
+    Discarded,
+}
 
 /// The three model extents every constructor here forwards unchanged — one value because they are
 /// always read from the same parse and passed together, and separately they pushed `new_inner` past the
@@ -484,23 +496,26 @@ impl SuperDscSession {
         activations: &[crate::wiring::Bind],
     ) -> Result<Vec<f32>> {
         Ok(self
-            .run_step_inner(n_new, seq_pos, activations, &[], &[], true)?
+            .run_step_inner(n_new, seq_pos, activations, &[], &[], StepLogits::ReadBack)?
             .unwrap_or_default())
     }
 
-    /// [`run_step`](Self::run_step) for a forward whose logits are NEVER read — batched prefill.
-    /// Skips both the logits D2H and the sen→IEEE convert.
-    ///
-    /// This matters because the prefill bundle's suffix is the lm_head-less tail (rmsnorm +
-    /// scalarmul, zero matmul), so its logits segment is never written — yet every chunk would
-    /// otherwise D2H ~3 MB of untouched memory (~1.9 ms measured) into a vocab-sized host buffer.
+    /// [`run_step`](Self::run_step) for a forward whose logits stay on the device — skips the logits
+    /// D2H and the sen→IEEE convert, and still runs the suffix ([`StepLogits::LeftOnDevice`]).
     pub fn run_step_no_logits(
         &mut self,
         n_new: usize,
         seq_pos: usize,
         activations: &[crate::wiring::Bind],
     ) -> Result<()> {
-        self.run_step_inner(n_new, seq_pos, activations, &[], &[], false)?;
+        self.run_step_inner(
+            n_new,
+            seq_pos,
+            activations,
+            &[],
+            &[],
+            StepLogits::LeftOnDevice,
+        )?;
         Ok(())
     }
 
@@ -521,7 +536,14 @@ impl SuperDscSession {
         activations: &[crate::wiring::Bind],
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
     ) -> Result<()> {
-        self.run_step_inner(n_new, seq_pos, activations, activations_f16, &[], false)?;
+        self.run_step_inner(
+            n_new,
+            seq_pos,
+            activations,
+            activations_f16,
+            &[],
+            StepLogits::LeftOnDevice,
+        )?;
         Ok(())
     }
 
@@ -534,7 +556,14 @@ impl SuperDscSession {
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
     ) -> Result<Vec<f32>> {
         Ok(self
-            .run_step_inner(n_new, seq_pos, activations, activations_f16, &[], true)?
+            .run_step_inner(
+                n_new,
+                seq_pos,
+                activations,
+                activations_f16,
+                &[],
+                StepLogits::ReadBack,
+            )?
             .unwrap_or_default())
     }
 
@@ -551,7 +580,7 @@ impl SuperDscSession {
         activations: &[crate::wiring::Bind],
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
         activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
-        want_logits: bool,
+        logits: StepLogits,
     ) -> Result<Option<Vec<f32>>> {
         self.run_step_inner(
             n_new,
@@ -559,7 +588,7 @@ impl SuperDscSession {
             activations,
             activations_f16,
             activations_i32,
-            want_logits,
+            logits,
         )
     }
 
@@ -701,18 +730,26 @@ impl SuperDscSession {
         // ⭐ RAW LE int32 bytes — bound through `bind_input_raw`, so the shadow write COPIES them
         // instead of re-encoding them as fp16. A gather's index table, and nothing else today.
         activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
-        want_logits: bool,
+        logits: StepLogits,
     ) -> Result<Option<Vec<f32>>> {
         self.bind_activations(activations, activations_f16, activations_i32)?;
-        let mut logits = if want_logits {
-            vec![0u8; self.vocab * 2]
-        } else {
-            Vec::new()
-        };
-        let out = want_logits.then_some(&mut logits[..]);
-        self.exec
-            .predict(NewTokens(n_new as i64), SeqPos(seq_pos as i64), out)?;
-        Ok(want_logits.then(|| f16_le_to_f32(&logits)))
+        let (n_new, seq_pos) = (NewTokens(n_new as i64), SeqPos(seq_pos as i64));
+        match logits {
+            StepLogits::ReadBack => {
+                let mut row = vec![0u8; self.vocab * 2];
+                self.exec
+                    .predict(n_new, seq_pos, Logits::ReadBack(&mut row[..]))?;
+                Ok(Some(f16_le_to_f32(&row)))
+            }
+            StepLogits::LeftOnDevice => {
+                self.exec.predict(n_new, seq_pos, Logits::LeftOnDevice)?;
+                Ok(None)
+            }
+            StepLogits::Discarded => {
+                self.exec.predict(n_new, seq_pos, Logits::Discarded)?;
+                Ok(None)
+            }
+        }
     }
 
     // ── DEBUG numeric bisection (SPYRE_SUPERDSC_SELFTEST). NOT a serving path. ──

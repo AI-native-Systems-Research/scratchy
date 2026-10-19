@@ -21,7 +21,7 @@ use std::num::NonZeroU32;
 #[cfg(not(feature = "spyre-hw"))]
 use scratchy_target_spyre::runner::SpyreSession;
 #[cfg(feature = "spyre-hw")]
-use scratchy_target_spyre::sdsc_runner::SuperDscSession;
+use scratchy_target_spyre::sdsc_runner::{StepLogits, SuperDscSession};
 
 use crate::error::ExecutorResult;
 #[cfg(feature = "spyre-hw")]
@@ -513,8 +513,9 @@ pub(crate) fn run_prefill_batch(
         );
     }
     // NO-LOGITS variant for every chunk but the last: only the FINAL chunk's lm-head tail produces a
-    // token, so the rest pass a null out-pointer and the shim skips the ~3 MB whole-segment D2H
-    // (~1.9 ms/chunk measured) plus the sen->IEEE convert.
+    // token, so the rest DISCARD their logits — the executor launches no suffix for them and reads
+    // nothing back (`StepLogits::Discarded`). A decode batch is NOT that case: it reads its whole
+    // `[rows, vocab]` result itself, so the suffix must run (`StepLogits::LeftOnDevice`).
     log_binds(
         &format!("prefill mq={mq} start={start}"),
         b.wiring,
@@ -524,7 +525,7 @@ pub(crate) fn run_prefill_batch(
     let logits = match want_logits {
         LogitsWanted::LastRow => {
             let l = pf
-                .run_step_i32(mq, start, &acts, &acts_f16, &acts_i32, true)
+                .run_step_i32(mq, start, &acts, &acts_f16, &acts_i32, StepLogits::ReadBack)
                 .map_err(|e| {
                     werr(format!(
                         "superdsc prefill run_step (mq={mq}, start={start}): {e}"
@@ -537,12 +538,19 @@ pub(crate) fn run_prefill_batch(
         // the folded tail), so it cannot serve this case. Run with a null out-pointer and read the
         // whole `[rows, width]` result tensor back instead — the same single D2H, then de-interleave.
         LogitsWanted::PerRequest(geom) => {
-            pf.run_step_i32(mq, start, &acts, &acts_f16, &acts_i32, false)
-                .map_err(|e| {
-                    werr(format!(
-                        "superdsc decode batch run_step (mq={mq}, start={start}): {e}"
-                    ))
-                })?;
+            pf.run_step_i32(
+                mq,
+                start,
+                &acts,
+                &acts_f16,
+                &acts_i32,
+                StepLogits::LeftOnDevice,
+            )
+            .map_err(|e| {
+                werr(format!(
+                    "superdsc decode batch run_step (mq={mq}, start={start}): {e}"
+                ))
+            })?;
             // ⭐⭐ THE OBSERVATION, not another argument: read the mask BACK off the device and diff it
             // against the bytes we staged. Identical ⇒ the mask is exonerated and the fault is in the KV
             // path. Different ⇒ the fault is placement, the H2D window, or the staging, and the first
@@ -603,12 +611,19 @@ pub(crate) fn run_prefill_batch(
             Some(gathered)
         }
         LogitsWanted::None => {
-            pf.run_step_i32(mq, start, &acts, &acts_f16, &acts_i32, false)
-                .map_err(|e| {
-                    werr(format!(
-                        "superdsc prefill run_step (mq={mq}, start={start}): {e}"
-                    ))
-                })?;
+            pf.run_step_i32(
+                mq,
+                start,
+                &acts,
+                &acts_f16,
+                &acts_i32,
+                StepLogits::Discarded,
+            )
+            .map_err(|e| {
+                werr(format!(
+                    "superdsc prefill run_step (mq={mq}, start={start}): {e}"
+                ))
+            })?;
             None
         }
     };
@@ -1706,7 +1721,7 @@ pub(crate) fn superdsc_forward_chunk(
             device_tok = Some(sampled);
         } else {
             let logits = session
-                .run_step_i32(1, p, &acts, &acts_f16, &acts_i32, true)
+                .run_step_i32(1, p, &acts, &acts_f16, &acts_i32, StepLogits::ReadBack)
                 .map_err(|e| werr(format!("superdsc run_step (pos {p}): {e}")))?
                 .unwrap_or_default();
             step_timing(p, _t_fwd);
