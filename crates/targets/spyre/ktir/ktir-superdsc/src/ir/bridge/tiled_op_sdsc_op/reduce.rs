@@ -4,7 +4,7 @@
 //! than folded into a bigger one.
 
 use crate::emit::{EmittedOp, op_func_from_str, sen169_bits};
-use crate::ir::island::tile_op::TileOp;
+use crate::ir::island::tile_op::{TileOp, TileOpKind};
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{KindTag, StickKind, Stk};
 use crate::superdsc_opspec::{
@@ -13,55 +13,41 @@ use crate::superdsc_opspec::{
 };
 use crate::work::distribute_cores;
 
-/// ⛔ A REDUCE'S TileOp OPERAND COUNT IS THE DDL's OWN INPUT ARITY, NOT A LITERAL 2. The seeded
-/// convention (`sum`/`max`/`mean`, `ddl_input_arity() = None`) binds data + accumulator as
-/// `inputLabeledDs[0..1]` — two HBM-resident operands. The FUSED unseeded reduce
-/// (`quantscalepertokenfp8`, `Some(1)`) keeps its accumulator ON-CHIP as a `ddl.internal_tensor`
-/// (`quant_scale_per_token.ddl:41`), so its per-core LX residency is ONE `[per_core_mb, k]`
-/// operand. A literal 2 modeled an accumulator that op does not have, and at a PRIME prefill
-/// rung — where `core_split` finds no even divisor, so the reduce keeps the WHOLE row count per
-/// core — the doubled count overflowed the usable LX scratchpad and time-tiled the REDUCTION
-/// axis (granite-3.1-2b mq=71 k=8192: 2,324,224 B; gemma-4-12b mq=43 k=15360: 2,641,920 B vs
-/// the 1,677,721-B budget), whose per-trip outputs ALIAS — the accum is `Scale::RedStick`,
-/// stride-exempt in `rewrite_op_for_time_tile` — exactly the collision the #50
-/// `tiled_trips_alias` guard refuses. At the true arity both geometries are single-shot
-/// (1,162,112 / 1,320,960 B), matching the fused op's own pinned arithmetic
-/// ("`(1024/32)·16384·2 = 1,048,576 B` per core, HALF the old residency"). The `[m, stick]`
-/// scale output (one 64-elem stick = 128 B/row) is not charged: the tightest real margin
-/// (12b mq=43: 356,761 B) is two orders above it. Anything else (`None`/`Some(2)`) keeps the
-/// seeded convention's conservative two-operand model — byte-identical for every shipped
-/// seeded reduce.
-fn reduce_tile_operands(op: OpFunc) -> u32 {
+/// ⛔ A REDUCE'S TileOp KIND IS THE DDL's OWN INPUT ARITY, NOT A LITERAL OPERAND COUNT. The
+/// FUSED unseeded reduce (`quantscalepertokenfp8`, `Some(1)`) keeps its accumulator ON-CHIP
+/// as a `ddl.internal_tensor` (`quant_scale_per_token.ddl:41`), so its per-core LX residency
+/// is ONE `[per_core_mb, k]` operand — `PointwiseOrReduce { n_operands: 1 }`, the charge that
+/// was always correct for it. The SEEDED convention (`sum`/`max`/`mean`,
+/// `ddl_input_arity() = None`) binds data + accumulator as `inputLabeledDs[0..1]` — two
+/// HBM-resident operands — and its accumulator is ONE STICK PER ROW whatever the trip, so its
+/// kind is `SeededReduce`: the data at its per-trip width plus the accum at its true
+/// one-stick size. A literal `n_operands = 2` modeled the accum as data-width, an
+/// OVER-CHARGE that split wide reduces into time-tiled forms whose per-trip outputs ALIAS —
+/// the accum is `Scale::RedStick`, stride-exempt in `rewrite_op_for_time_tile` — exactly the
+/// collision the #50 `tiled_trips_alias` guard refuses. Two measured bites of the same law:
+/// a PRIME prefill rung where `core_split` keeps the whole row count per core (the fused
+/// arity fix: granite-3.1-2b mq=71 k=8192 billed 2,324,224 B; gemma-4-12b mq=43 k=15360
+/// billed 2,641,920 B vs the 1,677,721-B budget), and the composite argmax's max32 at
+/// gemma's own vocab (m=1, 262144 fp32: billed 2,097,152 B, true 1,048,704 B — ONE trip,
+/// the form that ships). Anything else (`None`/`Some(2)+`) is the seeded convention.
+fn reduce_tile_kind(op: OpFunc) -> TileOpKind {
     match op.ddl_input_arity() {
-        Some(1) => 1,
-        _ => 2,
+        Some(1) => TileOpKind::PointwiseOrReduce { n_operands: 1 },
+        _ => TileOpKind::SeededReduce,
     }
 }
 
-/// `cols` axis. Two operands: `data` (all active) + `accum` (the accumulator,
-/// both `inputLabeledDs[1]` and the sole output, `out`-axis stick-reduction
-/// `[Active, RedStick, Active]`).
-/// fp16 wrapper (every existing caller). The torch-spyre fp32 `mean(x²)` uses [`reduce_opspec_df`].
-pub fn reduce_opspec(
+/// The reduce's SHARED `TileOp` front matter — the `[mb, out(stick), y]` iteration domain
+/// (the stick-padded `cols` as the reduction stick axis) plus the arity-picked kind — ONE
+/// constructor behind both `reduce_opspec_df` and `reduce_opspec_off`, so the two variants
+/// cannot drift in what they declare to the tiler. `Err` only where the emission itself
+/// would refuse (a `StickExtent` no stick-legal reduce can state).
+fn reduce_dims_kind(
     op: OpFunc,
     rows: u32,
     cols: u32,
-    data_name: &str,
-    accum_name: &str,
-    head_major: bool,
-) -> Result<OpSpec, String> {
-    reduce_opspec_df(op, rows, cols, data_name, accum_name, head_major, Df::Fp16)
-}
-
-pub fn reduce_opspec_df(
-    op: OpFunc,
-    rows: u32,
-    cols: u32,
-    data_name: &str,
-    accum_name: &str,
-    head_major: bool,
     df: Df,
-) -> Result<OpSpec, String> {
+) -> Result<(Vec<crate::superdsc_opspec::ItDim>, TileOpKind), String> {
     let stick_elems = if matches!(df, Df::Fp32) {
         StickExtent::<Fp32>::new(cols)?.elems()
     } else {
@@ -90,15 +76,109 @@ pub fn reduce_opspec_df(
             df,
         },
     ];
+    Ok((dims, reduce_tile_kind(op)))
+}
+
+/// The trip count the emission's own tiler will give a reduce at `(op, rows, cols, df)` —
+/// the SAME [`reduce_dims_kind`] declaration and the SAME `TileOp::tile` run the emission
+/// performs, so a caller choosing between emission forms (the argmax door's link 5, picking
+/// the single-trip max from the partials+combine max by exactly this count) cannot drift
+/// from what the bake actually tiles. `Err` only where the emission itself would refuse.
+pub fn reduce_trip_count(op: OpFunc, rows: u32, cols: u32, df: Df) -> Result<u32, String> {
+    let (dims, kind) = reduce_dims_kind(op, rows, cols, df)?;
+    let tile_op = TileOp { kind, dims, df };
+    let tiled = tile_op
+        .tile(MaxCores::<MAX_CORES>, distribute_cores, "out")
+        .map_err(|e| e.0)?;
+    Ok(tiled.time_tile.map(|t| t.count()).unwrap_or(1))
+}
+
+/// The PARTIALS+COMBINE form's first half — a seeded reduce that GENUINELY time-tiles
+/// (its data operand alone overruns the usable LX even under the true accum charge),
+/// writing each trip's partial into its OWN stick of a `[rows, trips × stick]` accum.
+/// The trips count is read off the BUILT spec's own tiler and RETURNED — one tiler run,
+/// so the caller's combine spans exactly the sticks the trips write (a probe that could
+/// disagree with the emission cannot exist; the caller passes no trips in). The caller
+/// follows with ONE combine reduce over the returned `trips` sticks
+/// (`reduce_opspec_df` at `cols = trips · elems_per_stick`) — max-of-maxes is max by
+/// associativity, sum-of-sums is sum; mean composes the same way at fixed N.
+pub fn reduce_opspec_partials(
+    op: OpFunc,
+    rows: u32,
+    cols: u32,
+    data_name: &str,
+    accum_name: &str,
+    head_major: bool,
+    df: Df,
+) -> Result<(OpSpec, u32), String> {
+    let mut spec = reduce_opspec_df(op, rows, cols, data_name, accum_name, head_major, df)?;
+    let trips = spec.time();
+    if trips < 2 {
+        return Err(format!(
+            "reduce `{accum_name}`: the partials form demands trips ≥ 2, got {trips} — a \
+             single-trip row takes the PLAIN seeded reduce (the true accum charge fits the \
+             row; the partials stride and the combine link would be dead weight)"
+        ));
+    }
+    // Rebuild the accum in place — args = [data, accum], the reduce's own construction —
+    // at its TRUE physical extent along `out`: ONE STICK PER TRIP, the buffer the
+    // partials law's per-trip stride walks and the combine reads back.
+    let accum = spec
+        .args
+        .pop()
+        .expect("the seeded reduce's accum is its last arg");
+    let rebuilt = match accum {
+        AnyTensorArg::R2(t) => AnyTensorArg::R2(
+            t.with_device_extent("out", trips * df.elems_per_stick())
+                .map_err(|e| e.0)?,
+        ),
+        AnyTensorArg::R3(t) => AnyTensorArg::R3(
+            t.with_device_extent("out", trips * df.elems_per_stick())
+                .map_err(|e| e.0)?,
+        ),
+        AnyTensorArg::R1(_) | AnyTensorArg::R4(_) => {
+            return Err(format!(
+                "reduce `{accum_name}`: the partials form declares its accum at ranks 2/3 \
+                 (the reduce's own two forms), not the rank this builder produced"
+            ));
+        }
+    };
+    spec.args.push(rebuilt);
+    Ok((spec, trips))
+}
+
+/// `cols` axis. Two operands: `data` (all active) + `accum` (the accumulator,
+/// both `inputLabeledDs[1]` and the sole output, `out`-axis stick-reduction
+/// `[Active, RedStick, Active]`).
+/// fp16 wrapper (every existing caller). The torch-spyre fp32 `mean(x²)` uses [`reduce_opspec_df`].
+pub fn reduce_opspec(
+    op: OpFunc,
+    rows: u32,
+    cols: u32,
+    data_name: &str,
+    accum_name: &str,
+    head_major: bool,
+) -> Result<OpSpec, String> {
+    reduce_opspec_df(op, rows, cols, data_name, accum_name, head_major, Df::Fp16)
+}
+
+pub fn reduce_opspec_df(
+    op: OpFunc,
+    rows: u32,
+    cols: u32,
+    data_name: &str,
+    accum_name: &str,
+    head_major: bool,
+    df: Df,
+) -> Result<OpSpec, String> {
     // LOWER to TileIR: this reduce's iteration domain + kind, ONE `TileOp` declaration instead of
     // the inline `WorkPlan::divide` + hand-picked `pointwise_lx_resident` closure — reached from the
     // REAL `lower_one_node` SubtileTape dispatch (every reduce: rmsnorm's mean, softmax's max/sum,
-    // fp8's amax), same as `pointwise_opspec`. The operand count comes off the DDL's own input
-    // arity — see [`reduce_tile_operands`].
+    // fp8's amax), same as `pointwise_opspec`. The kind comes off the DDL's own input arity, and the
+    // seeded accum is charged at its TRUE one-stick-per-row size — see [`reduce_tile_kind`].
+    let (dims, kind) = reduce_dims_kind(op, rows, cols, df)?;
     let tile_op = TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce {
-            n_operands: reduce_tile_operands(op),
-        },
+        kind,
         dims: dims.clone(),
         df,
     };
@@ -405,36 +485,11 @@ pub fn reduce_opspec_off(
     accum_off: u32,
     head_major: bool,
 ) -> Result<OpSpec, String> {
-    let cols_ext = StickExtent::<Fp16>::new(cols)?;
-    let dims = vec![
-        crate::superdsc_opspec::ItDim {
-            name: "mb",
-            size: rows,
-            is_reduction: false,
-            is_stick: false,
-            df: Df::Fp16,
-        },
-        crate::superdsc_opspec::ItDim {
-            name: "out",
-            size: cols_ext.elems(),
-            is_reduction: true,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-        crate::superdsc_opspec::ItDim {
-            name: "y",
-            size: 1,
-            is_reduction: false,
-            is_stick: false,
-            df: Df::Fp16,
-        },
-    ];
-    // LOWER to TileIR: same pattern as reduce_opspec_df — the per-head/offset reduce variant,
-    // including the DDL-arity operand count ([`reduce_tile_operands`]).
+    // LOWER to TileIR: same pattern as `reduce_opspec_df` — the per-head/offset reduce variant
+    // over the SAME shared declaration, kind picked off the DDL arity ([`reduce_tile_kind`]).
+    let (dims, kind) = reduce_dims_kind(op, rows, cols, Df::Fp16)?;
     let tile_op = TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce {
-            n_operands: reduce_tile_operands(op),
-        },
+        kind,
         dims: dims.clone(),
         df: Df::Fp16,
     };
@@ -608,4 +663,118 @@ pub fn assemble_reduce_off<D: KindTag, A: KindTag>(
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_reduce_off {op_name}: {e}"))
+}
+
+#[cfg(test)]
+mod seeded_reduce_trip_counts {
+    use super::*;
+
+    /// ⭐⭐⭐ THE TRUE ACCUM CHARGE, pinned at the reduce's own level through the SAME
+    /// tiler the emission runs ([`reduce_trip_count`]). Gemma-4's max32 (m=1, vocab
+    /// 262144, fp32) fits ONE trip — `262144·4 + 32·4 = 1,048,704 B` against the
+    /// 1,677,721-B usable LX — where the old two-operand model billed
+    /// `2·262144·4 = 2,097,152 B` and time-tiled it into the aliased-accum form the
+    /// bake's `tiled_trips_alias` guard refuses. The past-the-budget width (524288:
+    /// the DATA operand alone is 2,097,152 B) genuinely tiles even under the true
+    /// charge — the partials+combine law's own case, pinned end-to-end in the door
+    /// test file. And the FUSED unseeded reduce is unchanged: its on-chip accumulator
+    /// was always billed as one operand.
+    #[test]
+    fn gemmas_width_fits_one_trip_and_the_past_budget_width_genuinely_tiles() {
+        assert_eq!(
+            reduce_trip_count(OpFunc::Max, 1, 262_144, Df::Fp32).expect("262144 is stick-legal"),
+            1,
+            "the true charge fits gemma's vocab in ONE trip"
+        );
+        assert_eq!(
+            reduce_trip_count(OpFunc::Max, 1, 524_288, Df::Fp32).expect("524288 is stick-legal"),
+            2,
+            "the data operand alone exceeds the budget at 524288 — a REAL two-trip reduce"
+        );
+        // The fused unseeded reduce: ONE operand, the charge that was always correct —
+        // the prime-prefill geometry the arity fix landed for stays single-shot.
+        assert_eq!(
+            reduce_trip_count(OpFunc::QuantScalePerTokenFp8, 71, 8_192, Df::Fp16)
+                .expect("8192 is stick-legal"),
+            1,
+            "the fused reduce's on-chip accum keeps its one-operand charge"
+        );
+    }
+
+    /// A seeded reduce that fit before still fits — the charge only shrank (proven:
+    /// `seeded_reduce_resident_matches_formula_and_never_exceeds_the_old_charge`).
+    /// The shipping single-trip widths: granite's own vocab both ways, gemma's fp16
+    /// max16 at the full 262144, and a core-split prefill mean.
+    #[test]
+    fn widths_that_fit_before_still_fit() {
+        for &(rows, cols, df) in &[
+            (1u32, 49_152u32, Df::Fp16), // granite's max16
+            (1, 49_152, Df::Fp32),       // granite's max32
+            (1, 262_144, Df::Fp16),      // gemma's max16 at the full vocab
+            (16, 2_048, Df::Fp16),       // a core-split prefill mean (granite-2b hidden)
+        ] {
+            assert_eq!(
+                reduce_trip_count(OpFunc::Mean, rows, cols, df)
+                    .unwrap_or_else(|e| panic!("({rows}, {cols}, {df:?}) is stick-legal: {e}")),
+                1,
+                "({rows}, {cols}, {df:?}) was single-trip before the charge fix and must stay so"
+            );
+        }
+    }
+
+    /// ⛔ THE PARTIALS LAW'S REFUSAL — a seeded reduce that time-tiles WITHOUT the
+    /// partials form is a build Err naming the remedy, never an emitted op whose trips
+    /// alias on one accum stick (the #50 collision, and exactly what gemma's 262144
+    /// produced under the old over-charge before the charge fix made it single-trip).
+    #[test]
+    fn a_time_tiled_seeded_reduce_without_the_partials_form_refuses() {
+        let op = reduce_opspec_df(OpFunc::Max, 1, 524_288, "w", "j", false, Df::Fp32)
+            .expect("the bare opspec assembles");
+        assert_eq!(op.time(), 2, "the past-the-budget row genuinely tiles");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let err = match crate::emit::emit_sdsc_tiled("max32_bare", &op, &folds, &mut 0i64, None) {
+            Err(e) => e,
+            // `EmittedOp` is not `Debug`, so the Ok arm states its own refusal.
+            Ok(_) => panic!("the bare two-trip seeded reduce must refuse at the emission"),
+        };
+        assert!(
+            err.0.contains("not in the partials form"),
+            "the refusal names the law: {}",
+            err.0
+        );
+        assert!(
+            err.0.contains("reduce_opspec_partials"),
+            "the refusal names the remedy: {}",
+            err.0
+        );
+    }
+
+    /// The partials form's own emission: the accum carries the ONE-STICK per-trip
+    /// stride (each trip's partial lands in its own stick — the disjointness the bake's
+    /// `tiled_trips_alias` guard demands, pinned end-to-end at the door), and the
+    /// builder RETURNS the trips the combine must span — read off the built spec's own
+    /// tiler, so a probe that could disagree with the emission cannot exist.
+    #[test]
+    fn the_partials_form_strides_the_accum_one_stick_per_trip() {
+        let (op, trips) =
+            reduce_opspec_partials(OpFunc::Max, 1, 524_288, "w", "p", false, Df::Fp32)
+                .expect("the partials form assembles");
+        assert_eq!(trips, 2, "the returned trips is the tiler's own count");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let e = crate::emit::emit_sdsc_tiled("max32_partials", &op, &folds, &mut 0i64, None)
+            .expect("the partials form emits");
+        assert_eq!(e.time, 2);
+        assert_eq!(
+            e.affine_strides[1].get("out").copied(),
+            Some(Df::Fp32.elems_per_stick() as i64 * Df::Fp32.word_length() as i64),
+            "the accum (args[1]) advances EXACTLY one fp32 stick per trip"
+        );
+        // And the form itself demands trips ≥ 2 — a single-trip row takes the plain form.
+        let err = reduce_opspec_partials(OpFunc::Max, 1, 262_144, "w", "p", false, Df::Fp32)
+            .expect_err("a single-trip row must refuse the partials form");
+        assert!(
+            err.contains("trips ≥ 2"),
+            "the refusal states the precondition: {err}"
+        );
+    }
 }

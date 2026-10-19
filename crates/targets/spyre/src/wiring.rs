@@ -199,6 +199,75 @@ pub struct BakeFacts {
     /// fine gather reading an UNSTAGED index — zero, a VALID entry, so every pair gathers
     /// expert 0's sub-page 0 with a clean bake. One artifact-derived question answers both.
     pub subpage_bank_e: usize,
+    /// ⭐⭐⭐ THE COMPOSITE ARGMAX'S VOCAB — the bundle placed `argmax_ramp_tid` (the rolled
+    /// walk recognized a TIED ONE-REQUEST lm-head tail and minted the composite group), so
+    /// the session constructor must stage the descending `V − iota` ramp and the scalar-V
+    /// stick, fp32, ONCE AT LOAD through `superdsc_exec::Executor::bind_const_fp32`
+    /// ([`Self::argmax_const_binds`]) — never the per-step raw channel (a raw id bound
+    /// before prepare is exactly the raw+weight combination the staging loop refuses), and
+    /// never the f32→sen const bind, which narrows to fp16 and whose exact integers stop at
+    /// 2048, far below every real vocab (the mint's own reason for computing the ramp
+    /// in-func; `emit::argmax`). Read off the layout's own `argmax_vocab` REGISTRY — the
+    /// `router_experts` law: the pad-lane form places its ramp at the STICK-PADDED width
+    /// `[1, stick_pad(V)]`, so a placement-size derivation (`size / 4`) would answer
+    /// `stick_pad(V)`, and the sentinel threshold `idx ≥ V` would then accept the NaN
+    /// sentinel row as a real token. The registry and the placements answer ONE question
+    /// at ONE site (the layout pass that minted both). 0 when unplaced — every untied
+    /// model, prefill bundle and batched rung keeps the host readback path.
+    pub argmax_vocab: usize,
+}
+
+/// The composite argmax's resident constants as device bytes —
+/// [`BakeFacts::argmax_const_binds`]'s product. One struct, not a tuple, because the
+/// bias's channel differs from the other two's (the fp16 rides the weight convert, the
+/// fp32 pair rides the verbatim const bind) and the caller must not be able to mix them
+/// up by position.
+pub struct ArgmaxConsts {
+    /// The descending clamped ramp `max(V − iota, 0)`, `[1, stick_pad(V)]` fp32 LE —
+    /// staged through `bind_const_fp32` ⭐ IN THE `dl16tofp32` UPCAST'S STAGGERED ELEMENT
+    /// ARRANGEMENT ([`dl16_to_fp32_stagger_lane`]): the mul consumes the converted mask
+    /// lane-aligned, and the convert writes that mask staggered, so the ramp's value for
+    /// logical lane i sits at the physical lane the convert puts lane i at. The LOGICAL
+    /// values are the flat law (V at 0, 1 at V−1, 0 on the pads); only their physical
+    /// order is permuted, per 64-element window.
+    pub ramp: Vec<u8>,
+    /// The scalar-V splat, one fp32 stick — staged through `bind_const_fp32`.
+    pub v_stick: Vec<u8>,
+    /// The pad-lane form's bias, `[1, stick_pad(V)]` IEEE f16 LE (0 real / −65504 pad) —
+    /// `None` for a whole-stick vocab; staged through `bind_weight` (the f16→SEN convert).
+    pub bias: Option<Vec<u8>>,
+}
+
+/// ⭐⭐⭐⭐ THE `dl16tofp32` UPCAST'S STAGGERED ELEMENT ARRANGEMENT — the device fact the
+/// composite argmax's ramp const is staged in. The upcast convert does NOT write its
+/// fp32 result in standard stick order: each fp16 input stick (64 elements) spans a
+/// PAIR of fp32 output sticks, and within that 64-element window LOGICAL element
+/// `L = 8k + w` lands at PHYSICAL lane `4k + w` when `w < 4`, `4k + (w−4) + 32` when
+/// `w ≥ 4` — the within-stick reordering torch-spyre stamps as
+/// `ElementArrangement::DL16_TO_FP32` on every upcast result (its
+/// `stagger_to_standard_ea` op documents the pattern; its D2H `_copy_from` warns the
+/// buffer reads PERMUTED when a consumer ignores the EA).
+///
+/// Card-confirmed twice (#603 FACT 1): a 2b-fp16 step whose logits row's argmax was
+/// 723 (fp16-stick local 19) produced device idx 715 = 704 + D(19), and argmax 45600
+/// (local 32) produced 45584 = 45568 + D(32) — the device idx was NEVER the row
+/// argmax across 63/63 steps × 3 models, always off by a whole multiple of 4 lanes
+/// with the intra-4-lane position preserved, exactly this permutation.
+///
+/// The composite's mul reads the converted mask LANE-ALIGNED against the ramp const
+/// (both `[1, stick_pad(V)]` fp32 — it cannot know the mask's buffer is staggered), so
+/// the ramp is staged PRE-STAGGERED by the same law: the value for LOGICAL lane i sits
+/// at the PHYSICAL lane the convert puts lane i's value at, and the mul's per-lane
+/// product realigns. Every link past the mul is value-based (the max reduce is
+/// order-insensitive; `V − j` and the converts read values), so the chain's index is
+/// the true argmax with ZERO added ops.
+fn dl16_to_fp32_stagger_lane(l: usize) -> usize {
+    let (k, w) = (l / 8, l % 8);
+    if w < 4 {
+        4 * k + w
+    } else {
+        4 * k + (w - 4) + 32
+    }
 }
 
 impl BakeFacts {
@@ -211,6 +280,7 @@ impl BakeFacts {
         scalarmul_scales: &[],
         gathers_kv: false,
         subpage_bank_e: 0,
+        argmax_vocab: 0,
         router: (0, 0),
         router_k: 0,
         router_argsort: false,
@@ -254,6 +324,11 @@ impl BakeFacts {
                 })
                 .filter(|&e| e > 0)
                 .unwrap_or(0),
+            // The composite argmax's vocab — the layout's own registry (the `router_experts`
+            // law), NOT the ramp's placement size: the pad-lane form's ramp is placed at the
+            // stick-padded width, and a size-derived V would let the sentinel row pass as a
+            // real token. One question, one answer, at the site that minted both.
+            argmax_vocab: layout.argmax_vocab as usize,
             router,
             router_k,
             // The bare-argsort corner and the fused top-k's pad row, both asked of the
@@ -268,6 +343,87 @@ impl BakeFacts {
                 std::borrow::Cow::Owned(_) => &[],
             },
         }
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE COMPOSITE ARGMAX'S RESIDENT CONSTANTS AS DEVICE BYTES — the ramp and
+    /// the V stick that [`Self::argmax_vocab`] gates, plus the pad-lane form's fp16 bias.
+    /// `None` when the bundle placed no composite (vocab 0), so the session constructor's
+    /// bind is one `if let` with no second gate to drift from the first.
+    ///
+    /// THE RAMP is the descending `V − iota` row over the STICK-PADDED width
+    /// `[1, stick_pad(V)]` fp32 LE: lane `i` carries `max(V − i, 0)` — SIGNED arithmetic
+    /// clamped at zero, so the pad lanes (i ≥ V) carry 0 and the first maximal index's
+    /// product `mask · ramp` is strictly unique on the real lanes while a pad winner's
+    /// weight is 0 (the index-boundedness law: `idx = V − j ≤ V`, the sentinel row, never
+    /// past it). The clamp is VACUOUS on the real lanes (`V − i ≥ 1`), so a whole-stick
+    /// vocab's bytes are byte-identical to the landed form's. THE V STICK is the scalar V,
+    /// one fp32 stick with EVERY lane carrying V — splatted, not lane-0-only: the subtract
+    /// reads it through `out_broadcast` (a RedStick read), which resolves the value at LANE
+    /// 0 of the stick (the card-proven broadcast law in `route_argsort`'s doc), so lane 0 is
+    /// the only lane the arithmetic needs; the splat keeps the bytes correct under a
+    /// lane-WISE read too, so no future reader can turn "which lanes matter" into a defect.
+    ///
+    /// THE BIAS is the pad-lane form's third const — `Some` IFF the vocab is sub-stick:
+    /// `[1, stick_pad(V)]` fp16 LE, 0 on the real lanes and −65504 (fp16's lowest finite,
+    /// `manifest::argmax`'s own running-max init, the device's 0xFFFE) on the pad lanes, the
+    /// link-0 add's mb operand. It does NOT ride `bind_const_fp32` (fp32-verbatim only) —
+    /// the caller stages it through the WEIGHT channel's IEEE-f16→SEN convert, where both
+    /// of its values are exact.
+    ///
+    /// Host LE f32/f16 bytes ARE the device encodings for the fp32 consts (`Df::Fp32` is
+    /// IEEE_FP32), which is the whole reason `superdsc_exec::Executor::bind_const_fp32`
+    /// stages them verbatim. The stick width is the SAME constant the layout's
+    /// `place_const32` sized the placement from, so the bind is exactly as long as its own
+    /// placement.
+    ///
+    /// ⛔ STAGED AT LOAD, ONCE — the door records them as weights, so `refill_activations`
+    /// never re-uploads them and no per-step bind ever names them.
+    pub fn argmax_const_binds(&self) -> Option<ArgmaxConsts> {
+        let vocab = self.argmax_vocab;
+        if vocab == 0 {
+            return None;
+        }
+        // The stick-padded staging width — the same law the layout's placement sized the
+        // ramp at (a whole-stick vocab pads to itself, so its bytes are the landed form's).
+        let v_pad = vocab.next_multiple_of(64);
+        // SIGNED, clamped: the pad lanes carry 0, never a negative weight. ⭐ PRE-STAGGERED
+        // by the `dl16tofp32` upcast's element arrangement (`dl16_to_fp32_stagger_lane`):
+        // the convert writes the mask in that staggered order and the mul reads
+        // LANE-ALIGNED, so the ramp's value for LOGICAL lane i must sit at the PHYSICAL
+        // lane the convert puts lane i at — per 64-element window (one fp16 stick → one
+        // fp32 stick pair). A flat ramp here is the #603 FACT-1 defect: the device idx
+        // came back off by whole 4-lane groups (argmax 723 → idx 715, 45600 → 45584),
+        // never the row argmax.
+        let mut ramp = vec![0u8; v_pad * 4];
+        for base in (0..v_pad).step_by(64) {
+            for l in 0..64 {
+                let phys = base + dl16_to_fp32_stagger_lane(l);
+                let val = (vocab as i64 - (base + l) as i64).max(0) as f32;
+                ramp[phys * 4..phys * 4 + 4].copy_from_slice(&val.to_le_bytes());
+            }
+        }
+        // One fp32 stick — the same width the layout's `place_const32` sized the placement at.
+        use ktir_superdsc::superdsc_opspec::DataFormat;
+        let lanes = <ktir_superdsc::superdsc_opspec::Fp32 as DataFormat>::ELEMS_PER_STICK as usize;
+        let v_stick = (0..lanes)
+            .flat_map(|_| (vocab as f32).to_le_bytes())
+            .collect();
+        // The fp16 bias — the pad-lane form's own const. IEEE f16 LE bytes (0x0000 and
+        // 0xFBFF, `half`'s own round-trip — the same conversion the weight bind boundary
+        // uses), the weight channel's own input encoding.
+        let bias = (v_pad > vocab).then(|| {
+            (0..v_pad)
+                .flat_map(|i| {
+                    let v = if i < vocab { 0.0f32 } else { -65504.0 };
+                    half::f16::from_f32(v).to_le_bytes()
+                })
+                .collect()
+        });
+        Some(ArgmaxConsts {
+            ramp,
+            v_stick,
+            bias,
+        })
     }
 
     /// ⛔ REFUSE a decode bundle with no identity. Every model with attention references `ident`
@@ -1578,6 +1734,238 @@ mod constant_tape_tests {
         );
         // ⛔ Zero is not a launch: it is also the value this hardware reads as a maximum.
         assert!(StagedRows::of_launch(0).is_none());
+    }
+
+    /// ⭐⭐⭐ THE COMPOSITE ARGMAX'S CONST BYTES ARE A LAW, NOT A CONVENTION — the ramp's lane
+    /// values are the first-max arithmetic itself (`w = mask · max(V − iota, 0)` must make the
+    /// FIRST maximal index's weight unique and a pad winner's weight zero), and the V stick's
+    /// splat is what keeps the subtract's RedStick read correct under a lane-wise reader too.
+    /// A drift in any byte string is a wrong token with a clean bake, so the byte law is pinned
+    /// here where no card is needed — at BOTH forms: 300 is itself sub-stick (300 = 4·64 + 44,
+    /// the pad-lane form, granite-3.1's own shape class) and 256 is whole-stick (the landed
+    /// form's bytes, unchanged).
+    #[test]
+    fn argmax_const_binds_pin_the_ramp_and_the_splat() {
+        // No composite ⇒ no binds — the gate and the values answer ONE question.
+        assert!(
+            BakeFacts::NONE.argmax_const_binds().is_none(),
+            "vocab 0 (no composite) must bind nothing"
+        );
+
+        let lane = |b: &[u8], i: usize| f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+
+        // ── THE PAD-LANE FORM: vocab 300, staging width 320 (44 pad lanes) ──
+        let facts = BakeFacts {
+            argmax_vocab: 300,
+            ..BakeFacts::NONE
+        };
+        let ArgmaxConsts {
+            ramp,
+            v_stick,
+            bias,
+        } = facts
+            .argmax_const_binds()
+            .expect("a placed composite binds its consts");
+
+        // The ramp: `[1, 320]` fp32 LE in the UPCAST'S STAGGERED arrangement — read
+        // through the stagger (physical = base + D(local)), the LOGICAL values are the
+        // flat law itself: descending from V to exactly 1 on the real lanes (the last
+        // REAL lane is 1, not 0: a zero lane would let a tied maximum at the last index
+        // collide with an untied one at weight 0… and the mint computes the same
+        // string), ZERO on the 44 pad lanes — the clamp that keeps `idx = V − j ≤ V`,
+        // the sentinel row, never past it. The PHYSICAL order is the permutation the
+        // `dl16tofp32` convert writes the mask in — the mul reads lane-aligned, so THIS
+        // alignment is what makes the product the true weight.
+        assert_eq!(ramp.len(), 320 * 4, "one fp32 per STICK-PADDED lane");
+        let logical = |b: &[u8], i: usize| {
+            let phys = (i / 64) * 64 + dl16_to_fp32_stagger_lane(i % 64);
+            f32::from_le_bytes(b[phys * 4..phys * 4 + 4].try_into().unwrap())
+        };
+        assert_eq!(logical(&ramp, 0), 300.0, "logical lane 0 carries V");
+        assert_eq!(
+            logical(&ramp, 299),
+            1.0,
+            "the last REAL logical lane carries 1, never 0"
+        );
+        assert_eq!(logical(&ramp, 41), 259.0, "logical lane i carries V − i");
+        for i in 1..300 {
+            assert!(
+                logical(&ramp, i - 1) > logical(&ramp, i),
+                "descending on the reals (LOGICAL order — the physical order is the stagger)"
+            );
+        }
+        for i in 300..320 {
+            assert_eq!(logical(&ramp, i), 0.0, "pad lane {i} is CLAMPED to zero");
+        }
+        // The staging is a PER-64-WINDOW PERMUTATION of the flat bytes: D is a bijection
+        // on each window, so every physical lane is written exactly once — none left
+        // stale, none double-written.
+        let mut seen = [false; 64];
+        for l in 0..64 {
+            let p = dl16_to_fp32_stagger_lane(l);
+            assert!(!seen[p], "the stagger must be a bijection per window");
+            seen[p] = true;
+        }
+
+        // The V stick: one fp32 stick (32 lanes — the same width `place_const32` sized the
+        // placement at), EVERY lane carrying V, LE.
+        assert_eq!(v_stick.len(), 32 * 4, "exactly one fp32 stick");
+        for l in 0..32 {
+            assert_eq!(
+                lane(&v_stick, l),
+                300.0,
+                "lane {l} — the splat, not lane 0 alone"
+            );
+        }
+
+        // The BIAS: `[1, 320]` IEEE f16 LE — 0 on the real lanes, −65504 (fp16's lowest
+        // finite, the device's own running-max init) on the pad lanes. The add's mb operand
+        // reads it at Df::Fp16; both values are exact in f16, so `half`'s round-trip IS the
+        // law. A pad lane holding the worst garbage the buffer can carry (f16 max finite)
+        // biases to exactly 0 — at or below every real lane that could win anything.
+        let bias = bias.expect("a sub-stick vocab binds its bias");
+        assert_eq!(bias.len(), 320 * 2, "one f16 per STICK-PADDED lane");
+        let h16 =
+            |b: &[u8], i: usize| half::f16::from_le_bytes(b[i * 2..i * 2 + 2].try_into().unwrap());
+        for i in 0..300 {
+            assert_eq!(h16(&bias, i), half::f16::from_f32(0.0), "real lane {i}: 0");
+        }
+        for i in 300..320 {
+            assert_eq!(
+                h16(&bias, i),
+                half::f16::from_f32(-65504.0),
+                "pad lane {i}: the fp16 floor"
+            );
+        }
+
+        // ── THE WHOLE-STICK FORM: vocab 256, staging width 256 — byte-identical to the
+        // landed form's binds, and NO bias (the door registers AmBiased only in the
+        // pad-lane form; a whole-stick layout cannot drift into the third const).
+        let facts = BakeFacts {
+            argmax_vocab: 256,
+            ..BakeFacts::NONE
+        };
+        let ArgmaxConsts {
+            ramp,
+            v_stick,
+            bias,
+        } = facts
+            .argmax_const_binds()
+            .expect("a placed composite binds its consts");
+        assert_eq!(
+            ramp.len(),
+            256 * 4,
+            "the whole-stick ramp is the real vocab"
+        );
+        assert_eq!(lane(&ramp, 0), 256.0);
+        assert_eq!(
+            lane(&ramp, 255),
+            1.0,
+            "the last lane carries 1 — D fixes lanes 60–63, so the last REAL lane's \
+             value lands at the last PHYSICAL lane in this form"
+        );
+        for i in 1..256 {
+            assert!(
+                logical(&ramp, i - 1) > logical(&ramp, i),
+                "descending in LOGICAL order — the landed law, staggered staging"
+            );
+        }
+        assert_eq!(v_stick.len(), 32 * 4);
+        for l in 0..32 {
+            assert_eq!(lane(&v_stick, l), 256.0);
+        }
+        assert!(bias.is_none(), "a whole-stick vocab binds NO bias");
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE CARDLESS CHAIN REPLAY OVER THE RECORDED CARD FACTS (#603 FACT 1) —
+    /// the device idx was NEVER the row argmax: 63/63 steps × 3 models, always off by a
+    /// whole multiple of 4 lanes (2b fp16 histogram −16:21, −12:1, −8:11, −4:18, +4:1,
+    /// +12:2, +28:9 — never 0), with the two recorded pins argmax 723 → device 715 and
+    /// argmax 45600 → device 45584. This test models the chain EXACTLY as the device
+    /// runs it — the eq's {0,1} mask, the `dl16tofp32` convert's STAGGERED physical
+    /// placement (each fp16 stick's logical element L at physical lane D(L) of its
+    /// 64-element window), the mul's LANE-ALIGNED product against the staged ramp
+    /// bytes, the order-insensitive max, and `V − j` — and asserts both halves:
+    ///   • CALIBRATION: with a FLAT ramp (the pre-fix bind), the model reproduces the
+    ///     two recorded card pins EXACTLY (723 → 715, 45600 → 45584) — the model IS the
+    ///     device's arithmetic, not a plausible one;
+    ///   • THE FIX: with the staged (pre-staggered) ramp, the chain's index equals the
+    ///     host argmax for EVERY peak position — all 64 lanes of a window, the window
+    ///     boundaries, the first/last real lanes, and both forms' geometries.
+    #[test]
+    fn the_argmax_chain_replay_reproduces_the_card_and_the_fix() {
+        // The chain model over one fp16 logits row with a UNIQUE peak (values exact in
+        // fp16, so the host f32 `==` IS the device's fp16 eq): links 1–6, returning the
+        // device idx. The peak's uniqueness makes the mask single-hot, which is the only
+        // property of the row the chain's arithmetic can see (ties are the eq's own law,
+        // pinned elsewhere).
+        let chain_idx = |ramp: &[u8], vocab: usize, peak: usize| -> u32 {
+            let v_pad = vocab.next_multiple_of(64);
+            assert_eq!(ramp.len(), v_pad * 4);
+            let mut j = 0f32;
+            for i in 0..v_pad {
+                let hot = f32::from((i == peak) as u8);
+                let phys = (i / 64) * 64 + dl16_to_fp32_stagger_lane(i % 64);
+                let r = f32::from_le_bytes(ramp[phys * 4..phys * 4 + 4].try_into().unwrap());
+                j = j.max(hot * r);
+            }
+            (vocab as f32 - j) as u32
+        };
+        // The pre-fix FLAT ramp — the bind that produced the recorded card pins.
+        let flat_ramp = |vocab: usize| -> Vec<u8> {
+            let v_pad = vocab.next_multiple_of(64);
+            (0..v_pad)
+                .flat_map(|i| ((vocab as i64 - i as i64).max(0) as f32).to_le_bytes())
+                .collect()
+        };
+        // The 2b-fp16 cell's own geometry (granite-3.1-2b: vocab 49155, the PAD-LANE
+        // form — the cell the FACT-1 pins were recorded on).
+        const VOCAB: usize = 49_155;
+
+        // ── CALIBRATION: the flat ramp reproduces the card's wrong idx, exactly ──
+        assert_eq!(
+            chain_idx(&flat_ramp(VOCAB), VOCAB, 723),
+            715,
+            "the recorded FACT-1 pin: argmax 723 came back as device idx 715"
+        );
+        assert_eq!(
+            chain_idx(&flat_ramp(VOCAB), VOCAB, 45_600),
+            45_584,
+            "the recorded FACT-1 pin: argmax 45600 came back as device idx 45584"
+        );
+
+        // ── THE FIX: the staged ramp returns the argmax itself ──
+        let ArgmaxConsts { ramp, .. } = BakeFacts {
+            argmax_vocab: VOCAB,
+            ..BakeFacts::NONE
+        }
+        .argmax_const_binds()
+        .expect("a placed composite binds its consts");
+        // Every lane of one middle window, the window boundaries around it, the first
+        // and last real lanes, and the lanes beside a stick boundary elsewhere.
+        let mut peaks: Vec<usize> = (4_160..4_224).collect();
+        peaks.extend([4_159, 4_224, 0, VOCAB - 1, 64, 65, 12_287, 12_288]);
+        for &p in &peaks {
+            assert_eq!(
+                chain_idx(&ramp, VOCAB, p),
+                p as u32,
+                "peak {p}: the chain's index must BE the host argmax at every lane"
+            );
+        }
+        // And the whole-stick form (granite-3.3's 49152): the same law, no pads.
+        let ArgmaxConsts { ramp, .. } = BakeFacts {
+            argmax_vocab: 49_152,
+            ..BakeFacts::NONE
+        }
+        .argmax_const_binds()
+        .expect("a placed composite binds its consts");
+        for &p in &[0usize, 1, 63, 64, 65, 723, 45_600, 49_151] {
+            assert_eq!(
+                chain_idx(&ramp, 49_152, p),
+                p as u32,
+                "peak {p}: the whole-stick form's chain index must BE the argmax"
+            );
+        }
     }
 
     use scratchy_subtile::host_tape::{HostTape, KernelId, Launcher, TensorId, play};

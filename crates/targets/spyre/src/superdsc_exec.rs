@@ -804,6 +804,19 @@ pub struct Executor {
     kernel_weights: BTreeMap<bundle::PlaceId, &'static KernelWeight<'static>>,
     /// The role-`Logits` tensor — read back each step.
     logits_id: bundle::PlaceId,
+    /// ⭐⭐⭐⭐⭐ THE COMPOSITE ARGMAX'S IDX STICK (#603 PR3a) — WHERE the device-side
+    /// argmax's answer lands and the vocab it is indexed against, resolved at load the
+    /// same way [`Self::logits_id`] is: asked of the layout's own places. The mint's
+    /// chain ends in a `[rows, 64]` SenUint32 synthetic keyed off the ROW tid
+    /// (`SynthRole::AmIdxU32` — never host-bindable, only ever device-written), and the
+    /// greedy token step ([`Executor::predict_token`]) reads its row-0 word back as one
+    /// 256 B D2H instead of the ~100 KB logits row + host argmax it replaces.
+    ///
+    /// `None` for every bundle that minted no composite — untied models, prefill bundles,
+    /// batched rungs — and the token step REFUSES on `None` (loudly, never a logits
+    /// fallback: the serving side gates on `BakeFacts::argmax_vocab` before calling, so a
+    /// miss here is a wiring bug, not a sampling decision).
+    am_idx: Option<AmIdxReadback>,
     /// Ids `0..num_sources` are CALLER-FILLED every forward, EXCEPT the device-resident ones in
     /// [`Self::resident_sources`]. Set by [`Executor::declare_sources`]; `None` means nothing has
     /// told this executor how many, and the pre-launch completeness check cannot run.
@@ -903,6 +916,14 @@ pub struct Executor {
     /// Disjoint from `bound` by construction: every bind door removes its id from the other map, so
     /// one id has one source of bytes.
     staged: BTreeMap<bundle::PlaceId, u64>,
+    /// ⭐⭐⭐⭐⭐ IDS BOUND THROUGH [`Executor::bind_const_fp32`] — fp32 constants whose LE host
+    /// bytes ARE the device encoding (`Df::Fp32` is IEEE_FP32), so staging copies them VERBATIM:
+    /// no IEEE→SEN re-encode, no tile walk. The composite argmax's descending ramp and scalar-V
+    /// stick (#603 PR3a), and nothing else today.
+    ///
+    /// A set for the same reason [`Self::raw_ids`] is one: the staging loop consults it, and a
+    /// flag remembered by the bind call alone is a flag the loop can forget.
+    const_fp32_ids: BTreeSet<bundle::PlaceId>,
 
     // ── KV / fold ──
     kv: KvGeometry,
@@ -984,6 +1005,39 @@ pub struct RawBind {
     bytes: Vec<u8>,
 }
 
+/// ⭐ THE COMPOSITE ARGMAX'S READBACK TARGET (#603 PR3a) — the idx stick's placement id
+/// and the vocab the sentinel is measured against.
+///
+/// The vocab is [`crate::wiring::BakeFacts::argmax_vocab`] — the chain's own V, read off
+/// the layout's `argmax_vocab` registry at load (the `router_experts` law: the pad-lane
+/// form's ramp is placed at the stick-padded width, so the placement's size is NOT V) —
+/// and not the model-wide `Vocab` the caller hands `Executor::load`: the sentinel's
+/// meaning ("idx ≥ V ⇒ every lane was NaN") is a fact of the chain's own arithmetic
+/// (`w = (logits == m) · max(V − iota, 0)`; all-NaN ⇒ mask all-zero ⇒ `w` all-zero ⇒
+/// idx = V), so V is whatever the chain was minted at. The two spellings agree for every
+/// model that mints (the lm-head's N is the config vocab), but the chain's own number is
+/// the one the check can never drift from.
+struct AmIdxReadback {
+    /// The `[1, 64]` SenUint32 synthetic's placement id (`SynthRole::AmIdxU32`).
+    id: bundle::PlaceId,
+    /// The chain's own V — the sentinel's threshold.
+    vocab: usize,
+}
+
+/// The timers and H2D accounting of a step's FORWARD HALF — everything upstream of the
+/// readback that [`Executor::predict`] (logits D2H) and [`Executor::predict_token`] (the
+/// composite's idx stick D2H) share, held in one struct so the two tails print from the
+/// SAME numbers and cannot drift on anything the step did before its readback.
+struct ForwardHalf {
+    t_stream0: Instant,
+    t0: Instant,
+    t0b: Instant,
+    t1: Instant,
+    t2: Instant,
+    h2d_note: String,
+    h2d_bytes: u64,
+}
+
 impl Executor {
     // ──────────────────────────────────────────────────────────────────────────────────────────
     //  Create
@@ -1030,6 +1084,35 @@ impl Executor {
             .logits()
             .ok_or_else(|| anyhow!("bundle {} places no Logits tensor", code.fp))?
             .id;
+        // ⭐ THE COMPOSITE'S IDX STICK, resolved the same way `logits_id` is: ONE scan of
+        // the layout's own places for the AmIdxU32 synthetic, and the vocab asked of
+        // `BakeFacts` (the ramp's own placement — see `AmIdxReadback` for why not
+        // `vocab`). The two must AGREE on presence: a bundle that placed the stick but
+        // not the ramp (or vice versa) is a mint that wrote half of itself, and the
+        // `else` arm refuses rather than guessing which half is real.
+        let am_idx = match code.layout.places.iter().find(|p| {
+            matches!(
+                p.id,
+                bundle::PlaceId::Synth {
+                    role: bundle::SynthRole::AmIdxU32,
+                    ..
+                }
+            )
+        }) {
+            Some(p) => {
+                let vocab = crate::wiring::BakeFacts::of(&code.layout).argmax_vocab;
+                if vocab == 0 {
+                    bail!(
+                        "bundle {} places the composite's idx stick but no ramp — a mint \
+                         that wrote half of itself; refusing rather than serve a token off \
+                         an unsized sentinel",
+                        code.fp
+                    );
+                }
+                Some(AmIdxReadback { id: p.id, vocab })
+            }
+            None => None,
+        };
         let kernel_weights = code
             .layout
             .kernel_weights
@@ -1046,6 +1129,7 @@ impl Executor {
             segment_bytes: code.layout.segment_bytes,
             kernel_weights,
             logits_id,
+            am_idx,
             num_sources: None,
             resident_sources: std::collections::BTreeSet::new(),
             rolled: None,
@@ -1078,6 +1162,7 @@ impl Executor {
             raw_ids: BTreeSet::new(),
             keyed: BTreeMap::new(),
             staged: BTreeMap::new(),
+            const_fp32_ids: BTreeSet::new(),
             kv: KvGeometry::default(),
             fold: SessionKv::default(),
             block_table_set: false,
@@ -1725,6 +1810,58 @@ impl Executor {
         self.bound.insert(b.id, b.bytes);
     }
 
+    /// ⭐⭐⭐⭐⭐ Bind a RESIDENT FP32 CONSTANT at load — staged VERBATIM, once, never re-bound.
+    /// The composite argmax's descending ramp and scalar-V stick (#603 PR3a), and nothing else
+    /// today.
+    ///
+    /// ⛔ THIS IS NOT [`Self::bind_input_raw`], AND NOT A LAZIER [`Self::bind_weight`]. The raw
+    /// channel is PER-STEP (a raw id bound before prepare is exactly the raw+weight combination
+    /// the staging loop refuses); the weight channel re-encodes every byte through
+    /// `ieee_to_sen_bytes`, which reads a 4-byte fp32 as two fp16s and rewrites both mantissas.
+    /// A const bound here is a WEIGHT — resident, skipped by every per-step refill — whose bytes
+    /// need no conversion at all, because `Df::Fp32` IS IEEE fp32 and the host's LE bytes are
+    /// the device's own.
+    ///
+    /// Validated the way [`Self::place_raw`] validates its one product: a whole number of f32
+    /// entries, and no longer than the const's own placement (`>` not `!=` — the over-bind law;
+    /// a short bind leaves the placement's tail zero, which is a valid constant image).
+    pub fn bind_const_fp32(&mut self, id: bundle::PlaceId, bytes: Vec<u8>) -> Result<()> {
+        if self.prepared {
+            bail!(
+                "bind_const_fp32({id}): session ALREADY PREPARED — a resident constant must be \
+                 bound before prepare, where staging copies it into the shadow the H2D ships \
+                 once at load"
+            );
+        }
+        let Some(p) = self.places.get(&id) else {
+            bail!(
+                "bind_const_fp32({id}): NO placement in this bundle — the layout did not place \
+                 this const, so the caller's bind and the bundle's layout disagree about the \
+                 composite argmax. REFUSING"
+            );
+        };
+        if !bytes.len().is_multiple_of(4) {
+            bail!(
+                "bind_const_fp32({id}): {} B is not a whole number of fp32 entries",
+                bytes.len()
+            );
+        }
+        if bytes.len() as u64 > p.size {
+            bail!(
+                "bind_const_fp32({id}): {} B exceeds its own {} B placement (seg{} off {}) — \
+                 REFUSING, this would corrupt the following tensors",
+                bytes.len(),
+                p.size,
+                p.segment,
+                p.offset
+            );
+        }
+        self.weight_ids.insert(id);
+        self.const_fp32_ids.insert(id);
+        self.bound.insert(id, bytes);
+        Ok(())
+    }
+
     /// Declare, BEFORE prepare, that `seg` will be BORROWED from another session via
     /// [`Executor::alias_seg_from`]: prepare gives it a 128 B placeholder, skips its host staging
     /// and skips its H2D, so the session never builds the copy the alias immediately discards.
@@ -1856,6 +1993,20 @@ impl Executor {
         }
 
         // ── Collect the weight placements, validating each against its own extent. ──
+        // One bound tensor's staging transform — what the parallel stage loop does to its bytes.
+        // ⭐ VERBATIM IS A THIRD THING, NOT THE ABSENCE OF THE SECOND: this used to be
+        // `Option<(&KernelWeight, Element)>`, where `None` meant "convert", so an fp32 const
+        // had no honest spelling — its bytes are neither retiled nor IEEE-fp16-to-SEN
+        // re-encoded, they are already the device's own (`Df::Fp32` = IEEE_FP32).
+        #[derive(Clone, Copy)]
+        enum StageMode<'a> {
+            /// IEEE f16 → SEN169 f16 — the default for every magnitude the card holds in fp16.
+            Convert,
+            /// Retile into the device tile layout this matmul kernel reads.
+            Retile(&'a KernelWeight<'a>, Element),
+            /// Copy VERBATIM — a resident fp32 constant ([`Executor::bind_const_fp32`]).
+            Verbatim,
+        }
         struct Item<'a> {
             /// The SHADOW SLOT this weight stages into — a segment, or a weight bank beyond bank 0.
             /// See [`Executor::slot_of`]: banking gives one segment several regions, so the segment
@@ -1863,7 +2014,7 @@ impl Executor {
             slot: usize,
             offset: usize,
             src: &'a [u8],
-            walk: Option<(&'a KernelWeight<'a>, Element)>,
+            mode: StageMode<'a>,
         }
         let mut items: Vec<Item<'_>> = Vec::new();
         for (nm, src) in &self.bound {
@@ -1926,32 +2077,40 @@ impl Executor {
                     self.shadow(slot).len()
                 );
             }
-            let walk = match self.kernel_weights.get(nm) {
-                Some(k) => {
-                    let dev_elems: u64 = k.device_size.iter().product();
-                    if dev_elems as usize * k.word_length as usize != src.len() {
-                        bail!(
-                            "stage: kernel weight '{nm}' host size {} B != \
-                             prod(device_size)*word_length ({} B) — manifest/shape mismatch",
-                            src.len(),
-                            dev_elems as usize * k.word_length as usize
-                        );
+            let mode = if self.const_fp32_ids.contains(nm) {
+                // A resident fp32 const — its LE bytes are the device encoding, so nothing
+                // here may touch them. Checked FIRST so the kernel-weight lookup below can
+                // never hand a const a tile walk (it has no KernelWeight, but the ordering
+                // makes that a structural fact rather than a happy one).
+                StageMode::Verbatim
+            } else {
+                match self.kernel_weights.get(nm) {
+                    Some(&k) => {
+                        let dev_elems: u64 = k.device_size.iter().product();
+                        if dev_elems as usize * k.word_length as usize != src.len() {
+                            bail!(
+                                "stage: kernel weight '{nm}' host size {} B != \
+                                 prod(device_size)*word_length ({} B) — manifest/shape mismatch",
+                                src.len(),
+                                dev_elems as usize * k.word_length as usize
+                            );
+                        }
+                        let Some(elem) = Element::from_word_length(k.word_length) else {
+                            bail!(
+                                "stage: kernel weight '{nm}' word_length {} has no tile walk",
+                                k.word_length
+                            );
+                        };
+                        StageMode::Retile(k, elem)
                     }
-                    let Some(elem) = Element::from_word_length(k.word_length) else {
-                        bail!(
-                            "stage: kernel weight '{nm}' word_length {} has no tile walk",
-                            k.word_length
-                        );
-                    };
-                    Some((*k, elem))
+                    None => StageMode::Convert,
                 }
-                None => None,
             };
             items.push(Item {
                 slot,
                 offset: p.offset as usize,
                 src,
-                walk,
+                mode,
             });
         }
 
@@ -1959,13 +2118,9 @@ impl Executor {
         //    is what makes the parallel stage safe with no unsafe at all — and it PROVES the
         //    placements are disjoint (an overlap shows up as a backwards cursor, which is a
         //    refusal, where the C++ would simply have raced).
-        /// One weight's staging work: its source bytes, its OWN destination sub-slice, and the
-        /// tile walk (None = a plain IEEE→SEN convert).
-        type StageTask<'a> = (
-            &'a [u8],
-            &'a mut [u8],
-            Option<(&'a KernelWeight<'a>, Element)>,
-        );
+        /// One weight's staging work: its source bytes, its OWN destination sub-slice, and its
+        /// staging transform ([`StageMode`]).
+        type StageTask<'a> = (&'a [u8], &'a mut [u8], StageMode<'a>);
         let n_items = items.len();
         items.sort_by_key(|i| (i.slot, i.offset));
         let mut tasks: Vec<StageTask<'_>> = Vec::with_capacity(n_items);
@@ -1996,7 +2151,7 @@ impl Executor {
                 let (dst, r2) = r.split_at_mut(it.src.len());
                 rests[it.slot] = r2;
                 cursor[it.slot] = it.offset + it.src.len();
-                tasks.push((it.src, dst, it.walk));
+                tasks.push((it.src, dst, it.mode));
             }
         }
 
@@ -2015,9 +2170,9 @@ impl Executor {
         std::thread::scope(|scope| {
             for bucket in buckets {
                 scope.spawn(move || {
-                    for (src, dst, walk) in bucket {
-                        match walk {
-                            Some((k, elem)) => stage_weight_tiled(
+                    for (src, dst, mode) in bucket {
+                        match mode {
+                            StageMode::Retile(k, elem) => stage_weight_tiled(
                                 src,
                                 dst,
                                 RetileWalk {
@@ -2026,7 +2181,8 @@ impl Executor {
                                 },
                                 elem,
                             ),
-                            None => sen_convert::ieee_to_sen_bytes(src, dst),
+                            StageMode::Convert => sen_convert::ieee_to_sen_bytes(src, dst),
+                            StageMode::Verbatim => dst.copy_from_slice(src),
                         }
                     }
                 });
@@ -3946,6 +4102,39 @@ impl Executor {
                 );
             }
         }
+        // The inter-step device-idle gap's raw material, one line EVERY forward (the raw
+        // per-CB probe above stops at three): each class's device-clock window. The
+        // post-processor differences fwd N's `last` into fwd N+1's `first` — wrap-exact at
+        // any real step gap, the counter is free-running u32 — and decomposes the window by
+        // class: last compute end → D2H span → host tail → H2D span → first compute start.
+        // Classes mirror the routing above: crossings by direction on whichever pipeline
+        // carried them, non-crossing async/fill CBs as `other`, op CBs as `compute`.
+        {
+            use flex_rs::dma::DmaDirection;
+            use flex_rs::scheduler::PipelineId;
+            let compute = rb_class_window(&entries, |e| {
+                matches!(e.pipeline, PipelineId::Compute) && e.dma.is_none()
+            });
+            let h2d = rb_class_window(&entries, |e| e.dma == Some(DmaDirection::HostToDevice));
+            let d2h = rb_class_window(&entries, |e| e.dma == Some(DmaDirection::DeviceToHost));
+            let other = rb_class_window(&entries, |e| {
+                e.dma.is_none() && !matches!(e.pipeline, PipelineId::Compute)
+            });
+            let all = rb_class_window(&entries, |_| true);
+            let fmt = |w: &Option<RbClassWindow>| match w {
+                Some(w) => format!("[{},{},{}]", w.first, w.last, w.n),
+                None => "-".to_string(),
+            };
+            eprintln!(
+                "[sdsc-rbgap] fwd {} all{} compute{} h2d{} d2h{} other{}",
+                t.rb_steps,
+                fmt(&all),
+                fmt(&compute),
+                fmt(&h2d),
+                fmt(&d2h),
+                fmt(&other)
+            );
+        }
         // The op entries: compute CBs that are not DMA crossings. A crossing kept here would
         // both break the 1:1 zip below and bill the preamble/readback to whichever op it
         // happened to sort next to.
@@ -4004,22 +4193,15 @@ impl Executor {
         }
     }
 
-    /// Run ONE forward over `n_new` NEW positions appended at `[seq_pos..seq_pos+n_new)`: refill
-    /// the bound activations, launch prefix → body×iters → suffix, and copy the logits row back.
-    /// `out_logits` is `None` for a chunk whose logits nobody reads (every prefill chunk but the
-    /// last), which skips the read-back entirely.
-    pub fn predict(
-        &mut self,
-        n_new: NewTokens,
-        seq_pos: SeqPos,
-        out_logits: Option<&mut [u8]>,
-    ) -> Result<()> {
+    /// The shared FORWARD HALF of a step: the prepared/source gates, the RB window reset, the
+    /// activation refill, and the replay-or-launch decision — extracted from `predict` when
+    /// `predict_token` (#603 PR3a) needed the same body, so the refill law, the replay gate and
+    /// the launch are ONE behavior the two readbacks ride, never two copies.
+    fn forward_half(&mut self, n_new: NewTokens, seq_pos: SeqPos, d: &Diag) -> Result<ForwardHalf> {
         if !self.prepared {
             bail!("predict before prepare");
         }
         self.require_sources_filled()?;
-        let d = Diag::get();
-        let n_new = NewTokens(n_new.0.max(1));
 
         // RB timing: start the forward's window empty. The previous forward drained its own
         // entries at its synchronize; what is left in the ring now is pre-forward history
@@ -4061,6 +4243,104 @@ impl Executor {
             let _ = self.stream_ref()?.synchronize();
         }
         let t2 = Instant::now();
+        Ok(ForwardHalf {
+            t_stream0,
+            t0,
+            t0b,
+            t1,
+            t2,
+            h2d_note,
+            h2d_bytes,
+        })
+    }
+
+    /// The `[sdsc-phase]` block both readback tails print — one renderer, parameterized only by
+    /// WHICH readback ran (`"logits"` / `"idx"`), so the token step's line set cannot drift from
+    /// the logits step's. The rbgap and phase harnesses grep these lines.
+    fn print_step_phase(
+        half: &ForwardHalf,
+        d2h_name: &str,
+        d2h_seg: i64,
+        d2h_bytes: u64,
+        t2b: Instant,
+        t3: Instant,
+        n_new: i64,
+    ) {
+        let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
+        let ForwardHalf {
+            t_stream0,
+            t0,
+            t0b,
+            t1,
+            t2,
+            h2d_note,
+            h2d_bytes,
+        } = half;
+        eprintln!(
+            "[sdsc-phase] stream_recreate={:.2}  preamble_h2d={:.2}  compute={:.2}  \
+             {d2h_name}_d2h={:.2}  predict_total={:.2} ms  (n_new={})\n\
+             [sdsc-phase]   h2d: {}KB over{} | enqueue={:.2} sync={:.2}\n\
+             [sdsc-phase]   d2h: seg{} {}KB | enqueue={:.2} sync={:.2}",
+            ms(*t_stream0, *t0),
+            ms(*t0, *t1),
+            ms(*t1, *t2),
+            ms(*t2, t3),
+            ms(*t_stream0, t3),
+            n_new,
+            h2d_bytes >> 10,
+            if h2d_note.is_empty() {
+                " (nothing)".to_string()
+            } else {
+                h2d_note.clone()
+            },
+            ms(*t0, *t0b),
+            ms(*t0b, *t1),
+            d2h_seg,
+            d2h_bytes >> 10,
+            ms(*t2, t2b),
+            ms(t2b, t3),
+        );
+    }
+
+    /// The shared post-readback tail: RB attribution and the one-shot flex-leak probe — the
+    /// two things every step does after its synchronize, extracted with `forward_half` so the
+    /// token step keeps them by construction rather than by copy.
+    fn step_epilogue(&mut self, d: &Diag) {
+        if d.rb_time {
+            self.rb_attribute();
+        }
+
+        // FLEX-LEAK PROBE (one-shot): after the N-th forward, tear the stream + the whole runtime
+        // down. This BREAKS the session (no re-prepare) — measure, then stop the serve.
+        if let Some(n) = d.reset_probe {
+            let mut t = timers();
+            t.forwards += 1;
+            if t.forwards == n {
+                let before = vmrss_kb();
+                self.stream = None;
+                let _ = crate::runtime::runtime_reset();
+                let after = vmrss_kb();
+                eprintln!(
+                    "[sdsc-leak-probe] fwd={n} VmRSS {before} -> {after} kB (freed {} kB)",
+                    before - after
+                );
+            }
+        }
+    }
+
+    /// Run ONE forward over `n_new` NEW positions appended at `[seq_pos..seq_pos+n_new)`: refill
+    /// the bound activations, launch prefix → body×iters → suffix, and copy the logits row back.
+    /// `out_logits` is `None` for a chunk whose logits nobody reads (every prefill chunk but the
+    /// last), which skips the read-back entirely.
+    pub fn predict(
+        &mut self,
+        n_new: NewTokens,
+        seq_pos: SeqPos,
+        out_logits: Option<&mut [u8]>,
+    ) -> Result<()> {
+        let d = Diag::get();
+        let n_new = NewTokens(n_new.0.max(1));
+        let half = self.forward_half(n_new, seq_pos, d)?;
 
         // ── D2H the logits' segment, sen→IEEE the logits slice at its baked offset. ──
         // Skipped entirely when the caller wants no logits: only the LAST prefill chunk asks for
@@ -4143,38 +4423,11 @@ impl Executor {
             .synchronize()
             .map_err(|e| anyhow!("predict: sync: {e}"))?;
 
-        if d.rb_time {
-            self.rb_attribute();
-        }
-
         if d.phase_time {
             let t3 = Instant::now();
+            Self::print_step_phase(&half, "logits", d2h_seg, d2h_bytes, t2b, t3, n_new.0);
             let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
-            eprintln!(
-                "[sdsc-phase] stream_recreate={:.2}  preamble_h2d={:.2}  compute={:.2}  \
-                 logits_d2h={:.2}  predict_total={:.2} ms  (n_new={})\n\
-                 [sdsc-phase]   h2d: {}KB over{} | enqueue={:.2} sync={:.2}\n\
-                 [sdsc-phase]   d2h: seg{} {}KB | enqueue={:.2} sync={:.2}",
-                ms(t_stream0, t0),
-                ms(t0, t1),
-                ms(t1, t2),
-                ms(t2, t3),
-                ms(t_stream0, t3),
-                n_new.0,
-                h2d_bytes >> 10,
-                if h2d_note.is_empty() {
-                    " (nothing)".to_string()
-                } else {
-                    h2d_note
-                },
-                ms(t0, t0b),
-                ms(t0b, t1),
-                d2h_seg,
-                d2h_bytes >> 10,
-                ms(t2, t2b),
-                ms(t2b, t3),
-            );
-            report_phase_timers(ms(t1, t2));
+            report_phase_timers(ms(half.t1, half.t2));
         }
 
         if let Some(out) = out_logits {
@@ -4184,23 +4437,130 @@ impl Executor {
             sen_convert::sen_to_ieee_bytes(&src[..elems * 2], &mut out[..elems * 2]);
         }
 
-        // FLEX-LEAK PROBE (one-shot): after the N-th forward, tear the stream + the whole runtime
-        // down. This BREAKS the session (no re-prepare) — measure, then stop the serve.
-        if let Some(n) = d.reset_probe {
-            let mut t = timers();
-            t.forwards += 1;
-            if t.forwards == n {
-                let before = vmrss_kb();
-                self.stream = None;
-                let _ = crate::runtime::runtime_reset();
-                let after = vmrss_kb();
-                eprintln!(
-                    "[sdsc-leak-probe] fwd={n} VmRSS {before} -> {after} kB (freed {} kB)",
-                    before - after
-                );
-            }
-        }
+        self.step_epilogue(d);
         Ok(())
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE FLIPPED STEP (#603 PR3a) — `predict`'s forward with the readback turned
+    /// around: the bundle minted the composite argmax, so the suffix ends at the gather's
+    /// row and the token is already a device-side integer. The host's whole per-token serial
+    /// tail — the ~100 KB logits D2H, the sen→IEEE convert, the host argmax — collapses to
+    /// ONE 256 B D2H of the `[1, 64]` SenUint32 idx stick and a little-endian word read.
+    ///
+    /// ⛔ ONE D2H PER STEP, BY DESIGN. A readback call is not free — the enqueue alone is
+    /// ~0.45 ms p50, FLAT across models (measured on the hoststeps cells, 10-18; the
+    /// earlier model-scaled reading was first-decode-step samples plus a ~1.4% TS-counter
+    /// rate error, since corrected) — so a second per-step readback (e.g. refreshing the
+    /// row's host shadow to keep the gather's write resident) would cost ~half a
+    /// millisecond to save a ~4 KB row H2D that rides the preamble's merged runs anyway.
+    /// The row stays HOST-STAGED instead: the next step's bind re-uploads
+    /// `embed_tokens[idx]`, byte-identical to what the gather wrote (the tied table's own
+    /// row through the same f32→f16→sen pipeline — granite's tie carries no scale, which
+    /// the mint gate's arity-2-Dense conjunct is the proof of), so the gather's row write
+    /// is redundant, not load-bearing, and no shadow state needs to be true.
+    ///
+    /// ⛔ THE SYNC STAYS IN-STEP. The trailing-drain shape (return a resolver, let the
+    /// engine drain on its own clock) buys nothing while `engine_core` resolves
+    /// `ModelRunnerOutput` immediately after `execute_model` — that half is PR3b's.
+    ///
+    /// The sentinel: the chain's arithmetic answers `V` exactly when every logit lane was
+    /// NaN (all-NaN ⇒ the equality mask is all-zero ⇒ `w` all-zero ⇒ idx = V), and the
+    /// table's row `V` is the RESERVED ZERO ROW — so the device never reads out of bounds,
+    /// and the HOST refuses the token LOUDLY rather than feed a NaN-born index to the
+    /// detokenizer. The host's own argmax over the same row would have answered token 0
+    /// (its running max never sees a strict `>`); that divergence is recorded as a
+    /// follow-up, not reconciled here.
+    pub fn predict_token(&mut self, n_new: NewTokens, seq_pos: SeqPos) -> Result<u32> {
+        let d = Diag::get();
+        let n_new = NewTokens(n_new.0.max(1));
+        let half = self.forward_half(n_new, seq_pos, d)?;
+
+        // ── D2H the idx stick — the logits read's own window discipline (placement, not
+        // segment; align128 length; window-or-whole-region fallback), because the same
+        // guards make it safe: `audit_layout_addresses` pins the offset 128-aligned and
+        // the length inside the region, and `Flits::from_bytes` truncation is why the
+        // length rounds UP. 256 B for the one-request rung's [1, 64] stick.
+        let am = self.am_idx.as_ref().ok_or_else(|| {
+            anyhow!(
+                "predict_token: this bundle minted no composite argmax — the caller gates on \
+                 BakeFacts::argmax_vocab before the token step, so reaching this refusal is a \
+                 wiring bug, never a sampling decision"
+            )
+        })?;
+        let lp = self
+            .places
+            .get(&am.id)
+            .cloned()
+            .ok_or_else(|| anyhow!("the composite's idx stick {} has no placement", am.id))?;
+        // ⛔ THE ONE-REQUEST RUNG'S OWN SHAPE — `[1, 64]` SenUint32, 256 B. The mint is
+        // gated on the ONE-REQUEST tail (the lm-head folded to m=1), so a wider stick here
+        // is a bundle this step was never meant to serve; word 0 of row 0 is the only lane
+        // the flipped path has a meaning for, and refusing beats guessing which row is
+        // ours.
+        if lp.size != 256 {
+            bail!(
+                "predict_token: the idx stick is {} B, not the one-request rung's [1, 64] \
+                 256 B — this bundle's composite was minted at more than one row, and the \
+                 token step serves exactly the one-request shape",
+                lp.size
+            );
+        }
+        let seg = SegIdx::checked(lp.segment as i64)
+            .ok_or_else(|| anyhow!("the idx stick's segment {} is out of range", lp.segment))?;
+        let addr = self.seg_addr[seg.get()]
+            .as_ref()
+            .ok_or_else(|| anyhow!("the idx stick's seg{} has no region", lp.segment))?;
+        let tot = addr.total_size().as_u64();
+        let lo = lp.offset;
+        let len = crate::lower_subtile_tape_to_superdsc::align128(lp.size).min(tot - lo);
+        let win = (len < tot)
+            .then(|| addr.window(ByteOffset(lo), ByteSize(len)))
+            .flatten();
+        let (src, a, b) = match win.as_ref() {
+            Some(w) => (w, lo, lo + len),
+            None => (addr, 0, tot),
+        };
+        let d2h_bytes = b - a;
+        let host = &mut self.seg_host[seg.get()][a as usize..b as usize];
+        // ON THE COMPUTE PIPELINE, for the same reason the logits read rides it (#544):
+        // the readback is the step's LAST op, FIFO-behind the step's compute CBs, and its
+        // barrier drains the (empty) DMA deques instead of host-blocking on compute.
+        self.stream
+            .as_ref()
+            .unwrap()
+            .d2h_on_compute(host, src)
+            .map_err(|e| anyhow!("idx D2H: {e}"))?;
+        let t2b = Instant::now();
+        self.stream_ref()?
+            .synchronize()
+            .map_err(|e| anyhow!("predict_token: sync: {e}"))?;
+
+        if d.phase_time {
+            let t3 = Instant::now();
+            Self::print_step_phase(&half, "idx", lp.segment as i64, d2h_bytes, t2b, t3, n_new.0);
+            let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
+            report_phase_timers(ms(half.t1, half.t2));
+        }
+
+        // ⭐ THE TOKEN — word 0 of the stick, LE. SenUint32 is the raw-copy format on both
+        // directions of the DMA door (the block table binds through it verbatim), so the
+        // host word IS the device word.
+        let word = self.seg_host[seg.get()][lp.offset as usize..][..4]
+            .try_into()
+            .expect("the D2H above landed at least the placement's own 256 B");
+        let idx = u32::from_le_bytes(word);
+        if idx as usize >= am.vocab {
+            bail!(
+                "predict_token: the composite's answer is {idx} against a vocab of {} — the \
+                 sentinel row, which the chain reaches exactly when EVERY logit lane was NaN. \
+                 The step REFUSES rather than feed a NaN-born token to the detokenizer (the \
+                 host argmax would have answered token 0 over the same row — that divergence \
+                 is the recorded follow-up, not this step's decision)",
+                am.vocab
+            );
+        }
+        self.step_epilogue(d);
+        Ok(idx)
     }
 
     /// Refill per-step ACTIVATIONS into their segment's host staging at the baked offset
@@ -5502,6 +5862,56 @@ fn report_group_time(t: &Timers) {
     }
 }
 
+/// One CB class's device-clock window inside one forward: the extreme WRITTEN timestamp snapshots
+/// over that class's CBs. The five TS words are snapshots of one free-running u32 counter
+/// ([`flex_rs::control_block_wire::ResponseBlockWire::timestamps`]'s measured layout: ~1012
+/// cyc/µs, ~4.2 s wrap; a slot a CB does not write reads zero), so `first`/`last` are raw ticks —
+/// consecutive forwards' windows difference wrap-exactly into the inter-step device-idle gap
+/// (fwd N `last` → fwd N+1 `first`), the number #603's loop closure exists to move.
+struct RbClassWindow {
+    first: u32,
+    last: u32,
+    n: usize,
+}
+
+/// The window of every entry matching `class`, over written (nonzero) TS slots only: a CB
+/// hardware left unwritten cannot bound the window, and a class with no CBs is `None` — absent,
+/// never zero-bounded, so a missing class cannot swallow the gap being measured.
+fn rb_class_window(
+    entries: &[flex_rs::rb_telemetry::RbTiming],
+    class: impl Fn(&flex_rs::rb_telemetry::RbTiming) -> bool,
+) -> Option<RbClassWindow> {
+    let mut window: Option<RbClassWindow> = None;
+    for e in entries.iter().filter(|e| class(e)) {
+        let mut cb_first: Option<u32> = None;
+        let mut cb_last = 0u32;
+        for &ts in &e.rb.timestamps() {
+            if ts != 0 {
+                cb_first = Some(cb_first.map_or(ts, |f: u32| f.min(ts)));
+                cb_last = cb_last.max(ts);
+            }
+        }
+        let Some(cb_first) = cb_first else {
+            continue;
+        };
+        match &mut window {
+            Some(w) => {
+                w.first = w.first.min(cb_first);
+                w.last = w.last.max(cb_last);
+                w.n += 1;
+            }
+            None => {
+                window = Some(RbClassWindow {
+                    first: cb_first,
+                    last: cb_last,
+                    n: 1,
+                })
+            }
+        }
+    }
+    window
+}
+
 /// The RB-timestamp report: per-op device cycles, harvested from the response blocks at
 /// completion (no drain), cumulative across the run. Phases are named per the card-measured slot
 /// semantics ([`flex_rs::control_block_wire::ResponseBlockWire::exec_cmpt_cycles`] and siblings):
@@ -5813,5 +6223,57 @@ mod tests {
         let t = timers();
         assert_eq!(t.replay_hits, hits + 1, "the hit arm counted it");
         assert_eq!(t.replay_derives, derives + 1);
+    }
+
+    /// The rbgap window takes the extreme WRITTEN TS slots per class: a CB whose slots hardware
+    /// left zero never bounds it, and a class with no CBs is absent rather than zero-bounded —
+    /// the inter-step gap differences consecutive forwards' windows, so a bogus zero would
+    /// swallow the very window being measured.
+    #[test]
+    fn rbgap_window_bounds_only_written_slots() {
+        use flex_rs::control_block_wire::{RB_NUM_BYTES, ResponseBlockWire, TS_SECTION};
+        use flex_rs::dma::DmaDirection;
+        use flex_rs::rb_telemetry::RbTiming;
+        use flex_rs::scheduler::PipelineId;
+
+        let rb = |ts: [u32; 5]| {
+            let mut b = [0u8; RB_NUM_BYTES];
+            for (i, w) in ts.iter().enumerate() {
+                b[TS_SECTION + i * 4..TS_SECTION + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            ResponseBlockWire::from_bytes(&b)
+        };
+        let entry =
+            |id: u64, pipeline: PipelineId, dma: Option<DmaDirection>, ts: [u32; 5]| RbTiming {
+                id,
+                pipeline,
+                dma,
+                rb: rb(ts),
+            };
+        // A compute CB writes all five words (word1 == word0 per the measured layout); a D2H
+        // crossing writes only words 3-4; one pathological CB writes nothing at all.
+        let entries = vec![
+            entry(1, PipelineId::Compute, None, [100, 100, 120, 200, 210]),
+            entry(
+                2,
+                PipelineId::Compute,
+                Some(DmaDirection::DeviceToHost),
+                [0, 0, 0, 300, 340],
+            ),
+            entry(3, PipelineId::AsyncDmaI, None, [0; 5]),
+        ];
+        let all = rb_class_window(&entries, |_| true).unwrap();
+        assert_eq!((all.first, all.last, all.n), (100, 340, 2));
+        let compute = rb_class_window(&entries, |e| {
+            matches!(e.pipeline, PipelineId::Compute) && e.dma.is_none()
+        })
+        .unwrap();
+        assert_eq!((compute.first, compute.last, compute.n), (100, 210, 1));
+        let d2h = rb_class_window(&entries, |e| e.dma == Some(DmaDirection::DeviceToHost)).unwrap();
+        assert_eq!((d2h.first, d2h.last, d2h.n), (300, 340, 1));
+        assert!(
+            rb_class_window(&entries, |e| e.dma == Some(DmaDirection::HostToDevice)).is_none(),
+            "an absent class is absent, not zero-bounded"
+        );
     }
 }

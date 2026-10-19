@@ -8899,6 +8899,217 @@ pub fn route_topk(
     Ok(ops)
 }
 
+/// The per-`Program` door for [`crate::ktir_node::Program::Argmax`] — the composite
+/// device argmax, the loop-closure group: `row = embed(argmax(logits))` computed on
+/// device over the TIED lm_head bank, so the next step's input activation never
+/// crosses to the host. The body is [`crate::emit::argmax`]'s mint — this arm is the
+/// thin half: resolve the three boundary names the program's own views state, name
+/// the resident constants by their reserved tids (the fp32 ramp, the scalar V, and
+/// the pad-lane form's fp16 bias), declare the scratch synthetics
+/// at their full footprints (keyed off the ROW tid, the top-k door's own "key off
+/// the landing" law), and hand the geometry to the chain's one assembly.
+///
+/// ⭐ THE DESCRIPTORS ARE THE SAME COMPUTATION THE PROGRAM STATES — the parity gate
+/// (`zz_the_argmax_walk_parity`-class tests) executes the program's ops against the
+/// host argmax on the same logits, so a door that minted a different chain than the
+/// func states is a test failure, not a card surprise.
+///
+/// ⛔ THE TIE TOKEN IS THE ARM'S OWN GUARD. `Program::Argmax(tied)` carries the
+/// `TiedLmHeadEmbedding` the producer could only have minted through
+/// `from_tied_config`, so an untied model cannot reach this arm — the token is
+/// threaded to the assembly, which restates the refusal for any hand-built caller.
+pub fn argmax(
+    name: &str,
+    r: &[Region],
+    tied: crate::emit::argmax::TiedLmHeadEmbedding,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::emit::argmax::{ArgmaxGeom, ArgmaxSlots};
+    // THE MINT ORDER — positional, the whole contract (see `mint_argmax_node`'s doc):
+    // [logits, table, row].
+    let [lg, table, row] = r else {
+        return err(format!(
+            "Argmax {name}: {} parameter(s) against the mint's 3-slot order [logits, table, \
+             row] — the chain reads the lm_head output, the tied weight bank, and the next \
+             step's input-activation slot, in that order",
+            r.len()
+        ));
+    };
+    let rows = lg.v_rows;
+    let hidden = row.v_cols;
+    // ⭐ THE REAL VOCAB, off the TABLE's own view — `[V + 1, H]` in BOTH forms: the `+1`
+    // is the SENTINEL row, the zero row the `idx = V` gather reads when nothing real
+    // won (the all-NaN row; a pad lane that beat every real one — the pad-lane form's
+    // clamped ramp makes that the only alternative to a real lane). The LOGITS view
+    // states the STAGING width — `V` when the vocab is stick-aligned, `stick_pad(V)`
+    // when it is not — cross-checked below, so a hand-minted node cannot state a
+    // mismatched pair.
+    let Some(vocab) = table.v_rows.checked_sub(1) else {
+        return err(format!(
+            "Argmax {name}: the table t{} states {} row(s) — a zero-row table carries no \
+             real vocab lane and no sentinel row",
+            table.tid, table.v_rows
+        ));
+    };
+    if table.v_cols != hidden || row.v_rows != rows || row.v_cols != hidden {
+        return err(format!(
+            "Argmax {name}: the logits t{} [{rows}, {}], the table t{} [{}, {}], and the \
+             row t{} [{}, {}] — the gather reads the table as [vocab + 1, hidden] rows (the \
+             +1 the sentinel) and lands one [rows, hidden] row, so all three extents must \
+             agree",
+            lg.tid,
+            lg.v_cols,
+            table.tid,
+            table.v_rows,
+            table.v_cols,
+            row.tid,
+            row.v_rows,
+            row.v_cols
+        ));
+    }
+    // The staging-width law: the logits view must state the real vocab's stick padding —
+    // `V` at a whole-stick vocab (granite-3.3's 49152), `stick_pad(V)` at a sub-stick one
+    // (granite-3.1's 49155 → 49216).
+    let v_pad = vocab.div_ceil(FP16_ELEMS_PER_STICK) * FP16_ELEMS_PER_STICK;
+    if lg.v_cols != v_pad {
+        return err(format!(
+            "Argmax {name}: the logits t{} states [{rows}, {}] against the table t{}'s \
+             vocab {} — the logits view must state the vocab's stick-padded staging width \
+             [{rows}, {}]",
+            lg.tid, lg.v_cols, table.tid, vocab, v_pad
+        ));
+    }
+    // The pad-lane form flag — a sub-stick vocab takes the nine-link chain (link 0 adds
+    // the staged bias); a whole-stick one the landed eight links, verbatim.
+    let pad_lanes = !vocab.is_multiple_of(FP16_ELEMS_PER_STICK);
+    let lg_s = lg.name();
+    let table_s = table.name();
+    let row_s = row.name();
+    // ⭐ THE RESIDENT CONSTANTS, named by their reserved tids — the descending fp32
+    // ramp, the scalar V, and (pad-lane form only) the fp16 lane bias. Placed by the
+    // layout (the `router_const` law: the door names, the layout places), so a bundle
+    // without the composite never stages them — and a whole-stick one never stages the
+    // bias.
+    let ramp_s = crate::place::act_name(crate::reserved_tids::argmax_ramp_tid());
+    let v_s = crate::place::act_name(crate::reserved_tids::argmax_v_tid());
+    let bias_s = crate::place::act_name(crate::reserved_tids::argmax_bias_tid());
+    // The scratch synthetics, keyed off the ROW tid — the chain's own landing.
+    let row_id = PlaceId::Act(row.tid);
+    use crate::place::SynthRole as R;
+    let syn = |role: R| crate::placement::syn(layout, row_id.synth(role));
+    let m_s = syn(R::AmMax);
+    let mask_s = syn(R::AmMask);
+    let mask32_s = syn(R::AmMask32);
+    let w_s = syn(R::AmW);
+    let j_s = syn(R::AmJ);
+    let idx32_s = syn(R::AmIdx32);
+    let idx_u32_s = syn(R::AmIdxU32);
+    // The pad-lane form's biased row: the NAME is stated for the slot struct either way
+    // (the whole-stick arm never reads it), but it is REGISTERED only in the pad-lane
+    // form — a whole-stick bundle's layout stays byte-identical to before the form
+    // existed.
+    let biased_s = if pad_lanes {
+        syn(R::AmBiased)
+    } else {
+        row_id.synth(R::AmBiased).to_string()
+    };
+    // The partials+combine form's per-trip maxima: the max32's own trip count at this
+    // vocab (the SAME probe the assembly's link 5 runs) decides the form. ONE trip at
+    // every shipping vocab — gemma's 262144 included, the true-accum-charge fix's own
+    // case — so the scratch is named for the slot struct but REGISTERED only when the
+    // reduce genuinely tiles: a single-trip bundle's layout stays byte-identical to
+    // before the form existed.
+    let trips = match crate::ir::bridge::tiled_op_sdsc_op::reduce::reduce_trip_count(
+        crate::superdsc_opspec::OpFunc::Max,
+        rows,
+        v_pad,
+        crate::superdsc_opspec::Df::Fp32,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return err(format!(
+                "Argmax {name}: the max32's trip count at vocab {vocab}: {e}"
+            ));
+        }
+    };
+    let partials_s = if trips > 1 {
+        syn(R::AmPartials)
+    } else {
+        row_id.synth(R::AmPartials).to_string()
+    };
+    if let Some(l) = layout {
+        // The full footprints, at the chain's own formats — the [rows, v_pad] mask pair
+        // dominates; everything else is one-stick tail scratch.
+        l.synth_df(
+            row_id.synth(R::AmMax),
+            &[rows, FP16_ELEMS_PER_STICK],
+            Df::Fp16,
+        );
+        l.synth_df(row_id.synth(R::AmMask), &[rows, lg.v_cols], Df::Fp16);
+        l.synth_df(row_id.synth(R::AmMask32), &[rows, lg.v_cols], Df::Fp32);
+        l.synth_df(row_id.synth(R::AmW), &[rows, lg.v_cols], Df::Fp32);
+        l.synth_df(
+            row_id.synth(R::AmJ),
+            &[rows, Df::Fp32.elems_per_stick()],
+            Df::Fp32,
+        );
+        l.synth_df(
+            row_id.synth(R::AmIdx32),
+            &[rows, FP16_ELEMS_PER_STICK],
+            Df::Fp32,
+        );
+        l.synth_df(
+            row_id.synth(R::AmIdxU32),
+            &[rows, FP16_ELEMS_PER_STICK],
+            Df::SenUint32,
+        );
+        if pad_lanes {
+            l.synth_df(row_id.synth(R::AmBiased), &[rows, lg.v_cols], Df::Fp16);
+        }
+        if trips > 1 {
+            // The partials form's max32 output: ONE STICK PER TRIP, fp32 — exactly the
+            // sticks the trips write and the combine reduce reads.
+            l.synth_df(
+                row_id.synth(R::AmPartials),
+                &[rows, trips * Df::Fp32.elems_per_stick()],
+                Df::Fp32,
+            );
+        }
+    }
+    let s = ArgmaxSlots {
+        logits: &lg_s,
+        biased: &biased_s,
+        bias: &bias_s,
+        m: &m_s,
+        mask: &mask_s,
+        mask32: &mask32_s,
+        ramp: &ramp_s,
+        v_const: &v_s,
+        w: &w_s,
+        j: &j_s,
+        partials: &partials_s,
+        idx32: &idx32_s,
+        idx_u32: &idx_u32_s,
+        table: &table_s,
+        row: &row_s,
+    };
+    crate::emit::argmax::try_assemble_argmax(
+        ArgmaxGeom {
+            rows,
+            vocab,
+            hidden,
+        },
+        &s,
+        tied,
+        sym_id_base,
+        layout,
+    )
+    .map_err(|e| Error {
+        message: format!("Argmax {name}: {e}"),
+    })
+}
+
 /// The per-`Program` door for [`crate::ktir_node::Program::RouteGatherScores`] —
 /// the scores at the chosen indices, `out[i, j] = scores[i, idx[i, j]]`
 /// (`take_along_axis` at axis −1, metal's `gather_scores`).

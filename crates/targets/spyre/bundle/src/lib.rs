@@ -244,6 +244,13 @@ pub struct BundleLayout<'a> {
     /// placement) died with the rank-inversion door the fused pair replaced. The bake states
     /// it here beside `E`; the worker's bind reads it. 0 when the tape has no top-k.
     pub router_k: u32,
+    /// ⭐ THE COMPOSITE ARGMAX'S REAL VOCAB — the chain's own V, stated by the bake because
+    /// the const placements cannot carry it by size alone: the pad-lane form's ramp is
+    /// placed at the STICK-PADDED width `[1, stick_pad(V)]`, so `size / 4` is
+    /// `stick_pad(V)`, not `V`. The wiring's `BakeFacts::argmax_vocab` reads this — the
+    /// sentinel threshold (`idx ≥ V` ⇒ the NaN answer, refused loudly) and the const
+    /// binds' real-lane count both key on it. 0 when the tape minted no composite.
+    pub argmax_vocab: u32,
     /// Bytes between two requests' KV inside one page+layer, or 0 for an unpaged bundle. The
     /// EMITTER's number, travelling to the runtime rather than being re-derived there.
     pub kv_request_stride_bytes: u64,
@@ -298,6 +305,23 @@ impl<'a> BundleLayout<'a> {
             None => self.segment_bytes.get(weight_seg).copied(),
             Some(i) => self.weight_bank_bytes.get(i).copied(),
         }
+    }
+
+    /// ⭐⭐⭐ ONE MODEL PACKS ONE RESIDENT WEIGHT SEGMENT — this SHIPPED layout's packed size for
+    /// it, as the runtime's own alias guard reads it: bank 0's bytes ([`Self::segment_bytes`] at
+    /// `SegRole::Weight`) plus the extra banks ([`Self::weight_bank_bytes`]).
+    ///
+    /// The twin of the producer-side `lower_subtile_tape_to_superdsc::weight_seg_record`, which
+    /// reads the SAME numbers off the ktir-side plan the bake just built. The bake's parity ledger
+    /// compares that one; the model-side test (`argmax_composite_expansion.rs`) compares THIS one
+    /// back off the `inventory` registry, off the bundles that actually shipped — so the two
+    /// readings cannot drift apart, because this crate's one-type-family law is exactly what
+    /// forbids a field-for-field conversion between them.
+    pub fn weight_seg_record(&self) -> (u64, Vec<u64>) {
+        (
+            self.segment_bytes[ktir_superdsc::placement::SegRole::Weight.segment()],
+            self.weight_bank_bytes.to_vec(),
+        )
     }
 }
 

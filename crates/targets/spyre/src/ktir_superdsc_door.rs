@@ -298,6 +298,15 @@ pub fn lower(
         // dense body's own per-pair `matmulfp8` + dequant at baked offsets.
         // See the door's own doc for the five legs and the gather laws.
         Program::ExpertMatmul => lk::expert_matmul(name, &r, sym_id_base, layout, quantized),
+        // ⭐ THE COMPOSITE DEVICE ARGMAX — the loop-closure group (#603 PR3a):
+        // first-max over the logits row, then the TIED embedding row gathered
+        // on device, so the next step's input activation never crosses to the
+        // host. The arm is the thin half of `emit::argmax`'s mint: the
+        // descriptors and the walk-minted program are two expressions of ONE
+        // computation (the parity gate pins that they agree), and the
+        // `TiedLmHeadEmbedding` token the variant carries is the tie fact as
+        // a type — an untied model cannot reach this arm.
+        Program::Argmax(tied) => lk::argmax(name, &r, tied, sym_id_base, layout),
     }
 }
 

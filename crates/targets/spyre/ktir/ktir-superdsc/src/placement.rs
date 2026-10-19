@@ -285,6 +285,17 @@ pub struct BundleLayout {
     /// no top-k.
     #[serde(default)]
     pub router_k: u32,
+    /// ⭐ THE COMPOSITE ARGMAX'S REAL VOCAB — the chain's own V, the one geometry fact the
+    /// argmax const placements cannot carry by size alone. The pad-lane form (a sub-stick
+    /// vocab — granite-3.1's 49155) places its ramp at the STICK-PADDED width
+    /// `[1, stick_pad(V)]`, so the placement's `size / 4` is `stick_pad(V)`, NOT `V`; a
+    /// size-derived sentinel threshold would then accept the sentinel row `idx = V` as a
+    /// real token (the host refuses `idx ≥ V` as the NaN answer — the sentinel's own law).
+    /// The bake states the real vocab here the same way `E` rides
+    /// [`Self::router_experts`], and the wiring's `BakeFacts::argmax_vocab` reads it —
+    /// never a placement size. 0 when the tape minted no composite.
+    #[serde(default)]
+    pub argmax_vocab: u32,
     /// SYNTHETIC intermediates created during lowering (silu's `{out}_silu`,
     /// rmsnorm's `{out}_sq/mean/meps/inv/tmp/eps`) are NOT SubtileIR tensors, so
     /// they have no `t{id}` placement. They are lazily assigned a STABLE offset in

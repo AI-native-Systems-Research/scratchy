@@ -11,6 +11,7 @@
 #[cfg(feature = "spyre-hw")]
 use std::collections::HashMap;
 
+use scratchy_core_common::SamplingParams;
 use scratchy_serving_engine::executor::ModelRunnerOutput;
 use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
 #[cfg(feature = "spyre-hw")]
@@ -507,6 +508,15 @@ impl Worker for SpyreWorker {
                     // prefix-cache hit otherwise): it has not shared a step with anyone yet, so its
                     // slots and its tokens are still the same set.
                     kv_hist: scratchy_subtile::sdsc_abstract::KvHistory::contiguous(start),
+                    // ⭐ GREEDY, CAPTURED AT THE ONE STEP THAT CARRIES THE PARAMS (#603 PR3a) —
+                    // admission. Absent params mean greedy, which is what this path has always
+                    // done; a request that asks to sample keeps the logits D2H for its whole
+                    // life, through preempts and resumes, because nothing after this line ever
+                    // sees `sampling_params` again (cached requests do not repeat them).
+                    greedy: nr
+                        .sampling_params
+                        .as_ref()
+                        .is_none_or(SamplingParams::is_greedy),
                     #[cfg(not(feature = "spyre-hw"))]
                     kv_k: vec![Vec::new(); nlayers],
                     #[cfg(not(feature = "spyre-hw"))]
