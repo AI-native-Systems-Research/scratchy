@@ -212,3 +212,65 @@ impl Cell {
             .unwrap_or(f64::NAN)
     }
 }
+
+/// One perf PR's progress entry, `progress/<pr>.json`, shipped in the PR
+/// itself: the cells its merge gate measured, main against the PR, on one
+/// pod, back to back. The sweep files stay the record; a progress entry
+/// layers on top of them, and the page pairs each of its values with the
+/// newest sweep's torch cell — torch-spyre is never re-measured for one.
+///
+/// Every struct refuses fields it does not know, so a misspelt key fails the
+/// build rather than dropping out of the page.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Progress {
+    pub schema: u32,
+    /// The PR the file is named for: `progress/<pr>.json`.
+    pub pr: u32,
+    /// The PR's title as merged.
+    pub title: String,
+    /// The PR head commit that was measured, full sha.
+    pub head: String,
+    /// The main commit it was measured against, full sha.
+    pub base: String,
+    /// The day the PR merged, "2026-10-21": the page orders entries by it.
+    pub merged: String,
+    /// The one pod both sides ran on, back to back.
+    pub pod: String,
+    /// How the cells were measured: the script, its cell set, its gate.
+    pub harness: String,
+    /// Exactly the cells the PR measured — no filler.
+    pub cells: Vec<ProgressCell>,
+}
+
+/// One cell a progress entry measured: main's and the PR's value at one
+/// point of the sweep grid.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgressCell {
+    pub model: String,
+    pub dtype: Dtype,
+    pub metric: Metric,
+    #[serde(default = "one")]
+    pub conc: u32,
+    /// The context bucket the cell sits in ("~1k").
+    pub context: String,
+    /// main's value at the cell.
+    pub main: f64,
+    /// The PR's value at the cell.
+    pub pr: f64,
+    /// Every run behind each headline, in run order. Each headline is its
+    /// side's last run — the steady-state law the sweep cells follow — and
+    /// the build checks it, so a headline can never cherry-pick a rep.
+    pub reps: Reps,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// The runs behind a progress cell's headlines, per side.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reps {
+    pub main: Vec<f64>,
+    pub pr: Vec<f64>,
+}

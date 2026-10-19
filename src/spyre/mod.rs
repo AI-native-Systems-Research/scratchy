@@ -8,7 +8,7 @@
 
 mod data;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -25,11 +25,17 @@ use crate::charts::{
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
 use crate::thousands_f;
-use data::{Cell, Dtype, Metric, Notes, Provenance, Sweep};
+use data::{Cell, Dtype, Metric, Notes, Progress, Provenance, Sweep};
 
 /// The sweep files, relative to site/; copied to the same place under
 /// _site/, where the about table links to each.
 pub const DATA: &str = "data/spyre";
+
+/// The progress files, relative to site/: one per perf PR, shipped in the PR
+/// itself, named for its number. Copied to the same place under _site/. The
+/// directory is absent until the first perf PR lands one; the page then has
+/// no Progress section, which is not an error.
+pub const PROGRESS: &str = "data/spyre/progress";
 
 /// The two stacks, as every chart's sides: triton-scratchy is scratchy's
 /// Spyre path, torch-spyre the torch backend it is measured against.
@@ -149,6 +155,152 @@ fn problems(sweep: &Sweep) -> Vec<String> {
         ));
     }
     out
+}
+
+/// Every progress file, checked the way sweeps are. Fails naming each bad
+/// file, so one build reports all of them rather than the first. Ordered by
+/// merge date, then PR number: the order their values supersede each other.
+fn load_progress(site: &Site) -> Result<Vec<(PathBuf, Progress)>, String> {
+    let dir = site.root.join(PROGRESS);
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        // No directory yet: no perf PR has shipped a progress file, so the
+        // page has no Progress section. Not an error.
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    files.sort();
+    let (mut out, mut errors) = (Vec::new(), Vec::new());
+    for f in files {
+        let name = f
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let text = match fs::read_to_string(&f) {
+            Ok(t) => t,
+            Err(e) => {
+                errors.push(format!("{name}: {e}"));
+                continue;
+            }
+        };
+        let progress: Progress = match serde_json::from_str(&text) {
+            Ok(p) => p,
+            Err(e) => {
+                errors.push(format!("{name}: {e}"));
+                continue;
+            }
+        };
+        let want = format!("{}.json", progress.pr);
+        if name != want {
+            errors.push(format!("{name}: name it {want} (the PR's number)"));
+        }
+        errors.extend(
+            progress_problems(&progress)
+                .into_iter()
+                .map(|e| format!("{name}: {e}")),
+        );
+        out.push((f, progress));
+    }
+    if errors.is_empty() {
+        out.sort_by(|a, b| (&a.1.merged, a.1.pr).cmp(&(&b.1.merged, b.1.pr)));
+        Ok(out)
+    } else {
+        Err(errors
+            .iter()
+            .map(|e| format!("spyre page: {e}"))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+}
+
+/// What is wrong inside one progress entry, beyond what its types refuse:
+/// schema 1, full-sha head and base, a date merged, text where a line of it
+/// is owed, at least two runs a side of equal count whose last run is each
+/// headline (so a headline can never cherry-pick a rep), every value
+/// measured and above 0, and no cell twice.
+fn progress_problems(p: &Progress) -> Vec<String> {
+    let mut out = Vec::new();
+    if p.schema != 1 {
+        out.push(format!("schema {} is not 1", p.schema));
+    }
+    for (what, s) in [("head", &p.head), ("base", &p.base)] {
+        if !(s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())) {
+            out.push(format!("{what} {s} is not a full commit sha"));
+        }
+    }
+    if !is_date(&p.merged) {
+        out.push(format!("merged {} is not a date (YYYY-MM-DD)", p.merged));
+    }
+    for (what, s) in [
+        ("title", &p.title),
+        ("pod", &p.pod),
+        ("harness", &p.harness),
+    ] {
+        if s.trim().is_empty() {
+            out.push(format!("{what} is empty"));
+        }
+    }
+    if p.cells.is_empty() {
+        out.push("no cells: the entry measures nothing".to_string());
+    }
+    let mut seen = BTreeSet::new();
+    for c in &p.cells {
+        let at = format!(
+            "{} {} {} conc {} at {}",
+            c.model,
+            c.dtype.label(),
+            c.metric.short(),
+            c.conc,
+            c.context
+        );
+        if !seen.insert((&c.model, c.dtype, c.metric, c.conc, &c.context)) {
+            out.push(format!("{at} is in the entry twice"));
+        }
+        for (side, headline, runs) in [("main", c.main, &c.reps.main), ("pr", c.pr, &c.reps.pr)] {
+            if !(headline.is_finite() && headline > 0.0) {
+                out.push(format!("{at}: {side} must be measured and above 0"));
+            }
+            if runs.len() < 2 {
+                out.push(format!(
+                    "{at}: {side} has {} run(s); a cell needs at least two a side",
+                    runs.len()
+                ));
+            }
+            if let Some(last) = runs.last()
+                && *last != headline
+            {
+                out.push(format!(
+                    "{at}: {side} headline {headline} is not its last run ({last})"
+                ));
+            }
+            for v in runs {
+                if !(v.is_finite() && *v > 0.0) {
+                    out.push(format!("{at}: a {side} run is {v}, not a measurement"));
+                }
+            }
+        }
+        if c.reps.main.len() != c.reps.pr.len() {
+            out.push(format!(
+                "{at}: {} main run(s) against {} pr run(s); the sides must match",
+                c.reps.main.len(),
+                c.reps.pr.len()
+            ));
+        }
+    }
+    out
+}
+
+/// "2026-10-21": a day, as the page orders entries by.
+fn is_date(s: &str) -> bool {
+    s.len() == 10
+        && s.as_bytes()[4] == b'-'
+        && s.as_bytes()[7] == b'-'
+        && s[..4].bytes().all(|b| b.is_ascii_digit())
+        && s[5..7].bytes().all(|b| b.is_ascii_digit())
+        && s[8..].bytes().all(|b| b.is_ascii_digit())
 }
 
 // ---------------------------------------------------------------- accessors
@@ -990,6 +1142,214 @@ fn says_what_moved(sweep: &Sweep) -> bool {
     !sweep.moved.is_empty() || !sweep.levers.is_empty()
 }
 
+// ----------------------------------------------------------------- progress
+
+/// One row of the Progress table: the newest measurement of a cell the perf
+/// PRs are moving, whichever side measured it, and torch's newest sweep
+/// value at that cell.
+struct ProgressRow {
+    /// triton-scratchy's newest value at the cell.
+    latest: f64,
+    /// Where it came from: "PR #682, 2026-10-21" or "sweep 2026-10-19".
+    source: String,
+    /// The source's place in order: its date, whether it is a PR (a PR on
+    /// the same day as a sweep counts as newer), and its number.
+    order: (String, bool, u32),
+    /// torch-spyre's value at the cell in the newest sweep that has it, with
+    /// that sweep's date: torch is never re-measured for a PR.
+    torch: Option<(f64, String)>,
+    /// The note on the PR cell the row's value came from; a sweep-sourced
+    /// row carries none, because a sweep's cell notes already print under
+    /// that sweep's sections.
+    note: Option<String>,
+}
+
+/// The Progress table's rows: one per cell any progress entry measured — the
+/// cells the perf PRs are moving, nothing else. The newest value wins — a
+/// PR's over a sweep's when it merged later, a sweep's over an older PR's —
+/// and torch's value comes from the newest sweep that has the cell, never a
+/// PR (no PR re-measures torch).
+fn progress_rows(
+    progress: &[(PathBuf, Progress)],
+    sweeps: &[(PathBuf, Sweep)],
+) -> BTreeMap<(String, Dtype, Metric, u32, String), ProgressRow> {
+    let moved: BTreeSet<(String, Dtype, Metric, u32, String)> = progress
+        .iter()
+        .flat_map(|(_, p)| {
+            p.cells.iter().map(|c| {
+                (
+                    c.model.clone(),
+                    c.dtype,
+                    c.metric,
+                    c.conc,
+                    c.context.clone(),
+                )
+            })
+        })
+        .collect();
+    let mut rows: BTreeMap<_, ProgressRow> = BTreeMap::new();
+    // Sweeps load oldest first: each one with the cell supersedes the last.
+    for (_, s) in sweeps {
+        for c in &s.cells {
+            let Some(context) = &c.context else { continue };
+            let key = (c.model.clone(), c.dtype, c.metric, c.conc, context.clone());
+            if !moved.contains(&key) {
+                continue;
+            }
+            rows.insert(
+                key,
+                ProgressRow {
+                    latest: c.scratchy,
+                    source: format!("sweep {}", s.date),
+                    order: (s.date.clone(), false, 0),
+                    torch: Some((c.torch, s.date.clone())),
+                    note: None,
+                },
+            );
+        }
+    }
+    // Progress entries load in merge order; each only supersedes what it is
+    // newer than, and carries torch's sweep value forward untouched.
+    for (_, p) in progress {
+        for c in &p.cells {
+            let key = (
+                c.model.clone(),
+                c.dtype,
+                c.metric,
+                c.conc,
+                c.context.clone(),
+            );
+            let order = (p.merged.clone(), true, p.pr);
+            let newer = rows.get(&key).is_none_or(|row| order > row.order);
+            if newer {
+                let torch = rows.get(&key).and_then(|r| r.torch.clone());
+                rows.insert(
+                    key,
+                    ProgressRow {
+                        latest: c.pr,
+                        source: format!("PR #{}, {}", p.pr, p.merged),
+                        order,
+                        torch,
+                        note: c.note.clone(),
+                    },
+                );
+            }
+        }
+    }
+    rows
+}
+
+/// A progress cell must land on the page's grid: its model and its context
+/// have to be ones the sweeps measured, or its values cannot join anything
+/// the page shows.
+fn progress_vocabulary(
+    progress: &[(PathBuf, Progress)],
+    sweeps: &[(PathBuf, Sweep)],
+) -> Vec<String> {
+    let models: BTreeSet<String> = sweeps.iter().flat_map(|(_, s)| models(s)).collect();
+    let contexts: BTreeSet<String> = sweeps
+        .iter()
+        .flat_map(|(_, s)| s.contexts.keys().cloned())
+        .collect();
+    let mut out = Vec::new();
+    for (_, p) in progress {
+        for c in &p.cells {
+            if !models.contains(c.model.as_str()) {
+                out.push(format!(
+                    "progress {}: model {} is not one the sweeps measured",
+                    p.pr, c.model
+                ));
+            }
+            if !contexts.contains(c.context.as_str()) {
+                out.push(format!(
+                    "progress {}: context {} is not one the sweeps measured",
+                    p.pr, c.context
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// The Progress section: every perf PR's gate cells on the page. The sweeps
+/// stay the record; this is the newest measurement of each cell the PRs are
+/// moving, with its source, beside torch's newest sweep value there — one
+/// row per cell, so the next perf PR lands with its data visible.
+fn progress_section(progress: &[(PathBuf, Progress)], sweeps: &[(PathBuf, Sweep)]) -> Element {
+    if progress.is_empty() {
+        return rsx! {};
+    }
+    let rows = progress_rows(progress, sweeps);
+    let cell_name = |key: &(String, Dtype, Metric, u32, String)| {
+        let (model, dtype, metric, conc, context) = key;
+        if *conc > 1 {
+            format!(
+                "{} · {} · {} · conc {conc} · {context}",
+                size_name(model),
+                dtype.label(),
+                metric.short()
+            )
+        } else {
+            format!(
+                "{} · {} · {} · {context}",
+                size_name(model),
+                dtype.label(),
+                metric.short()
+            )
+        }
+    };
+    rsx! {
+        Section { id: "progress", level: 2,
+            Stack { gap: 4,
+                Heading { "Progress" }
+                p {
+                    "Every perf PR's merge gate, on the page: the cells its run measured, \
+                     main against the PR on one pod, back to back. Torch-spyre is not \
+                     re-measured for a PR — each cell pairs with the newest sweep's torch \
+                     value, labelled with that sweep's date. The sweeps stay the record; \
+                     these rows are the newest measurement of each cell the PRs are \
+                     moving, from a PR or a sweep, each naming its source."
+                }
+                Tile {
+                  Layer { level: 1,
+                    Table { headers: headers([
+                            "cell", "latest triton-scratchy", "source", "torch-spyre", "× vs torch-spyre",
+                        ]),
+                        for (key, row) in &rows {
+                            TableRow {
+                                TableCell { "{cell_name(key)}" }
+                                TableCell { "{fmt_value(key.2, row.latest)}" }
+                                TableCell { "{row.source}" }
+                                TableCell {
+                                    {
+                                        row.torch.as_ref().map_or_else(
+                                            || DASH.to_string(),
+                                            |(v, d)| format!("{} (sweep {d})", fmt_value(key.2, *v)),
+                                        )
+                                    }
+                                }
+                                TableCell {
+                                    {
+                                        row.torch.as_ref()
+                                            .and_then(|(t, _)| key.2.better().faster(Some(row.latest), Some(*t)))
+                                            .map_or_else(|| DASH.to_string(), |r| format!("×{r:.2}"))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                  }
+                }
+                for (key, row) in &rows {
+                    if let Some(note) = &row.note {
+                        p { "{cell_name(key)}: {note}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn moved_section(sweep: &Sweep) -> Element {
     if !says_what_moved(sweep) {
         return rsx! {};
@@ -1197,7 +1557,10 @@ fn about(sweeps: &[(PathBuf, Sweep)]) -> Element {
                     "torch-spyre and triton-scratchy are measured by their own harnesses (each \
                      sweep's are in the table below) at slightly different prompt lengths, so \
                      cells sit in context buckets and the page compares ratios, not absolutes. \
-                     Each sweep's JSON, with both sides' provenance, is linked below."
+                     Each sweep's JSON, with both sides' provenance, is linked below. Perf PRs \
+                     also land their gate cells as progress entries, one JSON per PR under \
+                     " code { "{PROGRESS}/" } ", which the Progress section pairs with the \
+                     newest sweep's torch value."
                 }
                 p {
                     code { "ITL" } " inter-token latency · " code { "TTFT" } " time to first \
@@ -1236,6 +1599,15 @@ fn about(sweeps: &[(PathBuf, Sweep)]) -> Element {
 
 pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     let sweeps = load(site)?;
+    let progress = load_progress(site)?;
+    let off_grid = progress_vocabulary(&progress, &sweeps);
+    if !off_grid.is_empty() {
+        return Err(off_grid
+            .iter()
+            .map(|e| format!("spyre page: {e}"))
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
     // The page charts the latest sweep; the about table lists every one.
     let latest = sweeps.last().map(|(_, s)| s);
     let mut sections: Vec<(String, String)> = Vec::new();
@@ -1265,6 +1637,9 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
             if says_what_moved(sweep) {
                 sections.push(("moved".to_string(), "What moved".to_string()));
             }
+            if !progress.is_empty() {
+                sections.push(("progress".to_string(), "Progress".to_string()));
+            }
             let names = models(sweep).join(" and ");
             let torch = &sweep.torch_spyre;
             let ours = &sweep.triton_scratchy;
@@ -1288,6 +1663,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
                     {conc_section(sweep)}
                     {fp8_section(sweep)}
                     {moved_section(sweep)}
+                    {progress_section(&progress, &sweeps)}
                 },
             )
         }
@@ -1330,6 +1706,14 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
         fs::copy(file, dest.join(file.file_name().unwrap_or_default()))
             .map_err(|e| format!("{}: {e}", file.display()))?;
     }
+    if !progress.is_empty() {
+        let pdest = site.out.join(PROGRESS);
+        fs::create_dir_all(&pdest).map_err(|e| format!("{}: {e}", pdest.display()))?;
+        for (file, _) in &progress {
+            fs::copy(file, pdest.join(file.file_name().unwrap_or_default()))
+                .map_err(|e| format!("{}: {e}", file.display()))?;
+        }
+    }
     Ok(format!(
         "spyre page: {} sweeps -> {}",
         sweeps.len(),
@@ -1339,7 +1723,12 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Sweep, problems};
+    use std::path::PathBuf;
+
+    use super::{
+        Dtype, Metric, Progress, Sweep, problems, progress_problems, progress_rows,
+        progress_vocabulary,
+    };
 
     /// A sweep of `cells`, with `extra` fields after them.
     fn sweep(cells: &str, extra: &str) -> serde_json::Result<Sweep> {
@@ -1385,5 +1774,144 @@ mod tests {
         );
         assert!(p[1].contains("both values must be measured"), "{p:?}");
         assert!(p[2].starts_with("target t: no cell"), "{p:?}");
+    }
+
+    /// A progress entry of `cells`, with `extra` fields after them.
+    fn progress(cells: &str, extra: &str) -> serde_json::Result<Progress> {
+        serde_json::from_str(&format!(
+            r#"{{
+                "schema": 1, "pr": 682, "title": "perf(spyre): t",
+                "head": "{}", "base": "{}",
+                "merged": "2026-10-21", "pod": "nickm2", "harness": "h",
+                "cells": [{cells}]{extra}
+            }}"#,
+            "1".repeat(40),
+            "2".repeat(40),
+        ))
+    }
+
+    /// A progress cell whose headlines are its sides' last runs.
+    const PCELL: &str = r#"{ "model": "granite-3.1-2b", "dtype": "fp16", "metric": "tok_s",
+                            "conc": 8, "context": "~1k",
+                            "main": 84.5, "pr": 94.62,
+                            "reps": { "main": [84.12, 84.5], "pr": [93.62, 94.62] } }"#;
+
+    #[test]
+    fn a_clean_progress_entry_has_no_problems() {
+        let p = progress(PCELL, "").expect("parses");
+        let problems = progress_problems(&p);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn a_misspelt_progress_key_fails_rather_than_dropping_out() {
+        let err = progress(PCELL, r#", "gate": "x""#).err().expect("refused");
+        assert!(err.to_string().contains("unknown field `gate`"), "{err}");
+    }
+
+    #[test]
+    fn progress_problems_name_a_cherry_picked_headline_a_single_run_and_a_short_sha() {
+        // A headline that is not its side's last run: a cherry-picked rep.
+        let picked = PCELL.replace(r#""main": 84.5"#, r#""main": 84.9"#);
+        // One run a side, against two on the other.
+        let single = PCELL.replace(
+            r#""reps": { "main": [84.12, 84.5], "pr": [93.62, 94.62] } }"#,
+            r#""reps": { "main": [84.5], "pr": [93.62, 94.62] } }"#,
+        );
+        let picked = progress_problems(&progress(&picked, "").expect("parses"));
+        assert_eq!(picked.len(), 1, "{picked:?}");
+        assert!(
+            picked[0].contains("main headline 84.9 is not its last run (84.5)"),
+            "{picked:?}"
+        );
+        let single = progress_problems(&progress(&single, "").expect("parses"));
+        assert_eq!(single.len(), 2, "{single:?}");
+        assert!(single[0].contains("main has 1 run(s)"), "{single:?}");
+        assert!(
+            single[1].contains("1 main run(s) against 2 pr run(s); the sides must match"),
+            "{single:?}"
+        );
+        let mut short = progress(PCELL, "").expect("parses");
+        short.head = "abc".to_string();
+        let short = progress_problems(&short);
+        assert_eq!(short.len(), 1, "{short:?}");
+        assert!(
+            short[0].contains("head abc is not a full commit sha"),
+            "{short:?}"
+        );
+    }
+
+    #[test]
+    fn progress_vocabulary_refuses_a_model_or_context_the_sweeps_never_measured() {
+        let sweeps = vec![(PathBuf::new(), sweep(CELL, "").expect("parses"))];
+        let on_grid = progress(PCELL, "").expect("parses");
+        assert!(progress_vocabulary(&[(PathBuf::new(), on_grid)], &sweeps).is_empty(),);
+        let away = progress(
+            &PCELL
+                .replace("granite-3.1-2b", "granite-3.1-3b")
+                .replace("~1k", "~5k"),
+            "",
+        )
+        .expect("parses");
+        let off = progress_vocabulary(&[(PathBuf::new(), away)], &sweeps);
+        assert_eq!(off.len(), 2, "{off:?}");
+        assert!(
+            off[0].contains("model granite-3.1-3b is not one the sweeps measured"),
+            "{off:?}"
+        );
+        assert!(
+            off[1].contains("context ~5k is not one the sweeps measured"),
+            "{off:?}"
+        );
+    }
+
+    #[test]
+    fn progress_rows_take_the_newest_source_and_never_torch_from_a_pr() {
+        // The sweep (2026-10-17) holds the cell: scratchy 84.5, torch 45.0 —
+        // and an ITL cell no progress entry measures, which must not grow a
+        // row: the table is the cells the PRs are moving, nothing else.
+        let sweeps = vec![(
+            PathBuf::new(),
+            sweep(
+                &format!(
+                    r#"{{ "model": "granite-3.1-2b", "dtype": "fp16", "metric": "tok_s",
+                        "conc": 8, "context": "~1k", "torch": 45.0, "scratchy": 84.5 }}, {CELL}"#
+                ),
+                "",
+            )
+            .expect("parses"),
+        )];
+        // One PR merged after the sweep, one before it: only the newer one's
+        // value may supersede the sweep's. Its cell carries a note, which
+        // lands on the row with its value.
+        let after = progress(
+            &PCELL.replace(
+                r#""reps": { "main": [84.12, 84.5], "pr": [93.62, 94.62] } }"#,
+                r#""reps": { "main": [84.12, 84.5], "pr": [93.62, 94.62] },
+                   "note": "rep 2 of a back-to-back boot" }"#,
+            ),
+            "",
+        )
+        .expect("parses");
+        let mut before = progress(PCELL, "").expect("parses");
+        before.merged = "2026-10-16".to_string();
+        let rows = progress_rows(
+            &[(PathBuf::new(), before), (PathBuf::new(), after)],
+            &sweeps,
+        );
+        let key = (
+            "granite-3.1-2b".to_string(),
+            Dtype::Fp16,
+            Metric::TokS,
+            8,
+            "~1k".to_string(),
+        );
+        assert_eq!(rows.len(), 1, "an unmoved sweep cell has no row");
+        let row = rows.get(&key).expect("the cell has a row");
+        assert_eq!(row.latest, 94.62);
+        assert_eq!(row.source, "PR #682, 2026-10-21");
+        // Torch comes from the sweep, whichever PR is newer.
+        assert_eq!(row.torch, Some((45.0, "2026-10-17".to_string())));
+        assert_eq!(row.note.as_deref(), Some("rep 2 of a back-to-back boot"));
     }
 }
