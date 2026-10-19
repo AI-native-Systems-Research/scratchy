@@ -18,7 +18,7 @@ use scratchy_subtile::handoff::{LoweredDecode, SlotMap, WeightKind, WeightSlot};
 use scratchy_subtile::kv_codec::{KvCodecError, expand_kv_codec};
 use scratchy_subtile::sample_rows::{SampleRowsError, expand_sample_rows};
 use scratchy_subtile::subtile_ir::ExpertBody;
-use scratchy_subtile::tape_colouring::{Colour, ColourCount, ColourError, colour_tape};
+use scratchy_subtile::tape_colouring::{ColourCount, ColourError, colour_tape};
 use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, fold_tape};
 use scratchy_subtile::wave_schedule::wave_order;
 use scratchy_target_metal::from_tape::{TapeItem, roll_at};
@@ -210,8 +210,8 @@ pub enum RollOutcome {
 pub struct MetalCanonical {
     pub steps: MetalStepTape,
     pub colours: ColourCount,
-    /// The colour holding the forward's result.
-    pub result: Colour,
+    /// The slot holding the forward's result.
+    pub result: ArenaSlotIdx,
     /// The colour holding every row's final hidden state after the forward ran.
     pub hidden: ArenaSlotIdx,
     /// `(tile, output)` → colour, what the arena statics are sized from.
@@ -464,7 +464,7 @@ pub fn lower_canonical(
          {} barriers a decode step)",
         backbone.len(),
         colour_count.get(),
-        result.index(),
+        result.0,
         barriers,
     );
     Ok(MetalCanonical {

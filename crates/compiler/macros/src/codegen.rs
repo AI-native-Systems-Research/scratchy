@@ -14359,7 +14359,7 @@ pub fn emit_model(
             .unwrap_or_else(|e| panic!("[m2-flip] {stem} m={m}: {e}"));
         *ns_field = lowered.colours.get();
         *bb_slot_field = lowered.hidden.0;
-        *term_field = lowered.result.index();
+        *term_field = lowered.result.0;
         // Arena sizing evaluates a FUF shape per colour, so colour 0 (the embedded hidden) is
         // keyed by the FUF Embed tile.
         let mut arena = lowered.arena;

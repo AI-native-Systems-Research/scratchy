@@ -197,7 +197,7 @@ pub struct OpColours {
     arena: SlotMap,
     by_tile: BTreeMap<(u32, u8), u32>,
     count: ColourCount,
-    result: Colour,
+    result: Slot,
 }
 
 impl OpColours {
@@ -245,14 +245,48 @@ impl OpColours {
                 _ => arena.insert_at(TileId(tile), 0, c),
             }
         }
-        let by_tile = arena.entries().map(|((t, s), c)| ((t.0, *s), *c)).collect();
-        Ok(Self {
+        let mut colours = Self {
+            by_tile: arena.entries().map(|((t, s), c)| ((t.0, *s), *c)).collect(),
             arena,
-            by_tile,
             count: colouring.count(),
-            result: colouring.result(),
-        })
+            result: Slot(colouring.result().index()),
+        };
+        colours.pin_hidden(l)?;
+        Ok(colours)
     }
+
+    /// ⛔ THE HIDDEN STATE IS [`Self::HIDDEN`] IN EVERY BUCKET. The host reads it by pointer (an MTP
+    /// head's next input), so its slot is allocated in full, and the arena sizes a slot by the
+    /// largest thing any bucket keeps in it. Left where the scan put it, it moves from bucket to
+    /// bucket, and its slot is sized by another bucket's tensor: on Qwen3.6-35B-A3B's head, the
+    /// 512 MiB logits where the host reads 16 KiB. A colour holds one shape, so swapping it with
+    /// `HIDDEN` across the bucket's every entry puts only `[m, hidden]` tiles there.
+    fn pin_hidden(&mut self, l: &LoweredDecode) -> Result<(), StepRefusal> {
+        let from = self.hidden(l)?.0;
+        let to = Self::HIDDEN.0;
+        if from == to || from == Colour::ZERO.index() || to >= self.count.get() {
+            return Ok(());
+        }
+        let swap = |c: u32| match c {
+            c if c == from => to,
+            c if c == to => from,
+            c => c,
+        };
+        let mut arena = SlotMap::new();
+        for (&(t, s), &c) in self.arena.entries() {
+            arena.insert_at(t, s, swap(c));
+        }
+        self.arena = arena;
+        for c in self.by_tile.values_mut() {
+            *c = swap(*c);
+        }
+        self.result = Slot(swap(self.result.0));
+        Ok(())
+    }
+
+    /// The slot every bucket's hidden state is pinned to ([`Self::pin_hidden`]): the first colour
+    /// after the embedded hidden's.
+    pub const HIDDEN: Slot = Slot(1);
 
     fn at(&self, tile: u32, slot: u8) -> Result<Slot, Refused> {
         let c = self.by_tile.get(&(tile, slot));
@@ -280,7 +314,8 @@ impl OpColours {
         self.count
     }
 
-    pub fn result(&self) -> Colour {
+    /// The slot holding the forward's result.
+    pub fn result(&self) -> Slot {
         self.result
     }
 
@@ -295,7 +330,7 @@ impl OpColours {
                 };
                 self.of(l, j).map_err(why)
             }
-            None => Ok(Slot(self.result.index())),
+            None => Ok(self.result),
         }
     }
 }
