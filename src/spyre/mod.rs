@@ -1308,6 +1308,43 @@ fn progress_timelines(
     out
 }
 
+/// The rendered sweep, freshened: a cell any perf PR re-measured since the
+/// sweep shows the PR's value — in the heat maps, the grids, the tables and
+/// the tiles, everything the page draws from the sweep — with a note naming
+/// the PR and both numbers. Torch's value stays the sweep's own (no PR
+/// re-measures torch), and the sweep files stay the record; only this
+/// rendered view carries the newer numbers. Returns the sources it applied.
+fn apply_progress(sweep: &mut Sweep, rows: &BTreeMap<CellKey, ProgressRow>) -> Vec<String> {
+    let mut sources = BTreeSet::new();
+    for c in &mut sweep.cells {
+        let Some(context) = c.context.clone() else {
+            continue;
+        };
+        let key = (c.model.clone(), c.dtype, c.metric, c.conc, context);
+        let Some(row) = rows.get(&key) else { continue };
+        // Only a PR-sourced row is newer than this sweep's own value: a
+        // sweep newer than every PR leaves the cell as it measured it.
+        if !row.order.1 {
+            continue;
+        }
+        let from = c.scratchy;
+        c.scratchy = row.latest;
+        let line = format!(
+            "{}: {} → {}",
+            row.source,
+            fmt_unit(c.metric, from),
+            fmt_unit(c.metric, row.latest)
+        );
+        sources.insert(row.source.clone());
+        c.note = Some(match c.note.take() {
+            Some(n) if n.ends_with('.') => format!("{n} {line}."),
+            Some(n) => format!("{n}. {line}."),
+            None => format!("{line}."),
+        });
+    }
+    sources.into_iter().collect()
+}
+
 /// A progress cell must land on the page's grid: its model and its context
 /// have to be ones the sweeps measured, or its values cannot join anything
 /// the page shows.
@@ -1782,10 +1819,17 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
             .collect::<Vec<_>>()
             .join("\n"));
     }
-    // The page charts the latest sweep; the about table lists every one.
-    let latest = sweeps.last().map(|(_, s)| s);
+    // The page charts the latest sweep, freshened by the progress entries:
+    // a cell a perf PR re-measured since shows the PR's value. The about
+    // table lists every sweep; the sweep files stay the record.
+    let rows = progress_rows(&progress, &sweeps);
+    let latest = sweeps.last().map(|(_, s)| {
+        let mut fresh = s.clone();
+        let sources = apply_progress(&mut fresh, &rows);
+        (fresh, sources)
+    });
     let mut sections: Vec<(String, String)> = Vec::new();
-    let (intro, tiles, body) = match latest {
+    let (intro, tiles, body) = match &latest {
         None => (
             rsx! {
                 "scratchy's Spyre path against torch-spyre on one Spyre card, per A/B sweep."
@@ -1798,7 +1842,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
                 }
             },
         ),
-        Some(sweep) => {
+        Some((sweep, freshened)) => {
             sections.push(("glance".to_string(), "At a glance".to_string()));
             sections.push(("decode".to_string(), "Decode".to_string()));
             sections.push(("prefill".to_string(), "Prefill".to_string()));
@@ -1827,6 +1871,15 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
                         ", torch-spyre measured {torch.measured} on \
                          {torch.host.as_deref().unwrap_or(\"the card\")}. Two harnesses, one \
                          card: compare ratios, not absolutes."
+                    }
+                    if !freshened.is_empty() {
+                        p {
+                            "Fresh since that sweep: " code { "{freshened.join(\", \")}" }
+                            " — every cell those PRs re-measured shows the PR's value \
+                             through this page, torch's value staying the sweep's; each \
+                             cell's note names its PR and both numbers, and the Progress \
+                             section holds every run."
+                        }
                     }
                 },
                 tiles(sweep),
@@ -1900,8 +1953,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        Dtype, Metric, Progress, Sweep, problems, progress_problems, progress_rows,
-        progress_timelines, progress_vocabulary,
+        CellKey, Dtype, Metric, Progress, Sweep, apply_progress, problems, progress_problems,
+        progress_rows, progress_timelines, progress_vocabulary,
     };
 
     /// A sweep of `cells`, with `extra` fields after them.
@@ -2131,5 +2184,57 @@ mod tests {
         // Torch's line breaks at the PR: no PR re-measures torch.
         let torch: Vec<Option<f64>> = steps.iter().map(|s| s.rival).collect();
         assert_eq!(torch, vec![Some(45.0), Some(45.0), None]);
+    }
+
+    #[test]
+    fn apply_progress_freshens_only_cells_a_pr_re_measured() {
+        // A sweep holding the cell (torch 63.0, scratchy 46.6, with a note),
+        // and a second cell no progress entry touches.
+        let mut s = sweep(
+            &format!(
+                r#"{{ "model": "granite-3.1-2b", "dtype": "fp16", "metric": "tok_s",
+                    "conc": 8, "context": "~1k", "torch": 45.0, "scratchy": 84.5,
+                    "note": "rep 2 of a boot." }}, {CELL}"#
+            ),
+            "",
+        )
+        .expect("parses");
+        let key: CellKey = (
+            "granite-3.1-2b".to_string(),
+            Dtype::Fp16,
+            Metric::TokS,
+            8,
+            "~1k".to_string(),
+        );
+        let row = |is_pr: bool| super::ProgressRow {
+            latest: if is_pr { 94.62 } else { 90.0 },
+            source: if is_pr {
+                "PR #692, 2026-10-19".to_string()
+            } else {
+                "sweep 2026-10-19".to_string()
+            },
+            order: ("2026-10-19".to_string(), is_pr, if is_pr { 692 } else { 0 }),
+            torch: Some((45.0, "2026-10-17".to_string())),
+            note: None,
+        };
+        let mut rows = std::collections::BTreeMap::new();
+        // A sweep-sourced row is not newer than the sweep it renders: the
+        // cell stays as measured.
+        rows.insert(key.clone(), row(false));
+        assert!(apply_progress(&mut s, &rows).is_empty());
+        assert_eq!(s.cells[0].scratchy, 84.5);
+        // A PR-sourced row freshens the cell, names the PR with both
+        // numbers, and leaves torch and every other cell alone.
+        rows.insert(key, row(true));
+        let applied = apply_progress(&mut s, &rows);
+        assert_eq!(applied, ["PR #692, 2026-10-19".to_string()]);
+        assert_eq!(s.cells[0].scratchy, 94.62);
+        assert_eq!(s.cells[0].torch, 45.0);
+        assert_eq!(
+            s.cells[0].note.as_deref(),
+            Some("rep 2 of a boot. PR #692, 2026-10-19: 84.5 tok/s → 94.6 tok/s.")
+        );
+        assert_eq!(s.cells[1].scratchy, 46.6);
+        assert_eq!(s.cells[1].note, None);
     }
 }

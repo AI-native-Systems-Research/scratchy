@@ -20,7 +20,7 @@ use serde::Deserialize;
 use crate::charts::Better;
 
 /// A whole A/B sweep.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sweep {
     pub schema: u32,
@@ -53,7 +53,7 @@ pub struct Sweep {
 }
 
 /// One row of "What moved": a change and what it did, in numbers.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Moved {
     /// The PR, or PRs: "#566–#568".
@@ -62,7 +62,7 @@ pub struct Moved {
 }
 
 /// One row of "Open levers": where, and the work.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Lever {
     /// The cell or theme: "8b 10k decode".
@@ -71,7 +71,7 @@ pub struct Lever {
 }
 
 /// Each section's closing paragraphs.
-#[derive(Default, Deserialize)]
+#[derive(Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Notes {
     #[serde(default)]
@@ -86,7 +86,7 @@ pub struct Notes {
 
 /// What one cell should reach, and why: the page sets it beside today's
 /// value there.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
     /// The tile's heading: "8b moonshot · short-context ITL".
@@ -104,7 +104,7 @@ pub struct Target {
 }
 
 /// One side's provenance: when, where and how its half of the sweep ran.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provenance {
     pub measured: String,
@@ -181,7 +181,7 @@ impl Dtype {
 
 /// One measured cell: both stacks' value at one model, dtype, metric,
 /// concurrency and context bucket.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cell {
     pub model: String,
