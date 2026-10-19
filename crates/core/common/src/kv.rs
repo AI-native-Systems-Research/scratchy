@@ -352,6 +352,31 @@ impl KvExtent {
             .blocks_this_step(block, reach, tokens_through_this_step, writing)
     }
 
+    /// ⭐ BLOCKS A **PROMPT CHUNK** NEEDS — [`Self::blocks_needed`] with nothing appended PAST the span.
+    ///
+    /// A step whose tokens are all prompt positions writes them AT those positions, every one inside
+    /// `tokens_through_this_step` — it is not a batched append, which is the only write that lands past a
+    /// request's span (at the batch's shared slot). So the chunk is covered by the token term, and adding it
+    /// to the span as well charges for it twice.
+    ///
+    /// 🛑 IT WAS CHARGED TWICE, AND THAT STARVED ONE REQUEST PER WAVE (#694). A worker that shares one
+    /// write slot reports every live request at the POOL's future write bound, which already reaches each
+    /// one's prompt end; `span + writing` then put a whole scheduler step's budget past it — 49-50 blocks
+    /// for a 10300-token prompt that needs 42 plus the write page, held for life because an allocation
+    /// only grows. MEASURED on granite-3.1-2b fp16 at `--max-num-seqs 4` (192 blocks): four such requests
+    /// asked for 200, so in every wave one of them waited out a whole batch-mate (ttft 136-142 s against
+    /// 9-31 s).
+    pub fn blocks_for_prompt_chunk(
+        self,
+        block: KvBlockTokens,
+        tokens_through_this_step: usize,
+        reach: KvSlotSpan,
+        inflight: InflightSlots,
+    ) -> usize {
+        self.span_now(inflight)
+            .blocks_this_step(block, reach, tokens_through_this_step, 0)
+    }
+
     /// ⭐ FULL BLOCKS A TOKEN-INDEXED CACHE MAY HASH — the caching rule, in the same one place.
     ///
     /// Capped by the cacheable prefix AND by whole blocks: a block hashed over anything past the first
@@ -505,6 +530,28 @@ mod step_reach_proofs {
         );
     }
 
+    /// ⭐ A PROMPT CHUNK IS COVERED AND NEVER CHARGED MORE THAN THE GENERAL RULE. Its pages hold every
+    /// position it writes (the token term) and the reported span; and dropping the append past the span
+    /// can only lower the count — #694's fix removes blocks, it never adds one.
+    #[kani::proof]
+    fn a_prompt_chunk_is_covered_and_never_charged_more() {
+        let (span, reach, block, own, writing) = inputs();
+        let e = KvExtent::new(span, CacheableTokens::NONE);
+        let chunk = e.blocks_for_prompt_chunk(block, own, reach, InflightSlots::NONE);
+        assert!(
+            chunk * block.get() >= own,
+            "every position the chunk writes"
+        );
+        assert!(
+            chunk * block.get() >= span.get() as usize,
+            "and every slot the report says it spans"
+        );
+        assert!(
+            chunk <= e.blocks_needed(block, own, writing, reach, InflightSlots::NONE),
+            "never more than the general rule"
+        );
+    }
+
     /// A TOKEN-ADDRESSED BACKEND IS UNTOUCHED. cuda and metal report no pool reach, so they pass
     /// [`KvSlotSpan::NONE`] and must get byte-identical arithmetic to what they had before the reach existed.
     #[kani::proof]
@@ -523,6 +570,27 @@ mod tests {
     fn a_zero_block_size_is_not_a_block_size() {
         assert!(KvBlockTokens::new(0).is_none());
         assert_eq!(KvBlockTokens::new(256).map(|b| b.get()), Some(256));
+    }
+
+    /// #694's arithmetic. A 10300-token prompt in a pool whose reported write bound is its own prompt end,
+    /// prefilling its second 2048-token chunk: the chunk sits inside the prompt, so the request needs its
+    /// prompt's pages — not the prompt plus a chunk's worth more.
+    #[test]
+    fn a_prompt_chunk_is_not_charged_past_a_span_that_already_reaches_its_prompt() {
+        let block = KvBlockTokens::new(256).expect("256 > 0");
+        let reported = KvExtent::new(KvSlotSpan::new(10300), CacheableTokens::new(2048));
+        let (through, chunk) = (4096, 2048);
+        let reach = KvSlotSpan::new(10300);
+        assert_eq!(
+            reported.blocks_needed(block, through, chunk, reach, InflightSlots::NONE),
+            49,
+            "the general rule puts the chunk past the span: ceil((10300 + 2048) / 256)"
+        );
+        assert_eq!(
+            reported.blocks_for_prompt_chunk(block, through, reach, InflightSlots::NONE),
+            41,
+            "a prompt chunk writes inside its own tokens: ceil(10300 / 256), the span it already holds"
+        );
     }
 
     #[test]

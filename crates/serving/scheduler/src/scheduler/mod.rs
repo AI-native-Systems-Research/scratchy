@@ -14,6 +14,8 @@
 //! * `recurrent_state` -- The prefix cache's recurrent-state (GDN) snapshot index.
 //! * `shared_memory` -- The budget KV and those snapshots share.
 
+#[cfg(test)]
+mod batched_admission_tests;
 pub mod core;
 pub mod interface;
 pub mod output;

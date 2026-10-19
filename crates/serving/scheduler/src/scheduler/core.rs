@@ -1861,7 +1861,25 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         // `PoolDemand::of_declaration(--max-model-len, --max-num-seqs)` already bought; against the old
         // hardcoded 8 GiB it would have exhausted the pool.
         let reach = self.step_reach;
+        // ⭐ EVERY POSITION THIS STEP COMPUTES IS A PROMPT POSITION — a prompt chunk, which writes its keys
+        // AT those positions, inside its own token count. Only a step past the prompt can append at a shared
+        // write slot beyond the span, so only it adds `writing` to the span (#694: a chunk charged both ways
+        // held a whole token budget of blocks past its prompt for life).
+        let prompt_chunk = request.num_computed_tokens as usize + num_new_tokens
+            <= request.num_prompt_tokens as usize;
         let needed = match request.kv_extent {
+            // ⭐ …AND IT EXTENDS THE RUN THE WORKER REPORTED. The chunk writes `[computed, computed + n)` at
+            // token positions only after a contiguous run that stops at or before `computed` — which every
+            // report of a prefilling request is (equal when synchronous, one step behind under async). A report
+            // whose token-addressed run already reaches PAST `computed` describes keys the scheduler is about to
+            // recompute, i.e. a history the two sides disagree about, and keeps the conservative arithmetic.
+            Some(e)
+                if prompt_chunk
+                    && e.cacheable_tokens().get() as usize
+                        <= request.num_computed_tokens as usize =>
+            {
+                e.blocks_for_prompt_chunk(block, total_tokens, reach, request.kv_inflight_slots())
+            }
             // ⛔ AGED BY THE STEPS IN FLIGHT. The report is from the last FINALIZED step, which under async
             // scheduling is not the step before this one — see `Request::kv_inflight_slots` and
             // [`scratchy_core_common::InflightSlots`] for the card measurement this closes.
@@ -2778,6 +2796,9 @@ impl Scheduler {
         // Async scheduling: reset placeholder count so the request is
         // re-scheduled from scratch after resuming.
         request.num_output_placeholders = 0;
+        // ⛔ ITS BLOCKS WERE JUST FREED, SO IT HAS NO KV EXTENT. The worker's report described keys this
+        // request no longer holds; kept, it sizes the re-admission as if they were still there (#694).
+        request.kv_extent = None;
 
         // Sync to canonical requests map.
         if let Some(canonical) = self.requests.get_mut(&request.request_id) {
@@ -2786,6 +2807,7 @@ impl Scheduler {
             canonical.spec_token_ids.clear();
             canonical.num_preemptions = request.num_preemptions;
             canonical.num_output_placeholders = 0;
+            canonical.kv_extent = None;
         }
     }
 
@@ -3036,8 +3058,15 @@ impl Scheduler {
         self.kv_cache.commit_state_saves(saves);
     }
 
+    ///
+    /// ⛔ ONLY FOR A REQUEST THAT IS RUNNING. A worker reports every request it still holds, and it is told
+    /// only about FINISHED ones — so a preempted request, whose blocks are freed, keeps being reported, and
+    /// writing that into its record would size its re-admission by KV it no longer has (#694).
     pub fn set_kv_extent(&mut self, request_id: &str, extent: scratchy_core_common::KvExtent) {
         if let Some(request) = self.requests.get_mut(request_id) {
+            if request.status != RequestStatus::Running {
+                return;
+            }
             request.kv_extent = Some(extent);
         }
         if let Some(&idx) = self.running_req_idx.get(request_id) {
