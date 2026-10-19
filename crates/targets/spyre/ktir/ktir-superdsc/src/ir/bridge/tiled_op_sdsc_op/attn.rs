@@ -2126,12 +2126,17 @@ fn assemble_new_block_chunk(
             blocks.first_head(b) * mq,
             row_block_name(blocks, b),
         );
-        let blk = wide.block(b).dev();
+        // ⭐ THE SCORE AND THE PROBABILITIES ARE CORE-LOCAL LX, ONE ROW BLOCK AT A TIME. Each is one core's
+        // slice of ONE row block (`sc`, `esub`, `exp`, declared by the caller), reused block after block,
+        // so every op addresses them at the pin — offset 0, no block corner. Every op here divides the
+        // block's ROWS alone, the score too (`MatN::of_new_block_scores`), so core `c` reads exactly the
+        // rows core `c` wrote; `emit`'s core-local read law compares each op's slice at build.
+        let at_pin = DevOff::ZERO;
         let (m, q, q_off) = row_block_query(blocks, b, mq, nqh, hd, qs)?;
         ops.push(assemble_matmul_off_with_epilogue(
             &format!("attn_ncsc_{bn}_o{t}"),
             m,
-            MatN::of_kv_window(cols),
+            MatN::of_new_block_scores(cols),
             MatK::of_head_dim(hd),
             MatY::unbatched(),
             bmm_form,
@@ -2140,9 +2145,9 @@ fn assemble_new_block_chunk(
             &Stk::<KernelTag>::kernel(hd as usize, slots as usize, new_kt),
             kt.block(kvh).dev(),
             &rb(sc, g_rows, slots),
-            blk,
+            at_pin,
             &rb(cmask, g_rows, slots),
-            blk,
+            wide.block(b).dev(),
             EpilogueOpFunc::StridedAdd,
             &[],
             false,
@@ -2155,7 +2160,7 @@ fn assemble_new_block_chunk(
             grp_rows,
             cols,
             &rb(sc, g_rows, slots),
-            blk,
+            at_pin,
             &hm(&bufs.run_m),
             row_step(h0),
             sym_id_base,
@@ -2167,11 +2172,11 @@ fn assemble_new_block_chunk(
             grp_rows,
             cols,
             &[
-                In::sliced(&rb(sc, g_rows, slots), blk).ew(),
+                In::sliced(&rb(sc, g_rows, slots), at_pin).ew(),
                 In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
             ],
             &rb(esub, g_rows, slots),
-            DevOff::ZERO,
+            at_pin,
             sym_id_base,
             layout,
         ));
@@ -2180,9 +2185,9 @@ fn assemble_new_block_chunk(
             "exp",
             grp_rows,
             cols,
-            &[In::sliced(&rb(esub, g_rows, slots), DevOff::ZERO).ew()],
+            &[In::sliced(&rb(esub, g_rows, slots), at_pin).ew()],
             &rb(exp, g_rows, slots),
-            blk,
+            at_pin,
             sym_id_base,
             layout,
         ));
@@ -2192,7 +2197,7 @@ fn assemble_new_block_chunk(
             grp_rows,
             cols,
             &rb(exp, g_rows, slots),
-            blk,
+            at_pin,
             &hm(&bufs.run_l),
             row_step(h0),
             sym_id_base,
@@ -2220,7 +2225,7 @@ fn assemble_new_block_chunk(
                 MatY::unbatched(),
                 bmm_form,
                 &rb(exp, g_rows, slots),
-                blk,
+                at_pin,
                 &Stk::<KernelTag>::kernel(slots as usize, v.v_cols as usize, new_v),
                 v_off,
                 &rb(&bufs.run_o, q_rows, hd),
@@ -3992,20 +3997,31 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         );
         let g_rows = blocks.rows();
         if let Some(l) = layout {
-            for r in [R::NewChunkSc, R::NewChunkExp] {
-                l.synth(out_id.synth(r), &[nqh * mq, cols.get()]);
+            // ⭐⭐ THE WHOLE BLOCK NEVER LEAVES LX — score, `esub` and `exp` are each one core's slice of one
+            // row block, reused block after block, exactly as the chunk's `cesub`/`cexp`. Every op over them
+            // divides the block's rows alone, so one rows-first slice sizes all three; the read law holds each
+            // op to it at build. MEASURED before this (granite-2b fp16, 512 rows, RB_TIME): the score and
+            // `exp` blocks made six HBM passes per kv head — 12 MB at ~100 GB/s, the whole of the block's
+            // 119 µs — and the block was 18% of a ~1k prompt's device time.
+            //
+            // ⛔ THE PINS COME OUT OF #675's ONE WINDOW BUDGET (`lx_window_fits`): `synth_lx_core_local`
+            // panics at expansion when the core-local pins and the op-local slots would meet, so a geometry
+            // whose block does not fit is a build failure, never an on-card overlap.
+            for (r, inputs) in [
+                (R::NewChunkSc, 2u32),
+                (R::NewChunkESub, 2),
+                (R::NewChunkExp, 1),
+            ] {
+                let slice = crate::emit::pointwise_untiled_slice_bytes(g_rows, cols.get(), inputs)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "attention o{t}: the {g_rows}-row causal new block is time-tiled at {} \
+                             columns, so its {r} has no core-local slice to pin in LX",
+                            cols.get()
+                        ))
+                    })?;
+                l.synth_lx_core_local(out_id.synth(r), slice);
             }
-            // ⭐ `esub`'s output never leaves LX — one core's slice of one row block, reused block after
-            // block, exactly as the chunk's `cesub`.
-            let slice = crate::emit::pointwise_untiled_slice_bytes(g_rows, cols.get(), 2)
-                .ok_or_else(|| {
-                    SuperDscError(format!(
-                        "attention o{t}: the {g_rows}-row causal new block is time-tiled at {} columns, \
-                         so its esub output has no core-local slice to pin in LX",
-                        cols.get()
-                    ))
-                })?;
-            l.synth_lx_core_local(out_id.synth(R::NewChunkESub), slice);
         }
         assemble_new_block_chunk(
             &mut ops,

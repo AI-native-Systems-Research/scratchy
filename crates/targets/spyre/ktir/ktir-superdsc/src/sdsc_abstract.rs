@@ -945,12 +945,20 @@ pub struct MatN(u32, OutputSplit);
 /// its columns alone, one whole stick per core, with its rows whole. The planner would also split a
 /// part's handful of rows once its columns run out (`mb:2 × out:16` at a 4-page part), which hands a
 /// core a slice another core holds. `emit`'s core-local read law refuses that at build.
+///
+/// [`MatN::of_new_block_scores`] is the other: the chunk-formed causal new-token block's score, whose
+/// `[rows, mq_pad]` block stays in a CORE-LOCAL LX scratch through its row max, `esub`, `exp`, row sum
+/// and PV. Every one of those consumers is the pointwise/reduce/matmul door dividing the block's ROWS
+/// alone (`{mb: 32}`), so the score must too: the planner's `{mb: 8, out: 4}` hands core `c` a quarter
+/// of the columns of a quarter of the rows — a slice no consumer on core `c` reads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OutputSplit {
     /// The matmul's own work division (`matmul_split_map` and its regimes), unchanged.
     Planned,
     /// Every core takes a whole-stick run of the output columns; rows and contraction stay whole.
     ColumnsAcrossCores,
+    /// Every core takes a run of the output ROWS; columns and contraction stay whole.
+    RowsAcrossCores,
 }
 
 impl MatN {
@@ -968,6 +976,12 @@ impl MatN {
     /// ([`OutputSplit::ColumnsAcrossCores`], which says why).
     pub const fn of_chunk_decode_scores(width: BlockCols) -> MatN {
         MatN(width.get(), OutputSplit::ColumnsAcrossCores)
+    }
+    /// ⭐ THE CHUNK-FORMED CAUSAL NEW-TOKEN BLOCK's SCORE — its ROWS divided across the cores
+    /// ([`OutputSplit::RowsAcrossCores`], which says why), so it writes the core-local slice its row
+    /// max, `esub`, `exp`, row sum and PV read.
+    pub const fn of_new_block_scores(width: BlockCols) -> MatN {
+        MatN(width.get(), OutputSplit::RowsAcrossCores)
     }
     /// Exactly ONE stick of output columns — the identity-slab copies, whose write is deliberately
     /// one stick so the op has no plane term of its own to get wrong. The width is the machine's

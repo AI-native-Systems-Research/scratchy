@@ -173,6 +173,31 @@ pub(crate) fn matmul_split_map_columns(
     map
 }
 
+/// ⭐ THE ROWS-FIRST SPLITTER — every core a run of `mb`, columns and contraction whole.
+///
+/// Reached only through [`crate::sdsc_abstract::OutputSplit::RowsAcrossCores`] (the chunk-formed causal
+/// block's score, whose output stays core-local in LX for consumers that each divide its rows alone).
+/// The cores divide the rows exactly as the pointwise door's rows-first law does
+/// ([`crate::work::distribute_cores`]: `core_split(mb)`), so core `c`'s output slice IS the slice the
+/// row max, `esub`, `exp`, row sum and PV on core `c` read. Whether those slices agree is not assumed
+/// here — `emit`'s core-local read law compares every op's per-core slice at build.
+pub(crate) fn matmul_split_map_rows(
+    dims: &[crate::superdsc_opspec::ItDim],
+    max_cores: u32,
+) -> std::collections::BTreeMap<&'static str, u32> {
+    let mb = dims
+        .iter()
+        .find(|d| d.name == MbAxis::NAME)
+        .map(|d| d.size)
+        .unwrap_or(1);
+    let split = crate::work::core_split(mb, max_cores);
+    let mut map = std::collections::BTreeMap::new();
+    if split > 1 {
+        map.insert(MbAxis::NAME, split);
+    }
+    map
+}
+
 /// The work-division splitter signature `TileOp::tile` consumes — the type a rung regime's
 /// [`super::walk::RungRegime::split_map`] answers with.
 pub(crate) type SplitMapFn =
