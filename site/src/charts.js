@@ -10,9 +10,35 @@
 // that wrong geometry (a heatmap's columns came out uneven) even after it is
 // resized. `load` waits for those modules and the stylesheets; the fonts can
 // still move text, so wait for them too.
+//
+// The page follows the reader's system theme, Carbon's white or g100 class on
+// <html> (chrome.rs), and so does every chart: the build gives each colour
+// for both, and when the class changes the charts redraw in the new one.
 (function () {
+  // Carbon Charts' name for the page's theme, and the key of its colours.
+  function theme() {
+    return document.documentElement.classList.contains('cds--g100')
+      ? { carbon: 'g100', key: 'dark' }
+      : { carbon: 'white', key: 'light' };
+  }
+  // The spec's options in the theme: its colours, each {light, dark}, as
+  // the one Carbon draws there.
+  function themed(options, t) {
+    var out = Object.assign({}, options, { theme: t.carbon });
+    var color = options.color;
+    if (color && color.scale) {
+      var scale = {};
+      Object.keys(color.scale).forEach(function (group) { scale[group] = color.scale[group][t.key]; });
+      out.color = { scale: scale };
+    } else if (color && color.gradient) {
+      out.color = { gradient: { colors: color.gradient.colors.map(function (c) { return c[t.key]; }) } };
+    }
+    return out;
+  }
   function draw() {
     var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart };
+    var drawn = [];
+    var current = theme();
     document.querySelectorAll('[data-chart]').forEach(function (el) {
       var spec = JSON.parse(el.getAttribute('data-chart'));
       if (spec.ratio) {
@@ -34,7 +60,8 @@
           ? function (v) { var k = at.indexOf(v); return k >= 0 ? names[k] : String(v); }
           : String;
       }
-      var chart = new charts[spec.kind](el, { data: spec.data, options: spec.options });
+      var chart = new charts[spec.kind](el, { data: spec.data, options: themed(spec.options, current) });
+      drawn.push({ chart: chart, options: spec.options });
       var scale = el.dataset.scale && document.getElementById(el.dataset.scale);
       if (scale) highlightSteps(chart, spec, scale);
       if (spec.kind === 'combo') {
@@ -46,6 +73,12 @@
         chart.services.events.addEventListener('render-finished', function () { labelFactors(el, spec.data); });
       }
     });
+    new MutationObserver(function () {
+      var t = theme();
+      if (t.key === current.key) return;
+      current = t;
+      drawn.forEach(function (d) { d.chart.model.setOptions(themed(d.options, t)); });
+    }).observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
   }
   // Writes the factor, "×2.4", in each square the build marked a highlight,
   // to two figures so it fits the overview's small squares; a quarter of the
@@ -103,7 +136,7 @@
       text.setAttribute('pointer-events', 'none');
       text.style.fontSize = '9px';
       text.style.fontWeight = 'bold';
-      text.style.fill = '#161616';
+      text.style.fill = 'var(--cds-text-primary)';
     });
   }
   // The relative luminance of an "rgb(r, g, b)" colour, 0 black to 1 white.

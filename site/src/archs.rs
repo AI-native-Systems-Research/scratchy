@@ -10,7 +10,7 @@ use dioxus::prelude::*;
 use serde::Serialize;
 
 use crate::carbon::{CodeSnippet, Column, Grid, Heading, SideNav, SideNavLink, Span, Stack, Tile};
-use crate::chrome::{self, Content, Head, Library, Published, Root, Tab, Theme};
+use crate::chrome::{self, Content, Head, Library, Published, Root, Tab};
 use crate::highlight;
 use crate::{Site, thousands};
 
@@ -263,7 +263,6 @@ fn page(
             og: None,
             root: Root(0),
             libraries: &[Library::DiffView],
-            theme: Theme::FollowSystem,
         },
         body,
     )
