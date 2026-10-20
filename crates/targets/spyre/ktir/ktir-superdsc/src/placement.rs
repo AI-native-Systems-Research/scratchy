@@ -488,6 +488,33 @@ pub fn syn(layout: Option<&BundleLayout>, id: PlaceId) -> String {
     n
 }
 
+/// Door 1 of the window mints — the DECLARED-SHAPE bound, on the operand facts (name + declared
+/// [`StickLayout`]) rather than a handle. Shared by [`BundleLayout::check_window`] (which adds the
+/// placement door) and the pointwise family's operand mint, whose callers hold handles but no
+/// `BundleLayout` (every unit test; the gate probes). `off_elems` and the extents are ELEMENTS of
+/// the operand's own `df`.
+pub(crate) fn window_fits_declared(
+    name: &str,
+    layout: StickLayout,
+    off_elems: u64,
+    rows: u32,
+    cols: u32,
+    what: &str,
+) -> Result<(), String> {
+    let shape_elems = layout.rows as u64 * layout.cols as u64;
+    let end_elems = off_elems + rows as u64 * cols as u64;
+    if end_elems > shape_elems {
+        return Err(format!(
+            "{what}: the operand window [{off_elems}, {end_elems}) (elements) of '{name}' \
+             runs past the end its handle declares — {rows}×{cols} = {shape_elems} elements \
+             at {:?}. An op that sweeps past its own tensor is a defect in the computation \
+             that produced this offset; it cannot compile.",
+            layout.df,
+        ));
+    }
+    Ok(())
+}
+
 impl BundleLayout {
     /// The identity behind an emitted operand's spelling, or `None` if nothing minted it.
     pub fn id_of(&self, name: &str) -> Option<PlaceId> {
@@ -524,24 +551,39 @@ impl BundleLayout {
         cols: u32,
         what: &str,
     ) -> Result<Win<'a, K>, String> {
-        let layout = stk.layout();
+        self.check_window(
+            stk.name(),
+            stk.layout(),
+            off.into_raw_elems() as u64,
+            rows,
+            cols,
+            what,
+        )?;
+        Ok(Win::minted(stk, off, rows, cols))
+    }
+
+    /// ⭐ The placement-authority CHECK behind [`Self::win`], on the operand FACTS — the handle's
+    /// name and declared [`StickLayout`] — instead of the handle itself. For the kind-erased
+    /// operand lists the pointwise family lowers ([`crate::emit::EwOperand`]): one slice holds
+    /// many layout kinds, so none of them can mint a kind-tagged [`Win`], but every one of them
+    /// runs the SAME two doors against the same numbers. A facts-checked operand and a
+    /// handle-minted window can never disagree about where a tensor ends.
+    pub(crate) fn check_window(
+        &self,
+        name: &str,
+        layout: StickLayout,
+        off_elems: u64,
+        rows: u32,
+        cols: u32,
+        what: &str,
+    ) -> Result<(), String> {
         let word = layout.df.word_length() as u64;
         let shape_elems = layout.rows as u64 * layout.cols as u64;
         let shape_bytes = shape_elems * word;
-        let off_elems = off.into_raw_elems() as u64;
         let end_elems = off_elems + rows as u64 * cols as u64;
         let end_bytes = end_elems * word;
-        let name = stk.name();
         // 1. THE DECLARED SHAPE — the window fits the tensor the HANDLE declares.
-        if end_elems > shape_elems {
-            return Err(format!(
-                "{what}: the operand window [{off_elems}, {end_elems}) (elements) of '{name}' \
-                 runs past the end its handle declares — {rows}×{cols} = {shape_elems} elements \
-                 at {:?}. An op that sweeps past its own tensor is a defect in the computation \
-                 that produced this offset; it cannot compile.",
-                layout.df,
-            ));
-        }
+        window_fits_declared(name, layout, off_elems, rows, cols, what)?;
         // 2. THE PLACEMENT FOOTPRINT — `resolve_seg_base`'s three arms, same numbers, so the mint
         //    and the bake-time guard read ONE window model.
         if let Some((_pin, fp)) = self.lx_pin(name) {
@@ -550,13 +592,13 @@ impl BundleLayout {
             // its declared shape may be the full tensor's — the same early return the bake-time
             // guard takes. But it has no addressable offset: every core's slice starts AT the pin.
             if self.lx_core_local(name) {
-                if off != DevOff::ZERO {
+                if off_elems != 0 {
                     return Err(format!(
                         "{what}: core-local LX tensor '{name}' windowed at element {off_elems} — \
                          each core's slice sits at the pin, so a view into it has no offset to take"
                     ));
                 }
-                return Ok(Win::minted(stk, off, rows, cols));
+                return Ok(());
             }
             if end_bytes > fp {
                 return Err(format!(
@@ -573,7 +615,7 @@ impl BundleLayout {
                      declared shape. The layout and the handle disagree about this tensor."
                 ));
             }
-            return Ok(Win::minted(stk, off, rows, cols));
+            return Ok(());
         }
         // A real caller-bound buffer → its global placement. The id comes from the layout's own
         // mint table, NOT from picking the digits back out of the spelling.
@@ -600,7 +642,7 @@ impl BundleLayout {
                     layout.df,
                 ));
             }
-            return Ok(Win::minted(stk, off, rows, cols));
+            return Ok(());
         }
         // A SYNTHETIC intermediate — declared or refused; the mint never allocates.
         let s = self.synth.borrow();
@@ -627,7 +669,7 @@ impl BundleLayout {
                          this tensor."
                     ));
                 }
-                Ok(Win::minted(stk, off, rows, cols))
+                Ok(())
             }
         }
     }

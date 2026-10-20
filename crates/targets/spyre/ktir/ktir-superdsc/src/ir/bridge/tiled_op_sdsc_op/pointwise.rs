@@ -500,6 +500,13 @@ pub fn pointwise_broadcast_opspec_from_tile(
         out_offset.elems(),
     );
     let df = tile_op.df;
+    // ⭐ THE FAMILY MINT — every operand's swept window (the per-form broadcast law,
+    // `EwOperand::swept_extents`) checked against its handle's declared shape and, when a layout
+    // is at hand, its placement footprint, BEFORE any op is built. This is the #731 door for the
+    // elementwise family: an op that reads past its tensor is a build failure naming the tensor
+    // and the bound it exceeded — the class #717's card failure (`add_o1137` reading `t1131`
+    // past its footprint) belongs to.
+    crate::emit::mint_ew_operands(op.name(), rows, cols, df, inputs, layout)?;
     let block = (rows as u64) * (cols as u64);
     let block_aligned = |off: u32| block != 0 && (off as u64).is_multiple_of(block);
     // ⭐ A WHOLE-STICK COLUMN WINDOW IS A STICK-MAJOR CORNER TOO (#622) — admitted by its TYPE
@@ -664,6 +671,19 @@ pub fn assemble_pointwise_broadcast_off_from_tile<O: KindTag>(
     let out_offset = out_offset.into();
     let o_name = o.name();
     let head_major = O::kind() == StickKind::Flat;
+    // ⭐ THE OUTPUT MINT — the output window `rows × stick-padded cols` at the corner, checked
+    // against the output handle's declared shape and placement before any op is built (the
+    // write-side twin of the input mint in `pointwise_broadcast_opspec_from_tile` below).
+    crate::emit::mint_ew_output(
+        op_name,
+        o,
+        out_offset.elems(),
+        rows,
+        cols,
+        tile_op.df,
+        layout,
+    )
+    .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
     // ⛔ ONE SHARED LIST, NOT A SECOND COPY. This was a verbatim duplicate of the `const` in
     // `emit::assemble_pointwise_broadcast_off`, so a fix had to land in both — and `"mish"` had been
     // added to neither. See [`crate::emit::SFP_SPLIT_TRANSCENDENTALS`] for the geometry, the dxp

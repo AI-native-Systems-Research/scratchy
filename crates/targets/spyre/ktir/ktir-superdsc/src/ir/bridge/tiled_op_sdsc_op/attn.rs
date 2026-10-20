@@ -88,6 +88,15 @@ fn hm(name: &str) -> Stk<FlatTag> {
     fl(name, 1, BlockCols::of_one_stick(Lanes::FP16).get())
 }
 
+/// `hm` at the buffer's TRUE row count — the handle a window mint reads as a BOUND. The mint is
+/// the first reader of a handle's layout as a bound, so the one-stick-wide buffers declare their
+/// real `[rows, 64]` shape there instead of `hm`'s `1×64` annotation (the synth declarations are
+/// `[rows, 64]`, so the mint's shape door and footprint door agree exactly). Same kind (`FlatTag`)
+/// and annotation-only dims: the emit is byte-identical.
+fn hm_rows(name: &str, rows: u32) -> Stk<FlatTag> {
+    fl(name, rows, BlockCols::of_one_stick(Lanes::FP16).get())
+}
+
 /// The ONE-STICK-WIDE online-softmax buffers, IN DECLARATION ORDER.
 ///
 /// ⛔ THE ORDER IS THE ADDRESS ASSIGNMENT. `BundleLayout::synth` is a bump allocator, so moving an
@@ -1287,8 +1296,11 @@ fn assemble_attn_block(
             "maximum",
             rows.swept(),
             BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm(run_m)).ew(), In::full(&hm(bmax)).ew()],
-            &hm(newm),
+            &[
+                In::full(&hm_rows(run_m, rows_n)).ew(),
+                In::full(&hm_rows(bmax, rows_n)).ew(),
+            ],
+            &hm_rows(newm, rows_n),
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
@@ -1301,8 +1313,11 @@ fn assemble_attn_block(
             "subtract",
             rows.swept(),
             BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm(run_m)).ew(), In::full(&hm(newm)).ew()],
-            &hm(corrsubt),
+            &[
+                In::full(&hm_rows(run_m, rows_n)).ew(),
+                In::full(&hm_rows(newm, rows_n)).ew(),
+            ],
+            &hm_rows(corrsubt, rows_n),
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
@@ -1312,8 +1327,8 @@ fn assemble_attn_block(
             "exp",
             rows.swept(),
             BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm(corrsubt)).ew()],
-            &hm(corr),
+            &[In::full(&hm_rows(corrsubt, rows_n)).ew()],
+            &hm_rows(corr, rows_n),
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
@@ -1323,8 +1338,8 @@ fn assemble_attn_block(
             "identity",
             rows.swept(),
             BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm(newm)).ew()],
-            &hm(run_m),
+            &[In::full(&hm_rows(newm, rows_n)).ew()],
+            &hm_rows(run_m, rows_n),
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
@@ -1337,8 +1352,13 @@ fn assemble_attn_block(
         "subtract",
         rows.swept(),
         width,
-        &[In::full(&hm(sc)).ew(), In::col(&hm(run_m)).ew()],
-        &hm(esubt),
+        &[
+            // `sc`/`esubt` at the swept `[rows_n, width_n]` — the same dims the score matmul's
+            // own output handle declares, not `hm`'s `1×64` annotation.
+            In::full(&fl(sc, rows_n, width_n)).ew(),
+            In::col(&hm_rows(run_m, rows_n)).ew(),
+        ],
+        &fl(esubt, rows_n, width_n),
         crate::addr::DevOff::ZERO,
         sym_id_base,
         layout,
@@ -1348,8 +1368,8 @@ fn assemble_attn_block(
         "exp",
         rows.swept(),
         width,
-        &[In::full(&hm(esubt)).ew()],
-        &hm(expb),
+        &[In::full(&fl(esubt, rows_n, width_n)).ew()],
+        &fl(expb, rows_n, width_n),
         crate::addr::DevOff::ZERO,
         sym_id_base,
         layout,
@@ -1404,10 +1424,12 @@ fn assemble_attn_block(
             rows.swept(),
             BlockCols::of_head_dim(hd),
             &[
-                In::sliced(&hm(run_o), nests.head_major(0, 0)).ew(),
-                In::col(&hm(corr)).ew(),
+                // `run_o`/`otmp` at their true head-wide `[rows_n, hd]` — the HEAD_WIDE_BUFS synth
+                // dimensions, not `hm`'s `1×64` annotation.
+                In::sliced(&fl(run_o, rows_n, hd), nests.head_major(0, 0)).ew(),
+                In::col(&hm_rows(corr, rows_n)).ew(),
             ],
-            &hm(otmp),
+            &fl(otmp, rows_n, hd),
             nests.head_major(0, 0),
             sym_id_base,
             layout,
@@ -1416,7 +1438,7 @@ fn assemble_attn_block(
     // `Some(otmp)` = fold this block in via `stridedadd`; `None` = the seed block writes its own
     // result. The HANDLE is minted once here so the three value-matmul arms below cannot each decide
     // separately whether this block folds — they only choose WHERE in `otmp` their own slab sits.
-    let fold_addend = (!seed.seeds()).then_some(otmp).map(|b| hm(b));
+    let fold_addend = (!seed.seeds()).then_some(otmp).map(|b| fl(b, rows_n, hd));
     // KV-head-BATCHED value bmm — the mirror of the score leg above (same y-stride argument:
     // expb's is mb·in = gqa·mq·width, ov's is mb·out = gqa·mq·hd, kernel's is declared).
     // REQUEST-AXIS VALUE — the mirror of the score leg. V is `[PAGE_SLOTS, hd]` per request and this
@@ -1725,8 +1747,11 @@ fn assemble_attn_block(
             "multiply",
             rows.swept(),
             BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm(run_l)).ew(), In::full(&hm(corr)).ew()],
-            &hm(ltmp),
+            &[
+                In::full(&hm_rows(run_l, rows_n)).ew(),
+                In::full(&hm_rows(corr, rows_n)).ew(),
+            ],
+            &hm_rows(ltmp, rows_n),
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
@@ -1736,8 +1761,11 @@ fn assemble_attn_block(
             "add",
             rows.swept(),
             BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm(ltmp)).ew(), In::full(&hm(bsum)).ew()],
-            &hm(run_l),
+            &[
+                In::full(&hm_rows(ltmp, rows_n)).ew(),
+                In::full(&hm_rows(bsum, rows_n)).ew(),
+            ],
+            &hm_rows(run_l, rows_n),
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
@@ -2177,7 +2205,7 @@ fn assemble_new_block_chunk(
             cols,
             &[
                 In::sliced(&rb(sc, g_rows, slots), at_pin).ew(),
-                In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
+                In::col_at(&hm_rows(&bufs.run_m, q_rows), row_step(h0)).ew(),
             ],
             &rb(esub, g_rows, slots),
             at_pin,
@@ -2742,8 +2770,11 @@ fn assemble_attn_chunk(
                     combine,
                     all_rows,
                     stick,
-                    &[In::full(&hm(acc)).ew(), In::full(&hm(temps[1])).ew()],
-                    &hm(out),
+                    &[
+                        In::full(&hm_rows(acc, q_rows)).ew(),
+                        In::full(&hm_rows(temps[1], q_rows)).ew(),
+                    ],
+                    &hm_rows(out, q_rows),
                     DevOff::ZERO,
                     sym_id_base,
                     layout,
@@ -2802,8 +2833,11 @@ fn assemble_attn_chunk(
             func,
             all_rows,
             stick,
-            &[In::full(&hm(ins[0])).ew(), In::full(&hm(ins[1])).ew()],
-            &hm(out),
+            &[
+                In::full(&hm_rows(ins[0], q_rows)).ew(),
+                In::full(&hm_rows(ins[1], q_rows)).ew(),
+            ],
+            &hm_rows(out, q_rows),
             DevOff::ZERO,
             sym_id_base,
             layout,
@@ -2818,8 +2852,8 @@ fn assemble_attn_chunk(
             func,
             all_rows,
             stick,
-            &[In::full(&hm(inp)).ew()],
-            &hm(out),
+            &[In::full(&hm_rows(inp, q_rows)).ew()],
+            &hm_rows(out, q_rows),
             DevOff::ZERO,
             sym_id_base,
             layout,
@@ -2881,7 +2915,10 @@ fn assemble_attn_chunk(
                 format!("_s{p}")
             };
             // `esub` and `exp` write DIFFERENT buffers — an exp must never read and write one buffer.
-            // `cesub` is core-local LX, so both address it at its pin (no corner).
+            // `cesub` is core-local LX, so both address it at its pin (no corner). The score and
+            // probability blocks are read/written at CHUNK-FRAME corners (`pc`), so their handles
+            // declare the FULL `[q_rows, slots]` buffers — the block-shaped `b_rows` annotation the
+            // raw form carried was never the window's bound.
             ops.push(assemble_pointwise_broadcast_divided(
                 PointwiseDivided {
                     op_name: &format!("attn_cesub_{bn}{suffix}_o{t}"),
@@ -2889,8 +2926,8 @@ fn assemble_attn_chunk(
                     rows: blk_rows,
                     cols: pw,
                     inputs: &[
-                        In::sliced(&rb(&cb.csc, b_rows, ps), pc).ew(),
-                        In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
+                        In::sliced(&rb(&cb.csc, q_rows, slots), pc).ew(),
+                        In::col_at(&hm_rows(&bufs.run_m, q_rows), row_step(h0)).ew(),
                     ],
                     o: &rb(&cb.cesub, b_rows, ps),
                     out_offset: DevOff::ZERO.into(),
@@ -2906,7 +2943,7 @@ fn assemble_attn_chunk(
                     rows: blk_rows,
                     cols: pw,
                     inputs: &[In::sliced(&rb(&cb.cesub, b_rows, ps), DevOff::ZERO).ew()],
-                    o: &rb(&cb.cexp, b_rows, ps),
+                    o: &rb(&cb.cexp, q_rows, slots),
                     out_offset: pc.into(),
                     division: cb.sm_division,
                 },
@@ -2947,15 +2984,15 @@ fn assemble_attn_chunk(
         all_rows,
         BlockCols::of_head_dim(hd),
         &[
-            In::full(&hm(&bufs.run_o)).ew(),
-            In::col(&hm(&bufs.corr)).ew(),
+            In::full(&fl(&bufs.run_o, q_rows, hd)).ew(),
+            In::col(&hm_rows(&bufs.corr, q_rows)).ew(),
         ],
-        &hm(&bufs.otmp),
+        &fl(&bufs.otmp, q_rows, hd),
         DevOff::ZERO,
         sym_id_base,
         layout,
     ));
-    let (otmp_h, run_o_h) = (hm(&bufs.otmp), hm(&bufs.run_o));
+    let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(&bufs.run_o, q_rows, hd));
     // ⭐ THE VALUE LEG, IN K-PARTS (`ChunkScratch::value_parts`): ONE part at decode, 16 pages a part
     // for a prompt chunk, whose whole-chunk PV dxp refuses to verify. Each part folds onto the last
     // through the same `stridedadd` epilogue, PING-PONGING between `run_o` and `otmp` so no matmul reads
@@ -3081,10 +3118,10 @@ fn assemble_attn_chunk(
         all_rows,
         stick,
         &[
-            In::full(&hm(&bufs.run_l)).ew(),
-            In::full(&hm(&bufs.corr)).ew(),
+            In::full(&hm_rows(&bufs.run_l, q_rows)).ew(),
+            In::full(&hm_rows(&bufs.corr, q_rows)).ew(),
         ],
-        &hm(&bufs.ltmp),
+        &hm_rows(&bufs.ltmp, q_rows),
         DevOff::ZERO,
         sym_id_base,
         layout,
@@ -3095,10 +3132,10 @@ fn assemble_attn_chunk(
         all_rows,
         stick,
         &[
-            In::full(&hm(&bufs.ltmp)).ew(),
-            In::full(&hm(&bufs.bsum)).ew(),
+            In::full(&hm_rows(&bufs.ltmp, q_rows)).ew(),
+            In::full(&hm_rows(&bufs.bsum, q_rows)).ew(),
         ],
-        &hm(&bufs.run_l),
+        &hm_rows(&bufs.run_l, q_rows),
         DevOff::ZERO,
         sym_id_base,
         layout,
@@ -3177,15 +3214,15 @@ fn prompt_probabilities_in_lx(
         all_rows,
         BlockCols::of_head_dim(hd),
         &[
-            In::full(&hm(&bufs.run_o)).ew(),
-            In::col(&hm(&bufs.corr)).ew(),
+            In::full(&fl(&bufs.run_o, q_rows, hd)).ew(),
+            In::col(&hm_rows(&bufs.corr, q_rows)).ew(),
         ],
-        &hm(&bufs.otmp),
+        &fl(&bufs.otmp, q_rows, hd),
         DevOff::ZERO,
         sym_id_base,
         layout,
     ));
-    let (otmp_h, run_o_h) = (hm(&bufs.otmp), hm(&bufs.run_o));
+    let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(&bufs.run_o, q_rows, hd));
     let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk
         .slot_parts(prompt_lx_part_pages(chunk, g_rows))
         .collect();
@@ -3207,8 +3244,11 @@ fn prompt_probabilities_in_lx(
                 grp_rows,
                 pw,
                 &[
-                    In::sliced(&rb(&cb.csc, g_rows, ps), pc).ew(),
-                    In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
+                    // The score block at its CHUNK-FRAME part corner — the FULL `[q_rows, slots]`
+                    // buffer, not the block-shaped `g_rows` annotation. `cesub` below is core-local
+                    // LX, addressed at its pin (offset 0), so ITS handle stays block-shaped.
+                    In::sliced(&rb(&cb.csc, q_rows, chunk.slots()), pc).ew(),
+                    In::col_at(&hm_rows(&bufs.run_m, q_rows), row_step(h0)).ew(),
                 ],
                 &rb(&cb.cesub, g_rows, ps),
                 DevOff::ZERO,
@@ -3307,8 +3347,11 @@ fn prompt_probabilities_in_lx(
             "add",
             all_rows,
             stick,
-            &[In::full(&hm(acc)).ew(), In::full(&hm(&cb.red[p])).ew()],
-            &hm(out),
+            &[
+                In::full(&hm_rows(acc, q_rows)).ew(),
+                In::full(&hm_rows(&cb.red[p], q_rows)).ew(),
+            ],
+            &hm_rows(out, q_rows),
             DevOff::ZERO,
             sym_id_base,
             layout,
@@ -3322,10 +3365,10 @@ fn prompt_probabilities_in_lx(
         all_rows,
         stick,
         &[
-            In::full(&hm(&bufs.run_l)).ew(),
-            In::full(&hm(&bufs.corr)).ew(),
+            In::full(&hm_rows(&bufs.run_l, q_rows)).ew(),
+            In::full(&hm_rows(&bufs.corr, q_rows)).ew(),
         ],
-        &hm(&bufs.ltmp),
+        &hm_rows(&bufs.ltmp, q_rows),
         DevOff::ZERO,
         sym_id_base,
         layout,
@@ -3336,10 +3379,10 @@ fn prompt_probabilities_in_lx(
         all_rows,
         stick,
         &[
-            In::full(&hm(&bufs.ltmp)).ew(),
-            In::full(&hm(&bufs.bsum)).ew(),
+            In::full(&hm_rows(&bufs.ltmp, q_rows)).ew(),
+            In::full(&hm_rows(&bufs.bsum, q_rows)).ew(),
         ],
-        &hm(&bufs.run_l),
+        &hm_rows(&bufs.run_l, q_rows),
         DevOff::ZERO,
         sym_id_base,
         layout,
@@ -4930,10 +4973,14 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 RowCount::of_mask_rows(rows),
                 BlockCols::of_head_dim(hd),
                 &[
-                    In::full(&hm(&bufs.run_o)).ew(),
-                    In::col(&hm(&bufs.run_l)).ew(),
+                    // The accumulators at their true extents — `run_o` head-wide `[rows, hd]`,
+                    // `run_l` one-stick `[rows, 64]` — and `out` at the flat-equal `[rows, hd]`
+                    // view of its `[mq, nqh·hd]` token-stream buffer (same element count; the
+                    // mint's bound is flat).
+                    In::full(&fl(&bufs.run_o, rows.get(), hd)).ew(),
+                    In::col(&hm_rows(&bufs.run_l, rows.get())).ew(),
                 ],
-                &hm(out),
+                &fl(out, rows.get(), hd),
                 crate::addr::DevOff::ZERO,
                 sym_id_base,
                 layout,
@@ -4949,8 +4996,12 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     RowCount::of_query_rows(width.mq()),
                     BlockCols::of_head_dim(hd),
                     &[
-                        In::sliced(&hm(&bufs.run_o), nests.token_stream(hi, 0).off()).ew(),
-                        In::col_at(&hm(&bufs.run_l), nests.head_major(hi, 0)).ew(),
+                        In::sliced(
+                            &fl(&bufs.run_o, rows.get(), hd),
+                            nests.token_stream(hi, 0).off(),
+                        )
+                        .ew(),
+                        In::col_at(&hm_rows(&bufs.run_l, rows.get()), nests.head_major(hi, 0)).ew(),
                     ],
                     &rb(out, mq, nqh * hd),
                     nests.token_stream(hi, 0).off(),
@@ -4985,10 +5036,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 RowCount::of_mask_rows(rows),
                 BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
                 &[
-                    In::sliced(&hm(&bufs.run_o), nests.head_major(0, s)).ew(),
-                    In::col(&hm(&bufs.run_l)).ew(),
+                    In::sliced(&fl(&bufs.run_o, rows.get(), hd), nests.head_major(0, s)).ew(),
+                    In::col(&hm_rows(&bufs.run_l, rows.get())).ew(),
                 ],
-                &hm(out),
+                &fl(out, rows.get(), hd),
                 nests.head_major(0, s),
                 sym_id_base,
                 layout,
@@ -5048,8 +5099,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     RowCount::of_query_rows(width.mq()),
                     BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
                     &[
-                        In::sliced(&hm(&bufs.run_o), nests.head_major(hi, s)).ew(),
-                        In::col_at(&hm(&bufs.run_l), nests.head_major(hi, 0)).ew(),
+                        In::sliced(&fl(&bufs.run_o, rows.get(), hd), nests.head_major(hi, s)).ew(),
+                        In::col_at(&hm_rows(&bufs.run_l, rows.get()), nests.head_major(hi, 0)).ew(),
                     ],
                     &rb(out, mq, nqh * hd),
                     nests.token_stream(hi, s).off(),

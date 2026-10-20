@@ -498,6 +498,12 @@ pub struct EwOperand<'a> {
     // `EwOperand::full(&str)` is UNCONSTRUCTABLE outside this module — the weakly-typed input path is
     // eliminated. Every pointwise/reduce input carries its layout kind in its type via `In<K>`.
     name: &'a str,
+    /// The handle's declared [`StickLayout`], captured by the `In` door that built this operand —
+    /// the shape authority the family mint (`mint_ew_operands`) checks every swept window against.
+    /// Carried IN the operand (not re-read from a handle at the funnel) so the checked shape is the
+    /// one the operand's own construction saw, and a broadcast form can never outlive the handle it
+    /// swept past.
+    layout: StickLayout,
     mb_broadcast: bool,
     out_broadcast: bool,
     col_offset: u32,
@@ -533,6 +539,9 @@ impl<'a> EwOperand<'a> {
     pub(crate) fn out_broadcast(&self) -> bool {
         self.out_broadcast
     }
+    pub(crate) fn mb_broadcast(&self) -> bool {
+        self.mb_broadcast
+    }
     pub(crate) fn col_offset(&self) -> u32 {
         self.col_offset
     }
@@ -540,6 +549,160 @@ impl<'a> EwOperand<'a> {
     pub(crate) fn is_stick_major_window_for(&self, rows: u32) -> bool {
         self.col_window.is_some_and(|w| w.is_stick_major_for(rows))
     }
+    /// The handle's declared [`StickLayout`], captured by the `In` door that built this operand.
+    pub(crate) fn declared(&self) -> StickLayout {
+        self.layout
+    }
+    /// The operand's SWEPT device-access window for a `[rows, cols]` op — the per-form law the
+    /// family mint (`mint_ew_operands`) checks. `stick_elems` is the op's stick-padded swept
+    /// width; `stick_lanes` one stick at the op's df:
+    /// - full / sliced / [`In::col_window`]: `rows × stick_elems` — the op's whole extent, padded
+    ///   lanes included (an `Active`-over-`out` operand reads the pad lanes of its last stick).
+    /// - out-broadcast (a per-row scalar: `col`/`col_at`): `rows × stick_lanes` — ONE STICK PER
+    ///   ROW, the RedStick `alpha_=0` broadcast READ.
+    /// - mb-broadcast (a `[1, cols]` row vector: `mb`/`mb_at`): `1 × stick_elems`.
+    /// - scalar (mb ∧ out, a `[1,1]` const): `1 × stick_lanes` — one stick.
+    pub(crate) fn swept_extents(
+        &self,
+        rows: u32,
+        stick_elems: u32,
+        stick_lanes: u32,
+    ) -> (u32, u32) {
+        match (self.mb_broadcast, self.out_broadcast) {
+            (true, true) => (1, stick_lanes),
+            (true, false) => (1, stick_elems),
+            (false, true) => (rows, stick_lanes),
+            (false, false) => (rows, stick_elems),
+        }
+    }
+}
+
+/// ⭐⭐⭐ THE POINTWISE FAMILY'S OPERAND MINT — the #731 door for every elementwise input.
+///
+/// Each operand's SWEPT window ([`EwOperand::swept_extents`] — the per-form broadcast law) is
+/// checked against BOTH authorities, the same doors [`BundleLayout::win`] runs for a
+/// handle-minted [`Win`]: the handle's declared shape (always — the `In` door captured it when
+/// the operand was built), and the placement footprint by name (when a `BundleLayout` is at
+/// hand). An operand that reads past its tensor is an `Err` naming the tensor, its window and
+/// the bound it exceeded — the class #717's card failure belongs to (`add_o1137` reading
+/// `t1131` past its footprint at the width-512 prefix-capable continuation), refused at build
+/// instead of detected on card. A gathered operand's window is its table's own rows (the index
+/// selects within the table by contract), so a table smaller than the op's row count is caught
+/// here too.
+pub(crate) fn mint_ew_operands(
+    op_name: &str,
+    rows: u32,
+    cols: u32,
+    df: Df,
+    inputs: &[EwOperand<'_>],
+    layout: Option<&BundleLayout>,
+) -> Result<(), String> {
+    // The op's stick basis — the same two forms `pointwise_broadcast_opspec_df` tiles at: fp16's
+    // 64-stick, or fp32's 32 for the torch-spyre fp32 rmsnorm island.
+    let stick_elems = if matches!(df, Df::Fp32) {
+        StickExtent::<Fp32>::new(cols)?.elems()
+    } else {
+        StickExtent::<Fp16>::new(cols)?.elems()
+    };
+    let stick_lanes = df.elems_per_stick();
+    for i in inputs {
+        let (sw_rows, sw_cols) = i.swept_extents(rows, stick_elems, stick_lanes);
+        let what = format!("{op_name}: operand '{}'", i.name());
+        // ⭐ THE OUT-BROADCAST (RedStick) FORMS' DEVICE ACCESS IS THE STICK **RUN** CONTAINING THE
+        // OFFSET — the L3 EBR is stick-granular and rounds the reader's allocate down to the stick
+        // base (rmsnorm's `rinv` half-stick law: the sub-stick remainder is a lane select inside
+        // the stick, byte-granular on LX), and each op row steps one stick. So the window the two
+        // doors bound starts at the stick BASE, while the VALUE each row reads sits at the offset
+        // itself — stated as its own bound, so a sub-stick offset can neither overstate the access
+        // (refusing a legal lane select) nor hide a scalar past the tensor's end. Every other form
+        // reads a contiguous range from its offset and keeps the exact bound.
+        let off = if i.out_broadcast() {
+            let shape_elems = i.declared().rows as u64 * i.declared().cols as u64;
+            // The per-row forms (col/col_at) step one op row per stick — the operand's own row
+            // pitch. The scalar form (mb ∧ out) reads ONE value for the whole op, so no pitch.
+            let stride = if i.mb_broadcast() {
+                0
+            } else {
+                let pitch = i.declared().cols as u32;
+                if pitch != stick_lanes {
+                    return Err(format!(
+                        "{what}: the broadcast operand is {pitch} columns wide — a per-row \
+                         scalar broadcast reads ONE STICK PER ROW, and no bound is stated for a \
+                         wider one"
+                    ));
+                }
+                stick_lanes as u64
+            };
+            let last_value = i.col_offset() as u64 + (sw_rows.saturating_sub(1) as u64) * stride;
+            if last_value >= shape_elems {
+                return Err(format!(
+                    "{what}: the broadcast read's last row scalar (element {last_value}) runs \
+                     past the end its handle declares — {shape_elems} elements. An op that reads \
+                     past its own tensor is a defect in the computation that produced this \
+                     offset; it cannot compile."
+                ));
+            }
+            i.col_offset() - i.col_offset() % stick_lanes
+        } else {
+            i.col_offset()
+        };
+        match layout {
+            Some(l) => {
+                l.check_window(i.name(), i.declared(), off as u64, sw_rows, sw_cols, &what)?
+            }
+            None => crate::placement::window_fits_declared(
+                i.name(),
+                i.declared(),
+                off as u64,
+                sw_rows,
+                sw_cols,
+                &what,
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// ⭐ The pointwise family's OUTPUT mint — the output window `rows × stick_elems` at the corner
+/// the assembler was given, checked against the output handle's declared shape and (when at
+/// hand) its placement. The `(Stk, OutCorner)` pair stays typed at the assembler — the corner's
+/// [`crate::addr::ColWindow`] provenance is what the stick-major predicate reads, so folding it
+/// into a `Win` would lose it — and THIS is the door that refuses a corner running past the
+/// output's own end.
+pub(crate) fn mint_ew_output<O: KindTag>(
+    op_name: &str,
+    o: &Stk<O>,
+    off_elems: u32,
+    rows: u32,
+    cols: u32,
+    df: Df,
+    layout: Option<&BundleLayout>,
+) -> Result<(), String> {
+    let stick_elems = if matches!(df, Df::Fp32) {
+        StickExtent::<Fp32>::new(cols)?.elems()
+    } else {
+        StickExtent::<Fp16>::new(cols)?.elems()
+    };
+    let what = format!("{op_name}: output '{}'", o.name());
+    match layout {
+        Some(l) => l.check_window(
+            o.name(),
+            o.layout(),
+            off_elems as u64,
+            rows,
+            stick_elems,
+            &what,
+        )?,
+        None => crate::placement::window_fits_declared(
+            o.name(),
+            o.layout(),
+            off_elems as u64,
+            rows,
+            stick_elems,
+            &what,
+        )?,
+    }
+    Ok(())
 }
 
 /// Whether a `[rows, cols]` fp16 pointwise op over `n_inputs` operands runs WITHOUT time-tiling — the
@@ -962,6 +1125,14 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
             inputs.len()
         )));
     }
+    // ⭐ THE OUTPUT MINT for the WHOLE NODE: the legs below each write a row window of the SAME
+    // output in place (together `[0, rows)`), so the node's full window is the bound every leg's
+    // write sits inside — `first_row·lanes + leg_rows·stick_elems ≤ rows·stick_elems` holds for
+    // every leg because `lanes ≤ stick_elems` and `first_row + leg_rows ≤ rows`. Checked once
+    // here, against the output handle's declared shape and placement. The legs' INPUTS are
+    // minted per-leg in `pointwise_broadcast_opspec_from_tile` (the leg's own tile carries
+    // `leg_rows`, so each broadcast form is checked at the rows that actually sweep it).
+    mint_ew_output(op_name, o, 0, rows, cols, tile_op.df, layout).map_err(SuperDscError)?;
     // ⭐ THE ENTRY COUNT, DERIVED BEFORE ANY OP IS BUILT — because it decides how many ops there are.
     // The page is [`PageExtent::single_position`] for a table lookup (one entry IS one row, see the
     // header); it is named ONCE here and handed to every leg, so the number this function counts
@@ -1610,6 +1781,12 @@ pub fn assemble_pointwise_broadcast_divided<O: KindTag>(
     } = p;
     let rows = rows.get();
     let cols = cols.get();
+    // ⭐ THE OUTPUT MINT — the output window `rows × stick-padded cols` at the corner, checked
+    // against the output handle's declared shape and placement before any op is built (the
+    // write-side twin of the input mint in `pointwise_broadcast_opspec_from_tile`, which runs
+    // inside the funnel call below).
+    mint_ew_output(op_name, o, out_offset.elems(), rows, cols, Df::Fp16, layout)
+        .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
     // The OUTPUT type drives the layout: a `Stk<FlatTag>` output IS a head-major (per-head attention)
     // op — rank-3 flat; a `Stk<RowBlockedTag>` output is the residual token stream (rank-2 stick-major).
     // So `head_major` is DERIVED from the output kind (no redundant bool that could disagree with it).
@@ -1709,6 +1886,12 @@ pub fn assemble_broadcast_mul_gate(
     o_name: &str,
 ) -> EmittedOp {
     let mut sym = 0i64;
+    // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: x and the output are the probe's own
+    // `[rows, cols]` tensors, and v is the `[rows, one-stick]` column the out-broadcast read sweeps
+    // (ONE STICK PER ROW — the RedStick law `EwOperand::swept_extents` states). The probe creates
+    // its tensors only in the descriptor (`layout: None`), so the handle IS the statement; the mint
+    // reads the dims as the bound.
+    let (r, c) = (rows.get(), cols.get());
     // "multiply" is the INTERNAL op_func_from_str key (→ OpFunc::Multiply, whose
     // wire name() is "mul"); passing "mul" would miss the match and default to Add.
     assemble_pointwise_broadcast(
@@ -1717,14 +1900,14 @@ pub fn assemble_broadcast_mul_gate(
         rows,
         cols,
         &[
-            In::full(&rbo(x_name)).ew(),
+            In::full(&rb(x_name, r, c)).ew(),
             EwOperand {
                 mb_broadcast: false,
                 out_broadcast: true,
-                ..In::full(&rbo(v_name)).ew()
+                ..In::full(&rb(v_name, r, Fp16::ELEMS_PER_STICK)).ew()
             },
         ],
-        &rbo(o_name),
+        &rb(o_name, r, c),
         &mut sym,
         None, // gate probe (not in the walk) → no global layout
     )
@@ -4058,6 +4241,7 @@ impl<'a, K: KindTag> In<'a, K> {
     pub fn ew(&self) -> EwOperand<'a> {
         EwOperand {
             name: self.h.name(),
+            layout: self.h.layout(),
             mb_broadcast: self.mb_broadcast,
             out_broadcast: self.out_broadcast,
             col_offset: self.col_offset,
@@ -6745,9 +6929,13 @@ mod gather_cut {
     /// requirement coincide). `layout: None` is this crate's unit-test arm, so addresses come from the
     /// per-arg segment fallback — inert for every property below, which are all DIFFERENCES.
     fn legs(rows: u32) -> Vec<EmittedOp> {
+        // TRUE shapes, not `rbo` lies: the mint in `pointwise_broadcast_opspec_from_tile` (and the
+        // gather door's output mint) checks every swept window against the handle's declared shape,
+        // so the table and output are declared at the node's own `[rows, 4096]` — embedding_granite's
+        // extents. The `[1,1]` scale keeps `rbo`: one RedStick IS its whole swept window.
         let scale = rbo("t4294967275");
-        let table = rbo("t1");
-        let out = rbo("t2");
+        let table = rb("t1", rows, COLS);
+        let out = rb("t2", rows, COLS);
         let t = tile(rows);
         let mut sid = 0i64;
         assemble_pointwise_broadcast_gather(
@@ -6941,7 +7129,9 @@ mod gather_cut {
     #[test]
     fn a_leg_longer_than_one_index_stick_is_refused_by_name() {
         let scale = rbo("t4294967275");
-        let table = rbo("t1");
+        // TRUE shape (`[cap()*2, 4096]`, covering both legs below): the input mint must not fire
+        // before the one-stick ceiling this test exists to pin.
+        let table = rb("t1", cap() * 2, COLS);
         let ins = [In::scalar(&scale).ew(), In::full(&table).ew()];
         let two = tile(cap() * 2);
         let mut sid = 0i64;
