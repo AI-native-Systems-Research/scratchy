@@ -922,6 +922,306 @@ pub(crate) fn lower_one_node<F: RopeForm>(
 /// The PRODUCER half over a whole UNROLLED graph: one KTIR program per node, plus the bundle layout
 /// every one of them resolves its addresses through.
 ///
+/// The matmul KERNEL weights' manifest triples — `(layer-0 weight tid, k, device-n)` — collected
+/// from a graph's own nodes.
+///
+/// ⛔⛔⛔ THE GEMM-WEIGHT MANIFEST GATE — EXHAUSTIVE BY CONSTRUCTION (W29).
+///
+/// The classification comes from the REGISTRY (`SubOp::gemm_weight_input` — one row per op, a new
+/// gemm kind is a compile error until it answers), and this collection is EXHAUSTIVE OVER IT:
+/// every op that carries a gemm weight must land in one of the named arms below, and one that
+/// does not REFUSES THE BAKE.
+///
+/// WHY REFUSE, AND WHY AT THE COLLECTION: the three arms below were held together only by the
+/// "every weight crosses the m=1 util floor" assumption, and the router broke that silently.
+/// `RouterLogits`' `[E,hidden]` projection was EXCLUDED from the kernel-weight manifest, so the
+/// shim's `None` arm staged the checkpoint's row-major bytes VERBATIM into the stick-tiled slot
+/// the gemm addresses: the 26b card computed `A @ perm(W)` — right ranking form, wrong experts
+/// ([113,122,28,0,…] vs host [102,79,114,92,…]) → junk (root-caused + on-card 2026-10-13). The
+/// same exclusion class had already fired once before as the fp8 arity gap (arity-2-only
+/// collection → flat-staged fp8 weights → scrambled `scr chat`, 2026-07-16). A THIRD kind would
+/// fire the same way and nothing downstream would say so — the emulator reads a weight through
+/// the program's row-major transpose-B `indexing_maps`, not through the card's per-core stick
+/// addressing, so a staging-layout defect is numerically INVISIBLE to every emu suite. THE BLIND
+/// SPOT THIS GATE COVERS: the bake-time numeric-equivalence gate runs the EMULATOR build, and
+/// the emulator never executes hardware staging — so the numeric gate cannot see staging defects
+/// at all. This gate (exhaustiveness + the width-law agreement in [`stage_kernel_weight_census`])
+/// is the coverage for exactly that hole: it refuses at BAKE, from the bake's own data, before
+/// any card or emulator runs.
+///
+/// Both doors into the SuperDSC lowering collect through HERE — the re-rolled tape walk and the
+/// unrolled graph walk — so the manifest cannot disagree with itself between them.
+fn collect_kernel0<F: RopeForm>(ir: &SubtileIR<F>) -> Result<Vec<(u32, u32, u32)>, SuperDscError> {
+    let mut kernel0: Vec<(u32, u32, u32)> = Vec::new();
+    for n in &ir.nodes {
+        match n.op.gemm_weight_input() {
+            // kernel0-collected: the dense gemms — W = inputs[1].
+            Some(1)
+                if matches!(n.op, SubOp::MatmulTile { .. })
+                    && (n.inputs.len() == 2 || n.inputs.len() == 3) =>
+            {
+                kernel0.push((
+                    n.inputs[1].tensor.index() as u32,
+                    n.inputs[0].region.cols.len,
+                    // DEVICE out extent via the TYPE-SAFE `DeviceWidth` — the SAME rule as the
+                    // worker's weight zero-pad and the slot reservation, so the RetileDescriptor
+                    // device_size, the per-core address, and the staged buffer agree by
+                    // construction (granite lm_head 49159→49664).
+                    //
+                    // ⭐ `for_pointwise` — the UNCONDITIONAL bump — NOT `for_output(m,·)`: the
+                    // staged buffer is ONE per model (the worker binds it once; each bucket's
+                    // session stages or borrows it), so its width must be m-INDEPENDENT, and the
+                    // slot reservation already sizes every gemm weight at this same unconditional
+                    // bump (`bump_sticks_to_splittable` on the cols, lower_subtile_tape_to_superdsc).
+                    // For any weight crossing the util floor at m=1 — every dense weight — the two
+                    // laws are IDENTICAL at every bucket (both bump), so those manifests are
+                    // byte-identical to before.
+                    DeviceWidth::for_pointwise(n.output.region.cols.len).get(),
+                ));
+                // KSPLIT fp32-merge (lm_head first-test, n>16384): the split weight ALSO needs B
+                // block-weight descriptors `[KB,N]` under reserved tids `ksplit_block_tid(b)`, matching
+                // the emit branch's block matmuls. Same gate + condition. The kernel0 descriptor loop
+                // below builds each as `[dev_out/64, KB, 64]` (in=KB) — exactly the block matmul's read
+                // (`ksplit_block_weight_kslice_offset_matches_read`). Worker gathers the K-slice bytes.
+            }
+            // The router's gemm has no per-op card path — the MoE lowers only from
+            // `kernels/moe.py` through KTIR; the worklist refuses the op itself, nothing to
+            // collect.
+            Some(1) if matches!(n.op, SubOp::RouterLogits { .. }) => {}
+            // Bank-staged no longer: the gathered expert gemm has no per-op card path (the MoE
+            // lowers only from `kernels/moe.py` through KTIR); the worklist refuses the op
+            // itself, nothing to collect.
+            Some(2) if matches!(n.op, SubOp::ExpertMatmul { .. }) => {}
+            // Carries a gemm weight but has no SuperDSC kernel — the worklist refuses the op
+            // itself; nothing to collect.
+            Some(2) if matches!(n.op, SubOp::AllRowsMatmul) => {}
+            // ⛔ A GEMM WEIGHT OUTSIDE THE COLLECTED SET — the router-defect class, refused at
+            // bake. A gemm whose weight never lands in the kernel0 manifest is staged by the
+            // shim's `None` arm (verbatim bytes into a stick-tiled slot): right ranking form,
+            // wrong elements, junk on the card, green on every emulator.
+            Some(pos) => {
+                let msg = format!(
+                    "reroll-superdsc: op {} (t{}) carries a GEMM WEIGHT at input \
+                     {pos} but the kernel-weight manifest does not collect its kind — \
+                     its weight would be staged VERBATIM into a stick-tiled slot (the \
+                     26b router-defect class: `A @ perm(W)`, junk on the card, invisible \
+                     to the emulator). Add the kind to the kernel0 collection or give it \
+                     its own staging arm in `SubOp::gemm_weight_input`",
+                    n.op.name(),
+                    n.output.tensor.index()
+                );
+                eprintln!("[spyre-gemm-weights] REFUSING TO BAKE: {msg}");
+                return Err(SuperDscError(msg));
+            }
+            None => {}
+        }
+    }
+    Ok(kernel0)
+}
+/// Device re-tile manifest: each matmul kernel weight (layer 0) + its per-layer
+/// copies → a RetileDescriptor built SOLELY from the DeviceTileLayout witness (the
+/// SAME source per_core_addr uses for the stride), so the shim's host re-tile and the
+/// on-card per-core address cannot diverge. KERNEL layout = [in,out] sticked on out.
+/// fp8 W8A8 weights (`input[1]` of an arity-3 MatmulTile) stage 1-byte / 128-elem stick (SEN143_FP8);
+/// dense weights stay fp16 2-byte / 64-stick. The shim reads `word_length` from this descriptor to
+/// size the H2D re-tile, so an fp8 weight MUST carry the fp8 descriptor or it is staged as 2-byte.
+///
+/// ⭐ POPULATED BEFORE ANY DOOR CALL, ON BOTH PATHS. The whole-function walk's transpose-B
+/// acceptance (`whole_function::transposed_b_is_placeable`) reads this census as the ONE
+/// producer fact it holds for a parameter-backed B: a `.T` matmul over a caller descriptor
+/// is placeable IFF the census names its tid — a tid the census names is re-tiled by the
+/// executor's H2D stage into exactly the layout this descriptor states, so the `.T` the
+/// indexing maps state was spent by the stage. The tape path stages the census before its
+/// declare pass (the first door call); the graph path before its own door loop.
+fn stage_kernel_weight_census<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    kernel0: &[(u32, u32, u32)],
+    per_layer: &std::collections::BTreeMap<u32, Vec<u32>>,
+    bundle_layout: &mut BundleLayout,
+) -> Result<(), SuperDscError> {
+    let fp8_weight_tids: std::collections::HashSet<u32> = ir
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
+        .map(|n| n.inputs[1].tensor.index() as u32)
+        .collect();
+    for (w_tid, in_k, out_n) in kernel0 {
+        let desc = if fp8_weight_tids.contains(w_tid) {
+            // fp8 W8A8 weight = the AIU matmulfp8 PACKED tile. Each 128-byte stick holds 64 N-cols each
+            // carrying its 2 K-bytes BYTE-ADJACENT — the matmulfp8 in-fold (gen_fp8_kernel_in_fold) reads the
+            // 2-pack as "2 fp8 per fp16-width slot, CONTIGUOUS". Device order (outer→inner):
+            // [N/64 n-sticks, K/2 k-pairs, 64 n-inner, 2 k-inner]; device[n_stick][k_outer][n_in][k_inner] =
+            // host[64·n_stick + 2N·k_outer + n_in + N·k_inner] = weight[2·k_outer+k_inner][64·n_stick+n_in].
+            // The [.,.,2,64] order (2 K-rows as two separate 64-N blocks) and a FLAT 128-stick layout BOTH
+            // scramble the weights → garbage; only this [.,.,64,2] order runs coherent (on-card 2026-07-16,
+            // `scr chat` → "Paris"). (K even + N%64==0 hold for every granite fp8 proj.)
+            // ⭐ THE fp8 K-PAD (`work::fp8_k_pad`) — the whole-stick law, ONE authority: the
+            // activation quantize's tail, the worker's staged rebuild, the placement's reserved
+            // rows, and this packed retile's K all take the SAME pad. A dense fp8 weight whose k
+            // is not a whole 128-elem stick (gemma-4-26b's dense GeGLU DOWN: k=2112 = 16.5
+            // sticks) widens to 2176 — the extra 64 K-rows are ZERO on the host, real staged
+            // bytes, inert to the contraction. Without the pad the retile enumerates n·k elements
+            // against the worker's n·k_pad staged rebuild, and the matmul's k_pad-wide tile read
+            // overruns the staged buffer. A no-op at every 128-aligned k (granite, g8b, g12b —
+            // byte-identical staging).
+            let k = fp8_k_pad(*in_k) as u64;
+            let n = *out_n as u64;
+            if !k.is_multiple_of(2) || !n.is_multiple_of(64) {
+                return Err(SuperDscError(format!(
+                    "fp8 W8A8 weight t{w_tid}: packed tile needs K({k})%2==0 and N({n})%64==0"
+                )));
+            }
+            RetileDescriptor {
+                device_size: vec![n / 64, k / 2, 64, 2],
+                // DISK ORDER, like the fp16 tile below. The worker no longer transposes, so this map
+                // reads the `[out, in]` buffer safetensors stores. Converting it is mechanical: a term
+                // that stepped an IN index by `x` was `x*n` against `[in, out]` and becomes `x*1`; a
+                // term that stepped an OUT index by `y` was `y*1` and becomes `y*k`. So
+                // `[64, 2n, 1, n]` → `[64k, 2, k, 1]`, which resolves `host[o*k + i]` for every
+                // coordinate (checked exhaustively against the transposed map's `host[i*n + o]`).
+                //
+                // MISSING THIS BRANCH is what made granite-3.1-8b emit garbage: it is fp8, so its
+                // GEMM weights come through here and not the fp16 path, and they were still being read
+                // as though something had transposed them.
+                stride_map: vec![64 * k, 2, k, 1],
+                stick_size: Fp8::ELEMS_PER_STICK,
+                word_length: Fp8::WORD_LENGTH,
+            }
+        } else {
+            let tile = DeviceTileLayout::<Fp16>::new(
+                &["in", "out"],
+                "out",
+                &[*in_k as u64, *out_n as u64],
+            )?;
+            RetileDescriptor {
+                device_size: tile.device_size(),
+                // DISK ORDER: the worker binds a GEMM weight in the `[out, in]` orientation
+                // safetensors stores it, so the re-tile reads it there rather than from a transposed
+                // copy. Same elements, one fewer pass over the model at load.
+                stride_map: tile.stride_map_disk_order(),
+                stick_size: Fp16::ELEMS_PER_STICK,
+                word_length: Fp16::WORD_LENGTH,
+            }
+        };
+        // ⛔⛔⛔ THE THREE WIDTH LAWS, HELD EQUAL AT BAKE (the staging-consistency guard, W29).
+        //
+        // For every gemm weight the manifest declares — the entry AND each of its per-layer
+        // copies — three independent laws must name the SAME device width, and each is computed
+        // here from the bake's own data:
+        //   1. THE MANIFEST'S: `out_n`, the width this loop declares in the RetileDescriptor
+        //      (`DeviceWidth::for_pointwise` over the gemm's output cols, at the collection).
+        //   2. THE WORKER'S: `DeviceWidth::for_pointwise` over the weight TENSOR's own cols —
+        //      the law `spyre_load.rs`'s N-pad applies to the same source (the wiring's
+        //      `[rows, cols]` pair is generated from these shapes). A gemm whose output region
+        //      names a different width than the weight tensor it reads (a sliced output, a
+        //      manifest/wiring shape desync) stages a buffer the manifest's tile does not
+        //      cover — the shim's `prod(device_size)` byte check would fire at LOAD, on the
+        //      card, after the build said yes.
+        //   3. THE SLOT RESERVATION'S: the bytes this bake placed for the tensor
+        //      (`compute_bundle_layout`'s `rows · bump(cols) · word_length`) must COVER
+        //      the manifest's `prod(device_size) · word_length` — at least, not exactly:
+        //      the reservation pads the weight's innermost stick dim to the DEVICE's
+        //      whole-stick footprint (fp8 is a 128-elem stick — the 26b's dense gate/up
+        //      at n=2112 = 16.5 sticks reserves 2176 cols), and over-reservation is the
+        //      documented safe direction (the retile's staging guard reads the WORKER's
+        //      bytes; `lower_subtile_tape_to_superdsc`'s own fp8 K-pad comment). UNDER-
+        //      reservation is what aliases — the t35 class the fp8 K-pad rows law fixed
+        //      (access 6,127,616 B vs placement 5,947,392 B). The K the manifest contracts
+        //      (fp8 weights take `fp8_k_pad`, the same whole-stick law the reservation's rows
+        //      take) times the same width. They were held together only by the "every weight
+        //      crosses the m=1 util floor" assumption, which the router broke silently: its
+        //      slot was reserved at the pointwise floor (512) while the excluded manifest
+        //      staged the checkpoint's 128-wide bytes verbatim — over-addressed the slot by
+        //      the retile, wrong experts, junk. The check is pure compile-time arithmetic on
+        //      the bake's own placements and descriptors; it needs no emulator run (and the
+        //      emulator could not witness it — see the gate at the collection above).
+        {
+            let wl = desc.word_length as u64;
+            let manifest_bytes = desc.device_size.iter().product::<u64>() * wl;
+            let mut tids = std::iter::once(*w_tid)
+                .chain(per_layer.get(w_tid).into_iter().flatten().copied())
+                .collect::<Vec<u32>>();
+            tids.sort_unstable();
+            tids.dedup();
+            for t in tids {
+                // The op that reads this weight, by name — the refusal's own provenance.
+                let op_name = match ir
+                    .nodes
+                    .iter()
+                    .find(|n| n.inputs.len() > 1 && n.inputs[1].tensor.index() as u32 == t)
+                {
+                    Some(n) => n.op.name(),
+                    None => "gemm",
+                };
+                let worker_w = DeviceWidth::for_pointwise(ir.tensors[t as usize].cols).get();
+                let slot = bundle_layout.placements.get(&t);
+                let slot_desc = match slot {
+                    Some(p) => format!("{} bytes (expected at least {manifest_bytes})", p.size),
+                    None => "NO PLACEMENT".to_string(),
+                };
+                let refuse = |what: &str| -> SuperDscError {
+                    let msg = format!(
+                        "reroll-superdsc: gemm weight t{t} of {op_name}: the staging width \
+                         laws disagree — {what}. The manifest declares {out_n}, the worker's \
+                         N-pad law says {worker_w}, the slot reservation holds {slot_desc}. A \
+                         divergence stages a buffer the device tile does not cover (or \
+                         under-covers): the router-defect class, wrong elements on the card, \
+                         invisible to the emulator. All three laws must be \
+                         `DeviceWidth::for_pointwise` over the same logical width, and the \
+                         reservation must hold at least prod(device_size)·word_length bytes"
+                    );
+                    eprintln!("[spyre-gemm-weights] REFUSING TO BAKE: {msg}");
+                    SuperDscError(msg)
+                };
+                if worker_w != *out_n {
+                    return Err(refuse(
+                        "the gemm's output width and the weight tensor's own cols disagree",
+                    ));
+                }
+                match slot {
+                    None => {
+                        return Err(refuse("the bake reserved no placement for the weight"));
+                    }
+                    Some(p) if p.size < manifest_bytes => {
+                        return Err(refuse(
+                            "the placement under-reserves the manifest's tile (aliases the next placement)",
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        bundle_layout.kernel_weights.insert(*w_tid, desc.clone());
+        if let Some(layers) = per_layer.get(w_tid) {
+            for &t in layers {
+                bundle_layout.kernel_weights.insert(t, desc.clone());
+            }
+        }
+    }
+    Ok(())
+}
+/// The UNROLLED graph path's OWN layout minting: the placement pass followed by the staging
+/// census — the two steps [`lower_graph_to_ktir`] performs before any door call, published as
+/// ONE spelling so a caller minting "the walk's own layout" cannot drift from the walk. A raw
+/// [`compute_bundle_layout`] misses the census, and the door's transpose-B acceptance reads
+/// the census as its one producer fact for a parameter-backed B — the golden tests hit exactly
+/// that drift when the census was factored out of the walk.
+pub fn graph_bundle_layout<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    weight_ids: &std::collections::HashSet<u32>,
+    rows_are_requests: bool,
+) -> Result<BundleLayout, SuperDscError> {
+    let mut bundle_layout = compute_bundle_layout(ir, weight_ids, rows_are_requests, &[])?;
+    let kernel0 = collect_kernel0(ir)?;
+    stage_kernel_weight_census(
+        ir,
+        &kernel0,
+        &std::collections::BTreeMap::new(),
+        &mut bundle_layout,
+    )?;
+    Ok(bundle_layout)
+}
+
 /// ⛔⛔⛔ THIS USED TO BE CALLED `lower_graph_to_superdsc`, AND KEEPING THAT NAME THROUGH THE SPLIT IS
 /// WHAT WENT WRONG. It is `ibm/main`'s function, text unchanged — but main's `lower_one_node` returned
 /// SuperDSC descriptors and this one returns KTIR programs, so the body silently stopped producing what
@@ -946,7 +1246,14 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // layer boundary to split the weight segment on. An empty map is what tells the layout that
     // banking is not expressible here, leaving the tail spill as the only lever (`&Default::default()`
     // rather than a bool, so there is one spelling of "the layer structure" and not two).
-    let bundle_layout = compute_bundle_layout(ir, weight_ids, rows_are_requests, &[])?;
+    // ⭐ THE STAGING CENSUS, BEFORE THE CONSUMER'S DOOR LOOP. `lower_graph_to_superdsc`
+    // threads this layout into `ktir_superdsc_door::lower` for every program, and the
+    // whole-function walk's transpose-B acceptance reads `kernel_weights` as its one
+    // producer fact — so the graph path mints the layout through the ONE shared spelling
+    // ([`graph_bundle_layout`]: placement pass + census), the same census the tape path
+    // takes. No layer classes on this path, so there are no per-layer families for the
+    // census to copy a weight's descriptor onto.
+    let bundle_layout = graph_bundle_layout(ir, weight_ids, rows_are_requests)?;
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(ir.nodes.len());
     // Collect EVERY distinct unhandled op kind (the full worklist) in one pass —
     // reconnaissance, not a silent skip: a non-empty set is a HARD error so a
@@ -1564,8 +1871,10 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // body→suffix seam must thread hidden_out → suffix_in at runtime (else the suffix
     // reads an unwritten slot = 0 → rmsnorm(0)=inf → garbage logits).
     let mut first_suffix_node: Option<u32> = None;
-    // Matmul KERNEL weights (layer-0 tid, in=k, out=n) for the device re-tile manifest.
-    let mut kernel0: Vec<(u32, u32, u32)> = Vec::new();
+    // Matmul KERNEL weights (layer-0 tid, in=k, out=n) for the device re-tile manifest —
+    // collected from the graph's own nodes by the ONE shared, exhaustiveness-gated collector
+    // (see [`collect_kernel0`]), the same walk the unrolled graph path takes.
+    let kernel0 = collect_kernel0(ir)?;
     // The CURRENT body's first/last Compute node, reset at each OpenLoop and folded into that
     // body's hidden tids at its CloseLoop.
     let mut cur_first: Option<u32> = None;
@@ -1622,103 +1931,6 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                 ..
             } => {
                 let n = &ir.nodes[node.index()];
-                // ⛔⛔⛔ THE GEMM-WEIGHT MANIFEST GATE — EXHAUSTIVE BY CONSTRUCTION (W29).
-                //
-                // The classification comes from the REGISTRY (`SubOp::gemm_weight_input` — one
-                // row per op, a new gemm kind is a compile error until it answers), and this
-                // collection is EXHAUSTIVE OVER IT: every op that carries a gemm weight must
-                // land in one of the named arms below, and one that does not REFUSES THE BAKE.
-                //
-                // WHY REFUSE, AND WHY HERE: the three arms below were held together only by the
-                // "every weight crosses the m=1 util floor" assumption, and the router broke
-                // that silently. `RouterLogits`' `[E,hidden]` projection was EXCLUDED from the
-                // kernel-weight manifest, so the shim's `None` arm staged the checkpoint's
-                // row-major bytes VERBATIM into the stick-tiled slot the gemm addresses: the
-                // 26b card computed `A @ perm(W)` — right ranking form, wrong experts
-                // ([113,122,28,0,…] vs host [102,79,114,92,…]) → junk (root-caused + on-card
-                // 2026-10-13). The same exclusion class had already fired once before as the
-                // fp8 arity gap (arity-2-only collection → flat-staged fp8 weights → scrambled
-                // `scr chat`, 2026-07-16). A THIRD kind would fire the same way and nothing
-                // downstream would say so — the emulator reads a weight through the program's
-                // row-major transpose-B `indexing_maps`, not through the card's per-core stick
-                // addressing, so a staging-layout defect is numerically INVISIBLE to every emu
-                // suite. THE BLIND SPOT THIS GATE COVERS: the bake-time numeric-equivalence
-                // gate runs the EMULATOR build, and the emulator never executes hardware
-                // staging — so the numeric gate cannot see staging defects at all. This gate
-                // (exhaustiveness + the width-law agreement below) is the coverage for exactly
-                // that hole: it refuses at BAKE, from the bake's own data, before any card or
-                // emulator runs.
-                //
-                // Collect matmul KERNEL weights for the device re-tile manifest: w =
-                // inputs[1] is [k,n]=[in,out] row-major; the PT array needs the device
-                // tile layout [out/64, in, 64]. in=A.cols (k), out=output.cols (n).
-                // Arity-3 fp8 W8A8 matmuls MUST be collected here too: their weight (inputs[1]; inputs[2] is
-                // w_scale) needs the 1-byte packed RetileDescriptor from the `fp8_weight_tids` branch below.
-                // in_k/out derive identically (inputs[0].cols=k, output.cols=n); the
-                // KSPLIT branch (out>16384) never fires for fp8 projs.
-                match n.op.gemm_weight_input() {
-                    // kernel0-collected: the dense gemms — W = inputs[1].
-                    Some(1)
-                        if matches!(n.op, SubOp::MatmulTile { .. })
-                            && (n.inputs.len() == 2 || n.inputs.len() == 3) =>
-                    {
-                        kernel0.push((
-                            n.inputs[1].tensor.index() as u32,
-                            n.inputs[0].region.cols.len,
-                            // DEVICE out extent via the TYPE-SAFE `DeviceWidth` — the SAME rule as the
-                            // worker's weight zero-pad and the slot reservation, so the RetileDescriptor
-                            // device_size, the per-core address, and the staged buffer agree by
-                            // construction (granite lm_head 49159→49664).
-                            //
-                            // ⭐ `for_pointwise` — the UNCONDITIONAL bump — NOT `for_output(m,·)`: the
-                            // staged buffer is ONE per model (the worker binds it once; each bucket's
-                            // session stages or borrows it), so its width must be m-INDEPENDENT, and the
-                            // slot reservation already sizes every gemm weight at this same unconditional
-                            // bump (`bump_sticks_to_splittable` on the cols, lower_subtile_tape_to_superdsc).
-                            // For any weight crossing the util floor at m=1 — every dense weight — the two
-                            // laws are IDENTICAL at every bucket (both bump), so those manifests are
-                            // byte-identical to before.
-                            DeviceWidth::for_pointwise(n.output.region.cols.len).get(),
-                        ));
-                        // KSPLIT fp32-merge (lm_head first-test, n>16384): the split weight ALSO needs B
-                        // block-weight descriptors `[KB,N]` under reserved tids `ksplit_block_tid(b)`, matching
-                        // the emit branch's block matmuls. Same gate + condition. The kernel0 descriptor loop
-                        // below builds each as `[dev_out/64, KB, 64]` (in=KB) — exactly the block matmul's read
-                        // (`ksplit_block_weight_kslice_offset_matches_read`). Worker gathers the K-slice bytes.
-                    }
-                    // The router's gemm has no per-op card path — the MoE lowers only
-                    // from `kernels/moe.py` through KTIR; the worklist below refuses
-                    // the op itself, nothing to collect.
-                    Some(1) if matches!(n.op, SubOp::RouterLogits { .. }) => {}
-                    // Bank-staged no longer: the gathered expert gemm has no per-op
-                    // card path (the MoE lowers only from `kernels/moe.py` through
-                    // KTIR); the worklist below refuses the op itself, nothing to
-                    // collect.
-                    Some(2) if matches!(n.op, SubOp::ExpertMatmul { .. }) => {}
-                    // Carries a gemm weight but has no SuperDSC kernel — the worklist below
-                    // refuses the op itself; nothing to collect.
-                    Some(2) if matches!(n.op, SubOp::AllRowsMatmul) => {}
-                    // ⛔ A GEMM WEIGHT OUTSIDE THE COLLECTED SET — the router-defect class,
-                    // refused at bake. A gemm whose weight never lands in the kernel0 manifest
-                    // is staged by the shim's `None` arm (verbatim bytes into a stick-tiled
-                    // slot): right ranking form, wrong elements, junk on the card, green on
-                    // every emulator.
-                    Some(pos) => {
-                        let msg = format!(
-                            "reroll-superdsc: op {} (t{}) carries a GEMM WEIGHT at input \
-                             {pos} but the kernel-weight manifest does not collect its kind — \
-                             its weight would be staged VERBATIM into a stick-tiled slot (the \
-                             26b router-defect class: `A @ perm(W)`, junk on the card, invisible \
-                             to the emulator). Add the kind to the kernel0 collection or give it \
-                             its own staging arm in `SubOp::gemm_weight_input`",
-                            n.op.name(),
-                            n.output.tensor.index()
-                        );
-                        eprintln!("[spyre-gemm-weights] REFUSING TO BAKE: {msg}");
-                        return Err(SuperDscError(msg));
-                    }
-                    None => {}
-                }
                 if seg >= 1 && seg <= loops.len() {
                     let bi = seg - 1;
                     let iters = bodies[bi].iters;
@@ -1878,6 +2090,12 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     }
     let launches: Vec<(u8, u32)> = order.iter().map(|&(b, i, _)| (b, i)).collect();
     let launch_layer: Vec<u32> = order.iter().map(|&(_, _, l)| l).collect();
+    // ⭐ THE STAGING CENSUS, BEFORE THE FIRST DOOR CALL. The declare pass below runs
+    // `ktir_superdsc_door::lower` over every op, and the whole-function walk's transpose-B
+    // acceptance reads `bundle_layout.kernel_weights` as its one producer fact — so the census
+    // must be populated HERE, before it, not after (the collection's own walk ended above, so
+    // `per_layer` is final). Same shared fn as the graph path; see [`stage_kernel_weight_census`].
+    stage_kernel_weight_census(ir, &kernel0, &per_layer, &mut bundle_layout)?;
     // ⛔⛔⛔ THE SHARED PLAN IS COMPLETED HERE, BEFORE ANY BUNDLE CAN SNAPSHOT IT.
     //
     // MEASURED, granite-3.1-2b on the card: main's decode bundle places rmsnorm scratch for tids
@@ -1935,172 +2153,6 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                     e.op_name, err.message
                 ))
             })?;
-        }
-    }
-    // Device re-tile manifest: each matmul kernel weight (layer 0) + its per-layer
-    // copies → a RetileDescriptor built SOLELY from the DeviceTileLayout witness (the
-    // SAME source per_core_addr uses for the stride), so the shim's host re-tile and the
-    // on-card per-core address cannot diverge. KERNEL layout = [in,out] sticked on out.
-    // fp8 W8A8 weights (`input[1]` of an arity-3 MatmulTile) stage 1-byte / 128-elem stick (SEN143_FP8);
-    // dense weights stay fp16 2-byte / 64-stick. The shim reads `word_length` from this descriptor to
-    // size the H2D re-tile, so an fp8 weight MUST carry the fp8 descriptor or it is staged as 2-byte.
-    let fp8_weight_tids: std::collections::HashSet<u32> = ir
-        .nodes
-        .iter()
-        .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
-        .map(|n| n.inputs[1].tensor.index() as u32)
-        .collect();
-    for (w_tid, in_k, out_n) in &kernel0 {
-        let desc = if fp8_weight_tids.contains(w_tid) {
-            // fp8 W8A8 weight = the AIU matmulfp8 PACKED tile. Each 128-byte stick holds 64 N-cols each
-            // carrying its 2 K-bytes BYTE-ADJACENT — the matmulfp8 in-fold (gen_fp8_kernel_in_fold) reads the
-            // 2-pack as "2 fp8 per fp16-width slot, CONTIGUOUS". Device order (outer→inner):
-            // [N/64 n-sticks, K/2 k-pairs, 64 n-inner, 2 k-inner]; device[n_stick][k_outer][n_in][k_inner] =
-            // host[64·n_stick + 2N·k_outer + n_in + N·k_inner] = weight[2·k_outer+k_inner][64·n_stick+n_in].
-            // The [.,.,2,64] order (2 K-rows as two separate 64-N blocks) and a FLAT 128-stick layout BOTH
-            // scramble the weights → garbage; only this [.,.,64,2] order runs coherent (on-card 2026-07-16,
-            // `scr chat` → "Paris"). (K even + N%64==0 hold for every granite fp8 proj.)
-            // ⭐ THE fp8 K-PAD (`work::fp8_k_pad`) — the whole-stick law, ONE authority: the
-            // activation quantize's tail, the worker's staged rebuild, the placement's reserved
-            // rows, and this packed retile's K all take the SAME pad. A dense fp8 weight whose k
-            // is not a whole 128-elem stick (gemma-4-26b's dense GeGLU DOWN: k=2112 = 16.5
-            // sticks) widens to 2176 — the extra 64 K-rows are ZERO on the host, real staged
-            // bytes, inert to the contraction. Without the pad the retile enumerates n·k elements
-            // against the worker's n·k_pad staged rebuild, and the matmul's k_pad-wide tile read
-            // overruns the staged buffer. A no-op at every 128-aligned k (granite, g8b, g12b —
-            // byte-identical staging).
-            let k = fp8_k_pad(*in_k) as u64;
-            let n = *out_n as u64;
-            if !k.is_multiple_of(2) || !n.is_multiple_of(64) {
-                return Err(SuperDscError(format!(
-                    "fp8 W8A8 weight t{w_tid}: packed tile needs K({k})%2==0 and N({n})%64==0"
-                )));
-            }
-            RetileDescriptor {
-                device_size: vec![n / 64, k / 2, 64, 2],
-                // DISK ORDER, like the fp16 tile below. The worker no longer transposes, so this map
-                // reads the `[out, in]` buffer safetensors stores. Converting it is mechanical: a term
-                // that stepped an IN index by `x` was `x*n` against `[in, out]` and becomes `x*1`; a
-                // term that stepped an OUT index by `y` was `y*1` and becomes `y*k`. So
-                // `[64, 2n, 1, n]` → `[64k, 2, k, 1]`, which resolves `host[o*k + i]` for every
-                // coordinate (checked exhaustively against the transposed map's `host[i*n + o]`).
-                //
-                // MISSING THIS BRANCH is what made granite-3.1-8b emit garbage: it is fp8, so its
-                // GEMM weights come through here and not the fp16 path, and they were still being read
-                // as though something had transposed them.
-                stride_map: vec![64 * k, 2, k, 1],
-                stick_size: Fp8::ELEMS_PER_STICK,
-                word_length: Fp8::WORD_LENGTH,
-            }
-        } else {
-            let tile = DeviceTileLayout::<Fp16>::new(
-                &["in", "out"],
-                "out",
-                &[*in_k as u64, *out_n as u64],
-            )?;
-            RetileDescriptor {
-                device_size: tile.device_size(),
-                // DISK ORDER: the worker binds a GEMM weight in the `[out, in]` orientation
-                // safetensors stores it, so the re-tile reads it there rather than from a transposed
-                // copy. Same elements, one fewer pass over the model at load.
-                stride_map: tile.stride_map_disk_order(),
-                stick_size: Fp16::ELEMS_PER_STICK,
-                word_length: Fp16::WORD_LENGTH,
-            }
-        };
-        // ⛔⛔⛔ THE THREE WIDTH LAWS, HELD EQUAL AT BAKE (the staging-consistency guard, W29).
-        //
-        // For every gemm weight the manifest declares — the entry AND each of its per-layer
-        // copies — three independent laws must name the SAME device width, and each is computed
-        // here from the bake's own data:
-        //   1. THE MANIFEST'S: `out_n`, the width this loop declares in the RetileDescriptor
-        //      (`DeviceWidth::for_pointwise` over the gemm's output cols, at the collection).
-        //   2. THE WORKER'S: `DeviceWidth::for_pointwise` over the weight TENSOR's own cols —
-        //      the law `spyre_load.rs`'s N-pad applies to the same source (the wiring's
-        //      `[rows, cols]` pair is generated from these shapes). A gemm whose output region
-        //      names a different width than the weight tensor it reads (a sliced output, a
-        //      manifest/wiring shape desync) stages a buffer the manifest's tile does not
-        //      cover — the shim's `prod(device_size)` byte check would fire at LOAD, on the
-        //      card, after the build said yes.
-        //   3. THE SLOT RESERVATION'S: the bytes this bake placed for the tensor
-        //      (`compute_bundle_layout`'s `rows · bump(cols) · word_length`) must COVER
-        //      the manifest's `prod(device_size) · word_length` — at least, not exactly:
-        //      the reservation pads the weight's innermost stick dim to the DEVICE's
-        //      whole-stick footprint (fp8 is a 128-elem stick — the 26b's dense gate/up
-        //      at n=2112 = 16.5 sticks reserves 2176 cols), and over-reservation is the
-        //      documented safe direction (the retile's staging guard reads the WORKER's
-        //      bytes; `lower_subtile_tape_to_superdsc`'s own fp8 K-pad comment). UNDER-
-        //      reservation is what aliases — the t35 class the fp8 K-pad rows law fixed
-        //      (access 6,127,616 B vs placement 5,947,392 B). The K the manifest contracts
-        //      (fp8 weights take `fp8_k_pad`, the same whole-stick law the reservation's rows
-        //      take) times the same width. They were held together only by the "every weight
-        //      crosses the m=1 util floor" assumption, which the router broke silently: its
-        //      slot was reserved at the pointwise floor (512) while the excluded manifest
-        //      staged the checkpoint's 128-wide bytes verbatim — over-addressed the slot by
-        //      the retile, wrong experts, junk. The check is pure compile-time arithmetic on
-        //      the bake's own placements and descriptors; it needs no emulator run (and the
-        //      emulator could not witness it — see the gate at the collection above).
-        {
-            let wl = desc.word_length as u64;
-            let manifest_bytes = desc.device_size.iter().product::<u64>() * wl;
-            let mut tids = std::iter::once(*w_tid)
-                .chain(per_layer.get(w_tid).into_iter().flatten().copied())
-                .collect::<Vec<u32>>();
-            tids.sort_unstable();
-            tids.dedup();
-            for t in tids {
-                // The op that reads this weight, by name — the refusal's own provenance.
-                let op_name = match ir
-                    .nodes
-                    .iter()
-                    .find(|n| n.inputs.len() > 1 && n.inputs[1].tensor.index() as u32 == t)
-                {
-                    Some(n) => n.op.name(),
-                    None => "gemm",
-                };
-                let worker_w = DeviceWidth::for_pointwise(ir.tensors[t as usize].cols).get();
-                let slot = bundle_layout.placements.get(&t);
-                let slot_desc = match slot {
-                    Some(p) => format!("{} bytes (expected at least {manifest_bytes})", p.size),
-                    None => "NO PLACEMENT".to_string(),
-                };
-                let refuse = |what: &str| -> SuperDscError {
-                    let msg = format!(
-                        "reroll-superdsc: gemm weight t{t} of {op_name}: the staging width \
-                         laws disagree — {what}. The manifest declares {out_n}, the worker's \
-                         N-pad law says {worker_w}, the slot reservation holds {slot_desc}. A \
-                         divergence stages a buffer the device tile does not cover (or \
-                         under-covers): the router-defect class, wrong elements on the card, \
-                         invisible to the emulator. All three laws must be \
-                         `DeviceWidth::for_pointwise` over the same logical width, and the \
-                         reservation must hold at least prod(device_size)·word_length bytes"
-                    );
-                    eprintln!("[spyre-gemm-weights] REFUSING TO BAKE: {msg}");
-                    SuperDscError(msg)
-                };
-                if worker_w != *out_n {
-                    return Err(refuse(
-                        "the gemm's output width and the weight tensor's own cols disagree",
-                    ));
-                }
-                match slot {
-                    None => {
-                        return Err(refuse("the bake reserved no placement for the weight"));
-                    }
-                    Some(p) if p.size < manifest_bytes => {
-                        return Err(refuse(
-                            "the placement under-reserves the manifest's tile (aliases the next placement)",
-                        ));
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
-        bundle_layout.kernel_weights.insert(*w_tid, desc.clone());
-        if let Some(layers) = per_layer.get(w_tid) {
-            for &t in layers {
-                bundle_layout.kernel_weights.insert(t, desc.clone());
-            }
         }
     }
     // ⭐⭐⭐ THE HEAD-MAJOR PERMUTED COPIES' MANIFEST + PER-LAYER FAMILY — this walk's half of the

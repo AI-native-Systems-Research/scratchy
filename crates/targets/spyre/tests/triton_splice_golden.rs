@@ -29,6 +29,7 @@ use scratchy_subtile::subtile_ir::{
     TensorShape,
 };
 use scratchy_target_spyre::ktir_superdsc_door::lower as door_lower;
+use scratchy_target_spyre::lower_subtile_tape_to_ktir::graph_bundle_layout;
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::compute_bundle_layout;
 
 /// The rmsnorm shapes that matter for the delivery scope: granite 3.2/3.3 at 2b and 8b
@@ -500,9 +501,10 @@ fn spliced_dense_matmul_lowers_through_the_door() {
         let ir = matmul_ir(m, k, n);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
-        // The layout the tape walk computes for this graph (`rows_are_requests:
-        // true` is the decode/batched shape).
-        let layout = compute_bundle_layout(&ir, &weight_ids, true, &[])
+        // The layout the walk computes for this graph (`rows_are_requests: true` is the
+        // decode/batched shape) — the walk's OWN minting (placement pass + staging census,
+        // [`graph_bundle_layout`]), so the door's transpose-B acceptance sees the census.
+        let layout = graph_bundle_layout(&ir, &weight_ids, true)
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
         // The splice — the row compiles the kernel for this node.
@@ -1161,7 +1163,10 @@ fn batched_decode_odd_vocab_lm_head_splices() {
     let ir = matmul_ir(m, k, n);
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
-    let layout = compute_bundle_layout(&ir, &weight_ids, true, &[])
+    // The walk's OWN minting (placement pass + staging census, [`graph_bundle_layout`]) —
+    // the door's transpose-B acceptance reads the census, so a placement-only layout
+    // would refuse the lm_head weight.
+    let layout = graph_bundle_layout(&ir, &weight_ids, true)
         .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
     // The splice — the odd vocab must compile at ANY row count (PlanCorelets'
@@ -1210,7 +1215,9 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
     for &(mq, k, n) in &[(31u32, 2048u32, 49_155u32), (8u32, 2048u32, 49_155u32)] {
         let ir = matmul_ir(mq, k, n);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
+        // The walk's OWN minting (placement pass + staging census) — the door's
+        // transpose-B acceptance reads the census.
+        let layout = graph_bundle_layout(&ir, &weight_ids, false)
             .unwrap_or_else(|e| panic!("layout minted mq={mq} k={k} n={n}: {e}"));
 
         // The splice — `lower_all` takes the fold route for this shape.
@@ -1271,8 +1278,9 @@ fn spliced_fp8_matmul_lowers_through_the_door() {
         let ir = matmul_fp8_ir(m, k, n);
         let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
 
-        // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, true, &[])
+        // The walk's OWN minting (placement pass + staging census) — the door's
+        // transpose-B acceptance reads the census.
+        let layout = graph_bundle_layout(&ir, &weight_ids, true)
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
         // The splice — the Fp8Dynamic row compiles the kernel for this node.
@@ -1462,9 +1470,15 @@ fn execute_fp8_program(
 /// [`SubtileIR`], fp8-dynamic weights — the arity-3 twin of [`matmul_ir`]:
 /// t0 = x, t1 = W (on-disk `[n, k]`), t2 = wscale (`[1, n]`), t3 = result.
 fn matmul_fp8_ir(m: u32, k: u32, n: u32) -> SubtileIR {
+    // t1's TensorShape is the MATH orientation every real weight IR carries — rows = the
+    // contraction k, cols = the output n (the dense sibling below and the producer's own
+    // fp8 fixture both state it; the width laws in `stage_kernel_weight_census` read cols
+    // as the worker's N-pad width and hold it equal to the gemm's device out width). The
+    // `[out, in]` orientation the worker BINDS is a staging fact — the retile's
+    // disk-order stride map reads those bytes — not this shape.
     let tensors = vec![
         TensorShape { rows: m, cols: k },
-        TensorShape { rows: n, cols: k },
+        TensorShape { rows: k, cols: n },
         TensorShape { rows: 1, cols: n },
         TensorShape { rows: m, cols: n },
     ];
