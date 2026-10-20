@@ -164,19 +164,35 @@ impl GpuWiredLimit {
     }
 }
 
-/// The GPU wired limit: the `iogpu.wired_limit_mb` sysctl where set, else macOS's default of it,
-/// 2/3 of physical memory up to 36 GiB and 3/4 above.
+/// The GPU wired limit on `device`: the `iogpu.wired_limit_mb` sysctl where set, else the default
+/// measured for its chip and memory ([`MEASURED_DEFAULT_LIMITS`]). `None` where neither says: the
+/// default is not a function of memory alone (a 36 GiB M3 Pro faults near 24 GiB, but a 32 GiB M5
+/// serves with 26.9 GiB wired), so a Mac nobody measured keeps the figure Metal reports.
 ///
-/// `recommendedMaxWorkingSetSize` reports the limit where the sysctl sets it, but overstates the
-/// default: 28.08 GiB on a 36 GiB M3 Pro, whose command buffers fault out of memory once the
-/// system's wired memory nears 24 GiB (and run at a 24 GiB sysctl, where it reports 24). `None`
-/// if the kernel answers neither sysctl.
-pub fn gpu_wired_limit() -> Option<GpuWiredLimit> {
-    let bytes = match sysctl_uint(c"iogpu.wired_limit_mb") {
-        Some(mb) if mb > 0 => mb << 20,
-        _ => default_gpu_wired_limit(sysctl_uint(c"hw.memsize")?),
-    };
-    Some(GpuWiredLimit(bytes))
+/// `recommendedMaxWorkingSetSize` reports the limit where the sysctl sets it, but can overstate
+/// the default: 28.08 GiB on the 36 GiB M3 Pro, whose command buffers fault out of memory once the
+/// system's wired memory nears 24 GiB (and run at a 24 GiB sysctl, where it reports 24).
+pub fn gpu_wired_limit(device: &ProtocolObject<dyn MTLDevice>) -> Option<GpuWiredLimit> {
+    match sysctl_uint(c"iogpu.wired_limit_mb") {
+        Some(mb) if mb > 0 => Some(GpuWiredLimit(mb << 20)),
+        _ => measured_default_limit(&device.name().to_string(), sysctl_uint(c"hw.memsize")?),
+    }
+}
+
+/// The default GPU wired limits measured where `iogpu.wired_limit_mb` is unset: `(chip family,
+/// memory, limit)`, the family as the device name carries it. An entry is a fault measured at its
+/// limit on that chip, not a rule for others.
+const MEASURED_DEFAULT_LIMITS: &[(&str, u64, u64)] = &[
+    // macOS 26.6.2: gemma-4-26b's 8x4096-token batch faults once the system's wired memory nears
+    // 24 GiB, and runs at an iogpu.wired_limit_mb of 24576 (#412).
+    ("M3", 36 << 30, 24 << 30),
+];
+
+/// The measured default limit for a device named `name` with `memsize` bytes of memory.
+fn measured_default_limit(name: &str, memsize: u64) -> Option<GpuWiredLimit> {
+    (MEASURED_DEFAULT_LIMITS.iter())
+        .find(|&&(chip, mem, _)| memsize == mem && name.split(' ').any(|w| w == chip))
+        .map(|&(_, _, limit)| GpuWiredLimit(limit))
 }
 
 /// The working set a budget on `device` sizes from: the smaller of what Metal recommends and the
@@ -184,7 +200,7 @@ pub fn gpu_wired_limit() -> Option<GpuWiredLimit> {
 /// sized against it never trips a guard sized against another.
 pub fn usable_working_set(device: &ProtocolObject<dyn MTLDevice>) -> u64 {
     let recommended = device.recommendedMaxWorkingSetSize();
-    gpu_wired_limit().map_or(recommended, |limit| recommended.min(limit.get()))
+    gpu_wired_limit(device).map_or(recommended, |limit| recommended.min(limit.get()))
 }
 
 /// An unsigned integer sysctl, 4 or 8 bytes wide (`iogpu.wired_limit_mb` is an `int`,
@@ -210,15 +226,6 @@ fn sysctl_uint(name: &std::ffi::CStr) -> Option<u64> {
     }
 }
 
-/// macOS's GPU wired limit when `iogpu.wired_limit_mb` is unset: 2/3 of `memsize` up to 36 GiB,
-/// 3/4 above.
-fn default_gpu_wired_limit(memsize: u64) -> u64 {
-    match memsize <= 36 << 30 {
-        true => memsize / 3 * 2,
-        false => memsize / 4 * 3,
-    }
-}
-
 /// Whether the default Metal device can create an `MTL4Compiler` (a real
 /// Metal-4 GPU is present). Equivalent to `detect_device().is_some()` without
 /// building the profile; kept for call sites that only need the boolean.
@@ -235,26 +242,39 @@ pub fn metal4_available() -> bool {
 mod tests {
     use super::*;
 
+    /// Only a measured Mac gets a default limit: the 36 GiB M3 Pro, whatever its M3 variant is
+    /// named. A 32 GiB M5 serves past what any memory-only rule would allow, and an M3 of another
+    /// size, or an M13, is not this one.
     #[test]
-    fn the_default_gpu_wired_limit_is_two_thirds_up_to_36_gib_and_three_quarters_above() {
-        assert_eq!(default_gpu_wired_limit(36 << 30), 24 << 30);
-        assert_eq!(default_gpu_wired_limit(24 << 30), 16 << 30);
-        assert_eq!(default_gpu_wired_limit(64 << 30), 48 << 30);
-        assert_eq!(default_gpu_wired_limit(128 << 30), 96 << 30);
+    fn only_a_measured_mac_gets_a_default_limit() {
+        let limit = |name, gib: u64| measured_default_limit(name, gib << 30).map(|l| l.get() >> 30);
+        assert_eq!(limit("Apple M3 Pro", 36), Some(24));
+        assert_eq!(limit("Apple M3 Max", 36), Some(24));
+        assert_eq!(limit("Apple M3 Pro", 18), None);
+        assert_eq!(limit("Apple M5", 32), None);
+        assert_eq!(limit("Apple M1 Max", 64), None);
+        assert_eq!(limit("Apple M13", 36), None);
     }
 
     /// Both sysctls the limit reads answer on a Mac, each at its own width:
     /// `iogpu.wired_limit_mb` (an `int`, 0 where unset) and `hw.memsize` (a `uint64_t`). The
-    /// limit is the sysctl where it is set, else the default from memory.
+    /// limit is the sysctl where it is set, else the default measured for this Mac, if any.
     #[test]
     fn the_gpu_wired_limit_is_read_from_the_kernel() {
         let mb = sysctl_uint(c"iogpu.wired_limit_mb").expect("iogpu.wired_limit_mb answers");
         let memsize = sysctl_uint(c"hw.memsize").expect("hw.memsize answers");
-        assert!(memsize >= 8 << 30, "hw.memsize {memsize}");
-        let limit = gpu_wired_limit().expect("a limit").get();
+        assert!(memsize > 0, "hw.memsize {memsize}");
+        let Some(device) = MTLCreateSystemDefaultDevice() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let limit = gpu_wired_limit(&device).map(GpuWiredLimit::get);
         match mb {
-            0 => assert_eq!(limit, default_gpu_wired_limit(memsize)),
-            mb => assert_eq!(limit, mb << 20),
+            0 => assert_eq!(
+                limit,
+                measured_default_limit(&device.name().to_string(), memsize).map(GpuWiredLimit::get)
+            ),
+            mb => assert_eq!(limit, Some(mb << 20)),
         }
     }
 
