@@ -307,7 +307,7 @@ fn layout_for(k: &KtirNode) -> BundleLayout {
 fn emitted(k: &KtirNode) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
     let layout = layout_for(k);
     let mut sid = 0i64;
-    lower_function(k, Some(&layout), &mut sid, None).map_err(|e| e.message)
+    lower_function(k, Some(&layout), &mut sid).map_err(|e| e.message)
 }
 
 /// The `index_tensor` alloc's run-base word (`startAddressCoreCorelet_.data_["[0, 0, 0]"]`,

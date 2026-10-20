@@ -1588,10 +1588,6 @@ fn spliced_rope_lowers_through_the_door() {
             // per-bundle geometry exists to state here).
             let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
                 rows_are_requests,
-                // No handoff: this fixture's rope program has no o matmul at all, and a stated
-                // handoff without one is the door's own refusal.
-                headmajor_handoff: false,
-                oproj_wtid: None,
             };
             let mut sym = 0i64;
             let _emitted = door_lower(

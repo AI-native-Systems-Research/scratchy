@@ -2045,8 +2045,7 @@ pub fn rmsnorm(
 /// measured over-run. But the width it fixes is a property of the TILE, not of the op kind: the
 /// dxp scheduler refuses any tile whose stick extent is not a whole 64-elem fp16 stick
 /// (`L3DlOpsScheduler:1040`), so a DENSE elementwise, a BROADCAST one and a REDUCE over a
-/// sub-stick logical width (`[MQ, MQ]` score tiles at a decode-batch rung; the headmajor
-/// fixture's `[1, 8]`) are all the same refusal. And the pad the width adds is real for every
+/// sub-stick logical width (`[MQ, MQ]` score tiles at a decode-batch rung; a `[1, 8]` are all the same refusal. And the pad the width adds is real for every
 /// one of them, because the producers hold it: a matmul mints its output at
 /// [`DeviceWidth::for_matmul`] and an intermediate's `BundleLayout::synth` footprint
 /// stick-rounds its inner axis, so `held` reproduces the pad and the cap is a NO-OP. A
@@ -3587,43 +3586,6 @@ pub fn lmlast(
         .collect())
 }
 
-/// main's `lower_matmul_node` (main 7752-8362).
-///
-/// Its door: `m`/`k`/`n` came from a `TileOp` built off the node and now come from the program's own
-/// tiles — `m`/`n` are the stored output tile's extents and `k` the activation tile's width, which is
-/// exactly what `node_to_tile_ops`' MatmulTile arm read (`a.region.cols.len` / `output.region.*`).
-///
-/// ⭐ ARITY IS THE PRECISION, and the fp8 half of main's body is already ported: three tensor inputs
-/// (activation, packed fp8 weight, the checkpoint's per-column `w_scale`) is W8A8 and goes to
-/// [`super::ktir_matmul_fp8`], which IS main's arity-3 branch unchanged.
-/// ⭐ UNCHANGED FOR EVERY EXISTING CALLER, deliberately. `crates/targets/spyre`'s own
-/// `ktir_superdsc_door` is the caller that states the head-major fact; its weights are transpose-B
-/// by construction (main's `[k, n]` SubtileIR region viewed as `[n, k]`) — which is exactly the
-/// reading the guard inside hardcoded before the orientation became a parameter. So this delegates
-/// at `TransposeB` and preserves today's behaviour byte-for-byte; only a producer that CAN prove
-/// the orientation is asked to.
-pub fn matmul(
-    name: &str,
-    r: &[Region],
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-    quantized: &mut std::collections::HashSet<String>,
-    headmajor: Option<HeadmajorOproj>,
-) -> Result<Vec<EmittedOp>, Error> {
-    matmul_oriented(
-        name,
-        r,
-        sym_id_base,
-        layout,
-        quantized,
-        MatmulProof {
-            b: super::whole_function::BOrient::TransposeB,
-            origin: OperandOrigin::Staged,
-            headmajor,
-        },
-    )
-}
-
 /// WHO THE OPERANDS OF THIS MATMUL CALL ARE — the typed discriminator the spurious-pad drop in
 /// [`matmul_oriented`] reads (issue 201 item 7: a bool cannot say why).
 pub enum OperandOrigin {
@@ -3636,25 +3598,12 @@ pub enum OperandOrigin {
     Windowed,
 }
 
-/// ⭐ THE HEAD-MAJOR o_proj HANDOFF, for the matmul door — the caller-side twin of the spyre
-/// door's `BundleAttnParams` head-major fact, carrying the ONE thing this side keys the B-operand
-/// swap on: the o matmul's weight tid, named by the bundle facts (dataflow-found, see that
-/// struct's own doc), never by a shape. `None` for every producer whose caller states no
-/// handoff — those bake exactly what they baked before this existed.
-#[derive(Clone, Copy)]
-pub struct HeadmajorOproj {
-    /// The o matmul's weight tid, as the bundle's canonical (layer-0) o_proj.
-    pub oproj_wtid: u32,
-}
-
 /// THE CALLER-PROVEN FACTS a matmul emission keys on — everything the door knows that the
 /// program's own tiles cannot state, bundled so the door states each fact exactly once: the weight
-/// orientation ([`super::whole_function::BOrient`]), who the operands are ([`OperandOrigin`]), and
-/// the head-major o_proj handoff ([`HeadmajorOproj`] — `None` wherever no bundle states one).
+/// orientation ([`super::whole_function::BOrient`]) and who the operands are ([`OperandOrigin`]).
 pub struct MatmulProof {
     pub b: super::whole_function::BOrient,
     pub origin: OperandOrigin,
-    pub headmajor: Option<HeadmajorOproj>,
 }
 
 /// [`matmul`] with the weight orientation PROVEN by the caller instead of assumed — see
@@ -3753,40 +3702,7 @@ pub fn matmul_oriented(
     // `[m, k]`.
     let (m, n) = (out.r_len, out.c_len);
     let k = a.c_len;
-    // ⭐⭐⭐ THE HEAD-MAJOR o_proj SWAP — the matmul half of the restructure whose finalize half lives
-    // in the attention door (`assemble_attn`'s `headmajor_handoff` form). Where the bundle's
-    // attention finalize writes `out` SLAB-MAJOR (one op per feature slab of the head dim), the
-    // contraction axis of THIS matmul arrives permuted — head-major `s·nqh·64 + h·64 + d` — so its
-    // B operand must be the second, k-shuffled o_proj copy staged under `oproj_headmajor_tid`, the
-    // copy whose retile walk enumerates exactly that order. The fact and the copy are minted
-    // together in `compute_bundle_layout`; this door only NAMES the operand, which is why the key
-    // is the WEIGHT TID the bundle facts stated by dataflow (see `HeadmajorOproj`) — never a shape:
-    // at `k == n` (granite-3.1-8b's `[4096, 4096]` o_proj) the extents cannot tell the o matmul
-    // from any other square projection, and a shape-keyed swap would re-point every square
-    // projection at the permuted copy.
-    //
-    // ⛔ AND THE WIDTH AND PRECISION ARE THE HANDOFF'S OWN. The fact was minted from the bundle's
-    // attention-output row count and the fp8 W8A8 o matmul the dataflow walk found; `m` here and
-    // `w.is_fp8` here are that same pair stated by the program. A swap at any other width or
-    // precision reads slab-major bytes against an unpermuted weight (or the reverse) — half a
-    // restructure, fluent and wrong — so a disagreement is refused here rather than baked.
-    let w_name = match proof.headmajor {
-        Some(h) if h.oproj_wtid == w.tid => {
-            if m != 1 || !w.is_fp8 {
-                return err(format!(
-                    "MatmulTile {name}: the bundle states the head-major o_proj handoff for weight \
-                     t{}, but this program states m={m} over an {} weight — the handoff is minted \
-                     for the single-row fp8 W8A8 o matmul (mq == 1 over a multi-slab head dim). \
-                     Half a restructure is a slab-major activation read against an unpermuted \
-                     weight: fix the bundle's statement, not the emission.",
-                    w.tid,
-                    if w.is_fp8 { "fp8" } else { "f16" },
-                ));
-            }
-            crate::place::act_name(crate::reserved_tids::oproj_headmajor_tid(w.tid))
-        }
-        _ => w.name(),
-    };
+    let w_name = w.name();
     // ── fp8 W8A8 (arity-3 [act(fp16 [m,k]), W(fp8 [k,n]), w_scale(f16 [n,1] ≡ [1,n])]): per-token quantize
     //    act → fp8, `matmulfp8` (fp8×fp8→fp16), dequant by `a_scale[m]·w_scale[n]`. fp8-ness is TYPED: the
     //    quantized act (`Df::Fp8` via `synth_df` + the qfp8ch convert's output) and the weight/act matmul

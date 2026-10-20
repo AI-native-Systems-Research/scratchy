@@ -66,29 +66,6 @@ pub struct BundleAttnParams {
     /// either way. A bundle with no attention node has no requests to have rows of, which is
     /// main's own `false` at that call site.
     pub rows_are_requests: bool,
-    /// ⭐ WHETHER THIS BUNDLE'S o_proj READS THE HEAD-MAJOR COPY — the finalize/weight contract of
-    /// the multi-slab single-row body, and the SECOND fact the program cannot state.
-    ///
-    /// At `nslab > 1` the shipped finalize relayouts `out` to token-stream at `nqh·nslab` ops; at
-    /// `mq == 1` a row IS a head, so the alternative is to leave `out` slab-major (one op per slab)
-    /// and permute o_proj's contraction axis to meet it — a SECOND, k-shuffled copy of each layer's
-    /// o_proj weight under [`crate::reserved_tids::oproj_headmajor_tid`]. The finalize cannot say
-    /// which arrangement its bytes are in, and the o matmul cannot say which copy its B operand
-    /// means — this ONE fact is what both consume, so the restructure cannot be half-applied:
-    /// the door swaps the B operand on exactly the bundles whose finalize went slab-major.
-    ///
-    /// Minted ONLY where fully expressible: the attention output is a single row (`mq == 1`),
-    /// the head dim spans more than one feature slab (`hd > POOL_STICK`), and the o matmul is fp8
-    /// W8A8 (the staging walk the permuted copy is derived for). A wider bundle, a single-slab head
-    /// dim, or a dense o_proj keeps the shipped emission byte-for-byte.
-    pub headmajor_handoff: bool,
-    /// The o matmul's weight tid — the MatmulTile found by DATAFLOW (its A operand is an attention
-    /// output), stated per bundle so the matmul door's swap keys on the OPERAND's identity and
-    /// never on a shape: at `k == n` (granite-3.1-8b's `[4096, 4096]` o_proj) the extents cannot
-    /// tell the o matmul from any other square projection, and a shape-keyed swap would re-point
-    /// every square projection at the permuted copy. `None` when the graph's attention has no
-    /// matmul consumer (nothing to swap; the handoff above is `false` with it).
-    pub oproj_wtid: Option<u32>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -137,10 +114,10 @@ pub fn lower(
         // (`subtile_ir.rs`'s set); for the rest the guard is a no-op at
         // corner 0, and it makes a corner that ever reaches one a build error naming the op, not a
         // piece written at the buffer base.
-        Program::Elementwise(_) => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
-        Program::SiluMul => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
-        Program::RmsNorm => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
-        Program::ScalarMul => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
+        Program::Elementwise(_) => windowed(name, &r, lower_function(k, layout, sym_id_base)),
+        Program::SiluMul => windowed(name, &r, lower_function(k, layout, sym_id_base)),
+        Program::RmsNorm => windowed(name, &r, lower_function(k, layout, sym_id_base)),
+        Program::ScalarMul => windowed(name, &r, lower_function(k, layout, sym_id_base)),
         Program::RmsNormUnit => {
             windowed(name, &r, lk::rmsnorm_unit(name, k, &r, sym_id_base, layout))
         }
@@ -158,37 +135,12 @@ pub fn lower(
         // ⭐ THE WALK PROVES WHAT THIS ARM HARDCODED. The per-`Program` matmul entry assumed
         // `TransposeB` and `OperandOrigin::Staged`; the walk reads the orientation off the op's own
         // `indexing_maps` (`whole_function::matmul_b_orientation`) and states the operands' origin
-        // as windows — the facts the spurious-pad drop in `matmul_oriented` discriminates on. The
-        // head-major swap fact is threaded exactly as before.
-        Program::Matmul => lower_function(
-            k,
-            layout,
-            sym_id_base,
-            // ⭐ THE HEAD-MAJOR SWAP'S DOOR FACT, from the same `BundleAttnParams` the rope/attn
-            // arms read: the o matmul's weight tid, named per bundle by the dataflow walk. Every
-            // other matmul of the bundle (q/k/v, mlp, lm_head) carries a tid the fact does not
-            // name, so it keeps its own staged weight — the swap is keyed on the operand's
-            // identity, never a shape. ⛔ A handoff without an `oproj_wtid` is a malformed bundle
-            // statement — the handoff is minted only where the walk found the o matmul — and a
-            // slab-major finalize with no weight to meet it is refused here, not emitted.
-            match attn_params {
-                Some(p) if p.headmajor_handoff => Some(lk::HeadmajorOproj {
-                    oproj_wtid: p.oproj_wtid.ok_or_else(|| Error {
-                        message: format!(
-                            "{name}: the bundle states the head-major attention finalize but \
-                             names no o_proj weight tid — the handoff is minted only where the \
-                             dataflow walk found the o matmul, so a handoff without one is a \
-                             malformed bundle statement",
-                        ),
-                    })?,
-                }),
-                _ => None,
-            },
-        ),
+        // as windows — the facts the spurious-pad drop in `matmul_oriented` discriminates on.
+        Program::Matmul => lower_function(k, layout, sym_id_base),
         // The last-row extraction is a PURE COPY (loads and stores only); the walk's own LmLast
         // arm keys on the stated `Program` and refuses a copy that grew a compute op rather than
         // half-lowering it.
-        Program::LmLast => lower_function(k, layout, sym_id_base, None),
+        Program::LmLast => lower_function(k, layout, sym_id_base),
         Program::Rope => rope(name, &r, sym_id_base, layout, attn_params),
         // ⭐ THE ATTENTION PATH IS THE GENERIC ONE — the hand-written `attn_at::<NQH, NKVH, HD>`
         // chain (GQA replication, Kᵀ restickify, the split-KV chunk, the per-page fold, the LX
@@ -200,7 +152,7 @@ pub fn lower(
         // belongs to the generic path, never to a regrown per-attention arm.
         // The head-major handoff is the O-PROJ MATMUL's fact (see that arm) — attention itself
         // carries none.
-        Program::Attn => lower_function(k, layout, sym_id_base, None),
+        Program::Attn => lower_function(k, layout, sym_id_base),
         // ⭐ NO DOOR TO CROSS. A transpose's descriptor is parameterised by the two extents its own
         // program states and by nothing about the model, so the arm is the body — unlike `rope`/`attn`
         // above, whose head geometry has to become const generics on this side.

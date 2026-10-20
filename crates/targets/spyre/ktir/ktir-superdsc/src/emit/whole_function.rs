@@ -111,7 +111,7 @@ pub struct SiluMulChain {
 /// # ⛔⛔⛔ THE HOLE THIS CLOSES IS A SILENT WRONG ANSWER, NOT A MISSING FEATURE
 ///
 /// Nothing else in this crate reads `IndexingMaps`. The weight's framing was instead inferred from its
-/// EXTENTS, by [`super::lower_ktir_to_superdsc::matmul`]'s two guards, which cannot tell the two apart
+/// EXTENTS, by [`super::lower_ktir_to_superdsc::matmul_oriented`]'s two guards, which cannot tell the two apart
 /// WHEN `k == n`: a `[k, n]` weight then satisfies both and lowers to a descriptor that contracts the
 /// other way round. Granite's attention output projection is `4096 × 4096`, so that is a shape this
 /// backend really compiles. This value is what those guards now frame themselves from.
@@ -228,7 +228,7 @@ pub fn matmul_b_orientation(
 /// # THE ARGUMENT, from the crate's own declarations
 ///
 /// Stating `indexing_maps` LABELS which axis of `B` is `k`. It does not MOVE a byte. The kernel slot
-/// reads exactly ONE residency and it is `[k, n]`: [`super::lower_ktir_to_superdsc::matmul`] declares
+/// reads exactly ONE residency and it is `[k, n]`: [`super::lower_ktir_to_superdsc::matmul_oriented`] declares
 /// the operand `StickLayout::kernel(k_in, n_out)`, whose address law is `dev_off_stk`'s rank-2
 /// stick-blocked form with `dims[0] = in = K` as the ROW count, and `StickLayout::addr_eq` states the
 /// consequence in the crate's own words — "`RowBlocked` vs `Kernel` is the identical stick-block
@@ -2202,11 +2202,6 @@ fn row_tiled_family(
 ///
 /// Each op is handed only its own operands' regions, so the existing bodies apply unchanged.
 ///
-/// `headmajor` is the head-major o_proj handoff fact ([`HeadmajorOproj`]), threaded from the door
-/// that owns the bundle's attention facts — the swap keys on the o matmul's weight tid, so of the
-/// many matmuls an unrolled graph holds, exactly the one whose `w.tid` the fact names takes it.
-/// `None` is the no-handoff emission every caller without a bundle fact gets.
-///
 /// # WHAT IS NOT IMPLEMENTED YET, AND IS REFUSED RATHER THAN GUESSED
 ///
 /// An INTERMEDIATE — a result one op produces and the next consumes, which no `ktdp.store` writes —
@@ -2247,7 +2242,6 @@ pub fn lower_function(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
     sym_id_base: &mut i64,
-    headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
 ) -> Result<Vec<super::EmittedOp>, Error> {
     let f = &k.func;
     let mut out = Vec::new();
@@ -2738,7 +2732,7 @@ pub fn lower_function(
         //
         // THE KERNEL SLOT'S DEVICE ORDER IS `[in, out]` = `[k, n]`, WITH `in` AS THE STICK-BLOCK ROW
         // COUNT. That is not this emitter's choice and it is the same for both orientations:
-        // `lower_ktir_to_superdsc::matmul` declares `Stk::<KernelTag>::kernel(k, n_dev, ..)`, i.e.
+        // `lower_ktir_to_superdsc::matmul_oriented` declares `Stk::<KernelTag>::kernel(k, n_dev, ..)`, i.e.
         // `StickLayout::kernel(k_in, n_out)` — `dev_off_stk`'s rank-2 law with `dims[0] = k`, element
         // `(k, n)` at `(n/stk)·(k·stk) + k·stk + (n%stk)`. A `[k, n]` operand is therefore ALREADY in
         // the residency the slot reads, and `StickLayout::addr_eq` says so in the crate's own words:
@@ -3077,7 +3071,6 @@ pub fn lower_function(
                 &per_op,
                 sym_id_base,
                 Some(layout),
-                headmajor,
                 WalkProof {
                     b_orient,
                     gather: op_gather.map(|(g, _, _)| g),
@@ -3123,7 +3116,6 @@ pub fn lower_function(
             &per_op,
             sym_id_base,
             layout,
-            headmajor,
             WalkProof {
                 b_orient,
                 gather: op_gather.map(|(g, _, _)| g),
@@ -3218,7 +3210,6 @@ fn emit_one(
     per_op: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
     proof: WalkProof<'_>,
 ) -> Result<Vec<super::EmittedOp>, Error> {
     let WalkProof {
@@ -3314,14 +3305,6 @@ fn emit_one(
                     // This door's operands are WINDOWS of the caller's parameters — the fact the
                     // spurious-pad drop in `matmul_oriented` discriminates on.
                     origin: super::lower_ktir_to_superdsc::OperandOrigin::Windowed,
-                    // ⭐ THE HEAD-MAJOR o_proj HANDOFF, THREADED FROM THE DOOR THAT OWNS THE BUNDLE
-                    // FACT. It is minted from the attention-output row count (mq == 1 over a
-                    // multi-slab head dim) and the o matmul's weight tid, neither of which a
-                    // program states; `matmul_oriented` keys the swap on `w.tid == oproj_wtid`, so
-                    // of the many matmuls an unrolled graph holds, exactly the one the fact names
-                    // takes it. `None` — every caller without a bundle fact — is the plain staged
-                    // weight, byte-identical to what this arm always emitted.
-                    headmajor,
                 },
             )?
         }

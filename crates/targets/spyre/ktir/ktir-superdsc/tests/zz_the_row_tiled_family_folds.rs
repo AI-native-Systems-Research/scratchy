@@ -334,7 +334,7 @@ fn layout_for(k: &KtirNode, view: (i64, i64)) -> BundleLayout {
 fn lowered(k: &KtirNode, view: (i64, i64)) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
     let layout = layout_for(k, view);
     let mut sid = 0i64;
-    lower_function(k, Some(&layout), &mut sid, None).map_err(|e| e.message)
+    lower_function(k, Some(&layout), &mut sid).map_err(|e| e.message)
 }
 
 /// The `dscs_[0]` entry of an emitted op — the descriptor the assertions read.

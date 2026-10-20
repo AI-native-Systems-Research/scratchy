@@ -519,9 +519,6 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // is a matmul), and one Triton kernel's parameter list is not a graph — its scale consts
         // are the `scalarmul_scales` above, bound per launch.
         weight_scale_folds: Vec::new(),
-        // No head-major o_proj copies: the restructure is minted from a spyre bundle's
-        // attention→o_proj dataflow, and one Triton kernel's parameter list is not that graph.
-        weight_copies: Vec::new(),
         // The rope-P class set, filled where P itself is placed (see the Rope arm above). `drive_rope`
         // resolves this rope's `p_tid` off it — the same registry the consumer ladder's door resolves
         // through, so the two ladders cannot disagree about which P table a class reads.

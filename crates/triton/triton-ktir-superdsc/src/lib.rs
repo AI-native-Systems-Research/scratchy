@@ -226,11 +226,6 @@ fn emit_regions(
                     // The per-`Program` door's operands are whole staged tensors, not windows of
                     // the caller's parameters — the fact the spurious-pad drop discriminates on.
                     origin: emit::lower_ktir_to_superdsc::OperandOrigin::Staged,
-                    // ⭐ NO HEAD-MAJOR o_proj HANDOFF HERE. That fact is minted from a spyre
-                    // BUNDLE's attention-output row count (mq == 1 over a multi-slab head dim) and
-                    // lives on the spyre door's `BundleAttnParams`; this Triton producer states no
-                    // bundle facts, so it keeps the pre-restructure emission.
-                    headmajor: None,
                 },
             )
         }
@@ -575,7 +570,7 @@ pub fn dump(node: &KtirNode) -> String {
 /// name rather than assigned a node kind on the producer's behalf.
 pub fn emit_whole(node: &KtirNode, layout: Option<&BundleLayout>) -> Result<Vec<EmittedOp>, Error> {
     let mut sym = 0i64;
-    ktir_superdsc::emit::whole_function::lower_function(node, layout, &mut sym, None).map_err(|e| {
+    ktir_superdsc::emit::whole_function::lower_function(node, layout, &mut sym).map_err(|e| {
         Error {
             stage: "whole-function",
             message: format!("{e:?}"),
@@ -1325,7 +1320,7 @@ mod one_k_window_from_the_fixture {
         let node = one_k_window();
         let l = layout::for_node(&node).expect("the layout serves the fixture");
         let mut sym = 0i64;
-        let ops = emit::whole_function::lower_function(&node, Some(&l), &mut sym, None)
+        let ops = emit::whole_function::lower_function(&node, Some(&l), &mut sym)
             .expect("the one-K mulf: a broadcast scalar times a windowed dense operand");
         let mulfs: Vec<_> = ops
             .iter()
@@ -1377,7 +1372,7 @@ mod one_k_window_from_the_fixture {
         let node = one_k_window();
         let l = layout::for_node(&node).expect("the layout serves the fixture");
         let mut sym = 0i64;
-        let ops = emit::whole_function::lower_function(&node, Some(&l), &mut sym, None)
+        let ops = emit::whole_function::lower_function(&node, Some(&l), &mut sym)
             .expect("the epilogue lowers beside the mulf");
         let addf = ops
             .iter()

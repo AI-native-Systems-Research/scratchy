@@ -68,7 +68,7 @@ use scratchy_subtile::subtile_ir::{
 use scratchy_subtile::subtile_tape::{lower_dag_to_tape, reroll_subtile_tape};
 use scratchy_target_spyre::ktir_superdsc_door::lower as door_lower;
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
-    ActiveCap, ATTN_MASK_TID, RolledSuperDsc, RungFacts, ladder_stages_one_layout,
+    ActiveCap, ATTN_MASK_TID, RolledSuperDsc, ladder_stages_one_layout,
     lower_subtile_tape_to_superdsc,
 };
 
@@ -239,7 +239,7 @@ fn n_layer_of(base: &LoweringInput, rows: u32, n: u32) -> (LoweringInput, HashSe
 /// validate → tape → reroll) and the rolled walk, at the PREFIX bake's own argument
 /// values: `ActiveCap::FULL` (the continuation sweep), `rows_are_requests = false`
 /// (a prompt chunk's rows are one request's positions — `!is_prefill && decode_rows
-/// > 1` is the emission's own derivation), `one_request = false` (a prefill bake).
+/// > 1` is the emission's own derivation).
 fn walk(active_cap: ActiveCap) -> (RolledSuperDsc, SubtileIR<NeoX>) {
     walk_shaped(active_cap, MQ, false, LAYERS)
 }
@@ -264,7 +264,6 @@ fn walk_shaped(
         &weight_ids,
         active_cap,
         rows_are_requests,
-        RungFacts { one_request: false },
     )
     .expect("the granite-2b prefix-capable chunk lowers through the rolled walk");
     (rolled, rg)

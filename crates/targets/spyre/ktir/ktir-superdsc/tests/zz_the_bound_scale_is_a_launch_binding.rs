@@ -282,7 +282,7 @@ fn a_row_view_is_not_a_bound_scale_and_the_walk_refuses_it() {
     // And the whole-function walk, with no other reading available, refuses by name.
     let layout = layout_for(&k);
     let mut sid = 0i64;
-    let e = match lower_function(&k, Some(&layout), &mut sid, None) {
+    let e = match lower_function(&k, Some(&layout), &mut sid) {
         Err(e) => e.message,
         Ok(_) => panic!("a row-vector scale must be refused, not lowered as a scalarmul"),
     };
@@ -301,7 +301,7 @@ fn the_bound_scale_operand_is_the_parameters_own_placement() {
     let k = scale_program(ScaleView::Degenerate);
     let layout = layout_for(&k);
     let mut sid = 0i64;
-    let ops = lower_function(&k, Some(&layout), &mut sid, None)
+    let ops = lower_function(&k, Some(&layout), &mut sid)
         .expect("the bound-scale program lowers through the whole-function door");
     let [op] = &ops[..] else {
         panic!(
@@ -412,7 +412,7 @@ fn a_baked_scale_does_not_read_the_scale_parameter() {
                 size: 2,
             },
         );
-        lower_function(&k, Some(&layout), &mut sid, None)
+        lower_function(&k, Some(&layout), &mut sid)
             .expect("the baked-scale program lowers through the registry arm")
     };
     let [op] = &ops[..] else {

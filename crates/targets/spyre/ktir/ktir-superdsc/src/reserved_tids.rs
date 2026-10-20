@@ -401,7 +401,7 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
 }
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 8] = [
+pub const RESERVED_REGIONS: [TidRegion; 7] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -437,19 +437,10 @@ pub const RESERVED_REGIONS: [TidRegion; 8] = [
         base: IDENTITY_CLASS_BASE,
         slots: 8,
     },
-    // ⭐ THE HEAD-MAJOR o_proj COPY takes the slot below the burned router-const hole and
-    // above the deliberately-kept-empty gap. See [`OPROJ_HEADMAJOR_BASE`] for what it names.
-    // (Rebased off main's MAX-121 — that slot is the rope-p class region on this line — to
-    // MAX-147, the first free slot below where the router consts lived; `OPROJ_HEADMAJOR_BASE`
-    // derives from this row, so nothing else moves.)
-    TidRegion {
-        name: "oproj_headmajor",
-        base: u32::MAX - 147,
-        slots: 1_000_000,
-    },
-    // ⛔ THE REMAINING GAP (from `oproj_headmajor`'s floor at MAX-1_000_146 down to `kct_resident`'s
+    // ⛔ THE REMAINING GAP (from the identity-class region's floor down to `kct_resident`'s
     // base at MAX-1_000_171) IS DELIBERATELY LEFT EMPTY. It held the K-split block/zero/down_proj
-    // regions, which are gone with the K-split itself. `kct_resident` keeps its ABSOLUTE base rather
+    // regions (gone with the K-split) and the head-major o_proj copy region (gone with the
+    // restructure — #717). `kct_resident` keeps its ABSOLUTE base rather
     // than sliding up into the hole: every reserved id is a number that has been baked into
     // artifacts, and moving one to tidy the map would silently repoint it.
     // ⛔ BOUNDED, WHERE IT USED TO BE OPEN-ENDED. `kct_resident_tid(k_id) = BASE - k_id` had no
@@ -630,23 +621,6 @@ pub const KTN_SCRATCH_BASE: u32 = reserved_region("ktn_scratch").base;
 /// Reserved tid for the new-block Kᵀ scratch of the new-K staging source tid `new_k_id`.
 pub fn ktn_scratch_tid(new_k_id: u32) -> u32 {
     reserved_region("ktn_scratch").at(new_k_id)
-}
-
-/// Base of the RESERVED tid block for the HEAD-MAJOR o_proj weight copy (the "kill the 64-op
-/// attn_o finalize" restructure — 32 heads × 2 slabs of single-core realdiv collapse to one op
-/// per feature slab). At `mq == 1 && nslab > 1` the attention finalize can write `out`
-/// head-major ONLY if the o matmul's B
-/// operand is k-axis-block-shuffled to match — a SECOND, permuted copy of each layer's o_proj
-/// weight, resident in seg1 next to its source. KEYED ON THE o_proj WEIGHT SOURCE TID `w_id`
-/// (like [`kct_resident_tid`]) so the emitter (which has the matmul's `w.tid`) and the
-/// layout/guard (which iterate every layer's `w_id`) compute the SAME copy tid with no
-/// layer-index handoff. A 1M region keeps it disjoint from `kct_resident` below and from real
-/// source tids (~thousands) — and unlike the kct region, only ~40 slots (one per layer) are ever
-/// taken.
-pub const OPROJ_HEADMAJOR_BASE: u32 = reserved_region("oproj_headmajor").base;
-/// Reserved tid for the head-major permuted copy of the o_proj weight with source tid `w_id`.
-pub fn oproj_headmajor_tid(w_id: u32) -> u32 {
-    reserved_region("oproj_headmajor").at(w_id)
 }
 
 /// ⛔⛔⛔ THE REGRESSION THAT ADDING A REGION CAUSED, PINNED — a resident Kᵗ kernel and the gather's

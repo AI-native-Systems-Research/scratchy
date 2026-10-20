@@ -258,19 +258,6 @@ pub struct BundleLayout {
     /// existed.
     #[serde(default)]
     pub weight_scale_folds: Vec<(u32, f32)>,
-    /// ⭐ THE HEAD-MAJOR o_proj PERMUTED COPIES — `(companion weight tid, permuted copy tid)`, one
-    /// pair per o_proj weight the head-major restructure companions. Where the bundle's
-    /// single-row attention finalize writes `out` SLAB-MAJOR, the o matmul's contraction axis
-    /// arrives permuted and its B operand must be the SECOND, k-shuffled o_proj copy staged under
-    /// `oproj_headmajor_tid` — the copy whose retile walk (in [`Self::kernel_weights`]) enumerates
-    /// exactly that order. The worker materializes each `to` tid from its `from` tid's bytes at
-    /// load. MINTED BUNDLE-INVARIANTLY — keyed on the geometry (multi-slab head dim + fp8 W8A8 o
-    /// matmul), never on the bundle's row count, because every bundle of a model shares ONE
-    /// staged weight segment; only the EMISSION gates on rows. EMPTY for every model the gate
-    /// excludes (granite-3.1-2b's one-slab head dim, every dense o_proj), which keeps those
-    /// bundles byte-identical to before this field existed.
-    #[serde(default)]
-    pub weight_copies: Vec<(u32, u32)>,
     /// ⭐ THE ROPE-P CLASS SET — this tape's DISTINCT rope head dims, sorted descending. Index `i` ↔
     /// [`rope_p_class_tid`](crate::reserved_tids::rope_p_class_tid)`(i)` (class 0 = the widest =
     /// `ROPE_P_TID`). One `[hd,hd]` P table per class: a hybrid (gemma-4) carries two rope head dims
