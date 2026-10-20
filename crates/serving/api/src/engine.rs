@@ -3065,302 +3065,6 @@ impl AsyncEngine {
         stop_string_finished
     }
 
-    /// Process an engine output for a single request (single-threaded path,
-    /// used by tests).
-    #[cfg(test)]
-    fn process_output(requests: &mut HashMap<String, RequestState>, output: EngineCoreOutput) {
-        let Some(req_state) = requests.get_mut(&output.request_id) else {
-            debug!("Output for unknown request {}, ignoring", output.request_id);
-            return;
-        };
-        if req_state.finish_reason.is_some() {
-            return;
-        }
-
-        // Track output tokens.
-        #[cfg(feature = "metrics")]
-        {
-            let metrics = crate::metrics::VllmMetrics::global();
-            metrics
-                .output_tokens_total
-                .inc_by(output.new_token_ids.len() as u64);
-        }
-
-        // --- TTFT / ITL timing ---
-        let now = Instant::now();
-        if !output.new_token_ids.is_empty() {
-            if req_state.first_token_time.is_none() {
-                // First token: record TTFT.
-                req_state.first_token_time = Some(now);
-                if std::env::var_os("SCRATCHY_TTFT_PHASE").is_some() {
-                    eprintln!(
-                        "[ttft-host] submit_to_first_token={:.2} ms  (queue + prefill forward + sample + detokenize)",
-                        now.duration_since(req_state.submit_time).as_secs_f64() * 1e3,
-                    );
-                }
-                #[cfg(feature = "metrics")]
-                {
-                    let ttft = now.duration_since(req_state.submit_time).as_secs_f64();
-                    crate::metrics::VllmMetrics::global()
-                        .time_to_first_token_seconds
-                        .observe(ttft);
-                }
-            } else if let Some(last) = req_state.last_token_time {
-                // Subsequent token: record inter-token latency.
-                let itl = now.duration_since(last).as_secs_f64();
-                #[cfg(feature = "metrics")]
-                crate::metrics::VllmMetrics::global()
-                    .inter_token_latency_seconds
-                    .observe(itl);
-                req_state.itl_count += 1;
-                req_state.itl_sum += itl;
-            }
-            req_state.last_token_time = Some(now);
-        }
-
-        // Accumulate tokens and logprobs.
-        req_state.generated_token_ids.extend(&output.new_token_ids);
-        if let Some(lps) = &output.new_logprobs {
-            req_state.logprobs.extend(lps.iter().cloned());
-        }
-        if let Some(plps) = output.new_prompt_logprobs {
-            req_state.prompt_logprobs = Some(plps);
-        }
-        let step_logprobs = output.new_logprobs.clone();
-
-        // Update cached tokens.
-        if output.num_cached_tokens > 0 {
-            req_state.num_cached_tokens = output.num_cached_tokens;
-        }
-
-        // Store pooler output (embedding vector) if present.
-        if output.pooler_output.is_some() {
-            req_state.pooler_output = output.pooler_output;
-        }
-
-        // Determine if the engine already terminated (stop token).
-        let stop_terminated = output.finish_reason == Some(FinishReason::Stop);
-
-        // Update the detokenizer with new tokens. Shared behind a lock now (see [`SharedDetok`]) —
-        // uncontended here, this is the serial path.
-        let mut detokenizer_stop = None;
-        if let Some(detok) = req_state.detokenizer.as_ref() {
-            detokenizer_stop = detok
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .update(&output.new_token_ids, stop_terminated);
-        }
-
-        // Determine finish/stop reason. Detokenizer stop takes priority.
-        let is_finished = output.finish_reason.is_some() || detokenizer_stop.is_some();
-        let (delta_finish_reason, delta_stop_reason) = if let Some(stop_str) = detokenizer_stop {
-            (Some(FinishReason::Stop), Some(StopReason::String(stop_str)))
-        } else {
-            (output.finish_reason, output.stop_reason.clone())
-        };
-
-        // Get delta text for streaming.
-        let delta_text = req_state.detokenizer.as_ref().map(|detok| {
-            detok
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_next_output_text(is_finished, true)
-        });
-
-        // Send streaming delta if applicable.
-        // Token counts, stamped on every delta this step emits. Read once
-        // here so the literals below stay uniform: which of them fires
-        // first depends on reasoning/tool-parser state, so there is no single
-        // "first delta" to special-case. `num_cached_tokens` is already set
-        // for this step (above), and the scheduler fixes it at admission.
-        // `generated_token_ids` already holds this step's tokens (above).
-        let usage = req_state.stream_usage();
-
-        if let Some(tx) = &req_state.stream_tx {
-            // If tool parser state is active, route through it.
-            if let Some(ref mut parser_state) = req_state.tool_parser_state {
-                if let Some(ref text) = delta_text {
-                    let previous_text = req_state.accumulated_text.clone();
-                    req_state.accumulated_text.push_str(text);
-                    let current_text = req_state.accumulated_text.clone();
-
-                    let parser_result =
-                        parser_state.process_delta(&previous_text, &current_text, text);
-
-                    match parser_result {
-                        ToolParserDelta::Content(content) => {
-                            let delta = StreamDelta {
-                                index: req_state.choice_index,
-                                new_token_ids: output.new_token_ids.clone(),
-                                text: Some(content),
-                                finish_reason: if is_finished && !req_state.tool_calls_emitted {
-                                    delta_finish_reason
-                                } else {
-                                    None
-                                },
-                                stop_reason: if is_finished && !req_state.tool_calls_emitted {
-                                    delta_stop_reason.clone()
-                                } else {
-                                    None
-                                },
-                                logprobs: step_logprobs.clone(),
-                                tool_call_deltas: None,
-                                reasoning: None,
-                                usage,
-                            };
-                            let _ = tx.send(delta);
-                        }
-                        ToolParserDelta::ToolCalls(tool_deltas) => {
-                            // Filter by forced function name if specified.
-                            let tool_deltas =
-                                if let Some(ref forced) = req_state.forced_function_name {
-                                    tool_deltas
-                                        .into_iter()
-                                        .filter(|d| {
-                                            d.function_name.as_ref().is_none_or(|n| n == forced)
-                                        })
-                                        .collect::<Vec<_>>()
-                                } else {
-                                    tool_deltas
-                                };
-                            if tool_deltas.is_empty() {
-                                // Filtered out — don't emit.
-                            } else {
-                                req_state.tool_calls_emitted = true;
-                                let delta = StreamDelta {
-                                    index: req_state.choice_index,
-                                    new_token_ids: output.new_token_ids.clone(),
-                                    text: None,
-                                    finish_reason: None,
-                                    stop_reason: None,
-                                    logprobs: step_logprobs.clone(),
-                                    tool_call_deltas: Some(tool_deltas),
-                                    reasoning: None,
-                                    usage,
-                                };
-                                let _ = tx.send(delta);
-                            }
-                        }
-                        ToolParserDelta::None => {
-                            // Buffering, don't send anything yet.
-                        }
-                    }
-
-                    // Send finish delta separately if finished and tool calls were emitted.
-                    if is_finished && req_state.tool_calls_emitted {
-                        let finish_delta = StreamDelta {
-                            index: req_state.choice_index,
-                            new_token_ids: vec![],
-                            text: None,
-                            finish_reason: Some(FinishReason::Stop), // overridden to tool_calls in server.rs
-                            stop_reason: delta_stop_reason.clone(),
-                            logprobs: None,
-                            tool_call_deltas: None,
-                            reasoning: None,
-                            usage,
-                        };
-                        let _ = tx.send(finish_delta);
-                    }
-                } else if is_finished {
-                    // No text but finished — send finish delta.
-                    let fr = if req_state.tool_calls_emitted {
-                        Some(FinishReason::Stop)
-                    } else {
-                        delta_finish_reason
-                    };
-                    let delta = StreamDelta {
-                        index: req_state.choice_index,
-                        new_token_ids: output.new_token_ids.clone(),
-                        text: None,
-                        finish_reason: fr,
-                        stop_reason: delta_stop_reason.clone(),
-                        logprobs: step_logprobs.clone(),
-                        tool_call_deltas: None,
-                        reasoning: None,
-                        usage,
-                    };
-                    let _ = tx.send(delta);
-                }
-            } else {
-                // No tool parsing — normal streaming path.
-                let delta = StreamDelta {
-                    index: req_state.choice_index,
-                    new_token_ids: output.new_token_ids,
-                    text: delta_text,
-                    finish_reason: delta_finish_reason,
-                    stop_reason: delta_stop_reason.clone(),
-                    logprobs: step_logprobs.clone(),
-                    tool_call_deltas: None,
-                    reasoning: None,
-                    usage,
-                };
-                let _ = tx.send(delta);
-            }
-        }
-
-        // Update request state finish/stop reason.
-        if is_finished && req_state.finish_reason.is_none() {
-            req_state.finish_reason = delta_finish_reason;
-            req_state.stop_reason = delta_stop_reason.or(output.stop_reason);
-        }
-
-        // Log and clean up when done.
-        if is_finished {
-            let total_latency = now.duration_since(req_state.submit_time).as_secs_f64();
-            let ttft_ms = req_state
-                .first_token_time
-                .map(|t| t.duration_since(req_state.submit_time).as_secs_f64() * 1000.0);
-            let avg_itl_ms = if req_state.itl_count > 0 {
-                Some(req_state.itl_sum / req_state.itl_count as f64 * 1000.0)
-            } else {
-                None
-            };
-            let prompt_tokens = req_state.num_prompt_tokens;
-            let completion_tokens = req_state.generated_token_ids.len() as u32;
-
-            let finish_str = req_state
-                .finish_reason
-                .map(|r| r.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            let stop_str = req_state
-                .stop_reason
-                .as_ref()
-                .map(|sr| match sr {
-                    StopReason::Token(id) => format!("token:{id}"),
-                    StopReason::String(s) => format!("string:{s}"),
-                })
-                .unwrap_or_default();
-
-            tracing::info!(
-                request_id = %output.request_id,
-                prompt_tokens = prompt_tokens,
-                completion_tokens = completion_tokens,
-                finish_reason = finish_str,
-                stop_reason = stop_str,
-                latency_ms = format!("{:.1}", total_latency * 1000.0),
-                ttft_ms = ttft_ms.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()),
-                avg_itl_ms = avg_itl_ms.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()),
-                "request finished"
-            );
-
-            #[cfg(feature = "metrics")]
-            {
-                let metrics = crate::metrics::VllmMetrics::global();
-                metrics.request_latency_seconds.observe(total_latency);
-                metrics.requests_active.dec();
-                metrics.requests_success_total.inc();
-            }
-            // Drop stream sender; capture whether this was a streaming request.
-            let was_streaming = req_state.stream_tx.take().is_some();
-
-            // Streaming requests are cleaned up here — there's no poll_until_done
-            // consumer. Non-streaming requests stay for poll_until_done to remove.
-            if was_streaming {
-                requests.remove(&output.request_id);
-            }
-        }
-    }
-
     /// Convert a chat completion request to an engine core request.
     fn chat_to_engine_request(
         &self,
@@ -4363,6 +4067,13 @@ mod tests {
     use scratchy_serving_engine::executor::NoopExecutor;
     use scratchy_serving_transport::messages::PauseMode;
 
+    /// One engine output through the server's output path: phase 1, the detokenizer, phase 3.
+    fn run_output(requests: &mut HashMap<String, RequestState>, output: EngineCoreOutput) {
+        let work = AsyncEngine::process_outputs_phase1(requests, std::slice::from_ref(&output));
+        let results = AsyncEngine::parallel_detokenize(work);
+        AsyncEngine::process_outputs_phase3(requests, vec![output], results);
+    }
+
     pub(super) fn make_test_request_state(
         stream_tx: Option<mpsc::UnboundedSender<StreamDelta>>,
     ) -> RequestState {
@@ -4695,7 +4406,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_output_unknown_request() {
+    fn test_run_output_unknown_request() {
         let mut requests = HashMap::new();
         let output = EngineCoreOutput {
             request_id: "unknown".to_string(),
@@ -4709,12 +4420,12 @@ mod tests {
             pooler_output: None,
         };
         // Should not panic.
-        AsyncEngine::process_output(&mut requests, output);
+        run_output(&mut requests, output);
     }
 
     /// An output for a request finished here already — a stop string matched, its non-streaming
-    /// entry waiting to be collected — came from a step still in flight for it: every path drops
-    /// it, the request's tokens as they were.
+    /// entry waiting to be collected — came from a step still in flight for it: the output path
+    /// drops it, the request's tokens as they were.
     #[test]
     fn an_output_for_a_finished_request_is_dropped() {
         let mut requests = HashMap::new();
@@ -4737,7 +4448,6 @@ mod tests {
         assert!(work.iter().all(Option::is_none), "nothing to detokenize");
         let results = AsyncEngine::parallel_detokenize(work);
         AsyncEngine::process_outputs_phase3(&mut requests, vec![output()], results);
-        AsyncEngine::process_output(&mut requests, output());
         assert_eq!(requests["req-1"].generated_token_ids, [10, 11]);
     }
 
@@ -4822,12 +4532,12 @@ mod tests {
     }
 
     #[test]
-    fn test_process_output_accumulates_tokens() {
+    fn test_run_output_accumulates_tokens() {
         let mut requests = HashMap::new();
         requests.insert("req-1".to_string(), make_test_request_state(None));
 
         // First output.
-        AsyncEngine::process_output(
+        run_output(
             &mut requests,
             EngineCoreOutput {
                 request_id: "req-1".to_string(),
@@ -4843,7 +4553,7 @@ mod tests {
         );
 
         // Second output.
-        AsyncEngine::process_output(
+        run_output(
             &mut requests,
             EngineCoreOutput {
                 request_id: "req-1".to_string(),
@@ -4866,17 +4576,27 @@ mod tests {
     }
 
     #[test]
-    fn test_process_output_streaming() {
+    fn test_run_output_streaming() {
+        let tok = Arc::new(make_test_tokenizer());
+        let prompt_ids = tok.encode("Hi", false).unwrap();
+        let (first, last) = (tok.encode("ab", false).unwrap(), tok.encode("c", false).unwrap());
+        let detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let mut requests = HashMap::new();
-        requests.insert("req-1".to_string(), make_test_request_state(Some(tx)));
+        {
+            let mut state = make_test_request_state(Some(tx));
+            state.num_prompt_tokens = prompt_ids.len() as u32;
+            state.detokenizer = Some(Arc::new(std::sync::Mutex::new(detok)));
+            requests.insert("req-1".to_string(), state);
+        }
 
-        AsyncEngine::process_output(
+        run_output(
             &mut requests,
             EngineCoreOutput {
                 request_id: "req-1".to_string(),
-                new_token_ids: vec![10, 11],
+                new_token_ids: first.clone(),
                 finish_reason: None,
                 stop_reason: None,
                 num_cached_tokens: 0,
@@ -4888,16 +4608,16 @@ mod tests {
         );
 
         let delta = rx.try_recv().unwrap();
-        assert_eq!(delta.new_token_ids, vec![10, 11]);
+        assert_eq!(delta.new_token_ids, first);
         assert!(delta.finish_reason.is_none());
-        assert!(delta.text.is_none()); // No tokenizer = no text.
+        assert_eq!(delta.text.as_deref(), Some("ab"));
 
         // Finish.
-        AsyncEngine::process_output(
+        run_output(
             &mut requests,
             EngineCoreOutput {
                 request_id: "req-1".to_string(),
-                new_token_ids: vec![12],
+                new_token_ids: last.clone(),
                 finish_reason: Some(FinishReason::Length),
                 stop_reason: None,
                 num_cached_tokens: 0,
@@ -4909,7 +4629,8 @@ mod tests {
         );
 
         let delta = rx.try_recv().unwrap();
-        assert_eq!(delta.new_token_ids, vec![12]);
+        assert_eq!(delta.new_token_ids, last);
+        assert_eq!(delta.text.as_deref(), Some("c"));
         assert_eq!(delta.finish_reason, Some(FinishReason::Length));
 
         // Finished streaming request should be removed from the map.
@@ -4917,7 +4638,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_output_with_detokenizer() {
+    fn test_run_output_with_detokenizer() {
         let tok = Arc::new(make_test_tokenizer());
         // Encode a prompt and some continuation.
         let prompt = "Hi";
@@ -4938,7 +4659,7 @@ mod tests {
             requests.insert("req-1".to_string(), state);
         }
 
-        AsyncEngine::process_output(
+        run_output(
             &mut requests,
             EngineCoreOutput {
                 request_id: "req-1".to_string(),
@@ -5260,7 +4981,7 @@ mod tests {
             requests.insert("req-idx".to_string(), state);
         }
 
-        AsyncEngine::process_output(
+        run_output(
             &mut requests,
             EngineCoreOutput {
                 request_id: "req-idx".to_string(),
@@ -5611,12 +5332,12 @@ mod tests {
     }
 
     #[test]
-    fn test_process_output_stores_pooler_output() {
+    fn test_run_output_stores_pooler_output() {
         let mut requests = HashMap::new();
         requests.insert("pool-1".to_string(), make_test_request_state(None));
 
         let embedding = EmbeddingData::Single(vec![0.1, 0.2, 0.3]);
-        AsyncEngine::process_output(
+        run_output(
             &mut requests,
             EngineCoreOutput {
                 request_id: "pool-1".to_string(),
@@ -5637,7 +5358,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         requests2.insert("pool-2".to_string(), make_test_request_state(Some(tx)));
 
-        AsyncEngine::process_output(
+        run_output(
             &mut requests2,
             EngineCoreOutput {
                 request_id: "pool-2".to_string(),
