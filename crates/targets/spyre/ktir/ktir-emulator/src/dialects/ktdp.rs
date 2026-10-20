@@ -231,22 +231,21 @@ fn construct_access_tile(
             // is refused rather than guessed at, mirroring the transpose
             // door's `tile_window_2d` census (which states the same refusal
             // for the orders it cannot un-permute).
-            if let Some(order) = coordinate_order.as_ref() {
-                if !(order.is_permutation()
+            if let Some(order) = coordinate_order.as_ref()
+                && !(order.is_permutation()
                     && order.num_dims == access_shape.len()
                     && order.exprs.len() == m.shape.len())
-                {
-                    return Err(format!(
-                        "construct_access_tile: access_tile_order over {} value \
-                         dims and {} results does not permute a {}-D tile over a \
-                         {}-D view — the emulator refuses to guess an addressing \
-                         for it",
-                        order.num_dims,
-                        order.exprs.len(),
-                        access_shape.len(),
-                        m.shape.len()
-                    ));
-                }
+            {
+                return Err(format!(
+                    "construct_access_tile: access_tile_order over {} value \
+                     dims and {} results does not permute a {}-D tile over a \
+                     {}-D view — the emulator refuses to guess an addressing \
+                     for it",
+                    order.num_dims,
+                    order.exprs.len(),
+                    access_shape.len(),
+                    m.shape.len()
+                ));
             }
             // ⭐ THE WINDOW MAY NOT LEAVE THE VIEW. The per-op window lives in the ACCESS
             // TILE, so this is the tile-side analogue of the view bounds check: a tile
@@ -275,7 +274,7 @@ fn construct_access_tile(
                         let mut perm = vec![usize::MAX; access_shape.len()];
                         for (view_axis, expr) in order.exprs.iter().enumerate() {
                             if let AffineExpr::Dim(value_axis) = expr {
-                                perm[*value_axis as usize] = view_axis;
+                                perm[*value_axis] = view_axis;
                             }
                         }
                         perm
