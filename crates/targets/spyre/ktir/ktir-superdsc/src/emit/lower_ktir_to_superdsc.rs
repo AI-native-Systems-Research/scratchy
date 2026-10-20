@@ -6747,7 +6747,9 @@ pub fn windowed_rmsnorm(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    use crate::ir::bridge::tiled_op_sdsc_op::assemble_reduce_off;
+    use crate::ir::bridge::tiled_op_sdsc_op::{
+        assemble_reduce_off, win_reduce_accum, win_reduce_data,
+    };
     let unit = matches!(
         k.program,
         crate::ktir_node::Program::WindowedRmsNorm { unit: true }
@@ -6912,15 +6914,31 @@ pub fn windowed_rmsnorm(
         ));
         // 2. mean(x²) — the per-head reduce: data at the window (block-aligned), accum at
         //    its own head's buffer at ZERO (the fp8 amax-partial shape).
+        let rmmean_op = format!("rmmean_{prefix}");
         ops.push(assemble_reduce_off(
-            &format!("rmmean_{prefix}"),
+            &rmmean_op,
             "mean",
             t_rows,
             f_cols,
-            &sq16_h,
-            win,
-            &mean_h,
-            crate::addr::DevOff::ZERO,
+            // The data window is head `h`'s `[m, d]` slab of the `[m, full]` square — `col_of`'s
+            // whole-block shift, minted against the buffer's own handle.
+            win_reduce_data(
+                layout,
+                &sq16_h,
+                win,
+                t_rows,
+                f_cols,
+                &format!("{rmmean_op}: squares"),
+            )
+            .map_err(|e| Error { message: e })?,
+            win_reduce_accum(
+                layout,
+                &mean_h,
+                crate::addr::DevOff::ZERO,
+                t_rows,
+                &format!("{rmmean_op}: mean"),
+            )
+            .map_err(|e| Error { message: e })?,
             sym_id_base,
             layout,
         ));

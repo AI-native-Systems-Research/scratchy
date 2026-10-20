@@ -19,7 +19,7 @@ use super::{
     rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
-    assemble_reduce_off, assemble_reduce_seeded, reduce_opspec,
+    assemble_reduce_off, assemble_reduce_seeded, reduce_opspec, win_reduce_accum, win_reduce_data,
 };
 use crate::place::{PlaceId, SynthRole};
 use crate::placement::{BundleLayout, syn};
@@ -311,10 +311,26 @@ pub(crate) fn fp8_quantize_descriptors(
                         "quantscalepertokenfp8",
                         m_rows,
                         crate::sdsc_abstract::BlockCols::of_feature_cols(k_part),
-                        &a_h,
-                        crate::addr::col_of(m, k, j * k_part, Df::Fp16),
-                        &accum_h,
-                        crate::addr::DevOff::ZERO,
+                        // The data window is the j-th `[m, k/time]` slab — `col_of`'s whole-block
+                        // shift (k/time is a whole 64-stick, the TimeTile invariant), minted
+                        // against the activation's own `[m, k]` handle.
+                        win_reduce_data(
+                            layout,
+                            &a_h,
+                            crate::addr::col_of(m, k, j * k_part, Df::Fp16),
+                            m_rows,
+                            crate::sdsc_abstract::BlockCols::of_feature_cols(k_part),
+                            &format!("{op_name}: activation"),
+                        )
+                        .map_err(SuperDscError)?,
+                        win_reduce_accum(
+                            layout,
+                            &accum_h,
+                            crate::addr::DevOff::ZERO,
+                            m_rows,
+                            &format!("{op_name}: scale"),
+                        )
+                        .map_err(SuperDscError)?,
                         sym_id_base,
                         layout,
                     ));
