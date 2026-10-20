@@ -1616,6 +1616,29 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         size: pmbytes,
                     },
                 );
+                // ⭐⭐⭐⭐⭐ THE PROGRAM'S OWN NAME FOR THE MASK BUFFER — the whole-function door's
+                // mask operand. The splice binds the attention's mask parameter at the graph's
+                // NEXT-FREE tid (`mint_attn`'s law: `ir.tensors.len()`), while every runtime
+                // consumer names the same bytes by the reserved const just placed. One buffer,
+                // two names, and the layout is where names meet bytes: the door resolves a
+                // parameter by its BINDING tid, so the program's mask load reaches these bytes
+                // through this second entry — the same placement-alias law the scalarmul fold's
+                // output uses above (`TensorPlacement { tid, ..p }`, a reader pointed at the
+                // producer's bytes). The bytes are SHARED, not duplicated: `seg_bytes` does not
+                // advance, and the address audit judges overlaps for synthetics only, by design.
+                // The door's own no-lazy-allocation refusal is the drift detector between the
+                // two statements of the mint law: if the splice ever numbers the mask elsewhere,
+                // the bound tid stops matching any placement and the bake names `t{…}` at the
+                // door instead of serving a tensor nobody placed.
+                let mask_binding = ir.tensors.len() as u32;
+                let pmask_place = placements[&ATTN_MASK_TID];
+                placements.insert(
+                    mask_binding,
+                    TensorPlacement {
+                        tid: mask_binding,
+                        ..pmask_place
+                    },
+                );
                 seg_bytes[mseg] = align128(pmoff + pmbytes);
                 let a = SegRole::Activation.segment();
                 let cmoff = seg_bytes[a];
@@ -8143,8 +8166,8 @@ mod tests {
         // the extraction program and the door must Err naming it.
         let (node, ir) = build(mq);
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
-            .expect("the tail's layout mints");
+        let layout =
+            compute_bundle_layout(&ir, &weight_ids, false, &[]).expect("the tail's layout mints");
         let mut programs = scratchy_triton_splice::lower_all(&node, &ir, false)
             .expect("the splice's fold mints the tail");
         let extract = programs
@@ -8221,8 +8244,8 @@ mod tests {
         // fp8 (arity-3): the placement reserves the PADDED extent — 2176·2816·1 B, the exact
         // bytes the matmul's tile read addresses (the refusal's access side).
         let ir = build(GemmWeight::Fp8Dynamic);
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
-            .expect("the fp8 layout mints");
+        let layout =
+            compute_bundle_layout(&ir, &weight_ids, false, &[]).expect("the fp8 layout mints");
         let p = layout.placements.get(&1).expect("the fp8 weight is placed");
         assert_eq!(
             p.size, 6_127_616,
@@ -8230,8 +8253,8 @@ mod tests {
         );
         // fp16 (arity-2), SAME shape: raw rows — 2112 = 33 whole fp16 sticks, no pad.
         let ir = build(GemmWeight::Dense);
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
-            .expect("the fp16 layout mints");
+        let layout =
+            compute_bundle_layout(&ir, &weight_ids, false, &[]).expect("the fp16 layout mints");
         let p = layout
             .placements
             .get(&1)
