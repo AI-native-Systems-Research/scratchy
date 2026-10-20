@@ -8689,7 +8689,7 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
 fn refuse_if_wiring_disagrees_with_manifest(
     stem: &str,
     manifest_json: &str,
-    emitted_layers: &[(u64, u32, u32, u32, u32)],
+    emitted_layers: &[(u64, u32, u32, u32, u32, u32)],
     emitted_embed: u32,
     emitted_cos: &[(u32, u32, proc_macro2::TokenStream)],
     emitted_sin: &[(u32, u32, proc_macro2::TokenStream)],
@@ -8788,7 +8788,9 @@ fn refuse_if_wiring_disagrees_with_manifest(
     }
     // ⛔ POSITION BY POSITION. The worker indexes `layers[i]` for layer `i`, so "same set, other
     // order" is exactly as wrong as a missing entry.
-    for (i, (&(mlayer, mk), &(wlayer, wk, wv, _, _))) in pk.iter().zip(emitted_layers).enumerate() {
+    for (i, (&(mlayer, mk), &(wlayer, wk, wv, _, _, _))) in
+        pk.iter().zip(emitted_layers).enumerate()
+    {
         if mlayer != wlayer || mk != wk as usize {
             fail.push(format!(
                 "layers[{i}]: manifest says layer {mlayer} prefix_k t{mk}, wiring says layer \
@@ -8797,7 +8799,7 @@ fn refuse_if_wiring_disagrees_with_manifest(
         }
         let _ = wv;
     }
-    for (i, (&(mlayer, mv), &(_, _, wv, _, _))) in pv.iter().zip(emitted_layers).enumerate() {
+    for (i, (&(mlayer, mv), &(_, _, wv, _, _, _))) in pv.iter().zip(emitted_layers).enumerate() {
         if mv != wv as usize {
             fail.push(format!(
                 "layers[{i}] (layer {mlayer}): manifest says prefix_v t{mv}, wiring says t{wv}"
@@ -9086,16 +9088,38 @@ fn emit_superdsc_wiring(
     // The worker's own walk, run here: find each node that reads the mask, and
     // take the prefix-K/V args plus the argument positionally after each as the
     // new-K/new-V outputs.
-    let mut layers: Vec<(u64, u32, u32, u32, u32)> = Vec::new();
+    let mut layers: Vec<(u64, u32, u32, u32, u32, u32)> = Vec::new();
     if let Some(mask) = gk.attn_mask {
-        let pk: std::collections::HashMap<u32, u64> = lwd
+        // Source id → (layer, the layer's attention-class head dim) — the K binding's
+        // own pair, carried so the wiring's LayerWiring can state the dim the host's
+        // Kᵀ-plane staging decomposes the cache width by.
+        //
+        // ⭐ THE K SLOT BINDS THE PLANE'S RESERVED TID, NOT THE SOURCE. The plain-B
+        // score leg reads the prefix keys through the Kᵀ PLANE — the pool's third
+        // plane, bound at `kct_resident_tid(pk)` (binding the cache tensor there
+        // would point the plane's fused view at the natural K plane's s-major bytes
+        // and silently misaddress the dot) — so an arg resolves to its PrefixK
+        // source through BOTH spellings: the source id itself and the reserved plane
+        // tid keyed on it. The map carries the SOURCE id back out, because the
+        // emitted `LayerWiring` states the source: `tensor_shapes[ks]` sizes the
+        // layer's kv width, and the worker derives the plane tid itself.
+        let pk: std::collections::HashMap<u32, (u64, u32, u32)> = lwd
             .bindings
             .iter()
             .enumerate()
             .filter_map(|(i, b)| match b {
-                SourceBinding::PrefixK { layer } => Some((i as u32, *layer)),
+                SourceBinding::PrefixK { layer, head_dim } => Some([
+                    (i as u32, (*layer, *head_dim, i as u32)),
+                    (
+                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::kct_resident_tid(
+                            i as u32,
+                        ),
+                        (*layer, *head_dim, i as u32),
+                    ),
+                ]),
                 _ => None,
             })
+            .flatten()
             .collect();
         let pv: std::collections::HashSet<u32> = lwd
             .bindings
@@ -9112,21 +9136,39 @@ fn emit_superdsc_wiring(
             }
             let (mut layer, mut k_src, mut new_k) = (None, None, None);
             let (mut v_src, mut new_v) = (None, None);
+            let mut layer_hd = None;
             for (i, a) in node.args.iter().map(|a| *a as u32).enumerate() {
-                if let Some(&l) = pk.get(&a) {
+                if let Some(&(l, hd, src)) = pk.get(&a) {
                     layer = Some(l);
-                    k_src = Some(a);
-                    new_k = node.args.get(i + 1).map(|x| *x as u32);
+                    layer_hd = Some(hd);
+                    k_src = Some(src);
+                    // ⭐ THE NEW-K SLOT BINDS THE RESTICKIFY'S SCRATCH, NOT THE STAGING
+                    // TENSOR. The scratch is a reserved tid keyed on the staging
+                    // tensor's own id (`ktn_scratch_tid`, the `kct_resident_tid`
+                    // keying law), and the wiring states the STAGING tensor — the
+                    // worker writes it and reads it back. Resolve the scratch through
+                    // the same keying, BY SEARCH over the graph's tensor ids so no
+                    // arithmetic about the reserved block is restated here
+                    // (`scale_idx_of`'s own law). A bound tid no scratch answers to
+                    // leaves this layer unassembled, and the completeness lock below
+                    // names the layer it dropped.
+                    new_k = node.args.get(i + 1).and_then(|x| {
+                        let bound = *x as u32;
+                        (0..gk.tensor_shapes.len() as u32).find(|&t| {
+                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ktn_scratch_tid(t)
+                                == bound
+                        })
+                    });
                 }
                 if pv.contains(&a) {
                     v_src = Some(a);
                     new_v = node.args.get(i + 1).map(|x| *x as u32);
                 }
             }
-            if let (Some(l), Some(ks), Some(nk), Some(vs), Some(nv)) =
-                (layer, k_src, new_k, v_src, new_v)
+            if let (Some(l), Some(ks), Some(nk), Some(vs), Some(nv), Some(hd)) =
+                (layer, k_src, new_k, v_src, new_v, layer_hd)
             {
-                layers.push((l, ks, vs, nk, nv));
+                layers.push((l, ks, vs, nk, nv, hd));
             }
         }
         layers.sort_by_key(|x| x.0);
@@ -9332,17 +9374,17 @@ fn emit_superdsc_wiring(
         &emitted_weight_ids,
     );
 
-    let layer_toks = layers.iter().map(|(_, ks, vs, nk, nv)| {
+    let layer_toks = layers.iter().map(|(_, ks, vs, nk, nv, hd)| {
         // ⭐ THE LAYER'S OWN KV WIDTH, off the prefix-K source's baked shape. A hybrid-attention
         // arch (gemma-4) gives sliding and global layers DIFFERENT kv_heads×head_dim, so the
         // model-wide `Geometry::kv_dim` cannot size a per-layer host buffer or readback — the
         // prefix-K source's column count IS the width this layer's K/V rows carry.
         let kvw = u32l(gk.tensor_shapes[*ks as usize].1);
-        let (ks, vs, nk, nv) = (u32l(*ks), u32l(*vs), u32l(*nk), u32l(*nv));
+        let (ks, vs, nk, nv, hd) = (u32l(*ks), u32l(*vs), u32l(*nk), u32l(*nv), u32l(*hd));
         quote! {
             ::scratchy_target_spyre::wiring::LayerWiring {
                 prefix_k: #ks, prefix_v: #vs, new_k: #nk, new_v: #nv,
-                kv_width: #kvw,
+                kv_width: #kvw, head_dim: #hd,
             }
         }
     });
@@ -12056,8 +12098,11 @@ fn dump_wavefront_mega(
                             }
                             SourceBinding::Cos { .. } => format!("{{\"id\":{i},\"role\":\"cos\"}}"),
                             SourceBinding::Sin { .. } => format!("{{\"id\":{i},\"role\":\"sin\"}}"),
-                            SourceBinding::PrefixK { layer } => {
-                                format!("{{\"id\":{i},\"role\":\"prefix_k\",\"layer\":{layer}}}")
+                            SourceBinding::PrefixK { layer, head_dim } => {
+                                format!(
+                                    "{{\"id\":{i},\"role\":\"prefix_k\",\"layer\":{layer},\
+                                     \"head_dim\":{head_dim}}}"
+                                )
                             }
                             SourceBinding::PrefixV { layer } => {
                                 format!("{{\"id\":{i},\"role\":\"prefix_v\",\"layer\":{layer}}}")

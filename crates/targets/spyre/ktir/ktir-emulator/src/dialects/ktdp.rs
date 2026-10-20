@@ -15,7 +15,7 @@
 //! the Python handler's `NotImplementedError`.
 
 use super::{Dispatch, LatencyCategory};
-use crate::affine::AffineMap;
+use crate::affine::{AffineExpr, AffineMap};
 use crate::attrkey::AttrKey;
 use crate::context::CoreContext;
 use crate::dtypes::DType;
@@ -201,10 +201,53 @@ fn construct_access_tile(
         _ => None,
     };
 
+    // `access_tile_order`: the value-space -> parent-space coordinate map. The
+    // ladder's `fold_trans_into_access_tile_order` sets it when a `.T` is folded
+    // into a load's tile, whose `Shape` is then the VALUE's (post-transpose)
+    // shape — the restickify load states `Shape=[512, 64]` over a `[64, 512]`
+    // view with order `(d1, d0)`. Absent is identity, which is what an as-built
+    // tile carries. Parsed here and carried on the `AccessTile` so the bounds
+    // check below and the load's gather both read it; validated per-parent in
+    // the arms below (the ranks come from the parent's shape).
+    let coordinate_order = match op.attr(AttrKey::CoordinateOrder) {
+        None => None,
+        Some(Attr::AffineMap(m)) => Some(m.clone()),
+        Some(other) => {
+            return Err(format!(
+                "construct_access_tile: attr access_tile_order is {other:?}, \
+                 expected an affine map"
+            ));
+        }
+    };
+
     // Single allocation -> direct tile_access; distributed view -> resolve
     // partition routing now via distributed_tile_access (mirrors ktdp__construct_access_tile).
     let parent_ref = match parent {
         Parent::Single(m) => {
+            // A present order must be a PURE PERMUTATION at the tile's ranks
+            // before it may steer the check or the gather: every view axis
+            // consumes exactly one value axis. Anything else — a shear, a
+            // projection, a rank that does not match the tile over its view —
+            // is refused rather than guessed at, mirroring the transpose
+            // door's `tile_window_2d` census (which states the same refusal
+            // for the orders it cannot un-permute).
+            if let Some(order) = coordinate_order.as_ref() {
+                if !(order.is_permutation()
+                    && order.num_dims == access_shape.len()
+                    && order.exprs.len() == m.shape.len())
+                {
+                    return Err(format!(
+                        "construct_access_tile: access_tile_order over {} value \
+                         dims and {} results does not permute a {}-D tile over a \
+                         {}-D view — the emulator refuses to guess an addressing \
+                         for it",
+                        order.num_dims,
+                        order.exprs.len(),
+                        access_shape.len(),
+                        m.shape.len()
+                    ));
+                }
+            }
             // ⭐ THE WINDOW MAY NOT LEAVE THE VIEW. The per-op window lives in the ACCESS
             // TILE, so this is the tile-side analogue of the view bounds check: a tile
             // reaching past its parent's declared extent reads bytes the buffer does not
@@ -213,17 +256,41 @@ fn construct_access_tile(
             // Checked only at EQUAL RANK, where dim i of the window corresponds to dim i of
             // the parent with no reshape or rank-reduction to interpret. Unequal rank is
             // counted, not silently passed, so the coverage is visible.
+            //
+            // A value axis addresses the VIEW axis its order names: absent or identity
+            // order → dim i; the `.T` order `(d1, d0)` makes value dim 0 address view
+            // dim 1. The RAW zip reads a `[512, 64]` window on a `[64, 512]` view as
+            // leaving dim 0, though the permutation keeps every element inside the
+            // view — the folded restickify load is exactly that tile — so the extent
+            // rides the permutation to the view axis it actually constrains.
             let base_coords = base_map.eval(&indices, &[]);
             TILE_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if access_shape.len() == m.shape.len() && base_coords.len() == m.shape.len() {
-                for (i, (&ext, &parent_ext)) in access_shape.iter().zip(&m.shape).enumerate() {
-                    let end = base_coords[i] + ext as i64;
-                    if end > parent_ext as i64 {
+                // `perm[i]` = the view axis value axis i addresses; identity when
+                // no order. Filled for every i: the permutation check above sent
+                // anything partial elsewhere.
+                let perm: Vec<usize> = match coordinate_order.as_ref() {
+                    None => (0..access_shape.len()).collect(),
+                    Some(order) => {
+                        let mut perm = vec![usize::MAX; access_shape.len()];
+                        for (view_axis, expr) in order.exprs.iter().enumerate() {
+                            if let AffineExpr::Dim(value_axis) = expr {
+                                perm[*value_axis as usize] = view_axis;
+                            }
+                        }
+                        perm
+                    }
+                };
+                for (i, &ext) in access_shape.iter().enumerate() {
+                    let view_axis = perm[i];
+                    let end = base_coords[view_axis] + ext as i64;
+                    if end > m.shape[view_axis] as i64 {
                         return Err(format!(
                             "construct_access_tile: window {access_shape:?} at base \
-                             {base_coords:?} runs to {end} in dim {i} of a parent view \
-                             {:?} — the tile leaves its view, which the hardware addresses \
-                             as declared even though the emulator zero-pads it",
+                             {base_coords:?} runs to {end} in view dim {view_axis} of a \
+                             parent view {:?} (value dim {i}) — the tile leaves its view, \
+                             which the hardware addresses as declared even though the \
+                             emulator zero-pads it",
                             m.shape
                         ));
                     }
@@ -234,6 +301,23 @@ fn construct_access_tile(
             ParentRef::Tile(tile_access(m, &indices, access_shape.clone(), &base_map))
         }
         Parent::Dist(d) => {
+            // The distributed arms do not consume an order (`distributed_load`/
+            // `distributed_store` route by partition sets), so a non-identity
+            // one would be silently dropped and the footprint mis-read.
+            // Refuse the combination rather than model it wrong; nothing in
+            // this pipeline mints a folded tile over a distributed view.
+            if coordinate_order
+                .as_ref()
+                .is_some_and(|order| !order.is_identity())
+            {
+                return Err(
+                    "construct_access_tile: a non-identity access_tile_order over a \
+                     distributed view is not modeled by this emulator — the partition \
+                     router does not consume an order, so the footprint would be \
+                     mis-read rather than refused"
+                        .into(),
+                );
+            }
             let dist = distributed_tile_access(
                 &d,
                 &access_shape,
@@ -250,7 +334,7 @@ fn construct_access_tile(
         shape: access_shape,
         base_map,
         coordinate_set,
-        coordinate_order: None, // access_tile_order parsing lands with the parser slice
+        coordinate_order,
     })))
 }
 
@@ -448,5 +532,111 @@ mod tests {
         let at = ops.attr(at, AttrKey::BaseMap, ident);
         let err = run(&[at], &mut ctx).unwrap_err();
         assert!(err.contains("expected MemRef"));
+    }
+
+    // ---- access_tile_order: the folded `.T` tile ---------------------------
+    //
+    // The ladder's fold_trans_into_access_tile_order rewrites a load's tile to
+    // the POST-TRANSPOSE shape with order `(d1, d0)` over the un-permuted view
+    // — restickify's [64, 512] source read as a [512, 64] value. These tests
+    // hold the emulator's half of that contract: the bounds check rides the
+    // permutation, and the load gathers through it.
+
+    /// A `[rows, cols]` f32 HBM view at `%p` (an element index).
+    fn build_f32_view(ops: &mut Ops, shape: Vec<i64>, strides: Vec<i64>) -> Operation<'static> {
+        let op = ops.op(Some("%v"), OpKind::KtdpConstructMemoryView, &["%p"]);
+        let op = ops.attr(op, AttrKey::Shape, ops.int_list(shape));
+        let op = ops.attr(op, AttrKey::Strides, ops.int_list(strides));
+        let op = ops.attr(op, AttrKey::MemorySpace, Attr::Str("HBM"));
+        ops.attr(op, AttrKey::Dtype, Attr::Dtype(DType::F32))
+    }
+
+    /// The folded tile over `%v` at `[%i, %j]`: `Shape=[8, 4]`, order `(d1, d0)`.
+    fn folded_trans_tile(ops: &mut Ops) -> Operation<'static> {
+        let at = ops.op(
+            Some("%t"),
+            OpKind::KtdpConstructAccessTile,
+            &["%v", "%i", "%j"],
+        );
+        let at = ops.attr(at, AttrKey::Shape, ops.int_list(vec![8, 4]));
+        let at = ops.attr(at, AttrKey::BaseMap, Attr::AffineMap(ops.identity_map(2)));
+        ops.attr(
+            at,
+            AttrKey::CoordinateOrder,
+            Attr::AffineMap(ops.perm_map(2, &[1, 0])),
+        )
+    }
+
+    #[test]
+    fn folded_trans_tile_loads_permuted() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        // [4, 8] f32 view at an allocated base, values 0..32 row-major:
+        // src[r][c] = r*8 + c.
+        let stick = ctx.hbm.borrow_mut().allocate(32 * 4);
+        let payload: Vec<u8> = (0..32).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        ctx.hbm
+            .borrow_mut()
+            .write_bytes(stick * crate::memref::STICK_BYTES, &payload);
+        ctx.set_value(ops.ssa("%p"), Value::Index(stick * crate::memref::STICK_BYTES / 4));
+        ctx.set_value(ops.ssa("%i"), Value::Index(0));
+        ctx.set_value(ops.ssa("%j"), Value::Index(0));
+        let view = build_f32_view(&mut ops, vec![4, 8], vec![8, 1]);
+        let at = folded_trans_tile(&mut ops);
+        let ld = ops.op(Some("%k"), OpKind::KtdpLoad, &["%t"]);
+        run(&[view, at, ld], &mut ctx).unwrap();
+        let k = ops.ssa("%k");
+        match ctx.get_value(k).unwrap() {
+            Value::Tile(tile) => {
+                assert_eq!(tile.shape, vec![8, 4]);
+                // kT[w][r] = src[r][w] = r*8 + w, read row-major over the value.
+                let expect: Vec<f32> = (0..8)
+                    .flat_map(|w| (0..4).map(move |r| (r * 8 + w) as f32))
+                    .collect();
+                assert_eq!(tile.as_f32().to_vec(), expect);
+            }
+            other => panic!("expected Tile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folded_trans_tile_off_view_still_refuses() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        ctx.set_value(ops.ssa("%p"), Value::Index(0));
+        // Base [1, 1]: value dim 0 (extent 8) addresses view dim 1 (extent 8),
+        // so it runs to 9 — off the view THROUGH the order, not despite it.
+        ctx.set_value(ops.ssa("%i"), Value::Index(1));
+        ctx.set_value(ops.ssa("%j"), Value::Index(1));
+        let view = build_f32_view(&mut ops, vec![4, 8], vec![8, 1]);
+        let at = folded_trans_tile(&mut ops);
+        let err = run(&[view, at], &mut ctx).unwrap_err();
+        assert!(err.contains("the tile leaves its view"), "{err}");
+        assert!(err.contains("in view dim 1"), "{err}");
+    }
+
+    #[test]
+    fn non_permutation_order_refuses() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        ctx.set_value(ops.ssa("%p"), Value::Index(0));
+        ctx.set_value(ops.ssa("%i"), Value::Index(0));
+        ctx.set_value(ops.ssa("%j"), Value::Index(0));
+        let view = build_f32_view(&mut ops, vec![4, 8], vec![8, 1]);
+        // (d0, d0): many-to-one, not a permutation — refuse to guess.
+        let at = ops.op(
+            Some("%t"),
+            OpKind::KtdpConstructAccessTile,
+            &["%v", "%i", "%j"],
+        );
+        let at = ops.attr(at, AttrKey::Shape, ops.int_list(vec![8, 4]));
+        let at = ops.attr(at, AttrKey::BaseMap, Attr::AffineMap(ops.identity_map(2)));
+        let at = ops.attr(
+            at,
+            AttrKey::CoordinateOrder,
+            Attr::AffineMap(ops.perm_map(2, &[0, 0])),
+        );
+        let err = run(&[view, at], &mut ctx).unwrap_err();
+        assert!(err.contains("refuses to guess"), "{err}");
     }
 }

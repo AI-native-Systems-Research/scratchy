@@ -296,6 +296,19 @@ pub fn attn_row() -> TritonKernelRow {
     }
 }
 
+/// THE NEW-BLOCK Kᵀ RESTICKIFY — the relayout `attn.py`'s plain-B score dot needs for
+/// its new-block leg. NOT routed through `row()`: it is not a `SubOp`'s kernel (no graph
+/// node owns it — the splice emits it beside every attention), so this row exists for
+/// `lower_attn`'s own use and the registry's law ("adding a kernel is a row").
+pub fn kt_restick_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/restickify.py"),
+        file: "restickify.py",
+        entry: "kt_restick",
+        program: Program::Transpose,
+    }
+}
+
 /// THE ROW FOR A NODE — the family functions composed. Every `SubOp` that can reach the
 /// splice has a family below (attention rides its own `lower_attn` entry); the ops the
 /// spyre target has no kernel FOR (the 2b expansion kinds, the host-routed pairs, …)
@@ -1308,18 +1321,29 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// THE ATTENTION SPLICE — compile `attn.py` for this node's geometry and swept rung, and
-/// mint the `Program::Attn` `KtirNode` with the door's own parameter order.
+/// mint the `Program::Attn` `KtirNode` with the door's own parameter order, PRECEDED by
+/// the new-block Kᵀ restickify (`restickify.py`) that writes the plain-B scratch the
+/// attention's new-block score dot reads.
 ///
 /// `cap` is the resident cache tensor's row extent (`lower_attn_node`'s own read), and
 /// `active_cap` is the swept rung the bundle was baked for — THE one bundle fact that must
-/// meet the program here, because `attn_at` reads the swept extent back off the program
-/// (`param_read_rows`) and the two must agree by the door's own hard error.
+/// meet the program here, because the door reads the swept extent back off the program
+/// and the two must agree by the door's own hard error.
+///
+/// ⭐ TWO OPS, IN DATAFLOW ORDER. The attention's score leg states the PLAIN `[k, n]`
+/// B form (the door's `transposed_b_is_placeable` law: a `.T` over an n-major buffer has
+/// no agent that spends the transposition), so the new block's Kᵀ must EXIST before the
+/// attention runs — the restickify is its writer, and the two ops leave this entry in
+/// the order the tape executes them. The resident prefix needs no restickify: its Kᵀ is
+/// the pool's third plane, written transposed by its own writer (the rope append's
+/// second store on card; the host's transposed staging on the emulator and the gate).
 pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     cap: u32,
     active_cap: ktir_superdsc::ktir_node::ActiveCap,
-) -> Result<EmittedOp, String> {
+    rows_are_requests: bool,
+) -> Result<Vec<EmittedOp>, String> {
     let row = attn_row();
     let (src, attn_program) = match &row {
         TritonKernelRow::Spliced { src, program, .. } => (*src, program),
@@ -1378,6 +1402,30 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // is what makes a no-prefix prompt chunk take the causal ONE-PASS arm.
     let mask_eff = mask_prefix && prefix_len > 0;
     let new_len = node.inputs[3].region.rows.len;
+    // ⭐ THE NEW BLOCK'S Kᵀ SCRATCH EXTENTS — the restickify's, and the attention's
+    // `desc_ktn` view's. `ktn_rows` is the stick cover of the new block's row count
+    // under the SAME `PaddedMq` law the placement sizes the staging tensor at (`new_k`
+    // is re-placed `[mq_pad, device cols]` so a padded read never aliases the next
+    // tensor — the placement's own comment), and `ktn_w` is the DEVICE width the
+    // producing proj matmul writes (`DeviceWidth::for_pointwise`, the placement's own
+    // width law). Both are whole sticks by construction, which the transpose door's
+    // stick law demands: a sub-stick extent is refused by the dxp scheduler, and the
+    // on-card ReStickify that was asked for one anyway wrote the second transposed
+    // stick wrong and garbled decode.
+    let ktn_rows =
+        ktir_superdsc::sdsc_abstract::PaddedMq::of_bundle(new_len, rows_are_requests)
+            .ok_or_else(|| {
+                format!(
+                    "triton splice: AttnDecode t{}: a {new_len}-row new block at \
+                     rows_are_requests={rows_are_requests} — not a width the pad law bakes, so \
+                     the new-block Kᵀ scratch has no placeable stick cover",
+                    node.output.tensor.index()
+                )
+            })?
+            .pad()
+            .rows()
+            .row_axis_extent();
+    let ktn_w = ktir_superdsc::work::DeviceWidth::for_pointwise(nkvh * hd).get();
     // The builder's own one-pass arm condition, verbatim: ONE LIVE SEGMENT (the dead
     // prefix leaves exactly the new block), mq > 1, no runtime length mask, and the new
     // block spanning the whole chunk (`seq_len == mq`) — the additive `[mq, mq]` causal
@@ -1417,6 +1465,8 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             prefix_len,
             kc_row,
             new_len,
+            ktn_rows,
+            ktn_w,
             scale: *scale,
             has_mask,
             one_pass,
@@ -1443,14 +1493,98 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         AttnPostCompile {
             cap,
             kv_width: nkvh * hd,
+            hd,
+            nkvh,
             dead_prefix: prefix_len == 0,
             has_mask,
         },
     )?;
     let k = mint_attn(node, ir, positional, has_mask)?;
+    // ── THE RESTICKIFY FIRST, the attention that reads its scratch second — the
+    // dataflow order the tape executes them in.
+    let new_k_tid = node.inputs[3].tensor.index() as u32;
+    let restick = mint_kt_restick(node, new_k_tid, ktn_rows, ktn_w)?;
     let name = format!("attn_s{}", node.id.index());
     let mut e = EmittedOp::bare(name);
     e.ktir = Some(k);
+    Ok(vec![restick, e])
+}
+
+/// THE NEW-BLOCK Kᵀ RESTICKIFY'S MINT — compile `restickify.py` at the scratch's
+/// extents and bind it `[new_k, ktn_scratch_tid(new_k)]`, the input the staging tensor
+/// and the output the reserved scratch the attention's `desc_ktn` parameter reads.
+///
+/// ⭐ THE POSITIONAL NODE IS MEMOIZED, like [`attn_positional`]'s: every layer of a
+/// rung states the SAME spec (the extents are the rung's, not the layer's), and the
+/// wiring walk lowers every layer — re-running `node_for` per layer was measured at a
+/// third of the granite-2b build for the attention's node alone. What differs per
+/// layer is exactly the bindings and the name, re-stated here.
+fn mint_kt_restick<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    new_k_tid: u32,
+    rows: u32,
+    w: u32,
+) -> Result<EmittedOp, String> {
+    let row = kt_restick_row();
+    let (src, program) = match &row {
+        TritonKernelRow::Spliced { src, program, .. } => (*src, *program),
+        TritonKernelRow::Refused(why) => return Err(why.to_string()),
+    };
+    static NODES: Memo<KtirNode> = Memo::new();
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for p in ["desc_k", "desc_kt"] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("ROWS", Val::Int(i128::from(rows)))?;
+    ce("W", Val::Int(i128::from(w)))?;
+    let spec = KernelSpec {
+        file: "restickify.py".to_string(),
+        kernel: "kt_restick".to_string(),
+        signature,
+        constexprs,
+    };
+    let key =
+        memo_key(src, &spec, &[1]).map(|k| format!("{k}\0{program:?}\u{1}{rows}\u{1}{w}"));
+    let positional = NODES.get_or_compute(key, || {
+        let module = compile_kernel(src, &spec, &[1])?;
+        triton_ktir_superdsc::node_for(&module, program)
+            .map_err(|e| format!("triton splice: node_for: {e}"))
+    })?;
+    let KtirNode { func, program, .. } = positional;
+    // The bindings: the staging tensor in, the reserved Kᵀ scratch out — the scratch
+    // tid is keyed on the staging tensor's own id (the `kct_resident_tid` keying law),
+    // so the splice here and the layout's placement walk compute the same tid with no
+    // layer-index handoff.
+    let bindings = vec![
+        BufferId::new(new_k_tid),
+        BufferId::new(ktir_superdsc::reserved_tids::ktn_scratch_tid(new_k_tid)),
+    ];
+    if func.arguments.len() != bindings.len() {
+        return Err(format!(
+            "triton splice: kt_restick compiled to {} parameters but the restickify states {} \
+             bindings — the kernel's parameter list diverged from the row's contract",
+            func.arguments.len(),
+            bindings.len()
+        ));
+    }
+    let name = Arena::global().str(format!("ktrestick_s{}", node.id.index()));
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(KtirNode {
+        func: ktir_core::ir::IRFunction { name, ..func },
+        program,
+        bindings,
+        mask: None,
+        node_out_tid: None,
+    });
     Ok(e)
 }
 
@@ -1460,6 +1594,8 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
 struct AttnPostCompile {
     cap: u32,
     kv_width: u32,
+    hd: u32,
+    nkvh: u32,
     dead_prefix: bool,
     has_mask: bool,
 }
@@ -1484,24 +1620,27 @@ fn attn_positional(
     let AttnPostCompile {
         cap,
         kv_width,
+        hd,
+        nkvh,
         dead_prefix,
         has_mask,
     } = post;
     let key = memo_key(src, spec, grid).map(|k| {
-        format!("{k}\0{program:?}\u{1}{cap}\u{1}{kv_width}\u{1}{dead_prefix}\u{1}{has_mask}")
+        format!("{k}\0{program:?}\u{1}{cap}\u{1}{kv_width}\u{1}{hd}\u{1}{nkvh}\u{1}{dead_prefix}\u{1}{has_mask}")
     });
     NODES.get_or_compute(key, || {
         let mut module = compile_kernel(src, spec, grid)?;
         // ⛔ THE DEAD PREFIX'S VIEWS, INJECTED. At `prefix_len == 0` the kernel guards its
-        // kc/vc descriptors away, the ladder DCEs them, and the resident cache parameters would
-        // be "addressed NOWHERE" — but the door requires them: `attn_operands` reads the cache's
+        // kt/vc descriptors away, the ladder DCEs them, and the resident cache parameters would
+        // be "addressed NOWHERE" — but the door requires them: it reads the cache's
         // identity and capacity off those views, and the card keeps the cache RESIDENT through
         // them. The builder keeps the view by construction (`KtirFunc::attn`'s zero-length
         // segment); the splice states the same fact post-compile, as one
         // `ktdp.construct_memory_view` per cache parameter over the SAME shape the live
-        // segment's view states (the full `[cap, nkvh·hd]` capacity).
+        // segment's view states (the Kᵀ plane's `[hd, nkvh·cap]` fused form at position 2,
+        // the V plane's `[cap, nkvh·hd]` at position 4).
         if dead_prefix {
-            inject_dead_cache_views(&mut module, cap, kv_width)?;
+            inject_dead_cache_views(&mut module, cap, kv_width, hd, nkvh)?;
         }
         // ⛔ THE MASKLESS SHAPE TRUNCATES THE MASK PARAMETER. The kernel's parameter list is
         // static Python, so `desc_mask` is declared in every arm; a maskless shape (a
@@ -1520,10 +1659,10 @@ fn attn_positional(
     })
 }
 
-/// THE ATTENTION KERNEL'S LAUNCH CONTRACT — the door's own parameter order (q, out, the
-/// four segment buffers in `attn_operands`'s positional order — resident K, new K,
-/// resident V, new V — then the mask), plus every extent as a constexpr: the geometry
-/// (`NQH/NKVH/HD/GQA`), the widths (`MQ/CAP/SWEPT/NEW_LEN`), the segment corners
+/// THE ATTENTION KERNEL'S LAUNCH CONTRACT — the door's own parameter order (q, out,
+/// the Kᵀ PLANE, the new block's Kᵀ scratch, resident V, new V — then the mask), plus
+/// every extent as a constexpr: the geometry (`NQH/NKVH/HD/GQA`), the widths
+/// (`MQ/CAP/SWEPT/NEW_LEN` and the scratch's `KTN_ROWS/KTN_W`), the segment corners
 /// (`KC_*/KD_*`, the region row/col starts), the scale, and the two arm selectors
 /// (`HAS_MASK`, `ONE_PASS`).
 ///
@@ -1547,6 +1686,8 @@ struct AttnFacts {
     prefix_len: u32,
     kc_row: u32,
     new_len: u32,
+    ktn_rows: u32,
+    ktn_w: u32,
     scale: f32,
     has_mask: bool,
     one_pass: bool,
@@ -1566,16 +1707,19 @@ fn attn_kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
         prefix_len,
         kc_row,
         new_len,
+        ktn_rows,
+        ktn_w,
         scale,
         has_mask,
         one_pass,
     } = *f;
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
-    // The door's positional order: q, out, kc, kd, vc, vd — the cache's K before the new
-    // block's K, then the same for V — then the mask when a segment reads it.
+    // The door's positional order: q, out, kt, ktn, vc, vd — the Kᵀ PLANE before the new
+    // block's Kᵀ scratch, then the V pair in the same order — then the mask when a
+    // segment reads it.
     let mut params: Vec<&str> = vec![
-        "desc_q", "desc_o", "desc_kc", "desc_kd", "desc_vc", "desc_vd",
+        "desc_q", "desc_o", "desc_kt", "desc_ktn", "desc_vc", "desc_vd",
     ];
     // ⛔ THE MASK PARAMETER IS ALWAYS IN THE SIGNATURE: the kernel's parameter list is static
     // Python, so a shape without a mask still declares `desc_mask` — and the trace (every
@@ -1612,6 +1756,12 @@ fn attn_kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
     ce("CAP", Val::Int(i128::from(cap)))?;
     ce("SWEPT", Val::Int(i128::from(prefix_len)))?;
     ce("NEW_LEN", Val::Int(i128::from(new_len)))?;
+    // The scratch's own extents — the restickify's folded basis sized them (the stick
+    // cover of the new block's rows, the device width of the staging tensor's columns),
+    // and the B window's EXACT law reads `NEW_LEN` while the descriptor's view states
+    // these: the scratch's pad columns exist only in the view, never in the score.
+    ce("KTN_ROWS", Val::Int(i128::from(ktn_rows)))?;
+    ce("KTN_W", Val::Int(i128::from(ktn_w)))?;
     ce("KC_ROW", Val::Int(i128::from(kc_row)))?;
     ce("KC_COL", Val::Int(i128::from(kc_c)))?;
     ce("KD_ROW", Val::Int(i128::from(kd_r)))?;
@@ -1631,41 +1781,60 @@ fn attn_kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// parameter, spliced at the top of the compiled kernel's body.
 ///
 /// ⛔ THE PARAMETER POSITIONS ARE THE DOOR'S, and the injection must find its own
-/// parameter: the kernel's pointer parameters are `desc_q` (0), `desc_o` (1), `desc_kc`
-/// (2), `desc_kd` (3), `desc_vc` (4), `desc_vd` (5), so the cache parameters are 2 and 4.
-/// The view shape is the segment's own `[cap, kv_width]` — the capacity
-/// `attn_operands` reads as `cap = kc.v_rows`, exactly what a live segment's view states
-/// and what the builder's dead segment keeps.
+/// parameter: the kernel's pointer parameters are `desc_q` (0), `desc_o` (1), `desc_kt`
+/// (2), `desc_ktn` (3), `desc_vc` (4), `desc_vd` (5), so the cache parameters are 2 and 4.
+/// Each view shape is the segment's own — the Kᵀ PLANE's fused `[hd, nkvh·cap]` at
+/// position 2 (the form the live segment's `desc_kt` states, heads concatenated along
+/// the out axis) and the V plane's `[cap, kv_width]` at position 4 — exactly what a
+/// live segment's view states and what the builder's dead segment keeps.
 fn inject_dead_cache_views(
     module: &mut triton_ktir::ir::Module,
     cap: u32,
     kv_width: u32,
+    hd: u32,
+    nkvh: u32,
 ) -> Result<(), String> {
     use triton_ktir::ir::{Attr, AttrKey, IrType, Op, OpKind};
     // Mint the view names BEFORE the body borrow: `fresh_named` needs `&mut module` and
     // the splice needs `&mut` the body, so the two phases cannot interleave (the rung-3
     // rewrite's own law).
-    let view_names = [module.fresh_named("kc_dead"), module.fresh_named("vc_dead")];
+    let view_names = [module.fresh_named("kt_dead"), module.fresh_named("vc_dead")];
     let kernel = module
         .kernel_mut()
         .map_err(|e| format!("triton splice: attn dead-view injection: {e}"))?;
     let region = kernel.regions.first_mut().ok_or_else(|| {
         "triton splice: attn dead-view injection: the kernel has no body".to_string()
     })?;
-    // The dead segment's view shape, as the ladder's own `build_base_memory_view` spells
+    // Each dead segment's view shape, as the ladder's own `build_base_memory_view` spells
     // it: `Shape`/`Strides` as element counts, `CoordinateSet` from the range-set law, HBM.
-    let dims = vec![i64::from(cap), i64::from(kv_width)];
-    let range_set = format!(
-        "(d0, d1) : (d0 >= 0, -d0 + {r} >= 0, d1 >= 0, -d1 + {c} >= 0)",
-        r = cap - 1,
-        c = kv_width - 1,
-    );
-    // Positions 2 and 4: the resident K and V cache parameters (`desc_kc`, `desc_vc`).
+    // Position 2 is the Kᵀ plane's fused form; position 4 the V plane's natural one.
+    let dims: [Vec<i64>; 2] = [
+        vec![i64::from(hd), i64::from(nkvh * cap)],
+        vec![i64::from(cap), i64::from(kv_width)],
+    ];
+    let strides: [Vec<i64>; 2] = [
+        vec![i64::from(nkvh * cap), 1],
+        vec![i64::from(kv_width), 1],
+    ];
+    let range_set: [String; 2] = [
+        format!(
+            "(d0, d1) : (d0 >= 0, -d0 + {r} >= 0, d1 >= 0, -d1 + {c} >= 0)",
+            r = hd - 1,
+            c = nkvh * cap - 1,
+        ),
+        format!(
+            "(d0, d1) : (d0 >= 0, -d0 + {r} >= 0, d1 >= 0, -d1 + {c} >= 0)",
+            r = cap - 1,
+            c = kv_width - 1,
+        ),
+    ];
+    // Positions 2 and 4: the Kᵀ plane and the V plane parameters (`desc_kt`,
+    // `desc_vc`).
     for (n, (view, param_idx)) in view_names.iter().zip([2usize, 4usize]).enumerate() {
         let Some(&(ptr, _)) = region.args.get(param_idx) else {
             return Err(format!(
                 "triton splice: attn dead-view injection: the kernel states fewer than {} \
-                 parameters — the door's order is q, out, kc, kd, vc, vd",
+                 parameters — the door's order is q, out, kt, ktn, vc, vd",
                 param_idx + 1
             ));
         };
@@ -1687,17 +1856,14 @@ fn inject_dead_cache_views(
             .with_result(
                 *view,
                 IrType::MemRef {
-                    dims: dims.clone(),
+                    dims: dims[n].clone(),
                     elem: triton_ktir::ir::DType::F16,
                 },
             )
             .with_operands([ptr])
-            .with_attr(AttrKey::Shape, Attr::IntList(dims.clone()))
-            .with_attr(
-                AttrKey::Strides,
-                Attr::IntList(vec![i64::from(kv_width), 1]),
-            )
-            .with_attr(AttrKey::CoordinateSet, Attr::AffineSet(range_set.clone()))
+            .with_attr(AttrKey::Shape, Attr::IntList(dims[n].clone()))
+            .with_attr(AttrKey::Strides, Attr::IntList(strides[n].clone()))
+            .with_attr(AttrKey::CoordinateSet, Attr::AffineSet(range_set[n].clone()))
             .with_attr(AttrKey::MemorySpace, Attr::Str("HBM".into()));
         // Splice at the TOP of the body, in parameter order: a view is loop-invariant by
         // construction (its one operand is the base address), and `regions()` finds it by
@@ -1758,17 +1924,31 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     mask_bound: bool,
 ) -> Result<KtirNode, String> {
     // ⛔ THE DOOR'S ORDER, NOT `lower_one`'s: q (inputs[0]), OUT (the node's output), then
-    // kc (inputs[1]), kd (inputs[3]), vc (inputs[2]), vd (inputs[4]) — the order
-    // `KtirFunc::attn`'s `arg_for` mints and `attn_operands` reads back. `regions()` zips
+    // the Kᵀ PLANE, the new block's Kᵀ SCRATCH, vc (inputs[2]), vd (inputs[4]) — the order
+    // the kernel's parameter list states and `regions()` zips back. `regions()` zips
     // `bindings[i]` against `arguments[i]`, so a swapped binding is a descriptor over the
     // wrong tensor, and the door's `is_out` check is what catches a transposed q/out.
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
+    // ⭐ POSITION 2 BINDS THE Kᵀ PLANE'S RESERVED TID, NOT THE CACHE TENSOR'S. The view
+    // the kernel states over `desc_kt` is the plane's fused `[hd, nkvh·cap]` form, and the
+    // plane is its OWN placement (`kct_resident_tid`, the pool's third plane at
+    // `kt_plane_base`) — binding the cache tensor here would point that view at the
+    // NATURAL K plane's bytes, s-major, and the plain-B dot would silently misaddress
+    // (the door's own refusal text: "a cache is k-major only if its WRITER wrote it so").
+    let k_id = node.inputs[1].tensor.index() as u32;
+    // ⭐ POSITION 3 BINDS THE SCRATCH, NOT THE STAGING TENSOR — the new block's Kᵀ is the
+    // restickify's OUTPUT (`ktn_scratch_tid`, keyed on the staging tensor's own tid the
+    // way `kct_resident_tid` keys the resident plane on its K tensor). The staging
+    // tensor itself is the RESTICKIFY's input, bound in that program's own row; binding
+    // it here would give the score dot a wide-form n-major B — the exact refusal the
+    // plain-B design exists to retire.
+    let new_k_tid = node.inputs[3].tensor.index() as u32;
     let mut bindings = vec![
         t(&node.inputs[0]),
         t(&node.output),
-        t(&node.inputs[1]),
-        t(&node.inputs[3]),
+        BufferId::new(ktir_superdsc::reserved_tids::kct_resident_tid(k_id)),
+        BufferId::new(ktir_superdsc::reserved_tids::ktn_scratch_tid(new_k_tid)),
         t(&node.inputs[2]),
         t(&node.inputs[4]),
     ];

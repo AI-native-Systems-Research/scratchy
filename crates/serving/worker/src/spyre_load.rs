@@ -237,6 +237,7 @@ pub(crate) fn wiring_to_parsed(
             new_k_id: l.new_k as usize,
             new_v_id: l.new_v as usize,
             kv_width: l.kv_width as usize,
+            head_dim: l.head_dim as usize,
         })
         .collect();
     if layers.is_empty() {

@@ -1786,8 +1786,35 @@ pub(crate) fn forward_chunk(
             let mut vbuf = vec![0.0f32; cap * kvw];
             kbuf[..req.kv_k[li].len()].copy_from_slice(&req.kv_k[li]);
             vbuf[..req.kv_v[li].len()].copy_from_slice(&req.kv_v[li]);
-            dynamic.push((lw.prefix_k_src as u64, kbuf, vec![cap, kvw]));
+            dynamic.push((lw.prefix_k_src as u64, kbuf.clone(), vec![cap, kvw]));
             dynamic.push((lw.prefix_v_src as u64, vbuf, vec![cap, kvw]));
+            // ⭐ THE Kᵀ PLANE'S BIND — the attention's resident-prefix score leg
+            // reads the plane's fused `[hd, nkvh·cap]` view (`desc_kt`, bound at
+            // `kct_resident_tid`), so the host states the one law that makes the
+            // plane the same keys the natural bind holds, transposed:
+            // `kt[d, kvh·cap + s] = k[s, kvh·hd + d]`. On card the plane is
+            // written by its own writer (the rope append's second store); the
+            // emulator's host IS that writer — the KV is host-grown and rebound
+            // every step, so the plane is rebuilt from the natural rows each
+            // time, exactly as the natural bind above is. `head_dim` is the
+            // layer's own class dim off the wiring (a hybrid arch's layers
+            // differ), the one fact that decomposes `kvw` into `(nkvh, hd)`.
+            let hd = lw.head_dim;
+            let nkvh = kvw / hd;
+            debug_assert_eq!(nkvh * hd, kvw, "the layer's kv width is its head count × head dim");
+            let plane_cols = nkvh * cap;
+            let mut kt = vec![0.0f32; hd * plane_cols];
+            for kvh in 0..nkvh {
+                for s in 0..cap {
+                    for d in 0..hd {
+                        kt[d * plane_cols + kvh * cap + s] = kbuf[s * kvw + kvh * hd + d];
+                    }
+                }
+            }
+            let kct = scratchy_target_spyre::lower_subtile_tape_to_superdsc::kct_resident_tid(
+                lw.prefix_k_src as u32,
+            );
+            dynamic.push((u64::from(kct), kt, vec![hd, plane_cols]));
         }
         // ⭐ THE LENGTH MASK IS FILLED BY WHOEVER KNOWS THE DECODE POSITION. The prefix cache tensor
         // spans the full structural capacity while only `start` of its rows are valid this step, so

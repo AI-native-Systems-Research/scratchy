@@ -2777,7 +2777,10 @@ mod tests {
         bindings.extend([
             SourceBinding::Cos { local: false },
             SourceBinding::Sin { local: false },
-            SourceBinding::PrefixK { layer: 0 },
+            SourceBinding::PrefixK {
+                layer: 0,
+                head_dim: 64,
+            },
             SourceBinding::PrefixV { layer: 0 },
         ]);
         fold(&src, bindings, rope_ops(v_read_again), &[], table, SPLIT)

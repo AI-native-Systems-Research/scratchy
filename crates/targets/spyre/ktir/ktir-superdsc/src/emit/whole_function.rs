@@ -2975,7 +2975,29 @@ pub fn lower_function(
             // whose every input is a minted band intermediate states no windowed input; its mint
             // stays at the tile and the extents law refuses the sweep mismatch by name — refused
             // at the op that could have extended it, not silently mis-sized.)
-            let dims = [band_rows_of(&per_op, dims[0]), dims[1]];
+            //
+            // ⛔⛔⛔ A MATMUL'S BAND IS ITS **ROW AXIS (A)**, NEVER ITS WEIGHT AXIS. The search
+            // above takes the first windowed input's `r_len`, and a matmul's B operand is
+            // routinely windowed in exactly the sense that law reads: the decode attention's
+            // value leg contracts a `[1, SWEPT]` weight row against the V cache's `[SWEPT, HD]`
+            // prefix window — a PROPER sub-window of the `[CAP, HD]` view at every interior
+            // ladder rung — so the mint took B's `r_len` (SWEPT) as the band and sized the
+            // output `[SWEPT, HD]` against the emitter's own `m = 1` (MEASURED: rungs 64/128
+            // refused `MatmulTile: A rows 1 != out rows (M) 64/128`; the ceiling rung swept the
+            // whole view — `r_cover == (0, v_rows)` — and passed only because no window was
+            // there to misread). A matmul's output rows are the contraction's M, which is A's
+            // rows, so the band may only be read off A — the same `per_op[0]` the `dev_dims`
+            // `k` below and the emitter's `a.r_len` read. A row-tiled matmul (A a flush band of
+            // a taller view) still takes its band from A; a weight-side window never was one.
+            let dims = match program {
+                Lowering::Node(Program::Matmul) => [
+                    per_op
+                        .first()
+                        .map_or(dims[0], |a| band_rows_of(std::slice::from_ref(a), dims[0])),
+                    dims[1],
+                ],
+                _ => [band_rows_of(&per_op, dims[0]), dims[1]],
+            };
             let Some(layout) = layout else {
                 return err(format!(
                     "{}: `{:?}`'s result is an intermediate, which needs a `BundleLayout` to hold \

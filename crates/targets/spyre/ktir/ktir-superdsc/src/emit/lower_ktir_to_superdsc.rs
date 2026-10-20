@@ -582,7 +582,9 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
         })?;
         // The FIRST access tile over this view — the window the program takes. A program that tiles
         // one buffer many ways (attention's per-head reads) is not addressed through this field;
-        // those bodies read their geometry from the node kind's own facts instead.
+        // those bodies read their geometry from the node kind's own facts instead. The extents are
+        // the tile's VIEW-space window ([`tile_window_2d`], which un-permutes a folded `.T`'s
+        // value shape), not the value's shape.
         let (r_start, c_start, r_len, c_len) = k
             .func
             .operations
@@ -592,7 +594,7 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
                     && o.operands.first() == view.result.as_ref()
             })
             .and_then(|t| {
-                let (tr, tc) = shape_2d(t)?;
+                let (tr, tc) = tile_window_2d(t)?;
                 let rs = t.operands.get(1).and_then(|s| consts.get(s).copied())?;
                 let cs = t.operands.get(2).and_then(|s| consts.get(s).copied())?;
                 Some((rs as u32, cs as u32, tr, tc))
@@ -674,7 +676,7 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
                     && o.operands.first().is_some_and(|v| param_views.contains(v))
             })
             .filter_map(|t| {
-                let (tr, _) = shape_2d(t)?;
+                let (tr, _) = tile_window_2d(t)?;
                 let rs = t.operands.get(1).and_then(|s| consts.get(s).copied())? as u32;
                 Some((rs, rs + tr))
             })
@@ -693,7 +695,7 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
                     && o.operands.first().is_some_and(|v| param_views.contains(v))
             })
             .filter_map(|t| {
-                let (_, tc) = shape_2d(t)?;
+                let (_, tc) = tile_window_2d(t)?;
                 let cs = t.operands.get(2).and_then(|s| consts.get(s).copied())? as u32;
                 Some((cs, cs + tc))
             })
@@ -909,6 +911,62 @@ pub(crate) fn shape_2d(op: &Operation<'_>) -> Option<(u32, u32)> {
         [a] => (1, *a as u32),
         [.., a, b] => (*a as u32, *b as u32),
     })
+}
+
+/// A `ktdp.construct_access_tile`'s `[rows, cols]` window over its VIEW — [`shape_2d`]'s reading
+/// un-permuted by the tile's `CoordinateOrder` when that order is transposing.
+///
+/// ⛔⛔⛔ A TRANSPOSING TILE'S `Shape` IS ITS **VALUE**'S SHAPE, NOT ITS WINDOW'S. The ladder's
+/// `fold_trans_into_access_tile_order` (`convert_ttir_to_ktdp.rs`) folds a `.T` whose operand
+/// comes straight from a `ktdp.load` into that load's tile: it rewrites the tile's type to the
+/// POST-TRANSPOSE shape and sets `CoordinateOrder` to the permutation, leaving the view and the
+/// corner operands alone. MEASURED, `restickify.py` (the tree's only load→`.T`→store program —
+/// every other `.T` in `crates/targets/spyre/kernels/` feeds a `tl.dot`, which `dot_to_linalg`
+/// rewires into the transpose-B maps before the fold can see it): the `[64, 512]` view's tile
+/// states `Shape=[512, 64]` with order `(d1, d0)`, and reading that shape as view extents made
+/// `regions()` report a `(0, 512) × (0, 64)` window over the `[64, 512]` view — "different
+/// bases" at the transpose door, refusing a program that states one whole-view tile per side.
+///
+/// [`Region`]'s fields are VIEW facts (its own doc: "the window the program takes" over the
+/// view), so the census here states the window in view space: the value shape UN-PERMUTED by
+/// the order. Identity orders (and an absent order, which is what an as-built tile carries)
+/// leave the reading alone — value dims are view dims there, so every program but a folded one
+/// is inert to this. This is the census's half of the prescription the ladder's own gap-4 audit
+/// states ("their side needs the attribute or a refusal naming it"): the transpose door SPENDS
+/// the permutation by its own semantics — a relayout reads the input view and writes it
+/// transposed — so stating the window honestly is the whole fix; no emission reads the order.
+///
+/// `None` — the caller's existing "no window stated" answer — for an order this 2-D census
+/// cannot state: present but not an affine map, or a permutation that is neither an identity
+/// nor the 2-D swap. Nothing in this pipeline mints one (the fold writes `order_map(rank,
+/// &order)` from a `tt.trans`, whose `order` this front end only ever states as the `.T` swap
+/// `[1, 0]`), so that arm is a refusal to guess rather than a reachable case.
+pub(crate) fn tile_window_2d(op: &Operation<'_>) -> Option<(u32, u32)> {
+    let (r, c) = shape_2d(op)?;
+    let order = op
+        .attributes
+        .iter()
+        .find(|(k, _)| *k == AttrKey::CoordinateOrder)
+        .map(|(_, v)| v);
+    // Absent = identity, which is what an as-built tile carries: the value shape is the window.
+    let Some(order) = order else { return Some((r, c)) };
+    let Attr::AffineMap(m) = order else {
+        return None;
+    };
+    // Identity in any rank: value axis i IS view axis i.
+    if m
+        .exprs
+        .iter()
+        .enumerate()
+        .all(|(i, e)| matches!(e, AffineExpr::Dim(j) if *j == i))
+    {
+        return Some((r, c));
+    }
+    // The 2-D swap (`.T`): value axis 0 is view axis 1 and vice versa.
+    if let [AffineExpr::Dim(1), AffineExpr::Dim(0)] = m.exprs {
+        return Some((c, r));
+    }
+    None
 }
 
 /// The registry slot a reserved-tid parameter names — the inverse of [`scalarmul_scale_tid`],
@@ -1165,23 +1223,35 @@ pub fn elementwise(
             ins.len(),
         ));
     }
-    // ⛔⛔⛔ THE BROADCAST AND PER-ROW ARMS CANNOT CARRY A CORNER — COLUMN OR ROW — AND ONE NEVER
-    // REACHES THEM FROM THIS FRONT END. A broadcast operand is addressed at its OWN extent (`In::col`:
-    // one lane per row; `In::mb`: one row of values) and the per-row chain writes LANE 0 of a
-    // one-stick output at the buffer base — neither form can state "columns
-    // `[c_start, c_start+c_len)` of a wider stick-blocked tensor" (what a column-blocked chunk is)
-    // nor "rows `[r_start, r_start+r_len)` of a taller one" (what a banded program's window is).
-    // The column-tiling set (`subtile_ir.rs`: `EwKind::Silu | Mul | Add`, `ScalarMul`, `SiluMul`)
-    // is all DENSE, so a corner arriving at either arm is a producer shape this door refuses BY
-    // NAME rather than mis-addressing — the same contract `base_addressed` states for a row corner
-    // on every other body. The DENSE arm below carries both corners; this guard is what keeps the
-    // other two from silently dropping them.
-    if (bcast.iter().any(Option::is_some) || out.c_len == 1)
-        && (out.c_start != 0
-            || ins.iter().any(|x| x.c_start != 0)
-            || out.r_start != 0
-            || ins.iter().any(|x| x.r_start != 0))
-    {
+    // ⛔⛔⛔ THE PER-ROW WIDTH AND THE BROADCAST OPERANDS CANNOT CARRY A CORNER — COLUMN OR ROW —
+    // AND THE DOOR REFUSES THEM BY NAME RATHER THAN MIS-ADDRESSING. Two laws, one per routing:
+    //
+    // 1. A ONE-COLUMN OUTPUT (`out.c_len == 1` — the per-row one-stick chain, and the width
+    //    [`elementwise_broadcast`] itself folds to at `c_len == 1`) writes LANE 0 of a one-stick
+    //    output at the buffer base, so neither a column window nor a row band is stateable: ANY
+    //    corner on ANY operand of a one-column-output op is refused — the original blanket guard,
+    //    unchanged, and the same contract `base_addressed` states for a row corner on every other
+    //    body.
+    //
+    // 2. A BROADCAST OPERAND (`bcast[i] = Some`) is addressed at its OWN extent — `In::col` (one
+    //    lane per row) and `In::mb` (one row of values) state no offset — so its region must be
+    //    whole-tensor; a corner on one is refused naming the operand and its mode.
+    //
+    // ⭐ AND THE DENSE OPERANDS AND THE OUTPUT OF A MULTI-STICK BROADCAST OP ARE PLACED
+    // PER-OPERAND — the dense arm's own windowed emission, verbatim ([`chunk_window`] at row 0,
+    // [`band_corner`] through `In::sliced`/`OutCorner::At` at a row corner, the output through its
+    // own [`OutCorner`]). The blanket guard this replaces claimed "one never reaches them from
+    // this front end", and that premise was MEASURED FALSE three days after it landed:
+    // `one_k_dot_to_mul` (triton-ktir, 9403f61d2) rewrites attn.py's decode value leg
+    // `tl.dot(w_d, vd)` — K=1 — into `broadcast(w_d) · vd`, and the vd leg is head h's
+    // `[MQ, HD]` window at column `kvh·HD` of the `[NEW_LEN, NKVH·HD]` V buffer: a DENSE operand
+    // at a column corner beside a broadcast one. The transposed-B dots were refusing that walk
+    // earlier, so the shape stayed invisible until the plain-B restatement cleared them. The
+    // broadcast arm's extents law already holds a dense operand to `v_rows == rows` — the sweep —
+    // which is exactly the same-rows condition a [`ColWindow`]'s stick-major presentation states,
+    // so the dense arm's forms place it without inventing an addressing mode.
+    let cornered = |x: &Region| x.c_start != 0 || x.r_start != 0;
+    if out.c_len == 1 && (cornered(&out) || ins.iter().any(cornered)) {
         let (who, cs) = ins
             .iter()
             .find(|x| x.c_start != 0)
@@ -1194,6 +1264,22 @@ pub fn elementwise(
              a column window, and neither a row corner (`base_addressed`'s own argument). A \
              column-blocked chunk or a banded window is DENSE elementwise; the dense arm carries \
              both corners, so give the broadcast/per-row chains whole-tensor regions.",
+        ));
+    }
+    if let Some((i, (x, b))) = ins
+        .iter()
+        .zip(bcast.iter())
+        .enumerate()
+        .find(|(_, (x, b))| b.is_some() && cornered(x))
+    {
+        return err(format!(
+            "Elementwise({kind:?}) {name}: input {i} t{} is broadcast ({b:?}) and states a window \
+             `[{}, {}]` at ({}, {}) of its `[{}, {}]` view, but a broadcast operand is addressed \
+             at its OWN extent — `In::col` reads one lane per row and `In::mb` one row of values, \
+             and neither states an offset — so the door refuses the corner rather than reading the \
+             broadcast source at the buffer base. Give the broadcast chains whole-tensor operands \
+             (the walk's intermediates and reductions already are).",
+            x.tid, x.r_len, x.c_len, x.r_start, x.c_start, x.v_rows, x.v_cols,
         ));
     }
     if bcast.iter().any(Option::is_some) {
@@ -1656,18 +1742,43 @@ fn elementwise_broadcast(
         .zip(ins)
         .map(|(n, x)| rb(n, x.v_rows, x.c_len))
         .collect();
+    // ⭐ THE DENSE OPERANDS AND THE OUTPUT TAKE THE DENSE ARM'S OWN PER-OPERAND WINDOW FORMS —
+    // the same forms, the same laws, the same builder ([`assemble_pointwise_broadcast_off_from_tile`]
+    // takes one mode per operand and one output corner, so a broadcast mode beside a windowed dense
+    // one is a mix it already states). A dense operand at row 0 is a whole-stick [`ColWindow`] of
+    // its same-rows parent — the extents law above holds `v_rows == rows`, which is exactly the
+    // same-rows condition the window's stick-major presentation states; at a row corner it is the
+    // single-stick rectangle `In::sliced` reaches. A corner-free operand keeps `In::full` and a
+    // corner-free output keeps [`OutCorner::ZERO`], so every corner-free broadcast program — every
+    // one this arm has ever baked — is emitted byte-identically; only a stated corner routes to the
+    // offset forms, the dense arm's own law. The BROADCAST operands keep `In::col`/`In::mb`: their
+    // regions are whole-tensor by the guard in [`elementwise`].
     let ew: Vec<_> = in_handles
         .iter()
-        .zip(bcast)
-        .map(|(h, b)| match b {
-            None => In::full(h).ew(),
-            Some(BcastAxis::Col) => In::col(h).ew(),
-            Some(BcastAxis::Mb) => In::mb(h).ew(),
+        .zip(ins.iter())
+        .zip(bcast.iter())
+        .map(|((h, x), b)| {
+            Ok(match b {
+                Some(BcastAxis::Col) => In::col(h).ew(),
+                Some(BcastAxis::Mb) => In::mb(h).ew(),
+                None if x.r_start == 0 && x.c_start == 0 => In::full(h).ew(),
+                None if x.r_start == 0 => In::col_window(h, chunk_window(name, rows, x)?).ew(),
+                None => In::sliced(h, band_corner(name, rows, x)?).ew(),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, Error>>()?;
     // The SAME `TileOp` the dense arm builds, so the two arms share one LX-tiling contract and a
     // broadcast op is not silently exempt from it.
     let tile_op = pointwise_tile_op(rows, cols, ins.len() as u32 + 1);
+    // The output's own corner: [`OutCorner::ZERO`] for a corner-free program (the byte-identical
+    // form), the window or corner the region states otherwise — the dense arm's `out_off`, verbatim.
+    let out_off: crate::addr::OutCorner = if out.r_start == 0 && out.c_start == 0 {
+        crate::addr::OutCorner::ZERO
+    } else if out.r_start == 0 {
+        chunk_window(name, rows, out)?.into()
+    } else {
+        crate::addr::OutCorner::At(band_corner(name, rows, out)?)
+    };
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
         &op_name,
         &tile_op,
@@ -1676,11 +1787,7 @@ fn elementwise_broadcast(
         cols,
         &ew,
         &out_h,
-        // WHOLE-TENSOR: [`elementwise`] refuses a column corner on any operand before routing
-        // here (a broadcast/per-row operand is addressed at its own extent or the buffer base,
-        // neither of which can place a column window), so the offset is 0 by proof, not by
-        // default.
-        crate::addr::DevOff::ZERO,
+        out_off,
         sym_id_base,
         layout,
     )])
@@ -4585,6 +4692,197 @@ mod elementwise_tests {
         );
     }
 
+    // ── THE BROADCAST ARM'S DENSE OPERANDS AND OUTPUT CARRY THEIR OWN WINDOWS ────────────────
+    //
+    // ⭐⭐⭐ THE ONE-K MULF IS WHY. `one_k_dot_to_mul` (triton-ktir, 9403f61d2) rewrites attn.py's
+    // decode value leg `tl.dot(w_d, vd)` — K=1 — into `broadcast(w_d) · vd`, and the vd leg is
+    // head h's `[MQ, HD]` window at column `kvh·HD` of the `[NEW_LEN, NKVH·HD]` V buffer: a DENSE
+    // operand at a column corner beside a broadcast one. The blanket corner guard this module's
+    // refusals above used to state predates that pass by three days and claimed "one never reaches
+    // them from this front end" — the transposed-B dots were refusing the walk earlier, so nothing
+    // saw the shape until the plain-B restatement cleared them. The DENSE operands and the OUTPUT
+    // now take the dense arm's own per-operand window forms; the BROADCAST operands and the
+    // per-row width keep the whole-tensor contract, refused by name below.
+
+    /// One WINDOWED operand: head h's `[rows, cols]` window at column `c` of a `[rows, v_cols]`
+    /// view — the shape `windowed_region` reports for vd's per-head load (`attn.py`'s
+    /// `vd_desc.load([KD_ROW, KD_COL + kvh * HD])`, granite-2b decode: `[1, 64]` at column
+    /// `kvh·64` of the `[1, 512]` V buffer).
+    fn win(tid: u32, rows: u32, v_cols: u32, c: u32, cols: u32, is_out: bool) -> Region {
+        Region {
+            tid,
+            v_rows: rows,
+            v_cols,
+            r_start: 0,
+            c_start: c,
+            r_len: rows,
+            c_len: cols,
+            r_cover: (0, rows),
+            c_cover: (0, v_cols),
+            is_out,
+            is_fp8: false,
+        }
+    }
+
+    /// ⭐ THE ONE-K MULF ITSELF — a Col-broadcast scalar times head 1's vd window, out a minted
+    /// corner-0 intermediate (the walk mints the mulf's result; the consumer addf takes the store
+    /// window). The dense operand's binding must carry ITS window (element 64 of the V buffer),
+    /// which is exactly what the old blanket guard refused and the class law
+    /// (`column_windows_are_honoured`) holds every other windowed operand to.
+    #[test]
+    fn a_dense_operand_beside_a_broadcast_carries_its_window() {
+        let r = node(
+            reg(5, 1, 1, false), // w_d: the [1, 1] per-row scalar
+            win(6, 1, 512, 64, 64, false), // vd: head 1's [1, 64] at column 64 of [1, 512]
+            reg(7, 1, 64, true), // the minted [1, 64] intermediate, corner 0
+        );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "mul_s7",
+            Elementwise::Mul,
+            &r,
+            &[Some(BcastAxis::Col), None],
+            &mut sym,
+            None,
+        )
+        .expect("the one-K mulf: a broadcast scalar times a windowed dense operand");
+        assert_eq!(ops.len(), 1, "an operand mode plus a window is not a decomposition");
+        assert_eq!(ops[0].op_name, "multiply_o7");
+        let vd = ops[0]
+            .arg_bindings
+            .iter()
+            .find(|b| b.buffer == "t6")
+            .expect("the dense operand is bound");
+        assert_eq!(
+            vd.offset_elems, 64,
+            "vd is addressed at head 1's window, not the buffer base — the old guard's blanket \
+             refusal would have had no answer for this op at all"
+        );
+        let w = ops[0]
+            .arg_bindings
+            .iter()
+            .find(|b| b.buffer == "t5")
+            .expect("the broadcast operand is bound");
+        assert_eq!(
+            w.offset_elems, 0,
+            "the broadcast operand stays at its own extent's base"
+        );
+    }
+
+    /// ⭐ THE OUTPUT TOO — a multi-stick broadcast op whose OUT is the store window (the epilogue
+    /// form: `out / l[:, None]` writing head h's columns). The output binding carries the window.
+    #[test]
+    fn a_broadcast_op_writes_its_outputs_window() {
+        let r = node(
+            reg(5, 1, 1, false),
+            reg(6, 1, 64, false),
+            win(7, 1, 512, 64, 64, true), // out: head 1's [1, 64] store window at column 64
+        );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "mul_s7",
+            Elementwise::Mul,
+            &r,
+            &[Some(BcastAxis::Col), None],
+            &mut sym,
+            None,
+        )
+        .expect("the output window is the dense arm's own per-operand form");
+        assert_eq!(ops.len(), 1);
+        let o = ops[0]
+            .arg_bindings
+            .iter()
+            .find(|b| b.buffer == "t7" && !b.is_input)
+            .expect("the output is bound");
+        assert_eq!(o.offset_elems, 64, "the write lands in head 1's columns");
+    }
+
+    /// ⭐ THE BYTE-IDENTITY CONTROL — the same op corner-free keeps every offset at 0, so nothing
+    /// the old guard admitted changes its bytes. This is the control that makes the two tests
+    /// above non-vacuous: the door did not start writing offsets everywhere, it routes on the
+    /// stated corner exactly as the dense arm does.
+    #[test]
+    fn a_corner_free_broadcast_op_keeps_every_offset_at_zero() {
+        let r = node(
+            reg(5, 1, 1, false),
+            reg(6, 1, 64, false),
+            reg(7, 1, 64, true),
+        );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "mul_s7",
+            Elementwise::Mul,
+            &r,
+            &[Some(BcastAxis::Col), None],
+            &mut sym,
+            None,
+        )
+        .expect("the corner-free form is the arm's ordinary case");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op_name, "multiply_o7");
+        assert!(
+            ops[0].arg_bindings.iter().all(|b| b.offset_elems == 0),
+            "no corner stated, no offset emitted"
+        );
+    }
+
+    /// ⛔ THE PER-ROW WIDTH KEEPS THE ORIGINAL REFUSAL — a one-column output writes lane 0 of a
+    /// one-stick output at the buffer base, and neither a column window nor a band is stateable
+    /// there. The blanket guard's own case, unchanged.
+    #[test]
+    fn a_per_row_width_with_a_corner_is_still_refused() {
+        let r = node(
+            reg(5, 4, 1, false),
+            win(6, 4, 128, 64, 1, false), // a [4, 1] window at column 64
+            reg(7, 4, 1, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "add_s7",
+            Elementwise::Add,
+            &r,
+            &[Some(BcastAxis::Col), None],
+            &mut sym,
+            None,
+        ) else {
+            panic!("a one-column output cannot place a windowed operand")
+        };
+        assert!(
+            e.message.contains("whole-tensor regions"),
+            "the original guard's own refusal, verbatim: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ AND A BROADCAST OPERAND WITH A CORNER IS REFUSED BY NAME — `In::col`/`In::mb` state no
+    /// offset, so a cornered broadcast source would be read at the buffer base. The walk's
+    /// intermediates and reductions are whole-tensor, so nothing real reaches this; the refusal
+    /// keeps it that way.
+    #[test]
+    fn a_broadcast_operand_with_a_corner_is_refused_by_name() {
+        let r = node(
+            win(5, 1, 64, 64, 1, false), // the [1, 1] scalar marked Col, AT a corner
+            reg(6, 1, 64, false),
+            reg(7, 1, 64, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "mul_s7",
+            Elementwise::Mul,
+            &r,
+            &[Some(BcastAxis::Col), None],
+            &mut sym,
+            None,
+        ) else {
+            panic!("a broadcast operand cannot carry a corner — its mode states no offset")
+        };
+        assert!(
+            e.message.contains("t5") && e.message.contains("broadcast"),
+            "names the operand and why its mode cannot place it: {}",
+            e.message
+        );
+    }
+
     // ── (iii) EXHAUSTIVE DECLARED-SET ASSERTIONS ──────────────────────────────────────────────
 
     /// ⛔ NO `_` ARM: a new [`Elementwise`] variant is an E0004 HERE, which is what makes
@@ -5039,9 +5337,15 @@ mod elementwise_tests {
         ) else {
             panic!("a broadcast arm at a column corner must refuse")
         };
+        // ⭐ THE GUARD IS SPLIT, NOT LIFTED: a broadcast OPERAND still cannot carry a corner
+        // (`In::col`/`In::mb` state no offset — the refusal names the mode), while the DENSE
+        // operands and the output beside it now take the dense arm's per-operand windows (the
+        // one-K mulf, `one_k_dot_to_mul`'s product). This case is the broadcast-operand half.
         assert!(
-            e.message.contains("column corner"),
-            "names the corner and the arm: {}",
+            e.message.contains("t6")
+                && e.message.contains("broadcast")
+                && e.message.contains("buffer base"),
+            "names the operand, its mode, and the mis-address it refuses: {}",
             e.message
         );
         // The per-row chain: a `[rows, 1]` output at a corner (a binary Sub, the softmax's

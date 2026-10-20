@@ -3,24 +3,38 @@
 over the paged KV cache.
 
 BODY PROVENANCE: `crates/triton/test-fixtures/attention_flash.py`'s numerics (the
-tutorial-derived flash form this tree card-validated), restated in the SPLICE's own
+tutorial-derived flash form this tree card-validated), restated in the SPLICE'S own
 launch contract — which is NOT the fixture's delta-8 layout. The fixture's
 transposed/splat-source staging belongs to the old ladder path; the splice presents
 the tensors the WAY THE BUILDER'S OWN PROGRAM VIEWS THEM (main's `KtirFunc::attn`), because
-the door (`ktir_superdsc_door::attn` → `attn_operands`) reads every fact — the q/out
-`[mq, nqh·hd]` views, the kv `[cap, nkvh·hd]` views, q's first tile's `hd` width, the
-cache's swept row extent — off the program itself.
+the door reads every fact — the q/out `[mq, nqh·hd]` views, the kv `[cap, nkvh·hd]`
+views, q's first tile's `hd` width, the cache's swept row extent — off the program itself.
 
 THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kernel):
 
 * PARAMETERS, IN ORDER: `desc_q`, `desc_o`, then the four segment buffers in the
-  door's positional order — resident K (`desc_kc`), new K (`desc_kd`), resident V
-  (`desc_vc`), new V (`desc_vd`) — then `desc_mask`. The door reads `r[0]`/`r[1]` as
-  q/out and the next four as (kc, new_k, vc, new_v), skipping the mask by its bound
-  tid (`KtirNode.mask`); the builder's own `arg_for` order is the same.
-* VIEWS: q and out are `[MQ, NQH*HD]`; the cache params are `[CAP, NKVH*HD]`; the new
-  params are `[NEW_LEN, NKVH*HD]`; the mask is `[1, SWEPT]` (decode) or `[MQ, MQ]`
-  (the causal one-pass). Every extent is a constexpr — one kernel per
+  door's positional order — the Kᵀ PLANE (`desc_kt`, the pool's third plane, in
+  the resident-K slot), the new block's Kᵀ scratch (`desc_ktn`, in the new-K
+  slot), resident V (`desc_vc`), new V (`desc_vd`) — then `desc_mask`. The door
+  reads `r[0]`/`r[1]` as q/out and the next four as the segment pairs, skipping
+  the mask by its bound tid (`KtirNode.mask`).
+* ⛔ K IS READ ONLY IN ITS TRANSPOSED FORM — the door's own law
+  (`transposed_b_is_placeable`): a `.T` over a buffer written n-major has no
+  agent that spends the transposition, so the score dot states the PLAIN `[k, n]`
+  form with the contraction axis as B's row axis. The resident prefix's Kᵀ comes
+  from the PLANE (written transposed by its own writer — the rope append's second
+  store on card, the host's transposed staging on the emulator and the gate); the
+  new block's comes from `desc_ktn`, the `restickify.py` program's output, which
+  the splice emits immediately before this one.
+* VIEWS: q and out are `[MQ, NQH*HD]`; `desc_kt` is `[HD, NKVH*CAP]` — the Kᵀ
+  plane's TRUE arrangement (per head `[hd, PAGE_SLOTS]` slot-sticked, heads
+  concatenated along the out axis: `kernel(HD, NKVH*CAP).dev_off(0, kvh*CAP + s)`
+  IS `kt_write_off(kvh, s, 0)`, exact at `CAP == PAGE_SLOTS`); `desc_ktn` is
+  `[KTN_W, KTN_ROWS]` — the restickify's transposed staging form, per head read
+  at the ROW corner `kvh*HD` (the B operand's in-corner, which the door places
+  without alignment needs and which is stick-aligned anyway); the V params are
+  `[CAP, NKVH*HD]` / `[NEW_LEN, NKVH*HD]`; the mask is `[1, SWEPT]` (decode) or
+  `[MQ, MQ]` (the causal one-pass). Every extent is a constexpr — one kernel per
   shape, the fixture's delta-7 law.
 * GRID: `[NQH]` at `MQ > 1`, `[1]` at decode — the builder's own head split: one
   head per program instance (`KtdpGetComputeTileId`, grid `(nq, 1)`), the same
@@ -29,9 +43,27 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   trace-time because the per-row causal extent `qi + 1` is a constexpr only
   inside it, rope.py's law). Decode keeps grid `[1]` and the trace-time head
   loop — the builder loops all heads at mq == 1 too.
-* CONSTEXPRS: `NQH, NKVH, HD, GQA, MQ, CAP, SWEPT, SCALE` plus the segment corners
-  (`KC_ROW/KC_COL/KD_ROW/KD_COL`), `NEW_LEN`, `HAS_MASK`, `ONE_PASS` — all stated
-  by the splice from the node's own payload and regions, never inferred.
+* CONSTEXPRS: `NQH, NKVH, HD, GQA, MQ, CAP, SWEPT, SCALE` plus the segment
+  corners (`KC_ROW/KC_COL/KD_ROW/KD_COL`), `NEW_LEN`, the new block's scratch
+  extents (`KTN_ROWS` the stick cover, `KTN_W` the device width), `HAS_MASK`,
+  `ONE_PASS` — all stated by the splice from the node's own payload and regions,
+  never inferred.
+
+⛔ THE Kᵀ PLANE'S STICK LAW. The plane is sticked on SLOTS (64 consecutive slots
+per stick), so every `desc_kt` load corner must be 64-aligned and every load
+width a 64 multiple — `KC_ROW` is 0 at the masked prefix (the builder's own law)
+and `SWEPT` the rung's swept extent (a ladder bound, itself a 64 multiple), so
+both hold by construction; the head's own corner `kvh*CAP` is whole pages. The
+V plane needs no such alignment (its stick axis is the head dim).
+
+⛔ THE NEW BLOCK'S B WINDOW IS EXACT. `desc_ktn`'s block is `[HD, NEW_LEN]` at
+`[kvh*HD, 0]` — the LOGICAL new-block extent, never the stick cover: the scratch's
+pad columns (the transposed staging pad rows, written by the restickify's fold and
+never zeroed) must not enter the score, and at `NEW_LEN` they cannot — the dot's
+logical n is `NEW_LEN`, the score tile's own width is `NEW_LEN`, and every reduce
+below bounds itself to it. The util-floor pad the matmul door applies to a
+sub-stick n lands in the score tile's own placement pad (the `cols_entire` law —
+the same exception the value leg's `[1,1]`-contraction dots ride).
 
 ⛔ THE THREE SHAPES, exactly the builder's own arms (main's `KtirFunc::attn`):
 
@@ -51,7 +83,7 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
    arm's do.
 
 ⛔ THE DEAD PREFIX IS A SPLICE-INJECTED VIEW, NOT A KERNEL LOAD. At `SWEPT == 0`
-the `if SWEPT > 0` guards below leave `desc_kc`/`desc_vc` addressed NOWHERE, and no
+the `if SWEPT > 0` guards below leave `desc_kt`/`desc_vc` addressed NOWHERE, and no
 Triton program can state "a parameter with a view and no access tile" — an
 unconsumed descriptor is DCE'd and the handoff refuses the hole (the fixture's
 delta-11 law). The builder keeps the dead segment's VIEW so the cache tensor stays
@@ -72,10 +104,11 @@ import triton.language as tl
 
 
 @triton.jit
-def _attn_one_pass_head(h, desc_q, desc_o, desc_kd, desc_vd, desc_mask,  #
+def _attn_one_pass_head(h, desc_q, desc_o, desc_ktn, desc_vd, desc_mask,  #
                         NQH: tl.constexpr, NKVH: tl.constexpr, HD: tl.constexpr,  #
                         GQA: tl.constexpr, MQ: tl.constexpr,  #
-                        NEW_LEN: tl.constexpr, KD_ROW: tl.constexpr,  #
+                        NEW_LEN: tl.constexpr, KTN_ROWS: tl.constexpr,  #
+                        KTN_W: tl.constexpr, KD_ROW: tl.constexpr,  #
                         KD_COL: tl.constexpr, SCALE: tl.constexpr):
     """One head's causal one-pass body — shared by the decode head loop and the
     mq > 1 per-program head (the builder's `head_pid` form). Descriptors are
@@ -90,9 +123,13 @@ def _attn_one_pass_head(h, desc_q, desc_o, desc_kd, desc_vd, desc_mask,  #
     q_wide = tl.make_tensor_descriptor(desc_q, shape=[MQ, q_width],
                                        strides=[q_width, 1],
                                        block_shape=[MQ, HD])
-    kd_desc = tl.make_tensor_descriptor(desc_kd, shape=[NEW_LEN, kv_width],
-                                        strides=[kv_width, 1],
-                                        block_shape=[MQ, HD])
+    # The new block's Kᵀ — the restickify's transposed staging form, this head's
+    # [HD, NEW_LEN] window at the ROW corner kvh*HD (the B operand's in-corner).
+    # The block is the LOGICAL extent: the scratch's stick-cover pad columns
+    # must not enter the score (see the module doc's EXACT-window law).
+    ktn_desc = tl.make_tensor_descriptor(desc_ktn, shape=[KTN_W, KTN_ROWS],
+                                         strides=[KTN_ROWS, 1],
+                                         block_shape=[HD, NEW_LEN])
     vd_desc = tl.make_tensor_descriptor(desc_vd, shape=[NEW_LEN, kv_width],
                                         strides=[kv_width, 1],
                                         block_shape=[MQ, HD])
@@ -101,9 +138,8 @@ def _attn_one_pass_head(h, desc_q, desc_o, desc_kd, desc_vd, desc_mask,  #
                                           block_shape=[MQ, MQ])
     kvh = h // GQA
     q = q_wide.load([0, h * HD])  # [MQ, HD]
-    k = kd_desc.load([KD_ROW, KD_COL + kvh * HD])  # [MQ, HD]
-    kt = k.T  # [HD, MQ]
-    qk = tl.dot(q, kt, out_dtype=tl.float16)  # [MQ, MQ]
+    ktn = ktn_desc.load([kvh * HD, 0])  # [HD, MQ]
+    qk = tl.dot(q, ktn, out_dtype=tl.float16)  # [MQ, MQ]
     qk = qk * SCALE
     qk = qk + mask_desc.load([0, 0])
     # Row-wise softmax, one reduce per axis.
@@ -118,11 +154,12 @@ def _attn_one_pass_head(h, desc_q, desc_o, desc_kd, desc_vd, desc_mask,  #
 
 
 @triton.jit
-def _attn_cont_head(h, desc_q, desc_o, desc_kc, desc_vc, desc_kd, desc_vd,  #
+def _attn_cont_head(h, desc_q, desc_o, desc_kt, desc_vc, desc_ktn, desc_vd,  #
                     desc_mask,  #
                     NQH: tl.constexpr, NKVH: tl.constexpr, HD: tl.constexpr,  #
                     GQA: tl.constexpr, MQ: tl.constexpr, SWEPT: tl.constexpr,  #
                     CAP: tl.constexpr, NEW_LEN: tl.constexpr,  #
+                    KTN_ROWS: tl.constexpr, KTN_W: tl.constexpr,  #
                     KC_ROW: tl.constexpr, KC_COL: tl.constexpr,  #
                     KD_ROW: tl.constexpr, KD_COL: tl.constexpr,  #
                     SCALE: tl.constexpr):
@@ -144,7 +181,7 @@ def _attn_cont_head(h, desc_q, desc_o, desc_kc, desc_vc, desc_kd, desc_vd,  #
 
     Every fact the door reads off the program is the old arm's: q's first tile is still
     `HD` columns wide (`[MQ, HD]`, the one-pass arm's own q tile), the cache tiles are
-    `[SWEPT, HD]` (the swept extent `param_read_rows` reads), and the scale is the same
+    `[SWEPT, HD]` (the swept extent the door reads back), and the scale is the same
     immediate multiply on the score dot."""
     # A continuation always has a live prefix: a chunk with none is the one-pass arm.
     tl.static_assert(SWEPT > 0)
@@ -156,15 +193,17 @@ def _attn_cont_head(h, desc_q, desc_o, desc_kc, desc_vc, desc_kd, desc_vd,  #
     o_wide = tl.make_tensor_descriptor(desc_o, shape=[MQ, q_width],
                                        strides=[q_width, 1],
                                        block_shape=[MQ, HD])
-    kc_desc = tl.make_tensor_descriptor(desc_kc, shape=[CAP, kv_width],
-                                        strides=[kv_width, 1],
-                                        block_shape=[SWEPT, HD])
+    # The resident prefix's Kᵀ — the PLANE's [HD, NKVH*CAP] fused view, this head's
+    # [HD, SWEPT] window at the slot corner kvh*CAP + KC_ROW (0 at the masked prefix).
+    kt_desc = tl.make_tensor_descriptor(desc_kt, shape=[HD, NKVH * CAP],
+                                        strides=[NKVH * CAP, 1],
+                                        block_shape=[HD, SWEPT])
     vc_desc = tl.make_tensor_descriptor(desc_vc, shape=[CAP, kv_width],
                                         strides=[kv_width, 1],
                                         block_shape=[SWEPT, HD])
-    kd_desc = tl.make_tensor_descriptor(desc_kd, shape=[NEW_LEN, kv_width],
-                                        strides=[kv_width, 1],
-                                        block_shape=[MQ, HD])
+    ktn_desc = tl.make_tensor_descriptor(desc_ktn, shape=[KTN_W, KTN_ROWS],
+                                         strides=[KTN_ROWS, 1],
+                                         block_shape=[HD, NEW_LEN])
     vd_desc = tl.make_tensor_descriptor(desc_vd, shape=[NEW_LEN, kv_width],
                                         strides=[kv_width, 1],
                                         block_shape=[MQ, HD])
@@ -178,12 +217,12 @@ def _attn_cont_head(h, desc_q, desc_o, desc_kc, desc_vc, desc_kd, desc_vd,  #
     kvh = h // GQA
     q = q_wide.load([0, h * HD])  # [MQ, HD]
     # Pass 1: both segments' scores for every row, and the per-row global max.
-    kc = kc_desc.load([KC_ROW, KC_COL + kvh * HD])  # [SWEPT, HD]
-    qk_c = tl.dot(q, kc.T, out_dtype=tl.float16)  # [MQ, SWEPT]
+    kt = kt_desc.load([0, kvh * CAP + KC_ROW])  # [HD, SWEPT]
+    qk_c = tl.dot(q, kt, out_dtype=tl.float16)  # [MQ, SWEPT]
     qk_c = qk_c * SCALE
     qk_c = qk_c + mask_c.load([0, 0])
-    kd = kd_desc.load([KD_ROW, KD_COL + kvh * HD])  # [MQ, HD]
-    qk_d = tl.dot(q, kd.T, out_dtype=tl.float16)  # [MQ, MQ]
+    ktn = ktn_desc.load([kvh * HD, 0])  # [HD, MQ]
+    qk_d = tl.dot(q, ktn, out_dtype=tl.float16)  # [MQ, MQ]
     qk_d = qk_d * SCALE
     qk_d = qk_d + mask_d.load([0, SWEPT])
     gmax = tl.maximum(tl.max(qk_c, 1), tl.max(qk_d, 1))  # [MQ]
@@ -201,11 +240,12 @@ def _attn_cont_head(h, desc_q, desc_o, desc_kc, desc_vc, desc_kd, desc_vd,  #
 
 @triton.jit
 def attn_fwd(desc_q, desc_o,  #
-             desc_kc, desc_kd, desc_vc, desc_vd,  #
+             desc_kt, desc_ktn, desc_vc, desc_vd,  #
              desc_mask,  #
              NQH: tl.constexpr, NKVH: tl.constexpr, HD: tl.constexpr,  #
              GQA: tl.constexpr, MQ: tl.constexpr, CAP: tl.constexpr,  #
              SWEPT: tl.constexpr, NEW_LEN: tl.constexpr,  #
+             KTN_ROWS: tl.constexpr, KTN_W: tl.constexpr,  #
              KC_ROW: tl.constexpr, KC_COL: tl.constexpr,  #
              KD_ROW: tl.constexpr, KD_COL: tl.constexpr,  #
              SCALE: tl.constexpr, HAS_MASK: tl.constexpr,  #
@@ -224,25 +264,26 @@ def attn_fwd(desc_q, desc_o,  #
     o_desc = tl.make_tensor_descriptor(desc_o, shape=[MQ, q_width],
                                        strides=[q_width, 1],
                                        block_shape=[1, HD])
-    # THE SWEPT RESIDENT CACHE — `SWEPT` rows at the segment's own corner. The door
-    # reads the rung back off exactly this tile (`param_read_rows`), so the splice
-    # states the RESOLVED active cap here, never the full capacity. Guarded: at
-    # `SWEPT == 0` the views are the splice's to inject (see the module doc).
+    # THE SWEPT RESIDENT SEGMENT — the Kᵀ plane and the V plane, `SWEPT` rows at
+    # the segment's own corners. The door reads the rung back off exactly these
+    # tiles, so the splice states the RESOLVED active cap here, never the full
+    # capacity. Guarded: at `SWEPT == 0` the views are the splice's to inject
+    # (see the module doc).
     if SWEPT > 0:
-        kc_desc = tl.make_tensor_descriptor(desc_kc, shape=[CAP, kv_width],
-                                            strides=[kv_width, 1],
-                                            block_shape=[SWEPT, HD])
+        kt_desc = tl.make_tensor_descriptor(desc_kt, shape=[HD, NKVH * CAP],
+                                            strides=[NKVH * CAP, 1],
+                                            block_shape=[HD, SWEPT])
         vc_desc = tl.make_tensor_descriptor(desc_vc, shape=[CAP, kv_width],
                                             strides=[kv_width, 1],
                                             block_shape=[SWEPT, HD])
-    # The new-token block's [NEW_LEN, HD] descriptors are the DECODE arm's (its
-    # [1, HD] loads ride the whole-region blocks); the one-pass and continuation
-    # helpers construct their own per-arm blocks from the same raw pointers.
+    # The new-token block's descriptors are the DECODE arm's (its [1, HD] loads
+    # ride the whole-region blocks); the one-pass and continuation helpers
+    # construct their own per-arm blocks from the same raw pointers.
     if not ONE_PASS:
         if MQ == 1:
-            kd_desc = tl.make_tensor_descriptor(desc_kd, shape=[NEW_LEN, kv_width],
-                                                strides=[kv_width, 1],
-                                                block_shape=[NEW_LEN, HD])
+            ktn_desc = tl.make_tensor_descriptor(desc_ktn, shape=[KTN_W, KTN_ROWS],
+                                                 strides=[KTN_ROWS, 1],
+                                                 block_shape=[HD, NEW_LEN])
             vd_desc = tl.make_tensor_descriptor(desc_vd, shape=[NEW_LEN, kv_width],
                                                 strides=[kv_width, 1],
                                                 block_shape=[NEW_LEN, HD])
@@ -280,23 +321,23 @@ def attn_fwd(desc_q, desc_o,  #
     # ONE-PASS (the builder's own arm): the program id is the head directly. ONE_PASS
     # implies MQ > 1 (the splice's condition), so this is always the per-program head.
     if ONE_PASS:
-        _attn_one_pass_head(pid, desc_q, desc_o, desc_kd, desc_vd, desc_mask,
-                            NQH, NKVH, HD, GQA, MQ, NEW_LEN, KD_ROW,
-                            KD_COL, SCALE)
+        _attn_one_pass_head(pid, desc_q, desc_o, desc_ktn, desc_vd, desc_mask,
+                            NQH, NKVH, HD, GQA, MQ, NEW_LEN, KTN_ROWS,
+                            KTN_W, KD_ROW, KD_COL, SCALE)
     elif MQ == 1:
         for h in tl.static_range(0, NQH, 1):
             kvh = h // GQA
             q = q_desc.load([0, h * HD])  # [1, HD]
             # Pass 1: per-segment scores and the global max.
             if SWEPT > 0:
-                kc = kc_desc.load([KC_ROW, KC_COL + kvh * HD])  # [SWEPT, HD]
-                qk_c = tl.dot(q, kc.T, out_dtype=tl.float16)  # [1, SWEPT]
+                kt = kt_desc.load([0, kvh * CAP + KC_ROW])  # [HD, SWEPT]
+                qk_c = tl.dot(q, kt, out_dtype=tl.float16)  # [1, SWEPT]
                 qk_c = qk_c * SCALE
                 if HAS_MASK:
                     qk_c = qk_c + mask_desc.load([0, 0])
                 m_c = tl.max(qk_c, 1)  # [1]
-            kd = kd_desc.load([KD_ROW, KD_COL + kvh * HD])  # [1, HD]
-            qk_d = tl.dot(q, kd.T, out_dtype=tl.float16)  # [1, 1]
+            ktn = ktn_desc.load([kvh * HD, 0])  # [HD, NEW_LEN]
+            qk_d = tl.dot(q, ktn, out_dtype=tl.float16)  # [1, NEW_LEN]
             qk_d = qk_d * SCALE
             m_d = tl.max(qk_d, 1)  # [1]
             if SWEPT > 0:
@@ -336,6 +377,6 @@ def attn_fwd(desc_q, desc_o,  #
         # not NQH heads' (granite: 32x fewer ops per program, which is the compile-time
         # law this kernel follows). Decode keeps the static head loop — the builder loops
         # all heads at mq == 1 too.
-        _attn_cont_head(pid, desc_q, desc_o, desc_kc, desc_vc, desc_kd, desc_vd,
+        _attn_cont_head(pid, desc_q, desc_o, desc_kt, desc_vc, desc_ktn, desc_vd,
                         desc_mask, NQH, NKVH, HD, GQA, MQ, SWEPT, CAP, NEW_LEN,
-                        KC_ROW, KC_COL, KD_ROW, KD_COL, SCALE)
+                        KTN_ROWS, KTN_W, KC_ROW, KC_COL, KD_ROW, KD_COL, SCALE)

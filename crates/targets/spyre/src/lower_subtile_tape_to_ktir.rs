@@ -897,8 +897,20 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             } else {
                 node
             };
-            match scratchy_triton_splice::lower_attn(node_ref, ir, cap, active_cap) {
-                Ok(e) => Ops(vec![e]),
+            // ⭐ TWO OPS, NOT ONE — the splice lowers an AttnDecode as the Kᵀ restickify
+            // (the new block's staging tensor into its scratch) and then the attention
+            // that reads the scratch, in dataflow order; `rows_are_requests` rides in
+            // because the restickify's extents come from the SAME `PaddedMq` pad law the
+            // placement sizes the staging tensor at, and that law's answer depends on
+            // whether the bundle's rows are requests.
+            match scratchy_triton_splice::lower_attn(
+                node_ref,
+                ir,
+                cap,
+                active_cap,
+                rows_are_requests,
+            ) {
+                Ok(v) => Ops(v),
                 Err(reason) => Unhandled(reason),
             }
         }
@@ -1552,8 +1564,11 @@ pub fn graph_wiring<F: RopeForm>(
                         // ⛔ THE CACHE'S VIEW, NOT THE MASK'S. The mask states `[1, capacity]` only at
                         // decode; a multi-row continuation binds one `[mq, capacity + mq]` tile (the
                         // prefix's length mask beside the new block's row mask), whose columns are not
-                        // the capacity. The resident K is the program's third parameter in every arm
-                        // (q, out, kc, kd, vc, vd — `attn_operands`'s order).
+                        // the capacity. The V CACHE is the program's fifth parameter in every arm
+                        // (q, out, kt, ktn, vc, vd): positions 2 and 3 state the Kᵀ plane's and the
+                        // scratch's fused `[hd, nkvh·cap]`-shaped views, whose COLUMN counts are
+                        // capacity-multiples rather than the capacity itself — only the V plane's
+                        // `[capacity, kv_width]` states the capacity as a view row count.
                         Some(mid) => {
                             let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(&k)
                                 .map_err(|e| SuperDscError(e.message))?;
@@ -1564,13 +1579,13 @@ pub fn graph_wiring<F: RopeForm>(
                                 )));
                             }
                             let cap = regs
-                                .get(2)
+                                .get(4)
                                 .filter(|r| r.tid != mid.get())
                                 .map(|r| r.v_rows)
                                 .ok_or_else(|| {
                                     SuperDscError(format!(
                                         "the attention binding mask t{mid} states no resident-cache \
-                                         parameter at position 2, so there is no `[capacity, \
+                                         parameter at position 4, so there is no `[capacity, \
                                          kv_width]` view to size the host buffer with"
                                     ))
                                 })?;
@@ -2141,6 +2156,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         let mut declare_syms: i64 = 0;
         for e in ops.iter() {
             let Some(k) = e.ktir.as_ref() else { continue };
+            let op_name = e.op_name.clone();
             crate::ktir_superdsc_door::lower(
                 k,
                 &mut declare_syms,
@@ -2149,8 +2165,8 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
             )
             .map_err(|err| {
                 SuperDscError(format!(
-                    "{}: declaring the shared plan's synthetics: {}",
-                    e.op_name, err.message
+                    "{op_name}: declaring the shared plan's synthetics: {}",
+                    err.message
                 ))
             })?;
         }

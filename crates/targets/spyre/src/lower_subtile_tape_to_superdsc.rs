@@ -190,8 +190,9 @@ pub use ktir_superdsc::reserved_tids::{
     RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID, RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID,
     RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID,
     SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion,
-    identity_class_tid, is_kernel_table_class_tid, kct_resident_tid, oproj_headmajor_tid,
-    reserved_region, rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
+    identity_class_tid, is_kernel_table_class_tid, kct_resident_tid, ktn_scratch_tid,
+    oproj_headmajor_tid, reserved_region, rope_p_class_hds, rope_p_class_tid,
+    scalarmul_scale_tid,
 };
 
 // The rung facts the walk takes as one explicit struct — the `#[forward]` expansion
@@ -1500,6 +1501,35 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     );
                     seg_bytes[seg3i] = align128(off + pbytes);
                 }
+                // ── THE NEW BLOCK'S Kᵀ SCRATCH (`ktn_scratch_tid`) ── the restickify's
+                // output and the attention's `desc_ktn` B operand, the staging tensor's
+                // transposed twin: same two extents, axes swapped (`[device cols,
+                // mq_pad]`, so the same byte footprint), fresh seg3 high-water. A
+                // RESERVED tid keyed on the staging tensor's own id (the `kct_resident_tid`
+                // keying law), so this walk and the splice's binding mint the same tid
+                // with no layer-index handoff. NOTHING stages it — the restickify writes
+                // it on device and the attention reads it — and its pad columns (the
+                // transposed staging pad rows) are never read: the attention's B window
+                // is the EXACT `[hd, new_len]`, so the pads are dead weight the stick law
+                // makes unavoidable, never score inputs.
+                let nid = node.inputs[3].tensor.index() as u32;
+                let ktn_w = DeviceWidth::for_pointwise(ir.tensors[nid as usize].cols).get() as u64;
+                let ktn_rows = mq_pad.rows().row_axis_extent() as u64;
+                let sbytes = ktn_w * ktn_rows * 2;
+                let off = seg_bytes[seg3i];
+                let stid = ktn_scratch_tid(nid);
+                placements.insert(
+                    stid,
+                    TensorPlacement {
+                        tid: stid,
+                        bank: 0,
+                        role: SegRole::Intermediate,
+                        segment: seg3i,
+                        offset: off,
+                        size: sbytes,
+                    },
+                );
+                seg_bytes[seg3i] = align128(off + sbytes);
             }
             if !scale_placed {
                 // Attention MASKS → seg0 (activation, re-bound per step), worker-TILED to [nqh·mq, *]:
@@ -3941,6 +3971,50 @@ pub fn numeric_gate<F: RopeForm>(
             crate::manifest::attn_mask_fill(cap as usize, valid_prefix),
             vec![1, cap as usize],
         ));
+    }
+    // ── The Kᵀ PLANE's prefix content, staged TRANSPOSED ──
+    // The program's resident-prefix score leg reads the plane's fused `[hd, nkvh·cap]`
+    // view (`desc_kt`, bound at `kct_resident_tid`), and the golden's reference
+    // attention reads the same keys in the cache tensor's NATURAL `[cap, nkvh·hd]`
+    // form — so the gate states the one law that makes both the same keys:
+    // `kt[d, kvh·cap + s] = k[s, kvh·hd + d]`, sourced from the SAME `dbg_synth_val`
+    // the natural cache's own probe bind holds. On card the plane is written by its own
+    // writer (the rope append's second store); the emulator has no such writer inside a
+    // gated step, so the gate binds the plane directly — a source like the scalars and
+    // the mask, UNFILTERED by the covering slice (the twin's programs bind the plane
+    // exactly as the full bundle does). The one-pass arm never loads it (SWEPT == 0 —
+    // the injected dead view is metadata, no access tile), so the bind is simply unused
+    // there, the mask's own law.
+    //
+    // ⛔ THE APPEND COLUMN IS NEVER STAGED-READ: the decode mask keeps exactly
+    // `valid_prefix` columns valid, so the plane's append slot (and every column past
+    // the prefix) is dead to this step's score; the transposed synth there is masked
+    // finite garbage, killed by the `-1e38` add exactly as the golden's own key set
+    // demands.
+    let mut kct_staged: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for n in &ir.nodes {
+        let SubOp::AttnDecode { geom, layout: kv, .. } = &n.op else {
+            continue;
+        };
+        let k_id = kv.cache_tensor().index() as u32;
+        if !kct_staged.insert(kct_resident_tid(k_id)) {
+            continue; // one plane per cache tensor, however many nodes read it
+        }
+        let (hd, nkvh) = (geom.hd().get() as usize, geom.nkvh().get() as usize);
+        let t = ir.tensors[k_id as usize];
+        let (cache_rows, kv_width) = (t.rows as usize, t.cols as usize);
+        debug_assert_eq!(kv_width, nkvh * hd, "the cache tensor's cols are the kv width");
+        let plane_cols = nkvh * cache_rows;
+        let mut kt = vec![0.0f32; hd * plane_cols];
+        for kvh in 0..nkvh {
+            for s in 0..cache_rows {
+                for d in 0..hd {
+                    kt[d * plane_cols + kvh * cache_rows + s] =
+                        dbg_synth_val(k_id as usize, s * kv_width + kvh * hd + d);
+                }
+            }
+        }
+        sources.push((u64::from(kct_resident_tid(k_id)), kt, vec![hd, plane_cols]));
     }
     // ── Run the bundle on the emulator ──
     // The golden tids, in the writer's own first-seen order — each with the

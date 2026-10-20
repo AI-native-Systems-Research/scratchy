@@ -658,6 +658,14 @@ pub struct LayerWiring {
     /// this is the per-layer answer, from the same `tensor_shapes` the tape
     /// was lowered at.
     pub kv_width: u32,
+    /// THIS layer's attention-class head dim, off the same class geometry the
+    /// `AttnDecode` was built with (a hybrid arch's layers carry different
+    /// ones). The host stages this layer's prefix K into the Kᵀ PLANE — per
+    /// head `[hd, capacity]`, heads concatenated — and that staging decomposes
+    /// `kv_width` by exactly this dim (`nkvh = kv_width / head_dim`); no other
+    /// fact on this wiring can, and the class head-dim set alone cannot name
+    /// THIS layer's class.
+    pub head_dim: u32,
 }
 
 /// Model geometry, baked.
