@@ -23,7 +23,7 @@
 // Force the linker to keep every compiled arch crate (and thus its
 // `ScratchyArchRegistration` `inventory::submit!`) — otherwise the model crates,
 // referenced only via the inventory registry, get dead-stripped and `try_load`
-// finds an empty registry. (The cuda/metal path does the same in `gpu_worker`,
+// finds an empty registry. (The metal path does the same in `gpu_worker`,
 // which isn't compiled under spyre.)
 extern crate scratchy_models as _;
 
@@ -51,8 +51,8 @@ pub struct SpyreWorker {
     pub(crate) requests: HashMap<String, ReqState>,
     /// ⭐ THE HOST'S PER-REQUEST BLOCK TABLE, IN THE STRUCT THE ENGINE ALREADY DEFINES FOR IT.
     ///
-    /// `InputBatch` (`crates/serving/engine/src/input_batch.rs`) is backend-neutral and is what cuda and
-    /// metal store their block tables in; its `update_blocks` carries the rule a private copy in this
+    /// `InputBatch` (`crates/serving/engine/src/input_batch.rs`) is backend-neutral and is what metal
+    /// stores its block tables in; its `update_blocks` carries the rule a private copy in this
     /// worker got wrong — *"The scheduler ships the FULL table each step, so this REPLACES (not
     /// appends)"*. This path used to keep its own `Vec<usize>` per request (and before that, pages the
     /// worker ALLOCATED ITSELF from a free list, which is what made a prefix-cache hit meaningless).
@@ -60,7 +60,7 @@ pub struct SpyreWorker {
     /// ⛔ ONLY THE BLOCK TABLE, FOR NOW. The rest of `ReqState` — tokens, `n_computed`, the KV row, and
     /// `KvHistory` — is not migrated: the first three duplicate `InputBatch` fields and SHOULD move, and
     /// `KvHistory` is genuinely this backend's (a pool whose batched write appends every row at one slot
-    /// has no counterpart on cuda/metal). Migrating the rest is mechanical and belongs in its own change,
+    /// has no counterpart on metal). Migrating the rest is mechanical and belongs in its own change,
     /// not bundled with a correctness fix.
     pub(crate) input_batch: scratchy_serving_engine::input_batch::InputBatch,
     /// HOW MANY REQUESTS THIS RUN MAY ADMIT AT ONCE — `--max-num-seqs`, as the scheduler was configured.
@@ -85,8 +85,8 @@ pub struct SpyreWorker {
     /// WHAT FRACTION OF THE CARD THIS RUN MAY SPEND — `--gpu-memory-utilization`, as the CLI gave it.
     ///
     /// ⛔ SPYRE IGNORED THIS FLAG ENTIRELY, because its KV budget was a constant and a constant has no
-    /// fraction to take. cuda and metal both size from `total_memory * utilization`, so the flag meant
-    /// something on two backends out of three.
+    /// fraction to take. Metal sizes from `total_memory * utilization`, so the flag meant
+    /// something on one backend and not the other.
     pub(crate) gpu_memory_utilization: f64,
 }
 
@@ -112,7 +112,7 @@ impl SpyreWorker {
     ///
     /// Separate from `new` because `WorkerConfig` is the engine's shared struct and these are scheduler
     /// numbers that only this backend's pool arithmetic consumes — adding them there would put fields on
-    /// cuda's and metal's config that neither reads. The factory calls this immediately after `new`.
+    /// metal's config that it never reads. The factory calls this immediately after `new`.
     ///
     /// ⛔ ONE SETTER FOR BOTH, BECAUSE THE POOL NEEDS BOTH AND NEITHER IS RECOVERABLE FROM THE OTHER.
     /// `PoolDemand` is `depth × width`: with only the width (which is all this used to take) the depth
@@ -154,24 +154,10 @@ impl SpyreWorker {
     }
 }
 
-/// DEFAULT-mode single-graph forward: process `toks` ONE token at a time (the
-/// proven static-SDPA graph is m=1), growing the KV host-side and masking padding
-/// prefix rows via `attn_lenmask`. Each step `p` (absolute position `start+i`):
-///   • bind the embedding `t{embed}` `[1, hidden]` of `toks[i]`;
-///   • bind cos/sin `t{id}` `[1, width]` (per-position RoPE tables tiled across
-///     heads) for every cos/sin source;
-///   • bind each layer's prefix-KV `t{id}` `[cap, kv_dim]` = the host KV cache
-///     rows `0..p` (positions `0..p-1`), zero-padded to `cap`;
-///   • bind `attn_lenmask` `[1,1,cap+1]`: 0 for valid columns `0..p` and the
-///     new-token column `cap`, large-negative for the padding columns `p..cap-1`
-///     (PROVEN on dd2 — without it the padding rows flood the softmax and the
-///     argmax flips, e.g. 1217 vs the golden 7042);
-///   • Predict → logits `[1,vocab]` + grown-KV (each `[cap+1, kv_dim]`, layer
-
 /// Spyre / KTIR backend factory. Registered with `inventory::submit!` so the
 /// backend-neutral `create_worker` (engine's `WorkerFactory` registry) finds it
-/// without naming `SpyreWorker` — the same seam cuda/metal register through. In
-/// a spyre-only build (mutually exclusive with cuda/metal) `"auto"` resolves
+/// without naming `SpyreWorker` — the same seam metal registers through. In
+/// a spyre build (mutually exclusive with metal) `"auto"` resolves
 /// here, so `scr chat` without an explicit `--device` serves on spyre.
 pub struct SpyreWorkerFactory;
 

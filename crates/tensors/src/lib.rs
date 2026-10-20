@@ -6,15 +6,13 @@
 //! The foundational types every backend builds on: [`GpuTensor`] (32-byte
 //! descriptor), [`TensorView`] (lifetime-checked borrow), [`DType`], and
 //! the [`DeviceAllocator`] host→device transfer trait. Pure metadata +
-//! traits — no CUDA, no Metal, no device calls — so it compiles everywhere
-//! and gives the `targets/{cuda,metal}` crates a shared home that cannot
-//! name a backend.
+//! traits — no device calls — so it compiles everywhere and gives the
+//! `targets/{metal,spyre}` crates a shared home that cannot name a backend.
 
 pub mod device_allocator;
 pub mod dtype;
 pub mod lowering_dtype;
 pub mod owned_tensor;
-pub mod precast;
 pub mod raw_mem;
 pub mod tensor;
 pub mod weight_path;
@@ -24,27 +22,24 @@ pub use device_allocator::{DeviceAllocator, PoolMemory};
 pub use dtype::DType;
 pub use lowering_dtype::{MetalDtype, ScaleDtype};
 pub use owned_tensor::OwnedTensor;
-pub use precast::{PrecastEntry, PrecastPipeline};
 pub use raw_mem::RawGpuMem;
 pub use tensor::{GpuTensor, TensorView};
 pub use weight_path::{layer_weight_path_with_root, vision_block_weight_path};
 pub use weight_source::WeightSource;
 
-/// Backend-neutral load-stream handle: a CUDA stream under the `cuda` feature,
-/// otherwise a unit placeholder so backend-agnostic signatures stay cfg-free.
-#[cfg(feature = "cuda")]
-pub type LoadStream = cudarc::driver::sys::CUstream;
-#[cfg(not(feature = "cuda"))]
+/// The stream a weight load queues its host→device copies on. Neither metal
+/// nor spyre has one, so it is `()`; the load signatures keep the parameter so
+/// they stay one shape across backends.
 pub type LoadStream = ();
 
 /// Backend-neutral opaque handle for the ambient forward-args bundle the
 /// `ScratchyWeights::forward*` trait methods take.
 ///
-/// The concrete bundle (`scratchy_target_cuda::ForwardCtx`) names the
+/// The concrete bundle (`scratchy_target_metal::ForwardCtx`) names the
 /// backend-coupled `KvCachePool` / `GdnStatePool` types, so it cannot live in
 /// the cfg-free dispatcher. Threading this opaque, lifetime-carrying newtype
 /// through the trait (the same neutralization [`LoadStream`] applies to the
-/// load stream) keeps the trait method signatures cfg-free of cuda/metal while
+/// load stream) keeps the trait method signatures backend-free while
 /// the per-arch `impl ScratchyWeights` recovers the concrete `&ForwardCtx` via
 /// [`ForwardCtxHandle::as_ref`]. Object-safe (a thin pointer; no associated
 /// types), so `Box<dyn ScratchyWeights>` and its fat-pointer transmute in the
@@ -72,7 +67,7 @@ impl<'a> ForwardCtxHandle<'a> {
     /// # Safety
     /// `T` must be the exact concrete type the handle was built from with
     /// [`Self::new`] (every `impl ScratchyWeights` and its caller agree on
-    /// `scratchy_target_cuda::ForwardCtx`).
+    /// the target's `ForwardCtx`).
     #[inline]
     pub unsafe fn as_ref<T>(self) -> &'a T {
         &*(self.ptr as *const T)
@@ -81,7 +76,7 @@ impl<'a> ForwardCtxHandle<'a> {
 
 /// Backend-neutral opaque handle for the live device the
 /// `ScratchyWeights::forward*` trait methods launch on. The concrete device
-/// (`scratchy_target_cuda::GpuDevice`) wraps cublas/streams/allocator and must
+/// (`scratchy_target_metal::GpuDevice`) wraps the queue/allocator and must
 /// not move into the leaf, so the trait names this newtype instead and the
 /// per-arch `impl ScratchyWeights` recovers `&mut GpuDevice` via
 /// [`ForwardDeviceHandle::as_mut`]. Same object-safety story as
@@ -161,7 +156,7 @@ impl<'a> GpuWeightsHandle<'a> {
 }
 
 /// Backend-neutral opaque handle for the Metal worker's per-forward
-/// `RuntimeBindings` (the Metal analogue of CUDA's `ForwardCtx`: input-id /
+/// `RuntimeBindings` (input-id /
 /// position / KV-cache / GDN buffers). `RuntimeBindings` is a metal-rs struct
 /// in `scratchy-target-metal`, so the cfg-free dispatcher's `MetalChainBody`
 /// type cannot name it directly without re-coupling the compiler to the metal

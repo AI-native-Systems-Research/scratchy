@@ -8,8 +8,7 @@
 //! - [`TcpControlChannel`] (`master_port + 2`): persistent length-prefixed
 //!   frames from rank 0 to every follower.
 //!
-//! `master_port` itself carries the NCCL unique-ID exchange, which needs the
-//! CUDA runtime and lives in `scratchy_target_cuda::tcp_store`.
+//! `master_port` itself is left free for the device runtime's own rendezvous.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -17,8 +16,7 @@ use std::net::{TcpListener, TcpStream};
 use anyhow::{Context, Result};
 use tracing::info;
 
-/// [`allreduce_min`] listens on `master_port + ALLREDUCE_PORT_OFFSET`. The
-/// NCCL-ID exchange owns `master_port` itself.
+/// [`allreduce_min`] listens on `master_port + ALLREDUCE_PORT_OFFSET`.
 pub const ALLREDUCE_PORT_OFFSET: u16 = 1;
 
 /// [`TcpControlChannel`] listens on `master_port + CONTROL_CHANNEL_PORT_OFFSET`.
@@ -140,7 +138,7 @@ fn allreduce_min_worker(value: usize, master_addr: &str, port: u16) -> Result<us
 // ---------------------------------------------------------------------------
 
 /// Persistent TCP control channel for broadcasting scheduler output from rank 0
-/// to all follower nodes. Unlike the one-shot NCCL-ID exchange and
+/// to all follower nodes. Unlike the one-shot
 /// [`allreduce_min`], this maintains persistent connections for the entire
 /// lifetime of the inference server.
 ///
@@ -451,8 +449,7 @@ mod tests {
 
     #[test]
     fn test_allreduce_sequential_calls() {
-        // Two sequential allreduce rounds on different ports (simulating
-        // NCCL ID exchange then memory coordination).
+        // Two sequential allreduce rounds on different ports.
         let port1: u16 = master_port_binding(ALLREDUCE_PORT_OFFSET);
         let port2: u16 = master_port_binding(ALLREDUCE_PORT_OFFSET);
         let handles: Vec<_> = (0..2)

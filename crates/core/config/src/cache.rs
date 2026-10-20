@@ -64,7 +64,6 @@ pub enum PrefixCachingHashAlgo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
     /// Size of a contiguous cache block in number of tokens.
-    /// On CUDA devices, only block sizes up to 32 are supported.
     /// If `None`, will be set by the platform at runtime.
     #[serde(default)]
     pub block_size: Option<usize>,

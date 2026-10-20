@@ -27,7 +27,7 @@
 //! Three crates name these types and none of them may depend on another:
 //!
 //! * `scratchy-subtile`'s SuperDSC lowering BUILDS them — and subtile is the generic scheduling layer
-//!   shared with the cuda/metal targets, so it must not own Spyre artifacts.
+//!   shared with the metal target, so it must not own Spyre artifacts.
 //! * the `#[forward]` macro BAKES them, emitting `inventory::submit!` tokens into each arch crate.
 //! * `scratchy-target-spyre` READS them at load, and re-exports this crate as its `bundle_code` so the
 //!   emitted tokens have one stable path to name.

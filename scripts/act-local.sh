@@ -15,14 +15,14 @@
 # your `~/.rustup` untouched. The sandbox is verified populated after a run;
 # your global default is never rewritten.
 #
-# The linux jobs (`cuda`, `fmt`) run inside Docker containers, so
+# The linux jobs (`workspace`, `fmt`) run inside Docker containers, so
 # they can't touch your host toolchain regardless — only the self-hosted macOS
 # job needed protecting.
 #
 # Usage
 # -----
 #   scripts/act-local.sh                 # full `pull_request` CI (all jobs)
-#   scripts/act-local.sh -j macos-metal  # just the metal job (skip slow emulated CUDA)
+#   scripts/act-local.sh -j macos-metal  # just the metal job (skip the slow emulated Linux jobs)
 #   scripts/act-local.sh push            # a different event
 # Any extra args are forwarded to `act`.
 #

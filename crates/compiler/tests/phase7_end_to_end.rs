@@ -3,13 +3,11 @@
 //! macro actually drives the full pipeline.
 //!
 //! The whole pipeline (parse → classify → shape-infer → CFG → unroll
-//! → solve × workloads → schedule × workloads) runs at compile time.
-//! If any pass fails for any (model × workload) combo, this file
-//! fails to compile.
+//! → tape × workloads) runs at compile time. If any pass fails for any
+//! (model × workload) combo, this file fails to compile.
 //!
-//! The emitted `llama::*` modules carry real values from the
-//! solver + scheduler. We assert on them to prove the pipeline's
-//! output isn't dummy.
+//! The emitted `llama::*` modules carry real values from the pipeline.
+//! We assert on them to prove its output isn't dummy.
 
 use scratchy_forward_compiler_macro::forward;
 
@@ -74,71 +72,3 @@ fn every_llama_config_was_compiled() {
     let _: usize = llama_3_2_1b::NUM_TILES;
     let _: usize = llama_3_2_3b::NUM_TILES;
 }
-
-// `every_workload_point_was_solved_for_llama_3_2_1b` and
-// `solver_produced_finite_positive_cost_across_workloads` used to
-// live here, reading per-bucket `m_<N>::PREDICTED_US` constants
-// emitted by the macro. Both were thin: the first probed path
-// resolution with no value asserted, the second's only real
-// invariant (prefill ≫ decode) is now `solver::tests::
-// prefill_cost_dwarfs_decode_cost`, which calls `solve()` directly
-// instead of routing the f64 through baked compile-time constants
-// that drift every time `target_profiles/*.csv` is regenerated.
-// The per-bucket `m_X[_sk_Y]` modules are no longer emitted.
-
-#[test]
-fn arch_level_weights_enum_and_dispatch_exist() {
-    // Observe the compiler emitted the arch-level `Weights` enum
-    // with one variant per compiled model, and the dispatching
-    // `forward` fn. Under #[cfg(feature = "cuda")] only — these
-    // reference cuda-only types (GpuWeights, CUstream, GpuDevice).
-    #[cfg(feature = "cuda")]
-    {
-        // Type-level observation: an enum variant for the 1B model
-        // exists and wraps that model's `Weights`. If the dispatcher
-        // wasn't emitted this line wouldn't type-check.
-        fn _probe(w: llama_3_2_1b::Weights) -> Weights {
-            Weights::Llama_3_2_1b(w)
-        }
-        let _: fn(llama_3_2_1b::Weights) -> Weights = _probe;
-    }
-}
-
-#[test]
-fn backbone_forward_emitted_for_every_bucket() {
-    // Per-bucket fn surfaces (`forward_m_<N>` / `forward_backbone_m_<N>`)
-    // were replaced by a per-canonical `FORWARD_TABLE` + `find_bucket`
-    // dispatch — fn-pointer probes per bucket no longer apply. The
-    // observable contract is now "the arch-level `forward_backbone`
-    // dispatcher exists with the expected signature, and behind it
-    // the canonical's FORWARD_TABLE has at least one entry per
-    // compiled (m, sk) point."
-    //
-    // The compiled-per-bucket guarantee survives via two checks:
-    //   1. `every_workload_point_was_solved_for_llama_3_2_1b` above
-    //      reads the per-bucket `m_<N>::PREDICTED_US` constant — if
-    //      a bucket failed to compile, the path wouldn't resolve.
-    //   2. The arch dispatcher's `find_bucket` consults a slice
-    //      whose row count equals `sfufs.per_workload.len()`.
-    #[cfg(feature = "cuda")]
-    {
-        type ArchF = unsafe fn(
-            &Weights,
-            &scratchy_forward_compiler::ForwardCtx,
-            &mut scratchy_target_cuda::device::GpuDevice,
-            u64,
-        ) -> scratchy_target_cuda::alloc::OwnedTensor;
-        let _: ArchF = forward_backbone;
-    }
-}
-
-// `scheduler_produces_linear_chain_on_fused_body` used to read
-// `llama_3_2_1b::m_1::{NUM_WAVES, NUM_SUBGRAPHS}` to assert the
-// post-fusion body is a serial chain (waves == subgraphs). The
-// per-bucket stub module that exposed these was dropped along
-// with PREDICTED_US — its assertion is structural (driven by the
-// solver + scheduler topology), so it belongs in
-// `schedule::tests` calling `schedule_workloads()` directly. Not
-// re-added here; if the serial-chain invariant ever regresses,
-// the right place to catch it is the unit test, not via macro-
-// emitted constants in an integration test.

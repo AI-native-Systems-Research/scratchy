@@ -3,9 +3,9 @@
 //!
 //! Holds the layer *type definitions* and their *pure* accessors (the surface
 //! the metal interpreter and `WeightAccessors` match on) so both
-//! `targets/{cuda,metal}` can name them without a circular dependency. CUDA/Metal
-//! runtime methods (kernel-calling `forward`, `GpuWeights`-bound `load`) stay in
-//! the target crates as extension traits — this crate names no backend.
+//! `targets/{metal,spyre}` can name them without a circular dependency. Runtime
+//! methods (kernel-calling `forward`, `GpuWeights`-bound `load`) stay in the
+//! target crates as extension traits — this crate names no backend.
 
 pub mod gdn_state;
 pub mod kv_cache;

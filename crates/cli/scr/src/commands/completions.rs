@@ -714,8 +714,8 @@ mod tests {
     }
 
     /// A binary built without any model scope has no `model names` subcommand
-    /// (it rides the optional `model` dependency edge — this is the shape CI's
-    /// `--workspace --features cuda,scratchy-models/all` produces). The script
+    /// (it rides the optional `model` dependency edge — this is the shape a build
+    /// that enables `scratchy-models/all` directly produces). The script
     /// must then omit model completion outright rather than emit TAB handlers
     /// that shell out to a command that does not exist.
     #[test]

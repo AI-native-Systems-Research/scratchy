@@ -11,28 +11,28 @@
 //! calling crate's lib.rs (Rust module system requirement).
 //!
 //! The load / fingerprint / registry surface names only neutral types
-//! (`LoadStream`, `WeightSource`) so it stays cfg-free of cuda/metal and a
-//! third target (Spyre) registers through this SAME inventory registry.
-//! Device-runtime forward methods (which name `GpuDevice` / `OwnedTensor`
-//! / `ForwardCtx`) are internally `#[cfg(any(cuda, metal))]`-gated.
+//! (`LoadStream`, `WeightSource`) so it stays backend-free and spyre
+//! registers through this SAME inventory registry. Device-runtime forward
+//! methods (which name `GpuDevice` / `OwnedTensor` / `ForwardCtx`) are
+//! internally `metal`-gated.
 
 // Backend-neutral device tensor — the `forward*` trait methods return one.
 // Lives in `scratchy-tensors` (the cfg-free core the compiler already deps),
 // so naming it keeps the trait free of any backend crate.
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "metal")]
 use scratchy_tensors::OwnedTensor;
 
 // Backend-neutral opaque handles for the ambient forward-args bundle
 // (`ForwardCtxHandle`) and the live device (`ForwardDeviceHandle`). The
 // concrete `ForwardCtx` names the backend-coupled KV/GDN pools and
-// `GpuDevice` wraps cublas/streams/allocator, so neither can move into the
+// `GpuDevice` wraps the queue/allocator, so neither can move into the
 // cfg-free dispatcher. The trait names these thin pointer newtypes instead
 // (the same neutralization `LoadStream` applies to the load stream); the
-// per-arch `impl ScratchyWeights` in `targets/{cuda,metal}` recovers the
+// per-arch `impl ScratchyWeights` in `targets/metal` recovers the
 // concrete `&ForwardCtx` / `&mut GpuDevice` from them. Object-safe (no
 // associated types), so `Box<dyn ScratchyWeights>` and its worker-side
 // fat-pointer transmute are unchanged.
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "metal")]
 use scratchy_tensors::{ForwardCtxHandle, ForwardDeviceHandle};
 
 /// One bound weight source: which tensor id it fills, the staged tensor, and
@@ -109,7 +109,7 @@ pub trait ScratchyWeights: Send + Sync {
     /// The loaded variant's `CanonicalParams::KV_CODEC`: how its KV cache is
     /// stored, fixed when it was built. Gated like [`Self::forward`]: spyre
     /// has no `CanonicalParams`, and no KV codec.
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(feature = "metal")]
     fn kv_codec(&self) -> crate::KvCodec;
 
     /// The embedded KTIR bundle for the host Spyre run path, or `None` for
@@ -119,7 +119,7 @@ pub trait ScratchyWeights: Send + Sync {
     /// compiler depend on a target crate); the spyre worker downcasts it back.
     /// The proc-macro emits a per-arch override under `-Fspyre` returning
     /// `Some(&model::KTIR_BUNDLE)` (the macro-embedded const); the default is
-    /// `None` (cuda/metal and arches without a compiled bundle).
+    /// `None` (metal and arches without a compiled bundle).
     fn ktir_bundle(&self) -> Option<&'static (dyn core::any::Any + Send + Sync)> {
         None
     }
@@ -137,7 +137,7 @@ pub trait ScratchyWeights: Send + Sync {
     ///
     /// The proc-macro emits the override per model — it must, because only
     /// generated code can name a generated field. The default is `None`
-    /// (cuda/metal, whose forwards read the fields directly).
+    /// (metal, whose forwards read the fields directly).
     ///
     /// ⛔ THE TENSORS BORROW THE WEIGHT STORE. They are views over buffers the
     /// `GpuWeights` allocator owns, so the caller must keep it alive until the
@@ -252,15 +252,15 @@ pub trait ScratchyWeights: Send + Sync {
 
     /// # Safety
     /// All tensors in `ctx` must be valid GPU memory; `device`
-    /// must be the live CUDA device. Same invariants as each
+    /// must be the live device. Same invariants as each
     /// per-arch `forward`.
     ///
     /// Gated to backends with a device-runtime forward path
-    /// (cuda/metal). A target whose forward runs through a
+    /// (metal). A target whose forward runs through a
     /// different seam (e.g. Spyre's host-orchestrated bundle FIFO)
     /// still registers + fingerprint-loads through this trait;
     /// it just doesn't carry the device-runtime forward methods.
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(feature = "metal")]
     unsafe fn forward(
         &self,
         ctx: ForwardCtxHandle<'_>,
@@ -275,50 +275,13 @@ pub trait ScratchyWeights: Send + Sync {
     /// tensors and `device` outlive the returned `OwnedTensor`
     /// and that kernel launches on `device.compute_stream` have
     /// completed before the output is read on another stream.
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(feature = "metal")]
     unsafe fn forward_backbone(
         &self,
         ctx: ForwardCtxHandle<'_>,
         device: ForwardDeviceHandle<'_>,
         num_tokens: u64,
     ) -> OwnedTensor;
-
-    /// Capture this arch's tape into a piecewise CUDA-graph runner.
-    /// Used at tp>1 where NCCL inside a monolithic graph fails on
-    /// L40S (verified). Runs eager NCCL between captured segments.
-    ///
-    /// Caller MUST have called
-    /// `device.caching.begin_allocate_to_pool()` before invoking
-    /// this fn so captured addresses come from a private pool that
-    /// stays alive for the runner's lifetime.
-    ///
-    /// Default impl panics; the proc-macro emits a per-arch
-    /// override that delegates to the canonical's
-    /// `forward_piecewise_capture` free fn.
-    ///
-    /// The returned runner is the cuda-only `PiecewiseRunner`, which lives in
-    /// `scratchy-target-cuda` (it wraps `CUgraphExec` + the captured private
-    /// pool) and so cannot be named by this cfg-free trait. It is boxed as a
-    /// neutral `Box<dyn Any + Send>`; the cuda worker downcasts it back to the
-    /// concrete `scratchy_target_cuda::piecewise::PiecewiseRunner` (it depends
-    /// on that crate directly). Same neutralization the device/ctx handles use.
-    ///
-    /// # Safety
-    /// Same as [`Self::forward`], plus the private-pool contract
-    /// above.
-    #[cfg(feature = "cuda")]
-    unsafe fn forward_piecewise_capture(
-        &self,
-        ctx: ForwardCtxHandle<'_>,
-        device: ForwardDeviceHandle<'_>,
-        num_tokens: u64,
-    ) -> anyhow::Result<Box<dyn core::any::Any + Send>> {
-        let _ = (ctx, device, num_tokens);
-        unimplemented!(
-            "forward_piecewise_capture: per-arch override not emitted \
-             — rebuild scratchy-models with the latest macro"
-        )
-    }
 
     /// Per-worker arena peak in bytes (metal only).
     ///
@@ -330,9 +293,8 @@ pub trait ScratchyWeights: Send + Sync {
     /// `determine_available_memory`, replacing the 512 MiB
     /// placeholder from Step 3.B.
     ///
-    /// Default returns 512 MiB so cuda-backed arches that never
-    /// override this still surface a sane placeholder if the
-    /// trait method is reached on a non-metal build path.
+    /// Default returns 512 MiB so arches that never override this
+    /// still surface a sane placeholder.
     #[cfg(feature = "metal")]
     fn metal_arena_peak_bytes(&self) -> u64 {
         512 * 1024 * 1024
@@ -603,9 +565,8 @@ pub struct HfFingerprint<'a> {
     ///
     /// `None` is permissive (the variant's baked value stays authoritative),
     /// matching [`Self::rope_scaling_hash`]. A caller that cannot trust its
-    /// source's value passes `None` rather than a guess: the cuda worker does
-    /// exactly that for GGUF, whose metadata routinely disagrees with the
-    /// canonical `config.json`. Note this is the checkpoint's TOP-LEVEL
+    /// source's value passes `None` rather than a guess (GGUF metadata, for
+    /// one, routinely disagrees with the canonical `config.json`). Note this is the checkpoint's TOP-LEVEL
     /// `rope_theta` only — arches that carry per-attention-class thetas nested
     /// under `rope_parameters` (gemma3/gemma4/qwen3.5) declare no top-level value,
     /// so they pass `None` here and are unaffected either way.

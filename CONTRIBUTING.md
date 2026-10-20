@@ -139,8 +139,8 @@ sent back regardless of how well it works:
   pass, consumed by both spyre and metal. Target-ABI facts are const tables the
   shared passes take as *input* — never logic, never scattered match arms.
 - **Per-target surface = opcode lowering only.**
-- **No instruction selection** for spyre or metal. ISel is cuda-gated and stays
-  that way.
+- **No instruction selection** for spyre or metal — the tape comes straight
+  from the fused forward.
 - **Metal 4 only.** Classic MTL3 command buffers are banned — enforced by
   `crates/targets/metal/build.rs` (`guard_no_classic_mtl3`) and by
   `disallowed-methods` in `clippy.toml`.
@@ -148,7 +148,7 @@ sent back regardless of how well it works:
 
 #### Build — scope to one model
 
-Pick exactly one backend (`metal`, `cuda`, `spyre` — mutually exclusive) and
+Pick exactly one backend (`metal`, `spyre` — mutually exclusive) and
 name at least one model. Naming zero models is a **build-time panic**, not a
 silent empty binary.
 
@@ -202,9 +202,9 @@ cargo clippy -p scratchy-models --features metal,all -- -D warnings
 # is the only lint coverage the build-time HF query gets). Needs network.
 cargo clippy -p scratchy-models --features metal,smollm2-135m,hf-completions -- -D warnings
 
-# Linux / cuda job
-SCRATCHY_GPU=h100 CUDA_COMPUTE_CAP=90 SCRATCHY_SKIP_CUDA_KERNELS=1 \
-cargo clippy --workspace --features cuda,scratchy-models/all \
+# Linux / workspace job
+SCRATCHY_SKIP_SENDNN_CXX=1 \
+cargo clippy --workspace --features spyre,scratchy-models/granite-3.1-8b-instruct \
   --exclude scratchy-target-metal \
   --exclude scratchy-target-metal-compiler -- -D warnings
 
@@ -217,12 +217,12 @@ cargo test -p scratchy-e2e -p scratchy-models \
 Both `all`-scoped clippy runs are the full-scope case: every config, every arch.
 Expect them to be slow and RAM-heavy — that's CI-scale cost, not a regression.
 
-Note the two `--exclude`s on the cuda gate are both required: `scratchy-target-metal`
+Note the two `--exclude`s on the workspace gate are both required: `scratchy-target-metal`
 and `scratchy-target-metal-compiler` each depend unconditionally on Apple-only
 `objc2`, and `--workspace` builds every member as a root regardless of
 `--features`, so excluding one still drags `objc2` onto Linux.
 
-The x86_64 cuda gate reproduces in a container (see [`CLAUDE.md`](CLAUDE.md)
+The x86_64 workspace gate reproduces in a container (see [`CLAUDE.md`](CLAUDE.md)
 for the full `docker run`); Apple Silicon runs it amd64-emulated — slow but
 faithful. The macOS metal job runs locally via `scripts/act-local.sh`.
 

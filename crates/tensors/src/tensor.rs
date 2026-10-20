@@ -31,7 +31,7 @@ pub struct GpuTensor {
 }
 
 // GpuTensor is Send/Sync — the raw pointer is a GPU device pointer,
-// and GPU memory is accessible from any host thread via CUDA driver API.
+// and device memory is accessible from any host thread.
 unsafe impl Send for GpuTensor {}
 unsafe impl Sync for GpuTensor {}
 

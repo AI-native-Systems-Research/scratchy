@@ -11,14 +11,12 @@ default = []
 # core-common. Compiled into a plain engine build for none of it.
 forward-telemetry = ["scratchy-target-metal?/forward-telemetry", "scratchy-core-common/forward-telemetry"]
 sampler-telemetry = ["scratchy-target-metal?/sampler-telemetry", "scratchy-core-common/sampler-telemetry"]
-cuda = ["cudarc", "dep:scratchy-forward-compiler", "dep:scratchy-models", "dep:scratchy-target-cuda", "dep:scratchy-builder-cuda", "scratchy-builder-cuda/cuda", "scratchy-forward-compiler/cuda", "scratchy-models/cuda", "scratchy-target-cuda/cuda"]
 metal = ["dep:scratchy-forward-compiler", "dep:scratchy-models", "dep:scratchy-target-metal", "dep:objc2", "dep:objc2-metal", "scratchy-forward-compiler/metal", "scratchy-models/metal"]
 # Multimodal capability, forwarded from `scr`'s `multimodal` feature via
 # scratchy-serving-api. No-op unless a backend that has one is also active.
 vision = ["scratchy-target-metal?/vision"]
-nccl = ["cuda", "scratchy-forward-compiler/nccl", "scratchy-target-cuda/nccl", "scratchy-models/nccl"]
 # IBM Spyre / KTIR: a host-only worker that runs the macro-emitted KTIR bundle
-# on the ktir-emulator (no GPU toolchain). NEVER touches target-cuda: the
+# on the ktir-emulator (no GPU toolchain). The
 # neutral `GpuWeights` comes from scratchy-layers, the registry/`try_load` +
 # `ScratchyWeights` from the compiler, `DType` from scratchy-tensors, and the host
 # `SpyreAllocator` + bundle runner from target-spyre.
@@ -31,13 +29,12 @@ spyre-hw = ["spyre", "dep:scratchy-builder-spyre", "scratchy-builder-spyre/spyre
 # differs is the device underneath. Forwards into the models crate so the macro's bake-time
 # numeric gate runs on every emu build (see the macro crate's `spyre-emu`).
 spyre-emu = ["spyre", "scratchy-target-spyre/spyre-emu", "scratchy-models/spyre-emu"]
-guided-decoding = ["scratchy-serving-engine/guided-decoding", "scratchy-target-cuda?/guided-decoding"]
+guided-decoding = ["scratchy-serving-engine/guided-decoding"]
 
 [dependencies]
 # The weight-load path fans the bf16→f16 narrowing across cores; pulled in by `spyre` (see the
-# feature above), absent from the host/cuda/metal builds.
+# feature above), absent from the host/metal builds.
 rayon = { workspace = true, optional = true }
-scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
 scratchy-target-spyre = { path = "../../targets/spyre", optional = true }
 scratchy-core-common = { workspace = true }
 scratchy-core-config = { workspace = true }
@@ -50,16 +47,11 @@ scratchy-models = { path = "../../models/arch", optional = true, default-feature
 # Weight staging shares the emitter's TYPE-SAFE `DeviceWidth` (padding/alignment lock-down) so the
 # staged weight width == the emitted device width by construction. Optional; enabled by `spyre`.
 scratchy-subtile = { path = "../../compiler/subtile", optional = true, features = ["spyre"] }
-# Spyre rides the neutral seam directly (never target-cuda): GpuWeights from
+# Spyre rides the neutral seam directly: GpuWeights from
 # scratchy-layers, DType from scratchy-tensors.
 scratchy-layers = { path = "../../layers", optional = true }
 scratchy-tensors = { path = "../../tensors", optional = true }
-# Build-time + link anchor only: depending on the kernel builder triggers .cu
-# compilation (the static `.a` cache `scratchy-target-cuda/build.rs` links
-# against), and `gpu_worker.rs`'s `extern crate scratchy_builder_cuda as _`
-# keeps it in the link graph. No code is imported from it.
-scratchy-builder-cuda = { path = "../../targets/cuda/builder", optional = true }
-# Build-time bake on the CARD (peer of scratchy-builder-cuda): pulled in by the worker's `spyre-hw`
+# Build-time bake on the CARD: pulled in by the worker's `spyre-hw`
 # feature (see the feature list above), so its build.rs runs at `cargo build` rather than at load.
 scratchy-builder-spyre = { path = "../../targets/spyre/builder", optional = true }
 scratchy-target-metal = { path = "../../targets/metal", optional = true }
@@ -71,7 +63,6 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-cudarc = { workspace = true, optional = true }
 rand = { workspace = true }
 inventory = { workspace = true }
 

@@ -192,7 +192,7 @@ pub async fn run_model_names(args: crate::args::NamesArgs) -> anyhow::Result<()>
 ///
 /// NOT offered for `-m`: a stem is a config file name, not a model argument, and
 /// suggesting one there would send the user down a path that cannot resolve.
-#[cfg(all(feature = "model", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "model", feature = "metal"))]
 fn compiled_variant_stems() -> Vec<String> {
     scratchy_forward_compiler::inventory::iter::<
         scratchy_forward_compiler::BackboneDumpRegistration,
@@ -205,7 +205,7 @@ fn compiled_variant_stems() -> Vec<String> {
 
 /// No backend compiled in means no backbones were emitted, so there are no
 /// stems to report (`scr model info` does not exist in such a build either).
-#[cfg(all(feature = "model", not(any(feature = "cuda", feature = "metal"))))]
+#[cfg(all(feature = "model", not(feature = "metal")))]
 fn compiled_variant_stems() -> Vec<String> {
     Vec::new()
 }

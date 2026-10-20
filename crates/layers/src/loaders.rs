@@ -4,13 +4,12 @@
 //! Each folds the per-accessor `(0..N).map(|layer| Type::load(gw, &path, …))`
 //! loop the codegen used to inline into a single fn call. Only the loaders whose
 //! every per-item load is a **neutral** free fn live here (generic over
-//! `A: DeviceAllocator`); both `targets/{cuda,metal}` re-export them at their
+//! `A: DeviceAllocator`); both `targets/{metal,spyre}` re-export them at their
 //! crate root so the forward-compiler macro's emitted `crate::__gpu::load_layered_*`
 //! resolves under either backend.
 //!
 //! Genuinely backend-divergent loaders (the RmsNorm keep-dtype split, the
-//! direct-write `load_dense_concat_packed`, cuda's stream/sharded/quant
-//! variants, metal's MLX-affine variants) stay in the target crates.
+//! direct-write `load_dense_concat_packed`, metal's MLX-affine variants) stay in the target crates.
 
 use anyhow::Result;
 use scratchy_tensors::DeviceAllocator;

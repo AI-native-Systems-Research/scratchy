@@ -46,7 +46,7 @@ pub struct SourceManifest {
     families: Vec<WeightSlot>,
 }
 
-/// A weight kind metal binds no bundle of (the cuda-only quantized linears and MoEs).
+/// A weight kind metal binds no bundle of (quantized linears and MoEs metal has no kernels for).
 #[derive(Debug)]
 pub struct UnboundKind {
     pub source: String,

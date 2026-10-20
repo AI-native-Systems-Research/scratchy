@@ -7,7 +7,7 @@ next attempt starts from what is measured rather than from what sounds right.
 
 | was | now |
 |---|---|
-| `ReqState::host_blocks` / worker-side free list | `InputBatch::block_tables` (the store cuda + metal use) |
+| `ReqState::host_blocks` / worker-side free list | `InputBatch::block_tables` (the store metal uses) |
 | `ReqState::tokens`, `ReqState::prompt_len` | `InputBatch::prompt` + `generated`; `prompt_len()` is DERIVED |
 | `ReqState::n_computed` | `InputBatch::tokens_in_pool` (+ `set_tokens_in_pool`) |
 | `SessionKv::kv_rows` (the pool row, in the DEVICE layer) | deleted — it had no readers (`5e319159`) |
@@ -99,11 +99,11 @@ harnesses and says `no harnesses matched`, which reads like a typo.
    exists and needs plumbing to `SpyreWorker`, the same way `set_admitted` plumbs `max_num_seqs`.
 2. ✅ **DONE.** **Refuse at load** if the memory budget cannot hold that, naming both numbers — do not serve 4096 tokens
    when 131072 was asked for. (See `capping-is-not-validating`.)
-3. ⬅ **NEXT, and it is a scheduler change touching cuda/metal — its own commit, its own test round on both
+3. ⬅ **NEXT, and it is a scheduler change touching metal — its own commit, its own test round on both
    models.** The scheduler can allocate every request out to the step's reach without exhausting the pool: it
    already knows every prompt length, so it takes `max(reported reach, max prompt over the requests it is about
    to schedule)` before allocating any of them. This is a change to the scheduling loop, which allocates for
-   every backend — cuda cannot be compiled on the dev laptop (no `nvcc`), so it needs care, not avoidance.
+   every backend, so it needs care, not avoidance.
 4. **Verify** `hole_pages_used()` is 0 across every axis of `scripts/spyre-batch-gate.sh`.
 5. **Delete** `PoolPartition`'s reserve, `KvRow`, `AffineRows`, `free_row`, the "decode one at a time" fallback,
    and reduce `map_row` to the identity. `KvHistory` collapses to a length once slot == token.

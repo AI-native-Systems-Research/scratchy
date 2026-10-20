@@ -1845,7 +1845,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         // [`KvExtent`] rather than being spelled here, because "spelled here" is how the second of the
         // three sites that need them ends up sizing by tokens while the first sizes by slots.
         //
-        // `kv_extent` is `None` for every backend whose KV is token-addressed (cuda/metal), and both
+        // `kv_extent` is `None` for every backend whose KV is token-addressed (metal), and both
         // lines are then exactly the arithmetic they always were.
         let block = scratchy_core_common::KvBlockTokens::new(self.block_size)
             .expect("a KV block holds at least one token");
@@ -1897,7 +1897,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             // batched step appends every row at a shared slot — there its very first write lands at the
             // batch's slot, which can be far past its own tokens, and the page for it was never allocated.
             // The worker has been covering that page from a reserve of its own, which is the last reason a
-            // per-request KV row exists down there. `kv_pool_reach` is `None` on cuda/metal, so this is the
+            // per-request KV row exists down there. `kv_pool_reach` is `None` on metal, so this is the
             // same arithmetic it always was for them.
             // ⛔⛔⛔ ONE ARM, BECAUSE THE NESTED MATCH HAD A HOLE IN IT AND THE HOLE WAS THE BUG.
             //
@@ -1910,7 +1910,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             // The pool reach and the step reach are the same KIND of fact (how deep the shared write slot
             // goes), so they belong in one `max`, and the absent one is `NONE` rather than a separate branch
             // that forgets the other. `reach` is `NONE` on every token-addressed backend, so this is the same
-            // arithmetic cuda/metal always had.
+            // arithmetic metal always had.
             None => scratchy_core_common::KvSlotSpan::NONE.blocks_this_step(
                 block,
                 self.kv_pool_reach

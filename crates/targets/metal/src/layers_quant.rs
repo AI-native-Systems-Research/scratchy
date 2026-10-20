@@ -3,11 +3,11 @@
 //!
 //! The payload TYPES (`AffineQuantLinear` / `Nvfp4Linear` /
 //! `AffineQuantEmbedding`) + their pure accessors live in the
-//! `scratchy-quantizations` crate (so `scratchy_target_cuda::layers::LinearLayer`
+//! `scratchy-quantizations` crate (so `scratchy_layers::layers::LinearLayer`
 //! can hold them behind `AffineQuant` / `Nvfp4` enum variants). Their `load()`
 //! constructors stay here as metal-local extension traits — they `load()`
 //! against the neutral [`WeightSource`] seam so they need not name
-//! `GpuWeights` (which lives in targets/cuda), letting them sit below it. The
+//! `GpuWeights`. The
 //! `e4m3_to_f32` decode (used by the NVFP4 fold) is a free fn below.
 
 use anyhow::Result;
@@ -608,12 +608,11 @@ impl MetalAffineEmbedOps for AffineQuantEmbedding {
 /// `scratchy-layers`; each wraps the corresponding metal payload loader above
 /// (`AffineQuantLinear::load` / `Nvfp4Linear::load{,_concat}`), which already
 /// `load()` against the neutral [`WeightSource`] seam — so these need not name
-/// `GpuWeights` (which lives in targets/cuda, above this crate).
+/// `GpuWeights`.
 ///
-/// Re-exported from `scratchy_target_cuda::layers` so the macro-emitted
+/// Re-exported so the macro-emitted `crate::__gpu::…`
 /// `LinearLayer::load_affine_quant(...)` / `load_nvfp4_quant(...)` path-syntax
-/// calls (in model crates, which depend on targets/cuda but not on
-/// targets/metal directly) resolve.
+/// calls resolve.
 pub trait MetalLinearLayerOps {
     fn load_affine_quant(
         weights: &mut GpuWeights,
@@ -776,9 +775,8 @@ impl MetalLinearLayerOps for LinearLayer {
 
 /// Metal-only dequant-at-load constructor on the neutral [`Embedding`] type.
 /// Defined + impl'd here (orphan rule) since `Embedding` lives in
-/// `scratchy-layers`. Re-exported from `scratchy_target_cuda::layers` so any
-/// macro-emitted / compiler `Embedding::load_affine_dequant(...)` path-syntax
-/// call resolves (model crates depend on targets/cuda, not targets/metal).
+/// `scratchy-layers`. Re-exported so any macro-emitted / compiler
+/// `Embedding::load_affine_dequant(...)` path-syntax call resolves.
 pub trait MetalEmbeddingOps {
     fn load_affine_dequant<W: WeightSource + ?Sized>(
         weights: &mut W,

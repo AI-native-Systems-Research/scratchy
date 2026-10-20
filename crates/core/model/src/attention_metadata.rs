@@ -101,55 +101,6 @@ impl AttentionMetadata {
             .map(|(&start, &qlen)| (start + qlen - 1) as u32)
             .collect()
     }
-
-    /// Create metadata for a padded all-decode batch (CUDA graph capture/replay).
-    ///
-    /// All requests are decode (q_len=1). Padded slots (`actual_bs..padded_bs`)
-    /// use dummy `seq_lens=1`, a single dummy block ID (block 0), and
-    /// `tokens_before=0`.
-    pub fn padded_decode(
-        padded_bs: usize,
-        actual_bs: usize,
-        seq_lens: &[usize],
-        block_ids: &[Vec<usize>],
-        tokens_before: &[usize],
-    ) -> Self {
-        debug_assert!(actual_bs <= padded_bs);
-        debug_assert_eq!(seq_lens.len(), actual_bs);
-        debug_assert_eq!(block_ids.len(), actual_bs);
-        debug_assert_eq!(tokens_before.len(), actual_bs);
-
-        let mut full_seq_lens = seq_lens.to_vec();
-        let mut full_block_ids = block_ids.to_vec();
-        let mut full_tokens_before = tokens_before.to_vec();
-        let mut full_is_prefill = vec![false; actual_bs];
-        let mut full_req_ids: Vec<String> =
-            (0..actual_bs).map(|i| format!("__graph_{i}")).collect();
-
-        // Pad dummy slots.
-        for _ in actual_bs..padded_bs {
-            full_seq_lens.push(1);
-            full_block_ids.push(vec![0]); // dummy block 0
-            full_tokens_before.push(0);
-            full_is_prefill.push(false);
-            full_req_ids.push("__pad__".to_string());
-        }
-
-        let query_start_loc: Vec<usize> = (0..=padded_bs).collect();
-        let q_lens = vec![1; padded_bs];
-
-        Self::new(
-            padded_bs,
-            padded_bs, // total_tokens = padded_bs (all decode, 1 token each)
-            query_start_loc,
-            q_lens,
-            full_seq_lens,
-            full_block_ids,
-            full_tokens_before,
-            full_is_prefill,
-            full_req_ids,
-        )
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -199,41 +150,6 @@ mod tests {
             vec!["a".into(), "b".into()],
         );
         assert!(all_decode.is_all_decode());
-    }
-
-    #[test]
-    fn test_padded_decode() {
-        let meta = AttentionMetadata::padded_decode(
-            8,
-            3,
-            &[10, 20, 5],
-            &[vec![0, 1], vec![2, 3, 4], vec![5]],
-            &[9, 19, 4],
-        );
-        assert_eq!(meta.num_reqs, 8);
-        assert_eq!(meta.total_tokens, 8);
-        assert!(meta.is_all_decode());
-        assert_eq!(meta.q_lens, vec![1; 8]);
-        assert_eq!(meta.query_start_loc, vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
-        // Real requests.
-        assert_eq!(meta.seq_lens[0], 10);
-        assert_eq!(meta.seq_lens[1], 20);
-        assert_eq!(meta.seq_lens[2], 5);
-        // Padded slots.
-        for i in 3..8 {
-            assert_eq!(meta.seq_lens[i], 1);
-            assert_eq!(meta.block_ids[i], vec![0]);
-            assert_eq!(meta.tokens_before[i], 0);
-            assert_eq!(meta.req_ids[i], "__pad__");
-        }
-    }
-
-    #[test]
-    fn test_padded_decode_exact_size() {
-        // actual_bs == padded_bs: no padding needed.
-        let meta = AttentionMetadata::padded_decode(2, 2, &[10, 20], &[vec![0], vec![1]], &[9, 19]);
-        assert_eq!(meta.num_reqs, 2);
-        assert!(meta.is_all_decode());
     }
 
     #[test]

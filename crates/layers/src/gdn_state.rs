@@ -11,8 +11,8 @@
 //!   ssm_state  : [num_slots, num_v_heads, head_v_dim, head_k_dim] (recurrent delta-rule state)
 //! ```
 //!
-//! Both buffers are **f32** (the surviving `gdn_*` CUDA kernels operate in f32,
-//! and the model's `mamba_ssm_dtype` is `float32`). The slot a sequence owns is
+//! Both buffers are **f32** (the `gdn_*` kernels operate in f32, and the
+//! model's `mamba_ssm_dtype` is `float32`). The slot a sequence owns is
 //! decided host-side by the forward compiler's `GdnSlotAllocator`;
 //! the per-step `state_indices` tensor (one slot id per batched sequence) is
 //! built by the worker and consumed by the kernels.
@@ -24,8 +24,8 @@
 //! takes the model's global layer index directly) while not wasting the large
 //! `ssm_state` allocation on full-attention layers.
 //!
-//! Like `KvCachePool` the buffer-allocation is a caller-supplied closure (cuda
-//! wraps `driver::mem_alloc`, metal wraps `device.new_buffer`); the layout /
+//! Like `KvCachePool` the buffer-allocation is a caller-supplied closure (metal
+//! wraps `device.new_buffer`); the layout /
 //! sizing / accessor logic is backend-neutral.
 //!
 //! **Checkpoints (speculative decoding).** A verify step runs a sequence's last token and its

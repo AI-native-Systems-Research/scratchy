@@ -35,7 +35,6 @@ impl EmbeddingSidecar {
             .arg(port.to_string())
             .arg("--runner")
             .arg("pooling")
-            .arg("--enforce-eager")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
 

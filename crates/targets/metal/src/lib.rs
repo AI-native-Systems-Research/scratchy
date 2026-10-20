@@ -323,10 +323,8 @@ pub use owned_metal::owned_from_metal_buffer;
 pub use stream::MetalStreamError;
 
 // ── `__gpu` surface scaffolding ──────────────────────────────────────────
-// Backend-neutral re-exports + aliases under the historic
-// `scratchy_target_cuda::…` paths so the forward-compiler macro's emitted
-// `crate::__gpu::…` references resolve against this crate once the metal
-// `__gpu` alias flips here. The neutral tensor core + layer types + RoPE
+// Backend-neutral re-exports + aliases so the forward-compiler macro's emitted
+// `crate::__gpu::…` references resolve against this crate. The neutral tensor core + layer types + RoPE
 // cache live in scratchy-tensors / scratchy-layers; only the metal-specific
 // upload/runtime surface is owned here.
 pub use scratchy_tensors::{DType, DeviceAllocator, GpuTensor, OwnedTensor, RawGpuMem, TensorView};
@@ -340,12 +338,10 @@ pub use scratchy_layers::rotary::{
     Llama3RopeScaling, LlamaConfig, LongRopeScaling, RotaryCache, YarnRopeScaling,
 };
 
-/// Backend-neutral model weights, allocator defaulted to [`MetalAllocator`].
-/// Mirrors `scratchy_target_cuda::weights` so the macro's
-/// `crate::__gpu::weights::GpuWeights` resolves under metal.
+/// Backend-neutral model weights, allocator defaulted to [`MetalAllocator`],
+/// so the macro's `crate::__gpu::weights::GpuWeights` resolves under metal.
 pub mod weights {
-    /// `GpuWeights<A = MetalAllocator>` — the historic
-    /// `scratchy_target_cuda::weights::GpuWeights` path under metal.
+    /// `GpuWeights<A = MetalAllocator>`.
     pub type GpuWeights<A = crate::MetalAllocator> = scratchy_layers::weights::GpuWeights<A>;
     pub use crate::weights_metal::MetalWeightsExt;
     pub use scratchy_layers::weights::{TensorRefs, UploadSrc};
