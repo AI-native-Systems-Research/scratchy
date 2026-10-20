@@ -468,6 +468,7 @@ fn pointwise_opspec_from_tile_split(
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -638,6 +639,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 

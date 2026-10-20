@@ -7386,46 +7386,42 @@ fn scalarmul_scaled(
 /// kind. A producer whose program states a bare `linalg.reduce` — every Triton `tl.sum(x, 1)` or
 /// `tl.max(x, 1)` that is not part of a recognised rmsnorm — had no entry point at all.
 ///
-/// # ⛔⛔⛔ A WIDE MULTI-ROW MAX IS REFUSED — THE SHARPEST SILENT WRONG ANSWER IN THIS FILE
+/// # ⭐ THE WIDE MULTI-ROW MAX LOWERS — THE REFUSAL THAT USED TO LIVE HERE MISREAD ITS ONE DIAGNOSTIC
 ///
-/// Inside `rows > 1` **AND** a reduced extent past ONE STICK, an on-card reduce-MAX mis-combines the
-/// per-stick partial maxima and hands back the SEED. That LOWERS, BAKES, produces a well-formed
-/// descriptor and exits 0 under `dxp_standalone`, which executes no arithmetic — so nothing in the
-/// compile path can see it, and a softmax built on it computes `exp(x - 0)` for every row. It is
-/// refused BY NAME instead.
+/// This door used to REFUSE `Max` at `rows > 1 && cols > 64` by name, on the reading that the
+/// on-card reduce-MAX "mis-combines the per-stick partial maxima and hands back the seed" inside
+/// exactly that cell. The template's own DDL refutes both halves of that sentence:
 ///
-/// ## ⭐⭐⭐ IT IS THE CONJUNCTION, AND EACH SINGLE-AXIS READING HAS A SHIPPING COUNTER-EXAMPLE
+/// * `summeanmaxexx2.ddl` seeds the identity ITSELF — `negInf`/`posInf`/`zero`/`one`
+///   `ddl.define_constant`s (`:69-72`) that the PE accumulator LRFs are initialized from (negInf
+///   for max at `:209`/`:235`, zero for sum), with the accumulator's HBM content read only on
+///   second-and-later reduce-dim chunk trips (`:159-196`, `:583-585`). The seed is not the
+///   accumulator's launch content, and a seed-win would read −65504, not 0.
+/// * The one diagnostic that ever measured the defect — `mxp = 0` over `[nqh, cap]`, 2026-07-28 —
+///   is the ZEROS-READ signature: `max(−65504, 0, x) = 0` for non-positive `x`, i.e. the reduced
+///   width walked its stick PADDING and the padding read a fresh buffer's zeros. And it predates
+///   the row-mixing fixes — `wire.rs`'s `group_stride` law records the same-era signature for a
+///   SUM ("summed a single stick across 32 consecutive rows (+ zero padding) instead of one
+///   row's 32 sticks → Σx²≈0 → amax≈0"), and that fix landed 2026-09-16 (`d878aceae`), with the
+///   `head_major` fix in the same window. The measured cell carried OUR addressing defect and
+///   OUR unmasked padding together; it could not have attributed itself to the reduce.
 ///
-/// Exactly ONE diagnostic ever measured this defect — `mxp = 0` over `[nqh, cap]` — and it moved the row
-/// count AND the width off their safe values TOGETHER, so on its own it cannot attribute the failure to
-/// either. Both single-axis readings were written down in this tree, and each is refuted by a different
-/// piece of hardware-proven emission:
+/// Both causes are closed in the emission: the addressing by the `group_stride`/`head_major`
+/// fixes — sum at `[rows>1, cols>64]` has been card-proven since (the rmsnorm prefill parity
+/// runs), and the template's sum and max paths differ only in compute type and internal seed —
+/// and the pad lanes by the SAMV coordinate masking
+/// ([`crate::superdsc_opspec::SamvCoordinateMask`], the vendor's own `_get_coordinate_mask`).
+/// torch-spyre lowers the wide multi-row max as ONE descriptor in ordinary production (SDPA's
+/// `torch.amax(scores, dim=-1)` over 512-wide = 8-stick tiles, pinned against CPU in their own
+/// test suite), so the shape is template-supported. The door lowers it.
 ///
-/// * **"`rows > 1` is the defect"** — refuted by [`attn.rs`](crate::ir::bridge::tiled_op_sdsc_op::attn),
-///   which records a per-row split TRIED AND REVERTED (2026-07-28) after direct comparison against the
-///   old proven flash-decode's `attn_bmax{b}_o{t}`: that code reduces MAX at `rows = nqh` (> 1) with
-///   `width` one stick, on real hardware, at 31 tok/s. Its `assemble_attn_block` `width` parameter states
-///   the safe regime and names the two other 64s it must not be confused with — "one stick for every live
-///   caller; `mq_pad` and the head dim are the other 64s it must not silently become".
-/// * **"`cols` past one stick is the defect"** — refuted by [`ktir_matmul_fp8`](crate::emit::ktir_matmul_fp8)'s
-///   `fq_amax_op`, the fp8 activation-quantize amax on EVERY fp8 matmul of every layer: it reduces MAX
-///   over the FULL hidden width `k` (2048/4096 — many sticks). At decode `m == 1` and that is the same
-///   rank-3 flat emission this door produces, proven on card at 41 tok/s.
+/// ⛔ THE ARBITER IS THE CARD, NOT THE COMPILE PATH: `dxp_standalone` executes no arithmetic, so
+/// no gate here can see numerics. The wide multi-row max is validated by the card gate — `[4,
+/// W>64]` max AND sum against the host reference, the `attn_bmax`-form and `fq_amax`-form
+/// no-regression runs, and the GQA-shared paged-attention twin flipping green.
 ///
-/// What the broken cell has that neither counter-example has is BOTH at once, and the conjunction is
-/// already named twice in the tree: `reduce.rs`'s `stickmajor` branch fires at exactly
-/// `rows > 1 && cols > 64`, and `ktir_matmul_fp8.rs` calls that regime "scrambled at rows>1 AND
-/// cols>64". Two readers each took half of it.
-///
-/// ## THE REMEDY IS TO TILE THE REDUCTION, NOT TO SPLIT ROWS
-///
-/// A genuinely wide max is tiled to one stick and combined — which is what `attention_flash.py` and
-/// `swiglu_mlp.py` pin `BLOCK_N = 64` for, as a CORRECTNESS constraint. It is NOT split into one reduce
-/// per row: that is the experiment `attn.rs` reverted, measured on hardware as zero behavioural change,
-/// and it costs `rows` descriptors per softmax for nothing.
-///
-/// `Sum` combines correctly multi-row at any width, and `Max` is correct at `rows == 1` (any width) and
-/// at one stick (any row count) — the decoder's `[64, 64]` softmax is the latter, so it lowers.
+/// `attention_flash.py` and `swiglu_mlp.py` still pin `BLOCK_N = 64` — that is those kernels'
+/// own work-division choice (and the fixtures' correctness constraint), not a door law.
 pub fn reduce(
     name: &str,
     kind: crate::ktir_node::ReduceKind,
@@ -7433,7 +7429,6 @@ pub fn reduce(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    use crate::ktir_node::ReduceKind;
     let (ins, out) = split_out(name, r, layout, 1)?;
     let data = ins[0];
     // The REDUCED extent is the data's column span and the result is one column per row. Read the
@@ -7446,40 +7441,10 @@ pub fn reduce(
             data.tid
         ));
     }
-    // ⛔⛔⛔ THE MEASURED DEVICE DEFECT, FIRST, so no other complaint can mask it.
-    //
-    // THE STICK WIDTH COMES FROM THE DATA FORMAT, NOT FROM A LITERAL 64. This door emits through
-    // `assemble_reduce_seeded` → `reduce_opspec`, the fp16 wrapper, so the reduced axis is an
-    // fp16 `StickExtent` and `Df::Fp16` is the format to ask. Asking it through
-    // `Df::elems_per_stick` (which defers to the type-level `DataFormat::ELEMS_PER_STICK`, the single
-    // source of truth) is what makes fp32's 32 and fp8/int8's 128 come out right BY CONSTRUCTION if a
-    // non-fp16 reduce is ever routed here — a literal would be silently wrong for three of the five
-    // formats, and a comment saying "64 is fp16's stick" would not travel with the code.
-    let stick = Df::Fp16.elems_per_stick();
-    if matches!(kind, ReduceKind::Max) && rows > 1 && cols > stick {
-        return err(format!(
-            "{name}: a `max` reduce over t{}'s {cols} columns × {rows} rows is REFUSED, and not \
-             because it cannot be described. THE REFUSED CELL IS THE CONJUNCTION: `rows > 1` AND a \
-             reduced extent past ONE STICK ({stick} elements at fp16). Inside it the on-card \
-             reduce-MAX mis-combines the per-stick partial maxima and hands back THE SEED, so this \
-             would emit a well-formed descriptor, bake, exit 0 under `dxp_standalone` (which executes \
-             no arithmetic), and return that seed for all {rows} rows — a softmax built on it computes \
-             `exp(x - 0)`, silently.              DO NOT READ THIS AS EITHER AXIS ALONE; each single-axis reading has a shipping, \
-             hardware-proven counter-example. `rows > 1` is NOT the defect: \
-             `ir/bridge/tiled_op_sdsc_op/attn.rs`'s `attn_bmax` reduces MAX at `rows = nqh > 1` with \
-             `width` one stick at 31 tok/s on card, and that file records a per-row split TRIED AND \
-             REVERTED (2026-07-28) against exactly that comparison. A width past one stick is NOT the \
-             defect either: `emit/ktir_matmul_fp8.rs`'s `fq_amax_op` reduces MAX over the whole hidden \
-             width `k` (2048/4096, many sticks) on every fp8 matmul, and at decode (`m == 1`) that is \
-             this same rank-3 flat emission at 41 tok/s. Only BOTH AT ONCE is broken, which is why the \
-             one diagnostic that measured it (`mxp=0` over `[nqh,cap]`) could not tell the axes apart.              THE REMEDY: tile the reduction to ONE STICK and combine the partials — which is what \
-             `attention_flash.py` and `swiglu_mlp.py` pin `BLOCK_N = 64` for, as a correctness \
-             constraint — or reduce with `sum`, which combines correctly multi-row at any width. It is \
-             NOT to split rows: that is the reverted experiment, measured on hardware as zero \
-             behavioural change, and it costs {rows} descriptors per softmax for nothing.",
-            data.tid
-        ));
-    }
+    // ⭐ THE WIDE MULTI-ROW MAX PASSES THROUGH — the guard that used to refuse it here was built
+    // on a misread diagnostic and is deleted; the corrected law (with the DDL citations and the
+    // card gate that arbitrates) is this function's own doc above. The shape checks below are
+    // unchanged and still refuse everything that is not a well-formed row reduction.
     // A `[rows, 1]` accumulator: the reduce writes one value per row.
     if out.c_len != 1 {
         return err(format!(

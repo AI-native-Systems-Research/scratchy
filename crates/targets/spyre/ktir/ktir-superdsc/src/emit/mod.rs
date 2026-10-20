@@ -760,6 +760,7 @@ fn sfp_rank1_opspec(
         tiled_symbols: vec![],
         time_tile: None,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -1805,6 +1806,7 @@ fn slice_add_gate_opspec(rows: u32, half: u32, x: &str, o: &str) -> Result<OpSpe
         tiled_symbols: vec![],
         time_tile: None,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -3685,6 +3687,39 @@ pub fn emit_sdsc(
             OpInfo::None | OpInfo::FusedEpilogue { .. } => serde_json::json!({}),
         }
     };
+    // ⭐ THE SAMV COORDINATE MASK (a padded reduce's identity-valued padding): when the op
+    // states one, its `samv-maskvalue` constant is APPENDED here at the next insertion index —
+    // the vendor's own rule (`constants["samv-maskvalue"] = _get_mask_value(op)` then
+    // `masking_const_id = len(constants)`, codegen/superdsc.py:2357-2365) — so the id is the
+    // index the appended entry occupies and can never collide with the scaling/exx2 entries
+    // above. `mask_bits` is the RAW SEN169 word (`0xFFFE` = the DDL's own negInf pattern for
+    // `max`, 0 otherwise), NOT a `sen169_bits` encoding: the backend's own multi-row max
+    // fixture pins the wire value (`"65534"`, `ddc/ddl_templates/test/sdsc_max.json`). See
+    // [`crate::superdsc_opspec::SamvCoordinateMask`] for the full law.
+    //
+    // The same mask feeds the two DSC-level fields: `coordinateMasking_` dims in ELEMENTS
+    // ([[valid, pad]] — valid + pad = the stick-padded extent) and the appended constant's id.
+    // Both stay empty/-1 for every stick-aligned reduce, byte-identical to before this field
+    // existed. The fixture's own `maskingConstId_: 8` counts ITS eight preceding constants;
+    // ours is 1 — `scaling_factor` occupies "0".
+    let (constant_info, coordinate_masking, masking_const_id) = match op.coordinate_mask {
+        None => (constant_info, BTreeMap::new(), -1),
+        Some(m) => {
+            let mut entries = constant_info.as_object().cloned().unwrap_or_default();
+            let idx = entries.len() as i64;
+            entries.insert(
+                idx.to_string(),
+                serde_json::json!({
+                    "dataFormat_": "SEN169_FP16",
+                    "name_": "samv-maskvalue",
+                    "data_": fold_manager_const(m.mask_bits, folds)
+                }),
+            );
+            let mut dims: BTreeMap<String, Vec<[i64; 2]>> = BTreeMap::new();
+            dims.insert(m.dim.to_string(), vec![[m.valid as i64, m.pad as i64]]);
+            (serde_json::Value::Object(entries), dims, idx)
+        }
+    };
     // torch-spyre's `generate_constant_info` returns the JSON *string* "{}" for the
     // EMPTY case and a DICT only when populated. VERIFIED on the REAL frontend (compiled
     // `torch.rsqrt` + `F.rms_norm`): rsqrt/add/mul → `"constantInfo_": "{}"` (a str), the
@@ -3745,8 +3780,8 @@ pub fn emit_sdsc(
         numCoreletsUsed_: folds.corelet_fold(),
         coreIdsUsed_: (0..cores).collect(),
         N_: n_space,
-        coordinateMasking_: BTreeMap::new(),
-        maskingConstId_: -1,
+        coordinateMasking_: coordinate_masking,
+        maskingConstId_: masking_const_id,
         dataStageParam_: BTreeMap::from([("0".to_string(), stage)]),
         primaryDsInfo_: primary,
         scheduleTree_: tree,
@@ -4258,6 +4293,7 @@ fn convert_opspec(
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -4630,6 +4666,7 @@ fn transpose_opspec(mb: u32, out: u32, in_name: &str, o_name: &str) -> Result<Op
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -5391,6 +5428,7 @@ fn restickify_opspec(
         tiled_symbols: vec![],
         time_tile: None,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -5490,6 +5528,7 @@ fn restickify_opspec_off(
         tiled_symbols: vec![],
         time_tile: None,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -5758,6 +5797,7 @@ fn topk_opspec(
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -5886,6 +5926,7 @@ fn restickify_kt_opspec_2d(
         tiled_symbols: vec![],
         time_tile: None,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -6088,6 +6129,7 @@ fn restickify_v_opspec_2d(
         tiled_symbols: vec![],
         time_tile: None,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 

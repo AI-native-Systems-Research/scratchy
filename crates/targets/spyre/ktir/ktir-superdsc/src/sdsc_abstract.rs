@@ -2884,10 +2884,12 @@ impl SlotCount {
 /// of the resident cache one fold pass's score/reduce group reads.
 ///
 /// The window holds [`Self::SLOTS`] slots — one POOL stick of them — NOT because a stick has 64 lanes
-/// but because reduce-MAX mis-combines partial maxima past one stick of COLUMNS (the documented
-/// hardware defect), so the sweep is blocked at exactly one stick of score columns, and a resident
-/// slot is one score column. Same value as [`Lanes::FP16`], different law: the lane count is the
-/// machine's, this is the reduce's.
+/// but because the fold sweep is BLOCKED at exactly one stick of score columns (the attention
+/// emitter's card-proven form, matching torch-spyre's own kv-block tiling of the online-softmax
+/// recurrence), and a resident slot is one score column. Same value as [`Lanes::FP16`], different
+/// law: the lane count is the machine's, this is the sweep's blocking. (The blocking used to be
+/// justified as a hardware reduce-MAX limit past one stick of columns — an attribution the
+/// template's own DDL refutes; see [`crate::emit::lower_ktir_to_superdsc::reduce`]'s law doc.)
 ///
 /// The index is two coordinates at once, aligned by construction: the KV window's first slot
 /// ([`Self::first_slot`]) and the prefix-mask SLAB whose columns are those slots
