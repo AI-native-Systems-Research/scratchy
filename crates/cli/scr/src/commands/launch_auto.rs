@@ -44,6 +44,16 @@ pub(crate) struct Tier {
     pub(crate) weights: &'static str,
 }
 
+impl Tier {
+    /// The name the build gives this tier's compiled variant: a quant preset
+    /// emits `<stem>-<preset>` (`qwen3.6-35b-a3b-mlx-affine-b4-g64-qembed`), the
+    /// name `scr model info` prints. The bare stem is the dense variant, which
+    /// cannot load this tier's quantized checkpoint, so it does not count.
+    fn variant_stem(&self) -> String {
+        format!("{}-{}", self.stem, self.quant)
+    }
+}
+
 /// Biggest first. Every one is an MLX checkpoint with quantized embeddings,
 /// hence the one `-qembed` preset. Weights on disk: 43.6 / 19.0 / 5.6 / 1.6
 /// GiB, against a Metal working set of ~75% of RAM.
@@ -104,7 +114,7 @@ pub(crate) fn pick(mem_bytes: u64, compiled: &[String]) -> Result<Pick, &'static
     // The last rung's floor is 0, so something always fits.
     let biggest = *fitting.peek().expect("the tier ladder ends at 0 GiB");
     let tier = fitting
-        .find(|t| compiled.iter().any(|s| s == t.stem))
+        .find(|t| compiled.iter().any(|s| *s == t.variant_stem()))
         .ok_or(biggest)?;
     Ok(Pick {
         tier,
@@ -218,7 +228,7 @@ mod tests {
 
     #[test]
     fn picks_the_biggest_compiled_tier_that_fits() {
-        let all: Vec<String> = TIERS.iter().map(|t| t.stem.to_string()).collect();
+        let all: Vec<String> = TIERS.iter().map(|t| t.variant_stem()).collect();
         let at = |gib: u64| pick(gib * GIB, &all).unwrap().tier.model;
         assert_eq!(at(128), "mlx-community/Qwen3.5-122B-A10B-OptiQ-2bit");
         assert_eq!(at(64), "mlx-community/Qwen3.6-35B-A3B-4bit");
@@ -227,16 +237,36 @@ mod tests {
         assert_eq!(at(8), "mlx-community/Qwen2.5-3B-Instruct-4bit");
     }
 
+    /// A tier counts as compiled in by the name `scr model info` prints for it:
+    /// the stem with the quant preset appended, which is what a `quant/mlx`
+    /// build emits. Matching the bare stem refused a binary that had the 35B.
+    #[test]
+    fn matches_the_preset_suffixed_variant_a_quant_build_emits() {
+        let built = stems(&["qwen3.6-35b-a3b-mlx-affine-b4-g64-qembed"]);
+        let p = pick(64 * GIB, &built).unwrap();
+        assert_eq!(p.tier.model, "mlx-community/Qwen3.6-35B-A3B-4bit");
+        assert_eq!(p.bigger_uncompiled, None);
+    }
+
+    /// The bare stem is the dense variant, which cannot load the tier's
+    /// quantized checkpoint, so it does not make the tier compiled in.
+    #[test]
+    fn a_dense_only_build_does_not_count() {
+        let err = pick(64 * GIB, &stems(&["qwen3.6-35b-a3b"])).unwrap_err();
+        assert_eq!(err.stem, "qwen3.6-35b-a3b");
+    }
+
     /// A bigger rung that fits but is not compiled in falls through to the
     /// biggest one that is, and names the one it skipped.
     #[test]
     fn falls_back_to_a_compiled_tier_and_names_the_skipped_one() {
-        let p = pick(64 * GIB, &stems(&["qwen3.5-9b", "llama-3.2-1b"])).unwrap();
+        let built = stems(&[
+            "qwen3.5-9b-mlx-affine-b4-g64-qembed",
+            "llama-3.2-1b-mlx-affine-b4-g64",
+        ]);
+        let p = pick(64 * GIB, &built).unwrap();
         assert_eq!(p.tier.stem, "qwen3.5-9b");
         assert_eq!(p.bigger_uncompiled.unwrap().stem, "qwen3.6-35b-a3b");
-
-        let exact = pick(64 * GIB, &stems(&["qwen3.6-35b-a3b"])).unwrap();
-        assert_eq!(exact.bigger_uncompiled, None);
     }
 
     /// Only a tier that FITS may be picked: a compiled 35B on a 16 GiB Mac is
@@ -244,7 +274,8 @@ mod tests {
     /// biggest rung that fits.
     #[test]
     fn never_picks_a_tier_that_does_not_fit() {
-        let err = pick(16 * GIB, &stems(&["qwen3.6-35b-a3b"])).unwrap_err();
+        let built = stems(&["qwen3.6-35b-a3b-mlx-affine-b4-g64-qembed"]);
+        let err = pick(16 * GIB, &built).unwrap_err();
         assert_eq!(err.stem, "qwen3.5-9b");
     }
 
