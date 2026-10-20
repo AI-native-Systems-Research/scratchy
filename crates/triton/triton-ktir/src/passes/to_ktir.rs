@@ -292,6 +292,7 @@ fn convert_body(module: &mut Module) -> Result<()> {
     convert_all(module, OpKind::TtBroadcast, convert_broadcast)?;
     convert_all(module, OpKind::TtExpandDims, convert_expand_dims)?;
     convert_all(module, OpKind::TtTrans, convert_trans)?;
+    convert_all(module, OpKind::TtReshape, convert_reshape)?;
     convert_all(module, OpKind::TtSplat, convert_splat_of_argument)?;
     convert_all(module, OpKind::TtMakeRange, convert_make_range)?;
     expand_splat_of_scalar_argument(module)?;
@@ -644,6 +645,87 @@ fn convert_trans(module: &mut Module, index: &DefIndex, path: &OpPath) -> Result
     let block = walk::block_mut(module, path).expect("path");
     block[idx] = transpose;
     block.insert(idx, init_op);
+    Ok(())
+}
+
+/// A `tt.reshape` as `tensor.reshape` -- the flat row-major reinterpretation the
+/// batched paged-decode kernel states over gathered pages and computed tiles.
+///
+/// # WHY THE TARGET RIDES AN ATTRIBUTE AND NOT A SECOND OPERAND
+///
+/// Real MLIR's `tensor.reshape` takes a runtime `shape` tensor operand, because the
+/// destination extents can be dynamic there. OURS CANNOT BE: the front end's
+/// `semantic.rs::reshape` builds the result type from the `dst_shape` the kernel
+/// spelled as constexpr literals, so the extents are compile-time facts of the TYPE.
+/// The scheduler dialect's own reshape family states them exactly this way -- the
+/// emulator's `tensor.reshape` reads a result-type-pinned `target_shape` attribute and
+/// IGNORES a second operand, and the door's `expand_shape`/`collapse_shape` arms read
+/// `TargetShape` off the attr -- so the attribute is the dialect's form, not a shortcut
+/// around it.
+///
+/// The value is DERIVED FROM THE RESULT TYPE here (never copied from the source), the
+/// same non-disagreeable discipline as `lower_op_kind`'s minting for the expand/collapse
+/// pair: the op cannot state a destination other than the type it produces.
+///
+/// # ⛔ FAIL CLOSED ON THE ELEMENT COUNT AND DTYPE
+///
+/// The front end already refuses a numel-changing reshape, but the bridge does not
+/// trust the front end's check as its own: a reshape that changed the element count or
+/// the element type would be a SILENT REINTERPRETATION -- wrong bytes with no
+/// diagnostic -- which is the one failure this pass exists to make loud.
+fn convert_reshape(module: &mut Module, index: &DefIndex, path: &OpPath) -> Result<()> {
+    let op = walk::at(module, path).expect("path").clone();
+    if op.operands.len() != 1 || op.results.len() != 1 {
+        return Err(refuse(format!(
+            "`tt.reshape` with {} operands and {} results: the reinterpretation is one \
+             value in, one value out",
+            op.operands.len(),
+            op.results.len()
+        )));
+    }
+    let src_ty = index
+        .type_of(op.operands[0])
+        .ok_or_else(|| refuse("tt.reshape operand has no type"))?;
+    let res_ty = op
+        .result_types
+        .first()
+        .cloned()
+        .ok_or_else(|| refuse("tt.reshape has no result type"))?;
+    let (src_dims, res_dims) = match (src_ty.dims(), res_ty.dims()) {
+        (Some(s), Some(r)) => (s.to_vec(), r.to_vec()),
+        _ => {
+            return Err(refuse(
+                "tt.reshape is not a reinterpretation of ranked tensors",
+            ));
+        }
+    };
+    let src_numel: i64 = src_dims.iter().product();
+    let res_numel: i64 = res_dims.iter().product();
+    if src_numel != res_numel {
+        return Err(refuse(format!(
+            "tt.reshape would reinterpret {src_numel} elements as {res_numel} ({src_dims:?} \
+             -> {res_dims:?}): the element count is the one thing a reshape must preserve",
+        )));
+    }
+    if src_ty.elem() != res_ty.elem() {
+        return Err(refuse(format!(
+            "tt.reshape would reinterpret a {:?} tile as a {:?} one: the front end's \
+             reshape preserves the element type, so a disagreement here is a silently \
+             mistyped tile",
+            src_ty.elem(),
+            res_ty.elem()
+        )));
+    }
+
+    let reshape = Op::new(OpKind::Other("tensor.reshape".into()))
+        .with_result(op.results[0], res_ty)
+        .with_operands([op.operands[0]])
+        .with_attr(
+            AttrKey::Other("target_shape".into()),
+            Attr::IntList(res_dims),
+        );
+    let idx = path.index();
+    walk::block_mut(module, path).expect("path")[idx] = reshape;
     Ok(())
 }
 
@@ -3244,6 +3326,76 @@ module {
             m.ops_deep()
                 .iter()
                 .any(|o| o.kind == OpKind::TensorCollapseShape)
+        );
+    }
+
+    /// `tt.reshape` -- the flat row-major reinterpretation the batched paged-decode
+    /// kernel states over gathered pages and computed tiles. The positive asserts
+    /// the `tensor.reshape` it becomes and the `target_shape` derived from the
+    /// RESULT TYPE; the controls below break the two laws the front end already
+    /// enforces, so reaching them means hand-written IR.
+    const RESHAPE: &str = "\
+module {
+  tt.func public @k(%q: !tt.ptr<f16>) attributes {noinline = false} {
+    %x = arith.constant dense<0.000000e+00> : tensor<64x64xf16>
+    %r = tt.reshape %x : tensor<64x64xf16> -> tensor<8x512xf16>
+    tt.return
+  }
+}
+";
+
+    /// The reshape crosses as `tensor.reshape` with its target derived from the
+    /// result type -- never copied from the source, so it cannot disagree with the
+    /// type the op actually produces -- and no `tt.*` survives.
+    #[test]
+    fn a_reshape_becomes_tensor_reshape_with_the_target_from_its_result_type() {
+        let m = run_on(RESHAPE, &[8]).unwrap();
+        let r = m
+            .ops_deep()
+            .into_iter()
+            .find(|o| o.kind.spelling() == "tensor.reshape")
+            .expect("the reshape crossed as tensor.reshape");
+        assert_eq!(
+            r.attr(&AttrKey::Other("target_shape".into())),
+            Some(&Attr::IntList(vec![8, 512])),
+            "target_shape is the RESULT TYPE's dims, emitted from the type rather than \
+             from the source"
+        );
+        assert_eq!(
+            r.result_types.first().and_then(|t| t.dims()),
+            Some(&[8i64, 512][..]),
+            "the result type is preserved by the rewrite"
+        );
+        assert!(
+            !m.ops_deep()
+                .iter()
+                .any(|o| o.kind.spelling().starts_with("tt.")),
+            "no tt.* op survives the conversion"
+        );
+    }
+
+    /// CONTROL — a reshape that changes the element count would be a silent
+    /// reinterpretation, so it is refused by name at the bridge.
+    #[test]
+    fn a_numel_changing_reshape_is_refused() {
+        let src = RESHAPE.replacen("-> tensor<8x512xf16>", "-> tensor<8x511xf16>", 1);
+        let e = run_on(&src, &[8]).unwrap_err();
+        assert!(
+            e.message
+                .contains("the element count is the one thing a reshape must preserve"),
+            "got {e}"
+        );
+    }
+
+    /// CONTROL — a reshape that changes the element type would be a silently
+    /// mistyped tile, so it is refused by name at the bridge.
+    #[test]
+    fn a_dtype_changing_reshape_is_refused() {
+        let src = RESHAPE.replacen("-> tensor<8x512xf16>", "-> tensor<8x512xf32>", 1);
+        let e = run_on(&src, &[8]).unwrap_err();
+        assert!(
+            e.message.contains("a silently mistyped tile"),
+            "got {e}"
         );
     }
 
