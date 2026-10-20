@@ -1221,8 +1221,7 @@ impl LLM {
                         on_token(&new_text);
                         full_text.push_str(&new_text);
                     }
-                    stop_string_finished =
-                        stop_string.is_some() && output.finish_reason.is_none();
+                    stop_string_finished = stop_string.is_some() && output.finish_reason.is_none();
                 }
                 if stop_string_finished {
                     use scratchy_core_common::engine_io::FinishReason;
