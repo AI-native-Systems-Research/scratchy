@@ -83,6 +83,12 @@ fn gather_copy(decl: (KernelAxis, PageExtent)) -> ktir_superdsc::superdsc_opspec
         },
         // Global block numbers — no source base (the `GatherCopy` law).
         ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+        // The destination's own law: this copy writes `mb × out` = 512 elements at entry 0, and the
+        // scratch states exactly that window — the dest-side bound the mint holds (#717's class).
+        ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+            rows: 8,
+            cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+        },
     )
     .expect("the gather-copy op builds")
 }
@@ -311,6 +317,8 @@ fn the_declarations_own_refusals_survive_the_move() {
             },
             // Global block numbers — no source base (the `GatherCopy` law).
             ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+            // An exact-fit destination, so the refusal under test stays the axis one, not the mint's.
+            ktir_superdsc::sdsc_abstract::GatherDest::Scratch { rows: 8, cols: 256 },
         )
         .is_err(),
         "an `in` axis is not a dim of the gather-copy op, and a silently-dropped pin is a gather with \
@@ -347,6 +355,12 @@ fn an_fp8_gathered_copy_builds_at_the_fp8_stick_and_carries_its_own_df() {
         },
         // Global block numbers — no source base (the `GatherCopy` law).
         ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+        // The expert slab's destination: 32 four-position entries × a 128-elem fp8 stick each —
+        // exactly this copy's `mb × out` window, in the entry frame the mint bounds.
+        ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+            rows: ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
+            cols: 512,
+        },
     )
     .expect("the fp8 expert-slab copy builds");
     // Both VALUE operands carry the fp8 residency — 1-byte words, the bank's own format.
@@ -400,6 +414,8 @@ fn an_fp8_gathered_copy_builds_at_the_fp8_stick_and_carries_its_own_df() {
             },
             // Global block numbers — no source base (the `GatherCopy` law).
             ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+            // An exact-fit destination, so the refusal under test stays the sub-stick one.
+            ktir_superdsc::sdsc_abstract::GatherDest::Scratch { rows: 8, cols: 256 },
         )
         .is_err(),
         "a 64-elem `out` is HALF an fp8 stick — the sub-stick refusal, at the fp8 width"

@@ -86,6 +86,11 @@ fn gather_copy_declared() -> ktir_superdsc::superdsc_opspec::OpSpec {
         vendor_index("Tensor1"),
         // Global block numbers — no source base (the `GatherCopy` law).
         ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+        // The destination's own law: the copy's `mb × out` = 1024-element window at entry 0, exact.
+        ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+            rows: 16,
+            cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+        },
     )
     .expect("the gather-copy op builds")
 }
@@ -109,6 +114,11 @@ fn gather_copy_base() -> ktir_superdsc::superdsc_opspec::OpSpec {
         vendor_index("Tensor1"),
         // Global block numbers — no source base (the `GatherCopy` law).
         ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+        // The destination's own law: the copy's `mb × out` = 1024-element window at entry 0, exact.
+        ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+            rows: 16,
+            cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+        },
     )
     .expect("the gather-copy op builds");
     // Drop the index operand and the declaration, leaving the bare two-operand identity.

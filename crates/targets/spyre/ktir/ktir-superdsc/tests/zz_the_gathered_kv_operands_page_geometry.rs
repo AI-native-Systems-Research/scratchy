@@ -356,6 +356,12 @@ fn gathered_score_shaped_op(axis: KernelAxis, page: PageExtent) -> serde_json::V
         },
         // Global block numbers — no source base (the `GatherCopy` law).
         ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+        // The destination's own law in the entry frame — one index stick of entries × the page's
+        // stick, exactly the copy's `mb × out` window — so the measurement stays about `skip_addr`.
+        ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+            rows: ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
+            cols: page.get() * ktir_superdsc::sdsc_abstract::POOL_STICK,
+        },
     )
     .expect("the gather-copy op builds at the score leg's extents");
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -380,6 +386,12 @@ fn ungathered_score_shaped_op() -> serde_json::Value {
         ),
         // Global block numbers — no source base (the `GatherCopy` law).
         ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+        // The destination's own law in the entry frame — `hd`'s page × one stick, one index stick
+        // of entries: exactly the copy's `mb × out` window.
+        ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+            rows: ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
+            cols: HD * ktir_superdsc::sdsc_abstract::POOL_STICK,
+        },
     )
     .expect("the gather-copy op builds");
     // Drop the index operand and the declaration, leaving the bare two-operand identity.

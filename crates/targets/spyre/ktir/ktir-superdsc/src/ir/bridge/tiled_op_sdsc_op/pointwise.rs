@@ -54,6 +54,7 @@ use crate::work::EwDivision;
 /// `out` the same law collapses to `r*64 + c`, i.e. ROW-MAJOR, and a pool block is `hd` consecutive
 /// sub-rows. `GatherScratch::sub_rows`/`entry_page` carry that split, and the gather's `page` is what
 /// keeps ONE ENTRY equal to one whole block.
+#[allow(clippy::too_many_arguments)]
 pub fn gather_copy_opspec(
     src: &str,
     dst: &str,
@@ -86,6 +87,14 @@ pub fn gather_copy_opspec(
     // isStartAddrSymbolic note) — so a nonzero base here survives the gather and a zero one
     // changes nothing on every existing caller.
     run: crate::superdsc_opspec::GatherRun,
+    // ⭐⭐⭐⭐⭐ WHERE THIS COPY'S DESTINATION ENDS — see `sdsc_abstract::GatherDest`. Carried by the
+    // copy (minted by the same `copies()` that mints the run, from the scratch the run lands in),
+    // because the destination's bound is a fact about the SCRATCH, not about the op: nothing else
+    // in this signature states where the copy's window stops, and a base whose run crosses the
+    // scratch's end is the #717 class — a clean bake whose overrun is the next intermediate's
+    // bytes, read back as keys or page numbers. The core-local LX forms state their own window
+    // kind here (each core's slice at the pin, no offset), never an exemption from the mint.
+    dest: crate::sdsc_abstract::GatherDest,
 ) -> Result<OpSpec, String> {
     crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
     // ⭐ `cols` IS the whole-stick width by the one-stick law below (`cols == df.elems_per_stick()`),
@@ -138,6 +147,48 @@ pub fn gather_copy_opspec(
             "gather_copy_opspec('{src}' -> '{dst}'): {rows} `mb` positions do not divide into whole \
              {page}-position entries, so the last index entry would cover a partial block."
         ));
+    }
+    // ⭐⭐⭐⭐⭐ THE DESTINATION WINDOW, BOUNDED AT THE RAW DOOR. The run writes `rows × cols` elements
+    // at `entry_elems · dest_entry`, and the copy carries the destination's own law for where that
+    // window stops (`GatherDest`). The Scratch arm runs the SAME full-window mint the convert and
+    // restickify families take (`mint_full_window`, layout-free arm here — the placement half rides
+    // `assemble_gather_copy`, where the layout is at hand): the last stick of a pass ends exactly at
+    // the scratch's end, so a run whose window crosses it — the #717 class, a clean bake whose
+    // overrun is the next intermediate's bytes read back as keys — is a build `Err` here instead.
+    // The CoreLocalLx arm is that form's OWN window kind: each core's slice sits at the pin, so the
+    // run has no offset to take, and the per-core slice is the read law's bound at emit — stated as
+    // the law that applies, never exempted from the mint by silence.
+    let dest_base = entry_elems.checked_mul(run.dest.entries()).ok_or_else(|| {
+        format!(
+            "gather_copy_opspec('{src}' -> '{dst}'): the destination base for the run at entry \
+                 {} overflows a 32-bit element offset at {entry_elems} elements per entry",
+            run.dest.entries()
+        )
+    })?;
+    match dest {
+        crate::sdsc_abstract::GatherDest::Scratch {
+            rows: d_rows,
+            cols: d_cols,
+        } => {
+            crate::emit::mint_full_window(
+                &format!("gather_copy_opspec('{src}' -> '{dst}'): the destination"),
+                &crate::emit::rb_df(dst, d_rows, d_cols, df),
+                dest_base as u64,
+                rows,
+                cols,
+                None,
+            )?;
+        }
+        crate::sdsc_abstract::GatherDest::CoreLocalLx => {
+            if run.dest.entries() != 0 {
+                return Err(format!(
+                    "gather_copy_opspec('{src}' -> '{dst}'): the run at destination entry {} lands \
+                     in a CORE-LOCAL LX tensor — each core's slice sits at the pin, so a \
+                     core-local destination has no offset to take",
+                    run.dest.entries()
+                ));
+            }
+        }
     }
     let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
         name,
@@ -222,14 +273,10 @@ pub fn gather_copy_opspec(
         // the INDEX's base in entries — equal to the destination's only while one index stick is 32
         // consecutive destination rows. A page-granular op's index base is `32 * request` while its rows
         // start at `request`, so reusing it lands every op's rows 32× too far out, past the scratch and
-        // into the next intermediate's bytes. Read as keys, clean bake, no fault.
-        entry_elems.checked_mul(run.dest.entries()).ok_or_else(|| {
-            format!(
-                "gather_copy_opspec('{src}' -> '{dst}'): the destination base for the run at entry \
-                     {} overflows a 32-bit element offset at {entry_elems} elements per entry",
-                run.dest.entries()
-            )
-        })?,
+        // into the next intermediate's bytes. Read as keys, clean bake, no fault. (Derived and bounded
+        // once above — `dest_base` — so the base the op carries and the base the mint checks are one
+        // number.)
+        dest_base,
     )?;
     // ⭐ THE VALUE OPERANDS' OWN df — `pointwise_opspec_from_tile_split` builds args at fp16 (the
     // residual default), so an fp8 copy re-states BOTH value args here. The index arg does not
@@ -311,6 +358,49 @@ pub fn assemble_gather_copy(
     // defect, whose overrun is another page's keys read as block numbers) and the two pins could drift
     // apart with nothing refusing it. See `sdsc_abstract::CopyDims`.
     let d = copy.dims();
+    // ⭐⭐⭐⭐⭐ THE PLACEMENT DOOR — the raw door inside `gather_copy_opspec` bounds the run's window
+    // against the extent the copy carries; this half resolves the destination's NAME against the
+    // layout, the same two-door mint every family since #734 takes. For an HBM scratch that is
+    // `mint_full_window` with the layout at hand: the handle states the pair the copy carries (the
+    // scratch's own `footprint_dims`, the pair its synth declared), and the layout answers for the
+    // bytes behind the name — a reservation smaller than the window is the "512 reserved against
+    // 2048 declared" class, whose overrun is another page's keys read as block numbers.
+    //
+    // ⭐ AND THE CORE-LOCAL FORM'S OWN KIND RIDES HERE TOO: a copy that states a CORE-LOCAL
+    // destination must find that name held core-local by the layout — the minted law and the
+    // layout are two authorities for one fact, and their disagreement is a build failure rather
+    // than a copy that addresses LX bytes as HBM (or HBM bytes as a pin). The per-core slice
+    // itself is the read law's bound, checked against the pin at emit.
+    let entry_elems = d.page().get().saturating_mul(d.out()) as u64;
+    let dest_base = entry_elems * copy.dest_entry() as u64;
+    match copy.dest() {
+        crate::sdsc_abstract::GatherDest::Scratch {
+            rows: d_rows,
+            cols: d_cols,
+        } => {
+            crate::emit::mint_full_window(
+                &format!("assemble_gather_copy {op_name}: the destination"),
+                &crate::emit::rb_df(dst, d_rows, d_cols, Df::Fp16),
+                dest_base,
+                d.mb(),
+                d.out(),
+                layout,
+            )
+            .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
+        }
+        crate::sdsc_abstract::GatherDest::CoreLocalLx => {
+            if let Some(l) = layout
+                && !l.lx_core_local(dst)
+            {
+                panic!(
+                    "assemble_gather_copy {op_name}: the copy states a CORE-LOCAL destination but \
+                     the layout does not hold '{dst}' as core-local LX — the minted law and the \
+                     layout disagree about where this run lands, so it addresses bytes neither \
+                     authority stands behind"
+                );
+            }
+        }
+    }
     let mut op = gather_copy_opspec(
         src,
         dst,
@@ -335,6 +425,8 @@ pub fn assemble_gather_copy(
             crate::superdsc_opspec::DestEntry::of_entries(copy.dest_entry()),
             0,
         ),
+        // The destination's own law, carried by the copy from the scratch it lands in.
+        copy.dest(),
     )
     .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
     // ⭐ THE DESTINATION MAY BE CORE-LOCAL LX — the chunk's V, landing in the scratchpad of the core whose

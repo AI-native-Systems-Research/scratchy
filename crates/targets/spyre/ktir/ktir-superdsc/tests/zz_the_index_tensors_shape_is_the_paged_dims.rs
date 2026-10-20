@@ -376,6 +376,8 @@ fn the_index_declares_entries_and_every_core_reads_the_same_table() {
             ktir_superdsc::superdsc_opspec::DestEntry::of_entries(runs[0].dest_entry()),
             0,
         ),
+        // The run's own stated destination — the mint bounds this run's window against it.
+        runs[0].dest(),
     )
     .expect("the shipped gather-copy builds");
     let idx_pos = op.indirect.expect("a declaration").index;

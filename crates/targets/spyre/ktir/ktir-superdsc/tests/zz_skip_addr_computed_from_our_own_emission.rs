@@ -169,6 +169,8 @@ fn the_shipped_gather_copys_skip_addr_is_one_pool_stick_block() {
                     ktir_superdsc::superdsc_opspec::DestEntry::of_entries(cp.dest_entry()),
                     0,
                 ),
+                // The copy's own stated destination — the mint bounds this run's window against it.
+                cp.dest(),
             )
             .expect("the gather-copy op builds");
             let value_idx = op.indirect.expect("a declared gather").value;
@@ -251,6 +253,8 @@ fn the_shipped_page_gather_copys_skip_addr_is_one_pool_stick_block() {
                         ktir_superdsc::superdsc_opspec::DestEntry::of_entries(cp.dest_entry()),
                         0,
                     ),
+                    // The copy's own stated destination — the mint bounds this run's window against it.
+                    cp.dest(),
                 )
                 .expect("the page gather-copy op builds");
                 let value_idx = op.indirect.expect("a declared gather").value;
@@ -344,6 +348,11 @@ fn pinning_the_entry_dim_makes_skip_addr_one_entrys_size() {
             first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
         },
         ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+        // The destination's own law: the copy's `mb × out` = 1024-element window at entry 0, exact.
+        ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+            rows: 16,
+            cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+        },
     )
     .expect("the gather-copy op builds");
     let value_idx = op.indirect.expect("a declared gather").value;
@@ -472,6 +481,12 @@ fn the_two_pins_hd_128_needs_derive_the_two_window_strides_the_pool_has() {
                 EntryBase::ZERO,
             ),
             ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+            // The destination's own law in the entry frame: one index stick of entries × the pin's
+            // stick — exactly the copy's `mb × out` window, at either plane's pin.
+            ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+                rows: ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
+                cols: pin * POOL_STICK,
+            },
         )
         .expect("the gather-copy op builds at both pins");
         let value_idx = op.indirect.expect("a declared gather").value;
