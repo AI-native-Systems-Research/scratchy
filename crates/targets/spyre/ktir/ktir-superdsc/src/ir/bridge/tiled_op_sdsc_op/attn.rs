@@ -3702,7 +3702,13 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     // not two lane counts: the window's rows are the tile's K rows, the slab its features.
                     KtTileSlots::of_row_window(RowWindow::ROWS),
                     KtTileFeats::of_head_slab(FeatIdx::SLAB_FEATS),
-                    new_k_scaled,
+                    // ⭐ THE INPUT HANDLE, AT THE BUFFER'S OWN TRUTH: new_k_scaled is allocated
+                    // `[mq_pad, nkvh·hd]` (the padded rows — the scale multiply and RoPE's producer both
+                    // state it; the pad rows past `mq` hold the next head's masked lanes by the zero-fill
+                    // law, still INSIDE this tensor). The mint bounds every (kvh, slab, sub-block) tile's
+                    // flat run against THAT, so a corner arithmetic that walks past the last head's last
+                    // slab is a build failure here rather than a clean bake reading the next tensor.
+                    &rb(new_k_scaled, mq_pad_t.rows().row_axis_extent(), nkvh * hd),
                     // PER-KV-HEAD BASE = `kvh * mq * hd` (2026-07-28, CORRECTED from a briefly-committed
                     // `mq_pad` version that regressed decode). `new_k_scaled` inherits its kv-head stride from
                     // RoPE, this tensor family's producer, which writes head h row r at
@@ -3725,7 +3731,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         .at(Idx::<Head>::n(kvh))
                         .slab(sl)
                         .dev(),
-                    &new_kt,
+                    // ⭐ THE OUTPUT HANDLE, likewise: `new_kt` is `nkvh` SEPARATE `[hd, mq_pad]` blocks
+                    // laid end to end (the synth above reserves exactly `[nkvh, hd, mq_pad]`), so the
+                    // handle states the whole flat run. The LAST sub-block's tile ends exactly at the
+                    // scratch's last element — fits with equality, which is what the mint checks.
+                    &rb(&new_kt, 1, nkvh * hd * mq_pad_t.slots().slot_axis_extent()),
                     // DEST: `[nkvh, hd, mq_pad]` with the stick on the SLOT axis, so kv head `kvh` and
                     // feature `sl*stick` are coordinates and the `j`-th sub-block is slot window `j*stick`.
                     // The law places the plane; the previous `sl*mq_pad*stick` guessed it and was wrong above
