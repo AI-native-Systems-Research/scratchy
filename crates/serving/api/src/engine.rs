@@ -205,6 +205,9 @@ struct RequestState {
     /// Position in response choices (for n>1 / multi-prompt support).
     choice_index: u32,
 
+    /// Which of the request's prompts this choice answers ([`Choice::prompt`]).
+    prompt_index: u32,
+
     /// When this request was submitted (for TTFT calculation).
     submit_time: Instant,
     /// When the first output token was received (None until first token).
@@ -264,11 +267,21 @@ impl RequestState {
     /// The token counts every delta sent for this request carries, as of now.
     fn stream_usage(&self) -> StreamUsage {
         StreamUsage {
+            prompt: self.prompt_index,
             prompt_tokens: self.num_prompt_tokens,
             cached_tokens: self.num_cached_tokens,
             completion_tokens: self.generated_token_ids.len() as u32,
         }
     }
+}
+
+/// Where one engine request's output goes in its response: the choice it fills, and the prompt it
+/// answers. A completion request runs `n` choices of each of its prompts, a chat request `n` of
+/// its one.
+#[derive(Debug, Clone, Copy, Default)]
+struct Choice {
+    index: u32,
+    prompt: u32,
 }
 
 /// Token counts for one request, carried on every [`StreamDelta`].
@@ -280,6 +293,9 @@ impl RequestState {
 /// value it sees rather than assume which delta arrives first.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StreamUsage {
+    /// Which of the request's prompts this choice answers. The choices of one prompt share its
+    /// tokens and its cache hit, so a response counts each once per prompt, not once per choice.
+    pub prompt: u32,
     /// Total prompt tokens for the request.
     pub prompt_tokens: u32,
     /// Prompt tokens served from the prefix cache. Block-aligned, so it
@@ -799,7 +815,10 @@ impl AsyncEngine {
                 num_prompt_tokens,
                 None,
                 detokenizer,
-                i as u32,
+                Choice {
+                    index: i as u32,
+                    prompt: 0,
+                },
                 None, // no streaming tool parser for non-streaming requests
                 None,
                 None, // no streaming reasoning parser for non-streaming requests
@@ -813,6 +832,8 @@ impl AsyncEngine {
         // Poll all children and build choices.
         let mut choices = Vec::with_capacity(n);
         let mut total_completion_tokens = 0u32;
+        // The prompt's cache hit, counted once as the prompt is: every choice runs the same
+        // prompt, and each records its own hit on it (#580).
         let mut total_cached_tokens = 0u32;
         let forced_tool = ForcedTool::of(&request.tool_choice);
 
@@ -820,7 +841,7 @@ impl AsyncEngine {
             let state = self.poll_until_done(child_id).await?;
             let completion_tokens = state.generated_token_ids.len() as u32;
             total_completion_tokens += completion_tokens;
-            total_cached_tokens += state.num_cached_tokens;
+            total_cached_tokens = total_cached_tokens.max(state.num_cached_tokens);
 
             let finish_reason_str = state
                 .finish_reason
@@ -1152,7 +1173,10 @@ impl AsyncEngine {
                 num_prompt_tokens,
                 Some(tx.clone()),
                 detokenizer,
-                i as u32,
+                Choice {
+                    index: i as u32,
+                    prompt: 0,
+                },
                 tool_state,
                 forced_tool.clone(),
                 reasoning_state,
@@ -1267,7 +1291,10 @@ impl AsyncEngine {
                     num_prompt_tokens,
                     None,
                     detokenizer,
-                    choice_index,
+                    Choice {
+                        index: choice_index,
+                        prompt: p_idx as u32,
+                    },
                     None, // no tool parsing for completions
                     None,
                     None, // no reasoning parsing for completions
@@ -1457,7 +1484,10 @@ impl AsyncEngine {
                     num_prompt_tokens,
                     Some(tx.clone()),
                     detokenizer,
-                    choice_index,
+                    Choice {
+                        index: choice_index,
+                        prompt: p_idx as u32,
+                    },
                     None, // no tool parsing for completions
                     None,
                     None, // no reasoning parsing for completions
@@ -1546,7 +1576,7 @@ impl AsyncEngine {
                     num_prompt_tokens,
                     None,
                     None,
-                    0,
+                    Choice::default(),
                     None,
                     None,
                     None,
@@ -2360,7 +2390,7 @@ impl AsyncEngine {
         num_prompt_tokens: u32,
         stream_tx: Option<mpsc::UnboundedSender<StreamDelta>>,
         detokenizer: Option<IncrementalDetokenizer>,
-        choice_index: u32,
+        choice: Choice,
         tool_parser_state: Option<Box<dyn StreamingToolParserState + Send>>,
         forced_tool: Option<ForcedTool>,
         reasoning_parser_state: Option<Box<dyn StreamingReasoningParserState + Send>>,
@@ -2411,7 +2441,8 @@ impl AsyncEngine {
                     // the state's business, and this is the only place a request's is installed — so
                     // exactly one place could ever get it wrong.
                     detokenizer: detokenizer.map(|d| Arc::new(std::sync::Mutex::new(d))),
-                    choice_index,
+                    choice_index: choice.index,
+                    prompt_index: choice.prompt,
                     submit_time: Instant::now(),
                     first_token_time: None,
                     last_token_time: None,
@@ -4157,6 +4188,7 @@ mod tests {
             stream_tx,
             detokenizer: None,
             choice_index: 0,
+            prompt_index: 0,
             submit_time: Instant::now(),
             first_token_time: None,
             last_token_time: None,
