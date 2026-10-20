@@ -7513,6 +7513,15 @@ fn scalarmul_scaled(
         // that refusal was lifted: `KTIR_WHOLE=1 bake_py embedding_granite`. `scalarmul` now DELEGATES
         // here, so there is one body and the drift class is gone rather than repaired.
         let gathered_inputs = [In::scalar(&scale_h).ew(), In::full(&x_h).ew()];
+        // ⭐ THE RUN, BUILT WHERE THE NODE'S ROWS ARE KNOWN — the program's stick-checked anchor
+        // plus the whole sticks this node's entries span ([`StickRun::covering`]). The constructor
+        // re-states the anchor check `gathers_of` already made, which is the point: the run is
+        // refused at the FIRST door that can see a mid-stick start, and a hand-built one cannot
+        // get behind it.
+        let run = crate::superdsc_opspec::StickRun::covering(g.first_entry.entries(), rows)
+            .map_err(|msg| Error {
+                message: format!("{name}: {msg}"),
+            })?;
         return crate::emit::assemble_pointwise_broadcast_gather(
             crate::emit::PointwiseGather {
                 op_name: &op_name,
@@ -7523,7 +7532,7 @@ fn scalarmul_scaled(
                 inputs: &gathered_inputs,
                 gathered_input: 1,
                 index_name: &crate::place::act_name(g.index_tid),
-                first_entry: g.first_entry,
+                run,
                 o: &out_h,
             },
             sym_id_base,

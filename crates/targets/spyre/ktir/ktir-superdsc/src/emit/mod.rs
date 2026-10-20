@@ -1030,13 +1030,14 @@ pub struct PointwiseGather<'a, O: KindTag> {
     /// The index buffer's operand spelling — `crate::place::act_name(index_tid)`, the same form every
     /// data operand here uses, so it resolves through the SAME [`BundleLayout`].
     pub index_name: &'a str,
-    /// ⭐ WHERE THIS GATHER'S RUN OF ENTRIES STARTS IN THE INDEX BUFFER — the program's own anchor
-    /// for this gather ([`Gather::first_entry`]), in ENTRIES. Zero for every gather whose index is
-    /// read from its start; an unrolled sweep's trip `b` states `b · BLOCK_N`, and each leg below
-    /// ADDS its own stick offset to it, so a trip's leg `k` reads index words
-    /// `[first_entry + k·32, first_entry + (k+1)·32)` of the SAME buffer the one-block form reads
-    /// from its start. An [`EntryBase`], so it is stick-aligned by construction (issue 201 item 7).
-    pub first_entry: crate::superdsc_opspec::EntryBase,
+    /// ⭐ THIS GATHER'S INDEX RUN — the stick-aligned start (the program's own anchor, in ENTRIES:
+    /// zero for every gather whose index is read from its start; an unrolled sweep's trip `b`
+    /// states `b · BLOCK_N`) plus the WHOLE STICKS the node's entries span. A [`StickRun`], so a
+    /// mid-stick run cannot be stated: the per-J merge form's run at entry 8 has no spelling, and
+    /// a kernel asking for one is refused at the walk that builds this value. Each leg below is
+    /// the run's own [`StickRun::leg`] — one stick, `k` sticks in — so the leg stride and the
+    /// run's span are the same unit by construction (issue 201 item 7's run half).
+    pub run: crate::superdsc_opspec::StickRun,
     pub o: &'a Stk<O>,
 }
 
@@ -1097,7 +1098,7 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
         inputs,
         gathered_input,
         index_name,
-        first_entry,
+        run,
         o,
     } = g;
     // ⛔ THE GATHERED INPUT MUST BE THE **LAST** ONE, because that is the only position at which the
@@ -1146,6 +1147,23 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
         ))
     })?;
     let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    // ⛔ THE RUN'S SPAN AND THE NODE'S ENTRIES ARE THE SAME FACT STATED TWICE, AND THE TYPE IS WHAT
+    // LETS THEM BE CHECKED AGAINST EACH OTHER. The cut below emits one op per index stick, so the
+    // stick count it cuts into IS the run's span; a caller that hand-built a shorter run (or
+    // stated the node's rows independently of the run it handed) would emit legs reading past the
+    // sticks the run declared — another run's words, converted as this one's page addresses.
+    // Refused here, by name, where both numbers are in hand.
+    let legs = entries.div_ceil(cap);
+    if legs != run.sticks() {
+        return Err(SuperDscError(format!(
+            "{op_name}: this node consumes {entries} index entries, which spans {legs} stick(s), but \
+             its gather run declares a span of {} stick(s) starting at stick {}. The cut emits one \
+             op per stick of the RUN, so the two must agree — a run shorter than the node reads \
+             index sticks it never declared, and a longer one leaves sticks no leg loads.",
+            run.sticks(),
+            run.start().sticks(),
+        )));
+    }
     // The OUTPUT kind drives the layout, exactly as in the sibling assemblers: a `Stk<FlatTag>` output
     // is a head-major rank-3 op, a `Stk<RowBlockedTag>` output is the rank-2 stick-major token stream.
     let head_major = O::kind() == StickKind::Flat;
@@ -1166,11 +1184,11 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
                 gathered_input,
                 index_name,
                 page,
-                // ⭐ THE NODE'S OWN ANCHOR — the whole run starts where the program says, which is
-                // index word `first_entry` (an uncut gather's run and a one-stick gather's are both
-                // the program's own; only the CUT below adds to it). Stick-aligned, checked here:
-                // the IBR is loaded one `SenUint32` stick at a time.
-                first_entry,
+                // ⭐ THE NODE'S OWN RUN — the whole run is the program's, uncut (an uncut gather's
+                // run and a one-stick gather's are both the program's own; only the CUT below
+                // slices it per stick). The [`StickRun`] carries the stick-aligned start and the
+                // one-stick span together, so the leg states exactly what the IBR loads.
+                run,
                 o_name: o.name(),
                 head_major,
             },
@@ -1271,17 +1289,16 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
                 gathered_input,
                 index_name,
                 page,
-                // ⭐ THE RUN'S BASE IN THE INDEX TENSOR — the program's own anchor PLUS this leg's
-                // own stick offset, both in ENTRIES. Leg `k` of a run starting at the program's
-                // `first_entry` reads index words `[first_entry + k·cap, first_entry + k·cap +
-                // leg_rows/page)`, and dropping either term is every leg reading the run's first
-                // stick (the `EntryBase` type exists because the run-half of that happened).
-                // MEASURED: leg `k`'s index `allocate` starts 128 B = one 32-entry `SenUint32`
-                // stick further on than leg `k-1`'s, for all eight. `of_entries` IS the alignment
-                // check — it refuses both an unaligned program anchor and a leg stride that is
-                // not a whole stick (a `cap` change that breaks the stride fails HERE, at bake
-                // time, instead of gathering another run's rows on card).
-                first_entry: first_entry.plus_entries(k * cap).map_err(SuperDscError)?,
+                // ⭐ THE RUN'S OWN LEG `k` — one stick, `k` sticks in, both facts from the run
+                // itself ([`StickRun::leg`]). Leg `k` of a run starting at the program's anchor
+                // reads index words `[start + k·32, start + k·32 + leg_rows/page)`, and dropping
+                // either term is every leg reading the run's first stick (the `EntryBase` type
+                // exists because the run-half of that happened). MEASURED: leg `k`'s index
+                // `allocate` starts 128 B = one 32-entry `SenUint32` stick further on than leg
+                // `k-1`'s, for all eight — and the leg stride being one stick BY CONSTRUCTION is
+                // what `of_sticks` states, where `plus_entries` used to check it (a `cap` change
+                // that broke the stride would now fail to compile against `leg`, not bake).
+                run: run.leg(k).map_err(SuperDscError)?,
                 o_name: o.name(),
                 head_major,
             },
@@ -1317,7 +1334,10 @@ struct GatherLeg<'a> {
     gathered_input: usize,
     index_name: &'a str,
     page: crate::superdsc_opspec::PageExtent,
-    first_entry: crate::superdsc_opspec::EntryBase,
+    /// THIS leg's index run — one whole stick at the run's own leg-`k` start ([`StickRun::leg`]).
+    /// A [`StickRun`] and not a bare base, so a leg cannot state more than one stick of index
+    /// (the wrap the one-stick guard below refuses) or start between sticks (the IBR law).
+    run: crate::superdsc_opspec::StickRun,
     o_name: &'a str,
     head_major: bool,
 }
@@ -1340,7 +1360,7 @@ fn one_gathered_leg(
         gathered_input,
         index_name,
         page,
-        first_entry,
+        run,
         o_name,
         head_major,
     } = leg;
@@ -1429,7 +1449,7 @@ fn one_gathered_leg(
                 // ⛔ NO SECOND PAGED AXIS. `out` is the factor `skip_addr` is made of; pinning it too
                 // would collapse an entry to a single element.
                 per_position: None,
-                first_entry,
+                first_entry: run.start(),
             },
             gathered_input,
         )
@@ -1455,17 +1475,18 @@ fn one_gathered_leg(
         ))
     })?;
     let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
-    if entries > cap {
+    if entries > cap || run.sticks() > 1 {
         return Err(SuperDscError(format!(
             "{op_name}: leg `{leg_name}` declares {entries} index entries ({leg_rows} `{}` \
-             position(s) / a {}-position page), and ONE gather op's index is ONE {cap}-entry stick. \
-             dxp fills the L3LU IBR with a single stick transfer and each core indexes it at its own \
-             work-slice word, so entries past the first {cap} WRAP — MEASURED on the card through this \
-             door: every output row `r` held the row `ids[r mod {cap}]` names, rows 0..{} exact and \
-             the whole tensor at 0.130597 with the right rms. Cut the node into one leg per index \
-             stick.",
+             position(s) / a {}-position page) over a run spanning {} stick(s), and ONE gather op's \
+             index is ONE {cap}-entry stick. dxp fills the L3LU IBR with a single stick transfer and \
+             each core indexes it at its own work-slice word, so entries past the first {cap} WRAP — \
+             MEASURED on the card through this door: every output row `r` held the row `ids[r mod \
+             {cap}]` names, rows 0..{} exact and the whole tensor at 0.130597 with the right rms. Cut \
+             the node into one leg per index stick.",
             ia.entry_dim.dim(),
             ia.page.get(),
+            run.sticks(),
             cap - 1,
         )));
     }
@@ -6948,7 +6969,8 @@ mod gather_cut {
                 inputs: &[In::scalar(&scale).ew(), In::full(&table).ew()],
                 gathered_input: 1,
                 index_name: "t0",
-                first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+                run: crate::superdsc_opspec::StickRun::covering(0, rows)
+                    .expect("the whole-buffer run covers any node"),
                 o: &out,
             },
             &mut sid,
@@ -7123,7 +7145,8 @@ mod gather_cut {
     /// ⛔⛔⛔ THE 32-ENTRY CEILING IS STILL ENFORCED ON THE OP THAT DECLARES THE INDEX, and the cut did
     /// not weaken it: `one_gathered_leg` refuses a longer run BY NAME. It is unreachable from the cut
     /// by construction, so it is reached here with a hand-built over-long leg — which is what makes it
-    /// a proof rather than dead code.
+    /// a proof rather than dead code. The over-long leg names a TWO-STICK run, the spelling the
+    /// [`crate::superdsc_opspec::StickRun`] type admits (a hand-built span) but the leg guard refuses.
     ///
     /// ⭐ AND THE DISCRIMINATING CONTROL IS ONE VARIABLE AWAY: the same leg at one stick emits.
     #[test]
@@ -7149,7 +7172,7 @@ mod gather_cut {
                 gathered_input: 1,
                 index_name: "t0",
                 page: crate::superdsc_opspec::PageExtent::single_position(),
-                first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+                run: crate::superdsc_opspec::StickRun::of_sticks(0, 2),
                 o_name: "t2",
                 head_major: false,
             },
@@ -7182,7 +7205,7 @@ mod gather_cut {
                     gathered_input: 1,
                     index_name: "t0",
                     page: crate::superdsc_opspec::PageExtent::single_position(),
-                    first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+                    run: crate::superdsc_opspec::StickRun::of_sticks(0, 1),
                     o_name: "t2",
                     head_major: false,
                 },
