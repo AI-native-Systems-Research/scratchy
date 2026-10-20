@@ -1701,6 +1701,14 @@ pub(crate) fn superdsc_forward_chunk(
     Ok(ChunkOut::Rows(logits_rows))
 }
 
+/// The request a [`forward_chunk`] runs for: its state, its id, and the store its tokens and token
+/// count live in.
+pub(crate) struct ChunkReq<'a> {
+    pub(crate) state: &'a mut ReqState,
+    pub(crate) id: &'a str,
+    pub(crate) tokens: &'a mut scratchy_serving_engine::input_batch::InputBatch,
+}
+
 /// Run `b` ONCE for `toks` at absolute positions `start..start+toks.len()`
 /// against `req`'s KV cache (m=toks.len() query rows in one forward). `start` is
 /// the valid-prefix count AND the runtime `decode_position`. Appends the new
@@ -1713,10 +1721,7 @@ pub(crate) fn forward_chunk(
     // The preserved prefill meta for the batched-prefill path, bound to the distinct prefill SESSION
     // by run_prefill_batch. None for every non-batched path (they use `b`, the decode meta).
     prefill_meta: Option<&BundleMeta>,
-    req: &mut ReqState,
-    // The request's id and the store its tokens and token-count live in.
-    id: &str,
-    tokens: &mut scratchy_serving_engine::input_batch::InputBatch,
+    request: ChunkReq<'_>,
     start: usize,
     toks: &[usize],
     // The host's list + the pool's owner split: every bind DERIVES this request's page map, and the map's
@@ -1726,6 +1731,11 @@ pub(crate) fn forward_chunk(
     // `superdsc_forward_chunk`'s chunk paths (see `run_request_step`, where it is built).
     pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
 ) -> ExecutorResult<ChunkOut> {
+    let ChunkReq {
+        state: req,
+        id,
+        tokens,
+    } = request;
     {
         let SendnnSession::SuperDsc(sb) = session;
         // Split the borrow: the prompt runs through the m=N `prefill` session (if present),
@@ -1768,15 +1778,18 @@ pub(crate) fn forward_chunk(
     session: &mut SpyreSession,
     b: &BundleMeta,
     prefill_meta: Option<&BundleMeta>,
-    req: &mut ReqState,
-    // Unused here — the emulator is handed its `toks` and never re-slices the history — but present so
-    // the two `forward_chunk` definitions have ONE signature. A cfg pair that differs in shape is a
-    // second call site the other cfg never compiles.
-    id: &str,
-    tokens: &mut scratchy_serving_engine::input_batch::InputBatch,
+    // Its id is unused here — the emulator is handed its `toks` and never re-slices the history — but
+    // present so the two `forward_chunk` definitions have ONE signature. A cfg pair that differs in
+    // shape is a second call site the other cfg never compiles.
+    request: ChunkReq<'_>,
     start: usize,
     toks: &[usize],
 ) -> ExecutorResult<ChunkOut> {
+    let ChunkReq {
+        state: req,
+        id,
+        tokens,
+    } = request;
     let _ = (prefill_meta, id); // the batched-prefill session pair is a sendnn-only shape
     let n = toks.len();
     // KTIR caps a forward at the baked m_cap. The sendnn paged prefill runs the
@@ -1905,17 +1918,13 @@ pub(crate) fn forward_chunk(
         // source's class index is offset past the cos sources.
         let n_cos = b.cos_srcs.len();
         for (ci, &(cid, w, kind)) in b.cos_srcs.iter().enumerate() {
-            dynamic.push((
-                cid as u64,
-                tile(&cos_tab[ci], w as usize, kind),
-                vec![rows, w as usize],
-            ));
+            dynamic.push((cid as u64, tile(&cos_tab[ci], w, kind), vec![rows, w]));
         }
         for (ci, &(sid, w, kind)) in b.sin_srcs.iter().enumerate() {
             dynamic.push((
                 sid as u64,
-                tile(&sin_tab[n_cos + ci], w as usize, kind),
-                vec![rows, w as usize],
+                tile(&sin_tab[n_cos + ci], w, kind),
+                vec![rows, w],
             ));
         }
         dynamic
@@ -2231,9 +2240,11 @@ pub(crate) fn run_request_step(
             &mut model.session,
             b,
             model.batched_prefill.as_ref(),
-            req,
-            id,
-            tokens,
+            ChunkReq {
+                state: req,
+                id,
+                tokens,
+            },
             pos,
             chunk,
             #[cfg(feature = "spyre-hw")]

@@ -30,6 +30,9 @@ use tracing::info;
 #[cfg(feature = "spyre-hw")]
 use tracing::{debug, warn};
 
+/// A weight staged for binding: its tensor id, bytes, dtype and shape.
+pub(crate) type StagedWeight = (usize, Vec<u8>, SDType, Vec<usize>);
+
 /// ⭐ THE RESIDENT SEGMENTS EVERY BORROWER ADOPTS, AS ONE LIST. Four sites alias these (the
 /// prefix-capable prefill, the prefill ladder rungs, the decode batch rungs, and the top prefill
 /// session), and a segment missing from ONE of them leaves that session pointing at a 128 B
@@ -390,7 +393,7 @@ fn spilled_weight_tail_tids(
 /// stage, or a payload a multiply cannot scale in place (fp8 — that is a requantize; integers).
 /// Either is a wiring↔recognition desync, not an input to interpret.
 fn apply_weight_scale_folds(
-    weights: &mut [(usize, Vec<u8>, SDType, Vec<usize>)],
+    weights: &mut [StagedWeight],
     folds: &[(u32, f32)],
 ) -> ExecutorResult<()> {
     use rayon::prelude::*;
@@ -479,7 +482,7 @@ fn apply_weight_scale_folds(
 /// stage, or a `to` id the binding already owns — either is a wiring↔mint desync, not an input
 /// to interpret.
 fn materialize_weight_copies(
-    weights: &mut Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
+    weights: &mut Vec<StagedWeight>,
     copies: &[(u32, u32)],
 ) -> ExecutorResult<()> {
     for (from, to) in copies {
@@ -522,9 +525,9 @@ pub(crate) fn stage_bound_weights(
     // The allocator that owns the bound tensors' buffers: staging TAKES each buffer
     // (no copy) at its last binding instead of copying it while the original stays alive.
     alloc: &mut SpyreAllocator,
-) -> ExecutorResult<Vec<(usize, Vec<u8>, SDType, Vec<usize>)>> {
+) -> ExecutorResult<Vec<StagedWeight>> {
     let _t_load = std::time::Instant::now();
-    let mut weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)> = Vec::new();
+    let mut weights: Vec<StagedWeight> = Vec::new();
     let _take_s = 0f64;
     // The LAST binding of each buffer — a buffer two bindings share (a tied head, k=v) is
     // copied for every binding but its last, which takes it.
@@ -1044,15 +1047,16 @@ impl SpyreWorker {
         // `None` IS read on the non-sendnn path, and what it feeds is one call away.
         // ⛔ THE MUTABILITY IS THE CARD PATH'S, so it carries that cfg rather than an
         // `#[allow(unused_mut)]`: only the branch below assigns these, and on the emulator the
-        // binding is a plain `None` that is read once.
+        // binding is `BakeFacts::NONE` (a bundle that placed nothing), read once. A card bake that
+        // never assigns its decode facts leaves `NONE` too, which `require_identity` refuses.
         #[cfg(feature = "spyre-hw")]
-        let mut decode_facts: Option<scratchy_target_spyre::wiring::BakeFacts> = None;
+        let mut decode_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
         #[cfg(not(feature = "spyre-hw"))]
-        let decode_facts: Option<scratchy_target_spyre::wiring::BakeFacts> = None;
+        let decode_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
         #[cfg(feature = "spyre-hw")]
-        let mut prefill_facts: Option<scratchy_target_spyre::wiring::BakeFacts> = None;
+        let mut prefill_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
         #[cfg(not(feature = "spyre-hw"))]
-        let prefill_facts: Option<scratchy_target_spyre::wiring::BakeFacts> = None;
+        let prefill_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
         // The KV byte budget the paged pool gets sized against — the card's real capacity ×
         // `--gpu-memory-utilization` − the bundle's non-KV segments. Declared out here for the same reason
         // `scalarmul_scales_v` is: it is computed in the SuperDsc branch below (sendnn only) but has to
@@ -1855,7 +1859,7 @@ impl SpyreWorker {
                             .join(", "),
                     )));
                 }
-                decode_facts = Some(df);
+                decode_facts = df;
                 // ── PREFILL-ALL-BUT-LAST: the DISTINCT m=N prefill dxp bundle (C4 stamps its own fp
                 //    in the prefill graph slot; lm_head skipped). Build a SECOND SuperDscSession from
                 //    it (binding the SAME weights again — 2× resident, the spike cost) so the prompt
@@ -1922,7 +1926,7 @@ impl SpyreWorker {
                         // What the PREFILL bake placed. From the bundle, never from
                         // `SCRATCHY_RMS_MATMUL_REDUCE`, so a bundle-vs-env mismatch cannot leave a
                         // matmul reading an unbound (zero) seg0.
-                        prefill_facts = Some(scratchy_target_spyre::wiring::BakeFacts::of(pl));
+                        prefill_facts = scratchy_target_spyre::wiring::BakeFacts::of(pl);
                         // The prefill bake's class sets against ITS placements — the same
                         // cross-check the decode bake just passed, for the same reason.
                         wirings
@@ -2763,14 +2767,7 @@ impl SpyreWorker {
         let mut decode: Vec<BundleMeta> = dparsed_all
             .into_iter()
             .enumerate()
-            .map(|(i, p)| {
-                mk_meta(
-                    p,
-                    decode_prog_base + i,
-                    decode_facts.unwrap_or(scratchy_target_spyre::wiring::BakeFacts::NONE),
-                    &wirings.decode,
-                )
-            })
+            .map(|(i, p)| mk_meta(p, decode_prog_base + i, decode_facts, &wirings.decode))
             .collect();
         // Ascending by capacity so `select_decode`'s first-fit picks the smallest.
         decode.sort_by_key(|b| b.capacity);
@@ -2778,7 +2775,7 @@ impl SpyreWorker {
             mk_meta(
                 p,
                 prefill_prog.unwrap(),
-                prefill_facts.unwrap_or(scratchy_target_spyre::wiring::BakeFacts::NONE),
+                prefill_facts,
                 wirings.prefill.as_ref().unwrap_or(&wirings.decode),
             )
         });
@@ -2848,7 +2845,7 @@ mod weight_scale_fold_tests {
     /// One staged weight as `stage_bound_weights` shapes them: `(id, bytes, dtype, dims)`.
     /// The element values go through the SAME one-rounding encode the load path produces
     /// (`f32 → dtype` once), so the test asserts the multiply's effect, not encoding drift.
-    fn staged(id: usize, dt: SDType, vals: &[f32]) -> (usize, Vec<u8>, SDType, Vec<usize>) {
+    fn staged(id: usize, dt: SDType, vals: &[f32]) -> StagedWeight {
         let bytes: Vec<u8> = vals
             .iter()
             .flat_map(|v| match dt {
@@ -2962,7 +2959,7 @@ mod weight_copy_tests {
     /// One staged fp8 o_proj-shaped weight as `stage_bound_weights` shapes it:
     /// `(id, bytes, dtype, dims)`. The values are arbitrary — the copy is byte-for-byte
     /// and dims-agnostic, which is the law under test.
-    fn oproj_row(id: usize, bytes: &[u8]) -> (usize, Vec<u8>, SDType, Vec<usize>) {
+    fn oproj_row(id: usize, bytes: &[u8]) -> StagedWeight {
         (id, bytes.to_vec(), SDType::Fp8E4m3, vec![4096, 4096])
     }
 

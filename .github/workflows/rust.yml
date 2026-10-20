@@ -541,6 +541,11 @@ jobs:
       # binary and no check was red. This leg is the compile cover for that class.
       - name: Test (spyre ktir-superdsc + bundle)
         run: cargo test -p ktir-superdsc -p scratchy-spyre-bundle
+      # scratchy-subtile's lib and integration tests ran in no step, so they rotted unseen (#542:
+      # a missing initializer field kept the lib tests from compiling). Pure Rust, no device, on
+      # the ktir-superdsc build the step above leaves; under `spyre`, which gates no test out.
+      - name: Test (scratchy-subtile, spyre)
+        run: cargo test -p scratchy-subtile --features spyre
       - name: Clippy (triton re-host crates, all targets)
         run: cargo clippy -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice --all-targets -- -D warnings
       - name: Test (triton re-host crates)

@@ -24,15 +24,51 @@
 //! notices, because the result is a fluent wrong answer with no fault.
 #![cfg(feature = "spyre")]
 
-use std::collections::HashSet;
+/// A set of physical pages, as bits: every pool here holds fewer than 192 (the sweep's is 4·32+8).
+/// A bitset rather than a `HashSet` so the sweep's million batches run in seconds, unoptimized.
+#[derive(Clone, Copy, Default)]
+struct Pages([u64; 3]);
 
-/// `ensure_pages`' draw rule, verbatim: the lowest page no live request holds and this one does not.
-fn draw(pool_pages: usize, held: &HashSet<usize>, own: &[usize], want: usize) -> Vec<usize> {
+impl Pages {
+    fn of(pages: &[usize]) -> Self {
+        let mut set = Self::default();
+        for &p in pages {
+            set.insert(p);
+        }
+        set
+    }
+
+    fn insert(&mut self, page: usize) {
+        self.0[page / 64] |= 1 << (page % 64);
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self(std::array::from_fn(|w| self.0[w] | other.0[w]))
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        (0..3).any(|w| self.0[w] & other.0[w] != 0)
+    }
+
+    fn len(self) -> usize {
+        self.0.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// The lowest page below `pool_pages` not in the set.
+    fn lowest_free(self, pool_pages: usize) -> Option<usize> {
+        let w = self.0.iter().position(|&w| w != u64::MAX)?;
+        let page = w * 64 + self.0[w].trailing_ones() as usize;
+        (page < pool_pages).then_some(page)
+    }
+}
+
+/// `ensure_pages`' draw rule: the lowest page no live request holds (`held`) and this one does not.
+fn draw(pool_pages: usize, held: Pages, own: &[usize], want: usize) -> Vec<usize> {
     let mut pages = own.to_vec();
+    let mut taken = held.union(Pages::of(own));
     while pages.len() < want {
-        let phys = (0..pool_pages)
-            .find(|p| !held.contains(p) && !pages.contains(p))
-            .expect("pool exhausted");
+        let phys = taken.lowest_free(pool_pages).expect("pool exhausted");
+        taken.insert(phys);
         pages.push(phys);
     }
     pages
@@ -43,40 +79,43 @@ fn grow_ragged(pool_pages: usize, initial: &[usize], want: usize) -> Vec<Vec<usi
     // PREFILL: each row holds exactly the pages its own prompt needed, drawn in row order.
     let mut rows: Vec<Vec<usize>> = Vec::new();
     for &n in initial {
-        let held: HashSet<usize> = rows.iter().flatten().copied().collect();
-        rows.push(draw(pool_pages, &held, &[], n));
+        let held = rows
+            .iter()
+            .fold(Pages::default(), |h, p| h.union(Pages::of(p)));
+        rows.push(draw(pool_pages, held, &[], n));
     }
     // DECODE: every row is grown to cover the SHARED write slot — the max over live ends, which is why a
     // shallow row grows at all. The held set is recomputed before each row, as the worker's loop does.
     for r in 0..rows.len() {
-        let held: HashSet<usize> = rows
-            .iter()
-            .enumerate()
+        let held = (rows.iter().enumerate())
             .filter(|(i, _)| *i != r)
-            .flat_map(|(_, p)| p.iter().copied())
-            .collect();
+            .fold(Pages::default(), |h, (_, p)| h.union(Pages::of(p)));
         let own = rows[r].clone();
-        rows[r] = draw(pool_pages, &held, &own, want);
+        rows[r] = draw(pool_pages, held, &own, want);
     }
     rows
 }
 
-fn assert_pairwise_disjoint(rows: &[Vec<usize>], what: &str) {
+/// `what` names the batch, and is built only when the assertion fails.
+fn assert_pairwise_disjoint(rows: &[Vec<usize>], what: impl Fn() -> String) {
+    let sets: Vec<Pages> = rows.iter().map(|p| Pages::of(p)).collect();
     for (a, pa) in rows.iter().enumerate() {
-        let uniq: HashSet<usize> = pa.iter().copied().collect();
         assert_eq!(
-            uniq.len(),
+            sets[a].len(),
             pa.len(),
-            "{what}: row {a} holds a page twice: {pa:?}"
+            "{}: row {a} holds a page twice: {pa:?}",
+            what()
         );
         for (b, pb) in rows.iter().enumerate().skip(a + 1) {
-            let shared: Vec<usize> = pa.iter().filter(|p| pb.contains(p)).copied().collect();
-            assert!(
-                shared.is_empty(),
-                "{what}: rows {a} and {b} SHARE page(s) {shared:?} — both write their new token at the \
-                 batch's ONE shared slot, so one silently overwrites the other's newest key.\n  row {a}: \
-                 {pa:?}\n  row {b}: {pb:?}"
-            );
+            if sets[a].intersects(sets[b]) {
+                let shared: Vec<usize> = pa.iter().filter(|p| pb.contains(p)).copied().collect();
+                panic!(
+                    "{}: rows {a} and {b} SHARE page(s) {shared:?} — both write their new token at \
+                     the batch's ONE shared slot, so one silently overwrites the other's newest \
+                     key.\n  row {a}: {pa:?}\n  row {b}: {pb:?}",
+                    what()
+                );
+            }
         }
     }
 }
@@ -86,7 +125,7 @@ fn a_ragged_batch_grown_to_the_shared_slot_keeps_every_rows_pages_disjoint() {
     // The profile the card fails on: 220 / 698 / 1268 / 1982 tokens = 1 / 3 / 5 / 8 pages, grown to 8.
     let want = 8usize;
     let rows = grow_ragged(136, &[1, 3, 5, 8], want);
-    assert_pairwise_disjoint(&rows, "ragged 1/3/5/8 -> 8");
+    assert_pairwise_disjoint(&rows, || "ragged 1/3/5/8 -> 8".into());
     for (r, pages) in rows.iter().enumerate() {
         assert_eq!(
             pages.len(),
@@ -102,7 +141,7 @@ fn the_uniform_batch_that_passes_on_card_draws_nothing_at_all() {
     // exercise the growth path, and therefore cannot see any bug that lives in it.
     let want = 8usize;
     let rows = grow_ragged(136, &[8, 8, 8, 8], want);
-    assert_pairwise_disjoint(&rows, "uniform 8/8/8/8");
+    assert_pairwise_disjoint(&rows, || "uniform 8/8/8/8".into());
     assert_eq!(
         rows,
         vec![
@@ -130,7 +169,7 @@ fn every_raggedness_up_to_the_ceiling_stays_disjoint() {
                     let initial = [a, b, c, d];
                     let want = *initial.iter().max().unwrap();
                     let rows = grow_ragged(4 * max + 8, &initial, want);
-                    assert_pairwise_disjoint(&rows, &format!("ragged {initial:?} -> {want}"));
+                    assert_pairwise_disjoint(&rows, || format!("ragged {initial:?} -> {want}"));
                 }
             }
         }
@@ -147,13 +186,17 @@ fn hoisting_the_held_set_out_of_the_loop_makes_two_rows_share_a_page() {
     let want = 8usize;
     let mut rows: Vec<Vec<usize>> = Vec::new();
     for &n in &initial {
-        let held: HashSet<usize> = rows.iter().flatten().copied().collect();
-        rows.push(draw(pool, &held, &[], n));
+        let held = rows
+            .iter()
+            .fold(Pages::default(), |h, p| h.union(Pages::of(p)));
+        rows.push(draw(pool, held, &[], n));
     }
-    let stale: HashSet<usize> = rows.iter().flatten().copied().collect(); // <-- hoisted
+    let stale = rows
+        .iter()
+        .fold(Pages::default(), |h, p| h.union(Pages::of(p))); // <-- hoisted
     for r in 0..rows.len() {
         let own = rows[r].clone();
-        rows[r] = draw(pool, &stale, &own, want);
+        rows[r] = draw(pool, stale, &own, want);
     }
     let mut shared_any = false;
     for (a, pa) in rows.iter().enumerate() {
