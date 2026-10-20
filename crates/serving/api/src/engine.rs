@@ -5789,6 +5789,13 @@ mod tests {
             Ok(())
         }
 
+        // It never schedules a step, so none can fail.
+        fn abandon_step(
+            &mut self,
+            _sched: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
+        ) {
+        }
+
         fn abort_running_requests(&mut self) {}
 
         fn shutdown(&mut self) -> scratchy_serving_engine::error::EngineResult<()> {
@@ -5925,6 +5932,15 @@ mod tests {
         ) -> scratchy_serving_engine::error::EngineResult<()> {
             self.aborted.lock().unwrap().extend_from_slice(request_ids);
             Ok(())
+        }
+
+        // As the engine does: a failed step's requests are aborted.
+        fn abandon_step(
+            &mut self,
+            sched: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
+        ) {
+            let ids = sched.num_scheduled_tokens.keys().cloned();
+            self.aborted.lock().unwrap().extend(ids);
         }
 
         fn abort_running_requests(&mut self) {}

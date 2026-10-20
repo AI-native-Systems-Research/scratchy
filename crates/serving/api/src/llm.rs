@@ -541,10 +541,14 @@ impl LLM {
         request_ids: &[String],
         error: scratchy_serving_engine::error::EngineError,
     ) -> anyhow::Error {
-        let failed = anyhow::anyhow!("engine step failed: {error}");
+        // The step's failure stays the error a caller prints (`{e}` shows only the outermost
+        // message): a failed retire is appended to it, not wrapped around it.
         match self.abort_and_drain(request_ids) {
-            Ok(()) => failed,
-            Err(drain) => failed.context(format!("retiring the generation's requests: {drain}")),
+            Ok(()) => anyhow::anyhow!("engine step failed: {error}"),
+            Err(drain) => anyhow::anyhow!(
+                "engine step failed: {error} (and retiring the generation's requests failed: \
+                 {drain})"
+            ),
         }
     }
 

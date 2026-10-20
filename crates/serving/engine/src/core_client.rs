@@ -113,8 +113,10 @@ pub trait EngineCoreClient {
     }
 
     /// A step the executor failed, never to be finalized: it leads no more and its requests are
-    /// aborted ([`EngineCore::abandon_step`]).
-    fn abandon_step(&mut self, _sched: &SchedulerOutput) {}
+    /// aborted ([`EngineCore::abandon_step`]). No default: the server's step loop aborts a failed
+    /// step's requests through it alone, so a client that took the executor and kept a no-op
+    /// here would leave them running.
+    fn abandon_step(&mut self, sched: &SchedulerOutput);
 
     /// Whether async scheduling is enabled on the underlying engine.
     fn async_scheduling(&self) -> bool {
@@ -811,6 +813,36 @@ mod tests {
         let outcome = client.get_output().unwrap();
         let StepOutcome::Progressed { outputs, .. } = outcome else {
             panic!("b is admitted: {outcome:?}");
+        };
+        assert_eq!(outputs.outputs[0].request_id, "b");
+    }
+
+    /// The synchronous path — an engine that never starts the pipeline, as one without async
+    /// scheduling — releases a failed step the same way: its request is aborted, so a later call
+    /// does not drive it on, and a request added after it runs.
+    #[test]
+    fn a_failed_sync_step_is_released() {
+        // Without a proposer, the executor's drafts go unread: it only fails its second step.
+        let executor = DraftingExecutor {
+            inner: NoopExecutor::new(1024),
+            steps: 0,
+            fail_at: 2,
+        };
+        let mut client = InprocClient::new(make_test_config(), Box::new(executor));
+
+        client.add_request(make_ec_request("a", 4)).unwrap();
+        let (outputs, _) = client.get_output().unwrap().into_tuple();
+        assert_eq!(outputs.outputs[0].request_id, "a", "the prompt step");
+        assert!(client.get_output().is_err(), "the decode step fails");
+        assert!(
+            !client.has_unfinished_requests(),
+            "the failed step's request is aborted"
+        );
+
+        client.add_request(make_ec_request("b", 4)).unwrap();
+        let outcome = client.get_output().unwrap();
+        let StepOutcome::Progressed { outputs, .. } = outcome else {
+            panic!("b runs: {outcome:?}");
         };
         assert_eq!(outputs.outputs[0].request_id, "b");
     }
