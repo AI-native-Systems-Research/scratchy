@@ -286,46 +286,62 @@ pub fn assemble_matmul_off<O: crate::sdsc_abstract::KindTag>(
 /// (`r_start` is refused upstream by `base_addressed`), so the swept `m` IS the tensor's row count
 /// and the handle extents the opspec derives are the tensor's own. Only the kernel's `in` axis —
 /// the one this tiling splits — needs the declaration.
-#[allow(clippy::too_many_arguments)]
+/// ⭐⭐⭐ THE WINDOWED MATMUL BOUNDARY TAKES CHECKED WINDOWS, NOT (name, raw offset) PAIRS.
+///
+/// Every operand arrives as a [`Win`](crate::addr::Win) — identity, minted offset and sweep
+/// extents as ONE value, checked against the tensor's declared shape and its placement
+/// footprint at the MINT (in the whole-function door, right where `DeviceWidth::for_matmul`
+/// computed the device width). The raw `(name, off)` pairs this boundary used to take were the
+/// seam the #717 pad walked through: a util-floor width of 512 sweeping a 64-column window of
+/// new_v read 64 columns past the placement, and nothing between this boundary and the bake
+/// could refuse it. The op's shape is NOT restated beside the windows: A sweeps `[m, k]`, W
+/// `[k, n_dev]`, O `[m, n_dev]`, and a disagreement between the three is refused here rather
+/// than baked as one operand's shape against another's.
 pub fn assemble_matmul_windowed(
     op_name: &str,
-    m: MatM,
-    n: MatN,
-    k: MatK,
-    a: &Stk<crate::sdsc_abstract::RowBlockedTag>,
-    a_off: crate::addr::DevOff,
-    w: &Stk<crate::sdsc_abstract::KernelTag>,
-    w_off: crate::addr::DevOff,
+    a: &crate::addr::Win<'_, crate::sdsc_abstract::RowBlockedTag>,
+    w: &crate::addr::Win<'_, crate::sdsc_abstract::KernelTag>,
     w_in_phys: u32,
-    o: &Stk<crate::sdsc_abstract::RowBlockedTag>,
-    o_off: crate::addr::DevOff,
+    o: &crate::addr::Win<'_, crate::sdsc_abstract::RowBlockedTag>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
+    let (m, k, n) = (a.rows(), a.cols(), w.cols());
+    if w.rows() != k || o.rows() != m || o.cols() != n {
+        panic!(
+            "assemble_matmul {op_name}: the operand windows disagree — A sweeps [{}, {}], W \
+             [{}, {}], O [{}, {}]: a matmul's operands sweep one shape, minted from one law",
+            a.rows(),
+            a.cols(),
+            w.rows(),
+            w.cols(),
+            o.rows(),
+            o.cols()
+        );
+    }
     let (a_name, w_name, o_name) = (a.name(), w.name(), o.name());
     let mut op = matmul_opspec_off::<Fp16>(
-        m,
-        n,
-        k,
+        MatM::of_token_rows(m),
+        MatN::of_out_features(n),
+        MatK::of_in_features(k),
         MatY::of_batch(1),
         SharedKernelBmmForm::batch_inner_proven(super::walk::MatmulWrapperSite::witness()),
         a_name,
         w_name,
         o_name,
-        a_off.into_raw_elems(),
-        w_off.into_raw_elems(),
-        o_off.into_raw_elems(),
+        a.off().into_raw_elems(),
+        w.off().into_raw_elems(),
+        o.off().into_raw_elems(),
     )
     .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
     // ⛔ THE KERNEL'S OWN `in` EXTENT, and a phys SMALLER than the swept k is a mis-declaration
     // (the same rule `matmul_opspec_batched_off` states): a window never covers more than its
     // allocation. Refused here rather than emitting a descriptor whose declared span exceeds the
     // footprint the placement reserved.
-    if w_in_phys < k.get() {
+    if w_in_phys < k {
         panic!(
             "assemble_matmul {op_name}: kernel `in` physical extent {w_in_phys} is SMALLER than \
-             the swept k {} — a window cannot cover more than its allocation",
-            k.get()
+             the swept k {k} — a window cannot cover more than its allocation"
         );
     }
     if let Some(kernel) = op.args.iter_mut().find(|arg| arg.view().name == w_name) {
@@ -366,7 +382,7 @@ pub fn assemble_matmul_windowed(
     // gate, A[64,12800]·W[12800,4096] down) — so the tiled descriptor says exactly what the
     // PASSING flat granite descriptor says (`N_.in_ = 4096/12800`, its kernels never wrong).
     // FLAT AND `k == in_phys` ARE BYTE-IDENTICAL: `w_in_phys == k` skips the rewrite.
-    if w_in_phys != k.get()
+    if w_in_phys != k
         && let Some(dsc) = emitted.op.as_mut()
     {
         for dsc_map in dsc.dscs_.iter_mut() {

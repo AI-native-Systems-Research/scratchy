@@ -51,7 +51,6 @@ use crate::place::{PlaceId, SynthRole};
 use crate::placement::{BundleLayout, syn};
 use crate::reserved_tids::{LAST_HIDDEN_TID, scalarmul_scale_tid};
 use crate::sdsc_abstract::{KernelTag, Stk};
-use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{DataFormat, Df, Fp16, ItDim, SdscFoldSet};
 use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES};
 use ktir_core::affine::AffineExpr;
@@ -3660,6 +3659,26 @@ pub struct MatmulProof {
 
 /// [`matmul`] with the weight orientation PROVEN by the caller instead of assumed — see
 /// [`super::whole_function::matmul_b_orientation`], which reads it off the op's own `indexing_maps`.
+/// A WINDOWED matmul emission mints its operand [`Win`](crate::addr::Win)s through the
+/// PLACEMENT authority (`BundleLayout::win` — the tensor's declared shape AND its placement
+/// footprint, the same `resolve_seg_base` arms), so the mint and the bake-time guard read one
+/// window model. The shape authority (`View::win`) is not a substitute HERE: its nest would be
+/// a door-local reconstruction of numbers the caller already stated, a fourth mint in all but
+/// name — so a windowed emission with no `BundleLayout` at hand is refused by name rather than
+/// minted against nothing.
+fn mint_window<'a, K: crate::sdsc_abstract::KindTag>(
+    layout: &BundleLayout,
+    stk: &'a crate::sdsc_abstract::Stk<K>,
+    off: crate::addr::DevOff,
+    rows: u32,
+    cols: u32,
+    what: &str,
+) -> Result<crate::addr::Win<'a, K>, Error> {
+    layout
+        .win(stk, off, rows, cols, what)
+        .map_err(|message| Error { message })
+}
+
 pub fn matmul_oriented(
     name: &str,
     r: &[Region],
@@ -3993,18 +4012,69 @@ pub fn matmul_oriented(
                 ));
             }
         }
+        // ⭐⭐⭐ THE TYPED OPERAND WINDOWS — identity, offset and sweep extents minted as ONE
+        // value through the placement authority, at the door where `n_dev` was computed. The
+        // handles declare the TENSORS (the regions' own view extents — what the placements
+        // hold); the WINS carry the SWEEPS: A `[m, k]` logical, W `[k, n_dev]` and O `[m, n_dev]`
+        // at the DEVICE width, so what the mint checks is the pad law's own product. With the
+        // floor test's aligned-`n` fix reverted, the #717 pad (n_dev 512 sweeping a 64-column
+        // window of new_v at kvh·64) fails HERE — an expansion-time `Err` naming `for_matmul`
+        // and the operand — instead of surviving to the bake's footprint audit.
+        let Some(layout_ref) = layout else {
+            return err(format!(
+                "{op_name}: a WINDOWED matmul emission requires the placement authority — the \
+                 operand windows are minted through `BundleLayout::win`, which checks each \
+                 sweep against the tensor's declared shape and its placement footprint. No \
+                 `BundleLayout` is at hand at this door, so there is no authority to mint the \
+                 windows against."
+            ));
+        };
+        let a_stk = rb(&a.name(), a.v_rows, a.v_cols);
+        let w_stk = Stk::<KernelTag>::kernel(k_full as usize, n_full as usize, &w_name);
+        // ⭐ THE OUTPUT HANDLE DECLARES THE UNION OF THE VIEW AND THE DEVICE SWEEP —
+        // `v_cols.max(n_dev)` — because the walk reserves a matmul intermediate at its DEVICE
+        // width while its REGION stays logical (whole_function's own law: the placement is
+        // synthed at `[dims[0], for_matmul(...)]`, the region carries the program's stated
+        // extents). A 1-wide logical output stick-fills to a 64-lane device sweep — the view
+        // ALONE would understate the tensor the placement holds and refuse the pad as a
+        // defect; the device width ALONE would refuse a corner-0 window into a WIDER view
+        // (the per-head slice of a concat). The union is the buffer these windows live in,
+        // and the placement remains the byte authority either way.
+        let o_stk = rb(&out.name(), out.v_rows, out.v_cols.max(n_dev));
+        let a_win = mint_window(
+            layout_ref,
+            &a_stk,
+            a_off,
+            m,
+            k,
+            &format!("{op_name} activation (A): the whole-function door's [m, k] sweep"),
+        )?;
+        let w_win = mint_window(
+            layout_ref,
+            &w_stk,
+            w_off,
+            k,
+            n_dev,
+            &format!(
+                "{op_name} weight (W): DeviceWidth::for_matmul(m={m}, n={n}, k={k}, windowed) \
+                 swept the kernel at the device width {n_dev} — a pad past the placement is \
+                 refused at this mint"
+            ),
+        )?;
+        let o_win = mint_window(
+            layout_ref,
+            &o_stk,
+            o_off,
+            m,
+            n_dev,
+            &format!("{op_name} output (O): the device-width [m, {n_dev}] write sweep"),
+        )?;
         assemble_matmul_windowed(
             &op_name,
-            MatM::of_token_rows(m),
-            MatN::of_out_features(n_dev),
-            MatK::of_in_features(k),
-            &rb(&a.name(), m, k),
-            a_off,
-            &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, &w_name),
-            w_off,
+            &a_win,
+            &w_win,
             k_full,
-            &rb(&out.name(), m, n_dev),
-            o_off,
+            &o_win,
             sym_id_base,
             layout,
         )
