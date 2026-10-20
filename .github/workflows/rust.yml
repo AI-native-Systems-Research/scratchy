@@ -172,8 +172,8 @@ jobs:
       # `--all-targets` can't simply be added to the workspace clippy: it would
       # also build ktir-emulator's two known-broken examples (bench,
       # ktir_diff_run) — the pre-existing MTL3->MTL4 gap documented at the KTIR
-      # steps in macos-metal, which is why those use `--lib --tests`. Hence a
-      # `-p`-scoped step instead.
+      # steps in macos-metal-tests, which is why those use `--lib --tests`.
+      # Hence a `-p`-scoped step instead.
       #
       # No backend feature, deliberately. scratchy-bench is `default = []` with
       # `cuda`/`metal` as pure pass-throughs to scratchy-serving-api and no
@@ -242,6 +242,11 @@ jobs:
   # crates) skips both; a push to main always runs them. The list, and the lock
   # each macOS job ends with that keeps it true, are in
   # scripts/ci-macos-scope.sh.
+  #
+  # Only a successful `macos=false` skips them. GitHub counts a skipped
+  # required check as passing, so their `if:` fails closed: `!cancelled()`
+  # drops the implicit `success()` that would otherwise skip them whenever
+  # this job fails.
   # ---------------------------------------------------------------------------
   macos-scope:
     name: macOS scope
@@ -279,13 +284,12 @@ jobs:
   # invocation over every stem (~13 min), longer than every other step
   # combined. The two share no build output: clippy writes check metadata,
   # and every `cargo test` step rebuilds the workspace in the `test` profile
-  # anyway. `macos-arm64 (metal)`, the branch rules' required check, is the
-  # gate job after them.
+  # anyway. Both are required checks in the branch rules.
   # ---------------------------------------------------------------------------
   macos-metal-clippy:
     name: macos-arm64 (metal clippy, all models)
     needs: macos-scope
-    if: needs.macos-scope.outputs.macos == 'true'
+    if: ${{ !cancelled() && !(needs.macos-scope.result == 'success' && needs.macos-scope.outputs.macos == 'false') }}
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
@@ -315,7 +319,7 @@ jobs:
   macos-metal-tests:
     name: macos-arm64 (metal tests)
     needs: macos-scope
-    if: needs.macos-scope.outputs.macos == 'true'
+    if: ${{ !cancelled() && !(needs.macos-scope.result == 'success' && needs.macos-scope.outputs.macos == 'false') }}
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
@@ -442,33 +446,13 @@ jobs:
       - name: Compiled no crate macos-scope skips for
         run: scripts/ci-macos-scope.sh lock
 
-  # The required check: the branch rules name `macos-arm64 (metal)`, so this
-  # passes only when both macOS jobs did, or when macos-scope found nothing
-  # they compile changed. `always()` is load-bearing: without it a failed
-  # dependency SKIPS this job, and GitHub counts a skipped required check as
-  # passing. A failed macos-scope has no `macos=false`, so it fails this too.
-  macos-metal:
-    name: macos-arm64 (metal)
-    needs: [macos-scope, macos-metal-clippy, macos-metal-tests]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Both macOS jobs passed, or neither was needed
-        run: |
-          echo "scope: ${{ needs.macos-scope.result }} macos=${{ needs.macos-scope.outputs.macos }}, clippy: ${{ needs.macos-metal-clippy.result }}, tests: ${{ needs.macos-metal-tests.result }}"
-          if [ "${{ needs.macos-scope.result }}" = success ] && [ "${{ needs.macos-scope.outputs.macos }}" = false ]; then
-            exit 0
-          fi
-          [ "${{ needs.macos-metal-clippy.result }}" = success ]
-          [ "${{ needs.macos-metal-tests.result }}" = success ]
-
   # ---------------------------------------------------------------------------
   # Linux / amd64 — Spyre emulator, non-Accelerate BLAS backends.
   #
   # ktir-emulator's `blis`/`mkl`/`openblas` features (the real IBM Spyre
   # deployment's BLAS choices, run on Linux) are otherwise never built or
   # tested anywhere: linux-cuda only compiles ktir-emulator with default
-  # (no-BLAS) features, and macos-metal's `[target.'cfg(target_os =
+  # (no-BLAS) features, and on the macOS jobs its `[target.'cfg(target_os =
   # "macos")'.dependencies.blas-src]` block is unconditional (always
   # Accelerate) — selecting `openblas`/`mkl` there collides with it. This job
   # is the only place a non-Accelerate BLAS backend actually links and runs.
