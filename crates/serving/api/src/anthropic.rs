@@ -1292,7 +1292,10 @@ impl AnthropicSseEncoder {
 
         if delta.finish_reason.is_some() {
             self.close_open(&mut events);
-            let stop_reason = if self.saw_tool_use {
+            // Only a call the model finished is `tool_use`: one cut off by `max_tokens` stays
+            // `max_tokens`, so no client runs a call whose input may be incomplete.
+            let stopped = delta.finish_reason == Some(scratchy_core_common::FinishReason::Stop);
+            let stop_reason = if self.saw_tool_use && stopped {
                 "tool_use".to_string()
             } else {
                 let r = delta.finish_reason.map(|r| r.to_string());
@@ -2138,6 +2141,30 @@ mod tests {
         assert_eq!(events[6].1["delta"]["stop_reason"], "tool_use");
     }
 
+    /// A tool call cut off by `max_tokens` stops `max_tokens`, not `tool_use`: its input may be
+    /// incomplete, so no client should run it.
+    #[test]
+    fn test_stream_tool_use_cut_off_stops_max_tokens() {
+        let mut enc = AnthropicSseEncoder::new("req1".into(), "m".into());
+        let mut events = Vec::new();
+        events.extend(enc.push(&mk_delta(
+            None,
+            Some(vec![mk_tc(
+                0,
+                Some("call_a"),
+                Some("get_weather"),
+                Some("{\"city\":"),
+            )]),
+            None,
+        )));
+        events.extend(enc.push(&mk_delta(None, None, Some(FinishReason::Length))));
+        let message_delta = events.iter().find(|(name, _)| *name == "message_delta");
+        assert_eq!(
+            message_delta.unwrap().1["delta"]["stop_reason"],
+            "max_tokens"
+        );
+    }
+
     #[test]
     fn test_stream_text_basic() {
         let mut enc = AnthropicSseEncoder::new("r".into(), "m".into());
@@ -2325,8 +2352,10 @@ mod tests {
     #[test]
     fn test_stream_tool_call_reports_buffered_tokens() {
         for reasoning in [false, true] {
-            let (deltas, generated) =
-                crate::engine::test_support::buffered_tool_call_deltas(reasoning);
+            let (deltas, generated) = crate::engine::test_support::buffered_tool_call_deltas(
+                reasoning,
+                FinishReason::Stop,
+            );
             let mut enc = AnthropicSseEncoder::new("r".into(), "m".into());
             let events: Vec<_> = deltas.iter().flat_map(|d| enc.push(d)).collect();
             assert!(

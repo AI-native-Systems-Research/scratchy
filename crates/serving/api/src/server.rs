@@ -866,8 +866,10 @@ fn stream_chat_response(
     });
 
     // The choices that have sent a tool-call delta. The engine sends a tool call's finish as a
-    // delta of its own, with no tool-call pieces, so the finish reason reads the whole stream,
-    // the way the non-streaming response and `/v1/messages` do.
+    // delta of its own, with no tool-call pieces, so the finish reason reads the whole stream, as
+    // `/v1/messages` does. Only a call the model finished is `tool_calls`: one cut off by
+    // `max_tokens` stays `length`, and an engine failure stays `abort`, so no client runs a call
+    // whose arguments may be incomplete.
     let mut called_tools = std::collections::HashSet::new();
     let stream = UnboundedReceiverStream::new(rx).map(move |delta| {
         recorder.record(&delta);
@@ -876,7 +878,8 @@ fn stream_chat_response(
             called_tools.insert(delta.index);
         }
         let finish_reason_str = delta.finish_reason.map(|r| {
-            if called_tools.contains(&delta.index) {
+            if r == scratchy_core_common::FinishReason::Stop && called_tools.contains(&delta.index)
+            {
                 "tool_calls".to_string()
             } else {
                 r.to_string()
@@ -2029,7 +2032,10 @@ mod tests {
     fn buffered_tool_call_rx(
         choices: u32,
     ) -> (tokio::sync::mpsc::UnboundedReceiver<StreamDelta>, u32) {
-        let (deltas, generated) = crate::engine::test_support::buffered_tool_call_deltas(false);
+        let (deltas, generated) = crate::engine::test_support::buffered_tool_call_deltas(
+            false,
+            scratchy_core_common::FinishReason::Stop,
+        );
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         for index in 0..choices {
             for delta in &deltas {
@@ -2197,6 +2203,35 @@ mod tests {
             chat_finishes(&payloads),
             [(0, "tool_calls".to_string()), (1, "stop".to_string())]
         );
+    }
+
+    /// Only a tool call the model finished ends `tool_calls`: one cut off by `max_tokens` ends
+    /// `length`, and an engine failure partway through ends `abort`, so no client runs a call
+    /// whose arguments may be incomplete.
+    #[tokio::test]
+    async fn test_chat_stream_tool_call_cut_short_keeps_its_finish_reason() {
+        use scratchy_core_common::FinishReason;
+        for (finish, expected) in [
+            (FinishReason::Length, "length"),
+            (FinishReason::Abort, "abort"),
+        ] {
+            let (mut rx, _) = buffered_tool_call_rx(1);
+            let (tx, cut_rx) = tokio::sync::mpsc::unbounded_channel();
+            while let Ok(mut delta) = rx.try_recv() {
+                if delta.finish_reason.is_some() {
+                    delta.finish_reason = Some(finish);
+                }
+                tx.send(delta).unwrap();
+            }
+            drop(tx);
+            let response = stream_chat_response("r".into(), "m".into(), cut_rx, false);
+            let payloads = sse_payloads(response.into_response()).await;
+            assert_eq!(
+                chat_finishes(&payloads),
+                [(0, expected.to_string())],
+                "{finish:?}"
+            );
+        }
     }
 
     /// Cached tokens add up across choices, as in the non-streaming response, and are reported
