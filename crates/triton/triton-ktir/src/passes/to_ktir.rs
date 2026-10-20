@@ -136,11 +136,18 @@ pub fn run(module: &mut Module, grid: &[i64]) -> Result<()> {
     // anything else is left for the window guard to report by name. See the pass doc.
     unroll_constant_trip_loops(module)?;
     fold_unit_grid_tile_id(module);
-    // AFTER the unit fold, deliberately: a unit grid already folded its landmark to zero and
-    // has nothing for this pass to do, and the twelve card-verified kernels at multi-tile grids
-    // (the embedding, the whole-node MLPs) never state a computed window corner, so the fire
-    // gate below leaves them byte-identical. Only the genuinely corner-carrying multi-tile
-    // body -- attention at 16 -- is unrolled.
+    // THE GRID-CORNER UNIFORM SPELLING, between the unit fold and the fire gate: a corner
+    // this pass rewrites is claimed by the recognizer the gate consults below, so an
+    // all-uniform grid keeps its launch instead of paying the clone protocol -- while a
+    // corner that is computed and NOT uniform (attention's head-grouped K/V at 16) still
+    // trips the gate exactly as before. See the pass doc for the proof discipline.
+    crate::passes::uniform_grid_corners::run(module, grid)?;
+    // AFTER the unit fold and the uniform rewrite, deliberately: a unit grid already folded
+    // its landmark to zero and has nothing for this pass to do, and the twelve
+    // card-verified kernels at multi-tile grids (the embedding, the whole-node MLPs) never
+    // state a computed window corner, so the fire gate below leaves them byte-identical.
+    // Only the genuinely corner-carrying multi-tile body -- attention at 16, whose K/V
+    // corner is the head-grouped family the uniform pass cannot state -- is unrolled.
     unroll_grid_positions(module)?;
     // SECOND TRIP-UNROLL ARM, deliberately after the grid unroll: a CAUSAL sweep's trip count is a
     // function of the grid position (`off_band = f(start_m)`), so the FIRST arm above -- run while
@@ -1829,9 +1836,11 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
 
     // ── FIRE GATE ──
     // ── FIRE GATE ──
-    // A load whose tile corner is not a constant, at a grid of more than one tile, whose
-    // tile feeds a MATMUL INPUT. The corner chain is the grid delinearisation, so a
-    // constant here means the grid position never reached the window. And the MATMUL
+    // A load whose tile corner is neither a constant nor a per-core uniform, at a grid of
+    // more than one tile, whose tile feeds a MATMUL INPUT. The corner chain is the grid
+    // delinearisation, so a constant here means the grid position never reached the
+    // window, and a uniform corner means the work division already carries it. And the
+    // MATMUL
     // INPUT is what separates the refused case from the card-verified whole-node ones:
     // a computed corner on a pointwise/store operand is carried by the door's
     // whole-node store regions and per-core work-slice addressing (MEASURED: rope_kv8
@@ -1843,6 +1852,9 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
     // ONE definition snapshot: the corner reads below were whole-module scans
     // paid per load candidate.
     let index = module.def_index();
+    // And ONE uniform-form snapshot: the same map for the corners the door resolves
+    // per core -- built once here, consulted per corner below.
+    let uniform = crate::passes::uniform_grid_corners::uniform_corners(&body, &index, landmark);
     let fires = body.iter().any(|o| {
         if o.kind != OpKind::KtdpLoad {
             return false;
@@ -1860,8 +1872,15 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
             .operands
             .get(1..3)
             .map(|cs| {
-                cs.iter()
-                    .any(|c| crate::passes::dot_to_linalg::const_int_index(&index, *c).is_none())
+                cs.iter().any(|c| {
+                    // Computed means NEITHER constant NOR uniform. The uniform corners
+                    // -- the spelling `uniform_grid_corners` mints and the form the
+                    // folded configurations already ship -- are resolved by the door's
+                    // per-core work division, so they are not this gate's business; a
+                    // corner that is neither is the clone protocol's.
+                    crate::passes::dot_to_linalg::const_int_index(&index, *c).is_none()
+                        && !uniform.contains_key(c)
+                })
             })
             .unwrap_or(false);
         if !computed {

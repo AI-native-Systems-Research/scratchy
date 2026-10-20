@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE TWENTY-FIVE CONFIGURATIONS, STATED ONCE.
+//! THE TWENTY-SIX CONFIGURATIONS, STATED ONCE.
 //!
 //! A "configuration" is a `.py` fixture plus the `tl.constexpr` values and the launch grid it is
 //! compiled at. Three consumers need that tuple: `examples/bake_py` (the dxp bake),
@@ -59,6 +59,11 @@ pub const ALL: &[&str] = &[
     // signature entry is `ArgSpec::Scalar`, which the frontend already lowers to a block
     // arg, so what this row names is where the chain refuses a splat OF an argument.
     "mul_scale_small",
+    // ⭐ RUNG 2 IN TWO DIMENSIONS (see the `matmul_tiled` case row): the per-core uniform
+    // corner on a 2-D window — the row that names where the PRODUCER stops (the
+    // multi-block `tt.dot` refusal in `dot_to_linalg`), so the door's band arm is measured
+    // on the elementwise family (`rope_q32`/`rope_kv8`) until that wall moves.
+    "matmul_tiled",
     // ⭐ RUNG 4, the gathered CONTRACTION (see the `paged_score_small` case row).
     "paged_score_small",
     // ⭐ TASK 27: rung 4 AROUND A FULL ONE-BLOCK FLASH STEP (see the `paged_attention_small`
@@ -520,12 +525,21 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // scale's provenance: `spec` puts `scale` in the signature as `ArgSpec::Scalar`,
         // which the frontend makes a block arg, and the frontend's `broadcast_pair`
         // splats it to the tile -- a `tt.splat` of a NON-constant, which no fixture
-        // before this one ever produced. What this row measures is the FIRST refusal
-        // the chain raises for that (expected at `from_ttir`, whose op set is the census
-        // of the sixteen post-make_ttir goldens and contains no `tt.splat` of an
-        // argument); it exists so the rung-3 work has a named, fail-closed before-state.
-        // `Program::Elementwise(Mul)` is stated per the constructor's demand; the
-        // whole-function door walks the ops and never reads it.
+        // before this one ever produced. The chain has since learned to carry that
+        // splat all the way to KTIR (a `[1, 1]` view + load beside the `[1024]` ones),
+        // and the two doors now ANSWER it differently, which is the measurement: the
+        // WHOLE-function door routes the mulf to the scalar-weighted body -- the scale
+        // lands in the launcher-bound registry (the 2-byte placement), the rank-1
+        // corner (`pid * BLOCK`, the 1-D rung-2 form) resolves as the FLUSH band, and
+        // the out-division slices the `[1, 1024]` view 16 × 64, one slice per core
+        // (MEASURED: `0_scalarmul_o1`, `numWkSlicesPerDim_` `out: 16`) -- so this row
+        // is rung 3's LANDED answer through that door. The PER-OP door still refuses
+        // at the pointwise extents law (a `[1, 1]` scale against the output's extent
+        // -- the broadcast only the registry can state, which the seeded whole-tensor
+        // path cannot express): that refusal is the named, fail-closed before-state
+        // this row exists to pin. `Program::Elementwise(Mul)` is stated per the
+        // constructor's demand; the whole-function door walks the ops and never
+        // reads it.
         "mul_scale_small" => (
             spec(
                 "mul_scale",
@@ -535,6 +549,39 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             ),
             vec![16],
             Program::Elementwise(Elementwise::Mul),
+        ),
+        // ⭐ RUNG 2 IN TWO DIMENSIONS. `mul_scale_small` states the per-core uniform
+        // corner (`pid * BLOCK`) on a 1-D window; this row states the same rung on a 2-D
+        // one -- a tiled matmul whose every window's ROW corner is `pid * BLOCK_M` and
+        // whose grid tiles the view exactly (`positions · stride == v_rows`). ⛔ THE ROW
+        // NAMES WHERE THE PRODUCER STOPS: `dot_to_linalg` refuses a multi-block `tt.dot`
+        // (BM must equal M) long before the door sees the module, so this configuration
+        // REFUSES at `make_ktir` by design -- the pinned record of the wall between the
+        // band family's elementwise measurement (`rope_q32`, end to end through the
+        // whole-function door) and its matmul one. When that wall moves, this row becomes
+        // the end-to-end measurement: the door's uniform arm resolves the corner as the
+        // band and `matmul_oriented` sweeps `m = out.r_len` = the whole view.
+        "matmul_tiled" => (
+            spec(
+                "matmul_tiled",
+                "matmul_tiled_kernel",
+                &[("a_ptr", "*fp16"), ("b_ptr", "*fp16"), ("o_ptr", "*fp16")],
+                &[
+                    ("M", Val::Int(512)),
+                    // N == BLOCK_N and K == BLOCK_K: the single-tile contract on the
+                    // shared axes (same law as the matmul row above), so the ONLY
+                    // per-program term anywhere is the row corner this row exists to
+                    // state.
+                    ("N", Val::Int(64)),
+                    ("K", Val::Int(64)),
+                    ("BLOCK_M", Val::Int(64)),
+                    ("BLOCK_N", Val::Int(64)),
+                    ("BLOCK_K", Val::Int(64)),
+                ],
+            ),
+            // M / BLOCK_M: the grid tiles `a`'s rows exactly, one row band per core.
+            vec![8],
+            Program::Matmul,
         ),
         // ⭐⭐⭐ RUNG 4 OF THE ADDRESS-PROVENANCE LADDER, THE MEASUREMENT: `q @ gather(k,
         // ids).T` -- a row index read from DEVICE MEMORY, the gathered rows feeding a
@@ -847,7 +894,7 @@ mod tests {
         }
         assert_eq!(
             super::ALL.len(),
-            25,
+            26,
             "a configuration was added or removed: update ALL (and the module title) deliberately"
         );
     }

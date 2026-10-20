@@ -1431,7 +1431,7 @@ pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error>
         .iter()
         .find(|o| o.result == tile_v && o.op_type == OpKind::KtdpConstructAccessTile);
     let Some(tile) = tile else { return Ok(None) };
-    let Some(mut r) = region_of_view_operand(k, tile, 0)? else {
+    let Some(r) = region_of_view_operand(k, tile, 0)? else {
         return Ok(None);
     };
     // ⭐⭐⭐⭐⭐ THE WINDOW IS THE LOAD'S OWN TILE, NOT THE PARAMETER'S FIRST.
@@ -1448,41 +1448,171 @@ pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error>
     //
     // So the tile in hand — THIS load's own `ktdp.construct_access_tile`, whose corner constants the
     // cast-resolving `index_constants` already sees — states the window, and it is copied onto the
-    // parameter's Region here. The tile's corner operands (1 = row, 2 = column) and its `Shape` are
-    // read by exactly the code `regions()` reads them with (`shape_2d` and `consts.get`), so the two
-    // walks cannot disagree about one tile. A tile whose corners are NOT constants names a window
-    // no descriptor can carry, and is refused by name rather than silently falling back to the
-    // parameter's first tile — the same discipline as `regions()`'s in-loop guard.
-    if tile.operands.len() == 3 {
-        let consts = super::lower_ktir_to_superdsc::index_constants(&k.func);
-        let Some(shape) = super::lower_ktir_to_superdsc::shape_2d(tile) else {
-            return err(format!(
-                "{}: the access tile feeding this load states no 2-D `shape`, so its window is \
-                 unknown",
-                f.name
-            ));
-        };
-        let (rs, cs) = match (
-            tile.operands.get(1).and_then(|s| consts.get(s).copied()),
-            tile.operands.get(2).and_then(|s| consts.get(s).copied()),
-        ) {
-            (Some(rs), Some(cs)) => (rs as u32, cs as u32),
-            _ => {
-                return err(format!(
-                    "{}: the access tile feeding this load states a window whose corner is not a \
-                     constant (`ktdp.construct_access_tile` operands 1/2), so the descriptor cannot \
-                     carry the offset. A loop-carried or computed corner needs hoisting or unrolling \
-                     before the whole-function door can address it.",
-                    f.name
-                ));
+    // parameter's Region here. The tile's corner operands (1 = row, 2 = column; a RANK-1 tile
+    // states its one corner at operand 1, its single axis) and its `Shape` are read by exactly the
+    // code `regions()` reads them with (`shape_2d` and `consts.get`), so the two walks cannot
+    // disagree about one tile. A tile whose corners are NOT constants names a window no descriptor
+    // can carry, and is refused by name rather than silently falling back to the parameter's first
+    // tile — the same discipline as `regions()`'s in-loop guard.
+    Ok(Some(windowed_region(k, r, tile)?))
+}
+
+/// ⭐⭐⭐⭐⭐ ONE ACCESS TILE's WINDOW, RESOLVED ONTO ITS PARAMETER's REGION — the walk the load side
+/// ([`region_for_operand`]) and the store side of [`lower_function`] share, so the two cannot
+/// disagree about what one `ktdp.construct_access_tile` states.
+///
+/// A tile with CONSTANT corners states its window directly: `r_start`/`c_start` the constants,
+/// `r_len`/`c_len` the tile's own `Shape`. The COVER stays the parameter walk's in that case — a
+/// constant-corner program's windows are what `regions()`'s fold already spans, and restating them
+/// here would change the row basis every existing body derives from that fold.
+///
+/// A tile whose ROW corner is not a constant may still state a window this door can address: the
+/// PER-CORE UNIFORM `stride · core_id + base` over the launch's own positions — the spelling
+/// triton-ktir's `uniform_grid_corners` mints and the form the folded configurations already ship.
+/// The launch's positions place core `c` at work item `c`, so when the corner provably computes
+/// `base + c · stride` with `stride` the tile's own row height, the per-core tiles TILE THE BAND
+/// `[base, base + positions · stride)` flush, and the band is one window a descriptor can sweep
+/// with the work division carrying the per-core term — the corner is REDUNDANT with the division,
+/// whatever the base. That is THE BAND CONTRACT, and it resolves the window as the BAND:
+/// `r_start = base`, `r_len = positions · stride` — not the tile's height; the lift is the point,
+/// `pointwise_rows`' windowed case and `matmul_oriented`'s `m = out.r_len` then sweep exactly the
+/// band — and `r_cover = (base, base + positions · stride)`, the statement `regions()` cannot
+/// make: its cover fold reads constants, so a uniform corner falls back to the whole view, which a
+/// band trip is not. The strict single-trip form (`base == 0`, `positions · stride == v_rows`) is
+/// the special case where the band IS the view and the region is the whole-view window.
+///
+/// ⛔ THE COLUMN CORNER STAYS CONSTANT-ONLY, deliberately. The work division carries ROW terms; a
+/// computed column corner is not redundant with anything, and resolving it at the base would
+/// address the wrong stick on every core past the first. (UnEQUAL constant column corners are
+/// per-operand windows — the dense pointwise emission's own law — and ride this same region.)
+///
+/// ⛔⭐ AND A RANK-1 TILE's ONE CORNER IS A COLUMN CORNER — with one family the `out`-dividing
+/// descriptors DO carry. A `[n]` view is one row of `n` columns in this door's 2-D spelling
+/// ([`shape_2d`]), so the single corner a rank-1 tile states (`[64]` over `[1024]`, the
+/// `mul_scale_small` row's `pid * BLOCK`) is the per-core term along the COLUMN axis. The FLUSH
+/// form of it — base 0, the launch's positions times the tile's own extent exactly the view's
+/// columns — is the one a descriptor division states: the scalar-weighted bodies split `out`
+/// across the launch's cores (`numWkSlicesPerDim_` `out: positions`, MEASURED on the
+/// `mul_scale_small` scalarmul bake: 16 cores × 64 columns of the `[1, 1024]` view), so the
+/// corner is REDUNDANT with that division exactly as a row band is redundant with the row
+/// division, and the window resolves as the WHOLE VIEW — the parameter fold's own answer for a
+/// corner it cannot read, now PROVEN flush rather than silently fallen back to. Anything else —
+/// a nonzero base, a stride that leaves gaps, a band the view does not bound — is carried by no
+/// division this door states, and is refused by name below. A CONSTANT rank-1 corner states an
+/// ordinary window and resolves like any other: the tile's own extent at the stated offset.
+///
+/// ⛔ AND THE CONTRACT IS EXACT, NOT BEST-EFFORT. A stride that is not the tile's own row height
+/// (per-core tiles with gaps — the band would hold rows no core computes), a base below zero or a
+/// band past the view's end, a zero position count, or a corner that is not uniform at all is
+/// refused by name below. Everything refused here keeps the clone protocol.
+fn windowed_region(k: &KtirNode, mut r: Region, tile: &Operation<'_>) -> Result<Region, Error> {
+    let f = &k.func;
+    let consts = super::lower_ktir_to_superdsc::index_constants(f);
+    let Some((tr, tc)) = super::lower_ktir_to_superdsc::shape_2d(tile) else {
+        return err(format!(
+            "{}: the access tile states no 2-D `shape`, so its window is unknown",
+            f.name
+        ));
+    };
+    let uniform = super::lower_ktir_to_superdsc::uniform_corners(f, &consts);
+    let (gx, gy, gz) = f.grid;
+    let positions = (gx * gy * gz) as i64;
+    // ⭐ A RANK-1 TILE STATES ONE CORNER, ITS SINGLE AXIS. A constant is an ordinary window at
+    // the tile's own extent; the FLUSH per-core uniform is the whole view the `out`-dividing
+    // bodies slice (see the doc); anything else computed is refused by name. A tile stating NO
+    // corner addresses the whole view, which is the region already in hand.
+    if tile.operands.len() < 3 {
+        if tile.operands.len() == 2 {
+            let corner = tile.operands[1];
+            match consts.get(&corner).copied() {
+                Some(cs) => {
+                    r.r_start = 0;
+                    r.r_len = tr;
+                    r.c_start = cs as u32;
+                    r.c_len = tc;
+                }
+                None => {
+                    let flush = uniform.get(&corner).is_some_and(|u| {
+                        u.base == 0
+                            && u.stride > 0
+                            && u.stride as u32 == tc
+                            && positions > 0
+                            && positions as u64 * u.stride as u64 == r.v_cols as u64
+                    });
+                    if !flush {
+                        return err(format!(
+                            "{}: the access tile {:?} is RANK-1 and its one corner is computed \
+                             in a form no descriptor division carries. The single axis is a \
+                             COLUMN in this door's 2-D spelling (`shape_2d` reads `[n]` as one \
+                             row of `n` columns), and the one carried form is the FLUSH band: \
+                             base 0, the launch's positions times the tile's own extent exactly \
+                             the view's columns -- the `out`-dividing bodies then slice exactly \
+                             the per-core tile the corner states (`mul_scale_small`'s \
+                             `pid * BLOCK` over `[1024]` is the measured form). A nonzero base, \
+                             a stride that leaves gaps, or a band the view does not bound is not \
+                             carried by any division this door states, and resolving it at the \
+                             base would hand every core the whole axis. Hoist or unroll the \
+                             corner before the whole-function door can address it.",
+                            f.name, tile.result,
+                        ));
+                    }
+                    // The flush band IS the view: the region in hand is already the whole-view
+                    // window, and the division carries the per-core slice.
+                }
             }
-        };
-        r.r_start = rs;
-        r.c_start = cs;
-        r.r_len = shape.0;
-        r.c_len = shape.1;
+        }
+        return Ok(r);
     }
-    Ok(Some(r))
+    let row = tile.operands.get(1).copied();
+    let col = tile.operands.get(2).copied();
+    let cs = col
+        .and_then(|s| consts.get(&s).copied())
+        .map(|cs| cs as u32);
+    // The row corner: a CONSTANT states one window at the tile's own height; the per-core
+    // uniform states the BAND the launch's own tiles tile. Anything else names a window no
+    // descriptor can carry.
+    let window = match row.and_then(|s| consts.get(&s).copied()) {
+        Some(rs) => Some((rs as u32, tr)),
+        None => row.and_then(|s| {
+            let u = uniform.get(&s)?;
+            let band = positions.checked_mul(u.stride)?;
+            (u.stride > 0
+                && u.base >= 0
+                && u.stride as u32 == tr
+                && positions > 0
+                && u.base + band <= r.v_rows as i64)
+                .then_some((u.base as u32, band as u32))
+        }),
+    };
+    let (Some((rs, r_len)), Some(cs)) = (window, cs) else {
+        return err(format!(
+            "{}: the access tile {:?} states a window whose corner is not a constant \
+             (`ktdp.construct_access_tile` operands 1/2), so the descriptor cannot carry the \
+             offset. A loop-carried or computed corner needs hoisting or unrolling before the \
+             whole-function door can address it -- or, for the row corner, the per-core uniform \
+             spelling whose launch tiles one band flush (stride the tile's row height, the band \
+             fitting the view), which this door resolves as that band.",
+            f.name, tile.result,
+        ));
+    };
+    r.r_start = rs;
+    r.c_start = cs;
+    r.r_len = r_len;
+    r.c_len = tc;
+    // THE BAND IS THE COVER the uniform arm states (see the doc); the constant arm keeps the
+    // parameter walk's fold.
+    if row.is_some_and(|s| !consts.contains_key(&s)) {
+        r.r_cover = (rs, rs.saturating_add(r_len));
+    }
+    Ok(r)
+}
+
+/// The rows a banded op's minted intermediate must hold: a WINDOWED input's band (`r_len`), or
+/// `logical` when every input is whole-view. See the mint's own doc for the full argument.
+fn band_rows_of(ins: &[Region], logical: u32) -> u32 {
+    ins.iter()
+        .find(|x| x.r_cover != (0, x.v_rows))
+        .map_or(logical, |x| x.r_len)
 }
 
 /// The [`Region`] of the parameter that operand `slot` of a TILE op reinterprets — the tail both the
@@ -2682,6 +2812,20 @@ pub fn lower_function(
                     ));
                 }
             };
+            // ⭐⭐⭐⭐⭐ A BANDED OP'S INTERMEDIATE IS THE BAND'S HEIGHT, NOT THE PER-CORE TILE'S.
+            //
+            // The program states the per-core tile (`[32, 64]` for one rope copy over 32
+            // positions), but [`windowed_region`] resolves each operand as the BAND (`[1024, 64]`
+            // — the launch's own tiles, flush), and the op sweeps the band: a mint at the tile's
+            // height would be a buffer the emission overruns by `positions − 1` tiles on every
+            // core past the first. The band is read off the inputs the same way
+            // [`pointwise_rows`] reads the sweep off the output — a WINDOWED input states it as
+            // its `r_len` — while a function whose inputs are all whole-view keeps the result
+            // type's own rows, so every mint this door has ever made is byte-identical. (A chain
+            // whose every input is a minted band intermediate states no windowed input; its mint
+            // stays at the tile and the extents law refuses the sweep mismatch by name — refused
+            // at the op that could have extended it, not silently mis-sized.)
+            let dims = [band_rows_of(&per_op, dims[0]), dims[1]];
             let Some(layout) = layout else {
                 return err(format!(
                     "{}: `{:?}`'s result is an intermediate, which needs a `BundleLayout` to hold \
@@ -2774,25 +2918,31 @@ pub fn lower_function(
             continue;
         };
         let out_tile = store.operands.get(1).copied();
-        let out_view = f
+        let tile = f
             .operations
             .iter()
-            .find(|o| o.op_type == OpKind::KtdpConstructAccessTile && o.result == out_tile)
-            .and_then(|t| t.operands.first().copied());
-        let out_ptr = f
-            .operations
-            .iter()
-            .find(|o| o.op_type == OpKind::KtdpConstructMemoryView && o.result == out_view)
-            .and_then(|o| o.operands.first().copied());
-        let out_idx = f.arguments.iter().position(|(a, _)| Some(*a) == out_ptr);
-        let Some(out_idx) = out_idx else {
+            .find(|o| o.op_type == OpKind::KtdpConstructAccessTile && o.result == out_tile);
+        // ⭐⭐⭐⭐⭐ THE STORE's OWN TILE IS THE OUTPUT's WINDOW — the load side's own law
+        // ([`region_for_operand`]'s "THE WINDOW IS THE LOAD'S OWN TILE"), stated for the store.
+        // `regions()` keeps the FIRST access tile over each parameter's view and falls back to
+        // the whole view when a corner is not a constant, so a banded program's stores would
+        // hand the body the whole `[v_rows, v_cols]` window: the descriptor would sweep rows the
+        // program never stores and address the band's own rows at the buffer base. The store's
+        // tile states the window, and `windowed_region` resolves it — constants or the per-core
+        // uniform band — through the ONE walk the load side takes, so the two cannot disagree.
+        let Some(tile) = tile else {
+            return err(format!(
+                "{}: `{:?}`'s store names no access tile",
+                f.name, op.op_type
+            ));
+        };
+        let Some(mut o) = region_of_view_operand(k, tile, 0)? else {
             return err(format!(
                 "{}: `{:?}`'s store names no parameter",
                 f.name, op.op_type
             ));
         };
-        let all = regions(k)?;
-        let mut o = all[out_idx];
+        o = windowed_region(k, o, tile)?;
         o.is_out = true;
         per_op.push(o);
 
