@@ -1221,12 +1221,15 @@ pub fn elementwise(
     // (`qk_d + mask_d` at `[MQ, MQ]`, `MQ` a decode-batch rung) is a tile the dxp scheduler
     // refuses; emitting it at the stick-rounded width its operands' placements hold is the
     // same rule the matmul producer already followed when it minted them. Every operand of
-    // this op is addressed at `cols`, so every name caps it.
-    let cols = {
+    // this op is addressed at `cols`, so every name caps it — but the law is a WHOLE-VIEW law
+    // ([`whole_view_op`]): a windowed piece's placement quotient is its PARENT's width.
+    let cols = if whole_view_op(&ins, &out) {
         let mut names: Vec<String> = ins.iter().map(Region::name).collect();
         names.push(out.name());
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         pointwise_device_cols(layout, &refs, rows, out.c_len)
+    } else {
+        out.c_len
     };
     check_pointwise_cols(cols, "Elementwise", out.tid)?;
     // ⭐ THE SWEEP IS COMPUTED BEFORE THE EXTENTS LAW, because the law is now stated OVER it: a
@@ -1616,7 +1619,7 @@ fn elementwise_broadcast(
     // still an operand mode (a spray is addressing, not width), so only the width is folded here.
     let cols = if out.c_len == 1 {
         FP16_ELEMS_PER_STICK
-    } else {
+    } else if whole_view_op(ins, out) {
         // ⭐ THE SAME DEVICE-WIDTH LAW the dense arm takes ([`pointwise_device_cols`]): this
         // arm's tile is sized by the output's columns too, and a sub-stick logical width is
         // the same dxp-scheduler refusal. The names that cap it are the tensors this op holds
@@ -1624,6 +1627,9 @@ fn elementwise_broadcast(
         // one value per row) is not addressed at `cols`, and an `Mb` one holds a SINGLE row
         // of them, so neither's footprint divides by this op's `rows`; both are measured
         // where they are addressed, by `resolve_seg_base`'s per-operand footprint guard.
+        // The whole-view gate ([`whole_view_op`]) still spans every operand — a `Col`/`Mb`
+        // operand of a windowed piece is windowed too, and the law is not the piece's to
+        // take.
         let mut names: Vec<String> = ins
             .iter()
             .zip(bcast)
@@ -1633,6 +1639,8 @@ fn elementwise_broadcast(
         names.push(out.name());
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         pointwise_device_cols(layout, &refs, rows, out.c_len)
+    } else {
+        out.c_len
     };
     check_pointwise_cols(cols, "Elementwise", out.tid)?;
     let op_name = format!("{op_func}_o{}", out.tid);
@@ -2007,6 +2015,30 @@ fn pointwise_width_the_output_holds(
     } else {
         cols
     }
+}
+
+/// ⛔ THE DEVICE-WIDTH LAW IS A WHOLE-VIEW LAW — the gate every [`pointwise_device_cols`] call
+/// site must pass before asking the layout for a width.
+///
+/// [`pointwise_width_the_output_holds`] divides a buffer's placement bytes by THIS OP's `rows`,
+/// which is only the buffer's width when the op's window IS the buffer: window == view, both
+/// axes, every region the op addresses. A WINDOWED piece — a column chunk of a wide tile, a
+/// banded row window — reads its PARENT's whole placement through a narrow window, so the
+/// quotient is the parent's width. The reproduction proof then passes VACUOUSLY: a `[64, 64]`
+/// chunk of a `[64, 128]` view asks for 512 (`for_pointwise` floors sub-stick widths), the
+/// placement holds 128, and `for_pointwise(128)` is ALSO 512 — both widths sit below the floor,
+/// the proof cannot fail, and the parent's 128 becomes the chunk's width. The emission then
+/// addresses the chunk's second corner over that width and the footprint guard PANICS inside
+/// the assembler (`access window end 24576B exceeds its placement footprint 16384B`) — a runtime
+/// abort standing in for what is a law-boundary miss.
+///
+/// A windowed piece's width is its own `c_len`, already whole-stick by [`chunk_window`]'s corner
+/// law, so the gate returns the caller's `cols` unchanged there. A row-FOLDED op is whole-view
+/// (the fold's contract keeps the window equal to the view), so the law still applies to it; so
+/// does the control table's genuinely-narrower whole-view input, case (d).
+fn whole_view_op(ins: &[Region], out: &Region) -> bool {
+    let whole = |x: &Region| x.r_len == x.v_rows && x.c_len == x.v_cols;
+    whole(out) && ins.iter().all(whole)
 }
 
 /// THE CONTROL SET FOR [`pointwise_width_the_output_holds`], the pointwise twin of
@@ -6161,10 +6193,14 @@ pub fn reduce(
     // sub-stick extent is the same dxp-scheduler refusal every pointwise arm refuses. The lanes
     // the width adds past the logical columns are the mask's −inf tail (see the law's doc) —
     // inert under `max`, zero under `sum` — and the data's footprint is the one name that
-    // caps, since a reduce reads no other tensor at `cols`.
-    let cols = {
+    // caps, since a reduce reads no other tensor at `cols`. Whole-view gated like every other
+    // call site ([`whole_view_op`]): a reduce over a window of a wider parent would read the
+    // parent's width out of the placement quotient.
+    let cols = if whole_view_op(&[data], &out) {
         let n = data.name();
         pointwise_device_cols(layout, &[&n], rows, logical_cols)
+    } else {
+        logical_cols
     };
     // A `[rows, 1]` accumulator: the reduce writes one value per row.
     if out.c_len != 1 {
