@@ -46,6 +46,11 @@ pub struct IncrementalDetokenizer {
     stream_prefix: String,
     /// Index within stream_ids corresponding to the prefix
     stream_prefix_index: usize,
+    /// The prompt's render when it ends in U+FFFD, so cannot lock as `stream_prefix`: a prompt
+    /// that ends partway through a character. The first delta starts where the stream stops
+    /// matching it, not at 0, which returned the prompt's render as output (#586). A deliberate
+    /// divergence from tokenizers' `step_decode_stream`, which starts it at 0.
+    unlocked_prefix: String,
 }
 
 impl IncrementalDetokenizer {
@@ -92,6 +97,7 @@ impl IncrementalDetokenizer {
             stream_ids: prompt_token_ids.to_vec(),
             stream_prefix: String::new(),
             stream_prefix_index: 0,
+            unlocked_prefix: String::new(),
         }
     }
 
@@ -158,7 +164,13 @@ impl IncrementalDetokenizer {
                 .decode(&self.stream_ids, self.skip_special_tokens)
             {
                 Ok(new_prefix) => {
-                    if !new_prefix.ends_with('�') {
+                    if new_prefix.ends_with('�') {
+                        // The prompt's render, at the first output token: what output a later
+                        // token renders is output, a U+FFFD of its own included.
+                        if self.num_output_tokens() == 1 {
+                            self.unlocked_prefix = new_prefix;
+                        }
+                    } else {
                         self.stream_prefix = new_prefix;
                         self.stream_prefix_index = self.stream_ids.len();
                     }
@@ -183,15 +195,25 @@ impl IncrementalDetokenizer {
             }
         };
 
+        // Where the new text starts. Unlocked, the stream renders the prompt's split character
+        // as U+FFFD while the token after it leaves it unfinished, and as the character once a
+        // token completes it: the new text starts at the first char that differs either way.
+        let floor = if self.stream_prefix.is_empty() {
+            common_prefix_len(&string, &self.unlocked_prefix)
+        } else {
+            self.stream_prefix.len()
+        };
+
         // Line 1110-1127: Check if we have valid new text
-        if string.len() > self.stream_prefix.len() && !string.ends_with('�') {
+        if string.len() > floor && !string.ends_with('�') {
             // Line 1111-1117: Validate prefix
             if !string.starts_with(&self.stream_prefix) {
                 return String::new();
             }
 
             // Line 1119: Extract new text
-            let new_text = string[self.stream_prefix.len()..].to_string();
+            let new_text = string[floor..].to_string();
+            self.unlocked_prefix.clear();
 
             // Line 1120-1123: Update state
             let new_prefix_index = self.stream_ids.len() - self.stream_prefix_index;
@@ -260,6 +282,14 @@ impl IncrementalDetokenizer {
     pub fn output_text(&self) -> &str {
         &self.output_text
     }
+}
+
+/// The bytes `a` and `b` share from their start, whole characters only.
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.char_indices()
+        .zip(b.chars())
+        .find(|&((_, x), y)| x != y)
+        .map_or(a.len().min(b.len()), |((i, _), _)| i)
 }
 
 /// Check for stop strings
@@ -928,5 +958,50 @@ mod tests {
             "Should produce output even with empty prompt: {:?}",
             text
         );
+    }
+
+    /// The output text of `generated` after `prompt` (byte tokens of the test tokenizer, which
+    /// has one token per byte), one token per step.
+    fn output_after(prompt: &[u8], generated: &[u8]) -> String {
+        let tok = Arc::new(make_test_tokenizer());
+        let ids = |bytes: &[u8]| -> Vec<u32> {
+            let mut ids = Vec::new();
+            for byte in bytes {
+                // A lone byte of a multi-byte character does not encode as text; its token is
+                // the one that byte carries inside the character.
+                let whole = match byte {
+                    0xC3 => "é".as_bytes(),
+                    0xA9 => "é".as_bytes(),
+                    _ => std::slice::from_ref(byte),
+                };
+                let at = whole.iter().position(|b| b == byte).unwrap();
+                let encoded = tok
+                    .encode(std::str::from_utf8(whole).unwrap(), false)
+                    .unwrap();
+                assert_eq!(encoded.len(), whole.len(), "one token per byte");
+                ids.push(encoded[at]);
+            }
+            ids
+        };
+        let mut detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &ids(prompt), vec![], 0, false, false);
+        for id in ids(generated) {
+            detok.update(&[id], false);
+        }
+        detok.get_next_output_text(true, false)
+    }
+
+    /// A prompt that ends partway through a character: the output is what the generated tokens
+    /// add, never the prompt's render (#586: it was returned whole).
+    #[test]
+    fn a_prompt_ending_mid_character_is_not_output() {
+        // The control: a prompt that ends on a whole character.
+        assert_eq!(output_after(b"Hi", b"xy"), "xy");
+        // é's first byte ends the prompt; the next token leaves it unfinished.
+        assert_eq!(output_after(b"Hi\xC3", b"xy"), "xy");
+        // The next token completes it: the character straddles the two, and is output.
+        assert_eq!(output_after(b"Hi\xC3", b"\xA9y"), "éy");
+        // A U+FFFD the generated tokens render is theirs, so it is output.
+        assert_eq!(output_after(b"Hi\xC3", b"\xC3x"), "\u{FFFD}x");
     }
 }
