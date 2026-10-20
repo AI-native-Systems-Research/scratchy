@@ -1580,8 +1580,7 @@ impl MetalAllocator {
                             // SAFETY: `[src, min(src+chunk+window, len))`
                             // is inside the mapped range `[base, base+len)`.
                             unsafe {
-                                let ahead =
-                                    (chunk_src + chunk_sz + READAHEAD_WINDOW).min(len);
+                                let ahead = (chunk_src + chunk_sz + READAHEAD_WINDOW).min(len);
                                 libc::madvise(
                                     (src_base_usize + chunk_src) as *mut libc::c_void,
                                     ahead - chunk_src,
