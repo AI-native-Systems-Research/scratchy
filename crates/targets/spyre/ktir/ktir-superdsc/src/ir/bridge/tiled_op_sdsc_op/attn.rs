@@ -22,10 +22,14 @@
 //!
 //! torch-spyre's version tiles this over kv-blocks with an online-softmax running-max recurrence
 //! (for arbitrarily long `max_seqlen_kv`). This port does the SAME — blocked, ≤stick(64)-wide per
-//! reduce — not the untiled "whole active_cap in one reduce" joint form: that form is mathematically
-//! equivalent on paper but re-triggers a documented, real hardware defect where reduce-MAX over more
-//! than one stick of columns mis-combines partial per-tile maxima (see
-//! `reference_spyre_multirow_reduce_not_broken.md`).
+//! reduce — not the untiled "whole active_cap in one reduce" joint form: the blocked recurrence
+//! is this emitter's card-proven form and matches the vendor's own tiling. (The old text
+//! justified the blocking with "a documented, real hardware defect where reduce-MAX over more
+//! than one stick of columns mis-combines partial per-tile maxima" — an attribution the
+//! template's own DDL refutes: the one measured `mxp = 0` cell carried this crate's own
+//! row-mixing and unmasked-padding defects, both since fixed. See
+//! [`crate::emit::lower_ktir_to_superdsc::reduce`]'s law doc — the wide multi-row max now
+//! lowers through the KTIR door and is card-gated. The blocking here is unchanged.)
 //!
 //! BATCHED OVER HEADS (2026-07-27, matching `superdsc-batch-perf`'s hardware-proven flash decode
 //! exactly): the per-head score/value MATMULS stay separate (each head needs its own K/V slice —
