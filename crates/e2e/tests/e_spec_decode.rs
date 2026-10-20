@@ -12,7 +12,8 @@
 //! Run with:
 //!   cargo test -p vllm-e2e --features e2e,cuda --release --test e_spec_decode -- --ignored --test-threads=1
 
-#![cfg(feature = "e2e")]
+// Every test here runs on cuda, so the helpers would be dead code on any other backend.
+#![cfg(all(feature = "e2e", feature = "cuda"))]
 
 use scratchy_e2e::{Client, TestModels, TestServer};
 use scratchy_serving_api::protocol::{

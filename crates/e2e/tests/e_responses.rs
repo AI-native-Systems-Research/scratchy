@@ -47,11 +47,10 @@ async fn test_responses_simple_text() {
     assert_eq!(body["output"][0]["role"], "assistant");
     assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
     assert!(
-        body["output"][0]["content"][0]["text"]
+        !body["output"][0]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .len()
-            > 0
+            .is_empty()
     );
     assert!(body["usage"]["input_tokens"].as_u64().unwrap() > 0);
     assert!(body["usage"]["output_tokens"].as_u64().unwrap() > 0);
@@ -229,11 +228,10 @@ async fn test_cuda_responses_simple() {
     assert_eq!(body["object"], "response");
     assert_eq!(body["status"], "completed");
     assert!(
-        body["output"][0]["content"][0]["text"]
+        !body["output"][0]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .len()
-            > 0
+            .is_empty()
     );
 }
 

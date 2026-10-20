@@ -10,6 +10,7 @@
 
 #![cfg(feature = "e2e")]
 
+use scratchy_e2e::assertions::embedding_vector;
 use scratchy_e2e::{Client, TestModels, TestServer};
 use scratchy_serving_api::protocol::{EmbeddingInput, EmbeddingRequest};
 
@@ -64,7 +65,7 @@ async fn test_pooling_single_embedding() {
     assert_eq!(response.data.len(), 1);
     assert_eq!(response.data[0].index, 0);
     assert_eq!(response.data[0].object, "embedding");
-    assert!(!response.data[0].embedding.is_empty());
+    assert!(!embedding_vector(&response.data[0]).is_empty());
     assert!(response.usage.prompt_tokens > 0);
     assert_eq!(response.usage.total_tokens, response.usage.prompt_tokens);
 }
@@ -89,10 +90,10 @@ async fn test_pooling_multiple_embeddings() {
 
     assert_eq!(response.data.len(), 3);
     // All embeddings should have the same dimension.
-    let dim = response.data[0].embedding.len();
+    let dim = embedding_vector(&response.data[0]).len();
     assert!(dim > 0);
-    assert_eq!(response.data[1].embedding.len(), dim);
-    assert_eq!(response.data[2].embedding.len(), dim);
+    assert_eq!(embedding_vector(&response.data[1]).len(), dim);
+    assert_eq!(embedding_vector(&response.data[2]).len(), dim);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -111,7 +112,7 @@ async fn test_pooling_embedding_normalized() {
     ));
     let response = client.embedding(&request).await.unwrap();
 
-    let emb = &response.data[0].embedding;
+    let emb = &embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -134,10 +135,10 @@ async fn test_pooling_embedding_dimensions() {
     request.dimensions = Some(32);
     let response = client.embedding(&request).await.unwrap();
 
-    assert_eq!(response.data[0].embedding.len(), 32);
+    assert_eq!(embedding_vector(&response.data[0]).len(), 32);
 
     // Should still be normalized after truncation.
-    let emb = &response.data[0].embedding;
+    let emb = &embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -169,8 +170,8 @@ async fn test_pooling_different_inputs_differ() {
         .await
         .unwrap();
 
-    let emb1 = &resp1.data[0].embedding;
-    let emb2 = &resp2.data[0].embedding;
+    let emb1 = &embedding_vector(&resp1.data[0]);
+    let emb2 = &embedding_vector(&resp2.data[0]);
     let cosine: f32 = emb1.iter().zip(emb2.iter()).map(|(a, b)| a * b).sum();
     assert!(
         cosine < 0.999,
@@ -246,9 +247,9 @@ async fn test_pooling_mean_strategy() {
     let response = client.embedding(&request).await.unwrap();
 
     assert_eq!(response.data.len(), 1);
-    assert!(!response.data[0].embedding.is_empty());
+    assert!(!embedding_vector(&response.data[0]).is_empty());
 
-    let emb = &response.data[0].embedding;
+    let emb = &embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -291,7 +292,7 @@ async fn test_cuda_pooling_single_embedding() {
 
     assert_eq!(response.object, "list");
     assert_eq!(response.data.len(), 1);
-    assert!(!response.data[0].embedding.is_empty());
+    assert!(!embedding_vector(&response.data[0]).is_empty());
     assert!(response.usage.prompt_tokens > 0);
 }
 
@@ -314,9 +315,9 @@ async fn test_cuda_pooling_multiple_embeddings() {
     let response = client.embedding(&request).await.unwrap();
 
     assert_eq!(response.data.len(), 2);
-    let dim = response.data[0].embedding.len();
+    let dim = embedding_vector(&response.data[0]).len();
     assert!(dim > 0);
-    assert_eq!(response.data[1].embedding.len(), dim);
+    assert_eq!(embedding_vector(&response.data[1]).len(), dim);
 }
 
 #[cfg(feature = "cuda")]
@@ -336,7 +337,7 @@ async fn test_cuda_pooling_normalized() {
     ));
     let response = client.embedding(&request).await.unwrap();
 
-    let emb = &response.data[0].embedding;
+    let emb = &embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -407,9 +408,9 @@ async fn test_cuda_pooling_mean_strategy() {
     let response = client.embedding(&request).await.unwrap();
 
     assert_eq!(response.data.len(), 1);
-    assert!(!response.data[0].embedding.is_empty());
+    assert!(!embedding_vector(&response.data[0]).is_empty());
 
-    let emb = &response.data[0].embedding;
+    let emb = &embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -434,9 +435,9 @@ async fn test_cuda_pooling_cls_strategy() {
     let response = client.embedding(&request).await.unwrap();
 
     assert_eq!(response.data.len(), 1);
-    assert!(!response.data[0].embedding.is_empty());
+    assert!(!embedding_vector(&response.data[0]).is_empty());
 
-    let emb = &response.data[0].embedding;
+    let emb = &embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -469,8 +470,8 @@ async fn test_cuda_pooling_different_inputs_differ() {
         .await
         .unwrap();
 
-    let emb1 = &resp1.data[0].embedding;
-    let emb2 = &resp2.data[0].embedding;
+    let emb1 = &embedding_vector(&resp1.data[0]);
+    let emb2 = &embedding_vector(&resp2.data[0]);
     let cosine: f32 = emb1.iter().zip(emb2.iter()).map(|(a, b)| a * b).sum();
     assert!(
         cosine < 0.999,
@@ -496,7 +497,7 @@ async fn test_cuda_pooling_mean_vs_last_differ() {
             .embedding(&embed_request(EmbeddingInput::Single(input.clone())))
             .await
             .unwrap();
-        resp.data[0].embedding.clone()
+        embedding_vector(&resp.data[0])
     };
 
     // Now run last server (previous freed GPU memory on drop).
@@ -511,7 +512,7 @@ async fn test_cuda_pooling_mean_vs_last_differ() {
             .embedding(&embed_request(EmbeddingInput::Single(input)))
             .await
             .unwrap();
-        resp.data[0].embedding.clone()
+        embedding_vector(&resp.data[0])
     };
 
     assert_eq!(emb_mean.len(), emb_last.len());

@@ -434,11 +434,14 @@ jobs:
       # GPU. This runner's paravirtual GPU has none, so each test would return
       # early (`skip_if_no_gpu!`) and pass without running. What CI can check
       # here is that the files compile and lint clean; run them on a real GPU.
+      # Every test target (`--tests`), not a named few: the ones no step named
+      # rotted against API changes nobody saw (#290 — e_batch, e_embedding,
+      # e_pooling, …). They are type-checked only, on the build this step
+      # already does; a cuda-only file compiles empty here.
       - name: Lint the metal e2e tests
         run: cargo clippy -p scratchy-e2e -p scratchy-models
           --features e2e,metal,scratchy-models/smollm2-135m
-          --test e1_basic_serving --test e_prefix_caching --test e_anthropic
-          --test e5_gemma4_tool_parser --test e_long_prompt_metal -- -D warnings
+          --tests -- -D warnings
 
       # See the clippy job's last step.
       - name: Compiled no crate macos-scope skips for

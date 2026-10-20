@@ -37,9 +37,11 @@
 
 #![cfg(feature = "e2e")]
 
+use scratchy_e2e::assertions::load_golden_refs;
+#[cfg(feature = "cuda")]
 use scratchy_e2e::assertions::{
     GoldenReference, GoldenResult, assert_coherent_text, check_logprobs_close_with_threshold,
-    extract_engine_output, load_golden_refs, write_golden_refs,
+    extract_engine_output, write_golden_refs,
 };
 use scratchy_e2e::{Client, TestModels, TestServer};
 use scratchy_serving_api::protocol::{CompletionPrompt, CompletionRequest};
@@ -54,6 +56,7 @@ fn completion_request(prompt: &str, max_tokens: u32, logprobs: u32) -> Completio
     }
 }
 
+#[cfg(feature = "cuda")]
 async fn run_correctness_test(model: &str, golden_key: &str) {
     run_correctness_test_with_threshold(model, golden_key, 10).await
 }
@@ -70,6 +73,7 @@ async fn run_correctness_test(model: &str, golden_key: &str) {
 /// gross regressions (e.g. wrong tensor shape, wrong absmax
 /// ordering) because the first 3 tokens and the top-N sets
 /// themselves still line up.
+#[cfg(feature = "cuda")]
 async fn run_correctness_test_with_threshold(
     model: &str,
     golden_key: &str,
@@ -152,6 +156,7 @@ async fn run_correctness_test_with_threshold(
 /// Golden comparison + per-prompt coherence check in one server boot.
 /// Used for real trained models where random-weight output is incoherent
 /// by design (those tests don't need coherence checking).
+#[cfg(feature = "cuda")]
 async fn run_correctness_test_with_coherence(
     model: &str,
     golden_key: &str,
@@ -1052,6 +1057,7 @@ async fn test_cuda_correctness_qwen3_moe_3b() {
 /// copying it into the slimed-qwen snapshot directory so the engine
 /// can encode prompts. Run as a setup step before the qwen2-moe
 /// correctness test.
+#[cfg(feature = "cuda")]
 fn ensure_slimed_qwen_tokenizer(slimed_repo: &str) -> anyhow::Result<()> {
     fn snapshot_dir(repo: &str) -> anyhow::Result<std::path::PathBuf> {
         let cache_root = std::env::var_os("HF_HOME")

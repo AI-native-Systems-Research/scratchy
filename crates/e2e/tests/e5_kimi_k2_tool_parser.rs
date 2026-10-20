@@ -168,10 +168,9 @@ async fn test_kimi_k2_stream_with_tools() {
     let chunks = client.chat_completion_stream(&request).await.unwrap();
     assert_valid_stream(&chunks);
 
-    let text = collect_stream_text(&chunks);
-    // May be empty if model tried to produce tool calls that didn't match format,
-    // but the stream itself should be well-formed.
-    assert!(chunks.len() >= 1, "should have at least 1 stream chunk");
+    // The text may be empty if the model tried to produce tool calls that didn't match the
+    // format, but the stream itself should be well-formed.
+    assert!(!chunks.is_empty(), "should have at least 1 stream chunk");
 }
 
 /// Streaming without tools — kimi_k2 parser should not interfere.

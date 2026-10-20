@@ -40,17 +40,18 @@ async fn start_otel_server() -> (u16, String, OtelTestServer) {
         model: model.to_string(),
         device: "auto".to_string(),
         dtype: "auto".to_string(),
-        max_num_seqs: 16,
+        max_num_seqs: Some(16),
         block_size: 16,
         gpu_memory_utilization: 0.9,
         ..Default::default()
     };
 
-    let stack =
-        tokio::task::spawn_blocking(move || scratchy_serving_api::init::initialize_stack(&config))
-            .await
-            .expect("panicked")
-            .expect("failed to init stack");
+    let stack = tokio::task::spawn_blocking(move || {
+        scratchy_serving_api::init::initialize_stack(&config, None)
+    })
+    .await
+    .expect("panicked")
+    .expect("failed to init stack");
 
     let step_handle = stack.engine.spawn_step_loop();
 
@@ -88,10 +89,10 @@ async fn start_otel_server() -> (u16, String, OtelTestServer) {
         if tokio::time::Instant::now() > deadline {
             panic!("otel test server did not become healthy");
         }
-        if let Ok(resp) = client.get(&health_url).send().await {
-            if resp.status().is_success() {
-                break;
-            }
+        if let Ok(resp) = client.get(&health_url).send().await
+            && resp.status().is_success()
+        {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
