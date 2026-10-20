@@ -1173,10 +1173,20 @@ fn is_plumbing(op: OpKind) -> bool {
 
 /// ONE recognised broadcast: the value a consumer reads, resolved back to the rank-2 SOURCE the
 /// chain started from, plus the axis.
+///
+/// ⭐ `flat` marks the RANK > 2 FORM — a broadcast whose result is rank 3 or more. The kernel-side
+/// spelling is the same softmax chain as the rank-2 one (an `expand_shape` inserting a degenerate
+/// trailing dim, a `collapse_shape`, then the `linalg.broadcast`), but the source is a full
+/// `[m, n]` tile rather than a vector, and the fact the chain proves is different: the source's
+/// FLAT elements are the vector — one scalar per flat row for `Col` (the `[B, G]` running max
+/// sprayed over `[B, G, PS]`'s trailing axis), a whole flat row for `Mb`. The consumer therefore
+/// presents the source's region FLAT — `[numel, 1]` / `[1, numel]` — which is the same bytes at
+/// the same offsets the tile always had; see the presentation at the walk's extent check.
 #[derive(Clone, Copy)]
 struct Bcast {
     src: Ssa,
     axis: BcastAxis,
+    flat: bool,
 }
 
 /// ⭐⭐⭐ A BROADCAST IS ADDRESSING, NOT A NODE — so its ops are PLUMBING and the CONSUMER carries it.
@@ -1253,9 +1263,56 @@ fn program_broadcast_chains(
                 f.name
             ));
         };
-        let axis = match dims {
-            [1] => BcastAxis::Col,
-            [0] => BcastAxis::Mb,
+        // ⭐⭐⭐ THE RESULT'S RANK DECIDES THE FRAME THE AXIS IS READ IN. Rank ≤ 2 is the law as it
+        // stood: `Dimensions` names the one axis of a rank-2 tile, `[1]` the trailing (stick) axis
+        // and `[0]` the rows. Rank > 2 is the batched kernel's frame — the leading axes are the
+        // flat frame's ROWS (the same reading `shape_2d` states) — so the TRAILING axis
+        // (`dims[0] == rank-1`) is still `Col`, but the source is a full tile whose FLAT elements
+        // are the per-row scalars (a `[B, G]` running max sprayed over `[B, G, PS]`): the `flat`
+        // form, which the consumer presents as `[numel, 1]`. A LEADING axis is `Mb` only when the
+        // source is ONE flat row; anything else on a leading or middle axis is ROW-REPLICATION —
+        // each flat row of the source repeating down the merged row axis — and is refused by name
+        // below, because no operand mode addresses it (see that refusal).
+        let rank = bc
+            .attributes
+            .iter()
+            .find_map(|(k, v)| match (k, v) {
+                (AttrKey::Shape, Attr::IntList(d)) => Some(d.len()),
+                _ => None,
+            })
+            .or_else(|| {
+                bc.result_type
+                    .as_ref()
+                    .and_then(|t| t.dims().map(|d| d.len()))
+            });
+        let Some(rank) = rank else {
+            return err(format!(
+                "{}: `linalg.broadcast` states no shaped result, so its rank — the frame the \
+                 `Dimensions` axis is read in — is unknown",
+                f.name
+            ));
+        };
+        let (axis, flat) = match (rank, dims) {
+            (_, [1]) if rank <= 2 => (BcastAxis::Col, false),
+            (_, [0]) if rank <= 2 => (BcastAxis::Mb, false),
+            (r, [d]) if r > 2 && *d as usize == r - 1 => (BcastAxis::Col, true),
+            (r, [d]) if r > 2 && *d == 0 => (BcastAxis::Mb, true),
+            (r, [d]) if r > 2 => {
+                return err(format!(
+                    "{}: `linalg.broadcast` adds dim {d} of a rank-{r} tensor — a MIDDLE axis of \
+                     the flat frame. Row-major that is ROW-REPLICATION: the source's extent on \
+                     that axis is 1 by the broadcast's own law, so each of the source's flat rows \
+                     repeats down the merged row axis (the batched paged-decode kernel's mask add \
+                     is exactly this shape, `[B, 1, PS] -> [B, G, PS]`). The device's pointwise \
+                     operand modes state a per-row scalar (`In::col`, one address per row) and a \
+                     row vector (`In::mb`, one row addressed once); neither states an address that \
+                     advances every k rows, and no descriptor in this door's vocabulary does, so \
+                     this is named rather than half-addressed. The door-proven statement of the \
+                     same math is `attn.py`'s own mask law: the host stages the mask at the score \
+                     tile's own rows and the kernel adds it at base — no broadcast at all",
+                    f.name
+                ));
+            }
             _ => {
                 return err(format!(
                     "{}: `linalg.broadcast` adds dims {dims:?}. This door expresses a broadcast as an \
@@ -1332,6 +1389,36 @@ fn program_broadcast_chains(
             };
             cursor = next;
         }
+        // ⭐⭐⭐ A FLAT `Mb` STILL OWES ITS ONE-ROW PROOF, AND THE EXPAND DOES NOT GIVE IT. A
+        // leading degenerate expand on a `[64, 4]` source targets `[1, 64, 4]` — degenerate on
+        // axis 0, exactly what the cross-check above wants — yet the source is SIXTY-FOUR flat
+        // rows, and spraying it down a leading axis repeats each of them (the batched kernel's
+        // J-slot merge, `[64, 4] -> [4, 64, 4]`, spelled `reshape -> collapse -> broadcast
+        // dims=[0]` with NO expand at all). The rank-2 law never needed this: a rank-2 `Mb`
+        // source IS one row by shape. The flat form must say it in its own frame: the source's
+        // `shape_2d` rows — every axis but the last folded — must be 1. It runs BEFORE the
+        // second proof so a multi-row leading spray gets THIS refusal — the one naming the
+        // restatements — and not the generic unproven-extent one.
+        if flat && axis == BcastAxis::Mb {
+            let source_rows = def_of(cursor)
+                .and_then(super::lower_ktir_to_superdsc::shape_2d)
+                .map(|(r, _)| r);
+            if source_rows != Some(1) {
+                return err(format!(
+                    "{}: `linalg.broadcast` sprays a rank > 2 source down its LEADING axis, but the \
+                     source is {} flat rows — ROW-REPLICATION, each flat row repeating down the \
+                     merged row axis (the batched paged-decode kernel's J-slot merge is exactly \
+                     this shape, `[64, 4] -> [4, 64, 4]`). The device's `mb` operand mode addresses \
+                     ONE row once; no operand mode advances an address every k rows, and no \
+                     descriptor in this door's vocabulary does, so this is named rather than \
+                     half-addressed. The door-proven statements of the same math are a real \
+                     permute (restating the merge so the merged axis is TRAILING) or unrolled \
+                     per-J state variables — the kernel's own choice, not a lowering fix",
+                    f.name,
+                    source_rows.unwrap_or(0)
+                ));
+            }
+        }
         if !saw_degenerate_expand {
             // ⭐ THE SOURCE'S OWN LOAD IS A SECOND PROOF OF THE SAME FACT. An fp8 weight-scale chain
             // does not spell the expand: the kernel loads the scale as a `[1, n]` WINDOW of its own
@@ -1343,29 +1430,120 @@ fn program_broadcast_chains(
             // refusal below: its extent is unproven, and addressing it as a broadcast would read
             // past its end.
             let source_proves_vector = def_of(cursor).is_some_and(|d| {
-                d.op_type == OpKind::KtdpLoad
-                    && super::lower_ktir_to_superdsc::shape_2d(d).is_some_and(|(r, c)| match axis {
+                if flat {
+                    // ⭐⭐⭐ THE FLAT FORM'S PROOFS, IN THE FLAT FRAME. `Col`: the proof is a
+                    // COUNT, not an extent — a flat `Col` source is a full tile whose FLAT
+                    // elements are the per-row scalars (a `[256, 4]` running max is the
+                    // `[1024, 1]` column vector of the flat frame, and extent-1 on its own
+                    // trailing axis is the wrong question about it), so the count is the right
+                    // one: exactly one source element per result row, which is what the
+                    // consumer's `[numel, 1]` presentation addresses. `Mb`: the one-row fact —
+                    // the same law the check above enforces, stated for a source the walk-back
+                    // reached without an expand.
+                    super::lower_ktir_to_superdsc::shape_2d(d).is_some_and(|(r, c)| match axis {
+                        BcastAxis::Col => {
+                            let want_rows = bc.attributes.iter().find_map(|(k, v)| match (k, v) {
+                                (AttrKey::Shape, Attr::IntList(s)) if s.len() > 2 => {
+                                    Some(s[..s.len() - 1].iter().product::<i64>())
+                                }
+                                _ => None,
+                            });
+                            want_rows.is_some_and(|w| r as i64 * c as i64 == w)
+                        }
                         BcastAxis::Mb => r == 1,
-                        BcastAxis::Col => c == 1,
                     })
+                } else {
+                    d.op_type == OpKind::KtdpLoad
+                        && super::lower_ktir_to_superdsc::shape_2d(d).is_some_and(|(r, c)| {
+                            match axis {
+                                BcastAxis::Mb => r == 1,
+                                BcastAxis::Col => c == 1,
+                            }
+                        })
+                }
             });
             if !source_proves_vector {
                 return err(format!(
                     "{}: a `linalg.broadcast` sprays along {axis:?} but its source is not reached \
                      through a `tensor.expand_shape` that inserts a DEGENERATE dim, nor is it a load \
-                     whose own window has extent 1 on that axis. Either is the thing that says the \
+                     whose own window has extent 1 on that axis{} Either is the thing that says the \
                      source IS a row or column vector, so without one the operand's extent is \
                      unproven and addressing it as a broadcast would read past its end.",
-                    f.name
+                    f.name,
+                    if flat {
+                        " (for the rank > 2 flat form: nor does its own proof hold — `Col` needs \
+                         one source element per result row, `Mb` needs a one-flat-row source)"
+                    } else {
+                        ""
+                    }
                 ));
             }
         }
         for v in chain {
             consumed.insert(v);
         }
-        map.insert(res, Bcast { src: cursor, axis });
+        map.insert(
+            res,
+            Bcast {
+                src: cursor,
+                axis,
+                flat,
+            },
+        );
     }
     Ok((map, consumed))
+}
+
+/// ⭐⭐⭐ THE FLAT FRAME'S PRESENTATION OF A BROADCAST SOURCE'S [`Region`] — the same bytes at
+/// the same offsets, addressed as the flat frame states them.
+///
+/// A rank > 2 broadcast's source is a full tile (the `[256, 4]` running max of a
+/// `[256, 4, PAGE_SLOTS]` score tile), and the flat frame's law is that a rank-N tile and its
+/// `[prod(leading..=second-last), last]` flattening are the SAME BYTES: element `(b, g)` at flat
+/// index `b·G + g` is flat row `b·G + g`'s scalar. So the operand the consumer addresses — one
+/// element per flat row (`Col`) or one flat row of the result's width (`Mb`) — is the source
+/// region with every axis but the last folded into rows:
+///
+/// - `Col`: the window presents `[window_numel, 1]`, the view `[view_numel, 1]`, and the window's
+///   flat start `r_start·v_cols + c_start` becomes the row start. The emission-side checks
+///   (the walk's extent check, `elementwise_broadcast`'s want check, `In::col`) then read a
+///   region whose extents are the vector's own, with no rank-3 arm anywhere downstream.
+/// - `Mb`: the source is ONE flat row (proven by [`program_broadcast_chains`]'s post-walk-back
+///   check before this presentation is ever reached), so it presents `[1, window_numel]` with
+///   the flat start on the column axis.
+///
+/// ⛔ THE STARTS ARE THE FLAT ELEMENT OFFSETS, and a nonzero one keeps the emitters' own
+/// base-address law: they refuse a nonzero row start by name rather than addressing row 0, so a
+/// parameter-backed flat source whose window starts off-base is refused downstream — named, not
+/// mis-addressed. A minted intermediate starts at 0 and is the kernel's own case.
+fn presented_flat(r: &Region, axis: BcastAxis) -> Region {
+    let view_numel = r.v_rows as u64 * r.v_cols as u64;
+    let window_numel = r.r_len as u64 * r.c_len as u64;
+    let start = r.r_start as u64 * r.v_cols as u64 + r.c_start as u64;
+    let mut f = *r;
+    match axis {
+        BcastAxis::Col => {
+            f.v_rows = view_numel as u32;
+            f.v_cols = 1;
+            f.r_len = window_numel as u32;
+            f.c_len = 1;
+            f.r_cover = (0, view_numel as u32);
+            f.c_cover = (0, 1);
+            f.r_start = start as u32;
+            f.c_start = 0;
+        }
+        BcastAxis::Mb => {
+            f.v_rows = 1;
+            f.v_cols = view_numel as u32;
+            f.r_len = 1;
+            f.c_len = window_numel as u32;
+            f.r_cover = (0, 1);
+            f.c_cover = (0, view_numel as u32);
+            f.r_start = 0;
+            f.c_start = start as u32;
+        }
+    }
+    f
 }
 
 /// The [`Region`] one OPERAND names, by walking back from the value to the parameter it reads.
@@ -2393,6 +2571,16 @@ pub fn lower_function(
             .iter()
             .map(|v| bcasts.get(v).map(|b| b.axis))
             .collect();
+        // ⭐⭐⭐ THE FLAT FORM'S FLAG RIDES BESIDE THE AXIS, because the two say different things:
+        // the axis says which MODE the consumer addresses the operand in, the flag says the
+        // source is a full tile whose FLAT elements are the vector — a `[256, 4]` running max
+        // is the `[1024, 1]` column vector of the flat frame — so the region handed downstream
+        // is PRESENTED flat (see the presentation in the region loop below) rather than being
+        // the source's own `[256, 4]` window. Rank 2 keeps `false` and its verbatim behavior.
+        let bcast_flat: Vec<bool> = in_values
+            .iter()
+            .map(|v| bcasts.get(v).is_some_and(|b| b.flat))
+            .collect();
         let in_values: Vec<Ssa> = in_values
             .iter()
             .map(|v| bcasts.get(v).map_or(*v, |b| b.src))
@@ -2427,10 +2615,27 @@ pub fn lower_function(
         // re-derived from a footprint that is identical either way.
         let mut from_parameter: Vec<bool> = Vec::with_capacity(n_in + 1);
         for (i, v) in in_values.iter().enumerate() {
+            // ⭐⭐⭐ THE FLAT BROADCAST'S SOURCE IS PRESENTED IN THE FLAT FRAME — the same bytes
+            // at the same offsets, addressed as `[numel, 1]` (Col) / `[1, numel]` (Mb). The
+            // source's own window is a full tile (`[256, 4]`); the consumer's operand mode
+            // addresses one element per flat row, and the extent check + the emission-side want
+            // check below read the PRESENTED shape, so the flat form flows through them — and
+            // through `In::col`/`In::mb` and the minted-buffer annotation — without a rank-3
+            // arm anywhere downstream. Rank 2 presents nothing (`bcast_flat` is `false`) and
+            // keeps its verbatim behavior.
+            let present = |mut r: Region| {
+                if bcast_flat[i] {
+                    r = presented_flat(
+                        &r,
+                        bcast_axes[i].expect("bcast_flat is set only where an axis is"),
+                    );
+                }
+                r.is_out = false;
+                r
+            };
             match region_for_operand(k, *v)? {
-                Some(mut r) => {
-                    r.is_out = false;
-                    per_op.push(r);
+                Some(r) => {
+                    per_op.push(present(r));
                     from_parameter.push(true);
                 }
                 // A value the walk cannot reach is either an intermediate this function already
@@ -2439,9 +2644,7 @@ pub fn lower_function(
                 // producer's behalf.
                 None => match inter.get(v) {
                     Some(r) => {
-                        let mut r = *r;
-                        r.is_out = false;
-                        per_op.push(r);
+                        per_op.push(present(*r));
                         from_parameter.push(false);
                     }
                     None => {
@@ -2819,6 +3022,19 @@ pub fn lower_function(
             let dims = match op.result_type {
                 Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() == 2 => {
                     [dims[0] as u32, dims[1] as u32]
+                }
+                // ⭐⭐⭐ A RANK > 2 INTERMEDIATE IS MINTED IN THE FLAT FRAME — every axis but the
+                // last folded into rows — the same reading [`shape_2d`] states and every consumer
+                // of the minted buffer addresses through. Row-major, the rank-N tile and its flat
+                // pair are the same bytes at the same offsets, so one buffer serves both; minting
+                // the STATED shape instead (`[256, 4, 256]`) would be a `[4, 256]` buffer under
+                // the old reading — a quarter of the footprint the flat `[1024, 256]` consumers
+                // address. The batched paged-decode kernel's score tiles and softmax states are
+                // all rank-3; without this arm every one of them was refused below as "states no
+                // 2-D tensor type". Rank 2 keeps the arm above verbatim.
+                Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() > 2 => {
+                    let rows: i64 = dims[..dims.len() - 1].iter().copied().product();
+                    [rows as u32, *dims.last().expect("dims.len() > 2") as u32]
                 }
                 // A RANK-1 INTERMEDIATE IS `[rows, 1]` WHEN ITS VALUE CAME FROM A ROW REDUCTION, and
                 // that is decided by PROVENANCE rather than by this op's kind.
@@ -3431,11 +3647,14 @@ mod broadcast_chain_tests {
     ///
     /// `target` is the expand's `TargetShape` and `bdims` the broadcast's `Dimensions`, so a case can
     /// move either one alone. `bdims: None` drops the attribute entirely; `via_expand: false` wires the
-    /// broadcast straight to the source so the degenerate-expand requirement is what fires.
+    /// broadcast straight to the source so the degenerate-expand requirement is what fires. `res` is
+    /// the broadcast result's own `Shape` — which every real frontend op states and the rank probe
+    /// reads to decide the frame the axis is named in.
     fn chain(
         target: &'static [i64],
         bdims: Option<&'static [i64]>,
         via_expand: bool,
+        res: &'static [i64],
     ) -> IRFunction<'static> {
         let a: &'static Arena = Arena::global();
         let (src, exp, col, emp, bc) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4));
@@ -3458,7 +3677,11 @@ mod broadcast_chain_tests {
         }
         ops.push(Operation::new(a, Some(emp), OpKind::TensorEmpty, &[]));
         let source = if via_expand { col } else { src };
-        let mut b = Operation::new(a, Some(bc), OpKind::LinalgBroadcast, &[source, emp]);
+        let mut b = Operation::new(a, Some(bc), OpKind::LinalgBroadcast, &[source, emp]).with_attr(
+            a,
+            AttrKey::Shape,
+            Attr::IntList(res),
+        );
         if let Some(d) = bdims {
             b = b.with_attr(a, AttrKey::Dimensions, Attr::IntList(d));
         }
@@ -3472,11 +3695,106 @@ mod broadcast_chain_tests {
         }
     }
 
-    fn refusal(target: &'static [i64], bdims: Option<&'static [i64]>, via: bool) -> String {
-        program_broadcast_chains(&chain(target, bdims, via))
+    /// WHAT THE BATCHED KERNEL EMITS for its rank-3 broadcasts, from the op dump of
+    /// `batched_decode.py` — the same `expand -> collapse -> empty -> broadcast` spine with a
+    /// STATED source, or the `reshape -> collapse` spine the mask and the J-slot merge spell:
+    ///
+    /// ```text
+    /// %83 = MathExp(...)                        Shape=[256, 4]        (the running max)
+    /// %85 = TensorExpandShape(%83)   TargetShape=[256, 4, 1]
+    /// %74 = TensorCollapseShape(%85) TargetShape=[256, 4]
+    /// %75 = TensorEmpty()                       Shape=[256, 4, 256]
+    /// %87 = LinalgBroadcast(%74, %75)           Shape=[256, 4, 256] Dimensions=[2]
+    /// ```
+    ///
+    /// `src_shape` states the source op's own `Shape` (the running max `[256, 4]`, the mask
+    /// `[256, 256]`, the merged max `[64, 4]`, a one-row vector `[1, 64]`), `relay` is the op
+    /// between the source and the collapse — an expand (the sprays) or a reshape (the mask and
+    /// the merge, which the frontend spells without any expand) — and `collapse`/`res`/`bdims`
+    /// are the collapse target, the broadcast's own `Shape`, and its `Dimensions`.
+    /// The op between the source and the collapse: the EXPAND the sprays spell (its own
+    /// `Shape` is its `TargetShape`), or the RESHAPE the mask and the J-slot merge spell.
+    enum Relay {
+        Expand(&'static [i64]),
+        Reshape(&'static [i64]),
+    }
+
+    fn chain3(
+        src_shape: &'static [i64],
+        relay: Relay,
+        collapse: &'static [i64],
+        res: &'static [i64],
+        bdims: &'static [i64],
+    ) -> IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let (src, mid, col, emp, bc) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let sh = |op: Operation<'static>, s: &'static [i64]| {
+            op.with_attr(a, AttrKey::Shape, Attr::IntList(s))
+        };
+        let mut ops = vec![sh(
+            Operation::new(a, Some(src), OpKind::MathExp, &[]),
+            src_shape,
+        )];
+        let (kind, target) = match relay {
+            Relay::Expand(t) => (OpKind::TensorExpandShape, t),
+            Relay::Reshape(t) => (OpKind::TensorReshape, t),
+        };
+        ops.push(
+            sh(Operation::new(a, Some(mid), kind, &[src]), target).with_attr(
+                a,
+                AttrKey::TargetShape,
+                Attr::IntList(target),
+            ),
+        );
+        ops.push(sh(
+            Operation::new(a, Some(col), OpKind::TensorCollapseShape, &[mid]),
+            collapse,
+        ));
+        ops.push(sh(
+            Operation::new(a, Some(emp), OpKind::TensorEmpty, &[]),
+            res,
+        ));
+        ops.push(
+            sh(
+                Operation::new(a, Some(bc), OpKind::LinalgBroadcast, &[col, emp]),
+                res,
+            )
+            .with_attr(a, AttrKey::Dimensions, Attr::IntList(bdims)),
+        );
+        IRFunction {
+            name: "bcast3_probe",
+            arguments: a.args(vec![]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    fn refusal(
+        target: &'static [i64],
+        bdims: Option<&'static [i64]>,
+        via: bool,
+        res: &'static [i64],
+    ) -> String {
+        program_broadcast_chains(&chain(target, bdims, via, res))
             .err()
             .map(|e| e.message)
             .unwrap_or_else(|| panic!("expected a refusal for target={target:?} bdims={bdims:?}"))
+    }
+
+    fn refusal3(
+        src_shape: &'static [i64],
+        relay: Relay,
+        collapse: &'static [i64],
+        res: &'static [i64],
+        bdims: &'static [i64],
+    ) -> String {
+        program_broadcast_chains(&chain3(src_shape, relay, collapse, res, bdims))
+            .err()
+            .map(|e| e.message)
+            .unwrap_or_else(|| {
+                panic!("expected a rank-3 refusal for src={src_shape:?} bdims={bdims:?}")
+            })
     }
 
     /// ⭐ CONTROL (Col) — THE DECODER'S `m[:, None]`. `[64] → [64, 1] → [64, 64]`, the shape
@@ -3484,7 +3802,7 @@ mod broadcast_chain_tests {
     /// a broken walk rather than working guards.
     #[test]
     fn the_col_chain_is_recognised_and_resolves_to_its_source() {
-        let f = chain(&[64, 1], Some(&[1]), true);
+        let f = chain(&[64, 1], Some(&[1]), true, &[64, 64]);
         let (map, consumed) = program_broadcast_chains(&f).expect("the softmax's own chain");
         let b = map
             .get(&Ssa(4))
@@ -3512,7 +3830,7 @@ mod broadcast_chain_tests {
     /// one decoder layer, so a bool would be a coin flip on real data.
     #[test]
     fn the_mb_chain_is_recognised_with_the_other_axis() {
-        let f = chain(&[1, 128], Some(&[0]), true);
+        let f = chain(&[1, 128], Some(&[0]), true, &[64, 128]);
         let (map, _) = program_broadcast_chains(&f).expect("the rmsnorm gain's own chain");
         assert_eq!(
             map[&Ssa(4)].axis,
@@ -3528,7 +3846,7 @@ mod broadcast_chain_tests {
     /// that lies the other way, so neither is believed.
     #[test]
     fn an_axis_the_two_attributes_disagree_about_is_refused() {
-        let m = refusal(&[1, 128], Some(&[1]), true);
+        let m = refusal(&[1, 128], Some(&[1]), true, &[1, 64]);
         assert!(
             m.contains("whose trailing axis is not degenerate"),
             "names WHICH axis is not degenerate — the expand's, not the broadcast's: {m}"
@@ -3544,7 +3862,7 @@ mod broadcast_chain_tests {
     /// would read one column and spray it, with no shape error anywhere.
     #[test]
     fn a_non_degenerate_expand_is_refused_as_a_relayout() {
-        let m = refusal(&[64, 128], Some(&[1]), true);
+        let m = refusal(&[64, 128], Some(&[1]), true, &[64, 64]);
         assert!(
             m.contains("A general reshape moves real elements"),
             "says WHY a general reshape is different in kind, not just that it was rejected: {m}"
@@ -3555,7 +3873,7 @@ mod broadcast_chain_tests {
     /// `In::scalar`, a third mode, and this door does not silently fold it into one of the two it emits.
     #[test]
     fn a_two_axis_broadcast_is_refused_by_name() {
-        let m = refusal(&[64, 1], Some(&[0, 1]), true);
+        let m = refusal(&[64, 1], Some(&[0, 1]), true, &[64, 64]);
         assert!(
             m.contains("In::col") && m.contains("In::mb"),
             "names both modes it does emit: {m}"
@@ -3566,7 +3884,7 @@ mod broadcast_chain_tests {
     /// choosing an operand mode for the producer.
     #[test]
     fn a_broadcast_with_no_dimensions_attribute_is_refused() {
-        let m = refusal(&[64, 1], None, true);
+        let m = refusal(&[64, 1], None, true, &[64, 64]);
         assert!(
             m.contains("no `Dimensions`"),
             "names the missing attribute: {m}"
@@ -3578,10 +3896,135 @@ mod broadcast_chain_tests {
     /// unproven. This is the case that fails if the walk ever accepts a chain it did not verify.
     #[test]
     fn a_broadcast_not_reached_through_a_degenerate_expand_is_refused() {
-        let m = refusal(&[64, 1], Some(&[1]), false);
+        let m = refusal(&[64, 1], Some(&[1]), false, &[64, 64]);
         assert!(
             m.contains("DEGENERATE dim"),
             "says what is missing and why it is load-bearing: {m}"
+        );
+    }
+
+    /// ⭐⭐⭐ THE RANK-3 TRAILING SPRAY — THE BATCHED KERNEL'S OWN `m[:, :, None]`, THE FLAT `Col`.
+    /// `[256, 4] -> [256, 4, 1] -> collapse -> [256, 4, 256]` with `Dimensions=[2]`: the running
+    /// max's `[256, 4]` window IS the `[1024, 1]` column vector of the flat frame (element
+    /// `(b, g)` is flat row `b·4 + g`'s scalar — same bytes, same offsets), so the chain is the
+    /// decoder's own Col mode with `flat` set, reading the SOURCE and not the plumbing. This is
+    /// the control for every rank-3 refusal below: the accepting arm is proven on the real
+    /// shape, not assumed.
+    #[test]
+    fn the_rank3_trailing_chain_is_flat_col() {
+        let f = chain3(
+            &[256, 4],
+            Relay::Expand(&[256, 4, 1]),
+            &[256, 4],
+            &[256, 4, 256],
+            &[2],
+        );
+        let (map, consumed) = program_broadcast_chains(&f).expect("the running max's own chain");
+        let b = map
+            .get(&Ssa(4))
+            .expect("the broadcast's result is what a consumer names");
+        assert_eq!(
+            b.axis,
+            BcastAxis::Col,
+            "`Dimensions=[2]` is the trailing axis"
+        );
+        assert!(
+            b.flat,
+            "the rank-3 form is the FLAT Col — the consumer presents the source `[numel, 1]`"
+        );
+        assert_eq!(
+            b.src,
+            Ssa(0),
+            "the consumer must read the rank-2 SOURCE (the running max), not the plumbing"
+        );
+        for v in [Ssa(1), Ssa(2), Ssa(4)] {
+            assert!(
+                consumed.contains(&v),
+                "{v:?} is plumbing and must be lowered by nothing"
+            );
+        }
+    }
+
+    /// ⭐ THE FLAT `Mb` ADMITTED FORM — a one-flat-row source sprayed down a leading axis, the
+    /// `[1, 64] -> [8, 1, 64]` vector-on-rows the rank-2 `Mb` always was, stated in the flat
+    /// frame. This is the control that the leading-axis law below is a ONE-ROW law and not a
+    /// blanket refusal of `Dimensions=[0]`.
+    #[test]
+    fn the_rank3_leading_one_row_source_is_flat_mb() {
+        let f = chain3(
+            &[1, 64],
+            Relay::Expand(&[1, 1, 64]),
+            &[1, 64],
+            &[8, 1, 64],
+            &[0],
+        );
+        let (map, _) = program_broadcast_chains(&f).expect("the one-row vector's own chain");
+        let b = map
+            .get(&Ssa(4))
+            .expect("the broadcast's result is what a consumer names");
+        assert_eq!(
+            b.axis,
+            BcastAxis::Mb,
+            "`Dimensions=[0]` is the leading axis"
+        );
+        assert!(b.flat, "the rank-3 form is the FLAT Mb");
+        assert_eq!(b.src, Ssa(0), "the consumer reads the rank-2 SOURCE");
+    }
+
+    /// ⛔⛔ THE RANK-3 MIDDLE AXIS — THE MASK ADD, `[256, 256] -> [256, 1, 256] -> [256, 4, 256]`
+    /// with `Dimensions=[1]`, spelled `reshape -> collapse -> broadcast` with no expand at all.
+    /// Row-major, spraying the middle axis repeats each of the source's flat rows down the
+    /// merged row axis (`result[b, g, j] = source[b, 0, j]`: flat row `b·4 + g` reads flat row
+    /// `b` — the row index ADVANCES every G rows), and no operand mode in this door's vocabulary
+    /// addresses that. The refusal must NAME the shape and `attn.py`'s door-proven restatement —
+    /// the host stages the mask at the score tile's own rows and the kernel adds it at base —
+    /// because that restatement is the kernel's move, not a lowering fix.
+    #[test]
+    fn the_rank3_middle_axis_is_row_replication_and_refused() {
+        let m = refusal3(
+            &[256, 256],
+            Relay::Reshape(&[256, 1, 256]),
+            &[256, 256],
+            &[256, 4, 256],
+            &[1],
+        );
+        assert!(
+            m.contains("MIDDLE axis"),
+            "names the axis class, not just the index: {m}"
+        );
+        assert!(
+            m.contains("ROW-REPLICATION"),
+            "names the data movement the device cannot address: {m}"
+        );
+        assert!(
+            m.contains("attn.py"),
+            "names the door-proven restatement so the kernel side knows the move: {m}"
+        );
+    }
+
+    /// ⛔⛔ THE RANK-3 LEADING AXIS OVER A MULTI-ROW SOURCE — THE J-SLOT MERGE, `[64, 4] ->
+    /// [1, 64, 4] -> collapse -> [4, 64, 4]` with `Dimensions=[0]`, the exact spelling the op
+    /// dump shows. The reshape's leading `1` satisfies the expand cross-check's own `want` — but
+    /// the source is SIXTY-FOUR flat rows, and spraying them down a leading axis repeats each one
+    /// every J rows. The `mb` mode addresses ONE row once; this is refused by name with the
+    /// restatements (a real permute, or unrolled per-J state variables) so the kernel side can
+    /// choose. This is the case that fails if the one-row law is ever dropped from the walk.
+    #[test]
+    fn the_rank3_leading_multirow_source_is_row_replication_and_refused() {
+        let m = refusal3(
+            &[64, 4],
+            Relay::Reshape(&[1, 64, 4]),
+            &[64, 4],
+            &[4, 64, 4],
+            &[0],
+        );
+        assert!(
+            m.contains("ROW-REPLICATION"),
+            "names the data movement the device cannot address: {m}"
+        );
+        assert!(
+            m.contains("J-slot merge"),
+            "names the kernel site this shape is, so the refusal reads as a work item: {m}"
         );
     }
 }
