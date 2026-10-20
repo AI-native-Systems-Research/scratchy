@@ -7510,6 +7510,12 @@ impl PageScratch {
                     // (32 words) while the destination advances only the `cut` entries the op covers.
                     // Deriving the destination from the index base puts op `r`'s rows `per_row`× off.
                     dest_entry: r * per_row + first,
+                    // The destination's own law — this scratch's `[rows, cols]`, the pair its synth
+                    // declared, so the run's window is bounded where it lands.
+                    dest: GatherDest::Scratch {
+                        rows: self.rows(),
+                        cols: self.cols() as u32,
+                    },
                     dims: CopyDims {
                         // THIS OP's RUN of the request's plane, in one-stick sub-rows — a whole cut, or
                         // the short tail. In ENTRIES first and then multiplied into sub-rows, so
@@ -7834,6 +7840,12 @@ impl ChunkScratch {
         (0..self.index_sticks()).map(move |j| GatherCopy {
             stick: j,
             dest_entry: j * stick,
+            // The destination's own law — the whole-chunk scratch's `[nkvh, head_chunk_elems]`,
+            // the pair its synth declared.
+            dest: GatherDest::Scratch {
+                rows: self.nkvh(),
+                cols: self.head_chunk_elems() as u32,
+            },
             dims: CopyDims {
                 mb: stick * page,
                 out: POOL_STICK,
@@ -8064,10 +8076,19 @@ impl ChunkKeysLx {
     /// The Kᵗ copies, one per (part, kv head), each with the core-local tensor it writes. Kᵗ's run starts
     /// at stick 0 and every stick of it is a whole part, so stick `j` writes tensor `j`.
     pub fn copies(self) -> impl Iterator<Item = (u32, GatherCopy)> {
-        self.lx
-            .chunk
-            .copies()
-            .map(|c| (c.stick, GatherCopy { dest_entry: 0, ..c }))
+        self.lx.chunk.copies().map(|c| {
+            (
+                c.stick,
+                GatherCopy {
+                    dest_entry: 0,
+                    // THE CORE-LOCAL WINDOW KIND — each copy lands in its own core-local tensor
+                    // (`ChunkKeysLx::tensor`), one entry per core at the pin, so the HBM scratch the
+                    // underlying copy carries is not this destination's law.
+                    dest: GatherDest::CoreLocalLx,
+                    ..c
+                },
+            )
+        })
     }
 }
 
@@ -8279,16 +8300,27 @@ impl ChunkLx {
         self.chunk.copies().map(move |c| {
             let j = c.stick;
             let dest = if j < lx { LxDest::Lx(j) } else { LxDest::Tail };
-            let dest_entry = if j < lx {
-                0
+            // The destination's law follows WHERE the copy lands, per branch: a whole part's copy
+            // writes its own core-local tensor (one entry per core at the pin — the CORE-LOCAL
+            // window kind), and a tail copy writes V's tail HBM scratch at its flat destination
+            // entry, whose bound is the tail's own `[nkvh, tail block]` footprint.
+            let (dest_entry, gdest) = if j < lx {
+                (0, GatherDest::CoreLocalLx)
             } else {
-                (j - lx) * CopyDims::ENTRIES_PER_OP
+                (
+                    (j - lx) * CopyDims::ENTRIES_PER_OP,
+                    GatherDest::Scratch {
+                        rows: self.tail_footprint_dims()[0],
+                        cols: self.tail_footprint_dims()[1],
+                    },
+                )
             };
             (
                 dest,
                 GatherCopy {
                     stick: j + base,
                     dest_entry,
+                    dest: gdest,
                     ..c
                 },
             )
@@ -9175,6 +9207,12 @@ impl GatherScratch {
                 // index's first entry are the same number. Stated rather than derived, so the page-granular
                 // form's divergence from it is visible at both sites.
                 dest_entry: first_entry,
+                // The destination's own law — this scratch's `[rows, cols]`, the pair its synth
+                // declared.
+                dest: GatherDest::Scratch {
+                    rows,
+                    cols: self.cols(),
+                },
                 dims: CopyDims {
                     // The run this op covers — a whole stick, or the short tail. In ENTRIES first,
                     // then multiplied into `mb` SUB-ROWS, so `page | mb` still holds by construction.
@@ -9357,6 +9395,97 @@ impl CopyDims {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ WHERE A GATHERED COPY'S DESTINATION ENDS — the destination's own law, carried by the
+/// copy that writes it, because the copy is minted from the scratch it lands in.
+///
+/// 🛑 **THE DESTINATION'S BOUND WAS NOWHERE.** `gather_copy_opspec` derives the base
+/// (`entry_elems * dest_entry`) and hands it to the op, and nothing compared that base plus the
+/// run's extent against the scratch the copy writes — the #717 class exactly: a base whose run
+/// crosses the scratch's end bakes clean and overruns into the next intermediate's bytes, read
+/// back as keys or page numbers with no fault anywhere. The bound is the destination scratch's
+/// own extent, and the scratch is what `copies()` is minted from — so the COPY carries it, and
+/// the builder refuses a run whose window crosses it (`gather_copy_opspec`'s destination bound,
+/// plus the placement door at `assemble_gather_copy`).
+///
+/// ⭐ THE CORE-LOCAL LX FORMS ARE THEIR OWN KIND, NOT AN EXEMPTION. A copy landing in a core-local
+/// LX tensor writes EACH CORE'S SLICE at the pin: the whole-operand extent is not that
+/// destination's bound, the per-core slice is, and `emit`'s core-local read law already holds the
+/// op to the pin and to the division its consumers read. Carried as a variant so the door knows
+/// WHICH law applies — the core-local form is stated at the mint as itself, never exempted from
+/// it by silence or by an early return.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GatherDest {
+    /// The HBM scratch's own `[rows, cols]` — the pair its synth declared (the minting scratch's
+    /// `footprint_dims`). The copy's destination window is `mb × out` elements at
+    /// `entry_elems · dest_entry`, and the bound is that window inside `rows × cols` — the last
+    /// stick of a pass ends exactly at the scratch's end, so a caller that shrinks either side
+    /// without re-deriving the other is a build failure.
+    Scratch { rows: u32, cols: u32 },
+    /// A CORE-LOCAL LX tensor (`BundleLayout::synth_lx_core_local`): each core writes its slice
+    /// at the pin, so the run has no addressable offset (the destination entry must be 0) and
+    /// the per-core slice is the read law's bound, checked against the pin at emit.
+    CoreLocalLx,
+}
+
+/// ⭐⭐⭐⭐⭐ A HAND-BUILT COPY'S WHOLE DECLARED LAW AS ONE VALUE — the extents, the format, the run
+/// and the destination's bound, because they are one copy seen four ways and a builder that takes
+/// them as loose arguments can be handed three facts about one run and a fourth about another
+/// (the same "one value, not N reaches" law [`CopyDims`] states for the minted cut).
+/// [`GatherCopy`] is the MINTED form — its only constructors are the `copies()` iterators, from a
+/// scratch that owns every number; this is the spec a caller states when no scratch mints it for
+/// them: the descriptor test rigs, and the MoE expert-slab copy that states its own fp8 format
+/// at the raw door.
+///
+/// ⛔ `rows` IS SUB-ROWS OF **ONE STICK**, AND `cols` MUST BE ONE STICK. A `[mb, out]` operand
+/// sticked on a MULTI-stick `out` is `RowBlocked` (stick-major), whose address law
+/// `(c/64)*(rows*64) + r*64 + c%64` scatters each gathered block across the whole buffer — off by
+/// `rows` from the contiguous `[hd, 64]` block the score kernel then reads, from a clean bake. At
+/// one stick of `out` the same law collapses to `r*64 + c`, i.e. ROW-MAJOR, and a pool block is
+/// `hd` consecutive sub-rows. `GatherScratch::sub_rows`/`entry_page` carry that split, and the
+/// gather's `page` is what keeps ONE ENTRY equal to one whole block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GatherCopySpec {
+    /// The run's `mb`.
+    pub rows: u32,
+    /// The run's `out` — EXACTLY one stick of [`Self::df`] (the one-stick law above).
+    pub cols: u32,
+    /// ⭐⭐⭐ THE VALUE OPERANDS' FORMAT — fp16 for every gathered fold to date, fp8 for the MoE
+    /// expert slabs. The vendor's `identity` bind carries NO DDL type constraint
+    /// (unary_parallel.ddl:17 "identity and shuffle only move data, so their input and output
+    /// are free to arrange it differently"), so the copy's df is a property of the BANK it
+    /// copies, not of the op — and the ONE-STICK law transfers per-format: an fp8 copy's `cols`
+    /// is one 128-elem fp8 stick, and the RowBlocked-scatter refusal the fp16 law states is the
+    /// same law at its own width.
+    pub df: crate::superdsc_opspec::Df,
+    /// ⭐⭐⭐⭐⭐ WHERE THIS RUN'S COPY STARTS, AT EACH END — see `superdsc_opspec::GatherRun`. The
+    /// destination entry is separate from the index's `first_entry`, and it has to be. See
+    /// [`GatherCopy::dest_entry`]: the two were one number while a run's entries and its
+    /// destination rows advanced together (the window-granular cut, where one index stick IS 32
+    /// scratch rows), and a page-granular op breaks that — it names ONE entry but must sit at a
+    /// stick boundary, so entries advance 32 per op while rows advance 1. Both are minted from
+    /// the same request index by `copies()`, so they cannot drift; they simply are not equal any
+    /// more. The source base is the SECOND paged-axis half of `addr = idx·skip_addr + base_addr`,
+    /// for a source whose entries are RELATIVE to a base inside its own buffer. ZERO for every
+    /// gathered KV copy (the pool's entries are GLOBAL stick-block numbers, and a per-run base
+    /// would be added twice — see [`GatherCopy`]'s "source base stays ZERO" law). The expert
+    /// bank is the other shape: its entries are EXPERT IDS relative to the bank's base, and the
+    /// bank's packed device layout makes one expert's slab ONE CONTIGUOUS range, so a chunk of
+    /// that slab is the range `[src_off, src_off + mb·page·cols)` and the index term
+    /// `idx·skip_addr` still supplies the WHOLE-slab stride. Both base and index are added by
+    /// `ConvertData_gather_idx` — card-proven at the score leg ("the index supplies only the
+    /// PAGE term", `emit/mod.rs`'s isStartAddrSymbolic note) — so a nonzero base here survives
+    /// the gather and a zero one changes nothing on every existing caller.
+    pub run: crate::superdsc_opspec::GatherRun,
+    /// ⭐⭐⭐⭐⭐ WHERE THIS COPY'S DESTINATION ENDS — see [`GatherDest`]. Carried with the run
+    /// (minted by the same `copies()` that mints it, from the scratch the run lands in), because
+    /// the destination's bound is a fact about the SCRATCH, not about the op: a base whose run
+    /// crosses the scratch's end is the #717 class — a clean bake whose overrun is the next
+    /// intermediate's bytes, read back as keys or page numbers. The core-local LX forms state
+    /// their own window kind (each core's slice at the pin, no offset), never an exemption from
+    /// the mint.
+    pub dest: GatherDest,
+}
+
 /// ⭐⭐⭐⭐⭐ ONE GATHER COPY OP — the run of scratch rows it serves, its declared extents, and the two
 /// BASES that place that run. One value, because the three are the same cut seen three ways and an op
 /// built from two of them and a stale third writes one run's blocks into another run's rows.
@@ -9398,6 +9527,10 @@ pub struct GatherCopy {
     /// Both are minted from the SAME request index inside `copies()`, so they cannot drift; what they
     /// cannot be any more is the same number.
     dest_entry: u32,
+    /// ⭐ WHERE THIS COPY'S DESTINATION ENDS — see [`GatherDest`]. Minted by the same `copies()` that
+    /// mints the run, from the scratch the run lands in, so the bound and the base cannot come from
+    /// two different scratches.
+    dest: GatherDest,
 }
 
 impl GatherCopy {
@@ -9415,6 +9548,12 @@ impl GatherCopy {
     /// [`Self::index_base`].
     pub const fn dest_entry(self) -> u32 {
         self.dest_entry
+    }
+
+    /// Where this copy's destination ENDS — the law [`GatherDest`] states, minted from the scratch
+    /// the copy lands in.
+    pub const fn dest(self) -> GatherDest {
+        self.dest
     }
 
     /// ⭐ THE INDEX OPERAND'S BASE, AS A WHOLE NUMBER OF INDEX STICKS. Spelled as a stick count and not
