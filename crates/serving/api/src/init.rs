@@ -2072,12 +2072,23 @@ pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack
 /// The model's canonical architecture used to select parsers: `model_type` if
 /// present (e.g. `qwen3_5_moe`, `gemma4`, `llama`), else the first
 /// `architectures` entry. Never the model name/path.
+///
+/// Granite 4.2 keeps `model_type: granite` but switched to ChatML, ` MudThink`
+/// reasoning and Qwen3-Coder XML tool calls — and it is the first granite with
+/// an untied lm_head (`tie_word_embeddings: false`; every granite ≤4.1 ties).
+/// Untying is an architecture fact from `config.json`, so it keys the format
+/// split the same way `model_type` does: untied granites report `granite_4_2`.
 fn model_arch(hf: &HfModelConfig) -> &str {
-    hf.model_type
+    let base = hf
+        .model_type
         .as_deref()
         .filter(|s| !s.is_empty())
         .or_else(|| hf.architectures.first().map(String::as_str))
-        .unwrap_or("")
+        .unwrap_or("");
+    if base == "granite" && hf.tie_word_embeddings == Some(false) {
+        return "granite_4_2";
+    }
+    base
 }
 
 /// Install a tool-call parser on `engine`, chosen from the model **architecture**,
