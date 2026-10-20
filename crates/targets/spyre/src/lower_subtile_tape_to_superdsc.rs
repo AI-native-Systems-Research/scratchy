@@ -1932,6 +1932,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
     Ok(BundleLayout {
         placements,
         ids,
+        // The intermediate-tid cursor seeds LAZILY, on the first mint, above the highest
+        // non-reserved placement of the whole bundle — the placement map is complete here,
+        // so the seed sees every tensor (see `BundleLayout::take_inter_tid`).
+        inter_cursor: Default::default(),
         segment_bytes: seg_bytes,
         weight_bank_bytes,
         weight_tail,
@@ -5986,6 +5990,10 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // which is all the runtime needs.
         rope_class_hds: _,
         attn_class_hds: _,
+        // EMIT-ONLY: the intermediate-tid cursor is spent by the time any bundle bakes — its whole
+        // job is done at mint time (bundle-unique tids, above every placement). The baked artifact
+        // carries the minted RESULTS (the synth placements above), not the minter.
+        inter_cursor: _,
     } = l;
 
     let mut places: Vec<bundle::Placement> = placements
@@ -6027,6 +6035,34 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
             is_logits: false,
         }
     }));
+
+    // ⛔ EVERY PLACE ONE ID — the bake-time twin of the runtime Executor::load's own refusal, fired
+    // here so the defect is a `cargo build` panic rather than a card incident one hour later. The
+    // runtime's check (same text, same numbers) was the ONLY guard until 2026-10-20, when granite-2b
+    // fp16 hit it at `load_model`: `1310 placements collapse to 1214 distinct ids` — an intermediate
+    // minted per NODE from that node's own bindings had landed on other nodes' placements, 96 of
+    // them. Duplicates are worse than a count mismatch: the map keeps ONE entry per id, so the other
+    // tensor has NO placement at all — the host binds nothing past it and the device reads whatever
+    // shares its address. `BundleLayout::take_inter_tid` makes the mint bundle-unique so this cannot
+    // fire from a mint again; this check stands for any other route onto a used id.
+    {
+        let mut seen = std::collections::BTreeSet::new();
+        let dupes: Vec<String> = places
+            .iter()
+            .filter(|p| !seen.insert(p.id))
+            .map(|p| p.id.to_string())
+            .collect();
+        assert!(
+            dupes.is_empty(),
+            "{} placements collapse to {} distinct ids — {:?} appear more than once. Two \
+             tensors share an identity, so one of them has no placement. An intermediate was \
+             minted onto a bound tensor's tid — the mint is BundleLayout::take_inter_tid's to \
+             make impossible, and the runtime's load check is the same refusal one hour later.",
+            places.len(),
+            places.len() - dupes.len(),
+            dupes
+        );
+    }
 
     // ⛔ THE INTERMEDIATE SEGMENT MUST COVER EVERY SYNTH, WHENEVER IT WAS DECLARED. The SubtileIR
     // walk grows this itself, right after its own node loop — but a synth can also be minted LATER,
@@ -9129,5 +9165,286 @@ mod tests {
             "the registry-only layout carries the node walk's scales"
         );
         assert_eq!(wiring.nodes.len(), 1, "the ScalarMul node still lowers");
+    }
+
+    /// ⭐ THE MINTING BODY, hand-stated — the walk-unit miniature of the spliced bodies that
+    /// mint: two parameter loads, one UNSTORED `arith.addf` whose result the terminal consumes
+    /// (an intermediate by the walk's own definition — this is exactly mint site 1's shape),
+    /// and one stored `arith.mulf` terminal.
+    ///
+    /// Hand-stated rather than spliced because no family the splice lowers at main leaves an
+    /// unstored classified result: the fused chains (silu, gelu, rmsnorm) fold their interiors
+    /// into one terminal, so their door arms mint nothing. The mint is reached by the bodies
+    /// that carry cross-op results — #717's attention through the whole-function door, and the
+    /// parked rope program that hit this on the card — and this body is their two-op
+    /// miniature, stated from the same op kinds the walk really reads (the `zz_` roster's law).
+    fn minting_program(
+        a: u32,
+        b: u32,
+        out: u32,
+        name: &'static str,
+    ) -> ktir_superdsc::ktir_node::KtirNode {
+        use ktir_core::arena::Arena;
+        use ktir_core::attrkey::AttrKey;
+        use ktir_core::dtypes::DType;
+        use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
+        use ktir_core::irtype::IrType;
+        use ktir_core::opkind::OpKind;
+        use ktir_superdsc::ktir_node::{BufferId, Elementwise, KtirNode, Program};
+        let arena: &'static Arena = Arena::global();
+        let shape = |op: Operation<'static>, r: i64, c: i64| {
+            op.with_attr(arena, AttrKey::Shape, Attr::IntList(arena.ints(vec![r, c])))
+                .with_attr(arena, AttrKey::Dtype, Attr::Dtype(DType::F16))
+        };
+        // The unstored add's result is a MINTED intermediate, so it states a 2-D tensor
+        // type — the footprint the walk's minted buffer is sized from (the same law the
+        // `zz_` roster's unstored matmuls follow).
+        let ty = |r: i64, c: i64| {
+            Some(IrType::Tensor {
+                dims: arena.ints(vec![r, c]),
+                elem: DType::F16,
+            })
+        };
+        // Parameters: a, b, out — the node's operand prefix, output LAST (the splice's own
+        // `default_bindings` law, so the fixture states the real binding order).
+        let (p_a, p_b, p_out) = (Ssa(0), Ssa(1), Ssa(2));
+        let zero = Ssa(3);
+        let (v_a, t_a, val_a) = (Ssa(4), Ssa(5), Ssa(6));
+        let (v_b, t_b, val_b) = (Ssa(7), Ssa(8), Ssa(9));
+        let (sum, prod, v_o, t_o) = (Ssa(10), Ssa(11), Ssa(12), Ssa(13));
+        let ops = vec![
+            Operation::new(arena, Some(zero), OpKind::ArithConstant, &[]).with_attr(
+                arena,
+                AttrKey::Value,
+                Attr::Int(0),
+            ),
+            shape(
+                Operation::new(arena, Some(v_a), OpKind::KtdpConstructMemoryView, &[p_a]),
+                8,
+                64,
+            ),
+            shape(
+                Operation::new(
+                    arena,
+                    Some(t_a),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_a, zero, zero],
+                ),
+                8,
+                64,
+            ),
+            shape(
+                Operation::new(arena, Some(val_a), OpKind::KtdpLoad, &[t_a]),
+                8,
+                64,
+            ),
+            shape(
+                Operation::new(arena, Some(v_b), OpKind::KtdpConstructMemoryView, &[p_b]),
+                8,
+                64,
+            ),
+            shape(
+                Operation::new(
+                    arena,
+                    Some(t_b),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_b, zero, zero],
+                ),
+                8,
+                64,
+            ),
+            shape(
+                Operation::new(arena, Some(val_b), OpKind::KtdpLoad, &[t_b]),
+                8,
+                64,
+            ),
+            // ⭐ THE INTERMEDIATE: `a + b` is consumed by the mul below and stored NOWHERE.
+            {
+                let mut op = shape(
+                    Operation::new(arena, Some(sum), OpKind::ArithAddf, &[val_a, val_b]),
+                    8,
+                    64,
+                );
+                op.result_type = ty(8, 64);
+                op
+            },
+            shape(
+                Operation::new(arena, Some(v_o), OpKind::KtdpConstructMemoryView, &[p_out]),
+                8,
+                64,
+            ),
+            shape(
+                Operation::new(
+                    arena,
+                    Some(t_o),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_o, zero, zero],
+                ),
+                8,
+                64,
+            ),
+            shape(
+                Operation::new(arena, Some(prod), OpKind::ArithMulf, &[sum, val_b]),
+                8,
+                64,
+            ),
+            Operation::new(arena, None, OpKind::KtdpStore, &[prod, t_o]),
+        ];
+        KtirNode {
+            func: IRFunction {
+                name,
+                arguments: arena.args(vec![
+                    (p_a, IrType::Index),
+                    (p_b, IrType::Index),
+                    (p_out, IrType::Index),
+                ]),
+                operations: arena.ops(ops),
+                grid: (1, 1, 1),
+                return_type: None,
+            },
+            program: Program::Elementwise(Elementwise::Mul),
+            bindings: vec![BufferId::new(a), BufferId::new(b), BufferId::new(out)],
+            mask: None,
+            node_out_tid: None,
+            minted: Default::default(),
+        }
+    }
+
+    /// The two-node bundle's shared layout: six placements `t0..t5` — node A binds
+    /// `t0, t1` and writes `t4`, node B binds `t2, t3` and writes `t5`. The `ids` row per
+    /// placement is what `compute_bundle_layout` derives; stated here the same way so the
+    /// bake's synthetic-identity lookup sees the same table the real layout builds.
+    fn two_node_layout() -> ktir_superdsc::placement::BundleLayout {
+        use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
+        let mut l = BundleLayout::default();
+        for tid in 0..6u32 {
+            l.ids.borrow_mut().insert(
+                ktir_superdsc::place::act_name(tid),
+                ktir_superdsc::place::PlaceId::Act(tid),
+            );
+            l.placements.insert(
+                tid,
+                TensorPlacement {
+                    tid,
+                    role: SegRole::Activation,
+                    segment: 0,
+                    bank: 0,
+                    offset: u64::from(tid) * 0x10000,
+                    size: 8 * 64 * 2,
+                },
+            );
+        }
+        // The placement high-water of seg0, as `compute_bundle_layout` states it — the bake's
+        // address check reads this, so a hand-stated layout states it too.
+        l.segment_bytes[0] = 6 * 0x10000;
+        l
+    }
+
+    /// ⭐⭐ THE CARD P0 OF 2026-10-20, AS A TEST — two whole-function nodes in ONE bundle, and
+    /// every intermediate mint must stay above every placement in it.
+    ///
+    /// The mint used to be seeded per NODE off that node's own bindings. Node A below
+    /// (bindings `t0, t1, t4`) therefore minted from `t5` — node B's output, a real placement —
+    /// and on the card, granite-2b fp16 refused at `load_model` with "1310 placements collapse
+    /// to 1214 distinct ids — t454 … t549 appear more than once" (96 silent aliases per rope
+    /// program, each landing on another node's placement exactly as node A's first mint lands
+    /// on `t5` here). The bundle-unique cursor (`BundleLayout::take_inter_tid`) mints strictly
+    /// above every placement instead, and this is the two-node shape that made the per-node
+    /// seed collide.
+    ///
+    /// ⛔ FAILS WITHOUT THE FIX BY CONSTRUCTION: node A's first mint lands on `t5` — a real
+    /// placement — so `bake_layout`'s duplicate-id refusal fires (and the distinctness assert
+    /// below would fire even without it).
+    #[test]
+    fn two_whole_function_nodes_in_one_bundle_mint_above_every_placement() {
+        let layout = two_node_layout();
+        // The seed's own filter: reserved tids (the const tables sit near `u32::MAX`) are
+        // skipped by the max, never walked into.
+        let max_real = layout
+            .placements
+            .keys()
+            .copied()
+            .filter(|t| !ktir_superdsc::reserved_tids::is_reserved(*t))
+            .max()
+            .expect("the layout places its tensors");
+
+        // THE NODES the walk lowers — one instance each, because each pass borrows the same
+        // emitted program's KTIR (the splice-runs-once shape; a fresh instance per pass is
+        // the defect the replay assert below refuses).
+        let programs = [
+            minting_program(0, 1, 4, "mint_a"),
+            minting_program(2, 3, 5, "mint_b"),
+        ];
+        // One full walk pass over the shared layout, in node order — the declare pass's own
+        // shape, which the real pass repeats verbatim.
+        let pass = |layout: &ktir_superdsc::placement::BundleLayout| {
+            for k in &programs {
+                let mut syms = 0i64;
+                ktir_superdsc::emit::whole_function::lower_function(
+                    k,
+                    Some(layout),
+                    &mut syms,
+                    None,
+                )
+                .expect("the walk lowers the minting program");
+            }
+        };
+
+        // THE DECLARE PASS, then the real one — the same two lowerings every rung runs over
+        // the ONE shared plan.
+        pass(&layout);
+        let synth_before = layout.synth.borrow().map.len();
+        assert!(
+            synth_before >= 2,
+            "each node minted at least one intermediate — the fixture no longer exercises \
+             the mint ({} minted)",
+            synth_before
+        );
+        // THE REAL PASS REPLAYS: no fresh synthetics, or the body's snapshot would lack them
+        // (the DMA-past-the-segment defect the declare pass exists to prevent). This is the
+        // replay record's own law — a mint keyed on the SSA value, confirmed by the layout
+        // before it is trusted — without which the second pass would mint beside the first
+        // pass's buffers instead of on them.
+        pass(&layout);
+        assert_eq!(
+            layout.synth.borrow().map.len(),
+            synth_before,
+            "the second lowering minted fresh synthetics — the declare/real name agreement broke"
+        );
+        // And every mint sat strictly above every real placement (max_real = t5 here): the
+        // cursor moved past the placements, never through them.
+        assert!(
+            layout.inter_cursor.get().is_some_and(|c| c > max_real),
+            "the mint cursor {:?} did not advance past the highest placement t{max_real}",
+            layout.inter_cursor.get()
+        );
+
+        // THE BAKE — the runtime's own law (`Executor::load`'s duplicate refusal), at build
+        // time: all place ids distinct.
+        let baked = bake_layout(&layout);
+        let mut seen = std::collections::BTreeSet::new();
+        assert!(
+            baked.places.iter().all(|p| seen.insert(p.id)),
+            "two placements share an identity — the exact card refusal this test pins"
+        );
+    }
+
+    /// ⛔ THE REFUSAL ITSELF: a layout whose synthetics collide with a real placement is a BUILD
+    /// failure, not a card one. The duplicate is injected by hand — declaring a synthetic at an
+    /// already-placed tid, exactly what a colliding mint does — because the mint path that used
+    /// to produce it is the one the test above pins as fixed.
+    #[test]
+    #[should_panic(expected = "collapse to")]
+    fn bake_layout_refuses_duplicate_placement_ids() {
+        let layout = two_node_layout();
+        // A synthetic at a REAL placement's tid — t5, node B's output, the tid the per-node
+        // seed minted first for node A (A's bindings max at t4, so the old seed was t5).
+        let victim = 5u32;
+        assert!(
+            layout.placements.contains_key(&victim),
+            "t{victim} must be a real placement for the collision to be the card's shape"
+        );
+        layout.synth(ktir_superdsc::place::PlaceId::Act(victim), &[1, 64]);
+        let _ = bake_layout(&layout);
     }
 }

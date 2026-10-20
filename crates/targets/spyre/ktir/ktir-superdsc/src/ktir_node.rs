@@ -400,7 +400,6 @@ impl ActiveCap {
 }
 
 /// One node's KTIR: the function, and which tensor each of its parameters carries.
-#[derive(Clone)]
 pub struct KtirNode {
     pub func: ktir_core::ir::IRFunction<'static>,
     /// What this program computes. See [`Program`] — carried because no reading of the IR recovers it.
@@ -452,6 +451,44 @@ pub struct KtirNode {
     /// dispatch happens per BUNDLE and later than the producer that knows. So it is stated here, as a
     /// [`BufferId`] like every other buffer this type names.
     pub node_out_tid: Option<BufferId>,
+    /// ⭐ THE MINT RECORD — every intermediate tid this node's lowering minted, by the SSA
+    /// value that needed it. `whole_function`'s `mint_inter` consults it FIRST and replays
+    /// the recorded tid when the SAME layout already declared that tid's synthetic — which is
+    /// how the declare pass and the real pass (two lowerings of the same node into the same
+    /// layout, [the splice memo's](crate::emit::whole_function) shared instance) land on the
+    /// SAME names instead of minting fresh buffers per pass.
+    ///
+    /// A `Mutex` and not a `RefCell` because the splice's whole-function memo holds
+    /// `KtirNode` in a process-wide `static` and requires `Sync`. The clone the memo hands
+    /// each rung carries the record BY CONTENTS — see the manual `Clone` below.
+    pub minted: std::sync::Mutex<std::collections::HashMap<ktir_core::ir::Ssa, u32>>,
+}
+
+impl Clone for KtirNode {
+    /// Manual for ONE field: the mint record clones by CONTENTS — a fresh `Mutex` over the
+    /// map's clone, NOT a shared `Arc<Mutex<…>>`. The splice's memo hands each rung its own
+    /// `KtirNode`, and a shared record would let one rung's declare pass overwrite another
+    /// rung's minted tids even though the two rungs lower into DIFFERENT layouts; the
+    /// contents-clone at `Memo` time freezes each rung's starting record at what the shared
+    /// instance had. The one safety valve is that replay only fires when the layout itself
+    /// confirms the tid — [`mint_inter`](crate::emit::whole_function) checks the layout's
+    /// synth map before trusting the record — so a record carried into a layout that never
+    /// declared that tid mints a fresh one instead of colliding.
+    fn clone(&self) -> Self {
+        KtirNode {
+            func: self.func,
+            program: self.program,
+            bindings: self.bindings.clone(),
+            mask: self.mask,
+            node_out_tid: self.node_out_tid,
+            minted: std::sync::Mutex::new(
+                self.minted
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone(),
+            ),
+        }
+    }
 }
 ///
 /// ⭐ DELIBERATELY *NOT* A [`Program`] VARIANT, and the reason is a real cost rather than taste.

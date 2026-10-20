@@ -100,6 +100,7 @@ pub fn node_for(m: &triton_ktir::ir::Module, program: Program) -> Result<KtirNod
         bindings,
         mask: None,
         node_out_tid: None,
+        minted: Default::default(),
     })
 }
 
