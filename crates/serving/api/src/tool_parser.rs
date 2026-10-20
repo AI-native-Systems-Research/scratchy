@@ -35,7 +35,7 @@ pub struct ExtractedToolCallInfo {
 }
 
 /// A streaming tool call delta (mirrors OpenAI DeltaToolCall).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeltaToolCall {
     /// Index of this tool call in the array.
     pub index: u32,
