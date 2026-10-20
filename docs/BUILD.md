@@ -219,8 +219,8 @@ TurboQuant codes (3-bit for the Llama family, 4-bit otherwise), and the build
 decides which: nothing chooses at runtime. `scratchy-cli`'s `metal` feature
 turns `turboquant` **on**; a cuda or spyre build does not have it. To build
 metal with a dense KV cache, name `metal-base` instead of `metal`: the same
-engine without `turboquant` or `mtp-heads` (add `mtp-heads` back to keep MTP
-drafting):
+engine without scratchy-models' `turboquant` or `mtp-heads` (add
+`model/mtp-heads` back to keep MTP drafting):
 
 ```bash
 cargo build --release -p scratchy-cli --features metal-base,model/llama-3.2-1b

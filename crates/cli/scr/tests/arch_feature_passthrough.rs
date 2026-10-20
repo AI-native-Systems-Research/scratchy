@@ -55,7 +55,7 @@ fn feature_keys(cargo_toml: &str) -> BTreeSet<String> {
 /// The admission rule, so this list cannot become a dumping ground: a name
 /// belongs here ONLY if it is not a model scope — i.e. it is not a checked-in
 /// `configs/<arch>/<stem>.json` stem, an `<arch>` directory name, `arch-<name>`,
-/// or `all`. Backend tiers (`spyre-hw`) and capability features
+/// or `all`. Backend tiers (`spyre-hw`, `spyre-emu`) and capability features
 /// (`hf-completions`) pass that rule; a model or arch name never does, which is
 /// the duplication this test exists to catch.
 const SHARED_NON_SCOPE_FEATURES: &[&str] = &[
@@ -65,6 +65,7 @@ const SHARED_NON_SCOPE_FEATURES: &[&str] = &[
     "nccl",
     "spyre",
     "spyre-hw",
+    "spyre-emu",
     "hf-completions",
 ];
 
