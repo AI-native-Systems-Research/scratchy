@@ -554,12 +554,21 @@ impl EngineCore {
         //    when no tokens are scheduled).
         let _t_exec = std::time::Instant::now();
         let executor = self.executor.as_mut().expect("checked above");
-        let mut model_output = executor
-            .execute_model(&scheduler_output)
-            .map_err(|e| EngineError::Executor(e.to_string()))?;
-
         // Resolve deferred D2H if present (sync path — resolve immediately).
-        model_output.resolve().map_err(EngineError::Executor)?;
+        let executed = executor
+            .execute_model(&scheduler_output)
+            .map_err(|e| EngineError::Executor(e.to_string()))
+            .and_then(|mut output| {
+                output.resolve().map_err(EngineError::Executor)?;
+                Ok(output)
+            });
+        let model_output = match executed {
+            Ok(output) => output,
+            Err(e) => {
+                self.abandon_step(&scheduler_output);
+                return Err(e);
+            }
+        };
         let _d_exec = _t_exec.elapsed();
 
         // 3. Finalize: process outputs, aborts, ngram, and stats.
@@ -655,9 +664,13 @@ impl EngineCore {
         }
     }
 
-    /// A step the executor failed: it is never finalized, so it leads no more.
+    /// A step the executor failed: it is never finalized, so it leads no more, and its requests
+    /// are aborted — none has the output the step owed it, and left running, the next step (or
+    /// the next caller's) would drive them on.
     pub fn abandon_step(&mut self, sched: &SchedulerOutput) {
         self.end_lead(sched);
+        let req_ids: Vec<String> = sched.num_scheduled_tokens.keys().cloned().collect();
+        self.abort_requests(&req_ids);
     }
 
     /// A step done — finalized or failed: the step behind it waits on it no more.

@@ -2224,15 +2224,11 @@ impl AsyncEngine {
                         }
                         Some((Err(e), sched)) => {
                             error!("Executor error: {}", e);
+                            // Aborts the step's requests in the engine, too.
                             client.abandon_step(&sched);
                             let err_msg = format!("Executor error: {e}");
-                            let req_ids: Vec<String> =
-                                sched.num_scheduled_tokens.keys().cloned().collect();
-                            client
-                                .abort_requests(&req_ids)
-                                .unwrap_or_else(|e| error!("abort_requests failed: {e}"));
                             Self::fail_requests(&mut *requests.lock().await, &err_msg, |id| {
-                                req_ids.iter().any(|r| r == id)
+                                sched.num_scheduled_tokens.contains_key(id)
                             });
                             notify.notify_waiters();
                             gpu_in_flight -= 1;

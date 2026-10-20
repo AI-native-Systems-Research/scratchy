@@ -532,6 +532,22 @@ impl LLM {
             .unwrap_or_else(|| Interrupted.into())
     }
 
+    /// End a generation whose step failed: abort its requests and step the engine until they are
+    /// retired, as [`LLM::stop`] does, then the step's error. The engine aborts the failed step's
+    /// own requests; the generation's others, still waiting or behind it, would otherwise run on
+    /// under the next call on this `LLM` (#575).
+    fn fail(
+        &mut self,
+        request_ids: &[String],
+        error: scratchy_serving_engine::error::EngineError,
+    ) -> anyhow::Error {
+        let failed = anyhow::anyhow!("engine step failed: {error}");
+        match self.abort_and_drain(request_ids) {
+            Ok(()) => failed,
+            Err(drain) => failed.context(format!("retiring the generation's requests: {drain}")),
+        }
+    }
+
     /// The model name / HuggingFace ID.
     pub fn model_name(&self) -> &str {
         &self.model_name
@@ -888,10 +904,10 @@ impl LLM {
             if self.interrupted() {
                 return Err(self.stop(&request_ids));
             }
-            let outcome = self
-                .client
-                .get_output()
-                .map_err(|e| anyhow::anyhow!("engine step failed: {e}"))?;
+            let outcome = match self.client.get_output() {
+                Ok(outcome) => outcome,
+                Err(e) => return Err(self.fail(&request_ids, e)),
+            };
             let outputs = match outcome {
                 StepOutcome::Progressed { outputs, .. } => outputs,
                 StepOutcome::Stalled => return Err(stalled_step("offline generate")),
@@ -1157,10 +1173,10 @@ impl LLM {
                 return Err(self.stop(std::slice::from_ref(&request_id)));
             }
             let _t_step_i = std::time::Instant::now();
-            let outcome = self
-                .client
-                .get_output()
-                .map_err(|e| anyhow::anyhow!("engine step failed: {e}"))?;
+            let outcome = match self.client.get_output() {
+                Ok(outcome) => outcome,
+                Err(e) => return Err(self.fail(std::slice::from_ref(&request_id), e)),
+            };
             let outputs = match outcome {
                 StepOutcome::Progressed { outputs, .. } => outputs,
                 StepOutcome::Stalled => return Err(stalled_step("streaming chat/completion")),
