@@ -36,13 +36,51 @@ import sys
 
 TOL = 2e-2
 
-# The card's `PlaceId::Act(t)` renders `t{t}`; its `PlaceId::Synth` renders `t{of}_{role}`
-# (e.g. `t1127_silu`) and is card-only — the emulator dumps graph tids — so synth files join
-# nothing but are LISTED rather than silently invisible.
+# ⛔ THE TWO SIDES SPELL THE TID DIFFERENTLY, AND EACH SPELLING IS STRUCTURAL. The card's stem is
+# `format!("..._t{id}", …)` where `id` is a `PlaceId` whose Display renders `t{tid}` — the literal
+# `t` plus the rendering is DOUBLE-t: `prog{P}_seg{S}_tt{T}.bin`. The emulator writes a plain u64
+# tid behind one `t`: `prog{P}_seg{S}_t{T}.bin`. The card's `PlaceId::Synth` renders `t{of}_{role}`
+# (so `tt{of}_{role}`) and is card-only — the emulator dumps graph tids — so synth files join
+# nothing but are LISTED rather than silently invisible. Synth roles appear both bare and under an
+# `op{O}_` timeline prefix (`xn`/`xc`/`rs` measured on the j25 dump), so the synth pattern takes
+# both; the LATEST pattern must NOT take the op-prefixed form, or a timeline copy would masquerade
+# as a tensor's final value.
 EMU_FILE = re.compile(r"prog\d+_seg\d+_t(\d+)\.bin$")
-CARD_LATEST = re.compile(r"prog\d+_seg\d+_t(\d+)\.bin$")
-CARD_SYNTH = re.compile(r"prog\d+_seg\d+_t(\d+)_[A-Za-z0-9]+\.bin$")
-CARD_TL = re.compile(r"op(\d+)_prog\d+_seg\d+_t(\d+)(?:_[A-Za-z0-9]+)?\.bin$")
+CARD_LATEST = re.compile(r"prog\d+_seg\d+_tt(\d+)\.bin$")
+CARD_SYNTH = re.compile(r"(?:op\d+_)?prog\d+_seg\d+_tt(\d+)_[A-Za-z0-9]+\.bin$")
+CARD_TL = re.compile(r"op(\d+)_prog\d+_seg\d+_tt(\d+)(?:_[A-Za-z0-9]+)?\.bin$")
+
+
+def selftest():
+    """Parse the EXACT filenames measured on the j25 dumps (nickm2 /work/runhelper-j25), so a
+    spelling drift in either writer's format! fails here instead of silently emptying the join."""
+    cases = [
+        # (pattern, filename, expected capture or None for no-match)
+        (CARD_LATEST, "prog0_seg0_tt1127.bin", "1127"),
+        (CARD_LATEST, "prog0_seg0_tt4294967271.bin", "4294967271"),
+        (CARD_LATEST, "op101_prog0_seg0_tt1127.bin", None),  # timeline copy is not a latest value
+        (CARD_LATEST, "prog0_seg0_t1127.bin", None),  # single-t is the EMULATOR's spelling
+        (CARD_TL, "op101_prog0_seg0_tt1127.bin", ("101", "1127")),
+        (CARD_TL, "op5_prog0_seg3_tt9_xc.bin", ("5", "9")),
+        (CARD_TL, "prog0_seg0_tt1127.bin", None),  # latest files carry no op number
+        (CARD_SYNTH, "op3_prog0_seg2_tt7_rs.bin", "7"),
+        (CARD_SYNTH, "prog0_seg2_tt7_xn.bin", "7"),
+        (CARD_SYNTH, "prog0_seg2_tt7.bin", None),  # no role suffix: not a synth
+        (EMU_FILE, "prog0_seg0_t1012.bin", "1012"),
+        (EMU_FILE, "prog0_seg0_tt1012.bin", None),  # double-t is the CARD's spelling
+        (EMU_FILE, "op1_prog0_seg0_t1012.bin", None),
+    ]
+    bad = 0
+    for pat, name, want in cases:
+        m = pat.match(name)
+        got = None if m is None else (m.groups() if len(m.groups()) > 1 else m.group(1))
+        if got != want:
+            print(f"FAIL {pat.pattern!r} on {name!r}: got {got!r}, want {want!r}")
+            bad += 1
+    if bad:
+        print(f"SELFTEST: {bad} failure(s)")
+        sys.exit(1)
+    print(f"SELFTEST: {len(cases)} filename cases parse")
 
 
 def read_f32(path):
@@ -115,6 +153,9 @@ def verdict(card_v, emu_v):
 
 
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] == "--selftest":
+        selftest()
+        return
     if len(sys.argv) != 3:
         print(__doc__)
         sys.exit(2)
