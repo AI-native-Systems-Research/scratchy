@@ -9167,7 +9167,6 @@ mod tests {
         assert_eq!(wiring.nodes.len(), 1, "the ScalarMul node still lowers");
     }
 
-
     /// ⭐ THE MINTING BODY, hand-stated — the walk-unit miniature of the spliced bodies that
     /// mint: two parameter loads, one UNSTORED `arith.addf` whose result the terminal consumes
     /// (an intermediate by the walk's own definition — this is exactly mint site 1's shape),
@@ -9179,7 +9178,12 @@ mod tests {
     /// that carry cross-op results — #717's attention through the whole-function door, and the
     /// parked rope program that hit this on the card — and this body is their two-op
     /// miniature, stated from the same op kinds the walk really reads (the `zz_` roster's law).
-    fn minting_program(a: u32, b: u32, out: u32, name: &'static str) -> ktir_superdsc::ktir_node::KtirNode {
+    fn minting_program(
+        a: u32,
+        b: u32,
+        out: u32,
+        name: &'static str,
+    ) -> ktir_superdsc::ktir_node::KtirNode {
         use ktir_core::arena::Arena;
         use ktir_core::attrkey::AttrKey;
         use ktir_core::dtypes::DType;
@@ -9376,8 +9380,13 @@ mod tests {
         let pass = |layout: &ktir_superdsc::placement::BundleLayout| {
             for k in &programs {
                 let mut syms = 0i64;
-                ktir_superdsc::emit::whole_function::lower_function(k, Some(layout), &mut syms, None)
-                    .expect("the walk lowers the minting program");
+                ktir_superdsc::emit::whole_function::lower_function(
+                    k,
+                    Some(layout),
+                    &mut syms,
+                    None,
+                )
+                .expect("the walk lowers the minting program");
             }
         };
 
