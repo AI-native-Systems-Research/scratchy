@@ -8,6 +8,7 @@
     "fp8-static-per-tensor",
     "mlx-affine-b4-g32",
     "mlx-affine-b4-g64",
+    "mlx-affine-b4-g64-qembed",
     "ggml"
   ]
 }

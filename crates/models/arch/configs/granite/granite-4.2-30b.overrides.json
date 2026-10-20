@@ -1,0 +1,4 @@
+{
+  "_comment": "ibm-granite/granite-4.2-30b(-q4-mlx) ships BF16 RMSNorm gains and BF16 affine scales/biases, like every granite-4.1 config (which carries scale_dtype inline).",
+  "scale_dtype": "bf16"
+}
