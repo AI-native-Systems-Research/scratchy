@@ -3594,6 +3594,14 @@ fn gathered_matmul_materializes(
     let x_h = super::rb(&table_name, rows, head);
     let inputs = [super::In::full(&x_h).ew()];
     let tile_op = super::lower_ktir_to_superdsc::pointwise_tile_op(rows, head, 2);
+    // ⭐ THE RUN — the program's stick-checked anchor plus the whole sticks these rows span
+    // ([`StickRun::covering`]). The constructor's start half re-states `gathers_of`'s anchor
+    // check at the door that builds the legs, so a mid-stick anchor has no path around it.
+    let run = crate::superdsc_opspec::StickRun::covering(g.first_entry.entries(), rows).map_err(
+        |msg| Error {
+            message: format!("{}: {msg}", f.name),
+        },
+    )?;
     let copied = super::assemble_pointwise_broadcast_gather(
         super::PointwiseGather {
             op_name: &inter_name,
@@ -3604,7 +3612,7 @@ fn gathered_matmul_materializes(
             inputs: &inputs,
             gathered_input: 0,
             index_name: &index_name,
-            first_entry: g.first_entry,
+            run,
             o: &super::rb(&inter_name, rows, head),
         },
         sym_id_base,

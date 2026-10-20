@@ -72,8 +72,10 @@ fn h(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
 }
 
 /// The embedding op exactly as `scalarmul_at`'s gathered branch builds it: `[scalar, table]` with the
-/// TABLE LAST, `multiply`, a row-blocked output. ONE LEG PER INDEX STICK. `first_entry` is the
-/// program's own anchor, so a run starting past the index buffer's first word can be stated.
+/// TABLE LAST, `multiply`, a row-blocked output. ONE LEG PER INDEX STICK. The run is built as the
+/// walk builds it ([`ktir_superdsc::superdsc_opspec::StickRun::covering`]) from the program's own
+/// anchor in entries, so a run starting past the index buffer's first word can be stated — and one
+/// starting between sticks is refused by the constructor itself (issue 201 item 1).
 fn emit_legs_at(
     rows: u32,
     cols: u32,
@@ -95,9 +97,10 @@ fn emit_legs_at(
             inputs: &inputs,
             gathered_input: 1,
             index_name: "EmbIds",
-            // The typed base: of_entries IS the alignment check, so the unaligned-start tests
-            // exercise the constructor's own refusal (issue 201 item 1).
-            first_entry: ktir_superdsc::superdsc_opspec::EntryBase::of_entries(first_entry)?,
+            // The typed run: `covering` IS the start-alignment check (its start half goes through
+            // `EntryBase::of_entries`), so the unaligned-start tests exercise the constructor's own
+            // refusal, and the span half states the whole sticks this node's entries occupy.
+            run: ktir_superdsc::superdsc_opspec::StickRun::covering(first_entry, rows)?,
             o: &out,
         },
         &mut sym,
@@ -276,7 +279,10 @@ fn the_gathered_operand_must_be_the_last_input() {
             inputs: &inputs,
             gathered_input: 0,
             index_name: "EmbIds",
-            first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
+            // The whole-buffer run, 256 entries over 8 sticks — valid on purpose, so the refusal
+            // under test is the DOMINANCE one and only that one.
+            run: ktir_superdsc::superdsc_opspec::StickRun::covering(0, ROWS)
+                .expect("the whole-buffer run covers the vendor pin's 256 rows"),
             o: &out,
         },
         &mut sym,
