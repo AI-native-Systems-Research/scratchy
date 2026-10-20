@@ -1982,13 +1982,22 @@ impl AsyncEngine {
                             });
 
                             // Phase 3: apply detok results, send streams (brief lock).
-                            {
+                            let stop_string_finished = {
                                 let mut reqs = requests.lock().await;
                                 Self::process_outputs_phase3(
                                     &mut reqs,
                                     outputs.outputs,
                                     detok_results,
-                                );
+                                )
+                            };
+
+                            // A stop string finished a request the engine is still decoding —
+                            // abort it there, or it runs on to max_tokens under the next
+                            // request's steps (#711).
+                            if !stop_string_finished.is_empty() {
+                                client
+                                    .abort_requests(&stop_string_finished)
+                                    .unwrap_or_else(|e| error!("abort_requests failed: {e}"));
                             }
 
                             // Wake waiters only when there are actual outputs.
@@ -2129,7 +2138,15 @@ impl AsyncEngine {
                 if let Some((prev_sched, prev_output)) = deferred.take() {
                     match client.finalize_step(&prev_sched, &prev_output) {
                         Ok(outputs) => {
-                            route_step_outputs(&requests, outputs).await;
+                            let stop_string_finished = route_step_outputs(&requests, outputs).await;
+                            // A stop string finished a request the engine is still decoding —
+                            // abort it there, or it runs on to max_tokens under the next
+                            // request's steps (#711).
+                            if !stop_string_finished.is_empty() {
+                                client
+                                    .abort_requests(&stop_string_finished)
+                                    .unwrap_or_else(|e| error!("abort_requests failed: {e}"));
+                            }
                             // A finalized step IS forward progress: prefill
                             // chunks sample no tokens, so gating this reset on
                             // sampled outputs would let the watchdog shoot a
@@ -2296,7 +2313,15 @@ impl AsyncEngine {
             // Finalize any remaining deferred output before shutdown.
             if let Some((prev_sched, prev_output)) = deferred.take() {
                 if let Ok(outputs) = client.finalize_step(&prev_sched, &prev_output) {
-                    route_step_outputs(&requests, outputs).await;
+                    let stop_string_finished = route_step_outputs(&requests, outputs).await;
+                    // A stop string finished a request the engine is still decoding —
+                    // abort it there, or it runs on to max_tokens under the next
+                    // request's steps (#711).
+                    if !stop_string_finished.is_empty() {
+                        client
+                            .abort_requests(&stop_string_finished)
+                            .unwrap_or_else(|e| error!("abort_requests failed: {e}"));
+                    }
                 }
                 notify.notify_waiters();
             }
@@ -2631,7 +2656,16 @@ impl AsyncEngine {
         requests: &mut HashMap<String, RequestState>,
         outputs: Vec<EngineCoreOutput>,
         detok_results: Vec<Option<DetokResult>>,
-    ) {
+    ) -> Vec<String> {
+        // The requests this call finishes by a STOP STRING alone — the engine kept
+        // decoding them, because a stop string is not an engine-side criterion
+        // (engine_core's `check_stop_criteria` knows EOS, stop tokens and
+        // max_tokens only). The caller must abort each one engine-side or it
+        // decodes on to max_tokens while the client believes it done: the next
+        // request is then admitted under a still-running row, sharing its steps
+        // (a 3.3x first-token latency), and its eventual retirement changes the
+        // batch's composition under whoever is still decoding (#711).
+        let mut stop_string_finished: Vec<String> = Vec::new();
         for (output, detok_result) in outputs.into_iter().zip(detok_results) {
             let Some(req_state) = requests.get_mut(&output.request_id) else {
                 // Already logged in Phase 1.
@@ -2645,6 +2679,13 @@ impl AsyncEngine {
             // NOTHING TO PUT BACK — the detokenizer never left. This arm used to reinstall it, and
             // when the state had already been removed it `continue`d above and dropped it forever.
             let (detokenizer_stop, delta_text) = detok_result.unwrap_or((None, None));
+
+            // Captured before `output` is consumed by the stream deltas below.
+            // The engine's own finish for this step means it has already retired
+            // the request — only a detokenizer-only finish leaves it running.
+            if detokenizer_stop.is_some() && output.finish_reason.is_none() {
+                stop_string_finished.push(output.request_id.clone());
+            }
 
             let step_logprobs = output.new_logprobs.clone();
 
@@ -3015,6 +3056,7 @@ impl AsyncEngine {
                 }
             }
         }
+        stop_string_finished
     }
 
     /// Process an engine output for a single request (single-threaded path,
@@ -3887,12 +3929,15 @@ fn executor_thread_loop(
 }
 
 /// Route step outputs to request states and update metrics.
-/// Returns `true` if any output tokens were produced.
+///
+/// Returns the requests this pass finishes by a stop string alone — the engine
+/// is still decoding each of those (a stop string is not an engine-side
+/// criterion), and the caller must abort them engine-side (#711).
 async fn route_step_outputs(
     requests: &Mutex<HashMap<String, RequestState>>,
     outputs: scratchy_serving_engine::engine_core::StepOutputs,
-) -> bool {
-    let mut had_outputs = false;
+) -> Vec<String> {
+    let mut stop_string_finished: Vec<String> = Vec::new();
     for (_, engine_outputs) in outputs {
         // Update scheduler gauges from stats.
         #[cfg(feature = "metrics")]
@@ -3916,8 +3961,6 @@ async fn route_step_outputs(
         }
 
         if !engine_outputs.outputs.is_empty() {
-            had_outputs = true;
-
             // Phase 1: accumulate tokens, take detokenizers (brief lock).
             let detok_work = {
                 let mut reqs = requests.lock().await;
@@ -3934,15 +3977,15 @@ async fn route_step_outputs(
             // Phase 3: apply detok results, send streams (brief lock).
             {
                 let mut reqs = requests.lock().await;
-                AsyncEngine::process_outputs_phase3(
+                stop_string_finished.extend(AsyncEngine::process_outputs_phase3(
                     &mut reqs,
                     engine_outputs.outputs,
                     detok_results,
-                );
+                ));
             }
         }
     }
-    had_outputs
+    stop_string_finished
 }
 
 // ---------------------------------------------------------------------------
@@ -4636,6 +4679,86 @@ mod tests {
         AsyncEngine::process_outputs_phase3(&mut requests, vec![output()], results);
         AsyncEngine::process_output(&mut requests, output());
         assert_eq!(requests["req-1"].generated_token_ids, [10, 11]);
+    }
+
+    /// A stop string is not an engine-side criterion, so a request it finishes is still running
+    /// engine-side. Phase 3 names every such request so the step loop can abort it there —
+    /// without that abort the engine decodes it on to max_tokens under the NEXT request's steps
+    /// (#711: the follow-up request came back garbage with a 3.3x first-token latency).
+    #[test]
+    fn a_stop_string_finish_names_the_request_for_engine_abort() {
+        let mut requests = HashMap::new();
+        requests.insert("req-1".to_string(), make_test_request_state(None));
+        let output = EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![12, 13],
+            finish_reason: None,
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let detok = Some((Some("Century".to_string()), Some("…Cent".to_string())));
+        let to_abort =
+            AsyncEngine::process_outputs_phase3(&mut requests, vec![output], vec![detok]);
+        assert_eq!(
+            to_abort,
+            vec!["req-1".to_string()],
+            "the engine still holds req-1"
+        );
+        assert_eq!(requests["req-1"].finish_reason, Some(FinishReason::Stop));
+        assert_eq!(
+            requests["req-1"].stop_reason,
+            Some(StopReason::String("Century".to_string()))
+        );
+    }
+
+    /// The engine's own finish for the same step means it already retired the request — no abort
+    /// may be asked for, or the loop would abort an id the scheduler no longer knows.
+    #[test]
+    fn an_engine_finish_needs_no_abort() {
+        let mut requests = HashMap::new();
+        requests.insert("req-1".to_string(), make_test_request_state(None));
+        let output = EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![12, 13],
+            finish_reason: Some(FinishReason::Length),
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let detok = Some((Some("Century".to_string()), Some("…Cent".to_string())));
+        let to_abort =
+            AsyncEngine::process_outputs_phase3(&mut requests, vec![output], vec![detok]);
+        assert!(to_abort.is_empty(), "the engine finished it itself");
+    }
+
+    /// No stop string, no engine finish: the request keeps decoding and nothing is named.
+    #[test]
+    fn a_running_request_names_no_abort() {
+        let mut requests = HashMap::new();
+        requests.insert("req-1".to_string(), make_test_request_state(None));
+        let output = EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![12, 13],
+            finish_reason: None,
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let detok = Some((None, Some("…".to_string())));
+        let to_abort =
+            AsyncEngine::process_outputs_phase3(&mut requests, vec![output], vec![detok]);
+        assert!(to_abort.is_empty());
+        assert_eq!(requests["req-1"].finish_reason, None);
     }
 
     #[test]
@@ -5646,6 +5769,203 @@ mod tests {
         let mut engine = AsyncEngine::new(client, "test-model".to_string(), 4096);
         engine.set_no_progress_timeout(Duration::from_secs(2));
         engine
+    }
+
+    /// The stop-string abort test's shared id recorders (added ids, aborted ids).
+    type IdLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A client whose every request decodes to text containing the stop word, and which records
+    /// every abort it is asked for. The stop word finishes each request API-side while the
+    /// engine-side request would decode on to max_tokens: the step loop must abort it there
+    /// (#711 — the request after a stop-string finish decoded garbage).
+    struct StopStringClient {
+        /// The stop word's token ids, ENCODED by the same tokenizer the engine detokenizes with
+        /// (the test vocab is the sorted byte-level alphabet, so an id is not its byte value).
+        stop_word_tokens: Vec<u32>,
+        added: IdLog,
+        aborted: IdLog,
+        emitted: std::sync::Mutex<std::collections::HashSet<String>>,
+    }
+
+    impl StopStringClient {
+        fn new(stop_word_tokens: Vec<u32>) -> (Self, IdLog, IdLog) {
+            let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let aborted = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    stop_word_tokens,
+                    added: Arc::clone(&added),
+                    aborted: Arc::clone(&aborted),
+                    emitted: std::sync::Mutex::new(std::collections::HashSet::new()),
+                },
+                added,
+                aborted,
+            )
+        }
+    }
+
+    impl EngineCoreClient for StopStringClient {
+        fn get_output(
+            &mut self,
+        ) -> scratchy_serving_engine::error::EngineResult<
+            StepOutcome<scratchy_core_common::EngineCoreOutputs>,
+        > {
+            let pending: Vec<String> = {
+                let added = self.added.lock().unwrap().clone();
+                let mut emitted = self.emitted.lock().unwrap();
+                added
+                    .into_iter()
+                    .filter(|id| emitted.insert(id.clone()))
+                    .collect()
+            };
+            if pending.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                return Ok(StepOutcome::Stalled);
+            }
+            let outputs = pending
+                .into_iter()
+                .map(|id| EngineCoreOutput {
+                    request_id: id,
+                    new_token_ids: self.stop_word_tokens.clone(),
+                    finish_reason: None,
+                    stop_reason: None,
+                    num_cached_tokens: 0,
+                    events: None,
+                    new_logprobs: None,
+                    new_prompt_logprobs: None,
+                    pooler_output: None,
+                })
+                .collect();
+            Ok(StepOutcome::Progressed {
+                outputs: scratchy_core_common::EngineCoreOutputs {
+                    outputs,
+                    ..Default::default()
+                },
+                model_executed: true,
+            })
+        }
+
+        fn add_request(
+            &mut self,
+            request: EngineCoreRequest,
+        ) -> scratchy_serving_engine::error::EngineResult<()> {
+            self.added.lock().unwrap().push(request.request_id);
+            Ok(())
+        }
+
+        fn abort_requests(
+            &mut self,
+            request_ids: &[String],
+        ) -> scratchy_serving_engine::error::EngineResult<()> {
+            self.aborted.lock().unwrap().extend_from_slice(request_ids);
+            Ok(())
+        }
+
+        fn abort_running_requests(&mut self) {}
+
+        fn shutdown(&mut self) -> scratchy_serving_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn reset_prefix_cache(&mut self) -> scratchy_serving_engine::error::EngineResult<bool> {
+            Ok(true)
+        }
+
+        fn pause_scheduler(
+            &mut self,
+            _mode: PauseMode,
+        ) -> scratchy_serving_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn resume_scheduler(&mut self) -> scratchy_serving_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn is_scheduler_paused(&self) -> bool {
+            false
+        }
+
+        fn sleep(&mut self, _level: u32) -> scratchy_serving_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn wake_up(
+            &mut self,
+            _tags: Option<&[String]>,
+        ) -> scratchy_serving_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn is_sleeping(&self) -> bool {
+            false
+        }
+    }
+
+    /// Stop → stop: each request finishes by its stop string API-side while the engine would
+    /// keep decoding it — the loop must abort each one engine-side, or the request after a
+    /// stop-string finish shares its steps with the leftover row (#711).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_string_finish_aborts_the_engine_side_request() {
+        let tok = Arc::new(make_test_tokenizer());
+        // " the country" — decodes to text matching a `stop: ["country"]` request.
+        let stop_word_tokens = tok.encode(" the country", false).unwrap();
+        let (client, added, aborted) = StopStringClient::new(stop_word_tokens);
+        let client: Box<dyn EngineCoreClient + Send> = Box::new(client);
+        let engine = Arc::new(AsyncEngine::with_tokenizer(
+            client,
+            "test-model".to_string(),
+            4096,
+            tok,
+        ));
+        engine.spawn_step_loop();
+
+        let mut request = make_chat_request();
+        request.stop = Some(protocol::StopCondition::Multiple(vec![
+            "country".to_string(),
+        ]));
+        request.max_tokens = Some(50);
+
+        let a = tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.chat_completion(request.clone()),
+        )
+        .await
+        .expect("request A timed out — the stop string never finished it")
+        .expect("request A failed");
+        assert_eq!(a.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert!(
+            !a.choices[0]
+                .message
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("country"),
+            "the reply is truncated at the stop string"
+        );
+
+        // The request right after the stop-string finish — the one #711 caught decoding
+        // garbage. Its own stop string must finish it the same way.
+        let b = tokio::time::timeout(Duration::from_secs(10), engine.chat_completion(request))
+            .await
+            .expect("request B timed out — the stop string never finished it")
+            .expect("request B failed");
+        assert_eq!(b.choices[0].finish_reason.as_deref(), Some("stop"));
+
+        let added = added.lock().unwrap().clone();
+        let aborted = aborted.lock().unwrap().clone();
+        assert_eq!(
+            added.len(),
+            2,
+            "both requests reached the engine: {added:?}"
+        );
+        assert_eq!(
+            aborted.len(),
+            2,
+            "every stop-string-finished request is aborted engine-side — without the abort the \
+             engine decodes it on to max_tokens under the next request's steps (#711); \
+             aborted {aborted:?} of {added:?}"
+        );
     }
 
     /// Test that the no-progress watchdog aborts requests stuck with no output.
