@@ -2213,9 +2213,11 @@ pub fn lower_function(
     // ⭐⭐⭐ THE GATHERS THE PROGRAM STATES, read ONCE and from [`gathers_of`] — the same joins the
     // per-`Program` door's `gather_of` makes, so the two doors cannot disagree about which parameter
     // is the table or which is the index. A program with ONE indirect tile reads identically to
-    // `gather_of`; a program with SEVERAL is the unrolled-sweep shape (every tile over the SAME index
-    // and value parameters, one per trip — `gathers_of` refuses different pairs by name), and the
-    // walk below names the op that carries EACH tile.
+    // `gather_of`; a program with SEVERAL is either the unrolled-sweep shape (every tile over the
+    // SAME index and value parameters, one per trip) or the batched paged-decode shape (K^T and V
+    // gathered through one or several index buffers — DIFFERENT pairs), and in both the walk below
+    // names the op that carries EACH tile, by load identity, so every descriptor still carries at
+    // most one index operand.
     //
     // ⛔ AND THEY ARE CARRIED, NOT COUNTED: `gather_carried` below is checked after the walk, per
     // tile. A gather the program states and no descriptor declares is a silently DIRECT read of the

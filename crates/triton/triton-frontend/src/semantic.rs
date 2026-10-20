@@ -1630,6 +1630,19 @@ impl Semantic {
     /// `arith.constant 0.000000e+00 : f16` behind. Measured in `swiglu_mlp`'s golden: three
     /// `tl.dot` calls, three dead zero constants (`%g_48`, `%u_51`, `%acc_43`), each
     /// immediately before its `tt.dot`.
+    ///
+    /// # ⭐ THE RANK-3 BATCHED FORM IS OURS, NOT TRITON'S
+    ///
+    /// Upstream's `semantic.dot` is rank-2 only (the check below is its own). This front end
+    /// ALSO admits `[batch, M, K] x [batch, K, N] -> [batch, M, N]`, both operands rank-3
+    /// over one SHARED leading batch dim -- the batched paged-decode kernel's form, where the
+    /// KV heads and the GQA group ride the dot's batch and M axes rather than becoming new
+    /// descriptors (torch-spyre's `batched_decode_head_major` rides the same axes as bmm batch
+    /// dims, and the vendor's matmul descriptor carries batch dims). The emitted op is the
+    /// SAME `tt.dot` with rank-3 operand and result types -- the rank rides the types, so the
+    /// rank-2 emission is byte-identical to upstream's -- and `dot_to_linalg` discriminates on
+    /// the rank to lower the batched form as `linalg.batch_matmul`. A mixed-rank pair (2x3,
+    /// 3x2) is refused: neither dialect states what it would mean.
     pub fn dot(
         &mut self,
         a: ValueId,
@@ -1639,10 +1652,11 @@ impl Semantic {
     ) -> Result<ValueId> {
         let (ta, tb) = (self.ty(a), self.ty(b));
         let (sa, sb) = (ta.shape(), tb.shape());
-        if sa.len() != 2 || sb.len() != 2 {
+        if sa.len() != sb.len() || !matches!(sa.len(), 2 | 3) {
             return Err(Error::new(
                 format!(
-                    "tl.dot needs two rank-2 operands, got ranks {} and {}",
+                    "tl.dot needs two rank-2 operands, or two rank-3 operands sharing one \
+                     leading batch dim -- got ranks {} and {}",
                     sa.len(),
                     sb.len()
                 ),
@@ -1650,7 +1664,25 @@ impl Semantic {
                 0,
             ));
         }
-        if sa[1] != sb[0] {
+        // The contraction's inner pair, by rank: rank-2 contracts `sa[1]` with `sb[0]`; the
+        // batched form keeps `sa[0]`/`sb[0]` as the batch and contracts `sa[2]` with `sb[1]`.
+        let (inner_a, inner_b) = if sa.len() == 3 {
+            if sa[0] != sb[0] {
+                return Err(Error::new(
+                    format!(
+                        "tl.dot batch dims disagree: [{}] against [{}]",
+                        join(sa),
+                        join(sb)
+                    ),
+                    0,
+                    0,
+                ));
+            }
+            (sa[2], sb[1])
+        } else {
+            (sa[1], sb[0])
+        };
+        if inner_a != inner_b {
             return Err(Error::new(
                 format!(
                     "tl.dot inner dimensions disagree: [{}] against [{}]",
@@ -1672,7 +1704,12 @@ impl Semantic {
                 0,
             ));
         }
-        let want = vec![sa[0], sb[1]];
+        // The result's extents: `[M, N]`, prefixed by the shared batch dim in the rank-3 form.
+        let want = if sa.len() == 3 {
+            vec![sa[0], sa[1], sb[2]]
+        } else {
+            vec![sa[0], sb[1]]
+        };
 
         // `out_dtype = tl.float32 if acc is None else acc.type.element_ty`
         // (`semantic.py:1467`).

@@ -114,6 +114,9 @@ pub enum OpKind {
     TtSplat,
     TtMakeRange,
     TtAddptr,
+    /// `tt.reshape` -- the flat row-major reinterpretation. See the `from_spelling` arm for
+    /// why this one is a named variant.
+    TtReshape,
 
     // --- linalg
     LinalgMatmul,
@@ -198,6 +201,7 @@ impl OpKind {
             TtSplat => "tt.splat",
             TtMakeRange => "tt.make_range",
             TtAddptr => "tt.addptr",
+            TtReshape => "tt.reshape",
             LinalgMatmul => "linalg.matmul",
             LinalgGeneric => "linalg.generic",
             LinalgReduce => "linalg.reduce",
@@ -275,6 +279,13 @@ impl OpKind {
             "tt.splat" => TtSplat,
             "tt.make_range" => TtMakeRange,
             "tt.addptr" => TtAddptr,
+            // The flat row-major reinterpretation (`semantic.py`'s `reshape`, `can_reorder`
+            // false, no attributes -- the destination extents ride the result type). A
+            // NAMED variant rather than `Other` because [`crate::from_ttir::OP_SET`] admits
+            // it: a censused op carried as `Other` is the exact anti-pattern that module's
+            // doc refuses ("we do not model this" and "we model this as Other on purpose"
+            // must not look the same).
+            "tt.reshape" => TtReshape,
             "linalg.matmul" => LinalgMatmul,
             "linalg.generic" => LinalgGeneric,
             "linalg.reduce" => LinalgReduce,

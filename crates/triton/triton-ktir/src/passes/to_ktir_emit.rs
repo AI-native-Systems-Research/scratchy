@@ -624,6 +624,7 @@ fn opkind(k: &OpKind) -> Result<KOpKind> {
             "tensor.extract_slice" => KOpKind::TensorExtractSlice,
             "tensor.insert_slice" => KOpKind::TensorInsertSlice,
             "tensor.from_elements" => KOpKind::TensorFromElements,
+            "tensor.reshape" => KOpKind::TensorReshape,
             other => {
                 return Err(refuse(format!(
                     "`{other}` is carried as our `OpKind::Other` and has no arm here. If \
