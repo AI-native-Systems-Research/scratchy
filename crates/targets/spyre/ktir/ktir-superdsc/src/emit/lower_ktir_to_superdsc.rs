@@ -3939,6 +3939,19 @@ pub fn matmul_oriented(
 /// tile-extent door to carry the padded-vs-logical extents apart, neither of which exists here. It is
 /// out of scope of an entry point, deliberately.
 ///
+/// ⭐⭐⭐ AND A WINDOW, WHEN THE PROGRAM STATES ONE — the grid-trip form a paged Kᵀ plane needs. An
+/// unrolled trip transposes ONE page part of a K plane (`[page, hd]` rows of the head's slice) into
+/// the matching columns of the Kᵀ scratch, and its regions carry the part's corners. The door takes
+/// the pointwise arms' two bases ([`pointwise_rows`]' law, stated for the swap): a program whose
+/// tiles TILE its view keeps this door's original whole-tensor form, guards verbatim and
+/// byte-identical; a single window at a corner emits the WINDOW at `rc_of` corners over each
+/// region's OWN view, with the physical row counts declared when either side's row window is partial
+/// (the torch-spyre `arg.device_size` law, plus the `N_` rewrite the card's residency reconstruction
+/// reads — see `super::try_assemble_restickify_transpose_2d`). The window's output must be its input
+/// TRANSPOSED — the correspondence law — and every corner along a side's stick axis must be a whole
+/// stick. Neither basis is a loosening: a cover that is neither a tiling nor a single window is
+/// refused by name, and the two sides must state the same basis.
+///
 /// ⛔ THE REFUSAL IS HERE AND NOT ONLY IN THE ASSEMBLER. [`super::assemble_transpose`] `panic!`s on a
 /// bad extent (every `assemble_*` in that file does — they are called from a `#[forward]` expansion,
 /// where a panic IS the build error). A producer crossing this door gets an `Error` it can report
@@ -3959,118 +3972,258 @@ pub fn transpose(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    let (ins, out) = split_out(name, r, layout, 1)?;
+    // ⭐⭐⭐ THE WINDOWED SPLIT — [`split_regions`], not [`split_out`]: a windowed transpose's input
+    // carries a ROW corner (an unrolled trip's page part of a K plane) and its output the SAME
+    // corner transposed (the matching columns of the Kᵀ scratch), and this emission PLACES both
+    // through `rc_of` — the same door the windowed pointwise arm splits through. `base_addressed`'s
+    // law does not lapse: the fold basis below still refuses a row corner it cannot place, and the
+    // window basis refuses any corner pair that is not the transposed window by name.
+    let (ins, out) = split_regions(name, r, layout, 1, &[])?;
     let a = ins[0];
-    // The INPUT's view IS the op's `[rows, cols]`: the builder iterates the input shape and the
-    // output is its transpose. Read from the input so the two cannot be read from the same place and
-    // agree vacuously.
-    let (mb, cols) = (a.v_rows, a.v_cols);
-    // ⛔⛔⛔ THE STICK LAW, FIRST, so the historically fatal shape can never fall past it into a
-    // shape complaint about something else.
     let stk = Fp16::ELEMS_PER_STICK;
-    if mb == 0 || cols == 0 || !mb.is_multiple_of(stk) || !cols.is_multiple_of(stk) {
-        return err(format!(
-            "{name}: transposing t{} `[{mb}, {cols}]` into t{} `[{cols}, {mb}]` — BOTH extents must \
-             be whole multiples of the {stk}-element SEN169_FP16 stick and {} is not. This relayout \
-             sticks its INPUT on the column extent and its OUTPUT on the row extent — the two axes \
-             swap, which is the transposition — so each extent is a stick extent of one side; \
-             a sub-stick tile is refused by the dxp scheduler (L3DlOpsScheduler:1040), and the on-card \
-             ReStickify that was asked for the per-step `[1, {stk}]` key anyway wrote the SECOND \
-             transposed stick wrong and garbled decode past {stk} tokens. Pad the offending extent up \
-             to a multiple of {stk} and loop whole {stk}x{stk} tiles, which is what the shipped \
-             attention does (it pads its row count and emits one single-stick transpose per \
-             sub-block). A padded destination for the unaligned extent is a separate shape law with \
-             its own typed tile extents; this entry point does not guess one.",
-            a.tid,
-            out.tid,
-            match (
-                mb.is_multiple_of(stk) && mb != 0,
-                cols.is_multiple_of(stk) && cols != 0
-            ) {
-                (false, false) => format!("neither ({mb} rows, {cols} columns)"),
-                (false, true) => format!("the row extent {mb}"),
-                _ => format!("the column extent {cols}"),
-            },
-        ));
-    }
     // The OUTPUT's own view must BE the transpose. Otherwise the descriptor would write a shape the
-    // program never declared — and the two extents would still be stick-aligned, so nothing above
-    // catches it.
-    if (out.v_rows, out.v_cols) != (cols, mb) {
+    // program never declared — and the two extents would still be stick-aligned, so nothing below
+    // catches it. Common to both bases, so it is stated before the basis is chosen.
+    if (out.v_rows, out.v_cols) != (a.v_cols, a.v_rows) {
         return err(format!(
-            "{name}: reads t{} `[{mb}, {cols}]` and writes t{} `[{}, {}]` — a transpose's output view \
-             is its input's, swapped (`[{cols}, {mb}]`). The descriptor iterates the INPUT shape and \
+            "{name}: reads t{} `[{}, {}]` and writes t{} `[{}, {}]` — a transpose's output view \
+             is its input's, swapped (`[{}, {}]`). The descriptor iterates the INPUT shape and \
              carries the reorder on the output's own stick order, so it cannot reshape as well.",
-            a.tid, out.tid, out.v_rows, out.v_cols,
+            a.tid, a.v_rows, a.v_cols, out.tid, out.v_rows, out.v_cols, a.v_cols, a.v_rows,
         ));
     }
-    // WHOLE VIEWS, BOTH SIDES: `assemble_transpose` takes two NAMES and two extents, no corner and no
-    // window — the same base-addressing fact [`base_addressed`] states for rows, in the column
-    // direction too. A windowed transpose is a different descriptor, so a stated window is refused
-    // rather than silently widened to the buffer.
-    for (x, role) in [(a, "input"), (out, "output")] {
-        if x.c_start != 0 || x.c_len != x.v_cols {
-            return err(format!(
-                "{name}: the {role} t{} takes columns {}..{} of its `[{}, {}]` view — \
-                 the relayout builder names a tensor and its two extents, with no column corner and \
-                 no window, so it transposes the WHOLE buffer. Materialize the window first.",
+    // ⭐⭐⭐ THE BASIS — the pointwise arms' law ([`pointwise_rows`]), stated for the swap. A
+    // program whose access tiles TILE its view is a FOLDED program: one descriptor spans the view
+    // entire, at zero corners. A grid trip takes ONE window at a corner this trip owns: the
+    // descriptor spans the window and the corners ride `rc_of`. A cover that is neither — several
+    // disjoint rectangles — is a program shape one relayout descriptor cannot serve, and is refused
+    // by name rather than folded. `true` = folded.
+    let basis_of = |x: &Region, role: &str| -> Result<bool, Error> {
+        if x.r_cover == (0, x.v_rows) && x.c_cover == (0, x.v_cols) {
+            Ok(true)
+        } else if x.r_cover == (x.r_start, x.r_start + x.r_len)
+            && x.c_cover == (x.c_start, x.c_start + x.c_len)
+        {
+            Ok(false)
+        } else {
+            err(format!(
+                "{name}: the {role} t{}'s access tiles cover rows {}..{} and columns {}..{} of its \
+                 `[{}, {}]` view in a first block of `[{r_len}, {c_len}]` — neither a row-blocked \
+                 program one descriptor can fold (windows tiling the view) nor a grid trip's single \
+                 window at a corner. The relayout sweeps one rectangle; this program states several.",
                 x.tid,
-                x.c_start,
-                x.c_start + x.c_len,
+                x.r_cover.0,
+                x.r_cover.1,
+                x.c_cover.0,
+                x.c_cover.1,
                 x.v_rows,
                 x.v_cols,
+                r_len = x.r_len,
+                c_len = x.c_len,
+            ))
+        }
+    };
+    let (a_folded, out_folded) = (basis_of(&a, "input")?, basis_of(&out, "output")?);
+    if a_folded != out_folded {
+        return err(format!(
+            "{name}: the input t{} and the output t{} are on different bases — one side's access \
+             tiles tile its view while the other's take a single window. A relayout reads and \
+             writes the SAME rectangle with its axes swapped, so the two sides must state it the \
+             same way",
+            a.tid, out.tid,
+        ));
+    }
+    if a_folded {
+        // ── THE FOLD BASIS: the door's original whole-tensor form, guards verbatim. ──
+        // The INPUT's view IS the op's `[rows, cols]`: the builder iterates the input shape and the
+        // output is its transpose. Read from the input so the two cannot be read from the same place
+        // and agree vacuously.
+        let (mb, cols) = (a.v_rows, a.v_cols);
+        // ⛔⛔⛔ THE STICK LAW, FIRST, so the historically fatal shape can never fall past it into a
+        // shape complaint about something else.
+        if mb == 0 || cols == 0 || !mb.is_multiple_of(stk) || !cols.is_multiple_of(stk) {
+            return err(format!(
+                "{name}: transposing t{} `[{mb}, {cols}]` into t{} `[{cols}, {mb}]` — BOTH extents must \
+                 be whole multiples of the {stk}-element SEN169_FP16 stick and {} is not. This relayout \
+                 sticks its INPUT on the column extent and its OUTPUT on the row extent — the two axes \
+                 swap, which is the transposition — so each extent is a stick extent of one side; \
+                 a sub-stick tile is refused by the dxp scheduler (L3DlOpsScheduler:1040), and the on-card \
+                 ReStickify that was asked for the per-step `[1, {stk}]` key anyway wrote the SECOND \
+                 transposed stick wrong and garbled decode past {stk} tokens. Pad the offending extent up \
+                 to a multiple of {stk} and loop whole {stk}x{stk} tiles, which is what the shipped \
+                 attention does (it pads its row count and emits one single-stick transpose per \
+                 sub-block). A padded destination for the unaligned extent is a separate shape law with \
+                 its own typed tile extents; this entry point does not guess one.",
+                a.tid,
+                out.tid,
+                match (
+                    mb.is_multiple_of(stk) && mb != 0,
+                    cols.is_multiple_of(stk) && cols != 0
+                ) {
+                    (false, false) => format!("neither ({mb} rows, {cols} columns)"),
+                    (false, true) => format!("the row extent {mb}"),
+                    _ => format!("the column extent {cols}"),
+                },
             ));
         }
+        // A folded program is base-addressed: one descriptor at zero corners, so a stated row corner
+        // is a fact it cannot carry ([`base_addressed`]'s own argument, restated here because the
+        // split above no longer states it for the window basis).
+        base_addressed(name, &a, "input 0")?;
+        base_addressed(name, &out, "output")?;
+        // WHOLE COLUMNS, BOTH SIDES: the fold emits one descriptor over each view entire, with no
+        // column corner — a column-blocked program is several windows and is the grid's to state,
+        // not this basis's to fold.
+        for (x, role) in [(a, "input"), (out, "output")] {
+            if x.c_start != 0 || x.c_len != x.v_cols {
+                return err(format!(
+                    "{name}: the {role} t{} takes columns {}..{} of its `[{}, {}]` view — \
+                     a folded relayout names a tensor and its two extents, with no column corner and \
+                     no window, so it transposes the WHOLE buffer. Materialize the window first.",
+                    x.tid,
+                    x.c_start,
+                    x.c_start + x.c_len,
+                    x.v_rows,
+                    x.v_cols,
+                ));
+            }
+        }
+        // The store windows must TILE the output, exactly as they must for every pointwise body: one
+        // descriptor spans all of it, so a program whose windows do not cover it would leave rows holding
+        // whatever the buffer held. `node_rows` is the shared guard; it answers the output's row extent,
+        // which is the input's column extent by the check above.
+        if node_rows(name, &out)? != cols {
+            return err(format!(
+                "{name}: the output's store windows do not cover its `[{cols}, {mb}]` view"
+            ));
+        }
+        // ⛔⛔⛔ THE RELAYOUT GOES OUT ON THE **RESTICKIFY** DOOR, NOT ON `OpFunc::Transpose`.
+        //
+        // `interslicetranspose_fp16` is the op named for this job and it CANNOT BE TRANSLATED at the
+        // default RCUDD1A arch, at any shape. Its output stick is the 8×8 inter-slice block over
+        // (`out`, `mb`) — TWO dims — and `Ddc::transformForInterSliceRestickify` turns a relayout's output
+        // stick into a dynamic mask over the innermost loop carrying `outputStickDimOrder[0]`, which for a
+        // 2-D tile is the FUSED `loop_dsX_dsY_out_mb`; `SNComputeLowering::constructDynamicMasking` accepts
+        // one loop carrying ONE dim (`SNComputeLowering.cpp:74`). Measured through `dxp_standalone`: every
+        // shape refuses there, including shapes whose core division splits both axes like the golden
+        // `sdsc_interslicetranspose.json` — which is what ruled the core division out as the cause.
+        // `OpFunc::Restickify` does the SAME transposition with a one-dim output stick and is accepted.
+        // See `super::restickify_transpose_opspec_2d`, which states the addressing argument in full, and
+        // `tests/zz_the_transpose_door_carries_a_two_dim_output_stick.rs`, which pins both doors' output sticks.
+        //
+        // ⛔ THE FALLIBLE FORM, because the builder makes a refusal this body cannot pre-check: the
+        // per-core tile must fit LX and this door cannot time-tile, and what the per-core tile IS depends
+        // on `distribute_cores`' answer for this shape. Restating that here would mean duplicating the
+        // divider; a panicking assembler would abort the build with a bare panic where a producer needs an
+        // error against its own op.
+        super::try_assemble_restickify_transpose_2d(
+            &format!("transpose_o{}", out.tid),
+            &super::TransposePlacement::whole(mb, cols),
+            &a.name(),
+            &out.name(),
+            sym_id_base,
+            layout,
+        )
+        .map(|op| vec![op])
+        .map_err(|message| Error {
+            message: format!("{name}: {message}"),
+        })
+    } else {
+        // ── THE WINDOW BASIS: a grid trip's single rectangle, PLACED. ──
+        //
+        // The extents are the WINDOW's — the tile the descriptor moves — and the corners are `rc_of`
+        // over each region's OWN `[v_rows, v_cols]` view: the input's stick-on-last nest and the
+        // output's, which the swap keeps distinct (one `rc_of` cannot serve both sides).
+        let (mb, cols) = (a.r_len, a.c_len);
+        // ⛔⛔⛔ THE STICK LAW, on the WINDOW extents — the same historically fatal shape, and for the
+        // same reason: each window extent is a stick extent of one side (the row extent of the input
+        // is the OUTPUT's stick axis, the column extent the input's own).
+        if mb == 0 || cols == 0 || !mb.is_multiple_of(stk) || !cols.is_multiple_of(stk) {
+            return err(format!(
+                "{name}: transposing the window `[{mb}, {cols}]` of t{} (`[{r_start}, {c_start}]` of its \
+                 `[{v_rows}, {v_cols}]` view) into t{} — BOTH window extents must be whole multiples \
+                 of the {stk}-element SEN169_FP16 stick. The input's row extent is the OUTPUT's stick \
+                 axis and its column extent the input's own, so each is a stick extent of one side; a \
+                 sub-stick tile is refused by the dxp scheduler (L3DlOpsScheduler:1040). Pad the \
+                 offending extent up to a multiple of {stk} and loop whole {stk}x{stk} tiles.",
+                a.tid,
+                out.tid,
+                r_start = a.r_start,
+                c_start = a.c_start,
+                v_rows = a.v_rows,
+                v_cols = a.v_cols,
+            ));
+        }
+        // ⛔⛔⛔ THE WINDOW-CORRESPONDENCE LAW — the output's window is the input's, TRANSPOSED. The
+        // swap maps the input's rows to the output's columns and its columns to the output's rows,
+        // so the store's rectangle must be the load's with its axes swapped — anything else is a
+        // relayout this descriptor cannot state (it would move a rectangle the program never
+        // named), and a row corner unpaired with its transposed column is exactly the
+        // `base_addressed` defect in the window's clothing.
+        if (out.r_start, out.r_len) != (a.c_start, a.c_len)
+            || (out.c_start, out.c_len) != (a.r_start, a.r_len)
+        {
+            return err(format!(
+                "{name}: reads rows {}..{} and columns {}..{} of t{} but stores rows {}..{} and \
+                 columns {}..{} of t{} — a windowed transpose's output window is its input's, \
+                 TRANSPOSED (`[{c_len}, {r_len}]` of the output view). The descriptor moves one \
+                 rectangle with its axes swapped; a store over any other rectangle is a program \
+                 shape it cannot state.",
+                a.r_start,
+                a.r_start + a.r_len,
+                a.c_start,
+                a.c_start + a.c_len,
+                a.tid,
+                out.r_start,
+                out.r_start + out.r_len,
+                out.c_start,
+                out.c_start + out.c_len,
+                out.tid,
+                c_len = a.c_len,
+                r_len = a.r_len,
+            ));
+        }
+        // ⛔ THE CORNERS ALONG EACH SIDE'S STICK AXIS MUST BE WHOLE STICKS. Each side's corner along
+        // its own stick axis aims a stick GROUP in that side's nest, and a sub-stick corner has no
+        // address there — the same law the windowed matmul states for its out-corner. The swap makes
+        // the two corners DIFFERENT facts: the input's column corner `a.c_start` and the output's
+        // column corner `out.c_start` (which is the input's ROW corner, transposed) each aim one
+        // side's groups, so BOTH must be stick-aligned even though only one carries a given axis.
+        if !a.c_start.is_multiple_of(stk) || !out.c_start.is_multiple_of(stk) {
+            return err(format!(
+                "{name}: the window corners are not stick-aligned — the input t{}'s column corner \
+                 {} and the output t{}'s column corner {} (the input's row corner, \
+                 transposed) must each be a whole {stk}-element stick, because each aims a stick \
+                 group in its own side's device nest. Pad the blocking so every window corner is \
+                 stick-aligned.",
+                a.tid, a.c_start, out.tid, out.c_start,
+            ));
+        }
+        // ⭐ THE CORNERS, nest-derived per region — and the physical row counts, stated when either
+        // side's row window is partial (each side's stick-group stride is its own row extent; the
+        // tile's strides would invent rows the allocation does not have). See
+        // `super::TransposePlacement`'s doc for the full three-fact contract.
+        let placement = super::TransposePlacement {
+            rows: a.r_len,
+            cols: a.c_len,
+            in_off: crate::addr::rc_of(a.v_rows, a.v_cols, a.r_start, a.c_start, Df::Fp16),
+            out_off: crate::addr::rc_of(out.v_rows, out.v_cols, out.r_start, out.c_start, Df::Fp16),
+            in_rows_phys: (a.r_len < a.v_rows).then_some(a.v_rows),
+            out_rows_phys: (out.r_len < out.v_rows).then_some(out.v_rows),
+        };
+        super::try_assemble_restickify_transpose_2d(
+            &format!("transpose_o{}", out.tid),
+            &placement,
+            &a.name(),
+            &out.name(),
+            sym_id_base,
+            layout,
+        )
+        .map(|op| vec![op])
+        .map_err(|message| Error {
+            message: format!("{name}: {message}"),
+        })
     }
-    // The store windows must TILE the output, exactly as they must for every pointwise body: one
-    // descriptor spans all of it, so a program whose windows do not cover it would leave rows holding
-    // whatever the buffer held. `node_rows` is the shared guard; it answers the output's row extent,
-    // which is the input's column extent by the check above.
-    if node_rows(name, &out)? != cols {
-        return err(format!(
-            "{name}: the output's store windows do not cover its `[{cols}, {mb}]` view"
-        ));
-    }
-    // The input's access tiles must likewise cover it — `Region::r_len` is block 0's height alone.
-    if a.r_cover != (0, mb) {
-        return err(format!(
-            "{name}: the program's access tiles over its input t{} cover rows {}..{} of a {mb}-row \
-             view — one descriptor transposes all of it, so the windows must tile `0..{mb}`.",
-            a.tid, a.r_cover.0, a.r_cover.1,
-        ));
-    }
-    // ⛔⛔⛔ THE RELAYOUT GOES OUT ON THE **RESTICKIFY** DOOR, NOT ON `OpFunc::Transpose`.
-    //
-    // `interslicetranspose_fp16` is the op named for this job and it CANNOT BE TRANSLATED at the
-    // default RCUDD1A arch, at any shape. Its output stick is the 8×8 inter-slice block over
-    // (`out`, `mb`) — TWO dims — and `Ddc::transformForInterSliceRestickify` turns a relayout's output
-    // stick into a dynamic mask over the innermost loop carrying `outputStickDimOrder[0]`, which for a
-    // 2-D tile is the FUSED `loop_dsX_dsY_out_mb`; `SNComputeLowering::constructDynamicMasking` accepts
-    // one loop carrying ONE dim (`SNComputeLowering.cpp:74`). Measured through `dxp_standalone`: every
-    // shape refuses there, including shapes whose core division splits both axes like the golden
-    // `sdsc_interslicetranspose.json` — which is what ruled the core division out as the cause.
-    // `OpFunc::Restickify` does the SAME transposition with a one-dim output stick and is accepted.
-    // See `super::restickify_transpose_opspec_2d`, which states the addressing argument in full, and
-    // `tests/zz_the_transpose_door_carries_a_two_dim_output_stick.rs`, which pins both doors' output sticks.
-    //
-    // ⛔ THE FALLIBLE FORM, because the builder makes a refusal this body cannot pre-check: the
-    // per-core tile must fit LX and this door cannot time-tile, and what the per-core tile IS depends
-    // on `distribute_cores`' answer for this shape. Restating that here would mean duplicating the
-    // divider; a panicking assembler would abort the build with a bare panic where a producer needs an
-    // error against its own op.
-    super::try_assemble_restickify_transpose_2d(
-        &format!("transpose_o{}", out.tid),
-        mb,
-        cols,
-        &a.name(),
-        &out.name(),
-        sym_id_base,
-        layout,
-    )
-    .map(|op| vec![op])
-    .map_err(|message| Error {
-        message: format!("{name}: {message}"),
-    })
 }
 
 /// A program's TENSOR inputs (in parameter order) and its output.

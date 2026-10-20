@@ -5966,6 +5966,62 @@ pub fn assemble_restickify_kt_2d(
         .unwrap_or_else(|e| panic!("assemble_restickify_kt_2d {op_name}: {e}"))
 }
 
+/// ⭐⭐⭐ THE PLACED TRANSPOSE TILE — a restickify-transpose's extents plus, when the program states
+/// a window rather than whole tensors, the same three facts every windowed operand takes:
+///
+/// 1. **The corner, per side**, as a device element offset in THAT SIDE's own stick-on-last nest
+///    (`rc_of` over the region's own `[v_rows, v_cols]` view — the input's nest for the input, the
+///    output's for the output; the axis swap keeps the two nests distinct, so one `rc_of` cannot
+///    serve both).
+/// 2. **The physical row count, when that side's ROW window is partial.** Each side's stick-group
+///    stride is its ROW extent (the input's `y`, the output's `out`), and the tile iterates a
+///    PARTIAL row range of the parent's nest — so a tile-derived stride invents rows the allocation
+///    does not have. [`AnyTensorArg::set_device_extent`] declares the view's own count, the same
+///    torch-spyre `arg.device_size` law [`assemble_matmul_windowed`]'s `w_in_phys` states for the
+///    kernel weight. A side whose rows are FULL passes `None` (no declaration — byte-identical).
+///    Note the symmetry the swap forces: the input's partial rows and the output's partial rows are
+///    DIFFERENT windows (the input's rows are the output's COLUMNS, its stick axis), so each side
+///    carries its own fact.
+/// 3. **The `N_` rewrite** — the card's residency reconstruction reads `N_`, not the declaration
+///    (the gathered-leg and windowed-matmul measurements, both on the record: pinning
+///    `maxDimSizes_` was inert; rewriting `N_` fixed the stride), so
+///    [`try_assemble_restickify_transpose_2d`] also writes the physical counts into the emitted
+///    `N_.y_`/`N_.out_`.
+///
+/// [`TransposePlacement::whole`] states the whole-tensor form — zero corners, no declarations — the
+/// standalone door's original contract, byte-identical.
+#[derive(Clone, Copy)]
+pub struct TransposePlacement {
+    /// The tile's `y` extent — the input's rows, which the swap makes the OUTPUT's stick axis.
+    /// Must be a whole 64-stick; the Kᵀ builder checks.
+    pub rows: u32,
+    /// The tile's `out` extent — the input's stick axis, which the swap makes the output's rows.
+    pub cols: u32,
+    /// The input's corner (fact 1).
+    pub in_off: crate::addr::DevOff,
+    /// The output's corner (fact 1).
+    pub out_off: crate::addr::DevOff,
+    /// The input's physical row count when its row window is partial (fact 2).
+    pub in_rows_phys: Option<u32>,
+    /// The output's physical row count when its row window is partial (fact 2).
+    pub out_rows_phys: Option<u32>,
+}
+
+impl TransposePlacement {
+    /// The whole-tensor form: the tile IS each buffer, so the corners are zero and neither side
+    /// declares a physical extent — the standalone door's original contract, byte-identical.
+    pub fn whole(rows: u32, cols: u32) -> Self {
+        Self {
+            rows,
+            cols,
+            in_off: crate::addr::DevOff::ZERO,
+            out_off: crate::addr::DevOff::ZERO,
+            in_rows_phys: None,
+            out_rows_phys: None,
+        }
+    }
+}
+
 /// A STANDALONE `[rows, cols] → [cols, rows]` fp16 TRANSPOSE ON THE RESTICKIFY DOOR — the form
 /// [`lower_ktir_to_superdsc::transpose`] emits for a producer's `linalg.transpose`.
 ///
@@ -5993,17 +6049,51 @@ pub fn assemble_restickify_kt_2d(
 /// The extents are plain `u32` here rather than the paged-KV
 /// [`KtTileSlots`](crate::sdsc_abstract::KtTileSlots)/[`KtTileFeats`](crate::sdsc_abstract::KtTileFeats)
 /// newtypes [`assemble_restickify_kt_2d`] takes: this door serves an arbitrary producer-stated shape,
-/// which is exactly the thing those newtypes exist to forbid for the cache. Offsets are zero — a
-/// `linalg.transpose` names whole buffers (its caller refuses a window).
+/// which is exactly the thing those newtypes exist to forbid for the cache.
+///
+/// ⭐⭐⭐ AND IT CARRIES A WINDOW, AS A [`TransposePlacement`] — the same three facts every windowed
+/// operand takes (see that type's doc). A whole-tensor transpose passes
+/// [`TransposePlacement::whole`]; a windowed one — an unrolled trip transposing one page part of a
+/// K plane into the matching columns of a Kᵀ scratch — passes the placed form.
 fn restickify_transpose_opspec_2d(
-    rows: u32,
-    cols: u32,
+    p: &TransposePlacement,
     in_name: &str,
     o_name: &str,
 ) -> Result<OpSpec, String> {
+    let (rows, cols) = (p.rows, p.cols);
     // The Kᵀ builder IS this descriptor: `cap`→`y` is the row axis, `hd`→`out` the column axis, and
     // both stick laws are checked there. Sharing it means the two doors cannot drift apart.
-    let op = restickify_kt_opspec_2d(rows, cols, in_name, o_name, 0, 0)?;
+    let mut op = restickify_kt_opspec_2d(
+        rows,
+        cols,
+        in_name,
+        o_name,
+        p.in_off.into_raw_elems(),
+        p.out_off.into_raw_elems(),
+    )?;
+    // ⭐ THE PHYSICAL ROW COUNTS ([`TransposePlacement`]'s fact 2), declared on the arg each side's
+    // name built. Found by NAME rather than by position so a future arg-order change in the Kᵀ
+    // builder cannot silently swap the declarations.
+    if let Some(phys) = p.in_rows_phys {
+        let arg = op
+            .args
+            .iter_mut()
+            .find(|a| a.view().name == in_name)
+            .ok_or_else(|| {
+                format!("restickify transpose [{rows}, {cols}]: no operand named {in_name}")
+            })?;
+        arg.set_device_extent("y", phys);
+    }
+    if let Some(phys) = p.out_rows_phys {
+        let arg = op
+            .args
+            .iter_mut()
+            .find(|a| a.view().name == o_name)
+            .ok_or_else(|| {
+                format!("restickify transpose [{rows}, {cols}]: no operand named {o_name}")
+            })?;
+        arg.set_device_extent("out", phys);
+    }
     // ⛔⛔⛔ AND IT MUST FAIL CLOSED ON LX, BECAUSE THIS DOOR CANNOT TIME-TILE ITS WAY OUT.
     //
     // `transpose_opspec` reached `TileOp::tile`, which splits the `out` stick dim in TIME when the
@@ -6033,18 +6123,54 @@ fn restickify_transpose_opspec_2d(
 
 /// [`restickify_transpose_opspec_2d`] assembled — the fallible form, because this is reached by a
 /// third-party KTIR producer that has its own op to blame (see [`try_assemble_transpose`]).
+///
+/// ⛔⛔⛔ AND IT REWRITES `N_` WHEN EITHER AXIS'S WINDOW IS PARTIAL — the card's law, measured twice
+/// on the record. `maxDimSizes_ = -1` on a stick-blocked operand means "reconstruct the device_size
+/// from `N_`/`layoutDimOrder_`/`stickSize_`", and `N_` is built from the WORK PLAN — the tile's
+/// extents. A window of a larger allocation reconstructed at the tile's extents strides every stick
+/// group after the first by the tile's row count instead of the view's: the gathered leg measured it
+/// as `within_2pct_strict = 0.017013` until its `N_.mb_` carried the TENSOR's row count, and the
+/// windowed matmul measured it as the corr-0.983 residual until `N_.in_` carried the weight's
+/// physical `in`. Pinning `maxDimSizes_` instead was INERT in both. So the physical counts declared
+/// on the args ( OUR address derivations) are ALSO written into `N_` (the CARD's reconstruction) —
+/// one number, two readers, held equal here.
+///
+/// The slots are consistent across both operands BY THE TRANSPOSE ITSELF: `N_.y_` is the `cap` axis
+/// — the input's rows and the output's columns, one view extent — and `N_.out_` is the `hd` axis —
+/// the input's columns and the output's rows, the other. A partial-window form where those two
+/// disagreed would be a shape the correspondence law in `lower_ktir_to_superdsc::transpose` already
+/// refused.
 pub fn try_assemble_restickify_transpose_2d(
     op_name: &str,
-    rows: u32,
-    cols: u32,
+    p: &TransposePlacement,
     in_name: &str,
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp, String> {
-    let op = restickify_transpose_opspec_2d(rows, cols, in_name, o_name)?;
+    let op = restickify_transpose_opspec_2d(p, in_name, o_name)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
+    let mut emitted =
+        emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)?;
+    // ⭐ THE `N_` REWRITE — see this fn's doc. ONLY `N_`: the work division
+    // (`numWkSlicesPerDim_`, `dataStageParam_.ss_`/`el_`, the per-core starts) keeps the TILE's
+    // extents, because rewriting the plan would divide the work by the physical extent, which is a
+    // different op.
+    if (p.in_rows_phys.is_some() || p.out_rows_phys.is_some())
+        && let Some(dsc) = emitted.op.as_mut()
+    {
+        for dsc_map in dsc.dscs_.iter_mut() {
+            for d in dsc_map.values_mut() {
+                if let Some(y) = p.in_rows_phys {
+                    d.N_.y_ = y as i64;
+                }
+                if let Some(o) = p.out_rows_phys {
+                    d.N_.out_ = o as i64;
+                }
+            }
+        }
+    }
+    Ok(emitted)
 }
 
 // ⛔ THE FLAT RESTICKIFY IS GONE — `restickify_flat_opspec_2d` /
