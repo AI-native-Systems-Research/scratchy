@@ -63,9 +63,17 @@ pub(crate) struct BundleMeta {
     ///
     /// ⭐ A FACT OF THE WIRING, NOT OF A MANIFEST. The prefix cache tensor spans the full
     /// structural capacity while only `decode_position` of its rows are valid at run time, so the
-    /// host fills this `[1, capacity]` source per step and the masked columns leave the softmax.
+    /// host fills this source per step at the bake-declared view (`mask_view` below) and the
+    /// masked columns leave the softmax.
     pub(crate) attn_mask_src: Option<usize>,
-    /// Prefix capacity (mask cols) — max context length this bundle serves.
+    /// ⭐ THE MASK'S BAKE-DECLARED VIEW — `Some` exactly when `attn_mask_src` is. The fill takes
+    /// this as its ONLY shape input (`sdsc_abstract::mask_fill`): the runtime `start`/`real`
+    /// values index into the baked shape and never define it. The decode arm's `[1, swept]`
+    /// length row, the one-pass `[mq, ktn_rows]` triangle, the continuation's
+    /// `[mq, swept + ktn_rows]` — one typed statement per bundle instead of a runtime guess.
+    pub(crate) mask_view: Option<scratchy_subtile::sdsc_abstract::MaskView>,
+    /// Prefix capacity — max context length this bundle serves. ⭐ THE CACHE'S OWN EXTENT, not the
+    /// mask's column count (the prefill arms' mask spans the swept prefix AND the new block).
     pub(crate) capacity: usize,
     /// Baked query-row count: 1 (decode) or M (batched prefill).
     pub(crate) m_cap: usize,

@@ -269,6 +269,7 @@ fn two_trip_program(swapped: Swapped) -> KtirNode {
             BufferId::new(204),
         ],
         mask: None,
+        mask_view: None,
         node_out_tid: None,
         minted: Default::default(),
     }

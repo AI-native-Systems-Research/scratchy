@@ -9089,7 +9089,10 @@ fn emit_superdsc_wiring(
     // take the prefix-K/V args plus the argument positionally after each as the
     // new-K/new-V outputs.
     let mut layers: Vec<(u64, u32, u32, u32, u32, u32)> = Vec::new();
-    if let Some(mask) = gk.attn_mask {
+    if let Some(mask_binding) = gk.attn_mask {
+        // The binding's TID is what the walk matches against — the view and the capacity are the
+        // worker's fill facts, not this scan's.
+        let mask = mask_binding.tid;
         // Source id → (layer, the layer's attention-class head dim) — the K binding's
         // own pair, carried so the wiring's LayerWiring can state the dim the host's
         // Kᵀ-plane staging decomposes the cache width by.
@@ -9398,8 +9401,39 @@ fn emit_superdsc_wiring(
     let dp = u32l(decode_position);
     let mask = match gk.attn_mask {
         Some(m) => {
-            let m = u32l(m);
-            quote! { ::core::option::Option::Some(#m) }
+            // ⭐ THE WHOLE BINDING AS LITERALS — tid, the declared view's kind and extents, and the
+            // resident capacity — so the generated code holds the bake's typed statement and the
+            // worker's fill is shaped by a compile-time constant, never by a runtime value.
+            let tid = u32l(m.tid);
+            let (mq, swept, ktn_rows, cap) = (
+                u32l(m.view.mq),
+                u32l(m.view.swept),
+                u32l(m.view.ktn_rows),
+                u32l(m.cap),
+            );
+            let kind = match m.view.kind {
+                scratchy_target_spyre::wiring::MaskArm::OnePass => {
+                    quote! { ::scratchy_target_spyre::wiring::MaskArm::OnePass }
+                }
+                scratchy_target_spyre::wiring::MaskArm::Continuation => {
+                    quote! { ::scratchy_target_spyre::wiring::MaskArm::Continuation }
+                }
+                scratchy_target_spyre::wiring::MaskArm::Decode => {
+                    quote! { ::scratchy_target_spyre::wiring::MaskArm::Decode }
+                }
+            };
+            quote! {
+                ::core::option::Option::Some(::scratchy_target_spyre::wiring::MaskBinding {
+                    tid: #tid,
+                    view: ::scratchy_target_spyre::wiring::MaskView {
+                        kind: #kind,
+                        mq: #mq,
+                        swept: #swept,
+                        ktn_rows: #ktn_rows,
+                    },
+                    cap: #cap,
+                })
+            }
         }
         None => quote! { ::core::option::Option::None },
     };
@@ -12056,7 +12090,7 @@ fn dump_wavefront_mega(
                 // The programs ride the bundle (`bundle_code::bundle(fp)`), not a per-node text.
                 let nodes: Vec<(String, String)> = Vec::new();
                 let attn_mask_json = match gk.attn_mask {
-                    Some(id) => id.to_string(),
+                    Some(binding) => binding.tid.to_string(),
                     None => "null".to_string(),
                 };
                 let mut man = format!(

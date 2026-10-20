@@ -9277,6 +9277,7 @@ mod tests {
             program: Program::Elementwise(Elementwise::Mul),
             bindings: vec![BufferId::new(a), BufferId::new(b), BufferId::new(out)],
             mask: None,
+            mask_view: None,
             node_out_tid: None,
             minted: Default::default(),
         }

@@ -14,8 +14,6 @@ use scratchy_subtile::sdsc_abstract::{PoolPartition, SlotCount};
 // The KTIR-emulator twin below (mask/rope pad-row clamping) — the card's twin shares the laws
 // through `ChunkRows` already.
 use scratchy_target_spyre::manifest::argmax;
-#[cfg(not(feature = "spyre-hw"))]
-use std::num::NonZeroU32;
 // The runner type is cfg-selected: the KTIR emulator's session on the host, the sendnn one on
 // silicon. Everything around it (weight load, dynamic sources, KV loop, sampling) is shared.
 #[cfg(not(feature = "spyre-hw"))]
@@ -451,6 +449,29 @@ pub(crate) fn run_prefill_batch(
     acts.extend(launcher.acts);
     acts_f16.extend(launcher.acts_f16);
     acts_i32.extend(launcher.acts_i32);
+    // ⭐⭐⭐ THE SCORE MASK'S OWN BIND — the spliced attention program's `desc_mask` operand, whose
+    // placement 62b4a0d1e sized from the bake's declared view but which NOTHING staged: the tape's
+    // mask steps write the RESERVED tids (`ATTN_CAUSAL_TID`/`ATTN_MASK_TID`) of the deleted
+    // hand-written emitter, so the prefill score mask read whatever the segment held. The bytes are
+    // composed at the BAKE'S VIEW (`mask_fill`), whose shape is a typed constant — the runtime's
+    // `start` (this chunk's resident prefix length) and `real` (its real token count) index into it
+    // and never define it.
+    //
+    // ⛔ A PROMPT CHUNK ONLY. A decode batch (`per_request.is_some()`) has its own mask staging —
+    // the fold-pass prefix blocks — and solo decode reads the tape's `PrefixMask` staging through
+    // the decode binding's reserved-tid alias; neither is this bind's to replace. The bundle's own
+    // wiring states whether a mask exists at all (`attn_mask_src`), and the view is Some exactly
+    // when it is — the bake refuses a mask binding with no declared view.
+    if per_request.is_none() {
+        if let (Some(tid), Some(view)) = (b.attn_mask_src, b.mask_view) {
+            acts.push((
+                scratchy_target_spyre::bundle_code::PlaceId::Act(tid as u32),
+                std::borrow::Cow::Owned(scratchy_subtile::sdsc_abstract::mask_fill(
+                    view, start, real,
+                )),
+            ));
+        }
+    }
     if let Some((id, key, vals)) = launcher.causal_keyed {
         pf.bind_keyed(id, key, &vals)
             .map_err(|e| werr(format!("prefill: keyed causal bind: {e}")))?;
@@ -1824,56 +1845,27 @@ pub(crate) fn forward_chunk(
         // spans the full structural capacity while only `start` of its rows are valid this step, so
         // the mask zeroes the valid columns and drives the rest to a large negative — they leave the
         // softmax through `exp(-inf) = 0`. It is a source like any other.
-        if let Some(mask) = b.attn_mask_src {
-            // ⭐ TWO MASKS, ONE SOURCE, TOLD APART BY THE BUNDLE'S OWN ROW COUNT. A `m_cap == 1`
-            // bundle masks the resident PREFIX: `[1, capacity]`, valid up to `start`. A prompt
-            // chunk (`m_cap > 1`) has no resident prefix — its bundle is baked `ActiveCap::NONE` —
-            // and instead needs the `[mq, mq]` CAUSAL triangle over its own keys, which is what
-            // lets the attention run all `mq` rows in one pass instead of unrolling them.
-            //
-            // ⭐ AND THE TRIANGLE IS TAKEN AT EACH ROW'S **CLAMPED** POSITION, NOT
-            // THE PLAIN `attn_causal_mask_fill(mq)`. The emitter folds the
-            // vocab-wide lm-head tail to m=1 over row `selector_lastrow_col(mq)` —
-            // the LAST BAKED row, which is a PAD row whenever `n < m_cap`. A pad
-            // row's forward must therefore be numerically IDENTICAL to the last
-            // real token's (same token id, see the embed staging above; same rotary
-            // position; same causal extent), or the first sampled token comes from
-            // a row the model never fed. The card path has had this law since
-            // `ChunkRows::row_logical_pos` (Kani-pinned
-            // `prefill_pad_row_holds_last_real_token`); the emulator bound the RAW
-            // triangle, whose pad rows attend at their PAD position's extent — a
-            // row that is not any token's forward. MEASURED on gemma-4-26b-a4b-it
-            // fp8 (23-token prompt on the m=31 rung): first sampled token was EOS
-            // (id 106), `LAST_HIDDEN` ≈ final-norm ROW 0, pad-row logits 0.
-            //
-            // ⛔ NOT `CausalKey::mask`: that returns the CARD's
-            // `[mq, mq_pad]` stick-padded layout (`mq_pad = mq.div_ceil(64)*64`),
-            // and this view is `[mq, mq]` — a 31-row chunk would bind row stride
-            // 64 into a 31-stride view and misalign every row past the first.
-            // The clamp (`row_logical_pos`) is the law; the fill here composes it
-            // with the same `prefill_causal_col_valid` SSOT at THIS bundle's own
-            // width.
-            let (fill, shape) = if b.m_cap > 1 {
-                let mq = b.m_cap;
-                let chunk = scratchy_subtile::sdsc_abstract::ChunkRows::chunk(
-                    NonZeroU32::new(mq as u32).expect("m_cap > 1"),
-                );
-                let mut m = vec![0.0f32; mq * mq];
-                for r in 0..mq {
-                    let pos = chunk.row_logical_pos(r, n);
-                    for c in 0..mq {
-                        if !scratchy_subtile::sdsc_abstract::prefill_causal_col_valid(c, pos) {
-                            m[r * mq + c] = -1.0e38;
-                        }
-                    }
-                }
-                (m, vec![mq, mq])
-            } else {
-                (
-                    scratchy_target_spyre::manifest::attn_mask_fill(cap, start),
-                    vec![1, cap],
-                )
-            };
+        // ⭐ THE MASK IS COMPOSED AT THE BAKE'S DECLARED VIEW — `mask_fill(view, start, n)`, the
+        // ONE fill law, shaped by nothing but the typed constant the splice minted per arm: the
+        // decode `[1, swept]` length row, the one-pass `[mq, ktn_rows]` clamped triangle, the
+        // continuation's `[mq, swept + ktn_rows]` prefix-plus-triangle. The runtime's `start`
+        // (the resident prefix length) and `n` (this chunk's real rows) INDEX INTO the view; they
+        // never define it.
+        //
+        // ⛔ THE VIEW REPLACED THE TWO SEPARATE STAGINGS THAT EACH STATED A DIFFERENT SHAPE. The
+        // prefill arm bound the RAW `[mq, mq]` triangle — unpadded, at the stale `-1.0e38` —
+        // while the spliced program's `desc_mask` reads `[mq, ktn_rows]` at the Kᵀ scratch's
+        // stick-covered row count, so every row past the first read the wrong columns; the decode
+        // arm bound `[1, cap]` off the cache's storage extent. Both were the deleted hand-written
+        // emitter's shapes, kept alive by this staging after the splice had declared its own. The
+        // clamp (`ChunkRows::row_logical_pos`) and the triangle (`prefill_causal_col_valid`) are
+        // unchanged laws — they live inside `mask_fill` now, stated once.
+        if let (Some(mask), Some(view)) = (b.attn_mask_src, b.mask_view) {
+            let fill = scratchy_subtile::sdsc_abstract::mask_fill(view, start, n);
+            let shape = vec![
+                scratchy_subtile::sdsc_abstract::MaskView::rows(view) as usize,
+                scratchy_subtile::sdsc_abstract::MaskView::cols(view) as usize,
+            ];
             dynamic.push((mask as u64, fill, shape));
         }
         // ⭐ ASK FOR THE ROWS THIS FORWARD WROTE, NOT THE WHOLE RESIDENT TENSOR. Decode and prefill

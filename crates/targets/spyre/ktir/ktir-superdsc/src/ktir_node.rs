@@ -425,6 +425,11 @@ pub struct KtirNode {
     /// was never absent from the IR anyway: the mask parameter's own view states `[1, capacity]`, so a
     /// caller that wants it reads it from [`regions`](crate::emit::lower_ktir_to_superdsc::regions).
     pub mask: Option<BufferId>,
+    /// The mask binding's DECLARED VIEW — the additive tile the program's mask parameter reads,
+    /// as the splice derived it beside the arm. `Some` exactly where [`Self::mask`] is: the
+    /// splice sets both from one arm, and a mask without a view is a binding whose bytes the
+    /// runtime would have to shape by guesswork — the defect class the view exists to close.
+    pub mask_view: Option<crate::sdsc_abstract::MaskView>,
     /// The output tensor of the NODE this program is HALF OF, when that is not the program's own
     /// output. `None` for every program that writes its node's output itself, which is all but one.
     ///
@@ -480,6 +485,7 @@ impl Clone for KtirNode {
             program: self.program,
             bindings: self.bindings.clone(),
             mask: self.mask,
+            mask_view: self.mask_view,
             node_out_tid: self.node_out_tid,
             minted: std::sync::Mutex::new(
                 self.minted

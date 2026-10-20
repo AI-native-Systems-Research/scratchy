@@ -1559,7 +1559,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // the same statement the placement pass sizes the mask binding's bytes from.
     let arm = AttnArm::of(node, ir, active_cap, rows_are_requests)?;
     let AttnArm {
-        swept: _,
+        swept,
         mq,
         prefix_len,
         kc_row,
@@ -1568,10 +1568,30 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         ktn_w,
         mask_eff: _,
         one_pass,
-        continuation: _,
+        continuation,
         has_mask,
     } = arm;
     let _ = (nqh, gqa);
+    // ⭐ THE MASK'S TYPED VIEW — the same statement [`AttnArm::mask_view`] makes for the
+    // placement, now CARRIED ON THE NODE so the wiring states one baked fact and the worker
+    // composes exactly that view instead of re-deriving the shape at runtime: OnePass reads
+    // only the clamped triangle over the new block, Continuation reads the swept prefix
+    // columns then the triangle, Decode reads one runtime-length row.
+    let mask_view = has_mask.then(|| {
+        let kind = if one_pass {
+            ktir_superdsc::sdsc_abstract::MaskArm::OnePass
+        } else if continuation {
+            ktir_superdsc::sdsc_abstract::MaskArm::Continuation
+        } else {
+            ktir_superdsc::sdsc_abstract::MaskArm::Decode
+        };
+        ktir_superdsc::sdsc_abstract::MaskView {
+            kind,
+            mq,
+            swept: if continuation { swept } else { 0 },
+            ktn_rows: if continuation || one_pass { ktn_rows } else { 0 },
+        }
+    });
     // The scale, stated as the kernel's own constexpr so the program's `qk * SCALE` mulf
     // carries exactly the value `program_score_scale` reads back — the door resolves the
     // registry slot FROM that value, so the program and `scalarmul_scales` cannot disagree.
@@ -1620,7 +1640,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             has_mask,
         },
     )?;
-    let k = mint_attn(node, ir, positional, has_mask)?;
+    let k = mint_attn(node, ir, positional, mask_view)?;
     // ── THE RESTICKIFY FIRST, the attention that reads its scratch second — the
     // dataflow order the tape executes them in.
     let new_k_tid = node.inputs[3].tensor.index() as u32;
@@ -1703,6 +1723,7 @@ fn mint_kt_restick<F: scratchy_subtile::subtile_ir::RopeForm>(
         program,
         bindings,
         mask: None,
+        mask_view: None,
         node_out_tid: None,
         // The same empty replay record #730's sweep gave the other two mint sites — the
         // restickify mint post-dates it and the rebase onto the bundle-unique mint left
@@ -2047,8 +2068,11 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     positional: KtirNode,
-    mask_bound: bool,
+    mask_view: Option<ktir_superdsc::sdsc_abstract::MaskView>,
 ) -> Result<KtirNode, String> {
+    // The tid and the view are ONE fact: the view is Some exactly when the kernel binds the
+    // mask parameter, so the binding's bytes and their declared shape cannot diverge.
+    let mask_bound = mask_view.is_some();
     // ⛔ THE DOOR'S ORDER, NOT `lower_one`'s: q (inputs[0]), OUT (the node's output), then
     // the Kᵀ PLANE, the new block's Kᵀ SCRATCH, vc (inputs[2]), vd (inputs[4]) — the order
     // the kernel's parameter list states and `regions()` zips back. `regions()` zips
@@ -2102,6 +2126,7 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         program,
         bindings,
         mask: mask_tid,
+        mask_view,
         node_out_tid: None,
         minted: Default::default(),
     })
@@ -3023,6 +3048,7 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
         program,
         bindings,
         mask: None,
+        mask_view: None,
         node_out_tid: None,
         minted: Default::default(),
     })

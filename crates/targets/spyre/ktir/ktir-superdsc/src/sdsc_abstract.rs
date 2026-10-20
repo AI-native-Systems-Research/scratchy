@@ -4773,6 +4773,115 @@ pub fn decode_batch_causal_col_valid(col: usize, row: usize) -> bool {
 /// come from a caller than its rows can.
 pub const ATTN_MASK_NEG: f32 = -(half::f16::MAX.to_f32_const() / 2.0);
 
+/// ⭐⭐⭐ THE SCORE-MASK OPERAND'S DECLARED VIEW — the BAKE'S OWN STATEMENT of the additive mask
+/// tile the spliced attention program reads, as a typed constant the runtime cannot reshape.
+///
+/// The splice derives this beside the arm (`AttnArm`), the layout sizes the mask binding's
+/// placement from it, and the worker's fill ([`mask_fill`]) takes it as its ONLY shape input —
+/// the same view stated once and consumed everywhere, because the shape was previously stated
+/// by nobody: the runtime staged the deleted hand-written emitter's mask shapes, and every
+/// prefill score-mask read ran past the staged bytes into whatever the device held there.
+///
+/// ⛔ THE KIND IS STATED, NOT DERIVED FROM THE COUNTS: `swept == 0` happens to imply the
+/// one-pass arm and `mq == 1` the decode arm, but reading the kind back off the arithmetic is
+/// a re-derivation the bake is not obliged to repeat. Runtime values (`start`, `real`) INDEX
+/// INTO this view — they never define it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaskView {
+    /// Which arm's fill law composes the bytes: the triangle, the prefix-plus-triangle, or the
+    /// runtime length mask.
+    pub kind: MaskArm,
+    /// The attention's baked query-row count. The view's ROWS are `mq` for the prefill arms and
+    /// `1` for decode — stated by `kind`, not re-derived here.
+    pub mq: u32,
+    /// The prefix columns the view sweeps before the new block (`ActiveCap::resolve`'s extent;
+    /// 0 for the one-pass arm).
+    pub swept: u32,
+    /// The new block's stick-covered column count (`PaddedMq`'s cover; 0 for the decode arm,
+    /// whose new key rides the Kᵀ scratch and needs no mask column).
+    pub ktn_rows: u32,
+}
+
+/// The arm whose fill law composes a [`MaskView`]'s bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaskArm {
+    /// A one-pass prompt chunk (dead prefix, the new block spans the chunk): the
+    /// `[mq, ktn_rows]` clamped causal triangle, `mask_neg` over the pad columns.
+    OnePass,
+    /// A whole-chunk continuation (live prefix): `[mq, swept + ktn_rows]` — prefix validity,
+    /// then the same clamped triangle.
+    Continuation,
+    /// Decode: the `[1, swept]` runtime length mask.
+    Decode,
+}
+
+impl MaskView {
+    /// The view's row count — `1` at decode, `mq` on the prefill arms.
+    pub const fn rows(self) -> u32 {
+        if matches!(self.kind, MaskArm::Decode) {
+            1
+        } else {
+            self.mq
+        }
+    }
+    /// The view's column count — `swept + ktn_rows` on every arm.
+    pub const fn cols(self) -> u32 {
+        self.swept + self.ktn_rows
+    }
+}
+
+/// ⭐⭐⭐ THE MASK FILL AT THE DECLARED VIEW — the runtime's one composition of the score
+/// mask's bytes, shaped by NOTHING but the baked [`MaskView`] and indexed by the launch's own
+/// `start` (the resident prefix length) and `real` (the chunk's real token count).
+///
+/// Additive law, the kernel's own: `0` where a column is valid, [`ATTN_MASK_NEG`] — FINITE, so
+/// `exp(score + mask)` underflows to 0 and the sum stays finite — where it is not. Every column
+/// of the view gets an explicit value; an additive byte the host never wrote reads as ZERO, i.e.
+/// VALID, which is fluent and wrong.
+///
+/// * prefix columns `[0, swept)`: valid where the resident prefix was written (`c < start`);
+///   the unwritten tail of the sweep is `mask_neg`, never left to stale device bytes.
+/// * new-block columns `[swept, swept + ktn_rows)`: the clamped triangle
+///   ([`ChunkRows::row_logical_pos`] + [`prefill_causal_col_valid`], the pad-row law the
+///   lm-head tail samples from) — which also covers the stick-pad columns, since a pad column
+///   is past every row's position.
+/// * decode: the length mask, valid `c < start` — the resident prefix before this step's new
+///   key, which rides the Kᵀ scratch and needs no column.
+pub fn mask_fill(view: MaskView, start: usize, real: usize) -> Vec<f32> {
+    let rows = view.rows() as usize;
+    let swept = view.swept as usize;
+    let cols = view.cols() as usize;
+    let mut m = vec![0.0f32; rows * cols];
+    match view.kind {
+        MaskArm::Decode => {
+            let keep = start.min(cols);
+            for v in m[keep..].iter_mut() {
+                *v = ATTN_MASK_NEG;
+            }
+        }
+        MaskArm::OnePass | MaskArm::Continuation => {
+            let chunk = ChunkRows::chunk(
+                std::num::NonZeroU32::new(view.mq).expect("a mask view's mq is nonzero"),
+            );
+            for r in 0..rows {
+                let pos = chunk.row_logical_pos(r, real);
+                let row = &mut m[r * cols..(r + 1) * cols];
+                for (c, v) in row[..swept].iter_mut().enumerate() {
+                    if c >= start {
+                        *v = ATTN_MASK_NEG;
+                    }
+                }
+                for (c, v) in row[swept..].iter_mut().enumerate() {
+                    if !prefill_causal_col_valid(c, pos) {
+                        *v = ATTN_MASK_NEG;
+                    }
+                }
+            }
+        }
+    }
+    m
+}
+
 /// ⭐⭐⭐ EVERY FACT A LAUNCH'S NEW-BLOCK CAUSAL MASK IS A FUNCTION OF, AS ONE VALUE — and
 /// [`Self::mask`] takes nothing else, so the mask cannot depend on a fact this key leaves out.
 ///
@@ -8812,6 +8921,98 @@ pub fn mlp_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⭐ THE MASK FILL AT THE DECLARED VIEW — the one composition of the score mask's bytes, pinned
+    /// per arm. The defects this closes are the two the runtime carried before the view existed:
+    /// a mask staged at a DIFFERENT SHAPE than the program's declared view (row stride `mq` read at
+    /// stride `ktn_rows` — every row past the first reads the wrong columns), and a tail value of
+    /// `-1e38` (an f32 the device's fp16 mask lane cannot hold) instead of the finite
+    /// [`ATTN_MASK_NEG`].
+    #[test]
+    fn mask_fill_composes_each_arms_declared_view() {
+        // ── THE VIEW'S SHAPE IS THE ARM'S OWN, not a runtime guess ──
+        let one_pass = MaskView {
+            kind: MaskArm::OnePass,
+            mq: 31,
+            swept: 0,
+            ktn_rows: 64,
+        };
+        let cont = MaskView {
+            kind: MaskArm::Continuation,
+            mq: 31,
+            swept: 512,
+            ktn_rows: 64,
+        };
+        let dec = MaskView {
+            kind: MaskArm::Decode,
+            mq: 1,
+            swept: 2048,
+            ktn_rows: 0,
+        };
+        assert_eq!((one_pass.rows(), one_pass.cols()), (31, 64));
+        assert_eq!((cont.rows(), cont.cols()), (31, 512 + 64));
+        assert_eq!((dec.rows(), dec.cols()), (1, 2048));
+
+        // ── DECODE: the length row — valid `c < start`, finite mask_neg past it ──
+        let m = mask_fill(dec, 70, 1);
+        assert_eq!(m.len(), 2048, "the fill covers EVERY column of the view");
+        assert!(m[..70].iter().all(|&v| v == 0.0), "the written prefix is valid");
+        assert!(
+            m[70..].iter().all(|&v| v == ATTN_MASK_NEG),
+            "the unwritten sweep tail is the FINITE mask_neg"
+        );
+        assert_ne!(
+            m[70],
+            -1.0e38,
+            "the stale f32 tail the fp16 mask lane cannot hold must be gone"
+        );
+
+        // ── ONE-PASS at `real < mq`: the clamped triangle over the new block, pad columns masked ──
+        // (a 23-token prompt on the 31-row rung — the measured gemma-4 case whose raw-triangle
+        // binding made the first sampled token EOS)
+        let m = mask_fill(one_pass, 0, 23);
+        assert_eq!(m.len(), 31 * 64, "the fill is at the Kᵀ cover's width, not mq");
+        let at = |r: usize, c: usize| m[r * 64 + c];
+        for r in 0..31 {
+            // Every row's extent is its CLAMPED position: pad rows take the last real row's.
+            let pos = ChunkRows::chunk(std::num::NonZeroU32::new(31).unwrap()).row_logical_pos(r, 23);
+            assert_eq!(pos, r.min(22), "the pad-row clamp is the lm-head tail's law");
+            for c in 0..64 {
+                assert_eq!(
+                    at(r, c),
+                    if prefill_causal_col_valid(c, pos) { 0.0 } else { ATTN_MASK_NEG },
+                    "row {r} col {c}: the triangle at the clamped position, pad columns masked"
+                );
+            }
+        }
+        // And the LAST baked row — where the lm-head reads — attends exactly the real prompt.
+        assert_eq!(
+            (0..64).filter(|&c| at(30, c) == 0.0).collect::<Vec<_>>(),
+            (0..23).collect::<Vec<_>>(),
+            "the lm-head's row attends exactly [0, real)"
+        );
+
+        // ── CONTINUATION: prefix validity, then the same triangle ──
+        let m = mask_fill(cont, 100, 31);
+        assert_eq!(m.len(), 31 * (512 + 64));
+        let at = |r: usize, c: usize| m[r * (512 + 64) + c];
+        for r in 0..31 {
+            for c in 0..512 {
+                assert_eq!(
+                    at(r, c),
+                    if c < 100 { 0.0 } else { ATTN_MASK_NEG },
+                    "prefix column {c}: valid where the resident prefix was written"
+                );
+            }
+            for c in 0..64 {
+                assert_eq!(
+                    at(r, 512 + c),
+                    if prefill_causal_col_valid(c, r) { 0.0 } else { ATTN_MASK_NEG },
+                    "the new-block triangle rides behind the swept prefix"
+                );
+            }
+        }
+    }
 
     /// ⛔ A RESHAPE CANNOT BE A PLACEMENT ALIAS ON THIS DEVICE — MEASURED, not
     /// read off the formula.

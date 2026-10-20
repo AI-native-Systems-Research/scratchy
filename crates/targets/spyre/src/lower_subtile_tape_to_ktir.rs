@@ -1396,12 +1396,16 @@ pub struct BundleWiring {
     pub num_sources: u32,
     pub result_tensor: u32,
     /// `tensor_shapes[id] = (rows, cols)` for every tensor. When `attn_mask` is set, the LAST entry
-    /// is the synthetic mask tensor `[1, capacity]`.
+    /// is the synthetic mask tensor at the DECLARED VIEW's shape.
     pub tensor_shapes: Vec<(u32, u32)>,
-    /// Tensor id of the shared attention runtime length-mask source, if the graph has a maskable
-    /// decode. The host fills it `[1, capacity]` per forward step (0 on valid columns, -inf past
-    /// the decode position); it is NOT one of `num_sources` and is written by no node.
-    pub attn_mask: Option<u32>,
+    /// The attention score-mask binding, if the graph has one: the synthetic tensor's id, the
+    /// bake's declared view of its tile, and the resident prefix capacity the bundle serves. The
+    /// host composes the fill at the view ([`crate::wiring::MaskView`], the typed constant the
+    /// splice mints per arm — the decode `[1, swept]` length row, the one-pass `[mq, ktn_rows]`
+    /// triangle, the continuation's `[mq, swept + ktn_rows]`), with the runtime `start`/`real`
+    /// values indexing into it; `cap` is the bucket-walk fact. It is NOT one of `num_sources` and
+    /// is written by no node.
+    pub attn_mask: Option<crate::wiring::MaskBinding>,
     /// EVERY compile-time scalar the programs read, in registry order: entry `i` is the value the
     /// worker must bind at [`scalarmul_scale_tid`]`(i)` — the model's own multipliers and RMSNorm
     /// epsilons, exactly the set and exactly the order `subtile→superdsc` registers.
@@ -1541,7 +1545,7 @@ pub fn graph_wiring<F: RopeForm>(
     // fact per program — its bindings — and one per mask. The fold below sees the results in node
     // order, so the first error and the mask check read exactly as the serial walk did.
     // One program's binding order, and the `(mask tid, capacity)` it reads, when it reads one.
-    type WiredProgram = (NodeArgs, Option<(u32, u32)>);
+    type WiredProgram = (NodeArgs, Option<crate::wiring::MaskBinding>);
     let per_node: Vec<Result<Vec<WiredProgram>, SuperDscError>> = {
         use rayon::prelude::*;
         ir.nodes
@@ -1558,21 +1562,24 @@ pub fn graph_wiring<F: RopeForm>(
                 for e in ops {
                     let Some(k) = e.ktir else { continue };
                     let mask = match k.mask {
-                        // ⭐ THE CAPACITY COMES OFF THE PROGRAM, not off the node: the resident cache's
-                        // own `ktdp.construct_memory_view` states `[capacity, kv_width]`, so the number
-                        // this pass needs to size the host buffer is read where every other extent is
-                        // read. It used to ride on `KtirNode::mask` as the second half of a pair the
-                        // LOWERING never looked at.
-                        //
-                        // ⛔ THE CACHE'S VIEW, NOT THE MASK'S. The mask states `[1, capacity]` only at
-                        // decode; a multi-row continuation binds one `[mq, capacity + mq]` tile (the
-                        // prefix's length mask beside the new block's row mask), whose columns are not
-                        // the capacity. The V CACHE is the program's fifth parameter in every arm
-                        // (q, out, kt, ktn, vc, vd): positions 2 and 3 state the Kᵀ plane's and the
-                        // scratch's fused `[hd, nkvh·cap]`-shaped views, whose COLUMN counts are
-                        // capacity-multiples rather than the capacity itself — only the V plane's
-                        // `[capacity, kv_width]` states the capacity as a view row count.
+                        // ⭐ THE VIEW COMES OFF THE NODE, not off a runtime guess: the splice
+                        // states the mask tile's `(rows, cols)` per arm — the decode
+                        // runtime-length row `[1, swept]`, the one-pass causal triangle
+                        // `[mq, ktn_rows]`, the continuation's `[mq, swept + ktn_rows]` — and
+                        // this pass sizes the host buffer from that ONE baked fact. The shape
+                        // is a typed constant in the generated code; the worker's fill takes
+                        // it as its only shape input, with the runtime `start`/`real` values
+                        // INDEXING into it. (The old derivation read the capacity off the
+                        // program's position-4 V-cache view and declared `[1, cap]` for every
+                        // arm — the stale hand-written emitter's decode shape, wrong for every
+                        // prefill arm.)
                         Some(mid) => {
+                            let view = k.mask_view.ok_or_else(|| {
+                                SuperDscError(format!(
+                                    "the attention bound mask t{mid} but declared no view for it — \
+                                     a mask binding without its typed view cannot be staged"
+                                ))
+                            })?;
                             let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(&k)
                                 .map_err(|e| SuperDscError(e.message))?;
                             if !regs.iter().any(|r| r.tid == mid.get()) {
@@ -1581,6 +1588,13 @@ pub fn graph_wiring<F: RopeForm>(
                                      — the attention bound a mask its own program never declares"
                                 )));
                             }
+                            // ⭐ THE RESIDENT CAPACITY STILL COMES OFF THE PROGRAM'S V-CACHE VIEW —
+                            // position 4's `[capacity, kv_width]` is the CACHE's own row count, a
+                            // DIFFERENT fact from the mask's shape (the prefill arms' mask spans
+                            // the swept prefix AND the new block, so its column count would
+                            // overstate the cache by the new block's rows). The bucket walk and
+                            // the prompt-fits bound read this number; the mask's bytes read the
+                            // view. One binding, two named facts, no re-derivation at either end.
                             let cap = regs
                                 .get(4)
                                 .filter(|r| r.tid != mid.get())
@@ -1589,10 +1603,14 @@ pub fn graph_wiring<F: RopeForm>(
                                     SuperDscError(format!(
                                         "the attention binding mask t{mid} states no resident-cache \
                                          parameter at position 4, so there is no `[capacity, \
-                                         kv_width]` view to size the host buffer with"
+                                         kv_width]` view to state the bundle's prefix capacity with"
                                     ))
                                 })?;
-                            Some((mid.get(), cap))
+                            Some(crate::wiring::MaskBinding {
+                                tid: mid.get(),
+                                view,
+                                cap,
+                            })
                         }
                         None => None,
                     };
@@ -1608,14 +1626,14 @@ pub fn graph_wiring<F: RopeForm>(
             .collect()
     };
     let mut nodes = Vec::with_capacity(ir.nodes.len());
-    let mut mask: Option<(u32, u32)> = None;
+    let mut mask: Option<crate::wiring::MaskBinding> = None;
     for lowered in per_node {
         for (args, m) in lowered? {
             if let Some(m) = m {
                 if mask.is_some_and(|prev| prev != m) {
                     return Err(SuperDscError(format!(
                         "the attention mask must be uniform across layers (one shared prefix \
-                         capacity), but {:?} and {m:?} were both emitted",
+                         capacity and one declared view), but {:?} and {m:?} were both emitted",
                         mask.unwrap()
                     )));
                 }
@@ -1626,19 +1644,21 @@ pub fn graph_wiring<F: RopeForm>(
     }
     let mut tensor_shapes: Vec<(u32, u32)> = ir.tensors.iter().map(|t| (t.rows, t.cols)).collect();
     let attn_mask = match mask {
-        Some((mid, cap)) => {
-            // The mask tensor sits at id == ir.tensors.len(); append its `[1, capacity]` shape so
-            // host buffer allocation covers it.
-            if mid as usize != tensor_shapes.len() {
+        Some(binding) => {
+            // The mask tensor sits at id == ir.tensors.len(); append the DECLARED VIEW's
+            // `(rows, cols)` — the same shape the placement pass sized the binding's bytes from —
+            // so the host buffer allocation covers exactly what the program reads.
+            if binding.tid as usize != tensor_shapes.len() {
                 return Err(SuperDscError(format!(
-                    "the mask's tensor id is {mid} but the next free id is {} — the mask is a \
+                    "the mask's tensor id is {} but the next free id is {} — the mask is a \
                      synthetic source placed one past the graph, and an id that is not the next \
                      free one is an id some real tensor already answers to",
+                    binding.tid,
                     tensor_shapes.len()
                 )));
             }
-            tensor_shapes.push((1, cap));
-            Some(mid)
+            tensor_shapes.push((binding.view.rows(), binding.view.cols()));
+            Some(binding)
         }
         None => None,
     };

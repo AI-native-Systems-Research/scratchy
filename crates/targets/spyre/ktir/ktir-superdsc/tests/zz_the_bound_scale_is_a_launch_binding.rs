@@ -162,6 +162,7 @@ fn scale_program(view: ScaleView) -> KtirNode {
         program: Program::ScalarMul,
         bindings: vec![BufferId::new(301), BufferId::new(302), BufferId::new(303)],
         mask: None,
+        mask_view: None,
         node_out_tid: None,
         minted: Default::default(),
     }

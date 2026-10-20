@@ -5041,6 +5041,7 @@ mod transpose_tests {
             program: Program::Transpose,
             bindings: vec![BufferId::new(101), BufferId::new(102)],
             mask: None,
+            mask_view: None,
             node_out_tid: None,
             minted: Default::default(),
         }

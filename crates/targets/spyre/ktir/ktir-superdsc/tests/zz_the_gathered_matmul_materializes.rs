@@ -281,6 +281,7 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
             BufferId::new(204),
         ],
         mask: None,
+        mask_view: None,
         node_out_tid: None,
         minted: Default::default(),
     }

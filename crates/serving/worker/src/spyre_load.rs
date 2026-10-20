@@ -184,6 +184,9 @@ pub(crate) struct Parsed {
     pub(crate) embed_src: usize,
     /// The attention length-mask source, when the wiring names one.
     pub(crate) attn_mask_src: Option<usize>,
+    /// The mask's bake-declared view — `Some` exactly when `attn_mask_src` is (see
+    /// `BundleMeta::mask_view`).
+    pub(crate) mask_view: Option<scratchy_subtile::sdsc_abstract::MaskView>,
     /// cos / sin runtime sources as `(source id, full column width, rotary class)`.
     /// GQA gives more than one width (Q vs K); a hybrid-attention arch (gemma-4)
     /// gives classes different tables. Each is filled by tiling the class's own
@@ -276,7 +279,8 @@ pub(crate) fn wiring_to_parsed(
                     .flat_map(|l| [l.new_k as usize, l.new_v as usize]),
             )
             .collect(),
-        attn_mask_src: w.attn_mask.map(|m| m as usize),
+        attn_mask_src: w.attn_mask.map(|m| m.tid as usize),
+        mask_view: w.attn_mask.map(|m| m.view),
     })
 }
 
@@ -2720,6 +2724,7 @@ impl SpyreWorker {
                 #[cfg(not(feature = "spyre-hw"))]
                 prog,
                 attn_mask_src: p.attn_mask_src,
+                mask_view: p.mask_view,
                 capacity: p.capacity,
                 m_cap: p.m_cap,
                 embed_src: p.embed_src,
