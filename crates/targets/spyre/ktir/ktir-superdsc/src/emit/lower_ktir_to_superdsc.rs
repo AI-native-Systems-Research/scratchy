@@ -750,7 +750,7 @@ fn store_views(f: &IRFunction<'static>) -> std::collections::HashSet<Ssa> {
 
 /// Every `arith.constant` index in the func, by the SSA it defines — an access tile's corner is one
 /// of these, and a corner is what carries a column-chunked node's `region.cols.start`.
-pub(crate) fn index_constants(f: &IRFunction<'static>) -> std::collections::HashMap<Ssa, i64> {
+pub fn index_constants(f: &IRFunction<'static>) -> std::collections::HashMap<Ssa, i64> {
     let mut m = std::collections::HashMap::new();
     for op in f.operations.iter() {
         if op.op_type != OpKind::ArithConstant {
@@ -789,6 +789,110 @@ pub(crate) fn index_constants(f: &IRFunction<'static>) -> std::collections::Hash
         }
     }
     m
+}
+
+/// A corner's affine form over the launch position: `stride · core_id + base`.
+///
+/// The door's half of the shared contract with triton-ktir's
+/// `uniform_grid_corners::uniform_corners` — the recognizer that crate's fire gate consults
+/// and whose pass mints the spelling this one reads. This crate is a serde-only leaf and
+/// cannot depend on that one, so the family is stated twice; the bridge test in
+/// `triton-ktir-superdsc` runs one module through both and asserts they agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Uniform {
+    pub stride: i64,
+    pub base: i64,
+}
+
+/// Every SSA the affine-form propagation can state as `stride · core_id + base` over the
+/// landmark — the door's twin of triton-ktir's `uniform_corners`, built the same way
+/// `index_constants` builds its constants: one pass over the function's top-level ops in
+/// program order (SSA definitions precede uses), seeded with the landmark itself.
+///
+/// SOUND by the same law as the twin: only ops closed under affine forms propagate — an
+/// `index_cast` is transparent, an `addi` of a constant or another uniform composes, a
+/// `muli` by a constant scales. Division, remainder, and a product of two position terms
+/// are dropped, so nothing is claimed the twin cannot also claim. Only the landmark's own
+/// `result` seeds the position: a multi-axis `ktdp.get_compute_tile_id` (scratchy's own
+/// producer emits those) names its other axes in `result_names`, and an axis coordinate is
+/// not the flat position — a corner riding one is not claimed rather than misclaimed.
+pub fn uniform_corners(
+    f: &IRFunction<'static>,
+    consts: &std::collections::HashMap<Ssa, i64>,
+) -> std::collections::HashMap<Ssa, Uniform> {
+    let mut out: std::collections::HashMap<Ssa, Uniform> = std::collections::HashMap::new();
+    let Some(landmark) = f
+        .operations
+        .iter()
+        .find(|o| o.op_type == OpKind::KtdpGetComputeTileId)
+        .and_then(|o| o.result)
+    else {
+        return out;
+    };
+    out.insert(landmark, Uniform { stride: 1, base: 0 });
+    for op in f.operations.iter() {
+        let Some(r) = op.result else { continue };
+        // ⛔ THE UNPACK IS PER-ARM, NOT UP FRONT: an `arith.index_cast` is UNARY (operand 1 is
+        // absent), so a two-operand tuple match would skip every cast — and the canonical
+        // spelling is `index_cast(muli(index_cast(landmark), S))`, three casts deep. The casts
+        // must propagate or NOTHING does.
+        let form: Option<Uniform> = match op.op_type {
+            OpKind::ArithIndexCast => op.operands.first().and_then(|a| out.get(a).copied()),
+            OpKind::ArithAddi | OpKind::ArithMuli => {
+                let (Some(a), Some(b)) =
+                    (op.operands.first().copied(), op.operands.get(1).copied())
+                else {
+                    continue;
+                };
+                let (fa, fb, ka, kb) = (
+                    out.get(&a).copied(),
+                    out.get(&b).copied(),
+                    consts.get(&a).copied(),
+                    consts.get(&b).copied(),
+                );
+                if op.op_type == OpKind::ArithAddi {
+                    match (fa, fb, ka, kb) {
+                        (Some(x), Some(y), _, _) => {
+                            compose(x.stride.checked_add(y.stride), x.base.checked_add(y.base))
+                        }
+                        (Some(x), None, _, Some(c)) => {
+                            compose(Some(x.stride), x.base.checked_add(c))
+                        }
+                        (None, Some(y), Some(c), _) => {
+                            compose(Some(y.stride), y.base.checked_add(c))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    // A product of two position terms is quadratic, not uniform: only mul by a
+                    // CONSTANT propagates — the same deliberate narrowing the twin states.
+                    match (fa, fb, ka, kb) {
+                        (Some(x), None, _, Some(c)) => {
+                            compose(x.stride.checked_mul(c), x.base.checked_mul(c))
+                        }
+                        (None, Some(y), Some(c), _) => {
+                            compose(y.stride.checked_mul(c), y.base.checked_mul(c))
+                        }
+                        _ => None,
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some(form) = form {
+            out.insert(r, form);
+        }
+    }
+    out
+}
+
+/// `Some` for a form inside the i32 domain, `None` for one that left it (or whose
+/// arithmetic overflowed) — the same guard the twin applies, so a form one side refuses
+/// the other refuses too.
+fn compose(stride: Option<i64>, base: Option<i64>) -> Option<Uniform> {
+    let stride = stride.filter(|s| (i32::MIN as i64..=i32::MAX as i64).contains(s))?;
+    let base = base.filter(|b| (i32::MIN as i64..=i32::MAX as i64).contains(b))?;
+    Some(Uniform { stride, base })
 }
 
 /// An op's `[.., rows, cols]` from its own `shape` attribute or result type — the same reading
@@ -951,36 +1055,65 @@ pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(&'static st
 /// ⭐ EVERY INPUT, NOT JUST A BINARY'S SECOND. The builder gives a unary's single input the output's
 /// dims too, so the same silence applies; the invariant is "all operands share the output's extent",
 /// and stating it per-arity would be the scattered logic this crate exists to avoid.
+/// ⭐⭐⭐ TWO BASES, ONE LAW: every operand must hold the op's row sweep (`rows` — the basis
+/// [`pointwise_rows`] reads off the OUTPUT), and the basis an operand holds it in is the
+/// operand's own.
+///
+/// A WHOLE-VIEW operand holds the sweep by BEING it (`v_rows == rows`, at row 0) — the seeded
+/// family's shape, and the only shape the old law here described (it compared `v_rows` against
+/// the output's `v_rows`). A WINDOWED operand — a banded program's per-core window, or a minted
+/// intermediate consumed by a banded op — holds the sweep as its WINDOW (`r_len == rows`, fitting
+/// its view), and comparing its `v_rows` instead would refuse exactly the programs the band lift
+/// admits: a banded output's whole view is every core's bands, not this op's sweep. The c_len
+/// equality is unchanged — the op's width is one number every operand shares.
 fn pointwise_extents_agree(
     name: &str,
     kind: Elementwise,
     ins: &[Region],
     out: &Region,
+    rows: u32,
 ) -> Result<(), Error> {
     for (i, x) in ins.iter().enumerate() {
-        if (x.v_rows, x.c_len) != (out.v_rows, out.c_len) {
+        let row_ok = if x.r_cover == (0, x.v_rows) {
+            x.r_start == 0 && x.v_rows == rows
+        } else {
+            x.r_len == rows && x.r_start + x.r_len <= x.v_rows
+        };
+        if !row_ok || x.c_len != out.c_len {
+            if x.r_cover == (0, x.v_rows) {
+                return err(format!(
+                    "Elementwise({kind:?}) {name}: input {i} t{} is `[{}, {}]` (view rows × window \
+                     cols) but the output t{} is `[{}, {}]`, and this emitter addresses EVERY operand \
+                     at the OUTPUT's extent — `pointwise_opspec_from_tile` computes `device_dims` once \
+                     from the output tile and hands the same dims to every TensorArg, so nothing \
+                     downstream ever reads this input's own view. The descriptor would read a {}-row × \
+                     {}-col tile out of a {}-row × {}-col operand, running off its end and taking the \
+                     wrong bytes for every row after the first — silently, and reporting success. \
+                     A row-broadcast `[1, n]` source or a per-row `[m, 1]` scalar is expressible only \
+                     through the EwOperand builders (`pw2` + `In::col`), which mark the operand \
+                     out-broadcast so the descriptor STATES the broadcast; this seeded whole-tensor \
+                     path cannot express it, so it refuses rather than mis-address it.",
+                    x.tid,
+                    x.v_rows,
+                    x.c_len,
+                    out.tid,
+                    out.v_rows,
+                    out.c_len,
+                    rows,
+                    out.c_len,
+                    x.v_rows,
+                    x.c_len,
+                ));
+            }
             return err(format!(
-                "Elementwise({kind:?}) {name}: input {i} t{} is `[{}, {}]` (view rows × window \
-                 cols) but the output t{} is `[{}, {}]`, and this emitter addresses EVERY operand \
-                 at the OUTPUT's extent — `pointwise_opspec_from_tile` computes `device_dims` once \
-                 from the output tile and hands the same dims to every TensorArg, so nothing \
-                 downstream ever reads this input's own view. The descriptor would read a {}-row × \
-                 {}-col tile out of a {}-row × {}-col operand, running off its end and taking the \
-                 wrong bytes for every row after the first — silently, and reporting success. \
-                 A row-broadcast `[1, n]` source or a per-row `[m, 1]` scalar is expressible only \
-                 through the EwOperand builders (`pw2` + `In::col`), which mark the operand \
-                 out-broadcast so the descriptor STATES the broadcast; this seeded whole-tensor \
-                 path cannot express it, so it refuses rather than mis-address it.",
-                x.tid,
-                x.v_rows,
-                x.c_len,
-                out.tid,
-                out.v_rows,
-                out.c_len,
-                out.v_rows,
-                out.c_len,
-                x.v_rows,
-                x.c_len,
+                "Elementwise({kind:?}) {name}: input {i} t{}'s window is `[{}, {}]` at row {} of its \
+                 `[{}, {}]` view, but the op sweeps `[{}, {}]` (the output t{}'s basis) — a windowed \
+                 operand must hold the sweep as its OWN window (`r_len` the sweep, fitting the view), \
+                 or the descriptor would read the wrong rows of this operand for the rows the output \
+                 states. The column extent is shared (`c_len`), so a mismatch there is the same \
+                 refusal; a row-broadcast `[1, n]` source or a per-row `[m, 1]` scalar is expressible \
+                 only through the EwOperand builders (`pw2` + `In::col`), which state the broadcast.",
+                x.tid, x.r_len, x.c_len, x.r_start, x.v_rows, x.v_cols, rows, out.c_len, out.tid,
             ));
         }
     }
@@ -1021,7 +1154,11 @@ pub fn elementwise(
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
     let (op_func, arity) = elementwise_op_func(name, kind)?;
-    let (ins, out) = split_out(name, r, layout, arity)?;
+    // ⭐ SPLIT WITHOUT THE BASE-ADDRESS GUARD: the dense arm below places row corners
+    // per-operand (the windowed emission), so which operands are inputs is a fact about the
+    // parameter list, not about how one arm addresses them. The arms that CANNOT carry a corner
+    // are refused it by the guard just below; every other body keeps `split_out`'s guard.
+    let (ins, out) = split_regions(name, r, layout, arity, &[])?;
     if !bcast.is_empty() && bcast.len() != ins.len() {
         return err(format!(
             "Elementwise({kind:?}) {name}: {} broadcast flags for {} inputs — the flags are \
@@ -1031,18 +1168,22 @@ pub fn elementwise(
             ins.len(),
         ));
     }
-    // ⛔⛔⛔ THE BROADCAST AND PER-ROW ARMS CANNOT CARRY A COLUMN CORNER, AND ONE NEVER REACHES
-    // THEM FROM THIS FRONT END. A broadcast operand is addressed at its OWN extent (`In::col`:
+    // ⛔⛔⛔ THE BROADCAST AND PER-ROW ARMS CANNOT CARRY A CORNER — COLUMN OR ROW — AND ONE NEVER
+    // REACHES THEM FROM THIS FRONT END. A broadcast operand is addressed at its OWN extent (`In::col`:
     // one lane per row; `In::mb`: one row of values) and the per-row chain writes LANE 0 of a
     // one-stick output at the buffer base — neither form can state "columns
-    // `[c_start, c_start+c_len)` of a wider stick-blocked tensor", which is what a column-blocked
-    // chunk is. The column-tiling set (`subtile_ir.rs`: `EwKind::Silu | Mul | Add`, `ScalarMul`,
-    // `SiluMul`) is all DENSE, so a corner arriving at either arm is a producer shape this door
-    // refuses BY NAME rather than mis-addressing — the same contract `base_addressed` states for
-    // a row corner. The DENSE arm below carries the corner; this guard is what keeps the other
-    // two from silently dropping it.
+    // `[c_start, c_start+c_len)` of a wider stick-blocked tensor" (what a column-blocked chunk is)
+    // nor "rows `[r_start, r_start+r_len)` of a taller one" (what a banded program's window is).
+    // The column-tiling set (`subtile_ir.rs`: `EwKind::Silu | Mul | Add`, `ScalarMul`, `SiluMul`)
+    // is all DENSE, so a corner arriving at either arm is a producer shape this door refuses BY
+    // NAME rather than mis-addressing — the same contract `base_addressed` states for a row corner
+    // on every other body. The DENSE arm below carries both corners; this guard is what keeps the
+    // other two from silently dropping them.
     if (bcast.iter().any(Option::is_some) || out.c_len == 1)
-        && (out.c_start != 0 || ins.iter().any(|x| x.c_start != 0))
+        && (out.c_start != 0
+            || ins.iter().any(|x| x.c_start != 0)
+            || out.r_start != 0
+            || ins.iter().any(|x| x.r_start != 0))
     {
         let (who, cs) = ins
             .iter()
@@ -1053,8 +1194,9 @@ pub fn elementwise(
             "Elementwise({kind:?}) {name}: {who} states column corner {cs} of its view, and the \
              arm this shape routes to (a broadcast operand or the per-row one-stick chain) \
              addresses its operands at the BUFFER BASE or at a broadcast mode — neither can place \
-             a column window. A column-blocked chunk is DENSE elementwise; the dense arm carries \
-             the corner, so give the broadcast/per-row chains whole-tensor regions.",
+             a column window, and neither a row corner (`base_addressed`'s own argument). A \
+             column-blocked chunk or a banded window is DENSE elementwise; the dense arm carries \
+             both corners, so give the broadcast/per-row chains whole-tensor regions.",
         ));
     }
     if bcast.iter().any(Option::is_some) {
@@ -1066,7 +1208,6 @@ pub fn elementwise(
     if out.c_len == 1 {
         return elementwise_per_row(name, kind, &ins, &out, sym_id_base, layout);
     }
-    pointwise_extents_agree(name, kind, &ins, &out)?;
     // ⛔ THIS COMMENT USED TO SAY `assemble_pointwise` EMITS THE SFP POLYNOMIAL TABLE "via
     // `constant_info(op_func)`". THERE IS NO SUCH FUNCTION. `constant_info` is a local in `emit_sdsc`
     // derived from the TYPED `op.op_info`, and the table is gated on
@@ -1079,7 +1220,11 @@ pub fn elementwise(
     // them. A comment claiming we emit the table describes the bug, not the fix.
     let cols = out.c_len;
     check_pointwise_cols(cols, "Elementwise", out.tid)?;
+    // ⭐ THE SWEEP IS COMPUTED BEFORE THE EXTENTS LAW, because the law is now stated OVER it: a
+    // windowed (banded) output's sweep is its window, not its whole view, and the operands are
+    // held to that basis ([`pointwise_extents_agree`]'s two-basis law below).
     let rows = pointwise_rows(name, &out)?;
+    pointwise_extents_agree(name, kind, &ins, &out, rows)?;
     let op_name = format!("{op_func}_o{}", out.tid);
     // ⛔⛔⛔ A COLUMN-BLOCKED CHUNK IS DENSE ELEMENTWISE WITH A CORNER, AND THE CORNER MUST RIDE
     // EVERY OPERAND — the 12b gemma-4 garbage. `subtile_ir.rs`'s column-tiling set
@@ -1103,7 +1248,17 @@ pub fn elementwise(
     // offset is the ONLY thing this change adds, so it is the only thing that may change the
     // bytes: any corner on any operand routes to the offset form, and a corner-free program does
     // not.
-    if out.c_start == 0 && ins.iter().all(|x| x.c_start == 0) {
+    //
+    // ⛔ AND "CORNER-FREE" MEANS ROWS TOO. The seeded form addresses every operand at the buffer
+    // base — a banded op whose every COLUMN corner happens to be 0 (a rope copy's first half)
+    // would silently read the wrong band at the base if the row corner were not part of this
+    // gate. The row term joins the column term here rather than in `base_addressed`, because the
+    // arm below this one CAN place it.
+    if out.c_start == 0
+        && ins.iter().all(|x| x.c_start == 0)
+        && out.r_start == 0
+        && ins.iter().all(|x| x.r_start == 0)
+    {
         let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
         let in_refs: Vec<&str> = in_names.iter().map(|s| s.as_str()).collect();
         let tile_op = pointwise_tile_op(rows, cols, arity as u32 + 1);
@@ -1118,38 +1273,48 @@ pub fn elementwise(
         );
         return Ok(vec![op]);
     }
-    // ⛔ THE EXTENTS LAW RESTATED FOR THE CHUNK: `pointwise_extents_agree` compared
-    // `(v_rows, c_len)` — the window's width, which every chunk's operands share — so it cannot
-    // catch a chunk whose operands carry DIFFERENT corners. Every operand of a column-blocked
-    // op reads the same window of the same-width tensors, so the corners must be equal; a
-    // mismatch would address one operand's window at another's corner.
-    if !ins.iter().all(|x| x.c_start == out.c_start) {
-        let who: Vec<String> = ins
-            .iter()
-            .map(|x| format!("t{}@{}", x.tid, x.c_start))
-            .collect();
-        return err(format!(
-            "Elementwise({kind:?}) {name}: the output t{}'s window starts at column {} but its \
-             inputs sit at [{}] — a column-blocked chunk reads and writes ONE window shared by \
-             every operand, so unequal corners would address one operand's columns at another's. \
-             The tiling front end mints one block per operand set; unequal corners mean a producer \
-             windowed the operands by hand.",
-            out.tid,
-            out.c_start,
-            who.join(", "),
-        ));
-    }
-    // Every operand sits at the output's corner (checked just above), so one corner serves all — a
-    // [`crate::addr::ColWindow`], so the piece is presented stick-major (#622).
-    let out_off = chunk_window(name, rows, &out)?;
+    // ⛔⛔⛔ THE CORNERS ARE PER-OPERAND, AND THE PAIRING IS THE PROGRAM'S OWN — the rotate-half
+    // finding. The old law here required every input's column corner to equal the output's,
+    // because the tiling front end mints one block per operand set and nothing else was known to
+    // reach this arm. But a rotate-half rope pairs the halves' windows over ONE view: `x1` reads
+    // columns `[0, 64)` while `x2` reads `[64, 128)` of the SAME tensor, and each product's
+    // operands sit at their OWN corners (`x1·cos` reads `x1@0` against `cos@0`, `x2·sin` reads
+    // `x2@64` against a `sin` window of its own view) — a single shared corner cannot state any
+    // of it. So the corner is per-operand now: every operand — input or output — is addressed at
+    // the window ITS OWN region states, and the extents law above is what makes that safe (every
+    // operand holds the same `[rows, cols]` sweep; only the corner differs). Equal corners —
+    // every column-blocked chunk the front end mints — emit exactly the bytes the shared-corner
+    // form did: same offset on every operand, same [`crate::addr::ColWindow`].
+    //
+    // ⭐ TWO FORMS, ONE BUILDER, PICKED BY THE ROW CORNER. At row 0 the window is a whole-stick
+    // COLUMN window of a same-rows stick-major parent — a [`crate::addr::ColWindow`], so the
+    // piece is presented stick-major and the work-division law reaches it (#622; the 12b gemma-4
+    // chunk family, card-proven). At a nonzero row corner — a BANDED program's window, one
+    // core's row band of a taller view — the window is not a column window of a same-rows tensor
+    // at all; it is a rectangle at `(r_start, c_start)` of the parent, addressed flat through
+    // [`band_corner`] (`In::sliced` at an `rc_of` corner, the write at `OutCorner::At`). That
+    // form is exactly the card-proven rotate-half geometry — a `[rows, 64]` window at a column
+    // corner of a wider view — with the row term the corner adds.
+    let out_off: crate::addr::OutCorner = if out.r_start == 0 {
+        chunk_window(name, rows, &out)?.into()
+    } else {
+        crate::addr::OutCorner::At(band_corner(name, rows, &out)?)
+    };
     // HANDLE-FLOW, `silumul`'s own discipline: the handles are bound once and the operands
     // borrow them, because an `EwOperand` holds a `&Stk` that must outlive the builder call.
     let out_h = rb(&out.name(), rows, cols);
     let in_handles: Vec<_> = ins.iter().map(|x| rb(&x.name(), rows, cols)).collect();
     let ew: Vec<_> = in_handles
         .iter()
-        .map(|h| In::col_window(h, out_off).ew())
-        .collect();
+        .zip(ins.iter())
+        .map(|(h, x)| {
+            Ok(if x.r_start == 0 {
+                In::col_window(h, chunk_window(name, rows, x)?).ew()
+            } else {
+                In::sliced(h, band_corner(name, rows, x)?).ew()
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
     let tile_op = pointwise_tile_op(rows, cols, arity as u32 + 1);
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
         &op_name,
@@ -1176,25 +1341,31 @@ pub fn elementwise(
 /// test asked the body and the body agreed with itself.
 ///
 /// So this asks the emission. For every op of the node and every operand binding naming a tensor the
-/// program windows at a column corner, the binding's `offset_elems` must be that window's corner in
-/// the tensor's storage ([`chunk_corner`]); the node's ops must start at least one write at the
-/// output's corner. A body that ignores `c_start` cannot produce a bundle: the door returns this `Err`
-/// and the bake fails naming the op.
+/// program windows at a corner — a COLUMN corner, or the ROW corner of a banded window, which the
+/// windowed pointwise emission places the same way — the binding's `offset_elems` must be that
+/// window's corner in the tensor's storage (`rc_of` over the region's own view, the plane term
+/// `c/64·v_rows·64` plus the row term; at row 0 it is the column corner alone); the node's ops must
+/// start at least one write at the output's corner. A body that ignores a stated corner cannot
+/// produce a bundle: the door returns this `Err` and the bake fails naming the op.
 ///
-/// A whole-tensor node (every corner 0) passes without looking, so nothing that is not column-blocked
+/// A whole-tensor node (every corner 0) passes without looking, so nothing that is not windowed
 /// pays for it.
 pub fn column_windows_are_honoured(
     name: &str,
     r: &[Region],
     ops: &[EmittedOp],
 ) -> Result<(), Error> {
-    let windowed: Vec<&Region> = r.iter().filter(|x| x.c_start != 0).collect();
+    let windowed: Vec<&Region> = r
+        .iter()
+        .filter(|x| x.c_start != 0 || x.r_start != 0)
+        .collect();
     if windowed.is_empty() {
         return Ok(());
     }
     for x in windowed {
         let rows = x.v_rows;
-        let want = chunk_corner(rows, x).into_raw_elems();
+        let want =
+            crate::addr::rc_of(rows, x.v_cols, x.r_start, x.c_start, Df::Fp16).into_raw_elems();
         let buf = x.name();
         let mut seen = false;
         for op in ops {
@@ -1203,13 +1374,16 @@ pub fn column_windows_are_honoured(
                 if b.offset_elems != want {
                     return err(format!(
                         "{name}: op `{}` addresses t{} at element {} of its buffer, but the program \
-                         windows that tensor at column {} — element {want} of its `[{rows}, {}]` \
-                         storage. A column-blocked piece that does not address its own window \
-                         recomputes another piece's columns and leaves its own unwritten.",
+                         windows that tensor at rows {}..{} × columns {}..{} — element {want} of its \
+                         `[{rows}, {}]` storage. A windowed piece that does not address its own \
+                         window recomputes another piece's bytes and leaves its own unwritten.",
                         op.op_name,
                         x.tid,
                         b.offset_elems,
+                        x.r_start,
+                        x.r_start + x.r_len,
                         x.c_start,
+                        x.c_start + x.c_len,
                         x.c_start + x.c_len,
                     ));
                 }
@@ -1217,8 +1391,11 @@ pub fn column_windows_are_honoured(
         }
         if x.is_out && !seen {
             return err(format!(
-                "{name}: the program writes t{} at column window {}..{}, and no emitted op names it",
+                "{name}: the program writes t{} at rows {}..{} × columns {}..{}, and no emitted op \
+                 names it",
                 x.tid,
+                x.r_start,
+                x.r_start + x.r_len,
                 x.c_start,
                 x.c_start + x.c_len,
             ));
@@ -1227,24 +1404,13 @@ pub fn column_windows_are_honoured(
     Ok(())
 }
 
-/// ⭐ WHERE A COLUMN-BLOCKED PIECE's WINDOW STARTS in its stick-blocked `[rows, full]` storage — the
-/// device element offset of column `out.c_start`, `(c/64)·(rows·64)`, through the address nest. The ONE
-/// spelling for every pointwise body whose pieces share one output tensor (`elementwise`'s dense arm,
-/// `scalarmul_scaled`); `full` is the storage's width (`c_start + c_len`), because the nest's row
-/// stride is a property of the storage, not of this piece's view. Zero for a whole-tensor region.
-fn chunk_corner(rows: u32, out: &Region) -> crate::addr::DevOff {
-    crate::addr::col_of(
-        rows,
-        out.c_start + out.c_len,
-        pointwise_chunk_out_offset(out.c_start),
-        Df::Fp16,
-    )
-}
-
-/// [`chunk_corner`] as a [`crate::addr::ColWindow`] — the same element, carrying the fact that a
-/// column-blocked piece is a whole-stick window of its stick-major storage, so the door presents it
-/// rank-2 stick-major and the work-division law reaches it (#622). `Err`, naming the op, when the
-/// piece's corner is not a whole stick.
+/// ⭐ A COLUMN-BLOCKED PIECE's WINDOW as a [`crate::addr::ColWindow`] — the device element offset of
+/// column `c_start` in its stick-blocked `[rows, full]` storage, `(c/64)·(rows·64)` through the
+/// address nest (`full` the storage's width `c_start + c_len`, because the nest's row stride is a
+/// property of the storage, not of this piece's view), carrying the fact that a column-blocked
+/// piece is a whole-stick window of its stick-major storage, so the door presents it rank-2
+/// stick-major and the work-division law reaches it (#622). `Err`, naming the op, when the piece's
+/// corner is not a whole stick.
 fn chunk_window(name: &str, rows: u32, out: &Region) -> Result<crate::addr::ColWindow, Error> {
     crate::addr::col_window_of(
         rows,
@@ -1255,6 +1421,45 @@ fn chunk_window(name: &str, rows: u32, out: &Region) -> Result<crate::addr::ColW
     .map_err(|e| Error {
         message: format!("{name}: {e}"),
     })
+}
+
+/// ⭐ THE CORNER OF A BANDED WINDOW — a row AND column corner of a stick-blocked view, the
+/// per-operand spelling the banded family's emission addresses through (`In::sliced` on the read
+/// side, `OutCorner::At` on the write). A rope copy's window is `[band, 64]` at `(r_start, 0)` or
+/// `(r_start, 64)` of its `[v_rows, 128]` view; the corner is that rectangle's first element in
+/// the view's own nest, `rc_of` — the parent's plane stride `v_rows·64` and row stride `64` both
+/// stated by the VIEW, never by the window.
+///
+/// ⛔⛔ SINGLE-STICK ONLY, AND THIS IS GEOMETRY, NOT TASTE. A window at a nonzero row corner is
+/// addressable only while it stays inside ONE column plane of the parent: the parent strides its
+/// planes `v_rows·64` apart while the window's own `[rows, c_len]` stick-major view strides them
+/// `rows·64`, so a multi-stick window's second plane lands `rows·64` from the first in the window
+/// and `(v_rows − rows)·64` further in the parent — not contiguous, and no flat or stick-major
+/// presentation reaches both planes at once. A sub-stick width mis-strides the rows the same way
+/// (`rows·c_len` against the parent's `rows·64`). The card-proven precedents for this exact form
+/// are the rotate-half halves and the per-head attention blocks — `[rows, 64]` rectangles at a
+/// corner of a wider view — and the band lift adds only the row term to that corner. Anything
+/// wider than one stick at a row corner is refused BY NAME, here, where the geometry says so.
+fn band_corner(name: &str, rows: u32, x: &Region) -> Result<crate::addr::DevOff, Error> {
+    if x.c_len != FP16_ELEMS_PER_STICK || !x.c_start.is_multiple_of(FP16_ELEMS_PER_STICK) {
+        return err(format!(
+            "{name}: t{}'s window is `[{}, {}]` at column {} of its `[{}, {}]` view, at row \
+             corner {} — a banded window is addressable only as ONE WHOLE \
+             {FP16_ELEMS_PER_STICK}-element stick at a whole-stick column: the parent strides its \
+             column planes `v_rows·64` elements apart while a window of {rows} rows would stride \
+             its own `rows·64`, so a multi-stick window's planes are not contiguous in the parent, \
+             and a sub-stick width mis-strides every row. Widen the sweep or keep the window at \
+             row 0, where the whole-stick column-window form reaches any width.",
+            x.tid, x.r_len, x.c_len, x.c_start, x.v_rows, x.v_cols, x.r_start,
+        ));
+    }
+    Ok(crate::addr::rc_of(
+        x.v_rows,
+        x.v_cols,
+        x.r_start,
+        x.c_start,
+        Df::Fp16,
+    ))
 }
 
 /// ⭐⭐⭐ THE PER-ROW CLASS — `[rows, 1]` elementwise, the running-max/alpha/denominator chain of an
@@ -5150,7 +5355,31 @@ pub fn split_out(
 ///
 /// `skip_tids` comes from [`gather_of`], i.e. from the program, never from a caller's assumption about
 /// which parameter is an index.
+///
+/// ⛔ EVERY OPERAND THESE BODIES EMIT IS BASE-ADDRESSED, so a stated row corner cannot ride one
+/// ([`base_addressed`]'s own argument). The windowed pointwise arm is the one emitter that CAN place a
+/// row corner, and it splits through [`split_regions`] directly — this guard is what keeps every other
+/// body from silently reading row 0 of a cornered operand.
 pub fn split_out_excluding(
+    name: &str,
+    r: &[Region],
+    layout: Option<&BundleLayout>,
+    arity: usize,
+    skip_tids: &[u32],
+) -> Result<(Vec<Region>, Region), Error> {
+    let (ins, out) = split_regions(name, r, layout, arity, skip_tids)?;
+    base_addressed(name, &out, "output")?;
+    for (i, x) in ins.iter().enumerate() {
+        base_addressed(name, x, &format!("input {i}"))?;
+    }
+    Ok((ins, out))
+}
+
+/// [`split_out_excluding`]'s SPLIT — the is_out/scale/skip filter and the arity check, with NO
+/// addressing guard. The door the windowed pointwise arm needs: its operands carry row corners the
+/// per-operand window emission places, so which operands are inputs is a fact about the parameter
+/// list, not about how any one body addresses them.
+fn split_regions(
     name: &str,
     r: &[Region],
     layout: Option<&BundleLayout>,
@@ -5176,11 +5405,6 @@ pub fn split_out_excluding(
             "{name}: {} tensor input(s) for an op that reads {arity}",
             ins.len()
         ));
-    }
-    // Every operand these bodies emit is base-addressed; a stated row corner cannot ride one.
-    base_addressed(name, &out, "output")?;
-    for (i, x) in ins.iter().enumerate() {
-        base_addressed(name, x, &format!("input {i}"))?;
     }
     Ok((ins, out))
 }
@@ -5627,11 +5851,13 @@ mod elementwise_tests {
         ];
         for o in EXTENTS {
             let out = reg(7, o.0, o.1, true);
-            // UNARY: one input, so the quantifier is exercised at arity 1.
+            // UNARY: one input, so the quantifier is exercised at arity 1. The basis is the
+            // output's own rows — `reg` mints a whole-view region, the shape `pointwise_rows`
+            // reads `v_rows` off.
             for a in EXTENTS {
                 let ins = [reg(5, a.0, a.1, false)];
                 assert_eq!(
-                    pointwise_extents_agree("p", Elementwise::Silu, &ins, &out).is_ok(),
+                    pointwise_extents_agree("p", Elementwise::Silu, &ins, &out, o.0).is_ok(),
                     a == o,
                     "unary out={o:?} in={a:?}"
                 );
@@ -5641,7 +5867,7 @@ mod elementwise_tests {
                 for b in EXTENTS {
                     let ins = [reg(5, a.0, a.1, false), reg(6, b.0, b.1, false)];
                     assert_eq!(
-                        pointwise_extents_agree("p", Elementwise::Add, &ins, &out).is_ok(),
+                        pointwise_extents_agree("p", Elementwise::Add, &ins, &out, o.0).is_ok(),
                         a == o && b == o,
                         "binary out={o:?} in0={a:?} in1={b:?}"
                     );
@@ -5851,11 +6077,15 @@ mod elementwise_tests {
         }
     }
 
-    /// ⛔ UNEQUAL CORNERS ARE REFUSED, not zipped: the tiling front end mints ONE window shared
-    /// by every operand of a chunk, so a producer that windowed operands by hand is a shape this
-    /// door names rather than guessing which corner to use.
+    /// ⭐ UNEQUAL CORNERS ARE CARRIED PER-OPERAND, not refused: a rotate-half rope pairs the
+    /// halves' windows over ONE view (`x1` at columns `[0, 64)` against `x2` at `[64, 128)` of the
+    /// same tensor), and each product's operands sit at their OWN corners — no single shared
+    /// corner states that. The law here used to refuse every unequal pair, because the tiling
+    /// front end mints one window per operand set and nothing else was known to reach the arm;
+    /// the per-operand window emission makes the corner an operand fact, and the class law
+    /// ([`column_windows_are_honoured`]) is what holds each binding to its own region's corner.
     #[test]
-    fn unequal_input_corners_are_refused_by_name() {
+    fn unequal_input_corners_are_carried_per_operand() {
         let rows = 25u32;
         let r = vec![
             chunked(5, rows, 8192, 7168, 15360, false),
@@ -5863,13 +6093,27 @@ mod elementwise_tests {
             chunked(7, rows, 8192, 7168, 15360, true),
         ];
         let mut sym = 0i64;
-        let Err(e) = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None) else {
-            panic!("operands at different corners must refuse, not pick one")
+        let ops = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None)
+            .expect("operands at different corners lower, each at its own");
+        // The class law holds every binding to its OWN region's corner — t6 at 0, t5 and the
+        // output at the stick-block corner of column 8192.
+        column_windows_are_honoured("mul_s23", &r, &ops)
+            .expect("each operand is addressed at its own corner");
+        let off = |ops: &Vec<EmittedOp>, buf: String| {
+            ops[0]
+                .arg_bindings
+                .iter()
+                .find(|b| b.buffer == buf)
+                .unwrap_or_else(|| panic!("a binding for {buf}"))
+                .offset_elems
         };
-        assert!(
-            e.message.contains("t6@0"),
-            "names the operand and its corner: {}",
-            e.message
+        assert_eq!(off(&ops, r[1].name()), 0, "t6 reads at its own corner 0");
+        let corner = (8192 / FP16_ELEMS_PER_STICK) * rows * FP16_ELEMS_PER_STICK;
+        assert_eq!(off(&ops, r[0].name()), corner, "t5 reads at its own corner");
+        assert_eq!(
+            off(&ops, r[2].name()),
+            corner,
+            "the output writes its own corner"
         );
     }
 
@@ -6047,7 +6291,7 @@ mod elementwise_tests {
             panic!("a piece written at the buffer base must be refused")
         };
         assert!(
-            e.message.contains("t7") && e.message.contains("column 8192"),
+            e.message.contains("t7") && e.message.contains("columns 8192..16384"),
             "names the tensor and its window: {}",
             e.message
         );
@@ -6662,9 +6906,9 @@ pub fn scalarweightmul(
 ) -> Result<Vec<EmittedOp>, Error> {
     // x, the weight, and the output — the parameters `KtirFunc::scalar_weight_mul` mints.
     let (tensors, out) = split_out(name, r, layout, 2)?;
-    pointwise_extents_agree(name, Elementwise::Mul, &tensors[0..1], &out)?;
-    check_pointwise_cols(out.c_len, "ScalarWeightMul", out.tid)?;
     let rows = node_rows(name, &out)?;
+    pointwise_extents_agree(name, Elementwise::Mul, &tensors[0..1], &out, rows)?;
+    check_pointwise_cols(out.c_len, "ScalarWeightMul", out.tid)?;
     let cols = out.c_len;
     let x = tensors[0].name();
     let w = tensors[1].name();
