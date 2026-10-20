@@ -4727,36 +4727,6 @@ impl SeqPos {
     }
 }
 
-/// ⭐⭐⭐ THE SUB-PAGE INDEX BANK — the `[E, S]` const table the fine expert gather's index is
-/// minted from (see [`crate::reserved_tids::expert_subpage_bank_tid`]): stick `e` holds the `S`
-/// values `e·S + s`, `s < S`, one u32 each. A gather OF this bank by the router's raw expert-id
-/// index copies whole sticks, so the result's flat lane `j` is `e_{j/S}·S + j%S` — the fine
-/// entry that names (expert, sub-page), the composition the sub-paged weight gather addresses
-/// its cut pages by.
-///
-/// ⭐ A LAYOUT LAW SHARED BY THE EMITTER AND THE WORKER, like
-/// [`decode_batch_prefix_mask_f16`]: the placement pass mints the `[E, S]` footprint from the
-/// door's own `e_count`, and the worker's forward tape stages these bytes through the raw-i32
-/// bind — both sides must derive the same words from the same `e_count` or the fine gather
-/// addresses sub-pages that are not the router's experts'. Lives here (not the worker) because
-/// it is the door's own composition, stated once where both readers can see it.
-///
-/// `S` is [`CopyDims::ENTRIES_PER_OP`] — one u32 index stick — because the gather that copies
-/// this bank moves whole sticks (a sub-stick `out` extent would leave holes in the fine index's
-/// flat lane sequence). The values reach `E·S − 1` = 4095 at E=128, past fp16's exact-integer
-/// range of 2048, so the table is u32 and the bytes are the raw-i32 bind's own LITTLE-ENDIAN
-/// wire form.
-pub fn expert_subpage_index_bank(e_count: u32) -> Vec<u8> {
-    let sub = CopyDims::ENTRIES_PER_OP;
-    let mut out = Vec::with_capacity(e_count as usize * sub as usize * 4);
-    for e in 0..e_count {
-        for s in 0..sub {
-            out.extend_from_slice((e * sub + s).to_le_bytes().as_slice());
-        }
-    }
-    out
-}
-
 /// THE DECODE-BATCH PREFIX MASK, staged in the device's own f16 — the whole `ATTN_MASK_TID` buffer for
 /// a batch of `hists.len()` requests, blocked by the grid's own [`MaskBlockForm`].
 ///
