@@ -2138,8 +2138,7 @@ impl AsyncEngine {
                 if let Some((prev_sched, prev_output)) = deferred.take() {
                     match client.finalize_step(&prev_sched, &prev_output) {
                         Ok(outputs) => {
-                            let stop_string_finished =
-                                route_step_outputs(&requests, outputs).await;
+                            let stop_string_finished = route_step_outputs(&requests, outputs).await;
                             // A stop string finished a request the engine is still decoding —
                             // abort it there, or it runs on to max_tokens under the next
                             // request's steps (#711).
@@ -4704,7 +4703,11 @@ mod tests {
         let detok = Some((Some("Century".to_string()), Some("…Cent".to_string())));
         let to_abort =
             AsyncEngine::process_outputs_phase3(&mut requests, vec![output], vec![detok]);
-        assert_eq!(to_abort, vec!["req-1".to_string()], "the engine still holds req-1");
+        assert_eq!(
+            to_abort,
+            vec!["req-1".to_string()],
+            "the engine still holds req-1"
+        );
         assert_eq!(requests["req-1"].finish_reason, Some(FinishReason::Stop));
         assert_eq!(
             requests["req-1"].stop_reason,
@@ -5768,6 +5771,9 @@ mod tests {
         engine
     }
 
+    /// The stop-string abort test's shared id recorders (added ids, aborted ids).
+    type IdLog = Arc<std::sync::Mutex<Vec<String>>>;
+
     /// A client whose every request decodes to text containing the stop word, and which records
     /// every abort it is asked for. The stop word finishes each request API-side while the
     /// engine-side request would decode on to max_tokens: the step loop must abort it there
@@ -5776,19 +5782,13 @@ mod tests {
         /// The stop word's token ids, ENCODED by the same tokenizer the engine detokenizes with
         /// (the test vocab is the sorted byte-level alphabet, so an id is not its byte value).
         stop_word_tokens: Vec<u32>,
-        added: Arc<std::sync::Mutex<Vec<String>>>,
-        aborted: Arc<std::sync::Mutex<Vec<String>>>,
+        added: IdLog,
+        aborted: IdLog,
         emitted: std::sync::Mutex<std::collections::HashSet<String>>,
     }
 
     impl StopStringClient {
-        fn new(
-            stop_word_tokens: Vec<u32>,
-        ) -> (
-            Self,
-            Arc<std::sync::Mutex<Vec<String>>>,
-            Arc<std::sync::Mutex<Vec<String>>>,
-        ) {
+        fn new(stop_word_tokens: Vec<u32>) -> (Self, IdLog, IdLog) {
             let added = Arc::new(std::sync::Mutex::new(Vec::new()));
             let aborted = Arc::new(std::sync::Mutex::new(Vec::new()));
             (
@@ -5921,16 +5921,26 @@ mod tests {
         engine.spawn_step_loop();
 
         let mut request = make_chat_request();
-        request.stop = Some(protocol::StopCondition::Multiple(vec!["country".to_string()]));
+        request.stop = Some(protocol::StopCondition::Multiple(vec![
+            "country".to_string(),
+        ]));
         request.max_tokens = Some(50);
 
-        let a = tokio::time::timeout(Duration::from_secs(10), engine.chat_completion(request.clone()))
-            .await
-            .expect("request A timed out — the stop string never finished it")
-            .expect("request A failed");
+        let a = tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.chat_completion(request.clone()),
+        )
+        .await
+        .expect("request A timed out — the stop string never finished it")
+        .expect("request A failed");
         assert_eq!(a.choices[0].finish_reason.as_deref(), Some("stop"));
         assert!(
-            !a.choices[0].message.content.as_deref().unwrap_or("").contains("country"),
+            !a.choices[0]
+                .message
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("country"),
             "the reply is truncated at the stop string"
         );
 
