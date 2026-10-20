@@ -19,7 +19,8 @@
 //!   view, so a gap would compute rows the program never states).
 //! * ⛔ AN OVERLAP refuses by name — same law, the mirrored failure.
 //! * A COLUMN-CHUNKED pair (several windows at the SAME rows) is NOT a row family: the fold
-//!   stays out of it and the walk answers exactly what it answered before the fold existed.
+//!   stays out of it, and the walk lowers each block as its own op at its own column corner
+//!   (#722's per-operand column windows — the legalization this pair is the witness for).
 //! * THE BARE SILU folds too: its terminal is the longhand's own `arith.divf` (the stored
 //!   `silu(x)`, no `up` multiply), one input per block — the chain reader's second terminal
 //!   form, not a per-op divide family.
@@ -427,30 +428,90 @@ fn an_overlap_between_row_windows_refuses_by_name() {
 
 /// ⭐ A COLUMN-CHUNKED PAIR IS NOT A ROW FAMILY. Two `[64, 64]` windows at the SAME rows and
 /// different columns are the column-chunked shape, and the fold must stay out of it — the
-/// blocks tile the COLUMN axis, which the row fold does not own. The walk then answers exactly
-/// what it answered before the fold existed (the per-op column-corner law, which a
-/// one-function column pair has always violated), proving the fold neither engaged nor
-/// changed the outcome.
+/// blocks tile the COLUMN axis, which the row fold does not own. The walk lowers each block
+/// AS ITS OWN OP at its own column corner — #722's per-operand column windows legalized
+/// exactly this pair, which the pre-#722 walk refused at its one-function column-corner law —
+/// so the answer is TWO ops, never the fold's one.
 #[test]
 fn a_column_chunked_pair_is_not_a_row_family() {
     let view = (64, 128);
     let k = add_family(view, &[(0, 64, 0, 64), (0, 64, 64, 64)]);
-    let e = match lowered(&k, view) {
-        Err(e) => e,
-        Ok(ops) => panic!(
-            "a one-function column-chunked pair kept its pre-fold behavior, which is a refusal — \
-             got {} op(s)",
+    let ops = lowered(&k, view).expect(
+        "a column-chunked pair lowers as two ops at their own column corners — #722's \
+         per-operand column windows legalized exactly this pair",
+    );
+    let [op0, op1] = &ops[..] else {
+        panic!(
+            "the fold must stay out of a column family — the blocks tile the COLUMN axis, \
+             which the row fold does not own, so two blocks are TWO ops. Got {}",
             ops.len()
-        ),
+        );
     };
-    assert!(
-        !e.contains("TILE the view"),
-        "the row fold must not engage on a column family, got: {e}"
+    // EACH OP IS THE FAMILY'S OWN ADD at its own chunk: the iteration space is the block's
+    // own `[64, 64]` window, never the view's 128 cols — that whole-view descriptor is the
+    // FOLD's emission, and the fold must not engage here.
+    for op in [op0, op1] {
+        assert_eq!(op.op_name, "add_o403", "each op is the family's one add");
+        assert_eq!(op.time, 1, "a per-op lowering emits no tiling of its own");
+        let d = dsc(op);
+        assert_eq!(
+            (d.N_.mb_, d.N_.out_),
+            (64, 64),
+            "each op's iteration space is its OWN `[64, 64]` chunk — the view's 128 cols would \
+             be the fold's one whole-view descriptor"
+        );
+    }
+    // EACH AT ITS OWN CORNER: every tensor the two descriptors share — `a`, `b`, and `out` —
+    // starts one CHUNK higher in op 1, the same constant on every core. That constant is the
+    // column corner 64 in the `[64, 128]` stick-major buffer's bytes: 64 rows · 64 elements ·
+    // 2 B = 8192, the second stick-group's base. The same corner on both ops would state the
+    // same addresses; the fold's one descriptor would state them once.
+    fn per_tensor_addresses(
+        op: &ktir_superdsc::emit::EmittedOp,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> {
+        let mut out = std::collections::BTreeMap::new();
+        for n in &dsc(op).scheduleTree_ {
+            if n.nodeType_ != "allocate" {
+                continue;
+            }
+            let cores = n
+                .startAddressCoreCorelet_
+                .data_
+                .iter()
+                .map(|(core, addr)| {
+                    (
+                        core.clone(),
+                        addr.parse::<u64>()
+                            .expect("an address is an integer string"),
+                    )
+                })
+                .collect();
+            out.insert(n.name_.clone(), cores);
+        }
+        out
+    }
+    let a0 = per_tensor_addresses(op0);
+    let a1 = per_tensor_addresses(op1);
+    assert_eq!(
+        a0.len(),
+        3,
+        "the pair's descriptors allocate the family's three tensors"
     );
-    assert!(
-        e.contains("unequal corners"),
-        "the walk's own column-corner law answers, as it did before the fold, got: {e}"
-    );
+    for (name, cores0) in &a0 {
+        let cores1 = a1
+            .get(name)
+            .unwrap_or_else(|| panic!("tensor {name} is allocated by both ops"));
+        for (core, addr0) in cores0 {
+            let addr1 = cores1[core];
+            assert_eq!(
+                addr1 - addr0,
+                8192,
+                "tensor {name} core {core}: op 1's chunk starts one corner higher — 64 rows · \
+                 64-col corner · 2 B, the second stick-group's base in the `[64, 128]` \
+                 stick-major buffer. The same corner on both ops would state the same address"
+            );
+        }
+    }
 }
 
 /// ⭐ THE BARE SILU FOLDS AS THE CHAIN'S UNARY FORM. Two `[32, 128]` blocks of the five-op
