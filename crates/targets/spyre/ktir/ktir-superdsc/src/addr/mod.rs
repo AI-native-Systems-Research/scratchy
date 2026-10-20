@@ -26,6 +26,9 @@
 pub mod shape;
 pub use shape::{Gqa, PadRows, Rows, Shape, Slabs};
 
+mod window;
+pub use window::Win;
+
 use crate::sdsc_abstract::{ElementArrangement, SpyreTensorLayout};
 use crate::superdsc_opspec::Df;
 
