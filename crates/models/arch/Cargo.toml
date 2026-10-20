@@ -677,6 +677,13 @@ metal = [
     "dep:scratchy-target-metal",
     "scratchy-vision?/metal",
 ]
+# NVIDIA CUDA. Builds no model yet: the build script refuses every arch (`CUDA_CAPABLE` in
+# scratchy-forwards.rs is empty) until one lowers.
+cuda = [
+    "scratchy-forward-compiler-macro/cuda",
+    "scratchy-forward-compiler/cuda",
+    "dep:scratchy-target-cuda",
+]
 # A CARD: the macro compiles the device image from the bundle's KTIR at bake time.
 spyre-hw = ["spyre", "scratchy-forward-compiler-macro/spyre-hw"]
 # THE EMULATOR + the bake-time numeric gate (see the macro crate's `spyre-emu`):
@@ -711,6 +718,7 @@ scratchy-quantizations = { path = "../quantization" }
 scratchy-forward-compiler = { path = "../../compiler" }
 scratchy-target-metal = { path = "../../targets/metal", optional = true }
 scratchy-target-spyre = { path = "../../targets/spyre", optional = true }
+scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
 scratchy-vision = { path = "../vision", optional = true }
 half = { workspace = true, optional = true }
 anyhow = { workspace = true }

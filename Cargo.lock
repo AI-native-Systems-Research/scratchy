@@ -3515,6 +3515,7 @@ dependencies = [
  "scratchy-forward-compiler",
  "scratchy-ir",
  "scratchy-subtile",
+ "scratchy-target-cuda-compiler",
  "scratchy-target-metal",
  "scratchy-target-metal-compiler",
  "scratchy-target-spyre",
@@ -3565,6 +3566,7 @@ dependencies = [
  "scratchy-forward-compiler-macro",
  "scratchy-layers",
  "scratchy-quantizations",
+ "scratchy-target-cuda",
  "scratchy-target-metal",
  "scratchy-target-spyre",
  "scratchy-tensors",
@@ -3751,6 +3753,21 @@ dependencies = [
  "scratchy-ir",
  "scratchy-spyre-bundle",
  "serde_json",
+]
+
+[[package]]
+name = "scratchy-target-cuda"
+version = "0.1.0"
+dependencies = [
+ "scratchy-subtile",
+]
+
+[[package]]
+name = "scratchy-target-cuda-compiler"
+version = "0.1.0"
+dependencies = [
+ "scratchy-subtile",
+ "scratchy-target-cuda",
 ]
 
 [[package]]

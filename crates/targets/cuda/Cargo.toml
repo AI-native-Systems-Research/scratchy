@@ -1,0 +1,14 @@
+[package]
+name = "scratchy-target-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NVIDIA CUDA backend for scratchy: the per-opcode ABI as declared data. No GPU toolchain yet."
+
+# The runtime side of the CUDA target. Today it holds only the const ABI tables the shared passes
+# take as input (`op_abi`) and the step type opcode lowering produces (`step`): no kernels, no
+# device, no `build.rs`, so it compiles anywhere, with no nvcc and no GPU.
+[dependencies]
+# The SHARED front end and passes. CUDA lowers the same `SubtileTape` metal and spyre lower; the
+# tables here are inputs to `tape_colouring`, `tape_folding` and `sample_rows`.
+scratchy-subtile = { path = "../../compiler/subtile" }

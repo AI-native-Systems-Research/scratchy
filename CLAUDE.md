@@ -58,7 +58,8 @@ cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
   `-Fquant/<preset>` only if the change is quant-specific. Never build
   `model/<arch>` or `model/all` just to test one thing — that forward-expands
   every config in scope (minutes-to-hours, OOM risk on a laptop).
-- `metal` and `spyre` are mutually exclusive.
+- `cuda`, `metal` and `spyre` are mutually exclusive. `cuda` builds no model
+  yet: `scratchy-models`' build script refuses every arch until one lowers.
 - Multimodal (vision arches + the `image`/`scratchy-vision` decode stack) is
   opt-in via the `multimodal` feature on `scratchy-cli` (on by default
   there) — a plain `chat`-only build never compiles image/png/zune-jpeg/etc.
@@ -75,7 +76,10 @@ check/clippy don't link the C++ shim). Both metal crates are excluded because
 they depend unconditionally on Apple-only `objc2` — the
 compiler crate via its own edge to scratchy-target-metal — and `--workspace`
 builds every member as a root regardless of `--features`, so excluding only
-one of the two still drags `objc2` onto Linux); the **macOS** job
+one of the two still drags `objc2` onto Linux). Its "CUDA scaffold" step then
+lints `scratchy-target-cuda`/`scratchy-target-cuda-compiler` (`--all-targets`)
+and the macro under `--features cuda`, and runs the two CUDA crates' tests — no
+nvcc, no GPU. The **macOS** job
 runs `cargo clippy -p scratchy-models --features metal,all,mtp,turboquant -- -D warnings`
 + kernel tests (`mtp` adds the multi-token-prediction head of every model whose
 checkpoint carries one: heads have no configs of their own, so `all` alone

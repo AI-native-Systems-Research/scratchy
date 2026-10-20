@@ -13026,7 +13026,7 @@ pub fn emit_model(
     // is already target-neutral (`crate::__gpu::layers::*`, where `__gpu` is
     // the per-target alias), so the same fields compile and load on any
     // backend.
-    #[cfg(all(feature = "spyre", not(feature = "metal")))]
+    #[cfg(not(feature = "metal"))]
     let (weights, weights_affine_rows) = {
         let lowered = workloads
             .iter()
@@ -13083,7 +13083,10 @@ pub fn emit_model(
         // The id → FIELD binding, emitted INTO THE SAME MODULE as the struct so
         // its arms can name `w.self_attn_q_proj[3]` directly. This is what the
         // worker's `"{disk}.weight"` lookup is replaced by; only generated code
-        // can name a generated field.
+        // can name a generated field. Spyre's alone: no other backend binds through it.
+        #[cfg(not(feature = "spyre"))]
+        let bindings = quote! {};
+        #[cfg(feature = "spyre")]
         let bindings = match (lowered.as_ref(), tw.as_ref()) {
             (Some(l), Some(t)) => crate::weight_bindings::emit_weight_bindings(l, program, t)
                 .unwrap_or_else(|e| panic!("[weight-bindings] {}: {e}", model.source_stem)),

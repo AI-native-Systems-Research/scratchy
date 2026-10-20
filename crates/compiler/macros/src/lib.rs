@@ -19,6 +19,10 @@
 
 use std::path::Path;
 
+#[cfg(all(feature = "cuda", feature = "metal"))]
+compile_error!("features 'cuda' and 'metal' are mutually exclusive — enable exactly one backend");
+#[cfg(all(feature = "cuda", feature = "spyre"))]
+compile_error!("features 'cuda' and 'spyre' are mutually exclusive — enable exactly one backend");
 #[cfg(all(feature = "metal", feature = "spyre"))]
 compile_error!("features 'metal' and 'spyre' are mutually exclusive — enable exactly one backend");
 
@@ -664,7 +668,7 @@ pub fn compile_carrier(
         )
     })?;
 
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
+    #[cfg(not(any(feature = "cuda", feature = "metal", feature = "spyre")))]
     compile_error!(
         "scratchy-forward-compiler-macro requires a backend feature: 'cuda', 'metal', or 'spyre'"
     );

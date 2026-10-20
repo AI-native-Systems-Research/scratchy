@@ -20,6 +20,7 @@ live-stats = []
 serve = ["dep:axum", "dep:tower-http", "dep:http", "tokio/net"]
 otel = ["scratchy-core-common/otel"]
 metal = ["scratchy-serving-worker/metal", "scratchy-forward-compiler/metal"]
+cuda = ["scratchy-serving-worker/cuda", "scratchy-forward-compiler/cuda"]
 spyre = ["scratchy-serving-worker/spyre"]
 # A card, and the emulator — siblings, forwarded to the worker's own tiers. Both also enable
 # the plain `spyre` above (mirroring the worker's own feature tree, where they are its
