@@ -236,7 +236,7 @@ pub fn matmul_b_orientation(
 ///  * a PRESENTED weight — the HOST stage, once, at bake time (`stage_2d(&StickLayout::kernel(k, n),
 ///    ..)`, `sdsc_abstract.rs:2124`). Free at inference, and the whole regression bar is this case.
 ///  * a CACHE — the DEVICE, writing it already transposed (`kcache_kt_write_offset`), which is why the
-///    shipped attention pays for a third physical Kᵀ plane (`assemble_restickify_kt_2d`) rather than
+///    shipped attention pays for a third physical Kᵀ plane (`assemble_restockify_kt_2d`) rather than
 ///    relabelling the one it has. **The relayout exists to MAKE a `[k, n]` buffer, never to consume
 ///    one.**
 ///
@@ -1205,8 +1205,9 @@ struct Bcast {
 /// stated in its own refusal: the SEEDED whole-tensor builder cannot say "broadcast", and the
 /// `EwOperand` builders can.
 ///
-/// This recogniser therefore returns, for each broadcast RESULT, the source value a consumer should
-/// read and the axis — and the `consumed` set of every value the chain minted, which no descriptor
+/// This recogniser therefore returns, for each value the chain mints (the broadcast's result AND
+/// its interior — see the keying law at the bottom), the source value a consumer should read and
+/// the axis — and the `consumed` set of every value the chain minted, which no descriptor
 /// lowers. It is the same rank walk [`program_rmsnorm_chains`] already does for its `rsqrt` and its
 /// gain (through the same three op kinds, to depth 3); this generalises it to any consumer.
 ///
@@ -1218,7 +1219,11 @@ struct Bcast {
 /// data movement the pointwise operand modes cannot express. Those are named, not treated as
 /// broadcasts. The `expand_shape`'s own `TargetShape` and the `linalg.broadcast`'s `Dimensions` state
 /// the axis INDEPENDENTLY, so they are cross-checked: a program where they disagree is not a
-/// broadcast this door understands.
+/// broadcast this door understands. And a source that is ALREADY rank-2 needs no expand at all —
+/// its own type states the vector-ness when it is degenerate on the sprayed axis (the arm the
+/// walk-back's `type_degenerate` check reads, for the pipeline-emitted broadcasts over `[m, 1]` /
+/// `[1, n]` operands); a rank-1 source keeps needing the expand, because `[n]` alone does not say
+/// which vector it is.
 fn program_broadcast_chains(
     f: &IRFunction<'static>,
 ) -> Result<
@@ -1332,38 +1337,63 @@ fn program_broadcast_chains(
             };
             cursor = next;
         }
-        if !saw_degenerate_expand {
-            // ⭐ THE SOURCE'S OWN LOAD IS A SECOND PROOF OF THE SAME FACT. An fp8 weight-scale chain
-            // does not spell the expand: the kernel loads the scale as a `[1, n]` WINDOW of its own
-            // parameter (`matmul_fp8.py`'s `ws_desc.load([0, 0])` over a `[1, n]` descriptor),
-            // collapses the degenerate dim away, and broadcasts the 1-D result down the rows. The
-            // load's OWN shape states the vector-ness the expand would have — extent 1 on the
-            // sprayed axis — because the window it names is the whole parameter. A source that is
-            // neither an expand-proven vector nor a load of extent 1 on the spray axis keeps the
-            // refusal below: its extent is unproven, and addressing it as a broadcast would read
-            // past its end.
-            let source_proves_vector = def_of(cursor).is_some_and(|d| {
-                d.op_type == OpKind::KtdpLoad
-                    && super::lower_ktir_to_superdsc::shape_2d(d).is_some_and(|(r, c)| match axis {
-                        BcastAxis::Mb => r == 1,
-                        BcastAxis::Col => c == 1,
-                    })
+        // ⭐⭐⭐ A RANK-2 SOURCE'S OWN TYPE IS THE SAME PROOF. A broadcast this pipeline emits
+        // over an ALREADY-rank-2 degenerate operand reaches this walk in two spellings, and the
+        // TYPE states the vector-ness for both:
+        // * `one_k_dot_to_mul`'s outer-product spelling widens `A [m, 1]` to `[m, n]` — a
+        //   COMPUTED value, collapse → `linalg.broadcast` with NO `tensor.expand_shape` anywhere
+        //   in the chain, because the source was never rank-1 and no expand ever existed to
+        //   insert the degenerate dim.
+        // * an fp8 weight-scale chain does not spell the expand either: the kernel loads the
+        //   scale as a `[1, n]` WINDOW of its own parameter (`matmul_fp8.py`'s
+        //   `ws_desc.load([0, 0])` over a `[1, n]` descriptor), collapses the degenerate dim
+        //   away, and broadcasts the result down the rows — the load's OWN result type states
+        //   the extent-1 the expand would have, because the window it names is the whole
+        //   parameter.
+        // For a rank-2 source the TYPE states the vector-ness itself: `[rows, 1]` can only be a
+        // per-row scalar and `[1, cols]` only a row vector (a `[1, 1]` is both, and the
+        // emission's operand-mode law refuses an axis its consumer cannot address). A RANK-1
+        // source keeps needing the expand: `[n]` alone does not say which vector it is.
+        let type_degenerate = def_of(cursor)
+            .and_then(|d| d.result_type)
+            .is_some_and(|t| match t {
+                ktir_core::irtype::IrType::Tensor { dims, .. } if dims.len() == 2 => match axis {
+                    BcastAxis::Col => dims[1] == 1,
+                    BcastAxis::Mb => dims[0] == 1,
+                },
+                _ => false,
             });
-            if !source_proves_vector {
-                return err(format!(
-                    "{}: a `linalg.broadcast` sprays along {axis:?} but its source is not reached \
-                     through a `tensor.expand_shape` that inserts a DEGENERATE dim, nor is it a load \
-                     whose own window has extent 1 on that axis. Either is the thing that says the \
-                     source IS a row or column vector, so without one the operand's extent is \
-                     unproven and addressing it as a broadcast would read past its end.",
-                    f.name
-                ));
-            }
+        if !saw_degenerate_expand && !type_degenerate {
+            return err(format!(
+                "{}: a `linalg.broadcast` sprays along {axis:?} but its source is neither \
+                 reached through a `tensor.expand_shape` that inserts a DEGENERATE dim nor \
+                 itself a rank-2 tensor degenerate on that axis — a computed `[m, 1]`, or a \
+                 load whose own window has extent 1 there. One of those two is the only thing \
+                 in the program that says the source IS a row or column vector, so without \
+                 either the operand's extent is unproven and addressing it as a broadcast \
+                 would read past its end.",
+                f.name
+            ));
         }
+        // ⭐⭐⭐⭐⭐ EVERY VALUE THE CHAIN MINTS IS THE SOURCE, ADDRESSED AS THIS BROADCAST — not only
+        // the `linalg.broadcast`'s own result. A second consumer of the same `m[:, None]` whose other
+        // operand already carries the degenerate shape needs NO spray op at all — Triton folds that
+        // broadcast into the binary op itself — so it reads the chain's INTERIOR (the
+        // `expand_shape`'s result, CSE'd with the first consumer's) directly. MEASURED on attn.py's
+        // decode arm: `qk_c - gmax[:, None]` is a `[1, swept]` tile and takes the broadcast, while
+        // `qk_d - gmax[:, None]` is a `[1, 1]` tile and reads the expand's result with no
+        // `linalg.broadcast` anywhere in its own chain. The expand/collapse pair moves no data, so
+        // every value in the chain IS the source viewed with the axis's degeneracy, and each is keyed
+        // with the same `Bcast`. The discipline is unchanged: the consumer's operand mode is still
+        // cross-examined against the region it resolves to — the walk's degenerate check below, and
+        // the emission's operand-mode law (`elementwise_broadcast`: a `Col` operand must carry the
+        // output's row count) — so a value keyed by an axis its consumer cannot address is refused
+        // by name, never mis-addressed.
+        let b = Bcast { src: cursor, axis };
         for v in chain {
             consumed.insert(v);
+            map.insert(v, b);
         }
-        map.insert(res, Bcast { src: cursor, axis });
     }
     Ok((map, consumed))
 }

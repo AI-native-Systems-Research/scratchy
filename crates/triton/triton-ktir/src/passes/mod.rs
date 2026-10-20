@@ -12,6 +12,7 @@ pub mod decompose_dense_constants;
 pub mod distribute_work;
 pub mod dot_to_linalg;
 pub mod legalize_types;
+pub mod one_k_dot_to_mul;
 pub mod plan_corelets;
 pub mod to_ktir;
 /// The second half of the KTDP -> KTIR stage: `to_ktir`'s rewrites, EMITTED as
