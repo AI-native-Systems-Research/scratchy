@@ -235,11 +235,22 @@ pub fn gather_of(k: &KtirNode) -> Result<Option<Gather>, Error> {
 /// operand, which the contract admits and the one-gather reading refuses only because it counts
 /// tiles instead of ops.
 ///
-/// The joins stay EXACTLY `gather_of`'s — same param walk, same self-reference refusal, same
-/// `entries` off the tile's own shape — with one added DISCRIMINATOR the single-gather reading
-/// never needed: every tile must name the SAME index and value parameters. Tiles over different
-/// pairs really would need two index operands on one descriptor-shaped op and are refused by name
-/// here rather than half-lowered; tiles over the same pair are the unrolled sweep's trips.
+/// ⭐⭐ AND THE PAIRS MAY DIFFER — the batched paged-decode shape. That kernel gathers TWO tables
+/// through ONE ids buffer: K^T whole pages and V whole pages, each feeding its own contraction,
+/// so its tiles span two (index, value) pairs in one function. This is safe for the same reason
+/// the unrolled sweep is: the one-index law is a PER-DESCRIPTOR fact, and the whole-function walk
+/// joins EACH op to its own tile by the identity of the gathered LOAD (`op_gather`), appending
+/// that tile's index region to THAT op's operand list — two ops gathering different tables are
+/// two descriptors, each carrying its own single index operand. The shapes that would violate the
+/// per-descriptor law are refused downstream, by name: an op reading a gathered value reaches the
+/// walk's ScalarMul-or-materialized rule, the materializer demands the gather be the matmul's B
+/// with exactly one consumer, and a tile no descriptor declares trips the uncarried check. None
+/// of those guards looks at a SECOND tile, so none is weakened by admitting one.
+///
+/// What the multi-pair reading DOES add is a fact the placement owns: the set of index buffers.
+/// A program may now state SEVERAL distinct index tids, and the layout sizes every one of them
+/// `SenUint32` (a 4 B/elem index is per-INDEX-BUFFER, not per-program), dtype-checks each, and
+/// gives each its flush-at-end fetch slack.
 ///
 /// A gather the walk below does not carry is still the silent-direct-read hazard `gather_of`'s
 /// comment names, so callers refuse an uncarried one exactly as before.
@@ -252,7 +263,6 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
         .filter(|o| o.op_type == OpKind::KtdpConstructIndirectAccessTile)
         .collect();
     let mut out: Vec<Gather> = Vec::with_capacity(tiles.len());
-    let tile_count = tiles.len();
     for tile in &tiles {
         // The SAME param walk `gather_of` runs, per tile — a closure over this tile's operands so
         // the two readings cannot disagree about which parameter a tile's view names.
@@ -386,24 +396,14 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
                 message: format!("{}: {msg}", f.name),
             })?
         };
-        // ⛔ THE ONE NEW DISCRIMINATOR: every tile must name the SAME parameter pair. A second
-        // pair really is two gathers on one descriptor-shaped program — the shape `gather_of`
-        // exists to refuse — and refusing it HERE names the pair instead of letting the walk
-        // half-materialize one of them.
-        if out
-            .first()
-            .is_some_and(|first| first.index_tid != index_tid || first.value_tid != value_tid)
-        {
-            return err(format!(
-                "{}: {} `ktdp.construct_indirect_access_tile` op(s) over {} different \
-                 index/value parameter pairs — one descriptor carries ONE index operand \
-                 (DSC2ToDataflowIR.cpp:51), so gathers over different buffers need one node \
-                 per gather. Tiles over the SAME pair (an unrolled sweep's trips) are fine.",
-                f.name,
-                tile_count,
-                out.len() + 1
-            ));
-        }
+        // ⭐ NO CROSS-TILE PAIR CHECK — deliberately. The one-index law is per DESCRIPTOR, and the
+        // walk below joins each op to its own tile by load identity, so two tiles over different
+        // pairs are two descriptors each carrying one index operand — the batched paged-decode
+        // shape (K^T and V gathered through one ids buffer). The per-op guards downstream (the
+        // ScalarMul-or-materialized rule, the materializer's B-side and single-consumer demands,
+        // the uncarried-tile check) are what enforce the law where it binds; a pair check HERE
+        // would refuse a shape those guards admit, which is how this reading used to stop one
+        // generalization short.
         // ⭐ THIS TILE'S GATHERED LOAD — the `ktdp.load` over the tile, found HERE so the value
         // travels with the gather. Exactly one load per tile: the tile IS the statement "the row
         // index is data", and a tile with no load states a gather nothing reads (refused below as
