@@ -427,6 +427,12 @@ pub enum AttrKey {
     /// `spyre.folded_grid_loop` -- THE LAUNCH CONTRACT: launch exactly `work_items`
     /// compute tiles, because the loop's zero-trip guard was folded away.
     FoldedGridLoop,
+    /// `spyre.unrolled_grid_loop` -- THE TRIP CONTRACT: `grid` was regridded to
+    /// `[num_cores]` by `fold_grid_work_loop`'s unroll arm and the body carries
+    /// `work_items / num_cores` copies per core, so every count of position-shaped
+    /// things downstream must multiply by the trip factor. `IntList [num_cores,
+    /// work_items]`.
+    UnrolledGridLoop,
     /// `spyre.canonical_verified` -- DotToLinalg's P1.0 trust tag.
     CanonicalVerified,
     /// `noinline`.
@@ -477,6 +483,7 @@ impl AttrKey {
             Grid => "grid",
             Reassociation => "reassociation",
             FoldedGridLoop => "spyre.folded_grid_loop",
+            UnrolledGridLoop => "spyre.unrolled_grid_loop",
             CanonicalVerified => "spyre.canonical_verified",
             Noinline => "noinline",
             Predicate => "predicate",
@@ -514,6 +521,7 @@ impl AttrKey {
             "grid" => Grid,
             "reassociation" => Reassociation,
             "spyre.folded_grid_loop" => FoldedGridLoop,
+            "spyre.unrolled_grid_loop" => UnrolledGridLoop,
             "spyre.canonical_verified" => CanonicalVerified,
             "noinline" => Noinline,
             "predicate" => Predicate,

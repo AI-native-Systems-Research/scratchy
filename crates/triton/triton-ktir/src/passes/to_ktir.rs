@@ -1209,7 +1209,10 @@ fn fold_grid_work_loop(module: &mut Module) -> Result<()> {
             // those trips, in order, and every work item is still covered exactly once. Unlike
             // the fold there is no zero-trip tile to invent a trip for, so there is no launch
             // obligation to record and `spyre.folded_grid_loop` is deliberately not set -- the
-            // same reasoning that applied when this arm left the loop alone.
+            // same reasoning that applied when this arm left the loop alone. The TRIP COUNT is
+            // a different fact and IS recorded, at the regrid below: it is a count obligation
+            // (`unroll_grid_positions` counts a parameter's windows against the positions),
+            // not a launch one.
             //
             // ⭐ WHY THE POSITION IS STILL ADDRESSABLE. The note above records that the grid
             // position must reach the scheduler either as an `scf.for`/`affine.for` induction
@@ -1331,8 +1334,27 @@ fn fold_grid_work_loop(module: &mut Module) -> Result<()> {
             // the loop FOLDS because one tile then runs per work item. Unrolled, `num_cores`
             // tiles launch and each covers `trips` work items, so leaving `grid` at `work_items`
             // would over-launch by the trip count -- here by 4x.
+            //
+            // ⭐ AND THE TRIP FACTOR IS A CONTRACT, NOT AN INFERENCE. `grid` now understates
+            // the position count: `num_cores` tiles each run `trips` work items, so the body
+            // holds `work_items` positions' worth of windows under an `n = num_cores` grid.
+            // `unroll_grid_positions` tells a parameter's partitioned windows from its swept
+            // ones BY COUNT against that `n`, so a factor that does not travel with the
+            // regrid makes the count silently wrong: a partitioned parameter's `n * trips`
+            // tiles read as a swept parameter's over-count and NOTHING materializes
+            // (MEASURED: the banded-attention twin at 64 positions, two trips -- the door's
+            // whole-view cover unions the store windows nothing wrote and the epilogue
+            // divide's extent check refuses). It travels as
+            // `spyre.unrolled_grid_loop = [num_cores, work_items]`, the same
+            // carry-the-numbers shape as the fold arm's launch contract: an obligation
+            // whose quantity the caller has to rediscover is most of the way to no
+            // obligation at all.
             if let Some(f) = module.ops.iter_mut().find(|o| o.kind == OpKind::FuncFunc) {
                 f.set_attr(AttrKey::Grid, Attr::IntList(vec![num_cores]));
+                f.set_attr(
+                    AttrKey::UnrolledGridLoop,
+                    Attr::IntList(vec![num_cores, work_items]),
+                );
             }
             continue;
         }
@@ -1796,7 +1818,9 @@ fn fold_index_arithmetic(module: &mut Module) {
 ///
 /// ⛔⛔ GRID-PARTITIONED BUFFERS ARE MATERIALIZED PER COPY; SWEPT BUFFERS ARE SHARED.
 /// The discriminator is read from the program after per-copy fold: a parameter whose copies
-/// state EXACTLY ONE access tile over its view, at a row corner that VARIES with the
+/// state EXACTLY ONE access tile per copy over its view (`trips` per copy when the grid
+/// work loop unrolled -- one per trip, see the trip contract at the head of the pass), at a
+/// row corner that VARIES with the
 /// position, is grid-partitioned -- each position owns a disjoint window (attention's Q and
 /// O: one [64, 128] window at `h*256 + m*64`). Such a corner is refused by `base_addressed`
 /// on every `rb`-addressed operand downstream, so each copy whose corner is nonzero gets a
@@ -1824,6 +1848,39 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
     if n <= 1 {
         return Ok(());
     }
+    // ⛔ THE TRIP CONTRACT, READ OFF THE REGRID. When the grid work loop had more work
+    // items than cores, `fold_grid_work_loop`'s unroll arm regridded `grid` to
+    // `[num_cores]` and left `trips = work_items / num_cores` straight-line copies per
+    // core in the body -- so an `n`-tile grid carries `n * trips` positions' worth of
+    // windows, and every position-shaped count below must carry the same factor. The
+    // factor is recorded by the arm that created it rather than re-derived from the
+    // body's copy structure, so the two passes cannot disagree about what a copy is.
+    // The sanity checks below are corruption checks, not workspace: the unroll arm
+    // guarantees both invariants when it sets the pair, so a violation here means one
+    // attr was set without the other and the counts below would be silently wrong.
+    let trips: i64 = match f.attr(&AttrKey::UnrolledGridLoop) {
+        Some(Attr::IntList(pair)) => {
+            let [cores, work_items] = pair.as_slice() else {
+                return Err(refuse(
+                    "`spyre.unrolled_grid_loop` must carry [num_cores, work_items]",
+                ));
+            };
+            if *cores != n {
+                return Err(refuse(format!(
+                    "`spyre.unrolled_grid_loop` records {cores} compute tiles but the \
+                     launch grid is {grid:?}"
+                )));
+            }
+            if work_items % cores != 0 {
+                return Err(refuse(format!(
+                    "`spyre.unrolled_grid_loop` records {work_items} work items over \
+                     {cores} compute tiles, which does not divide"
+                )));
+            }
+            work_items / cores
+        }
+        _ => 1,
+    };
     let kernel = module.kernel().map_err(|e| refuse(e.to_string()))?.clone();
     let body: Vec<Op> = kernel.regions[0].ops.clone();
     let Some(landmark_op) = body.iter().find(|o| o.kind == OpKind::KtdpGetComputeTileId) else {
@@ -1990,9 +2047,10 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
     //
     // Per parameter: its view (one per pointer in every fixture here; several views of one
     // pointer is left shared rather than guessed at), the tiles over that view across the
-    // WHOLE unrolled body, and their constant row corners. Exactly N tiles at row corners
-    // that vary = partitioned. More than N tiles = swept (K/V: 4 per copy -> 4N total).
-    // Fewer than N = a position that does not read the buffer, left shared.
+    // WHOLE unrolled body, and their constant row corners. Exactly `n * trips` tiles at row
+    // corners that vary = partitioned (`n` positions, one window per position per trip when
+    // the grid work loop unrolled). More than that = swept (K/V: 4 per copy ->
+    // 4N·trips total). Fewer = a position that does not read the buffer, left shared.
     let kernel = module.kernel().map_err(|e| refuse(e.to_string()))?.clone();
     let body: Vec<Op> = kernel.regions[0].ops.clone();
     let mut view_of: HashMap<Ssa, Ssa> = HashMap::new();
@@ -2020,7 +2078,7 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
         let Some(idxs) = tiles_of.get(view) else {
             continue;
         };
-        if idxs.len() != n as usize {
+        if idxs.len() != (n * trips) as usize {
             continue;
         }
         let corners: Vec<Option<i64>> = idxs

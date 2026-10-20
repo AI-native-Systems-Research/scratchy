@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE TWENTY-SIX CONFIGURATIONS, STATED ONCE.
+//! THE TWENTY-EIGHT CONFIGURATIONS, STATED ONCE.
 //!
 //! A "configuration" is a `.py` fixture plus the `tl.constexpr` values and the launch grid it is
 //! compiled at. Three consumers need that tuple: `examples/bake_py` (the dxp bake),
@@ -72,6 +72,13 @@ pub const ALL: &[&str] = &[
     // ⭐ TASK 28: the multi-block sweep — block table on device, flash recurrence carried
     // across blocks (see the `paged_attention_multiblock` case row).
     "paged_attention_multiblock",
+    // ⭐ THE DOUBLE-UNROLL COUNT TWIN — the production paged-decode body at two grid
+    // depths over the same kernel (see the `attention_banded_*` case rows): 32
+    // positions is the fold path, 64 crosses the 32-core bound into two trips per
+    // core, where `unroll_grid_positions` must count `n * trips` tiles to see the
+    // partitioned parameters. The `to_ktir.rs` count fix's gate.
+    "attention_banded_fold",
+    "attention_banded_batch",
 ];
 
 pub fn root() -> PathBuf {
@@ -691,6 +698,39 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             vec![1],
             Program::Matmul,
         ),
+        // ⭐ THE DOUBLE-UNROLL COUNT TWIN — `banded_attn_fwd` is the production
+        // paged-decode arm's body at granite-3.1-2b's real decode geometry (GQA=4,
+        // HD=64, a two-page sweep), minus the mask and segment corners the count wall
+        // does not live in. The TWO ROWS are the SAME KERNEL at two `NUM_SEQS`: the
+        // only structural difference is how many grid positions the launch asks for,
+        // which is exactly the knob `fold_grid_work_loop` turns on.
+        //
+        // THE FOLD ROW, `(1, 8, 4)` = 32 positions — exactly the 32-core fold bound.
+        // The whole grid fits in one trip per core: the positions become the loop's
+        // work items and each keeps its own delinearised corners. This row BAKES
+        // before the count fix and must bake IDENTICALLY after it — it is the control
+        // that the fix changes only the multi-trip count, nothing in the fold path.
+        //
+        // ⛔ THE BATCH ROW, `(2, 8, 4)` = 64 positions, IS THE WALL. Two trips per
+        // core: `fold_grid_work_loop`'s unroll arm regrids the launch to
+        // `[num_cores]` while the body carries two copies per landmark value, and
+        // `unroll_grid_positions`' partitioned-parameter count must then expect
+        // `n * trips` tiles at row corners that vary. Before the fix it expects `n`,
+        // sees `2n`, and NOTHING materializes — the door's refusal chain ends at the
+        // epilogue divide's extent check. After the fix this row BAKES at exactly
+        // twice the fold row's op count.
+        //
+        // ⛔ AND THE CORNERS MUST STAY DELINEARISED. A `GQA=1` simplification (a
+        // grid of `(NUM_SEQS, NKVH, 1)` with purely affine corners) would NOT fire
+        // the gate: `uniform_grid_corners` runs BEFORE `unroll_grid_positions` and
+        // claims every corner affine in a grid landmark as a per-core uniform, which
+        // removes the very computed corners this row exists to carry. The pids stay
+        // three, the div/mod stays in the row arithmetic, and the multi-dot body
+        // stays multi-dot so `dot_to_linalg`'s single-dot canonical verifiers (which
+        // refuse a computed A-offset) never gate it — the same exemption the
+        // production kernel rides.
+        "attention_banded_fold" => (banded_attn_spec(1), vec![1, 8, 4], Program::Attn),
+        "attention_banded_batch" => (banded_attn_spec(2), vec![2, 8, 4], Program::Attn),
         _ => return None,
     })
 }
@@ -728,6 +768,45 @@ fn attn_ce(stage: i128) -> Vec<(&'static str, Val)> {
         ("GQA", Val::Int(2)),
         ("STAGE", Val::Int(stage)),
     ]
+}
+
+/// The double-unroll count twin's buffers, in `banded_attn_fwd`'s parameter order — the
+/// production decode arm's own five: q/o rows, the transposed K plane, the V pool, and
+/// the i32 row-id table the V gather rides. No mask: the twin has no segment corners.
+const BANDED_ATTN: &[(&str, &str)] = &[
+    ("desc_q", "*fp16"),
+    ("desc_o", "*fp16"),
+    ("desc_kt", "*fp16"),
+    ("desc_v", "*fp16"),
+    ("desc_v_ids", "*i32"),
+];
+
+/// `banded_attn_fwd`'s constexprs at granite-3.1-2b's decode geometry — the production
+/// arm's own numbers (NQH=32, NKVH=8, GQA=4, HD=64, PAGES=2, PAGE_SLOTS=256, the 0.125
+/// scale) — with `NUM_SEQS` the parameter the two rows differ on: 1 lands the
+/// `(1, 8, 4)` grid exactly on the 32-core fold bound, 2 crosses it into two trips.
+fn banded_attn_ce(num_seqs: i128) -> Vec<(&'static str, Val)> {
+    vec![
+        ("NUM_SEQS", Val::Int(num_seqs)),
+        ("NQH", Val::Int(32)),
+        ("NKVH", Val::Int(8)),
+        ("HD", Val::Int(64)),
+        ("GQA", Val::Int(4)),
+        ("PAGES", Val::Int(2)),
+        ("PAGE_SLOTS", Val::Int(256)),
+        ("SCALE", Val::Float(0.125)),
+    ]
+}
+
+/// The double-unroll count twin's `KernelSpec` — `banded_attn_fwd` at
+/// [`banded_attn_ce`]'s geometry for the given sequence count.
+fn banded_attn_spec(num_seqs: i128) -> KernelSpec {
+    spec(
+        "banded_attn",
+        "banded_attn_fwd",
+        BANDED_ATTN,
+        &banded_attn_ce(num_seqs),
+    )
 }
 
 const SWIGLU: &[(&str, &str)] = &[
@@ -894,7 +973,7 @@ mod tests {
         }
         assert_eq!(
             super::ALL.len(),
-            26,
+            28,
             "a configuration was added or removed: update ALL (and the module title) deliberately"
         );
     }
