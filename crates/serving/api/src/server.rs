@@ -865,13 +865,18 @@ fn stream_chat_response(
         }
     });
 
+    // The choices that have sent a tool-call delta. The engine sends a tool call's finish as a
+    // delta of its own, with no tool-call pieces, so the finish reason reads the whole stream,
+    // the way the non-streaming response and `/v1/messages` do.
+    let mut called_tools = std::collections::HashSet::new();
     let stream = UnboundedReceiverStream::new(rx).map(move |delta| {
         recorder.record(&delta);
 
-        // Determine finish reason — override to "tool_calls" if tool call deltas present.
-        let has_tool_calls = delta.tool_call_deltas.is_some();
+        if delta.tool_call_deltas.is_some() {
+            called_tools.insert(delta.index);
+        }
         let finish_reason_str = delta.finish_reason.map(|r| {
-            if has_tool_calls {
+            if called_tools.contains(&delta.index) {
                 "tool_calls".to_string()
             } else {
                 r.to_string()
@@ -2136,6 +2141,62 @@ mod tests {
             assert_eq!(usage["prompt_tokens"], 5, "n={choices}");
             assert_eq!(usage["total_tokens"], 5 + generated, "n={choices}");
         }
+    }
+
+    /// Each choice's finish reason, in stream order.
+    fn chat_finishes(payloads: &[serde_json::Value]) -> Vec<(u64, String)> {
+        payloads
+            .iter()
+            .filter_map(|p| {
+                let choice = p["choices"].get(0)?;
+                let reason = choice["finish_reason"].as_str()?;
+                Some((choice["index"].as_u64().unwrap(), reason.to_string()))
+            })
+            .collect()
+    }
+
+    /// A choice that sent a tool call finishes with `tool_calls`, as OpenAI's API says, even
+    /// though the engine sends that finish as a delta of its own with no tool-call pieces.
+    #[tokio::test]
+    async fn test_chat_stream_tool_call_finishes_with_tool_calls() {
+        for choices in [1, 2] {
+            let (rx, _) = buffered_tool_call_rx(choices);
+            let response = stream_chat_response("r".into(), "m".into(), rx, false);
+            let payloads = sse_payloads(response.into_response()).await;
+            let finish = payloads
+                .iter()
+                .find(|p| !p["choices"][0]["finish_reason"].is_null())
+                .unwrap();
+            assert!(
+                finish["choices"][0]["delta"]["tool_calls"].is_null(),
+                "the finish carries no tool-call piece"
+            );
+            let expected: Vec<_> = (0..u64::from(choices))
+                .map(|i| (i, "tool_calls".to_string()))
+                .collect();
+            assert_eq!(chat_finishes(&payloads), expected, "n={choices}");
+        }
+    }
+
+    /// The reason follows each choice's own deltas: a choice that sent no tool call keeps its
+    /// own finish reason beside one that did.
+    #[tokio::test]
+    async fn test_chat_stream_finish_reason_is_per_choice() {
+        let (mut rx, _) = buffered_tool_call_rx(2);
+        let (tx, mixed_rx) = tokio::sync::mpsc::unbounded_channel();
+        while let Ok(delta) = rx.try_recv() {
+            if delta.index == 1 && delta.tool_call_deltas.is_some() {
+                continue;
+            }
+            tx.send(delta).unwrap();
+        }
+        drop(tx);
+        let response = stream_chat_response("r".into(), "m".into(), mixed_rx, false);
+        let payloads = sse_payloads(response.into_response()).await;
+        assert_eq!(
+            chat_finishes(&payloads),
+            [(0, "tool_calls".to_string()), (1, "stop".to_string())]
+        );
     }
 
     /// Cached tokens add up across choices, as in the non-streaming response, and are reported
