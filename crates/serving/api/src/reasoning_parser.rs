@@ -1118,6 +1118,11 @@ pub fn detect_reasoning_parser(arch: &str) -> Option<&'static str> {
     } else if a.contains("deepseek") {
         // deepseek_v3 / R1 emit `<think>…</think>`.
         Some("deepseek_r1")
+    } else if a.contains("granite_4_2") {
+        // Granite 4.2 (the first granite with an untied lm_head — see
+        // `model_arch` in init.rs) thinks in ` MudThink… MudThinkEnd`, Qwen3's
+        // tokens, so it reuses the Qwen3 parser.
+        Some("qwen3")
     } else if a.contains("qwen3") || a.contains("qwq") || a.contains("nemotron_h") {
         // Nemotron-H's template opens `<think>\n` in the prompt (`</think>` closed
         // there when thinking is off), Qwen3.5's convention.
@@ -2004,6 +2009,9 @@ mod gpt_oss_tests {
         assert_eq!(detect_reasoning_parser("gemma4"), Some("gemma4"));
         assert_eq!(detect_reasoning_parser("gemma4_moe"), Some("gemma4"));
         assert_eq!(detect_reasoning_parser("gemma4_unified"), Some("gemma4"));
+        // Granite 4.2 (untied lm_head) thinks; ≤4.1 does not.
+        assert_eq!(detect_reasoning_parser("granite_4_2"), Some("qwen3"));
+        assert_eq!(detect_reasoning_parser("granite"), None);
         // Architectures with no known reasoning format get no parser.
         assert_eq!(detect_reasoning_parser("gemma3"), None);
         assert_eq!(detect_reasoning_parser("llama"), None);

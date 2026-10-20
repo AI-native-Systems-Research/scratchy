@@ -2706,10 +2706,17 @@ pub fn get_tool_parser(name: &str) -> Result<Arc<dyn ToolCallParser>, String> {
 /// Note: architecture alone can't separate a finetune that changes the tool
 /// format from its base (e.g. Hermes-on-Llama, or Qwen3-Coder-30B which shares
 /// `qwen3_moe` with plain Qwen3-MoE); those need an explicit `--tool-call-parser`.
+/// Granite 4.2 is the one same-`model_type` split we can see: it untied the
+/// lm_head, and `model_arch` (init.rs) reports untied granites as
+/// `granite_4_2`.
 pub fn detect_tool_parser(arch: &str) -> Option<&'static str> {
     let a = arch.to_lowercase();
     if a.contains("kimi") {
         Some("kimi_k2")
+    } else if a.contains("granite_4_2") {
+        // Granite 4.2 dropped the 3.x tool format for Qwen3-Coder-style XML
+        // `<function=…><parameter=…>` calls.
+        Some("qwen3_coder")
     } else if a.contains("granite") {
         Some("granite")
     } else if a.contains("jamba") {
@@ -4587,6 +4594,9 @@ mod qwen3_coder_tests {
         assert_eq!(detect_tool_parser("gemma4"), Some("gemma4"));
         assert_eq!(detect_tool_parser("llama"), Some("llama3_json"));
         assert_eq!(detect_tool_parser("mistral"), Some("mistral"));
+        // Granite split: 4.2 (untied lm_head) vs ≤4.1.
+        assert_eq!(detect_tool_parser("granite_4_2"), Some("qwen3_coder"));
+        assert_eq!(detect_tool_parser("granite"), Some("granite"));
         // Also works on the raw architecture string.
         assert_eq!(
             detect_tool_parser("Qwen3_5MoeForConditionalGeneration"),
