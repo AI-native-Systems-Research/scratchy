@@ -462,6 +462,23 @@ pub const RESERVED_REGIONS: [TidRegion; 7] = [
     },
 ];
 
+/// Is `tid` one of the reserved synthetics — a sentinel, a slot of any region, or `LAST_HIDDEN_TID`
+/// (which sits at `u32::MAX`, one ABOVE the sentinels region's base, so a region scan alone misses
+/// it)?
+///
+/// ⭐ THE WHOLE-FUNCTION WALK'S INTERMEDIATE MINT ASKS. It numbers fresh intermediates strictly
+/// above every bound tid, and a bound reserved tid is legal — the LmLast extraction binds its
+/// destination to `LAST_HIDDEN_TID`, the one tid its consumer re-reads — so minting past the
+/// maximum would overflow `u32::MAX` and panic, while minting AT a reserved tid would alias the
+/// intermediate onto that synthetic's placement. A reserved tid names a producer-staged tensor,
+/// never a walk-minted intermediate, so the mint skips them and this predicate is what says which.
+pub fn is_reserved(tid: u32) -> bool {
+    tid == LAST_HIDDEN_TID
+        || RESERVED_REGIONS
+            .iter()
+            .any(|r| tid <= r.base && tid >= r.floor())
+}
+
 /// ⛔⛔⛔ A REGION IS ADDRESSED BY ITS **NAME**, NEVER BY ITS ARRAY INDEX — and this function exists
 /// because indexing it by position has already cost exactly the bug the table was built to prevent.
 ///

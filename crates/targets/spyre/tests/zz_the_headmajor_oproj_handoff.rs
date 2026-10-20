@@ -276,8 +276,8 @@ fn walk_at_8b() -> (RolledSuperDsc, SubtileIR<NeoX>, HashSet<u32>) {
 }
 
 /// Door-lower ONE body op's program — the consumer pass's per-op call (`sym` threads the
-/// descriptor id counter, `quantized` the per-bundle activation-quantize dedup set; both
-/// fresh per call, which cannot move an address — placements, not symbols, place tensors).
+/// descriptor id counter, fresh per call, which cannot move an address — placements, not
+/// symbols, place tensors).
 fn door_lower_op(
     rolled: &RolledSuperDsc,
     e: &EmittedOp,
@@ -285,8 +285,7 @@ fn door_lower_op(
 ) -> Result<Vec<EmittedOp>, DoorError> {
     let k = e.ktir.as_ref().expect("a body op carries its program");
     let mut sym = 0i64;
-    let mut quantized = HashSet::new();
-    door_lower(k, &mut sym, Some(&rolled.layout), &mut quantized, params)
+    door_lower(k, &mut sym, Some(&rolled.layout), params)
 }
 
 /// The body's matmul programs, in walk order (one canonical layer's worth: q, k, v, o,

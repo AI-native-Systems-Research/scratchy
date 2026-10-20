@@ -1171,7 +1171,6 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
         p.headmajor_handoff = false;
     }
     let mut sym_id_base: i64 = 0;
-    let mut fp8_quantized: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(programs.len());
     for e in &programs {
         let k = e.ktir.as_ref().ok_or_else(|| {
@@ -1186,7 +1185,6 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
                 k,
                 &mut sym_id_base,
                 Some(&bundle_layout),
-                &mut fp8_quantized,
                 attn_params,
             )
             .map_err(|err| {
@@ -2083,14 +2081,12 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         .chain(std::iter::once(&suffix))
     {
         let mut declare_syms: i64 = 0;
-        let mut declare_fp8: std::collections::HashSet<String> = std::collections::HashSet::new();
         for e in ops.iter() {
             let Some(k) = e.ktir.as_ref() else { continue };
             crate::ktir_superdsc_door::lower(
                 k,
                 &mut declare_syms,
                 Some(&bundle_layout),
-                &mut declare_fp8,
                 attn_params,
             )
             .map_err(|err| {

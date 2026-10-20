@@ -247,7 +247,7 @@ fn pv_program(acc: Acc) -> KtirNode {
 /// equal JSON are the same program on the card.
 fn descriptors_of(k: &KtirNode) -> Result<String, String> {
     let mut sid = 0i64;
-    let ops = lower_function(k, None, &mut sid).map_err(|e| e.message)?;
+    let ops = lower_function(k, None, &mut sid, None).map_err(|e| e.message)?;
     Ok(ops
         .iter()
         .map(|o| {

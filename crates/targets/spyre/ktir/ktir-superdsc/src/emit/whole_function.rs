@@ -86,19 +86,23 @@ use crate::work::DeviceWidth;
 ///   different function, so it is refused rather than rounded into one.
 ///
 /// A chain that almost matches is REFUSED BY NAME, never lowered as the nearest thing.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SiluMulChain {
     /// The value the negate consumed AND the divide's numerator — silu's argument.
     pub gate: Ssa,
-    /// The other factor of the terminal multiply.
-    pub up: Ssa,
-    /// The terminal `arith.mulf`'s result: the value the ONE fused op produces, and the value the
-    /// rest of the program consumes.
+    /// The other factor of the terminal multiply — `None` for the BARE form, whose longhand ends
+    /// at the STORED `silu(x)` with no multiply (`elementwise.py`'s `silu_fwd`), the unary
+    /// `Elementwise(Silu)` the door's own elementwise arm lowers as `("silu", 1)`.
+    pub up: Option<Ssa>,
+    /// The terminal's result — the `up` multiply's for the fused form, the divide's OWN for the
+    /// bare one. Either way it is the value the ONE fused op produces and the rest of the program
+    /// consumes.
     pub mul: Ssa,
-    /// `negf`, `exp`, `addf`, `divf` results — every intermediate the fused op never materialises,
-    /// so [`lower_function`] must lower NOTHING for them. The terminal multiply is deliberately not
-    /// in here: it is the op that BECOMES the fused program.
-    pub consumed: [Ssa; 4],
+    /// `negf`, `exp`, `addf` (and `divf`, for the fused form) results — every intermediate the
+    /// fused op never materialises, so [`lower_function`] must lower NOTHING for them. The
+    /// terminal is deliberately not in here: it is the op that BECOMES the fused program, which
+    /// is why the bare form's divide is absent exactly as the fused form's multiply is.
+    pub consumed: Vec<Ssa>,
 }
 
 /// WHICH WAY a `linalg.matmul` indexes its B operand — the orientation, READ FROM THE PROGRAM, because
@@ -336,6 +340,13 @@ pub struct RmsNormChain {
     /// The epsilon this chain's own `arith.addf` adds — read per chain, because
     /// `program_rmsnorm_eps` requires ONE root in the whole function and a decoder has two.
     pub eps: f32,
+    /// The OnePlusScale gain offset, when the chain's gain leg is `(1 + gamma)` rather than
+    /// `gamma`: ONE `arith.addf` over the loaded row with a splatted constant, consumed by the
+    /// chain exactly as the rank plumbing is. `None` is the Scale convention (no addf); the only
+    /// admitted value is 1.0 — `GainConvention::from_offset`'s own law, refused by name otherwise.
+    /// Read per chain the way [`super::lower_ktir_to_superdsc::rmsnorm`]'s `program_gain_offset`
+    /// reads it, so the two doors cannot state different formulas for one program.
+    pub ones: Option<f32>,
     /// Every intermediate the fused op never materialises, so `lower_function` lowers NOTHING for
     /// them. The final multiply is not here: it is the op that BECOMES the fused program.
     pub consumed: Vec<Ssa>,
@@ -568,6 +579,61 @@ fn rmsnorm_chain_from(
         };
         gamma = src;
     }
+    // ⭐ THE GAIN LEG'S OWN `(1 + w)` ADDF — the OnePlusScale convention (`rmsnorm.py`'s
+    // `rmsnorm_oneplus_fwd`), consumed by the chain the same way the rank plumbing is. The
+    // back-walk above stops AT the addf (it is not rank plumbing), and without this arm the addf
+    // would reach the walk as an `Elementwise(Add)` with a splat operand — a form the walk's own
+    // operand resolution refuses, so a oneplus program could not lower at all. ONE addf over the
+    // loaded row with a splatted constant: the constant must be the convention's own 1.0
+    // (`GainConvention::from_offset` admits 0.0 and 1.0 only, and 0.0 is stated as NO addf), and
+    // anything else is a producer bug refused by name — the same law the per-`Program` door's
+    // `program_gain_offset` arm states. An addf of another shape (no splat, two tensors) is not
+    // this convention and is left for the operand resolution to name, exactly as before this arm
+    // existed.
+    let mut ones = None;
+    if let Some(d) = def_of(gamma)
+        && d.op_type == OpKind::ArithAddf
+    {
+        let mut splat = None;
+        let mut row = None;
+        for &s in d.operands.iter() {
+            match splat_value(s) {
+                Some(v) => splat = Some(v),
+                None => row = Some(s),
+            }
+        }
+        if let (Some(v), Some(r)) = (splat, row) {
+            if v != 1.0 {
+                return err(format!(
+                    "{}: the rmsnorm's gain leg adds {v}, not 1.0 — `GainConvention::from_offset` \
+                     admits 0.0 (Scale, no addf) and 1.0 (OnePlusScale) only, so a program \
+                     stating any other offset is a producer bug",
+                    f.name
+                ));
+            }
+            ones = Some(1.0);
+            consumed.push(gamma);
+            gamma = r;
+            // The row's own rank plumbing, if it states any — the same three-op walk as the
+            // gain's, run on the addf's other side.
+            for _ in 0..3 {
+                let Some(dd) = def_of(gamma) else { break };
+                if !matches!(
+                    dd.op_type,
+                    OpKind::TensorExpandShape
+                        | OpKind::TensorCollapseShape
+                        | OpKind::LinalgBroadcast
+                ) {
+                    break;
+                }
+                consumed.push(gamma);
+                let Some(src) = dd.operands.first().copied() else {
+                    break;
+                };
+                gamma = src;
+            }
+        }
+    }
     let Some(out) = gain_mul.result else {
         return err(format!(
             "{}: the rmsnorm's gain multiply has no result",
@@ -619,6 +685,7 @@ fn rmsnorm_chain_from(
         gamma,
         out,
         eps: eps as f32,
+        ones,
         consumed,
     }))
 }
@@ -787,26 +854,64 @@ fn silu_mul_chain_from(
         return err(format!("{}: `arith.divf` with no result", f.name));
     };
 
-    // silu -> multiply by `up`. The other operand is `up`, whatever produced it.
-    // `Program::SiluMul` is `silu(gate)·up`; a bare silu with no multiply is `Elementwise` territory
-    // and this door has no arm for one, so a missing multiply is named rather than half-lowered.
-    let mul = link(div_v, OpKind::ArithMulf, "`silu(x)`")?;
-    let Some(up) = mul.operands.iter().copied().find(|&s| s != div_v) else {
-        return err(format!(
-            "{}: the silu's `arith.mulf` squares it rather than multiplying by an `up` tile",
+    // silu -> multiply by `up`, OR THE STORED BARE SILU. `Program::SiluMul` is `silu(gate)·up`;
+    // a bare silu — the longhand's result stored directly, no multiply — is the UNARY
+    // `Elementwise(Silu)` the door's own elementwise arm lowers as `("silu", 1)`, and the door
+    // ROUTES elementwise through this walk, so the chain reader recognises the store terminal as
+    // the longhand's second form rather than refusing what it just proved: the same five ops,
+    // ending at `o_desc.store([..], silu(x))` instead of the `up` multiply (`elementwise.py`'s
+    // `silu_fwd`). Everything else keeps the named refusal — one reader of a kind that is neither
+    // the multiply nor the store, no reader at all, or a second reader the fusion would starve.
+    let found: Vec<_> = readers(div_v).collect();
+    match found.as_slice() {
+        [m] if m.op_type == OpKind::ArithMulf => {
+            let Some(up) = m.operands.iter().copied().find(|&s| s != div_v) else {
+                return err(format!(
+                    "{}: the silu's `arith.mulf` squares it rather than multiplying by an `up` tile",
+                    f.name
+                ));
+            };
+            let Some(mul_v) = m.result else {
+                return err(format!("{}: `arith.mulf` with no result", f.name));
+            };
+            Ok(SiluMulChain {
+                gate,
+                up: Some(up),
+                mul: mul_v,
+                consumed: vec![neg_v, exp_v, add_v, div_v],
+            })
+        }
+        // The divide's result is the program's output: its one reader is the `ktdp.store` that
+        // writes `silu(x)` out. The divide is then the TERMINAL — its result is what the store
+        // stores — so it is not chain-interior and the walk lowers it as the one fused op.
+        [s] if s.op_type == OpKind::KtdpStore => Ok(SiluMulChain {
+            gate,
+            up: None,
+            mul: div_v,
+            consumed: vec![neg_v, exp_v, add_v],
+        }),
+        [o] => err(format!(
+            "{}: `silu(x)` is read by `{:?}`, but a silu longhand reads it with `{:?}` or stores it",
+            f.name,
+            o.op_type,
+            OpKind::ArithMulf
+        )),
+        [] => err(format!(
+            "{}: nothing reads `silu(x)`, so the silu longhand does not continue there",
             f.name
-        ));
-    };
-    let Some(mul_v) = mul.result else {
-        return err(format!("{}: `arith.mulf` with no result", f.name));
-    };
-
-    Ok(SiluMulChain {
-        gate,
-        up,
-        mul: mul_v,
-        consumed: [neg_v, exp_v, add_v, div_v],
-    })
+        )),
+        many => err(format!(
+            "{}: `silu(x)` is read by {} ops ({}), and this fusion DESTROYS it — the device's \
+             `OpFunc::Silu` never materialises the longhand's intermediates, so a second reader \
+             would be reading a value nothing writes. Exactly one reader is required.",
+            f.name,
+            many.len(),
+            many.iter()
+                .map(|o| format!("{:?}", o.op_type))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 /// The `Program` an op names, where the naming is 1:1 and needs no inference.
@@ -858,9 +963,11 @@ enum Lowering {
     /// tid rather than looking a value up in the registry. See [`bound_scale_of`] for the
     /// discriminator. The tensor operand is the splat's other side, same as [`ScalarMul`].
     BoundScalarMul(BoundScale),
-    /// A fused `x · rsqrt(mean(x²)+eps) · gamma`, with the epsilon this chain's own. See
-    /// [`program_rmsnorm_chains`] for why fusing it is the fix and filling the scale registry was not.
-    RmsNorm(f32),
+    /// A fused `x · rsqrt(mean(x²)+eps) · gamma`, with the epsilon this chain's own and the
+    /// OnePlusScale gain offset — `Some(1.0)` when the chain's gain leg is `(1 + gamma)`, `None`
+    /// for the Scale convention. See [`program_rmsnorm_chains`] for why fusing it is the fix and
+    /// filling the scale registry was not.
+    RmsNorm(f32, Option<f32>),
 }
 
 /// THE `Elementwise(Mul)` / `ScalarMul` TIEBREAK, read off ONE op rather than the whole function.
@@ -1226,13 +1333,32 @@ fn program_broadcast_chains(
             cursor = next;
         }
         if !saw_degenerate_expand {
-            return err(format!(
-                "{}: a `linalg.broadcast` sprays along {axis:?} but its source is not reached through \
-                 a `tensor.expand_shape` that inserts a DEGENERATE dim. That expand is the only thing \
-                 in the program that says the source IS a row or column vector, so without it the \
-                 operand's extent is unproven and addressing it as a broadcast would read past its end.",
-                f.name
-            ));
+            // ⭐ THE SOURCE'S OWN LOAD IS A SECOND PROOF OF THE SAME FACT. An fp8 weight-scale chain
+            // does not spell the expand: the kernel loads the scale as a `[1, n]` WINDOW of its own
+            // parameter (`matmul_fp8.py`'s `ws_desc.load([0, 0])` over a `[1, n]` descriptor),
+            // collapses the degenerate dim away, and broadcasts the 1-D result down the rows. The
+            // load's OWN shape states the vector-ness the expand would have — extent 1 on the
+            // sprayed axis — because the window it names is the whole parameter. A source that is
+            // neither an expand-proven vector nor a load of extent 1 on the spray axis keeps the
+            // refusal below: its extent is unproven, and addressing it as a broadcast would read
+            // past its end.
+            let source_proves_vector = def_of(cursor).is_some_and(|d| {
+                d.op_type == OpKind::KtdpLoad
+                    && super::lower_ktir_to_superdsc::shape_2d(d).is_some_and(|(r, c)| match axis {
+                        BcastAxis::Mb => r == 1,
+                        BcastAxis::Col => c == 1,
+                    })
+            });
+            if !source_proves_vector {
+                return err(format!(
+                    "{}: a `linalg.broadcast` sprays along {axis:?} but its source is not reached \
+                     through a `tensor.expand_shape` that inserts a DEGENERATE dim, nor is it a load \
+                     whose own window has extent 1 on that axis. Either is the thing that says the \
+                     source IS a row or column vector, so without one the operand's extent is \
+                     unproven and addressing it as a broadcast would read past its end.",
+                    f.name
+                ));
+            }
         }
         for v in chain {
             consumed.insert(v);
@@ -1394,9 +1520,451 @@ fn region_of_view_operand(
     Ok(Some(r))
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  THE ROW-TILED FAMILY FOLD — the door's own `Region::r_cover` law, restated for the walk.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The KIND discriminant of a row-fold candidate — one variant per foldable pointwise family,
+/// carrying everything "same op" means for it. Derived exactly as [`lower_function`]'s loop
+/// derives `program`, so a member the loop would classify differently can never be folded in.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RowFoldKind {
+    /// A recognised silu-mul chain's terminal multiply — the chain recognizer already proved every
+    /// member's interior is the same four-op silu.
+    SiluMul,
+    /// A recognised BARE silu chain's terminal divide — the longhand stored direct, one input. A
+    /// separate kind from [`RowFoldKind::SiluMul`] because the two differ in ARITY even where a
+    /// terminal's op kind does not: one folded descriptor stands for one, never a mix.
+    BareSilu,
+    /// A bare pointwise op, discriminated by its own `OpKind` (an `arith.addf` is not an
+    /// `arith.mulf`, and a mulf the splat/bound readers claim is not bare — see [`classify_row_fold`]).
+    Elementwise(OpKind),
+    /// `tile · const` — the multiplier is part of the kind: two blocks of one scalarmul carry the
+    /// same scale, and a family whose blocks did not would compute different functions per block.
+    ScalarMul(f32),
+    /// `tile · loaded [1,1] parameter` — the same launch-bound multiplier.
+    BoundScalarMul,
+}
+
+/// The pre-walk analyses the row fold's helpers read — the recognizers' outputs, threaded as ONE
+/// value so the helpers stay under the argument budget without `#[allow]`. Built once in
+/// [`lower_function`], after the recognizers run and before the op loop.
+struct FoldAnalyses<'a> {
+    silus: &'a [SiluMulChain],
+    rmsnorms: &'a [RmsNormChain],
+    gathered_loads: &'a std::collections::HashMap<Ssa, usize>,
+}
+
+/// Classify one terminal op the way [`lower_function`]'s loop does, reduced to the foldable
+/// families. `None` is every kind the fold does not own — an rmsnorm chain's gain multiply (the
+/// reduce inside it changes extent under a merge), a matmul (its trips are the time-tiling
+/// machinery's), a transpose, anything unrouted.
+fn classify_row_fold(
+    k: &KtirNode,
+    op: &Operation<'static>,
+    analyses: &FoldAnalyses<'_>,
+) -> Option<RowFoldKind> {
+    let f = &k.func;
+    let FoldAnalyses {
+        silus, rmsnorms, ..
+    } = analyses;
+    // The loop's own precedence, in the loop's own order: chain terminals first (silu, then rms —
+    // an rms terminal is NOT foldable), then the mulf tiebreaks, then the 1:1 map.
+    if op.op_type == OpKind::ArithMulf {
+        if silus.iter().any(|c| Some(c.mul) == op.result) {
+            return Some(RowFoldKind::SiluMul);
+        }
+        if rmsnorms.iter().any(|c| op.result == Some(c.out)) {
+            return None;
+        }
+        if let Some((v, _)) = splat_scale_of(f, op) {
+            return Some(RowFoldKind::ScalarMul(v));
+        }
+        if let Ok(Some(_)) = bound_scale_of(k, op) {
+            return Some(RowFoldKind::BoundScalarMul);
+        }
+        return Some(RowFoldKind::Elementwise(OpKind::ArithMulf));
+    }
+    // A BARE silu's terminal is the longhand's own `arith.divf` — the chain reader proved the five
+    // ops and the store, so the family kind is the chain's, never the divide's. The 1:1 map would
+    // otherwise call it `Elementwise(RealDiv)` and fold it as one, which would address the
+    // chain-interior `1 + e^-x` operand as a second input.
+    if silus
+        .iter()
+        .any(|c| c.up.is_none() && Some(c.mul) == op.result)
+    {
+        return Some(RowFoldKind::BareSilu);
+    }
+    match program_of(op.op_type) {
+        Some(Program::Elementwise(_)) => Some(RowFoldKind::Elementwise(op.op_type)),
+        _ => None,
+    }
+}
+
+/// The parameter a `ktdp.store` writes — the tile→view→pointer chain the walk's own out path
+/// walks, stated once so the family analysis cannot reach a different parameter than the emission
+/// does.
+fn store_ptr(f: &IRFunction<'static>, store: &Operation<'_>) -> Option<Ssa> {
+    let tile = f.operations.iter().find(|o| {
+        o.op_type == OpKind::KtdpConstructAccessTile && o.result == store.operands.get(1).copied()
+    })?;
+    let view = f.operations.iter().find(|o| {
+        o.op_type == OpKind::KtdpConstructMemoryView && o.result == tile.operands.first().copied()
+    })?;
+    view.operands.first().copied()
+}
+
+/// A store's own row window — the tile's `Shape` height and its row-corner constant, read with
+/// the same two readers (`shape_2d`, `index_constants`) [`region_for_operand`] reads a load's
+/// tile with, so the two walks cannot disagree about one tile.
+fn store_rows(
+    f: &IRFunction<'static>,
+    store: &Operation<'_>,
+    consts: &std::collections::HashMap<Ssa, i64>,
+) -> Option<(u32, u32)> {
+    let tile = f.operations.iter().find(|o| {
+        o.op_type == OpKind::KtdpConstructAccessTile && o.result == store.operands.get(1).copied()
+    })?;
+    let (r_len, _) = super::lower_ktir_to_superdsc::shape_2d(tile)?;
+    let r_start = tile.operands.get(1).and_then(|s| consts.get(s).copied())? as u32;
+    Some((r_start, r_len))
+}
+
+/// ⭐⭐⭐⭐⭐ THE ROW-TILED FAMILY FOLD. A row-blocked pointwise program — the kernels' own
+/// `EW_LX_ELEMS` law: `silumul` always at prefill, elementwise and scalarmul above the budget —
+/// states one load/chain/store family per `[BLOCK_M, N]` block, unrolled at constexpr trip counts.
+/// The DOOR folds those through `Region::r_cover` into ONE descriptor spanning the view; the walk
+/// lowers per-op at the LOAD'S OWN tile (the multi-trip matmul fix), so every block past the first
+/// refuses at the row-corner law — and the FIRST block already emits the fold, because its windows
+/// sit at row 0 and the emission's row count comes from the out region's cover.
+///
+/// So the fold here is the DEDUP plus a seal the door never needed: the family's members are
+/// skipped (the leader's descriptor computed their rows — one op, time factor 1, no tiling of our
+/// own), and the membership is proven to be ONE op over ONE window family that TILES THE VIEW
+/// EXACTLY — same kind, same parameters, same column window, row windows with no gap and no
+/// overlap, covering `0..view rows`. A family that almost tiles REFUSES BY NAME, never a partial
+/// merge: the leader's descriptor spans the whole view, so a gap would leave rows the program
+/// states unwritten and an overlap would state one row twice.
+///
+/// # NOT CANDIDATES, AND WHY
+///
+/// * GATHERED members (an unrolled embedding sweep's trips) return `Ok(None)` — their trips are
+///   gather semantics, each reading its own indirect tile, and merging them would strand the
+///   program's other tiles at the walk's `gather_carried` check. They keep today's per-trip
+///   lowering.
+/// * A family whose stores disagree about kind or parameters is not a family — the key does not
+///   match, nothing merges, and the members lower (and refuse, loudly) as today.
+fn row_tiled_family(
+    k: &KtirNode,
+    leader: &Operation<'static>,
+    leader_kind: RowFoldKind,
+    leader_in: &[Ssa],
+    leader_n_in: usize,
+    analyses: &FoldAnalyses<'_>,
+) -> Result<Option<std::collections::HashSet<Ssa>>, Error> {
+    let f = &k.func;
+    let FoldAnalyses {
+        silus,
+        rmsnorms: _,
+        gathered_loads,
+    } = analyses;
+    let consts = super::lower_ktir_to_superdsc::index_constants(f);
+    // The leader's own store — a family is keyed on the parameter its result is stored to. An
+    // unstored terminal is an intermediate chain, not a row-block family.
+    let Some(leader_res) = leader.result else {
+        return Ok(None);
+    };
+    let Some(leader_store) = f.operations.iter().find(|s| {
+        s.op_type == OpKind::KtdpStore && s.operands.first().copied() == Some(leader_res)
+    }) else {
+        return Ok(None);
+    };
+    let Some(out_ptr) = store_ptr(f, leader_store) else {
+        return Ok(None);
+    };
+    // EVERY store to that parameter, with its own row window — the family's full membership. ⛔
+    // FAIL-CLOSED ON THE CHAIN: a `ktdp.store` whose tile→view→parameter chain does not resolve
+    // cannot be classified as in or out of the family, and a membership that might be incomplete
+    // is a partial merge waiting to happen — so it refuses by name rather than guessing. Every
+    // producer's stores resolve (the walk's own out path reads the same chain for every op it
+    // lowers), so this names a producer form, not a working program.
+    let mut members: Vec<(&Operation<'static>, u32, u32)> = Vec::new();
+    for s in f
+        .operations
+        .iter()
+        .filter(|s| s.op_type == OpKind::KtdpStore)
+    {
+        let Some(p) = store_ptr(f, s) else {
+            return err(format!(
+                "{}: a `ktdp.store` states no tile→view→parameter chain, so the row-fold cannot \
+                 tell whether it writes the folded output — and a membership that might be \
+                 incomplete is a partial merge. The store's own op refuses the same chain when \
+                 the walk reaches it",
+                f.name
+            ));
+        };
+        if p != out_ptr {
+            continue;
+        }
+        let Some((rs, rl)) = store_rows(f, s, &consts) else {
+            return err(format!(
+                "{}: a `ktdp.store` to the row-folded output states no constant row window \
+                 (tile corner/shape), so the fold cannot prove the family tiles the view",
+                f.name
+            ));
+        };
+        members.push((s, rs, rl));
+    }
+    if members.len() < 2 {
+        return Ok(None);
+    }
+    // ⭐ ONE ROW WINDOW SHARED BY EVERY STORE IS NOT A ROW FAMILY. A column-chunked program states
+    // several `[m, chunk]` windows at the SAME rows, and the walk's per-op lowering already serves
+    // each chunk through its own column corner (`col_of`) — folding there would be wrong (the
+    // blocks tile the COLUMN axis, which the row fold does not own) and refusing would break a
+    // shape that works. So identical row windows bail to today's behavior; only a family whose
+    // stores state SEVERAL row windows — the `EW_LX_ELEMS` row-blocking signature — is analyzed.
+    if members
+        .iter()
+        .all(|(_, s, l)| (*s, *l) == (members[0].1, members[0].2))
+    {
+        return Ok(None);
+    }
+
+    // The leader's input regions — the tids and column windows every member must share. A value
+    // the parameter walk cannot reach (an intermediate this function computed, a constant) means
+    // the family is not one op over the parameters, and the loop's own resolution handles the op
+    // exactly as it did before the fold existed — so this is a BAIL, not a refusal.
+    let mut leader_regions: Vec<Region> = Vec::with_capacity(leader_in.len());
+    for v in leader_in {
+        let Some(r) = region_for_operand(k, *v)? else {
+            return Ok(None);
+        };
+        leader_regions.push(r);
+    }
+
+    // Classify every member's terminal and collect its input values, the way the loop would.
+    let mut terminals: Vec<(&Operation<'static>, RowFoldKind, Vec<Ssa>)> = Vec::new();
+    for (store, _, _) in &members {
+        let Some(v) = store.operands.first().copied() else {
+            return err(format!(
+                "{}: a `ktdp.store` to the row-blocked output states no stored value",
+                f.name
+            ));
+        };
+        let Some(term) = f.operations.iter().find(|o| o.result == Some(v)) else {
+            return err(format!(
+                "{}: the value a `ktdp.store` writes is produced by no top-level op",
+                f.name
+            ));
+        };
+        let Some(kind) = classify_row_fold(k, term, analyses) else {
+            return err(format!(
+                "{}: t{}'s row-blocked family mixes kinds — the walk folds ONE pointwise op \
+                 whose blocks tile the view, and a store to the same parameter from a different \
+                 kind ({:?}) is a program shape the fold refuses rather than partially merges",
+                f.name, leader_regions[0].tid, term.op_type
+            ));
+        };
+        if kind != leader_kind {
+            return err(format!(
+                "{}: the stores over t{} are not one op family — {leader_kind:?} at one store and \
+                 {kind:?} at another. The fold merges one kind's blocks or nothing, never a mix",
+                f.name, leader_regions[0].tid,
+            ));
+        }
+        let in_values: Vec<Ssa> = match kind {
+            RowFoldKind::SiluMul | RowFoldKind::BareSilu => {
+                let Some(c) = silus.iter().find(|c| Some(c.mul) == term.result) else {
+                    return err(format!(
+                        "{}: a silu family member whose terminal is not a recognised chain",
+                        f.name
+                    ));
+                };
+                // `classify_row_fold` gave every member the leader's kind, so the chain's form
+                // matches it: a silumul member states an `up`, a bare member ends at the stored
+                // divide. The mismatch arm is the seal on that invariant — one folded descriptor
+                // cannot stand for a family that mixes the two arities.
+                match (kind, c.up) {
+                    (RowFoldKind::SiluMul, Some(up)) => vec![c.gate, up],
+                    (RowFoldKind::BareSilu, None) => vec![c.gate],
+                    _ => {
+                        return err(format!(
+                            "{}: the row-block family over t{} mixes silu forms — one member's \
+                             chain ends at the stored divide and another's at the `up` multiply, \
+                             and the two are different ops even where their interiors are the same \
+                             four-op silu",
+                            f.name, leader_regions[0].tid
+                        ));
+                    }
+                }
+            }
+            RowFoldKind::Elementwise(_) => {
+                term.operands.iter().copied().take(leader_n_in).collect()
+            }
+            RowFoldKind::ScalarMul(_) => {
+                let Some((_, t)) = splat_scale_of(f, term) else {
+                    return err(format!(
+                        "{}: a scalar-multiply family member whose multiplier is not a splat",
+                        f.name
+                    ));
+                };
+                vec![t]
+            }
+            RowFoldKind::BoundScalarMul => {
+                let Ok(Some(b)) = bound_scale_of(k, term) else {
+                    return err(format!(
+                        "{}: a bound-scale family member with no bound scale",
+                        f.name
+                    ));
+                };
+                vec![b.tensor]
+            }
+        };
+        // ⛔ THE GATHER EXCLUSION — before any tiling arithmetic, because a gathered family's
+        // windows can tile exactly and the merge would still be wrong (see the doc above).
+        if in_values.iter().any(|v| gathered_loads.contains_key(v)) {
+            return Ok(None);
+        }
+        terminals.push((term, kind, in_values));
+    }
+
+    // ⛔⛔⛔ ONE OP, ONE WINDOW FAMILY, TILING THE VIEW EXACTLY. Per operand position: every
+    // member reads the SAME parameter at the SAME column window, and the row windows — sorted —
+    // start at 0, abut with no gap and no overlap, and end exactly at the view's rows. The stores
+    // are held to the same law. A family that fails this REFUSES; a partial merge would span rows
+    // the program never states.
+    let check_partition = |name: &str,
+                           intervals: &mut Vec<(u32, u32)>,
+                           view_rows: u32,
+                           what: &str|
+     -> Result<(), Error> {
+        intervals.sort_unstable();
+        let mut cursor = 0u32;
+        for &(s, len) in intervals.iter() {
+            if s != cursor {
+                return err(format!(
+                    "{}: {} {} row windows {}..{} where row {cursor} was due — the family's \
+                     windows must TILE the view exactly (start at 0, abut, end at {view_rows}); a \
+                     gap or an overlap means the one folded descriptor would leave stated rows \
+                     unwritten or state one row twice. The fold refuses rather than partially merge",
+                    f.name,
+                    name,
+                    what,
+                    s,
+                    s + len
+                ));
+            }
+            cursor = s + len;
+        }
+        if cursor != view_rows {
+            return err(format!(
+                "{}: {} {} row windows cover 0..{cursor} of a {view_rows}-row view — the family's \
+                 windows must TILE the view exactly; the one folded descriptor spans all \
+                 {view_rows} rows and a descriptor computing rows the program never states is the \
+                 defect the fold exists to prevent",
+                f.name, name, what
+            ));
+        }
+        Ok(())
+    };
+    // Per operand position: same tid, same column window, row partition.
+    for (pos, want) in leader_regions
+        .iter()
+        .enumerate()
+        .take(leader_n_in.min(leader_regions.len()))
+    {
+        let mut intervals: Vec<(u32, u32)> = Vec::new();
+        for (term, _, in_values) in terminals.iter() {
+            let Some(v) = in_values.get(pos).copied() else {
+                return err(format!(
+                    "{}: a row-block family member ({:?}) resolves fewer inputs than its leader",
+                    f.name, term.op_type
+                ));
+            };
+            let Some(r) = region_for_operand(k, v)? else {
+                return err(format!(
+                    "{}: a row-block family member's input {:?} resolves to no parameter — the \
+                     fold merges one op over the SAME parameters, never a mix of loads and \
+                     computed values",
+                    f.name, v
+                ));
+            };
+            if r.tid != want.tid {
+                return err(format!(
+                    "{}: the row-block family over t{} reads two different tensors at input \
+                     {pos} (t{} and t{}) — one op, one window family; a merge across parameters \
+                     is a partial merge and refuses",
+                    f.name, want.tid, want.tid, r.tid
+                ));
+            }
+            if r.c_start != want.c_start || r.c_len != want.c_len {
+                return err(format!(
+                    "{}: the row-block family over t{} reads input {pos} at two different column \
+                     windows ([{}, {}] and [{}, {}]) — the blocks of one op share one column \
+                     window, and unequal corners would address one block's columns at another's",
+                    f.name, want.tid, want.c_start, want.c_len, r.c_start, r.c_len
+                ));
+            }
+            intervals.push((r.r_start, r.r_len));
+        }
+        check_partition(
+            &format!("t{}", want.tid),
+            &mut intervals,
+            want.v_rows,
+            "loads",
+        )?;
+    }
+    // The stores, held to the same law against the output view's own rows — read the way the
+    // walk's own out path reads it (the parameter's row in `regions()`), so the fold and the
+    // emission cannot disagree about the view's extent.
+    let out_rows = {
+        let Some(out_idx) = f
+            .arguments
+            .iter()
+            .position(|(a, _)| Some(*a) == Some(out_ptr))
+        else {
+            return err(format!(
+                "{}: the row-folded output's store names no parameter",
+                f.name
+            ));
+        };
+        let all = regions(k)?;
+        let Some(r) = all.get(out_idx) else {
+            return err(format!(
+                "{}: the row-folded output parameter has no region, though its store reached it",
+                f.name
+            ));
+        };
+        r.v_rows
+    };
+    let mut store_intervals: Vec<(u32, u32)> =
+        members.iter().map(|(_, rs, rl)| (*rs, *rl)).collect();
+    check_partition("the output", &mut store_intervals, out_rows, "stores")?;
+
+    // The LEADER is the terminal this analysis was called on — the first family terminal in
+    // program order, because the walk visits ops in program order and fires the gate at the first
+    // one it can lower. Every other member is skipped, its rows computed by the leader's one
+    // folded descriptor.
+    let mut skip = std::collections::HashSet::new();
+    for (term, _, _) in terminals.iter() {
+        if let Some(r) = term.result
+            && r != leader_res
+        {
+            skip.insert(r);
+        }
+    }
+    Ok(Some(skip))
+}
+
 /// Lower a function holding MANY ops, one `Program` per op, in program order.
 ///
 /// Each op is handed only its own operands' regions, so the existing bodies apply unchanged.
+///
+/// `headmajor` is the head-major o_proj handoff fact ([`HeadmajorOproj`]), threaded from the door
+/// that owns the bundle's attention facts — the swap keys on the o matmul's weight tid, so of the
+/// many matmuls an unrolled graph holds, exactly the one whose `w.tid` the fact names takes it.
+/// `None` is the no-handoff emission every caller without a bundle fact gets.
 ///
 /// # WHAT IS NOT IMPLEMENTED YET, AND IS REFUSED RATHER THAN GUESSED
 ///
@@ -1410,6 +1978,7 @@ pub fn lower_function(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
     sym_id_base: &mut i64,
+    headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
 ) -> Result<Vec<super::EmittedOp>, Error> {
     let f = &k.func;
     let mut out = Vec::new();
@@ -1428,14 +1997,37 @@ pub fn lower_function(
     //
     // ⛔ THE TID MUST NOT COLLIDE WITH A PARAMETER'S. `act_name(tid)` is the operand name and the
     // key into `placements`/`ids`, so a reused tid would silently alias an intermediate onto a real
-    // buffer. They are minted strictly above every bound tid.
+    // buffer. They are minted strictly above every bound tid. ⛔ AND RESERVED TIDS ARE SKIPPED, NOT
+    // STEPPED PAST: a bound reserved tid is legal (the LmLast extraction binds its destination to
+    // `LAST_HIDDEN_TID`, one above the sentinel region), so the bare maximum is `u32::MAX` there and
+    // `+ 1` would panic — and a mint landing INSIDE a reserved region would alias that synthetic's
+    // placement. Reserved tids name producer-staged tensors, never intermediates, so the mint starts
+    // above the highest NON-reserved binding and steps past any region it lands in.
     let mut next_tid: u32 = k
         .bindings
         .iter()
         .map(|b| b.get())
+        .filter(|t| !crate::reserved_tids::is_reserved(*t))
         .max()
         .map_or(0, |m| m + 1);
+    while crate::reserved_tids::is_reserved(next_tid) {
+        next_tid += 1;
+    }
     let mut inter: std::collections::HashMap<Ssa, Region> = std::collections::HashMap::new();
+    // THE fp8 SCALE MULFS THE DOT ABSORBED. The walk lowers each op once, and an absorbed epilogue
+    // (`p * ws`, see the absorption at the `stored` lookup) already rode into its dot's emission —
+    // so the `arith.mulf` itself must not be lowered again when the loop reaches it. Membership is
+    // the mulf's RESULT value; skipped at the loop top beside the chain interiors.
+    let mut fp8_epilogue: std::collections::HashSet<Ssa> = std::collections::HashSet::new();
+    // THE ROW-TILED FAMILY FOLD'S SKIPPED MEMBERS. A row-blocked pointwise program states one
+    // load/chain/store family per `[BLOCK_M, N]` block, and the walk lowers per-op at the LOAD'S
+    // OWN tile — so every block past the first refuses at the row-corner law while the FIRST
+    // block's descriptor already spans the whole view (its out region's `r_cover` is the hull of
+    // every block's store, and [`node_rows`] folds that into the row count). [`row_tiled_family`]
+    // proves the blocks are ONE op over windows that tile the view exactly and returns the
+    // non-leader terminals; membership is the terminal's RESULT value, skipped at the loop top
+    // beside the chain interiors. The leader emits the fold — one op, time factor 1.
+    let mut row_fold_skip: std::collections::HashSet<Ssa> = std::collections::HashSet::new();
 
     // THE ONE FUSED CHAIN THIS DOOR READS, before the 1:1 walk rather than inside it. See
     // [`program_silu_mul_chain`] for why the module header's "recognises NOTHING" survives this: the
@@ -1475,6 +2067,13 @@ pub fn lower_function(
         .map(|(i, g)| (g.load, i))
         .collect();
     let mut gather_carried = vec![false; gathers.len()];
+    // The row fold's own view of the same analyses — built once here so its helpers read ONE
+    // value rather than threading three slices each (see [`FoldAnalyses`]).
+    let analyses = FoldAnalyses {
+        silus: &silus,
+        rmsnorms: &rmsnorms,
+        gathered_loads: &gathered_loads,
+    };
 
     for op in f.operations.iter() {
         if is_plumbing(op.op_type) {
@@ -1489,13 +2088,19 @@ pub fn lower_function(
                 || rmsnorms.iter().any(|c| c.consumed.contains(&r))
                 // The expand/collapse/broadcast chain itself: no descriptor, the consumer states it.
                 || bcast_consumed.contains(&r)
+                // An fp8 dot's absorbed scale mulf: it rode into the dot's emission above.
+                || fp8_epilogue.contains(&r)
+                // A row-folded family's non-leader block: the leader's one whole-view descriptor
+                // already computed its rows (see [`row_tiled_family`]).
+                || row_fold_skip.contains(&r)
         }) {
             continue;
         }
-        // The terminal `arith.mulf` IS the fused program, and its inputs are the chain's gate and up
-        // rather than its own operands (which are `silu(gate)` and up). Everything else keeps the
-        // 1:1 map exactly as before.
-        let terminal = silus.iter().copied().find(|c| op.result == Some(c.mul));
+        // The terminal — the `up` multiply for the fused form, the divide itself for a bare one —
+        // IS the fused program, and its inputs are the chain's gate and up rather than its own
+        // operands (which are `silu(gate)` and up). Everything else keeps the 1:1 map exactly as
+        // before.
+        let terminal = silus.iter().find(|c| op.result == Some(c.mul));
         // A `linalg.reduce`'s combiner is an ATTRIBUTE, not its op kind, so the kind is read off the op
         // beside the 1:1 map rather than from it — and it is carried HERE rather than as a `Program`
         // variant, because `Program` is matched exhaustively by consumers outside this crate and a bare
@@ -1527,8 +2132,18 @@ pub fn lower_function(
         // splat arm and before the 1:1 map, both of which would otherwise claim it.
         let rms = rmsnorms.iter().find(|c| op.result == Some(c.out));
         let Some(program) = terminal
-            .map(|_| Lowering::Silu)
-            .or(rms.map(|c| Lowering::RmsNorm(c.eps)))
+            .map(|c| {
+                if c.up.is_some() {
+                    Lowering::Silu
+                } else {
+                    // The BARE form: the longhand's result is stored direct, so the fused op is
+                    // the UNARY `Elementwise(Silu)` — `("silu", 1)` over `[gate, out]`, exactly
+                    // the op the per-`Program` door's elementwise arm emitted for one before the
+                    // reroute made this walk the door for elementwise too.
+                    Lowering::Node(Program::Elementwise(Elementwise::Silu))
+                }
+            })
+            .or(rms.map(|c| Lowering::RmsNorm(c.eps, c.ones)))
             .or(reduce.map(Lowering::Reduce))
             .or(scalar.map(|(v, _)| Lowering::ScalarMul(v)))
             .or(bound_scale.map(Lowering::BoundScalarMul))
@@ -1555,7 +2170,9 @@ pub fn lower_function(
         // THIS OP'S INPUTS. `linalg.matmul`'s last operand is its `outs` accumulator init, not an
         // input, and the result is the output — so the inputs are the leading operands.
         let n_in = match program {
-            // The silu's two inputs are the chain's gate and up, which the recogniser proved.
+            // The silu's two inputs are the chain's gate and up, which the recogniser proved. (A
+            // bare silu reaches the `Node(Elementwise(Silu))` arm, whose arity `elementwise_op_func`
+            // states as 1.)
             Lowering::Silu => 2,
             // `linalg.reduce`'s operands are `(data, init)`: the init is the SEED, which the reduce
             // op-func carries itself, so only the data is an input.
@@ -1563,8 +2180,8 @@ pub fn lower_function(
             // The splat is not an operand of the descriptor — it rides in the op as a bound `[1,1]`
             // const — so a scalar multiply reads ONE tensor.
             Lowering::ScalarMul(_) | Lowering::BoundScalarMul(_) => 1,
-            // x and gamma; the epsilon and `1/cols` are the fused body's own.
-            Lowering::RmsNorm(_) => 2,
+            // x and gamma; the epsilon, `1/cols` and the oneplus offset are the fused body's own.
+            Lowering::RmsNorm(..) => 2,
             Lowering::Node(Program::Matmul) => 2,
             Lowering::Node(Program::Elementwise(e)) => {
                 match super::lower_ktir_to_superdsc::elementwise_op_func(f.name, e) {
@@ -1584,7 +2201,12 @@ pub fn lower_function(
                 let c = rms.expect("just matched");
                 vec![c.x, c.gamma]
             }
-            (Some(c), _, _) => vec![c.gate, c.up],
+            (Some(c), _, _) => match c.up {
+                Some(up) => vec![c.gate, up],
+                // The bare form's one input is the gate; the divide's other operand is the
+                // chain-interior `1 + e^-x`, which the fused op never materialises.
+                None => vec![c.gate],
+            },
             // The TENSOR operand the recogniser proved, not operand 0 — the splat sits on either side
             // (`ms * INV_D` has it second, and nothing obliges a producer to put it there).
             (None, Some((_, tensor)), _) => vec![tensor],
@@ -1607,6 +2229,26 @@ pub fn lower_function(
             .iter()
             .map(|v| bcasts.get(v).map_or(*v, |b| b.src))
             .collect();
+
+        // ⭐⭐⭐⭐⭐ THE ROW-TILED FAMILY FOLD'S CANDIDACY GATE. Only the foldable pointwise kinds
+        // (the same `program` this loop just derived — never re-derived here, so the gate cannot
+        // disagree with the loop about what op this is), only with every operand DENSE (a
+        // broadcast family's blocks do not tile the view the same way and the broadcast arms
+        // address operands at their own extent). The analysis itself bails on everything that is
+        // not a row-blocked family, so a single-window or column-chunked program never enters it.
+        if bcast_axes.iter().all(Option::is_none)
+            && matches!(
+                program,
+                Lowering::Silu
+                    | Lowering::ScalarMul(_)
+                    | Lowering::BoundScalarMul(_)
+                    | Lowering::Node(Program::Elementwise(_))
+            )
+            && let Some(kind) = classify_row_fold(k, op, &analyses)
+            && let Some(members) = row_tiled_family(k, op, kind, &in_values, n_in, &analyses)?
+        {
+            row_fold_skip.extend(members);
+        }
 
         let mut per_op: Vec<Region> = Vec::with_capacity(n_in + 1);
         // ⭐ WHICH OPERANDS ARE PARAMETER-BACKED, kept BESIDE the regions because a `Region` cannot
@@ -1878,10 +2520,125 @@ pub fn lower_function(
         }
 
         // THIS OP'S OUTPUT: the parameter a `ktdp.store` writes from this op's result.
-        let stored = f
+        let mut stored = f
             .operations
             .iter()
             .find(|s| s.op_type == OpKind::KtdpStore && s.operands.first().copied() == op.result);
+        // ⭐⭐⭐ THE fp8 WEIGHT-SCALE EPILOGUE, ABSORBED AT THE DOT. `matmul_fp8.py` spells the W8A8
+        // contraction's scale multiply IN THE KERNEL — `p * ws` between the dot and the store — so
+        // the dot's result is never stored directly: without this arm the walk would mint it an
+        // intermediate and `matmul_oriented` would refuse the two-input fp8 weight ("a packed fp8
+        // weight comes with its per-column `w_scale`"). The multiply is NOT a separate device op —
+        // the W8A8 primitive applies the scale inside the contraction (`matmul_fp8_descriptors`
+        // takes the ws as its third fact) — so the spelled `arith.mulf` is absorbed HERE, at the op
+        // it belongs to, rather than emitted as a pointwise op over a minted buffer. Three seals
+        // restate the kernel's contract, and each refuses by name:
+        //   1. the dot's result has exactly ONE consumer, and it is the scale `arith.mulf`;
+        //   2. the mulf's other operand is the broadcast row `program_broadcast_chains` proved (a
+        //      `[1, n]` weight scale sprayed down the rows) — or, at `m == 1`, the `[1, n]` load
+        //      ITSELF, the spray being the identity the frontend folds away — and its source
+        //      resolves to a BOUND PARAMETER, the ws the launch stages;
+        //   3. the mulf's result is what a `ktdp.store` writes, so the contraction's output region
+        //      is the store's own.
+        // ⛔ fp8 ONLY. An fp16 dot whose result feeds a multiply is a REAL two-op chain (the
+        // attention score's scale, the rms mean's `· INV_D`) and lowering it as separate ops is the
+        // walk's own law; absorbing those would fold a pointwise op into a contraction that has no
+        // scale fact to carry it.
+        if stored.is_none()
+            && matches!(program, Lowering::Node(Program::Matmul))
+            && per_op.len() >= 2
+            && per_op[1].is_fp8
+        {
+            let Some(dot) = op.result else {
+                return err(format!(
+                    "{}: `{:?}` states no result to look for a scale epilogue on",
+                    f.name, op.op_type
+                ));
+            };
+            let deep = f.ops_deep();
+            let mut consumers = deep.iter().copied().filter(|o| o.operands.contains(&dot));
+            let Some(mulf) = consumers.next() else {
+                return err(format!(
+                    "{}: the fp8 dot's result has no consumer — `matmul_fp8.py` spells the scale \
+                     multiply `p * ws` between the dot and the store, so an fp8 contraction whose \
+                     result nothing reads is a new producer form this arm must be re-derived for",
+                    f.name
+                ));
+            };
+            if mulf.op_type != OpKind::ArithMulf || consumers.next().is_some() {
+                return err(format!(
+                    "{}: the fp8 dot's result must feed exactly one scale `arith.mulf` (the \
+                     kernel's `p * ws` epilogue) — anything else is a producer form the W8A8 \
+                     primitive has no fact for",
+                    f.name
+                ));
+            }
+            let Some(&scale_v) = mulf.operands.iter().find(|v| **v != dot) else {
+                return err(format!(
+                    "{}: the fp8 dot's scale `arith.mulf` names no operand besides the dot itself",
+                    f.name
+                ));
+            };
+            // ⭐ SEAL 2, BOTH SPRAY FORMS. The kernel sprays the `[1, n]` ws down the rows with a
+            // `linalg.broadcast` — every form except `m == 1`, where the spray is the IDENTITY: a
+            // `[1, n]` row over a one-row dot needs no broadcast op, and the frontend folds it
+            // away, so the mulf reads the LOAD itself (`matmul_fp8.py` at the decode shape). The
+            // direct form is admitted only when the load's own window is one row — the same
+            // degenerate-extent proof the broadcast chain's no-expand arm turns on — because at
+            // `m > 1` the frontend MATERIALSES the broadcast (the mulf's operand shapes differ),
+            // so a bare `[1, n]` load here can only be the m=1 identity spray of the same
+            // per-column scale.
+            let ws_src = match bcasts.get(&scale_v) {
+                Some(b) => b.src,
+                None => {
+                    let direct = f.operations.iter().any(|d| {
+                        d.result == Some(scale_v)
+                            && d.op_type == OpKind::KtdpLoad
+                            && super::lower_ktir_to_superdsc::shape_2d(d)
+                                .is_some_and(|(r, _)| r == 1)
+                    });
+                    if direct {
+                        scale_v
+                    } else {
+                        return err(format!(
+                            "{}: the fp8 dot's scale operand is not a recognised `linalg.broadcast` \
+                             row — the W8A8 primitive's ws is a `[1, n]` per-column scale sprayed \
+                             down the rows, and anything else is a shape the contraction's scale \
+                             fact cannot state",
+                            f.name
+                        ));
+                    }
+                }
+            };
+            let Some(mut ws_r) = region_for_operand(k, ws_src)? else {
+                return err(format!(
+                    "{}: the fp8 dot's scale row resolves to no bound parameter — the ws is a \
+                     tensor the launch stages, and a scale computed inside this function is a \
+                     producer form this arm refuses",
+                    f.name
+                ));
+            };
+            let Some(mulf_res) = mulf.result else {
+                return err(format!(
+                    "{}: the fp8 dot's scale `arith.mulf` states no result",
+                    f.name
+                ));
+            };
+            let Some(mulf_store) = f.operations.iter().find(|s| {
+                s.op_type == OpKind::KtdpStore && s.operands.first().copied() == Some(mulf_res)
+            }) else {
+                return err(format!(
+                    "{}: the fp8 dot's scaled result is never stored — the kernel's epilogue ends \
+                     at `o_desc.store` and an unstored contraction output has no region to emit",
+                    f.name
+                ));
+            };
+            ws_r.is_out = false;
+            per_op.push(ws_r);
+            from_parameter.push(true);
+            fp8_epilogue.insert(mulf_res);
+            stored = Some(mulf_store);
+        }
         let Some(store) = stored else {
             // NOT STORED => AN INTERMEDIATE. Mint a buffer for it, declare it to the layout, and
             // record it so the consuming op finds it as an input.
@@ -2005,6 +2762,7 @@ pub fn lower_function(
                 &per_op,
                 sym_id_base,
                 Some(layout),
+                headmajor,
                 WalkProof {
                     b_orient,
                     gather: op_gather.map(|(g, _, _)| g),
@@ -2044,6 +2802,7 @@ pub fn lower_function(
             &per_op,
             sym_id_base,
             layout,
+            headmajor,
             WalkProof {
                 b_orient,
                 gather: op_gather.map(|(g, _, _)| g),
@@ -2054,6 +2813,26 @@ pub fn lower_function(
         lowered += 1;
     }
 
+    // ⭐ THE PURE-COPY ARM. A copy program states no compute op at all — its ops are loads and
+    // stores, every one of them plumbing this walk skips — so `lowered == 0` is not a refusal for
+    // it but the expected shape, and the one production copy is the LmLast last-row extraction
+    // (`lmlast.py`: per-stick `[1, 64]` copies at a row corner, the ONE coordInfo form fp16 can
+    // represent). The arm is keyed on the `Program` the node states, never on the op list: a copy
+    // that grew a compute op is a NEW producer form, and lowering its compute while silently not
+    // running the copy half would emit a program whose stores are never written — so that case
+    // refuses here rather than half-lowering.
+    if k.program == Program::LmLast {
+        if lowered > 0 {
+            return err(format!(
+                "{}: an LmLast program with {lowered} compute op(s) — the last-row extraction is a \
+                 PURE COPY (loads and stores only), so a compute op here means the producer's form \
+                 changed and the copy half must be re-derived for it, not skipped",
+                f.name
+            ));
+        }
+        let r = regions(k)?;
+        return super::lower_ktir_to_superdsc::lmlast(f.name, k, &r, sym_id_base, layout);
+    }
     if lowered == 0 {
         return err(format!("{}: no compute op in the function", f.name));
     }
@@ -2118,6 +2897,7 @@ fn emit_one(
     per_op: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
+    headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
     proof: WalkProof<'_>,
 ) -> Result<Vec<super::EmittedOp>, Error> {
     let WalkProof {
@@ -2173,10 +2953,11 @@ fn emit_one(
         // THE FUSED RMSNORM. `per_op` is `[x, gamma, out]`, which is `rmsnorm_at`'s own
         // `split_out(.., 2)` order. The epsilon is THIS chain's, read at its own `arith.addf`, because
         // `program_rmsnorm_eps` requires one root per FUNCTION and a decoder layer has two.
-        Lowering::RmsNorm(eps) => {
+        Lowering::RmsNorm(eps, ones) => {
             return super::lower_ktir_to_superdsc::rmsnorm_at(
                 name,
                 eps,
+                ones,
                 per_op,
                 sym_id_base,
                 layout,
@@ -2212,14 +2993,14 @@ fn emit_one(
                     // This door's operands are WINDOWS of the caller's parameters — the fact the
                     // spurious-pad drop in `matmul_oriented` discriminates on.
                     origin: super::lower_ktir_to_superdsc::OperandOrigin::Windowed,
-                    // ⭐ NO HEAD-MAJOR o_proj HANDOFF HERE, BY CONSTRUCTION. That fact is minted
-                    // from the BUNDLE's attention-output row count (mq == 1 over a multi-slab head
-                    // dim) and lives on the spyre door's `BundleAttnParams`; this whole-function
-                    // door lowers an UNROLLED graph whose per-layer o matmuls key on per-layer
-                    // weight tids the bundle fact's one canonical tid cannot name. The unrolled
-                    // bake therefore keeps the pre-restructure emission — see the codegen's
-                    // headmajor mutation sites.
-                    headmajor: None,
+                    // ⭐ THE HEAD-MAJOR o_proj HANDOFF, THREADED FROM THE DOOR THAT OWNS THE BUNDLE
+                    // FACT. It is minted from the attention-output row count (mq == 1 over a
+                    // multi-slab head dim) and the o matmul's weight tid, neither of which a
+                    // program states; `matmul_oriented` keys the swap on `w.tid == oproj_wtid`, so
+                    // of the many matmuls an unrolled graph holds, exactly the one the fact names
+                    // takes it. `None` — every caller without a bundle fact — is the plain staged
+                    // weight, byte-identical to what this arm always emitted.
+                    headmajor,
                 },
             )?
         }
@@ -2811,6 +3592,36 @@ mod silu_chain_tests {
         }
     }
 
+    /// The BARE silu's builder — the same five ops with the divide STORED rather than multiplied,
+    /// `elementwise.py`'s `silu_fwd` form. Only the VALUE slot of the store matters to the reader
+    /// (the reader matches the op kind and the read value, never the tile), so a one-operand
+    /// `KtdpStore` states the form.
+    fn stored_chain() -> IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let (g, c1, sp) = (Ssa(0), Ssa(1), Ssa(2));
+        let (neg, exp, add, div) = (Ssa(3), Ssa(4), Ssa(5), Ssa(6));
+        let ops = vec![
+            Operation::new(a, Some(c1), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(1.0),
+            ),
+            Operation::new(a, Some(sp), OpKind::TensorSplat, &[c1]),
+            Operation::new(a, Some(neg), OpKind::ArithNegf, &[g]),
+            Operation::new(a, Some(exp), OpKind::MathExp, &[neg]),
+            Operation::new(a, Some(add), OpKind::ArithAddf, &[exp, sp]),
+            Operation::new(a, Some(div), OpKind::ArithDivf, &[g, add]),
+            Operation::new(a, None, OpKind::KtdpStore, &[div]),
+        ];
+        IRFunction {
+            name: "silu_stored_probe",
+            arguments: a.args(vec![(g, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
     /// THE CONTROL. Without this passing, every refusal below could be a broken builder rather than a
     /// working guard.
     #[test]
@@ -2818,9 +3629,9 @@ mod silu_chain_tests {
         let f = chain(1.0, Num::Gate, true);
         let cs = program_silu_mul_chains(&f).expect("the matching chain must be recognised");
         assert_eq!(cs.len(), 1, "one `arith.negf` heads one chain");
-        let c = cs[0];
+        let c = &cs[0];
         assert_eq!(c.gate, Ssa(0), "the gate is the value the negate consumed");
-        assert_eq!(c.up, Ssa(1), "`up` is the multiply's other operand");
+        assert_eq!(c.up, Some(Ssa(1)), "`up` is the multiply's other operand");
         assert_eq!(
             c.mul,
             Ssa(8),
@@ -2828,7 +3639,7 @@ mod silu_chain_tests {
         );
         assert_eq!(
             c.consumed,
-            [Ssa(4), Ssa(5), Ssa(6), Ssa(7)],
+            vec![Ssa(4), Ssa(5), Ssa(6), Ssa(7)],
             "negate/exp/add/divide are consumed by the fusion and must be lowered by nothing"
         );
     }
@@ -2860,15 +3671,47 @@ mod silu_chain_tests {
         );
     }
 
-    /// A bare silu with no multiply is not `Program::SiluMul`, and this door has no arm for a lone
-    /// silu — so it is named rather than half-lowered.
+    /// ⭐ THE SECOND TERMINAL FORM: the STORED BARE SILU. `elementwise.py`'s `silu_fwd` spells the
+    /// same five ops and stores `silu(x)` directly, with no `up` multiply — the per-`Program`
+    /// door's own elementwise arm lowered that as `("silu", 1)`, and routing elementwise through
+    /// this walk makes the walk the door for it. So the chain reader recognises the store terminal
+    /// as the chain's UNARY form rather than refusing what it just proved. (It WAS that refusal:
+    /// "this door has no arm for a lone silu" was true of the whole-function door until the
+    /// reroute; the per-`Program` elementwise arm it now feeds was always the arm.)
     #[test]
-    fn a_silu_with_no_multiply_is_refused_by_name() {
-        let e = program_silu_mul_chains(&chain(1.0, Num::Gate, false))
-            .expect_err("`SiluMul` is silu(gate)·up; a bare silu is not it");
+    fn a_stored_bare_silu_is_recognised_as_the_chain_s_unary_form() {
+        let f = stored_chain();
+        let cs = program_silu_mul_chains(&f).expect("the stored longhand is the same five ops");
+        assert_eq!(cs.len(), 1, "one `arith.negf` heads one chain");
+        let c = &cs[0];
+        assert_eq!(c.gate, Ssa(0), "the gate is the value the negate consumed");
         assert!(
-            e.message.contains("silu(x)") || e.message.contains("nothing reads"),
-            "the refusal must say the multiply is what is missing; got: {}",
+            c.up.is_none(),
+            "no `up`: the longhand ends at the stored `silu(x)`"
+        );
+        assert_eq!(
+            c.mul,
+            Ssa(6),
+            "the terminal is the divide's own result — the value the store writes"
+        );
+        assert_eq!(
+            c.consumed,
+            vec![Ssa(3), Ssa(4), Ssa(5)],
+            "negate/exp/add are consumed by the fusion; the divide is the terminal, exactly as \
+             the multiply is for the fused form"
+        );
+    }
+
+    /// A longhand whose result NOTHING reads — neither an `up` multiply nor a store — is still
+    /// refused: the five ops compute a value the program throws away, and no fused op stands for
+    /// one of those.
+    #[test]
+    fn a_silu_with_no_reader_at_all_is_refused_by_name() {
+        let e = program_silu_mul_chains(&chain(1.0, Num::Gate, false))
+            .expect_err("a longhand nothing reads is not a program this door lowers");
+        assert!(
+            e.message.contains("nothing reads `silu(x)`"),
+            "the refusal must say the terminal is what is missing; got: {}",
             e.message
         );
     }

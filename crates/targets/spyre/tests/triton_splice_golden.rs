@@ -76,7 +76,6 @@ fn spliced_rmsnorm_lowers_through_the_door() {
         // the descriptors that reach the card are minted here, so a door refusal is a
         // broken row, not a fallback.
         let mut sym = 0i64;
-        let mut quantized = HashSet::new();
         let _emitted = door_lower(
             spliced
                 .ktir
@@ -84,7 +83,6 @@ fn spliced_rmsnorm_lowers_through_the_door() {
                 .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
-            &mut quantized,
             None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
@@ -133,7 +131,6 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
 
         // The program lowers through the production door under the walk's own layout.
         let mut sym = 0i64;
-        let mut quantized = HashSet::new();
         let emitted = door_lower(
             spliced
                 .ktir
@@ -141,7 +138,6 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
                 .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
-            &mut quantized,
             None,
         )
         .unwrap_or_else(|e| panic!("oneplus program lowered (m={m} c={c}): {}", e.message));
@@ -252,7 +248,6 @@ fn spliced_silumul_lowers_through_the_door() {
 
         // The program lowers through the production door under the walk's own layout.
         let mut sym = 0i64;
-        let mut quantized = HashSet::new();
         let _emitted = door_lower(
             spliced
                 .ktir
@@ -260,7 +255,6 @@ fn spliced_silumul_lowers_through_the_door() {
                 .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
-            &mut quantized,
             None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
@@ -335,7 +329,6 @@ fn a_column_chunked_silumul_splices_through_the_door() {
     // Through the door: the regions the door reads must resolve, or the descriptors
     // mis-address on the card.
     let mut sym = 0i64;
-    let mut quantized = HashSet::new();
     let _emitted = door_lower(
         spliced
             .ktir
@@ -343,7 +336,6 @@ fn a_column_chunked_silumul_splices_through_the_door() {
             .expect("spliced op carries its program"),
         &mut sym,
         Some(&layout),
-        &mut quantized,
         None,
     )
     .unwrap_or_else(|e| panic!("spliced program lowered: {}", e.message));
@@ -429,7 +421,6 @@ fn spliced_elementwise_lowers_through_the_door() {
 
             // The program lowers through the production door under the walk's own layout.
             let mut sym = 0i64;
-            let mut quantized = HashSet::new();
             let _emitted = door_lower(
                 spliced
                     .ktir
@@ -437,7 +428,6 @@ fn spliced_elementwise_lowers_through_the_door() {
                     .expect("spliced op carries its program"),
                 &mut sym,
                 Some(&layout),
-                &mut quantized,
                 None,
             )
             .unwrap_or_else(|e| {
@@ -492,6 +482,16 @@ const MATMUL_SHAPES: &[(u32, u32, u32)] = &[
     (1, 2048, 512),   // decode, non-square
     (31, 2048, 2048), // prefill rung, square (both orientations pass extents)
     (31, 2048, 512),  // NON-SQUARE — the orientation discriminator (a tile of a wide N)
+    // The MLP WIDTHS the hidden-width rows never reach: gate/up at 2b's d_ff=8192 and the
+    // down projection's K=8192 form. Pinned when the sweep found the 8b-shaped
+    // `swiglu_mlp_granite` FRONTEND FIXTURE tripping `assemble_matmul`'s placement-footprint
+    // panic through the whole door (pre-existing, fixture-blocking-specific): the real
+    // spliced programs at these shapes lower clean at every rung — these rows keep it
+    // that way.
+    (1, 2048, 8192),  // 2b decode, gate/up — the MLP width every chat token runs
+    (1, 8192, 2048),  // 2b decode, down
+    (31, 2048, 8192), // 2b prefill rung, gate/up
+    (31, 8192, 2048), // 2b prefill rung, down
 ];
 
 #[test]
@@ -519,7 +519,6 @@ fn spliced_dense_matmul_lowers_through_the_door() {
 
         // The program lowers through the production door under the walk's own layout.
         let mut sym = 0i64;
-        let mut quantized = HashSet::new();
         let _emitted = door_lower(
             spliced
                 .ktir
@@ -527,7 +526,6 @@ fn spliced_dense_matmul_lowers_through_the_door() {
                 .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
-            &mut quantized,
             None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {}", e.message));
@@ -869,7 +867,6 @@ fn spliced_scalarmul_lowers_through_the_door() {
         // the node payload, so a splice that states a different scale than the node's
         // fails HERE by registry desync rather than by a wrong number on the card.
         let mut sym = 0i64;
-        let mut quantized = HashSet::new();
         let _emitted = door_lower(
             spliced
                 .ktir
@@ -877,7 +874,6 @@ fn spliced_scalarmul_lowers_through_the_door() {
                 .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
-            &mut quantized,
             None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
@@ -930,7 +926,6 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
             "op_name (chunk {chunk_idx}, c_start {c_start})"
         );
 
-        let mut quantized = HashSet::new();
         let _emitted = door_lower(
             spliced
                 .ktir
@@ -938,7 +933,6 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
                 .expect("spliced op carries its program"),
             &mut splice_sym,
             Some(&layout),
-            &mut quantized,
             None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (chunk {chunk_idx}): {}", e.message));
@@ -1183,7 +1177,6 @@ fn batched_decode_odd_vocab_lm_head_splices() {
 
     // Through the production door under the walk's own layout.
     let mut sym = 0i64;
-    let mut quantized = HashSet::new();
     let _emitted = door_lower(
         spliced
             .ktir
@@ -1191,7 +1184,6 @@ fn batched_decode_odd_vocab_lm_head_splices() {
             .expect("spliced op carries its program"),
         &mut sym,
         Some(&layout),
-        &mut quantized,
         None,
     )
     .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {}", e.message));
@@ -1235,11 +1227,10 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
         // Each program through the door under the SAME layout, symbol counters
         // threaded in bundle order (the door's names are per-bundle).
         let mut s_sym = 0i64;
-        let mut quantized = HashSet::new();
         for s_op in &spliced_ops {
             let s_ktir = s_op.ktir.as_ref().expect("spliced op carries its program");
-            let _emitted = door_lower(s_ktir, &mut s_sym, Some(&layout), &mut quantized, None)
-                .unwrap_or_else(|e| {
+            let _emitted =
+                door_lower(s_ktir, &mut s_sym, Some(&layout), None).unwrap_or_else(|e| {
                     panic!(
                         "spliced program lowered (mq={mq} k={k} n={n}): {}",
                         e.message
@@ -1272,8 +1263,8 @@ const MATMUL_FP8_SHAPES: &[(u32, u32, u32)] = &[
 /// The fp8 W8A8 row's gate: the spliced `matmul_fp8.py` program through the door.
 /// The program is `Program::Matmul` with an fp8 weight view and arity-3 bindings, so
 /// the door emits its 12-op W8A8 chain (abs→amax→amaxfl→ascale→invs→sc→chi→cl→
-/// qfp8ch→batchmatmulfp8→dqa→dqw) — at one-node grain the `quantized` set is fresh,
-/// so no dedup can hide a missing link in the chain.
+/// qfp8ch→batchmatmulfp8→dqa→dqw) — at one-node grain no dedup can hide a missing
+/// link in the chain.
 #[test]
 fn spliced_fp8_matmul_lowers_through_the_door() {
     for &(m, k, n) in MATMUL_FP8_SHAPES {
@@ -1297,10 +1288,8 @@ fn spliced_fp8_matmul_lowers_through_the_door() {
         );
 
         // The program lowers through the production door under the walk's own layout.
-        // A FRESH `quantized` set: at one-node grain no dedup fires, so the full
-        // quant chain is emitted and the chain itself is minted.
+        // One node is one grain: the full quant chain is emitted and minted.
         let mut sym = 0i64;
-        let mut quantized = HashSet::new();
         let _emitted = door_lower(
             spliced
                 .ktir
@@ -1308,7 +1297,6 @@ fn spliced_fp8_matmul_lowers_through_the_door() {
                 .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
-            &mut quantized,
             None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {}", e.message));
@@ -1604,12 +1592,10 @@ fn spliced_rope_lowers_through_the_door() {
                 oproj_wtid: None,
             };
             let mut sym = 0i64;
-            let mut quantized = HashSet::new();
             let _emitted = door_lower(
                 spliced.ktir.as_ref().expect("spliced op carries its program"),
                 &mut sym,
                 Some(&layout),
-                &mut quantized,
                 Some(attn_params),
             )
             .unwrap_or_else(|e| {
@@ -2155,12 +2141,10 @@ fn spliced_attn_lowers_through_the_door() {
                 oproj_wtid: None,
             };
             let mut sym = 0i64;
-            let mut quantized = HashSet::new();
             let _emitted = door_lower(
                 spliced.ktir.as_ref().expect("spliced op carries its program"),
                 &mut sym,
                 Some(&layout),
-                &mut quantized,
                 Some(attn_params),
             )
             .unwrap_or_else(|e| {

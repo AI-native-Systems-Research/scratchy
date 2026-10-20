@@ -7165,10 +7165,6 @@ fn ktir_groups_via_superdsc(
     // walk threads it: a per-op restart would alias addresses across ops in one bundle.
     let mut sym_id_base: i64 = 0;
     let mut sdsc_ops: Vec<EmittedOp> = Vec::new();
-    // fp8 activation-quantize dedup, per BUNDLE — main's own set, threaded the way its tape walk
-    // threaded it: q/k/v share one rms output and gate/up another, so each distinct activation is
-    // quantized ONCE and the later matmuls emit only `matmulfp8` + dequant.
-    let mut fp8_quantized: std::collections::HashSet<String> = std::collections::HashSet::new();
     // (program name, descriptors) — written into the dump's `bundle_id.json`, since the eprintln below
     // is invisible on a successful build.
     let mut per_prog: Vec<(String, usize)> = Vec::new();
@@ -7196,16 +7192,10 @@ fn ktir_groups_via_superdsc(
             ))
         })?;
         let _pc_cls = crate::pc::Pc::start(crate::pc::mint_class(&e.op_name));
-        let lowered = crate::ktir_superdsc_door::lower(
-            k,
-            &mut sym_id_base,
-            layout,
-            &mut fp8_quantized,
-            attn_params,
-        )
-        .map_err(|err| {
-            SuperDscError(format!("{}: KTIR -> SuperDSC: {}", e.op_name, err.message))
-        })?;
+        let lowered = crate::ktir_superdsc_door::lower(k, &mut sym_id_base, layout, attn_params)
+            .map_err(|err| {
+                SuperDscError(format!("{}: KTIR -> SuperDSC: {}", e.op_name, err.message))
+            })?;
         drop(_pc_cls);
         crate::pc::count(crate::pc::mint_class(&e.op_name), lowered.len() as u64);
         // ⭐ PER-PROGRAM ATTRIBUTION, because a TRIP IS NOT A DESCRIPTOR. `render_dxp_input`
@@ -8332,12 +8322,10 @@ mod tests {
             .expect("the tail emits an extraction program");
         extract.ktir.as_mut().expect("its KTIR").node_out_tid = None;
         let mut sym = 0i64;
-        let mut fp8q = std::collections::HashSet::new();
         let stripped = crate::ktir_superdsc_door::lower(
             extract.ktir.as_ref().unwrap(),
             &mut sym,
             Some(&layout),
-            &mut fp8q,
             None,
         );
         let why = match stripped {
@@ -8424,12 +8412,22 @@ mod tests {
     }
 
     #[test]
-    fn fp8_shared_activation_quantizes_once() {
+    fn fp8_shared_activation_quantizes_per_matmul_until_the_dedup_is_threaded() {
         // granite decode emits q/k/v = gemm(normed, ·) — THREE arity-3 fp8 matmuls reading the SAME
         // activation (and gate/up = gemm(normed2, ·) — two more). The per-token activation quantize
-        // (square→amax→scale→clamp→qfp8ch) is a PURE function of the activation, independent of the weight,
-        // so it must be emitted ONCE and shared — not re-run per matmul. Lock that: two arity-3 fp8 matmuls
-        // sharing t0 emit exactly ONE `fq_afp8_op` (qfp8ch) yet still TWO `fq_mm` (per-matmul matmulfp8).
+        // (square→amax→scale→clamp→qfp8ch) is a PURE function of the activation, independent of the
+        // weight, so it is worth emitting ONCE and sharing — and the per-`Program` door did exactly
+        // that, threading one bundle-wide `quantized` set through every fp8 matmul it lowered.
+        //
+        // ⛔ PR-A'S REROUTE DROPPED THAT DEDUP, AND THE RULING STATES IT RATHER THAN SILENTLY
+        // LOSING IT: the six easy families now lower through `whole_function::lower_function`,
+        // which lowers ONE op at a time and owns no bundle-wide set — so each fp8 matmul quantizes
+        // the shared activation itself. The door's own doc carries the same statement
+        // ("⛔ THE fp8 ACTIVATION-QUANTIZE DEDUP IS NOT THREADED THROUGH THE WALK, AND THAT IS
+        // STATED RATHER THAN SILENT"), and the follow-up threads the set where it is consumed.
+        // Until then this test pins WHAT IS: per-matmul chains (fq_afp8_op/fq_qspt_op/fq_clip_op
+        // == the matmul count), each still the FUSED per-op chain its name states — a silent
+        // revert to the unfused 4-op/2-op forms must still fail below.
         use scratchy_subtile::subtile_ir::{
             SubOp, SubtileIR, SubtileId, SubtileNode, TensorId, TensorRegion, TensorShape,
         };
@@ -8491,29 +8489,33 @@ mod tests {
             .filter(|o| o.op_name.ends_with("fq_afp8_op"))
             .count();
         assert_eq!(
-            quantizes, 1,
-            "two matmuls sharing an activation must quantize it ONCE (shared), got {quantizes}"
+            quantizes, 2,
+            "until the bundle-wide dedup is threaded through the walk, each of the two matmuls \
+             quantizes the shared activation itself — and this count is the STATED regression the \
+             door's doc names, not a silent one; got {quantizes}"
         );
         let matmuls = ops.iter().filter(|o| o.op_name.ends_with("fq_mm")).count();
         assert_eq!(
             matmuls, 2,
             "each fp8 matmul still emits its OWN matmulfp8 (weight differs), got {matmuls}"
         );
-        // The FIRST chain op is likewise shared: one, not two. It is now the fused per-token scale
-        // (`fq_qspt_op` — `quantscalepertokenfp8`), which subsumed the `abs` (`fq_absx_op`) that
-        // subsumed the `square` (`fq_sq_op`) this test originally named.
+        // The FIRST chain op likewise rides per-matmul now (the same stated regression): the fused
+        // per-token scale (`fq_qspt_op` — `quantscalepertokenfp8`), which subsumed the `abs`
+        // (`fq_absx_op`) that subsumed the `square` (`fq_sq_op`) this test originally named.
         //
         // ⛔ THE NAME IS THE ONLY THING THAT MOVES HERE, AND AN OUT-OF-DATE NAME MAKES THIS ASSERT
         // VACUOUS IN THE PASSING DIRECTION — it would be counting zero of something that no longer
         // exists, which is exactly how the `fq_sq_op` spelling survived. So it is pinned to the op the
-        // chain ACTUALLY starts with, and the count stays exactly 1 (shared, not per-matmul).
+        // chain ACTUALLY starts with, and the count stays the matmul count (per-op, until the dedup
+        // returns).
         let first_chain_op = ops
             .iter()
             .filter(|o| o.op_name.ends_with("fq_qspt_op"))
             .count();
         assert_eq!(
-            first_chain_op, 1,
-            "the fused per-token activation scale must be shared too, got {first_chain_op}"
+            first_chain_op, 2,
+            "the fused per-token activation scale rides each matmul's own chain until the dedup is \
+             threaded, got {first_chain_op}"
         );
         // ⭐ AND THE OP IT REPLACED MUST BE GONE, so a silent revert to the 4-op chain cannot leave this
         // test green: `fq_absx_op` counting 1 and `fq_qspt_op` counting 1 would both hold if BOTH were
@@ -8531,16 +8533,18 @@ mod tests {
             replaced, 0,
             "the 4 ops `quantscalepertokenfp8` subsumes must no longer be emitted, got {replaced}"
         );
-        // ⭐ SAME LAW FOR THE CLAMP TAIL: the fused `clip` is likewise shared (one per distinct
-        // activation), and the `minimum`/`maximum` pair it subsumes must be gone — the same
-        // vacuous-green trap, so a silent revert to the 2-op clamp cannot leave this green either.
+        // ⭐ SAME LAW FOR THE CLAMP TAIL: the fused `clip` rides each matmul's own chain (per-op,
+        // the same stated regression), and the `minimum`/`maximum` pair it subsumes must be gone —
+        // the same vacuous-green trap, so a silent revert to the 2-op clamp cannot leave this green
+        // either.
         let clip = ops
             .iter()
             .filter(|o| o.op_name.ends_with("fq_clip_op"))
             .count();
         assert_eq!(
-            clip, 1,
-            "the fused ±448 clamp must be shared too, got {clip}"
+            clip, 2,
+            "the fused ±448 clamp rides each matmul's own chain until the dedup is threaded, got \
+             {clip}"
         );
         let clamp_pair = ops
             .iter()
