@@ -300,20 +300,39 @@ fn the_gathered_operand_must_be_the_last_input() {
     );
 }
 
-/// ⛔⛔⛔ ONLY THE ENTRY AXIS MAY CARRY A SPLIT — the half of `gather_copy_opspec`'s reasoning that
-/// transfers to any gather.
+/// ⭐ A ONE-ROW LOOKUP IS THE VENDOR'S OWN ONE-CORE GATHER — `dxp/test/test_gather_1core`'s
+/// shape (`maxDimSizes_ [1,-1,-1]`), the same one this file's header cites as the narrower of
+/// the door's two cases.
 ///
-/// `skip_addr` is `page x the PER-CORE extents of the unpinned dims`, so a split `out` divides the
-/// entry. At one row there are no `mb` positions to spend cores on, so `distribute_cores` must take
-/// them from `out` — and that is the case this refuses.
-///
-/// ⛔ ONE-SIDED, like the one above: `ROWS = 256` is the passing arm and it is every other test here.
+/// `skip_addr` is `page x the PER-CORE extents of the unpinned dims`, so a split `out` divides
+/// the entry — the wrong-byte shape. At one row there are no `mb` positions to spend cores on,
+/// and the ruling (10-20) is that the cores the entries cannot take are LEFT IDLE, never
+/// filled by that split: the mint runs on `min(entries, cores)` cores over `mb` alone, so a
+/// 1-entry lookup emits on ONE core with `out` whole. What this file refused twice before
+/// (first by inspecting the emitted division, then at the mint as "fewer entries than cores")
+/// was the fill policy, not a byte law — the KV copy and the gathered matmul are card-proven
+/// at fewer cores than the machine.
 #[test]
-fn a_split_outside_the_entry_axis_is_refused() {
-    let msg = emit(1, COLS).expect_err("a 1-row lookup must be refused, not emitted");
+fn a_one_row_lookup_is_the_vendors_own_one_core_gather() {
+    let legs = emit_legs(1, COLS).expect("a 1-row lookup emits — one entry, one core");
+    assert_eq!(
+        legs.len(),
+        1,
+        "one entry is one leg, under the 32-entry cap"
+    );
+    let op = legs[0]
+        .op
+        .as_ref()
+        .expect("a gathered pointwise has a descriptor");
+    assert_eq!(
+        op.numCoresUsed_, 1,
+        "one entry runs on one core — the other 31 idle, never filled by a split"
+    );
     assert!(
-        msg.contains("skip_addr") && msg.contains("out"),
-        "the refusal must name the derived quantity and the axis. Got: {msg}"
+        op.numWkSlicesPerDim_.values().all(|&s| s == 1),
+        "`out` is never the filler: whole, all {COLS_STICKS} sticks, and `mb`'s one entry unsplit — \
+         every dim's split is 1. Got {:?}",
+        op.numWkSlicesPerDim_
     );
 }
 
@@ -361,7 +380,7 @@ fn the_same_op_without_a_gather_declares_none() {
         ktir_superdsc::addr::OutCorner::ZERO,
         false,
         None,
-        ktir_superdsc::work::EwDivision::Law,
+        ktir_superdsc::work::CoreDivision::Ew(ktir_superdsc::work::EwDivision::Law),
     )
     .expect("the ungathered op builds");
     assert!(
