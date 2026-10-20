@@ -145,18 +145,7 @@ fn wait4_child(child: &mut Child) -> Result<ChildUsage> {
     // writes through and does not retain.
     let rc = unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
     anyhow::ensure!(rc == pid, "wait4({pid}) returned {rc}");
-    let ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
-    let how = if libc::WIFSIGNALED(status) {
-        format!("signal {}", libc::WTERMSIG(status))
-    } else {
-        format!("exit {}", libc::WEXITSTATUS(status))
-    };
-    Ok(ChildUsage {
-        peak_rss_mib: rss_to_mib(ru.ru_maxrss as i64),
-        major_faults: ru.ru_majflt as i64,
-        ok,
-        status: how,
-    })
+    Ok(usage_of(status, ru))
 }
 
 /// The process group of the server child currently running, for the signal
@@ -182,6 +171,18 @@ fn spawn_child(argv: &[String]) -> Result<Child> {
 
 /// Kill the child's whole process group, then reap the child itself.
 ///
+/// How long `kill_group` waits after SIGTERM before it sends SIGKILL. Mirrors
+/// the metal aligned-weights sidecar writer's own drain budget
+/// (`DRAIN_BUDGET_SECS` in `join_sidecar_writers`): a server tearing down
+/// gracefully flushes one-time on-disk caches, the sidecar's background writer
+/// only persists its build through that drain, and the writer's own watchdog
+/// cancels a wedged write at the same 300 s this waits — so a healthy drain is
+/// never killed mid-write, and a stuck child never stalls the harness past the
+/// deadline its own shutdown would have enforced anyway. A server with nothing
+/// to flush exits on SIGTERM at once, so a launch that built nothing pays
+/// nothing.
+const KILL_GRACE: Duration = Duration::from_secs(300);
+
 /// A server is not necessarily one process. vLLM's API server spawns
 /// `VLLM::EngineCore` separately, so `Child::kill` — which signals exactly one
 /// pid — left the engine orphaned to init still holding 72444 MiB of device
@@ -191,6 +192,17 @@ fn spawn_child(argv: &[String]) -> Result<Child> {
 ///
 /// Kill before reap, as `wait4_child` explains: reaping frees the pid, and a
 /// freed pid may be recycled into an unrelated process group.
+///
+/// SIGTERM first, SIGKILL only after [`KILL_GRACE`]. The order is
+/// load-bearing, not politeness: the ladder's COLD/WARM rungs mean "the
+/// derived on-disk caches are populated", and a cache that is only written by
+/// a graceful shutdown never populates under a straight SIGKILL. The metal
+/// worker's aligned-weights sidecar is exactly that — its background writer
+/// is detached, persists only through `join_sidecar_writers` at exit, and a
+/// SIGKILL discards the build mid-write. Measured consequence: every primed
+/// launch re-paid the realign copy (peak RSS ≈ 2× the weights, #411), so the
+/// ladder's COLD/WARM reps measured the one-shot copy path instead of the
+/// settled state their rung names.
 fn kill_group(child: &mut Child) -> Result<ChildUsage> {
     let pid = child.id() as libc::pid_t;
     // A child that died during startup was already reaped by `wait_ready`'s
@@ -200,13 +212,61 @@ fn kill_group(child: &mut Child) -> Result<ChildUsage> {
         // SAFETY: `pid` is a live, unreaped child that `spawn_child` placed in
         // a new group of its own, so `-pid` names that group and nothing else.
         // The only failure is ESRCH, i.e. the tree is already gone.
+        unsafe { libc::kill(-pid, libc::SIGTERM) };
+        // Wait out the grace period with wait4(WNOHANG), not `try_wait`: the
+        // reap must land here, with the rusage of *this* child attached —
+        // `try_wait` would also reap, but its cached status leaves the
+        // blocking wait4 below nothing to wait for (ECHILD).
+        let deadline = Instant::now() + KILL_GRACE;
+        loop {
+            let mut status: libc::c_int = 0;
+            let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+            // SAFETY: WNOHANG on our own live, unreaped child; `wait4` only
+            // writes through the status and rusage pointers it is given.
+            let rc = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut ru) };
+            anyhow::ensure!(rc != -1, "wait4(WNOHANG, {pid}) returned {rc}");
+            if rc == pid {
+                CHILD_GROUP.store(0, Ordering::SeqCst);
+                return Ok(usage_of(status, ru));
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Overran the grace — the hard stop the child's own shutdown watchdog
+        // would have enforced by now.
+        // SAFETY: as above; the child is still unreaped, so `-pid` still
+        // names its group.
         unsafe { libc::kill(-pid, libc::SIGKILL) };
+        // A child that moved itself out of the group would escape the signal above;
+        // this one cannot miss it, and is a no-op when the group kill worked.
+        let _ = child.kill();
     }
-    // A child that moved itself out of the group would escape the signal above;
-    // this one cannot miss it, and is a no-op when the group kill worked.
-    let _ = child.kill();
     CHILD_GROUP.store(0, Ordering::SeqCst);
     wait4_child(child)
+}
+
+/// A reaped child's status and rusage as a [`ChildUsage`]. Shared by the
+/// blocking reap in `wait4_child` and the WNOHANG reap inside `kill_group`'s
+/// grace loop, so both report exit status and resource usage identically.
+fn usage_of(status: libc::c_int, ru: libc::rusage) -> ChildUsage {
+    let ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    let how = if libc::WIFSIGNALED(status) {
+        format!("signal {}", libc::WTERMSIG(status))
+    } else {
+        format!("exit {}", libc::WEXITSTATUS(status))
+    };
+    ChildUsage {
+        // `rusage`'s counters are `i64` on every supported target (apple
+        // spells them i64, linux `c_long` — i64 on the 64-bit targets CI
+        // runs), so no cast is needed and one would trip
+        // `unnecessary_cast` on apple.
+        peak_rss_mib: rss_to_mib(ru.ru_maxrss),
+        major_faults: ru.ru_majflt,
+        ok,
+        status: how,
+    }
 }
 
 /// Make Ctrl-C tear the child's group down too.

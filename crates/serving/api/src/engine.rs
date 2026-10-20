@@ -2070,11 +2070,24 @@ impl AsyncEngine {
         let (sched_tx, sched_rx) = tokio::sync::mpsc::channel::<ExecutorWork>(2);
         let (model_tx, mut model_rx) = tokio::sync::mpsc::channel::<ExecutorResult>(2);
 
-        // Spawn the executor on a dedicated OS thread.
-        std::thread::Builder::new()
-            .name("scratchy-serving-worker".into())
-            .spawn(move || executor_thread_loop(executor, sched_rx, model_tx))
-            .expect("failed to spawn executor thread");
+        // Spawn the executor on a dedicated OS thread, and own both its
+        // channel sender and its join handle in one guard moved into the
+        // loop below. A bare `spawn` whose handle is dropped detaches the
+        // thread: nothing then waits out the teardown it runs at the end
+        // (`executor.shutdown()` → the worker's sidecar drain and residency
+        // release), so the process exited mid-drain whenever the loop ended
+        // — measured as the aligned-weights sidecar being discarded
+        // mid-write on every SIGTERM'd launch (#411), the step loop's task
+        // finishing while the executor thread was still shutting down.
+        let executor_pipe = ExecutorPipeline {
+            tx: Some(sched_tx),
+            thread: Some(
+                std::thread::Builder::new()
+                    .name("scratchy-serving-worker".into())
+                    .spawn(move || executor_thread_loop(executor, sched_rx, model_tx))
+                    .expect("failed to spawn executor thread"),
+            ),
+        };
 
         async move {
             // Pre-scheduling with deferred finalization:
@@ -2102,7 +2115,8 @@ impl AsyncEngine {
                 // 0. Drain pending embedding requests.
                 while let Ok(embed_req) = embed_rx.try_recv() {
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                    if sched_tx
+                    if executor_pipe
+                        .tx()
                         .send(ExecutorWork::Embed(embed_req.token_id_seqs, reply_tx))
                         .await
                         .is_err()
@@ -2120,7 +2134,7 @@ impl AsyncEngine {
 
                 // 0b. Drain control messages.
                 while let Ok(msg) = control_rx.try_recv() {
-                    Self::handle_control_message_async(&mut client, msg, &sched_tx).await;
+                    Self::handle_control_message_async(&mut client, msg, executor_pipe.tx()).await;
                 }
 
                 // 1. Drain pending request submissions (non-blocking).
@@ -2168,7 +2182,8 @@ impl AsyncEngine {
                     match client.schedule_next() {
                         Ok(Some(sched)) => {
                             let speculative = sched.is_speculative() && !sched.spec_pipeline.leads;
-                            if sched_tx
+                            if executor_pipe
+                                .tx()
                                 .send(ExecutorWork::Execute(Box::new(sched)))
                                 .await
                                 .is_err()
@@ -2256,7 +2271,8 @@ impl AsyncEngine {
                             }
                             Some(embed_req) = embed_rx.recv() => {
                                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                                if sched_tx
+                                if executor_pipe
+                                    .tx()
                                     .send(ExecutorWork::Embed(
                                         embed_req.token_id_seqs,
                                         reply_tx,
@@ -2278,7 +2294,7 @@ impl AsyncEngine {
                                 continue;
                             }
                             Some(msg) = control_rx.recv() => {
-                                Self::handle_control_message_async(&mut client, msg, &sched_tx).await;
+                                Self::handle_control_message_async(&mut client, msg, executor_pipe.tx()).await;
                                 continue;
                             }
                             else => break, // All channels closed.
@@ -2327,7 +2343,7 @@ impl AsyncEngine {
             }
 
             // Shutdown: drop the sender so the executor thread exits.
-            let _ = sched_tx.send(ExecutorWork::Shutdown).await;
+            let _ = executor_pipe.tx().send(ExecutorWork::Shutdown).await;
         }
     }
 
@@ -3882,6 +3898,43 @@ enum ExecutorResult {
     ),
 }
 
+/// Owns the async executor thread's channel sender and join handle, so the
+/// thread's teardown is waited out wherever the step loop's future ends —
+/// completed or dropped mid-await (a SIGTERM ends the process through
+/// `serve` returning, which can drop the loop's task before its own tail
+/// runs). [`Drop`] closes the channel first — the executor thread's cue to
+/// run `executor.shutdown()` (see `executor_thread_loop`) — then joins, so
+/// the worker shutdown the thread performs (the metal aligned-sidecar
+/// drain, the GPU residency release) completes before whatever dropped this
+/// proceeds. The sender is `Option` only so `Drop` can take it; the thread
+/// handle likewise. Mirrors the `InprocClient` pipeline's own
+/// drop-sender-then-join teardown in `core_client.rs`.
+struct ExecutorPipeline {
+    tx: Option<tokio::sync::mpsc::Sender<ExecutorWork>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ExecutorPipeline {
+    /// The sender, for as long as the pipeline is alive.
+    fn tx(&self) -> &tokio::sync::mpsc::Sender<ExecutorWork> {
+        self.tx
+            .as_ref()
+            .expect("executor pipeline sender already dropped")
+    }
+}
+
+impl Drop for ExecutorPipeline {
+    fn drop(&mut self) {
+        // Close the channel before joining: the executor thread exits its
+        // work loop on a closed channel (running its teardown), and would
+        // otherwise sit in `blocking_recv` forever waiting for this sender.
+        drop(self.tx.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// The executor thread's main loop.
 ///
 /// Receives work items from the step loop, executes them, and sends results
@@ -3920,12 +3973,29 @@ fn executor_thread_loop(
             ExecutorWork::IsSleeping(reply) => {
                 let _ = reply.send(executor.is_sleeping());
             }
-            ExecutorWork::Shutdown => {
-                executor.shutdown();
-                break;
-            }
+            // The teardown itself runs once, below the loop: `Shutdown`
+            // breaks out of it, and a channel that closed without `Shutdown`
+            // must reach the same call.
+            ExecutorWork::Shutdown => break,
         }
     }
+    // Shut down on EVERY exit from the loop, not just the explicit
+    // `Shutdown` work item. The other exit — the channel closing — is the
+    // common way a SIGTERM ends this server: the step loop's task is
+    // dropped when the tokio runtime tears down after `serve` returns,
+    // racing the loop's own wake-and-break (its tail sends `Shutdown`
+    // only if it gets to run first), so the executor thread used to see a
+    // closed channel and exit silently, skipping `worker.shutdown()`.
+    // Measured consequence: the metal worker's aligned-sidecar drain never
+    // ran — the background writer was killed mid-write and its build
+    // discarded, so every launch re-paid the cold realign copy (#411) —
+    // and the wired GPU residency was left to the kernel's intermittent
+    // reclaim instead of the deterministic release this path promises.
+    // With the teardown here, the dropping thread's `InprocClient` join
+    // (which is what closed the channel) waits out the drain before the
+    // process can exit. The sibling `executor_bg_loop` has always run
+    // this same tail on its own channel-close path.
+    executor.shutdown();
 }
 
 /// Route step outputs to request states and update metrics.
