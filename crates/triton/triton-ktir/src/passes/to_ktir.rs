@@ -3393,10 +3393,7 @@ module {
     fn a_dtype_changing_reshape_is_refused() {
         let src = RESHAPE.replacen("-> tensor<8x512xf16>", "-> tensor<8x512xf32>", 1);
         let e = run_on(&src, &[8]).unwrap_err();
-        assert!(
-            e.message.contains("a silently mistyped tile"),
-            "got {e}"
-        );
+        assert!(e.message.contains("a silently mistyped tile"), "got {e}");
     }
 
     #[test]

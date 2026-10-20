@@ -161,8 +161,7 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
             });
         }
     }
-    let index_tids: std::collections::BTreeSet<u32> =
-        gathers.iter().map(|g| g.index_tid).collect();
+    let index_tids: std::collections::BTreeSet<u32> = gathers.iter().map(|g| g.index_tid).collect();
 
     let mut placements: std::collections::BTreeMap<u32, TensorPlacement> = Default::default();
     // Bytes placed per segment so far — the running high-water [`pack`] appends at.
@@ -1030,9 +1029,10 @@ mod tests {
         // BOTH ids buffers are 64-entry i32 vectors: 256 B each at SenUint32,
         // 128 B at the fp16 default the first-only reading left the second at.
         for (tid, what) in [(403u32, "ids A"), (404, "ids B")] {
-            let p = layout.placements.get(&tid).unwrap_or_else(|| {
-                panic!("{what} (t{tid}) has no placement")
-            });
+            let p = layout
+                .placements
+                .get(&tid)
+                .unwrap_or_else(|| panic!("{what} (t{tid}) has no placement"));
             assert_eq!(
                 p.size, 256,
                 "{what} (t{tid}) is a 64-entry SENUINT32 index: 4 B an element. A size of \

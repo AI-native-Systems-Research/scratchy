@@ -55,7 +55,8 @@ fn two_pair_program() -> KtirNode {
     // Each table's indirect tile and its load.
     let (ind_kt, load_kt, ind_v, load_v) = (Ssa(12), Ssa(13), Ssa(14), Ssa(15));
     // The output view/tile, the zero outs, the two matmuls and their addf.
-    let (v_o, t_o, outs, mm_kt, mm_v, addf) = (Ssa(16), Ssa(17), Ssa(18), Ssa(19), Ssa(20), Ssa(21));
+    let (v_o, t_o, outs, mm_kt, mm_v, addf) =
+        (Ssa(16), Ssa(17), Ssa(18), Ssa(19), Ssa(20), Ssa(21));
 
     // The `Sym(1) + Dim(0)` subscript `gather_subscripts` builds. Both tiles
     // anchor at entry 0 (`intermediate_vars[1]` is the shared `zero`), which is
@@ -197,7 +198,12 @@ fn two_pair_program() -> KtirNode {
         // gathered B, summed.
         {
             let mut op = shape(
-                Operation::new(a, Some(mm_kt), OpKind::LinalgMatmul, &[val_a, load_kt, outs]),
+                Operation::new(
+                    a,
+                    Some(mm_kt),
+                    OpKind::LinalgMatmul,
+                    &[val_a, load_kt, outs],
+                ),
                 8,
                 64,
             );
@@ -403,9 +409,7 @@ fn two_tables_through_one_ids_each_matmul_gathers_its_own() {
                 .dscs_
                 .first()
                 .and_then(|m| m.values().next())
-                .is_some_and(|d| {
-                    d.computeOp_.iter().any(|c| c.opFuncName == "batchmatmul")
-                })
+                .is_some_and(|d| d.computeOp_.iter().any(|c| c.opFuncName == "batchmatmul"))
         })
         .collect();
     assert_eq!(
@@ -421,10 +425,7 @@ fn two_tables_through_one_ids_each_matmul_gathers_its_own() {
         .map(|mm| alloc_address(mm, "KERNEL"))
         .collect();
     for (i, b) in b_addrs.iter().enumerate() {
-        assert!(
-            b.is_some(),
-            "contraction {i} declares a KERNEL (B) operand"
-        );
+        assert!(b.is_some(), "contraction {i} declares a KERNEL (B) operand");
         assert_ne!(
             *b,
             Some(KT_ADDR),

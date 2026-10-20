@@ -135,8 +135,8 @@ fn disagreeing_inner_dimensions_are_refused_by_name() {
 #[test]
 fn a_rank_four_pair_is_refused_by_name() {
     let src = batched_dot_kernel("2, 2, 2, 64", "2, 2, 64, 16");
-    let e = codegen::compile(&src, &spec(), Target::spyre())
-        .expect_err("a rank-4 dot must be refused");
+    let e =
+        codegen::compile(&src, &spec(), Target::spyre()).expect_err("a rank-4 dot must be refused");
     let msg = e.to_string();
     assert!(
         msg.contains("got ranks 4 and 4"),

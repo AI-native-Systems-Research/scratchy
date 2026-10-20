@@ -2030,7 +2030,8 @@ module {
         let mut m = parse::parse(&src).unwrap();
         let e = run(&mut m).unwrap_err();
         assert!(
-            e.message.contains("does not state [b, M, K] x [b, K, N] -> [b, M, N]"),
+            e.message
+                .contains("does not state [b, M, K] x [b, K, N] -> [b, M, N]"),
             "the shape-law refusal must fire; got {e}"
         );
     }
