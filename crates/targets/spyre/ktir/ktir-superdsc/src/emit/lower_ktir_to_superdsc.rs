@@ -1317,8 +1317,17 @@ pub fn elementwise(
     };
     // HANDLE-FLOW, `silumul`'s own discipline: the handles are bound once and the operands
     // borrow them, because an `EwOperand` holds a `&Stk` that must outlive the builder call.
-    let out_h = rb(&out.name(), rows, cols);
-    let in_handles: Vec<_> = ins.iter().map(|x| rb(&x.name(), rows, cols)).collect();
+    // ⭐ AND THE HANDLE DECLARES THE **STORAGE**, NOT THE WINDOW: each region's own view
+    // `[v_rows, v_cols]` — the parent the corner arithmetic (`chunk_window`/`band_corner` over
+    // `rc_of`'s nest) addresses within. A handle declared at the window `[rows, cols]` makes the
+    // corner itself past-the-end (chunk 1 of the `[25, 15360]` MLP intermediate: corner 204800
+    // against a 179200-element declaration), which the operand mint refuses — the same
+    // annotation-only dims the `rbo` comment promises nothing reads but the checks.
+    let out_h = rb(&out.name(), out.v_rows, out.v_cols);
+    let in_handles: Vec<_> = ins
+        .iter()
+        .map(|x| rb(&x.name(), x.v_rows, x.v_cols))
+        .collect();
     let ew: Vec<_> = in_handles
         .iter()
         .zip(ins.iter())
@@ -1638,7 +1647,17 @@ fn elementwise_broadcast(
     let in_handles: Vec<_> = in_names
         .iter()
         .zip(ins)
-        .map(|(n, x)| rb(n, x.v_rows, x.c_len))
+        .zip(bcast)
+        .map(|((n, x), b)| match b {
+            // ⭐ A `Col` OPERAND'S STORAGE IS STICK-WIDE, not `[rows, 1]`: the row reduction that
+            // wrote it reserved `rows × 64` (`synth_footprint_bytes` rounds the inner extent up to
+            // a whole stick — the `rinv` law this arm's own header cites), and the RedStick read
+            // sweeps ONE STICK PER ROW. The operand mint checks that swept window against the
+            // handle's declaration, so the annotation now states the footprint the storage always
+            // had — `rb(name, rows, 64)`, the same handle `rmsnorm.rs` mints for `rinv`.
+            Some(BcastAxis::Col) => rb(n, x.v_rows, FP16_ELEMS_PER_STICK),
+            _ => rb(n, x.v_rows, x.c_len),
+        })
         .collect();
     let ew: Vec<_> = in_handles
         .iter()
@@ -1734,10 +1753,15 @@ pub fn silumul(
     };
     let (gate_w, up_w, out_w) = (window(gate_off)?, window(up_off)?, window(out_off)?);
     // HANDLE-FLOW: bind gate/up/tmp/out once; `tmp` flows from the silu output INTO the mul input.
-    let gate = rb(&gate, rows, cols);
-    let up = rb(&up, rows, cols);
-    let tmp = rb(&tmp, rows, cols);
-    let out = rb(&out, rows, cols);
+    // ⭐ THE HANDLES DECLARE THE **STORAGE**, like the corners above them: each tensor is the WHOLE
+    // `[rows, v_cols]` intermediate (the region's own view — `full_cols` is the chunk-relative
+    // width the corner arithmetic takes, which for a non-final chunk under-states the view). A
+    // handle at the chunk's `[rows, cols]` makes chunk 1's own corner past-the-end, which the
+    // operand mint refuses — the dims are annotation-only, so this changes no byte.
+    let gate = rb(&gate, rows, gate_r.v_cols);
+    let up = rb(&up, rows, up_r.v_cols);
+    let tmp = rb(&tmp, rows, o.v_cols);
+    let out = rb(&out, rows, o.v_cols);
     Ok(vec![
         assemble_pointwise_broadcast_off(
             &silu_name,
@@ -1911,15 +1935,47 @@ pub fn rmsnorm(
 /// satisfied by a narrower descriptor that computes fewer columns than the program states. And it is a
 /// no-op wherever the layout does reserve the pad, which is the lm-head logits case the rule exists
 /// for.
+/// Returns the width PAIR a pointwise op over `[rows, ·]` may emit at:
+///
+/// * **the op width** — the floored device width, dropped to what the placement holds when the
+///   excess is provably the floor's own pad (unchanged law); and
+/// * **the storage width** — what the placement holds PER ROW (the whole-view width the tensors
+///   are stored at, not any one chunk's), which is what the operand handles declare so the
+///   operand mint checks every swept window against the storage that actually holds it.
+///
+/// # ⛔⛔⛔ A PLACEMENT SMALLER THAN THE PROGRAM'S OWN WIDTH IS AN `Err`, NEVER A CAP
+///
+/// `view_cols` is the program's own width — the region's view, the columns the program
+/// states. When the narrowest placement among `names` holds LESS than that, the emission would
+/// have to compute fewer columns than the program states to fit — the SILENT wrong answer this
+/// function used to produce whenever its reproduction proof passed vacuously (the measured
+/// case: a `[512, 512]` whole-view mask add over a validity-shaped `[1, 139776]` reservation —
+/// `held = 279552/512` B/row → 273 elems → floor-stick 256, and `for_pointwise(256) == 512`
+/// "reproduced" the asked width, so the add baked at `[512, 256]`, half the causal triangle
+/// unswept and half the output unwritten while downstream max/sub/exp read all 512). Under the
+/// Win ruling that is unreachable: the refusal names the tensor, its placement and the width
+/// the program states, and the build fails instead of the descriptor lying.
+///
+/// The floor-drop band is unchanged and still legal: `view_cols ≤ held < cols` with the
+/// reproduction proof (`for_pointwise(held) == cols`) drops only the pad this rule's own floor
+/// added. A placement that holds AT LEAST the program's width but not the floor is the
+/// measured decoder-intermediate case (a `[64, 64]` score tile whose 64 columns `for_pointwise`
+/// bumps to the 8-stick occupancy floor) — the op emits at `held` and every byte is one the
+/// program states.
 fn pointwise_width_the_output_holds(
     layout: Option<&BundleLayout>,
     names: &[&str],
     rows: u32,
+    view_cols: u32,
     cols: u32,
-) -> u32 {
-    let Some(l) = layout else { return cols };
+) -> Result<(u32, u32), Error> {
+    let Some(l) = layout else {
+        // No layout (every unit test; the gate probes): the op keeps its floored width and the
+        // storage is the whole view at the same padding law.
+        return Ok((cols, DeviceWidth::for_pointwise(view_cols).get()));
+    };
     if rows == 0 {
-        return cols;
+        return Ok((cols, cols));
     }
     // ⭐ EVERY TENSOR THE OP ADDRESSES AT `cols`, NOT JUST THE OUTPUT. `cols` sizes the input view and
     // the output view alike, so the pad is only real if BOTH hold it — and MEASURED, the one that did
@@ -1948,16 +2004,33 @@ fn pointwise_width_the_output_holds(
         Some(((row_bytes / 2) as u32 / FP16_ELEMS_PER_STICK) * FP16_ELEMS_PER_STICK)
     };
     let Some(held) = names.iter().filter_map(|n| held_of(n)).min() else {
-        return cols;
+        return Ok((cols, cols));
     };
+    // ⛔⛔⛔ THE PROGRAM'S OWN WIDTH IS THE FLOOR OF THE LEGAL — a placement that cannot hold it is a
+    // reservation defect (the prefix-continuation mask's validity-shaped reservation under a
+    // whole-view score mask), and satisfying it with a narrower descriptor computes fewer columns
+    // than the program states. Refused BY NAME; never capped.
+    if held > 0 && held < view_cols {
+        let who = names
+            .iter()
+            .find(|n| held_of(n) == Some(held))
+            .copied()
+            .unwrap_or(names.first().copied().unwrap_or("the operand"));
+        return err(format!(
+            "a pointwise op over a [{rows}, {view_cols}] view whose narrowest placement '{who}' \
+             holds only {held} columns per row — the placement cannot hold the width the program \
+             itself states, so the only descriptor that fits would compute fewer columns than the \
+             program. This is a reservation defect, not a pad to drop: reserve '{who}' at the width \
+             the program states (or wider), or state the program's true width."
+        ));
+    }
     // THE PROOF: re-pad what the layout holds and require it to REPRODUCE the width we were about to
-    // emit. Only then is the excess demonstrably this rule's own pad; anything else is a genuine
-    // over-run and must still reach the footprint guard and be refused BY NAME, rather than be quietly
-    // satisfied by a narrower descriptor computing fewer columns than the program states.
+    // emit. Only then is the excess demonstrably this rule's own pad; anything else keeps `cols` and
+    // the operand mint / the footprint guard refuse the genuine over-run BY NAME.
     if held > 0 && held < cols && DeviceWidth::for_pointwise(held).get() == cols {
-        held
+        Ok((held, held))
     } else {
-        cols
+        Ok((cols, held.max(cols)))
     }
 }
 
@@ -2024,10 +2097,12 @@ mod pointwise_width_caps {
         l
     }
 
-    /// The width the guard returns for a single placed operand of `size` bytes at `cols`.
-    fn width_for(size: u64, cols: u32) -> u32 {
+    /// The OP width the guard returns for a single placed operand of `size` bytes, a program
+    /// view of `view` columns and a floored ask of `cols`.
+    fn width_for(size: u64, view: u32, cols: u32) -> Result<u32, Error> {
         let l = placed(size);
-        pointwise_width_the_output_holds(Some(&l), &[&act_name(1)], ROWS, cols)
+        pointwise_width_the_output_holds(Some(&l), &[&act_name(1)], ROWS, view, cols)
+            .map(|(op, _)| op)
     }
 
     /// ⛔ CASE (a) — THE MEASURED OVER-RUN. `qk · QK_SCALE` writes a `[64, 64]` tile;
@@ -2036,10 +2111,10 @@ mod pointwise_width_caps {
     #[test]
     fn an_under_reserved_intermediate_caps_the_pointwise_width() {
         assert_eq!(
-            width_for(64 * 64 * 2, 512),
+            width_for(64 * 64 * 2, 64, 512).expect("the floor pad drops"),
             64,
             "a `[64, 64]` tile holds 64 columns; emitting 512 is the measured \
-             `0B + 65536B exceeds footprint 8192B` refusal"
+             `0B + 65536B exceeds footprint 8192B` refusal — the floor's own pad, dropped"
         );
     }
 
@@ -2049,22 +2124,30 @@ mod pointwise_width_caps {
     #[test]
     fn a_fully_reserved_tensor_keeps_the_padded_width() {
         assert_eq!(
-            width_for(u64::from(ROWS) * 512 * 2, 512),
+            width_for(u64::from(ROWS) * 512 * 2, 512, 512).expect("the pad is reserved"),
             512,
             "when the layout reserves the padded width the pad is REAL and nothing may move"
         );
     }
 
-    /// ⛔ CASE (c) — A SHORTFALL THAT IS NOT THIS RULE'S PAD IS LEFT TO THE FOOTPRINT GUARD.
-    /// `for_pointwise(512)` is 512, which does not reproduce the 1024 asked for, so this is a real
-    /// over-run: `cols` comes back unchanged and the refusal happens by name. Remove the reproduction
-    /// check and this returns 512 while (a) and (b) stay green.
+    /// ⛔ CASE (c) — A PLACEMENT SMALLER THAN THE PROGRAM'S OWN WIDTH IS REFUSED HERE, BY NAME.
+    /// The program states 1024 columns and the placement holds 512: the only descriptor that
+    /// fits would compute fewer columns than the program states — the silent wrong answer this
+    /// cap used to reach the footprint guard with (and, when the reproduction proof passed
+    /// vacuously, to bake — the `[512, 512]` mask add capped to `[512, 256]`). Under the Win
+    /// ruling the refusal happens at the width choice itself.
     #[test]
-    fn a_shortfall_that_is_not_this_rules_pad_is_left_to_the_footprint_guard() {
-        assert_eq!(
-            width_for(u64::from(ROWS) * 512 * 2, 1024),
-            1024,
-            "512 does not re-pad to 1024, so this is a real over-run and must NOT be narrowed away"
+    fn a_shortfall_below_the_programs_own_width_is_refused_by_name() {
+        let Err(e) = width_for(u64::from(ROWS) * 512 * 2, 1024, 1024) else {
+            panic!(
+                "a placement holding 512 of a 1024-column program was ACCEPTED — the only \
+                    descriptor that fits computes half the columns the program states"
+            )
+        };
+        assert!(
+            e.message.contains("reservation defect") && e.message.contains("[64, 1024]"),
+            "the refusal names the defect and the shape: {}",
+            e.message
         );
     }
 
@@ -2081,16 +2164,50 @@ mod pointwise_width_caps {
             .insert(narrow.to_string(), 64 * 64 * 2);
         let out = act_name(1);
         assert_eq!(
-            pointwise_width_the_output_holds(Some(&l), &[&out, narrow], ROWS, 512),
+            pointwise_width_the_output_holds(Some(&l), &[&out, narrow], ROWS, 64, 512)
+                .expect("the narrow input's floor pad drops")
+                .0,
             64,
             "the INPUT is the operand that does not hold the pad, and it lives in the synth \
              allocator rather than in `placements` — both halves of the bug this once had"
         );
         assert_eq!(
-            pointwise_width_the_output_holds(Some(&l), &[&out], ROWS, 512),
+            pointwise_width_the_output_holds(Some(&l), &[&out], ROWS, 64, 512)
+                .expect("the output alone holds the pad")
+                .0,
             512,
             "reading ONLY the output finds nothing wrong, which is why the minimum is taken over \
              every tensor the op addresses"
+        );
+    }
+
+    /// ⛔⛔⛔ THE VACUOUS PROOF — the measured silent cap this function's `Err` exists to make
+    /// unreachable. A `[512, 512]` whole-view mask add over a validity-shaped `[1, 139776]`
+    /// reservation: `held = 279552/512` B/row → 273 elems → floor-stick 256, and
+    /// `for_pointwise(256) == 512` "reproduced" the asked width — so the old cap narrowed the add
+    /// to `[512, 256]`, sweeping half the causal triangle and leaving half the output unwritten
+    /// while downstream max/sub/exp read all 512. The proof passing is EXACTLY what must not
+    /// satisfy a placement smaller than the program's own 512-column view.
+    #[test]
+    fn a_vacuously_reproducing_reservation_is_refused_not_capped() {
+        // The pod's own numbers: 279552 B over 512 rows → 273 elems/row → floor-stick 256.
+        let l = placed(279552);
+        let Err(e) = pointwise_width_the_output_holds(
+            Some(&l),
+            &[&act_name(1)],
+            512,
+            512,
+            DeviceWidth::for_pointwise(512).get(),
+        ) else {
+            panic!(
+                "the vacuous reproduction was ACCEPTED — the add bakes at [512, 256] and half \
+                    the causal triangle is never swept"
+            )
+        };
+        assert!(
+            e.message.contains("reservation defect"),
+            "the refusal names the class: {}",
+            e.message
         );
     }
 }
@@ -2999,13 +3116,19 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         // by a `[1, hd]` matmul, so reading it as `[1, stick]` slices declares a second arrangement for
         // one tensor and the arrangement authority rejects the bundle. Making decode stick-wide means
         // making the P matmul stick-wide too, which is a different rotate formulation, not a slice.
+        //
+        // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: every rope buffer — x/cos/sin (the worker's
+        // `[mq, total]` plane) and the rot/xc/rs intermediates — is `[mq, total]` in elements, and this
+        // op's `[1, hd]` window rides a `rope_prefill_block_offset` corner of it. The mint reads the
+        // handle's dims as the BOUND (#731's door), so the annotation lie is now a refusal; the builder
+        // reads name + kind only, so the emission is byte-identical.
         let op = pointwise_broadcast_opspec_df(
             op_func_from_str(f),
             1,
             hd,
             &[
-                In::sliced(&rbo(a), aoff).ew(),
-                In::sliced(&rbo(b), boff).ew(),
+                In::sliced(&rb(a, mq, total), aoff).ew(),
+                In::sliced(&rb(b, mq, total), boff).ew(),
             ],
             o,
             ooff.into(),
@@ -3170,13 +3293,16 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                        ooff: crate::addr::DevOff,
                        sib: &mut i64|
          -> Result<(), Error> {
+            // ⭐ TRUE EXTENTS (`[mq, total]`), not `rbo`'s `1×64` annotation — the slab windows are
+            // corners of the same `[mq, total]` plane `ew_ph` reads (see its note); the mint reads the
+            // dims as the bound and the builder reads name + kind only.
             let op = pointwise_broadcast_opspec_df(
                 op_func_from_str(f),
                 mq,
                 stk,
                 &[
-                    In::sliced(&rbo(a), aoff).ew(),
-                    In::sliced(&rbo(b), boff).ew(),
+                    In::sliced(&rb(a, mq, total), aoff).ew(),
+                    In::sliced(&rb(b, mq, total), boff).ew(),
                 ],
                 o,
                 ooff.into(),
@@ -3341,9 +3467,9 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             "multiply",
             rows_all,
             cols_all,
-            In::full(&rbo(&x)),
-            In::full(&rbo(&cos)),
-            &rbo(&xc),
+            In::full(&rb(&x, mq, total)),
+            In::full(&rb(&cos, mq, total)),
+            &rb(&xc, mq, total),
             sym_id_base,
             layout,
         ));
@@ -3352,9 +3478,9 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             "multiply",
             rows_all,
             cols_all,
-            In::full(&rbo(&rot)),
-            In::full(&rbo(&sin)),
-            &rbo(&rs),
+            In::full(&rb(&rot, mq, total)),
+            In::full(&rb(&sin, mq, total)),
+            &rb(&rs, mq, total),
             sym_id_base,
             layout,
         ));
@@ -3366,9 +3492,9 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             "add",
             rows_all,
             cols_all,
-            In::full(&rbo(&xc)),
-            In::full(&rbo(&rs)),
-            &rbo(&out),
+            In::full(&rb(&xc, mq, total)),
+            In::full(&rb(&rs, mq, total)),
+            &rb(&out, mq, total),
             sym_id_base,
             layout,
         ));
@@ -3424,13 +3550,17 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                        ooff: crate::addr::DevOff,
                        sib: &mut i64|
          -> Result<(), Error> {
+            // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: this branch reads every buffer as the
+            // `[rows, hd]` image — the same elements the `[heads*mq, hd]` synth above reserves (the
+            // callers pass `all = heads*mq`) — so the handle states the swept window's own extent. The
+            // mint reads the dims as the bound; the builder reads name + kind only.
             let op = pointwise_broadcast_opspec_df(
                 op_func_from_str(f),
                 rows,
                 hd,
                 &[
-                    In::sliced(&rbo(a), aoff).ew(),
-                    In::sliced(&rbo(b), boff).ew(),
+                    In::sliced(&rb(a, rows, hd), aoff).ew(),
+                    In::sliced(&rb(b, rows, hd), boff).ew(),
                 ],
                 o,
                 ooff.into(),
@@ -4098,8 +4228,15 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                     crate::sdsc_abstract::QueryRowCount::of_mq(mq),
                 ),
                 crate::sdsc_abstract::BlockCols::of_feature_cols(nqh * hd),
-                &[In::full(&rbo(&q)).ew(), In::scalar(&rbo(&sqrt_scale)).ew()],
-                &rbo(&qs),
+                // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: the qs synthetic above reserves
+                // `[mq, nqh*hd]` and Q is the same plane, so both handles state the swept extent —
+                // the mint's bound. The `[1,1]` √scale keeps `rbo`: one RedStick IS its whole
+                // swept window.
+                &[
+                    In::full(&rb(&q, mq, nqh * hd)).ew(),
+                    In::scalar(&rbo(&sqrt_scale)).ew(),
+                ],
+                &rb(&qs, mq, nqh * hd),
                 crate::addr::DevOff::ZERO,
                 sym_id_base,
                 layout,
@@ -4111,10 +4248,10 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                 crate::sdsc_abstract::RowCount::of_padded_chunk_rows(mq_pad),
                 crate::sdsc_abstract::BlockCols::of_feature_cols(nkvh * hd),
                 &[
-                    In::full(&rbo(&new_k_rep)).ew(),
+                    In::full(&rb(&new_k_rep, mq_pad.row_axis_extent(), nkvh * hd)).ew(),
                     In::scalar(&rbo(&sqrt_scale)).ew(),
                 ],
-                &rbo(&new_k_scaled),
+                &rb(&new_k_scaled, mq_pad.row_axis_extent(), nkvh * hd),
                 crate::addr::DevOff::ZERO,
                 sym_id_base,
                 layout,
@@ -4720,8 +4857,12 @@ pub fn lmlast(
     if let Some(l) = layout {
         l.synth(PlaceId::Act(out.tid), &[1, hidden]);
     }
-    let src_name = rb(&src.name(), 1, stk);
-    let dst = rbo(&out.name());
+    // ⭐ TRUE EXTENTS, not the `[1, stk]`/`rbo` staging annotations: the source IS the `[mq, hidden]`
+    // prompt buffer and the destination IS the `[1, hidden]` staging the synth above reserves, so the
+    // handles state the buffers the corners below address — the mint's bound. The stick walk's last
+    // window ends exactly at `mq*hidden` / `hidden` elements respectively.
+    let src_name = rb(&src.name(), mq, hidden);
+    let dst = rb(&out.name(), 1, hidden);
     Ok((0..hidden / stk)
         .map(|j| {
             assemble_pointwise_broadcast_off(
@@ -6928,12 +7069,15 @@ pub fn scalarweightmul(
     let x = tensors[0].name();
     let w = tensors[1].name();
     let t = out.tid;
-    let x_h = rbo(&x);
+    // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: the op sweeps `[rows, cols]` (the extents the
+    // `RowCount`/`BlockCols` slots below state), so x and the output declare exactly that — the
+    // mint's bound. The builder reads name + kind only.
+    let x_h = rb(&x, rows, cols);
     // The weight is `[1]` on disk and `[1, stick]` in its placement — the same
     // one-stick shape the rmsnorm's `[1,1]` epsilon const takes, read in the
     // same `In::scalar` broadcast mode (lane 0 sprayed over rows and cols).
     let w_h = rb(&w, 1, crate::work::FP16_ELEMS_PER_STICK);
-    let out_h = rbo(&out.name());
+    let out_h = rb(&out.name(), rows, cols);
     let op_name = format!("scalarmul_o{t}");
     Ok(vec![pw2(
         &op_name,
@@ -7052,8 +7196,11 @@ pub fn reshape(
     // multiples of `stk`, so `base % c_in` (and `base % c_out`) is a multiple of `stk` at most
     // `c − stk` — the 64-element run lies inside ONE row's column stick on both the input and
     // the output, one copy covers it, and no partial-stick address is ever formed.
-    let src_name = rb(&src.name(), 1, stk);
-    let dst = rbo(&out.name());
+    // ⭐ TRUE EXTENTS on both sides, not the `[1, stk]`/`rbo` staging annotations: the corners below
+    // are `rc_of` corners of each side's OWN `[r, c]` view, so the handles declare those views —
+    // the mint's bound. The stick walk's last window ends exactly at `total` elements on each side.
+    let src_name = rb(&src.name(), r_in, c_in);
+    let dst = rb(&out.name(), r_out, c_out);
     let n_sticks = total / u64::from(stk);
     let mut ops = Vec::with_capacity(n_sticks as usize);
     for q in 0..n_sticks {
@@ -7234,17 +7381,26 @@ fn scalarmul_scaled(
     // scheduler rejects). `for_pointwise` == the producer's `for_output` for macs≥2^20 producers. A no-op
     // for 64-aligned tensors (residual/embedding [.,4096]).
     //
-    // ⛔ AND THE PAD IS ONLY REAL IF SOMETHING RESERVED IT — capped at the width the OUTPUT's placement
-    // actually holds. See [`pointwise_width_the_output_holds`].
-    let cols = pointwise_width_the_output_holds(
+    // ⛔ AND THE PAD IS ONLY REAL IF SOMETHING RESERVED IT — the width pair: `cols` is what the op
+    // sweeps (the floored width, floor-dropped to what the placement holds), `store_cols` is what
+    // the placement holds per row (the whole-view storage the handles declare). A placement that
+    // cannot hold the program's own view width is an `Err` here — never a narrower descriptor.
+    // See [`pointwise_width_the_output_holds`].
+    let (cols, store_cols) = pointwise_width_the_output_holds(
         layout,
         &[&out_name, &x],
         rows,
+        out.v_cols,
         DeviceWidth::for_pointwise(out.c_len).get(),
-    );
+    )?;
     let scale_name = crate::place::act_name(scale_tid);
     let op_name = format!("scalarmul_o{}", out.tid);
-    let x_h = rbo(&x);
+    // ⭐ TRUE SHAPES, not `rbo` lies: the tile and output are declared at the `[rows, store_cols]`
+    // the placement actually holds per row (the whole-view storage — a chunked piece's corner sits
+    // past a piece-width declaration), and the op sweeps `cols` within it. The `[1,1]` scale keeps
+    // `rbo`: one RedStick IS its whole swept window.
+    let x_h = rb(&x, rows, store_cols);
+    let out_h = rb(&out_name, rows, store_cols);
     let scale_h = rbo(&scale_name);
     // `In::col_window` at corner 0 is field for field `In::full` in what it emits (corner 0 is a whole-block
     // shift, stick-major either way), so a whole-tensor ScalarMul (piece 0, and every node narrower than one
@@ -7368,7 +7524,7 @@ fn scalarmul_scaled(
                 gathered_input: 1,
                 index_name: &crate::place::act_name(g.index_tid),
                 first_entry: g.first_entry,
-                o: &rbo(&out_name),
+                o: &out_h,
             },
             sym_id_base,
             layout,
@@ -7386,7 +7542,7 @@ fn scalarmul_scaled(
         rows,
         cols,
         &inputs,
-        &rbo(&out_name),
+        &out_h,
         corner,
         sym_id_base,
         layout,

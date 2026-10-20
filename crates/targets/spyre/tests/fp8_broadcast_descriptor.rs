@@ -13,8 +13,19 @@ use ktir_superdsc::emit;
 use scratchy_subtile::sdsc_abstract::{
     BlockCols, Lanes, RowBlockedTag, RowCount, StickLayout, Stk,
 };
+/// The one-stick handle — the TRUE shape of a `[1,1]` const read in the scalar broadcast
+/// mode (one RedStick IS its whole swept window).
 fn h(n: &str) -> Stk<RowBlockedTag> {
     Stk::<RowBlockedTag>::new(n, StickLayout::row_blocked(1, 64)).unwrap()
+}
+
+/// The wide legs' own tensors at their TRUE extents — the mint in the pointwise family
+/// checks every swept window against the handle's declared shape (#731's door), so the
+/// `[31, 2048]` residual stream, the `[31, 64]` per-row scale column, and the `[1, 2048]`
+/// gamma row declare what the op actually sweeps (the old `1×64` helper under every
+/// tensor was the annotation lie the mint refuses).
+fn wide(n: &str, rows: usize, cols: usize) -> Stk<RowBlockedTag> {
+    Stk::<RowBlockedTag>::new(n, StickLayout::row_blocked(rows, cols)).unwrap()
 }
 
 /// The 2nd input (the broadcast operand) of a 2-input pointwise op is `scheduleTree_[1]`.
@@ -40,8 +51,11 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
         "mul",
         m,
         k,
-        &[In::full(&h("t_act")).ew(), In::scalar(&h("t_inv448")).ew()],
-        &h("t_pre"),
+        &[
+            In::full(&wide("t_act", 31, 2048)).ew(),
+            In::scalar(&h("t_inv448")).ew(),
+        ],
+        &wide("t_pre", 31, 2048),
         &mut s,
         None,
     );
@@ -51,8 +65,11 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
         "mul",
         m,
         k,
-        &[In::full(&h("t_act")).ew(), In::col(&h("t_invs")).ew()],
-        &h("t_sc"),
+        &[
+            In::full(&wide("t_act", 31, 2048)).ew(),
+            In::col(&wide("t_invs", 31, 64)).ew(),
+        ],
+        &wide("t_sc", 31, 2048),
         &mut s,
         None,
     );
@@ -62,8 +79,11 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
         "mul",
         m,
         k,
-        &[In::full(&h("t_xn")).ew(), In::mb(&h("t_gamma")).ew()],
-        &h("t_out"),
+        &[
+            In::full(&wide("t_xn", 31, 2048)).ew(),
+            In::mb(&wide("t_gamma", 1, 2048)).ew(),
+        ],
+        &wide("t_out", 31, 2048),
         &mut s,
         None,
     );
@@ -74,10 +94,10 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
         m,
         stk,
         &[
-            In::full(&h("t_msum")).ew(),
+            In::full(&wide("t_msum", 31, 64)).ew(),
             In::scalar(&h("t_invcols")).ew(),
         ],
-        &h("t_mean"),
+        &wide("t_mean", 31, 64),
         &mut s,
         None,
     );

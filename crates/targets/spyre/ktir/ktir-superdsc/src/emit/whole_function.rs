@@ -3586,7 +3586,12 @@ fn gathered_matmul_materializes(
     let table_name = crate::place::act_name(g.value_tid);
     let index_name = crate::place::act_name(g.index_tid);
     let inter_name = r.name();
-    let x_h = super::rbo(&table_name);
+    // ⭐ TRUE SHAPES, not `rbo`'s `1×64` annotation: the table and the intermediate declare the
+    // swept `[rows, head]` — the scalarmul arm's convention (the index selects rows within the
+    // table, so the read window is the bound; the placement door still holds the window against
+    // the table's real footprint). The intermediate's `synth` above states the same pair. The
+    // builder reads name + kind only, so the dims are the mint's bound and nothing else.
+    let x_h = super::rb(&table_name, rows, head);
     let inputs = [super::In::full(&x_h).ew()];
     let tile_op = super::lower_ktir_to_superdsc::pointwise_tile_op(rows, head, 2);
     let copied = super::assemble_pointwise_broadcast_gather(
@@ -3600,7 +3605,7 @@ fn gathered_matmul_materializes(
             gathered_input: 0,
             index_name: &index_name,
             first_entry: g.first_entry,
-            o: &super::rbo(&inter_name),
+            o: &super::rb(&inter_name, rows, head),
         },
         sym_id_base,
         Some(layout),
