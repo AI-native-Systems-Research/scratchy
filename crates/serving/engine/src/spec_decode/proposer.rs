@@ -97,21 +97,14 @@ pub struct DraftSeedInputs {
 impl DraftSeedInputs {
     /// The K-step chain's state for the requests at `rows` (indices into `req_ids`), in that
     /// order, as a seed of its own. It carries no lockstep inputs and marks the lockstep done: the
-    /// lockstep runs once, over every request the target ran.
+    /// lockstep runs once, over every request the target ran. Nor does it carry the worker's
+    /// speculative chain, which ran for every request: the regular chain runs, which is always
+    /// correct (the speculative one only saves its time).
     fn rows(&self, rows: &[usize]) -> Self {
         fn pick<T: Clone>(values: &[T], rows: &[usize]) -> Vec<T> {
             rows.iter().map(|&i| values[i].clone()).collect()
         }
-        // Each field is empty when the worker ran no speculative chain, and stays so.
-        let pick_present = |values: &[u32]| -> Vec<u32> {
-            rows.iter()
-                .filter_map(|&i| values.get(i).copied())
-                .collect()
-        };
-        let table: Vec<&[u32]> = self
-            .block_table
-            .chunks(self.block_table_stride.max(1))
-            .collect();
+        let table: Vec<&[u32]> = self.block_table.chunks(self.block_table_stride).collect();
         Self {
             input_ids: Vec::new(),
             positions: Vec::new(),
@@ -130,11 +123,27 @@ impl DraftSeedInputs {
             was_spec_decode: pick(&self.was_spec_decode, rows),
             block_size: self.block_size,
             async_lockstep_done: true,
-            speculative_seeds: pick_present(&self.speculative_seeds),
-            speculative_chain_drafts: (self.speculative_chain_drafts.iter())
-                .map(|iter| pick_present(iter))
-                .collect(),
+            speculative_seeds: Vec::new(),
+            speculative_chain_drafts: Vec::new(),
         }
+    }
+}
+
+/// What a request the K-step chain drafts for sampled this step: its last token, the chain's
+/// seed, and how many tokens it took. A request partway through its prompt sampled none, and has
+/// no `Sampled`.
+#[derive(Clone, Copy, Debug)]
+struct Sampled {
+    last: u32,
+    taken: usize,
+}
+
+impl Sampled {
+    fn of(tokens: &[u32]) -> Option<Self> {
+        Some(Self {
+            last: *tokens.last()?,
+            taken: tokens.len(),
+        })
     }
 }
 
@@ -320,38 +329,35 @@ impl DraftModelProposer {
 
         // A request partway through its prompt sampled no token this step: it has nothing to
         // draft from, and the lockstep above already mirrored its chunk into the draft's KV. The
-        // chain drafts for the others (#391: one request's prompts split across steps panicked
-        // the engine thread here).
-        let drafting: Vec<usize> = (0..num_reqs).filter(|&i| !sampled[i].is_empty()).collect();
-        if drafting.len() == num_reqs {
-            return Self::chain_k(seed, sampled, backend, k);
-        }
+        // chain drafts for the others, if any.
+        let sampled: Vec<Option<Sampled>> = sampled.iter().map(|t| Sampled::of(t)).collect();
+        let drafting: Vec<usize> = (0..num_reqs).filter(|&i| sampled[i].is_some()).collect();
+        let rows: Vec<Sampled> = drafting.iter().filter_map(|&i| sampled[i]).collect();
         if drafting.is_empty() {
             return HashMap::new();
         }
-        let sampled: Vec<Vec<u32>> = drafting.iter().map(|&i| sampled[i].clone()).collect();
-        Self::chain_k(&seed.rows(&drafting), &sampled, backend, k)
+        if drafting.len() == num_reqs {
+            return Self::chain_k(seed, &rows, backend, k);
+        }
+        Self::chain_k(&seed.rows(&drafting), &rows, backend, k)
     }
 
-    /// The K-step chain on the draft, each request seeded with its last token in `sampled`
-    /// (index-wise with `seed.req_ids`, none empty).
+    /// The K-step chain on the draft, each request (index-wise with `seed.req_ids`) seeded with
+    /// its last sampled token.
     fn chain_k(
         seed: &DraftSeedInputs,
-        sampled: &[Vec<u32>],
+        sampled: &[Sampled],
         backend: &mut dyn SpecDecodeBackend,
         k: usize,
     ) -> HashMap<String, Vec<u32>> {
         let num_reqs = seed.req_ids.len();
 
         // ── 2. K decode steps on the draft.
-        let mut current_tokens: Vec<u32> = sampled
-            .iter()
-            .map(|s| *s.last().expect("sampled_token_ids[i] non-empty"))
-            .collect();
+        let mut current_tokens: Vec<u32> = sampled.iter().map(|s| s.last).collect();
         let mut current_positions: Vec<usize> = (0..num_reqs)
             .map(|i| {
                 let advance = if seed.was_spec_decode[i] {
-                    sampled[i].len()
+                    sampled[i].taken
                 } else {
                     seed.q_lens[i]
                 };
@@ -427,9 +433,9 @@ impl DraftModelProposer {
             let mut all_hit = true;
             for (i, sampled_i) in sampled.iter().enumerate().take(num_reqs) {
                 let was_spec = seed.was_spec_decode[i];
-                let accepted_count = sampled_i.len();
+                let accepted_count = sampled_i.taken;
                 let expected_full_accept = seed.q_lens[i];
-                let bonus = *sampled_i.last().expect("sampled non-empty");
+                let bonus = sampled_i.last;
                 if !was_spec
                     || accepted_count != expected_full_accept
                     || bonus != seed.speculative_seeds[i]
@@ -723,8 +729,7 @@ mod tests {
 
     /// A request partway through its prompt samples no token, so it has nothing to draft from:
     /// the lockstep still mirrors its chunk into the draft's KV, and the chain drafts for the
-    /// other requests alone, each on its own block-table row (#391: this panicked the engine
-    /// thread).
+    /// other requests alone, each on its own block-table row.
     #[test]
     fn a_request_mid_prompt_is_left_out_of_the_chain() {
         let (drafts, forwards) = propose(&[vec![5], vec![], vec![9]]);
@@ -752,5 +757,15 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Every request partway through its prompt — one prompt longer than a step admits, say:
+    /// nothing to draft from, so no drafts, and the one forward is the lockstep over every chunk.
+    #[test]
+    fn a_step_of_prompt_chunks_alone_drafts_nothing() {
+        let (drafts, forwards) = propose(&[vec![], vec![], vec![]]);
+        assert!(drafts.is_empty(), "{drafts:?}");
+        assert_eq!(forwards.len(), 1, "the lockstep alone");
+        assert_eq!(forwards[0].input_ids, seed().input_ids);
     }
 }
