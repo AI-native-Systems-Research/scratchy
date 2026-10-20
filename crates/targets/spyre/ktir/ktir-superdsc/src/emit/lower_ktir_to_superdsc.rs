@@ -910,7 +910,22 @@ pub(crate) fn shape_2d(op: &Operation<'_>) -> Option<(u32, u32)> {
     Some(match dims.as_slice() {
         [] => (1, 1),
         [a] => (1, *a as u32),
-        [.., a, b] => (*a as u32, *b as u32),
+        // ⭐⭐⭐ RANK > 2 IS READ IN THE FLAT FRAME: every axis but the last folded into rows, the
+        // last the columns. Row-major, a rank-N tile and its `[prod(leading..=second-last), last]`
+        // flattening are the SAME BYTES at the same offsets — the batched paged-decode kernel's
+        // `[B, G, PS]` score tile IS the `[B·G, PS]` tile its pointwise consumers address — so this
+        // is a reading, not a relayout. For rank 2 the leading fold is the empty product (1) and
+        // the pair is exactly what it always was, so every existing caller is byte-identical; the
+        // OLD `[.., a, b]` arm took the LAST TWO AXES ONLY (`[256, 4, 256]` read as `(4, 256)`),
+        // which drops the batch multiplier and was never reachable anyway — no rank-3 op survived
+        // the ladder to reach it until the batched dot and the reshape bridge landed.
+        [rest @ .., a, b] => (
+            rest.iter()
+                .copied()
+                .chain(std::iter::once(*a))
+                .product::<i64>() as u32,
+            *b as u32,
+        ),
     })
 }
 
