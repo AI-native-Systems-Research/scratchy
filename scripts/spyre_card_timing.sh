@@ -338,6 +338,11 @@ self_test() {
   CAND=""; REF=""
   parse_args /bin/cand /bin/ref --cells long
   check '--cells long is kept' "$CELLS" long
+  # A call site that lost its arguments in a refactor dies only on the pod,
+  # under set -u, at the moment the cell starts (the 8b conc-8 cell shipped
+  # bare once). No call in this script may be bare.
+  bare=$(grep -nE '^[[:space:]]*(bench_run|rung1_run)[[:space:]]*$' "$0" || true)
+  check 'no bare bench_run/rung1_run call site' "$bare" ""
   if ( parse_args --cells bogus ) 2>/dev/null; then
     echo "FAIL: --cells bogus was not refused" >&2; fails=$((fails + 1))
   else
@@ -959,7 +964,7 @@ case "$MODEL_KIND" in
     W10K_S=$LAST_WARM_S; M10K_S=$LAST_RUN_S
     serve_down
     serve_up 8 8704
-    bench_run
+    bench_run c8-1k "$DS_1K" 8 8 9 1083
     BENCH_S=$LAST_BENCH_S
     serve_down
     SHAPES="two boots (solo: mns 2, mml 12288; conc-8: mns 8, mml 8704)"
