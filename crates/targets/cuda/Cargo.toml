@@ -3,12 +3,33 @@ name = "scratchy-target-cuda"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "NVIDIA CUDA backend for scratchy: the per-opcode ABI as declared data. No GPU toolchain yet."
+description = "NVIDIA CUDA backend for scratchy: the per-opcode ABI as declared data, and the H100 kernels behind the `nvcc` feature."
 
-# The runtime side of the CUDA target. Today it holds only the const ABI tables the shared passes
-# take as input (`op_abi`) and the step type opcode lowering produces (`step`): no kernels, no
-# device, no `build.rs`, so it compiles anywhere, with no nvcc and no GPU.
+# The runtime side of the CUDA target: the const ABI tables the shared passes take as input
+# (`op_abi`), the step type opcode lowering produces (`step`), and, under `nvcc`, the kernels.
+#
+# THE FEATURE TIERS (as `spyre` / `spyre-hw` split, `crates/targets/spyre/Cargo.toml`):
+#
+#   (none) — toolchain-free. `build.rs` spawns nothing and links nothing, so the crate compiles
+#            anywhere, with no nvcc and no GPU. This is the build CI and the Mac use.
+#   nvcc   — compiles `kernels/*.cu` (ThunderKittens vendored at `kernels/thunderkittens/`) with
+#            nvcc from CUDA 12.8+ on PATH for `sm_90a`, links them, and adds `kernels`, their
+#            launchers. Named for the toolchain it needs, not for a GPU: it compiles on any Linux
+#            host with nvcc. Its test (`gemm_bf16`) needs an sm_90 GPU and fails without one.
+#            Never built in CI; the GKE H100 run is its only gate.
+[features]
+nvcc = []
+
 [dependencies]
 # The SHARED front end and passes. CUDA lowers the same `SubtileTape` metal and spyre lower; the
 # tables here are inputs to `tape_colouring`, `tape_folding` and `sample_rows`.
 scratchy-subtile = { path = "../../compiler/subtile" }
+
+[dev-dependencies]
+# bf16 <-> f32 for the GEMM test's inputs and output.
+half = { workspace = true }
+
+# The bf16 GEMM against a CPU reference, on the GPU. Not built without `nvcc`.
+[[test]]
+name = "gemm_bf16"
+required-features = ["nvcc"]

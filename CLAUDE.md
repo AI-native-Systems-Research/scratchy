@@ -60,6 +60,10 @@ cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
   every config in scope (minutes-to-hours, OOM risk on a laptop).
 - `cuda`, `metal` and `spyre` are mutually exclusive. `cuda` builds no model
   yet: `scratchy-models`' build script refuses every arch until one lowers.
+- `scratchy-target-cuda`'s `nvcc` feature compiles `kernels/*.cu`
+  (ThunderKittens vendored at `kernels/thunderkittens/`) for `sm_90a` and links
+  them. It needs CUDA 12.8+ `nvcc` on `PATH`, and its tests need an H100. CI
+  never builds it, so the GKE H100 run is its only gate.
 - Multimodal (vision arches + the `image`/`scratchy-vision` decode stack) is
   opt-in via the `multimodal` feature on `scratchy-cli` (on by default
   there) — a plain `chat`-only build never compiles image/png/zune-jpeg/etc.
