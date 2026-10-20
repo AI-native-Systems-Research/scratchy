@@ -1385,6 +1385,41 @@ impl MetalAllocator {
         }
     }
 
+    /// Drop the source pages of `[start, start + range_len)` — a range inside
+    /// the mapping `[map_base, map_base + map_len)` — from the process's
+    /// resident set, so the realign copy's source side stays a bounded
+    /// readahead window instead of a second weights-sized resident set
+    /// (#411).
+    ///
+    /// `msync(MS_INVALIDATE)`, not `madvise(MADV_DONTNEED)`: on macOS,
+    /// DONTNEED is a no-op on `MAP_SHARED` file mappings (measured: a
+    /// 512 MiB touched shared read-only mapping advised DONTNEED kept all
+    /// 513 MiB resident), while MS_INVALIDATE drops the clean pages (same
+    /// probe: 513 → 449 MiB for a 64 MiB mid-range call) and any later
+    /// reader re-faults the same bytes from the file — the mapping is
+    /// read-only, so no page can be dirty and nothing can be lost.
+    ///
+    /// Two alignment rules, both measured: the start address must be
+    /// page-aligned (an unaligned start returns EINVAL and drops nothing),
+    /// and the range must not extend past the mapping's end (also EINVAL);
+    /// an unaligned end *inside* the mapping is accepted. Hence the round
+    /// down / clamp here. `PAGE` is 16 KiB — safe on a 4 KiB-page Mac too,
+    /// where it only rounds to a coarser boundary that is still aligned.
+    fn invalidate_shared_pages(map_base: usize, map_len: usize, start: usize, range_len: usize) {
+        const PAGE: usize = 16 * 1024;
+        debug_assert!(start >= map_base && start + range_len <= map_base + map_len);
+        let lo = start & !(PAGE - 1);
+        let hi = ((start + range_len + PAGE - 1) & !(PAGE - 1)).min(map_base + map_len);
+        if hi > lo {
+            // SAFETY: `[lo, hi)` lies inside the mapped range — `lo` is at
+            // or above the page-aligned `map_base`, `hi` is clamped to the
+            // mapping's end — and the pages are clean (read-only mapping).
+            unsafe {
+                libc::msync(lo as *mut libc::c_void, hi - lo, libc::MS_INVALIDATE);
+            }
+        }
+    }
+
     /// The pre-sidecar `register_mmap` tail: allocate the aligned
     /// buffer, copy every tensor into it (page-fault bound; WILLNEED
     /// hinted), then optionally build the sidecar in the background.
@@ -1430,6 +1465,18 @@ impl MetalAllocator {
         // parallelize across rayon workers and small tensors remain
         // a single dispatch.
         const READ_CHUNK: usize = 16 * 1024 * 1024;
+
+        /// How far past the chunk being copied the kernel keeps streaming
+        /// source pages in (`MADV_WILLNEED`), bounding the mapping's
+        /// resident set during the realign copy. Big enough that the
+        /// copier never outruns the disk (the copy is disk-bound with or
+        /// without a bigger window — with a warm page cache the load's
+        /// parse→routing span measured the same within noise, 576 ms
+        /// before vs 650 ms after on granite-3.3-2b's 1.36 GiB, and a
+        /// cold cache leaves nothing to prefault ahead of), small enough
+        /// that the source copy is a few hundred MiB of RSS, not another
+        /// weights-sized resident set.
+        const READAHEAD_WINDOW: usize = 256 * 1024 * 1024;
 
         // mmap source base — usize for Send across rayon closures. The
         // backing `Arc<Mmap>` is held alive in the `MmapRegion` below
@@ -1487,22 +1534,38 @@ impl MetalAllocator {
             });
         }
         {
-            // Async readahead for the whole source mapping before the
-            // copy loop touches it. Measured on Qwen3.5-35B (18.6 GiB,
-            // 4 shards): baseline sequential copy 13.9 s; with
-            // MADV_WILLNEED 7.4 s — the kernel streams file pages in
-            // ahead of the copier instead of demand-faulting at queue
-            // depth 1. (`GpuWeights::from_dir` issues the same hint
-            // per shard at mmap time, so later shards prefetch while
-            // earlier ones copy.)
-            unsafe {
-                libc::madvise(base as *mut libc::c_void, len, libc::MADV_WILLNEED);
-            }
+            // Bounded readahead + drop-behind, so the source mapping's
+            // resident set stays a window, not the shard.
+            //
+            // What this replaced: one MADV_WILLNEED over the whole mapping
+            // before the copy loop, which faulted the entire shard in
+            // ahead of the copier — during the load the process then held
+            // BOTH the checkpoint's pages and the fresh StorageModeShared
+            // buffer, so peak RSS ≈ 2× the weights (#411; measured on
+            // granite-3.3-2b: 2,986 MiB against 1,359 MiB of weights).
+            // On a Mac that cannot hold both next to the OS (gemma-4-26b
+            // on a 36 GB M3 Pro) macOS pages the machine to death exactly
+            // when the loader is paying for the disk anyway, and the
+            // worker's own budget (`weights+overhead`) understates the
+            // process by the whole source copy.
+            //
+            // Instead: before each chunk, WILLNEED only the chunk plus a
+            // READAHEAD window past it; after copying, invalidate the
+            // chunk's source pages (see [`invalidate_shared_pages`]). The
+            // pipeline keeps the kernel streaming ahead of the copier
+            // (the copy stays disk-bound either way — the window merely
+            // bounds how far ahead the pages land), and the source's
+            // resident set is bounded by the window instead of the file.
+            //
             // 1 worker: the copy is page-fault bound and macOS
             // serializes fault handling on the VM object lock — extra
             // threads measured NEUTRAL-to-WORSE (2w: 27 s, 4w: 22 s,
-            // 8w: 14.5 s vs 1w+WILLNEED: 7.4 s, 4w+WILLNEED: 9.7 s).
+            // 8w: 14.5 s vs 1w+prefetch: 7.4 s, 4w+prefetch: 9.7 s on
+            // Qwen3.5-35B's 18.6 GiB).
             let n_workers = 1;
+            // Ascending source offset, so the window advances one way
+            // (chunks are disjoint: safetensors tensors never overlap).
+            chunk_jobs.sort_by_key(|j| j.0);
             let next = std::sync::atomic::AtomicUsize::new(0);
             let jobs = &chunk_jobs;
             std::thread::scope(|scope| {
@@ -1513,16 +1576,38 @@ impl MetalAllocator {
                             let Some((chunk_src, chunk_dst, chunk_sz, ready)) = jobs.get(i) else {
                                 break;
                             };
+                            // Refill the readahead window past this chunk.
+                            // SAFETY: `[src, min(src+chunk+window, len))`
+                            // is inside the mapped range `[base, base+len)`.
+                            unsafe {
+                                let ahead =
+                                    (chunk_src + chunk_sz + READAHEAD_WINDOW).min(len);
+                                libc::madvise(
+                                    (src_base_usize + chunk_src) as *mut libc::c_void,
+                                    ahead - chunk_src,
+                                    libc::MADV_WILLNEED,
+                                );
+                            }
                             let dst = (dst_base_usize + chunk_dst) as *mut u8;
                             let src = (src_base_usize + chunk_src) as *const u8;
                             unsafe {
                                 std::ptr::copy_nonoverlapping(src, dst, *chunk_sz);
                             }
+                            // Drop what the copier just consumed.
+                            Self::invalidate_shared_pages(
+                                src_base_usize,
+                                len,
+                                src_base_usize + chunk_src,
+                                *chunk_sz,
+                            );
                             ready.signal_chunk();
                         }
                     });
                 }
             });
+            // Tail sweep: the last window's ahead-pages and the header
+            // page are done with — nothing reads the mapping again.
+            Self::invalidate_shared_pages(src_base_usize, len, src_base_usize, len);
         }
 
         // Weight buffer (aligned copy path). Weights set → pageable by
