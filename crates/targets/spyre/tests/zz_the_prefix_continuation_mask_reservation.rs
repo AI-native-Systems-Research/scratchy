@@ -44,6 +44,11 @@
 //! * one-pass prefill (start==0): `[MQ, KTN_ROWS]`;
 //! * prefix-capable continuation: `[MQ, SWEPT + KTN_ROWS]`.
 //!
+//! and the third leg pins the DECODE side's own constraint: a BATCHED-decode rung
+//! (rows are REQUESTS) must keep the alias at every rung, because the decode ladder
+//! stages ONE layout — the macro's `ladder_stages_one_layout` guard, the pod's job-20
+//! refusal.
+//!
 //! The width-256 prefix rung passed by arithmetic luck (its mask_d end
 //! `256 · 512 · 2 = 262144 B` fit under 279552 B with 17088 B of slack); the
 //! width-512 rung needed `512 · 768 · 2 = 786432 B` and refused. The refusal was
@@ -63,7 +68,8 @@ use scratchy_subtile::subtile_ir::{
 use scratchy_subtile::subtile_tape::{lower_dag_to_tape, reroll_subtile_tape};
 use scratchy_target_spyre::ktir_superdsc_door::lower as door_lower;
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
-    ActiveCap, RolledSuperDsc, RungFacts, lower_subtile_tape_to_superdsc,
+    ActiveCap, ATTN_MASK_TID, RolledSuperDsc, RungFacts, ladder_stages_one_layout,
+    lower_subtile_tape_to_superdsc,
 };
 
 /// granite-3.1-2b's attention-block geometry: hidden 2048, kv_dim 512 (8 kv-heads ×
@@ -84,18 +90,23 @@ const LAYERS: u32 = 40;
 /// derived from `min(max_position_embeddings, 256)`).
 const MQ: u32 = 512;
 const PREFIX: u32 = 256;
+/// A decode batch width — one of `PagedKvPool::BATCH_RUNGS` `{2, 4, 8, 16, 32}`: the
+/// widest rung the pod's job-20 bake lowered (rows=32, `[32, swept + 64]` mask view,
+/// 20480 B at the ceiling vs 8192 B at active_cap=64, tid 1131).
+const BATCH: u32 = 8;
 
-/// The one-layer fixture at granite-3.1-2b's geometry, restated as a PREFILL CHUNK:
-/// every op at `m = MQ`, per-position rope tables at the production widths (the
-/// q-site pair `[MQ, H]`, the K-site append's own-width pair `[MQ, KV]` — the
-/// head-major test's per-width memoization law), and the two cache sources at the
-/// resident prefix capacity `[PREFIX, KV]` — the capacity the splice resolves
-/// `SWEPT` from under `ActiveCap::FULL`.
-fn continuation_layer_input() -> LoweringInput {
+/// The one-layer fixture at granite-3.1-2b's geometry, restated as a CHUNK at an
+/// arbitrary row count: every op at `m = rows`, per-position rope tables at the
+/// production widths (the q-site pair `[rows, H]`, the K-site append's own-width pair
+/// `[rows, KV]` — the head-major test's per-width memoization law), and the two cache
+/// sources at the resident prefix capacity `[PREFIX, KV]` — the capacity the splice
+/// resolves `SWEPT` from under `ActiveCap::FULL`. `rows = MQ` is the prefill chunk;
+/// `rows = BATCH` (a request-batch width) is the batched-decode leg.
+fn chunk_layer_input(rows: u32) -> LoweringInput {
     let mut input = fixtures::one_layer_input_shaped(H, KV, I, HD);
-    input.sources[0] = SourceShape { rows: MQ, cols: H }; // 0  x — the chunk's rows
-    input.sources[5] = SourceShape { rows: MQ, cols: H }; // 5  cos, q-site [MQ, heads·hd]
-    input.sources[6] = SourceShape { rows: MQ, cols: H }; // 6  sin, q-site
+    input.sources[0] = SourceShape { rows, cols: H }; // 0  x — the chunk's rows
+    input.sources[5] = SourceShape { rows, cols: H }; // 5  cos, q-site [rows, heads·hd]
+    input.sources[6] = SourceShape { rows, cols: H }; // 6  sin, q-site
     input.sources[7] = SourceShape {
         rows: PREFIX,
         cols: KV,
@@ -104,13 +115,13 @@ fn continuation_layer_input() -> LoweringInput {
         rows: PREFIX,
         cols: KV,
     }; // 8  prefix_v cache [cap=PREFIX, kv]
-    input.sources.push(SourceShape { rows: MQ, cols: KV }); // 14 cos, k-site [MQ, kv]
-    input.sources.push(SourceShape { rows: MQ, cols: KV }); // 15 sin, k-site
+    input.sources.push(SourceShape { rows, cols: KV }); // 14 cos, k-site [rows, kv]
+    input.sources.push(SourceShape { rows, cols: KV }); // 15 sin, k-site
     // The K-side append (op 5) reads its own-width pair — the per-width law.
     input.ops[5].inputs[1] = InputRef::Ext(14);
     input.ops[5].inputs[2] = InputRef::Ext(15);
     for op in &mut input.ops {
-        op.m = MQ;
+        op.m = rows;
     }
     // The attention's valid_len is the modeled prefix capacity — the bridge's own
     // stamp (`valid_len = bx.prefix_len`), decoupled from the cache TENSOR's rows
@@ -123,15 +134,15 @@ fn continuation_layer_input() -> LoweringInput {
     input
 }
 
-/// `LAYERS` copies of the chunk-shaped layer, each with its OWN weights/KV sources
+/// `n` copies of the chunk-shaped layer, each with its OWN weights/KV sources
 /// (the `n_layer_input_distinct` law), under the one-op embedding stand-in the
 /// re-roll needs (every layer's input Computed — the head-major test's prologue
 /// trick). Source ids: 0=x, 1=cos_q, 2=sin_q, 3=cos_k, 4=sin_k (all five SHARED),
-/// then `LAYERS` blocks of eleven per-layer sources; layer `L`'s block starts at
+/// then `n` blocks of eleven per-layer sources; layer `L`'s block starts at
 /// `5 + L·11`. Returns the input with the staged-WEIGHT source id set — every
-/// per-layer source except the two KV caches.
-fn n_layer_continuation(n: u32) -> (LoweringInput, HashSet<u32>) {
-    let base = continuation_layer_input();
+/// per-layer source except the two KV caches. `rows` is the chunk's row count
+/// (MQ for the prefill legs, a batch width for the batched-decode leg).
+fn n_layer_of(base: &LoweringInput, rows: u32, n: u32) -> (LoweringInput, HashSet<u32>) {
     let body = base.ops.clone();
     let ops_per_layer = body.len(); // 15
     // Base source ids: 0=x, 1=rms_w0, 2=q_w, 3=k_w, 4=v_w, 5=cos_q, 6=sin_q,
@@ -175,7 +186,7 @@ fn n_layer_continuation(n: u32) -> (LoweringInput, HashSet<u32>) {
     // repeating body. It reads NO weight, so the staged-weight set is untouched.
     ops.push(OpDesc {
         op: SubOp::ScalarMul { scale: 12.0 },
-        m: MQ,
+        m: rows,
         inputs: vec![InputRef::Ext(0)],
     });
     let mut weight_ids = HashSet::new();
@@ -195,7 +206,7 @@ fn n_layer_continuation(n: u32) -> (LoweringInput, HashSet<u32>) {
                 .collect();
             let mut op = OpDesc {
                 op: op.op,
-                m: MQ,
+                m: rows,
                 inputs,
             };
             // The KV writer's layer id is per-copy state — production graphs stamp
@@ -230,7 +241,19 @@ fn n_layer_continuation(n: u32) -> (LoweringInput, HashSet<u32>) {
 /// (a prompt chunk's rows are one request's positions — `!is_prefill && decode_rows
 /// > 1` is the emission's own derivation), `one_request = false` (a prefill bake).
 fn walk(active_cap: ActiveCap) -> (RolledSuperDsc, SubtileIR<NeoX>) {
-    let (input, weight_ids) = n_layer_continuation(LAYERS);
+    walk_shaped(active_cap, MQ, false, LAYERS)
+}
+
+/// [`walk`] at an arbitrary row kind: `rows_are_requests = true` is the BATCH
+/// ladder's own bake fact (a batch rung's rows are REQUESTS), the shape the
+/// decode-ladder legs below lower at.
+fn walk_shaped(
+    active_cap: ActiveCap,
+    rows: u32,
+    rows_are_requests: bool,
+    layers: u32,
+) -> (RolledSuperDsc, SubtileIR<NeoX>) {
+    let (input, weight_ids) = n_layer_of(&chunk_layer_input(rows), rows, layers);
     let rg = lower_region(&input, std::num::NonZeroU32::new(8192).unwrap());
     let valid = ValidatedGraph::new(&rg).expect("the granite-2b chunk graph validates");
     let tape = lower_dag_to_tape(&valid);
@@ -240,7 +263,7 @@ fn walk(active_cap: ActiveCap) -> (RolledSuperDsc, SubtileIR<NeoX>) {
         &rg,
         &weight_ids,
         active_cap,
-        false,
+        rows_are_requests,
         RungFacts { one_request: false },
     )
     .expect("the granite-2b prefix-capable chunk lowers through the rolled walk");
@@ -357,4 +380,47 @@ fn the_one_pass_mask_reservation_covers_the_causal_triangle() {
          [MQ={MQ}, KTN_ROWS={MQ}] needs {need} B over the same synthetic tid",
         placed.size
     );
+}
+
+/// ⭐ THE BATCHED-DECODE LADDER — the pod's job-20 refusal, pinned as the macro's own
+/// guard states it. A batch rung's rows are REQUESTS (`rows_are_requests = true`, a
+/// `PagedKvPool::BATCH_RUNGS` width), and every rung of a decode session shares ONE
+/// host-staged layout with the ceiling (`ladder_stages_one_layout`, the codegen's
+/// rung-vs-ceiling check): the mask binding must alias the runtime validity buffer at
+/// EVERY rung — never the prompt chunk's own-placement arm, whose `[rows, swept +
+/// ktn_rows]` size varies with the rung's swept extent (20480 B at the ceiling vs
+/// 8192 B at active_cap=64 on the pod, tid 1131 — bytes no rung body staged).
+///
+/// Two layers, not forty: this leg pins the LAYOUT LAW (placement equality across
+/// rungs), which is layer-count-invariant — the prefill legs above carry the forty
+/// because the 546-page reservation arithmetic is load-bearing there.
+#[test]
+fn a_batched_decode_rung_stages_the_ceilings_mask_layout() {
+    let (ceiling, rg) = walk_shaped(ActiveCap::FULL, BATCH, true, 2);
+    let (rung, _) = walk_shaped(ActiveCap::new(64), BATCH, true, 2);
+
+    // THE ONE-LAYOUT LAW — the macro's own guard, verbatim: the exact check the pod's
+    // job-20 bake panicked on, over every host-staged activation the two layouts place.
+    ladder_stages_one_layout(&ceiling.layout, &rung.layout).unwrap_or_else(|e| {
+        panic!("the batched-decode rung stages the ceiling's layout (job 20): {e}")
+    });
+
+    // THE STAGING CONTRACT — at BOTH rungs the binding reads the validity bytes: same
+    // segment, same offset, same size as `ATTN_MASK_TID`'s reservation.
+    let mask_tid = mask_binding_tid(&rg);
+    for (name, layout) in [("ceiling", &ceiling.layout), ("rung 64", &rung.layout)] {
+        let bound = layout
+            .placements
+            .get(&mask_tid)
+            .expect("the mask's binding tid is placed (the splice's and the placement's mint laws agree)");
+        let staged = layout
+            .placements
+            .get(&ATTN_MASK_TID)
+            .expect("the validity reservation is placed");
+        assert_eq!(
+            (bound.segment, bound.offset, bound.size),
+            (staged.segment, staged.offset, staged.size),
+            "the {name} batched-decode binding must alias the runtime validity buffer"
+        );
+    }
 }

@@ -1657,7 +1657,8 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // that name meets bytes. WHICH bytes is the ARM's question, and the arm has
                 // exactly two answers:
                 //
-                // * A PROMPT CHUNK (mq > 1) binds its SCORE mask — the additive causal tile the
+                // * A PROMPT CHUNK (rows > 1, one request's positions) binds its SCORE
+                //   mask — the additive causal tile the
                 //   program's own `desc_mask` declares: `[mq, ktn_rows]` at the one-pass,
                 //   `[mq, swept + ktn_rows]` at the continuation. Those bytes are the chunk's
                 //   own, so the binding gets its OWN placement sized from the program's
@@ -1668,23 +1669,36 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 //   into one footprint, which is what the width-512 prefix rung's
                 //   `add_o1137: end 786432B vs footprint 279552B` refusal and the plain rung's
                 //   silently capped `[512,256]` mask add both were. The alias is deleted.)
-                // * A DECODE bundle (mq == 1) binds the RUNTIME LENGTH MASK — the same
-                //   validity bytes the host stages into `ATTN_MASK_TID` every step (the
-                //   `PrefixMask` forward step, `pmask_slots`' whole-page law), whose
-                //   `[1, swept]` per-forward view the broadcast reservation covers at every
-                //   rung. One buffer, two names, and the bytes are SHARED, not duplicated:
-                //   `seg_bytes` does not advance, and the address audit judges overlaps for
-                //   synthetics only, by design.
+                // * A DECODE bundle (its rows are REQUESTS — the mq==1 solo bundle or a
+                //   batch-ladder rung, `PagedKvPool::BATCH_RUNGS`) binds the RUNTIME LENGTH
+                //   MASK — the same validity bytes the host stages into `ATTN_MASK_TID`
+                //   every step (the `PrefixMask` forward step, `pmask_slots`' whole-page
+                //   law), whose `[1, swept]` per-forward view the broadcast reservation
+                //   covers at every rung. One buffer, two names, and the bytes are SHARED,
+                //   not duplicated: `seg_bytes` does not advance, and the address audit
+                //   judges overlaps for synthetics only, by design. ⛔ THE LADDER LAW: a
+                //   decode session's rungs stage ONE layout — the ceiling's — so the
+                //   binding's placement must be RUNG-INVARIANT, and the alias is what makes
+                //   it so (the pmask reservation is cap-independent). Sizing a batch rung's
+                //   binding from its own arm instead (`[rows, swept + ktn_rows]`) varied it
+                //   with the rung — job 20's refusal: ceiling 20480 B vs rung 8192 B at
+                //   active_cap=64, tid 1131, `ladder_stages_one_layout`.
                 //
                 // The door's own no-lazy-allocation refusal is the drift detector between the
                 // two statements of the mint law: if the splice ever numbers the mask elsewhere,
                 // the bound tid stops matching any placement and the bake names `t{…}` at the
                 // door instead of serving a tensor nobody placed.
                 let mask_binding = ir.tensors.len() as u32;
-                let prompt_chunk = ir.nodes.iter().any(|n| {
-                    matches!(&n.op, SubOp::AttnDecode { .. })
-                        && n.output.region.rows.len > 1
-                });
+                // ⭐ A PROMPT CHUNK'S rows are ONE REQUEST'S POSITIONS — `rows.len > 1` with
+                // `rows_are_requests == false`, the emission's own derivation
+                // (`!is_prefill && decode_rows > 1`). A BATCHED-DECODE rung is `rows.len > 1`
+                // too, but its rows are REQUESTS: it takes the alias arm below whatever its
+                // row count is (see the ladder law on the decode arm).
+                let prompt_chunk = !rows_are_requests
+                    && ir.nodes.iter().any(|n| {
+                        matches!(&n.op, SubOp::AttnDecode { .. })
+                            && n.output.region.rows.len > 1
+                    });
                 // Past the validity reservation — the score mask's bytes are its own.
                 seg_bytes[mseg] = align128(pmoff + pmbytes);
                 if prompt_chunk {
