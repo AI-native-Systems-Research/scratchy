@@ -122,9 +122,32 @@ pub fn run(module: &mut Module) -> Result<()> {
             .ok_or_else(|| Refusal::new(PASS, "expected 2-D ranked tensor operands"))?;
 
         let two_d = |t: &IrType| matches!(t, IrType::Tensor { dims, .. } if dims.len() == 2);
-        if !two_d(&a_ty) || !two_d(&b_ty) || !two_d(&d_ty) {
-            return Err(Refusal::new(PASS, "expected 2-D ranked tensor operands"));
-        }
+        // ⭐ THE RANK DISPATCH. Rank 2 is every dot the fixtures state and the whole-kernel
+        // contract below verifies. Rank 3 is the BATCHED form -- [b, M, K] x [b, K, N] ->
+        // [b, M, N], the batched paged-decode kernel's heads-and-GQA-as-batch-dims shape --
+        // which this pass lowers as `linalg.batch_matmul` (the arm after the f16 gate) and
+        // which can never be the rank-2 canonical single-program matmul, so it is left
+        // UNTAGGED for the whole-function walk. Anything else (rank 1, rank 4, a scalar, a
+        // mismatched pair) is refused by name: the front end's own `dot` already refuses it,
+        // so reaching this refusal means hand-written IR.
+        let dims_of = |t: &IrType| -> Option<Vec<i64>> {
+            match t {
+                IrType::Tensor { dims, .. } => Some(dims.clone()),
+                _ => None,
+            }
+        };
+        let (da, db, dd) = (dims_of(&a_ty), dims_of(&b_ty), dims_of(&d_ty));
+        let batched = match (&da, &db, &dd) {
+            (Some(a), Some(b), Some(d)) if a.len() == 3 && b.len() == 3 && d.len() == 3 => true,
+            (Some(_), Some(_), Some(_)) if two_d(&a_ty) && two_d(&b_ty) && two_d(&d_ty) => false,
+            _ => {
+                return Err(Refusal::new(
+                    PASS,
+                    "expected 2-D ranked tensor operands (or the rank-3 batched form \
+                     [b, M, K] x [b, K, N] -> [b, M, N])",
+                ));
+            }
+        };
         // f16-only: the device accumulates in DL16-f16. ⭐ THE ONE EXCEPTION IS THE fp8 W8A8
         // WEIGHT: the kernel WIDENS it with `.to(tl.float16)` (the frontend refuses a mixed
         // `tl.dot`, "Both operands must be same dtype"), so the dot's operands are all f16
@@ -140,6 +163,69 @@ pub fn run(module: &mut Module) -> Result<()> {
                 "only f16 tt.dot is supported (device accumulates in DL16-f16); use an \
                  f16 accumulator. f32-accumulator folding is a follow-on.",
             ));
+        }
+
+        // ⭐⭐⭐ THE BATCHED ARM: rank-3 `tt.dot` -> `linalg.batch_matmul`, UNTAGGED.
+        //
+        // MLIR's own batched contraction, the same DPS shape as `linalg.matmul` -- ins(a, b)
+        // outs(c) over [b, M, K] x [b, K, N] -> [b, M, N] -- which is why the rewrite is a
+        // KIND CHANGE ONLY: the operands stay [a, b, accumulator] in their order, and the
+        // emulator's own `batch_matmul` runs exactly this form. It rides `OpKind::Other`
+        // precisely as `to_ktir`'s `convert_trans` mints `Other("linalg.transpose")`: a
+        // MINTED op, not a censused one, so no rank-2 machinery (`plan_corelets`'s shape
+        // recovery, the standalone single-program door's tag requirement) can match it by
+        // accident -- the handoff's `Other` arm names `KOpKind::LinalgBatchMatmul`, and the
+        // whole-function walk is where a batch matmul lowers.
+        //
+        // ⛔ NO MAPS, EVER, ON THE BATCHED FORM. `linalg.batch_matmul`'s default indexing is
+        // A (d0, d1, d2), B (d0, d2, d3), out (d0, d1, d3) -- B as [k, n], the standard
+        // orientation. The transposed-B fold below is a PRESENTED-WEIGHT law (the host
+        // stages the bytes); a batched operand is an in-register computed value (the
+        // gathered, reshaped page tile), which has no host to place a transposition, so a
+        // `.T` on a rank-3 operand is not folded -- it is REFUSED, the same law as the
+        // gathered K leg. The fp8 widening is refused for the same reason: the W8A8 door is
+        // the rank-2 standalone contract's own, and no batched form of it is stated.
+        if batched {
+            let (da, db, dd) = (
+                da.expect("batched implies rank-3 dims"),
+                db.expect("batched implies rank-3 dims"),
+                dd.expect("batched implies rank-3 dims"),
+            );
+            let widened = |v: Ssa| {
+                index
+                    .def_of(v)
+                    .is_some_and(|o| o.kind == OpKind::ArithExtf || o.kind == OpKind::TtTrans)
+            };
+            if widened(dot.operands[0]) || widened(dot.operands[1]) {
+                return Err(Refusal::new(
+                    PASS,
+                    "a rank-3 tt.dot operand reaches the dot through an `arith.extf` or a \
+                     `tt.trans`: the fp8 W8A8 widening and the transposed-B fold are \
+                     rank-2 presented-weight laws (the host stages those bytes), and no \
+                     batched form of either is stated. Present the batched operands as \
+                     f16 values in the standard [b, M, K] / [b, K, N] orientation",
+                ));
+            }
+            if da[0] != db[0] || da[0] != dd[0] {
+                return Err(Refusal::new(
+                    PASS,
+                    format!(
+                        "the batched tt.dot's batch dims disagree: A {da:?}, B {db:?}, out {dd:?}"
+                    ),
+                ));
+            }
+            if da[2] != db[1] || da[1] != dd[1] || db[2] != dd[2] {
+                return Err(Refusal::new(
+                    PASS,
+                    format!(
+                        "the batched tt.dot does not state [b, M, K] x [b, K, N] -> [b, M, N]: \
+                         A {da:?}, B {db:?}, out {dd:?}"
+                    ),
+                ));
+            }
+            let op = walk::at_mut(module, path).expect("collected path");
+            op.kind = OpKind::Other("linalg.batch_matmul".to_string());
+            continue;
         }
 
         // ⭐⭐⭐ THE fp8 W8A8 WEIGHT LEG: a chain `extf`/`trans` between the weight load and
@@ -1816,6 +1902,155 @@ module {
             e.message
                 .contains("A and B must be direct tt.descriptor_load results"),
             "got {e}"
+        );
+    }
+
+    /// THE BATCHED FORM — the batched paged-decode kernel's qk dot at small
+    /// geometry (`[b, M, K] x [b, K, N] -> [b, M, N]`, both operands re-chunked
+    /// rank-3 tiles, not presented weights). The positive asserts the rewrite and
+    /// its UNTAGGED, MAP-LESS shape; the controls below each break one law.
+    const BATCHED: &str = "\
+module {
+  tt.func public @k(%q: !tt.ptr<f16>) attributes {noinline = false} {
+    %cst = arith.constant dense<0.000000e+00> : tensor<8x4x64xf16>
+    %a = arith.constant dense<1.000000e+00> : tensor<8x4x64xf16>
+    %b = arith.constant dense<2.000000e+00> : tensor<8x64x64xf16>
+    %o = tt.dot %a, %b, %cst : tensor<8x4x64xf16> * tensor<8x64x64xf16> -> tensor<8x4x64xf16>
+    tt.return
+  }
+}
+";
+
+    /// The batched dot lowers as `linalg.batch_matmul` -- a KIND CHANGE ONLY:
+    /// operands stay `[a, b, accumulator]`, no maps of its own, and NO trust tag,
+    /// because the rank-2 canonical single-program contract is not this op's and
+    /// the whole-function walk is where a batch matmul lowers.
+    #[test]
+    fn the_batched_dot_lowers_to_an_untagged_batch_matmul() {
+        let mut m = parse::parse(BATCHED).unwrap();
+        run(&mut m).expect("the batched dot must lower, not be refused");
+        let c = m.census();
+        let get = |n: &str| c.iter().find(|(k, _)| k == n).map(|(_, v)| *v).unwrap_or(0);
+        assert_eq!(get("linalg.batch_matmul"), 1, "the dot lowered");
+        assert_eq!(get("tt.dot"), 0, "no dot survives");
+        assert!(
+            !m.attrs
+                .iter()
+                .any(|(k, _)| *k == AttrKey::CanonicalVerified),
+            "the module carries NO trust tag -- the batched form is not the rank-2 \
+             canonical single-program matmul"
+        );
+        for op in m.ops_deep() {
+            if op.kind == OpKind::Other("linalg.batch_matmul".into()) {
+                assert_eq!(
+                    op.operands.len(),
+                    3,
+                    "the operands stay [a, b, accumulator] -- a kind change only"
+                );
+                assert!(
+                    op.attr(&AttrKey::IndexingMaps).is_none(),
+                    "the batched matmul states NO maps -- its indexing is the DPS default, \
+                     and the transposed-B fold is a rank-2 presented-weight law"
+                );
+                assert!(
+                    op.attr(&AttrKey::CanonicalVerified).is_none(),
+                    "the op is untagged"
+                );
+            }
+        }
+    }
+
+    /// CONTROL — a batched operand through a `tt.trans`: the transposed-B fold is
+    /// a PRESENTED-WEIGHT law (the host stages the bytes), and a batched operand
+    /// is an in-register computed value with no host to place a transposition.
+    #[test]
+    fn a_batched_operand_through_a_trans_is_refused() {
+        let src = BATCHED.replacen(
+            "    %o = tt.dot %a, %b, %cst",
+            "    %bt = tt.trans %b : tensor<8x64x64xf16> {order = array<i32: 0, 2, 1>}\n    %o = tt.dot %a, %bt, %cst",
+            1,
+        );
+        let mut m = parse::parse(&src).unwrap();
+        let e = run(&mut m).unwrap_err();
+        assert!(
+            e.message.contains("rank-2 presented-weight laws"),
+            "the trans refusal must name the law; got {e}"
+        );
+    }
+
+    /// CONTROL — a batched operand through an `arith.extf` (the fp8 W8A8
+    /// widening): the fp8 door is the rank-2 standalone contract's own, and no
+    /// batched form of it is stated.
+    #[test]
+    fn a_batched_operand_through_an_extf_is_refused() {
+        let src = BATCHED.replacen(
+            "    %o = tt.dot %a, %b, %cst",
+            "    %aw = arith.extf %a8 : tensor<8x4x64xf8E4M3FN> to tensor<8x4x64xf16>\n    %o = tt.dot %aw, %b, %cst",
+            1,
+        )
+        .replacen(
+            "    %a = arith.constant dense<1.000000e+00> : tensor<8x4x64xf16>",
+            "    %a8 = arith.constant dense<1.000000e+00> : tensor<8x4x64xf8E4M3FN>",
+            1,
+        );
+        let mut m = parse::parse(&src).unwrap();
+        let e = run(&mut m).unwrap_err();
+        assert!(
+            e.message.contains("rank-2 presented-weight laws"),
+            "the extf refusal must name the law; got {e}"
+        );
+    }
+
+    /// CONTROL — batch dims that disagree: no pairing of the batches exists, so
+    /// the shape law is refused by name.
+    #[test]
+    fn a_batched_dot_with_disagreeing_batch_dims_is_refused() {
+        let src = BATCHED.replacen(
+            "    %b = arith.constant dense<2.000000e+00> : tensor<8x64x64xf16>\n    %o = tt.dot %a, %b, %cst : tensor<8x4x64xf16> * tensor<8x64x64xf16> -> tensor<8x4x64xf16>",
+            "    %b = arith.constant dense<2.000000e+00> : tensor<9x64x64xf16>\n    %o = tt.dot %a, %b, %cst : tensor<8x4x64xf16> * tensor<9x64x64xf16> -> tensor<8x4x64xf16>",
+            1,
+        );
+        let mut m = parse::parse(&src).unwrap();
+        let e = run(&mut m).unwrap_err();
+        assert!(
+            e.message.contains("batch dims disagree"),
+            "the batch-dims refusal must fire; got {e}"
+        );
+    }
+
+    /// CONTROL — the inner pair disagrees (B's K is 32 against A's 64): the
+    /// `[b, M, K] x [b, K, N] -> [b, M, N]` law is refused by name.
+    #[test]
+    fn a_batched_dot_violating_the_shape_law_is_refused() {
+        let src = BATCHED.replacen(
+            "    %b = arith.constant dense<2.000000e+00> : tensor<8x64x64xf16>\n    %o = tt.dot %a, %b, %cst : tensor<8x4x64xf16> * tensor<8x64x64xf16> -> tensor<8x4x64xf16>",
+            "    %b = arith.constant dense<2.000000e+00> : tensor<8x32x64xf16>\n    %o = tt.dot %a, %b, %cst : tensor<8x4x64xf16> * tensor<8x32x64xf16> -> tensor<8x4x64xf16>",
+            1,
+        );
+        let mut m = parse::parse(&src).unwrap();
+        let e = run(&mut m).unwrap_err();
+        assert!(
+            e.message.contains("does not state [b, M, K] x [b, K, N] -> [b, M, N]"),
+            "the shape-law refusal must fire; got {e}"
+        );
+    }
+
+    /// CONTROL — a mixed-rank pair (A rank-3, B rank-2): neither dialect states
+    /// what it would mean, and the front end already refuses it, so reaching this
+    /// refusal means hand-written IR.
+    #[test]
+    fn a_mixed_rank_dot_is_refused_by_name() {
+        let src = BATCHED.replacen(
+            "    %b = arith.constant dense<2.000000e+00> : tensor<8x64x64xf16>\n    %o = tt.dot %a, %b, %cst : tensor<8x4x64xf16> * tensor<8x64x64xf16> -> tensor<8x4x64xf16>",
+            "    %b = arith.constant dense<2.000000e+00> : tensor<64x64xf16>\n    %o = tt.dot %a, %b, %cst : tensor<8x4x64xf16> * tensor<64x64xf16> -> tensor<8x4x64xf16>",
+            1,
+        );
+        let mut m = parse::parse(&src).unwrap();
+        let e = run(&mut m).unwrap_err();
+        assert!(
+            e.message
+                .contains("expected 2-D ranked tensor operands (or the rank-3 batched form"),
+            "the rank-dispatch refusal must fire; got {e}"
         );
     }
 }
