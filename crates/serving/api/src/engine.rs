@@ -8,7 +8,7 @@
 //!
 //! Port of: `vllm/v1/engine/async_llm.py` (subset)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Marks a client's prompt-cache breakpoint in a chat message's text (the Anthropic path's
@@ -253,8 +253,8 @@ struct RequestState {
     /// Whether any tool call deltas have been emitted (for setting finish_reason).
     tool_calls_emitted: bool,
 
-    /// The tool `tool_choice: {function: {name}}` forces, which the stream keeps calls to.
-    forced_tool: Option<ForcedTool>,
+    /// The tool calls streamed so far: each call named first, and only the forced tool's.
+    tool_calls: ToolCallStream,
 
     /// Pooling output (embedding data), set when the engine is in pooling mode.
     pooler_output: Option<EmbeddingData>,
@@ -870,20 +870,16 @@ impl AsyncEngine {
                     if request.tools.is_some() && !is_tool_choice_none(&request.tool_choice) {
                         let extracted = parser.extract_tool_calls(&text_for_tools);
                         if extracted.tools_called {
-                            // Filter by forced function name if tool_choice specifies one.
-                            let tool_calls = if let Some(forced) =
-                                get_tool_choice_function_name(&request.tool_choice)
-                            {
-                                extracted
-                                    .tool_calls
-                                    .into_iter()
-                                    .filter(|tc| tc.function.name == forced)
-                                    .collect::<Vec<_>>()
-                            } else {
-                                extracted.tool_calls
-                            };
+                            let forced = ForcedTool::of(&request.tool_choice);
+                            let tool_calls: Vec<_> = (extracted.tool_calls.into_iter())
+                                .filter(|tc| {
+                                    forced.as_ref().is_none_or(|f| f.admits(&tc.function.name))
+                                })
+                                .collect();
                             if tool_calls.is_empty() {
-                                (Some(text_for_tools), None, finish_reason_str)
+                                // Every call named a tool other than the forced one: dropped,
+                                // as the stream drops them, so the reply is the text around them.
+                                (extracted.content, None, finish_reason_str)
                             } else {
                                 (
                                     extracted.content,
@@ -1100,7 +1096,7 @@ impl AsyncEngine {
             && request.tools.is_some()
             && !is_tool_choice_none(&request.tool_choice);
 
-        let forced_fn = get_tool_choice_function_name(&request.tool_choice);
+        let forced_tool = ForcedTool::of(&request.tool_choice);
 
         // All n children share one channel.
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1157,7 +1153,7 @@ impl AsyncEngine {
                 detokenizer,
                 i as u32,
                 tool_state,
-                forced_fn.clone().map(ForcedTool::new),
+                forced_tool.clone(),
                 reasoning_state,
                 request.include_reasoning,
             )
@@ -2432,7 +2428,7 @@ impl AsyncEngine {
                     accumulated_content: String::new(),
                     accumulated_token_ids: Vec::new(),
                     tool_calls_emitted: false,
-                    forced_tool,
+                    tool_calls: ToolCallStream::new(forced_tool),
                     pooler_output: None,
                 },
             );
@@ -2865,12 +2861,9 @@ impl AsyncEngine {
                                     };
                                     let _ = tx.send(delta);
                                 }
-                                let tool_deltas = match req_state.forced_tool.as_mut() {
-                                    Some(forced) => forced.retain(tool_deltas),
-                                    None => tool_deltas,
-                                };
+                                let tool_deltas = req_state.tool_calls.admit(tool_deltas);
                                 if tool_deltas.is_empty() {
-                                    // Filtered out — don't emit.
+                                    // Held for a name, or dropped — don't emit.
                                 } else {
                                     req_state.tool_calls_emitted = true;
                                     let delta = StreamDelta {
@@ -3964,49 +3957,97 @@ fn is_tool_choice_none(tool_choice: &Option<serde_json::Value>) -> bool {
     tool_choice.as_ref().and_then(|v| v.as_str()) == Some("none")
 }
 
-/// Extract the forced function name from `tool_choice`, if it specifies one.
-///
-/// OpenAI format: `{"type": "function", "function": {"name": "get_weather"}}`
-fn get_tool_choice_function_name(tool_choice: &Option<serde_json::Value>) -> Option<String> {
-    let val = tool_choice.as_ref()?;
-    let obj = val.as_object()?;
-    let func = obj.get("function")?.as_object()?;
-    func.get("name")?.as_str().map(|s| s.to_string())
-}
-
-/// The one tool a `tool_choice` makes the model call, applied to a stream call by call.
-///
-/// A parser names a call only in the call's first delta; the argument pieces after it carry no
-/// name. So a call is kept or dropped whole on that first delta, and a call to any other tool
-/// sends nothing, as the non-streaming response drops it. The calls kept are numbered from 0 in
-/// the order they start, the positions they hold in the non-streaming response's list.
-struct ForcedTool {
-    name: String,
-    /// The index each kept call has in the parser's deltas -> its index in the stream.
-    kept: HashMap<u32, u32>,
-}
+/// The one tool a `tool_choice` makes the model call (OpenAI's
+/// `{"type": "function", "function": {"name": "get_weather"}}`; `/v1/messages` converts Anthropic's
+/// `{"type": "tool", "name": …}` to it), decoded once per request. Both replies drop a call to any
+/// other tool, so the reply is the text around it: the stream must decide a call at its first
+/// delta, before it can know whether a later call will be kept (#683).
+#[derive(Clone, Debug, PartialEq)]
+struct ForcedTool(String);
 
 impl ForcedTool {
-    fn new(name: String) -> Self {
+    /// The tool `tool_choice` forces, if it names one.
+    fn of(tool_choice: &Option<serde_json::Value>) -> Option<Self> {
+        let func = tool_choice
+            .as_ref()?
+            .as_object()?
+            .get("function")?
+            .as_object()?;
+        Some(Self(func.get("name")?.as_str()?.to_string()))
+    }
+
+    /// Whether a call to `name` is kept.
+    fn admits(&self, name: &str) -> bool {
+        self.0 == name
+    }
+}
+
+/// A tool call's index among the tool parser's deltas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ParserCall(u32);
+
+/// A tool call's index in the stream the client receives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct StreamCall(u32);
+
+/// A request's streamed tool calls as they leave the output path: each call's name first, and
+/// with a [`ForcedTool`], only that tool's calls, numbered from 0 in the order they are named (the
+/// places they hold in the non-streaming reply's list).
+///
+/// Every consumer reads a call's first delta as its start (`/v1/messages` opens the `tool_use`
+/// block with its name; the forced filter keeps or drops the call on it), but a parser can write
+/// a call's arguments before its name: Mistral's pre-v11 format takes the object's keys in the
+/// order the model writes them. So a call's deltas are held until its name arrives, and go out
+/// right after it; a call that never names its tool sends nothing.
+#[derive(Default)]
+struct ToolCallStream {
+    forced: Option<ForcedTool>,
+    kept: HashMap<ParserCall, StreamCall>,
+    /// The calls that named a tool the request does not allow.
+    dropped: HashSet<ParserCall>,
+    /// The deltas of calls whose name has not arrived.
+    unnamed: HashMap<ParserCall, Vec<DeltaToolCall>>,
+}
+
+impl ToolCallStream {
+    fn new(forced: Option<ForcedTool>) -> Self {
         Self {
-            name,
-            kept: HashMap::new(),
+            forced,
+            ..Self::default()
         }
     }
 
-    /// The deltas of `deltas` that belong to a call of the forced tool, renumbered.
-    fn retain(&mut self, deltas: Vec<DeltaToolCall>) -> Vec<DeltaToolCall> {
-        deltas
-            .into_iter()
-            .filter_map(|mut delta| {
-                if delta.function_name.as_ref() == Some(&self.name) {
-                    let next = self.kept.len() as u32;
-                    self.kept.entry(delta.index).or_insert(next);
-                }
-                delta.index = *self.kept.get(&delta.index)?;
-                Some(delta)
-            })
-            .collect()
+    /// The deltas to send for the parser's `deltas`, renumbered for the stream.
+    fn admit(&mut self, deltas: Vec<DeltaToolCall>) -> Vec<DeltaToolCall> {
+        let mut out = Vec::new();
+        for delta in deltas {
+            let call = ParserCall(delta.index);
+            if self.dropped.contains(&call) {
+                continue;
+            }
+            if let Some(&StreamCall(index)) = self.kept.get(&call) {
+                out.push(DeltaToolCall { index, ..delta });
+                continue;
+            }
+            let Some(name) = delta.function_name.as_deref() else {
+                self.unnamed.entry(call).or_default().push(delta);
+                continue;
+            };
+            let held = self.unnamed.remove(&call).unwrap_or_default();
+            if self.forced.as_ref().is_some_and(|f| !f.admits(name)) {
+                self.dropped.insert(call);
+                continue;
+            }
+            let stream_call = StreamCall(self.kept.len() as u32);
+            self.kept.insert(call, stream_call);
+            let StreamCall(index) = stream_call;
+            out.extend(
+                std::iter::once(delta)
+                    .chain(held)
+                    .map(|d| DeltaToolCall { index, ..d }),
+            );
+        }
+        out
     }
 }
 
@@ -4130,7 +4171,7 @@ mod tests {
             accumulated_content: String::new(),
             accumulated_token_ids: Vec::new(),
             tool_calls_emitted: false,
-            forced_tool: None,
+            tool_calls: ToolCallStream::default(),
             pooler_output: None,
         }
     }
@@ -5289,77 +5330,55 @@ mod tests {
         assert!(!is_tool_choice_none(&Some(serde_json::json!("auto"))));
     }
 
+    /// `tool_choice` forces a tool only when it names one, in OpenAI's object form.
     #[test]
-    fn test_get_tool_choice_function_name_none() {
-        assert_eq!(get_tool_choice_function_name(&None), None);
-    }
-
-    #[test]
-    fn test_get_tool_choice_function_name_auto() {
+    fn a_forced_tool_is_read_from_a_named_function_only() {
+        let of = |tc: Option<serde_json::Value>| ForcedTool::of(&tc);
+        assert_eq!(of(None), None);
+        assert_eq!(of(Some(serde_json::json!("auto"))), None);
         assert_eq!(
-            get_tool_choice_function_name(&Some(serde_json::json!("auto"))),
+            of(Some(
+                serde_json::json!({"type": "function", "function": {}})
+            )),
             None
         );
-    }
-
-    #[test]
-    fn test_get_tool_choice_function_name_object() {
-        let tc = serde_json::json!({
-            "type": "function",
-            "function": {"name": "get_weather"}
-        });
         assert_eq!(
-            get_tool_choice_function_name(&Some(tc)),
-            Some("get_weather".to_string())
+            of(Some(
+                serde_json::json!({"type": "function", "function": {"name": "get_weather"}})
+            )),
+            Some(ForcedTool("get_weather".to_string()))
         );
     }
 
-    #[test]
-    fn test_get_tool_choice_function_name_missing_name() {
-        let tc = serde_json::json!({"type": "function", "function": {}});
-        assert_eq!(get_tool_choice_function_name(&Some(tc)), None);
+    /// What a reply streams for `pieces` (one engine output each, the last finishing it) with
+    /// the `parser` tool parser and `forced` as the request's forced tool.
+    fn stream_tool_reply(parser: &str, forced: Option<&str>, pieces: &[&str]) -> Vec<StreamDelta> {
+        let pieces = (pieces.iter().enumerate())
+            .map(|(i, text)| (vec![20 + i as u32], *text))
+            .collect();
+        let configure = |state: &mut RequestState| {
+            state.tool_parser_state = Some(
+                crate::tool_parser::get_tool_parser(parser)
+                    .unwrap()
+                    .create_streaming_state(),
+            );
+            state.tool_calls = ToolCallStream::new(forced.map(|f| ForcedTool(f.to_string())));
+        };
+        super::test_support::stream_pieces(configure, pieces, FinishReason::Stop)
     }
 
-    /// Every tool-call delta a hermes reply streams, one output per piece, through phases 1 and
-    /// 3 as the step loop runs them, with `forced` as the request's forced tool. A call's id is
-    /// random per run, so each one present reads `call`.
-    fn hermes_stream_tool_calls(forced: Option<&str>, pieces: &[&str]) -> Vec<DeltaToolCall> {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = make_test_request_state(Some(tx));
-        state.tool_parser_state = Some(
-            crate::tool_parser::get_tool_parser("hermes")
-                .unwrap()
-                .create_streaming_state(),
-        );
-        state.forced_tool = forced.map(|name| ForcedTool::new(name.to_string()));
-        let mut requests = HashMap::from([("req-1".to_string(), state)]);
-        let last = pieces.len() - 1;
-        for (i, text) in pieces.iter().enumerate() {
-            let outputs = vec![EngineCoreOutput {
-                request_id: "req-1".to_string(),
-                new_token_ids: vec![20 + i as u32],
-                finish_reason: (i == last).then_some(FinishReason::Stop),
-                stop_reason: None,
-                num_cached_tokens: 0,
-                events: None,
-                new_logprobs: None,
-                new_prompt_logprobs: None,
-                pooler_output: None,
-            }];
-            AsyncEngine::process_outputs_phase1(&mut requests, &outputs);
-            let detok = vec![Some((None, Some(text.to_string())))];
-            AsyncEngine::process_outputs_phase3(&mut requests, outputs, detok);
-        }
-        let mut deltas = Vec::new();
-        while let Ok(delta) = rx.try_recv() {
-            deltas.extend(delta.tool_call_deltas.into_iter().flatten());
-        }
-        for delta in &mut deltas {
-            if delta.id.is_some() {
-                delta.id = Some("call".to_string());
-            }
-        }
-        deltas
+    /// The tool-call deltas of `deltas`, in order. A call's id is random per run, so each one
+    /// present reads `call`.
+    fn tool_calls(deltas: &[StreamDelta]) -> Vec<DeltaToolCall> {
+        let calls = deltas
+            .iter()
+            .flat_map(|d| d.tool_call_deltas.iter().flatten());
+        calls
+            .map(|d| DeltaToolCall {
+                id: d.id.as_ref().map(|_| "call".to_string()),
+                ..d.clone()
+            })
+            .collect()
     }
 
     /// A call to Bash, written across five tokens.
@@ -5372,20 +5391,31 @@ mod tests {
     ];
 
     /// A forced tool_choice drops a call to another tool whole: the deltas after its first carry
-    /// no name, and none of its arguments may reach the stream (#683).
+    /// no name, and none of its arguments may reach the stream (#683). The reply then is the text
+    /// around the call — none here — and finishes `Stop`, with nothing a stream encoder would
+    /// turn into a tool-call finish.
     #[test]
     fn a_forced_tool_choice_streams_no_part_of_another_tools_call() {
-        let unforced = hermes_stream_tool_calls(None, &BASH_CALL);
+        let unforced = tool_calls(&stream_tool_reply("hermes", None, &BASH_CALL));
         assert_eq!(unforced[0].function_name.as_deref(), Some("Bash"));
         assert!(
             unforced[1..].iter().any(|d| d.function_arguments.is_some()),
             "unforced, the call streams its arguments after its name: {unforced:?}"
         );
 
-        let forced = hermes_stream_tool_calls(Some("Read"), &BASH_CALL);
-        assert!(forced.is_empty(), "{forced:?}");
+        let forced = stream_tool_reply("hermes", Some("Read"), &BASH_CALL);
+        assert!(tool_calls(&forced).is_empty(), "{forced:?}");
+        assert!(
+            forced
+                .iter()
+                .all(|d| d.text.as_deref().is_none_or(str::is_empty)),
+            "no text around the call, and none of the call's own: {forced:?}"
+        );
+        let finishes: Vec<_> = forced.iter().filter_map(|d| d.finish_reason).collect();
+        assert_eq!(finishes, [FinishReason::Stop]);
 
-        assert_eq!(hermes_stream_tool_calls(Some("Bash"), &BASH_CALL), unforced);
+        let kept = stream_tool_reply("hermes", Some("Bash"), &BASH_CALL);
+        assert_eq!(tool_calls(&kept), unforced);
     }
 
     /// The calls a forced tool_choice keeps are numbered from 0, the places they hold in the
@@ -5399,7 +5429,7 @@ mod tests {
             "\"arguments\": {\"file_path\": \"a.rs\"}}",
             "\n</tool_call>",
         ]);
-        let unforced = hermes_stream_tool_calls(None, &pieces);
+        let unforced = tool_calls(&stream_tool_reply("hermes", None, &pieces));
         let read_index = unforced
             .iter()
             .find(|d| d.function_name.as_deref() == Some("Read"))
@@ -5414,10 +5444,60 @@ mod tests {
             .collect();
         assert!(read.iter().any(|d| d.function_arguments.is_some()));
         assert_eq!(
-            hermes_stream_tool_calls(Some("Read"), &pieces),
+            tool_calls(&stream_tool_reply("hermes", Some("Read"), &pieces)),
             read,
             "Read's deltas, at index 0"
         );
+    }
+
+    /// Mistral's pre-v11 format takes a call's keys in the order the model writes them, so its
+    /// arguments can stream before its name. The output path holds them until the name arrives:
+    /// every consumer reads a call's first delta as its start (`/v1/messages` opened a `tool_use`
+    /// block named ""), and a forced tool_choice decides the call on its name (it dropped the
+    /// arguments and kept the name).
+    #[test]
+    fn a_calls_name_streams_before_its_arguments() {
+        let pieces = [
+            "[TOOL_CALLS]",
+            " [{\"arguments\": {\"file_path\": ",
+            "\"a.rs\"}",
+            ", \"name\": \"Read\"}]",
+        ];
+        // The parser itself writes the arguments first: without the hold, the stream would too.
+        let mut parser = crate::tool_parser::get_tool_parser("mistral")
+            .unwrap()
+            .create_streaming_state();
+        let mut text = String::new();
+        let mut parsed = Vec::new();
+        for piece in pieces {
+            let previous = text.clone();
+            text.push_str(piece);
+            if let ToolParserDelta::ToolCalls(d) = parser.process_delta(&previous, &text, piece) {
+                parsed.extend(d);
+            }
+        }
+        assert!(
+            parsed[0].function_name.is_none() && parsed[0].function_arguments.is_some(),
+            "{parsed:?}"
+        );
+
+        for forced in [None, Some("Read")] {
+            let calls = tool_calls(&stream_tool_reply("mistral", forced, &pieces));
+            assert_eq!(
+                calls[0].function_name.as_deref(),
+                Some("Read"),
+                "{forced:?}"
+            );
+            assert!(calls.iter().all(|d| d.index == 0), "{forced:?}");
+            let args: String = calls
+                .iter()
+                .filter_map(|d| d.function_arguments.as_deref())
+                .collect();
+            let args: serde_json::Value = serde_json::from_str(&args).unwrap();
+            assert_eq!(args, serde_json::json!({"file_path": "a.rs"}), "{forced:?}");
+        }
+        let other = stream_tool_reply("mistral", Some("Bash"), &pieces);
+        assert!(tool_calls(&other).is_empty(), "{other:?}");
     }
 
     // -------------------------------------------------------------------
@@ -6908,9 +6988,8 @@ pub(crate) mod test_support {
     use super::*;
 
     /// The deltas the engine streams for a qwen3_coder tool call the parser buffers for most of
-    /// its steps — run through phases 1 and 3 as the step loop does — with the number of tokens
-    /// generated. `reasoning` puts a reasoning parser in front, with a short thought first; the last
-    /// step ends the request with `finish`.
+    /// its steps, with the number of tokens generated. `reasoning` puts a reasoning parser in
+    /// front, with a short thought first; the last step ends the request with `finish`.
     ///
     /// The buffered steps send no delta, so the deltas' `new_token_ids` add up to fewer tokens
     /// than were generated: a consumer has to read the count from [`StreamUsage`].
@@ -6918,25 +6997,11 @@ pub(crate) mod test_support {
         reasoning: bool,
         finish: FinishReason,
     ) -> (Vec<StreamDelta>, u32) {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut requests = HashMap::new();
-        let mut state = super::tests::make_test_request_state(Some(tx));
-        state.tool_parser_state = Some(
-            crate::tool_parser::get_tool_parser("qwen3_coder")
-                .unwrap()
-                .create_streaming_state(),
-        );
         let mut pieces: Vec<(Vec<u32>, &str)> = Vec::new();
         if reasoning {
-            let parser = crate::reasoning_parser::Qwen3ReasoningParser::new(
-                &super::tests::reasoning_test_vocab(),
-            )
-            .unwrap();
-            state.reasoning_parser_state = Some(parser.create_streaming_state());
             pieces.push((vec![10], "I will run ls."));
             pieces.push((vec![101, 11], "\n</think>\n\n"));
         }
-        requests.insert("req-1".to_string(), state);
         pieces.extend([
             (vec![12], "<tool_call>\n"),
             (vec![13], "<function=Bash>\n"),
@@ -6946,8 +7011,36 @@ pub(crate) mod test_support {
             (vec![17], "</function>\n"),
             (vec![18], "</tool_call>"),
         ]);
-
         let generated = pieces.iter().map(|(ids, _)| ids.len() as u32).sum();
+        let configure = |state: &mut RequestState| {
+            state.tool_parser_state = Some(
+                crate::tool_parser::get_tool_parser("qwen3_coder")
+                    .unwrap()
+                    .create_streaming_state(),
+            );
+            if reasoning {
+                let parser = crate::reasoning_parser::Qwen3ReasoningParser::new(
+                    &super::tests::reasoning_test_vocab(),
+                )
+                .unwrap();
+                state.reasoning_parser_state = Some(parser.create_streaming_state());
+            }
+        };
+        (stream_pieces(configure, pieces, finish), generated)
+    }
+
+    /// The deltas a request streams for `pieces` — each piece one engine output, its token ids
+    /// and the text they detokenize to, the last one finishing the request with `finish` — run
+    /// through phases 1 and 3 as the step loop runs them. `configure` sets the request's parsers.
+    pub(super) fn stream_pieces(
+        configure: impl FnOnce(&mut RequestState),
+        pieces: Vec<(Vec<u32>, &str)>,
+        finish: FinishReason,
+    ) -> Vec<StreamDelta> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = super::tests::make_test_request_state(Some(tx));
+        configure(&mut state);
+        let mut requests = HashMap::from([("req-1".to_string(), state)]);
         let last = pieces.len() - 1;
         for (i, (ids, text)) in pieces.into_iter().enumerate() {
             let outputs = vec![EngineCoreOutput {
@@ -6969,6 +7062,6 @@ pub(crate) mod test_support {
         while let Ok(delta) = rx.try_recv() {
             deltas.push(delta);
         }
-        (deltas, generated)
+        deltas
     }
 }
