@@ -2935,9 +2935,6 @@ impl Executor {
             swept: self.body_swept(sel),
             gathers: crate::wiring::GathersKv::of_launch_groups([gathers_any]),
             folds: folds_any,
-            // The bank's placement census is the BUNDLE's own layout (see the accessor's doc for
-            // why that, and not a per-class fold, is this fact's granularity).
-            subpage_bank: crate::wiring::StagesSubpageBank::of_layout(&self.code.layout),
             // The rung's op-local pin slots, the same layout's baked sum — every bundle of the
             // rung carries the same number, so the body's own artifact is as good a seat as any.
             lx_op_local_bytes: self.code.layout.lx_op_local_bytes,
@@ -5613,7 +5610,6 @@ pub struct StepBody {
     swept: SweptCols,
     gathers: crate::wiring::GathersKv,
     folds: bool,
-    subpage_bank: crate::wiring::StagesSubpageBank,
     lx_op_local_bytes: u64,
     lx_prob_pin_bytes: u64,
 }
@@ -5642,19 +5638,6 @@ impl StepBody {
     /// wrong layout.
     pub const fn chunk(self) -> bool {
         self.gathers.get() && !self.folds
-    }
-
-    /// ⭐ WHETHER THE FINE-INDEX BANK IS STAGED FOR **THIS** LAUNCH — the bundle's own placement
-    /// census (`StagesSubpageBank::of_layout`), NOT a per-body fold, because the bank is placed
-    /// once per bundle (the expert door's census) and the tape step it gates belongs to the whole
-    /// launch: any body of the bundle that reads the fine index reads it after the one staging
-    /// step, so the bundle-level answer is the step's own granularity. A body that stages no bank
-    /// is inert (`subpage_bank_e == 0` mints no step); the reverse — a sub-paged expert gather
-    /// with no staged bank — reads an unstaged u32 table of zeros, and expert 0's sub-page 0 is a
-    /// REAL address, which is fluent, wrong output from a clean bake (the reason the parameter is
-    /// a witness type and not a `bool`; see [`crate::wiring::StagesSubpageBank`]).
-    pub const fn subpage_bank(self) -> crate::wiring::StagesSubpageBank {
-        self.subpage_bank
     }
 
     /// ⭐ THE RUNG'S OP-LOCAL LX PIN SLOTS, in bytes — read off the selected body's own baked

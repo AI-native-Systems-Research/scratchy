@@ -890,87 +890,26 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             node.op,
             node.output.tensor.index() as u32,
         )),
-        // The per-expert scale — the fourth and last of the router index
-        // rows. The splice's row (`routeexpertscale.py`, the lane-free
-        // one-hot column scan with the scale riding the multiply's
-        // broadcast) states it: the door's own `7k − 2` select chain over
-        // the same minted views, IN THE DOOR'S MINT ORDER (the splice's
-        // binding row permutes the node's `[scores, idx, scale]` to
-        // `[scale, idx, scores]` — `tensors[0]` IS the scale row, the
-        // recorded m=8 mis-read law), the emulator's column scan.
-        SubOp::RouteExpertScale { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
-                Ok(ops) => Ops(ops),
-                Err(reason) => Unhandled(reason),
-            }
-        }
-        // THE FUSED TOP-K PAIR — the wall-11 fix. The splice's row
-        // (`routetopk.py`, the ripple-mirror form over the RAW LOGITS)
-        // states it: the vendor `topkindex`/`topkvalue` selection as ONE
-        // kernel whose K running registers live in the OUTPUT buffers, with
-        // the argsort and the score gather FOLDED INTO IT (`lower_all`
-        // silences both — see the arms below). ⛔ THE STICK LAW IS THE
-        // DOOR'S, NOT A REFUSAL: the measured law (the reduction dim may
-        // not ride the stick; the vendor's own `_check_stick_topk`) puts
-        // the `[m, W]` scores' experts ON the stick, so the door
-        // (`lower_ktir_to_superdsc::route_topk`) stages to `[m_pad, W]`,
-        // Kᵀ-restickifies to `topk.ddl`'s own `[W, m]`-token-sticked
-        // orientation, runs the pair at slots 64, and lands ids/values
-        // token-major `[m_pad, 64]`. The pair's ids are scan positions —
-        // unique by construction, never a sum of duplicate ranks past the
-        // bank — which is why the fold is the wall-11 CULPRIT'S CURE, not
-        // an optimization: the per-row-scalar argsort it replaces could
-        // DUPLICATE rank targets at ties and fault the card's FETCH.
-        // THREE parameters in the door's MINT ORDER `[lg, vals, ids]`
-        // (positional, never `split_out`): the logits, the gather
-        // consumer's output (this kernel lands the values), the node's own
-        // ids output.
-        SubOp::RouteTopK { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
-                Ok(ops) => Ops(ops),
-                Err(reason) => Unhandled(reason),
-            }
-        }
-        // The bare score gather — the fold's leftover corner, not the
-        // router chain's own. `lower_all` folds the gather away when its
-        // ids come from a RouteTopK whose logits are this gather's source
-        // (the fused pair lands the values itself), so this row runs only
-        // for a gather whose ids arrive from anywhere else — the splice's
-        // row (`routegather.py`, the lane-free one-hot column scan) states
-        // that function, the door's own `6k − 2` one-hot select chain over
-        // the same minted views.
-        SubOp::RouteGatherScores => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
-                Ok(ops) => Ops(ops),
-                Err(reason) => Unhandled(reason),
-            }
-        }
-        // The bare stable ascending rank vector — the fold's other leftover
-        // corner. `lower_all` folds the argsort away when every consumer of
-        // its rank vector is a RouteTopK (the fused pair reads the LOGITS,
-        // not the ranks), so this row runs only for an argsort whose ranks
-        // feed anything else — the splice's row (`routeargsort.py`, the
-        // lane-free count form) states that function, the door's own
-        // `9W + 1` compare/reduce chain over the same minted views. The
-        // kernel's header states why the form is lane-free (`tl.arange`
-        // refuses the chain fixture's `E = 5`).
-        SubOp::RouteArgsort => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
-                Ok(ops) => Ops(ops),
-                Err(reason) => Unhandled(reason),
-            }
-        }
-        // The gathered expert projection — the weight row each pair reads is selected
-        // by its expert index (an `indirect` access-tile dim on the weight read), the
-        // one door capability the dense matmul row does not state. The splice's row
-        // (`expertmatmul.py`, the one-hot-over-E ladder form) states it: the door's
-        // own five-leg chain over the same minted views, the emulator's
-        // arithmetic-mask form over the bank.
-        SubOp::ExpertMatmul { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
-                Ok(ops) => Ops(ops),
-                Err(reason) => Unhandled(reason),
-            }
+        // ⛔ THE MoE SUB-OPS HAVE NO PER-OP CARD PATH — the MoE lowers only
+        // from `kernels/moe.py` through KTIR. The splice's registry refuses
+        // every MoE row and the door has no MoE arm, so a graph still
+        // stating these sub-ops cannot bake on the card; the message names
+        // the one path that exists.
+        SubOp::RouterNorm { .. }
+        | SubOp::RouterLogits { .. }
+        | SubOp::RouteScale { .. }
+        | SubOp::RouteSoftmax
+        | SubOp::RouteRenorm
+        | SubOp::RouteArgsort
+        | SubOp::RouteTopK { .. }
+        | SubOp::RouteGatherScores
+        | SubOp::RouteExpertScale { .. }
+        | SubOp::ExpertGatedAct { .. }
+        | SubOp::ExpertSort { .. }
+        | SubOp::ExpertUnsort
+        | SubOp::ExpertCombine { .. }
+        | SubOp::ExpertMatmul { .. } => {
+            Unhandled("the MoE lowers only from kernels/moe.py through KTIR".to_string())
         }
         SubOp::KvEncode { .. }
         | SubOp::KvStage { .. }
@@ -986,33 +925,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         // replaces used to refuse the RESTICKIFY by name — the stick-walk kernel
         // (`reshape.py`, one `[1, 64]` identity per flat stick through the door's own
         // `lmlast` mechanism) IS that re-laying copy now. ──
-        //
-        // ⭐ ROUTERLOGITS' MALFORMED-NODE GUARD FIRST (branch:
-        // `lower_router_logits_node`): `node_to_single_tile_op` is the REFUSAL half
-        // of the matmul row — the one place a malformed node is refused before a
-        // program is built, with the dims read from exactly the regions the kernel
-        // states. The splice cannot call it (it lives in this crate), so the guard
-        // rides the routing arm.
-        SubOp::RouterLogits { .. } => {
-            if let Err(reason) =
-                crate::ir::bridge::subtile_tape_tile_op::node_to_single_tile_op(node)
-            {
-                return Unhandled(reason);
-            }
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
-                Ok(ops) => Ops(ops),
-                Err(reason) => Unhandled(reason),
-            }
-        }
-        SubOp::RouterNorm { .. }
-        | SubOp::RouteSoftmax
-        | SubOp::RouteScale { .. }
-        | SubOp::RouteRenorm
-        | SubOp::ExpertGatedAct { .. }
-        | SubOp::ExpertSort { .. }
-        | SubOp::ExpertUnsort
-        | SubOp::ExpertCombine { .. }
-        | SubOp::TanhSoftCap { .. }
+        SubOp::TanhSoftCap { .. }
         | SubOp::RmsNormUnit { .. }
         | SubOp::ScalarWeightMul
         | SubOp::Reshape { .. } => {
@@ -1172,14 +1085,6 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // See main's `lower_attn_node`. Prefill callers pass false.
     rows_are_requests: bool,
 ) -> Result<(Vec<EmittedOp>, BundleLayout), SuperDscError> {
-    // ⛔⭐ THE ADDRESSING LOCKDOWN RUNS FIRST — the general well-formedness pass
-    // (the graph half of the lockdown; the binding half is the splice's M6 walk and
-    // the door half is `expert_matmul`'s bank guard). Every index→address
-    // composition is proven here, over the whole graph, BEFORE a program is minted:
-    // the routing's id range vs the experts its banks pack, and the closed consumer
-    // table that fail-closes on any new index-consumer class. A bake that cannot
-    // prove its addressing does not bake.
-    scratchy_triton_splice::addressing::verify_addressing(ir).map_err(SuperDscError)?;
     // GLOBAL ≤7-segment memory layout (task #55) computed ONCE for the whole bundle.
     // Every op resolves each tensor's HBM address from this (by `t{id}` name) so a
     // tensor shared across ops gets the SAME address — fixing the per-op `arg_index`
@@ -1624,12 +1529,6 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         chunk_pages,
     } = rung;
     let _pc = crate::pc::Pc::start("producer");
-    // ⛔⭐ THE ADDRESSING LOCKDOWN RUNS FIRST — the same graph-half sweep
-    // `lower_graph_to_ktir` states for the unrolled walk, run here for the tape's
-    // re-rolled one: the whole graph's index→address compositions proven BEFORE the
-    // segment walk mints a program. One implementation (the splice's `addressing`
-    // module), two bake heads.
-    scratchy_triton_splice::addressing::verify_addressing(ir).map_err(SuperDscError)?;
     // ⭐ THE CHUNK THIS GRAPH'S EVERY ATTENTION CLASS CAN EXPRESS, decided ONCE for both of its
     // consumers — the index placement (`compute_bundle_layout`'s `gathers_kv`) and the door's
     // `BundleAttnParams` — so an index is reserved exactly where a chunk gathers through it.
@@ -1919,15 +1818,11 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                 // w_scale) needs the 1-byte packed RetileDescriptor from the `fp8_weight_tids` branch below.
                 // in_k/out derive identically (inputs[0].cols=k, output.cols=n); the
                 // KSPLIT branch (out>16384) never fires for fp8 projs.
-                // ⭐ THE ROUTER'S OWN GEMM IS A KERNEL WEIGHT TOO (`RouterLogits`, arity 2, W = inputs[1] —
-                // same tile dims: `matmul_tile_dims` serves both kinds).
                 match n.op.gemm_weight_input() {
-                    // kernel0-collected: the dense/router gemms — W = inputs[1].
+                    // kernel0-collected: the dense gemms — W = inputs[1].
                     Some(1)
-                        if matches!(
-                            n.op,
-                            SubOp::MatmulTile { .. } | SubOp::RouterLogits { .. }
-                        ) && (n.inputs.len() == 2 || n.inputs.len() == 3) =>
+                        if matches!(n.op, SubOp::MatmulTile { .. })
+                            && (n.inputs.len() == 2 || n.inputs.len() == 3) =>
                     {
                         kernel0.push((
                             n.inputs[1].tensor.index() as u32,
@@ -1944,12 +1839,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                             // bump (`bump_sticks_to_splittable` on the cols, lower_subtile_tape_to_superdsc).
                             // For any weight crossing the util floor at m=1 — every dense weight — the two
                             // laws are IDENTICAL at every bucket (both bump), so those manifests are
-                            // byte-identical to before. The router's `[E,hidden]` is the one real weight
-                            // BELOW that floor at m=1 (E=128, k=2816 → 360K macs): its per-bucket matmul
-                            // width varies (128 at m≤2, 512 at m≥3), and the pointwise floor (512) is the
-                            // MAX any bucket's gemm reads — every bucket takes its own stick-prefix of the
-                            // one buffer (the decode gemm reads 2 of 8 sticks; proven on-card by the
-                            // shared-segment decode gemm at out=128 against the prefill's 8-stick slot).
+                            // byte-identical to before.
                             DeviceWidth::for_pointwise(n.output.region.cols.len).get(),
                         ));
                         // KSPLIT fp32-merge (lm_head first-test, n>16384): the split weight ALSO needs B
@@ -1958,8 +1848,14 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                         // below builds each as `[dev_out/64, KB, 64]` (in=KB) — exactly the block matmul's read
                         // (`ksplit_block_weight_kslice_offset_matches_read`). Worker gathers the K-slice bytes.
                     }
-                    // Bank-staged: the gathered expert gemm's weight (inputs[2]) is an expert
-                    // BANK — seg1 bank, its own retile, never through kernel0.
+                    // The router's gemm has no per-op card path — the MoE lowers only
+                    // from `kernels/moe.py` through KTIR; the worklist below refuses
+                    // the op itself, nothing to collect.
+                    Some(1) if matches!(n.op, SubOp::RouterLogits { .. }) => {}
+                    // Bank-staged no longer: the gathered expert gemm has no per-op
+                    // card path (the MoE lowers only from `kernels/moe.py` through
+                    // KTIR); the worklist below refuses the op itself, nothing to
+                    // collect.
                     Some(2) if matches!(n.op, SubOp::ExpertMatmul { .. }) => {}
                     // Carries a gemm weight but has no SuperDSC kernel — the worklist below
                     // refuses the op itself; nothing to collect.

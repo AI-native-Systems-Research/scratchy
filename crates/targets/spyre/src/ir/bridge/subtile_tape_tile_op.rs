@@ -91,13 +91,6 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
     };
 
     match n.op {
-        // The router's dense `[m, experts]` projection — the SAME tile shape the dense
-        // matmul takes (K from the activation's column extent), because it IS the dense
-        // matmul: `lower_router_logits_node` runs `KtirFunc::matmul` over it verbatim.
-        // BEFORE the `expansion_ops!()` refusal so its later listing there is
-        // unreachable for this one op (the rest of the MoE/KV/sample expansions still
-        // have no tile shape).
-        SubOp::RouterLogits { .. } => matmul_tile_dims(n, mb, out_active, y),
         // The standard pointwise/reduce tile over `[mb, out_active, y]`:
         // the ops differ only in operand count, which
         // `crate::op_abi` declares. One arm, so adding such an op is a
@@ -217,8 +210,8 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
     }
 }
 
-/// The `[mb, in(reduction), out, y]` matmul tile both the dense `MatmulTile` and the router's
-/// `RouterLogits` take — K from the FIRST input's column extent (the A-slice's `[mr, kr]`),
+/// The `[mb, in(reduction), out, y]` matmul tile the dense `MatmulTile` takes — K from the
+/// FIRST input's column extent (the A-slice's `[mr, kr]`),
 /// matching how `matmul_lx_resident` reads `per_core_extent("in")`.
 fn matmul_tile_dims(
     n: &SubtileNode<impl scratchy_subtile::subtile_ir::RopeForm>,
@@ -244,25 +237,6 @@ fn matmul_tile_dims(
         dims,
         df: Df::Fp16,
     }])
-}
-
-/// Convenience for a caller that KNOWS (by `SubOp` kind) its node decomposes into exactly one
-/// `TileOp` — `Elementwise`/`SumReduce`/`SiluMul`/`ScalarMul`/`RmsNorm*`/`MatmulTile`, everything
-/// except the composite RoPE mapping. `Err` if that expectation is violated (a future `node_to_tile_ops`
-/// change making a kind multi-op would surface here as a build-time-adjacent error, not a silent
-/// wrong pick of `tile_ops[0]`).
-pub(crate) fn node_to_single_tile_op<F: scratchy_subtile::subtile_ir::RopeForm>(
-    n: &SubtileNode<F>,
-) -> Result<TileOp, String> {
-    let mut ops = node_to_tile_ops(n)?;
-    if ops.len() != 1 {
-        return Err(format!(
-            "node {}: expected exactly 1 TileOp, node_to_tile_ops produced {}",
-            n.id.index(),
-            ops.len()
-        ));
-    }
-    Ok(ops.remove(0))
 }
 
 #[cfg(test)]

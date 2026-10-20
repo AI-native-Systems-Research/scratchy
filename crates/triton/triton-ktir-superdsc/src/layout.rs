@@ -526,10 +526,6 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // No attention identity classes: `Attn` is refused BY NAME at this crate's doors, so no
         // `AttnDecode` program reaches layout to state a head dim.
         attn_class_hds: Vec::new(),
-        // No MoE router in a single-kernel Triton bundle — the Route/Expert programs have no entry
-        // points on this ladder (refused by name at the door), so there is no expert count to state.
-        router_experts: 0,
-        router_k: 0,
         synth,
         // No pinned-LX intermediates: the triton shim emits no rmsnorm-style scratchpad
         // tensors, so the per-core pin registry starts empty — same role as `synth` above.
@@ -633,25 +629,12 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         // by-name refusals stop their SubOps at the producer), and the door itself refuses them by
         // name — so there is no body whose reserved constants this table could state. Enumerated
         // rather than `_` so a new `Program` variant is E0004 here, not a silent `None` that
-        // pretends to have read a body it never had. (These are the gemma-4 campaign's vocabulary:
-        // the MoE router and expert programs, TanhSoftCap, RmsNormUnit, ScalarWeightMul, Reshape,
-        // WindowedRmsNorm. Phase 2 gives the ones that earn it real rows; until then this arm is
-        // the honest statement.)
+        // pretends to have read a body it never had. (The MoE programs are no longer variants at
+        // all — the MoE lowers only from `kernels/moe.py` through KTIR.)
         Program::RmsNormUnit
         | Program::TanhSoftCap
         | Program::ScalarWeightMul
         | Program::Reshape
-        | Program::RouteSoftmax
-        | Program::RouteRenorm
-        | Program::RouteArgsort
-        | Program::RouteTopK
-        | Program::RouteGatherScores
-        | Program::RouteExpertScale
-        | Program::ExpertGatedAct(_)
-        | Program::ExpertSort
-        | Program::ExpertUnsort
-        | Program::ExpertCombine
-        | Program::ExpertMatmul
         | Program::WindowedRmsNorm { .. } => None,
     }
 }
@@ -882,17 +865,6 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         | Program::TanhSoftCap
         | Program::ScalarWeightMul
         | Program::Reshape
-        | Program::RouteSoftmax
-        | Program::RouteRenorm
-        | Program::RouteArgsort
-        | Program::RouteTopK
-        | Program::RouteGatherScores
-        | Program::RouteExpertScale
-        | Program::ExpertGatedAct(_)
-        | Program::ExpertSort
-        | Program::ExpertUnsort
-        | Program::ExpertCombine
-        | Program::ExpertMatmul
         | Program::WindowedRmsNorm { .. } => Vec::new(),
     }
 }

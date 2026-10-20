@@ -1097,9 +1097,6 @@ impl Worker for SpyreWorker {
                 })?;
                 let swept = step.swept();
                 let gathers_kv = step.gathers();
-                // ⭐ THE RUNG'S OWN BANK CENSUS — the bundle this executor residently holds, from
-                // the same `StepBody` for the same reason: the borrowed meta describes neither.
-                let subpage_bank = step.subpage_bank();
                 let bake_gathers_kv = gathers_kv.get();
                 // ⭐⭐⭐ WHEN THE BODY IS A BATCH CHUNK, ITS LAW — read off the selected body's own swept
                 // extent (`J` pages per request) at this rung's width, the inverse of what the bake
@@ -1485,7 +1482,6 @@ impl Worker for SpyreWorker {
                     // ⭐ THE RUNG'S OWN ANSWER, riding with the rung's own `seqs` for the same reason:
                     // the meta above is borrowed for tensor ids and describes neither.
                     gathers_kv,
-                    subpage_bank,
                     launch_pos,
                     // Every row is a different request and every row is sampled — the tail runs
                     // unfolded, so the logits come back de-interleaved, one contiguous row each.

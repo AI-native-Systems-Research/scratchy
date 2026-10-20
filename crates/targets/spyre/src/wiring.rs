@@ -148,32 +148,6 @@ pub struct BakeFacts {
     pub uses_identity: bool,
     /// granite ScalarMul multipliers; index `i` is const tid `scalarmul_scale_tid(i)`.
     pub scalarmul_scales: &'static [f32],
-    /// ⭐ THE ROUTER CONST GEOMETRY `(padded expert width W, expert count E)`, off the
-    /// router_const region's own placements: W from the `[W,W]` IDENTITY table's size
-    /// (`sqrt(size/2)` — the one router table EVERY router tape places), and E from the
-    /// layout's own `router_experts` registry entry — the one fact no placement size
-    /// carries, because the pad rows' VALUES need the UNPADDED count. k rides the
-    /// layout's own `router_k` registry entry (the `[k,W]` targets table that used to
-    /// carry it died with the rank-inversion door the fused pair replaced).
-    /// `(0, 0)` when the bundle has no MoE router. Same "asked of the artifact" law as
-    /// `ones_reduce_len`.
-    pub router: (usize, usize),
-    /// The top-k width, off the layout's `router_k` registry — the softmax mask's bind
-    /// builds its k-boundary (0 below k, −inf above) from it. 0 when the bundle has no
-    /// top-k.
-    pub router_k: usize,
-    /// ⭐ THE BARE-ARGSORT CORNER — the bundle placed the `[W,W]` tie table, i.e. some
-    /// argsort's rank vector feeds something other than a RouteTopK (the splice folds
-    /// every all-topk argsort into the fused pair, which reads the raw logits and needs
-    /// no ranks). The tie table and the argsort's maximum-form pad mask are bound ONLY
-    /// here; the placement and this lookup answer ONE question, so they cannot desync.
-    pub router_argsort: bool,
-    /// ⭐ THE FUSED TOP-K'S PAD ROW — the bundle placed `router_topk_pad_tid` (a RouteTopK
-    /// exists AND `W > E`: the logits' stick pad is real, so the staging's add-form
-    /// sanitize must force those lanes to −inf or a zero pad lane would outrank every
-    /// negative logit and steal a slot). The row's bind builds 0 below E, −inf above,
-    /// from the same `(W, E)` the geometry carries.
-    pub router_topk_pad: bool,
     /// ⭐⭐⭐⭐⭐ The bundle placed `KV_BLOCK_INDEX_TID` — it emitted a GATHERED KV read, so the forward
     /// tape carries a [`ForwardKernel::KvBlockIndex`](crate::forward_tape::ForwardKernel::KvBlockIndex)
     /// step and the launch must stage a block table.
@@ -184,21 +158,6 @@ pub struct BakeFacts {
     /// step reads an unstaged index, and an unstaged index is ZERO — a VALID block — so every row
     /// attends row 0's keys, fluently and wrongly.
     pub gathers_kv: bool,
-    /// ⭐⭐⭐ THE SUB-PAGE INDEX BANK'S EXPERT COUNT — the bundle placed
-    /// [`expert_subpage_bank_tid`](crate::lower_subtile_tape_to_superdsc::expert_subpage_bank_tid)
-    /// (an expert door's `expert_slab_subpages` cut fired — the vendor-scheduler LX law, wall #6),
-    /// so the forward tape carries a [`ForwardKernel::SubpageBank`](crate::forward_tape::ForwardKernel::SubpageBank)
-    /// step and the launch must stage the `[E, 32]` fine-index table through the raw-i32 bind.
-    /// E is read off the bank's OWN placement (`[E, S]` u32 ⇒ `size / (S·4)` rows — the placement
-    /// pass mints it at exactly the door's `e_count`), never re-derived: the placement IS the
-    /// authority the door's gather addresses. 0 when unplaced — every model whose expert pages
-    /// fit the vendor scheduler's 4×page budget, i.e. everything before the 26b.
-    ///
-    /// Same mechanism and the same asymmetry as [`Self::gathers_kv`]: a bank step this bundle
-    /// did not place is refused at the raw bind (loud); a placed bank with no step leaves the
-    /// fine gather reading an UNSTAGED index — zero, a VALID entry, so every pair gathers
-    /// expert 0's sub-page 0 with a clean bake. One artifact-derived question answers both.
-    pub subpage_bank_e: usize,
 }
 
 impl BakeFacts {
@@ -210,57 +169,17 @@ impl BakeFacts {
         uses_identity: false,
         scalarmul_scales: &[],
         gathers_kv: false,
-        subpage_bank_e: 0,
-        router: (0, 0),
-        router_k: 0,
-        router_argsort: false,
-        router_topk_pad: false,
     };
 
     /// Read them off the generated layout.
     pub fn of(layout: &'static bundle::BundleLayout<'static>) -> Self {
         use crate::lower_subtile_tape_to_superdsc as sd;
         let ones = layout.place_of_tid(sd::ONES_REDUCE_TID);
-        // The router geometry, off the IDENTITY table's placement and the layout's own
-        // `router_experts` registry entry (the E fact no placement size carries — the pad
-        // rows' VALUES need the unpadded count). The placement pass mints the identity
-        // table at exactly `[W, W]` fp16 for EVERY router tape (the expert-scale door
-        // reads it), so `sqrt(size/2)` IS W. k rides the layout's `router_k` registry
-        // (the targets table that used to carry it died with the rank-inversion door).
-        let router = match layout.place_of_tid(sd::router_identity_tid()) {
-            Some(p) => {
-                let w = ((p.size / 2) as f64).sqrt() as usize;
-                let e = layout.router_experts as usize;
-                (w, e)
-            }
-            None => (0, 0),
-        };
-        let router_k = layout.router_k as usize;
         BakeFacts {
             uses_ones_reduce: ones.is_some(),
             ones_reduce_len: ones.map_or(0, |p| (p.size / 2) as usize),
             uses_identity: layout.place_of_tid(sd::IDENTITY_TID).is_some(),
             gathers_kv: layout.place_of_tid(sd::KV_BLOCK_INDEX_TID).is_some(),
-            // The bank's own rows — `[E, S]` u32 at `S = CopyDims::ENTRIES_PER_OP` (32), so a
-            // placed bank of `size` bytes states `size / 128` experts. The placement pass and
-            // the door read ONE `e_count`; this reads it back off the artifact, so a drift
-            // between them is a load-time wrong-E, not a silent one.
-            subpage_bank_e: layout
-                .place_of_tid(sd::expert_subpage_bank_tid())
-                .map(|p| {
-                    (p.size
-                        / (scratchy_subtile::sdsc_abstract::CopyDims::ENTRIES_PER_OP as u64 * 4))
-                        as usize
-                })
-                .filter(|&e| e > 0)
-                .unwrap_or(0),
-            router,
-            router_k,
-            // The bare-argsort corner and the fused top-k's pad row, both asked of the
-            // artifact the placement pass itself minted (the tie table / the pad row) —
-            // one question, one answer, no second derivation to drift.
-            router_argsort: layout.place_of_tid(sd::router_rank_tie_tid()).is_some(),
-            router_topk_pad: layout.place_of_tid(sd::router_topk_pad_tid()).is_some(),
             scalarmul_scales: match &layout.scalarmul_scales {
                 std::borrow::Cow::Borrowed(v) => v,
                 // A generated layout is always `Cow::Borrowed`; the owned arm exists for the
@@ -315,10 +234,6 @@ impl BakeFacts {
             rope_class_hds: w.rope_class_hds,
             attn_class_hds: w.attn_class_hds,
             rms_invcols: w.rms_invcols,
-            router: self.router,
-            router_k: self.router_k,
-            router_argsort: self.router_argsort,
-            router_topk_pad: self.router_topk_pad,
         }
     }
 }
@@ -515,7 +430,6 @@ impl Wiring {
         rows: StagedRows,
         owns_prefix: bool,
         gathers: GathersKv,
-        subpage_bank: StagesSubpageBank,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
         self.forward_shape_within(
@@ -523,7 +437,6 @@ impl Wiring {
             rows,
             owns_prefix,
             gathers,
-            subpage_bank,
             n_consts,
         )
     }
@@ -555,9 +468,6 @@ impl Wiring {
         // ⛔ A WITNESS, NOT A `bool` — mintable only from a [`BakeFacts`] read off the bundle's own
         // layout. See [`GathersKv`].
         gathers: GathersKv,
-        // ⛔ THE SAME DISCIPLINE FOR THE FINE-INDEX BANK — mintable only from the facts or the
-        // layout. See [`StagesSubpageBank`].
-        subpage_bank: StagesSubpageBank,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
         assert!(
@@ -574,7 +484,6 @@ impl Wiring {
             sin_srcs: self.sin_srcs,
             prefix_mask: owns_prefix,
             kv_block_index: gathers.get(),
-            subpage_bank_e: subpage_bank.experts(),
             n_consts,
         }
     }
@@ -638,55 +547,6 @@ impl GathersKv {
     }
 
     pub const fn get(self) -> bool {
-        self.0
-    }
-}
-
-/// ⭐⭐⭐ THE PROOF THAT "THIS BUNDLE'S EXPERT GATHER IS SUB-PAGED" CAME FROM THE BUNDLE — the
-/// fine-index bank's expert count, or 0 for a bundle that placed none. Exactly
-/// [`GathersKv`]'s discipline, because the failure modes are the same pair in the same
-/// arrangement: the door's `embi` gather and this staging are the two halves of one fine
-/// index, and they fail asymmetrically. A bank step on a bundle that placed none is refused
-/// at the raw bind (loud); a PLACED bank with no step leaves the fine weight gathers reading
-/// an unstaged index — zero, a VALID entry, so every pair gathers expert 0's sub-page 0 with
-/// a clean bake and fluent, wrong output. A bare `usize` parameter is the arrangement in
-/// which a caller answers the question from a phase or a rung instead of the artifact, so
-/// the only doors are the facts and the layout.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct StagesSubpageBank(usize);
-
-impl StagesSubpageBank {
-    /// The bundle's own answer, off its facts.
-    pub fn of(facts: &BakeFacts) -> Self {
-        StagesSubpageBank(facts.subpage_bank_e)
-    }
-
-    /// The same answer straight off a LAYOUT — the load-time placement check, mirroring
-    /// [`GathersKv::of_layout`]. The bank's `[E, S]` u32 placement states its own row count.
-    pub fn of_layout(layout: &bundle::BundleLayout<'_>) -> Self {
-        use crate::lower_subtile_tape_to_superdsc as sd;
-        StagesSubpageBank(
-            layout
-                .place_of_tid(sd::expert_subpage_bank_tid())
-                .map(|p| {
-                    (p.size
-                        / (scratchy_subtile::sdsc_abstract::CopyDims::ENTRIES_PER_OP as u64 * 4))
-                        as usize
-                })
-                .filter(|&e| e > 0)
-                .unwrap_or(0),
-        )
-    }
-
-    /// ⭐ THE EMULATOR'S ANSWER: no SuperDSC layout to ask, no bank to stage. Same named-door
-    /// law as [`GathersKv::no_layout_to_ask`] — the one sound caller-side zero.
-    pub const fn no_layout_to_ask() -> Self {
-        StagesSubpageBank(0)
-    }
-
-    /// The bank's expert count — the value the tape's `SubpageBank` kernel builds its table
-    /// from. 0 means no bank, no step.
-    pub const fn experts(self) -> usize {
         self.0
     }
 }
@@ -994,17 +854,9 @@ pub struct Wiring {
     /// `[n, k]` buffer's INNER axis to match the retile — a strided rebuild, not the outer-axis
     /// `resize` the N-pad uses. Baked here (from the same `ir` the retile reads) because the
     /// bank/weight orientation is a BAKE fact the worker cannot re-derive from `tensor_shapes`
-    /// alone (a bank's N axis is its ROWS). Empty for every 128-aligned model — granite, g8b
+    /// alone. Empty for every 128-aligned model — granite, g8b
     /// and g12b stage byte-identically.
     pub fp8_k_pads: &'static [(u32, u32)],
-    /// ⭐ THE EXPERT BANK IN-PADS — `(bank source id, in_pad)` for EVERY arity-4 ExpertMatmul's
-    /// bank operand, UNFILTERED (a MEMBERSHIP list: the worker's bank arm consults it before
-    /// the DeviceWidth N-pad, which at a bank pads the WRONG axis — the bank's N is its ROWS —
-    /// so an aligned bank must be listed too or it would take that arm). The bank's k axis is
-    /// its COLS (`[E·out, in]`, the stacked host form), and the pad is the same `fp8_k_pad` the
-    /// manifest's expert retile and the door's contraction K take. Empty for every model with
-    /// no MoE fp8 experts.
-    pub expert_k_pads: &'static [(u32, u32)],
 }
 
 /// The per-model wiring set: one [`Wiring`] per baked PROGRAM.
@@ -1076,24 +928,6 @@ pub struct ConstantEnv {
     /// as a subslice rather than copied into a fresh `vec![sc]` per scale per forward. The array
     /// is already a `static` the macro emitted onto the layout, so the borrow is real.
     pub scalarmul_scales: &'static [f32],
-    /// ⭐ THE ROUTER CONST GEOMETRY, off the bundle's own placements: `(padded expert width W,
-    /// expert count E)`. W derives from the router_const region's placement exactly as the
-    /// placement pass minted it (W = the `[W,W]` IDENTITY table's placement width — the one
-    /// router table every router tape places), E from the layout's `router_experts` registry
-    /// entry (the pad rows' values need it and no placement size carries it). `(0, 0)` when
-    /// the bundle has no MoE router — a non-MoE model binds nothing.
-    pub router: (usize, usize),
-    /// The top-k width, off the layout's `router_k` registry — the softmax mask's bind
-    /// builds its k-boundary (0 below k, −inf above) from it. 0 when the bundle has no
-    /// top-k, and then no mask is bound.
-    pub router_k: usize,
-    /// The bare-argsort corner (the `[W,W]` tie table is placed — some argsort's ranks
-    /// feed something other than the fused top-k): the tie table and the argsort's
-    /// maximum-form pad mask are bound only here.
-    pub router_argsort: bool,
-    /// The fused top-k's add-form pad row is placed (a RouteTopK exists AND `W > E`): its
-    /// bind builds 0 below E, −inf above, from the `(W, E)` the geometry carries.
-    pub router_topk_pad: bool,
 }
 
 // ── THE CONSTANTS THAT ARE LITERALLY CONSTANT ───────────────────────────────
@@ -1307,107 +1141,6 @@ pub fn synthetic_constants(env: &ConstantEnv) -> Vec<(u32, ConstValues)> {
         ));
     }
 
-    // ⭐ THE ROUTER CONST ROWS — the MoE router doors' token-independent factors, BUILT HERE at
-    // load exactly like the identity/rope-P tables: the values are pure functions of the router
-    // geometry the placements carry, so the bake ships only the geometry and this bind stages the
-    // bytes. `(0, 0)` (no MoE router) binds nothing — a non-MoE model is byte-identical.
-    let (w, e) = env.router;
-    if w > 0 && e > 0 {
-        // ⭐⭐ THE ARGSORT FAMILY IS GATED ON THE BARE CORNER — the splice folds every
-        // all-topk argsort into the fused pair (which reads the raw logits and needs no
-        // ranks, no tie table, no rank pad), so the `[W,W]` tie table and the argsort's
-        // maximum-form pad mask are bound only when the bundle PLACED the tie table —
-        // the same artifact-derived question the placement pass answered.
-        if env.router_argsort {
-            // The stable-argsort tie-break table `tie[j,h'] = 𝟙[h' < j]` — j on rows, h' on
-            // lanes, the orientation the rank compare's mb-broadcast multiply reads. fp16 0/1.
-            let mut tie = vec![0.0f32; w * w];
-            for j in 0..w {
-                for h in 0..j {
-                    tie[j * w + h] = 1.0;
-                }
-            }
-            out.push((sd::router_rank_tie_tid(), ConstValues::Owned(tie)));
-            // The ARGSORT PAD-MASK row: −inf in lanes 0..E (the real experts — `maximum(v, −inf) = v`
-            // for every non-NaN v, NEGATIVES INCLUDED), +inf in lanes E..W (the producer's zero-padded
-            // lanes — `maximum` forces them to sort last, so a zero pad lane can never outrank a
-            // negative real score). ⛔ The real-lane value MUST be −inf, never 0: `maximum(v, 0)`
-            // CLAMPS every negative logit to exactly 0 (measured on-card: the 26b sanitize output
-            // held 0 wherever the router logit was negative), collapsing the ranks into tie-runs —
-            // every MoE model with negative router logits misroutes.
-            let mask: Vec<f32> = (0..w)
-                .map(|h| {
-                    if h < e {
-                        f32::NEG_INFINITY
-                    } else {
-                        f32::INFINITY
-                    }
-                })
-                .collect();
-            out.push((sd::router_pad_mask_tid(), ConstValues::Owned(mask)));
-        }
-        // The identity table, row j = the one-hot row with lane j hot. ONE [W,W] table serves
-        // every per-slot one-hot read — the argsort corner's per-EXPERT lane writes and the
-        // expert-scale door's per-SLOT writes are rows of the same E-sized identity.
-        let mut ident = vec![0.0f32; w * w];
-        for j in 0..w {
-            ident[j * w + j] = 1.0;
-        }
-        out.push((sd::router_identity_tid(), ConstValues::Owned(ident)));
-        // The iota row `h ↦ h` (the value the one-hot select chains multiply their match
-        // masks against).
-        let iota: Vec<f32> = (0..w).map(|h| h as f32).collect();
-        out.push((sd::router_topk_iota_tid(), ConstValues::Owned(iota)));
-        if env.router_k > 0 {
-            // The SOFTMAX SANITIZE row — 0 at the top-k landing's REPLICA-RUN HEADS, −inf
-            // everywhere else. The pair emits each of the k results replicated 64/k lanes
-            // wide per token stick (the ring's slots-per-core form, card-measured at the
-            // 26b: the landing's [m,64] row holds result r at lanes [r·rep, (r+1)·rep)), so
-            // keeping lanes 0..k — the OLD content — kept k replicas of result 0 and made
-            // every softmax row uniform (rsub 1.0×k, scores 1/k×k, measured). The head at
-            // each run's first lane is the one lane per result the chain must keep: `x + 0`
-            // bit-identical there, `exp(−inf)=0` kills every other replica and pad lane.
-            // k off the layout's own registry (the `[k,W]` targets table that used to
-            // carry it died with the rank-inversion door the fused pair replaced).
-            let k = env.router_k;
-            let stick = ktir_superdsc::work::FP16_ELEMS_PER_STICK as usize;
-            // ⛔ THE HEADS SIT AT LANE r·(64/k), WHOLE LANES ONLY WHEN k DIVIDES 64 — the
-            // top-k door refuses a k that does not divide the stick at bake; this assert
-            // states the same law against the registry so a desync fails loudly at bind
-            // instead of staging a silently fractional head mask.
-            assert!(
-                k <= stick && stick.is_multiple_of(k),
-                "router top-k k={k} against the {stick}-lane stick: the landing's replica-run \
-                 heads sit at lane r·{stick}/{k}, which is not a whole lane",
-            );
-            let rep = stick / k;
-            let sm_mask: Vec<f32> = (0..w)
-                .map(|h| {
-                    if h < stick && h % rep == 0 {
-                        0.0
-                    } else {
-                        f32::NEG_INFINITY
-                    }
-                })
-                .collect();
-            out.push((sd::router_sm_mask_tid(), ConstValues::Owned(sm_mask)));
-        }
-        // ⭐ THE FUSED TOP-K'S ADD-FORM PAD ROW — 0 in lanes 0..E (the real experts:
-        // `x + 0 = x` bit-identical, negatives included), −inf in lanes E..W (the
-        // producer's zero-padded lanes: the pair's scan runs to W, and a zero pad lane
-        // would OUTRANK every negative router logit and steal a slot, emitting the
-        // out-of-range id whose expert-page fetch faults the card — wall-11's own
-        // root). ADD-form, not the argsort's maximum-form: `maximum` can only RAISE,
-        // so no maximum row can force a zero pad lane DOWN to −inf. Bound only when
-        // the bundle PLACED it (a RouteTopK exists AND `W > E`; at every real router
-        // W == E and the row is never minted).
-        if env.router_topk_pad {
-            let pad: Vec<f32> = (0..w)
-                .map(|h| if h < e { 0.0 } else { f32::NEG_INFINITY })
-                .collect();
-            out.push((sd::router_topk_pad_tid(), ConstValues::Owned(pad)));
-        }
-    }
     out
 }
 
@@ -1620,11 +1353,6 @@ mod constant_tape_tests {
             rope_class_hds: &[64],
             attn_class_hds: &[64],
             rms_invcols: Vec::leak(vec![1.0f32 / 2048.0; 64]),
-            // No MoE router in this fixture's model — the router consts bind nothing.
-            router: (0, 0),
-            router_k: 0,
-            router_argsort: false,
-            router_topk_pad: false,
         }
     }
 
@@ -1951,7 +1679,6 @@ mod constant_tape_tests {
                     StagedRows::of_launch(rows as usize).expect("rows > 0"),
                     false,
                     GathersKv::of(&BakeFacts::NONE),
-                    StagesSubpageBank::of(&BakeFacts::NONE),
                     0,
                 );
                 let step = shape
@@ -2043,7 +1770,6 @@ mod constant_tape_tests {
             rms_invcols: &[],
             scalarmul_scales: &[],
             fp8_k_pads: &[],
-            expert_k_pads: &[],
             weight_scale_folds: &[],
             weight_copies: &[],
         }

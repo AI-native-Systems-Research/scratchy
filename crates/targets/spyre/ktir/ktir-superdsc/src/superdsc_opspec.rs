@@ -2891,8 +2891,8 @@ impl GatherIndex {
 
     /// ⭐⭐⭐⭐⭐ THE TOKEN-PLANE FORM — one entry PER TOKEN ROW, each naming ONE WHOLE KERNEL PLANE:
     /// the prefill-m>1 per-expert batched matmul, where entry `t` is token `t`'s RAW EXPERT ID and the
-    /// value operand is the chunk-major expert bank (`e·chunk + χ·E·chunk`, the `expert_slab_chunks`
-    /// law). Probe-proven end to end (2026-10-09, `/tmp/prefill-m1-probe-report.md`): this shape
+    /// value operand is the chunk-major expert bank (`e·chunk + χ·E·chunk`, the chunk-major
+    /// bank law). Probe-proven end to end (2026-10-09, `/tmp/prefill-m1-probe-report.md`): this shape
     /// schedules to `init_binary` with the gather ENGAGED at both the small (m8, in128) and the 26b
     /// gate (m96, in2816) geometries — `RC=0`, `srcIndirect=YES`, the vendor's own paged loop nest
     /// built by `processHbmPagedTensors`.

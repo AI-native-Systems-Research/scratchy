@@ -33,8 +33,8 @@
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc as lk;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{
-    Error, Region, attn_at, elementwise, err, lmlast, matmul, regions, rmsnorm, rope_at,
-    route_renorm, route_softmax, scalarmul, silumul, split_out,
+    Error, Region, attn_at, elementwise, err, lmlast, matmul, regions, rmsnorm, rope_at, scalarmul,
+    silumul, split_out,
 };
 use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::placement::BundleLayout;
@@ -177,7 +177,7 @@ pub fn lower(
         // rc 0 on main.
         // ⛔ EVERY POINTWISE KIND is held to the column windows its program states, on what it EMITS
         // (`lk::column_windows_are_honoured`). The front end column-tiles only some of them
-        // (`subtile_ir.rs`'s set and the MoE path's gated act); for the rest the guard is a no-op at
+        // (`subtile_ir.rs`'s set); for the rest the guard is a no-op at
         // corner 0, and it makes a corner that ever reaches one a build error naming the op, not a
         // piece written at the buffer base.
         Program::Elementwise(ew) => windowed(
@@ -196,17 +196,6 @@ pub fn lower(
         Program::WindowedRmsNorm { .. } => lk::windowed_rmsnorm(name, k, &r, sym_id_base, layout),
         Program::TanhSoftCap => {
             windowed(name, &r, lk::tanhsoftcap(name, k, &r, sym_id_base, layout))
-        }
-        // The router's row softmax/renorm — no geometry door to cross, no registry
-        // const to resolve: the whole chain is data-driven and the body is the
-        // rmsnorm's structure with the softmax's primitives in it.
-        Program::RouteSoftmax => windowed(name, &r, route_softmax(name, &r, sym_id_base, layout)),
-        Program::RouteRenorm => windowed(name, &r, route_renorm(name, &r, sym_id_base, layout)),
-        // The expert MLP's gated activation — silumul's body with the act's own
-        // device primitive (key `"silu"`/`"gelu"`, the wire `gelufwd` coming from
-        // the OpFunc), over the pair rows the sort laid out.
-        Program::ExpertGatedAct(act) => {
-            windowed(name, &r, lk::gated_act(name, act, &r, sym_id_base, layout))
         }
         Program::ScalarWeightMul => {
             windowed(name, &r, lk::scalarweightmul(name, &r, sym_id_base, layout))
@@ -247,57 +236,6 @@ pub fn lower(
         // program states and by nothing about the model, so the arm is the body — unlike `rope`/`attn`
         // above, whose head geometry has to become const generics on this side.
         Program::Transpose => lk::transpose(name, &r, sym_id_base, layout),
-        // ── THE MoE ROUTING + EXPERT OPS — the router's bare corners (an
-        // argsort whose ranks feed anything but the fused pair, a gather
-        // whose ids arrive from anywhere else) plus the expert chain. The
-        // EMULATOR runs these programs' ops directly (`ktir_groups` ignores
-        // the Program field off-card), so these doors only fire under
-        // `-Fspyre-hw`. Each row's expert indices sorted by ascending
-        // score, AS THE RANK VECTOR — the compare/reduce form the emu
-        // states, one `j` at a time with every token riding the mb axis
-        // (see the door's own doc for the 7E+1 chain and the pad-mask
-        // sanitize that makes it correct).
-        Program::RouteArgsort => lk::route_argsort(name, &r, sym_id_base, layout),
-        // The fused vendor top-k pair over the RAW LOGITS — the argsort and
-        // the score gather folded into it (the splice's two router folds),
-        // so the program's parameters are `[lg, vals, ids]` in the mint
-        // order. The door stages to `[m_pad, W]` (the add-form pad-row
-        // sanitize at `W > E`), Kᵀ-restickifies to the pair's
-        // token-sticked orientation, runs `topkindex`/`topkvalue` at 64
-        // slots, and lands both token-major `[m_pad, 64]` — the ids scan
-        // positions, unique by construction, never the duplicate-rank sums
-        // that faulted the 26b card's FETCH (wall 11). See the door's own
-        // doc for the full chain.
-        Program::RouteTopK => lk::route_topk(name, &r, sym_id_base, layout),
-        // The scores at the chosen indices — a ONE-HOT SELECT over the score
-        // row (equal the per-row index against the iota columns, mask, reduce)
-        // rather than an indirect access tile: no data-dependent memory
-        // traffic, the same compare/reduce machinery as the doors before it.
-        // 6k-2 ops, per slot; see the door's own doc.
-        Program::RouteGatherScores => lk::route_gather_scores(name, &r, sym_id_base, layout),
-        // Each score times its expert's learned scale — the gather door's own
-        // one-hot select with the LOADED [E] scale row as the parent, then the
-        // score riding the matched lane through the reduce. 7k-2 ops; see the
-        // door's own doc.
-        Program::RouteExpertScale => lk::route_expert_scale(name, &r, sym_id_base, layout),
-        // The (token, slot) pair rows — `k` identity legs at stick-aligned column
-        // offsets, the gathered regime's own statement that the permutation is a
-        // no-op (metal's gathered bake emits nothing and reads token rows k times).
-        Program::ExpertSort => lk::expert_sort(name, &r, sym_id_base, layout),
-        // The pair rows back in token order — ONE identity over the whole
-        // `[m, k·w]` tile, the materialized no-op of the same regime.
-        Program::ExpertUnsort => lk::expert_unsort(name, &r, sym_id_base, layout),
-        // The pair rows weighted by their routing scores and summed back into
-        // the token stream — the per-slot fma chain, the add legs
-        // accumulating into one scratch (in place, the softmax's own
-        // destination-reuse law) and the final add writing the output.
-        Program::ExpertCombine => lk::expert_combine(name, &r, sym_id_base, layout),
-        // One projection of each pair's expert over the stacked `[E·out, in]`
-        // fp8 bank — the gathered W8A8 body: the index converted to u32, the
-        // expert slabs and scales gathered into pair-indexed scratch, then the
-        // dense body's own per-pair `matmulfp8` + dequant at baked offsets.
-        // See the door's own doc for the five legs and the gather laws.
-        Program::ExpertMatmul => lk::expert_matmul(name, &r, sym_id_base, layout, quantized),
     }
 }
 

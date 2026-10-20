@@ -12,8 +12,8 @@ THE COMPUTATION, IN PROGRAM ORDER:
 2. ROUTER LOGITS — `xn @ router.proj.T`, the dense `[E, H]` projection, f16.
 3. TOP-K — K rounds over the whole `[M, E]` row: the row maximum, the highest expert id
    among the lanes equal to it, then that lane masked out. The selection `topk.ddl`'s
-   ripple computes (`routetopk.py`): descending by value, and among equal values the later
-   scan position first. Slot 0 the maximum.
+   ripple computes: descending by value, and among equal values the later scan position
+   first. Slot 0 the maximum.
 4. ROUTE WEIGHTS — the K selected logits × `H^-0.5`, a softmax over the K, then × each
    selected expert's `router.per_expert_scale`, read BY ITS ID.
 5. EXPERTS — per routed pair, the gate/up/down slabs selected BY ID out of the stacked
@@ -65,12 +65,12 @@ the routed ids are stored as i32 before any slab is read; the route weights ride
 and each pair's activation is staged at its own window of `desc_act`, the `[K, I]` rows the
 card's down quantize reads as one matrix.
 
-⛔ WHY THE TOP-K IS ROUND-BASED, NOT `routetopk.py`'s RIPPLE. The ripple reads the logits
+⛔ WHY THE TOP-K IS ROUND-BASED, NOT THE `topk.ddl` RIPPLE. The ripple reads the logits
 one `[M, 1]` column at a time, and a descriptor block must carry at least 16 bytes in its
 last dimension (upstream's own check — real Triton refuses the 2-byte column). Rounds over
 the whole row select the same experts in the same slot order with no column access.
 
-⛔ EVERY LOOP IS `tl.static_range` — the ladder's law (`expertmatmul.py`'s header): every
+⛔ EVERY LOOP IS `tl.static_range` — the ladder's law: every
 offset but the routed expert id is a trace-time constant, and the id is the ONLY data-
 dependent address in the program.
 """
@@ -151,7 +151,7 @@ def moe_fwd(desc_xr, desc_rg, desc_rw, desc_pes,  #
     vals = tl.zeros([M, K], dtype=tl.float16)
     idsf = tl.zeros([M, K], dtype=tl.float16)
     psel = tl.zeros([M, K], dtype=tl.float16)
-    # Every select is tile-on-tile f16 (`routetopk.py`'s law): a bare Python float in a
+    # Every select is tile-on-tile f16 (the select law): a bare Python float in a
     # `tl.where` becomes an f32 tensor and widens the whole select.
     neg_inf = tl.full([M, E], float("-inf"), tl.float16)
     no_lane = tl.full([M, E], -1.0, tl.float16)

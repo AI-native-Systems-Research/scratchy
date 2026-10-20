@@ -110,13 +110,6 @@ pub(crate) fn run_prefill_batch(
     // mints this from an artifact — `BakeFacts` for a prompt chunk, the rung's own layout for a
     // batched step.
     gathers: scratchy_target_spyre::wiring::GathersKv,
-    // ⭐⭐⭐ THE FINE-INDEX BANK'S OWN ANSWER — the third fact `b` cannot answer, with `gathers`'
-    // exact provenance: the sub-paged expert gather is emitted only by the doors whose
-    // `expert_slab_subpages` fired, and on a batched rung the borrowed single-request meta
-    // describes neither. Still a [`StagesSubpageBank`], so it still has one door — every caller
-    // mints it from an artifact: `BakeFacts` for a prompt chunk, the rung's own `StepBody` (the
-    // bundle's layout census) for a batched step.
-    subpage_bank: scratchy_target_spyre::wiring::StagesSubpageBank,
     start: usize,
     want_logits: LogitsWanted<'_>,
 ) -> ExecutorResult<Option<Vec<f32>>> {
@@ -414,9 +407,6 @@ pub(crate) fn run_prefill_batch(
         // ⛔ AND IT IS THE PARAMETER, NOT `b.facts`: on a batched rung `b` is the borrowed
         // single-request meta, whose layout places no index — see `gathers` in the signature.
         gathers,
-        // ⛔ THE SAME PROVENANCE LAW — the parameter, never `b.facts`, for the reason the
-        // `gathers` comment one line up states.
-        subpage_bank,
         consts.len(),
     );
     let inputs = scratchy_target_spyre::forward_tape::ForwardInputs {
@@ -802,13 +792,6 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
                     bytes.extend_from_slice(&e.as_i32().to_le_bytes());
                 }
                 self.acts_i32.push((tensor, bytes));
-            }
-            // ⭐⭐ THE FINE-INDEX BANK — already LE u32 bytes from the shared layout law, so it
-            // takes the same raw channel verbatim (see [`Staged::SubpageBank`]'s doc for why it
-            // is not a `GatherEntry` list: the bank's composition is the door's cut, not the KV
-            // pool's page stride).
-            scratchy_target_spyre::forward_tape::Staged::SubpageBank(bytes) => {
-                self.acts_i32.push((tensor, bytes))
             }
         }
         Ok(())
@@ -1321,10 +1304,6 @@ pub(crate) fn superdsc_forward_chunk(
                     // mixes the per-page body (gathers nothing) with split-KV chunks (gather every
                     // page), and its `KV_BLOCK_INDEX` placement is the chunk ceiling's.
                     step.gathers(),
-                    // ⭐ THE PREFILL META'S OWN BANK CENSUS — a prompt chunk launches `pf` under
-                    // `pmeta`, and the bank is placed once per bundle, so the artifact answer is the
-                    // meta's.
-                    scratchy_target_spyre::wiring::StagesSubpageBank::of(&pmeta.facts),
                     chunk_start,
                     // A prompt's tail is FOLDED to one row by the emitter, so there is one row to
                     // read however many rows this chunk ran at.
@@ -1568,9 +1547,6 @@ pub(crate) fn superdsc_forward_chunk(
             // the bundle's `KV_BLOCK_INDEX` placement is the chunk ceiling's. Asked of the bundle,
             // a one-page context demanded a table its body never reads and the step refused.
             step.gathers(),
-            // ⛔ THE FINE-INDEX BANK IS THE BUNDLE'S — placed once per bundle, so the step reports
-            // the bundle's placement, never the phase.
-            step.subpage_bank(),
             consts.len(),
         );
         // fp16-safe attention "-inf": half the largest finite fp16 magnitude, negated —

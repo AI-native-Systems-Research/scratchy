@@ -173,7 +173,8 @@ fn walk_off(node: &serde_json::Value, n_: &serde_json::Value, pos: &[u64]) -> u6
 /// coordinates; the group re-layout keeps the stick axis (features) and PERMUTES the stick planes
 /// (plane `h·nslab + s` of the stream ⇒ plane `s` of block `h/gqa` at row `h % gqa`). No restickify
 /// descriptor's input and output stick on the same axis — the restickify DDL refuses that binding
-/// (`restickify_flat_opspec_2d`'s note: "the two ports' stick dims to be DISTINCT actual dims").
+/// (the two ports' stick dims must be DISTINCT actual dims; the flat-restickify probe's "silent"
+/// control measured that refusal at `ddl_conversion.cpp:2539`).
 #[test]
 fn the_relayout_keeps_the_stick_axis_so_no_restickify_can_express_it() {
     // In the stream, element (h, f) sits on stick plane h·nslab + f/64, lane f%64; in the block it sits on

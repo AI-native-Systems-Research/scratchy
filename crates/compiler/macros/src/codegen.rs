@@ -9465,44 +9465,6 @@ fn emit_superdsc_wiring(
             quote! { (#id, #k) }
         })
         .collect::<Vec<_>>();
-    // ⭐ THE EXPERT BANK IN-PADS — the expert twin of the dense list, keyed off the
-    // ExpertMatmul's BANK operand (inputs[2] of the arity-4 op; the bank's k axis is
-    // its COLS — `[E·out, in]`, the stacked host form). UNFILTERED: this is a
-    // MEMBERSHIP list, not a widen list — the worker's bank arm takes it BEFORE the
-    // DeviceWidth N-pad (which at a bank pads the WRONG axis and would append bytes
-    // the staging guard refuses), so every expert bank must appear, aligned or not.
-    // Same rule (`fp8_k_pad`), same tape, as the manifest's own expert retile.
-    let expert_k_pads: Vec<(u32, u32)> = {
-        use scratchy_subtile::lower::InputRef;
-        use scratchy_subtile::subtile_ir::SubOp;
-        let mut pads: Vec<(u32, u32)> = Vec::new();
-        for od in &lwd.input.ops {
-            let SubOp::ExpertMatmul { .. } = od.op else {
-                continue;
-            };
-            if od.inputs.len() != 4 {
-                continue;
-            }
-            let Some(InputRef::Ext(e)) = od.inputs.get(2) else {
-                continue;
-            };
-            let Some(&(_rows, cols)) = gk.tensor_shapes.get(*e) else {
-                continue;
-            };
-            let in_pad = scratchy_target_spyre::lower_subtile_tape_to_superdsc::fp8_k_pad(cols);
-            pads.push((*e as u32, in_pad));
-        }
-        pads.sort();
-        pads.dedup();
-        pads
-    };
-    let expert_k_pad_toks = expert_k_pads
-        .iter()
-        .map(|&(id, in_pad)| {
-            let (id, in_pad) = (u32l(id), u32l(in_pad));
-            quote! { (#id, #in_pad) }
-        })
-        .collect::<Vec<_>>();
     quote! {
         ::scratchy_target_spyre::wiring::Wiring {
             result: #result,
@@ -9530,7 +9492,6 @@ fn emit_superdsc_wiring(
             weight_scale_folds: &[#(#weight_scale_fold_lits),*],
             weight_copies: &[#(#weight_copy_lits),*],
             fp8_k_pads: &[#(#fp8_k_pad_toks),*],
-            expert_k_pads: &[#(#expert_k_pad_toks),*],
         }
     }
 }
@@ -9760,9 +9721,6 @@ fn synth_role_tokens(
         // door fills ahead of the gain multiply (the stored gamma row rides untouched).
         R::Gw => quote! { #b::Gw },
         R::Tanhc => quote! { #b::Tanhc },
-        R::RMax => quote! { #b::RMax },
-        R::RSub => quote! { #b::RSub },
-        R::RDen => quote! { #b::RDen },
         R::GatherKt => quote! { #b::GatherKt },
         R::GatherV => quote! { #b::GatherV },
         R::ChunkSc => quote! { #b::ChunkSc },
@@ -9806,45 +9764,6 @@ fn synth_role_tokens(
             let i = proc_macro2::Literal::u32_unsuffixed(*i);
             quote! { #b::LAcc(#i) }
         }
-        // The expert-combine scratch: slot `j`'s `rows_j · score_j` product and
-        // the running f32-referenced accumulator ([`lk::expert_combine`]'s own
-        // synths, the `FqAmaxP(j)` payload shape).
-        R::ECombP(j) => {
-            let j = proc_macro2::Literal::u32_unsuffixed(*j);
-            quote! { #b::ECombP(#j) }
-        }
-        R::ECombAcc => quote! { #b::ECombAcc },
-        // The route-argsort scratch: the sanitized scores, the per-j compare
-        // and product scratch, the count scratch, the reduce accum, and the
-        // one-hot product accumulator ([`lk::route_argsort`]'s own synths).
-        R::AXSan => quote! { #b::AXSan },
-        R::ALt => quote! { #b::ALt },
-        R::ACnt => quote! { #b::ACnt },
-        R::ARank => quote! { #b::ARank },
-        R::AAcc => quote! { #b::AAcc },
-        // The route-top-k scratch: the per-slot match mask, the selector
-        // product, and the reduce accum ([`lk::route_topk`]'s own synths).
-        R::AMatch => quote! { #b::AMatch },
-        R::ASel => quote! { #b::ASel },
-        R::AIdx => quote! { #b::AIdx },
-        // The expert-matmul scratch: the fp32 index-staging leg, the SENUINT32 index, the
-        // fine sub-page index the cut gather addresses its pages by, the pair-indexed
-        // fp8 weight and bf16 scale gathers, and the raw / a_scale-folded products
-        // ([`lk::expert_matmul`]'s own synths — all unit, so plain idents). The fused
-        // top-k pair's own outputs sit in the same family ([`lk::route_topk`]'s XT-fed
-        // slot-major twins — the 64-slot stick the landings and the converts read).
-        R::XF32 => quote! { #b::XF32 },
-        R::XIdx => quote! { #b::XIdx },
-        R::XSub => quote! { #b::XSub },
-        R::XP => quote! { #b::XP },
-        R::XT => quote! { #b::XT },
-        R::XFl => quote! { #b::XFl },
-        R::TopKIdx => quote! { #b::TopKIdx },
-        R::TopKVal => quote! { #b::TopKVal },
-        R::XWScratch => quote! { #b::XWScratch },
-        R::XSScratch => quote! { #b::XSScratch },
-        R::XRaw => quote! { #b::XRaw },
-        R::XDqA => quote! { #b::XDqA },
         R::GatherKtLx(i) => {
             let i = proc_macro2::Literal::u32_unsuffixed(*i);
             quote! { #b::GatherKtLx(#i) }
@@ -9989,8 +9908,6 @@ fn layout_tokens(
         scalarmul_scales,
         weight_scale_folds,
         weight_copies,
-        router_experts,
-        router_k,
         kv_request_stride_bytes,
         lx_op_local_bytes,
         lx_prob_pin_bytes,
@@ -10044,10 +9961,6 @@ fn layout_tokens(
             }
         }
     };
-    let rexperts = proc_macro2::Literal::u32_unsuffixed(*router_experts);
-    // The router top-k width — the softmax's k-boundary mask row's own bind fact,
-    // 0 when the tape has no top-k (the field's own doc beside `router_experts`).
-    let rk = proc_macro2::Literal::u32_unsuffixed(*router_k);
     quote! {
         ::scratchy_target_spyre::bundle_code::BundleLayout {
             segment_bytes: [#(#segs),*],
@@ -10058,8 +9971,6 @@ fn layout_tokens(
             scalarmul_scales: ::std::borrow::Cow::Borrowed(&[#(#scales),*]),
             weight_scale_folds: ::std::borrow::Cow::Borrowed(&[#(#folds),*]),
             weight_copies: ::std::borrow::Cow::Borrowed(&[#(#copies),*]),
-            router_experts: #rexperts,
-            router_k: #rk,
             kv_request_stride_bytes: #krs,
             lx_op_local_bytes: #lxol,
             lx_prob_pin_bytes: #lxpp,

@@ -349,115 +349,13 @@ pub fn identity_class_tid(idx: usize) -> u32 {
     reserved_region("identity_class").at(idx as u32 - 1)
 }
 
-/// ⭐⭐⭐⭐⭐ THE ROUTER **CONST** REGION — the token-independent rows and tables the MoE router
-/// doors read, worker-bound like the rope-P tables.
-///
-/// The router quartet's doors (`RouteArgsort`, `RouteTopK`, `RouteGatherScores`,
-/// `RouteExpertScale`) decompose the emu's compare/reduce semantics into pointwise
-/// `lesserthan`/`equal` over broadcast operands plus native row reduces — the
-/// `broadcast_ops.ddl` compare/select family, the same wire shape as the card-proven
-/// add/maximum. Every one of those forms needs a FACTOR that is a pure function of the
-/// router's geometry (the expert count), not of the tokens:
-///
-///   * **`rank_tie`** — the stable-argsort tie-break matrix `tie[j,h'] = 𝟙[h' < j]`, a
-///     `[W,W]` 0/1 table (W = the padded expert width, 64-lane sticks), read
-///     mb-broadcast in the rank compare's `equal`-leg multiply.
-///   * **`topk_iota`** — the `[1,W]` iota row `h ↦ h`, the value the one-hot
-///     selects multiply their match masks by.
-///   * **`identity`** — the `[W,W]` identity table, row `j` = the one-hot row with lane `j`
-///     hot, the row the combine-chain shape writes logical lane `j` of an output stick
-///     through. ONE table, not k one-hot rows: the argsort reads one row per RANKED
-///     EXPERT (E rows, k-free), and the expert-scale selector reads one row per top-k
-///     SLOT (k ≤ E rows) — both are rows of the same E-sized identity.
-///
-/// Same mechanism as the rope-P classes: the DOOR resolves the row/table's tid here, the
-/// placement pass mints its seg0 footprint, and the worker's load-time bind
-/// (`wiring::synthetic_constants`) builds the value from the same bake-carried geometry.
-/// SIZED IN SLOTS: one `rank_tie`, one `identity`, one `topk_iota`, one `pad_mask`,
-/// one `sm_mask`, one `subpage_bank`, one `topk_pad` — seven live. Slots 3–5 are
-/// RETIRED (the old one-hot top-k's `targets` table and its uniform `pad_hi`/`pad_lo`
-/// sanitize rows — dead the day the fused vendor pair replaced the rank-inversion
-/// chain): burned, never reused, because a reused reserved id would silently alias
-/// any stale artifact still carrying the old slot. `subpage_bank` is the one E-sized
-/// u32 placement the sub-paged expert gather needs (see [`expert_subpage_bank_tid`]).
-pub const ROUTER_CONST_BASE: u32 = u32::MAX - 137;
-
-/// The `[W,W]` stable-argsort tie-break table `tie[j,h'] = 𝟙[h' < j]` (j on rows, h' on
-/// lanes — the orientation the rank compare's mb-broadcast multiply reads).
-pub fn router_rank_tie_tid() -> u32 {
-    reserved_region("router_const").at(0)
-}
-
-/// The `[W,W]` identity table: row `j` is the one-hot row with lane `j` hot. ONE table
-/// serves every consumer that needs a per-slot one-hot row — the argsort's per-expert
-/// lane writes (E rows) and the top-k selector's per-slot writes (k ≤ E rows) are rows
-/// of the SAME E-sized identity, so k never sizes a placement.
-pub fn router_identity_tid() -> u32 {
-    reserved_region("router_const").at(1)
-}
-
-/// The `[1,W]` iota row `h ↦ h` the one-hot selects sum their match masks against.
-pub fn router_topk_iota_tid() -> u32 {
-    reserved_region("router_const").at(2)
-}
-
-// Slots 3–5 are RETIRED — the old one-hot top-k's `[k,W]` targets table (3) and its
-// uniform `pad_hi`/`pad_lo` sanitize rows (4, 5). Dead with the rank-inversion chain
-// the fused vendor pair replaced; burned, never reused (see the region doc above).
-
-/// The `[1,W]` SOFTMAX PAD-MASK row: `0` in lanes `0..k` (the real top-k
-/// scores — `x + mask` leaves them bit-identical) and `−inf` in lanes `k..W`
-/// (the producer's pad — `exp(−inf) = 0`, so a pad lane never contributes to
-/// the softmax's denominator). k-DEPENDENT like the targets table, placed only
-/// when the tape has a RouteTopK node.
-pub fn router_sm_mask_tid() -> u32 {
-    reserved_region("router_const").at(7)
-}
-
-/// The `[1,W]` ARGSORT PAD-MASK row: `−inf` in lanes `0..E` (the real experts — `maximum(v, −inf) = v`
-/// for every non-NaN v, NEGATIVES INCLUDED — a `0` there would clamp every negative router logit to
-/// exactly 0, measured on-card) and `+inf` in lanes `E..W` (the producer's zero-pad — `maximum` forces
-/// them to sort last, so a zero pad lane can never outrank a negative real score). The maximum-form
-/// twin of the top-k pad row below (which is add-form — `maximum` can only raise, so it cannot force
-/// a zero pad lane DOWN): this row is E-dependent, so its VALUE comes from the geometry handoff.
-pub fn router_pad_mask_tid() -> u32 {
-    reserved_region("router_const").at(6)
-}
-
-/// The `[E, 32]` SUB-PAGE INDEX BANK: stick `e` holds `e·S + s` for `s < 32`, the fine index
-/// the sub-paged expert gather addresses its cut pages by (S =
-/// [`crate::work::expert_slab_subpages`]'s cut, always [`crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP`]
-/// when this bank is placed). The raw router index supplies only the expert id `e`; no pointwise
-/// law can interleave an `s`-ramp into it without reading past the `[1,W]` index's own declared
-/// range, so the fine index is MINTED BY GATHERING this bank: one op per raw index stick, page =
-/// one position, out = one u32 stick — dest lane `j` of the result is `e_{j/32}·32 + j%32`,
-/// which is the fine index. u32-TYPED because the values reach `E·S − 1` = 4095 at E=128, past
-/// fp16's exact-integer range (2048), and worker-bound VERBATIM through the raw-i32 staging path
-/// (the `activations_i32` bind, `place_raw` + `bind_input_raw`), never through the fp32→sen
-/// const bind that would corrupt int32 bytes. E-DERIVED and cut-gated: placed only when an
-/// expert door's `expert_slab_subpages` fired (>1) — the 26b and nothing before it, so every
-/// earlier model's wire stays byte-identical.
-pub fn expert_subpage_bank_tid() -> u32 {
-    reserved_region("router_const").at(8)
-}
-
-/// The `[1,W]` TOPK PAD row: `0` in lanes `0..E` (the real experts — `x + 0 = x`
-/// bit-identical, NEGATIVES INCLUDED) and `−inf` in lanes `E..W` (the producer's
-/// zero-pad — the top-k pair's scan runs to W, and a zero pad lane would OUTRANK every
-/// negative router logit and steal a slot, emitting the out-of-range id `≥ E` whose
-/// expert-page fetch faults the card: wall-11's own root). ADD-form, not
-/// [`router_pad_mask_tid`]'s maximum-form, and that is a measured law not a taste:
-/// `maximum` can only RAISE, so no maximum row can force a zero pad lane DOWN to −inf
-/// (the argsort's own +inf-above-E row would force every pad lane INTO slot 0 — the
-/// exact inversion). `−inf` above E loses every strict GREATERTHAN, so a pad lane never
-/// displaces a real candidate; the ids stay scan positions `0..E−1`, in-range by
-/// construction. E-dependent like `pad_mask` (its VALUE comes from the geometry
-/// handoff) and W-gated: placed only when a RouteTopK exists AND `W > E` — at every
-/// real router (W == E, the logits written at full width) the row is inert and never
-/// placed, so the 26b/tiny26 wires stay byte-identical.
-pub fn router_topk_pad_tid() -> u32 {
-    reserved_region("router_const").at(9)
-}
+// ⛔ THE ROUTER CONST REGION IS GONE — the hand-written per-op MoE card lowering that
+// placed its tables (the tie table, the identity table, the iota row, the argsort/
+// softmax pad-masks, the sub-page index bank, the fused top-k's pad row) is deleted;
+// the MoE lowers only from `kernels/moe.py` through KTIR. The region's slots are
+// BURNED, never reused: a stale artifact still carrying an old slot would silently
+// alias anything that took its place, so the ids stay unallocated (the same law the
+// retired one-hot top-k slots followed inside the region while it lived).
 
 /// Does `tid` name a KERNEL-TABLE class table of family `what` (`"rope-P"` or `"identity"`)?
 ///
@@ -503,7 +401,7 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
 }
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 8] = [
+pub const RESERVED_REGIONS: [TidRegion; 7] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -539,25 +437,11 @@ pub const RESERVED_REGIONS: [TidRegion; 8] = [
         base: IDENTITY_CLASS_BASE,
         slots: 8,
     },
-    // ⭐ THE ROUTER CONST REGION — the MoE router doors' token-independent factors (see
-    // [`ROUTER_CONST_BASE`]): the tie table, the identity table, the iota row, the
-    // argsort/softmax pad-masks, the sub-page index bank, and the fused top-k's pad row.
-    // 10 slots: 1 tie + 1 identity + 1 iota + 3 RETIRED (the old one-hot top-k's targets
-    // table and its two sanitize halves — burned, never reused) + 1 argsort pad-mask +
-    // 1 softmax pad-mask + 1 sub-page bank + 1 top-k pad row. Sits in the top of the gap
-    // below `identity_class` (whose floor is MAX-136) and above `oproj_headmajor`
-    // (MAX-147); the 10th slot (MAX-146) grows toward it,
-    // which the region's own disjointness proof re-checks.
-    TidRegion {
-        name: "router_const",
-        base: ROUTER_CONST_BASE,
-        slots: 10,
-    },
-    // ⭐ THE HEAD-MAJOR o_proj COPY takes the next slot of the same gap, below `router_const` and
-    // above the deliberately-kept-empty hole. See [`OPROJ_HEADMAJOR_BASE`] for what it names.
+    // ⭐ THE HEAD-MAJOR o_proj COPY takes the slot below the burned router-const hole and
+    // above the deliberately-kept-empty gap. See [`OPROJ_HEADMAJOR_BASE`] for what it names.
     // (Rebased off main's MAX-121 — that slot is the rope-p class region on this line — to
-    // MAX-147, the first free slot below the router consts; `OPROJ_HEADMAJOR_BASE` derives from
-    // this row, so nothing else moves.)
+    // MAX-147, the first free slot below where the router consts lived; `OPROJ_HEADMAJOR_BASE`
+    // derives from this row, so nothing else moves.)
     TidRegion {
         name: "oproj_headmajor",
         base: u32::MAX - 147,
@@ -637,8 +521,6 @@ pub const EVERY_NAMED_REGION_RESOLVES: () = {
     assert!(reserved_region("kv_block_index").base == KV_BLOCK_INDEX_TID);
     assert!(reserved_region("rope_p_class").base == ROPE_P_CLASS_BASE);
     assert!(reserved_region("identity_class").base == IDENTITY_CLASS_BASE);
-    assert!(reserved_region("router_const").base == ROUTER_CONST_BASE);
-    assert!(reserved_region("router_const").floor() < ROUTER_CONST_BASE);
     assert!(reserved_region("kct_resident").slots > 0);
 };
 

@@ -234,16 +234,6 @@ pub struct BundleLayout<'a> {
     /// runtime half). See the producer-side `BundleLayout::weight_copies` for the mint's
     /// bundle-invariance law.
     pub weight_copies: Cow<'a, [(u32, u32)]>,
-    /// ⭐ THE ROUTER EXPERT COUNT `E` — the one router-const geometry fact no placement size
-    /// carries (the tie table is `[W,W]` at the PADDED width; W does not reveal E). The argsort
-    /// pad-mask row's VALUE is E-dependent, so the bake states it here and the worker's bind
-    /// reads it. 0 when the tape has no MoE router.
-    pub router_experts: u32,
-    /// ⭐ THE ROUTER TOP-K WIDTH `k` — the softmax's k-boundary mask row is k-DEPENDENT (0
-    /// below k, −inf above), and the old artifact seat for k (the `[k,W]` targets table's own
-    /// placement) died with the rank-inversion door the fused pair replaced. The bake states
-    /// it here beside `E`; the worker's bind reads it. 0 when the tape has no top-k.
-    pub router_k: u32,
     /// Bytes between two requests' KV inside one page+layer, or 0 for an unpaged bundle. The
     /// EMITTER's number, travelling to the runtime rather than being re-derived there.
     pub kv_request_stride_bytes: u64,
