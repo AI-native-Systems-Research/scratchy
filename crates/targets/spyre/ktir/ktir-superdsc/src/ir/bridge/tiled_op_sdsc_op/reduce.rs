@@ -9,7 +9,7 @@ use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{KindTag, StickKind, Stk};
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, DataFormat, Df, Fp16, Fp32, MAX_CORES, MaxCores, OpFunc, OpInfo,
-    OpSpec, Role, Scale, SdscFoldSet, StickExtent, TensorArg,
+    OpSpec, Role, SamvCoordinateMask, Scale, SdscFoldSet, TensorArg,
 };
 use crate::work::distribute_cores;
 
@@ -36,22 +36,43 @@ fn reduce_tile_kind(op: OpFunc) -> TileOpKind {
     }
 }
 
+/// The stick-padded extent of `cols` under `df` — the reduction axis's TRUE on-device width.
+/// Unlike a matmul's N/K extents ([`crate::superdsc_opspec::StickExtent::new`] REFUSES
+/// sub-stick widths outright — a non-multiple-of-64 tile faults the scheduler,
+/// L3DlOpsScheduler:1040), a reduce PADS UP to the next whole stick and masks the pad lanes
+/// with the reduce's identity ([`reduce_coordinate_mask`]): the padded extent is still a
+/// whole-stick dim the scheduler accepts, and the mask makes the padding numerically inert.
+/// This is the vendor's own shape — `_get_padded_iteration_space` (codegen/superdsc.py:477-507)
+/// pads every iteration space to stick alignment, and their `[mb=32, 514]` max fixture walks
+/// `out_ = 576` with `coordinateMasking_: {"out": [[514, 62]]}` (sdsc_max.json).
+fn reduce_stick_elems(cols: u32, df: Df) -> Result<u32, String> {
+    if cols == 0 {
+        return Err(
+            "reduce width 0: a reduce needs at least one element along its reduced axis"
+                .to_string(),
+        );
+    }
+    let eps = if matches!(df, Df::Fp32) {
+        <Fp32 as DataFormat>::ELEMS_PER_STICK
+    } else {
+        <Fp16 as DataFormat>::ELEMS_PER_STICK
+    };
+    Ok(cols.div_ceil(eps) * eps)
+}
+
 /// The reduce's SHARED `TileOp` front matter — the `[mb, out(stick), y]` iteration domain
 /// (the stick-padded `cols` as the reduction stick axis) plus the arity-picked kind — ONE
 /// constructor behind both `reduce_opspec_df` and `reduce_opspec_off`, so the two variants
 /// cannot drift in what they declare to the tiler. `Err` only where the emission itself
-/// would refuse (a `StickExtent` no stick-legal reduce can state).
+/// would refuse (a `StickExtent` no stick-legal reduce can state). Returns the padded stick
+/// extent alongside, the number the coordinate mask is computed from.
 fn reduce_dims_kind(
     op: OpFunc,
     rows: u32,
     cols: u32,
     df: Df,
-) -> Result<(Vec<crate::superdsc_opspec::ItDim>, TileOpKind), String> {
-    let stick_elems = if matches!(df, Df::Fp32) {
-        StickExtent::<Fp32>::new(cols)?.elems()
-    } else {
-        StickExtent::<Fp16>::new(cols)?.elems()
-    };
+) -> Result<(Vec<crate::superdsc_opspec::ItDim>, TileOpKind, u32), String> {
+    let stick_elems = reduce_stick_elems(cols, df)?;
     let dims = vec![
         crate::superdsc_opspec::ItDim {
             name: "mb",
@@ -75,7 +96,56 @@ fn reduce_dims_kind(
             df,
         },
     ];
-    Ok((dims, reduce_tile_kind(op)))
+    Ok((dims, reduce_tile_kind(op), stick_elems))
+}
+
+/// ⭐ THE SAMV COORDINATE MASK on a padded reduce stick — the vendor's own answer to an
+/// unaligned reduced width. A reduce over `cols` that is not a stick multiple still walks the
+/// STICK-PADDED extent (the allocator hands out whole sticks), so the pad lanes ride the
+/// reduction as whatever the buffer holds — for `max` over non-positive data that is a
+/// zeros-read (`max(−65504, 0, x) = 0`, the measured `mxp=0` signature). The device's fix is
+/// `coordinateMasking_` plus a `samv-maskvalue` constant: every coordinate past `valid` is fed
+/// the mask word instead of a memory read, and the mask word is the reduce's IDENTITY — the
+/// padding then contributes nothing. torch-spyre builds exactly this pair whenever the reduced
+/// stick dim padded (`_get_coordinate_mask` + `constants["samv-maskvalue"] =
+/// _get_mask_value(op)`, codegen/superdsc.py:2357-2365 and :281-319), and the backend's own
+/// multi-row max fixture pins the wire form (`ddc/ddl_templates/test/sdsc_max.json`:
+/// `coordinateMasking_: {"out": [[514, 62]]}`, const word `"65534"`).
+///
+/// `mask_bits` is the RAW SEN169 word, NOT `sen169_bits` of a value: the fixture's `65534` =
+/// `0xFFFE` is the DDL's own `negInf` pattern (`summeanmaxexx2.ddl:69-72` defines it as a
+/// `define_constant`), not the value-true encoding of −65504 (`0xDE00`). `max` masks with
+/// negInf; every other seeded kind (sum/mean/exx2) masks with 0 — the additive identity.
+///
+/// fp32 is REFUSED, not masked: SAMV masking is a ≤16-bit-element mechanism (the vendor's own
+/// element-bit guard in `_get_coordinate_mask`), so an fp32 padded reduce has no faithful
+/// descriptor — it would fold the padding into the result. That is a build `Err` here (garbage
+/// refuses at bake), never a silent wrong answer.
+fn reduce_coordinate_mask(
+    op: OpFunc,
+    cols: u32,
+    stick_elems: u32,
+    df: Df,
+    accum_name: &str,
+) -> Result<Option<SamvCoordinateMask>, String> {
+    let pad = stick_elems - cols;
+    if pad == 0 {
+        return Ok(None);
+    }
+    if matches!(df, Df::Fp32) {
+        return Err(format!(
+            "reduce `{accum_name}`: the reduced width {cols} is not a stick multiple (stick \
+             extent {stick_elems}, pad {pad}) and SAMV coordinate masking is fp16-only (the \
+             vendor's own ≤16-bit element limit) — an fp32 reduce here would fold the padding \
+             into the result. Keep the fp32 reduced width a stick multiple."
+        ));
+    }
+    Ok(Some(SamvCoordinateMask {
+        dim: "out",
+        valid: cols,
+        pad,
+        mask_bits: if matches!(op, OpFunc::Max) { 0xFFFE } else { 0 },
+    }))
 }
 
 /// `cols` axis. Two operands: `data` (all active) + `accum` (the accumulator,
@@ -107,7 +177,10 @@ pub fn reduce_opspec_df(
     // REAL `lower_one_node` SubtileTape dispatch (every reduce: rmsnorm's mean, softmax's max/sum,
     // fp8's amax), same as `pointwise_opspec`. The kind comes off the DDL's own input arity, and the
     // seeded accum is charged at its TRUE one-stick-per-row size — see [`reduce_tile_kind`].
-    let (dims, kind) = reduce_dims_kind(op, rows, cols, df)?;
+    let (dims, kind, stick_elems) = reduce_dims_kind(op, rows, cols, df)?;
+    // The pad-lane mask, stated before anything else so an unmaskable shape (fp32 + pad) is a
+    // build Err here, not a descriptor that silently folds its padding into the result.
+    let coordinate_mask = reduce_coordinate_mask(op, cols, stick_elems, df, accum_name)?;
     let tile_op = TileOp {
         kind,
         dims: dims.clone(),
@@ -264,6 +337,7 @@ pub fn reduce_opspec_df(
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask,
     })
 }
 
@@ -476,7 +550,10 @@ pub fn reduce_opspec_off_divided(r: ReduceOffSpec<'_>) -> Result<OpSpec, String>
     } = r;
     // LOWER to TileIR: same pattern as `reduce_opspec_df` — the per-head/offset reduce variant
     // over the SAME shared declaration, kind picked off the DDL arity ([`reduce_tile_kind`]).
-    let (dims, kind) = reduce_dims_kind(op, rows, cols, Df::Fp16)?;
+    let (dims, kind, stick_elems) = reduce_dims_kind(op, rows, cols, Df::Fp16)?;
+    // The pad-lane mask (see `reduce_opspec_df`'s identical call): stated first so an
+    // unmaskable shape is a build Err, never a silently-wrong descriptor.
+    let coordinate_mask = reduce_coordinate_mask(op, cols, stick_elems, Df::Fp16, accum_name)?;
     let tile_op = TileOp {
         kind,
         dims: dims.clone(),
@@ -625,6 +702,7 @@ pub fn reduce_opspec_off_divided(r: ReduceOffSpec<'_>) -> Result<OpSpec, String>
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask,
     })
 }
 

@@ -3063,6 +3063,53 @@ pub enum IndirectRole {
 // OpSpec — the typed frontend op.
 // ───────────────────────────────────────────────────────────────────────────
 
+/// The SAMV COORDINATE MASKING on a seeded reduce's PADDED stick dim — the backend
+/// feature torch-spyre's `codegen/superdsc.py` emits and this crate did not:
+/// when the reduced stick dim's extent was rounded up to a whole stick, the
+/// padded lanes are substituted with a per-kind REDUCTION IDENTITY constant
+/// (`samv-maskvalue`) instead of reading whatever the buffer holds there.
+///
+/// Without it, a `max` over an unaligned width reduces the padding too: the
+/// padded lanes read whatever the allocation holds (a fresh buffer: zeros), so
+/// the result is `max(identity, data, 0)` — for non-positive data that is `0`,
+/// the exact `mxp = 0` signature once measured over `[nqh, cap]`. torch-spyre
+/// hit the same class and root-caused the SEED VALUE
+/// (`codegen/superdsc.py:244-264`): `float("-inf")` mis-encodes through
+/// `deeptools::FloatToFp16Bin` as a NaN bit pattern and `max(x, NaN) == NaN`
+/// poisons the whole reduction, so the identity is the FINITE fp16 limit —
+/// which on the wire is the template's own `negInf`/`posInf` words (below).
+///
+/// The wire fields (mirrored from torch-spyre `compute_ops.py:1357-1410`, and
+/// stated by the backend's own reduce fixture `ddc/ddl_templates/test/sdsc_max.json`:
+/// `coordinateMasking_ {"out": [[514, 62]]}`, `maskingConstId_ 8`,
+/// `constantInfo_ {"8": {name_: "samv-maskvalue", data_ "[0,0,0]": ["65534"]}}`):
+///   * `coordinateMasking_` — one `[[valid, pad]]` pair per masked dim, in
+///     ELEMENTS, `valid + pad` = the stick-padded extent;
+///   * a `samv-maskvalue` entry appended to `constantInfo_` AFTER the op's own
+///     constants (insertion order — mean's `scaling_factor` shifts it, #4390),
+///     with `maskingConstId_` = that entry's index.
+///
+/// `mask_bits` is a RAW SEN169 word, NOT `sen169_bits(f32)`: the identities are
+/// the DDL's own `ddl.define_constant` patterns (`summeanmaxexx2.ddl:69-72`:
+/// `zero 0x0`, `negInf 0xFFFE`, `posInf 0x7FFE`) — the same words the template
+/// seeds its PE accumulator LRFs from (`:209`, `:235`), so the padded lanes and
+/// the on-chip seed can never disagree. `sen169_bits(-65504.0)` would emit the
+/// VALUE-TRUE encoding of −65504 (a different word); the backend's fixture pins
+/// `0xFFFE` = 65534 and so does this crate's own SFP table (`negInf`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SamvCoordinateMask {
+    /// The reduced STICK dim's SDSC name (`"out"` for this crate's reduce family).
+    pub dim: &'static str,
+    /// The LOGICAL (pre-padding) extent, in elements.
+    pub valid: u32,
+    /// The pad amount, in elements (`stick_padded − valid`). Always > 0 — the
+    /// builder only states a mask when the stick extent actually padded.
+    pub pad: u32,
+    /// The identity's RAW SEN169 word — `0xFFFE` (negInf) for `max`, `0` for
+    /// every other reduce kind, per `_get_mask_value`'s table.
+    pub mask_bits: u32,
+}
+
 /// The TYPED FRONTEND op. Carries ONLY what the frontend decides; everything the
 /// L3 scheduler fills (corelet split, time fold, lx/hbm sizes, register-file
 /// residency) is ABSENT by construction. Faithful to op_spec.py `OpSpec`, but the
@@ -3095,6 +3142,11 @@ pub struct OpSpec {
     /// One `Option` for the whole op, never a flag per operand: see [`IndirectAccess`] for why a
     /// half-declared pair must be unrepresentable.
     pub indirect: Option<IndirectAccess>,
+    /// The SAMV coordinate masking on a seeded reduce's padded stick dim. `None` (every
+    /// stick-aligned reduce) emits `coordinateMasking_: {}`, `maskingConstId_: -1` and no
+    /// `samv-maskvalue` constant — byte-identical to before this field existed. See
+    /// [`SamvCoordinateMask`] for the wire fields and the identity-value law.
+    pub coordinate_mask: Option<SamvCoordinateMask>,
 }
 
 impl OpSpec {
