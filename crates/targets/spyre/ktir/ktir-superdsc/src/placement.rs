@@ -201,6 +201,23 @@ pub struct BundleLayout {
     /// that spelling to its own identity, filled where the spelling is created.
     #[serde(skip)]
     pub ids: std::cell::RefCell<std::collections::BTreeMap<String, PlaceId>>,
+    /// ⭐ THE INTERMEDIATE-TID CURSOR — the ONE source of fresh intermediate tids, bundle-unique.
+    ///
+    /// ⛔ MEASURED on the card (2026-10-20, granite-2b fp16 at `load_model`): the mint used to
+    /// be seeded per NODE from that node's own bindings' max, so node B's mint landed on node
+    /// A's placement — `1310 placements collapse to 1214 distinct ids` (96 duplicates = the
+    /// number of intermediates one rope mints per node), the runtime refused to load, and the
+    /// load-time aliasing is worse than the refusal: a `BTreeMap` keeps ONE entry per id, so
+    /// the other tensor has NO placement at all and the device reads whatever shares its
+    /// address. The cursor is seeded LAZILY, on first mint, above the highest non-reserved
+    /// placement id in the WHOLE bundle — `#[forward]` expands every node before any lowering
+    /// runs, so the seed sees every placement — and advances monotonically past reserved tids
+    /// (the rope P / identity / scalarmul const tables live above `u32::MAX/2` and are skipped,
+    /// never minted onto). `take_inter_tid(floor)` also honors a caller-passed floor, so a
+    /// node lowered into TWO layouts (declare pass then real pass) can demand the same
+    /// tid again; [`KtirNode::minted`] replays the node's own record for exactly that.
+    #[serde(skip)]
+    pub inter_cursor: std::cell::Cell<Option<u32>>,
     /// Bytes occupied per segment (index = segment id 0..6). For the weight segment this is BANK
     /// 0's bytes — see [`BundleLayout::weight_bank_bytes`].
     pub segment_bytes: [u64; 7],
@@ -485,6 +502,37 @@ impl BundleLayout {
             .iter()
             .position(|&h| h == hd)
             .map(crate::reserved_tids::identity_class_tid)
+    }
+
+    /// Mint the NEXT intermediate tid — bundle-unique by construction. First call seeds the
+    /// cursor above the highest non-reserved placement id in the whole bundle (reserved tids
+    /// are the const tables and are skipped, never landed on); every later call advances
+    /// monotonically. `floor` is the caller's node-derived bound: the returned tid is at or
+    /// above it, so a node whose bindings sit above the current cursor still mints clear of
+    /// its own tensors too. See [`Self::inter_cursor`] for why the seed is bundle-wide.
+    pub fn take_inter_tid(&self, floor: u32) -> u32 {
+        let mut cur = match self.inter_cursor.get() {
+            Some(c) => c,
+            None => {
+                let above_places = self
+                    .placements
+                    .keys()
+                    .copied()
+                    .filter(|t| !crate::reserved_tids::is_reserved(*t))
+                    .max()
+                    .map_or(0, |m| m + 1);
+                above_places.max(floor)
+            }
+        };
+        if cur < floor {
+            cur = floor;
+        }
+        while crate::reserved_tids::is_reserved(cur) {
+            cur += 1;
+        }
+        let tid = cur;
+        self.inter_cursor.set(Some(cur + 1));
+        tid
     }
 
     /// Declare a SYNTHETIC intermediate at its FULL shape (`dims`, outermost→innermost),

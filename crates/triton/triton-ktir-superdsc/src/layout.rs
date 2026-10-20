@@ -497,6 +497,9 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     Ok(BundleLayout {
         placements,
         ids,
+        // No minted intermediates yet: the cursor seeds lazily, on the first mint, above this
+        // layout's own highest placement — one Triton kernel's bundle starts empty-handed.
+        inter_cursor: Default::default(),
         // The PLACEMENT high-water per segment. It does not include the synthetics, which are
         // bump-allocated during lowering through the `RefCell` above and so do not exist yet — the
         // same order `compute_bundle_layout` builds in.

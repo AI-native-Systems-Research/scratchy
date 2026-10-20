@@ -2104,6 +2104,34 @@ fn row_tiled_family(
 /// rather than inventing an address. A CONSTANT operand (a `tensor.splat`) is refused for the same
 /// reason: `Program::ScalarMul` is the door for "times a stated constant" and choosing it here would
 /// be picking a node kind on the producer's behalf.
+/// Mint the tid for an intermediate of `ssa` — BUNDLE-unique, and REPLAYED when this node's
+/// lowering runs twice into the same layout.
+///
+/// The declare pass and the real pass ([`lower_subtile_tape_to_ktir`]'s two visits of the
+/// same node) must agree on every intermediate's NAME, or the real pass's mint lands beside
+/// the declare pass's buffer and a consumer sees whichever the walk visited first — the
+/// DMA-past-segment defect this replay closes. The node's own record
+/// ([`KtirNode::minted`](crate::ktir_node::KtirNode::minted)) maps the SSA value to the tid
+/// minted for it, and the replay fires only when THIS layout confirmed it (its synth map
+/// holds `act_name(tid)`), so a record carried into a different layout mints fresh instead
+/// of colliding with that layout's placements. `floor` is the node-derived bound from
+/// [`lower_function`] — see its law doc for why the mint is bundle-seeded, not node-seeded.
+fn mint_inter(k: &KtirNode, layout: &BundleLayout, floor: u32, ssa: Ssa) -> u32 {
+    let mut minted = k.minted.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(&tid) = minted.get(&ssa)
+        && layout
+            .synth
+            .borrow()
+            .map
+            .contains_key(&crate::place::act_name(tid))
+    {
+        return tid;
+    }
+    let tid = layout.take_inter_tid(floor);
+    minted.insert(ssa, tid);
+    tid
+}
+
 pub fn lower_function(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
@@ -2133,16 +2161,24 @@ pub fn lower_function(
     // `+ 1` would panic — and a mint landing INSIDE a reserved region would alias that synthetic's
     // placement. Reserved tids name producer-staged tensors, never intermediates, so the mint starts
     // above the highest NON-reserved binding and steps past any region it lands in.
-    let mut next_tid: u32 = k
+    //
+    // ⛔⭐ AND THAT BOUND IS A FLOOR, NOT THE SEED. MEASURED on the card (2026-10-20, granite-2b
+    // fp16): seeding the mint from THIS node's bindings alone minted node B's intermediates onto
+    // node A's real placements — `1310 placements collapse to 1214 distinct ids`, 96 duplicates,
+    // the runtime refusing to load. The seed is the BUNDLE's
+    // ([`BundleLayout::take_inter_tid`](crate::placement::BundleLayout::take_inter_tid)): lazily
+    // initialized above the highest non-reserved placement in the whole bundle, monotonic from
+    // there. This node-derived value survives as the FLOOR the bundle minter honors — a node
+    // lowered into a layout that places its own bindings high still mints clear of its own
+    // tensors — and as the replay gate below.
+    let floor: u32 = k
         .bindings
         .iter()
+        .chain(k.mask.iter())
         .map(|b| b.get())
         .filter(|t| !crate::reserved_tids::is_reserved(*t))
         .max()
         .map_or(0, |m| m + 1);
-    while crate::reserved_tids::is_reserved(next_tid) {
-        next_tid += 1;
-    }
     let mut inter: std::collections::HashMap<Ssa, Region> = std::collections::HashMap::new();
     // THE fp8 SCALE MULFS THE DOT ABSORBED. The walk lowers each op once, and an absorbed epilogue
     // (`p * ws`, see the absorption at the `stored` lookup) already rode into its dot's emission —
@@ -2530,7 +2566,7 @@ pub fn lower_function(
                 &mut GatherEmit {
                     sym_id_base,
                     out: &mut out,
-                    next_tid: &mut next_tid,
+                    floor,
                     inter: &mut inter,
                 },
                 g,
@@ -2833,8 +2869,7 @@ pub fn lower_function(
                     f.name, op.op_type
                 ));
             };
-            let tid = next_tid;
-            next_tid += 1;
+            let tid = mint_inter(k, layout, floor, res);
             // ⛔⛔⛔ A MATMUL'S INTERMEDIATE IS RESERVED AT ITS **DEVICE** WIDTH, NOT THE LOGICAL
             // SHAPE — everything else keeps the logical dims.
             //
@@ -3215,13 +3250,14 @@ fn emit_one(
 /// `false` is not an error: a matmul whose B is NOT the gathered table still falls to the
 /// fail-closed refusal below, with its own name in the message.
 ///
-/// The emission's mutable scratch (`sym_id_base`, `out`, `next_tid`, `inter`) travels in
-/// [`GatherEmit`] rather than as four more arguments — the walk owns one of these, threading it
-/// to every materialization.
+/// The emission's mutable scratch (`sym_id_base`, `out`, `inter`) travels in
+/// [`GatherEmit`] rather than as three more arguments — the walk owns one of these, threading it
+/// to every materialization. `floor` is [`lower_function`]'s node-derived tid bound, carried so
+/// this mint honors it like the walk's own does.
 struct GatherEmit<'a> {
     sym_id_base: &'a mut i64,
     out: &'a mut Vec<super::EmittedOp>,
-    next_tid: &'a mut u32,
+    floor: u32,
     inter: &'a mut std::collections::HashMap<Ssa, Region>,
 }
 
@@ -3236,7 +3272,7 @@ fn gathered_matmul_materializes(
     let GatherEmit {
         sym_id_base,
         out,
-        next_tid,
+        floor,
         inter,
     } = emit;
     let f = &k.func;
@@ -3310,8 +3346,7 @@ fn gathered_matmul_materializes(
             f.name
         ));
     };
-    let tid = **next_tid;
-    **next_tid += 1;
+    let tid = mint_inter(k, layout, *floor, gathered_result);
     layout.synth(crate::place::PlaceId::Act(tid), &[rows, head]);
     let r = Region {
         tid,
