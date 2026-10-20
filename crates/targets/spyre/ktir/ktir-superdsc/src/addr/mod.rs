@@ -527,15 +527,6 @@ impl DevOff {
     pub const fn of_mask_corner(c: crate::sdsc_abstract::MaskCorner) -> DevOff {
         DevOff(c.elems())
     }
-    /// The corner of ONE kv head's block in a split-KV chunk tensor — derived by
-    /// [`ChunkScratch`]'s own law (the gather scratch's kernel base, or a per-head wide intermediate's
-    /// base). Its own door for the same reason as [`Self::of_mask_corner`]: a head block is a whole
-    /// plane term, not a single-stick view step.
-    ///
-    /// [`ChunkScratch`]: crate::sdsc_abstract::ChunkScratch
-    pub const fn of_chunk_corner(c: crate::sdsc_abstract::ChunkCorner) -> DevOff {
-        DevOff(c.elems())
-    }
     /// Consume into the raw element offset. Deliberately named to be greppable: every call is a
     /// place where the typed offset re-enters untyped code, i.e. a remaining migration seam.
     pub fn into_raw_elems(self) -> u32 {

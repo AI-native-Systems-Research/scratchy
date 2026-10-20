@@ -788,7 +788,7 @@ impl Recording<'_> {
         };
         let no = || self.no(i, Refused::CodecUnanchored);
         let layer = match self.l.bindings[e] {
-            SourceBinding::PrefixK { layer } | SourceBinding::PrefixV { layer } => layer,
+            SourceBinding::PrefixK { layer, .. } | SourceBinding::PrefixV { layer } => layer,
             _ => return Err(no()),
         };
         let reads = |od: &scratchy_subtile::lower::OpDesc| {
@@ -1638,7 +1638,7 @@ impl Recording<'_> {
     fn prefix_layer(&self, i: usize) -> Option<LayerId> {
         match self.arg(i, 1).ok()? {
             InputRef::Ext(e) => match self.l.bindings[e] {
-                SourceBinding::PrefixK { layer } => Some(LayerId(layer as u32)),
+                SourceBinding::PrefixK { layer, .. } => Some(LayerId(layer as u32)),
                 _ => None,
             },
             InputRef::Op(_) => None,

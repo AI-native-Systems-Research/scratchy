@@ -1,6 +1,5 @@
 //! Bridge 3: `TiledOp -> SdscOp`. This is where composite-op decomposition legitimately belongs
-//! (RmsNorm's 5-op form with the fused `exx2` head, RoPE's rotate+xc+rs+add, AttnDecode's fused
-//! attention): the schedule must
+//! (RmsNorm's 5-op form with the fused `exx2` head, RoPE's rotate+xc+rs+add): the schedule must
 //! be decided FIRST against the whole composite `TileOp` (Bridge 2), and only THEN does
 //! decomposition into concrete `SdscOp`s happen, informed by that schedule.
 //!
@@ -18,22 +17,26 @@
 //! (`crate::ir::bridge::tiled_op_sdsc_op::foo`) so no caller needed to change when this split from
 //! one file into three.
 //!
-//! The COMPOSITE-op decomposition itself (RoPE's rotate+xc+rs+add, AttnDecode's fused attention,
-//! SiluMul's internal multi-op sequence, and the `lower_*_node` dispatch functions) still lives in
-//! the live emitter: each of those already calls through to these families' functions as its own
-//! OWN primitive-op building blocks. RmsNorm's decomposition ([`rmsnorm`]) has moved here —
-//! it is the first composite decomposer ported, matching torch-spyre's `spyre_rms_norm` exactly
-//! (see that module's doc). Migrating the *remaining* composite decomposers here too is real,
-//! ongoing work, not yet complete for RoPE/AttnDecode/SiluMul.
+//! The COMPOSITE-op decomposition itself (RoPE's rotate+xc+rs+add, SiluMul's internal multi-op
+//! sequence, and the `lower_*_node` dispatch functions) still lives in the live emitter: each of
+//! those already calls through to these families' functions as its own OWN primitive-op building
+//! blocks. RmsNorm's decomposition ([`rmsnorm`]) has moved here — it is the first composite
+//! decomposer ported, matching torch-spyre's `spyre_rms_norm` exactly (see that module's doc).
+//! Migrating the *remaining* composite decomposers here too is real, ongoing work, not yet
+//! complete for RoPE/SiluMul.
 //!   - [`rmsnorm`] — torch-spyre `spyre_rms_norm`, one formula for every row count.
+//!
+//! ⛔ THERE IS NO ATTENTION MODULE, AND ITS ABSENCE IS THE ARCHITECTURE. The hand-written
+//! AttnDecode decomposition (GQA replication, Kᵀ restickify, the split-KV chunk, the per-page
+//! fold, the LX pins) is deleted: a spliced attention program lowers through the generic
+//! op-by-op whole-function door like every other Triton kernel, and a per-attention decomposer
+//! here would be a second path around it.
 
-pub mod attn;
 pub mod matmul;
 pub mod pointwise;
 pub mod reduce;
 pub mod rmsnorm;
 
-pub use attn::assemble_attn;
 pub use matmul::{
     SharedKernelBmmForm, assemble_matmul, assemble_matmul_batched_off,
     assemble_matmul_batched_seeded, assemble_matmul_off, assemble_matmul_off_phys_m,

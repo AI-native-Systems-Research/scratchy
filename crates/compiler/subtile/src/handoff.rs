@@ -280,8 +280,19 @@ pub enum SourceBinding {
         local: bool,
     },
     /// The read-only prefix KV cache for a layer, `[prefix_len, kvdim]`.
+    ///
+    /// `head_dim` is the LAYER'S OWN ATTENTION CLASS's head dim (a hybrid-attention
+    /// arch's layers carry different ones), off the same class geometry the
+    /// `AttnDecode` this cache feeds was built with. The spyre target's attention
+    /// reads this cache's keys through the Kᵀ PLANE — per head `[hd, capacity]`,
+    /// heads concatenated — and the host stages that plane by transposing the
+    /// natural rows under exactly this dim: `kt[d, kvh·cap + s] = k[s, kvh·hd + d]`.
+    /// No other fact on this binding can decompose `kvdim` into `(nkvh, hd)`, and
+    /// the class head-dim set alone cannot name THIS layer's class, so the dim
+    /// rides the binding the way the layer does.
     PrefixK {
         layer: u64,
+        head_dim: u32,
     },
     PrefixV {
         layer: u64,

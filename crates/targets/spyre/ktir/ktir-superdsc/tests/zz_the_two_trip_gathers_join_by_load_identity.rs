@@ -471,3 +471,46 @@ fn the_windowed_drop_does_not_fire_below_the_util_floor() {
          skip a pad the caller's windows cannot honor, not to strand the gemm"
     );
 }
+
+/// ⭐⭐⭐ THE DROP FIRES AT AN ALIGNED WIDTH TOO — the #717 card-CLI build refusal. The per-head
+/// value dot at prefill width 128 is [128,64]·K=128 over a 64-column window of new_v at kvh·64
+/// of a 512-column placement: `n` is ALREADY stick-aligned, so the old test's `n64 > logical_n`
+/// conjunct was false, the shape fell through to `for_output`, and macs = 128·64·128 = 2²⁰
+/// exactly bumped n 64→512 — the B read then ran 64 columns past the placement
+/// (`matmul_o1171: t451: access window end 147456B (offset 16384B, operand 131072B) exceeds its
+/// placement footprint 131072B`). The widths ≥ 128 are exactly the rungs where macs ≥ 2²⁰; the
+/// emulator's one-width bake (31) stays under, which is why only the card CLI's full ladder saw
+/// it. The floor test — NOT the rounding — is what decides the drop.
+#[test]
+fn the_windowed_drop_fires_at_an_aligned_width_too() {
+    // The #717 value-dot shape: m=128, n=64 (aligned), k=128. `CoreSplit::plan(128, 64)` splits
+    // 128 rows over 1 stick = 32 cores ≥ the floor of 8, so the drop MUST fire and keep n at 64.
+    let m = 128;
+    let n = 64;
+    let k = 128;
+    assert!(
+        ktir_superdsc::work::CoreSplit::plan(m, n).ncores() >= UTIL_FLOOR_CORES,
+        "the control's premise: {m}×{n} splits onto ≥{UTIL_FLOOR_CORES} cores by rows, aligned \
+         or not"
+    );
+    assert_eq!(
+        DeviceWidth::for_matmul(m, n, k, true).get(),
+        64,
+        "windowed: an aligned n whose split meets the floor is NOT bumped — for_output would pad \
+         it to 512 and read past the caller's window"
+    );
+    // The control: the SAME shape staged takes the bump — the pad is real only where the
+    // staged-buffer contract (the worker's weight zero-pad) makes it real.
+    assert_eq!(
+        DeviceWidth::for_matmul(m, n, k, false).get(),
+        DeviceWidth::for_output(m, n, k).get(),
+        "staged: the full rule applies — the two readings differ, so the windowed assertion is \
+         not vacuous"
+    );
+    assert_eq!(
+        DeviceWidth::for_matmul(m, n, k, false).get(),
+        512,
+        "the staged shape really is FLOP-heavy (macs = 128·64·128 = 2²⁰): the bump is live here, \
+         so the windowed 64 above is the drop doing its work"
+    );
+}

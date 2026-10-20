@@ -993,6 +993,8 @@ fn fold_trans_into_access_tile_order(module: &mut Module) {
             }
 
             let new_shape: Vec<i64> = order.iter().map(|d| block_shape[*d as usize]).collect();
+            // The rebuilt set, stated before `new_shape` moves into the result type.
+            let new_set = build_range_set_nd(&new_shape);
             // The rewritten ops start from the MODULE's own tile and load (the index holds only
             // their heads, and these two are written back whole).
             let tile_path = find_path_of_result(module, tile_v).expect("the tile has a path");
@@ -1004,6 +1006,16 @@ fn fold_trans_into_access_tile_order(module: &mut Module) {
                 AttrKey::AccessTileOrder,
                 Attr::AffineMap(order_map(rank, &order)),
             );
+            // ⛔ THE SET IS STATED IN VALUE COORDS, AND THE FOLD JUST CHANGED THE
+            // VALUE SPACE. The as-built set is the full box over the PRE-transpose
+            // block (`build_direct_access_tile`'s statement); left alone, its extents
+            // read against the TRANSPOSED `Shape` as a partial selection — MEASURED,
+            // the granite-2b gate's restickify load: `[64, 512]`'s `d0 < 64 ∧ d1 < 512`
+            // over a `[512, 64]` value intersects to `[0,64) × [0,64)`, 4096 of 32768
+            // points, and the load's data no longer fills its own shape. Rebuild it
+            // as the full box over the new shape — the same statement the as-built
+            // tile makes, restated in the space the folded tile now enumerates.
+            new_tile.set_attr(AttrKey::AccessTileSet, Attr::AffineSet(new_set));
 
             let mut new_load = walk::at(module, &load_path).expect("load path").clone();
             new_load.results = trans.results.clone();

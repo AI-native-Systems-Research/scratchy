@@ -295,19 +295,25 @@ impl DeviceWidth {
     /// `windowed = true` is the whole-function door's minted-intermediate arm: the padded weight
     /// columns would be read from the CALLER'S parameter windows (`for_output`'s staged-buffer
     /// contract does not exist there), so the util-floor bump is dropped when the LOGICAL width
-    /// already meets the floor. ⛔ ONLY THE FLOOR BUP IS DROPPED — the rounding to a whole
+    /// already meets the floor. ⛔ THE DROP IS NOT GATED ON STICK-ROUNDING: an ALREADY-ALIGNED
+    /// `n` meets the floor exactly as well as an unaligned one, and gating the test on
+    /// `n64 > logical_n` sent every aligned `n` to `for_output`'s bump — MEASURED as the #717
+    /// card-CLI build refusal at prefill width ≥ 128 (`assemble_matmul matmul_o1171: t451:
+    /// access window end 147456B (offset 16384B, operand 131072B) exceeds its placement
+    /// footprint 131072B (seg0)`): the per-head value dot is [128,64]·K=128 over a 64-column
+    /// window of new_v at kvh·64 of a 512-column placement, macs = 128·64·128 = 2²⁰ exactly, so
+    /// the bump padded n 64→512 and the B read ran 64 columns past the placement — the widths
+    /// ≥ 128 are exactly the rungs where macs ≥ 2²⁰ (31 stays under, which is why the emulator's
+    /// one-width bake never saw it). ⛔ ONLY THE FLOOR BUMP IS DROPPED — the rounding to a whole
     /// 64-stick STAYS (issue 201 item 5): an unaligned `n` with a ≥8-core split still emits at
     /// `n.next_multiple_of(64)`, so it cannot fall into the per-core stick guard that a raw
     /// `n_dev = n` would hit. `UTIL_FLOOR_CORES` is the floor both the drop test and guard #11
     /// use — named once, not three hard-coded `8`s.
     pub fn for_matmul(m: u32, logical_n: u32, k: u32, windowed: bool) -> DeviceWidth {
-        if windowed {
-            let n64 = logical_n.next_multiple_of(FP16_ELEMS_PER_STICK);
-            if n64 > logical_n && CoreSplit::plan(m, logical_n).ncores() >= UTIL_FLOOR_CORES {
-                // The logical width already meets the util floor the bump was buying — and its
-                // stick rounding is kept by returning `n64`, not `logical_n`.
-                return DeviceWidth(n64);
-            }
+        if windowed && CoreSplit::plan(m, logical_n).ncores() >= UTIL_FLOOR_CORES {
+            // The logical width already meets the util floor the bump was buying — and its
+            // stick rounding is kept by rounding UP here, not returning `logical_n` raw.
+            return DeviceWidth(logical_n.next_multiple_of(FP16_ELEMS_PER_STICK));
         }
         DeviceWidth::for_output(m, logical_n, k)
     }

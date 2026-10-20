@@ -177,24 +177,45 @@ fn store(
 /// Resolve the access tile's coordinate list, if it carries a coordinate_set.
 /// Enumerate over `access.shape`, then reorder each point through
 /// `coordinate_order` when present (mirrors `css.enumerate` + `cso.eval`).
+///
+/// A tile with NO coordinate_set but a NON-IDENTITY order also enumerates: the
+/// implicit set is the full box `[0, shape)` in VALUE space, and the raw
+/// footprint would read the wrong elements — the order names which VIEW axis
+/// each value axis addresses (the restickify's folded `.T` load is a
+/// `[512, 64]` value over a `[64, 512]` view). Enumerate the value box and map
+/// each point through the order into parent-relative coords, the same
+/// enumerate-then-reorder the explicit-set case runs.
 fn enumerated_coords(access: &AccessTile) -> Option<Vec<Vec<i64>>> {
-    let css = access.coordinate_set.as_ref()?;
-    // Fast-path bypass: a coordinate set covering the full `[0, shape)` box with
-    // an identity iteration order selects exactly the whole tile in row-major
-    // order — identical to a plain contiguous load/store. Returning `None` takes
-    // that fast path instead of enumerating every point (the O(2^n) `is_full`
-    // vertex check vs O(∏ shape) enumeration + element-wise gather/scatter).
     let order_is_identity = access
         .coordinate_order
         .as_ref()
         .is_none_or(|m| m.is_identity());
-    if order_is_identity && css.is_full(&access.shape) {
+    if let Some(css) = access.coordinate_set.as_ref() {
+        // Fast-path bypass: a coordinate set covering the full `[0, shape)` box with
+        // an identity iteration order selects exactly the whole tile in row-major
+        // order — identical to a plain contiguous load/store. Returning `None` takes
+        // that fast path instead of enumerating every point (the O(2^n) `is_full`
+        // vertex check vs O(∏ shape) enumeration + element-wise gather/scatter).
+        if order_is_identity && css.is_full(&access.shape) {
+            return None;
+        }
+        let mut coords = css.enumerate(&access.shape, &[]);
+        if let Some(order) = &access.coordinate_order {
+            coords = coords.iter().map(|pt| order.eval(pt, &[])).collect();
+        }
+        return Some(coords);
+    }
+    if order_is_identity {
         return None;
     }
-    let mut coords = css.enumerate(&access.shape, &[]);
-    if let Some(order) = &access.coordinate_order {
-        coords = coords.iter().map(|pt| order.eval(pt, &[])).collect();
-    }
+    let order = access
+        .coordinate_order
+        .as_ref()
+        .expect("checked non-identity");
+    let mut coords = Vec::new();
+    rect_iter(&access.shape, &mut |pt| {
+        coords.push(order.eval(pt, &[]));
+    });
     Some(coords)
 }
 

@@ -133,6 +133,17 @@ fn the_structure_matches_the_cpp_per_fixture() {
 /// `indexing_maps = [[0, 2], [1, 2], [0, 1]]`. scratchy runs Granite at 41 tok/s through that
 /// lowering, so where the two disagree the C++'s intermediate form is the one this path cannot use.
 ///
+/// THE SECOND DIVERGENCE, SAME OP: THE FOLDED TILE'S `access_tile_set`. The C++'s fold rewrites
+/// the order and the result type and leaves the set at the PRE-transpose block's extents — but the
+/// runtime enumerates the set in VALUE space (the Python reference's `css.enumerate(access_tile.
+/// shape)`, which this port mirrors), so the C++'s set selects a partial box against the
+/// transposed shape and the load's gathered data no longer fills it. MEASURED: the granite-2b
+/// numeric gate's restickify load — `[64, 512]`'s `d0 < 64 ∧ d1 < 512` over a `[512, 64]` value
+/// intersects to `[0,64) × [0,64)`, 4096 of 32768 points, and the load panics on its own shape.
+/// Our fold rebuilds the set as the full box over the post-transpose shape. This is the same
+/// class as the first divergence — the C++'s intermediate form is the one this runtime cannot
+/// execute — on the same op, so the same `tile` arm records it.
+///
 /// ⛔ NARROW ON PURPOSE. Exactly four fields, on the ops a transposed dot weight touches, and
 /// nothing else: the tile's order and type, the load's type, and the matmul's `indexing_maps`. Any
 /// other difference still fails. A blanket "attention may differ" would have hidden the next real

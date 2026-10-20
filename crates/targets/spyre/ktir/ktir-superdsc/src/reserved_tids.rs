@@ -401,7 +401,7 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
 }
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 7] = [
+pub const RESERVED_REGIONS: [TidRegion; 8] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -458,6 +458,21 @@ pub const RESERVED_REGIONS: [TidRegion; 7] = [
     TidRegion {
         name: "kct_resident",
         base: u32::MAX - 1_000_171,
+        slots: 1_000_000,
+    },
+    // ⭐ THE NEW-BLOCK Kᵀ SCRATCH — the restickify program's per-layer destination. The splice
+    // emits `restickify.py` before every attention, transposing the new-K staging tensor into
+    // the plain-B form the score dot's door demands (a `.T` over an n-major buffer has no
+    // agent that spends it); the scratch that transposed form lands in is neither a graph
+    // tensor (the IR never names it — it exists only between the two spliced programs) nor a
+    // pool plane (it is a per-step transient, not a paged cache), so it is a reserved synthetic
+    // with its own seg3 placement. KEYED ON THE NEW-K SOURCE TID `new_k_id` (the same keying law
+    // as `kct_resident_tid`) so the splice (which mints the bindings) and the layout (which
+    // places them) compute the SAME tid with no layer-index handoff. One million slots keeps it
+    // disjoint from `kct_resident` above and from real source tids (~thousands).
+    TidRegion {
+        name: "ktn_scratch",
+        base: u32::MAX - 2_000_171,
         slots: 1_000_000,
     },
 ];
@@ -539,6 +554,7 @@ pub const EVERY_NAMED_REGION_RESOLVES: () = {
     assert!(reserved_region("rope_p_class").base == ROPE_P_CLASS_BASE);
     assert!(reserved_region("identity_class").base == IDENTITY_CLASS_BASE);
     assert!(reserved_region("kct_resident").slots > 0);
+    assert!(reserved_region("ktn_scratch").slots > 0);
 };
 
 pub const SENTINELS_ARE_INSIDE_THEIR_REGION: () = {
@@ -605,6 +621,15 @@ pub const KCT_RESIDENT_BASE: u32 = reserved_region("kct_resident").base;
 /// Reserved tid for the resident per-layer Kᵀ kernel of the K-cache source tid `k_id`.
 pub fn kct_resident_tid(k_id: u32) -> u32 {
     reserved_region("kct_resident").at(k_id)
+}
+
+/// Base of the RESERVED tid block for the NEW-BLOCK Kᵀ scratch — the restickify program's
+/// per-layer destination (see the `ktn_scratch` region's own row for what it names). One
+/// scratch per attention node per layer, ~40 slots on a real model.
+pub const KTN_SCRATCH_BASE: u32 = reserved_region("ktn_scratch").base;
+/// Reserved tid for the new-block Kᵀ scratch of the new-K staging source tid `new_k_id`.
+pub fn ktn_scratch_tid(new_k_id: u32) -> u32 {
+    reserved_region("ktn_scratch").at(new_k_id)
 }
 
 /// Base of the RESERVED tid block for the HEAD-MAJOR o_proj weight copy (the "kill the 64-op

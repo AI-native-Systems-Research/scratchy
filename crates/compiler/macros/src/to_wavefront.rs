@@ -519,11 +519,21 @@ impl<'a> Builder<'a> {
     /// one layer's K and V caches share a width, and a second call from the SAME class finds its
     /// pair; a wrong pairing would be caught by the SubtileIR shape validator, which refuses a
     /// cache region wider than its source.
-    fn prefix_for(&mut self, layer: u64, kvdim: u32) -> (usize, usize) {
+    ///
+    /// `head_dim` is the same class fact, carried for the K side only: the spyre target's
+    /// attention reads this cache's keys through its Kᵀ plane (`[hd, capacity]` per head), and
+    /// the host's staging of that plane decomposes `kvdim` by exactly this dim. The V cache
+    /// needs no decomposition (its plane is the natural `[cap, kvdim]`), so `PrefixV` carries
+    /// none.
+    fn prefix_for(&mut self, layer: u64, kvdim: u32, head_dim: u32) -> (usize, usize) {
         if let Some(pp) = self.prefix.get(&(layer, kvdim)) {
             return *pp;
         }
-        let pk = self.push_source(self.prefix_len, kvdim, SourceBinding::PrefixK { layer });
+        let pk = self.push_source(
+            self.prefix_len,
+            kvdim,
+            SourceBinding::PrefixK { layer, head_dim },
+        );
         let pv = self.push_source(self.prefix_len, kvdim, SourceBinding::PrefixV { layer });
         self.prefix.insert((layer, kvdim), (pk, pv));
         (pk, pv)
@@ -1059,8 +1069,10 @@ pub fn lower_decode_to_wavefront(
                 // helper (same indices Attention will receive later). The
                 // WIDTH is this layer's own k-rope width — a hybrid model's
                 // classes have different kv widths, so the cache the append
-                // writes must be THIS class's.
-                let (pk, pv) = bx.prefix_for(layer as u64, k_cols);
+                // writes must be THIS class's. The HEAD DIM is the same
+                // class's (the local above), riding the K binding for the
+                // host's Kᵀ-plane staging.
+                let (pk, pv) = bx.prefix_for(layer as u64, k_cols, head_dim.get());
                 let qi = bx.push_op(
                     SubOp::rope_rotate(head_dim),
                     vec![q, InputRef::Ext(cos_q), InputRef::Ext(sin_q)],
@@ -1111,9 +1123,11 @@ pub fn lower_decode_to_wavefront(
                 // The prefix cache at THIS layer's own K width — a hybrid
                 // model's classes have different kv widths, so the cache the
                 // append writes must be THIS class's (the same rule the rope
-                // arm's `prefix_for(layer, k_cols)` follows).
+                // arm's `prefix_for(layer, k_cols)` follows). The head dim is
+                // the base class's here, matching the append's own rope dim
+                // above.
                 let k_cols = bx.out_cols(tile, 0, "kv_append k cols")?;
-                let (pk, pv) = bx.prefix_for(layer as u64, k_cols);
+                let (pk, pv) = bx.prefix_for(layer as u64, k_cols, head_dim.get());
                 let ki = bx.push_op(
                     // `Causal` by default; the consuming attention arm backpatches
                     // `SlidingWindow` for sliding layers.
@@ -1227,7 +1241,9 @@ pub fn lower_decode_to_wavefront(
                 // The prefix cache at THIS layer's class width — a hybrid model's
                 // sliding and global layers have different kv widths, and the cache
                 // this attention reads is the one its own class's RopeAppend wrote.
-                let (pk, pv) = bx.prefix_for(layer, geom.kv_width());
+                // The head dim is the same class's, riding the K binding for the
+                // host's Kᵀ-plane staging.
+                let (pk, pv) = bx.prefix_for(layer, geom.kv_width(), geom.hd().get());
                 if let AttnMask::SlidingWindow { window } = mask {
                     // The k-rope for a sliding layer targets the LOCAL
                     // geometry class.
@@ -1308,8 +1324,10 @@ pub fn lower_decode_to_wavefront(
                 };
                 // The prefix cache at THIS layer's class width — a hybrid
                 // model's sliding and global layers have different kv widths,
-                // and the cache this attention reads is its own class's.
-                let (pk, pv) = bx.prefix_for(layer, geom.kv_width());
+                // and the cache this attention reads is its own class's. The
+                // head dim is the same class's, riding the K binding for the
+                // host's Kᵀ-plane staging.
+                let (pk, pv) = bx.prefix_for(layer, geom.kv_width(), geom.hd().get());
                 let idx = bx.push_op(
                     SubOp::attn_decode(geom, bx.scale, bx.prefix_len, mask),
                     vec![q, InputRef::Ext(pk), InputRef::Ext(pv)],

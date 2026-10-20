@@ -220,8 +220,10 @@ pub fn matmul_b_orientation(
     ))
 }
 
-/// ⛔⛔⛔ A TRANSPOSE-B `B` HAS TO BE **PLACED** BY SOMEBODY, AND ONLY A PRESENTED BUFFER HAS ANYBODY
-/// TO DO IT. This is the seal on the one silent wrong answer this door used to compile.
+/// ⛔⛔⛔ A TRANSPOSE-B `B` HAS TO BE **PLACED** BY AN AGENT THAT OWNS ITS BYTES — AND THIS DOOR
+/// HOLDS EXACTLY ONE AGENT FACT: THE LAYOUT'S STAGING CENSUS, FOR A PARAMETER THE CENSUS NAMES.
+/// A computed value has no agent at all, and a parameter the census does not name has none either.
+/// This is the seal on the one silent wrong answer this door used to compile.
 ///
 /// # THE ARGUMENT, from the crate's own declarations
 ///
@@ -234,11 +236,16 @@ pub fn matmul_b_orientation(
 /// spent OUTSIDE the descriptor by one of exactly two agents:
 ///
 ///  * a PRESENTED weight — the HOST stage, once, at bake time (`stage_2d(&StickLayout::kernel(k, n),
-///    ..)`, `sdsc_abstract.rs:2124`). Free at inference, and the whole regression bar is this case.
+///    ..)`, `sdsc_abstract.rs:2124`). Free at inference. That stage is a producer contract this door
+///    now sees THROUGH THE LAYOUT: since the per-`Program` matmul arm was retired onto this walk,
+///    the projection clientele lowers here, and `BundleLayout::kernel_weights` — the census of tids
+///    the H2D stage re-tiles into the kernel slot's device layout, from the same
+///    `DeviceTileLayout` witness the per-core address reads — is the fact that says which
+///    parameters it covers.
 ///  * a CACHE — the DEVICE, writing it already transposed (`kcache_kt_write_offset`), which is why the
-///    shipped attention pays for a third physical Kᵀ plane (`assemble_restickify_kt_2d`) rather than
-///    relabelling the one it has. **The relayout exists to MAKE a `[k, n]` buffer, never to consume
-///    one.**
+///    shipped attention paid for a third physical Kᵀ plane (`assemble_restockify_kt_2d`, deleted with
+///    that chain) rather than relabelling the one it has. **The relayout exists to MAKE a `[k, n]`
+///    buffer, never to consume one.**
 ///
 /// An IN-REGISTER COMPUTED value is NEITHER. Nothing stages it, no cache write orders it, and nothing
 /// in this crate reads an access tile's `CoordinateOrder` (it occurs inside one comment and nowhere
@@ -258,6 +265,13 @@ pub fn matmul_b_orientation(
 /// as of this change: it folds a `.T` into the maps ONLY when the transposed value is a direct
 /// `tt.descriptor_load`.
 ///
+/// A front end holding a `.T` over a PARAMETER has the sharper remedy: present the plane with the
+/// CONTRACTION AXIS AS ITS ROW AXIS and state the PLAIN form over THAT. A device-written cache gets
+/// it from its write — the host-presented Kᵀ, `kcache_kt_write_offset` — and the proof it is enough
+/// is the V leg of the same kernels: `tl.dot(p, v)` over the n-major `[cap, kv_width]` V cache
+/// contracts WHERE IT LIES because `cap` is its row axis (`vcache_write_offset`: "the VALUE bmm reads
+/// as a `[cap, hd]` KERNEL sticked on `hd`").
+///
 /// ⛔ THAT COSTS AN ARCH FEATURE THIS PATH DOES NOT HAVE ON MPW4, AND THE REASON IS NOW MECHANICAL
 /// RATHER THAN OBSERVED. deeptools maps an opFunc to a DDL template per ISA
 /// (`ddc/ddl/ddl_conversion.h`'s `opFuncToDdlTemplate`): `BATCHMATMUL_FWD` has a
@@ -271,13 +285,80 @@ pub fn matmul_b_orientation(
 /// division, the tile geometry, or which relayout primitive is picked — and swapping primitives
 /// cannot move it. A dxp refusal on a program that computes the right thing is nevertheless the
 /// outcome this guard exists to force: it is a build error, not a wrong number.
+///
+/// # ⛔ WHY A PARAMETER IS ACCEPTED ONLY THROUGH THE LAYOUT'S STAGING CENSUS
+///
+/// This door's parameters are the SPLICE's descriptor buffers, and it reads each WHERE ITS PRODUCER
+/// STAGED IT — no `stage_2d` runs inside this walk. A cache is k-major only if its WRITER wrote it
+/// so. The KTIR states neither fact, so the door cannot tell a k-major-staged weight from an
+/// n-major device-written cache from the program alone — and the honest default would be the
+/// refusal for both. What re-opens acceptance for the weight is the ONE producer fact the door
+/// holds beside the program: `BundleLayout::kernel_weights`, the census of tids the executor's H2D
+/// stage re-tiles into the kernel slot's device layout. The census is built from the same
+/// `DeviceTileLayout` witness the per-core address reads (`RetileDescriptor`'s own doc: "the shim's
+/// re-tile and the emitter's per-core address read the SAME device layout — they cannot diverge"),
+/// so a B the census names is k-major BY STAGING and its `.T` is spent — and a B it does not name
+/// (a KV cache window, an activation) keeps the refusal. The census is not a heuristic: a weight
+/// the stage does not re-tile is absent from it by construction, and a cache never enters it.
+///
+/// The acceptance that used to live here UNKEYED ("a parameter-backed transpose-B is placeable
+/// because the device writes caches already transposed") was true exactly while the hand-written
+/// attention's Kᵀ write existed. That chain is deleted (`ebe9a95b9`); the rope append writes the
+/// cache natural, and the acceptance became a FALSE ACCEPT with two measured failure modes on the
+/// granite-2b plan-only bake, both in the windowed corner law's transposed nest `[k_full, n_full]`:
+///   * a SUB-STICK transposed `n` (`n_full = 1`, attn's new-K score dot) pads each row to a whole
+///     stick, so corner row 64 lands at offset 4096 against a 512-element logical footprint —
+///     `addr: 4096 outside footprint 512`, a debug_assert PANIC;
+///   * a STICK-WIDE transposed `n` (`n_full = 256`, attn's resident-prefix score dot) keeps the
+///     arithmetic inside the footprint, PASSES the assert, and emits a descriptor addressing the
+///     k-major law over n-major bytes — silently misaddressed on card.
+///
+/// A guard that only converted the panic would keep the second failure; this one refuses both by
+/// provenance, before the corner law runs.
 fn transposed_b_is_placeable(
     name: &str,
     b: BOrient,
     b_is_parameter_backed: bool,
+    b_tid: u32,
+    layout: Option<&BundleLayout>,
 ) -> Result<(), Error> {
-    if b == BOrient::PlainB || b_is_parameter_backed {
+    if b == BOrient::PlainB {
         return Ok(());
+    }
+    if b_is_parameter_backed {
+        // ⭐ THE ONE AGENT THIS DOOR CAN NAME FOR A PARAMETER: the layout's own staging census.
+        // `BundleLayout::kernel_weights` maps exactly the tids the executor's H2D stage re-tiles
+        // into the kernel slot's device layout — built from the SAME `DeviceTileLayout` witness
+        // the per-core address reads, so the stage's bytes and this emission's addressing cannot
+        // diverge. A B the census names is k-major BY STAGING: the `.T` the maps state was spent
+        // by the stage, and the descriptor reads the bytes where they lie.
+        if layout.is_some_and(|l| l.kernel_weights.contains_key(&b_tid)) {
+            return Ok(());
+        }
+        return err(format!(
+            "{name}: this `linalg.matmul` states the TRANSPOSE-B form \
+             (`[[d0,d2],[d1,d2],[d0,d1]]`, B's map ending in the reduction dim, so B's region is \
+             `[n, k]`) over a B that is a PARAMETER of this kernel — a load of one of the caller's \
+             descriptor buffers — and the layout's staging census (`BundleLayout::kernel_weights`, \
+             the tids the H2D stage re-tiles into the kernel slot's device layout) does NOT name \
+             t{b_tid}. The maps LABEL which axis is k; they do not PLACE it, and the kernel slot \
+             reads `[k, n]` (`StickLayout::kernel(k_in, n_out)`) whatever they say. Spending that \
+             transposition is the job of an agent that owns the bytes: a censused weight's is \
+             spent by the H2D stage, and a cache is k-major only if its WRITER wrote it so — a \
+             `.T` over a buffer written n-major, the way the K caches a paged attention kernel \
+             declares `[cap, kv_width]` row-major, has no agent at all. What this guard replaces \
+             is worse than a refusal: the windowed corner law's transposed nest pads a sub-stick \
+             transposed n to a whole stick, so at `n = 1` it PANICS on the footprint assert and \
+             at a stick-wide `n` it PASSES and emits a descriptor addressing the k-major law \
+             over n-major bytes — a silent misaddress on card that no extent guard catches, \
+             because the transposed arithmetic stays inside the footprint. Present B with the \
+             CONTRACTION AXIS AS ITS ROW AXIS and state the PLAIN `[k, n]` form over that plane: \
+             a device-written cache gets it from its WRITE (the recorded host-presented Kᵀ, \
+             `kcache_kt_write_offset`), the way this kernel's own V leg contracts in place \
+             (`tl.dot(p, v)` over the n-major V cache — `cap` is its row axis); anything else \
+             is a real relayout beside the matmul (a `linalg.transpose` → `Program::Transpose`) \
+             over the plain form. Refused rather than addressed by the wrong law."
+        ));
     }
     err(format!(
         "{name}: this `linalg.matmul` states the TRANSPOSE-B form \
@@ -1205,8 +1286,9 @@ struct Bcast {
 /// stated in its own refusal: the SEEDED whole-tensor builder cannot say "broadcast", and the
 /// `EwOperand` builders can.
 ///
-/// This recogniser therefore returns, for each broadcast RESULT, the source value a consumer should
-/// read and the axis — and the `consumed` set of every value the chain minted, which no descriptor
+/// This recogniser therefore returns, for each value the chain mints (the broadcast's result AND
+/// its interior — see the keying law at the bottom), the source value a consumer should read and
+/// the axis — and the `consumed` set of every value the chain minted, which no descriptor
 /// lowers. It is the same rank walk [`program_rmsnorm_chains`] already does for its `rsqrt` and its
 /// gain (through the same three op kinds, to depth 3); this generalises it to any consumer.
 ///
@@ -1218,7 +1300,11 @@ struct Bcast {
 /// data movement the pointwise operand modes cannot express. Those are named, not treated as
 /// broadcasts. The `expand_shape`'s own `TargetShape` and the `linalg.broadcast`'s `Dimensions` state
 /// the axis INDEPENDENTLY, so they are cross-checked: a program where they disagree is not a
-/// broadcast this door understands.
+/// broadcast this door understands. And a source that is ALREADY rank-2 needs no expand at all —
+/// its own type states the vector-ness when it is degenerate on the sprayed axis (the arm the
+/// walk-back's `type_degenerate` check reads, for the pipeline-emitted broadcasts over `[m, 1]` /
+/// `[1, n]` operands); a rank-1 source keeps needing the expand, because `[n]` alone does not say
+/// which vector it is.
 fn program_broadcast_chains(
     f: &IRFunction<'static>,
 ) -> Result<
@@ -1332,38 +1418,63 @@ fn program_broadcast_chains(
             };
             cursor = next;
         }
-        if !saw_degenerate_expand {
-            // ⭐ THE SOURCE'S OWN LOAD IS A SECOND PROOF OF THE SAME FACT. An fp8 weight-scale chain
-            // does not spell the expand: the kernel loads the scale as a `[1, n]` WINDOW of its own
-            // parameter (`matmul_fp8.py`'s `ws_desc.load([0, 0])` over a `[1, n]` descriptor),
-            // collapses the degenerate dim away, and broadcasts the 1-D result down the rows. The
-            // load's OWN shape states the vector-ness the expand would have — extent 1 on the
-            // sprayed axis — because the window it names is the whole parameter. A source that is
-            // neither an expand-proven vector nor a load of extent 1 on the spray axis keeps the
-            // refusal below: its extent is unproven, and addressing it as a broadcast would read
-            // past its end.
-            let source_proves_vector = def_of(cursor).is_some_and(|d| {
-                d.op_type == OpKind::KtdpLoad
-                    && super::lower_ktir_to_superdsc::shape_2d(d).is_some_and(|(r, c)| match axis {
-                        BcastAxis::Mb => r == 1,
-                        BcastAxis::Col => c == 1,
-                    })
+        // ⭐⭐⭐ A RANK-2 SOURCE'S OWN TYPE IS THE SAME PROOF. A broadcast this pipeline emits
+        // over an ALREADY-rank-2 degenerate operand reaches this walk in two spellings, and the
+        // TYPE states the vector-ness for both:
+        // * `one_k_dot_to_mul`'s outer-product spelling widens `A [m, 1]` to `[m, n]` — a
+        //   COMPUTED value, collapse → `linalg.broadcast` with NO `tensor.expand_shape` anywhere
+        //   in the chain, because the source was never rank-1 and no expand ever existed to
+        //   insert the degenerate dim.
+        // * an fp8 weight-scale chain does not spell the expand either: the kernel loads the
+        //   scale as a `[1, n]` WINDOW of its own parameter (`matmul_fp8.py`'s
+        //   `ws_desc.load([0, 0])` over a `[1, n]` descriptor), collapses the degenerate dim
+        //   away, and broadcasts the result down the rows — the load's OWN result type states
+        //   the extent-1 the expand would have, because the window it names is the whole
+        //   parameter.
+        // For a rank-2 source the TYPE states the vector-ness itself: `[rows, 1]` can only be a
+        // per-row scalar and `[1, cols]` only a row vector (a `[1, 1]` is both, and the
+        // emission's operand-mode law refuses an axis its consumer cannot address). A RANK-1
+        // source keeps needing the expand: `[n]` alone does not say which vector it is.
+        let type_degenerate = def_of(cursor)
+            .and_then(|d| d.result_type)
+            .is_some_and(|t| match t {
+                ktir_core::irtype::IrType::Tensor { dims, .. } if dims.len() == 2 => match axis {
+                    BcastAxis::Col => dims[1] == 1,
+                    BcastAxis::Mb => dims[0] == 1,
+                },
+                _ => false,
             });
-            if !source_proves_vector {
-                return err(format!(
-                    "{}: a `linalg.broadcast` sprays along {axis:?} but its source is not reached \
-                     through a `tensor.expand_shape` that inserts a DEGENERATE dim, nor is it a load \
-                     whose own window has extent 1 on that axis. Either is the thing that says the \
-                     source IS a row or column vector, so without one the operand's extent is \
-                     unproven and addressing it as a broadcast would read past its end.",
-                    f.name
-                ));
-            }
+        if !saw_degenerate_expand && !type_degenerate {
+            return err(format!(
+                "{}: a `linalg.broadcast` sprays along {axis:?} but its source is neither \
+                 reached through a `tensor.expand_shape` that inserts a DEGENERATE dim nor \
+                 itself a rank-2 tensor degenerate on that axis — a computed `[m, 1]`, or a \
+                 load whose own window has extent 1 there. One of those two is the only thing \
+                 in the program that says the source IS a row or column vector, so without \
+                 either the operand's extent is unproven and addressing it as a broadcast \
+                 would read past its end.",
+                f.name
+            ));
         }
+        // ⭐⭐⭐⭐⭐ EVERY VALUE THE CHAIN MINTS IS THE SOURCE, ADDRESSED AS THIS BROADCAST — not only
+        // the `linalg.broadcast`'s own result. A second consumer of the same `m[:, None]` whose other
+        // operand already carries the degenerate shape needs NO spray op at all — Triton folds that
+        // broadcast into the binary op itself — so it reads the chain's INTERIOR (the
+        // `expand_shape`'s result, CSE'd with the first consumer's) directly. MEASURED on attn.py's
+        // decode arm: `qk_c - gmax[:, None]` is a `[1, swept]` tile and takes the broadcast, while
+        // `qk_d - gmax[:, None]` is a `[1, 1]` tile and reads the expand's result with no
+        // `linalg.broadcast` anywhere in its own chain. The expand/collapse pair moves no data, so
+        // every value in the chain IS the source viewed with the axis's degeneracy, and each is keyed
+        // with the same `Bcast`. The discipline is unchanged: the consumer's operand mode is still
+        // cross-examined against the region it resolves to — the walk's degenerate check below, and
+        // the emission's operand-mode law (`elementwise_broadcast`: a `Col` operand must carry the
+        // output's row count) — so a value keyed by an axis its consumer cannot address is refused
+        // by name, never mis-addressed.
+        let b = Bcast { src: cursor, axis };
         for v in chain {
             consumed.insert(v);
+            map.insert(v, b);
         }
-        map.insert(res, Bcast { src: cursor, axis });
     }
     Ok((map, consumed))
 }
@@ -2665,9 +2776,11 @@ pub fn lower_function(
         // its `lower_ktir_to_superdsc::transpose` door are left exactly as they were — they serve
         // `Program::Transpose`, a producer stating a `linalg.transpose` in its own right.
         //
-        // ⭐ AND THE OTHER HALF IS NO LONGER A GAP — IT IS THE REFUSAL DIRECTLY BELOW. A transpose-B B
-        // whose region is a COMPUTED value has nobody to place its bytes, so this door will not lower
-        // it. See [`transposed_b_is_placeable`], which states the whole argument.
+        // ⭐ AND THE OTHER HALF IS THE REFUSAL DIRECTLY BELOW, KEYED ON THE ONE PRODUCER FACT THIS
+        // DOOR HOLDS. A transpose-B B that is a COMPUTED value has no agent here at all; one that
+        // is a PARAMETER has exactly one — the layout's staging census — and a B the census does
+        // not name (a cache window) has none. See [`transposed_b_is_placeable`] for the whole
+        // argument.
         if let Some(b) = b_orient {
             // ⛔ FAIL CLOSED ON THE INDEX ITSELF. `n_in` is 2 for a matmul so operand 1 always
             // exists, and defaulting a MISSING entry to "placeable" would make a malformed program
@@ -2682,7 +2795,8 @@ pub fn lower_function(
                     from_parameter.len()
                 ));
             };
-            transposed_b_is_placeable(f.name, b, b_from_parameter)?;
+            let b_tid = per_op[1].tid;
+            transposed_b_is_placeable(f.name, b, b_from_parameter, b_tid, layout)?;
         }
 
         // THIS OP'S OUTPUT: the parameter a `ktdp.store` writes from this op's result.
@@ -2861,7 +2975,29 @@ pub fn lower_function(
             // whose every input is a minted band intermediate states no windowed input; its mint
             // stays at the tile and the extents law refuses the sweep mismatch by name — refused
             // at the op that could have extended it, not silently mis-sized.)
-            let dims = [band_rows_of(&per_op, dims[0]), dims[1]];
+            //
+            // ⛔⛔⛔ A MATMUL'S BAND IS ITS **ROW AXIS (A)**, NEVER ITS WEIGHT AXIS. The search
+            // above takes the first windowed input's `r_len`, and a matmul's B operand is
+            // routinely windowed in exactly the sense that law reads: the decode attention's
+            // value leg contracts a `[1, SWEPT]` weight row against the V cache's `[SWEPT, HD]`
+            // prefix window — a PROPER sub-window of the `[CAP, HD]` view at every interior
+            // ladder rung — so the mint took B's `r_len` (SWEPT) as the band and sized the
+            // output `[SWEPT, HD]` against the emitter's own `m = 1` (MEASURED: rungs 64/128
+            // refused `MatmulTile: A rows 1 != out rows (M) 64/128`; the ceiling rung swept the
+            // whole view — `r_cover == (0, v_rows)` — and passed only because no window was
+            // there to misread). A matmul's output rows are the contraction's M, which is A's
+            // rows, so the band may only be read off A — the same `per_op[0]` the `dev_dims`
+            // `k` below and the emitter's `a.r_len` read. A row-tiled matmul (A a flush band of
+            // a taller view) still takes its band from A; a weight-side window never was one.
+            let dims = match program {
+                Lowering::Node(Program::Matmul) => [
+                    per_op
+                        .first()
+                        .map_or(dims[0], |a| band_rows_of(std::slice::from_ref(a), dims[0])),
+                    dims[1],
+                ],
+                _ => [band_rows_of(&per_op, dims[0]), dims[1]],
+            };
             let Some(layout) = layout else {
                 return err(format!(
                     "{}: `{:?}`'s result is an intermediate, which needs a `BundleLayout` to hold \
@@ -3656,15 +3792,65 @@ mod matmul_orientation_tests {
         );
     }
 
-    /// ⭐ THE ACCEPTING CASE FOR [`transposed_b_is_placeable`], AND IT IS THE WHOLE REGRESSION BAR:
-    /// a transpose-B weight that IS parameter-backed. `rmsnorm_granite`, both `swiglu_mlp_*` and
-    /// every projection in both decoders are this case, measured byte-identical, and they are correct
-    /// because the HOST stage places the bytes (`stage_2d(&StickLayout::kernel(k, n), ..)`). If this
-    /// case ever refused, the guard below would be indistinguishable from "refuse every `.T`".
+    /// ⛔ THE PARAMETER-BACKED REFUSAL, ONE VARIABLE FROM THE CASE BELOW — and the case that used to
+    /// ACCEPT here. The old acceptance's theory was "the device writes caches already transposed",
+    /// which was true exactly while the hand-written attention's Kᵀ write existed; that chain is
+    /// deleted (`ebe9a95b9`), the rope append writes the cache natural, and the acceptance became a
+    /// FALSE ACCEPT with two measured failure modes on the granite-2b plan-only bake: the windowed
+    /// corner law's transposed nest PANICS on the footprint assert at a sub-stick transposed `n`
+    /// (attn's new-K dot, `n_full = 1`) and silently MISADDRESSES on card at a stick-wide one (the
+    /// resident-prefix dot, `n_full = 256` — the assert passes, the law is wrong). Since the
+    /// per-`Program` matmul arm was retired onto this walk, the projection clientele lowers HERE
+    /// too — keyed on the layout's staging census, which this probe holds none of: a parameter no
+    /// census names is the cache case, and it refuses.
     #[test]
-    fn a_transpose_b_over_a_presented_weight_is_placeable() {
-        transposed_b_is_placeable("probe", BOrient::TransposeB, true)
-            .expect("a presented weight's transposition is spent by the host stage");
+    fn a_transpose_b_over_a_parameter_of_this_door_is_refused_by_name() {
+        let e = transposed_b_is_placeable("probe", BOrient::TransposeB, true, 7, None)
+            .expect_err("no census names this parameter, so no agent places its bytes");
+        assert!(
+            e.message.contains("PARAMETER"),
+            "names WHAT is wrong with the operand, not merely that it was rejected: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("kernel_weights"),
+            "and names the census whose absence is the refusal, so the fix is findable: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("misaddress"),
+            "and says what the false accept it replaces would have emitted: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("ROW AXIS"),
+            "and names the form the producer must present instead, so the refusal is actionable: {}",
+            e.message
+        );
+    }
+
+    /// ⭐ THE CENSUSED CONTROL, one variable from the case above: the SAME parameter-backed
+    /// transpose-B, with a layout whose staging census names the tid. `BundleLayout::kernel_weights`
+    /// is the census of tids the executor's H2D stage re-tiles into the kernel slot's device layout,
+    /// built from the same `DeviceTileLayout` witness the per-core address reads — so a B it names
+    /// is k-major BY STAGING and the `.T` the maps state is spent by that stage. This is every
+    /// projection since the per-`Program` matmul arm was retired onto this walk; refusing it would
+    /// stop the whole model from lowering for the wrong reason.
+    #[test]
+    fn a_transpose_b_over_a_censused_weight_parameter_is_placeable() {
+        let mut layout = BundleLayout::default();
+        layout.kernel_weights.insert(
+            7,
+            crate::placement::RetileDescriptor {
+                device_size: vec![2, 128, 64],
+                stride_map: vec![64, 256, 1],
+                stick_size: 64,
+                word_length: 2,
+            },
+        );
+        transposed_b_is_placeable("probe", BOrient::TransposeB, true, 7, Some(&layout)).expect(
+            "the H2D stage re-tiles t7 into the kernel slot's device layout; the `.T` is spent",
+        );
     }
 
     /// ⛔ THE REFUSAL, **ONE VARIABLE** FROM THE CASE ABOVE — the provenance of B and nothing else.
@@ -3674,7 +3860,7 @@ mod matmul_orientation_tests {
     /// this test fails while every other test in the crate still passes — which is the point.
     #[test]
     fn a_transpose_b_over_a_computed_value_is_refused_by_name() {
-        let e = transposed_b_is_placeable("probe", BOrient::TransposeB, false)
+        let e = transposed_b_is_placeable("probe", BOrient::TransposeB, false, 7, None)
             .expect_err("an in-register value has no host stage and no cache write");
         assert!(
             e.message.contains("COMPUTED value"),
@@ -3701,7 +3887,7 @@ mod matmul_orientation_tests {
     /// decoders would stop lowering for the wrong reason.
     #[test]
     fn a_plain_b_over_a_computed_value_is_contracted_where_it_lies() {
-        transposed_b_is_placeable("probe", BOrient::PlainB, false)
+        transposed_b_is_placeable("probe", BOrient::PlainB, false, 7, None)
             .expect("`p @ v`: a computed `[k, n]` tile is already in the kernel slot's own order");
     }
 

@@ -1144,6 +1144,264 @@ mod decoder_from_the_fixture {
 //  offset 0 (never flush — a neighbour above absorbs the over-read), and attention's flush-at-end
 //  OUTPUT writes clean — it is the gather's fetch path alone that pays this.
 // ══════════════════════════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  THE RESTICKIFY — the splice's load→`.T`→store program, observed at the door.
+//
+//  `restickify.py` is the tree's ONLY transpose program whose transposed value comes straight
+//  from a descriptor load (every other `.T` in `crates/targets/spyre/kernels/` feeds a `tl.dot`,
+//  which `dot_to_linalg` rewires into the transpose-B maps before the fold can see it), so it is
+//  the one program that exercises `fold_trans_into_access_tile_order`'s surviving firing surface —
+//  and the one whose folded tile the door's census has to read in VIEW space.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod restickify_from_the_kernel {
+    use super::*;
+
+    /// `restickify.py` at the granite-3.1-2b decode rung's extents: ROWS is the stick cover
+    /// `pad_of_mq(1)` = 64 and W is the device width of an 8-head × 64 head-dim kv plane = 512
+    /// (`lower_attn`'s own facts, the same numbers the splice's `mint_kt_restick` states).
+    fn kt_restick_64x512() -> ktir_superdsc::ktir_node::KtirNode {
+        use triton_frontend::codegen::{ArgSpec, KernelSpec};
+        use triton_frontend::semantic::Val;
+        use triton_frontend::target::Target;
+        let mut signature = std::collections::HashMap::new();
+        for p in ["desc_k", "desc_kt"] {
+            signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("signature"));
+        }
+        let mut constexprs = std::collections::HashMap::new();
+        for (k, v) in [("ROWS", Val::Int(64)), ("W", Val::Int(512))] {
+            signature.insert(
+                k.to_string(),
+                ArgSpec::parse("constexpr").expect("constexpr"),
+            );
+            constexprs.insert(k.to_string(), v);
+        }
+        let file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate sits one level under crates/triton")
+            .parent()
+            .expect("crates/triton sits one level under the worktree root")
+            .join("targets/spyre/kernels/restickify.py");
+        let kspec = KernelSpec {
+            kernel: "kt_restick".to_string(),
+            signature,
+            constexprs,
+            file: file.to_string_lossy().to_string(),
+        };
+        let src = std::fs::read_to_string(&file).expect("read restickify.py");
+        let mut tt =
+            triton_frontend::codegen::compile(&src, &kspec, Target::spyre()).expect("codegen");
+        triton_frontend::opt::make_ttir(&mut tt).expect("make_ttir");
+        let mut m = triton_ktir::from_ttir::convert(&tt).expect("from_ttir");
+        let grid = vec![1];
+        triton_ktir::make_ktir(&mut m, &grid).expect("make_ktir");
+        triton_ktir::passes::to_ktir::run(&mut m, &grid).expect("to_ktir");
+        node_for(&m, Program::Transpose).expect("node_for")
+    }
+
+    /// ⭐ THE CENSUS READS THE FOLDED TILE'S WINDOW IN VIEW SPACE. The ladder folds the `.T`
+    /// into the load's tile (`Shape=[W, ROWS]`, order `(d1, d0)`) over the `[ROWS, W]` view, and
+    /// `regions()` used to read that value shape as the view-space window — a `(0, 512) × (0, 64)`
+    /// window over `[64, 512]` that made the two sides of the relayout disagree about their basis
+    /// ("one side's access tiles tile its view while the other's take a single window"). The
+    /// window is now stated un-permuted, so BOTH sides state one whole-view tile — the folded
+    /// basis the restickify's own doc contracts ("ONE TILE PER SIDE — the tile IS the view").
+    #[test]
+    fn the_folded_tile_windows_its_view_not_its_value() {
+        let node = kt_restick_64x512();
+        let r = emit::lower_ktir_to_superdsc::regions(&node).expect("regions");
+        assert_eq!(r.len(), 2, "desc_k and desc_kt, or the premise is wrong");
+        // The input: the `[ROWS, W]` staging view, windowed WHOLE — the un-permuted reading.
+        assert_eq!(
+            (r[0].v_rows, r[0].v_cols, r[0].is_out),
+            (64, 512, false),
+            "the staging side is the `[ROWS, W]` view, read not written"
+        );
+        assert_eq!(
+            (r[0].r_start, r[0].r_len, r[0].c_start, r[0].c_len),
+            (0, 64, 0, 512),
+            "the folded tile's window is its view entire, not its value's shape `[512, 64]`"
+        );
+        assert_eq!(
+            (r[0].r_cover, r[0].c_cover),
+            ((0, 64), (0, 512)),
+            "the cover spans the view, the basis the fold contract states"
+        );
+        // The output: the `[W, ROWS]` scratch, stored, windowed whole.
+        assert_eq!(
+            (r[1].v_rows, r[1].v_cols, r[1].is_out),
+            (512, 64, true),
+            "the scratch side is the transposed `[W, ROWS]` view, written"
+        );
+        assert_eq!(
+            (r[1].r_start, r[1].r_len, r[1].c_start, r[1].c_len),
+            (0, 512, 0, 64),
+            "one whole-view store tile"
+        );
+    }
+
+    /// ⭐ AND THE DOOR LOWERS IT — one relayout, the fold basis's own shape. Before the census
+    /// read the order, this was the bake's refusal ("the input t… and the output t… are on
+    /// different bases"); it is now the single restickify descriptor the kernel contracts.
+    #[test]
+    fn the_door_lowers_the_folded_transpose_to_one_relayout() {
+        let node = kt_restick_64x512();
+        let l = layout::for_node(&node).expect("the layout must serve a restickify");
+        let ops = emit_node_with(&node, Some(&l)).expect("the door lowers the folded form");
+        assert_eq!(
+            ops.len(),
+            1,
+            "one relayout descriptor over the whole tensor, not a decomposition"
+        );
+    }
+}
+
+#[cfg(test)]
+mod one_k_window_from_the_fixture {
+    use super::*;
+
+    /// `test-fixtures/one_k_window.py` at the granite-3.1-2b decode rung's extents: HD=64,
+    /// V_COLS = NKVH·HD = 512 (8 kv heads), the V window at column HD — kvh=1, the first GQA head
+    /// whose window leaves column 0 — and SWEPT=64, one stick of prefix. `one_k_dot_to_mul`
+    /// rewrites the K=1 value-leg dot into a Col-broadcast times the windowed dense vd; this
+    /// fixture holds that whole chain.
+    fn one_k_window() -> ktir_superdsc::ktir_node::KtirNode {
+        use triton_frontend::codegen::{ArgSpec, KernelSpec};
+        use triton_frontend::semantic::Val;
+        use triton_frontend::target::Target;
+        let mut signature = std::collections::HashMap::new();
+        for p in ["desc_q", "desc_k", "desc_w", "desc_vc", "desc_v", "desc_o"] {
+            signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("signature"));
+        }
+        let mut constexprs = std::collections::HashMap::new();
+        for (k, v) in [
+            ("HD", Val::Int(64)),
+            ("V_COLS", Val::Int(512)),
+            ("SWEPT", Val::Int(64)),
+        ] {
+            signature.insert(
+                k.to_string(),
+                ArgSpec::parse("constexpr").expect("constexpr"),
+            );
+            constexprs.insert(k.to_string(), v);
+        }
+        let file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate sits one level under crates/triton")
+            .join("test-fixtures/one_k_window.py");
+        let kspec = KernelSpec {
+            kernel: "one_k_window".to_string(),
+            signature,
+            constexprs,
+            file: file.to_string_lossy().to_string(),
+        };
+        let src = std::fs::read_to_string(&file).expect("read one_k_window.py");
+        let mut tt =
+            triton_frontend::codegen::compile(&src, &kspec, Target::spyre()).expect("codegen");
+        triton_frontend::opt::make_ttir(&mut tt).expect("make_ttir");
+        let mut m = triton_ktir::from_ttir::convert(&tt).expect("from_ttir");
+        let grid = vec![1];
+        triton_ktir::make_ktir(&mut m, &grid).expect("make_ktir");
+        triton_ktir::passes::to_ktir::run(&mut m, &grid).expect("to_ktir");
+        // The tag documents the subject op (the value-leg multiply); the whole-function walk
+        // derives every op's own program, which is the path this test exercises directly.
+        node_for(
+            &m,
+            Program::Elementwise(ktir_superdsc::ktir_node::Elementwise::Mul),
+        )
+        .expect("node_for")
+    }
+
+    /// ⭐ THE ONE-K MULF LOWERS AT ITS DENSE OPERAND'S WINDOW. The walk recognises the ladder's
+    /// broadcast chain (else the mulf would fall to the dense arm, whose extents law refuses the
+    /// `[1, 1]` operand by name), and the broadcast arm places vd at kvh=1's column window —
+    /// element 64 of the `[1, 512]` V buffer — where the old blanket corner guard refused the op
+    /// outright ("give the broadcast/per-row chains whole-tensor regions"). The broadcast source
+    /// stays at the base, and the minted result writes at corner 0, so only the dense operand
+    /// carries the window.
+    #[test]
+    fn the_walk_lowers_the_one_k_mulf_at_its_dense_operands_window() {
+        let node = one_k_window();
+        let l = layout::for_node(&node).expect("the layout serves the fixture");
+        let mut sym = 0i64;
+        let ops = emit::whole_function::lower_function(&node, Some(&l), &mut sym, None)
+            .expect("the one-K mulf: a broadcast scalar times a windowed dense operand");
+        let mulfs: Vec<_> = ops
+            .iter()
+            .filter(|op| op.op_name.starts_with("multiply_"))
+            .collect();
+        assert_eq!(mulfs.len(), 1, "one value-leg multiply, got {:?}", {
+            let names: Vec<_> = ops.iter().map(|o| o.op_name.clone()).collect();
+            names
+        });
+        let mulf = mulfs[0];
+        let in_off = |want: u32| {
+            mulf.arg_bindings
+                .iter()
+                .find(|b| b.is_input && b.offset_elems == want)
+                .map(|b| b.buffer.clone())
+        };
+        assert!(
+            in_off(64).is_some(),
+            "the dense vd operand is addressed at kvh=1's window (element 64), not the base: {:?}",
+            mulf.arg_bindings
+                .iter()
+                .map(|b| (b.buffer.clone(), b.offset_elems))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            in_off(0).is_some(),
+            "the broadcast source stays at its own extent's base"
+        );
+        assert!(
+            mulf.arg_bindings
+                .iter()
+                .any(|b| !b.is_input && b.offset_elems == 0),
+            "the mulf's minted result writes at corner 0 — the consumer addf takes the store window"
+        );
+        // AND THE CLASS LAW over the parameter regions: every windowed operand every op binds —
+        // vd, acc, and the store target at column 64 — is addressed at its own corner.
+        let r = emit::lower_ktir_to_superdsc::regions(&node).expect("regions");
+        emit::lower_ktir_to_superdsc::column_windows_are_honoured("one_k_window", &r, &ops)
+            .expect("every windowed operand is addressed at its own corner");
+    }
+
+    /// ⭐ AND THE EPILOGUE ADDF WRITES THE STORE WINDOW — the dense arm's per-operand corners on
+    /// the same program: both inputs are minted corner-0 intermediates (the prefix value leg's
+    /// `[1, HD]` and the mulf's), and the store writes at column HD. This is the decode arm's own
+    /// terminal (`o_desc.store([0, h*HD], o + o_d)`) and the card-proven rotate-half class, and it
+    /// pins that the miniature states that shape and not some simpler one.
+    #[test]
+    fn the_epilogue_addf_reads_its_intermediates_and_writes_its_window() {
+        let node = one_k_window();
+        let l = layout::for_node(&node).expect("the layout serves the fixture");
+        let mut sym = 0i64;
+        let ops = emit::whole_function::lower_function(&node, Some(&l), &mut sym, None)
+            .expect("the epilogue lowers beside the mulf");
+        let addf = ops
+            .iter()
+            .find(|op| op.op_name.starts_with("add_"))
+            .expect("one epilogue add");
+        assert!(
+            addf.arg_bindings
+                .iter()
+                .filter(|b| b.is_input)
+                .all(|b| b.offset_elems == 0),
+            "both addend intermediates are read at corner 0: {:?}",
+            addf.arg_bindings
+                .iter()
+                .map(|b| (b.buffer.clone(), b.offset_elems))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            addf.arg_bindings
+                .iter()
+                .any(|b| !b.is_input && b.offset_elems == 64),
+            "the store writes its window"
+        );
+    }
+}
+
 #[cfg(test)]
 mod paged_score_from_the_fixture {
     use super::*;

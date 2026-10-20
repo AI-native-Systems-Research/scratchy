@@ -34,12 +34,12 @@
 //! branch, unchanged, reached from facts the KTIR states — and the fp8 arm below calls it.
 
 use super::{
-    EmittedOp, In, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, bmm_site,
-    check_pointwise_cols, emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec_df,
+    EmittedOp, In, assemble_pointwise_broadcast_off, bmm_site, check_pointwise_cols,
+    emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec_df,
     pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
-    assemble_attn, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
+    assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_pointwise_broadcast_off_from_tile, assemble_pointwise_seeded_from_tile,
@@ -49,12 +49,8 @@ use crate::ir::island::tile_op::{TileOp, TileOpKind};
 use crate::ktir_node::{Elementwise, KtirNode};
 use crate::place::{PlaceId, SynthRole};
 use crate::placement::{BundleLayout, syn};
-use crate::reserved_tids::{
-    ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_ZERO_TID, LAST_HIDDEN_TID, kct_resident_tid,
-    scalarmul_scale_tid,
-};
+use crate::reserved_tids::{LAST_HIDDEN_TID, scalarmul_scale_tid};
 use crate::sdsc_abstract::{KernelTag, Stk};
-use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{DataFormat, Df, Fp16, ItDim, SdscFoldSet};
 use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES};
 use ktir_core::affine::AffineExpr;
@@ -585,7 +581,9 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
         })?;
         // The FIRST access tile over this view — the window the program takes. A program that tiles
         // one buffer many ways (attention's per-head reads) is not addressed through this field;
-        // those bodies read their geometry from the node kind's own facts instead.
+        // those bodies read their geometry from the node kind's own facts instead. The extents are
+        // the tile's VIEW-space window ([`tile_window_2d`], which un-permutes a folded `.T`'s
+        // value shape), not the value's shape.
         let (r_start, c_start, r_len, c_len) = k
             .func
             .operations
@@ -595,7 +593,7 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
                     && o.operands.first() == view.result.as_ref()
             })
             .and_then(|t| {
-                let (tr, tc) = shape_2d(t)?;
+                let (tr, tc) = tile_window_2d(t)?;
                 let rs = t.operands.get(1).and_then(|s| consts.get(s).copied())?;
                 let cs = t.operands.get(2).and_then(|s| consts.get(s).copied())?;
                 Some((rs as u32, cs as u32, tr, tc))
@@ -677,7 +675,7 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
                     && o.operands.first().is_some_and(|v| param_views.contains(v))
             })
             .filter_map(|t| {
-                let (tr, _) = shape_2d(t)?;
+                let (tr, _) = tile_window_2d(t)?;
                 let rs = t.operands.get(1).and_then(|s| consts.get(s).copied())? as u32;
                 Some((rs, rs + tr))
             })
@@ -696,7 +694,7 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
                     && o.operands.first().is_some_and(|v| param_views.contains(v))
             })
             .filter_map(|t| {
-                let (_, tc) = shape_2d(t)?;
+                let (_, tc) = tile_window_2d(t)?;
                 let cs = t.operands.get(2).and_then(|s| consts.get(s).copied())? as u32;
                 Some((cs, cs + tc))
             })
@@ -912,6 +910,63 @@ pub(crate) fn shape_2d(op: &Operation<'_>) -> Option<(u32, u32)> {
         [a] => (1, *a as u32),
         [.., a, b] => (*a as u32, *b as u32),
     })
+}
+
+/// A `ktdp.construct_access_tile`'s `[rows, cols]` window over its VIEW — [`shape_2d`]'s reading
+/// un-permuted by the tile's `CoordinateOrder` when that order is transposing.
+///
+/// ⛔⛔⛔ A TRANSPOSING TILE'S `Shape` IS ITS **VALUE**'S SHAPE, NOT ITS WINDOW'S. The ladder's
+/// `fold_trans_into_access_tile_order` (`convert_ttir_to_ktdp.rs`) folds a `.T` whose operand
+/// comes straight from a `ktdp.load` into that load's tile: it rewrites the tile's type to the
+/// POST-TRANSPOSE shape and sets `CoordinateOrder` to the permutation, leaving the view and the
+/// corner operands alone. MEASURED, `restickify.py` (the tree's only load→`.T`→store program —
+/// every other `.T` in `crates/targets/spyre/kernels/` feeds a `tl.dot`, which `dot_to_linalg`
+/// rewires into the transpose-B maps before the fold can see it): the `[64, 512]` view's tile
+/// states `Shape=[512, 64]` with order `(d1, d0)`, and reading that shape as view extents made
+/// `regions()` report a `(0, 512) × (0, 64)` window over the `[64, 512]` view — "different
+/// bases" at the transpose door, refusing a program that states one whole-view tile per side.
+///
+/// [`Region`]'s fields are VIEW facts (its own doc: "the window the program takes" over the
+/// view), so the census here states the window in view space: the value shape UN-PERMUTED by
+/// the order. Identity orders (and an absent order, which is what an as-built tile carries)
+/// leave the reading alone — value dims are view dims there, so every program but a folded one
+/// is inert to this. This is the census's half of the prescription the ladder's own gap-4 audit
+/// states ("their side needs the attribute or a refusal naming it"): the transpose door SPENDS
+/// the permutation by its own semantics — a relayout reads the input view and writes it
+/// transposed — so stating the window honestly is the whole fix; no emission reads the order.
+///
+/// `None` — the caller's existing "no window stated" answer — for an order this 2-D census
+/// cannot state: present but not an affine map, or a permutation that is neither an identity
+/// nor the 2-D swap. Nothing in this pipeline mints one (the fold writes `order_map(rank,
+/// &order)` from a `tt.trans`, whose `order` this front end only ever states as the `.T` swap
+/// `[1, 0]`), so that arm is a refusal to guess rather than a reachable case.
+pub(crate) fn tile_window_2d(op: &Operation<'_>) -> Option<(u32, u32)> {
+    let (r, c) = shape_2d(op)?;
+    let order = op
+        .attributes
+        .iter()
+        .find(|(k, _)| *k == AttrKey::CoordinateOrder)
+        .map(|(_, v)| v);
+    // Absent = identity, which is what an as-built tile carries: the value shape is the window.
+    let Some(order) = order else {
+        return Some((r, c));
+    };
+    let Attr::AffineMap(m) = order else {
+        return None;
+    };
+    // Identity in any rank: value axis i IS view axis i.
+    if m.exprs
+        .iter()
+        .enumerate()
+        .all(|(i, e)| matches!(e, AffineExpr::Dim(j) if *j == i))
+    {
+        return Some((r, c));
+    }
+    // The 2-D swap (`.T`): value axis 0 is view axis 1 and vice versa.
+    if let [AffineExpr::Dim(1), AffineExpr::Dim(0)] = m.exprs {
+        return Some((c, r));
+    }
+    None
 }
 
 /// The registry slot a reserved-tid parameter names — the inverse of [`scalarmul_scale_tid`],
@@ -1168,23 +1223,35 @@ pub fn elementwise(
             ins.len(),
         ));
     }
-    // ⛔⛔⛔ THE BROADCAST AND PER-ROW ARMS CANNOT CARRY A CORNER — COLUMN OR ROW — AND ONE NEVER
-    // REACHES THEM FROM THIS FRONT END. A broadcast operand is addressed at its OWN extent (`In::col`:
-    // one lane per row; `In::mb`: one row of values) and the per-row chain writes LANE 0 of a
-    // one-stick output at the buffer base — neither form can state "columns
-    // `[c_start, c_start+c_len)` of a wider stick-blocked tensor" (what a column-blocked chunk is)
-    // nor "rows `[r_start, r_start+r_len)` of a taller one" (what a banded program's window is).
-    // The column-tiling set (`subtile_ir.rs`: `EwKind::Silu | Mul | Add`, `ScalarMul`, `SiluMul`)
-    // is all DENSE, so a corner arriving at either arm is a producer shape this door refuses BY
-    // NAME rather than mis-addressing — the same contract `base_addressed` states for a row corner
-    // on every other body. The DENSE arm below carries both corners; this guard is what keeps the
-    // other two from silently dropping them.
-    if (bcast.iter().any(Option::is_some) || out.c_len == 1)
-        && (out.c_start != 0
-            || ins.iter().any(|x| x.c_start != 0)
-            || out.r_start != 0
-            || ins.iter().any(|x| x.r_start != 0))
-    {
+    // ⛔⛔⛔ THE PER-ROW WIDTH AND THE BROADCAST OPERANDS CANNOT CARRY A CORNER — COLUMN OR ROW —
+    // AND THE DOOR REFUSES THEM BY NAME RATHER THAN MIS-ADDRESSING. Two laws, one per routing:
+    //
+    // 1. A ONE-COLUMN OUTPUT (`out.c_len == 1` — the per-row one-stick chain, and the width
+    //    [`elementwise_broadcast`] itself folds to at `c_len == 1`) writes LANE 0 of a one-stick
+    //    output at the buffer base, so neither a column window nor a row band is stateable: ANY
+    //    corner on ANY operand of a one-column-output op is refused — the original blanket guard,
+    //    unchanged, and the same contract `base_addressed` states for a row corner on every other
+    //    body.
+    //
+    // 2. A BROADCAST OPERAND (`bcast[i] = Some`) is addressed at its OWN extent — `In::col` (one
+    //    lane per row) and `In::mb` (one row of values) state no offset — so its region must be
+    //    whole-tensor; a corner on one is refused naming the operand and its mode.
+    //
+    // ⭐ AND THE DENSE OPERANDS AND THE OUTPUT OF A MULTI-STICK BROADCAST OP ARE PLACED
+    // PER-OPERAND — the dense arm's own windowed emission, verbatim ([`chunk_window`] at row 0,
+    // [`band_corner`] through `In::sliced`/`OutCorner::At` at a row corner, the output through its
+    // own [`OutCorner`]). The blanket guard this replaces claimed "one never reaches them from
+    // this front end", and that premise was MEASURED FALSE three days after it landed:
+    // `one_k_dot_to_mul` (triton-ktir, 9403f61d2) rewrites attn.py's decode value leg
+    // `tl.dot(w_d, vd)` — K=1 — into `broadcast(w_d) · vd`, and the vd leg is head h's
+    // `[MQ, HD]` window at column `kvh·HD` of the `[NEW_LEN, NKVH·HD]` V buffer: a DENSE operand
+    // at a column corner beside a broadcast one. The transposed-B dots were refusing that walk
+    // earlier, so the shape stayed invisible until the plain-B restatement cleared them. The
+    // broadcast arm's extents law already holds a dense operand to `v_rows == rows` — the sweep —
+    // which is exactly the same-rows condition a [`ColWindow`]'s stick-major presentation states,
+    // so the dense arm's forms place it without inventing an addressing mode.
+    let cornered = |x: &Region| x.c_start != 0 || x.r_start != 0;
+    if out.c_len == 1 && (cornered(&out) || ins.iter().any(cornered)) {
         let (who, cs) = ins
             .iter()
             .find(|x| x.c_start != 0)
@@ -1197,6 +1264,22 @@ pub fn elementwise(
              a column window, and neither a row corner (`base_addressed`'s own argument). A \
              column-blocked chunk or a banded window is DENSE elementwise; the dense arm carries \
              both corners, so give the broadcast/per-row chains whole-tensor regions.",
+        ));
+    }
+    if let Some((i, (x, b))) = ins
+        .iter()
+        .zip(bcast.iter())
+        .enumerate()
+        .find(|(_, (x, b))| b.is_some() && cornered(x))
+    {
+        return err(format!(
+            "Elementwise({kind:?}) {name}: input {i} t{} is broadcast ({b:?}) and states a window \
+             `[{}, {}]` at ({}, {}) of its `[{}, {}]` view, but a broadcast operand is addressed \
+             at its OWN extent — `In::col` reads one lane per row and `In::mb` one row of values, \
+             and neither states an offset — so the door refuses the corner rather than reading the \
+             broadcast source at the buffer base. Give the broadcast chains whole-tensor operands \
+             (the walk's intermediates and reductions already are).",
+            x.tid, x.r_len, x.c_len, x.r_start, x.c_start, x.v_rows, x.v_cols,
         ));
     }
     if bcast.iter().any(Option::is_some) {
@@ -1218,12 +1301,26 @@ pub fn elementwise(
     // 20-entry table SHADOWED the DDL's internal Newton bit-trick constants and made `rsqrt` compute
     // `1/x`, and the fix was to stop shipping it rather than to hand-build the iteration. The DSM fills
     // them. A comment claiming we emit the table describes the bug, not the fix.
-    let cols = out.c_len;
+    let rows = pointwise_rows(name, &out)?;
+    // ⭐⭐⭐ THE DEVICE WIDTH, NOT THE LOGICAL COLUMN COUNT — [`pointwise_device_cols`], the
+    // ScalarMul law extended to this arm. A dense elementwise over a sub-stick logical width
+    // (`qk_d + mask_d` at `[MQ, MQ]`, `MQ` a decode-batch rung) is a tile the dxp scheduler
+    // refuses; emitting it at the stick-rounded width its operands' placements hold is the
+    // same rule the matmul producer already followed when it minted them. Every operand of
+    // this op is addressed at `cols`, so every name caps it — but the law is a WHOLE-VIEW law
+    // ([`whole_view_op`]): a windowed piece's placement quotient is its PARENT's width.
+    let cols = if whole_view_op(&ins, &out) {
+        let mut names: Vec<String> = ins.iter().map(Region::name).collect();
+        names.push(out.name());
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        pointwise_device_cols(layout, &refs, rows, out.c_len)
+    } else {
+        out.c_len
+    };
     check_pointwise_cols(cols, "Elementwise", out.tid)?;
     // ⭐ THE SWEEP IS COMPUTED BEFORE THE EXTENTS LAW, because the law is now stated OVER it: a
     // windowed (banded) output's sweep is its window, not its whole view, and the operands are
     // held to that basis ([`pointwise_extents_agree`]'s two-basis law below).
-    let rows = pointwise_rows(name, &out)?;
     pointwise_extents_agree(name, kind, &ins, &out, rows)?;
     let op_name = format!("{op_func}_o{}", out.tid);
     // ⛔⛔⛔ A COLUMN-BLOCKED CHUNK IS DENSE ELEMENTWISE WITH A CORNER, AND THE CORNER MUST RIDE
@@ -1608,6 +1705,26 @@ fn elementwise_broadcast(
     // still an operand mode (a spray is addressing, not width), so only the width is folded here.
     let cols = if out.c_len == 1 {
         FP16_ELEMS_PER_STICK
+    } else if whole_view_op(ins, out) {
+        // ⭐ THE SAME DEVICE-WIDTH LAW the dense arm takes ([`pointwise_device_cols`]): this
+        // arm's tile is sized by the output's columns too, and a sub-stick logical width is
+        // the same dxp-scheduler refusal. The names that cap it are the tensors this op holds
+        // at `rows` rows — the output and the DENSE operands. A `Col` operand (`[rows, 1]`,
+        // one value per row) is not addressed at `cols`, and an `Mb` one holds a SINGLE row
+        // of them, so neither's footprint divides by this op's `rows`; both are measured
+        // where they are addressed, by `resolve_seg_base`'s per-operand footprint guard.
+        // The whole-view gate ([`whole_view_op`]) still spans every operand — a `Col`/`Mb`
+        // operand of a windowed piece is windowed too, and the law is not the piece's to
+        // take.
+        let mut names: Vec<String> = ins
+            .iter()
+            .zip(bcast)
+            .filter(|(_, b)| b.is_none())
+            .map(|(x, _)| Region::name(x))
+            .collect();
+        names.push(out.name());
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        pointwise_device_cols(layout, &refs, rows, out.c_len)
     } else {
         out.c_len
     };
@@ -1625,18 +1742,43 @@ fn elementwise_broadcast(
         .zip(ins)
         .map(|(n, x)| rb(n, x.v_rows, x.c_len))
         .collect();
+    // ⭐ THE DENSE OPERANDS AND THE OUTPUT TAKE THE DENSE ARM'S OWN PER-OPERAND WINDOW FORMS —
+    // the same forms, the same laws, the same builder ([`assemble_pointwise_broadcast_off_from_tile`]
+    // takes one mode per operand and one output corner, so a broadcast mode beside a windowed dense
+    // one is a mix it already states). A dense operand at row 0 is a whole-stick [`ColWindow`] of
+    // its same-rows parent — the extents law above holds `v_rows == rows`, which is exactly the
+    // same-rows condition the window's stick-major presentation states; at a row corner it is the
+    // single-stick rectangle `In::sliced` reaches. A corner-free operand keeps `In::full` and a
+    // corner-free output keeps [`OutCorner::ZERO`], so every corner-free broadcast program — every
+    // one this arm has ever baked — is emitted byte-identically; only a stated corner routes to the
+    // offset forms, the dense arm's own law. The BROADCAST operands keep `In::col`/`In::mb`: their
+    // regions are whole-tensor by the guard in [`elementwise`].
     let ew: Vec<_> = in_handles
         .iter()
-        .zip(bcast)
-        .map(|(h, b)| match b {
-            None => In::full(h).ew(),
-            Some(BcastAxis::Col) => In::col(h).ew(),
-            Some(BcastAxis::Mb) => In::mb(h).ew(),
+        .zip(ins.iter())
+        .zip(bcast.iter())
+        .map(|((h, x), b)| {
+            Ok(match b {
+                Some(BcastAxis::Col) => In::col(h).ew(),
+                Some(BcastAxis::Mb) => In::mb(h).ew(),
+                None if x.r_start == 0 && x.c_start == 0 => In::full(h).ew(),
+                None if x.r_start == 0 => In::col_window(h, chunk_window(name, rows, x)?).ew(),
+                None => In::sliced(h, band_corner(name, rows, x)?).ew(),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, Error>>()?;
     // The SAME `TileOp` the dense arm builds, so the two arms share one LX-tiling contract and a
     // broadcast op is not silently exempt from it.
     let tile_op = pointwise_tile_op(rows, cols, ins.len() as u32 + 1);
+    // The output's own corner: [`OutCorner::ZERO`] for a corner-free program (the byte-identical
+    // form), the window or corner the region states otherwise — the dense arm's `out_off`, verbatim.
+    let out_off: crate::addr::OutCorner = if out.r_start == 0 && out.c_start == 0 {
+        crate::addr::OutCorner::ZERO
+    } else if out.r_start == 0 {
+        chunk_window(name, rows, out)?.into()
+    } else {
+        crate::addr::OutCorner::At(band_corner(name, rows, out)?)
+    };
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
         &op_name,
         &tile_op,
@@ -1645,11 +1787,7 @@ fn elementwise_broadcast(
         cols,
         &ew,
         &out_h,
-        // WHOLE-TENSOR: [`elementwise`] refuses a column corner on any operand before routing
-        // here (a broadcast/per-row operand is addressed at its own extent or the buffer base,
-        // neither of which can place a column window), so the offset is 0 by proof, not by
-        // default.
-        crate::addr::DevOff::ZERO,
+        out_off,
         sym_id_base,
         layout,
     )])
@@ -1896,6 +2034,46 @@ pub fn rmsnorm(
 /// satisfied by a narrower descriptor that computes fewer columns than the program states. And it is a
 /// no-op wherever the layout does reserve the pad, which is the lm-head logits case the rule exists
 /// for.
+/// ⭐⭐⭐ THE POINTWISE DEVICE-WIDTH LAW, stated once for every arm that sizes a tile by an op's
+/// logical column count: the width EMITTED is [`DeviceWidth::for_pointwise`] of the logical
+/// columns — stick-rounded, bumped to a splittable stick count — CAPPED at the whole-stick
+/// width the placements actually hold ([`pointwise_width_the_output_holds`]).
+///
+/// # WHY EVERY ARM TAKES IT, NOT JUST SCALARMUL
+///
+/// [`scalarmul_scaled`] took this law first because a ScalarMul on the padded logits was the
+/// measured over-run. But the width it fixes is a property of the TILE, not of the op kind: the
+/// dxp scheduler refuses any tile whose stick extent is not a whole 64-elem fp16 stick
+/// (`L3DlOpsScheduler:1040`), so a DENSE elementwise, a BROADCAST one and a REDUCE over a
+/// sub-stick logical width (`[MQ, MQ]` score tiles at a decode-batch rung; the headmajor
+/// fixture's `[1, 8]`) are all the same refusal. And the pad the width adds is real for every
+/// one of them, because the producers hold it: a matmul mints its output at
+/// [`DeviceWidth::for_matmul`] and an intermediate's `BundleLayout::synth` footprint
+/// stick-rounds its inner axis, so `held` reproduces the pad and the cap is a NO-OP. A
+/// 64-aligned op is a no-op the same way — the cap reproduces the width `for_pointwise`
+/// already chose — which keeps every existing bundle byte-identical.
+///
+/// # THE PAD LANES ARE THE MASK'S −inf TAIL
+///
+/// The lanes this width adds past the logical columns are read by the op but written by nobody
+/// the program states: they hold whatever the producer's own pad left there. In the attention
+/// chain the producer is `qk + mask` and the mask's host staging pads its columns with −inf
+/// (the additive mask's pad-up law), so the widened lanes are numerically inert under every
+/// consumer — `max` ignores −inf, `exp(−inf) = 0` leaves sums and dot-products unchanged.
+fn pointwise_device_cols(
+    layout: Option<&BundleLayout>,
+    names: &[&str],
+    rows: u32,
+    logical_cols: u32,
+) -> u32 {
+    pointwise_width_the_output_holds(
+        layout,
+        names,
+        rows,
+        DeviceWidth::for_pointwise(logical_cols).get(),
+    )
+}
+
 fn pointwise_width_the_output_holds(
     layout: Option<&BundleLayout>,
     names: &[&str],
@@ -1944,6 +2122,30 @@ fn pointwise_width_the_output_holds(
     } else {
         cols
     }
+}
+
+/// ⛔ THE DEVICE-WIDTH LAW IS A WHOLE-VIEW LAW — the gate every [`pointwise_device_cols`] call
+/// site must pass before asking the layout for a width.
+///
+/// [`pointwise_width_the_output_holds`] divides a buffer's placement bytes by THIS OP's `rows`,
+/// which is only the buffer's width when the op's window IS the buffer: window == view, both
+/// axes, every region the op addresses. A WINDOWED piece — a column chunk of a wide tile, a
+/// banded row window — reads its PARENT's whole placement through a narrow window, so the
+/// quotient is the parent's width. The reproduction proof then passes VACUOUSLY: a `[64, 64]`
+/// chunk of a `[64, 128]` view asks for 512 (`for_pointwise` floors sub-stick widths), the
+/// placement holds 128, and `for_pointwise(128)` is ALSO 512 — both widths sit below the floor,
+/// the proof cannot fail, and the parent's 128 becomes the chunk's width. The emission then
+/// addresses the chunk's second corner over that width and the footprint guard PANICS inside
+/// the assembler (`access window end 24576B exceeds its placement footprint 16384B`) — a runtime
+/// abort standing in for what is a law-boundary miss.
+///
+/// A windowed piece's width is its own `c_len`, already whole-stick by [`chunk_window`]'s corner
+/// law, so the gate returns the caller's `cols` unchanged there. A row-FOLDED op is whole-view
+/// (the fold's contract keeps the window equal to the view), so the law still applies to it; so
+/// does the control table's genuinely-narrower whole-view input, case (d).
+fn whole_view_op(ins: &[Region], out: &Region) -> bool {
+    let whole = |x: &Region| x.r_len == x.v_rows && x.c_len == x.v_cols;
+    whole(out) && ins.iter().all(whole)
 }
 
 /// THE CONTROL SET FOR [`pointwise_width_the_output_holds`], the pointwise twin of
@@ -2122,321 +2324,11 @@ pub fn scalarmul(
     scalarmul_at(name, scale, gather_of(k)?, r, sym_id_base, layout)
 }
 
-/// A KV HEAD INDEX, TYPED, from a loop counter — the one place a bare `usize` becomes a [`KvHead`].
-///
-/// A kv head, a query head, a slot and a feature are all small integers, and nothing but spelling kept
-/// them apart at a call site. `?` here means a head past the pool's count is a build error rather than
-/// an address in the next plane.
-///
-/// [`KvHead`]: crate::sdsc_abstract::KvHead
-fn kv_head_of(kvh: u32, nkvh: u32) -> Result<crate::sdsc_abstract::KvHead, Error> {
-    let n = std::num::NonZeroU32::new(nkvh).ok_or_else(|| Error {
-        message: "a paged pool needs at least one kv head".into(),
-    })?;
-    crate::sdsc_abstract::KvHead::new(kvh, n).ok_or_else(|| Error {
-        message: format!("kv head {kvh} is past the pool's {nkvh} head(s)"),
-    })
-}
-
-/// main's `lower_attn_node` (main 9528-10376), waiting for its head geometry to become consts — the
-/// consumer side of `with_config_attn_geometry`, exactly as main's `LowerAttn` was.
-///
-/// ⛔⛔⛔ AND IT IS MAIN'S `LowerAttn` FIELD FOR FIELD, WHICH IS WHY `AttnFacts` IS GONE. main's pack
-/// is `{ node, cap, active_cap, rows_are_requests, sym_id_base, layout }`: the NODE, plus the four
-/// things the node does not state. This pack replaces `node` with the node's PROGRAM — from which
-/// [`attn_operands`] reads the six tensor identities and the resident capacity that main read off
-/// `node.inputs` / `node.op` / `ir.tensors` — and keeps exactly main's remainder. `scale` joins them
-/// because main took it off `node.op`'s `SubOp::AttnDecode { scale }` payload, the same place it took
-/// the geometry the door above turns into the consts.
-///
-/// ⛔ NOTHING HERE IS STAPLED TO THE PROGRAM. These are ARGUMENTS, supplied per call by the caller
-/// that crossed the geometry door — a third-party KTIR producer's caller states them from its own
-/// configs, exactly as scratchy's does. A record hanging off [`KtirNode`] is what made the crate's
-/// attention path unusable to anyone but this producer.
-pub struct AttnAt<'a> {
-    pub name: &'a str,
-    /// The node's KTIR, and its parameters as [`Region`]s — the program, and nothing beside it.
-    pub k: &'a KtirNode,
-    pub r: &'a [Region],
-    /// main's `LowerAttn::rows_are_requests` — TRUE when this bundle's query rows are separate
-    /// requests (a batched decode) rather than consecutive positions of one sequence.
-    ///
-    /// ⛔ THE ONE FACT WITH NO STATEMENT ANYWHERE IN THE PROGRAM, and it cannot have one: it decides
-    /// the DEVICE's row/slot laws (`attn_bundle_rows`' pad, rope's head-major collapse), which the
-    /// emulator does not model at all — the attention/rope programs never receive it and
-    /// emit the same ops either way.
-    pub rows_are_requests: bool,
-    /// Whether this bundle's attention reads the paged KV through an index — the caller-side twin of
-    /// the spyre door's `BundleAttnParams::gathers_kv` (the batched rungs' per-page gather, or the
-    /// one-request rung's split-KV chunk). Decides the `KV_BLOCK_INDEX_TID` admission below; the
-    /// placement reserves under the SAME fact — one predicate, both halves of the gather.
-    pub gathers_kv: bool,
-    /// The split-KV chunk's page count — the caller-side twin of `BundleAttnParams::chunk_pages`.
-    /// `Some` lowers the prefix through [`crate::sdsc_abstract::ChunkScratch`] (every resident page in
-    /// one pass); `None` keeps the per-page fold.
-    pub chunk_pages: Option<u32>,
-    /// Whether this bundle's attention score scale is carried by the staged weights — the
-    /// caller-side twin of the spyre door's `BundleAttnParams::scale_in_weights`. The fold removes
-    /// the score mulf from the program, so a folded program states NO multiplier; a model whose
-    /// attention scale genuinely IS 1.0 states none either (the triton→ktir pipeline folds a
-    /// multiply by 1.0 away). This fact is what tells the door that absence is one of those two
-    /// and not a broken program.
-    pub scale_in_weights: bool,
-    /// ⭐ WHETHER THE FINALIZE HANDS `out` TO o_proj SLAB-MAJOR — the caller-side twin of the spyre
-    /// door's `BundleAttnParams::headmajor_handoff`, and the SAME fact the matmul door swaps the o
-    /// matmul's B operand on (the permuted `oproj_headmajor_tid` copy): one fact, both halves of the
-    /// restructure, so neither can be emitted without the other. TRUE only for the single-row
-    /// (`mq == 1`) body of a multi-slab head dim with an fp8 W8A8 o matmul.
-    pub headmajor_handoff: bool,
-    pub sym_id_base: &'a mut i64,
-    pub layout: Option<&'a BundleLayout>,
-}
-
 /// ⭐⭐⭐ THE ATTENTION NODE'S OPERANDS AND ITS RESIDENT CAPACITY, READ OUT OF THE PROGRAM THAT
 /// STATES THEM — the seven fields `AttnFacts` used to carry from the producer.
 ///
 /// Every one is a positional join on [`KtirNode::args`], which is the join [`regions`] already
 /// performs: the attention program mints its parameters in first-use order — `q`, `out`,
-/// then (when this node emits the runtime length mask) the mask, then EVERY segment's K view followed
-/// by EVERY segment's V view — and `crate::place::act_name(tid)` is the operand spelling every proven
-/// builder agrees on.
-///
-/// ⛔ AND THE POSITIONS ARE CROSS-CHECKED AGAINST THE SHAPES THEY MUST HAVE, because a silent
-/// positional slip REPOINTS A TENSOR: `q`/`out` are `[mq, nqh·hd]` and every K/V view is `[·, nkvh·hd]`,
-/// so a q↔kv swap is caught; the two views of one SEGMENT share a row extent while a segment's K and
-/// the NEXT segment's V do not, so an all-Ks-then-all-Vs order mistaken for an interleaved one is
-/// caught. A mismatch is a build error naming what disagreed, never a descriptor built on a guess.
-#[derive(Clone, Copy, Debug)]
-pub struct AttnOperands {
-    /// main's `inputs[0]` — the rotated Q.
-    pub q_id: u32,
-    /// main's `output`.
-    pub out_id: u32,
-    /// main's `kv.cache_tensor()` / `kv.v_cache_tensor()` — the resident prefix cache, segment 0.
-    pub k_id: u32,
-    pub v_id: u32,
-    /// main's `inputs[3]` / `inputs[4]` — this step's new K and V, the last segment.
-    pub new_k_id: u32,
-    pub new_v_id: u32,
-    /// The resident cache's structural capacity — the prefix K view's OWN row extent, which is
-    /// `ir.tensors[kv.cache_tensor()].rows`, i.e. exactly what main's call site looked up.
-    pub cap: u32,
-    /// Which PARAMETER the resident K is, so the sweep check below reads the rows of that buffer
-    /// without searching for it a second time.
-    pub k_param: usize,
-    /// The query row count, read off `q`'s own view — not a fact the caller states.
-    pub mq: u32,
-}
-
-/// [`AttnOperands`], with every position proven against the shape it must have.
-///
-/// `geom` is the witness the door minted, so the widths checked against are the model's, evaluated
-/// once — and the head dim is checked against the program's own per-head window, which is the first
-/// `ktdp.construct_access_tile` over the `q` view.
-pub fn attn_operands<const NQH: u32, const NKVH: u32, const HD: u32>(
-    name: &str,
-    k: &KtirNode,
-    r: &[Region],
-    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
-) -> Result<AttnOperands, Error> {
-    let (q_width, kv_width) = (geom.nqh() * geom.hd(), geom.nkvh() * geom.hd());
-    // `q`, then `out`: the attention program's first two parameter mints, in that order.
-    let (q, out) = match (r.first(), r.get(1)) {
-        (Some(q), Some(o)) => (q, o),
-        _ => {
-            return err(format!(
-                "{name}: an attention program states {} parameter(s); its construction mints at \
-                 least six (q, out, and each segment's K then V)",
-                r.len()
-            ));
-        }
-    };
-    // ⭐⭐⭐ THE QUERY ROW COUNT COMES FROM THE PROGRAM. It was `KtirNode::out_shape.0`, and both
-    // checks below forced it equal to this very view's row extent — so the record was a copy of what
-    // `q`'s own `ktdp.construct_memory_view` states, and a third-party producer had to supply a
-    // number its program already carries. The `out` check below is unchanged and still real: `q` and
-    // `out` must agree on rows, and both on the geometry's column width.
-    let mq = q.v_rows;
-    let shape_is = |role: &str, x: &Region, rows: u32, cols: u32| -> Result<(), Error> {
-        if (x.v_rows, x.v_cols) != (rows, cols) {
-            return err(format!(
-                "{name}: parameter {role} t{} states a `[{}, {}]` view where the node's geometry \
-                 (nqh={NQH} nkvh={NKVH} head_dim={HD}) and its {mq} query row(s) make it \
-                 `[{rows}, {cols}]` — the positional join on `KtirNode::args` disagrees with the \
-                 shape the operand must have, which means it names a different tensor",
-                x.tid, x.v_rows, x.v_cols,
-            ));
-        }
-        Ok(())
-    };
-    shape_is("q", q, mq, q_width)?;
-    shape_is("out", out, mq, q_width)?;
-    // ⛔ THE STORE SAYS WHICH ONE IS THE OUTPUT, so a q↔out transposition cannot survive even when
-    // (as here) the two share a shape.
-    if q.is_out || !out.is_out {
-        return err(format!(
-            "{name}: parameter 0 (t{}, read as `q`) is {}written by a `ktdp.store` and parameter 1 \
-             (t{}, taken as `out`) is {}— `q` is the read operand and `out` the written one, so this \
-             program's parameters are not the order the attention program mints them in",
-            q.tid,
-            if q.is_out { "" } else { "not " },
-            out.tid,
-            if out.is_out { "" } else { "not " },
-        ));
-    }
-    // ⭐ THE HEAD DIM, FROM THE PROGRAM'S OWN PER-HEAD WINDOW. The attention program reads head `h` as
-    // `tile(q_view, ·, h·hd, ·, hd)`, so the first access tile over the `q` view is `hd` wide — the
-    // one place the program states the head dim rather than a product with it.
-    //
-    // ⛔ AND IT IS THE TILE'S OWN `Shape`, NOT [`Region::c_len`]. That field is dropped to the whole
-    // view unless BOTH of the tile's corner operands are `arith.constant`s, and a PREFILL attention
-    // runs one head per core — its column corner is `arith.muli(pid, hd)`, so `c_len` reads back the
-    // full `nqh·hd` and a check against it refused every prefill bundle (MEASURED: "the program's
-    // first window on `q` t341 is 576 column(s) wide where the door's head dim is 64"). The `Shape`
-    // says `hd` either way.
-    let q_window_cols = param_first_tile(&k.func, &k.func.arguments[0].0).map(|(_, c)| c);
-    if q_window_cols != Some(geom.hd()) {
-        return err(format!(
-            "{name}: the program's first window on `q` t{} is {} where the door's head dim is {} — \
-             the geometry crossed does not belong to this program",
-            q.tid,
-            match q_window_cols {
-                Some(c) => format!("{c} column(s) wide"),
-                None => "not a window at all".to_string(),
-            },
-            geom.hd(),
-        ));
-    }
-    // The K/V segment parameters: everything after `q`/`out` except the runtime length mask, whose
-    // tensor id the node already states (it is SYNTHETIC — beyond the graph — so nothing else could).
-    let mask_tid = k.mask.map(|b| b.get());
-    let segs: Vec<(usize, &Region)> = r
-        .iter()
-        .enumerate()
-        .skip(2)
-        .filter(|(_, x)| Some(x.tid) != mask_tid)
-        .collect();
-    // main's own arity: `AttnDecode` "expects 5 inputs [q, prefix_k, prefix_v, new_k, new_v]", so
-    // exactly two segments, and the program states each one's K view before any V view.
-    let [(k_param, kc), (_, new_k), (_, vc), (_, new_v)] = match segs.as_slice() {
-        [a, b, c, d] => [*a, *b, *c, *d],
-        _ => {
-            return err(format!(
-                "{name}: the program takes {} K/V segment parameter(s); an attention node has \
-                 exactly four (the resident prefix cache's K and V, and this step's new K and V — \
-                 main's `inputs[1..5]`)",
-                segs.len()
-            ));
-        }
-    };
-    for (role, x) in [
-        ("resident K", kc),
-        ("new K", new_k),
-        ("resident V", vc),
-        ("new V", new_v),
-    ] {
-        if x.v_cols != kv_width {
-            return err(format!(
-                "{name}: parameter {role} t{} states a {}-column view where the node's geometry \
-                 (nqh={NQH} nkvh={NKVH} head_dim={HD}) makes a kv stream {kv_width} wide — the \
-                 positional join names a different tensor",
-                x.tid, x.v_cols,
-            ));
-        }
-    }
-    // ⛔ THE TWO VIEWS OF ONE SEGMENT SHARE A ROW EXTENT. This is what proves the order is
-    // all-Ks-then-all-Vs and not K,V,K,V: under the wrong reading `vc` would be the PREFIX's V (the
-    // full capacity) while `new_k` would be it too, and the resident/new row extents differ.
-    if kc.v_rows != vc.v_rows || new_k.v_rows != new_v.v_rows {
-        return err(format!(
-            "{name}: the resident cache's K t{} `[{}, ·]` and V t{} `[{}, ·]`, and this step's new K \
-             t{} `[{}, ·]` and V t{} `[{}, ·]`, must each be one segment's pair and so share a row \
-             extent — they do not, so the K and V parameter lists are not the order the \
-             construction mints them in",
-            kc.tid, kc.v_rows, vc.tid, vc.v_rows, new_k.tid, new_k.v_rows, new_v.tid, new_v.v_rows,
-        ));
-    }
-    Ok(AttnOperands {
-        q_id: q.tid,
-        out_id: out.tid,
-        k_id: kc.tid,
-        v_id: vc.tid,
-        new_k_id: new_k.tid,
-        new_v_id: new_v.tid,
-        cap: kc.v_rows,
-        k_param,
-        mq,
-    })
-}
-
-/// ⛔⛔⛔ AN ATTENTION PROGRAM'S SIZE MUST NOT GROW WITH ITS ROWS — the bake refuses a per-row unroll.
-///
-/// The continuation arm was a `tl.static_range(0, MQ)` of per-row bodies, each with its own `[qi + 1,
-/// HD]` causal tiles: `MQ` bodies whose tiles summed to `MQ²/2` rows. Its program, and every pass that
-/// walks it, grew with the rows: MEASURED on granite-2b, 94.7 s to lower at 256 rows (the bake's
-/// widest compile) and a build-script thread past 25 min at 102 GB without finishing at 512. The bundle
-/// was correct; only the build paid.
-///
-/// So the check is on the LOWERED program, at the door, for every multi-row attention: the number of
-/// windows it takes of its query `q` (parameter 0), regions included so a loop the front end failed to
-/// fold still counts its body. A whole-chunk head reads its query ONCE, so the program takes at most
-/// one window per head (`heads` — the grid is unrolled into the program, so every head's body is in
-/// it); a per-row form takes one per head PER ROW. That is the property a raw op-count bound cannot
-/// state, because a program's absolute size also scales with its heads and head dim. Decode
-/// (`mq == 1`) has one row, so the two forms coincide there.
-pub fn attn_program_is_flat_in_rows(
-    name: &str,
-    f: &IRFunction<'static>,
-    mq: u32,
-    heads: u32,
-) -> Result<(), Error> {
-    if mq <= 1 {
-        return Ok(());
-    }
-    let Some((q, _)) = f.arguments.first() else {
-        return err(format!(
-            "{name}: an attention program with no parameters — its query is parameter 0"
-        ));
-    };
-    let tiles = param_tiles_deep(f, q);
-    if tiles > heads as usize {
-        return err(format!(
-            "{name}: a {mq}-row attention program over {heads} head(s) takes {tiles} windows of its \
-             query, where a whole-chunk head takes one — it unrolls per row, so its size, its \
-             lowering and every pass over it grow with its rows. State the chunk whole: one score tile \
-             per segment and the causal triangle in the mask."
-        ));
-    }
-    Ok(())
-}
-
-/// The rows of one parameter's buffer the program actually READS — every `ktdp.construct_access_tile`
-/// over any view of it, as the widest row extent; `0` when it takes no window at all.
-///
-/// ⭐ THIS IS WHERE `active_cap` MEETS THE PROGRAM. A bundle baked at `ActiveCap::NONE` sweeps no
-/// resident prefix, and its program says so by naming the cache tensor (so the identity survives) and
-/// taking no access tile of it. `nb == 0` on the device and "no prefix block" in the emulator are then
-/// the same statement rather than two.
-///
-/// ⛔ [`regions`] CANNOT ANSWER THIS. Its window fields come from the FIRST access tile whose corner
-/// is a pair of `arith.constant`s, and attention's kv corner is `arith.addi(col_start, kv_head·hd)` —
-/// so that field falls back to the whole view, which is the capacity and not the sweep.
-fn param_read_rows(f: &IRFunction<'static>, ptr: &Ssa) -> u32 {
-    param_tiles(f, ptr)
-        .filter_map(|t| shape_2d(t).map(|(rows, _)| rows))
-        .max()
-        .unwrap_or(0)
-}
-
-/// The `[rows, cols]` of the FIRST window the program takes of one parameter's buffer — its access
-/// tile's own `Shape`, which is stated whatever its corner is made of.
-/// PUBLIC for the door: the geometry mint reads a program's head dim here, the same way rope's
-/// head dim is read — the door (`ktir_superdsc_door::attn`) mints `ModelAttnGeometry` off the
-/// program's own views because a hybrid model's bundle carries more than one.
-pub fn param_first_tile(f: &IRFunction<'static>, ptr: &Ssa) -> Option<(u32, u32)> {
-    param_tiles(f, ptr).find_map(shape_2d)
-}
-
 /// Every `ktdp.construct_access_tile` over any view of one parameter, in program order.
 fn param_tiles<'f>(
     f: &'f IRFunction<'static>,
@@ -2756,48 +2648,6 @@ pub fn program_windowed_eps(f: &IRFunction<'static>) -> Option<f32> {
         }
     }
     found.map(|v| v as f32)
-}
-
-/// ⭐ `pub` FOR THE SAME REASON AS [`program_rmsnorm_eps`]: the caller builds the registry this
-/// value is looked up in, by bits, so it must be able to read the same value rather than restate the
-/// reading.
-pub fn program_score_scale(f: &IRFunction<'static>) -> Option<f32> {
-    let const_of: std::collections::HashMap<Ssa, f64> = f
-        .operations
-        .iter()
-        .filter(|o| o.op_type == OpKind::ArithConstant)
-        .filter_map(|o| {
-            let v = o.attributes.iter().find_map(|(kk, v)| match (kk, v) {
-                (AttrKey::Value, Attr::Float(x)) => Some(*x),
-                _ => None,
-            })?;
-            Some((o.result?, v))
-        })
-        .collect();
-    // `tensor.splat` result -> the scalar it splatted, when that scalar is a float constant.
-    let splat_of: std::collections::HashMap<Ssa, f64> = f
-        .operations
-        .iter()
-        .filter(|o| o.op_type == OpKind::TensorSplat)
-        .filter_map(|o| Some((o.result?, *const_of.get(o.operands.first()?)?)))
-        .collect();
-    let is_matmul: std::collections::HashSet<Ssa> = f
-        .operations
-        .iter()
-        .filter(|o| o.op_type == OpKind::LinalgMatmul)
-        .filter_map(|o| o.result)
-        .collect();
-    f.operations
-        .iter()
-        .filter(|o| o.op_type == OpKind::ArithMulf)
-        .find_map(|o| {
-            let l = o.operands.first()?;
-            let rr = o.operands.get(1)?;
-            if !is_matmul.contains(l) {
-                return None;
-            }
-            Some(*splat_of.get(rr)? as f32)
-        })
 }
 
 /// The CAP a [`Program::TanhSoftCap`](crate::ktir_node::Program::TanhSoftCap)
@@ -3605,1002 +3455,6 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
     Ok(ops)
 }
 
-/// main's `lower_attn_node` (main 9528-10376) BODY, at its const geometry — BATCHED over q-heads
-/// (BatchMatmul, batch=`num_q_heads`), reading the resident transposed-K + replicated K/V cache
-/// (seg2, worker-filled) over the full `cap` masked by `t{ATTN_MASK_TID}`. Decode (mq=1): per head
-/// `scores[1,cap] = Q·Kᵀ·scale + mask`, softmax, `out=probs·V`. Viewed as `[nqh, cap]` for the
-/// ew/softmax ops (mb=nqh, out=cap; `[nqh,1,cap]`≡`[nqh,cap]` bytes). Softmax reduce-outputs are one
-/// stick (like rmsnorm's mean).
-pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
-    a: AttnAt<'_>,
-    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
-) -> Result<Vec<EmittedOp>, Error> {
-    let AttnAt {
-        name: _name,
-        k,
-        r,
-        rows_are_requests,
-        gathers_kv,
-        chunk_pages,
-        scale_in_weights,
-        headmajor_handoff,
-        sym_id_base,
-        layout,
-    } = a;
-    // ⭐⭐⭐ THE OPERANDS COME FROM THE PROGRAM. main read them off `node.inputs` / `node.op` /
-    // `ir.tensors[..].rows`; the program states every one of them, so this is the same reading through
-    // the door this file's header describes — not a record the producer filled in beside it.
-    let ops_in = attn_operands(_name, k, r, geom)?;
-    let mq = ops_in.mq;
-    attn_program_is_flat_in_rows(_name, &k.func, mq, geom.nqh())?;
-    let (k_id, v_id) = (ops_in.k_id, ops_in.v_id);
-    let (nqh, nkvh, hd) = (geom.nqh(), geom.nkvh(), geom.hd());
-    let cap = ops_in.cap;
-    let stick = Fp16::ELEMS_PER_STICK; // 64
-    // ── PAGED-ATTENTION COMPUTE EXTENT, READ OFF THE PROGRAM ──
-    //
-    // ⭐⭐⭐ IT WAS `AttnAt::active_cap`, THE RUNG, RESOLVED HERE. The rung is a PRODUCER input: it
-    // decides how many rows of the resident cache the attention program takes an access tile of, so the
-    // program already carries the swept extent and the lowering can read it back. `param_read_rows`
-    // is that reading — the widest row extent any `ktdp.construct_access_tile` over the cache
-    // parameter takes, and 0 when the program takes none (`ActiveCap::NONE`'s zero-length segment).
-    //
-    // ⛔ AND THIS WAS MEASURED, NOT ARGUED. The old code resolved the rung and then checked only
-    // whether the two AGREED ABOUT ZERO — never that the extents matched — so whether the field was
-    // derivable had never actually been established. Making `active_cap != prefix_rows` a hard error
-    // and building granite-3.1-8b fp8 on the card, whose bake loops the whole
-    // `ActiveCap::decode_ladder` (`codegen.rs:9470`, one bundle per rung), it never fired: every rung
-    // of the ladder resolved to exactly what its program reads. The emulator alone would NOT have
-    // shown this — it bakes `ActiveCap::FULL`, where `resolve` is trivially `cap`, which is the same
-    // blind spot that let a wrong rope reading through.
-    let prefix_rows = param_read_rows(&k.func, &k.func.arguments[ops_in.k_param].0);
-    let active_cap: u32 = prefix_rows;
-    // ⛔⛔⛔ THE RUNG AND THE PROGRAM MUST AGREE ABOUT WHETHER THERE IS A PREFIX AT ALL, because
-    // that is the one place the two consumers could compute different things and neither would fault.
-    // `ActiveCap::NONE` means `nb == 0` here — the new-token block alone seeds and finalizes the
-    // softmax — and the producer says the same thing by taking NO access tile of the resident cache
-    // (the tensor is still named, so its identity survives; see the attention program's zero-length
-    // segment). A rung that swept nothing against a program that reads the prefix — or the reverse —
-    // is an emulator that cannot be an oracle for this node, so it is a build error naming both.
-    // The swept extent cannot exceed the buffer it sweeps: the cache parameter's own view states
-    // `cap` rows, and a program taking a window past that addresses bytes nothing wrote.
-    if prefix_rows > cap {
-        return err(format!(
-            "AttnDecode t{}: the program reads {prefix_rows} row(s) of the resident cache t{k_id} \
-             whose own view states only {cap} — the capacity read off that view is not the buffer \
-             this program addresses.",
-            ops_in.out_id,
-        ));
-    }
-    // ⭐⭐⭐ THE MULTIPLIER COMES FROM THE PROGRAM, AND IT IS THE ONLY READING OF IT. The attention
-    // program states `attention_multiplier` inline (`self.scalar(f64::from(scale))`) because the emulator
-    // interprets these ops and the three attention optimizers recognise the scale by pattern; the
-    // DEVICE reads it as a bound `[1,1]` const, whose slot is resolved below FROM THIS VALUE.
-    //
-    // ⛔ IT WAS A CALLER-STATED `f32` CHECKED AGAINST THIS DERIVATION, WHICH IS A SIDECAR. The check
-    // could only ever pass — every program that lowered at all agreed with its caller — so the value
-    // the caller passed was never the source of anything, only a second copy of one config number
-    // travelling `SubtileIR → params → SuperDSC` past the IR. A third-party producer had to supply a
-    // number its own program already states. There is one reading now, and no default: a program with
-    // no multiplier is a build error naming it.
-    //
-    // ⭐ EXCEPT THE TWO CASES WHERE THE PROGRAM CANNOT STATE IT. One is THE FOLD: when the bundle's
-    // `√attention_multiplier` was folded into `W_q`/`W_k`, the node's scale was rewritten to 1.0
-    // before the splice minted this program, and the triton→ktir pipeline folds a multiply by 1.0
-    // away entirely — the program TRUTHFULLY states no multiplier, because no device multiply is
-    // left to do (the weights carry `√scale` each). The other is THE UNIT SCALE: a model whose
-    // attention scale genuinely is 1.0 (gemma-4's arch defaults `attention_multiplier` to it) has
-    // no multiply to state in the first place, and the same pipeline folding takes it — and the
-    // skip arm below is the correct lowering for both, because `√1.0` leaves the weights carrying
-    // the whole scale either way. `scale_in_weights` is the caller's statement that one of these
-    // is the case; a multiplier-less program without it is still the build error below, and a
-    // program that states a real multiplier WHILE the caller says the weights carry the scale is
-    // the half-applied fold — the multiplies would double-scale pre-scaled weights, so it is
-    // refused, not best-efforted.
-    let scale_val = match program_score_scale(&k.func) {
-        None if scale_in_weights => None,
-        None => {
-            return Err(Error {
-                message: format!(
-                    "AttnDecode t{}: the program states no score multiplier. The attention program \
-                     scales its scores with an `arith.mulf` against an `arith.constant`, and the \
-                     descriptor's `[1,1]` scale const is resolved from that value, so a program \
-                     without one cannot be lowered — unless the bundle's score scale is already \
-                     carried by its staged weights (folded into W_q/W_k, or a unit attention \
-                     scale), which the caller must then state in `BundleAttnParams::scale_in_weights`.",
-                    ops_in.out_id,
-                ),
-            });
-        }
-        Some(v) if scale_in_weights && v != 1.0 => {
-            return Err(Error {
-                message: format!(
-                    "AttnDecode t{}: the bundle states its attention scale is carried by the staged \
-                     weights, but the program still states a score multiplier of {v}. Both cases \
-                     that carry the scale (the fold, a unit multiplier) mint the program at 1.0, so \
-                     a real multiplier here means the graph and the splice disagreed — emitting the \
-                     multiplies would scale weights that already carry the scale.",
-                    ops_in.out_id,
-                ),
-            });
-        }
-        some => some,
-    };
-    // SPAN-OVERFLOW GUARD (ported from torch-spyre's span_overflow_hint_analysis.py). Real
-    // corrective re-tiling of the resident cache's PHYSICAL STORAGE (not just the compute sweep
-    // `active_cap` already bounds) means paging the cache into multiple physical buffers — a
-    // structural change to the resident-KV allocation, not something this one call site can retrofit
-    // in place. So this guard does what torch-spyre's planner does BEFORE re-tiling: run the actual
-    // search (`cheapest_split_clearing_span`) and report the split it finds, rather than a bare
-    // "not implemented". Unreachable for every real model config checked so far (granite hd=64,
-    // cap up to several thousand: span ~0.5 MB against a 256 MB budget — see
-    // `ir::bridge::span_overflow`'s own tests) — kept as a real `cargo build` guard, not a runtime
-    // assert, so a future config that DOES trip it fails loudly with the fix already computed.
-    {
-        use crate::ir::bridge::span_overflow::{
-            MAX_SPAN_BYTES, cheapest_split_clearing_span, physical_span_bytes,
-        };
-        let span = physical_span_bytes(cap, hd, stick, Fp16::WORD_LENGTH);
-        if span > MAX_SPAN_BYTES {
-            let cap_dim = ItDim {
-                name: "cap",
-                size: cap,
-                is_reduction: false,
-                is_stick: true,
-                df: Df::Fp16,
-            };
-            let split_report = match cheapest_split_clearing_span(&cap_dim, |split| {
-                physical_span_bytes(cap / split.max(1), hd, stick, Fp16::WORD_LENGTH)
-            }) {
-                Ok(split) => format!(
-                    "the cheapest legal split of `cap` that clears the limit is {split}-way \
-                     (cap/{split}={} slots/core) — but applying it requires paging the resident \
-                     KV allocation, not implemented at this call site",
-                    cap / split.max(1)
-                ),
-                Err(e) => format!("no legal split of `cap` clears the limit either: {e}"),
-            };
-            return err(format!(
-                "AttnDecode t{}: resident K/V cache [cap={cap}, hd={hd}] physical span {span} B \
-                 exceeds the {MAX_SPAN_BYTES} B hardware addressing limit. {split_report}.",
-                ops_in.out_id,
-            ));
-        }
-    }
-    // ⛔ ONE SOURCE FOR THE PADDED ROW COUNT AND THE ROW LAWS: `attn_bundle_rows` is the parse
-    // boundary from the bundle's runtime width to the pad law WITH the geometry's consts in scope,
-    // and the SAME carrier rides into `assemble_attn`, so the two cannot disagree. A decode width
-    // (one row, or rows that are requests) must be a baked ladder rung there — the pad is
-    // `Rung<MQ>`'s compile-time arithmetic and every row extent is `RungRowLaws`' const
-    // (`MaskRows = NQH*MQ` by the compiler), and an unlisted width is this loud bake error, the
-    // same boundary discipline as the geometry door in `lower_one_node`. A prefill chunk's width is
-    // a runtime quantity and takes the runtime arm of the same law.
-    let bundle_rows = crate::sdsc_abstract::attn_bundle_rows(geom, mq, rows_are_requests)
-        .ok_or_else(|| Error {
-            message: format!(
-                "AttnDecode t{}: a decode bundle at {mq} query rows — not a width the decode \
-                     ladder bakes (1, or PagedKvPool::BATCH_RUNGS). The decode width is a const of \
-                     the bundle (`Rung<MQ>`); bake a listed rung, or grow the ladder and its \
-                     dispatch together.",
-                ops_in.out_id
-            ),
-        })?;
-    let width = bundle_rows.width();
-    let mq_pad = width.pad().rows();
-    let t = ops_in.out_id;
-    let q = crate::place::act_name(ops_in.q_id); // roped Q [mq, nqh·hd]
-    let new_k = crate::place::act_name(ops_in.new_k_id); // roped new-K [mq_pad, nkvh·hd] (worker zero-pads rows)
-    let new_v = crate::place::act_name(ops_in.new_v_id); // new-V       [mq_pad, nkvh·hd]
-    let kc = crate::place::act_name(k_id); // natural K cache [nqh, cap, hd] (seg2, GQA-replicated, slab-major)
-    let vc = crate::place::act_name(v_id); // natural V cache [nqh, cap, hd] (seg2, GQA-replicated, slab-major)
-    let kct = crate::place::act_name(kct_resident_tid(k_id)); // resident Kᵀ scratch [nqh, hd, cap]
-    // ⭐⭐⭐ AN ATTENTION WHOSE SCALE THE WEIGHTS CARRY STATES NO SCALE AT ALL. The √scale was
-    // FOLDED into W_q and W_k (the producer half's `attn_scale_weight_folds` recognition), or the
-    // model's attention scale IS 1.0 and there was nothing to fold: the splice minted this program
-    // at scale 1.0 either way, the triton→ktir pipeline folded the `qk · 1.0` multiply away
-    // entirely, and the registry census skipped the node's arm — so `scale_val` above is `None`,
-    // and the query and the roped new-K arrive over the staged weights already carrying √scale
-    // each: `(q·√s)·(k·√s)ᵀ` is `(q·kᵀ)·s` with no device multiply left to do. The skip arm at the
-    // multiplies below takes both: no registry lookups (a folded node pushed no slot, so looking
-    // anything up is a desync error by design), no `qs`/`new_k_scaled` buffers, and the score legs
-    // read `q` and the roped new-K directly.
-    let pmask = crate::place::act_name(ATTN_MASK_TID); // [nqh, cap]    prefix validity (worker-tiled, mb-broadcast over mq)
-    let cmask = crate::place::act_name(ATTN_CAUSAL_TID); // [mq, mq_pad] causal triu (worker-tiled)
-    // [mq, nqh·hd] — the identity; every scratch name below is a rendering of it.
-    let attn_id = PlaceId::Act(t);
-    let n = |r: SynthRole| syn(layout, attn_id.synth(r));
-    // ⭐ THE IDENTITY CLASS TID — which `[hd,hd]` identity table this attention class's krep/vrep and
-    // cachewr matmuls name. One table per DISTINCT AttnDecode head dim (the bake's
-    // `attn_class_hds` registry), because a hybrid model's wide class reads slab 1 of a
-    // max-hd placement holding a base-hd table as ALL ZERO (dump-proven on gemma-4
-    // tiny-allglobal: `newkrep` lanes 64..127 zero while lanes 0..63 equal the roped K).
-    // A uniform model resolves class 0, which IS `IDENTITY_TID`, so its ops are unchanged.
-    let ident = crate::place::act_name(
-        layout
-            .and_then(|l| l.identity_tid_of_class(hd))
-            .ok_or_else(|| Error {
-                message: format!(
-                    "AttnDecode t{t}: head_dim {hd} absent from BundleLayout.attn_class_hds {:?} \
-                     (registry desync — the placement pass and this lowering disagree about the \
-                     tape's attention classes, so which identity table this node reads is not a \
-                     fact either of them states)",
-                    layout.map(|l| l.attn_class_hds.clone()).unwrap_or_default(),
-                ),
-            })?,
-    );
-
-    let mut ops: Vec<EmittedOp> = Vec::new();
-
-    // ── (0) ZERO new_k/new_v's PADDING rows [mq..mq_pad) before anything reads them (BUG #3, see
-    // ATTN_ZERO_TID's placement comment above). `new_k`/`new_v` are a lifetime-reused seg3
-    // intermediate — never explicitly re-zeroed between steps/layers — so rows beyond the real `mq`
-    // can alias whatever unrelated tensor last lived at that byte range. The causal mask only
-    // reliably neutralizes BOUNDED garbage; this makes the padding actually zero instead of relying
-    // on that. Per-kv-head (nkvh, not nqh — new_k/new_v are still nkvh-wide here, before GQA-replicate
-    // expands them), one zero-copy each, matching ATTN_ZERO's own [mqp,hd] per-head-width shape.
-    if mq_pad.row_axis_extent() > mq {
-        let zero = crate::place::act_name(ATTN_ZERO_TID);
-        let pad_rows = mq_pad.row_axis_extent() - mq;
-        // THE ONE OFFSET LEFT THAT A NEST CANNOT EXPRESS, and the reason is a real layout defect, not
-        // a missing abstraction. `new_k`/`new_v` are ALLOCATED `[mq_pad, nkvh*hd]` but RoPE PACKS them
-        // by the REAL row count `mq`, so a per-head block holds exactly `mq` rows and has no room of
-        // its own for padding: "row mq of head kvh" is not an address that exists. Framing the zero-fill
-        // on the packed nest trips the footprint check at decode (mq=1) immediately, and framing it on
-        // the padded nest moves every other consumer. So the zeros go where they have always gone --
-        // past the packed data -- which is NOT where the Kt restickify reads this head's padding from.
-        // It reads the NEXT head's real K/V there and relies on the causal mask to neutralise it.
-        //
-        // Reconciling that means making RoPE write `mq_pad`-framed, which is a worker change as well as
-        // an emitter one. Until then this stays byte-identical rather than becoming a second convention.
-        for kvh in 0..nkvh {
-            ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_kzero{kvh}_o{t}"),
-                "identity",
-                crate::sdsc_abstract::RowCount::of_zero_pad_rows(pad_rows),
-                crate::sdsc_abstract::BlockCols::of_head_dim(hd),
-                &[In::full(&rb(&zero, pad_rows, hd)).ew()],
-                &rb(&new_k, mq_pad.row_axis_extent(), nkvh * hd),
-                // FLAT, and that is the finding: this lands past the packed data, in a region no
-                // consumer reads (see the note above), so it is placed row-major rather than through
-                // the stick law. Saying `flat` makes which arrangement was meant explicit instead of
-                // leaving `mq*nkvh*hd + kvh*hd` for a reader to infer.
-                crate::addr::Nest::flat(
-                    &["row", "feat"],
-                    &[mq_pad.row_axis_extent(), nkvh * hd],
-                    Df::Fp16,
-                )
-                .view()
-                .at(crate::addr::Idx::<crate::addr::Row>::n(mq))
-                .at(crate::addr::Idx::<crate::addr::Feat>::n(kvh * hd))
-                .dev(),
-                sym_id_base,
-                layout,
-            ));
-            ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_vzero{kvh}_o{t}"),
-                "identity",
-                crate::sdsc_abstract::RowCount::of_zero_pad_rows(pad_rows),
-                crate::sdsc_abstract::BlockCols::of_head_dim(hd),
-                &[In::full(&rb(&zero, pad_rows, hd)).ew()],
-                &rb(&new_v, mq_pad.row_axis_extent(), nkvh * hd),
-                crate::addr::Nest::flat(
-                    &["row", "feat"],
-                    &[mq_pad.row_axis_extent(), nkvh * hd],
-                    Df::Fp16,
-                )
-                .view()
-                .at(crate::addr::Idx::<crate::addr::Row>::n(mq))
-                .at(crate::addr::Idx::<crate::addr::Feat>::n(kvh * hd))
-                .dev(),
-                sym_id_base,
-                layout,
-            ));
-        }
-    }
-
-    // ── (1) GQA-replicate: NEITHER K nor V's freshly-computed new-token block replicates to nqh
-    // anymore. `kct`/(the value-side equivalent for the new block) only ever need ONE representative
-    // copy per kv-head group — the resident-cache side (`kc`/`vc`, still genuinely nqh-sized for
-    // their own OWN separately-proven cache-write convention) is untouched, but the new-token block's
-    // OWN scratch buffers (new_k_rep/new_v_rep) are fresh allocations with no such constraint, so
-    // dedup them too. `assemble_attn`'s new-block reads (both K, from before, and V, now) map query
-    // head h to its kv-head via `gqa_kv_head`, matching producer/consumer by construction.
-    //
-    // A DECODE BATCH TRIMS THEM TOO. The copies exist so a per-head reader finds its own replicated
-    // slot; the GQA-group-batched attention reads the REPRESENTATIVE slot directly and never looks at
-    // them, and a batched decode now runs that form. So the `nkvh*2` identity copies a layer are pure
-    // work at any batch width, for the same reason they are at one row.
-    //
-    // Prefill keeps them — it runs the per-head reader — so its bundles stay byte-identical.
-    let decode_trim =
-        // ⭐ THE PARAMETER, NOT THE GLOBAL. This function already RECEIVES the kind; reading the
-        // thread-local here was a second carrier for one fact, and the two could disagree.
-        // ⛔ AND `mq == 1` IS NOT "SOLO DECODE": it is also a one-token prefill chunk. The kinds
-        // coincide at width one, which is exactly why `bs=1` passing never proved anything about the
-        // batched kind. Keep both terms, but understand the first as a WIDTH fact and the second as a
-        // KIND fact — they are not two spellings of the same test.
-        mq == 1 || rows_are_requests;
-    let (new_k_rep, new_v_rep) = if decode_trim {
-        (new_k.clone(), new_v.clone())
-    } else {
-        (
-            syn(layout, attn_id.synth(SynthRole::NewKRep)),
-            syn(layout, attn_id.synth(SynthRole::NewVRep)),
-        )
-    };
-    if !decode_trim && let Some(l) = layout {
-        for r in [SynthRole::NewKRep, SynthRole::NewVRep] {
-            l.synth(attn_id.synth(r), &[mq_pad.row_axis_extent(), nkvh * hd]);
-        }
-    }
-    // PER-KV-HEAD BASE = `kvh * mq * hd` (2026-07-28, CORRECTED from an earlier `mq_pad` version that
-    // regressed decode). The stride between kv-head column-blocks in these `[*, nkvh*hd]` tensors is
-    // set by their PRODUCER, RoPE, which writes head h row r at
-    // `rope_prefill_block_offset(r,h,mq,hd) = h*mq*hd + r*hd` -- stride `mq`, the chunk's REAL query-row
-    // count, NOT the stick-padded `mq_pad`.
-    //
-    // SLAB-SPLIT, for the same reason as every other head-dim-spanning op here. A single
-    // `[mq_pad, hd]` copy addresses its own second stick at `mq_pad*stick` — its declared row count
-    // — but RoPE, which WROTE this buffer, puts it at `mq*stick`, because it packs each (head, slab)
-    // as `mq` tightly-strided rows. Those coincide only when a head is ONE stick, and at
-    // head_dim 128 / mq 31 / mq_pad 64 they are 2112 elements apart: every kv-head's upper half of K
-    // and V is copied from, and to, the wrong place on every prefill.
-    //
-    // At nslab == 1 there is one iteration, every slab term is 0, `stick == hd` makes `n`/`k`
-    // identical, and the name collapses -- granite-3.1-2b emits exactly what it did before.
-    let krep_nslab = (hd / stick).max(1);
-    for kvh in 0..nkvh {
-        if decode_trim {
-            break; // the copies are the identity — `new_k_rep`/`new_v_rep` ARE `new_k`/`new_v`.
-        }
-        for s in 0..krep_nslab {
-            // ⛔⛔⛔ NAMED AXES, NOT HAND-SUMMED PRODUCTS — the same conversion as `attn.rs`'s kv stream,
-            // and the same reason: `kvh * hd + s * stick` adds two products of DIFFERENT UNITS (kv-head x
-            // head_dim, slab x lanes) into one column, and the two are IDENTICAL at hd == stick == 64.
-            let slab_off =
-                crate::addr::Nest::new(&["row", "head", "feat"], &[mq, nkvh, hd], Df::Fp16)
-                    .view()
-                    .at(crate::addr::Idx::<crate::addr::Head>::n(kvh))
-                    .slab(s)
-                    .dev();
-            // The identity's (in-slab s, out-slab s) diagonal block, as a coordinate on the [in, out]
-            // kernel nest rather than the product `s*stick*(hd+stick)` it works out to.
-            let ident_off = crate::addr::Nest::new(&["row", "feat"], &[hd, hd], Df::Fp16)
-                .view()
-                .at(crate::addr::Idx::<crate::addr::Row>::n(s * stick))
-                .slab(s)
-                .dev();
-            let nm = |base: &str| {
-                if krep_nslab == 1 {
-                    format!("attn_{base}{kvh}_o{t}")
-                } else {
-                    format!("attn_{base}{kvh}s{s}_o{t}")
-                }
-            };
-            ops.push(assemble_matmul_off(
-                &nm("krep"),
-                crate::sdsc_abstract::MatM::of_padded_chunk_rows(mq_pad),
-                crate::sdsc_abstract::MatN::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                crate::sdsc_abstract::MatK::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                crate::sdsc_abstract::MatY::unbatched(),
-                crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
-                    bmm_site::TapeLoweringSite::witness(),
-                ),
-                &rb(&new_k, mq_pad.row_axis_extent(), nkvh * hd),
-                slab_off,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &ident),
-                ident_off,
-                &rb(&new_k_rep, mq_pad.row_axis_extent(), nkvh * hd),
-                slab_off,
-                sym_id_base,
-                layout,
-            ));
-            ops.push(assemble_matmul_off(
-                &nm("vrep"),
-                crate::sdsc_abstract::MatM::of_padded_chunk_rows(mq_pad),
-                crate::sdsc_abstract::MatN::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                crate::sdsc_abstract::MatK::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                crate::sdsc_abstract::MatY::unbatched(),
-                crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
-                    bmm_site::TapeLoweringSite::witness(),
-                ),
-                &rb(&new_v, mq_pad.row_axis_extent(), nkvh * hd),
-                slab_off,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &ident),
-                ident_off,
-                &rb(&new_v_rep, mq_pad.row_axis_extent(), nkvh * hd),
-                slab_off,
-                sym_id_base,
-                layout,
-            ));
-        }
-    }
-
-    // ── (2) qs = Q·sqrt_scale, new_k_scaled = new_k_rep·sqrt_scale (torch-spyre scales BOTH Q and K
-    // by sqrt(scale), so `scores = (Q·√s)@(K·√s)ᵀ = Q@Kᵀ·s`). The resident cache stores K ALREADY
-    // scaled (see the cache-write below), so the prefix score needs only qs scaled. new_k_scaled is
-    // nkvh-wide now (K dedup, see above) — assemble_attn's "new block" score reads it per-query-head
-    // via the SAME gqa-dedup mapping kct_base already uses (matching producer/consumer by construction).
-    //
-    // ⭐ WHEN THE PROGRAM STATES NO MULTIPLIER — OR STATES 1.0 (see the comment beside `scale_val`)
-    // this whole section is SKIPPED: no multiplies, no `[1,1]` consts looked up, no
-    // `qs`/`new_k_scaled` synthetics — the score legs read `q` and the roped new-K (which the fold
-    // already pre-scaled) by their own names.
-    let (qs, new_k_scaled) = match scale_val {
-        None | Some(1.0) => (q.clone(), new_k_rep.clone()),
-        // attention_multiplier (config) — see the ORIGINAL header doc: NO 1/sqrt(hd) recompute.
-        Some(scale_val) => {
-            // ⭐ ONE LOOKUP LAW — `scale_slot`, the door every other bound constant resolves
-            // through (exact bits, then the f16 image). This arm once carried its own bits-only
-            // copy of the lookup, which refused any config whose attention multiplier is not
-            // f16-exact: the program states the multiplier's fp16 image (its `qk * SCALE` mulf
-            // runs on the fp16 dot's result, so the constant is the f16-rounded spelling) while
-            // the census registers the config's f32, and the two agree by bits only when the
-            // value is f16-exact. The f16 image the fallback matches is the value the worker
-            // binds anyway (`SCALE_BYTES = 2`).
-            let scale_idx = scale_slot(layout, scale_val).ok_or_else(|| Error {
-                message: format!(
-                    "AttnDecode t{t}: scale {scale_val} absent from BundleLayout.scalarmul_scales \
-                     (registry desync)"
-                ),
-            })?;
-            // unused directly: torch-spyre splits into sqrt_scale on both Q and K.
-            let _scale = crate::place::act_name(scalarmul_scale_tid(scale_idx));
-            // ⭐ √scale IS READ OFF THE REGISTRY'S OWN ENTRY — the census pushed `scale.sqrt()`
-            // of the config's f32, so the bits the lookup below wants match BY CONSTRUCTION;
-            // recomputing from the program's spelling could miss the census's entry by one
-            // f16 ulp of double rounding when the slot above resolved through the f16 image.
-            let sqrt_scale_val = match layout {
-                Some(l) => l.scalarmul_scales[scale_idx].sqrt(),
-                None => scale_val.sqrt(),
-            };
-            let sqrt_scale_idx = layout
-                .and_then(|l| {
-                    l.scalarmul_scales
-                        .iter()
-                        .position(|s| s.to_bits() == sqrt_scale_val.to_bits())
-                })
-                .ok_or_else(|| Error {
-                    message: format!(
-                        "AttnDecode t{t}: √scale {sqrt_scale_val} absent from scalarmul_scales \
-                     (registry desync)"
-                    ),
-                })?;
-            let sqrt_scale = crate::place::act_name(scalarmul_scale_tid(sqrt_scale_idx)); // [1,1] = √attention_multiplier
-            let (qs, new_k_scaled) = (n(SynthRole::Qs), n(SynthRole::NewKScaled));
-            if let Some(l) = layout {
-                l.synth(attn_id.synth(SynthRole::Qs), &[mq, nqh * hd]);
-                l.synth(
-                    attn_id.synth(SynthRole::NewKScaled),
-                    &[mq_pad.row_axis_extent(), nkvh * hd],
-                );
-            }
-            ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_qs_o{t}"),
-                "multiply",
-                // Q is `[mq, nqh*hd]`: the chunk's REAL rows, the full query feature width.
-                crate::sdsc_abstract::RowCount::of_query_rows(
-                    crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-                ),
-                crate::sdsc_abstract::BlockCols::of_feature_cols(nqh * hd),
-                &[In::full(&rbo(&q)).ew(), In::scalar(&rbo(&sqrt_scale)).ew()],
-                &rbo(&qs),
-                crate::addr::DevOff::ZERO,
-                sym_id_base,
-                layout,
-            ));
-            ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_nks_o{t}"),
-                "multiply",
-                // new-K is allocated `[mq_pad, nkvh*hd]`: the scale covers the PADDED rows, zeros included.
-                crate::sdsc_abstract::RowCount::of_padded_chunk_rows(mq_pad),
-                crate::sdsc_abstract::BlockCols::of_feature_cols(nkvh * hd),
-                &[
-                    In::full(&rbo(&new_k_rep)).ew(),
-                    In::scalar(&rbo(&sqrt_scale)).ew(),
-                ],
-                &rbo(&new_k_scaled),
-                crate::addr::DevOff::ZERO,
-                sym_id_base,
-                layout,
-            ));
-            (qs, new_k_scaled)
-        }
-    };
-
-    // ⭐ THE GATHER'S INDEX TENSOR, NAMED BY ITS RESERVED TID'S OWN SPELLING — `act_name` is what the
-    // placement, the bind and the descriptor all resolve through, so the tensor the descriptor gathers
-    // from is the tensor the worker fills. Under the SAME `gathers_kv` that places it: the reference
-    // gathers its pages on every decode, so the one-request rung gathers alongside the batched rungs,
-    // while prefill — rows are positions sharing one resident history, nothing per-row for an index
-    // to select — keeps the sweep and its byte-identical emission.
-    //
-    // ⛔⛔⛔ AND UNDER THE **GEOMETRY** TOO, WHICH IS THE OTHER HALF OF THE ONE RULE. `gathers_kv`
-    // alone named a tensor that `assemble_attn` may then decline (`GatherScratch::of_fold_pass` refuses a
-    // head dim its flat copy cannot express) — so an 8b bundle reserved the index activation and carried a
-    // `KvBlockIndex` forward step for a gather that appears in no descriptor. Asking
-    // `GatherScratch::admits` HERE and at the placement (`lower_subtile_tape_to_superdsc`) makes the two
-    // halves ONE predicate; see that door for why the split was invisible at hd=64.
-    // ⭐⭐⭐⭐⭐ THE PAGE-GRANULAR DOOR, ASKED HERE SO THE TENSOR'S NAME AND THE EMISSION ARE ONE
-    // PREDICATE — AND A REFUSAL IS A **BUILD FAILURE**, NOT A SILENTLY UNGATHERED BUNDLE.
-    //
-    // ⛔⛔⛔ IT WAS `.is_some()`, AND THAT IS HOW AN hd=128 BUILD PASSED ITS GATE WHILE GATHERING
-    // NOTHING. `PageScratch::of_pass` refused two slabs, this gate turned the refusal into `None`,
-    // `assemble_attn`'s `zip` turned `None` into the ungathered bundle, and every test that asked
-    // "does the gather work" was answered by a 2b build where the door was open. A runtime refusal that
-    // falls back to the form that shipped is indistinguishable from a working feature at the one
-    // geometry it is exercised on.
-    //
-    // ⭐ `expect` IS A COMPILE-TIME FAILURE HERE. `#[forward]` runs this whole pipeline at macro
-    // expansion, so a geometry the page gather cannot express now stops the BUILD and names the
-    // quantity, instead of emitting a bundle that quietly drops the gather. Every geometry
-    // `rows_are_requests` can present is admissible by construction — `mq <= WIDEST_BATCH_RUNG` is the
-    // same 32 as `ENTRIES_PER_PASS_MAX`, `hd` is a whole number of sticks for every model, and the entry
-    // count is cut to fit both the IBR stick and the LX chunk (`PageScratch::entries_per_op`) — so this
-    // panic is unreachable rather than enforced, which is the only shape a panic in the emitter may have.
-    //
-    // ⛔ THE `KV_BLOCK_INDEX_TID` PLACEMENT RESERVES ON `gathers_kv` ALONE (see
-    // `lower_subtile_tape_to_superdsc` for the measured reason it is not narrowed), and with the door
-    // now total under that same predicate the two halves are the SAME set of bundles — the hd=128
-    // asymmetry that had three doors giving two answers is gone.
-    // ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK, minted here so a chunk width this geometry cannot express is a BUILD
-    // failure naming the quantity — `ChunkScratch::of_chunk` refuses more than one feature slab, more
-    // than `PAGES_MAX` pages, or a footprint past `u32`. A chunk is a gathered read, so it demands the
-    // same `gathers_kv` the placement reserved the index under: a chunk without it would gather through
-    // an index no placement holds.
-    // A batch's rows are requests over their own runs of the chunk (`sdsc_abstract::BatchChunk`), which
-    // `assemble_attn` mints from this chunk and the width — so the row kind decides the mask's READ, not
-    // whether a chunk is admissible.
-    let chunk: Option<crate::sdsc_abstract::ChunkScratch> = chunk_pages.map(|pages| {
-        assert!(
-            gathers_kv,
-            "attention {_name}: a split-KV chunk of {pages} page(s) is a gathered read — it needs \
-             `gathers_kv` (the index placement); rows_are_requests={rows_are_requests}"
-        );
-        let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
-        crate::sdsc_abstract::ChunkScratch::of_chunk(pool, pages).unwrap_or_else(|| {
-            panic!(
-                "attention {_name}: a split-KV chunk of {pages} page(s) at nkvh={nkvh}, hd={hd} is not \
-                 expressible — `ChunkScratch::of_chunk` refuses more than one {stick}-element feature \
-                 slab, more than {max} pages, or a footprint past a u32 descriptor extent",
-                stick = crate::sdsc_abstract::POOL_STICK,
-                max = crate::sdsc_abstract::ChunkScratch::PAGES_MAX,
-            )
-        })
-    });
-    let kv_block_index: Option<String> = gathers_kv.then(|| {
-        let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
-        // A chunk's own door was asked above; the per-page door is the batched rungs'.
-        if chunk.is_some() {
-            return crate::place::act_name(crate::reserved_tids::KV_BLOCK_INDEX_TID);
-        }
-        crate::sdsc_abstract::PageScratch::of_pass(
-            pool,
-            crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-        )
-        .unwrap_or_else(|| {
-            panic!(
-                "the paged attention bundle for a batch of {mq} request row(s) at nkvh={nkvh}, \
-                 hd={hd} cannot express a page-granular KV gather, and a batched-decode bundle has \
-                 no ungathered form to fall back to. `PageScratch::of_pass` refuses when hd is not a \
-                 whole number of {stick}-element sticks, when the batch is wider than {max} index \
-                 entries, when one entry's double-buffered pair does not fit LX, or when the plane's \
-                 footprint leaves a u32 descriptor extent. Fix the geometry or widen the door — do \
-                 NOT reintroduce a fallback.",
-                stick = crate::sdsc_abstract::POOL_STICK,
-                max = crate::sdsc_abstract::PageScratch::ENTRIES_PER_PASS_MAX,
-            )
-        });
-        crate::place::act_name(crate::reserved_tids::KV_BLOCK_INDEX_TID)
-    });
-    // ── (3) the unified score/softmax/output computation — ONE algorithm for any mq (see
-    // ir::bridge::tiled_op_sdsc_op::attn's module doc for the torch-spyre correspondence). The head
-    // geometry travels as the minted type, not as three integers this call could reorder, and the
-    // width travels fused to its row laws on the boundary's one carrier.
-    ops.extend(assemble_attn(
-        t,
-        geom,
-        bundle_rows,
-        cap,
-        active_cap,
-        &qs,
-        &new_k_scaled,
-        &new_v_rep,
-        &kct,
-        &vc,
-        &pmask,
-        &cmask,
-        // ⭐⭐⭐⭐⭐ THE GATHER, ON — the prefix score leg's Kᵗ operand takes its KV base from this index
-        // tensor instead of from the runtime's per-launch page shift.
-        //
-        // ⛔ GATED ON `gathers_kv`, WHICH IS THE SAME CONDITION THE PLACEMENT USES. Both halves
-        // of a gather have to be decided once: `compute_bundle_layout` places `KV_BLOCK_INDEX_TID`
-        // under this predicate, `BakeFacts::gathers_kv` reads that placement, and the forward tape's
-        // `KvBlockIndex` step comes from that. The reference gathers on every decode — batched and
-        // one-request alike — while prefill shares ONE resident history across every row, so there is
-        // nothing per-row for an index to select and its emission stays byte-identical to before this
-        // existed.
-        //
-        // ⛔ AND THE NAME IS THE RESERVED TID'S OWN SPELLING, not a synthetic. `act_name` is what the
-        // placement, the bind and the descriptor all resolve through, so the tensor the descriptor
-        // gathers from is the tensor the worker fills. A name no placement matches is a bind the
-        // launcher SKIPS in silence, and a skipped index reads as zero — block 0, a real address — so
-        // every row of the batch would answer from row 0's keys.
-        //
-        // ══════════════════════════════════════════════════════════════════════════════════════════
-        // ⭐⭐⭐⭐⭐ ON — AND WHAT IT IS ATTACHED TO IS THE WHOLE STORY. A VENDOR CONSTRAINT MEASURED ON
-        // THE CARD THREE TIMES:
-        //
-        // **DEEPTOOLS CANNOT SCHEDULE A GATHER ON AN OP THAT HAS A `KERNEL` — i.e. ON A MATMUL.**
-        //
-        // The bake refuses, and the two refusals bracket the cause exactly (granite-3.1-2b fp8, pod
-        // `nickm-7db9667cdd-z2jc6`):
-        //   index memOrg_ = hbm+lx  ->  `sbf-ddc: DtException: Expect a valid allocate node.,
-        //                                L3DlOpsScheduler.cpp:2337`
-        //   index memOrg_ = hbm     ->  `sbf-ddc: DtException: Expect LX in labeledDs memOrg_.,
-        //                                L3DlOpsScheduler.cpp:2334`
-        // Both lines are in `calculateFlopPerByte`, which for EVERY HBM-pinned labeledDs demands an LX
-        // memOrg entry AND an allocated LX node. `allocAllMem` gives one to each STAGED operand and
-        // never to an index — an index is read into the IBR, not staged — so the two requirements
-        // cannot both be met and there is no third `memOrg_` to try.
-        //
-        // ⭐ IT ONLY RUNS FOR A REUSE OP, AND THAT IS THE WHOLE ANSWER.
-        // `L3DlOpsScheduler.cpp:1550` gates it on `isReuse`, and `hasDimensionReuse` (`:303-321`) is
-        // *"`primaryDsInfo_.size() > 1 && primaryDsInfo_.count(DsTypes::KERNEL)`"*. So:
-        //   our score op       primaryDsInfo_ {INPUT, KERNEL, OUTPUT, KERNEL_IDX}  -> reuse, EXPLORER RUNS
-        //   test_gather_1core  primaryDsInfo_ {OUTPUT, KERNEL_IDX}                 -> no KERNEL, skipped
-        //   sdsc_add_paged_l3lu primaryDsInfo_ {OUTPUT, KERNEL_IDX}                -> no KERNEL, skipped
-        // Neither vendor fixture gathers on a matmul. `test_gather_1core`'s op is `identity`; IBM's
-        // paged attention gathers on `AddZero` — an elementwise copy — and feeds the RESULT to its
-        // matmul. `a-gather-is-an-ordinary-compute-op-with-an-index-annotated-operand` says exactly
-        // that, and this is the constraint that forces it.
-        //
-        // ⭐ SO THE SHAPE THAT BAKES IS A SEPARATE GATHER OP, AND THAT IS WHAT `assemble_attn` NOW EMITS:
-        // two KERNEL-less `identity` copies that move the paged Kᵗ and V blocks through the index into
-        // CONTIGUOUS scratches, with the score and value matmuls reading those scratches per-request and
-        // carrying no gather at all. `emit_sdsc` still refuses a gather on a KERNEL-bearing op at build
-        // time (`asking_the_shipped_prefix_fold_for_a_gather_is_refused_naming_the_kernel` drives this
-        // very call path to prove the refusal reaches it), so the constraint is enforced rather than
-        // remembered.
-        //
-        // ⛔ `Some` IS THE COUPLING, NOT A SWITCH. Passing the NAME is what makes the emitter unable to
-        // gather unless a caller has a tensor to name — and the caller that names it is the same one that
-        // must place it (`compute_bundle_layout`, under this same `rows_are_requests`) and stage it
-        // (`BakeFacts::gathers_kv` → the forward tape's `KvBlockIndex` step). A name no placement matches
-        // is a bind the launcher SKIPS in silence, and a skipped index reads as entry 0 — a REAL address,
-        // page 0's first block, so every row of the batch would answer from one request's keys.
-        //
-        // ⛔ AND `assemble_attn` MAY STILL DECLINE IT. `GatherScratch::of_fold_pass` refuses a head dim
-        // above one stick, because a 64-slot window of the V plane is then `nslab` runs `PLANE_SLOTS*64`
-        // apart and a flat block copy would relayout it. That bundle emits exactly what it emits today
-        // rather than a copy that bakes and scrambles the value leg.
-        kv_block_index.as_deref(),
-        chunk,
-        attn_id,
-        rows_are_requests,
-        // The head-major o_proj handoff — the bundle fact the finalize above and the o matmul's
-        // B-operand swap key on together. See [`AttnAt::headmajor_handoff`].
-        headmajor_handoff,
-        sym_id_base,
-        layout,
-    )?);
-
-    // ── (4) + (5): the KV cache write and the Kᵀ re-transpose — see [`kv_cache_write`].
-    ops.extend(kv_cache_write(
-        KvCacheWrite {
-            t,
-            mq,
-            nkvh,
-            hd,
-            rows_are_requests,
-            new_k: &new_k_scaled,
-            new_v: &new_v_rep,
-            kc: &kc,
-            vc: &vc,
-            kct: &kct,
-            ident: &ident,
-        },
-        sym_id_base,
-        layout,
-    )?);
-    Ok(ops)
-}
-
-/// What one step's KV cache write moves, and between which buffers — everything [`kv_cache_write`]
-/// reads off the attention it closes.
-pub struct KvCacheWrite<'a> {
-    /// The attention's output tensor, which every op's name is suffixed with.
-    pub t: u32,
-    /// The step's query rows: one decode token, a batch's requests, or a prompt chunk's positions.
-    pub mq: u32,
-    pub nkvh: u32,
-    pub hd: u32,
-    /// The rows are a decode batch's requests (one op per request), not one sequence's positions.
-    pub rows_are_requests: bool,
-    /// This step's new K (already √-scaled) and V, `[mq, nkvh·hd]` row-blocked.
-    pub new_k: &'a str,
-    pub new_v: &'a str,
-    /// The resident natural-K, V and Kᵀ planes.
-    pub kc: &'a str,
-    pub vc: &'a str,
-    pub kct: &'a str,
-    /// The `[64, 64]` identity the copies contract against.
-    pub ident: &'a str,
-}
-
-/// ── (4) KV CACHE WRITE: append this step's new_k_scaled (nkvh-wide, dedup)/new_v_rep (nqh-wide)
-/// into the resident cache, then (5) re-transpose the Kᵀ plane from it. K writes only the nkvh
-/// representative slots (kvh*gqa) — `kctpost` (below) only ever reads those; the other slots were
-/// always dead. V is UNCHANGED (nqh writes, genuinely all read via `vc`'s own nqh-replicated
-/// convention). Writes K ALREADY sqrt-scaled, so future steps' prefix scores need no further K scaling.
-///
-/// REQUEST-MAJOR, so that one request's kv-head copies are CONSECUTIVE and fuse into a
-/// single launch. A group resolves one request's page table and write cursor, so the run
-/// breaks where the request changes (`GroupKind::Slot`'s `req`) — kv-head-major order would
-/// alternate requests every op and leave every copy its own launch, which is what made a
-/// batch of 8 slower than 8 separate forwards. One request ⇒ this loop runs once and the
-/// order is exactly what it was.
-///
-/// Its own function, public, so the emitted parts of a wide prompt window are pinned off the op list
-/// this very code returns rather than off a copy of it.
-pub fn kv_cache_write(
-    w: KvCacheWrite<'_>,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
-    let KvCacheWrite {
-        t,
-        mq,
-        nkvh,
-        hd,
-        rows_are_requests,
-        new_k: new_k_scaled,
-        new_v: new_v_rep,
-        kc,
-        vc,
-        kct,
-        ident,
-    } = w;
-    let stick = Fp16::ELEMS_PER_STICK;
-    let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
-    let mut ops: Vec<EmittedOp> = Vec::new();
-    let per_request = rows_are_requests && mq > 1;
-    // ⛔⛔⛔ AND THE SLAB CANNOT JOIN THAT `y` AXIS — MEASURED ON CARD, NOT INFERRED. The pair
-    // `(h, s)` linearizes as `h*nslab + s`, and that index steps exactly ONE STICK PLANE on BOTH
-    // operands, so ONE `y` of `nkvh*nslab` should cover both loops. It passes every check this backend
-    // has — the builder's y-stride check at hd 64/128/256/512, a conservation law differenced out of
-    // both nests, two Kani proofs of coverage + injectivity — and granite-2b (hd=64, where nslab==1
-    // makes the two forms identical) stays coherent 10/10. On granite-8b at hd=128 it produces GARBAGE
-    // from the first token ("The is a 1", 10/10 runs). So whatever makes a `y` step cross a feature
-    // slab is NOT the address arithmetic; do not retry the pair walk on the strength of the
-    // arithmetic, which is correct and insufficient.
-    let src_nest = crate::addr::Nest::new(&["row", "head", "feat"], &[mq, nkvh, hd], Df::Fp16);
-    // ⛔ `PLANE_SLOTS`, NOT `PAGE_SLOTS`, AND LOAD-BEARING AT EVERY HEAD DIM — this extent IS the
-    // write's kv-head stride (the `y` step is derived from it), and every READER takes its head stride
-    // from `PagedKvPool::plane_block_elems()`, which is physical. Declaring the ADDRESSABLE page while
-    // the pool strides by the PHYSICAL plane splits one law into two: writes land at `kvh*PAGE_SLOTS*hd`
-    // and reads at `kvh*PLANE_SLOTS*hd`, so every kv head but 0 reads keys nobody wrote. MEASURED: that
-    // regressed granite-2b (hd=64) from coherent to garbled, which is how it was found.
-    let dst_nest = crate::addr::Nest::new(
-        &["slot", "feat"],
-        &[crate::sdsc_abstract::PagedKvPool::PLANE_SLOTS as u32, hd],
-        Df::Fp16,
-    );
-    // ASKED OF THE SHAPE, once: the slab count reaches this write only through `slabs_of`, so there is
-    // no `hd/64` in scope for the loop and the pitches to spell differently.
-    let slabs = crate::addr::Shape::<0, 0, 0, 0>::slabs_of(hd, Df::Fp16);
-    // ⭐⭐⭐ A PROMPT WINDOW WIDER THAN A PAGE IS WRITTEN IN PAGE PARTS.
-    //
-    // One launch resolves ONE page per group (the page holding the group's cursor), and a page plane is
-    // `PAGE_SLOTS` slots of ONE kv head — so a single `[mq, hd]` copy of more rows than that would run off
-    // the page into the NEXT KV HEAD's block. Instead each `(kv head, slab)` copy is cut into parts of
-    // `PAGE_SLOTS` rows: part `p` reads the chunk's rows from `p·PAGE_SLOTS` and writes the SAME baked
-    // destination, carrying `kv_slot_offset = p·PAGE_SLOTS` so the runtime aims it at the page that slot
-    // falls in (`fold_plan::op_slot_pos`), and skips it when the request holds no such page (a short
-    // last chunk's padding). A window is a whole number of pages (`PREFILL_CHUNK_SLOTS`'s module law)
-    // and starts at a page boundary (`chunk_write_start`), so every part fills its page from slot 0.
-    //
-    // PART-MAJOR, so a part's copies are consecutive and fuse into one launch — the same reason the
-    // loop is request-major. A window that fits a page is ONE part with offset 0, and every name, row
-    // and op is exactly what it was.
-    let page = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
-    let parts = if per_request { 1 } else { mq.div_ceil(page) };
-    let part_tag = |p: u32| {
-        if parts > 1 {
-            format!("_p{p}")
-        } else {
-            String::new()
-        }
-    };
-    for req in 0..if per_request { mq } else { 1 } {
-        // ⛔ NO REQUEST TERM IN THE ADDRESS. `req` here indexes a ROW OF THE ACTIVATION and nothing more:
-        // which page that row's token lands in is the host's page map, applied as a per-launch shift. A page
-        // holds slots, not requests, so the address inside it is `(kv head, slot, feature)`.
-        let rq = if per_request {
-            format!("_r{req}")
-        } else {
-            String::new()
-        };
-        // ⛔⛔⛔ THE HEADS GO ON `y` ONLY WHEN THIS OP COVERS ONE ROW, and `rows_per_op` is that test.
-        //
-        // The plane-walk placement declares `pitch = rows * nslab`, which describes head-outermost planes of
-        // `rows` rows. The source is row-outermost — head `h` of row `r` is at `r*(nkvh*hd) + h*hd`, heads
-        // INTERLEAVED inside a row — so the two readings agree only at one row, where the row axis is
-        // degenerate. Decode qualifies both ways: solo decode has `mq == 1`, and a batched decode step emits
-        // one op per request (`per_request`), each covering its single row. A PREFILL CHUNK does not: one op
-        // spans `mq` rows, and `y` then strides heads as if each owned `mq` consecutive rows.
-        //
-        // MEASURED, granite-2b (hd=64, nslab=1) with the collapse ungated: every prompt from 400 characters
-        // up decodes fluent garbage (`'(\x03d. .exaggeret'` for a prompt whose answer is `Paris`).
-        let rows_per_op = if per_request { 1 } else { mq };
-        let heads_on_y = rows_per_op == 1;
-        for p in 0..parts {
-            // The part's first source row, and the rows it copies: the whole request row, or the chunk's
-            // rows from `p·PAGE_SLOTS` up to a page of them (the last part takes the remainder).
-            let (row0, part_rows) = if per_request {
-                (req, 1)
-            } else {
-                (p * page, (mq - p * page).min(page))
-            };
-            let pt = part_tag(p);
-            for s in 0..slabs.get() {
-                for h in 0..if heads_on_y { 1 } else { nkvh } {
-                    let a_place = if heads_on_y {
-                        crate::sdsc_abstract::OperandPlacement::of_plane_walk_by_head(
-                            &src_nest,
-                            crate::addr::Idx::<crate::addr::Row>::n(row0),
-                            s,
-                            slabs,
-                        )
-                    } else {
-                        crate::sdsc_abstract::OperandPlacement::at_head(
-                            &src_nest,
-                            crate::addr::Idx::<crate::addr::Row>::n(row0),
-                            h,
-                            s,
-                            slabs,
-                        )
-                    };
-                    let o_place = if heads_on_y {
-                        crate::sdsc_abstract::OperandPlacement::of_plane_walk_by_head_block_base(
-                            &dst_nest, s, slabs,
-                        )
-                    } else {
-                        crate::sdsc_abstract::OperandPlacement::at_block(
-                            &dst_nest,
-                            crate::sdsc_abstract::PagedKvPool::block_of(kv_head_of(h, nkvh)?),
-                            s,
-                            slabs,
-                        )
-                    };
-                    // K writes only the nkvh representative slots (`kctpost` only ever reads those); V is the
-                    // nkvh-wide `new_v_rep`, whose reader is kv-head indexed too. Both sides of both writes are
-                    // therefore kv-head indexed, which is what lets ONE `y` axis serve them.
-                    for (base, src, dst) in [("kc", new_k_scaled, kc), ("vc", new_v_rep, vc)] {
-                        ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
-                        &if heads_on_y {
-                            format!("cachewr_{base}s{s}{rq}{pt}_o{t}")
-                        } else {
-                            format!("cachewr_{base}{h}s{s}{rq}{pt}_o{t}")
-                        },
-                        // The kv stream's REAL rows this copy covers: one per request-copy, else the part's.
-                        crate::sdsc_abstract::MatM::of_query_rows(
-                            crate::sdsc_abstract::QueryRowCount::of_mq(part_rows),
-                        ),
-                        crate::sdsc_abstract::MatN::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                        crate::sdsc_abstract::MatK::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                        // `y` WALKS THE KV HEADS OF THIS SLAB — the same door the score leg's GQA group uses, and
-                        // for the same reason: the batch axis carries BOTH operands' head strides, so it cannot be
-                        // asked for without stating where the heads are, and the builder refuses a walk that
-                        // strides by neither.
-                        if heads_on_y {
-                            crate::sdsc_abstract::MatY::of_gqa_group(nkvh, a_place, o_place)
-                        } else {
-                            // The head is in both offsets, so there is no batch axis to stride — and nothing for the
-                            // builder's stride check to be wrong about.
-                            crate::sdsc_abstract::MatY::unbatched()
-                        },
-                        crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::of_kv_cache_write(
-                        ),
-                        &rb(src, mq, nkvh * hd),
-                        a_place,
-                        // I[64,64] — the identity for EVERY slab, so the shared 2-D kernel a `y` batch demands is
-                        // exactly what an identity copy needs. Offset 0: see the residency argument above.
-                        &Stk::<KernelTag>::kernel(stick as usize, stick as usize, ident),
-                        crate::addr::DevOff::ZERO,
-                        &Stk::<KernelTag>::kernel(
-                            crate::sdsc_abstract::PagedKvPool::PLANE_SLOTS,
-                            hd as usize,
-                            dst,
-                        ),
-                        o_place,
-                        sym_id_base,
-                        layout,
-                    ));
-                        if let Some(o) = ops.last_mut() {
-                            o.slot_stride_bytes = stick * 2;
-                            // PAGED: the slot is the position WITHIN its page; the page comes from the block table.
-                            o.kv_page_slots = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
-                            // ⭐ TAGGED WITH ITS ROW, and it has to be. Untagged, this op took the page from the
-                            // LAUNCH's position — fine while the address carried a request term, because then the row
-                            // was already in the address. That term is gone: a page holds slots, so the ONLY thing that
-                            // says which page this row's token lands in is the tag, which `nonfold_page_delta` turns
-                            // into that row's page through the host's block table.
-                            o.kv_request = req;
-                            // The page part: the runtime aims it `p` pages past the cursor's (see above).
-                            o.kv_slot_offset = p * page;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // ── (5) RE-TRANSPOSE the resident Kᵀ cache from the natural kc the cachewr just wrote, so NEXT
-    // step's prefix score reads this step's new K too (hd==stick only — guarded above).
-    //
-    // ONE RE-TRANSPOSE PER (REQUEST, KV-HEAD) — not one for the whole batch.
-    //
-    // This loop used to run over kv-heads only, so a batch of 8 re-transposed ONE page: the one
-    // `pool.write_base(kvh, hd)` names, which after the shim's per-op shift is request 0's. Every
-    // other request's freshly-written K therefore never reached `kct`, so its NEXT step scored the
-    // prefix against a stale Kᵀ.
-    //
-    // AND THE REQUEST IS THE ADDRESS, NOT A TAG — so the batch's re-transposes are ONE launch.
-    //
-    // Flat product loop (not nested) so the body below keeps the indentation — and the shape — of the
-    // whole-page form it is otherwise unchanged from.
-    //
-    // ⭐ AND ONE PER PAGE PART, PART-MAJOR — the window's second page holds natural K the cache write
-    // just wrote, and its Kᵀ is as stale as the first page's was. A whole-page re-transpose is already
-    // the per-page form, so a part is the same op aimed `p` pages on (`kv_slot_offset`), skipped with
-    // its cache write when the request holds no such page.
-    let kct_reqs = if per_request { mq } else { 1 };
-    for (p, req, kvh) in (0..parts)
-        .flat_map(|p| (0..kct_reqs).map(move |r| (p, r)))
-        .flat_map(|(p, r)| (0..nkvh).map(move |k| (p, r, k)))
-    {
-        let rq = if per_request {
-            format!("_r{req}")
-        } else {
-            String::new()
-        };
-        let pt = part_tag(p);
-        // WHOLE-PAGE re-transpose, structurally the proven full-`cap` form with the page (equal to
-        // that cap) substituted — NOT the slab-granular variant, whose on-card attempt regressed
-        // decode. Source and destination take the identical `layer + page` shift, which is why
-        // natural K lives in the page rather than a segment of its own.
-        ops.push(assemble_restickify_kt_2d(
-            &format!("attn_kctpost{kvh}{rq}{pt}_o{t}"),
-            crate::sdsc_abstract::KtTileSlots::of_page(),
-            crate::sdsc_abstract::KtTileFeats::of_head_dim(hd),
-            kc,
-            // The two planes are the whole content of this op: it reads natural K and writes Kᵀ, both at
-            // the same `(kv head)` block of the page the launch was shifted to.
-            crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
-                crate::sdsc_abstract::KvPlane::Knat,
-                kv_head_of(kvh, nkvh)?,
-            ))),
-            kct,
-            crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
-                crate::sdsc_abstract::KvPlane::Kt,
-                kv_head_of(kvh, nkvh)?,
-            ))),
-            sym_id_base,
-            layout,
-        ));
-        // ⭐ TAGGED WITH ITS ROW, for the same reason the cache writes are: this op reads natural K and
-        // writes Kᵀ within ONE row's page, and with no request term left in the address the tag is the only
-        // thing that tells the runtime which page that is.
-        if let Some(o) = ops.last_mut() {
-            o.kv_request = req;
-            o.kv_slot_offset = p * page;
-        }
-    }
-
-    Ok(ops)
-}
-
 /// main's PREFILL LAST-ROW EXTRACTION — the first half of `lower_prefill_lm_head_at_m1`
 /// (main `lower_subtile_tape_to_superdsc.rs:10496-10534`), verbatim below its door.
 ///
@@ -4805,6 +3659,26 @@ pub struct MatmulProof {
 
 /// [`matmul`] with the weight orientation PROVEN by the caller instead of assumed — see
 /// [`super::whole_function::matmul_b_orientation`], which reads it off the op's own `indexing_maps`.
+/// A WINDOWED matmul emission mints its operand [`Win`](crate::addr::Win)s through the
+/// PLACEMENT authority (`BundleLayout::win` — the tensor's declared shape AND its placement
+/// footprint, the same `resolve_seg_base` arms), so the mint and the bake-time guard read one
+/// window model. The shape authority (`View::win`) is not a substitute HERE: its nest would be
+/// a door-local reconstruction of numbers the caller already stated, a fourth mint in all but
+/// name — so a windowed emission with no `BundleLayout` at hand is refused by name rather than
+/// minted against nothing.
+fn mint_window<'a, K: crate::sdsc_abstract::KindTag>(
+    layout: &BundleLayout,
+    stk: &'a crate::sdsc_abstract::Stk<K>,
+    off: crate::addr::DevOff,
+    rows: u32,
+    cols: u32,
+    what: &str,
+) -> Result<crate::addr::Win<'a, K>, Error> {
+    layout
+        .win(stk, off, rows, cols, what)
+        .map_err(|message| Error { message })
+}
+
 pub fn matmul_oriented(
     name: &str,
     r: &[Region],
@@ -5138,18 +4012,69 @@ pub fn matmul_oriented(
                 ));
             }
         }
+        // ⭐⭐⭐ THE TYPED OPERAND WINDOWS — identity, offset and sweep extents minted as ONE
+        // value through the placement authority, at the door where `n_dev` was computed. The
+        // handles declare the TENSORS (the regions' own view extents — what the placements
+        // hold); the WINS carry the SWEEPS: A `[m, k]` logical, W `[k, n_dev]` and O `[m, n_dev]`
+        // at the DEVICE width, so what the mint checks is the pad law's own product. With the
+        // floor test's aligned-`n` fix reverted, the #717 pad (n_dev 512 sweeping a 64-column
+        // window of new_v at kvh·64) fails HERE — an expansion-time `Err` naming `for_matmul`
+        // and the operand — instead of surviving to the bake's footprint audit.
+        let Some(layout_ref) = layout else {
+            return err(format!(
+                "{op_name}: a WINDOWED matmul emission requires the placement authority — the \
+                 operand windows are minted through `BundleLayout::win`, which checks each \
+                 sweep against the tensor's declared shape and its placement footprint. No \
+                 `BundleLayout` is at hand at this door, so there is no authority to mint the \
+                 windows against."
+            ));
+        };
+        let a_stk = rb(&a.name(), a.v_rows, a.v_cols);
+        let w_stk = Stk::<KernelTag>::kernel(k_full as usize, n_full as usize, &w_name);
+        // ⭐ THE OUTPUT HANDLE DECLARES THE UNION OF THE VIEW AND THE DEVICE SWEEP —
+        // `v_cols.max(n_dev)` — because the walk reserves a matmul intermediate at its DEVICE
+        // width while its REGION stays logical (whole_function's own law: the placement is
+        // synthed at `[dims[0], for_matmul(...)]`, the region carries the program's stated
+        // extents). A 1-wide logical output stick-fills to a 64-lane device sweep — the view
+        // ALONE would understate the tensor the placement holds and refuse the pad as a
+        // defect; the device width ALONE would refuse a corner-0 window into a WIDER view
+        // (the per-head slice of a concat). The union is the buffer these windows live in,
+        // and the placement remains the byte authority either way.
+        let o_stk = rb(&out.name(), out.v_rows, out.v_cols.max(n_dev));
+        let a_win = mint_window(
+            layout_ref,
+            &a_stk,
+            a_off,
+            m,
+            k,
+            &format!("{op_name} activation (A): the whole-function door's [m, k] sweep"),
+        )?;
+        let w_win = mint_window(
+            layout_ref,
+            &w_stk,
+            w_off,
+            k,
+            n_dev,
+            &format!(
+                "{op_name} weight (W): DeviceWidth::for_matmul(m={m}, n={n}, k={k}, windowed) \
+                 swept the kernel at the device width {n_dev} — a pad past the placement is \
+                 refused at this mint"
+            ),
+        )?;
+        let o_win = mint_window(
+            layout_ref,
+            &o_stk,
+            o_off,
+            m,
+            n_dev,
+            &format!("{op_name} output (O): the device-width [m, {n_dev}] write sweep"),
+        )?;
         assemble_matmul_windowed(
             &op_name,
-            MatM::of_token_rows(m),
-            MatN::of_out_features(n_dev),
-            MatK::of_in_features(k),
-            &rb(&a.name(), m, k),
-            a_off,
-            &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, &w_name),
-            w_off,
+            &a_win,
+            &w_win,
             k_full,
-            &rb(&out.name(), m, n_dev),
-            o_off,
+            &o_win,
             sym_id_base,
             layout,
         )
@@ -5192,6 +4117,19 @@ pub fn matmul_oriented(
 /// tile-extent door to carry the padded-vs-logical extents apart, neither of which exists here. It is
 /// out of scope of an entry point, deliberately.
 ///
+/// ⭐⭐⭐ AND A WINDOW, WHEN THE PROGRAM STATES ONE — the grid-trip form a paged Kᵀ plane needs. An
+/// unrolled trip transposes ONE page part of a K plane (`[page, hd]` rows of the head's slice) into
+/// the matching columns of the Kᵀ scratch, and its regions carry the part's corners. The door takes
+/// the pointwise arms' two bases ([`pointwise_rows`]' law, stated for the swap): a program whose
+/// tiles TILE its view keeps this door's original whole-tensor form, guards verbatim and
+/// byte-identical; a single window at a corner emits the WINDOW at `rc_of` corners over each
+/// region's OWN view, with the physical row counts declared when either side's row window is partial
+/// (the torch-spyre `arg.device_size` law, plus the `N_` rewrite the card's residency reconstruction
+/// reads — see `super::try_assemble_restickify_transpose_2d`). The window's output must be its input
+/// TRANSPOSED — the correspondence law — and every corner along a side's stick axis must be a whole
+/// stick. Neither basis is a loosening: a cover that is neither a tiling nor a single window is
+/// refused by name, and the two sides must state the same basis.
+///
 /// ⛔ THE REFUSAL IS HERE AND NOT ONLY IN THE ASSEMBLER. [`super::assemble_transpose`] `panic!`s on a
 /// bad extent (every `assemble_*` in that file does — they are called from a `#[forward]` expansion,
 /// where a panic IS the build error). A producer crossing this door gets an `Error` it can report
@@ -5212,118 +4150,258 @@ pub fn transpose(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    let (ins, out) = split_out(name, r, layout, 1)?;
+    // ⭐⭐⭐ THE WINDOWED SPLIT — [`split_regions`], not [`split_out`]: a windowed transpose's input
+    // carries a ROW corner (an unrolled trip's page part of a K plane) and its output the SAME
+    // corner transposed (the matching columns of the Kᵀ scratch), and this emission PLACES both
+    // through `rc_of` — the same door the windowed pointwise arm splits through. `base_addressed`'s
+    // law does not lapse: the fold basis below still refuses a row corner it cannot place, and the
+    // window basis refuses any corner pair that is not the transposed window by name.
+    let (ins, out) = split_regions(name, r, layout, 1, &[])?;
     let a = ins[0];
-    // The INPUT's view IS the op's `[rows, cols]`: the builder iterates the input shape and the
-    // output is its transpose. Read from the input so the two cannot be read from the same place and
-    // agree vacuously.
-    let (mb, cols) = (a.v_rows, a.v_cols);
-    // ⛔⛔⛔ THE STICK LAW, FIRST, so the historically fatal shape can never fall past it into a
-    // shape complaint about something else.
     let stk = Fp16::ELEMS_PER_STICK;
-    if mb == 0 || cols == 0 || !mb.is_multiple_of(stk) || !cols.is_multiple_of(stk) {
-        return err(format!(
-            "{name}: transposing t{} `[{mb}, {cols}]` into t{} `[{cols}, {mb}]` — BOTH extents must \
-             be whole multiples of the {stk}-element SEN169_FP16 stick and {} is not. This relayout \
-             sticks its INPUT on the column extent and its OUTPUT on the row extent — the two axes \
-             swap, which is the transposition — so each extent is a stick extent of one side; \
-             a sub-stick tile is refused by the dxp scheduler (L3DlOpsScheduler:1040), and the on-card \
-             ReStickify that was asked for the per-step `[1, {stk}]` key anyway wrote the SECOND \
-             transposed stick wrong and garbled decode past {stk} tokens. Pad the offending extent up \
-             to a multiple of {stk} and loop whole {stk}x{stk} tiles, which is what the shipped \
-             attention does (it pads its row count and emits one single-stick transpose per \
-             sub-block). A padded destination for the unaligned extent is a separate shape law with \
-             its own typed tile extents; this entry point does not guess one.",
-            a.tid,
-            out.tid,
-            match (
-                mb.is_multiple_of(stk) && mb != 0,
-                cols.is_multiple_of(stk) && cols != 0
-            ) {
-                (false, false) => format!("neither ({mb} rows, {cols} columns)"),
-                (false, true) => format!("the row extent {mb}"),
-                _ => format!("the column extent {cols}"),
-            },
-        ));
-    }
     // The OUTPUT's own view must BE the transpose. Otherwise the descriptor would write a shape the
-    // program never declared — and the two extents would still be stick-aligned, so nothing above
-    // catches it.
-    if (out.v_rows, out.v_cols) != (cols, mb) {
+    // program never declared — and the two extents would still be stick-aligned, so nothing below
+    // catches it. Common to both bases, so it is stated before the basis is chosen.
+    if (out.v_rows, out.v_cols) != (a.v_cols, a.v_rows) {
         return err(format!(
-            "{name}: reads t{} `[{mb}, {cols}]` and writes t{} `[{}, {}]` — a transpose's output view \
-             is its input's, swapped (`[{cols}, {mb}]`). The descriptor iterates the INPUT shape and \
+            "{name}: reads t{} `[{}, {}]` and writes t{} `[{}, {}]` — a transpose's output view \
+             is its input's, swapped (`[{}, {}]`). The descriptor iterates the INPUT shape and \
              carries the reorder on the output's own stick order, so it cannot reshape as well.",
-            a.tid, out.tid, out.v_rows, out.v_cols,
+            a.tid, a.v_rows, a.v_cols, out.tid, out.v_rows, out.v_cols, a.v_cols, a.v_rows,
         ));
     }
-    // WHOLE VIEWS, BOTH SIDES: `assemble_transpose` takes two NAMES and two extents, no corner and no
-    // window — the same base-addressing fact [`base_addressed`] states for rows, in the column
-    // direction too. A windowed transpose is a different descriptor, so a stated window is refused
-    // rather than silently widened to the buffer.
-    for (x, role) in [(a, "input"), (out, "output")] {
-        if x.c_start != 0 || x.c_len != x.v_cols {
-            return err(format!(
-                "{name}: the {role} t{} takes columns {}..{} of its `[{}, {}]` view — \
-                 the relayout builder names a tensor and its two extents, with no column corner and \
-                 no window, so it transposes the WHOLE buffer. Materialize the window first.",
+    // ⭐⭐⭐ THE BASIS — the pointwise arms' law ([`pointwise_rows`]), stated for the swap. A
+    // program whose access tiles TILE its view is a FOLDED program: one descriptor spans the view
+    // entire, at zero corners. A grid trip takes ONE window at a corner this trip owns: the
+    // descriptor spans the window and the corners ride `rc_of`. A cover that is neither — several
+    // disjoint rectangles — is a program shape one relayout descriptor cannot serve, and is refused
+    // by name rather than folded. `true` = folded.
+    let basis_of = |x: &Region, role: &str| -> Result<bool, Error> {
+        if x.r_cover == (0, x.v_rows) && x.c_cover == (0, x.v_cols) {
+            Ok(true)
+        } else if x.r_cover == (x.r_start, x.r_start + x.r_len)
+            && x.c_cover == (x.c_start, x.c_start + x.c_len)
+        {
+            Ok(false)
+        } else {
+            err(format!(
+                "{name}: the {role} t{}'s access tiles cover rows {}..{} and columns {}..{} of its \
+                 `[{}, {}]` view in a first block of `[{r_len}, {c_len}]` — neither a row-blocked \
+                 program one descriptor can fold (windows tiling the view) nor a grid trip's single \
+                 window at a corner. The relayout sweeps one rectangle; this program states several.",
                 x.tid,
-                x.c_start,
-                x.c_start + x.c_len,
+                x.r_cover.0,
+                x.r_cover.1,
+                x.c_cover.0,
+                x.c_cover.1,
                 x.v_rows,
                 x.v_cols,
+                r_len = x.r_len,
+                c_len = x.c_len,
+            ))
+        }
+    };
+    let (a_folded, out_folded) = (basis_of(&a, "input")?, basis_of(&out, "output")?);
+    if a_folded != out_folded {
+        return err(format!(
+            "{name}: the input t{} and the output t{} are on different bases — one side's access \
+             tiles tile its view while the other's take a single window. A relayout reads and \
+             writes the SAME rectangle with its axes swapped, so the two sides must state it the \
+             same way",
+            a.tid, out.tid,
+        ));
+    }
+    if a_folded {
+        // ── THE FOLD BASIS: the door's original whole-tensor form, guards verbatim. ──
+        // The INPUT's view IS the op's `[rows, cols]`: the builder iterates the input shape and the
+        // output is its transpose. Read from the input so the two cannot be read from the same place
+        // and agree vacuously.
+        let (mb, cols) = (a.v_rows, a.v_cols);
+        // ⛔⛔⛔ THE STICK LAW, FIRST, so the historically fatal shape can never fall past it into a
+        // shape complaint about something else.
+        if mb == 0 || cols == 0 || !mb.is_multiple_of(stk) || !cols.is_multiple_of(stk) {
+            return err(format!(
+                "{name}: transposing t{} `[{mb}, {cols}]` into t{} `[{cols}, {mb}]` — BOTH extents must \
+                 be whole multiples of the {stk}-element SEN169_FP16 stick and {} is not. This relayout \
+                 sticks its INPUT on the column extent and its OUTPUT on the row extent — the two axes \
+                 swap, which is the transposition — so each extent is a stick extent of one side; \
+                 a sub-stick tile is refused by the dxp scheduler (L3DlOpsScheduler:1040), and the on-card \
+                 ReStickify that was asked for the per-step `[1, {stk}]` key anyway wrote the SECOND \
+                 transposed stick wrong and garbled decode past {stk} tokens. Pad the offending extent up \
+                 to a multiple of {stk} and loop whole {stk}x{stk} tiles, which is what the shipped \
+                 attention does (it pads its row count and emits one single-stick transpose per \
+                 sub-block). A padded destination for the unaligned extent is a separate shape law with \
+                 its own typed tile extents; this entry point does not guess one.",
+                a.tid,
+                out.tid,
+                match (
+                    mb.is_multiple_of(stk) && mb != 0,
+                    cols.is_multiple_of(stk) && cols != 0
+                ) {
+                    (false, false) => format!("neither ({mb} rows, {cols} columns)"),
+                    (false, true) => format!("the row extent {mb}"),
+                    _ => format!("the column extent {cols}"),
+                },
             ));
         }
+        // A folded program is base-addressed: one descriptor at zero corners, so a stated row corner
+        // is a fact it cannot carry ([`base_addressed`]'s own argument, restated here because the
+        // split above no longer states it for the window basis).
+        base_addressed(name, &a, "input 0")?;
+        base_addressed(name, &out, "output")?;
+        // WHOLE COLUMNS, BOTH SIDES: the fold emits one descriptor over each view entire, with no
+        // column corner — a column-blocked program is several windows and is the grid's to state,
+        // not this basis's to fold.
+        for (x, role) in [(a, "input"), (out, "output")] {
+            if x.c_start != 0 || x.c_len != x.v_cols {
+                return err(format!(
+                    "{name}: the {role} t{} takes columns {}..{} of its `[{}, {}]` view — \
+                     a folded relayout names a tensor and its two extents, with no column corner and \
+                     no window, so it transposes the WHOLE buffer. Materialize the window first.",
+                    x.tid,
+                    x.c_start,
+                    x.c_start + x.c_len,
+                    x.v_rows,
+                    x.v_cols,
+                ));
+            }
+        }
+        // The store windows must TILE the output, exactly as they must for every pointwise body: one
+        // descriptor spans all of it, so a program whose windows do not cover it would leave rows holding
+        // whatever the buffer held. `node_rows` is the shared guard; it answers the output's row extent,
+        // which is the input's column extent by the check above.
+        if node_rows(name, &out)? != cols {
+            return err(format!(
+                "{name}: the output's store windows do not cover its `[{cols}, {mb}]` view"
+            ));
+        }
+        // ⛔⛔⛔ THE RELAYOUT GOES OUT ON THE **RESTICKIFY** DOOR, NOT ON `OpFunc::Transpose`.
+        //
+        // `interslicetranspose_fp16` is the op named for this job and it CANNOT BE TRANSLATED at the
+        // default RCUDD1A arch, at any shape. Its output stick is the 8×8 inter-slice block over
+        // (`out`, `mb`) — TWO dims — and `Ddc::transformForInterSliceRestickify` turns a relayout's output
+        // stick into a dynamic mask over the innermost loop carrying `outputStickDimOrder[0]`, which for a
+        // 2-D tile is the FUSED `loop_dsX_dsY_out_mb`; `SNComputeLowering::constructDynamicMasking` accepts
+        // one loop carrying ONE dim (`SNComputeLowering.cpp:74`). Measured through `dxp_standalone`: every
+        // shape refuses there, including shapes whose core division splits both axes like the golden
+        // `sdsc_interslicetranspose.json` — which is what ruled the core division out as the cause.
+        // `OpFunc::Restickify` does the SAME transposition with a one-dim output stick and is accepted.
+        // See `super::restickify_transpose_opspec_2d`, which states the addressing argument in full, and
+        // `tests/zz_the_transpose_door_carries_a_two_dim_output_stick.rs`, which pins both doors' output sticks.
+        //
+        // ⛔ THE FALLIBLE FORM, because the builder makes a refusal this body cannot pre-check: the
+        // per-core tile must fit LX and this door cannot time-tile, and what the per-core tile IS depends
+        // on `distribute_cores`' answer for this shape. Restating that here would mean duplicating the
+        // divider; a panicking assembler would abort the build with a bare panic where a producer needs an
+        // error against its own op.
+        super::try_assemble_restickify_transpose_2d(
+            &format!("transpose_o{}", out.tid),
+            &super::TransposePlacement::whole(mb, cols),
+            &a.name(),
+            &out.name(),
+            sym_id_base,
+            layout,
+        )
+        .map(|op| vec![op])
+        .map_err(|message| Error {
+            message: format!("{name}: {message}"),
+        })
+    } else {
+        // ── THE WINDOW BASIS: a grid trip's single rectangle, PLACED. ──
+        //
+        // The extents are the WINDOW's — the tile the descriptor moves — and the corners are `rc_of`
+        // over each region's OWN `[v_rows, v_cols]` view: the input's stick-on-last nest and the
+        // output's, which the swap keeps distinct (one `rc_of` cannot serve both sides).
+        let (mb, cols) = (a.r_len, a.c_len);
+        // ⛔⛔⛔ THE STICK LAW, on the WINDOW extents — the same historically fatal shape, and for the
+        // same reason: each window extent is a stick extent of one side (the row extent of the input
+        // is the OUTPUT's stick axis, the column extent the input's own).
+        if mb == 0 || cols == 0 || !mb.is_multiple_of(stk) || !cols.is_multiple_of(stk) {
+            return err(format!(
+                "{name}: transposing the window `[{mb}, {cols}]` of t{} (`[{r_start}, {c_start}]` of its \
+                 `[{v_rows}, {v_cols}]` view) into t{} — BOTH window extents must be whole multiples \
+                 of the {stk}-element SEN169_FP16 stick. The input's row extent is the OUTPUT's stick \
+                 axis and its column extent the input's own, so each is a stick extent of one side; a \
+                 sub-stick tile is refused by the dxp scheduler (L3DlOpsScheduler:1040). Pad the \
+                 offending extent up to a multiple of {stk} and loop whole {stk}x{stk} tiles.",
+                a.tid,
+                out.tid,
+                r_start = a.r_start,
+                c_start = a.c_start,
+                v_rows = a.v_rows,
+                v_cols = a.v_cols,
+            ));
+        }
+        // ⛔⛔⛔ THE WINDOW-CORRESPONDENCE LAW — the output's window is the input's, TRANSPOSED. The
+        // swap maps the input's rows to the output's columns and its columns to the output's rows,
+        // so the store's rectangle must be the load's with its axes swapped — anything else is a
+        // relayout this descriptor cannot state (it would move a rectangle the program never
+        // named), and a row corner unpaired with its transposed column is exactly the
+        // `base_addressed` defect in the window's clothing.
+        if (out.r_start, out.r_len) != (a.c_start, a.c_len)
+            || (out.c_start, out.c_len) != (a.r_start, a.r_len)
+        {
+            return err(format!(
+                "{name}: reads rows {}..{} and columns {}..{} of t{} but stores rows {}..{} and \
+                 columns {}..{} of t{} — a windowed transpose's output window is its input's, \
+                 TRANSPOSED (`[{c_len}, {r_len}]` of the output view). The descriptor moves one \
+                 rectangle with its axes swapped; a store over any other rectangle is a program \
+                 shape it cannot state.",
+                a.r_start,
+                a.r_start + a.r_len,
+                a.c_start,
+                a.c_start + a.c_len,
+                a.tid,
+                out.r_start,
+                out.r_start + out.r_len,
+                out.c_start,
+                out.c_start + out.c_len,
+                out.tid,
+                c_len = a.c_len,
+                r_len = a.r_len,
+            ));
+        }
+        // ⛔ THE CORNERS ALONG EACH SIDE'S STICK AXIS MUST BE WHOLE STICKS. Each side's corner along
+        // its own stick axis aims a stick GROUP in that side's nest, and a sub-stick corner has no
+        // address there — the same law the windowed matmul states for its out-corner. The swap makes
+        // the two corners DIFFERENT facts: the input's column corner `a.c_start` and the output's
+        // column corner `out.c_start` (which is the input's ROW corner, transposed) each aim one
+        // side's groups, so BOTH must be stick-aligned even though only one carries a given axis.
+        if !a.c_start.is_multiple_of(stk) || !out.c_start.is_multiple_of(stk) {
+            return err(format!(
+                "{name}: the window corners are not stick-aligned — the input t{}'s column corner \
+                 {} and the output t{}'s column corner {} (the input's row corner, \
+                 transposed) must each be a whole {stk}-element stick, because each aims a stick \
+                 group in its own side's device nest. Pad the blocking so every window corner is \
+                 stick-aligned.",
+                a.tid, a.c_start, out.tid, out.c_start,
+            ));
+        }
+        // ⭐ THE CORNERS, nest-derived per region — and the physical row counts, stated when either
+        // side's row window is partial (each side's stick-group stride is its own row extent; the
+        // tile's strides would invent rows the allocation does not have). See
+        // `super::TransposePlacement`'s doc for the full three-fact contract.
+        let placement = super::TransposePlacement {
+            rows: a.r_len,
+            cols: a.c_len,
+            in_off: crate::addr::rc_of(a.v_rows, a.v_cols, a.r_start, a.c_start, Df::Fp16),
+            out_off: crate::addr::rc_of(out.v_rows, out.v_cols, out.r_start, out.c_start, Df::Fp16),
+            in_rows_phys: (a.r_len < a.v_rows).then_some(a.v_rows),
+            out_rows_phys: (out.r_len < out.v_rows).then_some(out.v_rows),
+        };
+        super::try_assemble_restickify_transpose_2d(
+            &format!("transpose_o{}", out.tid),
+            &placement,
+            &a.name(),
+            &out.name(),
+            sym_id_base,
+            layout,
+        )
+        .map(|op| vec![op])
+        .map_err(|message| Error {
+            message: format!("{name}: {message}"),
+        })
     }
-    // The store windows must TILE the output, exactly as they must for every pointwise body: one
-    // descriptor spans all of it, so a program whose windows do not cover it would leave rows holding
-    // whatever the buffer held. `node_rows` is the shared guard; it answers the output's row extent,
-    // which is the input's column extent by the check above.
-    if node_rows(name, &out)? != cols {
-        return err(format!(
-            "{name}: the output's store windows do not cover its `[{cols}, {mb}]` view"
-        ));
-    }
-    // The input's access tiles must likewise cover it — `Region::r_len` is block 0's height alone.
-    if a.r_cover != (0, mb) {
-        return err(format!(
-            "{name}: the program's access tiles over its input t{} cover rows {}..{} of a {mb}-row \
-             view — one descriptor transposes all of it, so the windows must tile `0..{mb}`.",
-            a.tid, a.r_cover.0, a.r_cover.1,
-        ));
-    }
-    // ⛔⛔⛔ THE RELAYOUT GOES OUT ON THE **RESTICKIFY** DOOR, NOT ON `OpFunc::Transpose`.
-    //
-    // `interslicetranspose_fp16` is the op named for this job and it CANNOT BE TRANSLATED at the
-    // default RCUDD1A arch, at any shape. Its output stick is the 8×8 inter-slice block over
-    // (`out`, `mb`) — TWO dims — and `Ddc::transformForInterSliceRestickify` turns a relayout's output
-    // stick into a dynamic mask over the innermost loop carrying `outputStickDimOrder[0]`, which for a
-    // 2-D tile is the FUSED `loop_dsX_dsY_out_mb`; `SNComputeLowering::constructDynamicMasking` accepts
-    // one loop carrying ONE dim (`SNComputeLowering.cpp:74`). Measured through `dxp_standalone`: every
-    // shape refuses there, including shapes whose core division splits both axes like the golden
-    // `sdsc_interslicetranspose.json` — which is what ruled the core division out as the cause.
-    // `OpFunc::Restickify` does the SAME transposition with a one-dim output stick and is accepted.
-    // See `super::restickify_transpose_opspec_2d`, which states the addressing argument in full, and
-    // `tests/zz_the_transpose_door_carries_a_two_dim_output_stick.rs`, which pins both doors' output sticks.
-    //
-    // ⛔ THE FALLIBLE FORM, because the builder makes a refusal this body cannot pre-check: the
-    // per-core tile must fit LX and this door cannot time-tile, and what the per-core tile IS depends
-    // on `distribute_cores`' answer for this shape. Restating that here would mean duplicating the
-    // divider; a panicking assembler would abort the build with a bare panic where a producer needs an
-    // error against its own op.
-    super::try_assemble_restickify_transpose_2d(
-        &format!("transpose_o{}", out.tid),
-        mb,
-        cols,
-        &a.name(),
-        &out.name(),
-        sym_id_base,
-        layout,
-    )
-    .map(|op| vec![op])
-    .map_err(|message| Error {
-        message: format!("{name}: {message}"),
-    })
 }
 
 /// A program's TENSOR inputs (in parameter order) and its output.
@@ -5681,6 +4759,201 @@ mod elementwise_tests {
         assert!(
             e.message.contains("SPRAY") || e.message.contains("spray"),
             "names what it would be: {}",
+            e.message
+        );
+    }
+
+    // ── THE BROADCAST ARM'S DENSE OPERANDS AND OUTPUT CARRY THEIR OWN WINDOWS ────────────────
+    //
+    // ⭐⭐⭐ THE ONE-K MULF IS WHY. `one_k_dot_to_mul` (triton-ktir, 9403f61d2) rewrites attn.py's
+    // decode value leg `tl.dot(w_d, vd)` — K=1 — into `broadcast(w_d) · vd`, and the vd leg is
+    // head h's `[MQ, HD]` window at column `kvh·HD` of the `[NEW_LEN, NKVH·HD]` V buffer: a DENSE
+    // operand at a column corner beside a broadcast one. The blanket corner guard this module's
+    // refusals above used to state predates that pass by three days and claimed "one never reaches
+    // them from this front end" — the transposed-B dots were refusing the walk earlier, so nothing
+    // saw the shape until the plain-B restatement cleared them. The DENSE operands and the OUTPUT
+    // now take the dense arm's own per-operand window forms; the BROADCAST operands and the
+    // per-row width keep the whole-tensor contract, refused by name below.
+
+    /// One WINDOWED operand: head h's `[rows, cols]` window at column `c` of a `[rows, v_cols]`
+    /// view — the shape `windowed_region` reports for vd's per-head load (`attn.py`'s
+    /// `vd_desc.load([KD_ROW, KD_COL + kvh * HD])`, granite-2b decode: `[1, 64]` at column
+    /// `kvh·64` of the `[1, 512]` V buffer).
+    fn win(tid: u32, rows: u32, v_cols: u32, c: u32, cols: u32, is_out: bool) -> Region {
+        Region {
+            tid,
+            v_rows: rows,
+            v_cols,
+            r_start: 0,
+            c_start: c,
+            r_len: rows,
+            c_len: cols,
+            r_cover: (0, rows),
+            c_cover: (0, v_cols),
+            is_out,
+            is_fp8: false,
+        }
+    }
+
+    /// ⭐ THE ONE-K MULF ITSELF — a Col-broadcast scalar times head 1's vd window, out a minted
+    /// corner-0 intermediate (the walk mints the mulf's result; the consumer addf takes the store
+    /// window). The dense operand's binding must carry ITS window (element 64 of the V buffer),
+    /// which is exactly what the old blanket guard refused and the class law
+    /// (`column_windows_are_honoured`) holds every other windowed operand to.
+    #[test]
+    fn a_dense_operand_beside_a_broadcast_carries_its_window() {
+        let r = node(
+            reg(5, 1, 1, false),           // w_d: the [1, 1] per-row scalar
+            win(6, 1, 512, 64, 64, false), // vd: head 1's [1, 64] at column 64 of [1, 512]
+            reg(7, 1, 64, true),           // the minted [1, 64] intermediate, corner 0
+        );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "mul_s7",
+            Elementwise::Mul,
+            &r,
+            &[Some(BcastAxis::Col), None],
+            &mut sym,
+            None,
+        )
+        .expect("the one-K mulf: a broadcast scalar times a windowed dense operand");
+        assert_eq!(
+            ops.len(),
+            1,
+            "an operand mode plus a window is not a decomposition"
+        );
+        assert_eq!(ops[0].op_name, "multiply_o7");
+        let vd = ops[0]
+            .arg_bindings
+            .iter()
+            .find(|b| b.buffer == "t6")
+            .expect("the dense operand is bound");
+        assert_eq!(
+            vd.offset_elems, 64,
+            "vd is addressed at head 1's window, not the buffer base — the old guard's blanket \
+             refusal would have had no answer for this op at all"
+        );
+        let w = ops[0]
+            .arg_bindings
+            .iter()
+            .find(|b| b.buffer == "t5")
+            .expect("the broadcast operand is bound");
+        assert_eq!(
+            w.offset_elems, 0,
+            "the broadcast operand stays at its own extent's base"
+        );
+    }
+
+    /// ⭐ THE OUTPUT TOO — a multi-stick broadcast op whose OUT is the store window (the epilogue
+    /// form: `out / l[:, None]` writing head h's columns). The output binding carries the window.
+    #[test]
+    fn a_broadcast_op_writes_its_outputs_window() {
+        let r = node(
+            reg(5, 1, 1, false),
+            reg(6, 1, 64, false),
+            win(7, 1, 512, 64, 64, true), // out: head 1's [1, 64] store window at column 64
+        );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "mul_s7",
+            Elementwise::Mul,
+            &r,
+            &[Some(BcastAxis::Col), None],
+            &mut sym,
+            None,
+        )
+        .expect("the output window is the dense arm's own per-operand form");
+        assert_eq!(ops.len(), 1);
+        let o = ops[0]
+            .arg_bindings
+            .iter()
+            .find(|b| b.buffer == "t7" && !b.is_input)
+            .expect("the output is bound");
+        assert_eq!(o.offset_elems, 64, "the write lands in head 1's columns");
+    }
+
+    /// ⭐ THE BYTE-IDENTITY CONTROL — the same op corner-free keeps every offset at 0, so nothing
+    /// the old guard admitted changes its bytes. This is the control that makes the two tests
+    /// above non-vacuous: the door did not start writing offsets everywhere, it routes on the
+    /// stated corner exactly as the dense arm does.
+    #[test]
+    fn a_corner_free_broadcast_op_keeps_every_offset_at_zero() {
+        let r = node(
+            reg(5, 1, 1, false),
+            reg(6, 1, 64, false),
+            reg(7, 1, 64, true),
+        );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "mul_s7",
+            Elementwise::Mul,
+            &r,
+            &[Some(BcastAxis::Col), None],
+            &mut sym,
+            None,
+        )
+        .expect("the corner-free form is the arm's ordinary case");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op_name, "multiply_o7");
+        assert!(
+            ops[0].arg_bindings.iter().all(|b| b.offset_elems == 0),
+            "no corner stated, no offset emitted"
+        );
+    }
+
+    /// ⛔ THE PER-ROW WIDTH KEEPS THE ORIGINAL REFUSAL — a one-column output writes lane 0 of a
+    /// one-stick output at the buffer base, and neither a column window nor a band is stateable
+    /// there. The blanket guard's own case, unchanged.
+    #[test]
+    fn a_per_row_width_with_a_corner_is_still_refused() {
+        let r = node(
+            reg(5, 4, 1, false),
+            win(6, 4, 128, 64, 1, false), // a [4, 1] window at column 64
+            reg(7, 4, 1, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "add_s7",
+            Elementwise::Add,
+            &r,
+            &[Some(BcastAxis::Col), None],
+            &mut sym,
+            None,
+        ) else {
+            panic!("a one-column output cannot place a windowed operand")
+        };
+        assert!(
+            e.message.contains("whole-tensor regions"),
+            "the original guard's own refusal, verbatim: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ AND A BROADCAST OPERAND WITH A CORNER IS REFUSED BY NAME — `In::col`/`In::mb` state no
+    /// offset, so a cornered broadcast source would be read at the buffer base. The walk's
+    /// intermediates and reductions are whole-tensor, so nothing real reaches this; the refusal
+    /// keeps it that way.
+    #[test]
+    fn a_broadcast_operand_with_a_corner_is_refused_by_name() {
+        let r = node(
+            win(5, 1, 64, 64, 1, false), // the [1, 1] scalar marked Col, AT a corner
+            reg(6, 1, 64, false),
+            reg(7, 1, 64, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "mul_s7",
+            Elementwise::Mul,
+            &r,
+            &[Some(BcastAxis::Col), None],
+            &mut sym,
+            None,
+        ) else {
+            panic!("a broadcast operand cannot carry a corner — its mode states no offset")
+        };
+        assert!(
+            e.message.contains("t5") && e.message.contains("broadcast"),
+            "names the operand and why its mode cannot place it: {}",
             e.message
         );
     }
@@ -6139,9 +5412,15 @@ mod elementwise_tests {
         ) else {
             panic!("a broadcast arm at a column corner must refuse")
         };
+        // ⭐ THE GUARD IS SPLIT, NOT LIFTED: a broadcast OPERAND still cannot carry a corner
+        // (`In::col`/`In::mb` state no offset — the refusal names the mode), while the DENSE
+        // operands and the output beside it now take the dense arm's per-operand windows (the
+        // one-K mulf, `one_k_dot_to_mul`'s product). This case is the broadcast-operand half.
         assert!(
-            e.message.contains("column corner"),
-            "names the corner and the arm: {}",
+            e.message.contains("t6")
+                && e.message.contains("broadcast")
+                && e.message.contains("buffer base"),
+            "names the operand, its mode, and the mis-address it refuses: {}",
             e.message
         );
         // The per-row chain: a `[rows, 1]` output at a corner (a binary Sub, the softmax's
@@ -7441,10 +6720,18 @@ pub fn reduce(
             data.tid
         ));
     }
-    // ⭐ THE WIDE MULTI-ROW MAX PASSES THROUGH — the guard that used to refuse it here was built
-    // on a misread diagnostic and is deleted; the corrected law (with the DDL citations and the
-    // card gate that arbitrates) is this function's own doc above. The shape checks below are
-    // unchanged and still refuse everything that is not a well-formed row reduction.
+    // ⭐ THE REDUCE DOES NOT TAKE THE POINTWISE DEVICE-WIDTH LAW — it has its own, better one.
+    // This arm once pre-rounded `cols` through [`pointwise_device_cols`] (the same sub-stick
+    // dxp-scheduler refusal the pointwise arms patch), but the reduce family now pads an
+    // unaligned reduced width up to the stick extent ITSELF and masks the pad lanes with the
+    // reduce's identity const (`reduce_stick_elems` + `reduce_coordinate_mask`, the vendor's
+    // own `coordinateMasking_` form). Pre-rounding here would hand that machinery an
+    // already-aligned `cols`, the pad delta would read as zero, and NO MASK WOULD BE EMITTED —
+    // the pad lanes would ride as whatever the buffer holds, the exact zeros-read defect the
+    // mask exists to kill (MEASURED as the composition failure: the padded wide-max door test
+    // asserted `{"out":[[514,62]]}` and got `{}`). The logical `cols` goes through whole, and
+    // the stick-rounded placement width the old law read is never smaller than the padded
+    // extent (the allocator hands out whole sticks), so the padded read cannot overrun.
     // A `[rows, 1]` accumulator: the reduce writes one value per row.
     if out.c_len != 1 {
         return err(format!(

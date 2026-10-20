@@ -66,7 +66,7 @@ pub(crate) fn run_prefill_batch(
     // `None` for a prompt chunk, whose rows share `start` and read one broadcast row — and whose launch
     // declares no fold, so there is no decode-shaped value for it to carry.
     // ⭐ AND WHEN THE STEP's BODY IS A BATCH CHUNK, ITS LAW INSTEAD OF THE FOLD's GRID: the mask is then
-    // ONE per-row block every row block reads (`BatchPrefix::Chunk`), not a block per pass.
+    // Fold-pass blocks, one per pass.
     per_request: Option<(
         &scratchy_subtile::sdsc_abstract::LiveBatch,
         scratchy_subtile::sdsc_abstract::BatchPrefix,
@@ -330,13 +330,6 @@ pub(crate) fn run_prefill_batch(
     // pass per (request, page) and `fold_delta` steps the mask one block per pass.
     let histories = per_request.as_ref().map(|(rows, _)| rows.mask_histories());
     let prefix_src = match (&per_request, &histories) {
-        // ⭐ A BATCH CHUNK BODY: one per-row block, from the law the emitter baked the read with.
-        (Some((_, scratchy_subtile::sdsc_abstract::BatchPrefix::Chunk(bc))), Some(hs)) => {
-            Some(scratchy_target_spyre::forward_tape::PrefixSource::Chunk {
-                chunk: *bc,
-                histories: hs,
-            })
-        }
         (Some((_, scratchy_subtile::sdsc_abstract::BatchPrefix::Fold(fold))), Some(hs)) => {
             use scratchy_subtile::sdsc_abstract::PrefixMaskShape;
             // THE SAME SHAPE THE EMITTER READ, from the pool's page width — the emitter blocks the
@@ -813,118 +806,6 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
     }
 }
 
-// ⛔ `sendnn`-ONLY. This was lost when the decode binder was rewritten: a script inserted
-// `ForwardLauncher` just above by walking back over `///` lines but NOT `#[...]`, so it landed
-// between this `#[cfg]` and the fn it guarded and the attribute attached to the launcher instead.
-// Invisible under `-Fsendnn`; it broke the KTIR-only build, which is exactly what `8bd5c755b` had
-// just repaired.
-#[cfg(feature = "spyre-hw")]
-/// What a chunk body attends, for [`chunk_index_table`]: the keys resident before it (positions
-/// `0..resident`, which the chunk must hold) and the slots whose pages its table names.
-///
-/// ⛔ EACH ITEM CARRIES ITS OWN `#[cfg]` — see the note above: an item inserted under another's
-/// attribute takes it, and the item it guarded is left ungated.
-struct ChunkKeys {
-    resident: usize,
-    mapped: u32,
-    /// Whose rows the body attends with. It decides the value leg's entry order
-    /// (`ChunkScratch::lx_form`), and the bake took it from the same fact.
-    rows: scratchy_subtile::sdsc_abstract::ChunkRowKind,
-}
-
-#[cfg(feature = "spyre-hw")]
-/// ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK'S INDEX TABLE — for the two bodies whose rows share ONE resident
-/// history: the one-request decode and a prompt chunk's prefix. The body that will RUN (`step`) names
-/// its chunk by its swept extent (`pages * PAGE_SLOTS`, the rung the macro recorded), so the table is
-/// built for exactly that chunk — a table for another width names blocks the copies do not read and
-/// leaves the ones they do at zero. `None` when the body gathers nothing.
-///
-/// The keys (see [`ChunkKeys`]) must all lie inside the chunk: `select_body` chose the smallest rung
-/// covering them, so a shortfall means the ladder stopped below this context — attending a prefix that
-/// ends early — and it refuses.
-///
-/// The pages are `req.page_map(ctx, want)` — the very map the launch installed, holes served from the
-/// pool's reserved range included — so the table the card reads and the map the cache write used are one
-/// derivation. A chunk wider than the map repeats the LAST real page; the broadcast validity row (over
-/// logical slots, exactly the order the chunk gathers) silences those slots, the reference's pad-up law.
-///
-/// ⛔ EVERY FAILURE REFUSES, never a zero table: an unstaged entry reads ZERO, and zero is a VALID block
-/// — page 0's keys, fluently wrong.
-fn chunk_index_table(
-    what: &str,
-    // ⭐ THE POOL'S GEOMETRY, threaded from `Loaded` — `Shared` carries no kv width BY DESIGN (a
-    // hybrid-attention arch has no single one), and the pool is the one lawful model-wide use (see
-    // `Loaded::kv_dim`). The same two numbers the batched-decode site reads off the model.
-    pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
-    session: &SuperDscSession,
-    step: scratchy_target_spyre::superdsc_exec::StepBody,
-    req: &ReqState,
-    ctx: PageMapCtx<'_>,
-    keys: ChunkKeys,
-) -> ExecutorResult<Option<Vec<scratchy_subtile::sdsc_abstract::GatherEntry>>> {
-    let ChunkKeys {
-        resident,
-        mapped,
-        rows,
-    } = keys;
-    if !step.gathers().get() {
-        return Ok(None);
-    }
-    const PER_PAGE: u32 = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
-    let swept = step.swept().get();
-    let chunk_pages = swept / PER_PAGE;
-    if !swept.is_multiple_of(PER_PAGE) || (chunk_pages as usize) * (PER_PAGE as usize) < resident {
-        return Err(werr(format!(
-            "{what}: the chunk body sweeps {swept} slot(s) — not a whole number of {PER_PAGE}-slot \
-             pages, or fewer slots than the {resident} resident key(s). The chunk ladder's top rung \
-             ({} pages) is below this context.",
-            scratchy_subtile::sdsc_abstract::ChunkScratch::PAGES_MAX
-        )));
-    }
-    let per_page = session.gather_entries_per_page(pool).ok_or_else(|| {
-        werr(format!(
-            "{what}: this bundle emits a GATHERED KV read, but a physical page is not a whole number \
-             of STICK BLOCKS — no integer index can name a page boundary"
-        ))
-    })?;
-    let scratch = scratchy_subtile::sdsc_abstract::ChunkScratch::of_chunk(pool, chunk_pages)
-        .ok_or_else(|| {
-            werr(format!(
-                "{what}: a {chunk_pages}-page chunk is not expressible at this geometry, but the bake \
-                 emitted one — the bake and the host disagree about the chunk"
-            ))
-        })?;
-    let want = scratchy_subtile::sdsc_abstract::RowPages::holding(
-        scratchy_subtile::sdsc_abstract::SlotCount::new(mapped),
-    );
-    let map = req.page_map(ctx, want).ok_or_else(|| {
-        werr(format!(
-            "{what}: cannot map {want:?} page(s): the host granted {} block(s) — every page holding a \
-             key must be a host block",
-            ctx.host.len(),
-        ))
-    })?;
-    scratchy_subtile::sdsc_abstract::chunk_gather_index_table(
-        scratch,
-        rows,
-        &map.as_i64(),
-        per_page,
-        // The body's own baked op-local pin budget — the same term the bake's `lx_form` witness
-        // read off the layout, so the host refuses exactly the chunks the bake refused.
-        step.lx_op_local_bytes(),
-        // And the chunk form's probability-part pins — the second core-local term the same
-        // witness summed beside the gathers, so the two arms cannot drift.
-        step.lx_prob_pin_bytes(),
-    )
-    .map(Some)
-    .ok_or_else(|| {
-        werr(format!(
-            "{what}: could not build the chunk gather's index table from this request's page map \
-                 — the map is empty or an entry overflows int32"
-        ))
-    })
-}
-
 /// ⭐ WHAT ONE CHUNK'S FORWARD PRODUCED — the per-row logits the host sampler
 /// reads. One enum (not a bare `Vec<Vec<f32>>`) because the shape is a fact of the
 /// step the caller must not be able to confuse with the model's other outs.
@@ -961,8 +842,8 @@ pub(crate) fn superdsc_forward_chunk(
     // map rather than reading a stored one, and the map's fully-masked and hole pages come from the
     // reserved range.
     ctx: PageMapCtx<'_>,
-    // The pool's geometry, threaded from the model — `chunk_index_table`'s law, ONE spelling (built in
-    // `run_request_step` off `Loaded`'s own two numbers).
+    // The pool's geometry, threaded from the model — ONE spelling (built in `run_request_step`
+    // off `Loaded`'s own two numbers).
     pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
 ) -> ExecutorResult<ChunkOut> {
     let n = toks.len();
@@ -1263,28 +1144,15 @@ pub(crate) fn superdsc_forward_chunk(
                         "prompt chunk at {chunk_start}: the session could not say which body runs: {e}"
                     ))
                 })?;
-                let kv_blocks = chunk_index_table(
-                    "prompt chunk",
-                    pool,
-                    pf,
-                    step,
-                    req,
-                    ctx,
-                    ChunkKeys {
-                        resident: chunk_start,
-                        mapped: chunk_start as u32,
-                        rows: scratchy_subtile::sdsc_abstract::ChunkRowKind::Prompt,
-                    },
-                )?;
                 prefill_logits = run_prefill_batch(
                     // A prompt chunk: these rows are consecutive positions of one sequence, so they
                     // share both the causal triangle and one resident-prefix validity row. `None` IS
                     // that statement — there are no per-request rows, so the chunk laws are the only
                     // ones reachable.
                     None,
-                    // The chunk's index table — `None` for a body that gathers nothing (no prefix, or
-                    // a prefix within one page on the per-page body).
-                    kv_blocks.as_deref(),
+                    // No KV block table: the gathered-KV read is deleted with the hand-written
+                    // attention, so no body of this bundle gathers.
+                    None,
                     sh,
                     pf,
                     pmeta,
@@ -1561,22 +1429,8 @@ pub(crate) fn superdsc_forward_chunk(
             1,
         )
         .expect("one real row of a one-row rung");
-        // ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK'S INDEX — the one-request body attends EVERY resident page in one
-        // pass (see `chunk_index_table`): positions `0..p` are resident, and the map holds the new
-        // token's page too.
-        let kv_blocks = chunk_index_table(
-            "solo decode",
-            pool,
-            session,
-            step,
-            req,
-            ctx,
-            ChunkKeys {
-                resident: p,
-                mapped: p as u32 + 1,
-                rows: scratchy_subtile::sdsc_abstract::ChunkRowKind::OneRequest,
-            },
-        )?;
+        // No KV block table is staged: the gathered-KV read is deleted with the hand-written
+        // attention, so no body of this bundle gathers.
         let inputs = scratchy_target_spyre::forward_tape::ForwardInputs {
             hidden: h,
             // ⭐⭐⭐⭐⭐ THE BAKED HEAD COUNT — the causal tile is `nqh` rows at mq==1, and
@@ -1605,7 +1459,7 @@ pub(crate) fn superdsc_forward_chunk(
             // `kernel_values` turns into a REFUSAL if the tape carries the step — never into an
             // empty buffer, because an unstaged index reads as block 0 and block 0 is a real
             // address (row 0's first page), so every pass would answer from row 0's keys.
-            kv_blocks: kv_blocks.as_deref(),
+            kv_blocks: None,
         };
         let fsteps = shape.steps();
         let fops = scratchy_target_spyre::forward_tape::operands(&fsteps);
@@ -1932,8 +1786,39 @@ pub(crate) fn forward_chunk(
             let mut vbuf = vec![0.0f32; cap * kvw];
             kbuf[..req.kv_k[li].len()].copy_from_slice(&req.kv_k[li]);
             vbuf[..req.kv_v[li].len()].copy_from_slice(&req.kv_v[li]);
-            dynamic.push((lw.prefix_k_src as u64, kbuf, vec![cap, kvw]));
+            dynamic.push((lw.prefix_k_src as u64, kbuf.clone(), vec![cap, kvw]));
             dynamic.push((lw.prefix_v_src as u64, vbuf, vec![cap, kvw]));
+            // ⭐ THE Kᵀ PLANE'S BIND — the attention's resident-prefix score leg
+            // reads the plane's fused `[hd, nkvh·cap]` view (`desc_kt`, bound at
+            // `kct_resident_tid`), so the host states the one law that makes the
+            // plane the same keys the natural bind holds, transposed:
+            // `kt[d, kvh·cap + s] = k[s, kvh·hd + d]`. On card the plane is
+            // written by its own writer (the rope append's second store); the
+            // emulator's host IS that writer — the KV is host-grown and rebound
+            // every step, so the plane is rebuilt from the natural rows each
+            // time, exactly as the natural bind above is. `head_dim` is the
+            // layer's own class dim off the wiring (a hybrid arch's layers
+            // differ), the one fact that decomposes `kvw` into `(nkvh, hd)`.
+            let hd = lw.head_dim;
+            let nkvh = kvw / hd;
+            debug_assert_eq!(
+                nkvh * hd,
+                kvw,
+                "the layer's kv width is its head count × head dim"
+            );
+            let plane_cols = nkvh * cap;
+            let mut kt = vec![0.0f32; hd * plane_cols];
+            for kvh in 0..nkvh {
+                for s in 0..cap {
+                    for d in 0..hd {
+                        kt[d * plane_cols + kvh * cap + s] = kbuf[s * kvw + kvh * hd + d];
+                    }
+                }
+            }
+            let kct = scratchy_target_spyre::lower_subtile_tape_to_superdsc::kct_resident_tid(
+                lw.prefix_k_src as u32,
+            );
+            dynamic.push((u64::from(kct), kt, vec![hd, plane_cols]));
         }
         // ⭐ THE LENGTH MASK IS FILLED BY WHOEVER KNOWS THE DECODE POSITION. The prefix cache tensor
         // spans the full structural capacity while only `start` of its rows are valid this step, so

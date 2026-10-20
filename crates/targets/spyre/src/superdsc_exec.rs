@@ -2918,29 +2918,17 @@ impl Executor {
         // fact rides on the launch group that carries it (`bundle::KvShifts::gathered`), so a body
         // that gathers cannot be driven as one that does not, or the reverse.
         let mut gathers_any = false;
-        // Same authority, same reason: whether this body re-launches a page fold is the
-        // `page_fold` its own launch groups carry (what `fold_plan::reps` multiplies by) — any
-        // class's fold makes the step a fold, not a chunk.
-        let mut folds_any = false;
         for c in 0..self.n_classes() {
             let ls = self.list_sel_for(sel, c);
             gathers_any |= crate::wiring::GathersKv::of_launch_groups(
                 self.list(ls).iter().map(|o| o.kv.gathered),
             )
             .get();
-            folds_any |= self.list(ls).iter().any(|o| o.kv.page_fold);
         }
         Ok(StepBody {
             sel,
             swept: self.body_swept(sel),
             gathers: crate::wiring::GathersKv::of_launch_groups([gathers_any]),
-            folds: folds_any,
-            // The rung's op-local pin slots, the same layout's baked sum — every bundle of the
-            // rung carries the same number, so the body's own artifact is as good a seat as any.
-            lx_op_local_bytes: self.code.layout.lx_op_local_bytes,
-            // The chunk form's probability-part pins, the same layout's recorded term — the
-            // admission summed it beside the gathers, so the host's read must carry it too.
-            lx_prob_pin_bytes: self.code.layout.lx_prob_pin_bytes,
         })
     }
 
@@ -5609,9 +5597,6 @@ pub struct StepBody {
     sel: BodySel,
     swept: SweptCols,
     gathers: crate::wiring::GathersKv,
-    folds: bool,
-    lx_op_local_bytes: u64,
-    lx_prob_pin_bytes: u64,
 }
 
 impl StepBody {
@@ -5629,33 +5614,6 @@ impl StepBody {
     /// groups (`bundle::KvShifts::gathered`).
     pub const fn gathers(self) -> crate::wiring::GathersKv {
         self.gathers
-    }
-
-    /// ⭐ WHETHER **THIS** BODY IS A SPLIT-KV CHUNK — it gathers and carries no page fold, so it attends
-    /// exactly its own chunk in one launch and the host stages the CHUNK's index and mask, not the
-    /// fold's. On a decode batch this is what separates a chunk rung from the gathered fold below and
-    /// past it — both gather, and staging one's table for the other reads real block numbers from the
-    /// wrong layout.
-    pub const fn chunk(self) -> bool {
-        self.gathers.get() && !self.folds
-    }
-
-    /// ⭐ THE RUNG'S OP-LOCAL LX PIN SLOTS, in bytes — read off the selected body's own baked
-    /// layout (`bundle::BundleLayout::lx_op_local_bytes`), the host's term of the one
-    /// `lx_window_fits` budget. The host's chunk-table arm threads this into
-    /// `chunk_gather_index_table`, so the host refuses exactly the chunks the bake's `lx_form`
-    /// witness refused — neither arm budgets against another rung's pins.
-    pub const fn lx_op_local_bytes(self) -> u64 {
-        self.lx_op_local_bytes
-    }
-
-    /// ⭐ THE CHUNK FORM'S PROBABILITY-PART LX PINS, in bytes — read off the selected body's own
-    /// baked layout (`bundle::BundleLayout::lx_prob_pin_bytes`), the host's SECOND core-local
-    /// term of the same budget: the bake's `lx_form` admission summed it beside the gather pins,
-    /// and the host's chunk-table arm threads it in beside [`Self::lx_op_local_bytes`], so the
-    /// host refuses exactly what the bake refused.
-    pub const fn lx_prob_pin_bytes(self) -> u64 {
-        self.lx_prob_pin_bytes
     }
 }
 

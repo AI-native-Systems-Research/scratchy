@@ -184,6 +184,11 @@ pub type Result<T> = std::result::Result<T, Refusal>;
 /// pipeline. An empty grid keeps `DistributeWork`'s single-axis heuristic, and a
 /// multi-axis kernel then RED-stops rather than guessing a block count.
 pub fn make_ktir(module: &mut Module, grid: &[i64]) -> Result<()> {
+    // ⭐ FIRST, so a K=1 dot is a multiply before anything counts dots: a kernel whose
+    // only dot is a one-K one becomes dotless here and takes the whole-function door,
+    // rather than `dot_to_linalg`'s single-dot contract refusing it as a non-canonical
+    // matmul. See [`passes::one_k_dot_to_mul`].
+    passes::one_k_dot_to_mul::run(module)?;
     passes::dot_to_linalg::run(module)?;
     passes::convert_ttir_to_ktdp::run(module)?;
     passes::distribute_work::run(module, grid)?;

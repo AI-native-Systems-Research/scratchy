@@ -43,6 +43,12 @@ pub(crate) struct LayerWiring {
     /// layers different widths, so every per-layer buffer size, readback count and
     /// extend length reads THIS, never the model-wide `kv_dim`.
     pub(crate) kv_width: usize,
+    /// THIS layer's attention-class head dim (a hybrid arch's layers carry
+    /// different ones). The KTIR emulator binds this layer's prefix K into the
+    /// Kᵀ PLANE — per head `[hd, capacity]`, heads concatenated — and that bind
+    /// decomposes `kv_width` by exactly this dim; see the staging in
+    /// `spyre_forward.rs`'s per-layer prefix-KV loop.
+    pub(crate) head_dim: usize,
 }
 
 /// Per-phase metadata for one program (decode m=1 or prefill m=M) inside the

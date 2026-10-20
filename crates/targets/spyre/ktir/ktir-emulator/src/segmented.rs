@@ -57,9 +57,9 @@ fn view_shape_of(op: &Operation) -> Option<Vec<usize>> {
 /// touches, by scanning each node's `ktdp.construct_memory_view` ops (whose
 /// `sizes:` attribute is the tensor's full shape) and mapping the view's pointer
 /// operand to a tensor id via that node's bindings. A tensor may be viewed in
-/// several nodes; any one view's shape is authoritative (they agree). This lets
-/// the driver size the intermediate / result / scratch buffers with NO external
-/// manifest — the shapes live in the IR.
+/// several nodes, and the WIDEST view stages it — see [`collect_view_shapes`]'s
+/// own law. This lets the driver size the intermediate / result / scratch
+/// buffers with NO external manifest — the shapes live in the IR.
 pub(crate) fn derive_shapes(
     module: &IRModule,
     spec: &ProgramSpec,
@@ -135,6 +135,23 @@ pub(crate) fn collect_view_dtypes(
 
 /// Walk ops (recursing into regions) recording the shape of every memory view
 /// whose pointer operand is a known node arg → tensor id.
+///
+/// ⛔ THE ALLOCATION HOLDS EVERY VIEW, so the WIDEST view stages the tensor.
+/// This used to be first-view-wins on the premise that a tensor's views agree —
+/// and the padded staging contract broke that premise: a staging tensor is
+/// viewed at its producer's LOGICAL form (`[1, 512]`, the k_proj's output view
+/// of the new block's K) and at a consumer's PADDED wide form (`[64, 512]`, the
+/// Kᵀ restickify's stick-cover read), so first-view-wins sized the tensor at
+/// 1024 bytes and the bounds check in `ktdp.construct_memory_view` refused the
+/// padded view over it (MEASURED: the numeric gate's `view [64, 512] spans
+/// 65536 bytes but the tensor allocated at byte … holds only 1024`). The card
+/// states the same law at PLACEMENT time — `compute_bundle_layout` re-places a
+/// padded staging tensor at the padded device-width form precisely so a padded
+/// read never aliases the next tensor — and this is the emulator's model of it:
+/// sizing at the widest view is the derivation-side twin of that re-placement.
+/// Views that agree (every ordinary tensor) are unchanged; the readback clamps
+/// and compare sets that key off `numel` already take `min` against the
+/// caller's wanted extent, so a wider staging shape only adds never-read pad.
 pub(crate) fn collect_view_shapes(
     ops: &[Operation],
     arg_to_tensor: &HashMap<Ssa, u64>,
@@ -146,7 +163,14 @@ pub(crate) fn collect_view_shapes(
             && let Some(&tid) = arg_to_tensor.get(ptr)
             && let Some(shape) = view_shape_of(op)
         {
-            shapes.entry(tid).or_insert(shape);
+            shapes
+                .entry(tid)
+                .and_modify(|old| {
+                    if shape.iter().product::<usize>() > old.iter().product::<usize>() {
+                        *old = shape.clone();
+                    }
+                })
+                .or_insert(shape);
         }
         for rg in op.regions {
             collect_view_shapes(rg, arg_to_tensor, shapes);
