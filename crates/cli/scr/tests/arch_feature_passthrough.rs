@@ -19,29 +19,58 @@
 //! `granite` apart from a legitimately-scoped new feature by string shape
 //! alone.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Extract top-level `name = [...]` (or `name = []`) feature keys from a
-/// `[features]` table. Deliberately dumb line scanning, not a TOML parser:
-/// every entry this test cares about is a single line of that form, which is
-/// how both files are written. Continuation lines of a multi-line array
-/// (`"foo",`) have no top-level `=` and are naturally skipped.
-fn feature_keys(cargo_toml: &str) -> BTreeSet<String> {
-    let features_start = cargo_toml.find("[features]").expect("no [features] table");
-    let after = &cargo_toml[features_start + "[features]".len()..];
-    let features_end = after.find("\n[").unwrap_or(after.len());
-    let body = &after[..features_end];
+/// A `[features]` table: each feature's name and entries. A reader for this one table's shape,
+/// not a TOML parser — `name = ["a", "b"]`, an array on one line or across several, a `#` comment
+/// anywhere outside a quoted entry — which is every form both files use.
+fn features(cargo_toml: &str) -> BTreeMap<String, Vec<String>> {
+    let start = cargo_toml.find("[features]").expect("no [features] table");
+    let after = &cargo_toml[start + "[features]".len()..];
+    let body = &after[..after.find("\n[").unwrap_or(after.len())];
 
-    body.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return None;
-            }
-            let (key, _) = line.split_once('=')?;
-            Some(key.trim().trim_matches('"').to_string())
-        })
+    let mut table = BTreeMap::new();
+    // A feature whose array has not closed yet: its name and the array text so far.
+    let mut open: Option<(String, String)> = None;
+    for line in body.lines().map(uncommented) {
+        let (name, array) = match open.take() {
+            Some((name, array)) => (name, array + line),
+            None => match line.split_once('=') {
+                Some((name, array)) => (name.trim().trim_matches('"').to_string(), array.into()),
+                None => continue,
+            },
+        };
+        if array.contains(']') {
+            table.insert(name, entries(&array));
+        } else {
+            open = Some((name, array));
+        }
+    }
+    table
+}
+
+/// `line` up to a `#` outside quotes.
+fn uncommented(line: &str) -> &str {
+    let mut quoted = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '#' if !quoted => return &line[..i],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// The quoted entries of an array's text, `[` to `]`.
+fn entries(array: &str) -> Vec<String> {
+    let inner = array.split_once('[').map_or("", |(_, rest)| rest);
+    let inner = inner.split_once(']').map_or(inner, |(inside, _)| inside);
+    inner
+        .split(',')
+        .map(|e| e.trim().trim_matches('"').to_string())
+        .filter(|e| !e.is_empty())
         .collect()
 }
 
@@ -73,36 +102,24 @@ const SHARED_NON_SCOPE_FEATURES: &[&str] = &[
 /// No feature of this crate only forwards to scratchy-models, whether or not
 /// the two crates share its name: `model/<feature>` already reaches every
 /// scratchy-models feature, so a forwarder is a second spelling of one switch.
-/// Same dumb line scan as [`feature_keys`]: single-line arrays only, which is
-/// how every forwarder has been written.
+/// Read through [`features`], so a forwarder written across several lines, or
+/// with a trailing comment, fails too.
 #[test]
 fn no_feature_of_this_crate_only_forwards_to_scratchy_models() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR unset");
     let cli_toml = Path::new(&manifest_dir).join("Cargo.toml");
     let cli_src = std::fs::read_to_string(&cli_toml)
         .unwrap_or_else(|e| panic!("reading {}: {e}", cli_toml.display()));
-    let features_start = cli_src.find("[features]").expect("no [features] table");
-    let after = &cli_src[features_start + "[features]".len()..];
-    let body = &after[..after.find("\n[").unwrap_or(after.len())];
 
-    let forwarders: Vec<&str> = body
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with('#'))
-        .filter_map(|line| {
-            let (key, value) = line.split_once('=')?;
-            let entries = value.trim().strip_prefix('[')?.strip_suffix(']')?;
-            let entries: Vec<&str> = entries
-                .split(',')
-                .map(|e| e.trim().trim_matches('"'))
-                .filter(|e| !e.is_empty())
-                .collect();
-            let forwards = !entries.is_empty()
+    let forwarders: Vec<String> = features(&cli_src)
+        .into_iter()
+        .filter(|(_, entries)| {
+            !entries.is_empty()
                 && entries
                     .iter()
-                    .all(|e| e.starts_with("model/") || e.starts_with("model?/"));
-            forwards.then_some(key.trim())
+                    .all(|e| e.starts_with("model/") || e.starts_with("model?/"))
         })
+        .map(|(name, _)| name)
         .collect();
 
     assert!(
@@ -132,11 +149,10 @@ fn scratchy_models_is_aliased_model_with_no_hand_forwarded_scope_features() {
          from this crate's build line without a hand-forwarded passthrough feature."
     );
 
-    let models_keys = feature_keys(&models_src);
-    let cli_keys = feature_keys(&cli_src);
-
-    let reintroduced: Vec<&String> = models_keys
-        .intersection(&cli_keys)
+    let models_features = features(&models_src);
+    let reintroduced: Vec<String> = features(&cli_src)
+        .into_keys()
+        .filter(|k| models_features.contains_key(k))
         .filter(|k| !SHARED_NON_SCOPE_FEATURES.contains(&k.as_str()))
         .collect();
 
