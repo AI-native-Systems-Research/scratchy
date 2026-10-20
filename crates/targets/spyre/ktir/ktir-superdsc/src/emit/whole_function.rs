@@ -220,8 +220,9 @@ pub fn matmul_b_orientation(
     ))
 }
 
-/// ⛔⛔⛔ A TRANSPOSE-B `B` HAS TO BE **PLACED** BY SOMEBODY, AND ONLY A PRESENTED BUFFER HAS ANYBODY
-/// TO DO IT. This is the seal on the one silent wrong answer this door used to compile.
+/// ⛔⛔⛔ A TRANSPOSE-B `B` HAS TO BE **PLACED** BY AN AGENT THAT OWNS ITS BYTES, AND THIS DOOR HAS
+/// NONE — NOT FOR A COMPUTED VALUE, NOT FOR A PARAMETER. This is the seal on the one silent wrong
+/// answer this door used to compile.
 ///
 /// # THE ARGUMENT, from the crate's own declarations
 ///
@@ -234,11 +235,14 @@ pub fn matmul_b_orientation(
 /// spent OUTSIDE the descriptor by one of exactly two agents:
 ///
 ///  * a PRESENTED weight — the HOST stage, once, at bake time (`stage_2d(&StickLayout::kernel(k, n),
-///    ..)`, `sdsc_abstract.rs:2124`). Free at inference, and the whole regression bar is this case.
+///    ..)`, `sdsc_abstract.rs:2124`). Free at inference. That stage is the PER-`Program` door's
+///    producer contract — `lower_ktir_to_superdsc::matmul` hard-codes `TransposeB` + `Staged` for
+///    exactly this clientele (every projection, measured byte-identical) — and none of it flows
+///    through this guard.
 ///  * a CACHE — the DEVICE, writing it already transposed (`kcache_kt_write_offset`), which is why the
-///    shipped attention pays for a third physical Kᵀ plane (`assemble_restockify_kt_2d`) rather than
-///    relabelling the one it has. **The relayout exists to MAKE a `[k, n]` buffer, never to consume
-///    one.**
+///    shipped attention paid for a third physical Kᵀ plane (`assemble_restockify_kt_2d`, deleted with
+///    that chain) rather than relabelling the one it has. **The relayout exists to MAKE a `[k, n]`
+///    buffer, never to consume one.**
 ///
 /// An IN-REGISTER COMPUTED value is NEITHER. Nothing stages it, no cache write orders it, and nothing
 /// in this crate reads an access tile's `CoordinateOrder` (it occurs inside one comment and nowhere
@@ -258,6 +262,13 @@ pub fn matmul_b_orientation(
 /// as of this change: it folds a `.T` into the maps ONLY when the transposed value is a direct
 /// `tt.descriptor_load`.
 ///
+/// A front end holding a `.T` over a PARAMETER has the sharper remedy: present the plane with the
+/// CONTRACTION AXIS AS ITS ROW AXIS and state the PLAIN form over THAT. A device-written cache gets
+/// it from its write — the host-presented Kᵀ, `kcache_kt_write_offset` — and the proof it is enough
+/// is the V leg of the same kernels: `tl.dot(p, v)` over the n-major `[cap, kv_width]` V cache
+/// contracts WHERE IT LIES because `cap` is its row axis (`vcache_write_offset`: "the VALUE bmm reads
+/// as a `[cap, hd]` KERNEL sticked on `hd`").
+///
 /// ⛔ THAT COSTS AN ARCH FEATURE THIS PATH DOES NOT HAVE ON MPW4, AND THE REASON IS NOW MECHANICAL
 /// RATHER THAN OBSERVED. deeptools maps an opFunc to a DDL template per ISA
 /// (`ddc/ddl/ddl_conversion.h`'s `opFuncToDdlTemplate`): `BATCHMATMUL_FWD` has a
@@ -271,13 +282,65 @@ pub fn matmul_b_orientation(
 /// division, the tile geometry, or which relayout primitive is picked — and swapping primitives
 /// cannot move it. A dxp refusal on a program that computes the right thing is nevertheless the
 /// outcome this guard exists to force: it is a build error, not a wrong number.
+///
+/// # ⛔ WHY A PARAMETER IS REFUSED HERE TOO, WHEN THE PER-`Program` WEIGHT IS NOT
+///
+/// This door's parameters are the SPLICE's descriptor buffers, and it reads each WHERE ITS PRODUCER
+/// STAGED IT — no `stage_2d` runs for them here (that is the per-`Program` producer's contract, and
+/// its clientele never reaches this walk), and a cache is k-major only if its WRITER wrote it so.
+/// The KTIR states neither fact, so this door cannot tell a k-major-staged weight from an n-major
+/// device-written cache, and the honest default is the refusal. The fact that would re-open
+/// acceptance — a caller stating "this parameter is staged k-major" — does not exist yet.
+///
+/// The acceptance that used to live here ("a parameter-backed transpose-B is placeable because the
+/// device writes caches already transposed") was true exactly while the hand-written attention's Kᵀ
+/// write existed. That chain is deleted (`ebe9a95b9`); the rope append writes the cache natural, and
+/// the acceptance became a FALSE ACCEPT with two measured failure modes on the granite-2b plan-only
+/// bake, both in the windowed corner law's transposed nest `[k_full, n_full]`:
+///   * a SUB-STICK transposed `n` (`n_full = 1`, attn's new-K score dot) pads each row to a whole
+///     stick, so corner row 64 lands at offset 4096 against a 512-element logical footprint —
+///     `addr: 4096 outside footprint 512`, a debug_assert PANIC;
+///   * a STICK-WIDE transposed `n` (`n_full = 256`, attn's resident-prefix score dot) keeps the
+///     arithmetic inside the footprint, PASSES the assert, and emits a descriptor addressing the
+///     k-major law over n-major bytes — silently misaddressed on card.
+///
+/// A guard that only converted the panic would keep the second failure; this one refuses both by
+/// provenance, before the corner law runs.
 fn transposed_b_is_placeable(
     name: &str,
     b: BOrient,
     b_is_parameter_backed: bool,
 ) -> Result<(), Error> {
-    if b == BOrient::PlainB || b_is_parameter_backed {
+    if b == BOrient::PlainB {
         return Ok(());
+    }
+    if b_is_parameter_backed {
+        return err(format!(
+            "{name}: this `linalg.matmul` states the TRANSPOSE-B form \
+             (`[[d0,d2],[d1,d2],[d0,d1]]`, B's map ending in the reduction dim, so B's region is \
+             `[n, k]`) over a B that is a PARAMETER of this kernel — a load of one of the caller's \
+             descriptor buffers. The maps LABEL which axis is k; they do not PLACE it, and the \
+             kernel slot reads `[k, n]` (`StickLayout::kernel(k_in, n_out)`) whatever they say. \
+             Spending that transposition is the job of an agent that owns the bytes, and both \
+             agents are OUTSIDE this kernel: the HOST stage for a presented weight \
+             (`stage_2d(&StickLayout::kernel(k, n), ..)`) is the per-`Program` door's producer \
+             contract — which is why every projection lowers there — and a cache is k-major only \
+             if its WRITER wrote it so. This whole-function door reads each parameter WHERE ITS \
+             PRODUCER STAGED IT and holds no fact stating that order, so a `.T` over a buffer \
+             written n-major — the K caches a paged attention kernel declares `[cap, kv_width]` \
+             row-major — has no agent at all. What this guard replaces is worse than a refusal: \
+             the windowed corner law's transposed nest pads a sub-stick transposed n to a whole \
+             stick, so at `n = 1` it PANICS on the footprint assert and at a stick-wide `n` it \
+             PASSES and emits a descriptor addressing the k-major law over n-major bytes — a \
+             silent misaddress on card that no extent guard catches, because the transposed \
+             arithmetic stays inside the footprint. Present B with the CONTRACTION AXIS AS ITS \
+             ROW AXIS and state the PLAIN `[k, n]` form over that plane: a device-written cache \
+             gets it from its WRITE (the recorded host-presented Kᵀ, `kcache_kt_write_offset`), \
+             the way this kernel's own V leg contracts in place (`tl.dot(p, v)` over the n-major \
+             V cache — `cap` is its row axis); anything else is a real relayout beside the matmul \
+             (a `linalg.transpose` → `Program::Transpose`) over the plain form. Refused rather \
+             than addressed by the wrong law."
+        ));
     }
     err(format!(
         "{name}: this `linalg.matmul` states the TRANSPOSE-B form \
@@ -2696,8 +2759,9 @@ pub fn lower_function(
         // `Program::Transpose`, a producer stating a `linalg.transpose` in its own right.
         //
         // ⭐ AND THE OTHER HALF IS NO LONGER A GAP — IT IS THE REFUSAL DIRECTLY BELOW. A transpose-B B
-        // whose region is a COMPUTED value has nobody to place its bytes, so this door will not lower
-        // it. See [`transposed_b_is_placeable`], which states the whole argument.
+        // — a COMPUTED value or a PARAMETER of this kernel — has no agent here that places its bytes,
+        // so this door will not lower it. See [`transposed_b_is_placeable`], which states the whole
+        // argument.
         if let Some(b) = b_orient {
             // ⛔ FAIL CLOSED ON THE INDEX ITSELF. `n_in` is 2 for a matmul so operand 1 always
             // exists, and defaulting a MISSING entry to "placeable" would make a malformed program
@@ -3686,15 +3750,37 @@ mod matmul_orientation_tests {
         );
     }
 
-    /// ⭐ THE ACCEPTING CASE FOR [`transposed_b_is_placeable`], AND IT IS THE WHOLE REGRESSION BAR:
-    /// a transpose-B weight that IS parameter-backed. `rmsnorm_granite`, both `swiglu_mlp_*` and
-    /// every projection in both decoders are this case, measured byte-identical, and they are correct
-    /// because the HOST stage places the bytes (`stage_2d(&StickLayout::kernel(k, n), ..)`). If this
-    /// case ever refused, the guard below would be indistinguishable from "refuse every `.T`".
+    /// ⛔ THE PARAMETER-BACKED REFUSAL, ONE VARIABLE FROM THE CASE BELOW — and the case that used to
+    /// ACCEPT here. The old acceptance's theory was "the device writes caches already transposed",
+    /// which was true exactly while the hand-written attention's Kᵀ write existed; that chain is
+    /// deleted (`ebe9a95b9`), the rope append writes the cache natural, and the acceptance became a
+    /// FALSE ACCEPT with two measured failure modes on the granite-2b plan-only bake: the windowed
+    /// corner law's transposed nest PANICS on the footprint assert at a sub-stick transposed `n`
+    /// (attn's new-K dot, `n_full = 1`) and silently MISADDRESSES on card at a stick-wide one (the
+    /// resident-prefix dot, `n_full = 256` — the assert passes, the law is wrong). The clientele the
+    /// old doc cited as the regression bar — `rmsnorm_granite`, both `swiglu_mlp_*`, every projection
+    /// — never flows through this guard at all: those are per-`Program` matmuls whose host stage
+    /// (`stage_2d(&StickLayout::kernel(k, n), ..)`) is THAT door's producer contract, and they keep
+    /// lowering there, byte-identical, untouched by this flip.
     #[test]
-    fn a_transpose_b_over_a_presented_weight_is_placeable() {
-        transposed_b_is_placeable("probe", BOrient::TransposeB, true)
-            .expect("a presented weight's transposition is spent by the host stage");
+    fn a_transpose_b_over_a_parameter_of_this_door_is_refused_by_name() {
+        let e = transposed_b_is_placeable("probe", BOrient::TransposeB, true)
+            .expect_err("this door has no agent that places a parameter's bytes");
+        assert!(
+            e.message.contains("PARAMETER"),
+            "names WHAT is wrong with the operand, not merely that it was rejected: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("misaddress"),
+            "and says what the false accept it replaces would have emitted: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("ROW AXIS"),
+            "and names the form the producer must present instead, so the refusal is actionable: {}",
+            e.message
+        );
     }
 
     /// ⛔ THE REFUSAL, **ONE VARIABLE** FROM THE CASE ABOVE — the provenance of B and nothing else.
