@@ -509,6 +509,55 @@ pub fn pointwise_broadcast_opspec_from_tile(
     crate::emit::mint_ew_operands(op.name(), rows, cols, df, inputs, layout)?;
     let block = (rows as u64) * (cols as u64);
     let block_aligned = |off: u32| block != 0 && (off as u64).is_multiple_of(block);
+    // ⭐⭐⭐ THE ROW-SPLIT (Y) MODE — an op one of whose operands is a y-broadcast ([`In::y_broadcast`],
+    // the whole-function walk's Y admission: a leading-axis `linalg.broadcast` of a multi-row
+    // `[mb, out]` source into `[y, mb, out]`, the batched paged-decode kernel's J-slot merge).
+    // The op's tensors present Y-MAJOR — `["y", "mb", "out"]`, the same head-outermost spelling
+    // the batched matmul's I/O walks use — with `out` the ONE STICK the frame law
+    // ([`crate::sdsc_abstract::RegionFrame::split_rows`]) allows, so the source's `(mb, out)`
+    // bytes and the output's `(y·mb, out)` bytes are the same stick-blocked bytes the mints
+    // reserved. Everything below is cross-checks; the addressing itself is the ordinary
+    // scale-driven rule (`build_coordinates`/`per_core_addr`), which is why the form needs no
+    // new addressing code — only the layout order and the operand scales stated honestly.
+    let stated_ys: Vec<u32> = inputs
+        .iter()
+        .map(|i| i.y_broadcast())
+        .filter(|&y| y > 1)
+        .collect();
+    let ymajor = !stated_ys.is_empty();
+    if ymajor {
+        // ONE spray count per op: every y-broadcast operand of one op sprays the broadcast's own
+        // leading extent, so a disagreement is two ops fused under one name.
+        let y = stated_ys[0];
+        if !stated_ys.iter().all(|&s| s == y) {
+            return Err(format!(
+                "{o_name}: the op's y-broadcast operands state different spray counts \
+                 ({stated_ys:?}) — one op has ONE leading extent"
+            ));
+        }
+        // The TileOp must state the same count on its own `y` dim: the tiler's iteration space
+        // and the operands' addressing read the same spray, so a disagreement is a caller that
+        // built its TileOp from a different shape than its operands.
+        let tile_y = tile_op.dims.iter().find(|d| d.name == "y").map(|d| d.size);
+        if tile_y != Some(y) {
+            return Err(format!(
+                "{o_name}: the TileOp's `y` dim states {tile_y:?} but the y-broadcast operands \
+                 spray {y} — the tile and the operands disagree on the op's leading extent"
+            ));
+        }
+        // THE SINGLE-STICK LAW — the frame law's own `cols ≤ lanes` half, restated at the
+        // emission: the spray's source is single-stick, so an op wider than one stick did not
+        // come through the Y admission. This is also what keeps `ymajor` and `stickmajor` below
+        // disjoint (stickmajor requires `cols >` one stick).
+        if cols > Fp16::ELEMS_PER_STICK {
+            return Err(format!(
+                "{o_name}: a row-split (y-broadcast) op at cols={cols} > {} — the spray's \
+                 source is single-stick by the frame law, so a wider op did not come through \
+                 the Y admission",
+                Fp16::ELEMS_PER_STICK
+            ));
+        }
+    }
     // ⭐ A WHOLE-STICK COLUMN WINDOW IS A STICK-MAJOR CORNER TOO (#622) — admitted by its TYPE
     // ([`crate::addr::ColWindow`], carried as `EwOperand::col_window` / `out_window`), never by testing the
     // integer: the window's planes are whole `[rows, 64]` planes of the parent at the parent's plane stride,
@@ -534,7 +583,14 @@ pub fn pointwise_broadcast_opspec_from_tile(
         )
         .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
-    let device_dims = plan.iter_syms(["mb", "out", "y"]);
+    // Y-MAJOR in the row-split mode (`ymajor` above): the syms are picked by NAME in the order
+    // the layout states them, so the plan's own `y`/`mb`/`out` syms feed the `["y", "mb", "out"]`
+    // TensorArgs directly — the same plan, walked head-outermost.
+    let device_dims = if ymajor {
+        plan.iter_syms(["y", "mb", "out"])
+    } else {
+        plan.iter_syms(["mb", "out", "y"])
+    };
     // ── STICK-MAJOR RESIDUAL + PER-HEAD ATTN ── The m>1 seam fix: a residual whole-tensor
     // pointwise op writes FLAT (rank-3 [mb,out,y=1]) but the consuming matmul reads STICK-MAJOR
     // (rank-2 [mb,out]); byte-identical at rows==1, scrambled at rows>1 AND cols>64. Present the op
@@ -576,9 +632,10 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // and `tiled_trips_alias` (the OUTPUT-side backstop) still fire; the broadcast side
     // is pinned by `time_tiled_broadcast_operand_is_address_stable` in `emit/mod.rs`.
 
-    // Build a rank-2 stick-major (`stickmajor`) or the legacy rank-3 flat operand. rank-2 drops the
-    // size-1 `y` dim + its scale so `for_view_df` classifies it RowBlocked (stick-major), matching
-    // the matmul I/O.
+    // Build a rank-2 stick-major (`stickmajor`), the legacy rank-3 flat operand, or — in the
+    // row-split mode — the Y-MAJOR rank-3 operand (`["y", "mb", "out"]`, the caller passing the
+    // scale in the same order via [`EwOperand::scale_ymajor`]). rank-2 drops the size-1 `y` dim +
+    // its scale so `for_view_df` classifies it RowBlocked (stick-major), matching the matmul I/O.
     let mk =
         |is_input: bool, name: &str, scale: [Scale; 3], off: u32| -> Result<AnyTensorArg, String> {
             if stickmajor {
@@ -606,7 +663,11 @@ pub fn pointwise_broadcast_opspec_from_tile(
                         Role::Output,
                         scale,
                         device_dims,
-                        ["mb", "out", "y"],
+                        if ymajor {
+                            ["y", "mb", "out"]
+                        } else {
+                            ["mb", "out", "y"]
+                        },
                         "out",
                         Allocation::Hbm,
                     )
@@ -619,7 +680,16 @@ pub fn pointwise_broadcast_opspec_from_tile(
         };
     let mut args = Vec::with_capacity(inputs.len() + 1);
     for inp in inputs {
-        args.push(mk(true, inp.name(), inp.scale(), inp.col_offset())?);
+        args.push(mk(
+            true,
+            inp.name(),
+            if ymajor {
+                inp.scale_ymajor()
+            } else {
+                inp.scale()
+            },
+            inp.col_offset(),
+        )?);
     }
     // The OUTPUT may write to a COLUMN SLICE of its tensor (`out_offset` cols in →
     // `out_offset·2` byte offset): RoPE's rotate-half writes each head-half to a
