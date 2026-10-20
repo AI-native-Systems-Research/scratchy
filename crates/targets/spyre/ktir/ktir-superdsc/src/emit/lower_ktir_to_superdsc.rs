@@ -6643,27 +6643,25 @@ pub fn reduce(
     // The REDUCED extent is the data's column span and the result is one column per row. Read the
     // shape off the DATA rather than the output, so `rows` and `cols` cannot both come from the same
     // region and agree vacuously.
-    let (rows, logical_cols) = (data.r_len, data.c_len);
-    if rows == 0 || logical_cols == 0 {
+    let (rows, cols) = (data.r_len, data.c_len);
+    if rows == 0 || cols == 0 {
         return err(format!(
-            "{name}: reducing t{} `[{rows}, {logical_cols}]` — a reduce needs a non-empty tile",
+            "{name}: reducing t{} `[{rows}, {cols}]` — a reduce needs a non-empty tile",
             data.tid
         ));
     }
-    // ⭐⭐⭐ THE REDUCE TAKES THE SAME DEVICE-WIDTH LAW ([`pointwise_device_cols`]): the reduced
-    // extent is emitted at the stick-rounded width the data's own placement holds, because a
-    // sub-stick extent is the same dxp-scheduler refusal every pointwise arm refuses. The lanes
-    // the width adds past the logical columns are the mask's −inf tail (see the law's doc) —
-    // inert under `max`, zero under `sum` — and the data's footprint is the one name that
-    // caps, since a reduce reads no other tensor at `cols`. Whole-view gated like every other
-    // call site ([`whole_view_op`]): a reduce over a window of a wider parent would read the
-    // parent's width out of the placement quotient.
-    let cols = if whole_view_op(&[data], &out) {
-        let n = data.name();
-        pointwise_device_cols(layout, &[&n], rows, logical_cols)
-    } else {
-        logical_cols
-    };
+    // ⭐ THE REDUCE DOES NOT TAKE THE POINTWISE DEVICE-WIDTH LAW — it has its own, better one.
+    // This arm once pre-rounded `cols` through [`pointwise_device_cols`] (the same sub-stick
+    // dxp-scheduler refusal the pointwise arms patch), but the reduce family now pads an
+    // unaligned reduced width up to the stick extent ITSELF and masks the pad lanes with the
+    // reduce's identity const (`reduce_stick_elems` + `reduce_coordinate_mask`, the vendor's
+    // own `coordinateMasking_` form). Pre-rounding here would hand that machinery an
+    // already-aligned `cols`, the pad delta would read as zero, and NO MASK WOULD BE EMITTED —
+    // the pad lanes would ride as whatever the buffer holds, the exact zeros-read defect the
+    // mask exists to kill (MEASURED as the composition failure: the padded wide-max door test
+    // asserted `{"out":[[514,62]]}` and got `{}`). The logical `cols` goes through whole, and
+    // the stick-rounded placement width the old law read is never smaller than the padded
+    // extent (the allocator hands out whole sticks), so the padded read cannot overrun.
     // A `[rows, 1]` accumulator: the reduce writes one value per row.
     if out.c_len != 1 {
         return err(format!(
