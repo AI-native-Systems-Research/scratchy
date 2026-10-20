@@ -1215,12 +1215,23 @@ pub fn elementwise(
     // 20-entry table SHADOWED the DDL's internal Newton bit-trick constants and made `rsqrt` compute
     // `1/x`, and the fix was to stop shipping it rather than to hand-build the iteration. The DSM fills
     // them. A comment claiming we emit the table describes the bug, not the fix.
-    let cols = out.c_len;
+    let rows = pointwise_rows(name, &out)?;
+    // ⭐⭐⭐ THE DEVICE WIDTH, NOT THE LOGICAL COLUMN COUNT — [`pointwise_device_cols`], the
+    // ScalarMul law extended to this arm. A dense elementwise over a sub-stick logical width
+    // (`qk_d + mask_d` at `[MQ, MQ]`, `MQ` a decode-batch rung) is a tile the dxp scheduler
+    // refuses; emitting it at the stick-rounded width its operands' placements hold is the
+    // same rule the matmul producer already followed when it minted them. Every operand of
+    // this op is addressed at `cols`, so every name caps it.
+    let cols = {
+        let mut names: Vec<String> = ins.iter().map(Region::name).collect();
+        names.push(out.name());
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        pointwise_device_cols(layout, &refs, rows, out.c_len)
+    };
     check_pointwise_cols(cols, "Elementwise", out.tid)?;
     // ⭐ THE SWEEP IS COMPUTED BEFORE THE EXTENTS LAW, because the law is now stated OVER it: a
     // windowed (banded) output's sweep is its window, not its whole view, and the operands are
     // held to that basis ([`pointwise_extents_agree`]'s two-basis law below).
-    let rows = pointwise_rows(name, &out)?;
     pointwise_extents_agree(name, kind, &ins, &out, rows)?;
     let op_name = format!("{op_func}_o{}", out.tid);
     // ⛔⛔⛔ A COLUMN-BLOCKED CHUNK IS DENSE ELEMENTWISE WITH A CORNER, AND THE CORNER MUST RIDE
@@ -1606,7 +1617,22 @@ fn elementwise_broadcast(
     let cols = if out.c_len == 1 {
         FP16_ELEMS_PER_STICK
     } else {
-        out.c_len
+        // ⭐ THE SAME DEVICE-WIDTH LAW the dense arm takes ([`pointwise_device_cols`]): this
+        // arm's tile is sized by the output's columns too, and a sub-stick logical width is
+        // the same dxp-scheduler refusal. The names that cap it are the tensors this op holds
+        // at `rows` rows — the output and the DENSE operands. A `Col` operand (`[rows, 1]`,
+        // one value per row) is not addressed at `cols`, and an `Mb` one holds a SINGLE row
+        // of them, so neither's footprint divides by this op's `rows`; both are measured
+        // where they are addressed, by `resolve_seg_base`'s per-operand footprint guard.
+        let mut names: Vec<String> = ins
+            .iter()
+            .zip(bcast)
+            .filter(|(_, b)| b.is_none())
+            .map(|(x, _)| Region::name(x))
+            .collect();
+        names.push(out.name());
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        pointwise_device_cols(layout, &refs, rows, out.c_len)
     };
     check_pointwise_cols(cols, "Elementwise", out.tid)?;
     let op_name = format!("{op_func}_o{}", out.tid);
@@ -1893,6 +1919,46 @@ pub fn rmsnorm(
 /// satisfied by a narrower descriptor that computes fewer columns than the program states. And it is a
 /// no-op wherever the layout does reserve the pad, which is the lm-head logits case the rule exists
 /// for.
+/// ⭐⭐⭐ THE POINTWISE DEVICE-WIDTH LAW, stated once for every arm that sizes a tile by an op's
+/// logical column count: the width EMITTED is [`DeviceWidth::for_pointwise`] of the logical
+/// columns — stick-rounded, bumped to a splittable stick count — CAPPED at the whole-stick
+/// width the placements actually hold ([`pointwise_width_the_output_holds`]).
+///
+/// # WHY EVERY ARM TAKES IT, NOT JUST SCALARMUL
+///
+/// [`scalarmul_scaled`] took this law first because a ScalarMul on the padded logits was the
+/// measured over-run. But the width it fixes is a property of the TILE, not of the op kind: the
+/// dxp scheduler refuses any tile whose stick extent is not a whole 64-elem fp16 stick
+/// (`L3DlOpsScheduler:1040`), so a DENSE elementwise, a BROADCAST one and a REDUCE over a
+/// sub-stick logical width (`[MQ, MQ]` score tiles at a decode-batch rung; the headmajor
+/// fixture's `[1, 8]`) are all the same refusal. And the pad the width adds is real for every
+/// one of them, because the producers hold it: a matmul mints its output at
+/// [`DeviceWidth::for_matmul`] and an intermediate's `BundleLayout::synth` footprint
+/// stick-rounds its inner axis, so `held` reproduces the pad and the cap is a NO-OP. A
+/// 64-aligned op is a no-op the same way — the cap reproduces the width `for_pointwise`
+/// already chose — which keeps every existing bundle byte-identical.
+///
+/// # THE PAD LANES ARE THE MASK'S −inf TAIL
+///
+/// The lanes this width adds past the logical columns are read by the op but written by nobody
+/// the program states: they hold whatever the producer's own pad left there. In the attention
+/// chain the producer is `qk + mask` and the mask's host staging pads its columns with −inf
+/// (the additive mask's pad-up law), so the widened lanes are numerically inert under every
+/// consumer — `max` ignores −inf, `exp(−inf) = 0` leaves sums and dot-products unchanged.
+fn pointwise_device_cols(
+    layout: Option<&BundleLayout>,
+    names: &[&str],
+    rows: u32,
+    logical_cols: u32,
+) -> u32 {
+    pointwise_width_the_output_holds(
+        layout,
+        names,
+        rows,
+        DeviceWidth::for_pointwise(logical_cols).get(),
+    )
+}
+
 fn pointwise_width_the_output_holds(
     layout: Option<&BundleLayout>,
     names: &[&str],
@@ -6083,17 +6149,23 @@ pub fn reduce(
     // The REDUCED extent is the data's column span and the result is one column per row. Read the
     // shape off the DATA rather than the output, so `rows` and `cols` cannot both come from the same
     // region and agree vacuously.
-    let (rows, cols) = (data.r_len, data.c_len);
-    if rows == 0 || cols == 0 {
+    let (rows, logical_cols) = (data.r_len, data.c_len);
+    if rows == 0 || logical_cols == 0 {
         return err(format!(
-            "{name}: reducing t{} `[{rows}, {cols}]` — a reduce needs a non-empty tile",
+            "{name}: reducing t{} `[{rows}, {logical_cols}]` — a reduce needs a non-empty tile",
             data.tid
         ));
     }
-    // ⭐ THE WIDE MULTI-ROW MAX PASSES THROUGH — the guard that used to refuse it here was built
-    // on a misread diagnostic and is deleted; the corrected law (with the DDL citations and the
-    // card gate that arbitrates) is this function's own doc above. The shape checks below are
-    // unchanged and still refuse everything that is not a well-formed row reduction.
+    // ⭐⭐⭐ THE REDUCE TAKES THE SAME DEVICE-WIDTH LAW ([`pointwise_device_cols`]): the reduced
+    // extent is emitted at the stick-rounded width the data's own placement holds, because a
+    // sub-stick extent is the same dxp-scheduler refusal every pointwise arm refuses. The lanes
+    // the width adds past the logical columns are the mask's −inf tail (see the law's doc) —
+    // inert under `max`, zero under `sum` — and the data's footprint is the one name that
+    // caps, since a reduce reads no other tensor at `cols`.
+    let cols = {
+        let n = data.name();
+        pointwise_device_cols(layout, &[&n], rows, logical_cols)
+    };
     // A `[rows, 1]` accumulator: the reduce writes one value per row.
     if out.c_len != 1 {
         return err(format!(
