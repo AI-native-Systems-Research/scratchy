@@ -822,15 +822,20 @@ impl ChoiceUsage {
 
     /// Usage across the stream, matching the non-streaming responses: each prompt's tokens and
     /// cache hit count once, however many choices run it, and output adds up across choices.
-    /// Its cached tokens are part of its prompt tokens, so they never exceed them (#580).
+    /// Its cached tokens are part of its prompt tokens, so they never exceed them (#580). The
+    /// hit is the least any choice of the prompt had: what the cache held when the request came
+    /// in. A choice admitted after a sibling computed the prompt hits the sibling's fresh blocks,
+    /// and the largest hit would report that prefill as cached.
     fn totals(&self) -> UsageTotals {
         let choices = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let mut prompts: std::collections::HashMap<u32, (u32, u32)> =
+        let mut prompts: std::collections::HashMap<crate::engine::PromptIndex, (u32, u32)> =
             std::collections::HashMap::new();
         for u in choices.values() {
-            let (tokens, cached) = prompts.entry(u.prompt).or_default();
+            let (tokens, cached) = prompts
+                .entry(u.prompt)
+                .or_insert((u.prompt_tokens, u.cached_tokens));
             *tokens = (*tokens).max(u.prompt_tokens);
-            *cached = (*cached).max(u.cached_tokens);
+            *cached = (*cached).min(u.cached_tokens);
         }
         UsageTotals {
             prompt_tokens: prompts.values().map(|&(tokens, _)| tokens).sum(),
@@ -2258,22 +2263,24 @@ mod tests {
     }
 
     /// The prompt's cache hit is reported in `prompt_tokens_details`, as in the non-streaming
-    /// response. Only one of the two choices hits the cache here.
+    /// response: the least any choice had (2 of 2 and 6), what the cache held on arrival. A
+    /// larger hit is a choice reusing a sibling's prefill of the same prompt.
     #[tokio::test]
     async fn test_chat_stream_usage_reports_cached_tokens() {
         let (mut rx, _) = buffered_tool_call_rx(2);
         let (tx, cached_rx) = tokio::sync::mpsc::unbounded_channel();
         while let Ok(mut delta) = rx.try_recv() {
-            if delta.index == 1 {
-                delta.usage.cached_tokens = 3;
-            }
+            delta.usage.cached_tokens = [2, 6][delta.index as usize];
             tx.send(delta).unwrap();
         }
         drop(tx);
         let response = stream_chat_response("r".into(), "m".into(), cached_rx, true);
         let payloads = sse_payloads(response.into_response()).await;
         let usage = &payloads.last().expect("usage chunk")["usage"];
-        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(
+            usage["prompt_tokens_details"]["cached_tokens"], 2,
+            "the least hit: what the cache held when the request came in"
+        );
         assert_eq!(
             usage["prompt_tokens"], 5,
             "cached tokens are part of the prompt"
@@ -2306,8 +2313,8 @@ mod tests {
         let (mut rx, generated) = buffered_tool_call_rx(4);
         let (tx, prompts_rx) = tokio::sync::mpsc::unbounded_channel();
         while let Ok(mut delta) = rx.try_recv() {
-            delta.usage.prompt = delta.index / 2;
-            delta.usage.prompt_tokens = [5, 9][delta.usage.prompt as usize];
+            delta.usage.prompt = crate::engine::PromptIndex(delta.index / 2);
+            delta.usage.prompt_tokens = [5, 9][delta.usage.prompt.0 as usize];
             tx.send(delta).unwrap();
         }
         drop(tx);

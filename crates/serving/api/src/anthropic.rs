@@ -2307,7 +2307,7 @@ mod tests {
     fn test_stream_reports_prompt_and_cached_tokens() {
         let mut enc = AnthropicSseEncoder::new("r".into(), "m".into());
         let usage = StreamUsage {
-            prompt: 0,
+            prompt: crate::engine::PromptIndex(0),
             prompt_tokens: 1000,
             cached_tokens: 960,
             completion_tokens: 2,
@@ -2337,7 +2337,7 @@ mod tests {
     fn test_stream_reports_prompt_tokens_without_cache_hit() {
         let mut enc = AnthropicSseEncoder::new("r".into(), "m".into());
         let usage = StreamUsage {
-            prompt: 0,
+            prompt: crate::engine::PromptIndex(0),
             prompt_tokens: 512,
             cached_tokens: 0,
             completion_tokens: 1,
