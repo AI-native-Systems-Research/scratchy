@@ -226,7 +226,7 @@ A rung fixes the **weights**. Four things it does not fix, each of which must
 still appear on every published row:
 
 1. **KV-cache dtype — not matchable at runtime on metal.** The `metal` feature
-   implies `turboquant` (`crates/cli/scr/Cargo.toml:45`), and the codec is fixed
+   implies `turboquant` (the `metal` feature in `crates/cli/scr/Cargo.toml`), and the codec is fixed
    when the model is built, from that feature plus the model's attention
    geometry. `--kv-cache-dtype` *asserts* the built-in codec and is refused when
    it disagrees (`crates/serving/worker/src/gpu_worker.rs:3066-3081`). So the

@@ -53,11 +53,13 @@ fn feature_keys(cargo_toml: &str) -> BTreeSet<String> {
 /// `scratchy-serving-api`/-worker deps), not hand-forwarded scope features.
 ///
 /// The admission rule, so this list cannot become a dumping ground: a name
-/// belongs here ONLY if it is not a model scope — i.e. it is not a checked-in
-/// `configs/<arch>/<stem>.json` stem, an `<arch>` directory name, `arch-<name>`,
-/// or `all`. Backend tiers (`spyre-hw`, `spyre-emu`) and capability features
-/// (`hf-completions`) pass that rule; a model or arch name never does, which is
-/// the duplication this test exists to catch.
+/// belongs here ONLY if this crate's declaration does more than forward to
+/// scratchy-models. The backends and their tiers (`spyre-hw`, `spyre-emu`) gate
+/// the serving crates. A feature that only forwards (`x = ["model?/x"]`) is
+/// never admitted, whatever it names — a model scope or a capability alike:
+/// name the dependency feature where it is used instead (`metal` names
+/// `model?/turboquant`, `default` names `model?/hf-completions`), and
+/// [`no_feature_of_this_crate_only_forwards_to_scratchy_models`] fails on one.
 const SHARED_NON_SCOPE_FEATURES: &[&str] = &[
     "default",
     "cuda",
@@ -66,8 +68,50 @@ const SHARED_NON_SCOPE_FEATURES: &[&str] = &[
     "spyre",
     "spyre-hw",
     "spyre-emu",
-    "hf-completions",
 ];
+
+/// No feature of this crate only forwards to scratchy-models, whether or not
+/// the two crates share its name: `model/<feature>` already reaches every
+/// scratchy-models feature, so a forwarder is a second spelling of one switch.
+/// Same dumb line scan as [`feature_keys`]: single-line arrays only, which is
+/// how every forwarder has been written.
+#[test]
+fn no_feature_of_this_crate_only_forwards_to_scratchy_models() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR unset");
+    let cli_toml = Path::new(&manifest_dir).join("Cargo.toml");
+    let cli_src = std::fs::read_to_string(&cli_toml)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", cli_toml.display()));
+    let features_start = cli_src.find("[features]").expect("no [features] table");
+    let after = &cli_src[features_start + "[features]".len()..];
+    let body = &after[..after.find("\n[").unwrap_or(after.len())];
+
+    let forwarders: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            let entries = value.trim().strip_prefix('[')?.strip_suffix(']')?;
+            let entries: Vec<&str> = entries
+                .split(',')
+                .map(|e| e.trim().trim_matches('"'))
+                .filter(|e| !e.is_empty())
+                .collect();
+            let forwards = !entries.is_empty()
+                && entries
+                    .iter()
+                    .all(|e| e.starts_with("model/") || e.starts_with("model?/"));
+            forwards.then_some(key.trim())
+        })
+        .collect();
+
+    assert!(
+        forwarders.is_empty(),
+        "crates/cli/scr/Cargo.toml declares feature(s) {forwarders:?} that only \
+         forward to scratchy-models — `model/<feature>` already reaches them. \
+         Name the dependency feature where it is used instead."
+    );
+}
 
 #[test]
 fn scratchy_models_is_aliased_model_with_no_hand_forwarded_scope_features() {

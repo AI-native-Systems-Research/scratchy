@@ -94,8 +94,8 @@ Note the convention for selecting models and quants:
   drafts with it (`--num-speculative-tokens 0` serves without). `spec/mtp`
   adds the other published drafters (the bf16 and QAT assistants, which draft
   when `--speculative-model` names them).
-- `hf-completions` — shell tab completion over the real HuggingFace ids this
-  build can actually run (`scr completions zsh --install`). **On by default**;
+- `model/hf-completions` — shell tab completion over the real HuggingFace ids
+  this build can actually run (`scr completions zsh --install`). **On by default**;
   it resolves that list against huggingface.co at build time, so an air-gapped
   build wants `--no-default-features`. See [`docs/BUILD.md`](docs/BUILD.md).
 - TurboQuant KV-cache compression is **on with `metal`**, for every model
