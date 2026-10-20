@@ -490,7 +490,10 @@ fn pointwise_opspec(
 /// `RedNonStick` (-1, a non-stick size-1 dim); `out` broadcast (a `[m, 1]` column
 /// vector like RmsNorm's inv_rms, or a `[1,1]` scalar const) → `out` = `RedStick`
 /// (-2, the one-stick `alpha_=0` broadcast READ proven on-card 2026-06-25). Both
-/// are MaterializedStick-safe. `y` is always `Active` (the unused trailing slot).
+/// are MaterializedStick-safe. `y` is `Active` for every operand but the ROW-SPLIT form
+/// ([`In::y_broadcast`]): a `[mb, out]` source sprayed down the op's leading `y` dim carries
+/// `y = RedNonStick` there — the vendor's own reduced-dim law (`superdsc.py`'s
+/// `reduced_dims → scale = -1`), the same scale the on-card-proven pmask fusion uses.
 #[derive(Clone, Copy)]
 pub struct EwOperand<'a> {
     // Fields are PRIVATE and there are NO raw ctors: the ONLY way to build an EwOperand is `In::ew()`,
@@ -506,6 +509,12 @@ pub struct EwOperand<'a> {
     layout: StickLayout,
     mb_broadcast: bool,
     out_broadcast: bool,
+    /// ⭐ THE ROW-SPLIT (Y) BROADCAST COUNT — 0 = not a y-broadcast; n ≥ 2 = the source is a
+    /// `[mb, out]` tile sprayed down the op's leading `y` dim, n sprays deep. Set only by
+    /// [`In::y_broadcast`], whose callers are the whole-function walk's Y admission (a
+    /// leading-axis `linalg.broadcast` over a multi-row source whose result is `[y, mb, ..]`),
+    /// so the count is the broadcast's OWN stated leading extent — not a caller's pick.
+    y_broadcast: u32,
     col_offset: u32,
     /// The [`crate::addr::ColWindow`] `col_offset` came from — set only by [`In::col_window`], so a
     /// stick-major presentation of a column window is admitted by type, never by testing the integer.
@@ -524,8 +533,22 @@ impl<'a> EwOperand<'a> {
             } else {
                 Scale::Active
             },
-            Scale::Active,
+            if self.y_broadcast > 0 {
+                Scale::RedNonStick
+            } else {
+                Scale::Active
+            },
         ]
+    }
+
+    /// The SAME scales in Y-MAJOR order `[y, mb, out]` — the layout order the row-split mode's
+    /// op presents its tensors in (the `TensorArg` layout of the y-major frame, the same
+    /// `["y", "mb", "out"]` head-outermost spelling the batched matmul's walks use). A rotation
+    /// of [`scale`](Self::scale)'s `[mb, out, y]`, so the y-major builder reads one ordered
+    /// triple per operand instead of re-deriving it at its own call site.
+    pub(crate) fn scale_ymajor(&self) -> [Scale; 3] {
+        let s = self.scale();
+        [s[2], s[0], s[1]]
     }
 
     // Read-only accessors, `pub(crate)` so the TileIR→SdscOp bridge functions that read these
@@ -541,6 +564,10 @@ impl<'a> EwOperand<'a> {
     }
     pub(crate) fn mb_broadcast(&self) -> bool {
         self.mb_broadcast
+    }
+    /// The row-split spray count — 0 when this operand is not a y-broadcast.
+    pub(crate) fn y_broadcast(&self) -> u32 {
+        self.y_broadcast
     }
     pub(crate) fn col_offset(&self) -> u32 {
         self.col_offset
@@ -562,12 +589,19 @@ impl<'a> EwOperand<'a> {
     ///   ROW, the RedStick `alpha_=0` broadcast READ.
     /// - mb-broadcast (a `[1, cols]` row vector: `mb`/`mb_at`): `1 × stick_elems`.
     /// - scalar (mb ∧ out, a `[1,1]` const): `1 × stick_lanes` — one stick.
+    /// - y-broadcast (the row-split form: `y_broadcast`): `(rows/y) × stick_elems` — the
+    ///   `[mb, out]` source at its own extent, one spray's worth of rows, at the SAME
+    ///   stick-padded width the dense operands sweep (the pad lanes are the mint's own
+    ///   footprint — the source region is single-stick by the frame law).
     pub(crate) fn swept_extents(
         &self,
         rows: u32,
         stick_elems: u32,
         stick_lanes: u32,
     ) -> (u32, u32) {
+        if self.y_broadcast > 1 {
+            return (rows / self.y_broadcast, stick_elems);
+        }
         match (self.mb_broadcast, self.out_broadcast) {
             (true, true) => (1, stick_lanes),
             (true, false) => (1, stick_elems),
@@ -4200,6 +4234,7 @@ pub struct In<'a, K: KindTag> {
     h: &'a Stk<K>,
     mb_broadcast: bool,
     out_broadcast: bool,
+    y_broadcast: u32,
     col_offset: u32,
     col_window: Option<crate::addr::ColWindow>,
 }
@@ -4210,6 +4245,7 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: false,
             out_broadcast: false,
+            y_broadcast: 0,
             col_offset: 0,
             col_window: None,
         }
@@ -4219,6 +4255,7 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: true,
             out_broadcast: true,
+            y_broadcast: 0,
             col_offset: 0,
             col_window: None,
         }
@@ -4228,6 +4265,7 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: false,
             out_broadcast: true,
+            y_broadcast: 0,
             col_offset: 0,
             col_window: None,
         }
@@ -4237,6 +4275,7 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: false,
             out_broadcast: false,
+            y_broadcast: 0,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
         }
@@ -4250,6 +4289,7 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: false,
             out_broadcast: false,
+            y_broadcast: 0,
             col_offset: w.dev().into_raw_elems(),
             col_window: Some(w),
         }
@@ -4261,6 +4301,7 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: false,
             out_broadcast: true,
+            y_broadcast: 0,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
         }
@@ -4271,6 +4312,7 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: true,
             out_broadcast: false,
+            y_broadcast: 0,
             col_offset: 0,
             col_window: None,
         }
@@ -4282,7 +4324,33 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: true,
             out_broadcast: false,
+            y_broadcast: 0,
             col_offset: col_offset.into_raw_elems(),
+            col_window: None,
+        }
+    }
+    /// ⭐⭐⭐ THE ROW-SPLIT (Y) BROADCAST — a `[mb, out]` source sprayed down the op's LEADING
+    /// `y` dim, `y` sprays deep: the batched paged-decode kernel's J-slot merge (`merged` at
+    /// `[64, 4]`, read by its consumer as the op `[mb = 64, out = 64, y = 4]`). The source is
+    /// addressed as the `[y, mb, out]` frame's `[mb, out]` slice at `y`'s stride-0 — scale
+    /// `y = RedNonStick`, the vendor's reduced-dim law — so flat element `(j, b, c)` reads the
+    /// source's `(b, c)` exactly. The frame law
+    /// ([`crate::sdsc_abstract::RegionFrame::split_rows`]) is checked by the consumer door
+    /// before this operand is built: `rows == y·mb`, the source single-stick. `y`
+    /// must be ≥ 2 — a spray of one is a reshape, not a broadcast, and is refused by the
+    /// admission upstream.
+    pub fn y_broadcast(h: &'a Stk<K>, y: u32) -> Self {
+        assert!(
+            y > 1,
+            "In::y_broadcast: a spray count of {y} is not a broadcast — the leading dim must \
+             spray a real count (the walk's Y admission refuses y == 1 upstream)"
+        );
+        In {
+            h,
+            mb_broadcast: false,
+            out_broadcast: false,
+            y_broadcast: y,
+            col_offset: 0,
             col_window: None,
         }
     }
@@ -4292,6 +4360,7 @@ impl<'a, K: KindTag> In<'a, K> {
             layout: self.h.layout(),
             mb_broadcast: self.mb_broadcast,
             out_broadcast: self.out_broadcast,
+            y_broadcast: self.y_broadcast,
             col_offset: self.col_offset,
             col_window: self.col_window,
         }

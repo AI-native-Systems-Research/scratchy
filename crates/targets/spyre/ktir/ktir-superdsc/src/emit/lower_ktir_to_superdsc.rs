@@ -941,8 +941,12 @@ fn scale_idx_of(layout: Option<&BundleLayout>, tid: u32) -> Option<usize> {
 /// ⛔ IT IS `node_to_tile_ops`' OWN DECLARATION, NOT A NEW ONE. That function builds `mb` from the
 /// output's rows, `out` from its cols (`is_stick`), a size-1 `y`, and `n_operands` from the operand
 /// count — pure shape, nothing that needs the node. `in`(K) is added for a matmul, and a ScalarMul's
-/// `out` is the DEVICE width. Those are the three arms, and they are the three arms here.
-pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, n_operands: u32) -> TileOp {
+/// `out` is the DEVICE width. Those are the three arms, and they are the three arms here — plus the
+/// `y` PARAMETER the row-split broadcast mode adds: the one arm that states a real `y > 1` is the
+/// leading-axis broadcast consumer (`elementwise_broadcast`'s Y arm, which derives `y` and
+/// `mb = rows/y` from the checked [`crate::sdsc_abstract::RowSplitFrame`]); every other caller
+/// passes 1 and keeps the size-1 dim this doc describes.
+pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, y: u32, n_operands: u32) -> TileOp {
     TileOp {
         kind: TileOpKind::PointwiseOrReduce { n_operands },
         dims: vec![
@@ -962,7 +966,7 @@ pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, n_operands: u32) -> TileOp
             },
             ItDim {
                 name: "y",
-                size: 1,
+                size: y.max(1),
                 is_reduction: false,
                 is_stick: false,
                 df: Df::Fp16,
@@ -1137,11 +1141,13 @@ fn pointwise_extents_agree(
 
 /// WHICH AXIS a pointwise operand is broadcast along.
 ///
-/// The two are not interchangeable and the device says which through a different [`In`] builder, so
+/// The three are not interchangeable and the device says which through a different [`In`] builder, so
 /// they are a variant rather than a `bool`: [`In::col`] marks the operand out-broadcast (a per-row
 /// scalar sprayed along the stick axis) and [`In::mb`] marks it mb-broadcast (a row vector sprayed
 /// down the rows). Emitting one for the other reads a `[m, 1]` operand as a `[1, n]` and takes the
-/// wrong bytes for every row after the first.
+/// wrong bytes for every row after the first. [`In::y_broadcast`] marks the ROW-SPLIT form — a
+/// multi-row `[mb, out]` source sprayed down the op's LEADING dim — whose count is carried in the
+/// variant because the op's `[mb, out, y]` facts are a function of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BcastAxis {
     /// `[m, 1]` → `[m, n]`: a per-row scalar (a row reduction's result) sprayed along the columns.
@@ -1149,6 +1155,12 @@ pub enum BcastAxis {
     Col,
     /// `[1, n]` → `[m, n]`: a row vector (an rmsnorm gain) sprayed down the rows. `n1[None, :]`.
     Mb,
+    /// `[mb, out]` → `[y, mb, out]`: a MULTI-row source sprayed down a new LEADING dim — the
+    /// row-split form, the batched paged-decode kernel's J-slot merge (`[64, 4] -> [4, 64, 4]`,
+    /// `Dimensions=[0]` over a source the walk-back proved to be `y·mb` rows). The count is the
+    /// broadcast's own stated leading extent; the consumer checks it against the source region's
+    /// frame ([`crate::sdsc_abstract::RegionFrame::split_rows`]) before building the operand.
+    Y(u32),
 }
 
 /// main's `lower_elementwise_node` (main 8362-8432). Its door: the [`Elementwise`] kind is stated by
@@ -1276,7 +1288,7 @@ pub fn elementwise(
     {
         let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
         let in_refs: Vec<&str> = in_names.iter().map(|s| s.as_str()).collect();
-        let tile_op = pointwise_tile_op(rows, cols, arity as u32 + 1);
+        let tile_op = pointwise_tile_op(rows, cols, 1, arity as u32 + 1);
         let op = assemble_pointwise_seeded_from_tile(
             &op_name,
             &tile_op,
@@ -1339,7 +1351,7 @@ pub fn elementwise(
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    let tile_op = pointwise_tile_op(rows, cols, arity as u32 + 1);
+    let tile_op = pointwise_tile_op(rows, cols, 1, arity as u32 + 1);
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
         &op_name,
         &tile_op,
@@ -1529,7 +1541,7 @@ fn elementwise_per_row(
     let cols = FP16_ELEMS_PER_STICK;
     let rows = pointwise_rows(name, out)?;
     let op_name = format!("{op_func}_o{}", out.tid);
-    let tile_op = pointwise_tile_op(rows, cols, arity as u32 + 1);
+    let tile_op = pointwise_tile_op(rows, cols, 1, arity as u32 + 1);
     let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
     let in_refs: Vec<&str> = in_names.iter().map(|s| s.as_str()).collect();
     let op = assemble_pointwise_seeded_from_tile(
@@ -1609,17 +1621,47 @@ fn elementwise_broadcast(
     // one; comparing a window's inputs against a view's extent is the mismatch that reads rows
     // nobody wrote.
     let rows = pointwise_rows(name, out)?;
+    // ⭐⭐⭐ THE ROW-SPLIT (Y) MODE'S FRAME, DERIVED BEFORE THE WANT LOOP — because the want row
+    // for a `Y` operand (`rows/y`) is only honest when `y` DIVIDES `rows`, and that divisibility
+    // is itself half of the frame law: the output's own device frame `[rows, c_len]` must split
+    // into exactly `y` sprays of `rows/y` rows with the `out` dim the ONE stick (the source is
+    // single-stick). [`RegionFrame::split_rows`] checks all of it and returns the op's
+    // `[mb, out, y]` facts; its `Err` is the refusal, so a row-split the bytes do not support is
+    // a build failure here, not a wrong-byte bake (the mb re-row's own defect class).
+    let ymode: Option<u32> = bcast.iter().find_map(|b| match b {
+        Some(BcastAxis::Y(y)) => Some(*y),
+        _ => None,
+    });
+    let split = match ymode {
+        Some(y) => Some(
+            crate::sdsc_abstract::RegionFrame::stick_blocked(
+                rows as usize,
+                out.c_len as usize,
+                crate::superdsc_opspec::Df::Fp16,
+            )
+            .split_rows(y as usize, (rows / y) as usize)
+            .map_err(|e| Error {
+                message: format!("Elementwise({kind:?}) {name}: output t{}: {e}", out.tid),
+            })?,
+        ),
+        None => None,
+    };
     for (i, x) in ins.iter().enumerate() {
         let want = match bcast[i] {
             None => (rows, out.c_len),
             Some(BcastAxis::Col) => (rows, 1),
             Some(BcastAxis::Mb) => (1, out.c_len),
+            // ⭐ THE ROW-SPLIT SOURCE IS THE `[mb, out]` TILE — one spray's worth of the output's
+            // rows, at the output's own column extent. The divisibility that makes `rows/y`
+            // honest is the frame law above, already proven.
+            Some(BcastAxis::Y(y)) => (rows / y, out.c_len),
         };
         if (x.v_rows, x.c_len) != want {
             return err(format!(
                 "Elementwise({kind:?}) {name}: input {i} t{} is `[{}, {}]` but its operand mode \
                  ({:?}) requires `[{}, {}]` against the `[{}, {}]` output t{}. A `Col` operand is one \
-                 value per row (`[rows, 1]`), an `Mb` operand one row of values (`[1, cols]`), and a \
+                 value per row (`[rows, 1]`), an `Mb` operand one row of values (`[1, cols]`), a `Y` \
+                 operand one spray's worth of rows (`[rows/y, cols]`), and a \
                  dense operand the whole tile; the descriptor addresses it as its mode says, so an \
                  extent that disagrees reads bytes nobody wrote.",
                 x.tid, x.v_rows, x.c_len, bcast[i], want.0, want.1, out.v_rows, out.c_len, out.tid,
@@ -1630,7 +1672,11 @@ fn elementwise_broadcast(
     // through [`elementwise_per_row`]: the value rides in lane 0 of a one-stick output, which is the
     // width `attn.rs`'s own `lcorr`/`ladd` emissions state. A broadcast OPERAND of a per-row op is
     // still an operand mode (a spray is addressing, not width), so only the width is folded here.
-    let cols = if out.c_len == 1 {
+    // The Y mode's width is the frame's `out` — the ONE stick the split law allows — which is the
+    // same pad-up a `[rows, 1]` output takes: the mint's footprint already reserved it.
+    let cols = if let Some(s) = split {
+        s.out as u32
+    } else if out.c_len == 1 {
         FP16_ELEMS_PER_STICK
     } else {
         out.c_len
@@ -1656,7 +1702,12 @@ fn elementwise_broadcast(
             // handle's declaration, so the annotation now states the footprint the storage always
             // had — `rb(name, rows, 64)`, the same handle `rmsnorm.rs` mints for `rinv`.
             Some(BcastAxis::Col) => rb(n, x.v_rows, FP16_ELEMS_PER_STICK),
-            _ => rb(n, x.v_rows, x.c_len),
+            // ⭐⭐⭐ AND IN THE Y MODE EVERY OPERAND IS STICK-WIDE for the same reason: the op's
+            // `out` dim IS the one stick the frame law allows, so the dense operand's storage is
+            // `[v_rows, 64]` — the footprint its `(v_rows, c_len < 64)` mint already reserved —
+            // and the swept window the mint checks (`rows × stick` dense, `rows/y × stick` for
+            // the spray) fits it exactly.
+            _ => rb(n, x.v_rows, if split.is_some() { cols } else { x.c_len }),
         })
         .collect();
     let ew: Vec<_> = in_handles
@@ -1666,11 +1717,22 @@ fn elementwise_broadcast(
             None => In::full(h).ew(),
             Some(BcastAxis::Col) => In::col(h).ew(),
             Some(BcastAxis::Mb) => In::mb(h).ew(),
+            Some(BcastAxis::Y(y)) => In::y_broadcast(h, *y).ew(),
         })
         .collect();
     // The SAME `TileOp` the dense arm builds, so the two arms share one LX-tiling contract and a
-    // broadcast op is not silently exempt from it.
-    let tile_op = pointwise_tile_op(rows, cols, ins.len() as u32 + 1);
+    // broadcast op is not silently exempt from it. In the Y mode the tile states the OP's own
+    // `[mb, out, y]` dims — `mb` one spray's worth of rows, `y` the spray count — which is the
+    // iteration space the y-major TensorArgs (`["y", "mb", "out"]`) walk.
+    let tile_op = pointwise_tile_op(
+        match &split {
+            Some(s) => s.mb as u32,
+            None => rows,
+        },
+        cols,
+        ymode.unwrap_or(1),
+        ins.len() as u32 + 1,
+    );
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
         &op_name,
         &tile_op,
@@ -5770,6 +5832,208 @@ mod elementwise_tests {
         assert_eq!(ops[0].op_name, "multiply_o7");
     }
 
+    /// ⭐⭐⭐ THE ROW-SPLIT (Y) MODE NOW EMITS — the J-slot merge's own op at its production
+    /// geometry: the subtract whose operands are the `[256, 4]` score tile (dense) and the
+    /// `[64, 4]` merged max (the J-reduce's output, one spray's worth of rows), under a
+    /// `[256, 4]` output — the exact regions the batched paged-decode kernel's broadcast chain
+    /// resolves to. One op, still `sub_o*`: the operand mode is addressing, not a
+    /// decomposition, and the frame law (`RegionFrame::split_rows`) has already re-proven
+    /// `rows == y*mb` and the single-stick source before any operand was built.
+    #[test]
+    fn a_stated_y_broadcast_operand_emits_one_op() {
+        let r = node(
+            reg(5, 256, 4, false),
+            reg(6, 64, 4, false),
+            reg(7, 256, 4, true),
+        );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[None, Some(BcastAxis::Y(4))],
+            &mut sym,
+            None,
+        )
+        .expect("the J-slot merge's subtract is the row-split operand mode");
+        assert_eq!(ops.len(), 1, "an operand mode is not a decomposition");
+        assert_eq!(
+            ops[0].op_name, "sub_o7",
+            "the descriptor NAME must not change with the operand mode — it feeds the bundle \
+             fingerprint, and the row-split arm is the same op",
+        );
+    }
+
+    /// ⭐ AND THE DESCRIPTOR STATES THE Y-MAJOR FRAME — the same op built directly at the
+    /// `OpSpec` door, pinning what the bake actually receives: the plan walks `mb=64` (one
+    /// spray's worth of rows), `out=64` (the ONE stick the frame law allows), `y=4` (the spray
+    /// count); every tensor's layout is `["y", "mb", "out"]`; and the merged source's scale is
+    /// `RedNonStick` on the `y` slot — the vendor's reduced-dim law, the stride-0 read that
+    /// addresses `source[b, c]` at `result[j, b, c]` byte for byte.
+    #[test]
+    fn the_row_split_op_states_the_y_major_frame() {
+        use crate::superdsc_opspec::Scale;
+        let dense_h = rb("t5", 256, 64);
+        let merged_h = rb("t6", 64, 64);
+        let dense = In::full(&dense_h).ew();
+        let merged = In::y_broadcast(&merged_h, 4).ew();
+        let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
+            &pointwise_tile_op(64, 64, 4, 3),
+            256,
+            64,
+            op_func_from_str("sub"),
+            &[dense, merged],
+            "t7",
+            crate::addr::OutCorner::ZERO,
+            false,
+            None,
+            EwDivision::Law,
+        )
+        .expect("the row-split op emits");
+        assert_eq!(op.iter.extent("mb"), 64, "mb is one spray's worth of rows");
+        assert_eq!(
+            op.iter.extent("out"),
+            64,
+            "out is the ONE stick the frame law allows"
+        );
+        assert_eq!(op.iter.extent("y"), 4, "y is the spray count");
+        for a in &op.args {
+            assert_eq!(
+                a.view().layout,
+                &["y", "mb", "out"] as &[&'static str],
+                "every tensor presents y-major in the row-split mode: {}",
+                a.view().name
+            );
+        }
+        let merged_view = op
+            .args
+            .iter()
+            .find(|a| a.view().name == "t6")
+            .expect("the merged source's arg")
+            .view();
+        assert_eq!(
+            merged_view.scale,
+            &[Scale::RedNonStick, Scale::Active, Scale::Active] as &[Scale],
+            "the spray dim is the stride-0 read — the vendor's reduced-dim law"
+        );
+    }
+
+    /// ⛔ THE TILE AND THE OPERANDS MUST AGREE ON THE SPRAY COUNT — a `TileOp` whose `y` dim
+    /// states a different count than the y-broadcast operands spray is a caller that built its
+    /// tile from a different shape than its operands, and the tiler's iteration space and the
+    /// operands' addressing would read different bytes. Refused by name.
+    #[test]
+    fn a_tile_that_disagrees_with_the_spray_count_is_refused() {
+        let dense_h = rb("t5", 256, 64);
+        let merged_h = rb("t6", 64, 64);
+        let dense = In::full(&dense_h).ew();
+        let merged = In::y_broadcast(&merged_h, 4).ew();
+        let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
+            &pointwise_tile_op(64, 64, 2, 3),
+            256,
+            64,
+            op_func_from_str("sub"),
+            &[dense, merged],
+            "t7",
+            crate::addr::OutCorner::ZERO,
+            false,
+            None,
+            EwDivision::Law,
+        ) else {
+            panic!("a tile stating y=2 over operands that spray 4 must not emit");
+        };
+        assert!(
+            m.contains("the TileOp's `y` dim states") && m.contains("spray 4"),
+            "states both counts: {m}"
+        );
+    }
+
+    /// ⛔ THE SINGLE-STICK LAW AT THE OPSPEC DOOR — a row-split op wider than one stick did not
+    /// come through the Y admission (the spray's source is single-stick by the frame law), and
+    /// emitting it would address a wide op in a frame built for one stick. Refused by name.
+    #[test]
+    fn a_row_split_op_wider_than_one_stick_is_refused() {
+        let dense_h = rb("t5", 256, 128);
+        let merged_h = rb("t6", 64, 128);
+        let dense = In::full(&dense_h).ew();
+        let merged = In::y_broadcast(&merged_h, 4).ew();
+        let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
+            &pointwise_tile_op(64, 128, 4, 3),
+            256,
+            128,
+            op_func_from_str("sub"),
+            &[dense, merged],
+            "t7",
+            crate::addr::OutCorner::ZERO,
+            false,
+            None,
+            EwDivision::Law,
+        ) else {
+            panic!("a row-split op at cols=128 must not emit");
+        };
+        assert!(
+            m.contains("a row-split (y-broadcast) op at cols=128"),
+            "names the width and the law: {m}"
+        );
+    }
+
+    /// ⛔ THE FRAME LAW AT THE CONSUMER DOOR — an output whose rows do not split into exactly
+    /// `y` sprays of the source's rows (`250` into 4 sprays of 62 — 248, two short) is refused
+    /// by the frame law BEFORE any want check or operand is built: the split the bytes do not
+    /// support is a build failure, not a wrong-byte bake.
+    #[test]
+    fn an_output_whose_rows_do_not_split_is_refused_by_the_frame_law() {
+        let r = node(
+            reg(5, 250, 4, false),
+            reg(6, 62, 4, false),
+            reg(7, 250, 4, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[None, Some(BcastAxis::Y(4))],
+            &mut sym,
+            None,
+        ) else {
+            panic!("250 rows do not split into 4 sprays of 62 — the frame law must refuse");
+        };
+        assert!(
+            e.message.contains("rows == y*mb"),
+            "names the frame law's own arithmetic: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ AND THE MULTI-STICK OUTPUT — a `[256, 128]` output under a row-split flag: the
+    /// source would have to be multi-stick, which the split law refuses (the split's `out` dim
+    /// IS the one stick). Refused by name at the same door.
+    #[test]
+    fn a_multi_stick_output_under_a_row_split_flag_is_refused() {
+        let r = node(
+            reg(5, 256, 128, false),
+            reg(6, 64, 128, false),
+            reg(7, 256, 128, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[None, Some(BcastAxis::Y(4))],
+            &mut sym,
+            None,
+        ) else {
+            panic!("a multi-stick row-split source must not emit");
+        };
+        assert!(
+            e.message.contains("SINGLE stick column"),
+            "names the single-stick law: {}",
+            e.message
+        );
+    }
+
     /// ⛔⛔⛔ THE AXIS AND THE EXTENT MUST AGREE, and this is the refusal that makes the flag a
     /// STATEMENT rather than a licence. A `Col` flag over an operand that is really the whole tile
     /// would address one lane per row and spray it over 128 columns — a silently wrong answer with no
@@ -7437,7 +7701,7 @@ fn scalarmul_scaled(
     let inputs = [In::col_window(&x_h, corner).ew(), In::scalar(&scale_h).ew()];
     // ⭐ THE SAME `TileOp` `node_to_tile_ops`' ScalarMul arm declares: `out` at the DEVICE width
     // computed above, `n_operands: 2` (the scalar rides in the op, not as a tiled operand).
-    let mut tile_op = pointwise_tile_op(rows, cols, 2);
+    let mut tile_op = pointwise_tile_op(rows, cols, 1, 2);
     tile_op.kind = TileOpKind::PointwiseOrReduce { n_operands: 2 };
     // ⭐⭐⭐ THE GATHERED FORM IS THE SAME OP WITH AN INDEX OPERAND ON ITS FIRST INPUT — not a different
     // `opFuncName`. The shipped `dxp/test/test_gather_1core/sdsc_1.json` is an ordinary `identity`

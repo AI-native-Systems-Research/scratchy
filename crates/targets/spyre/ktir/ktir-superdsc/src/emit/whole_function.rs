@@ -1292,7 +1292,9 @@ fn program_broadcast_chains(
                 f.name
             ));
         };
-        let (axis, flat) = match (rank, dims) {
+        // Mutable because the Y ADMISSION below re-states a leading multi-row spray's axis and
+        // flat flag after the walk-back has resolved the source's own row count.
+        let (mut axis, mut flat) = match (rank, dims) {
             (_, [1]) if rank <= 2 => (BcastAxis::Col, false),
             (_, [0]) if rank <= 2 => (BcastAxis::Mb, false),
             (r, [d]) if r > 2 && *d as usize == r - 1 => (BcastAxis::Col, true),
@@ -1358,7 +1360,12 @@ fn program_broadcast_chains(
                     };
                     let want = match axis {
                         BcastAxis::Col => target.len().checked_sub(1),
-                        BcastAxis::Mb => Some(0),
+                        // `Mb` and the (later-assigned) `Y` both spray a LEADING axis: the
+                        // relay's insert must be the leading `1` either way — at classification
+                        // time the axis is still `Mb` (the `Y` admission runs after the
+                        // walk-back, on the resolved source's own row count), and a chain the
+                        // admission flips to `Y` passed the same leading-`1` check here.
+                        BcastAxis::Mb | BcastAxis::Y(_) => Some(0),
                     };
                     // CROSS-CHECKED AGAINST THE BROADCAST'S OWN `Dimensions`: two independent
                     // statements of the same axis, so a program where they disagree is refused instead
@@ -1374,13 +1381,82 @@ fn program_broadcast_chains(
                             f.name,
                             match axis {
                                 BcastAxis::Col => "trailing",
-                                BcastAxis::Mb => "leading",
+                                // `Mb` and the post-walk-back `Y` both spray the LEADING axis —
+                                // the same word names it for the reader either way.
+                                BcastAxis::Mb | BcastAxis::Y(_) => "leading",
                             }
                         ));
                     }
                     saw_degenerate_expand = true;
                 }
                 OpKind::TensorCollapseShape => {}
+                // ⭐ A NUMEL-PRESERVING `TensorReshape` IS A FLAT NO-OP, SO THE WALK TRAVERSES IT.
+                // A reshape states no degenerate dim and moves no element: it re-frames the SAME
+                // row-major flat order (Triton's `tl.reshape`, the only producer this door sees),
+                // so the value it produces and the value it consumes are the SAME BYTES and the
+                // source the walk is looking for is on the far side of it. That is exactly the
+                // J-slot merge's own sandwich — `merged [64, 4] -> reshape [1, 64, 4] -> collapse
+                // -> broadcast` — whose source is the J-reduce's OUTPUT, a mint this function's
+                // consumer looks up by SSA; stopping at the reshape would name a plumbing value
+                // no mint exists for. The numel equality is the whole proof: an element-count
+                // change is a real data movement (a relayout this door cannot express), named
+                // below rather than traversed. This is the ONE reshape fact this walk takes;
+                // forwarding a source region THROUGH a reshape for a general consumer is wall 5's
+                // own door, not this one.
+                OpKind::TensorReshape => {
+                    let target = d.attributes.iter().find_map(|(k, v)| match (k, v) {
+                        (AttrKey::TargetShape, Attr::IntList(t)) => Some(*t),
+                        _ => None,
+                    });
+                    let Some(target) = target else {
+                        return err(format!(
+                            "{}: `tensor.reshape` states no `TargetShape`, so whether it \
+                             preserves the element count — the thing that makes it a flat no-op \
+                             the broadcast walk can traverse — cannot be decided",
+                            f.name
+                        ));
+                    };
+                    let target_numel: i64 = target.iter().product();
+                    // The SOURCE's own extent, from the op that produced the reshape's operand —
+                    // the next hop out, which the loop is about to walk to anyway.
+                    let source_numel = d
+                        .operands
+                        .first()
+                        .and_then(|&s| def_of(s))
+                        .and_then(|sd| {
+                            sd.attributes.iter().find_map(|(k, v)| match (k, v) {
+                                (AttrKey::Shape, Attr::IntList(l)) => {
+                                    Some(l.iter().product::<i64>())
+                                }
+                                _ => None,
+                            })
+                        })
+                        .or_else(|| {
+                            d.operands.first().and_then(|&s| def_of(s)).and_then(|sd| {
+                                sd.result_type
+                                    .as_ref()
+                                    .and_then(|t| t.dims().map(|ds| ds.iter().product::<i64>()))
+                            })
+                        });
+                    match source_numel {
+                        Some(n) if n == target_numel => {}
+                        Some(n) => {
+                            return err(format!(
+                                "{}: `tensor.reshape` targets {target:?} ({target_numel} \
+                                 elements) from a {n}-element source — a reshape that changes the \
+                                 element count is a real data movement, not the flat no-op a \
+                                 broadcast chain traverses. The broadcast's source would be a \
+                                 relayout this door cannot express, so it is named rather than \
+                                 mis-addressed",
+                                f.name
+                            ));
+                        }
+                        // The source's extent is not stated here: stop AT the reshape's result
+                        // and let the consumer's own region lookup name what cannot be found,
+                        // rather than guessing the traversal.
+                        None => break,
+                    }
+                }
                 _ => break,
             }
             chain.push(cursor);
@@ -1392,34 +1468,107 @@ fn program_broadcast_chains(
         // ⭐⭐⭐ A FLAT `Mb` STILL OWES ITS ONE-ROW PROOF, AND THE EXPAND DOES NOT GIVE IT. A
         // leading degenerate expand on a `[64, 4]` source targets `[1, 64, 4]` — degenerate on
         // axis 0, exactly what the cross-check above wants — yet the source is SIXTY-FOUR flat
-        // rows, and spraying it down a leading axis repeats each of them (the batched kernel's
-        // J-slot merge, `[64, 4] -> [4, 64, 4]`, spelled `reshape -> collapse -> broadcast
-        // dims=[0]` with NO expand at all). The rank-2 law never needed this: a rank-2 `Mb`
-        // source IS one row by shape. The flat form must say it in its own frame: the source's
-        // `shape_2d` rows — every axis but the last folded — must be 1. It runs BEFORE the
-        // second proof so a multi-row leading spray gets THIS refusal — the one naming the
-        // restatements — and not the generic unproven-extent one.
+        // rows. The rank-2 law never needed this: a rank-2 `Mb` source IS one row by shape. The
+        // flat form must say it in its own frame: the source's `shape_2d` rows — every axis but
+        // the last folded — must be 1. A source that passes keeps the flat `Mb` verbatim. A
+        // MULTI-row source falls to the Y ADMISSION below before any refusal is returned, so a
+        // leading spray over real rows gets the mode that addresses it — or the refusal naming
+        // why not — and not the generic unproven-extent one.
+        let mut y_admitted = false;
         if flat && axis == BcastAxis::Mb {
             let source_rows = def_of(cursor)
                 .and_then(super::lower_ktir_to_superdsc::shape_2d)
                 .map(|(r, _)| r);
             if source_rows != Some(1) {
-                return err(format!(
-                    "{}: `linalg.broadcast` sprays a rank > 2 source down its LEADING axis, but the \
-                     source is {} flat rows — ROW-REPLICATION, each flat row repeating down the \
-                     merged row axis (the batched paged-decode kernel's J-slot merge is exactly \
-                     this shape, `[64, 4] -> [4, 64, 4]`). The device's `mb` operand mode addresses \
-                     ONE row once; no operand mode advances an address every k rows, and no \
-                     descriptor in this door's vocabulary does, so this is named rather than \
-                     half-addressed. The door-proven statements of the same math are a real \
-                     permute (restating the merge so the merged axis is TRAILING) or unrolled \
-                     per-J state variables — the kernel's own choice, not a lowering fix",
-                    f.name,
-                    source_rows.unwrap_or(0)
-                ));
+                // ⭐⭐⭐⭐⭐ THE Y ADMISSION — the ROW-SPLIT broadcast. A leading-axis spray over a
+                // MULTI-row source is not row-replication when the result's own shape says the
+                // split: `[y, mb, ..]` with `y > 1` and `mb` the source's OWN row count. That is
+                // the J-slot merge exactly — `merged [64, 4] -> [4, 64, 4]`, `Dimensions=[0]` —
+                // and the device CAN address it: the consumer op `[mb, out, y]` presents every
+                // tensor in the `[y, mb, out]` frame and the source is the `[mb, out]` slice at
+                // y's stride-0 (scale `y = -1`, the vendor's reduced-dim law — the same scale the
+                // on-card pmask fusion uses), so flat element `(j, b, c)` reads the source's
+                // `(b, c)` byte for byte. The count comes from the broadcast's OWN stated leading
+                // extent and the cover from the source's own shape, so the admission is proved
+                // from two independent statements — and the consumer re-proves it against the
+                // resolved REGION (`elementwise_broadcast`'s want check + the frame law) before
+                // any operand is built. Everything else about a leading multi-row spray really is
+                // row-replication and is refused by name below.
+                let res_shape = bc
+                    .attributes
+                    .iter()
+                    .find_map(|(k, v)| match (k, v) {
+                        (AttrKey::Shape, Attr::IntList(s)) => Some(s.to_vec()),
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        bc.result_type
+                            .as_ref()
+                            .and_then(|t| t.dims().map(|d| d.to_vec()))
+                    });
+                let Some(s) = res_shape else {
+                    return err(format!(
+                        "{}: `linalg.broadcast` sprays a rank > 2 source of {} flat rows down its \
+                         LEADING axis but states no shaped result, so the row-split frame — the \
+                         `[y, mb, ..]` the leading dim would have to name — cannot be proven. The \
+                         `mb` operand mode addresses ONE row once and the row-split mode needs the \
+                         spray count, so neither can be chosen for it",
+                        f.name,
+                        source_rows.unwrap_or(0)
+                    ));
+                };
+                let y = s.first().copied().unwrap_or(0);
+                if y <= 1 {
+                    return err(format!(
+                        "{}: `linalg.broadcast` sprays a rank > 2 source of {} flat rows down its \
+                         LEADING axis to a result whose leading dim is {y} — a spray of one is no \
+                         broadcast (the dim is already there), and anything else over a multi-row \
+                         source is ROW-REPLICATION: each flat row repeating down the merged row \
+                         axis. The device's `mb` operand mode addresses ONE row once; the \
+                         row-split mode needs a real `y > 1`; neither addresses this, so it is \
+                         named rather than half-addressed",
+                        f.name,
+                        source_rows.unwrap_or(0)
+                    ));
+                }
+                match source_rows {
+                    None => {
+                        return err(format!(
+                            "{}: `linalg.broadcast` sprays a rank > 2 source down its LEADING \
+                             axis to {s:?}, but the source states no shape, so its row count — the \
+                             split's `mb` — is unproven. The row-split frame needs `rows == y*mb` \
+                             exactly, and an unproven cover either reads rows the source does not \
+                             have or leaves rows unaddressed",
+                            f.name
+                        ));
+                    }
+                    Some(rows) if s.get(1).is_some_and(|&m| m as u32 == rows) => {
+                        axis = BcastAxis::Y(y as u32);
+                        flat = false;
+                        y_admitted = true;
+                    }
+                    Some(rows) => {
+                        return err(format!(
+                            "{}: `linalg.broadcast` sprays a {}-flat-row source down its LEADING \
+                             axis to {s:?} — the merged axis does not line up with the source's \
+                             rows, so this is ROW-REPLICATION, each flat row repeating down the \
+                             merged row axis (the batched paged-decode kernel's J-slot merge is \
+                             the admitted form of this shape, `[64, 4] -> [4, 64, 4]`, and it \
+                             lines up: 4 sprays of the source's own 64 rows). The device's `mb` \
+                             operand mode addresses ONE row once and the row-split mode needs \
+                             `rows == y*mb` exactly, so neither addresses this, and no descriptor \
+                             in this door's vocabulary does — it is named rather than \
+                             half-addressed. The door-proven statements of the same math are a \
+                             real permute (restating the merge so the merged axis is TRAILING) or \
+                             unrolled per-J state variables — the kernel's own choice, not a \
+                             lowering fix",
+                            f.name, rows
+                        ));
+                    }
+                }
             }
         }
-        if !saw_degenerate_expand {
+        if !saw_degenerate_expand && !y_admitted {
             // ⭐ THE SOURCE'S OWN LOAD IS A SECOND PROOF OF THE SAME FACT. An fp8 weight-scale chain
             // does not spell the expand: the kernel loads the scale as a `[1, n]` WINDOW of its own
             // parameter (`matmul_fp8.py`'s `ws_desc.load([0, 0])` over a `[1, n]` descriptor),
@@ -1451,6 +1600,11 @@ fn program_broadcast_chains(
                             want_rows.is_some_and(|w| r as i64 * c as i64 == w)
                         }
                         BcastAxis::Mb => r == 1,
+                        // Unreachable: a `Y` chain is `flat = false` by the time it gets here
+                        // (the admission that mints `Y` clears the flag), and this proof block
+                        // is skipped for an admitted `Y` — the row-split source is a FULL TILE
+                        // by design, the opposite of a vector, so `false` is the honest arm.
+                        BcastAxis::Y(_) => false,
                     })
                 } else {
                     d.op_type == OpKind::KtdpLoad
@@ -1458,6 +1612,9 @@ fn program_broadcast_chains(
                             match axis {
                                 BcastAxis::Mb => r == 1,
                                 BcastAxis::Col => c == 1,
+                                // Unreachable for the same reason the flat-proof arm above
+                                // states: an admitted `Y` skips this whole block.
+                                BcastAxis::Y(_) => false,
                             }
                         })
                 }
@@ -1516,10 +1673,43 @@ fn program_broadcast_chains(
 /// base-address law: they refuse a nonzero row start by name rather than addressing row 0, so a
 /// parameter-backed flat source whose window starts off-base is refused downstream — named, not
 /// mis-addressed. A minted intermediate starts at 0 and is the kernel's own case.
-fn presented_flat(r: &Region, axis: BcastAxis) -> Region {
+///
+/// ⭐⭐⭐ CHECKED, NOT ASSUMED — the presentation is a RE-FRAME of the source's device frame, so
+/// it goes through [`crate::sdsc_abstract::RegionFrame`]: the `Col` form is the re-row
+/// `[numel, 1]` (byte-faithful exactly at a one-column source, where it is the identity) and the
+/// `Mb` form is the contiguous-read presentation `[1, numel]` (byte-faithful exactly at a
+/// one-row or single-stick source). A multi-column source presented `[numel, 1]` would read
+/// element `f = r·cols + c` at stick `f` while the buffer holds it at `r·lanes + c` — wrong for
+/// every row past the first — so it is an `Err` HERE, at the reframe, rather than a clean bake
+/// of wrong bytes. The `Y` axis presents nothing (its admission clears the flat flag), and its
+/// arm is the identity for exactly that reason.
+fn presented_flat(r: &Region, axis: BcastAxis) -> Result<Region, String> {
+    // THE SOURCE VIEW'S OWN FRAME — the byte law is decided on the frame the mint reserved,
+    // before any presentation field is touched.
+    let frame = crate::sdsc_abstract::RegionFrame::stick_blocked(
+        r.v_rows as usize,
+        r.v_cols as usize,
+        crate::superdsc_opspec::Df::Fp16,
+    );
+    let presented = match axis {
+        BcastAxis::Col => frame.flat_col()?,
+        BcastAxis::Mb => frame.flat_mb()?,
+        // The row-split mode addresses the source's OWN `[mb, out]` region — the presentation
+        // is the identity, and this arm exists only because the match is exhaustive.
+        BcastAxis::Y(_) => return Ok(*r),
+    };
     let view_numel = r.v_rows as u64 * r.v_cols as u64;
     let window_numel = r.r_len as u64 * r.c_len as u64;
     let start = r.r_start as u64 * r.v_cols as u64 + r.c_start as u64;
+    debug_assert_eq!(
+        (presented.rows as u64, presented.cols as u64),
+        match axis {
+            BcastAxis::Col => (view_numel, 1),
+            BcastAxis::Mb => (1, view_numel),
+            BcastAxis::Y(_) => (r.v_rows as u64, r.v_cols as u64),
+        },
+        "the presented frame and the presented Region state the same shape"
+    );
     let mut f = *r;
     match axis {
         BcastAxis::Col => {
@@ -1542,8 +1732,9 @@ fn presented_flat(r: &Region, axis: BcastAxis) -> Region {
             f.r_start = 0;
             f.c_start = start as u32;
         }
+        BcastAxis::Y(_) => {}
     }
-    f
+    Ok(f)
 }
 
 /// The [`Region`] one OPERAND names, by walking back from the value to the parameter it reads.
@@ -2623,19 +2814,26 @@ pub fn lower_function(
             // through `In::col`/`In::mb` and the minted-buffer annotation — without a rank-3
             // arm anywhere downstream. Rank 2 presents nothing (`bcast_flat` is `false`) and
             // keeps its verbatim behavior.
-            let present = |mut r: Region| {
+            // ⛔ AND THE PRESENTATION IS CHECKED AT THE REFRAME: a multi-column source presented
+            // `[numel, 1]`, or a multi-stick source presented `[1, numel]`, is a re-frame the
+            // bytes do not support, and `presented_flat`'s `RegionFrame` law refuses it HERE —
+            // a build failure naming the arithmetic, never a clean bake of wrong bytes.
+            let present = |mut r: Region| -> Result<Region, Error> {
                 if bcast_flat[i] {
                     r = presented_flat(
                         &r,
                         bcast_axes[i].expect("bcast_flat is set only where an axis is"),
-                    );
+                    )
+                    .map_err(|e| Error {
+                        message: format!("{}: {e}", f.name),
+                    })?;
                 }
                 r.is_out = false;
-                r
+                Ok(r)
             };
             match region_for_operand(k, *v)? {
                 Some(r) => {
-                    per_op.push(present(r));
+                    per_op.push(present(r)?);
                     from_parameter.push(true);
                 }
                 // A value the walk cannot reach is either an intermediate this function already
@@ -2644,7 +2842,7 @@ pub fn lower_function(
                 // producer's behalf.
                 None => match inter.get(v) {
                     Some(r) => {
-                        per_op.push(present(*r));
+                        per_op.push(present(*r)?);
                         from_parameter.push(false);
                     }
                     None => {
@@ -2677,11 +2875,19 @@ pub fn lower_function(
             let degenerate = match axis {
                 BcastAxis::Col => r.c_len == 1,
                 BcastAxis::Mb => r.v_rows == 1,
+                // ⭐ THE ROW-SPLIT SOURCE IS A FULL TILE ON PURPOSE — the opposite of degenerate
+                // — so there is nothing to check in THIS frame. Its proof is the consumer's own
+                // want check (`elementwise_broadcast`: the source at `[rows/y, c_len]` against
+                // the result's rows) plus the `RegionFrame::split_rows` law the consumer runs
+                // before building the operand: `rows == y·mb`, single stick. Those two
+                // independent statements own it; a third here would be a copy that can drift.
+                BcastAxis::Y(_) => true,
             };
             if !degenerate {
                 let what = match axis {
                     BcastAxis::Col => "column",
                     BcastAxis::Mb => "row",
+                    BcastAxis::Y(_) => "row-split",
                 };
                 return err(format!(
                     "{}: `{:?}` input {i} is a recognised {axis:?} broadcast, but the source it \
@@ -3593,7 +3799,7 @@ fn gathered_matmul_materializes(
     // builder reads name + kind only, so the dims are the mint's bound and nothing else.
     let x_h = super::rb(&table_name, rows, head);
     let inputs = [super::In::full(&x_h).ew()];
-    let tile_op = super::lower_ktir_to_superdsc::pointwise_tile_op(rows, head, 2);
+    let tile_op = super::lower_ktir_to_superdsc::pointwise_tile_op(rows, head, 1, 2);
     // ⭐ THE RUN — the program's stick-checked anchor plus the whole sticks these rows span
     // ([`StickRun::covering`]). The constructor's start half re-states `gathers_of`'s anchor
     // check at the door that builds the legs, so a mid-stick anchor has no path around it.
@@ -4015,20 +4221,81 @@ mod broadcast_chain_tests {
         );
     }
 
-    /// ⛔⛔ THE RANK-3 LEADING AXIS OVER A MULTI-ROW SOURCE — THE J-SLOT MERGE, `[64, 4] ->
+    /// ⭐⭐⭐ THE RANK-3 LEADING AXIS OVER A MULTI-ROW SOURCE — THE J-SLOT MERGE, `[64, 4] ->
     /// [1, 64, 4] -> collapse -> [4, 64, 4]` with `Dimensions=[0]`, the exact spelling the op
-    /// dump shows. The reshape's leading `1` satisfies the expand cross-check's own `want` — but
-    /// the source is SIXTY-FOUR flat rows, and spraying them down a leading axis repeats each one
-    /// every J rows. The `mb` mode addresses ONE row once; this is refused by name with the
-    /// restatements (a real permute, or unrolled per-J state variables) so the kernel side can
-    /// choose. This is the case that fails if the one-row law is ever dropped from the walk.
+    /// dump shows — ADMITTED as the ROW-SPLIT (`Y`) operand mode. The source is the `[mb, out]`
+    /// tile (sixty-four single-stick rows) and the broadcast sprays it down a NEW leading dim,
+    /// J sprays deep: `result[j, b, c] = source[b, c]`, which the `y`-broadcast scale
+    /// (`RedNonStick` on the new dim, the vendor's reduced-dim law) addresses byte for byte.
+    /// The walk-back crosses the numel-preserving `tt.reshape` (a reshape is a flat no-op) to
+    /// name the rank-2 SOURCE, and the frame law (`RegionFrame::split_rows`) re-proves the
+    /// divisibility at the emission before any operand is built.
     #[test]
-    fn the_rank3_leading_multirow_source_is_row_replication_and_refused() {
-        let m = refusal3(
+    fn the_rank3_leading_multirow_source_is_the_row_split_y_mode() {
+        let f = chain3(
             &[64, 4],
             Relay::Reshape(&[1, 64, 4]),
             &[64, 4],
             &[4, 64, 4],
+            &[0],
+        );
+        let (map, consumed) = program_broadcast_chains(&f).expect("the J-slot merge's own chain");
+        let b = map
+            .get(&Ssa(4))
+            .expect("the broadcast's result is what a consumer names");
+        assert_eq!(
+            b.axis,
+            BcastAxis::Y(4),
+            "a multi-row source sprayed down a NEW leading dim is the row-split form"
+        );
+        assert!(
+            !b.flat,
+            "the row-split source is the `[mb, out]` TILE at its own extents, not a flat \
+             presentation"
+        );
+        assert_eq!(
+            b.src,
+            Ssa(0),
+            "the walk-back crossed the numel-preserving reshape to the rank-2 SOURCE (merged)"
+        );
+        for v in [Ssa(1), Ssa(2), Ssa(4)] {
+            assert!(
+                consumed.contains(&v),
+                "{v:?} is plumbing and must be lowered by nothing"
+            );
+        }
+    }
+
+    /// ⛔ THE SPRAY OF ONE — the same J-slot merge spine with the result's leading dim already
+    /// collapsed (`[1, 64, 4]`): the dim is already in the source, so there is no broadcast to
+    /// address and no split to prove. Refused by name rather than admitted as a no-op the
+    /// consumer would still try to present.
+    #[test]
+    fn a_rank3_leading_spray_of_one_is_refused() {
+        let m = refusal3(
+            &[64, 4],
+            Relay::Reshape(&[1, 64, 4]),
+            &[64, 4],
+            &[1, 64, 4],
+            &[0],
+        );
+        assert!(
+            m.contains("a spray of one is no broadcast"),
+            "names the degenerate spray: {m}"
+        );
+    }
+
+    /// ⛔ THE MISALIGNED MERGE — a `[4, 32, 4]` result over the same 64-row source: the merged
+    /// axis does not line up with the source's rows, so no `rows == y*mb` split exists and the
+    /// shape really is row-replication. The refusal keeps naming the J-slot merge as the
+    /// admitted form of the shape so it reads as a work item, not a wall.
+    #[test]
+    fn a_rank3_leading_spray_that_misaligns_the_rows_is_refused() {
+        let m = refusal3(
+            &[64, 4],
+            Relay::Reshape(&[1, 64, 4]),
+            &[64, 4],
+            &[4, 32, 4],
             &[0],
         );
         assert!(
@@ -4037,8 +4304,106 @@ mod broadcast_chain_tests {
         );
         assert!(
             m.contains("J-slot merge"),
-            "names the kernel site this shape is, so the refusal reads as a work item: {m}"
+            "names the kernel site whose shape IS admitted, so the refusal reads as a work \
+             item: {m}"
         );
+    }
+
+    /// ⛔ THE ELEMENT-COUNT-CHANGING RESHAPE — the merge spine with a reshape that DOUBLES the
+    /// element count (`[64, 4]` → `[1, 128, 4]`): a numel change is a real data movement, not
+    /// the flat no-op the walk traverses, so the broadcast's source would be a relayout this
+    /// door cannot express. Refused by name at the reshape itself.
+    #[test]
+    fn a_reshape_that_changes_the_element_count_is_refused() {
+        let m = refusal3(
+            &[64, 4],
+            Relay::Reshape(&[1, 128, 4]),
+            &[128, 4],
+            &[4, 128, 4],
+            &[0],
+        );
+        assert!(
+            m.contains("a reshape that changes the element count is a real data movement"),
+            "names the relayout at the reshape itself: {m}"
+        );
+    }
+}
+
+/// ⭐ THE FLAT PRESENTATION IS CHECKED AT THE REFRAME — [`presented_flat`] runs the source's own
+/// device frame through `RegionFrame`'s re-row law, so a presentation the bytes do not support
+/// is an `Err` at the presentation, never a clean bake of wrong bytes. The multi-column
+/// `[256, 4]` mint presented as the `[1024, 1]` column vector is the defect class the law
+/// exists for: the flat frame reads element `f` at `f·64`, but the mint holds `(r, c)` at
+/// `r·64 + c`.
+#[cfg(test)]
+mod presented_flat_tests {
+    use super::*;
+
+    fn reg(rows: u32, cols: u32) -> Region {
+        Region {
+            tid: 0,
+            v_rows: rows,
+            v_cols: cols,
+            r_start: 0,
+            c_start: 0,
+            r_len: rows,
+            c_len: cols,
+            r_cover: (0, rows),
+            c_cover: (0, cols),
+            is_out: false,
+            is_fp8: false,
+        }
+    }
+
+    /// The real kernel's own flat `Col` source — the rank-1-from-reduce mint `[1024, 1]` — is
+    /// the IDENTITY: the flat frame is the mint's own frame, so the presentation changes
+    /// nothing and the chain passes byte-identically.
+    #[test]
+    fn the_rank1_mint_presents_flat_col_as_the_identity() {
+        let p = presented_flat(&reg(1024, 1), BcastAxis::Col).expect("the identity");
+        assert_eq!((p.v_rows, p.v_cols), (1024, 1));
+    }
+
+    /// ⛔ THE MULTI-COLUMN MINT CANNOT BE PRESENTED `[numel, 1]` — the flat frame would read
+    /// element `f` at `f·64` while the mint holds `(r, c)` at `r·64 + c`. Refused at the
+    /// reframe, naming the re-row law that failed.
+    #[test]
+    fn a_multi_column_mint_is_refused_the_flat_col_presentation() {
+        let Err(m) = presented_flat(&reg(256, 4), BcastAxis::Col) else {
+            panic!("a [256, 4] mint presented [1024, 1] reads bytes nobody wrote");
+        };
+        assert!(
+            m.contains("stride BETWEEN stick columns"),
+            "names the re-row law: {m}"
+        );
+    }
+
+    /// A single-stick-wide source CAN be presented `[1, numel]` — its rows are contiguous, so
+    /// the flat row reads the same bytes the mint holds.
+    #[test]
+    fn a_single_stick_source_presents_flat_mb() {
+        let p =
+            presented_flat(&reg(256, 4), BcastAxis::Mb).expect("cols <= one stick is contiguous");
+        assert_eq!((p.v_rows, p.v_cols), (1, 1024));
+    }
+
+    /// ⛔ A MULTI-STICK SOURCE CANNOT — presenting `[1, numel]` interleaves the stick columns
+    /// (the flat row strides one stick while the mint's stick columns sit a whole row-block
+    /// apart). Refused, naming the order.
+    #[test]
+    fn a_multi_stick_source_is_refused_the_flat_mb_presentation() {
+        let Err(m) = presented_flat(&reg(256, 128), BcastAxis::Mb) else {
+            panic!("a [256, 128] mint presented [1, 32768] interleaves its stick columns");
+        };
+        assert!(m.contains("WRONG ORDER"), "names the order: {m}");
+    }
+
+    /// The row-split mode presents NOTHING — the source keeps its own `[mb, out]` extents and
+    /// the `y`-broadcast scale owns the addressing, so the presentation is the identity.
+    #[test]
+    fn the_row_split_mode_presents_nothing() {
+        let p = presented_flat(&reg(64, 4), BcastAxis::Y(4)).expect("the identity");
+        assert_eq!((p.v_rows, p.v_cols), (64, 4));
     }
 }
 
