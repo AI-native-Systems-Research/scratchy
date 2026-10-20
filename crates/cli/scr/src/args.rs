@@ -446,8 +446,8 @@ pub struct ServeArgs {
     ///
     /// `ngram` selects the n-gram proposer (matches in the request's own
     /// token history). Any other value is treated as a draft-model local
-    /// path or HuggingFace repo ID; the draft-model proposer is not wired
-    /// yet and the engine will refuse to start until it is.
+    /// path or HuggingFace repo ID; the engine starts only when the draft
+    /// shares the target's vocabulary and tokenizer.
     #[arg(long)]
     pub speculative_model: Option<String>,
 
