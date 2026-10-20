@@ -232,8 +232,8 @@ pub fn assemble_matmul_off<O: crate::sdsc_abstract::KindTag>(
     n: MatN,
     k: MatK,
     batch: MatY,
-    // The bundle's shared-kernel bmm form — the attention emitter names it once at its own
-    // boundary (`SharedKernelBmmForm::of_attn_rows`) and threads it here.
+    // The bundle's shared-kernel bmm form — the caller that knows the bundle's row kind states
+    // it once (`SharedKernelBmmForm`) and threads it here.
     form: SharedKernelBmmForm,
     a: &Stk<crate::sdsc_abstract::RowBlockedTag>,
     a_off: crate::addr::DevOff,

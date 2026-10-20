@@ -7,7 +7,7 @@
 
 use ktir_superdsc::emit::rb;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{SharedKernelBmmForm, assemble_matmul_off};
-use scratchy_subtile::sdsc_abstract::{KernelTag, MatK, MatM, MatN, MatY, QueryRowCount, Stk};
+use scratchy_subtile::sdsc_abstract::{KernelTag, MatK, MatM, MatN, MatY, Stk};
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::concrete_trips;
 
 /// granite-3.1-2b's tail: hidden 2048 -> the padded 51200-wide logits placement.
@@ -20,8 +20,8 @@ fn lm_head_trips(m: u32) -> usize {
         MatN::of_out_features(n),
         MatK::of_in_features(k),
         MatY::unbatched(),
-        // Token rows, never a request batch: the row-kind boundary yields the proven walk.
-        SharedKernelBmmForm::of_attn_rows(false, QueryRowCount::of_mq(1)),
+        // Token rows, never a request batch: the row-kind door yields the proven walk.
+        SharedKernelBmmForm::of_token_rows(),
         &rb("a", m, k),
         scratchy_subtile::addr::DevOff::ZERO,
         &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),

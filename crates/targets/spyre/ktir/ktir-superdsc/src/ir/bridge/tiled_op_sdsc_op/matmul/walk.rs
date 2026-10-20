@@ -10,7 +10,7 @@
 //!
 //! So "which stride does `mb` get" is decided by nothing but the ORDER of two string
 //! literals — a quantity with no name and no type, and the recorded mq>1 defect class
-//! (attn.rs, "the two are SWAPPED"): `[mb, y, in]` assigns mb the batch BLOCK `y·in`
+//! (the deleted hand-written attention emitter, "the two are SWAPPED"): `[mb, y, in]` assigns mb the batch BLOCK `y·in`
 //! while the physical head-major operand's row pitch is `in`, numerically equal exactly
 //! at `mb == 1`. This module gives every matmul walk axis a NAME ([`WalkAxis`]) and every
 //! walk a CONSTRUCTOR named for the stride assignment it encodes — and the batch-inner
@@ -26,77 +26,52 @@
 
 use std::marker::PhantomData;
 
-use crate::sdsc_abstract::QueryRowCount;
-
 /// ⭐ WHICH FORM a SHARED-KERNEL batched (`y > 1`, 2-D-kernel) matmul takes: the RUNG REGIME it is
-/// emitted under, carried as a VALUE of that regime's sealed type. Threaded from `assemble_attn`
-/// down through the opspec builders — no env var, no thread-local, no site that infers it from a
-/// row count. The declared rank-3 walk ORDER and the work-division policy are not stored here at
-/// all: both are ASSOCIATED to the regime type ([`RungRegime`]), so this form can only relay them,
-/// never recombine them.
+/// emitted under, carried as a VALUE of that regime's sealed type. Threaded from the caller that
+/// knows the bundle's row kind down through the opspec builders — no env var, no thread-local, no
+/// site that infers it from a row count. The declared rank-3 walk ORDER and the work-division
+/// policy are not stored here at all: both are ASSOCIATED to the regime type ([`RungRegime`]), so
+/// this form can only relay them, never recombine them.
 ///
-/// The field is private and there are exactly two doors:
-///   * [`SharedKernelBmmForm::of_attn_rows`] — the attention emitter's ONE parse boundary, and the
-///     ONLY constructor that can yield the request-batch regime;
-///   * [`SharedKernelBmmForm::batch_inner_proven`] — for every batched matmul that is not
-///     attention decode (the dense wrappers, the Kani-tower seam, the fp8 chain): the walk those
+/// The field is private and every door names the row kind or walk it yields:
+///   * [`SharedKernelBmmForm::batch_inner_proven`] — every batched matmul whose rows are not
+///     head planes (the dense wrappers, the Kani-tower seam, the fp8 chain): the walk those
 ///     callers have always emitted. It demands a [`NonAttnBmmSite`] witness, mintable only inside
-///     the matmul wrapper module and the tape lowering — the attention emitter owns neither, so
-///     inside it this door does not open and `of_attn_rows` is the only source of a form.
+///     the matmul wrapper module and the tape lowering.
+///   * [`SharedKernelBmmForm::of_head_batched`] — a matmul NEWLY `y`-batched over heads (the tape
+///     lowering's RoPE rotate and its kin): head-outermost at every head dim.
+///   * [`SharedKernelBmmForm::of_token_rows`] and [`SharedKernelBmmForm::of_head_outermost`] —
+///     the same two regimes stated as a row kind / walk fact, for a caller outside the crate
+///     driving the pub matmul wrappers directly.
 ///
-/// So a batch-decode rung CANNOT take the mq==1-proven walk — its own boundary returns the
-/// request-batch regime, whose walk is a DIFFERENT TYPE — and nothing outside the emitter can
-/// claim its rows are requests.
+/// The two regimes' walks are DIFFERENT TYPES ([`RungRegime`]'s associated orders), so a rung
+/// handed the wrong form is an `E0308` at the emission site, not a silently crossed stride pair.
 #[derive(Clone, Copy)]
 pub struct SharedKernelBmmForm(SharedKernelBmmRegime);
 
 impl SharedKernelBmmForm {
-    /// THE attention emitter's parse boundary — the only door to the request-batch regime. Rows
-    /// that are independent REQUESTS at `mq > 1` are a batch-decode rung and take the corrected
-    /// head-outermost walk; everything else — the mq==1 solo bundle (proven on hardware) and every
-    /// prefill chunk — keeps the batch-inner form byte-for-byte.
-    pub fn of_attn_rows(rows_are_requests: bool, mq: QueryRowCount) -> Self {
-        if rows_are_requests && mq.get() > 1 {
-            SharedKernelBmmForm(SharedKernelBmmRegime::Requests(HeadOutermostRequests(())))
-        } else {
-            SharedKernelBmmForm(SharedKernelBmmRegime::Proven(BatchInnerMq1Proven(())))
-        }
+    /// A matmul whose rows are TOKEN ROWS — one request's positions, or a dense projection's
+    /// plain rows: never an axis that steps whole head planes. The on-hardware-proven
+    /// batch-inner walk, the same regime [`Self::batch_inner_proven`] mints in-crate for the
+    /// dense wrappers, the Kani-tower seam, and the fp8 chain.
+    pub fn of_token_rows() -> Self {
+        SharedKernelBmmForm(SharedKernelBmmRegime::Proven(BatchInnerMq1Proven(())))
     }
 
-    /// ⭐⭐⭐⭐⭐ THE SCORE LEG'S DOOR when its contraction is SLAB-SPLIT — the head-OUTERMOST order,
-    /// because it is the only one whose `y` stride depends on the operand's pitch at all.
-    ///
-    /// ⛔ `BatchInnerMq1Proven` DERIVES `y` = `in`, FULL STOP. Its order is `[mb, y, in]`, so `mb` sits
-    /// OUTSIDE `y` and contributes nothing: with a one-stick `in` the walk strides `y` by 64 whatever
-    /// pitch the operand declares. That is the build-time refusal "strides `y` by 64 elems
-    /// (derived=64, in=64), but adjacent heads are 128 elems apart" — the pitch was right and the ORDER
-    /// could not use it.
-    ///
-    /// `[y, mb, in]` derives `mb_dev * in`, so with each operand at its own pitch
-    /// ([`crate::sdsc_abstract::BatchStrides`]):
-    ///   qs (token stream) pitch `mq*nslab` ⇒ `mq*nslab*stick` = `mq*hd`    — its real head stride ✓
-    ///   sc (head-major)   pitch `mq`       ⇒ `mq*stick`                    — its real head stride ✓
-    ///
-    /// At one slab the split degenerates and this door returns the proven form, so every hd=64 bundle
-    /// keeps the on-hardware-proven walk byte-for-byte.
-    pub fn of_score_leg(
-        rows_are_requests: bool,
-        mq: QueryRowCount,
-        slabs: crate::addr::Slabs,
-    ) -> Self {
-        if slabs.get() > 1 {
-            SharedKernelBmmForm(SharedKernelBmmRegime::Requests(HeadOutermostRequests(())))
-        } else {
-            Self::of_attn_rows(rows_are_requests, mq)
-        }
+    /// A matmul whose `y` axis steps WHOLE HEAD PLANES on its operands — head-major residency
+    /// at every head dim, the head-OUTERMOST order `[y, mb, ·]`. The same regime
+    /// [`Self::of_head_batched`] mints in-crate for the tape lowering's newly head-batched
+    /// sites (RoPE's rotate and its kin).
+    pub fn of_head_outermost() -> Self {
+        SharedKernelBmmForm(SharedKernelBmmRegime::Requests(HeadOutermostRequests(())))
     }
 
     /// ⭐⭐⭐ A MATMUL THAT IS **NEWLY** `y`-BATCHED OVER HEADS — always the head-OUTERMOST order, at
     /// EVERY head dim.
     ///
-    /// ⛔ DO NOT REUSE [`Self::of_score_leg`] FOR THIS. That door degenerates to the proven batch-inner
-    /// form at one slab, which is correct for a leg that was ALREADY batched there (its emission must
-    /// not move). For an op whose `y` axis is NEW, the batch-inner order cannot express a head stride at
+    /// ⛔ NOT for a leg that was ALREADY batched at one slab — such a site's emission must not
+    /// move, and it keeps the proven batch-inner form ([`Self::batch_inner_proven`]). For an op
+    /// whose `y` axis is NEW, the batch-inner order cannot express a head stride at
     /// all: `[mb, y, in]` puts `mb` outside `y`, so `y` strides exactly `in`. At hd=64/mq=7 that is 64
     /// against a real head stride of `mq*hd` = 448 — the build-time refusal RoPE's rotate matmul hit on
     /// granite-3.1-2b fp8 the moment it stopped looping heads.
@@ -107,37 +82,12 @@ impl SharedKernelBmmForm {
         SharedKernelBmmForm(SharedKernelBmmRegime::Requests(HeadOutermostRequests(())))
     }
 
-    /// ⭐⭐⭐⭐⭐ THE KV CACHE WRITE'S DOOR — the plane walk, head-OUTERMOST at EVERY head dim, and no
-    /// witness to charge because there is nothing here for a caller to choose.
-    ///
-    /// The write's `y` axis covers `(kv head, slab)` PAIRS ([`crate::sdsc_abstract::KvPlanes`]), whose
-    /// step is ONE STICK PLANE on each operand — `mq*stick` on the token stream, `PLANE_SLOTS*stick` on
-    /// the pool. `[mb, y, in]` cannot express either: `mb` sits outside `y`, so the walk strides `y` by
-    /// exactly `in` (64) whatever pitch an operand declares. So the batch-inner order is not an
-    /// alternative for this site at any width — including `mq == 1`, where every OTHER site's proven
-    /// form is the batch-inner one. That asymmetry is why this is its own door rather than a call to
-    /// [`Self::of_score_leg`] (which degenerates at one slab) or [`Self::of_head_batched`] (whose
-    /// witness exists to keep the attention emitter out of the proven form, a question this site does
-    /// not have).
-    pub fn of_kv_cache_write() -> Self {
-        SharedKernelBmmForm(SharedKernelBmmRegime::Requests(HeadOutermostRequests(())))
-    }
-
-    /// ⭐ THE QUERY GROUP RE-LAYOUT's DOOR ([`crate::sdsc_abstract::QGroupBlock`]) — the cache write's
-    /// own descriptor shape for the same reason: `y` walks a GQA group's heads, one stick plane per step
-    /// on the stream (`nslab` planes apart) and one row per step on the block, and `[mb, y, in]` strides
-    /// `y` by exactly `in` whatever pitch an operand declares. Head-outermost at every width.
-    pub fn of_query_group_copy() -> Self {
-        SharedKernelBmmForm(SharedKernelBmmRegime::Requests(HeadOutermostRequests(())))
-    }
-
-    /// Every batched matmul OUTSIDE the attention emitter: the dense/bmm wrappers, the Kani-tower
-    /// seam, the fp8 chain. None of them has request rows, so none of them can be the rung the
-    /// corrected walk exists for — they keep the walk they have always emitted. Inside the
-    /// attention emitter this constructor is not a door: it takes a [`NonAttnBmmSite`] witness,
-    /// and both witness mints live in modules the attention emitter is not part of — the block
-    /// assembler takes its form as a parameter, and the only value that parameter can be fed is
-    /// one from [`Self::of_attn_rows`].
+    /// Every batched matmul whose rows are not head planes: the dense/bmm wrappers, the
+    /// Kani-tower seam, the fp8 chain. None of them has request rows, so none of them can be
+    /// the rung the head-outermost walk exists for — they keep the walk they have always
+    /// emitted. It takes a [`NonAttnBmmSite`] witness, and both witness mints live in modules
+    /// the tape lowering hands a form to as a parameter — the value that parameter is fed is
+    /// one minted here or by [`Self::of_head_batched`].
     pub(crate) fn batch_inner_proven(_: impl NonAttnBmmSite) -> Self {
         SharedKernelBmmForm(SharedKernelBmmRegime::Proven(BatchInnerMq1Proven(())))
     }
@@ -162,13 +112,14 @@ pub(crate) enum SharedKernelBmmRegime {
 
 /// The batch-inner `[mb, y, ·]` regime + joint cost-model split — what every shipped bundle
 /// carries, on-hardware-proven for the mq==1 decode g-form. The private field seals construction
-/// into this module's two form doors.
+/// into this module's form doors.
 #[derive(Clone, Copy)]
 pub(crate) struct BatchInnerMq1Proven(());
 
-/// The head-outermost `[y, mb, ·]` regime + batch-divides-first split — the corrected form for
-/// rows-are-requests decode rungs at mq>1. NOT yet proven on hardware. The private field seals
-/// construction into [`SharedKernelBmmForm::of_attn_rows`], the one parse boundary.
+/// The head-outermost `[y, mb, ·]` regime + batch-divides-first split — for matmuls whose `y`
+/// axis steps whole head planes (the tape lowering's newly head-batched sites, such as RoPE's
+/// rotate). NOT yet proven on hardware. The private field seals construction into this module's
+/// form doors.
 #[derive(Clone, Copy)]
 pub(crate) struct HeadOutermostRequests(());
 
@@ -195,9 +146,8 @@ mod site_sealed {
 /// walk is only mintable by a module that holds one of these, and the two mints —
 /// [`MatmulWrapperSite::witness`] (the matmul wrapper family: the untyped dense wrapper and the
 /// Kani-tower seam) and `TapeLoweringSite::witness` (the tape lowering's dense/fp8/RoPE/krep/vrep
-/// wrappers) — are each private to their owning module. The attention emitter owns neither, so an
-/// attention builder cannot state the proven form locally; its one source of a form is
-/// [`SharedKernelBmmForm::of_attn_rows`].
+/// wrappers) — are each private to their owning module, so no other module in the crate can
+/// state the proven form locally.
 pub(crate) trait NonAttnBmmSite: site_sealed::Sealed {}
 
 /// The matmul wrapper family's [`NonAttnBmmSite`]: [`super::opspec::matmul_opspec`] (the untyped

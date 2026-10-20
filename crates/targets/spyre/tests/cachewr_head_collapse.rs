@@ -63,7 +63,7 @@ fn cachewr_op(mq: u32, hd: u32, per_request: bool, req: u32, s: u32) -> emit::Em
         MatN::one_stick(Lanes::FP16),
         MatK::one_stick(Lanes::FP16),
         MatY::of_gqa_group(NKVH, a_place, o_place),
-        SharedKernelBmmForm::of_kv_cache_write(),
+        SharedKernelBmmForm::of_head_outermost(),
         &Stk::<RowBlockedTag>::new(
             "t_newk",
             StickLayout::row_blocked(mq as usize, (NKVH * hd) as usize),

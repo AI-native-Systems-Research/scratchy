@@ -163,7 +163,7 @@ fn print_what_the_shipped_fold_score_op_addresses() {
                 BlockCols::of_slot_window(SlotWindow::SLOTS),
             ),
         ),
-        SharedKernelBmmForm::of_attn_rows(true, QueryRowCount::of_mq(MQ)),
+        SharedKernelBmmForm::of_head_outermost(),
         &act("t_qs", MQ, HD),
         DevOff::ZERO,
         &ker("t_kct", HD, PAGE_SLOTS),

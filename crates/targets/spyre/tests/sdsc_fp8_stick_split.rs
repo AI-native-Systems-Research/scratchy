@@ -21,7 +21,7 @@
 use ktir_superdsc::emit::{assemble_convert, rb};
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off;
-use scratchy_subtile::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
+use scratchy_subtile::sdsc_abstract::{MatK, MatM, MatN, MatY};
 use scratchy_subtile::superdsc_opspec::{Df, Fp8, Fp16, Role};
 
 /// These probes emit decode-shaped projections: one token row, projection feature widths, no batch.
@@ -38,8 +38,8 @@ fn yy() -> MatY {
     MatY::unbatched()
 }
 fn pf() -> SharedKernelBmmForm {
-    // Token rows, never a request batch: the row-kind boundary yields the proven walk.
-    SharedKernelBmmForm::of_attn_rows(false, QueryRowCount::of_mq(1))
+    // Token rows, never a request batch: the row-kind door yields the proven walk.
+    SharedKernelBmmForm::of_token_rows()
 }
 
 #[test]

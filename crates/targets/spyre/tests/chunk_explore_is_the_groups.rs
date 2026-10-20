@@ -17,7 +17,7 @@ use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul::{
     SharedKernelBmmForm, matmul_opspec_off_operands_phys_gathered,
 };
-use ktir_superdsc::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
+use ktir_superdsc::sdsc_abstract::{MatK, MatM, MatN, MatY};
 use ktir_superdsc::superdsc_opspec::{
     DataFormat, Df, EntryBase, Fp8, Fp16, GatherIndex, GatherRun, KernelAxis, PageExtent, Role,
     SdscFoldSet,
@@ -50,7 +50,7 @@ fn gathered_expert_matmul() -> emit::EmittedOp {
         MatN::of_out_features(64),
         MatK::of_in_features(2816),
         MatY::unbatched(),
-        SharedKernelBmmForm::of_attn_rows(false, QueryRowCount::of_mq(1)),
+        SharedKernelBmmForm::of_token_rows(),
         "Tensor0",
         "Tensor1",
         "Tensor3",
