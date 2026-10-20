@@ -507,13 +507,17 @@ impl EwDivision {
 /// a core owning a COLUMN SLICE of an entry loses that slice and reads the entry from its
 /// start.
 ///
-/// ⛔ AND A GATHER WITH FEWER ENTRIES THAN CORES CANNOT BE CONSTRUCTED: the cores the entries
-/// cannot take could only be filled by splitting another axis, which is the wrong-byte shape
-/// above, so the mint refuses rather than choosing between a wrong split and a silent
-/// fraction-of-the-machine op. The producer's move is the batch width — the prefill kernel's
-/// own 8→32-entry restructuring, which is the boundary as measured (`entries == cores` clears,
-/// `entries < cores` refused) — not a slower op. At `entries ≥ cores` the split is
-/// [`core_split`]'s largest divisor and every core owns one or more WHOLE entries.
+/// ⭐ AND A GATHER LAWFULLY RUNS ON `min(entries, cores)` CORES — fewer cores than the machine
+/// is the CARD-PROVEN shape of both existing gathered doors (`gather_copy_cores`' KV copy and
+/// the gathered matmul arm's re-division), and the vendor's own one-core gather
+/// (`dxp/test/test_gather_1core`) is the `entries == 1` case. The cores the entries cannot
+/// take are LEFT IDLE, never filled by splitting another axis — that filler split is the
+/// wrong-byte shape above, and it is the only way this law can be broken, so the mint refuses
+/// nothing about the core count. The split is [`core_split`]'s largest divisor of `entries`
+/// within the budget — exactly `min(entries, cores)` at every `entries ≤ cores` — so every
+/// core owns one or more WHOLE entries whatever the count. (Ruling 10-20: `entries ≥ cores`
+/// was this door's fill POLICY, not a byte law; the producer's batch-width move stays the
+/// perf move, but a short gather is no longer unconstructible.)
 ///
 /// This is the gathered POINTWISE leg's door (the attention legs). The KV copy door
 /// (`gather_copy_cores`) states the mb-only half of this law privately — its entries are
@@ -527,9 +531,10 @@ pub struct GatherSplit {
 impl GatherSplit {
     /// THE ONLY CONSTRUCTOR — the cores distributed over the gather's ENTRIES. `entry_page` is
     /// the `mb` positions ONE index entry covers; the division is over entries, so no core owns
-    /// a fraction of one. `Err` names the law that failed: a plan with no `mb` dim for the
-    /// entries to enumerate, an `mb` that does not divide into whole entries, or entries fewer
-    /// than the cores.
+    /// a fraction of one. The mint runs on `min(entries, max_cores)` cores (the largest divisor
+    /// of `entries` within the budget — the same number at every `entries ≤ max_cores`) and
+    /// splits NOTHING but `mb`. `Err` names the law that failed: a plan with no `mb` dim for
+    /// the entries to enumerate, or an `mb` that does not divide into whole entries.
     pub fn over_entries(dims: &[ItDim], max_cores: u32, entry_page: u32) -> Result<Self, String> {
         let Some(mb) = dims
             .iter()
@@ -550,17 +555,6 @@ impl GatherSplit {
             ));
         }
         let entries = mb.size / entry_page;
-        if entries < max_cores {
-            return Err(format!(
-                "{entries} index entries against {max_cores} cores — a gather with fewer \
-                 entries than cores cannot be constructed: the cores the entries cannot take \
-                 could only be filled by splitting another axis, and dxp derives `skip_addr` \
-                 from the per-core extents of the unpinned dims, so a split elsewhere shrinks \
-                 what one index entry covers (every index step then lands a fraction of a row \
-                 short, from a clean bake). The producer's move is the batch width, not a \
-                 slower op"
-            ));
-        }
         let mut splits = BTreeMap::new();
         let split = core_split(entries, max_cores);
         if split > 1 {
@@ -617,20 +611,31 @@ mod gather_split_tests {
         );
     }
 
-    /// ⛔ THE MEASURED BOUNDARY — the prefill kernel's earlier 8-entry form: 8 entries against
-    /// 32 cores is refused by name, because the 24 cores the entries cannot take could only be
-    /// filled by splitting another axis, and that is the wrong-byte shape (`out` split 4 ways,
-    /// every index step a fraction of a row short, from a clean bake). The producer's move is
-    /// the batch width — the kernel's own 8→32 restructuring — not a slower op.
+    /// ⭐ THE RULING (10-20): A GATHER LAWFULLY RUNS ON FEWER CORES THAN THE MACHINE — the
+    /// prefill kernel's earlier 8-entry form is CONSTRUCTIBLE: the mint is `{mb: 8}`, the op
+    /// runs on 8 cores with 24 idle, and `out` is still carried whole. What that form measured
+    /// (`out` split 4 ways) was the FILLER split `distribute_cores` made to spend the idle
+    /// cores — the wrong-byte shape — and `min(entries, cores)` over `mb` alone is the shape
+    /// that keeps `skip_addr` correct at any core count. The batch width stays the perf move;
+    /// it is no longer a correctness refusal.
     #[test]
-    fn entries_fewer_than_cores_cannot_be_constructed() {
-        let Err(m) = GatherSplit::over_entries(&dims(8, 256), 32, 1) else {
-            panic!("8 entries on 32 cores must not construct — the filler split is the defect");
-        };
-        assert!(m.contains("cannot be constructed"), "names the law: {m}");
+    fn entries_fewer_than_cores_run_on_their_entries() {
+        let g = GatherSplit::over_entries(&dims(8, 256), 32, 1).expect("8 entries on 32 cores");
+        assert_eq!(
+            g.splits(),
+            &BTreeMap::from([("mb", 8u32)]),
+            "8 whole entries, one per core, `out` never the filler"
+        );
+    }
+
+    /// The vendor's own one-core gather (`dxp/test/test_gather_1core`) is the `entries == 1`
+    /// case: `mb` is UNSPLIT (a split of 1 is no split) and the op runs on one core.
+    #[test]
+    fn one_entry_is_the_vendors_own_one_core_gather() {
+        let g = GatherSplit::over_entries(&dims(1, 256), 32, 1).expect("1 entry on 32 cores");
         assert!(
-            m.contains("8 index entries against 32 cores"),
-            "states the boundary it measured: {m}"
+            g.splits().is_empty(),
+            "a single entry leaves `mb` unsplit — one core, one whole entry"
         );
     }
 

@@ -1452,9 +1452,12 @@ fn one_gathered_leg(
     // index entry covers and every index step lands a fraction of a row short, from a clean
     // bake (the prefill attention kernel's leg t6 measured it: 8 entries on 32 cores left
     // `distribute_cores` to split `out` 4 ways). The mint refuses the shapes the bytes do not
-    // support — no `mb` to enumerate, a partial entry, or fewer entries than cores — so this
-    // leg cannot be built with any other division: the walk check this replaces IS the
-    // constructor now, and a wrong division is unrepresentable rather than inspected.
+    // support — no `mb` to enumerate, or a partial entry — and otherwise runs on
+    // `min(entries, cores)` cores over `mb` alone (ruling 10-20: the KV copy and the gathered
+    // matmul are card-proven at fewer cores than the machine; the idle cores are never filled
+    // by splitting another axis), so this leg cannot be built with any other division: the
+    // walk check this replaces IS the constructor now, and a wrong division is unrepresentable
+    // rather than inspected.
     let split = crate::work::GatherSplit::over_entries(
         &leg_tile.dims,
         crate::superdsc_opspec::MAX_CORES,
