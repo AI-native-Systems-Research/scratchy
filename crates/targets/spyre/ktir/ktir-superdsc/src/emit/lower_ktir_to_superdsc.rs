@@ -5887,7 +5887,7 @@ mod elementwise_tests {
             crate::addr::OutCorner::ZERO,
             false,
             None,
-            EwDivision::Law,
+            crate::work::CoreDivision::Ew(EwDivision::Law),
         )
         .expect("the row-split op emits");
         assert_eq!(op.iter.extent("mb"), 64, "mb is one spray's worth of rows");
@@ -5938,7 +5938,7 @@ mod elementwise_tests {
             crate::addr::OutCorner::ZERO,
             false,
             None,
-            EwDivision::Law,
+            crate::work::CoreDivision::Ew(EwDivision::Law),
         ) else {
             panic!("a tile stating y=2 over operands that spray 4 must not emit");
         };
@@ -5967,7 +5967,7 @@ mod elementwise_tests {
             crate::addr::OutCorner::ZERO,
             false,
             None,
-            EwDivision::Law,
+            crate::work::CoreDivision::Ew(EwDivision::Law),
         ) else {
             panic!("a row-split op at cols=128 must not emit");
         };

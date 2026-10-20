@@ -12,7 +12,7 @@ use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, DataFormat, Df, Fp16, MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec,
     Role, Scale, SdscFoldSet, TensorArg,
 };
-use crate::work::EwDivision;
+use crate::work::{CoreDivision, EwDivision};
 
 /// ⭐⭐⭐⭐⭐ THE GATHER'S OWN OP — a KERNEL-LESS `identity` that copies a PAGED source through an int32
 /// index into a CONTIGUOUS destination. This is the only op shape deeptools will schedule a gather on.
@@ -478,10 +478,12 @@ fn pointwise_opspec_from_tile_split(
 /// builder's `stickmajor`/block-alignment logic needs the untouched `rows·cols` product, not the
 /// stick-rounded `out` extent `TileOp` carries.
 ///
-/// `division` is [`EwDivision::Law`] for every caller but one, and the law reads `layout`: an op none of
-/// whose operands is a core-local LX pin takes the division its operands' layout calls for (`None`, every
-/// unit test without a layout, has no pins). The gathered-row leg passes [`EwDivision::RowsFirst`]: its
-/// index enumerates `mb` in whole entries, so `mb` must take the cores.
+/// `division` is [`CoreDivision::Ew`] at [`EwDivision::Law`] for every ungathered caller, and
+/// the law reads `layout`: an op none of whose operands is a core-local LX pin takes the
+/// division its operands' layout calls for (`None`, every unit test without a layout, has no
+/// pins). A gathered op passes [`CoreDivision::Gathered`] — its [`crate::work::GatherSplit`] is minted from
+/// its entries, not resolved from a layout, because only the entry axis may carry a split (the
+/// `skip_addr` law; see [`crate::work::GatherSplit`]).
 #[allow(clippy::too_many_arguments)]
 pub fn pointwise_broadcast_opspec_from_tile(
     tile_op: &TileOp,
@@ -493,7 +495,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
     out_offset: OutCorner,
     head_major: bool,
     layout: Option<&BundleLayout>,
-    division: EwDivision,
+    division: CoreDivision,
 ) -> Result<OpSpec, String> {
     let (out_window, out_offset) = (
         out_offset.is_stick_major_window_for(rows),
@@ -570,18 +572,29 @@ pub fn pointwise_broadcast_opspec_from_tile(
         && inputs.iter().all(|i| {
             i.out_broadcast() || i.is_stick_major_window_for(rows) || block_aligned(i.col_offset())
         });
-    // ⭐ THE DIVISION FOLLOWS THE LAYOUT JUST DECIDED — the same `stickmajor`, so the operands' rank and the
-    // cores' cut are one decision. See `EwDivision`.
+    // ⭐ THE DIVISION FOLLOWS THE LAYOUT JUST DECIDED for an ungathered op — the same
+    // `stickmajor`, so the operands' rank and the cores' cut are one decision. See `EwDivision`.
     let core_local = layout.is_some_and(|l| {
         l.lx_core_local(o_name) || inputs.iter().any(|i| l.lx_core_local(i.name()))
     });
-    let tiled = tile_op
-        .tile(
-            MaxCores::<MAX_CORES>,
-            division.resolve(stickmajor, core_local).splitter(),
-            "out",
-        )
-        .map_err(|e| e.0)?;
+    // ⭐⭐⭐ A GATHERED OP'S SPLIT IS ITS `GatherSplit` (`crate::work`), VERBATIM — not resolved from the operand
+    // layout (the elementwise law's input) and not consulted for `stickmajor`: only the entry
+    // axis may carry a split, because dxp derives `skip_addr` from the per-core extents of the
+    // unpinned dims — a split elsewhere shrinks what one index entry covers. The mint already
+    // refused every shape that would have needed one, so the closure hands the tiler the minted
+    // map whatever budget it asks with.
+    let tiled = match &division {
+        CoreDivision::Gathered(g) => tile_op
+            .tile(MaxCores::<MAX_CORES>, |_, _| g.splits().clone(), "out")
+            .map_err(|e| e.0)?,
+        CoreDivision::Ew(d) => tile_op
+            .tile(
+                MaxCores::<MAX_CORES>,
+                d.resolve(stickmajor, core_local).splitter(),
+                "out",
+            )
+            .map_err(|e| e.0)?,
+    };
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
     // Y-MAJOR in the row-split mode (`ymajor` above): the syms are picked by NAME in the order
     // the layout states them, so the plan's own `y`/`mb`/`out` syms feed the `["y", "mb", "out"]`
@@ -782,7 +795,7 @@ pub fn assemble_pointwise_broadcast_off_from_tile<O: KindTag>(
         out_offset,
         head_major,
         layout,
-        EwDivision::Law,
+        CoreDivision::Ew(EwDivision::Law),
     )
     .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());

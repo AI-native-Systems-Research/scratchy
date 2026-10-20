@@ -910,7 +910,19 @@ pub(crate) fn pointwise_broadcast_opspec_df(
         df,
     };
     pointwise_broadcast_opspec_from_tile(
-        &tile_op, rows, cols, op, inputs, o_name, out_offset, head_major, layout, division,
+        &tile_op,
+        rows,
+        cols,
+        op,
+        inputs,
+        o_name,
+        out_offset,
+        head_major,
+        layout,
+        // This door is the ungathered family's: the elementwise law, wrapped for the shared
+        // builder's `CoreDivision` (a gathered op's own split is a `GatherSplit`, minted by its
+        // leg — see `one_gathered_leg`).
+        crate::work::CoreDivision::Ew(division),
     )
 }
 
@@ -1434,6 +1446,21 @@ fn one_gathered_leg(
             .collect(),
         df: tile_op.df,
     };
+    // ⭐⭐⭐ THE LEG'S CORE SPLIT IS A `GatherSplit` — MINTED FROM THE LEG'S OWN FACTS, before any
+    // operand is built. Only the entry axis (`mb`) may carry a split: dxp derives `skip_addr`
+    // from the per-core extents of the unpinned dims, so a split elsewhere shrinks what one
+    // index entry covers and every index step lands a fraction of a row short, from a clean
+    // bake (the prefill attention kernel's leg t6 measured it: 8 entries on 32 cores left
+    // `distribute_cores` to split `out` 4 ways). The mint refuses the shapes the bytes do not
+    // support — no `mb` to enumerate, a partial entry, or fewer entries than cores — so this
+    // leg cannot be built with any other division: the walk check this replaces IS the
+    // constructor now, and a wrong division is unrepresentable rather than inspected.
+    let split = crate::work::GatherSplit::over_entries(
+        &leg_tile.dims,
+        crate::superdsc_opspec::MAX_CORES,
+        page.get(),
+    )
+    .map_err(|e| SuperDscError(format!("{op_name}: leg `{leg_name}`: {e}")))?;
     let mut op = pointwise_broadcast_opspec_from_tile(
         &leg_tile,
         leg_rows,
@@ -1448,9 +1475,7 @@ fn one_gathered_leg(
         crate::addr::OutCorner::ZERO,
         head_major,
         layout,
-        // ⛔ ROWS FIRST, STATED: the gather's index enumerates `mb` in whole entries
-        // (`attach_gather_index` refuses a plan with no `mb` split to enumerate), so `mb` takes the cores.
-        crate::work::EwDivision::RowsFirst,
+        crate::work::CoreDivision::Gathered(split),
     )
     .map_err(SuperDscError)?;
     // ⭐⭐⭐ THE ROW WINDOW: THE ONLY BYTE OF THE OUTPUT OPERAND THE CUT MOVES.
@@ -1538,48 +1563,12 @@ fn one_gathered_leg(
             cap - 1,
         )));
     }
-    // ⛔⛔⛔ ONLY THE ENTRY AXIS MAY CARRY A SPLIT, AND THIS IS THE HALF OF `gather_copy_opspec`'S
-    // REASONING THAT TRANSFERS TO ANY GATHER.
-    //
-    // dxp derives `skip_addr` as `page x the PER-CORE extents of the UNPINNED dims`
-    // (`getBufferCapacityForNodePerDim`, reproduced by `zz_skip_addr_computed_from_our_own_emission.rs`),
-    // so a split `out` DIVIDES the entry by the core count: at `cols = 4096` split 2 ways, `skip_addr`
-    // is 2048 against a host staging row numbers in units of 4096 — a clean bake whose every index step
-    // lands half a row short, i.e. fluent text assembled from two different rows. dbo also reduces the
-    // value tensor's per-core starts to a single `min` before deriving any address
-    // (`computeGatherMetadata`), so a core owning a COLUMN SLICE of an entry loses that slice and reads
-    // the entry from its start.
-    //
-    // ⭐ SPLITTING THE ENTRY AXIS IS THE ONE DIVISION THAT SURVIVES BOTH: a core owns whole entries,
-    // each row's base comes from the index, and the per-core index offset is carried through the
-    // conversion (`allocateAndModifyGather` preserves it "by computing the delta from the original
-    // minimum address and applying it uniformly"). `distribute_cores` splits `mb` first and spends only
-    // what is left on the other axes, so this is the division it already makes whenever the row count
-    // reaches the core count — and where it does not (a 1-row lookup, whose cores must come from `out`)
-    // this is an `Err` naming the axis rather than a descriptor whose cores all read column 0.
-    //
-    // ⛔ IT LIVES HERE RATHER THAN IN `attach_gather_index` DELIBERATELY. That door is shared with the
-    // KV paths, whose own divider (`gather_copy_cores`) already satisfies this by construction; adding a
-    // blanket refusal there would change a card-measured mechanism to restate what one of its callers
-    // already guarantees. Promoting it is a question for that door's two existing callers, not a thing
-    // to decide from here.
+    // (The work-division inspection that lived here — "only the entry axis may carry a split",
+    // with the `skip_addr` derivation and the leg-t6 measurement — is `GatherSplit`'s own
+    // constructor now, called above: the leg's split is minted `mb`-only before any operand is
+    // built, so there is no division left to inspect and no way to state one that would shrink
+    // an entry. The law and its card measurements live in `crate::work::GatherSplit`'s doc.)
     let entry_axis = ia.entry_dim.dim();
-    if let Some(d) = op
-        .iter
-        .dims()
-        .iter()
-        .find(|d| d.name != entry_axis && op.iter.split_of(d.name) > 1)
-    {
-        return Err(SuperDscError(format!(
-            "{op_name}: leg `{leg_name}`'s work division splits `{}` {} ways, and only the entry axis \
-             (`{entry_axis}`) may carry a split. dxp derives `skip_addr` from the PER-CORE extents of \
-             the unpinned dims, so a split elsewhere shrinks what one index entry covers — every index \
-             step then lands a fraction of a row short, from a clean bake. Give the op enough rows for \
-             `distribute_cores` to spend its cores on `{entry_axis}` alone.",
-            d.name,
-            op.iter.split_of(d.name)
-        )));
-    }
     let folds = SdscFoldSet::new(op.iter.cores_used());
     let mut emitted = emit_sdsc_tiled(leg_name, &op, &folds, sym_id_base, layout)?;
     // ⭐⭐⭐⭐⭐ `N_` CARRIES THE **TENSOR'S** ROW COUNT, NOT THE LEG'S — THE ONE NUMBER THE CUT CHANGES

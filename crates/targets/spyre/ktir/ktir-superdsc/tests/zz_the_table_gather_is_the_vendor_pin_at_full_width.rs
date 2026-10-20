@@ -300,20 +300,23 @@ fn the_gathered_operand_must_be_the_last_input() {
     );
 }
 
-/// ⛔⛔⛔ ONLY THE ENTRY AXIS MAY CARRY A SPLIT — the half of `gather_copy_opspec`'s reasoning that
-/// transfers to any gather.
+/// ⛔⛔⛔ A LOOKUP WITH FEWER ENTRIES THAN CORES CANNOT BE CONSTRUCTED — the shape that used to
+/// be caught by inspecting the emitted division ("only the entry axis may carry a split") is now
+/// refused at the MINT, before any operand is built.
 ///
 /// `skip_addr` is `page x the PER-CORE extents of the unpinned dims`, so a split `out` divides the
-/// entry. At one row there are no `mb` positions to spend cores on, so `distribute_cores` must take
-/// them from `out` — and that is the case this refuses.
+/// entry. At one row there are no `mb` positions to spend cores on, and the only way to fill the
+/// other 31 is the `out` split that is the wrong-byte shape — so the `GatherSplit` constructor
+/// refuses the shape itself, by name, and no walk check remains to inspect what can no longer be
+/// built.
 ///
 /// ⛔ ONE-SIDED, like the one above: `ROWS = 256` is the passing arm and it is every other test here.
 #[test]
-fn a_split_outside_the_entry_axis_is_refused() {
+fn a_lookup_with_fewer_entries_than_cores_cannot_be_constructed() {
     let msg = emit(1, COLS).expect_err("a 1-row lookup must be refused, not emitted");
     assert!(
-        msg.contains("skip_addr") && msg.contains("out"),
-        "the refusal must name the derived quantity and the axis. Got: {msg}"
+        msg.contains("cannot be constructed") && msg.contains("skip_addr"),
+        "the refusal must name the boundary and the derived quantity. Got: {msg}"
     );
 }
 
@@ -361,7 +364,7 @@ fn the_same_op_without_a_gather_declares_none() {
         ktir_superdsc::addr::OutCorner::ZERO,
         false,
         None,
-        ktir_superdsc::work::EwDivision::Law,
+        ktir_superdsc::work::CoreDivision::Ew(ktir_superdsc::work::EwDivision::Law),
     )
     .expect("the ungathered op builds");
     assert!(
