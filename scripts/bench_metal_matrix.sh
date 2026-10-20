@@ -372,7 +372,7 @@ MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 
 die() { echo "error: $*" >&2; exit 1; }
 command -v cargo >/dev/null || die "cargo not on PATH"
-[[ "$(uname -s)" == "Darwin" ]] || die "this runner is for Apple Silicon; use the cuda/spyre runner elsewhere"
+[[ "$(uname -s)" == "Darwin" ]] || die "this runner is for Apple Silicon; use the spyre runner elsewhere"
 
 # ---- versions and pins -------------------------------------------------------
 # Each Mac installs the comparison engines on its own schedule, so a run records

@@ -9,7 +9,6 @@ use std::time::Instant;
 
 use anyhow::Result;
 use scratchy_core_common::telemetry;
-use scratchy_core_config::{CudaGraphConfig, CudaGraphMode};
 use scratchy_serving_api::init::{VllmConfig, initialize_stack};
 use scratchy_serving_api::server::{AppState, ServerConfig};
 use tracing::info;
@@ -128,62 +127,17 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         pooling_strategy: args.pooling_strategy.clone(),
         tensor_parallel_size: args.tensor_parallel_size,
         pipeline_parallel_size: args.pipeline_parallel_size,
-        num_nodes: args.num_nodes,
-        node_rank: args.node_rank,
-        master_addr: args.master_addr.clone(),
-        master_port: args.master_port,
         disable_async_scheduling: args.disable_async_scheduling,
         runner: args.runner.clone(),
-        cuda_graph_config: if args.enforce_eager {
-            None
-        } else {
-            let parsed_mode =
-                CudaGraphMode::parse(&args.cuda_graph_mode).unwrap_or(CudaGraphMode::Auto);
-            let sizes = CudaGraphConfig::parse_sizes(&args.cuda_graph_sizes);
-            let capture_sizes = match (sizes.is_empty(), args.max_num_seqs) {
-                // "auto" AND an explicit width → compute Python-matching sizes here.
-                (true, Some(n)) => CudaGraphConfig::auto_capture_sizes(n),
-                // "auto" with no width named: leave it EMPTY so `CudaWorker` derives the ladder from
-                // the RESOLVED `max_num_seqs` (it already calls `auto_capture_sizes` on an empty
-                // list). Guessing 256 here would bake a ladder for a width nobody chose.
-                (true, None) => Vec::new(),
-                (false, _) => sizes,
-            };
-            Some(CudaGraphConfig {
-                enabled: true,
-                mode: parsed_mode,
-                capture_sizes,
-                num_warmups: 2,
-            })
-        },
         enable_prefix_caching: !args.no_prefix_caching,
-        enforce_eager: args.enforce_eager,
-        cuda_graph_mode: args.cuda_graph_mode.clone(),
         max_num_batched_tokens: args.max_num_batched_tokens,
-        cublas_autotune: args.cublas_autotune,
         kv_cache_dtype: args.kv_cache_dtype.clone(),
         calculate_kv_scales: args.calculate_kv_scales,
-        distributed_executor_backend: args.distributed_executor_backend.clone(),
         chat_template: args.chat_template.clone(),
         // Server/CLI keep the default indicatif stderr bars; only the TUI
         // wires a DownloadObserver here.
         download_observer: None,
     };
-
-    // Multi-node follower: run headless (no engine, no HTTP server).
-    // This blocks until the leader sends a Shutdown command.
-    #[cfg(feature = "nccl")]
-    if config.num_nodes > 1 && config.node_rank > 0 {
-        info!(
-            "Follower node (rank {}): entering headless mode",
-            config.node_rank
-        );
-        return tokio::task::spawn_blocking(move || {
-            scratchy_serving_api::init::initialize_and_run_follower(&config)
-        })
-        .await
-        .expect("initialize_and_run_follower panicked");
-    }
 
     // Keep a clone for /server_info (before we move config into the blocking task).
     let scratchy_core_config_snapshot = config.clone();

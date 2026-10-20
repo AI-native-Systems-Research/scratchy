@@ -14,7 +14,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
-use scratchy_core_config::{CudaGraphConfig, CudaGraphMode};
 use scratchy_serving_api::llm::{ChatMessage, LLM, LLMBuilder, SamplingParams};
 use scratchy_serving_api::tokenizer::Tokenizer;
 
@@ -315,7 +314,6 @@ fn build_llm(args: &BenchRulerArgs) -> Result<LLM> {
         .gpu_memory_utilization(args.gpu_memory_utilization)
         .max_num_seqs(args.max_num_seqs)
         .block_size(args.block_size)
-        .enforce_eager(args.enforce_eager)
         .enable_prefix_caching(true);
 
     let max_ctx = *args.context_lengths.iter().max().unwrap_or(&8000);
@@ -329,17 +327,6 @@ fn build_llm(args: &BenchRulerArgs) -> Result<LLM> {
     }
     if let Some(ref gguf) = args.gguf_file {
         builder = builder.gguf_file(gguf);
-    }
-    if !args.enforce_eager {
-        let sizes = CudaGraphConfig::parse_sizes("auto");
-        if !sizes.is_empty() {
-            builder = builder.cuda_graph_config(CudaGraphConfig {
-                enabled: true,
-                mode: CudaGraphMode::default(),
-                capture_sizes: sizes,
-                num_warmups: 3,
-            });
-        }
     }
     builder.build()
 }

@@ -17,10 +17,7 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Whether to spawn a child process by default.
 fn should_spawn() -> bool {
-    if std::env::var("VLLM_TEST_SPAWN").as_deref() == Ok("1") {
-        return true;
-    }
-    cfg!(feature = "cuda")
+    std::env::var("VLLM_TEST_SPAWN").as_deref() == Ok("1")
 }
 
 /// Internal mode: how the server is running.
@@ -37,7 +34,7 @@ enum TestServerMode {
 /// A running vLLM server for E2E testing.
 ///
 /// The server runs either in-process on a background tokio task, or as a
-/// spawned child process (for CUDA tests, to reclaim GPU memory between tests).
+/// spawned child process (to reclaim GPU memory between tests).
 /// On drop, the server is stopped and resources are released.
 pub struct TestServer {
     mode: TestServerMode,
@@ -64,7 +61,6 @@ impl TestServer {
             dtype: None,
             device: None,
             spawn: should_spawn(),
-            enforce_eager: None,
             max_num_seqs: None,
             prefix_caching: true,
         }
@@ -94,7 +90,7 @@ impl Drop for TestServer {
             TestServerMode::ChildProcess { child } => {
                 let _ = child.kill();
                 let _ = child.wait();
-                // Give the CUDA driver time to reclaim GPU memory after process exit.
+                // Give the driver time to reclaim GPU memory after process exit.
                 std::thread::sleep(Duration::from_secs(2));
             }
         }
@@ -118,7 +114,6 @@ pub struct TestServerBuilder {
     tensor_parallel_size: usize,
     pipeline_parallel_size: usize,
     spawn: bool,
-    enforce_eager: Option<bool>,
     max_num_seqs: Option<usize>,
     prefix_caching: bool,
 }
@@ -198,7 +193,7 @@ impl TestServerBuilder {
         self
     }
 
-    /// Override the device (e.g. "cpu", "cuda:0", "metal").
+    /// Override the device (e.g. "cpu", "metal", "spyre").
     pub fn with_device(mut self, device: &str) -> Self {
         self.device = Some(device.to_string());
         self
@@ -224,14 +219,6 @@ impl TestServerBuilder {
     /// Turn prefix caching off (`--no-prefix-caching`), in either mode.
     pub fn without_prefix_caching(mut self) -> Self {
         self.prefix_caching = false;
-        self
-    }
-
-    /// Override the enforce-eager setting.
-    /// When `false`, CUDA graphs are enabled (default for CLI).
-    /// When `true`, CUDA graphs are disabled (default for in-process tests).
-    pub fn with_enforce_eager(mut self, eager: bool) -> Self {
-        self.enforce_eager = Some(eager);
         self
     }
 
@@ -300,10 +287,6 @@ impl TestServerBuilder {
 
         if self.disable_async_scheduling {
             cmd.arg("--disable-async-scheduling");
-        }
-
-        if self.enforce_eager == Some(true) {
-            cmd.arg("--enforce-eager");
         }
 
         if let Some(n) = self.max_num_seqs {
@@ -375,7 +358,7 @@ impl TestServerBuilder {
         let runner = self.runner.clone();
         let dtype = self.dtype.clone().unwrap_or_else(|| "auto".to_string());
         let device = self.device.clone().unwrap_or_else(|| "auto".to_string());
-        let mut config = scratchy_serving_api::init::VllmConfig {
+        let config = scratchy_serving_api::init::VllmConfig {
             model: model.clone(),
             device,
             dtype,
@@ -391,9 +374,6 @@ impl TestServerBuilder {
             runner: runner.clone(),
             ..Default::default()
         };
-        if let Some(eager) = self.enforce_eager {
-            config.enforce_eager = eager;
-        }
 
         // Initialize the full stack (blocking — downloads model, loads weights).
         // 5 min timeout: first run may need to download multi-GB model weights.
@@ -566,12 +546,6 @@ fn resolve_binary_path() -> Result<std::path::PathBuf> {
         // The E2E test Cargo invocation sets these features on vllm-e2e,
         // but we need them on scratchy-cli too.
         let mut features = Vec::new();
-        if cfg!(feature = "cuda") {
-            features.push("cuda");
-        }
-        if cfg!(feature = "nccl") {
-            features.push("nccl");
-        }
         if cfg!(feature = "metal") {
             features.push("metal");
         }

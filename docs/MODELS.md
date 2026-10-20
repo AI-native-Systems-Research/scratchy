@@ -378,17 +378,17 @@ reference.
 
 Add `testdata/<arch>_<size>.json` generated from Python vLLM on the
 same prompts the existing goldens use. Add a
-`test_cuda_correctness_<arch>_<size>` in
+`test_metal_correctness_<arch>_<size>` in
 `crates/e2e/tests/e_correctness.rs`. Verify the test passes on
-CUDA before claiming the arch is landed:
+Metal before claiming the arch is landed:
 
 ```
-cargo test -p scratchy-e2e --features e2e,cuda --release \
-    --test e_correctness test_cuda_correctness_<arch>_<size> \
+cargo test -p scratchy-e2e --features e2e,metal --release \
+    --test e_correctness test_metal_correctness_<arch>_<size> \
     -- --ignored --test-threads=1
 ```
 
-No edits to `scratchy-serving-worker/src/cuda_worker.rs` are needed — the
+No edits to `scratchy-serving-worker/src/gpu_worker.rs` are needed — the
 arch auto-registers via `inventory::submit!` from the umbrella.
 
 ## Building (which models/quants actually compile in)
@@ -410,6 +410,6 @@ aliases.
   `crates/compiler/macros/src/weights_manifest.rs`. It's reserved for
   truly universal conventions (e.g. `embed_tokens`, `lm_head`) —
   everything arch-specific lives in the arch's `weights.json`.
-- **Don't** edit `scratchy-serving-worker/src/cuda_worker.rs` for a new arch.
+- **Don't** edit `scratchy-serving-worker/src/gpu_worker.rs` for a new arch.
   Auto-registration covers it; arch-specific state lives on the
   emitted `Weights` type.

@@ -1,18 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! Thread-pool executor for multi-GPU tensor parallelism.
-//!
-//! Thread-pool executor giving each worker a dedicated OS thread. This is
-//! essential for NCCL: collectives like all-reduce block until all ranks
-//! participate, so each rank must run on its own OS thread to avoid deadlock.
+//! Thread-pool executor giving each worker a dedicated OS thread, so ranks
+//! that block on one another (collectives) never share a thread.
 //!
 //! # Architecture
 //!
 //! ```text
 //!   ThreadPoolExecutor
-//!     ├── OS Thread (rank 0) ──► Worker + NcclProcessGroup
-//!     └── OS Thread (rank 1) ──► Worker + NcclProcessGroup
+//!     ├── OS Thread (rank 0) ──► Worker
+//!     └── OS Thread (rank 1) ──► Worker
 //! ```
 //!
 //! The executor broadcasts scheduler outputs to all workers via channels,
@@ -43,9 +40,6 @@ enum Request {
     },
     DetermineAvailableMemory,
     CheckHealth,
-    /// NCCL broadcast bytes on the worker thread (correct CUDA context).
-    /// `(data, root)` — root sends, others receive.
-    NcclBroadcast(Vec<u8>, usize),
     Shutdown,
 }
 
@@ -55,8 +49,6 @@ enum Response {
     CacheInitialized(ExecutorResult<()>),
     AvailableMemory(ExecutorResult<usize>),
     HealthOk(ExecutorResult<()>),
-    /// Result of NCCL broadcast (received bytes or error).
-    NcclBroadcastResult(ExecutorResult<Vec<u8>>),
     ShutdownAck,
 }
 
@@ -71,7 +63,6 @@ struct WorkerThread {
 
 fn worker_loop(
     mut worker: Box<dyn Worker>,
-    pg: Option<std::sync::Arc<dyn scratchy_core_model::process_group::ProcessGroup>>,
     rx: std::sync::mpsc::Receiver<Request>,
     tx: std::sync::mpsc::Sender<Response>,
 ) {
@@ -90,17 +81,6 @@ fn worker_loop(
                 Response::AvailableMemory(worker.determine_available_memory())
             }
             Request::CheckHealth => Response::HealthOk(worker.check_health()),
-            Request::NcclBroadcast(data, root) => {
-                let result = if let Some(ref pg) = pg {
-                    pg.broadcast_bytes(&data, root)
-                        .map_err(|e| crate::error::ExecutorError::WorkerExecution(e.to_string()))
-                } else {
-                    Err(crate::error::ExecutorError::Config(
-                        "NCCL broadcast requires process group".to_string(),
-                    ))
-                };
-                Response::NcclBroadcastResult(result)
-            }
             Request::Shutdown => {
                 worker.shutdown();
                 let _ = tx.send(Response::ShutdownAck);
@@ -119,8 +99,8 @@ fn worker_loop(
 
 /// Multi-GPU executor using dedicated OS threads per worker.
 ///
-/// Each worker runs on its own OS thread, ensuring NCCL collectives can
-/// execute concurrently across ranks without tokio scheduling issues.
+/// Each worker runs on its own OS thread, so ranks run concurrently without
+/// tokio scheduling issues.
 pub struct ThreadPoolExecutor {
     workers: Vec<WorkerThread>,
     #[allow(dead_code)]
@@ -132,22 +112,8 @@ impl ThreadPoolExecutor {
     /// Create a new thread-pool executor from pre-initialized workers.
     ///
     /// Workers are moved to dedicated OS threads. They must already have
-    /// device init, model load, and NCCL injection completed.
-    /// Create a new thread-pool executor.
-    ///
-    /// `process_groups` is an optional list of per-worker process groups for
-    /// NCCL broadcast (multi-node control channel). Pass `None` for
-    /// single-node setups.
+    /// device init and model load completed.
     pub fn new(workers: Vec<Box<dyn Worker>>, parallel_config: ResolvedParallelConfig) -> Self {
-        Self::with_process_groups(workers, parallel_config, None)
-    }
-
-    /// Create with explicit per-worker NCCL process groups for multi-node broadcast.
-    pub fn with_process_groups(
-        workers: Vec<Box<dyn Worker>>,
-        parallel_config: ResolvedParallelConfig,
-        process_groups: Option<Vec<Arc<dyn scratchy_core_model::process_group::ProcessGroup>>>,
-    ) -> Self {
         let output_rank = parallel_config.output_rank();
 
         let handles: Vec<WorkerThread> = workers
@@ -156,13 +122,9 @@ impl ThreadPoolExecutor {
             .map(|(rank, worker)| {
                 let (req_tx, req_rx) = std::sync::mpsc::channel();
                 let (resp_tx, resp_rx) = std::sync::mpsc::channel();
-                let pg = process_groups
-                    .as_ref()
-                    .and_then(|pgs| pgs.get(rank).cloned());
-
                 let handle = std::thread::Builder::new()
                     .name(format!("vllm-worker-{rank}"))
-                    .spawn(move || worker_loop(worker, pg, req_rx, resp_tx))
+                    .spawn(move || worker_loop(worker, req_rx, resp_tx))
                     .expect("failed to spawn worker thread");
 
                 WorkerThread {
@@ -196,22 +158,6 @@ impl ThreadPoolExecutor {
         }
         // Collect responses (blocking — each worker responds in order).
         self.workers.iter().map(|w| w.rx.recv().unwrap()).collect()
-    }
-
-    /// NCCL broadcast bytes on the worker thread (correct CUDA context).
-    ///
-    /// Dispatches to the rank-0 worker thread. For multi-node: rank 0 sends,
-    /// remote ranks receive. All ranks must call simultaneously (collective).
-    pub fn nccl_broadcast(&self, data: &[u8], root: usize) -> ExecutorResult<Vec<u8>> {
-        // Only dispatch to the first (rank 0) worker — it has the NCCL comm.
-        let w = &self.workers[0];
-        let _ = w.tx.send(Request::NcclBroadcast(data.to_vec(), root));
-        match w.rx.recv().unwrap() {
-            Response::NcclBroadcastResult(result) => result,
-            _ => Err(crate::error::ExecutorError::WorkerExecution(
-                "unexpected response from NCCL broadcast".to_string(),
-            )),
-        }
     }
 }
 

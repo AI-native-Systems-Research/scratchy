@@ -3,7 +3,7 @@
 //!
 //! Used by embedding endpoints to configure how model hidden states are
 //! converted into embedding vectors. The actual pooling/normalization is
-//! performed by each backend (MLX, CUDA) using native tensor ops.
+//! performed by each backend using native tensor ops.
 
 /// Pooling strategy for extracting embeddings from hidden states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

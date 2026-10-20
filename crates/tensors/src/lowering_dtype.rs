@@ -14,8 +14,8 @@
 /// `W::METAL_DTYPE` to pick the right symbol when populating
 /// [`LoweredCommand::function`].
 ///
-/// Llama-3.x ships bf16 on disk; the cuda backend runs them in bf16
-/// natively, and Apple Silicon (M3+) has hardware bf16 MMA. Casting
+/// Llama-3.x ships bf16 on disk, and Apple Silicon (M3+) has hardware
+/// bf16 MMA. Casting
 /// to fp16 — which the metal backend did originally — clips
 /// exponent range and accumulates into nonsense output across deep
 /// layer chains (28 layers for Llama-3.2-3B).

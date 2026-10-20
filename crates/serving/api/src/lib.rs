@@ -17,7 +17,6 @@ pub mod chat_template;
 pub mod detokenizer;
 pub mod engine;
 pub mod error;
-pub mod headless;
 pub mod init;
 pub use init::try_load_tokenizer;
 

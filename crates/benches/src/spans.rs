@@ -10,7 +10,6 @@ use std::time::Instant;
 
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
-use scratchy_core_config::{CudaGraphConfig, CudaGraphMode};
 use scratchy_serving_api::llm::{LLM, LLMBuilder, Prompt, SamplingParams};
 
 use crate::args::BenchSpansArgs;
@@ -230,7 +229,6 @@ fn build_llm(args: &BenchSpansArgs, prefix_caching: bool) -> Result<LLM> {
         .gpu_memory_utilization(args.gpu_memory_utilization)
         .max_num_seqs(args.max_num_seqs)
         .block_size(args.block_size)
-        .enforce_eager(args.enforce_eager)
         .enable_prefix_caching(prefix_caching);
 
     let total_doc_tokens = args.num_docs * args.doc_blocks * args.block_size;
@@ -245,18 +243,6 @@ fn build_llm(args: &BenchSpansArgs, prefix_caching: bool) -> Result<LLM> {
     }
     if let Some(ref gguf) = args.gguf_file {
         builder = builder.gguf_file(gguf);
-    }
-
-    if !args.enforce_eager {
-        let sizes = CudaGraphConfig::parse_sizes("auto");
-        if !sizes.is_empty() {
-            builder = builder.cuda_graph_config(CudaGraphConfig {
-                enabled: true,
-                mode: CudaGraphMode::default(),
-                capture_sizes: sizes,
-                num_warmups: 3,
-            });
-        }
     }
 
     builder.build()

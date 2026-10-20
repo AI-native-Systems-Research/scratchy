@@ -13,8 +13,8 @@
 //! By default it removes entries not used in the last 30 days (`--days N`
 //! overrides). `--nuke` ignores the age filter and targets everything;
 //! `--force` skips the interactive y/N confirmation. This is pure
-//! filesystem work, so the command is available on every build (cuda,
-//! metal, cpu) regardless of which backend produced the caches.
+//! filesystem work, so the command is available on every build (metal,
+//! spyre, cpu) regardless of which backend produced the caches.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -562,7 +562,7 @@ mod tests {
     #[test]
     fn nuke_keeps_everything_sorted_by_size() {
         let now = SystemTime::now();
-        let fresh = now - Duration::from_secs(1 * DAY_SECS);
+        let fresh = now - Duration::from_secs(DAY_SECS);
         let entries = vec![entry("a", 10, fresh), entry("b", 20, fresh)];
         let kept = select_stale(entries, true, 30, now);
         assert_eq!(kept.len(), 2);
@@ -658,7 +658,7 @@ mod tests {
         assert_eq!(map.len(), 2, "both shards should map to the model");
         assert!(map.values().all(|m| m == "acme/Big-Model"));
         let mut total = 0u64;
-        for (key, _model) in &map {
+        for key in map.keys() {
             std::fs::write(weight_root.join(format!("{key}.bin")), vec![0u8; 1000]).unwrap();
             std::fs::write(weight_root.join(format!("{key}.meta.json")), b"{}").unwrap();
             total += 1000 + 2;

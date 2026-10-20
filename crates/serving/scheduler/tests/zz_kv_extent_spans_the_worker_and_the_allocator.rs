@@ -87,7 +87,7 @@ fn a_hole_bearing_request_is_allocated_by_slots_and_cached_by_its_contiguous_pre
 }
 
 /// ⛔ THE CONTROL: with no extent reported — every backend whose KV is token-addressed — both rules are
-/// exactly the arithmetic they always were. A regression here is a change to cuda/metal behaviour.
+/// exactly the arithmetic they always were. A regression here is a change to metal behaviour.
 #[test]
 fn a_backend_that_reports_nothing_is_allocated_and_cached_by_its_token_count() {
     let mut t = SimpleBlockTracker::with_caching(64, BLOCK);
@@ -179,7 +179,7 @@ fn a_shallow_request_under_a_deep_step_reach_holds_blocks_for_the_reach() {
     );
 
     // ⛔ THE CONTROL, IN THE SAME TEST: a tracker that did NOT declare the capability must be untouched by
-    // any reach. This is cuda and metal, and a regression here is a change to their allocation.
+    // any reach. This is metal, and a regression here is a change to its allocation.
     let mut plain = SimpleBlockTracker::with_caching(64, BLOCK);
     plain.set_kv_pool_reach(KvSlotSpan::new(697));
     plain.set_step_reach(KvSlotSpan::new(798));
@@ -277,7 +277,7 @@ fn an_extent_one_step_in_flight_is_allocated_for_the_slot_the_launch_will_write(
         "an up-to-date report and an aged one describing the SAME state must allocate the same"
     );
 
-    // ⛔ AND THE TOKEN-ADDRESSED CONTROL: cuda and metal report no extent at all, so nothing here can reach
+    // ⛔ AND THE TOKEN-ADDRESSED CONTROL: metal reports no extent at all, so nothing here can reach
     // them. A regression on this line is a change to their allocation.
     let mut plain = SimpleBlockTracker::with_caching(64, BLOCK);
     plain.set_step_reach(KvSlotSpan::new((current_end + 1) as u32));
@@ -321,7 +321,7 @@ fn a_new_request_is_allocated_for_the_step_reach_before_any_pool_reach_exists() 
          the token-count answer that left the worker serving page 2 from its own reserve"
     );
 
-    // The control again: undeclared, so the reach is inert and this is the cuda/metal answer.
+    // The control again: undeclared, so the reach is inert and this is the metal answer.
     let mut plain = SimpleBlockTracker::with_caching(64, BLOCK);
     plain.set_step_reach(KvSlotSpan::new(698));
     let same = request_of("fresh", 441, None);

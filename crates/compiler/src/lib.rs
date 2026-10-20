@@ -19,8 +19,6 @@
 //! proc-macro time. Re-exporting the macro would re-introduce the
 //! macro→forward→macro cycle.
 
-pub mod attack_surface;
-pub mod backend_compat;
 pub mod gdn_slot_allocator;
 pub mod gdn_state_layout;
 // `info` is the non-generic, hashable backbone view used by
@@ -51,24 +49,15 @@ pub use scratchy_ir::{BiasStorage, Instruction, KvOffset, KvOffsets, RowsExtern}
 pub use scratchy_ir::{pack_moe_expert_bits, unpack_moe_expert_bits};
 // `CanonicalParams` + `WeightAccessors` are cross-backend — the
 // metal interpreter (`interpreter::metal::worker::resolve_weight`)
-// invokes both, mirroring the cuda eval body's pattern. Both now live
-// in the cfg-free `scratchy-ir` crate (`CanonicalParams`'s
+// invokes both. Both live in the cfg-free `scratchy-ir` crate (`CanonicalParams`'s
 // `METAL_DTYPE` / `SCALE_DTYPE` consts name the relocated
 // `scratchy_tensors::{MetalDtype, ScaleDtype}` enums), so the
 // re-exports are unconditional and the macro path
 // `::scratchy_forward_compiler::CanonicalParams` keeps resolving.
-pub use backend_compat::{BackendCompat, Cuda, Metal, Wgpu};
 pub use scratchy_ir::{CanonicalParams, KvCodec, TqBits, WeightAccessors};
-// The cuda runtime entry points (`run` / `run_backbone` / `InstructionEval` /
-// `InterpreterCtx`), tile-table helpers (`view` / `tile_ref` / `take_owned`),
-// piecewise capture, vision-arch wrappers (`VisionWrapper` /
-// `VisionArchWeights`), and the layered-load helpers (`load_layered_*`) are
-// all weight-upload / device-runtime code that names the concrete
-// `GpuWeights` / `GpuDevice` / `ForwardCtx`. They live in
-// `scratchy-target-cuda`; the macro reaches them via `::scratchy_target_cuda::*`
-// (every arch crate deps that crate directly), so the compiler no longer
-// re-exports them — that re-export is what made the compiler depend UP on the
-// target, the edge this crate's contract inverts.
+// Device-runtime code that names the concrete `GpuWeights` / `GpuDevice`
+// lives in the target crates, never here: re-exporting it would make the
+// compiler depend UP on a target, the edge this crate's contract inverts.
 
 /// One row in a per-canonical forward dispatch table. Replaces the
 /// O(N×M) nested-match `pub fn forward()` + per-bucket
@@ -96,13 +85,10 @@ pub use scratchy_ir::{CanonicalParams, KvCodec, TqBits, WeightAccessors};
 ///   6 = num_slots      — tile-table size for `run`/`run_backbone`
 ///   7 = backbone_slot  — slot `forward_backbone` returns
 ///   8 = terminal_slot  — slot `forward` returns (after lm_head)
-// `BucketEntry` is a plain tuple struct — no backend deps. Lifted to
-// `any(cuda, metal)` so the metal-side macro emits `FORWARD_TABLE`
-// too and `scr model info`'s `dump()` walks it. The cuda runtime
-// uses fields 6/7/8 (num_slots / backbone_slot / terminal_slot) to
-// size the tile table and pick return slots; the metal pool uses
-// `METAL_BUCKETS` instead, so those fields stay populated but
-// untouched on metal.
+// `BucketEntry` is a plain tuple struct — no backend deps. The macro emits
+// `FORWARD_TABLE` and `scr model info`'s `dump()` walks it. Fields 6/7/8
+// (num_slots / backbone_slot / terminal_slot) stay populated; the metal pool
+// sizes from `METAL_BUCKETS` instead and leaves them untouched.
 pub struct BucketEntry<Op: 'static>(
     pub u64,
     pub u64,
@@ -143,9 +129,7 @@ pub fn find_bucket<Op: 'static>(
 /// Runtime gate for the per-op trace `Instruction::eval` opens
 /// each match with. Reads `SCRATCHY_TRACE` from the environment on
 /// the first call and caches the result. Set `SCRATCHY_TRACE=1`
-/// (or any non-empty, non-"0" value) before launch to enable;
-/// pair with `CUDA_LAUNCH_BLOCKING=1` so the trace lines align
-/// with kernel completion order.
+/// (or any non-empty, non-"0" value) before launch to enable.
 ///
 /// Unconditionally compiled in — the cost when disabled is one
 /// atomic-load + branch per dispatched op. `Instruction<W>` carries
@@ -253,12 +237,10 @@ pub fn hash_json_value(v: &serde_json::Value) -> u64 {
     h.finish()
 }
 
-// `ForwardCtx` (ambient-args bundle the emitted forward fn takes) +
-// `EmbedPatch` (multimodal embed-splice descriptor) name the backend-coupled
-// `KvCachePool` / `GdnStatePool`, so they stay in `scratchy-target-cuda`. The
-// `ScratchyWeights` trait below takes the neutral `ForwardCtxHandle` instead of
-// `&ForwardCtx`; the macro reaches the concrete type via
-// `::scratchy_target_cuda::ForwardCtx` (every arch crate deps it directly).
+// `ForwardCtx` (ambient-args bundle the emitted forward fn takes) names the
+// backend-coupled `KvCachePool` / `GdnStatePool`, so it lives in the target
+// crate (`scratchy_target_metal::ForwardCtx`). The `ScratchyWeights` trait
+// below takes the neutral `ForwardCtxHandle` instead of `&ForwardCtx`.
 
 // ── Cross-arch dispatcher ────────────────────────────────────────
 //
@@ -269,14 +251,9 @@ pub fn hash_json_value(v: &serde_json::Value) -> u64 {
 // only its source file plus a single `pub mod <arch>;` in the
 // calling crate's lib.rs (Rust module system requirement).
 //
-// Same trait + registration + walk under both backends. The trait
-// method signatures are identical character-for-character — the
-// types they reference (`GpuDevice`, `OwnedTensor`, `ForwardCtx`)
-// are cfg-mutex'd to their cuda or metal incarnation, so a single
-// signature serves both. Per-arch `impl ScratchyWeights` bodies
-// (macro-emitted) cfg-mutex'd internally where the call shape
-// genuinely differs (cuda calls cuda's `forward(weights, ctx,
-// device, num_tokens)`; metal goes through `MetalWorkerPool::forward`).
+// Same trait + registration + walk under every backend: the trait methods
+// take neutral handles, so a single signature serves them all. Metal's
+// per-arch bodies go through `MetalWorkerPool::forward`.
 
 mod dispatcher;
 
@@ -284,7 +261,7 @@ mod dispatcher;
 pub use dispatcher::{ChainStepHandle, MetalChainBody, MetalForwardFollowup, MetalForwardOnto};
 // Backend-neutral contracts — the `ScratchyWeights` trait (its device-runtime
 // forward methods take the neutral `ForwardCtxHandle` / `ForwardDeviceHandle`)
-// and the pure-config `HfFingerprint` carry no cuda/metal coupling, so they're
+// and the pure-config `HfFingerprint` carry no backend coupling, so they're
 // re-exported unconditionally; a third target (Spyre) names them without a
 // backend feature.
 pub use dispatcher::{BoundWeight, HfFingerprint, LentWeight, ScratchyWeights};
@@ -307,12 +284,7 @@ pub use mm::{EmbedPatch, PixelInput};
 // here — the `#[forward]` macro emits `::scratchy_forward_compiler::Scratchy*`
 // directly, which keeps resolving after the `__gpu` alias flips to metal (a
 // crate that cannot depend on this one).
-#[cfg(any(
-    feature = "cuda",
-    feature = "metal",
-    feature = "spyre",
-    feature = "vision"
-))]
+#[cfg(any(feature = "metal", feature = "spyre", feature = "vision"))]
 pub mod arch_registry;
 /// SuperDSC device code as `&'static` bytes in the binary, submitted by the `#[forward]` emit after
 /// `dxp_standalone` compiles it. Replaces the fingerprint→directory table and the bundle cache it
@@ -321,7 +293,7 @@ pub mod arch_registry;
 // generic and names no device-runtime or vision types, so it compiles + is
 // reachable under spyre too — the spyre worker fingerprint-loads through this
 // SAME registry (with `GpuWeights<SpyreAllocator>`).
-#[cfg(any(feature = "cuda", feature = "metal", feature = "spyre"))]
+#[cfg(any(feature = "metal", feature = "spyre"))]
 pub use arch_registry::{ArchLoad, ArchTryLoadFn, ScratchyArchRegistration, try_load};
 pub mod heads;
 pub use heads::{HeadRegistration, PublishedDrafter, TargetShape, draft_head, head_of};
@@ -330,7 +302,7 @@ pub use heads::{HeadRegistration, PublishedDrafter, TargetShape, draft_head, hea
 #[cfg(feature = "spyre")]
 pub use arch_registry::{resolve_ktir_bundle, resolve_sengraph_bundle};
 // MM sibling names `scratchy-vision` (`MmMetadata`) + device-runtime types, so
-// it's gated on the `vision` CAPABILITY (not a target): cuda/metal enable it
+// it's gated on the `vision` CAPABILITY (not a target): metal enables it
 // today; spyre opts in the same way when it grows a vision path.
 #[cfg(feature = "vision")]
 pub use arch_registry::{MmTryLoadFn, ScratchyMmRegistration, resolve_mm_metadata, try_load_mm};
@@ -347,7 +319,5 @@ pub mod metal_followup_reexports {
 /// `::scratchy_forward_compiler::inventory::submit!` block for
 /// [`BackboneDumpRegistration`] (the neutral `scr model info` dump
 /// registry that stays in this crate) resolves without the consuming crate
-/// adding its own `inventory` dep. The `GpuWeights`-coupled
-/// `ScratchyArchRegistration` / `ScratchyMmRegistration` submissions now go
-/// through `::scratchy_target_cuda::inventory` instead.
+/// adding its own `inventory` dep.
 pub use inventory;

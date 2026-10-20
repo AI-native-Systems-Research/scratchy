@@ -66,7 +66,7 @@ pub struct ModelParams {
     /// `config.json`. The macro unions these across every compiled
     /// model in an arch directory to produce the `hf_arches` list
     /// baked into the arch's
-    /// `scratchy_target_cuda::ScratchyArchRegistration` registration,
+    /// `scratchy_forward_compiler::ScratchyArchRegistration` registration,
     /// driving the runtime `try_load(..., arch_hint)` dispatch.
     pub architectures: Vec<String>,
     /// The checkpoint architectures of the model this arch is a part of — its config's own
@@ -120,17 +120,6 @@ pub struct ModelParams {
     /// the former per-quirk `Option` fields — model-arch knowledge
     /// lives in the arch crate, never as switches in this crate.
     pub arch: crate::arch_spec::DeclaredArchSpec,
-    /// HF `torch_dtype` string, lowercased. Read by codegen as the
-    /// FALLBACK for the rotary cache compute dtype when the embed
-    /// tensor isn't visible in the weights table at load time. Today's
-    /// primary path reads `embed_tokens.weight`'s on-disk dtype at
-    /// runtime — see `emit_weights_struct`'s `rotary_prelude`. AWQ
-    /// variants frequently override the base dtype (Qwen2.5 base
-    /// ships bf16; `*-Instruct-AWQ` ships f16) while keeping the
-    /// manifest `torch_dtype` literal unchanged, so the runtime read
-    /// is load-bearing for AWQ correctness. `None` when the JSON
-    /// omits the field.
-    pub torch_dtype: Option<String>,
     /// The activation a routed expert applies to its in-projection, as the config declares it
     /// — see [`ExpertActivation`].
     pub expert_activation: ExpertActivation,
@@ -514,8 +503,8 @@ fn load_dir_mode(
     //
     // A handful of stems are byte-identical files checked into two arch
     // dirs at once (the same checkpoint, loadable via a vision arch or its
-    // non-vision base arch — e.g. `gemma-3-12b-it` under both `gemma3/` and
-    // `gemma3-mm/`); for those the vision arch keeps the bare stem and the
+    // non-vision base arch — e.g. `qwen2-vl-2b-mlx` under both `qwen2/` and
+    // `qwen2-vl/`); for those the vision arch keeps the bare stem and the
     // base arch's copy is `<stem>-text-only` (VISION_ARCH_FOR_STEM below,
     // verified per pair against crates/models/arch/Cargo.toml — mirrors the
     // Cargo.toml feature-name generator exactly, must stay in sync with it).
@@ -549,9 +538,6 @@ fn load_dir_mode(
         ("locateanything-3b", "locateanything"),
         ("qwen3.5-9b", "qwen3-5-vl"),
         ("qwen3.6-27b", "qwen3-5-vl"),
-        ("gemma-3-12b-it", "gemma3-mm"),
-        ("gemma-3-27b-it", "gemma3-mm"),
-        ("gemma-3-4b-it", "gemma3-mm"),
     ];
     let arch_name = dir
         .file_name()
@@ -646,17 +632,9 @@ fn load_dir_mode(
     // solver as Dense (codegen dequantizes at load time), and `nvfp4`
     // reaches it as a genuine metal quant claimed by `MetalNvfp4QmmImpl`
     // (forward-time E2M1 dequant-on-read qmv/qmm_t). Every other preset
-    // routes through CUDA-only Impls (Marlin / Bnb4 / Fp8 / Ggml) that the
-    // metal impl pool has no claimants for, so the solver would explode
+    // routes through Impls (Marlin / Bnb4 / Fp8 / Ggml) that the metal
+    // impl pool has no claimants for, so the solver would explode
     // with `UnclaimedTile`.
-    //
-    // Backend claimability — cuda: the mirror. `mlx-affine-*` weights are
-    // an Apple checkpoint format with no CUDA Impl in the pool (the Affine
-    // quant flow lives entirely in the metal kernels). `nvfp4` is currently
-    // metal-only too (E2M1 dequant qmv/qmm_t shaders + `MetalNvfp4QmmImpl`);
-    // a CUDA NVFP4 path is future work. Skip both so the cuda solver
-    // doesn't fail with `UnclaimedTile` on `Embed`/`Gemm` for those storage
-    // tags.
     let quant_preset_active = |preset_name: &str| -> bool {
         if let Some(q) = &enabled_quants
             && !q.contains(preset_name)
@@ -666,11 +644,6 @@ fn load_dir_mode(
         if cfg!(feature = "metal")
             && !preset_name.starts_with("mlx-affine-")
             && preset_name != "nvfp4"
-        {
-            return false;
-        }
-        if cfg!(feature = "cuda")
-            && (preset_name.starts_with("mlx-affine-") || preset_name == "nvfp4")
         {
             return false;
         }
@@ -817,12 +790,12 @@ fn load_dir_mode(
     // identical Impl-set signatures share one emitted body. Without
     // that dedup, N sizes × M presets quickly blow up release-build
     // LLVM work.
-    // Under `--features metal` we skip CUDA-only quant variants
+    // Under `--features metal` we skip quant variants metal can't claim
     // (awq-gemm / gptq-* / bnb-nf4-dq / fp8-* / ct-int4-sym / ggml) —
     // their on-disk layouts route through `MarlinFusedGateUpSiluMul` /
     // `Bnb4Linear` / `Fp8Linear` / `GgmlLinear` impls that the metal
     // impl pool has no claimants for, so the solver explodes with
-    // `UnclaimedTile` on the first quant tile. A CUDA-only preset being
+    // `UnclaimedTile` on the first quant tile. A preset being
     // skipped this way on metal means it was never `quant_preset_active`
     // in the first place, so it also never suppressed the dense base
     // above — dense only drops out for a preset that actually synthesizes.
@@ -832,7 +805,7 @@ fn load_dir_mode(
     // load time via `LinearLayer::load_affine_dequant_as_dense`, so
     // the forward path remains the existing bf16 Gemm path that the
     // metal impl pool already claims. The preset-filter inside the
-    // overlay loop below keeps CUDA-only presets out while still
+    // overlay loop below keeps unclaimable presets out while still
     // synthesizing the affine variant.
     let quantizations_path = dir.join("quantizations.json");
     let presets = declared_preset_names(&quantizations_path)?;
@@ -867,7 +840,7 @@ fn load_dir_mode(
         for preset_name in &presets {
             // Quant feature scoping (SCRATCHY_QUANTS) + backend claimability
             // (metal only claims mlx-affine-*/nvfp4 as those route through
-            // Dense/MetalNvfp4QmmImpl; cuda is the mirror — see
+            // Dense/MetalNvfp4QmmImpl — see
             // `quant_preset_active`'s definition above for the full backend
             // reasoning, shared with the dense-suppression pre-check so the
             // two can't drift apart).
@@ -1113,9 +1086,7 @@ pub fn load_head_file(
 /// `group_size`/`bits`/`mode`, rather than one width for the whole model.
 ///
 /// Only metal lowers those today: the per-projection widths are read back by
-/// `unpack_moe_expert_bits` / `affine_gather_qmv_symbol`, and cuda's ISel has
-/// no `Embed` Impl that claims a mixed-bit quantized embedding — it refuses
-/// the solve outright ("no Impl in the library matched tile 0 op Embed").
+/// `unpack_moe_expert_bits` / `affine_gather_qmv_symbol`.
 ///
 /// So `all` is BACKEND-RELATIVE for these, exactly as it already is for
 /// synthesized quant variants via `quant_preset_active` above: the same
@@ -1551,20 +1522,6 @@ fn parse_tie_word_embeddings(json: &serde_json::Value) -> Option<bool> {
     json.get("tie_word_embeddings").and_then(|v| v.as_bool())
 }
 
-/// Top-level `torch_dtype` → `text_config.torch_dtype` →
-/// `text_config.dtype` (newer transformers serialization: Qwen3.5
-/// wrappers carry the compute dtype only as `text_config.dtype`,
-/// which the hoist surfaces as `dtype`, never `torch_dtype`).
-fn parse_torch_dtype(json: &serde_json::Value) -> Option<String> {
-    json.get("torch_dtype")
-        .or_else(|| {
-            json.get("text_config")
-                .and_then(|t| t.get("torch_dtype").or_else(|| t.get("dtype")))
-        })
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_ascii_lowercase())
-}
-
 /// Resolve the final per-variant arch spec: the arch crate's DECLARED
 /// values as the base, with per-checkpoint JSON drift (explicit config
 /// fields / `.overrides.json`) winning field-by-field. Consumers read
@@ -1723,7 +1680,6 @@ fn model_params_from_json(
     let rope_scaling_hash = json.get("rope_scaling").map(hash_json_value);
     let mrope_section = extract_mrope_section(json);
     let arch = resolve_arch_spec(spec, json, source_stem);
-    let torch_dtype = parse_torch_dtype(json);
     let expert_activation = parse_expert_activation(json);
 
     apply_generic_bound_defaults(&mut bounds);
@@ -1747,7 +1703,6 @@ fn model_params_from_json(
         rope_scaling_hash,
         mrope_section,
         arch,
-        torch_dtype,
         expert_activation,
     })
 }
@@ -1857,7 +1812,6 @@ fn vision_params_from_json(
         }
     }
 
-    let torch_dtype = parse_torch_dtype(json);
     let expert_activation = parse_expert_activation(json);
     apply_generic_bound_defaults(&mut bounds);
 
@@ -1880,7 +1834,6 @@ fn vision_params_from_json(
         rope_scaling_hash: None,
         mrope_section: None,
         arch,
-        torch_dtype,
         expert_activation,
     })
 }

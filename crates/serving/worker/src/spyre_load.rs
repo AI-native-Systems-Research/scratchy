@@ -177,6 +177,9 @@ use crate::spyre_types::*;
 use crate::spyre_worker::*;
 use crate::worker_factory::resolve_model_path;
 
+/// One staged weight: `(tensor id, bytes, dtype, shape)`.
+type StagedWeight = (usize, Vec<u8>, SDType, Vec<usize>);
+
 /// Parsed per-program metadata + the owned manifest (kept alive for the shared
 /// session) + model-level dims. No weights, no session — the caller builds those
 /// ONCE across both programs (decode + prefill share weight tensor ids).
@@ -390,7 +393,7 @@ fn spilled_weight_tail_tids(
 /// stage, or a payload a multiply cannot scale in place (fp8 — that is a requantize; integers).
 /// Either is a wiring↔recognition desync, not an input to interpret.
 fn apply_weight_scale_folds(
-    weights: &mut [(usize, Vec<u8>, SDType, Vec<usize>)],
+    weights: &mut [StagedWeight],
     folds: &[(u32, f32)],
 ) -> ExecutorResult<()> {
     use rayon::prelude::*;
@@ -479,7 +482,7 @@ fn apply_weight_scale_folds(
 /// stage, or a `to` id the binding already owns — either is a wiring↔mint desync, not an input
 /// to interpret.
 fn materialize_weight_copies(
-    weights: &mut Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
+    weights: &mut Vec<StagedWeight>,
     copies: &[(u32, u32)],
 ) -> ExecutorResult<()> {
     for (from, to) in copies {
@@ -522,9 +525,9 @@ pub(crate) fn stage_bound_weights(
     // The allocator that owns the bound tensors' buffers: staging TAKES each buffer
     // (no copy) at its last binding instead of copying it while the original stays alive.
     alloc: &mut SpyreAllocator,
-) -> ExecutorResult<Vec<(usize, Vec<u8>, SDType, Vec<usize>)>> {
+) -> ExecutorResult<Vec<StagedWeight>> {
     let _t_load = std::time::Instant::now();
-    let mut weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)> = Vec::new();
+    let mut weights: Vec<StagedWeight> = Vec::new();
     let _take_s = 0f64;
     // The LAST binding of each buffer — a buffer two bindings share (a tied head, k=v) is
     // copied for every binding but its last, which takes it.
@@ -801,7 +804,7 @@ impl SpyreWorker {
 
         // Load on-disk weights into a host GpuWeights, then resolve the compiled
         // arch through scratchy's registry (fingerprint) — exactly like the
-        // cuda/metal workers. NO stem-glob, NO ~/.cache read: the matched
+        // metal worker. NO stem-glob, NO ~/.cache read: the matched
         // ScratchyWeights carries the macro-embedded KTIR bundle.
         let _t_gw = std::time::Instant::now();
         let mut gw = GpuWeights::from_dir(&model_dir, SpyreAllocator::new())
@@ -831,7 +834,7 @@ impl SpyreWorker {
         // Fetch the embedded KTIR bundle (spyre's forward representation) for THIS
         // checkpoint — READ-ONLY (fingerprint sniff), leaving every tensor in `gw`
         // for the destructive byte extraction below. spyre's typed `Weights::load`
-        // is real (it builds the same fielded struct cuda/metal do), but the KTIR
+        // is real (it builds the same fielded struct metal does), but the KTIR
         // runner streams raw weights, so the worker takes spyre's forward path
         // here instead. The fingerprint (`gw` shapes + `hf_fp`) discriminates
         // variants: an arch registers many distinct base models (llama-2-13b …
@@ -847,7 +850,7 @@ impl SpyreWorker {
         // bundle could come from one and the weights from another.
         //
         // `try_load` runs the GENERATED `Weights::load` — the same loader
-        // cuda/metal use — and the bundle, the weight binding and the embed
+        // metal uses — and the bundle, the weight binding and the embed
         // table are all read off THAT model.
         let _t_try = std::time::Instant::now();
         let model = scratchy_forward_compiler::try_load(
@@ -1041,18 +1044,18 @@ impl SpyreWorker {
         // ⚠️ ONE `allow` SURVIVES, DOWN FROM SIX, and it is a cfg artifact rather than a silenced
         // problem: a value computed inside `cfg(sendnn)` and consumed outside it must be declared
         // before the branch, so its initialiser is dead in exactly the build that assigns it.
-        // `None` IS read on the non-sendnn path, and what it feeds is one call away.
+        // `NONE` IS read on the non-sendnn path, and what it feeds is one call away.
         // ⛔ THE MUTABILITY IS THE CARD PATH'S, so it carries that cfg rather than an
         // `#[allow(unused_mut)]`: only the branch below assigns these, and on the emulator the
         // binding is a plain `None` that is read once.
         #[cfg(feature = "spyre-hw")]
-        let mut decode_facts: Option<scratchy_target_spyre::wiring::BakeFacts> = None;
+        let mut decode_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
         #[cfg(not(feature = "spyre-hw"))]
-        let decode_facts: Option<scratchy_target_spyre::wiring::BakeFacts> = None;
+        let decode_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
         #[cfg(feature = "spyre-hw")]
-        let mut prefill_facts: Option<scratchy_target_spyre::wiring::BakeFacts> = None;
+        let mut prefill_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
         #[cfg(not(feature = "spyre-hw"))]
-        let prefill_facts: Option<scratchy_target_spyre::wiring::BakeFacts> = None;
+        let prefill_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
         // The KV byte budget the paged pool gets sized against — the card's real capacity ×
         // `--gpu-memory-utilization` − the bundle's non-KV segments. Declared out here for the same reason
         // `scalarmul_scales_v` is: it is computed in the SuperDsc branch below (sendnn only) but has to
@@ -1203,11 +1206,10 @@ impl SpyreWorker {
                 // and every request takes the per-request path (~93 µs of launch each) — correct output,
                 // much slower.
                 //
-                // ⭐⭐ SO IT IS REPORTED AS A CAP AND THE SCHEDULER IS HELD TO IT — the cuda rule.
-                // cuda refuses no `max_num_seqs`: it derives its captured-graph ladder FROM it
-                // (`auto_capture_sizes(max_num_seqs)`), so its fast path always covers the configured
-                // concurrency. A BAKED ladder cannot grow to meet the flag, so this backend holds the same
-                // invariant from the other end via `Worker::max_num_seqs_override`. A bare `scr serve` and
+                // ⭐⭐ SO IT IS REPORTED AS A CAP AND THE SCHEDULER IS HELD TO IT. No backend refuses a
+                // `max_num_seqs`, and the fast path should always cover the configured concurrency. A
+                // BAKED ladder cannot grow to meet the flag, so this backend holds that invariant from
+                // the other end via `Worker::max_num_seqs_override`. A bare `scr serve` and
                 // an explicit `--max-num-seqs 256` then behave IDENTICALLY (both 32-wide, batched), which
                 // the refusal made incoherent: it rejected the explicit spelling of the very default it
                 // was silently substituting.
@@ -1256,11 +1258,9 @@ impl SpyreWorker {
                 // placeholder and repeated the bug.
                 //
                 // ⭐ AND THE FORMULA IS THE SHARED ONE, NOT A THIRD SPELLING OF IT.
-                // `scratchy_serving_engine::gpu_budget::compute_available_kv_bytes` is documented
-                // "backend-neutral ... shared by the CUDA and Metal Worker implementations" and lives in a
-                // crate this file already depends on. cuda calls it; metal calls it; spyre had a constant.
-                // Three backends, one law, and the only one that opted out is the one that then could not
-                // start.
+                // `scratchy_serving_engine::gpu_budget::compute_available_kv_bytes` is the backend-neutral
+                // budget law and lives in a crate this file already depends on. Metal calls it; spyre had a
+                // constant, and the one that opted out is the one that then could not start.
                 //
                 // ⭐⭐⭐ THE POOL'S OWN DEMAND, DERIVED ONCE, HERE — above the budget on purpose: the
                 // census below needs it (the prefill anchor's spare includes a SECOND pool exactly
@@ -1855,7 +1855,7 @@ impl SpyreWorker {
                             .join(", "),
                     )));
                 }
-                decode_facts = Some(df);
+                decode_facts = df;
                 // ── PREFILL-ALL-BUT-LAST: the DISTINCT m=N prefill dxp bundle (C4 stamps its own fp
                 //    in the prefill graph slot; lm_head skipped). Build a SECOND SuperDscSession from
                 //    it (binding the SAME weights again — 2× resident, the spike cost) so the prompt
@@ -1922,7 +1922,7 @@ impl SpyreWorker {
                         // What the PREFILL bake placed. From the bundle, never from
                         // `SCRATCHY_RMS_MATMUL_REDUCE`, so a bundle-vs-env mismatch cannot leave a
                         // matmul reading an unbound (zero) seg0.
-                        prefill_facts = Some(scratchy_target_spyre::wiring::BakeFacts::of(pl));
+                        prefill_facts = scratchy_target_spyre::wiring::BakeFacts::of(pl);
                         // The prefill bake's class sets against ITS placements — the same
                         // cross-check the decode bake just passed, for the same reason.
                         wirings
@@ -2763,14 +2763,7 @@ impl SpyreWorker {
         let mut decode: Vec<BundleMeta> = dparsed_all
             .into_iter()
             .enumerate()
-            .map(|(i, p)| {
-                mk_meta(
-                    p,
-                    decode_prog_base + i,
-                    decode_facts.unwrap_or(scratchy_target_spyre::wiring::BakeFacts::NONE),
-                    &wirings.decode,
-                )
-            })
+            .map(|(i, p)| mk_meta(p, decode_prog_base + i, decode_facts, &wirings.decode))
             .collect();
         // Ascending by capacity so `select_decode`'s first-fit picks the smallest.
         decode.sort_by_key(|b| b.capacity);
@@ -2778,7 +2771,7 @@ impl SpyreWorker {
             mk_meta(
                 p,
                 prefill_prog.unwrap(),
-                prefill_facts.unwrap_or(scratchy_target_spyre::wiring::BakeFacts::NONE),
+                prefill_facts,
                 wirings.prefill.as_ref().unwrap_or(&wirings.decode),
             )
         });
@@ -2848,7 +2841,7 @@ mod weight_scale_fold_tests {
     /// One staged weight as `stage_bound_weights` shapes them: `(id, bytes, dtype, dims)`.
     /// The element values go through the SAME one-rounding encode the load path produces
     /// (`f32 → dtype` once), so the test asserts the multiply's effect, not encoding drift.
-    fn staged(id: usize, dt: SDType, vals: &[f32]) -> (usize, Vec<u8>, SDType, Vec<usize>) {
+    fn staged(id: usize, dt: SDType, vals: &[f32]) -> StagedWeight {
         let bytes: Vec<u8> = vals
             .iter()
             .flat_map(|v| match dt {
@@ -2962,7 +2955,7 @@ mod weight_copy_tests {
     /// One staged fp8 o_proj-shaped weight as `stage_bound_weights` shapes it:
     /// `(id, bytes, dtype, dims)`. The values are arbitrary — the copy is byte-for-byte
     /// and dims-agnostic, which is the law under test.
-    fn oproj_row(id: usize, bytes: &[u8]) -> (usize, Vec<u8>, SDType, Vec<usize>) {
+    fn oproj_row(id: usize, bytes: &[u8]) -> StagedWeight {
         (id, bytes.to_vec(), SDType::Fp8E4m3, vec![4096, 4096])
     }
 

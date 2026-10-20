@@ -6,16 +6,13 @@
 //! "give me `N` bytes of device memory and put these host bytes on
 //! it" — lives behind this trait.
 //!
-//! - **CUDA impl** (`cuda_allocator::CudaAllocator`) allocates GPU
-//!   memory via `mem_alloc`, queues `memcpy_htod_async` on the
-//!   loader's stream, and synchronizes before returning. Allocations
-//!   are tracked in a `Vec<RawGpuMem>` for ownership transfer via
-//!   `take_allocations`.
-//!
 //! - **Metal impl** (Apple silicon, unified memory) bump-allocates
 //!   inside an arena `MTLBuffer` in `StorageModeShared`. The
 //!   "transfer" is a `memcpy(buffer.contents() + offset, src, len)`
 //!   — same-RAM copy, no DMA.
+//!
+//! - **Spyre impl** (`SpyreAllocator`) holds host memory the worker stages
+//!   onto the card.
 
 use anyhow::Result;
 use std::path::Path;
@@ -36,8 +33,7 @@ pub trait PoolMemory: Send + Sync {
 /// allocation plus host→device byte transfer.
 ///
 /// `GpuWeights` is generic over `A: DeviceAllocator` so backend-
-/// specific accessors (e.g. CUDA's `take_allocations` for the
-/// load-then-detach pattern) live on `impl GpuWeights<CudaAllocator>`
+/// specific accessors live on `impl GpuWeights<ConcreteAllocator>`
 /// blocks that already know the concrete allocator type — no `Any`
 /// downcasts required at any call site.
 ///
@@ -55,10 +51,8 @@ pub trait DeviceAllocator: Send + Sync {
     /// # Safety
     ///
     /// `src_host` must point to `bytes` valid host bytes for the
-    /// duration of this call. CUDA implementations issue
-    /// `memcpy_htod_async` against `src_host`; passing pageable
-    /// memory works but blocks the CPU. Metal implementations
-    /// `memcpy` from `src_host`, so any host memory is fine.
+    /// duration of this call. Metal implementations `memcpy` from
+    /// `src_host`, so any host memory is fine.
     unsafe fn alloc_and_copy_host(&mut self, src_host: *const u8, bytes: usize) -> Result<*mut u8>;
 
     /// Variant of [`alloc_and_copy_host`] that promises the resulting
@@ -76,10 +70,8 @@ pub trait DeviceAllocator: Send + Sync {
     /// only do scalar reads. Threading dtype-aware `min_align` lets
     /// those tensors take zero-copy.
     ///
-    /// CUDA has no analogous gate (cudaMalloc returns 256-byte
-    /// aligned pointers; the host→device copy is the cost-dominant
-    /// step regardless of alignment), so the default forwards to
-    /// [`alloc_and_copy_host`] and ignores `min_align`.
+    /// A backend with no analogous gate keeps the default, which
+    /// forwards to [`alloc_and_copy_host`] and ignores `min_align`.
     ///
     /// # Safety
     ///
@@ -100,7 +92,7 @@ pub trait DeviceAllocator: Send + Sync {
 
     /// `bytes` of device memory the host writes in place, from where
     /// [`alloc_and_copy_host`] would copy to: `None` when the device's
-    /// memory is not host-visible (cuda, spyre), so a caller fills host
+    /// memory is not host-visible (spyre), so a caller fills host
     /// memory and copies it instead. Metal's unified memory is.
     ///
     /// # Safety
@@ -115,17 +107,15 @@ pub trait DeviceAllocator: Send + Sync {
     // ---- Backend-specific surface that generic `GpuWeights<A>` / pools need ----
     //
     // These let the shared containers stay backend-neutral: they name only
-    // `Self::Stream` / `Self::Mem`, never a concrete `CUstream` / `RawGpuMem` /
-    // `MetalMem`. Used monomorphized (one backend per build), never as
+    // `Self::Stream` / `Self::Mem`, never a concrete `MetalMem`. Used monomorphized (one backend per build), never as
     // `dyn DeviceAllocator`, so associated types are fine.
 
     /// The host→device stream this allocator queues transfers on
-    /// (`CUstream` under cuda, `()` under metal). Cuda's precast /
-    /// `take_into` paths queue their own DMAs on it.
+    /// (`()` under metal and spyre).
     type Stream;
 
     /// The device-memory handle this allocator hands out and tracks
-    /// (`RawGpuMem` under cuda, `MetalMem` under metal). Lets generic
+    /// (`MetalMem` under metal). Lets generic
     /// `GpuWeights` / KV / GDN pools store `Vec<Self::Mem>` without naming a
     /// backend type. The [`PoolMemory`] bound lets that generic pool code read
     /// back the device pointer to build views.
@@ -133,62 +123,29 @@ pub trait DeviceAllocator: Send + Sync {
 
     fn stream(&self) -> Self::Stream;
 
-    /// Track an externally-allocated device buffer (cuda: the GGUF dequant
-    /// path allocates outside the main route). Metal default: no-op — its
-    /// arenas own their memory.
+    /// Track an externally-allocated device buffer. Default: no-op — the
+    /// metal arenas own their memory.
     fn push_alloc(&mut self, _alloc: Self::Mem) {}
 
-    /// Drain + transfer ownership of all tracked allocations (cuda's
-    /// load-then-detach). Metal default: empty.
+    /// Drain + transfer ownership of all tracked allocations. Default: empty.
     fn take_allocations(&mut self) -> Vec<Self::Mem> {
         Vec::new()
     }
 
     /// Untrack one allocation by pointer, leaking its wrapper so the caller
-    /// owns the device memory (cuda quant-repack swap-in). Metal default: no-op.
+    /// owns the device memory. Default: no-op.
     fn unrecord_alloc(&mut self, _ptr: *mut u8) {}
 
     /// Register a safetensors mmap for the zero-copy alias path (metal does a
-    /// realign-pack so tensor offsets become bind-aligned). Cuda default:
-    /// no-op — `cudaMalloc` + DMA happens regardless of mmap layout.
+    /// realign-pack so tensor offsets become bind-aligned). Default: no-op.
     fn register_mmap(&self, _path: &Path, _mmap: Arc<memmap2::Mmap>) -> Result<()> {
         Ok(())
     }
 
     /// Hint the OS to start paging in a freshly-mapped safetensors shard
     /// (`MADV_WILLNEED`) to overlap disk I/O with parsing + the H2D copy.
-    /// Cuda does this; metal skips it (it prefaults per-shard inside
+    /// Metal skips it (it prefaults per-shard inside
     /// [`register_mmap`](Self::register_mmap), keeping the working set small).
     /// Default: no-op.
     fn prefault_mmap(&self, _mmap: &memmap2::Mmap) {}
-
-    /// Adopt a neutral [`RawGpuMem`](crate::RawGpuMem) allocation into this
-    /// allocator's lifetime tracker. The cuda precast / GGUF / quant-repack
-    /// paths mint `RawGpuMem` outside the main `alloc_and_copy_host` route;
-    /// generic `GpuWeights<A>` code calls this naming only the neutral
-    /// `RawGpuMem` (never `A::Mem`), so it stays backend-agnostic. Identical
-    /// to [`push_alloc`](Self::push_alloc) for cuda (where `Mem = RawGpuMem`);
-    /// the call sites are cuda-only, so the default is `unreachable!`.
-    fn adopt_raw(&mut self, _mem: crate::RawGpuMem) {
-        unreachable!("adopt_raw is a cuda-only neutral-RawGpuMem tracking hook")
-    }
-
-    /// Allocate `bytes` of device memory and copy `src_dev` (an existing
-    /// *device* pointer) into it device-to-device, synchronizing before
-    /// return; the allocation is tracked like [`alloc_and_copy_host`]. Used
-    /// by the cuda TP `take_shard` precast-staging path (dim>1 strided
-    /// gather of a device-resident staged tensor); metal has no device-side
-    /// precast source, so the default is `unreachable!`.
-    ///
-    /// # Safety
-    /// `src_dev` must point to `bytes` valid device bytes for the call.
-    ///
-    /// [`alloc_and_copy_host`]: Self::alloc_and_copy_host
-    unsafe fn alloc_and_copy_device(
-        &mut self,
-        _src_dev: *const u8,
-        _bytes: usize,
-    ) -> Result<*mut u8> {
-        unreachable!("alloc_and_copy_device is a cuda-only precast-shard staging hook")
-    }
 }

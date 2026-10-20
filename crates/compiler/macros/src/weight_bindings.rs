@@ -11,10 +11,10 @@
 //! kernel ABI — so every target gets the SAME answer and a new
 //! target inherits it by construction rather than by re-deriving it.
 //!
-//! ⛔ WHY THIS EXISTS AT ALL. Without it the accessor set had two producers and
-//! both were target-locked: instruction selection (cuda's solver) and metal's
-//! instruction-stream bridge. Under spyre both are empty, so the emitted
-//! `Weights` struct carried NO weight fields — verified in generated output:
+//! ⛔ WHY THIS EXISTS AT ALL. Without it the accessor set had one producer and
+//! it was target-locked: metal's instruction-stream bridge. Under spyre it is
+//! empty, so the emitted `Weights` struct carried NO weight fields — verified
+//! in generated output:
 //!
 //! ```ignore
 //! pub struct Weights { pub rotary: RotaryCache }   // that is all

@@ -10,7 +10,7 @@
 //! own `configs/<name>/`, and writes the emitted modules to
 //! `$OUT_DIR/<mod>.rs`, which `src/lib.rs` wraps in `pub mod <mod>` and
 //! `include!`s. The pipeline lib is a build-dependency; the backend feature
-//! (metal/cuda/…) is forwarded onto it so the emit matches what we then compile.
+//! (metal/spyre/…) is forwarded onto it so the emit matches what we then compile.
 use proc_macro2::{Group, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
 use rayon::prelude::*;
 use scratchy_forward_compiler_macro::{compile_carrier, parse_python_file, render_tokens};
@@ -193,19 +193,8 @@ fn write_if_changed(out: &Path, text: &str) {
     }
 }
 
-/// Arches whose emit only compiles under cuda (no metal surface). Under a pure
-/// `--features metal` build we must NOT run their pipeline (it would emit metal
-/// code for ops metal doesn't implement). Kept in sync with src/lib.rs gates.
-const CUDA_ONLY: &[&str] = &[
-    "deepseek-v2",
-    "deepseek-v3",
-    "deepseek-v3-flat",
-    "gemma3-mm",
-];
-/// Arches whose emit only compiles under metal (no cuda surface — no ISel
-/// claims for their ops). Under a cuda build we must NOT run their pipeline
-/// (the solver would find tile claims missing and panic). Kept in sync with
-/// src/lib.rs gates.
+/// Arches whose emit only compiles under metal. Kept in sync with src/lib.rs
+/// gates.
 const METAL_ONLY: &[&str] = &[
     "gemma4-assistant",
     "glm4-moe",
@@ -317,7 +306,6 @@ fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     for name in [
-        "SCRATCHY_GPU",
         // Spyre/KTIR bundle knobs read at emit time by `dump_wavefront_mega`:
         // they bake the prefix cap, decode row count, and prefill width into the
         // embedded KTIR bundle, so a change must re-run this build script (which
@@ -341,7 +329,6 @@ fn main() {
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
-    let cuda = std::env::var("CARGO_FEATURE_CUDA").is_ok();
     let metal = std::env::var("CARGO_FEATURE_METAL").is_ok();
     let spyre = std::env::var("CARGO_FEATURE_SPYRE").is_ok();
 
@@ -378,14 +365,12 @@ fn main() {
             }
             // Backend gate: mirror the `pub mod <name>` cfg in src/lib.rs, so we
             // never run the pipeline for an arch whose mod won't be compiled.
-            let supported = if CUDA_ONLY.contains(&arch.as_str()) {
-                cuda
-            } else if METAL_ONLY.contains(&arch.as_str()) {
+            let supported = if METAL_ONLY.contains(&arch.as_str()) {
                 metal
             } else if SPYRE_CAPABLE.contains(&arch.as_str()) {
-                cuda || metal || spyre
+                metal || spyre
             } else {
-                cuda || metal
+                metal
             };
             if !supported {
                 return None;

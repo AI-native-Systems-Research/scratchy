@@ -87,7 +87,7 @@ pub trait MultimodalForward: Send + Sync {
     ///   copy each slice into the corresponding `Embed` tile rows.
     ///
     /// # Safety
-    /// `device` must be the live CUDA device the encoder
+    /// `device` must be the live device the encoder
     /// kernels launch on; the caller must keep `pixel_batches`
     /// alive for the duration of the call (the host-side
     /// borrow ends before any returned GPU memory is read).

@@ -175,7 +175,7 @@ pub fn page(assets: &Published) -> Result<String, String> {
 
             {section("Key numbers", None, rsx! {
                 Grid { gutter: Gutter::Cards,
-                    {number("30", "Mi", "AoT binary, Metal", rsx! { "100\u{202f}Mi for Spyre, 250\u{202f}Mi for CUDA." })}
+                    {number("30", "Mi", "AoT binary, Metal", rsx! { "100\u{202f}Mi for Spyre." })}
                     {number("330", "Mi", "Docker image, Spyre", rsx! { "The runtime is the binary. There is no graph executor to ship." })}
                     {number("300", "ms", "Warm start, Apple Silicon",
                         rsx! { em { "Independent of model size." } " 12\u{202f}s for 8B on Spyre." })}
@@ -219,7 +219,7 @@ pub fn page(assets: &Published) -> Result<String, String> {
                     Column { span: Span::NARROW,
                         Stack { gap: 5,
                             p {
-                                "Scratchy's first target is not CUDA. It is the "
+                                "Scratchy's first target is the "
                                 a { href: "https://research.ibm.com/blog/spyre-for-z", "IBM Spyre AIU" }
                                 " — and that is the real test, because novel silicon is where the library era has \
                                  nothing to offer you."
@@ -245,8 +245,7 @@ pub fn page(assets: &Published) -> Result<String, String> {
                     Column { span: Span::WIDE,
                         Stack { gap: 5,
                             p {
-                                "Supporting silicon with no ecosystem behind it took about as much Rust as supporting \
-                                 CUDA, and it cost "
+                                "Supporting silicon with no ecosystem behind it cost "
                                 em { "zero lines of model code" }
                                 ". The same 25 architectures, the same 1,580 lines of DSL, the same 22-line LLaMA. An \
                                  8B model boots in 12\u{202f}s from a 330\u{202f}Mi image."
@@ -266,7 +265,6 @@ pub fn page(assets: &Published) -> Result<String, String> {
             {section("Targets", Some(rsx! { "Pick one backend per build; they are mutually exclusive." }), rsx! {
                 Grid { gutter: Gutter::Cards,
                     {target("-Fspyre", "IBM Spyre AIU · requires the Spyre build toolkit")}
-                    {target("-Fcuda", "NVIDIA · requires the CUDA build toolkit")}
                     {target("-Fmetal", "Apple Silicon · requires macOS")}
                 }
             })}

@@ -4,9 +4,9 @@
 # Emit one arch's forward to stdout, for ANY arch, on ANY host.
 #
 # `scratchy-models`' build script gates each arch on a backend (SPYRE_CAPABLE /
-# CUDA_ONLY in scratchy-forwards.rs), so a host with neither a CUDA toolchain nor
-# macOS can only `cargo check` llama and granite — the other 23 arches' codegen
-# is unverifiable there. The pipeline itself (parse → classify → shape → CFG →
+# METAL_ONLY in scratchy-forwards.rs), so a host without macOS can only
+# `cargo check` the spyre-capable arches — every other arch's codegen is
+# unverifiable there. The pipeline itself (parse → classify → shape → CFG →
 # unroll → schedule → codegen) is target-neutral, so this drives it directly via
 # the `emit_arch` example, with no backend gate.
 #
@@ -45,10 +45,10 @@ var="CARGO_FEATURE_$(printf '%s' "$stem" | tr '[:lower:]-' '[:upper:]_')"
 # default run matches a plain `-Fmodel/<stem>` build rather than silently
 # including every quant preset.
 # The macro crate `compile_error!`s without a backend feature, so one is always
-# passed. `spyre` is the default because it's the only backend that needs neither
-# nvcc nor macOS — the emit up to codegen is target-neutral, so it is also the
-# cheapest way to exercise any arch. Override for a target-specific check:
-#   SCRATCHY_EMIT_FEATURES=cuda scripts/emit-arch.sh gemma3-mm gemma-3-4b-it
+# passed. `spyre` is the default because it's the only backend that doesn't need
+# macOS — the emit up to codegen is target-neutral, so it is also the cheapest
+# way to exercise any arch. Override for a target-specific check:
+#   SCRATCHY_EMIT_FEATURES=metal scripts/emit-arch.sh qwen3 qwen3-0.6b
 emit() {
   env "$var=1" SCRATCHY_QUANTS="${SCRATCHY_QUANTS-}" \
     cargo run -q -p scratchy-forward-compiler-macro --example emit_arch \

@@ -9,7 +9,7 @@ pub mod batch;
 pub mod bench;
 // ⛔ GATED, because every item `bundle.rs` names is. It imports `BundleRunArgs` and
 // `scratchy_target_spyre`, both `#[cfg(feature = "spyre-hw")]`, so an ungated declaration breaks the
-// DEFAULT build and `-Fcuda`/`-Fmetal` and CI with `E0432`/`E0433` — measured `rc 101` on
+// DEFAULT build and `-Fmetal` and CI with `E0432`/`E0433` — measured `rc 101` on
 // `cargo check -p scratchy-cli`, against `rc 0` on main.
 #[cfg(feature = "spyre-hw")]
 pub mod bundle;
@@ -21,7 +21,7 @@ pub mod convert;
 #[cfg(feature = "claude")]
 pub mod launch;
 pub mod model;
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "metal")]
 pub mod model_info;
 pub mod pull;
 #[cfg(feature = "serve")]

@@ -2994,8 +2994,7 @@ mod tests {
         // G.4 gate: every name `OpKind::as_str` returns must round-
         // trip through `from_name`, otherwise classify rejects DSL
         // bodies that wrote the op (parse-then-reject violation).
-        // Locks in the four arms added in G.4 lockstep with the
-        // existing matchers in `impl_lib::starter_library`.
+        // Locks in the four arms added in G.4.
         assert_eq!(
             OpKind::from_name("varlen_attention"),
             Some(OpKind::VarlenAttention)

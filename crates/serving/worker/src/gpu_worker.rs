@@ -1,29 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `CudaWorker` / `MetalWorker`: `Worker` implementations backed by the GPU runtime.
+//! `MetalWorker`: the `Worker` implementation backed by the Metal runtime
+//! (scratchy-forward-compiler `MetalWorkerPool` + scratchy-target-metal).
 //!
-//! Cuda build: scratchy-serving-cuda + scratchy-forward-compiler (full feature set: CUDA graphs,
-//! NCCL, FP8, etc.). Metal build: scratchy-forward-compiler MetalWorkerPool + the
-//! scratchy-target-metal crate. The struct is shared with cfg-mutex'd fields.
-//!
-//! Gated behind the `cuda` or `metal` feature flag.
+//! Gated behind the `metal` feature flag.
 
 // Force the linker to keep `scratchy_models` — its `#[forward]`
 // modules register with `inventory::submit!` for auto-discovery by
 // `scratchy_forward_compiler::try_load`. Without this, the linker gc's the
 // crate (no direct symbol references after the Phase B collapse)
-// and the inventory comes up empty. Mirrored under metal now that
-// the per-canonical metal `forward` body + `inventory::submit!`
-// registration are emitted under `cfg(any(cuda, metal))` (Step 3.E).
-#[cfg(any(feature = "cuda", feature = "metal"))]
+// and the inventory comes up empty.
+#[cfg(feature = "metal")]
 extern crate scratchy_models as _;
-
-// Force the linker to keep `scratchy_builder_cuda` so its build.rs runs (it
-// compiles the CUDA kernel `.a` files that `scratchy-target-cuda/build.rs`
-// emits `rustc-link-lib` directives for). No code is imported from it; the
-// reference exists solely to anchor the crate in this binary's dep graph.
-// cuda-only — the builder is not a dependency under metal.
-#[cfg(feature = "cuda")]
-extern crate scratchy_builder_cuda as _;
 
 #[cfg(feature = "metal")]
 use std::collections::HashMap;
@@ -54,9 +41,6 @@ use scratchy_serving_scheduler::scheduler::output::{
 #[cfg(feature = "metal")]
 use tracing::info;
 
-// Backend-neutral types lifted in Step 1 of the cfg-mutex extension:
-// `KvCachePool` is `cfg(any(cuda, metal))` in `scratchy-target-cuda::kv_cache`,
-// and `DType` is unconditional in `scratchy-target-cuda::dtype`.
 #[cfg(feature = "metal")]
 use scratchy_forward_compiler::gdn_slot_allocator::{GdnRow, GdnSlotAllocator};
 #[cfg(feature = "metal")]
@@ -68,12 +52,6 @@ use scratchy_target_metal::gdn_state::{GdnSave, GdnSlot, GdnStatePool};
 #[cfg(feature = "metal")]
 use scratchy_target_metal::kv_cache::KvCachePool;
 
-// The CUDA `Worker` lives in `scratchy-target-cuda`; re-exported here for
-// back-compat so callers naming `gpu_worker::{CudaWorker, CudaWorkerFactory}`
-// keep resolving.
-#[cfg(feature = "cuda")]
-pub use scratchy_target_cuda::cuda_worker::{CudaWorker, CudaWorkerFactory};
-
 #[cfg(feature = "metal")]
 use scratchy_target_metal::OwnedTensor;
 #[cfg(feature = "metal")]
@@ -83,11 +61,8 @@ use scratchy_target_metal::interpreter::metal::{
 #[cfg(feature = "metal")]
 use std::sync::Arc;
 
-// Backend-neutral types used by metal lifecycle bodies. Under cfg(metal),
-// `GpuDevice` resolves to the Apple-silicon arm carrying `device + queue +
-// allocator`; `OwnedTensor` / `TensorView` / `GpuTensor` / `GpuWeights` are
-// the ones lifted to `cfg(any(cuda, metal))` in Step 1; `MetalAllocator`
-// is the metal-side `BackendAllocator`; `MetalMem` wraps `metal::Buffer`
+// Types used by metal lifecycle bodies. `GpuDevice` carries `device + queue +
+// allocator`; `MetalAllocator` is the metal-side `BackendAllocator`; `MetalMem` wraps `metal::Buffer`
 // for the metal arm of the KV/GDN pools.
 #[cfg(feature = "metal")]
 use ::objc2_metal::{MTLBuffer as _, MTLDevice as _};
@@ -126,7 +101,7 @@ pub use crate::worker_factory::WorkerCreateConfig;
 /// Tuple is `(seq_offset, length, grid_t, grid_h_merged, grid_w_merged)`
 /// where `seq_offset` is relative to the req's full sequence start (NOT
 /// batch start) — the same coordinate system as `PlaceholderRange.offset`.
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "metal")]
 pub type SeqMmInfo = (u32, u32, u32, u32, u32);
 
 // ---------------------------------------------------------------------------
@@ -274,8 +249,8 @@ pub struct MetalWorker {
     resolved_max_num_seqs: Option<usize>,
     /// Loaded scratchy-forward-compiler weights — `Box<dyn ScratchyWeights>`
     /// dispatched through `try_load`. The trait `forward` body
-    /// collapses to the per-canonical metal `forward` fn under
-    /// cfg(metal); the worker calls it through the trait vtable.
+    /// collapses to the per-canonical metal `forward` fn; the worker
+    /// calls it through the trait vtable.
     model: Option<Box<dyn scratchy_forward_compiler::ScratchyWeights>>,
     /// Vision tower for multimodal arches (Qwen3.5-VL). Loaded by
     /// `load_model` via `try_load_mm` alongside the text weights; `None`
@@ -467,12 +442,9 @@ unsafe impl Send for MetalWorker {}
 // worker load paths.
 pub use crate::worker_factory::resolve_model_path;
 
-/// Backend-neutral MRoPE position builders. Shared by the cuda and metal
-/// worker paths — `build_mrope_positions_2d` is pure index math over
+/// MRoPE position builders — `build_mrope_positions_2d` is pure index math over
 /// `PreparedInputs` + per-req patch grids, and `build_per_req_mm_seq_info_metal`
-/// is the metal twin of the cuda `build_per_req_mm_seq_info` (it takes the
-/// `MultimodalForward` handle directly rather than destructuring a
-/// `CudaModel`, which is cuda-only).
+/// builds per-req seq-space MM info from the `MultimodalForward` handle.
 #[cfg(feature = "metal")]
 impl MetalWorker {
     /// Build `[3, n_tokens]` u32 MRoPE positions for an image-bearing
@@ -561,8 +533,7 @@ impl MetalWorker {
 
     /// Metal twin of [`Self::build_per_req_mm_seq_info`]: builds per-req
     /// seq-space MM info from the `MultimodalForward` handle directly
-    /// (the metal worker holds `self.mm: Option<Box<dyn MultimodalForward>>`,
-    /// not a cuda-only `CudaModel`). Same tuple/semantics: empty inner
+    /// (the metal worker holds `self.mm: Option<Box<dyn MultimodalForward>>`). Same tuple/semantics: empty inner
     /// `Vec` for reqs without mm_data, all-empty outer `Vec` (caller
     /// falls back to 1D positions) for a text-only batch.
     #[cfg(all(feature = "metal", feature = "vision"))]
@@ -947,39 +918,20 @@ enum DraftScratch {
 
 // `compute_available_kv_bytes`, `PrefillBucketSelection`, and
 // `select_prefill_bucket` are backend-neutral; they live in
-// `scratchy-serving-engine` so the CUDA worker (in `scratchy-serving-cuda`)
-// can reach them without a dependency cycle. Re-exported here so callers
+// `scratchy-serving-engine` so any worker can reach them without a
+// dependency cycle. Re-exported here so callers
 // naming `gpu_worker::{...}` keep resolving.
 pub use scratchy_serving_engine::gpu_budget::{
     PrefillBucketSelection, compute_available_kv_bytes, select_prefill_bucket,
 };
 
 // ---------------------------------------------------------------------------
-// Metal arm (Phase F: cfg-mutex extension; Step 2 = instantiate-only).
+// MetalWorker constructor + `Worker` impl
 // ---------------------------------------------------------------------------
-//
-// The metal `new()` constructor + `Worker` impl live in their own
-// cfg-gated blocks rather than as `#[cfg]` arms inside the cuda
-// constructor / cuda Worker impl. The cuda body is ~3500 lines that
-// call cuda-only helpers (CudaModel dispatch, CudaGraphRunner, NCCL
-// PP, FP8 scales, LogitsProcessorPipeline, GdnStatePool, …); none
-// of those compile under metal, so wrapping each cuda body with an
-// `#[cfg(feature = "cuda")] { … }` arm would still drag the
-// dead-under-metal code through type-checking. Per the Phase F
-// rules, the MetalWorker struct stays one struct with cfg-mutex'd
-// fields; the trait impl uses cfg-mutex'd blocks for the same reason
-// the macro emission uses cfg-mutex'd `Weights` blocks.
-//
-// Step 2 wires `init_device` / `shutdown` / `rank` etc. and stubs the
-// heavy lifecycle methods (`load_model`, `initialize_cache`,
-// `execute_model`, `compile_or_warm_up_model`,
-// `determine_available_memory`) so scratchy-serving-api can instantiate a
-// MetalWorker under metal. Step 3 fills those bodies in via the
-// per-arch `metal_pool()` factory + `MetalWorkerPool::forward`.
 
 // `gdn_slot_key` and the shared unset-`--max-num-seqs` resolver are
 // backend-neutral; they live in `scratchy-serving-engine` (cycle-free for
-// both the CUDA and Metal workers) and are re-exported here.
+// every worker) and are re-exported here.
 #[cfg(feature = "metal")]
 use scratchy_serving_engine::gpu_budget::MaxNumSeqsFacts;
 pub use scratchy_serving_engine::gpu_budget::{gdn_slot_key, resolve_default_max_num_seqs};
@@ -1002,8 +954,7 @@ impl MetalWorker {
             model_dir: None,
             hf_config: None,
             pooling_strategy: scratchy_core_model::embedding::PoolingStrategy::Last,
-            // Metal forward currently produces f16 outputs; cuda's "auto"
-            // resolves to bf16 from the checkpoint, but scratchy-target-metal's
+            // Metal forward currently produces f16 outputs; scratchy-target-metal's
             // shaders are specialized on f16 and the worker only needs
             // this dtype to size KV cache slots, which Step 3 will revise.
             model_dtype: GpuDType::F16,
@@ -1078,8 +1029,7 @@ impl MetalWorker {
         self.progress_callback = Some(cb);
     }
 
-    /// Expose the HF config after load_model. Mirrors the cuda-side
-    /// accessor — scratchy-serving-api reads this to drive `compute_num_blocks`
+    /// Expose the HF config after load_model. scratchy-serving-api reads this to drive `compute_num_blocks`
     /// and the cache-init path.
     pub fn hf_config(&self) -> Option<&HfModelConfig> {
         self.hf_config.as_ref()
@@ -1482,9 +1432,7 @@ impl MetalWorker {
     }
 
     /// Bytes per element for the model's KV cache dtype. Metal forces
-    /// f16 for both compute and cache, so this is a constant; we keep
-    /// the same accessor name as the cuda side so scratchy-serving-api treats
-    /// the worker uniformly.
+    /// f16 for both compute and cache, so this is a constant.
     pub fn resolved_dtype_elem_bytes(&self) -> usize {
         self.model_dtype.size_bytes()
     }
@@ -1559,8 +1507,7 @@ impl MetalWorker {
 
     /// Run the vision tower for every MM-bearing request at its first
     /// prefill step and return `(mm_embeds [n_img_tokens, hidden],
-    /// embed_patches)`. Metal twin of the cuda `run_mm_vision_forward`
-    /// (which destructures a `CudaModel`); here the `mm` handle is passed
+    /// embed_patches)`. The `mm` handle is passed
     /// in directly from `self.mm`. `None` when no batched request carries
     /// pixel data this step (text-only / decode steps).
     ///
@@ -2910,7 +2857,7 @@ impl MetalWorker {
     /// caller's slot in `sampled_token_ids` (used only by the caller). `req_ids`
     /// is the full per-batch request-id list (indexed by `result_index`).
     ///
-    /// Pipeline (mirrors cuda's f32 sampling path): gather each row's logits
+    /// Pipeline: gather each row's logits
     /// (f16/bf16) into a compact f32 scratch, apply repetition / frequency /
     /// presence penalties (only when a row needs them), then top-k/top-p/min-p
     /// sample. All three stages ride ONE MTL4 command buffer with dispatch→
@@ -2937,7 +2884,7 @@ impl MetalWorker {
 
         // Assemble this step's sampler inputs (metal's `GpuSampleParams` layout)
         // and hand them to the metal sampler. The per-request seed inside comes
-        // from the shared `scratchy_core_common::fnv_seed`, so it matches cuda;
+        // from the shared `scratchy_core_common::fnv_seed`;
         // the format-assembly + all MTL4 detail live in `scratchy_target_metal`.
         let params = scratchy_target_metal::sampling::gather_gpu_sample_params(
             jobs,
@@ -4997,8 +4944,7 @@ impl Worker for MetalWorker {
             model_dir.display()
         );
 
-        // Metal currently supports safetensors only — GGUF requires the
-        // cuda-side dequant kernels. Surface that early with a clear
+        // Metal supports safetensors only (no GGUF dequant kernels). Surface that early with a clear
         // message rather than failing deep in `GpuWeights::from_dir`.
         if model_dir.is_file() && model_dir.extension().is_some_and(|e| e == "gguf") {
             return Err(ExecutorError::WorkerInit(
@@ -5083,8 +5029,7 @@ impl Worker for MetalWorker {
 
         // Metal backend default dtype is bf16 — matches the on-disk
         // `torch_dtype: bfloat16` of every modern HF Llama / Qwen /
-        // Phi / Mistral checkpoint and the cuda backend's native
-        // dtype. Apple Silicon M3+ has hardware bf16 MMA; the metal
+        // Phi / Mistral checkpoint. Apple Silicon M3+ has hardware bf16 MMA; the metal
         // shaders ship `_bf16_specialized` siblings for every
         // on-path kernel and `MetalDtype::Bf16` is the default on
         // `CanonicalParams::METAL_DTYPE`. F16-on-disk weights get
@@ -5092,7 +5037,7 @@ impl Worker for MetalWorker {
         // the kernel's expected binding type).
         weights.set_target_dtype(GpuDType::BF16);
 
-        // Build HF fingerprint — same disambiguation surface cuda uses.
+        // Build HF fingerprint.
         // `max_position_embeddings` is intentionally omitted (see
         // `HfFingerprint`'s doc-comment).
         let hf_fp = scratchy_forward_compiler::HfFingerprint {
@@ -5114,7 +5059,7 @@ impl Worker for MetalWorker {
             .or(hf_config.max_position_embeddings())
             .unwrap_or(4096);
 
-        // Under cfg(metal), `CUstream = ()`; the per-canonical
+        // The load stream is `()` (`LoadStream`); the per-canonical
         // `Weights::load` body ignores the stream parameter (uploads go
         // through the allocator inside `GpuWeights`).
         let t_try_load = std::time::Instant::now();
@@ -5157,7 +5102,7 @@ impl Worker for MetalWorker {
         // arch filter as the text `try_load` above. Returns `Ok(None)`
         // for text-only arches and MM arches whose checkpoint has no
         // `visual.*` tensors. Consumed at forward time when the batch
-        // carries `mm_data` (mirrors the cuda load path).
+        // carries `mm_data`.
         #[cfg(feature = "vision")]
         let mm = scratchy_forward_compiler::try_load_mm(
             &mut weights,
@@ -5917,8 +5862,7 @@ impl Worker for MetalWorker {
                 budget as f64 / 1_073_741_824.0,
             );
             // Stash the cap on the metal `gpu_device` (the GpuDevice every
-            // metal forward path runs through — `self.device` is the
-            // cuda-only field). Whichever forward triggers the one-shot lazy
+            // metal forward path runs through). Whichever forward triggers the one-shot lazy
             // pool init reads it and prunes the ladder.
             if let Some(dev) = self.gpu_device.as_mut() {
                 dev.metal_bucket_max_m = Some(sel.max_bucket_m);
@@ -6216,7 +6160,7 @@ impl Worker for MetalWorker {
                 // per-request StdRng so its `uniform_random` draws are
                 // reproducible across steps (unseeded requests derive the
                 // uniform deterministically from a req_id+step hash in the
-                // sample block — matches cuda's `gen_seed`).
+                // sample block).
                 if let Some(seed) = params.seed {
                     use rand::SeedableRng;
                     self.seeded_rngs.insert(
@@ -6374,7 +6318,7 @@ impl Worker for MetalWorker {
         // this step touches (max over all per-seq block tables) before
         // the forward dereferences the chunk-address table bindlessly.
         // On metal-chunked pools this allocates chunks on demand; no-op
-        // on cuda / single-buffer. Compute the max into a local so no
+        // on single-buffer pools. Compute the max into a local so no
         // borrow of `attn` is held across the `&mut self` grow call.
         #[cfg(feature = "metal")]
         {
