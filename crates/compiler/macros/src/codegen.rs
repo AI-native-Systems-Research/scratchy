@@ -8969,7 +8969,6 @@ fn emit_superdsc_wiring(
     gk: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring,
     lwd: &crate::to_wavefront::LoweredDecode,
     model: &ModelParams,
-    decode_position: u32,
     // The manifest this wiring REPLACES. Both come from `gk`; they must agree, and
     // `refuse_if_wiring_disagrees_with_manifest` is what checks that they do.
     manifest_json: &str,
@@ -9447,7 +9446,6 @@ fn emit_superdsc_wiring(
     // class's facts, and each cos/sin source's `RotaryKind` reads them.)
     let result = u32l(gk.result_tensor);
     let num_sources = u32l(gk.num_sources);
-    let dp = u32l(decode_position);
     let mask = mask_binding_tokens(gk.attn_mask);
 
     // ⭐ THE KERNEL-TABLE CLASS SETS, FROM THE BAKE — NOT THE TABLES THEMSELVES. The tables are
@@ -9547,7 +9545,6 @@ fn emit_superdsc_wiring(
             result: #result,
             num_sources: #num_sources,
             attn_mask: #mask,
-            decode_position: #dp,
             tensor_shapes: &[#(#shapes),*],
             embed_src: #embed_src_lit,
             cos_srcs: &[#(#cos_toks),*],
@@ -10846,7 +10843,6 @@ fn dump_wavefront_mega(
             Wiring {
                 slot: Option<WiringSlot>,
                 gk: scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring,
-                decode_position: u32,
                 man: String,
             },
             // ⭐ ONE WEIGHT-SEGMENT PARITY LEDGER ENTRY — this bundle's packed weight
@@ -10873,9 +10869,6 @@ fn dump_wavefront_mega(
         let emit_bundle_deferred =
             |lwd: &to_wavefront::LoweredDecode,
              base: String,
-             // The capacity THIS bundle is baked for. Decode cap buckets vary it;
-             // every other call site passes the full `prefix_len`.
-             cap: u32,
              seq_sym: Option<(&'static str, u32)>,
              prefill_mq: Option<u32>,
              // The resident-prefix sweep this bundle is baked for. Decode always FULL.
@@ -12045,10 +12038,9 @@ fn dump_wavefront_mega(
                     None => "null".to_string(),
                 };
                 let mut man = format!(
-                    "{{\"result\":{},\"num_sources\":{},\"decode_position\":{},\"attn_mask\":{},\"tensors\":[",
+                    "{{\"result\":{},\"num_sources\":{},\"attn_mask\":{},\"tensors\":[",
                     gk.result_tensor,
                     gk.num_sources,
-                    cap.saturating_sub(1),
                     attn_mask_json,
                 );
                 for (id, (r, c)) in gk.tensor_shapes.iter().enumerate() {
@@ -12270,7 +12262,6 @@ fn dump_wavefront_mega(
                     fx.push(BakeEffect::Wiring {
                         slot,
                         gk,
-                        decode_position: cap.saturating_sub(1),
                         man: man.clone(),
                     });
                 }
@@ -12333,13 +12324,8 @@ fn dump_wavefront_mega(
                     }
                     // The wiring is built HERE, on the expansion's own thread: it is a token stream,
                     // and tokens do not cross threads.
-                    BakeEffect::Wiring {
-                        slot,
-                        gk,
-                        decode_position,
-                        man,
-                    } => {
-                        let w = emit_superdsc_wiring(&gk, lwd, model, decode_position, &man);
+                    BakeEffect::Wiring { slot, gk, man } => {
+                        let w = emit_superdsc_wiring(&gk, lwd, model, &man);
                         let mut s = wiring_tokens.borrow_mut();
                         match slot {
                             Some(WiringSlot::Prefill) => s.1 = Some(w),
@@ -12358,7 +12344,6 @@ fn dump_wavefront_mega(
         let emit_bundle =
             |lwd: &to_wavefront::LoweredDecode,
              base: String,
-             cap: u32,
              seq_sym: Option<(&'static str, u32)>,
              prefill_mq: Option<u32>,
              active_cap: scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
@@ -12366,7 +12351,6 @@ fn dump_wavefront_mega(
                 let (r, fx) = emit_bundle_deferred(
                     lwd,
                     base,
-                    cap,
                     seq_sym,
                     prefill_mq,
                     active_cap,
@@ -12387,7 +12371,6 @@ fn dump_wavefront_mega(
             emit_bundle(
                 &lowered,
                 format!("ktir_decode_{stem_id}"),
-                prefix_len.get(),
                 None, // KTIR decode is m=1; its sengraph is replaced by the CB one below
                 None, // decode path (Store + PagedAttnCompute) -- no prefill width
                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
@@ -12432,7 +12415,6 @@ fn dump_wavefront_mega(
                 let (m, n, _g, _gs) = emit_bundle(
                     &lwd,
                     format!("ktir_decode_{stem_id}_cap{cap}"),
-                    cap,
                     None,
                     None,
                     scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
@@ -12499,8 +12481,6 @@ fn dump_wavefront_mega(
                         emit_bundle(
                             &lwd_b,
                             format!("ktir_decode_{stem_id}"),
-                            // `cap`: this bundle is baked for the full prefix.
-                            prefix_len.get(),
                             // `seq_sym` / `prefill_mq`: decode, so neither applies.
                             None,
                             None,
@@ -12750,7 +12730,6 @@ fn dump_wavefront_mega(
                     let (r, fx) = emit_bundle_deferred(
                         &lwd_p,
                         format!("ktir_prefill_{stem_id}"),
-                        prefix_len.get(),
                         // prefill: rewrite the concrete prompt length `pl` → symbol
                         // s0 (offline_decoder idx-0 graph: prompt sym = Tq = Tkv).
                         // ── superdsc: keep the prefill tape CONCRETE (m=pl) so the reroll
@@ -12864,7 +12843,6 @@ fn dump_wavefront_mega(
                         emit_bundle(
                             &lwd_p,
                             format!("ktir_prefill_{stem_id}"),
-                            prefix_len.get(),
                             None,
                             Some(m),
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
@@ -12971,7 +12949,6 @@ fn dump_wavefront_mega(
                     let (_m, _n, sg, groups) = emit_bundle(
                         &lwd_cb,
                         format!("ktir_decode_cb_{stem_id}"),
-                        prefix_len.get(),
                         Some(("s0", decode_mq)),
                         None,
                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,

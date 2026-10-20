@@ -190,19 +190,20 @@ impl BakeFacts {
     }
 
     /// ⛔ REFUSE a decode bundle with no identity. Every model with attention references `ident`
-    /// unconditionally (`assemble_attn`'s GQA new_k/new_v replication), so a bundle that did not
-    /// place it runs those matmuls against an UNINITIALISED buffer — silently wrong attention at
-    /// every layer of every step, the "stable but incoherent" class. Not zero-safe, so not a
-    /// default.
+    /// unconditionally (the spliced attention program's GQA new_k/new_v replication — the
+    /// `attn_krep`/`attn_vrep` matmuls), so a bundle that did not place it runs those matmuls
+    /// against an UNINITIALISED buffer — silently wrong attention at every layer of every step,
+    /// the "stable but incoherent" class. Not zero-safe, so not a default.
     pub fn require_identity(&self, what: &str) -> Result<(), String> {
         if self.uses_identity {
             return Ok(());
         }
         Err(format!(
-            "superdsc decode bundle {what} did NOT place IDENTITY_TID, but assemble_attn's GQA \
-             new_k/new_v replication references it unconditionally for every AttnDecode node — \
-             decode would run with an unfilled identity buffer. Refusing to serve: \
-             compute_bundle_layout's has_attn placement gate and this lookup have desynced."
+            "superdsc decode bundle {what} did NOT place IDENTITY_TID, but the spliced attention \
+             program's GQA new_k/new_v replication (attn_krep/attn_vrep) references it \
+             unconditionally for every AttnDecode node — decode would run with an unfilled \
+             identity buffer. Refusing to serve: compute_bundle_layout's has_attn placement gate \
+             and this lookup have desynced."
         ))
     }
 
@@ -784,8 +785,6 @@ pub struct Wiring {
     /// The AttnDecode score-mask binding — its tensor id, its bake-declared view, and the resident
     /// prefix capacity the bundle serves — when the model has a maskable decode or a prompt chunk.
     pub attn_mask: Option<MaskBinding>,
-    /// Baked `valid_len - 1`; a worker overrides per generated token.
-    pub decode_position: u32,
     /// `[rows, cols]` per tensor id.
     pub tensor_shapes: &'static [(u32, u32)],
     /// The host-gathered hidden row's source id.
@@ -1760,7 +1759,6 @@ mod constant_tape_tests {
             result: 0,
             num_sources: 0,
             attn_mask: None,
-            decode_position: 0,
             tensor_shapes: &[],
             embed_src: 0,
             cos_srcs: &[],
