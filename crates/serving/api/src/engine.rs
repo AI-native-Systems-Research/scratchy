@@ -814,6 +814,7 @@ impl AsyncEngine {
         let mut choices = Vec::with_capacity(n);
         let mut total_completion_tokens = 0u32;
         let mut total_cached_tokens = 0u32;
+        let forced_tool = ForcedTool::of(&request.tool_choice);
 
         for (i, child_id) in child_ids.iter().enumerate() {
             let state = self.poll_until_done(child_id).await?;
@@ -865,43 +866,43 @@ impl AsyncEngine {
                 };
 
             // Try tool call extraction if parser is configured and request has tools.
-            let (final_content, final_tool_calls, final_finish_reason) =
-                if let Some(ref parser) = self.tool_parser {
-                    if request.tools.is_some() && !is_tool_choice_none(&request.tool_choice) {
-                        let extracted = parser.extract_tool_calls(&text_for_tools);
-                        if extracted.tools_called {
-                            let forced = ForcedTool::of(&request.tool_choice);
-                            let tool_calls: Vec<_> = (extracted.tool_calls.into_iter())
-                                .filter(|tc| {
-                                    forced.as_ref().is_none_or(|f| f.admits(&tc.function.name))
-                                })
-                                .collect();
-                            if tool_calls.is_empty() {
-                                // Every call named a tool other than the forced one: dropped,
-                                // as the stream drops them, so the reply is the text around them.
-                                (extracted.content, None, finish_reason_str)
-                            } else {
-                                (
-                                    extracted.content,
-                                    Some(tool_calls),
-                                    "tool_calls".to_string(),
-                                )
-                            }
+            let (final_content, final_tool_calls, final_finish_reason) = if let Some(ref parser) =
+                self.tool_parser
+            {
+                if request.tools.is_some() && !is_tool_choice_none(&request.tool_choice) {
+                    let extracted = parser.extract_tool_calls(&text_for_tools);
+                    if extracted.tools_called {
+                        let tool_calls: Vec<_> = (extracted.tool_calls.into_iter())
+                            .filter(|tc| {
+                                (forced_tool.as_ref()).is_none_or(|f| f.admits(&tc.function.name))
+                            })
+                            .collect();
+                        if tool_calls.is_empty() {
+                            // Every call named a tool other than the forced one: dropped,
+                            // as the stream drops them, so the reply is the text around them.
+                            (extracted.content, None, finish_reason_str)
                         } else {
-                            // No tool call: keep the parser's cleaned content (it
-                            // may strip control tokens) instead of the raw text.
                             (
-                                extracted.content.or(Some(text_for_tools)),
-                                None,
-                                finish_reason_str,
+                                extracted.content,
+                                Some(tool_calls),
+                                "tool_calls".to_string(),
                             )
                         }
                     } else {
-                        (Some(text_for_tools), None, finish_reason_str)
+                        // No tool call: keep the parser's cleaned content (it
+                        // may strip control tokens) instead of the raw text.
+                        (
+                            extracted.content.or(Some(text_for_tools)),
+                            None,
+                            finish_reason_str,
+                        )
                     }
                 } else {
                     (Some(text_for_tools), None, finish_reason_str)
-                };
+                }
+            } else {
+                (Some(text_for_tools), None, finish_reason_str)
+            };
 
             // If reasoning parser returned content=None (everything was reasoning),
             // preserve None rather than wrapping an empty string.
@@ -6319,6 +6320,77 @@ mod tests {
         assert!(
             msg.content.is_none(),
             "content should be None when no </think>"
+        );
+    }
+
+    /// A tool parser that reads one Bash call beside fixed text out of any reply, so a
+    /// non-streaming test can see what the response keeps of it (NoopExecutor's text is
+    /// placeholders).
+    struct OneBashCall;
+
+    impl crate::tool_parser::ToolCallParser for OneBashCall {
+        fn extract_tool_calls(&self, _: &str) -> crate::tool_parser::ExtractedToolCallInfo {
+            crate::tool_parser::ExtractedToolCallInfo {
+                tools_called: true,
+                tool_calls: vec![protocol::ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: protocol::FunctionCall {
+                        name: "Bash".to_string(),
+                        arguments: "{\"command\": \"ls\"}".to_string(),
+                    },
+                }],
+                content: Some("Let me look.".to_string()),
+            }
+        }
+
+        fn create_streaming_state(&self) -> Box<dyn StreamingToolParserState + Send> {
+            crate::tool_parser::get_tool_parser("hermes")
+                .unwrap()
+                .create_streaming_state()
+        }
+    }
+
+    /// The non-streaming reply drops a call to a tool other than the forced one, as the stream
+    /// does, and is the text around it — not the raw output, and not a tool-call finish (#683).
+    /// Forcing the tool the model called keeps the call (the control).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chat_completion_drops_a_call_to_a_tool_not_forced() {
+        let mut engine = make_test_engine();
+        engine.set_tool_parser(Arc::new(OneBashCall));
+        let engine = Arc::new(engine);
+        engine.spawn_step_loop();
+        let request = |forced: &str| protocol::ChatCompletionRequest {
+            tools: Some(vec![protocol::ChatCompletionToolsParam {
+                tool_type: "function".to_string(),
+                function: protocol::FunctionDefinition {
+                    name: forced.to_string(),
+                    description: None,
+                    parameters: None,
+                },
+            }]),
+            tool_choice: Some(
+                serde_json::json!({"type": "function", "function": {"name": forced}}),
+            ),
+            max_tokens: Some(4),
+            ..make_chat_request()
+        };
+
+        let kept = engine.chat_completion(request("Bash")).await.unwrap();
+        let choice = &kept.choices[0];
+        let calls = choice.message.tool_calls.as_ref().expect("the Bash call");
+        assert_eq!(calls[0].function.name, "Bash");
+        assert_eq!(choice.message.content.as_deref(), Some("Let me look."));
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+
+        let dropped = engine.chat_completion(request("Read")).await.unwrap();
+        let choice = &dropped.choices[0];
+        assert!(choice.message.tool_calls.is_none(), "{choice:?}");
+        assert_eq!(choice.message.content.as_deref(), Some("Let me look."));
+        assert_eq!(
+            choice.finish_reason.as_deref(),
+            Some("length"),
+            "max_tokens ended it"
         );
     }
 
