@@ -80,16 +80,18 @@ fn gather_copy_declared() -> ktir_superdsc::superdsc_opspec::OpSpec {
     gather_copy_opspec(
         "Tensor0",
         "Tensor2",
-        16,
-        ktir_superdsc::sdsc_abstract::POOL_STICK,
-        ktir_superdsc::superdsc_opspec::Df::Fp16,
         vendor_index("Tensor1"),
-        // Global block numbers — no source base (the `GatherCopy` law).
-        ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
-        // The destination's own law: the copy's `mb × out` = 1024-element window at entry 0, exact.
-        ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+        ktir_superdsc::sdsc_abstract::GatherCopySpec {
             rows: 16,
             cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+            df: ktir_superdsc::superdsc_opspec::Df::Fp16,
+            // Global block numbers — no source base (the `GatherCopy` law).
+            run: ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+            // The destination's own law: the copy's `mb × out` = 1024-element window at entry 0, exact.
+            dest: ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+                rows: 16,
+                cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+            },
         },
     )
     .expect("the gather-copy op builds")
@@ -108,16 +110,18 @@ fn gather_copy_base() -> ktir_superdsc::superdsc_opspec::OpSpec {
     let mut op = gather_copy_opspec(
         "Tensor0",
         "Tensor2",
-        16,
-        ktir_superdsc::sdsc_abstract::POOL_STICK,
-        ktir_superdsc::superdsc_opspec::Df::Fp16,
         vendor_index("Tensor1"),
-        // Global block numbers — no source base (the `GatherCopy` law).
-        ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
-        // The destination's own law: the copy's `mb × out` = 1024-element window at entry 0, exact.
-        ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+        ktir_superdsc::sdsc_abstract::GatherCopySpec {
             rows: 16,
             cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+            df: ktir_superdsc::superdsc_opspec::Df::Fp16,
+            // Global block numbers — no source base (the `GatherCopy` law).
+            run: ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+            // The destination's own law: the copy's `mb × out` = 1024-element window at entry 0, exact.
+            dest: ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+                rows: 16,
+                cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+            },
         },
     )
     .expect("the gather-copy op builds");

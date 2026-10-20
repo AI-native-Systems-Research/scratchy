@@ -81,9 +81,6 @@ fn gather_copy() -> emit::EmittedOp {
     let spec = gather_copy_opspec(
         "KtPool",
         "KtScratch",
-        8,
-        ktir_superdsc::sdsc_abstract::POOL_STICK,
-        Df::Fp16,
         GatherIndex {
             name: "BlockTable".to_string(),
             entry_dim: KernelAxis::Batch,
@@ -91,11 +88,16 @@ fn gather_copy() -> emit::EmittedOp {
             per_position: None,
             first_entry: EntryBase::ZERO,
         },
-        GatherRun::CONTIGUOUS,
-        // The destination's own law: the copy's `mb × out` = 512-element window at entry 0, exact.
-        ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+        ktir_superdsc::sdsc_abstract::GatherCopySpec {
             rows: 8,
             cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+            df: Df::Fp16,
+            run: GatherRun::CONTIGUOUS,
+            // The destination's own law: the copy's `mb × out` = 512-element window at entry 0, exact.
+            dest: ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+                rows: 8,
+                cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+            },
         },
     )
     .expect("the gather copy builds");

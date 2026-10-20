@@ -156,21 +156,23 @@ fn the_shipped_gather_copys_skip_addr_is_one_pool_stick_block() {
             let op = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
                 "Tensor0",
                 "Tensor2",
-                cp.dims().mb(),
-                ktir_superdsc::sdsc_abstract::POOL_STICK,
-                ktir_superdsc::superdsc_opspec::Df::Fp16,
                 ktir_superdsc::superdsc_opspec::GatherIndex::of_scratch_rows(
                     "BlockTable".to_string(),
                     PageExtent::of_positions(scratch.entry_page()),
                     cp.index_base(),
                 ),
-                // Global block numbers — no source base.
-                ktir_superdsc::superdsc_opspec::GatherRun::split(
-                    ktir_superdsc::superdsc_opspec::DestEntry::of_entries(cp.dest_entry()),
-                    0,
-                ),
-                // The copy's own stated destination — the mint bounds this run's window against it.
-                cp.dest(),
+                ktir_superdsc::sdsc_abstract::GatherCopySpec {
+                    rows: cp.dims().mb(),
+                    cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+                    df: ktir_superdsc::superdsc_opspec::Df::Fp16,
+                    // Global block numbers — no source base.
+                    run: ktir_superdsc::superdsc_opspec::GatherRun::split(
+                        ktir_superdsc::superdsc_opspec::DestEntry::of_entries(cp.dest_entry()),
+                        0,
+                    ),
+                    // The copy's own stated destination — the mint bounds this run's window against it.
+                    dest: cp.dest(),
+                },
             )
             .expect("the gather-copy op builds");
             let value_idx = op.indirect.expect("a declared gather").value;
@@ -238,9 +240,6 @@ fn the_shipped_page_gather_copys_skip_addr_is_one_pool_stick_block() {
                 let op = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
                     "Tensor0",
                     "Tensor2",
-                    cp.dims().mb(),
-                    ktir_superdsc::sdsc_abstract::POOL_STICK,
-                    ktir_superdsc::superdsc_opspec::Df::Fp16,
                     ktir_superdsc::superdsc_opspec::GatherIndex::of_scratch_rows(
                         "BlockTable".to_string(),
                         PageExtent::of_positions(
@@ -248,13 +247,18 @@ fn the_shipped_page_gather_copys_skip_addr_is_one_pool_stick_block() {
                         ),
                         cp.index_base(),
                     ),
-                    // Global block numbers — no source base.
-                    ktir_superdsc::superdsc_opspec::GatherRun::split(
-                        ktir_superdsc::superdsc_opspec::DestEntry::of_entries(cp.dest_entry()),
-                        0,
-                    ),
-                    // The copy's own stated destination — the mint bounds this run's window against it.
-                    cp.dest(),
+                    ktir_superdsc::sdsc_abstract::GatherCopySpec {
+                        rows: cp.dims().mb(),
+                        cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+                        df: ktir_superdsc::superdsc_opspec::Df::Fp16,
+                        // Global block numbers — no source base.
+                        run: ktir_superdsc::superdsc_opspec::GatherRun::split(
+                            ktir_superdsc::superdsc_opspec::DestEntry::of_entries(cp.dest_entry()),
+                            0,
+                        ),
+                        // The copy's own stated destination — the mint bounds this run's window against it.
+                        dest: cp.dest(),
+                    },
                 )
                 .expect("the page gather-copy op builds");
                 let value_idx = op.indirect.expect("a declared gather").value;
@@ -337,9 +341,6 @@ fn pinning_the_entry_dim_makes_skip_addr_one_entrys_size() {
     let op = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
         "Tensor0",
         "Tensor2",
-        16,
-        ktir_superdsc::sdsc_abstract::POOL_STICK,
-        ktir_superdsc::superdsc_opspec::Df::Fp16,
         ktir_superdsc::superdsc_opspec::GatherIndex {
             name: "BlockTable".to_string(),
             entry_dim: axis,
@@ -347,11 +348,16 @@ fn pinning_the_entry_dim_makes_skip_addr_one_entrys_size() {
             per_position: None,
             first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
         },
-        ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
-        // The destination's own law: the copy's `mb × out` = 1024-element window at entry 0, exact.
-        ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+        ktir_superdsc::sdsc_abstract::GatherCopySpec {
             rows: 16,
             cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+            df: ktir_superdsc::superdsc_opspec::Df::Fp16,
+            run: ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+            // The destination's own law: the copy's `mb × out` = 1024-element window at entry 0, exact.
+            dest: ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+                rows: 16,
+                cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+            },
         },
     )
     .expect("the gather-copy op builds");
@@ -472,20 +478,22 @@ fn the_two_pins_hd_128_needs_derive_the_two_window_strides_the_pool_has() {
         let op = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
             "Tensor0",
             "Tensor2",
-            mb,
-            POOL_STICK,
-            ktir_superdsc::superdsc_opspec::Df::Fp16,
             GatherIndex::of_scratch_rows(
                 "BlockTable".to_string(),
                 PageExtent::of_positions(pin),
                 EntryBase::ZERO,
             ),
-            ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
-            // The destination's own law in the entry frame: one index stick of entries × the pin's
-            // stick — exactly the copy's `mb × out` window, at either plane's pin.
-            ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
-                rows: ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
-                cols: pin * POOL_STICK,
+            ktir_superdsc::sdsc_abstract::GatherCopySpec {
+                rows: mb,
+                cols: POOL_STICK,
+                df: ktir_superdsc::superdsc_opspec::Df::Fp16,
+                run: ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+                // The destination's own law in the entry frame: one index stick of entries × the pin's
+                // stick — exactly the copy's `mb × out` window, at either plane's pin.
+                dest: ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+                    rows: ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
+                    cols: pin * POOL_STICK,
+                },
             },
         )
         .expect("the gather-copy op builds at both pins");

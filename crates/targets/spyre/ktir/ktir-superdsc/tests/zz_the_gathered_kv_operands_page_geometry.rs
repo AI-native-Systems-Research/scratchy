@@ -331,6 +331,13 @@ fn gathered_score_shaped_op(axis: KernelAxis, page: PageExtent) -> serde_json::V
     let op = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
         "Tensor0",
         "Tensor2",
+        GatherIndex {
+            name: "Tensor3".to_string(),
+            entry_dim: axis,
+            page,
+            per_position: None,
+            first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
+        },
         // ⛔ THE SAME ELEMENTS, IN ONE-STICK SUB-ROWS — the shipped shape. A `[mb, out]` operand sticked on
         // a MULTI-stick `out` classifies stick-major, which scatters each gathered block `rows*64` apart
         // instead of contiguous; the builder refuses it, and the arithmetic measured here (a pinned dim
@@ -344,23 +351,18 @@ fn gathered_score_shaped_op(axis: KernelAxis, page: PageExtent) -> serde_json::V
         // `page × a stick` rather than as the score window so every page this helper is handed — a whole
         // stick, one position, `hd` sub-rows — is exercised at a legal index width instead of one that
         // happens to fit only at the widest page.
-        page.get() * ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
-        ktir_superdsc::sdsc_abstract::POOL_STICK,
-        ktir_superdsc::superdsc_opspec::Df::Fp16,
-        GatherIndex {
-            name: "Tensor3".to_string(),
-            entry_dim: axis,
-            page,
-            per_position: None,
-            first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
-        },
-        // Global block numbers — no source base (the `GatherCopy` law).
-        ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
-        // The destination's own law in the entry frame — one index stick of entries × the page's
-        // stick, exactly the copy's `mb × out` window — so the measurement stays about `skip_addr`.
-        ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
-            rows: ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
-            cols: page.get() * ktir_superdsc::sdsc_abstract::POOL_STICK,
+        ktir_superdsc::sdsc_abstract::GatherCopySpec {
+            rows: page.get() * ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
+            cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+            df: ktir_superdsc::superdsc_opspec::Df::Fp16,
+            // Global block numbers — no source base (the `GatherCopy` law).
+            run: ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+            // The destination's own law in the entry frame — one index stick of entries × the page's
+            // stick, exactly the copy's `mb × out` window — so the measurement stays about `skip_addr`.
+            dest: ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+                rows: ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
+                cols: page.get() * ktir_superdsc::sdsc_abstract::POOL_STICK,
+            },
         },
     )
     .expect("the gather-copy op builds at the score leg's extents");
@@ -375,22 +377,24 @@ fn ungathered_score_shaped_op() -> serde_json::Value {
     let mut op = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
         "Tensor0",
         "Tensor2",
-        // The SAME width as the gathered control above, for the same reason — one index stick.
-        HD * ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
-        ktir_superdsc::sdsc_abstract::POOL_STICK,
-        ktir_superdsc::superdsc_opspec::Df::Fp16,
         GatherIndex::of_scratch_rows(
             "Tensor3".to_string(),
             PageExtent::of_positions(HD),
             ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
         ),
-        // Global block numbers — no source base (the `GatherCopy` law).
-        ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
-        // The destination's own law in the entry frame — `hd`'s page × one stick, one index stick
-        // of entries: exactly the copy's `mb × out` window.
-        ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
-            rows: ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
-            cols: HD * ktir_superdsc::sdsc_abstract::POOL_STICK,
+        // The SAME width as the gathered control above, for the same reason — one index stick.
+        ktir_superdsc::sdsc_abstract::GatherCopySpec {
+            rows: HD * ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
+            cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+            df: ktir_superdsc::superdsc_opspec::Df::Fp16,
+            // Global block numbers — no source base (the `GatherCopy` law).
+            run: ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+            // The destination's own law in the entry frame — `hd`'s page × one stick, one index
+            // stick of entries: exactly the copy's `mb × out` window.
+            dest: ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+                rows: ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
+                cols: HD * ktir_superdsc::sdsc_abstract::POOL_STICK,
+            },
         },
     )
     .expect("the gather-copy op builds");

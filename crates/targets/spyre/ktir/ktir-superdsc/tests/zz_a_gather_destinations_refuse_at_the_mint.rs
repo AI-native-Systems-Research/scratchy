@@ -47,9 +47,6 @@ fn copy_opspec(mb: u32, run: GatherRun, dest: GatherDest) -> Result<OpSpec, Stri
     gather_copy_opspec(
         "KtPool",
         "KtScratch",
-        mb,
-        ktir_superdsc::sdsc_abstract::POOL_STICK,
-        Df::Fp16,
         GatherIndex {
             name: "BlockTable".to_string(),
             entry_dim: KernelAxis::Batch,
@@ -57,9 +54,14 @@ fn copy_opspec(mb: u32, run: GatherRun, dest: GatherDest) -> Result<OpSpec, Stri
             per_position: None,
             first_entry: EntryBase::ZERO,
         },
-        // Global block numbers — no source base (the `GatherCopy` law).
-        run,
-        dest,
+        ktir_superdsc::sdsc_abstract::GatherCopySpec {
+            rows: mb,
+            cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+            df: Df::Fp16,
+            // Global block numbers — no source base (the `GatherCopy` law).
+            run,
+            dest,
+        },
     )
 }
 

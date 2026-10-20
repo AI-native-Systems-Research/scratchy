@@ -9020,6 +9020,65 @@ pub enum GatherDest {
     CoreLocalLx,
 }
 
+/// ⭐⭐⭐⭐⭐ A HAND-BUILT COPY'S WHOLE DECLARED LAW AS ONE VALUE — the extents, the format, the run
+/// and the destination's bound, because they are one copy seen four ways and a builder that takes
+/// them as loose arguments can be handed three facts about one run and a fourth about another
+/// (the same "one value, not N reaches" law [`CopyDims`] states for the minted cut).
+/// [`GatherCopy`] is the MINTED form — its only constructors are the `copies()` iterators, from a
+/// scratch that owns every number; this is the spec a caller states when no scratch mints it for
+/// them: the descriptor test rigs, and the MoE expert-slab copy that states its own fp8 format
+/// at the raw door.
+///
+/// ⛔ `rows` IS SUB-ROWS OF **ONE STICK**, AND `cols` MUST BE ONE STICK. A `[mb, out]` operand
+/// sticked on a MULTI-stick `out` is `RowBlocked` (stick-major), whose address law
+/// `(c/64)*(rows*64) + r*64 + c%64` scatters each gathered block across the whole buffer — off by
+/// `rows` from the contiguous `[hd, 64]` block the score kernel then reads, from a clean bake. At
+/// one stick of `out` the same law collapses to `r*64 + c`, i.e. ROW-MAJOR, and a pool block is
+/// `hd` consecutive sub-rows. `GatherScratch::sub_rows`/`entry_page` carry that split, and the
+/// gather's `page` is what keeps ONE ENTRY equal to one whole block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GatherCopySpec {
+    /// The run's `mb`.
+    pub rows: u32,
+    /// The run's `out` — EXACTLY one stick of [`Self::df`] (the one-stick law above).
+    pub cols: u32,
+    /// ⭐⭐⭐ THE VALUE OPERANDS' FORMAT — fp16 for every gathered fold to date, fp8 for the MoE
+    /// expert slabs. The vendor's `identity` bind carries NO DDL type constraint
+    /// (unary_parallel.ddl:17 "identity and shuffle only move data, so their input and output
+    /// are free to arrange it differently"), so the copy's df is a property of the BANK it
+    /// copies, not of the op — and the ONE-STICK law transfers per-format: an fp8 copy's `cols`
+    /// is one 128-elem fp8 stick, and the RowBlocked-scatter refusal the fp16 law states is the
+    /// same law at its own width.
+    pub df: crate::superdsc_opspec::Df,
+    /// ⭐⭐⭐⭐⭐ WHERE THIS RUN'S COPY STARTS, AT EACH END — see `superdsc_opspec::GatherRun`. The
+    /// destination entry is separate from the index's `first_entry`, and it has to be. See
+    /// [`GatherCopy::dest_entry`]: the two were one number while a run's entries and its
+    /// destination rows advanced together (the window-granular cut, where one index stick IS 32
+    /// scratch rows), and a page-granular op breaks that — it names ONE entry but must sit at a
+    /// stick boundary, so entries advance 32 per op while rows advance 1. Both are minted from
+    /// the same request index by `copies()`, so they cannot drift; they simply are not equal any
+    /// more. The source base is the SECOND paged-axis half of `addr = idx·skip_addr + base_addr`,
+    /// for a source whose entries are RELATIVE to a base inside its own buffer. ZERO for every
+    /// gathered KV copy (the pool's entries are GLOBAL stick-block numbers, and a per-run base
+    /// would be added twice — see [`GatherCopy`]'s "source base stays ZERO" law). The expert
+    /// bank is the other shape: its entries are EXPERT IDS relative to the bank's base, and the
+    /// bank's packed device layout makes one expert's slab ONE CONTIGUOUS range, so a chunk of
+    /// that slab is the range `[src_off, src_off + mb·page·cols)` and the index term
+    /// `idx·skip_addr` still supplies the WHOLE-slab stride. Both base and index are added by
+    /// `ConvertData_gather_idx` — card-proven at the score leg ("the index supplies only the
+    /// PAGE term", `emit/mod.rs`'s isStartAddrSymbolic note) — so a nonzero base here survives
+    /// the gather and a zero one changes nothing on every existing caller.
+    pub run: crate::superdsc_opspec::GatherRun,
+    /// ⭐⭐⭐⭐⭐ WHERE THIS COPY'S DESTINATION ENDS — see [`GatherDest`]. Carried with the run
+    /// (minted by the same `copies()` that mints it, from the scratch the run lands in), because
+    /// the destination's bound is a fact about the SCRATCH, not about the op: a base whose run
+    /// crosses the scratch's end is the #717 class — a clean bake whose overrun is the next
+    /// intermediate's bytes, read back as keys or page numbers. The core-local LX forms state
+    /// their own window kind (each core's slice at the pin, no offset), never an exemption from
+    /// the mint.
+    pub dest: GatherDest,
+}
+
 /// ⭐⭐⭐⭐⭐ ONE GATHER COPY OP — the run of scratch rows it serves, its declared extents, and the two
 /// BASES that place that run. One value, because the three are the same cut seen three ways and an op
 /// built from two of them and a stale third writes one run's blocks into another run's rows.

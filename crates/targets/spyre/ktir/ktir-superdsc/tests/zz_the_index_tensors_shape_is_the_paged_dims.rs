@@ -367,17 +367,19 @@ fn the_index_declares_entries_and_every_core_reads_the_same_table() {
     let op = gather_copy_opspec(
         "KtPool",
         "KtScratch",
-        d.mb(),
-        d.out(),
-        ktir_superdsc::superdsc_opspec::Df::Fp16,
         GatherIndex::of_scratch_rows("BlockTable".to_string(), d.page(), runs[0].index_base()),
-        // Global block numbers — no source base (the `GatherCopy` law).
-        ktir_superdsc::superdsc_opspec::GatherRun::split(
-            ktir_superdsc::superdsc_opspec::DestEntry::of_entries(runs[0].dest_entry()),
-            0,
-        ),
-        // The run's own stated destination — the mint bounds this run's window against it.
-        runs[0].dest(),
+        ktir_superdsc::sdsc_abstract::GatherCopySpec {
+            rows: d.mb(),
+            cols: d.out(),
+            df: ktir_superdsc::superdsc_opspec::Df::Fp16,
+            // Global block numbers — no source base (the `GatherCopy` law).
+            run: ktir_superdsc::superdsc_opspec::GatherRun::split(
+                ktir_superdsc::superdsc_opspec::DestEntry::of_entries(runs[0].dest_entry()),
+                0,
+            ),
+            // The run's own stated destination — the mint bounds this run's window against it.
+            dest: runs[0].dest(),
+        },
     )
     .expect("the shipped gather-copy builds");
     let idx_pos = op.indirect.expect("a declaration").index;

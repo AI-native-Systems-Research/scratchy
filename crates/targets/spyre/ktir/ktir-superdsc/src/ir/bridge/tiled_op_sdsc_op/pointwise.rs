@@ -48,54 +48,26 @@ use crate::work::EwDivision;
 /// sees a regular buffer.
 ///
 /// ## ⛔ `rows` IS SUB-ROWS OF **ONE STICK**, AND `cols` MUST BE ONE STICK
-/// A `[mb, out]` operand sticked on a MULTI-STICK `out` is `RowBlocked` (stick-major), whose address law
-/// `(c/64)*(rows*64) + r*64 + c%64` scatters each gathered block across the whole buffer — off by `rows`
-/// from the contiguous `[hd, 64]` block the score kernel then reads, from a clean bake. At one stick of
-/// `out` the same law collapses to `r*64 + c`, i.e. ROW-MAJOR, and a pool block is `hd` consecutive
-/// sub-rows. `GatherScratch::sub_rows`/`entry_page` carry that split, and the gather's `page` is what
-/// keeps ONE ENTRY equal to one whole block.
-#[allow(clippy::too_many_arguments)]
+/// Stated on the spec that carries them — see `sdsc_abstract::GatherCopySpec`, whose doc holds
+/// the law and the address arithmetic it prevents.
 pub fn gather_copy_opspec(
     src: &str,
     dst: &str,
-    rows: u32,
-    cols: u32,
-    // ⭐⭐⭐ THE VALUE OPERANDS' FORMAT — fp16 for every gathered fold to date, fp8 for the MoE expert
-    // slabs. The vendor's `identity` bind carries NO DDL type constraint (unary_parallel.ddl:17
-    // "identity and shuffle only move data, so their input and output are free to arrange it
-    // differently"), so the copy's df is a property of the BANK it copies, not of the op — and the
-    // ONE-STICK law below transfers per-format: an fp8 copy's `cols` is one 128-elem fp8 stick, and
-    // the RowBlocked-scatter refusal the fp16 law states is the same law at its own width.
-    df: Df,
     gather: crate::superdsc_opspec::GatherIndex,
-    // ⭐⭐⭐⭐⭐ WHERE THIS RUN'S COPY STARTS, AT EACH END — see `superdsc_opspec::GatherRun`. The
-    // destination entry is separate from `gather.first_entry`, and it has to be. See
-    // `GatherCopy::dest_entry`: the two were one number while a run's entries and its destination
-    // rows advanced together (the window-granular cut, where one index stick IS 32 scratch rows),
-    // and a page-granular op breaks that — it names ONE entry but must sit at a stick boundary, so
-    // entries advance 32 per op while rows advance 1. Both are minted from the same request index
-    // by `copies()`, so they cannot drift; they simply are not equal any more. The source base is
-    // the SECOND paged-axis half of `addr = idx·skip_addr + base_addr`, for a source whose entries
-    // are RELATIVE to a base inside its own buffer. ZERO for every gathered KV copy (the pool's
-    // entries are GLOBAL stick-block numbers, and a per-run base would be added twice — see
-    // [`crate::sdsc_abstract::GatherCopy`]'s "source base stays ZERO" law). The expert bank is
-    // the other shape: its entries are EXPERT IDS relative to the bank's base, and the bank's
-    // packed device layout makes one expert's slab ONE CONTIGUOUS range, so a chunk of that slab
-    // is the range `[src_off, src_off + mb·page·cols)` and the index term `idx·skip_addr` still
-    // supplies the WHOLE-slab stride. Both base and index are added by `ConvertData_gather_idx`
-    // — card-proven at the score leg ("the index supplies only the PAGE term", `emit/mod.rs`'s
-    // isStartAddrSymbolic note) — so a nonzero base here survives the gather and a zero one
-    // changes nothing on every existing caller.
-    run: crate::superdsc_opspec::GatherRun,
-    // ⭐⭐⭐⭐⭐ WHERE THIS COPY'S DESTINATION ENDS — see `sdsc_abstract::GatherDest`. Carried by the
-    // copy (minted by the same `copies()` that mints the run, from the scratch the run lands in),
-    // because the destination's bound is a fact about the SCRATCH, not about the op: nothing else
-    // in this signature states where the copy's window stops, and a base whose run crosses the
-    // scratch's end is the #717 class — a clean bake whose overrun is the next intermediate's
-    // bytes, read back as keys or page numbers. The core-local LX forms state their own window
-    // kind here (each core's slice at the pin, no offset), never an exemption from the mint.
-    dest: crate::sdsc_abstract::GatherDest,
+    // ⭐⭐⭐⭐⭐ THE COPY'S WHOLE DECLARED LAW AS ONE VALUE — the extents, the format, the run and the
+    // destination's bound ([`crate::sdsc_abstract::GatherCopySpec`]): the run's landing and the
+    // scratch it lands in are facts about ONE copy, and this builder takes them together or not
+    // at all. `GatherCopy` is the minted form; the spec is what a caller states when no scratch
+    // mints it for them.
+    spec: crate::sdsc_abstract::GatherCopySpec,
 ) -> Result<OpSpec, String> {
+    let crate::sdsc_abstract::GatherCopySpec {
+        rows,
+        cols,
+        df,
+        run,
+        dest,
+    } = spec;
     crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
     // ⭐ `cols` IS the whole-stick width by the one-stick law below (`cols == df.elems_per_stick()`),
     // so it needs no `StickExtent` round-trip — and a typed one would have to name a format. The
@@ -404,29 +376,31 @@ pub fn assemble_gather_copy(
     let mut op = gather_copy_opspec(
         src,
         dst,
-        d.mb(),
-        d.out(),
-        // Every gathered fold to date copies fp16 KV planes — the MoE expert-slab copy is the
-        // first fp8 caller and states its own df at its own door.
-        Df::Fp16,
         crate::superdsc_opspec::GatherIndex::of_scratch_rows(
             index.to_string(),
             d.page(),
             // THE INDEX's base, in whole index STICKS — dxp loads the IBR one stick at a time.
             copy.index_base(),
         ),
-        // ⛔ AND THE DESTINATION's base SEPARATELY, with the source's own base at its ZERO law. It
-        // used to be derived from the index base above; see `GatherCopy::dest_entry` for the
-        // measurement that separated them (a page-granular op names one entry at stick `r` but
-        // writes run `r`, so the two advance at different rates). Both come from `copies()`, which
-        // mints them from one request index. The KV pool's entries are GLOBAL block numbers — no
-        // source base (the `GatherCopy` law).
-        crate::superdsc_opspec::GatherRun::split(
-            crate::superdsc_opspec::DestEntry::of_entries(copy.dest_entry()),
-            0,
-        ),
-        // The destination's own law, carried by the copy from the scratch it lands in.
-        copy.dest(),
+        crate::sdsc_abstract::GatherCopySpec {
+            rows: d.mb(),
+            cols: d.out(),
+            // Every gathered fold to date copies fp16 KV planes — the MoE expert-slab copy is the
+            // first fp8 caller and states its own df at its own door.
+            df: Df::Fp16,
+            // ⛔ AND THE DESTINATION's base SEPARATELY, with the source's own base at its ZERO law. It
+            // used to be derived from the index base above; see `GatherCopy::dest_entry` for the
+            // measurement that separated them (a page-granular op names one entry at stick `r` but
+            // writes run `r`, so the two advance at different rates). Both come from `copies()`, which
+            // mints them from one request index. The KV pool's entries are GLOBAL block numbers — no
+            // source base (the `GatherCopy` law).
+            run: crate::superdsc_opspec::GatherRun::split(
+                crate::superdsc_opspec::DestEntry::of_entries(copy.dest_entry()),
+                0,
+            ),
+            // The destination's own law, carried by the copy from the scratch it lands in.
+            dest: copy.dest(),
+        },
     )
     .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
     // ⭐ THE DESTINATION MAY BE CORE-LOCAL LX — the chunk's V, landing in the scratchpad of the core whose
