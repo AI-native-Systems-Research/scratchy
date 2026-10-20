@@ -4726,14 +4726,21 @@ pub fn kv_cache_write(
             &format!("attn_kctpost{kvh}{rq}{pt}_o{t}"),
             crate::sdsc_abstract::KtTileSlots::of_page(),
             crate::sdsc_abstract::KtTileFeats::of_head_dim(hd),
-            kc,
+            // ⭐ BOTH HANDLES AT THE PLANE'S OWN LAW — `pool.addr` is PLANE-RELATIVE (each plane is
+            // its own named tensor; the plane base is implicit in which name an op takes), so the
+            // bound the mint states is the plane's own `plane_stride()` — the one number that sizes
+            // the pool's placement, stated by the same function the offsets come from. The window is
+            // ONE block (`[PAGE_SLOTS, hd]`), which the pool's own doctest pins inside the stride
+            // for every head the block table can name; a kv head past `nkvh` now refuses HERE
+            // instead of re-transposing another plane's bytes into Kᵀ.
+            &rb(kc, 1, pool.plane_stride() as u32),
             // The two planes are the whole content of this op: it reads natural K and writes Kᵀ, both at
             // the same `(kv head)` block of the page the launch was shifted to.
             crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
                 crate::sdsc_abstract::KvPlane::Knat,
                 kv_head_of(kvh, nkvh)?,
             ))),
-            kct,
+            &rb(kct, 1, pool.plane_stride() as u32),
             crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
                 crate::sdsc_abstract::KvPlane::Kt,
                 kv_head_of(kvh, nkvh)?,
@@ -5467,12 +5474,16 @@ pub fn transpose(
     // on `distribute_cores`' answer for this shape. Restating that here would mean duplicating the
     // divider; a panicking assembler would abort the build with a bare panic where a producer needs an
     // error against its own op.
+    // ⭐ THE HANDLES STATE THE VIEWS THE CHECKS ABOVE ALREADY PROVED: `[mb, cols]` in, `[cols, mb]`
+    // out — whole buffers, both sides, by this body's own whole-view law. The mint's new fact is the
+    // PLACEMENT half: a view can be whole while the reservation behind its name is smaller, which
+    // bakes clean and overruns into the next tensor's bytes.
     super::try_assemble_restickify_transpose_2d(
         &format!("transpose_o{}", out.tid),
         mb,
         cols,
-        &a.name(),
-        &out.name(),
+        &rb(&a.name(), mb, cols),
+        &rb(&out.name(), cols, mb),
         sym_id_base,
         layout,
     )

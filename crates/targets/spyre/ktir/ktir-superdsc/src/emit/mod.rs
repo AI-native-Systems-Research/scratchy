@@ -684,25 +684,39 @@ pub(crate) fn mint_ew_output<O: KindTag>(
         StickExtent::<Fp16>::new(cols)?.elems()
     };
     let what = format!("{op_name}: output '{}'", o.name());
+    mint_full_window(&what, o, off_elems as u64, rows, stick_elems, layout)
+}
+
+/// ⭐ THE FULL-WINDOW MINT — one whole `[rows, cols]` window at an element corner, checked against
+/// BOTH authorities, the same doors [`mint_ew_operands`] runs for a pointwise operand: the handle's
+/// declared shape (always), and the placement footprint by name (when a `BundleLayout` is at hand).
+///
+/// This is the convert and restickify families' door. Their ops read and write whole tiles at
+/// nest-derived corners — no broadcast forms, no per-row value bounds — so the one question a mint
+/// can ask of them is whether the tile fits the tensor it names, and this asks exactly that. The
+/// corner arrives in ELEMENTS of the operand's own df (a `DevOff`'s raw elements, or 0), and the
+/// handle's own df must be the operand's real one: the placement door prices bytes at the handle's
+/// word length, so an fp16-annotated fp8 buffer overstates every window 2× and would refuse legal
+/// slots (see [`rb_df`]).
+pub(crate) fn mint_full_window<O: KindTag>(
+    what: &str,
+    h: &Stk<O>,
+    off_elems: u64,
+    rows: u32,
+    cols: u32,
+    layout: Option<&BundleLayout>,
+) -> Result<(), String> {
     match layout {
-        Some(l) => l.check_window(
-            o.name(),
-            o.layout(),
-            off_elems as u64,
-            rows,
-            stick_elems,
-            &what,
-        )?,
+        Some(l) => l.check_window(h.name(), h.layout(), off_elems, rows, cols, what),
         None => crate::placement::window_fits_declared(
-            o.name(),
-            o.layout(),
-            off_elems as u64,
+            h.name(),
+            h.layout(),
+            off_elems,
             rows,
-            stick_elems,
-            &what,
-        )?,
+            cols,
+            what,
+        ),
     }
-    Ok(())
 }
 
 /// Whether a `[rows, cols]` fp16 pointwise op over `n_inputs` operands runs WITHOUT time-tiling — the
@@ -4148,6 +4162,19 @@ pub fn rb(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
         .expect("token-stream matmul operand is RowBlocked by construction")
 }
 
+/// [`rb`] at the operand's OWN df — the fp8 activation's handle. The kind is annotation-only to the
+/// emit (the OpSpec carries the real df), but the WINDOW MINT's placement door prices bytes at the
+/// handle's word length, so a buffer whose elements are 1 byte must not be annotated at 2: every
+/// window over it would be overstated 2× and the last slot's legal convert would refuse. Same
+/// infallibility contract as [`rb`] — only the df reaches the layout.
+pub fn rb_df(name: &str, rows: u32, cols: u32, df: Df) -> Stk<RowBlockedTag> {
+    Stk::<RowBlockedTag>::new(
+        name,
+        StickLayout::row_blocked_df(rows as usize, cols as usize, df),
+    )
+    .expect("token-stream matmul operand is RowBlocked by construction")
+}
+
 /// Mint a `Flat` (head-major, row-major) output handle `[rows, cols]` — the per-head attention
 /// pointwise/reduce path (`head_major`). Its `Stk<FlatTag>` type is what the builder reads to know the
 /// op is head-major (a `RowBlocked` output ⇒ residual token stream). df annotation-only.
@@ -4517,6 +4544,29 @@ pub fn assemble_convert(
 ) -> EmittedOp {
     // TYPED: a dtype-convert's input and output are both the RowBlocked token stream (only the df
     // changes — fp16→fp32 / fp16→fp8); the handle carries only `.name()`, so the emit is byte-identical.
+    //
+    // ⭐ AND NOW MINTED: the whole-tensor window `[rows, cols]` at 0 against BOTH doors, on each side
+    // at its own df — the #731 law for this family (an op sweeping past its tensor is a defect in the
+    // computation that produced the offset; it cannot compile). The output handle's df is the OUTPUT's
+    // own (`rb_df`), so the placement door prices its bytes at one byte per fp8 element.
+    mint_full_window(
+        &format!("{op_name}: operand '{}'", in_.name()),
+        in_,
+        0,
+        rows,
+        cols,
+        layout,
+    )
+    .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"));
+    mint_full_window(
+        &format!("{op_name}: output '{}'", o.name()),
+        o,
+        0,
+        rows,
+        cols,
+        layout,
+    )
+    .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"));
     let op = convert_opspec(op_func_from_str(op_func), rows, cols, in_.name(), o.name())
         .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -4524,49 +4574,15 @@ pub fn assemble_convert(
         .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"))
 }
 
-/// Assemble a dtype-convert op over an OFFSET SLICE of its operands (see [`convert_opspec`]):
-/// `in_off`/`o_off` are ELEMENT offsets along each operand's OWN df (the fp16 input counts fp16
-/// elements, the fp8 output fp8 elements), applied via [`AnyTensorArg::set_offset_elems`] before
-/// emit — the same plumbing the windowed matmul and the offset reduce use. ⛔ m=1 ONLY: the offset
-/// is a FLAT stick-axis slice, which addresses a single-row buffer's column window; at rows>1 a
-/// column window of a stick-major tensor is NOT contiguous (see `reduce_opspec_off`'s
-/// block-alignment law), so the per-pair caller routes `pairs > 1 ∧ m > 1` to
-/// [`assemble_convert_col`], the DevOff twin. Emit-time panic on a malformed spec = a `cargo build`
-/// error (guard-every-crash), same as the other `assemble_*`.
-#[allow(clippy::too_many_arguments)]
-pub fn assemble_convert_off(
-    op_name: &str,
-    op_func: &str,
-    rows: u32,
-    cols: u32,
-    in_: &Stk<RowBlockedTag>,
-    in_off: u32,
-    o: &Stk<RowBlockedTag>,
-    o_off: u32,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> EmittedOp {
-    // TYPED, same as `assemble_convert`: both operands are the RowBlocked token stream and the
-    // handles carry only `.name()` — the offsets ride the args, not the handles.
-    let mut op = convert_opspec(op_func_from_str(op_func), rows, cols, in_.name(), o.name())
-        .unwrap_or_else(|e| panic!("assemble_convert_off {op_name}: {e}"));
-    for (arg, off) in op.args.iter_mut().zip([in_off, o_off]) {
-        arg.set_offset_elems(off);
-    }
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_convert_off {op_name}: {e}"))
-}
-
 /// Assemble a dtype-convert op over a COLUMN WINDOW of its operands (see [`convert_opspec`]):
 /// `in_off`/`o_off` are [`crate::addr::DevOff`]s — nest-derived column offsets built by
 /// [`crate::addr::col_of`], so the `(c/lanes)·(rows·lanes)` group-corner term of the stick-major
-/// layout is present by construction (a flat stick-axis slice drops it, which is why the m=1 twin
-/// [`assemble_convert_off`] cannot serve rows>1 — see `reduce_opspec_off`'s block-alignment law).
-/// The m>1 twin the per-pair quantize tail routes to when `pairs > 1 ∧ m > 1`: the same
-/// `set_offset_elems` plumbing the windowed matmul and the offset reduce use, at DevOff precision.
-/// Emit-time panic on a malformed spec = a `cargo build` error (guard-every-crash), same as the
-/// other `assemble_*`.
+/// layout is present by construction. ⛔ THE ONE CONVERT DOOR FOR EVERY `m`: at `m == 1` a
+/// `col_of` corner degenerates to the flat stick-axis slice exactly (one row ⇒ no group-corner
+/// term), so the per-pair quantize tail's decode arm routes HERE too and the raw-`u32` twin that
+/// used to serve it (`assemble_convert_off`, flat offsets with no nest behind them) is deleted —
+/// there is no convert door left that takes an offset no nest minted. Emit-time panic on a
+/// malformed spec = a `cargo build` error (guard-every-crash), same as the other `assemble_*`.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_convert_col(
     op_name: &str,
@@ -4580,8 +4596,32 @@ pub fn assemble_convert_col(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
-    // TYPED, same as `assemble_convert_off`: both operands are the RowBlocked token stream and
-    // the handles carry only `.name()` — the offsets ride the args, not the handles.
+    // TYPED, same as `assemble_convert`: both operands are the RowBlocked token stream and the
+    // handles carry only `.name()` — the offsets ride the args, not the handles.
+    //
+    // ⭐ AND MINTED at the corner, both doors, each side at its own df — the #731 law for the
+    // per-slot convert: slot `s`'s window `[rows, cols]` at `s·inn`/`s·inn_pad` must fit the
+    // FULL-buffer handles the caller trued (`cl_reach`/`k_pad`), which is exactly the arithmetic
+    // `cl_reach = (pairs−1)·inn + inn_pad` states — the last slot's window ends at the buffer's own
+    // end, so a caller that shrinks either side without re-deriving the other is a build failure.
+    mint_full_window(
+        &format!("{op_name}: operand '{}'", in_.name()),
+        in_,
+        in_off.into_raw_elems() as u64,
+        rows,
+        cols,
+        layout,
+    )
+    .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"));
+    mint_full_window(
+        &format!("{op_name}: output '{}'", o.name()),
+        o,
+        o_off.into_raw_elems() as u64,
+        rows,
+        cols,
+        layout,
+    )
+    .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"));
     let mut op = convert_opspec(op_func_from_str(op_func), rows, cols, in_.name(), o.name())
         .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"));
     for (arg, off) in op.args.iter_mut().zip([in_off, o_off]) {
@@ -5534,229 +5574,13 @@ mod transpose_stick_law {
     }
 }
 
-/// Build the typed [`OpSpec`] for a `restickify` — a DEPLOYED device dim-reorder
-/// (vs the UNDEPLOYED `interslicetranspose`). Reorders `in_name` `[mb,out]`
-/// (sticked on `out`) → `o_name` `[out,mb]` (sticked on `mb`): the SAME logical
-/// data re-tiled so a downstream matmul reads it in the KERNEL `[in,out]` layout
-/// WITHOUT a fused bmm-transpose (which SIGABRTs in dxp_standalone — IBM #1731).
-/// torch-spyre inserts exactly this for a transposed matmul input
-/// (test_padding.py: "restickify reorders x's device dims").
-///
-/// Used by in-bundle attention to turn the natural-written K cache `[cap,hd]`
-/// (hd-sticked, the contiguous per-slot write layout) into the prefix-score
-/// kernel layout `[hd,cap]` (cap-sticked) on-card, resident — no host, no
-/// re-upload. The OUTPUT carries the reorder via its `layoutDimOrder_`
-/// (`["out","mb"]`) + `stickDimOrder_` (`["mb"]`), distinct from the INPUT's
-/// (`["mb","out"]` / `["out"]`); the normal emit branch handles distinct sticks
-/// (no Transpose-style 8×8 override).
-///
-/// ⚠️ POD-CONFIRM (SDK `dscdefn.cpp opFuncsToString` + a restickify golden): the
-/// exact `opFuncName`, `exUnit`, and the precise output layoutDimOrder/stickDimOrder
-/// the deployed template expects. `mb` (the output stick) MUST be 64-aligned.
-fn restickify_opspec(
-    batch: u32,
-    cap: u32,
-    hd: u32,
-    in_name: &str,
-    o_name: &str,
-) -> Result<OpSpec, String> {
-    // Dim names + stick roles match the dxp-validated golden sdsc_restickify.json
-    // EXACTLY: `out` = INPUT stick (carries hd), `y` = OUTPUT stick (carries cap),
-    // `mb` = the preserved batch (nqh heads — golden had mb=1; we ride nqh here).
-    // BOTH the input stick (hd→out) and output stick (cap→y) must be whole 64-sticks.
-    let _out_ext = StickExtent::<Fp16>::new(hd)?;
-    let _y_ext = StickExtent::<Fp16>::new(cap)?;
-    // BOTH out (input stick) and y (output stick) are 64-granular split dims — the dual
-    // stick. The golden splits both (out:2 × y:9 = 18 cores); marking only one leaves the
-    // other with no stick-multiple candidate → scheduler "no valid candidate". (matmul
-    // likewise has two stick dims: out + in.) mb (nqh) is the non-stick preserved batch.
-    let dims = vec![
-        ItDim {
-            name: "mb",
-            size: batch.max(1),
-            is_reduction: false,
-            is_stick: false,
-            df: Df::Fp16,
-        },
-        ItDim {
-            name: "out",
-            size: hd,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-        ItDim {
-            name: "y",
-            size: cap,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-    ];
-    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores)?;
-    let device_dims = plan.iter_syms(["mb", "out", "y"]);
-    // INPUT: layout `[mb,out,y]` sticked on `out` (hd-sticked = the natural cache write
-    // layout). OUTPUT: layout KEEPS `[mb,out,y]` but sticks on `y` (cap-sticked = the
-    // transposed-kernel layout the score bmm reads). Same dim ORDER (batch `mb`=nqh
-    // OUTERMOST ⇒ each head's [hd,cap] block is CONTIGUOUS), only the stick axis swaps
-    // out→y — THE restickify. Batch-outermost is REQUIRED: the per-batch score bmm
-    // ([`matmul_opspec_batched`]) reads kc_t as KERNEL `[y,in,out]`=[nqh,hd,cap] and
-    // advances one `hd·cap` block per head; the OLD `[out,y,mb]` output put heads
-    // INNERMOST (interleaved) → per-head bytes wrong (the 5-attempt failure root).
-    let input = TensorArg::<3>::new(
-        true,
-        in_name.to_string(),
-        Role::Input,
-        [Scale::Active, Scale::Active, Scale::Active],
-        device_dims,
-        ["mb", "out", "y"],
-        "out",
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?;
-    let output = TensorArg::<3>::new(
-        false,
-        o_name.to_string(),
-        Role::Output,
-        [Scale::Active, Scale::Active, Scale::Active],
-        device_dims,
-        ["mb", "out", "y"],
-        "y",
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?;
-    Ok(OpSpec {
-        op: OpFunc::Restickify,
-        is_reduction: false,
-        iter: plan,
-        args: vec![AnyTensorArg::R3(input), AnyTensorArg::R3(output)],
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-        coordinate_mask: None,
-    })
-}
-
-/// Assemble a complete SuperDSC `restickify` reordering `in_name` `[mb,out]`
-/// (sticked on `out`) → `o_name` `[out,mb]` (sticked on `mb`). See
-/// [`restickify_opspec`]. The deployed on-card transpose primitive.
-#[allow(clippy::too_many_arguments)]
-pub fn assemble_restickify(
-    op_name: &str,
-    batch: u32,
-    cap: u32,
-    hd: u32,
-    in_name: &str,
-    o_name: &str,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> EmittedOp {
-    let op = restickify_opspec(batch, cap, hd, in_name, o_name)
-        .unwrap_or_else(|e| panic!("assemble_restickify {op_name}: {e}"));
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_restickify {op_name}: {e}"))
-}
-
-/// [`restickify_opspec`] with per-operand ELEMENT offsets — for the PER-HEAD restickify
-/// (batch=1, head h's `[cap,hd]→[hd,cap]` block sliced via `in_off=h·cap·hd`,
-/// `out_off=h·hd·cap`). The batched (mb=nqh) restickify mishandles per-head data on-card
-/// (same class as the 3-D-kernel batched-matmul bug — PROVEN via the attn host oracle:
-/// cos 0.72-0.84), so emit nqh single-head restickifies, mirroring the per-head matmul fix.
-#[allow(clippy::too_many_arguments)]
-fn restickify_opspec_off(
-    batch: u32,
-    cap: u32,
-    hd: u32,
-    in_name: &str,
-    o_name: &str,
-    in_off: u32,
-    out_off: u32,
-) -> Result<OpSpec, String> {
-    let _out_ext = StickExtent::<Fp16>::new(hd)?;
-    let _y_ext = StickExtent::<Fp16>::new(cap)?;
-    let dims = vec![
-        ItDim {
-            name: "mb",
-            size: batch.max(1),
-            is_reduction: false,
-            is_stick: false,
-            df: Df::Fp16,
-        },
-        ItDim {
-            name: "out",
-            size: hd,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-        ItDim {
-            name: "y",
-            size: cap,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-    ];
-    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores)?;
-    let device_dims = plan.iter_syms(["mb", "out", "y"]);
-    let input = TensorArg::<3>::new(
-        true,
-        in_name.to_string(),
-        Role::Input,
-        [Scale::Active, Scale::Active, Scale::Active],
-        device_dims,
-        ["mb", "out", "y"],
-        "out",
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?
-    .with_offset(in_off);
-    let output = TensorArg::<3>::new(
-        false,
-        o_name.to_string(),
-        Role::Output,
-        [Scale::Active, Scale::Active, Scale::Active],
-        device_dims,
-        ["mb", "out", "y"],
-        "y",
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?
-    .with_offset(out_off);
-    Ok(OpSpec {
-        op: OpFunc::Restickify,
-        is_reduction: false,
-        iter: plan,
-        args: vec![AnyTensorArg::R3(input), AnyTensorArg::R3(output)],
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-        coordinate_mask: None,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn assemble_restickify_off(
-    op_name: &str,
-    batch: u32,
-    cap: u32,
-    hd: u32,
-    in_name: &str,
-    in_off: u32,
-    o_name: &str,
-    out_off: u32,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> EmittedOp {
-    let op = restickify_opspec_off(batch, cap, hd, in_name, o_name, in_off, out_off)
-        .unwrap_or_else(|e| panic!("assemble_restickify {op_name}: {e}"));
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_restickify {op_name}: {e}"))
-}
+// ⛔ THE 3-D RESTICKIFY FAMILY IS GONE — `restickify_opspec`/`assemble_restickify` (the batched
+// mb=nqh form), `restickify_opspec_off`/`assemble_restickify_off` (its per-head raw-`u32` twin)
+// and `restickify_v_opspec_2d`/`assemble_restickify_v_2d` (the V-side re-stick, further below) had
+// ZERO callers: the Kᵀ re-stick runs through [`assemble_restickify_kt_2d`] and the value bmm reads
+// the natural V cache directly. The raw-`u32` `in_off`/`out_off` pairs were the last restickify
+// doors with no nest behind them — a caller reintroducing this op writes it against a minted
+// handle at the kt_2d door, so an offset no view computed cannot be stated.
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
 // THE VENDOR TOP-K PAIR — `topk.ddl`'s `topkindex`/`topkvalue`, the selection primitive that
@@ -6142,26 +5966,59 @@ fn restickify_kt_opspec_2d(
 /// each door names which quantity fills it, so the pair cannot be handed over swapped.
 /// `in_off`/`out_off` are the per-head element offsets into the natural cache (`head·cap·hd`) and
 /// the Kᵀ scratch (`head·hd·cap`).
+///
+/// ⭐ AND NOW MINTED, BOTH SIDES. The op re-lays one tile — `[slots, feats]` read slab-major,
+/// `[feats, slots]` written slot-major — which is ONE CONTIGUOUS run of `slots·feats` elements at
+/// each corner, so the window the mint bounds is that flat run against the handle's declared
+/// buffer. The handles replace the names: the caller states what each tensor IS (`[mq_pad,
+/// nkvh·hd]` for the roped new-K; the plane totals for the resident caches), and an offset whose
+/// run would cross the tensor's end — the Kᵀ restickify writing past the `[nkvh, hd, mq_pad]`
+/// scratch into the next intermediate's bytes, read back as keys with a clean bake — is a `cargo
+/// build` failure at this door instead.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_restickify_kt_2d(
     op_name: &str,
     slots: crate::sdsc_abstract::KtTileSlots,
     feats: crate::sdsc_abstract::KtTileFeats,
-    in_name: &str,
+    in_: &Stk<RowBlockedTag>,
     in_off: crate::addr::DevOff,
-    o_name: &str,
+    o: &Stk<RowBlockedTag>,
     out_off: crate::addr::DevOff,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
     let in_off = in_off.into_raw_elems();
     let out_off = out_off.into_raw_elems();
+    // THE TILE'S FLAT RUN — the element range each side touches. Not `[slots, feats]` as a strided
+    // window: the restickify reads its source sticked on the FEATURE axis and writes its output
+    // sticked on the SLOT axis, and both passes walk the SAME contiguous `slots·feats` elements
+    // from their corner (the addressing doc in `restickify_kt_opspec_2d`). One flat window states
+    // exactly the bytes either side can reach.
+    let run = slots.extent().saturating_mul(feats.extent());
+    mint_full_window(
+        &format!("{op_name}: operand '{}'", in_.name()),
+        in_,
+        in_off as u64,
+        1,
+        run,
+        layout,
+    )
+    .unwrap_or_else(|e| panic!("assemble_restickify_kt_2d {op_name}: {e}"));
+    mint_full_window(
+        &format!("{op_name}: output '{}'", o.name()),
+        o,
+        out_off as u64,
+        1,
+        run,
+        layout,
+    )
+    .unwrap_or_else(|e| panic!("assemble_restickify_kt_2d {op_name}: {e}"));
 
     let op = restickify_kt_opspec_2d(
         slots.extent(),
         feats.extent(),
-        in_name,
-        o_name,
+        in_.name(),
+        o.name(),
         in_off,
         out_off,
     )
@@ -6238,16 +6095,40 @@ fn restickify_transpose_opspec_2d(
 
 /// [`restickify_transpose_opspec_2d`] assembled — the fallible form, because this is reached by a
 /// third-party KTIR producer that has its own op to blame (see [`try_assemble_transpose`]).
+///
+/// ⭐ MINTED, BOTH SIDES, at the whole-buffer window: the caller's own law refuses a windowed
+/// transpose (whole views, both sides — see `lower_ktir_to_superdsc::transpose`), so the flat
+/// `[1, rows·cols]` run at 0 IS the op's whole access, and the mint's question is whether each
+/// handle's declared buffer — and, when a layout is at hand, its PLACEMENT — actually holds that
+/// many elements. The placement half is the new fact: a view can be whole while the reservation
+/// behind its name is smaller ("512 reserved against 2048 declared"), which is a clean-bake
+/// overrun into the next tensor's bytes, and it refuses here instead.
 pub fn try_assemble_restickify_transpose_2d(
     op_name: &str,
     rows: u32,
     cols: u32,
-    in_name: &str,
-    o_name: &str,
+    in_: &Stk<RowBlockedTag>,
+    o: &Stk<RowBlockedTag>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp, String> {
-    let op = restickify_transpose_opspec_2d(rows, cols, in_name, o_name)?;
+    mint_full_window(
+        &format!("{op_name}: operand '{}'", in_.name()),
+        in_,
+        0,
+        rows,
+        cols,
+        layout,
+    )?;
+    mint_full_window(
+        &format!("{op_name}: output '{}'", o.name()),
+        o,
+        0,
+        cols,
+        rows,
+        layout,
+    )?;
+    let op = restickify_transpose_opspec_2d(rows, cols, in_.name(), o.name())?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
 }
@@ -6260,105 +6141,9 @@ pub fn try_assemble_restickify_transpose_2d(
 // record (the same-dim "silent" control refusing at `ddl_conversion.cpp:2539`, the
 // two-distinct-stick-dims law the restackify DDL demands) survives in this file's
 // history.
-
-/// PATH B (V side): a RANK-2 per-head restickify that RE-STICKS the natural V cache `[cap,hd]` (flat
-/// row-major, the on-card `[1,hd]`-per-slot write) into the hd-sticked `[cap,hd]` KERNEL the value bmm
-/// reads. UNLIKE K this is NOT a transpose — same dim order `[cap,hd]`, only the stick axis moves
-/// flat→hd (dim0→dim1). The value bmm `out_pre = probs[1,cap]·V[cap,hd] → [1,hd]` reads V as kernel
-/// `[k=cap, n=hd]` sticked on n=hd ⇒ device `[hd/64,cap,64]` = `vcache_write_offset`. Here:
-///   • INPUT  logical `[cap,hd]`, stick = `cap` (dim 0, NOT last) ⇒ device_size FLAT ⇒ reads V[slot][d]
-///     at `slot*hd+d` — EXACTLY the natural write (`dev_off([cap,hd],0,·)`).
-///   • OUTPUT logical `[cap,hd]`, stick = `hd` (dim 1 = LAST) ⇒ device_size `[hd/64,cap,64]` ⇒ writes
-///     V[slot][d] at `vcache_write_offset(slot,d)` = `dev_off([cap,hd],1,[slot,d])`, the value-bmm read.
-/// Proven by `restickify_v_opspec_realizes_contract{,_hd128}` (Kani) + the `pathb_v_*` chain.
-fn restickify_v_opspec_2d(
-    cap: u32,
-    hd: u32,
-    in_name: &str,
-    o_name: &str,
-    in_off: u32,
-    out_off: u32,
-) -> Result<OpSpec, String> {
-    let _cap_ext = StickExtent::<Fp16>::new(cap)?;
-    let _hd_ext = StickExtent::<Fp16>::new(hd)?;
-    let dims = vec![
-        ItDim {
-            name: "cap",
-            size: cap,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-        ItDim {
-            name: "hd",
-            size: hd,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-    ];
-    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores)?;
-    // INPUT: natural V view `[cap,hd]` sticked on `cap` (dim 0) ⇒ NOT (len==2 && stick_idx==1) ⇒ FLAT
-    // row-major `slot*hd+d` = the natural per-slot dense write.
-    let input = TensorArg::<2>::new(
-        true,
-        in_name.to_string(),
-        Role::Input,
-        [Scale::Active, Scale::Active],
-        plan.iter_syms(["cap", "hd"]),
-        ["cap", "hd"],
-        "cap",
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?
-    .with_offset(in_off);
-    // OUTPUT: value-bmm kernel view `[cap,hd]` sticked on `hd` (dim 1 = LAST) ⇒ device_size
-    // `[hd/64,cap,64]` = the exact hd-sticked layout the value bmm reads (vcache_write_offset).
-    let output = TensorArg::<2>::new(
-        false,
-        o_name.to_string(),
-        Role::Output,
-        [Scale::Active, Scale::Active],
-        plan.iter_syms(["cap", "hd"]),
-        ["cap", "hd"],
-        "hd",
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?
-    .with_offset(out_off);
-    Ok(OpSpec {
-        op: OpFunc::Restickify,
-        is_reduction: false,
-        iter: plan,
-        args: vec![AnyTensorArg::R2(input), AnyTensorArg::R2(output)],
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-        coordinate_mask: None,
-    })
-}
-
-/// Assemble ONE per-head V re-stickify (natural `[cap,hd]` → hd-sticked `[cap,hd]`). See
-/// [`restickify_v_opspec_2d`].
-#[allow(clippy::too_many_arguments)]
-pub fn assemble_restickify_v_2d(
-    op_name: &str,
-    cap: u32,
-    hd: u32,
-    in_name: &str,
-    in_off: u32,
-    o_name: &str,
-    out_off: u32,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> EmittedOp {
-    let op = restickify_v_opspec_2d(cap, hd, in_name, o_name, in_off, out_off)
-        .unwrap_or_else(|e| panic!("assemble_restickify_v_2d {op_name}: {e}"));
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_restickify_v_2d {op_name}: {e}"))
-}
+//
+// The V-side re-stick (`restickify_v_opspec_2d`/`assemble_restickify_v_2d`, "PATH B") is deleted
+// with them — see the tombstone at the 3-D family above.
 
 /// The SFP transcendentals that CRASH the dxp compile at multi-stick width with an out-broadcast
 /// operand — see the guard in `assemble_pointwise_broadcast_off`, which explains the geometry and cites
