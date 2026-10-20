@@ -1373,12 +1373,12 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         one_request: one_request_decode,
     } = rung;
     let _pc = crate::pc::Pc::start("producer");
-    // ⛔⭐ THE ADDRESSING LOCKDOWN RUNS FIRST — the same graph-half sweep
-    // `lower_graph_to_ktir` states for the unrolled walk, run here for the tape's
-    // re-rolled one: the whole graph's index→address compositions proven BEFORE the
-    // segment walk mints a program. One implementation (the splice's `addressing`
-    // module), two bake heads.
-    scratchy_triton_splice::addressing::verify_addressing(ir).map_err(SuperDscError)?;
+    // ⛔ THE ADDRESSING LOCKDOWN IS DELETED WITH ITS SUBJECT. The graph-half sweep
+    // (`splice::addressing::verify_addressing`) enumerated the MoE per-op door's index mints
+    // (`RouteTopK` → `expert_matmul` → the expert bank) and proved each composition against the
+    // bank's budget; #716 deleted that lowering and the pass with it. The proof obligation is not
+    // forgiven — it returns stated against whatever KTIR op regrows the routing, at that op's own
+    // door, not as a sweep over a deleted class table.
     // ⛔ THE `set_rows_are_requests` / `RestoreRar` DANCE IS DELETED. It pushed the row KIND into a
     // thread-local for the duration of one bundle's lowering, with a `Drop` guard to restore it, purely
     // so the matmul splitter would not need the fact in its signature. That made the kind ambient: no
