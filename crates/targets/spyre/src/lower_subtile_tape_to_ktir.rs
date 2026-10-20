@@ -1222,8 +1222,10 @@ pub fn graph_bundle_layout<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
     rows_are_requests: bool,
+    active_cap: ActiveCap,
 ) -> Result<BundleLayout, SuperDscError> {
-    let mut bundle_layout = compute_bundle_layout(ir, weight_ids, rows_are_requests, &[])?;
+    let mut bundle_layout =
+        compute_bundle_layout(ir, weight_ids, rows_are_requests, active_cap, &[])?;
     let kernel0 = collect_kernel0(ir)?;
     stage_kernel_weight_census(
         ir,
@@ -1265,7 +1267,8 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // ([`graph_bundle_layout`]: placement pass + census), the same census the tape path
     // takes. No layer classes on this path, so there are no per-layer families for the
     // census to copy a weight's descriptor onto.
-    let bundle_layout = graph_bundle_layout(ir, weight_ids, rows_are_requests)?;
+    let bundle_layout =
+        graph_bundle_layout(ir, weight_ids, rows_are_requests, active_cap)?;
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(ir.nodes.len());
     // Collect EVERY distinct unhandled op kind (the full worklist) in one pass —
     // reconnaissance, not a silent skip: a non-empty set is a HARD error so a
@@ -1722,8 +1725,13 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // The layout's budget passes (spill/bank) take the per-loop maps directly: the spill reasons
     // over WHICH tids are per-layer at all (flattened internally), and the BANK needs the class
     // boundaries to know which (class, iteration) launches must stay in one bank.
-    let mut bundle_layout =
-        compute_bundle_layout(ir, weight_ids, rows_are_requests, &per_layer_ext)?;
+    let mut bundle_layout = compute_bundle_layout(
+        ir,
+        weight_ids,
+        rows_are_requests,
+        active_cap,
+        &per_layer_ext,
+    )?;
     // ── THE TAPE'S SEGMENTS: prefix, ONE RANGE PER LOOP (an attention class's body), suffix ──
     // The rolled tape is `prefix; [OpenLoop(body₀) CloseLoop]…[OpenLoop(bodyₙ) CloseLoop]; suffix`
     // — sibling loops, never nested (the TapeBuilder typestate forbids nesting). One `(range,
@@ -3438,6 +3446,7 @@ mod attn_scale_weight_fold_tests {
             &ir,
             &weight_ids,
             false,
+            crate::lower_subtile_tape_to_superdsc::ActiveCap::NONE,
             &[],
         )
         .expect("the same graph lays out");

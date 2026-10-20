@@ -464,7 +464,7 @@ fn the_headmajor_oproj_handoff_runs_the_whole_walk() {
     // bundle's row count, because every bundle of a model shares ONE staged weight
     // segment. (The empty class slice is the unbanked mint — no layer structure stated,
     // so no banking; the copies mint from the geometry alone.)
-    let layout_prefill = compute_bundle_layout(&rg, &weight_ids, false, &[])
+    let layout_prefill = compute_bundle_layout(&rg, &weight_ids, false, ActiveCap::NONE, &[])
         .expect("the mint runs for the prefill row kind");
     assert_eq!(
         layout_prefill.weight_copies,

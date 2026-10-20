@@ -1320,6 +1320,195 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 //    fact, not an inferred one).
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
+/// ⭐⭐⭐ THE ATTENTION ARM, STATED ONCE — the one derivation of the arm selection and its
+/// extents, shared by the splice (which mints the program those extents describe) and the
+/// spyre placement pass (which sizes the mask binding's bytes from the same statement, so
+/// the reservation cannot disagree with the shape: there is only one of it).
+///
+/// The arm is a fact of the NODE (its row count, its producer, its cache tensor's rows)
+/// and of the RUNG (`active_cap`) — never of the caller — which is why the derivation
+/// takes exactly those and nothing else. Every field is the one `lower_attn` reads below;
+/// moving the code here changed no law.
+pub struct AttnArm {
+    /// The swept extent — `ActiveCap::resolve` over the cache tensor's rows.
+    pub swept: u32,
+    /// The chunk's query rows: 1 = decode, >1 = a prompt chunk.
+    pub mq: u32,
+    /// The prefix segment's own row extent (`KtirSeg`'s law, not the rung's).
+    pub prefix_len: u32,
+    /// The pre-populated prefix's region corner; 0 for a masked prefix.
+    pub kc_row: u32,
+    /// The new block's row count.
+    pub new_len: u32,
+    /// The new block's Kᵀ scratch row extent — the stick cover under `PaddedMq`.
+    pub ktn_rows: u32,
+    /// The device width the producing proj matmul writes.
+    pub ktn_w: u32,
+    /// A runtime length mask is in effect (a live masked prefix).
+    pub mask_eff: bool,
+    /// The additive `[mq, ktn_rows]` causal triangle replaces the per-row slice.
+    pub one_pass: bool,
+    /// `attn.py`'s `_attn_cont_head` — causality rides the mask.
+    pub continuation: bool,
+    /// A mask parameter is bound at all (the maskless shape truncates it away).
+    pub has_mask: bool,
+}
+
+impl AttnArm {
+    /// Derive the arm exactly as `lower_attn` does. Every refusal below is the splice's
+    /// own, moved verbatim — a bundle whose attention does not arm cleanly fails here
+    /// whether the splice or the placement asks first, with the same message.
+    pub fn of<F: scratchy_subtile::subtile_ir::RopeForm>(
+        node: &SubtileNode<F>,
+        ir: &SubtileIR<F>,
+        active_cap: ktir_superdsc::ktir_node::ActiveCap,
+        rows_are_requests: bool,
+    ) -> Result<AttnArm, String> {
+        let SubOp::AttnDecode { .. } = &node.op else {
+            return Err(
+                "triton splice: the arm was asked of a node that is not an AttnDecode".to_string(),
+            );
+        };
+        if node.inputs.len() < 5 {
+            return Err(format!(
+                "triton splice: AttnDecode t{} expects 5 inputs [q, prefix_k, prefix_v, new_k, \
+                 new_v], found {}",
+                node.output.tensor.index(),
+                node.inputs.len()
+            ));
+        }
+        let stick = ktir_superdsc::sdsc_abstract::POOL_STICK; // 64 — the rung alignment law
+        // The cache tensor's own row count — `lower_attn`'s caller passes exactly this
+        // read as `cap` (`ir.tensors[kv.cache_tensor().rows`), so the arm derives it
+        // itself and the two spellings cannot drift.
+        let cache_rows = match &node.op {
+            SubOp::AttnDecode { layout: kv, .. } => {
+                ir.tensors[kv.cache_tensor().index()].rows
+            }
+            _ => unreachable!("the AttnDecode arm was checked on entry"),
+        };
+        let swept = active_cap.resolve(cache_rows, stick);
+        let mq = node.output.region.rows.len;
+        // ⛔ THE PREFIX SEGMENT'S OWN LAW, `KtirSeg`'s and not the rung's: a MASKED prefix
+        // (this forward's own rope-append) is read from row 0 to the SWEPT extent — the
+        // rung, bounded by the cache TENSOR's own rows (`graph.shape(kr.tensor).rows`,
+        // NOT the region's: `lower_region` slices a rope-append prefix's region to
+        // `valid_len - 1` rows while the builder's tile sweeps the rung and lets the
+        // runtime length mask bound it); a PRE-POPULATED one (the emulator's host-threaded
+        // cache) is read at its own region rows and corner. The door reads this extent
+        // back off the program (`param_read_rows`), so the spliced tile must state exactly
+        // the region's own rows there.
+        let mask_prefix = matches!(
+            &node.op,
+            SubOp::AttnDecode {
+                producer: scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
+                ..
+            }
+        );
+        let (prefix_len, kc_row) = if mask_prefix {
+            (swept.min(cache_rows), 0)
+        } else {
+            (
+                node.inputs[1].region.rows.len,
+                node.inputs[1].region.rows.start,
+            )
+        };
+        // `KtirFunc::attn`'s zero-length segment law: a dead prefix (prefix_len == 0) keeps
+        // its VIEW (injected below) and drops its compute, AND CLEARS `mask_prefix` — with no
+        // prefix segment there is nothing the runtime length mask could bound. That clearing
+        // is what makes a no-prefix prompt chunk take the causal ONE-PASS arm.
+        let mask_eff = mask_prefix && prefix_len > 0;
+        let new_len = node.inputs[3].region.rows.len;
+        // ⭐ THE NEW BLOCK'S Kᵀ SCRATCH EXTENTS — the restickify's, and the attention's
+        // `desc_ktn` view's. `ktn_rows` is the stick cover of the new block's row count
+        // under the SAME `PaddedMq` law the placement sizes the staging tensor at (`new_k`
+        // is re-placed `[mq_pad, device cols]` so a padded read never aliases the next
+        // tensor — the placement's own comment), and `ktn_w` is the DEVICE width the
+        // producing proj matmul writes (`DeviceWidth::for_pointwise`, the placement's own
+        // width law). Both are whole sticks by construction, which the transpose door's
+        // stick law demands: a sub-stick extent is refused by the dxp scheduler, and the
+        // on-card ReStickify that was asked for one anyway wrote the second transposed
+        // stick wrong and garbled decode.
+        let ktn_rows = ktir_superdsc::sdsc_abstract::PaddedMq::of_bundle(new_len, rows_are_requests)
+            .ok_or_else(|| {
+                format!(
+                    "triton splice: AttnDecode t{}: a {new_len}-row new block at \
+                     rows_are_requests={rows_are_requests} — not a width the pad law bakes, so \
+                     the new-block Kᵀ scratch has no placeable stick cover",
+                    node.output.tensor.index()
+                )
+            })?
+            .pad()
+            .rows()
+            .row_axis_extent();
+        let nkvh = match &node.op {
+            SubOp::AttnDecode { geom, .. } => geom.nkvh().get(),
+            _ => unreachable!("the AttnDecode arm was checked on entry"),
+        };
+        let hd = match &node.op {
+            SubOp::AttnDecode { geom, .. } => geom.hd().get(),
+            _ => unreachable!("the AttnDecode arm was checked on entry"),
+        };
+        let ktn_w = ktir_superdsc::work::DeviceWidth::for_pointwise(nkvh * hd).get();
+        // The builder's own one-pass arm condition, verbatim: ONE LIVE SEGMENT (the dead
+        // prefix leaves exactly the new block), mq > 1, no runtime length mask, and the new
+        // block spanning the whole chunk (`seq_len == mq`) — the additive `[mq, mq]` causal
+        // triangle can then replace the per-row slice. (A temporary `mq >= 8` floor sat
+        // here to satisfy the front end's since-removed TMA 16-byte check — a GPU law the
+        // Spyre target does not have; with the check gone the builder's own condition
+        // stands again, and the ladder's bottom rung takes the one-pass arm like main.)
+        let one_pass = !mask_eff && prefix_len == 0 && new_len == mq && mq > 1;
+        // Every other multi-row shape is the whole-chunk continuation (`attn.py`'s
+        // `_attn_cont_head`), which states its causality in the mask rather than in per-row
+        // tile extents — so it always binds one.
+        let continuation = mq > 1 && !one_pass;
+        if continuation && (prefix_len == 0 || new_len < mq) {
+            return Err(format!(
+                "triton splice: AttnDecode t{}: a {mq}-row attention with a {prefix_len}-row prefix and \
+                 a {new_len}-row new block — the whole-chunk continuation needs a live prefix and a new \
+                 block covering every row, and a dead prefix with a full new block is the one-pass arm",
+                node.output.tensor.index()
+            ));
+        }
+        // THE MASK IS BOUND WHEN A SEGMENT CONSUMES IT — the runtime length mask (decode,
+        // `[1, prefix_len]`), the causal triangle (the one-pass, `[mq, mq]`), or the
+        // continuation's `[mq, prefix_len + mq]` prefix-plus-new-block mask.
+        let has_mask = mask_eff || one_pass || continuation;
+        Ok(AttnArm {
+            swept,
+            mq,
+            prefix_len,
+            kc_row,
+            new_len,
+            ktn_rows,
+            ktn_w,
+            mask_eff,
+            one_pass,
+            continuation,
+            has_mask,
+        })
+    }
+
+    /// The mask binding's DECLARED VIEW — `(rows, cols)` of the additive mask tile the
+    /// program's `desc_mask` states: the decode runtime length mask `[1, SWEPT]`, the
+    /// one-pass causal triangle `[MQ, KTN_ROWS]`, the continuation's
+    /// `[MQ, SWEPT + KTN_ROWS]` prefix-plus-new-block mask. `None` when the arm binds no
+    /// mask (the maskless shape truncates the parameter away, so no bytes are read and
+    /// none need placing).
+    pub fn mask_view(&self) -> Option<(u32, u32)> {
+        if !self.has_mask {
+            return None;
+        }
+        if self.one_pass {
+            Some((self.mq, self.ktn_rows))
+        } else if self.continuation {
+            Some((self.mq, self.swept + self.ktn_rows))
+        } else {
+            Some((1, self.swept))
+        }
+    }
+}
+
 /// THE ATTENTION SPLICE — compile `attn.py` for this node's geometry and swept rung, and
 /// mint the `Program::Attn` `KtirNode` with the door's own parameter order, PRECEDED by
 /// the new-block Kᵀ restickify (`restickify.py`) that writes the plain-B scratch the
@@ -1365,90 +1554,24 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         ));
     }
     let (nqh, nkvh, hd) = (geom.nqh().get(), geom.nkvh().get(), geom.hd().get());
-    let stick = ktir_superdsc::sdsc_abstract::POOL_STICK; // 64 — the rung alignment law
-    let swept = active_cap.resolve(cap, stick);
-    let mq = node.output.region.rows.len;
     let gqa = geom.gqa().get();
-    // ⛔ THE PREFIX SEGMENT'S OWN LAW, `KtirSeg`'s and not the rung's: a MASKED prefix
-    // (this forward's own rope-append) is read from row 0 to the SWEPT extent — the
-    // rung, bounded by the cache TENSOR's own rows (`graph.shape(kr.tensor).rows`,
-    // NOT the region's: `lower_region` slices a rope-append prefix's region to
-    // `valid_len - 1` rows while the builder's tile sweeps the rung and lets the
-    // runtime length mask bound it); a PRE-POPULATED one (the emulator's host-threaded
-    // cache) is read at its own region rows and corner. The door reads this extent
-    // back off the program (`param_read_rows`), so the spliced tile must state exactly
-    // the builder's.
-    let mask_prefix = matches!(
-        &node.op,
-        SubOp::AttnDecode {
-            producer: scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
-            ..
-        }
-    );
-    // The cache tensor's own row count — the builder's bound (`swept.min` of exactly
-    // this), and the same reading `lower_one_node`'s walk used for `cap`.
-    let cache_rows = ir.tensors[node.inputs[1].tensor.index()].rows;
-    let (prefix_len, kc_row) = if mask_prefix {
-        (swept.min(cache_rows), 0)
-    } else {
-        (
-            node.inputs[1].region.rows.len,
-            node.inputs[1].region.rows.start,
-        )
-    };
-    // `KtirFunc::attn`'s zero-length segment law: a dead prefix (prefix_len == 0) keeps
-    // its VIEW (injected below) and drops its compute, AND CLEARS `mask_prefix` — with no
-    // prefix segment there is nothing the runtime length mask could bound. That clearing
-    // is what makes a no-prefix prompt chunk take the causal ONE-PASS arm.
-    let mask_eff = mask_prefix && prefix_len > 0;
-    let new_len = node.inputs[3].region.rows.len;
-    // ⭐ THE NEW BLOCK'S Kᵀ SCRATCH EXTENTS — the restickify's, and the attention's
-    // `desc_ktn` view's. `ktn_rows` is the stick cover of the new block's row count
-    // under the SAME `PaddedMq` law the placement sizes the staging tensor at (`new_k`
-    // is re-placed `[mq_pad, device cols]` so a padded read never aliases the next
-    // tensor — the placement's own comment), and `ktn_w` is the DEVICE width the
-    // producing proj matmul writes (`DeviceWidth::for_pointwise`, the placement's own
-    // width law). Both are whole sticks by construction, which the transpose door's
-    // stick law demands: a sub-stick extent is refused by the dxp scheduler, and the
-    // on-card ReStickify that was asked for one anyway wrote the second transposed
-    // stick wrong and garbled decode.
-    let ktn_rows = ktir_superdsc::sdsc_abstract::PaddedMq::of_bundle(new_len, rows_are_requests)
-        .ok_or_else(|| {
-            format!(
-                "triton splice: AttnDecode t{}: a {new_len}-row new block at \
-                     rows_are_requests={rows_are_requests} — not a width the pad law bakes, so \
-                     the new-block Kᵀ scratch has no placeable stick cover",
-                node.output.tensor.index()
-            )
-        })?
-        .pad()
-        .rows()
-        .row_axis_extent();
-    let ktn_w = ktir_superdsc::work::DeviceWidth::for_pointwise(nkvh * hd).get();
-    // The builder's own one-pass arm condition, verbatim: ONE LIVE SEGMENT (the dead
-    // prefix leaves exactly the new block), mq > 1, no runtime length mask, and the new
-    // block spanning the whole chunk (`seq_len == mq`) — the additive `[mq, mq]` causal
-    // triangle can then replace the per-row slice. (A temporary `mq >= 8` floor sat
-    // here to satisfy the front end's since-removed TMA 16-byte check — a GPU law the
-    // Spyre target does not have; with the check gone the builder's own condition
-    // stands again, and the ladder's bottom rung takes the one-pass arm like main.)
-    let one_pass = !mask_eff && prefix_len == 0 && new_len == mq && mq > 1;
-    // Every other multi-row shape is the whole-chunk continuation (`attn.py`'s
-    // `_attn_cont_head`), which states its causality in the mask rather than in per-row
-    // tile extents — so it always binds one.
-    let continuation = mq > 1 && !one_pass;
-    if continuation && (prefix_len == 0 || new_len < mq) {
-        return Err(format!(
-            "triton splice: AttnDecode t{}: a {mq}-row attention with a {prefix_len}-row prefix and \
-             a {new_len}-row new block — the whole-chunk continuation needs a live prefix and a new \
-             block covering every row, and a dead prefix with a full new block is the one-pass arm",
-            node.output.tensor.index()
-        ));
-    }
-    // THE MASK IS BOUND WHEN A SEGMENT CONSUMES IT — the runtime length mask (decode,
-    // `[1, prefix_len]`), the causal triangle (the one-pass, `[mq, mq]`), or the
-    // continuation's `[mq, prefix_len + mq]` prefix-plus-new-block mask.
-    let has_mask = mask_eff || one_pass || continuation;
+    // ⭐ THE ARM, FROM THE ONE DERIVATION — every extent below reads off [`AttnArm::of`],
+    // the same statement the placement pass sizes the mask binding's bytes from.
+    let arm = AttnArm::of(node, ir, active_cap, rows_are_requests)?;
+    let AttnArm {
+        swept: _,
+        mq,
+        prefix_len,
+        kc_row,
+        new_len,
+        ktn_rows,
+        ktn_w,
+        mask_eff: _,
+        one_pass,
+        continuation: _,
+        has_mask,
+    } = arm;
+    let _ = (nqh, gqa);
     // The scale, stated as the kernel's own constexpr so the program's `qk * SCALE` mulf
     // carries exactly the value `program_score_scale` reads back — the door resolves the
     // registry slot FROM that value, so the program and `scalarmul_scales` cannot disagree.

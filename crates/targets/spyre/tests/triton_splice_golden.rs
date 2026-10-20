@@ -30,7 +30,7 @@ use scratchy_subtile::subtile_ir::{
 };
 use scratchy_target_spyre::ktir_superdsc_door::lower as door_lower;
 use scratchy_target_spyre::lower_subtile_tape_to_ktir::graph_bundle_layout;
-use scratchy_target_spyre::lower_subtile_tape_to_superdsc::compute_bundle_layout;
+use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{ActiveCap, compute_bundle_layout};
 
 /// The rmsnorm shapes that matter for the delivery scope: granite 3.2/3.3 at 2b and 8b
 /// both normalize at hidden 2048 (2b) and 4096 (8b), decode rows 1 and a prefill rung's
@@ -57,7 +57,7 @@ fn spliced_rmsnorm_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, ActiveCap::NONE, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles the kernel for this node. Every width is
@@ -107,7 +107,7 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
         // collected the convention's own 1.0 alongside the epsilon, or the door's
         // slot lookup fails as a registry desync (the test's own control on the
         // wiring, not an assertion here: the door refuses below).
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, ActiveCap::NONE, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
         assert!(
             layout
@@ -172,7 +172,7 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
         // push is gated on the node's own convention, so a Scale-only model's
         // registry is byte-identical to the form before the row existed.
         let scale_ir = rmsnorm_ir(m, c, GainConvention::Scale);
-        let scale_layout = compute_bundle_layout(&scale_ir, &weight_ids, false, &[])
+        let scale_layout = compute_bundle_layout(&scale_ir, &weight_ids, false, ActiveCap::NONE, &[])
             .unwrap_or_else(|e| panic!("scale layout minted m={m} c={c}: {e}"));
         assert!(
             !scale_layout
@@ -229,7 +229,7 @@ fn spliced_silumul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, ActiveCap::NONE, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles the kernel for this node, at EVERY rung: a
@@ -315,7 +315,7 @@ fn a_column_chunked_silumul_splices_through_the_door() {
     chunked.nodes[0].output = window(2);
 
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-    let layout = compute_bundle_layout(&chunked, &weight_ids, false, &[])
+    let layout = compute_bundle_layout(&chunked, &weight_ids, false, ActiveCap::NONE, &[])
         .unwrap_or_else(|e| panic!("layout minted for the chunked node: {e}"));
 
     // The splice — the chunked node compiles (the kernels state `C_START`).
@@ -400,7 +400,7 @@ fn spliced_elementwise_lowers_through_the_door() {
             let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
             // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
+            let layout = compute_bundle_layout(&ir, &weight_ids, false, ActiveCap::NONE, &[])
                 .unwrap_or_else(|e| panic!("layout minted {kind:?} m={m} c={c}: {e}"));
 
             // The splice — the row compiles the kernel for this node at every
@@ -504,7 +504,7 @@ fn spliced_dense_matmul_lowers_through_the_door() {
         // The layout the walk computes for this graph (`rows_are_requests: true` is the
         // decode/batched shape) — the walk's OWN minting (placement pass + staging census,
         // [`graph_bundle_layout`]), so the door's transpose-B acceptance sees the census.
-        let layout = graph_bundle_layout(&ir, &weight_ids, true)
+        let layout = graph_bundle_layout(&ir, &weight_ids, true, ActiveCap::NONE)
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
         // The splice — the row compiles the kernel for this node.
@@ -847,7 +847,7 @@ fn spliced_scalarmul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, ActiveCap::NONE, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles `scalarmul.py` for this node.
@@ -896,7 +896,7 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
     let scale = 0.022_097_087f32;
     let ir = scalarmul_ir(1, LOGITS_COLS, scale);
     let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
-    let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
+    let layout = compute_bundle_layout(&ir, &weight_ids, false, ActiveCap::NONE, &[])
         .unwrap_or_else(|e| panic!("layout minted for the chunked logits: {e}"));
 
     // ONE symbol counter across the bundle, the way the bake threads it — chunk k's
@@ -1166,7 +1166,7 @@ fn batched_decode_odd_vocab_lm_head_splices() {
     // The walk's OWN minting (placement pass + staging census, [`graph_bundle_layout`]) —
     // the door's transpose-B acceptance reads the census, so a placement-only layout
     // would refuse the lm_head weight.
-    let layout = graph_bundle_layout(&ir, &weight_ids, true)
+    let layout = graph_bundle_layout(&ir, &weight_ids, true, ActiveCap::NONE)
         .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
     // The splice — the odd vocab must compile at ANY row count (PlanCorelets'
@@ -1217,7 +1217,7 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
         // The walk's OWN minting (placement pass + staging census) — the door's
         // transpose-B acceptance reads the census.
-        let layout = graph_bundle_layout(&ir, &weight_ids, false)
+        let layout = graph_bundle_layout(&ir, &weight_ids, false, ActiveCap::NONE)
             .unwrap_or_else(|e| panic!("layout minted mq={mq} k={k} n={n}: {e}"));
 
         // The splice — `lower_all` takes the fold route for this shape.
@@ -1280,7 +1280,7 @@ fn spliced_fp8_matmul_lowers_through_the_door() {
 
         // The walk's OWN minting (placement pass + staging census) — the door's
         // transpose-B acceptance reads the census.
-        let layout = graph_bundle_layout(&ir, &weight_ids, true)
+        let layout = graph_bundle_layout(&ir, &weight_ids, true, ActiveCap::NONE)
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
         // The splice — the Fp8Dynamic row compiles the kernel for this node.
@@ -1559,7 +1559,7 @@ fn spliced_rope_lowers_through_the_door() {
             let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
 
             // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout(&ir, &weight_ids, rows_are_requests, &[])
+            let layout = compute_bundle_layout(&ir, &weight_ids, rows_are_requests, ActiveCap::NONE, &[])
                 .unwrap_or_else(|e| {
                     panic!(
                         "layout minted mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}: {e}"

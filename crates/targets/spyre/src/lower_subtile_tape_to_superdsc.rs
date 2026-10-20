@@ -696,6 +696,12 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // and so does the attention pad's door: a decode width must be a baked ladder rung
     // (`PaddedMq::of_bundle`), which is the `Err` this returns.
     rows_are_requests: bool,
+    // ⭐ THE SWEPT RUNG THE BUNDLE WAS BAKED FOR — the one bundle fact the mask binding's
+    // placement needs beside the graph's own: the score mask's declared view is
+    // `[mq, swept + ktn_rows]` at the continuation, and `swept` is `active_cap.resolve` over
+    // the cache tensor's rows (the same read the splice's arm derivation makes — see the
+    // mask placement below).
+    active_cap: ActiveCap,
     // ⭐ THE LAYER STRUCTURE, so the weight segment can be split into BANKS at a LAYER boundary —
     // see [`bank_weight_segment`]. ONE MAP PER ATTENTION CLASS (a hybrid model's classes have
     // different layer counts, and banking needs the class boundaries), from
@@ -1647,28 +1653,83 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 );
                 // ⭐⭐⭐⭐⭐ THE PROGRAM'S OWN NAME FOR THE MASK BUFFER — the whole-function door's
                 // mask operand. The splice binds the attention's mask parameter at the graph's
-                // NEXT-FREE tid (`mint_attn`'s law: `ir.tensors.len()`), while every runtime
-                // consumer names the same bytes by the reserved const just placed. One buffer,
-                // two names, and the layout is where names meet bytes: the door resolves a
-                // parameter by its BINDING tid, so the program's mask load reaches these bytes
-                // through this second entry — the same placement-alias law the scalarmul fold's
-                // output uses above (`TensorPlacement { tid, ..p }`, a reader pointed at the
-                // producer's bytes). The bytes are SHARED, not duplicated: `seg_bytes` does not
-                // advance, and the address audit judges overlaps for synthetics only, by design.
+                // NEXT-FREE tid (`mint_attn`'s law: `ir.tensors.len()`), and the layout is where
+                // that name meets bytes. WHICH bytes is the ARM's question, and the arm has
+                // exactly two answers:
+                //
+                // * A PROMPT CHUNK (mq > 1) binds its SCORE mask — the additive causal tile the
+                //   program's own `desc_mask` declares: `[mq, ktn_rows]` at the one-pass,
+                //   `[mq, swept + ktn_rows]` at the continuation. Those bytes are the chunk's
+                //   own, so the binding gets its OWN placement sized from the program's
+                //   DECLARED view — the same authority as every other tensor, stated once in
+                //   the splice's `AttnArm::mask_view` and read here, so the reservation cannot
+                //   disagree with the shape: there is only one of it. (It used to be aliased
+                //   onto the validity reservation below — two different tensors' shapes fused
+                //   into one footprint, which is what the width-512 prefix rung's
+                //   `add_o1137: end 786432B vs footprint 279552B` refusal and the plain rung's
+                //   silently capped `[512,256]` mask add both were. The alias is deleted.)
+                // * A DECODE bundle (mq == 1) binds the RUNTIME LENGTH MASK — the same
+                //   validity bytes the host stages into `ATTN_MASK_TID` every step (the
+                //   `PrefixMask` forward step, `pmask_slots`' whole-page law), whose
+                //   `[1, swept]` per-forward view the broadcast reservation covers at every
+                //   rung. One buffer, two names, and the bytes are SHARED, not duplicated:
+                //   `seg_bytes` does not advance, and the address audit judges overlaps for
+                //   synthetics only, by design.
+                //
                 // The door's own no-lazy-allocation refusal is the drift detector between the
                 // two statements of the mint law: if the splice ever numbers the mask elsewhere,
                 // the bound tid stops matching any placement and the bake names `t{…}` at the
                 // door instead of serving a tensor nobody placed.
                 let mask_binding = ir.tensors.len() as u32;
-                let pmask_place = placements[&ATTN_MASK_TID];
-                placements.insert(
-                    mask_binding,
-                    TensorPlacement {
-                        tid: mask_binding,
-                        ..pmask_place
-                    },
-                );
+                let prompt_chunk = ir.nodes.iter().any(|n| {
+                    matches!(&n.op, SubOp::AttnDecode { .. })
+                        && n.output.region.rows.len > 1
+                });
+                // Past the validity reservation — the score mask's bytes are its own.
                 seg_bytes[mseg] = align128(pmoff + pmbytes);
+                if prompt_chunk {
+                    // The widest view the bundle's attention arms declare — one rung bakes one
+                    // arm, but a class-split roll states several, and the shared binding tid
+                    // must hold them all.
+                    let mut mbytes: u64 = 0;
+                    for an in &ir.nodes {
+                        if matches!(&an.op, SubOp::AttnDecode { .. }) {
+                            let arm = scratchy_triton_splice::AttnArm::of(
+                                an,
+                                ir,
+                                active_cap,
+                                rows_are_requests,
+                            )
+                            .map_err(SuperDscError)?;
+                            if let Some((rows, cols)) = arm.mask_view() {
+                                mbytes = mbytes
+                                    .max(u64::from(rows) * u64::from(cols) * 2);
+                            }
+                        }
+                    }
+                    let moff = seg_bytes[mseg];
+                    placements.insert(
+                        mask_binding,
+                        TensorPlacement {
+                            tid: mask_binding,
+                            bank: 0,
+                            role: SegRole::Activation,
+                            segment: mseg,
+                            offset: moff,
+                            size: mbytes,
+                        },
+                    );
+                    seg_bytes[mseg] = align128(moff + mbytes);
+                } else {
+                    let pmask_place = placements[&ATTN_MASK_TID];
+                    placements.insert(
+                        mask_binding,
+                        TensorPlacement {
+                            tid: mask_binding,
+                            ..pmask_place
+                        },
+                    );
+                }
                 let a = SegRole::Activation.segment();
                 let cmoff = seg_bytes[a];
                 // The mask is `[nqh·mq, mq_pad]`: `mq_pad` is its COLUMN count, the score width —
@@ -7876,7 +7937,7 @@ mod tests {
             op_output: Vec::new(),
         };
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, ActiveCap::NONE, &[])
             .expect("a layout for a plain matmul bundle");
 
         // ⭐ ROLES AND PACKING, ASSERTED AS THE RULES — not as magic numbers. This test pinned
@@ -8246,7 +8307,7 @@ mod tests {
         let (node, ir) = build(mq);
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
         let layout =
-            compute_bundle_layout(&ir, &weight_ids, false, &[]).expect("the tail's layout mints");
+            compute_bundle_layout(&ir, &weight_ids, false, ActiveCap::NONE, &[]).expect("the tail's layout mints");
         let mut programs = scratchy_triton_splice::lower_all(&node, &ir, false)
             .expect("the splice's fold mints the tail");
         let extract = programs
@@ -8324,7 +8385,7 @@ mod tests {
         // bytes the matmul's tile read addresses (the refusal's access side).
         let ir = build(GemmWeight::Fp8Dynamic);
         let layout =
-            compute_bundle_layout(&ir, &weight_ids, false, &[]).expect("the fp8 layout mints");
+            compute_bundle_layout(&ir, &weight_ids, false, ActiveCap::NONE, &[]).expect("the fp8 layout mints");
         let p = layout.placements.get(&1).expect("the fp8 weight is placed");
         assert_eq!(
             p.size, 6_127_616,
@@ -8333,7 +8394,7 @@ mod tests {
         // fp16 (arity-2), SAME shape: raw rows — 2112 = 33 whole fp16 sticks, no pad.
         let ir = build(GemmWeight::Dense);
         let layout =
-            compute_bundle_layout(&ir, &weight_ids, false, &[]).expect("the fp16 layout mints");
+            compute_bundle_layout(&ir, &weight_ids, false, ActiveCap::NONE, &[]).expect("the fp16 layout mints");
         let p = layout
             .placements
             .get(&1)
@@ -9046,7 +9107,7 @@ mod tests {
         let weight_ids: std::collections::HashSet<u32> = [0u32].into_iter().collect();
         // The budget pass refuses the same fixture the wiring accepts — on the UNROLLED graph,
         // with no layer classes, an over-cap weight segment is un-bankable and un-spillable.
-        let err = compute_bundle_layout(&ir, &weight_ids, false, &[])
+        let err = compute_bundle_layout(&ir, &weight_ids, false, ActiveCap::NONE, &[])
             .expect_err("the placement pass is the budget law and must refuse 32 GiB in seg1");
         assert!(
             err.0.contains("one device region can hold"),
