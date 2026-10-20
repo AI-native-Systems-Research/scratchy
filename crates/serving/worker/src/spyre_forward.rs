@@ -1801,7 +1801,11 @@ pub(crate) fn forward_chunk(
             // differ), the one fact that decomposes `kvw` into `(nkvh, hd)`.
             let hd = lw.head_dim;
             let nkvh = kvw / hd;
-            debug_assert_eq!(nkvh * hd, kvw, "the layer's kv width is its head count × head dim");
+            debug_assert_eq!(
+                nkvh * hd,
+                kvw,
+                "the layer's kv width is its head count × head dim"
+            );
             let plane_cols = nkvh * cap;
             let mut kt = vec![0.0f32; hd * plane_cols];
             for kvh in 0..nkvh {

@@ -949,13 +949,14 @@ pub(crate) fn tile_window_2d(op: &Operation<'_>) -> Option<(u32, u32)> {
         .find(|(k, _)| *k == AttrKey::CoordinateOrder)
         .map(|(_, v)| v);
     // Absent = identity, which is what an as-built tile carries: the value shape is the window.
-    let Some(order) = order else { return Some((r, c)) };
+    let Some(order) = order else {
+        return Some((r, c));
+    };
     let Attr::AffineMap(m) = order else {
         return None;
     };
     // Identity in any rank: value axis i IS view axis i.
-    if m
-        .exprs
+    if m.exprs
         .iter()
         .enumerate()
         .all(|(i, e)| matches!(e, AffineExpr::Dim(j) if *j == i))
@@ -4732,9 +4733,9 @@ mod elementwise_tests {
     #[test]
     fn a_dense_operand_beside_a_broadcast_carries_its_window() {
         let r = node(
-            reg(5, 1, 1, false), // w_d: the [1, 1] per-row scalar
+            reg(5, 1, 1, false),           // w_d: the [1, 1] per-row scalar
             win(6, 1, 512, 64, 64, false), // vd: head 1's [1, 64] at column 64 of [1, 512]
-            reg(7, 1, 64, true), // the minted [1, 64] intermediate, corner 0
+            reg(7, 1, 64, true),           // the minted [1, 64] intermediate, corner 0
         );
         let mut sym = 0i64;
         let ops = elementwise(
@@ -4746,7 +4747,11 @@ mod elementwise_tests {
             None,
         )
         .expect("the one-K mulf: a broadcast scalar times a windowed dense operand");
-        assert_eq!(ops.len(), 1, "an operand mode plus a window is not a decomposition");
+        assert_eq!(
+            ops.len(),
+            1,
+            "an operand mode plus a window is not a decomposition"
+        );
         assert_eq!(ops[0].op_name, "multiply_o7");
         let vd = ops[0]
             .arg_bindings

@@ -1170,7 +1170,10 @@ mod restickify_from_the_kernel {
         }
         let mut constexprs = std::collections::HashMap::new();
         for (k, v) in [("ROWS", Val::Int(64)), ("W", Val::Int(512))] {
-            signature.insert(k.to_string(), ArgSpec::parse("constexpr").expect("constexpr"));
+            signature.insert(
+                k.to_string(),
+                ArgSpec::parse("constexpr").expect("constexpr"),
+            );
             constexprs.insert(k.to_string(), v);
         }
         let file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1276,7 +1279,10 @@ mod one_k_window_from_the_fixture {
             ("V_COLS", Val::Int(512)),
             ("SWEPT", Val::Int(64)),
         ] {
-            signature.insert(k.to_string(), ArgSpec::parse("constexpr").expect("constexpr"));
+            signature.insert(
+                k.to_string(),
+                ArgSpec::parse("constexpr").expect("constexpr"),
+            );
             constexprs.insert(k.to_string(), v);
         }
         let file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -191,8 +191,7 @@ pub use ktir_superdsc::reserved_tids::{
     RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID,
     SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion,
     identity_class_tid, is_kernel_table_class_tid, kct_resident_tid, ktn_scratch_tid,
-    oproj_headmajor_tid, reserved_region, rope_p_class_hds, rope_p_class_tid,
-    scalarmul_scale_tid,
+    oproj_headmajor_tid, reserved_region, rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
 };
 
 // The rung facts the walk takes as one explicit struct — the `#[forward]` expansion
@@ -3993,7 +3992,10 @@ pub fn numeric_gate<F: RopeForm>(
     // demands.
     let mut kct_staged: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for n in &ir.nodes {
-        let SubOp::AttnDecode { geom, layout: kv, .. } = &n.op else {
+        let SubOp::AttnDecode {
+            geom, layout: kv, ..
+        } = &n.op
+        else {
             continue;
         };
         let k_id = kv.cache_tensor().index() as u32;
@@ -4003,7 +4005,11 @@ pub fn numeric_gate<F: RopeForm>(
         let (hd, nkvh) = (geom.hd().get() as usize, geom.nkvh().get() as usize);
         let t = ir.tensors[k_id as usize];
         let (cache_rows, kv_width) = (t.rows as usize, t.cols as usize);
-        debug_assert_eq!(kv_width, nkvh * hd, "the cache tensor's cols are the kv width");
+        debug_assert_eq!(
+            kv_width,
+            nkvh * hd,
+            "the cache tensor's cols are the kv width"
+        );
         let plane_cols = nkvh * cache_rows;
         let mut kt = vec![0.0f32; hd * plane_cols];
         for kvh in 0..nkvh {

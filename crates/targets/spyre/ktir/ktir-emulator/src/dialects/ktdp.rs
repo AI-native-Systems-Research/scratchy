@@ -578,7 +578,10 @@ mod tests {
         ctx.hbm
             .borrow_mut()
             .write_bytes(stick * crate::memref::STICK_BYTES, &payload);
-        ctx.set_value(ops.ssa("%p"), Value::Index(stick * crate::memref::STICK_BYTES / 4));
+        ctx.set_value(
+            ops.ssa("%p"),
+            Value::Index(stick * crate::memref::STICK_BYTES / 4),
+        );
         ctx.set_value(ops.ssa("%i"), Value::Index(0));
         ctx.set_value(ops.ssa("%j"), Value::Index(0));
         let view = build_f32_view(&mut ops, vec![4, 8], vec![8, 1]);

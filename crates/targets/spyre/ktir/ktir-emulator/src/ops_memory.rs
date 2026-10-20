@@ -208,7 +208,10 @@ fn enumerated_coords(access: &AccessTile) -> Option<Vec<Vec<i64>>> {
     if order_is_identity {
         return None;
     }
-    let order = access.coordinate_order.as_ref().expect("checked non-identity");
+    let order = access
+        .coordinate_order
+        .as_ref()
+        .expect("checked non-identity");
     let mut coords = Vec::new();
     rect_iter(&access.shape, &mut |pt| {
         coords.push(order.eval(pt, &[]));

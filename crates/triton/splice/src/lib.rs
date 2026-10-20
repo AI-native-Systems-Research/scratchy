@@ -1412,19 +1412,18 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // stick law demands: a sub-stick extent is refused by the dxp scheduler, and the
     // on-card ReStickify that was asked for one anyway wrote the second transposed
     // stick wrong and garbled decode.
-    let ktn_rows =
-        ktir_superdsc::sdsc_abstract::PaddedMq::of_bundle(new_len, rows_are_requests)
-            .ok_or_else(|| {
-                format!(
-                    "triton splice: AttnDecode t{}: a {new_len}-row new block at \
+    let ktn_rows = ktir_superdsc::sdsc_abstract::PaddedMq::of_bundle(new_len, rows_are_requests)
+        .ok_or_else(|| {
+            format!(
+                "triton splice: AttnDecode t{}: a {new_len}-row new block at \
                      rows_are_requests={rows_are_requests} — not a width the pad law bakes, so \
                      the new-block Kᵀ scratch has no placeable stick cover",
-                    node.output.tensor.index()
-                )
-            })?
-            .pad()
-            .rows()
-            .row_axis_extent();
+                node.output.tensor.index()
+            )
+        })?
+        .pad()
+        .rows()
+        .row_axis_extent();
     let ktn_w = ktir_superdsc::work::DeviceWidth::for_pointwise(nkvh * hd).get();
     // The builder's own one-pass arm condition, verbatim: ONE LIVE SEGMENT (the dead
     // prefix leaves exactly the new block), mq > 1, no runtime length mask, and the new
@@ -1472,19 +1471,18 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             one_pass,
         },
     )?;
-    // ⭐ THE GRID IS THE HEAD COUNT AT mq > 1 — the builder's own structure. `KtirFunc::attn`
-    // runs one head per program instance when `mq > 1` (`KtdpGetComputeTileId`, grid
-    // `(nq, 1)`), and the kernel states the same shape: `tl.program_id(0)` IS the head in
-    // its mq > 1 arms, so the grid folds the head axis and the program carries ONE head's
-    // body — 32x fewer ops per program than a static_range head loop unrolled into one
-    // grid-[1] program (granite: 32 query heads), which is the compile-time law the
-    // builder's form sets. Decode keeps grid [1] and the kernel's own static head loop,
-    // exactly the builder's `mq == 1` arm.
-    let grid: Vec<i64> = if mq > 1 {
-        vec![i64::from(nqh)]
-    } else {
-        vec![1]
-    };
+    // ⭐ THE GRID IS `[1]` AT EVERY MQ — the decode arm's own form. The builder's
+    // grid-`(nq, 1)` one-head-per-program split is defunct here, MEASURED: `to_ktir`'s
+    // clone protocol (`unroll_grid_positions`) fires on every mq>1 attention — the V
+    // corner `kvh*HD` is computed and feeds a matmul — and re-materializes every grid
+    // position as a body copy anyway (grid reset to `[1]`), so the split bought no op
+    // count; and its per-position corners walk the protocol's partition census, which
+    // re-partitioned the Kᵀ scratch's head-offset ROW corner into per-position POINTER
+    // ARGUMENTS (granite-2b mq=31: `attn_fwd` compiled to 35 parameters against the
+    // door's 7). The kernel's head loop is trace-time at every MQ (`tl.static_range`,
+    // constant corners per trip), so the launch is one program and the door's
+    // 7-binding contract holds.
+    let grid: Vec<i64> = vec![1];
     let positional = attn_positional(
         src,
         &spec,
@@ -1552,8 +1550,7 @@ fn mint_kt_restick<F: scratchy_subtile::subtile_ir::RopeForm>(
         signature,
         constexprs,
     };
-    let key =
-        memo_key(src, &spec, &[1]).map(|k| format!("{k}\0{program:?}\u{1}{rows}\u{1}{w}"));
+    let key = memo_key(src, &spec, &[1]).map(|k| format!("{k}\0{program:?}\u{1}{rows}\u{1}{w}"));
     let positional = NODES.get_or_compute(key, || {
         let module = compile_kernel(src, &spec, &[1])?;
         triton_ktir_superdsc::node_for(&module, program)
@@ -1812,10 +1809,7 @@ fn inject_dead_cache_views(
         vec![i64::from(hd), i64::from(nkvh * cap)],
         vec![i64::from(cap), i64::from(kv_width)],
     ];
-    let strides: [Vec<i64>; 2] = [
-        vec![i64::from(nkvh * cap), 1],
-        vec![i64::from(kv_width), 1],
-    ];
+    let strides: [Vec<i64>; 2] = [vec![i64::from(nkvh * cap), 1], vec![i64::from(kv_width), 1]];
     let range_set: [String; 2] = [
         format!(
             "(d0, d1) : (d0 >= 0, -d0 + {r} >= 0, d1 >= 0, -d1 + {c} >= 0)",
@@ -1863,7 +1857,10 @@ fn inject_dead_cache_views(
             .with_operands([ptr])
             .with_attr(AttrKey::Shape, Attr::IntList(dims[n].clone()))
             .with_attr(AttrKey::Strides, Attr::IntList(strides[n].clone()))
-            .with_attr(AttrKey::CoordinateSet, Attr::AffineSet(range_set[n].clone()))
+            .with_attr(
+                AttrKey::CoordinateSet,
+                Attr::AffineSet(range_set[n].clone()),
+            )
             .with_attr(AttrKey::MemorySpace, Attr::Str("HBM".into()));
         // Splice at the TOP of the body, in parameter order: a view is loop-invariant by
         // construction (its one operand is the base address), and `regions()` finds it by

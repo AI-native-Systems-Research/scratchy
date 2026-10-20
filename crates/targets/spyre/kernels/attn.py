@@ -36,13 +36,20 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   `[CAP, NKVH*HD]` / `[NEW_LEN, NKVH*HD]`; the mask is `[1, SWEPT]` (decode) or
   `[MQ, MQ]` (the causal one-pass). Every extent is a constexpr — one kernel per
   shape, the fixture's delta-7 law.
-* GRID: `[NQH]` at `MQ > 1`, `[1]` at decode — the builder's own head split: one
-  head per program instance (`KtdpGetComputeTileId`, grid `(nq, 1)`), the same
-  form every NQH-tile kernel in this tree follows. The head is `tl.program_id(0)`
-  in both mq > 1 arms; the trace unrolls ONE head's body (the row loop stays
-  trace-time because the per-row causal extent `qi + 1` is a constexpr only
-  inside it, rope.py's law). Decode keeps grid `[1]` and the trace-time head
-  loop — the builder loops all heads at mq == 1 too.
+* GRID: `[1]` at every shape — the head loop is TRACE-TIME (`tl.static_range`),
+  the decode arm's own form. The builder's grid-`(nq, 1)` one-head-per-program
+  split is DEFUNCT here, and MEASURED so: `to_ktir`'s clone protocol
+  (`unroll_grid_positions`) fires on every mq>1 attention — the V corner
+  `kvh*HD` is computed and feeds a matmul — and re-materializes every grid
+  position as a body copy anyway (the grid resets to `[1]`), so the split bought
+  no op count; and its per-position corners walk the protocol's partition
+  census, which re-partitioned the Kᵀ scratch's head-offset ROW corner into 28
+  per-position POINTER ARGUMENTS (MEASURED at granite-2b mq=31: `attn_fwd`
+  compiled to 35 parameters against the door's 7). The trace-time loop states
+  the same 32 head bodies with CONSTANT corners — the form the decode arm ships
+  and the door resolves window-by-window. The trace unrolls ONE head's body per
+  trip because the per-row causal extent `qi + 1` is a constexpr only inside it,
+  rope.py's law.
 * CONSTEXPRS: `NQH, NKVH, HD, GQA, MQ, CAP, SWEPT, SCALE` plus the segment
   corners (`KC_ROW/KC_COL/KD_ROW/KD_COL`), `NEW_LEN`, the new block's scratch
   extents (`KTN_ROWS` the stick cover, `KTN_W` the device width), `HAS_MASK`,
@@ -110,11 +117,12 @@ def _attn_one_pass_head(h, desc_q, desc_o, desc_ktn, desc_vd, desc_mask,  #
                         NEW_LEN: tl.constexpr, KTN_ROWS: tl.constexpr,  #
                         KTN_W: tl.constexpr, KD_ROW: tl.constexpr,  #
                         KD_COL: tl.constexpr, SCALE: tl.constexpr):
-    """One head's causal one-pass body — shared by the decode head loop and the
-    mq > 1 per-program head (the builder's `head_pid` form). Descriptors are
-    constructed HERE because guard-conditional names cannot be passed as arguments
-    (the actual argument evaluates at trace time), and the `[MQ, HD]`-block
-    descriptors are this arm's own (rope.py's second-descriptor law)."""
+    """One head's causal one-pass body — one trip of the trace-time head loop (and the
+    form the decode arm's own loop takes; `h` is a trace-time constant, so every
+    corner below is constant). Descriptors are constructed HERE because
+    guard-conditional names cannot be passed as arguments (the actual argument
+    evaluates at trace time), and the `[MQ, HD]`-block descriptors are this arm's
+    own (rope.py's second-descriptor law)."""
     q_width = NQH * HD
     kv_width = NKVH * HD
     o_wide = tl.make_tensor_descriptor(desc_o, shape=[MQ, q_width],
@@ -164,7 +172,9 @@ def _attn_cont_head(h, desc_q, desc_o, desc_kt, desc_vc, desc_ktn, desc_vd,  #
                     KD_ROW: tl.constexpr, KD_COL: tl.constexpr,  #
                     SCALE: tl.constexpr):
     """One head's continuation body, WHOLE-CHUNK: the resident prefix and the chunk's own
-    new block scored for all `MQ` rows at once, combined by one two-segment softmax.
+    new block scored for all `MQ` rows at once, combined by one two-segment softmax —
+    one trip of the trace-time head loop (`h` is a trace-time constant, so every
+    corner below is constant).
 
     ⛔ IT WAS A PER-ROW UNROLL, AND THAT WAS THE BAKE'S WIDEST COMPILE. The row loop was
     `tl.static_range(0, MQ)` with each row's own `[qi + 1, HD]` causal tiles, so the
@@ -308,22 +318,20 @@ def attn_fwd(desc_q, desc_o,  #
     # minimum width: the front end's TMA 16-byte floor was a GPU law this target
     # does not have, and it is gone — the ladder's bottom rung (MQ=7) takes this
     # arm exactly as the builder's did.
-    # ⭐ ONE HEAD PER PROGRAM at mq > 1 — the builder's own structure. `KtirFunc::attn`
-    # runs `KtdpGetComputeTileId` with grid `(nq, 1)` when mq > 1 (one head per core,
-    # `nh = 1` in its head loop), and loops all heads inside the program only at decode.
-    # The splice states the same shape: the program id IS the head, and the head loops
-    # below stay trace-time only where the builder keeps them (MQ == 1). This is the
-    # compile-time law, not a tuning choice: a static_range head loop unrolls NQH bodies
-    # into ONE grid-[1] program (granite: 32 heads = 32x the ops of the builder's form,
-    # and the ladder's passes each walk every op), while `program_id(0)` emits one body
-    # and lets the grid N-fold it.
-    pid = tl.program_id(0)
-    # ONE-PASS (the builder's own arm): the program id is the head directly. ONE_PASS
-    # implies MQ > 1 (the splice's condition), so this is always the per-program head.
+    # ⭐ THE HEAD LOOP IS TRACE-TIME at every MQ, the decode arm's own form. The
+    # builder's grid-`(nq, 1)` one-head-per-program split is defunct here, MEASURED:
+    # `to_ktir`'s clone protocol fires on every mq>1 attention (the V corner is
+    # computed and feeds a matmul) and re-materializes every grid position as a body
+    # copy anyway, so the split bought no op count — while its per-position corners
+    # walk the protocol's partition census, which re-partitioned the Kᵀ scratch's
+    # head-offset ROW corner into per-position POINTER ARGUMENTS (granite-2b mq=31:
+    # 35 parameters against the door's 7). The trace-time loop states the same 32
+    # head bodies with CONSTANT corners, `h` a trace-time constant per trip.
     if ONE_PASS:
-        _attn_one_pass_head(pid, desc_q, desc_o, desc_ktn, desc_vd, desc_mask,
-                            NQH, NKVH, HD, GQA, MQ, NEW_LEN, KTN_ROWS,
-                            KTN_W, KD_ROW, KD_COL, SCALE)
+        for h in tl.static_range(0, NQH, 1):
+            _attn_one_pass_head(h, desc_q, desc_o, desc_ktn, desc_vd, desc_mask,
+                                NQH, NKVH, HD, GQA, MQ, NEW_LEN, KTN_ROWS,
+                                KTN_W, KD_ROW, KD_COL, SCALE)
     elif MQ == 1:
         for h in tl.static_range(0, NQH, 1):
             kvh = h // GQA
@@ -372,11 +380,10 @@ def attn_fwd(desc_q, desc_o,  #
         # here only with a live prefix and its mask bound (`SWEPT > 0`, `HAS_MASK`); any
         # other `MQ > 1` shape is the one-pass arm or a refusal.
         #
-        # ⭐ THE HEAD AXIS IS THE PROGRAM ID — the builder's `head_pid` form: one
-        # head per program instance at mq > 1, so the op count is ONE head's body,
-        # not NQH heads' (granite: 32x fewer ops per program, which is the compile-time
-        # law this kernel follows). Decode keeps the static head loop — the builder loops
-        # all heads at mq == 1 too.
-        _attn_cont_head(pid, desc_q, desc_o, desc_kt, desc_vc, desc_ktn, desc_vd,
-                        desc_mask, NQH, NKVH, HD, GQA, MQ, SWEPT, CAP, NEW_LEN,
-                        KTN_ROWS, KTN_W, KC_ROW, KC_COL, KD_ROW, KD_COL, SCALE)
+        # ⭐ THE HEAD LOOP IS TRACE-TIME here too — one trip per head, `h` a trace-time
+        # constant, the decode arm's own form (see the one-pass arm's comment for the
+        # measured law that retired the grid-`(nq, 1)` per-program head).
+        for h in tl.static_range(0, NQH, 1):
+            _attn_cont_head(h, desc_q, desc_o, desc_kt, desc_vc, desc_ktn, desc_vd,
+                            desc_mask, NQH, NKVH, HD, GQA, MQ, SWEPT, CAP, NEW_LEN,
+                            KTN_ROWS, KTN_W, KC_ROW, KC_COL, KD_ROW, KD_COL, SCALE)

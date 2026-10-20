@@ -9155,8 +9155,9 @@ fn emit_superdsc_wiring(
                     new_k = node.args.get(i + 1).and_then(|x| {
                         let bound = *x as u32;
                         (0..gk.tensor_shapes.len() as u32).find(|&t| {
-                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ktn_scratch_tid(t)
-                                == bound
+                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ktn_scratch_tid(
+                                t,
+                            ) == bound
                         })
                     });
                 }

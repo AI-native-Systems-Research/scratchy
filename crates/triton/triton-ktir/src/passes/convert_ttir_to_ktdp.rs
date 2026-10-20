@@ -1015,10 +1015,7 @@ fn fold_trans_into_access_tile_order(module: &mut Module) {
             // points, and the load's data no longer fills its own shape. Rebuild it
             // as the full box over the new shape — the same statement the as-built
             // tile makes, restated in the space the folded tile now enumerates.
-            new_tile.set_attr(
-                AttrKey::AccessTileSet,
-                Attr::AffineSet(new_set),
-            );
+            new_tile.set_attr(AttrKey::AccessTileSet, Attr::AffineSet(new_set));
 
             let mut new_load = walk::at(module, &load_path).expect("load path").clone();
             new_load.results = trans.results.clone();
