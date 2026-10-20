@@ -1581,6 +1581,12 @@ fn mint_kt_restick<F: scratchy_subtile::subtile_ir::RopeForm>(
         bindings,
         mask: None,
         node_out_tid: None,
+        // The same empty replay record #730's sweep gave the other two mint sites — the
+        // restickify mint post-dates it and the rebase onto the bundle-unique mint left
+        // this literal behind. A fresh node carries no record: the layout's
+        // `take_inter_tid` mints clear of every placement, and the record fills in as
+        // the declare and real passes confirm the same names.
+        minted: Default::default(),
     });
     Ok(e)
 }
