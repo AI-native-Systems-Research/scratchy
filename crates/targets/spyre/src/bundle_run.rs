@@ -470,6 +470,10 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
             layout,
             groups: std::borrow::Cow::Owned(groups),
             reroll: None,
+            // A directory on disk carries no bake-declared mask view, and this runner stages no
+            // score mask — `None` states both, rather than guessing a shape for bytes no program
+            // here is known to read.
+            attn_mask: None,
         }));
 
     // ── Bind, prepare, launch ──

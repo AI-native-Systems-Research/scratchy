@@ -143,6 +143,10 @@ pub use ktir_superdsc::place::{PlaceId, SynthRole};
 /// The segment budget's verdict on the weight tail, declared beside the producer's layout for the
 /// same reason as [`PlaceId`]: both ends read the one type.
 pub use ktir_superdsc::placement::WeightTail;
+/// The attention score-mask binding [`BundleCode::attn_mask`] carries — re-exported for the same
+/// reason as [`PlaceId`]: the lowering that mints it and the runtime that stages its fill name one
+/// declaration.
+pub use ktir_superdsc::sdsc_abstract::MaskBinding;
 
 /// One tensor's baked placement inside its segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -634,6 +638,15 @@ pub struct BundleCode<'a> {
     pub groups: Cow<'a, [LaunchGroup<'a>]>,
     /// `Some` ⇒ this bundle is a re-rolled BODY (one layer).
     pub reroll: Option<RerollMeta<'a>>,
+    /// ⭐ THIS BUNDLE'S OWN ATTENTION SCORE-MASK BINDING — the synthetic mask's tensor id, the view
+    /// THIS bake declared for it, and the prefix capacity this bundle serves. The mask's tid is
+    /// minted per GRAPH, so every rung of a width ladder answers to the SAME id while declaring a
+    /// DIFFERENT view; the binding a launch must stage is therefore the one on the bundle that
+    /// launch RUNS — this field — never a family-level copy keyed by the tid alone. A rung's view
+    /// cannot reach another rung's launch through this object: it would have to be the same bundle.
+    ///
+    /// `None` ⇒ no op in this bundle reads a score mask.
+    pub attn_mask: Option<ktir_superdsc::sdsc_abstract::MaskBinding>,
 }
 
 impl<'a> BundleCode<'a> {
@@ -781,6 +794,7 @@ mod tests {
     fn a_launch_carries_its_own_program() {
         let code = BundleCode {
             fp: Cow::Borrowed("fp"),
+            attn_mask: None,
             layout: BundleLayout::default(),
             groups: Cow::Borrowed(&[
                 LaunchGroup {

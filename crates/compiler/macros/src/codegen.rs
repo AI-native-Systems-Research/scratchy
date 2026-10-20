@@ -8915,6 +8915,55 @@ fn superdsc_rotary_kind(
     }
 }
 
+/// ⭐ ONE RENDERER for an attention score-mask binding as literals — tid, the declared view's kind
+/// and extents, and the resident capacity — so the generated code holds the bake's typed statement
+/// and the staging's fill is shaped by a compile-time constant, never by a runtime value. Shared by
+/// the two baked homes of the binding: the graph-level `Wiring` (the family's uniformity fact) and
+/// each `BundleCode` (the per-rung fact the launch stages — the tid is shared across a width
+/// ladder's rungs while each rung's view is its own, so the two homes may differ in view and must
+/// never differ in renderer).
+#[cfg(feature = "spyre")]
+fn mask_binding_tokens(
+    m: Option<scratchy_target_spyre::wiring::MaskBinding>,
+) -> proc_macro2::TokenStream {
+    match m {
+        Some(m) => {
+            let u32l = proc_macro2::Literal::u32_unsuffixed;
+            let tid = u32l(m.tid);
+            let (mq, swept, ktn_rows, cap) = (
+                u32l(m.view.mq),
+                u32l(m.view.swept),
+                u32l(m.view.ktn_rows),
+                u32l(m.cap),
+            );
+            let kind = match m.view.kind {
+                scratchy_target_spyre::wiring::MaskArm::OnePass => {
+                    quote! { ::scratchy_target_spyre::wiring::MaskArm::OnePass }
+                }
+                scratchy_target_spyre::wiring::MaskArm::Continuation => {
+                    quote! { ::scratchy_target_spyre::wiring::MaskArm::Continuation }
+                }
+                scratchy_target_spyre::wiring::MaskArm::Decode => {
+                    quote! { ::scratchy_target_spyre::wiring::MaskArm::Decode }
+                }
+            };
+            quote! {
+                ::core::option::Option::Some(::scratchy_target_spyre::wiring::MaskBinding {
+                    tid: #tid,
+                    view: ::scratchy_target_spyre::wiring::MaskView {
+                        kind: #kind,
+                        mq: #mq,
+                        swept: #swept,
+                        ktn_rows: #ktn_rows,
+                    },
+                    cap: #cap,
+                })
+            }
+        }
+        None => quote! { ::core::option::Option::None },
+    }
+}
+
 #[cfg(feature = "spyre")]
 fn emit_superdsc_wiring(
     gk: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring,
@@ -9399,44 +9448,7 @@ fn emit_superdsc_wiring(
     let result = u32l(gk.result_tensor);
     let num_sources = u32l(gk.num_sources);
     let dp = u32l(decode_position);
-    let mask = match gk.attn_mask {
-        Some(m) => {
-            // ⭐ THE WHOLE BINDING AS LITERALS — tid, the declared view's kind and extents, and the
-            // resident capacity — so the generated code holds the bake's typed statement and the
-            // worker's fill is shaped by a compile-time constant, never by a runtime value.
-            let tid = u32l(m.tid);
-            let (mq, swept, ktn_rows, cap) = (
-                u32l(m.view.mq),
-                u32l(m.view.swept),
-                u32l(m.view.ktn_rows),
-                u32l(m.cap),
-            );
-            let kind = match m.view.kind {
-                scratchy_target_spyre::wiring::MaskArm::OnePass => {
-                    quote! { ::scratchy_target_spyre::wiring::MaskArm::OnePass }
-                }
-                scratchy_target_spyre::wiring::MaskArm::Continuation => {
-                    quote! { ::scratchy_target_spyre::wiring::MaskArm::Continuation }
-                }
-                scratchy_target_spyre::wiring::MaskArm::Decode => {
-                    quote! { ::scratchy_target_spyre::wiring::MaskArm::Decode }
-                }
-            };
-            quote! {
-                ::core::option::Option::Some(::scratchy_target_spyre::wiring::MaskBinding {
-                    tid: #tid,
-                    view: ::scratchy_target_spyre::wiring::MaskView {
-                        kind: #kind,
-                        mq: #mq,
-                        swept: #swept,
-                        ktn_rows: #ktn_rows,
-                    },
-                    cap: #cap,
-                })
-            }
-        }
-        None => quote! { ::core::option::Option::None },
-    };
+    let mask = mask_binding_tokens(gk.attn_mask);
 
     // ⭐ THE KERNEL-TABLE CLASS SETS, FROM THE BAKE — NOT THE TABLES THEMSELVES. The tables are
     // pure functions of each class's head dim, but baking them as literals was the gemma-4 defect
@@ -9649,6 +9661,10 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
             }
             None => quote! { ::core::option::Option::None },
         };
+        // ⭐ THE BUNDLE'S OWN MASK BINDING — rendered per bundle, because the tid is shared across a
+        // width ladder's rungs while each rung's view is its own: the launch stages THIS bundle's
+        // binding (the session reads it off the code it runs), never a family-level copy.
+        let mask = mask_binding_tokens(b.attn_mask);
         out.extend(quote! {
             ::scratchy_target_spyre::bundle_code::inventory::submit! {
                 ::scratchy_target_spyre::bundle_code::BundleCode {
@@ -9656,6 +9672,7 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
                     layout: #layout,
                     groups: ::std::borrow::Cow::Borrowed(&[#(#groups),*]),
                     reroll: #reroll,
+                    attn_mask: #mask,
                 }
             }
         });

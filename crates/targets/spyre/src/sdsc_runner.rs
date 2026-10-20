@@ -139,6 +139,12 @@ pub struct SuperDscSession {
     /// callers pair it with [`Self::pmask_slots`]: unpaged, the attention sweeps the whole `cap`, so a
     /// `cap` past the mask's placement is unservable and must be refused rather than staged either way.
     pub paged: bool,
+    /// ⭐ THIS SESSION'S OWN attention score-mask binding — the tid the graph minted, the view THIS
+    /// bundle's bake declared, the capacity this bundle serves. A session is built from ONE
+    /// `BundleCode`, so the binding a launch stages through this session is the launching bundle's
+    /// own by construction: a rung's view cannot reach another rung's launch, because it would have
+    /// to be the same session. `None` ⇒ no op in this bundle reads a score mask.
+    attn_mask: Option<crate::wiring::MaskBinding>,
 }
 
 impl SuperDscSession {
@@ -315,6 +321,7 @@ impl SuperDscSession {
             kv_dim: exec.kv_dim.0,
             pmask_slots: exec.pmask_slots(),
             paged: exec.is_paged(),
+            attn_mask: code.attn_mask,
             exec,
         })
     }
@@ -328,6 +335,14 @@ impl SuperDscSession {
     /// Whether this bundle's resident cache is PAGED.
     pub fn is_paged(&self) -> bool {
         self.page_slots > 0
+    }
+
+    /// ⭐ THE LAUNCHING BUNDLE'S OWN attention score-mask binding — what a fill staged into this
+    /// session must be shaped by. The session was built from ONE bundle, so this is per (bundle,
+    /// tid) by construction; staging at any other bundle's view is a bind the executor's placement
+    /// guard refuses, and this accessor is the one lawful way to avoid ever handing it one.
+    pub fn attn_mask(&self) -> Option<crate::wiring::MaskBinding> {
+        self.attn_mask
     }
 
     /// Positions a request can hold given the `pages` it was assigned.

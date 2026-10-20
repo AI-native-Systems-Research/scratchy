@@ -182,10 +182,14 @@ use crate::worker_factory::resolve_model_path;
 /// ONCE across both programs (decode + prefill share weight tensor ids).
 pub(crate) struct Parsed {
     pub(crate) embed_src: usize,
-    /// The attention length-mask source, when the wiring names one.
+    /// The attention length-mask source, when the wiring names one. EMULATOR-ONLY (see
+    /// [`crate::spyre_types::BundleMeta::attn_mask_src`]): populated from the bundle the program
+    /// RUNS, never from the family wiring.
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) attn_mask_src: Option<usize>,
     /// The mask's bake-declared view — `Some` exactly when `attn_mask_src` is (see
     /// `BundleMeta::mask_view`).
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) mask_view: Option<scratchy_subtile::sdsc_abstract::MaskView>,
     /// cos / sin runtime sources as `(source id, full column width, rotary class)`.
     /// GQA gives more than one width (Q vs K); a hybrid-attention arch (gemma-4)
@@ -279,8 +283,13 @@ pub(crate) fn wiring_to_parsed(
                     .flat_map(|l| [l.new_k as usize, l.new_v as usize]),
             )
             .collect(),
-        attn_mask_src: w.attn_mask.map(|m| m.tid as usize),
-        mask_view: w.attn_mask.map(|m| m.view),
+        // ⛔ NO MASK FIELDS HERE — the binding is captured from the BUNDLE the program runs (at the
+        // session build below, on the emulator), because the wiring's copy is the graph-level one:
+        // the tid is shared across a width ladder's rungs while each rung's view is its own.
+        #[cfg(not(feature = "spyre-hw"))]
+        attn_mask_src: None,
+        #[cfg(not(feature = "spyre-hw"))]
+        mask_view: None,
     })
 }
 
@@ -896,6 +905,34 @@ impl SpyreWorker {
                 None => None,
             };
             (d, p)
+        };
+        // ⭐ THE MASK BINDING, FROM THE BUNDLE EACH PROGRAM RUNS — one `bundle(fp)` lookup per
+        // phase, read for its `attn_mask` instead of its launches. One program, one bundle, one
+        // binding: the emulator's fill is shaped by the LAUNCHED bundle's own view, the same law
+        // the card's rung fill follows off its session — never a family-level wiring copy, whose
+        // view is the graph's ceiling while a rung's placement is its own. (Emulator-only: on the
+        // card the fields do not exist, so no family-level copy can be read there at all.)
+        #[cfg(not(feature = "spyre-hw"))]
+        let (dparsed_all, pparsed) = {
+            let mask_of = |fp: &str| {
+                scratchy_target_spyre::bundle_code::bundle(fp).and_then(|c| c.attn_mask)
+            };
+            let pparsed = pparsed.map(|mut p| {
+                let m = bundle.prefill.as_ref().and_then(|pb| mask_of(pb.fp));
+                p.attn_mask_src = m.map(|m| m.tid as usize);
+                p.mask_view = m.map(|m| m.view);
+                p
+            });
+            let decode_mask = mask_of(bundle.decode[0].fp);
+            let dparsed_all: Vec<Parsed> = dparsed_all
+                .into_iter()
+                .map(|mut p| {
+                    p.attn_mask_src = decode_mask.map(|m| m.tid as usize);
+                    p.mask_view = decode_mask.map(|m| m.view);
+                    p
+                })
+                .collect();
+            (dparsed_all, pparsed)
         };
         // Model-level dims are identical across cap buckets, so the first is the reference.
         let dparsed = &dparsed_all[0];
@@ -2673,7 +2710,9 @@ impl SpyreWorker {
              wiring: &'static scratchy_target_spyre::wiring::Wiring| BundleMeta {
                 #[cfg(not(feature = "spyre-hw"))]
                 prog,
+                #[cfg(not(feature = "spyre-hw"))]
                 attn_mask_src: p.attn_mask_src,
+                #[cfg(not(feature = "spyre-hw"))]
                 mask_view: p.mask_view,
                 capacity: p.capacity,
                 m_cap: p.m_cap,

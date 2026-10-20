@@ -6067,6 +6067,12 @@ pub struct EmittedBundle {
     /// The memory plan. Empty (`Default`) when the caller supplied no layout.
     pub layout: bundle::BundleLayout<'static>,
     pub groups: PendingGroups,
+    /// ⭐ THIS BUNDLE'S OWN attention score-mask binding — the tid the graph minted, the view THIS
+    /// bake declared for it, the capacity this bundle serves. The tid is shared by every rung of a
+    /// width ladder (it is minted per graph), so the binding the launch stages must be the one the
+    /// LAUNCHING bundle baked — never a family-level copy keyed by the tid alone. Derived from the
+    /// ops' own KTIR ([`bundle_mask_binding`]), the same extraction the graph wiring runs.
+    pub attn_mask: Option<bundle::MaskBinding>,
 }
 
 /// A bundle's launches, either already complete or waiting on the device compiler.
@@ -6469,6 +6475,38 @@ pub fn drain_emitted_bundles() -> Result<Vec<bundle::BundleCode<'static>>, Strin
         .collect()
 }
 
+/// ⭐ THE BUNDLE'S OWN ATTENTION SCORE-MASK BINDING — one fold over the ops' KTIR, refusing any two
+/// ops that declare DIFFERENT bindings for the same synthetic mask tid inside one bundle. The
+/// extraction itself is [`crate::lower_subtile_tape_to_ktir::mask_binding_of`] — the same one
+/// implementation the graph wiring reads — so the binding baked onto the bundle and the binding the
+/// wiring states cannot disagree by construction.
+///
+/// ⛔ WHY THIS IS A BUNDLE FACT AND NOT A WIRING FACT. The mask tid is minted per GRAPH, so every
+/// rung of a width ladder shares it; but each rung's bake declares its OWN view (`[27, 64]` at
+/// mq=27, `[512, 768]` at the width-512 continuation), and the placement sizes each rung's mask
+/// bytes from its own view. A fill shaped by any copy other than the LAUNCHING bundle's is a
+/// rung-512 view reaching a rung-27 placement — the t1131 bind refusal. The binding therefore
+/// ships ON the bundle ([`bundle::BundleCode::attn_mask`]), where it is per (bundle, tid) by
+/// construction.
+fn bundle_mask_binding(ops: &[EmittedOp]) -> Result<Option<bundle::MaskBinding>, String> {
+    let mut mask: Option<bundle::MaskBinding> = None;
+    for e in ops {
+        let Some(k) = e.ktir.as_ref() else { continue };
+        let Some(m) = crate::lower_subtile_tape_to_ktir::mask_binding_of(k).map_err(|e| e.0)? else {
+            continue;
+        };
+        if mask.is_some_and(|prev| prev != m) {
+            return Err(format!(
+                "the attention mask must be uniform across one bundle's ops (one shared \
+                 synthetic tid, one declared view), but {:?} and {m:?} were both emitted",
+                mask.unwrap()
+            ));
+        }
+        mask = Some(m);
+    }
+    Ok(mask)
+}
+
 fn emit_bundle_inner(
     ops: &[EmittedOp],
     layout: Option<&BundleLayout>,
@@ -6491,6 +6529,13 @@ fn emit_bundle_inner(
     }
 
     let fp = bundle_fp(ops, fold, attn_params);
+    // ⭐ THE BUNDLE'S OWN MASK BINDING, from the FULL op list (before `ops_for_grouping` trims
+    // anything) — each op's KTIR states the mask it reads, and the fold refuses two ops in one
+    // bundle declaring different bindings for the same synthetic tid. This is the fact that makes
+    // a rung's view unable to reach another rung's launch: it is baked onto the bundle the launch
+    // runs, not onto a family-level copy keyed by the tid.
+    let attn_mask =
+        bundle_mask_binding(ops).map_err(std::io::Error::other)?;
     let kept: Vec<&EmittedOp> = ops_for_grouping(ops, fold);
     let filtered: Vec<EmittedOp>;
     let ops: &[EmittedOp] = if kept.len() == ops.len() {
@@ -6519,6 +6564,7 @@ fn emit_bundle_inner(
         fp,
         layout: layout.map(bake_layout).unwrap_or_default(),
         groups,
+        attn_mask,
     })
 }
 
@@ -6581,6 +6627,7 @@ impl EmittedBundle {
             layout: self.layout,
             groups: std::borrow::Cow::Owned(groups),
             reroll,
+            attn_mask: self.attn_mask,
         })
     }
 }

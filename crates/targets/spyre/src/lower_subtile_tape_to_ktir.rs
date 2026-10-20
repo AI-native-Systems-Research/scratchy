@@ -17,7 +17,7 @@
 
 use crate::lower_subtile_tape_to_superdsc::*;
 use ktir_superdsc::emit::EmittedOp;
-use ktir_superdsc::ktir_node::ActiveCap;
+use ktir_superdsc::ktir_node::{ActiveCap, KtirNode};
 use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
 use scratchy_subtile::superdsc_opspec::{DataFormat, DeviceTileLayout};
 
@@ -1191,6 +1191,54 @@ pub(crate) struct WiringRegistries {
     pub attn_class_hds: Vec<u32>,
 }
 
+/// ⭐ ONE IMPLEMENTATION OF THE MASK BINDING'S EXTRACTION — every consumer of a program's
+/// score-mask binding (the graph wiring's uniformity walk, the per-bundle bake that ships it on
+/// [`crate::bundle_code::BundleCode`]) reads it off the SAME node, the same way. A second
+/// implementation free to disagree is how the binding's view came to be stated at one shape by the
+/// wiring and at another by the bake.
+///
+/// The binding is the node's OWN three facts, carried not re-derived: the synthetic mask's tid, the
+/// DECLARED view the splice minted beside the arm (`[1, swept]` decode, `[mq, ktn_rows]` one-pass,
+/// `[mq, swept + ktn_rows]` continuation), and the resident prefix capacity stated by the program's
+/// position-4 V-cache view — the CACHE's own row count, a different fact from the mask's shape (the
+/// prefill arms' mask spans the swept prefix AND the new block). `None` when the program reads no
+/// mask.
+pub(crate) fn mask_binding_of(k: &KtirNode) -> Result<Option<crate::wiring::MaskBinding>, SuperDscError> {
+    let Some(mid) = k.mask else {
+        return Ok(None);
+    };
+    let view = k.mask_view.ok_or_else(|| {
+        SuperDscError(format!(
+            "the attention bound mask t{mid} but declared no view for it — a mask binding \
+             without its typed view cannot be staged"
+        ))
+    })?;
+    let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(k)
+        .map_err(|e| SuperDscError(e.message))?;
+    if !regs.iter().any(|r| r.tid == mid.get()) {
+        return Err(SuperDscError(format!(
+            "the mask buffer t{mid} is not among this program's parameters — the attention \
+             bound a mask its own program never declares"
+        )));
+    }
+    let cap = regs
+        .get(4)
+        .filter(|r| r.tid != mid.get())
+        .map(|r| r.v_rows)
+        .ok_or_else(|| {
+            SuperDscError(format!(
+                "the attention binding mask t{mid} states no resident-cache parameter at \
+                 position 4, so there is no `[capacity, kv_width]` view to state the bundle's \
+                 prefix capacity with"
+            ))
+        })?;
+    Ok(Some(crate::wiring::MaskBinding {
+        tid: mid.get(),
+        view,
+        cap,
+    }))
+}
+
 /// Lower `ir` for its WIRING alone — the same per-node arms a bake runs, read for the parameter
 /// pairings rather than for the programs.
 ///
@@ -1263,64 +1311,11 @@ pub fn graph_wiring<F: RopeForm>(
                 let mut out = Vec::with_capacity(ops.len());
                 for e in ops {
                     let Some(k) = e.ktir else { continue };
-                    let mask = match k.mask {
-                        // ⭐ THE VIEW COMES OFF THE NODE, not off a runtime guess: the splice
-                        // states the mask tile's `(rows, cols)` per arm — the decode
-                        // runtime-length row `[1, swept]`, the one-pass causal triangle
-                        // `[mq, ktn_rows]`, the continuation's `[mq, swept + ktn_rows]` — and
-                        // this pass sizes the host buffer from that ONE baked fact. The shape
-                        // is a typed constant in the generated code; the worker's fill takes
-                        // it as its only shape input, with the runtime `start`/`real` values
-                        // INDEXING into it. (The old derivation read the capacity off the
-                        // program's position-4 V-cache view and declared `[1, cap]` for every
-                        // arm — the stale hand-written emitter's decode shape, wrong for every
-                        // prefill arm.)
-                        Some(mid) => {
-                            let view = k.mask_view.ok_or_else(|| {
-                                SuperDscError(format!(
-                                    "the attention bound mask t{mid} but declared no view for it — \
-                                     a mask binding without its typed view cannot be staged"
-                                ))
-                            })?;
-                            let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(&k)
-                                .map_err(|e| SuperDscError(e.message))?;
-                            if !regs.iter().any(|r| r.tid == mid.get()) {
-                                return Err(SuperDscError(format!(
-                                    "the mask buffer t{mid} is not among this program's parameters \
-                                     — the attention bound a mask its own program never declares"
-                                )));
-                            }
-                            // ⭐ THE RESIDENT CAPACITY STILL COMES OFF THE PROGRAM'S V-CACHE VIEW —
-                            // position 4's `[capacity, kv_width]` is the CACHE's own row count, a
-                            // DIFFERENT fact from the mask's shape (the prefill arms' mask spans
-                            // the swept prefix AND the new block, so its column count would
-                            // overstate the cache by the new block's rows). The bucket walk and
-                            // the prompt-fits bound read this number; the mask's bytes read the
-                            // view. One binding, two named facts, no re-derivation at either end.
-                            let cap = regs
-                                .get(4)
-                                .filter(|r| r.tid != mid.get())
-                                .map(|r| r.v_rows)
-                                .ok_or_else(|| {
-                                    SuperDscError(format!(
-                                        "the attention binding mask t{mid} states no resident-cache \
-                                         parameter at position 4, so there is no `[capacity, \
-                                         kv_width]` view to state the bundle's prefix capacity with"
-                                    ))
-                                })?;
-                            Some(crate::wiring::MaskBinding {
-                                tid: mid.get(),
-                                view,
-                                cap,
-                            })
-                        }
-                        None => None,
-                    };
                     out.push((
                         NodeArgs {
                             args: k.bindings.iter().map(|b| b.get() as usize).collect(),
                         },
-                        mask,
+                        mask_binding_of(&k)?,
                     ));
                 }
                 Ok(out)

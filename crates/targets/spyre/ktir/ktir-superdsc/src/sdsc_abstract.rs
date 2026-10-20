@@ -4830,6 +4830,36 @@ impl MaskView {
     }
 }
 
+/// ⭐ THE ATTENTION MASK BINDING AS ONE BAKED FACT: WHERE the mask lives (its tensor id), WHAT SHAPE
+/// it is (the bake's declared [`MaskView`]), and HOW MUCH PREFIX the bundle serves (the resident
+/// capacity — the V-cache view's row count). The three travel together because they are consumed
+/// together: the staging composes the fill at the view's shape and the bucket walk bounds by the
+/// capacity, and splitting them across fields is how the mask's shape came to be stated by nobody
+/// while its placement was sized from the truth.
+///
+/// ⛔ IT LIVES HERE, BESIDE THE VIEW IT NAMES, AND ON THE BAKED BUNDLE — not only on a graph-level
+/// wiring. The mask's tensor id is minted per GRAPH, so every rung of a width ladder shares the id
+/// while each rung's bake declares its OWN view for it; a binding read off a family-level copy is a
+/// rung-512 view reaching a rung-27 launch, and the executor's placement guard is what catches it.
+/// The binding a launch must read is the one on the bundle that launch RUNS ([`crate::bundle_code`]'s
+/// `BundleCode::attn_mask`), where the view is per (bundle, tid) by construction.
+///
+/// Declared in this crate (not the wiring that also carries it) because the baked bundle is a LEAF
+/// consumer — the lowering that mints the binding and the bake that places it name one declaration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaskBinding {
+    /// The synthetic mask tensor's id — one past the graph's tensors, per the splice's own mint.
+    pub tid: u32,
+    /// The bake's declared view of the mask tile — the staging's fill takes this as its ONLY shape
+    /// input ([`mask_fill`]); the runtime's `start`/`real` values index into it and never define it.
+    pub view: MaskView,
+    /// The resident prefix capacity this bundle serves — the cache's own row extent as the
+    /// program's V-cache view states it. NOT the mask's column count: the prefill arms' mask tile
+    /// spans the swept prefix AND the new block, so reading the capacity off the mask's shape would
+    /// overstate the cache by exactly the new block's rows.
+    pub cap: u32,
+}
+
 /// ⭐⭐⭐ THE MASK FILL AT THE DECLARED VIEW — the runtime's one composition of the score
 /// mask's bytes, shaped by NOTHING but the baked [`MaskView`] and indexed by the launch's own
 /// `start` (the resident prefix length) and `real` (the chunk's real token count).

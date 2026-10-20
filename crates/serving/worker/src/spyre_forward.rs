@@ -457,17 +457,24 @@ pub(crate) fn run_prefill_batch(
     // `start` (this chunk's resident prefix length) and `real` (its real token count) index into it
     // and never define it.
     //
+    // ⛔ THE VIEW IS THE LAUNCHING RUNG'S OWN, OFF THE SESSION IT RUNS ON. The mask's tensor id is
+    // minted per GRAPH, so every rung of the prefill width ladder answers to the SAME tid while
+    // each rung's bake declares its OWN view for it — the mq=27 rung's `[27, 64]` one-pass tile,
+    // the width-512 continuation's `[512, 768]`. A fill shaped by a family-level copy is a rung-512
+    // view reaching a rung-27 placement (job 23's t1131 bind refusal, 786432 B into 3456 B). The
+    // binding is read off `pf` — THIS chunk's session, built from the rung's own bundle — so the
+    // view and the placement are one bundle's facts by construction, and no family-level copy
+    // exists to read instead.
+    //
     // ⛔ A PROMPT CHUNK ONLY. A decode batch (`per_request.is_some()`) has its own mask staging —
     // the fold-pass prefix blocks — and solo decode reads the tape's `PrefixMask` staging through
-    // the decode binding's reserved-tid alias; neither is this bind's to replace. The bundle's own
-    // wiring states whether a mask exists at all (`attn_mask_src`), and the view is Some exactly
-    // when it is — the bake refuses a mask binding with no declared view.
+    // the decode binding's reserved-tid alias; neither is this bind's to replace.
     if per_request.is_none() {
-        if let (Some(tid), Some(view)) = (b.attn_mask_src, b.mask_view) {
+        if let Some(binding) = pf.attn_mask() {
             acts.push((
-                scratchy_target_spyre::bundle_code::PlaceId::Act(tid as u32),
+                scratchy_target_spyre::bundle_code::PlaceId::Act(binding.tid),
                 std::borrow::Cow::Owned(scratchy_subtile::sdsc_abstract::mask_fill(
-                    view, start, real,
+                    binding.view, start, real,
                 )),
             ));
         }
@@ -1860,6 +1867,11 @@ pub(crate) fn forward_chunk(
         // emitter's shapes, kept alive by this staging after the splice had declared its own. The
         // clamp (`ChunkRows::row_logical_pos`) and the triangle (`prefill_causal_col_valid`) are
         // unchanged laws — they live inside `mask_fill` now, stated once.
+        //
+        // ⭐ THE VIEW IS THE LAUNCHED PROGRAM'S OWN — `b`'s mask fields are captured at load from
+        // the `BundleCode` of the program `b.prog` runs (see the session build in `spyre_load`),
+        // never from the family wiring, so the fill follows the same per-bundle law the card's
+        // rung fill follows off its session.
         if let (Some(mask), Some(view)) = (b.attn_mask_src, b.mask_view) {
             let fill = scratchy_subtile::sdsc_abstract::mask_fill(view, start, n);
             let shape = vec![

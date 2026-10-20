@@ -769,31 +769,11 @@ impl RotaryKind {
     }
 }
 
-/// ⭐ THE ATTENTION MASK BINDING AS ONE BAKED FACT: WHERE the mask lives (its tensor id), WHAT SHAPE
-/// it is (the bake's declared [`MaskView`]), and HOW MUCH PREFIX the bundle serves (the resident
-/// capacity — the V-cache view's row count, the same fact `capacity()` answered before the view
-/// existed). The three travel together because they are consumed together: the worker stages the
-/// fill at the view's shape and the bucket walk bounds by the capacity, and splitting them across
-/// fields is how the mask's shape came to be stated by nobody while its placement was sized from
-/// the truth.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MaskBinding {
-    /// The synthetic mask tensor's id — one past the graph's tensors, per the splice's own mint.
-    pub tid: u32,
-    /// The bake's declared view of the mask tile — the worker's fill takes this as its ONLY shape
-    /// input ([`ktir_superdsc::sdsc_abstract::mask_fill`]); the runtime's `start`/`real` values
-    /// index into it and never define it.
-    pub view: MaskView,
-    /// The resident prefix capacity this bundle serves — the cache's own row extent as the
-    /// program's V-cache view states it. NOT the mask's column count: the prefill arms' mask tile
-    /// spans the swept prefix AND the new block, so reading the capacity off the mask's shape would
-    /// overstate the cache by exactly the new block's rows.
-    pub cap: u32,
-}
-
 /// Re-exported so the wiring's consumers (the worker, the generated code) can name the mask's
-/// typed view through the crate they already depend on — the same module the splice mints it in.
-pub use ktir_superdsc::sdsc_abstract::{MaskArm, MaskView};
+/// typed binding and view through the crate they already depend on — the same module the splice
+/// mints both in. The binding is DECLARED in `sdsc_abstract` (beside the view) so the baked-bundle
+/// leaf can carry it too; see its doc there for why that side matters.
+pub use ktir_superdsc::sdsc_abstract::{MaskArm, MaskBinding, MaskView};
 
 /// Everything the worker needs to launch one baked bundle, emitted whole.
 pub struct Wiring {

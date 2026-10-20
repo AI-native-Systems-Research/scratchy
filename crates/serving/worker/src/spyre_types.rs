@@ -59,18 +59,24 @@ pub(crate) struct BundleMeta {
     /// Program index in the shared session (see [`SpyreSession::run_step`]).
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) prog: usize,
-    /// The attention length-mask source, when this bundle has one.
+    /// The attention length-mask source, when this bundle has one. EMULATOR-ONLY: on the card the
+    /// fill reads the LAUNCHING rung's binding off its own session (`SuperDscSession::attn_mask`),
+    /// so no family-level copy exists there to read — the mask tid is shared across a width
+    /// ladder's rungs while each rung's view is its own, and this field would be one view standing
+    /// for the whole family.
     ///
-    /// ⭐ A FACT OF THE WIRING, NOT OF A MANIFEST. The prefix cache tensor spans the full
-    /// structural capacity while only `decode_position` of its rows are valid at run time, so the
-    /// host fills this source per step at the bake-declared view (`mask_view` below) and the
-    /// masked columns leave the softmax.
+    /// ⭐ A FACT OF THE BUNDLE THIS META'S PROGRAM RUNS, captured from its `BundleCode` at load.
+    /// The prefix cache tensor spans the full structural capacity while only the live prefix of
+    /// its rows is valid at run time, so the host fills this source per step at the bake-declared
+    /// view (`mask_view` below) and the masked columns leave the softmax.
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) attn_mask_src: Option<usize>,
     /// ⭐ THE MASK'S BAKE-DECLARED VIEW — `Some` exactly when `attn_mask_src` is. The fill takes
     /// this as its ONLY shape input (`sdsc_abstract::mask_fill`): the runtime `start`/`real`
     /// values index into the baked shape and never define it. The decode arm's `[1, swept]`
     /// length row, the one-pass `[mq, ktn_rows]` triangle, the continuation's
     /// `[mq, swept + ktn_rows]` — one typed statement per bundle instead of a runtime guess.
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) mask_view: Option<scratchy_subtile::sdsc_abstract::MaskView>,
     /// Prefix capacity — max context length this bundle serves. ⭐ THE CACHE'S OWN EXTENT, not the
     /// mask's column count (the prefill arms' mask spans the swept prefix AND the new block).
