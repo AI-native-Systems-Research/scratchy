@@ -1545,15 +1545,12 @@ fn spliced_rope_lowers_through_the_door() {
             let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
 
             // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout(
-                &ir,
-                &weight_ids,
-                rows_are_requests,
-                &[],
-            )
-            .unwrap_or_else(|e| {
-                panic!("layout minted mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}: {e}")
-            });
+            let layout = compute_bundle_layout(&ir, &weight_ids, rows_are_requests, &[])
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "layout minted mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}: {e}"
+                    )
+                });
 
             // The splice — the row compiles the kernel for this node. The splice has
             // no rope-specific refusal (the historical builder's own `total % hd` refusal is

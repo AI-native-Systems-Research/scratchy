@@ -10978,9 +10978,7 @@ fn dump_wavefront_mega(
                                 // are one token each of the running requests once it is baked wider than
                                 // a single row.
                                 !is_prefill && decode_rows > 1,
-                                superdsc::RungFacts {
-                                    one_request,
-                                },
+                                superdsc::RungFacts { one_request },
                             ) {
                                 Ok(rolled) => {
                                     // ⭐ AND THE PARITY LEDGER'S ENTRY FOR THIS BUNDLE — the

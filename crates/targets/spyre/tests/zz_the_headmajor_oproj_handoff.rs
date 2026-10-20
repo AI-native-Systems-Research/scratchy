@@ -265,9 +265,7 @@ fn walk_at_8b() -> (RolledSuperDsc, SubtileIR<NeoX>, HashSet<u32>) {
         ActiveCap::FULL,
         false,
         // The one-request rung's facts: the handoff is a property of the per-page body.
-        RungFacts {
-            one_request: true,
-        },
+        RungFacts { one_request: true },
     )
     .expect("the 8b-shaped two-layer graph lowers with the head-major handoff");
     (rolled, rg, weight_ids)

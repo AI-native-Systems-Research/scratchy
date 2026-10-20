@@ -1400,12 +1400,8 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // The layout's budget passes (spill/bank) take the per-loop maps directly: the spill reasons
     // over WHICH tids are per-layer at all (flattened internally), and the BANK needs the class
     // boundaries to know which (class, iteration) launches must stay in one bank.
-    let mut bundle_layout = compute_bundle_layout(
-        ir,
-        weight_ids,
-        rows_are_requests,
-        &per_layer_ext,
-    )?;
+    let mut bundle_layout =
+        compute_bundle_layout(ir, weight_ids, rows_are_requests, &per_layer_ext)?;
     // ── THE TAPE'S SEGMENTS: prefix, ONE RANGE PER LOOP (an attention class's body), suffix ──
     // The rolled tape is `prefix; [OpenLoop(body₀) CloseLoop]…[OpenLoop(bodyₙ) CloseLoop]; suffix`
     // — sibling loops, never nested (the TapeBuilder typestate forbids nesting). One `(range,
