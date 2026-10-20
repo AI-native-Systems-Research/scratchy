@@ -387,7 +387,7 @@ fn attrkey(k: &AttrKey) -> Result<Key> {
         Predicate => Key::As(KAttrKey::Predicate),
 
         // The function's, not an operation's.
-        SymName | Grid | Noinline | FoldedGridLoop => Key::OnFunction,
+        SymName | Grid | Noinline | FoldedGridLoop | UnrolledGridLoop => Key::OnFunction,
 
         // Ours. See the note above.
         Pattern | WorkDivision | Index | DataBounds | OutputPartition | PtRows | XrfCapacity
