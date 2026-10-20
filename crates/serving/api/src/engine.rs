@@ -2690,7 +2690,14 @@ impl AsyncEngine {
 
             // NOTHING TO PUT BACK — the detokenizer never left. This arm used to reinstall it, and
             // when the state had already been removed it `continue`d above and dropped it forever.
-            let (detokenizer_stop, delta_text) = detok_result.unwrap_or((None, None));
+            // No result here means no detokenizer, so the engine has no tokenizer
+            // ([`SharedDetok`]): a step's text is its token ids' placeholders, as the
+            // non-streaming response's is. Filled here, the one place that knows why the text is
+            // missing: a delta's `text: None` means "no text" to every encoder, which is what a
+            // reasoning-only or finish delta carries (#601: the chat encoder streamed a reasoning
+            // delta's token ids as `<token_N>` content).
+            let (detokenizer_stop, delta_text) = detok_result
+                .unwrap_or_else(|| (None, Some(placeholder_text(&output.new_token_ids))));
 
             // Captured before `output` is consumed by the stream deltas below.
             // The engine's own finish for this step means it has already retired
@@ -4961,6 +4968,32 @@ mod tests {
             text.contains("there"),
             "Expected 'there' in delta text, got: {text:?}"
         );
+    }
+
+    /// An engine with no tokenizer streams each step's token ids as placeholders, as its
+    /// non-streaming response does: the output path fills them, so an encoder reads a delta's
+    /// `text: None` as no text.
+    #[test]
+    fn a_request_with_no_detokenizer_streams_placeholders() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut requests =
+            HashMap::from([("req-1".to_string(), make_test_request_state(Some(tx)))]);
+        let outputs = vec![EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![10, 11],
+            finish_reason: None,
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        }];
+        let work = AsyncEngine::process_outputs_phase1(&mut requests, &outputs);
+        let results = AsyncEngine::parallel_detokenize(work);
+        AsyncEngine::process_outputs_phase3(&mut requests, outputs, results);
+        let delta = rx.try_recv().unwrap();
+        assert_eq!(delta.text.as_deref(), Some("<token_10><token_11>"));
     }
 
     #[test]

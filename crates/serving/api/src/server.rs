@@ -928,17 +928,8 @@ fn stream_chat_response(
         let (content, tool_calls) = if tool_calls_json.is_some() {
             (None, tool_calls_json)
         } else {
-            // Use detokenized text if available, otherwise fall back to placeholders.
-            let text = delta.text.unwrap_or_else(|| {
-                use std::fmt::Write;
-                let mut s = String::new();
-                for id in &delta.new_token_ids {
-                    let _ = write!(s, "<token_{id}>");
-                }
-                s
-            });
-            let content = if text.is_empty() { None } else { Some(text) };
-            (content, None)
+            // `None` is a delta with no content: reasoning only, or a finish.
+            (delta.text.filter(|text| !text.is_empty()), None)
         };
 
         let chunk = protocol::ChatCompletionStreamResponse::new(
@@ -1025,14 +1016,8 @@ fn stream_completion_response(
 
         let finish_reason_str = delta.finish_reason.map(|r| r.to_string());
 
-        let text = delta.text.unwrap_or_else(|| {
-            use std::fmt::Write;
-            let mut s = String::new();
-            for id in &delta.new_token_ids {
-                let _ = write!(s, "<token_{id}>");
-            }
-            s
-        });
+        // `None` is a delta with no text: a finish.
+        let text = delta.text.unwrap_or_default();
 
         let chunk = protocol::CompletionStreamResponse::new(
             format!("cmpl-{}", req_id),
@@ -2265,6 +2250,31 @@ mod tests {
         let payloads = sse_payloads(response.into_response()).await;
         let usage = &payloads.last().expect("usage chunk")["usage"];
         assert!(usage.get("prompt_tokens_details").is_none(), "{usage}");
+    }
+
+    /// A reasoning-only delta has no text, and streams no content: not its token ids as
+    /// `<token_N>` placeholders (#601: every gpt-oss reasoning delta did).
+    #[tokio::test]
+    async fn test_chat_stream_reasoning_delta_streams_no_content() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(StreamDelta {
+            index: 0,
+            new_token_ids: vec![2167],
+            text: None,
+            finish_reason: None,
+            stop_reason: None,
+            logprobs: None,
+            tool_call_deltas: None,
+            reasoning: Some("We".into()),
+            usage: Default::default(),
+        })
+        .unwrap();
+        drop(tx);
+        let response = stream_chat_response("r".into(), "m".into(), rx, false);
+        let payloads = sse_payloads(response.into_response()).await;
+        let delta = &payloads[0]["choices"][0]["delta"];
+        assert_eq!(delta["reasoning"], "We");
+        assert!(delta.get("content").is_none(), "{delta}");
     }
 
     #[tokio::test]
