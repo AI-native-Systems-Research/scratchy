@@ -3928,29 +3928,28 @@ pub fn numeric_gate<F: RopeForm>(
     // away for them), so a tape with no rope-append prefix keeps the
     // all-valid default — the bind is then simply unused.
     if let Some(pg) = prefill {
-        // ⭐ THE PREFILL MASK, BY THE RUNTIME'S OWN LAW: the forward's emu
-        // staging binds a `[mq, mq]` clamped causal triangle — the same two
-        // calls the worker's `forward_chunk` composes (`ChunkRows::row_logical_pos`
-        // over `prefill_causal_col_valid`, the SSOT the one-pass kernel's own
-        // `[MQ, MQ]` mask descriptor states) — at a FULL chunk: every row
-        // real, so the clamp is the identity and the golden, which has no
-        // pad-row law, sees exactly the rows the program reads. ⛔ NOT
-        // `CausalKey::mask`: that is the card's `[mq, mq_pad]` stick-padded
-        // layout — a different tensor than the one-pass kernel consumes.
-        let mq = pg.mq as usize;
-        let chunk = scratchy_subtile::sdsc_abstract::ChunkRows::chunk(
-            std::num::NonZeroU32::new(pg.mq).expect("a prefill rung bakes mq > 1"),
-        );
-        let mut m = vec![0.0f32; mq * mq];
-        for r in 0..mq {
-            let pos = chunk.row_logical_pos(r, mq);
-            for c in 0..mq {
-                if !scratchy_subtile::sdsc_abstract::prefill_causal_col_valid(c, pos) {
-                    m[r * mq + c] = -1.0e38;
-                }
-            }
-        }
-        sources.push((u64::from(ir.tensors.len() as u32), m, vec![mq, mq]));
+        // ⭐ THE PREFILL MASK IS `CausalKey::mask` ITSELF — the `[mq, mq_pad]` stick-padded
+        // causal tile with the `-32752` tail, at a FULL chunk (every row real, so the clamp
+        // is the identity and the golden, which has no pad-row law, sees exactly the rows
+        // the program reads). The one-pass kernel's mask descriptor states this SAME
+        // `[MQ, KTN_ROWS]` window — the padded-K build — so the gate binds the runtime's
+        // own bytes rather than a gate-local `[mq, mq]` triangle: the pad columns are the
+        // ones the program's score actually adds `-32752` to, and staging anything else
+        // would test a mask the card never binds. The tail value is the CARD's finite
+        // fp16 "-inf" (never `-1e38`: that is an f32 the device's fp16 mask lane cannot
+        // hold, and IEEE inf mis-encodes as NaN), so emulator and card run one law.
+        let key = scratchy_subtile::sdsc_abstract::CausalKey::chunk(
+            scratchy_subtile::sdsc_abstract::RungWidth::of_emitted_rows(pg.mq)
+                .expect("a prefill rung bakes mq > 1"),
+            pg.mq as usize,
+        )
+        .expect("a full chunk is a launch");
+        let (mq, mq_pad) = (key.rows(), key.rows_pad());
+        sources.push((
+            u64::from(ir.tensors.len() as u32),
+            key.mask(),
+            vec![mq, mq_pad],
+        ));
     } else {
         let valid_prefix = ir
             .nodes

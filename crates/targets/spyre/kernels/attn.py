@@ -33,8 +33,10 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   `[KTN_W, KTN_ROWS]` — the restickify's transposed staging form, per head read
   at the ROW corner `kvh*HD` (the B operand's in-corner, which the door places
   without alignment needs and which is stick-aligned anyway); the V params are
-  `[CAP, NKVH*HD]` / `[NEW_LEN, NKVH*HD]`; the mask is `[1, SWEPT]` (decode) or
-  `[MQ, MQ]` (the causal one-pass). Every extent is a constexpr — one kernel per
+  `[CAP, NKVH*HD]` / `[KTN_ROWS, NKVH*HD]` (the new-V view at the stick cover its
+  value dot contracts over); the mask is `[1, SWEPT]` (decode), `[MQ, KTN_ROWS]`
+  (the causal one-pass), or `[MQ, SWEPT + KTN_ROWS]` (the continuation's one
+  prefix-plus-new-block tile). Every extent is a constexpr — one kernel per
   shape, the fixture's delta-7 law.
 * GRID: `[1]` at every shape — the head loop is TRACE-TIME (`tl.static_range`),
   the decode arm's own form. The builder's grid-`(nq, 1)` one-head-per-program
@@ -63,14 +65,29 @@ and `SWEPT` the rung's swept extent (a ladder bound, itself a 64 multiple), so
 both hold by construction; the head's own corner `kvh*CAP` is whole pages. The
 V plane needs no such alignment (its stick axis is the head dim).
 
-⛔ THE NEW BLOCK'S B WINDOW IS EXACT. `desc_ktn`'s block is `[HD, NEW_LEN]` at
-`[kvh*HD, 0]` — the LOGICAL new-block extent, never the stick cover: the scratch's
-pad columns (the transposed staging pad rows, written by the restickify's fold and
-never zeroed) must not enter the score, and at `NEW_LEN` they cannot — the dot's
-logical n is `NEW_LEN`, the score tile's own width is `NEW_LEN`, and every reduce
-below bounds itself to it. The util-floor pad the matmul door applies to a
-sub-stick n lands in the score tile's own placement pad (the `cols_entire` law —
-the same exception the value leg's `[1,1]`-contraction dots ride).
+⛔ THE NEW BLOCK'S K IS THE STICK COVER, AND ITS PAD LANES ARE WRITTEN, NOT
+MASKED. `desc_ktn`'s block is `[HD, KTN_ROWS]` at `[kvh*HD, 0]` and the value
+leg's `vd` block is `[KTN_ROWS, HD]` — the STICK COVER of the new block, never
+its logical extent. The matmul door emits no `coordinateMasking_` on a
+contraction axis (the K-stick law — masking rides only on transfer whose stick
+layout carries the masked dim, which a plain-B `[k, n]` view's K axis is not),
+so a sub-stick K cannot be stated at all: the value dot's K IS `KTN_ROWS`, and
+the scratch's pad columns (the transposed staging pad rows) therefore ENTER the
+score. They die there, by arithmetic: the mask's `-32752` tail (a finite fp16
+"-inf" — never IEEE inf, whose encoding is NaN on this device) puts every pad
+column's masked score at `<= 65504*SCALE - 32752`, and every real column's at
+`>= -65504*SCALE`; at attention scales `SCALE <= 1/8`, that is
+`8188 - 32752 = -24564 < -8188`, with the diagonal always unmasked so a real
+column always exists — the row max is a real column's, and
+`exp(pad_score - max)` underflows to exactly 0. The pad columns add nothing to
+the softmax sum and multiply nothing into the value dot.
+⛔ THAT ARITHMETIC IS ONLY SOUND ON FINITE PAD LANES (`0 * NaN` is `NaN`, and
+the mask add cannot kill a NaN it is added to). So the pad lanes are WRITTEN,
+never trusted to zero-init or lifetime reuse: the producers of `new_k`/`new_v`
+state `M = KTN_ROWS` over the host-staged replicated embedding rows, making
+every pad row the projection of a real token — finite by construction. The
+bake-time witness refuses the build when any producer's M understates the
+consumer's padded K, so the NaN law is enforced, not argued.
 
 ⛔ THE THREE SHAPES, exactly the builder's own arms (main's `KtirFunc::attn`):
 
@@ -79,7 +96,8 @@ the same exception the value leg's `[1,1]`-contraction dots ride).
    the builder's 3-pass row loop at its single row.
 2. PREFILL ONE-PASS (`ONE_PASS`): the first prompt chunk — no resident prefix
    (`SWEPT == 0`, the bundle baked `ActiveCap::NONE`) attends only its own `MQ`
-   tokens causally: whole-chunk scores `[MQ, MQ]` plus the additive triangle mask,
+   tokens causally: whole-chunk scores `[MQ, KTN_ROWS]` (the stick cover, pad
+   columns killed at the mask tail) plus the additive triangle mask,
    ONE row-wise softmax. The builder's own one-pass arm, at every `MQ > 1` — the
    front end's TMA 16-byte floor (a GPU law) is gone, so the ladder's bottom rung
    (MQ=7) takes this arm exactly as the builder's did.
@@ -132,31 +150,38 @@ def _attn_one_pass_head(h, desc_q, desc_o, desc_ktn, desc_vd, desc_mask,  #
                                        strides=[q_width, 1],
                                        block_shape=[MQ, HD])
     # The new block's Kᵀ — the restickify's transposed staging form, this head's
-    # [HD, NEW_LEN] window at the ROW corner kvh*HD (the B operand's in-corner).
-    # The block is the LOGICAL extent: the scratch's stick-cover pad columns
-    # must not enter the score (see the module doc's EXACT-window law).
+    # [HD, KTN_ROWS] window at the ROW corner kvh*HD (the B operand's in-corner).
+    # The block is the STICK COVER: the pad columns enter the score and die at the
+    # mask's -32752 tail (see the module doc's pad law), which is the only form the
+    # K-stick law admits.
     ktn_desc = tl.make_tensor_descriptor(desc_ktn, shape=[KTN_W, KTN_ROWS],
                                          strides=[KTN_ROWS, 1],
-                                         block_shape=[HD, NEW_LEN])
-    vd_desc = tl.make_tensor_descriptor(desc_vd, shape=[NEW_LEN, kv_width],
+                                         block_shape=[HD, KTN_ROWS])
+    # The new block's V at the same stick cover — the value dot's K. Its pad rows
+    # are WRITTEN by the padded producer (M = KTN_ROWS over replicated embedding
+    # rows), so e's zero pad columns multiply finite values.
+    vd_desc = tl.make_tensor_descriptor(desc_vd, shape=[KTN_ROWS, kv_width],
                                         strides=[kv_width, 1],
-                                        block_shape=[MQ, HD])
-    mask_desc = tl.make_tensor_descriptor(desc_mask, shape=[MQ, MQ],
-                                          strides=[MQ, 1],
-                                          block_shape=[MQ, MQ])
+                                        block_shape=[KTN_ROWS, HD])
+    # The causal tile at the runtime's own [rows, rows_pad] pitch — CausalKey's
+    # staging form, mask_neg tail in the pad columns included.
+    mask_desc = tl.make_tensor_descriptor(desc_mask, shape=[MQ, KTN_ROWS],
+                                          strides=[KTN_ROWS, 1],
+                                          block_shape=[MQ, KTN_ROWS])
     kvh = h // GQA
     q = q_wide.load([0, h * HD])  # [MQ, HD]
-    ktn = ktn_desc.load([kvh * HD, 0])  # [HD, MQ]
-    qk = tl.dot(q, ktn, out_dtype=tl.float16)  # [MQ, MQ]
+    ktn = ktn_desc.load([kvh * HD, 0])  # [HD, KTN_ROWS]
+    qk = tl.dot(q, ktn, out_dtype=tl.float16)  # [MQ, KTN_ROWS]
     qk = qk * SCALE
     qk = qk + mask_desc.load([0, 0])
-    # Row-wise softmax, one reduce per axis.
+    # Row-wise softmax, one reduce per axis. The pad columns are part of the
+    # reduced width and contribute exactly exp(-32752 - real_max) = 0.
     mx = tl.max(qk, 1)  # [MQ]
     sh = qk - mx[:, None]
     e = tl.exp(sh.to(tl.float32)).to(tl.float16)
     su = tl.sum(e, 1)  # [MQ]
-    v = vd_desc.load([KD_ROW, KD_COL + kvh * HD])  # [MQ, HD]
-    o = tl.dot(e, v, out_dtype=tl.float16)  # [MQ, HD]
+    v = vd_desc.load([KD_ROW, KD_COL + kvh * HD])  # [KTN_ROWS, HD]
+    o = tl.dot(e, v, out_dtype=tl.float16)  # [MQ, HD] — K=KTN_ROWS, stick-clear
     o = o / su[:, None]
     o_wide.store([0, h * HD], o)
 
@@ -183,11 +208,14 @@ def _attn_cont_head(h, desc_q, desc_o, desc_kt, desc_vc, desc_ktn, desc_vd,  #
     build-script thread in `to_ktir_emit` for over 25 min at 102 GB without finishing.
 
     The causality now rides the mask instead of the tile extents, exactly as the one-pass
-    arm's does: the mask parameter is ONE `[MQ, SWEPT + MQ]` additive tile, the prefix's
+    arm's does: the mask parameter is ONE `[MQ, SWEPT + KTN_ROWS]` additive tile, the prefix's
     runtime length mask in its first `SWEPT` columns and the new block's row mask in the
     rest — the causal triangle for a prompt chunk, the diagonal for a decode batch, staged
     by the host either way (the device has no lane-wise integer compare to derive one,
-    attention_flash delta 10). The program's size is now flat in `MQ`.
+    attention_flash delta 10). The program's size is now flat in `MQ`, and the new block's
+    `KTN_ROWS`-wide window is the same stick cover the one-pass arm states — its pad
+    columns die at the mask tail, its pad rows are written by the padded producers (the
+    module doc's pad law).
 
     Every fact the door reads off the program is the old arm's: q's first tile is still
     `HD` columns wide (`[MQ, HD]`, the one-pass arm's own q tile), the cache tiles are
@@ -213,17 +241,17 @@ def _attn_cont_head(h, desc_q, desc_o, desc_kt, desc_vc, desc_ktn, desc_vd,  #
                                         block_shape=[SWEPT, HD])
     ktn_desc = tl.make_tensor_descriptor(desc_ktn, shape=[KTN_W, KTN_ROWS],
                                          strides=[KTN_ROWS, 1],
-                                         block_shape=[HD, NEW_LEN])
-    vd_desc = tl.make_tensor_descriptor(desc_vd, shape=[NEW_LEN, kv_width],
+                                         block_shape=[HD, KTN_ROWS])
+    vd_desc = tl.make_tensor_descriptor(desc_vd, shape=[KTN_ROWS, kv_width],
                                         strides=[kv_width, 1],
-                                        block_shape=[MQ, HD])
-    width: tl.constexpr = SWEPT + MQ
+                                        block_shape=[KTN_ROWS, HD])
+    width: tl.constexpr = SWEPT + KTN_ROWS
     mask_c = tl.make_tensor_descriptor(desc_mask, shape=[MQ, width],
                                        strides=[width, 1],
                                        block_shape=[MQ, SWEPT])
     mask_d = tl.make_tensor_descriptor(desc_mask, shape=[MQ, width],
                                        strides=[width, 1],
-                                       block_shape=[MQ, MQ])
+                                       block_shape=[MQ, KTN_ROWS])
     kvh = h // GQA
     q = q_wide.load([0, h * HD])  # [MQ, HD]
     # Pass 1: both segments' scores for every row, and the per-row global max.
@@ -231,18 +259,19 @@ def _attn_cont_head(h, desc_q, desc_o, desc_kt, desc_vc, desc_ktn, desc_vd,  #
     qk_c = tl.dot(q, kt, out_dtype=tl.float16)  # [MQ, SWEPT]
     qk_c = qk_c * SCALE
     qk_c = qk_c + mask_c.load([0, 0])
-    ktn = ktn_desc.load([kvh * HD, 0])  # [HD, MQ]
-    qk_d = tl.dot(q, ktn, out_dtype=tl.float16)  # [MQ, MQ]
+    ktn = ktn_desc.load([kvh * HD, 0])  # [HD, KTN_ROWS]
+    qk_d = tl.dot(q, ktn, out_dtype=tl.float16)  # [MQ, KTN_ROWS]
     qk_d = qk_d * SCALE
     qk_d = qk_d + mask_d.load([0, SWEPT])
     gmax = tl.maximum(tl.max(qk_c, 1), tl.max(qk_d, 1))  # [MQ]
-    # Pass 2: exp(score - gmax) and the per-row global sum.
+    # Pass 2: exp(score - gmax) and the per-row global sum. The new block's pad
+    # columns contribute exactly exp(-32752 - gmax) = 0.
     e_c = tl.exp((qk_c - gmax[:, None]).to(tl.float32)).to(tl.float16)
     e_d = tl.exp((qk_d - gmax[:, None]).to(tl.float32)).to(tl.float16)
     gsum = tl.sum(e_c, 1) + tl.sum(e_d, 1)  # [MQ]
     # Pass 3: weighted V, accumulated across the two segments.
     vc = vc_desc.load([KC_ROW, KC_COL + kvh * HD])  # [SWEPT, HD]
-    vd = vd_desc.load([KD_ROW, KD_COL + kvh * HD])  # [MQ, HD]
+    vd = vd_desc.load([KD_ROW, KD_COL + kvh * HD])  # [KTN_ROWS, HD]
     o = tl.dot(e_c / gsum[:, None], vc, out_dtype=tl.float16)  # [MQ, HD]
     o_d = tl.dot(e_d / gsum[:, None], vd, out_dtype=tl.float16)  # [MQ, HD]
     o_wide.store([0, h * HD], o + o_d)
