@@ -573,9 +573,11 @@ pub fn dump(node: &KtirNode) -> String {
 /// name rather than assigned a node kind on the producer's behalf.
 pub fn emit_whole(node: &KtirNode, layout: Option<&BundleLayout>) -> Result<Vec<EmittedOp>, Error> {
     let mut sym = 0i64;
-    ktir_superdsc::emit::whole_function::lower_function(node, layout, &mut sym).map_err(|e| Error {
-        stage: "whole-function",
-        message: format!("{e:?}"),
+    ktir_superdsc::emit::whole_function::lower_function(node, layout, &mut sym, None).map_err(|e| {
+        Error {
+            stage: "whole-function",
+            message: format!("{e:?}"),
+        }
     })
 }
 

@@ -33,9 +33,9 @@
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc as lk;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{
-    Error, Region, attn_at, elementwise, err, lmlast, matmul, regions, rmsnorm, rope_at, scalarmul,
-    silumul, split_out,
+    Error, Region, attn_at, err, regions, rope_at, split_out,
 };
+use ktir_superdsc::emit::whole_function::lower_function;
 use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::placement::BundleLayout;
 
@@ -141,9 +141,23 @@ pub struct BundleAttnParams {
 
 /// One KTIR program → the SuperDSC descriptors main's body for that node kind emits.
 ///
-/// `quantized` is main's own per-BUNDLE fp8 activation-quantize dedup set, threaded exactly as its
-/// tape walk threaded it: q/k/v read one rms output and gate/up another, so each distinct activation
-/// is quantized once and the later matmuls emit only `matmulfp8` + dequant.
+/// ⭐⭐⭐ THE GENERIC KINDS GO THROUGH THE ONE WALK. The pointwise kinds (elementwise, silumul,
+/// rmsnorm, scalarmul), the matmuls (fp16 and fp8 W8A8) and the LmLast copy are lowered by
+/// [`lower_function`] — the same per-op walk the whole-function door is — rather than by
+/// per-`Program` arms of their own: one implementation of each body, reached from both doors, so
+/// the two cannot drift about what a silu or a contraction emits. The walk classifies each op
+/// from the program's own ops (chain recognizers, splat/bound tiebreaks, the 1:1 map), proves
+/// what the per-`Program` arms assumed (the matmul's B orientation, from `indexing_maps`), and
+/// folds a row-blocked pointwise family into one whole-view descriptor (see
+/// `whole_function::row_tiled_family`).
+///
+/// ⛔ THE fp8 ACTIVATION-QUANTIZE DEDUP IS NOT THREADED THROUGH THE WALK, AND THAT IS STATED
+/// RATHER THAN SILENT. The per-`Program` matmul arm took main's per-BUNDLE dedup set, so q/k/v
+/// reading one rms output quantized it once; the walk states its set per op (see `emit_one`'s
+/// Matmul arm), so each fp8 matmul node emits its own quantize chain — same numerics, more ops,
+/// until the set is threaded across the walk's calls. This door no longer takes the set: a
+/// parameter nothing reads is a lie about behavior, and the follow-up that threads the dedup
+/// adds it where it is consumed.
 ///
 /// `attn_params` is [`BundleAttnParams`] — main's own remaining parameters, for the two bodies whose
 /// device laws need a fact no program states.
@@ -151,7 +165,6 @@ pub fn lower(
     k: &KtirNode,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    quantized: &mut std::collections::HashSet<String>,
     attn_params: Option<BundleAttnParams>,
 ) -> Result<Vec<EmittedOp>, Error> {
     // The name is still the program's identity for the emulator (which keys functions by it) and for
@@ -163,30 +176,15 @@ pub fn lower(
     // and a new kind fell through a `_` arm. `KtirNode::program` states it, so there is NO catch-all
     // here and a producer that gains a kind is an E0004 at this match.
     match k.program {
-        // `&[]` IS THE DENSE PATH, AND IT IS ARGUMENT 4. The broadcast flag slice is per-operand and
-        // is stated by the whole-function walk from the region it read; a per-`Program` op has no
-        // region to state one, and an empty slice is the byte-identical no-broadcast emission this
-        // door always had. Measured: granite's baked descriptors are unchanged with this argument in
-        // place, 2b and 8b at fp16 and fp8, `diff -r` 0 lines.
-        //
-        // ⛔ THE POSITION MATTERS AND THE COMPILER ONLY HALF-NAMES IT. `&[]` infers its element type
-        // from whichever parameter it lands on, so writing it in slot 3 type-checks AS THE REGION LIST
-        // and pushes the error onto the NEXT argument — `expected &[Option<BcastAxis>], found
-        // &Vec<Region>` at `&r` — which reads as a problem with the regions rather than with where the
-        // empty slice went. Measured that way: `cargo check -p scratchy-target-spyre` rc 101, against
-        // rc 0 on main.
         // ⛔ EVERY POINTWISE KIND is held to the column windows its program states, on what it EMITS
         // (`lk::column_windows_are_honoured`). The front end column-tiles only some of them
         // (`subtile_ir.rs`'s set); for the rest the guard is a no-op at
         // corner 0, and it makes a corner that ever reaches one a build error naming the op, not a
         // piece written at the buffer base.
-        Program::Elementwise(ew) => windowed(
-            name,
-            &r,
-            elementwise(name, ew, &r, &[], sym_id_base, layout),
-        ),
-        Program::SiluMul => windowed(name, &r, silumul(name, &r, sym_id_base, layout)),
-        Program::RmsNorm => windowed(name, &r, rmsnorm(name, k, &r, sym_id_base, layout)),
+        Program::Elementwise(_) => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
+        Program::SiluMul => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
+        Program::RmsNorm => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
+        Program::ScalarMul => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
         Program::RmsNormUnit => {
             windowed(name, &r, lk::rmsnorm_unit(name, k, &r, sym_id_base, layout))
         }
@@ -201,13 +199,15 @@ pub fn lower(
             windowed(name, &r, lk::scalarweightmul(name, &r, sym_id_base, layout))
         }
         Program::Reshape => lk::reshape(name, &r, sym_id_base, layout),
-        Program::ScalarMul => windowed(name, &r, scalarmul(name, k, &r, sym_id_base, layout)),
-        Program::Matmul => matmul(
-            name,
-            &r,
-            sym_id_base,
+        // ⭐ THE WALK PROVES WHAT THIS ARM HARDCODED. The per-`Program` matmul entry assumed
+        // `TransposeB` and `OperandOrigin::Staged`; the walk reads the orientation off the op's own
+        // `indexing_maps` (`whole_function::matmul_b_orientation`) and states the operands' origin
+        // as windows — the facts the spurious-pad drop in `matmul_oriented` discriminates on. The
+        // head-major swap fact is threaded exactly as before.
+        Program::Matmul => lower_function(
+            k,
             layout,
-            quantized,
+            sym_id_base,
             // ⭐ THE HEAD-MAJOR SWAP'S DOOR FACT, from the same `BundleAttnParams` the rope/attn
             // arms read: the o matmul's weight tid, named per bundle by the dataflow walk. Every
             // other matmul of the bundle (q/k/v, mlp, lm_head) carries a tid the fact does not
@@ -229,7 +229,10 @@ pub fn lower(
                 _ => None,
             },
         ),
-        Program::LmLast => lmlast(name, k, &r, sym_id_base, layout),
+        // The last-row extraction is a PURE COPY (loads and stores only); the walk's own LmLast
+        // arm keys on the stated `Program` and refuses a copy that grew a compute op rather than
+        // half-lowering it.
+        Program::LmLast => lower_function(k, layout, sym_id_base, None),
         Program::Rope => rope(name, &r, sym_id_base, layout, attn_params),
         Program::Attn => attn(name, k, &r, sym_id_base, layout, attn_params),
         // ⭐ NO DOOR TO CROSS. A transpose's descriptor is parameterised by the two extents its own

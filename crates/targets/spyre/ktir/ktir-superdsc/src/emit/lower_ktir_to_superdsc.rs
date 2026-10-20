@@ -6192,6 +6192,7 @@ mod proofs {
 pub fn rmsnorm_at(
     name: &str,
     eps: f32,
+    ones: Option<f32>,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
@@ -6212,15 +6213,39 @@ pub fn rmsnorm_at(
     // rms_norm_eps (config) flows via the scalarmul registry (compute_bundle_layout collected it) —
     // the same reserved `[1,1]` const `subtile→superdsc` adds to the mean-of-squares.
     let eps_const = crate::place::act_name(scalarmul_scale_tid(eps_idx));
+    // ⭐ THE GAIN OFFSET, THREADED FROM THE CHAIN READER — the arm this door's own comment once
+    // demanded: `program_rmsnorm_chains` now reads each chain's gamma leg the way it reads its
+    // epsilon, so a whole kernel with a OnePlusScale rmsnorm hands this door the offset. The
+    // value is the chain reader's (already refused everything but the convention's own 1.0), the
+    // slot is resolved BY THAT VALUE exactly as the epsilon's is, and the emission is the SAME
+    // `assemble_rmsnorm` one-plus row the per-`Program` door emits — ONE `add` ahead of the gain
+    // multiply, the formula the program runs, op for op.
+    let ones_const = match ones {
+        None => None,
+        Some(1.0) => {
+            let ones_idx = scale_slot(layout, 1.0).ok_or_else(|| Error {
+                message: format!(
+                    "RmsNorm {name}: the program states gain offset 1.0 (the OnePlusScale \
+                     convention), which is absent from `BundleLayout::scalarmul_scales` — the \
+                     descriptor adds it as a bound `[1,1]` const ahead of the gain multiply, so \
+                     the value the program uses must have a registry slot (registry desync)"
+                ),
+            })?;
+            Some(crate::place::act_name(scalarmul_scale_tid(ones_idx)))
+        }
+        Some(other) => {
+            return Err(Error {
+                message: format!(
+                    "RmsNorm {name}: the program states gain offset {other}, which is not a \
+                     gain convention — `GainConvention::from_offset` admits 0.0 (Scale) and 1.0 \
+                     (OnePlusScale) only, so a program stating any other offset is a producer bug"
+                ),
+            });
+        }
+    };
     let x = tensors[0].name();
     let gamma = tensors[1].name();
     let t = out.tid;
-    // ⛔ NO GAIN OFFSET ON THIS DOOR YET — the whole-function chain reader
-    // (`program_rmsnorm_chains`) reads each chain's epsilon but not its gamma leg,
-    // so a whole kernel with a OnePlusScale rmsnorm cannot hand this door the
-    // offset. `None` is the Scale lowering; the first whole-function caller that
-    // needs the offset must widen the chain reader the way it reads eps, or this
-    // door would lower a different formula than the program runs.
     Ok(assemble_rmsnorm(
         &format!("o{t}"),
         rows,
@@ -6229,7 +6254,7 @@ pub fn rmsnorm_at(
         &gamma,
         PlaceId::Act(t),
         &eps_const,
-        None,
+        ones_const.as_deref(),
         sym_id_base,
         layout,
     ))
