@@ -7081,6 +7081,85 @@ mod tests {
             }
         }
     }
+
+    /// The content a gpt-oss reply streams for `pieces` (one engine output each, the last ending
+    /// it on `max_tokens`), through phases 1 and 3 as the step loop runs them.
+    fn harmony_streamed_content(pieces: &[&str]) -> String {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = make_test_request_state(Some(tx));
+        state.reasoning_parser_state =
+            Some(crate::reasoning_parser::GptOssReasoningParser.create_streaming_state());
+        let mut requests = HashMap::from([("req-1".to_string(), state)]);
+        let last = pieces.len() - 1;
+        for (i, text) in pieces.iter().enumerate() {
+            let outputs = vec![EngineCoreOutput {
+                request_id: "req-1".to_string(),
+                new_token_ids: vec![20 + i as u32],
+                finish_reason: (i == last).then_some(FinishReason::Length),
+                stop_reason: None,
+                num_cached_tokens: 0,
+                events: None,
+                new_logprobs: None,
+                new_prompt_logprobs: None,
+                pooler_output: None,
+            }];
+            AsyncEngine::process_outputs_phase1(&mut requests, &outputs);
+            let detok = vec![Some((None, Some(text.to_string())))];
+            AsyncEngine::process_outputs_phase3(&mut requests, outputs, detok);
+        }
+        let mut content = String::new();
+        while let Ok(delta) = rx.try_recv() {
+            content.extend(delta.text);
+        }
+        content
+    }
+
+    /// A gpt-oss reply streams the same content the complete reply splits out, through the
+    /// engine's own routing: every delta goes through the harmony scanner, content included, and
+    /// the scanner's held text is flushed at the end. Reasoning-first, the engine stopped feeding
+    /// it at the first content, so a `<` held there was lost and later markers streamed as text.
+    #[test]
+    fn a_harmony_reply_streams_the_content_the_complete_reply_splits_out() {
+        let header = [
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "think",
+            "<|end|>",
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "final",
+            "<|message|>",
+        ];
+        let finals: [&[&str]; 3] = [
+            // The control: content whose `<` closes in the same delta.
+            &["Use", " \"<", "div", ">\""],
+            // Content whose first delta ends on an unclosed `<`.
+            &["\"<", "div", ">\""],
+            // A second final message after content.
+            &[
+                "Hi",
+                "<|end|>",
+                "<|start|>",
+                "assistant",
+                "<|channel|>",
+                "final",
+                "<|message|>",
+                " again",
+            ],
+        ];
+        for content in finals {
+            let pieces: Vec<&str> = header.iter().chain(content).copied().collect();
+            let whole =
+                crate::reasoning_parser::GptOssReasoningParser.extract_reasoning(&pieces.concat());
+            assert_eq!(
+                Some(harmony_streamed_content(&pieces)),
+                whole.content,
+                "{content:?}"
+            );
+        }
+    }
 }
 
 /// Engine-produced delta streams for the HTTP encoders' tests.

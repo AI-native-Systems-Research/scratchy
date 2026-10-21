@@ -138,20 +138,24 @@ pub trait StreamingReasoningParserState: Send {
 
     /// Whether reasoning can re-open after content in a single generation.
     ///
-    /// Most formats are strictly reasoning-first (DeepSeek, Qwen3, harmony);
-    /// the engine stops routing text through the parser once content has been
-    /// seen. Gemma 4's thought channels interleave — text, then a channel,
-    /// then a tool call — so its parser overrides this and keeps routing
-    /// every delta.
+    /// Most formats are strictly reasoning-first (DeepSeek, Qwen3); the engine
+    /// stops routing text through the parser once content has been seen.
+    /// Gemma 4's thought channels interleave — text, then a channel, then a
+    /// tool call — and so can harmony's messages, so their parsers override
+    /// this and keep routing every delta.
     fn interleaved(&self) -> bool {
         false
     }
 
     /// Release anything the parser held back against a marker that never
-    /// arrived, as a final delta. Called once when the request finishes;
-    /// parsers that hold text back across deltas (Gemma 4's channel-name
-    /// hold) must return it here so a reply ending on held text is not
-    /// truncated.
+    /// arrived, as a final delta. Called once when the request finishes, if
+    /// the parser still routes text then: always for an [`interleaved`]
+    /// parser, and for a reasoning-first one only if no content came. A
+    /// parser that holds text back across deltas (Gemma 4's channel-name
+    /// hold, harmony's unclosed `<`) must be interleaved, and return the text
+    /// here, so a reply ending on held text is not truncated.
+    ///
+    /// [`interleaved`]: StreamingReasoningParserState::interleaved
     fn flush(&mut self) -> ReasoningDelta {
         ReasoningDelta::None
     }
@@ -682,6 +686,14 @@ impl StreamingReasoningParserState for GptOssStreamingState {
         let (mut reasoning, mut content) = (String::new(), String::new());
         self.0.finish(&mut reasoning, &mut content);
         reasoning_delta(reasoning, content)
+    }
+
+    /// Every delta goes through the scanner, content included: a harmony reply can open another
+    /// channel after content (a later message), and the scanner may hold a `<` that the next
+    /// delta closes. Left to the engine after the first content, the held `<` was lost and any
+    /// later marker streamed as text.
+    fn interleaved(&self) -> bool {
+        true
     }
 }
 
@@ -2452,8 +2464,9 @@ mod gemma4_tests {
         let parser = Gemma4ReasoningParser;
         assert!(parser.requires_special_tokens());
         assert!(parser.create_streaming_state().interleaved());
-        // Harmony is reasoning-first; its markers are special tokens in gpt-oss's tokenizer.
+        // Harmony's messages interleave too, and its markers are special tokens in gpt-oss's
+        // tokenizer.
         assert!(GptOssReasoningParser.requires_special_tokens());
-        assert!(!GptOssReasoningParser.create_streaming_state().interleaved());
+        assert!(GptOssReasoningParser.create_streaming_state().interleaved());
     }
 }
