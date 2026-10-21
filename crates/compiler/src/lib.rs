@@ -283,6 +283,7 @@ mod dispatcher;
 #[cfg(feature = "metal")]
 pub use dispatcher::{
     ChainStepHandle, GpuExecutionFailed, MetalChainBody, MetalForwardFollowup, MetalForwardOnto,
+    SampledRowCount,
 };
 // Backend-neutral contracts — the `ScratchyWeights` trait (its device-runtime
 // forward methods take the neutral `ForwardCtxHandle` / `ForwardDeviceHandle`)

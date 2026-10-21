@@ -3314,7 +3314,9 @@ fn metal_chain_dispatch(
             }
 
             for iter in 0..k_usize {
-                handle.run_forward_step(enc, num_tokens_u32, num_reqs_u32, num_reqs_u32)?;
+                // A K-step decode samples each sequence's one row.
+                let sampled = ::scratchy_forward_compiler::SampledRowCount(num_reqs_u32);
+                handle.run_forward_step(enc, num_tokens_u32, num_reqs_u32, sampled)?;
 
                 let table = &argmax_arg_tables_for_closure[iter];
                 let out_addr = argmax_bufs_for_closure[iter].gpuAddress();

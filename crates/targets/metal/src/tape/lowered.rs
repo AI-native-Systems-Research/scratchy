@@ -1972,6 +1972,21 @@ impl LoweredMetalTape {
         }
     }
 
+    /// What a step sampling `sampled` rows writes of the logits past the buffer `decode_rows`
+    /// sizes (`None`: the buffer holds it). A command over every row of a step that samples each
+    /// writes whole tiles of them, so the step writes what a buffer for `sampled` rows holds
+    /// ([`Self::logits_slot_rows`] at them) — more than `sampled` where the bucket's rows are no
+    /// whole number of tiles, and more than the buffer when `sampled` passes `decode_rows`.
+    pub fn logits_overflow(
+        &self,
+        decode_rows: Option<DecodeRows>,
+        sampled: crate::tape::ids::SampledRowCount,
+    ) -> Option<LogitsOverflow> {
+        let holds = self.logits_slot_rows(decode_rows);
+        let writes = self.logits_slot_rows(Some(DecodeRows(sampled.get())));
+        (writes > holds).then_some(LogitsOverflow { writes, holds })
+    }
+
     pub fn commands_expanded(&self) -> Vec<GatedCommand> {
         let mut out = Vec::with_capacity(self.commands.len());
         let cmds = self.commands;
@@ -2046,6 +2061,13 @@ pub enum LogitsRows {
     /// matvec and the logit tail one a row, the matmul over every row of a step that samples each
     /// its own tile: the buffer holds the most rows a step samples, so tiled.
     Sampled { tile: RowTile },
+}
+
+/// Logits rows a step writes (`writes`) past the rows its bucket's buffer holds (`holds`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogitsOverflow {
+    pub writes: u32,
+    pub holds: u32,
 }
 
 /// The rows one threadgroup of a command over the logits writes along its row axis: the tile of

@@ -1018,16 +1018,16 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         })
     }
 
-    /// [`Self::pick_bucket`] for `inputs`' step, which its bucket's logits buffer must hold: a step
-    /// sampling more rows than it does would write its logits past the buffer.
+    /// [`Self::pick_bucket`] for `inputs`' step, whose logits its bucket's buffer must hold
+    /// ([`LoweredMetalTape::logits_overflow`]): a step writing more would write past it.
     pub fn pick_bucket_for(&self, inputs: &ForwardInputs<'_>) -> Result<usize, ForwardError> {
         let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
-        let holds = self.bucket_tapes[bucket_idx].logits_slot_rows(self.decode_rows);
-        let sampled = inputs.sampled_rows().len();
-        if sampled > holds as usize {
-            return Err(ForwardError::TooManySampledRows { sampled, holds });
+        let sampled = inputs.sampled_row_count();
+        let tape = &self.bucket_tapes[bucket_idx];
+        match tape.logits_overflow(self.decode_rows, sampled) {
+            Some(overflow) => Err(ForwardError::TooManySampledRows { sampled, overflow }),
+            None => Ok(bucket_idx),
         }
-        Ok(bucket_idx)
     }
 
     /// Lazily build the pool's MTL4 surface (queue + allocator +
@@ -2162,7 +2162,7 @@ fn write_runtime_inputs(
     )?;
     // The rows the forward samples: the lm_head slice gathers them and puts them back, a
     // compaction moves their logits to the front.
-    let sampled = inputs.sampled_rows();
+    let sampled = inputs.sampled_rows;
     write(
         "num_sample_rows",
         &runtime.num_sample_rows_u32,
@@ -2172,7 +2172,7 @@ fn write_runtime_inputs(
     write(
         "sampled_rows",
         &runtime.sample_indices,
-        bytes_of(&sampled[..]),
+        bytes_of(sampled),
         Padding::Zero,
     )?;
     // GDN per-forward indices (hybrid arches only): a `GdnSeqSlots` record
@@ -2295,6 +2295,10 @@ mod tests {
     use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    /// The rows a step of at most 9 one-row sequences samples, its first `n` for `n` rows: every
+    /// row, each its sequence's last.
+    const EVERY_ROW: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 
     /// The test tapes' variant: `TestWeights`' block capacity, no TurboQuant decode attention.
     const TEST_VARIANT: TapeVariant = TapeVariant {
@@ -2464,6 +2468,30 @@ mod tests {
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             cache_live: &[],
         }
+    }
+
+    /// A step's logits fit its bucket's buffer only if every row its tape writes does. A 96-row
+    /// bucket tiled by 64 (NAX) whose buffer is sized for 40 sampled rows holds one tile, 64 rows:
+    /// a step sampling 64 rows passes that count, but the matmul over every row runs
+    /// `⌈2 · 64 / 96⌉ = 2` tiles, the bucket's 96 rows, so it is refused.
+    #[test]
+    fn a_step_whose_tiles_pass_the_logits_buffer_is_refused() {
+        use crate::tape::ids::{DecodeRows, SampledRowCount};
+        use crate::tape::lowered::{LogitsOverflow, LogitsRows, RowTile};
+        let tape = LoweredMetalTape {
+            logits_rows: LogitsRows::Sampled {
+                tile: RowTile::Rows64,
+            },
+            ..synthetic_tape(96)
+        };
+        let decode_rows = Some(DecodeRows(40));
+        assert_eq!(tape.logits_slot_rows(decode_rows), 64);
+        let overflow = |n| tape.logits_overflow(decode_rows, SampledRowCount(n));
+        assert_eq!(overflow(40), None);
+        let (writes, holds) = (96, 64);
+        assert_eq!(overflow(64), Some(LogitsOverflow { writes, holds }));
+        // A buffer of the bucket's rows holds every row the bucket runs.
+        assert_eq!(tape.logits_overflow(None, SampledRowCount(96)), None);
     }
 
     /// Build a pool with `max_workers = max` for a one-bucket
@@ -2821,7 +2849,7 @@ mod tests {
             cu_seqlens_q: Some(cu),
             seq_used_k: Some(used),
             block_tables: vec![table],
-            sampled_rows: None,
+            sampled_rows: &EVERY_ROW[..2],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -2884,7 +2912,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            sampled_rows: None,
+            sampled_rows: &EVERY_ROW[..1],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -2983,7 +3011,7 @@ mod tests {
                 cu_seqlens_q: None,
                 seq_used_k: None,
                 block_tables: Vec::new(),
-                sampled_rows: None,
+                sampled_rows: &EVERY_ROW[..ids.len()],
                 gdn_state_indices: None,
                 gdn_is_fresh: None,
                 vision_rope_freqs: None,
@@ -3063,7 +3091,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            sampled_rows: None,
+            sampled_rows: &EVERY_ROW[..4],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -3120,7 +3148,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            sampled_rows: None,
+            sampled_rows: &EVERY_ROW[..<[u32]>::len(ids)],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -3224,7 +3252,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            sampled_rows: None,
+            sampled_rows: &EVERY_ROW[..0],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -3267,7 +3295,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            sampled_rows: None,
+            sampled_rows: &EVERY_ROW[..9],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -3320,7 +3348,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            sampled_rows: None,
+            sampled_rows: &EVERY_ROW[..1],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,

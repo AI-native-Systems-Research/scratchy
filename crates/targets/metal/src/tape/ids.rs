@@ -184,6 +184,11 @@ pub use crate::tape::constants::ConstSlot;
 // obvious mistake (`HeadDim(W::NUM_Q_HEADS)`) rather than silent
 // reordering of two interchangeable `u32`s.
 
+/// The rows one step samples (its `SampleIndices`' length): the count the chain step's trait
+/// carries ([`scratchy_forward_compiler::ChainStepHandle`]), read by a runtime gate and a
+/// [`crate::tape::lowered::SetAxis`].
+pub use scratchy_forward_compiler::SampledRowCount;
+
 macro_rules! u32_newtype {
     ($($(#[$m:meta])* $name:ident),* $(,)?) => {$(
         $(#[$m])*
@@ -322,10 +327,6 @@ u32_newtype!(
     /// ([`crate::tape::lowered::LoweredMetalTape::scratch_bytes`]), and the logits buffer holds
     /// ([`crate::tape::lowered::LoweredMetalTape::logits_rows`]).
     DecodeRows,
-    /// The rows one step samples (its `SampleIndices`' length): one a sequence, every row of a
-    /// sequence verifying drafts — what a runtime gate and a [`crate::tape::lowered::SetAxis`]
-    /// read.
-    SampledRowCount,
     /// Logits per row a model's forward leaves (`METAL_VOCAB_SIZE`): the width the off-tape
     /// kernels (argmax, grammar mask, sampler) read ([`crate::off_tape`]).
     LogitsWidth,

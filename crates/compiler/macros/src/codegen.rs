@@ -15027,7 +15027,7 @@ pub fn emit_model(
     // The rows of the terminal slot a forward leaves for its caller: a decoder's logits of the
     // rows its step samples, at the front; an encoder's hidden state at every row.
     let terminal_rows = match layout {
-        BackboneLayout::Decoder { .. } => quote! { inputs.sampled_rows().len() },
+        BackboneLayout::Decoder { .. } => quote! { inputs.sampled_rows.len() },
         BackboneLayout::Encoder => quote! { n },
     };
 
@@ -15649,7 +15649,8 @@ pub fn emit_model(
         }
 
         /// The runtime inputs `ctx` carries for a forward of `num_tokens` tokens, handed to `run`:
-        /// they borrow the host slices `ctx`'s views point at and the rows built here.
+        /// they borrow the host slices `ctx`'s views point at and the rows built here. Refused
+        /// when they name no rows to sample (`ForwardError::EmptySequence`).
         ///
         /// # Safety
         /// Every non-null view in `ctx` points at host-visible memory of its numel.
@@ -15658,7 +15659,7 @@ pub fn emit_model(
             ctx: &crate::__gpu::ForwardCtx,
             num_tokens: u64,
             run: impl FnOnce(&::scratchy_target_metal::interpreter::metal::ForwardInputs<'_>) -> R,
-        ) -> R {
+        ) -> ::core::result::Result<R, ::scratchy_target_metal::interpreter::metal::ForwardError> {
             // ── Read host-visible input slices off ctx ────────────
             //
             // Under metal, every `TensorView` in `ctx` resolves to a
@@ -15744,7 +15745,7 @@ pub fn emit_model(
 
             // The rows the forward samples (`None`: each sequence's last), resolved once here
             // for every reader of the inputs: the lm_head leaves their logits at the front of
-            // its output, in order.
+            // its output, in order. A sequence of no rows has no last row: refused.
             let last_rows;
             let sampled_rows: &[u32] = match ctx.sampled_rows.as_ref() {
                 ::std::option::Option::Some(view) => {
@@ -15755,11 +15756,11 @@ pub fn emit_model(
                     last_rows = ::scratchy_target_metal::interpreter::metal::ForwardInputs::last_rows(
                         cu_seqlens_q,
                         num_tokens as u32,
-                    );
-                    &last_rows
+                    )
+                    .map_err(::scratchy_target_metal::interpreter::metal::ForwardError::EmptySequence)?;
+                    last_rows.rows()
                 }
             };
-            let sampled_rows = ::std::option::Option::Some(sampled_rows);
 
             // GDN per-forward indices (hybrid arches): read from ctx's
             // host-visible TensorViews (a `GdnSeqSlots` record — 6 i32s —
@@ -15909,7 +15910,7 @@ pub fn emit_model(
                 deferred: ctx.deferred,
                 reads: ctx.reads,
             };
-            run(&inputs)
+            ::core::result::Result::Ok(run(&inputs))
         }
 
         #metal_rope_rows_fn
@@ -16028,6 +16029,7 @@ pub fn emit_model(
                     tail_adapter,
                 )
             })
+            .and_then(::core::convert::identity)
             // A command buffer the GPU failed (an out-of-memory, say) fails this step, not the
             // worker thread: the executor fails its requests and schedules again. Any other error
             // is an invariant the forward broke (no bucket fits, a block table of the wrong width,
@@ -16073,6 +16075,7 @@ pub fn emit_model(
                 ) -> ::core::result::Result<(), ::std::string::String> {
                     let ctx: &crate::__gpu::ForwardCtx = unsafe { ctx.as_ref() };
                     with_forward_inputs(ctx, num_tokens, |inputs| self.0.then(inputs, encoder))
+                        .and_then(::core::convert::identity)
                         .map_err(|e| format!("Onto::then: {e}"))
                 }
 
@@ -16100,6 +16103,7 @@ pub fn emit_model(
             }
             let pool = resident_metal_pool(wm, ctx, device);
             with_forward_inputs(ctx, num_tokens, |inputs| pool.forward_onto(inputs, encoder))
+                .and_then(::core::convert::identity)
                 .map(|onto| ::std::boxed::Box::new(Onto(onto))
                     as ::std::boxed::Box<dyn ::scratchy_forward_compiler::MetalForwardOnto + 'w>)
                 .map_err(|e| format!("MetalWorkerPool::forward_onto: {e}"))
@@ -16162,14 +16166,14 @@ pub fn emit_model(
                                 >,
                                 num_tokens: u32,
                                 num_seqs: u32,
-                                sampled_rows: u32,
+                                sampled_rows: ::scratchy_forward_compiler::SampledRowCount,
                             ) -> ::core::result::Result<(), ::std::string::String> {
                                 self.worker
                                     .run_bucket_mtl4(
                                         self.bucket_idx,
                                         num_tokens,
                                         num_seqs,
-                                        ::scratchy_target_metal::tape::ids::SampledRowCount(sampled_rows),
+                                        sampled_rows,
                                         ::scratchy_target_metal::interpreter::metal::ForwardReads::Outputs,
                                         encoder,
                                     )
@@ -16208,6 +16212,8 @@ pub fn emit_model(
                 )
                 .map_err(|e| format!("MetalWorkerPool::with_chain_encoder: {e}"))
             })
+            .map_err(|e| format!("forward_chain_with_encoder: {e}"))
+            .and_then(::core::convert::identity)
         }
     };
 

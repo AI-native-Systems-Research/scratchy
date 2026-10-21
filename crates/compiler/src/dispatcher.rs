@@ -501,6 +501,20 @@ pub trait MetalForwardOnto {
     fn vocab(&self) -> u32;
 }
 
+/// The rows one forward samples (its sampled rows' count): one a sequence, every row of a
+/// sequence verifying drafts — the logits it leaves at the front of its output, what a metal
+/// tape's runtime gates and sampled-rows grids read.
+#[cfg(feature = "metal")]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct SampledRowCount(pub u32);
+
+#[cfg(feature = "metal")]
+impl SampledRowCount {
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// Non-generic view of the macro-emitted MetalWorker for the
 /// spec-decode K-step chain body. The body holds an
 /// `&dyn ChainStepHandle` and calls `run_forward_step` K times to
@@ -519,7 +533,7 @@ pub trait ChainStepHandle {
         encoder: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         num_tokens: u32,
         num_seqs: u32,
-        sampled_rows: u32,
+        sampled_rows: SampledRowCount,
     ) -> Result<(), String>;
 
     /// The bucket's terminal arena slot (lm_head output). Stable
