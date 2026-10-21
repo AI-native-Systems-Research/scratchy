@@ -2222,17 +2222,26 @@ impl AsyncEngine {
                 //    for here — the batch queued behind it keeps the GPU busy —
                 //    and fails its step like an executor error if its device
                 //    work did.
+                //    The wait blocks its thread for the step's device work, so
+                //    it runs on a blocking thread, never this task's worker:
+                //    there it held the streams this loop had just woken (in
+                //    the worker's LIFO slot, which no other worker steals)
+                //    until the loop next yielded, and their chunks went out
+                //    in bursts.
                 if gpu_in_flight > 0 {
-                    let received =
-                        model_rx
-                            .recv()
-                            .await
-                            .map(|ExecutorResult::Model(result, sched)| {
-                                let resolved = result
+                    let received = match model_rx.recv().await {
+                        Some(ExecutorResult::Model(result, sched)) => {
+                            let resolved = tokio::task::spawn_blocking(move || {
+                                result
                                     .map_err(|e| e.to_string())
-                                    .and_then(|mut output| output.resolve().map(|()| output));
-                                (resolved, sched)
-                            });
+                                    .and_then(|mut output| output.resolve().map(|()| output))
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("resolving the step: {e}")));
+                            Some((resolved, sched))
+                        }
+                        None => None,
+                    };
                     match received {
                         Some((Ok(model_output), sched)) => {
                             deferred = Some((sched, model_output));
@@ -6508,6 +6517,125 @@ mod tests {
                 || err_msg.contains("Executor error")
                 || err_msg.contains("step loop exited"),
             "unexpected error: {err_msg}"
+        );
+    }
+
+    /// An executor whose steps resolve as a device's do: each output deferred, its resolve
+    /// blocking its thread for a 2 ms device step — by when the step behind it has its output
+    /// queued — and then until the request's stream has received every step before it, what a
+    /// device step's wait overlaps when the step loop holds no stream behind it, or until a
+    /// second passes, a stall it counts.
+    struct DeviceStepExecutor {
+        inner: NoopExecutor,
+        steps: usize,
+        streamed: Arc<std::sync::atomic::AtomicUsize>,
+        stalls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl scratchy_serving_engine::executor::Executor for DeviceStepExecutor {
+        /// It samples no grammar.
+        fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
+
+        fn execute_model(
+            &mut self,
+            scheduler_output: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
+        ) -> scratchy_serving_engine::error::EngineResult<
+            scratchy_serving_engine::executor::ModelRunnerOutput,
+        > {
+            use std::sync::atomic::Ordering::SeqCst;
+            let output = self.inner.execute_model(scheduler_output)?;
+            let before = self.steps;
+            self.steps += 1;
+            let (streamed, stalls) = (Arc::clone(&self.streamed), Arc::clone(&self.stalls));
+            let tokens = output.sampled_token_ids.into_iter().flatten().collect();
+            Ok(
+                scratchy_serving_engine::executor::ModelRunnerOutput::deferred(
+                    output.req_ids,
+                    Box::new(move || {
+                        std::thread::sleep(Duration::from_millis(2));
+                        let deadline = Instant::now() + Duration::from_secs(1);
+                        while streamed.load(SeqCst) < before {
+                            if Instant::now() > deadline {
+                                stalls.fetch_add(1, SeqCst);
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Ok(tokens)
+                    }),
+                ),
+            )
+        }
+
+        fn initialize_cache(
+            &mut self,
+            num_gpu_blocks: usize,
+            num_cpu_blocks: usize,
+        ) -> scratchy_serving_engine::error::EngineResult<()> {
+            self.inner.initialize_cache(num_gpu_blocks, num_cpu_blocks)
+        }
+
+        fn determine_available_memory(
+            &mut self,
+        ) -> scratchy_serving_engine::error::EngineResult<Vec<usize>> {
+            self.inner.determine_available_memory()
+        }
+
+        fn shutdown(&mut self) {
+            self.inner.shutdown()
+        }
+
+        fn is_sleeping(&self) -> bool {
+            self.inner.is_sleeping()
+        }
+    }
+
+    /// The async step loop waits out a deferred step's device work without holding the streams
+    /// it just sent a step's tokens to: each reaches its reader while the next step resolves.
+    /// Waited for on the loop's own worker, a reader that step had woken sat in that worker's
+    /// LIFO slot, which no other worker steals, until the loop next yielded — its tokens went
+    /// out in bursts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_async_loop_streams_each_step_while_the_next_resolves() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (streamed, stalls) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let executor = DeviceStepExecutor {
+            inner: NoopExecutor::new(1024),
+            steps: 0,
+            streamed: Arc::clone(&streamed),
+            stalls: Arc::clone(&stalls),
+        };
+        // The scheduler's own flag too: a step is scheduled behind the one in flight, so the
+        // loop's wait for its result is ready at once, as a device step's is.
+        let mut config = make_engine_config();
+        config.async_scheduling = true;
+        config.scheduler_config.async_scheduling = Some(true);
+        let client = Box::new(InprocClient::new(config, Box::new(executor)));
+        let mut engine = AsyncEngine::new(client, "test-model".to_string(), 4096);
+        engine.set_async_scheduling(true);
+        let engine = Arc::new(engine);
+        engine.spawn_step_loop();
+
+        let mut request =
+            make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1, 2, 3])));
+        request.max_tokens = Some(64);
+        request.stream = true;
+        let (_, _, mut rx) = engine.completion_stream(request).await.unwrap();
+        // The stream's reader is a task of the runtime, as a server connection's is.
+        let reader = Arc::clone(&streamed);
+        tokio::spawn(async move {
+            while rx.recv().await.is_some() {
+                reader.fetch_add(1, SeqCst);
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(streamed.load(SeqCst) >= 64, "every token streamed");
+        assert_eq!(
+            stalls.load(SeqCst),
+            0,
+            "steps resolved with their stream held"
         );
     }
 
