@@ -141,6 +141,14 @@ jobs:
           --features scratchy-serving-api/nccl,scratchy-models/smollm2-135m
           -- -D warnings
 
+      # The e2e tests' cuda half, type-checked and linted: the macOS e2e step
+      # compiles their cuda-only files empty, and the workspace clippy above has
+      # no `--tests`, so no other step builds them.
+      - name: Lint the cuda e2e tests
+        run: cargo clippy -p scratchy-e2e -p scratchy-models
+          --features e2e,cuda,scratchy-models/smollm2-135m
+          --tests -- -D warnings
+
       # The multi-node control plane, the rank rendezvous and the channel
       # that carries `ControlMessage` to followers, is plain TCP + serde: no
       # backend, no GPU. Only NCCL's own collectives need the hardware.
@@ -434,14 +442,21 @@ jobs:
       # GPU. This runner's paravirtual GPU has none, so each test would return
       # early (`skip_if_no_gpu!`) and pass without running. What CI can check
       # here is that the files compile and lint clean; run them on a real GPU.
-      # Every test target (`--tests`), not a named few: the ones no step named
-      # rotted against API changes nobody saw (#290 — e_batch, e_embedding,
-      # e_pooling, …). They are type-checked only, on the build this step
-      # already does; a cuda-only file compiles empty here.
+      # `--tests` type-checks every e2e test target (a cuda-only file compiles
+      # empty here), and, since `-p scratchy-models` is what names the model,
+      # scratchy-models' own lib and integration tests at that model. `otel` is
+      # on so e_otel.rs, which needs it, compiles too.
       - name: Lint the metal e2e tests
         run: cargo clippy -p scratchy-e2e -p scratchy-models
-          --features e2e,metal,scratchy-models/smollm2-135m
+          --features e2e,metal,otel,scratchy-models/smollm2-135m
           --tests -- -D warnings
+
+      # scratchy-cli's own test targets (its unit tests and
+      # tests/arch_feature_passthrough.rs), type-checked and linted: no other
+      # step builds them.
+      - name: Lint scratchy-cli's test targets
+        run: cargo clippy -p scratchy-cli --features metal,claude,model/smollm2-135m
+          --all-targets -- -D warnings
 
       # See the clippy job's last step.
       - name: Compiled no crate macos-scope skips for

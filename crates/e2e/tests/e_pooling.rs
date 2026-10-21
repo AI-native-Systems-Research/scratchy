@@ -112,7 +112,7 @@ async fn test_pooling_embedding_normalized() {
     ));
     let response = client.embedding(&request).await.unwrap();
 
-    let emb = &embedding_vector(&response.data[0]);
+    let emb = embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -138,7 +138,7 @@ async fn test_pooling_embedding_dimensions() {
     assert_eq!(embedding_vector(&response.data[0]).len(), 32);
 
     // Should still be normalized after truncation.
-    let emb = &embedding_vector(&response.data[0]);
+    let emb = embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -170,8 +170,8 @@ async fn test_pooling_different_inputs_differ() {
         .await
         .unwrap();
 
-    let emb1 = &embedding_vector(&resp1.data[0]);
-    let emb2 = &embedding_vector(&resp2.data[0]);
+    let emb1 = embedding_vector(&resp1.data[0]);
+    let emb2 = embedding_vector(&resp2.data[0]);
     let cosine: f32 = emb1.iter().zip(emb2.iter()).map(|(a, b)| a * b).sum();
     assert!(
         cosine < 0.999,
@@ -249,7 +249,7 @@ async fn test_pooling_mean_strategy() {
     assert_eq!(response.data.len(), 1);
     assert!(!embedding_vector(&response.data[0]).is_empty());
 
-    let emb = &embedding_vector(&response.data[0]);
+    let emb = embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -337,7 +337,7 @@ async fn test_cuda_pooling_normalized() {
     ));
     let response = client.embedding(&request).await.unwrap();
 
-    let emb = &embedding_vector(&response.data[0]);
+    let emb = embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -410,7 +410,7 @@ async fn test_cuda_pooling_mean_strategy() {
     assert_eq!(response.data.len(), 1);
     assert!(!embedding_vector(&response.data[0]).is_empty());
 
-    let emb = &embedding_vector(&response.data[0]);
+    let emb = embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -437,7 +437,7 @@ async fn test_cuda_pooling_cls_strategy() {
     assert_eq!(response.data.len(), 1);
     assert!(!embedding_vector(&response.data[0]).is_empty());
 
-    let emb = &embedding_vector(&response.data[0]);
+    let emb = embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -470,8 +470,8 @@ async fn test_cuda_pooling_different_inputs_differ() {
         .await
         .unwrap();
 
-    let emb1 = &embedding_vector(&resp1.data[0]);
-    let emb2 = &embedding_vector(&resp2.data[0]);
+    let emb1 = embedding_vector(&resp1.data[0]);
+    let emb2 = embedding_vector(&resp2.data[0]);
     let cosine: f32 = emb1.iter().zip(emb2.iter()).map(|(a, b)| a * b).sum();
     assert!(
         cosine < 0.999,

@@ -86,7 +86,6 @@ async fn start_baseline_server(model: &str) -> TestServer {
 // ===========================================================================
 
 /// Basic: server starts, generates coherent text with spec decode.
-#[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_spec_decode_basic_completion() {
@@ -108,7 +107,6 @@ async fn test_cuda_spec_decode_basic_completion() {
 }
 
 /// Basic: chat completion with spec decode.
-#[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_spec_decode_chat() {
@@ -132,7 +130,6 @@ async fn test_cuda_spec_decode_chat() {
 ///
 /// This is the most important spec decode test. If this fails, the rejection
 /// sampling logic is broken.
-#[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_spec_decode_matches_baseline() {
@@ -193,7 +190,6 @@ async fn test_cuda_spec_decode_matches_baseline() {
 }
 
 /// Streaming: verify SSE events arrive and form coherent text.
-#[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_spec_decode_streaming() {
@@ -241,7 +237,6 @@ async fn test_cuda_spec_decode_streaming() {
 }
 
 /// Metrics: verify spec decode Prometheus counters are present and populated.
-#[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_spec_decode_metrics() {
@@ -294,7 +289,6 @@ async fn test_cuda_spec_decode_metrics() {
 }
 
 /// Multiple concurrent requests with spec decode.
-#[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_spec_decode_concurrent() {

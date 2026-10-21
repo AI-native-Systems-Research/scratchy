@@ -10,6 +10,7 @@
 
 #![cfg(feature = "e2e")]
 
+use scratchy_e2e::assertions::{embedding_vector, embedding_vectors};
 use scratchy_e2e::{Client, TestModels, TestServer};
 use scratchy_serving_api::protocol::{EmbeddingInput, EmbeddingRequest};
 
@@ -21,29 +22,6 @@ fn embed_request(input: EmbeddingInput) -> EmbeddingRequest {
         dimensions: None,
         user: None,
     }
-}
-
-/// Extract a flat `Vec<f32>` from the embedding JSON value (single-vector case).
-fn embedding_as_vec(value: &serde_json::Value) -> Vec<f32> {
-    value
-        .as_array()
-        .expect("embedding should be a JSON array")
-        .iter()
-        .map(|v| v.as_f64().expect("embedding element should be a number") as f32)
-        .collect()
-}
-
-/// Get the length of the embedding JSON array.
-fn embedding_len(value: &serde_json::Value) -> usize {
-    value
-        .as_array()
-        .expect("embedding should be a JSON array")
-        .len()
-}
-
-/// Check if the embedding JSON array is non-empty.
-fn embedding_is_nonempty(value: &serde_json::Value) -> bool {
-    value.as_array().map(|a| !a.is_empty()).unwrap_or(false)
 }
 
 // ===========================================================================
@@ -68,16 +46,16 @@ async fn test_modernbert_cls_embedding() {
     assert_eq!(response.object, "list");
     assert_eq!(response.data.len(), 1);
     assert_eq!(response.data[0].index, 0);
-    assert!(embedding_is_nonempty(&response.data[0].embedding));
+    assert!(!embedding_vector(&response.data[0]).is_empty());
     // ModernBERT-base hidden_size = 768
     assert_eq!(
-        embedding_len(&response.data[0].embedding),
+        embedding_vector(&response.data[0]).len(),
         768,
         "ModernBERT-base should produce 768-dim embeddings"
     );
 
     // Should be L2-normalized.
-    let emb = embedding_as_vec(&response.data[0].embedding);
+    let emb = embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -107,9 +85,9 @@ async fn test_modernbert_mean_embedding() {
     let response = client.embedding(&request).await.unwrap();
 
     assert_eq!(response.data.len(), 1);
-    assert_eq!(embedding_len(&response.data[0].embedding), 768);
+    assert_eq!(embedding_vector(&response.data[0]).len(), 768);
 
-    let emb = embedding_as_vec(&response.data[0].embedding);
+    let emb = embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -143,7 +121,7 @@ async fn test_modernbert_multiple_embeddings() {
     assert_eq!(response.data.len(), 3);
     for (i, d) in response.data.iter().enumerate() {
         assert_eq!(d.index, i);
-        assert_eq!(embedding_len(&d.embedding), 768);
+        assert_eq!(embedding_vector(d).len(), 768);
     }
 }
 
@@ -176,8 +154,8 @@ async fn test_modernbert_different_inputs_differ() {
         .await
         .unwrap();
 
-    let emb1 = embedding_as_vec(&resp1.data[0].embedding);
-    let emb2 = embedding_as_vec(&resp2.data[0].embedding);
+    let emb1 = embedding_vector(&resp1.data[0]);
+    let emb2 = embedding_vector(&resp2.data[0]);
     let cosine: f32 = emb1.iter().zip(emb2.iter()).map(|(a, b)| a * b).sum();
     assert!(
         cosine < 0.999,
@@ -205,9 +183,10 @@ async fn test_modernbert_all_tokens_embedding() {
     let response = client.embedding(&request).await.unwrap();
 
     assert_eq!(response.data.len(), 1);
-    // AllTokens returns 2D embedding — each token gets its own vector.
-    // The embedding field is a JSON array of arrays.
-    assert!(embedding_is_nonempty(&response.data[0].embedding));
+    // AllTokens returns 2D embedding — each token gets its own vector, all one width.
+    let rows = embedding_vectors(&response.data[0]);
+    assert!(!rows.is_empty() && !rows[0].is_empty());
+    assert!(rows.iter().all(|r| r.len() == rows[0].len()));
 }
 
 // ===========================================================================
@@ -259,9 +238,9 @@ async fn test_cuda_modernbert_cls_embedding() {
     let response = client.embedding(&request).await.unwrap();
 
     assert_eq!(response.data.len(), 1);
-    assert_eq!(embedding_len(&response.data[0].embedding), 768);
+    assert_eq!(embedding_vector(&response.data[0]).len(), 768);
 
-    let emb = embedding_as_vec(&response.data[0].embedding);
+    let emb = embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -288,7 +267,7 @@ async fn test_cuda_modernbert_mean_embedding() {
     let response = client.embedding(&request).await.unwrap();
 
     assert_eq!(response.data.len(), 1);
-    assert_eq!(embedding_len(&response.data[0].embedding), 768);
+    assert_eq!(embedding_vector(&response.data[0]).len(), 768);
 }
 
 #[cfg(feature = "cuda")]
@@ -311,8 +290,8 @@ async fn test_cuda_modernbert_multiple_embeddings() {
     let response = client.embedding(&request).await.unwrap();
 
     assert_eq!(response.data.len(), 2);
-    assert_eq!(embedding_len(&response.data[0].embedding), 768);
-    assert_eq!(embedding_len(&response.data[1].embedding), 768);
+    assert_eq!(embedding_vector(&response.data[0]).len(), 768);
+    assert_eq!(embedding_vector(&response.data[1]).len(), 768);
 }
 
 #[cfg(feature = "cuda")]
@@ -332,5 +311,7 @@ async fn test_cuda_modernbert_all_tokens_embedding() {
     let response = client.embedding(&request).await.unwrap();
 
     assert_eq!(response.data.len(), 1);
-    assert!(embedding_is_nonempty(&response.data[0].embedding));
+    let rows = embedding_vectors(&response.data[0]);
+    assert!(!rows.is_empty() && !rows[0].is_empty());
+    assert!(rows.iter().all(|r| r.len() == rows[0].len()));
 }

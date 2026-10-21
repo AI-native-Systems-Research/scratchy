@@ -111,7 +111,7 @@ async fn test_embedding_normalized() {
     ));
     let response = client.embedding(&request).await.unwrap();
 
-    let emb = &embedding_vector(&response.data[0]);
+    let emb = embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -138,8 +138,8 @@ async fn test_embedding_different_inputs() {
     let resp2 = client.embedding(&req2).await.unwrap();
 
     // Embeddings should be different.
-    let emb1 = &embedding_vector(&resp1.data[0]);
-    let emb2 = &embedding_vector(&resp2.data[0]);
+    let emb1 = embedding_vector(&resp1.data[0]);
+    let emb2 = embedding_vector(&resp2.data[0]);
     let cosine: f32 = emb1.iter().zip(emb2.iter()).map(|(a, b)| a * b).sum();
     assert!(
         cosine < 0.999,
@@ -168,7 +168,7 @@ async fn test_embedding_mean_pooling() {
     let response = client.embedding(&request).await.unwrap();
 
     assert_eq!(response.data.len(), 1);
-    let emb = &embedding_vector(&response.data[0]);
+    let emb = embedding_vector(&response.data[0]);
     assert!(!emb.is_empty());
 
     // Should be L2-normalized regardless of pooling strategy.
@@ -196,7 +196,7 @@ async fn test_embedding_cls_pooling() {
     let response = client.embedding(&request).await.unwrap();
 
     assert_eq!(response.data.len(), 1);
-    let emb = &embedding_vector(&response.data[0]);
+    let emb = embedding_vector(&response.data[0]);
     assert!(!emb.is_empty());
 
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -233,8 +233,8 @@ async fn test_embedding_mean_vs_last_differ() {
         .await
         .unwrap();
 
-    let emb_mean = &embedding_vector(&resp_mean.data[0]);
-    let emb_last = &embedding_vector(&resp_last.data[0]);
+    let emb_mean = embedding_vector(&resp_mean.data[0]);
+    let emb_last = embedding_vector(&resp_last.data[0]);
 
     // Same model, same input, different strategies → different embeddings.
     assert_eq!(emb_mean.len(), emb_last.len());
@@ -313,7 +313,7 @@ async fn test_cuda_embedding_normalized() {
     ));
     let response = client.embedding(&request).await.unwrap();
 
-    let emb = &embedding_vector(&response.data[0]);
+    let emb = embedding_vector(&response.data[0]);
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 0.01,
@@ -345,8 +345,8 @@ async fn test_cuda_embedding_different_inputs() {
         .await
         .unwrap();
 
-    let emb1 = &embedding_vector(&resp1.data[0]);
-    let emb2 = &embedding_vector(&resp2.data[0]);
+    let emb1 = embedding_vector(&resp1.data[0]);
+    let emb2 = embedding_vector(&resp2.data[0]);
     let cosine: f32 = emb1.iter().zip(emb2.iter()).map(|(a, b)| a * b).sum();
     assert!(
         cosine < 0.999,
@@ -390,7 +390,7 @@ async fn test_cuda_embedding_mean_pooling() {
     let response = client.embedding(&request).await.unwrap();
 
     assert_eq!(response.data.len(), 1);
-    let emb = &embedding_vector(&response.data[0]);
+    let emb = embedding_vector(&response.data[0]);
     assert!(!emb.is_empty());
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
@@ -417,7 +417,7 @@ async fn test_cuda_embedding_cls_pooling() {
     let response = client.embedding(&request).await.unwrap();
 
     assert_eq!(response.data.len(), 1);
-    let emb = &embedding_vector(&response.data[0]);
+    let emb = embedding_vector(&response.data[0]);
     assert!(!emb.is_empty());
     let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(

@@ -17,6 +17,13 @@ pub fn embedding_vector(obj: &EmbeddingObject) -> Vec<f32> {
         .unwrap_or_else(|e| panic!("embedding {} is not one vector: {e}", obj.index))
 }
 
+/// The vectors a multi-vector embedding object carries (ColBERT's `[[f32; D]; T]`, one per
+/// token), and fails on anything else.
+pub fn embedding_vectors(obj: &EmbeddingObject) -> Vec<Vec<f32>> {
+    serde_json::from_value(obj.embedding.clone())
+        .unwrap_or_else(|e| panic!("embedding {} is not a multi-vector: {e}", obj.index))
+}
+
 /// Assert that a chat completion response is well-formed.
 pub fn assert_valid_chat_response(resp: &ChatCompletionResponse) {
     // ID should start with "chatcmpl-"
