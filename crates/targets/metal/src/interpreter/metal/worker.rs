@@ -2728,6 +2728,7 @@ mod tests {
             terminal_slot: 0,
             backbone_slot,
             arena_bytes: &[],
+            logits_row_bytes: 0,
             backbone: &[],
             lm_head: &[],
             backbone_barriers: &[],

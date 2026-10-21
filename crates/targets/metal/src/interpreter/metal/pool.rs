@@ -3655,6 +3655,7 @@ mod tests {
             terminal_slot: 1,
             backbone_slot,
             arena_bytes: arena,
+            logits_row_bytes: 0,
             backbone: EMPTY_BACKBONE,
             lm_head: EMPTY_LM_HEAD,
             backbone_barriers: EMPTY_BARRIERS,
@@ -3669,7 +3670,7 @@ mod tests {
             (rungs.pick(&device, None, 128, KvAddressing::Direct)).expect("a test rung")
         };
         let needs = pick(guest).guest(None);
-        let priced = pick(host).hosting_arena_bytes(&needs);
+        let priced = pick(host).hosting_arena_bytes(None, &needs);
         let (weights, allocator) = build_test_weights(&device);
         let build = |rungs, share, terminal| {
             let factory = RuntimeFactory::new(|d, _| empty_runtime(d, 1));
