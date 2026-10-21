@@ -403,15 +403,13 @@ jobs:
       # to repair two of them after `try_load` gained a typed result, and CI
       # would not have noticed.
       #
-      # Deliberately a NARROW model scope, not `all`: at `all,turboquant` two
-      # of these files are already rotted against APIs that moved out from
-      # under them (`MetalMem::from_buffer`, `MetalResidencySet::insert`, and
-      # `ForwardCtx`'s turboquant sliding-window fields). Pre-existing, same
-      # class as the KTIR rot above, and its own change to fix. Two stems is
-      # enough to compile all three files.
+      # Deliberately a NARROW model scope, not `all` (every config's expansion
+      # and bake). These three stems compile carrier_parity, metal_o2_logits
+      # and qwen3_py_parity (`qwen3-0.6b` is its `[[test]]` required feature:
+      # without it the file rotted unbuilt).
       - name: Model-crate integration tests type-check
         run: cargo clippy -p scratchy-models --tests
-          --features metal,qwen3.5-35b-a3b,qwen3.6-35b-a3b -- -D warnings
+          --features metal,qwen3.5-35b-a3b,qwen3.6-35b-a3b,qwen3-0.6b -- -D warnings
 
       # Serving-layer unit tests: tool-call parsers (Hermes / Llama / Kimi /
       # Mistral / Jamba / Granite / Gemma-4), chat-template rendering, the

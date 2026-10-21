@@ -156,26 +156,22 @@ fn qwen3_py_carrier_parity() {
             128,        // BLOCKS_PER_CHUNK (metal target const)
             usize::MAX, // eager: allocate all chunks now
             |bytes| {
-                use objc2_metal::{MTLDevice as _, MTLResourceOptions};
-                let buf = device_arc
-                    .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-                    .expect("kv chunk alloc");
-                // The interpreter's command buffers attach the allocator's
-                // residency set — every buffer the forward reads MUST be
-                // inserted before the first forward's lazy commit (the
-                // worker inserts each chunk exactly this way, gpu_worker.rs
-                // "residency.insert(&buffer)"). A non-resident chunk reads
-                // structured garbage through the chunk-address table.
-                allocator.residency().insert(&buf);
-                Ok(scratchy_target_metal::MetalMem::from_buffer(buf))
+                // new_pinned: allocates and holds residency in the
+                // allocator's set. The interpreter's command buffers attach
+                // that set, and a non-resident chunk reads structured
+                // garbage through the chunk-address table.
+                Ok(scratchy_target_metal::MetalMem::new_pinned(
+                    &device_arc,
+                    allocator.residency(),
+                    bytes,
+                ))
             },
             |bytes| {
-                use objc2_metal::{MTLDevice as _, MTLResourceOptions};
-                let buf = device_arc
-                    .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-                    .expect("kv table alloc");
-                allocator.residency().insert(&buf);
-                Ok(scratchy_target_metal::MetalMem::from_buffer(buf))
+                Ok(scratchy_target_metal::MetalMem::new_pinned(
+                    &device_arc,
+                    allocator.residency(),
+                    bytes,
+                ))
             },
         )
         .expect("KvCachePool::new_metal_chunked")
@@ -240,7 +236,6 @@ fn qwen3_py_carrier_parity() {
         gdn_state_indices: None,
         gdn_is_fresh: None,
         has_spec_tokens: false,
-        kv_turboquant: false,
         mm_embeds: None,
         embed_patches: &[],
         vision_rope_cos: None,
