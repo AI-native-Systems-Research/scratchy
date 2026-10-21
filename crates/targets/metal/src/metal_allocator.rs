@@ -794,6 +794,12 @@ impl MetalAllocator {
         AffineCodesTarget::of(Some(&crate::device::profile_for_device(&self.device)))
     }
 
+    /// How this device's kernels read `bits`-bit MLX-affine codes: what a command binding them
+    /// by [`Self::bind_affine_codes`] reads them as.
+    pub fn affine_codes(&self, bits: u32) -> AffineCodes {
+        self.affine_codes_target().for_bits(bits)
+    }
+
     /// The buffer binding for the MLX-affine packed codes `ptr..ptr + len`,
     /// stored the way the reading command's kernel reads them (`codes`,
     /// from its constants). On `Offset8` they are stored XOR 0x88 — signed

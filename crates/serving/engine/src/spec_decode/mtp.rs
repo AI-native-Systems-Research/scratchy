@@ -263,6 +263,11 @@ pub struct MtpDrafter {
     /// and KV. A head with KV of its own writes its row's KV at the row's position, and each
     /// chained draft is one position further.
     pub reads_target_kv: bool,
+    /// The token ids the head's own lm_head drafts over, a prefix of its target's vocabulary
+    /// (`Some(n)`: ids `0..n`); `None` when it drafts over all of them. A step one of whose
+    /// drafting sequences' newest token lies past the prefix drafts over the whole vocabulary
+    /// ([`Drafting::wide`]).
+    pub draft_vocab: Option<u32>,
 }
 
 /// A step's rows as its target runs them, in sequence order: what the head's passes read.
@@ -318,6 +323,10 @@ pub struct HeadPasses {
 pub struct Drafting {
     pub one: PassOne,
     pub chain: Chain,
+    /// Some drafting sequence's newest token the host has lies past the head's draft vocabulary
+    /// ([`MtpDrafter::draft_vocab`]): its reply is in tokens the prefix cannot draft, so every
+    /// pass's argmax runs over its target's whole vocabulary.
+    pub wide: bool,
 }
 
 /// A head forward of pass 1 over rows of a step: the rows' host inputs, and what the device copies
@@ -543,6 +552,10 @@ impl MtpDrafter {
         // The step's sequences each draft what its verify rows leave room for.
         let passes = self.budget.drafts_at(step.req_ids.len());
         let past_gate = passes == 0;
+        let past_prefix = |tokens: &[u32]| {
+            (self.draft_vocab).is_some_and(|n| tokens.last().is_some_and(|&t| t >= n))
+        };
+        let mut wide = false;
         for i in (0..step.req_ids.len()).filter(|&i| plan.contains(&step.req_ids[i])) {
             let tokens = history(&step.req_ids[i]).unwrap_or_default();
             let rows = step.cu_seqlens_q[i] as usize..step.cu_seqlens_q[i + 1] as usize;
@@ -573,6 +586,7 @@ impl MtpDrafter {
                     used,
                 );
                 drafting.push((i, first..one.token_rows.len()));
+                wide |= past_prefix(&tokens);
             }
         }
         one.has_spec_tokens = drafting.iter().any(|(_, tokens)| tokens.len() > 1);
@@ -580,6 +594,7 @@ impl MtpDrafter {
         let drafting = one.map(|one| Drafting {
             chain: self.chain(step, &one, &drafting, passes),
             one,
+            wide,
         });
         (prime.is_some() || drafting.is_some()).then_some(HeadPasses { prime, drafting })
     }
@@ -842,6 +857,7 @@ mod tests {
         },
         max_model_len: 4096,
         reads_target_kv: false,
+        draft_vocab: None,
     };
 
     /// A step's sequences each draft what its verify rows leave room for, at most the head's
@@ -926,6 +942,32 @@ mod tests {
         assert_eq!(prime.seqused_k, [14, 3]);
     }
 
+    /// A step drafts over its target's whole vocabulary exactly when a sequence that drafts in it
+    /// has its newest token past the head's draft prefix: `a` drafts, its newest token 510; `b`,
+    /// whose newest is 707, only primes its prompt, so it never widens the step; a head drafting
+    /// over every id never does.
+    #[test]
+    fn a_step_drafts_wide_when_a_drafting_reply_is_past_the_prefix() {
+        let step = TwoSequences::new();
+        let wide = |draft_vocab| {
+            let drafter = MtpDrafter {
+                draft_vocab,
+                ..DRAFTER
+            };
+            (drafter.passes(&step.rows(), &step.before(), &ids(&["a", "b"]), &mut any))
+                .and_then(|p| p.drafting)
+                .expect("a drafts")
+                .wide
+        };
+        assert!(
+            wide(Some(510)),
+            "a's newest token is the prefix's first past it"
+        );
+        assert!(!wide(Some(511)), "a's newest token is the prefix's last");
+        assert!(!wide(Some(600)), "only b's newest token is past the prefix");
+        assert!(!wide(None), "the head drafts over every id");
+    }
+
     /// Pass 1 runs every row of each planned sequence, split by whether a draft can read it: the
     /// rows whose next token the host has (`b`'s prompt) prime, for their KV alone; the rest
     /// (`a`'s verify rows, each of which can be its newest) draft, the target's tokens at them.
@@ -996,7 +1038,7 @@ mod tests {
             (vec![701, 702], vec![0, 1], vec![2])
         );
         assert_eq!((prime.hidden_rows, prime.steps), (vec![(0, 4, 2)], vec![1]));
-        let Drafting { one, chain } = passes.drafting.expect("both draft");
+        let Drafting { one, chain, .. } = passes.drafting.expect("both draft");
         assert_eq!(one.positions, [10, 11, 12, 13, 2]);
         assert_eq!(one.slot_mapping, [58, 59, 60, 61, 82]);
         assert_eq!(

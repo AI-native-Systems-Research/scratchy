@@ -16,13 +16,96 @@ use objc2_metal::{MTLDevice as _, MTLLibrary as _};
 
 use crate::sampling::{CastDtype, SamplerStage};
 use crate::shader_cache::{ComputePipelineState, Device, Library, load_library_from_bytes};
-use crate::specialized_pipeline_cache::PipelineKey;
+use crate::specialized_pipeline_cache::{ConstantValue, PipelineKey};
 use crate::stream::MetalStreamError;
-use crate::tape::ids::{BitsetWords, BlockSize, LogitsWidth};
+use crate::tape::ids::{BitsetWords, BlockSize, KDimI32, LogitsWidth, MDimI32, NDimI32};
 use crate::tape::kernel_constants::{
-    ArgmaxConstants, ChainAdvanceConstants, GrammarMaskConstants, MtpChainConstants,
+    AffineCodes, AffineQmvConstants, AffineQmvWideConstants, ArgmaxConstants,
+    ChainAdvanceConstants, GrammarMaskConstants, MtpChainConstants,
 };
 use crate::tape::lowered::{BakedKernel, MetalDtype};
+use crate::tape::quantized::{
+    DequantDtype, QmvKernel, ScaleDtype, pick_qmv_kernel, pick_qmv_kernel_wide,
+    qmv_kernel_static_name,
+};
+
+/// The most rows a multi-token-prediction head's pass reads its lm_head for: a verify-sized
+/// step's.
+pub const SUFFIX_MAX_ROWS: usize = 8;
+
+/// A multi-token-prediction head drafting over the first `prefix` token ids of its target's
+/// vocabulary, whose lm_head's `rows` rows past them are `hidden` wide: `bits`-bit MLX-affine
+/// codes, a `scale`-typed scale and bias a `group` columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VocabSuffix {
+    pub prefix: u32,
+    pub rows: u32,
+    pub hidden: u32,
+    pub bits: u32,
+    pub group: u32,
+    pub scale: ScaleDtype,
+}
+
+impl VocabSuffix {
+    /// The matvec of `m` rows (`1..=SUFFIX_MAX_ROWS`) over the suffix.
+    pub fn qmv_kernel(self, m: u32) -> QmvKernel {
+        match m {
+            1 => pick_qmv_kernel(self.rows, self.hidden, self.bits),
+            _ => pick_qmv_kernel_wide(self.rows, self.hidden, self.bits, m, true),
+        }
+    }
+
+    /// Its key, `dtype` activations, its codes read as `codes`.
+    fn qmv_key(self, dtype: DequantDtype, codes: AffineCodes, m: u32) -> PipelineKey {
+        let kernel = self.qmv_kernel(m);
+        let name = qmv_kernel_static_name(kernel, dtype, self.scale, self.bits, self.group);
+        let (k, n) = (KDimI32(self.hidden as i32), NDimI32(self.rows as i32));
+        let constants: Vec<ConstantValue> = match kernel {
+            QmvKernel::Wide { .. } => AffineQmvWideConstants {
+                k,
+                n,
+                m: MDimI32(m as i32),
+                codes,
+            }
+            .into(),
+            _ => AffineQmvConstants { k, n, codes }.into(),
+        };
+        PipelineKey::new("quantized_qmv", name, constants)
+    }
+}
+
+/// One of each way a device's kernels read MLX-affine codes ([`AffineCodes`]).
+#[derive(Clone, Copy)]
+pub struct ByCodes<T> {
+    pub as_written: T,
+    pub offset8: T,
+}
+
+impl<T> ByCodes<T> {
+    pub fn get(&self, codes: AffineCodes) -> &T {
+        match codes {
+            AffineCodes::AsWritten => &self.as_written,
+            AffineCodes::Offset8 => &self.offset8,
+        }
+    }
+
+    fn map<U>(self, mut f: impl FnMut(T) -> U) -> ByCodes<U> {
+        ByCodes {
+            as_written: f(self.as_written),
+            offset8: f(self.offset8),
+        }
+    }
+}
+
+/// A [`VocabSuffix`] head's kernels past its prefix: the matvec of a pass's `m` rows over the
+/// suffix at `qmv.get(codes)[m - 1]` — its codes read as the device reads them — and the argmax
+/// across the prefix's logits and the suffix's.
+#[derive(Clone, Copy)]
+pub struct SuffixKernels<K> {
+    pub suffix: VocabSuffix,
+    pub qmv: ByCodes<[K; SUFFIX_MAX_ROWS]>,
+    pub argmax: K,
+}
 
 /// One model's off-tape kernels: each a [`PipelineKey`] at expansion, a [`BakedKernel`] in the
 /// binary.
@@ -42,6 +125,9 @@ pub struct OffTape<K> {
     pub mtp_chain: Option<K>,
     /// A drafting model's pick of a step's inputs by the step before it; `None` for any other.
     pub select_rows: Option<K>,
+    /// A multi-token-prediction head drafting over a prefix of its target's vocabulary: its
+    /// kernels past the prefix; `None` for any other model.
+    pub vocab_suffix: Option<SuffixKernels<K>>,
 }
 
 pub type OffTapeKernels = OffTape<BakedKernel>;
@@ -49,29 +135,59 @@ pub type OffTapeKernels = OffTape<BakedKernel>;
 impl OffTape<PipelineKey> {
     /// The keys of the off-tape kernels reading logits `vocab` wide, of activation `dtype`, over a
     /// KV cache paged in blocks of `block_size`; `head`: a multi-token-prediction head's chain;
-    /// `drafts`: the model drafts.
+    /// `drafts`: the model drafts; `vocab_suffix`: a head drafting over a prefix of its target's
+    /// vocabulary, the rest of it.
     pub fn keys(
         vocab: LogitsWidth,
         dtype: MetalDtype,
         block_size: BlockSize,
         head: Option<MtpChainConstants>,
         drafts: bool,
+        vocab_suffix: Option<VocabSuffix>,
     ) -> Self {
-        let (argmax, dual_write, grammar_mask, cast) = match dtype {
+        let (argmax, dual_write, argmax_split, grammar_mask, cast, dequant) = match dtype {
             MetalDtype::F16 => (
                 "argmax_f16",
                 "argmax_f16_dual_write",
+                "argmax_split_f16",
                 "grammar_mask_f16",
                 CastDtype::F16,
+                DequantDtype::F16,
             ),
             MetalDtype::Bf16 => (
                 "argmax_bf16",
                 "argmax_bf16_dual_write",
+                "argmax_split_bf16",
                 "grammar_mask_bf16",
                 CastDtype::Bf16,
+                DequantDtype::Bf16,
             ),
             MetalDtype::Int4 => panic!("off-tape kernels: int4 logits have no kernel"),
         };
+        let vocab_suffix = vocab_suffix.map(|suffix| {
+            assert_eq!(
+                suffix.prefix,
+                vocab.get(),
+                "a head drafting over a prefix of its target's vocabulary reads logits that wide"
+            );
+            let rows =
+                |codes| std::array::from_fn(|m| suffix.qmv_key(dequant, codes, m as u32 + 1));
+            SuffixKernels {
+                suffix,
+                qmv: ByCodes {
+                    as_written: rows(AffineCodes::AsWritten),
+                    offset8: rows(AffineCodes::Offset8),
+                },
+                argmax: PipelineKey::new(
+                    "argmax",
+                    argmax_split,
+                    vec![
+                        ConstantValue::uint(0, suffix.prefix),
+                        ConstantValue::uint(1, suffix.rows),
+                    ],
+                ),
+            }
+        });
         let argmax_key = |f| PipelineKey::new("argmax", f, ArgmaxConstants { vocab }.into());
         let words_per_row = BitsetWords(crate::grammar_mask::words_per_row(vocab.get()));
         let grammar = GrammarMaskConstants {
@@ -91,6 +207,7 @@ impl OffTape<PipelineKey> {
             ),
             mtp_chain: head.map(|c| PipelineKey::new("mtp_chain", "mtp_chain", c.into())),
             select_rows: drafts.then(|| PipelineKey::new("select_rows", "select_rows", Vec::new())),
+            vocab_suffix,
         }
     }
 }
@@ -105,7 +222,12 @@ impl<K> OffTape<K> {
             sampler: self.sampler.map(|row| row.map(&mut f)),
             chain_advance: f(self.chain_advance),
             mtp_chain: self.mtp_chain.map(&mut f),
-            select_rows: self.select_rows.map(f),
+            select_rows: self.select_rows.map(&mut f),
+            vocab_suffix: self.vocab_suffix.map(|s| SuffixKernels {
+                suffix: s.suffix,
+                qmv: s.qmv.map(|rows| rows.map(&mut f)),
+                argmax: f(s.argmax),
+            }),
         }
     }
 }
