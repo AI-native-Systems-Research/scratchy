@@ -1045,12 +1045,15 @@ impl SpyreWorker {
         // problem: a value computed inside `cfg(sendnn)` and consumed outside it must be declared
         // before the branch, so its initialiser is dead in exactly the build that assigns it.
         // `None` IS read on the non-sendnn path, and what it feeds is one call away.
-        // ⛔ THE MUTABILITY IS THE CARD PATH'S, so it carries that cfg rather than an
-        // `#[allow(unused_mut)]`: only the branch below assigns these, and on the emulator the
-        // binding is `BakeFacts::NONE` (a bundle that placed nothing), read once. A card bake that
-        // never assigns its decode facts leaves `NONE` too, which `require_identity` refuses.
+        // ⛔ ON THE CARD, `decode_facts` HAS NO VALUE UNTIL THE DECODE BAKE GIVES IT ONE: the
+        // branch below that bakes the decode bundle assigns it, and every other card path returns
+        // an error first, so the compiler proves it is set before it is read (the
+        // `served_context_v` pattern below). `BakeFacts::NONE` is not a default for the card.
+        // `prefill_facts` is assigned only when a prefill bundle is baked, and is
+        // `BakeFacts::NONE` (a bundle that placed nothing) when there is none. On the emulator
+        // both are `NONE`, read once.
         #[cfg(feature = "spyre-hw")]
-        let mut decode_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
+        let decode_facts: scratchy_target_spyre::wiring::BakeFacts;
         #[cfg(not(feature = "spyre-hw"))]
         let decode_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
         #[cfg(feature = "spyre-hw")]

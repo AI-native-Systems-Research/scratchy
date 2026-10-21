@@ -194,9 +194,8 @@ fn hoisting_the_held_set_out_of_the_loop_makes_two_rows_share_a_page() {
     let stale = rows
         .iter()
         .fold(Pages::default(), |h, p| h.union(Pages::of(p))); // <-- hoisted
-    for r in 0..rows.len() {
-        let own = rows[r].clone();
-        rows[r] = draw(pool, stale, &own, want);
+    for row in &mut rows {
+        *row = draw(pool, stale, row, want);
     }
     let mut shared_any = false;
     for (a, pa) in rows.iter().enumerate() {
