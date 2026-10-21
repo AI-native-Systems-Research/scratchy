@@ -810,13 +810,6 @@ fn reduce_combiner(op_name: OpKind) -> Option<fn(f32, f32) -> f32> {
                 b
             }
         },
-        // INTEGER max on this executor's f32 carrier: the tiles' `as_f32` view holds
-        // i32 values exactly below 2^24, and the sampler's ramp domain (V - i, V the
-        // vocab) lives far under it, so the compare is exact there. No NaN case --
-        // integers have none -- matching `binary_int`'s `i64::max`. Beyond 2^24 the
-        // carrier cannot order distinct i32s; the fold still returns a maximal lane
-        // but may pick between f32-equal neighbours.
-        OpKind::ArithMaxsi => |a: f32, b: f32| if a >= b { a } else { b },
         OpKind::ArithMinimumf | OpKind::ArithMinf => |a: f32, b: f32| {
             if a.is_nan() || b.is_nan() {
                 f32::NAN

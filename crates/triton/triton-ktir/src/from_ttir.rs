@@ -62,9 +62,8 @@ const PASS: &str = "from-ttir";
 /// `OpKind::from_spelling` would happily turn into an `Other`, because "we do not model
 /// this" and "we model this as Other on purpose" must not look the same.
 ///
-/// THE NINE DELIBERATE `Other`s: `arith.negf`, `math.rsqrt`, `arith.cmpf`,
-/// `arith.sitofp`, `arith.fptosi`, `arith.uitofp`, `arith.subi`, `arith.extui`, and
-/// `arith.maxsi` have no `OpKind` variant.
+/// THE SIX DELIBERATE `Other`s: `arith.negf`, `math.rsqrt`, `arith.cmpf`,
+/// `arith.sitofp`, `arith.fptosi`, and `arith.uitofp` have no `OpKind` variant.
 /// They are listed here so the choice is visible, and it is safe because a consumer keys
 /// on `OpKind::spelling()` for exactly these -- `triton-superdsc-lower`'s op map reads
 /// `arith.negf` (its SiLU recogniser's head) and `math.rsqrt` through the spelling, and
@@ -92,17 +91,6 @@ pub const OP_SET: &[&str] = &[
     // The MoE kernel's fp8 clamps (`moe.py`): `tl.minimum` beside `tl.maximum`. `ArithMinnumf`
     // is modelled one to one, as `ArithMaxnumf` is.
     "arith.minnumf",
-    // THE INTEGER-COMBINE EXTENSION (the sampler's ladder form): `argmax_first_max`'s index
-    // math is i32 end to end -- fp16 exact integers stop at 2048 and the vocab is 49k, and
-    // `make_ktir`'s LegalizeTypes RED-stops genuine f32 compute, so the ramp multiply and the
-    // running combine are INTEGER ops no golden carries (the router rows select and cast their
-    // way around integer maxima). All three ride `Other` with `to_ktir_emit`'s Other arm naming
-    // their `KOpKind`, and the emulator has served `ArithSubi`/`ArithExtui`/`ArithMaxsi` all
-    // along (`ktir-emulator:src/dialects/arith.rs`). The executed proof is
-    // `triton-numeric:tests/argmax_first_max.rs`.
-    "arith.subi",  // Other, on purpose
-    "arith.extui", // Other, on purpose
-    "arith.maxsi", // Other, on purpose
     "arith.extf",
     "arith.truncf",
     "arith.negf", // Other, on purpose
