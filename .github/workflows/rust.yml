@@ -446,11 +446,12 @@ jobs:
       # `--tests` type-checks every e2e test target (a cuda-only file compiles
       # empty here), and, since `-p scratchy-models` is what names the model,
       # scratchy-models' own lib and integration tests at that model. `otel` is
-      # on so e_otel.rs, which needs it, compiles too.
+      # on so e_otel.rs, which needs it, compiles too. `--keep-going` as in the
+      # cuda e2e lint.
       - name: Lint the metal e2e tests
         run: cargo clippy -p scratchy-e2e -p scratchy-models
           --features e2e,metal,otel,scratchy-models/smollm2-135m
-          --tests -- -D warnings
+          --tests --keep-going -- -D warnings
 
       # scratchy-cli's own test targets (its unit tests and
       # tests/arch_feature_passthrough.rs), type-checked and linted: no other
