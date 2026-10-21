@@ -57,6 +57,59 @@ pub(crate) fn materialize_rows(fuf: &mut Fuf) {
     }
 }
 
+/// The other end of a head's `target_hidden`: a target exporting several hidden states
+/// (`export_hidden`, at each of its `eagle_aux_layers` for an EAGLE-3 drafter) exports them side
+/// by side, in the order the forward makes them — one `[num_tokens, n·w]` hidden state, as its
+/// drafter's `fc` reads them.
+///
+/// Each is read where it is made: an export names the residual stream, whose buffer the layer's
+/// next in-place add overwrites (metal's `add_inplace`), so nothing after it may read it there.
+/// The first export becomes its copy (a one-operand `Concat`), each later one the concatenation
+/// of the copy so far with its stream, and an export appended after them names the whole. No-op
+/// for a forward exporting one hidden state or none: a lone export names a stream read as the
+/// forward ends (an MTP head's final hidden state).
+pub(crate) fn chain_exports(fuf: &mut Fuf) {
+    let exports: Vec<usize> = (0..fuf.nodes.len())
+        .filter(|&i| fuf.nodes[i].op == OpKind::ExportHidden)
+        .collect();
+    if exports.len() < 2 {
+        return;
+    }
+    let Ok([rows, width]) = <[_; 2]>::try_from(fuf.nodes[exports[0]].outputs[0].clone()) else {
+        panic!("export_hidden of a rank-2 hidden state");
+    };
+    let mut so_far: Option<FufInput> = None;
+    for (k, &at) in exports.iter().enumerate() {
+        let node = &mut fuf.nodes[at];
+        let stream = node.inputs[0].clone();
+        node.op = OpKind::Concat;
+        node.inputs = so_far.into_iter().chain([stream]).collect();
+        node.outputs = vec![vec![rows.clone(), times(k as u64 + 1, &width)]];
+        so_far = Some(FufInput::Tile {
+            id: node.id,
+            slot: 0,
+        });
+    }
+    let id = TileId(fuf.nodes.len() as u32);
+    fuf.nodes.push(FufNode {
+        id,
+        op: OpKind::ExportHidden,
+        inputs: so_far.into_iter().collect(),
+        outputs: vec![vec![rows, times(exports.len() as u64, &width)]],
+    });
+}
+
+/// `n·w`, flattened as [`Dim::Mul`] keeps it.
+fn times(n: u64, w: &crate::shape::Dim) -> crate::shape::Dim {
+    use crate::shape::Dim;
+    match w {
+        w if n == 1 => w.clone(),
+        Dim::Lit(w) => Dim::Lit(n * w),
+        Dim::Mul(terms) => Dim::Mul(std::iter::once(Dim::Lit(n)).chain(terms.clone()).collect()),
+        w => Dim::Mul(vec![Dim::Lit(n), w.clone()]),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,7 +311,7 @@ mod tests {
     }
 
     /// Each source gets its own tile, shaped by its own extern: an MTP head reads its target's
-    /// hidden rows (`[num_tokens, backbone_hidden_size]`, its target's width) beside the token
+    /// hidden rows (`[num_tokens, target_hidden_size]`, its target's width) beside the token
     /// embedding.
     #[test]
     fn materialize_rows_gives_each_source_its_own_tile() {
@@ -287,7 +340,7 @@ mod tests {
         let (pos, _) = tile_of(RowsExtern::PosEmbeds);
         assert_eq!(
             hidden_shape,
-            vec![bound("num_tokens"), bound("backbone_hidden_size")]
+            vec![bound("num_tokens"), bound("target_hidden_size")]
         );
         let consumer = &fuf.nodes[0].inputs;
         assert!(matches!(consumer[0], FufInput::Tile { id, slot: 0 } if id == hidden));

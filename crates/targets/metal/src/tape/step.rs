@@ -22,7 +22,7 @@ pub use scratchy_subtile::subtile_ir::{
     RouterBundle, UngatedAct,
 };
 
-pub use super::lowered::ActivationWidth;
+pub use super::lowered::{ActivationWidth, ConcatWidths};
 
 use super::ids::ArenaSlotIdx as Slot;
 use super::lowered::{Fence, RuntimeGate};
@@ -308,17 +308,17 @@ pub enum MetalStep {
     VarlenAttention(Slot, Slot, Slot, Slot, CuSeqlens),
     /// `(q, k, q_out, k_out)`: vision 2-D rope.
     VisionRope(Slot, Slot, Slot, Slot),
-    /// `(out, source)`: the host-staged rows of `source` (vision pixels, vision position
-    /// embeddings, a target model's hidden states).
-    LoadRows(Slot, scratchy_ir::RowsExtern),
+    /// `(out, source, width)`: the host-staged rows of `source` (vision pixels, vision position
+    /// embeddings, a target model's hidden states), each `width` wide.
+    LoadRows(Slot, scratchy_ir::RowsExtern, ActivationWidth),
     /// `(in, out, indices, width)`: row permutation by a runtime index buffer.
     EmbeddingGather(Slot, Slot, GatherIndices, ActivationWidth),
     /// `(qg, q, gate)`: split the doubled q projection into query and gate.
     GateSplit(Slot, Slot, Slot),
     /// `(attn, gate, out)`: `attn * sigmoid(gate)`.
     GateApply(Slot, Slot, Slot),
-    /// `(a, b, out, width)`: `out[t] = a[t] ++ b[t]`, each operand `width` wide.
-    Concat(Slot, Slot, Slot, ActivationWidth),
+    /// `(a, b, out, widths)`: `out[t] = a[t] ++ b[t]`, each operand its width.
+    Concat(Slot, Slot, Slot, ConcatWidths),
     /// `(routed, shared, gate, out)`: `routed + shared * sigmoid(gate)`.
     GateScale(Slot, Slot, Slot, Slot),
     /// `(qkv, z, a, b, out, layer)`: Gated-DeltaNet linear attention.

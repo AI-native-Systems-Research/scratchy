@@ -972,6 +972,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         tail: Option<F>,
         writes: &InputWrites,
         deferred: Option<&Deferral>,
+        after: Option<&dyn super::forward::AfterForward>,
     ) -> Result<(), ForwardError>
     where
         F: FnOnce(
@@ -999,7 +1000,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let needs_serialized = worker.bucket_has_avg_pool_2d(bucket_idx);
         if needs_serialized {
             assert!(
-                deferred.is_none(),
+                deferred.is_none() && after.is_none(),
                 "a serialized forward waits for each of its command buffers"
             );
             assert!(
@@ -1048,8 +1049,26 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             Ok(())
         };
         if let Some(deferral) = deferred {
+            assert!(
+                after.is_none(),
+                "a deferred forward's work after it is its own"
+            );
             let ((), committed) = self.commit(Some(writes), encode)?;
             deferral.committed(committed.in_flight);
+            return Ok(());
+        }
+        // Work after the forward, in a command buffer of its own committed behind it — so it
+        // starts once the forward is done — that the host does not wait for: the forward's
+        // outputs are read as soon as its own is done.
+        if let Some(after) = after {
+            let ((), forward) = self.commit(Some(writes), encode)?;
+            let committed = self.commit(None, |enc| {
+                after.encode(enc).map_err(ForwardError::Followup)
+            });
+            let waited = forward.in_flight.wait();
+            let ((), committed) = committed?;
+            after.committed(committed.in_flight);
+            waited?;
             return Ok(());
         }
         let ((), took) = self.submit(Some(writes), encode)?;
@@ -1348,6 +1367,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             tail,
             &writes,
             inputs.deferred,
+            inputs.after,
         )?;
 
         // DIAGNOSTIC: dump non-zero counts for each arena slot. Tells
@@ -1638,7 +1658,7 @@ impl<W: CanonicalParams> Onto<'_, W> {
     ) -> Result<(), ForwardError> {
         use objc2_metal::{MTL4VisibilityOptions, MTLStages};
         assert!(
-            inputs.deferred.is_none(),
+            inputs.deferred.is_none() && inputs.after.is_none(),
             "a forward played in another's command buffer is waited for with it"
         );
         let pool = self.guard.pool;
@@ -2719,6 +2739,7 @@ mod tests {
             mrope_cos_sin: None,
             device_inputs: &[],
             deferred: None,
+            after: None,
             reads: ForwardReads::Outputs,
         }
     }
@@ -2783,6 +2804,7 @@ mod tests {
             mrope_cos_sin: None,
             device_inputs: &[],
             deferred: None,
+            after: None,
             reads: ForwardReads::Outputs,
         };
         // Closure runs *while* the worker is checked out — assertion
@@ -2798,6 +2820,66 @@ mod tests {
             })
             .expect("forward succeeds");
         assert_eq!(saw, 42);
+        assert_eq!(pool.available(), 1, "worker returned to pool after forward");
+    }
+
+    /// Work after a forward runs in a command buffer of its own, which the forward does not wait
+    /// for: the forward returns with it committed, and once it is done what it wrote is there.
+    #[test]
+    fn work_after_a_forward_is_committed_behind_it() {
+        use objc2_metal::MTL4ComputeCommandEncoder as _;
+        let Some(pool) = build_multi_bucket_pool(&[1], 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        pool.ensure_mtl4();
+        let out =
+            (pool.allocator.residency()).pin(crate::mtl4_dispatch::shared_zeroed(&pool.device, 16));
+        pool.allocator.residency().commit();
+        let target = (*out).clone();
+        let mut after = super::super::forward::ForwardAfter::new(Box::new(move |enc| {
+            // SAFETY: four bytes of a 16-byte shared buffer pinned in the pool's set.
+            unsafe {
+                enc.fillBuffer_range_value(&target, objc2_foundation::NSRange::new(0, 4), 42)
+            };
+            Ok(())
+        }));
+        let inputs = ForwardInputs {
+            span_ids: None,
+            num_tokens: 1,
+            input_ids: &[0u32],
+            positions: &[0u32],
+            slot_mappings: Vec::new(),
+            cu_seqlens_q: None,
+            seq_used_k: None,
+            block_tables: Vec::new(),
+            has_spec_tokens: false,
+            last_token_indices: None,
+            gdn_state_indices: None,
+            gdn_is_fresh: None,
+            vision_rope_freqs: None,
+            vision_cu_seqlens_full: None,
+            vision_cu_seqlens_window: None,
+            vision_window_index: None,
+            vision_reverse_indices: None,
+            vision_position_ids: None,
+            pixels: None,
+            pos_embeds: None,
+            target_hidden: None,
+            mm_embeds: None,
+            mm_dst_rows: None,
+            mrope_cos_sin: None,
+            device_inputs: &[],
+            deferred: None,
+            after: Some(&after),
+            reads: ForwardReads::Outputs,
+        };
+        pool.forward(&inputs, |_, _| ()).expect("forward succeeds");
+        let in_flight = after
+            .take_in_flight()
+            .expect("the work after it is committed");
+        in_flight.wait().expect("the work after it runs");
+        assert_eq!(crate::mtl4_dispatch::read_slice::<u8>(&out, 4), [42; 4]);
         assert_eq!(pool.available(), 1, "worker returned to pool after forward");
     }
 
@@ -2882,6 +2964,7 @@ mod tests {
                 target_hidden: None,
                 device_inputs,
                 deferred: Some(&deferral),
+                after: None,
                 reads: ForwardReads::Outputs,
             };
             let before = input_ids();
@@ -2962,6 +3045,7 @@ mod tests {
             target_hidden: None,
             device_inputs: &[],
             deferred: Some(&deferral),
+            after: None,
             reads: ForwardReads::Outputs,
         };
         let writes = begin_step(&guard, &inputs, pool.block_table_stride).expect("inputs fit");
@@ -3020,6 +3104,7 @@ mod tests {
             target_hidden: None,
             device_inputs,
             deferred: None,
+            after: None,
             reads: ForwardReads::Outputs,
         };
         let first = [
@@ -3125,6 +3210,7 @@ mod tests {
             mrope_cos_sin: None,
             device_inputs: &[],
             deferred: None,
+            after: None,
             reads: ForwardReads::Outputs,
         };
         let err = pool
@@ -3169,6 +3255,7 @@ mod tests {
             mrope_cos_sin: None,
             device_inputs: &[],
             deferred: None,
+            after: None,
             reads: ForwardReads::Outputs,
         };
         match pool.forward(&inputs, |_, _| ()) {
@@ -3223,6 +3310,7 @@ mod tests {
             mrope_cos_sin: None,
             device_inputs: &[],
             deferred: None,
+            after: None,
             reads: ForwardReads::Outputs,
         };
         let err = pool

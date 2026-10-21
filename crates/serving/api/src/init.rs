@@ -814,9 +814,9 @@ fn draft_head(
     .with_context(|| format!("resolving draft model path {spec:?}"))?;
     let draft_cfg = HfModelConfig::from_dir(&draft_dir)
         .with_context(|| format!("reading draft config.json at {draft_dir:?}"))?;
-    Ok(draft_cfg
-        .arch_hint()
-        .and_then(scratchy_forward_compiler::draft_head))
+    Ok(draft_cfg.arch_hint().and_then(|arch| {
+        scratchy_forward_compiler::draft_head(arch, &|key| draft_cfg.extra.contains_key(key))
+    }))
 }
 
 /// The speculative decoding a run does ([`Speculation`]), validated before any model load. Called

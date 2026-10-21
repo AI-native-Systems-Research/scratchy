@@ -32,6 +32,9 @@
 //!    position, slot and used KV length the host laid out for each accepted count. The host reads
 //!    back the drafts alone.
 //!
+//! A parallel-drafting head (P-EAGLE, [`PastFirst::Parallel`]) runs no pass past the first: its
+//! pass 1 drafts every token, as vLLM's does.
+//!
 //! The head's KV pool has the target's blocks, so it shares the target's block table. Only a
 //! sequence that produced a token this step drafts; an intermediate prefill chunk still primes its
 //! rows' head KV for the prompt.
@@ -114,13 +117,19 @@
 //!   (`gdn_scan_simd_resumes_from_checkpoint`): two loops calling one inlined row lost the
 //!   bit-exactness (the varlen scan's replay 1 ULP off), the compiler contracting each copy apart.
 //!   Without a head both compile to the plain kernels (`GDN_SCAN_DRAFTS`, `GDN_CONV_DRAFTS` 0).
-//! - TODO: time to first token pays the head's prime over the prompt — what its KV write needs
-//!   over every prompt row — then its newest row whole and the chain. Per-dispatch GPU time on a
-//!   1588-row prompt chunk (base M5): 5.2 ms (prime 3.1, newest row 1.1, chain 1.0), from 34.2 ms
-//!   when every row ran the whole head; first token on a ~5.6k-token prompt +0.7% against main.
-//!   The prompt's last chunk drafts, so it is not deferred, and waits for the chunk still in
-//!   flight before its own inputs are written (~5 ms idle on the base M5): writing them on the
-//!   device, as a deferred step does, would let it queue behind that chunk.
+//! - TODO: time to first token pays the head's prime over a prompt's chunks before its last — what
+//!   their KV writes need over each row. The step that gives a request its first token runs its
+//!   head's passes after it, in a command buffer the host does not wait for (the worker's
+//!   `head_in_flight`), and drafts nothing: that token is the target's alone, and the next step,
+//!   which decodes without drafts, waits for the passes instead. An earlier chunk's prime runs in
+//!   its own step, before the next chunk overwrites the target hidden states it reads; moving it
+//!   past the first token means keeping them (a P-EAGLE target's 8640 wide, 17 KB a token). On a
+//!   base M5, gpt-oss-20b with P-EAGLE's 4 dense layers, the prime is 0.11 ms a prompt row
+//!   against the target's 0.47: first token +0% at 1920 tokens (one chunk), +12% at 5864 (three).
+//!   Qwen3.6's one-layer head: 5.2 ms of GPU time a 1588-row chunk (prime 3.1, newest row 1.1,
+//!   chain 1.0). The prompt's last chunk drafts, so it is not deferred, and waits for the chunk
+//!   still in flight before its own inputs are written (~5 ms idle on the base M5): writing them
+//!   on the device, as a deferred step does, would let it queue behind that chunk.
 //! - TODO: the next step is scheduled once the host has read this one's tokens and drafts (#240:
 //!   pipelined cycles). Its inputs are on the device already.
 //! - TODO: choose `k` per bucket. `spec_drafts` is one constant for every bucket, because the
@@ -263,6 +272,23 @@ pub struct MtpDrafter {
     /// and KV. A head with KV of its own writes its row's KV at the row's position, and each
     /// chained draft is one position further.
     pub reads_target_kv: bool,
+    /// How it drafts past its first draft.
+    pub past_first: PastFirst,
+}
+
+/// How a head drafts past its first draft ([`MtpDrafter::past_first`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PastFirst {
+    /// A pass a draft, each reading the draft and final hidden state before it.
+    Chained,
+    /// Pass 1 drafts every token (P-EAGLE, vLLM's parallel drafting): a drafting sequence's rows
+    /// run on, a row a draft past the first, at the positions after its last row's, reading the
+    /// head's placeholders — `mask_token`, and a target hidden row its worker holds. On the
+    /// device, by what the target accepted, the rows through the newest read the target's tokens
+    /// and hidden rows, the next ones the placeholders and draft past the newest; the rows the
+    /// target rejected read placeholders too, and nothing reads theirs. Every row's position is
+    /// the host's.
+    Parallel { mask_token: u32 },
 }
 
 /// A step's rows as its target runs them, in sequence order: what the head's passes read.
@@ -347,9 +373,10 @@ pub struct PassOne {
     pub steps: Vec<usize>,
 }
 
-/// Passes 2..=k, one row per drafting sequence — one the step gives a token — chained on the
-/// device after pass 1 (module docs): their host inputs, and the tables the device picks the rest
-/// from by the number of drafts the target accepted.
+/// The passes after pass 1, over each drafting sequence — one the step gives a token — on the
+/// device after pass 1 (module docs): a chained head's passes 2..=k, one row a sequence each (a
+/// parallel-drafting head runs none, [`PastFirst`]). Their host inputs, and the tables the device
+/// picks the rest from by the number of drafts the target accepted.
 #[derive(Debug, PartialEq)]
 pub struct Chain {
     /// Per drafting sequence: its first token row in the step, its token rows, and its first token
@@ -357,13 +384,13 @@ pub struct Chain {
     pub seqs: Vec<[u32; 3]>,
     /// Per step row, the token the row after it reads — the draft it verifies within a sequence.
     pub drafted: Vec<u32>,
-    /// After each of its passes: per drafting sequence and accepted count `0..=k` (`k` the head's
-    /// most drafts, [`Self::drafts`]), the next pass's position, slot and used KV length (zeros
-    /// after the last pass, which has none).
+    /// After each of its passes: per drafting sequence, accepted count `0..=k` (`k` the head's
+    /// most drafts, [`Self::drafts`]) and row of the next pass ([`Self::rows`]), that row's
+    /// position, slot and used KV length (zeros after the last pass, which has none).
     pub next: Vec<Vec<u32>>,
-    /// Each chained pass's host inputs, one row per drafting sequence. The token, position, slot
-    /// and used KV length are placeholders the device overwrites: the position and used length the
-    /// largest the last pass takes, the slot none.
+    /// Each chained pass's host inputs, a row per drafting sequence (a parallel-drafting head runs
+    /// no chained pass). The token, position, slot and used KV length are placeholders the device
+    /// overwrites — the position and used length the largest the last pass takes, the slot none.
     pub input_ids: Vec<u32>,
     pub positions: Vec<u32>,
     pub slot_mapping: Vec<u32>,
@@ -375,6 +402,11 @@ pub struct Chain {
     /// Each drafting sequence's index in the step.
     steps: Vec<usize>,
     drafts: usize,
+    /// The rows a sequence each chained pass runs, one a draft it makes; a parallel-drafting
+    /// head's rows past each sequence's newest in pass 1.
+    rows: usize,
+    /// The drafts the passes make each sequence.
+    made: usize,
 }
 
 impl PassOne {
@@ -445,6 +477,29 @@ impl PassOne {
         self.steps.push(i);
     }
 
+    /// `count` rows more for the sequence pushed last, at the positions after its last row's: a
+    /// parallel-drafting head's rows past its newest ([`PastFirst::Parallel`]), reading
+    /// `mask_token` and, on the device, the head's placeholder target hidden row.
+    fn push_masks(&mut self, step: &StepRows<'_>, mask_token: u32, count: usize) {
+        let (Some(&i), Some(&last)) = (self.steps.last(), self.positions.last()) else {
+            return;
+        };
+        for p in (last + 1..).take(count) {
+            self.input_ids.push(mask_token);
+            self.positions.push(p);
+            self.slot_mapping.push(step.slot(i, p as usize));
+        }
+        let rows = self.input_ids.len() as u32;
+        let [Some(end), Some(used), Some(last_row)] = [
+            self.cu_seqlens_q.last_mut(),
+            self.seqused_k.last_mut(),
+            self.last_rows.last_mut(),
+        ] else {
+            return;
+        };
+        (*end, *used, *last_row) = (rows, last + count as u32 + 1, rows - 1);
+    }
+
     /// The pass, its sequences' block tables laid out from `step`'s; `None` with no row.
     fn of(mut self, step: &StepRows<'_>) -> Option<Self> {
         self.block_table = step.block_rows(&self.steps);
@@ -453,14 +508,15 @@ impl PassOne {
 }
 
 impl Chain {
-    /// A chained pass's host-side request (its target hidden states come from the device).
+    /// A chained pass's host-side request (its target hidden states come from the device). A pass
+    /// of several rows a sequence drafts at every one: the lm_head runs every row.
     pub fn request(&self) -> ForwardArgmaxRequest<'_> {
         request(
             [&self.input_ids, &self.positions, &self.slot_mapping],
             [&self.cu_seqlens_q, &self.seqused_k, &self.block_table],
             self.block_table_stride,
             Some(&self.last_rows),
-            false,
+            self.rows > 1,
         )
     }
 
@@ -469,10 +525,21 @@ impl Chain {
         self.steps.len()
     }
 
-    /// The head's passes over the step's drafting sequences — pass 1 and the chained ones — the
-    /// drafts each gets.
+    /// The head's passes over the step's drafting sequences: pass 1 and the chained ones.
     pub fn passes(&self) -> usize {
         self.next.len()
+    }
+
+    /// The rows a sequence each chained pass runs: one for a chained head; a parallel-drafting
+    /// one's pass 1 runs this many past each sequence's newest, a draft past the first each.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// The drafts the passes make each sequence: pass 1's and a chained pass's one each, a
+    /// parallel-drafting head's pass 1 every one.
+    pub fn made(&self) -> usize {
+        self.made
     }
 
     /// The head's most drafts a sequence, whatever this chain's passes: the room a sequence takes
@@ -573,9 +640,12 @@ impl MtpDrafter {
                     used,
                 );
                 drafting.push((i, first..one.token_rows.len()));
+                if let PastFirst::Parallel { mask_token } = self.past_first {
+                    one.push_masks(step, mask_token, passes - 1);
+                }
             }
         }
-        one.has_spec_tokens = drafting.iter().any(|(_, tokens)| tokens.len() > 1);
+        one.has_spec_tokens = (one.cu_seqlens_q.windows(2)).any(|w| w[1] - w[0] > 1);
         let (prime, one) = (prime.of(step), one.of(step));
         let drafting = one.map(|one| Drafting {
             chain: self.chain(step, &one, &drafting, passes),
@@ -584,18 +654,28 @@ impl MtpDrafter {
         (prime.is_some() || drafting.is_some()).then_some(HeadPasses { prime, drafting })
     }
 
-    /// Passes 2..=`passes` after `one` for the `drafting` sequences (each its index in the step and
-    /// its span of `one`'s token rows): `passes` drafts each. A sequence's accepted count — what the
-    /// step's verify kept of the drafts it verified — runs to the head's most drafts.
+    /// The passes after `one` for the `drafting` sequences (each its index in the step and its
+    /// span of `one`'s token rows), `drafts` drafts each: a chained head's passes 2..=`drafts`; a
+    /// parallel-drafting head's none, its pass 1 drafting every one. A sequence's accepted
+    /// count — what the step's verify kept of the drafts it verified — runs to the head's most
+    /// drafts.
     fn chain(
         &self,
         step: &StepRows<'_>,
         one: &PassOne,
         drafting: &[(usize, std::ops::Range<usize>)],
-        passes: usize,
+        drafts: usize,
     ) -> Chain {
         let k = self.budget.drafts;
         let n = drafting.len();
+        let past_first = self.past_first;
+        // The passes the drafts take, and the rows a sequence each chained one runs: a chained
+        // head's pass a draft, of one row a sequence; a parallel-drafting head's pass 1 alone,
+        // whose rows past each sequence's newest draft past the first.
+        let (passes, rows) = match past_first {
+            PastFirst::Chained => (drafts, 1),
+            PastFirst::Parallel { .. } => (1, drafts - 1),
+        };
         let steps: Vec<usize> = drafting.iter().map(|&(i, _)| i).collect();
         let seqs: Vec<[u32; 3]> = (drafting.iter())
             .map(|(_, tokens)| {
@@ -606,8 +686,8 @@ impl MtpDrafter {
         // The step's next-row tokens: within a sequence, the draft each row verifies.
         let mut drafted = step.input_ids[1..].to_vec();
         drafted.push(0);
-        // After pass `d`, the next pass's row at accepted count `a` sits at `first + a + d`, the
-        // newest row's position plus `d` — or, reading the target's KV, at `first + a + 1` for
+        // After pass `d`, a chained head's next row at accepted count `a` sits at `first + a + d`,
+        // the newest row's position plus `d` — or, reading the target's KV, at `first + a + 1` for
         // every pass, attending the target's KV through `first + a`, writing none.
         let target_kv = self.reads_target_kv;
         let next = (1..=passes)
@@ -615,23 +695,31 @@ impl MtpDrafter {
                 (drafting.iter().zip(&seqs))
                     .flat_map(|(&(i, _), &[step_row, ..])| {
                         let first = step.positions[step_row as usize] as usize;
-                        (0..=k).flat_map(move |a| match (d < passes, target_kv) {
-                            (true, false) => {
-                                let p = first + a + d;
-                                [p as u32, step.slot(i, p), p as u32 + 1]
-                            }
-                            (true, true) => {
-                                let p = (first + a + 1) as u32;
-                                [p, u32::MAX, p]
-                            }
-                            (false, _) => [0; 3],
+                        (0..=k).flat_map(move |a| {
+                            (0..rows).flat_map(move |_| match (d < passes, target_kv) {
+                                (false, _) => [0; 3],
+                                (true, false) => {
+                                    let p = first + a + d;
+                                    [p as u32, step.slot(i, p), p as u32 + 1]
+                                }
+                                (true, true) => {
+                                    let p = (first + a + 1) as u32;
+                                    [p, u32::MAX, p]
+                                }
+                            })
                         })
                     })
                     .collect()
             })
             .collect();
-        // Placeholders: the last pass's position at the most drafts accepted.
-        let last: Vec<u32> = (seqs.iter())
+        // A chained pass's placeholders: its positions at the most drafts accepted. A
+        // parallel-drafting head runs none.
+        let chained = match past_first {
+            PastFirst::Chained => n,
+            PastFirst::Parallel { .. } => 0,
+        };
+        let positions: Vec<u32> = (seqs.iter())
+            .take(chained)
             .map(|&[step_row, rows, _]| {
                 let newest = step.positions[step_row as usize] + rows - 1;
                 match target_kv {
@@ -644,16 +732,18 @@ impl MtpDrafter {
             seqs,
             drafted,
             next,
-            input_ids: vec![0; n],
-            seqused_k: last.iter().map(|&p| p + 1).collect(),
-            positions: last,
-            slot_mapping: vec![u32::MAX; n],
-            cu_seqlens_q: (0..=n as u32).collect(),
-            block_table: step.block_rows(&steps),
+            input_ids: vec![0; chained],
+            seqused_k: positions.iter().map(|p| p + 1).collect(),
+            positions,
+            slot_mapping: vec![u32::MAX; chained],
+            cu_seqlens_q: (0..=chained as u32).collect(),
+            block_table: step.block_rows(&steps[..chained]),
             block_table_stride: step.block_table_stride,
-            last_rows: (0..n as u32).collect(),
+            last_rows: (0..chained as u32).collect(),
             steps,
             drafts: k,
+            rows,
+            made: drafts,
         }
     }
 
@@ -669,7 +759,7 @@ impl MtpDrafter {
         produced: &[Vec<u32>],
         history: &dyn Fn(&str) -> Option<Vec<u32>>,
     ) -> HashMap<String, Vec<u32>> {
-        let (k, passes) = (chain.drafts(), chain.passes());
+        let (k, made) = (chain.drafts(), chain.made());
         // Each sequence's newest row: the position before its newest token.
         let newest: Vec<Option<usize>> = (chain.steps.iter())
             .map(|&i| {
@@ -677,14 +767,15 @@ impl MtpDrafter {
                 tokens.checked_sub(2).filter(|_| !produced[i].is_empty())
             })
             .collect();
-        // Pass `d + 1` runs at the newest position plus `d`, and its draft lands one past it.
+        // Draft `d + 1`'s row runs at the newest position plus `d` (a chained head's pass `d + 1`,
+        // a parallel head's row `d` past the newest), and its draft lands one past it.
         let fits = |d: usize| {
             newest
                 .iter()
                 .flatten()
                 .all(|&p| p + d + 2 < self.max_model_len)
         };
-        let depth = 1 + (1..passes).take_while(|&d| fits(d)).count();
+        let depth = 1 + (1..made).take_while(|&d| fits(d)).count();
         (chain.steps.iter().zip(&newest).enumerate())
             .filter_map(|(s, (&i, newest))| {
                 let d = picked[s * k..][..depth].to_vec();
@@ -842,6 +933,7 @@ mod tests {
         },
         max_model_len: 4096,
         reads_target_kv: false,
+        past_first: PastFirst::Chained,
     };
 
     /// A step's sequences each draft what its verify rows leave room for, at most the head's
@@ -893,6 +985,41 @@ mod tests {
             .passes(&two.rows(), &two.before(), &ids(&["a", "b"]), &mut any)
             .expect("passes");
         assert_eq!(passes.drafting.expect("a drafts").chain.passes(), 3);
+    }
+
+    /// A parallel-drafting head (P-EAGLE) drafts every token in pass 1, as vLLM's does: `a`'s
+    /// four verify rows run on two more, reading the mask token at positions 14 and 15, so its
+    /// six rows sit at 10..=15 whatever the verify kept — which of them read the target's tokens
+    /// and which the placeholders is the device's to lay out — and attend through 15. No pass
+    /// chains after it, and the drafts read back are three.
+    #[test]
+    fn a_parallel_head_drafts_every_token_in_pass_one() {
+        const MASK: u32 = 201_020;
+        let drafter = MtpDrafter {
+            past_first: PastFirst::Parallel { mask_token: MASK },
+            ..DRAFTER
+        };
+        let step = TwoSequences::new();
+        let passes = drafter
+            .passes(&step.rows(), &step.before(), &ids(&["a", "b"]), &mut any)
+            .expect("passes");
+        let Drafting { one, chain } = passes.drafting.expect("a drafts");
+        // Block 3 of 16-token blocks: position `p`'s slot is `48 + p`.
+        assert_eq!(one.positions, [10, 11, 12, 13, 14, 15]);
+        assert_eq!(one.slot_mapping, [58, 59, 60, 61, 62, 63]);
+        assert_eq!(one.input_ids, [0, 0, 0, 0, MASK, MASK]);
+        assert_eq!((one.cu_seqlens_q, one.seqused_k), (vec![0, 6], vec![16]));
+        assert_eq!((one.last_rows, one.has_spec_tokens), (vec![5], true));
+        assert_eq!(one.token_rows, [(0, 0), (1, 1), (2, 2), (3, 3)]);
+        assert_eq!(chain.seqs, [[0, 4, 0]]);
+        assert_eq!((chain.passes(), chain.rows(), chain.made()), (1, 2, 3));
+        assert_eq!(chain.next, [vec![0; 4 * 2 * 3]]);
+        assert!(chain.input_ids.is_empty() && chain.positions.is_empty());
+        assert_eq!(chain.cu_seqlens_q, [0]);
+        let picked = [7, 8, 9];
+        let produced = [vec![0, 1, 2, 3], Vec::new()];
+        let drafts = drafter.drafts(&chain, &picked, &step.rows(), &produced, &step.after(3));
+        assert_eq!(drafts["a"], picked);
     }
 
     fn ids(of: &[&str]) -> HashSet<String> {

@@ -591,14 +591,18 @@ fn load_dir_mode(
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default();
-        let target = compiled_head_targets(spec, mtp).find(|(s, _)| s == stem);
         mtp_heads
-            && target.is_some_and(|(_, target)| {
+            && (compiled_head_targets(spec, mtp).filter(|(s, _)| s == stem)).any(|(_, target)| {
                 let (arch, stem) = target.split_once('/').unwrap_or_default();
                 model_feature_enabled(arch, stem)
             })
     };
-    let head_drafts = |stem: &str, json: &serde_json::Value| -> Result<Option<u64>, ConfigError> {
+    // What a target's tape bakes of the head that drafts for it: its drafts a step, and — for an
+    // EAGLE-3 drafter reading several of its target's hidden states — the target layers whose
+    // input residual stream it reads (the head config's `eagle_config`, as vLLM reads it).
+    let head_facts = |stem: &str,
+                      json: &serde_json::Value|
+     -> Result<Option<(u64, Option<serde_json::Value>)>, ConfigError> {
         if !mtp_heads || !spec.hf_architectures.is_empty() {
             return Ok(None);
         }
@@ -606,11 +610,24 @@ fn load_dir_mode(
         for arch_dir in arch_dirs(configs_root)? {
             let head = load_arch_json(&arch_dir)?;
             let drafts = (head.bound_defaults.iter()).find(|(k, _)| k == "spec_drafts");
-            let heads_this = compiled_head_targets(&head, mtp).any(|(_, t)| *t == this)
+            let head_config = compiled_head_targets(&head, mtp).find(|(_, t)| *t == this);
+            let heads_this = head_config.is_some()
                 || (head.checkpoint_of.iter().any(|a| a == arch_name) && carries_head(&head, json));
-            if let (true, Some(&(_, drafts))) = (heads_this, drafts) {
-                return Ok(Some(drafts));
-            }
+            let (true, Some(&(_, drafts))) = (heads_this, drafts) else {
+                continue;
+            };
+            let aux = match head_config {
+                Some((head_stem, _)) => {
+                    let (_, mut head_json) =
+                        read_json_file(&arch_dir.join(format!("{head_stem}.json")))?;
+                    apply_overrides_file(&arch_dir, head_stem, &mut head_json, &mut Vec::new())?;
+                    (head_json.get("eagle_config"))
+                        .and_then(|c| c.get(EAGLE_AUX_LAYER_IDS))
+                        .cloned()
+                }
+                None => None,
+            };
+            return Ok(Some((drafts, aux)));
         }
         Ok(None)
     };
@@ -777,8 +794,12 @@ fn load_dir_mode(
         }
         selected_configs().lock().unwrap().insert(p.clone());
         let (raw, mut json) = read_json_file(p)?;
-        if let (Some(drafts), Some(obj)) = (head_drafts(&stem, &json)?, json.as_object_mut()) {
+        if let (Some((drafts, aux)), Some(obj)) = (head_facts(&stem, &json)?, json.as_object_mut())
+        {
             obj.insert("spec_drafts".to_string(), drafts.into());
+            if let Some(aux) = aux {
+                obj.insert(EAGLE_AUX_LAYER_IDS.to_string(), aux);
+            }
         }
         // Dense-base drift surface: `<stem>.overrides.json` deep-merges
         // onto the verbatim checkpoint config (same mechanism the
@@ -1668,11 +1689,17 @@ fn model_params_from_json(
     let name = parse_name(source_stem, source_path)?;
     let mut bounds = extract_bounds(json);
     derive_sliding_window_pattern(json, &mut bounds);
-    let layer_sets =
-        derive_layer_sets(json, &mut bounds).map_err(|reason| ConfigError::LayerPattern {
-            path: source_path.to_path_buf(),
-            reason,
-        })?;
+    let layer_err = |reason| ConfigError::LayerPattern {
+        path: source_path.to_path_buf(),
+        reason,
+    };
+    let mut layer_sets = derive_layer_sets(json, &mut bounds).map_err(layer_err)?;
+    let aux = eagle_aux_layers(json, &bounds).map_err(layer_err)?;
+    layer_sets.insert(EAGLE_AUX_LAYERS.to_string(), aux);
+    layer_sets.insert(
+        ATTENTION_BIAS_LAYERS.to_string(),
+        attention_bias_layers(json, &bounds),
+    );
     if let Some(limit) = binding_time_step_limit(json) {
         return Err(ConfigError::TimeStepLimit {
             path: source_path.to_path_buf(),
@@ -1990,7 +2017,7 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
     }
     spec.vision_norm_eps = json.get("vision_norm_eps").and_then(|v| v.as_f64());
     spec.tie_default = json.get("tie_default").and_then(|v| v.as_bool());
-    spec.head_targets = str_str_pairs(&path, &json, "head_targets")?;
+    spec.head_targets = head_target_pairs(&path, &json)?;
     // A variant is its config's stem (dense) or `<config>-<preset>`, as the variant loop of
     // `load_dir_mode` names it.
     let presets = declared_preset_names(&dir.join("quantizations.json"))?;
@@ -2031,6 +2058,23 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
     spec.published_as = published_as;
     spec.checkpoint_prefix = as_str("checkpoint_prefix");
     spec.reads_target_kv = json.get("reads_target_kv").and_then(|v| v.as_bool()) == Some(true);
+    spec.parallel_drafting = match json.get("parallel_drafting") {
+        None => None,
+        Some(v) => {
+            let field = |key: &str| {
+                (v.get(key).and_then(|s| s.as_str()).map(str::to_string)).ok_or_else(|| {
+                    ConfigError::ArchJson {
+                        path: path.clone(),
+                        reason: format!("`parallel_drafting.{key}` must be a string"),
+                    }
+                })
+            };
+            Some(crate::arch_spec::ParallelDraftingSpec {
+                mask_token_key: field("mask_token")?,
+                mask_hidden: field("mask_hidden")?,
+            })
+        }
+    };
     let strings = |key: &str| -> Result<Option<Vec<String>>, ConfigError> {
         json.get(key)
             .map(|v| {
@@ -2107,6 +2151,7 @@ const ARCH_JSON_KEYS: &[&str] = &[
     "checkpoint_of",
     "checkpoint_prefix",
     "reads_target_kv",
+    "parallel_drafting",
     "borrows",
     "top_level_weights",
     "scale_dtype",
@@ -2220,6 +2265,38 @@ fn str_str_pairs(
         out.push((k.clone(), s.to_string()));
     }
     out.sort();
+    Ok(out)
+}
+
+/// `head_targets`: each head config's target config, or a list of them, as `(config, target)`
+/// pairs — a config of several targets a pair each, in the list's order.
+fn head_target_pairs(
+    path: &Path,
+    json: &serde_json::Value,
+) -> Result<Vec<(String, String)>, ConfigError> {
+    let Some(obj) = json.get("head_targets") else {
+        return Ok(Vec::new());
+    };
+    let fail = |reason: String| ConfigError::ArchJson {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let obj = (obj.as_object()).ok_or_else(|| fail("`head_targets` must be an object".into()))?;
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (config, targets) in obj {
+        let targets: Vec<&serde_json::Value> = match targets {
+            serde_json::Value::Array(list) if !list.is_empty() => list.iter().collect(),
+            target => vec![target],
+        };
+        for target in targets {
+            let target = target.as_str().ok_or_else(|| {
+                fail(format!(
+                    "`head_targets.{config}` must be a target config or a list of them"
+                ))
+            })?;
+            out.push((config.clone(), target.to_string()));
+        }
+    }
     Ok(out)
 }
 
@@ -2747,6 +2824,58 @@ pub(crate) fn derive_layer_sets(
         .collect())
 }
 
+/// The config key naming the target layers whose input residual stream an EAGLE-3 drafter reads:
+/// vLLM's, under a drafter config's `eagle_config`; a target it drafts for carries it at its top
+/// level.
+const EAGLE_AUX_LAYER_IDS: &str = "eagle_aux_hidden_state_layer_ids";
+
+/// The layer set a target's DSL exports those residual streams at (`if layer in
+/// eagle_aux_layers:`).
+const EAGLE_AUX_LAYERS: &str = "eagle_aux_layers";
+
+/// The target layers an EAGLE-3 drafter reads the input residual stream of
+/// ([`EAGLE_AUX_LAYER_IDS`]); empty for a config without one, so a target's predicate reads the
+/// empty set when no such drafter compiles beside it.
+fn eagle_aux_layers(
+    json: &serde_json::Value,
+    bounds: &BTreeMap<String, u64>,
+) -> Result<LayerSet, String> {
+    let Some(ids) = json.get(EAGLE_AUX_LAYER_IDS) else {
+        return Ok(LayerSet::default());
+    };
+    let layers = bounds.get("num_hidden_layers").copied();
+    let mut members = (ids.as_array().into_iter().flatten())
+        .map(|v| match (v.as_u64(), layers) {
+            (Some(l), Some(n)) if l < n => Ok(l),
+            _ => Err(format!(
+                "{EAGLE_AUX_LAYER_IDS}: `{v}` is not a layer of this config's {layers:?}"
+            )),
+        })
+        .collect::<Result<Vec<u64>, String>>()?;
+    if members.is_empty() {
+        return Err(format!(
+            "{EAGLE_AUX_LAYER_IDS}: expected a list of layer indices, got {ids}"
+        ));
+    }
+    members.sort_unstable();
+    members.dedup();
+    Ok(LayerSet(members))
+}
+
+/// The layer set whose attention projections carry biases (`if layer in attention_bias_layers:`):
+/// every layer of a config with `attention_bias: true` (a Llama-family config's flag), none
+/// otherwise — so one DSL serves both (AWS's P-EAGLE drafters: 120B's has them, 20B's not).
+const ATTENTION_BIAS_LAYERS: &str = "attention_bias_layers";
+
+fn attention_bias_layers(json: &serde_json::Value, bounds: &BTreeMap<String, u64>) -> LayerSet {
+    let biased = json.get("attention_bias").and_then(|b| b.as_bool()) == Some(true);
+    let layers = match biased {
+        true => bounds.get("num_hidden_layers").copied().unwrap_or(0),
+        false => 0,
+    };
+    LayerSet((0..layers).collect())
+}
+
 fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
     // MLA (DeepSeek family) head_dim — MUST run before the generic
     // hidden/heads rule: MLA's per-head Q/K width is
@@ -2877,6 +3006,13 @@ fn apply_generic_bound_defaults(bounds: &mut BTreeMap<String, u64>) {
         && let Some(&h) = bounds.get("hidden_size")
     {
         bounds.insert("backbone_hidden_size".to_string(), h);
+    }
+    // The width of the target hidden rows a drafter reads: its target's residual width, unless it
+    // reads several of its target's hidden states side by side (P-EAGLE declares three).
+    if !bounds.contains_key("target_hidden_size")
+        && let Some(&h) = bounds.get("backbone_hidden_size")
+    {
+        bounds.insert("target_hidden_size".to_string(), h);
     }
     // Per-class attention geometry defaults: uniform-geometry arches
     // never declare global_* keys, but the shape sigs anchor the
@@ -3561,6 +3697,38 @@ mod tests {
             read_json_file(&repo_model_archs("gemma4").join("gemma-4-31b-it.json")).expect("json");
         assert_eq!(big["architectures"][0], "Gemma4ForConditionalGeneration");
         assert_ne!(big["text_config"]["hidden_size"], 2816);
+    }
+
+    /// AWS's 120B P-EAGLE drafters draft for both gpt-oss-120b configs (the quant presets' base and
+    /// the self-contained 3-bit), 20B's for gpt-oss-20b; only 120B's attention carries biases, on
+    /// every one of its layers.
+    #[test]
+    fn the_p_eagle_drafters_name_their_targets_and_their_attention_biases() {
+        let dir = repo_model_archs("p-eagle");
+        let spec = load_arch_json(&dir).expect("arch.json");
+        let targets = |head: &str| -> Vec<&str> {
+            (spec.head_targets.iter())
+                .filter(|(stem, _)| stem == head)
+                .map(|(_, target)| target.as_str())
+                .collect()
+        };
+        let biased = |stem: &str| -> Vec<u64> {
+            let path = dir.join(format!("{stem}.json"));
+            let (_, mut json) = read_json_file(&path).expect("json");
+            apply_overrides_file(&dir, stem, &mut json, &mut Vec::new()).expect("overrides");
+            let head =
+                model_params_from_json(&json, stem, &path, Vec::new(), &spec).expect("parse");
+            head.layer_sets[ATTENTION_BIAS_LAYERS].members().to_vec()
+        };
+        for stem in ["gpt-oss-120b-p-eagle", "gpt-oss-120b-p-eagle-mixed"] {
+            let both = ["gpt-oss/gpt-oss-120b", "gpt-oss/gpt-oss-120b-3bit"];
+            assert_eq!(targets(stem), both, "{stem}");
+            assert_eq!(biased(stem), [0, 1, 2, 3], "{stem}");
+        }
+        for stem in ["gpt-oss-20b-p-eagle", "gpt-oss-20b-p-eagle-mixed"] {
+            assert_eq!(targets(stem), ["gpt-oss/gpt-oss-20b"], "{stem}");
+            assert_eq!(biased(stem), [] as [u64; 0], "{stem}");
+        }
     }
 
     /// The parity-tiny configs keep every property the carrier gate

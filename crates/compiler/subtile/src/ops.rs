@@ -122,7 +122,7 @@ macro_rules! for_each_subop {
                 rows = [in0], gemm_w = [none];
             GateApply [SubOp::GateApply] arity = (|n| n == 2), cols = [in0], rows = [in0],
                 gemm_w = [none];
-            Concat [SubOp::Concat { .. }] arity = (|n| n == 2), cols = [field cols],
+            Concat [SubOp::Concat { .. }] arity = (|n| n == 1 || n == 2), cols = [field cols],
                 rows = [in0], gemm_w = [none];
             GateScale [SubOp::GateScale] arity = (|n| n == 3), cols = [in0], rows = [in0],
                 gemm_w = [none];

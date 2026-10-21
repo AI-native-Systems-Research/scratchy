@@ -1101,6 +1101,9 @@ pub fn compile_carrier(
             // `target_hidden`), every downstream `FufInput::Extern` referencing it rewired to
             // read its slot 0. No-op for a body that reads none.
             rows_lowering::materialize_rows(&mut model_fuf);
+            // A target exporting several hidden states (its EAGLE-3 drafter's) exports them side
+            // by side as one. No-op for a forward exporting one or none.
+            rows_lowering::chain_exports(&mut model_fuf);
 
             // At tp>1, the runtime weight tensors are per-rank shards
             // (column-parallel q/k/v/gate/up halve dim 0; row-parallel
@@ -1890,6 +1893,9 @@ pub fn compile_carrier(
             /// Its `spec_drafts` and `spec_verify_rows`.
             spec: [u64; 2],
             reads_target_kv: bool,
+            /// A parallel-drafting head's mask token, the config key naming it, and the tensor of
+            /// its mask rows' target hidden states.
+            parallel: Option<(u64, String, String)>,
         }
         let head_facts: std::collections::BTreeMap<String, HeadFacts> = solved
             .iter()
@@ -1909,8 +1915,31 @@ pub fn compile_carrier(
                     spec: ["spec_drafts", "spec_verify_rows"]
                         .map(|b| sm.model.bounds.get(b).copied().unwrap_or(0)),
                     reads_target_kv: sm.model.arch.reads_target_kv,
+                    parallel: (sm.model.arch.parallel_drafting.as_ref()).map(|p| {
+                        let token = sm.model.bounds.get(&p.mask_token_key).copied();
+                        let token = token.unwrap_or_else(|| {
+                            panic!(
+                                "{}: a parallel-drafting head's config names its mask token \
+                                 (`{}`)",
+                                sm.mod_name, p.mask_token_key
+                            )
+                        });
+                        (token, p.mask_token_key.clone(), p.mask_hidden.clone())
+                    }),
                 };
                 (sm.mod_name.clone(), facts)
+            })
+            .collect();
+        // The width of the target hidden rows a head variant reads (`target_hidden_size`): its
+        // target's, so it differs between variants of one head arch, unlike its `HeadFacts`.
+        let target_widths: std::collections::BTreeMap<&str, u64> = solved
+            .iter()
+            .filter(|sm| head_facts[&sm.mod_name].reads_target_hidden)
+            .map(|sm| {
+                let width = sm.model.bounds.get("target_hidden_size").copied();
+                let width =
+                    width.unwrap_or_else(|| panic!("{}: a head's target_hidden_size", sm.mod_name));
+                (sm.mod_name.as_str(), width)
             })
             .collect();
         let head_tokens = {
@@ -1919,6 +1948,17 @@ pub fn compile_carrier(
                 let variant_ident = pascal_case(&a.model_ident);
                 let reads = fact(a).reads_target_hidden;
                 quote! { Weights::#variant_ident(_) => #reads, }
+            });
+            // A head's width, read only for a head: every other model's is its hidden size.
+            let width_arms = arch_dispatch_arms.iter().map(|a| {
+                let variant_ident = pascal_case(&a.model_ident);
+                match target_widths.get(a.model_ident.to_string().as_str()) {
+                    Some(width) => quote! { Weights::#variant_ident(_) => #width, },
+                    None => quote! {
+                        Weights::#variant_ident(_) =>
+                            ::scratchy_forward_compiler::ScratchyWeights::hidden_size(self),
+                    },
+                }
             });
             let lent_arms = arch_dispatch_arms.iter().flat_map(|a| {
                 let variant_ident = pascal_case(&a.model_ident);
@@ -1939,6 +1979,12 @@ pub fn compile_carrier(
                 fn reads_target_hidden(&self) -> bool {
                     match self {
                         #(#reads_arms)*
+                    }
+                }
+
+                fn target_hidden_width(&self) -> u64 {
+                    match self {
+                        #(#width_arms)*
                     }
                 }
 
@@ -1971,27 +2017,41 @@ pub fn compile_carrier(
                         panic!("{arch_ident}: a head registers under one identity ({hf_arches:?})");
                     };
                     let HeadFacts {
-                        lent: [Some(embed_tokens), lm_head],
+                        lent: [embed_tokens, lm_head],
                         lm_head_rows,
                         drafts_for,
                         repo_infix,
                         checkpoint_prefix,
                         spec,
                         reads_target_kv,
+                        parallel,
                         ..
-                    } = first
-                    else {
-                        panic!(
-                            "{arch_ident}: a head reading `target_hidden` must name embed_tokens \
-                             (it has {first:?})"
-                        );
+                    } = first;
+                    let parallel = match parallel {
+                        Some((token, key, hidden)) => {
+                            let token = u32::try_from(*token).expect("a mask token fits u32");
+                            quote! {
+                                ::core::option::Option::Some(
+                                    ::scratchy_forward_compiler::ParallelDrafting {
+                                        mask_token: #token,
+                                        mask_token_key: #key,
+                                        mask_hidden: #hidden,
+                                    }
+                                )
+                            }
+                        }
+                        None => quote! { ::core::option::Option::None },
                     };
                     let some = |v: &Option<String>| match v {
                         Some(v) => quote! { ::core::option::Option::Some(#v) },
                         None => quote! { ::core::option::Option::None },
                     };
-                    let (lm_head, repo_infix, checkpoint_prefix) =
-                        (some(lm_head), some(repo_infix), some(checkpoint_prefix));
+                    let (embed_tokens, lm_head, repo_infix, checkpoint_prefix) = (
+                        some(embed_tokens),
+                        some(lm_head),
+                        some(repo_infix),
+                        some(checkpoint_prefix),
+                    );
                     let lm_head_rows = proc_macro2::Literal::u32_unsuffixed(*lm_head_rows as u32);
                     let [drafts, verify_rows] =
                         spec.map(|v| u8::try_from(v).expect("a head's spec facts fit a u8"));
@@ -2039,6 +2099,7 @@ pub fn compile_carrier(
                             lm_head: #lm_head,
                             lm_head_rows: #lm_head_rows,
                             reads_target_kv: #reads_target_kv,
+                            parallel: #parallel,
                             drafts_for: &[#(#drafts_for),*],
                             repo_infix: #repo_infix,
                             checkpoint_prefix: #checkpoint_prefix,

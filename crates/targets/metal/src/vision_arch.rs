@@ -369,6 +369,7 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             has_spec_tokens: false,
             device_inputs: &[],
             deferred: None,
+            after: None,
             reads: crate::ForwardReads::Outputs,
         };
 

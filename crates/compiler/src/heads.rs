@@ -12,7 +12,8 @@ pub struct HeadRegistration {
     /// The architecture it registers under (its arch.json `hf_architectures`): what a loader
     /// dispatches it by, wherever its tensors are found.
     pub arch: &'static str,
-    pub embed_tokens: &'static str,
+    /// `None`: the head's embedding is its own (P-EAGLE's, which it trained).
+    pub embed_tokens: Option<&'static str>,
     /// `None`: the head's logits are its own (Gemma 4's assistant: its tied embedding).
     pub lm_head: Option<&'static str>,
     pub lm_head_rows: u32,
@@ -20,6 +21,10 @@ pub struct HeadRegistration {
     /// of its own, its query sits at the position after the row it reads, and its chained drafts
     /// keep that position.
     pub reads_target_kv: bool,
+    /// It drafts every token past its first in one forward (P-EAGLE): that forward's rows sit at
+    /// the positions after a sequence's newest and read its placeholders. `None`: each draft past
+    /// the first is a forward of its own, on the one before it.
+    pub parallel: Option<ParallelDrafting>,
     /// The checkpoint architectures of the targets it drafts for: its config is its target's.
     pub drafts_for: &'static [&'static str],
     /// How its repo is named when published apart from its target's (an MLX conversion strips the
@@ -49,6 +54,21 @@ pub struct HeadRegistration {
     pub verify_rows: u8,
 }
 
+/// The placeholders a parallel-drafting head's rows past a sequence's newest read
+/// ([`HeadRegistration::parallel`]): learned in training, where the rows a sequential drafter
+/// reads the token and target hidden state before them have neither yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParallelDrafting {
+    /// The token each such row embeds (P-EAGLE's `ptd_token_id`).
+    pub mask_token: u32,
+    /// The config key naming it, which every checkpoint of the head carries: what tells one from a
+    /// model of the architecture it registers under (P-EAGLE's config reads `LlamaForCausalLM`).
+    pub mask_token_key: &'static str,
+    /// The checkpoint tensor holding the target hidden states each such row reads
+    /// (`[target_hidden_size]`, P-EAGLE's `mask_hidden`).
+    pub mask_hidden: &'static str,
+}
+
 /// A drafter published as a checkpoint of its own that its target drafts with by default: no
 /// checkpoint of the target carries it (Google ships Gemma 4's assistant only as a repo of its
 /// own), so the compiled drafter names the repo it loads from.
@@ -73,7 +93,7 @@ impl HeadRegistration {
     /// The on-disk prefix the head loads `w` from, when it borrows `w`.
     pub fn prefix(&self, w: crate::LentWeight) -> Option<&'static str> {
         match w {
-            crate::LentWeight::EmbedTokens => Some(self.embed_tokens),
+            crate::LentWeight::EmbedTokens => self.embed_tokens,
             crate::LentWeight::LmHead => self.lm_head,
         }
     }
@@ -88,10 +108,16 @@ impl HeadRegistration {
     }
 }
 
-/// The registration of the multi-token-prediction head `arch_hint` names, if it names one.
-pub fn draft_head(arch_hint: &str) -> Option<HeadRegistration> {
+/// The registration of the multi-token-prediction head a draft checkpoint's config names: its
+/// `arch_hint`, and — for a head registering under an architecture other models share (P-EAGLE's
+/// `LlamaForCausalLM`) — the key only its configs carry (`has_key`), so a plain draft model of that
+/// architecture is no head.
+pub fn draft_head(arch_hint: &str, has_key: &dyn Fn(&str) -> bool) -> Option<HeadRegistration> {
     registered()
-        .find(|(hf_arches, _)| hf_arches.contains(&arch_hint))
+        .find(|(hf_arches, head)| {
+            hf_arches.contains(&arch_hint)
+                && head.parallel.is_none_or(|p| has_key(p.mask_token_key))
+        })
         .map(|(_, head)| head)
 }
 
@@ -154,10 +180,11 @@ mod tests {
         };
         let head = HeadRegistration {
             arch: "Gemma4AssistantForCausalLM",
-            embed_tokens: "model.target_embed_tokens",
+            embed_tokens: Some("model.target_embed_tokens"),
             lm_head: None,
             lm_head_rows: 262_144,
             reads_target_kv: true,
+            parallel: None,
             drafts_for: &["Gemma4ForConditionalGeneration"],
             repo_infix: None,
             checkpoint_prefix: None,

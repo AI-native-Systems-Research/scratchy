@@ -174,6 +174,7 @@ pub(crate) fn lent_weight_prefix(
         ))
     };
     match w {
+        LentWeight::EmbedTokens if !borrowed("embed_tokens") => None,
         LentWeight::LmHead if !borrowed("lm_head") => None,
         LentWeight::LmHead if !model.tie_word_embeddings => {
             let id = program.weights.find(&["lm_head"])?;
@@ -7480,10 +7481,14 @@ struct CanonicalLowered {
 /// Gemm (tp=1) or its AllGather wrapper (tp>1) for decoders, the
 /// merger MLP's bias_add for vision encoders.
 fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
+    use crate::classified::OpKind;
+    // The tail's appended nodes belong where they read or are read: the splices and row loads
+    // near the Embed, a target's exported hidden states (`rows_lowering::chain_exports`) after
+    // their last concatenation.
     fuf.nodes.iter().rev().find(|n| {
         !matches!(
             n.op,
-            crate::classified::OpKind::MmEmbedSplice | crate::classified::OpKind::LoadRows(_)
+            OpKind::MmEmbedSplice | OpKind::LoadRows(_) | OpKind::ExportHidden
         )
     })
 }
@@ -7523,19 +7528,29 @@ enum BackboneLayout {
 fn metal_off_tape_tokens(
     width: u64,
     mc: &scratchy_target_metal::tape::model_consts::MetalModelConsts,
-    head: Option<(u32, u32)>,
+    head: Option<(u32, u32, bool)>,
 ) -> TokenStream {
     use scratchy_target_metal::off_tape::OffTape;
     use scratchy_target_metal::tape::ids::{BlockSize, HiddenSize, LogitsWidth, NumDrafts, RotDim};
-    use scratchy_target_metal::tape::kernel_constants::MtpChainConstants;
+    use scratchy_target_metal::tape::kernel_constants::{DraftsPastFirst, MtpChainConstants};
     let width = u32::try_from(width).expect("logits width fits u32");
     // The chain advances the full-context group's slots (KV group 0).
     let block_size = BlockSize(mc.global_block_size);
-    let head = head.map(|(drafts, hidden)| MtpChainConstants {
+    // The chain's rope tables hold one row a sequence a pass: a parallel pass's rows read
+    // positions.
+    assert!(
+        !(mc.mrope && head.is_some_and(|(_, _, parallel)| parallel)),
+        "a parallel-drafting head ropes by position, not by MRoPE rows"
+    );
+    let head = head.map(|(drafts, hidden, parallel)| MtpChainConstants {
         hidden: HiddenSize(hidden),
         drafts: NumDrafts(drafts),
         // An MRoPE head reads a cos/sin row a token in place of its position.
         rope: RotDim(if mc.mrope { mc.rot_dim } else { 0 }),
+        past_first: match parallel {
+            true => DraftsPastFirst::Parallel,
+            false => DraftsPastFirst::Chained,
+        },
     });
     let keys = OffTape::keys(
         LogitsWidth(width),
@@ -13820,9 +13835,10 @@ pub fn emit_model(
     > = BTreeMap::new();
     // `last_node_id` must be the lm_head Gemm (tp=1) or the post-lm_head
     // AllGather (tp>1), not one of the post-Embed `MmEmbedSplice` nodes
-    // that `tp_lowering::insert_mm_splices` appends. Those sit at fuf-
-    // array-tail but semantically belong near the Embed; walking past
-    // them with `last_non_splice_node` recovers the real terminal.
+    // that `tp_lowering::insert_mm_splices` appends, nor a target's
+    // appended export. Those sit at fuf-array-tail but semantically
+    // belong elsewhere; walking past them with `last_non_splice_node`
+    // recovers the real terminal.
     let last_node_id = last_non_splice_node(fuf)
         .expect("non-empty FUF expected")
         .id;
@@ -14295,15 +14311,19 @@ pub fn emit_model(
                 _ => None,
             }
         });
-        let fused_mlp = l.input.ops.iter().all(|od| {
-            !matches!(
-                od.op,
-                scratchy_subtile::subtile_ir::SubOp::MatmulTile {
-                    weight: scratchy_subtile::lower::GemmWeight::Affine { .. },
-                    ..
-                }
-            )
-        });
+        // Whether the MLP's gate/up projections are dense — the pairs, not every matmul: a dense
+        // drafter borrowing its target's affine lm_head (P-EAGLE) still packs its dense pairs.
+        let fused_mlp = (0..l.input.ops.len())
+            .filter_map(|i| crate::weight_bindings::gate_up_pair(&l, i))
+            .all(|(_, gate, _)| {
+                !matches!(
+                    l.input.ops[gate].op,
+                    scratchy_subtile::subtile_ir::SubOp::MatmulTile {
+                        weight: scratchy_subtile::lower::GemmWeight::Affine { .. },
+                        ..
+                    }
+                )
+            });
         let weight_paths: Vec<Vec<String>> = (0..program.weights.len())
             .map(|i| program.weights.path(WeightId(i as u32)).to_vec())
             .collect();
@@ -14769,14 +14789,10 @@ pub fn emit_model(
             scratchy_forward_compiler::RowsExtern::TargetHidden,
         )
     });
-    // The width of those rows (the `TargetHidden` extern's): its target's hidden size — which a
-    // drafter of its own width (Gemma 4's assistant) reads and exports at, its passes chained at.
-    let target_hidden_width: u64 = model
-        .bounds
-        .get("backbone_hidden_size")
-        .or_else(|| model.bounds.get("hidden_size"))
-        .copied()
-        .unwrap_or(0);
+    // The width of those rows (the `TargetHidden` extern's, `target_hidden_size`): its target's
+    // hidden size — which a drafter of its own width (Gemma 4's assistant) reads and exports at,
+    // its passes chained at — or the width it declares (P-EAGLE's three target hidden states).
+    let target_hidden_width: u64 = model.bounds.get("target_hidden_size").copied().unwrap_or(0);
     let (
         vision_freqs_bytes_lit,
         vision_pixels_bytes_lit,
@@ -15005,7 +15021,7 @@ pub fn emit_model(
             let drafts =
                 u32::try_from(drafts.expect("an MTP head's spec_drafts")).expect("drafts fit u32");
             let hidden = u32::try_from(target_hidden_width).expect("hidden width fits u32");
-            (drafts, hidden)
+            (drafts, hidden, model.arch.parallel_drafting.is_some())
         });
         metal_arena_bytes_statics.push(metal_off_tape_tokens(logits_width, mc, head));
     }
@@ -15779,6 +15795,7 @@ pub fn emit_model(
                 mrope_cos_sin,
                 device_inputs: ctx.device_inputs,
                 deferred: ctx.deferred,
+                after: ctx.after,
                 reads: ctx.reads,
             };
             run(&inputs)

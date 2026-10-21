@@ -568,6 +568,7 @@ mod imp {
                 last_token_indices: Some(host_view(&lti, &[1], u32t)),
                 device_inputs: &[],
                 deferred: None,
+                after: None,
                 reads: scratchy_target_metal::ForwardReads::Outputs,
             };
 
