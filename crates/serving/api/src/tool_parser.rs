@@ -504,18 +504,23 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 ///
 /// ⛔ BUT ONLY A REPLY IN THAT SHAPE IS READ AS ONE. A worker applies a grammar best-effort: it
 /// decodes unconstrained, with a warning, when the grammar won't compile, and the Spyre worker
-/// applies none. A reply is the grammar's only if it opens with `[` after whitespace, all the
-/// grammar allows; any other is read by `fallback`, the engine's own parser, as `"auto"` would
-/// read it, or is text when there is none. So a grammar that didn't hold costs the constraint,
-/// never the calls.
+/// applies none. A reply is the grammar's only if it opens with `[` and then `{`, past
+/// whitespace, all the grammar allows; any other, Mistral's `[TOOL_CALLS]` and a pythonic
+/// `[f(…)]` among them, is read by `fallback`, the engine's own parser, as `"auto"` would read it,
+/// or is text when there is none. So a grammar that didn't hold costs the constraint, never the
+/// calls.
 pub(crate) struct RequiredToolCallsParser {
     pub(crate) fallback: Option<Arc<dyn ToolCallParser>>,
 }
 
-/// Whether a reply that starts `text` is in the shape `"required"`'s grammar gives it, once its
-/// first character past whitespace has arrived.
+/// Whether a reply that starts `text` is in the shape `"required"`'s grammar gives it, an array
+/// whose first call has opened, once enough of it has arrived to say.
 fn opens_a_call_array(text: &str) -> Option<bool> {
-    text.trim_start().chars().next().map(|c| c == '[')
+    let mut opening = text.trim_start().chars();
+    match opening.next()? {
+        '[' => (opening.as_str().trim_start().chars().next()).map(|c| c == '{'),
+        _ => Some(false),
+    }
 }
 
 impl ToolCallParser for RequiredToolCallsParser {
@@ -544,8 +549,8 @@ impl ToolCallParser for RequiredToolCallsParser {
     }
 }
 
-/// [`RequiredToolCallsParser`]'s stream. It holds the reply back until its first character past
-/// whitespace says whose it is. The grammar's array streams its calls, with no text; any other
+/// [`RequiredToolCallsParser`]'s stream. It holds the reply back until its opening says whose it
+/// is. The grammar's array streams its calls, with no text; any other
 /// reply streams through the fallback parser, or as text.
 enum RequiredToolCallsStreamingState {
     Undecided {
@@ -3082,14 +3087,23 @@ mod tests {
         parser: &dyn ToolCallParser,
         reply: &str,
     ) -> (String, Vec<(u32, String)>, Vec<String>) {
+        let characters: Vec<String> = reply.chars().map(String::from).collect();
+        stream_in_pieces(parser, &characters)
+    }
+
+    /// What `parser` streams for a reply fed in `pieces`, as [`stream_by_character`] reports it.
+    fn stream_in_pieces(
+        parser: &dyn ToolCallParser,
+        pieces: &[impl AsRef<str>],
+    ) -> (String, Vec<(u32, String)>, Vec<String>) {
         let mut state = parser.create_streaming_state();
         let (mut current, mut text) = (String::new(), String::new());
         let mut names: Vec<(u32, String)> = Vec::new();
         let mut arguments: Vec<String> = Vec::new();
-        for c in reply.chars() {
+        for piece in pieces {
             let previous = current.clone();
-            current.push(c);
-            match state.process_delta(&previous, &current, &c.to_string()) {
+            current.push_str(piece.as_ref());
+            match state.process_delta(&previous, &current, piece.as_ref()) {
                 ToolParserDelta::Content(content) => text.push_str(&content),
                 ToolParserDelta::ToolCalls(calls) => {
                     for call in calls {
@@ -3140,10 +3154,47 @@ mod tests {
         assert_eq!(text, native, "streamed whole, as text");
         assert!(names.is_empty());
 
-        // Leading whitespace doesn't decide it: the first character past it does.
+        // Leading whitespace doesn't decide it: the first characters past it do.
         let (text, names, _) = stream_by_character(&bare, &format!(" \n{REQUIRED_REPLY}"));
         assert_eq!(text, "");
         assert_eq!(names.len(), 2);
+    }
+
+    /// A `[` alone doesn't make a reply the grammar's: Mistral's calls open `[TOOL_CALLS]`, and its
+    /// v11+ calls (`name{…}`) carry no `"name"` for the array reader to find. Only `[` then `{`,
+    /// the opening the grammar's first call gives, is read as the array; this reply goes to the
+    /// Mistral parser, whole and streamed in the tokens it arrives in.
+    #[test]
+    fn a_required_reply_opening_with_a_bracket_but_no_call_reads_as_auto() {
+        let mistral = RequiredToolCallsParser {
+            fallback: Some(get_tool_parser("mistral").unwrap()),
+        };
+        for (reply, tokens) in [
+            (
+                r#"[TOOL_CALLS]Bash{"command": "ls"}"#,
+                &["[TOOL_CALLS]", "Bash", r#"{"command""#, r#": "ls"}"#][..],
+            ),
+            (
+                r#"[TOOL_CALLS] [{"name": "Bash", "arguments": {"command": "ls"}}]"#,
+                &[
+                    "[TOOL_CALLS]",
+                    " [",
+                    r#"{"name": "Bash", "#,
+                    r#""arguments": {"command": "ls"}}]"#,
+                ][..],
+            ),
+        ] {
+            let whole = mistral.extract_tool_calls(reply);
+            let names: Vec<_> = (whole.tool_calls.iter())
+                .map(|tc| tc.function.name.as_str())
+                .collect();
+            assert_eq!(names, ["Bash"], "{reply}");
+            let (text, names, arguments) = stream_in_pieces(&mistral, tokens);
+            assert_eq!(text, "", "{reply}");
+            assert_eq!(names, [(0, "Bash".to_string())], "{reply}");
+            let arguments: serde_json::Value = serde_json::from_str(&arguments[0]).unwrap();
+            assert_eq!(arguments, serde_json::json!({"command": "ls"}), "{reply}");
+        }
     }
 
     /// ⭐ `"required"`'s grammar, compiled by llguidance as the sampler compiles it, takes a call to
