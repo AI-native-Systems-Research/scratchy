@@ -584,6 +584,21 @@ impl AsyncEngine {
         self.tool_parser.clone()
     }
 
+    /// The parser `request`'s reply is read with: under `tool_choice: "required"`, the one for
+    /// the JSON its grammar makes the reply (`RequiredToolCallsParser`), with or without a parser
+    /// set on the engine; otherwise the engine's.
+    fn request_tool_parser(
+        &self,
+        request: &protocol::ChatCompletionRequest,
+    ) -> Option<Arc<dyn ToolCallParser>> {
+        match request.tool_choice {
+            Some(protocol::ToolChoice::Required) => {
+                Some(Arc::new(crate::tool_parser::RequiredToolCallsParser))
+            }
+            _ => self.tool_parser.clone(),
+        }
+    }
+
     /// Set the reasoning parser on this engine.
     pub fn set_reasoning_parser(&mut self, parser: Arc<dyn ReasoningParser>) {
         self.reasoning_parser = Some(parser);
@@ -903,7 +918,8 @@ impl AsyncEngine {
                 };
 
             // Try tool call extraction if parser is configured and request has tools.
-            let (final_content, final_tool_calls, final_finish_reason) = match &self.tool_parser {
+            let parser = self.request_tool_parser(&request);
+            let (final_content, final_tool_calls, final_finish_reason) = match parser {
                 Some(parser) if request.tools.is_some() => {
                     let reply =
                         reply_tool_calls(parser.as_ref(), text_for_tools, &request.tool_choice);
@@ -1103,7 +1119,8 @@ impl AsyncEngine {
         }
 
         // Determine if tool parsing is active for this request.
-        let use_tool_parser = self.tool_parser.is_some()
+        let tool_parser = self.request_tool_parser(&request);
+        let use_tool_parser = tool_parser.is_some()
             && request.tools.is_some()
             && !is_tool_choice_none(&request.tool_choice);
 
@@ -1143,9 +1160,7 @@ impl AsyncEngine {
 
             // Create streaming tool parser state if applicable.
             let tool_state = if use_tool_parser {
-                self.tool_parser
-                    .as_ref()
-                    .map(|p| p.create_streaming_state())
+                tool_parser.as_ref().map(|p| p.create_streaming_state())
             } else {
                 None
             };
@@ -3437,6 +3452,24 @@ impl AsyncEngine {
             &request.guided_regex,
             &request.guided_grammar,
         )?;
+        // ⭐ `tool_choice: "required"` IS A GRAMMAR (#765): the reply is a JSON array of calls to
+        // the declared tools, so it is a tool call whatever the model would have said. It shapes
+        // the whole reply, so a reply already shaped another way can't take it too.
+        let guided_grammar = match (&request.tool_choice, guided_grammar) {
+            (Some(protocol::ToolChoice::Required), None) => Some(GuidedGrammar::JsonSchema {
+                schema: crate::tool_parser::required_tool_calls_schema(
+                    request.tools.as_deref().unwrap_or_default(),
+                ),
+            }),
+            (Some(protocol::ToolChoice::Required), Some(_)) => {
+                return Err(ServeError::Validation(
+                    "tool_choice \"required\" constrains the reply itself, so it can't be \
+                     combined with response_format, guided_regex or guided_grammar"
+                        .to_string(),
+                ));
+            }
+            (_, guided_grammar) => guided_grammar,
+        };
 
         // Tokenize bad_words strings into token sequences.
         let bad_words_token_ids = self.tokenize_bad_words(&request.bad_words)?;
@@ -5553,6 +5586,69 @@ mod tests {
     #[test]
     fn test_is_tool_choice_none_with_auto() {
         assert!(!is_tool_choice_none(&Some(protocol::ToolChoice::Auto)));
+    }
+
+    /// `"required"` is a grammar (#765): its sampling params carry the schema of calls to the
+    /// declared tools, a request that shapes its reply another way too is refused, and its reply is
+    /// read as those calls, whether the engine has a tool parser or not.
+    #[test]
+    fn a_required_tool_choice_constrains_the_reply_to_calls() {
+        use protocol::ToolChoice;
+        let engine = make_test_engine();
+        let bash = protocol::ChatCompletionToolsParam {
+            tool_type: "function".to_string(),
+            function: protocol::FunctionDefinition {
+                name: "Bash".to_string(),
+                description: None,
+                parameters: None,
+            },
+        };
+        let request = |choice, response_format| protocol::ChatCompletionRequest {
+            tools: Some(vec![bash.clone()]),
+            tool_choice: Some(choice),
+            response_format,
+            ..make_chat_request()
+        };
+
+        // The grammar: the schema of calls to the declared tools.
+        let params = engine.build_sampling_params_from_chat(&request(ToolChoice::Required, None));
+        let expected = crate::tool_parser::required_tool_calls_schema(std::slice::from_ref(&bash));
+        assert!(
+            matches!(
+                params.unwrap().guided_grammar,
+                Some(GuidedGrammar::JsonSchema { ref schema }) if *schema == expected
+            ),
+            "\"required\" carries its grammar"
+        );
+        let auto = engine.build_sampling_params_from_chat(&request(ToolChoice::Auto, None));
+        assert!(auto.unwrap().guided_grammar.is_none());
+
+        // A reply already shaped another way can't take it too.
+        let json_object: protocol::ResponseFormat =
+            serde_json::from_value(serde_json::json!({"type": "json_object"})).unwrap();
+        let both = request(ToolChoice::Required, Some(json_object));
+        let err = engine.build_sampling_params_from_chat(&both).err();
+        assert!(matches!(err, Some(ServeError::Validation(_))), "{err:?}");
+
+        // Its reply is read as calls, with no tool parser set on the engine.
+        assert!(engine.tool_parser().is_none());
+        let parser = engine.request_tool_parser(&request(ToolChoice::Required, None));
+        let reply = r#"[{"name": "Bash", "parameters": {"command": "ls"}}]"#;
+        let tool_reply = reply_tool_calls(
+            parser.expect("\"required\" has its parser").as_ref(),
+            reply.to_string(),
+            &Some(ToolChoice::Required),
+        );
+        let names: Vec<_> = (tool_reply.calls.iter().flatten())
+            .map(|tc| tc.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["Bash"]);
+        assert_eq!(tool_reply.content, None);
+        let auto_parser = engine.request_tool_parser(&request(ToolChoice::Auto, None));
+        assert!(
+            auto_parser.is_none(),
+            "otherwise the engine's own: none here"
+        );
     }
 
     /// A forced tool `tools` doesn't declare (a misspelled or empty name), and `"required"` with

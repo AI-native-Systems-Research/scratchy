@@ -255,6 +255,13 @@ jobs:
         run: cargo test -p scratchy-serving-engine -p scratchy-core-model
           --features scratchy-serving-engine/guided-decoding
 
+      # The serving layer's unit tests with `guided-decoding`, as every `scr serve` build has it:
+      # its tests of a grammar the server builds, such as `tool_choice: "required"`'s (#765), run
+      # it through that guide. The macOS serving-layer step builds without the feature, so it
+      # compiles those tests out. No backend feature, as above.
+      - name: Serving-layer unit tests (guided-decoding)
+        run: cargo test -p scratchy-serving-api --features serve,guided-decoding --lib
+
   # ---------------------------------------------------------------------------
   # Whether this run needs the macOS jobs. A PR whose every changed file is in
   # a crate no macOS job compiles (the Spyre target and its triton re-host

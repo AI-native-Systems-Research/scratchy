@@ -421,6 +421,79 @@ fn json_value_to_tool_call(val: &serde_json::Value) -> Option<protocol::ToolCall
 }
 
 // ---------------------------------------------------------------------------
+// tool_choice "required"
+// ---------------------------------------------------------------------------
+
+/// ⭐ THE GRAMMAR `tool_choice: "required"` CONSTRAINS A REPLY TO (#765), as vLLM's
+/// `_get_json_schema_from_tool` does: a JSON array of at least one call, each
+/// `{"name": …, "parameters": {…}}` naming one of `tools` with that tool's own parameters
+/// schema. So the reply is a tool call by construction, whatever the model would have said, and
+/// [`RequiredToolCallsParser`] reads it.
+pub(crate) fn required_tool_calls_schema(
+    tools: &[protocol::ChatCompletionToolsParam],
+) -> serde_json::Value {
+    let calls: Vec<serde_json::Value> = (tools.iter())
+        .map(|tool| {
+            let parameters = (tool.function.parameters.as_ref())
+                .and_then(|p| serde_json::to_value(p).ok())
+                .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} }));
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "enum": [tool.function.name] },
+                    "parameters": parameters,
+                },
+                "required": ["name", "parameters"],
+            })
+        })
+        .collect();
+    serde_json::json!({ "type": "array", "minItems": 1, "items": { "anyOf": calls } })
+}
+
+/// The parser for a `tool_choice: "required"` reply, which its grammar makes a JSON array of
+/// calls ([`required_tool_calls_schema`]), whatever tool-call format the model would use unasked.
+/// Each call reads as a Llama 3 JSON call does (`{"name", "parameters"}`); the array's own
+/// brackets and commas are never text.
+pub(crate) struct RequiredToolCallsParser;
+
+impl ToolCallParser for RequiredToolCallsParser {
+    fn extract_tool_calls(&self, model_output: &str) -> ExtractedToolCallInfo {
+        let mut extracted = llama_json_extract(model_output);
+        if extracted.tools_called {
+            extracted.content = None;
+        }
+        extracted
+    }
+
+    fn create_streaming_state(&self) -> Box<dyn StreamingToolParserState + Send> {
+        Box::new(RequiredToolCallsStreamingState(
+            LlamaJsonStreamingState::new(),
+        ))
+    }
+}
+
+/// [`RequiredToolCallsParser`]'s stream: the Llama JSON one's calls, with no text, since all
+/// there is outside the calls is the array's punctuation.
+struct RequiredToolCallsStreamingState(LlamaJsonStreamingState);
+
+impl StreamingToolParserState for RequiredToolCallsStreamingState {
+    fn process_delta(
+        &mut self,
+        previous_text: &str,
+        current_text: &str,
+        delta_text: &str,
+    ) -> ToolParserDelta {
+        match self
+            .0
+            .process_delta(previous_text, current_text, delta_text)
+        {
+            ToolParserDelta::Content(_) => ToolParserDelta::None,
+            calls => calls,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LLaMA JSON streaming state machine
 // ---------------------------------------------------------------------------
 
@@ -2752,6 +2825,190 @@ pub fn detect_tool_parser(arch: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- tool_choice "required" (#765) --
+
+    fn tool(
+        name: &str,
+        parameters: Option<serde_json::Value>,
+    ) -> protocol::ChatCompletionToolsParam {
+        protocol::ChatCompletionToolsParam {
+            tool_type: "function".to_string(),
+            function: protocol::FunctionDefinition {
+                name: name.to_string(),
+                description: None,
+                parameters: parameters.map(protocol::OrderedJson::from),
+            },
+        }
+    }
+
+    /// A reply as `"required"`'s grammar shapes it: two calls in one array.
+    const REQUIRED_REPLY: &str = r#"[{"name": "Bash", "parameters": {"command": "ls -l"}}, {"name": "Read", "parameters": {"path": "a.rs"}}]"#;
+
+    /// `"required"`'s grammar is an array of at least one call, each naming a declared tool and
+    /// carrying that tool's parameters schema (an empty object's for a tool that declares none).
+    #[test]
+    fn the_required_schema_is_an_array_of_calls_to_the_declared_tools() {
+        let command = serde_json::json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"],
+        });
+        let schema =
+            required_tool_calls_schema(&[tool("Bash", Some(command.clone())), tool("Read", None)]);
+        assert_eq!(schema["type"], "array");
+        assert_eq!(schema["minItems"], 1);
+        let calls = schema["items"]["anyOf"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0]["properties"]["name"]["enum"],
+            serde_json::json!(["Bash"])
+        );
+        assert_eq!(calls[0]["properties"]["parameters"], command);
+        assert_eq!(
+            calls[0]["required"],
+            serde_json::json!(["name", "parameters"])
+        );
+        assert_eq!(
+            calls[1]["properties"]["name"]["enum"],
+            serde_json::json!(["Read"])
+        );
+        assert_eq!(calls[1]["properties"]["parameters"]["type"], "object");
+    }
+
+    /// A whole `"required"` reply is its calls, in order, with no text: the array's brackets and
+    /// commas are not content.
+    #[test]
+    fn a_required_reply_reads_as_its_calls() {
+        let extracted = RequiredToolCallsParser.extract_tool_calls(REQUIRED_REPLY);
+        assert!(extracted.tools_called);
+        assert_eq!(extracted.content, None);
+        let calls: Vec<(&str, serde_json::Value)> = (extracted.tool_calls.iter())
+            .map(|tc| {
+                let args = serde_json::from_str(&tc.function.arguments).unwrap();
+                (tc.function.name.as_str(), args)
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                ("Bash", serde_json::json!({"command": "ls -l"})),
+                ("Read", serde_json::json!({"path": "a.rs"}))
+            ]
+        );
+    }
+
+    /// A streamed `"required"` reply streams its calls, each named first, and no text, whatever
+    /// pieces the reply arrives in: here, a character at a time.
+    #[test]
+    fn a_streamed_required_reply_streams_its_calls_and_no_text() {
+        let mut state = RequiredToolCallsParser.create_streaming_state();
+        let mut text = String::new();
+        let mut names: Vec<(u32, String)> = Vec::new();
+        let mut arguments: Vec<String> = Vec::new();
+        for c in REQUIRED_REPLY.chars() {
+            let previous = text.clone();
+            text.push(c);
+            match state.process_delta(&previous, &text, &c.to_string()) {
+                ToolParserDelta::Content(content) => panic!("text {content:?} after {previous:?}"),
+                ToolParserDelta::ToolCalls(calls) => {
+                    for call in calls {
+                        let index = call.index as usize;
+                        if let Some(name) = call.function_name {
+                            assert_eq!(arguments.len(), index, "{name} named first");
+                            names.push((call.index, name));
+                            arguments.push(String::new());
+                        }
+                        if let Some(args) = call.function_arguments {
+                            arguments[index].push_str(&args);
+                        }
+                    }
+                }
+                ToolParserDelta::None => {}
+            }
+        }
+        assert_eq!(names, [(0, "Bash".to_string()), (1, "Read".to_string())]);
+        let arguments: Vec<serde_json::Value> = (arguments.iter())
+            .map(|a| serde_json::from_str(a).unwrap())
+            .collect();
+        assert_eq!(
+            arguments,
+            [
+                serde_json::json!({"command": "ls -l"}),
+                serde_json::json!({"path": "a.rs"})
+            ]
+        );
+    }
+
+    /// ⭐ `"required"`'s grammar, compiled by llguidance as the sampler compiles it, takes a call to
+    /// a declared tool and nothing else: a call to another tool, no call at all, and plain text
+    /// are each refused partway, as the sampler's mask would refuse them. The tokenizer has a token
+    /// per printable ASCII character, so a reply is fed exactly as written.
+    #[cfg(feature = "guided-decoding")]
+    #[test]
+    fn the_required_grammar_takes_a_call_to_a_declared_tool_and_nothing_else() {
+        use scratchy_serving_engine::grammar::{GrammarGuide, build_parser_factory};
+        // Byte-level BPE writes a space as `Ġ`; every other printable character is itself.
+        let piece = |c: char| if c == ' ' { 'Ġ' } else { c };
+        let vocab: serde_json::Map<String, serde_json::Value> = (' '..='~')
+            .zip(1u32..)
+            .map(|(c, id)| (piece(c).to_string(), serde_json::json!(id)))
+            .collect();
+        let id_of = |c: char| vocab[&piece(c).to_string()].as_u64().unwrap() as u32;
+        let byte_level = serde_json::json!({
+            "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true
+        });
+        let tokenizer = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [{
+                "id": 0, "content": "</s>", "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": true
+            }],
+            "normalizer": null,
+            "pre_tokenizer": byte_level,
+            "post_processor": null,
+            "decoder": byte_level,
+            "model": {
+                "type": "BPE", "dropout": null, "unk_token": null,
+                "continuing_subword_prefix": "", "end_of_word_suffix": "", "fuse_unk": false,
+                "vocab": vocab, "merges": []
+            }
+        });
+        let factory = build_parser_factory(tokenizer.to_string().as_bytes()).unwrap();
+        let command = serde_json::json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"],
+        });
+        let schema = required_tool_calls_schema(&[tool("Bash", Some(command))]);
+        // Where the grammar refuses `reply`: the first character it won't take, or the reply's end
+        // when it won't let the reply end there. `None`: taken whole.
+        let refused_at = |reply: &str| {
+            let mut guide = GrammarGuide::from_json_schema(&schema, &factory).unwrap();
+            for (at, c) in reply.char_indices() {
+                let allowed = guide.allowed_tokens().unwrap_or_default();
+                if !allowed.contains(&id_of(c)) {
+                    return Some(at);
+                }
+                assert!(guide.advance(id_of(c)));
+            }
+            // Then it may end: the grammar is complete, and the end of the sequence is all it
+            // leaves to sample.
+            (!guide.is_finished()).then_some(reply.len())
+        };
+        let call = r#"[{"name":"Bash","parameters":{"command":"ls -l"}}]"#;
+        assert_eq!(refused_at(call), None, "{call}");
+        for refused in [
+            r#"[{"name":"Read","parameters":{"command":"ls"}}]"#,
+            r#"[{"name":"Bash","parameters":{}}]"#,
+            "[]",
+            "Sure, let me look.",
+        ] {
+            assert!(refused_at(refused).is_some(), "{refused}");
+        }
+    }
 
     // -- Parser auto-detection from model id --
 
