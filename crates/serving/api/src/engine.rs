@@ -202,8 +202,8 @@ struct RequestState {
     /// [`SharedDetok`] for why it is shared rather than moved in and out.
     detokenizer: Option<SharedDetok>,
 
-    /// Position in response choices (for n>1 / multi-prompt support).
-    choice_index: u32,
+    /// The response choice it fills, and the prompt it answers (for n>1 / multi-prompt support).
+    choice: Choice,
 
     /// When this request was submitted (for TTFT calculation).
     submit_time: Instant,
@@ -264,12 +264,27 @@ impl RequestState {
     /// The token counts every delta sent for this request carries, as of now.
     fn stream_usage(&self) -> StreamUsage {
         StreamUsage {
+            prompt: self.choice.prompt,
             prompt_tokens: self.num_prompt_tokens,
             cached_tokens: self.num_cached_tokens,
             completion_tokens: self.generated_token_ids.len() as u32,
         }
     }
 }
+
+/// Where one engine request's output goes in its response: the choice it fills, and the prompt it
+/// answers. A completion request runs `n` choices of each of its prompts, a chat request `n` of
+/// its one.
+#[derive(Debug, Clone, Copy, Default)]
+struct Choice {
+    index: u32,
+    prompt: PromptIndex,
+}
+
+/// Which of a request's prompts a choice answers: its position in a completion request's prompt
+/// list (0 for chat, which has one). Its own type, so it cannot be swapped for a choice index.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct PromptIndex(pub u32);
 
 /// Token counts for one request, carried on every [`StreamDelta`].
 ///
@@ -280,6 +295,9 @@ impl RequestState {
 /// value it sees rather than assume which delta arrives first.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StreamUsage {
+    /// Which of the request's prompts this choice answers. The choices of one prompt share its
+    /// tokens and its cache hit, so a response counts each once per prompt, not once per choice.
+    pub prompt: PromptIndex,
     /// Total prompt tokens for the request.
     pub prompt_tokens: u32,
     /// Prompt tokens served from the prefix cache. Block-aligned, so it
@@ -799,7 +817,10 @@ impl AsyncEngine {
                 num_prompt_tokens,
                 None,
                 detokenizer,
-                i as u32,
+                Choice {
+                    index: i as u32,
+                    prompt: PromptIndex(0),
+                },
                 None, // no streaming tool parser for non-streaming requests
                 None,
                 None, // no streaming reasoning parser for non-streaming requests
@@ -813,14 +834,19 @@ impl AsyncEngine {
         // Poll all children and build choices.
         let mut choices = Vec::with_capacity(n);
         let mut total_completion_tokens = 0u32;
-        let mut total_cached_tokens = 0u32;
+        // The prompt's cache hit, counted once as the prompt is: every choice runs the same
+        // prompt, and each records its own hit on it (#580). The least of them: what the cache
+        // held when the request came in, not a sibling's fresh prefill (`ChoiceUsage::totals`).
+        let mut cached_tokens: Option<u32> = None;
         let forced_tool = ForcedTool::of(&request.tool_choice);
 
         for (i, child_id) in child_ids.iter().enumerate() {
             let state = self.poll_until_done(child_id).await?;
             let completion_tokens = state.generated_token_ids.len() as u32;
             total_completion_tokens += completion_tokens;
-            total_cached_tokens += state.num_cached_tokens;
+            cached_tokens = Some(
+                cached_tokens.map_or(state.num_cached_tokens, |c| c.min(state.num_cached_tokens)),
+            );
 
             let finish_reason_str = state
                 .finish_reason
@@ -975,13 +1001,11 @@ impl AsyncEngine {
             prompt_tokens: num_prompt_tokens,
             completion_tokens: Some(total_completion_tokens),
             total_tokens: num_prompt_tokens + total_completion_tokens,
-            prompt_tokens_details: if total_cached_tokens > 0 {
-                Some(protocol::PromptTokenUsageInfo {
-                    cached_tokens: Some(total_cached_tokens),
-                })
-            } else {
-                None
-            },
+            prompt_tokens_details: (cached_tokens.filter(|&c| c > 0)).map(|c| {
+                protocol::PromptTokenUsageInfo {
+                    cached_tokens: Some(c),
+                }
+            }),
         };
 
         Ok(protocol::ChatCompletionResponse::new(model, choices, usage))
@@ -1152,7 +1176,10 @@ impl AsyncEngine {
                 num_prompt_tokens,
                 Some(tx.clone()),
                 detokenizer,
-                i as u32,
+                Choice {
+                    index: i as u32,
+                    prompt: PromptIndex(0),
+                },
                 tool_state,
                 forced_tool.clone(),
                 reasoning_state,
@@ -1267,7 +1294,10 @@ impl AsyncEngine {
                     num_prompt_tokens,
                     None,
                     detokenizer,
-                    choice_index,
+                    Choice {
+                        index: choice_index,
+                        prompt: PromptIndex(p_idx as u32),
+                    },
                     None, // no tool parsing for completions
                     None,
                     None, // no reasoning parsing for completions
@@ -1457,7 +1487,10 @@ impl AsyncEngine {
                     num_prompt_tokens,
                     Some(tx.clone()),
                     detokenizer,
-                    choice_index,
+                    Choice {
+                        index: choice_index,
+                        prompt: PromptIndex(p_idx as u32),
+                    },
                     None, // no tool parsing for completions
                     None,
                     None, // no reasoning parsing for completions
@@ -1546,7 +1579,7 @@ impl AsyncEngine {
                     num_prompt_tokens,
                     None,
                     None,
-                    0,
+                    Choice::default(),
                     None,
                     None,
                     None,
@@ -2360,7 +2393,7 @@ impl AsyncEngine {
         num_prompt_tokens: u32,
         stream_tx: Option<mpsc::UnboundedSender<StreamDelta>>,
         detokenizer: Option<IncrementalDetokenizer>,
-        choice_index: u32,
+        choice: Choice,
         tool_parser_state: Option<Box<dyn StreamingToolParserState + Send>>,
         forced_tool: Option<ForcedTool>,
         reasoning_parser_state: Option<Box<dyn StreamingReasoningParserState + Send>>,
@@ -2411,7 +2444,7 @@ impl AsyncEngine {
                     // the state's business, and this is the only place a request's is installed — so
                     // exactly one place could ever get it wrong.
                     detokenizer: detokenizer.map(|d| Arc::new(std::sync::Mutex::new(d))),
-                    choice_index,
+                    choice,
                     submit_time: Instant::now(),
                     first_token_time: None,
                     last_token_time: None,
@@ -2641,7 +2674,7 @@ impl AsyncEngine {
             req_state.error = Some(err.to_string());
             if let Some(tx) = req_state.stream_tx.take() {
                 let _ = tx.send(StreamDelta {
-                    index: req_state.choice_index,
+                    index: req_state.choice.index,
                     new_token_ids: Vec::new(),
                     text: None,
                     finish_reason: Some(FinishReason::Abort),
@@ -2832,7 +2865,7 @@ impl AsyncEngine {
                             ToolParserDelta::Content(content) => {
                                 let attach_finish = is_finished && !req_state.tool_calls_emitted;
                                 let delta = StreamDelta {
-                                    index: req_state.choice_index,
+                                    index: req_state.choice.index,
                                     new_token_ids: output.new_token_ids.clone(),
                                     text: Some(content),
                                     finish_reason: if attach_finish {
@@ -2857,7 +2890,7 @@ impl AsyncEngine {
                                 // Emit reasoning delta separately if present.
                                 if let Some(reasoning) = reasoning_delta {
                                     let delta = StreamDelta {
-                                        index: req_state.choice_index,
+                                        index: req_state.choice.index,
                                         new_token_ids: vec![],
                                         text: None,
                                         finish_reason: None,
@@ -2875,7 +2908,7 @@ impl AsyncEngine {
                                 } else {
                                     req_state.tool_calls_emitted = true;
                                     let delta = StreamDelta {
-                                        index: req_state.choice_index,
+                                        index: req_state.choice.index,
                                         new_token_ids: output.new_token_ids.clone(),
                                         text: None,
                                         finish_reason: None,
@@ -2892,7 +2925,7 @@ impl AsyncEngine {
                                 // Buffering in tool parser — but still emit reasoning if present.
                                 if let Some(reasoning) = reasoning_delta {
                                     let delta = StreamDelta {
-                                        index: req_state.choice_index,
+                                        index: req_state.choice.index,
                                         new_token_ids: output.new_token_ids.clone(),
                                         text: None,
                                         finish_reason: None,
@@ -2926,7 +2959,7 @@ impl AsyncEngine {
                             // makes a tool call's `Stop` `tool_calls`, and a `Length` stays
                             // `length` (the call was cut off).
                             let finish_delta = StreamDelta {
-                                index: req_state.choice_index,
+                                index: req_state.choice.index,
                                 new_token_ids: vec![],
                                 text: None,
                                 finish_reason: delta_finish_reason,
@@ -2942,7 +2975,7 @@ impl AsyncEngine {
                         // No content text but finished — send finish delta, with the step's own
                         // reason (see the finish above).
                         let delta = StreamDelta {
-                            index: req_state.choice_index,
+                            index: req_state.choice.index,
                             new_token_ids: output.new_token_ids.clone(),
                             text: None,
                             finish_reason: delta_finish_reason,
@@ -2956,7 +2989,7 @@ impl AsyncEngine {
                     } else if reasoning_delta.is_some() {
                         // Only reasoning, no content for tool parser yet.
                         let delta = StreamDelta {
-                            index: req_state.choice_index,
+                            index: req_state.choice.index,
                             new_token_ids: output.new_token_ids.clone(),
                             text: None,
                             finish_reason: None,
@@ -2977,7 +3010,7 @@ impl AsyncEngine {
                     };
                     if text_out.is_some() || reasoning_delta.is_some() || is_finished {
                         let delta = StreamDelta {
-                            index: req_state.choice_index,
+                            index: req_state.choice.index,
                             new_token_ids: output.new_token_ids,
                             text: text_out,
                             finish_reason: delta_finish_reason,
@@ -4163,7 +4196,7 @@ mod tests {
             stop_reason: None,
             stream_tx,
             detokenizer: None,
-            choice_index: 0,
+            choice: Choice::default(),
             submit_time: Instant::now(),
             first_token_time: None,
             last_token_time: None,
@@ -5006,6 +5039,77 @@ mod tests {
         assert_eq!(response.usage.prompt_tokens, 5);
     }
 
+    /// A streamed completion stamps each choice's delta with the prompt it answers, the one
+    /// fact the usage chunk counts each prompt once by (#557): choice `i` of `n` per prompt
+    /// answers prompt `i / n`, with that prompt's length.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_completion_stream_stamps_each_choice_with_its_prompt() {
+        let engine = Arc::new(make_test_engine());
+        engine.spawn_step_loop();
+        let mut request =
+            make_completion_request(Some(protocol::CompletionPrompt::MultipleTokenIds(vec![
+                vec![1, 2],
+                vec![3, 4, 5],
+            ])));
+        request.n = 2;
+        request.stream = true;
+        let (_, _, mut rx) = engine.completion_stream(request).await.unwrap();
+
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(delta) = rx.recv().await {
+            let prompt = delta.index / 2;
+            assert_eq!(
+                delta.usage.prompt,
+                PromptIndex(prompt),
+                "choice {}",
+                delta.index
+            );
+            assert_eq!(delta.usage.prompt_tokens, [2, 3][prompt as usize]);
+            seen.insert(delta.index);
+        }
+        assert_eq!(seen, (0..4).collect(), "every choice streamed");
+    }
+
+    /// The non-streaming chat reply counts the prompt's cache hit once, as it counts the prompt
+    /// (#580): with the prompt cached, two choices that each hit it report the one hit, and never
+    /// more cached tokens than prompt tokens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chat_completion_n2_counts_the_prompts_cache_hit_once() {
+        let mut config = make_engine_config();
+        config.enable_prefix_caching = true;
+        let client = Box::new(InprocClient::new(config, Box::new(NoopExecutor::new(1024))));
+        let tok = Arc::new(make_test_tokenizer());
+        let engine = Arc::new(AsyncEngine::with_tokenizer(
+            client,
+            "test-model".to_string(),
+            4096,
+            tok,
+        ));
+        engine.spawn_step_loop();
+        // Several 16-token blocks long, so a cache hit spans whole blocks.
+        let request = |n| {
+            let mut request = make_chat_request();
+            request.messages[0].content = Some(serde_json::Value::String(
+                "a prompt long enough to fill several cache blocks of sixteen tokens".repeat(2),
+            ));
+            request.n = n;
+            request.max_tokens = Some(2);
+            request
+        };
+        let cached = |usage: &protocol::UsageInfo| {
+            (usage.prompt_tokens_details.as_ref()).and_then(|d| d.cached_tokens)
+        };
+
+        engine.chat_completion(request(1)).await.unwrap();
+        let warm = engine.chat_completion(request(1)).await.unwrap().usage;
+        let hit = cached(&warm).expect("the prompt is cached");
+        assert!(hit > 0 && hit <= warm.prompt_tokens);
+
+        let two = engine.chat_completion(request(2)).await.unwrap().usage;
+        assert_eq!(two.prompt_tokens, warm.prompt_tokens);
+        assert_eq!(cached(&two), Some(hit), "the one hit, not one per choice");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_chat_completion_stream_n2() {
         let engine = Arc::new(make_test_engine());
@@ -5083,7 +5187,7 @@ mod tests {
         {
             let mut state = make_test_request_state(Some(tx));
             state.num_prompt_tokens = 3;
-            state.choice_index = 7;
+            state.choice.index = 7;
             requests.insert("req-idx".to_string(), state);
         }
 

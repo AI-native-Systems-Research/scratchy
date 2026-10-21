@@ -820,29 +820,63 @@ impl ChoiceUsage {
             .insert(delta.index, delta.usage);
     }
 
-    /// Output tokens across every choice.
-    fn completion_tokens(&self) -> u32 {
+    /// Usage across the stream, matching the non-streaming responses: each prompt's tokens and
+    /// cache hit count once, however many choices run it, and output adds up across choices.
+    /// Its cached tokens are part of its prompt tokens, so they never exceed them (#580). The
+    /// hit is the least any choice of the prompt had: what the cache held when the request came
+    /// in. A choice admitted after a sibling computed the prompt hits the sibling's fresh blocks,
+    /// and the largest hit would report that prefill as cached.
+    fn totals(&self) -> UsageTotals {
         let choices = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        choices.values().map(|u| u.completion_tokens).sum()
-    }
-
-    /// Usage for a chat stream, matching the non-streaming response: every choice shares one
-    /// prompt, so `prompt_tokens` is counted once, while output and cached tokens add up across
-    /// choices.
-    fn chat_usage(&self) -> protocol::UsageInfo {
-        let choices = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let prompt_tokens = choices.values().map(|u| u.prompt_tokens).max().unwrap_or(0);
-        let completion_tokens = choices.values().map(|u| u.completion_tokens).sum();
-        let cached_tokens: u32 = choices.values().map(|u| u.cached_tokens).sum();
-        protocol::UsageInfo {
-            prompt_tokens,
-            completion_tokens: Some(completion_tokens),
-            total_tokens: prompt_tokens + completion_tokens,
-            prompt_tokens_details: (cached_tokens > 0).then_some(protocol::PromptTokenUsageInfo {
-                cached_tokens: Some(cached_tokens),
-            }),
+        let mut prompts: std::collections::HashMap<crate::engine::PromptIndex, (u32, u32)> =
+            std::collections::HashMap::new();
+        for u in choices.values() {
+            let (tokens, cached) = prompts
+                .entry(u.prompt)
+                .or_insert((u.prompt_tokens, u.cached_tokens));
+            *tokens = (*tokens).max(u.prompt_tokens);
+            *cached = (*cached).min(u.cached_tokens);
+        }
+        UsageTotals {
+            prompt_tokens: prompts.values().map(|&(tokens, _)| tokens).sum(),
+            cached_tokens: prompts.values().map(|&(_, cached)| cached).sum(),
+            completion_tokens: choices.values().map(|u| u.completion_tokens).sum(),
         }
     }
+
+    /// Usage for a chat stream, with the prompt's cache hit in `prompt_tokens_details`.
+    fn chat_usage(&self) -> protocol::UsageInfo {
+        let t = self.totals();
+        protocol::UsageInfo {
+            prompt_tokens: t.prompt_tokens,
+            completion_tokens: Some(t.completion_tokens),
+            total_tokens: t.prompt_tokens + t.completion_tokens,
+            prompt_tokens_details: (t.cached_tokens > 0).then_some(
+                protocol::PromptTokenUsageInfo {
+                    cached_tokens: Some(t.cached_tokens),
+                },
+            ),
+        }
+    }
+
+    /// Usage for a completions stream: no `prompt_tokens_details`, as in the non-streaming
+    /// response.
+    fn completion_usage(&self) -> protocol::UsageInfo {
+        let t = self.totals();
+        protocol::UsageInfo {
+            prompt_tokens: t.prompt_tokens,
+            completion_tokens: Some(t.completion_tokens),
+            total_tokens: t.prompt_tokens + t.completion_tokens,
+            prompt_tokens_details: None,
+        }
+    }
+}
+
+/// A stream's token counts, each prompt counted once ([`ChoiceUsage::totals`]).
+struct UsageTotals {
+    prompt_tokens: u32,
+    cached_tokens: u32,
+    completion_tokens: u32,
 }
 
 /// Build an SSE stream for chat completions.
@@ -998,15 +1032,8 @@ fn stream_completion_response(
     let usage_chunk = include_usage.then(|| {
         let (id, model) = (format!("cmpl-{}", request_id), model.clone());
         move || {
-            let completion_tokens = usage.completion_tokens();
             let mut chunk = protocol::CompletionStreamResponse::new(id, model, vec![]);
-            chunk.usage = Some(protocol::UsageInfo {
-                // Always 0, unlike chat's chunk: #557.
-                prompt_tokens: 0,
-                completion_tokens: Some(completion_tokens),
-                total_tokens: completion_tokens,
-                prompt_tokens_details: None,
-            });
+            chunk.usage = Some(usage.completion_usage());
             chunk
         }
     });
@@ -2101,9 +2128,10 @@ mod tests {
                 "model": "m",
                 "choices": [],
                 "usage": {
-                    "prompt_tokens": 0,
+                    // One prompt, two choices of it: counted once.
+                    "prompt_tokens": 5,
                     "completion_tokens": generated,
-                    "total_tokens": generated,
+                    "total_tokens": 5 + generated,
                 },
             })
         );
@@ -2219,27 +2247,69 @@ mod tests {
         }
     }
 
-    /// Cached tokens add up across choices, as in the non-streaming response, and are reported
-    /// in `prompt_tokens_details`. Only one of the two choices hits the cache here.
+    /// The prompt's cache hit is reported in `prompt_tokens_details`, as in the non-streaming
+    /// response: the least any choice had (2 of 2 and 6), what the cache held on arrival. A
+    /// larger hit is a choice reusing a sibling's prefill of the same prompt.
     #[tokio::test]
     async fn test_chat_stream_usage_reports_cached_tokens() {
         let (mut rx, _) = buffered_tool_call_rx(2);
         let (tx, cached_rx) = tokio::sync::mpsc::unbounded_channel();
         while let Ok(mut delta) = rx.try_recv() {
-            if delta.index == 1 {
-                delta.usage.cached_tokens = 3;
-            }
+            delta.usage.cached_tokens = [2, 6][delta.index as usize];
             tx.send(delta).unwrap();
         }
         drop(tx);
         let response = stream_chat_response("r".into(), "m".into(), cached_rx, true);
         let payloads = sse_payloads(response.into_response()).await;
         let usage = &payloads.last().expect("usage chunk")["usage"];
-        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(
+            usage["prompt_tokens_details"]["cached_tokens"], 2,
+            "the least hit: what the cache held when the request came in"
+        );
         assert_eq!(
             usage["prompt_tokens"], 5,
             "cached tokens are part of the prompt"
         );
+    }
+
+    /// Every choice runs the one prompt and records its own hit on it, so the hit counts once, as
+    /// the prompt does: cached tokens never exceed prompt tokens (#580).
+    #[tokio::test]
+    async fn test_chat_stream_usage_counts_the_prompts_cache_hit_once() {
+        let (mut rx, _) = buffered_tool_call_rx(2);
+        let (tx, cached_rx) = tokio::sync::mpsc::unbounded_channel();
+        while let Ok(mut delta) = rx.try_recv() {
+            delta.usage.cached_tokens = 4;
+            tx.send(delta).unwrap();
+        }
+        drop(tx);
+        let response = stream_chat_response("r".into(), "m".into(), cached_rx, true);
+        let payloads = sse_payloads(response.into_response()).await;
+        let usage = &payloads.last().expect("usage chunk")["usage"];
+        assert_eq!(usage["prompt_tokens"], 5);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 4);
+    }
+
+    /// A completions stream counts each of its prompts once, however many choices run it, as the
+    /// non-streaming response does (#557: it reported 0): two prompts of 5 and 9 tokens, two
+    /// choices each.
+    #[tokio::test]
+    async fn test_completion_stream_usage_counts_each_prompt_once() {
+        let (mut rx, generated) = buffered_tool_call_rx(4);
+        let (tx, prompts_rx) = tokio::sync::mpsc::unbounded_channel();
+        while let Ok(mut delta) = rx.try_recv() {
+            delta.usage.prompt = crate::engine::PromptIndex(delta.index / 2);
+            delta.usage.prompt_tokens = [5, 9][delta.usage.prompt.0 as usize];
+            tx.send(delta).unwrap();
+        }
+        drop(tx);
+        let response = stream_completion_response("r".into(), "m".into(), prompts_rx, true);
+        let payloads = sse_payloads(response.into_response()).await;
+        let usage = &payloads.last().expect("usage chunk")["usage"];
+        assert_eq!(usage["prompt_tokens"], 14);
+        assert_eq!(usage["completion_tokens"], generated);
+        assert_eq!(usage["total_tokens"], 14 + generated);
+        assert!(usage.get("prompt_tokens_details").is_none(), "{usage}");
     }
 
     /// No cache hit, no `prompt_tokens_details` — the non-streaming response leaves it out too.

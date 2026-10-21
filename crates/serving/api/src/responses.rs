@@ -1423,6 +1423,7 @@ mod tests {
                 tool_call_deltas: None,
                 reasoning: None,
                 usage: crate::engine::StreamUsage {
+                    prompt: crate::engine::PromptIndex(0),
                     prompt_tokens: 42,
                     cached_tokens: 0,
                     completion_tokens: generated,
