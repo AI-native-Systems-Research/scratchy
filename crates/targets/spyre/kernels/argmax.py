@@ -14,8 +14,8 @@ stated in the kernel, over generic ops only.
 THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kernel):
 
 * PARAMETERS, IN ORDER: `logits`, `bramp`, `lramp`, `binc`, `linc`, `ones`,
-  `sixtyfour`, then `idx` — the node's operand order then the output. The
-  registry does not permute. The six tables after the logits row are STAGED
+  `sixtyfour`, `padoff`, then `idx` — the node's operand order then the output. The
+  registry does not permute. The seven tables after the logits row are STAGED
   buffers the host owns (the fixture's own host contract): constant across
   decode steps, functions of the vocab alone.
 * CONSTEXPRS: `V` (the model's real vocab), `PAD_V` (V rounded up to a
@@ -23,11 +23,17 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   `BLOCK = 64` — stated by the splice from the node's vocab, never hardcoded
   to a model: a different vocab bakes its own tables.
 * GRID: `[1]` — the sampler serves the solo greedy decode step's single row.
-* THE LOGITS ROW'S PAD LANES are staged at −inf (the widening mint's own law,
-  see `SubOp::ArgMax`): a finite lane always out-maxes them, and an all-−inf
-  row still answers lane 0 — a FINITE floor (fp16 −65504) would out-max an
-  all-−inf row and flip its answer to the sentinel, disagreeing with the host
-  reference's `position(|x| x == m)`.
+* THE PAD LAW RIDES THE STAGED OFFSET TABLE (the seventh, `padoff`): 0.0 on
+  `[0, V)`, −inf on `[V, PAD_V)`. The kernel computes `xm = x + padoff` before
+  the first max and uses `xm` throughout, so the row's own pad bytes are
+  irrelevant — the lm-head's zero-pad columns write 0.0 into them every step,
+  and `0 + −inf = −inf` all the same (a durable −inf tail survives too:
+  `−inf + −inf = −inf`). A real lane is untouched (`x + 0` exact), NaN rides
+  through (`NaN + 0 = NaN`, the all-NaN sentinel law intact), and an all-−inf
+  row still answers lane 0 — every lane ties at −inf and the staged ramps pick
+  the first, agreeing with the host reference's first-max. This is why the
+  offset table and not a V-constexpr mask: the pad law is a HOST-STAGED fact
+  like every other table this kernel reads, never an in-kernel arange.
 
 THE ALGORITHM (equality selection, no inversions): the staged DECREASING ramps
 (bramp block-major, lramp lane-minor) make each `max` land on the FIRST
@@ -52,7 +58,7 @@ import triton.language as tl
 
 @triton.jit
 def argmax_fwd(logits_ptr, bramp_ptr, lramp_ptr, binc_ptr, linc_ptr,  #
-               ones_ptr, sixtyfour_ptr, idx_ptr,  #
+               ones_ptr, sixtyfour_ptr, padoff_ptr, idx_ptr,  #
                V: tl.constexpr, PAD_V: tl.constexpr,  #
                NB: tl.constexpr, BLOCK: tl.constexpr):
     # THE WHOLE ROW IS ONE TILE: one load, [1, PAD_V], the rmsnorm fixture's own
@@ -63,10 +69,22 @@ def argmax_fwd(logits_ptr, bramp_ptr, lramp_ptr, binc_ptr, linc_ptr,  #
     l_desc = tl.make_tensor_descriptor(logits_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
                                        block_shape=[1, PAD_V])
     x = l_desc.load([0, 0])
+    # THE PAD LAW, BEFORE THE FIRST MAX: xm = x + padoff, and xm throughout.
+    # padoff is 0.0 on the real lanes (x + 0 exact) and -inf on the pads, so a
+    # pad lane can never win a max or an equality the real lanes contest
+    # WHATEVER the row's pad bytes hold (the lm-head's zero-pad columns write
+    # 0.0 there every step; 0 + -inf = -inf, and a durable -inf tail survives
+    # as -inf + -inf = -inf). NaN rides through (NaN + 0 = NaN), so the
+    # all-NaN sentinel law below is intact. A two-tensor add of two loaded
+    # tiles -- the same Elementwise(Add) every spliced add kernel is.
+    p_desc = tl.make_tensor_descriptor(padoff_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
+                                       block_shape=[1, PAD_V])
+    padoff = p_desc.load([0, 0])
+    xm = x + padoff
     # The global max. `tl.max` of an f16 tile reduces in f32 (upstream's own
     # promotion) and is narrowed straight back, moe.py's spelling: the max of
     # f16 values is exactly representable in f16, so the round trip is exact.
-    m = tl.max(x, axis=1).to(tl.float16)
+    m = tl.max(xm, axis=1).to(tl.float16)
     mm = tl.expand_dims(m, 1)
 
     # LEVEL 1 -- the FIRST 64-block holding the maximum. bramp is the staged
@@ -77,7 +95,7 @@ def argmax_fwd(logits_ptr, bramp_ptr, lramp_ptr, binc_ptr, linc_ptr,  #
     br_desc = tl.make_tensor_descriptor(bramp_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
                                         block_shape=[1, PAD_V])
     bramp = br_desc.load([0, 0])
-    mask = (x == mm).to(tl.float16)
+    mask = (xm == mm).to(tl.float16)
     w1 = mask * bramp
     jA = tl.max(w1, axis=1).to(tl.float16)
     # The equality inverts the ramp: bramp is CONSTANT per block, so comparing

@@ -2,7 +2,7 @@
 //! every other spliced Triton kernel takes, over the SAME mint the codegen seam
 //! performs — the op_name by the builder's naming law, the program, the
 //! parameter count, the grid, and the buffer pairing (the widened row first,
-//! the six tables in operand order, the idx stick LAST). The golden's own
+//! the seven tables in operand order, the idx stick LAST). The golden's own
 //! discipline: what the card launches is what this test pins.
 
 use ktir_superdsc::ktir_node::Program;
@@ -49,23 +49,23 @@ fn the_minted_argmax_lowers_through_the_splice_like_every_other_kernel() {
     assert!(op.op.is_none(), "a spliced op has no SuperDSC descriptor");
     let k = op.ktir.as_ref().expect("a spliced op carries its program");
     assert_eq!(k.program, Program::ArgMax);
-    // Eight kernel parameters: the row, the six tables, the idx stick out — the
+    // Nine kernel parameters: the row, the seven tables, the idx stick out — the
     // constexprs (V, PAD_V, NB, BLOCK) fold into the program, not the signature.
     assert_eq!(
         k.func.arguments.len(),
-        8,
-        "the compiled program takes the eight pointer parameters"
+        9,
+        "the compiled program takes the nine pointer parameters"
     );
     assert_eq!(k.func.grid, (1, 1, 1), "one work item: the whole row is one tile");
 
     // The buffer pairing: the tape's real tensor indices, the operand prefix,
-    // the output LAST — the widened row (renumbered to 8), the six minted table
-    // sources [2, 8), the idx stick 9.
+    // the output LAST — the widened row (renumbered to 9), the seven minted table
+    // sources [2, 9), the idx stick 10.
     let bound: Vec<u32> = k.bindings.iter().map(|b| b.get()).collect();
     assert_eq!(
         bound,
-        vec![8, 2, 3, 4, 5, 6, 7, 9],
-        "the row first, the six tables in operand order, the stick LAST"
+        vec![9, 2, 3, 4, 5, 6, 7, 8, 10],
+        "the row first, the seven tables in operand order, the stick LAST"
     );
     assert!(k.mask.is_none(), "the argmax reads no runtime length mask");
 }

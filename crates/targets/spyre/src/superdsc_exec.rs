@@ -1811,8 +1811,8 @@ impl Executor {
     /// bytes are the device's own (`Df::Fp32` = IEEE_FP32 —
     /// [`Self::bind_const_fp32`]), and everything else rides the weight
     /// channel's IEEE→SEN convert ([`Self::bind_weight`]), bit-exact for every
-    /// value a staged table states. An entry whose tid is a graph OUTPUT (the
-    /// −inf pad tail class) simply binds that output's initial bytes into its
+    /// value a staged table states. An entry whose tid is a graph OUTPUT
+    /// simply binds that output's initial bytes into its
     /// own placement — the ops that overwrite it per step do so over these
     /// bytes, exactly as the card behaves.
     pub fn bind_load_consts(

@@ -864,9 +864,7 @@ pub struct Wiring {
     /// stated as a LIST: a second spliced kernel with staged tables adds one
     /// [`LoadConst`] kind and rides this same field — no new wiring surface, no
     /// per-op field, no consumer that names the op. The ids are the graph's own
-    /// tensor ids (the same ids the placement pass places), and an entry whose
-    /// tid is a graph OUTPUT stages that output's initial bytes (the −inf pad
-    /// tail class).
+    /// tensor ids (the same ids the placement pass places).
     pub load_consts: &'static [(u32, LoadConst)],
 }
 
@@ -878,18 +876,11 @@ pub struct Wiring {
 /// choosing fp32-verbatim vs fp16-convert off the ENTRY'S OWN dtype.
 #[derive(Clone, Copy, Debug)]
 pub enum LoadConst {
-    /// One of the device argmax's six operand tables, by the kernel's operand
+    /// One of the device argmax's seven operand tables, by the kernel's operand
     /// order (1-based over the ArgMax node's inputs; input 0 is the row).
     /// Bytes from [`argmax_staged_tables`] — the one derivation every stager
     /// reads, so a table defect cannot hide on one leg only.
     ArgMaxTable { vocab: u32, operand: u8 },
-    /// The result row's −inf pad tail: zeros on `[0, vocab·2)`, IEEE −inf on
-    /// `[vocab·2, pad_vocab·2)` — the zones the lm-head matmul's zero-pad
-    /// columns never write, so a pad lane cannot win a max the real lanes
-    /// contest. `pad_vocab` derives from `vocab` through
-    /// [`argmax_pad_vocab`](scratchy_subtile::subtile_ir::argmax_pad_vocab),
-    /// the same single derivation every other reader uses.
-    NegInfPadTail { vocab: u32 },
 }
 
 impl LoadConst {
@@ -903,31 +894,22 @@ impl LoadConst {
                 let (bytes, dt, shape) = argmax_staged_tables(vocab)
                     .into_iter()
                     .nth((operand - 1) as usize)
-                    .expect("the mint emits operand 1..=6 — the registry's own row");
+                    .expect("the mint emits operand 1..=7 — the registry's own row");
                 (bytes, dt, shape)
-            }
-            LoadConst::NegInfPadTail { vocab } => {
-                let pad_v = scratchy_subtile::subtile_ir::argmax_pad_vocab(vocab) as usize;
-                let neg_inf = half::f16::NEG_INFINITY.to_le_bytes();
-                let mut row = vec![0u8; pad_v * 2];
-                for c in row[vocab as usize * 2..].as_chunks_mut::<2>().0 {
-                    c.copy_from_slice(&neg_inf);
-                }
-                (row, scratchy_tensors::DType::F16, [1, pad_v])
             }
         }
     }
 }
 
-/// ⭐ THE DEVICE ARGMAX'S SIX STAGED TABLES — the kernel's own host contract
+/// ⭐ THE DEVICE ARGMAX'S SEVEN STAGED TABLES — the kernel's own host contract
 /// (`kernels/argmax.py`'s docstring), stated ONCE for every stager: the
 /// bake-time numeric gate and the worker's load-time staging read this same
 /// fn, so a table defect cannot hide on one leg only (the synth weights' own
 /// law). The tables are functions of the vocab alone, constant across decode
 /// steps, staged ONCE.
 ///
-/// In the kernel's OPERAND ORDER — `bramp, lramp, binc, linc, ones, sixtyfour`
-/// — each entry is `(bytes, dtype, [rows, cols])`:
+/// In the kernel's OPERAND ORDER — `bramp, lramp, binc, linc, ones, sixtyfour,
+/// padoff` — each entry is `(bytes, dtype, [rows, cols])`:
 ///
 /// * `bramp` — strictly DECREASING in the block index (`NB - b`), so the first
 ///   `max` lands on the FIRST block holding the row's maximum; 0 on the pad
@@ -943,9 +925,16 @@ impl LoadConst {
 ///   broadcast the selected numbers out to the output stick, the fp32 scale
 ///   row carries the `·64` of the wide integer combine (past fp16's exact
 ///   range; exact in f32 below 2^24).
+/// * `padoff` — THE PAD LAW: 0.0 on `[0, vocab)`, −inf on the pads. The
+///   kernel adds it to the row before its first max, so a pad lane can never
+///   win whatever the row's pad bytes hold (the lm-head's zero-pad columns
+///   write 0.0 there every step; NaN rides through, keeping the all-NaN
+///   sentinel intact). Carried as a staged table — the same host contract as
+///   every other constant — never a V-constexpr mask.
 ///
 /// Every value is a small exact integer on the fp16 grid (`NB ≤ 1024` at
-/// granite's PAD_V 65536), so the staging round trips bit-exactly.
+/// granite's PAD_V 65536; `padoff` stages only 0.0 and −inf), so the staging
+/// round trips bit-exactly.
 pub fn argmax_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType, [usize; 2])> {
     let pad_v = scratchy_subtile::subtile_ir::argmax_pad_vocab(vocab) as usize;
     let block = scratchy_subtile::subtile_ir::ARGMAX_BLOCK as usize;
@@ -1001,6 +990,18 @@ pub fn argmax_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType
                 .collect(),
             scratchy_tensors::DType::F32,
             [1, block],
+        ),
+        // padoff: THE PAD LAW — 0.0 on the real lanes, −inf on the pads. Not
+        // a `f16_row` operand: the pad value is −inf, not a small integer.
+        (
+            (0..pad_v)
+                .flat_map(|i| {
+                    let x = if i < v { 0.0 } else { f32::NEG_INFINITY };
+                    half::f16::from_f32(x).to_le_bytes()
+                })
+                .collect(),
+            scratchy_tensors::DType::F16,
+            [1, pad_v],
         ),
     ]
 }

@@ -5,7 +5,7 @@
   "inputs_fn": "inputs",
   "reference_fn": "reference",
   "seed": 0,
-  "torch": "2.14.1",
+  "torch": "2.11.0+cpu",
   "generated_by": "test/numeric/gen_numeric_data.py",
   "constexprs": {
     "V": 49155,
@@ -76,6 +76,14 @@
       "dtype": "f32"
     },
     {
+      "arg": "padoff_ptr",
+      "file": "in_padoff_ptr.bin",
+      "shape": [
+        65536
+      ],
+      "dtype": "f16"
+    },
+    {
       "arg": "idx_ptr",
       "file": "in_idx_ptr.bin",
       "shape": [
@@ -93,5 +101,5 @@
     ],
     "dtype": "i32"
   },
-  "reference_note": "THE STIMULUS CARRIES A REAL TIE AT HIGH LANES: 40017 and 48000 both hold the row's maximum, so `ref_out.bin`'s single lane is 40017 -- FIRST-max pinned against a tie, not a vacuous uniqueness. THE NEGATIVE CONTROLS ARE PART OF THE CONTRACT, AND THERE ARE TWO: (1) a last-max implementation answers 48000 against these same bytes and must not match `ref_out.bin`; a run that still matches cannot have taken the tie. (2) an f16-DEGRADED FINAL COMBINE answers 40032 or 40016 -- 40017 = 625*64 + 17 is not fp16-representable (ULP 32 at [32768, 65536)) -- so a kernel whose `b*64 + l` island collapsed out of f32 cannot match either; a run that still matches cannot have degraded. The tie lanes are high ON PURPOSE: the original 100/5000 stimulus sat inside fp16's exact-integer range and could not see (2) at all. The pad lanes past V=49155 hold -inf in the row and NB/BLOCK in the increasing tables (the host obligations the fixture's own docstring states); a kernel that lets a pad lane win the equality answers PAD_V-adjacent garbage, never 40017."
+  "reference_note": "THE STIMULUS CARRIES A REAL TIE AT HIGH LANES: 40017 and 48000 both hold the row's maximum, so `ref_out.bin`'s single lane is 40017 -- FIRST-max pinned against a tie, not a vacuous uniqueness. THE NEGATIVE CONTROLS ARE PART OF THE CONTRACT, AND THERE ARE THREE: (1) a last-max implementation answers 48000 against these same bytes and must not match `ref_out.bin`; a run that still matches cannot have taken the tie. (2) an f16-DEGRADED FINAL COMBINE answers 40032 or 40016 -- 40017 = 625*64 + 17 is not fp16-representable (ULP 32 at [32768, 65536)) -- so a kernel whose `b*64 + l` island collapsed out of f32 cannot match either; a run that still matches cannot have degraded. The tie lanes are high ON PURPOSE: the original 100/5000 stimulus sat inside fp16's exact-integer range and could not see (2) at all. (3) THE PADOFF CONTROL: the row's pads past V=49155 hold 0.0 -- the production shape, the lm-head's zero-pad columns -- and the real lanes sit BELOW ZERO, so a kernel that maxes the RAW row answers a pad lane; only `x + padoff` (the staged offset row, -inf past V) keeps the answer on the real lanes. A kernel that lets a pad lane win answers PAD_V-adjacent garbage, never 40017."
 }

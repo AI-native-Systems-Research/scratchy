@@ -115,21 +115,22 @@ DEVICE LAWS THIS SHAPE OBEYS
 
 HOST CONTRACT (the part that is not in this file)
 -------------------------------------------------
-SIX staged buffers, all host obligations for the same reason embedding.py
+SEVEN staged tables, all host obligations for the same reason embedding.py
 pads nothing in-kernel and attention_sdpa.py's causal mask is
 host-precomputed: the buffers are staging rows the host already owns, and
-`other=`-masked loads are not in this frontend's vocabulary. The first five
+`other=`-masked loads are not in this frontend's vocabulary. The first six
 are CONSTANT across decode steps (functions of V alone), so under the
 pooled-substrate regime they live in stable slots and every step's CB reads
 the same addresses:
 
 * THE LOGITS ROW is presented as [PAD_V] fp16, PAD_V = the vocab rounded UP
   to a power-of-two whole row (the descriptor block must be a power of two),
-  with the pad lanes already holding -inf (the fp16 floor). Real lanes are
-  untouched: adding -inf past the row cannot change the max, and a pad lane
-  can never win the equality against a finite m. On device those pads stage
-  through ieee_to_sen's reserved exp-63 INF mapping (sign | 0x7E00) -- the
-  closest SEN169 expresses to a floor, and still below every real logit.
+  with the pad lanes holding 0.0 -- the PRODUCTION shape: the lm-head's
+  zero-pad weight columns write 0.0 there every decode step. The row's pad
+  bytes are deliberately load-bearing garbage to the sampler: the kernel adds
+  the offset table before its first max, so it never maxes the raw pads. (On
+  device a durable -inf tail past the device width also survives -- the
+  offset makes both shapes the same answer.)
 * THE BLOCK RAMP is [PAD_V] fp16 with bramp_i = NB - (i // 64) on the real
   lanes and 0 on the pad lanes -- strictly decreasing in the block index, so
   the first-block law is its monotonicity.
@@ -148,6 +149,16 @@ the same addresses:
   what a `tl.full` constant would splat, so the multiply stays a two-tensor
   op) and [1, BLOCK] fp32 of 64.0 (the island's scale, in the island's own
   dtype so the f32 multiply is also two-tensor).
+* THE OFFSET TABLE is [PAD_V] fp16 with 0.0 on `[0, V)` and -inf on the pads
+  -- THE PAD LAW, added to the row before the kernel's first max (`xm = x +
+  padoff`, xm throughout). Real lanes are untouched (`x + 0` exact); the pads
+  become -inf whatever the row staged there (0.0 from the lm-head's zero
+  columns, a durable -inf tail: `0 + -inf = -inf` and `-inf + -inf = -inf`
+  alike); NaN rides through (`NaN + 0 = NaN`), so the all-NaN sentinel law
+  survives; and an all-(-inf) row still answers lane 0 (every lane ties at
+  -inf and the ramps pick the first). Staging the law as a table -- never a
+  V-constexpr arange mask -- keeps it on the same host contract as every
+  other constant this kernel reads.
 
 Computing the ramps in-kernel would need `V - (start + tl.arange(...))`-style
 arithmetic -- a runtime scalar added to an arange in the tile domain, a form
@@ -181,7 +192,7 @@ DTYPE = torch.float16
 
 @triton.jit
 def argmax_first_max_kernel(logits_ptr, bramp_ptr, lramp_ptr, binc_ptr, linc_ptr,
-                            ones_ptr, sixtyfour_ptr, idx_ptr,
+                            ones_ptr, sixtyfour_ptr, padoff_ptr, idx_ptr,
                             V: tl.constexpr, PAD_V: tl.constexpr,
                             NB: tl.constexpr, BLOCK: tl.constexpr):
     # THE WHOLE ROW IS ONE TILE: one load, [1, PAD_V], the rmsnorm fixture's own
@@ -192,10 +203,22 @@ def argmax_first_max_kernel(logits_ptr, bramp_ptr, lramp_ptr, binc_ptr, linc_ptr
     l_desc = tl.make_tensor_descriptor(logits_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
                                        block_shape=[1, PAD_V])
     x = l_desc.load([0, 0])
+    # THE PAD LAW, BEFORE THE FIRST MAX: xm = x + padoff, and xm throughout.
+    # padoff is 0.0 on the real lanes (x + 0 exact) and -inf on the pads, so a
+    # pad lane can never win a max or an equality the real lanes contest
+    # WHATEVER the row's pad bytes hold (this fixture stages them 0.0 -- the
+    # production shape, the lm-head's zero-pad columns; 0 + -inf = -inf). NaN
+    # rides through (NaN + 0 = NaN), so the all-NaN sentinel law is intact. A
+    # two-tensor add of two loaded tiles -- the same Elementwise(Add) every
+    # spliced add kernel is.
+    p_desc = tl.make_tensor_descriptor(padoff_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
+                                       block_shape=[1, PAD_V])
+    padoff = p_desc.load([0, 0])
+    xm = x + padoff
     # The global max. `tl.max` of an f16 tile reduces in f32 (upstream's own
     # promotion) and is narrowed straight back, moe.py's spelling: the max of
     # f16 values is exactly representable in f16, so the round trip is exact.
-    m = tl.max(x, axis=1).to(tl.float16)
+    m = tl.max(xm, axis=1).to(tl.float16)
     mm = tl.expand_dims(m, 1)
 
     # LEVEL 1 -- the FIRST 64-block holding the maximum. bramp is the staged
@@ -206,7 +229,7 @@ def argmax_first_max_kernel(logits_ptr, bramp_ptr, lramp_ptr, binc_ptr, linc_ptr
     br_desc = tl.make_tensor_descriptor(bramp_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
                                         block_shape=[1, PAD_V])
     bramp = br_desc.load([0, 0])
-    mask = (x == mm).to(tl.float16)
+    mask = (xm == mm).to(tl.float16)
     w1 = mask * bramp
     jA = tl.max(w1, axis=1).to(tl.float16)
     # The equality inverts the ramp: bramp is CONSTANT per block, so comparing
@@ -268,11 +291,16 @@ def argmax_first_max_kernel(logits_ptr, bramp_ptr, lramp_ptr, binc_ptr, linc_ptr
 
 
 def inputs(seed: int = 0):
-    """The six staged buffers (host contract): one fp16 logits row, pad
-    lanes -inf, with a deliberate TIE at the max -- lanes 40017 and 48000 both
-    hold the row's largest value, so the reference pins FIRST-max against a
-    real tie, not a vacuous one -- plus the four constant index tables and the
-    two widen tables.
+    """The seven staged tables (host contract) plus the logits row, whose pads
+    hold 0.0 -- the PRODUCTION shape, the lm-head's zero-pad columns -- so the
+    pad law lives entirely in the `padoff` table. The row carries a deliberate
+    TIE at the max -- lanes 40017 and 48000 both hold the row's largest value,
+    so the reference pins FIRST-max against a real tie, not a vacuous one --
+    and its real lanes sit BELOW ZERO on purpose (the padoff control): with
+    0.0-staged pads, a kernel that maxes the RAW row answers a pad lane, so
+    only `x + padoff` (pads -inf) keeps the answer on the real lanes. A
+    positive-max stimulus cannot see a missing offset table at all -- the pads
+    never win either way -- which is why this row is shifted.
 
     The tie lanes are HIGH on purpose, and that is a second pin: the answer
     40017 = 625*64 + 17 is NOT representable in fp16 (the format's ULP is 32
@@ -282,16 +310,24 @@ def inputs(seed: int = 0):
     sits inside fp16's exact-integer range, so a degraded combine still
     answers it exactly and the defect hides."""
     g = torch.Generator().manual_seed(seed)
-    x = torch.randn(V, generator=g, dtype=DTYPE)
+    # -8 keeps every real lane below the 0.0 pads (randn's max over 49k lanes
+    # is ~4.3), so the tie maximum is negative too and the padoff control
+    # discriminates: raw-row maxing answers a pad lane, never 40017.
+    x = torch.randn(V, generator=g, dtype=DTYPE) - 8.0
     # ONE ABOVE the natural maximum: a 49k-lane fp16 randn row ties its own
     # maximum naturally (the format's tail is coarse), so pinning the tie AT
     # the natural max would leave an earlier natural lane winning. +1 is exact
-    # in fp16 at randn magnitudes and strictly above every natural lane.
+    # in fp16 at these magnitudes and strictly above every natural lane.
     top = x.max() + 1.0
     x[40017] = top
     x[48000] = top
-    row = torch.full((PAD_V,), NEG_INF, dtype=DTYPE)
+    row = torch.zeros(PAD_V, dtype=DTYPE)
     row[:V] = x
+    # THE OFFSET TABLE: 0.0 on the real lanes, -inf on the pads -- the pad law
+    # the kernel adds before its first max. Staging it here (not as an
+    # in-kernel arange mask) is the same host contract as every other table.
+    padoff = torch.zeros(PAD_V, dtype=DTYPE)
+    padoff[V:] = NEG_INF
     bramp = torch.zeros(PAD_V, dtype=DTYPE)
     lramp = torch.zeros(PAD_V, dtype=DTYPE)
     binc = torch.full((PAD_V,), NB, dtype=DTYPE)
@@ -303,15 +339,16 @@ def inputs(seed: int = 0):
         linc[i] = i % BLOCK
     ones = torch.ones((1, BLOCK), dtype=DTYPE)
     sixtyfour = torch.full((1, BLOCK), 64.0, dtype=torch.float32)
-    return row, bramp, lramp, binc, linc, ones, sixtyfour
+    return row, bramp, lramp, binc, linc, ones, sixtyfour, padoff
 
 
 def reference(row: torch.Tensor) -> torch.Tensor:
-    """First-max argmax, derived: the equality mask's first true index. Pad
-    lanes are -inf and can never tie a finite max; an all-NaN real row leaves
-    the mask empty and answers the sentinel (one past the padded row),
-    matching the kernel's arithmetic. Returned as a 1-lane int32 tensor (the
-    ingestion dtype)."""
+    """First-max argmax, derived: the equality mask's first true index, over
+    the REAL lanes alone (the pads are unread -- the kernel's own pad law adds
+    -inf to them, and the reference states the same predicate over [0, V)).
+    An all-NaN real row leaves the mask empty and answers the sentinel (one
+    past the padded row), matching the kernel's arithmetic. Returned as a
+    1-lane int32 tensor (the ingestion dtype)."""
     x = row[:V]
     m = x.max()
     mask = x == m

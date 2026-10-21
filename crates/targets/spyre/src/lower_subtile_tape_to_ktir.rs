@@ -1594,10 +1594,11 @@ fn result_tail_lm_head<F: RopeForm>(ir: &SubtileIR<F>) -> Option<&SubtileNode<F>
 pub fn load_consts_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
 ) -> Result<Vec<(u32, crate::wiring::LoadConst)>, SuperDscError> {
-    // ⭐ THE DEVICE ARGMAX'S MINT — the six operand tables (functions of the
+    // ⭐ THE DEVICE ARGMAX'S MINT — the seven operand tables (functions of the
     // vocab alone, built by the shared `argmax_staged_tables` derivation the
-    // kind names) and the widened result row's −inf pad tail (the zones the
-    // lm-head matmul's zero-pad columns never write).
+    // kind names; the seventh is the pad law's offset row, which the kernel
+    // adds to the logits row before its first max — the row's own pad bytes
+    // are never its contract).
     let mut mints = ir
         .nodes
         .iter()
@@ -1615,10 +1616,10 @@ pub fn load_consts_of_ir<F: RopeForm>(
             };
             assert_eq!(
                 node.inputs.len(),
-                7,
-                "the ArgMax node's arity is the registry's own row (logits + six tables)"
+                8,
+                "the ArgMax node's arity is the registry's own row (logits + seven tables)"
             );
-            let mut consts: Vec<(u32, crate::wiring::LoadConst)> = node.inputs[1..]
+            Ok(node.inputs[1..]
                 .iter()
                 .enumerate()
                 .map(|(i, tr)| {
@@ -1630,12 +1631,7 @@ pub fn load_consts_of_ir<F: RopeForm>(
                         },
                     )
                 })
-                .collect();
-            consts.push((
-                ir.result.index() as u32,
-                crate::wiring::LoadConst::NegInfPadTail { vocab },
-            ));
-            Ok(consts)
+                .collect())
         }
     }
 }

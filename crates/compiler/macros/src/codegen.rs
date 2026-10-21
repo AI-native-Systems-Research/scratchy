@@ -9608,13 +9608,6 @@ fn emit_superdsc_wiring(
                         }
                     }
                 }
-                scratchy_target_spyre::wiring::LoadConst::NegInfPadTail { vocab } => {
-                    quote! {
-                        ::scratchy_target_spyre::wiring::LoadConst::NegInfPadTail {
-                            vocab: #vocab,
-                        }
-                    }
-                }
             };
             quote! { (#tid, #kind) }
         })
@@ -11023,7 +11016,7 @@ fn dump_wavefront_mega(
                 // lm-head the emitted tail admits (arity-2 Dense fp16 — the ruling's
                 // admission, the #698 tie conjunct DROPPED: no gather link exists to
                 // demand it). The splice is the kernel's ONLY entry — this mint appends
-                // the node and its six staged-table sources to the graph, and everything
+                // the node and its seven staged-table sources to the graph, and everything
                 // downstream (the splice's row, the door's whole-function walk, the
                 // placement pass, the wiring's argmax facts) is the same machinery every
                 // other Triton kernel takes. Batched rungs, prefill and every staged or
@@ -11036,7 +11029,7 @@ fn dump_wavefront_mega(
                     let mint = scratchy_subtile::subtile_ir::mint_argmax(&mut krg);
                     eprintln!(
                         "[spyre-superdsc] {base}: the device argmax minted — vocab {} (padded \
-                         row {}), six staged tables + the [1, 64] idx stick appended to the \
+                         row {}), seven staged tables + the [1, 64] idx stick appended to the \
                          one-request graph",
                         mint.vocab, mint.pad_vocab
                     );

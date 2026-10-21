@@ -45,7 +45,13 @@
 //!    protect the fptosi-terminated island (measured, 2026-10-21). A tie at LOW lanes
 //!    (the original 100/5000 stimulus) sits inside fp16's exact-integer range and cannot
 //!    see this defect at all.
-//! 2. **The lane-uniformity claim is asserted, not assumed**: every lane of the [64] i32 stick
+//! 3. **The padoff control**: the row's pads stage 0.0 -- the PRODUCTION shape, the
+//!    lm-head's zero-pad columns -- and the row's real lanes sit BELOW ZERO, so a kernel
+//!    that maxes the RAW row answers a pad lane (0.0 out-maxes every real lane) and the
+//!    exact comparison sees it. Only `x + padoff` (the staged offset row, -inf on the
+//!    pads) keeps the answer on the real lanes; a positive-max stimulus cannot see a
+//!    missing offset table at all, which is why the fixture shifts its row negative.
+//! 4. **The lane-uniformity claim is asserted, not assumed**: every lane of the [64] i32 stick
 //!    must hold the same index. The kernel computes one vector and stores it whole; a lane that
 //!    disagrees is a stick-addressing defect the single-lane reference cannot see on its own.
 //!
@@ -62,11 +68,17 @@ use triton_numeric::{data, execute, lower};
 /// The stimulus's logits row, decoded. Read from the same checked bytes the run binds, so the
 /// control and the execution cannot disagree about what the row holds.
 fn logits_row(f: &data::Fixture) -> Vec<f64> {
+    input_row(f, "logits_ptr")
+}
+
+/// Any staged input, decoded — the padoff control reads the offset row the same way the
+/// run binds it.
+fn input_row(f: &data::Fixture, arg: &str) -> Vec<f64> {
     let t = f
         .inputs
         .iter()
-        .find(|t| t.arg == "logits_ptr")
-        .unwrap_or_else(|| panic!("the fixture records a `logits_ptr` input"));
+        .find(|t| t.arg == arg)
+        .unwrap_or_else(|| panic!("the fixture records a `{arg}` input"));
     let p = data::dir(&f.config).join(&t.file);
     let bytes = std::fs::read(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
     data::decode_f64(&bytes, t.elements(), t.dtype)
@@ -129,14 +141,31 @@ fn the_stimulus_tie_discriminates() {
     let v = f.int("V").expect("V is recorded") as usize;
     assert!(row.len() > v, "the row is padded past V");
     let real = &row[..v];
-    // The pad contract: -inf past V, which can never win a max over a finite row.
+    // The pad contract, PRODUCTION shape: the pads hold 0.0 (the lm-head's zero-pad
+    // columns write 0.0 there every step) and the real lanes sit below zero, so the
+    // raw row's max IS a pad lane -- only the staged offset row (-inf past V, added
+    // before the kernel's first max) keeps the answer on the real lanes.
     assert!(
         real.iter().all(|&x| x.is_finite()),
         "the real lanes are finite, else the pad control below is vacuous"
     );
     assert!(
-        row[v..].iter().all(|&x| x == f64::NEG_INFINITY),
-        "the pad lanes hold -inf (the host obligation the fixture states)"
+        row[v..].iter().all(|&x| x == 0.0),
+        "the pad lanes hold 0.0 (the production shape -- the lm-head's zero-pad columns)"
+    );
+    assert!(
+        real.iter().cloned().fold(f64::NEG_INFINITY, f64::max) < 0.0,
+        "the real lanes sit below zero, else the padoff control is vacuous (a positive \
+         max beats the 0.0 pads with or without the offset row)"
+    );
+    // THE OFFSET ROW itself: 0.0 on the real lanes (x + 0 exact), -inf on the pads --
+    // the host obligation that carries the pad law.
+    let padoff = input_row(&f, "padoff_ptr");
+    assert_eq!(padoff.len(), row.len(), "the offset row covers the whole padded row");
+    assert!(
+        padoff[..v].iter().all(|&x| x == 0.0) && padoff[v..].iter().all(|&x| x == f64::NEG_INFINITY),
+        "the offset row is 0.0 on the real lanes and -inf on the pads (the pad law the \
+         kernel adds before its first max)"
     );
 
     let first = first_max(real);

@@ -383,9 +383,10 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
             program: Program::Reshape,
         },
         // ⭐ THE GREEDY TOKEN PICK — the whole vocab scan as ONE kernel: the row, the
-        // six staged tables (functions of the vocab alone, host-staged at load), and
-        // the `[1, 64]` i32 idx stick out. The vocab rides the node (never a model
-        // name); every constexpr below derives from it.
+        // seven staged tables (functions of the vocab alone, host-staged at load —
+        // the seventh is the pad law's offset row), and the `[1, 64]` i32 idx stick
+        // out. The vocab rides the node (never a model name); every constexpr below
+        // derives from it.
         SubOp::ArgMax { .. } => TritonKernelRow::Spliced {
             src: include_str!("../../../targets/spyre/kernels/argmax.py"),
             file: "argmax.py",
@@ -1148,11 +1149,11 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
         // refuses them before the splice — the MoE lowers only from
         // `kernels/moe.py` through KTIR.
         SubOp::ScalarWeightMul => 2,
-        // ⭐ THE ARGMAX'S ARITY IS 7: the logits row plus the six staged tables
-        // (two decreasing ramps, two increasing index tables, two widen tables) —
-        // every kernel parameter but the output is a tape operand, per the splice's
-        // own positional law.
-        SubOp::ArgMax { .. } => 7,
+        // ⭐ THE ARGMAX'S ARITY IS 8: the logits row plus the seven staged tables
+        // (two decreasing ramps, two increasing index tables, two widen tables,
+        // the pad law's offset row) — every kernel parameter but the output is a
+        // tape operand, per the splice's own positional law.
+        SubOp::ArgMax { .. } => 8,
         SubOp::TanhSoftCap { .. } | SubOp::RmsNormUnit { .. } | SubOp::Reshape { .. } => 1,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
@@ -2363,13 +2364,15 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // law, ONE derivation shared with the host reference and the load-time
             // table staging), NB its block count (bramp's ceiling, fp16-exact at 1024),
             // BLOCK the stick (the two-level split's lane width and the output stick).
-            // The signature states every kernel parameter's dtype: the row and the five
-            // f16 tables, the f32 widen table (the island's own dtype), and the i32
-            // output stick (the index-ingestion law).
+            // The signature states every kernel parameter's dtype: the row and the six
+            // f16 tables, the f32 widen table (the island's own dtype), the pad law's
+            // f16 offset row (the seventh table), and the i32 output stick (the
+            // index-ingestion law).
             let pad_v = scratchy_subtile::subtile_ir::argmax_pad_vocab(*vocab);
             let nb = pad_v / scratchy_subtile::subtile_ir::ARGMAX_BLOCK;
             for p in [
                 "logits_ptr", "bramp_ptr", "lramp_ptr", "binc_ptr", "linc_ptr", "ones_ptr",
+                "padoff_ptr",
             ] {
                 signature.insert(
                     p.to_string(),

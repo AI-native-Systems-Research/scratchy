@@ -32,12 +32,14 @@
 //!     whole-stick door emission, so the inversion rides the EQUALITY selection
 //!     instead (the increasing 0-based tables read the numbers back out through the
 //!     one-hot). A subf sneaking back in is the unlowerable form returning;
-//!   * `arith.extf`/`arith.addf`/`arith.fptosi` — the ONE fp32 island: the final
-//!     `b*64 + l*` reaches 49154 (past fp16's exact range), so it widens,
-//!     multiply-adds in f32 (exact below 2^24), and casts to i32 — moe.py's gelu
-//!     island and the KSPLIT pair's own device recipe;
-//!   * `tt.descriptor_load` × 7 / `tt.descriptor_store` — the row, the four staged
-//!     index tables and the two widen tables in, the i32 stick out;
+//!   * `arith.extf`/`arith.addf`/`arith.fptosi` — the pad law's `x + padoff`
+//!     (the f16 offset-row add before the first max) and the ONE fp32 island:
+//!     the final `b*64 + l*` reaches 49154 (past fp16's exact range), so it
+//!     widens, multiply-adds in f32 (exact below 2^24), and casts to i32 —
+//!     moe.py's gelu island and the KSPLIT pair's own device recipe;
+//!   * `tt.descriptor_load` × 8 / `tt.descriptor_store` — the row, the four
+//!     staged index tables, the two widen tables and the pad law's offset
+//!     row in, the i32 stick out;
 //!   * `tt.expand_dims`/`tt.broadcast` — the [1] → [1,1] → [1, BLOCK] seams (the golden
 //!     shapes: rank-2 tiles, rank-1 reduce results, no scalar anywhere, so no
 //!     reduce-to-scalar and no splat of an interior value exists in the kernel).
@@ -139,14 +141,17 @@ fn argmax_first_max_compiles_and_states_the_algorithm_in_generic_ops() {
          subtraction is the v5 `NB - jA` form returning -- a [1]-shaped splat-minus-tensor \
          with no whole-stick door emission"
     );
-    assert!(count(&ops, "arith.addf") >= 1, "the island's b*64 + l*");
+    assert!(
+        count(&ops, "arith.addf") >= 2,
+        "the pad law's x + padoff and the island's b*64 + l*"
+    );
     assert!(
         count(&ops, "arith.fptosi") >= 1,
         "the island's f32 -> i32 cast"
     );
     assert!(
-        count(&ops, "tt.descriptor_load") >= 7,
-        "the row loads (x, bramp, lramp, binc, linc, ones, sixtyfour)"
+        count(&ops, "tt.descriptor_load") >= 8,
+        "the row loads (x, bramp, lramp, binc, linc, ones, sixtyfour, padoff)"
     );
     assert!(
         count(&ops, "tt.descriptor_store") >= 1,

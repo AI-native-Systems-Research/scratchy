@@ -563,7 +563,7 @@ def _mul_scale_inputs(mod, ce):
 
 
 def _argmax_inputs(mod, ce):
-    row, bramp, lramp, binc, linc, ones, sixtyfour = mod.inputs(seed=SEED)
+    row, bramp, lramp, binc, linc, ones, sixtyfour, padoff = mod.inputs(seed=SEED)
     ref = mod.reference(row)
     # THE OUTPUT IS ONE i32 LANE, not an fp16 tile: this is the first config whose
     # reference is an INDEX (the gather ingestion dtype), so `out_dtype` below is
@@ -578,27 +578,30 @@ def _argmax_inputs(mod, ce):
     # law -- a single V - i ramp would need 49155 in a lane). THE TWO WIDEN TABLES
     # are the [1, BLOCK] ones row (f16) and 64.0 row (f32) the output-stick widen
     # and the island's scale read -- loaded, never splatted, so every multiply in
-    # the kernel stays a two-tensor op.
+    # the kernel stays a two-tensor op. THE OFFSET ROW is the pad law: 0.0 on the
+    # real lanes, -inf on the pads, added before the kernel's first max.
     ins = [("logits_ptr", row, "f16"), ("bramp_ptr", bramp, "f16"),
            ("lramp_ptr", lramp, "f16"), ("binc_ptr", binc, "f16"),
            ("linc_ptr", linc, "f16"), ("ones_ptr", ones, "f16"),
-           ("sixtyfour_ptr", sixtyfour, "f32"),
+           ("sixtyfour_ptr", sixtyfour, "f32"), ("padoff_ptr", padoff, "f16"),
            ("idx_ptr", torch.zeros(64, dtype=torch.int32), "i32")]
     note = (
         f"THE STIMULUS CARRIES A REAL TIE AT HIGH LANES: 40017 and 48000 both hold the "
         f"row's maximum, so `ref_out.bin`'s single lane is 40017 -- FIRST-max pinned "
         f"against a tie, not a vacuous uniqueness. THE NEGATIVE CONTROLS ARE PART OF THE "
-        f"CONTRACT, AND THERE ARE TWO: (1) a last-max implementation answers 48000 "
+        f"CONTRACT, AND THERE ARE THREE: (1) a last-max implementation answers 48000 "
         f"against these same bytes and must not match `ref_out.bin`; a run that still "
         f"matches cannot have taken the tie. (2) an f16-DEGRADED FINAL COMBINE answers "
         f"40032 or 40016 -- 40017 = 625*64 + 17 is not fp16-representable (ULP 32 at "
         f"[32768, 65536)) -- so a kernel whose `b*64 + l` island collapsed out of f32 "
         f"cannot match either; a run that still matches cannot have degraded. The tie "
         f"lanes are high ON PURPOSE: the original 100/5000 stimulus sat inside fp16's "
-        f"exact-integer range and could not see (2) at all. The pad lanes past "
-        f"V={ce['V']} hold -inf in the row and NB/BLOCK in the increasing tables (the "
-        f"host obligations the fixture's own docstring states); a kernel that lets a "
-        f"pad lane win the equality answers PAD_V-adjacent garbage, never 40017."
+        f"exact-integer range and could not see (2) at all. (3) THE PADOFF CONTROL: the "
+        f"row's pads past V={ce['V']} hold 0.0 -- the production shape, the lm-head's "
+        f"zero-pad columns -- and the real lanes sit BELOW ZERO, so a kernel that maxes "
+        f"the RAW row answers a pad lane; only `x + padoff` (the staged offset row, "
+        f"-inf past V) keeps the answer on the real lanes. A kernel that lets a pad "
+        f"lane win answers PAD_V-adjacent garbage, never 40017."
     )
     return ins, ref, note
 
