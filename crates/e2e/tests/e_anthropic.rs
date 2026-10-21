@@ -303,11 +303,11 @@ async fn test_anthropic_missing_max_tokens() {
         .await
         .unwrap();
 
-    // Should fail with 422 (Unprocessable Entity) since max_tokens is required
-    assert!(
-        !resp.status().is_success(),
-        "should fail without max_tokens"
-    );
+    // A 400 in Anthropic's error shape, as Anthropic answers a request without max_tokens.
+    assert_eq!(resp.status().as_u16(), 400, "should fail without max_tokens");
+    let error: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(error["type"], "error", "{error}");
+    assert_eq!(error["error"]["type"], "invalid_request_error", "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -18,6 +18,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::info;
 
 use crate::engine::StreamDelta;
+use crate::error::{ApiJson, ServeError};
 use crate::protocol;
 use crate::server::AppState;
 
@@ -991,11 +992,38 @@ fn stream_buffered_messages_response(
 // Handler: POST /v1/messages
 // ---------------------------------------------------------------------------
 
+/// A [`ServeError`] as the Anthropic Messages API answers one, in its status and shape
+/// (`{"type": "error", "error": {"type": …, "message": …}}`): what an Anthropic client, Claude Code
+/// among them, reads an error by. `/v1/messages` answers every error this way, a body it can't
+/// read (#787) included.
+struct AnthropicError(ServeError);
+
+impl IntoResponse for AnthropicError {
+    fn into_response(self) -> Response {
+        let kind = match &self.0 {
+            ServeError::Validation(_) => "invalid_request_error",
+            ServeError::ModelNotFound(_) | ServeError::RequestNotFound(_) => "not_found_error",
+            ServeError::Engine(_) | ServeError::EngineShutdown | ServeError::Internal(_) => {
+                "api_error"
+            }
+        };
+        let body = serde_json::json!({
+            "type": "error",
+            "error": { "type": kind, "message": self.0.to_string() },
+        });
+        (self.0.status_code(), Json(body)).into_response()
+    }
+}
+
 /// POST /v1/messages — Anthropic Messages API.
 pub async fn messages(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<MessagesRequest>,
+    body: Result<ApiJson<MessagesRequest>, ServeError>,
 ) -> Response {
+    let request = match body {
+        Ok(ApiJson(request)) => request,
+        Err(e) => return AnthropicError(e).into_response(),
+    };
     info!(
         "POST /v1/messages: model={:?}, max_tokens={}, stream={}",
         request.model, request.max_tokens, request.stream
@@ -1017,7 +1045,7 @@ pub async fn messages(
             .map(|t| t.name.as_str())
             .collect();
         if let Err(e) = crate::engine::check_tool_choice(&tool_choice, &tools) {
-            return e.into_response();
+            return AnthropicError(e).into_response();
         }
         let spnl = build_spnl_query(&request);
         match crate::query::anthropic_spans_completion(&state, &spnl).await {
@@ -1030,7 +1058,7 @@ pub async fn messages(
                     Json(msg).into_response()
                 };
             }
-            Err(e) => return e.into_response(),
+            Err(e) => return AnthropicError(e).into_response(),
         }
     }
 
@@ -1042,7 +1070,7 @@ pub async fn messages(
             Ok((request_id, model, rx)) => {
                 stream_messages_response(request_id, model, rx).into_response()
             }
-            Err(e) => e.into_response(),
+            Err(e) => AnthropicError(e).into_response(),
         }
     } else {
         match state.engine.chat_completion(chat_request).await {
@@ -1050,7 +1078,7 @@ pub async fn messages(
                 let anthropic_response = convert_response(response);
                 Json(anthropic_response).into_response()
             }
-            Err(e) => e.into_response(),
+            Err(e) => AnthropicError(e).into_response(),
         }
     }
 }
