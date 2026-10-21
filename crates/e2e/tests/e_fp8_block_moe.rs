@@ -151,8 +151,8 @@ fn make_fp8_tensor(shape: &[usize]) -> safetensors::tensor::TensorView<'static> 
 
 /// Create an f32 block-scale tensor (all 1.0 so dequant is identity-ish).
 fn make_block_scale(n: usize, k: usize) -> safetensors::tensor::TensorView<'static> {
-    let scale_rows = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    let scale_cols = (k + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let scale_rows = n.div_ceil(BLOCK_SIZE);
+    let scale_cols = k.div_ceil(BLOCK_SIZE);
     let numel = scale_rows * scale_cols;
     let data: Vec<f32> = vec![1.0f32; numel];
     let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();

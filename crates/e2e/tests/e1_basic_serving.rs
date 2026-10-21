@@ -2699,10 +2699,8 @@ async fn test_cuda_logprobs_completion() {
         !token_logprobs.is_empty(),
         "token_logprobs should not be empty"
     );
-    for lp in token_logprobs {
-        if let Some(v) = lp {
-            assert!(*v <= 0.0, "logprob should be non-positive, got {v}");
-        }
+    for v in token_logprobs.iter().flatten() {
+        assert!(*v <= 0.0, "logprob should be non-positive, got {v}");
     }
 }
 
