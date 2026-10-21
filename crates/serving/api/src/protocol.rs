@@ -265,9 +265,10 @@ impl ToolChoice {
         })
     }
 
-    /// The Anthropic Messages API's forms: `{"type": "auto" | "any" | "none"}` (other keys, such as
-    /// `disable_parallel_tool_use`, ignored), `{"type": "tool", "name": …}`, and the bare strings
-    /// `"auto"`, `"any"` and `"none"`. `any` is [`Self::Required`].
+    /// The Anthropic Messages API's forms: `{"type": "auto" | "any" | "none"}`,
+    /// `{"type": "tool", "name": …}`, and the bare strings `"auto"`, `"any"` and `"none"`. `any` is
+    /// [`Self::Required`]. An object's `disable_parallel_tool_use` is read beside it, as a
+    /// [`CallLimit`] (`crate::anthropic::AnthropicToolChoice`).
     pub fn from_anthropic(v: &serde_json::Value) -> Result<Self, String> {
         let kind = |s: &str| match s {
             "auto" => Some(Self::Auto),
@@ -368,6 +369,36 @@ impl<'de> Deserialize<'de> for ToolChoice {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let form = serde_json::Value::deserialize(deserializer)?;
         Self::from_chat(&form).map_err(serde::de::Error::custom)
+    }
+}
+
+/// How many tool calls a reply may carry, whichever endpoint the request came through (#794):
+/// any, or with `parallel_tool_calls: false` (Anthropic's `disable_parallel_tool_use: true`) one.
+/// Under `tool_choice: "required"` the reply's grammar takes that many; otherwise the reply keeps
+/// that many of the calls it would keep, the first, as vLLM does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CallLimit {
+    #[default]
+    Any,
+    One,
+}
+
+impl CallLimit {
+    /// The limit a request's `parallel_tool_calls` sets: only an explicit `false` sets one, as vLLM
+    /// reads it.
+    pub fn of(parallel_tool_calls: Option<bool>) -> Self {
+        match parallel_tool_calls {
+            Some(false) => Self::One,
+            _ => Self::Any,
+        }
+    }
+
+    /// The most calls a reply keeps.
+    pub fn most(self) -> usize {
+        match self {
+            Self::Any => usize::MAX,
+            Self::One => 1,
+        }
     }
 }
 
@@ -480,6 +511,10 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
 
+    /// Whether the reply may call more than one tool: `false` limits it to one ([`CallLimit`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+
     /// User identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
@@ -558,6 +593,13 @@ pub struct ChatCompletionRequest {
     /// Will be accessible by the chat template (e.g. `{"enable_thinking": false}`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<std::collections::HashMap<String, serde_json::Value>>,
+}
+
+impl ChatCompletionRequest {
+    /// How many tool calls the reply may carry, as its `parallel_tool_calls` sets it.
+    pub fn call_limit(&self) -> CallLimit {
+        CallLimit::of(self.parallel_tool_calls)
+    }
 }
 
 // ---------------------------------------------------------------------------

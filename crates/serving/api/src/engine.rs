@@ -852,7 +852,7 @@ impl AsyncEngine {
                     prompt: PromptIndex(0),
                 },
                 None, // no streaming tool parser for non-streaming requests
-                None,
+                ToolCallStream::default(),
                 None, // no streaming reasoning parser for non-streaming requests
                 request.include_reasoning,
             )
@@ -924,8 +924,13 @@ impl AsyncEngine {
             let parser = self.request_tool_parser(&request);
             let (final_content, final_tool_calls, final_finish_reason) = match parser {
                 Some(parser) if request.tools.is_some() => {
-                    let reply =
-                        reply_tool_calls(parser.as_ref(), text_for_tools, &request.tool_choice);
+                    let limit = request.call_limit();
+                    let reply = reply_tool_calls(
+                        parser.as_ref(),
+                        text_for_tools,
+                        &request.tool_choice,
+                        limit,
+                    );
                     let finish = match reply.calls {
                         Some(_) => "tool_calls".to_string(),
                         None => finish_reason_str,
@@ -1128,6 +1133,7 @@ impl AsyncEngine {
             && !is_tool_choice_none(&request.tool_choice);
 
         let forced_tool = ForcedTool::of(&request.tool_choice);
+        let limit = request.call_limit();
 
         // All n children share one channel.
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1185,7 +1191,7 @@ impl AsyncEngine {
                     prompt: PromptIndex(0),
                 },
                 tool_state,
-                forced_tool.clone(),
+                ToolCallStream::new(forced_tool.clone(), limit),
                 reasoning_state,
                 request.include_reasoning,
             )
@@ -1303,7 +1309,7 @@ impl AsyncEngine {
                         prompt: PromptIndex(p_idx as u32),
                     },
                     None, // no tool parsing for completions
-                    None,
+                    ToolCallStream::default(),
                     None, // no reasoning parsing for completions
                     true,
                 )
@@ -1496,7 +1502,7 @@ impl AsyncEngine {
                         prompt: PromptIndex(p_idx as u32),
                     },
                     None, // no tool parsing for completions
-                    None,
+                    ToolCallStream::default(),
                     None, // no reasoning parsing for completions
                     true,
                 )
@@ -1585,7 +1591,7 @@ impl AsyncEngine {
                     None,
                     Choice::default(),
                     None,
-                    None,
+                    ToolCallStream::default(),
                     None,
                     true,
                 )
@@ -2400,7 +2406,7 @@ impl AsyncEngine {
         detokenizer: Option<IncrementalDetokenizer>,
         choice: Choice,
         tool_parser_state: Option<Box<dyn StreamingToolParserState + Send>>,
-        forced_tool: Option<ForcedTool>,
+        tool_calls: ToolCallStream,
         reasoning_parser_state: Option<Box<dyn StreamingReasoningParserState + Send>>,
         include_reasoning: bool,
     ) -> ServeResult<()> {
@@ -2467,7 +2473,7 @@ impl AsyncEngine {
                     accumulated_content: String::new(),
                     accumulated_token_ids: Vec::new(),
                     tool_calls_emitted: false,
-                    tool_calls: ToolCallStream::new(forced_tool),
+                    tool_calls,
                     pooler_output: None,
                 },
             );
@@ -3461,7 +3467,8 @@ impl AsyncEngine {
         let guided_grammar = match (&request.tool_choice, guided_grammar) {
             (Some(protocol::ToolChoice::Required), None) => {
                 let tools = request.tools.as_deref().unwrap_or_default();
-                let schema = crate::tool_parser::required_tool_calls_schema(tools)
+                let limit = request.call_limit();
+                let schema = crate::tool_parser::required_tool_calls_schema(tools, limit)
                     .map_err(ServeError::Validation)?;
                 Some(GuidedGrammar::JsonSchema { schema })
             }
@@ -4050,12 +4057,14 @@ fn is_tool_choice_none(tool_choice: &Option<protocol::ToolChoice>) -> bool {
 
 /// A whole reply as its `tool_choice` lets its tool calls out: read by `parser` unless the choice
 /// is `"none"`, and with a [`ForcedTool`] only that tool's calls, the reply then the text around
-/// the others. Both whole-reply paths apply it (the chat endpoint's, and `/v1/messages`' under
-/// `tool-spans`); the stream applies the same rule call by call ([`ToolCallStream`]).
+/// the others. Of the calls kept, `limit` keeps the first ones (#794). Both whole-reply paths
+/// apply it (the chat endpoint's, and `/v1/messages`' under `tool-spans`); the stream applies the
+/// same rule call by call ([`ToolCallStream`]).
 pub(crate) fn reply_tool_calls(
     parser: &dyn ToolCallParser,
     text: String,
     tool_choice: &Option<protocol::ToolChoice>,
+    limit: protocol::CallLimit,
 ) -> ToolReply {
     if is_tool_choice_none(tool_choice) {
         return ToolReply {
@@ -4075,6 +4084,7 @@ pub(crate) fn reply_tool_calls(
     let forced = ForcedTool::of(tool_choice);
     let calls: Vec<_> = (extracted.tool_calls.into_iter())
         .filter(|tc| (forced.as_ref()).is_none_or(|f| f.admits(&tc.function.name)))
+        .take(limit.most())
         .collect();
     // Every call named a tool other than the forced one: dropped, as the stream drops them, so
     // the reply is the text around them.
@@ -4122,8 +4132,9 @@ struct ParserCall(u32);
 struct StreamCall(u32);
 
 /// A request's streamed tool calls as they leave the output path: each call's name first, and
-/// with a [`ForcedTool`], only that tool's calls, numbered from 0 in the order they are named (the
-/// places they hold in the non-streaming reply's list).
+/// with a [`ForcedTool`], only that tool's calls, and of those only the first ones its
+/// [`protocol::CallLimit`] keeps, numbered from 0 in the order they are named (the places they
+/// hold in the non-streaming reply's list).
 ///
 /// Every consumer reads a call's first delta as its start (`/v1/messages` opens the `tool_use`
 /// block with its name; the forced filter keeps or drops the call on it), but a parser can write
@@ -4133,17 +4144,19 @@ struct StreamCall(u32);
 #[derive(Default)]
 struct ToolCallStream {
     forced: Option<ForcedTool>,
+    limit: protocol::CallLimit,
     kept: HashMap<ParserCall, StreamCall>,
-    /// The calls that named a tool the request does not allow.
+    /// The calls that named a tool the request does not allow, or came past its limit.
     dropped: HashSet<ParserCall>,
     /// The deltas of calls whose name has not arrived.
     unnamed: HashMap<ParserCall, Vec<DeltaToolCall>>,
 }
 
 impl ToolCallStream {
-    fn new(forced: Option<ForcedTool>) -> Self {
+    fn new(forced: Option<ForcedTool>, limit: protocol::CallLimit) -> Self {
         Self {
             forced,
+            limit,
             ..Self::default()
         }
     }
@@ -4165,7 +4178,8 @@ impl ToolCallStream {
                 continue;
             };
             let held = self.unnamed.remove(&call).unwrap_or_default();
-            if self.forced.as_ref().is_some_and(|f| !f.admits(name)) {
+            let forced_out = self.forced.as_ref().is_some_and(|f| !f.admits(name));
+            if forced_out || self.kept.len() >= self.limit.most() {
                 self.dropped.insert(call);
                 continue;
             }
@@ -4374,6 +4388,7 @@ mod tests {
             response_format: None,
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             user: None,
             top_k: None,
             min_p: None,
@@ -5616,14 +5631,29 @@ mod tests {
 
         // The grammar: the schema of calls to the declared tools.
         let params = engine.build_sampling_params_from_chat(&request(ToolChoice::Required, None));
-        let expected =
-            crate::tool_parser::required_tool_calls_schema(std::slice::from_ref(&bash)).unwrap();
+        let schema = |limit| {
+            crate::tool_parser::required_tool_calls_schema(std::slice::from_ref(&bash), limit)
+        };
+        let expected = schema(protocol::CallLimit::Any).unwrap();
         assert!(
             matches!(
                 params.unwrap().guided_grammar,
                 Some(GuidedGrammar::JsonSchema { ref schema }) if *schema == expected
             ),
             "\"required\" carries its grammar"
+        );
+        // `parallel_tool_calls: false`: the grammar of one call.
+        let one = protocol::ChatCompletionRequest {
+            parallel_tool_calls: Some(false),
+            ..request(ToolChoice::Required, None)
+        };
+        let expected = schema(protocol::CallLimit::One).unwrap();
+        assert!(
+            matches!(
+                engine.build_sampling_params_from_chat(&one).unwrap().guided_grammar,
+                Some(GuidedGrammar::JsonSchema { ref schema }) if *schema == expected
+            ),
+            "parallel_tool_calls: false carries the grammar of one call"
         );
         let auto = engine.build_sampling_params_from_chat(&request(ToolChoice::Auto, None));
         assert!(auto.unwrap().guided_grammar.is_none());
@@ -5653,6 +5683,7 @@ mod tests {
             parser.expect("\"required\" has its parser").as_ref(),
             reply.to_string(),
             &Some(ToolChoice::Required),
+            protocol::CallLimit::Any,
         );
         let names: Vec<_> = (tool_reply.calls.iter().flatten())
             .map(|tc| tc.function.name.as_str())
@@ -5728,8 +5759,13 @@ mod tests {
     }
 
     /// What a reply streams for `pieces` (one engine output each, the last finishing it) with
-    /// the `parser` tool parser and `forced` as the request's forced tool.
-    fn stream_tool_reply(parser: &str, forced: Option<&str>, pieces: &[&str]) -> Vec<StreamDelta> {
+    /// the `parser` tool parser, `forced` as the request's forced tool and `limit` as its call limit.
+    fn stream_tool_reply(
+        parser: &str,
+        forced: Option<&str>,
+        limit: protocol::CallLimit,
+        pieces: &[&str],
+    ) -> Vec<StreamDelta> {
         let pieces = (pieces.iter().enumerate())
             .map(|(i, text)| (vec![20 + i as u32], *text))
             .collect();
@@ -5739,7 +5775,8 @@ mod tests {
                     .unwrap()
                     .create_streaming_state(),
             );
-            state.tool_calls = ToolCallStream::new(forced.map(|f| ForcedTool(f.to_string())));
+            let forced = forced.map(|f| ForcedTool(f.to_string()));
+            state.tool_calls = ToolCallStream::new(forced, limit);
         };
         super::test_support::stream_pieces(configure, pieces, FinishReason::Stop)
     }
@@ -5768,7 +5805,12 @@ mod tests {
         let parser = crate::tool_parser::get_tool_parser("hermes").unwrap();
         let text = format!("Let me look.{}", BASH_CALL.concat());
         let reply = |choice: Option<ToolChoice>| {
-            let reply = reply_tool_calls(parser.as_ref(), text.clone(), &choice);
+            let reply = reply_tool_calls(
+                parser.as_ref(),
+                text.clone(),
+                &choice,
+                protocol::CallLimit::Any,
+            );
             let names = (reply.calls.iter().flatten())
                 .map(|tc| tc.function.name.clone())
                 .collect::<Vec<_>>();
@@ -5795,20 +5837,34 @@ mod tests {
         "\n</tool_call>",
     ];
 
+    /// A call to Read after one before it, written across four tokens.
+    const READ_CALL: [&str; 4] = [
+        "\n<tool_call>\n",
+        "{\"name\": \"Read\", ",
+        "\"arguments\": {\"file_path\": \"a.rs\"}}",
+        "\n</tool_call>",
+    ];
+
     /// A forced tool_choice drops a call to another tool whole: the deltas after its first carry
     /// no name, and none of its arguments may reach the stream (#683). The reply then is the text
     /// around the call — none here — and finishes `Stop`, with nothing a stream encoder would
     /// turn into a tool-call finish.
     #[test]
     fn a_forced_tool_choice_streams_no_part_of_another_tools_call() {
-        let unforced = tool_calls(&stream_tool_reply("hermes", None, &BASH_CALL));
+        let unforced = tool_calls(&stream_tool_reply(
+            "hermes",
+            None,
+            protocol::CallLimit::Any,
+            &BASH_CALL,
+        ));
         assert_eq!(unforced[0].function_name.as_deref(), Some("Bash"));
         assert!(
             unforced[1..].iter().any(|d| d.function_arguments.is_some()),
             "unforced, the call streams its arguments after its name: {unforced:?}"
         );
 
-        let forced = stream_tool_reply("hermes", Some("Read"), &BASH_CALL);
+        let forced =
+            stream_tool_reply("hermes", Some("Read"), protocol::CallLimit::Any, &BASH_CALL);
         assert!(tool_calls(&forced).is_empty(), "{forced:?}");
         assert!(
             forced
@@ -5819,7 +5875,7 @@ mod tests {
         let finishes: Vec<_> = forced.iter().filter_map(|d| d.finish_reason).collect();
         assert_eq!(finishes, [FinishReason::Stop]);
 
-        let kept = stream_tool_reply("hermes", Some("Bash"), &BASH_CALL);
+        let kept = stream_tool_reply("hermes", Some("Bash"), protocol::CallLimit::Any, &BASH_CALL);
         assert_eq!(tool_calls(&kept), unforced);
     }
 
@@ -5828,13 +5884,13 @@ mod tests {
     #[test]
     fn a_forced_tool_choice_numbers_the_calls_it_keeps_from_zero() {
         let mut pieces = BASH_CALL.to_vec();
-        pieces.extend([
-            "\n<tool_call>\n",
-            "{\"name\": \"Read\", ",
-            "\"arguments\": {\"file_path\": \"a.rs\"}}",
-            "\n</tool_call>",
-        ]);
-        let unforced = tool_calls(&stream_tool_reply("hermes", None, &pieces));
+        pieces.extend(READ_CALL);
+        let unforced = tool_calls(&stream_tool_reply(
+            "hermes",
+            None,
+            protocol::CallLimit::Any,
+            &pieces,
+        ));
         let read_index = unforced
             .iter()
             .find(|d| d.function_name.as_deref() == Some("Read"))
@@ -5849,8 +5905,55 @@ mod tests {
             .collect();
         assert!(read.iter().any(|d| d.function_arguments.is_some()));
         assert_eq!(
-            tool_calls(&stream_tool_reply("hermes", Some("Read"), &pieces)),
+            tool_calls(&stream_tool_reply(
+                "hermes",
+                Some("Read"),
+                protocol::CallLimit::Any,
+                &pieces
+            )),
             read,
+            "Read's deltas, at index 0"
+        );
+    }
+
+    /// `parallel_tool_calls: false` keeps a reply's first call and drops the rest, whole and
+    /// streamed, as vLLM does (#794). The first call kept, that is: under a forced tool, the first
+    /// call to it, at index 0.
+    #[test]
+    fn parallel_tool_calls_false_keeps_a_replys_first_call() {
+        use protocol::{CallLimit, ToolChoice};
+        let mut pieces = BASH_CALL.to_vec();
+        pieces.extend(READ_CALL);
+        let parser = crate::tool_parser::get_tool_parser("hermes").unwrap();
+        let whole = |choice: Option<ToolChoice>, limit| {
+            let reply = reply_tool_calls(parser.as_ref(), pieces.concat(), &choice, limit);
+            (reply.calls.iter().flatten())
+                .map(|tc| tc.function.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(whole(None, CallLimit::Any), ["Bash", "Read"]);
+        assert_eq!(whole(None, CallLimit::One), ["Bash"]);
+        let read = Some(ToolChoice::Function("Read".into()));
+        assert_eq!(whole(read, CallLimit::One), ["Read"]);
+
+        let streamed =
+            |forced, limit| tool_calls(&stream_tool_reply("hermes", forced, limit, &pieces));
+        let bash = tool_calls(&stream_tool_reply(
+            "hermes",
+            None,
+            CallLimit::Any,
+            &BASH_CALL,
+        ));
+        let both = streamed(None, CallLimit::Any);
+        assert!(
+            both.len() > bash.len(),
+            "unlimited, Read streams after Bash"
+        );
+        assert_eq!(both[..bash.len()], bash[..]);
+        assert_eq!(streamed(None, CallLimit::One), bash, "Bash's deltas alone");
+        assert_eq!(
+            streamed(Some("Read"), CallLimit::One),
+            streamed(Some("Read"), CallLimit::Any),
             "Read's deltas, at index 0"
         );
     }
@@ -5887,7 +5990,12 @@ mod tests {
         );
 
         for forced in [None, Some("Read")] {
-            let calls = tool_calls(&stream_tool_reply("mistral", forced, &pieces));
+            let calls = tool_calls(&stream_tool_reply(
+                "mistral",
+                forced,
+                protocol::CallLimit::Any,
+                &pieces,
+            ));
             assert_eq!(
                 calls[0].function_name.as_deref(),
                 Some("Read"),
@@ -5901,7 +6009,7 @@ mod tests {
             let args: serde_json::Value = serde_json::from_str(&args).unwrap();
             assert_eq!(args, serde_json::json!({"file_path": "a.rs"}), "{forced:?}");
         }
-        let other = stream_tool_reply("mistral", Some("Bash"), &pieces);
+        let other = stream_tool_reply("mistral", Some("Bash"), protocol::CallLimit::Any, &pieces);
         assert!(tool_calls(&other).is_empty(), "{other:?}");
     }
 
