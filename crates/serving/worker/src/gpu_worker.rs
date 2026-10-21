@@ -362,6 +362,10 @@ pub struct MetalWorker {
     /// `tokenizer.json` the first time a grammar request appears.
     #[cfg(feature = "guided-decoding")]
     grammar_factory: Option<std::sync::Arc<scratchy_serving_engine::grammar::LlgParserFactory>>,
+    /// The tokens the engine stops a request on, which every grammar ends on
+    /// (`Worker::set_stop_token_ids`).
+    #[cfg(feature = "guided-decoding")]
+    stop_token_ids: Vec<u32>,
     /// Compiled grammar-mask kernel (forces disallowed logits to -inf
     /// before argmax). Built alongside `argmax_kernels` at load_model.
     #[cfg(feature = "guided-decoding")]
@@ -1049,6 +1053,8 @@ impl MetalWorker {
             #[cfg(feature = "guided-decoding")]
             grammar_factory: None,
             #[cfg(feature = "guided-decoding")]
+            stop_token_ids: Vec::new(),
+            #[cfg(feature = "guided-decoding")]
             grammar_mask_kernels: None,
             #[cfg(feature = "guided-decoding")]
             grammar_pending: None,
@@ -1117,7 +1123,8 @@ impl MetalWorker {
                 return;
             }
         };
-        match scratchy_serving_engine::grammar::build_parser_factory(&bytes) {
+        let stops = &self.stop_token_ids;
+        match scratchy_serving_engine::grammar::build_parser_factory(&bytes, stops) {
             Ok(factory) => {
                 info!("guided-decoding: built grammar parser factory from tokenizer.json");
                 self.grammar_factory = Some(factory);
@@ -4942,6 +4949,19 @@ fn reserve_pinned(
 
 #[cfg(feature = "metal")]
 impl Worker for MetalWorker {
+    /// Kept for the grammar factory, which is built the first time a grammar request appears; one
+    /// built before is dropped, to be built again ending on these. A build without
+    /// `guided-decoding` samples no grammar.
+    fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+        #[cfg(feature = "guided-decoding")]
+        {
+            self.stop_token_ids = stop_token_ids.to_vec();
+            self.grammar_factory = None;
+        }
+        #[cfg(not(feature = "guided-decoding"))]
+        let _ = stop_token_ids;
+    }
+
     fn init_device(&mut self) -> ExecutorResult<()> {
         let device = scratchy_target_metal::detect_device()
             .ok_or_else(|| ExecutorError::WorkerInit("no Metal device available".to_string()))?;

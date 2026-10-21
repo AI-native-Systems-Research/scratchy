@@ -1608,6 +1608,10 @@ pub struct CudaWorker {
     /// Parser factory for grammar-guided decoding (built once from tokenizer).
     #[cfg(feature = "guided-decoding")]
     grammar_factory: Option<std::sync::Arc<scratchy_serving_engine::grammar::LlgParserFactory>>,
+    /// The tokens the engine stops a request on, which every grammar ends on
+    /// (`Worker::set_stop_token_ids`).
+    #[cfg(feature = "guided-decoding")]
+    stop_token_ids: Vec<u32>,
     /// LogitsProcessor pipeline: persistent GPU state, rebuilt only on batch changes.
     logits_pipeline: Option<LogitsProcessorPipeline>,
     /// Grammar mask processor (separate from pipeline — needs backup logits).
@@ -1780,6 +1784,8 @@ impl CudaWorker {
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
             grammar_factory: None,
+            #[cfg(feature = "guided-decoding")]
+            stop_token_ids: Vec::new(),
             logits_pipeline: None,
             grammar_processor: GrammarMaskProcessor::new(),
             allowed_token_ids_processor: AllowedTokenIdsProcessor::new(),
@@ -1962,7 +1968,8 @@ impl CudaWorker {
             }
         };
 
-        match scratchy_serving_engine::grammar::build_parser_factory(&tokenizer_bytes) {
+        let stops = &self.stop_token_ids;
+        match scratchy_serving_engine::grammar::build_parser_factory(&tokenizer_bytes, stops) {
             Ok(factory) => {
                 info!("ScratchyWorker: grammar parser factory built");
                 self.grammar_factory = Some(factory);
@@ -3386,6 +3393,19 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for CudaWorker {
 
 #[cfg(feature = "cuda")]
 impl Worker for CudaWorker {
+    /// Kept for the grammar factory, which is built the first time a grammar request appears; one
+    /// built before is dropped, to be built again ending on these. A build without
+    /// `guided-decoding` samples no grammar.
+    fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+        #[cfg(feature = "guided-decoding")]
+        {
+            self.stop_token_ids = stop_token_ids.to_vec();
+            self.grammar_factory = None;
+        }
+        #[cfg(not(feature = "guided-decoding"))]
+        let _ = stop_token_ids;
+    }
+
     /// CUDA now implements the grouped SWA KV path: the executor builds
     /// per-KV-group block tables + slot mappings (`build_attention_tensors`),
     /// threads them through `ForwardCtx::{block_tables, slot_mappings}`, and

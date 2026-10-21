@@ -1556,6 +1556,9 @@ mod tests {
     }
 
     impl Executor for ScriptedExecutor {
+        /// Its script samples no grammar.
+        fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
+
         fn execute_model(
             &mut self,
             scheduler_output: &SchedulerOutput,
