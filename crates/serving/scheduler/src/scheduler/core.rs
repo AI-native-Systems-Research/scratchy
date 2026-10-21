@@ -72,11 +72,8 @@ pub struct RecurrentPrefixPlan {
 // ---------------------------------------------------------------------------
 
 /// Trait that abstracts the KV cache manager operations needed by the
-/// scheduler.
-///
-/// The real `KVCacheManager` (in the `kv_cache_manager` module) will
-/// implement this trait. For testing and initial bring-up, a simple
-/// block-counting implementation is provided.
+/// scheduler. Implemented by [`SimpleBlockTracker`], the scheduler's KV block
+/// tracker.
 pub trait KVCacheManagerOps: Send {
     /// Try to allocate blocks for a request.
     ///
@@ -216,7 +213,7 @@ pub trait KVCacheManagerOps: Send {
 }
 
 // ---------------------------------------------------------------------------
-// SimpleBlockTracker -- a minimal KV cache manager for initial bring-up
+// SimpleBlockTracker -- the scheduler's KV block tracker
 // ---------------------------------------------------------------------------
 
 /// A block tracker that satisfies [`KVCacheManagerOps`].
@@ -3217,7 +3214,7 @@ impl Scheduler {
 
     /// ⭐ RECORD WHAT THE WORKER SAID ITS KV LOOKS LIKE for one request — the slots to allocate blocks
     /// for and the prefix that may be hashed into the cache. Both are read by
-    /// `KVCacheManager::allocate_slots` on the NEXT step.
+    /// [`SimpleBlockTracker`]'s `allocate_slots` on the NEXT step.
     ///
     /// Written into BOTH the canonical map and the `running` copy, for the same reason
     /// [`append_output_tokens`](Self::append_output_tokens) is: the two are separate `Request` values and
