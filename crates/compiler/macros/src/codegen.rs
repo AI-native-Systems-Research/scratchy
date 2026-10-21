@@ -7670,8 +7670,7 @@ fn metal_vocab_suffix(
         scratchy_forward_compiler::LentWeight::LmHead,
     )?;
     let method = &model.quantization.as_ref()?.method;
-    let (group, bits) =
-        crate::quantization::affine_role_widths(program, method, &lm_head, None)?;
+    let (group, bits) = crate::quantization::affine_role_widths(program, method, &lm_head, None)?;
     let fits = |v: u64| u32::try_from(v).expect("a vocabulary fits u32");
     Some(scratchy_target_metal::off_tape::VocabSuffix {
         prefix: fits(prefix),
