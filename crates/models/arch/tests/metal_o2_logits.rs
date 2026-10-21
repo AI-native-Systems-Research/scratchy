@@ -93,8 +93,8 @@ const PROMPTS: &[&str] = &[
 ];
 
 /// One prompt of 65-512 tokens: with [`LONG_BUCKET_CAP`] its prefill runs in bucket 512, the
-/// smallest bucket whose baked M5 tapes carry the lm_head slice (`GatherLastToken` → qmv →
-/// `ScatterFirstToLastRow`); buckets ≤ 64 compact every row's logits on M5 instead.
+/// smallest bucket whose baked M5 tapes carry the lm_head slice (`GatherSampledRows` → qmv →
+/// `PutSampledRowsBack`); buckets ≤ 64 compact every row's logits on M5 instead.
 /// Compiled with the one case that reads it.
 #[cfg(feature = "llama-3.2-3b")]
 const LONG_PROMPTS: &[&str] = &[

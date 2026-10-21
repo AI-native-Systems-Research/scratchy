@@ -1902,24 +1902,11 @@ impl Recording<'_> {
         ))
     }
 
-    /// Whether op `i` is a row-wise op of the result's logit tail — a soft cap or a scale over the
-    /// sampled rows' construct, through the tail before it — whose rows are the sampled rows'
+    /// Whether op `i` is of the logit tail the shared pass left over its sampled rows' construct
+    /// ([`scratchy_subtile::sample_rows::sampled_logit_tail`]), whose rows are the sampled rows'
     /// logits alone.
     fn in_logit_tail(&self, i: usize) -> bool {
-        let tail = |j: usize| {
-            matches!(
-                self.op(j),
-                SubOp::TanhSoftCap { .. } | SubOp::ScalarMul { .. }
-            )
-        };
-        let mut j = i;
-        while tail(j) {
-            match self.step_arg(j, 0) {
-                Ok(a) => j = a,
-                Err(_) => return false,
-            }
-        }
-        j != i && matches!(self.op(j), SubOp::AllRowsMatmul)
+        scratchy_subtile::sample_rows::sampled_logit_tail(&self.l.input).contains(&i)
     }
 
     /// A step no fold touches, lowered on its own.

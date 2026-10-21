@@ -1155,7 +1155,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         bucket: usize,
         num_tokens: u32,
         num_seqs: u32,
-        sampled_rows: u32,
+        sampled_rows: crate::tape::ids::SampledRowCount,
         reads: super::ForwardReads,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
     ) -> Result<(), WorkerError> {
@@ -1173,7 +1173,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         bucket: usize,
         num_tokens: u32,
         num_seqs: u32,
-        sampled_rows: u32,
+        sampled_rows: crate::tape::ids::SampledRowCount,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         range: std::ops::Range<usize>,
     ) -> Result<(), WorkerError> {
@@ -1193,7 +1193,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         bucket: usize,
         num_tokens: u32,
         num_seqs: u32,
-        sampled_rows: u32,
+        sampled_rows: crate::tape::ids::SampledRowCount,
         reads: super::ForwardReads,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         range: Option<std::ops::Range<usize>>,
@@ -1501,7 +1501,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         K::FusedGateUpSiluMul | K::SiluMul | K::GeluMul | K::AffineGatherW4a8ActQuant => {
             KernelKind::Mlp
         }
-        K::GatherLastToken | K::ScatterFirstToLastRow | K::Softmax | K::SliceTrailingColsU32 => {
+        K::GatherSampledRows | K::PutSampledRowsBack | K::Softmax | K::SliceTrailingColsU32 => {
             KernelKind::Sample
         }
         K::VisionLayerNorm | K::VisionRope | K::VisionVarlenAttn | K::AvgPool2d | K::VisionGelu => {
@@ -1983,8 +1983,10 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
     let decode_step = num_tokens == num_seqs;
     match gate {
         None => true,
-        Some(super::lowered::RuntimeGate::UnlessEveryRowSampled) => sampled_rows < num_tokens,
-        Some(super::lowered::RuntimeGate::OnlyIfEveryRowSampled) => sampled_rows >= num_tokens,
+        Some(super::lowered::RuntimeGate::UnlessEveryRowSampled) => sampled_rows.get() < num_tokens,
+        Some(super::lowered::RuntimeGate::OnlyIfEveryRowSampled) => {
+            sampled_rows.get() >= num_tokens
+        }
         Some(super::lowered::RuntimeGate::OnlyIfDecodeStep) => decode_step,
         Some(super::lowered::RuntimeGate::UnlessDecodeStep) => !decode_step,
         Some(super::lowered::RuntimeGate::OnlyIfSmallMTokens) => {
@@ -2016,7 +2018,7 @@ pub struct StepFacts {
     pub num_seqs: u32,
     /// The rows the step samples (its `SampleIndices`' length): one a sequence, every row of a
     /// sequence verifying drafts.
-    pub sampled_rows: u32,
+    pub sampled_rows: crate::tape::ids::SampledRowCount,
     /// Some sequence's block table has an unrotated (bit-31, span) block.
     pub unrotated_blocks: bool,
     /// Every sequence's Gated-DeltaNet step is plain: no replay, no records.
@@ -2045,23 +2047,20 @@ fn scale_tg_for_num_tokens(
     let Some(s) = scaling else {
         return tg;
     };
-    let bm = s.bucket_m.get().max(1) as u64;
-    let n = (step.num_tokens.max(1) as u64).min(bm);
     let slot = match s.axis {
         super::lowered::MScaleAxis::X => &mut tg.width,
         super::lowered::MScaleAxis::Y => &mut tg.height,
         super::lowered::MScaleAxis::Z => &mut tg.depth,
     };
-    // new = ceil(baseline * n / bucket_m). Clamped above to the
-    // baseline so accidental num_tokens > bucket_m can't grow the
-    // grid past what was baked.
-    let baseline = *slot as u64;
-    let scaled = baseline.saturating_mul(n).div_ceil(bm);
-    *slot = scaled as usize;
+    // new = ceil(baseline * n / bucket_m), n capped at the bucket so an
+    // accidental num_tokens > bucket_m can't grow the grid past what was
+    // baked — the count the logits buffer's rows are sized by too.
+    let live = u64::from(step.num_tokens.max(1));
+    *slot = super::lowered::scaled_groups(*slot as u64, live, u64::from(s.bucket_m.get())) as usize;
     // `set_axis`: SET (not scale) the chosen axis to the live count (`SetAxis`).
     let set = match s.set_axis {
         Some(super::lowered::SetAxis::Seqs(axis)) => Some((axis, step.num_seqs)),
-        Some(super::lowered::SetAxis::SampledRows(axis)) => Some((axis, step.sampled_rows)),
+        Some(super::lowered::SetAxis::SampledRows(axis)) => Some((axis, step.sampled_rows.get())),
         None => None,
     };
     if let Some((axis, count)) = set {
@@ -2174,7 +2173,7 @@ mod tests {
         let step = |num_tokens, num_seqs, unrotated_blocks| StepFacts {
             num_tokens,
             num_seqs,
-            sampled_rows: num_seqs,
+            sampled_rows: crate::tape::ids::SampledRowCount(num_seqs),
             unrotated_blocks,
             gdn_plain: true,
             gdn_plain_rows: true,
@@ -2258,7 +2257,7 @@ mod tests {
         use super::super::lowered::RuntimeGate::{OnlyIfEveryRowSampled, UnlessEveryRowSampled};
         let lm_head = |tokens, seqs, sampled| {
             let s = StepFacts {
-                sampled_rows: sampled,
+                sampled_rows: crate::tape::ids::SampledRowCount(sampled),
                 ..step(tokens, seqs, false)
             };
             let slice = gate_matches(Some(UnlessEveryRowSampled), s);
@@ -2336,11 +2335,12 @@ mod tests {
             })
             .collect();
         let num_sampled = sampled.len();
-        let width = 1024u32;
+        let row_stride = crate::tape::ids::RowStride(1024);
+        let width = row_stride.get();
         let bucket_m = 512;
         let slot = crate::tape::ids::ArenaSlotIdx(0);
-        let gather = crate::tape::lowering::gather_last_token_command(&p, slot, width);
-        let scatter = crate::tape::lowering::scatter_first_to_last_row_command(&p, slot, width);
+        let gather = crate::tape::lowering::gather_sampled_rows_command(&p, slot, row_stride);
+        let scatter = crate::tape::lowering::put_sampled_rows_back_command(&p, slot, row_stride);
         // `(row, the row it holds)`. Gather: row i holds sampled row i.
         // Scatter: sampled row i holds row i. Both: every row holds itself.
         let at = |i: usize| sampled[i] as usize;
@@ -2365,7 +2365,7 @@ mod tests {
             let step = StepFacts {
                 num_tokens: num_tokens as u32,
                 num_seqs: q_lens.len() as u32,
-                sampled_rows: num_sampled as u32,
+                sampled_rows: crate::tape::ids::SampledRowCount(num_sampled as u32),
                 unrotated_blocks: false,
                 gdn_plain: true,
                 gdn_plain_rows: true,

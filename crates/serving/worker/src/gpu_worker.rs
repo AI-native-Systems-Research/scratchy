@@ -6932,7 +6932,8 @@ impl Worker for MetalWorker {
         let sampled_rows = ::scratchy_serving_engine::spec_decode::SampledRows::of(
             &cu_seqlens_u32[..=num_reqs],
             |i| !prepared.req_inputs[i].spec_token_ids.is_empty(),
-        );
+        )
+        .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
         let req_ids_in_order: Vec<String> = attn.req_ids.clone();
         let q_lens: Vec<usize> = attn.q_lens.clone();
 

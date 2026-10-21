@@ -154,31 +154,55 @@ pub struct ForwardArgmaxRequest<'a> {
 /// sampled row `j` of sequence `i` is step row `cu_seqlens_q[i + 1] - (count_i - j)`. The logits
 /// the forward leaves, and every row read off them (argmax, sampler, grammar mask), are these
 /// rows', in order.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SampledRows {
     /// Each sampled row's step row, ascending (Python vLLM's `logits_indices`).
     rows: Vec<u32>,
-    /// Cumulative sampled rows per sequence, `num_seqs + 1` long: sequence `i`'s are
-    /// `cu[i]..cu[i + 1]`.
+    /// Cumulative sampled rows per sequence, `num_seqs + 1` long, strictly ascending: sequence
+    /// `i`'s are `cu[i]..cu[i + 1]`, at least one.
     cu: Vec<u32>,
 }
 
+/// A step's sequence of no rows: it has no last row to sample, so no step holds one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmptySequence {
+    pub seq: usize,
+}
+
+impl std::fmt::Display for EmptySequence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sequence {} of the step holds no rows to sample",
+            self.seq
+        )
+    }
+}
+
+impl std::error::Error for EmptySequence {}
+
 impl SampledRows {
     /// The sampled rows of the step whose sequences' rows `cu_seqlens_q` bounds: every row of a
-    /// sequence `every_row(i)` holds, the last of any other. A sequence of no rows samples none.
-    pub fn of(cu_seqlens_q: &[u32], every_row: impl Fn(usize) -> bool) -> Self {
+    /// sequence `every_row(i)` holds, the last of any other. Refused for a sequence of no rows.
+    pub fn of(
+        cu_seqlens_q: &[u32],
+        every_row: impl Fn(usize) -> bool,
+    ) -> Result<Self, EmptySequence> {
         let mut rows = Vec::new();
         let mut cu = vec![0];
         for (i, seq) in cu_seqlens_q.windows(2).enumerate() {
             let (start, end) = (seq[0], seq[1]);
+            if end <= start {
+                return Err(EmptySequence { seq: i });
+            }
             let first = match every_row(i) {
                 true => start,
-                false => end.saturating_sub(1).max(start),
+                false => end - 1,
             };
             rows.extend(first..end);
             cu.push(rows.len() as u32);
         }
-        Self { rows, cu }
+        Ok(Self { rows, cu })
     }
 
     /// Each sampled row's step row, ascending.
@@ -324,18 +348,18 @@ pub trait SpecDecodeBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::SampledRows;
+    use super::{EmptySequence, SampledRows};
 
-    /// A step of a decode (row 0), a verify of three rows (1..=3), a prompt chunk (4..=9) and a
-    /// sequence of no rows: the decode and the chunk sample their last rows, the verify its
-    /// every one, the empty sequence none — ascending, each sequence's at its own offsets.
+    /// A step of a decode (row 0), a verify of three rows (1..=3) and a prompt chunk (4..=9): the
+    /// decode and the chunk sample their last rows, the verify its every one — ascending, each
+    /// sequence's at its own offsets.
     #[test]
     fn a_step_samples_each_sequence_s_last_rows() {
-        let sampled = SampledRows::of(&[0, 1, 4, 10, 10], |i| i == 1);
+        let sampled = SampledRows::of(&[0, 1, 4, 10], |i| i == 1).expect("no empty sequence");
         assert_eq!(sampled.rows(), [0, 1, 2, 3, 9]);
         assert_eq!(sampled.len(), 5);
-        let seqs: Vec<_> = (0..4).map(|i| sampled.of_seq(i)).collect();
-        assert_eq!(seqs, [0..1, 1..4, 4..5, 5..5]);
+        let seqs: Vec<_> = (0..3).map(|i| sampled.of_seq(i)).collect();
+        assert_eq!(seqs, [0..1, 1..4, 4..5]);
         let last: Vec<usize> = (0..3).map(|i| sampled.last_of(i)).collect();
         assert_eq!(last, [0, 3, 4]);
         // A row's index among the sampled rows; a row its sequence does not sample has none.
@@ -343,5 +367,15 @@ mod tests {
         assert_eq!(sampled.index(2, 9), Some(4));
         assert_eq!(sampled.index(2, 8), None);
         assert_eq!(sampled.index(0, 1), None);
+    }
+
+    /// A sequence of no rows has no last row to sample, whether or not it verifies drafts: the
+    /// step is refused, naming it.
+    #[test]
+    fn a_sequence_of_no_rows_is_refused() {
+        for every_row in [false, true] {
+            let refused = SampledRows::of(&[0, 1, 1, 4], |_| every_row);
+            assert_eq!(refused, Err(EmptySequence { seq: 1 }));
+        }
     }
 }

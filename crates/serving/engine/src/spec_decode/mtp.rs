@@ -795,7 +795,7 @@ mod tests {
                 block_ids: vec![vec![3], vec![5]],
                 history_a: (500..511).collect(),
                 history_b: (700..708).collect(),
-                sampled: SampledRows::of(&[0, 4, 7], |i| i == 0),
+                sampled: SampledRows::of(&[0, 4, 7], |i| i == 0).expect("no empty sequence"),
             }
         }
 
@@ -851,7 +851,7 @@ mod tests {
                 req_ids: vec!["a".into(), "b".into(), "c".into()],
                 block_ids: vec![vec![3], vec![5], vec![7]],
                 history_c: (800..805).collect(),
-                sampled: SampledRows::of(&[0, 4, 7, 8], |i| i == 0),
+                sampled: SampledRows::of(&[0, 4, 7, 8], |i| i == 0).expect("no empty sequence"),
             }
         }
 

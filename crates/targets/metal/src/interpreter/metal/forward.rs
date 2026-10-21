@@ -150,13 +150,27 @@ impl<'a> ForwardInputs<'a> {
     /// every row, a step that names no sequences being one token each.
     pub fn sampled_rows(&self) -> std::borrow::Cow<'a, [u32]> {
         use std::borrow::Cow;
-        match (self.sampled_rows, self.cu_seqlens_q) {
-            (Some(rows), _) => Cow::Borrowed(rows),
-            (None, Some(cu)) => {
-                let last = cu.windows(2).filter(|w| w[1] > w[0]).map(|w| w[1] - 1);
-                Cow::Owned(last.collect())
-            }
-            (None, None) => Cow::Owned((0..self.num_tokens).collect()),
+        match self.sampled_rows {
+            Some(rows) => Cow::Borrowed(rows),
+            None => Cow::Owned(Self::last_rows(self.cu_seqlens_q, self.num_tokens)),
+        }
+    }
+
+    /// How many rows the forward samples ([`Self::sampled_rows`]).
+    pub fn sampled_row_count(&self) -> crate::tape::ids::SampledRowCount {
+        crate::tape::ids::SampledRowCount(self.sampled_rows().len() as u32)
+    }
+
+    /// Each sequence `cu_seqlens_q` bounds' last row — every row of `num_tokens`, a step that
+    /// names no sequences being one token each: the rows a forward samples when its caller names
+    /// none. A sequence of no rows has none.
+    pub fn last_rows(cu_seqlens_q: Option<&[u32]>, num_tokens: u32) -> Vec<u32> {
+        match cu_seqlens_q {
+            Some(cu) => (cu.windows(2))
+                .filter(|w| w[1] > w[0])
+                .map(|w| w[1] - 1)
+                .collect(),
+            None => (0..num_tokens).collect(),
         }
     }
 }
@@ -501,6 +515,10 @@ pub enum ForwardError {
     /// through: its caller grows them first (`SparseRegistry::reach`), or the forward would read
     /// un-wired memory.
     KvNotMapped { block: u32, mapped: usize },
+    /// A step samples `sampled` rows, more than its bucket's logits buffer holds (`holds`: the
+    /// rows a step samples at most, `GpuDevice::max_decode_rows`, as the tape writes them): its
+    /// logits would be written past the buffer.
+    TooManySampledRows { sampled: usize, holds: u32 },
 }
 
 impl std::fmt::Display for ForwardError {
@@ -546,6 +564,11 @@ impl std::fmt::Display for ForwardError {
                 f,
                 "MetalWorkerPool::forward: block {block} is past the {mapped} blocks the \
                  TurboQuant KV stores are mapped through (`SparseRegistry::reach` them first)"
+            ),
+            Self::TooManySampledRows { sampled, holds } => write!(
+                f,
+                "MetalWorkerPool::forward: the step samples {sampled} rows, past the {holds} \
+                 its bucket's logits buffer holds"
             ),
         }
     }

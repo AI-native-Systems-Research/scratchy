@@ -1018,6 +1018,18 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         })
     }
 
+    /// [`Self::pick_bucket`] for `inputs`' step, which its bucket's logits buffer must hold: a step
+    /// sampling more rows than it does would write its logits past the buffer.
+    pub fn pick_bucket_for(&self, inputs: &ForwardInputs<'_>) -> Result<usize, ForwardError> {
+        let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
+        let holds = self.bucket_tapes[bucket_idx].logits_slot_rows(self.decode_rows);
+        let sampled = inputs.sampled_rows().len();
+        if sampled > holds as usize {
+            return Err(ForwardError::TooManySampledRows { sampled, holds });
+        }
+        Ok(bucket_idx)
+    }
+
     /// Lazily build the pool's MTL4 surface (queue + allocator +
     /// shared event). Panics if MTL4 is unavailable on this host
     /// (requires macOS 15+ on Apple Family 7+).
@@ -1066,7 +1078,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         bucket_idx: usize,
         num_tokens: usize,
         num_seqs: u32,
-        sampled_rows: u32,
+        sampled_rows: crate::tape::ids::SampledRowCount,
         reads: ForwardReads,
         tail: Option<F>,
         writes: &InputWrites,
@@ -1304,7 +1316,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         bucket_idx: usize,
         num_tokens: usize,
         num_seqs: u32,
-        sampled_rows: u32,
+        sampled_rows: crate::tape::ids::SampledRowCount,
         range: std::ops::Range<usize>,
         writes: Option<&InputWrites>,
     ) -> Result<(), ForwardError> {
@@ -1417,9 +1429,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             usize,
         ) -> Result<(), ForwardError>,
     {
-        let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
+        let bucket_idx = self.pick_bucket_for(inputs)?;
         let num_seqs = num_seqs(inputs);
-        let sampled_rows = inputs.sampled_rows().len() as u32;
+        let sampled_rows = inputs.sampled_row_count();
         self.attach_residency();
 
         let guard = self.checkout()?;
@@ -1754,7 +1766,7 @@ impl<W: CanonicalParams> Onto<'_, W> {
             "a forward played in another's command buffer is waited for with it"
         );
         let pool = self.guard.pool;
-        let bucket_idx = pool.pick_bucket(inputs.num_tokens)?;
+        let bucket_idx = pool.pick_bucket_for(inputs)?;
         assert!(
             !self.guard.worker.bucket_has_avg_pool_2d(bucket_idx),
             "a serialized forward runs in command buffers of its own"
@@ -1785,7 +1797,7 @@ impl<W: CanonicalParams> Onto<'_, W> {
                 bucket_idx,
                 inputs.num_tokens,
                 num_seqs(inputs),
-                inputs.sampled_rows().len() as u32,
+                inputs.sampled_row_count(),
                 inputs.reads,
                 enc,
             )
@@ -2141,9 +2153,7 @@ fn write_runtime_inputs(
             return Err(ForwardError::KvNotMapped { block, mapped });
         }
     }
-    // Tell the gather kernel (used right before lm_head) what the
-    // actual num_tokens of this forward is so it can pick the
-    // last-token source row.
+    // The forward's actual num_tokens, for a kernel that reads M at runtime.
     write(
         "num_tokens",
         &runtime.num_tokens_u32,

@@ -14463,6 +14463,12 @@ pub fn emit_model(
             stem,
             m,
             buckets: &buckets,
+            rows: match layout {
+                BackboneLayout::Decoder { .. } => {
+                    scratchy_subtile::sample_rows::ResultRows::Sampled
+                }
+                BackboneLayout::Encoder => scratchy_subtile::sample_rows::ResultRows::Every,
+            },
         };
         let lowered = mc3::lower_canonical(&l, &facts, mc, at, &mut metal_sources)
             .unwrap_or_else(|e| panic!("[m2-flip] {stem} m={m}: {e}"));
@@ -14746,14 +14752,15 @@ pub fn emit_model(
         // The logits: the terminal tile and the in-place logit tail under it, back to the lm_head
         // — the terminal slot's chain. A forward leaves only the rows its step samples there, so
         // they take that slot's bytes a row (`MetalBucketSpec::logits_row_bytes`), its rows
-        // counted at load; an encoder's terminal rows are every row.
+        // counted at load; an encoder's terminal rows are every row, as are every row of a
+        // backend that samples none (metal alone compacts them).
         // A tile output the coloring did not register (a refused canonical's empty map, an input
         // the tape's arena keys by another tile) is in no slot, so not the terminal's.
         let in_terminal = |id: TileId, slot: u8| {
             (slots_b.iter()).any(|(at, colour)| at == (id, slot) && colour == *terminal_slot_b)
         };
         let logits_tiles: Vec<(TileId, u8)> = match layout {
-            BackboneLayout::Decoder { .. } => {
+            BackboneLayout::Decoder { .. } if cfg!(feature = "metal") => {
                 let mut chain = vec![(last_node_id, 0u8)];
                 while let Some(&(tile, _)) = chain.last() {
                     let under = fuf.get(tile).inputs.iter().find_map(|i| match *i {
@@ -14769,7 +14776,7 @@ pub fn emit_model(
                 }
                 chain
             }
-            BackboneLayout::Encoder => Vec::new(),
+            BackboneLayout::Decoder { .. } | BackboneLayout::Encoder => Vec::new(),
         };
         let mut bucket_arena_bytes: Vec<u64> = vec![0u64; *num_slots_b as usize];
         let mut logits_row_bytes: u64 = 0;
@@ -15735,12 +15742,24 @@ pub fn emit_model(
                 })
                 .collect();
 
-            // The rows the forward samples (`None`: each sequence's last): the
-            // lm_head leaves their logits at the front of its output, in order.
-            let sampled_rows = ctx.sampled_rows.as_ref().map(|view| {
-                let raw = view.as_raw();
-                ::std::slice::from_raw_parts(raw.raw_ptr() as *const u32, raw.numel())
-            });
+            // The rows the forward samples (`None`: each sequence's last), resolved once here
+            // for every reader of the inputs: the lm_head leaves their logits at the front of
+            // its output, in order.
+            let last_rows;
+            let sampled_rows: &[u32] = match ctx.sampled_rows.as_ref() {
+                ::std::option::Option::Some(view) => {
+                    let raw = view.as_raw();
+                    ::std::slice::from_raw_parts(raw.raw_ptr() as *const u32, raw.numel())
+                }
+                ::std::option::Option::None => {
+                    last_rows = ::scratchy_target_metal::interpreter::metal::ForwardInputs::last_rows(
+                        cu_seqlens_q,
+                        num_tokens as u32,
+                    );
+                    &last_rows
+                }
+            };
+            let sampled_rows = ::std::option::Option::Some(sampled_rows);
 
             // GDN per-forward indices (hybrid arches): read from ctx's
             // host-visible TensorViews (a `GdnSeqSlots` record — 6 i32s —
@@ -16113,8 +16132,8 @@ pub fn emit_model(
                 // Pre-pick the bucket from iter-0 num_tokens. The chain
                 // shape is constant across iters so this index is reused.
                 let bucket_idx = pool
-                    .pick_bucket(inputs.num_tokens)
-                    .map_err(|e| format!("MetalWorkerPool::pick_bucket: {e}"))?;
+                    .pick_bucket_for(inputs)
+                    .map_err(|e| format!("MetalWorkerPool::pick_bucket_for: {e}"))?;
                 let terminal_slot =
                     METAL_BUCKETS[bucket_idx].terminal_slot as usize;
                 let vocab = METAL_VOCAB_SIZE as u32;
@@ -16150,7 +16169,7 @@ pub fn emit_model(
                                         self.bucket_idx,
                                         num_tokens,
                                         num_seqs,
-                                        sampled_rows,
+                                        ::scratchy_target_metal::tape::ids::SampledRowCount(sampled_rows),
                                         ::scratchy_target_metal::interpreter::metal::ForwardReads::Outputs,
                                         encoder,
                                     )

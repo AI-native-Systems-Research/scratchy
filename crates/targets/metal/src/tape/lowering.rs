@@ -17,7 +17,7 @@
 //! compile here (E0004) until its arm exists.
 
 use crate::tape::ids::ArenaSlotIdx as Slot;
-use crate::tape::ids::{QSize, SourceIx};
+use crate::tape::ids::{QSize, RowStride, SourceIx};
 use crate::tape::kernel_bindings::{CosSinTable, source};
 use crate::tape::kernel_constants::{QueryRows, norm_threads};
 use crate::tape::model_consts::MetalModelConsts;
@@ -56,7 +56,7 @@ use crate::specialized_pipeline_cache::ConstantValue;
 
 use crate::tape::lowered::{
     Binding, DispatchShape, Fence, GatedCommand, GemmDims, IntoBaked, KernelId, LogitsRows,
-    LoweredCommand, LoweredMetalTape, LoweringError, MScaleAxis, MScaling, MetalDtype,
+    LoweredCommand, LoweredMetalTape, LoweringError, MScaleAxis, MScaling, MetalDtype, RowTile,
     RuntimeBindingKind, SetAxis, WeightTensor, baked, baked_commands,
 };
 
@@ -284,10 +284,13 @@ fn sample_rows(
         (None, R::Matmul) => (plain, Some(LogitsRows::Bucket)),
         (None, R::Gather | R::AllRows) => (Vec::new(), None),
         (None, R::Scatter) => {
-            let compact = gather_last_token_command(p, output, n.get());
+            let compact = gather_sampled_rows_command(p, output, RowStride(n.get()));
             (sliced(compact), Some(LogitsRows::Bucket))
         }
-        (Some(_), R::Gather) => (sliced(gather_last_token_command(p, input, k.get())), None),
+        (Some(_), R::Gather) => (
+            sliced(gather_sampled_rows_command(p, input, RowStride(k.get()))),
+            None,
+        ),
         (Some(a), R::Matmul) => {
             let x = Some(SetAxis::SampledRows(crate::tape::lowered::MScaleAxis::X));
             let ix = w.of(WeightKind::Linear, 0)?;
@@ -303,13 +306,11 @@ fn sample_rows(
                 /*wide_ok=*/ false,
                 Vec::new(),
             );
-            let one = LogitsRows::Sampled {
-                tile: super::ids::RowTile(1),
-            };
+            let one = LogitsRows::Sampled { tile: RowTile::Row };
             (sliced(qmv), Some(one))
         }
         (Some(_), R::Scatter) => {
-            let back = scatter_first_to_last_row_command(p, input, k.get());
+            let back = put_sampled_rows_back_command(p, input, RowStride(k.get()));
             (sliced(back), None)
         }
         (Some(_), R::AllRows) => {
@@ -322,40 +323,37 @@ fn sample_rows(
     })
 }
 
-/// What `commands` write of `slot` — the logits of a step that samples every row it runs:
-/// each command's rows a threadgroup along its scaled row axis, the step's rows rounded up to a
-/// whole one ([`LogitsRows::Sampled`]); the bucket's rows ([`LogitsRows::Bucket`]) when a command
-/// writing it scales no row axis, sets one, or tiles the bucket's rows unevenly.
+/// What `commands` write of `slot` — the logits of a step that samples every row it runs, its
+/// grid scaled by them: each command's kernel tile ([`RowTile::of`]) where its grid tiles the
+/// bucket's rows in it (`⌈bucket_m / tile⌉` threadgroups on the scaled axis), the largest of them
+/// ([`LogitsRows::Sampled`]); the bucket's rows ([`LogitsRows::Bucket`]) when a command writing it
+/// has no tile in the table, scales no row axis, sets one, or tiles otherwise.
 fn rows_written(commands: &[GatedCommand], slot: Slot) -> LogitsRows {
     let binds = |c: &&GatedCommand| {
         (c.command.bindings.iter())
             .any(|b| matches!(*b, Binding::ArenaSlot { slot: s, .. } if s == slot.get()))
     };
     let tiles = commands.iter().filter(binds).map(|c| {
+        let tile = RowTile::of(c.command.kernel)?;
+        let Some(MScaling {
+            axis,
+            bucket_m,
+            set_axis: None,
+        }) = c.command.dispatch.m_scaling
+        else {
+            return None;
+        };
         let (x, y, z) = c.command.dispatch.threadgroups;
-        match c.command.dispatch.m_scaling {
-            Some(MScaling {
-                axis,
-                bucket_m,
-                set_axis: None,
-            }) => {
-                let groups = match axis {
-                    MScaleAxis::X => x,
-                    MScaleAxis::Y => y,
-                    MScaleAxis::Z => z,
-                };
-                let rows = bucket_m.get();
-                (groups > 0 && rows.is_multiple_of(groups)).then(|| rows / groups)
-            }
-            Some(MScaling {
-                set_axis: Some(_), ..
-            })
-            | None => None,
-        }
+        let groups = match axis {
+            MScaleAxis::X => x,
+            MScaleAxis::Y => y,
+            MScaleAxis::Z => z,
+        };
+        (groups == bucket_m.get().div_ceil(tile.get())).then_some(tile)
     });
-    match tiles.collect::<Option<Vec<u32>>>() {
+    match tiles.collect::<Option<Vec<RowTile>>>() {
         Some(tiles) => LogitsRows::Sampled {
-            tile: super::ids::RowTile(tiles.into_iter().max().unwrap_or(1)),
+            tile: tiles.into_iter().max().unwrap_or(RowTile::Row),
         },
         None => LogitsRows::Bucket,
     }
@@ -367,8 +365,7 @@ fn writes_logits(tape: Option<LogitsRows>, step: Option<LogitsRows>) -> Option<L
     match (tape, step) {
         (Some(LogitsRows::Bucket), _) | (_, Some(LogitsRows::Bucket)) => Some(LogitsRows::Bucket),
         (Some(LogitsRows::Sampled { tile: a }), Some(LogitsRows::Sampled { tile: b })) => {
-            let tile = super::ids::RowTile(a.get().max(b.get()));
-            Some(LogitsRows::Sampled { tile })
+            Some(LogitsRows::Sampled { tile: a.max(b) })
         }
         (rows, None) | (None, rows) => rows,
     }
@@ -524,45 +521,45 @@ fn qmv_end_weights(
     Ok(v)
 }
 
-/// The sampled rows' gather and scatter kernels, each with its f16 and bf16 symbols.
+/// The sampled rows' gather and put-back kernels, each with its f16 and bf16 symbols.
 const GATHER: (KernelId, [&str; 2]) = (
-    KernelId::GatherLastToken,
+    KernelId::GatherSampledRows,
     [
-        "gather_last_token_f16_specialized",
-        "gather_last_token_bf16_specialized",
+        "gather_sampled_rows_f16_specialized",
+        "gather_sampled_rows_bf16_specialized",
     ],
 );
-const SCATTER: (KernelId, [&str; 2]) = (
-    KernelId::ScatterFirstToLastRow,
+const PUT_BACK: (KernelId, [&str; 2]) = (
+    KernelId::PutSampledRowsBack,
     [
-        "scatter_first_to_last_row_f16_specialized",
-        "scatter_first_to_last_row_bf16_specialized",
+        "put_sampled_rows_back_f16_specialized",
+        "put_sampled_rows_back_bf16_specialized",
     ],
 );
 
-/// The step's sampled rows of `slot`, `width` wide, to its front, in order, in place: row `i`
-/// swapped with sampled row `i` — the lm_head slice's input, or every row's logits compacted.
-pub(crate) fn gather_last_token_command(
+/// The step's sampled rows of `slot` to its front, in order, in place: row `i` swapped with
+/// sampled row `i` — the lm_head slice's input, or every row's logits compacted.
+pub(crate) fn gather_sampled_rows_command(
     p: &MetalModelConsts,
     slot: Slot,
-    width: u32,
+    row_stride: RowStride,
 ) -> LoweredCommand {
-    sample_slice_command(p, slot, width, GATHER)
+    sample_slice_command(p, slot, row_stride, GATHER)
 }
 
 /// The gather undone over `slot`, in place: row `i` swapped back to sampled row `i`.
-pub(crate) fn scatter_first_to_last_row_command(
+pub(crate) fn put_sampled_rows_back_command(
     p: &MetalModelConsts,
     slot: Slot,
-    width: u32,
+    row_stride: RowStride,
 ) -> LoweredCommand {
-    sample_slice_command(p, slot, width, SCATTER)
+    sample_slice_command(p, slot, row_stride, PUT_BACK)
 }
 
 fn sample_slice_command(
     p: &MetalModelConsts,
     slot: Slot,
-    row_stride: u32,
+    row_stride: RowStride,
     (kernel, [f16_symbol, bf16_symbol]): (KernelId, [&'static str; 2]),
 ) -> LoweredCommand {
     // One thread per column, walking the sampled rows in order: the rows
@@ -570,14 +567,11 @@ fn sample_slice_command(
     const THREADS_PER_TG: u32 = 256;
     LoweredCommand {
         kernel,
-        library: "gather_last_token",
+        library: "sample_rows",
         function: pick_specialized_symbol(f16_symbol, bf16_symbol, p.metal_dtype),
-        constants: super::kernel_constants::GatherLastTokenConstants {
-            row_stride: super::ids::HiddenSize(row_stride),
-        }
-        .into_baked(),
+        constants: super::kernel_constants::SampleRowsConstants { row_stride }.into_baked(),
         dispatch: DispatchShape {
-            threadgroups: (row_stride.div_ceil(THREADS_PER_TG), 1, 1),
+            threadgroups: (row_stride.get().div_ceil(THREADS_PER_TG), 1, 1),
             threads_per_threadgroup: (THREADS_PER_TG, 1, 1),
             m_scaling: None,
         },
@@ -10552,8 +10546,9 @@ mod tests {
     /// plain matmul's rows.
     #[test]
     fn sampled_rows_slice_where_the_matmul_is_one_qmm_t() {
-        use crate::tape::ids::{DecodeRows, RowTile};
+        use crate::tape::ids::DecodeRows;
         use crate::tape::lowered::Fence as F;
+        use crate::tape::lowered::RowTile;
         use crate::tape::lowered::RuntimeGate::{OnlyIfEveryRowSampled, UnlessEveryRowSampled};
         let rows = sampled_rows([F::Coherent, F::None, F::Coherent, F::None]);
         let at = bake_point(512, None);
@@ -10561,9 +10556,9 @@ mod tests {
         assert_eq!(
             gated_steps(&tape),
             [
-                (KernelId::GatherLastToken, Some(UnlessEveryRowSampled)),
+                (KernelId::GatherSampledRows, Some(UnlessEveryRowSampled)),
                 (KernelId::AffineQmvFast, Some(UnlessEveryRowSampled)),
-                (KernelId::ScatterFirstToLastRow, Some(UnlessEveryRowSampled)),
+                (KernelId::PutSampledRowsBack, Some(UnlessEveryRowSampled)),
                 (KernelId::AffineQmmT, Some(OnlyIfEveryRowSampled)),
             ]
         );
@@ -10615,7 +10610,12 @@ mod tests {
         assert_eq!(qmv.bindings, bindings);
         assert_eq!(tape.splitk_scratch_bytes, 0);
         // qmm_t's tile is 32 rows: a step of 33 sampled rows writes 64 of them.
-        assert_eq!(tape.logits_rows, LogitsRows::Sampled { tile: RowTile(32) });
+        assert_eq!(
+            tape.logits_rows,
+            LogitsRows::Sampled {
+                tile: RowTile::Rows32
+            }
+        );
         assert_eq!(tape.logits_slot_rows(Some(DecodeRows(33))), 64);
         assert_eq!(tape.logits_slot_rows(Some(DecodeRows(4096))), 512);
         assert_eq!(tape.logits_slot_rows(None), 512);
@@ -10659,7 +10659,7 @@ mod tests {
                 panic!("bucket {bucket_m}: one compaction after the matmul");
             };
             assert_eq!(compact.gate, Some(UnlessEveryRowSampled));
-            assert_eq!(compact.command.kernel, K::GatherLastToken);
+            assert_eq!(compact.command.kernel, K::GatherSampledRows);
             assert!(matches!(
                 compact.command.bindings[0],
                 Binding::ArenaSlot {
@@ -10815,7 +10815,7 @@ mod tests {
             ..MetalStepTape::default()
         };
         let steps = gated_steps(&lower_at(sampled, m5));
-        assert!(steps.contains(&(KernelId::GatherLastToken, Some(UnlessEveryRowSampled))));
+        assert!(steps.contains(&(KernelId::GatherSampledRows, Some(UnlessEveryRowSampled))));
         assert!(steps.ends_with(&[
             (KernelId::AffineW4a8Quant, Some(OnlyIfEveryRowSampled)),
             (KernelId::AffineQmmW4a8, Some(OnlyIfEveryRowSampled)),

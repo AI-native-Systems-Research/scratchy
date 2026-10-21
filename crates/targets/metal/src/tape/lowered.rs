@@ -16,7 +16,7 @@
 
 use crate::tape::constants::ConstantValue;
 use crate::tape::ids::{
-    BucketM, CommandIx, DecodeRows, LayerId, MaxBlocksPerSeq, RowTile, SourceIx, TqDecodeHeads,
+    BucketM, CommandIx, DecodeRows, LayerId, MaxBlocksPerSeq, SourceIx, TqDecodeHeads,
 };
 
 /// One-of identifier for the kernel a `LoweredCommand` invokes.
@@ -317,18 +317,18 @@ pub enum KernelId {
     /// in place: the lm_head input before the lm_head slice's matvec
     /// runs at the sampled rows alone, or every row's logits compacted
     /// to the sampled rows' where the lm_head ran over every row. Maps to
-    /// `gather_last_token_{f16,bf16}_specialized` in
-    /// `gather_last_token.metallib`. Reads the rows from the runtime
+    /// `gather_sampled_rows_{f16,bf16}_specialized` in
+    /// `sample_rows.metallib`. Reads the rows from the runtime
     /// buffers the worker re-writes each forward() —
     /// `RuntimeBindingKind::{SampleIndices, NumSampleRowsU32}`.
-    GatherLastToken,
-    /// Paired with [`KernelId::GatherLastToken`]: the gather undone, in
+    GatherSampledRows,
+    /// Paired with [`KernelId::GatherSampledRows`]: the gather undone, in
     /// place — the lm_head input's sampled rows put back after the
     /// slice's matvec read them, so the final hidden states read as the
     /// backbone wrote them. Maps to
-    /// `scatter_first_to_last_row_{f16,bf16}_specialized` in
-    /// `gather_last_token.metallib`.
-    ScatterFirstToLastRow,
+    /// `put_sampled_rows_back_{f16,bf16}_specialized` in
+    /// `sample_rows.metallib`.
+    PutSampledRowsBack,
     /// Row-wise precise softmax (MoE router prerequisite). Faithful
     /// port of MLX `softmax_single_row` from
     /// `mlx/backend/metal/kernels/softmax.h:10-98`. Bindings:
@@ -577,8 +577,8 @@ impl KernelId {
             | Self::GatedDeltaNet
             | Self::SplitKReduceSum
             | Self::AffineEmbed
-            | Self::GatherLastToken
-            | Self::ScatterFirstToLastRow
+            | Self::GatherSampledRows
+            | Self::PutSampledRowsBack
             | Self::Softmax
             | Self::ArgPartitionTopK
             | Self::TakeAlongAxis
@@ -1268,17 +1268,16 @@ pub enum RuntimeBindingKind {
         layer: LayerId,
     },
     /// `[1]` u32 — actual `num_tokens` of this forward, written by
-    /// the worker at `forward()` entry. Consumed by
-    /// `KernelId::GatherLastToken` so the kernel can compute the
-    /// source row index `num_tokens - 1` at runtime without needing
-    /// a function constant (M varies per call).
+    /// the worker at `forward()` entry, for a kernel that needs M at
+    /// runtime without a function constant (M varies per call).
     NumTokensU32,
     /// `[1]` u32 — the in-flight forward's sampled rows' count (`SampleIndices`' length): the
     /// rows the lm_head slice gathers and puts back, and the logits rows a compaction keeps.
     NumSampleRowsU32,
     /// `[num_sample_rows]` u32 — the in-flight forward's sampled rows, ascending: each
     /// sequence's last row, every row of a sequence verifying drafts. Python vLLM's
-    /// `logits_indices`. Read by the index-driven `gather_rows` / `put_rows_back` kernels.
+    /// `logits_indices`. Read by [`KernelId::GatherSampledRows`] and
+    /// [`KernelId::PutSampledRowsBack`].
     SampleIndices,
     /// Gated-DeltaNet conv-state ring for a linear-attention layer
     /// (persistent f32 pool, mutated in place across forwards — the
@@ -1958,12 +1957,16 @@ impl LoweredMetalTape {
     }
 
     /// The rows the logits buffer holds when no step samples more than `sampled` rows (`None`:
-    /// every row of the bucket) — the bucket's rows at most ([`LogitsRows`]).
+    /// every row of the bucket) — the bucket's rows at most ([`LogitsRows`]). A tiled grid bakes
+    /// `⌈bucket_m / tile⌉` threadgroups and runs [`scaled_groups`] of them, each writing a whole
+    /// tile; at most the bucket's rows, which its kernel clamps to.
     pub fn logits_slot_rows(&self, sampled: Option<DecodeRows>) -> u32 {
         match (self.logits_rows, sampled) {
             (LogitsRows::Sampled { tile }, Some(rows)) => {
-                let tile = tile.get().max(1);
-                (rows.get().div_ceil(tile).saturating_mul(tile)).min(self.bucket_m)
+                let (bucket_m, tile) = (u64::from(self.bucket_m), u64::from(tile.get()));
+                let groups =
+                    scaled_groups(bucket_m.div_ceil(tile), u64::from(rows.get()), bucket_m);
+                (groups.saturating_mul(tile)).min(bucket_m) as u32
             }
             (LogitsRows::Bucket, _) | (_, None) => self.bucket_m,
         }
@@ -2039,11 +2042,54 @@ pub enum LogitsRows {
     /// The lm_head runs every row of a step and moves the sampled rows' logits to the front: the
     /// buffer holds the bucket's rows.
     Bucket,
-    /// Every command over the logits writes the step's sampled rows rounded up to whole `tile`s
-    /// of rows — the sampled matvec and the logit tail one a row, the matmul over every row of a
-    /// step that samples each its own tile: the buffer holds the most rows a step samples, so
-    /// rounded.
+    /// Every command over the logits writes the step's sampled rows in whole `tile`s — the sampled
+    /// matvec and the logit tail one a row, the matmul over every row of a step that samples each
+    /// its own tile: the buffer holds the most rows a step samples, so tiled.
     Sampled { tile: RowTile },
+}
+
+/// The rows one threadgroup of a command over the logits writes along its row axis: the tile of
+/// the kernel ([`RowTile::of`]), never zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+pub enum RowTile {
+    /// A row a threadgroup: the sampled rows' matvec and logit tail, their grid SET to the rows.
+    Row,
+    /// 32: `qmm_t` (`BM`) and the W4A8 GEMM (`W4A8_TILE_ROWS`).
+    Rows32,
+    /// 64: the NAX `qmm_t` (`BM`).
+    Rows64,
+}
+
+impl RowTile {
+    /// The tile of `kernel` writing the logits over every row of a step, its grid scaled by the
+    /// step's rows (`None`: a kernel this table does not tile, whose logits the buffer holds for
+    /// the bucket's every row).
+    pub const fn of(kernel: KernelId) -> Option<Self> {
+        const _: () = assert!(crate::quantized::W4A8_TILE_ROWS == 32);
+        match kernel {
+            KernelId::AffineQmmT | KernelId::AffineQmmW4a8 => Some(Self::Rows32),
+            KernelId::AffineQmmTNax => Some(Self::Rows64),
+            _ => None,
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        match self {
+            Self::Row => 1,
+            Self::Rows32 => 32,
+            Self::Rows64 => 64,
+        }
+    }
+}
+
+/// The threadgroups a grid axis of `baseline` of them, baked for `bucket_m` rows, runs at `live`
+/// rows: `⌈baseline · live / bucket_m⌉`, `live` capped at the bucket — the scaling the worker
+/// dispatches with ([`MScaling`]), and so the rows a tiled command writes.
+pub fn scaled_groups(baseline: u64, live: u64, bucket_m: u64) -> u64 {
+    let bucket_m = bucket_m.max(1);
+    baseline
+        .saturating_mul(live.min(bucket_m))
+        .div_ceil(bucket_m)
 }
 
 /// One bucket's lowered tape — the input the `MetalWorker` walks at

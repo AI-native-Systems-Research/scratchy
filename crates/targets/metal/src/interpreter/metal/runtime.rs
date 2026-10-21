@@ -110,7 +110,7 @@ pub struct RuntimeBindings {
     pub num_tokens_u32: Buffer,
     /// `[1]` u32 — the in-flight forward's sampled rows' count
     /// ([`super::ForwardInputs::sampled_rows`]). Read by the
-    /// `gather_last_token`/`scatter_first_to_last_row` kernels.
+    /// `gather_sampled_rows`/`put_sampled_rows_back` kernels.
     pub num_sample_rows_u32: Buffer,
     /// `[num_sample_rows]` u32 — the in-flight forward's sampled rows,
     /// ascending: Python vLLM's `logits_indices`. Sized at construction

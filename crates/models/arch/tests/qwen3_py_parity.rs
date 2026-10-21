@@ -209,7 +209,6 @@ fn qwen3_py_carrier_parity() {
     // last, `[n-1]`. The forward leaves their logits at the front of its
     // logits buffer — row 0 here, the last token's, the row production
     // samples from.
-
     let lti: Vec<u32> = vec![n as u32 - 1];
     let lti_buf = device.alloc_gpu_tensor_from_host(&[1], DType::U32, unsafe {
         std::slice::from_raw_parts(lti.as_ptr() as *const u8, 4)

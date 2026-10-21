@@ -23,8 +23,8 @@ pub mod proposer;
 pub mod verify;
 
 pub use backend::{
-    BackendError, ForwardArgmaxRequest, ForwardHandle, KvPoolHandle, ModelHandle, SampledRows,
-    SpecDecodeBackend,
+    BackendError, EmptySequence, ForwardArgmaxRequest, ForwardHandle, KvPoolHandle, ModelHandle,
+    SampledRows, SpecDecodeBackend,
 };
 pub use mtp::{
     Chain, DraftBudget, DraftVocab, Drafting, HeadPasses, MtpDrafter, MtpProposer,

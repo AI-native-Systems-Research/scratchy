@@ -270,8 +270,11 @@ u32_newtype!(
     /// MLP intermediate size (`W::INTERMEDIATE_SIZE`).
     IntermediateSize,
     /// Generic hidden size in elements (used by elementwise kernels —
-    /// `AffineEmbed.hidden_size`, `GatherLastToken.row_stride`).
+    /// `AffineEmbed.hidden_size`).
     HiddenSize,
+    /// Elements between one row of a buffer and the next, that a row-moving kernel swaps whole:
+    /// the hidden size (the lm_head's input) or the vocabulary (its logits).
+    RowStride,
     /// MLX-affine packed-K (input cols) for a qmv / qmm_t dispatch.
     KDim,
     /// MLX-affine output cols / weight rows (qmv / qmm_t `n_v`).
@@ -319,9 +322,10 @@ u32_newtype!(
     /// ([`crate::tape::lowered::LoweredMetalTape::scratch_bytes`]), and the logits buffer holds
     /// ([`crate::tape::lowered::LoweredMetalTape::logits_rows`]).
     DecodeRows,
-    /// Rows one threadgroup of a command over the logits writes along its scaled row axis: a
-    /// step's every row it runs, rounded up to a whole tile.
-    RowTile,
+    /// The rows one step samples (its `SampleIndices`' length): one a sequence, every row of a
+    /// sequence verifying drafts — what a runtime gate and a [`crate::tape::lowered::SetAxis`]
+    /// read.
+    SampledRowCount,
     /// Logits per row a model's forward leaves (`METAL_VOCAB_SIZE`): the width the off-tape
     /// kernels (argmax, grammar mask, sampler) read ([`crate::off_tape`]).
     LogitsWidth,

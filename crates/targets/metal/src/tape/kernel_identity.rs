@@ -29,7 +29,7 @@
 //!   - Embed (same — static after dtype pick; left for follow-up)
 //!   - RmsNorm / FusedAddRmsNorm (depends on scale dtype)
 //!   - FusedGateUpSiluMul (decode vs prefill branch)
-//!   - GatherLastToken / ScatterFirstToLastRow (same)
+//!   - GatherSampledRows / PutSampledRowsBack (same)
 //!   - RopeAppend (dtype-only — left for follow-up)
 //!   - Synth* (compiler-emitted symbol — never static)
 
