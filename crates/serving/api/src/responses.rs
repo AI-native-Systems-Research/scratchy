@@ -1147,16 +1147,20 @@ mod tests {
         assert_eq!(json_schema.json_schema, Some(schema));
         assert_eq!(json_schema.strict, Some(true));
 
-        // Without a schema it is still a json_schema format, one the chat path refuses.
+        // Without a schema it is still a json_schema format, one the chat path refuses (a 400).
         let bare = serde_json::json!({"format": {"type": "json_schema", "name": "city"}});
         let req: ResponsesRequest =
             serde_json::from_value(serde_json::json!({"input": "Hi", "text": bare})).unwrap();
-        let Some(protocol::ResponseFormat::Standard(format)) =
-            convert_request(&req).response_format
-        else {
+        let response_format = convert_request(&req).response_format;
+        let Some(protocol::ResponseFormat::Standard(format)) = &response_format else {
             panic!("a json_schema format");
         };
-        assert_eq!(format.json_schema.unwrap().json_schema, None);
+        assert_eq!(format.json_schema.as_ref().unwrap().json_schema, None);
+        let refused = crate::engine::parse_response_format(&response_format);
+        assert!(
+            matches!(refused, Err(crate::error::ServeError::Validation(_))),
+            "{refused:?}"
+        );
     }
 
     #[test]

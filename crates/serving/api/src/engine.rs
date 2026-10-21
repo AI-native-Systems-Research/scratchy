@@ -3812,7 +3812,7 @@ fn parse_logit_bias(
 /// - `type: "json_object"` → `Some(GuidedGrammar::Json)`
 /// - `type: "json_schema"` → `Some(GuidedGrammar::JsonSchema { schema })`
 /// - `type: "structural_tag"` → `Some(GuidedGrammar::StructuralTag { spec })`
-fn parse_response_format(
+pub(crate) fn parse_response_format(
     rf: &Option<protocol::ResponseFormat>,
 ) -> ServeResult<Option<GuidedGrammar>> {
     let Some(rf) = rf else {
