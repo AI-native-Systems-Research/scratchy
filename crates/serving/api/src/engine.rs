@@ -5508,20 +5508,28 @@ mod tests {
         assert!(matches!(result, Some(GuidedGrammar::Json)));
     }
 
+    /// A json_schema `response_format` carries its schema under OpenAI's key, `schema`, as vLLM
+    /// reads it, and the schema is the grammar's. `json_schema`, the key read before, is read too.
+    /// It is written under `schema`.
     #[test]
-    fn test_protocol_response_format_json_schema_still_works() {
-        // Note: the inner `json_schema` field maps to JsonSchemaResponseFormat.json_schema
-        // which expects the key "json_schema" (not "schema") in our struct.
-        let json_str = r#"{
-            "type": "json_schema",
-            "json_schema": {
-                "name": "test",
-                "json_schema": {"type": "object", "properties": {"x": {"type": "integer"}}}
-            }
-        }"#;
-        let rf: protocol::ResponseFormat = serde_json::from_str(json_str).unwrap();
-        let result = parse_response_format(&Some(rf)).unwrap();
-        assert!(matches!(result, Some(GuidedGrammar::JsonSchema { .. })));
+    fn a_json_schema_response_format_reads_its_schema_where_openai_puts_it() {
+        let schema =
+            serde_json::json!({"type": "object", "properties": {"x": {"type": "integer"}}});
+        for key in ["schema", "json_schema"] {
+            let form = serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "test", key: schema},
+            });
+            let rf: protocol::ResponseFormat = serde_json::from_value(form).unwrap();
+            let result = parse_response_format(&Some(rf.clone())).unwrap();
+            assert!(
+                matches!(result, Some(GuidedGrammar::JsonSchema { schema: ref s }) if *s == schema),
+                "{key}: {result:?}"
+            );
+            let written = serde_json::to_value(&rf).unwrap();
+            assert_eq!(written["json_schema"]["schema"], schema, "{key}");
+            assert!(written["json_schema"].get("json_schema").is_none(), "{key}");
+        }
     }
 
     // ---------------------------------------------------------------
