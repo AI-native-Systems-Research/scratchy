@@ -759,6 +759,11 @@ PY
     if (( rc == 142 )); then
         cells_hung=1
         echo "timed out after ${CELL_TIMEOUT_S}s; skipping this server's remaining cells"
+    elif (( rc )) && tail -n 5 "${RAW}/cells-${stem}.log" | grep -q 'requests failed\. Check server'; then
+        # Every request of the cell failed, so bench serve wrote no JSON for the
+        # check below to read: the server stopped answering before the cell began.
+        cells_hung=1
+        echo "every request failed; skipping this server's remaining cells (see ${RAW}/cells-${stem}.log)"
     elif (( rc )); then
         echo "failed (see ${RAW}/cells-${stem}.log)"
     else

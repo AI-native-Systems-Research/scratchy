@@ -181,8 +181,9 @@ fn send_request(
     let mut last_choices_time: Option<Instant> = None;
     // Why the stream says the request failed, if it does: the first one wins.
     let mut failure: Option<String> = None;
-    // Whether the server closed the answer (`data: [DONE]`): a read error after that ends a
-    // finished request, not a failed one.
+    // Whether the client has read the server's `data: [DONE]`: a read error after that ends a
+    // finished request, not a failed one. It helps only once `[DONE]` is parsed: a server that
+    // resets right after sending it still fails the request when the reset beats this read.
     let mut done = false;
 
     loop {
@@ -1516,7 +1517,12 @@ mod tests {
                 s.write_all(head.as_bytes()).unwrap();
                 s.write_all(body.as_bytes()).unwrap();
                 s.flush().unwrap();
-                // Dropped here with no `0\r\n\r\n`: the body ends unterminated.
+                // Closed with no `0\r\n\r\n`, so the body ends unterminated. Half-close, then read
+                // what is left of the request: a socket closed with unread input sends a reset,
+                // and on macOS the client's next read-timeout call then fails (EINVAL) before it
+                // reads the events this wrote.
+                s.shutdown(std::net::Shutdown::Write).unwrap();
+                let _ = std::io::copy(&mut s, &mut std::io::sink());
             });
             let client = Client {
                 agent: crate::http::agent(false),
