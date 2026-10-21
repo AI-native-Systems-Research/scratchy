@@ -221,6 +221,9 @@ pub(crate) fn solo_step_is_decode(
 ///     win. Each row attends only its own request's blocks (PROVEN: per-row
 ///     block_table honored; rows don't cross-contaminate).
 impl Worker for SpyreWorker {
+    /// The Spyre worker applies no grammar.
+    fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
+
     /// THE CONTEXT THE POOL CAN ADDRESS, so the ENGINE rejects an over-long prompt at admission
     /// instead of the worker killing the whole batch mid-forward.
     ///

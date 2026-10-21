@@ -5887,6 +5887,9 @@ mod tests {
     struct FailingExecutor;
 
     impl scratchy_serving_engine::executor::Executor for FailingExecutor {
+        /// It samples no grammar.
+        fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
+
         fn execute_model(
             &mut self,
             _scheduler_output: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
@@ -5928,6 +5931,9 @@ mod tests {
     struct PanickingExecutor;
 
     impl scratchy_serving_engine::executor::Executor for PanickingExecutor {
+        /// It samples no grammar.
+        fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
+
         fn execute_model(
             &mut self,
             _scheduler_output: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,

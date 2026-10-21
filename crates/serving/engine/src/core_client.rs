@@ -731,6 +731,10 @@ mod tests {
     }
 
     impl Executor for DraftingExecutor {
+        fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+            self.inner.set_stop_token_ids(stop_token_ids);
+        }
+
         fn pipelines_speculative_steps(&self) -> bool {
             true
         }

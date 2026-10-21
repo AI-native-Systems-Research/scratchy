@@ -2744,6 +2744,9 @@ mod tests {
     struct SnapshottingExecutor(NoopExecutor);
 
     impl Executor for SnapshottingExecutor {
+        fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+            self.0.set_stop_token_ids(stop_token_ids)
+        }
         fn execute_model(
             &mut self,
             scheduler_output: &SchedulerOutput,

@@ -42,6 +42,8 @@ enum Request {
         num_cpu_blocks: usize,
     },
     DetermineAvailableMemory,
+    /// The engine's stop tokens, for the worker's grammars (`Worker::set_stop_token_ids`).
+    SetStopTokenIds(Arc<[u32]>),
     CheckHealth,
     /// NCCL broadcast bytes on the worker thread (correct CUDA context).
     /// `(data, root)` — root sends, others receive.
@@ -54,6 +56,7 @@ enum Response {
     ModelOutput(Box<ExecutorResult<ModelRunnerOutput>>),
     CacheInitialized(ExecutorResult<()>),
     AvailableMemory(ExecutorResult<usize>),
+    StopTokenIdsSet,
     HealthOk(ExecutorResult<()>),
     /// Result of NCCL broadcast (received bytes or error).
     NcclBroadcastResult(ExecutorResult<Vec<u8>>),
@@ -88,6 +91,10 @@ fn worker_loop(
             }
             Request::DetermineAvailableMemory => {
                 Response::AvailableMemory(worker.determine_available_memory())
+            }
+            Request::SetStopTokenIds(stop_token_ids) => {
+                worker.set_stop_token_ids(&stop_token_ids);
+                Response::StopTokenIdsSet
             }
             Request::CheckHealth => Response::HealthOk(worker.check_health()),
             Request::NcclBroadcast(data, root) => {
@@ -245,6 +252,12 @@ impl Executor for ThreadPoolExecutor {
         self.parallel_config.pp_group.world_size
     }
 
+    /// To every worker thread, each of which samples on its rank.
+    fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+        let stop_token_ids: Arc<[u32]> = stop_token_ids.into();
+        self.broadcast(|| Request::SetStopTokenIds(Arc::clone(&stop_token_ids)));
+    }
+
     fn initialize_cache(
         &mut self,
         num_gpu_blocks: usize,
@@ -336,5 +349,32 @@ impl Executor for ThreadPoolExecutor {
             let _ = w.rx.recv();
         }
         self.is_shutdown = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::{NoopWorker, StopRecordingWorker};
+
+    /// The engine's stop tokens reach every worker thread, each of which samples on its rank.
+    #[test]
+    fn the_stop_tokens_reach_every_worker_thread() {
+        let handed: Vec<_> = (0..2)
+            .map(|_| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+            .collect();
+        let workers = (handed.iter())
+            .map(|h| {
+                let worker = NoopWorker::with_defaults(16 * 1024 * 1024);
+                Box::new(StopRecordingWorker(worker, h.clone())) as Box<dyn Worker>
+            })
+            .collect();
+        let mut exec =
+            ThreadPoolExecutor::new(workers, ResolvedParallelConfig::tensor_parallel(2, 0));
+        exec.set_stop_token_ids(&[2, 0]);
+        for h in &handed {
+            assert_eq!(*h.lock().unwrap(), [2, 0]);
+        }
+        exec.shutdown();
     }
 }

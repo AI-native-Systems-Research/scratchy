@@ -4950,11 +4950,16 @@ fn reserve_pinned(
 #[cfg(feature = "metal")]
 impl Worker for MetalWorker {
     /// Kept for the grammar factory, which is built the first time a grammar request appears; one
-    /// built before is dropped, to be built again ending on these.
-    #[cfg(feature = "guided-decoding")]
+    /// built before is dropped, to be built again ending on these. A build without
+    /// `guided-decoding` samples no grammar.
     fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
-        self.stop_token_ids = stop_token_ids.to_vec();
-        self.grammar_factory = None;
+        #[cfg(feature = "guided-decoding")]
+        {
+            self.stop_token_ids = stop_token_ids.to_vec();
+            self.grammar_factory = None;
+        }
+        #[cfg(not(feature = "guided-decoding"))]
+        let _ = stop_token_ids;
     }
 
     fn init_device(&mut self) -> ExecutorResult<()> {

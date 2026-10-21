@@ -280,8 +280,8 @@ pub trait Worker: Send {
     /// The tokens the engine stops a request on (`EngineCoreConfig::eos_token_ids`), handed over
     /// once, as the engine is built, before its first step. A worker that applies guided grammars
     /// ends them on these ([`crate::grammar::build_parser_factory`]), so a finished grammar allows
-    /// what stops the request. Default: ignored, by a worker that applies none.
-    fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
+    /// what stops the request. No default: a worker that applies grammars must keep them.
+    fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]);
 
     /// Take the pre-loaded tokenizer, if one was loaded during `load_model()`.
     ///
@@ -399,6 +399,9 @@ impl NoopWorker {
 }
 
 impl Worker for NoopWorker {
+    /// It samples no grammar.
+    fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
+
     fn init_device(&mut self) -> ExecutorResult<()> {
         self.initialized = true;
         Ok(())
@@ -473,6 +476,9 @@ mod tests {
     }
 
     impl Worker for WidthWorker {
+        /// It samples no grammar.
+        fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
+
         fn init_device(&mut self) -> ExecutorResult<()> {
             Ok(())
         }

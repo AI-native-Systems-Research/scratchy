@@ -393,7 +393,8 @@ pub fn apply_grammar_mask(logits: &mut [f32], allowed: &[TokenId]) {
 /// instruct model that is often not the token that ends a turn. SmolLM2 and Qwen end one on
 /// `<|im_end|>`, and Llama 3 Instruct on `<|eot_id|>`. With toktrie's own, a constrained reply's
 /// model emits it, unstopped, until `max_tokens`. So every stop token in the tokenizer's vocab is
-/// the end of sequence here, and with none (or none in the vocab), toktrie's own.
+/// the end of sequence here. A stop token past the vocab is left out with a warning, and with none
+/// left, toktrie's own is the end, with a warning that names it.
 ///
 /// Workers call this once at model-load time and cache the result.
 /// The `ParserFactory` is expensive to create (builds sliced bias computer)
@@ -404,11 +405,22 @@ pub fn build_parser_factory(
 ) -> Result<Arc<ParserFactory>, String> {
     let mut byte_tok = ByteTokenizer::from_json_bytes(tokenizer_json).map_err(|e| e.to_string())?;
     let vocab_size = byte_tok.tokrx_info().vocab_size;
-    let stops: Vec<u32> = (stop_token_ids.iter().copied())
-        .filter(|&id| id < vocab_size)
-        .collect();
-    if !stops.is_empty() {
-        byte_tok.set_eos_tokens(&stops);
+    let (stops, past): (Vec<u32>, Vec<u32>) =
+        (stop_token_ids.iter()).partition(|&&id| id < vocab_size);
+    if !past.is_empty() {
+        tracing::warn!(
+            "guided-decoding: stop tokens {past:?} are past the tokenizer's vocab of {vocab_size}, \
+             so no grammar ends on them"
+        );
+    }
+    match stops.is_empty() {
+        false => byte_tok.set_eos_tokens(&stops),
+        true => tracing::warn!(
+            "guided-decoding: no stop token in the tokenizer's vocab (of {stop_token_ids:?}), so \
+             a finished grammar allows only the tokenizer's own end of sequence, {}, which may \
+             not stop the request",
+            byte_tok.tokrx_info().tok_eos
+        ),
     }
     let tok_env = byte_tok.into_tok_env(None).map_err(|e| e.to_string())?;
     let mut factory = ParserFactory::new_simple(&tok_env).map_err(|e| e.to_string())?;
