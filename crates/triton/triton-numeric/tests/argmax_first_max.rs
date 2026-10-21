@@ -6,8 +6,8 @@
 //!
 //! This is the rung ABOVE the door: `triton-numeric` stops before the SuperDSC descriptor
 //! emission (the case row's door kind is `None` and says why), so a green result here states
-//! that the KERNEL'S ARITHMETIC -- the three whole-row maxima, the two equality masks, the
-//! two staged ramps, the fp32-island combine, the index cast -- computes the right FUNCTION
+//! that the KERNEL'S ARITHMETIC -- the five whole-row maxima, the three equality masks,
+//! the four staged index tables, the fp32-island combine, the index cast -- computes the right FUNCTION
 //! on the device model. It does not state that the descriptors address it right; that is the
 //! next rung's gate.
 //!
@@ -118,7 +118,7 @@ fn the_sampler_executes_first_max_exactly() {
 }
 
 /// THE NEGATIVE CONTROL: the stimulus's tie must be able to fail the comparison. The last-max
-/// index of these same bytes is 5000 (the tie's other lane); if it equalled the first-max
+/// index of these same bytes is 48000 (the tie's other lane); if it equalled the first-max
 /// answer the tie would be vacuous and the exact comparison above could not see a tie-break
 /// defect -- every wrong-way implementation would pass.
 #[test]

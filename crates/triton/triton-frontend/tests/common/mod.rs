@@ -236,12 +236,18 @@ pub fn expert_slab() -> Case {
 
 /// `argmax_first_max.py`'s signature: the solo greedy decode step's vocab scan. The idx
 /// output is `*i32` (the gather ingestion dtype); `PAD_V` is the vocab padded to a whole
-/// power-of-two row with -inf lanes and the two fp16 ramps staged, HOST obligations the
-/// fixture's docstring states.
+/// power-of-two row with -inf lanes and FOUR fp16 index tables staged (the two decreasing
+/// ramps pick first-block/first-lane; the two increasing 0-based tables read the numbers
+/// back out), plus the [1, BLOCK] ones row (f16) and 64.0 row (f32) the widen and the
+/// island's scale read -- HOST obligations the fixture's docstring states.
 const ARGMAX: &[(&str, &str)] = &[
     ("logits_ptr", "*fp16"),
     ("bramp_ptr", "*fp16"),
     ("lramp_ptr", "*fp16"),
+    ("binc_ptr", "*fp16"),
+    ("linc_ptr", "*fp16"),
+    ("ones_ptr", "*fp16"),
+    ("sixtyfour_ptr", "*fp32"),
     ("idx_ptr", "*i32"),
     ("V", "constexpr"),
     ("PAD_V", "constexpr"),

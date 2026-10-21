@@ -563,25 +563,32 @@ def _mul_scale_inputs(mod, ce):
 
 
 def _argmax_inputs(mod, ce):
-    row, bramp, lramp = mod.inputs(seed=SEED)
+    row, bramp, lramp, binc, linc, ones, sixtyfour = mod.inputs(seed=SEED)
     ref = mod.reference(row)
     # THE OUTPUT IS ONE i32 LANE, not an fp16 tile: this is the first config whose
     # reference is an INDEX (the gather ingestion dtype), so `out_dtype` below is
     # "i32" and the ref dump does NOT pass through the fp16 truncation every other
     # config takes. A 49k index does not survive fp16 (exact integers stop at 2048),
     # which is the same law the kernel's fp32-island combine routes around.
-    # THE TWO RAMPS are the host obligations (strictly decreasing per level, 0 on the
-    # pad lanes) -- constants across steps, staged once. Both ride fp16: every lane
-    # value stays under 2048 (the docstring's two-level law -- a single V - i ramp
-    # would need 49155 in a lane).
+    # THE FOUR INDEX TABLES are the host obligations (the two DECREASING ramps pick
+    # first-block/first-lane; the two INCREASING 0-based tables read the selected
+    # numbers back out through the one-hot, with NB/BLOCK on the pad lanes so an
+    # all-NaN row answers the sentinel) -- constants across steps, staged once.
+    # All ride fp16: every lane value stays under 2048 (the docstring's two-level
+    # law -- a single V - i ramp would need 49155 in a lane). THE TWO WIDEN TABLES
+    # are the [1, BLOCK] ones row (f16) and 64.0 row (f32) the output-stick widen
+    # and the island's scale read -- loaded, never splatted, so every multiply in
+    # the kernel stays a two-tensor op.
     ins = [("logits_ptr", row, "f16"), ("bramp_ptr", bramp, "f16"),
-           ("lramp_ptr", lramp, "f16"),
+           ("lramp_ptr", lramp, "f16"), ("binc_ptr", binc, "f16"),
+           ("linc_ptr", linc, "f16"), ("ones_ptr", ones, "f16"),
+           ("sixtyfour_ptr", sixtyfour, "f32"),
            ("idx_ptr", torch.zeros(64, dtype=torch.int32), "i32")]
     note = (
         f"THE STIMULUS CARRIES A REAL TIE AT HIGH LANES: 40017 and 48000 both hold the "
         f"row's maximum, so `ref_out.bin`'s single lane is 40017 -- FIRST-max pinned "
         f"against a tie, not a vacuous uniqueness. THE NEGATIVE CONTROLS ARE PART OF THE "
-        f"CONTRACT, AND THERE ARE TWO: (1) a last-max implementation answers 50000 "
+        f"CONTRACT, AND THERE ARE TWO: (1) a last-max implementation answers 48000 "
         f"against these same bytes and must not match `ref_out.bin`; a run that still "
         f"matches cannot have taken the tie. (2) an f16-DEGRADED FINAL COMBINE answers "
         f"40032 or 40016 -- 40017 = 625*64 + 17 is not fp16-representable (ULP 32 at "
@@ -589,9 +596,9 @@ def _argmax_inputs(mod, ce):
         f"cannot match either; a run that still matches cannot have degraded. The tie "
         f"lanes are high ON PURPOSE: the original 100/5000 stimulus sat inside fp16's "
         f"exact-integer range and could not see (2) at all. The pad lanes past "
-        f"V={ce['V']} hold -inf (the host obligation the fixture's own docstring "
-        f"states); a kernel that lets a pad lane win the equality answers "
-        f"PAD_V-adjacent garbage, never 40017."
+        f"V={ce['V']} hold -inf in the row and NB/BLOCK in the increasing tables (the "
+        f"host obligations the fixture's own docstring states); a kernel that lets a "
+        f"pad lane win the equality answers PAD_V-adjacent garbage, never 40017."
     )
     return ins, ref, note
 
@@ -806,8 +813,8 @@ FNS = {
 # the dump
 
 
-_NP = {"f16": "<f2", "i32": "<i4"}
-_TORCH = {"f16": torch.float16, "i32": torch.int32}
+_NP = {"f16": "<f2", "f32": "<f4", "i32": "<i4"}
+_TORCH = {"f16": torch.float16, "f32": torch.float32, "i32": torch.int32}
 
 
 def dump(t, dtype, path):

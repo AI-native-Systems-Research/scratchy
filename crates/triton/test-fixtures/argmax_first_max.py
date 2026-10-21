@@ -5,62 +5,78 @@ arithmetic, as one kernel.
 This is the ladder form of loop closure's device sampler (#603/#500): the
 algorithm that used to live in a hand-minted 8-link SuperDDC composite
 (#698, deleted by #714) is stated HERE, in the kernel, over generic ops only
--- whole-row `tt.reduce` max, an equality compare, staged-table multiplies,
+-- whole-row `tt.reduce` maxima, equality compares, staged-table multiplies,
 the fp32 island for the one wide integer. Nothing argmax-specific exists
 below the kernel: whatever lowering the splice emits for `tt.reduce`/
 `arith.cmpf`/`arith.mulf` is the lowering this kernel gets, which is the
 whole point.
 
-THE ALGORITHM (two-level selection over one tile)
--------------------------------------------------
+THE ALGORITHM (equality selection over one tile, no inversions)
+----------------------------------------------------------------
     m    = max of the logits row (whole row, one reduce)
-    w1   = (x == m) * bramp          bramp_i = NB - (i // 64)   (first-BLOCK)
-    jA   = max of w1                 b* = NB - jA  -- the FIRST 64-block of the row
-                                     holding the maximum
-    sel  = (bramp == b*_indicator)   one-hot on block b* only
-    w2   = (x == m) * sel * lramp    lramp_i = 64 - (i % 64)    (first-LANE)
-    jB   = max of w2                 l* = 64 - jB  -- the FIRST lane within block b*
-                                     holding the maximum
-    idx  = b* * 64 + l*              (computed in the fp32 island)
+    mask = (x == m)                     true at EVERY lane holding the max
+    w1   = mask * bramp                 bramp_i = NB - (i // 64)  (first-BLOCK)
+    jA   = max of w1                    bramp's value at the first maximal block
+    sel  = (bramp == jA)                one on block b* ONLY (bramp is
+                                        block-constant, so the equality selects
+                                        the block and nothing else)
+    w2   = mask * sel * lramp           lramp_i = 64 - (i % 64)   (first-LANE)
+    jB   = max of w2                    lramp's value at the first maximal lane
+                                        within block b*
+    selL = (lramp == jB)                one at lane l* of EVERY block (lramp is
+                                        periodic), so `sel * selL` is one at
+                                        (b*, l*) and nowhere else
+    onehot = sel * selL                 THE first maximal lane, exactly one
+    b*   = max of (onehot * binc)       binc_i = i // 64   (increasing, 0-based)
+    l*   = max of (onehot * linc)       linc_i = i % 64   (increasing, 0-based)
+    idx  = b* * 64 + l*                 (computed in the fp32 island)
 
-FIRST-MAX BY ARITHMETIC, not by a tie-break rule: the equality mask is true at
-EVERY lane holding the maximum; bramp is STRICTLY DECREASING in the block
-index, so the max of w1 lands on the SMALLEST block containing the maximum;
-lramp is STRICTLY DECREASING in the lane index, so the max of w2 lands on the
-SMALLEST lane within that block. No comparator chain, no index-carrying
-reduce pair -- the tie law is the two ramps' monotonicity. This is #631's
-first-max law (host argmax, metal, and the deleted composite all agree on it)
-made structural.
-
-WHY TWO LEVELS AND NOT ONE RAMP: a single ramp V - i would need values up to
-49155 in a lane, and fp16 exact integers stop at 2048. The two-level split
-keeps EVERY lane value in the fp16-exact range: bramp <= NB = 1024 and
-lramp <= 64, and every product along the way (mask * bramp <= 1024,
-mask * sel * lramp <= 64) is an exact small-integer fp16 product. This is
-moe.py's own law -- "the lane ids ride f16 (exact to 2048; the real router's
-E = 128)" -- restated at vocab width, where a single id cannot ride f16 but
-the (block, lane) PAIR always can.
-
-THE WIDE INTEGER RIDES THE FP32 ISLAND, ONCE: the final combine
-`b* * 64 + l*` reaches 49154, past fp16's exact range, so it is computed as
-`(b.to(f32) * 64 + l.to(f32)).to(int32)` -- the f16 -> f32 widen, one f32
-multiply-add, and the f32 -> i32 cast. This is the exact island moe.py's
-gelu runs (``g32 = g.to(tl.float32)`` for a cubic that overflows f16) and
-rmsnorm.py's mean runs; on the device it is the KSPLIT pair's own recipe
-(`dl16tofp32` -> same-stick f32 adds -> `fp32todl16`/`fp32toint32`), and the
-values are whole numbers below 2^24, exact in every one of those formats.
-Everything ELSE in the kernel stays in its native fp16 domain end to end --
-the max, the equality compares, the ramp multiplies never leave it.
+FIRST-MAX BY ARITHMETIC, not by a tie-break rule. The selection never
+INVERTS anything: the decreasing ramps (bramp, lramp) make each `max` land on
+the FIRST block / FIRST lane (a strictly decreasing weight is #631's
+first-max law made structural), and the INCREASING ramps (binc, linc) read
+the selected block and lane numbers back OUT through the one-hot -- `max` of
+`onehot * binc` is b* because the one-hot lane carries b* and every other
+lane carries 0, including the b* == 0 case (an all-zero product row whose
+max is 0 IS the answer). The v5 form inverted by subtraction
+(`b = NB - jA`, `l = BLOCK - jB`); those `[1]`-shaped `splat - tensor` subs
+have no door arm and no whole-stick emission, while an equality has one
+(`equal`, the vendor's own broadcast op), so the inversion rides the
+equality selection instead. Same tie law, same sentinel, no subtractions.
 
 THE SENTINEL LAW (all-NaN row), derived not patched: a NaN lane never wins an
 ordered max and never satisfies an ordered equality, so an all-NaN row leaves
-the mask identically zero: jA = 0 (b* = NB), jB = 0 (l* = 64), and
-idx = NB * 64 + 64 = PAD_V + 64 -- past the last real lane under either NaN
-semantics (maxnumf-style combines leave m at the -inf of the pad lanes, whose
-ramps are 0; NaN-propagating combines leave m itself NaN; the mask is zero
-both ways). The caller treats idx > V as the loud refusal (the host argmax
-answers token 0 over the same row; that divergence is recorded, not
-reconciled here).
+w1 identically zero: jA = 0, and `bramp == 0` holds exactly on the PAD lanes
+(bramp is 0 there); likewise jB = 0 and `lramp == 0` selects the pad lanes.
+`onehot` is then the whole pad region, where the host stages binc = NB and
+linc = BLOCK -- so b* = NB, l* = BLOCK and idx = NB * 64 + 64 = PAD_V + 64,
+past the last real lane under either NaN semantics (maxnumf-style combines
+leave m at the -inf of the pad lanes, whose ramps are 0; NaN-propagating
+combines leave m itself NaN; w1 is zero both ways). The caller treats idx > V
+as the loud refusal (the host argmax answers token 0 over the same row; that
+divergence is recorded, not reconciled here). A finite row can never reach
+the pad lanes: its jA >= 1 (the first real block's bramp is NB or less but at
+least NB - 767) and its jB >= 1, and no pad lane holds a nonzero ramp.
+
+WHY THE BLOCK/LANE NUMBERS RIDE f16: every STAGED lane value is a whole
+number <= 1024 (NB = 1024, the ramps' ceiling), and every product along the
+way (mask * bramp <= 1024, onehot * binc <= 1023, onehot * linc <= 63) is an
+exact small-integer fp16 product. This is moe.py's own law -- "the lane ids
+ride f16 (exact to 2048; the real router's E = 128)" -- restated at vocab
+width, where a single flat id cannot ride f16 but the (block, lane) PAIR
+always can.
+
+THE WIDE INTEGER RIDES THE FP32 ISLAND, ONCE: the final combine
+`b* * 64 + l*` reaches 49154, past fp16's exact range, so it is computed as
+`(b64.to(f32) * sf + l64.to(f32)).to(int32)` -- the f16 -> f32 widens, one f32
+multiply-add against staged tables, and the f32 -> i32 cast. This is the
+exact island moe.py's gelu runs (``g32 = g.to(tl.float32)`` for a cubic that
+overflows f16) and rmsnorm.py's mean runs; on the device it is the KSPLIT
+pair's own recipe (`dl16tofp32` -> same-stick f32 multiply-add ->
+`fp32toint32`), and the values are whole numbers below 2^24, exact in every
+one of those formats. Everything ELSE in the kernel stays in its native fp16
+domain end to end -- the maxima, the equality compares, the ramp multiplies
+never leave it.
 
 DEVICE LAWS THIS SHAPE OBEYS
 ----------------------------
@@ -68,7 +84,7 @@ DEVICE LAWS THIS SHAPE OBEYS
   in ONE descriptor block, exactly as rmsnorm.py loads [BLOCK_M, D_MODEL] --
   the descriptor's iteration space carries the width, so there is NO
   per-stick loop to unroll and the door receives a straight-line program of
-  about fifteen ops (three reduces, the compare/multiply chain, the island,
+  about twenty ops (five reduces, the compare/multiply chain, the island,
   the store). A per-stick-loop form would splice to ~2300 trips and tens of
   thousands of descriptors; this form is the door-lowerable one.
 * EACH `tt.reduce` IS the golden rank-2 -> rank-1 form over the tile's second
@@ -78,6 +94,18 @@ DEVICE LAWS THIS SHAPE OBEYS
 * NO LOOPS AT ALL: not even `tl.static_range` -- every offset is the one
   [0, 0] load corner. (moe.py's law is that every loop is static; this kernel
   has none to keep static.)
+* NO `[1]`-SHAPED COMPUTE: every reduce result is consumed either by an
+  equality (through the [1] -> [1, PAD_V] broadcast the compare materialises)
+  or by the `* ones` widen (through the [1] -> [1, BLOCK] broadcast the
+  multiply materialises) -- both are operand modes of a [1, n] op, never ops
+  of their own. A `[1]`-shaped pointwise op is sub-stick on this device and
+  the door refuses it; this kernel never states one.
+* NO SPLAT OPERAND ON ANY COMPUTE OP: the widen multiplies read a LOADED
+  [1, BLOCK] table of ones and the island's scale a LOADED [1, BLOCK] f32
+  table of 64.0 -- both host-staged, neither a `tensor.splat`, so every
+  multiply in the kernel is a two-tensor `Elementwise(Mul)` (a splatted
+  operand would route to the scalar-multiply door, which addresses one
+  registry slot, not a sprayed row).
 * V, PAD_V, NB, BLOCK ARE constexpr (SPYRE-SPECIFIC): the emitter derives
   work division from descriptor extents, and Spyre compiles one kernel per
   shape. Same law as every other fixture.
@@ -87,10 +115,13 @@ DEVICE LAWS THIS SHAPE OBEYS
 
 HOST CONTRACT (the part that is not in this file)
 -------------------------------------------------
-THREE staged buffers, all host obligations for the same reason embedding.py
+SIX staged buffers, all host obligations for the same reason embedding.py
 pads nothing in-kernel and attention_sdpa.py's causal mask is
 host-precomputed: the buffers are staging rows the host already owns, and
-`other=`-masked loads are not in this frontend's vocabulary.
+`other=`-masked loads are not in this frontend's vocabulary. The first five
+are CONSTANT across decode steps (functions of V alone), so under the
+pooled-substrate regime they live in stable slots and every step's CB reads
+the same addresses:
 
 * THE LOGITS ROW is presented as [PAD_V] fp16, PAD_V = the vocab rounded UP
   to a power-of-two whole row (the descriptor block must be a power of two),
@@ -105,13 +136,21 @@ host-precomputed: the buffers are staging rows the host already owns, and
   within each block, so the first-lane law is its monotonicity. It is the
   same 64-value pattern in every block, staged expanded because a [1, 64]
   stick cannot broadcast against a [1, PAD_V] tile.
-Both ramps are CONSTANT across decode steps (functions of V alone), so the
-host stages them ONCE; under the pooled-substrate regime they live in
-stable slots and every step's CB reads the same addresses. Computing them
-in-kernel would need `V - (start + tl.arange(...))`-style arithmetic -- a
-runtime scalar added to an arange in the tile domain, a form no fixture
-carries (see the pass-2 comment in the v4 history and attention's aranges,
-which are dead code in every golden).
+* THE BLOCK INDEX TABLE is [PAD_V] fp16 with binc_i = i // 64 on the real
+  lanes and NB on the pad lanes -- 0-based and increasing, so the one-hot
+  reads b* straight out; the PAD value is the SENTINEL's block half (an
+  all-NaN row's onehot lands on the pad lanes, so b* = NB there).
+* THE LANE INDEX TABLE is [PAD_V] fp16 with linc_i = i % 64 on the real
+  lanes and BLOCK on the pad lanes -- the lane half of the same law.
+* THE WIDEN TABLES are [1, BLOCK] fp16 of 1.0 (the `* ones` widen, staging
+  what a `tl.full` constant would splat, so the multiply stays a two-tensor
+  op) and [1, BLOCK] fp32 of 64.0 (the island's scale, in the island's own
+  dtype so the f32 multiply is also two-tensor).
+
+Computing the ramps in-kernel would need `V - (start + tl.arange(...))`-style
+arithmetic -- a runtime scalar added to an arange in the tile domain, a form
+no fixture carries (see the pass-2 comment in the v4 history and attention's
+aranges, which are dead code in every golden).
 
 The output is ONE i32 value (the gather ingestion law: index tables are
 SENUINT32 at wordLength 4), stored as a [1, 64] i32 stick with every lane
@@ -139,7 +178,8 @@ DTYPE = torch.float16
 
 
 @triton.jit
-def argmax_first_max_kernel(logits_ptr, bramp_ptr, lramp_ptr, idx_ptr,
+def argmax_first_max_kernel(logits_ptr, bramp_ptr, lramp_ptr, binc_ptr, linc_ptr,
+                            ones_ptr, sixtyfour_ptr, idx_ptr,
                             V: tl.constexpr, PAD_V: tl.constexpr,
                             NB: tl.constexpr, BLOCK: tl.constexpr):
     # THE WHOLE ROW IS ONE TILE: one load, [1, PAD_V], the rmsnorm fixture's own
@@ -167,41 +207,70 @@ def argmax_first_max_kernel(logits_ptr, bramp_ptr, lramp_ptr, idx_ptr,
     mask = (x == mm).to(tl.float16)
     w1 = mask * bramp
     jA = tl.max(w1, axis=1).to(tl.float16)
-    b = NB - jA  # the first maximal block, [1]
-
-    # LEVEL 2 -- the FIRST lane within block b*. sel is one exactly on block
-    # b*'s lanes (bramp is constant per block, so bramp == the block's own
-    # indicator selects it and nothing else; the pad lanes' 0 never matches a
-    # b* that a real lane won). lramp is the staged per-lane table, strictly
-    # decreasing within each block; mask * sel * lramp <= 64.
+    # The equality inverts the ramp: bramp is CONSTANT per block, so comparing
+    # it against its own value at the first maximal block selects that block
+    # and nothing else. No subtraction anywhere in the kernel.
     sel = (bramp == tl.expand_dims(jA, 1)).to(tl.float16)
+
+    # LEVEL 2 -- the FIRST lane within block b*. lramp is the staged per-lane
+    # table, strictly decreasing within each block; mask * sel * lramp <= 64.
     lr_desc = tl.make_tensor_descriptor(lramp_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
                                         block_shape=[1, PAD_V])
     lramp = lr_desc.load([0, 0])
     w2 = mask * sel * lramp
     jB = tl.max(w2, axis=1).to(tl.float16)
-    l = BLOCK - jB  # the first maximal lane within b*, [1]
+    # lramp is PERIODIC (the same 64 values in every block), so this equality
+    # selects lane l* of EVERY block -- and intersected with sel (block b*
+    # only) it is the one-hot at the first maximal lane. The mask is already
+    # carried by jA and jB, so it is not needed here.
+    selL = (lramp == tl.expand_dims(jB, 1)).to(tl.float16)
+    onehot = sel * selL
 
-    # THE WIDE INTEGER RIDES THE FP32 ISLAND, ONCE: b * 64 + l reaches 49154,
-    # past fp16's exact range, so the combine widens, multiplies-adds in f32
-    # (exact below 2^24), and casts to i32 -- moe.py's gelu island and the
-    # KSPLIT pair's own device recipe. The [1]s broadcast to the [1, BLOCK]
-    # output stick through the unit-dim multiply (the tl.maximum broadcast
-    # law: no tl.broadcast_to, no splat of an interior value).
-    ones = tl.full([1, BLOCK], 1.0, tl.float16)
-    b64 = tl.expand_dims(b, 1) * ones
-    l64 = tl.expand_dims(l, 1) * ones
-    idx = (b64.to(tl.float32) * 64.0 + l64.to(tl.float32)).to(tl.int32)
-    o_desc = tl.make_tensor_descriptor(idx_ptr, shape=[1, BLOCK], strides=[BLOCK, 1],
+    # READ THE NUMBERS OUT through the one-hot: binc and linc are the staged
+    # INCREASING 0-based index tables, so the max of the masked product IS the
+    # selected block / lane number -- including the b* == 0 case, where an
+    # all-zero product row's max is 0 and 0 is the answer.
+    bi_desc = tl.make_tensor_descriptor(binc_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
+                                        block_shape=[1, PAD_V])
+    binc = bi_desc.load([0, 0])
+    wB = onehot * binc
+    bstar = tl.max(wB, axis=1).to(tl.float16)
+    li_desc = tl.make_tensor_descriptor(linc_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
+                                        block_shape=[1, PAD_V])
+    linc = li_desc.load([0, 0])
+    wL = onehot * linc
+    lstar = tl.max(wL, axis=1).to(tl.float16)
+
+    # WIDEN TO THE OUTPUT STICK through a LOADED ones table: the [1]s broadcast
+    # to [1, BLOCK] as an operand mode of a two-tensor multiply (a `tl.full`
+    # constant would splat and route the op to the scalar-multiply door; a
+    # staged row keeps it `Elementwise(Mul)` -- and the frontend folds a
+    # multiply-by-ones constant away entirely, so the table is load-bearing).
+    o_desc = tl.make_tensor_descriptor(ones_ptr, shape=[1, BLOCK], strides=[BLOCK, 1],
                                        block_shape=[1, BLOCK])
-    o_desc.store([0, 0], idx)
+    ones = o_desc.load([0, 0])
+    b64 = tl.expand_dims(bstar, 1) * ones
+    l64 = tl.expand_dims(lstar, 1) * ones
+
+    # THE WIDE INTEGER RIDES THE FP32 ISLAND, ONCE: b* * 64 + l* reaches 49154,
+    # past fp16's exact range, so the combine widens, multiplies-adds in f32
+    # (exact below 2^24) against a staged f32 scale table, and casts to i32 --
+    # moe.py's gelu island and the KSPLIT pair's own device recipe.
+    sf_desc = tl.make_tensor_descriptor(sixtyfour_ptr, shape=[1, BLOCK], strides=[BLOCK, 1],
+                                        block_shape=[1, BLOCK])
+    sf = sf_desc.load([0, 0])
+    idx = (b64.to(tl.float32) * sf + l64.to(tl.float32)).to(tl.int32)
+    i_desc = tl.make_tensor_descriptor(idx_ptr, shape=[1, BLOCK], strides=[BLOCK, 1],
+                                       block_shape=[1, BLOCK])
+    i_desc.store([0, 0], idx)
 
 
 def inputs(seed: int = 0):
-    """The three staged buffers (host contract): one fp16 logits row, pad
+    """The six staged buffers (host contract): one fp16 logits row, pad
     lanes -inf, with a deliberate TIE at the max -- lanes 40017 and 48000 both
     hold the row's largest value, so the reference pins FIRST-max against a
-    real tie, not a vacuous one -- plus the two constant ramps.
+    real tie, not a vacuous one -- plus the four constant index tables and the
+    two widen tables.
 
     The tie lanes are HIGH on purpose, and that is a second pin: the answer
     40017 = 625*64 + 17 is NOT representable in fp16 (the format's ULP is 32
@@ -223,10 +292,16 @@ def inputs(seed: int = 0):
     row[:V] = x
     bramp = torch.zeros(PAD_V, dtype=DTYPE)
     lramp = torch.zeros(PAD_V, dtype=DTYPE)
+    binc = torch.full((PAD_V,), NB, dtype=DTYPE)
+    linc = torch.full((PAD_V,), BLOCK, dtype=DTYPE)
     for i in range(V):
         bramp[i] = NB - (i // BLOCK)
         lramp[i] = BLOCK - (i % BLOCK)
-    return row, bramp, lramp
+        binc[i] = i // BLOCK
+        linc[i] = i % BLOCK
+    ones = torch.ones((1, BLOCK), dtype=DTYPE)
+    sixtyfour = torch.full((1, BLOCK), 64.0, dtype=torch.float32)
+    return row, bramp, lramp, binc, linc, ones, sixtyfour
 
 
 def reference(row: torch.Tensor) -> torch.Tensor:
