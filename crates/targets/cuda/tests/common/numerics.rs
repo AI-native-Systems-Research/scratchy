@@ -3,8 +3,9 @@
 //! bf16 inputs the GPU read, and the per-element bound
 //! `|gpu − ref| ≤ 2⁻⁷·|ref| + 2⁻¹⁴·S`, with `S = Σₖ |A[i,k]·B[j,k]|`.
 //!
-//! The relative term is 2× the half-ulp the single bf16 rounding on store costs, and the absolute
-//! term covers f32 accumulation-order error (about √K·2⁻²⁴·S) with a wide margin. A dropped or
+//! The relative term is twice the worst case of the single bf16 rounding on store (half an ulp,
+//! just under 2⁻⁸ of the value), and the absolute term covers f32 accumulation-order error (about
+//! √K·2⁻²⁴·S) with a wide margin. A dropped or
 //! repeated K step, or a wrong-layout B operand, moves an element far past the bound. NaN or Inf
 //! fails.
 
@@ -72,12 +73,16 @@ impl Comparison {
         self.out_of_bound == 0
     }
 
-    /// `max_abs_err=.. mean_abs_err=.. worst=(i,j) gpu=.. ref=.. bound=.. out_of_bound=..`.
+    /// `max_abs_err=.. mean_abs_err=.. worst=(i,j) gpu=.. ref=.. err=.. bound=.. ratio=..
+    /// out_of_bound=..`: the global errors, then the element with the largest error relative to
+    /// its bound, with its OWN error, its bound and their ratio (a pass has every ratio ≤ 1).
     pub fn line(&self) -> String {
         let (wi, wj, wgpu, wref, wbound) = self.worst;
+        let werr = (wgpu - wref).abs();
+        let ratio = werr / wbound.max(f64::MIN_POSITIVE);
         format!(
-            "max_abs_err={:.6} mean_abs_err={:.6} worst=({wi},{wj}) gpu={wgpu} ref={wref:.6} \
-             bound={wbound:.6} out_of_bound={}",
+            "max_abs_err={:.6e} mean_abs_err={:.6e} worst=({wi},{wj}) gpu={wgpu} ref={wref:.6e} \
+             err={werr:.6e} bound={wbound:.6e} ratio={ratio:.4} out_of_bound={}",
             self.max_abs_err, self.mean_abs_err, self.out_of_bound
         )
     }
@@ -121,9 +126,12 @@ pub fn compare(gpu: &[u16], a: &[u16], b: &[u16], m: usize, n: usize, k: usize) 
 // ── The row kernels (RMSNorm, add, SiluMul) ─────────────────────────
 //
 // Each reference is computed in f64 from the same bf16 values the GPU read. RMSNorm and SiluMul
-// pass under `|gpu − ref| ≤ 2⁻⁸·|ref| + 2⁻²⁴`: 2⁻⁸ is twice the half-ulp of their one bf16
-// rounding, and covers the f32 arithmetic and the fast-math `rsqrtf`, `__expf` and division with
-// a wide margin; 2⁻²⁴ is the floor flush-to-zero needs. The add is bit-exact: its reference is the
+// pass under `|gpu − ref| ≤ 2⁻⁸·|ref| + 2⁻²⁴`. One bf16 rounding costs at most half an ulp, which
+// is just under 2⁻⁸ of the value (the worst case is a midpoint just above a power of two), so
+// 2⁻⁸ is the worst case of that one rounding, not twice it, and a worst-element ratio near 0.99
+// is expected. The margin left there, about 2⁻¹⁶·|ref|, covers the f32 arithmetic (about 2⁻²⁰ or
+// less, the fast-math `rsqrtf`, `__expf` and division included); 2⁻²⁴ is the floor
+// flush-to-zero needs. The add is bit-exact: its reference is the
 // kernel's own sequence (an exact widening, one f32 add, one rounding).
 
 /// The row kernels' relative bound, `2⁻⁸`.
@@ -234,5 +242,159 @@ pub fn centred_gains(len: usize, seed: u64) -> Vec<u16> {
     bf16_inputs(len, seed)
         .into_iter()
         .map(|b| bits(bf16::from_bits(b).to_f32() / 4.0))
+        .collect()
+}
+
+// ── The attention prelude and gate (rope, gate split, gate apply) ──
+//
+// Each reference is f64, from the same bf16 values the GPU read, the rotary table's included.
+// A rotated pair passes under `|gpu − ref| ≤ 2⁻⁸·|ref| + 2⁻¹⁶·S + 2⁻²⁴`, `S = |x0·c| + |x1·s|`:
+// the `S` term covers cancellation, where `ref` is near 0 but the f32 products are not. The
+// pass-through lanes and the gate split are bit-exact. The gate apply passes under the row
+// kernels' bound.
+
+/// The rope's bound on a rotated element whose reference is `r`, its products' magnitudes `s`.
+pub fn rope_bound(r: f64, s: f64) -> f64 {
+    r.abs() * ROW_REL + s / 65_536.0 + ROW_ABS
+}
+
+/// The rope's reference for `x [rows, cols]` under `table [rows, rot_dim]`, as `(ref, S)` per
+/// element: each head's lane `d < rot_dim/2` paired with lane `d + pair`, both rotated by the
+/// table's pair `d`. `pair` is `rot_dim / 2` for the real rope; `head_dim / 2` is the full-head
+/// pairing of the self-check, the values a kernel pairing across the whole head would write at
+/// lanes `d` and `d + 128`. `None` for a lane the pairing does not rotate, which the real rope
+/// passes through bit for bit.
+pub fn rope_reference(
+    x: &[u16],
+    table: &[u16],
+    (rows, cols): (usize, usize),
+    (head_dim, rot_dim): (usize, usize),
+    pair: usize,
+) -> Vec<Option<(f64, f64)>> {
+    let (x, t) = (widen(x), widen(table));
+    let half = rot_dim / 2;
+    let mut out = vec![None; rows * cols];
+    for r in 0..rows {
+        let (c, s) = t[r * rot_dim..][..rot_dim].split_at(half);
+        for h in 0..cols / head_dim {
+            let base = r * cols + h * head_dim;
+            for d in 0..half {
+                let (x0, x1) = (x[base + d], x[base + d + pair]);
+                let mag = (x0 * c[d]).abs() + (x1 * s[d]).abs();
+                out[base + d] = Some((x0 * c[d] - x1 * s[d], mag));
+                out[base + d + pair] = Some((x1 * c[d] + x0 * s[d], mag));
+            }
+        }
+    }
+    out
+}
+
+/// How a rope's output compares with its reference: the rotated lanes under [`rope_bound`], and
+/// the count of pass-through lanes that differ from the input in any bit.
+pub struct RopeComparison {
+    pub rotated: Comparison,
+    pub pass_through_mismatched: usize,
+}
+
+/// Compare `gpu` (`[rows, cols]` bf16 bits) with `refs` ([`rope_reference`]) and the input `x`.
+pub fn compare_rope(
+    gpu: &[u16],
+    x: &[u16],
+    refs: &[Option<(f64, f64)>],
+    cols: usize,
+) -> RopeComparison {
+    assert_eq!(
+        gpu.len(),
+        refs.len(),
+        "the GPU output and the reference differ in length"
+    );
+    let (mut max_err, mut sum_err, mut bad, mut n) = (0.0f64, 0.0f64, 0usize, 0usize);
+    let (mut worst, mut worst_ratio) = ((0, 0, 0.0f64, 0.0f64, 0.0f64), -1.0f64);
+    let mut pass_through_mismatched = 0;
+    for (idx, (&bits, r)) in gpu.iter().zip(refs).enumerate() {
+        let Some((r, s)) = *r else {
+            pass_through_mismatched += usize::from(bits != x[idx]);
+            continue;
+        };
+        n += 1;
+        let g = f64::from(bf16::from_bits(bits).to_f32());
+        let bound = rope_bound(r, s);
+        let err = (g - r).abs();
+        if !(g.is_finite() && err <= bound) {
+            bad += 1;
+        }
+        let ratio = if g.is_finite() {
+            err / bound
+        } else {
+            f64::INFINITY
+        };
+        if ratio > worst_ratio {
+            worst_ratio = ratio;
+            worst = (idx / cols, idx % cols, g, r, bound);
+        }
+        if g.is_finite() {
+            max_err = max_err.max(err);
+            sum_err += err;
+        }
+    }
+    RopeComparison {
+        rotated: Comparison {
+            max_abs_err: max_err,
+            mean_abs_err: sum_err / n.max(1) as f64,
+            worst,
+            out_of_bound: bad,
+        },
+        pass_through_mismatched,
+    }
+}
+
+/// How many of the rotated elements of `gpu` a reference with another pairing (`wrong`) puts
+/// outside its bound, and how many rotated elements there are: the full-head-pairing self-check.
+pub fn rope_misses(gpu: &[u16], wrong: &[Option<(f64, f64)>]) -> (usize, usize) {
+    let (mut missed, mut n) = (0, 0);
+    for (&bits, r) in gpu.iter().zip(wrong) {
+        if let Some((r, s)) = *r {
+            n += 1;
+            let g = f64::from(bf16::from_bits(bits).to_f32());
+            missed += usize::from((g - r).abs() > rope_bound(r, s));
+        }
+    }
+    (missed, n)
+}
+
+/// The per-head split of `qg [rows, 2·half_cols]`: `(q, gate)`, each `[rows, half_cols]`.
+pub fn gate_split_reference(
+    qg: &[u16],
+    (rows, half_cols): (usize, usize),
+    head_dim: usize,
+) -> (Vec<u16>, Vec<u16>) {
+    let (mut q, mut gate) = (Vec::with_capacity(rows * half_cols), Vec::new());
+    gate.reserve(rows * half_cols);
+    for row in qg.chunks_exact(2 * half_cols).take(rows) {
+        for head in row.chunks_exact(2 * head_dim) {
+            q.extend_from_slice(&head[..head_dim]);
+            gate.extend_from_slice(&head[head_dim..]);
+        }
+    }
+    (q, gate)
+}
+
+/// The split by halves of the whole row (`qg[:, :half]`, `qg[:, half:]`), the self-check's wrong
+/// split.
+pub fn whole_row_split(qg: &[u16], half_cols: usize) -> (Vec<u16>, Vec<u16>) {
+    let (mut q, mut gate) = (Vec::new(), Vec::new());
+    for row in qg.chunks_exact(2 * half_cols) {
+        q.extend_from_slice(&row[..half_cols]);
+        gate.extend_from_slice(&row[half_cols..]);
+    }
+    (q, gate)
+}
+
+/// `a / (1 + e^(−g))` per element, in f64.
+pub fn gate_apply_reference(attn: &[u16], gate: &[u16]) -> Vec<f64> {
+    widen(attn)
+        .iter()
+        .zip(widen(gate))
+        .map(|(a, g)| a / (1.0 + (-g).exp()))
         .collect()
 }

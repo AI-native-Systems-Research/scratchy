@@ -56,6 +56,33 @@ unsafe extern "C" {
         cols: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_rope_bf16(
+        x: *const c_void,
+        table: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        head_dim: u32,
+        rot_dim: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gate_split_bf16(
+        qg: *const c_void,
+        q: *mut c_void,
+        gate: *mut c_void,
+        rows: u32,
+        half_cols: u32,
+        head_dim: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gate_apply_bf16(
+        attn: *const c_void,
+        gate: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// Why a launcher did not launch, or the launch failed.
@@ -63,8 +90,22 @@ unsafe extern "C" {
 pub enum KernelError {
     /// The GEMM does not take this shape; nothing was launched.
     Shape { m: u32, n: u32, k: u32 },
-    /// A row kernel (RMSNorm, add, SiluMul) does not take this shape; nothing was launched.
+    /// A row kernel (RMSNorm, add, SiluMul, GateApply) does not take this shape; nothing was
+    /// launched.
     RowShape { rows: u32, cols: u32 },
+    /// The rope does not take this shape; nothing was launched.
+    RopeShape {
+        rows: u32,
+        cols: u32,
+        head_dim: u32,
+        rot_dim: u32,
+    },
+    /// The gate split does not take this shape; nothing was launched.
+    GateShape {
+        rows: u32,
+        half_cols: u32,
+        head_dim: u32,
+    },
     /// The launcher's C++ host code threw (caught before it could reach Rust).
     HostException,
     /// A `cudaError_t` from the kernel's one-time setup or from its launch.
@@ -78,6 +119,23 @@ impl fmt::Display for KernelError {
             KernelError::RowShape { rows, cols } => {
                 write!(f, "kernel refused shape rows={rows} cols={cols}")
             }
+            KernelError::RopeShape {
+                rows,
+                cols,
+                head_dim,
+                rot_dim,
+            } => write!(
+                f,
+                "rope refused shape rows={rows} cols={cols} head_dim={head_dim} rot_dim={rot_dim}"
+            ),
+            KernelError::GateShape {
+                rows,
+                half_cols,
+                head_dim,
+            } => write!(
+                f,
+                "gate split refused shape rows={rows} half_cols={half_cols} head_dim={head_dim}"
+            ),
             KernelError::HostException => write!(f, "kernel launcher's host code threw"),
             KernelError::Cuda(code) => write!(f, "CUDA error {code}"),
         }
@@ -217,5 +275,103 @@ pub unsafe fn silu_mul_bf16(
 ) -> Result<(), KernelError> {
     // SAFETY: as `rms_norm_bf16`'s.
     let code = unsafe { scratchy_cuda_silu_mul_bf16(gate, up, out, rows, cols, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the bf16 partial rotary embedding over `x` and `out` `[rows, cols]`, `cols = heads ·
+/// head_dim`: per head, the first `rot_dim` lanes rotated in NeoX pairing within that width
+/// (`(d, d + rot_dim/2)`) by `table`'s row for the token, `[cos(0..R/2) | sin(0..R/2)]`, in f32
+/// with one bf16 rounding per output; the lanes `rot_dim..head_dim` copied bit for bit.
+/// Asynchronous.
+///
+/// Refused with [`KernelError::RopeShape`], before any pointer is touched, unless `rows`, `cols`,
+/// `head_dim` and `rot_dim` are non-zero, `rot_dim` is a multiple of 16
+/// (`step::ROPE_BF16_ROT_MULTIPLE`) and at most `head_dim`, `head_dim` a multiple of 8, `cols` a
+/// multiple of `head_dim`, and `rows · cols` at most `i32::MAX`. A failed launch returns the
+/// launch's own `cudaError_t`.
+///
+/// # Safety
+///
+/// `x`, `table` and `out` must be 16-byte-aligned device pointers to at least `rows·cols`,
+/// `rows·rot_dim` and `rows·cols` bf16 elements, valid for the whole kernel, with `out`
+/// overlapping neither input. `stream` must be a live `cudaStream_t` of the current device, or
+/// null for the default stream.
+pub unsafe fn rope_bf16(
+    x: *const c_void,
+    table: *const c_void,
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    (head_dim, rot_dim): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code =
+        unsafe { scratchy_cuda_rope_bf16(x, table, out, rows, cols, head_dim, rot_dim, stream) };
+    check(
+        code,
+        KernelError::RopeShape {
+            rows,
+            cols,
+            head_dim,
+            rot_dim,
+        },
+    )
+}
+
+/// Launch the bf16 per-head gate split: for head `h` and lane `d`, `q[r, h·hd + d] =
+/// qg[r, 2h·hd + d]` and `gate[r, h·hd + d] = qg[r, 2h·hd + hd + d]`, `qg` `[rows, 2·half_cols]`
+/// and `q`, `gate` `[rows, half_cols]`. Copies, so bit-exact. Asynchronous.
+///
+/// Refused with [`KernelError::GateShape`], before any pointer is touched, unless `rows`,
+/// `half_cols` and `head_dim` are non-zero, `head_dim` a multiple of 8
+/// (`step::GATE_SPLIT_BF16_HEAD_MULTIPLE`), `half_cols` a multiple of `head_dim`, and
+/// `rows · 2·half_cols` at most `i32::MAX`. A failed launch returns the launch's own
+/// `cudaError_t`.
+///
+/// # Safety
+///
+/// `qg`, `q` and `gate` must be 16-byte-aligned device pointers to at least `rows·2·half_cols`,
+/// `rows·half_cols` and `rows·half_cols` bf16 elements, valid for the whole kernel, no two
+/// overlapping. `stream` must be a live `cudaStream_t` of the current device, or null for the
+/// default stream.
+pub unsafe fn gate_split_bf16(
+    qg: *const c_void,
+    q: *mut c_void,
+    gate: *mut c_void,
+    (rows, half_cols): (u32, u32),
+    head_dim: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code =
+        unsafe { scratchy_cuda_gate_split_bf16(qg, q, gate, rows, half_cols, head_dim, stream) };
+    check(
+        code,
+        KernelError::GateShape {
+            rows,
+            half_cols,
+            head_dim,
+        },
+    )
+}
+
+/// Launch the bf16 `out = attn / (1 + e^(−gate))` over `[rows, cols]`, in f32 with one bf16
+/// rounding per element. Asynchronous; the shape rule is the row kernels'
+/// (`step::GATE_APPLY_BF16_COLS`).
+///
+/// # Safety
+///
+/// `attn`, `gate` and `out` must be 16-byte-aligned device pointers to at least `rows·cols` bf16
+/// elements each, valid for the whole kernel, with `out` overlapping neither input. `stream` must
+/// be a live `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn gate_apply_bf16(
+    attn: *const c_void,
+    gate: *const c_void,
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe { scratchy_cuda_gate_apply_bf16(attn, gate, out, rows, cols, stream) };
     check(code, KernelError::RowShape { rows, cols })
 }

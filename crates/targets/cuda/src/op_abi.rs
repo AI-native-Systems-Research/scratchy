@@ -164,6 +164,7 @@ mod tests {
     use super::*;
 
     use scratchy_subtile::lower::GemmWeight;
+    use scratchy_subtile::model_geometry::HeadDim;
     use scratchy_subtile::subtile_ir::{GainConvention, RowScale};
     use scratchy_subtile::tape_colouring::{Outputs, Reads, Residency};
 
@@ -200,7 +201,15 @@ mod tests {
             residency: Residency::Arena,
             ..ColourRule::FRESH
         };
-        let cases: [(SubOp, ColourRule); 10] = [
+        let cases: [(SubOp, ColourRule); 12] = [
+            (
+                SubOp::RopeRotate {
+                    head_dim: HeadDim::new(256),
+                    _form: std::marker::PhantomData,
+                },
+                fresh_across(Outputs::One),
+            ),
+            (SubOp::GateApply, fresh_across(Outputs::One)),
             (
                 SubOp::Reshape {
                     rows: RowScale::Times(NonZeroU32::MIN),

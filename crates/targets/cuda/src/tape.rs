@@ -44,6 +44,30 @@ pub struct ArenaLayout {
     pub total_bytes: u64,
 }
 
+/// The forward's rotary table: one row per token, `[bucket_m, rot_dim]` bf16, row `t` laid out
+/// `[cos θ_t,0..R/2 | sin θ_t,0..R/2]` with `θ_t,i = p_t · theta^(−2i/R)`.
+///
+/// Its place, size and constants are fixed at expansion; its contents are the forward's runtime
+/// data, built on the host from the token positions (`crate::rotary::rotary_rows`) and uploaded
+/// with the input, as token ids are. It is not a colour, and not a weight: every `Cos`/`Sin`
+/// source the canonical binds reads this one table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RotaryTable {
+    /// Where the table lives in the arena, after every colour.
+    pub span: ArenaSpan,
+    /// `R`, the rotated width of each head.
+    pub rot_dim: u32,
+    /// `rope_theta` as its bits (`f64::to_bits`), so the table is `Eq`; [`Self::theta`] reads it.
+    pub theta_bits: u64,
+}
+
+impl RotaryTable {
+    /// The table's `rope_theta`.
+    pub const fn theta(&self) -> f64 {
+        f64::from_bits(self.theta_bits)
+    }
+}
+
 /// One bucket's forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CudaTape {
@@ -59,6 +83,8 @@ pub struct CudaTape {
     pub weight_bytes: &'static [u64],
     /// One step per launch, in launch order.
     pub steps: &'static [CudaStep],
+    /// The rotary table the forward fills, when a step reads one; `None` for a tape with no rope.
+    pub rotary: Option<RotaryTable>,
 }
 
 /// Why a tape cannot be played: it would make a kernel read or write outside the arena, or read
@@ -90,11 +116,22 @@ pub enum TapeError {
         span: ArenaSpan,
         total: u64,
     },
-    /// The span the `step`-th step writes overlaps one it reads.
+    /// A span the `step`-th step writes overlaps one it reads.
     WriteOverlapsRead {
         step: usize,
         write: ArenaSpan,
         read: ArenaSpan,
+    },
+    /// The two spans the `step`-th step writes overlap each other.
+    WritesOverlap { step: usize },
+    /// The rotary table is not at a multiple of [`CUDA_ARENA_ALIGN`], or reaches past the arena.
+    RotaryOutside { span: ArenaSpan, total: u64 },
+    /// The rotary table's span is not `bucket_m` rows of `rot_dim` bf16, or `rot_dim` is not a
+    /// non-zero even number: the forward would fill a different number of bytes than it holds.
+    RotaryShape {
+        span: ArenaSpan,
+        bucket_m: u32,
+        rot_dim: u32,
     },
     /// The `step`-th step reads weight `ix`, and the tape declares `weights` weights.
     WeightIndex {
@@ -168,6 +205,28 @@ impl std::fmt::Display for TapeError {
                     "step {step} writes {wb} bytes at {wo} over the {rb} bytes at {ro} it reads"
                 )
             }
+            Self::WritesOverlap { step } => {
+                write!(f, "the two spans step {step} writes overlap each other")
+            }
+            Self::RotaryOutside { span, total } => {
+                let (bytes, offset) = at(span);
+                write!(
+                    f,
+                    "the rotary table ({bytes} bytes at {offset}) is misaligned or reaches past \
+                     the {total}-byte arena"
+                )
+            }
+            Self::RotaryShape {
+                span,
+                bucket_m,
+                rot_dim,
+            } => write!(
+                f,
+                "the rotary table is {} bytes; {bucket_m} rows of rot_dim = {rot_dim} bf16 (a \
+                 non-zero even width) are {}",
+                span.bytes,
+                u64::from(*bucket_m) * u64::from(*rot_dim) * CUDA_ACT_BYTES
+            ),
             Self::WeightIndex { step, ix, weights } => write!(
                 f,
                 "step {step} reads weight {ix}, and the tape declares {weights} weights"
@@ -190,10 +249,10 @@ impl std::error::Error for TapeError {}
 impl CudaTape {
     /// Check that playing this tape stays inside its arena and its declared weights.
     ///
-    /// Every colour is aligned and inside `total_bytes`, and so are the input and result spans.
-    /// Every step's spans ([`CudaStep::extents`]) are aligned and inside `total_bytes`, its write
-    /// overlaps none of its reads, and each weight it reads is one the tape declares, declared at
-    /// least as large as the step reads. All arithmetic is checked. The worker runs this on every
+    /// Every colour is aligned and inside `total_bytes`, and so are the input and result spans and
+    /// the rotary table. Every step's spans ([`CudaStep::extents`]) are aligned and inside
+    /// `total_bytes`, each span it writes overlaps none of its reads nor its other write, and each
+    /// weight it reads is one the tape declares, declared at least as large as the step reads. All arithmetic is checked. The worker runs this on every
     /// tape before it allocates anything; its own weight checks then close the chain from each
     /// step to the buffer it reads.
     pub fn validate(&self) -> Result<(), TapeError> {
@@ -233,10 +292,31 @@ impl CudaTape {
                 total,
             });
         }
+        if let Some(t) = self.rotary {
+            if !(t.span.offset.0.is_multiple_of(CUDA_ARENA_ALIGN) && inside(t.span, total)) {
+                return Err(TapeError::RotaryOutside {
+                    span: t.span,
+                    total,
+                });
+            }
+            // The forward fills exactly `bucket_m · rot_dim` bf16 into the span, in rows of
+            // `rot_dim/2` cos and `rot_dim/2` sin.
+            let rows_bytes =
+                (u64::from(self.bucket_m) * u64::from(t.rot_dim)).checked_mul(CUDA_ACT_BYTES);
+            if t.rot_dim == 0 || t.rot_dim % 2 != 0 || rows_bytes != Some(t.span.bytes) {
+                return Err(TapeError::RotaryShape {
+                    span: t.span,
+                    bucket_m: self.bucket_m,
+                    rot_dim: t.rot_dim,
+                });
+            }
+        }
         for (step, s) in self.steps.iter().enumerate() {
             let e = s.extents().ok_or(TapeError::StepOverflow { step })?;
             let reads = e.reads.iter().flatten();
-            for &span in reads.clone().chain([&e.writes]) {
+            let writes = [Some(e.writes), e.second_write];
+            let writes = writes.iter().flatten();
+            for &span in reads.clone().chain(writes.clone()) {
                 if !span.offset.0.is_multiple_of(CUDA_ARENA_ALIGN) {
                     return Err(TapeError::StepMisaligned {
                         step,
@@ -247,12 +327,13 @@ impl CudaTape {
                     return Err(TapeError::StepOutside { step, span, total });
                 }
             }
-            if let Some(&read) = reads.clone().find(|&&r| overlap(r, e.writes)) {
-                return Err(TapeError::WriteOverlapsRead {
-                    step,
-                    write: e.writes,
-                    read,
-                });
+            for &write in writes {
+                if let Some(&read) = reads.clone().find(|&&r| overlap(r, write)) {
+                    return Err(TapeError::WriteOverlapsRead { step, write, read });
+                }
+            }
+            if e.second_write.is_some_and(|w| overlap(w, e.writes)) {
+                return Err(TapeError::WritesOverlap { step });
             }
             if let Some(w) = e.weight {
                 let weights = self.weight_bytes.len();
@@ -289,7 +370,7 @@ mod tests {
     use scratchy_subtile::subtile_ir::GainConvention;
 
     use super::*;
-    use crate::step::{AddBf16, GemmBf16, RmsNormBf16};
+    use crate::step::{AddBf16, GateSplitBf16, GemmBf16, RmsNormBf16, RopeBf16};
 
     const fn span(offset: u64, bytes: u64) -> ArenaSpan {
         ArenaSpan {
@@ -333,6 +414,7 @@ mod tests {
         result: span(786432, 524288),
         weight_bytes: &[0, 1048576, 2048],
         steps: GOOD_STEPS,
+        rotary: None,
     };
 
     /// `GOOD` with its steps replaced by `step` alone.
@@ -534,6 +616,139 @@ mod tests {
                 ix: 2,
                 need: 1048576,
                 declared: 2048
+            })
+        );
+    }
+
+    /// `GOOD` with a rotary table of `bytes` at `offset`.
+    fn with_rotary(offset: u64, bytes: u64) -> CudaTape {
+        CudaTape {
+            rotary: Some(RotaryTable {
+                span: span(offset, bytes),
+                rot_dim: 64,
+                theta_bits: 1e7f64.to_bits(),
+            }),
+            ..GOOD
+        }
+    }
+
+    /// `GOOD`'s 256 rows of 64 bf16: the table's bytes.
+    const TABLE: u64 = 256 * 64 * 2;
+    /// The arena's last `TABLE` bytes.
+    const TABLE_AT: u64 = 1310720 - TABLE;
+
+    #[test]
+    fn a_rotary_table_inside_the_arena_validates() {
+        let t = with_rotary(TABLE_AT, TABLE);
+        assert_eq!(t.validate(), Ok(()));
+        assert_eq!(t.rotary.map(|r| r.theta()), Some(1e7));
+    }
+
+    #[test]
+    fn rotary_outside() {
+        for (offset, bytes) in [
+            (TABLE_AT + 256, TABLE),
+            (TABLE_AT + 128, TABLE),
+            (u64::MAX - 255, TABLE),
+        ] {
+            assert_eq!(
+                with_rotary(offset, bytes).validate(),
+                Err(TapeError::RotaryOutside {
+                    span: span(offset, bytes),
+                    total: 1310720
+                }),
+                "{offset}, {bytes}"
+            );
+        }
+    }
+
+    /// A table of another size than `bucket_m · rot_dim` bf16, or of an odd or zero width.
+    #[test]
+    fn rotary_shape() {
+        let t = with_rotary(TABLE_AT, TABLE - 256);
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::RotaryShape {
+                span: span(TABLE_AT, TABLE - 256),
+                bucket_m: 256,
+                rot_dim: 64
+            })
+        );
+        for rot_dim in [0, 63] {
+            let mut t = with_rotary(TABLE_AT, TABLE);
+            if let Some(r) = t.rotary.as_mut() {
+                r.rot_dim = rot_dim;
+            }
+            assert!(
+                matches!(t.validate(), Err(TapeError::RotaryShape { rot_dim: r, .. }) if r == rot_dim),
+                "rot_dim {rot_dim}"
+            );
+        }
+    }
+
+    /// A 64-token rope over `[64, 2048]` reading `x` from colour 1, the table from the arena's
+    /// last 8192 bytes, and writing colour 2.
+    fn rope(table: u64) -> CudaStep {
+        CudaStep::Rope(RopeBf16 {
+            x: ArenaOffset(262144),
+            table: ArenaOffset(table),
+            out: ArenaOffset(786432),
+            rows: 64,
+            cols: 2048,
+            head_dim: 256,
+            rot_dim: 64,
+        })
+    }
+
+    #[test]
+    fn a_rope_reads_its_table() {
+        assert_eq!(with_step(rope(1302528)).validate(), Ok(()));
+        assert_eq!(
+            with_step(rope(1306624)).validate(),
+            Err(TapeError::StepOutside {
+                step: 0,
+                span: span(1306624, 8192),
+                total: 1310720
+            })
+        );
+    }
+
+    /// A split of `qg [64, 2048]` at 0 into `q [64, 1024]` at 262144 and the gate at `gate`.
+    fn gate_split(gate: u64) -> CudaStep {
+        CudaStep::GateSplit(GateSplitBf16 {
+            qg: ArenaOffset(0),
+            q: ArenaOffset(262144),
+            gate: ArenaOffset(gate),
+            rows: 64,
+            half_cols: 1024,
+            head_dim: 256,
+        })
+    }
+
+    #[test]
+    fn a_gate_split_checks_both_writes() {
+        assert_eq!(with_step(gate_split(786432)).validate(), Ok(()));
+        // The gate starts inside `q`: [262144, 393216) and [327680, 458752).
+        assert_eq!(
+            with_step(gate_split(327680)).validate(),
+            Err(TapeError::WritesOverlap { step: 0 })
+        );
+        // The gate over `qg`, which the split reads.
+        assert_eq!(
+            with_step(gate_split(65536)).validate(),
+            Err(TapeError::WriteOverlapsRead {
+                step: 0,
+                write: span(65536, 131072),
+                read: span(0, 262144)
+            })
+        );
+        // The gate past the arena.
+        assert_eq!(
+            with_step(gate_split(1245184)).validate(),
+            Err(TapeError::StepOutside {
+                step: 0,
+                span: span(1245184, 131072),
+                total: 1310720
             })
         );
     }

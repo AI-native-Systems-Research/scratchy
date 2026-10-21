@@ -18,6 +18,8 @@
 pub mod kernels;
 /// CUDA's per-opcode ABI as declared data: the colour rule, fusions and sampled rows.
 pub mod op_abi;
+/// The rotary table's rows, built on the host from the forward's token positions.
+pub mod rotary;
 /// The device, its buffers, and the worker that plays a tape. Links `cudart`, so `nvcc` only.
 #[cfg(feature = "nvcc")]
 pub mod runtime;

@@ -5,44 +5,54 @@
 //! value and the rule.
 
 mod common {
+    pub mod attn_gate;
     pub mod chains;
     pub mod mlp;
 }
 
+use std::num::NonZeroU32;
+
+use common::attn_gate::{ATTN_GATE_M128, ATTN_GATE_M256, attn_gate, attn_gate_input};
 use common::chains::{
-    THREE_GEMM_M256, TWO_GEMM_M128, TWO_GEMM_M256, assert_tape_is_lowered, chain_input, three_gemm,
-    two_gemm, with_hidden,
+    QWEN3_5_FACTS, THREE_GEMM_M256, TWO_GEMM_M128, TWO_GEMM_M256, assert_tape_is_lowered,
+    chain_input, three_gemm, two_gemm, with_hidden,
 };
 use common::mlp::{EPS, H, I, MLP_M128, MLP_M256, mlp};
 use scratchy_subtile::fixtures::{
-    front_end_lowered, gemm_m1_only_input, one_layer_input, rope_rotate_only_input,
-    silu_mul_only_input,
+    front_end_lowered, gemm_m1_only_input, one_layer_input, silu_mul_only_input,
 };
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{
     AffineInt4, GemmWeight, GemmWeightKind, InputRef, LoweringInput, OpDesc,
 };
-use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SourceShape, SubOp};
+use scratchy_subtile::model_geometry::HeadDim;
+use scratchy_subtile::subtile_ir::{EwKind, GainConvention, RowScale, SourceShape, SubOp};
 use scratchy_target_cuda::step::{CudaStep, GemmBf16};
 use scratchy_target_cuda::tape::{ArenaOffset, CUDA_ARENA_ALIGN, CudaTape};
 use scratchy_target_cuda_compiler::canonical::{
-    ArenaRefusal, CanonicalAt, CanonicalRefusal, GemmShapeRule, OperandRefusal, RowShapeRule,
-    lower_canonical,
+    ArenaRefusal, CanonicalAt, CanonicalRefusal, CudaModelFacts, GateShapeRule, GemmShapeRule,
+    OperandRefusal, RopeShapeRule, RowShapeRule, ViewRefusal, lower_canonical,
 };
 
-fn lower(
+fn lower_with(
     l: &LoweredDecode,
+    facts: CudaModelFacts,
 ) -> Result<scratchy_target_cuda_compiler::canonical::CudaCanonical, CanonicalRefusal> {
     let at = CanonicalAt {
         stem: "fixture",
         m: u64::from(l.input.ops[0].m),
     };
-    lower_canonical(l, at)
+    lower_canonical(l, facts, at)
 }
 
 /// The refusal and its message, which must name every value in `names`.
 fn refused(l: &LoweredDecode, names: &[&str]) -> CanonicalRefusal {
-    let e = match lower(l) {
+    refused_with(l, QWEN3_5_FACTS, names)
+}
+
+/// [`refused`] under `facts`.
+fn refused_with(l: &LoweredDecode, facts: CudaModelFacts, names: &[&str]) -> CanonicalRefusal {
+    let e = match lower_with(l, facts) {
         Err(e) => e,
         Ok(c) => panic!("lowered a canonical the kernel cannot run: {c:?}"),
     };
@@ -239,12 +249,15 @@ fn a_layer_lowers_its_norm_and_is_refused_at_its_first_gemm() {
 /// An op with no lowering at all is refused by its name.
 #[test]
 fn an_op_with_no_lowering_is_refused_naming_it() {
-    let e = refused(&with_hidden(rope_rotate_only_input()), &["RopeRotate"]);
+    let e = refused(
+        &ew_only(EwKind::Gelu, 256, H, None),
+        &["Gelu", "does not lower"],
+    );
     assert!(matches!(
         e,
         CanonicalRefusal::NotLowered {
             step: 0,
-            op: "RopeRotate"
+            op: "Gelu"
         }
     ));
 }
@@ -265,8 +278,24 @@ fn every_static_validates() {
         ("THREE_GEMM_M256", &THREE_GEMM_M256),
         ("MLP_M128", &MLP_M128),
         ("MLP_M256", &MLP_M256),
+        ("ATTN_GATE_M128", &ATTN_GATE_M128),
+        ("ATTN_GATE_M256", &ATTN_GATE_M256),
     ] {
         assert_eq!(tape.validate(), Ok(()), "{name}");
+    }
+}
+
+/// The tapes before this one have no rope, so no rotary table.
+#[test]
+fn the_earlier_statics_have_no_rotary_table() {
+    for tape in [
+        &TWO_GEMM_M128,
+        &TWO_GEMM_M256,
+        &THREE_GEMM_M256,
+        &MLP_M128,
+        &MLP_M256,
+    ] {
+        assert_eq!(tape.rotary, None);
     }
 }
 
@@ -535,6 +564,350 @@ fn a_norm_gain_that_is_not_a_weight_is_refused() {
             op: "RmsNorm",
             operand: 1,
             why: OperandRefusal::NotAWeight { source: None },
+        }
+    ));
+}
+
+// ── qwen3.5-0.8b's attention prelude and gate ──────────────────────
+
+#[test]
+fn the_attention_gate_statics_are_what_their_canonicals_lower_to() {
+    assert_tape_is_lowered("attn_gate(128)", &ATTN_GATE_M128, &attn_gate(128));
+    assert_tape_is_lowered("attn_gate(256)", &ATTN_GATE_M256, &attn_gate(256));
+}
+
+/// Ten ops, eight launches: the two views emit none. The gate (colour 8) is the split's second
+/// buffer and the gate apply's second read; the rope reads the table after the colours; `o` is
+/// written over `n`.
+#[test]
+fn the_attention_gate_numbers() {
+    for (tape, m) in [(&ATTN_GATE_M128, 128u64), (&ATTN_GATE_M256, 256)] {
+        let (h, q) = (1024 * m * 2, 2048 * m * 2);
+        assert_eq!(tape.arena.colour_bytes, [h, h, 2 * q, q, q, q, q, h, q]);
+        let colours_end = 3 * h + 7 * q;
+        let rotary = tape.rotary.expect("the tape has a rope");
+        assert_eq!(
+            (rotary.span.offset.0, rotary.span.bytes),
+            (colours_end, m * 64 * 2)
+        );
+        assert_eq!((rotary.rot_dim, rotary.theta()), (64, 1e7));
+        assert_eq!(tape.arena.total_bytes, colours_end + m * 128);
+        for &o in tape.arena.colour_offsets {
+            assert_eq!(o % CUDA_ARENA_ALIGN, 0);
+        }
+    }
+    assert_eq!(ATTN_GATE_M256.arena.total_bytes, 8945664);
+    assert_eq!(ATTN_GATE_M128.arena.total_bytes, 4472832);
+    let [
+        CudaStep::RmsNorm(n),
+        CudaStep::Gemm(qg),
+        CudaStep::GateSplit(split),
+        CudaStep::RmsNorm(qn),
+        CudaStep::Rope(rope),
+        CudaStep::GateApply(ga),
+        CudaStep::Gemm(o),
+        CudaStep::Add(y),
+    ] = *ATTN_GATE_M256.steps
+    else {
+        panic!("the steps are norm, gemm, gate split, norm, rope, gate apply, gemm, add");
+    };
+    let colour = |c: usize| ArenaOffset(ATTN_GATE_M256.arena.colour_offsets[c]);
+    assert_eq!((qg.a, split.qg), (n.y, qg.c));
+    assert_eq!((split.q, split.gate), (colour(3), colour(8)));
+    assert_eq!(
+        (qn.x, qn.rows, qn.cols),
+        (split.q, 2048, 256),
+        "the per-head view of q"
+    );
+    assert_eq!(rope.x, qn.y, "the flatten-back view of qn");
+    assert_eq!(rope.table, ATTN_GATE_M256.rotary.unwrap().span.offset);
+    assert_eq!(
+        (ga.attn, ga.gate),
+        (rope.out, split.gate),
+        "gated by the second output"
+    );
+    assert_eq!((o.a, o.c), (ga.out, n.y), "o is written over n's colour");
+    assert_eq!((y.a, y.b), (o.c, ArenaOffset(0)), "y = o + x");
+}
+
+/// A view whose element count changes is refused (a `Reshape` to `[2m, 1024]` of `[m, 2048]`
+/// keeps the count, so the view rows are `Times(8)` with 128 columns: half the elements).
+#[test]
+fn a_view_that_changes_the_element_count_is_refused() {
+    let mut l = attn_gate(256);
+    l.input.ops[3].op = SubOp::Reshape {
+        rows: RowScale::Times(NonZeroU32::new(8).unwrap()),
+        cols: 128,
+    };
+    l.input.sources[3] = SourceShape { rows: 1, cols: 128 };
+    let e = refused(&l, &["Reshape", "cannot be a view", "524288", "262144"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::View {
+            step: 3,
+            why: ViewRefusal::ElementCount {
+                input: 524288,
+                output: 262144
+            }
+        }
+    ));
+}
+
+/// A view of a source would get a fresh colour nothing writes.
+#[test]
+fn a_view_of_a_source_is_refused() {
+    let l = with_hidden(LoweringInput {
+        exported: None,
+        sources: vec![shape(256, 2048)],
+        ops: vec![OpDesc {
+            op: SubOp::Reshape {
+                rows: RowScale::Times(NonZeroU32::new(8).unwrap()),
+                cols: 256,
+            },
+            m: 256,
+            inputs: vec![InputRef::Ext(0)],
+        }],
+        result: 0,
+    });
+    let e = refused(&l, &["Reshape", "source"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::View {
+            step: 0,
+            why: ViewRefusal::OfASource
+        }
+    ));
+}
+
+/// The rope's `cos` bound to a weight, or to the sliding-window table (`local: true`).
+#[test]
+fn a_rope_operand_that_is_not_the_global_table_is_refused() {
+    let mut l = attn_gate(256);
+    l.bindings[4] = SourceBinding::Weight { id: 4, index: None };
+    let e = refused(&l, &["RopeRotate", "operand 1", "Weight"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::RotaryOperand {
+            step: 6,
+            operand: 1,
+            binding: Some(SourceBinding::Weight { .. })
+        }
+    ));
+    let mut l = attn_gate(256);
+    l.bindings[5] = SourceBinding::Sin { local: true };
+    let e = refused(&l, &["RopeRotate", "operand 2", "local: true"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::RotaryOperand {
+            step: 6,
+            operand: 2,
+            binding: Some(SourceBinding::Sin { local: true })
+        }
+    ));
+}
+
+/// `RopeRotate(x, cos, sin)` alone over `x [tokens, cols]`, the embedded hidden, and the global
+/// table.
+fn rope_only(tokens: u32, cols: u32, head_dim: u32) -> LoweredDecode {
+    let mut l = with_hidden(LoweringInput {
+        exported: None,
+        sources: vec![
+            shape(tokens, cols),
+            shape(tokens, cols),
+            shape(tokens, cols),
+        ],
+        ops: vec![OpDesc {
+            op: SubOp::rope_rotate(HeadDim::new(head_dim)),
+            m: tokens,
+            inputs: vec![InputRef::Ext(0), InputRef::Ext(1), InputRef::Ext(2)],
+        }],
+        result: 0,
+    });
+    l.bindings[1] = SourceBinding::Cos { local: false };
+    l.bindings[2] = SourceBinding::Sin { local: false };
+    l
+}
+
+#[test]
+fn a_rope_whose_rot_dim_is_off_the_vector_is_refused() {
+    let facts = CudaModelFacts {
+        rot_dim: 24,
+        ..QWEN3_5_FACTS
+    };
+    let e = refused_with(
+        &rope_only(256, 2048, 256),
+        facts,
+        &["rot_dim=24", "multiple of 16"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::RopeShape {
+            step: 0,
+            rot_dim: 24,
+            rule: RopeShapeRule::RotOffVector { multiple: 16 },
+            ..
+        }
+    ));
+}
+
+/// The rope's rule, check by check: a `rot_dim` above the head, a `head_dim` off the vector, a
+/// `cols` that is not a whole number of heads, and a zero `rot_dim`.
+#[test]
+fn every_rope_shape_rule_is_refused() {
+    let with = |rot_dim| CudaModelFacts {
+        rot_dim,
+        ..QWEN3_5_FACTS
+    };
+    let cases = [
+        (
+            rope_only(256, 2048, 256),
+            with(512),
+            RopeShapeRule::RotAboveHead,
+        ),
+        (
+            rope_only(256, 2016, 252),
+            with(64),
+            RopeShapeRule::HeadOffVector { multiple: 8 },
+        ),
+        (
+            rope_only(256, 1000, 256),
+            with(64),
+            RopeShapeRule::ColsOffHead,
+        ),
+        (
+            rope_only(256, 2048, 256),
+            with(0),
+            RopeShapeRule::Empty { dim: "rot_dim" },
+        ),
+    ];
+    for (l, facts, rule) in cases {
+        let e = refused_with(&l, facts, &["RopeRotate"]);
+        assert!(
+            matches!(e, CanonicalRefusal::RopeShape { step: 0, rule: r, .. } if r == rule),
+            "{rule:?}: {e:?}"
+        );
+    }
+}
+
+/// A rope over more rows than the bucket has tokens: the rotary table has one row per token. Its
+/// `x` is the `[256, 4096]` hidden viewed as `[512, 2048]`.
+#[test]
+fn a_rope_whose_rows_are_not_the_tokens_is_refused() {
+    let mut l = with_hidden(LoweringInput {
+        exported: None,
+        sources: vec![shape(256, 4096), shape(512, 2048), shape(512, 2048)],
+        ops: vec![
+            OpDesc {
+                op: SubOp::Elementwise(EwKind::Add),
+                m: 256,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(0)],
+            },
+            OpDesc {
+                op: SubOp::Reshape {
+                    rows: RowScale::Times(NonZeroU32::new(2).unwrap()),
+                    cols: 2048,
+                },
+                m: 256,
+                inputs: vec![InputRef::Op(0)],
+            },
+            OpDesc {
+                op: SubOp::rope_rotate(HeadDim::new(256)),
+                m: 256,
+                inputs: vec![InputRef::Op(1), InputRef::Ext(1), InputRef::Ext(2)],
+            },
+        ],
+        result: 2,
+    });
+    l.bindings[1] = SourceBinding::Cos { local: false };
+    l.bindings[2] = SourceBinding::Sin { local: false };
+    let e = refused(&l, &["rows=512", "256 tokens"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::RopeShape {
+            step: 2,
+            rows: 512,
+            rule: RopeShapeRule::RowsNotTokens { tokens: 256 },
+            ..
+        }
+    ));
+}
+
+/// A gate split whose `half_cols` is not a whole number of the model's heads.
+#[test]
+fn a_gate_split_off_the_head_is_refused() {
+    let facts = CudaModelFacts {
+        head_dim: 384,
+        ..QWEN3_5_FACTS
+    };
+    let e = refused_with(&attn_gate(256), facts, &["GateSplit", "half_cols=2048"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GateShape {
+            step: 2,
+            half_cols: 2048,
+            head_dim: 384,
+            rule: GateShapeRule::HalfOffHead,
+            ..
+        }
+    ));
+    let facts = CudaModelFacts {
+        head_dim: 0,
+        ..QWEN3_5_FACTS
+    };
+    let e = refused_with(&attn_gate(256), facts, &["GateSplit", "head_dim = 0"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GateShape {
+            step: 2,
+            rule: GateShapeRule::Empty { dim: "head_dim" },
+            ..
+        }
+    ));
+}
+
+/// A gate apply whose gate is not a gate split's: here, the rope's output.
+#[test]
+fn a_gate_apply_whose_gate_is_not_a_split_is_refused() {
+    let mut input = attn_gate_input(256);
+    input.ops[7].inputs[1] = InputRef::Op(6);
+    let mut l = with_hidden(input);
+    l.bindings[4] = SourceBinding::Cos { local: false };
+    l.bindings[5] = SourceBinding::Sin { local: false };
+    let e = refused(&l, &["GateApply", "operand 1", "GateSplit"]);
+    assert!(matches!(e, CanonicalRefusal::GateOperand { step: 7 }));
+}
+
+/// A gate split whose op the colour rule gives one output (as a rule change could) has no
+/// buffer for its gate.
+///
+/// CUDA's rule gives `GateSplit` two outputs, so no canonical reaches this through
+/// `lower_canonical`: it is unreachable under CUDA's table, and the refusal's message is checked
+/// here instead.
+#[test]
+fn a_gate_split_with_no_second_colour_is_named() {
+    let e = CanonicalRefusal::SecondOutput { step: 2 };
+    let msg = e.to_string();
+    assert!(
+        msg.contains("step 2") && msg.contains("no second colour"),
+        "{msg}"
+    );
+}
+
+/// A row op with zero rows: the shared graph keeps a zero-row source, so `lower_canonical` reaches
+/// the row rule's `Empty`.
+#[test]
+fn a_row_op_with_no_rows_is_refused() {
+    let e = refused(
+        &ew_only(EwKind::Add, 0, H, Some(shape(0, H))),
+        &["rows = 0"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::RowShape {
+            step: 0,
+            op: "Add",
+            rule: RowShapeRule::Empty { dim: "rows" },
+            ..
         }
     ));
 }

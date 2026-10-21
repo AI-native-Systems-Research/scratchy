@@ -25,10 +25,11 @@ nvcc = []
 # The SHARED front end and passes. CUDA lowers the same `SubtileTape` metal and spyre lower; the
 # tables here are inputs to `tape_colouring`, `tape_folding` and `sample_rows`.
 scratchy-subtile = { path = "../../compiler/subtile" }
+# bf16 round-to-nearest-even for the rotary table the worker builds on the host (`rotary`), and
+# bf16 <-> f32 for the GPU tests' inputs and outputs.
+half = { workspace = true }
 
 [dev-dependencies]
-# bf16 <-> f32 for the GEMM tests' inputs and outputs.
-half = { workspace = true }
 # The tape tests build their fixtures with the shared lowering types and lower them with CUDA's
 # compiler, which depends on this crate: a dev-only cycle Cargo allows. The integration tests link
 # one copy of this library, the one the compiler links too.
@@ -44,6 +45,12 @@ required-features = ["nvcc"]
 # `nvcc`.
 [[test]]
 name = "row_ops"
+required-features = ["nvcc"]
+
+# The rope, gate-split and gate-apply kernels against a CPU reference, on the GPU. Not built
+# without `nvcc`.
+[[test]]
+name = "rope_gate"
 required-features = ["nvcc"]
 
 # The hand-written tapes against what CUDA's compiler lowers. No toolchain needed.
