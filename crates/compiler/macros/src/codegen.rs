@@ -7536,8 +7536,9 @@ fn metal_off_tape_tokens(
     width: u64,
     mc: &scratchy_target_metal::tape::model_consts::MetalModelConsts,
     head: Option<(u32, u32)>,
+    vocab_suffix: Option<scratchy_target_metal::off_tape::VocabSuffix>,
 ) -> TokenStream {
-    use scratchy_target_metal::off_tape::OffTape;
+    use scratchy_target_metal::off_tape::{ByCodes, OffTape, SuffixKernels, VocabSuffix};
     use scratchy_target_metal::tape::ids::{BlockSize, HiddenSize, LogitsWidth, NumDrafts, RotDim};
     use scratchy_target_metal::tape::kernel_constants::MtpChainConstants;
     let width = u32::try_from(width).expect("logits width fits u32");
@@ -7555,6 +7556,7 @@ fn metal_off_tape_tokens(
         block_size,
         head,
         mc.spec_drafts > 0,
+        vocab_suffix,
     );
     let ids = keys.map(|key| scratchy_target_metal_compiler::static_tape::kernel_ref(&key));
     let OffTape {
@@ -7566,7 +7568,56 @@ fn metal_off_tape_tokens(
         chain_advance,
         mtp_chain,
         select_rows,
+        vocab_suffix,
     } = ids;
+    let vocab_suffix = vocab_suffix.map(
+        |SuffixKernels {
+             suffix,
+             qmv,
+             argmax,
+         }| {
+            let VocabSuffix {
+                prefix,
+                rows,
+                hidden,
+                bits,
+                group,
+                scale,
+                verify_rows,
+                window,
+            } = suffix;
+            use scratchy_target_metal::tape::quantized::ScaleDtype;
+            let scale = match scale {
+                ScaleDtype::F16 => {
+                    quote!(::scratchy_target_metal::tape::quantized::ScaleDtype::F16)
+                }
+                ScaleDtype::Bf16 => {
+                    quote!(::scratchy_target_metal::tape::quantized::ScaleDtype::Bf16)
+                }
+            };
+            let ByCodes {
+                as_written,
+                offset8,
+            } = qmv;
+            quote!(::scratchy_target_metal::off_tape::SuffixKernels {
+                suffix: ::scratchy_target_metal::off_tape::VocabSuffix {
+                    prefix: #prefix,
+                    rows: #rows,
+                    hidden: #hidden,
+                    bits: #bits,
+                    group: #group,
+                    scale: #scale,
+                    verify_rows: #verify_rows,
+                    window: #window,
+                },
+                qmv: ::scratchy_target_metal::off_tape::ByCodes {
+                    as_written: &[#(#as_written),*],
+                    offset8: &[#(#offset8),*],
+                },
+                argmax: #argmax,
+            })
+        },
+    );
     let vocab = vocab.get();
     let sampler = sampler.iter().map(|row| {
         let row = row.iter();
@@ -7576,7 +7627,8 @@ fn metal_off_tape_tokens(
         Some(k) => quote!(::core::option::Option::Some(#k)),
         None => quote!(::core::option::Option::None),
     };
-    let (mtp_chain, select_rows) = (option(mtp_chain), option(select_rows));
+    let (mtp_chain, select_rows, vocab_suffix) =
+        (option(mtp_chain), option(select_rows), option(vocab_suffix));
     quote! {
         /// This model's off-tape kernels, baked for its logits.
         #[cfg(feature = "metal")]
@@ -7590,9 +7642,58 @@ fn metal_off_tape_tokens(
                 chain_advance: #chain_advance,
                 mtp_chain: #mtp_chain,
                 select_rows: #select_rows,
+                vocab_suffix: #vocab_suffix,
             }
         };
     }
+}
+
+/// A multi-token-prediction head drafting over a prefix of its target's vocabulary — its logits
+/// `vocab_size` wide, its target's `target_vocab_size` — whose lm_head is MLX-affine: the rest of
+/// its target's lm_head (`scratchy_target_metal::off_tape::VocabSuffix`), at the widths its
+/// lm_head is quantized to, a pass reading at most its `spec_verify_rows` rows. `None` for any
+/// other model; a head whose lm_head is stored otherwise (a dense bf16 build) has no kernel past
+/// its prefix, and drafts over the prefix alone.
+#[cfg(feature = "metal")]
+fn metal_vocab_suffix(
+    program: &Program,
+    fuf: &crate::fuf::Fuf,
+    model: &crate::config::ModelParams,
+    mc: &scratchy_target_metal::tape::model_consts::MetalModelConsts,
+) -> Option<scratchy_target_metal::off_tape::VocabSuffix> {
+    let (&prefix, &all) = (
+        model.bounds.get("vocab_size")?,
+        model.bounds.get("target_vocab_size")?,
+    );
+    if all <= prefix {
+        return None;
+    }
+    let stem = &model.source_stem;
+    let bound = |name: &str| {
+        *(model.bounds.get(name)).unwrap_or_else(|| {
+            panic!("`{stem}`: a head drafting over a vocabulary prefix declares its `{name}`")
+        })
+    };
+    let (verify_rows, window) = (bound("spec_verify_rows"), bound("spec_wide_window"));
+    let lm_head = lent_weight_prefix(
+        program,
+        fuf,
+        model,
+        scratchy_forward_compiler::LentWeight::LmHead,
+    )?;
+    let method = &model.quantization.as_ref()?.method;
+    let (group, bits) = crate::quantization::affine_role_widths(program, method, &lm_head, None)?;
+    let fits = |v: u64| u32::try_from(v).expect("a vocabulary fits u32");
+    Some(scratchy_target_metal::off_tape::VocabSuffix {
+        prefix: fits(prefix),
+        rows: fits(all - prefix),
+        hidden: fits(mc.hidden_size as u64),
+        bits,
+        group,
+        scale: mc.scale_dtype,
+        verify_rows: fits(verify_rows),
+        window: fits(window),
+    })
 }
 
 /// The model's `METAL_TQ_CODEBOOK`: its TurboQuant codebook at the global head dim, computed here
@@ -15049,7 +15150,8 @@ pub fn emit_model(
             let hidden = u32::try_from(target_hidden_width).expect("hidden width fits u32");
             (drafts, hidden)
         });
-        metal_arena_bytes_statics.push(metal_off_tape_tokens(logits_width, mc, head));
+        let vocab_suffix = metal_vocab_suffix(program, fuf, model, mc);
+        metal_arena_bytes_statics.push(metal_off_tape_tokens(logits_width, mc, head, vocab_suffix));
     }
     let metal_emission = quote! {
         #(#metal_arena_bytes_statics)*

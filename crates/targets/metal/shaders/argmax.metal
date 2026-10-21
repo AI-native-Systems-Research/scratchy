@@ -35,35 +35,48 @@ using namespace metal;
 
 SCRATCHY_CONSTANT(uint, ARGMAX_VOCAB, 0);
 
-// The argmax of row `gid`, in thread 0: the largest value, the smallest index among equal ones,
-// NaN never chosen. Each thread scans 4 adjacent elements a step; simdgroups then reduce with
-// shuffles and their leaders through `shared_*` — one barrier, any associative order, since the
-// comparison picks the same element whatever the order.
+// A thread's running argmax: `v` at `i` replaces `best` at `best_i` when larger, or equal at a
+// smaller index; NaN never replaces.
+inline void argmax_take(thread float& best, thread uint& best_i, float v, uint i) {
+    if (v > best || (v == best && i < best_i)) {
+        best = v;
+        best_i = i;
+    }
+}
+
+// Thread `tid`'s scan of `n` elements of `row`, element `e` at id `first + e`: 4 adjacent
+// elements a step.
 template <typename T>
-inline uint argmax_row(
-    device const T* logits,
-    uint gid,
+inline void argmax_scan(
+    thread float& best,
+    thread uint& best_i,
+    device const T* row,
+    uint n,
+    uint first,
+    uint tid,
+    uint tg)
+{
+    for (uint base = tid * 4u; base < n; base += tg * 4u) {
+        for (uint j = 0; j < 4u && base + j < n; j++) {
+            argmax_take(best, best_i, float(row[base + j]), first + base + j);
+        }
+    }
+}
+
+// The threadgroup's argmax of its threads' scans, in thread 0: the largest value, the smallest
+// index among equal ones, NaN never chosen. Simdgroups reduce with shuffles and their leaders
+// through `shared_*` — one barrier, any associative order, since the comparison picks the same
+// element whatever the order.
+inline uint argmax_reduce(
+    float best,
+    uint best_i,
     uint tid,
     uint tg,
     threadgroup float* shared_max,
     threadgroup uint* shared_idx)
 {
-    float best = -INFINITY;
-    uint  best_i = 0;
-    auto take = [&](float v, uint i) {
-        if (v > best || (v == best && i < best_i)) {
-            best = v;
-            best_i = i;
-        }
-    };
-    device const T* row = logits + uint(gid) * ARGMAX_VOCAB;
-    for (uint base = tid * 4u; base < ARGMAX_VOCAB; base += tg * 4u) {
-        for (uint j = 0; j < 4u && base + j < ARGMAX_VOCAB; j++) {
-            take(float(row[base + j]), base + j);
-        }
-    }
     for (ushort off = 16; off > 0; off >>= 1) {
-        take(simd_shuffle_down(best, off), simd_shuffle_down(best_i, off));
+        argmax_take(best, best_i, simd_shuffle_down(best, off), simd_shuffle_down(best_i, off));
     }
     const uint lane = tid % 32u, simd = tid / 32u, simds = (tg + 31u) / 32u;
     if (lane == 0) {
@@ -79,10 +92,54 @@ inline uint argmax_row(
             best_i = shared_idx[lane];
         }
         for (ushort off = 16; off > 0; off >>= 1) {
-            take(simd_shuffle_down(best, off), simd_shuffle_down(best_i, off));
+            argmax_take(best, best_i, simd_shuffle_down(best, off), simd_shuffle_down(best_i, off));
         }
     }
     return best_i;
+}
+
+// The argmax of row `gid` of `logits` [batch, ARGMAX_VOCAB], in thread 0.
+template <typename T>
+inline uint argmax_row(
+    device const T* logits,
+    uint gid,
+    uint tid,
+    uint tg,
+    threadgroup float* shared_max,
+    threadgroup uint* shared_idx)
+{
+    float best = -INFINITY;
+    uint  best_i = 0;
+    argmax_scan(best, best_i, logits + uint(gid) * ARGMAX_VOCAB, ARGMAX_VOCAB, 0u, tid, tg);
+    return argmax_reduce(best, best_i, tid, tg, shared_max, shared_idx);
+}
+
+// The argmax of row `gid` over two segments of one vocabulary: `prefix` [batch, ARGMAX_VOCAB]
+// holds ids `0..ARGMAX_VOCAB`, `suffix` [batch, ARGMAX_SUFFIX] the ids after them — a draft head's
+// vocabulary prefix and the rest of its target's.
+SCRATCHY_CONSTANT_OPTIONAL(uint, ARGMAX_SUFFIX, 1);
+
+template <typename T>
+[[kernel]] void argmax_split(
+    device const T*  prefix [[buffer(0)]],
+    device       uint* output [[buffer(1)]],
+    constant     uint& batch  [[buffer(2)]],
+    device const T*  suffix [[buffer(3)]],
+    uint  gid [[threadgroup_position_in_grid]],
+    uint  tid [[thread_position_in_threadgroup]],
+    uint  tg  [[threads_per_threadgroup]])
+{
+    if (gid >= batch) return;
+    threadgroup float shared_max[1024];
+    threadgroup uint  shared_idx[1024];
+    float best = -INFINITY;
+    uint  best_i = 0;
+    argmax_scan(best, best_i, prefix + gid * ARGMAX_VOCAB, ARGMAX_VOCAB, 0u, tid, tg);
+    argmax_scan(best, best_i, suffix + gid * ARGMAX_SUFFIX, ARGMAX_SUFFIX, ARGMAX_VOCAB, tid, tg);
+    uint v = argmax_reduce(best, best_i, tid, tg, shared_max, shared_idx);
+    if (tid == 0) {
+        output[gid] = v;
+    }
 }
 
 template <typename T>
@@ -145,3 +202,5 @@ SCRATCHY_KERNEL(argmax_f16, argmax<half>)
 SCRATCHY_KERNEL(argmax_bf16, argmax<bfloat>)
 SCRATCHY_KERNEL(argmax_f16_dual_write, argmax_dual_write<half>)
 SCRATCHY_KERNEL(argmax_bf16_dual_write, argmax_dual_write<bfloat>)
+SCRATCHY_KERNEL(argmax_split_f16, argmax_split<half>)
+SCRATCHY_KERNEL(argmax_split_bf16, argmax_split<bfloat>)

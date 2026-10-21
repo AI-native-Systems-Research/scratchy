@@ -299,6 +299,13 @@ pub struct MetalWorker {
     argmax_kernels: Option<scratchy_target_metal::argmax::ArgmaxKernels>,
     /// The argmax baked for the draft model's logits (its forwards and chain).
     draft_argmax_kernels: Option<scratchy_target_metal::argmax::ArgmaxKernels>,
+    /// A multi-token-prediction head drafting over a prefix of its target's vocabulary: the rest
+    /// of the target's lm_head, for the steps that draft over all of it ([`vocab_suffix_draft`]).
+    draft_vocab_suffix: Option<
+        scratchy_target_metal::vocab_suffix::SuffixDraft<
+            scratchy_target_metal::off_tape::OffTapePipeline,
+        >,
+    >,
     /// The passes of a multi-token-prediction head (a `draft_model` that reads the target's
     /// hidden states), run at the end of a step the engine planned drafts for.
     mtp_drafter: Option<::scratchy_serving_engine::spec_decode::MtpDrafter>,
@@ -1034,6 +1041,7 @@ impl MetalWorker {
             draft_kv_cache: None,
             argmax_kernels: None,
             draft_argmax_kernels: None,
+            draft_vocab_suffix: None,
             mtp_drafter: None,
             sampler_kernels: None,
             sampler_arena: None,
@@ -1793,10 +1801,13 @@ impl MetalWorker {
         // A multi-token-prediction head carries no embedding or lm_head: lend it the target's,
         // from the target store's refs (same mmap → no second upload).
         if let Some(head) = scratchy_forward_compiler::draft_head(&draft_arch) {
+            // It drafts over its whole vocabulary until its bake says otherwise (below: a
+            // vocabulary suffix).
             self.mtp_drafter = Some(::scratchy_serving_engine::spec_decode::MtpDrafter {
                 budget: draft_budget(&head),
                 max_model_len: self.max_model_len(),
                 reads_target_kv: head.reads_target_kv,
+                draft_vocab: None,
             });
             let (Some(target), Some(refs)) =
                 (self.model.as_deref(), self.target_tensor_refs.as_ref())
@@ -1890,6 +1901,53 @@ impl MetalWorker {
             draft_off_tape,
         )
         .map_err(|e| ExecutorError::WorkerInit(format!("MTP chain compile: {e:?}")))?;
+        // A head its expansion baked a vocabulary suffix for drafts over the prefix and, on the
+        // steps whose reply is past it, the rest of its target's lm_head.
+        self.draft_vocab_suffix = match (&draft_off_tape.vocab_suffix, self.mtp_drafter.as_mut()) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(ExecutorError::WorkerInit(
+                    "a vocabulary suffix baked for a model that is no multi-token-prediction head"
+                        .into(),
+                ));
+            }
+            (Some(kernels), Some(drafter)) => {
+                let (Some(target), Some(refs)) =
+                    (self.model.as_deref(), self.target_tensor_refs.as_ref())
+                else {
+                    return Err(ExecutorError::WorkerInit(
+                        "MTP head: its vocabulary suffix reads its target's lm_head".into(),
+                    ));
+                };
+                let suffix =
+                    vocab_suffix_draft(gpu_device, target, refs, &mut draft_weights, kernels)
+                        .and_then(|draft| {
+                            let verify_rows = draft.suffix().verify_rows as usize;
+                            match verify_rows == drafter.budget.verify_rows {
+                                true => Ok(draft),
+                                false => Err(format!(
+                                    "baked for {verify_rows} verify rows, drafting {}",
+                                    drafter.budget.verify_rows
+                                )),
+                            }
+                        })
+                        .map_err(|e| {
+                            ExecutorError::WorkerInit(format!("MTP head: vocabulary suffix: {e}"))
+                        })?;
+                let s = suffix.suffix();
+                drafter.draft_vocab = Some(::scratchy_serving_engine::spec_decode::DraftVocab {
+                    prefix: s.prefix,
+                    window: s.window as usize,
+                });
+                info!(
+                    "ScratchyWorker(metal): MTP head drafts over token ids 0..{} of {}; a step \
+                     whose reply is past them drafts over all",
+                    s.prefix,
+                    s.prefix + s.rows
+                );
+                Some(suffix)
+            }
+        };
         self.draft_model = Some(draft_model);
         // Spec-decode runs the chunked-addressing tape rung: the direct (BPC=0) path has an
         // unresolved interaction with the draft K-step chain on 3B-class+ models (out-of-vocab
@@ -3851,6 +3909,7 @@ impl MetalWorker {
                     argmax_kernels: (self.draft_argmax_kernels.as_ref()).ok_or_else(|| {
                         BackendError::Backend("draft argmax_kernels not built".into())
                     })?,
+                    suffix: self.draft_vocab_suffix.as_ref(),
                     chain_kernel: self.mtp_chain_kernel.as_ref(),
                     buffer,
                     layout,
@@ -4335,6 +4394,95 @@ fn hosted_by(
     Ok(hosted.map(|h| *h).unwrap_or_default())
 }
 
+/// The rest of `target`'s lm_head past the vocabulary prefix its multi-token-prediction head
+/// drafts over (`kernels`, the head's bake): lent into the head's `weights` whole — the very
+/// tensors the target binds, same mmap, same zero-copy upload — checked against the bake, and
+/// bound where the target binds them, its codes read the way the target's binding stores them.
+#[cfg(feature = "metal")]
+fn vocab_suffix_draft(
+    gpu_device: &GpuDevice,
+    target: &dyn scratchy_forward_compiler::ScratchyWeights,
+    refs: &scratchy_target_metal::weights::TensorRefs,
+    weights: &mut GpuWeights,
+    kernels: &scratchy_target_metal::off_tape::SuffixKernels<
+        scratchy_target_metal::tape::lowered::BakedKernel,
+        &'static [scratchy_target_metal::tape::lowered::BakedKernel],
+    >,
+) -> Result<
+    scratchy_target_metal::vocab_suffix::SuffixDraft<
+        scratchy_target_metal::off_tape::OffTapePipeline,
+    >,
+    String,
+> {
+    use scratchy_target_metal::off_tape::OffTapePipeline;
+    use scratchy_target_metal::vocab_suffix::{LmHead, LmHeadPart, SuffixDraft};
+    const LENT: &str = "draft_vocab_suffix";
+    let suffix = kernels.suffix;
+    let from = (target.lent_weight_prefix(scratchy_forward_compiler::LentWeight::LmHead))
+        .ok_or("the target has no lm_head")?;
+    (weights.lend(refs, from, LENT, None)).map_err(|e| format!("lending its lm_head: {e}"))?;
+    let take = |weights: &mut GpuWeights, part: &str| {
+        let name = format!("{LENT}.{part}");
+        (weights.take_keep_dtype(&name)).map_err(|e| format!("`{name}`: {e}"))
+    };
+    let (codes, scales, biases) = (
+        take(weights, "weight")?,
+        take(weights, "scales")?,
+        take(weights, "biases")?,
+    );
+    // The lm_head the target loaded is the one the head's expansion baked its kernels for: its
+    // rows, its codes' width and its scales' and biases' dtype and group.
+    let rows = (suffix.prefix + suffix.rows) as usize;
+    let (code_bytes, scale_bytes) = suffix.row_bytes();
+    let scale = suffix.scale.as_dtype();
+    let fits = |t: &GpuTensor, row_bytes: usize| {
+        t.shape().first().map(|&r| r as usize) == Some(rows) && t.size_bytes() == rows * row_bytes
+    };
+    let baked = fits(&codes, code_bytes)
+        && [&scales, &biases]
+            .iter()
+            .all(|t| t.dtype() == scale && fits(t, scale_bytes));
+    if !baked {
+        let shape = |t: &GpuTensor| (t.shape().to_vec(), t.dtype(), t.size_bytes());
+        return Err(format!(
+            "the target's lm_head (codes {:?}, scales {:?}, biases {:?}) is not the one the head \
+             baked ({suffix:?})",
+            shape(&codes),
+            shape(&scales),
+            shape(&biases)
+        ));
+    }
+    let allocator = &gpu_device.allocator;
+    // The same range, read the same way, as the target's lm_head: the allocator hands back the
+    // target's own binding.
+    let codes_read = allocator.affine_codes(suffix.bits);
+    let (buffer, offset) =
+        (allocator.bind_affine_codes(codes.raw_ptr(), codes.size_bytes(), codes_read))
+            .map_err(|e| format!("binding the target's lm_head codes: {e:?}"))?;
+    let part = |t: &GpuTensor, what: &str| {
+        (allocator.buffer_for(t.raw_ptr()))
+            .map(|(buffer, offset)| LmHeadPart { buffer, offset })
+            .ok_or_else(|| format!("the target's lm_head {what} is not resident"))
+    };
+    let lm_head = LmHead {
+        codes: LmHeadPart { buffer, offset },
+        scales: part(&scales, "scales")?,
+        biases: part(&biases, "biases")?,
+    };
+    let device: &scratchy_target_metal::mtl4_dispatch::Device = &gpu_device.device;
+    let pipeline = |k| OffTapePipeline::new(device, k).map_err(|e| format!("{e:?}"));
+    let qmv = (kernels.qmv.get(codes_read).iter())
+        .map(pipeline)
+        .collect::<Result<Vec<_>, String>>()?;
+    let residency = allocator.residency();
+    let logits = residency.pin(scratchy_target_metal::mtl4_dispatch::shared_zeroed(
+        device,
+        (suffix.verify_rows * suffix.rows) as usize * size_of::<u16>(),
+    ));
+    residency.commit();
+    SuffixDraft::new(suffix, lm_head, qmv, pipeline(&kernels.argmax)?, logits)
+}
+
 /// An MTP head's passes over a step ([`HeadPasses`](::scratchy_serving_engine::spec_decode::HeadPasses)),
 /// encoded in its target's command buffer after the target's forward and argmax: pass 1, then each
 /// chained pass behind the device's pick of its inputs.
@@ -4348,6 +4496,12 @@ struct HeadPassesEncoder<'a> {
     /// The step's sliding KV groups' tables, when the head reads its target's KV.
     sliding: StepTables,
     argmax_kernels: &'a scratchy_target_metal::argmax::ArgmaxKernels,
+    /// The rest of the vocabulary, for a step whose reply lies past the head's draft prefix.
+    suffix: Option<
+        &'a scratchy_target_metal::vocab_suffix::SuffixDraft<
+            scratchy_target_metal::off_tape::OffTapePipeline,
+        >,
+    >,
     chain_kernel: Option<&'a scratchy_target_metal::mtp_chain::MtpChainKernel>,
     /// The buffer the chain's [`ChainLayout`] lays out; `None` without a chain.
     buffer: Option<Arc<ChainBuffer>>,
@@ -4433,14 +4587,31 @@ impl<'a> HeadPassesEncoder<'a> {
             let batch = if depth == 1 { layout.window.len() } else { n };
             let consts = |i: usize| layout.address(buffer, ChainLayout::CONSTS) + (i * 4) as u64;
             let picked = layout.address(buffer, ChainLayout::PICKED);
-            let argmax_table = argument_table(&self.device, &[logits, picked, consts(depth - 1)])?;
-            scratchy_target_metal::argmax::encode_argmax_into_mtl4(
-                self.argmax_kernels,
-                enc,
-                &argmax_table,
-                batch as u32,
-            )
-            .map_err(|e| format!("encode head argmax: {e:?}"))?;
+            match self.suffix.filter(|_| drafting.wide) {
+                // The reply lies past the prefix: draft over the whole vocabulary.
+                Some(suffix) => {
+                    let hidden = onto.hidden().gpuAddress() + (first as usize * row_bytes) as u64;
+                    let pick = scratchy_target_metal::vocab_suffix::PassPick {
+                        hidden,
+                        prefix_logits: logits,
+                        picked,
+                        batch_const: consts(depth - 1),
+                        batch,
+                    };
+                    suffix.encode(enc, &self.device.device, pick)?;
+                }
+                None => {
+                    let argmax_table =
+                        argument_table(&self.device, &[logits, picked, consts(depth - 1)])?;
+                    scratchy_target_metal::argmax::encode_argmax_into_mtl4(
+                        self.argmax_kernels,
+                        enc,
+                        &argmax_table,
+                        batch as u32,
+                    )
+                    .map_err(|e| format!("encode head argmax: {e:?}"))?;
+                }
+            }
             let at = |section| layout.address(buffer, section);
             let table = (depth - 1) * n * (layout.k + 1);
             let next = at(ChainLayout::NEXT) + (table * 3 * 4) as u64;
@@ -6839,6 +7010,9 @@ impl Worker for MetalWorker {
         let block_ids_u32: Vec<Vec<u32>> = (attn.block_ids.iter())
             .map(|v| v.iter().map(|&b| b as u32).collect())
             .collect();
+        let prompt_lens: Vec<u32> = (req_ids_in_order.iter())
+            .map(|r| self.input_batch.history(r).0.len() as u32)
+            .collect();
         let step_rows = ::scratchy_serving_engine::spec_decode::StepRows {
             req_ids: &req_ids_in_order,
             input_ids: &input_ids_u32,
@@ -6850,6 +7024,7 @@ impl Worker for MetalWorker {
             block_table_stride: max_blocks_eff,
             block_ids: &block_ids_u32,
             block_size,
+            prompt_lens: &prompt_lens,
         };
         let head_passes = match self.mtp_drafter {
             Some(drafter) if !scheduler_output.draft_req_ids.is_empty() => {
@@ -7767,6 +7942,7 @@ impl Worker for MetalWorker {
         self.kv_cache = None; // drops the file-backed store(s) → Drop msyncs their codes
         self.model = None;
         self.argmax_kernels = None;
+        self.draft_vocab_suffix = None;
         self.argmax_slots.clear();
         #[cfg(feature = "guided-decoding")]
         {
