@@ -199,14 +199,26 @@ def argmax_first_max_kernel(logits_ptr, bramp_ptr, lramp_ptr, idx_ptr,
 
 def inputs(seed: int = 0):
     """The three staged buffers (host contract): one fp16 logits row, pad
-    lanes -inf, with a deliberate TIE at the max -- lanes 100 and 5000 both
+    lanes -inf, with a deliberate TIE at the max -- lanes 40017 and 48000 both
     hold the row's largest value, so the reference pins FIRST-max against a
-    real tie, not a vacuous one -- plus the two constant ramps."""
+    real tie, not a vacuous one -- plus the two constant ramps.
+
+    The tie lanes are HIGH on purpose, and that is a second pin: the answer
+    40017 = 625*64 + 17 is NOT representable in fp16 (the format's ULP is 32
+    at [32768, 65536)), so a kernel whose final combine degraded to f16
+    answers 40032 or 40016 and the exact comparison sees it. A tie at low
+    lanes (the original 100/5000) cannot discriminate that: 100 = 1*64 + 36
+    sits inside fp16's exact-integer range, so a degraded combine still
+    answers it exactly and the defect hides."""
     g = torch.Generator().manual_seed(seed)
     x = torch.randn(V, generator=g, dtype=DTYPE)
-    top = x.max()
-    x[100] = top
-    x[5000] = top
+    # ONE ABOVE the natural maximum: a 49k-lane fp16 randn row ties its own
+    # maximum naturally (the format's tail is coarse), so pinning the tie AT
+    # the natural max would leave an earlier natural lane winning. +1 is exact
+    # in fp16 at randn magnitudes and strictly above every natural lane.
+    top = x.max() + 1.0
+    x[40017] = top
+    x[48000] = top
     row = torch.full((PAD_V,), NEG_INF, dtype=DTYPE)
     row[:V] = x
     bramp = torch.zeros(PAD_V, dtype=DTYPE)

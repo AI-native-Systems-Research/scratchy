@@ -28,15 +28,23 @@
 //!
 //! `make_range.rs` states the law this file follows: a comparison that cannot fail proves
 //! nothing, and for an exact comparison the failing control is a DIFFERING ANSWER, not a
-//! bracket. The stimulus carries real ties: the generator PINS lanes 100 and 5000 at the
-//! row's maximum, and the fp16 randn row ties NATURALLY beyond them (an fp16 tail is coarse
-//! enough that the maximum of 49k standard normals is attained by several lanes), so:
+//! bracket. The stimulus carries a DELIBERATE tie at HIGH lanes: the generator pins the
+//! row's maximum (one above the natural max -- a 49k-lane fp16 randn row ties its own
+//! maximum naturally, so pinning AT it would leave an earlier natural lane winning) at
+//! lanes 40017 and 48000, and BOTH placements are load-bearing:
 //!
 //! 1. **The last-max control**: the LAST maximal index of the same bytes is computed here
-//!    from the stimulus itself, not restated -- 36885 against the current seed, not 100. An
-//!    implementation that breaks the tie the wrong way answers the last index and the exact
-//!    comparison sees it. Without ties the two answers would coincide and no tie-break defect
-//!    would be visible; the control proves the stimulus discriminates.
+//!    from the stimulus itself, not restated -- 48000, not 40017. An implementation that
+//!    breaks the tie the wrong way answers the last index and the exact comparison sees
+//!    it. Without ties the two answers would coincide and no tie-break defect would be
+//!    visible; the control proves the stimulus discriminates.
+//! 2. **The f16-degrade control**: the ANSWER 40017 = 625*64 + 17 is not fp16-representable
+//!    (ULP 32 at [32768, 65536)), so a kernel whose `b*64 + l` island collapsed out of f32
+//!    answers 40032 and the exact comparison sees it. This is not hypothetical: the
+//!    collapsed form answered 40032 on a green run before `LegalizeTypes` learned to
+//!    protect the fptosi-terminated island (measured, 2026-10-21). A tie at LOW lanes
+//!    (the original 100/5000 stimulus) sits inside fp16's exact-integer range and cannot
+//!    see this defect at all.
 //! 2. **The lane-uniformity claim is asserted, not assumed**: every lane of the [64] i32 stick
 //!    must hold the same index. The kernel computes one vector and stores it whole; a lane that
 //!    disagrees is a stick-addressing defect the single-lane reference cannot see on its own.
@@ -142,7 +150,8 @@ fn the_stimulus_tie_discriminates() {
     assert_ne!(
         first, last,
         "VACUOUS TIE: first-max and last-max coincide, so the exact comparison cannot see a \
-         tie-break defect. Regenerate the stimulus (the fixture ties lanes 100 and 5000) -- \
+         tie-break defect. Regenerate the stimulus (the fixture ties lanes 40017 and
+         48000) --\
          this failure means the tie is gone."
     );
     println!(

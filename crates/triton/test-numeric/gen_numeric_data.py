@@ -307,8 +307,9 @@ CONFIGS = {
     # ⭐ THE FIRST INTEGER-OUTPUT CONFIG. The reference is ONE i32 lane (a token index,
     # the gather ingestion dtype), so `OUT_DTYPE` below routes the ref dump around the
     # fp16 truncation every other config takes -- a 49k index does not survive fp16
-    # (exact integers stop at 2048). The stimulus carries a deliberate tie at lanes
-    # 100/5000 so the golden pins FIRST-max.
+    # (exact integers stop at 2048). The stimulus carries a deliberate tie at HIGH lanes
+    # 40017/50000 so the golden pins FIRST-max AND discriminates an f16-degraded final
+    # combine: 40017 = 625*64 + 17 is not fp16-representable (ULP 32 up there).
     "argmax_first_max": dict(fixture="argmax_first_max", kernel="argmax_first_max_kernel",
                              ce=_argmax_ce(), grid=[1], out_dtype="i32"),
 }
@@ -577,14 +578,20 @@ def _argmax_inputs(mod, ce):
            ("lramp_ptr", lramp, "f16"),
            ("idx_ptr", torch.zeros(64, dtype=torch.int32), "i32")]
     note = (
-        f"THE STIMULUS CARRIES A REAL TIE: lanes 100 and 5000 both hold the row's "
-        f"maximum, so `ref_out.bin`'s single lane is 100 -- FIRST-max pinned against a "
-        f"tie, not a vacuous uniqueness. THE NEGATIVE CONTROL IS PART OF THE CONTRACT: "
-        f"a last-max implementation answers 5000 against these same bytes and must not "
-        f"match `ref_out.bin`; a run that still matches cannot have taken the tie. The "
-        f"pad lanes past V={ce['V']} hold -inf (the host obligation the fixture's own "
-        f"docstring states); a kernel that lets a pad lane win the equality answers "
-        f"PAD_V-adjacent garbage, never 100."
+        f"THE STIMULUS CARRIES A REAL TIE AT HIGH LANES: 40017 and 48000 both hold the "
+        f"row's maximum, so `ref_out.bin`'s single lane is 40017 -- FIRST-max pinned "
+        f"against a tie, not a vacuous uniqueness. THE NEGATIVE CONTROLS ARE PART OF THE "
+        f"CONTRACT, AND THERE ARE TWO: (1) a last-max implementation answers 50000 "
+        f"against these same bytes and must not match `ref_out.bin`; a run that still "
+        f"matches cannot have taken the tie. (2) an f16-DEGRADED FINAL COMBINE answers "
+        f"40032 or 40016 -- 40017 = 625*64 + 17 is not fp16-representable (ULP 32 at "
+        f"[32768, 65536)) -- so a kernel whose `b*64 + l` island collapsed out of f32 "
+        f"cannot match either; a run that still matches cannot have degraded. The tie "
+        f"lanes are high ON PURPOSE: the original 100/5000 stimulus sat inside fp16's "
+        f"exact-integer range and could not see (2) at all. The pad lanes past "
+        f"V={ce['V']} hold -inf (the host obligation the fixture's own docstring "
+        f"states); a kernel that lets a pad lane win the equality answers "
+        f"PAD_V-adjacent garbage, never 40017."
     )
     return ins, ref, note
 
