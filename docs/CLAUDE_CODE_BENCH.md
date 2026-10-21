@@ -226,12 +226,12 @@ A rung fixes the **weights**. Four things it does not fix, each of which must
 still appear on every published row:
 
 1. **KV-cache dtype — not matchable at runtime on metal.** The `metal` feature
-   implies `turboquant` (`crates/cli/scr/Cargo.toml:45`), and the codec is fixed
+   (`crates/cli/scr/Cargo.toml`) implies `turboquant`, and the codec is fixed
    when the model is built, from that feature plus the model's attention
    geometry. `--kv-cache-dtype` *asserts* the built-in codec and is refused when
-   it disagrees (`crates/serving/worker/src/gpu_worker.rs:3066-3081`). So the
-   match-or-disclose rule is satisfied here by **disclosure**: matching it would
-   mean a second build without the feature, not a flag — the same point
+   it disagrees (`initialize_cache` in `crates/serving/worker/src/gpu_worker.rs`).
+   So the match-or-disclose rule is satisfied here by **disclosure**: matching
+   it would mean a second build without the feature, not a flag — the same point
    [`BENCHMARKING.md`](BENCHMARKING.md) §4 already makes against mlx-lm. How much
    KV each model even has is architectural, and T0.8 records the consequence:
 
