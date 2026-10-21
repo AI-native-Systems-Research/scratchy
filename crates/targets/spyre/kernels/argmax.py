@@ -23,6 +23,11 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   `BLOCK = 64` — stated by the splice from the node's vocab, never hardcoded
   to a model: a different vocab bakes its own tables.
 * GRID: `[1]` — the sampler serves the solo greedy decode step's single row.
+* THE LOGITS ROW'S PAD LANES are staged at −inf (the widening mint's own law,
+  see `SubOp::ArgMax`): a finite lane always out-maxes them, and an all-−inf
+  row still answers lane 0 — a FINITE floor (fp16 −65504) would out-max an
+  all-−inf row and flip its answer to the sentinel, disagreeing with the host
+  reference's `position(|x| x == m)`.
 
 THE ALGORITHM (equality selection, no inversions): the staged DECREASING ramps
 (bramp block-major, lramp lane-minor) make each `max` land on the FIRST

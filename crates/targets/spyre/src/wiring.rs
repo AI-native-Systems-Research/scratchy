@@ -857,6 +857,152 @@ pub struct Wiring {
     /// alone. Empty for every 128-aligned model — granite, g8b
     /// and g12b stage byte-identically.
     pub fp8_k_pads: &'static [(u32, u32)],
+    /// ⭐ THE LOAD-TIME CONSTANTS — `(tid, kind)` for every resident buffer the
+    /// graph's own producer minted below the `SourceBinding` layer: staged ONCE
+    /// at load through the kind's builder ([`LoadConst::build`]), never a
+    /// per-step source, never baked as literals. The rope tables' own law,
+    /// stated as a LIST: a second spliced kernel with staged tables adds one
+    /// [`LoadConst`] kind and rides this same field — no new wiring surface, no
+    /// per-op field, no consumer that names the op. The ids are the graph's own
+    /// tensor ids (the same ids the placement pass places), and an entry whose
+    /// tid is a graph OUTPUT stages that output's initial bytes (the −inf pad
+    /// tail class).
+    pub load_consts: &'static [(u32, LoadConst)],
+}
+
+/// ⭐ A LOAD-TIME CONSTANT'S KIND — the shared builder that makes its bytes.
+/// A kind names a BUILDER ([`Self::build`]), never a consumer: this enum is
+/// the producer's statement of its host contract, translated once into the
+/// generic [`Wiring::load_consts`] list, and everything downstream (the bake's
+/// numeric gate, the worker's load staging) iterates the list op-blind,
+/// choosing fp32-verbatim vs fp16-convert off the ENTRY'S OWN dtype.
+#[derive(Clone, Copy, Debug)]
+pub enum LoadConst {
+    /// One of the device argmax's six operand tables, by the kernel's operand
+    /// order (1-based over the ArgMax node's inputs; input 0 is the row).
+    /// Bytes from [`argmax_staged_tables`] — the one derivation every stager
+    /// reads, so a table defect cannot hide on one leg only.
+    ArgMaxTable { vocab: u32, operand: u8 },
+    /// The result row's −inf pad tail: zeros on `[0, vocab·2)`, IEEE −inf on
+    /// `[vocab·2, pad_vocab·2)` — the zones the lm-head matmul's zero-pad
+    /// columns never write, so a pad lane cannot win a max the real lanes
+    /// contest. `pad_vocab` derives from `vocab` through
+    /// [`argmax_pad_vocab`](scratchy_subtile::subtile_ir::argmax_pad_vocab),
+    /// the same single derivation every other reader uses.
+    NegInfPadTail { vocab: u32 },
+}
+
+impl LoadConst {
+    /// The const's bytes, true dtype, and `[rows, cols]` shape — ONE
+    /// derivation per kind, shared by every stager (the bake's numeric gate
+    /// and the worker's load staging both call here, so a defect cannot hide
+    /// on one leg only).
+    pub fn build(&self) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
+        match *self {
+            LoadConst::ArgMaxTable { vocab, operand } => {
+                let (bytes, dt, shape) = argmax_staged_tables(vocab)
+                    .into_iter()
+                    .nth((operand - 1) as usize)
+                    .expect("the mint emits operand 1..=6 — the registry's own row");
+                (bytes, dt, shape)
+            }
+            LoadConst::NegInfPadTail { vocab } => {
+                let pad_v = scratchy_subtile::subtile_ir::argmax_pad_vocab(vocab) as usize;
+                let neg_inf = half::f16::NEG_INFINITY.to_le_bytes();
+                let mut row = vec![0u8; pad_v * 2];
+                for c in row[vocab as usize * 2..].as_chunks_mut::<2>().0 {
+                    c.copy_from_slice(&neg_inf);
+                }
+                (row, scratchy_tensors::DType::F16, [1, pad_v])
+            }
+        }
+    }
+}
+
+/// ⭐ THE DEVICE ARGMAX'S SIX STAGED TABLES — the kernel's own host contract
+/// (`kernels/argmax.py`'s docstring), stated ONCE for every stager: the
+/// bake-time numeric gate and the worker's load-time staging read this same
+/// fn, so a table defect cannot hide on one leg only (the synth weights' own
+/// law). The tables are functions of the vocab alone, constant across decode
+/// steps, staged ONCE.
+///
+/// In the kernel's OPERAND ORDER — `bramp, lramp, binc, linc, ones, sixtyfour`
+/// — each entry is `(bytes, dtype, [rows, cols])`:
+///
+/// * `bramp` — strictly DECREASING in the block index (`NB - b`), so the first
+///   `max` lands on the FIRST block holding the row's maximum; 0 on the pad
+///   lanes, which can never win a max the real lanes contest.
+/// * `lramp` — strictly decreasing within each block, PERIODIC (`BLOCK - l`),
+///   so the second `max` lands on the first lane of that block.
+/// * `binc` / `linc` — the INCREASING 0-based block / lane index tables the
+///   one-hot reads the selected numbers back out through; on the pad lanes
+///   they stage `NB` / `BLOCK` — the SENTINEL's own values, so a row whose
+///   one-hot falls on the pads (all-NaN, #666) answers
+///   `idx = NB·BLOCK + BLOCK = PAD_V + BLOCK`, past the last real lane.
+/// * `ones` / `sixtyfour` — the `[1, BLOCK]` widen tables: the fp16 ones
+///   broadcast the selected numbers out to the output stick, the fp32 scale
+///   row carries the `·64` of the wide integer combine (past fp16's exact
+///   range; exact in f32 below 2^24).
+///
+/// Every value is a small exact integer on the fp16 grid (`NB ≤ 1024` at
+/// granite's PAD_V 65536), so the staging round trips bit-exactly.
+pub fn argmax_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType, [usize; 2])> {
+    let pad_v = scratchy_subtile::subtile_ir::argmax_pad_vocab(vocab) as usize;
+    let block = scratchy_subtile::subtile_ir::ARGMAX_BLOCK as usize;
+    let nb = pad_v / block;
+    let v = vocab as usize;
+    // A whole-row fp16 table under a per-lane rule: lane `i < vocab` takes
+    // `real(i)`, a pad lane takes `pad`.
+    let f16_row = |real: &dyn Fn(usize) -> usize, pad: usize| -> Vec<u8> {
+        (0..pad_v)
+            .flat_map(|i| {
+                let x = if i < v { real(i) } else { pad };
+                half::f16::from_f32(x as f32).to_le_bytes()
+            })
+            .collect()
+    };
+    vec![
+        // bramp: NB - b, pads 0.
+        (
+            f16_row(&|i| nb - i / block, 0),
+            scratchy_tensors::DType::F16,
+            [1, pad_v],
+        ),
+        // lramp: BLOCK - l, periodic, pads 0.
+        (
+            f16_row(&|i| block - i % block, 0),
+            scratchy_tensors::DType::F16,
+            [1, pad_v],
+        ),
+        // binc: the block index, pads NB.
+        (
+            f16_row(&|i| i / block, nb),
+            scratchy_tensors::DType::F16,
+            [1, pad_v],
+        ),
+        // linc: the lane index, pads BLOCK.
+        (
+            f16_row(&|i| i % block, block),
+            scratchy_tensors::DType::F16,
+            [1, pad_v],
+        ),
+        // ones: [1, BLOCK] of 1.0.
+        (
+            (0..block)
+                .flat_map(|_| half::f16::from_f32(1.0).to_le_bytes())
+                .collect(),
+            scratchy_tensors::DType::F16,
+            [1, block],
+        ),
+        // sixtyfour: [1, BLOCK] of 64.0 — the ONLY fp32 table.
+        (
+            (0..block)
+                .flat_map(|_| 64.0f32.to_le_bytes())
+                .collect(),
+            scratchy_tensors::DType::F32,
+            [1, block],
+        ),
+    ]
 }
 
 /// The per-model wiring set: one [`Wiring`] per baked PROGRAM.
@@ -1772,6 +1918,7 @@ mod constant_tape_tests {
             fp8_k_pads: &[],
             weight_scale_folds: &[],
             weight_copies: &[],
+            load_consts: &[],
         }
     }
 

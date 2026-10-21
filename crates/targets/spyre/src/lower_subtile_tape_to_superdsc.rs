@@ -720,13 +720,50 @@ pub fn compute_bundle_layout<F: RopeForm>(
         .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
         .map(|n| n.inputs[1].tensor.index() as u32)
         .collect();
+    // ⭐ THE PER-TENSOR DEVICE FORMAT, FROM THE KERNEL SIGNATURES — a tensor whose
+    // consumer is a spliced kernel is sized at the format that kernel's signature
+    // states for it ([`scratchy_triton_splice::operand_dfs`], the registry's own
+    // operand order), never at a per-op width census: a `[1, 64]` f32 table or an
+    // i32 idx stick states its own element width in the kernel that reads it, and
+    // a placement sized at the fp16 default would under-reserve by half and the
+    // footprint guard would refuse the CORRECT descriptor (the `[1,64]` f32
+    // island reads 256 B against a 128 B fp16 placement). A kind that is not a
+    // `lower_one` kernel states no formats here (`None`), leaving its tensors to
+    // the fp8/fp16 rules below — the fp8 weight set keeps its own structural law
+    // (it also feeds the k-pad rows), and the two agree wherever they overlap.
+    // ⛔ AND A SEAT THAT REFUSES CONTRIBUTES NO WIDTHS — the refusal is the
+    // LOWERING's to raise: `lower_one_node` compiles this same seat and fails
+    // loudly there on every real bake, while THIS walk never compiles nodes, so
+    // a graph whose scope leaves a seat unlowered (measured: the door fixtures'
+    // K-side `rope_append`, whose hand-declared cos source is the whole q-width
+    // table — a shape #720's windowing law refuses and no production tape
+    // carries; granite's full graph passes this census strictly) must not fail
+    // the LAYOUT for a program it never mints. The refusing node's tensors keep
+    // the fp8/fp16 rules below — exactly the widths the pre-census layout gave
+    // them, and a node with no program states no kernel formats to honor.
+    let kernel_dfs: std::collections::BTreeMap<u32, Df> = {
+        let mut m: std::collections::BTreeMap<u32, Df> = Default::default();
+        for n in &ir.nodes {
+            let Some(dfs) = scratchy_triton_splice::operand_dfs(n, ir).ok().flatten() else {
+                continue;
+            };
+            for &(tid, df) in &dfs {
+                if df != Df::Fp16 {
+                    m.insert(tid, df);
+                }
+            }
+        }
+        m
+    };
     let nbytes = |tid: u32| -> u64 {
         let s = ir.tensors[tid as usize];
         // Reserve the DEVICE footprint: a stick-last tensor pads its innermost stick dim up to a whole
         // stick on-device — fp16 is a 64-elem / 2-byte stick, fp8 is a 128-elem / 1-byte stick (HALF the
         // bytes). Width is DERIVED from the operand's `Df` (rung 1), never hardcoded. (granite lm_head
         // vocab 49159 → 49216 padding stays in-bounds for the on-card write / weight staging.)
-        let df = if fp8_weight_tids.contains(&tid) {
+        let df = if let Some(wide) = kernel_dfs.get(&tid) {
+            *wide
+        } else if fp8_weight_tids.contains(&tid) {
             Df::Fp8
         } else {
             Df::Fp16
@@ -2698,12 +2735,16 @@ pub(crate) struct StagedWeights {
 }
 
 impl StagedWeights {
-    /// The reference legs' zero-copy window over this staging.
+    /// The reference legs' zero-copy window over this staging. The window owns
+    /// no load-consts (`&[]`): the synth-weight staging never minted any, and
+    /// the gate's own view — the one that judges a bundle with load-consts —
+    /// states them separately (see [`StagedWeightView::load_consts`]).
     pub(crate) fn view(&self) -> StagedWeightView<'_> {
         StagedWeightView {
             bytes: &self.bytes,
             gemm: &self.gemm,
             scale_rows: &self.scale_rows,
+            load_consts: &[],
         }
     }
 }
@@ -2718,6 +2759,15 @@ pub(crate) struct StagedWeightView<'a> {
     pub bytes: &'a [(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)],
     pub gemm: &'a std::collections::HashSet<u32>,
     pub scale_rows: &'a std::collections::HashSet<u32>,
+    /// The load-time constants — the SAME `(tid, kind)` list the worker's
+    /// `bind_load_consts` stages. ⛔ DELIBERATELY NOT part of `bytes`: a weight
+    /// is a source whose bytes ARE its value (the per-node `materialize`
+    /// substitutes them at every read), while a load-const whose tid is a
+    /// graph OUTPUT stages that output's INITIAL bytes — the ops overwrite
+    /// them wherever they compute — so the reference legs take them through
+    /// [`Self::stage_load_consts`] at buffer init instead, never through the
+    /// read-time channel.
+    pub load_consts: &'a [(u32, crate::wiring::LoadConst)],
 }
 
 impl StagedWeightView<'_> {
@@ -2761,6 +2811,60 @@ impl StagedWeightView<'_> {
             }
         }
         Some(out)
+    }
+
+    /// ⭐ THE LOAD-CONSTS, STATED AS INITIAL BYTES — the reference legs'
+    /// statement of the worker's own `bind_load_consts` staging: the worker
+    /// writes each entry's built bytes at its tid's stick BEFORE the programs
+    /// run, and the programs overwrite whatever they compute, so the reference
+    /// writes the f32 image of the SAME builder's bytes (`LoadConst::build`,
+    /// the one derivation both legs call) into `bufs[tid]` once at buffer init
+    /// and lets the node walk overwrite it the same way. ⛔ NOT the
+    /// `bytes`/`materialize` channel — that substitutes a weight's bytes at
+    /// every READ, and an OUTPUT-tid entry reaching it would replace the
+    /// computed product with its own initial bytes at every consumer
+    /// (measured: the argmax mint's widened row read back as its staged
+    /// zeros, golden idx 0 against a true argmax of 12358 on both legs).
+    /// `floor` skips entries below it: the teacher-forced walk relays its
+    /// source slots from the golden per node, so only its non-source buffers
+    /// take initial bytes here; the golden passes 0. An entry whose buffer the
+    /// covering slice left unallocated is skipped with it — nothing bound
+    /// reads it.
+    pub(crate) fn stage_load_consts(&self, bufs: &mut [Vec<f32>], floor: usize) {
+        for &(tid, kind) in self.load_consts {
+            let i = tid as usize;
+            if i < floor || i >= bufs.len() || bufs[i].is_empty() {
+                continue;
+            }
+            let (bytes, dt, _shape) = kind.build();
+            let vals: Vec<f32> = match dt {
+                scratchy_tensors::DType::F16 => bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|p| half::f16::from_le_bytes(*p).to_f32())
+                    .collect(),
+                scratchy_tensors::DType::F32 => bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|p| f32::from_le_bytes(*p))
+                    .collect(),
+                other => panic!(
+                    "the reference legs have no f32 image for the load-const at t{tid} \
+                     staged as {other:?} — extend `stage_load_consts` with that dtype's decode"
+                ),
+            };
+            assert_eq!(
+                vals.len(),
+                bufs[i].len(),
+                "the load-const at t{tid} builds {} values against an IR shape of {} — \
+                 the builder and the mint disagree",
+                vals.len(),
+                bufs[i].len()
+            );
+            bufs[i] = vals;
+        }
     }
 }
 
@@ -3127,6 +3231,12 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
             bufs[s].copy_from_slice(src);
         }
     }
+    // ⭐ THE LOAD-CONSTS' INITIAL BYTES — the same pre-program staging the
+    // resident performs (`stage_load_consts`' doc is the law): written once
+    // at buffer init, overwritten by the node walk wherever ops compute. A
+    // source-tid entry (the staged tables) lands here over its synth slot —
+    // its bytes are its value, and no op ever writes it.
+    weights.stage_load_consts(&mut bufs, 0);
     for node in &ir.nodes {
         if folded_node(node.id) {
             continue;
@@ -3442,6 +3552,11 @@ fn teacher_forced_walk<F: RopeForm>(
             }
         })
         .collect();
+    // The load-consts' initial bytes, same law as the golden's init call —
+    // floored at `nsrc`: this walk's source slots are relayed from the golden
+    // per node (they already carry their staged bytes there), so only its
+    // non-source buffers take initial bytes here.
+    weights.stage_load_consts(&mut tf, nsrc);
     let mut rows: Vec<TeacherForcedRow> = Vec::new();
     for (ni, node) in ir.nodes.iter().enumerate() {
         if folded_node(node.id) {
@@ -3979,16 +4094,40 @@ pub fn numeric_gate<F: RopeForm>(
     //    ~12 GB of codes, its 7-of-48 covering slice ~1.75 GB); the clone is
     //    the one transient double, and the slice keeps both sides small. ──
     let StagedWeights {
-        bytes: emu_weights,
+        bytes: mut emu_weights,
         gemm,
         scale_rows,
     } = stage_synth_weights(ir, weight_ids, covering);
+    // ⭐ THE LOAD-TIME CONSTANTS — resident bytes at their TRUE dtypes, staged
+    // into the session exactly as the worker stages them at load: each entry's
+    // kind names the ONE builder (`LoadConst::build`) both legs call, so a
+    // staging defect cannot hide on one leg only. A source the list names is
+    // minted below the `LoweredDecode` binding layer (no `SourceBinding`,
+    // absent from `weight_ids`), so the source loop below would otherwise hand
+    // it to `run_step`'s f16-only source channel — and an fp32 table would
+    // encode into half the bytes its f32 view spans. ⛔ THE REFERENCE LEGS TAKE
+    // THEM THROUGH THE VIEW'S OWN `stage_load_consts`, NOT `bytes`: the clone
+    // crosses BEFORE the entries join the session's staging, because
+    // `materialize` substitutes at every READ (a weight's bytes are its value)
+    // and an OUTPUT-tid entry reaching it would replace the computed product
+    // with its own initial bytes at every consumer (measured: the argmax
+    // mint's widened row read back as its staged zeros, golden idx 0 against
+    // a true argmax of 12358 on both legs).
+    let load_consts = crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir)
+        .map_err(|e| e.0)?;
+    let load_const_tids: std::collections::HashSet<u32> =
+        load_consts.iter().map(|&(tid, _)| tid).collect();
     let weights_ref = emu_weights.clone();
     let view = StagedWeightView {
         bytes: &weights_ref,
         gemm: &gemm,
         scale_rows: &scale_rows,
+        load_consts: &load_consts,
     };
+    for &(tid, kind) in &load_consts {
+        let (bytes, dt, shape) = kind.build();
+        emu_weights.push((tid as usize, bytes, dt, shape.to_vec()));
+    }
     // ── The probe sources: synth at the IR shape, scales as ones, the mask
     //    keeping the prefix region's rows valid (the reference's own key set) ──
     // The rope cos/sin sources stage at their runtime contract — period-`half`,
@@ -4010,7 +4149,10 @@ pub fn numeric_gate<F: RopeForm>(
         // part of the graph under test. The reserved-tid sources appended
         // below (the scalars, the mask) stay UNfiltered — the twin's programs
         // bind them exactly as the full bundle does.
-        if weight_ids.contains(&tid) || covering.is_some_and(|c| !c.contains(&(tid as u64))) {
+        if weight_ids.contains(&tid)
+            || load_const_tids.contains(&tid)
+            || covering.is_some_and(|c| !c.contains(&(tid as u64)))
+        {
             continue;
         }
         let t = ir.tensors[tid as usize];
@@ -4159,8 +4301,23 @@ pub fn numeric_gate<F: RopeForm>(
         .filter(|t| bound.contains(t))
         .collect();
     let refs: Vec<(&[bundle::LaunchGroup<'static>], &[u64])> = vec![(groups, &results)];
-    let mut session = crate::runner::SpyreSession::new_multi(&refs, emu_weights)
-        .map_err(|e| format!("gate session: {e}"))?;
+    // ⭐ THE SHAPE FLOOR — the krg's own tensor shapes, the tape's statement
+    // the resident sticks allocate at LEAST. The emulator's view walk derives a
+    // tid's extent only from views its arg→tid mappings reach, and a widened
+    // reader whose view sits on an interior edge of a fused function is
+    // invisible to it (measured: the argmax mint's PAD_V-wide logits row over
+    // the lm-head matmul's narrower device-width out view). The floor is the
+    // same authority `compute_bundle_layout` reserves from — the minted krg —
+    // and it is a MAX, so it can only raise an allocation.
+    let shape_floor: std::collections::HashMap<u64, usize> = ir
+        .tensors
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (i as u64, t.rows as usize * t.cols as usize))
+        .collect();
+    let mut session =
+        crate::runner::SpyreSession::new_multi_floored(&refs, emu_weights, &shape_floor)
+            .map_err(|e| format!("gate session: {e}"))?;
     let observables = session.observable_tids(0);
     let compare: Vec<(u64, usize)> = golden_tids
         .iter()

@@ -96,6 +96,7 @@ use std::collections::HashMap;
 use ktir_core::arena::Arena;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::{BufferId, Elementwise, KtirNode, Program};
+use ktir_superdsc::superdsc_opspec::Df;
 use scratchy_subtile::lower::GemmWeight;
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SubOp, SubtileIR, SubtileNode};
 
@@ -2366,7 +2367,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // f16 tables, the f32 widen table (the island's own dtype), and the i32
             // output stick (the index-ingestion law).
             let pad_v = scratchy_subtile::subtile_ir::argmax_pad_vocab(*vocab);
-            let nb = pad_v / 64;
+            let nb = pad_v / scratchy_subtile::subtile_ir::ARGMAX_BLOCK;
             for p in [
                 "logits_ptr", "bramp_ptr", "lramp_ptr", "binc_ptr", "linc_ptr", "ones_ptr",
             ] {
@@ -2391,7 +2392,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("V", Val::Int(i128::from(*vocab)))?;
             ce("PAD_V", Val::Int(i128::from(pad_v)))?;
             ce("NB", Val::Int(i128::from(nb)))?;
-            ce("BLOCK", Val::Int(64))?;
+            ce("BLOCK", Val::Int(i128::from(scratchy_subtile::subtile_ir::ARGMAX_BLOCK)))?;
         }
         (op, entry) => {
             return Err(format!(
@@ -2730,6 +2731,113 @@ fn default_bindings<F: scratchy_subtile::subtile_ir::RopeForm>(
     let mut bindings: Vec<BufferId> = node.inputs.iter().take(n_bound).map(&t).collect();
     bindings.push(t(&node.output));
     bindings
+}
+
+/// ⭐⭐⭐ THE OPERAND FORMATS A SPLICED KERNEL STATES — every buffer parameter's
+/// element format, as `(tensor id, format)` pairs in the node's OPERAND ORDER
+/// ([`default_bindings`]' law: the node's inputs, the output LAST). This is the
+/// PLACEMENT PASS's width authority: a tensor whose consumer is a spliced
+/// kernel is sized at the format that kernel's signature states for it, never
+/// at a per-op width census — a `[1, 64]` f32 table or an i32 idx stick states
+/// its own element width in the kernel that reads it, and a placement sized at
+/// the fp16 default would under-reserve by half and the footprint guard would
+/// refuse the CORRECT descriptor.
+///
+/// The ORDER comes from the kernel's own declared parameter list — the
+/// signature map is keyed by NAME and unordered — and each entry is the
+/// SIGNATURE's stated pointer dtype, the same statement the compile itself
+/// reads. `Ok(None)` for a kind that is not a `lower_one` kernel: a `Refused`
+/// row's formats are another producer's statement, and attention — a Spliced
+/// row that lowers through `lower_attn`'s door-order bindings — states its
+/// widths at the door (the per-parameter view dtype), not here.
+///
+/// The device-format mapping is the door's own law: a stated dtype with no
+/// device format is refused BY NAME, because sizing it at some other format's
+/// bytes would turn the footprint guard into a rubber stamp for exactly the
+/// access it exists to catch. ⚠ AN `Err` HERE IS THE SEAT'S OWN REFUSAL — the
+/// same `kernel_spec` the compile runs — so a caller that does not itself
+/// compile the node (the placement pass's width census) treats it as "no
+/// formats from this seat" and leaves the refusal to the lowering, which
+/// raises it loudly on every node it actually mints; a caller that does
+/// compile should propagate it unchanged.
+pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> Result<Option<Vec<(u32, Df)>>, String> {
+    // Attention is a Spliced ROW but not a `lower_one` kernel (its door-order
+    // bindings and mask slot are `lower_attn`'s); its widths are the door's
+    // statement. This names the ROUTING, not a format.
+    if matches!(node.op, SubOp::AttnDecode { .. }) {
+        return Ok(None);
+    }
+    let row = row(&node.op);
+    let TritonKernelRow::Spliced { src, file, entry, .. } = &row else {
+        return Ok(None);
+    };
+    let spec = kernel_spec(node, ir, file, entry)?;
+    let module = triton_frontend::py::parser::parse(src)
+        .map_err(|e| format!("triton splice: {file}: {e}"))?;
+    let f = module
+        .function(entry)
+        .ok_or_else(|| format!("triton splice: {file} declares no function {entry}"))?;
+    let mut dfs: Vec<Df> = Vec::new();
+    for p in &f.params {
+        if p.is_constexpr() {
+            continue;
+        }
+        let Some(arg) = spec.signature.get(&p.name) else {
+            return Err(format!(
+                "triton splice: {file}'s {entry} parameter `{}` is missing from the signature",
+                p.name
+            ));
+        };
+        match arg {
+            ArgSpec::Ptr(t) => dfs.push(df_of_stated_type(&p.name, t)?),
+            // A scalar parameter is not an operand buffer; the zip with the
+            // binding law below refuses any kernel whose parameters are not
+            // exactly its operands.
+            ArgSpec::Scalar(_) => {}
+            ArgSpec::Constexpr => unreachable!("is_constexpr filtered the parameter above"),
+        }
+    }
+    let bindings = default_bindings(node);
+    if bindings.len() != dfs.len() {
+        return Err(format!(
+            "triton splice: {file}'s {entry} states {} buffer parameter(s) for {} operand(s) — \
+             the registry's operand-order contract is violated",
+            dfs.len(),
+            bindings.len()
+        ));
+    }
+    Ok(Some(
+        bindings
+            .into_iter()
+            .zip(dfs)
+            .map(|(b, df)| (b.get(), df))
+            .collect(),
+    ))
+}
+
+/// One stated pointer dtype → its device format — the door's own mapping law
+/// (F16→Fp16, BF16→Bf16, F32→Fp32, F8E4M3FN→Fp8, i32→SenUint32): a dtype with
+/// no device format is refused BY NAME.
+fn df_of_stated_type(param: &str, t: &triton_frontend::ttir::Type) -> Result<Df, String> {
+    use triton_frontend::ttir::{FloatKind, Type};
+    Ok(match t {
+        Type::Float(FloatKind::F16) => Df::Fp16,
+        Type::Float(FloatKind::BF16) => Df::Bf16,
+        Type::Float(FloatKind::F32) => Df::Fp32,
+        Type::Float(FloatKind::F8E4M3FN) => Df::Fp8,
+        Type::Int(32, _) => Df::SenUint32,
+        other => {
+            return Err(format!(
+                "triton splice: parameter `{param}` states element type {other:?}, which has no \
+                 device format — the placement would be sized at some other format's bytes and \
+                 the footprint guard would then compare an access against a fiction. Give the \
+                 buffer a dtype the device has (f16, bf16, f32, f8E4M3FN, i32)."
+            ))
+        }
+    })
 }
 
 /// Mint the [`KtirNode`]: the adapter's `node_for` compilation, then RE-STATE the fields

@@ -249,7 +249,7 @@ macro_rules! __out_cols_body {
         1u32
     };
     ($w:ident, [stick]) => {
-        64u32
+        crate::subtile_ir::ARGMAX_BLOCK
     };
     ($w:ident, [field $f:ident]) => {
         *$f

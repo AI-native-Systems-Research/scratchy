@@ -1293,6 +1293,13 @@ pub struct BundleWiring {
     /// attention classes states its set here the day it lands (the registry row already exists).
     pub rope_class_hds: Vec<u32>,
     pub attn_class_hds: Vec<u32>,
+    /// ⭐ THE LOAD-TIME CONSTANTS — `(tid, kind)` for every resident buffer this
+    /// graph's own producer minted below the `SourceBinding` layer, derived by
+    /// [`load_consts_of_ir`] (the one derivation; the bake's numeric gate reads
+    /// the same list). The worker stages each entry ONCE at load through the
+    /// kind's builder — the rope tables' own law. The tables carry no
+    /// `SourceBinding`; this list is the worker's only naming of them.
+    pub load_consts: Vec<(u32, crate::wiring::LoadConst)>,
 }
 
 /// One program's parameter order: `args[i]` is the tensor the i-th parameter addresses.
@@ -1317,6 +1324,7 @@ pub(crate) struct WiringRegistries {
     pub weight_copies: Vec<(u32, u32)>,
     pub rope_class_hds: Vec<u32>,
     pub attn_class_hds: Vec<u32>,
+    pub load_consts: Vec<(u32, crate::wiring::LoadConst)>,
 }
 
 /// Lower `ir` for its WIRING alone — the same per-node arms a bake runs, read for the parameter
@@ -1370,6 +1378,12 @@ pub fn graph_wiring<F: RopeForm>(
                 _ => None,
             },
         )),
+        // ⭐ THE LOAD-CONST LIST, off the minted node itself — the one node this
+        // graph either carries or does not. [`load_consts_of_ir`] is the one
+        // derivation (the bake's numeric gate reads the same list), so the
+        // wiring's ids and the layout's placements cannot disagree — the
+        // `weight_copies` one-mint law.
+        load_consts: load_consts_of_ir(ir)?,
     };
     // ⭐ EVERY NODE IS LOWERED ON ITS OWN, so they are lowered IN PARALLEL and folded IN ORDER. Each
     // node's arm is a pure function of the node and the graph (the kernel memos it reaches are
@@ -1490,6 +1504,7 @@ pub fn graph_wiring<F: RopeForm>(
         // the emitter's class tids agree by construction (see the field's doc).
         rope_class_hds: registries.rope_class_hds,
         attn_class_hds: registries.attn_class_hds,
+        load_consts: registries.load_consts,
     })
 }
 
@@ -1508,6 +1523,121 @@ pub struct RungFacts {
     /// The split-KV chunk this rung bakes — see `BundleAttnParams::chunk_pages` (a
     /// one-request or prompt-chunk rung; `None` for the whole-cap rungs).
     pub chunk_pages: Option<u32>,
+}
+
+/// ⭐⭐⭐⭐⭐ CAN THE DEVICE ARGMAX SERVE THIS RESULT TAIL? — the mint-site gate,
+/// keyed on the STRUCTURE the graph itself states, never on a quant preset's NAME
+/// (so a future preset cannot slip past a name list). ONE fact, read off the result
+/// tail's lm-head matmul:
+///
+/// * ARITY-2 DENSE — fp8 W8A8 stages the per-channel scale as the matmul's THIRD
+///   operand and MLX-affine packs the table; the device argmax reads the result ROW
+///   the dense tail produces, and the ruling's admission keeps the mint to the tail
+///   forms the deleted #698 composite was card-proven on (the tie conjunct is
+///   DROPPED — no gather link exists to demand it). The boundary is the STAGING,
+///   never the preset's PRESENCE: granite's own fp8-dynamic-per-channel IGNORES the
+///   lm_head, so the dense tail persists under it and the mint survives the preset.
+///
+/// An unrecognizable tail (no lm-head matmul under the single-input post-op chain)
+/// simply does not mint — the model keeps the host argmax exactly as a staged tail
+/// does, never a build refusal: unlike #698's composite, the kernel demands NOTHING
+/// from the lm-head, so absence of the recognized form is a quiet boundary, not an
+/// inconsistency.
+pub fn lm_head_admits_the_argmax<F: RopeForm>(ir: &SubtileIR<F>) -> bool {
+    let Some(node) = result_tail_lm_head(ir) else {
+        return false;
+    };
+    let SubOp::MatmulTile { weight, .. } = &node.op else {
+        unreachable!("the tail walk breaks only on a MatmulTile");
+    };
+    node.inputs.len() == 2 && matches!(weight, scratchy_subtile::lower::GemmWeight::Dense)
+}
+
+/// The result tail's lm-head matmul, when the result ends in one: back through the
+/// single-input column-preserving tail ops (granite's logits-scaling ScalarMul,
+/// gemma's TanhSoftCap — the argmax reads THROUGH them, so they stay exactly where
+/// they are) to the MatmulTile that produces the logits. `None` for any other tail.
+///
+/// The vocab matmul is N-block TILED — many subtiles write the result tensor in
+/// column slices — and every subtile of one source op states the same structure, so
+/// the FIRST writer is the representative one (the gate's own law; #698 walked the
+/// same first-writer on the card-proven cells).
+fn result_tail_lm_head<F: RopeForm>(ir: &SubtileIR<F>) -> Option<&SubtileNode<F>> {
+    let mut t = ir.result;
+    loop {
+        let node = ir.nodes.iter().find(|n| n.output.tensor == t)?;
+        match &node.op {
+            SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. } if node.inputs.len() == 1 => {
+                t = node.inputs[0].tensor;
+            }
+            SubOp::MatmulTile { .. } => return Some(node),
+            _ => return None,
+        }
+    }
+}
+
+/// ⭐⭐⭐ THE LOAD-TIME CONSTANTS A GRAPH CARRIES — `(tid, kind)` for every
+/// resident buffer the graph's own producer minted below the `SourceBinding`
+/// layer. THE ONE DERIVATION: [`graph_wiring`](self)'s registry and the bake's
+/// numeric gate both read this list, so the wiring's ids and the gate's staged
+/// bytes cannot disagree (the `weight_copies` one-mint law).
+///
+/// This fn is the PRODUCER'S TRANSLATION POINT — the one place a minted op
+/// states its host contract as generic [`LoadConst`] kinds. Everything
+/// downstream of it is op-blind: the kinds name shared builders
+/// ([`crate::wiring::LoadConst::build`]), the consumers iterate the list, and
+/// a second spliced kernel with staged tables adds its arm HERE and rides the
+/// same list with zero new wiring surface.
+///
+/// A second minted node of one kind is a build error, not a last-write-wins:
+/// two scans would stage two sticks and the worker could read either.
+pub fn load_consts_of_ir<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<Vec<(u32, crate::wiring::LoadConst)>, SuperDscError> {
+    // ⭐ THE DEVICE ARGMAX'S MINT — the six operand tables (functions of the
+    // vocab alone, built by the shared `argmax_staged_tables` derivation the
+    // kind names) and the widened result row's −inf pad tail (the zones the
+    // lm-head matmul's zero-pad columns never write).
+    let mut mints = ir
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.op, SubOp::ArgMax { .. }));
+    match (mints.next(), mints.next()) {
+        (None, _) => Ok(Vec::new()),
+        (Some(_), Some(_)) => Err(SuperDscError(
+            "two ArgMax nodes in one graph — the mint appends exactly one to the one-request \
+             rung; a second means two mints ran over one graph"
+                .to_string(),
+        )),
+        (Some(node), None) => {
+            let SubOp::ArgMax { vocab } = node.op else {
+                unreachable!("the filter matched an ArgMax")
+            };
+            assert_eq!(
+                node.inputs.len(),
+                7,
+                "the ArgMax node's arity is the registry's own row (logits + six tables)"
+            );
+            let mut consts: Vec<(u32, crate::wiring::LoadConst)> = node.inputs[1..]
+                .iter()
+                .enumerate()
+                .map(|(i, tr)| {
+                    (
+                        tr.tensor.index() as u32,
+                        crate::wiring::LoadConst::ArgMaxTable {
+                            vocab,
+                            operand: (i + 1) as u8,
+                        },
+                    )
+                })
+                .collect();
+            consts.push((
+                ir.result.index() as u32,
+                crate::wiring::LoadConst::NegInfPadTail { vocab },
+            ));
+            Ok(consts)
+        }
+    }
 }
 
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`

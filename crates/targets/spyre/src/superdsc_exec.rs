@@ -1800,6 +1800,43 @@ impl Executor {
         Ok(())
     }
 
+    /// ⭐⭐⭐ STAGE THE LOAD-TIME CONSTANTS — every entry of the wiring's
+    /// [`load_consts`](crate::wiring::Wiring::load_consts) list, bound ONCE at
+    /// load, before prepare (each is a function of the graph alone, so
+    /// re-binding per step would re-upload constants). Must be called before
+    /// [`Executor::prepare`], exactly like [`Self::bind_weight`].
+    ///
+    /// The fp32-verbatim vs fp16-convert choice keys off the ENTRY'S OWN
+    /// dtype, never off the op that minted it: a resident fp32 constant's LE
+    /// bytes are the device's own (`Df::Fp32` = IEEE_FP32 —
+    /// [`Self::bind_const_fp32`]), and everything else rides the weight
+    /// channel's IEEE→SEN convert ([`Self::bind_weight`]), bit-exact for every
+    /// value a staged table states. An entry whose tid is a graph OUTPUT (the
+    /// −inf pad tail class) simply binds that output's initial bytes into its
+    /// own placement — the ops that overwrite it per step do so over these
+    /// bytes, exactly as the card behaves.
+    pub fn bind_load_consts(
+        &mut self,
+        consts: &[(u32, crate::wiring::LoadConst)],
+    ) -> Result<()> {
+        if self.prepared {
+            bail!(
+                "bind_load_consts: session ALREADY PREPARED — load-time constants are resident, \
+                 staged once at load"
+            );
+        }
+        for &(tid, kind) in consts {
+            let (bytes, dt, _shape) = kind.build();
+            let id = bundle::PlaceId::Act(tid);
+            if matches!(dt, scratchy_tensors::DType::F32) {
+                self.bind_const_fp32(id, bytes)?;
+            } else {
+                self.bind_weight(id, bytes);
+            }
+        }
+        Ok(())
+    }
+
     /// Declare, BEFORE prepare, that `seg` will be BORROWED from another session via
     /// [`Executor::alias_seg_from`]: prepare gives it a 128 B placeholder, skips its host staging
     /// and skips its H2D, so the session never builds the copy the alias immediately discards.

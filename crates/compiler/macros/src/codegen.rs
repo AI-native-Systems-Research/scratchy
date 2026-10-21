@@ -9309,6 +9309,17 @@ fn emit_superdsc_wiring(
         let mut embeds = 0usize;
         for id in 0..gk.num_sources {
             let Some(b) = lwd.bindings.get(id as usize) else {
+                // ⭐ A LOAD-CONST SOURCE — minted below the `LoweredDecode`
+                // binding layer, so it carries NO `SourceBinding`: the wiring's
+                // `load_consts` list names it (BY MEMBERSHIP in the generic
+                // list, never by the op that minted it), and the worker stages
+                // its bytes once at load through the kind's builder — the rope
+                // tables' own law. This arm is that list's declaration; every
+                // other binding-less source is still the
+                // hang-or-silent-wrong refusal below.
+                if gk.load_consts.iter().any(|&(tid, _)| tid == id) {
+                    continue;
+                }
                 fail.push(format!(
                     "source t{id} is inside `num_sources` but has NO binding — nothing fills it"
                 ));
@@ -9578,6 +9589,36 @@ fn emit_superdsc_wiring(
             quote! { (#id, #k) }
         })
         .collect::<Vec<_>>();
+    // ⭐ THE LOAD-TIME CONSTANTS — straight off the bake's own one derivation
+    // (`load_consts_of_ir`, the same list the numeric gate stages), never
+    // recomputed here: each entry is `(tid, kind)` and the KIND names the
+    // shared builder that makes the bytes, so the worker and the gate stage
+    // identical bytes by construction.
+    let load_const_toks = gk
+        .load_consts
+        .iter()
+        .map(|&(tid, kind)| {
+            let tid = u32l(tid);
+            let kind = match kind {
+                scratchy_target_spyre::wiring::LoadConst::ArgMaxTable { vocab, operand } => {
+                    quote! {
+                        ::scratchy_target_spyre::wiring::LoadConst::ArgMaxTable {
+                            vocab: #vocab,
+                            operand: #operand,
+                        }
+                    }
+                }
+                scratchy_target_spyre::wiring::LoadConst::NegInfPadTail { vocab } => {
+                    quote! {
+                        ::scratchy_target_spyre::wiring::LoadConst::NegInfPadTail {
+                            vocab: #vocab,
+                        }
+                    }
+                }
+            };
+            quote! { (#tid, #kind) }
+        })
+        .collect::<Vec<_>>();
     quote! {
         ::scratchy_target_spyre::wiring::Wiring {
             result: #result,
@@ -9605,6 +9646,7 @@ fn emit_superdsc_wiring(
             weight_scale_folds: &[#(#weight_scale_fold_lits),*],
             weight_copies: &[#(#weight_copy_lits),*],
             fp8_k_pads: &[#(#fp8_k_pad_toks),*],
+            load_consts: &[#(#load_const_toks),*],
         }
     }
 }
@@ -10975,7 +11017,30 @@ fn dump_wavefront_mega(
                 // never wrong: the rung contract's own fallback).
                 let mut prefill_fp_stamped = false;
                 let fused = scratchy_subtile::lower::fuse_silu_mul(&lwd.input);
-                let krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
+                let mut krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
+                // ⭐⭐⭐ THE DEVICE ARGMAX'S MINT (#603) — the ONE rung whose next token
+                // needs just `argmax(logits)`: the one-request decode rung whose
+                // lm-head the emitted tail admits (arity-2 Dense fp16 — the ruling's
+                // admission, the #698 tie conjunct DROPPED: no gather link exists to
+                // demand it). The splice is the kernel's ONLY entry — this mint appends
+                // the node and its six staged-table sources to the graph, and everything
+                // downstream (the splice's row, the door's whole-function walk, the
+                // placement pass, the wiring's argmax facts) is the same machinery every
+                // other Triton kernel takes. Batched rungs, prefill and every staged or
+                // unrecognizable lm-head keep the host readback path unchanged.
+                if one_request
+                    && scratchy_target_spyre::lower_subtile_tape_to_ktir::lm_head_admits_the_argmax(
+                        &krg,
+                    )
+                {
+                    let mint = scratchy_subtile::subtile_ir::mint_argmax(&mut krg);
+                    eprintln!(
+                        "[spyre-superdsc] {base}: the device argmax minted — vocab {} (padded \
+                         row {}), six staged tables + the [1, 64] idx stick appended to the \
+                         one-request graph",
+                        mint.vocab, mint.pad_vocab
+                    );
+                }
                 if let Err(e) = scratchy_subtile::subtile_ir::ValidatedGraph::new(&krg) {
                     eprintln!("[spyre-ktir] {stem}: SubtileIR rejected by validate() — {e:?}");
                     return ((String::new(), Vec::new(), String::new(), Vec::new()), fx);
