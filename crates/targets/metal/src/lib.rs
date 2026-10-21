@@ -285,7 +285,7 @@ pub mod aot;
 // (used by the interpreter's `#[cfg(test)]` golden checks).
 pub mod cpu_golden;
 pub mod interpreter;
-pub mod paged_kv_layout;
+pub use scratchy_subtile::paged_kv_layout;
 
 /// Number of paged-KV-cache blocks backed by one physical chunk buffer
 /// in the metal reactive (chunked) KV pool. SINGLE SOURCE OF TRUTH for

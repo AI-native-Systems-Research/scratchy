@@ -53,6 +53,12 @@ required-features = ["nvcc"]
 name = "rope_gate"
 required-features = ["nvcc"]
 
+# The KV append and the prefill attention over the paged KV cache against a CPU reference and
+# exact probes, on the GPU. Not built without `nvcc`.
+[[test]]
+name = "attention"
+required-features = ["nvcc"]
+
 # The hand-written tapes against what CUDA's compiler lowers. No toolchain needed.
 [[test]]
 name = "tape_layout"

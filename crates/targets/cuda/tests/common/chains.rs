@@ -10,9 +10,9 @@ use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{SourceShape, SubOp};
 use scratchy_target_cuda::step::{CudaStep, GemmBf16};
-use scratchy_target_cuda::tape::{ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, WeightIx};
+use scratchy_target_cuda::tape::{ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, KvTape, WeightIx};
 use scratchy_target_cuda_compiler::canonical::{
-    CanonicalAt, CudaCanonical, CudaModelFacts, lower_canonical,
+    CanonicalAt, CanonicalKv, CudaCanonical, CudaModelFacts, lower_canonical,
 };
 
 /// qwen3.5's model facts: `head_dim` 256, a quarter of it rotated, `rope_theta` 1e7. Every fixture
@@ -41,6 +41,7 @@ pub fn assert_tape_is_lowered(name: &str, tape: &CudaTape, l: &LoweredDecode) {
         weight_bytes,
         steps,
         rotary,
+        kv,
     } = *tape;
     let at = CanonicalAt {
         stem: name,
@@ -56,6 +57,7 @@ pub fn assert_tape_is_lowered(name: &str, tape: &CudaTape, l: &LoweredDecode) {
         weight_bytes: lowered_weights,
         steps: lowered_steps,
         rotary: lowered_rotary,
+        kv: lowered_kv,
     } = lower_canonical(l, QWEN3_5_FACTS, at)
         .unwrap_or_else(|e| panic!("{name}: lower_canonical: {e}"));
     assert_eq!(bucket_m, lowered_m, "{name}: bucket_m");
@@ -67,6 +69,28 @@ pub fn assert_tape_is_lowered(name: &str, tape: &CudaTape, l: &LoweredDecode) {
     assert_eq!(weight_bytes, lowered_weights, "{name}: weight_bytes");
     assert_eq!(steps, lowered_steps, "{name}: steps");
     assert_eq!(rotary, lowered_rotary, "{name}: rotary");
+    let kv = kv.map(
+        |KvTape {
+             layers,
+             kv_heads,
+             head_dim,
+             block_size,
+             max_blocks_per_seq,
+             block_table,
+             slot_mapping,
+             sequence,
+         }| CanonicalKv {
+            layers: layers.to_vec(),
+            kv_heads,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+            block_table,
+            slot_mapping,
+            sequence,
+        },
+    );
+    assert_eq!(kv, lowered_kv, "{name}: kv");
 }
 
 /// The chains' activation width: `x` is `[M, HIDDEN]`.
@@ -153,6 +177,7 @@ pub static TWO_GEMM_M128: CudaTape = CudaTape {
         gemm(131072, 2, 393216, 128, 512, 1024),
     ],
     rotary: None,
+    kv: None,
 };
 
 /// [`two_gemm`]`(256)`: colours x, y1, y2.
@@ -171,6 +196,7 @@ pub static TWO_GEMM_M256: CudaTape = CudaTape {
         gemm(262144, 2, 786432, 256, 512, 1024),
     ],
     rotary: None,
+    kv: None,
 };
 
 /// [`three_gemm`]: `y1` is dead after step 1, so `y3` takes its colour, and the arena is the
@@ -191,4 +217,5 @@ pub static THREE_GEMM_M256: CudaTape = CudaTape {
         gemm(786432, 3, 262144, 256, 1024, 512),
     ],
     rotary: None,
+    kv: None,
 };

@@ -157,6 +157,7 @@ pub static MLP_M128: CudaTape = CudaTape {
         add(262144, 0, 4194304, 128),
     ],
     rotary: None,
+    kv: None,
 };
 
 /// [`mlp`]`(256)`: `x` 0, `n` 524288, `gate` 1048576, `up` 2883584, `s` 4718592 (unused),
@@ -180,4 +181,5 @@ pub static MLP_M256: CudaTape = CudaTape {
         add(524288, 0, 8388608, 256),
     ],
     rotary: None,
+    kv: None,
 };

@@ -282,6 +282,14 @@ pub enum ColourError {
         first: Holder,
         second: Holder,
     },
+    /// A two-output step's second shape reads operand `operand`, and the step has no such
+    /// operand. A validated graph gives every op its registry arity, so only a tape built around
+    /// the validator reaches this.
+    MissingOperand {
+        step: StepPos,
+        op: &'static str,
+        operand: OperandIx,
+    },
 }
 
 impl std::fmt::Display for ColourError {
@@ -314,6 +322,10 @@ impl std::fmt::Display for ColourError {
                 "colour {} is held by {} ({}, live to {}) and {} ({}, live to {}) AT THE SAME \
                  TIME — one kernel would write over a buffer the other still owns",
                 colour.0, first.step, first.op, first.last, second.step, second.op, second.last,
+            ),
+            Self::MissingOperand { step, op, operand } => write!(
+                f,
+                "{step} ({op}) has no operand {operand}, which its second output's shape reads"
             ),
         }
     }
@@ -608,26 +620,45 @@ pub fn colour_tape(
     // A second output is a distinct allocation with no tracked lifetime: never reused. Its shape
     // is the op's (`SubOp::second_output_shape`), recorded for the arena; minted after the scan,
     // it never enters a free pool, so recording it moves no colouring.
-    let operand_shape = |s: &Step<'_>, k: usize| match s.operands.get(k) {
+    // A missing operand is refused, not sized: the first one `second_output_shape` asks for is
+    // recorded, and the step fails after the call.
+    let operand_shape = |s: &Step<'_>, k: usize, missing: &std::cell::Cell<Option<usize>>| match s
+        .operands
+        .get(k)
+    {
         Some(Operand::Step(q)) => steps[*q].shape,
         Some(Operand::Source(t)) => {
             let shape = graph.shape(*t);
             (shape.rows, shape.cols)
         }
-        // A validated graph gives every op its registry arity, so `k` is always an operand.
-        None => (0, 0),
+        None => {
+            missing.set(missing.get().or(Some(k)));
+            (0, 0)
+        }
     };
     let mut by_slot = HashMap::with_capacity(n);
-    for (s, c) in steps.iter().zip(&colour) {
+    for (p, (s, c)) in steps.iter().zip(&colour).enumerate() {
         let Some(c) = *c else { continue };
-        let second = (s.rule.outputs == Outputs::Two).then(|| {
+        let second = if s.rule.outputs == Outputs::Two {
             let second = Colour(next);
             next += 1;
-            if let Some(shape) = s.op.second_output_shape(s.shape, |k| operand_shape(s, k)) {
+            let missing = std::cell::Cell::new(None);
+            let shape =
+                s.op.second_output_shape(s.shape, |k| operand_shape(s, k, &missing));
+            if let Some(k) = missing.get() {
+                return Err(ColourError::MissingOperand {
+                    step: pos(p),
+                    op: name(p),
+                    operand: OperandIx(k as u8),
+                });
+            }
+            if let Some(shape) = shape {
                 colour_shape.insert(second, shape);
             }
-            second
-        });
+            Some(second)
+        } else {
+            None
+        };
         by_slot.insert(s.writes, (c, second));
     }
     Ok(TapeColouring {
@@ -1202,5 +1233,69 @@ mod tests {
         ops.push(gemm(64, vec![Op(7), Ext(1)]));
         let refused = coloured(&src, weights(3), ops, no_folds);
         assert!(matches!(refused, Err(ColourError::AliasUncoloured { .. })));
+    }
+
+    /// A two-output step whose second shape reads an operand the step does not have is refused,
+    /// naming the step and the operand, rather than sized `(0, 0)`. The validator never lets such
+    /// a graph through, so the tape is built by hand around it: a `VisionRope` (whose second
+    /// output is operand 1's shape) given only its operand 0.
+    #[test]
+    fn a_second_output_reading_a_missing_operand_is_refused() {
+        use crate::subtile_tape::{ComputeInputBuild, TapeBuilder};
+        fn two_output_rope(op: &SubOp) -> ColourRule {
+            match op {
+                SubOp::VisionRope => ColourRule::FRESH.reads_across().two_outputs(),
+                _ => rule(op),
+            }
+        }
+        let facts = ColourFacts {
+            rule: two_output_rope,
+            colour_zero: SourceBinding::EmbeddedHidden,
+        };
+        let input = LoweringInput {
+            sources: [(1, 64), (64, 64), (1, 64)]
+                .iter()
+                .map(|&(rows, cols)| SourceShape { rows, cols })
+                .collect(),
+            result: 1,
+            exported: None,
+            ops: vec![
+                gemm(64, vec![Ext(0), Ext(1)]),
+                op(SubOp::VisionRope, 1, vec![Op(0), Ext(2)]),
+            ],
+        };
+        let mut bindings = weights(3);
+        bindings[0] = SourceBinding::EmbeddedHidden;
+        let graph = lower_region(&input, std::num::NonZeroU32::MAX);
+        let external = |r: &crate::subtile_ir::TensorRegion| ComputeInputBuild::External {
+            tensor: r.tensor,
+            region: r.region,
+            per_layer: Vec::new(),
+        };
+        let (mm, rope) = (&graph.nodes[0], &graph.nodes[1]);
+        let mut b = TapeBuilder::new();
+        let slot = b.alloc_slot();
+        let product = b.compute_to(
+            mm.id,
+            slot,
+            &[external(&mm.inputs[0]), external(&mm.inputs[1])],
+        );
+        let slot = b.alloc_slot();
+        let _ = b.compute_to(
+            rope.id,
+            slot,
+            &[ComputeInputBuild::Computed(vec![&product])],
+        );
+        let tape = b.finish();
+        let got = colour_tape(&graph, &tape, &bindings, &FoldFacts::default(), &facts);
+        let Err(e @ ColourError::MissingOperand { op, operand, .. }) = got else {
+            panic!("expected MissingOperand, got {got:?}");
+        };
+        assert_eq!((op, operand), ("VisionRope", OperandIx(1)));
+        let msg = e.to_string();
+        assert!(
+            msg.contains("VisionRope") && msg.contains("operand 1"),
+            "{msg}"
+        );
     }
 }

@@ -8,7 +8,7 @@
 //! analyses nothing. Plain `Copy` data with no pointer, so it builds in a `const` context and on a
 //! host with no CUDA toolchain.
 
-use crate::step::CudaStep;
+use crate::step::{AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, RopeAppendBf16, RopeBf16};
 
 /// Bytes per activation element: CUDA's activations are bf16.
 pub const CUDA_ACT_BYTES: u64 = 2;
@@ -68,6 +68,35 @@ impl RotaryTable {
     }
 }
 
+/// The tape's paged KV cache: which layers' K and V it writes or reads, their geometry, and the
+/// three arena regions the forward fills with the sequence's data.
+///
+/// Every field is fixed at expansion. The pool's block count is not here: it is the worker's
+/// (`runtime::KvPoolConfig`), sized once at construction. What the forward writes into the
+/// regions (the block table, the slot of each token row, the prefix and query lengths) is its
+/// runtime data, uploaded as the rotary table's rows are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvTape {
+    /// Model layer ids whose K/V this tape reads or writes, in pool order (ascending); a step's
+    /// `layer` is an index into this list.
+    pub layers: &'static [u32],
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    /// Token slots per block: [`CUDA_KV_BLOCK_SIZE`].
+    pub block_size: u32,
+    /// Block-table entries per sequence: `crate::step::CUDA_MAX_BLOCKS_PER_SEQ`.
+    pub max_blocks_per_seq: u32,
+    /// `max_blocks_per_seq` u32, the unused entries `u32::MAX`.
+    pub block_table: ArenaSpan,
+    /// `bucket_m` u32, a padding row's `u32::MAX`.
+    pub slot_mapping: ArenaSpan,
+    /// `[prefix_len, q_len]` u32: 8 bytes at an aligned offset of its own.
+    pub sequence: ArenaSpan,
+}
+
+/// Bytes of one u32 entry of a KV region.
+const KV_ENTRY_BYTES: u64 = 4;
+
 /// One bucket's forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CudaTape {
@@ -85,6 +114,29 @@ pub struct CudaTape {
     pub steps: &'static [CudaStep],
     /// The rotary table the forward fills, when a step reads one; `None` for a tape with no rope.
     pub rotary: Option<RotaryTable>,
+    /// The paged KV cache and its regions, when the canonical binds a `PrefixK` source; `None`
+    /// for a tape with no attention.
+    pub kv: Option<KvTape>,
+}
+
+/// Which of the tape's reserved regions a [`TapeError`] names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Region {
+    Rotary,
+    BlockTable,
+    SlotMapping,
+    Sequence,
+}
+
+impl std::fmt::Display for Region {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Rotary => "the rotary table",
+            Self::BlockTable => "the block table",
+            Self::SlotMapping => "the slot mapping",
+            Self::Sequence => "the sequence region",
+        })
+    }
 }
 
 /// Why a tape cannot be played: it would make a kernel read or write outside the arena, or read
@@ -145,6 +197,53 @@ pub enum TapeError {
         ix: u32,
         need: u64,
         declared: u64,
+    },
+    /// A KV region is not at a multiple of [`CUDA_ARENA_ALIGN`], or reaches past the arena.
+    KvRegionOutside {
+        region: Region,
+        span: ArenaSpan,
+        total: u64,
+    },
+    /// A KV region is not the bytes the forward fills: the block table `max_blocks_per_seq · 4`,
+    /// the slot mapping `bucket_m · 4`, the sequence exactly 8.
+    KvRegionShape {
+        region: Region,
+        span: ArenaSpan,
+        want: u64,
+    },
+    /// The tape's block size is not [`CUDA_KV_BLOCK_SIZE`], the one the kernels take.
+    KvBlockSize { block_size: u32 },
+    /// The `step`-th step uses KV layer index `layer`; the tape has `layers` (none when it has no
+    /// [`KvTape`]).
+    KvLayer {
+        step: usize,
+        layer: u32,
+        layers: usize,
+    },
+    /// The `step`-th step's `region` operand is not the tape's region of that name (`None` when
+    /// the tape has none).
+    KvRegionMismatch {
+        step: usize,
+        region: Region,
+        span: ArenaSpan,
+        tape: Option<ArenaSpan>,
+    },
+    /// The `step`-th step's kv heads or head dim are not the tape's KV geometry, so its kernel
+    /// would address the pool with other strides than the worker allocated it with.
+    KvStepGeometry { step: usize },
+    /// The `step`-th step's rope reads `table`, which is not the tape's rotary table (`None`
+    /// when the tape has none).
+    RotaryMismatch {
+        step: usize,
+        table: ArenaOffset,
+        tape: Option<ArenaOffset>,
+    },
+    /// The `step`-th step writes `write` over `region`, which the forward fills before the steps
+    /// run and they only read.
+    WriteOverRegion {
+        step: usize,
+        write: ArenaSpan,
+        region: Region,
     },
 }
 
@@ -240,6 +339,86 @@ impl std::fmt::Display for TapeError {
                 f,
                 "step {step} reads {need} bytes of weight {ix}; the tape declares {declared}"
             ),
+            Self::KvRegionOutside {
+                region,
+                span,
+                total,
+            } => {
+                let (bytes, offset) = at(span);
+                write!(
+                    f,
+                    "{region} ({bytes} bytes at {offset}) is misaligned or reaches past the \
+                     {total}-byte arena"
+                )
+            }
+            Self::KvRegionShape { region, span, want } => write!(
+                f,
+                "{region} is {} bytes; the forward fills {want}",
+                span.bytes
+            ),
+            Self::KvBlockSize { block_size } => write!(
+                f,
+                "the KV block size is {block_size}; the CUDA kernels take {CUDA_KV_BLOCK_SIZE}"
+            ),
+            Self::KvLayer {
+                step,
+                layer,
+                layers,
+            } => write!(
+                f,
+                "step {step} uses KV layer index {layer}, and the tape has {layers} KV layers"
+            ),
+            Self::KvRegionMismatch {
+                step,
+                region,
+                span,
+                tape,
+            } => {
+                let (bytes, offset) = at(span);
+                match tape {
+                    Some(t) => {
+                        let (tb, to) = at(t);
+                        write!(
+                            f,
+                            "step {step} reads {region} as {bytes} bytes at {offset}; the tape's is \
+                             {tb} bytes at {to}"
+                        )
+                    }
+                    None => write!(
+                        f,
+                        "step {step} reads {region} as {bytes} bytes at {offset}; the tape has no \
+                         KV cache"
+                    ),
+                }
+            }
+            Self::KvStepGeometry { step } => write!(
+                f,
+                "step {step}'s kv heads or head dim are not the tape's KV cache geometry"
+            ),
+            Self::RotaryMismatch { step, table, tape } => match tape {
+                Some(t) => write!(
+                    f,
+                    "step {step} reads a rotary table at {}; the tape's is at {}",
+                    table.0, t.0
+                ),
+                None => write!(
+                    f,
+                    "step {step} reads a rotary table at {}; the tape has none",
+                    table.0
+                ),
+            },
+            Self::WriteOverRegion {
+                step,
+                write,
+                region,
+            } => {
+                let (bytes, offset) = at(write);
+                write!(
+                    f,
+                    "step {step} writes {bytes} bytes at {offset} over {region}, which the \
+                     forward fills"
+                )
+            }
         }
     }
 }
@@ -247,14 +426,17 @@ impl std::fmt::Display for TapeError {
 impl std::error::Error for TapeError {}
 
 impl CudaTape {
-    /// Check that playing this tape stays inside its arena and its declared weights.
+    /// Check that playing this tape stays inside its arena, its declared weights and its KV pool.
     ///
-    /// Every colour is aligned and inside `total_bytes`, and so are the input and result spans and
-    /// the rotary table. Every step's spans ([`CudaStep::extents`]) are aligned and inside
-    /// `total_bytes`, each span it writes overlaps none of its reads nor its other write, and each
-    /// weight it reads is one the tape declares, declared at least as large as the step reads. All arithmetic is checked. The worker runs this on every
-    /// tape before it allocates anything; its own weight checks then close the chain from each
-    /// step to the buffer it reads.
+    /// Every colour is aligned and inside `total_bytes`, and so are the input and result spans,
+    /// the rotary table and the KV regions, each region the size the forward fills. Every step's
+    /// spans ([`CudaStep::extents`]) are aligned and inside `total_bytes`, each span it writes
+    /// overlaps none of its reads, nor its other write, nor a region the forward fills, and each
+    /// weight it reads is one the tape declares, declared at least as large as the step reads. A
+    /// rope reads the tape's rotary table, a KV step the tape's regions, at a KV layer the tape
+    /// has, with the tape's KV geometry. All arithmetic is checked. The worker runs this on every
+    /// tape before it allocates anything; its own weight and pool checks then close the chain
+    /// from each step to the buffer it reads.
     pub fn validate(&self) -> Result<(), TapeError> {
         let total = self.arena.total_bytes;
         let (bytes, offsets) = (self.arena.colour_bytes, self.arena.colour_offsets);
@@ -311,6 +493,7 @@ impl CudaTape {
                 });
             }
         }
+        let regions = self.kv_regions(total)?;
         for (step, s) in self.steps.iter().enumerate() {
             let e = s.extents().ok_or(TapeError::StepOverflow { step })?;
             let reads = e.reads.iter().flatten();
@@ -335,6 +518,26 @@ impl CudaTape {
             if e.second_write.is_some_and(|w| overlap(w, e.writes)) {
                 return Err(TapeError::WritesOverlap { step });
             }
+            for &write in [Some(e.writes), e.second_write].iter().flatten() {
+                if let Some(&(region, _)) = regions.iter().find(|(_, r)| overlap(*r, write)) {
+                    return Err(TapeError::WriteOverRegion {
+                        step,
+                        write,
+                        region,
+                    });
+                }
+            }
+            self.check_step_operands(step, s)?;
+            if let Some((layer, _)) = e.kv {
+                let layers = self.kv.map_or(0, |kv| kv.layers.len());
+                if layer as usize >= layers {
+                    return Err(TapeError::KvLayer {
+                        step,
+                        layer,
+                        layers,
+                    });
+                }
+            }
             if let Some(w) = e.weight {
                 let weights = self.weight_bytes.len();
                 let ix = w.ix.0;
@@ -351,6 +554,132 @@ impl CudaTape {
             }
         }
         Ok(())
+    }
+
+    /// The regions the forward fills before the steps run: the rotary table and the KV regions,
+    /// each checked to be aligned, inside the arena, and the size the forward writes. The rotary
+    /// table's own checks ran before this.
+    fn kv_regions(&self, total: u64) -> Result<Vec<(Region, ArenaSpan)>, TapeError> {
+        let mut regions: Vec<(Region, ArenaSpan)> = self
+            .rotary
+            .map(|t| (Region::Rotary, t.span))
+            .into_iter()
+            .collect();
+        let Some(kv) = self.kv else {
+            return Ok(regions);
+        };
+        if kv.block_size != CUDA_KV_BLOCK_SIZE {
+            return Err(TapeError::KvBlockSize {
+                block_size: kv.block_size,
+            });
+        }
+        for (region, span, want) in [
+            (
+                Region::BlockTable,
+                kv.block_table,
+                u64::from(kv.max_blocks_per_seq) * KV_ENTRY_BYTES,
+            ),
+            (
+                Region::SlotMapping,
+                kv.slot_mapping,
+                u64::from(self.bucket_m) * KV_ENTRY_BYTES,
+            ),
+            (Region::Sequence, kv.sequence, 2 * KV_ENTRY_BYTES),
+        ] {
+            if !(span.offset.0.is_multiple_of(CUDA_ARENA_ALIGN) && inside(span, total)) {
+                return Err(TapeError::KvRegionOutside {
+                    region,
+                    span,
+                    total,
+                });
+            }
+            if span.bytes != want {
+                return Err(TapeError::KvRegionShape { region, span, want });
+            }
+            regions.push((region, span));
+        }
+        Ok(regions)
+    }
+
+    /// A rope's or rope-append's table is the tape's rotary table, and a KV step's regions and
+    /// geometry are the tape's.
+    fn check_step_operands(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
+        let rotary = |table: ArenaOffset| {
+            let tape = self.rotary.map(|t| t.span.offset);
+            if tape == Some(table) {
+                Ok(())
+            } else {
+                Err(TapeError::RotaryMismatch { step, table, tape })
+            }
+        };
+        let region = |region: Region, span: ArenaSpan, tape: Option<ArenaSpan>| {
+            if tape == Some(span) {
+                Ok(())
+            } else {
+                Err(TapeError::KvRegionMismatch {
+                    step,
+                    region,
+                    span,
+                    tape,
+                })
+            }
+        };
+        match *s {
+            CudaStep::Rope(RopeBf16 { table, .. }) => rotary(table),
+            CudaStep::RopeAppend(RopeAppendBf16 {
+                table,
+                slot_mapping,
+                rows,
+                cols,
+                head_dim,
+                ..
+            }) => {
+                rotary(table)?;
+                let span = ArenaSpan {
+                    offset: slot_mapping,
+                    bytes: u64::from(rows) * KV_ENTRY_BYTES,
+                };
+                region(Region::SlotMapping, span, self.kv.map(|k| k.slot_mapping))?;
+                match self.kv {
+                    Some(kv)
+                        if head_dim == kv.head_dim
+                            && Some(cols) == kv.kv_heads.checked_mul(kv.head_dim) =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(TapeError::KvStepGeometry { step }),
+                }
+            }
+            CudaStep::AttnPrefill(AttnPrefillBf16 {
+                block_table,
+                sequence,
+                kv_heads,
+                head_dim,
+                ..
+            }) => {
+                let kv = self.kv;
+                let table = ArenaSpan {
+                    offset: block_table,
+                    bytes: kv.map_or(0, |k| u64::from(k.max_blocks_per_seq)) * KV_ENTRY_BYTES,
+                };
+                region(Region::BlockTable, table, kv.map(|k| k.block_table))?;
+                let seq = ArenaSpan {
+                    offset: sequence,
+                    bytes: 2 * KV_ENTRY_BYTES,
+                };
+                region(Region::Sequence, seq, kv.map(|k| k.sequence))?;
+                match kv {
+                    Some(kv) if (kv_heads, head_dim) == (kv.kv_heads, kv.head_dim) => Ok(()),
+                    _ => Err(TapeError::KvStepGeometry { step }),
+                }
+            }
+            CudaStep::Gemm(_)
+            | CudaStep::RmsNorm(_)
+            | CudaStep::Add(_)
+            | CudaStep::SiluMul(_)
+            | CudaStep::GateSplit(_)
+            | CudaStep::GateApply(_) => Ok(()),
+        }
     }
 }
 
@@ -370,7 +699,10 @@ mod tests {
     use scratchy_subtile::subtile_ir::GainConvention;
 
     use super::*;
-    use crate::step::{AddBf16, GateSplitBf16, GemmBf16, RmsNormBf16, RopeBf16};
+    use crate::step::{
+        AddBf16, AttnPrefillBf16, CUDA_MAX_BLOCKS_PER_SEQ, GateSplitBf16, GemmBf16, KvUse,
+        RmsNormBf16, RopeAppendBf16, RopeBf16,
+    };
 
     const fn span(offset: u64, bytes: u64) -> ArenaSpan {
         ArenaSpan {
@@ -415,6 +747,7 @@ mod tests {
         weight_bytes: &[0, 1048576, 2048],
         steps: GOOD_STEPS,
         rotary: None,
+        kv: None,
     };
 
     /// `GOOD` with its steps replaced by `step` alone.
@@ -620,9 +953,13 @@ mod tests {
         );
     }
 
-    /// `GOOD` with a rotary table of `bytes` at `offset`.
+    /// `GOOD` with its arena grown by [`TABLE`] bytes and a rotary table of `bytes` at `offset`.
     fn with_rotary(offset: u64, bytes: u64) -> CudaTape {
         CudaTape {
+            arena: ArenaLayout {
+                total_bytes: ROTARY_TOTAL,
+                ..GOOD.arena
+            },
             rotary: Some(RotaryTable {
                 span: span(offset, bytes),
                 rot_dim: 64,
@@ -634,8 +971,11 @@ mod tests {
 
     /// `GOOD`'s 256 rows of 64 bf16: the table's bytes.
     const TABLE: u64 = 256 * 64 * 2;
-    /// The arena's last `TABLE` bytes.
-    const TABLE_AT: u64 = 1310720 - TABLE;
+    /// After `GOOD`'s colours: a table placed over a colour would be written by the step that
+    /// writes that colour.
+    const TABLE_AT: u64 = 1310720;
+    /// [`with_rotary`]'s arena: `GOOD`'s and the table.
+    const ROTARY_TOTAL: u64 = TABLE_AT + TABLE;
 
     #[test]
     fn a_rotary_table_inside_the_arena_validates() {
@@ -655,7 +995,7 @@ mod tests {
                 with_rotary(offset, bytes).validate(),
                 Err(TapeError::RotaryOutside {
                     span: span(offset, bytes),
-                    total: 1310720
+                    total: ROTARY_TOTAL
                 }),
                 "{offset}, {bytes}"
             );
@@ -700,9 +1040,14 @@ mod tests {
         })
     }
 
+    /// A rope reading the tape's table validates; one reaching past the arena does not.
     #[test]
     fn a_rope_reads_its_table() {
-        assert_eq!(with_step(rope(1302528)).validate(), Ok(()));
+        let t = CudaTape {
+            steps: Box::leak(Box::new([rope(TABLE_AT)])),
+            ..with_rotary(TABLE_AT, TABLE)
+        };
+        assert_eq!(t.validate(), Ok(()));
         assert_eq!(
             with_step(rope(1306624)).validate(),
             Err(TapeError::StepOutside {
@@ -711,6 +1056,309 @@ mod tests {
                 total: 1310720
             })
         );
+    }
+
+    /// A rope whose table is not the tape's rotary table, or on a tape with none: the forward
+    /// fills only the tape's.
+    #[test]
+    fn rotary_mismatch() {
+        let t = CudaTape {
+            steps: Box::leak(Box::new([rope(TABLE_AT - 256)])),
+            ..with_rotary(TABLE_AT, TABLE)
+        };
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::RotaryMismatch {
+                step: 0,
+                table: ArenaOffset(TABLE_AT - 256),
+                tape: Some(ArenaOffset(TABLE_AT)),
+            })
+        );
+        assert_eq!(
+            with_step(rope(1302528)).validate(),
+            Err(TapeError::RotaryMismatch {
+                step: 0,
+                table: ArenaOffset(1302528),
+                tape: None,
+            })
+        );
+    }
+
+    // ── The KV cache's regions ─────────────────────────────────────
+
+    /// [`KV_GOOD`]'s regions, after `GOOD`'s colours: the rotary table (`256 · 64` bf16), the
+    /// block table (`128` u32), the slot mapping (`256` u32), the sequence (`2` u32, in a 256-byte
+    /// slot).
+    const KV_ROTARY: u64 = 1310720;
+    const KV_TABLE: u64 = KV_ROTARY + TABLE;
+    const KV_SLOTS: u64 = KV_TABLE + 512;
+    const KV_SEQ: u64 = KV_SLOTS + 1024;
+    const KV_TOTAL: u64 = KV_SEQ + 256;
+
+    /// `k [256, 512]` at 262144 and `v` at 524288 (colour 1's halves), rotated K into colour 2,
+    /// written to KV layer `layer`.
+    fn rope_append(layer: u32, slot_mapping: u64) -> CudaStep {
+        CudaStep::RopeAppend(RopeAppendBf16 {
+            k: ArenaOffset(262144),
+            v: ArenaOffset(524288),
+            table: ArenaOffset(KV_ROTARY),
+            slot_mapping: ArenaOffset(slot_mapping),
+            k_out: ArenaOffset(786432),
+            layer,
+            rows: 256,
+            cols: 512,
+            head_dim: 256,
+            rot_dim: 64,
+        })
+    }
+
+    /// `q [256, 2 · 256]` at 262144 over KV layer 0, into colour 2.
+    fn attn(block_table: u64, sequence: u64, kv_heads: u32) -> CudaStep {
+        CudaStep::AttnPrefill(AttnPrefillBf16 {
+            q: ArenaOffset(262144),
+            block_table: ArenaOffset(block_table),
+            sequence: ArenaOffset(sequence),
+            out: ArenaOffset(786432),
+            layer: 0,
+            rows: 256,
+            q_heads: 2,
+            kv_heads,
+            head_dim: 256,
+            scale_bits: 0.0625f32.to_bits(),
+        })
+    }
+
+    const KV: KvTape = KvTape {
+        layers: &[3],
+        kv_heads: 2,
+        head_dim: 256,
+        block_size: CUDA_KV_BLOCK_SIZE,
+        max_blocks_per_seq: CUDA_MAX_BLOCKS_PER_SEQ,
+        block_table: span(KV_TABLE, 512),
+        slot_mapping: span(KV_SLOTS, 1024),
+        sequence: span(KV_SEQ, 8),
+    };
+
+    /// `GOOD`'s colours with the rotary table and the three KV regions after them, and `steps`.
+    fn kv_tape(kv: KvTape, steps: &[CudaStep]) -> CudaTape {
+        CudaTape {
+            arena: ArenaLayout {
+                total_bytes: KV_TOTAL,
+                ..GOOD.arena
+            },
+            steps: Box::leak(steps.to_vec().into_boxed_slice()),
+            rotary: Some(RotaryTable {
+                span: span(KV_ROTARY, TABLE),
+                rot_dim: 64,
+                theta_bits: 1e7f64.to_bits(),
+            }),
+            kv: Some(kv),
+            ..GOOD
+        }
+    }
+
+    #[test]
+    fn a_kv_tape_validates() {
+        let steps = [rope_append(0, KV_SLOTS), attn(KV_TABLE, KV_SEQ, 2)];
+        assert_eq!(kv_tape(KV, &steps).validate(), Ok(()));
+        let [Some(e0), Some(e1)] = steps.map(|s| s.extents()) else {
+            panic!("both steps' extents fit u64");
+        };
+        assert_eq!(e0.kv, Some((0, KvUse::Write)));
+        assert_eq!(e1.kv, Some((0, KvUse::Read)));
+        assert_eq!(e0.reads[3], Some(span(KV_SLOTS, 1024)), "the slot mapping");
+        assert_eq!(e1.reads[1], Some(span(KV_TABLE, 512)), "the block table");
+        assert_eq!(e1.reads[2], Some(span(KV_SEQ, 8)), "the sequence");
+    }
+
+    #[test]
+    fn kv_region_outside() {
+        for (kv, region, at) in [
+            (
+                KvTape {
+                    block_table: span(KV_TABLE + 128, 512),
+                    ..KV
+                },
+                Region::BlockTable,
+                span(KV_TABLE + 128, 512),
+            ),
+            (
+                KvTape {
+                    slot_mapping: span(KV_TOTAL, 1024),
+                    ..KV
+                },
+                Region::SlotMapping,
+                span(KV_TOTAL, 1024),
+            ),
+            (
+                KvTape {
+                    sequence: span(u64::MAX - 255, 8),
+                    ..KV
+                },
+                Region::Sequence,
+                span(u64::MAX - 255, 8),
+            ),
+        ] {
+            assert_eq!(
+                kv_tape(kv, &[]).validate(),
+                Err(TapeError::KvRegionOutside {
+                    region,
+                    span: at,
+                    total: KV_TOTAL
+                }),
+                "{region}"
+            );
+        }
+    }
+
+    #[test]
+    fn kv_region_shape() {
+        for (kv, region, at, want) in [
+            (
+                KvTape {
+                    block_table: span(KV_TABLE, 256),
+                    ..KV
+                },
+                Region::BlockTable,
+                span(KV_TABLE, 256),
+                512,
+            ),
+            (
+                KvTape {
+                    slot_mapping: span(KV_SLOTS, 512),
+                    ..KV
+                },
+                Region::SlotMapping,
+                span(KV_SLOTS, 512),
+                1024,
+            ),
+            (
+                KvTape {
+                    sequence: span(KV_SEQ, 4),
+                    ..KV
+                },
+                Region::Sequence,
+                span(KV_SEQ, 4),
+                8,
+            ),
+        ] {
+            assert_eq!(
+                kv_tape(kv, &[]).validate(),
+                Err(TapeError::KvRegionShape {
+                    region,
+                    span: at,
+                    want
+                }),
+                "{region}"
+            );
+        }
+    }
+
+    #[test]
+    fn kv_block_size() {
+        let kv = KvTape {
+            block_size: 16,
+            ..KV
+        };
+        assert_eq!(
+            kv_tape(kv, &[]).validate(),
+            Err(TapeError::KvBlockSize { block_size: 16 })
+        );
+    }
+
+    #[test]
+    fn kv_layer() {
+        assert_eq!(
+            kv_tape(KV, &[rope_append(1, KV_SLOTS)]).validate(),
+            Err(TapeError::KvLayer {
+                step: 0,
+                layer: 1,
+                layers: 1
+            })
+        );
+    }
+
+    /// A rope-append's slot mapping, and an attention's block table and sequence, that are not
+    /// the tape's; and a KV step on a tape with no KV cache.
+    #[test]
+    fn kv_region_mismatch() {
+        let elsewhere = KV_TABLE;
+        assert_eq!(
+            kv_tape(KV, &[rope_append(0, elsewhere)]).validate(),
+            Err(TapeError::KvRegionMismatch {
+                step: 0,
+                region: Region::SlotMapping,
+                span: span(elsewhere, 1024),
+                tape: Some(KV.slot_mapping),
+            })
+        );
+        assert_eq!(
+            kv_tape(KV, &[attn(KV_SLOTS, KV_SEQ, 2)]).validate(),
+            Err(TapeError::KvRegionMismatch {
+                step: 0,
+                region: Region::BlockTable,
+                span: span(KV_SLOTS, 512),
+                tape: Some(KV.block_table),
+            })
+        );
+        assert_eq!(
+            kv_tape(KV, &[attn(KV_TABLE, KV_SLOTS, 2)]).validate(),
+            Err(TapeError::KvRegionMismatch {
+                step: 0,
+                region: Region::Sequence,
+                span: span(KV_SLOTS, 8),
+                tape: Some(KV.sequence),
+            })
+        );
+        let t = CudaTape {
+            kv: None,
+            ..kv_tape(KV, &[attn(KV_TABLE, KV_SEQ, 2)])
+        };
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::KvRegionMismatch {
+                step: 0,
+                region: Region::BlockTable,
+                span: span(KV_TABLE, 0),
+                tape: None,
+            })
+        );
+    }
+
+    /// An attention whose kv heads are not the tape's would read the pool with other strides.
+    #[test]
+    fn kv_step_geometry() {
+        assert_eq!(
+            kv_tape(KV, &[attn(KV_TABLE, KV_SEQ, 1)]).validate(),
+            Err(TapeError::KvStepGeometry { step: 0 })
+        );
+        let kv = KvTape { kv_heads: 4, ..KV };
+        assert_eq!(
+            kv_tape(kv, &[rope_append(0, KV_SLOTS)]).validate(),
+            Err(TapeError::KvStepGeometry { step: 0 })
+        );
+    }
+
+    /// A step writing over the rotary table or a KV region, which the forward fills before the
+    /// steps run.
+    #[test]
+    fn write_over_region() {
+        for (c, region) in [
+            (KV_ROTARY, Region::Rotary),
+            (KV_TABLE, Region::BlockTable),
+            (KV_SLOTS, Region::SlotMapping),
+        ] {
+            let t = kv_tape(KV, &[gemm(0, 1, c, (1, 256, 512))]);
+            assert_eq!(
+                t.validate(),
+                Err(TapeError::WriteOverRegion {
+                    step: 0,
+                    write: span(c, 512),
+                    region
+                }),
+                "{region}"
+            );
+        }
     }
 
     /// A split of `qg [64, 2048]` at 0 into `q [64, 1024]` at 262144 and the gate at `gate`.

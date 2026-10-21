@@ -13,8 +13,9 @@
 //! here lays steps out along a loop.
 //!
 //! The result is one bucket's tape in parts ([`CudaCanonical`]): the arena's layout, sized here
-//! from the colourer's per-colour shapes, the input and result spans, each weight's bytes, and the
-//! steps. They are the fields of a `static` `scratchy_target_cuda::tape::CudaTape`.
+//! from the colourer's per-colour shapes, the input and result spans, each weight's bytes, the
+//! steps, and the rotary table's and the KV cache's regions after the colours. They are the
+//! fields of a `static` `scratchy_target_cuda::tape::CudaTape`.
 //!
 //! [`steps_from_tape`]: crate::steps_from_tape
 
@@ -30,7 +31,7 @@ use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, StepRole, TapeFo
 use scratchy_target_cuda::op_abi::{
     CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_FUSIONS, CUDA_SAMPLE_ROWS, CudaFusion,
 };
-use scratchy_target_cuda::step::CudaStep;
+use scratchy_target_cuda::step::{CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep};
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, RotaryTable,
 };
@@ -94,6 +95,24 @@ pub struct CudaCanonical {
     /// The rotary table, after every colour: `Some` exactly when the canonical binds a
     /// `Cos { local: false }` source.
     pub rotary: Option<RotaryTable>,
+    /// The paged KV cache and its regions, after the rotary table: `Some` exactly when the
+    /// canonical binds a `PrefixK` source. The fields of a `scratchy_target_cuda::tape::KvTape`.
+    pub kv: Option<CanonicalKv>,
+}
+
+/// One canonical's paged KV cache: the fields of a `scratchy_target_cuda::tape::KvTape`, its
+/// layer list owned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalKv {
+    /// The model layer ids of the `PrefixK` sources, ascending: a step's `layer` indexes it.
+    pub layers: Vec<u32>,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub block_size: u32,
+    pub max_blocks_per_seq: u32,
+    pub block_table: ArenaSpan,
+    pub slot_mapping: ArenaSpan,
+    pub sequence: ArenaSpan,
 }
 
 /// Why a canonical could not be lowered.
@@ -178,8 +197,12 @@ pub enum CanonicalRefusal {
     FusionShape {
         step: usize,
     },
-    /// The `step`-th `Compute` names a producer slot (a fold's activation, a gate's split) that no
-    /// `Compute` of the tape writes.
+    /// The `step`-th `Compute` names a producer slot (a fold's activation, a gate's split, an
+    /// attention's `RopeAppend`) that no `Compute` of the tape writes.
+    ///
+    /// No canonical reaches this through [`lower_canonical`]: it hands the lowering every
+    /// `Compute` of the tape, and the tape writes every slot before a step reads it. It guards a
+    /// direct caller of `steps_from_tape` that passes fewer, and is tested that way.
     ProducerMissing {
         step: usize,
         op: &'static str,
@@ -190,23 +213,84 @@ pub enum CanonicalRefusal {
         step: usize,
         why: ViewRefusal,
     },
-    /// Operand `operand` of the `step`-th `Compute`, a `RopeRotate`, is not the rotary `cos`
-    /// (operand 1) or `sin` (operand 2) source of the global table: it is this binding, or a
-    /// computed value (`None`).
+    /// Operand `operand` of the `step`-th `Compute`, a `RopeRotate` or `RopeAppend`, is not the
+    /// rotary `cos` (operand 1) or `sin` (operand 2) source of the global table: it is this
+    /// binding, or a computed value (`None`).
     RotaryOperand {
         step: usize,
+        op: &'static str,
         operand: u8,
         binding: Option<SourceBinding>,
     },
-    /// The `step`-th `Compute` is a `RopeRotate` of a shape the bf16 rope does not take.
+    /// The `step`-th `Compute` is a `RopeRotate` or `RopeAppend` of a shape the bf16 rope does
+    /// not take (a `RopeAppend`'s is its K's).
     RopeShape {
         step: usize,
+        op: &'static str,
         rows: u32,
         cols: u32,
         head_dim: u32,
         rot_dim: u32,
         rule: RopeShapeRule,
     },
+    /// The `step`-th `Compute` is a `RopeAppend` in the interleaved pairing; the bf16 rope pairs
+    /// NeoX lanes only.
+    RopePairing {
+        step: usize,
+    },
+    /// The `step`-th `Compute` is a `RopeAppend` or attention of a sliding-window layer; CUDA's
+    /// kernels mask causally only.
+    SlidingWindow {
+        step: usize,
+        op: &'static str,
+    },
+    /// The `step`-th `Compute` is a `RopeAppend` or attention whose head dim is not the model's,
+    /// which is the KV cache's.
+    KvHeadDim {
+        step: usize,
+        op: &'static str,
+        head_dim: u32,
+        want: u32,
+    },
+    /// Operand `operand` of the `step`-th `Compute` is not `want`, layer `layer`'s `PrefixK` or
+    /// `PrefixV` source: it is this binding, or a computed value (`None`).
+    KvOperand {
+        step: usize,
+        op: &'static str,
+        operand: u8,
+        layer: u64,
+        want: &'static str,
+        binding: Option<SourceBinding>,
+    },
+    /// The `step`-th `Compute` is an attention of a shape the bf16 prefill kernel does not take.
+    AttnShape {
+        step: usize,
+        rows: u32,
+        head_dim: u32,
+        rule: AttnShapeRule,
+    },
+    /// The `step`-th `Compute` is an attention with sinks (a 6th input); CUDA has no sink
+    /// kernel.
+    AttnSinks {
+        step: usize,
+    },
+    /// The `step`-th `Compute` is an attention whose new K (operand 3) or V (operand 4) is not
+    /// what its layer's `RopeAppend` wrote and read.
+    AttnProducer {
+        step: usize,
+        operand: u8,
+        why: ProducerRefusal,
+    },
+    /// The `step`-th `Compute` reads or writes the KV cache with a kv-head count or width that is
+    /// not the cache's (`kv_heads` heads of the model's head dim).
+    KvGeometry {
+        step: usize,
+        op: &'static str,
+        kv_heads: u32,
+        cols: u32,
+    },
+    /// The canonical's `PrefixK` / `PrefixV` sources cannot be one KV pool.
+    KvCache(KvCacheRefusal),
     /// The `step`-th `Compute` is a `GateSplit` of a shape the bf16 split does not take.
     GateShape {
         step: usize,
@@ -273,6 +357,46 @@ pub enum RopeShapeRule {
     RowsNotTokens { tokens: u32 },
 }
 
+/// Which rule an attention's shape breaks: the prefill kernel's, stated at expansion time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttnShapeRule {
+    /// One row: decode attention, which has no kernel yet.
+    Decode,
+    /// `rows` is zero or not a multiple of `multiple`, the query rows of one CTA.
+    RowsOffTile { multiple: u32 },
+    /// `head_dim` is not the one the kernel is instantiated for.
+    HeadDim { want: u32 },
+}
+
+/// Why an attention's new K or V is not its layer's `RopeAppend`'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProducerRefusal {
+    /// Operand 3 is not a `RopeAppend`'s output.
+    NotARopeAppend,
+    /// Operand 3 is the `RopeAppend` of layer `layer`, not the attention's.
+    OtherLayer { layer: u32 },
+    /// Operand 4 is not the slot the `RopeAppend` read as V.
+    NotItsV,
+}
+
+/// Why the `PrefixK` / `PrefixV` sources cannot be one KV pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvCacheRefusal {
+    /// Layer `layer` binds a `PrefixK` and no `PrefixV`, or the reverse.
+    Unpaired { layer: u64 },
+    /// Layer `layer`'s id does not fit a `u32`.
+    LayerTooLarge { layer: u64 },
+    /// Layer `layer`'s cache is `cols` wide, not a non-zero whole number of the model's
+    /// `head_dim`-wide heads.
+    OffHead {
+        layer: u64,
+        cols: u32,
+        head_dim: u32,
+    },
+    /// Layer `layer`'s cache is `cols` wide; the pool's (its first layer's) is `want`.
+    Width { layer: u64, cols: u32, want: u32 },
+}
+
 /// Which rule a gate split's shape breaks: the launcher's, stated at expansion time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GateShapeRule {
@@ -306,6 +430,11 @@ pub enum GemmShapeRule {
 pub enum OperandRefusal {
     /// The step has no such operand.
     Missing,
+    /// The operand must be a computed slot, and is source `source` (`binding`).
+    NotASlot {
+        source: usize,
+        binding: SourceBinding,
+    },
     /// The operand reads part of its tensor; a kernel binds whole buffers.
     PartialRead,
     /// The operand is a re-rolled per-layer source; CUDA does not re-roll.
@@ -432,26 +561,29 @@ impl std::fmt::Display for CanonicalRefusal {
             }
             Self::RotaryOperand {
                 step,
+                op,
                 operand,
                 binding: Some(binding),
             } => write!(
                 f,
-                "step {step} (RopeRotate) operand {operand} reads a {binding:?} source; the cuda \
-                 rope reads the global rotary table, operand 1 Cos {{ local: false }} and operand 2 \
+                "step {step} ({op}) operand {operand} reads a {binding:?} source; the cuda rope \
+                 reads the global rotary table, operand 1 Cos {{ local: false }} and operand 2 \
                  Sin {{ local: false }}"
             ),
             Self::RotaryOperand {
                 step,
+                op,
                 operand,
                 binding: None,
             } => write!(
                 f,
-                "step {step} (RopeRotate) operand {operand} is a computed value; the cuda rope \
-                 reads the global rotary table, operand 1 Cos {{ local: false }} and operand 2 \
+                "step {step} ({op}) operand {operand} is a computed value; the cuda rope reads \
+                 the global rotary table, operand 1 Cos {{ local: false }} and operand 2 \
                  Sin {{ local: false }}"
             ),
             Self::RopeShape {
                 step,
+                op,
                 rows,
                 cols,
                 head_dim,
@@ -459,9 +591,77 @@ impl std::fmt::Display for CanonicalRefusal {
                 rule,
             } => write!(
                 f,
-                "step {step} (RopeRotate) is rows={rows} cols={cols} head_dim={head_dim} \
+                "step {step} ({op}) is rows={rows} cols={cols} head_dim={head_dim} \
                  rot_dim={rot_dim}, which the bf16 rope refuses: {rule}"
             ),
+            Self::RopePairing { step } => write!(
+                f,
+                "step {step} (RopeAppend) pairs its lanes interleaved; the bf16 rope pairs NeoX \
+                 lanes only"
+            ),
+            Self::SlidingWindow { step, op } => write!(
+                f,
+                "step {step} ({op}) is a sliding-window layer's; the cuda kernels mask causally \
+                 only"
+            ),
+            Self::KvHeadDim {
+                step,
+                op,
+                head_dim,
+                want,
+            } => write!(
+                f,
+                "step {step} ({op}) has head_dim = {head_dim}; the KV cache's is the model's \
+                 {want}"
+            ),
+            Self::KvOperand {
+                step,
+                op,
+                operand,
+                layer,
+                want,
+                binding,
+            } => match binding {
+                Some(b) => write!(
+                    f,
+                    "step {step} ({op}) operand {operand} reads a {b:?} source; it must be \
+                         layer {layer}'s {want}"
+                ),
+                None => write!(
+                    f,
+                    "step {step} ({op}) operand {operand} is a computed value; it must be \
+                         layer {layer}'s {want}"
+                ),
+            },
+            Self::AttnShape {
+                step,
+                rows,
+                head_dim,
+                rule,
+            } => write!(
+                f,
+                "step {step} (AttnDecode) is rows={rows} head_dim={head_dim}, which the bf16 \
+                 prefill attention refuses: {rule}"
+            ),
+            Self::AttnSinks { step } => write!(
+                f,
+                "step {step} (AttnDecode) has a 6th input, attention sinks; the cuda attention \
+                 has none"
+            ),
+            Self::AttnProducer { step, operand, why } => {
+                write!(f, "step {step} (AttnDecode) operand {operand}: {why}")
+            }
+            Self::KvGeometry {
+                step,
+                op,
+                kv_heads,
+                cols,
+            } => write!(
+                f,
+                "step {step} ({op}) reads or writes {cols} KV columns over {kv_heads} kv heads; \
+                 the KV cache's geometry differs"
+            ),
+            Self::KvCache(e) => write!(f, "the KV cache cannot be laid out: {e}"),
             Self::GateShape {
                 step,
                 rows,
@@ -552,6 +752,65 @@ impl std::fmt::Display for RopeShapeRule {
     }
 }
 
+impl std::fmt::Display for AttnShapeRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decode => write!(
+                f,
+                "rows = 1 is decode attention, and CUDA has no decode attention kernel yet"
+            ),
+            Self::RowsOffTile { multiple } => write!(
+                f,
+                "rows must be a non-zero multiple of {multiple}, the query rows of one CTA"
+            ),
+            Self::HeadDim { want } => write!(
+                f,
+                "head_dim must be {want}, the one the kernel is instantiated for"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for ProducerRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotARopeAppend => write!(f, "the new K is not a RopeAppend's output"),
+            Self::OtherLayer { layer } => write!(
+                f,
+                "the new K is layer {layer}'s RopeAppend, not the attention's layer's"
+            ),
+            Self::NotItsV => write!(f, "the new V is not the value its RopeAppend wrote"),
+        }
+    }
+}
+
+impl std::fmt::Display for KvCacheRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unpaired { layer } => write!(
+                f,
+                "layer {layer} binds only one of PrefixK and PrefixV; a layer's cache is both"
+            ),
+            Self::LayerTooLarge { layer } => {
+                write!(f, "layer {layer} does not fit the tape's u32 layer ids")
+            }
+            Self::OffHead {
+                layer,
+                cols,
+                head_dim,
+            } => write!(
+                f,
+                "layer {layer}'s cache is {cols} columns wide, not a non-zero whole number of \
+                 head_dim = {head_dim} heads"
+            ),
+            Self::Width { layer, cols, want } => write!(
+                f,
+                "layer {layer}'s cache is {cols} columns wide; the pool's is {want}"
+            ),
+        }
+    }
+}
+
 impl std::fmt::Display for GateShapeRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -595,6 +854,10 @@ impl std::fmt::Display for OperandRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Missing => write!(f, "the step has no such operand"),
+            Self::NotASlot { source, binding } => write!(
+                f,
+                "it reads source {source} ({binding:?}); it must be a computed slot"
+            ),
             Self::PartialRead => {
                 write!(f, "it reads part of its tensor; a kernel binds a whole one")
             }
@@ -701,6 +964,7 @@ pub fn lower_canonical(
 ) -> Result<CudaCanonical, CanonicalRefusal> {
     let plan = plan_canonical(l, facts, at)?;
     let arena = arena_layout(&plan);
+    let kv = kv_cache(&plan);
     let cx = StepCx {
         graph: &plan.graph,
         bindings: &plan.lowered.bindings,
@@ -712,6 +976,11 @@ pub fn lower_canonical(
             Err(e) => Err(*e),
         },
         rotary: arena.as_ref().ok().and_then(|a| a.rotary).map(|t| t.offset),
+        kv: match &kv {
+            Ok(k) => Ok(k.as_ref()),
+            Err(e) => Err(*e),
+        },
+        kv_regions: arena.as_ref().ok().and_then(|a| a.kv),
     };
     let computes: Vec<TapeStep<'_>> = (plan.tape.instrs().iter())
         .filter_map(|i| match i {
@@ -739,6 +1008,7 @@ pub fn lower_canonical(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let arena = arena.map_err(CanonicalRefusal::Arena)?;
+    let kv = kv.map_err(CanonicalRefusal::KvCache)?;
     let span = |c: Colour| ArenaSpan {
         offset: ArenaOffset(arena.offsets[c.index() as usize]),
         bytes: arena.bytes[c.index() as usize],
@@ -768,18 +1038,112 @@ pub fn lower_canonical(
             rot_dim: plan.facts.rot_dim,
             theta_bits: plan.facts.rope_theta.to_bits(),
         }),
+        // The arena placed the regions exactly when a `PrefixK` is bound, and `kv_cache` found
+        // the pool exactly then.
+        kv: kv.zip(arena.kv).map(|(k, r)| CanonicalKv {
+            layers: k.layers,
+            kv_heads: k.kv_heads,
+            head_dim: k.head_dim,
+            block_size: CUDA_KV_BLOCK_SIZE,
+            max_blocks_per_seq: CUDA_MAX_BLOCKS_PER_SEQ,
+            block_table: r.block_table,
+            slot_mapping: r.slot_mapping,
+            sequence: r.sequence,
+        }),
     })
 }
 
-/// The arena of one canonical: each colour's bytes and offset, the rotary table's span, and
-/// their total.
+/// The KV pool of one canonical: its layers, ascending, and its geometry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvPool {
+    /// The model layer ids of the `PrefixK` sources: a step's `layer` is an index into this.
+    pub layers: Vec<u32>,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+}
+
+impl KvPool {
+    /// The pool index of model layer `layer`.
+    pub fn index_of(&self, layer: u64) -> Option<u32> {
+        let layer = u32::try_from(layer).ok()?;
+        (self.layers.iter().position(|&l| l == layer)).map(|i| i as u32)
+    }
+}
+
+/// The KV pool the canonical's `PrefixK` / `PrefixV` sources describe, or `None` when it binds
+/// none. Every layer binds both; every source is `kv_heads · head_dim` columns, the model's head
+/// dim and one width for the whole pool.
+fn kv_cache(plan: &CudaPlan) -> Result<Option<KvPool>, KvCacheRefusal> {
+    let head_dim = plan.facts.head_dim;
+    let mut k_layers = BTreeMap::new();
+    let mut v_layers = BTreeMap::new();
+    for (t, binding) in plan.lowered.bindings.iter().enumerate() {
+        let cols = plan.graph.tensors[t].cols;
+        match *binding {
+            SourceBinding::PrefixK { layer } => {
+                k_layers.insert(layer, cols);
+            }
+            SourceBinding::PrefixV { layer } => {
+                v_layers.insert(layer, cols);
+            }
+            _ => {}
+        }
+    }
+    if let Some(&layer) = (k_layers.keys())
+        .find(|l| !v_layers.contains_key(l))
+        .or_else(|| v_layers.keys().find(|l| !k_layers.contains_key(l)))
+    {
+        return Err(KvCacheRefusal::Unpaired { layer });
+    }
+    let Some((&first, &want)) = k_layers.iter().next() else {
+        return Ok(None);
+    };
+    if head_dim == 0 || want == 0 || !want.is_multiple_of(head_dim) {
+        return Err(KvCacheRefusal::OffHead {
+            layer: first,
+            cols: want,
+            head_dim,
+        });
+    }
+    for (&layer, &cols) in k_layers.iter().chain(&v_layers) {
+        if cols != want {
+            return Err(KvCacheRefusal::Width { layer, cols, want });
+        }
+    }
+    let layers = (k_layers.keys())
+        .map(|&layer| u32::try_from(layer).map_err(|_| KvCacheRefusal::LayerTooLarge { layer }))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(KvPool {
+        layers,
+        kv_heads: want / head_dim,
+        head_dim,
+    }))
+}
+
+/// The arena of one canonical: each colour's bytes and offset, the rotary table's and the KV
+/// regions' spans, and their total.
 struct Arena {
     bucket_m: u32,
     bytes: Vec<u64>,
     offsets: Vec<u64>,
     rotary: Option<ArenaSpan>,
+    kv: Option<KvRegions>,
     total: u64,
 }
+
+/// Where the forward's KV sequence data lives in the arena, after the rotary table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvRegions {
+    /// `CUDA_MAX_BLOCKS_PER_SEQ` u32.
+    pub block_table: ArenaSpan,
+    /// `bucket_m` u32.
+    pub slot_mapping: ArenaSpan,
+    /// `[prefix_len, q_len]` u32.
+    pub sequence: ArenaSpan,
+}
+
+/// Bytes of one u32 entry of a KV region.
+const KV_ENTRY_BYTES: u64 = 4;
 
 /// The shape of the one source bound to the embedded hidden: colour 0, the bucket's tokens.
 fn embedded_hidden(plan: &CudaPlan) -> Result<TensorShape, ArenaRefusal> {
@@ -796,7 +1160,9 @@ fn embedded_hidden(plan: &CudaPlan) -> Result<TensorShape, ArenaRefusal> {
 /// Size every colour from the shape its values share, and place the colours one after another in
 /// colour order, each at a multiple of [`CUDA_ARENA_ALIGN`]. Colour 0 is the embedded hidden's
 /// buffer, so it is sized from the source bound to it. When the canonical binds the global rotary
-/// `cos`, the rotary table (`[bucket_m, rot_dim]` bf16) follows the colours, aligned the same way.
+/// `cos`, the rotary table (`[bucket_m, rot_dim]` bf16) follows the colours, aligned the same way;
+/// when it binds a `PrefixK`, the block table (`CUDA_MAX_BLOCKS_PER_SEQ` u32), the slot mapping
+/// (`bucket_m` u32) and the sequence (2 u32) follow, in that order, each aligned the same way.
 fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
     let hidden = embedded_hidden(plan)?;
     // Every colour the tape's steps were given, by index: a slot's colour, and a two-output
@@ -845,11 +1211,30 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
             })
         })
         .transpose()?;
+    let binds_prefix =
+        (plan.lowered.bindings.iter()).any(|b| matches!(b, SourceBinding::PrefixK { .. }));
+    let kv = binds_prefix
+        .then(|| {
+            let mut region = |entries: u64| -> Result<ArenaSpan, ArenaRefusal> {
+                let bytes = entries * KV_ENTRY_BYTES;
+                Ok(ArenaSpan {
+                    offset: ArenaOffset(place(bytes)?),
+                    bytes,
+                })
+            };
+            Ok(KvRegions {
+                block_table: region(u64::from(CUDA_MAX_BLOCKS_PER_SEQ))?,
+                slot_mapping: region(u64::from(hidden.rows))?,
+                sequence: region(2)?,
+            })
+        })
+        .transpose()?;
     Ok(Arena {
         bucket_m: hidden.rows,
         bytes,
         offsets,
         rotary,
+        kv,
         total,
     })
 }

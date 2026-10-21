@@ -18,9 +18,10 @@ use scratchy_subtile::tape_folding::FusedShape;
 use scratchy_target_cuda::op_abi::CudaFusion;
 use scratchy_target_cuda::step::CudaStep;
 use scratchy_target_cuda_compiler::canonical::{
-    ArenaRefusal, CanonicalAt, CanonicalRefusal, CudaModelFacts, CudaPlan, GemmShapeRule,
-    OperandRefusal, lower_canonical, plan_canonical,
+    ArenaRefusal, CanonicalAt, CanonicalRefusal, CudaModelFacts, CudaPlan, GateShapeRule,
+    GemmShapeRule, OperandRefusal, RopeShapeRule, lower_canonical, plan_canonical,
 };
+use scratchy_target_cuda_compiler::steps_from_tape::{StepCx, TapeStep, lower_fused};
 
 const AT: CanonicalAt<'static> = CanonicalAt {
     stem: "fixture",
@@ -409,4 +410,198 @@ fn lower_canonical_refuses_a_decode_gemm_by_its_shape() {
         Err(e) => panic!("expected the m = 1 shape refusal at step 0, got: {e}"),
         Ok(_) => panic!("lower_canonical lowered a decode GEMM CUDA has no kernel for"),
     }
+}
+
+// ── Refusals no earlier test reached ───────────────────────────────
+
+/// `RopeRotate(x, cos, sin)` alone over `[tokens, cols]`: `x` the embedded hidden, `cos` and
+/// `sin` the global table.
+fn rope_only(tokens: u32, cols: u32, head_dim: u32) -> LoweredDecode {
+    let shape = SourceShape { rows: tokens, cols };
+    let mut l = with_hidden(LoweringInput {
+        exported: None,
+        sources: vec![shape, shape, shape],
+        ops: vec![OpDesc {
+            op: SubOp::rope_rotate(HeadDim::new(head_dim)),
+            m: tokens,
+            inputs: vec![InputRef::Ext(0), InputRef::Ext(1), InputRef::Ext(2)],
+        }],
+        result: 0,
+    });
+    l.bindings[1] = SourceBinding::Cos { local: false };
+    l.bindings[2] = SourceBinding::Sin { local: false };
+    l
+}
+
+fn refusal(l: &LoweredDecode, facts: CudaModelFacts) -> CanonicalRefusal {
+    match lower_canonical(l, facts, AT) {
+        Err(e) => {
+            eprintln!("refused: {e}");
+            e
+        }
+        Ok(c) => panic!("lowered a canonical the kernel cannot run: {c:?}"),
+    }
+}
+
+/// A rope whose `cos` is a computed value, not a source: the kernel reads the tape's table.
+#[test]
+fn a_rope_whose_cos_is_computed_is_refused() {
+    let shape = SourceShape {
+        rows: 256,
+        cols: 2048,
+    };
+    let mut l = with_hidden(LoweringInput {
+        exported: None,
+        sources: vec![shape, shape],
+        ops: vec![
+            OpDesc {
+                op: SubOp::Elementwise(EwKind::Add),
+                m: 256,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(0)],
+            },
+            OpDesc {
+                op: SubOp::rope_rotate(HeadDim::new(256)),
+                m: 256,
+                inputs: vec![InputRef::Ext(0), InputRef::Op(0), InputRef::Ext(1)],
+            },
+        ],
+        result: 1,
+    });
+    l.bindings[1] = SourceBinding::Sin { local: false };
+    let e = refusal(&l, FACTS);
+    assert!(e.to_string().contains("computed value"), "{e}");
+    assert!(matches!(
+        e,
+        CanonicalRefusal::RotaryOperand {
+            step: 1,
+            op: "RopeRotate",
+            operand: 1,
+            binding: None,
+        }
+    ));
+}
+
+/// A rope over more than `i32::MAX` elements: 65536 rows of 32768 lanes.
+#[test]
+fn a_rope_above_int_max_elements_is_refused() {
+    let e = refusal(&rope_only(65536, 32768, 256), FACTS);
+    assert!(e.to_string().contains("2147483648"), "{e}");
+    assert!(matches!(
+        e,
+        CanonicalRefusal::RopeShape {
+            step: 0,
+            rule: RopeShapeRule::TooManyElements {
+                elements: 2147483648
+            },
+            ..
+        }
+    ));
+}
+
+/// A gate split whose model `head_dim` is not a whole number of 16-byte vectors.
+#[test]
+fn a_gate_split_off_the_vector_is_refused() {
+    let facts = CudaModelFacts {
+        head_dim: 12,
+        ..FACTS
+    };
+    let e = refusal(&attn_gate(256), facts);
+    assert!(e.to_string().contains("multiple of 8"), "{e}");
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GateShape {
+            step: 2,
+            head_dim: 12,
+            rule: GateShapeRule::HeadOffVector { multiple: 8 },
+            ..
+        }
+    ));
+}
+
+/// A gate split over more than `i32::MAX` elements: `qg` is 65536 rows of 2 · 16384 lanes.
+#[test]
+fn a_gate_split_above_int_max_elements_is_refused() {
+    let l = with_hidden(LoweringInput {
+        exported: None,
+        sources: vec![SourceShape {
+            rows: 65536,
+            cols: 32768,
+        }],
+        ops: vec![OpDesc {
+            op: SubOp::GateSplit { half_cols: 16384 },
+            m: 65536,
+            inputs: vec![InputRef::Ext(0)],
+        }],
+        result: 0,
+    });
+    let e = refusal(&l, FACTS);
+    assert!(e.to_string().contains("2147483648"), "{e}");
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GateShape {
+            step: 0,
+            rule: GateShapeRule::TooManyElements {
+                elements: 2147483648
+            },
+            ..
+        }
+    ));
+}
+
+/// `ProducerMissing` cannot be reached through `lower_canonical`: `computes` there is every
+/// `Compute` of the tape, and every computed operand is a slot one of them writes. So the lowering
+/// function is called directly, with the `Silu` the `SiluMul` fold absorbed left out of
+/// `computes`.
+#[test]
+fn a_fold_whose_absorbed_step_is_not_on_the_tape_is_refused() {
+    let l = mlp_block();
+    let p = plan_canonical(&l, FACTS, AT).expect("plan_canonical on the MLP block");
+    let cx = StepCx {
+        graph: &p.graph,
+        bindings: &p.lowered.bindings,
+        colouring: &p.colouring,
+        facts: p.facts,
+        tokens: Some(256),
+        offsets: Err(ArenaRefusal::TooLarge),
+        rotary: None,
+        kv: Ok(None),
+        kv_regions: None,
+    };
+    let computes: Vec<TapeStep<'_>> = (p.tape.instrs().iter())
+        .filter_map(|i| match i {
+            Instr::Compute {
+                node,
+                writes,
+                inputs,
+                ..
+            } => Some((&p.graph.nodes[node.index()], *writes, inputs)),
+            _ => None,
+        })
+        .enumerate()
+        .map(|(step, (node, writes, inputs))| TapeStep {
+            step,
+            node,
+            writes,
+            inputs,
+        })
+        .collect();
+    let (driver, fusion) = p.folds.fusions().next().expect("the MLP folds its SiluMul");
+    let mul = (computes.iter())
+        .find(|c| c.writes == driver)
+        .expect("the driver is on the tape");
+    let without_silu: Vec<TapeStep<'_>> = (computes.iter())
+        .filter(|c| !matches!(c.node.op, SubOp::Elementwise(EwKind::Silu)))
+        .map(|c| TapeStep {
+            step: c.step,
+            node: c.node,
+            writes: c.writes,
+            inputs: c.inputs,
+        })
+        .collect();
+    let e = lower_fused(&cx, mul, fusion, &without_silu).expect_err("the Silu is missing");
+    assert!(e.to_string().contains("producer slot"), "{e}");
+    assert!(matches!(
+        e,
+        CanonicalRefusal::ProducerMissing { step: 4, op: "Mul" }
+    ));
 }
