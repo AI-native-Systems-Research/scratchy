@@ -863,10 +863,10 @@ impl EngineCore {
         let mut client_outputs: StepOutputs = HashMap::new();
         let mut finished_ids: Vec<(String, RequestStatus)> = Vec::new();
 
-        // ⭐ THE STEP RAN, SO THE RECURRENT-STATE SNAPSHOTS IT SAVED HOLD THEIR STATE — committed
-        // here and not when they were scheduled, because a step that fails never gets here.
-        self.scheduler
-            .commit_state_saves(&scheduler_output.recurrent_state.saves);
+        // ⭐ THE STEP RAN, SO THE RECURRENT-STATE SNAPSHOTS IT SAVED HOLD THEIR STATE, AND THE KV
+        // BLOCKS REGISTERED WHILE IT WAS SCHEDULED HOLD THEIRS — committed here and not when they
+        // were scheduled, because a step that fails never gets here.
+        self.scheduler.commit_step(scheduler_output);
         // ⭐ THE WORKER'S KV REPORT, BEFORE ANY OF THE TOKEN BOOKKEEPING. Empty for every backend whose
         // keys sit at their token positions; on one where they do not, this is what the next step's block
         // allocation is sized by and what bounds the prefix it may cache. Over the whole report rather
