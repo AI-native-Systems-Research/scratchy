@@ -3191,6 +3191,19 @@ impl Scheduler {
         }
     }
 
+    /// Records a verify step's acceptance for `request_id`, feeding the miss
+    /// policy: the step count and its accepted drafts. The engine stops
+    /// drafting for a request whose drafts stop paying (its
+    /// `spec_drafts_stopped`).
+    pub fn record_spec_acceptance(&mut self, request_id: &str, accepted: usize) {
+        if let Some(request) = self.requests.get_mut(request_id) {
+            request.spec_verify_steps = request.spec_verify_steps.saturating_add(1);
+            request.spec_accepted_drafts = request
+                .spec_accepted_drafts
+                .saturating_add(accepted as u32);
+        }
+    }
+
     /// Append output token IDs to a request, updating both the canonical
     /// `requests` map and the `running` list.
     pub fn append_output_tokens(&mut self, request_id: &str, token_ids: &[u32]) {

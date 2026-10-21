@@ -223,12 +223,31 @@ impl<T> StepOutcome<T> {
     }
 }
 
-/// Whether `req_id` takes speculative drafts: it is running, and its sampling does not read its
-/// history (a verify row's would need the drafts before it).
+/// A request stops drafting for the rest of its life when its drafts stop paying. The verify
+/// step costs roughly twice a plain decode step (measured on Qwen3.6-35B-A3B, M5 Max), so
+/// drafting pays only while a request accepts about one draft a step. Two stops:
+/// [`SPEC_MISS_FAST_STOP`] verify steps that accepted nothing — a reply outside the head's
+/// draft vocabulary, the MTP head's prefix — and [`SPEC_RATE_WINDOW`] steps whose accepted
+/// drafts stayed under one a step, where the verify step's premium stops buying tokens. No
+/// re-arm: a reply's acceptance does not drift back above the line, and the cost of a wrong
+/// stop is bounded at plain-step speed.
+const SPEC_MISS_FAST_STOP: u32 = 8;
+const SPEC_RATE_WINDOW: u32 = 16;
+
+/// Whether `request`'s drafting has been switched off by the miss policy.
+fn spec_drafts_stopped(request: &Request) -> bool {
+    let (steps, accepted) = (request.spec_verify_steps, request.spec_accepted_drafts);
+    (steps >= SPEC_MISS_FAST_STOP && accepted == 0)
+        || (steps >= SPEC_RATE_WINDOW && accepted < steps)
+}
+
+/// Whether `req_id` takes speculative drafts: it is running, its sampling does not read its
+/// history (a verify row's would need the drafts before it), and its drafts have not stopped
+/// paying — see [`spec_drafts_stopped`].
 fn takes_drafts(scheduler: &Scheduler, req_id: &str) -> bool {
-    scheduler
-        .get_request(req_id)
-        .is_some_and(|r| !r.status.is_finished() && !r.sampling_params.reads_history())
+    scheduler.get_request(req_id).is_some_and(|r| {
+        !r.status.is_finished() && !r.sampling_params.reads_history() && !spec_drafts_stopped(r)
+    })
 }
 
 impl EngineCore {
@@ -779,6 +798,7 @@ impl EngineCore {
                     !r.status.is_finished()
                         && !r.all_token_ids.is_empty()
                         && !r.sampling_params.reads_history()
+                        && !spec_drafts_stopped(r)
                 });
                 if !keeps_drafts {
                     continue;
@@ -959,6 +979,9 @@ impl EngineCore {
             {
                 let num_draft_tokens = scheduled_spec_ids.len();
                 let num_accepted = generated.len().saturating_sub(1);
+                // Feed the miss policy before the rewind: the next step's `plan_drafts`
+                // reads it through `takes_drafts`.
+                self.scheduler.record_spec_acceptance(req_id, num_accepted);
                 let num_rejected = num_draft_tokens.saturating_sub(num_accepted);
                 if num_rejected > 0 {
                     self.scheduler

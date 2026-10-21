@@ -454,6 +454,14 @@ pub struct Request {
     /// Speculative-decoding draft token IDs (if any).
     pub spec_token_ids: Vec<u32>,
 
+    /// Verify steps this request has drafted through, and the drafts they
+    /// accepted. The engine's miss policy stops drafting for a request whose
+    /// drafts stop paying — see `engine_core`'s `spec_drafts_stopped`.
+    #[serde(default)]
+    pub spec_verify_steps: u32,
+    #[serde(default)]
+    pub spec_accepted_drafts: u32,
+
     /// Number of tokens that have been computed (prompt + output KV cached).
     pub num_computed_tokens: u32,
 
@@ -561,6 +569,8 @@ impl Request {
             prompt_token_ids,
             output_token_ids: Vec::new(),
             spec_token_ids: Vec::new(),
+            spec_verify_steps: 0,
+            spec_accepted_drafts: 0,
             num_computed_tokens: 0,
             num_prompt_tokens,
             cache_salt,
