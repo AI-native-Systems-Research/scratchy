@@ -350,6 +350,21 @@ fn main() {
     // a backend they support is on. Sorted for deterministic output.
     let dsl_dir = manifest.join("dsl");
     println!("cargo:rerun-if-changed={}", dsl_dir.display());
+    // A head that prefills at its target's chunk width must have every rung its target has, or a
+    // chunk at a rung it lacks panics at runtime: refuse the build instead, before any expansion.
+    // Every head is checked, selected or not, so every arch.json the check reads is watched (dsl/
+    // already is, file by file), and an incremental build agrees with a clean one.
+    for e in std::fs::read_dir(manifest.join("configs"))
+        .unwrap()
+        .flatten()
+    {
+        let arch_json = e.path().join("arch.json");
+        if arch_json.is_file() {
+            println!("cargo:rerun-if-changed={}", arch_json.display());
+        }
+    }
+    scratchy_forward_compiler_macro::check_head_ladders(&manifest)
+        .unwrap_or_else(|e| panic!("head ladder: {e}"));
     let mut dsl_files: Vec<PathBuf> = std::fs::read_dir(&dsl_dir)
         .unwrap()
         .flatten()
