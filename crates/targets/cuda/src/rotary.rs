@@ -102,7 +102,9 @@ mod tests {
     fn every_entry_is_within_the_bound_of_the_f64_angle() {
         let positions = [0, 1, 2, 7, 1000, 65535, 200000, 262143];
         let rows = rotary_rows(&positions, R, THETA);
-        for (row, &p) in rows.chunks_exact(R as usize).zip(&positions) {
+        let (rows, rest) = rows.as_chunks::<{ R as usize }>();
+        assert!(rest.is_empty(), "the table is whole rows");
+        for (row, &p) in rows.iter().zip(&positions) {
             assert_eq!(misses(row, p), 0, "position {p}");
         }
     }
