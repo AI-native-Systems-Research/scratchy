@@ -404,13 +404,12 @@ jobs:
       # would not have noticed.
       #
       # Deliberately a NARROW model scope, not `all` (every config's expansion
-      # and bake). These two stems compile carrier_parity and metal_o2_logits.
-      # qwen3_py_parity needs `qwen3-0.6b` (its `[[test]]` required-features),
-      # which this step does not name: one more expansion and bake, whose
-      # cold cost on CI is unmeasured, so that file stays a local-only build.
+      # and bake). These three stems compile carrier_parity, metal_o2_logits
+      # and qwen3_py_parity (`qwen3-0.6b` is its `[[test]]` required feature:
+      # without it the file rotted unbuilt).
       - name: Model-crate integration tests type-check
         run: cargo clippy -p scratchy-models --tests
-          --features metal,qwen3.5-35b-a3b,qwen3.6-35b-a3b -- -D warnings
+          --features metal,qwen3.5-35b-a3b,qwen3.6-35b-a3b,qwen3-0.6b -- -D warnings
 
       # Serving-layer unit tests: tool-call parsers (Hermes / Llama / Kimi /
       # Mistral / Jamba / Granite / Gemma-4), chat-template rendering, the

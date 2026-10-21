@@ -156,9 +156,10 @@ fn qwen3_py_carrier_parity() {
             128,        // BLOCKS_PER_CHUNK (metal target const)
             usize::MAX, // eager: allocate all chunks now
             |bytes| {
-                // new_pinned: allocates and holds residency in the allocator's set. The
-                // interpreter's command buffers attach that set, and a non-resident chunk reads
-                // structured garbage through the chunk-address table.
+                // new_pinned: allocates and holds residency in the
+                // allocator's set. The interpreter's command buffers attach
+                // that set, and a non-resident chunk reads structured
+                // garbage through the chunk-address table.
                 Ok(scratchy_target_metal::MetalMem::new_pinned(
                     &device_arc,
                     allocator.residency(),
