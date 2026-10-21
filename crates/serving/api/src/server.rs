@@ -134,31 +134,41 @@ async fn count_request(
 // Router
 // ---------------------------------------------------------------------------
 
-/// ⭐ THE LARGEST REQUEST BODY AN ENDPOINT READS IS ITS UPSTREAM API'S, not axum's 2 MB default,
-/// which one screenshot or a long agent session passes (#789). Past it, a 413 in the API's own
-/// error JSON (`ServeError::PayloadTooLarge`).
-///
-/// The OpenAI-compatible routes, the router's default: OpenAI takes a request of up to 512 MB of
-/// image inputs (developers.openai.com/api/docs/guides/images-vision). 512 MiB, a little over
-/// that.
-const OPENAI_BODY_LIMIT: usize = 512 << 20;
+/// Bytes of request JSON a token of the model's context may take: about 4 for a token of text,
+/// and 8× that for what JSON adds around it. That covers escapes (`\uXXXX`, 6 bytes, for each
+/// non-ASCII character, as Python's `json.dumps` writes them by default), long tokens such as
+/// runs of spaces, and the structure of the messages and tools.
+const BODY_BYTES_PER_TOKEN: usize = 32;
 
-/// `/v1/messages`: the Anthropic Messages API refuses a request past 32 MB with a 413
-/// `request_too_large` (platform.claude.com/docs/en/api/overview), so no Anthropic client sends
-/// one larger. 32 MiB, a little over that.
-const ANTHROPIC_BODY_LIMIT: usize = 32 << 20;
+/// What a model that takes images reads on top of its text. An image's bytes don't follow its
+/// tokens: it is resized to the model's input, so a 12-megapixel phone photo, about 5 MB of
+/// base64, may be 256 tokens. This is about six of them.
+const IMAGE_BODY_BYTES: usize = 32 << 20;
+
+/// The least any model reads: axum's default, which every route had before #789, so a body read
+/// then is read now. Not all of a request is prompt (a `response_format` schema, a guided grammar,
+/// `logit_bias`), so not all of it is bounded by the context.
+const MIN_BODY_LIMIT: usize = 2 << 20;
+
+/// ⭐ THE LARGEST REQUEST BODY THE SERVER READS IS WHAT ITS MODEL CAN TAKE (#789): a context of
+/// `max_model_len` tokens at [`BODY_BYTES_PER_TOKEN`], and [`IMAGE_BODY_BYTES`] more when it
+/// `takes_images`, but never less than [`MIN_BODY_LIMIT`]. A larger body can't fit the context, so
+/// it is refused before it is buffered, with a 413 in the API's own error JSON
+/// (`ServeError::PayloadTooLarge`), not read whole only to be refused for its length.
+fn body_limit(max_model_len: usize, takes_images: bool) -> usize {
+    let text = max_model_len.saturating_mul(BODY_BYTES_PER_TOKEN);
+    let images = if takes_images { IMAGE_BODY_BYTES } else { 0 };
+    text.saturating_add(images).max(MIN_BODY_LIMIT)
+}
 
 /// Build the axum router with all API routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
-    let anthropic_limit = DefaultBodyLimit::max(ANTHROPIC_BODY_LIMIT);
+    let limit = body_limit(state.engine.max_model_len(), state.engine.takes_images());
     #[allow(unused_mut)]
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/chat/completions/render", post(render_chat_completion))
-        .route(
-            "/v1/messages",
-            post(crate::anthropic::messages).layer(anthropic_limit),
-        )
+        .route("/v1/messages", post(crate::anthropic::messages))
         .route("/v1/responses", post(crate::responses::responses))
         .route("/v1/completions", post(completions))
         .route("/v1/query/execute", post(crate::query::execute_query))
@@ -180,9 +190,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         router = router.route("/metrics", get(metrics));
     }
 
-    // Every other route reads up to the OpenAI limit; `/v1/messages`' own layer, nearer its
-    // handler, sets its limit after this one, so it is the one that holds there.
-    router = router.layer(DefaultBodyLimit::max(OPENAI_BODY_LIMIT));
+    router = router.layer(DefaultBodyLimit::max(limit));
 
     // Count arrivals before anything else runs, so a request that a handler
     // later rejects still counts as traffic that reached this server.
@@ -1111,6 +1119,11 @@ mod tests {
     use tower::ServiceExt;
 
     fn make_test_state() -> Arc<AppState> {
+        make_test_state_of(4096)
+    }
+
+    /// A test state whose model has `max_model_len` tokens of context.
+    fn make_test_state_of(max_model_len: usize) -> Arc<AppState> {
         let engine_config = EngineCoreConfig {
             hybrid_kv: None,
             scheduler_config: SchedulerConfig {
@@ -1122,7 +1135,7 @@ mod tests {
                 long_prefill_token_threshold: 0,
                 ..Default::default()
             },
-            max_model_len: 4096,
+            max_model_len,
             num_gpu_blocks: 1024,
             block_size: 16,
             engine_index: 0,
@@ -1135,10 +1148,10 @@ mod tests {
         };
         let executor = Box::new(NoopExecutor::new(1024));
         let client = Box::new(InprocClient::new(engine_config, executor));
-        let engine = Arc::new(AsyncEngine::new(client, "test-model".to_string(), 4096));
+        let engine = AsyncEngine::new(client, "test-model".to_string(), max_model_len);
 
         Arc::new(AppState {
-            engine,
+            engine: Arc::new(engine),
             config: ServerConfig::default(),
             is_pooling: false,
             scratchy_core_config: None,
@@ -1472,14 +1485,26 @@ mod tests {
         serde_json::from_slice(&body).unwrap_or_else(|e| panic!("not JSON ({e}): {body:?}"))
     }
 
-    /// A body is read up to its API's limit and refused past it (#789). `/v1/messages` is pinned at
-    /// its limit: a body of exactly [`ANTHROPIC_BODY_LIMIT`] bytes is read, so it is refused for
-    /// what it says (a 400 here), and one byte more is a 413 `request_too_large`. The OpenAI routes
-    /// read a 3 MB body, past axum's old 2 MB default. Their 512 MiB limit itself is not sent here:
-    /// a body that large is no test's to allocate.
+    /// The body limit follows the model's context (#789): 32 bytes a token, 32 MiB more for a
+    /// model that takes images, and never under axum's 2 MiB default.
+    #[test]
+    fn the_body_limit_is_what_the_models_context_takes() {
+        const MIB: usize = 1 << 20;
+        assert_eq!(body_limit(4096, false), 2 * MIB, "the floor");
+        assert_eq!(body_limit(65_536, false), 2 * MIB);
+        assert_eq!(body_limit(131_072, false), 4 * MIB);
+        assert_eq!(body_limit(262_144, false), 8 * MIB);
+        assert_eq!(body_limit(131_072, true), 36 * MIB, "and the images'");
+        assert_eq!(body_limit(4096, true), 32 * MIB + 128 * 1024);
+    }
+
+    /// Every route reads a body up to its model's limit and refuses one byte more, with a 413 in
+    /// the API's own error JSON (#789). The body at the limit is read, so it is refused for what it
+    /// says (a bad `tool_choice`, a 400). A model of a smaller context refuses a body the larger one
+    /// read.
     #[tokio::test]
-    async fn a_body_is_read_up_to_its_apis_limit_and_refused_past_it() {
-        let send = |uri: &str, body: String| {
+    async fn a_body_is_read_up_to_its_models_limit_and_refused_past_it() {
+        let send = |max_model_len: usize, uri: &str, body: String| {
             let request = Request::builder()
                 .method("POST")
                 .uri(uri)
@@ -1487,38 +1512,55 @@ mod tests {
                 .body(Body::from(body))
                 .unwrap();
             async move {
-                let response = build_router(make_test_state())
+                let response = build_router(make_test_state_of(max_model_len))
                     .oneshot(request)
                     .await
                     .unwrap();
                 (response.status(), error_body(response).await)
             }
         };
-        let three_mb = "x".repeat(3 << 20);
-        let chat = format!(
-            r#"{{"messages": [{{"role": "user", "content": "{three_mb}"}}], "tool_choice": "requried"}}"#
-        );
-        let (status, error) = send("/v1/chat/completions", chat).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
-
+        // A body of exactly `bytes`, `content` padded to make it so.
+        let sized = |bytes: usize, body: &dyn Fn(&str) -> String| {
+            let body = body(&"x".repeat(bytes - body("").len()));
+            assert_eq!(body.len(), bytes);
+            body
+        };
+        let chat = |content: &str| {
+            format!(
+                r#"{{"messages": [{{"role": "user", "content": "{content}"}}],
+                    "tool_choice": "requried"}}"#
+            )
+        };
         let messages = |content: &str| {
             format!(
                 r#"{{"max_tokens": 8, "messages": [{{"role": "user", "content": "{content}"}}],
                     "tool_choice": {{"type": "mystery"}}}}"#
             )
         };
-        let content = ANTHROPIC_BODY_LIMIT - messages("").len();
-        let at_limit = messages(&"x".repeat(content));
-        assert_eq!(at_limit.len(), ANTHROPIC_BODY_LIMIT);
-        let (status, error) = send("/v1/messages", at_limit).await;
+        let context = 131_072;
+        let limit = body_limit(context, false);
+        assert_eq!(limit, 4 << 20);
+
+        let (status, error) = send(context, "/v1/chat/completions", sized(limit, &chat)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let (status, error) = send(context, "/v1/chat/completions", sized(limit + 1, &chat)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
+        assert_eq!(error["error"]["type"], "RequestTooLargeError", "{error}");
+
+        let (status, error) = send(context, "/v1/messages", sized(limit, &messages)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
         assert_eq!(error["error"]["type"], "invalid_request_error", "{error}");
-
-        let past = messages(&"x".repeat(content + 1));
-        let (status, error) = send("/v1/messages", past).await;
+        let (status, error) = send(context, "/v1/messages", sized(limit + 1, &messages)).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
         assert_eq!(error["type"], "error", "{error}");
         assert_eq!(error["error"]["type"], "request_too_large", "{error}");
+
+        // The same 3 MiB body, read at a 128k context, is past an 8k one's limit.
+        let three_mib = sized(3 << 20, &chat);
+        let (status, error) = send(context, "/v1/chat/completions", three_mib.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let (status, error) = send(8192, "/v1/chat/completions", three_mib).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
     }
 
     /// A `PayloadTooLarge` is a 413 in the OpenAI error shape, as the OpenAI-compatible routes
