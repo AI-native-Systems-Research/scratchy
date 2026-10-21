@@ -3400,7 +3400,10 @@ impl AsyncEngine {
         &self,
         request: &protocol::ChatCompletionRequest,
     ) -> ServeResult<SamplingParams> {
-        check_tool_choice(request)?;
+        let tools: Vec<&str> = (request.tools.iter().flatten())
+            .map(|t| t.function.name.as_str())
+            .collect();
+        check_tool_choice(&request.tool_choice, &tools)?;
         let stop = match &request.stop {
             Some(protocol::StopCondition::Single(s)) => vec![s.clone()],
             Some(protocol::StopCondition::Multiple(v)) => v.clone(),
@@ -3972,12 +3975,14 @@ fn build_completion_logprobs(
 /// from `tools` would have every call the model makes dropped, and its reply would come back as
 /// text with no error: #767's bug, through a misspelled name. `"required"` with no tools could be
 /// met by none. Both are refused, as vLLM's `check_tool_usage` and the upstream APIs refuse them.
-fn check_tool_choice(request: &protocol::ChatCompletionRequest) -> ServeResult<()> {
-    let tools = request.tools.as_deref().unwrap_or_default();
-    match &request.tool_choice {
-        Some(protocol::ToolChoice::Function(name))
-            if !tools.iter().any(|t| t.function.name == *name) =>
-        {
+/// `tools` names the tools the request declares. Every chat request is checked as its sampling
+/// params are built; `/v1/messages`' `tool-spans` path, which builds none, checks its own.
+pub(crate) fn check_tool_choice(
+    tool_choice: &Option<protocol::ToolChoice>,
+    tools: &[&str],
+) -> ServeResult<()> {
+    match tool_choice {
+        Some(protocol::ToolChoice::Function(name)) if !tools.contains(&name.as_str()) => {
             Err(ServeError::Validation(format!(
                 "tool_choice forces the tool `{name}`, which `tools` does not declare"
             )))

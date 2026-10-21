@@ -1012,10 +1012,16 @@ pub async fn messages(
     // feature — see the spans section above for why it is not shipped.
     #[cfg(feature = "tool-spans")]
     if spans_enabled(&request) {
+        let tool_choice = (request.tool_choice.clone()).map(|AnthropicToolChoice(c)| c);
+        let tools: Vec<&str> = (request.tools.iter().flatten())
+            .map(|t| t.name.as_str())
+            .collect();
+        if let Err(e) = crate::engine::check_tool_choice(&tool_choice, &tools) {
+            return e.into_response();
+        }
         let spnl = build_spnl_query(&request);
         match crate::query::anthropic_spans_completion(&state, &spnl).await {
             Ok(resp) => {
-                let tool_choice = (request.tool_choice.clone()).map(|AnthropicToolChoice(c)| c);
                 let parser = state.engine.tool_parser();
                 let msg = completion_to_messages_response(resp, parser.as_ref(), &tool_choice);
                 return if is_stream {
