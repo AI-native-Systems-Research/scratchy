@@ -191,7 +191,21 @@ fn step_2_collapse_island(module: &mut Module, protected: &HashSet<Ssa>) {
             // if it is NOT, then it consumes exactness-f32 and exits elsewhere --
             // skipping the retype leaves its f32 for the RED-stop to refuse by name
             // rather than silently degrading. Either way, no retype here.
-            if op.operands.iter().any(|v| protected.contains(v)) {
+            //
+            // ⛔ AND A PROTECTED **RESULT** PINS ITS OWN OP OUT TOO -- the ISLAND HEAD.
+            // The closure walks backward over f32 values, so every island member but
+            // the head is reached through a protected operand; the head (an `arith.extf`
+            // f16→f32 whose widen the island exists to hold) has an f16 OPERAND and a
+            // protected RESULT. The operand test alone does not see it, so without this
+            // second test the collapse retypes the head's result to f16 while leaving
+            // the op standing: a "widen" typed f16→f16, an op whose stated meaning
+            // (dl16tofp32, the device recipe the island is) is erased from its own type
+            // while its body survives. The numbers survive (the consumer promotes), but
+            // the DOOR reads that type to pick the convert -- an f16-typed extf cannot
+            // be lowered as the f32 widen it is. The head keeps its widen type.
+            if op.operands.iter().any(|v| protected.contains(v))
+                || op.results.iter().any(|r| protected.contains(r))
+            {
                 continue;
             }
             let operand_is_f16 = op
@@ -536,6 +550,23 @@ module {
         // is gone. The counts are exact, not floors: two islands, one churn.
         assert_eq!(get("arith.extf"), 2, "the fptosi island's extfs survive");
         assert_eq!(get("arith.truncf"), 0, "the churn's truncf still collapses");
+        // ⛔ AND THE ISLAND HEAD KEEPS ITS WIDEN TYPE: both surviving extfs are typed
+        // f16→f32, not f16→f16. The collapse's operand test cannot see the head (its
+        // operand is f16, only its RESULT is protected), so without the result test the
+        // head's type is silently rewritten to f16 while the op stands -- a "widen" that
+        // no longer widens. The door reads that type to pick `dl16tofp32`; this pins it.
+        let extf_f32 = m
+            .ops_deep()
+            .into_iter()
+            .filter(|o| {
+                o.kind == OpKind::ArithExtf
+                    && o.result_type().and_then(|t| t.elem()) == Some(DType::F32)
+            })
+            .count();
+        assert_eq!(
+            extf_f32, 2,
+            "the island's extf heads keep their f32 widen type"
+        );
         // The island's compute stays F32 -- mulf, addf, and the f32 constant -- and
         // the fptosi's operand is still the f32 add.
         let f32_count = m
