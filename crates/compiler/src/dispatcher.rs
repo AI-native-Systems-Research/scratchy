@@ -361,12 +361,21 @@ pub trait ScratchyWeights: Send + Sync {
     #[cfg(feature = "metal")]
     fn metal_rungs(&self) -> &'static (dyn core::any::Any + Send + Sync);
 
-    /// The arena slots and scratch of the model's resident pool, a
-    /// `scratchy_target_metal::interpreter::metal::LentActivation` typed `Any` (as
-    /// [`Self::metal_rungs`]): what a model whose forwards never overlap this one's places its own
-    /// in. `None` until this model's first forward builds the pool.
+    /// What the model's resident pool shares with its guest, a
+    /// `scratchy_target_metal::interpreter::metal::HostArena` typed `Any` (as
+    /// [`Self::metal_rungs`]): the arena slots and scratch a model whose forwards never overlap
+    /// this one's runs in, which the pool was sized to hold. `None` until this model's first
+    /// forward builds the pool.
     #[cfg(feature = "metal")]
-    fn metal_lend_activation(&self) -> Option<Box<dyn core::any::Any>>;
+    fn metal_hosted(&self) -> Option<Box<dyn core::any::Any>>;
+
+    /// Make this model's resident pool hold a guest's arena: `guest` a
+    /// `scratchy_target_metal::interpreter::metal::GuestArena` typed `Any` (as
+    /// [`Self::metal_rungs`]), what a model whose forwards follow this one's on its command buffer
+    /// (an MTP head) needs of it. Set once, before the pool is built at this model's first forward;
+    /// refused once the pool exists — it was sized without the guest.
+    #[cfg(feature = "metal")]
+    fn metal_host(&self, guest: Box<dyn core::any::Any>) -> Result<(), String>;
 
     /// The model's `CanonicalParams::METAL_DTYPE`, so the worker can size
     /// its KV cache without monomorphizing on `W`.
@@ -495,9 +504,6 @@ pub trait MetalForwardOnto {
 
     /// The logits' row width.
     fn vocab(&self) -> u32;
-
-    /// Rows `rows` of the final (post-norm) hidden states, as bytes.
-    fn hidden_rows(&self, rows: &[u32]) -> Vec<u8>;
 }
 
 /// Non-generic view of the macro-emitted MetalWorker for the

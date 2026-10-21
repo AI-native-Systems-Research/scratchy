@@ -1875,6 +1875,75 @@ pub struct TapeLoop {
     pub layer_stride: u32,
 }
 
+/// What a scratch buffer a tape binds holds: one buffer a worker of each kind some tape needs.
+/// The last two scale with the KV cap rung ([`RungScratch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScratchKind {
+    /// Split-K partial sums, reduced by the next command.
+    SplitK,
+    /// MoE routing and expert rows, and the TurboQuant decode split's partials.
+    Moe,
+    /// The rope-once pre-roped K.
+    RopedK,
+    /// The hd512 unfused attention's dense K/V, scores and per-head Q/O.
+    AttnUnfused,
+}
+
+impl ScratchKind {
+    pub const ALL: [Self; 4] = [Self::SplitK, Self::Moe, Self::RopedK, Self::AttnUnfused];
+
+    /// What a worker's buffer of this kind is called in an allocation failure.
+    pub const fn what(self) -> &'static str {
+        match self {
+            Self::SplitK => "splitk scratch",
+            Self::Moe => "moe scratch",
+            Self::RopedK => "roped-K scratch",
+            Self::AttnUnfused => "attn-unfused scratch",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::SplitK => 0,
+            Self::Moe => 1,
+            Self::RopedK => 2,
+            Self::AttnUnfused => 3,
+        }
+    }
+}
+
+/// One `T` per [`ScratchKind`], indexed by kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PerScratch<T>([T; 4]);
+
+impl<T> PerScratch<T> {
+    pub fn from_fn(mut f: impl FnMut(ScratchKind) -> T) -> Self {
+        Self(ScratchKind::ALL.map(&mut f))
+    }
+
+    /// [`Self::from_fn`] for a fallible `f`: the first kind's error.
+    pub fn try_from_fn<E>(mut f: impl FnMut(ScratchKind) -> Result<T, E>) -> Result<Self, E> {
+        let [a, b, c, d] = ScratchKind::ALL.map(&mut f);
+        Ok(Self([a?, b?, c?, d?]))
+    }
+
+    pub fn map<U>(self, f: impl FnMut(T) -> U) -> PerScratch<U> {
+        PerScratch(self.0.map(f))
+    }
+
+    /// Each kind with its value.
+    pub fn iter(&self) -> impl Iterator<Item = (ScratchKind, &T)> {
+        ScratchKind::ALL.into_iter().zip(&self.0)
+    }
+}
+
+impl<T> std::ops::Index<ScratchKind> for PerScratch<T> {
+    type Output = T;
+    fn index(&self, kind: ScratchKind) -> &T {
+        &self.0[kind.index()]
+    }
+}
+
 impl LoweredMetalTape {
     /// The tape's commands with the layer loop played out: prologue, then the body once per
     /// iteration with every `LayerId` advanced, then the tail.
@@ -1887,18 +1956,18 @@ impl LoweredMetalTape {
     /// Exact because the only per-iteration input to the lowering is `layer_offset`, consumed
     /// in exactly one pattern (`LayerId(literal + layer_offset)`); a weight's source family
     /// does not vary.
-    /// The bytes of each scratch buffer the tape binds: split-K, MoE, roped K, hd512 unfused —
-    /// the MoE scratch holding the decode split's partials for at most `decode_rows` of the
-    /// bucket's rows (`None`: every row).
-    pub fn scratch_bytes(&self, decode_rows: Option<DecodeRows>) -> [u32; 4] {
+    /// The bytes of each scratch buffer the tape binds ([`ScratchKind`]), the MoE scratch holding
+    /// the decode split's partials for at most `decode_rows` of the bucket's rows (`None`: every
+    /// row).
+    pub fn scratch_bytes(&self, decode_rows: Option<DecodeRows>) -> PerScratch<u32> {
         let rows = decode_rows.map_or(self.bucket_m, |r| r.get().min(self.bucket_m));
         let partials = self.decode_partials_row_bytes.saturating_mul(rows);
-        [
-            self.splitk_scratch_bytes,
-            self.moe_scratch_bytes.max(partials),
-            self.roped_k_scratch_bytes,
-            self.attn_unfused_scratch_bytes,
-        ]
+        PerScratch::from_fn(|kind| match kind {
+            ScratchKind::SplitK => self.splitk_scratch_bytes,
+            ScratchKind::Moe => self.moe_scratch_bytes.max(partials),
+            ScratchKind::RopedK => self.roped_k_scratch_bytes,
+            ScratchKind::AttnUnfused => self.attn_unfused_scratch_bytes,
+        })
     }
 
     pub fn commands_expanded(&self) -> Vec<GatedCommand> {
@@ -2112,16 +2181,17 @@ pub enum LoweringError {
     /// A scratch buffer the KV cap rung `block_cap` sizes exceeds the 32-bit byte sizes and
     /// offsets its kernels bind: the rung cannot exist for this tape.
     ScratchTooLarge {
-        scratch: ScratchKind,
+        scratch: RungScratch,
         block_cap: MaxBlocksPerSeq,
     },
     /// The tape lists more distinct commands than a [`CommandIx`] can index.
     TooManyCommands(TooManyCommands),
 }
 
-/// A scratch buffer whose size scales with the KV cap rung.
+/// A scratch buffer whose size scales with the KV cap rung: of the [`ScratchKind`]s, the ones a
+/// rung can outgrow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScratchKind {
+pub enum RungScratch {
     /// The rope-once pre-roped K.
     RopedK,
     /// The hd512 unfused attention's dense K/V, scores and per-head Q/O.

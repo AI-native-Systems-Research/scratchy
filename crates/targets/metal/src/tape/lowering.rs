@@ -915,7 +915,7 @@ fn roped_k_bytes(dims: [u32; 5], block_cap: u32) -> Result<u32, LoweringError> {
     let bytes = dims.iter().try_fold(1u64, |b, &d| b.checked_mul(d.into()));
     let bytes = bytes.and_then(|b| u32::try_from(b).ok());
     bytes.ok_or(LoweringError::ScratchTooLarge {
-        scratch: super::lowered::ScratchKind::RopedK,
+        scratch: super::lowered::RungScratch::RopedK,
         block_cap: super::ids::MaxBlocksPerSeq(block_cap),
     })
 }
@@ -3935,7 +3935,7 @@ fn lower_one(
                 let bs = block_size;
                 let lq = bucket_m;
                 let too_large = || LoweringError::ScratchTooLarge {
-                    scratch: super::lowered::ScratchKind::AttnUnfused,
+                    scratch: super::lowered::RungScratch::AttnUnfused,
                     block_cap: super::ids::MaxBlocksPerSeq(block_cap),
                 };
                 let max_kv = block_cap.checked_mul(bs).ok_or_else(too_large)?;
@@ -9769,7 +9769,10 @@ mod tests {
         );
         let row = p.num_q_heads * splits * (2 + p.global_head_dim) * 4;
         assert_eq!(tape.decode_partials_row_bytes, row);
-        assert_eq!(tape.scratch_bytes(None)[1], row);
+        assert_eq!(
+            tape.scratch_bytes(None)[crate::tape::lowered::ScratchKind::Moe],
+            row
+        );
 
         let kernels = |tape: &LoweredMetalTape| {
             (tape.commands.iter())
@@ -9801,7 +9804,10 @@ mod tests {
         assert!((gqa.constants.iter()).any(|k| *k == ConstantValue::uint(22, 1)));
         assert!((gqa.bindings.iter()).any(|b| b.index() == 23));
         assert_eq!(verify.decode_partials_row_bytes, row);
-        assert_eq!(verify.scratch_bytes(None)[1], 4 * row);
+        assert_eq!(
+            verify.scratch_bytes(None)[crate::tape::lowered::ScratchKind::Moe],
+            4 * row
+        );
 
         // Running its KV writer (Gemma 4's global layers), it is the tape's only encoder.
         use crate::tape::step::RopedAttention;
@@ -9891,7 +9897,10 @@ mod tests {
         assert_eq!(combine.dispatch.threads_per_threadgroup, (128, 1, 1));
         let row = p.num_q_heads * splits * (2 + p.global_head_dim) * 4;
         assert_eq!(tape.decode_partials_row_bytes, row);
-        assert_eq!(tape.scratch_bytes(None)[1], row);
+        assert_eq!(
+            tape.scratch_bytes(None)[crate::tape::lowered::ScratchKind::Moe],
+            row
+        );
         // A group that does not divide the query heads evenly cannot fill the
         // fragments' rows — 29 over 4 — so it stays on the twin.
         let kernels = |tape: &LoweredMetalTape| {
@@ -10000,9 +10009,18 @@ mod tests {
         // Every row's partials, or only those of the rows a decode or verify step brings.
         let row = p.num_q_heads * splits * (2 + p.global_head_dim) * 4;
         assert_eq!(batched.decode_partials_row_bytes, row);
-        assert_eq!(batched.scratch_bytes(None)[1], 4 * row);
-        assert_eq!(batched.scratch_bytes(Some(DecodeRows(2)))[1], 2 * row);
-        assert_eq!(batched.scratch_bytes(Some(DecodeRows(128)))[1], 4 * row);
+        assert_eq!(
+            batched.scratch_bytes(None)[crate::tape::lowered::ScratchKind::Moe],
+            4 * row
+        );
+        assert_eq!(
+            batched.scratch_bytes(Some(DecodeRows(2)))[crate::tape::lowered::ScratchKind::Moe],
+            2 * row
+        );
+        assert_eq!(
+            batched.scratch_bytes(Some(DecodeRows(128)))[crate::tape::lowered::ScratchKind::Moe],
+            4 * row
+        );
     }
 
     /// A bucket whose partials scratch would not fit the u32 the op scratch is sized in
@@ -10041,7 +10059,7 @@ mod tests {
         let decode = kernels(&lower_tq(&p, rows(), 8));
         assert!(decode.contains(&KernelId::AttentionDecodeGqaTq));
         assert_eq!(
-            lower_tq(&p, rows(), 8).scratch_bytes(None)[1],
+            lower_tq(&p, rows(), 8).scratch_bytes(None)[crate::tape::lowered::ScratchKind::Moe],
             8 * p.num_q_heads * splits * (2 + p.global_head_dim) * 4
         );
     }

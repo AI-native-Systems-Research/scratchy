@@ -46,12 +46,13 @@ pub use forward::{
 };
 pub use pool::{
     MetalBucketSpec, MetalRungs, MetalWorkerPool, Onto, PickedRung, PoolBuildError, PooledWorker,
-    RuntimeFactory, TqGroup, WorkerGuard, pick_rung,
+    RuntimeFactory, TqGroup, WorkerGuard, host_guest, pick_rung,
 };
 pub use runtime::RuntimeBindings;
 pub use worker::{
-    Activation, ArenaLayout, BoundBuffer, BucketBaking, BucketStep, LentActivation, MetalWorker,
-    ResolvedSources, SourceMiss, SparsePlan, TerminalReads, WorkerError,
+    Activation, ArenaLayout, ArenaRanks, ArenaRole, ArenaShare, BoundBuffer, BucketBaking,
+    BucketStep, ByRank, GuestArena, HostArena, HostPart, Hosting, MetalWorker, Rank,
+    ResolvedSources, Slot, SourceMiss, SparsePlan, TerminalReads, WorkerError,
 };
 
 // Centralized type aliases for the objc2-metal `Retained` wrapper

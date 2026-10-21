@@ -2594,16 +2594,31 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
-    // Per-variant lending of each model's resident pool's activation buffers.
-    let metal_lend_activation_arms: Vec<proc_macro2::TokenStream> = arms
+    // Per-variant: what each model's resident pool shares with its guest.
+    let metal_hosted_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
         .map(|a| {
             let variant_ident = pascal_case(&a.model_ident);
             quote! {
                 Weights::#variant_ident(w) => w.metal_pool.get().map(|p| {
-                    ::std::boxed::Box::new(p.lend_activation())
+                    ::std::boxed::Box::new(p.hosted())
                         as ::std::boxed::Box<dyn ::core::any::Any>
                 }),
+            }
+        })
+        .collect();
+
+    // Per-variant: make each model's resident pool hold a guest's arena, before it is built.
+    let metal_host_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            quote! {
+                Weights::#variant_ident(w) => ::scratchy_target_metal::interpreter::metal::host_guest(
+                    &w.metal_pool,
+                    &w.metal_guest,
+                    guest,
+                ),
             }
         })
         .collect();
@@ -3300,9 +3315,19 @@ fn emit_arch_dispatcher(
             }
 
             #[cfg(feature = "metal")]
-            fn metal_lend_activation(&self) -> ::core::option::Option<::std::boxed::Box<dyn ::core::any::Any>> {
+            fn metal_hosted(&self) -> ::core::option::Option<::std::boxed::Box<dyn ::core::any::Any>> {
                 match self {
-                    #(#metal_lend_activation_arms)*
+                    #(#metal_hosted_arms)*
+                }
+            }
+
+            #[cfg(feature = "metal")]
+            fn metal_host(
+                &self,
+                guest: ::std::boxed::Box<dyn ::core::any::Any>,
+            ) -> ::core::result::Result<(), ::std::string::String> {
+                match self {
+                    #(#metal_host_arms)*
                 }
             }
 

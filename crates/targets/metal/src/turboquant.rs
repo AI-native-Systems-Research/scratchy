@@ -69,14 +69,14 @@ pub struct TqPool<'a> {
 /// the global KV writers). Uniform arches pass all-true → every layer real
 /// (byte-identical to before, when `is_global` was implicitly all-true).
 ///
-/// `lent` is a scratch of a pool whose forwards never overlap this one's (a head's target's,
-/// [`crate::interpreter::metal::LentActivation::tq_scratch`]): of this geometry, the provision
+/// `hosted` is the scratch of the pool whose arena this one runs in (a head's target's,
+/// [`crate::interpreter::metal::HostArena::tq_scratch`]): of this geometry, the provision
 /// stages through it and allocates none of its own.
 pub fn build_tq_provision(
     allocator: &crate::MetalAllocator,
     pool: TqPool<'_>,
     codebook: &TqCodebook,
-    lent: Option<&crate::interpreter::metal::runtime::TqScratch>,
+    hosted: Option<&crate::interpreter::metal::runtime::TqScratch>,
 ) -> crate::interpreter::metal::runtime::TqRuntimeBuffers {
     let TqPool {
         is_global,
@@ -114,12 +114,12 @@ pub fn build_tq_provision(
         (bytes.norms, true),
         (bytes.scratch, true),
     );
-    // A lent scratch of this geometry is staged through, and none of this pool's own is laid out:
-    // its stores are its lender's, mapped as far as the same blocks are reached.
+    // A hosted scratch of this geometry is staged through, and none of this pool's own is laid
+    // out: its stores are its host's, mapped as far as the same blocks are reached.
     let chunk_bytes = blocks_per_chunk * scratch.0;
     let scratch_bytes = num_blocks * scratch.0;
-    let lent = lent.filter(|s| s.bytes == scratch_bytes && s.chunk_bytes == chunk_bytes);
-    let own_scratch = if lent.is_some() { 0 } else { 2 };
+    let hosted = hosted.filter(|s| s.bytes == scratch_bytes && s.chunk_bytes == chunk_bytes);
+    let own_scratch = if hosted.is_some() { 0 } else { 2 };
     let layout: Vec<(usize, bool)> = [packed, packed, norms, norms]
         .into_iter()
         .flat_map(|store| std::iter::repeat_n(store, n_global))
@@ -158,7 +158,7 @@ pub fn build_tq_provision(
             .collect();
         crate::argmax::upload_shared_buffer(device, &vals)
     };
-    let scratch = match lent {
+    let scratch = match hosted {
         Some(s) => s.clone(),
         None => {
             let k_data = next.next().expect("K scratch");
@@ -401,11 +401,11 @@ mod tests {
         }
     }
 
-    /// A provision lent a scratch of its own geometry (a head's, its target's) stages through
+    /// A provision hosted a scratch of its own geometry (a head's, its target's) stages through
     /// those very buffers and allocates no scratch of its own; one of another geometry — another
     /// block count, so other chunk offsets in the tables — is not its to use, and it builds its own.
     #[test]
-    fn a_provision_stages_through_a_lent_scratch_of_its_geometry() {
+    fn a_provision_stages_through_a_hosted_scratch_of_its_geometry() {
         let Some(device) = crate::detect_device().map(|d| d.device) else {
             eprintln!("skipping: no Metal 4 GPU");
             return;
