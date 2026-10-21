@@ -3389,7 +3389,6 @@ impl AsyncEngine {
             template.render_chat(
                 &request.messages,
                 request.tools.as_deref(),
-                request.tool_choice.as_ref(),
                 merged_kwargs.as_ref(),
                 true,
             )?
@@ -4570,6 +4569,40 @@ mod tests {
         // Without tokenizer, prompt is byte values of "Hello".
         let ids = ec_req.prompt_token_ids.unwrap();
         assert_eq!(ids.len(), 5); // b"Hello" = 5 bytes
+    }
+
+    /// A `tool_choice` of `"none"` renders the same prompt as `"auto"`, tools included: most
+    /// templates put the tools first, so leaving them out would give a `"none"` request no
+    /// prefix in common with its siblings', and it would prefill from scratch. The engine reads
+    /// no tool call out of its reply instead.
+    #[test]
+    fn a_tool_choice_of_none_renders_the_prompt_auto_does() {
+        let mut engine = make_test_engine();
+        let template = "{% if tools %}TOOLS {% endif %}{{ messages[0]['content'] }}";
+        engine.set_chat_template(Arc::new(ChatTemplate::new(template.to_string()).unwrap()));
+        let prompt = |tool_choice: Option<serde_json::Value>| {
+            let request = protocol::ChatCompletionRequest {
+                tools: Some(vec![protocol::ChatCompletionToolsParam {
+                    tool_type: "function".to_string(),
+                    function: protocol::FunctionDefinition {
+                        name: "Bash".to_string(),
+                        description: None,
+                        parameters: None,
+                    },
+                }]),
+                tool_choice,
+                ..make_chat_request()
+            };
+            let params = engine.build_sampling_params_from_chat(&request).unwrap();
+            let ec_req = engine
+                .chat_to_engine_request("test-1", &request, &params)
+                .unwrap();
+            ec_req.prompt_token_ids.unwrap()
+        };
+        let auto = prompt(Some(serde_json::json!("auto")));
+        assert_eq!(auto, b"TOOLS Hello".map(u32::from), "the tools render");
+        assert_eq!(prompt(Some(serde_json::json!("none"))), auto);
+        assert_eq!(prompt(None), auto);
     }
 
     #[test]

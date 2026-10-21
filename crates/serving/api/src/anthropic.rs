@@ -294,9 +294,8 @@ fn last_breakpoint(req: &MessagesRequest) -> Option<Breakpoint> {
 
 /// Anthropic's `tool_choice` as the chat endpoint's. Anthropic sends an object —
 /// `{"type": "auto" | "any" | "none"}`, or `{"type": "tool", "name": …}` — and the bare strings are
-/// accepted as well. Passed through unconverted, `{"type": "none"}` still rendered and parsed the
-/// tools, and `{"type": "any"}` let the model answer without one. A form it doesn't know passes
-/// through as it came.
+/// accepted as well. `any` is the chat endpoint's `"required"`, which no endpoint enforces yet
+/// (#765). A form it doesn't know passes through as it came.
 fn convert_tool_choice(tc: Value) -> Value {
     let kind = tc
         .as_str()
