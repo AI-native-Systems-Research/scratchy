@@ -2224,15 +2224,11 @@ impl AsyncEngine {
                         }
                         Some((Err(e), sched)) => {
                             error!("Executor error: {}", e);
+                            // Aborts the step's requests in the engine, too.
                             client.abandon_step(&sched);
                             let err_msg = format!("Executor error: {e}");
-                            let req_ids: Vec<String> =
-                                sched.num_scheduled_tokens.keys().cloned().collect();
-                            client
-                                .abort_requests(&req_ids)
-                                .unwrap_or_else(|e| error!("abort_requests failed: {e}"));
                             Self::fail_requests(&mut *requests.lock().await, &err_msg, |id| {
-                                req_ids.iter().any(|r| r == id)
+                                sched.num_scheduled_tokens.contains_key(id)
                             });
                             notify.notify_waiters();
                             gpu_in_flight -= 1;
@@ -5787,6 +5783,13 @@ mod tests {
             Ok(())
         }
 
+        // It never schedules a step, so none can fail.
+        fn abandon_step(
+            &mut self,
+            _sched: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
+        ) {
+        }
+
         fn abort_running_requests(&mut self) {}
 
         fn shutdown(&mut self) -> scratchy_serving_engine::error::EngineResult<()> {
@@ -5923,6 +5926,15 @@ mod tests {
         ) -> scratchy_serving_engine::error::EngineResult<()> {
             self.aborted.lock().unwrap().extend_from_slice(request_ids);
             Ok(())
+        }
+
+        // As the engine does: a failed step's requests are aborted.
+        fn abandon_step(
+            &mut self,
+            sched: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
+        ) {
+            let ids = sched.num_scheduled_tokens.keys().cloned();
+            self.aborted.lock().unwrap().extend(ids);
         }
 
         fn abort_running_requests(&mut self) {}
