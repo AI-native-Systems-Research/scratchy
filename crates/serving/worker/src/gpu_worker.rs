@@ -1915,6 +1915,18 @@ impl MetalWorker {
         .map_err(|e| ExecutorError::WorkerInit(format!("MTP chain compile: {e:?}")))?;
         self.draft_vocab_suffix = match (suffix_of, &draft_off_tape.vocab_suffix) {
             (None, None) => None,
+            // A head whose lm_head is not MLX-affine baked no kernel past its prefix: it drafts
+            // over the prefix alone, and no step drafts wide.
+            (Some(prefix), None) => {
+                if let Some(drafter) = self.mtp_drafter.as_mut() {
+                    drafter.draft_vocab = None;
+                }
+                info!(
+                    "ScratchyWorker(metal): MTP head drafts over token ids 0..{prefix} (its \
+                     lm_head has no kernel past them)"
+                );
+                None
+            }
             (Some(prefix), Some(kernels)) if kernels.suffix.prefix == prefix => {
                 let suffix = DraftVocabSuffix::new(gpu_device, &mut draft_weights, kernels)
                     .map_err(|e| {

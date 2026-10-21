@@ -7645,9 +7645,10 @@ fn metal_off_tape_tokens(
 }
 
 /// A multi-token-prediction head drafting over a prefix of its target's vocabulary — its logits
-/// `vocab_size` wide, its embedding `embed_vocab_size`: the rest of its target's lm_head
-/// (`scratchy_target_metal::off_tape::VocabSuffix`), at the widths its lm_head is quantized to.
-/// `None` for any other model.
+/// `vocab_size` wide, its embedding `embed_vocab_size` — whose lm_head is MLX-affine: the rest
+/// of its target's lm_head (`scratchy_target_metal::off_tape::VocabSuffix`), at the widths its
+/// lm_head is quantized to. `None` for any other model; a head whose lm_head is stored otherwise
+/// (a dense bf16 build) has no kernel past its prefix, and drafts over the prefix alone.
 #[cfg(feature = "metal")]
 fn metal_vocab_suffix(
     program: &Program,
@@ -7659,35 +7660,26 @@ fn metal_vocab_suffix(
         model.bounds.get("vocab_size")?,
         model.bounds.get("embed_vocab_size")?,
     );
-    (all > prefix).then(|| {
-        let stem = &model.source_stem;
-        let lm_head = lent_weight_prefix(
-            program,
-            fuf,
-            model,
-            scratchy_forward_compiler::LentWeight::LmHead,
-        )
-        .unwrap_or_else(|| {
-            panic!("`{stem}`: a head drafting over a vocabulary prefix has no lm_head")
-        });
-        let (group, bits) = (model.quantization.as_ref())
-            .and_then(|qc| {
-                crate::quantization::affine_role_widths(program, &qc.method, &lm_head, None)
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "`{stem}`: a head drafting over a vocabulary prefix reads an MLX-affine lm_head"
-                )
-            });
-        let fits = |v: u64| u32::try_from(v).expect("a vocabulary fits u32");
-        scratchy_target_metal::off_tape::VocabSuffix {
-            prefix: fits(prefix),
-            rows: fits(all - prefix),
-            hidden: fits(mc.hidden_size as u64),
-            bits,
-            group,
-            scale: mc.scale_dtype,
-        }
+    if all <= prefix {
+        return None;
+    }
+    let lm_head = lent_weight_prefix(
+        program,
+        fuf,
+        model,
+        scratchy_forward_compiler::LentWeight::LmHead,
+    )?;
+    let method = &model.quantization.as_ref()?.method;
+    let (group, bits) =
+        crate::quantization::affine_role_widths(program, method, &lm_head, None)?;
+    let fits = |v: u64| u32::try_from(v).expect("a vocabulary fits u32");
+    Some(scratchy_target_metal::off_tape::VocabSuffix {
+        prefix: fits(prefix),
+        rows: fits(all - prefix),
+        hidden: fits(mc.hidden_size as u64),
+        bits,
+        group,
+        scale: mc.scale_dtype,
     })
 }
 
