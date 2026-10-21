@@ -31,6 +31,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{Span, error, info};
 
 use crate::engine::{AsyncEngine, StreamDelta, StreamUsage};
+use crate::error::ApiJson;
 use crate::protocol;
 
 // ---------------------------------------------------------------------------
@@ -379,7 +380,7 @@ fn build_tls_config(
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<protocol::ChatCompletionRequest>,
+    ApiJson(request): ApiJson<protocol::ChatCompletionRequest>,
 ) -> Response {
     info!(
         "POST /v1/chat/completions: model={:?}, max_tokens={:?}, max_completion_tokens={:?}, stream={}",
@@ -405,7 +406,7 @@ async fn chat_completions(
 /// POST /v1/chat/completions/render
 async fn render_chat_completion(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<protocol::ChatCompletionRequest>,
+    ApiJson(request): ApiJson<protocol::ChatCompletionRequest>,
 ) -> Response {
     info!(
         "POST /v1/chat/completions/render: model={:?}",
@@ -421,7 +422,7 @@ async fn render_chat_completion(
 async fn completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<protocol::CompletionRequest>,
+    ApiJson(request): ApiJson<protocol::CompletionRequest>,
 ) -> Response {
     if request.stream {
         let include_usage = wants_usage(request.stream_options.as_ref());
@@ -442,7 +443,7 @@ async fn completions(
 /// POST /v1/embeddings
 async fn embeddings(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<protocol::EmbeddingRequest>,
+    ApiJson(request): ApiJson<protocol::EmbeddingRequest>,
 ) -> Response {
     match state.engine.embeddings(request).await {
         Ok(response) => Json(response).into_response(),
@@ -624,7 +625,7 @@ async fn server_info(
 /// POST /tokenize
 async fn tokenize(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<protocol::TokenizeRequest>,
+    ApiJson(request): ApiJson<protocol::TokenizeRequest>,
 ) -> Response {
     let tokenizer = match state.engine.tokenizer() {
         Some(t) => t,
@@ -711,7 +712,7 @@ async fn tokenize(
 /// POST /detokenize
 async fn detokenize(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<protocol::DetokenizeRequest>,
+    ApiJson(request): ApiJson<protocol::DetokenizeRequest>,
 ) -> Response {
     let tokenizer = match state.engine.tokenizer() {
         Some(t) => t,
@@ -1435,13 +1436,104 @@ mod tests {
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();
-        // Missing required field "messages" → 422
-        assert_eq!(
-            response.status(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "actual status: {}",
-            response.status()
-        );
+        // Missing required field "messages": a 400 in the OpenAI error shape, naming the field.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = error_body(response).await;
+        let message = error["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("messages"), "{error}");
+        assert_eq!(error["error"]["type"], "BadRequestError", "{error}");
+    }
+
+    /// The body of an error response, as JSON.
+    async fn error_body(response: axum::response::Response) -> serde_json::Value {
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap_or_else(|e| panic!("not JSON ({e}): {body:?}"))
+    }
+
+    /// A body past axum's body limit (2 MB by default) keeps its 413, in each API's error JSON:
+    /// "too big" stays apart from "malformed". `request_too_large` is Anthropic's own type for it.
+    #[tokio::test]
+    async fn a_body_past_the_limit_is_a_413_in_the_apis_error_shape() {
+        let big = "x".repeat(3 << 20);
+        let send = |uri: &str, body: String| {
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            async move {
+                let response = build_router(make_test_state())
+                    .oneshot(request)
+                    .await
+                    .unwrap();
+                (response.status(), error_body(response).await)
+            }
+        };
+        let chat = format!(r#"{{"messages": [{{"role": "user", "content": "{big}"}}]}}"#);
+        let (status, error) = send("/v1/chat/completions", chat).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
+        assert_eq!(error["error"]["type"], "RequestTooLargeError", "{error}");
+
+        let messages =
+            format!(r#"{{"max_tokens": 8, "messages": [{{"role": "user", "content": "{big}"}}]}}"#);
+        let (status, error) = send("/v1/messages", messages).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
+        assert_eq!(error["type"], "error", "{error}");
+        assert_eq!(error["error"]["type"], "request_too_large", "{error}");
+    }
+
+    /// A body an endpoint can't read is a 400 in that API's error JSON, as the upstream APIs answer
+    /// it, not axum's plain-text 422 (#787): `/v1/responses` in the OpenAI shape, `/v1/messages`
+    /// in Anthropic's. `/v1/messages` answers the engine's own refusals in Anthropic's shape too.
+    #[tokio::test]
+    async fn an_unreadable_body_is_a_400_in_the_apis_error_shape() {
+        let post = |uri: &str, body: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let send = |request: Request<Body>| async move {
+            let response = build_router(make_test_state())
+                .oneshot(request)
+                .await
+                .unwrap();
+            (response.status(), error_body(response).await)
+        };
+
+        let responses = r#"{"input": "Hi", "tool_choice": "requried"}"#;
+        let (status, error) = send(post("/v1/responses", responses)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let message = error["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("tool_choice"), "{error}");
+
+        let anthropic_error = |error: &serde_json::Value| {
+            assert_eq!(error["type"], "error", "{error}");
+            assert_eq!(error["error"]["type"], "invalid_request_error", "{error}");
+            error["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let messages = r#"{"max_tokens": 8, "messages": [{"role": "user", "content": "Hi"}],
+                           "tool_choice": {"type": "mystery"}}"#;
+        let (status, error) = send(post("/v1/messages", messages)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(anthropic_error(&error).contains("tool_choice"), "{error}");
+
+        let (status, error) = send(post("/v1/messages", "{invalid")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        anthropic_error(&error);
+
+        let undeclared = r#"{"max_tokens": 8, "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "Raed"}}"#;
+        let (status, error) = send(post("/v1/messages", undeclared)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(anthropic_error(&error).contains("Raed"), "{error}");
     }
 
     #[tokio::test]
@@ -1996,7 +2088,7 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(
             response.status(),
-            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::BAD_REQUEST,
             "actual status: {}",
             response.status()
         );

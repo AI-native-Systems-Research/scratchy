@@ -22,6 +22,7 @@ use uuid::Uuid;
 use scratchy_core_common::FinishReason;
 
 use crate::engine::StreamDelta;
+use crate::error::ApiJson;
 use crate::protocol;
 use crate::server::AppState;
 
@@ -517,7 +518,7 @@ fn convert_response(
 /// POST /v1/responses — OpenAI Responses API.
 pub async fn responses(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<ResponsesRequest>,
+    ApiJson(request): ApiJson<ResponsesRequest>,
 ) -> Response {
     info!(
         "POST /v1/responses: model={:?}, stream={}",
