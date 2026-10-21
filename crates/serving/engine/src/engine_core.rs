@@ -666,11 +666,14 @@ impl EngineCore {
 
     /// A step the executor failed: it is never finalized, so it leads no more, and its requests
     /// are aborted — none has the output the step owed it, and left running, the next step (or
-    /// the next caller's) would drive them on.
-    pub fn abandon_step(&mut self, sched: &SchedulerOutput) {
+    /// the next caller's) would drive them on. The KV it was to write is no prefix-cache hit
+    /// ([`Scheduler::forget_unwritten`]), and a request a step behind it admitted onto that KV is
+    /// aborted with them. Returns every request aborted.
+    pub fn abandon_step(&mut self, sched: &SchedulerOutput) -> Vec<String> {
         self.end_lead(sched);
-        let req_ids: Vec<String> = sched.num_scheduled_tokens.keys().cloned().collect();
+        let req_ids = self.scheduler.forget_unwritten(sched);
         self.abort_requests(&req_ids);
+        req_ids
     }
 
     /// A step done — finalized or failed: the step behind it waits on it no more.
