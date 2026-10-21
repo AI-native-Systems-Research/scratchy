@@ -6,17 +6,20 @@
 //!
 //! This is the rung ABOVE the door: `triton-numeric` stops before the SuperDSC descriptor
 //! emission (the case row's door kind is `None` and says why), so a green result here states
-//! that the KERNEL'S ARITHMETIC -- two online passes, the equality mask, the fp32 ramp, the
-//! index cast -- computes the right FUNCTION on the device model. It does not state that the
-//! descriptors address it right; that is the next rung's gate.
+//! that the KERNEL'S ARITHMETIC -- the three whole-row maxima, the two equality masks, the
+//! two staged ramps, the fp32-island combine, the index cast -- computes the right FUNCTION
+//! on the device model. It does not state that the descriptors address it right; that is the
+//! next rung's gate.
 //!
 //! # WHAT THE COMPARISON IS: EXACT, AND WHY THAT IS HONEST HERE
 //!
 //! Every other configuration in this crate compares under a DERIVED ROUNDING ENVELOPE because
 //! its output is an f16 tile produced by f16 arithmetic. This kernel's output is an i32 INDEX,
-//! and the index is exact by construction: the running maxima combine real f16 values with no
-//! arithmetic beyond `maximum`, the equality mask is exact, and the ramp/index math runs in fp32
-//! where every integer below 2^24 is exact -- 49155 is. So the bound is ZERO, stated as
+//! and the index is exact by construction: the whole-row maxima combine real f16 values with
+//! no arithmetic beyond `maximum`, both equality masks are exact, the two-level ramp products
+//! stay in the fp16-exact small-integer range (block < 1024, lane < 64), and the one wide
+//! integer (`b·64 + l`, reaching 49154) rides the fp32 island where every integer below 2^24
+//! is exact. So the bound is ZERO, stated as
 //! equality, and [`Comparison`] is not used: an envelope's ratio machinery over a zero bound
 //! reports `inf` or `0` and nothing in between, which would dress an exact comparison as a
 //! rounded one. `max|err| = 0` over all 64 lanes is the claim, and every lane is asserted.
@@ -25,13 +28,15 @@
 //!
 //! `make_range.rs` states the law this file follows: a comparison that cannot fail proves
 //! nothing, and for an exact comparison the failing control is a DIFFERING ANSWER, not a
-//! bracket. The stimulus carries a real tie (lanes 100 and 5000 share the row's maximum), so:
+//! bracket. The stimulus carries real ties: the generator PINS lanes 100 and 5000 at the
+//! row's maximum, and the fp16 randn row ties NATURALLY beyond them (an fp16 tail is coarse
+//! enough that the maximum of 49k standard normals is attained by several lanes), so:
 //!
-//! 1. **The last-max control**: the LAST maximal index of the same bytes is 5000, not 100 --
-//!    computed here from the stimulus itself, not restated. An implementation that breaks the
-//!    tie the wrong way answers 5000 and the exact comparison sees it. Without the tie the two
-//!    answers would coincide and no tie-break defect would be visible; the control proves the
-//!    stimulus discriminates.
+//! 1. **The last-max control**: the LAST maximal index of the same bytes is computed here
+//!    from the stimulus itself, not restated -- 36885 against the current seed, not 100. An
+//!    implementation that breaks the tie the wrong way answers the last index and the exact
+//!    comparison sees it. Without ties the two answers would coincide and no tie-break defect
+//!    would be visible; the control proves the stimulus discriminates.
 //! 2. **The lane-uniformity claim is asserted, not assumed**: every lane of the [64] i32 stick
 //!    must hold the same index. The kernel computes one vector and stores it whole; a lane that
 //!    disagrees is a stick-addressing defect the single-lane reference cannot see on its own.

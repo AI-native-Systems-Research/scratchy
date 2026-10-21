@@ -177,8 +177,9 @@ def _attn_ce_1tile():
 
 def _argmax_ce():
     # A copy of the `argmax` row in `triton-ktir-superdsc/src/cases.rs` (the authority).
-    # PAD_V is the host-side -inf padding of the vocab row to a whole stick.
-    return {"V": 49155, "PAD_V": 49216, "BLOCK": 64}
+    # PAD_V is the host-side -inf padding of the vocab row to a whole power-of-two row
+    # (the descriptor block's law); NB is the two-level split's block count.
+    return {"V": 49155, "PAD_V": 65536, "NB": 1024, "BLOCK": 64}
 
 
 CONFIGS = {
@@ -561,19 +562,19 @@ def _mul_scale_inputs(mod, ce):
 
 
 def _argmax_inputs(mod, ce):
-    row = mod.inputs(seed=SEED)
+    row, bramp, lramp = mod.inputs(seed=SEED)
     ref = mod.reference(row)
     # THE OUTPUT IS ONE i32 LANE, not an fp16 tile: this is the first config whose
     # reference is an INDEX (the gather ingestion dtype), so `out_dtype` below is
     # "i32" and the ref dump does NOT pass through the fp16 truncation every other
     # config takes. A 49k index does not survive fp16 (exact integers stop at 2048),
-    # which is the same law the kernel's i32 index arithmetic states.
-    # THE RAMP TABLE is the second host obligation (strictly decreasing, V - i on
-    # the real lanes, 0 on the pad lanes) -- constant across steps, staged once.
-    v, pad_v = ce["V"], ce["PAD_V"]
-    ramp = torch.tensor([v - i if i < v else 0 for i in range(pad_v)],
-                        dtype=torch.int32)
-    ins = [("logits_ptr", row, "f16"), ("ramp_ptr", ramp, "i32"),
+    # which is the same law the kernel's fp32-island combine routes around.
+    # THE TWO RAMPS are the host obligations (strictly decreasing per level, 0 on the
+    # pad lanes) -- constants across steps, staged once. Both ride fp16: every lane
+    # value stays under 2048 (the docstring's two-level law -- a single V - i ramp
+    # would need 49155 in a lane).
+    ins = [("logits_ptr", row, "f16"), ("bramp_ptr", bramp, "f16"),
+           ("lramp_ptr", lramp, "f16"),
            ("idx_ptr", torch.zeros(64, dtype=torch.int32), "i32")]
     note = (
         f"THE STIMULUS CARRIES A REAL TIE: lanes 100 and 5000 both hold the row's "

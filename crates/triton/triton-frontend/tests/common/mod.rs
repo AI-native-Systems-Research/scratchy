@@ -236,19 +236,23 @@ pub fn expert_slab() -> Case {
 
 /// `argmax_first_max.py`'s signature: the solo greedy decode step's vocab scan. The idx
 /// output is `*i32` (the gather ingestion dtype); `PAD_V` is the vocab padded to a whole
-/// stick with -inf lanes, a HOST obligation the fixture's docstring states.
+/// power-of-two row with -inf lanes and the two fp16 ramps staged, HOST obligations the
+/// fixture's docstring states.
 const ARGMAX: &[(&str, &str)] = &[
     ("logits_ptr", "*fp16"),
-    ("ramp_ptr", "*i32"),
+    ("bramp_ptr", "*fp16"),
+    ("lramp_ptr", "*fp16"),
     ("idx_ptr", "*i32"),
     ("V", "constexpr"),
     ("PAD_V", "constexpr"),
+    ("NB", "constexpr"),
     ("BLOCK", "constexpr"),
 ];
 
 /// The one argmax configuration, matching `cases.rs`' `argmax_first_max` row: granite-3.1's
-/// vocab 49155 (deliberately NOT a multiple of 64, so `PAD_V`'s 5 pad lanes are real), the
-/// one-stick reduce width.
+/// vocab 49155 (deliberately NOT a multiple of 64, so the pad lanes are real), the
+/// power-of-two padded row (the descriptor block's law), and the two-level split's block
+/// count NB = PAD_V / BLOCK.
 pub fn argmax_first_max() -> Case {
     build(
         "argmax_first_max",
@@ -257,7 +261,8 @@ pub fn argmax_first_max() -> Case {
         ARGMAX,
         &[
             ("V", Val::Int(49155)),
-            ("PAD_V", Val::Int(49216)),
+            ("PAD_V", Val::Int(65536)),
+            ("NB", Val::Int(1024)),
             ("BLOCK", Val::Int(64)),
         ],
     )

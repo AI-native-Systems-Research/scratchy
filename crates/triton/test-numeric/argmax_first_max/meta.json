@@ -9,7 +9,8 @@
   "generated_by": "test/numeric/gen_numeric_data.py",
   "constexprs": {
     "V": 49155,
-    "PAD_V": 49216,
+    "PAD_V": 65536,
+    "NB": 1024,
     "BLOCK": 64
   },
   "grid": [
@@ -20,17 +21,25 @@
       "arg": "logits_ptr",
       "file": "in_logits_ptr.bin",
       "shape": [
-        49216
+        65536
       ],
       "dtype": "f16"
     },
     {
-      "arg": "ramp_ptr",
-      "file": "in_ramp_ptr.bin",
+      "arg": "bramp_ptr",
+      "file": "in_bramp_ptr.bin",
       "shape": [
-        49216
+        65536
       ],
-      "dtype": "i32"
+      "dtype": "f16"
+    },
+    {
+      "arg": "lramp_ptr",
+      "file": "in_lramp_ptr.bin",
+      "shape": [
+        65536
+      ],
+      "dtype": "f16"
     },
     {
       "arg": "idx_ptr",

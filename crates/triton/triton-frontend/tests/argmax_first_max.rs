@@ -11,23 +11,34 @@
 //!
 //! THE ALGORITHM'S OP FOOTPRINT, pinned (see the fixture's docstring for the arithmetic):
 //!
-//!   * `tt.reduce` × 4 — the two passes' per-stick maxima (pass 1 fp16 over logits,
-//!     pass 2 i32 over `w`), each within ONE stick (the reduce-MAX single-stick law);
-//!   * `arith.cmpf` — the equality mask;
-//!   * `arith.extui` — the mask's i1 → i32 widening (the index math is INTEGER: fp16
-//!     exact integers stop at 2048 and the device's f16 legalization refuses genuine
-//!     f32 compute, so the ramp product runs in i32 lanes — exact at any vocab width);
-//!   * `arith.muli` — mask × ramp (the ramp itself is LOADED from the staged table, the
-//!     attention-mask precedent: no fixture adds a runtime scalar to an arange);
-//!   * `arith.maxsi` — the integer running combine (and the reduce region's combiner);
-//!   * `arith.subi` — the final `V - j`;
-//!   * `tt.expand_dims`/`tt.broadcast` — the explicit [1] <-> [1, BLOCK] seams (the golden
+//!   * `tt.reduce` × 3 — the whole-row maxima: the global max `m`, the first-block
+//!     combine `jA`, the first-lane combine `jB`. Each is the golden rank-2 → rank-1
+//!     reduce over the [1, PAD_V] tile's second axis, and the WHOLE ROW IS ONE TILE
+//!     (the rmsnorm whole-row block), so there is NO per-stick loop to unroll — the
+//!     program the door receives is STRAIGHT-LINE, ~15 ops, which is the door-lowerable
+//!     form (a per-stick-loop kernel would splice to ~2300 trips);
+//!   * `arith.maxnumf`/`arith.truncf` — each f16 reduce runs in f32 (upstream's own
+//!     promotion) and narrows straight back, moe.py's spelling; the max of f16 values
+//!     is exactly representable, so the round trip is exact;
+//!   * `arith.cmpf` × 2 — the equality mask `(x == m)` and the block one-hot
+//!     `(bramp == jA)`;
+//!   * `arith.uitofp` × 2 — the i1 masks' → f16 widening (the 0/1 selectands);
+//!   * `arith.mulf` — `mask · bramp`, `mask · sel · lramp`, and the unit-dim `ones`
+//!     broadcasts of the [1] answers to the [1, BLOCK] output stick;
+//!   * `arith.subf` × 2 — `NB - jA` and `BLOCK - jB` (the two-level decode);
+//!   * `arith.extf`/`arith.addf`/`arith.fptosi` — the ONE fp32 island: the final
+//!     `b·64 + l` reaches 49154 (past fp16's exact range), so it widens,
+//!     multiply-adds in f32 (exact below 2^24), and casts to i32 — moe.py's gelu
+//!     island and the KSPLIT pair's own device recipe;
+//!   * `tt.descriptor_load` × 3 / `tt.descriptor_store` — the row and the two staged
+//!     ramps in, the i32 stick out;
+//!   * `tt.expand_dims`/`tt.broadcast` — the [1] → [1,1] → [1, BLOCK] seams (the golden
 //!     shapes: rank-2 tiles, rank-1 reduce results, no scalar anywhere, so no
-//!     reduce-to-scalar and no splat of an interior value exists in the kernel);
-//!   * `tt.descriptor_load`/`tt.descriptor_store` — the row and ramp in, the i32 stick out.
+//!     reduce-to-scalar and no splat of an interior value exists in the kernel).
 //!
-//! WHAT MUST NOT BE PRESENT: any op whose existence is argmax-specific. The whole point of
-//! the ladder form is that every op above is the same op `rmsnorm`/`attention`/`moe` use.
+//! WHAT MUST NOT BE PRESENT: any op whose existence is argmax-specific, any `scf.for`
+//! (the straight-line law above), and any `tt.splat`. The whole point of the ladder
+//! form is that every op above is the same op `rmsnorm`/`attention`/`moe` use.
 
 mod common;
 
@@ -88,35 +99,51 @@ fn argmax_first_max_compiles_and_states_the_algorithm_in_generic_ops() {
     eprintln!("argmax_first_max op census: {census:?}");
     eprintln!("argmax_first_max op sequence: {ops:?}");
 
-    // Every link of the algorithm, as the generic op that carries it. One `tt.reduce`
-    // PER LOOP BODY: pass 1's fp16 max over the logits, pass 2's i32 max over `w`.
+    // Every link of the algorithm, as the generic op that carries it. THREE whole-row
+    // reduces: the global max, the first-block combine, the first-lane combine.
+    assert!(count(&ops, "tt.reduce") >= 3, "the three whole-row maxima");
     assert!(
-        count(&ops, "tt.reduce") >= 2,
-        "the two passes' per-stick maxima"
+        count(&ops, "arith.maxnumf") >= 3,
+        "the reduces' f32 combine (the promotion)"
     );
-    assert!(count(&ops, "arith.cmpf") >= 1, "the equality mask");
     assert!(
-        count(&ops, "arith.extui") >= 1,
-        "the mask's i1 -> i32 widening"
+        count(&ops, "arith.truncf") >= 3,
+        "the reduces' narrow back to f16"
     );
-    assert!(count(&ops, "arith.muli") >= 1, "mask * ramp");
     assert!(
-        count(&ops, "arith.maxsi") >= 1,
-        "the integer running combine"
+        count(&ops, "arith.extf") >= 3,
+        "the widens: reduce operands + the fp32 island"
     );
-    assert!(count(&ops, "arith.subi") >= 1, "V - j");
+    assert!(count(&ops, "arith.cmpf") >= 2, "the two equality masks");
+    assert!(
+        count(&ops, "arith.uitofp") >= 2,
+        "the masks' i1 -> f16 widening"
+    );
+    assert!(
+        count(&ops, "arith.mulf") >= 4,
+        "mask * ramp and the ones broadcasts"
+    );
+    assert!(
+        count(&ops, "arith.subf") >= 2,
+        "NB - jA and BLOCK - jB (the two-level decode)"
+    );
+    assert!(count(&ops, "arith.addf") >= 1, "the island's b*64 + l");
+    assert!(
+        count(&ops, "arith.fptosi") >= 1,
+        "the island's f32 -> i32 cast"
+    );
     assert!(
         count(&ops, "tt.descriptor_load") >= 3,
-        "the row loads (x twice, ramp once)"
+        "the row loads (x, bramp, lramp)"
     );
     assert!(
         count(&ops, "tt.descriptor_store") >= 1,
         "the i32 stick store"
     );
-    assert!(count(&ops, "tt.expand_dims") >= 2, "the [1] -> [1,1] seams");
+    assert!(count(&ops, "tt.expand_dims") >= 3, "the [1] -> [1,1] seams");
     assert!(
-        count(&ops, "tt.broadcast") >= 2,
-        "the [1,1] -> [1,BLOCK] seams"
+        count(&ops, "tt.broadcast") >= 3,
+        "the [1,1] -> [1,BLOCK]/[1,PAD_V] seams"
     );
     // AND NO SCALAR REDUCE / INTERIOR SPLAT: the shapes are the golden forms, so a scalar
     // sneaking back in (a reduce-to-scalar, a splat of an interior value) is a lowering
@@ -127,10 +154,12 @@ fn argmax_first_max_compiles_and_states_the_algorithm_in_generic_ops() {
          splat of an interior value -- the form to_ktir refuses by design"
     );
 
-    // And the loops that carry the two passes (static trip counts).
+    // AND STRAIGHT-LINE, NO LOOPS: the whole row is one tile, so no scf.for exists to
+    // unroll -- the door receives ~15 generic ops, not ~2300 spliced trips. A loop
+    // sneaking back in is the unroll bomb the door cannot afford.
     assert!(
-        count(&ops, "scf.for") >= 2,
-        "the two passes' loops -- got {} scf.for",
-        count(&ops, "scf.for")
+        !ops.iter().any(|o| o == "scf.for"),
+        "an scf.for survived: the kernel states whole-row tiles, so a loop is a lowering \
+         regression -- and the trip-unroll would splice it into thousands of descriptors"
     );
 }

@@ -744,31 +744,40 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Option<Program>)> {
         "attention_banded_fold" => (banded_attn_spec(1), vec![1, 8, 4], Some(Program::Attn)),
         "attention_banded_batch" => (banded_attn_spec(2), vec![2, 8, 4], Some(Program::Attn)),
         // ⭐ THE LADDER FORM OF THE GREEDY SAMPLER (#603/#500, #714's nuke ruling): the vocab
-        // scan as ONE Triton kernel stated in generic ops -- per-stick `tt.reduce` maxima,
-        // elementwise running combines, a `tt.make_range` ramp, compare, widen, cast, all inside
-        // two `scf.for` passes. FIRST-max by arithmetic (the ramp's monotonicity), fp32 index
-        // math, one program over the solo decode step's [PAD_V] row. See the fixture's own
-        // docstring for the full algorithm and host contract.
+        // scan as ONE Triton kernel stated in generic ops -- the whole padded row as ONE
+        // descriptor tile (rmsnorm's whole-row block), three whole-row `tt.reduce` maxima,
+        // two equality masks, the two staged fp16 ramps (first-block then first-lane, the
+        // two-level split that keeps every lane value fp16-exact below 2048), and ONE fp32
+        // island for the final `b*64 + l`. FIRST-max by arithmetic (the ramps'
+        // monotonicity), STRAIGHT-LINE (no loops at all -- the door receives ~15 generic
+        // ops, not a spliced trip bomb), one program over the solo decode step's [PAD_V]
+        // row. See the fixture's own docstring for the full algorithm and host contract.
         //
-        // ⛔ THE DOOR KIND IS `None` AND THAT IS THE HONEST STATE: no `Program` variant names a
-        // multi-pass scan, and adding `Program::Argmax` would put an algorithm name in the
-        // compiler -- the exact hack the ladder law deletes. The NUMERIC legs run on this row
+        // ⛔ THE DOOR KIND IS `None` AND THAT IS THE HONEST STATE: no `Program` variant
+        // covers the SFP op vocabulary this kernel needs (`Max` reduce, `Equal`, `Multiply`,
+        // the fp32-convert island, `Fp32ToInt32`), and adding `Program::Argmax` would put an
+        // algorithm name in the compiler -- the exact hack the ladder law deletes. The
+        // NUMERIC legs run on this row
         // today (`.py` → TTIR → KTIR → the ktir emulator, against the fixture's own torch
         // reference with a deliberate tie at lanes 100/5000 pinning first-max); the door
-        // consumers (`bake_py`, the emit tests) refuse it by name until the generic loop/scan
-        // lowering exists.
+        // consumers (`bake_py`, the emit tests) refuse it by name until that generic per-op
+        // door arm exists. (⛔ NOT the vendor topk pair: `topk.ddl`'s ripple keeps the LAST
+        // index among equals -- `GREATERTHAN(running, candidate)` with an equal candidate
+        // displacing -- so `topkindex` at k=1 is LAST-max and cannot serve #631's law.)
         "argmax_first_max" => (
             spec(
                 "argmax_first_max",
                 "argmax_first_max_kernel",
                 &[
                     ("logits_ptr", "*fp16"),
-                    ("ramp_ptr", "*i32"),
+                    ("bramp_ptr", "*fp16"),
+                    ("lramp_ptr", "*fp16"),
                     ("idx_ptr", "*i32"),
                 ],
                 &[
                     ("V", Val::Int(49155)),
-                    ("PAD_V", Val::Int(49216)),
+                    ("PAD_V", Val::Int(65536)),
+                    ("NB", Val::Int(1024)),
                     ("BLOCK", Val::Int(64)),
                 ],
             ),
