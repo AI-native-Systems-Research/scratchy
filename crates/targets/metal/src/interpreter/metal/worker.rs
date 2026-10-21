@@ -66,14 +66,14 @@ impl Activation {
 }
 
 /// What a pool's worker maps as its buckets reach it ([`SparseBuffer`]) rather than allocating in
-/// full: each bucket's bytes in each arena slot, in bucket order (`MetalBucketSpec::arena_bytes`),
+/// full: each bucket's bytes in each arena slot, in bucket order (`MetalBucketSpec::slot_bytes`),
 /// and the slots the host reads by pointer, which stay allocated in full and shared — every
 /// bucket's backbone hidden states (a forward's `hidden_out` rows; an encoder's output, which is
 /// its terminal slot too) and, where the pool's owner reads its logits on the host, every terminal
 /// slot ([`TerminalReads`]). A guest's host reads none ([`ArenaShare::In`]).
 #[derive(Clone, Default)]
 pub struct SparsePlan {
-    pub bucket_arena: Vec<&'static [u64]>,
+    pub bucket_arena: Vec<Vec<u64>>,
     pub host_slots: Vec<u32>,
 }
 
@@ -876,7 +876,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     "SparsePlan: one arena table per bucket tape"
                 );
                 let arena_needs = |slot: usize| -> Vec<usize> {
-                    let bytes = |t: &&[u64]| t.get(slot).copied().unwrap_or(0) as usize;
+                    let bytes = |t: &Vec<u64>| t.get(slot).copied().unwrap_or(0) as usize;
                     plan.bucket_arena.iter().map(bytes).collect()
                 };
                 let scratch_needs = |kind: ScratchKind| -> Vec<usize> {
@@ -1150,19 +1150,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
         bucket: usize,
         num_tokens: u32,
         num_seqs: u32,
-        has_spec_tokens: bool,
+        sampled_rows: u32,
         reads: super::ForwardReads,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
     ) -> Result<(), WorkerError> {
-        self.run_bucket_mtl4_inner(
-            bucket,
-            num_tokens,
-            num_seqs,
-            has_spec_tokens,
-            reads,
-            enc,
-            None,
-        )
+        self.run_bucket_mtl4_inner(bucket, num_tokens, num_seqs, sampled_rows, reads, enc, None)
     }
 
     /// Activation-dump replay segment: encode only the flat dispatch
@@ -1176,7 +1168,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         bucket: usize,
         num_tokens: u32,
         num_seqs: u32,
-        has_spec_tokens: bool,
+        sampled_rows: u32,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         range: std::ops::Range<usize>,
     ) -> Result<(), WorkerError> {
@@ -1184,7 +1176,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             bucket,
             num_tokens,
             num_seqs,
-            has_spec_tokens,
+            sampled_rows,
             super::ForwardReads::Outputs,
             enc,
             Some(range),
@@ -1196,7 +1188,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         bucket: usize,
         num_tokens: u32,
         num_seqs: u32,
-        has_spec_tokens: bool,
+        sampled_rows: u32,
         reads: super::ForwardReads,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         range: Option<std::ops::Range<usize>>,
@@ -1243,7 +1235,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         let facts = StepFacts {
             num_tokens,
             num_seqs,
-            has_spec_tokens,
+            sampled_rows,
             unrotated_blocks: self
                 .unrotated_blocks
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -1291,9 +1283,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     }
                 }
                 if !gate_matches(*gate, facts) {
-                    // Skipped: e.g. the lm_head slice's gather/qmv/scatter
-                    // (`OnlyIfNoSpec`) on a spec-decode verify step, or
-                    // its M=bucket_m fallback (`OnlyIfSpec`) on any other.
+                    // Skipped: e.g. the lm_head slice (`UnlessEveryRowSampled`)
+                    // on a step that samples every row, or the every-row
+                    // lm_head (`OnlyIfEveryRowSampled`) on any other.
                     // Either way the timestamp slot, barrier, and
                     // dispatch are skipped together so the kernel
                     // doesn't run with stale per-dispatch state.
@@ -1329,12 +1321,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         visibility,
                     );
                 }
-                let tg_scaled = scale_tg_for_num_tokens(
-                    *tg,
-                    *scaling,
-                    super::ids::NumTokens(num_tokens),
-                    num_seqs,
-                );
+                let tg_scaled = scale_tg_for_num_tokens(*tg, *scaling, facts);
                 // TurboQuant full-context staging: the baked grid is a
                 // placeholder; the kernel needs (max_blocks, num_kv_heads,
                 // num_seqs) — block-table-driven, with early-exit past
@@ -1968,66 +1955,31 @@ fn resolve_bindings(
     Ok(out)
 }
 
-/// Rewrite the m-axis of a baked threadgroup grid to match the
-/// actual `num_tokens` of this forward, instead of the bucket_m the
-/// grid was baked against.
+/// Evaluate a per-dispatch [`RuntimeGate`] against the step being encoded: `true` when the
+/// dispatch fires, `false` when it is skipped. `gate == None` (the common case) always fires.
 ///
-/// `scaling = None` means the kernel's grid doesn't scale with M
-/// (or the lowering pass hasn't yet been taught to emit a scaling
-/// hint for it) — return the baked grid unchanged. When `scaling =
-/// Some(MScaling { axis, tile })`, replace `tg.{axis}` with
-/// `num_tokens.div_ceil(tile)`, clamped so we never grow above the
-/// baked value (guards against `num_tokens > bucket_m`, which the
-/// bucket picker already rules out but defense-in-depth).
-/// Evaluate a per-dispatch [`RuntimeGate`] against the live
-/// `num_seqs` of this forward (= `cu_seqlens_q.len() - 1`).
-/// Returns `true` when the dispatch should fire, `false` when it
-/// should be skipped. `gate == None` (the common case) always
-/// fires.
-///
-/// `OnlyIfNoSpec` fires when there's exactly one sequence in
-/// the bucket — either pure single-seq prefill or a one-token
-/// decode forward. The lm_head slice's gather/qmv/scatter trio is
-/// gated this way.
-///
-/// `OnlyIfSpec` fires on a spec-decode verify step, and on a
-/// decode-only step (every sequence one token). The
-/// full-`M=bucket_m` lm_head fallback is gated this way so the
-/// slice's per-seq-incorrect logits get overwritten with a
-/// correct multi-row GEMM result — and so a decode-only step,
-/// where the slice is off, still computes logits at all.
+/// The lm_head pair splits on whether the step samples every row it runs. A decode step, or a
+/// speculative verify step of drafting sequences alone, does (`OnlyIfEveryRowSampled`): the
+/// lm_head over every row leaves the sampled rows' logits in order, and slicing would only add
+/// launches — gating the slice on at every multi-sequence step regressed c=4 TPOT by +5% on
+/// Llama-1B. A prefill chunk or a mixed batch does not (`UnlessEveryRowSampled`): the slice, or
+/// the compaction. The pair is exhaustive by construction: a decode step that ran neither left
+/// the logits slot's stale contents for the argmax, and every row froze on its first token
+/// (issue #361).
 pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) -> bool {
     let StepFacts {
         num_tokens,
         num_seqs,
-        has_spec_tokens,
+        sampled_rows,
         unrotated_blocks,
         gdn_plain,
         gdn_plain_rows,
     } = step;
-    // lm_head slice (`OnlyIfNoSpec`) fires only when there are EXTRA
-    // tokens to drop (prefill / chunked-prefill / mixed batches);
-    // steady-state decode has `num_tokens == num_seqs` and slicing
-    // would just add 2 kernel launches with no GEMM-work savings
-    // (qmv at M=num_seqs == qmm at M=num_seqs). Verified: gating
-    // unconditionally on multi-seq regressed c=4 TPOT by +5% on
-    // Llama-1B; gating on `num_tokens > num_seqs` keeps the prefill
-    // win without hurting decode.
-    //
-    // That carve-out hands decode-only steps to the full-M fallback
-    // (`OnlyIfSpec`), which must therefore fire there too: the pair
-    // is exhaustive by construction, and before it was, a decode-only
-    // step in a bucket whose lm_head lowers to one `qmm_t` (the slice
-    // band, `bucket_m ≥ vector_limit`) ran NO lm_head command at all —
-    // the argmax re-read the logits slot's stale contents and every
-    // row froze on its first token (issue #361).
     let decode_step = num_tokens == num_seqs;
     match gate {
         None => true,
-        Some(super::lowered::RuntimeGate::OnlyIfNoSpec) => {
-            !has_spec_tokens && num_tokens > num_seqs
-        }
-        Some(super::lowered::RuntimeGate::OnlyIfSpec) => has_spec_tokens || decode_step,
+        Some(super::lowered::RuntimeGate::UnlessEveryRowSampled) => sampled_rows < num_tokens,
+        Some(super::lowered::RuntimeGate::OnlyIfEveryRowSampled) => sampled_rows >= num_tokens,
         Some(super::lowered::RuntimeGate::OnlyIfDecodeStep) => decode_step,
         Some(super::lowered::RuntimeGate::UnlessDecodeStep) => !decode_step,
         Some(super::lowered::RuntimeGate::OnlyIfSmallMTokens) => {
@@ -2057,7 +2009,9 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
 pub struct StepFacts {
     pub num_tokens: u32,
     pub num_seqs: u32,
-    pub has_spec_tokens: bool,
+    /// The rows the step samples (its `SampleIndices`' length): one a sequence, every row of a
+    /// sequence verifying drafts.
+    pub sampled_rows: u32,
     /// Some sequence's block table has an unrotated (bit-31, span) block.
     pub unrotated_blocks: bool,
     /// Every sequence's Gated-DeltaNet step is plain: no replay, no records.
@@ -2066,17 +2020,28 @@ pub struct StepFacts {
     pub gdn_plain_rows: bool,
 }
 
+/// Rewrite the m-axis of a baked threadgroup grid to match the
+/// actual `num_tokens` of this forward, instead of the bucket_m the
+/// grid was baked against.
+///
+/// `scaling = None` means the kernel's grid doesn't scale with M
+/// (or the lowering pass hasn't yet been taught to emit a scaling
+/// hint for it) — return the baked grid unchanged. When `scaling =
+/// Some(MScaling { axis, tile })`, replace `tg.{axis}` with
+/// `num_tokens.div_ceil(tile)`, clamped so we never grow above the
+/// baked value (guards against `num_tokens > bucket_m`, which the
+/// bucket picker already rules out but defense-in-depth). Its
+/// `set_axis`, if any, is then SET to the live count it names.
 fn scale_tg_for_num_tokens(
     mut tg: MTLSize,
     scaling: Option<super::lowered::MScaling>,
-    num_tokens: super::ids::NumTokens,
-    num_seqs: u32,
+    step: StepFacts,
 ) -> MTLSize {
     let Some(s) = scaling else {
         return tg;
     };
     let bm = s.bucket_m.get().max(1) as u64;
-    let n = (num_tokens.get().max(1) as u64).min(bm);
+    let n = (step.num_tokens.max(1) as u64).min(bm);
     let slot = match s.axis {
         super::lowered::MScaleAxis::X => &mut tg.width,
         super::lowered::MScaleAxis::Y => &mut tg.height,
@@ -2088,18 +2053,19 @@ fn scale_tg_for_num_tokens(
     let baseline = *slot as u64;
     let scaled = baseline.saturating_mul(n).div_ceil(bm);
     *slot = scaled as usize;
-    // `seq_axis`: SET (not scale) the chosen axis to the live num_seqs.
-    // The steel paged prefill kernel needs one grid-Z layer per sequence
-    // (`tid.z = seq_idx`) so a BQ-block tile never straddles a sequence
-    // boundary; over-dispatched (seq, q-block) pairs early-out in the
-    // kernel. See `MScaling::seq_axis`.
-    if let Some(seq_ax) = s.seq_axis {
-        let seq_slot = match seq_ax {
+    // `set_axis`: SET (not scale) the chosen axis to the live count (`SetAxis`).
+    let set = match s.set_axis {
+        Some(super::lowered::SetAxis::Seqs(axis)) => Some((axis, step.num_seqs)),
+        Some(super::lowered::SetAxis::SampledRows(axis)) => Some((axis, step.sampled_rows)),
+        None => None,
+    };
+    if let Some((axis, count)) = set {
+        let slot = match axis {
             super::lowered::MScaleAxis::X => &mut tg.width,
             super::lowered::MScaleAxis::Y => &mut tg.height,
             super::lowered::MScaleAxis::Z => &mut tg.depth,
         };
-        *seq_slot = num_seqs.max(1) as usize;
+        *slot = count.max(1) as usize;
     }
     tg
 }
@@ -2203,7 +2169,7 @@ mod tests {
         let step = |num_tokens, num_seqs, unrotated_blocks| StepFacts {
             num_tokens,
             num_seqs,
-            has_spec_tokens: false,
+            sampled_rows: num_seqs,
             unrotated_blocks,
             gdn_plain: true,
             gdn_plain_rows: true,
@@ -2275,86 +2241,60 @@ mod tests {
             "a decode step"
         );
         // The lm_head pair is exhaustive — no step runs neither, no step runs
-        // both — and each side takes the steps it is for: the slice the
-        // prefill-shaped steps, the full-M fallback the spec verifies and the
-        // decode-only steps. Issue #361: before the fallback took decode-only
-        // steps, a decode step in a bucket whose lm_head lowers to one `qmm_t`
-        // (the slice band, `bucket_m ≥ vector_limit`) ran no lm_head at all —
-        // the argmax re-read the logits slot's stale contents and every row
-        // froze on its first token.
-        use super::super::lowered::RuntimeGate::{OnlyIfNoSpec, OnlyIfSpec};
-        for has_spec in [false, true] {
-            for (tokens, seqs) in [
-                (1u32, 1u32),
-                (9, 9),
-                (16, 16),
-                (80, 80),
-                (18, 16),
-                (512, 9),
-                (4096, 128),
-            ] {
-                let s = StepFacts {
-                    num_tokens: tokens,
-                    num_seqs: seqs,
-                    has_spec_tokens: has_spec,
-                    unrotated_blocks: false,
-                    gdn_plain: true,
-                    gdn_plain_rows: true,
-                };
-                let (slice, full) = (
-                    gate_matches(Some(OnlyIfNoSpec), s),
-                    gate_matches(Some(OnlyIfSpec), s),
-                );
-                assert!(
-                    slice ^ full,
-                    "the lm_head gate pair must be exhaustive at num_tokens={tokens} \
-                     num_seqs={seqs} has_spec_tokens={has_spec}"
-                );
-            }
+        // both — and each side takes the steps it is for: the slice the steps
+        // that sample fewer rows than they run (a prefill chunk, a mixed batch,
+        // a verify step beside a prefill chunk), the every-row matmul those
+        // that sample each (a decode step, a verify step alone). Issue #361:
+        // before the every-row matmul took decode steps, a decode step in a
+        // bucket whose lm_head lowers to one `qmm_t` (the slice band,
+        // `bucket_m ≥ vector_limit`) ran no lm_head at all — the argmax re-read
+        // the logits slot's stale contents and every row froze on its first
+        // token.
+        use super::super::lowered::RuntimeGate::{OnlyIfEveryRowSampled, UnlessEveryRowSampled};
+        let lm_head = |tokens, seqs, sampled| {
+            let s = StepFacts {
+                sampled_rows: sampled,
+                ..step(tokens, seqs, false)
+            };
+            let slice = gate_matches(Some(UnlessEveryRowSampled), s);
+            let every = gate_matches(Some(OnlyIfEveryRowSampled), s);
+            assert!(
+                slice ^ every,
+                "the lm_head gate pair must be exhaustive at num_tokens={tokens} \
+                 num_seqs={seqs} sampled_rows={sampled}"
+            );
+            slice
+        };
+        for (tokens, seqs, sampled, slices) in [
+            // Decode steps.
+            (1u32, 1u32, 1u32, false),
+            (9, 9, 9, false),
+            (80, 80, 80, false),
+            // Prefill chunks and mixed batches: a row a sequence.
+            (18, 16, 16, true),
+            (512, 9, 9, true),
+            (4096, 128, 128, true),
+            // A verify step of six sequences, three rows each, alone; beside a prefill chunk.
+            (18, 6, 18, false),
+            (530, 7, 19, true),
+        ] {
+            assert_eq!(
+                lm_head(tokens, seqs, sampled),
+                slices,
+                "{tokens} {seqs} {sampled}"
+            );
         }
-        // Decode-only, no spec: the fallback is the only lm_head that runs.
-        let decode_only = StepFacts {
-            num_tokens: 9,
-            num_seqs: 9,
-            has_spec_tokens: false,
-            unrotated_blocks: false,
-            gdn_plain: true,
-            gdn_plain_rows: true,
-        };
-        assert!(!gate_matches(Some(OnlyIfNoSpec), decode_only));
-        assert!(gate_matches(Some(OnlyIfSpec), decode_only));
-        // Prefill-shaped, no spec: the slice runs, the fallback does not.
-        let prefill = StepFacts {
-            num_tokens: 512,
-            num_seqs: 9,
-            has_spec_tokens: false,
-            unrotated_blocks: false,
-            gdn_plain: true,
-            gdn_plain_rows: true,
-        };
-        assert!(gate_matches(Some(OnlyIfNoSpec), prefill));
-        assert!(!gate_matches(Some(OnlyIfSpec), prefill));
-        // A spec verify reads every row: the fallback, never the slice.
-        let verify = StepFacts {
-            num_tokens: 18,
-            num_seqs: 6,
-            has_spec_tokens: true,
-            unrotated_blocks: false,
-            gdn_plain: true,
-            gdn_plain_rows: true,
-        };
-        assert!(!gate_matches(Some(OnlyIfNoSpec), verify));
-        assert!(gate_matches(Some(OnlyIfSpec), verify));
     }
 
     /// The lm_head sample slice, as the tape builds and dispatches it: the
-    /// gather swaps each sequence's last row into row `i`, the scatter swaps
-    /// row `i` back, both in place. In a mixed step, decodes and short chunks
-    /// put some sequences' last rows inside `0..num_seqs`, the rows the
-    /// others are moved to; every sequence must still get its own row, and
-    /// the scatter after the gather must leave every row where it started.
+    /// gather swaps sampled row `i` into row `i`, the scatter swaps row `i`
+    /// back, both in place. In a mixed step, decodes, verifies and short
+    /// chunks put some sampled rows inside `0..num_sampled`, the rows the
+    /// others are moved to; every sampled row must still land at its own
+    /// index, and the scatter after the gather must leave every row where it
+    /// started.
     #[test]
-    fn sample_slice_moves_each_sequences_own_row() {
+    fn sample_slice_moves_each_sampled_row() {
         let Some(device) = crate::detect_device().filter(|_| crate::metal4_available()) else {
             eprintln!("skipping: no Metal device");
             return;
@@ -2366,26 +2306,41 @@ mod tests {
             metal_dtype: MetalDtype::F16,
             ..crate::tape::model_consts::MetalModelConsts::from_canonical::<TestWeights>()
         };
-        // Decodes, then short prefix-hit chunks, then long chunks.
-        let q_lens: Vec<u32> = [vec![1; 24], vec![2; 16], vec![3; 8], vec![40; 4]].concat();
+        // Decodes, then verifies (every row sampled), then short prefix-hit chunks, then long
+        // chunks.
+        let q_lens: Vec<u32> = [
+            vec![1; 24],
+            vec![3; 6],
+            vec![2; 16],
+            vec![3; 8],
+            vec![40; 4],
+        ]
+        .concat();
         let cu: Vec<u32> = std::iter::once(0)
             .chain(q_lens.iter().scan(0, |end, n| {
                 *end += n;
                 Some(*end)
             }))
             .collect();
-        let (num_seqs, num_tokens) = (q_lens.len(), *cu.last().unwrap() as usize);
-        let last = |i: usize| cu[i + 1] as usize - 1;
+        let num_tokens = *cu.last().unwrap() as usize;
+        let verifies = 24..30;
+        let sampled: Vec<u32> = (0..q_lens.len())
+            .flat_map(|i| match verifies.contains(&i) {
+                true => cu[i]..cu[i + 1],
+                false => cu[i + 1] - 1..cu[i + 1],
+            })
+            .collect();
+        let num_sampled = sampled.len();
         let width = 1024u32;
         let bucket_m = 512;
         let slot = crate::tape::ids::ArenaSlotIdx(0);
         let gather = crate::tape::lowering::gather_last_token_command(&p, slot, width);
         let scatter = crate::tape::lowering::scatter_first_to_last_row_command(&p, slot, width);
-        // `(row, the row it holds)`. Gather: row i holds sequence i's last
-        // row. Scatter: that last row holds row i, sequence i's logits. Both:
-        // every row holds itself.
-        let gathered = (0..num_seqs).map(|i| (i, last(i))).collect();
-        let scattered = (0..num_seqs).map(|i| (last(i), i)).collect();
+        // `(row, the row it holds)`. Gather: row i holds sampled row i.
+        // Scatter: sampled row i holds row i. Both: every row holds itself.
+        let at = |i: usize| sampled[i] as usize;
+        let gathered = (0..num_sampled).map(|i| (i, at(i))).collect();
+        let scattered = (0..num_sampled).map(|i| (at(i), i)).collect();
         let restored = (0..num_tokens).map(|r| (r, r)).collect();
         let cases: [(&str, Vec<&LoweredCommand>, Vec<(usize, usize)>); 3] = [
             ("gather", vec![&gather], gathered),
@@ -2400,8 +2355,16 @@ mod tests {
                 })
                 .collect();
             let buf = crate::mtl4_dispatch::shared_slice(&device, &rows);
-            let cu_buf = crate::mtl4_dispatch::shared_slice(&device, &cu);
-            let n_buf = crate::mtl4_dispatch::shared_u32(&device, num_seqs as u32);
+            let sampled_buf = crate::mtl4_dispatch::shared_slice(&device, &sampled);
+            let n_buf = crate::mtl4_dispatch::shared_u32(&device, num_sampled as u32);
+            let step = StepFacts {
+                num_tokens: num_tokens as u32,
+                num_seqs: q_lens.len() as u32,
+                sampled_rows: num_sampled as u32,
+                unrotated_blocks: false,
+                gdn_plain: true,
+                gdn_plain_rows: true,
+            };
             for cmd in cmds {
                 let key = crate::specialized_pipeline_cache::PipelineKey::new(
                     cmd.library,
@@ -2410,16 +2373,11 @@ mod tests {
                 );
                 let pso = crate::aot::baked_build(&cache, &key).expect("pipeline");
                 let (grid, threads) = mtl_size_pair(cmd, TEST_VARIANT);
-                let grid = scale_tg_for_num_tokens(
-                    grid,
-                    cmd.dispatch.m_scaling,
-                    super::super::ids::NumTokens(num_tokens as u32),
-                    num_seqs as u32,
-                );
+                let grid = scale_tg_for_num_tokens(grid, cmd.dispatch.m_scaling, step);
                 assert!(crate::mtl4_dispatch::dispatch_threadgroups(
                     &device,
                     &pso,
-                    &[&buf, &cu_buf, &n_buf],
+                    &[&buf, &sampled_buf, &n_buf],
                     grid,
                     threads,
                 ));
@@ -2679,6 +2637,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             cache_live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
@@ -3073,6 +3032,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             cache_live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
@@ -3165,6 +3125,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             cache_live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
@@ -3291,6 +3252,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             cache_live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.

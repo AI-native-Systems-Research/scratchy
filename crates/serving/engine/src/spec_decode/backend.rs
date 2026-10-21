@@ -139,27 +139,77 @@ pub struct ForwardArgmaxRequest<'a> {
     pub max_seqlen_q: usize,
     pub max_seqlen_k: usize,
     pub num_tokens: usize,
-    /// `true` when this is a spec-decode verify batch (at least one
-    /// req carries `spec_token_ids`). Backend forwards this into the
-    /// lm_head slice's runtime gate so the slice (which writes only
-    /// the last logits row) is skipped and the full GEMM fires
-    /// instead — rejection sampling needs every row populated.
-    /// `false` for non-spec prefill/decode and for draft-model
-    /// lockstep prefill / K-step chain forwards.
-    pub has_spec_tokens: bool,
-    /// `[num_sample_rows]` u32 — per-sample-row source index into the
-    /// `[num_tokens, hidden]` activation produced by the forward.
-    /// Mirrors Python vLLM's `logits_indices = query_start_loc[1:] - 1`
-    /// and the CUDA path's `ForwardCtx.last_token_indices`. Backends
-    /// thread it into their lm_head fast path so the GEMM runs at
-    /// `M = num_sample_rows` instead of `M = num_tokens`. `None`
-    /// signals "no sampled tokens this step" (chunked-prefill
-    /// intermediate chunks) — backends fall back to the full GEMM.
-    pub last_token_indices: Option<&'a [u32]>,
+    /// The rows the forward samples ([`SampledRows::rows`]): Python vLLM's `logits_indices`. The
+    /// forward's logits, and the argmax the backend returns, are theirs, in order. `None`: each
+    /// sequence's last row.
+    pub sampled_rows: Option<&'a [u32]>,
     /// `[num_tokens, hidden]` row-major, model dtype: the final (post-norm) hidden state each row
     /// of a multi-token-prediction head reads — its target's, or its own from the pass before.
     /// `None` for every other model.
     pub target_hidden: Option<&'a [u8]>,
+}
+
+/// The rows a step samples: each sequence's last, or — a sequence verifying drafts — every one of
+/// its rows, each of which can be its newest. A sequence's sampled rows are its last rows, so
+/// sampled row `j` of sequence `i` is step row `cu_seqlens_q[i + 1] - (count_i - j)`. The logits
+/// the forward leaves, and every row read off them (argmax, sampler, grammar mask), are these
+/// rows', in order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SampledRows {
+    /// Each sampled row's step row, ascending (Python vLLM's `logits_indices`).
+    rows: Vec<u32>,
+    /// Cumulative sampled rows per sequence, `num_seqs + 1` long: sequence `i`'s are
+    /// `cu[i]..cu[i + 1]`.
+    cu: Vec<u32>,
+}
+
+impl SampledRows {
+    /// The sampled rows of the step whose sequences' rows `cu_seqlens_q` bounds: every row of a
+    /// sequence `every_row(i)` holds, the last of any other. A sequence of no rows samples none.
+    pub fn of(cu_seqlens_q: &[u32], every_row: impl Fn(usize) -> bool) -> Self {
+        let mut rows = Vec::new();
+        let mut cu = vec![0];
+        for (i, seq) in cu_seqlens_q.windows(2).enumerate() {
+            let (start, end) = (seq[0], seq[1]);
+            let first = match every_row(i) {
+                true => start,
+                false => end.saturating_sub(1).max(start),
+            };
+            rows.extend(first..end);
+            cu.push(rows.len() as u32);
+        }
+        Self { rows, cu }
+    }
+
+    /// Each sampled row's step row, ascending.
+    pub fn rows(&self) -> &[u32] {
+        &self.rows
+    }
+
+    /// How many rows the step samples.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Sequence `i`'s sampled rows, as indices into [`Self::rows`] — rows of the logits.
+    pub fn of_seq(&self, i: usize) -> std::ops::Range<usize> {
+        self.cu[i] as usize..self.cu[i + 1] as usize
+    }
+
+    /// Sequence `i`'s last sampled row, as an index into [`Self::rows`]: its last row's logits.
+    pub fn last_of(&self, i: usize) -> usize {
+        self.cu[i + 1] as usize - 1
+    }
+
+    /// The index into [`Self::rows`] of step row `row` of sequence `i`, one of its sampled rows
+    /// (`None` past them).
+    pub fn index(&self, i: usize, row: u32) -> Option<usize> {
+        self.of_seq(i).find(|&j| self.rows[j] == row)
+    }
 }
 
 /// Primitive the backend exposes for spec decode.
@@ -173,9 +223,9 @@ pub struct ForwardArgmaxRequest<'a> {
 /// See module docs for the design rationale.
 pub trait SpecDecodeBackend {
     /// Run a forward pass against `model` + `kv_pool` with the inputs in
-    /// `req`, plus a per-row argmax over the resulting `[req.num_tokens,
-    /// vocab]` logits. Blocks the calling thread until completion.
-    /// Returns per-row argmax IDs (length == `req.num_tokens`).
+    /// `req`, plus a per-row argmax over its logits — its sampled rows'
+    /// (`req.sampled_rows`). Blocks the calling thread until completion.
+    /// Returns an argmax ID per sampled row, in order.
     fn forward_argmax_blocking(
         &mut self,
         model: ModelHandle,
@@ -269,5 +319,29 @@ pub trait SpecDecodeBackend {
         _k: usize,
     ) -> Result<Vec<Vec<u32>>, BackendError> {
         Err(BackendError::NotImplemented("forward_chain_k"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SampledRows;
+
+    /// A step of a decode (row 0), a verify of three rows (1..=3), a prompt chunk (4..=9) and a
+    /// sequence of no rows: the decode and the chunk sample their last rows, the verify its
+    /// every one, the empty sequence none — ascending, each sequence's at its own offsets.
+    #[test]
+    fn a_step_samples_each_sequence_s_last_rows() {
+        let sampled = SampledRows::of(&[0, 1, 4, 10, 10], |i| i == 1);
+        assert_eq!(sampled.rows(), [0, 1, 2, 3, 9]);
+        assert_eq!(sampled.len(), 5);
+        let seqs: Vec<_> = (0..4).map(|i| sampled.of_seq(i)).collect();
+        assert_eq!(seqs, [0..1, 1..4, 4..5, 5..5]);
+        let last: Vec<usize> = (0..3).map(|i| sampled.last_of(i)).collect();
+        assert_eq!(last, [0, 3, 4]);
+        // A row's index among the sampled rows; a row its sequence does not sample has none.
+        assert_eq!(sampled.index(1, 2), Some(2));
+        assert_eq!(sampled.index(2, 9), Some(4));
+        assert_eq!(sampled.index(2, 8), None);
+        assert_eq!(sampled.index(0, 1), None);
     }
 }

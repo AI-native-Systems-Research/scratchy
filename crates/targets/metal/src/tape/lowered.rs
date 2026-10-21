@@ -16,7 +16,7 @@
 
 use crate::tape::constants::ConstantValue;
 use crate::tape::ids::{
-    BucketM, CommandIx, DecodeRows, LayerId, MaxBlocksPerSeq, SourceIx, TqDecodeHeads,
+    BucketM, CommandIx, DecodeRows, LayerId, MaxBlocksPerSeq, RowTile, SourceIx, TqDecodeHeads,
 };
 
 /// One-of identifier for the kernel a `LoweredCommand` invokes.
@@ -313,24 +313,19 @@ pub enum KernelId {
     /// `nn.QuantizedEmbedding.__call__`
     /// (`python/mlx/nn/layers/quantized.py:144`).
     AffineEmbed,
-    /// Slice the last-token row of a `[num_tokens, hidden]` activation
-    /// to row 0 of the same buffer, in place. Inserted by the lowering
-    /// pass before the lm_head GEMM so the GEMM runs at M=1 instead of
-    /// M=num_tokens — only the last token's logits are ever consumed
-    /// by the sampler. Maps to `gather_last_token_{f16,bf16}_specialized`
-    /// in `gather_last_token.metallib`. Reads num_tokens from a 4-byte
-    /// runtime buffer the worker re-writes each forward() — see
-    /// `RuntimeBindingKind::NumTokensU32`.
+    /// Swap the step's sampled rows of a buffer to its front, in order,
+    /// in place: the lm_head input before the lm_head slice's matvec
+    /// runs at the sampled rows alone, or every row's logits compacted
+    /// to the sampled rows' where the lm_head ran over every row. Maps to
+    /// `gather_last_token_{f16,bf16}_specialized` in
+    /// `gather_last_token.metallib`. Reads the rows from the runtime
+    /// buffers the worker re-writes each forward() —
+    /// `RuntimeBindingKind::{SampleIndices, NumSampleRowsU32}`.
     GatherLastToken,
-    /// Paired with [`KernelId::GatherLastToken`]: copies row 0 of a
-    /// `[num_tokens, vocab]` logits tensor BACK to row `num_tokens-1`
-    /// in place, after the lm_head GEMM ran on its shrunk
-    /// 1-m-tile grid. The worker's downstream
-    /// `embedding_gather(logits, last_token_indices=[num_tokens-1])`
-    /// then reads valid logits at row `num_tokens-1` without needing
-    /// to know about the slice. Reads num_tokens from the same 4-byte
-    /// runtime buffer the gather does
-    /// (`RuntimeBindingKind::NumTokensU32`). Maps to
+    /// Paired with [`KernelId::GatherLastToken`]: the gather undone, in
+    /// place — the lm_head input's sampled rows put back after the
+    /// slice's matvec read them, so the final hidden states read as the
+    /// backbone wrote them. Maps to
     /// `scatter_first_to_last_row_{f16,bf16}_specialized` in
     /// `gather_last_token.metallib`.
     ScatterFirstToLastRow,
@@ -684,17 +679,24 @@ pub enum MScaleAxis {
 pub struct MScaling {
     pub axis: MScaleAxis,
     pub bucket_m: BucketM,
-    /// When `Some(ax)`, the worker SETS `threadgroups.{ax}` to the live
-    /// `num_seqs` at dispatch (not a proportional scale — an exact set).
-    /// Used by the steel paged prefill attention kernel, whose grid is
-    /// `(Q-blocks-per-seq, num_q_heads, num_seqs)`: it tiles queries in
-    /// BQ-sized blocks that must not straddle a sequence boundary, so it
-    /// needs one grid-Z layer per sequence (`tid.z = seq_idx`, indexing
-    /// `cu_seqlens_q` / `block_table`). `axis` still scales the Q-block
-    /// dimension by `num_tokens`; over-dispatched blocks early-out in the
-    /// kernel. `None` (every other kernel, incl. SDPA which is per-query-
-    /// token and self-attributes via `cu_seqlens_q`) leaves Z untouched.
-    pub seq_axis: Option<MScaleAxis>,
+    /// An axis the worker SETS to a live count at dispatch (not a proportional scale — an exact
+    /// set); `None` (most kernels, incl. SDPA, which is per-query-token and self-attributes via
+    /// `cu_seqlens_q`) sets none.
+    pub set_axis: Option<SetAxis>,
+}
+
+/// A grid axis set to a live count of the step at dispatch ([`MScaling::set_axis`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum SetAxis {
+    /// The step's sequences. The steel paged prefill attention's grid is
+    /// `(Q-blocks-per-seq, num_q_heads, num_seqs)`: it tiles queries in BQ-sized blocks that
+    /// must not straddle a sequence boundary, so it needs one grid-Z layer per sequence
+    /// (`tid.z = seq_idx`, indexing `cu_seqlens_q` / `block_table`); `axis` still scales the
+    /// Q-block dimension by `num_tokens`, and over-dispatched blocks early-out in the kernel.
+    Seqs(MScaleAxis),
+    /// The step's sampled rows: a command over the logits, one row of them a threadgroup row
+    /// (the sampled lm_head's matvec, the logit tail's caps and scales).
+    SampledRows(MScaleAxis),
 }
 
 /// Runtime gate evaluated per dispatch — when `Some`, the worker
@@ -708,27 +710,17 @@ pub struct MScaling {
 /// commands that aren't gated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum RuntimeGate {
-    /// Run only when `!has_spec_tokens` **and** the step has rows to
-    /// drop (`num_tokens > num_seqs`). Used by the lm_head slice
-    /// trio (gather/qmv/scatter) — the slice writes exactly the
-    /// `num_sample_rows` rows pointed at by `last_token_indices`,
-    /// which is correct for single-seq + multi-seq prefill, but wrong
-    /// for spec verify where rejection sampling needs every row of
-    /// logits, and pure overhead at decode (num_sample_rows ==
-    /// num_seqs) where the full-M fallback covers it with no extra
-    /// launches.
-    OnlyIfNoSpec,
-    /// Run when `has_spec_tokens` **or** the step is decode-only
-    /// (`num_tokens == num_seqs`). Used by the full `M=bucket_m`
-    /// lm_head fallback that populates every row of logits for greedy
-    /// rejection sampling at spec-decode verify — and as the only
-    /// lm_head a decode-only step runs, the slice being gated off
-    /// there. The two gates are complements: exactly one fires on
-    /// every step, so no step is left without an lm_head (issue #361:
-    /// before the decode-only term, a decode step in a bucket whose
-    /// lm_head lowers to one `qmm_t` computed no logits and every
-    /// row froze on its first token).
-    OnlyIfSpec,
+    /// Run only on a step that samples fewer rows than it runs (`sampled_rows < num_tokens`: a
+    /// prefill chunk, a mixed batch): the lm_head slice — the gather of the sampled rows, the
+    /// matvec at them, the activation put back — and the compaction of every row's logits to
+    /// the sampled ones.
+    UnlessEveryRowSampled,
+    /// Run only on a step that samples every row it runs (`sampled_rows == num_tokens`: a
+    /// decode step, a speculative verify step of drafting sequences alone): the lm_head over
+    /// every row, whose logits are already the sampled rows', in order. The complement of
+    /// [`Self::UnlessEveryRowSampled`]: exactly one fires on every step, so no step is left
+    /// without an lm_head (issue #361).
+    OnlyIfEveryRowSampled,
     /// Run only on a decode step — every sequence contributes exactly one
     /// token (`num_tokens == num_seqs`): a TurboQuant model's
     /// `AttentionViaCacheTq`, reading the packed store directly.
@@ -824,7 +816,7 @@ impl DispatchShape {
         // on lowering.rs, so the value is spelled here.
         let mut d = Self::dispatch_1d(eff_m * width.get(), 256);
         d.m_scaling = Some(MScaling {
-            seq_axis: None,
+            set_axis: None,
             axis: MScaleAxis::X,
             bucket_m,
         });
@@ -1281,17 +1273,12 @@ pub enum RuntimeBindingKind {
     /// source row index `num_tokens - 1` at runtime without needing
     /// a function constant (M varies per call).
     NumTokensU32,
-    /// `[1]` u32 — actual `num_seqs` of the in-flight forward
-    /// (= `cu_seqlens_q.len() - 1`). Mirrors `NumTokensU32` but for
-    /// the per-seq-sample-row count the lm_head slice trio uses to
-    /// gate its inner loop (gather copies `num_seqs` rows, qmm runs
-    /// at M = num_seqs, scatter writes back `num_seqs` rows).
-    NumSeqsU32,
-    /// `[num_seqs]` u32 — per-sequence sample-row index
-    /// (`cu_seqlens_q[i+1] - 1` for seq `i`). Mirrors Python vLLM's
-    /// `logits_indices` and the CUDA path's `ForwardCtx.last_token_indices`.
-    /// Read by the index-driven `gather_last_token`/`scatter_first_to_last_row`
-    /// kernels — one row per sequence, in cu_seqlens_q order.
+    /// `[1]` u32 — the in-flight forward's sampled rows' count (`SampleIndices`' length): the
+    /// rows the lm_head slice gathers and puts back, and the logits rows a compaction keeps.
+    NumSampleRowsU32,
+    /// `[num_sample_rows]` u32 — the in-flight forward's sampled rows, ascending: each
+    /// sequence's last row, every row of a sequence verifying drafts. Python vLLM's
+    /// `logits_indices`. Read by the index-driven `gather_rows` / `put_rows_back` kernels.
     SampleIndices,
     /// Gated-DeltaNet conv-state ring for a linear-attention layer
     /// (persistent f32 pool, mutated in place across forwards — the
@@ -1734,7 +1721,7 @@ impl RuntimeBindingKind {
             | Self::SeqUsedK
             | Self::SpanIds
             | Self::NumTokensU32
-            | Self::NumSeqsU32
+            | Self::NumSampleRowsU32
             | Self::SampleIndices
             | Self::GdnStateIndices
             | Self::GdnIsFresh
@@ -1970,6 +1957,18 @@ impl LoweredMetalTape {
         })
     }
 
+    /// The rows the logits buffer holds when no step samples more than `sampled` rows (`None`:
+    /// every row of the bucket) — the bucket's rows at most ([`LogitsRows`]).
+    pub fn logits_slot_rows(&self, sampled: Option<DecodeRows>) -> u32 {
+        match (self.logits_rows, sampled) {
+            (LogitsRows::Sampled { tile }, Some(rows)) => {
+                let tile = tile.get().max(1);
+                (rows.get().div_ceil(tile).saturating_mul(tile)).min(self.bucket_m)
+            }
+            (LogitsRows::Bucket, _) | (_, None) => self.bucket_m,
+        }
+    }
+
     pub fn commands_expanded(&self) -> Vec<GatedCommand> {
         let mut out = Vec::with_capacity(self.commands.len());
         let cmds = self.commands;
@@ -2031,6 +2030,20 @@ impl LoweredMetalTape {
             }
         }
     }
+}
+
+/// The rows of the logits buffer a tape's commands write. A forward leaves the logits of the rows
+/// its step samples at the buffer's front, in order; what else it writes bounds the buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum LogitsRows {
+    /// The lm_head runs every row of a step and moves the sampled rows' logits to the front: the
+    /// buffer holds the bucket's rows.
+    Bucket,
+    /// Every command over the logits writes the step's sampled rows rounded up to whole `tile`s
+    /// of rows — the sampled matvec and the logit tail one a row, the matmul over every row of a
+    /// step that samples each its own tile: the buffer holds the most rows a step samples, so
+    /// rounded.
+    Sampled { tile: RowTile },
 }
 
 /// One bucket's lowered tape — the input the `MetalWorker` walks at
@@ -2106,6 +2119,9 @@ pub struct LoweredMetalTape {
     /// q_head + Kdense + Vdense_T + scores + out_head regions. Zero when no
     /// hd512-unfused attention was lowered.
     pub attn_unfused_scratch_bytes: u32,
+    /// The rows of the logits buffer (the terminal slot) the tape's commands write: what the
+    /// buffer holds beyond the rows a step samples ([`Self::logits_slot_rows`]).
+    pub logits_rows: LogitsRows,
     /// Per command, whether a forward reading only its cache writes plays it
     /// ([`crate::interpreter::metal::ForwardReads::CacheWrites`]): what a KV or recurrent-state
     /// write needs, from the metal compiler's liveness walk over the rows. Off for the lm_head,

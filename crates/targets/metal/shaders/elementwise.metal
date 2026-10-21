@@ -146,6 +146,8 @@ SCRATCHY_KERNEL(bias_add_bf16_specialized, bias_add<bfloat>)
 // `embed(...) * sqrt(hidden_size)`).
 #ifdef SCRATCHY_CONSTANT_2
 SCRATCHY_CONSTANT(float, SCALAR_MUL_SCALE, 2);
+
+#ifdef SCRATCHY_CONSTANT_3
 // The elements the buffer holds: the dispatch rounds up to whole threadgroups.
 SCRATCHY_CONSTANT(uint, SCALAR_MUL_N, 3);
 
@@ -160,8 +162,29 @@ template <typename T>
 }
 #endif
 
+// The same over the logits of the rows a step samples, at the front of the
+// buffer, rows `SCALAR_MUL_WIDTH` wide (slot 6): grid (ceil(width / 256),
+// sampled rows). Granite's `logits * 1/logits_scaling`.
+#ifdef SCRATCHY_CONSTANT_6
+SCRATCHY_CONSTANT(uint, SCALAR_MUL_WIDTH, 6);
+
+template <typename T>
+[[kernel]] void scalar_mul_sampled(
+    device       T* out    [[buffer(0)]],
+    device const T* input  [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= SCALAR_MUL_WIDTH) return;
+    const ulong i = ulong(gid.y) * SCALAR_MUL_WIDTH + gid.x;
+    out[i] = T(float(input[i]) * SCALAR_MUL_SCALE);
+}
+#endif
+#endif
+
 SCRATCHY_KERNEL(scalar_mul_f16_specialized, scalar_mul<half>)
 SCRATCHY_KERNEL(scalar_mul_bf16_specialized, scalar_mul<bfloat>)
+SCRATCHY_KERNEL(scalar_mul_sampled_f16, scalar_mul_sampled<half>)
+SCRATCHY_KERNEL(scalar_mul_sampled_bf16, scalar_mul_sampled<bfloat>)
 
 // ScalarWeightMul: out = in * w[0] — multiply by a loaded [1]-shaped
 // weight (Gemma4 `layer_scalar`, applied to the hidden state at the
@@ -197,8 +220,8 @@ template <typename T>
     out[gid] = T(TANH_SOFTCAP_CAP * tanh(x / TANH_SOFTCAP_CAP));
 }
 
-// The same over the rows a step samples, one per sequence (its last: `cu_seqlens_q[s + 1] - 1`),
-// rows `TANH_SOFTCAP_WIDTH` wide (slot 6): grid (ceil(width / 256), sequences).
+// The same over the logits of the rows a step samples, at the front of the buffer, rows
+// `TANH_SOFTCAP_WIDTH` wide (slot 6): grid (ceil(width / 256), sampled rows).
 #ifdef SCRATCHY_CONSTANT_6
 SCRATCHY_CONSTANT(uint, TANH_SOFTCAP_WIDTH, 6);
 
@@ -206,11 +229,10 @@ template <typename T>
 [[kernel]] void tanh_soft_cap_sampled(
     device const T* input [[buffer(0)]],
     device T* out [[buffer(1)]],
-    device const uint* cu_seqlens_q [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (gid.x >= TANH_SOFTCAP_WIDTH) return;
-    const ulong i = ulong(cu_seqlens_q[gid.y + 1] - 1) * TANH_SOFTCAP_WIDTH + gid.x;
+    const ulong i = ulong(gid.y) * TANH_SOFTCAP_WIDTH + gid.x;
     float x = float(input[i]);
     out[i] = T(TANH_SOFTCAP_CAP * tanh(x / TANH_SOFTCAP_CAP));
 }

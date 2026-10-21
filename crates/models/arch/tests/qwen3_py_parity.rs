@@ -205,14 +205,11 @@ fn qwen3_py_carrier_parity() {
     let bt_buf = device.alloc_gpu_tensor_from_host(&[1, NUM_BLOCKS], DType::U32, unsafe {
         std::slice::from_raw_parts(block_table.as_ptr() as *const u8, NUM_BLOCKS * 4)
     });
-    // The worker always passes the per-sequence sample rows for prefill
-    // (`last_token_indices = [n-1]` for one sequence). It is NOT optional
-    // decoration: the lm_head slice trio (gather → qmv → scatter) reads
-    // `num_sample_rows = last_token_indices.len()` as its early-out count —
-    // `None` means 0 and the gather/scatter become no-ops, leaving the
-    // logits buffer valid only at scattered sample rows (everything else
-    // is stale arena). Compare the LAST row only — that is the row the
-    // scatter writes and the row production samples from.
+    // The rows the step samples, as the worker passes them: one sequence's
+    // last, `[n-1]`. The forward leaves their logits at the front of its
+    // logits buffer — row 0 here, the last token's, the row production
+    // samples from.
+
     let lti: Vec<u32> = vec![n as u32 - 1];
     let lti_buf = device.alloc_gpu_tensor_from_host(&[1], DType::U32, unsafe {
         std::slice::from_raw_parts(lti.as_ptr() as *const u8, 4)
@@ -235,7 +232,6 @@ fn qwen3_py_carrier_parity() {
         gdn_state: None,
         gdn_state_indices: None,
         gdn_is_fresh: None,
-        has_spec_tokens: false,
         mm_embeds: None,
         embed_patches: &[],
         vision_rope_cos: None,
@@ -252,7 +248,7 @@ fn qwen3_py_carrier_parity() {
         vision_window_index: None,
         vision_reverse_indices: None,
         vision_position_ids: None,
-        last_token_indices: Some(unsafe { lti_buf.as_view() }),
+        sampled_rows: Some(unsafe { lti_buf.as_view() }),
         device_inputs: &[],
         deferred: None,
         reads: scratchy_target_metal::ForwardReads::Outputs,
@@ -264,16 +260,15 @@ fn qwen3_py_carrier_parity() {
         unsafe { scratchy_models::qwen3::qwen3_0_6b::forward(&w, &ctx, &mut device, n as u64) };
 
     // ── Readback: StorageModeShared arena → host-readable after the
-    // interpreter's waitUntilCompleted. Logits are bf16 [n, vocab]; only
-    // the LAST row is a valid sample row (the scatter target) — compare
-    // it against the oracle's last-token logits row. ──
+    // interpreter's waitUntilCompleted. Logits are bf16 [1, vocab]: the one
+    // sampled row's, the last token's — compare it against the oracle's
+    // last-token logits row. ──
     let t = out.as_gpu_tensor();
-    assert_eq!(t.dim(0), n, "logits rows");
+    assert_eq!(t.dim(0), 1, "logits rows: the one sampled row");
     assert_eq!(t.dim(1), vocab, "logits cols");
     let raw = t.raw_ptr() as *const u16;
-    let got_row = (n - 1) * vocab;
     let got: Vec<f32> = (0..vocab)
-        .map(|i| bf16::from_bits(unsafe { *raw.add(got_row + i) }).to_f32())
+        .map(|i| bf16::from_bits(unsafe { *raw.add(i) }).to_f32())
         .collect();
     let gold_row: Vec<f32> = golden[(n - 1) * vocab..n * vocab].to_vec();
 

@@ -111,8 +111,9 @@ pub enum VerifySeqs {
     /// As many a step as a multi-token-prediction head's budget drafts for
     /// ([`crate::spec_decode::DraftBudget::max_seqs`]).
     Head(crate::spec_decode::DraftBudget),
-    /// Every sequence a step runs: an n-gram or standalone draft model drafts for each.
-    Every,
+    /// Every sequence a step runs: an n-gram or standalone draft model drafts `drafts` tokens for
+    /// each.
+    Every { drafts: usize },
 }
 
 /// What a worker drafts with, besides its target.

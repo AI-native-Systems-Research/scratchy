@@ -313,10 +313,15 @@ u32_newtype!(
     /// ([`crate::device::gpu_cores`]). No baked profile can stand in for it:
     /// one chip name ships with several core counts (an M1 Max has 24 or 32).
     GpuCores,
-    /// The most rows a decode or verify step brings — one a sequence of the serving engine's
-    /// `max_num_seqs`, a verify step's drafts too — read at load: the rows the TurboQuant decode split's partials are
-    /// reserved for ([`crate::tape::lowered::LoweredMetalTape::scratch_bytes`]).
+    /// The most rows a step samples, and a decode or verify step brings — one a sequence of the
+    /// serving engine's `max_num_seqs`, a verify step's drafts too — read at load: the rows the
+    /// TurboQuant decode split's partials are reserved for
+    /// ([`crate::tape::lowered::LoweredMetalTape::scratch_bytes`]), and the logits buffer holds
+    /// ([`crate::tape::lowered::LoweredMetalTape::logits_rows`]).
     DecodeRows,
+    /// Rows one threadgroup of a command over the logits writes along its scaled row axis: a
+    /// step's every row it runs, rounded up to a whole tile.
+    RowTile,
     /// Logits per row a model's forward leaves (`METAL_VOCAB_SIZE`): the width the off-tape
     /// kernels (argmax, grammar mask, sampler) read ([`crate::off_tape`]).
     LogitsWidth,

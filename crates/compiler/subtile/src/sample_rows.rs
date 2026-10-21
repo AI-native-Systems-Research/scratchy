@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 //! THE SAMPLED ROWS OF A RESULT MATMUL, INSERTED FROM A TARGET'S DECLARED FACTS.
 //!
-//! The sampler reads one row of the forward's result per sequence, so on a multi-row step the
-//! result matmul — the vocabulary projection — need only compute those rows. A target that can
-//! compute them apart declares for which weights ([`SampleRowsFacts`]); this pass wraps each such
-//! result matmul of a multi-row canonical in one construct (one expansion, no guard):
+//! The sampler reads the rows of the forward's result a step samples — each sequence's last, every
+//! row of a sequence verifying drafts — so on a multi-row step the result matmul (the vocabulary
+//! projection) need only compute those rows, and its output need only hold them: the construct
+//! leaves their logits at the front of its output, in order (Python vLLM's `logits_indices`). A
+//! target that compacts them declares for which weights ([`SampleRowsFacts`]); this pass wraps
+//! each such result matmul of a multi-row canonical in one construct (one expansion, no guard):
 //!
-//! 1. [`SubOp::SampleRowsGather`] moves each sequence's sampled row to the front of the
-//!    activation, in place, and the matmul reads it;
-//! 2. the matmul;
-//! 3. [`SubOp::SampleRowsScatter`] moves its front rows back to the sampled rows, in place;
+//! 1. [`SubOp::SampleRowsGather`] moves the sampled rows to the front of the activation, in place,
+//!    and the matmul reads them;
+//! 2. the matmul, of the sampled rows;
+//! 3. [`SubOp::SampleRowsScatter`], in place over the matmul's output: what the target runs after
+//!    it — the gathered activation put back, or, where the matmul ran over every row, the sampled
+//!    rows' logits moved to the front;
 //! 4. [`SubOp::AllRowsMatmul`], the matmul over every row taking over that output — what a step
-//!    that reads every row runs instead of 1–3, and never on a step 1–3 run on.
+//!    that samples every row runs instead of 1–3 (its rows are its sampled rows, in order), and
+//!    never on a step 1–3 run on.
 //!
 //! Whether a bake point slices at all, and on which steps each part runs, is the target's
 //! lowering: the tape states the dataflow, and a part that does not run leaves the buffer it would
@@ -19,9 +24,8 @@
 //! samples no rows never calls this.
 //!
 //! The result may be the matmul's logit tail instead ([`under_logit_tail`]): the construct then
-//! takes the matmul's place under it, and the tail reads the construct's end over every row, as it
-//! read the matmul. After 1–3 it caps or scales the sampled rows (the others are stale and never
-//! read); after 4, every row.
+//! takes the matmul's place under it, and the tail reads the construct's end, as it read the
+//! matmul — the sampled rows' logits, at the front.
 
 use std::cmp::Ordering;
 

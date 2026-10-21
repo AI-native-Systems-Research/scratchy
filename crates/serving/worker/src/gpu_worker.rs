@@ -670,15 +670,20 @@ impl StepSlotMapping {
 #[cfg(feature = "metal")]
 const METAL_KV_ELEM_BYTES: usize = 2;
 
-/// A decode step's most rows, as the metal device carries it: a row for each of `max_num_seqs`
-/// sequences, plus the drafts of the ones that draft — the most `arch`'s compiled head's budget
-/// drafts a step ([`DraftBudget::draft_rows`]), beside sequences that run plain in the same step.
-/// The rows the TurboQuant decode split's partials and the sampler hold.
+/// The most rows a step samples — and a decode or verify step brings — as the metal device
+/// carries it: a row for each of `max_num_seqs` sequences, plus the drafts of the ones that verify
+/// them: the most a head's budget drafts a step ([`DraftBudget::draft_rows`]), beside sequences
+/// that run plain in the same step, or an n-gram or draft model's every sequence's. The rows the
+/// TurboQuant decode split's partials, the sampler and the logits hold.
 #[cfg(feature = "metal")]
-fn decode_rows(arch: &str, max_num_seqs: usize) -> scratchy_target_metal::tape::ids::DecodeRows {
-    let rows = match scratchy_forward_compiler::head_of(arch) {
-        Some(head) => max_num_seqs + draft_budget(&head).draft_rows(max_num_seqs),
-        None => max_num_seqs,
+fn decode_rows(
+    verify_seqs: VerifySeqs,
+    max_num_seqs: usize,
+) -> scratchy_target_metal::tape::ids::DecodeRows {
+    let rows = match verify_seqs {
+        VerifySeqs::Off => max_num_seqs,
+        VerifySeqs::Head(budget) => max_num_seqs + budget.draft_rows(max_num_seqs),
+        VerifySeqs::Every { drafts } => max_num_seqs.saturating_mul(1 + drafts),
     };
     scratchy_target_metal::tape::ids::DecodeRows(u32::try_from(rows).unwrap_or(u32::MAX))
 }
@@ -709,7 +714,7 @@ fn gdn_draft_lanes(
     let count = match verify_seqs {
         VerifySeqs::Off => return None,
         VerifySeqs::Head(budget) => max_num_seqs.min(2 * budget.max_seqs()),
-        VerifySeqs::Every => max_num_seqs,
+        VerifySeqs::Every { .. } => max_num_seqs,
     };
     let count = u16::try_from(count.min(usize::from(DraftLanes::MAX))).expect("≤ MAX fits a u16");
     DraftLanes::new(cfg.checkpoint_rows(), count)
@@ -1236,7 +1241,7 @@ impl MetalWorker {
                         .and_then(|c| gdn_draft_lanes(verify_seqs, c, width))
                 };
                 let (gdn_per_slot, gdn_lanes) = match verify_seqs {
-                    VerifySeqs::Every => (gdn.as_ref().map(|_| gdn_bytes(1, lanes(1))), 0),
+                    VerifySeqs::Every { .. } => (gdn.as_ref().map(|_| gdn_bytes(1, lanes(1))), 0),
                     _ => (
                         gdn.as_ref().map(|_| gdn_bytes(1, None)),
                         gdn_bytes(0, lanes(usize::MAX)),
@@ -1366,59 +1371,66 @@ impl MetalWorker {
             .map(|dev| dev.device.currentAllocatedSize())
             .unwrap_or(0);
         let bucket_costs = self.metal_bucket_costs(model, dev)?;
-        let arena_peak = if bucket_costs.is_empty() {
-            model.metal_arena_peak_bytes() as usize
-        } else {
-            // The same 0.6 arena-fraction split `determine_available_memory`
-            // runs; the pad mirrors the non-arena terms the KV formula
-            // subtracts so the headroom here equals what is actually left.
-            const ARENA_FRACTION: f64 = 0.6;
-            let pad = (64 + 150) * 1024 * 1024usize;
-            let fixed = weights_and_overhead.saturating_add(pad);
-            let sel =
-                select_prefill_bucket(total as u64, fixed as u64, &bucket_costs, ARENA_FRACTION);
-            sel.arena_bytes as usize
-        };
-        // A selected bucket's price already counts the draft's arena. Without cost tables, the
-        // target's full-ladder peak stands for the draft's too, a safe upper bound.
-        let arena_peak_pair = match (bucket_costs.is_empty(), self.draft_model.is_some()) {
-            (true, true) => arena_peak.saturating_mul(2),
-            _ => arena_peak,
-        };
+        // The same 0.6 arena-fraction split `determine_available_memory`
+        // runs; the pad mirrors the non-arena terms the KV formula
+        // subtracts so the headroom here equals what is actually left. A
+        // selected bucket's price already counts the draft's arena.
+        const ARENA_FRACTION: f64 = 0.6;
+        let pad = (64 + 150) * 1024 * 1024usize;
+        let fixed = weights_and_overhead.saturating_add(pad);
+        let sel = select_prefill_bucket(total as u64, fixed as u64, &bucket_costs, ARENA_FRACTION);
+        let arena_peak = sel.arena_bytes as usize;
         let rung_scratch = self.metal_rung_scratch(model, dev, block_cap)?;
-        Ok((arena_peak_pair.saturating_add(64 * 1024 * 1024))
+        Ok((arena_peak.saturating_add(64 * 1024 * 1024))
             .saturating_add(usize::try_from(rung_scratch).unwrap_or(usize::MAX)))
     }
 
-    /// Each prefill bucket's arena price: the target's, and every arena that runs at it. A draft
-    /// forward (an MTP head's pass 1, a draft model's lockstep prefill) runs the target's rows, so
-    /// it needs the same bucket. A draft model's arena is its own, at the smallest of its buckets
-    /// that holds them; a head's is the target's, grown to hold it (`ArenaShare::Hosts`), so it
-    /// adds what the target's arena grows by. Empty when the target emits no cost table.
+    /// Each prefill bucket's arena price: the target's, and every arena that runs at it — each the
+    /// arena its pool allocates with its ladder pruned to the bucket, the logits held for the most
+    /// rows a step samples (`GpuDevice::max_decode_rows`). A draft forward (an MTP head's pass 1,
+    /// a draft model's lockstep prefill) runs the target's rows, so it needs the same bucket. A
+    /// draft model's arena is its own, at the smallest of its buckets that holds them, its logits
+    /// at every row (its lockstep device bounds no rows); a head's is the target's, grown to hold
+    /// it (`ArenaShare::Hosts`), so it adds what the target's arena grows by.
     fn metal_bucket_costs(
         &self,
         target: &dyn scratchy_forward_compiler::ScratchyWeights,
         dev: &scratchy_target_metal::GpuDevice,
     ) -> ExecutorResult<Vec<(u32, u64)>> {
+        type Model<'m> = &'m dyn scratchy_forward_compiler::ScratchyWeights;
+        let layout = |m: Model<'_>, bucket_m: u32, rows| {
+            ExecutorResult::Ok(Self::metal_pick(m, dev, Some(bucket_m), 1)?.arena_layout(rows))
+        };
+        let buckets = |m: Model<'_>| -> ExecutorResult<Vec<u32>> {
+            let rungs = scratchy_target_metal::interpreter::metal::MetalRungs::of(m.metal_rungs())
+                .map_err(|e| ExecutorError::WorkerInit(format!("bucket costs: {e}")))?;
+            Ok(rungs.buckets.iter().map(|spec| spec.bucket_m).collect())
+        };
+        let rows = dev.max_decode_rows;
         let draft = self.draft_model.as_deref();
-        let draft_costs = draft.map_or(&[][..], |m| m.metal_bucket_arena_costs());
-        let head = draft.filter(|m| m.reads_target_hidden());
-        (target.metal_bucket_arena_costs().iter())
-            .map(|&(bucket_m, bytes)| {
-                let draft = match head {
-                    Some(head) => {
-                        let pick = |m: &dyn scratchy_forward_compiler::ScratchyWeights| {
-                            Self::metal_pick(m, dev, Some(bucket_m), 1)
-                        };
-                        let guest = pick(head)?.guest(dev.max_decode_rows);
-                        pick(target)?.hosting_arena_bytes(&guest)
+        let draft_buckets = match draft {
+            Some(d) if !d.reads_target_hidden() => buckets(d)?,
+            _ => Vec::new(),
+        };
+        (buckets(target)?.into_iter())
+            .map(|bucket_m| {
+                let own = layout(target, bucket_m, rows)?;
+                let draft = match draft {
+                    Some(head) if head.reads_target_hidden() => {
+                        let pick = |m: Model<'_>| Self::metal_pick(m, dev, Some(bucket_m), 1);
+                        let guest = pick(head)?.guest(rows);
+                        pick(target)?.hosting_arena_bytes(rows, &guest)
                     }
-                    None => (draft_costs.iter())
-                        .find(|&&(m, _)| m >= bucket_m)
-                        .or(draft_costs.last())
-                        .map_or(0, |&(_, bytes)| bytes),
+                    Some(draft) => {
+                        let holds = (draft_buckets.iter()).find(|&&m| m >= bucket_m);
+                        match holds.or(draft_buckets.last()) {
+                            Some(&m) => layout(draft, m, None)?.iter().sum(),
+                            None => 0,
+                        }
+                    }
+                    None => 0,
                 };
-                Ok((bucket_m, bytes + draft))
+                Ok((bucket_m, own.iter().sum::<u64>() + draft))
             })
             .collect()
     }
@@ -3024,7 +3036,7 @@ impl MetalWorker {
     ///
     /// `jobs[j] = (result_index, logits_row)`: `logits_row` is the request's
     /// sample position in the logits buffer captured this step by
-    /// `forward_argmax_blocking` (`sample_indices[i]`); `result_index` is the
+    /// `forward_argmax_blocking` (one of its sampled rows); `result_index` is the
     /// caller's slot in `sampled_token_ids` (used only by the caller). `req_ids`
     /// is the full per-batch request-id list (indexed by `result_index`).
     ///
@@ -3209,11 +3221,9 @@ fn metal_chain_dispatch(
 
     // ── 6. ForwardCtx ───────────────────────────────────────────
     // Draft K-step chain: every forward step decodes 1 token per seq
-    // (num_tokens == num_reqs), so `last_token_indices = [0, 1, …,
-    // num_reqs-1]` would just be an identity gather. Skip it — the
-    // gather/scatter early-out when src == dst makes the slice a
-    // no-op anyway, and a non-zero indices buffer would cost only
-    // memcpy. None here keeps the chain dispatch lean.
+    // (num_tokens == num_reqs), so it samples every row: its default
+    // sampled rows (each sequence's last) are all of them, and the lm_head
+    // runs over every row with no slice to gate.
     // Draft K-step chain is single-group (no SWA ring) — null sliding views.
     let ctx = scratchy_target_metal::ForwardCtx {
         input_ids: view_input_ids,
@@ -3249,8 +3259,7 @@ fn metal_chain_dispatch(
         gdn_state: None,
         gdn_state_indices: None,
         gdn_is_fresh: None,
-        has_spec_tokens: false,
-        last_token_indices: None,
+        sampled_rows: None,
         device_inputs: &[],
         deferred: None,
         reads: Reads::Outputs,
@@ -3305,7 +3314,7 @@ fn metal_chain_dispatch(
             }
 
             for iter in 0..k_usize {
-                handle.run_forward_step(enc, num_tokens_u32, num_reqs_u32, false)?;
+                handle.run_forward_step(enc, num_tokens_u32, num_reqs_u32, num_reqs_u32)?;
 
                 let table = &argmax_arg_tables_for_closure[iter];
                 let out_addr = argmax_bufs_for_closure[iter].gpuAddress();
@@ -3648,12 +3657,11 @@ impl MetalWorker {
         let buf_cu_seqlens = Self::alloc_shared_u32_buf(&mtl_device, req.cu_seqlens_q);
         let buf_seqused_k = Self::alloc_shared_u32_buf(&mtl_device, req.seqused_k);
         let buf_block_table = Self::alloc_shared_u32_buf(&mtl_device, req.block_table);
-        // Stage the sample-row indices for the lm_head slice. The
-        // closure inside macro-generated `forward` reads these via
-        // `ctx.last_token_indices.as_raw()` and converts to a `&[u32]`
-        // that drives the index-driven gather/scatter kernels.
-        let buf_last_token_indices = req
-            .last_token_indices
+        // Stage the rows the forward samples. The closure inside macro-generated
+        // `forward` reads them via `ctx.sampled_rows.as_raw()` and converts to a
+        // `&[u32]` that drives the index-driven gather/scatter kernels.
+        let buf_sampled_rows = req
+            .sampled_rows
             .map(|s| Self::alloc_shared_u32_buf(&mtl_device, s));
         // ── 2. Wrap MTLBuffers in TensorViews. Dtype is purely
         //       descriptive; the macro-emitted forward only reads
@@ -3707,11 +3715,10 @@ impl MetalWorker {
                 dtype_u32,
             ))
         };
-        // last_token_indices is optional — chunked-prefill intermediate
-        // chunks pass None, every other workload provides it.
-        let view_last_token_indices = req.last_token_indices.map(|s| unsafe {
+        // `None`: each sequence's last row.
+        let view_sampled_rows = req.sampled_rows.map(|s| unsafe {
             TensorView::from_raw(GpuTensor::new(
-                buf_last_token_indices.as_ref().unwrap().contents().as_ptr() as *mut u8,
+                buf_sampled_rows.as_ref().unwrap().contents().as_ptr() as *mut u8,
                 &[s.len().max(1)],
                 dtype_u32,
             ))
@@ -3883,8 +3890,7 @@ impl MetalWorker {
             gdn_state: gdn_state_ref,
             gdn_state_indices: view_gdn_indices,
             gdn_is_fresh: view_gdn_is_fresh,
-            has_spec_tokens: req.has_spec_tokens,
-            last_token_indices: view_last_token_indices,
+            sampled_rows: view_sampled_rows,
             device_inputs: &device_inputs,
             deferred: deferral.as_ref(),
             reads: Reads::Outputs,
@@ -4039,6 +4045,9 @@ impl MetalWorker {
             std::cell::RefCell<Option<(scratchy_target_metal::mtl4_dispatch::Buffer, u32)>>,
         > = std::rc::Rc::new(std::cell::RefCell::new(None));
         let logits_capture_cl = logits_capture.clone();
+        // The rows the argmax runs over: the forward's sampled rows, as its followup sees them.
+        let argmax_rows = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let argmax_rows_cl = argmax_rows.clone();
         // ── Fused on-GPU sampler (peak path) ─────────────────────────────
         // If `execute_model` prepared this step's non-greedy rows, encode the
         // sampler (cast → [penalties] → sample) onto THIS forward's command
@@ -4070,6 +4079,7 @@ impl MetalWorker {
                 unsafe {
                     *consts_ptr = total_n_actual;
                 }
+                argmax_rows_cl.set(total_n_actual);
                 use ::objc2_metal::{MTL4ArgumentTable, MTLBuffer};
                 let logits_addr = logits_buf.gpuAddress();
                 let out_addr = argmax_out_for_closure.gpuAddress();
@@ -4160,14 +4170,14 @@ impl MetalWorker {
             return Ok(Forwarded::default());
         }
 
-        // ── 5. Read host-visible argmax buffer + return. ─────────────────
-        let argmax_slice: &[u32] = unsafe {
+        // ── 5. Read host-visible argmax buffer + return: a token a sampled row. ─
+        let out: Vec<u32> = unsafe {
             std::slice::from_raw_parts(
                 argmax_out.contents().as_ptr() as *const u32,
-                req.num_tokens.max(1),
+                argmax_rows.get() as usize,
             )
-        };
-        let out = argmax_slice[..req.num_tokens.max(1)].to_vec();
+        }
+        .to_vec();
         // Hand the captured logits slot to `execute_model`'s sample block. Only
         // the TARGET forward's logits are used for sampling; a draft/verify
         // forward's capture is harmless (never read for a sampling request).
@@ -4546,7 +4556,7 @@ struct HeadPassesEncoder<'a> {
 #[cfg(feature = "metal")]
 impl<'a> HeadPassesEncoder<'a> {
     /// Encode the passes onto `enc` after the target's forward, which picked its tokens into
-    /// `tokens` (one `u32` a row) and left its final hidden states in `hidden`.
+    /// `tokens` (one `u32` a sampled row) and left its final hidden states in `hidden`.
     fn encode(
         &mut self,
         enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
@@ -4601,7 +4611,7 @@ impl<'a> HeadPassesEncoder<'a> {
         ];
         for depth in 1..=layout.passes {
             if depth > 1 {
-                let ctx = head_ctx(self.kv_cache, &creq, &inputs, false, Reads::Outputs);
+                let ctx = head_ctx(self.kv_cache, &creq, &inputs, Reads::Outputs);
                 // SAFETY: as pass 1's.
                 unsafe {
                     onto.then(
@@ -4693,10 +4703,11 @@ impl<'a> HeadPassesEncoder<'a> {
     ) -> Result<Box<dyn scratchy_forward_compiler::MetalForwardOnto + 'a>, String> {
         use scratchy_target_metal::interpreter::metal::DeviceInputInto as Into;
         let row_bytes = self.layout.hidden_bytes;
-        let token_inputs = (pass.token_rows.iter()).map(|&(row, step_row)| {
+        // The target's token at a sampled row: `tokens` holds one a sampled row, in order.
+        let token_inputs = (pass.token_rows.iter()).map(|&(row, sampled)| {
             DeviceInput::token(
                 tokens.clone(),
-                step_row as usize * size_of::<u32>(),
+                sampled as usize * size_of::<u32>(),
                 row as usize,
             )
         });
@@ -4725,13 +4736,7 @@ impl<'a> HeadPassesEncoder<'a> {
         let (table_refs, slot_refs) = (refs(&tables), refs(&slots));
         req.sliding_block_tables = &table_refs;
         req.sliding_slot_mappings = &slot_refs;
-        let ctx = head_ctx(
-            self.kv_cache,
-            &req,
-            &device_inputs,
-            pass.has_spec_tokens,
-            reads,
-        );
+        let ctx = head_ctx(self.kv_cache, &req, &device_inputs, reads);
         let (ctx, n) = (
             scratchy_target_metal::ForwardCtxHandle::new(&ctx),
             req.num_tokens,
@@ -4845,7 +4850,6 @@ fn head_ctx<'c>(
     kv_cache: &'c KvCachePool,
     req: &'c ::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'c>,
     device_inputs: &'c [DeviceInput],
-    has_spec_tokens: bool,
     reads: scratchy_target_metal::ForwardReads,
 ) -> scratchy_target_metal::ForwardCtx<'c> {
     let view = |s: &[u32], shape: &[usize]| unsafe {
@@ -4893,8 +4897,7 @@ fn head_ctx<'c>(
         gdn_state: None,
         gdn_state_indices: None,
         gdn_is_fresh: None,
-        has_spec_tokens,
-        last_token_indices: req.last_token_indices.map(|r| view(r, &[r.len()])),
+        sampled_rows: req.sampled_rows.map(|r| view(r, &[r.len()])),
         device_inputs,
         deferred: None,
         reads,
@@ -5336,7 +5339,7 @@ impl Worker for MetalWorker {
         // A decode step brings a row a sequence (a verify step its drafts too) of at most the batch
         // the resolver below picks, which never exceeds the requested width or the base one.
         gpu_device.max_decode_rows = Some(decode_rows(
-            &arch,
+            self.config.verify_seqs,
             (self.config.max_num_seqs)
                 .unwrap_or(scratchy_serving_engine::gpu_budget::BASE_MAX_NUM_SEQS),
         ));
@@ -5487,7 +5490,10 @@ impl Worker for MetalWorker {
         // `gpu_device` it needs for rung picking are still locals here
         // (fields assigned at the end of load_model) — pass them in.
         self.resolve_max_num_seqs(model.as_ref(), &arch, &gpu_device)?;
-        gpu_device.max_decode_rows = Some(decode_rows(&arch, self.max_num_seqs_resolved()));
+        gpu_device.max_decode_rows = Some(decode_rows(
+            self.config.verify_seqs,
+            self.max_num_seqs_resolved(),
+        ));
 
         {
             use std::sync::atomic::Ordering;
@@ -5573,7 +5579,7 @@ impl Worker for MetalWorker {
         let sampler_arena = scratchy_target_metal::sampling::SamplerArena::new(
             &gpu_device.device,
             gpu_device.allocator.residency(),
-            decode_rows(&arch, self.max_num_seqs_resolved()).0,
+            decode_rows(self.config.verify_seqs, self.max_num_seqs_resolved()).0,
             &sampler,
             max_model_len.max(1) as u32,
         );
@@ -6067,12 +6073,10 @@ impl Worker for MetalWorker {
         // post-`load_model`.
         //
         // Peak activation: the metal pool's per-worker arena is sized
-        // for the elementwise-max across every bucket spec
-        // (`for_buckets` does the max). We expose that per-canonical
-        // sum via `ScratchyWeights::metal_arena_peak_bytes()` (emitted
-        // by the per-canonical macro from the colored slot map at
-        // expansion time). For metal we currently run at most
-        // `max_workers = 1`, so peak == arena_peak. Runtime bindings
+        // for the elementwise-max across every bucket spec it keeps
+        // (`for_buckets` does the max), its logits for the most rows a
+        // step samples (`metal_bucket_costs`). For metal we currently
+        // run at most `max_workers = 1`, so peak == arena_peak. Runtime bindings
         // (input_ids/positions/etc.) and the per-step staging buffers
         // we allocate inside `execute_model` are <10 MiB and dwarfed
         // by the arena; we add a 64 MiB pad as a conservative bound.
@@ -6232,16 +6236,13 @@ impl Worker for MetalWorker {
             self.metal_prefill_bucket_max_m = Some(sel.max_bucket_m);
             Some(sel)
         };
+        // Without a loaded model and device there is no ladder to price: a 512 MiB placeholder.
         let arena_peak = match selection {
             Some(sel) => sel.arena_bytes as usize,
-            None => self
-                .model
-                .as_ref()
-                .map(|m| m.metal_arena_peak_bytes() as usize)
-                .unwrap_or(512 * 1024 * 1024),
+            None => 512 * 1024 * 1024,
         };
-        // The selected bucket's price already counts the draft's arena. Without cost tables, take
-        // the target's full-ladder peak for the draft too, as a safe upper bound.
+        // The selected bucket's price already counts the draft's arena. Without one, take the
+        // placeholder for the draft too.
         let arena_peak_pair = match (selection.is_some(), self.draft_model.is_some()) {
             (false, true) => arena_peak.saturating_mul(2),
             _ => arena_peak,
@@ -6926,7 +6927,12 @@ impl Worker for MetalWorker {
 
         let max_seqlen_q = attn.q_lens.iter().copied().max().unwrap_or(0);
         let max_seqlen_k = attn.seq_lens.iter().copied().max().unwrap_or(0);
-        let sample_indices: Vec<u32> = attn.sample_indices();
+        // The rows the step samples: every row of a request verifying drafts, any other's last.
+        // The forward's logits, its argmax and every row read off them are theirs, in order.
+        let sampled_rows = ::scratchy_serving_engine::spec_decode::SampledRows::of(
+            &cu_seqlens_u32[..=num_reqs],
+            |i| !prepared.req_inputs[i].spec_token_ids.is_empty(),
+        );
         let req_ids_in_order: Vec<String> = attn.req_ids.clone();
         let q_lens: Vec<usize> = attn.q_lens.clone();
 
@@ -6934,7 +6940,7 @@ impl Worker for MetalWorker {
         // allow-masks ───────────────────────────────────────────────────
         // For every request with an active grammar FSM that will sample a
         // real token this step, build a dense vocab bitset of its allowed
-        // tokens and record the logits row to mask (`sample_indices[i]`).
+        // tokens and record the logits row to mask (`sampled_rows.last_of(i)`).
         // The mask is dispatched before argmax in `forward_argmax_blocking`
         // (it `.take()`s `grammar_pending`), and the FSM is advanced with the
         // sampled token after readback. Skipped (no overhead) when no request
@@ -6965,7 +6971,7 @@ impl Worker for MetalWorker {
                         let Some(allowed) = guide.allowed_tokens() else {
                             continue;
                         };
-                        rows.push(sample_indices[i]);
+                        rows.push(sampled_rows.last_of(i) as u32);
                         scratchy_target_metal::grammar_mask::push_allow_bitset_row(
                             &mut allow_bits,
                             &allowed,
@@ -7074,16 +7080,6 @@ impl Worker for MetalWorker {
         // it via a dedicated trait primitive. The K-step draft chain
         // below stays inline until phase 5.4 moves it host-side into
         // `DraftModelProposer::propose`.
-        // Spec verify? Any req carrying spec_token_ids flips the gate
-        // so the lm_head slice trio (OnlyIfSingleSeqNoSpec) skips and
-        // the full GEMM (OnlyIfMultiSeqOrSpec) writes every row of
-        // logits — required for rejection sampling on > 1 sample
-        // positions per seq.
-        let has_spec_tokens = prepared
-            .req_inputs
-            .iter()
-            .any(|r| !r.spec_token_ids.is_empty());
-
         // Phase 8: when a draft model is loaded AND we're in lockstep+K
         // mode (extended-batch disabled), kick off the lockstep prefill
         // on the dedicated `draft_queue` in a scoped thread, in
@@ -7112,6 +7108,7 @@ impl Worker for MetalWorker {
             block_ids: &block_ids_u32,
             block_size,
             prompt_lens: &prompt_lens,
+            sampled: &sampled_rows,
         };
         let head_passes = match self.mtp_drafter {
             Some(drafter) if !scheduler_output.draft_req_ids.is_empty() => {
@@ -7196,9 +7193,9 @@ impl Worker for MetalWorker {
             // rejection below keeps its drafts while the sampled tokens equal them: rejection
             // sampling of one-token (greedy) drafts, whose tokens are the target's distribution.
             match req_slice.spec_token_ids.is_empty() {
-                true => fused_sample_jobs.push((i, sample_indices[i])),
+                true => fused_sample_jobs.push((i, sampled_rows.last_of(i) as u32)),
                 false => {
-                    let rows = req_slice.token_start..req_slice.token_start + req_slice.token_count;
+                    let rows = sampled_rows.of_seq(i);
                     fused_sample_jobs.extend(rows.map(|row| (i, row as u32)));
                 }
             }
@@ -7238,12 +7235,7 @@ impl Worker for MetalWorker {
                 max_seqlen_q,
                 max_seqlen_k,
                 num_tokens,
-                has_spec_tokens,
-                last_token_indices: if sample_indices.is_empty() {
-                    None
-                } else {
-                    Some(&sample_indices)
-                },
+                sampled_rows: Some(sampled_rows.rows()),
                 target_hidden: None,
             };
             // Phase 9: the worker-side speculative K-step chain (runs
@@ -7337,9 +7329,7 @@ impl Worker for MetalWorker {
                 // last-row-per-req argmax inside the scoped lockstep
                 // thread so we can compare to target's actual bonus
                 // after the join. Pure measurement — no behavioral
-                // change yet.
-                let lock_cu_for_thread = lock_cu_seqlens.to_vec();
-                // Spec-9 captures (moved into thread closure).
+                // change yet. Spec-9 captures (moved into thread closure).
                 let spec9_eligible_thread = spec9_single_req_eligible;
                 let spec9_k_thread = spec9_k;
                 let spec9_tokens_before_thread = spec9_tokens_before;
@@ -7446,8 +7436,7 @@ impl Worker for MetalWorker {
                             gdn_state: None,
                             gdn_state_indices: None,
                             gdn_is_fresh: None,
-                            has_spec_tokens: false,
-                            last_token_indices: None,
+                            sampled_rows: None,
                             device_inputs: &[],
                             deferred: None,
                             reads: Reads::Outputs,
@@ -7476,10 +7465,9 @@ impl Worker for MetalWorker {
                                 logits.as_gpu_tensor().raw_ptr() as *const u8;
                             let vocab = dm.vocab_size() as usize;
                             let mut out = Vec::with_capacity(lock_num_reqs);
+                            // The draft samples each sequence's last row: its logits row `i`.
                             for i in 0..lock_num_reqs {
-                                let last_row =
-                                    lock_cu_for_thread[i + 1] as usize - 1;
-                                let row_off = last_row * vocab * 2;
+                                let row_off = i * vocab * 2;
                                 let row = unsafe {
                                     std::slice::from_raw_parts(
                                         logits_ptr.add(row_off) as *const u16,
@@ -7570,8 +7558,7 @@ impl Worker for MetalWorker {
                                     max_seqlen_q: 1,
                                     max_seqlen_k: chain_pos + 1,
                                     num_tokens: 1,
-                                    has_spec_tokens: false,
-                                    last_token_indices: None,
+                                    sampled_rows: None,
                                     target_hidden: None,
                                 };
                             metal_chain_dispatch(
@@ -7613,13 +7600,12 @@ impl Worker for MetalWorker {
                         if !spec_seeds.is_empty() && !target_argmax.is_empty() {
                             // Probe: compare draft's predicted bonus
                             // vs target's actual bonus (per req).
-                            // cu_seqlens_q[i+1]-1 is the last verify row.
-                            let cu = &lock_cu_seqlens;
-                            for i in 0..lock_num_reqs {
-                                let target_bonus_idx = cu[i + 1] as usize - 1;
+                            // Each request's last sampled row is its last verify row.
+                            let seeds = spec_seeds.iter().take(lock_num_reqs).enumerate();
+                            for (i, &spec_seed) in seeds {
+                                let target_bonus_idx = sampled_rows.last_of(i);
                                 if target_bonus_idx < target_argmax.len() {
                                     let target_bonus = target_argmax[target_bonus_idx];
-                                    let spec_seed = spec_seeds[i];
                                     eprintln!(
                                         "[spec9-probe] req={} spec_seed={} \
                                      target_bonus={} match={}",
@@ -7670,7 +7656,7 @@ impl Worker for MetalWorker {
             for (i, req_id) in req_ids_in_order.iter().enumerate() {
                 if prepared.req_inputs[i].emits_token {
                     self.input_batch.commit_in_flight(req_id, q_lens[i]);
-                    rows.push((req_id.clone(), sample_indices[i] as usize));
+                    rows.push((req_id.clone(), sampled_rows.last_of(i)));
                 } else {
                     self.input_batch.commit_step(req_id, &[], q_lens[i], false);
                 }
@@ -7820,17 +7806,16 @@ impl Worker for MetalWorker {
                 continue;
             }
             if req_slice.spec_token_ids.is_empty() {
-                let row = sample_indices[i] as usize;
+                let row = sampled_rows.last_of(i);
                 debug_assert!(row < total_n as usize);
                 // The row's token: its sampled token for a non-greedy request,
                 // the GPU argmax otherwise (or if the fused sampler was skipped).
                 sampled_token_ids.push(vec![argmax_slice[row]]);
                 was_spec_decode.push(false);
             } else {
-                let start = req_slice.token_start;
-                let end = start + req_slice.token_count;
-                debug_assert!(end <= total_n as usize);
-                let target_ids = &argmax_slice[start..end];
+                let rows = sampled_rows.of_seq(i);
+                debug_assert!(rows.end <= total_n as usize);
+                let target_ids = &argmax_slice[rows];
                 let rejection = ::scratchy_serving_engine::spec_decode::greedy_rejection_sample(
                     target_ids,
                     &req_slice.spec_token_ids,

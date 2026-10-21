@@ -68,22 +68,11 @@ pub struct ForwardInputs<'a> {
     /// order; group 0 = full). Empty when no paged read. Same single-vs-N
     /// contract as [`Self::slot_mappings`].
     pub block_tables: Vec<&'a [u32]>,
-    /// `true` when this forward is a spec-decode verify batch (one
-    /// or more reqs carries `spec_token_ids`). Currently informational —
-    /// the lm_head slice trio reads `last_token_indices` for its row
-    /// list whether or not spec-decode is active, so this flag has no
-    /// effect on slice dispatch today. Retained for callers that pass
-    /// it; may be wired to additional gates in the future.
-    pub has_spec_tokens: bool,
-    /// `[num_sample_rows]` u32 — per-sample-row source index into the
-    /// `[num_tokens, hidden]` lm_head input. Mirrors Python vLLM's
-    /// `logits_indices = query_start_loc[1:] - 1` and the CUDA path's
-    /// `ForwardCtx.last_token_indices`. When `Some`, the lm_head slice
-    /// trio gathers these rows, runs the GEMM at `M = len`, scatters
-    /// back. `None` falls back to the full `M = bucket_m` lm_head
-    /// GEMM (used by chunked-prefill intermediate chunks that produce
-    /// no sampled tokens).
-    pub last_token_indices: Option<&'a [u32]>,
+    /// `[num_sample_rows]` u32 — the rows the forward samples, ascending: each sequence's last,
+    /// every row of a sequence verifying drafts. Python vLLM's `logits_indices`. The forward
+    /// leaves their logits at the front of its logits buffer, row `i` sampled row `i`'s. `None`:
+    /// each sequence's last row ([`Self::sampled_rows`]).
+    pub sampled_rows: Option<&'a [u32]>,
     /// `[num_seqs * 6]` i32 — a [`GdnSeqSlots`](crate::gdn_state::GdnSeqSlots) record per
     /// batched sequence (cu_seqlens order), flattened as `GdnSeqSlots::words`. `None` for
     /// non-hybrid arches; required for any bucket that runs `Instruction::GatedDeltaNet`.
@@ -154,6 +143,22 @@ pub struct ForwardInputs<'a> {
     pub deferred: Option<&'a Deferral>,
     /// What the caller reads of this forward.
     pub reads: ForwardReads,
+}
+
+impl<'a> ForwardInputs<'a> {
+    /// The rows the forward samples, ascending: the caller's, else each sequence's last row —
+    /// every row, a step that names no sequences being one token each.
+    pub fn sampled_rows(&self) -> std::borrow::Cow<'a, [u32]> {
+        use std::borrow::Cow;
+        match (self.sampled_rows, self.cu_seqlens_q) {
+            (Some(rows), _) => Cow::Borrowed(rows),
+            (None, Some(cu)) => {
+                let last = cu.windows(2).filter(|w| w[1] > w[0]).map(|w| w[1] - 1);
+                Cow::Owned(last.collect())
+            }
+            (None, None) => Cow::Owned((0..self.num_tokens).collect()),
+        }
+    }
 }
 
 /// What a forward's caller reads of it.

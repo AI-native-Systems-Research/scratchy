@@ -203,77 +203,74 @@ fn tanh_soft_cap_f16_specialized_matches_cpu() {
     assert!(max_err < 0.05, "tanh_soft_cap max_err {max_err}");
 }
 
-/// The soft cap of a step that samples caps each sequence's last row — in place, as the tape runs
-/// it — to the bits the every-row cap gives that row, and leaves every other row as it was.
+/// The logit tail over a step's sampled rows — the soft cap, the scale — runs over the rows at the
+/// buffer's front, one a grid row, in place as the tape runs it: each of them gets the bits the
+/// every-row op gives it, and every row past them stays as it was.
 #[test]
-fn tanh_soft_cap_sampled_caps_each_sequences_last_row_alone() {
+fn the_sampled_logit_tail_runs_over_the_front_rows_alone() {
     let Some(di) = detect_device() else {
         eprintln!("skipping: no Metal device");
         return;
     };
     let device = di.device.clone();
-    // Three sequences of 5, 1 and 6 rows; a width no multiple of the threadgroup's 256.
-    let (width, cu) = (1000usize, [0u32, 5, 6, 12]);
-    let rows = cu[3] as usize;
+    // Four sampled rows of twelve; a width no multiple of the threadgroup's 256.
+    let (width, rows, sampled) = (1000usize, 12usize, 4usize);
     let padded = (rows * width).next_multiple_of(256);
-    let cap = 30.0f32;
     let x = pseudo(17, padded, 80.0);
-    let constants = vec![ConstantValue::float(1, cap)];
-    let all = baked_pipeline(
-        &device,
-        "elementwise",
-        "tanh_soft_cap_f16_specialized",
-        constants,
-    )
-    .expect("tanh_soft_cap pipeline");
-    let constants = vec![
-        ConstantValue::float(1, cap),
-        ConstantValue::uint(6, width as u32),
+    let width_constant = ConstantValue::uint(6, width as u32);
+    let cases = [
+        (
+            "tanh_soft_cap_f16_specialized",
+            vec![ConstantValue::float(1, 30.0)],
+            "tanh_soft_cap_sampled_f16",
+            vec![ConstantValue::float(1, 30.0), width_constant],
+        ),
+        (
+            "scalar_mul_f16_specialized",
+            vec![
+                ConstantValue::float(2, 0.25),
+                ConstantValue::uint(3, padded as u32),
+            ],
+            "scalar_mul_sampled_f16",
+            vec![ConstantValue::float(2, 0.25), width_constant],
+        ),
     ];
-    let sampled = baked_pipeline(
-        &device,
-        "elementwise",
-        "tanh_soft_cap_sampled_f16",
-        constants,
-    )
-    .expect("tanh_soft_cap_sampled pipeline");
-    let (every, some) = (buf_f16(&device, &x), buf_f16(&device, &x));
-    dispatch_1d(&device, &all, &[&every, &every], padded);
-    let size = |width| MTLSize {
-        width,
-        height: 1,
-        depth: 1,
-    };
-    let mut groups = size(width.div_ceil(256));
-    groups.height = cu.len() - 1;
-    let cu_buf = buf_u32(&device, &cu);
-    if !common::dispatch_threadgroups(
-        &device,
-        &sampled,
-        &[&some, &some, &cu_buf],
-        groups,
-        size(256),
-    ) {
-        return;
-    }
-    let bits = |b: &Buffer| {
-        read_f16(b, rows * width)
-            .iter()
-            .map(|v| v.to_bits())
-            .collect()
-    };
-    let (every, some): (Vec<u32>, Vec<u32>) = (bits(&every), bits(&some));
-    let input: Vec<u32> = x[..rows * width]
-        .iter()
-        .map(|&v| f16::from_f32(v).to_f32().to_bits())
-        .collect();
-    for r in 0..rows {
-        let row = r * width..(r + 1) * width;
-        let want = match cu[1..].contains(&(r as u32 + 1)) {
-            true => &every[row.clone()],
-            false => &input[row.clone()],
+    for (every_row, every_constants, front_rows, front_constants) in cases {
+        let all = baked_pipeline(&device, "elementwise", every_row, every_constants)
+            .expect("every-row pipeline");
+        let front = baked_pipeline(&device, "elementwise", front_rows, front_constants)
+            .expect("sampled-rows pipeline");
+        let (every, some) = (buf_f16(&device, &x), buf_f16(&device, &x));
+        dispatch_1d(&device, &all, &[&every, &every], padded);
+        let size = |width| MTLSize {
+            width,
+            height: 1,
+            depth: 1,
         };
-        assert_eq!(&some[row], want, "row {r}");
+        let mut groups = size(width.div_ceil(256));
+        groups.height = sampled;
+        if !common::dispatch_threadgroups(&device, &front, &[&some, &some], groups, size(256)) {
+            return;
+        }
+        let bits = |b: &Buffer| {
+            read_f16(b, rows * width)
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        let (every, some): (Vec<u32>, Vec<u32>) = (bits(&every), bits(&some));
+        let input: Vec<u32> = x[..rows * width]
+            .iter()
+            .map(|&v| f16::from_f32(v).to_f32().to_bits())
+            .collect();
+        for r in 0..rows {
+            let row = r * width..(r + 1) * width;
+            let want = match r < sampled {
+                true => &every[row.clone()],
+                false => &input[row.clone()],
+            };
+            assert_eq!(&some[row], want, "{front_rows}: row {r}");
+        }
     }
 }
 
@@ -289,8 +286,6 @@ fn tanh_soft_cap_sampled_is_the_every_row_cap_at_every_input() {
     let device = di.device.clone();
     let (width, rows) = (1024usize, 64usize);
     let patterns: Vec<u16> = (0..=u16::MAX).collect();
-    let cu: Vec<u32> = (0..=rows as u32).collect();
-    let cu_buf = buf_u32(&device, &cu);
     let raw = |data: &[u16]| {
         let buf = device
             .newBufferWithLength_options(data.len() * 2, MTLResourceOptions::StorageModeShared)
@@ -326,7 +321,7 @@ fn tanh_soft_cap_sampled_is_the_every_row_cap_at_every_input() {
             height: 1,
             depth: 1,
         };
-        let buffers = [&some, &some, &cu_buf];
+        let buffers = [&some, &some];
         if !common::dispatch_threadgroups(&device, &sampled, &buffers, groups, threads) {
             return;
         }

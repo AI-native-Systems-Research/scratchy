@@ -14676,10 +14676,6 @@ pub fn emit_model(
     let mut metal_arena_bytes_statics: Vec<TokenStream> = Vec::new();
     #[cfg(feature = "metal")]
     let mut metal_tape_cmds = scratchy_target_metal_compiler::static_tape::CommandPool::default();
-    // `(bucket_m, total_colored_arena_bytes)` per bucket — the per-bucket cost
-    // the load-time `select_prefill_bucket` compares against the device's
-    // affordable arena budget to prune the ladder target-reactively.
-    let mut metal_bucket_cost_entries: Vec<TokenStream> = Vec::new();
     // Each slot's bytes at its largest bucket, and the slots holding a bucket's final hidden
     // states: what the model's arena ranks are baked from (`ArenaRanks`).
     let mut metal_ladder_arena: Vec<u64> = Vec::new();
@@ -14747,21 +14743,51 @@ pub fn emit_model(
         // entries once at init time to size the per-worker arena
         // (init-time alloc, reused across every forward).
         let bp_bounds = bounds_for_wp(model, wp, tp_world_size);
+        // The logits: the terminal tile and the in-place logit tail under it, back to the lm_head
+        // — the terminal slot's chain. A forward leaves only the rows its step samples there, so
+        // they take that slot's bytes a row (`MetalBucketSpec::logits_row_bytes`), its rows
+        // counted at load; an encoder's terminal rows are every row.
+        let logits_tiles: Vec<(TileId, u8)> = match layout {
+            BackboneLayout::Decoder { .. } => {
+                let mut chain = vec![(last_node_id, 0u8)];
+                while let Some(&(tile, _)) = chain.last() {
+                    let under = fuf.get(tile).inputs.iter().find_map(|i| match *i {
+                        crate::fuf::FufInput::Tile { id, slot }
+                            if slots_b.of(id, slot) == *terminal_slot_b =>
+                        {
+                            Some((id, slot))
+                        }
+                        _ => None,
+                    });
+                    match under {
+                        Some(under) if !chain.contains(&under) => chain.push(under),
+                        _ => break,
+                    }
+                }
+                chain
+            }
+            BackboneLayout::Encoder => Vec::new(),
+        };
         let mut bucket_arena_bytes: Vec<u64> = vec![0u64; *num_slots_b as usize];
+        let mut logits_row_bytes: u64 = 0;
         for ((tile_id, out_slot), color) in slots_b.iter() {
             let node = fuf.get(tile_id);
             let shape = &node.outputs[out_slot as usize];
-            let elems: u64 = crate::weight_vocab::eval_shape_with(shape, &bp_bounds)
-                .expect("shape inference left a Var in a tile output — codegen invariant")
-                .into_iter()
-                .product();
+            let dims = crate::weight_vocab::eval_shape_with(shape, &bp_bounds)
+                .expect("shape inference left a Var in a tile output — codegen invariant");
             // f16 = 2 bytes/element; metal kernels are f16-only.
-            let bytes = elems.saturating_mul(2);
+            if logits_tiles.contains(&(tile_id, out_slot)) {
+                let row: u64 = dims.iter().skip(1).product();
+                logits_row_bytes = logits_row_bytes.max(row.saturating_mul(2));
+                continue;
+            }
+            let bytes = dims.into_iter().product::<u64>().saturating_mul(2);
             let slot_idx = color as usize;
             if bytes > bucket_arena_bytes[slot_idx] {
                 bucket_arena_bytes[slot_idx] = bytes;
             }
         }
+        let logits_row_bytes_lit = proc_macro2::Literal::u64_unsuffixed(logits_row_bytes);
         // Every color must have at least one (tile, slot) pair; if
         // the worker ever sees a 0-byte arena slot it'll fail the
         // ICB residency. Guarantee a 1-byte minimum so unused colors
@@ -14779,15 +14805,6 @@ pub fn emit_model(
             *ladder = (*ladder).max(bytes);
         }
         metal_hidden_slots.insert(*backbone_slot_b);
-
-        // Per-bucket total arena cost (sum over colored slots) for the
-        // load-time selector. Monotonic in `m`; consumed by
-        // `select_prefill_bucket` via `metal_bucket_arena_costs()`.
-        let bucket_total_arena_lit =
-            proc_macro2::Literal::u64_unsuffixed(bucket_arena_bytes.iter().sum::<u64>());
-        metal_bucket_cost_entries.push(quote! {
-            (#bucket_m_lit, #bucket_total_arena_lit),
-        });
 
         let arena_static_ident = bucket_static_ident("METAL_ARENA_BYTES_M", wp);
         let arena_bytes_lits = bucket_arena_bytes
@@ -14861,6 +14878,7 @@ pub fn emit_model(
                 terminal_slot: #terminal_slot_lit,
                 backbone_slot: #backbone_slot_lit,
                 arena_bytes: #arena_static_ident,
+                logits_row_bytes: #logits_row_bytes_lit,
                 backbone: #bb_static,
                 lm_head: #lm_static,
                 backbone_barriers: #bb_barriers_static,
@@ -14996,51 +15014,11 @@ pub fn emit_model(
         BackboneLayout::Encoder => model.bounds.get("hidden_size").copied().unwrap_or(0),
     };
     let vocab_size_lit = proc_macro2::Literal::u64_unsuffixed(logits_width);
-
-    // Per-worker arena peak in bytes — sum across every slot of the
-    // worker's arena layout, where each slot is sized to fit the
-    // largest tape_index's claim on that color. The pool computes this
-    // exact layout at runtime via elementwise-max across each
-    // `MetalBucketSpec.arena_bytes`; we mirror that calculation here
-    // at compile time so the metal worker can pre-declare its
-    // resident-arena bytes via the ScratchyWeights trait (used to
-    // size the `peak_activation_bytes` argument to
-    // `compute_available_kv_bytes`).
-    let metal_arena_peak_bytes_lit = {
-        let mut layout: Vec<u64> = Vec::new();
-        for &m in &num_tokens_points {
-            let wp = bucket_points
-                .iter()
-                .find(|wp| wp.num_tokens == m && wp.sk_bucket == 0)
-                .copied()
-                .or_else(|| bucket_points.iter().find(|wp| wp.num_tokens == m).copied())
-                .expect("every num_tokens point has at least one wp");
-            let i = bucket_points
-                .iter()
-                .position(|w| *w == wp)
-                .expect("wp came from bucket_points");
-            let canonical = bucket_canonical[i];
-            let (_, num_slots_b, _, _, slots_b) = &canonical_lowered[&canonical];
-            if layout.len() < *num_slots_b as usize {
-                layout.resize(*num_slots_b as usize, 0);
-            }
-            let bp_bounds = bounds_for_wp(model, wp, tp_world_size);
-            for ((tile_id, out_slot), color) in slots_b.iter() {
-                let node = fuf.get(tile_id);
-                let shape = &node.outputs[out_slot as usize];
-                let elems: u64 = crate::weight_vocab::eval_shape_with(shape, &bp_bounds)
-                    .expect("shape inference left a Var in a tile output")
-                    .into_iter()
-                    .product();
-                let bytes = elems.saturating_mul(2);
-                let slot_idx = color as usize;
-                if bytes > layout[slot_idx] {
-                    layout[slot_idx] = bytes;
-                }
-            }
-        }
-        let total: u64 = layout.iter().sum();
-        proc_macro2::Literal::u64_unsuffixed(total)
+    // The rows of the terminal slot a forward leaves for its caller: a decoder's logits of the
+    // rows its step samples, at the front; an encoder's hidden state at every row.
+    let terminal_rows = match layout {
+        BackboneLayout::Decoder { .. } => quote! { inputs.sampled_rows().len() },
+        BackboneLayout::Encoder => quote! { n },
     };
 
     // Per-forward MRoPE cos/sin override builder, spliced into the metal
@@ -15243,28 +15221,6 @@ pub fn emit_model(
         /// `OwnedTensor` as `[num_tokens, METAL_VOCAB_SIZE]` f16.
         #[cfg(feature = "metal")]
         pub const METAL_VOCAB_SIZE: u64 = #vocab_size_lit;
-
-        /// Per-worker arena peak in bytes for this canonical. The
-        /// pool's `arena_layout` is the elementwise-max across every
-        /// tape_index spec's `arena_bytes`; per-canonical that's the
-        /// shared `METAL_ARENA_BYTES_M_<m>` static (every tape_index in
-        /// one canonical points at the same row), so the sum equals
-        /// the worker's resident-arena byte footprint. Read by
-        /// `MetalWorker::determine_available_memory` to
-        /// replace the 512 MiB peak-activation placeholder.
-        #[cfg(feature = "metal")]
-        pub const METAL_ARENA_PEAK_BYTES: u64 = #metal_arena_peak_bytes_lit;
-
-        /// `(bucket_m, total_colored_arena_bytes)` for every compiled bucket
-        /// of this canonical, ascending by `bucket_m`. The load-time
-        /// `select_prefill_bucket` reads this (via
-        /// `ScratchyWeights::metal_bucket_arena_costs`) to prune the global
-        /// ladder to the largest bucket the device can afford while leaving a
-        /// KV floor — the target-reactive replacement for a hardcoded
-        /// per-model `workloads` cap.
-        #[cfg(feature = "metal")]
-        pub static METAL_BUCKET_ARENA_COSTS: &[(u32, u64)] =
-            &[ #(#metal_bucket_cost_entries)* ];
 
         /// Build a [`MetalWorkerPool`] for this canonical. Thin
         /// wrapper over [`MetalWorkerPool::for_buckets`] that threads
@@ -15570,14 +15526,13 @@ pub fn emit_model(
                             // forward()'s `num_tokens` here before
                             // dispatch so per-call kernels see M.
                             num_tokens_u32: alloc(4),
-                            // 4 bytes — worker writes `num_sample_rows`
-                            // here (= last_token_indices.len()) before
-                            // dispatch so the lm_head slice's gather /
-                            // scatter / qmv know how many rows to act on.
+                            // 4 bytes — worker writes the sampled rows'
+                            // count here before dispatch so the lm_head
+                            // slice's gather / scatter know how many rows
+                            // to move.
                             num_sample_rows_u32: alloc(4),
-                            // [max_m] u32 — worker writes the lm_head
-                            // sample-row source indices here before
-                            // dispatch.
+                            // [max_m] u32 — worker writes the sampled
+                            // rows here before dispatch.
                             sample_indices: alloc(max_m * 4),
                             // GDN persistent state (per-layer) + per-forward
                             // indices/fresh flags (Shared, overwritten each
@@ -15777,14 +15732,9 @@ pub fn emit_model(
                 })
                 .collect();
 
-            // Plumb the lm_head sample-row index list from ForwardCtx.
-            // `last_token_indices` is `Option<TensorView>` — present
-            // when the worker built `logits_indices = query_start_loc[1:] - 1`
-            // (any prefill/decode that produces a sampled token), absent
-            // for chunked-prefill intermediate chunks. The metal slice
-            // gathers exactly these rows then runs the lm_head qmv at
-            // M = indices.len().
-            let last_token_indices = ctx.last_token_indices.as_ref().map(|view| {
+            // The rows the forward samples (`None`: each sequence's last): the
+            // lm_head leaves their logits at the front of its output, in order.
+            let sampled_rows = ctx.sampled_rows.as_ref().map(|view| {
                 let raw = view.as_raw();
                 ::std::slice::from_raw_parts(raw.raw_ptr() as *const u32, raw.numel())
             });
@@ -15918,8 +15868,7 @@ pub fn emit_model(
                     .into_iter()
                     .chain(sliding_block_tables)
                     .collect(),
-                has_spec_tokens: ctx.has_spec_tokens,
-                last_token_indices,
+                sampled_rows,
                 gdn_state_indices,
                 gdn_is_fresh,
                 vision_rope_freqs,
@@ -15975,38 +15924,38 @@ pub fn emit_model(
             // `executeCommandsInBuffer` (interleaved with MPS GEMMs
             // on <M4 hardware), waits for completion, then invokes
             // the closure with `&MetalWorker` + `bucket_idx`. The
-            // tape_index's terminal arena slot holds the lm_head output;
+            // tape_index's terminal arena slot holds the lm_head output —
+            // the logits of the rows the step samples, at its front;
             // we wrap that buffer in a fresh `OwnedTensor` (Arc-
             // handle clone — no copy) so the caller can read
-            // `[num_tokens, vocab_size]` f16 logits without taking
+            // `[sampled rows, vocab_size]` f16 logits without taking
             // ownership of the worker's arena.
-            // Adapter: pool's tail receives `(encoder, worker, bucket_idx)`
-            // and returns `Result<(), ForwardError>`. The public hook
-            // is `(encoder, logits_buf, total_n, vocab) -> Result<(), String>`.
-            // Resolve logits + dims from the worker's arena and the
-            // canonical's compile-time vocab; map error variants.
-            let tail_adapter = followup.map(|f| {
-                move |enc: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
-                          dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
-                      >,
-                      worker: &::scratchy_target_metal::interpreter::metal::MetalWorker<Weights>,
-                      bucket_idx: usize|
-                      -> ::core::result::Result<
-                    (),
-                    ::scratchy_target_metal::interpreter::metal::ForwardError,
-                > {
-                    let spec = &METAL_BUCKETS[bucket_idx];
-                    let logits_buf = &worker.arena[spec.terminal_slot as usize];
-                    let hidden_buf = &worker.arena[spec.backbone_slot as usize];
-                    let total_n = n as u32;
-                    let vocab = METAL_VOCAB_SIZE as u32;
-                    f(enc, logits_buf, hidden_buf, total_n, vocab).map_err(
-                        ::scratchy_target_metal::interpreter::metal::ForwardError::Followup,
-                    )
-                }
-            });
-
             with_forward_inputs(ctx, num_tokens, |inputs| {
+                let rows = #terminal_rows;
+                // Adapter: pool's tail receives `(encoder, worker, bucket_idx)`
+                // and returns `Result<(), ForwardError>`. The public hook
+                // is `(encoder, logits_buf, total_n, vocab) -> Result<(), String>`.
+                // Resolve logits + dims from the worker's arena and the
+                // canonical's compile-time vocab; map error variants.
+                let tail_adapter = followup.map(|f| {
+                    move |enc: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
+                              dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
+                          >,
+                          worker: &::scratchy_target_metal::interpreter::metal::MetalWorker<Weights>,
+                          bucket_idx: usize|
+                          -> ::core::result::Result<
+                        (),
+                        ::scratchy_target_metal::interpreter::metal::ForwardError,
+                    > {
+                        let spec = &METAL_BUCKETS[bucket_idx];
+                        let logits_buf = &worker.arena[spec.terminal_slot as usize];
+                        let hidden_buf = &worker.arena[spec.backbone_slot as usize];
+                        let vocab = METAL_VOCAB_SIZE as u32;
+                        f(enc, logits_buf, hidden_buf, rows as u32, vocab).map_err(
+                            ::scratchy_target_metal::interpreter::metal::ForwardError::Followup,
+                        )
+                    }
+                });
                 pool.forward_with_tail(
                     inputs,
                     |worker, bucket_idx| {
@@ -16034,8 +15983,8 @@ pub fn emit_model(
                         }
                         let buf = worker.arena[spec.terminal_slot as usize].clone();
                         let vocab = METAL_VOCAB_SIZE as usize;
-                        let shape = [n, vocab];
-                        let bytes = n * vocab * 2; // bf16/f16 — both 2 bytes
+                        let shape = [rows, vocab];
+                        let bytes = rows * vocab * 2; // bf16/f16 — both 2 bytes
                         let dtype = match <Weights as ::scratchy_forward_compiler::CanonicalParams>::METAL_DTYPE {
                             ::scratchy_target_metal::interpreter::metal::MetalDtype::F16 =>
                                 crate::__gpu::dtype::DType::F16,
@@ -16191,14 +16140,14 @@ pub fn emit_model(
                                 >,
                                 num_tokens: u32,
                                 num_seqs: u32,
-                                has_spec_tokens: bool,
+                                sampled_rows: u32,
                             ) -> ::core::result::Result<(), ::std::string::String> {
                                 self.worker
                                     .run_bucket_mtl4(
                                         self.bucket_idx,
                                         num_tokens,
                                         num_seqs,
-                                        has_spec_tokens,
+                                        sampled_rows,
                                         ::scratchy_target_metal::interpreter::metal::ForwardReads::Outputs,
                                         encoder,
                                     )
@@ -16481,7 +16430,7 @@ fn emit_shim_model(
         pub use super::#canonical::{
             forward, forward_chain_with_encoder, forward_onto, forward_with_metal_followup,
             metal_rope_rows,
-            METAL_ARENA_PEAK_BYTES, METAL_BUCKET_ARENA_COSTS, METAL_BUCKETS, METAL_OFF_TAPE, METAL_RUNGS,
+            METAL_BUCKETS, METAL_OFF_TAPE, METAL_RUNGS,
             metal_pool,
         };
     };

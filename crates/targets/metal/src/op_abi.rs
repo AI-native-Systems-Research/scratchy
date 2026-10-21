@@ -177,10 +177,11 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
 
 // ── The sampled rows ────────────────────────────────────────────────
 
-/// Metal's sampled rows: the MLX-affine result matmul, whose sampled rows the lm_head slice
-/// computes with qmv.
+/// Metal's sampled rows: every result matmul it runs leaves the sampled rows' logits at the front
+/// of its output — the MLX-affine one's computed by the lm_head slice's qmv, a dense one's moved
+/// there after its GEMM.
 pub const METAL_SAMPLE_ROWS: SampleRowsFacts = SampleRowsFacts {
-    weights: &[GemmWeightKind::Affine],
+    weights: &[GemmWeightKind::Affine, GemmWeightKind::Dense],
 };
 
 // ── The KV codec (TurboQuant) ───────────────────────────────────────

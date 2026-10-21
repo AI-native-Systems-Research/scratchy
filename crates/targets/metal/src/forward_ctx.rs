@@ -10,9 +10,10 @@
 //! `::scratchy_target_metal::ForwardCtx` directly.
 //!
 //! This is the metal sibling of the cuda `ForwardCtx`: the vision fields are
-//! unconditional (metal is the only configuration here), `has_spec_tokens` is
-//! kept (the metal lm_head slice gating reads it), and the cuda-only nccl
-//! `tp_group` field is absent (metal is single-device).
+//! unconditional (metal is the only configuration here), the rows a forward
+//! samples are its `sampled_rows` (a verify step's every row too, so it needs no
+//! speculative flag), and the cuda-only nccl `tp_group` field is absent (metal
+//! is single-device).
 
 use crate::TensorView;
 use crate::gdn_state::GdnStatePool;
@@ -75,12 +76,6 @@ pub struct ForwardCtx<'a> {
     /// Per-sequence GDN fresh flags, shape `[num_seqs]` u32 — 1 on a
     /// sequence's first (fresh) forward. `None` for non-hybrid arches.
     pub gdn_is_fresh: Option<TensorView<'a>>,
-    /// `true` when at least one req in this forward carries `spec_token_ids`
-    /// (= a spec-decode verify batch). Threaded through to `gate_matches` so
-    /// the lm_head slice trio (gated `OnlyIfSingleSeqNoSpec`) skips and the
-    /// full `M=bucket_m` lm_head fallback (gated `OnlyIfMultiSeqOrSpec`) fires.
-    /// Caller sets `false` for prefill / decode / lockstep / draft chain.
-    pub has_spec_tokens: bool,
     /// Multimodal embed splice. `mm_embeds` carries the projected
     /// vision-encoder output `[total_mm_tokens, hidden]`; `embed_patches`
     /// names the destination ranges in the input-id sequence. Empty
@@ -131,10 +126,10 @@ pub struct ForwardCtx<'a> {
     /// Consumed by `Instruction::PosEmbed`. `None` for text-side forwards and
     /// vision arches without a positional embedding.
     pub vision_position_ids: Option<TensorView<'a>>,
-    /// Per-sequence final-token row indices, `[num_seqs]` u32. `Some(_)` when
-    /// `num_seqs < num_tokens` so the lm_head GEMM gathers before the matmul;
-    /// `None` at decode or when not built by the worker.
-    pub last_token_indices: Option<TensorView<'a>>,
+    /// The rows the forward samples, `[num_sample_rows]` u32 ascending: each
+    /// sequence's last, every row of a sequence verifying drafts. Their logits
+    /// lead the forward's logits, in order. `None`: each sequence's last row.
+    pub sampled_rows: Option<TensorView<'a>>,
     /// Bytes earlier forwards wrote on the device, for this one's runtime inputs.
     pub device_inputs: &'a [crate::interpreter::metal::DeviceInput],
     /// `Some`: the host does not wait for this forward

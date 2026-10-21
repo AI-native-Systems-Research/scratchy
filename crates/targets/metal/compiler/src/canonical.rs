@@ -260,7 +260,8 @@ fn decode_barriers(t: &Assembled, flags: &[Fence], m: u64) -> usize {
     let decode = StepFacts {
         num_tokens: rows,
         num_seqs: rows,
-        has_spec_tokens: false,
+        // A decode step samples its every row.
+        sampled_rows: rows,
         unrotated_blocks: false,
         gdn_plain: true,
         // A decode step's sequences are one row each.
