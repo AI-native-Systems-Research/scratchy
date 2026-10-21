@@ -213,6 +213,8 @@ pub struct TapeColouring {
     by_slot: HashMap<SlotId, (Colour, Option<Colour>)>,
     count: ColourCount,
     result: Colour,
+    /// The `(rows, cols)` of every colour the scan minted: the one shape every holder of it has.
+    colour_shape: HashMap<Colour, (u32, u32)>,
 }
 
 impl TapeColouring {
@@ -233,6 +235,14 @@ impl TapeColouring {
     /// The colour holding the forward's result.
     pub fn result(&self) -> Colour {
         self.result
+    }
+
+    /// The `(rows, cols)` of every value colour `c` holds: a colour is reused only by a value of
+    /// the same shape, so this is exact. `None` for colour 0, which is the colour-zero source's
+    /// buffer and sized by that source, and for a two-output step's second colour, whose shape
+    /// the scan never sees.
+    pub fn shape_of(&self, c: Colour) -> Option<(u32, u32)> {
+        self.colour_shape.get(&c).copied()
     }
 }
 
@@ -608,6 +618,7 @@ pub fn colour_tape(
         by_slot,
         count: ColourCount(next),
         result: colour[result_owner].expect("the scan colours every step"),
+        colour_shape,
     })
 }
 
@@ -951,6 +962,74 @@ mod tests {
         assert_eq!(direct[4], direct[2]);
         assert_eq!(peeled[4], peeled[0]);
         assert_ne!(peeled[0], peeled[2]);
+    }
+
+    /// Every fresh step's colour reports that step's output shape; colour 0 and a second colour
+    /// report none.
+    #[test]
+    fn shape_of_is_each_colours_value_shape() {
+        // The neutral table, with the product declared two-output.
+        fn two_output_rule(op: &SubOp) -> ColourRule {
+            match op {
+                SubOp::Elementwise(EwKind::Mul) => ColourRule::FRESH.two_outputs(),
+                _ => rule(op),
+            }
+        }
+        let facts = ColourFacts {
+            rule: two_output_rule,
+            colour_zero: SourceBinding::EmbeddedHidden,
+        };
+        let ops = vec![
+            gemm(64, vec![Ext(0), Ext(1)]),
+            op(ADD, 1, vec![Op(0), Ext(0)]),
+            gemm(128, vec![Op(1), Ext(2)]),
+            op(MUL, 1, vec![Op(2), Op(2)]),
+            gemm(64, vec![Op(3), Ext(3)]),
+            gemm(128, vec![Op(4), Ext(2)]),
+        ];
+        let input = LoweringInput {
+            sources: [(1, 64), (64, 64), (64, 128), (128, 64)]
+                .iter()
+                .map(|&(rows, cols)| SourceShape { rows, cols })
+                .collect(),
+            result: ops.len() - 1,
+            exported: None,
+            ops,
+        };
+        let mut bindings = weights(4);
+        bindings[0] = SourceBinding::EmbeddedHidden;
+        let graph = lower_region(&input, std::num::NonZeroU32::MAX);
+        let tape = lower_dag_to_tape(&ValidatedGraph::new(&graph).expect("a valid fixture"));
+        let c = colour_tape(&graph, &tape, &bindings, &FoldFacts::default(), &facts).unwrap();
+        let steps: Vec<(SlotId, &SubOp, (u32, u32))> = (tape.instrs().iter())
+            .filter_map(|i| match i {
+                Instr::Compute { node, writes, .. } => {
+                    let node = &graph.nodes[node.index()];
+                    let shape = graph.shape(node.output.tensor);
+                    Some((*writes, &node.op, (shape.rows, shape.cols)))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut fresh = 0;
+        for &(slot, op, shape) in &steps {
+            let colour = c.colour_of(slot).unwrap();
+            if matches!(op, SubOp::Elementwise(EwKind::Add)) {
+                // Written over the colour-zero source.
+                assert_eq!(colour, Colour::ZERO);
+            } else {
+                assert_eq!(c.shape_of(colour), Some(shape), "{}", op.name());
+                fresh += 1;
+            }
+        }
+        assert_eq!(fresh, 5);
+        // The last projection reuses the first `[1, 128]` colour, whose shape stays its own.
+        assert_eq!(c.colour_of(steps[5].0), c.colour_of(steps[2].0));
+        assert_eq!(c.shape_of(Colour::ZERO), None);
+        let second = c
+            .second_colour_of(steps[3].0)
+            .expect("the product writes two buffers");
+        assert_eq!(c.shape_of(second), None);
     }
 
     #[test]

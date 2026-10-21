@@ -6,23 +6,32 @@
 //! from whole ops, the fold pass, the colourer. Then CUDA's opcode lowering ([`steps_from_tape`]).
 //!
 //! No KV codec (CUDA is bf16 only) and no wave order (that pass exists because metal's barriers
-//! drain everything in flight; CUDA runs one stream in order). No re-roll either: the unrolled
-//! tape is what the colourer and the fold pass read, and nothing here lays steps out along a loop.
+//! drain everything in flight; CUDA runs one stream in order, so its tape has no barrier at all).
+//! No re-roll either: the unrolled tape is what the colourer and the fold pass read, and nothing
+//! here lays steps out along a loop.
+//!
+//! The result is one bucket's tape in parts ([`CudaCanonical`]): the arena's layout, sized here
+//! from the colourer's per-colour shapes, the input and result spans, each weight's bytes, and the
+//! steps. They are the fields of a `static` `scratchy_target_cuda::tape::CudaTape`.
 //!
 //! [`steps_from_tape`]: crate::steps_from_tape
 
-use scratchy_subtile::handoff::LoweredDecode;
+use std::collections::BTreeMap;
+
+use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
+use scratchy_subtile::lower::GemmWeightKind;
 use scratchy_subtile::sample_rows::{SampleRowsError, expand_sample_rows};
 use scratchy_subtile::subtile_ir::{SubtileIR, ValidatedGraph, lower_region};
 use scratchy_subtile::subtile_tape::{Instr, SubtileTape, lower_dag_to_tape};
-use scratchy_subtile::tape_colouring::{ColourCount, ColourError, TapeColouring, colour_tape};
+use scratchy_subtile::tape_colouring::{Colour, ColourError, TapeColouring, colour_tape};
 use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, TapeFolds, fold_tape};
 use scratchy_target_cuda::op_abi::{
     CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_FUSIONS, CUDA_SAMPLE_ROWS, CudaFusion,
 };
 use scratchy_target_cuda::step::CudaStep;
+use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN};
 
-use crate::steps_from_tape::lower_step;
+use crate::steps_from_tape::{StepCx, TapeStep, lower_step};
 
 /// Which canonical this is, for the refusals.
 #[derive(Clone, Copy, Debug)]
@@ -43,9 +52,23 @@ pub struct CudaPlan {
     pub colouring: TapeColouring,
 }
 
-/// One decode canonical, lowered.
+/// One decode canonical, lowered: the parts of one bucket's `CudaTape`, every one a constant.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CudaCanonical {
-    pub colours: ColourCount,
+    /// The bucket's token count: the rows of the embedded hidden, colour 0.
+    pub bucket_m: u32,
+    /// Per colour: its value's `rows × cols × CUDA_ACT_BYTES`.
+    pub colour_bytes: Vec<u64>,
+    /// Per colour: the sum of the `CUDA_ARENA_ALIGN`-aligned sizes of the colours before it.
+    pub colour_offsets: Vec<u64>,
+    /// Every colour's aligned size, summed.
+    pub total_bytes: u64,
+    /// Colour 0, the embedded hidden the forward uploads.
+    pub input: ArenaSpan,
+    /// The colourer's result colour, which the forward downloads.
+    pub result: ArenaSpan,
+    /// Per source index: its weight buffer's bytes; 0 for a source that is not a weight.
+    pub weight_bytes: Vec<u64>,
     /// One step per `Compute` on the tape, in tape order.
     pub steps: Vec<CudaStep>,
 }
@@ -63,6 +86,85 @@ pub enum CanonicalRefusal {
         step: usize,
         op: &'static str,
     },
+    /// The `step`-th `Compute` is a GEMM of a shape the bf16 kernel does not take.
+    GemmShape {
+        step: usize,
+        m: u32,
+        n: u32,
+        k: u32,
+        rule: GemmShapeRule,
+    },
+    /// The `step`-th `Compute` is a GEMM whose weight is not dense bf16.
+    GemmWeight {
+        step: usize,
+        weight: GemmWeightKind,
+    },
+    /// An operand of the `step`-th `Compute` that its kernel cannot bind.
+    Operand {
+        step: usize,
+        op: &'static str,
+        operand: u8,
+        why: OperandRefusal,
+    },
+    /// The `step`-th `Compute` writes part of its output tensor.
+    PartialWrite {
+        step: usize,
+        op: &'static str,
+    },
+    /// The arena cannot be laid out.
+    Arena(ArenaRefusal),
+}
+
+/// Which rule a GEMM's shape breaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemmShapeRule {
+    /// `m = 1`: a decode GEMV, which has no kernel yet.
+    Decode,
+    /// `dim` is zero or not a multiple of the kernel's `tile`.
+    OffTile {
+        dim: &'static str,
+        value: u32,
+        tile: u32,
+    },
+    /// `dim` is above `i32::MAX`, the largest dimension ThunderKittens' `gl` stores.
+    AboveIntMax { dim: &'static str, value: u32 },
+}
+
+/// Why an operand cannot be bound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OperandRefusal {
+    /// The step has no such operand.
+    Missing,
+    /// The operand reads part of its tensor; a kernel binds whole buffers.
+    PartialRead,
+    /// The operand is a re-rolled per-layer source; CUDA does not re-roll.
+    PerLayer,
+    /// The operand has this many writers; one buffer cannot hold it.
+    SplitWriters(usize),
+    /// An activation operand is a source other than the embedded hidden.
+    NotHiddenOrSlot {
+        source: usize,
+        binding: SourceBinding,
+    },
+    /// A weight operand is not a model weight: this source, or a computed value (`None`).
+    NotAWeight {
+        source: Option<(usize, SourceBinding)>,
+    },
+}
+
+/// Why the arena cannot be laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArenaRefusal {
+    /// No source is bound to the embedded hidden, so colour 0 has no size and the forward has no
+    /// input. Until the embedding opcode lowers, colour 0's contents are the forward's input.
+    NoEmbeddedHidden,
+    /// Several sources are bound to the embedded hidden; colour 0 is one buffer.
+    SeveralEmbeddedHidden,
+    /// The colourer reports no shape for this colour (a two-output step's second buffer), so it
+    /// cannot be sized.
+    UnsizedColour(u32),
+    /// The arena's bytes overflow `u64`.
+    TooLarge,
 }
 
 impl std::fmt::Display for CanonicalRefusal {
@@ -76,6 +178,103 @@ impl std::fmt::Display for CanonicalRefusal {
                 f,
                 "step {step} computes {op}, which the cuda backend does not lower yet"
             ),
+            Self::GemmShape {
+                step,
+                m,
+                n,
+                k,
+                rule,
+            } => write!(
+                f,
+                "step {step} is a GEMM of m={m} n={n} k={k}, which the bf16 kernel refuses: {rule}"
+            ),
+            Self::GemmWeight { step, weight } => write!(
+                f,
+                "step {step} is a GEMM over a {weight:?} weight; the bf16 kernel takes Dense only"
+            ),
+            Self::Operand {
+                step,
+                op,
+                operand,
+                why,
+            } => write!(
+                f,
+                "step {step} ({op}) operand {operand} cannot be bound: {why}"
+            ),
+            Self::PartialWrite { step, op } => write!(
+                f,
+                "step {step} ({op}) writes part of its output tensor; a kernel writes a whole one"
+            ),
+            Self::Arena(e) => write!(f, "the arena cannot be laid out: {e}"),
+        }
+    }
+}
+
+impl std::fmt::Display for GemmShapeRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decode => write!(
+                f,
+                "m = 1 is a decode GEMV, and CUDA has no decode GEMV kernel yet"
+            ),
+            Self::OffTile { dim, value, tile } => write!(
+                f,
+                "{dim} = {value} must be a non-zero multiple of {tile}, the bf16 GEMM's tile"
+            ),
+            Self::AboveIntMax { dim, value } => write!(
+                f,
+                "{dim} = {value} is above {}, the largest dimension ThunderKittens' `gl` stores",
+                i32::MAX
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for OperandRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(f, "the step has no such operand"),
+            Self::PartialRead => {
+                write!(f, "it reads part of its tensor; a kernel binds a whole one")
+            }
+            Self::PerLayer => write!(f, "it is a per-layer source, and CUDA does not re-roll"),
+            Self::SplitWriters(n) => write!(f, "it has {n} writers; one buffer cannot hold it"),
+            Self::NotHiddenOrSlot { source, binding } => write!(
+                f,
+                "it reads source {source} ({binding:?}); an activation must be a computed slot \
+                 or the embedded hidden"
+            ),
+            Self::NotAWeight {
+                source: Some((source, binding)),
+            } => write!(
+                f,
+                "it reads source {source} ({binding:?}); the GEMM's B must be a model weight"
+            ),
+            Self::NotAWeight { source: None } => write!(
+                f,
+                "it reads a computed value; the GEMM's B must be a model weight"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for ArenaRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoEmbeddedHidden => write!(
+                f,
+                "no source is bound to the embedded hidden: colour 0 has no size and the forward \
+                 has no input"
+            ),
+            Self::SeveralEmbeddedHidden => write!(
+                f,
+                "several sources are bound to the embedded hidden, and colour 0 is one buffer"
+            ),
+            Self::UnsizedColour(c) => write!(
+                f,
+                "colour {c} has no shape (a two-output step's second buffer), so it cannot be sized"
+            ),
+            Self::TooLarge => write!(f, "the arena's bytes overflow u64"),
         }
     }
 }
@@ -123,23 +322,137 @@ pub fn plan_canonical(
     })
 }
 
-/// Lower one decode canonical: [`plan_canonical`], then every `Compute` on the tape through CUDA's
-/// opcode lowering, in tape order.
+/// Lower one decode canonical: [`plan_canonical`], the arena laid out from the colouring, then
+/// every `Compute` on the tape through CUDA's opcode lowering, in tape order.
+///
+/// A step's refusal comes before the arena's: a canonical whose first op has no lowering is
+/// refused for that op, whatever its bindings.
 pub fn lower_canonical(
     l: &LoweredDecode,
     at: CanonicalAt<'_>,
 ) -> Result<CudaCanonical, CanonicalRefusal> {
     let plan = plan_canonical(l, at)?;
+    let arena = arena_layout(&plan);
+    let cx = StepCx {
+        graph: &plan.graph,
+        bindings: &plan.lowered.bindings,
+        colouring: &plan.colouring,
+        offsets: match &arena {
+            Ok(a) => Ok(a.offsets.as_slice()),
+            Err(e) => Err(*e),
+        },
+    };
     let steps = (plan.tape.instrs().iter())
         .filter_map(|i| match i {
-            Instr::Compute { node, .. } => Some(&plan.graph.nodes[node.index()].op),
+            Instr::Compute {
+                node,
+                writes,
+                inputs,
+                ..
+            } => Some((&plan.graph.nodes[node.index()], *writes, inputs)),
             _ => None,
         })
         .enumerate()
-        .map(|(step, op)| lower_step(step, op))
+        .map(|(step, (node, writes, inputs))| {
+            let s = TapeStep {
+                step,
+                node,
+                writes,
+                inputs,
+            };
+            lower_step(&cx, &s)
+        })
         .collect::<Result<Vec<_>, _>>()?;
+    let arena = arena.map_err(CanonicalRefusal::Arena)?;
+    let span = |c: Colour| ArenaSpan {
+        offset: ArenaOffset(arena.offsets[c.index() as usize]),
+        bytes: arena.bytes[c.index() as usize],
+    };
+    let (input, result) = (span(Colour::ZERO), span(plan.colouring.result()));
+    let weight_bytes = (plan.lowered.bindings.iter().enumerate())
+        .map(|(t, binding)| match binding {
+            SourceBinding::Weight { .. } => {
+                let shape = plan.graph.tensors[t];
+                elements_bytes(shape.rows, shape.cols).ok_or(ArenaRefusal::TooLarge)
+            }
+            _ => Ok(0),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(CanonicalRefusal::Arena)?;
     Ok(CudaCanonical {
-        colours: plan.colouring.count(),
+        bucket_m: arena.bucket_m,
+        colour_bytes: arena.bytes,
+        colour_offsets: arena.offsets,
+        total_bytes: arena.total,
+        input,
+        result,
+        weight_bytes,
         steps,
     })
+}
+
+/// The arena of one canonical: each colour's bytes and offset, and their total.
+struct Arena {
+    bucket_m: u32,
+    bytes: Vec<u64>,
+    offsets: Vec<u64>,
+    total: u64,
+}
+
+/// Size every colour from the shape its values share, and place the colours one after another in
+/// colour order, each at a multiple of [`CUDA_ARENA_ALIGN`]. Colour 0 is the embedded hidden's
+/// buffer, so it is sized from the source bound to it.
+fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
+    let mut hidden = (plan.lowered.bindings.iter().enumerate())
+        .filter(|(_, b)| **b == SourceBinding::EmbeddedHidden)
+        .map(|(t, _)| plan.graph.tensors[t]);
+    let hidden = match (hidden.next(), hidden.next()) {
+        (Some(h), None) => h,
+        (None, _) => return Err(ArenaRefusal::NoEmbeddedHidden),
+        (Some(_), Some(_)) => return Err(ArenaRefusal::SeveralEmbeddedHidden),
+    };
+    // Every colour the tape's steps were given, by index: a slot's colour, and a two-output
+    // step's second one. The colourer mints colours `0..count`, each for some step.
+    let mut colours: BTreeMap<u32, Colour> = BTreeMap::from([(0, Colour::ZERO)]);
+    for instr in plan.tape.instrs() {
+        if let Instr::Compute { writes, .. } = instr {
+            let c = plan.colouring.colour_of(*writes);
+            let second = plan.colouring.second_colour_of(*writes);
+            colours.extend(c.into_iter().chain(second).map(|c| (c.index(), c)));
+        }
+    }
+    let bytes = (0..plan.colouring.count().get())
+        .map(|i| {
+            let (rows, cols) = match colours.get(&i) {
+                Some(&Colour::ZERO) => (hidden.rows, hidden.cols),
+                Some(&c) => plan
+                    .colouring
+                    .shape_of(c)
+                    .ok_or(ArenaRefusal::UnsizedColour(i))?,
+                None => return Err(ArenaRefusal::UnsizedColour(i)),
+            };
+            elements_bytes(rows, cols).ok_or(ArenaRefusal::TooLarge)
+        })
+        .collect::<Result<Vec<u64>, _>>()?;
+    let mut offsets = Vec::with_capacity(bytes.len());
+    let mut total = 0u64;
+    for &b in &bytes {
+        offsets.push(total);
+        total = (b.checked_next_multiple_of(CUDA_ARENA_ALIGN))
+            .and_then(|aligned| total.checked_add(aligned))
+            .ok_or(ArenaRefusal::TooLarge)?;
+    }
+    Ok(Arena {
+        bucket_m: hidden.rows,
+        bytes,
+        offsets,
+        total,
+    })
+}
+
+/// `rows × cols` activations' bytes, or `None` on overflow.
+fn elements_bytes(rows: u32, cols: u32) -> Option<u64> {
+    u64::from(rows)
+        .checked_mul(u64::from(cols))?
+        .checked_mul(CUDA_ACT_BYTES)
 }
