@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::GemmWeightKind;
 use scratchy_subtile::sample_rows::{SampleRowsError, expand_sample_rows};
-use scratchy_subtile::subtile_ir::{SubtileIR, ValidatedGraph, lower_region};
+use scratchy_subtile::subtile_ir::{SubtileIR, TensorShape, ValidatedGraph, lower_region};
 use scratchy_subtile::subtile_tape::{Instr, SubtileTape, lower_dag_to_tape};
 use scratchy_subtile::tape_colouring::{Colour, ColourError, TapeColouring, colour_tape};
 use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, StepRole, TapeFolds, fold_tape};
@@ -31,9 +31,24 @@ use scratchy_target_cuda::op_abi::{
     CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_FUSIONS, CUDA_SAMPLE_ROWS, CudaFusion,
 };
 use scratchy_target_cuda::step::CudaStep;
-use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN};
+use scratchy_target_cuda::tape::{
+    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, RotaryTable,
+};
 
 use crate::steps_from_tape::{StepCx, TapeStep, lower_fused, lower_step};
+
+/// The model facts CUDA's opcode lowering reads, beside the canonical: expansion-time constants,
+/// the counterpart of the `MetalModelConsts` fields metal's rope and gate lowerings read.
+///
+/// `GateSplit` carries only `half_cols`, so its `head_dim` is this one; `RopeRotate` carries its
+/// `head_dim` but not its rotated width, so `rot_dim` (`partial_rotary_factor · head_dim`) is this
+/// one, and `rope_theta` builds the rotary table's rows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CudaModelFacts {
+    pub head_dim: u32,
+    pub rot_dim: u32,
+    pub rope_theta: f64,
+}
 
 /// Which canonical this is, for the refusals.
 #[derive(Clone, Copy, Debug)]
@@ -52,6 +67,8 @@ pub struct CudaPlan {
     pub tape: SubtileTape,
     pub folds: TapeFolds<CudaFusion>,
     pub colouring: TapeColouring,
+    /// The model facts the plan was made with, which opcode lowering reads.
+    pub facts: CudaModelFacts,
 }
 
 /// One decode canonical, lowered: the parts of one bucket's `CudaTape`, every one a constant.
@@ -63,7 +80,7 @@ pub struct CudaCanonical {
     pub colour_bytes: Vec<u64>,
     /// Per colour: the sum of the `CUDA_ARENA_ALIGN`-aligned sizes of the colours before it.
     pub colour_offsets: Vec<u64>,
-    /// Every colour's aligned size, summed.
+    /// Every colour's aligned size, summed, and the rotary table's after them.
     pub total_bytes: u64,
     /// Colour 0, the embedded hidden the forward uploads.
     pub input: ArenaSpan,
@@ -71,9 +88,12 @@ pub struct CudaCanonical {
     pub result: ArenaSpan,
     /// Per source index: its weight buffer's bytes; 0 for a source that is not a weight.
     pub weight_bytes: Vec<u64>,
-    /// One step per launch, in tape order: each kept `Compute` and each fold's driver; a
-    /// `Compute` a fold absorbed has none.
+    /// One step per launch, in tape order: each kept `Compute` but a view, and each fold's
+    /// driver; a view or a `Compute` a fold absorbed has none.
     pub steps: Vec<CudaStep>,
+    /// The rotary table, after every colour: `Some` exactly when the canonical binds a
+    /// `Cos { local: false }` source.
+    pub rotary: Option<RotaryTable>,
 }
 
 /// Why a canonical could not be lowered.
@@ -158,6 +178,53 @@ pub enum CanonicalRefusal {
     FusionShape {
         step: usize,
     },
+    /// The `step`-th `Compute` names a producer slot (a fold's activation, a gate's split) that no
+    /// `Compute` of the tape writes.
+    ProducerMissing {
+        step: usize,
+        op: &'static str,
+    },
+    /// The `step`-th `Compute` is a `Reshape` CUDA cannot run as a view (no launch, its input's
+    /// buffer).
+    View {
+        step: usize,
+        why: ViewRefusal,
+    },
+    /// Operand `operand` of the `step`-th `Compute`, a `RopeRotate`, is not the rotary `cos`
+    /// (operand 1) or `sin` (operand 2) source of the global table: it is this binding, or a
+    /// computed value (`None`).
+    RotaryOperand {
+        step: usize,
+        operand: u8,
+        binding: Option<SourceBinding>,
+    },
+    /// The `step`-th `Compute` is a `RopeRotate` of a shape the bf16 rope does not take.
+    RopeShape {
+        step: usize,
+        rows: u32,
+        cols: u32,
+        head_dim: u32,
+        rot_dim: u32,
+        rule: RopeShapeRule,
+    },
+    /// The `step`-th `Compute` is a `GateSplit` of a shape the bf16 split does not take.
+    GateShape {
+        step: usize,
+        rows: u32,
+        half_cols: u32,
+        head_dim: u32,
+        rule: GateShapeRule,
+    },
+    /// The `step`-th `Compute` is a `GateApply` whose gate (operand 1) is not a `GateSplit`'s
+    /// output.
+    GateOperand {
+        step: usize,
+    },
+    /// The `step`-th `Compute` is a `GateSplit` the colourer gave no second colour, so its gate
+    /// has no buffer.
+    SecondOutput {
+        step: usize,
+    },
     /// The arena cannot be laid out.
     Arena(ArenaRefusal),
 }
@@ -170,6 +237,52 @@ pub enum RowShapeRule {
     /// `cols` is not a multiple of the kernel's vector width, `multiple` bf16 per 16-byte load.
     OffVector { cols: u32, multiple: u32 },
     /// `rows · cols` is above `i32::MAX`, the largest element count the launcher indexes.
+    TooManyElements { elements: u64 },
+}
+
+/// Why a `Reshape` cannot be a view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewRefusal {
+    /// Its operand is a source, not a computed slot: the colourer aliases a view only to a step,
+    /// so a view of a source would get a fresh colour nothing writes.
+    OfASource,
+    /// Its element count is not its input's.
+    ElementCount { input: u64, output: u64 },
+    /// Its colour is not its input's. CUDA's colour rule aliases every `Reshape` to operand 0,
+    /// so this cannot happen under it; the arm checks rather than trusts it.
+    Colour { input: u32, output: u32 },
+}
+
+/// Which rule a rope's shape breaks: the launcher's, stated at expansion time, and the table's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeShapeRule {
+    /// `dim` is zero.
+    Empty { dim: &'static str },
+    /// `rot_dim` is not a multiple of `multiple`: each half of the rotated lanes is whole 16-byte
+    /// vectors.
+    RotOffVector { multiple: u32 },
+    /// `rot_dim` is above `head_dim`.
+    RotAboveHead,
+    /// `head_dim` is not a multiple of `multiple`, the kernel's 16-byte bf16 vector.
+    HeadOffVector { multiple: u32 },
+    /// `cols` is not a whole number of heads.
+    ColsOffHead,
+    /// `rows · cols` is above `i32::MAX`, the largest element count the launcher indexes.
+    TooManyElements { elements: u64 },
+    /// `rows` is not the bucket's `tokens`: the rotary table has one row per token.
+    RowsNotTokens { tokens: u32 },
+}
+
+/// Which rule a gate split's shape breaks: the launcher's, stated at expansion time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateShapeRule {
+    /// `dim` is zero.
+    Empty { dim: &'static str },
+    /// `head_dim` is not a multiple of `multiple`, the kernel's 16-byte bf16 vector.
+    HeadOffVector { multiple: u32 },
+    /// `half_cols` is not a whole number of heads.
+    HalfOffHead,
+    /// `rows · 2·half_cols` is above `i32::MAX`, the largest element count the launcher indexes.
     TooManyElements { elements: u64 },
 }
 
@@ -310,6 +423,65 @@ impl std::fmt::Display for CanonicalRefusal {
                 "step {step} drives a SiluMul fold that folded the gate or up projection in; the \
                  cuda SiluMul kernel reads both as computed buffers"
             ),
+            Self::ProducerMissing { step, op } => write!(
+                f,
+                "step {step} ({op}) names a producer slot that no step of the tape writes"
+            ),
+            Self::View { step, why } => {
+                write!(f, "step {step} (Reshape) cannot be a view: {why}")
+            }
+            Self::RotaryOperand {
+                step,
+                operand,
+                binding: Some(binding),
+            } => write!(
+                f,
+                "step {step} (RopeRotate) operand {operand} reads a {binding:?} source; the cuda \
+                 rope reads the global rotary table, operand 1 Cos {{ local: false }} and operand 2 \
+                 Sin {{ local: false }}"
+            ),
+            Self::RotaryOperand {
+                step,
+                operand,
+                binding: None,
+            } => write!(
+                f,
+                "step {step} (RopeRotate) operand {operand} is a computed value; the cuda rope \
+                 reads the global rotary table, operand 1 Cos {{ local: false }} and operand 2 \
+                 Sin {{ local: false }}"
+            ),
+            Self::RopeShape {
+                step,
+                rows,
+                cols,
+                head_dim,
+                rot_dim,
+                rule,
+            } => write!(
+                f,
+                "step {step} (RopeRotate) is rows={rows} cols={cols} head_dim={head_dim} \
+                 rot_dim={rot_dim}, which the bf16 rope refuses: {rule}"
+            ),
+            Self::GateShape {
+                step,
+                rows,
+                half_cols,
+                head_dim,
+                rule,
+            } => write!(
+                f,
+                "step {step} (GateSplit) is rows={rows} half_cols={half_cols} head_dim={head_dim}, \
+                 which the bf16 gate split refuses: {rule}"
+            ),
+            Self::GateOperand { step } => write!(
+                f,
+                "step {step} (GateApply) operand 1 is not a GateSplit's output; the gate is a \
+                 GateSplit's second buffer"
+            ),
+            Self::SecondOutput { step } => write!(
+                f,
+                "step {step} (GateSplit) has no second colour, so its gate has no buffer"
+            ),
             Self::Arena(e) => write!(f, "the arena cannot be laid out: {e}"),
         }
     }
@@ -327,6 +499,72 @@ impl std::fmt::Display for RowShapeRule {
                 f,
                 "rows·cols = {elements} is above {}, the largest element count the launcher \
                  indexes",
+                i32::MAX
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for ViewRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OfASource => write!(
+                f,
+                "its operand is a source, and a view aliases only a computed slot"
+            ),
+            Self::ElementCount { input, output } => write!(
+                f,
+                "it has {output} elements and its input {input}; a view keeps the count"
+            ),
+            Self::Colour { input, output } => write!(
+                f,
+                "its colour is {output} and its input's {input}; a view is its input's buffer"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for RopeShapeRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty { dim } => write!(f, "{dim} = 0"),
+            Self::RotOffVector { multiple } => write!(
+                f,
+                "rot_dim must be a multiple of {multiple}, two 16-byte bf16 vectors"
+            ),
+            Self::RotAboveHead => write!(f, "rot_dim is above head_dim"),
+            Self::HeadOffVector { multiple } => write!(
+                f,
+                "head_dim must be a multiple of {multiple}, the kernel's 16-byte bf16 vector"
+            ),
+            Self::ColsOffHead => write!(f, "cols must be a whole number of heads"),
+            Self::TooManyElements { elements } => write!(
+                f,
+                "rows·cols = {elements} is above {}, the largest element count the launcher \
+                 indexes",
+                i32::MAX
+            ),
+            Self::RowsNotTokens { tokens } => write!(
+                f,
+                "rows must be the bucket's {tokens} tokens, one rotary table row each"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for GateShapeRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty { dim } => write!(f, "{dim} = 0"),
+            Self::HeadOffVector { multiple } => write!(
+                f,
+                "head_dim must be a multiple of {multiple}, the kernel's 16-byte bf16 vector"
+            ),
+            Self::HalfOffHead => write!(f, "half_cols must be a whole number of heads"),
+            Self::TooManyElements { elements } => write!(
+                f,
+                "rows·2·half_cols = {elements} is above {}, the largest element count the \
+                 launcher indexes",
                 i32::MAX
             ),
         }
@@ -403,9 +641,10 @@ impl std::fmt::Display for ArenaRefusal {
 }
 
 /// Run the shared passes on one decode canonical under CUDA's tables: sampled rows, graph and
-/// tape, folds, colours.
+/// tape, folds, colours. `facts` ride along to opcode lowering; no shared pass reads them.
 pub fn plan_canonical(
     l: &LoweredDecode,
+    facts: CudaModelFacts,
     at: CanonicalAt<'_>,
 ) -> Result<CudaPlan, CanonicalRefusal> {
     let CanonicalAt { stem, m } = at;
@@ -443,31 +682,36 @@ pub fn plan_canonical(
         tape,
         folds,
         colouring,
+        facts,
     })
 }
 
 /// Lower one decode canonical: [`plan_canonical`], the arena laid out from the colouring, then
 /// every `Compute` on the tape, in tape order, by its fold role: a kept step through
-/// [`lower_step`], a fold's driver through [`lower_fused`], and an absorbed step (or an epilogue,
-/// which no CUDA fold makes) to no launch.
+/// [`lower_step`] (a view to no launch), a fold's driver through [`lower_fused`], and an absorbed
+/// step (or an epilogue, which no CUDA fold makes) to no launch.
 ///
 /// A step's refusal comes before the arena's: a canonical whose first op has no lowering is
 /// refused for that op, whatever its bindings. A refusal's `step` is the step's position among
 /// the tape's `Compute`s, absorbed ones included.
 pub fn lower_canonical(
     l: &LoweredDecode,
+    facts: CudaModelFacts,
     at: CanonicalAt<'_>,
 ) -> Result<CudaCanonical, CanonicalRefusal> {
-    let plan = plan_canonical(l, at)?;
+    let plan = plan_canonical(l, facts, at)?;
     let arena = arena_layout(&plan);
     let cx = StepCx {
         graph: &plan.graph,
         bindings: &plan.lowered.bindings,
         colouring: &plan.colouring,
+        facts: plan.facts,
+        tokens: embedded_hidden(&plan).ok().map(|h| h.rows),
         offsets: match &arena {
             Ok(a) => Ok(a.offsets.as_slice()),
             Err(e) => Err(*e),
         },
+        rotary: arena.as_ref().ok().and_then(|a| a.rotary).map(|t| t.offset),
     };
     let computes: Vec<TapeStep<'_>> = (plan.tape.instrs().iter())
         .filter_map(|i| match i {
@@ -489,7 +733,7 @@ pub fn lower_canonical(
         .collect();
     let steps = (computes.iter())
         .filter_map(|s| match plan.folds.role(s.writes) {
-            StepRole::Kept => Some(lower_step(&cx, s)),
+            StepRole::Kept => lower_step(&cx, s, &computes).transpose(),
             StepRole::Drives(f) => Some(lower_fused(&cx, s, f, &computes)),
             StepRole::Absorbed { .. } | StepRole::Epilogue { .. } => None,
         })
@@ -519,29 +763,42 @@ pub fn lower_canonical(
         result,
         weight_bytes,
         steps,
+        rotary: arena.rotary.map(|span| RotaryTable {
+            span,
+            rot_dim: plan.facts.rot_dim,
+            theta_bits: plan.facts.rope_theta.to_bits(),
+        }),
     })
 }
 
-/// The arena of one canonical: each colour's bytes and offset, and their total.
+/// The arena of one canonical: each colour's bytes and offset, the rotary table's span, and
+/// their total.
 struct Arena {
     bucket_m: u32,
     bytes: Vec<u64>,
     offsets: Vec<u64>,
+    rotary: Option<ArenaSpan>,
     total: u64,
+}
+
+/// The shape of the one source bound to the embedded hidden: colour 0, the bucket's tokens.
+fn embedded_hidden(plan: &CudaPlan) -> Result<TensorShape, ArenaRefusal> {
+    let mut hidden = (plan.lowered.bindings.iter().enumerate())
+        .filter(|(_, b)| **b == SourceBinding::EmbeddedHidden)
+        .map(|(t, _)| plan.graph.tensors[t]);
+    match (hidden.next(), hidden.next()) {
+        (Some(h), None) => Ok(h),
+        (None, _) => Err(ArenaRefusal::NoEmbeddedHidden),
+        (Some(_), Some(_)) => Err(ArenaRefusal::SeveralEmbeddedHidden),
+    }
 }
 
 /// Size every colour from the shape its values share, and place the colours one after another in
 /// colour order, each at a multiple of [`CUDA_ARENA_ALIGN`]. Colour 0 is the embedded hidden's
-/// buffer, so it is sized from the source bound to it.
+/// buffer, so it is sized from the source bound to it. When the canonical binds the global rotary
+/// `cos`, the rotary table (`[bucket_m, rot_dim]` bf16) follows the colours, aligned the same way.
 fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
-    let mut hidden = (plan.lowered.bindings.iter().enumerate())
-        .filter(|(_, b)| **b == SourceBinding::EmbeddedHidden)
-        .map(|(t, _)| plan.graph.tensors[t]);
-    let hidden = match (hidden.next(), hidden.next()) {
-        (Some(h), None) => h,
-        (None, _) => return Err(ArenaRefusal::NoEmbeddedHidden),
-        (Some(_), Some(_)) => return Err(ArenaRefusal::SeveralEmbeddedHidden),
-    };
+    let hidden = embedded_hidden(plan)?;
     // Every colour the tape's steps were given, by index: a slot's colour, and a two-output
     // step's second one. The colourer mints colours `0..count`, each for some step.
     let mut colours: BTreeMap<u32, Colour> = BTreeMap::from([(0, Colour::ZERO)]);
@@ -567,16 +824,32 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
         .collect::<Result<Vec<u64>, _>>()?;
     let mut offsets = Vec::with_capacity(bytes.len());
     let mut total = 0u64;
-    for &b in &bytes {
-        offsets.push(total);
+    let mut place = |b: u64| -> Result<u64, ArenaRefusal> {
+        let at = total;
         total = (b.checked_next_multiple_of(CUDA_ARENA_ALIGN))
             .and_then(|aligned| total.checked_add(aligned))
             .ok_or(ArenaRefusal::TooLarge)?;
+        Ok(at)
+    };
+    for &b in &bytes {
+        offsets.push(place(b)?);
     }
+    let rotary = (plan.lowered.bindings)
+        .contains(&SourceBinding::Cos { local: false })
+        .then(|| {
+            let bytes =
+                elements_bytes(hidden.rows, plan.facts.rot_dim).ok_or(ArenaRefusal::TooLarge)?;
+            Ok(ArenaSpan {
+                offset: ArenaOffset(place(bytes)?),
+                bytes,
+            })
+        })
+        .transpose()?;
     Ok(Arena {
         bucket_m: hidden.rows,
         bytes,
         offsets,
+        rotary,
         total,
     })
 }

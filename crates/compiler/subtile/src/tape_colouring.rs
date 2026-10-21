@@ -238,9 +238,10 @@ impl TapeColouring {
     }
 
     /// The `(rows, cols)` of every value colour `c` holds: a colour is reused only by a value of
-    /// the same shape, so this is exact. `None` for colour 0, which is the colour-zero source's
-    /// buffer and sized by that source, and for a two-output step's second colour, whose shape
-    /// the scan never sees.
+    /// the same shape, so this is exact. A two-output step's second colour has the shape its op
+    /// states ([`SubOp::second_output_shape`]); it is never reused. `None` for colour 0, which is
+    /// the colour-zero source's buffer and sized by that source, and for a second colour whose op
+    /// states no second shape.
     pub fn shape_of(&self, c: Colour) -> Option<(u32, u32)> {
         self.colour_shape.get(&c).copied()
     }
@@ -604,13 +605,28 @@ pub fn colour_tape(
         });
     }
 
-    // A second output is a distinct allocation with no tracked lifetime: never reused.
+    // A second output is a distinct allocation with no tracked lifetime: never reused. Its shape
+    // is the op's (`SubOp::second_output_shape`), recorded for the arena; minted after the scan,
+    // it never enters a free pool, so recording it moves no colouring.
+    let operand_shape = |s: &Step<'_>, k: usize| match s.operands.get(k) {
+        Some(Operand::Step(q)) => steps[*q].shape,
+        Some(Operand::Source(t)) => {
+            let shape = graph.shape(*t);
+            (shape.rows, shape.cols)
+        }
+        // A validated graph gives every op its registry arity, so `k` is always an operand.
+        None => (0, 0),
+    };
     let mut by_slot = HashMap::with_capacity(n);
     for (s, c) in steps.iter().zip(&colour) {
         let Some(c) = *c else { continue };
         let second = (s.rule.outputs == Outputs::Two).then(|| {
+            let second = Colour(next);
             next += 1;
-            Colour(next - 1)
+            if let Some(shape) = s.op.second_output_shape(s.shape, |k| operand_shape(s, k)) {
+                colour_shape.insert(second, shape);
+            }
+            second
         });
         by_slot.insert(s.writes, (c, second));
     }
@@ -1030,6 +1046,65 @@ mod tests {
             .second_colour_of(steps[3].0)
             .expect("the product writes two buffers");
         assert_eq!(c.shape_of(second), None);
+    }
+
+    /// A `GateSplit`'s second colour, the gate, has the query's shape `[M, half_cols]`, and is
+    /// a colour of its own that no other value takes.
+    #[test]
+    fn a_gate_splits_second_colour_has_the_querys_shape() {
+        fn gate_rule(op: &SubOp) -> ColourRule {
+            match op {
+                SubOp::GateSplit { .. } => ColourRule::FRESH.reads_across().two_outputs(),
+                _ => rule(op),
+            }
+        }
+        let facts = ColourFacts {
+            rule: gate_rule,
+            colour_zero: SourceBinding::EmbeddedHidden,
+        };
+        let (m, half) = (4, 128);
+        let ops = vec![
+            OpDesc {
+                op: SubOp::MatmulTile {
+                    n: 2 * half,
+                    weight: GemmWeight::Dense,
+                },
+                m,
+                inputs: vec![Ext(0), Ext(1)],
+            },
+            op(SubOp::GateSplit { half_cols: half }, m, vec![Op(0)]),
+            op(SubOp::GateApply, m, vec![Op(1), Op(1)]),
+        ];
+        let input = LoweringInput {
+            sources: [(m, 64), (64, 2 * half)]
+                .iter()
+                .map(|&(rows, cols)| SourceShape { rows, cols })
+                .collect(),
+            result: ops.len() - 1,
+            exported: None,
+            ops,
+        };
+        let mut bindings = weights(2);
+        bindings[0] = SourceBinding::EmbeddedHidden;
+        let graph = lower_region(&input, std::num::NonZeroU32::MAX);
+        let tape = lower_dag_to_tape(&ValidatedGraph::new(&graph).expect("a valid fixture"));
+        let c = colour_tape(&graph, &tape, &bindings, &FoldFacts::default(), &facts).unwrap();
+        let slots: Vec<SlotId> = (tape.instrs().iter())
+            .filter_map(|i| match i {
+                Instr::Compute { writes, .. } => Some(*writes),
+                _ => None,
+            })
+            .collect();
+        let split = slots[1];
+        let gate = c
+            .second_colour_of(split)
+            .expect("the split writes two buffers");
+        assert_eq!(c.shape_of(gate), Some((m, half)));
+        assert_eq!(c.shape_of(c.colour_of(split).unwrap()), Some((m, half)));
+        for &s in &slots {
+            assert_ne!(c.colour_of(s), Some(gate), "the gate's colour is its own");
+        }
+        assert_eq!(c.count().get(), gate.index() + 1, "the gate is minted last");
     }
 
     #[test]

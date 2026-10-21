@@ -19,7 +19,10 @@ use super::device::CudaDevice;
 use super::ffi;
 use super::{CudaError, check};
 use crate::kernels::{self, KernelError};
-use crate::step::{AddBf16, CudaStep, GemmBf16, RmsNormBf16, SiluMulBf16};
+use crate::rotary::fill_rotary_rows;
+use crate::step::{
+    AddBf16, CudaStep, GateApplyBf16, GateSplitBf16, GemmBf16, RmsNormBf16, RopeBf16, SiluMulBf16,
+};
 use crate::tape::{ArenaOffset, ArenaSpan, CudaTape, TapeError};
 
 /// Why a worker could not be built.
@@ -67,6 +70,9 @@ pub enum ForwardError {
     InputSize { expected: u64, got: u64 },
     /// The result buffer is not the bucket's result span, in bytes; nothing was enqueued.
     ResultSize { expected: u64, got: u64 },
+    /// The forward was given `got` positions; the bucket's tape takes `expected` (its `bucket_m`
+    /// when it has a rotary table, else 0). Nothing was enqueued.
+    Positions { expected: usize, got: usize },
     /// The host buffer of an arena read is not the span's size, in bytes; nothing was enqueued.
     ReadSize { expected: u64, got: u64 },
     /// An arena read's span reaches past the arena; nothing was enqueued.
@@ -93,6 +99,12 @@ impl fmt::Display for ForwardError {
                 write!(
                     f,
                     "the result buffer is {got} bytes; the bucket writes {expected}"
+                )
+            }
+            Self::Positions { expected, got } => {
+                write!(
+                    f,
+                    "the forward was given {got} positions; the bucket takes {expected}"
                 )
             }
             Self::ReadSize { expected, got } => {
@@ -152,6 +164,9 @@ pub struct CudaWorker<'a> {
     weights: &'a [DeviceBuffer],
     stream: Stream,
     arena: DeviceBuffer,
+    /// The host side of the rotary table, sized once for the largest tape's: each forward with a
+    /// table fills its rows from the positions and uploads them, so a forward allocates nothing.
+    rotary_host: Vec<u16>,
 }
 
 impl<'a> CudaWorker<'a> {
@@ -188,6 +203,12 @@ impl<'a> CudaWorker<'a> {
         }
         let arena_bytes =
             (tapes.iter().map(|t| t.arena.total_bytes).max()).ok_or(WorkerError::NoTapes)?;
+        // Each table's span lies inside its arena (`validate`), so its byte count fits a usize.
+        let rotary_elements = (tapes.iter())
+            .filter_map(|t| t.rotary)
+            .map(|r| r.span.bytes as usize / std::mem::size_of::<u16>())
+            .max()
+            .unwrap_or(0);
         let stream = Stream::new().map_err(WorkerError::Cuda)?;
         let arena = DeviceBuffer::alloc(device, arena_bytes).map_err(WorkerError::Cuda)?;
         Ok(Self {
@@ -195,6 +216,7 @@ impl<'a> CudaWorker<'a> {
             weights,
             stream,
             arena,
+            rotary_host: vec![0; rotary_elements],
         })
     }
 
@@ -203,13 +225,18 @@ impl<'a> CudaWorker<'a> {
         self.arena.bytes()
     }
 
-    /// Run bucket `bucket`'s tape: upload `input` into its input span, launch every step in
+    /// Run bucket `bucket`'s tape: upload `input` into its input span (and, when the tape has a
+    /// rotary table, that table's rows for `positions`, one per token), launch every step in
     /// order, download its result span into `result`, and wait once. Returns once the GPU is done,
     /// error or not, so nothing the forward touched is still in use.
+    ///
+    /// `positions` holds one position per token when the tape has a rotary table, and is empty
+    /// when it has none; anything else is [`ForwardError::Positions`], before any copy.
     pub fn forward(
         &mut self,
         bucket: usize,
         input: &[u16],
+        positions: &[u32],
         result: &mut [u16],
     ) -> Result<(), ForwardError> {
         let tape = self.tapes.get(bucket).ok_or(ForwardError::Bucket {
@@ -230,7 +257,30 @@ impl<'a> CudaWorker<'a> {
                 got,
             });
         }
-        let enqueued = self.enqueue(tape, input, result);
+        let expected = tape.rotary.map_or(0, |_| tape.bucket_m as usize);
+        if positions.len() != expected {
+            return Err(ForwardError::Positions {
+                expected,
+                got: positions.len(),
+            });
+        }
+        let table = match tape.rotary {
+            Some(r) => {
+                let rows = &mut self.rotary_host[..positions.len() * r.rot_dim as usize];
+                fill_rotary_rows(positions, r.rot_dim, r.theta(), rows);
+                Some((r.span, &*rows))
+            }
+            None => None,
+        };
+        let enqueued = Self::enqueue(
+            &self.stream,
+            &self.arena,
+            self.weights,
+            tape,
+            input,
+            table,
+            result,
+        );
         let drained = self.stream.synchronize().map_err(ForwardError::Cuda);
         enqueued.and(drained)
     }
@@ -275,52 +325,69 @@ impl<'a> CudaWorker<'a> {
         copied.and(drained)
     }
 
-    /// Everything one forward enqueues, stopping at the first failure. The caller drains the
-    /// stream whatever this returns.
+    /// Everything one forward enqueues, stopping at the first failure: the input copy, the rotary
+    /// table's rows when the tape has one (`table`: its span and the rows, which hold exactly its
+    /// bytes), every launch and the result copy. The caller drains the stream whatever this
+    /// returns.
     fn enqueue(
-        &self,
+        stream: &Stream,
+        arena: &DeviceBuffer,
+        weights: &[DeviceBuffer],
         tape: &CudaTape,
         input: &[u16],
+        table: Option<(ArenaSpan, &[u16])>,
         result: &mut [u16],
     ) -> Result<(), ForwardError> {
+        let slot = |offset| Self::slot_of(arena, offset);
         // SAFETY: the input span lies inside the tape's arena (`new` validated it), which is at
         // most `arena_bytes`; `input` holds exactly its bytes, and `input` stays borrowed until the
         // caller's stream wait has returned.
         check(
             unsafe {
                 ffi::cudaMemcpyAsync(
-                    self.slot(tape.input.offset),
+                    slot(tape.input.offset),
                     input.as_ptr().cast(),
                     std::mem::size_of_val(input),
                     ffi::MEMCPY_HOST_TO_DEVICE,
-                    self.stream.0,
+                    stream.0,
                 )
             },
             "cudaMemcpyAsync(host to device)",
         )
         .map_err(ForwardError::Cuda)?;
+        if let Some((span, rows)) = table {
+            debug_assert_eq!(std::mem::size_of_val(rows) as u64, span.bytes);
+            // SAFETY: the rotary span lies inside the tape's arena (`new` validated it), which is
+            // at most `arena_bytes`; `rows` is `bucket_m · rot_dim` elements (`forward` checked
+            // `positions.len() == bucket_m`), exactly the span's bytes, and it is the worker's own
+            // buffer, which no forward touches until the caller's stream wait has returned.
+            check(
+                unsafe {
+                    ffi::cudaMemcpyAsync(
+                        slot(span.offset),
+                        rows.as_ptr().cast(),
+                        std::mem::size_of_val(rows),
+                        ffi::MEMCPY_HOST_TO_DEVICE,
+                        stream.0,
+                    )
+                },
+                "cudaMemcpyAsync(rotary table, host to device)",
+            )
+            .map_err(ForwardError::Cuda)?;
+        }
         // SAFETY (every arm): `new` validated the tape (`CudaTape::validate`): each span a step
         // reads or writes (`CudaStep::extents`, the kernel's own operand sizes) is 256-byte
-        // aligned and inside the tape's arena, which is at most this worker's; the span it writes
-        // overlaps none it reads; each weight it reads has an index the tape declares, declared at
-        // least as large as the step reads, and `new` checked every declared size against its
-        // buffer. cudaMalloc pointers are 256-byte aligned. The stream is live.
+        // aligned and inside the tape's arena, which is at most this worker's; each span it
+        // writes overlaps none it reads, nor its other write; each weight it reads has an index
+        // the tape declares, declared at least as large as the step reads, and `new` checked every
+        // declared size against its buffer. cudaMalloc pointers are 256-byte aligned. The stream
+        // is live.
         for (step, s) in tape.steps.iter().enumerate() {
             let launched = match *s {
                 CudaStep::Gemm(GemmBf16 { a, b, c, m, n, k }) => {
-                    let b = self.weights[b.0 as usize].ptr();
+                    let b = weights[b.0 as usize].ptr();
                     // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
-                    unsafe {
-                        kernels::gemm_bf16_abt(
-                            self.slot(a),
-                            b,
-                            self.slot(c),
-                            m,
-                            n,
-                            k,
-                            self.stream.0,
-                        )
-                    }
+                    unsafe { kernels::gemm_bf16_abt(slot(a), b, slot(c), m, n, k, stream.0) }
                 }
                 CudaStep::RmsNorm(
                     norm @ RmsNormBf16 {
@@ -333,17 +400,17 @@ impl<'a> CudaWorker<'a> {
                         ..
                     },
                 ) => {
-                    let gain = self.weights[gain.0 as usize].ptr();
+                    let gain = weights[gain.0 as usize].ptr();
                     // SAFETY: as above, for `x` and `y` (`rows*cols`) and `gain` (`cols`).
                     unsafe {
                         kernels::rms_norm_bf16(
-                            self.slot(x),
+                            slot(x),
                             gain,
-                            self.slot(y),
+                            slot(y),
                             (rows, cols),
                             norm.eps(),
                             convention.offset(),
-                            self.stream.0,
+                            stream.0,
                         )
                     }
                 }
@@ -356,13 +423,7 @@ impl<'a> CudaWorker<'a> {
                 }) => {
                     // SAFETY: as above, for `a`, `b` and `out` (`rows*cols` each).
                     unsafe {
-                        kernels::add_bf16(
-                            self.slot(a),
-                            self.slot(b),
-                            self.slot(out),
-                            (rows, cols),
-                            self.stream.0,
-                        )
+                        kernels::add_bf16(slot(a), slot(b), slot(out), (rows, cols), stream.0)
                     }
                 }
                 CudaStep::SiluMul(SiluMulBf16 {
@@ -375,11 +436,73 @@ impl<'a> CudaWorker<'a> {
                     // SAFETY: as above, for `gate`, `up` and `out` (`rows*cols` each).
                     unsafe {
                         kernels::silu_mul_bf16(
-                            self.slot(gate),
-                            self.slot(up),
-                            self.slot(out),
+                            slot(gate),
+                            slot(up),
+                            slot(out),
                             (rows, cols),
-                            self.stream.0,
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::Rope(RopeBf16 {
+                    x,
+                    table,
+                    out,
+                    rows,
+                    cols,
+                    head_dim,
+                    rot_dim,
+                }) => {
+                    // SAFETY: as above, for `x` and `out` (`rows*cols`) and `table`
+                    // (`rows*rot_dim`), whose rows this forward uploaded above.
+                    unsafe {
+                        kernels::rope_bf16(
+                            slot(x),
+                            slot(table),
+                            slot(out),
+                            (rows, cols),
+                            (head_dim, rot_dim),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::GateSplit(GateSplitBf16 {
+                    qg,
+                    q,
+                    gate,
+                    rows,
+                    half_cols,
+                    head_dim,
+                }) => {
+                    // SAFETY: as above, for `qg` (`rows*2*half_cols`), and `q` and `gate`
+                    // (`rows*half_cols` each), its two writes, which overlap neither each other
+                    // nor `qg`.
+                    unsafe {
+                        kernels::gate_split_bf16(
+                            slot(qg),
+                            slot(q),
+                            slot(gate),
+                            (rows, half_cols),
+                            head_dim,
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::GateApply(GateApplyBf16 {
+                    attn,
+                    gate,
+                    out,
+                    rows,
+                    cols,
+                }) => {
+                    // SAFETY: as above, for `attn`, `gate` and `out` (`rows*cols` each).
+                    unsafe {
+                        kernels::gate_apply_bf16(
+                            slot(attn),
+                            slot(gate),
+                            slot(out),
+                            (rows, cols),
+                            stream.0,
                         )
                     }
                 }
@@ -391,10 +514,10 @@ impl<'a> CudaWorker<'a> {
             unsafe {
                 ffi::cudaMemcpyAsync(
                     result.as_mut_ptr().cast(),
-                    self.slot(tape.result.offset),
+                    slot(tape.result.offset),
                     std::mem::size_of_val(result),
                     ffi::MEMCPY_DEVICE_TO_HOST,
-                    self.stream.0,
+                    stream.0,
                 )
             },
             "cudaMemcpyAsync(device to host)",
@@ -405,7 +528,12 @@ impl<'a> CudaWorker<'a> {
     /// The device address of an arena offset. The arena is device memory Rust never reads, so the
     /// address is computed, not dereferenced.
     fn slot(&self, offset: ArenaOffset) -> *mut c_void {
+        Self::slot_of(&self.arena, offset)
+    }
+
+    /// [`Self::slot`] of `arena`, for [`Self::enqueue`], which borrows the worker by its parts.
+    fn slot_of(arena: &DeviceBuffer, offset: ArenaOffset) -> *mut c_void {
         let offset = usize::try_from(offset.0).expect("an arena offset fits the host's usize");
-        self.arena.ptr().wrapping_byte_add(offset)
+        arena.ptr().wrapping_byte_add(offset)
     }
 }

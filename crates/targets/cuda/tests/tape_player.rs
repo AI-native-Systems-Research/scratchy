@@ -9,27 +9,33 @@
 
 // `pub`: each test binary uses a different part of `common`, and nothing in it is dead code.
 pub mod common {
+    pub mod attn_gate;
     pub mod chains;
     pub mod mlp;
     pub mod numerics;
 }
 
+use common::attn_gate::{ATTN_GATE_M128, ATTN_GATE_M256, attn_gate};
 use common::chains::{
     HIDDEN, THREE_GEMM_M256, TWO_GEMM_M128, TWO_GEMM_M256, assert_tape_is_lowered, three_gemm,
     two_gemm,
 };
 use common::mlp::{EPS, MLP_M128, MLP_M256, mlp};
 use common::numerics::{
-    add_reference, bf16_inputs, centred_gains, compare, compare_rows, mismatched_bits,
-    rms_norm_reference, silu_mul_reference,
+    add_reference, bf16_inputs, centred_gains, compare, compare_rope, compare_rows,
+    gate_apply_reference, gate_split_reference, mismatched_bits, rms_norm_reference,
+    rope_reference, silu_mul_reference,
 };
 use scratchy_subtile::subtile_ir::GainConvention;
 use scratchy_target_cuda::kernels::rms_norm_bf16;
+use scratchy_target_cuda::rotary::rotary_rows;
 use scratchy_target_cuda::runtime::{
     CudaDevice, CudaWorker, DeviceBuffer, ForwardError, WorkerError,
 };
 use scratchy_target_cuda::step::CudaStep;
-use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, CudaTape, TapeError, WeightIx};
+use scratchy_target_cuda::tape::{
+    ArenaOffset, ArenaSpan, CudaTape, RotaryTable, TapeError, WeightIx,
+};
 
 /// One worker's buckets: `M = 128` and `M = 256` of the same two-GEMM graph.
 static TWO_GEMM_BUCKETS: [CudaTape; 2] = [TWO_GEMM_M128, TWO_GEMM_M256];
@@ -47,6 +53,8 @@ fn the_played_tapes_are_the_lowered_ones() {
     assert_tape_is_lowered("three_gemm", &THREE_GEMM_M256, &three_gemm());
     assert_tape_is_lowered("mlp(128)", &MLP_M128, &mlp(128));
     assert_tape_is_lowered("mlp(256)", &MLP_M256, &mlp(256));
+    assert_tape_is_lowered("attn_gate(128)", &ATTN_GATE_M128, &attn_gate(128));
+    assert_tape_is_lowered("attn_gate(256)", &ATTN_GATE_M256, &attn_gate(256));
 }
 
 /// Device 0, which must be an H100; panics with the reason otherwise.
@@ -127,7 +135,7 @@ fn a_two_gemm_chain_matches_the_cpu_reference_in_each_bucket() {
         let m = tape.bucket_m as usize;
         let x = input(m);
         let mut y2 = vec![0u16; m * H];
-        worker.forward(bucket, &x, &mut y2).expect("forward");
+        worker.forward(bucket, &x, &[], &mut y2).expect("forward");
         let y1 = read(&mut worker, colour(tape, 1));
         pass &= check_stage("y1 = x·W1ᵀ", &y1, &x, &w.w1, (m, WIDE, H));
         pass &= check_stage("y2 = y1·W2ᵀ", &y2, &y1, &w.w2, (m, H, WIDE));
@@ -165,7 +173,7 @@ fn the_worker_allocates_once_and_no_forward_allocates() {
         let m = TWO_GEMM_BUCKETS[bucket].bucket_m as usize;
         let mut y2 = vec![0u16; m * H];
         worker
-            .forward(bucket, &inputs[bucket], &mut y2)
+            .forward(bucket, &inputs[bucket], &[], &mut y2)
             .expect("forward");
         if i == 0 {
             free_after_first = Some(device.mem_info().expect("cudaMemGetInfo").0);
@@ -209,14 +217,16 @@ fn the_three_gemm_chain_reuses_a_colour_and_stays_right() {
     let mut worker = CudaWorker::new(&device, two, &table[..3]).expect("two-GEMM worker");
     let mut two_y2 = vec![0u16; 256 * H];
     worker
-        .forward(0, &x, &mut two_y2)
+        .forward(0, &x, &[], &mut two_y2)
         .expect("two-GEMM forward");
     drop(worker);
 
     let three = std::slice::from_ref(&THREE_GEMM_M256);
     let mut worker = CudaWorker::new(&device, three, &table).expect("three-GEMM worker");
     let mut y3 = vec![0u16; 256 * WIDE];
-    worker.forward(0, &x, &mut y3).expect("three-GEMM forward");
+    worker
+        .forward(0, &x, &[], &mut y3)
+        .expect("three-GEMM forward");
     let y2 = read(&mut worker, colour(&THREE_GEMM_M256, 2));
     let pass = check_stage(
         "y3 = y2·W3ᵀ (over y1's colour)",
@@ -248,7 +258,7 @@ fn short_inputs_and_short_weights_are_refused() {
     let mut worker = CudaWorker::new(&device, &TWO_GEMM_BUCKETS, &table).expect("worker");
     let x = input(256);
     let mut y2 = vec![0u16; 256 * H];
-    let got = worker.forward(1, &x[..x.len() - 1], &mut y2);
+    let got = worker.forward(1, &x[..x.len() - 1], &[], &mut y2);
     let want = Err(ForwardError::InputSize {
         expected: 262144,
         got: 262142,
@@ -256,7 +266,7 @@ fn short_inputs_and_short_weights_are_refused() {
     eprintln!("input one element short: {got:?} {}", verdict(got == want));
     assert_eq!(got, want);
     worker
-        .forward(1, &x, &mut y2)
+        .forward(1, &x, &[], &mut y2)
         .expect("the next valid forward");
     let y1 = read(&mut worker, colour(&TWO_GEMM_M256, 1));
     let pass = check_stage(
@@ -337,11 +347,12 @@ fn check_rows(what: &str, gpu: &[u16], refs: &[f64], (rows, cols): (usize, usize
     cmp.pass()
 }
 
-/// The MLP's norm run on its own, on device copies of `x` and `g`, with the tape's eps and
-/// convention: `n`, which `d` overwrites in the arena before the forward ends.
+/// The tape's first step, its input norm, run on its own, on device copies of `x` and `g`, with
+/// the tape's eps and convention: `n`, which a later step overwrites in the arena before the
+/// forward ends (the MLP's `d`, the attention gate's `o`).
 fn n_direct(device: &CudaDevice, tape: &CudaTape, x: &[u16], g: &[u16]) -> Vec<u16> {
     let CudaStep::RmsNorm(norm) = tape.steps[0] else {
-        panic!("the MLP's first step is its norm");
+        panic!("the tape's first step is its norm");
     };
     assert_eq!(
         (norm.eps(), norm.convention),
@@ -384,7 +395,7 @@ fn the_mlp_block_matches_the_cpu_reference_in_each_bucket() {
         let m = tape.bucket_m as usize;
         let x = mlp_input(m);
         let mut y = vec![0u16; m * MLP_H];
-        worker.forward(bucket, &x, &mut y).expect("forward");
+        worker.forward(bucket, &x, &[], &mut y).expect("forward");
         let n = n_direct(&device, tape, &x, &w.g);
         let n_ref = rms_norm_reference(&x, &w.g, (m, MLP_H), f64::from(EPS), 1.0);
         pass &= check_rows("n_direct = RmsNorm(x, g)", &n, &n_ref, (m, MLP_H));
@@ -435,7 +446,7 @@ fn the_mlp_worker_allocates_once_and_no_forward_allocates() {
         let m = MLP_BUCKETS[bucket].bucket_m as usize;
         let mut y = vec![0u16; m * MLP_H];
         worker
-            .forward(bucket, &inputs[bucket], &mut y)
+            .forward(bucket, &inputs[bucket], &[], &mut y)
             .expect("forward");
         if i == 0 {
             free_after_first = Some(device.mem_info().expect("cudaMemGetInfo").0);
@@ -501,6 +512,273 @@ fn a_tape_reading_an_undeclared_weight_is_refused_before_any_allocation() {
     });
     eprintln!(
         "MLP_M256 with its down GEMM reading weight 9: {got:?} allocations={allocated} \
+         (expect 0) {}",
+        verdict(got == want && allocated == 0)
+    );
+    assert_eq!(got, want);
+    assert_eq!(allocated, 0, "a refused tape allocated");
+}
+
+// ── qwen3.5-0.8b's attention prelude and gate ──────────────────────
+
+/// One worker's buckets: `M = 128` and `M = 256` of the attention prelude and gate.
+static ATTN_BUCKETS: [CudaTape; 2] = [ATTN_GATE_M128, ATTN_GATE_M256];
+
+const AG_H: usize = common::attn_gate::H as usize;
+const AG_Q: usize = common::attn_gate::Q as usize;
+const AG_HD: usize = common::attn_gate::HD as usize;
+const AG_R: usize = common::attn_gate::R as usize;
+
+/// The block's weights as stored on the device: `g_in [H]` and `q_norm [HD]` (zero-centred),
+/// `Wq [2Q, H]`, `Wo [H, Q]`.
+struct AttnWeights {
+    g_in: Vec<u16>,
+    wq: Vec<u16>,
+    q_norm: Vec<u16>,
+    wo: Vec<u16>,
+}
+
+fn attn_weights() -> AttnWeights {
+    AttnWeights {
+        g_in: centred_gains(AG_H, 0x0A77_0001),
+        wq: bf16_inputs(2 * AG_Q * AG_H, 0x0A77_0002),
+        q_norm: centred_gains(AG_HD, 0x0A77_0003),
+        wo: bf16_inputs(AG_H * AG_Q, 0x0A77_0004),
+    }
+}
+
+/// The weight table, by source index: 0 is the embedded hidden and 4, 5 the rotary `cos` and
+/// `sin`, none of them weights.
+fn attn_table(device: &CudaDevice, w: &AttnWeights) -> [DeviceBuffer; 7] {
+    [
+        DeviceBuffer::empty(),
+        DeviceBuffer::upload(device, &w.g_in).expect("upload g_in"),
+        DeviceBuffer::upload(device, &w.wq).expect("upload Wq"),
+        DeviceBuffer::upload(device, &w.q_norm).expect("upload q_norm"),
+        DeviceBuffer::empty(),
+        DeviceBuffer::empty(),
+        DeviceBuffer::upload(device, &w.wo).expect("upload Wo"),
+    ]
+}
+
+/// The embedded hidden of an `m`-row attention bucket.
+fn attn_input(m: usize) -> Vec<u16> {
+    bf16_inputs(m * AG_H, 0x0000_0A7E ^ m as u64)
+}
+
+/// The positions of an `m`-row bucket: `7 + 3t`, with row 5 at 200000.
+fn attn_positions(m: usize) -> Vec<u32> {
+    (0..m as u32)
+        .map(|t| if t == 5 { 200000 } else { 7 + 3 * t })
+        .collect()
+}
+
+/// Both buckets of one worker, each stage against its own GPU input: `n_direct` against the norm
+/// reference; `qg` against the GEMM of `n_direct`; `q` and `gate` bit-exactly against the per-head
+/// split of `qg`; `qn` against the per-head norm of `q`; `qr` against the rope of `qn` under the
+/// uploaded table, its pass-through lanes bit-exact; `ga` against the gate apply of `qr` and
+/// `gate`; `o` against the GEMM of `ga`; `y` bit-exactly against the add of `o` and `x`.
+#[test]
+fn the_attention_gate_matches_the_cpu_reference_in_each_bucket() {
+    let device = h100();
+    let w = attn_weights();
+    let table = attn_table(&device, &w);
+    let mut worker = CudaWorker::new(&device, &ATTN_BUCKETS, &table).expect("worker");
+    let mut pass = true;
+    for (bucket, tape) in ATTN_BUCKETS.iter().enumerate() {
+        let m = tape.bucket_m as usize;
+        let x = attn_input(m);
+        let positions = attn_positions(m);
+        let mut y = vec![0u16; m * AG_H];
+        worker
+            .forward(bucket, &x, &positions, &mut y)
+            .expect("forward");
+        let n = n_direct(&device, tape, &x, &w.g_in);
+        let n_ref = rms_norm_reference(&x, &w.g_in, (m, AG_H), f64::from(EPS), 1.0);
+        pass &= check_rows("n_direct = RmsNorm(x, g_in)", &n, &n_ref, (m, AG_H));
+        let qg = read(&mut worker, colour(tape, 2));
+        pass &= check_stage("qg = n·Wqᵀ", &qg, &n, &w.wq, (m, 2 * AG_Q, AG_H));
+        let q = read(&mut worker, colour(tape, 3));
+        let gate = read(&mut worker, colour(tape, 8));
+        let (want_q, want_gate) = gate_split_reference(&qg, (m, AG_Q), AG_HD);
+        let split_bits = mismatched_bits(&q, &want_q) + mismatched_bits(&gate, &want_gate);
+        eprintln!(
+            "q, gate = GateSplit(qg) rows={m} half_cols={AG_Q}: mismatched_bits={split_bits} {}",
+            verdict(split_bits == 0)
+        );
+        pass &= split_bits == 0;
+        let qn = read(&mut worker, colour(tape, 4));
+        let qn_ref = rms_norm_reference(&q, &w.q_norm, (m * 8, AG_HD), f64::from(EPS), 1.0);
+        pass &= check_rows(
+            "qn = RmsNorm(q viewed [8M, 256], q_norm)",
+            &qn,
+            &qn_ref,
+            (m * 8, AG_HD),
+        );
+        let qr = read(&mut worker, colour(tape, 5));
+        let rotary = tape.rotary.expect("the tape has a rotary table");
+        let uploaded = read(&mut worker, rotary.span);
+        let table_matches = uploaded == rotary_rows(&positions, rotary.rot_dim, rotary.theta());
+        let refs = rope_reference(&qn, &uploaded, (m, AG_Q), (AG_HD, AG_R), AG_R / 2);
+        let cmp = compare_rope(&qr, &qn, &refs, AG_Q);
+        let ok = cmp.rotated.pass() && cmp.pass_through_mismatched == 0 && table_matches;
+        eprintln!(
+            "qr = RopeRotate(qn) rows={m} cols={AG_Q}: {} pass_through_mismatched_bits={} \
+             table_is_the_positions'={table_matches} {}",
+            cmp.rotated.line(),
+            cmp.pass_through_mismatched,
+            verdict(ok)
+        );
+        pass &= ok;
+        let ga = read(&mut worker, colour(tape, 6));
+        let ga_ref = gate_apply_reference(&qr, &gate);
+        pass &= check_rows("ga = qr·sigmoid(gate)", &ga, &ga_ref, (m, AG_Q));
+        let o = read(&mut worker, colour(tape, 1));
+        pass &= check_stage(
+            "o = ga·Woᵀ (over n's colour)",
+            &o,
+            &ga,
+            &w.wo,
+            (m, AG_H, AG_Q),
+        );
+        let mismatched = mismatched_bits(&y, &add_reference(&o, &x));
+        eprintln!(
+            "y = o + x rows={m} cols={AG_H}: mismatched_bits={mismatched} {}",
+            verdict(mismatched == 0)
+        );
+        pass &= mismatched == 0;
+    }
+    assert!(pass, "a stage of the attention gate is out of bound");
+}
+
+/// One arena of the larger bucket's 8945664 bytes, five allocations in all (four weights and the
+/// arena), none per forward, and every result bit-identical to its bucket's first.
+#[test]
+fn the_attention_gate_worker_allocates_once_and_no_forward_allocates() {
+    let device = h100();
+    let w = attn_weights();
+    let before = device.allocations();
+    let table = attn_table(&device, &w);
+    let mut worker = CudaWorker::new(&device, &ATTN_BUCKETS, &table).expect("worker");
+    let built = device.allocations() - before;
+    let arena = worker.arena_bytes();
+    eprintln!(
+        "attention gate arena_bytes={arena} (expect 8945664) allocations(weights + arena)={built} \
+         (expect 5) {}",
+        verdict(arena == 8945664 && built == 5)
+    );
+    assert_eq!(arena, 8945664, "the arena is the larger bucket's total");
+    assert_eq!(built, 5, "four weights and one arena");
+
+    let inputs = [attn_input(128), attn_input(256)];
+    let positions = [attn_positions(128), attn_positions(256)];
+    let mut firsts: [Option<Vec<u16>>; 2] = [None, None];
+    let at_forwards = device.allocations();
+    let mut free_after_first = None;
+    let mut identical = true;
+    for (i, bucket) in [1usize, 0, 1, 0, 1].into_iter().enumerate() {
+        let m = ATTN_BUCKETS[bucket].bucket_m as usize;
+        let mut y = vec![0u16; m * AG_H];
+        worker
+            .forward(bucket, &inputs[bucket], &positions[bucket], &mut y)
+            .expect("forward");
+        if i == 0 {
+            free_after_first = Some(device.mem_info().expect("cudaMemGetInfo").0);
+        }
+        match &firsts[bucket] {
+            Some(first) => identical &= *first == y,
+            None => firsts[bucket] = Some(y),
+        }
+    }
+    let free_after_first = free_after_first.expect("forward 1 ran");
+    let free_after_last = device.mem_info().expect("cudaMemGetInfo").0;
+    let during = device.allocations() - at_forwards;
+    eprintln!(
+        "attention gate five forwards (256, 128, 256, 128, 256): allocations={during} (expect 0) \
+         free_after_forward_1={free_after_first} free_after_forward_5={free_after_last} \
+         results_bit_identical={identical} {}",
+        verdict(during == 0 && free_after_first == free_after_last && identical)
+    );
+    assert_eq!(during, 0, "a forward allocated device memory");
+    assert_eq!(
+        free_after_first, free_after_last,
+        "device free memory moved"
+    );
+    assert!(identical, "a bucket's result changed between forwards");
+}
+
+/// A forward given the wrong number of positions is refused before anything is enqueued, and a
+/// tape with no rotary table takes none.
+#[test]
+fn a_forward_with_the_wrong_positions_is_refused() {
+    let device = h100();
+    let w = attn_weights();
+    let table = attn_table(&device, &w);
+    let mut worker = CudaWorker::new(&device, &ATTN_BUCKETS, &table).expect("worker");
+    let x = attn_input(256);
+    let mut y = vec![0u16; 256 * AG_H];
+    let got = worker.forward(1, &x, &attn_positions(255), &mut y);
+    let want = Err(ForwardError::Positions {
+        expected: 256,
+        got: 255,
+    });
+    let untouched = y.iter().all(|&b| b == 0);
+    eprintln!(
+        "attention gate with 255 positions: {got:?} result_untouched={untouched} {}",
+        verdict(got == want && untouched)
+    );
+    assert_eq!(got, want);
+    assert!(untouched, "a refused forward wrote its result");
+    drop(worker);
+
+    let w = mlp_weights();
+    let table = mlp_table(&device, &w);
+    let mut worker = CudaWorker::new(&device, &MLP_BUCKETS, &table).expect("MLP worker");
+    let got = worker.forward(1, &mlp_input(256), &[7], &mut vec![0u16; 256 * MLP_H]);
+    let want = Err(ForwardError::Positions {
+        expected: 0,
+        got: 1,
+    });
+    eprintln!("MLP with one position: {got:?} {}", verdict(got == want));
+    assert_eq!(got, want);
+}
+
+/// [`ATTN_GATE_M256`] with its rotary table one row past the arena's end.
+static BAD_ROTARY: [CudaTape; 1] = [CudaTape {
+    rotary: Some(RotaryTable {
+        span: ArenaSpan {
+            offset: ArenaOffset(8912896 + 256),
+            bytes: 32768,
+        },
+        rot_dim: 64,
+        theta_bits: 0x416312D000000000,
+    }),
+    ..ATTN_GATE_M256
+}];
+
+/// A tape whose rotary table reaches past its arena is refused by `CudaWorker::new` before
+/// anything is allocated.
+#[test]
+fn a_tape_whose_rotary_table_reaches_past_the_arena_is_refused() {
+    assert_eq!(f64::from_bits(0x416312D000000000), 1e7);
+    let device = h100();
+    let w = attn_weights();
+    let table = attn_table(&device, &w);
+    let before = device.allocations();
+    let got = CudaWorker::new(&device, &BAD_ROTARY, &table).map(|_| ());
+    let allocated = device.allocations() - before;
+    let want = Err(WorkerError::Tape {
+        bucket: 0,
+        error: TapeError::RotaryOutside {
+            span: ArenaSpan {
+                offset: ArenaOffset(8913152),
+                bytes: 32768,
+            },
+            total: 8945664,
+        },
+    });
+    eprintln!(
+        "ATTN_GATE_M256 with its rotary table past the arena: {got:?} allocations={allocated} \
          (expect 0) {}",
         verdict(got == want && allocated == 0)
     );

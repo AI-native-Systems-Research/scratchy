@@ -18,24 +18,32 @@ use scratchy_subtile::tape_colouring::{Colour, TapeColouring};
 use scratchy_subtile::tape_folding::{FusedShape, Fusion};
 use scratchy_target_cuda::op_abi::CudaFusion;
 use scratchy_target_cuda::step::{
-    ADD_BF16_COLS, AddBf16, CudaStep, GEMM_BF16_TILE, GemmBf16, RMS_NORM_BF16_COLS, RmsNormBf16,
-    SILU_MUL_BF16_COLS, SiluMulBf16,
+    ADD_BF16_COLS, AddBf16, CudaStep, GATE_APPLY_BF16_COLS, GATE_SPLIT_BF16_HEAD_MULTIPLE,
+    GEMM_BF16_TILE, GateApplyBf16, GateSplitBf16, GemmBf16, RMS_NORM_BF16_COLS,
+    ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RopeBf16, SILU_MUL_BF16_COLS,
+    SiluMulBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, WeightIx};
 
 use crate::canonical::{
-    ArenaRefusal, CanonicalRefusal, GemmShapeRule, OperandRefusal, RowShapeRule,
+    ArenaRefusal, CanonicalRefusal, CudaModelFacts, GateShapeRule, GemmShapeRule, OperandRefusal,
+    RopeShapeRule, RowShapeRule, ViewRefusal,
 };
 
-/// What a step's lowering reads besides the step itself: the planned canonical, and where each
-/// colour lives in the arena.
+/// What a step's lowering reads besides the step itself: the planned canonical, the model facts,
+/// and where each colour and the rotary table live in the arena.
 pub struct StepCx<'a> {
     pub graph: &'a SubtileIR,
     /// Parallel to the graph's sources.
     pub bindings: &'a [SourceBinding],
     pub colouring: &'a TapeColouring,
+    pub facts: CudaModelFacts,
+    /// The bucket's token count (the embedded hidden's rows), when one source is bound to it.
+    pub tokens: Option<u32>,
     /// Each colour's byte offset, or why the arena has no layout.
     pub offsets: Result<&'a [u64], ArenaRefusal>,
+    /// The rotary table's offset, when the arena has one.
+    pub rotary: Option<ArenaOffset>,
 }
 
 /// One `Compute` of the tape: its position among the `Compute`s, its node, the slot it writes and
@@ -47,15 +55,24 @@ pub struct TapeStep<'a> {
     pub inputs: &'a ComputeInputs,
 }
 
-/// Lower the op of one kept `Compute` on the tape to its CUDA step.
-pub fn lower_step(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<CudaStep, CanonicalRefusal> {
+/// Lower the op of one kept `Compute` on the tape to its CUDA step, or to none for a view.
+/// `computes` is every `Compute` of the tape, in which a `GateApply` finds its gate's `GateSplit`.
+pub fn lower_step(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    computes: &[TapeStep<'_>],
+) -> Result<Option<CudaStep>, CanonicalRefusal> {
     use EwKind as E;
     use SubOp as L;
     let op = &s.node.op;
-    match op {
+    let step = match op {
         L::MatmulTile { n, weight } => gemm(cx, s, *n, *weight).map(CudaStep::Gemm),
         L::RmsNorm { eps, gain } => rms_norm(cx, s, *eps, *gain).map(CudaStep::RmsNorm),
         L::Elementwise(E::Add) => add(cx, s).map(CudaStep::Add),
+        L::Reshape { .. } => return view(cx, s).map(|()| None),
+        L::RopeRotate { head_dim, .. } => rope(cx, s, head_dim.get()).map(CudaStep::Rope),
+        L::GateSplit { half_cols } => gate_split(cx, s, *half_cols).map(CudaStep::GateSplit),
+        L::GateApply => gate_apply(cx, s, computes).map(CudaStep::GateApply),
         // SwiGLU runs only as the `SiluMul` fold: a `Silu` the fold left, a `Mul` driving none,
         // and the pre-fused op (which only spyre's `fuse_silu_mul` makes) have no kernel.
         L::Elementwise(E::Silu | E::Mul) | L::SiluMul => Err(CanonicalRefusal::Unfused {
@@ -63,20 +80,16 @@ pub fn lower_step(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<CudaStep, Canonic
             op: op.name(),
         }),
         L::SumReduce { .. }
-        | L::Reshape { .. }
         | L::Elementwise(E::Gelu | E::QuickGelu | E::GeluErf | E::Relu2 | E::Sub | E::BiasAdd)
         | L::ScalarMul { .. }
         | L::RmsNormReduce { .. }
         | L::RmsNormApply { .. }
-        | L::RopeRotate { .. }
         | L::RopeAppend { .. }
         | L::KvAppend { .. }
         | L::AttnDecode { .. }
         | L::TanhSoftCap { .. }
         | L::RmsNormUnit { .. }
         | L::ScalarWeightMul
-        | L::GateSplit { .. }
-        | L::GateApply
         | L::Concat { .. }
         | L::GateScale
         | L::LoadRows { .. }
@@ -114,7 +127,8 @@ pub fn lower_step(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<CudaStep, Canonic
             step: s.step,
             op: op.name(),
         }),
-    }
+    };
+    step.map(Some)
 }
 
 /// Lower the `Compute` driving `fusion` to the fused kernel's CUDA step. `computes` is every
@@ -264,8 +278,11 @@ fn silu_mul(
     else {
         return Err(CanonicalRefusal::FusionShape { step });
     };
-    let act = (computes.iter().find(|c| c.writes == silu))
-        .expect("the fold pass names an activation slot a Compute of this tape writes");
+    let act =
+        (computes.iter().find(|c| c.writes == silu)).ok_or(CanonicalRefusal::ProducerMissing {
+            step,
+            op: s.node.op.name(),
+        })?;
     let (silu_in, up) = match (act.node.inputs.as_slice(), s.node.inputs.as_slice()) {
         ([g], [_, u]) => (g, u),
         ([_], _) => return Err(operand(s, 1, OperandRefusal::Missing)),
@@ -287,6 +304,268 @@ fn silu_mul(
         rows,
         cols,
     })
+}
+
+/// `Reshape` as a view: no launch, and its output is its input's buffer. CUDA's colour rule
+/// aliases every `Reshape` to operand 0; this checks that the alias holds rather than trusting it.
+/// Row-major, `[m, heads·hd]` and `[m·heads, hd]` are the same bytes in the same order, so both
+/// row scales (`Times` and `Over`) are views.
+fn view(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<(), CanonicalRefusal> {
+    let step = s.step;
+    let refuse = |why| CanonicalRefusal::View { step, why };
+    let [input] = s.node.inputs.as_slice() else {
+        return Err(operand(s, 0, OperandRefusal::Missing));
+    };
+    let slot = match s.inputs.iter().next() {
+        Some(ComputeInput::Computed(slots)) => match slots.as_slice() {
+            [slot] => *slot,
+            _ => return Err(operand(s, 0, OperandRefusal::SplitWriters(slots.len()))),
+        },
+        Some(ComputeInput::External { .. }) => return Err(refuse(ViewRefusal::OfASource)),
+        None => return Err(operand(s, 0, OperandRefusal::Missing)),
+    };
+    let count = |t: TensorShape| u64::from(t.rows) * u64::from(t.cols);
+    let (i, o) = (
+        cx.graph.shape(input.tensor),
+        cx.graph.shape(s.node.output.tensor),
+    );
+    if count(i) != count(o) {
+        return Err(refuse(ViewRefusal::ElementCount {
+            input: count(i),
+            output: count(o),
+        }));
+    }
+    whole_tensors(cx, s, &[(0, input)])?;
+    // Unreachable under CUDA's rule (`op_abi::cuda_colour_rule` aliases a `Reshape` to operand 0,
+    // and (a) above made that operand a step): kept so a rule change cannot make a view silently
+    // read a buffer nobody wrote.
+    let (ic, oc) = (colour_of(cx, slot), colour_of(cx, s.writes));
+    if ic != oc {
+        return Err(refuse(ViewRefusal::Colour {
+            input: ic.index(),
+            output: oc.index(),
+        }));
+    }
+    Ok(())
+}
+
+/// `RopeRotate { head_dim }` as the bf16 partial rope: `x` (operand 0) a computed slot or the
+/// embedded hidden; operands 1 and 2 the global rotary `cos` and `sin`, which CUDA does not upload
+/// as sources but reads as the tape's one rotary table. The rotated width is the model's
+/// (`CudaModelFacts::rot_dim`); the op carries only `head_dim`.
+fn rope(cx: &StepCx<'_>, s: &TapeStep<'_>, head_dim: u32) -> Result<RopeBf16, CanonicalRefusal> {
+    let (step, node) = (s.step, s.node);
+    let rot_dim = cx.facts.rot_dim;
+    let [x, ..] = node.inputs.as_slice() else {
+        return Err(operand(s, 0, OperandRefusal::Missing));
+    };
+    let TensorShape { rows, cols } = cx.graph.shape(node.output.tensor);
+    rope_shape(rows, cols, head_dim, rot_dim, cx.tokens).map_err(|rule| {
+        CanonicalRefusal::RopeShape {
+            step,
+            rows,
+            cols,
+            head_dim,
+            rot_dim,
+            rule,
+        }
+    })?;
+    same_shape(cx, s, 0, x, rows, cols)?;
+    whole_tensors(cx, s, &[(0, x)])?;
+    let mut inputs = s.inputs.iter();
+    let xc = activation(cx, s, 0, inputs.next())?;
+    for (k, want) in [
+        (1, SourceBinding::Cos { local: false }),
+        (2, SourceBinding::Sin { local: false }),
+    ] {
+        let binding = match inputs.next() {
+            Some(ComputeInput::External { tensor, .. }) => {
+                Some(cx.bindings[tensor.index()].clone())
+            }
+            Some(ComputeInput::Computed(_)) => None,
+            None => return Err(operand(s, k, OperandRefusal::Missing)),
+        };
+        if binding.as_ref() != Some(&want) {
+            return Err(CanonicalRefusal::RotaryOperand {
+                step,
+                operand: k,
+                binding,
+            });
+        }
+    }
+    let at = arena(cx)?;
+    // Operand 1 is the global `cos`, so the arena placed the table.
+    let table = cx.rotary.ok_or(CanonicalRefusal::RotaryOperand {
+        step,
+        operand: 1,
+        binding: None,
+    })?;
+    Ok(RopeBf16 {
+        x: at(xc),
+        table,
+        out: at(colour_of(cx, s.writes)),
+        rows,
+        cols,
+        head_dim,
+        rot_dim,
+    })
+}
+
+/// `GateSplit { half_cols }` as the bf16 per-head split: `qg` (operand 0) `[rows, 2·half_cols]`,
+/// the query this step's colour and the gate its second colour. `head_dim` is the model's: the op
+/// carries only `half_cols`.
+fn gate_split(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    half_cols: u32,
+) -> Result<GateSplitBf16, CanonicalRefusal> {
+    let (step, node) = (s.step, s.node);
+    let head_dim = cx.facts.head_dim;
+    let [qg] = node.inputs.as_slice() else {
+        return Err(operand(s, 0, OperandRefusal::Missing));
+    };
+    let rows = cx.graph.shape(node.output.tensor).rows;
+    gate_shape(rows, half_cols, head_dim).map_err(|rule| CanonicalRefusal::GateShape {
+        step,
+        rows,
+        half_cols,
+        head_dim,
+        rule,
+    })?;
+    same_shape(cx, s, 0, qg, rows, 2 * half_cols)?;
+    whole_tensors(cx, s, &[(0, qg)])?;
+    let gate =
+        (cx.colouring.second_colour_of(s.writes)).ok_or(CanonicalRefusal::SecondOutput { step })?;
+    let qgc = activation(cx, s, 0, s.inputs.iter().next())?;
+    let at = arena(cx)?;
+    Ok(GateSplitBf16 {
+        qg: at(qgc),
+        q: at(colour_of(cx, s.writes)),
+        gate: at(gate),
+        rows,
+        half_cols,
+        head_dim,
+    })
+}
+
+/// `GateApply` as the bf16 `attn · sigmoid(gate)`: `attn` (operand 0) a computed slot or the
+/// embedded hidden. Operand 1 names a `GateSplit`'s slot, and means its SECOND output, the gate:
+/// the shared graph has one tensor for both, so read naively it would gate by the query. As metal
+/// does (`metal/compiler/src/steps_from_tape.rs`), the gate binds the producer's second colour.
+fn gate_apply(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    computes: &[TapeStep<'_>],
+) -> Result<GateApplyBf16, CanonicalRefusal> {
+    let (step, node) = (s.step, s.node);
+    let (a, g) = match node.inputs.as_slice() {
+        [a, g] => (a, g),
+        _ => return Err(operand(s, 1, OperandRefusal::Missing)),
+    };
+    let TensorShape { rows, cols } = cx.graph.shape(node.output.tensor);
+    row_shape(s, rows, cols, GATE_APPLY_BF16_COLS)?;
+    same_shape(cx, s, 0, a, rows, cols)?;
+    same_shape(cx, s, 1, g, rows, cols)?;
+    whole_tensors(cx, s, &[(0, a), (1, g)])?;
+    let mut inputs = s.inputs.iter();
+    let ac = activation(cx, s, 0, inputs.next())?;
+    let refuse = CanonicalRefusal::GateOperand { step };
+    let split = match inputs.next() {
+        Some(ComputeInput::Computed(slots)) => match slots.as_slice() {
+            [slot] => computes.iter().find(|c| c.writes == *slot),
+            _ => None,
+        },
+        _ => None,
+    }
+    .filter(|c| matches!(c.node.op, SubOp::GateSplit { .. }))
+    .ok_or(refuse)?;
+    let gate = (cx.colouring.second_colour_of(split.writes))
+        .ok_or(CanonicalRefusal::SecondOutput { step: split.step })?;
+    let at = arena(cx)?;
+    Ok(GateApplyBf16 {
+        attn: at(ac),
+        gate: at(gate),
+        out: at(colour_of(cx, s.writes)),
+        rows,
+        cols,
+    })
+}
+
+/// The bf16 rope's shape rule, the one its launcher applies, and the table's: `rows`, `cols`,
+/// `head_dim` and `rot_dim` non-zero; `rot_dim` a multiple of [`ROPE_BF16_ROT_MULTIPLE`] and at
+/// most `head_dim`; `head_dim` a multiple of [`ROPE_BF16_HEAD_MULTIPLE`]; `cols` a whole number
+/// of heads; `rows · cols` at most `i32::MAX`; and `rows` the bucket's `tokens`, when known.
+fn rope_shape(
+    rows: u32,
+    cols: u32,
+    head_dim: u32,
+    rot_dim: u32,
+    tokens: Option<u32>,
+) -> Result<(), RopeShapeRule> {
+    for (dim, value) in [
+        ("rows", rows),
+        ("cols", cols),
+        ("head_dim", head_dim),
+        ("rot_dim", rot_dim),
+    ] {
+        if value == 0 {
+            return Err(RopeShapeRule::Empty { dim });
+        }
+    }
+    if !rot_dim.is_multiple_of(ROPE_BF16_ROT_MULTIPLE) {
+        return Err(RopeShapeRule::RotOffVector {
+            multiple: ROPE_BF16_ROT_MULTIPLE,
+        });
+    }
+    if rot_dim > head_dim {
+        return Err(RopeShapeRule::RotAboveHead);
+    }
+    if !head_dim.is_multiple_of(ROPE_BF16_HEAD_MULTIPLE) {
+        return Err(RopeShapeRule::HeadOffVector {
+            multiple: ROPE_BF16_HEAD_MULTIPLE,
+        });
+    }
+    if !cols.is_multiple_of(head_dim) {
+        return Err(RopeShapeRule::ColsOffHead);
+    }
+    let elements = u64::from(rows) * u64::from(cols);
+    if elements > i32::MAX as u64 {
+        return Err(RopeShapeRule::TooManyElements { elements });
+    }
+    if let Some(tokens) = tokens
+        && rows != tokens
+    {
+        return Err(RopeShapeRule::RowsNotTokens { tokens });
+    }
+    Ok(())
+}
+
+/// The bf16 gate split's shape rule, the one its launcher applies: `rows`, `half_cols` and
+/// `head_dim` non-zero; `head_dim` a multiple of [`GATE_SPLIT_BF16_HEAD_MULTIPLE`]; `half_cols` a
+/// whole number of heads; `rows · 2·half_cols` at most `i32::MAX`.
+fn gate_shape(rows: u32, half_cols: u32, head_dim: u32) -> Result<(), GateShapeRule> {
+    for (dim, value) in [
+        ("rows", rows),
+        ("half_cols", half_cols),
+        ("head_dim", head_dim),
+    ] {
+        if value == 0 {
+            return Err(GateShapeRule::Empty { dim });
+        }
+    }
+    if !head_dim.is_multiple_of(GATE_SPLIT_BF16_HEAD_MULTIPLE) {
+        return Err(GateShapeRule::HeadOffVector {
+            multiple: GATE_SPLIT_BF16_HEAD_MULTIPLE,
+        });
+    }
+    if !half_cols.is_multiple_of(head_dim) {
+        return Err(GateShapeRule::HalfOffHead);
+    }
+    let elements = u64::from(rows) * 2 * u64::from(half_cols);
+    if elements > i32::MAX as u64 {
+        return Err(GateShapeRule::TooManyElements { elements });
+    }
+    Ok(())
 }
 
 /// The bf16 GEMM's shape rule: `m`, `n` and `k` non-zero multiples of [`GEMM_BF16_TILE`], and

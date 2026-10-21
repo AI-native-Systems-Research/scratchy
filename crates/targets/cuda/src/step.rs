@@ -22,6 +22,14 @@ pub enum CudaStep {
     /// `silu(gate) · up` in one launch, lowered from the `SiluMul` fold of an `Elementwise(Silu)`
     /// into the `Elementwise(Mul)` it gates (`kernels/silu_mul_bf16.cu`).
     SiluMul(SiluMulBf16),
+    /// The bf16 partial rotary embedding, lowered from `SubOp::RopeRotate`
+    /// (`kernels/rope_bf16.cu`).
+    Rope(RopeBf16),
+    /// The per-head split of a doubled `q_proj` output into query and gate, lowered from
+    /// `SubOp::GateSplit` (`kernels/gate_split_bf16.cu`).
+    GateSplit(GateSplitBf16),
+    /// `attn · sigmoid(gate)`, lowered from `SubOp::GateApply` (`kernels/gate_apply_bf16.cu`).
+    GateApply(GateApplyBf16),
 }
 
 /// The bf16 GEMM's tile `(m, n, k)`: every `m`, `n` and `k` it takes is a non-zero multiple of
@@ -103,6 +111,65 @@ pub struct SiluMulBf16 {
     pub cols: u32,
 }
 
+/// The rope's `rot_dim` is a non-zero multiple of this, at most `head_dim`: each head's `R/2`
+/// rotated pairs are whole 8-wide vectors on both halves (`kernels/rope_bf16.cu`).
+pub const ROPE_BF16_ROT_MULTIPLE: u32 = 16;
+/// The rope's `head_dim` is a non-zero multiple of this (the pass-through lanes are whole 16-byte
+/// vectors), and its `cols` a multiple of `head_dim`. `rows` is non-zero and `rows · cols` at most
+/// `i32::MAX`.
+pub const ROPE_BF16_HEAD_MULTIPLE: u32 = 8;
+
+/// Partial rotary embedding over `[rows, cols]`, `cols = heads · head_dim`, bf16 in and out.
+///
+/// For token row `r` and each head, pair `d < rot_dim/2` of lanes `(d, d + rot_dim/2)` (NeoX
+/// pairing within the rotated width) becomes `(x0·c − x1·s, x1·c + x0·s)` in f32, rounded once,
+/// with `c = table[r, d]` and `s = table[r, rot_dim/2 + d]`. Lanes `rot_dim..head_dim` are copied
+/// bit for bit. `table` is the tape's rotary table ([`crate::tape::RotaryTable`]), `[rows,
+/// rot_dim]` bf16; `out` overlaps neither input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RopeBf16 {
+    pub x: ArenaOffset,
+    pub table: ArenaOffset,
+    pub out: ArenaOffset,
+    pub rows: u32,
+    pub cols: u32,
+    pub head_dim: u32,
+    pub rot_dim: u32,
+}
+
+/// The gate split's `head_dim` is a non-zero multiple of this (`kernels/gate_split_bf16.cu`: one
+/// 16-byte vector per thread, never straddling a head), and `half_cols` a non-zero multiple of
+/// `head_dim`. `rows` is non-zero and `rows · 2·half_cols` at most `i32::MAX`.
+pub const GATE_SPLIT_BF16_HEAD_MULTIPLE: u32 = 8;
+
+/// Per head `h` and lane `d`: `q[r, h·hd + d] = qg[r, 2h·hd + d]` and `gate[r, h·hd + d] =
+/// qg[r, 2h·hd + hd + d]`, bf16 copies. `qg` is `[rows, 2·half_cols]`, `q` and `gate` are `[rows,
+/// half_cols]`, and neither output overlaps `qg` or the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GateSplitBf16 {
+    pub qg: ArenaOffset,
+    pub q: ArenaOffset,
+    pub gate: ArenaOffset,
+    pub rows: u32,
+    pub half_cols: u32,
+    pub head_dim: u32,
+}
+
+/// The gate apply's `cols` is a non-zero multiple of this (`kernels/gate_apply_bf16.cu`: one
+/// 8-wide bf16 vector per thread), `rows` non-zero, and `rows · cols` at most `i32::MAX`.
+pub const GATE_APPLY_BF16_COLS: u32 = 8;
+
+/// `out = attn / (1 + e^(−gate))` over `[rows, cols]`, bf16 in and out, computed in f32 and
+/// rounded once. No broadcast: all three are arena slots of the same shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GateApplyBf16 {
+    pub attn: ArenaOffset,
+    pub gate: ArenaOffset,
+    pub out: ArenaOffset,
+    pub rows: u32,
+    pub cols: u32,
+}
+
 /// A weight a step reads, and the bytes it reads of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WeightRead {
@@ -110,12 +177,13 @@ pub struct WeightRead {
     pub bytes: u64,
 }
 
-/// What one step touches: the arena spans it reads, in operand order, the span it writes, and
-/// the weight it reads.
+/// What one step touches: the arena spans it reads, in operand order, the span it writes, a
+/// second span it writes (a two-output kernel's), and the weight it reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepExtents {
     pub reads: [Option<ArenaSpan>; 2],
     pub writes: ArenaSpan,
+    pub second_write: Option<ArenaSpan>,
     pub weight: Option<WeightRead>,
 }
 
@@ -134,6 +202,7 @@ impl CudaStep {
                 Some(StepExtents {
                     reads: [Some(span(a, ab)), None],
                     writes: span(c, cb),
+                    second_write: None,
                     weight: Some(WeightRead { ix: b, bytes: bb }),
                 })
             }
@@ -151,6 +220,7 @@ impl CudaStep {
                 Some(StepExtents {
                     reads: [Some(span(x, xb)), None],
                     writes: span(y, xb),
+                    second_write: None,
                     weight: Some(WeightRead {
                         ix: gain,
                         bytes: gb,
@@ -170,6 +240,13 @@ impl CudaStep {
                 out,
                 rows,
                 cols,
+            })
+            | Self::GateApply(GateApplyBf16 {
+                attn: a,
+                gate: b,
+                out,
+                rows,
+                cols,
             }) => {
                 let Some(bytes) = bf16_bytes(rows, cols) else {
                     return None;
@@ -177,6 +254,48 @@ impl CudaStep {
                 Some(StepExtents {
                     reads: [Some(span(a, bytes)), Some(span(b, bytes))],
                     writes: span(out, bytes),
+                    second_write: None,
+                    weight: None,
+                })
+            }
+            Self::Rope(RopeBf16 {
+                x,
+                table,
+                out,
+                rows,
+                cols,
+                rot_dim,
+                ..
+            }) => {
+                let (Some(xb), Some(tb)) = (bf16_bytes(rows, cols), bf16_bytes(rows, rot_dim))
+                else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [Some(span(x, xb)), Some(span(table, tb))],
+                    writes: span(out, xb),
+                    second_write: None,
+                    weight: None,
+                })
+            }
+            Self::GateSplit(GateSplitBf16 {
+                qg,
+                q,
+                gate,
+                rows,
+                half_cols,
+                ..
+            }) => {
+                let Some(hb) = bf16_bytes(rows, half_cols) else {
+                    return None;
+                };
+                let Some(qgb) = hb.checked_mul(2) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [Some(span(qg, qgb)), None],
+                    writes: span(q, hb),
+                    second_write: Some(span(gate, hb)),
                     weight: None,
                 })
             }
