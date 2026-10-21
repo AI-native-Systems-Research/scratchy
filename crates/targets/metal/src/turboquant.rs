@@ -70,7 +70,7 @@ pub struct TqPool<'a> {
 /// (byte-identical to before, when `is_global` was implicitly all-true).
 ///
 /// `lent` is a scratch of a pool whose forwards never overlap this one's (a head's target's,
-/// [`crate::interpreter::metal::LentActivation::tq_scratch`]): of this geometry, the provision
+/// [`crate::interpreter::metal::HostArena::tq_scratch`]): of this geometry, the provision
 /// stages through it and allocates none of its own.
 pub fn build_tq_provision(
     allocator: &crate::MetalAllocator,

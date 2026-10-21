@@ -33,7 +33,9 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "metal")]
 use scratchy_core_common::SamplingParams;
 #[cfg(feature = "metal")]
-use scratchy_core_common::lend::unlent_bytes;
+use scratchy_target_metal::interpreter::metal::{
+    ArenaShare, GuestArena, HiddenReads, HostArena, TerminalReads,
+};
 // Read only by the metal embeddings path below (it walks a
 // StorageModeShared arena slot via `buf.contents()`), so the import follows
 // that gate rather than being carried on every backend.
@@ -937,7 +939,7 @@ impl SharedKv {
 
 /// Where a TurboQuant draft stages its KV: its own fp16 scratch, or — a head, which runs after its
 /// target and never beside it, of the target's KV geometry — the target's
-/// (`LentActivation::tq_scratch`).
+/// (`HostArena::tq_scratch`).
 #[cfg(feature = "metal")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DraftScratch {
@@ -1377,8 +1379,8 @@ impl MetalWorker {
     /// Each prefill bucket's arena price: the target's, and every arena that runs at it. A draft
     /// forward (an MTP head's pass 1, a draft model's lockstep prefill) runs the target's rows, so
     /// it needs the same bucket. A draft model's arena is its own, at the smallest of its buckets
-    /// that holds them; a head places its arena in the target's (`draft_device`), so it adds what
-    /// that does not hold. Empty when the target emits no cost table.
+    /// that holds them; a head's is the target's, grown to hold it (`ArenaShare::Hosts`), so it
+    /// adds what the target's arena grows by. Empty when the target emits no cost table.
     fn metal_bucket_costs(
         &self,
         target: &dyn scratchy_forward_compiler::ScratchyWeights,
@@ -1391,11 +1393,11 @@ impl MetalWorker {
             .map(|&(bucket_m, bytes)| {
                 let draft = match head {
                     Some(head) => {
-                        let layout = |m: &dyn scratchy_forward_compiler::ScratchyWeights| {
-                            let rung = Self::metal_pick(m, dev, Some(bucket_m), 1)?;
-                            ExecutorResult::Ok(rung.arena_layout())
+                        let pick = |m: &dyn scratchy_forward_compiler::ScratchyWeights| {
+                            Self::metal_pick(m, dev, Some(bucket_m), 1)
                         };
-                        unlent_bytes(&layout(head)?, &layout(target)?)
+                        let guest = head_guest(&pick(head)?, dev.max_decode_rows);
+                        pick(target)?.hosting_arena_bytes(&guest)
                     }
                     None => (draft_costs.iter())
                         .find(|&&(m, _)| m >= bucket_m)
@@ -1408,8 +1410,8 @@ impl MetalWorker {
     }
 
     /// The scratch of the KV cap rung each pool runs on at `block_cap` blocks a sequence: the
-    /// target's, and a draft's — a head's only what the target's scratch does not hold, as its
-    /// arena.
+    /// target's, and a draft's — a head's only what the target's scratch grows by to hold it, as
+    /// its arena.
     fn metal_rung_scratch(
         &self,
         target: &dyn scratchy_forward_compiler::ScratchyWeights,
@@ -1423,14 +1425,35 @@ impl MetalWorker {
         let rows = dev.max_decode_rows;
         let draft = self.draft_model.as_deref();
         let draft_bytes = match draft {
-            Some(head) if head.reads_target_hidden() => unlent_bytes(
-                &pick(head)?.scratch_sizes(rows),
-                &target_rung.scratch_sizes(rows),
-            ),
+            Some(head) if head.reads_target_hidden() => {
+                target_rung.hosting_scratch_bytes(rows, &head_guest(&pick(head)?, rows))
+            }
             Some(draft) => pick(draft)?.scratch_bytes(rows),
             None => 0,
         };
         Ok(target_rung.scratch_bytes(rows) + draft_bytes)
+    }
+
+    /// What the target's pool holds for its MTP head ([`ArenaShare::Hosts`]): the head's arena and
+    /// scratch at the bucket cap and KV cap rung its own pool runs on — its KV pool's, or its
+    /// target's for a head reading its target's KV. `None` without a head. Set on the target's
+    /// device before its pool is built, at its first forward.
+    fn metal_head_guest(&self) -> ExecutorResult<Option<GuestArena>> {
+        let (Some(head), Some(dev)) = (
+            self.draft_model.as_deref().filter(|_| self.draft_is_head()),
+            self.gpu_device.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        let kv = match self.head_reads_target_kv() {
+            true => self.kv_cache.as_ref(),
+            false => self.draft_kv_cache.as_ref(),
+        };
+        let kv = kv.ok_or_else(|| {
+            ExecutorError::WorkerInit("MTP head: its KV pool is not initialized".into())
+        })?;
+        let rung = Self::metal_pick(head, dev, dev.metal_bucket_max_m, kv.max_blocks_per_seq)?;
+        Ok(Some(head_guest(&rung, dev.max_decode_rows)))
     }
 
     /// The resolved width, floored at 1. Every consumer of the width calls
@@ -1533,15 +1556,21 @@ impl MetalWorker {
 
     /// The device a draft forward runs on: the target's device and allocator, on the draft queue
     /// when there is one (a draft model runs beside the target). A head runs after the target, on
-    /// its queue, each forward waited on, so it places its pool's buffers in the target's.
+    /// its command buffer, so its pool runs in the target's arena, which the target's pool sized to
+    /// hold it ([`Self::metal_head_guest`]).
     fn draft_device(
         &self,
     ) -> Result<GpuDevice, ::scratchy_serving_engine::spec_decode::BackendError> {
         use ::scratchy_serving_engine::spec_decode::BackendError;
         let main = (self.gpu_device.as_ref())
             .ok_or_else(|| BackendError::Backend("gpu_device not initialized".into()))?;
-        let lent = match self.model.as_deref() {
-            Some(target) if self.draft_is_head() => lent_by(target)?,
+        let (share, hidden_reads, terminal_reads) = match self.model.as_deref() {
+            Some(target) if self.draft_is_head() => {
+                let (hidden, terminal) = HEAD_READS;
+                (ArenaShare::In(Box::new(hosted_by(target)?)), hidden, terminal)
+            }
+            // A draft model's arena is its own, and its argmax runs on the GPU, on the forward's
+            // own command buffer.
             _ => Default::default(),
         };
         Ok(GpuDevice {
@@ -1551,9 +1580,9 @@ impl MetalWorker {
             metal_bucket_max_m: main.metal_bucket_max_m,
             kv_addressing: main.kv_addressing,
             max_decode_rows: main.max_decode_rows,
-            lent,
-            // Its argmax runs on the GPU, on the forward's own command buffer.
-            terminal_reads: Default::default(),
+            share,
+            hidden_reads,
+            terminal_reads,
         })
     }
 
@@ -3617,7 +3646,7 @@ impl MetalWorker {
             _ => None,
         };
         // An MTP head's passes, on a device of their own like any head forward — taken while the
-        // target's worker is still in its pool, to lend the head its activation.
+        // target's worker is still in its pool, to share the target's arena with the head.
         let head_device = then.map(|_| self.draft_device()).transpose()?;
         let device_mut: &mut GpuDevice = if let Some(ref mut shadow) = shadow_draft_device {
             shadow
@@ -4288,24 +4317,38 @@ impl ChainLayout {
     }
 }
 
-/// The buffers `target`'s pool lends a model whose forwards never overlap its own — an MTP head's:
-/// none until the target's first forward builds that pool.
+/// What the host reads of an MTP head's forwards by pointer: neither its hidden states, which its
+/// chain reads on the device, nor its logits, which its argmax does — so every slot it takes of
+/// its target's arena may be sparse.
 #[cfg(feature = "metal")]
-fn lent_by(
+const HEAD_READS: (HiddenReads, TerminalReads) = (HiddenReads::Gpu, TerminalReads::Gpu);
+
+/// What an MTP head's pool on `rung` needs of its target's arena, the decode split's partials for
+/// at most `rows` rows ([`HEAD_READS`]).
+#[cfg(feature = "metal")]
+fn head_guest(
+    rung: &scratchy_target_metal::interpreter::metal::PickedRung<'_>,
+    rows: Option<scratchy_target_metal::tape::ids::DecodeRows>,
+) -> GuestArena {
+    let (hidden, terminal) = HEAD_READS;
+    rung.guest(rows, hidden, terminal)
+}
+
+/// What `target`'s pool shares with its MTP head, which runs in it: nothing until the target's
+/// first forward builds that pool.
+#[cfg(feature = "metal")]
+fn hosted_by(
     target: &dyn scratchy_forward_compiler::ScratchyWeights,
-) -> Result<
-    scratchy_target_metal::interpreter::metal::LentActivation,
-    ::scratchy_serving_engine::spec_decode::BackendError,
-> {
-    let lent = (target.metal_lend_activation())
-        .map(|l| l.downcast::<scratchy_target_metal::interpreter::metal::LentActivation>())
+) -> Result<HostArena, ::scratchy_serving_engine::spec_decode::BackendError> {
+    let hosted = (target.metal_hosted())
+        .map(|h| h.downcast::<HostArena>())
         .transpose()
         .map_err(|_| {
             ::scratchy_serving_engine::spec_decode::BackendError::Backend(
-                "target lent no LentActivation".into(),
+                "target hosted no HostArena".into(),
             )
         })?;
-    Ok(lent.map(|l| *l).unwrap_or_default())
+    Ok(hosted.map(|h| *h).unwrap_or_default())
 }
 
 /// An MTP head's passes over a step ([`HeadPasses`](::scratchy_serving_engine::spec_decode::HeadPasses)),
@@ -4512,10 +4555,11 @@ impl<'a> HeadPassesEncoder<'a> {
             unsafe { onto.then(ctx, n as u64, enc) }?;
             return Ok(onto);
         }
-        // The head's pool is built at its first forward, in the target's buffers: the target's own
+        // The head's pool is built at its first forward, in the target's arena: the target's own
         // pool exists by now — its forward, which this rides, built it — where at the step's start
         // it may not have.
-        self.device.lent = lent_by(self.target).map_err(|e| e.to_string())?;
+        let hosted = hosted_by(self.target).map_err(|e| e.to_string())?;
+        self.device.share = ArenaShare::In(Box::new(hosted));
         // SAFETY: every view points at the passes' vectors, alive for the call; the forward is
         // encoded onto `enc`, which the target's command buffer outlives.
         unsafe {
@@ -5747,6 +5791,13 @@ impl Worker for MetalWorker {
         // shared `recommendedMaxWorkingSetSize` budget.
         if self.draft_model.is_some() {
             self.initialize_draft_cache_metal(num_gpu_blocks)?;
+        }
+        // The target's pool, built at its first forward, holds its MTP head's arena: the head's
+        // forwards follow the target's on its command buffer, and run in it.
+        if let Some(guest) = self.metal_head_guest()?
+            && let Some(dev) = self.gpu_device.as_mut()
+        {
+            dev.share = ArenaShare::Hosts(guest);
         }
 
         Ok(())
@@ -7053,8 +7104,10 @@ impl Worker for MetalWorker {
                             // The draft chain runs under spec-decode: chunked addressing.
                             kv_addressing:
                                 scratchy_target_metal::tape::lowered::KvAddressing::Chunked,
-                            // It runs beside the target: nothing of the target's is lent.
-                            lent: Default::default(),
+                            // It runs beside the target: its arena is its own, and the host reads
+                            // its hidden states as any model's.
+                            share: Default::default(),
+                            hidden_reads: Default::default(),
                             // Its verify seed is an argmax the host runs over the logits.
                             terminal_reads:
                                 scratchy_target_metal::interpreter::metal::TerminalReads::Host,

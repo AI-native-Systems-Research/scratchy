@@ -49,7 +49,7 @@ pub struct TqRuntimeBuffers {
 /// coded layer of a forward — chunk tables (bound at each layer's `kv_cache_k/v` slot: attention,
 /// rope, dequant and quantize all use it) and their backing data (kept alive and resident here).
 /// Its contents live within one layer of one forward, so a model whose forwards never overlap this
-/// one's stages through it too ([`super::worker::LentActivation`]) when its geometry is the same.
+/// one's stages through it too ([`super::worker::HostArena`]) when its geometry is the same.
 #[derive(Clone)]
 pub struct TqScratch {
     pub k_table: Buffer,

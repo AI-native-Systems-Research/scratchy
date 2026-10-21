@@ -14567,6 +14567,10 @@ pub fn emit_model(
     // the load-time `select_prefill_bucket` compares against the device's
     // affordable arena budget to prune the ladder target-reactively.
     let mut metal_bucket_cost_entries: Vec<TokenStream> = Vec::new();
+    // Each slot's bytes at its largest bucket, and the slots holding a bucket's final hidden
+    // states: what the model's arena ranks are baked from (`ArenaRanks`).
+    let mut metal_ladder_arena: Vec<u64> = Vec::new();
+    let mut metal_hidden_slots: std::collections::BTreeSet<u32> = Default::default();
     // The KV cap rungs every bucket bakes, topped by every block the model's positions fill.
     #[cfg(feature = "metal")]
     let metal_cap_ladder = {
@@ -14655,6 +14659,13 @@ pub fn emit_model(
                 *b = 1;
             }
         }
+        if metal_ladder_arena.len() < bucket_arena_bytes.len() {
+            metal_ladder_arena.resize(bucket_arena_bytes.len(), 0);
+        }
+        for (ladder, &bytes) in metal_ladder_arena.iter_mut().zip(&bucket_arena_bytes) {
+            *ladder = (*ladder).max(bytes);
+        }
+        metal_hidden_slots.insert(*backbone_slot_b);
 
         // Per-bucket total arena cost (sum over colored slots) for the
         // load-time selector. Monotonic in `m`; consumed by
@@ -14746,6 +14757,24 @@ pub fn emit_model(
             },
         });
     }
+
+    // THE ARENA RANKS: the slots by size at their largest bucket, largest first, ties by slot —
+    // the order in which another model whose forwards never overlap this one's shares its arena
+    // (`ArenaRanks`): every slot as a guest, all but the buckets' final hidden states as a host.
+    let (metal_ranks_all, metal_ranks_hosting) = {
+        let mut all: Vec<u32> = (0..metal_ladder_arena.len() as u32).collect();
+        all.sort_by_key(|&slot| (std::cmp::Reverse(metal_ladder_arena[slot as usize]), slot));
+        let hosting: Vec<u32> = (all.iter().copied())
+            .filter(|slot| !metal_hidden_slots.contains(slot))
+            .collect();
+        let lits = |slots: Vec<u32>| -> Vec<proc_macro2::Literal> {
+            slots
+                .into_iter()
+                .map(proc_macro2::Literal::u32_unsuffixed)
+                .collect()
+        };
+        (lits(all), lits(hosting))
+    };
 
     // Largest `num_tokens` across all buckets — drives runtime
     // buffer sizing in the metal forward body's `RuntimeFactory`.
@@ -15039,6 +15068,10 @@ pub fn emit_model(
                         <Weights as ::scratchy_forward_compiler::CanonicalParams>::NUM_GLOBAL_KV_HEADS,
                     ),
                 },
+                ranks: ::scratchy_target_metal::interpreter::metal::ArenaRanks {
+                    all: &[#(#metal_ranks_all),*],
+                    hosting: &[#(#metal_ranks_hosting),*],
+                },
             };
 
         /// Largest `num_tokens` tape_index across [`METAL_BUCKETS`]. The
@@ -15161,8 +15194,11 @@ pub fn emit_model(
                 addressing,
                 // Nor the serving engine's batch: every bucket row's decode partials.
                 None,
-                ::core::default::Default::default(),
-                // Its callers read the logits on the host.
+                METAL_RUNGS.ranks,
+                // Its arena is its own.
+                ::scratchy_target_metal::interpreter::metal::ArenaShare::Own,
+                // Its callers read the hidden states and the logits on the host.
+                ::scratchy_target_metal::interpreter::metal::HiddenReads::Host,
                 ::scratchy_target_metal::interpreter::metal::TerminalReads::Host,
             )
         }
@@ -15309,7 +15345,7 @@ pub fn emit_model(
                     r.get().min(METAL_MAX_BUCKET_M)
                 }) as u64;
                 let factory: ::scratchy_target_metal::interpreter::metal::RuntimeFactory =
-                    ::scratchy_target_metal::interpreter::metal::RuntimeFactory::new(move |dev, lent| {
+                    ::scratchy_target_metal::interpreter::metal::RuntimeFactory::new(move |dev, host| {
                         let max_m = METAL_MAX_BUCKET_M as u64;
                         let alloc = |bytes: u64| {
                             use ::scratchy_target_metal::interpreter::metal::__re::MTLDevice as _;
@@ -15327,9 +15363,9 @@ pub fn emit_model(
                         let __tq_prov = METAL_TQ_CODEBOOK.as_ref().map(|codebook| {
                             // A head reading its target's KV binds its target's packed stores.
                             if #reads_target_kv {
-                                return lent.tq.clone().expect(
-                                    "a head reading its target's TurboQuant KV builds its pool on \
-                                     its target's, which lends it",
+                                return host.tq.clone().expect(
+                                    "a head reading its target's TurboQuant KV builds its pool in \
+                                     its target's, which shares it",
                                 );
                             }
                             ::scratchy_target_metal::turboquant::build_tq_provision(
@@ -15342,7 +15378,7 @@ pub fn emit_model(
                                     blocks_per_chunk: ::scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize,
                                 },
                                 codebook,
-                                lent.tq_scratch.as_ref(),
+                                host.tq_scratch.as_ref(),
                             )
                         });
                         ::scratchy_target_metal::interpreter::metal::RuntimeBindings {
@@ -15493,10 +15529,13 @@ pub fn emit_model(
                     // The serving engine's batch, stashed by the worker: the decode split's
                     // partials are reserved for that many rows.
                     device.max_decode_rows,
-                    // The buffers of a model whose forwards never overlap this one's, which the
-                    // worker places its own in (an MTP head, its target's).
-                    device.lent.clone(),
-                    // Whether its owner reads the logits on the host (a draft model's seed).
+                    METAL_RUNGS.ranks,
+                    // How its arena is shared with that of a model whose forwards never overlap
+                    // its own: an MTP target's holds its head's, a head's is its target's.
+                    device.share.clone(),
+                    // Whether its owner reads the hidden states (anything but an MTP head) and the
+                    // logits (a draft model's seed) on the host.
+                    device.hidden_reads,
                     device.terminal_reads,
                 )
                 .expect("MetalWorkerPool::for_buckets: pool init failed")
@@ -15801,6 +15840,14 @@ pub fn emit_model(
             num_tokens: u64,
             followup: ::core::option::Option<::scratchy_forward_compiler::MetalForwardFollowup<'_>>,
         ) -> crate::__gpu::OwnedTensor {
+            // A pool whose hidden states only the GPU reads keeps them sparse: the host cannot.
+            assert!(
+                ctx.hidden_out.is_none()
+                    || device.hidden_reads
+                        == ::scratchy_target_metal::interpreter::metal::HiddenReads::Host,
+                "a forward asked the host for hidden rows its device keeps on the GPU \
+                 (`HiddenReads::Gpu`, an MTP head's)"
+            );
             let pool = resident_metal_pool(wm, ctx, device);
             let n = num_tokens as usize;
 

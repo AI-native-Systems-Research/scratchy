@@ -34,8 +34,8 @@ use super::lowered::{LoweredMetalTape, ModelSources};
 use super::pipelines::SpecializedPipelines;
 use super::runtime::{InputWrite, InputWrites, Padding, RuntimeBindings};
 use super::worker::{
-    ArenaLayout, LentActivation, MetalWorker, ResolvedSources, SparsePlan, TerminalReads,
-    WorkerError,
+    ArenaLayout, ArenaRanks, ArenaShare, GuestArena, HiddenReads, HostArena, MetalWorker,
+    ResolvedSources, SparsePlan, TerminalReads, WorkerError, hosted_layout,
 };
 use crate::MetalAllocator;
 use crate::tape::constants::TapeVariant;
@@ -210,7 +210,7 @@ impl From<WorkerError> for PoolBuildError {
 #[derive(Clone)]
 pub struct RuntimeFactory(Arc<FactoryFn>);
 
-struct FactoryFn(Box<dyn Fn(&Device, &LentActivation) -> RuntimeBindings>);
+struct FactoryFn(Box<dyn Fn(&Device, &HostArena) -> RuntimeBindings>);
 
 // SAFETY: the boxed closure captures only Metal object handles (objc2
 // `Retained`, thread-safe retain/release) and POD; identical grounds to
@@ -220,14 +220,15 @@ unsafe impl Sync for FactoryFn {}
 
 impl RuntimeFactory {
     /// Wrap a per-worker `RuntimeBindings` builder.
-    pub fn new(f: impl Fn(&Device, &LentActivation) -> RuntimeBindings + 'static) -> Self {
+    pub fn new(f: impl Fn(&Device, &HostArena) -> RuntimeBindings + 'static) -> Self {
         Self(Arc::new(FactoryFn(Box::new(f))))
     }
 
-    /// Build a fresh set of runtime bindings for a worker on `device`, placing what it can in
-    /// `lent` ([`LentActivation::tq_scratch`]).
-    pub fn build(&self, device: &Device, lent: &LentActivation) -> RuntimeBindings {
-        ((self.0).0)(device, lent)
+    /// Build a fresh set of runtime bindings for a worker on `device`, staging through its host's
+    /// TurboQuant scratch where it has one of the same geometry, and binding its host's KV where
+    /// it reads it ([`HostArena`]).
+    pub fn build(&self, device: &Device, host: &HostArena) -> RuntimeBindings {
+        ((self.0).0)(device, host)
     }
 }
 
@@ -336,8 +337,8 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     mtl4: Mutex<Option<Mtl4Pool>>,
     inner: Mutex<PoolInner<W>>,
     cv: Condvar,
-    /// The first worker's arena slots, scratch and TurboQuant scratch ([`Self::lend_activation`]).
-    lendable: LentActivation,
+    /// What the first worker shares with the pool's guest ([`Self::hosted`]).
+    hosting: HostArena,
 }
 
 /// Pool-owned MTL4 surface. The command buffer is re-created per forward
@@ -438,6 +439,8 @@ pub struct TqGroup {
 pub struct MetalRungs {
     pub buckets: &'static [MetalBucketSpec],
     pub tq: TqGroup,
+    /// Its arena slots by size, as a guest and as a host ([`ArenaRanks`]).
+    pub ranks: ArenaRanks,
 }
 
 /// The rung a pool runs on: its KV cap, which is the row width of every step's block tables, and
@@ -447,6 +450,8 @@ pub struct PickedRung<'a> {
     /// The query heads one TurboQuant decode threadgroup serves on this device.
     pub tq_heads: TqDecodeHeads,
     pub tapes: Vec<(&'a MetalBucketSpec, &'a ClassedTape)>,
+    /// The model's arena ranks, which it shares an arena with another model's by.
+    pub ranks: ArenaRanks,
 }
 
 impl PickedRung<'_> {
@@ -497,6 +502,63 @@ impl PickedRung<'_> {
         }
         arena_layout
     }
+
+    /// The slots the host reads by pointer, which stay allocated in full and shared: each kept
+    /// bucket's final hidden states where it reads those ([`HiddenReads`]), and its logits where
+    /// it reads those ([`TerminalReads`]).
+    pub fn host_slots(&self, hidden: HiddenReads, terminal: TerminalReads) -> Vec<u32> {
+        (self.tapes.iter())
+            .flat_map(|(spec, _)| {
+                let hidden = (hidden == HiddenReads::Host).then_some(spec.backbone_slot);
+                let logits = (terminal == TerminalReads::Host).then_some(spec.terminal_slot);
+                [hidden, logits]
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// What this rung needs of its host's arena as a guest, its host reading what `hidden` and
+    /// `terminal` say: each slot's bytes rank by rank, the ranks the host reads, its scratch by
+    /// kind, the decode split's partials for at most `decode_rows` rows.
+    pub fn guest(
+        &self,
+        decode_rows: Option<DecodeRows>,
+        hidden: HiddenReads,
+        terminal: TerminalReads,
+    ) -> GuestArena {
+        let layout = self.arena_layout();
+        let read = self.host_slots(hidden, terminal);
+        let slots = self.ranks.guest_slots(layout.len());
+        GuestArena {
+            arena: slots.iter().map(|&slot| layout[slot]).collect(),
+            host_read: (slots.iter().enumerate())
+                .filter(|(_, slot)| read.contains(&(**slot as u32)))
+                .map(|(rank, _)| rank)
+                .collect(),
+            scratch: self.scratch_sizes(decode_rows),
+        }
+    }
+
+    /// The bytes this rung's arena grows by to hold `guest`'s ([`hosted_layout`]): what its pool
+    /// allocates for the guest, which the memory budget prices.
+    pub fn hosting_arena_bytes(&self, guest: &GuestArena) -> u64 {
+        let own = self.arena_layout();
+        let hosted = hosted_layout(&own, &self.ranks, guest);
+        hosted.iter().sum::<u64>() - own.iter().sum::<u64>()
+    }
+
+    /// The bytes this rung's scratch grows by to hold `guest`'s, kind by kind
+    /// ([`super::worker::hosted_scratch`]), the decode split's partials for at most `decode_rows`
+    /// rows.
+    pub fn hosting_scratch_bytes(
+        &self,
+        decode_rows: Option<DecodeRows>,
+        guest: &GuestArena,
+    ) -> u64 {
+        let own = self.scratch_sizes(decode_rows);
+        let hosted = super::worker::hosted_scratch(own, guest);
+        hosted.iter().sum::<u64>() - own.iter().sum::<u64>()
+    }
 }
 
 /// Pick the macro-baked rung a pool on `device` runs: the device's generation class and
@@ -512,6 +574,7 @@ impl PickedRung<'_> {
 pub fn pick_rung<'a>(
     device: &ProtocolObject<dyn MTLDevice>,
     bucket_specs: &'a [MetalBucketSpec],
+    ranks: ArenaRanks,
     tq: TqGroup,
     max_bucket_m: Option<u32>,
     block_cap: usize,
@@ -563,6 +626,7 @@ pub fn pick_rung<'a>(
         cap,
         tq_heads,
         tapes,
+        ranks,
     })
 }
 
@@ -586,6 +650,7 @@ impl MetalRungs {
         pick_rung(
             device,
             self.buckets,
+            self.ranks,
             self.tq,
             max_bucket_m,
             block_cap,
@@ -599,8 +664,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     ///
     /// Eager creation surfaces allocation/recording/pipeline-lookup
     /// failures at construction time and warms the first-forward
-    /// path (no creation cost on the first checkout). The first worker places its
-    /// buffers in `lent` ([`LentActivation`]); any later one allocates its own.
+    /// path (no creation cost on the first checkout). The first worker's arena is shared with
+    /// another model's as `share` says, by this model's `ranks` ([`ArenaShare`]); any later
+    /// worker's is its own.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: Arc<Device>,
@@ -613,7 +679,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         runtime_factory: RuntimeFactory,
         max_workers: usize,
         decode_rows: Option<DecodeRows>,
-        lent: LentActivation,
+        share: ArenaShare,
+        ranks: ArenaRanks,
         sparse_plan: Option<SparsePlan>,
     ) -> Result<Self, WorkerError>
     where
@@ -655,13 +722,19 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 total_created: 0,
             }),
             cv: Condvar::new(),
-            lendable: LentActivation::default(),
+            hosting: HostArena::default(),
         };
-        let first = pool.spawn_worker(&lent)?;
-        pool.lendable = LentActivation {
+        let first = pool.spawn_worker(&share, &ranks)?;
+        // A host shares the slot each guest rank takes; a pool hosting none, none.
+        let guest_ranks = match &share {
+            ArenaShare::Hosts(guest) => guest.arena.len(),
+            ArenaShare::Own | ArenaShare::In(_) => 0,
+        };
+        let slots = ranks.hosting_slots(pool.arena_layout.len(), guest_ranks);
+        pool.hosting = HostArena {
             tq_scratch: first.runtime.tq.as_ref().map(|t| t.scratch.clone()),
             tq: first.runtime.tq.clone(),
-            ..first.worker.activation()
+            ..first.worker.hosted(&slots)
         };
         {
             let mut inner = pool.inner.lock().unwrap();
@@ -697,10 +770,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         addressing: KvAddressing,
         // The most rows a decode or verify step brings (`GpuDevice::max_decode_rows`).
         decode_rows: Option<DecodeRows>,
-        // Buffers of a pool whose forwards never overlap this one's, for the first worker to place
-        // its own in ([`LentActivation`]).
-        lent: LentActivation,
-        // Whether the host reads the logits by pointer, so the terminal slots stay shared.
+        // The model's arena ranks, and how its arena is shared with that of a model whose
+        // forwards never overlap its own ([`ArenaShare`]).
+        ranks: ArenaRanks,
+        share: ArenaShare,
+        // Whether the host reads the final hidden states and the logits by pointer, so those slots
+        // stay shared.
+        hidden: HiddenReads,
         terminal: TerminalReads,
     ) -> Result<Self, PoolBuildError>
     where
@@ -714,6 +790,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let rung = pick_rung(
             &device,
             bucket_specs,
+            ranks,
             tq,
             max_bucket_m,
             block_cap,
@@ -721,6 +798,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         )?;
         let variant = rung.variant();
         let arena_layout = rung.arena_layout();
+        let host_slots = rung.host_slots(hidden, terminal);
         let picked = rung.tapes;
 
         let cache = SpecializedPipelineCache::new((*device).clone(), &[])
@@ -735,16 +813,6 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let tapes: Vec<LoweredMetalTape> = picked.iter().map(|(_, rung)| rung.tape).collect();
         let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
         let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache), variant));
-        // Every slot the host reads by pointer stays shared: each bucket's backbone hidden states
-        // (an MTP head's next input; an encoder's output, its terminal too) and, where the host
-        // reads the logits, each terminal slot.
-        let host_slots = (picked.iter())
-            .flat_map(|(spec, _)| {
-                let logits = (terminal == TerminalReads::Host).then_some(spec.terminal_slot);
-                [Some(spec.backbone_slot), logits]
-            })
-            .flatten()
-            .collect();
         let sparse_plan = SparsePlan {
             bucket_arena: picked.iter().map(|(spec, _)| spec.arena_bytes).collect(),
             host_slots,
@@ -761,7 +829,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             runtime_factory,
             max_workers,
             decode_rows,
-            lent,
+            share,
+            ranks,
             Some(sparse_plan),
         )
         .map_err(PoolBuildError::Worker)
@@ -814,7 +883,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             if inner.total_created < self.max_workers {
                 inner.total_created += 1;
                 drop(inner);
-                match self.spawn_worker(&LentActivation::default()) {
+                match self.spawn_worker(&ArenaShare::Own, &ArenaRanks::default()) {
                     Ok(pooled) => {
                         return Ok(WorkerGuard {
                             pool: self,
@@ -854,7 +923,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         if inner.total_created < self.max_workers {
             inner.total_created += 1;
             drop(inner);
-            match self.spawn_worker(&LentActivation::default()) {
+            match self.spawn_worker(&ArenaShare::Own, &ArenaRanks::default()) {
                 Ok(pooled) => Some(Ok(WorkerGuard {
                     pool: self,
                     inner: Some(pooled),
@@ -1485,8 +1554,16 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         (at, replaced)
     }
 
-    fn spawn_worker(&self, lent: &LentActivation) -> Result<PooledWorker<W>, WorkerError> {
-        let runtime = self.runtime_factory.build(&self.device, lent);
+    fn spawn_worker(
+        &self,
+        share: &ArenaShare,
+        ranks: &ArenaRanks,
+    ) -> Result<PooledWorker<W>, WorkerError> {
+        let host = match share {
+            ArenaShare::In(host) => &**host,
+            ArenaShare::Own | ArenaShare::Hosts(_) => &HostArena::default(),
+        };
+        let runtime = self.runtime_factory.build(&self.device, host);
         let worker = MetalWorker::<W>::new_with_residency(
             self.device.clone(),
             &self.arena_layout,
@@ -1496,7 +1573,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             &runtime,
             Some(self.allocator.residency()),
             self.decode_rows,
-            lent,
+            share,
+            ranks,
             self.sparse_plan.as_ref(),
         )?;
         Ok(PooledWorker {
@@ -1507,12 +1585,11 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         })
     }
 
-    /// The first worker's arena slots, scratch and TurboQuant scratch, to lend a pool whose
-    /// forwards never overlap this one's ([`LentActivation`]), out of the pool or not: the borrower
-    /// places its buffers in them once, building its pool, and every forward of it follows this
-    /// pool's — an MTP head's even on the command buffer of the target forward that holds the worker.
-    pub fn lend_activation(&self) -> LentActivation {
-        self.lendable.clone()
+    /// What the first worker shares with the pool's guest ([`HostArena`]), out of the pool or not:
+    /// the guest builds its pool in it once, and every forward of it follows this pool's — an MTP
+    /// head's even on the command buffer of the target forward that holds the worker.
+    pub fn hosted(&self) -> HostArena {
+        self.hosting.clone()
     }
 
     fn checkin(&self, pooled: PooledWorker<W>) {
@@ -2377,7 +2454,8 @@ mod tests {
             runtime_factory,
             max,
             None,
-            LentActivation::default(),
+            ArenaShare::Own,
+            ArenaRanks::default(),
             None,
         )
         .expect("pool builds");
@@ -2622,7 +2700,8 @@ mod tests {
             runtime_factory,
             max_workers,
             None,
-            LentActivation::default(),
+            ArenaShare::Own,
+            ArenaRanks::default(),
             None,
         )
         .expect("pool builds");
@@ -3317,7 +3396,9 @@ mod tests {
             128, // block_cap (test default — matches the legacy MAX_BLOCKS_PER_SEQ)
             KvAddressing::Direct,
             None,
-            LentActivation::default(),
+            ArenaRanks::default(),
+            ArenaShare::Own,
+            HiddenReads::Host,
             TerminalReads::Gpu,
         ))
     }
@@ -3350,7 +3431,9 @@ mod tests {
             128, // block_cap (unused — NoBuckets fires first)
             KvAddressing::Direct,
             None,
-            LentActivation::default(),
+            ArenaRanks::default(),
+            ArenaShare::Own,
+            HiddenReads::Host,
             TerminalReads::Gpu,
         );
         match res {

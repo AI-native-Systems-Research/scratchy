@@ -66,10 +66,10 @@ impl Activation {
 
 /// What a pool's worker maps as its buckets reach it ([`SparseBuffer`]) rather than allocating in
 /// full: each bucket's bytes in each arena slot, in bucket order (`MetalBucketSpec::arena_bytes`),
-/// and the slots the host reads by pointer, which stay allocated in full and shared — every
-/// bucket's backbone hidden states (an MTP head's next input; an encoder's output, which is its
-/// terminal slot too) and, where the pool's owner reads its logits on the host, every terminal slot
-/// ([`TerminalReads`]).
+/// and the slots the host reads by pointer, which stay allocated in full and shared — where the
+/// pool's owner reads them ([`HiddenReads`]), every bucket's backbone hidden states (an encoder's
+/// output, which is its terminal slot too), and where it reads its logits ([`TerminalReads`]),
+/// every terminal slot.
 #[derive(Clone, Default)]
 pub struct SparsePlan {
     pub bucket_arena: Vec<&'static [u64]>,
@@ -85,20 +85,104 @@ pub enum TerminalReads {
     Host,
 }
 
-/// A worker's arena slots and scratch, lent to a new worker of a model that never runs at the same
-/// time ([`scratchy_core_common::lend`]): it places its own in them, allocating only what they do
-/// not hold.
+/// Who reads a pool's final hidden states (each bucket's backbone slot): the host too, by pointer
+/// (a forward's `hidden_out` rows, an encoder's output), or only the GPU — an MTP head's, which its
+/// chain reads on the device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HiddenReads {
+    #[default]
+    Host,
+    Gpu,
+}
+
+/// A model's arena slots by size, largest first — each slot's bytes at its largest bucket, ties by
+/// slot — baked at expansion: the order in which two models whose forwards never overlap share one
+/// arena ([`ArenaShare`]). The guest's slot of rank `r` is its host's slot of rank `r`, which the
+/// host sizes to hold both ([`hosted_layout`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ArenaRanks {
+    /// Every slot: the order in which it takes its host's slots, as a guest.
+    pub all: &'static [u32],
+    /// Every slot but the buckets' final hidden states: the order in which it holds a guest's
+    /// slots, as a host. A guest reads its host's hidden states after its own forward has begun —
+    /// an MTP head's pass 1 once a run of rows — so it shares none of them.
+    pub hosting: &'static [u32],
+}
+
+impl ArenaRanks {
+    /// The slots of an arena of `len` slots, in the order of `ranks`.
+    fn within(ranks: &[u32], len: usize) -> impl Iterator<Item = usize> + '_ {
+        ranks.iter().map(|&s| s as usize).filter(move |&s| s < len)
+    }
+
+    /// As a guest with an arena of `len` slots: its slots, rank by rank.
+    pub fn guest_slots(&self, len: usize) -> Vec<usize> {
+        Self::within(self.all, len).collect()
+    }
+
+    /// As a host with an arena of `len` slots, of a guest with `ranks` ranks: the slot each rank
+    /// takes — the host's hosting slots in order, then fresh slots past its own for the rest.
+    pub fn hosting_slots(&self, len: usize, ranks: usize) -> Vec<usize> {
+        let mut slots: Vec<usize> = Self::within(self.hosting, len).take(ranks).collect();
+        let fresh = ranks - slots.len();
+        slots.extend(len..len + fresh);
+        slots
+    }
+}
+
+/// What a guest of a pool's arena needs of it ([`ArenaShare::Hosts`]): its slots' bytes, rank by
+/// rank ([`ArenaRanks::guest_slots`]), the ranks it reads by pointer, and its scratch by kind.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GuestArena {
+    /// Each rank's bytes: the largest of its kept buckets'.
+    pub arena: Vec<u64>,
+    /// The ranks whose slot its host reads by pointer, which stay allocated in full.
+    pub host_read: Vec<usize>,
+    /// Split-K, MoE, roped K and hd512 unfused: the host's scratch of each kind is the guest's too.
+    pub scratch: [u64; 4],
+}
+
+/// `layout`, a host's arena ranked `ranks`, grown to hold `guest`: each slot a guest rank takes
+/// ([`ArenaRanks::hosting_slots`]) at least that rank's bytes. The one arena the two models'
+/// forwards run in, which the host allocates and the memory budget prices.
+pub fn hosted_layout(layout: &[u64], ranks: &ArenaRanks, guest: &GuestArena) -> ArenaLayout {
+    let slots = ranks.hosting_slots(layout.len(), guest.arena.len());
+    let mut out = layout.to_vec();
+    out.resize(layout.len().max(slots.iter().map(|s| s + 1).max().unwrap_or(0)), 0);
+    for (&slot, &bytes) in slots.iter().zip(&guest.arena) {
+        out[slot] = out[slot].max(bytes);
+    }
+    out
+}
+
+/// A host's scratch `own` grown to hold `guest`'s, kind by kind.
+pub fn hosted_scratch(own: [u64; 4], guest: &GuestArena) -> [u64; 4] {
+    std::array::from_fn(|kind| own[kind].max(guest.scratch[kind]))
+}
+
+/// What a host pool shares with its guest ([`ArenaShare::In`]): the slot each guest rank takes, its
+/// scratch by kind; and its TurboQuant scratch, which a guest of the same geometry stages through,
+/// and whole TurboQuant runtime — its packed KV stores, codebook and scratch — which a guest
+/// reading the host's KV binds (an MTP head with none of its own).
 #[derive(Clone, Default)]
-pub struct LentActivation {
-    /// Arena slots, as the borrower's arena slots.
+pub struct HostArena {
     pub arena: Vec<Activation>,
-    /// Scratch: private storage, as the borrower's scratch.
-    pub scratch: Vec<Activation>,
-    /// A TurboQuant pool's fp16 scratch, staged through by a borrower of the same geometry.
+    pub scratch: [Option<Activation>; 4],
     pub tq_scratch: Option<super::runtime::TqScratch>,
-    /// The lender's whole TurboQuant runtime — its packed KV stores, codebook and scratch: a
-    /// borrower that reads the lender's KV (an MTP head with none of its own) binds them.
     pub tq: Option<super::runtime::TqRuntimeBuffers>,
+}
+
+/// How a pool's arena relates to that of a model whose forwards never overlap its own, and follow
+/// them on its command buffer: an MTP head's, its target's.
+#[derive(Clone, Default)]
+pub enum ArenaShare {
+    /// Its arena is its own.
+    #[default]
+    Own,
+    /// It holds the guest's arena in its own ([`hosted_layout`], [`hosted_scratch`]).
+    Hosts(GuestArena),
+    /// Its arena and scratch are its host's, rank by rank and kind by kind.
+    In(Box<HostArena>),
 }
 
 /// One unit of execution in a bucket's plan.
@@ -226,6 +310,18 @@ pub enum WorkerError {
     SparseMap { bucket: usize, reason: String },
     /// The queue the sparse activations map on could not be created.
     SparseMapper { reason: String },
+    /// A guest's arena ranks do not name each of its `slots` slots once.
+    GuestUnranked { ranked: usize, slots: usize },
+    /// A guest's `what` of rank or kind `at` needs `need` bytes its host's arena was not sized for:
+    /// the host was built for another guest, or for none.
+    HostShort {
+        what: &'static str,
+        at: usize,
+        need: u64,
+        has: u64,
+    },
+    /// A guest reads its slot `slot` by pointer, and its host placed it sparse.
+    HostSlotSparse { slot: usize },
 }
 
 impl std::fmt::Display for WorkerError {
@@ -306,6 +402,25 @@ impl std::fmt::Display for WorkerError {
                     "MetalWorker: the sparse activations' mapping queue: {reason}"
                 )
             }
+            Self::GuestUnranked { ranked, slots } => write!(
+                f,
+                "MetalWorker: a guest's arena ranks name {ranked} of its {slots} slots"
+            ),
+            Self::HostShort {
+                what,
+                at,
+                need,
+                has,
+            } => write!(
+                f,
+                "MetalWorker: a guest's {what} {at} needs {need} bytes of its host's, which holds \
+                 {has}: the host's arena was sized for another guest"
+            ),
+            Self::HostSlotSparse { slot } => write!(
+                f,
+                "MetalWorker: a guest reads its slot {slot} by pointer, and its host placed it \
+                 sparse"
+            ),
         }
     }
 }
@@ -331,14 +446,14 @@ pub enum SourceMiss {
 /// references threaded through `new`.
 pub struct MetalWorker<W: CanonicalParams> {
     pub arena: Vec<Buffer>,
-    /// The arena slots as allocated, to lend ([`Self::activation`]).
+    /// The arena slots as allocated, to share with a guest ([`Self::hosted`]).
     arena_activation: Vec<Activation>,
     /// Residency pins for every buffer the baked dispatches reach by address.
     _pins: Vec<crate::residency::Pinned>,
     pub bucket_bakings: Vec<BucketBaking>,
-    /// The scratch buffers the baked dispatches bind by address (split-K, MoE, roped K, hd512
-    /// unfused: those some tape needs, see [`Self::new_with_residency`]), held for them.
-    scratch: Vec<Activation>,
+    /// The scratch buffers the baked dispatches bind by address, by kind (split-K, MoE, roped K,
+    /// hd512 unfused: those some tape needs, see [`Self::new_with_residency`]), held for them.
+    scratch: [Option<Activation>; 4],
     /// The sparse activations and how far each bucket reaches in them; `None` when every
     /// activation is allocated in full.
     sparse: Option<SparseActivation>,
@@ -405,12 +520,14 @@ impl SparseActivation {
 }
 
 impl<W: CanonicalParams> MetalWorker<W> {
-    /// This worker's arena slots and scratch, to lend ([`LentActivation`]).
-    pub fn activation(&self) -> LentActivation {
-        let (arena, scratch) = (self.arena_activation.clone(), self.scratch.clone());
-        LentActivation {
-            arena,
-            scratch,
+    /// What this worker shares with a guest whose ranks take its `slots`
+    /// ([`ArenaRanks::hosting_slots`]): those slots, rank by rank, and its scratch ([`HostArena`]).
+    pub fn hosted(&self, slots: &[usize]) -> HostArena {
+        HostArena {
+            arena: (slots.iter())
+                .map(|&slot| self.arena_activation[slot].clone())
+                .collect(),
+            scratch: self.scratch.clone(),
             tq_scratch: None,
             tq: None,
         }
@@ -443,7 +560,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
             runtime,
             None,
             None,
-            &LentActivation::default(),
+            &ArenaShare::Own,
+            &ArenaRanks::default(),
             None,
         )
     }
@@ -452,10 +570,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// that worker-local arena slots get inserted into. Used by the
     /// pool to pin every per-worker arena into the wired set so cmdbuf
     /// dispatches don't race against Apple's lazy paging on
-    /// Llama-3.2-class working sets. The arena slots and scratch take
-    /// `lent` buffers where they hold them ([`LentActivation`]); with a
-    /// residency set and a `plan`, the rest are placement-sparse, mapped as
-    /// far as the buckets that run reach ([`SparsePlan`]).
+    /// Llama-3.2-class working sets. The arena and scratch are shared with
+    /// another model's as `share` says, by this model's `ranks`
+    /// ([`ArenaShare`]); with a residency set and a `plan`, what the host does
+    /// not read by pointer is placement-sparse, mapped as far as the buckets
+    /// that run reach ([`SparsePlan`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_residency(
         device: Arc<Device>,
@@ -468,7 +587,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // The most rows a decode or verify step brings (`GpuDevice::max_decode_rows`): the decode
         // split's partials are reserved for at most these.
         decode_rows: Option<crate::tape::ids::DecodeRows>,
-        lent: &LentActivation,
+        share: &ArenaShare,
+        ranks: &ArenaRanks,
         plan: Option<&SparsePlan>,
     ) -> Result<Self, WorkerError> {
         // Arena slot count comes from the lowered tape (post-FUF
@@ -503,36 +623,61 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // only what the buckets that run reach, where one allocated in full is zero-filled and wired
         // whole on the first forward, whatever its bucket.
         let plan = plan.filter(|_| residency.is_some());
-        let host_read = |slot: usize| plan.is_none_or(|p| p.host_slots.contains(&(slot as u32)));
         let make = |bytes: u64, mode, sparse: bool, what| match sparse {
             true => SparseBuffer::new(&device, bytes)
                 .map(Activation::Sparse)
                 .map_err(|_| WorkerError::BufferAlloc { what, bytes }),
             false => alloc(bytes, mode, what).map(Activation::Full),
         };
-        // Need `i`'s lent buffer, where one holds it; else it is allocated.
-        fn place<'a>(
-            needs: &[u64],
-            from: &'a [Activation],
-        ) -> impl Fn(usize) -> Option<Activation> + 'a {
+        let held = |a: &Activation| {
             use crate::interpreter::metal::__re::MTLBuffer as _;
-            let lengths: Vec<u64> = from.iter().map(|a| a.buffer().length() as u64).collect();
-            let lent = scratchy_core_common::lend::lend(needs, &lengths);
-            move |i| lent[i].map(|j| from[j].clone())
+            a.buffer().length() as u64
+        };
+        // A host holds its guest's slots too, rank by rank: each it hosts one in grown to that
+        // rank's bytes, kept in full where the guest reads it by pointer.
+        let (layout, guest_reads) = match share {
+            ArenaShare::Hosts(guest) => {
+                let slots = ranks.hosting_slots(arena_layout.len(), guest.arena.len());
+                let reads: Vec<usize> = guest.host_read.iter().map(|&r| slots[r]).collect();
+                (hosted_layout(arena_layout, ranks, guest), reads)
+            }
+            ArenaShare::Own | ArenaShare::In(_) => (arena_layout.clone(), Vec::new()),
+        };
+        let host_read = |slot: usize| {
+            plan.is_none_or(|p| p.host_slots.contains(&(slot as u32))) || guest_reads.contains(&slot)
+        };
+        // A guest's slots are its host's, rank by rank, which the host sized to hold them.
+        let mut hosted: Vec<Option<Activation>> = vec![None; layout.len()];
+        if let ArenaShare::In(host) = share {
+            let slots = ranks.guest_slots(layout.len());
+            if slots.len() != layout.len() {
+                return Err(WorkerError::GuestUnranked {
+                    ranked: slots.len(),
+                    slots: layout.len(),
+                });
+            }
+            for (rank, slot) in slots.into_iter().enumerate() {
+                let (need, has) = (layout[slot], host.arena.get(rank).map_or(0, held));
+                if has < need {
+                    let what = "arena slot of rank";
+                    return Err(WorkerError::HostShort {
+                        what,
+                        at: rank,
+                        need,
+                        has,
+                    });
+                }
+                hosted[slot] = Some(host.arena[rank].clone());
+            }
         }
         // Shared storage so test code can seed/inspect arena contents without staging copies, and
         // so the host can read the slots it reads by pointer; dispatch-bound buffers are fine in
-        // shared on Apple silicon — the existing `MetalAllocator` uses the same mode. A slot the
-        // host reads takes no lent sparse buffer: the host cannot read one.
-        let lent_slot = place(arena_layout, &lent.arena);
-        let arena_activation: Vec<Activation> = (arena_layout.iter().enumerate())
-            .map(|(i, &size)| match lent_slot(i) {
-                Some(Activation::Sparse(_)) if host_read(i) => make(
-                    size,
-                    MTLResourceOptions::StorageModeShared,
-                    false,
-                    "arena slot",
-                ),
+        // shared on Apple silicon — the existing `MetalAllocator` uses the same mode.
+        let arena_activation: Vec<Activation> = (layout.iter().zip(hosted).enumerate())
+            .map(|(i, (&size, hosted))| match hosted {
+                Some(Activation::Sparse(_)) if host_read(i) => {
+                    Err(WorkerError::HostSlotSparse { slot: i })
+                }
                 Some(activation) => Ok(activation),
                 None => make(
                     size,
@@ -562,18 +707,33 @@ impl<W: CanonicalParams> MetalWorker<W> {
         //   scratch, is the persistent artifact).
         // - hd512-unfused attention (q_head/Kdense/Vdense_T/scores/out_head packed at baked
         //   offsets): one buffer, overwritten per layer.
-        let sizes: [u64; 4] = std::array::from_fn(|i| {
+        let own: [u64; 4] = std::array::from_fn(|i| {
             let max = bucket_tapes
                 .iter()
                 .map(|t| t.scratch_bytes(decode_rows)[i])
                 .max();
             max.map_or(0, u64::from)
         });
-        let lent_scratch = place(&sizes, &lent.scratch);
+        // A host's scratch of each kind holds its guest's too; a guest's is its host's.
+        let sizes = match share {
+            ArenaShare::Hosts(guest) => hosted_scratch(own, guest),
+            ArenaShare::Own | ArenaShare::In(_) => own,
+        };
         let private = MTLResourceOptions::StorageModePrivate;
-        let scratch = |i: usize, what| match lent_scratch(i) {
-            Some(activation) => Ok(Some(activation)),
-            None => (sizes[i] > 0)
+        let scratch = |i: usize, what| match share {
+            ArenaShare::In(host) if sizes[i] > 0 => {
+                let has = host.scratch[i].as_ref().map_or(0, held);
+                match &host.scratch[i] {
+                    Some(activation) if has >= sizes[i] => Ok(Some(activation.clone())),
+                    _ => Err(WorkerError::HostShort {
+                        what,
+                        at: i,
+                        need: sizes[i],
+                        has,
+                    }),
+                }
+            }
+            _ => (sizes[i] > 0)
                 .then(|| make(sizes[i], private, plan.is_some(), what))
                 .transpose(),
         };
@@ -815,10 +975,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 moe_scratch,
                 roped_k_scratch,
                 attn_unfused_scratch,
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
+            ],
             sparse,
             tq_dequant_max_blocks: std::sync::atomic::AtomicU32::new(0),
             unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
@@ -2483,10 +2640,38 @@ mod tests {
         }
     }
 
-    /// A worker built with another's activation lent places each arena slot in the smallest lent
-    /// buffer that holds it, and allocates the slot no lent buffer holds.
+    /// A host holds its guest rank by rank: each hosting slot grows to the guest rank's bytes, a
+    /// slot outside the hosting ranks (a bucket's hidden states) and a slot past the host's arena
+    /// (another canonical's, not kept) host nothing, and the ranks past the hosting slots take
+    /// fresh slots; the scratch grows kind by kind. Pure arithmetic: no device.
     #[test]
-    fn a_worker_places_its_arena_in_lent_buffers() {
+    fn a_host_grows_its_arena_and_scratch_to_hold_its_guest() {
+        let ranks = ArenaRanks {
+            all: &[3, 0, 2, 1],
+            hosting: &[3, 0, 1],
+        };
+        // Slot 3 ranks first but lies past this 3-slot arena: its bucket is not kept.
+        assert_eq!(ranks.guest_slots(3), [0, 2, 1]);
+        assert_eq!(ranks.hosting_slots(3, 4), [0, 1, 3, 4]);
+        let guest = GuestArena {
+            arena: vec![100, 50, 30, 20],
+            host_read: Vec::new(),
+            scratch: [0, 70, 5, 0],
+        };
+        assert_eq!(
+            hosted_layout(&[80, 60, 40], &ranks, &guest),
+            [100, 60, 40, 30, 20],
+            "rank 0 grows slot 0, rank 1 fits slot 1, slot 2 (hidden states) hosts nothing"
+        );
+        assert_eq!(hosted_scratch([10, 90, 0, 3], &guest), [10, 90, 5, 3]);
+    }
+
+    /// A host and its guest run in one arena: the guest's slot of each rank is the host's slot of
+    /// that rank, grown to hold both; the host's hidden-states slot holds none of the guest's; a
+    /// rank past the host's hosting slots takes a fresh slot of the host's; a host sized for
+    /// another guest refuses this one.
+    #[test]
+    fn a_guest_runs_in_its_hosts_arena_rank_by_rank() {
         use crate::interpreter::metal::__re::MTLBuffer as _;
         let Some(device) = crate::detect_device().filter(|_| crate::metal4_available()) else {
             eprintln!("skipping: no Metal device");
@@ -2499,7 +2684,7 @@ mod tests {
         let pipelines =
             crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
                 .expect("pipelines");
-        let build = |layout: &ArenaLayout, lent: &LentActivation| {
+        let build = |layout: &ArenaLayout, share: &ArenaShare, ranks: &ArenaRanks| {
             MetalWorker::<TestWeights>::new_with_residency(
                 device.clone(),
                 layout,
@@ -2509,23 +2694,61 @@ mod tests {
                 &runtime,
                 None,
                 None,
-                lent,
+                share,
+                ranks,
                 None,
             )
-            .expect("worker builds")
         };
-        let lender = build(&vec![64 * 1024, 4 * 1024], &LentActivation::default());
-        let borrower = build(&vec![4 * 1024, 16 * 1024, 128 * 1024], &lender.activation());
-        let address = |b: &Buffer| b.gpuAddress();
-        assert_eq!(address(&borrower.arena[0]), address(&lender.arena[1]));
-        assert_eq!(address(&borrower.arena[1]), address(&lender.arena[0]));
-        assert!(
-            lender
-                .arena
-                .iter()
-                .all(|b| address(b) != address(&borrower.arena[2]))
+        const K: u64 = 1024;
+        // The host's slot 2 holds its hidden states: it hosts in slots 0 and 1 only.
+        let (host_layout, host_ranks) = (
+            vec![64 * K, 4 * K, 8 * K],
+            ArenaRanks {
+                all: &[0, 2, 1],
+                hosting: &[0, 1],
+            },
         );
-        assert_eq!(borrower.arena[2].length(), 128 * 1024);
+        let (guest_layout, guest_ranks) = (
+            vec![4 * K, 16 * K, 128 * K],
+            ArenaRanks {
+                all: &[2, 1, 0],
+                hosting: &[2, 1, 0],
+            },
+        );
+        let guest = GuestArena {
+            arena: vec![128 * K, 16 * K, 4 * K],
+            host_read: Vec::new(),
+            scratch: [0; 4],
+        };
+        let host = build(&host_layout, &ArenaShare::Hosts(guest.clone()), &host_ranks)
+            .expect("the host builds");
+        let lengths: Vec<u64> = host.arena.iter().map(|b| b.length() as u64).collect();
+        assert_eq!(lengths, [128 * K, 16 * K, 8 * K, 4 * K]);
+        let slots = host_ranks.hosting_slots(host_layout.len(), guest.arena.len());
+        assert_eq!(slots, [0, 1, 3]);
+        let hosted = ArenaShare::In(Box::new(host.hosted(&slots)));
+        let guest_worker = build(&guest_layout, &hosted, &guest_ranks).expect("the guest builds");
+        let address = |b: &Buffer| b.gpuAddress();
+        let at = |w: &MetalWorker<TestWeights>, slot: usize| address(&w.arena[slot]);
+        assert_eq!(at(&guest_worker, 2), at(&host, 0));
+        assert_eq!(at(&guest_worker, 1), at(&host, 1));
+        assert_eq!(at(&guest_worker, 0), at(&host, 3));
+        assert!((0..3).all(|slot| at(&guest_worker, slot) != at(&host, 2)));
+
+        let bigger = vec![4 * K, 16 * K, 256 * K];
+        let refused = build(&bigger, &hosted, &guest_ranks).err();
+        assert!(
+            matches!(
+                refused,
+                Some(WorkerError::HostShort {
+                    at: 0,
+                    need,
+                    has,
+                    ..
+                }) if need == 256 * K && has == 128 * K
+            ),
+            "{refused:?}"
+        );
     }
 
     #[test]
