@@ -127,7 +127,9 @@ the same addresses:
   to a power-of-two whole row (the descriptor block must be a power of two),
   with the pad lanes already holding -inf (the fp16 floor). Real lanes are
   untouched: adding -inf past the row cannot change the max, and a pad lane
-  can never win the equality against a finite m.
+  can never win the equality against a finite m. On device those pads stage
+  through ieee_to_sen's reserved exp-63 INF mapping (sign | 0x7E00) -- the
+  closest SEN169 expresses to a floor, and still below every real logit.
 * THE BLOCK RAMP is [PAD_V] fp16 with bramp_i = NB - (i // 64) on the real
   lanes and 0 on the pad lanes -- strictly decreasing in the block index, so
   the first-block law is its monotonicity.
