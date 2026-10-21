@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::{Mutex, OnceLock};
 
-use crate::shader_cache::load_library_from_bytes;
+use crate::shader_cache::{load_library_from_bytes, pipeline_build_turn};
 use crate::stream::MetalStreamError;
 use crate::tape::lowered::BakedKernel;
 
@@ -184,16 +184,19 @@ impl SpecializedPipelineCache {
                 .newCompilerWithDescriptor_error(&cdesc)
                 .expect("newCompilerWithDescriptor")
         });
-        let pipeline = compiler
-            .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&pipe_desc, None)
-            .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!(
-                    "MTL4 build pipeline `{}` (lib `{}`, {} constants): {e:?}",
-                    key.kernel_name,
-                    key.library_name,
-                    key.constants.len(),
-                ))
-            })?;
+        let built = {
+            let _turn = pipeline_build_turn();
+            compiler
+                .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&pipe_desc, None)
+        };
+        let pipeline = built.map_err(|e| {
+            MetalStreamError::ShaderCompilationFailed(format!(
+                "MTL4 build pipeline `{}` (lib `{}`, {} constants): {e:?}",
+                key.kernel_name,
+                key.library_name,
+                key.constants.len(),
+            ))
+        })?;
 
         // GUARD (threadgroup-overflow class): a kernel whose total threadgroup
         // memory exceeds the device limit faults at GPU exec with a cryptic

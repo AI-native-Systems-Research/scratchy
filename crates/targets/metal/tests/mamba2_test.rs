@@ -11,7 +11,7 @@
 //! continuation across a chunk boundary (chunks shorter than the conv window included), decode
 //! steps of one token a sequence, and a slot re-taken fresh mid-run. Both scan mappings run — the
 //! per-thread scan (state 16, the parity-tiny geometry) and the simd scan (state 128, the real
-//! checkpoints'). The tests take turns on the GPU ([`gpu_turn`]).
+//! checkpoints').
 
 mod common;
 
@@ -31,20 +31,6 @@ type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>
 const EPS: f32 = 1e-5;
 /// The lowering's 1-D / channel threadgroup cap (`THREADS_PER_GROUP`).
 const THREADS: usize = 256;
-
-/// The GPU, one test at a time. Apple's driver corrupts its own heap when these tests build their
-/// pipelines at the same time, each through its own `SpecializedPipelineCache` (crash reports: in
-/// `AGX::UserCommonShaderFactory` and `ReflectionKey::initGPUCompilerSPIOptionsHash`, under
-/// `SpecializedPipelineCache::get_or_build`), and `cargo test -p scratchy-target-metal` runs them
-/// on parallel threads. The driver crash is #288's (first seen in `quantized_qmv_test`); this lock
-/// goes when that is fixed.
-static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// This test's turn on the GPU; a test that panicked with it held leaves it usable.
-fn gpu_turn() -> std::sync::MutexGuard<'static, ()> {
-    GPU.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 /// A Mamba-2 mixer's geometry, in the GDN state pool's terms: groups as key heads, heads as
 /// value heads, `[head_dim, state]` a head.
@@ -597,7 +583,6 @@ fn schedule() -> Vec<Step> {
 /// The parity-tiny geometry (state 16): the gating, then the per-thread scan.
 #[test]
 fn mamba2_per_thread_scan_matches_reference() {
-    let _turn = gpu_turn();
     let geo = Geometry {
         heads: 8,
         head_dim: 16,
@@ -615,7 +600,6 @@ fn mamba2_per_thread_scan_matches_reference() {
 /// `dt` read straight off the in-projection row.
 #[test]
 fn mamba2_simd_scan_matches_reference() {
-    let _turn = gpu_turn();
     let geo = Geometry {
         heads: 8,
         head_dim: 64,
@@ -634,7 +618,6 @@ fn mamba2_simd_scan_matches_reference() {
 /// the same schedule.
 #[test]
 fn mamba2_pipelined_scan_matches_reference() {
-    let _turn = gpu_turn();
     let geo = Geometry {
         heads: 8,
         head_dim: 64,
@@ -751,7 +734,6 @@ fn snapshots(geo: Geometry, dtype: Dtype, routed: bool) {
 /// routing at state 128 — a prefill the pipelined scan's — in both dtypes.
 #[test]
 fn mamba2_snapshots_resume_a_prefill() {
-    let _turn = gpu_turn();
     let per_thread = Geometry {
         heads: 8,
         head_dim: 16,
@@ -778,7 +760,6 @@ fn mamba2_snapshots_resume_a_prefill() {
 /// `rmsnorm_g(silu(z)·y)·w`, `z` a column slice of a wider row, the weight spanning all groups.
 #[test]
 fn mamba2_gate_before_norm_matches_reference() {
-    let _turn = gpu_turn();
     let Some(di) = detect_device() else {
         eprintln!("skipping: no Metal device");
         return;
