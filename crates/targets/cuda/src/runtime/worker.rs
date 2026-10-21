@@ -388,8 +388,11 @@ impl<'a> CudaWorker<'a> {
     ///
     /// When a tape has a KV cache, `kv_pool` must be given with at least one block, and every KV
     /// tape must share one geometry; the pool is then one more allocation, of `layers · 2 ·
-    /// PagedKvLayout::buffer_elems()` bf16, never cleared (every slot a kernel reads was written
-    /// first, or is masked). When no tape has one, `kv_pool` must be `None`.
+    /// PagedKvLayout::buffer_elems()` bf16, never cleared: an unwritten slot holds anything, NaN
+    /// included. The attention kernel reads unwritten slots only in the partial last tile of a
+    /// sequence, masks their scores, and zeroes their V rows in shared memory before P·V
+    /// (`kernels/attn_prefill_bf16.cu`), so they reach no output. When no tape has one,
+    /// `kv_pool` must be `None`.
     pub fn new(
         device: &CudaDevice,
         tapes: &'static [CudaTape],

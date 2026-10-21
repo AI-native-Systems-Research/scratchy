@@ -31,6 +31,17 @@
 //     `warp::right_fill` drops keys ≥ kv_len), not upstream's 16x16 tile-diagonal `make_causal`,
 //     which assumes query and key tiles start together; here the queries start at P, which need
 //     not be a multiple of anything.
+//   - The masks alone do NOT make unwritten cache slots harmless. When kv_len is not a multiple
+//     of 64, the last tile holds slots at or past kv_len that no append wrote (the pool is never
+//     cleared, so they hold anything, NaN included). Their scores are masked to −inf, so their
+//     p is 0, but the P·V WGMMA still multiplies p by their V rows, and 0 · NaN = NaN. So the
+//     consumers zero those V rows [kv_len − k0, 64) in shared memory before either P·V: after
+//     `v_smem_arrived`, all 256 consumer threads write the zeros (through the swizzled tile's
+//     `operator[]`), fence them to the async proxy the tensor cores read through
+//     (`fence.proxy.async.shared::cta`), and meet at named barrier 1 before either warpgroup's
+//     `mma_AB`. The stage was released to the producer only after both warpgroups' previous
+//     `mma_async_wait`, so nothing reads it while it is zeroed. K needs nothing: its scores are
+//     overwritten with −inf by `right_fill` before `row_max`.
 //   - K and V come from the paged cache: KV tile j is block `block_table[j]`, one TMA box of
 //     `[64, 256]` at `{block, kv_head, 0, 0}` (block_size = kv_height = 64, so one box fills the
 //     tile). The producer reads the block id from global memory before each load.
@@ -74,6 +85,12 @@ constexpr int NUM_WARPS = NUM_WARPGROUPS * kittens::WARPGROUP_WARPS;
 constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
 // Query rows per CTA (`step::ATTN_PREFILL_BF16_ROWS`).
 constexpr int CTA_ROWS = CONSUMER_WARPGROUPS * QO_HEIGHT;
+constexpr int CONSUMER_THREADS = CONSUMER_WARPGROUPS * kittens::WARPGROUP_WARPS *
+                                 kittens::WARP_THREADS;
+// The named barrier over the two consumer warpgroups (ids 4 and 5 are each warpgroup's own, at
+// the O store; 0 is `__syncthreads`).
+constexpr int CONSUMERS_BARRIER = 1;
+using consumers = kittens::group<CONSUMER_WARPGROUPS * kittens::WARPGROUP_WARPS>;
 // Token slots per KV block (`step::CUDA_KV_BLOCK_SIZE`): one block is one K (or V) tile.
 constexpr uint32_t BLOCK_SIZE = 64;
 static_assert(KV_HEIGHT == int(BLOCK_SIZE), "one paged (block, kv head) tile is one TMA box");
@@ -217,6 +234,19 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
             warp::mul_row(o_reg, o_reg, max_vec_last_scaled);
 
             wait(v_smem_arrived[stage], phase);
+            // A partial last tile: zero the V rows of the slots at or past kv_len, which no append
+            // wrote, before either warpgroup's P·V reads them (0 · NaN = NaN). `valid` is the
+            // same for the whole CTA, so every consumer thread takes this branch or none does.
+            const int valid = kv_len - k0;
+            if (valid < KV_HEIGHT) {
+                const int t = warpgroupid * kittens::WARPGROUP_THREADS + warpgroup::laneid();
+                for (int e = t; e < (KV_HEIGHT - valid) * HEAD_DIM; e += CONSUMER_THREADS) {
+                    v_smem[stage][{valid + e / HEAD_DIM, e % HEAD_DIM}] =
+                        kittens::base_types::constants<bf16>::zero();
+                }
+                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                consumers::sync(CONSUMERS_BARRIER);
+            }
             warpgroup::mma_AB(o_reg, att_block_mma, v_smem[stage]);
             // Wait for the WGMMA to finish reading the stage before releasing it to the producer.
             warpgroup::mma_async_wait();

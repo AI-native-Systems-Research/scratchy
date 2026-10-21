@@ -31,7 +31,8 @@ const SCALE: f32 = 0.0625;
 const TABLE: [u32; 8] = [11, 3, 14, 0, 7, 9, 2, 5];
 /// An output element no launch wrote: a bf16 NaN.
 const SENTINEL: u16 = 0xFFFF;
-/// A cache element no append wrote, in the append test: a bf16 NaN, so any write over it shows.
+/// A cache element no append wrote: a bf16 NaN, so a write over it, or a read of it into an
+/// output, shows.
 const POISON: u16 = 0x7FC1;
 
 fn h100() -> CudaDevice {
@@ -292,73 +293,105 @@ fn the_attention_is_within_the_f64_bound() {
     assert!(pass, "an attention case is out of bound");
 }
 
+/// How the probe poisons the V of every slot the appends did not write.
+#[derive(Clone, Copy, Debug)]
+enum VPoison {
+    /// One-hot at lane `slot % 256`, value 64: a finite value a read of the slot moves into a lane
+    /// that must be zero.
+    OneHot,
+    /// Every element a bf16 NaN: the value an unwritten slot of the never-cleared pool may hold.
+    /// A masked slot's p is 0, and 0 · NaN = NaN, so this catches a kernel that multiplies the
+    /// partial last tile's unwritten V rows instead of zeroing them.
+    Nan,
+}
+
 /// Test 3: With K = 0 every score is 0 and every p is 1, so `o_i = Σ_{j∈A_i} v_j / |A_i|`. V of key j
-/// is one-hot at lane j (both kv heads); every slot the appends did not write holds poison one-hot
-/// at lane `slot % 256` = 64. So row i's output is `1/(P+i+1)` in lanes `0 ..= P+i`, and exactly
-/// `+0.0` elsewhere, unless the mask or the block lookup is wrong.
+/// is one-hot at lane j (both kv heads); every slot the appends did not write holds the poison
+/// ([`VPoison`]). So row i's output is `1/(P+i+1)` in lanes `0 ..= P+i`, and exactly `+0.0`
+/// elsewhere (no NaN anywhere), unless the mask, the block lookup or the partial last tile's V is
+/// wrong. kv_len = 137 and 100 leave the last block partial; 128 and 256 fill it.
 #[test]
 fn the_mask_and_block_table_probe_is_exact() {
     let device = h100();
     let (qh, kvh) = (8usize, 2usize);
     let l = layout(kvh);
     let mut pass = true;
-    for (rows, p, len) in [(128usize, 0usize, 128usize), (128, 37, 100), (256, 0, 256)] {
-        let tokens = p + len;
-        assert!(tokens <= HD, "one-hot V needs kv_len ≤ 256");
-        // The poison: every slot's V one-hot at lane `slot % 256`, value 64; K zero.
-        let mut vpool = vec![0u16; l.buffer_elems()];
-        for slot in 0..BLOCKS * BS {
-            for h in 0..kvh {
-                vpool[l.elem_offset_for_global_slot(slot as u32, h as u32) + slot % HD] =
-                    bits(64.0);
-            }
-        }
-        let kc = up(&device, &vec![0u16; l.buffer_elems()]);
-        let vc = up(&device, &vpool);
-        let k = vec![0u16; tokens * kvh * HD];
-        let mut v = vec![0u16; tokens * kvh * HD];
-        for j in 0..tokens {
-            for h in 0..kvh {
-                v[(j * kvh + h) * HD + j] = bits(1.0);
-            }
-        }
-        let sb = up_u32(&device, &slots(&TABLE, 0, tokens, tokens));
-        append(
-            (&kc, &vc),
-            (&up(&device, &k), &up(&device, &v)),
-            &sb,
-            tokens,
-            kvh,
-        )
-        .expect("kv_append_bf16");
-        let q = bf16_inputs(rows * qh * HD, 0x0A77_F000 + rows as u64 + p as u64);
-        let out = attend(&device, &q, (&kc, &vc), &TABLE, (p, len), (rows, qh, kvh))
-            .expect("attn_prefill_bf16");
-        let (mut nonzero, mut off) = (0usize, 0usize);
-        for i in 0..len {
-            let n = p + i + 1;
-            let want = bits(1.0 / n as f32);
-            for g in 0..qh {
-                for d in 0..HD {
-                    let got = out[(i * qh + g) * HD + d];
-                    if d < n {
-                        // Within one bf16 rounding of 1/n: its bf16, or a neighbour.
-                        off += usize::from(got.abs_diff(want) > 1);
-                    } else {
-                        nonzero += usize::from(got != 0);
+    for poison in [VPoison::OneHot, VPoison::Nan] {
+        for (rows, p, len) in [
+            (128usize, 0usize, 128usize),
+            (128, 37, 100),
+            (256, 0, 256),
+            (128, 0, 100),
+        ] {
+            let tokens = p + len;
+            assert!(tokens <= HD, "one-hot V needs kv_len ≤ 256");
+            // The poison in every slot's V; K zero.
+            let mut vpool = match poison {
+                VPoison::OneHot => vec![0u16; l.buffer_elems()],
+                VPoison::Nan => vec![POISON; l.buffer_elems()],
+            };
+            if let VPoison::OneHot = poison {
+                for slot in 0..BLOCKS * BS {
+                    for h in 0..kvh {
+                        vpool[l.elem_offset_for_global_slot(slot as u32, h as u32) + slot % HD] =
+                            bits(64.0);
                     }
                 }
             }
+            let kc = up(&device, &vec![0u16; l.buffer_elems()]);
+            let vc = up(&device, &vpool);
+            let k = vec![0u16; tokens * kvh * HD];
+            let mut v = vec![0u16; tokens * kvh * HD];
+            for j in 0..tokens {
+                for h in 0..kvh {
+                    v[(j * kvh + h) * HD + j] = bits(1.0);
+                }
+            }
+            let sb = up_u32(&device, &slots(&TABLE, 0, tokens, tokens));
+            append(
+                (&kc, &vc),
+                (&up(&device, &k), &up(&device, &v)),
+                &sb,
+                tokens,
+                kvh,
+            )
+            .expect("kv_append_bf16");
+            let q = bf16_inputs(rows * qh * HD, 0x0A77_F000 + rows as u64 + p as u64);
+            let out = attend(&device, &q, (&kc, &vc), &TABLE, (p, len), (rows, qh, kvh))
+                .expect("attn_prefill_bf16");
+            let (mut nonzero, mut off) = (0usize, 0usize);
+            let nonfinite = (out[..len * qh * HD].iter())
+                .filter(|&&b| !bf16::from_bits(b).to_f32().is_finite())
+                .count();
+            for i in 0..len {
+                let n = p + i + 1;
+                let want = bits(1.0 / n as f32);
+                for g in 0..qh {
+                    for d in 0..HD {
+                        let got = out[(i * qh + g) * HD + d];
+                        if d < n {
+                            // Within one bf16 rounding of 1/n: its bf16, or a neighbour.
+                            off += usize::from(got.abs_diff(want) > 1);
+                        } else {
+                            nonzero += usize::from(got != 0);
+                        }
+                    }
+                }
+            }
+            let ok = nonzero == 0 && off == 0 && nonfinite == 0;
+            eprintln!(
+                "mask/table probe poison={poison:?} rows={rows} P={p} L={len}: \
+             nonzero_in_zero_lanes={nonzero} one_over_n_lanes_off={off} \
+             nonfinite_outputs={nonfinite} {}",
+                verdict(ok)
+            );
+            pass &= ok;
         }
-        let ok = nonzero == 0 && off == 0;
-        eprintln!(
-            "mask/table probe rows={rows} P={p} L={len}: nonzero_in_zero_lanes={nonzero} \
-             one_over_n_lanes_off={off} {}",
-            verdict(ok)
-        );
-        pass &= ok;
     }
-    assert!(pass, "the mask or the block table is wrong");
+    assert!(
+        pass,
+        "the mask, the block table or the partial last tile's V is wrong"
+    );
 }
 
 /// Test 4: With K = 0 and kv head h's V the constant h + 1, query head g's output is exactly g / hr + 1.
