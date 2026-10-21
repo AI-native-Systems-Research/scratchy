@@ -850,10 +850,12 @@ sha2 = "0.11"
 tokenizers = { workspace = true }
 
 # The qwen3 py-parity test drives the real HF snapshot for the full
-# `qwen3-0.6b` stem directly (module path + goldens), so it only builds
-# when that stem is in scope. The universal gate (tests/carrier_parity.rs)
-# has no such requirement — it skips arches the build doesn't scope in.
+# `qwen3-0.6b` stem directly (module path + goldens) on the metal target
+# (`scratchy-target-metal`, an optional dependency `metal` turns on), so a
+# build without both that stem and `metal` skips it. The universal gate
+# (tests/carrier_parity.rs) has no stem requirement — it skips arches the
+# build doesn't scope in, and compiles empty without `metal`.
 [[test]]
 name = "qwen3_py_parity"
-required-features = ["qwen3-0.6b"]
+required-features = ["metal", "qwen3-0.6b"]
 

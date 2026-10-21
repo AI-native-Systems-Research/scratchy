@@ -38,7 +38,7 @@
 //! runs in a build selecting that preset
 //! (`--features ...,scratchy-quantizations/P`); every other build skips it.
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 mod imp {
     // The gate walks every goldens dir, but only arches whose stem feature
     // this build names have a compiled variant. Those variants register via
@@ -801,5 +801,5 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
 mod imp {}
