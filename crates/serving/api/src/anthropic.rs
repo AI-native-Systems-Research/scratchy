@@ -1002,6 +1002,7 @@ impl IntoResponse for AnthropicError {
     fn into_response(self) -> Response {
         let kind = match &self.0 {
             ServeError::Validation(_) => "invalid_request_error",
+            ServeError::PayloadTooLarge(_) => "request_too_large",
             ServeError::ModelNotFound(_) | ServeError::RequestNotFound(_) => "not_found_error",
             ServeError::Engine(_) | ServeError::EngineShutdown | ServeError::Internal(_) => {
                 "api_error"

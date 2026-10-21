@@ -19,6 +19,10 @@ pub enum ServeError {
     #[error("validation error: {0}")]
     Validation(String),
 
+    /// The request body is past the size the server buffers (axum's body limit).
+    #[error("request too large: {0}")]
+    PayloadTooLarge(String),
+
     #[error("model not found: {0}")]
     ModelNotFound(String),
 
@@ -35,11 +39,13 @@ pub enum ServeError {
     Internal(String),
 }
 
-/// A JSON request body, read as axum's [`Json`] reads it, but rejected as the server's own
-/// [`ServeError::Validation`]. So a body that isn't JSON, or doesn't deserialize into `T` (a missing
-/// field, an unknown `tool_choice` form), gets a 400 in the endpoint's error JSON, as the upstream
-/// APIs answer it, rather than axum's plain-text 422 (#787). The message keeps serde's, which
-/// names the field.
+/// A JSON request body, read as axum's [`Json`] reads it, but rejected as the server's own error,
+/// in the endpoint's error JSON rather than axum's plain text (#787).
+/// - A body that isn't JSON, or doesn't deserialize into `T` (a missing field, an unknown
+///   `tool_choice` form), is a 400 [`ServeError::Validation`], as the upstream APIs answer it,
+///   where axum gives a 422. The message keeps serde's, which names the field.
+/// - One past the body limit keeps axum's 413, as [`ServeError::PayloadTooLarge`]: a client must
+///   still tell "too big" from "malformed".
 #[cfg(feature = "serve")]
 pub struct ApiJson<T>(pub T);
 
@@ -54,6 +60,9 @@ where
     async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, ServeError> {
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                Err(ServeError::PayloadTooLarge(rejection.body_text()))
+            }
             Err(rejection) => Err(ServeError::Validation(rejection.body_text())),
         }
     }
@@ -64,6 +73,7 @@ impl ServeError {
     pub(crate) fn status_code(&self) -> StatusCode {
         match self {
             ServeError::Validation(_) => StatusCode::BAD_REQUEST,
+            ServeError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ServeError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ServeError::Engine(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServeError::EngineShutdown => StatusCode::SERVICE_UNAVAILABLE,
@@ -75,6 +85,7 @@ impl ServeError {
     fn error_type(&self) -> &str {
         match self {
             ServeError::Validation(_) => "BadRequestError",
+            ServeError::PayloadTooLarge(_) => "RequestTooLargeError",
             ServeError::ModelNotFound(_) => "NotFoundError",
             ServeError::Engine(_) => "InternalServerError",
             ServeError::EngineShutdown => "ServiceUnavailableError",

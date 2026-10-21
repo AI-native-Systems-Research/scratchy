@@ -1450,6 +1450,39 @@ mod tests {
         serde_json::from_slice(&body).unwrap_or_else(|e| panic!("not JSON ({e}): {body:?}"))
     }
 
+    /// A body past axum's body limit (2 MB by default) keeps its 413, in each API's error JSON:
+    /// "too big" stays apart from "malformed". `request_too_large` is Anthropic's own type for it.
+    #[tokio::test]
+    async fn a_body_past_the_limit_is_a_413_in_the_apis_error_shape() {
+        let big = "x".repeat(3 << 20);
+        let send = |uri: &str, body: String| {
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            async move {
+                let response = build_router(make_test_state())
+                    .oneshot(request)
+                    .await
+                    .unwrap();
+                (response.status(), error_body(response).await)
+            }
+        };
+        let chat = format!(r#"{{"messages": [{{"role": "user", "content": "{big}"}}]}}"#);
+        let (status, error) = send("/v1/chat/completions", chat).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
+        assert_eq!(error["error"]["type"], "RequestTooLargeError", "{error}");
+
+        let messages =
+            format!(r#"{{"max_tokens": 8, "messages": [{{"role": "user", "content": "{big}"}}]}}"#);
+        let (status, error) = send("/v1/messages", messages).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
+        assert_eq!(error["type"], "error", "{error}");
+        assert_eq!(error["error"]["type"], "request_too_large", "{error}");
+    }
+
     /// A body an endpoint can't read is a 400 in that API's error JSON, as the upstream APIs answer
     /// it, not axum's plain-text 422 (#787): `/v1/responses` in the OpenAI shape, `/v1/messages`
     /// in Anthropic's. `/v1/messages` answers the engine's own refusals in Anthropic's shape too.
