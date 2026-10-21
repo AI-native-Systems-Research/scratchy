@@ -70,6 +70,18 @@ pub(crate) struct BundleMeta {
     pub(crate) cos_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
     pub(crate) sin_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
     pub(crate) result_id: usize,
+    /// ⭐ WHETHER THIS RUNG'S RESULT IS AN INDEX STICK — the answer re-point
+    /// ([`crate::spyre_forward::ChunkOut::Picked`]): the minted argmax rung's
+    /// result is the kernel's own `[1, 64]` i32 stick, every plain rung's is
+    /// the f16 logits row. A copy out of the wiring (like every field here)
+    /// taken at parse, so the KTIR emulator path — which carries no `wiring`
+    /// reference in its [`BundleMeta`] — still reads the bake's own statement
+    /// of what the result IS.
+    pub(crate) result_is_index: bool,
+    /// The result's readback extent in ELEMENTS: the vocab row on a plain
+    /// rung, the idx stick's own count on a minted one. Asking the stick for
+    /// `vocab` elems would claim a width the bundle never made.
+    pub(crate) result_want: usize,
     /// One per layer, in layer order.
     pub(crate) layers: Vec<LayerWiring>,
     /// Tensors read back from each forward, in a stable order: `result_id`

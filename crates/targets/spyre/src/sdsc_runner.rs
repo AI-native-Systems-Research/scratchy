@@ -725,6 +725,19 @@ impl SuperDscSession {
         Ok(f16_le_to_f32(&self.exec.read_tensor(id, cap)?))
     }
 
+    /// ⭐ THE GENERIC RAW-READ VARIANT of [`Self::read_tensor`] — the tensor's
+    /// own bytes, VERBATIM, no f16 decode. A step whose rung's result is not
+    /// the f16 row runs `StepLogits::LeftOnDevice` and reads the result here:
+    /// the CALLER decodes at the dtype the wiring's `result_dtype` states (an
+    /// index stick's raw LE int32 words), because only the wiring knows it.
+    pub fn read_tensor_raw(
+        &mut self,
+        id: crate::bundle_code::PlaceId,
+        cap_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        Ok(self.exec.read_tensor_raw(id, cap_bytes)?)
+    }
+
     /// Zero a whole tensor segment ON THE DEVICE, without a host mirror of it.
     ///
     /// The KV pool must start zeroed (decode computes q·k over a whole page before the validity mask

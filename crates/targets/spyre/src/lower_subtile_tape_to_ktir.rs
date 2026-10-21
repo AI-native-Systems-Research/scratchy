@@ -1232,6 +1232,16 @@ pub struct BundleWiring {
     pub nodes: Vec<NodeArgs>,
     pub num_sources: u32,
     pub result_tensor: u32,
+    /// ⭐ THE RESULT'S OWN DTYPE — the fact that decides how the consumer reads
+    /// the rung's answer back, stated by the RESULT PRODUCER'S OWN KERNEL
+    /// SIGNATURE when the result is a spliced kernel's output
+    /// ([`result_dtype_of_ir`]) and the f16 row every native tail emits
+    /// otherwise. An INTEGER dtype states the result IS the picked token (the
+    /// device argmax's idx stick): the consumer reads the raw bytes at this
+    /// dtype instead of converting a `[1, vocab]` f16 row, and the row it was
+    /// picked from stays readable by tid either way — the answer re-point's
+    /// own contract, recorded on [`crate::wiring::Wiring::result_dtype`].
+    pub result_dtype: scratchy_tensors::DType,
     /// `tensor_shapes[id] = (rows, cols)` for every tensor. When `attn_mask` is set, the LAST entry
     /// is the synthetic mask tensor `[1, capacity]`.
     pub tensor_shapes: Vec<(u32, u32)>,
@@ -1494,6 +1504,7 @@ pub fn graph_wiring<F: RopeForm>(
         nodes,
         num_sources: ir.num_sources,
         result_tensor: ir.result.index() as u32,
+        result_dtype: result_dtype_of_ir(ir)?,
         tensor_shapes,
         attn_mask,
         scalarmul_scales: registries.scalarmul_scales,
@@ -1634,6 +1645,91 @@ pub fn load_consts_of_ir<F: RopeForm>(
                 .collect())
         }
     }
+}
+
+/// ⭐ THE RESULT'S OWN DTYPE, from the RESULT PRODUCER'S OWN KERNEL SIGNATURE —
+/// the same `operand_dfs` authority the placement widths already read (the
+/// registry's operand-order contract zips the kernel's buffer parameters with
+/// the node's bindings, output LAST), asked here for the one binding that
+/// names the result. A result no spliced kernel produces is the f16 row every
+/// native lm-head tail emits; a spliced result carries whatever dtype its
+/// kernel's own parameter states — the device argmax's `idx_ptr: *i32` makes
+/// the minted rung's answer an INDEX, and the consumer's raw-read branch keys
+/// on exactly that fact, never on the op's name.
+pub fn result_dtype_of_ir<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<scratchy_tensors::DType, SuperDscError> {
+    let node = ir
+        .nodes
+        .iter()
+        .find(|n| n.output.tensor == ir.result)
+        .expect("validate demands the result is an op output, so it has a writer");
+    let dfs = scratchy_triton_splice::operand_dfs(node, ir)
+        .map_err(|e| SuperDscError(format!("the result's dtype: {e}")))?;
+    let Some(dfs) = dfs else {
+        return Ok(scratchy_tensors::DType::F16);
+    };
+    dfs.iter()
+        .find(|(tid, _)| *tid == ir.result.index() as u32)
+        .ok_or_else(|| {
+            SuperDscError(
+                "the result's producer binds no parameter for the result tensor — the \
+                 registry's operand-order contract (output LAST) is violated"
+                    .to_string(),
+            )
+        })
+        .and_then(|(_, df)| match df {
+            ktir_superdsc::superdsc_opspec::Df::Fp16 => Ok(scratchy_tensors::DType::F16),
+            ktir_superdsc::superdsc_opspec::Df::Bf16 => Ok(scratchy_tensors::DType::BF16),
+            ktir_superdsc::superdsc_opspec::Df::Fp32 => Ok(scratchy_tensors::DType::F32),
+            ktir_superdsc::superdsc_opspec::Df::Fp8 => Ok(scratchy_tensors::DType::Fp8E4m3),
+            // The door's own mapping law states an i32 buffer as SenUint32; the
+            // consumer reads raw LE int32 words either way.
+            ktir_superdsc::superdsc_opspec::Df::SenUint32 => Ok(scratchy_tensors::DType::I32),
+            ktir_superdsc::superdsc_opspec::Df::SenInt8 => Err(SuperDscError(
+                "the result's kernel states an int8 output, which no consumer reads back \
+                 today — state a dtype the readback knows (f16, bf16, f32, fp8, i32)"
+                    .to_string(),
+            )),
+        })
+}
+
+/// ⭐ ONE NODE'S OUTPUT STICK, BY THE SAME SIGNATURE AUTHORITY — `true` for
+/// every native op (the f16 stick the reference legs' hop-by-hop rounding
+/// law states) and for a spliced kernel whose own parameter states an f16
+/// output; `false` when the signature states another stick, because the f16
+/// rounding hop is the F16 STICK's law, never the value's. Measured on the
+/// argmax mint: the idx stick is the kernel's own `*i32` buffer, and the
+/// blanket f16 rounding certified idx 12358 as 12360 (the f16 grid's spacing
+/// at [8192, 16384) is 8) against a faithful emulator answer of 12358 — a
+/// WRONG TOKEN as the reference law, surfaced the moment the gate began
+/// comparing the stick exactly. An integer stick holds whole f32 numbers
+/// EXACTLY; the rounding hop is a corruption there, not a grid statement.
+pub fn node_output_on_f16_stick<F: RopeForm>(
+    node: &scratchy_subtile::subtile_ir::SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> bool {
+    let dfs = match scratchy_triton_splice::operand_dfs(node, ir) {
+        Ok(Some(dfs)) => dfs,
+        // A native op, or a spliced ROW without a kernel signature (attention,
+        // whose widths are the door's statement): the f16 stick.
+        Ok(None) => return true,
+        Err(e) => panic!(
+            "a spliced node's own output stick is unreadable — the reference legs refuse to \
+             guess the grid it rounds through: {e}"
+        ),
+    };
+    let Some((_, df)) = dfs
+        .iter()
+        .find(|(tid, _)| *tid == node.output.tensor.index() as u32)
+    else {
+        panic!(
+            "the spliced kernel for {:?} binds no parameter for its own output — the \
+             registry's operand-order contract (output LAST) is violated",
+            node.op
+        )
+    };
+    matches!(df, ktir_superdsc::superdsc_opspec::Df::Fp16)
 }
 
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`

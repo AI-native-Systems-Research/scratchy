@@ -1407,7 +1407,10 @@ pub struct SubtileIR<F: RopeForm = NeoX> {
     /// `tensors[0..num_sources]` are leaf sources.
     pub num_sources: u32,
     pub nodes: Vec<SubtileNode<F>>,
-    /// The tensor whose buffer is the forward result (logits).
+    /// The tensor whose buffer is the forward result — the logits row on every
+    /// plain graph, and the MINTED idx stick on a graph [`mint_argmax`] served
+    /// (the answer re-point: the host reads the picked token, not the row it
+    /// was picked from).
     pub result: TensorId,
     /// PROVENANCE: `op_output[j]` is the tensor written by source op `j`
     /// of the `LoweringInput` this IR was lowered from.
@@ -1454,11 +1457,22 @@ pub struct ArgmaxMint {
 }
 
 /// Append the greedy token pick to a ONE-REQUEST decode graph: seven staged-table
-/// sources, the result tail chain's tensors widened to `[1, PAD_V]`, and the
-/// `ArgMax` node reading the whole widened row. Pure graph surgery — the GATE
+/// sources, the result tail chain's tensors widened to `[1, PAD_V]`, the
+/// `ArgMax` node reading the whole widened row, and the graph's RESULT re-pointed
+/// to the node's idx stick. Pure graph surgery — the GATE
 /// (which rungs mint) is the caller's fact; this fn states only its own
 /// invariants and panics on their violation, which at expansion time is a build
 /// error, never a runtime one.
+///
+/// ⭐ THE ANSWER RE-POINT: `result` names the idx stick, so every seat keyed on
+/// the result — the wiring's `result` tid, the placement pass's `SegRole::Logits`
+/// classification, the worker's readback — addresses the picked token, and the
+/// dtype the kernel's own signature states for that output (`i32`) rides the
+/// wiring as the fact that tells the consumer to read it RAW instead of through
+/// the f16 convert. The ROW is NOT deleted: it stays exactly where the mint put
+/// it, a placed op output readable by tid — the re-point is the greedy
+/// contract's redirect of the ANSWER, never a removal of the row it was picked
+/// from (the wiring's own doc records this contract).
 ///
 /// ⭐ THE SEVEN SOURCES ARE INSERTED AT `[num_sources, num_sources+7)`, NOT APPENDED:
 /// sources must hold `tensors[0..num_sources]`, so the insert renumbers every
@@ -1606,6 +1620,10 @@ pub fn mint_argmax<F: RopeForm>(graph: &mut SubtileIR<F>) -> ArgmaxMint {
         inputs,
         output: whole(idx),
     });
+    // 4) The answer re-point: the rung's result IS the stick. validate demands
+    //    the result is an op output — the ArgMax node's output qualifies, and
+    //    the row keeps its own placement and its own readers either way.
+    graph.result = idx;
     ArgmaxMint { vocab, pad_vocab }
 }
 
@@ -4109,8 +4127,8 @@ mod tests {
 
         // The seven sources hold [2, 9); the old op output moved 2 -> 9; the stick is 10.
         assert_eq!(g.num_sources, 9, "seven table sources were inserted");
-        assert_eq!(g.result.0, 9, "the result tid was renumbered up by seven");
-        assert_eq!(g.op_output, vec![TensorId(9)], "op_output moved with it");
+        assert_eq!(g.result.0, 10, "the answer re-point: the rung's result is the idx stick");
+        assert_eq!(g.op_output, vec![TensorId(9)], "op_output moved with it (the ROW, still placed and readable by tid)");
         assert_eq!(
             (g.tensors[9].rows, g.tensors[9].cols),
             (1, 8),
@@ -4154,6 +4172,7 @@ mod tests {
             "the row first, then the seven tables in operand order"
         );
         assert_eq!(node.output.tensor.0, 10);
+        assert_eq!(node.output.tensor, g.result, "the stick is the graph result");
         for tr in node.inputs.iter().chain(std::iter::once(&node.output)) {
             assert_eq!(
                 (
@@ -4224,6 +4243,10 @@ mod tests {
                 .collect();
             let bufs = eval_dag(&g, &srcs);
             let idx_tid = g.nodes.last().unwrap().output.tensor;
+            assert_eq!(
+                idx_tid, g.result,
+                "the answer re-point: reading the result reads the stick"
+            );
             bufs[idx_tid.index()].clone()
         };
         let stick = |v: f32| vec![v; ARGMAX_BLOCK as usize];
@@ -4289,18 +4312,25 @@ mod tests {
         // The matmul's output (tid n_src, renumbered up by seven) AND the ScalarMul's
         // result are BOTH [1, PAD_V] now — the epilogue's chunks cannot disagree.
         let matmul_out = TensorId(n_src + 7);
-        let result = g.result;
-        assert_ne!(matmul_out, result, "the fixture is a two-link tail");
+        let row = g.nodes.last().unwrap().inputs[0].tensor;
+        assert_ne!(matmul_out, row, "the fixture is a two-link tail");
         assert_eq!((g.tensors[matmul_out.index()].rows, g.tensors[matmul_out.index()].cols), (1, 8));
-        assert_eq!((g.tensors[result.index()].rows, g.tensors[result.index()].cols), (1, 8));
+        assert_eq!((g.tensors[row.index()].rows, g.tensors[row.index()].cols), (1, 8));
         // The writers' regions are UNTOUCHED — [0, vocab) exactly as before.
         assert_eq!(g.nodes[0].output.region.cols.len, 5, "the matmul's writer region");
         assert_eq!(g.nodes[1].output.region.cols.len, 5, "the epilogue's writer region");
         assert_eq!(g.nodes[1].inputs[0].tensor, matmul_out, "the epilogue reads the matmul's output");
-        // And the mint's argmax node reads the whole widened RESULT.
+        // And the mint's argmax node reads the whole widened ROW — while the rung's
+        // RESULT is the node's own stick (the answer re-point).
         let node = g.nodes.last().unwrap();
-        assert_eq!(node.inputs[0].tensor, result);
+        assert_eq!(node.inputs[0].tensor, row);
         assert_eq!(node.inputs[0].region.cols.len, 8, "the whole widened row");
+        assert_eq!(g.result, node.output.tensor, "the answer re-point: the result is the stick");
+        assert_eq!(
+            (g.tensors[g.result.index()].rows, g.tensors[g.result.index()].cols),
+            (1, ARGMAX_BLOCK),
+            "the stick is the result, not the row"
+        );
         assert!(validate(&g).is_ok(), "the chain-widened graph must validate");
     }
 }

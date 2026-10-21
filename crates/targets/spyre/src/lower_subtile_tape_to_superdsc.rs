@@ -3237,6 +3237,20 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
     // source-tid entry (the staged tables) lands here over its synth slot —
     // its bytes are its value, and no op ever writes it.
     weights.stage_load_consts(&mut bufs, 0);
+    // ⭐ THE OFF-f16 STICKS — the outputs whose writer's own kernel signature
+    // states a non-f16 stick (the argmax mint's i32 idx): the rounding hop
+    // below is the F16 STICK's law, and pushing a whole-number index through
+    // the f16 grid MOVES the value itself (12358 → 12360 at the grid's
+    // spacing 8 in [8192, 16384) — measured). Stated once here so the loop's
+    // guard is a set lookup, never a per-node signature read.
+    let off_f16_sticks: std::collections::HashSet<u64> = ir
+        .nodes
+        .iter()
+        .filter(|n| {
+            !crate::lower_subtile_tape_to_ktir::node_output_on_f16_stick(n, ir)
+        })
+        .map(|n| n.output.tensor.index() as u64)
+        .collect();
     for node in &ir.nodes {
         if folded_node(node.id) {
             continue;
@@ -3329,11 +3343,16 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
             }
         }
         // The f16 stick the program stores this node's output through (see
-        // the staging block above for the law). The fold's reader-half alias
-        // below scatters the SAME rounded product — the folded tid holds the
-        // producer's stick, grid included.
-        for v in out.iter_mut() {
-            *v = half::f16::from_f32(*v).to_f32();
+        // the staging block above for the law) — EXCEPT an output whose own
+        // signature states a non-f16 stick (`off_f16_sticks`): the idx stick
+        // is the kernel's i32 buffer, and its whole numbers are exact; the
+        // f16 hop would MOVE them (12358 → 12360, measured). The fold's
+        // reader-half alias below scatters the SAME product — the folded tid
+        // holds the producer's stick, grid included.
+        if !off_f16_sticks.contains(&(node.output.tensor.index() as u64)) {
+            for v in out.iter_mut() {
+                *v = half::f16::from_f32(*v).to_f32();
+            }
         }
         let shape = ir.shape(node.output.tensor);
         scratchy_subtile::subtile_ir::scatter(
@@ -3557,6 +3576,18 @@ fn teacher_forced_walk<F: RopeForm>(
     // per node (they already carry their staged bytes there), so only its
     // non-source buffers take initial bytes here.
     weights.stage_load_consts(&mut tf, nsrc);
+    // The off-f16 sticks, the golden's own law verbatim (`eval_golden_buffers`'s
+    // set above is the statement): the rounding hop below must skip an output
+    // whose signature states a non-f16 stick, or the walk's OWN local leg lies
+    // about the op (the idx stick measured 12358 → 12360 through the grid).
+    let off_f16_sticks: std::collections::HashSet<u64> = ir
+        .nodes
+        .iter()
+        .filter(|n| {
+            !crate::lower_subtile_tape_to_ktir::node_output_on_f16_stick(n, ir)
+        })
+        .map(|n| n.output.tensor.index() as u64)
+        .collect();
     let mut rows: Vec<TeacherForcedRow> = Vec::new();
     for (ni, node) in ir.nodes.iter().enumerate() {
         if folded_node(node.id) {
@@ -3642,8 +3673,13 @@ fn teacher_forced_walk<F: RopeForm>(
         for s in 0..nsrc {
             std::mem::swap(&mut golden[s], &mut tf[s]);
         }
-        for v in tf_out.iter_mut() {
-            *v = half::f16::from_f32(*v).to_f32();
+        // The f16 stick law, the golden's own hop verbatim — and the same
+        // exemption: a non-f16 output stick skips the grid (the idx stick's
+        // whole numbers are exact; the hop would move them).
+        if !off_f16_sticks.contains(&(node.output.tensor.index() as u64)) {
+            for v in tf_out.iter_mut() {
+                *v = half::f16::from_f32(*v).to_f32();
+            }
         }
         let shape = ir.shape(node.output.tensor);
         scratchy_subtile::subtile_ir::scatter(
@@ -4407,6 +4443,18 @@ pub fn numeric_gate<F: RopeForm>(
     }) {
         folded.insert(ir.result.index() as u64);
     }
+    // ⭐ THE RESULT'S OWN DTYPE — the same fact the wiring ships
+    // (`result_dtype_of_ir`). An INTEGER result is an INDEX stick, and a
+    // tolerance over indices is a category error: one lane off is a WRONG
+    // TOKEN, not accumulation noise, and its rel (1/40017 ≈ 2.5e-5 on
+    // granite) sails under CLEAN_TOL — the gate would certify an argmax that
+    // picked the wrong word. The numeric legs already pin the fixture's idx
+    // exactly (64/64 lanes); this states the same law for the rung's ANSWER,
+    // post-re-point: the result compares EXACTLY (tolerance 0).
+    let result_is_index = matches!(
+        crate::lower_subtile_tape_to_ktir::result_dtype_of_ir(ir),
+        Ok(scratchy_tensors::DType::I32) | Ok(scratchy_tensors::DType::U32)
+    );
     for &(tid, _) in &compare {
         let g_full = &eval_bufs[tid as usize];
         let e = match out.get(&tid) {
@@ -4456,7 +4504,16 @@ pub fn numeric_gate<F: RopeForm>(
             .sum();
         let rel = dsum / gsum.max(1e-6);
         let is_fp8 = tainted.contains(&(tid as u32));
-        let tol = if is_fp8 { FP8_TOL } else { CLEAN_TOL };
+        // The index stick's exact law above: tolerance 0 for the re-pointed
+        // result when its dtype is an integer — any divergence at all is a
+        // wrong token.
+        let tol = if is_fp8 {
+            FP8_TOL
+        } else if result_is_index && tid == ir.result.index() as u64 {
+            0.0
+        } else {
+            CLEAN_TOL
+        };
         verdicts.push(ComparedVerdict {
             tid,
             n,

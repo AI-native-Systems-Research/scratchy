@@ -194,6 +194,12 @@ pub(crate) struct Parsed {
     pub(crate) cos_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
     pub(crate) sin_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
     pub(crate) result_id: usize,
+    /// See [`crate::spyre_types::BundleMeta::result_is_index`] — the bake's
+    /// own statement of whether this rung's result is the idx stick.
+    pub(crate) result_is_index: bool,
+    /// See [`crate::spyre_types::BundleMeta::result_want`] — the result's
+    /// readback extent in elements.
+    pub(crate) result_want: usize,
     pub(crate) capacity: usize,
     pub(crate) m_cap: usize,
     pub(crate) hidden: usize,
@@ -253,11 +259,24 @@ pub(crate) fn wiring_to_parsed(
             .collect()
     };
     let embed_src = w.embed_src as usize;
+    // The result's own answer shape, off the wiring's one derivation — the
+    // stick's element count on a minted rung, the vocab row otherwise. Both
+    // flow into the BundleMeta as plain copies (the emulator path carries no
+    // `wiring` reference to re-ask).
+    let result_is_index = w.result_is_index();
+    let result_want = if result_is_index {
+        let (rows, cols) = w.tensor_shapes[w.result as usize];
+        (rows * cols) as usize
+    } else {
+        w.geometry.vocab as usize
+    };
     Ok(Parsed {
         embed_src,
         cos_srcs: triples(w.cos_srcs),
         sin_srcs: triples(w.sin_srcs),
         result_id: w.result as usize,
+        result_is_index,
+        result_want,
         capacity,
         m_cap: (w.tensor_shapes[embed_src].0 as usize).max(1),
         hidden: w.geometry.hidden as usize,
@@ -347,6 +366,17 @@ fn resident_source_ids(
         .iter()
         .flat_map(|l| [l.prefix_k, l.prefix_v])
         .chain(spilled_weight_tail.iter().copied())
+        // ⭐ THE LOAD-CONST TIDS — the staged tables are bound ONCE at load on the
+        // owner session (`bind_load_consts`, before prepare, resident like a
+        // weight). A BORROWING rung never binds them itself, so a table whose
+        // placement sits outside the aliased segments classifies `Nobody` and
+        // every launch on that rung is refused; the loader's declaration is the
+        // accurate answer for them exactly as it is for the spilled tail. Keyed
+        // on the wiring's own list (op-blind: a second kernel with staged
+        // tables rides the same union), and it can only excuse ids at or past
+        // the graph's own source count — a real source can never collide with
+        // a minted table id.
+        .chain(w.load_consts.iter().map(|&(tid, _)| tid))
         .collect()
 }
 
@@ -2732,6 +2762,8 @@ impl SpyreWorker {
                 cos_srcs: p.cos_srcs,
                 sin_srcs: p.sin_srcs,
                 result_id: p.result_id,
+                result_is_index: p.result_is_index,
+                result_want: p.result_want,
                 layers: p.layers,
                 #[cfg(not(feature = "spyre-hw"))]
                 output_ids: p.output_ids,

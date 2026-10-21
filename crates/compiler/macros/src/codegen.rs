@@ -9475,6 +9475,30 @@ fn emit_superdsc_wiring(
     // (Moved above the rotary-source emission: `hd` and `theta` are the base
     // class's facts, and each cos/sin source's `RotaryKind` reads them.)
     let result = u32l(gk.result_tensor);
+    // ⭐ THE RESULT'S OWN DTYPE — straight off the bake's one derivation
+    // (`result_dtype_of_ir`, the result producer's own kernel signature), never
+    // recomputed here: it is the fact that tells the worker whether the rung's
+    // answer is the f16 row (convert and argmax on the host) or an index stick
+    // (read raw, the device already picked).
+    // `scratchy-tensors` is only a dev-dependency where this expands (the
+    // models crate), so the literal rides the spyre crate's own root re-export
+    // — the same `::scratchy_target_spyre::` prefix every other wiring type
+    // in this emission uses.
+    let result_dtype = match gk.result_dtype {
+        scratchy_target_spyre::DType::F16 => quote! { ::scratchy_target_spyre::DType::F16 },
+        scratchy_target_spyre::DType::BF16 => quote! { ::scratchy_target_spyre::DType::BF16 },
+        scratchy_target_spyre::DType::F32 => quote! { ::scratchy_target_spyre::DType::F32 },
+        scratchy_target_spyre::DType::U32 => quote! { ::scratchy_target_spyre::DType::U32 },
+        scratchy_target_spyre::DType::I32 => quote! { ::scratchy_target_spyre::DType::I32 },
+        // `result_dtype_of_ir` refuses every dtype the readback cannot name, so
+        // this arm is unreachable by construction — spelled out so a new DType
+        // variant fails HERE rather than silently lower in the wiring.
+        other => panic!(
+            "[superdsc-wiring] {}: the result's dtype {other:?} has no wiring literal — the \
+             readback cannot read it back",
+            model.source_stem
+        ),
+    };
     let num_sources = u32l(gk.num_sources);
     let dp = u32l(decode_position);
     let mask = match gk.attn_mask {
@@ -9615,6 +9639,7 @@ fn emit_superdsc_wiring(
     quote! {
         ::scratchy_target_spyre::wiring::Wiring {
             result: #result,
+            result_dtype: #result_dtype,
             num_sources: #num_sources,
             attn_mask: #mask,
             decode_position: #dp,
@@ -11030,7 +11055,8 @@ fn dump_wavefront_mega(
                     eprintln!(
                         "[spyre-superdsc] {base}: the device argmax minted — vocab {} (padded \
                          row {}), seven staged tables + the [1, 64] idx stick appended to the \
-                         one-request graph",
+                         one-request graph, and the rung's RESULT re-pointed to the stick (the \
+                         row stays placed and readable by tid)",
                         mint.vocab, mint.pad_vocab
                     );
                 }

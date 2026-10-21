@@ -239,6 +239,20 @@ impl BakeFacts {
 }
 
 impl Wiring {
+    /// ⭐ IS THE RUNG'S RESULT THE PICKED TOKEN ITSELF? — the one question the
+    /// worker asks of [`Self::result_dtype`]. An integer result (the device
+    /// argmax's `i32` idx stick today) states the device already picked: the
+    /// step leaves the result on the device, reads the stick's raw bytes at
+    /// this dtype, and the host's row-argmax is replaced by the stick's first
+    /// word. Keyed on the DTYPE the result's own producer stated, never on the
+    /// op's name — a second kernel with an index result rides the same branch.
+    pub const fn result_is_index(&self) -> bool {
+        matches!(
+            self.result_dtype,
+            scratchy_tensors::DType::I32 | scratchy_tensors::DType::U32
+        )
+    }
+
     /// ⛔ THE CLASS SETS, CHECKED AGAINST THE PLACEMENTS — ONCE, AT LOAD.
     ///
     /// The bake used to emit the identity and rope-P tables as f32 LITERALS staged at the BASE head
@@ -765,6 +779,19 @@ impl RotaryKind {
 pub struct Wiring {
     /// Tensor id of the logits.
     pub result: u32,
+    /// ⭐ THE RESULT'S OWN DTYPE — the fact that decides how the worker reads the
+    /// rung's answer back ([`Self::result_is_index`] is the one question asked of
+    /// it). Stated by the result producer's own kernel signature when a spliced
+    /// kernel produced the result, and the f16 row every native lm-head tail
+    /// emits otherwise.
+    ///
+    /// ⛔ THE ROW REMAINS A PLACED TENSOR, READABLE BY TID, when the result is an
+    /// index stick: the answer re-point is the greedy contract's redirect of the
+    /// ANSWER (the host reads the picked token, not the row it was picked from),
+    /// never a deletion of the row. Any consumer that needs the row can still
+    /// name its tid and read it; the mint widens it, places it, and leaves every
+    /// writer exactly where it was.
+    pub result_dtype: scratchy_tensors::DType,
     /// Tensor ids `0..num_sources` are caller-filled.
     pub num_sources: u32,
     /// The AttnDecode runtime length mask, if the model has a maskable decode.
@@ -1895,6 +1922,7 @@ mod constant_tape_tests {
     fn uniform_wiring() -> Wiring {
         Wiring {
             result: 0,
+            result_dtype: scratchy_tensors::DType::F16,
             num_sources: 0,
             attn_mask: None,
             decode_position: 0,
