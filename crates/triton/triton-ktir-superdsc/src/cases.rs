@@ -755,16 +755,18 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Option<Program>)> {
         // solo decode step's [PAD_V] row. See the fixture's own docstring for the full
         // algorithm and host contract.
         //
-        // ⛔ THE DOOR KIND IS `None` AND THAT IS THE HONEST STATE: no `Program` variant
-        // covers the SFP op vocabulary this kernel needs (`Max` reduce, `Equal`, `Multiply`,
-        // the fp32-convert island, `Fp32ToInt32`), and adding `Program::Argmax` would put an
-        // algorithm name in the compiler -- the exact hack the ladder law deletes. The
-        // NUMERIC legs run on this row
-        // today (`.py` → TTIR → KTIR → the ktir emulator, against the fixture's own torch
-        // reference with a deliberate tie at lanes 40017/48000 pinning first-max AND
-        // discriminating an f16-degraded final combine); the door consumers (`bake_py`, the
-        // emit tests) refuse it by name until that generic per-op
-        // door arm exists. (⛔ NOT the vendor topk pair: `topk.ddl`'s ripple keeps the LAST
+        // ⭐ THE DOOR IS THE WHOLE-FUNCTION WALK, and every op in the kernel crosses it
+        // through a GENERIC arm: the five maxima as bare `Reduce(Max)`, the three
+        // `cmpf(oeq)`+`uitofp` pairs folded to `Elementwise(Equal)` (the vendor's own
+        // `OpFunc::Equal` -- the device HAS the primitive and KTIR cannot name it in one
+        // op), the fp16 multiplies as `Elementwise(Mul)` (the `[1]`-answer widens through
+        // the broadcast operand mode), and the island as `dl16tofp32` -> same-stick f32
+        // multiply-add -> `fp32toint32` (the KSPLIT device recipe, `assemble_convert`).
+        // NO `Program::Argmax` exists or is wanted -- an algorithm name in the compiler is
+        // the exact hack the ladder law deletes. The door kind below is stated only
+        // because the signature demands one (`KTIR_WHOLE=1` walks the ops and never reads
+        // it, the decoder rows' own precedent); a per-`Program` run refuses loudly at the
+        // arity check. (⛔ NOT the vendor topk pair: `topk.ddl`'s ripple keeps the LAST
         // index among equals -- `GREATERTHAN(running, candidate)` with an equal candidate
         // displacing -- so `topkindex` at k=1 is LAST-max and cannot serve #631's law.)
         "argmax_first_max" => (
@@ -789,7 +791,10 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Option<Program>)> {
                 ],
             ),
             vec![1],
-            None,
+            // A PLACEHOLDER THE SIGNATURE DEMANDS, never read by the whole-function walk
+            // (`KTIR_WHOLE=1`, the decoder rows' own law); the per-`Program` door refuses
+            // this function loudly at its arity check (8 parameters for an op that reads 2).
+            Some(Program::Elementwise(Elementwise::Mul)),
         ),
         _ => return None,
     })
@@ -1041,12 +1046,14 @@ mod tests {
     /// ⛔ A `None` DOOR KIND IS A STAGE, NOT A DEFAULT. Every row whose third field is `None`
     /// must SAY SO in its arm's comment (why no `Program` variant is honest for it yet), and this
     /// test pins the SET of such rows by name -- so a new `None` row is a deliberate act that
-    /// updates this list, not a copy-paste of the argmax arm's trailing field. When a row gains
+    /// updates this list, not a copy-paste of another arm's trailing field. When a row gains
     /// its door it leaves this list and the list shrinks toward empty, which is the direction
-    /// the ladder runs.
+    /// the ladder runs. ⭐ THE LIST IS NOW EMPTY: `argmax_first_max` was the last doorless row,
+    /// and its kernel crosses the whole-function door through generic arms only -- the ladder's
+    /// stated destination. A new `None` row starts the list over and must say why.
     #[test]
     fn the_rows_without_a_door_are_exactly_the_named_set() {
-        const DOORLESS: &[&str] = &["argmax_first_max"];
+        const DOORLESS: &[&str] = &[];
         for name in super::ALL {
             let (_, _, door) = super::case(name).expect("a name from ALL");
             let doorless = door.is_none();

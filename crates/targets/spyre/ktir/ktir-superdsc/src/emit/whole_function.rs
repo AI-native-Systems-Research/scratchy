@@ -43,6 +43,7 @@
 //! guessed node kind is a well-formed descriptor computing the wrong function.
 
 use ktir_core::attrkey::AttrKey;
+use ktir_core::dtypes::DType;
 use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
 use ktir_core::opkind::OpKind;
 
@@ -50,9 +51,11 @@ use super::lower_ktir_to_superdsc::{Error, Gather, Region, err, gathers_of, regi
 use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind};
 // The broadcast AXIS is the emission door's own vocabulary — `elementwise` selects the `In` builder
 // from it — so it lives beside that door and this recogniser names the same type rather than a
-// parallel one that would have to be mapped across the boundary.
-use super::lower_ktir_to_superdsc::BcastAxis;
+// parallel one that would have to be mapped across the boundary. The CONVERT KIND is the same
+// trade for a dtype-convert: the emission door's own vocabulary, not a `Program` variant.
+use super::lower_ktir_to_superdsc::{BcastAxis, ConvertKind};
 use crate::placement::BundleLayout;
+use crate::superdsc_opspec::Df;
 use crate::work::DeviceWidth;
 
 /// THE SILU LONGHAND, as the ONE fused op it is — `out = silu(gate) · up`.
@@ -968,6 +971,12 @@ enum Lowering {
     /// for the Scale convention. See [`program_rmsnorm_chains`] for why fusing it is the fix and
     /// filling the scale registry was not.
     RmsNorm(f32, Option<f32>),
+    /// A dtype-CONVERT cast — `arith.extf` f16→f32 (`dl16tofp32`) or `arith.fptosi` f32→i32
+    /// (`fp32toint32`) — the vendor's own convert `OpFunc`s, 1:1 in (op kind, element pair).
+    /// Local rather than a `Program` variant for the same reason `Reduce` is: a bare convert is
+    /// reachable only through this walk, and `Program` is matched exhaustively by consumers
+    /// outside this crate. See [`convert_kind_of`] for the discriminator and what it refuses.
+    Convert(ConvertKind),
 }
 
 /// THE `Elementwise(Mul)` / `ScalarMul` TIEBREAK, read off ONE op rather than the whole function.
@@ -1129,6 +1138,185 @@ pub fn reduce_kind_of(op: &ktir_core::ir::Operation<'static>) -> Option<ReduceKi
         (AttrKey::ReduceFn, Attr::Op(OpKind::ArithMaxnumf)) => Some(ReduceKind::Max),
         _ => None,
     })
+}
+
+/// THE CONVERT A CAST NAMES, where the naming is 1:1 in (op kind, element pair).
+///
+/// ⭐ NOT IN [`program_of`] for the same reason [`reduce_kind_of`] is not: `program_of` takes an
+/// `OpKind` alone, and `OpKind::ArithExtf` says "a widening cast happens here" without saying
+/// WHICH — `extf` f16→f32 is `dl16tofp32`, an `extf` f16→f32 over an INTEGER target is a
+/// different op with no recipe. The element pair is read off the op's own types, so nothing is
+/// stapled to the program a third party must restate.
+///
+/// The two recipes are the vendor's own convert `OpFunc`s, and they are the KSPLIT fp32 island's
+/// two ends: `dl16tofp32` widens an fp16 stick to same-stick fp32 (the multiply-add's entrance —
+/// ⛔ an fp16 value MUST stage through it on the way to an integer, because `Fp32ToInt32`'s DDL
+/// slice law refuses a direct fp16→u32 pairing), and `fp32toint32` re-sticks an IEEE fp32 word
+/// as a SENUINT32 index (the exit).
+///
+/// ⛔ EVERY OTHER PAIR IS A NAMED REFUSAL, NOT A FALLTHROUGH. An `extf`/`fptosi` that reaches
+/// this function with a pair outside the two recipes returns `Err` here — naming the op, the
+/// operand's element and the result's — rather than `Ok(None)`, because `Ok(None)` would hand it
+/// to the generic "no 1:1 `Program`" refusal whose message cannot say WHICH converts this door
+/// does lower. A producer spelling `extf` f32→f16 (the narrow-back, `fp32todl16`) is told that
+/// here; it is not lowered as the nearest convert, which would silently re-stick at the wrong
+/// width.
+fn convert_kind_of(
+    f: &IRFunction<'static>,
+    op: &ktir_core::ir::Operation<'static>,
+) -> Result<Option<ConvertKind>, Error> {
+    if !matches!(op.op_type, OpKind::ArithExtf | OpKind::ArithFptosi) {
+        return Ok(None);
+    }
+    // The operand's element type, read off its DEFINING op's result type — the same lookup
+    // `splat_scale_of`'s `def_of` makes, top-level, because a cast's operand is a value this
+    // function computed or loaded, never a region interior.
+    let elem_of = |v: Ssa| {
+        f.operations
+            .iter()
+            .find(|o| o.result == Some(v))
+            .and_then(|o| o.result_type)
+            .and_then(|t| t.elem())
+    };
+    let [operand] = op.operands[..] else {
+        return err(format!(
+            "{}: `{:?}` states {} operands — a dtype-convert reads exactly one",
+            f.name,
+            op.op_type,
+            op.operands.len()
+        ));
+    };
+    let in_elem = elem_of(operand);
+    let out_elem = op.result_type.and_then(|t| t.elem());
+    match (op.op_type, in_elem, out_elem) {
+        (OpKind::ArithExtf, Some(DType::F16), Some(DType::F32)) => Ok(Some(ConvertKind::Dl16ToFp32)),
+        (OpKind::ArithFptosi, Some(DType::F32), Some(DType::I32)) => {
+            Ok(Some(ConvertKind::Fp32ToInt32))
+        }
+        _ => err(format!(
+            "{}: `{:?}` {:?} → {:?} is not one of the dtype-converts this door lowers. The \
+             device's convert OpFuncs spell exactly two recipes reachable from a Triton kernel: \
+             `arith.extf` f16 → f32 (`dl16tofp32`, the fp32 island's entrance) and \
+             `arith.fptosi` f32 → i32 (`fp32toint32`, its exit — an fp16 value must stage \
+             through the widen first; the direct fp16→u32 cast is DDL-refused). Any other pair \
+             is a producer form refused by name rather than lowered as the nearest convert",
+            f.name, op.op_type, in_elem, out_elem
+        )),
+    }
+}
+
+/// THE BUFFER FORMAT an op's result type names.
+///
+/// F16 and F32 are the fp16/fp32 sticks; I32 is SENUINT32 — the 4-byte/32-stick index format
+/// that is `fp32toint32`'s own output. A STATED type with none of those mappings (a bool, an
+/// i64, an fp8 result) is refused BY NAME: silently defaulting to fp16 would reserve HALF the
+/// bytes an f32 intermediate needs (the footprint guard refuses the first over-run, or without
+/// it the next intermediate is aliased onto it) and mis-stick every descriptor over it.
+///
+/// ⭐ AN UNSTATED type keeps the door's historical fp16 basis. `Operation::new` defaults
+/// `result_type` to `None`, and a hand-built IR (the unit tests' minimal programs) states no
+/// type at all — every op the real pipeline emits carries one, so `None` here is an omitted
+/// annotation, not a fact to refuse, and the only behavior-preserving reading is the fp16 basis
+/// every one of those programs was lowered under before the format became readable here.
+fn result_df_of(name: &str, op: &ktir_core::ir::Operation<'static>) -> Result<Df, Error> {
+    match op.result_type.and_then(|t| t.elem()) {
+        None => Ok(Df::Fp16),
+        Some(DType::F16) => Ok(Df::Fp16),
+        Some(DType::F32) => Ok(Df::Fp32),
+        Some(DType::I32) => Ok(Df::SenUint32),
+        Some(other) => err(format!(
+            "{name}: `{:?}`'s result element type is {other:?}, which has no buffer format this \
+             door mints — an intermediate of that dtype has no stick basis to reserve or address. \
+             It is refused by name rather than defaulted to fp16, which would reserve the wrong \
+             width and mis-stick every descriptor over it",
+            op.op_type
+        )),
+    }
+}
+
+/// The equality-mask folds: each retype's result → the comparison's own two operands, plus the
+/// i1 results the fold consumed (skipped at the walk's loop top, beside the chain interiors).
+struct EqualMasks {
+    by_retype: std::collections::HashMap<Ssa, (Ssa, Ssa)>,
+    consumed: std::collections::HashSet<Ssa>,
+}
+
+/// ⭐⭐⭐ THE EQUALITY MASK — `arith.cmpf(oeq)` retyped by `arith.uitofp`, folded to ONE
+/// `Elementwise(Equal)`.
+///
+/// # WHY THIS RECOGNISER EXISTS AT ALL, AND WHY IT IS NOT AN EXCEPTION TO THE MODULE HEADER
+///
+/// The device HAS the primitive: `OpFunc::Equal` (`broadcast_ops.ddl:41`) realizes `a == b` as
+/// an fp16 0.0/1.0 TENSOR — `EQUAL` into a BOOL state reg, then `SELECT(plus1, zero)` — the
+/// same arity-2 broadcast-op family as `maximum`/`minimum`. KTIR has no op for that: the
+/// comparison is `arith.cmpf` (an i1) and the 0/1 tensor is a SEPARATE `arith.uitofp` retype,
+/// because an i1 cannot ride the fp16 stick. So the two-op spelling is the only one a producer
+/// HAS — the same argument that admits the silu longhand ([`program_silu_mul_chains`]): the
+/// device's op exists and the IR cannot name it in one op, and lowering the pair op-by-op would
+/// emit a form the pointwise family does not have (a bool-typed compare with no stick) rather
+/// than a slower lowering of the same function. The fold is the 1:1 map: `cmpf(oeq)` +
+/// `uitofp`→f16 IS `Elementwise(Equal)` over the cmpf's own two operands.
+///
+/// # ⛔ WHAT IS REFUSED RATHER THAN GUESSED
+///
+/// * the predicate must be `oeq` — `OpFunc::Equal` is EQUALITY (NaN compares FALSE on the SFP
+///   unit, matching the ordered compare), and any other predicate is a DIFFERENT function this
+///   fold must not silently re-mean. An unfolded `cmpf` — any other predicate, or one whose sole
+///   reader is not the retype — is left alone and reaches the walk's by-name refusal, which
+///   names `ArithCmpf`.
+/// * the retype's target must be F16 — the device op's wire-level result IS the fp16 0/1 tensor
+///   (`SELECT(plus1, zero)`), so a `uitofp` to any other width is left alone rather than
+///   re-emitted at the wrong format.
+/// * the `cmpf`'s i1 result must have exactly ONE consumer, the retype — the fold DESTROYS the
+///   i1 value (the device op never materialises it), so a second reader would read a value
+///   nothing writes. The same seal the silu recogniser states for its longhand interior.
+///
+/// Returns the folds ([`EqualMasks`]): each `uitofp` result → the `cmpf`'s two operands, and the
+/// i1 results the fold consumed.
+fn program_equal_masks(f: &IRFunction<'static>) -> Result<EqualMasks, Error> {
+    let mut masks = EqualMasks {
+        by_retype: std::collections::HashMap::new(),
+        consumed: std::collections::HashSet::new(),
+    };
+    let deep = f.ops_deep();
+    for op in deep
+        .iter()
+        .copied()
+        .filter(|o| o.op_type == OpKind::ArithCmpf)
+    {
+        let Some(res) = op.result else { continue };
+        // THE PREDICATE IS THE FUNCTION: ordered equality is `OpFunc::Equal`'s own semantics.
+        let oeq = op.attributes.iter().any(|(k, v)| {
+            matches!((k, v), (AttrKey::Predicate, Attr::Str(s)) if *s == "oeq")
+        });
+        if !oeq {
+            continue;
+        }
+        let [a, b] = op.operands[..] else { continue };
+        // ⛔ EXACTLY ONE READER, AND IT IS THE RETYPE — see the seal above.
+        let mut consumers = deep.iter().copied().filter(|o| o.operands.contains(&res));
+        let Some(u) = consumers.next() else { continue };
+        if consumers.next().is_some()
+            || u.op_type != OpKind::ArithUitofp
+            || u.operands != [res]
+        {
+            continue;
+        }
+        // ⛔ THE RETYPE'S TARGET IS F16 — the device op's wire result is the fp16 0/1 tensor.
+        if !matches!(
+            u.result_type,
+            Some(ktir_core::irtype::IrType::Tensor {
+                elem: DType::F16,
+                ..
+            })
+        ) {
+            continue;
+        }
+        let Some(u_res) = u.result else { continue };
+        masks.by_retype.insert(u_res, (a, b));
+        masks.consumed.insert(res);
+    }
+    Ok(masks)
 }
 
 /// Is this op addressing or bookkeeping rather than computation?
@@ -2579,7 +2767,11 @@ pub fn lower_function(
     // THE BROADCAST PLUMBING, read before the walk for the same reason: these ops lower to NOTHING and
     // the consumer carries the broadcast as an operand mode. See [`program_broadcast_chains`].
     let (bcasts, bcast_consumed) = program_broadcast_chains(f)?;
-    // ⭐⭐⭐ THE GATHERS THE PROGRAM STATES, read ONCE and from [`gathers_of`] — the same joins the
+    // THE EQUALITY MASKS, read before the walk for the same reason the silus are: the device's
+    // `OpFunc::Equal` is ONE op and KTIR spells it as two (`cmpf` + `uitofp`), so the comparison
+    // is chain-interior and the RETYPE is the terminal this walk lowers. See
+    // [`program_equal_masks`].
+    let equal_masks = program_equal_masks(f)?;    // ⭐⭐⭐ THE GATHERS THE PROGRAM STATES, read ONCE and from [`gathers_of`] — the same joins the
     // per-`Program` door's `gather_of` makes, so the two doors cannot disagree about which parameter
     // is the table or which is the index. A program with ONE indirect tile reads identically to
     // `gather_of`; a program with SEVERAL is either the unrolled-sweep shape (every tile over the
@@ -2625,6 +2817,9 @@ pub fn lower_function(
                 || rmsnorms.iter().any(|c| c.consumed.contains(&r))
                 // The expand/collapse/broadcast chain itself: no descriptor, the consumer states it.
                 || bcast_consumed.contains(&r)
+                // An equality mask's `arith.cmpf`: the fold destroyed the i1, and the `uitofp`
+                // terminal below stands for the pair.
+                || equal_masks.consumed.contains(&r)
                 // An fp8 dot's absorbed scale mulf: it rode into the dot's emission above.
                 || fp8_epilogue.contains(&r)
                 // A row-folded family's non-leader block: the leader's one whole-view descriptor
@@ -2668,6 +2863,17 @@ pub fn lower_function(
         // An rmsnorm chain's TERMINAL gain multiply becomes the one fused program. Checked before the
         // splat arm and before the 1:1 map, both of which would otherwise claim it.
         let rms = rmsnorms.iter().find(|c| op.result == Some(c.out));
+        // AN EQUALITY MASK'S RETYPE is the fold's terminal: the `Elementwise(Equal)` stands for the
+        // `cmpf(oeq)`+`uitofp` pair, and its inputs are the comparison's own operands (resolved
+        // below). Checked before the 1:1 map, which has no `ArithUitofp` arm — an unfolded retype
+        // falls to the by-name refusal, correctly.
+        let equal = (op.op_type == OpKind::ArithUitofp)
+            .then(|| op.result.and_then(|r| equal_masks.by_retype.get(&r).copied()))
+            .flatten();
+        // A dtype-convert cast, 1:1 in (op kind, element pair) — see [`convert_kind_of`]. `Err` for
+        // an `extf`/`fptosi` whose pair is outside the two recipes (the named refusal lives there);
+        // `None` for every other op kind, which falls through to the 1:1 map.
+        let convert = convert_kind_of(f, op)?;
         let Some(program) = terminal
             .map(|c| {
                 if c.up.is_some() {
@@ -2684,6 +2890,8 @@ pub fn lower_function(
             .or(reduce.map(Lowering::Reduce))
             .or(scalar.map(|(v, _)| Lowering::ScalarMul(v)))
             .or(bound_scale.map(Lowering::BoundScalarMul))
+            .or(equal.map(|_| Lowering::Node(Program::Elementwise(Elementwise::Equal))))
+            .or(convert.map(Lowering::Convert))
             .or_else(|| program_of(op.op_type).map(Lowering::Node))
         else {
             return err(format!(
@@ -2693,6 +2901,14 @@ pub fn lower_function(
                 f.name, op.op_type
             ));
         };
+
+        // ⭐ THE OP'S OWN RESULT FORMAT, read off the result type and never assumed: every op this
+        // door had lowered before the fp32 island is fp16, and the island's multiply-add states
+        // F32. It is threaded to the MINT (the intermediate reserves the ACTUAL dtype's width —
+        // an f32 buffer at an fp16 reservation is half the bytes, aliased onto the next tensor)
+        // and to the ELEMENTWISE EMISSION (the stick basis and `dataFormat_` are the dtype's own
+        // facts). Read once here so no consumer re-derives it and drifts.
+        let op_df = result_df_of(f.name, op)?;
 
         // THE WEIGHT'S ORIENTATION, PROVEN FROM THE MAPS before any extent is trusted. See
         // [`BOrient`]: the extent guards downstream cannot distinguish the two framings when
@@ -2719,6 +2935,9 @@ pub fn lower_function(
             Lowering::ScalarMul(_) | Lowering::BoundScalarMul(_) => 1,
             // x and gamma; the epsilon, `1/cols` and the oneplus offset are the fused body's own.
             Lowering::RmsNorm(..) => 2,
+            // A dtype-convert reads ONE tensor; the formats ride the `OpFunc`
+            // (`convert_dtypes`), never the operand list.
+            Lowering::Convert(_) => 1,
             Lowering::Node(Program::Matmul) => 2,
             Lowering::Node(Program::Elementwise(e)) => {
                 match super::lower_ktir_to_superdsc::elementwise_op_func(f.name, e) {
@@ -2737,6 +2956,13 @@ pub fn lower_function(
             _ if rms.is_some() => {
                 let c = rms.expect("just matched");
                 vec![c.x, c.gamma]
+            }
+            // THE EQUALITY MASK's inputs are the comparison's own two operands, not the retype's
+            // (the retype reads the i1 the fold destroys). The broadcast resolution below then
+            // applies to them exactly as it would to a spelled two-tensor op's.
+            _ if equal.is_some() => {
+                let (a, b) = equal.expect("just matched");
+                vec![a, b]
             }
             (Some(c), _, _) => match c.up {
                 Some(up) => vec![c.gate, up],
@@ -3342,7 +3568,13 @@ pub fn lower_function(
                 }
                 _ => dims,
             };
-            layout.synth(crate::place::PlaceId::Act(tid), &dev_dims);
+            // ⭐ THE MINT RESERVES THE OP'S OWN RESULT FORMAT — `synth` is `synth_df(Fp16)`, and
+            // an f32 intermediate (the widen island's multiply-add results) at an fp16
+            // reservation is HALF the bytes the emission writes: the footprint guard would
+            // refuse the first over-run, or without it the next intermediate would be aliased.
+            // `synth_df` reserves the true width, the same fact `pointwise_broadcast_opspec_df`
+            // threads into the descriptors.
+            layout.synth_df(crate::place::PlaceId::Act(tid), &dev_dims, op_df);
             let r = Region {
                 tid,
                 v_rows: dims[0],
@@ -3370,6 +3602,7 @@ pub fn lower_function(
                     b_orient,
                     gather: op_gather.map(|(g, _, _)| g),
                     bcast: &bcast_axes,
+                    df: op_df,
                 },
             )?;
             out.append(&mut emitted);
@@ -3416,6 +3649,7 @@ pub fn lower_function(
                 b_orient,
                 gather: op_gather.map(|(g, _, _)| g),
                 bcast: &bcast_axes,
+                df: op_df,
             },
         )?;
         out.append(&mut emitted);
@@ -3493,6 +3727,11 @@ struct WalkProof<'a> {
     /// [`program_broadcast_chains`]) — positional with `per_op`'s inputs, empty when no operand is
     /// broadcast.
     bcast: &'a [Option<BcastAxis>],
+    /// THE OP'S OWN RESULT FORMAT, read off the result type ([`result_df_of`]) — `Fp16` for every
+    /// op this door lowered before the fp32 island, `Fp32` on the island's multiply-add. Read by
+    /// the `Elementwise` arm, which states it on the tile and every `TensorArg`; unread by the
+    /// arms whose formats ride other facts (the convert's ride its `OpFunc`).
+    df: Df,
 }
 
 /// Hand ONE op's regions to the body its `Program` names.
@@ -3513,6 +3752,7 @@ fn emit_one(
         b_orient,
         gather,
         bcast,
+        df,
     } = proof;
     // THE FUSED SILU. Reached only through [`program_silu_mul_chains`], which PROVED the five-op
     // longhand; `per_op` is `[gate, up, out]`, which is the parameter order `silumul`'s own
@@ -3572,6 +3812,13 @@ fn emit_one(
                 layout,
             );
         }
+        // A DTYPE-CONVERT — one input, one output, both the RowBlocked token stream, the formats
+        // riding the `OpFunc` through `convert_dtypes`. The same `assemble_convert` body the fp8
+        // quantiser's tail and the KSPLIT pair's own device recipe use, so the doors cannot
+        // drift about what a convert emits.
+        Lowering::Convert(kind) => {
+            return super::lower_ktir_to_superdsc::convert(name, kind, per_op, sym_id_base, layout);
+        }
         Lowering::Node(p) => p,
     };
     Ok(match program {
@@ -3614,7 +3861,9 @@ fn emit_one(
             )?
         }
         Program::Elementwise(e) => {
-            super::lower_ktir_to_superdsc::elementwise(name, e, per_op, bcast, sym_id_base, layout)?
+            super::lower_ktir_to_superdsc::elementwise_df(
+                name, e, per_op, bcast, df, sym_id_base, layout,
+            )?
         }
         Program::Transpose => {
             super::lower_ktir_to_superdsc::transpose(name, per_op, sym_id_base, layout)?

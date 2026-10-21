@@ -34,9 +34,9 @@
 //! branch, unchanged, reached from facts the KTIR states — and the fp8 arm below calls it.
 
 use super::{
-    EmittedOp, In, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, bmm_site,
-    check_pointwise_cols, emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec_df,
-    pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
+    EmittedOp, In, assemble_convert, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d,
+    bmm_site, check_pointwise_cols, check_pointwise_cols_df, emit_sdsc_tiled, fl,
+    op_func_from_str, pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_attn, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
@@ -55,7 +55,7 @@ use crate::reserved_tids::{
 };
 use crate::sdsc_abstract::{KernelTag, Stk};
 use crate::sdsc_abstract::{MatK, MatM, MatN};
-use crate::superdsc_opspec::{DataFormat, Df, Fp16, ItDim, SdscFoldSet};
+use crate::superdsc_opspec::{DataFormat, Df, Fp16, Fp32, ItDim, SdscFoldSet, StickExtent};
 use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES};
 use ktir_core::affine::AffineExpr;
 use ktir_core::attrkey::AttrKey;
@@ -947,6 +947,30 @@ fn scale_idx_of(layout: Option<&BundleLayout>, tid: u32) -> Option<usize> {
 /// `mb = rows/y` from the checked [`crate::sdsc_abstract::RowSplitFrame`]); every other caller
 /// passes 1 and keeps the size-1 dim this doc describes.
 pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, y: u32, n_operands: u32) -> TileOp {
+    pointwise_tile_op_df(rows, cols, y, n_operands, Df::Fp16)
+}
+
+/// [`pointwise_tile_op`] at a stated [`Df`] — the torch-spyre fp32-rmsnorm precedent's own law
+/// ([`pointwise_broadcast_opspec_df`]): the stick basis is the ACTUAL dtype's (fp32 = 32-element
+/// stick), because an fp32 op's `out` dim measured on the fp16 basis would state the wrong
+/// `stickSize_`/`wordLength` for every operand the tile feeds. `Df::Fp16` keeps the proven basis
+/// verbatim (`cols.max(1)` — `cols` is already whole-stick by [`check_pointwise_cols`], and `0`
+/// passes that check, so the `StickExtent` round-trip is not imposed on it); every other format
+/// rounds at its own stick, which is a no-op for a whole-stick `cols` and the fix for a
+/// sub-fp16-stick-but-whole-own-stick one (a per-row fp32 lane is 32, valid fp32, NOT a
+/// 64-multiple — `pointwise_broadcast_opspec_df`'s own note).
+pub(crate) fn pointwise_tile_op_df(rows: u32, cols: u32, y: u32, n_operands: u32, df: Df) -> TileOp {
+    let out_size = match df {
+        Df::Fp16 => cols.max(1),
+        Df::Fp32 => StickExtent::<Fp32>::new(cols)
+            .expect("check_pointwise_cols_df already proved cols a whole fp32 stick")
+            .elems(),
+        // ⛔ NO OTHER FORMAT REACHES HERE: [`elementwise_df`] refuses a non-fp16/fp32 `df` by
+        // name before building a tile, because the pointwise builders below state exactly these
+        // two (same branch in `pointwise_broadcast_opspec_df`). Stated rather than `_`-ed so a
+        // new format is an E0004 here, at the seam that would have to learn it.
+        other => unreachable!("elementwise_df refused the {other:?} pointwise form by name"),
+    };
     TileOp {
         kind: TileOpKind::PointwiseOrReduce { n_operands },
         dims: vec![
@@ -955,24 +979,24 @@ pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, y: u32, n_operands: u32) -
                 size: rows,
                 is_reduction: false,
                 is_stick: false,
-                df: Df::Fp16,
+                df,
             },
             ItDim {
                 name: "out",
-                size: cols.max(1),
+                size: out_size,
                 is_reduction: false,
                 is_stick: true,
-                df: Df::Fp16,
+                df,
             },
             ItDim {
                 name: "y",
                 size: y.max(1),
                 is_reduction: false,
                 is_stick: false,
-                df: Df::Fp16,
+                df,
             },
         ],
-        df: Df::Fp16,
+        df,
     }
 }
 
@@ -1034,6 +1058,13 @@ pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(&'static st
         Elementwise::RealDiv => ("realdiv", 2),
         Elementwise::Maximum => ("maximum", 2),
         Elementwise::Minimum => ("minimum", 2),
+        // The equality mask. `OpFunc::Equal` realizes as `EQUAL` into a BOOL state reg then
+        // `SELECT(plus1, zero)` (`broadcast_ops.ddl:41`), so the wire-level result IS an fp16
+        // 0.0/1.0 tensor — the same shape every pointwise here already emits, NOT a bool tile
+        // needing a dtype lane of its own. NaN compares FALSE on the SFP unit, which is the
+        // emulator's ordered `cmpf oeq` verbatim, so the numeric rung and the card compute the
+        // same predicate. Used by the first-max sampler's one-hot selectors.
+        Elementwise::Equal => ("equal", 2),
         // ⛔ THE DDL HAS NO PRIMITIVE FOR THESE TWO, AND SUBSTITUTING THE NEAREST ONE IS THE BUG.
         // `QuickGelu` is x·σ(1.702x) and `GeluErf` is the exact-erf gelu — neither is
         // `OpFunc::Gelu`'s tanh polynomial, so emitting "gelu" for them would run a DIFFERENT
@@ -1180,6 +1211,38 @@ pub fn elementwise(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
+    elementwise_df(name, kind, r, bcast, Df::Fp16, sym_id_base, layout)
+}
+
+/// [`elementwise`] at a stated [`Df`] — the torch-spyre fp32-rmsnorm precedent's own door
+/// ([`pointwise_broadcast_opspec_df`]): an op whose RESULT is fp32 (the widen island's
+/// multiply-add) states `df` on every `ItDim`, the `TileOp`, and every `TensorArg`, because the
+/// stick basis and the `dataFormat_`/`wordLength` the descriptor declares are properties of the
+/// ACTUAL dtype — an fp16-annotated descriptor over fp32 buffers mis-stripes every stick.
+///
+/// ⛔⛔ THE fp32 FORM ADMITTED HERE IS THE DENSE CORNER-FREE ONE, AND THE OTHER ARMS REFUSE IT
+/// BY NAME RATHER THAN EMIT IT UNSTATED:
+///   * the SEEDED whole-tensor path ([`assemble_pointwise_seeded_from_tile`]) cannot state `df`
+///     at all — its `TensorArg`s carry no `with_df` — so an fp32 op routed there would emit an
+///     fp16-annotated descriptor over fp32 buffers: right shape, wrong `dataFormat_`, silently.
+///     The fp32 dense form therefore rides the [`EwOperand`] builder
+///     ([`assemble_pointwise_broadcast_off_from_tile`], all-`In::full` operands — the documented
+///     degenerate case of the generalization), which threads `tile_op.df` into every arg.
+///   * a BROADCAST operand, the PER-ROW one-stick chain, and the CORNERED windows are fp16-proven
+///     forms whose offsets and widths are stated on the fp16 element basis
+///     ([`chunk_window`]/[`band_corner`] address in `Df::Fp16` elements); an fp32 op in any of
+///     those shapes is a form this door has not proven, and it is refused by name here rather
+///     than mis-addressed. `Df::Fp16` keeps every one of those paths byte-identical — the `df`
+///     only selects between them when it is not `Fp16`, which no existing caller states.
+pub fn elementwise_df(
+    name: &str,
+    kind: Elementwise,
+    r: &[Region],
+    bcast: &[Option<BcastAxis>],
+    df: Df,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
     let (op_func, arity) = elementwise_op_func(name, kind)?;
     // ⭐ SPLIT WITHOUT THE BASE-ADDRESS GUARD: the dense arm below places row corners
     // per-operand (the windowed emission), so which operands are inputs is a fact about the
@@ -1225,6 +1288,81 @@ pub fn elementwise(
              column-blocked chunk or a banded window is DENSE elementwise; the dense arm carries \
              both corners, so give the broadcast/per-row chains whole-tensor regions.",
         ));
+    }
+    // ⛔⛔⛔ THE NON-fp16 GATE — everything below this block is the fp16-proven machinery, and a
+    // non-fp16 op may take only the DENSE CORNER-FREE form (the module doc above states why each
+    // other arm refuses). The forms admitted: `Df::Fp32`, no broadcast flag, no per-row output,
+    // no corner on any operand — the whole-stick `[rows, cols]` fp32 multiply-add of the widen
+    // island, emitted through the df-carrying [`EwOperand`] builder at offset 0.
+    if df != Df::Fp16 {
+        if !matches!(df, Df::Fp32) {
+            return err(format!(
+                "Elementwise({kind:?}) {name}: the op's result format is {df:?}, and this door \
+                 lowers pointwise ops in Fp16 and Fp32 only — the stick basis, the operand modes \
+                 and the window offsets below are all stated on one of those two, so any other \
+                 format is a producer form this door refuses by name rather than guessing a \
+                 basis for"
+            ));
+        }
+        if bcast.iter().any(Option::is_some) {
+            return err(format!(
+                "Elementwise({kind:?}) {name}: a BROADCAST operand on an fp32 op — the operand \
+                 modes (`In::col`/`In::mb`) and their degenerate-extent proofs are fp16-proven \
+                 forms, and an fp32 broadcast is a shape this door has not proven. It is refused \
+                 by name rather than emitted on an unproven basis"
+            ));
+        }
+        if out.c_len == 1 {
+            return err(format!(
+                "Elementwise({kind:?}) {name}: a per-row one-stick fp32 output — the one-stick \
+                 chain rides lane 0 of a 64-element fp16 stick ([`elementwise_per_row`]'s own \
+                 law), and the fp32 per-row form is not one this door has proven. It is refused \
+                 by name rather than emitted on an unproven basis"
+            ));
+        }
+        if out.c_start != 0
+            || ins.iter().any(|x| x.c_start != 0)
+            || out.r_start != 0
+            || ins.iter().any(|x| x.r_start != 0)
+        {
+            return err(format!(
+                "Elementwise({kind:?}) {name}: a CORNERED fp32 op — the window corners are \
+                 addressed on the fp16 element basis ([`chunk_window`]/[`band_corner`] state \
+                 `Df::Fp16` offsets), and an fp32 window is a shape this door has not proven. It \
+                 is refused by name rather than mis-addressed"
+            ));
+        }
+        let cols = out.c_len;
+        check_pointwise_cols_df(cols, "Elementwise", out.tid, df)?;
+        let rows = pointwise_rows(name, &out)?;
+        pointwise_extents_agree(name, kind, &ins, &out, rows)?;
+        let op_name = format!("{op_func}_o{}", out.tid);
+        // HANDLE-FLOW, the broadcast arm's own discipline: the handles are bound once and the
+        // operands borrow them, because an `EwOperand` holds a `&Stk` that must outlive the
+        // builder call. All-dense `In::full` — the documented degenerate case of the
+        // generalization — with the `df` riding the `TileOp` into every `TensorArg`.
+        let out_h = rb(&out.name(), rows, cols);
+        let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
+        let in_handles: Vec<_> = in_names
+            .iter()
+            .zip(ins.iter())
+            .map(|(n, x)| rb(n, x.v_rows, x.c_len))
+            .collect();
+        let ew: Vec<_> = in_handles.iter().map(|h| In::full(h).ew()).collect();
+        let tile_op = pointwise_tile_op_df(rows, cols, 1, arity as u32 + 1, df);
+        return Ok(vec![assemble_pointwise_broadcast_off_from_tile(
+            &op_name,
+            &tile_op,
+            op_func,
+            rows,
+            cols,
+            &ew,
+            &out_h,
+            // WHOLE-TENSOR by the corner refusal above, not by default.
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        )]);
     }
     if bcast.iter().any(Option::is_some) {
         return elementwise_broadcast(name, kind, &ins, &out, bcast, sym_id_base, layout);
@@ -1746,6 +1884,83 @@ fn elementwise_broadcast(
         // neither of which can place a column window), so the offset is 0 by proof, not by
         // default.
         crate::addr::DevOff::ZERO,
+        sym_id_base,
+        layout,
+    )])
+}
+
+/// A dtype-CONVERT's kind — the device's own convert `OpFunc`s, discriminated by the
+/// (operand, result) element pair the KTIR op states. Not a [`Program`] variant: `Program` is
+/// matched exhaustively by consumers outside this crate, and a bare convert is reachable only
+/// through the whole-function walk, so the kind lives here at the emission door — the same
+/// trade [`BcastAxis`] makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConvertKind {
+    /// `arith.extf` f16 → f32. `OpFunc::Dl16ToFp32`, dxp `"dl16tofp32"` — the WIDENING half of
+    /// the KSPLIT fp32 island: `dl16tofp32` → same-stick f32 multiply-add → `fp32toint32`.
+    /// ⛔ The fp16 operand must STAGE through this convert, never a direct fp16→u32 cast —
+    /// `Fp32ToInt32`'s own DDL slice law (`unary_parallel.ddl:59`) refuses that pairing.
+    Dl16ToFp32,
+    /// `arith.fptosi` f32 → i32. `OpFunc::Fp32ToInt32`, dxp `"fp32toint32"` — the island's exit,
+    /// an IEEE fp32 word re-sticked as a SENUINT32 index.
+    Fp32ToInt32,
+}
+
+impl ConvertKind {
+    /// The `op_func_from_str` key — a DESCRIPTOR NAME feeding the bundle fingerprint
+    /// ([`elementwise_op_func`]'s own law), so it is the exact input key, never the
+    /// `OpFunc::name()` dxp spelling.
+    pub fn op_func(self) -> &'static str {
+        match self {
+            ConvertKind::Dl16ToFp32 => "dl16tofp32",
+            ConvertKind::Fp32ToInt32 => "fp32toint32",
+        }
+    }
+
+    /// The WIDER of this convert's two formats — the work-division stick basis
+    /// [`convert_opspec`] states: `dl16tofp32` keeps the fp16 input's 64 (fp16 is wider than
+    /// fp32's 32), `fp32toint32` takes 32 (fp32 in, u32 out, both 32-element sticks).
+    fn stick_df(self) -> Df {
+        match self {
+            ConvertKind::Dl16ToFp32 => Df::Fp16,
+            ConvertKind::Fp32ToInt32 => Df::Fp32,
+        }
+    }
+}
+
+/// THE CONVERT DOOR: one dtype-convert op, ONE tensor input, ONE output, both the RowBlocked
+/// token stream — the same [`assemble_convert`] body the fp8 quantiser's tail and the KSPLIT
+/// pair's own device recipe use, so a whole-kernel producer and a per-`Program` one cannot drift
+/// about what a convert emits.
+///
+/// ⭐ THE GUARDS ARE THE ELEMENTWISE DOOR'S OWN, restated for a unary op: the output's row
+/// basis is [`pointwise_rows`]' reading, and `cols` must be a whole stick of the WIDER format —
+/// a core's slab is cut at that basis ([`convert_opspec`]'s own law), so a sub-stick width is a
+/// dxp scheduler refusal at bake, named here one rung earlier.
+pub fn convert(
+    name: &str,
+    kind: ConvertKind,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let (ins, out) = split_out(name, r, layout, 1)?;
+    let rows = pointwise_rows(name, &out)?;
+    let cols = out.c_len;
+    check_pointwise_cols_df(cols, "Convert", out.tid, kind.stick_df())?;
+    let op_func = kind.op_func();
+    let op_name = format!("{op_func}_o{}", out.tid);
+    // The handles are ANNOTATION-ONLY (`assemble_convert` reads `.name()`; the dtypes ride the
+    // `OpFunc` through `convert_dtypes`), so the RowBlocked mint is exact for both operands.
+    let in_h = rb(&ins[0].name(), rows, cols);
+    let out_h = rb(&out.name(), rows, cols);
+    Ok(vec![assemble_convert(
+        &op_name,
+        op_func,
+        rows,
+        cols,
+        &in_h,
+        &out_h,
         sym_id_base,
         layout,
     )])
@@ -6141,10 +6356,11 @@ mod elementwise_tests {
             Elementwise::RealDiv => 15,
             Elementwise::Maximum => 16,
             Elementwise::Minimum => 17,
+            Elementwise::Equal => 18,
         }
     }
 
-    const DECLARED: usize = 18;
+    const DECLARED: usize = 19;
 
     #[test]
     fn all_declares_every_variant_exactly_once() {
@@ -6325,6 +6541,7 @@ mod elementwise_tests {
             (Elementwise::Maximum, 2),
             (Elementwise::Minimum, 2),
             (Elementwise::Sub, 2),
+            (Elementwise::Equal, 2),
         ] {
             assert_eq!(elementwise_op_func("p", k).unwrap().1, want, "{k:?} arity");
         }

@@ -101,6 +101,11 @@ pub enum Elementwise {
     Maximum,
     /// `min(a, b)`. Live on card already via the fp8 quantiser's clamp (`ktir_matmul_fp8.rs`).
     Minimum,
+    /// `a == b` as 0/1 fp16. `OpFunc::Equal`, dxp `"equal"` — the vendor realizes it as `EQUAL`
+    /// into a BOOL state reg then `SELECT(plus1, zero)` (`broadcast_ops.ddl:41`), so the
+    /// wire-level result IS fp16 0.0/1.0, the same arity-2 broadcast-op shape as
+    /// `maximum`/`minimum`. NaN compares FALSE, matching the emulator's ordered `cmpf oeq`.
+    Equal,
 }
 
 impl Elementwise {
@@ -128,6 +133,7 @@ impl Elementwise {
         Elementwise::RealDiv,
         Elementwise::Maximum,
         Elementwise::Minimum,
+        Elementwise::Equal,
     ];
 }
 
