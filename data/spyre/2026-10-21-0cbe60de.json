@@ -1,0 +1,683 @@
+{
+  "schema": 1,
+  "date": "2026-10-21",
+  "contexts": {
+    "~123": 128,
+    "~1k": 1061,
+    "~10k": 10091
+  },
+  "torch_spyre": {
+    "measured": "2026-10-19",
+    "host": "not re-run this sweep: every torch cell is the 2026-10-19 sweep's value carried verbatim (that sweep ran its torch legs on nickm4; its file carries the re-run history)",
+    "harness": "carried, not re-measured. The torch side is the reference stack (/work/spyre-inference) and did not change since 2026-10-19, so this sweep re-measured only the scratchy side and carries every torch cell from the 2026-10-19 sweep as-is — same harness, same prompts, same buckets (that sweep: vllm bench serve, out=256, rung 1 at --max-concurrency 1 on the len-* sets, batched at --max-concurrency 4/8 on the shared conc-* sets, 2 reps per back-to-back boot, cell = rep 2). Each carried cell says so in its note; the cells the 10-19 sweep itself carried from 10-18 keep that history in their notes. Scratchy ran the same prompts, buckets, serve flags and rep conventions, so the ratios compare like-for-like sweep over sweep."
+  },
+  "triton_scratchy": {
+    "measured": "2026-10-21",
+    "commit": "0cbe60de8e886549b8edb37c0c24a19858e07577",
+    "host": "nickm4 (all 24 legs, one card, one pod)",
+    "harness": "built on-pod from a clean checkout of the frozen sweep sha (one binary per model×dtype; fp8 = quant/fp8-dynamic-per-channel on the RedHatAI FP8-dynamic checkpoints), with no SCRATCHY_SDSC_* knobs set — the sweep measures shipping behavior. scr serve --device spyre, taskset -c 48-95, port 8079, a teardown guard (no live vllm, no vfio-device holder, 30 s quiet) before every boot. Rung 1: the #677 calibrated harness — the frozen sha's own scripts/bench_spyre_rung1.py under the reference venv, streaming /v1/chat/completions on the sweep's own base prompts (scripts/spyre_rung1_prompts/), --no-prefix-caching --max-num-seqs 2 --max-model-len 34816, 3 reps on distinct prompts, medians; serve-recorded prompt lengths 128/1061/10091, gated to ±2% of the bucket by the serve's request-finished lines. Batched: vllm bench serve on the shared conc-* sets (123/1024/10300), 16 prompts, --max-concurrency 4/8, --max-num-seqs 4/8, --max-model-len 8704 (8b) / 12288 (2b; 8b ~10k keeps 34816), 2 reps per back-to-back boot, cell = rep 2 (steady state). The two 8b fp16 batched ~10k legs refused at serve boot (KV budget) and are left absent rather than re-run at a smaller max-model-len, which would make the cell non-like-for-like with its row."
+  },
+  "cells": [
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 61.0,
+      "scratchy": 43.30588050652295,
+      "note": "torch value carried from the 2026-10-19 sweep, which itself carried it (a 2026-10-14 measurement)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~1k",
+      "torch": 63.0,
+      "scratchy": 44.78319687768817,
+      "note": "torch value carried from the 2026-10-19 sweep, which itself carried it (a 2026-10-14 measurement)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~10k",
+      "torch": 75.0,
+      "scratchy": 59.093182906508446,
+      "note": "torch value carried from the 2026-10-19 sweep, which itself carried it (a 2026-10-14 measurement)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 75.06679699427502,
+      "scratchy": 51.360090021226625,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 51.3374, rep 2 51.3601 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 4,
+      "context": "~1k",
+      "torch": 67.73924548407176,
+      "scratchy": 57.64057336502946,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 61.3123, rep 2 57.6406 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 4,
+      "context": "~10k",
+      "torch": 208.216346245186,
+      "scratchy": 550.5631872452796,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 550.757, rep 2 550.563 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 62.822039487917785,
+      "scratchy": 62.24759663500841,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 61.8424, rep 2 62.2476 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~1k",
+      "torch": 88.88436455060454,
+      "scratchy": 70.40856895447872,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 79.8224, rep 2 70.4086 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~10k",
+      "torch": 370.1270589299098,
+      "scratchy": 1172.9980970413296,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 1173.02, rep 2 1173 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 143.5340106021613,
+      "scratchy": 132.45887297671288,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~1k",
+      "torch": 148.92181495441963,
+      "scratchy": 136.563551845029,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~10k",
+      "torch": 164.0,
+      "scratchy": 155.61792883090675,
+      "note": "torch value carried from the 2026-10-19 sweep, which itself carried it (a 2026-10-14 measurement)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 144.39078664735837,
+      "scratchy": 150.45769403131644,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 150.498, rep 2 150.458 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 4,
+      "context": "~1k",
+      "torch": 160.07965710607596,
+      "scratchy": 157.57773889995676,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 165.681, rep 2 157.578 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 151.56627896095753,
+      "scratchy": 171.64076126691901,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 171.548, rep 2 171.641 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~1k",
+      "torch": 173.89633859023817,
+      "scratchy": 181.39818584336442,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 212.166, rep 2 181.398 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 111.0,
+      "scratchy": 62.97825602814555,
+      "note": "torch value carried from the 2026-10-19 sweep, which itself carried it (a 2026-10-14 measurement)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~1k",
+      "torch": 458.0,
+      "scratchy": 473.53693610057235,
+      "note": "torch value carried from the 2026-10-19 sweep, which itself carried it (a 2026-10-14 measurement)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~10k",
+      "torch": 8227.0,
+      "scratchy": 7338.127285940573,
+      "note": "torch value carried from the 2026-10-19 sweep, which itself carried it (a 2026-10-14 measurement)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 248.04746604058892,
+      "scratchy": 329.9741504015401,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 331.317, rep 2 329.974 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 4,
+      "context": "~1k",
+      "torch": 385.42302907444537,
+      "scratchy": 612.1158965397626,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 1073.08, rep 2 612.116 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 4,
+      "context": "~10k",
+      "torch": 10323.981421417557,
+      "scratchy": 16634.156200569123,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 16652.8, rep 2 16634.2 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 229.24780694302171,
+      "scratchy": 570.7141145830974,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 572.979, rep 2 570.714 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 8,
+      "context": "~1k",
+      "torch": 463.98821263574064,
+      "scratchy": 1123.6221625003964,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 2581.93, rep 2 1123.62 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 8,
+      "context": "~10k",
+      "torch": 12152.477052994072,
+      "scratchy": 22051.390422973782,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 22071.3, rep 2 22051.4 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 256.4256329787895,
+      "scratchy": 172.1281020436436,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~1k",
+      "torch": 946.2668369524181,
+      "scratchy": 1015.297541860491,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~10k",
+      "torch": 13035.0,
+      "scratchy": 11706.825664965436,
+      "note": "torch value carried from the 2026-10-19 sweep, which itself carried it (a 2026-10-14 measurement)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 476.98079189285636,
+      "scratchy": 903.6601925035939,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 904.056, rep 2 903.66 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 4,
+      "context": "~1k",
+      "torch": 705.360846943222,
+      "scratchy": 1423.1270591262728,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 2421.21, rep 2 1423.13 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 554.7926330473274,
+      "scratchy": 1535.2417450631037,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 1534.8, rep 2 1535.24 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 8,
+      "context": "~1k",
+      "torch": 789.7606720216572,
+      "scratchy": 2484.52736006584,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 5323.22, rep 2 2484.53 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 4,
+      "context": "~123",
+      "torch": 53.108930735498134,
+      "scratchy": 76.25615625602369,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 76.3463, rep 2 76.2562 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 4,
+      "context": "~1k",
+      "torch": 57.73269444565062,
+      "scratchy": 66.86505609345134,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 60.4967, rep 2 66.8651 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 4,
+      "context": "~10k",
+      "torch": 16.35777221035234,
+      "scratchy": 6.553717971852586,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 6.55505, rep 2 6.55372 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~123",
+      "torch": 124.89122974411147,
+      "scratchy": 124.94291918185716,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 125.389, rep 2 124.943 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~1k",
+      "torch": 86.4408435620205,
+      "scratchy": 107.34013424437903,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 89.379, rep 2 107.34 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~10k",
+      "torch": 18.26699878692647,
+      "scratchy": 6.262621814659269,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 6.26209, rep 2 6.26262 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 4,
+      "context": "~123",
+      "torch": 27.411269814947207,
+      "scratchy": 26.073700614818197,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 26.0573, rep 2 26.0737 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 4,
+      "context": "~1k",
+      "torch": 24.66752319767196,
+      "scratchy": 24.618987741549095,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 22.762, rep 2 24.619 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~123",
+      "torch": 51.75575019582286,
+      "scratchy": 45.207991968074836,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 45.2337, rep 2 45.208 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~1k",
+      "torch": 44.96561118621276,
+      "scratchy": 42.03133855545539,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 34.5366, rep 2 42.0313 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 260.0923891024043,
+      "scratchy": 27.348308474756777,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "itl_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 441.8666422020133,
+      "scratchy": 35.02481912728399,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 35.0124, rep 2 35.0248 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 781.3521216491091,
+      "scratchy": 49.693853137375534,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 49.5655, rep 2 49.6939 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp8",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 257.0,
+      "scratchy": 74.23405954614282,
+      "note": "torch value carried from the 2026-10-19 sweep, which itself carried it (a 2026-10-14 measurement)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp8",
+      "metric": "itl_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 613.7060494586716,
+      "scratchy": 95.45362389819952,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 95.4614, rep 2 95.4536 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp8",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 1411.7164960473447,
+      "scratchy": 122.9307039942154,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 122.923, rep 2 122.931 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 18845.162497018464,
+      "scratchy": 68.4864679351449,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "ttft_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 36613.71065303683,
+      "scratchy": 324.26825701259077,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 323.711, rep 2 324.268 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "ttft_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 37016.674472019076,
+      "scratchy": 588.2826790912077,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 584.259, rep 2 588.283 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp8",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 41700.0,
+      "scratchy": 155.04739782772958,
+      "note": "torch value carried from the 2026-10-19 sweep, which itself carried it (a 2026-10-14 measurement)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp8",
+      "metric": "ttft_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 80764.9914114736,
+      "scratchy": 750.3196090692654,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 747.425, rep 2 750.32 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp8",
+      "metric": "ttft_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 84666.31552402396,
+      "scratchy": 1349.7412805445492,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 1348.76, rep 2 1349.74 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "tok_s",
+      "conc": 4,
+      "context": "~123",
+      "torch": 6.854060344913208,
+      "scratchy": 110.604983806721,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 110.675, rep 2 110.605 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~123",
+      "torch": 8.58975543433008,
+      "scratchy": 154.59865990904098,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 156.002, rep 2 154.599 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp8",
+      "metric": "tok_s",
+      "conc": 4,
+      "context": "~123",
+      "torch": 4.313787341362337,
+      "scratchy": 40.81765586302663,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 40.816, rep 2 40.8177 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp8",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~123",
+      "torch": 4.6083036283108285,
+      "scratchy": 62.63461037368455,
+      "note": "torch value carried from the 2026-10-19 sweep (measured 2026-10-19; torch unchanged, not re-run); two back-to-back reps on one boot — scratchy rep 1 62.6508, rep 2 62.6346 tok/s; the cell is each side's rep 2 (steady state)."
+    }
+  ],
+  "since": "#673–#731",
+  "target": {
+    "label": "8b moonshot · short-context ITL",
+    "model": "granite-3.1-8b",
+    "dtype": "fp16",
+    "metric": "itl_ms",
+    "conc": 1,
+    "context": "~123",
+    "value": 110.0,
+    "why": "the card's measured ceiling: 16.36 GB/token at 149 GB/s, one fp16 matmul across all 32 cores"
+  },
+  "moved": [
+    {
+      "pr": "#692, #703",
+      "what": "decode batch chunks divide their esub/exp sticks first and split row max and row sum along the reduced axis: conc-8 ~1k ITL 91.1 → 70.4 ms (2b) and 199.3 → 181.4 ms (8b); conc-4 ~1k 64.8 → 57.6 ms. 2b is now ahead of torch at conc 8 (70.4 vs 88.9 ms; 107.3 vs 86.4 tok/s). Sweep-over-sweep across #673–#731, not these PRs alone."
+    },
+    {
+      "pr": "#707, #709",
+      "what": "a prompt chunk launches no lm_head suffix whose logits nobody reads, and keeps its causal score and probabilities in core-local LX: 2b batched ~10k TTFT 20.5 → 16.6 s at conc 4 and 27.6 → 22.1 s at conc 8; rung-1 TTFT down at every 2b bucket (67.5 → 63.0 ms at ~123, 561 → 474 ms at ~1k, 7.76 → 7.34 s at ~10k) and at 8b ~1k/~10k (1057 → 1015 ms, 12.3 → 11.7 s). Sweep-over-sweep across #673–#731."
+    },
+    {
+      "pr": "#701",
+      "what": "every request of a long-context batched wave is admitted on the shared write-slot pool: 2b batched ~10k throughput up — conc 4 5.44 → 6.55 tok/s, conc 8 5.62 → 6.26 — still 2.5–2.9× behind torch. Sweep-over-sweep across #673–#731."
+    },
+    {
+      "pr": "#698",
+      "what": "the composite device argmax token step closes greedy solo decode's loop on the card. Rung-1 ITL is flat sweep-over-sweep (2b 42.9 → 43.3 ms, 8b 131.1 → 132.5) — no cell claim."
+    },
+    {
+      "pr": "#728, #729",
+      "what": "a request its stop string finished aborts engine-side instead of decoding garbage — correctness; the sweep's legs run ignore_eos, so no cell claim."
+    },
+    {
+      "pr": "#730, #731, #714–#725",
+      "what": "operand windows minted at the authority (the Win type), bundle-unique intermediate tids with a duplicate-placement refusal at bake, and the lowering-door refactors — no cell claims; the rung-1 cells they touch are flat sweep-over-sweep."
+    }
+  ],
+  "levers": [
+    {
+      "lever": "batched ~10k decode",
+      "work": "2b conc-8 ~10k ITL 1173.0 ms vs torch 370.1 (torch 3.2× ahead, flat sweep-over-sweep); the 8b batched ~10k cells are absent by design — the KV budget at max-model-len 34816 fits ≤2 concurrent seqs."
+    },
+    {
+      "lever": "batched TTFT",
+      "work": "the widest remaining gap: 2b conc-8 ~1k 1123.6 vs 464.0 ms (torch 2.4× ahead), 8b conc-8 ~1k 2484.5 vs 789.8 ms (3.1×); 2b conc-8 ~10k 22.1 vs 12.2 s (1.8×). Down from 2.5×/3.2×/2.3× on 10-19 but still the front to work."
+    },
+    {
+      "lever": "8b conc-8 decode",
+      "work": "torch 1.04× ahead at ~1k (ITL 173.9 vs 181.4 ms; 45.0 vs 42.0 tok/s), down from 1.15× on 10-19; 2b is now ahead at conc 8 (ITL 70.4 vs 88.9 ms, 1.26×)."
+    },
+    {
+      "lever": "8b decode floor",
+      "work": "132.5 ms at ~123 against the card's ≈110 ms floor (16.4 GB/token at 149 GB/s) — the rest is attention and elementwise glue."
+    },
+    {
+      "lever": "8b fp8 prefill",
+      "work": "155.0 ms at ~123 — 10% under this sweep's fp16 (172.1) but 3% over 10-19's fp8 (149.9): the halved weight bytes still just beat the per-row quantize overhead; fusing the quantize into the matmul is still the work."
+    },
+    {
+      "lever": "per-token overhead",
+      "work": "2b fp8 short-context ITL 27.3 ms, flat sweep-over-sweep; ~10% of it is host time between steps — compile-time CB replay with the next token chosen on the device (#603)."
+    }
+  ],
+  "notes": {
+    "decode": [
+      "Rung-1 (single-request) decode is flat sweep-over-sweep — 2b 42.9 → 43.3 ms at ~123, 8b 131.1 → 132.5 — as expected: nothing in #673–#731 targets the solo decode path's inner loop. Short-context parity is a shared floor: both stacks stream 16.4 GB of fp16 weights per token, and one fp16 matmul on this card streams at most ~149 GB/s across all 32 cores, so fp16 at one request bottoms out near 110 ms/token.",
+      "The batched decode cells are where this sweep moved: conc-4 and conc-8 ~1k ITL improved 9–23% (2b conc-8 91.1 → 70.4 ms, now 1.26× ahead of torch; 8b conc-8 199.3 → 181.4 ms, torch's lead down from 1.15× to 1.04×). The ~10k batched decode cells are flat (2b conc-8 1178.9 → 1173.0 ms) — the long-context batched path is a different front from the short-context one."
+    ],
+    "prefill": [
+      "TTFT improved nearly everywhere: rung-1 2b at every bucket (67.5 → 63.0 ms at ~123, 561 → 474 ms at ~1k, 7.76 → 7.34 s at ~10k), 8b at ~1k and ~10k (1057 → 1015 ms, 12.3 → 11.7 s), and the 2b batched ~10k cells by 19–20% (conc 4 20.5 → 16.6 s, conc 8 27.6 → 22.1 s). The 8b rung-1 ~123 cell is flat (168.2 → 172.1 ms, +2.3%). Scratchy's rung-1 TTFT now beats torch at every 2b bucket and at 8b ~10k; the batched TTFT cells still trail torch everywhere."
+    ],
+    "conc": [
+      "Every batched cell is the second of two back-to-back reps on one server boot (rep 1 is reliably the slow rep — a property of the harness); both reps are recorded in each cell's note. Decode squares prefer itl_ms (per-request median TPOT under that batch); tok_s is recorded alongside for the concurrency view.",
+      "The 8b fp16 batched ~10k squares are unmeasured by design: the serve refuses at boot — max-model-len 34816 × max-num-seqs 4 needs 545 KV pages (32700 MB at 60 MB per page) against the 16384 MB budget (273 pages); at max-num-seqs 8 it needs 1089 pages (65340 MB). 8b ~10k at this max-model-len fits ≤2 concurrent seqs; left absent rather than re-run at a smaller max-model-len, which would make the cell non-like-for-like with its row.",
+      "The torch side was not re-run: every torch cell is the 2026-10-19 sweep's value carried verbatim (the reference stack did not change), and each cell's note says so. The scratchy side ran the same prompts, buckets, serve flags and rep conventions on nickm4, so the sweep-over-sweep deltas above are scratchy-side changes on a fixed torch baseline."
+    ],
+    "fp8": [
+      "fp8 cells are flat to slightly better: 2b ITL 27.2 → 27.3 ms at rung 1, 49.7 at conc 8 (−6%); 8b 74.0 → 74.2 ms at rung 1, 122.9 at conc 8 (−3%). The 8b fp8 TTFT cells drifted ~3% up (149.9 → 155.0 ms at rung 1) — within rep noise of the 10-19 values, and still 10% under this sweep's fp16.",
+      "The fp8 gap vs torch widens with concurrency, as on 10-19: 2b ITL 27.3 vs torch 260.1 ms at rung 1 (9.5×) and 49.7 vs 781.4 at conc 8 (15.7×); 8b 74.2 vs 257.0 (3.5×) and 122.9 vs 1411.7 (11.5×). Torch fp8 values are the 2026-10-19 measurements carried."
+    ]
+  }
+}
