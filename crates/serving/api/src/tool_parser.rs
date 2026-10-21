@@ -3233,7 +3233,8 @@ mod tests {
                 "vocab": vocab, "merges": []
             }
         });
-        let factory = build_parser_factory(tokenizer.to_string().as_bytes()).unwrap();
+        // The engine stops this model on `</s>` (0), so its grammars end there (#808).
+        let factory = build_parser_factory(tokenizer.to_string().as_bytes(), &[0]).unwrap();
         let command = serde_json::json!({
             "type": "object",
             "properties": { "command": { "type": "string" } },
