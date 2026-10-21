@@ -95,6 +95,39 @@ impl Engine {
         }
     }
 
+    /// Whether it serves an `ignore_eos` request to its full length, so a live server delivers
+    /// every answer token asked for ([`super::data::Run::mark_dead`]). In every published run,
+    /// scratchy's live cells deliver 99% or more of them and mlx-lm's 84% or more. oMLX stops at
+    /// EOS regardless (#479), as does ollama, at as little as 36% and 15%; vllm-metal, llama.cpp
+    /// and mistral.rs have no published cells to show either, so they are not judged.
+    pub fn honours_ignore_eos(self) -> bool {
+        match self {
+            Engine::Scratchy | Engine::MlxLm => true,
+            Engine::OmlxTq
+            | Engine::Omlx
+            | Engine::VllmMetal
+            | Engine::Ollama
+            | Engine::LlamaCpp
+            | Engine::Mistralrs => false,
+        }
+    }
+
+    /// Its scaling cells, to mark as a run loads ([`super::data::Run::mark_dead`]).
+    pub fn cells_mut(self, m: &mut Model) -> &mut [Cell] {
+        match self {
+            Engine::Scratchy => &mut m.scaling,
+            Engine::OmlxTq => &mut m.scaling_omlx_tq,
+            Engine::Omlx => &mut m.scaling_omlx,
+            Engine::MlxLm => &mut m.scaling_mlx_lm,
+            Engine::VllmMetal => &mut m.scaling_vllm_metal,
+            Engine::Ollama => &mut m.scaling_ollama,
+            Engine::LlamaCpp => &mut m.scaling_llama_cpp,
+            Engine::Mistralrs => &mut m.scaling_mistralrs,
+        }
+        .as_deref_mut()
+        .unwrap_or_default()
+    }
+
     pub fn ladder(self, m: &Model) -> &[Rep] {
         match self {
             Engine::Scratchy => &m.cache_ladder,

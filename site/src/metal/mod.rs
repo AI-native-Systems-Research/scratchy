@@ -31,7 +31,7 @@ use crate::charts::{
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
 use data::{At, Bytes, Cell, Model, Run, Scenario};
 use numbers::{
-    DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, Startup, cfmt, failed, fmt, lfmt, marks,
+    DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, Startup, cfmt, failed_note, fmt, lfmt, marks,
     marks_note, med, served, timing,
 };
 
@@ -86,6 +86,7 @@ fn load(site: &Site) -> Result<Vec<Run>, String> {
                 m.model_id
             ));
         }
+        run.mark_dead();
         run.file = f;
         runs.push(run);
     }
@@ -570,7 +571,7 @@ fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
             lfmt(ladder, Scenario::Warm, Startup::FirstToken, 0, 1000.0),
             cfmt(one, Metric::Ttft),
             cfmt(one, Metric::Tpot),
-            fmt(timing(one, Metric::Throughput), 1) + if failed(one) > 0 { FAILED } else { "" },
+            cfmt(one, Metric::Throughput),
             fmt(med(ladder, Scenario::Cold, Startup::PeakRss), 0),
         ];
         let now = summary_raw(m, run);
@@ -913,20 +914,18 @@ fn sweep_part<'a>(m: &'a Model, run: &Run, prev: Option<Entry<'a>>, sweep: Sweep
             })
             .filter(|(_, ss)| ss.iter().any(|s| s.class != "prev"))
             .collect();
-        // Who has no line here, and why: no cells at this sweep (failed, or
-        // not measured), or cells that never streamed. Named for the side
-        // that is missing, scratchy included.
-        let (no_cells, no_stream): (Vec<&str>, Vec<&str>) = ran
-            .iter()
-            .filter(|(_, cs)| !plotted(cs))
-            .fold((Vec::new(), Vec::new()), |(mut nc, mut ns), (e, cs)| {
-                if cs.is_empty() {
-                    nc.push(e.label())
-                } else {
-                    ns.push(e.label())
-                }
-                (nc, ns)
-            });
+        // Each engine not plotted, by why: no cells at all, every cell from a server that had
+        // stopped answering, or cells whose answers never streamed.
+        let (mut no_cells, mut dead, mut no_stream) = (Vec::new(), Vec::new(), Vec::new());
+        for (e, cs) in ran.iter().filter(|(_, cs)| !plotted(cs)) {
+            if cs.is_empty() {
+                no_cells.push(e.label())
+            } else if cs.values().all(|c| c.dead) {
+                dead.push(e.label())
+            } else {
+                no_stream.push(e.label())
+            }
+        }
         rsx! {
             Stack { gap: 2,
                 strong { "{title}" }
@@ -936,6 +935,9 @@ fn sweep_part<'a>(m: &'a Model, run: &Run, prev: Option<Entry<'a>>, sweep: Sweep
                             {bar_chart(ss, &xs, (t.as_str(), ylabel), sweep, "200px", &format!("{title}, scratchy {t}"))}
                         }
                     }
+                }
+                if !dead.is_empty() {
+                    p { "{dead.join(\", \")}: the server had stopped answering, so every request failed; not plotted." }
                 }
                 if !no_stream.is_empty() {
                     p { "{no_stream.join(\", \")}: {NO_STREAM}, not plotted." }
@@ -1071,7 +1073,7 @@ struct ShapeGrid<'a> {
     down: Vec<u32>,
     across: Vec<u32>,
     have: Vec<(Engine, ByShape<'a>)>,
-    /// The headline comparison: the first of Engine::RIVALS the run has.
+    /// The headline comparison: the first of Engine::RIVALS with a live cell here.
     rival: Option<Engine>,
     /// Every engine the run has a grid for, the rival first.
     present: Vec<Engine>,
@@ -1161,8 +1163,13 @@ impl<'a> ShapeGrid<'a> {
             .into_iter()
             .filter(|&e| !g.cells(e).is_empty())
             .collect();
+        // The headline comparison is the first rival with a live cell: one whose server stopped
+        // answering for the whole slice has nothing to compare against, while a later one does.
+        let rival = (present.iter().copied())
+            .find(|&e| g.cells(e).values().any(|c| !c.dead))
+            .or(present.first().copied());
         Some(ShapeGrid {
-            rival: present.first().copied(),
+            rival,
             present,
             ..g
         })
@@ -1265,9 +1272,10 @@ impl Trend {
         match self {
             Trend::UsersDecode | Trend::UsersPrefill => {
                 let mine = by_users(m, run, Engine::Scratchy);
+                // The first rival with a live cell along users, as `ShapeGrid::of` picks.
                 let rival = Engine::RIVALS
                     .into_iter()
-                    .find(|&e| !by_users(m, run, e).is_empty())?;
+                    .find(|&e| by_users(m, run, e).values().any(|c| !c.dead))?;
                 let theirs = by_users(m, run, rival);
                 let pts = mine
                     .iter()
@@ -1292,15 +1300,20 @@ impl Trend {
                 let pts = along
                     .iter()
                     .map(|&a| {
-                        let at = |e: Engine| {
-                            geometric_mean(across.iter().filter_map(|&b| {
-                                timing(g.at(Some(e), if prompt { (a, b) } else { (b, a) }), metric)
-                            }))
-                        };
+                        // Only the rungs both engines measured: averaging each over its own would
+                        // compare different cells, and a dead or unstreamed cell left out of one
+                        // side would move that side's mean alone.
+                        let both: Vec<(f64, f64)> = (across.iter())
+                            .filter_map(|&b| {
+                                let at = if prompt { (a, b) } else { (b, a) };
+                                let value = |e: Engine| timing(g.at(Some(e), at), metric);
+                                Some((value(Engine::Scratchy)?, value(rival)?))
+                            })
+                            .collect();
                         Step {
                             x: f64::from(a),
-                            scratchy: at(Engine::Scratchy),
-                            rival: at(rival),
+                            scratchy: geometric_mean(both.iter().map(|&(s, _)| s)),
+                            rival: geometric_mean(both.iter().map(|&(_, r)| r)),
                             highlight: false,
                         }
                     })
@@ -1384,12 +1397,13 @@ fn mark(metric: Metric, cells: &[Option<&Cell>]) -> String {
     out
 }
 
-/// Why a cell has no ratio.
+/// Why a cell has no ratio: not measured, measured a server that had stopped answering, or never
+/// streamed.
 fn why(c: Option<&Cell>, name: &str) -> String {
-    if c.is_some() {
-        format!("{name}: {NO_STREAM}")
-    } else {
-        format!("no {name}")
+    match c {
+        None => format!("no {name}"),
+        Some(c) if c.dead => format!("{name}: {}", failed_note(Some(c))),
+        Some(_) => format!("{name}: {NO_STREAM}"),
     }
 }
 
@@ -1589,8 +1603,10 @@ fn history(entries: &[Entry]) -> Element {
                                     fmt(med(ladder, Scenario::Cold, Startup::Ready), 2),
                                     fmt(med(ladder, Scenario::Cold, Startup::FirstToken), 2),
                                     fmt(med(ladder, Scenario::Warm, Startup::FirstToken).map(|v| v * 1000.0), 0),
-                                    fmt(timing(one, Metric::Throughput), 1),
-                                    fmt(timing(many, Metric::Throughput), 1),
+                                    // Every cell's number through cfmt, so a dead or failed
+                                    // one carries its mark like the TPOT beside it.
+                                    cfmt(one, Metric::Throughput),
+                                    cfmt(many, Metric::Throughput),
                                     cfmt(many, Metric::Tpot),
                                 ];
                                 rsx! { for v in vals { TableCell { "{v}" } } }
@@ -2463,7 +2479,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::size_name;
+    use super::{DATA, Run, size_name, slug};
 
     #[test]
     fn a_models_name_gives_its_parameter_size() {
@@ -2477,10 +2493,11 @@ mod tests {
     /// glm-4.5-air and qwen3.6-35b-a3b cells of the M1 Max run in #472, and the M3 Pro's gemma
     /// 4096-token cells from the one its OOM struck in (#412), 4096x16, which still streamed a
     /// few tokens, on. Every engine that stops at EOS early (ollama, oMLX) keeps its numbers, and
-    /// so does scratchy's f378699e gemma cell at 16 users, live at 99% of its tokens.
+    /// so does scratchy's f378699e gemma cell at 16 users, live at 99% of its tokens. A marked
+    /// cell counts every request failed, says why, and shows no number.
     #[test]
     fn the_published_cells_of_a_dead_server_and_only_those_are_marked() {
-        use super::numbers::{Engine, Metric, timing};
+        use super::numbers::{DASH, Engine, FAILED, Metric, cfmt, failed, failed_note, partial};
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let site = crate::Site {
             root: root.to_path_buf(),
@@ -2488,27 +2505,113 @@ mod tests {
             out: root.join("_site"),
         };
         let runs = super::load(&site).expect("the published runs load");
-        let mut dead = std::collections::BTreeMap::<(String, &str, &str), usize>::new();
+        let mut dead = std::collections::BTreeMap::<(String, String, &str, &str), usize>::new();
         for r in &runs {
             for m in &r.models {
                 for e in Engine::ALL {
                     for c in e.cells(m).iter().filter(|c| c.dead) {
-                        assert_eq!(timing(Some(c), Metric::Throughput), None);
-                        let key = (r.repo.sha8().to_string(), m.stem.as_str(), e.key());
+                        let all = c.completed.unwrap_or(0) + c.failed.unwrap_or(0);
+                        assert_eq!(failed(Some(c)), all, "every request of a dead cell failed");
+                        assert!(failed_note(Some(c)).contains("stopped answering"));
+                        assert_eq!(cfmt(Some(c), Metric::Ttft), format!("{DASH}{FAILED}"));
+                        assert!(!partial(Some(c), Metric::Ttft));
+                        let machine = slug(r.machine.chip.as_str());
+                        let key = (machine, r.repo.sha8().to_string(), m.stem.as_str(), e.key());
                         *dead.entry(key).or_default() += 1;
                     }
                 }
             }
         }
         let want = [
-            ("649ebce2", "gemma-4-26b-a4b-it", "scratchy", 3),
-            ("c8860b1d", "glm-4.5-air", "scratchy", 22),
-            ("c8860b1d", "qwen3.6-35b-a3b", "scratchy", 10),
-            ("cc51e0d8", "gemma-4-26b-a4b-it", "scratchy", 3),
+            (
+                "apple-m3-pro",
+                "649ebce2",
+                "gemma-4-26b-a4b-it",
+                "scratchy",
+                3,
+            ),
+            ("apple-m1-max", "c8860b1d", "glm-4.5-air", "scratchy", 22),
+            (
+                "apple-m1-max",
+                "c8860b1d",
+                "qwen3.6-35b-a3b",
+                "scratchy",
+                10,
+            ),
+            (
+                "apple-m3-pro",
+                "cc51e0d8",
+                "gemma-4-26b-a4b-it",
+                "scratchy",
+                3,
+            ),
         ];
         let want: std::collections::BTreeMap<_, _> = (want.iter())
-            .map(|&(sha, stem, e, n)| ((sha.to_string(), stem, e), n))
+            .map(|&(mc, sha, stem, e, n)| ((mc.to_string(), sha.to_string(), stem, e), n))
             .collect();
         assert_eq!(dead, want);
+    }
+
+    /// A sparkline step compares the two engines on the rungs both measured. The M1 Max run in
+    /// #472 has glm-4.5-air's scratchy cells dead at 1024 and 4096 prompt tokens with 16-token
+    /// answers: averaged over each engine's own cells, scratchy read 1.86x oMLX TurboQuant's
+    /// throughput; on the one rung both have, it is 0.95x.
+    #[test]
+    fn a_sparkline_step_averages_only_the_rungs_both_engines_measured() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let file = root
+            .join(DATA)
+            .join("apple-m1-max-2026-10-14T191550Z-c8860b1d.json");
+        let mut run: Run =
+            serde_json::from_str(&std::fs::read_to_string(&file).expect("the M1 Max run"))
+                .expect("a run");
+        run.mark_dead();
+        let m = run
+            .models
+            .iter()
+            .find(|m| m.stem == "glm-4.5-air")
+            .expect("glm-4.5-air");
+        let (rival, steps) = super::Trend::AnswerDecode
+            .points(m, &run)
+            .expect("a sparkline");
+        assert_eq!(rival.key(), "omlx_tq");
+        let step = steps
+            .iter()
+            .find(|s| s.x == 16.0)
+            .expect("the 16-token step");
+        let ratio = step.scratchy.expect("scratchy") / step.rival.expect("the rival");
+        assert!(
+            (ratio - 0.95).abs() < 0.01,
+            "scratchy against oMLX TurboQuant: {ratio:.3}x"
+        );
+    }
+
+    /// A run whose bench counted aborted and errored requests itself (#510) keeps what it
+    /// recorded: its cells are never re-judged by their answer tokens, however few.
+    #[test]
+    fn a_run_that_counted_its_failures_is_not_re_judged() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let file = root
+            .join(DATA)
+            .join("apple-m3-pro-2026-10-13T010519Z-cc51e0d8.json");
+        let text = std::fs::read_to_string(&file).expect("the published M3 Pro run");
+        let mut json: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let judged = |json: &serde_json::Value| {
+            let mut run: Run = serde_json::from_value(json.clone()).expect("a run");
+            run.mark_dead();
+            let m = run
+                .models
+                .iter()
+                .find(|m| m.stem == "gemma-4-26b-a4b-it")
+                .expect("gemma");
+            m.scaling.iter().flatten().filter(|c| c.dead).count()
+        };
+        assert_eq!(
+            judged(&json),
+            3,
+            "an older run is judged by its answer tokens"
+        );
+        json["config"]["failures_counted"] = true.into();
+        assert_eq!(judged(&json), 0, "a run that counted its failures is not");
     }
 }
