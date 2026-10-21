@@ -4591,6 +4591,14 @@ fn emit_weights_struct(
                 pub metal_pool: ::std::sync::OnceLock<
                     ::scratchy_target_metal::interpreter::metal::MetalWorkerPool<Self>,
                 >,
+                /// The arena of the model whose forwards follow this one's on its command buffer
+                /// (its MTP head), which `metal_pool` holds in its own: set before the pool is
+                /// built (`ScratchyWeights::metal_host`), a fact of this model, not of the device
+                /// it shares with other models' pools.
+                #[cfg(feature = "metal")]
+                pub metal_guest: ::std::sync::OnceLock<
+                    ::scratchy_target_metal::interpreter::metal::GuestArena,
+                >,
             }
         },
         WeightsEmitMode::Shim { canonical } => quote! {
@@ -4676,6 +4684,8 @@ fn emit_weights_struct(
                     #rope_context_init
                     #[cfg(feature = "metal")]
                     metal_pool: ::std::sync::OnceLock::new(),
+                    #[cfg(feature = "metal")]
+                    metal_guest: ::std::sync::OnceLock::new(),
                 })
             }
 
@@ -4742,6 +4752,8 @@ fn emit_weights_struct(
                     #rope_context_init
                     #[cfg(feature = "metal")]
                     metal_pool: ::std::sync::OnceLock::new(),
+                    #[cfg(feature = "metal")]
+                    metal_guest: ::std::sync::OnceLock::new(),
                 })
             }
 
@@ -14761,7 +14773,8 @@ pub fn emit_model(
     // THE ARENA RANKS: the slots by size at their largest bucket, largest first, ties by slot —
     // the order in which another model whose forwards never overlap this one's shares its arena
     // (`ArenaRanks`): every slot as a guest, all but the buckets' final hidden states as a host.
-    let (metal_ranks_all, metal_ranks_hosting) = {
+    // `ArenaRanks::new` checks both against the hidden-states slots in the `static` they land in.
+    let (metal_ranks_all, metal_ranks_hosting, metal_ranks_hidden) = {
         let mut all: Vec<u32> = (0..metal_ladder_arena.len() as u32).collect();
         all.sort_by_key(|&slot| (std::cmp::Reverse(metal_ladder_arena[slot as usize]), slot));
         let hosting: Vec<u32> = (all.iter().copied())
@@ -14773,7 +14786,8 @@ pub fn emit_model(
                 .map(proc_macro2::Literal::u32_unsuffixed)
                 .collect()
         };
-        (lits(all), lits(hosting))
+        let hidden = metal_hidden_slots.iter().copied().collect();
+        (lits(all), lits(hosting), lits(hidden))
     };
 
     // Largest `num_tokens` across all buckets — drives runtime
@@ -15068,10 +15082,13 @@ pub fn emit_model(
                         <Weights as ::scratchy_forward_compiler::CanonicalParams>::NUM_GLOBAL_KV_HEADS,
                     ),
                 },
-                ranks: ::scratchy_target_metal::interpreter::metal::ArenaRanks {
-                    all: &[#(#metal_ranks_all),*],
-                    hosting: &[#(#metal_ranks_hosting),*],
-                },
+                // Checked as this static compiles: every slot ranked once, and no slot holding a
+                // bucket's final hidden states among the hosting ranks.
+                ranks: ::scratchy_target_metal::interpreter::metal::ArenaRanks::new(
+                    &[#(#metal_ranks_all),*],
+                    &[#(#metal_ranks_hosting),*],
+                    &[#(#metal_ranks_hidden),*],
+                ),
             };
 
         /// Largest `num_tokens` tape_index across [`METAL_BUCKETS`]. The
@@ -15184,7 +15201,7 @@ pub fn emit_model(
                 device,
                 weights,
                 allocator,
-                METAL_BUCKETS,
+                &METAL_RUNGS,
                 runtime_factory,
                 max_workers,
                 // Standalone factory: no device-budget context here, so keep
@@ -15194,11 +15211,9 @@ pub fn emit_model(
                 addressing,
                 // Nor the serving engine's batch: every bucket row's decode partials.
                 None,
-                METAL_RUNGS.ranks,
                 // Its arena is its own.
                 ::scratchy_target_metal::interpreter::metal::ArenaShare::Own,
-                // Its callers read the hidden states and the logits on the host.
-                ::scratchy_target_metal::interpreter::metal::HiddenReads::Host,
+                // Its callers read the logits on the host.
                 ::scratchy_target_metal::interpreter::metal::TerminalReads::Host,
             )
         }
@@ -15515,7 +15530,7 @@ pub fn emit_model(
                     device.device.clone(),
                     wm,
                     device.allocator.clone(),
-                    METAL_BUCKETS,
+                    &METAL_RUNGS,
                     factory,
                     1,
                     // Target-reactive cap stashed on the device by the worker
@@ -15529,13 +15544,14 @@ pub fn emit_model(
                     // The serving engine's batch, stashed by the worker: the decode split's
                     // partials are reserved for that many rows.
                     device.max_decode_rows,
-                    METAL_RUNGS.ranks,
                     // How its arena is shared with that of a model whose forwards never overlap
-                    // its own: an MTP target's holds its head's, a head's is its target's.
-                    device.share.clone(),
-                    // Whether its owner reads the hidden states (anything but an MTP head) and the
-                    // logits (a draft model's seed) on the host.
-                    device.hidden_reads,
+                    // its own: an MTP target holds its head's (a fact of the target, set before
+                    // its first forward), a head runs in its target's (its device's).
+                    ::scratchy_target_metal::interpreter::metal::ArenaShare::of(
+                        wm.metal_guest.get(),
+                        device.host.as_deref(),
+                    ),
+                    // Whether its owner reads the logits on the host (a draft model's seed).
                     device.terminal_reads,
                 )
                 .expect("MetalWorkerPool::for_buckets: pool init failed")
@@ -15840,15 +15856,14 @@ pub fn emit_model(
             num_tokens: u64,
             followup: ::core::option::Option<::scratchy_forward_compiler::MetalForwardFollowup<'_>>,
         ) -> crate::__gpu::OwnedTensor {
-            // A pool whose hidden states only the GPU reads keeps them sparse: the host cannot.
+            let pool = resident_metal_pool(wm, ctx, device);
+            // A guest's slots are its host's, which may be sparse: the host reads none of them.
             assert!(
                 ctx.hidden_out.is_none()
-                    || device.hidden_reads
-                        == ::scratchy_target_metal::interpreter::metal::HiddenReads::Host,
-                "a forward asked the host for hidden rows its device keeps on the GPU \
-                 (`HiddenReads::Gpu`, an MTP head's)"
+                    || pool.role() != ::scratchy_target_metal::interpreter::metal::ArenaRole::Guest,
+                "a forward asked the host for hidden rows of a pool that runs in another's arena \
+                 (an MTP head's)"
             );
-            let pool = resident_metal_pool(wm, ctx, device);
             let n = num_tokens as usize;
 
 
@@ -15998,29 +16013,6 @@ pub fn emit_model(
 
                 fn vocab(&self) -> u32 {
                     METAL_VOCAB_SIZE as u32
-                }
-
-                fn hidden_rows(&self, rows: &[u32]) -> ::std::vec::Vec<u8> {
-                    use ::scratchy_target_metal::interpreter::metal::__re::MTLBuffer as _;
-                    let spec = &METAL_BUCKETS[self.0.bucket_idx()];
-                    let row_bytes = <Weights as ::scratchy_forward_compiler::CanonicalParams>::HIDDEN_SIZE * 2;
-                    let hidden = self.0.worker().arena[spec.backbone_slot as usize].contents();
-                    let rows_held = spec.bucket_m as usize;
-                    rows.iter()
-                        .flat_map(|&row| {
-                            assert!((row as usize) < rows_held, "hidden row {row} past the bucket's {rows_held}");
-                            // SAFETY: the backbone slot holds `[bucket_m, HIDDEN_SIZE]` 2-byte rows,
-                            // and `row < bucket_m`; the command buffer that wrote them is done.
-                            unsafe {
-                                ::std::slice::from_raw_parts(
-                                    (hidden.as_ptr() as *const u8).add(row as usize * row_bytes),
-                                    row_bytes,
-                                )
-                            }
-                            .iter()
-                            .copied()
-                        })
-                        .collect()
                 }
             }
             let pool = resident_metal_pool(wm, ctx, device);

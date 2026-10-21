@@ -34,14 +34,11 @@ pub struct GpuDevice {
     /// partials are reserved for (`LoweredMetalTape::scratch_bytes`). `None`: a bucket's every
     /// row.
     pub max_decode_rows: Option<crate::tape::ids::DecodeRows>,
-    /// How the lazy `MetalWorkerPool::for_buckets` shares this device's pool's arena with that of
-    /// a model whose forwards never overlap its own: an MTP target's holds its head's, a head's is
-    /// its target's.
-    pub share: crate::interpreter::metal::ArenaShare,
-    /// Whether this device's owner reads its final hidden states on the host (anything but an MTP
-    /// head, whose chain reads them on the device), so the lazy `MetalWorkerPool::for_buckets`
-    /// keeps the backbone slots shared rather than sparse.
-    pub hidden_reads: crate::interpreter::metal::HiddenReads,
+    /// The arena of a pool whose forwards this device's follow on its command buffer, which the
+    /// lazy `MetalWorkerPool::for_buckets` builds this device's pool in (an MTP head's device: its
+    /// target's). A host holds its guest's arena as a fact of its model, not of the device it
+    /// shares with other models (`ScratchyWeights::metal_host`).
+    pub host: Option<Box<crate::interpreter::metal::HostArena>>,
     /// Whether this device's owner reads its logits on the host (a draft model's verify seed), so
     /// the lazy `MetalWorkerPool::for_buckets` keeps the terminal slots shared rather than sparse.
     pub terminal_reads: crate::interpreter::metal::TerminalReads,
@@ -59,8 +56,7 @@ impl GpuDevice {
             metal_bucket_max_m: None,
             kv_addressing: Default::default(),
             max_decode_rows: None,
-            share: Default::default(),
-            hidden_reads: Default::default(),
+            host: None,
             terminal_reads: Default::default(),
         }
     }

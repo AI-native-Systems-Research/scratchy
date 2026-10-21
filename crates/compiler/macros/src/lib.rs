@@ -2492,6 +2492,21 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
+    // Per-variant: make each model's resident pool hold a guest's arena, before it is built.
+    let metal_host_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            quote! {
+                Weights::#variant_ident(w) => ::scratchy_target_metal::interpreter::metal::host_guest(
+                    &w.metal_pool,
+                    &w.metal_guest,
+                    guest,
+                ),
+            }
+        })
+        .collect();
+
     // Per-variant `METAL_RUNGS` reads: each model's baked tape rungs.
     let metal_rungs_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
@@ -3187,6 +3202,16 @@ fn emit_arch_dispatcher(
             fn metal_hosted(&self) -> ::core::option::Option<::std::boxed::Box<dyn ::core::any::Any>> {
                 match self {
                     #(#metal_hosted_arms)*
+                }
+            }
+
+            #[cfg(feature = "metal")]
+            fn metal_host(
+                &self,
+                guest: ::std::boxed::Box<dyn ::core::any::Any>,
+            ) -> ::core::result::Result<(), ::std::string::String> {
+                match self {
+                    #(#metal_host_arms)*
                 }
             }
 

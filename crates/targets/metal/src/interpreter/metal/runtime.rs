@@ -56,8 +56,8 @@ pub struct TqScratch {
     pub v_table: Buffer,
     pub k_data: Buffer,
     pub v_data: Buffer,
-    /// The bytes of each of K and V, and of one chunk the tables address: the geometry a borrower
-    /// must match.
+    /// The bytes of each of K and V, and of one chunk the tables address: the geometry a guest
+    /// staging through it must match.
     pub bytes: usize,
     pub chunk_bytes: usize,
 }

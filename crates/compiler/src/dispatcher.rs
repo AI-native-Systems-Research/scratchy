@@ -369,6 +369,14 @@ pub trait ScratchyWeights: Send + Sync {
     #[cfg(feature = "metal")]
     fn metal_hosted(&self) -> Option<Box<dyn core::any::Any>>;
 
+    /// Make this model's resident pool hold a guest's arena: `guest` a
+    /// `scratchy_target_metal::interpreter::metal::GuestArena` typed `Any` (as
+    /// [`Self::metal_rungs`]), what a model whose forwards follow this one's on its command buffer
+    /// (an MTP head) needs of it. Set once, before the pool is built at this model's first forward;
+    /// refused once the pool exists — it was sized without the guest.
+    #[cfg(feature = "metal")]
+    fn metal_host(&self, guest: Box<dyn core::any::Any>) -> Result<(), String>;
+
     /// The model's `CanonicalParams::METAL_DTYPE`, so the worker can size
     /// its KV cache without monomorphizing on `W`.
     #[cfg(feature = "metal")]
@@ -496,9 +504,6 @@ pub trait MetalForwardOnto {
 
     /// The logits' row width.
     fn vocab(&self) -> u32;
-
-    /// Rows `rows` of the final (post-norm) hidden states, as bytes.
-    fn hidden_rows(&self, rows: &[u32]) -> Vec<u8>;
 }
 
 /// Non-generic view of the macro-emitted MetalWorker for the

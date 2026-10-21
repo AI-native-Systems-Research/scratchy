@@ -34,14 +34,15 @@ use super::lowered::{LoweredMetalTape, ModelSources};
 use super::pipelines::SpecializedPipelines;
 use super::runtime::{InputWrite, InputWrites, Padding, RuntimeBindings};
 use super::worker::{
-    ArenaLayout, ArenaRanks, ArenaShare, GuestArena, HiddenReads, HostArena, MetalWorker,
-    ResolvedSources, SparsePlan, TerminalReads, WorkerError, hosted_layout,
+    ArenaLayout, ArenaRanks, ArenaRole, ArenaShare, GuestArena, HostArena, Hosting, MetalWorker,
+    ResolvedSources, Slot, SparsePlan, TerminalReads, WorkerError,
 };
 use crate::MetalAllocator;
 use crate::tape::constants::TapeVariant;
 use crate::tape::ids::{
     DecodeRows, HeadDim, MaxBlocksPerSeq, NumKvHeads, NumQHeads, TqDecodeHeads,
 };
+use crate::tape::lowered::PerScratch;
 use crate::tape::lowered::{ClassedTape, KvAddressing};
 use objc2::runtime::ProtocolObject;
 use scratchy_ir::{CanonicalParams, Instruction};
@@ -150,6 +151,9 @@ pub enum PoolBuildError {
     /// The device's IO-registry entry has no GPU core count
     /// ([`crate::device::gpu_cores`]), which the TurboQuant decode tapes need.
     UnknownGpuCores,
+    /// A guest of another pool's arena was asked to keep its logits for the host, which reads
+    /// none of a guest's slots: they may be its host's sparse buffers.
+    GuestReadsLogits,
 }
 
 impl std::fmt::Display for PoolBuildError {
@@ -175,6 +179,10 @@ impl std::fmt::Display for PoolBuildError {
             ),
             Self::Worker(e) => write!(f, "MetalWorkerPool::for_buckets: {e}"),
             Self::NoBuckets => write!(f, "MetalWorkerPool::for_buckets: bucket_specs is empty"),
+            Self::GuestReadsLogits => f.write_str(
+                "MetalWorkerPool::for_buckets: a guest of another pool's arena cannot keep its \
+                 logits for the host",
+            ),
             Self::UnknownGpuCores => write!(
                 f,
                 "MetalWorkerPool::for_buckets: the device's IO-registry entry has no gpu-core-count"
@@ -339,6 +347,8 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     cv: Condvar,
     /// What the first worker shares with the pool's guest ([`Self::hosted`]).
     hosting: HostArena,
+    /// What the pool is to the arena it runs in ([`Self::role`]).
+    role: ArenaRole,
 }
 
 /// Pool-owned MTL4 surface. The command buffer is re-created per forward
@@ -465,17 +475,16 @@ impl PickedRung<'_> {
 }
 
 impl PickedRung<'_> {
-    /// The bytes of each scratch buffer a worker allocates for these tapes (split-K, MoE, roped K,
-    /// hd512 unfused): the largest any tape needs, the decode split's partials for at most
-    /// `decode_rows` rows.
-    pub fn scratch_sizes(&self, decode_rows: Option<DecodeRows>) -> [u64; 4] {
+    /// The bytes of each scratch buffer a worker allocates for these tapes: the largest any tape
+    /// needs of its kind, the decode split's partials for at most `decode_rows` rows.
+    pub fn scratch_sizes(&self, decode_rows: Option<DecodeRows>) -> PerScratch<u64> {
         let tapes = || (self.tapes.iter()).map(|(_, rung)| rung.tape.scratch_bytes(decode_rows));
-        std::array::from_fn(|i| tapes().map(|s| u64::from(s[i])).max().unwrap_or(0))
+        PerScratch::from_fn(|kind| tapes().map(|s| u64::from(s[kind])).max().unwrap_or(0))
     }
 
     /// The bytes of the scratch buffers a worker allocates for these tapes.
     pub fn scratch_bytes(&self, decode_rows: Option<DecodeRows>) -> u64 {
-        self.scratch_sizes(decode_rows).iter().sum()
+        self.scratch_sizes(decode_rows).iter().map(|(_, b)| b).sum()
     }
 
     /// The worker's arena: sized for the largest activation across every bucket, AND for the
@@ -504,60 +513,51 @@ impl PickedRung<'_> {
     }
 
     /// The slots the host reads by pointer, which stay allocated in full and shared: each kept
-    /// bucket's final hidden states where it reads those ([`HiddenReads`]), and its logits where
-    /// it reads those ([`TerminalReads`]).
-    pub fn host_slots(&self, hidden: HiddenReads, terminal: TerminalReads) -> Vec<u32> {
+    /// bucket's final hidden states, and its logits where the host reads those
+    /// ([`TerminalReads`]). A guest's ([`ArenaShare::In`]): none — the slots it takes are its
+    /// host's, which may be sparse.
+    pub fn host_slots(&self, share: &ArenaShare, terminal: TerminalReads) -> Vec<u32> {
+        if share.role() == ArenaRole::Guest {
+            return Vec::new();
+        }
         (self.tapes.iter())
             .flat_map(|(spec, _)| {
-                let hidden = (hidden == HiddenReads::Host).then_some(spec.backbone_slot);
                 let logits = (terminal == TerminalReads::Host).then_some(spec.terminal_slot);
-                [hidden, logits]
+                [Some(spec.backbone_slot), logits]
             })
             .flatten()
             .collect()
     }
 
-    /// What this rung needs of its host's arena as a guest, its host reading what `hidden` and
-    /// `terminal` say: each slot's bytes rank by rank, the ranks the host reads, its scratch by
-    /// kind, the decode split's partials for at most `decode_rows` rows.
-    pub fn guest(
-        &self,
-        decode_rows: Option<DecodeRows>,
-        hidden: HiddenReads,
-        terminal: TerminalReads,
-    ) -> GuestArena {
+    /// What this rung needs of its host's arena as a guest: each slot's bytes rank by rank, its
+    /// scratch by kind, the decode split's partials for at most `decode_rows` rows.
+    pub fn guest(&self, decode_rows: Option<DecodeRows>) -> GuestArena {
         let layout = self.arena_layout();
-        let read = self.host_slots(hidden, terminal);
         let slots = self.ranks.guest_slots(layout.len());
         GuestArena {
-            arena: slots.iter().map(|&slot| layout[slot]).collect(),
-            host_read: (slots.iter().enumerate())
-                .filter(|(_, slot)| read.contains(&(**slot as u32)))
-                .map(|(rank, _)| rank)
-                .collect(),
+            arena: slots.iter().map(|(_, &Slot(slot))| layout[slot]).collect(),
             scratch: self.scratch_sizes(decode_rows),
         }
     }
 
-    /// The bytes this rung's arena grows by to hold `guest`'s ([`hosted_layout`]): what its pool
+    /// The bytes this rung's arena grows by to hold `guest`'s ([`Hosting`]): what its pool
     /// allocates for the guest, which the memory budget prices.
     pub fn hosting_arena_bytes(&self, guest: &GuestArena) -> u64 {
         let own = self.arena_layout();
-        let hosted = hosted_layout(&own, &self.ranks, guest);
+        let hosted = Hosting::of(&own, &self.ranks, guest).layout;
         hosted.iter().sum::<u64>() - own.iter().sum::<u64>()
     }
 
     /// The bytes this rung's scratch grows by to hold `guest`'s, kind by kind
-    /// ([`super::worker::hosted_scratch`]), the decode split's partials for at most `decode_rows`
-    /// rows.
+    /// ([`Hosting::scratch`]), the decode split's partials for at most `decode_rows` rows.
     pub fn hosting_scratch_bytes(
         &self,
         decode_rows: Option<DecodeRows>,
         guest: &GuestArena,
     ) -> u64 {
         let own = self.scratch_sizes(decode_rows);
-        let hosted = super::worker::hosted_scratch(own, guest);
-        hosted.iter().sum::<u64>() - own.iter().sum::<u64>()
+        let sum = |s: PerScratch<u64>| s.iter().map(|(_, b)| b).sum::<u64>();
+        sum(Hosting::scratch(own, guest)) - sum(own)
     }
 }
 
@@ -571,15 +571,18 @@ impl PickedRung<'_> {
 /// less any whose tape cannot exist at the rung (its scratch outgrows the 32-bit offsets its
 /// kernels bind: no such rung was baked). Longer prompts chunk to the largest kept bucket via
 /// `pick_bucket`.
-pub fn pick_rung<'a>(
+pub fn pick_rung(
     device: &ProtocolObject<dyn MTLDevice>,
-    bucket_specs: &'a [MetalBucketSpec],
-    ranks: ArenaRanks,
-    tq: TqGroup,
+    rungs: &MetalRungs,
     max_bucket_m: Option<u32>,
     block_cap: usize,
     addressing: KvAddressing,
-) -> Result<PickedRung<'a>, PoolBuildError> {
+) -> Result<PickedRung<'static>, PoolBuildError> {
+    let MetalRungs {
+        buckets: bucket_specs,
+        tq,
+        ranks,
+    } = *rungs;
     let smallest = bucket_specs
         .iter()
         .min_by_key(|s| s.bucket_m)
@@ -630,6 +633,25 @@ pub fn pick_rung<'a>(
     })
 }
 
+/// Make the pool built into `pool` hold `guest`'s arena too (`ScratchyWeights::metal_host`, typed
+/// there as `Any`: the trait cannot name this crate): set once, into `slot`, before the pool is
+/// built. A pool already built was sized without the guest, and refuses it at load rather than at
+/// the guest's first forward.
+pub fn host_guest<W: CanonicalParams>(
+    pool: &std::sync::OnceLock<MetalWorkerPool<W>>,
+    slot: &std::sync::OnceLock<GuestArena>,
+    guest: Box<dyn std::any::Any>,
+) -> Result<(), String> {
+    let guest = guest
+        .downcast::<GuestArena>()
+        .map_err(|_| "metal_host: the guest is not a GuestArena (stale build)".to_string())?;
+    if pool.get().is_some() {
+        return Err("metal_host: the pool is built, sized without its guest".into());
+    }
+    slot.set(*guest)
+        .map_err(|_| "metal_host: the pool already holds a guest".into())
+}
+
 impl MetalRungs {
     /// The rungs `ScratchyWeights::metal_rungs` hands out (typed there as `Any`: the trait cannot
     /// name this crate).
@@ -647,15 +669,7 @@ impl MetalRungs {
         block_cap: usize,
         addressing: KvAddressing,
     ) -> Result<PickedRung<'static>, PoolBuildError> {
-        pick_rung(
-            device,
-            self.buckets,
-            self.ranks,
-            self.tq,
-            max_bucket_m,
-            block_cap,
-            addressing,
-        )
+        pick_rung(device, self, max_bucket_m, block_cap, addressing)
     }
 }
 
@@ -723,18 +737,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }),
             cv: Condvar::new(),
             hosting: HostArena::default(),
+            role: share.role(),
         };
         let first = pool.spawn_worker(&share, &ranks)?;
-        // A host shares the slot each guest rank takes; a pool hosting none, none.
-        let guest_ranks = match &share {
-            ArenaShare::Hosts(guest) => guest.arena.len(),
-            ArenaShare::Own | ArenaShare::In(_) => 0,
-        };
-        let slots = ranks.hosting_slots(pool.arena_layout.len(), guest_ranks);
         pool.hosting = HostArena {
             tq_scratch: first.runtime.tq.as_ref().map(|t| t.scratch.clone()),
             tq: first.runtime.tq.clone(),
-            ..first.worker.hosted(&slots)
+            ..first.worker.hosted()
         };
         {
             let mut inner = pool.inner.lock().unwrap();
@@ -759,7 +768,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         device: Arc<Device>,
         weights: &W,
         allocator: Arc<MetalAllocator>,
-        bucket_specs: &[MetalBucketSpec],
+        // The model's buckets and arena ranks, one model's both.
+        rungs: &MetalRungs,
         runtime_factory: RuntimeFactory,
         max_workers: usize,
         max_bucket_m: Option<u32>,
@@ -770,35 +780,24 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         addressing: KvAddressing,
         // The most rows a decode or verify step brings (`GpuDevice::max_decode_rows`).
         decode_rows: Option<DecodeRows>,
-        // The model's arena ranks, and how its arena is shared with that of a model whose
-        // forwards never overlap its own ([`ArenaShare`]).
-        ranks: ArenaRanks,
+        // How its arena is shared with that of a model whose forwards never overlap its own
+        // ([`ArenaShare`]).
         share: ArenaShare,
-        // Whether the host reads the final hidden states and the logits by pointer, so those slots
-        // stay shared.
-        hidden: HiddenReads,
+        // Whether the host reads the logits by pointer, so the terminal slots stay shared. A
+        // guest's host reads none of its slots.
         terminal: TerminalReads,
     ) -> Result<Self, PoolBuildError>
     where
         W: ModelSources,
     {
-        let tq = TqGroup {
-            head_dim: HeadDim(W::GLOBAL_HEAD_DIM),
-            q_heads: NumQHeads(W::NUM_Q_HEADS),
-            kv_heads: NumKvHeads(W::NUM_GLOBAL_KV_HEADS),
-        };
-        let rung = pick_rung(
-            &device,
-            bucket_specs,
-            ranks,
-            tq,
-            max_bucket_m,
-            block_cap,
-            addressing,
-        )?;
+        if share.role() == ArenaRole::Guest && terminal == TerminalReads::Host {
+            return Err(PoolBuildError::GuestReadsLogits);
+        }
+        let rung = pick_rung(&device, rungs, max_bucket_m, block_cap, addressing)?;
         let variant = rung.variant();
         let arena_layout = rung.arena_layout();
-        let host_slots = rung.host_slots(hidden, terminal);
+        let host_slots = rung.host_slots(&share, terminal);
+        let ranks = rung.ranks;
         let picked = rung.tapes;
 
         let cache = SpecializedPipelineCache::new((*device).clone(), &[])
@@ -883,7 +882,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             if inner.total_created < self.max_workers {
                 inner.total_created += 1;
                 drop(inner);
-                match self.spawn_worker(&ArenaShare::Own, &ArenaRanks::default()) {
+                match self.spawn_worker(&ArenaShare::Own, &ArenaRanks::NONE) {
                     Ok(pooled) => {
                         return Ok(WorkerGuard {
                             pool: self,
@@ -923,7 +922,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         if inner.total_created < self.max_workers {
             inner.total_created += 1;
             drop(inner);
-            match self.spawn_worker(&ArenaShare::Own, &ArenaRanks::default()) {
+            match self.spawn_worker(&ArenaShare::Own, &ArenaRanks::NONE) {
                 Ok(pooled) => Some(Ok(WorkerGuard {
                     pool: self,
                     inner: Some(pooled),
@@ -1592,6 +1591,11 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         self.hosting.clone()
     }
 
+    /// What the pool is to the arena it runs in: a guest's host reads none of its slots.
+    pub fn role(&self) -> ArenaRole {
+        self.role
+    }
+
     fn checkin(&self, pooled: PooledWorker<W>) {
         let mut inner = self.inner.lock().unwrap();
         inner.available.push(pooled);
@@ -1731,7 +1735,7 @@ impl<W: CanonicalParams> Onto<'_, W> {
         staging.retired.extend(replaced);
         self.staged = at + writes.staged.len();
         // After everything on the encoder so far: it wrote what the device inputs read, and may
-        // read this worker's runtime inputs or share its activation (an arena lent to it).
+        // read this worker's runtime inputs or run in its arena (a guest's).
         let all = MTLStages::Dispatch | MTLStages::Blit;
         enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
             all,
@@ -2455,7 +2459,7 @@ mod tests {
             max,
             None,
             ArenaShare::Own,
-            ArenaRanks::default(),
+            ArenaRanks::NONE,
             None,
         )
         .expect("pool builds");
@@ -2701,7 +2705,7 @@ mod tests {
             max_workers,
             None,
             ArenaShare::Own,
-            ArenaRanks::default(),
+            ArenaRanks::NONE,
             None,
         )
         .expect("pool builds");
@@ -3377,6 +3381,19 @@ mod tests {
     // are empty here so the barrier slices are empty too.
     const EMPTY_BARRIERS: &[bool] = &[];
 
+    /// `specs` as one model's rungs, ranked `ranks` (leaked: a pool's rungs are `'static`).
+    fn test_rungs(specs: &[MetalBucketSpec], ranks: ArenaRanks) -> &'static MetalRungs {
+        Box::leak(Box::new(MetalRungs {
+            buckets: Box::leak(specs.to_vec().into_boxed_slice()),
+            tq: TqGroup {
+                head_dim: HeadDim(TestWeights::GLOBAL_HEAD_DIM),
+                q_heads: NumQHeads(TestWeights::NUM_Q_HEADS),
+                kv_heads: NumKvHeads(TestWeights::NUM_GLOBAL_KV_HEADS),
+            },
+            ranks,
+        }))
+    }
+
     fn build_via_for_buckets(
         bucket_specs: &[MetalBucketSpec],
         max_workers: usize,
@@ -3389,16 +3406,14 @@ mod tests {
             device,
             &weights,
             allocator,
-            bucket_specs,
+            test_rungs(bucket_specs, ArenaRanks::NONE),
             runtime_factory,
             max_workers,
             None,
             128, // block_cap (test default — matches the legacy MAX_BLOCKS_PER_SEQ)
             KvAddressing::Direct,
             None,
-            ArenaRanks::default(),
             ArenaShare::Own,
-            HiddenReads::Host,
             TerminalReads::Gpu,
         ))
     }
@@ -3424,16 +3439,14 @@ mod tests {
             device,
             &weights,
             allocator,
-            &[],
+            test_rungs(&[], ArenaRanks::NONE),
             runtime_factory,
             1,
             None,
             128, // block_cap (unused — NoBuckets fires first)
             KvAddressing::Direct,
             None,
-            ArenaRanks::default(),
             ArenaShare::Own,
-            HiddenReads::Host,
             TerminalReads::Gpu,
         );
         match res {
@@ -3554,5 +3567,95 @@ mod tests {
             pool.pick_bucket(9),
             Err(ForwardError::NoBucketFits { .. })
         ));
+    }
+
+    /// A host pool built to hold its guest allocates what the budget prices for it
+    /// (`PickedRung::hosting_arena_bytes`), and a guest pool built in what it shares runs in the
+    /// host's buffers rank by rank, never in the host's hidden states; a guest keeps no logits for
+    /// the host.
+    #[test]
+    fn a_guest_pool_runs_in_its_host_pools_arena() {
+        use crate::interpreter::metal::__re::MTLBuffer as _;
+        let Some(device) = crate::detect_device().filter(|_| crate::metal4_available()) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = Arc::new(device.device.clone());
+        const K: u64 = 1024;
+        // Whole sparse tiles, so the buffers' lengths are the bytes asked for.
+        static HOST_ARENA: [u64; 3] = [256 * K, 64 * K, 128 * K];
+        static GUEST_ARENA: [u64; 3] = [64 * K, 128 * K, 512 * K];
+        let spec = |arena: &'static [u64], backbone_slot| MetalBucketSpec {
+            bucket_m: 1,
+            num_arena_slots: 3,
+            terminal_slot: 1,
+            backbone_slot,
+            arena_bytes: arena,
+            backbone: EMPTY_BACKBONE,
+            lm_head: EMPTY_LM_HEAD,
+            backbone_barriers: EMPTY_BARRIERS,
+            lm_head_barriers: EMPTY_BARRIERS,
+            tapes: test_empty_tapes(1, 3),
+            kernels: &[],
+        };
+        let host = test_rungs(
+            &[spec(&HOST_ARENA, 2)],
+            ArenaRanks::new(&[0, 2, 1], &[0, 1], &[2]),
+        );
+        let guest = test_rungs(
+            &[spec(&GUEST_ARENA, 0)],
+            ArenaRanks::new(&[2, 1, 0], &[2, 1], &[0]),
+        );
+        let pick = |rungs: &MetalRungs| {
+            (rungs.pick(&device, None, 128, KvAddressing::Direct)).expect("a test rung")
+        };
+        let needs = pick(guest).guest(None);
+        let priced = pick(host).hosting_arena_bytes(&needs);
+        let (weights, allocator) = build_test_weights(&device);
+        let build = |rungs, share, terminal| {
+            let factory = RuntimeFactory::new(|d, _| empty_runtime(d, 1));
+            MetalWorkerPool::<TestWeights>::for_buckets(
+                device.clone(),
+                &weights,
+                allocator.clone(),
+                rungs,
+                factory,
+                1,
+                None,
+                128,
+                KvAddressing::Direct,
+                None,
+                share,
+                terminal,
+            )
+        };
+        let host_pool = build(host, ArenaShare::Hosts(needs), TerminalReads::Gpu)
+            .expect("the host pool builds");
+        assert_eq!(host_pool.role(), ArenaRole::Host);
+        let host_worker = host_pool.checkout().expect("a host worker");
+        let allocated: u64 = (host_worker.worker.arena.iter())
+            .map(|b| b.length() as u64)
+            .sum();
+        assert_eq!(allocated, HOST_ARENA.iter().sum::<u64>() + priced);
+
+        let shared = || ArenaShare::In(Box::new(host_pool.hosted()));
+        let guest_pool = build(guest, shared(), TerminalReads::Gpu).expect("the guest pool builds");
+        assert_eq!(guest_pool.role(), ArenaRole::Guest);
+        let guest_worker = guest_pool.checkout().expect("a guest worker");
+        let at = |arena: &[Buffer], slot: usize| arena[slot].gpuAddress();
+        let (h, g) = (&host_worker.worker.arena, &guest_worker.worker.arena);
+        assert_eq!(at(g, 2), at(h, 0), "rank 0");
+        assert_eq!(at(g, 1), at(h, 1), "rank 1");
+        assert_eq!(at(g, 0), at(h, 3), "rank 2, past the host's hosting slots");
+        assert!(
+            (0..3).all(|slot| at(g, slot) != at(h, 2)),
+            "the host's hidden states"
+        );
+
+        let refused = build(guest, shared(), TerminalReads::Host).err();
+        assert!(
+            matches!(refused, Some(PoolBuildError::GuestReadsLogits)),
+            "{refused:?}"
+        );
     }
 }
