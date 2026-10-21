@@ -10,6 +10,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::tape::quantized::QmvWideTile;
+
 /// Apple Silicon architecture generation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AppleSiliconGen {
@@ -132,20 +134,22 @@ pub fn is_nax_capable(g: AppleSiliconGen) -> bool {
     matches!(g, AppleSiliconGen::M5)
 }
 
-/// Returns `true` when the small-M `qmv_wide` band beats the plain qmv kernels
-/// for MLX-affine weights — MLX's `use_qmv_wide` gate
-/// (`quantized.cpp:537`): `mode != "affine" || arch_gen >= 15`. Gen 15 is the
-/// M3 (M4 is 16, M5 is 17 — see [`is_nax_capable`]), so M3 and later take the
-/// wide band; MLX's own comment: "affine qmv_wide only beats qmv on gen-15+".
+/// The small-M `qmv_wide` band a generation decodes its m ≥ 2 MLX-affine matvecs on, at its
+/// vector tile; `None` where the band loses to the plain qmv kernels. MLX's `use_qmv_wide` gate
+/// (`quantized.cpp:537`): `mode != "affine" || arch_gen >= 15`. Gen 15 is the M3 (M4 is 16, M5
+/// is 17 — see [`is_nax_capable`]), so M3 and later take the band; MLX's own comment: "affine
+/// qmv_wide only beats qmv on gen-15+". The M3 and M4 keep MLX's tile; the M5 takes an 8-row
+/// bucket in one ([`QmvWideTile::ROWS_8`], measured there).
 ///
 /// M2 (gen 14) is inside [`GenClass::Mid`](crate::tape::lowered::GenClass),
 /// whose tapes bake against an M4 profile — so an M2 device runs the wide
 /// kernel where MLX would not, the one place this gate and MLX's disagree.
-pub fn affine_qmv_wide_ok(g: AppleSiliconGen) -> bool {
-    matches!(
-        g,
-        AppleSiliconGen::M3 | AppleSiliconGen::M4 | AppleSiliconGen::M5
-    )
+pub fn affine_qmv_wide_band(g: AppleSiliconGen) -> Option<QmvWideTile> {
+    match g {
+        AppleSiliconGen::M1 | AppleSiliconGen::M2 => None,
+        AppleSiliconGen::M3 | AppleSiliconGen::M4 => Some(QmvWideTile::MLX),
+        AppleSiliconGen::M5 => Some(QmvWideTile::ROWS_8),
+    }
 }
 
 /// Returns `true` when the GPU's bf16 simdgroup MMA path is slow
@@ -181,17 +185,17 @@ mod tests {
     }
 
     /// The wide band's boundary is MLX's `arch_gen >= 15`: every generation from
-    /// the M3 on, not the NAX boundary two generations later.
+    /// the M3 on, not the NAX boundary two generations later; the M5's tile is the one measured.
     #[test]
-    fn affine_qmv_wide_ok_follows_arch_gen_15() {
-        for (g, wide) in [
-            (AppleSiliconGen::M1, false),
-            (AppleSiliconGen::M2, false),
-            (AppleSiliconGen::M3, true),
-            (AppleSiliconGen::M4, true),
-            (AppleSiliconGen::M5, true),
+    fn affine_qmv_wide_band_follows_arch_gen_15() {
+        for (g, band) in [
+            (AppleSiliconGen::M1, None),
+            (AppleSiliconGen::M2, None),
+            (AppleSiliconGen::M3, Some(QmvWideTile::MLX)),
+            (AppleSiliconGen::M4, Some(QmvWideTile::MLX)),
+            (AppleSiliconGen::M5, Some(QmvWideTile::ROWS_8)),
         ] {
-            assert_eq!(affine_qmv_wide_ok(g), wide, "{g:?}");
+            assert_eq!(affine_qmv_wide_band(g), band, "{g:?}");
         }
     }
 }

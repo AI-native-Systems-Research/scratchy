@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The affine matvec at 1-4 rows, plain and normalizing its input on load (`QmvEnds::norm`), at
-//! decode shapes of Qwen3.6-35B-A3B (4-bit) and GLM-4.5-Air (3-bit). This is the sweep
-//! `ModelFoldFacts::matvec_norms` (the norm folds on the one-row bucket alone) was measured on:
-//! base M5, the plain wide matvec at 3-4 rows costs what one row costs, while normalizing on load
-//! makes it ALU-bound (Qwen3.6's 248k-row lm_head at 4 rows 2137 vs 3302 µs; one row 2131 vs
-//! 2134). Rerun it on a new chip before moving the fold. Each cell is µs a dispatch over one
+//! The affine matvec at 1, 2, 4 and 8 rows, plain and normalizing its input on load
+//! (`QmvEnds::norm`), at decode shapes of Qwen3.6-35B-A3B (4-bit) and GLM-4.5-Air (3-bit). This is
+//! the sweep `ModelFoldFacts::matvec_norms` (the norm folds on the one-row bucket alone) and
+//! `QmvWideTile::ROWS_8` were measured on: base M5, the plain wide matvec at 3-4 rows costs what
+//! one row costs, while normalizing on load makes it ALU-bound (Qwen3.6's 248k-row lm_head at 4
+//! rows 2137 vs 3302 µs; one row 2131 vs 2134); at 8 rows it turns ALU-bound plain too (lm_head
+//! ~2×), one 8-vector tile (`8p`) 0–13% under MLX's two of 4 (`8mlxp`), and the matmul the band
+//! hands larger buckets to (`8mm`, `8sk` split-K without its reduce) over twice the matvec. Rerun
+//! it on a new chip before moving the fold or the tile. Each cell is µs a dispatch over one
 //! command buffer of `ITERS` dispatches a barrier apart, the weights rotated over copies past the
 //! system cache, best of 3.
 //!
@@ -26,8 +29,9 @@ use scratchy_target_metal::tape::kernel_constants::{
     AffineCodes, AffineQmvConstants, AffineQmvWideConstants,
 };
 use scratchy_target_metal::tape::quantized::{
-    DequantDtype, QmvKernel, ScaleDtype, pick_qmv_kernel, pick_qmv_kernel_wide, qmv_dispatch_shape,
-    qmv_kernel_static_name,
+    DequantDtype, QmmTKernel, QmvKernel, QmvWideTile, ScaleDtype, pick_qmm_t_kernel,
+    pick_qmv_kernel, pick_qmv_kernel_wide, qmm_t_dispatch_shape, qmm_t_kernel_static_name,
+    qmv_dispatch_shape, qmv_kernel_static_name,
 };
 use scratchy_target_metal::tape::step::{Eps, GainOffset, QmvEnds, RowNorm};
 
@@ -52,10 +56,15 @@ const fn shape(name: &'static str, n: u32, k: u32, bits: u32) -> Shape {
     Shape { name, n, k, bits }
 }
 
+/// The rows each shape is timed at: the decode buckets up to 8 sequences.
+const ROWS: [u32; 4] = [1, 2, 4, 8];
+
 const SHAPES: &[Shape] = &[
     shape("qwen3.6 lm_head", 248320, 2048, 4),
     shape("qwen3.6 gdn in_proj", 12288, 2048, 4),
     shape("qwen3.6 q+gate", 8192, 2048, 4),
+    shape("qwen3.6 gdn out_proj", 2048, 4096, 4),
+    shape("qwen3.6 k / v", 512, 2048, 4),
     shape("glm lm_head", 151552, 4096, 3),
     shape("glm q_proj", 12288, 4096, 3),
 ];
@@ -91,7 +100,8 @@ fn qmv_rows_plain_and_normalizing_on_load() {
         }),
         ..QmvEnds::default()
     };
-    println!("µs a dispatch: rows 1-4, plain (p) and normalizing on load (n)");
+    println!("µs a dispatch: rows {ROWS:?}, plain (p) and normalizing on load (n)");
+    let max_rows = *ROWS.iter().max().expect("rows") as usize;
     for s in SHAPES {
         let (n, k) = (s.n as usize, s.k as usize);
         let bytes = n * k * s.bits as usize / 8;
@@ -109,16 +119,30 @@ fn qmv_rows_plain_and_normalizing_on_load() {
                 )
             })
             .collect();
-        let x = shared_slice(&device, &bf16_row(4 * k, 0.5));
+        let x = shared_slice(&device, &bf16_row(max_rows * k, 0.5));
         let gain = shared_slice(&device, &bf16_row(k, 0.1));
-        let y = shared_zeroed(&device, 4 * n * 2);
+        let y = shared_zeroed(&device, max_rows * n * 2);
         let mut line = format!("{:<20}", s.name);
-        for m in 1..=4u32 {
+        // Each row count at the M5's pick, then the most rows again at MLX's tile (`mlx`, two
+        // tiles of 4 at 8 rows, each streaming the matrix): what `QmvWideTile::ROWS_8` saves.
+        let picked = ROWS.map(|m| {
+            let kernel = match m {
+                1 => pick_qmv_kernel(s.n, s.k, s.bits),
+                _ => pick_qmv_kernel_wide(s.n, s.k, s.bits, m, Some(QmvWideTile::ROWS_8)),
+            };
+            (m, kernel, String::new())
+        });
+        let mlx_tile = {
+            let rows = max_rows as u32;
+            let tile = Some(QmvWideTile::MLX);
+            (
+                rows,
+                pick_qmv_kernel_wide(s.n, s.k, s.bits, rows, tile),
+                "mlx".to_string(),
+            )
+        };
+        for (m, kernel, label) in picked.into_iter().chain([mlx_tile]) {
             for ends in [QmvEnds::default(), normed] {
-                let kernel = match m {
-                    1 => pick_qmv_kernel(s.n, s.k, s.bits),
-                    _ => pick_qmv_kernel_wide(s.n, s.k, s.bits, m, true),
-                };
                 let name = qmv_kernel_static_name(
                     kernel,
                     DequantDtype::Bf16,
@@ -170,8 +194,58 @@ fn qmv_rows_plain_and_normalizing_on_load() {
                 time();
                 let best = (0..3).map(|_| time()).fold(f64::MAX, f64::min);
                 let tag = if ends.norm.is_some() { 'n' } else { 'p' };
-                line += &format!("  {m}{tag} {best:7.1}");
+                line += &format!("  {m}{label}{tag} {best:7.1}");
             }
+        }
+        // The most rows on the matmul kernel the matvec band hands larger buckets to (`mm`; `sk`
+        // its split-K form, timed without the partials' reduce): x loaded once a threadgroup.
+        if s.bits == 4 {
+            let m = max_rows as u32;
+            let kernel = pick_qmm_t_kernel(m, s.n, s.k, 1, GROUP, false);
+            let split = match kernel {
+                QmmTKernel::SplitK { split_k, .. } => split_k as usize,
+                _ => 1,
+            };
+            let name = qmm_t_kernel_static_name(
+                kernel,
+                DequantDtype::Bf16,
+                ScaleDtype::Bf16,
+                s.bits,
+                GROUP,
+                s.n.is_multiple_of(32),
+            );
+            let mut constants = vec![
+                ConstantValue::int(0, s.k as i32),
+                ConstantValue::int(1, s.n as i32),
+                ConstantValue::int(2, m as i32),
+            ];
+            if let QmmTKernel::SplitK {
+                k_partition_size, ..
+            } = kernel
+            {
+                constants.push(ConstantValue::int(3, k_partition_size as i32));
+            }
+            constants.extend(AffineCodes::AsWritten.constant());
+            let pso = baked_build(&cache, &PipelineKey::new("quantized_qmm", name, constants))
+                .expect(name);
+            let partials = shared_zeroed(&device, split * max_rows * n * 2);
+            let (grid, threads) = qmm_t_dispatch_shape(kernel, m, s.n, 1);
+            let time = || {
+                let mut batch = Mtl4DispatchBatch::begin(&device).expect("mtl4 batch");
+                for i in 0..ITERS {
+                    let (w, scales, biases) = &weights[i % copies];
+                    let binds = [(w, 0), (scales, 1), (biases, 2), (&x, 3), (&partials, 4)];
+                    batch.encode(&pso, &binds, &[], &[], &[], size(grid), size(threads));
+                    batch.barrier();
+                }
+                let t0 = std::time::Instant::now();
+                batch.commit(true);
+                t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64
+            };
+            time();
+            let best = (0..3).map(|_| time()).fold(f64::MAX, f64::min);
+            let tag = if split > 1 { "sk" } else { "mm" };
+            line += &format!("  {m}{tag} {best:7.1}");
         }
         println!("{line}   ({:.1} MB of codes)", bytes as f64 / 1e6);
     }

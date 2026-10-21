@@ -448,7 +448,7 @@ fn a_normalizing_matvec_is_as_close_to_the_exact_normed_product_as_the_norm_then
 fn a_normalizing_wide_matvec_is_as_close_to_the_exact_normed_product_on_every_row() {
     use scratchy_target_metal::tape::ids::MDimI32;
     use scratchy_target_metal::tape::kernel_constants::AffineQmvWideConstants;
-    use scratchy_target_metal::tape::quantized::pick_qmv_kernel_wide;
+    use scratchy_target_metal::tape::quantized::{QmvWideTile, pick_qmv_kernel_wide};
     for c in cases() {
         let Some(device) = detect_device().map(|d| d.device.clone()) else {
             return;
@@ -456,7 +456,13 @@ fn a_normalizing_wide_matvec_is_as_close_to_the_exact_normed_product_on_every_ro
         let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
         for m in 2..=5usize {
             // K 64 / 128 run the quad kernel at any rows: no wide matvec to check.
-            let kernel = pick_qmv_kernel_wide(c.n as u32, c.k as u32, 4, m as u32, true);
+            let kernel = pick_qmv_kernel_wide(
+                c.n as u32,
+                c.k as u32,
+                4,
+                m as u32,
+                Some(QmvWideTile::ROWS_8),
+            );
             if !matches!(kernel, QmvKernel::Wide { .. }) {
                 continue;
             }

@@ -1689,8 +1689,9 @@ INST_QMV_ALL_B2(f16,  half,   f16,  half,   64)
 // qmv_wide instantiations — the small-M band (2 ≤ M < vector_limit).
 // k_lanes=8 (the affine pick, quantized.cpp:567): 4 output rows per
 // simdgroup × 2 simdgroups = 8 rows per threadgroup. vecs_per_tg in
-// {2,3,4,5} covers the decode buckets (bucket_m 2..8 on one tile, 16
-// on 4×4). bits 4 and 8, gs in {32, 64, 128} (every MLX-affine preset
+// 2..=8 covers every tile `QmvWideTile` picks: MLX's (≤ 5 vectors, an
+// 8-row bucket on 2 × 4) and the M5's (≤ 8, an 8-row bucket on one
+// tile). bits 4 and 8, gs in {32, 64, 128} (every MLX-affine preset
 // group size, as MLX's `instantiate_quantized_groups`), batch_0 only —
 // the band is a decode-batch shape, never an MoE weight batch.
 #define INST_QMV_WIDE(name, act_tag, act_type, scale_tag, scale_type, gs, bits, nv, kl)       \
@@ -1703,10 +1704,16 @@ INST_QMV_ALL_B2(f16,  half,   f16,  half,   64)
   INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 4, 3, 8)  \
   INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 4, 4, 8)  \
   INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 4, 5, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 4, 6, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 4, 7, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 4, 8, 8)  \
   INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 8, 2, 8)  \
   INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 8, 3, 8)  \
   INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 8, 4, 8)  \
-  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 8, 5, 8)
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 8, 5, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 8, 6, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 8, 7, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 8, 8, 8)
 
 INST_QMV_WIDE_ALL(bf16, bfloat, f16, half, 32)
 INST_QMV_WIDE_ALL(bf16, bfloat, f16, half, 64)
@@ -1723,7 +1730,10 @@ INST_QMV_WIDE_ALL(f16, half, f16, half, 128)
   INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 3, 2, 8)  \
   INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 3, 3, 8)  \
   INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 3, 4, 8)  \
-  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 3, 5, 8)
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 3, 5, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 3, 6, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 3, 7, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 3, 8, 8)
 
 INST_QMV_WIDE_ALL_B3(bf16, bfloat, bf16, bfloat, 64)
 INST_QMV_WIDE_ALL_B3(f16, half, f16, half, 64)
@@ -1733,7 +1743,10 @@ INST_QMV_WIDE_ALL_B3(f16, half, f16, half, 64)
   INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 2, 8)  \
   INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 3, 8)  \
   INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 4, 8)  \
-  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 5, 8)
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 5, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 6, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 7, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 8, 8)
 
 INST_QMV_WIDE_ALL_B2(bf16, bfloat, bf16, bfloat, 64)
 INST_QMV_WIDE_ALL_B2(f16, half, f16, half, 64)

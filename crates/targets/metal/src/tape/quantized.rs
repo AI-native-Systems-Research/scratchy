@@ -71,7 +71,7 @@ pub enum QmvKernel {
     /// `affine_qmv_fast_*_t8_*` — [`QmvKernel::Fast`] at MLX's 8-row threadgroups
     /// ([`QMV_FAST_FOLD_TILE_ROWS`]), the pick for the m≥2 buckets a pre-gen-15 GPU
     /// decodes with: the small-M wide band that would take them needs gen-15+
-    /// ([`affine_qmv_wide_ok`](crate::targets::affine_qmv_wide_ok): M3+). The fold
+    /// ([`affine_qmv_wide_band`](crate::targets::affine_qmv_wide_band): M3+). The fold
     /// streams each matrix's weights once per row at either tile, and
     /// there the 4-row tile only doubles the threadgroup count — #312 cost a third of
     /// granite c4 decode TPOT on an M1 Max this way — so it keeps MLX's tile. One-row
@@ -93,15 +93,38 @@ pub enum QmvKernel {
     /// reused across `nv` input vectors, so weight traffic is
     /// M-independent where the plain qmv re-streams the whole matrix
     /// per row. MLX `qmv_wide` (gen-15+ for affine). `nv` is the
-    /// per-threadgroup vector tile, `ceil(M / ceil(M/5))` capped at 5
-    /// (`quantized.cpp:555`).
+    /// per-threadgroup vector tile: M over the fewest tiles of at most
+    /// the target's [`QmvWideTile`].
     Wide { nv: u32 },
+}
+
+/// The most input vectors one `affine_qmv_wide` threadgroup tile reuses each dequantized weight
+/// group for. A bucket of more rows splits into the fewest tiles of at most this many, and each
+/// tile streams and dequantizes the whole matrix once. `nv` 2..=8 are instantiated, so neither
+/// constant can pick a kernel the metallib lacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QmvWideTile(u32);
+
+impl QmvWideTile {
+    /// MLX's tile, `ceil(M / ceil(M/5))` (`quantized.cpp:555`): an 8-row bucket takes two
+    /// tiles of 4.
+    pub const MLX: Self = Self(5);
+    /// One tile for every bucket up to 8 rows. Base M5 (`qmv_rows_probe_test`): at 8 rows one
+    /// tile runs 0–13% under MLX's two of 4 and never over — lm_head 3764 vs 4337 µs, GDN
+    /// in_proj 203 vs 223, gdn out_proj 78 vs 81, q+gate 143 vs 143 (Qwen3.6, 4-bit), GLM-4.5-Air
+    /// lm_head 4878 vs 5454 (3-bit) — the same rows bit for bit. Up to 5 rows it is MLX's tile.
+    pub const ROWS_8: Self = Self(8);
+
+    /// The vector tile `nv` of an `m`-row bucket: `m` over the fewest tiles of at most `self`.
+    pub const fn vecs_for(self, m: u32) -> u32 {
+        m.div_ceil(m.div_ceil(self.0))
+    }
 }
 
 /// Pick the right qmv variant per MLX `quantized.cpp:1826 dispatch_qmv`:
 /// quad first (tiny K), then the small-M wide band (`M ≥ 2` on gen-15+ —
-/// M3 and later, [`affine_qmv_wide_ok`](crate::targets::affine_qmv_wide_ok)),
-/// then fast/generic.
+/// M3 and later, [`affine_qmv_wide_band`](crate::targets::affine_qmv_wide_band),
+/// at its tile), then fast/generic.
 ///
 /// ```text
 /// if ((K == 128 || K == 64) && is_power_of_2(bits)) → qmv_quad(d=K)
@@ -114,15 +137,19 @@ pub enum QmvKernel {
 /// target), the m≥2 buckets the band would have taken decode on the fast kernel's
 /// fold twin (`FastFold`) instead — MLX's 8-row threadgroups, not the one-row
 /// kernel's 4 ([`QMV_FAST_TILE_ROWS`]).
-pub fn pick_qmv_kernel_wide(n: u32, k: u32, bits: u32, m: u32, wide_ok: bool) -> QmvKernel {
+pub fn pick_qmv_kernel_wide(
+    n: u32,
+    k: u32,
+    bits: u32,
+    m: u32,
+    wide: Option<QmvWideTile>,
+) -> QmvKernel {
     let pow2_bits = bits != 0 && (bits & (bits - 1)) == 0;
     if (k == 64 || k == 128) && pow2_bits {
         QmvKernel::Quad { d: k }
-    } else if m >= 2 && wide_ok {
-        // vecs_per_tg = ceil(M / ceil(M/5)) capped at 5 (quantized.cpp:555).
-        let n_tiles = m.div_ceil(5);
+    } else if let Some(tile) = wide.filter(|_| m >= 2) {
         QmvKernel::Wide {
-            nv: m.div_ceil(n_tiles),
+            nv: tile.vecs_for(m),
         }
     } else if m == 1 && n < 8 && matches!(bits, 2 | 4 | 8) && k.is_multiple_of(16) {
         // Sub-tile N at one row: the generic kernel's guarded path parks a
@@ -153,9 +180,9 @@ pub const fn qmv_fast_covers(n: u32, k: u32) -> bool {
     n.is_multiple_of(8) && k.is_multiple_of(QMV_FAST_K_STEP)
 }
 
-/// The M=1 form — `pick_qmv_kernel_wide` with `m = 1, wide_ok = false`.
+/// The M=1 form — `pick_qmv_kernel_wide` with `m = 1` and no wide band.
 pub fn pick_qmv_kernel(n: u32, k: u32, bits: u32) -> QmvKernel {
-    pick_qmv_kernel_wide(n, k, bits, 1, false)
+    pick_qmv_kernel_wide(n, k, bits, 1, None)
 }
 
 /// The rows an `affine_qmv_fast` threadgroup takes: its 2 simdgroups × the shader's
@@ -321,10 +348,10 @@ pub fn qmv_kernel_static_name(
             format!("affine_qmv_tiny_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_batch_0")
         }
         QmvKernel::Wide { nv } => {
-            if !matches!(nv, 2..=5) {
+            if !matches!(nv, 2..=8) {
                 panic!(
                     "qmv_kernel_static_name: QmvKernel::Wide with unsupported nv={nv} \
-                     — only 2..=5 instantiated"
+                     — only 2..=8 instantiated"
                 );
             }
             format!(
@@ -1305,30 +1332,52 @@ mod tests {
         // m≥2 takes the wide band on a gen-15+ (M5) target…
         for m in [2u32, 3, 4, 8] {
             assert!(matches!(
-                pick_qmv_kernel_wide(2048, 2048, 4, m, true),
+                pick_qmv_kernel_wide(2048, 2048, 4, m, Some(QmvWideTile::MLX)),
                 QmvKernel::Wide { .. }
             ));
             // …and before it, the same buckets decode on the fast kernel's fold
             // twin: MLX's 8-row threadgroups, not the one-row kernel's 4.
             assert_eq!(
-                pick_qmv_kernel_wide(2048, 2048, 4, m, false),
+                pick_qmv_kernel_wide(2048, 2048, 4, m, None),
                 QmvKernel::FastFold
             );
         }
         // One-row buckets keep the one-row kernel at either gate.
         assert_eq!(
-            pick_qmv_kernel_wide(2048, 2048, 4, 1, false),
+            pick_qmv_kernel_wide(2048, 2048, 4, 1, None),
             QmvKernel::Fast
         );
         assert_eq!(
-            pick_qmv_kernel_wide(2048, 2048, 4, 1, true),
+            pick_qmv_kernel_wide(2048, 2048, 4, 1, Some(QmvWideTile::MLX)),
             QmvKernel::Fast
         );
         // The twin follows fast's coverage rule.
         assert_eq!(
-            pick_qmv_kernel_wide(2049, 2048, 4, 4, false),
+            pick_qmv_kernel_wide(2049, 2048, 4, 4, None),
             QmvKernel::Generic
         );
+    }
+
+    /// The tile cap: MLX's splits an 8-row bucket into two tiles of 4, `ROWS_8` takes it in one;
+    /// both agree up to 5 rows, and no row count the matvec band admits picks an `nv` outside the
+    /// instantiated 2..=8.
+    #[test]
+    fn qmv_wide_tile_takes_an_8_row_bucket_in_one_tile() {
+        let nv = |tile, m| match pick_qmv_kernel_wide(2048, 2048, 4, m, Some(tile)) {
+            QmvKernel::Wide { nv } => nv,
+            other => panic!("M={m} picked {other:?}"),
+        };
+        assert_eq!(nv(QmvWideTile::MLX, 8), 4);
+        assert_eq!(nv(QmvWideTile::ROWS_8, 8), 8);
+        for m in 2..=5 {
+            assert_eq!(nv(QmvWideTile::MLX, m), nv(QmvWideTile::ROWS_8, m), "M={m}");
+        }
+        let band = get_qmv_batch_limit(2048, 2048, crate::tape::targets::AppleSiliconGen::M5);
+        for tile in [QmvWideTile::MLX, QmvWideTile::ROWS_8] {
+            for m in 2..band {
+                assert!((2..=8).contains(&nv(tile, m)), "{tile:?} M={m}");
+            }
+        }
     }
 
     #[test]
@@ -1337,31 +1386,31 @@ mod tests {
         // generic kernel here and leaves a whole simdgroup parked (the same
         // class of measured divergence as the NAX floor, #326).
         // Qwen3.6's shared-expert gate: N=1, K=2048, 8-bit.
-        assert_eq!(pick_qmv_kernel_wide(1, 2048, 8, 1, false), QmvKernel::Tiny);
+        assert_eq!(pick_qmv_kernel_wide(1, 2048, 8, 1, None), QmvKernel::Tiny);
         // odd sub-tile N at 4-bit, whole second K pass
-        assert_eq!(pick_qmv_kernel_wide(7, 2048, 4, 1, false), QmvKernel::Tiny);
+        assert_eq!(pick_qmv_kernel_wide(7, 2048, 4, 1, None), QmvKernel::Tiny);
         // partial second pass: K = 1024 + 8 lane chunks
-        assert_eq!(pick_qmv_kernel_wide(1, 1152, 4, 1, false), QmvKernel::Tiny);
+        assert_eq!(pick_qmv_kernel_wide(1, 1152, 4, 1, None), QmvKernel::Tiny);
         // the 3-bit packing's word indexing doesn't divide by lane
         assert_eq!(
-            pick_qmv_kernel_wide(1, 2048, 3, 1, false),
+            pick_qmv_kernel_wide(1, 2048, 3, 1, None),
             QmvKernel::Generic
         );
         // K must be a whole multiple of the 16-value lane chunk
         assert_eq!(
-            pick_qmv_kernel_wide(1, 1023, 4, 1, false),
+            pick_qmv_kernel_wide(1, 1023, 4, 1, None),
             QmvKernel::Generic
         );
         // N=8 is fast's whole tile, not sub-tile
-        assert_eq!(pick_qmv_kernel_wide(8, 2048, 4, 1, false), QmvKernel::Fast);
+        assert_eq!(pick_qmv_kernel_wide(8, 2048, 4, 1, None), QmvKernel::Fast);
         // M ≥ 2 keeps the wide band ahead of tiny
         assert!(matches!(
-            pick_qmv_kernel_wide(1, 2048, 8, 2, true),
+            pick_qmv_kernel_wide(1, 2048, 8, 2, Some(QmvWideTile::MLX)),
             QmvKernel::Wide { .. }
         ));
         // quad still wins its K band first
         assert_eq!(
-            pick_qmv_kernel_wide(1, 128, 4, 1, false),
+            pick_qmv_kernel_wide(1, 128, 4, 1, None),
             QmvKernel::Quad { d: 128 }
         );
 

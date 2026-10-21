@@ -45,8 +45,8 @@ fn attention_blocks_per_chunk(chunked: bool) -> u32 {
 }
 use crate::op_abi::GuardRun;
 use crate::quantized::{
-    DequantDtype, NaxDequant, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile,
-    W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Act, W4a8Rows, W4a8Tile, pick_qmm_t_kernel,
+    DequantDtype, NaxDequant, QmmTKernel, QmvKernel, QmvWideTile, SMALL_M_TILE_COLS, ScaleDtype,
+    SmallMTile, W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Act, W4a8Rows, W4a8Tile, pick_qmm_t_kernel,
     pick_qmv_kernel_wide, qmm_t_dispatch_shape, qmm_t_kernel_static_name,
     qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name, qmv_dispatch_shape,
     qmv_kernel_static_name, small_m_kernel_static_name, splitk_reduce_kernel_static_name,
@@ -283,7 +283,7 @@ fn sample_rows(
                 g.layer,
                 ix,
                 codes,
-                /*wide_ok=*/ false,
+                /*wide=*/ None,
                 Vec::new(),
             ))
         }
@@ -375,7 +375,7 @@ fn affine_qmv_command(
     layer: LayerId,
     ix: SourceIx,
     codes: super::kernel_constants::AffineCodes,
-    wide_ok: bool,
+    wide: Option<QmvWideTile>,
     end_weights: Vec<Binding>,
 ) -> LoweredCommand {
     let (n, k, bits) = (g.n.get(), g.k.get(), g.bits.get());
@@ -384,7 +384,7 @@ fn affine_qmv_command(
     // so the per-sequence weight re-stream the plain row-parallel qmv
     // pays disappears. `rows` here is the bucket's row count; the wide
     // grid is exact per bucket (nv baked), no m_scaling on X.
-    let kernel = pick_qmv_kernel_wide(n, k, bits, rows, wide_ok);
+    let kernel = pick_qmv_kernel_wide(n, k, bits, rows, wide);
     let (tg, tpg) = qmv_dispatch_shape(kernel, rows, n, /*B=*/ 1);
     let (kernel_id, constants) = match kernel {
         QmvKernel::Quad { .. } => (
@@ -2626,10 +2626,10 @@ fn lower_one(
                 let layer = super::ids::LayerId(*layer + layer_offset);
                 let codes = super::kernel_constants::AffineCodes::of(profile, g.bits.get());
                 // MLX gates affine qmv_wide on arch gen >= 15 (quantized.cpp:537-539) —
-                // M3 and later (M4 is gen 16, M5 is gen 17). `affine_qmv_wide_ok` mirrors
-                // that boundary; M1/M2 keep the fold twin.
-                let wide_ok =
-                    profile.is_some_and(|pr| crate::targets::affine_qmv_wide_ok(pr.generation));
+                // M3 and later (M4 is gen 16, M5 is gen 17). `affine_qmv_wide_band` mirrors
+                // that boundary, at each generation's tile; M1/M2 keep the fold twin.
+                let wide =
+                    profile.and_then(|pr| crate::targets::affine_qmv_wide_band(pr.generation));
                 // Every matvec-band kernel takes the folded ends (`qmv_fast_impl`,
                 // `qmv_impl` and `qmv_quad_impl` since #242, `qmv_wide_impl` since the
                 // wide gained them) — at any row count the bucket dispatches it.
@@ -2641,7 +2641,7 @@ fn lower_one(
                     layer,
                     w.of(WeightKind::Linear, 0)?,
                     codes,
-                    wide_ok,
+                    wide,
                     qmv_end_weights(g, w, layer_offset)?,
                 )
             // The matmul band takes no ends: the qmm_t kernels have no norm / bias /
@@ -10348,12 +10348,13 @@ mod tests {
     }
 
     /// The small-M wide band follows MLX's gen-15 boundary
-    /// (`affine_qmv_wide_ok`): every production bake profile from the M3 on —
+    /// (`affine_qmv_wide_band`): every production bake profile from the M3 on —
     /// the Mid class bakes against an M4 profile, the M5 class its own —
     /// lowers an m≥2 matvec-band bucket to `affine_qmv_wide`, where the M1
     /// class keeps the fast kernel's fold twin. MLX dispatches the same way
     /// (`use_qmv_wide`, quantized.cpp:537): its own comment says the affine
-    /// wide kernel only beats the plain qmv from gen 15 on.
+    /// wide kernel only beats the plain qmv from gen 15 on. The Mid class's 8-row bucket takes
+    /// MLX's two tiles of 4, the M5 class's one tile of 8.
     #[test]
     fn qmv_wide_band_follows_the_gen_15_boundary() {
         fn lower_at(
@@ -10366,7 +10367,16 @@ mod tests {
             )
             .expect("lower_subtile_tape_to_metal")
         }
-        for profile in [&crate::targets::M4_10CORE, &crate::targets::M5_10CORE] {
+        for (profile, function) in [
+            (
+                &crate::targets::M4_10CORE,
+                "affine_qmv_wide_bf16_s_f16_gs_64_b_4_nv_4_kl_8_batch_0",
+            ),
+            (
+                &crate::targets::M5_10CORE,
+                "affine_qmv_wide_bf16_s_f16_gs_64_b_4_nv_8_kl_8_batch_0",
+            ),
+        ] {
             let command = &lower_at(profile).commands[0].command;
             assert_eq!(
                 command.kernel,
@@ -10374,10 +10384,7 @@ mod tests {
                 "the {:?} class bakes the wide band",
                 profile.generation
             );
-            assert_eq!(
-                command.function,
-                "affine_qmv_wide_bf16_s_f16_gs_64_b_4_nv_4_kl_8_batch_0"
-            );
+            assert_eq!(command.function, function, "{:?}", profile.generation);
         }
         let command = &lower_at(&crate::targets::M1_MAX).commands[0].command;
         assert_eq!(
