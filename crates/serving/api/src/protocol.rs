@@ -237,7 +237,7 @@ pub enum ToolChoice {
     None,
     /// Any tool, or none.
     Auto,
-    /// Some tool. Not enforced yet: answered as [`Self::Auto`] is (#765).
+    /// Some tool: the reply is constrained to a JSON array of calls to the declared tools (#765).
     Required,
     /// This tool: a call to any other is dropped, so the reply is the text around it (#746).
     Function(String),
