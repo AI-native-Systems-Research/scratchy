@@ -118,7 +118,8 @@ use std::sync::Arc;
 
 use crate::address::CompositeAddress;
 use crate::dma::{
-    DmaDirection, DmaParams, DmaParamsError, DmaShaping, HostVirtualAddress, IovaAddress, OpName,
+    DmaDirection, DmaParams, DmaParamsError, DmaPipelineShape, DmaShaping, HostVirtualAddress,
+    IovaAddress, OpName,
 };
 use crate::host_interface::{Alignment, RaiiBuffer, RaiiBufferError};
 use crate::iommu::{IommuMapping, PfIommuMapper};
@@ -600,8 +601,8 @@ impl SharedHostPool {
     /// Port of `SharedPool::EnqueueCopy` / `SharedHostPool`'s
     /// `CopyRawPreMapped` entry (reached on `RuntimeStream` via
     /// `runtime_stream.hpp:148`/`:175`): enqueue a DMA between slot `slot`
-    /// and a single-chunk device object, riding the pool's pre-mapped IOVA —
-    /// no staging buffer, no per-step pin.
+    /// and a single-chunk device object on the DEFAULT (async DMA) pipeline,
+    /// riding the pool's pre-mapped IOVA — no staging buffer, no per-step pin.
     ///
     /// Validation is the vendor's `copyRawImpl` set, in the vendor's order,
     /// all firing BEFORE any DMA is issued: the stream must not be in the
@@ -624,6 +625,57 @@ impl SharedHostPool {
         device_address: Option<Arc<CompositeAddress>>,
         to_device: bool,
     ) -> Result<(), SharedHostPoolError> {
+        self.enqueue_copy_shaped(
+            stream,
+            slot,
+            device_address,
+            to_device,
+            DmaPipelineShape::AsyncDma,
+        )
+    }
+
+    /// ⭐ #603 PR3b — [`Self::enqueue_copy`] on the COMPUTE pipeline: the pool's
+    /// twin of the runtime's `h2d_on_compute`/`d2h_on_compute` pair, for the
+    /// copies that must ride FIFO-behind a step's compute CBs (the decode
+    /// window's idx-stick D2H, the LAST op of its step). The same junction law
+    /// those doors carry (#544): on the default pipeline the copy's switch
+    /// barrier host-blocks on the compute deque; on COMPUTE the barrier drains
+    /// the (empty) DMA deques instead and the queue's own FIFO carries the
+    /// ordering the host-side wait used to.
+    ///
+    /// # Errors
+    /// Identical to [`Self::enqueue_copy`] — the doors differ only in the
+    /// pipeline the copy rides.
+    pub fn enqueue_copy_on_compute(
+        &self,
+        stream: &Arc<RuntimeStream>,
+        slot: usize,
+        device_address: Option<Arc<CompositeAddress>>,
+        to_device: bool,
+    ) -> Result<(), SharedHostPoolError> {
+        self.enqueue_copy_shaped(
+            stream,
+            slot,
+            device_address,
+            to_device,
+            DmaPipelineShape::ComputePipeline,
+        )
+    }
+
+    /// The one body behind [`Self::enqueue_copy`] and
+    /// [`Self::enqueue_copy_on_compute`]: the `CopyRawPreMapped` precondition
+    /// and null-IOVA belt, the `copyRawImpl` validation set in the vendor's
+    /// order, and the pre-mapped submission — parameterized ONLY by the
+    /// pipeline the copy rides, the same factor the runtime's own DMA door
+    /// pairs take.
+    fn enqueue_copy_shaped(
+        &self,
+        stream: &Arc<RuntimeStream>,
+        slot: usize,
+        device_address: Option<Arc<CompositeAddress>>,
+        to_device: bool,
+        pipeline_shape: DmaPipelineShape,
+    ) -> Result<(), SharedHostPoolError> {
         // CopyRawPreMapped's side of the contract: resolve the slot and
         // refuse a null IOVA before descending into the copy validation.
         // (A constructed pool always has a non-zero base IOVA — the
@@ -638,47 +690,57 @@ impl SharedHostPool {
         }
         let device = device_address.ok_or(SharedHostPoolError::NullDeviceAddress)?;
         validate_copy_raw_device(&device, resolved.host_capacity)?;
-        // createDmaParams(host, total_size, to_device, dev, dci = null,
-        // iova): the transfer length is ALWAYS the device object's
-        // total_size (checked to fit the slot above), the op name is the
-        // copyRaw pair, and the pool's stable slot IOVA rides the
-        // pre-mapped field.
-        let op_name = if to_device {
-            "RuntimeStreamCopyRawH2D"
-        } else {
-            "RuntimeStreamCopyRawD2H"
-        };
-        let direction = if to_device {
-            DmaDirection::HostToDevice
-        } else {
-            DmaDirection::DeviceToHost
-        };
-        let params = match DmaParams::with_explicit_size(
-            resolved.host_address,
-            device.total_size(),
-            direction,
-            Some(device),
-            DmaShaping {
-                dci: None,
-                op_name: OpName(Some(op_name.to_string())),
-                iova: Some(resolved.iova),
-                ..DmaShaping::default()
-            },
-        ) {
-            Ok(p) => p,
-            // Unreachable — `device` was just unwrapped from `Some` — but
-            // the null check is `with_explicit_size`'s own, so map it rather
-            // than assert it away.
-            Err(DmaParamsError::NullDeviceAddress) => {
-                return Err(SharedHostPoolError::NullDeviceAddress);
-            }
-        };
+        let params = copy_raw_params(resolved, &device, to_device, pipeline_shape)?;
         let launch = if to_device {
             stream.launch_h2d(params, None)
         } else {
             stream.launch_d2h(params, None)
         };
         launch.map_err(SharedHostPoolError::Launch)
+    }
+}
+
+/// `createDmaParams(host, total_size, to_device, dev, dci = null, iova)` — the
+/// pre-mapped `DmaParams` both copy doors submit, extracted as a pure function
+/// because the launch half needs a live stream while the shaping half is
+/// exactly what a cardless test must pin: the transfer length is ALWAYS the
+/// device object's `total_size` (checked to fit the slot by the caller), the
+/// op name is the copyRaw pair, the pool's stable slot IOVA rides the
+/// pre-mapped field, and the pipeline is the door's own shaping.
+fn copy_raw_params(
+    resolved: ResolvedSlot,
+    device: &Arc<CompositeAddress>,
+    to_device: bool,
+    pipeline_shape: DmaPipelineShape,
+) -> Result<DmaParams, SharedHostPoolError> {
+    let op_name = if to_device {
+        "RuntimeStreamCopyRawH2D"
+    } else {
+        "RuntimeStreamCopyRawD2H"
+    };
+    let direction = if to_device {
+        DmaDirection::HostToDevice
+    } else {
+        DmaDirection::DeviceToHost
+    };
+    match DmaParams::with_explicit_size(
+        resolved.host_address,
+        device.total_size(),
+        direction,
+        Some(Arc::clone(device)),
+        DmaShaping {
+            dci: None,
+            op_name: OpName(Some(op_name.to_string())),
+            iova: Some(resolved.iova),
+            pipeline_shape,
+            ..DmaShaping::default()
+        },
+    ) {
+        Ok(p) => Ok(p),
+        // Unreachable — `device` is a shared reference to a live `Arc` — but
+        // the null check is `with_explicit_size`'s own, so map it rather
+        // than assert it away.
+        Err(DmaParamsError::NullDeviceAddress) => Err(SharedHostPoolError::NullDeviceAddress),
     }
 }
 
@@ -872,6 +934,60 @@ mod tests {
             err,
             SharedHostPoolError::MultiChunkDevice { chunk_count: 2 }
         ));
+    }
+
+    // --- the copy doors' shaping (pure params; the launch itself needs a live
+    // stream, but a copy riding the WRONG pipeline is a silent mis-submission,
+    // so the shaping is pinned here) ---
+
+    #[test]
+    fn copy_raw_params_rides_the_pool_iova_and_the_doors_pipeline() {
+        let resolved = ResolvedSlot {
+            host_address: HostVirtualAddress(0x1000_0000),
+            host_capacity: 4096,
+            iova: IovaAddress(0x2000_0000),
+        };
+        let device = dummy_addr(256);
+
+        let d2h_compute =
+            copy_raw_params(resolved, &device, false, DmaPipelineShape::ComputePipeline).unwrap();
+        // The compute door's whole point: #544's junction law, FIFO-behind the
+        // step's compute CBs instead of host-blocking on the compute deque.
+        assert_eq!(
+            d2h_compute.pipeline_shape(),
+            DmaPipelineShape::ComputePipeline
+        );
+        // The pre-mapped fields: the slot's OWN stable IOVA (never a fresh
+        // mapping), the slot's host address, the device object's total size as
+        // the transfer length, and the direction.
+        assert_eq!(d2h_compute.iova(), Some(IovaAddress(0x2000_0000)));
+        assert_eq!(d2h_compute.hmva(), HostVirtualAddress(0x1000_0000));
+        assert_eq!(d2h_compute.dma_size(), ByteSize(256));
+        assert_eq!(d2h_compute.direction(), DmaDirection::DeviceToHost);
+
+        let h2d_default =
+            copy_raw_params(resolved, &device, true, DmaPipelineShape::AsyncDma).unwrap();
+        assert_eq!(h2d_default.pipeline_shape(), DmaPipelineShape::AsyncDma);
+        assert_eq!(h2d_default.direction(), DmaDirection::HostToDevice);
+        assert_eq!(h2d_default.iova(), Some(IovaAddress(0x2000_0000)));
+    }
+
+    #[test]
+    fn copy_raw_params_op_name_names_the_direction() {
+        let resolved = ResolvedSlot {
+            host_address: HostVirtualAddress(0x1000_0000),
+            host_capacity: 4096,
+            iova: IovaAddress(0x2000_0000),
+        };
+        let device = dummy_addr(512);
+        // `OpName` has no `PartialEq`; the vendor pair is the observable, and
+        // it is what a CB trace names the op by.
+        let h2d =
+            copy_raw_params(resolved, &device, true, DmaPipelineShape::ComputePipeline).unwrap();
+        assert_eq!(h2d.op_name().0.as_deref(), Some("RuntimeStreamCopyRawH2D"));
+        let d2h =
+            copy_raw_params(resolved, &device, false, DmaPipelineShape::ComputePipeline).unwrap();
+        assert_eq!(d2h.op_name().0.as_deref(), Some("RuntimeStreamCopyRawD2H"));
     }
 
     // Everything else the vendor suite covers needs a live senlib link
