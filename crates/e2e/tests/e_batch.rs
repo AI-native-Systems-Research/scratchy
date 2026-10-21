@@ -98,7 +98,7 @@ async fn run_batch(config: VllmConfig, input_path: &str, output_path: &str) -> a
         return Ok(());
     }
 
-    let stack = tokio::task::spawn_blocking(move || initialize_stack(&config))
+    let stack = tokio::task::spawn_blocking(move || initialize_stack(&config, None))
         .await
         .expect("initialize_stack panicked")?;
 

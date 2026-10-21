@@ -141,6 +141,25 @@ jobs:
           --features scratchy-serving-api/nccl,scratchy-models/smollm2-135m
           -- -D warnings
 
+      # The e2e tests' cuda half, type-checked and linted: the macOS e2e step
+      # compiles their cuda-only files empty, and the workspace clippy above has
+      # no `--tests`, so no other step builds them. `otel` is on so e_otel.rs,
+      # which needs it and runs on any backend, compiles too: here rather than
+      # on macOS, whose tests job is the longer one. `--keep-going` reports
+      # every failing test target, not just those in flight at the first failure.
+      - name: Lint the cuda e2e tests
+        run: cargo clippy -p scratchy-e2e -p scratchy-models
+          --features e2e,cuda,otel,scratchy-models/smollm2-135m
+          --tests --keep-going -- -D warnings
+
+      # scratchy-cli's own test targets (its unit tests and
+      # tests/arch_feature_passthrough.rs), type-checked and linted: no other
+      # step builds them. None is backend-specific, so they're linted here
+      # rather than on macOS, whose tests job is the longer one.
+      - name: Lint scratchy-cli's test targets
+        run: cargo clippy -p scratchy-cli --features cuda,claude,model/smollm2-135m
+          --all-targets -- -D warnings
+
       # The multi-node control plane, the rank rendezvous and the channel
       # that carries `ControlMessage` to followers, is plain TCP + serde: no
       # backend, no GPU. Only NCCL's own collectives need the hardware.
@@ -434,11 +453,15 @@ jobs:
       # GPU. This runner's paravirtual GPU has none, so each test would return
       # early (`skip_if_no_gpu!`) and pass without running. What CI can check
       # here is that the files compile and lint clean; run them on a real GPU.
+      # `--tests` type-checks every e2e test target (a cuda-only file compiles
+      # empty here), and, since `-p scratchy-models` is what names the model,
+      # scratchy-models' own lib and integration tests at that model. e_otel.rs
+      # and scratchy-cli's test targets are linted in the cuda job. `--keep-going`
+      # as in the cuda e2e lint.
       - name: Lint the metal e2e tests
         run: cargo clippy -p scratchy-e2e -p scratchy-models
           --features e2e,metal,scratchy-models/smollm2-135m
-          --test e1_basic_serving --test e_prefix_caching --test e_anthropic
-          --test e5_gemma4_tool_parser --test e_long_prompt_metal -- -D warnings
+          --tests --keep-going -- -D warnings
 
       # See the clippy job's last step.
       - name: Compiled no crate macos-scope skips for

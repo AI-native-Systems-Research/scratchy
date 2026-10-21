@@ -245,8 +245,6 @@ async fn test_cuda_fp8_kv_graph_concurrent() {
         .await
         .unwrap();
 
-    let client = Client::new(server.base_url());
-
     // Launch 3 concurrent completions to exercise batch > 1 decode graphs.
     let futs: Vec<_> = (0..3)
         .map(|i| {

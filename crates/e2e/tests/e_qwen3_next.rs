@@ -194,9 +194,9 @@ fn generate_weights(
     // Final norm.
     tensors.insert("model.norm.weight".into(), make_tensor(&[hidden]));
 
-    for i in 0..n_layers {
+    for (i, layer_type) in layer_types.iter().enumerate().take(n_layers) {
         let prefix = format!("model.layers.{i}");
-        let is_full_attn = layer_types[i] == "full_attention";
+        let is_full_attn = layer_type == "full_attention";
         let is_moe = !mlp_only.contains(&i) && n_experts > 0;
 
         // Layer norms.

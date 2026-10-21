@@ -177,9 +177,7 @@ async fn test_mistral_stream_with_tools() {
 
     let chunks = client.chat_completion_stream(&request).await.unwrap();
     assert_valid_stream(&chunks);
-
-    let _text = collect_stream_text(&chunks);
-    assert!(chunks.len() >= 1, "should have at least 1 stream chunk");
+    assert!(!chunks.is_empty(), "should have at least 1 stream chunk");
 }
 
 /// Streaming without tools — mistral parser should not interfere.

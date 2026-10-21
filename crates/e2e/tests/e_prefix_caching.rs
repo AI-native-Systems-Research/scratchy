@@ -148,6 +148,7 @@ async fn test_prefix_caching_mlx_same_prompt_twice() {
 /// prompt is a few hundred tokens, well clear of that edge. The text has to
 /// carry the length itself: SmolLM's chat template does not reference `tools`,
 /// so tool schemas on the request would render to nothing at all.
+#[cfg(target_os = "macos")]
 fn long_chat_request() -> scratchy_serving_api::protocol::ChatCompletionRequest {
     use scratchy_serving_api::protocol::{ChatCompletionMessageParam, ChatCompletionRequest};
 
@@ -179,6 +180,7 @@ fn long_chat_request() -> scratchy_serving_api::protocol::ChatCompletionRequest 
 
 /// Send the same long prompt twice and assert the SECOND request reports a
 /// prefix-cache hit through `usage.prompt_tokens_details.cached_tokens`.
+#[cfg(target_os = "macos")]
 async fn assert_reports_cached_tokens(client: &Client, device: &str) {
     let request = long_chat_request();
 

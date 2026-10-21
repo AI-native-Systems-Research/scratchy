@@ -12,7 +12,8 @@
 //! Run with:
 //!   cargo test -p vllm-e2e --features e2e,cuda --release --test e_spec_decode -- --ignored --test-threads=1
 
-#![cfg(feature = "e2e")]
+// Every test here runs on cuda, so the helpers would be dead code on any other backend.
+#![cfg(all(feature = "e2e", feature = "cuda"))]
 
 use scratchy_e2e::{Client, TestModels, TestServer};
 use scratchy_serving_api::protocol::{
@@ -85,7 +86,6 @@ async fn start_baseline_server(model: &str) -> TestServer {
 // ===========================================================================
 
 /// Basic: server starts, generates coherent text with spec decode.
-#[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_spec_decode_basic_completion() {
@@ -107,7 +107,6 @@ async fn test_cuda_spec_decode_basic_completion() {
 }
 
 /// Basic: chat completion with spec decode.
-#[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_spec_decode_chat() {
@@ -131,7 +130,6 @@ async fn test_cuda_spec_decode_chat() {
 ///
 /// This is the most important spec decode test. If this fails, the rejection
 /// sampling logic is broken.
-#[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_spec_decode_matches_baseline() {
@@ -192,7 +190,6 @@ async fn test_cuda_spec_decode_matches_baseline() {
 }
 
 /// Streaming: verify SSE events arrive and form coherent text.
-#[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_spec_decode_streaming() {
@@ -240,7 +237,6 @@ async fn test_cuda_spec_decode_streaming() {
 }
 
 /// Metrics: verify spec decode Prometheus counters are present and populated.
-#[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_spec_decode_metrics() {
@@ -293,7 +289,6 @@ async fn test_cuda_spec_decode_metrics() {
 }
 
 /// Multiple concurrent requests with spec decode.
-#[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_spec_decode_concurrent() {
