@@ -111,7 +111,7 @@ pub struct ResponsesRequest {
     #[serde(default)]
     pub tools: Vec<FunctionToolDef>,
     #[serde(default)]
-    pub tool_choice: Option<Value>,
+    pub tool_choice: Option<ResponsesToolChoice>,
     #[serde(default)]
     pub metadata: Option<Value>,
     #[serde(default)]
@@ -126,6 +126,26 @@ pub struct ResponsesRequest {
     pub top_logprobs: Option<u32>,
     #[serde(default)]
     pub text: Option<Value>,
+}
+
+/// A request's `tool_choice` in the Responses API's forms ([`protocol::ToolChoice::from_responses`]),
+/// echoed back in them: one it does not know fails the request as it is parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponsesToolChoice(pub protocol::ToolChoice);
+
+impl Serialize for ResponsesToolChoice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.to_responses().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ResponsesToolChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let form = Value::deserialize(deserializer)?;
+        protocol::ToolChoice::from_responses(&form)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Stop condition — single string or array.
@@ -158,7 +178,7 @@ pub struct ResponsesResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<Value>,
+    pub tool_choice: Option<ResponsesToolChoice>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
 }
@@ -324,20 +344,7 @@ fn convert_request(req: &ResponsesRequest) -> protocol::ChatCompletionRequest {
         )
     };
 
-    // Convert tool_choice
-    let tool_choice = req.tool_choice.clone().map(|tc| {
-        if let Some(s) = tc.as_str() {
-            match s {
-                "auto" | "none" | "required" => tc,
-                name => serde_json::json!({
-                    "type": "function",
-                    "function": { "name": name }
-                }),
-            }
-        } else {
-            tc
-        }
-    });
+    let tool_choice = (req.tool_choice.clone()).map(|ResponsesToolChoice(choice)| choice);
 
     // Convert stop
     let stop = req.stop.as_ref().map(|s| match s {
@@ -955,6 +962,65 @@ fn stream_responses(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Responses API's `tool_choice` forms read into the engine's choice (#767): its forced
+    /// tool `{"type": "function", "name": …}` (the chat form's nesting read too), and the three
+    /// keywords. The request echoes them back in the Responses form.
+    #[test]
+    fn responses_tool_choice_forms_reach_the_engine() {
+        use protocol::ToolChoice;
+        use serde_json::json;
+        let cases = [
+            (json!("none"), ToolChoice::None),
+            (json!("auto"), ToolChoice::Auto),
+            (json!("required"), ToolChoice::Required),
+            (
+                json!({"type": "function", "name": "get_weather"}),
+                ToolChoice::Function("get_weather".into()),
+            ),
+            (
+                json!({"type": "function", "function": {"name": "get_weather"}}),
+                ToolChoice::Function("get_weather".into()),
+            ),
+        ];
+        for (form, choice) in cases {
+            let req: ResponsesRequest =
+                serde_json::from_value(json!({ "input": "Hi", "tool_choice": form })).unwrap();
+            assert_eq!(
+                convert_request(&req).tool_choice,
+                Some(choice.clone()),
+                "{form}"
+            );
+            let echoed = serde_json::to_value(ResponsesToolChoice(choice)).unwrap();
+            let canonical = match &form {
+                Value::Object(_) => json!({"type": "function", "name": "get_weather"}),
+                keyword => keyword.clone(),
+            };
+            assert_eq!(echoed, canonical, "{form}");
+        }
+    }
+
+    /// A `tool_choice` the Responses API doesn't define fails the request as it is parsed (#767):
+    /// a bare string other than the three keywords was read as a tool name, and a hosted tool
+    /// isn't served.
+    #[test]
+    fn an_unknown_responses_tool_choice_fails_the_request() {
+        use serde_json::json;
+        for bad in [
+            json!("requried"),
+            json!("get_weather"),
+            json!({"type": "file_search"}),
+            json!({"type": "function"}),
+            json!(1),
+        ] {
+            let request = json!({ "input": "Hi", "tool_choice": bad });
+            let err = serde_json::from_value::<ResponsesRequest>(request).expect_err("not a form");
+            assert!(
+                err.to_string().contains(r#"{"type": "function", "name""#),
+                "{bad}: {err}"
+            );
+        }
+    }
 
     #[test]
     fn test_deserialize_simple_text_input() {
