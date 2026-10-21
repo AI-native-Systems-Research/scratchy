@@ -292,6 +292,31 @@ fn last_breakpoint(req: &MessagesRequest) -> Option<Breakpoint> {
     })
 }
 
+/// Anthropic's `tool_choice` as the chat endpoint's. Anthropic sends an object —
+/// `{"type": "auto" | "any" | "none"}`, or `{"type": "tool", "name": …}` — and the bare strings are
+/// accepted as well. `any` is the chat endpoint's `"required"`, which no endpoint enforces yet
+/// (#765). A form it doesn't know passes through as it came.
+fn convert_tool_choice(tc: Value) -> Value {
+    let kind = tc
+        .as_str()
+        .or_else(|| tc.get("type").and_then(Value::as_str));
+    let converted = match kind {
+        Some("auto") => "auto",
+        Some("any") => "required",
+        Some("none") => "none",
+        _ => {
+            return match tc.get("name").and_then(Value::as_str) {
+                Some(name) => serde_json::json!({
+                    "type": "function",
+                    "function": { "name": name }
+                }),
+                None => tc,
+            };
+        }
+    };
+    Value::String(converted.to_string())
+}
+
 fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
     let mut messages = Vec::new();
 
@@ -491,24 +516,7 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
             .collect()
     });
 
-    // Convert tool_choice
-    let tool_choice = req.tool_choice.map(|tc| {
-        if let Some(s) = tc.as_str() {
-            match s {
-                "auto" => Value::String("auto".to_string()),
-                "any" => Value::String("required".to_string()),
-                "none" => Value::String("none".to_string()),
-                _ => tc,
-            }
-        } else if let Some(name) = tc.get("name").and_then(|n| n.as_str()) {
-            serde_json::json!({
-                "type": "function",
-                "function": { "name": name }
-            })
-        } else {
-            tc
-        }
-    });
+    let tool_choice = req.tool_choice.map(convert_tool_choice);
 
     let stop = req.stop_sequences.map(protocol::StopCondition::Multiple);
 
@@ -1860,6 +1868,33 @@ mod tests {
         };
         let chat = convert_request(req);
         assert_eq!(chat.tool_choice, Some(Value::String("required".into())));
+    }
+
+    /// Anthropic's object forms convert as its bare strings do, and a forced tool becomes the
+    /// chat endpoint's named function.
+    #[test]
+    fn test_convert_tool_choice_object_forms() {
+        use serde_json::json;
+        let cases = [
+            (json!({"type": "auto"}), json!("auto")),
+            (json!({"type": "any"}), json!("required")),
+            (json!({"type": "none"}), json!("none")),
+            (
+                json!({"type": "auto", "disable_parallel_tool_use": true}),
+                json!("auto"),
+            ),
+            (
+                json!({"type": "tool", "name": "Read"}),
+                json!({"type": "function", "function": {"name": "Read"}}),
+            ),
+            (json!("auto"), json!("auto")),
+            (json!("any"), json!("required")),
+            (json!("none"), json!("none")),
+            (json!({"type": "mystery"}), json!({"type": "mystery"})),
+        ];
+        for (anthropic, chat) in cases {
+            assert_eq!(convert_tool_choice(anthropic.clone()), chat, "{anthropic}");
+        }
     }
 
     #[test]

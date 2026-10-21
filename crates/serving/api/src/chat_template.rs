@@ -381,19 +381,17 @@ impl ChatTemplate {
         &self,
         messages: &[protocol::ChatCompletionMessageParam],
         tools: Option<&[protocol::ChatCompletionToolsParam]>,
-        tool_choice: Option<&serde_json::Value>,
         extra_kwargs: Option<&std::collections::HashMap<String, serde_json::Value>>,
         add_generation_prompt: bool,
     ) -> Result<String, ServeError> {
         let views: Vec<TemplateMessageView<'_>> =
             messages.iter().map(TemplateMessageView::new).collect();
 
-        // `tool_choice: "none"` means "do not tell the model about the tools",
-        // so the template must not see them at all.
-        let tools = match tool_choice {
-            Some(tc) if tc.as_str() == Some("none") => None,
-            _ => tools.map(|t| minijinja::Value::from(Serde(t))),
-        };
+        // The tools render whatever `tool_choice` says, `"none"` included: the engine reads no
+        // tool call out of a `"none"` reply. Leaving them out would change the prompt's start,
+        // which most templates give the tools, so a `"none"` request would share no prefix with
+        // its siblings' and prefill from scratch. vLLM keeps them too, by default.
+        let tools = tools.map(|t| minijinja::Value::from(Serde(t)));
 
         self.render_values(
             minijinja::Value::from(Serde(&views)),
@@ -853,9 +851,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = tpl
-            .render_chat(&[], Some(&tools), None, None, false)
-            .unwrap();
+        let result = tpl.render_chat(&[], Some(&tools), None, false).unwrap();
         assert_eq!(
             result,
             r#"TOOLS:[{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]"#
@@ -939,7 +935,7 @@ mod tests {
         );
 
         // Through the shared routine it renders.
-        let out = tpl.render_chat(&[msg], None, None, None, false).unwrap();
+        let out = tpl.render_chat(&[msg], None, None, false).unwrap();
         assert_eq!(out, "assistant: |");
     }
 
@@ -953,7 +949,7 @@ mod tests {
         .unwrap();
         // Indexing `.command` only works once the JSON *string* is an object.
         let out = tpl
-            .render_chat(&[tool_call_turn()], None, None, None, false)
+            .render_chat(&[tool_call_turn()], None, None, false)
             .unwrap();
         assert_eq!(out, "ls");
     }
@@ -971,7 +967,7 @@ mod tests {
         let mut msg = tool_call_turn();
         msg.tool_calls.as_mut().unwrap()[0].function.arguments =
             r#"{"path":"/tmp","command":"ls","args":{"z":1,"a":2}}"#.to_string();
-        let out = tpl.render_chat(&[msg], None, None, None, false).unwrap();
+        let out = tpl.render_chat(&[msg], None, None, false).unwrap();
         assert_eq!(
             out,
             r#"{"path": "/tmp", "command": "ls", "args": {"z": 1, "a": 2}}"#
@@ -993,13 +989,15 @@ mod tests {
             tool_call_id: None,
             reasoning: None,
         };
-        let out = tpl.render_chat(&[msg], None, None, None, false).unwrap();
+        let out = tpl.render_chat(&[msg], None, None, false).unwrap();
         assert_eq!(out, "[Hello]");
     }
 
-    /// `tool_choice: "none"` means the template must not see the tools at all.
+    /// The tools a request sends reach the template; `render_chat` takes no `tool_choice`, so a
+    /// `"none"` request renders them as an `"auto"` one does (the engine's test of that is
+    /// `a_tool_choice_of_none_renders_the_prompt_auto_does`).
     #[test]
-    fn test_render_chat_honours_tool_choice_none() {
+    fn test_render_chat_renders_the_tools() {
         let tpl =
             ChatTemplate::new("{% if tools %}TOOLS{% else %}NONE{% endif %}".to_string()).unwrap();
         let msg = protocol::ChatCompletionMessageParam {
@@ -1020,14 +1018,11 @@ mod tests {
         }];
 
         let with = tpl
-            .render_chat(std::slice::from_ref(&msg), Some(&tools), None, None, false)
+            .render_chat(std::slice::from_ref(&msg), Some(&tools), None, false)
             .unwrap();
         assert_eq!(with, "TOOLS");
 
-        let none = serde_json::Value::String("none".to_string());
-        let without = tpl
-            .render_chat(&[msg], Some(&tools), Some(&none), None, false)
-            .unwrap();
+        let without = tpl.render_chat(&[msg], None, None, false).unwrap();
         assert_eq!(without, "NONE");
     }
 

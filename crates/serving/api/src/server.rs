@@ -654,7 +654,7 @@ async fn tokenize(
                     .into_response();
                 }
             };
-            match template.render_chat(messages, None, None, None, request.add_generation_prompt) {
+            match template.render_chat(messages, None, None, request.add_generation_prompt) {
                 Ok(text) => text,
                 Err(e) => {
                     return Json(protocol::ErrorResponse::new(
