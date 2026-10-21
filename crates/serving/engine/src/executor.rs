@@ -379,6 +379,12 @@ pub trait Executor: Send {
         None
     }
 
+    /// Hand the engine's stop tokens to the worker that samples
+    /// ([`crate::worker::Worker::set_stop_token_ids`]): the engine calls it once, as it is built.
+    /// `EngineCore` stops a request on the same ids, so the two can't disagree. Default: ignored,
+    /// by an executor that does not forward it.
+    fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
+
     /// Check whether the executor is healthy.
     ///
     /// Returns `Ok(())` if healthy, or an error describing the problem.

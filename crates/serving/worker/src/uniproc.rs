@@ -137,6 +137,11 @@ impl Executor for UniProcExecutor {
         self.worker.snapshot_budget()
     }
 
+    /// Straight through to the worker, which samples.
+    fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+        self.worker.set_stop_token_ids(stop_token_ids);
+    }
+
     fn initialize_cache(
         &mut self,
         num_gpu_blocks: usize,
@@ -227,6 +232,55 @@ mod tests {
     fn make_test_executor() -> UniProcExecutor {
         let worker = Box::new(NoopWorker::with_defaults(16 * 1024 * 1024));
         UniProcExecutor::new(worker)
+    }
+
+    /// A [`NoopWorker`] that keeps the stop tokens it is handed.
+    struct StopRecordingWorker(NoopWorker, std::sync::Arc<std::sync::Mutex<Vec<u32>>>);
+
+    impl Worker for StopRecordingWorker {
+        fn init_device(&mut self) -> ExecutorResult<()> {
+            self.0.init_device()
+        }
+        fn load_model(&mut self) -> ExecutorResult<()> {
+            self.0.load_model()
+        }
+        fn initialize_cache(&mut self, gpu: usize, cpu: usize) -> ExecutorResult<()> {
+            self.0.initialize_cache(gpu, cpu)
+        }
+        fn determine_available_memory(&mut self) -> ExecutorResult<usize> {
+            self.0.determine_available_memory()
+        }
+        fn execute_model(
+            &mut self,
+            scheduler_output: &SchedulerOutput,
+        ) -> ExecutorResult<ModelRunnerOutput> {
+            self.0.execute_model(scheduler_output)
+        }
+        fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+            *self.1.lock().unwrap() = stop_token_ids.to_vec();
+        }
+        fn shutdown(&mut self) {
+            self.0.shutdown()
+        }
+        fn rank(&self) -> usize {
+            self.0.rank()
+        }
+        fn local_rank(&self) -> usize {
+            self.0.local_rank()
+        }
+        fn is_driver_worker(&self) -> bool {
+            self.0.is_driver_worker()
+        }
+    }
+
+    /// The engine's stop tokens reach the worker, which samples.
+    #[test]
+    fn the_stop_tokens_reach_the_worker() {
+        let handed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker = NoopWorker::with_defaults(16 * 1024 * 1024);
+        let mut exec = UniProcExecutor::new(Box::new(StopRecordingWorker(worker, handed.clone())));
+        exec.set_stop_token_ids(&[2, 0]);
+        assert_eq!(*handed.lock().unwrap(), [2, 0]);
     }
 
     #[test]

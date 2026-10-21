@@ -385,13 +385,31 @@ pub fn apply_grammar_mask(logits: &mut [f32], allowed: &[TokenId]) {
     }
 }
 
-/// Build a `TokEnv` and `ParserFactory` from raw tokenizer.json bytes.
+/// Build a `TokEnv` and `ParserFactory` from raw tokenizer.json bytes, its grammars ending on
+/// `stop_token_ids`: the tokens the engine stops a request on (`EngineCoreConfig::eos_token_ids`).
+///
+/// ⛔ A FINISHED GRAMMAR ALLOWS ONLY ITS END OF SEQUENCE, SO THAT MUST BE WHAT STOPS THE REQUEST.
+/// toktrie reads its own from tokenizer.json, by name (`<|endoftext|>`, `</s>`, …), and on an
+/// instruct model that is often not the token that ends a turn. SmolLM2 and Qwen end one on
+/// `<|im_end|>`, and Llama 3 Instruct on `<|eot_id|>`. With toktrie's own, a constrained reply's
+/// model emits it, unstopped, until `max_tokens`. So every stop token in the tokenizer's vocab is
+/// the end of sequence here, and with none (or none in the vocab), toktrie's own.
 ///
 /// Workers call this once at model-load time and cache the result.
 /// The `ParserFactory` is expensive to create (builds sliced bias computer)
 /// but is reused across all requests.
-pub fn build_parser_factory(tokenizer_json: &[u8]) -> Result<Arc<ParserFactory>, String> {
-    let byte_tok = ByteTokenizer::from_json_bytes(tokenizer_json).map_err(|e| e.to_string())?;
+pub fn build_parser_factory(
+    tokenizer_json: &[u8],
+    stop_token_ids: &[u32],
+) -> Result<Arc<ParserFactory>, String> {
+    let mut byte_tok = ByteTokenizer::from_json_bytes(tokenizer_json).map_err(|e| e.to_string())?;
+    let vocab_size = byte_tok.tokrx_info().vocab_size;
+    let stops: Vec<u32> = (stop_token_ids.iter().copied())
+        .filter(|&id| id < vocab_size)
+        .collect();
+    if !stops.is_empty() {
+        byte_tok.set_eos_tokens(&stops);
+    }
     let tok_env = byte_tok.into_tok_env(None).map_err(|e| e.to_string())?;
     let mut factory = ParserFactory::new_simple(&tok_env).map_err(|e| e.to_string())?;
     factory.set_stderr_log_level(0);
@@ -407,6 +425,14 @@ mod tests {
     use super::*;
 
     fn make_test_factory() -> Arc<ParserFactory> {
+        make_test_factory_ending_on(&[])
+    }
+
+    /// The test tokenizer's factory, its grammars ending on `stop_token_ids`. The tokenizer's own
+    /// end of sequence, by toktrie's reading of its names, is `</s>` (31); `<|im_end|>` (32) is
+    /// the end of a turn, as an instruct model's chat template ends one. Ids are dense, as a real
+    /// tokenizer's are: toktrie sizes its vocab by the tokens it has, not by their largest id.
+    fn make_test_factory_ending_on(stop_token_ids: &[u32]) -> Arc<ParserFactory> {
         // Use a minimal BPE tokenizer JSON for testing.
         let tokenizer_json = r#"{
             "version": "1.0",
@@ -414,7 +440,8 @@ mod tests {
             "padding": null,
             "added_tokens": [
                 {"id": 0, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
-                {"id": 99, "content": "</s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+                {"id": 31, "content": "</s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 32, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
             ],
             "normalizer": null,
             "pre_tokenizer": {
@@ -470,7 +497,7 @@ mod tests {
                 "merges": []
             }
         }"#;
-        build_parser_factory(tokenizer_json.as_bytes()).unwrap()
+        build_parser_factory(tokenizer_json.as_bytes(), stop_token_ids).unwrap()
     }
 
     #[test]
@@ -570,6 +597,36 @@ mod tests {
             guide.allowed_tokens().is_none(),
             "terminated grammar should return None"
         );
+    }
+
+    /// ⭐ A finished grammar allows the tokens the engine stops a request on, so the request stops
+    /// there. The tokenizer's own end of sequence (`</s>`, 31) is not one of them on an instruct
+    /// model whose turns end on `<|im_end|>` (32, as SmolLM2's and Qwen's do): allowing it alone,
+    /// the model emits it until `max_tokens`. Every stop token is allowed, and each ends the
+    /// grammar. With none given, the tokenizer's own is the end, as before.
+    #[test]
+    fn a_finished_grammar_allows_the_tokens_that_stop_the_request() {
+        let finished = |stop_token_ids: &[u32]| {
+            let factory = make_test_factory_ending_on(stop_token_ids);
+            let mut guide = GrammarGuide::from_regex("[0-9]", &factory).unwrap();
+            assert!(guide.advance(8), "1");
+            assert!(guide.is_finished());
+            guide
+        };
+        let mut allowed = finished(&[32]).allowed_tokens().unwrap();
+        allowed.sort();
+        assert_eq!(allowed, [32], "<|im_end|>, the turn's end");
+
+        let mut allowed = finished(&[31, 32]).allowed_tokens().unwrap();
+        allowed.sort();
+        assert_eq!(allowed, [31, 32], "every stop token");
+        for stop in [31, 32] {
+            let mut guide = finished(&[31, 32]);
+            assert!(guide.advance(stop));
+            assert!(guide.is_terminated(), "{stop} ends it");
+        }
+
+        assert_eq!(finished(&[]).allowed_tokens().unwrap(), [31], "</s>");
     }
 
     #[test]

@@ -233,7 +233,10 @@ fn takes_drafts(scheduler: &Scheduler, req_id: &str) -> bool {
 
 impl EngineCore {
     /// Create a new EngineCore.
-    pub fn new(config: EngineCoreConfig, executor: Box<dyn Executor>) -> Self {
+    pub fn new(config: EngineCoreConfig, mut executor: Box<dyn Executor>) -> Self {
+        // ⭐ A finished guided grammar ends on what stops a request here, not on a guess of
+        // the tokenizer's (`grammar::build_parser_factory`).
+        executor.set_stop_token_ids(&config.eos_token_ids);
         use scratchy_serving_scheduler::scheduler::core::SimpleBlockTracker;
 
         let kv_cache: Box<dyn scratchy_serving_scheduler::scheduler::core::KVCacheManagerOps> = {
@@ -2699,6 +2702,42 @@ mod tests {
 
         assert_eq!(req_out.finish_reason, Some(FinishReason::Stop));
         assert_eq!(engine.num_unfinished_requests(), 0);
+    }
+
+    /// A [`NoopExecutor`] that keeps the stop tokens it is handed.
+    struct StopRecordingExecutor(NoopExecutor, std::sync::Arc<std::sync::Mutex<Vec<u32>>>);
+
+    impl Executor for StopRecordingExecutor {
+        fn execute_model(
+            &mut self,
+            scheduler_output: &SchedulerOutput,
+        ) -> EngineResult<ModelRunnerOutput> {
+            self.0.execute_model(scheduler_output)
+        }
+        fn initialize_cache(&mut self, gpu: usize, cpu: usize) -> EngineResult<()> {
+            self.0.initialize_cache(gpu, cpu)
+        }
+        fn determine_available_memory(&mut self) -> EngineResult<Vec<usize>> {
+            self.0.determine_available_memory()
+        }
+        fn shutdown(&mut self) {
+            self.0.shutdown()
+        }
+        fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+            *self.1.lock().unwrap() = stop_token_ids.to_vec();
+        }
+    }
+
+    /// The engine hands the worker the tokens it stops a request on, as it is built, so a finished
+    /// guided grammar ends on those (`grammar::build_parser_factory`).
+    #[test]
+    fn the_engine_hands_its_stop_tokens_to_the_worker() {
+        let handed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut config = make_test_config();
+        config.eos_token_ids = vec![2, 0];
+        let executor = StopRecordingExecutor(NoopExecutor::new(1024), handed.clone());
+        let _engine = EngineCore::new(config, Box::new(executor));
+        assert_eq!(*handed.lock().unwrap(), [2, 0]);
     }
 
     /// A [`NoopExecutor`] whose worker keeps recurrent-state snapshots (a GDN hybrid on metal).
