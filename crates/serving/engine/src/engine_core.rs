@@ -666,11 +666,14 @@ impl EngineCore {
 
     /// A step the executor failed: it is never finalized, so it leads no more, and its requests
     /// are aborted — none has the output the step owed it, and left running, the next step (or
-    /// the next caller's) would drive them on.
-    pub fn abandon_step(&mut self, sched: &SchedulerOutput) {
+    /// the next caller's) would drive them on. The KV it was to write is no prefix-cache hit
+    /// ([`Scheduler::forget_unwritten`]), and a request a step behind it admitted onto that KV is
+    /// aborted with them. Returns every request aborted.
+    pub fn abandon_step(&mut self, sched: &SchedulerOutput) -> Vec<String> {
         self.end_lead(sched);
-        let req_ids: Vec<String> = sched.num_scheduled_tokens.keys().cloned().collect();
+        let req_ids = self.scheduler.forget_unwritten(sched);
         self.abort_requests(&req_ids);
+        req_ids
     }
 
     /// A step done — finalized or failed: the step behind it waits on it no more.
@@ -860,10 +863,10 @@ impl EngineCore {
         let mut client_outputs: StepOutputs = HashMap::new();
         let mut finished_ids: Vec<(String, RequestStatus)> = Vec::new();
 
-        // ⭐ THE STEP RAN, SO THE RECURRENT-STATE SNAPSHOTS IT SAVED HOLD THEIR STATE — committed
-        // here and not when they were scheduled, because a step that fails never gets here.
-        self.scheduler
-            .commit_state_saves(&scheduler_output.recurrent_state.saves);
+        // ⭐ THE STEP RAN, SO THE RECURRENT-STATE SNAPSHOTS IT SAVED HOLD THEIR STATE, AND THE KV
+        // BLOCKS REGISTERED WHILE IT WAS SCHEDULED HOLD THEIRS — committed here and not when they
+        // were scheduled, because a step that fails never gets here.
+        self.scheduler.commit_step(scheduler_output);
         // ⭐ THE WORKER'S KV REPORT, BEFORE ANY OF THE TOKEN BOOKKEEPING. Empty for every backend whose
         // keys sit at their token positions; on one where they do not, this is what the next step's block
         // allocation is sized by and what bounds the prefix it may cache. Over the whole report rather

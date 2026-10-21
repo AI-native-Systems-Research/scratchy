@@ -113,10 +113,11 @@ pub trait EngineCoreClient {
     }
 
     /// A step the executor failed, never to be finalized: it leads no more and its requests are
-    /// aborted ([`EngineCore::abandon_step`]). No default: the server's step loop aborts a failed
-    /// step's requests through it alone, so a client that took the executor and kept a no-op
-    /// here would leave them running.
-    fn abandon_step(&mut self, sched: &SchedulerOutput);
+    /// aborted, with any a step behind it admitted onto the KV it was to write
+    /// ([`EngineCore::abandon_step`]). Returns every request aborted. No default: the server's
+    /// step loop aborts a failed step's requests through it alone, so a client that took the
+    /// executor and kept a no-op here would leave them running.
+    fn abandon_step(&mut self, sched: &SchedulerOutput) -> Vec<String>;
 
     /// Whether async scheduling is enabled on the underlying engine.
     fn async_scheduling(&self) -> bool {
@@ -523,8 +524,8 @@ impl EngineCoreClient for InprocClient {
         Ok(self.engine.schedule_next())
     }
 
-    fn abandon_step(&mut self, sched: &SchedulerOutput) {
-        self.engine.abandon_step(sched);
+    fn abandon_step(&mut self, sched: &SchedulerOutput) -> Vec<String> {
+        self.engine.abandon_step(sched)
     }
 
     fn async_scheduling(&self) -> bool {

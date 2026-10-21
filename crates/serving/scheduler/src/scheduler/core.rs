@@ -26,7 +26,7 @@ use tracing::warn;
 use super::interface::{PauseState, SchedulerInterface};
 use super::output::{
     CachedKvOp, CachedRequestData, NewRequestData, RecurrentStateOps, SchedulerOutput,
-    SharedMemoryOps, StateSnapshotOp,
+    SharedMemoryOps, StateSnapshotOp, StepId,
 };
 use super::recurrent_state::{SnapshotBudget, StateSnapshots};
 use super::request_queue::{RequestQueue, SchedulingPolicy, create_request_queue};
@@ -119,8 +119,8 @@ pub trait KVCacheManagerOps: Send {
     /// the cached blocks.
     fn get_computed_blocks(&self, request: &Request) -> (u32, Vec<Vec<usize>>);
 
-    /// Notify the KV cache manager that a new scheduling step is starting.
-    fn new_step_starts(&mut self);
+    /// Notify the KV cache manager that a new scheduling step is starting, and number it.
+    fn new_step_starts(&mut self) -> StepId;
 
     /// THE WORKER'S POOL-WIDE KV REACH, for the allocator that sizes a request nothing has run yet.
     ///
@@ -194,6 +194,19 @@ pub trait KVCacheManagerOps: Send {
 
     /// The step that carried `saves` reported back: those snapshots now hold their state.
     fn commit_state_saves(&mut self, _saves: &[StateSnapshotOp]) {}
+
+    /// Step `step` came back, and every step before it came back or failed: each block registered
+    /// in the prefix cache while they were scheduled holds the KV it was registered for.
+    fn commit_written(&mut self, step: StepId);
+
+    /// ⛔ A FAILED STEP'S BLOCKS ARE NO PREFIX-CACHE HITS. Step `failed` never came back, and
+    /// `requests` ran in it. A block is registered when the step that writes it is scheduled, so
+    /// the steps behind can hit it, and no step that came back proves any block one of them
+    /// registered since `failed` was scheduled: each stops being a hit, though its request has been
+    /// freed since. So does every block a request that took one of them from the cache registered:
+    /// each of its keys attended KV nobody wrote. Returns `requests` and those, each once: none may
+    /// run on.
+    fn forget_unwritten(&mut self, failed: StepId, requests: &[String]) -> Vec<String>;
 
     /// The memory this step moves between KV and the snapshots (see [`SharedMemoryOps`]),
     /// taken once its scheduling is done.
@@ -284,6 +297,23 @@ pub struct SimpleBlockTracker {
 
     /// Request ID → ordered list of block hashes.
     req_to_hashes: HashMap<String, Vec<u64>>,
+
+    /// The step being scheduled, or the last one if none is: what a block
+    /// registered now is journaled under.
+    step: StepId,
+
+    /// ⭐ THE PREFIX-CACHE REGISTRATIONS NO STEP THAT CAME BACK HAS PROVEN
+    /// WRITTEN, per step, oldest first: per request, each block it registered
+    /// while the step was scheduled. Kept apart from the per-request maps,
+    /// which a request's `free` erases while its blocks stay mapped, so a
+    /// request preempted or aborted with a step in flight is still found here
+    /// ([`KVCacheManagerOps::forget_unwritten`]). A step's entries go when it
+    /// or a later step comes back ([`KVCacheManagerOps::commit_written`]).
+    journal: VecDeque<StepJournal>,
+
+    /// The last step that came back: steps come back in the order they were
+    /// scheduled, which `journal` is dropped by.
+    committed: StepId,
 
     /// Spans (relocatable KV cache block) configuration.
     spans_config: SpansConfig,
@@ -403,6 +433,35 @@ struct GroupHashes {
     registered: usize,
 }
 
+/// One step's journal entry (`SimpleBlockTracker::journal`).
+#[derive(Debug)]
+struct StepJournal {
+    step: StepId,
+    /// Per request, each block it registered in the prefix cache while the
+    /// step was scheduled.
+    registered: HashMap<String, Vec<(Origin, Registered)>>,
+}
+
+/// How a request came by a block it registered in the prefix cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Origin {
+    /// Its own step writes the block's KV.
+    Wrote,
+    /// It took the block from the cache: the block's hash already mapped to
+    /// it, and its KV is its writer's — the hit block a fully cached prompt
+    /// recomputes, too.
+    Took,
+}
+
+/// A block as a request registered it in the prefix cache: its KV-cache
+/// group, its `space_slot`, and the hash it is cached under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Registered {
+    group: u32,
+    slot: usize,
+    hash: u64,
+}
+
 /// One KV-cache group's allocation spec on the hybrid (SWA) path.
 #[derive(Clone, Copy, Debug)]
 struct SwaGroup {
@@ -505,6 +564,9 @@ impl SimpleBlockTracker {
             block_hash_to_id: HashMap::new(),
             block_id_to_hash: HashMap::new(),
             req_to_hashes: HashMap::new(),
+            step: StepId::default(),
+            journal: VecDeque::new(),
+            committed: StepId::default(),
             spans_config: SpansConfig::from_env(),
             swa_groups: None,
             hybrid_spaces: Vec::new(),
@@ -1003,6 +1065,41 @@ impl SimpleBlockTracker {
         }
     }
 
+    /// Journal that request `id` registered `blocks` in the prefix cache, under the step being
+    /// scheduled (`journal`).
+    fn record(&mut self, id: &str, blocks: impl IntoIterator<Item = (Origin, Registered)>) {
+        let mut blocks = blocks.into_iter().peekable();
+        if blocks.peek().is_none() {
+            return;
+        }
+        if self.journal.back().is_none_or(|j| j.step != self.step) {
+            let step = self.step;
+            (self.journal).push_back(StepJournal {
+                step,
+                registered: HashMap::new(),
+            });
+        }
+        let journal = self.journal.back_mut().expect("pushed above");
+        match journal.registered.get_mut(id) {
+            Some(registered) => registered.extend(blocks),
+            None => {
+                journal.registered.insert(id.to_owned(), blocks.collect());
+            }
+        }
+    }
+
+    /// Stop `block` being a prefix-cache hit, if the cache still maps it as it was registered: a
+    /// block recycled since is another request's now, and so is a mapping another moved.
+    fn uncache(&mut self, block: Registered) {
+        if self.swa_groups.is_some() {
+            if self.hybrid_id_to_key.get(&block.slot) == Some(&(block.group, block.hash)) {
+                self.evict_hybrid_cached(block.slot);
+            }
+        } else if self.block_id_to_hash.get(&block.slot) == Some(&block.hash) {
+            self.evict_cached(block.slot);
+        }
+    }
+
     /// Whether `block_id`'s memory is mapped: always, unless KV shares its budget with the
     /// snapshots and the block's granule is not.
     fn block_mapped(&self, block_id: usize) -> bool {
@@ -1197,19 +1294,24 @@ impl SimpleBlockTracker {
             let slot = self.space_slot(space, id);
             self.ref_cnt[slot] = 1;
             self.hybrid_spaces[space].used += 1;
-            // Lazy eviction: if this recycled block was still hash-mapped, drop
-            // both directions so it can't be handed out as a stale cache hit
-            // (mirrors `allocate_fresh_blocks` / Python `_maybe_evict_cached_block`).
-            // The key's mapping goes only if it still points at THIS block: a later
-            // request that computed the same key into a block of its own moved it.
-            if let Some(key) = self.hybrid_id_to_key.remove(&slot)
-                && self.hybrid_hash_to_id.get(&key) == Some(&id)
-            {
-                self.hybrid_hash_to_id.remove(&key);
-            }
+            self.evict_hybrid_cached(slot);
             ids.push(id);
         }
         Some(ids)
+    }
+
+    /// Lazy eviction on the hybrid path: if block `slot` is still hash-mapped,
+    /// drop both directions so it can't be handed out as a stale cache hit
+    /// (mirrors [`Self::evict_cached`] / Python `_maybe_evict_cached_block`).
+    /// The key's mapping goes only if it still points at THIS block: a later
+    /// request that computed the same key into a block of its own moved it.
+    fn evict_hybrid_cached(&mut self, slot: usize) {
+        let (_, id) = self.slot_block(slot);
+        if let Some(key) = self.hybrid_id_to_key.remove(&slot)
+            && self.hybrid_hash_to_id.get(&key) == Some(&id)
+        {
+            self.hybrid_hash_to_id.remove(&key);
+        }
     }
 
     /// Return `blocks` of block space `space` to that space (hybrid path),
@@ -1634,7 +1736,8 @@ impl SimpleBlockTracker {
             .map(std::mem::take)
             .unwrap_or_default();
         req_hashes.resize_with(groups.len(), GroupHashes::default);
-        // `(key, block, space_slot)` of each block to register.
+        // `(key, block, space_slot, origin)` of each block to register: one the key already maps
+        // to was taken from the cache.
         let mut new_keys = Vec::new();
         for (g, grp) in groups.iter().enumerate() {
             let group = &mut req_hashes[g];
@@ -1652,14 +1755,23 @@ impl SimpleBlockTracker {
                 if bid == Self::NULL_BLOCK {
                     continue; // out-of-window: never register (KV is gone)
                 }
-                new_keys.push(((g as u32, hash), bid, self.space_slot(grp.space, bid)));
+                let key = (g as u32, hash);
+                let origin = match self.hybrid_hash_to_id.get(&key) == Some(&bid) {
+                    true => Origin::Took,
+                    false => Origin::Wrote,
+                };
+                new_keys.push((key, bid, self.space_slot(grp.space, bid), origin));
             }
             group.registered = group.registered.max(ready);
         }
-        for (key, bid, slot) in new_keys {
+        let mut journaled = Vec::with_capacity(new_keys.len());
+        for (key, bid, slot, origin) in new_keys {
             self.hybrid_hash_to_id.insert(key, bid);
             self.hybrid_id_to_key.insert(slot, key);
+            let (group, hash) = key;
+            journaled.push((origin, Registered { group, slot, hash }));
         }
+        self.record(id, journaled);
         match self.hybrid_req_hashes.get_mut(id) {
             Some(kept) => *kept = req_hashes,
             None => {
@@ -2006,9 +2118,18 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                 //    slot) + register fresh FULL blocks so later (reordered)
                 //    requests can hit them.
                 let mut all_ids = Vec::with_capacity(needed);
+                let mut journaled = Vec::new();
                 for i in 0..needed {
                     if let Some(bid) = reuse_at(i) {
                         all_ids.push(bid); // hash already registered by req1
+                        if let Some(&hash) = all_hashes.get(i) {
+                            let block = Registered {
+                                group: 0,
+                                slot: bid,
+                                hash,
+                            };
+                            journaled.push((Origin::Took, block));
+                        }
                     } else {
                         let bid = self.allocate_fresh_blocks(1)?[0];
                         all_ids.push(bid);
@@ -2016,10 +2137,17 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                             let h = all_hashes[i];
                             self.block_hash_to_id.insert(h, bid);
                             self.block_id_to_hash.insert(bid, h);
+                            let block = Registered {
+                                group: 0,
+                                slot: bid,
+                                hash: h,
+                            };
+                            journaled.push((Origin::Wrote, block));
                         }
                     }
                 }
                 debug_assert_eq!(all_ids.len(), needed, "block table must be dense+ordinal");
+                self.record(&request.request_id, journaled);
 
                 // 4. req_to_hashes = positional full-block hashes (hit + miss
                 //    alike), so free/seal/re-admit accounting stays consistent.
@@ -2066,6 +2194,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         entry.1 = needed;
 
         // When caching is enabled, record block hashes for full blocks.
+        let mut journaled = Vec::new();
         if let Some(all_hashes) = all_hashes {
             let all_block_ids = &entry.0[0];
             let mut hashes = self
@@ -2081,6 +2210,12 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                     self.block_hash_to_id.insert(hash, bid);
                     self.block_id_to_hash.insert(bid, hash);
                     hashes.push(hash);
+                    let block = Registered {
+                        group: 0,
+                        slot: bid,
+                        hash,
+                    };
+                    journaled.push((Origin::Wrote, block));
                 }
             }
 
@@ -2092,6 +2227,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
 
         // Return all block IDs for this request (single KV cache group).
         let result = entry.0.clone();
+        self.record(&request.request_id, journaled);
         Some(result)
     }
 
@@ -2182,6 +2318,8 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             .req_to_hashes
             .entry(request.request_id.clone())
             .or_default();
+        // An aborted request's last chunk may still be in flight: sealed blocks are journaled too.
+        let mut journaled = Vec::new();
         for i in hashes.len()..num_full_blocks {
             if i < all_hashes.len() && i < block_ids.len() {
                 let hash = all_hashes[i];
@@ -2189,6 +2327,12 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                 self.block_hash_to_id.insert(hash, bid);
                 self.block_id_to_hash.insert(bid, hash);
                 hashes.push(hash);
+                let block = Registered {
+                    group: 0,
+                    slot: bid,
+                    hash,
+                };
+                journaled.push((Origin::Wrote, block));
 
                 if self.spans_config.debug {
                     tracing::debug!(
@@ -2200,6 +2344,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                 }
             }
         }
+        self.record(&request.request_id, journaled);
     }
 
     fn free_volatile(&mut self, request_id: &str) {
@@ -2314,10 +2459,12 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         (contiguous_tokens, vec![matched_block_ids])
     }
 
-    fn new_step_starts(&mut self) {
+    fn new_step_starts(&mut self) -> StepId {
         if let Some(rec) = self.recurrent.as_mut() {
             rec.snapshots.tick();
         }
+        self.step = self.step.next();
+        self.step
     }
 
     fn reset_prefix_cache(&mut self) -> bool {
@@ -2331,6 +2478,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         self.block_hash_to_id.clear();
         self.block_id_to_hash.clear();
         self.req_to_hashes.clear();
+        self.journal.clear();
         self.hybrid_hash_to_id.clear();
         self.hybrid_id_to_key.clear();
         self.hybrid_req_hashes.clear();
@@ -2546,6 +2694,50 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                 rec.snapshots.commit(op.slot, op.key, &op.req_id);
             }
         }
+    }
+
+    fn commit_written(&mut self, step: StepId) {
+        debug_assert!(
+            step >= self.committed,
+            "{step:?} came back after {:?}: steps come back in order",
+            self.committed
+        );
+        self.committed = step;
+        while self.journal.front().is_some_and(|j| j.step <= step) {
+            self.journal.pop_front();
+        }
+    }
+
+    fn forget_unwritten(&mut self, failed: StepId, requests: &[String]) -> Vec<String> {
+        let mut doomed = requests.to_vec();
+        let mut newly = doomed.clone();
+        let mut gone = HashSet::new();
+        while !newly.is_empty() {
+            // Their own writes since `failed` was scheduled: no step that came back proves one.
+            let mut wrote = Vec::new();
+            for journal in (self.journal.iter_mut()).filter(|j| j.step >= failed) {
+                for id in &newly {
+                    let blocks = journal.registered.remove(id).unwrap_or_default();
+                    wrote.extend(blocks.into_iter().filter(|(o, _)| *o == Origin::Wrote));
+                }
+            }
+            for (_, block) in wrote {
+                self.uncache(block);
+                gone.insert(block);
+            }
+            // A request that took one of them from the cache: every key it computed attended it.
+            let took: HashSet<&String> = (self.journal.iter())
+                .filter(|j| j.step >= failed)
+                .flat_map(|j| j.registered.iter())
+                .filter(|(_, blocks)| {
+                    (blocks.iter()).any(|(o, b)| *o == Origin::Took && gone.contains(b))
+                })
+                .map(|(id, _)| id)
+                .collect();
+            newly = took.into_iter().cloned().collect();
+            doomed.extend(newly.iter().cloned());
+        }
+        doomed
     }
 
     fn take_shared_memory_ops(&mut self) -> SharedMemoryOps {
@@ -3051,11 +3243,24 @@ impl Scheduler {
         self.kv_cache.set_kv_backed(backed);
     }
 
-    /// The step that carried `saves` reported back, so its recurrent-state snapshots hold their
-    /// state and may be resumed from. Called from the step's output, never at scheduling time:
-    /// a step that fails never gets here, and its snapshots never become hittable.
-    pub fn commit_state_saves(&mut self, saves: &[StateSnapshotOp]) {
-        self.kv_cache.commit_state_saves(saves);
+    /// Step `step` came back, so what it wrote holds: its recurrent-state snapshots may be resumed
+    /// from, and the prefix-cache blocks registered while it was scheduled stay hits whatever a
+    /// later step does. Called from the step's output, never at scheduling time: a step that fails
+    /// never gets here ([`Self::forget_unwritten`]).
+    pub fn commit_step(&mut self, step: &SchedulerOutput) {
+        self.kv_cache
+            .commit_state_saves(&step.recurrent_state.saves);
+        self.kv_cache.commit_written(step.step);
+    }
+
+    /// ⛔ THE STEP `failed` SCHEDULED NEVER CAME BACK, so the KV it was to write may not exist. Its
+    /// blocks went into the prefix cache when it was scheduled, for the steps behind it to hit, and
+    /// now stop being hits ([`KVCacheManagerOps::forget_unwritten`]). Returns the requests that
+    /// cannot run on: the step's own, and any a step behind it admitted onto those blocks. The
+    /// caller aborts them.
+    pub fn forget_unwritten(&mut self, failed: &SchedulerOutput) -> Vec<String> {
+        let requests: Vec<String> = failed.num_scheduled_tokens.keys().cloned().collect();
+        self.kv_cache.forget_unwritten(failed.step, &requests)
     }
 
     ///
@@ -3178,7 +3383,7 @@ impl SchedulerInterface for Scheduler {
             token_budget = 0;
         }
 
-        self.kv_cache.new_step_starts();
+        let step = self.kv_cache.new_step_starts();
 
         // ---------------------------------------------------------------
         // Phase 1: Schedule RUNNING requests
@@ -3658,6 +3863,7 @@ impl SchedulerInterface for Scheduler {
                 saves: state_saves,
                 memory: self.kv_cache.take_shared_memory_ops(),
             },
+            step,
         };
 
         // Post-schedule updates.
@@ -7364,6 +7570,329 @@ mod tests {
         assert_eq!(t1, t0);
     }
 
+    // ----- A failed step's blocks (#759) -----
+
+    /// The prefix-cache hit, in tokens, of a new request whose prompt is `0..len`.
+    fn hit_of(t: &SimpleBlockTracker, len: usize) -> u32 {
+        t.get_computed_blocks(&make_request("probe", len)).0
+    }
+
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    fn sorted(mut ids: Vec<String>) -> Vec<String> {
+        ids.sort();
+        ids
+    }
+
+    /// A step's blocks are registered when it is scheduled, for the steps behind it to hit. Once
+    /// it fails they are no hits, and those of the step before it, which came back, still are.
+    #[test]
+    fn a_failed_steps_blocks_are_no_prefix_cache_hits() {
+        let mut t = SimpleBlockTracker::with_caching(16, 16);
+        let mut r = make_request("r1", 64);
+        let ran = t.new_step_starts();
+        t.allocate_slots(&r, 32, 0, &[]).unwrap();
+        t.commit_written(ran);
+        r.num_computed_tokens = 32;
+        let failed = t.new_step_starts();
+        t.allocate_slots(&r, 32, 0, &[]).unwrap();
+        assert_eq!(
+            hit_of(&t, 64),
+            64,
+            "the second chunk is a hit once scheduled"
+        );
+
+        assert_eq!(t.forget_unwritten(failed, &ids(&["r1"])), ["r1"]);
+        assert_eq!(hit_of(&t, 64), 32, "the first chunk came back");
+        let next = t.new_step_starts();
+        t.commit_written(next);
+        assert!(
+            t.journal.is_empty(),
+            "a step that comes back drops what it proved"
+        );
+    }
+
+    /// A request a step behind the failed one admitted onto its blocks attended KV nobody wrote:
+    /// it fails with it, and the blocks it wrote are no hits either. A bystander's still are.
+    #[test]
+    fn a_request_admitted_onto_a_failed_steps_blocks_fails_with_it() {
+        let mut t = SimpleBlockTracker::with_caching(32, 16);
+        let failed = t.new_step_starts();
+        t.allocate_slots(&make_request("r1", 64), 64, 0, &[])
+            .unwrap();
+        t.new_step_starts();
+        let mut q = make_request("q", 96);
+        let (hit, blocks) = t.get_computed_blocks(&q);
+        assert_eq!(hit, 64, "q is admitted onto r1's blocks");
+        q.num_computed_tokens = hit;
+        let q_blocks = t.allocate_slots(&q, 32, 0, &blocks).unwrap()[0].clone();
+        let params = SamplingParams {
+            max_tokens: Some(100),
+            ..Default::default()
+        };
+        let other = Request::new("b".into(), (900..932).collect(), params, 1.0, 0, 0, None);
+        t.allocate_slots(&other, 32, 0, &[]).unwrap();
+        assert!(t.block_id_to_hash.contains_key(&q_blocks[4]));
+
+        let failed = sorted(t.forget_unwritten(failed, &ids(&["r1"])));
+        assert_eq!(failed, ["q", "r1"]);
+        assert_eq!(hit_of(&t, 64), 0);
+        assert!(
+            !t.block_id_to_hash.contains_key(&q_blocks[4]),
+            "q's own block"
+        );
+        assert_eq!(t.get_computed_blocks(&other).0, 32, "the bystander's");
+    }
+
+    /// A request freed with its step in flight, preempted or aborted, leaves its blocks mapped:
+    /// its step failing finds them all the same, and the request admitted onto them.
+    #[test]
+    fn a_request_freed_before_its_step_failed_is_forgotten_all_the_same() {
+        let mut t = SimpleBlockTracker::with_caching(32, 16);
+        let failed = t.new_step_starts();
+        t.allocate_slots(&make_request("r1", 64), 64, 0, &[])
+            .unwrap();
+        t.new_step_starts();
+        t.free("r1");
+        let mut q = make_request("q", 96);
+        let (hit, blocks) = t.get_computed_blocks(&q);
+        assert_eq!(hit, 64, "r1's freed blocks are still hits");
+        q.num_computed_tokens = hit;
+        t.allocate_slots(&q, 32, 0, &blocks).unwrap();
+
+        let failed = sorted(t.forget_unwritten(failed, &ids(&["r1"])));
+        assert_eq!(failed, ["q", "r1"]);
+        assert_eq!(hit_of(&t, 64), 0);
+    }
+
+    /// A failed request's blocks registered in a step behind its failed one go too: their KV was
+    /// the failed step's to write.
+    #[test]
+    fn a_failed_requests_blocks_registered_behind_its_step_go_too() {
+        let mut t = SimpleBlockTracker::with_caching(16, 16);
+        let mut r = make_request("r1", 63);
+        let ran = t.new_step_starts();
+        t.allocate_slots(&r, 63, 0, &[]).unwrap();
+        t.commit_written(ran);
+        r.num_computed_tokens = 63;
+        // It writes position 63, whose token the step before it has just sampled.
+        let failed = t.new_step_starts();
+        t.allocate_slots(&r, 1, 0, &[]).unwrap();
+        r.num_computed_tokens = 64;
+        r.append_output_token_ids(&[7]);
+        // The step behind it fills block 3 in the request's tokens, so registers it.
+        t.new_step_starts();
+        t.allocate_slots(&r, 1, 0, &[]).unwrap();
+        let params = SamplingParams {
+            max_tokens: Some(100),
+            ..Default::default()
+        };
+        let probe = Request::new("p".into(), r.all_token_ids.clone(), params, 1.0, 0, 0, None);
+        assert_eq!(t.get_computed_blocks(&probe).0, 64);
+
+        assert_eq!(t.forget_unwritten(failed, &ids(&["r1"])), ["r1"]);
+        assert_eq!(t.get_computed_blocks(&probe).0, 48);
+    }
+
+    /// A prompt cached in full is admitted a block short, and its step recomputes that block in
+    /// place. The block is its writer's: the step failing leaves it cached, and its writer runs on.
+    #[test]
+    fn a_failed_step_leaves_the_cached_block_it_recomputes() {
+        let mut t = SimpleBlockTracker::with_caching(16, 16);
+        let ran = t.new_step_starts();
+        t.allocate_slots(&make_request("p", 64), 64, 0, &[])
+            .unwrap();
+        t.commit_written(ran);
+        let failed = t.new_step_starts();
+        let mut r = make_request("r1", 64);
+        let (_, blocks) = t.get_computed_blocks(&r);
+        r.num_computed_tokens = 48;
+        t.allocate_slots(&r, 16, 0, &blocks).unwrap();
+
+        assert_eq!(
+            t.forget_unwritten(failed, &ids(&["r1"])),
+            ["r1"],
+            "p runs on"
+        );
+        assert_eq!(hit_of(&t, 64), 64);
+    }
+
+    /// The hybrid path's lookup, one token past a cached `0..128` prompt.
+    fn hybrid_hit(t: &SimpleBlockTracker) -> u32 {
+        t.get_computed_blocks(&hybrid_req("probe", 129)).0
+    }
+
+    #[test]
+    fn a_failed_steps_blocks_are_no_hybrid_prefix_cache_hits() {
+        for stores in BOTH_STORES {
+            let mut t = SimpleBlockTracker::with_caching(64, 16);
+            t.enable_hybrid(64, vec![(false, 0, 32), (true, 1024, 16)], stores);
+            let mut r = hybrid_req("r1", 128);
+            let ran = t.new_step_starts();
+            t.allocate_slots(&r, 64, 0, &[]).unwrap();
+            t.commit_written(ran);
+            r.num_computed_tokens = 64;
+            let failed = t.new_step_starts();
+            t.allocate_slots(&r, 64, 0, &[]).unwrap();
+            assert_eq!(hybrid_hit(&t), 128, "{stores:?}");
+
+            assert_eq!(t.forget_unwritten(failed, &ids(&["r1"])), ["r1"]);
+            assert_eq!(hybrid_hit(&t), 64, "{stores:?}");
+        }
+    }
+
+    /// A gemma-4-shaped tracker with a window no prompt here leaves: one full group (bs 32) and
+    /// one sliding group (bs 16).
+    fn wide_window_hybrid(stores: HybridKvStores) -> SimpleBlockTracker {
+        let mut t = SimpleBlockTracker::with_caching(64, 16);
+        t.enable_hybrid(64, vec![(false, 0, 32), (true, 1024, 16)], stores);
+        t
+    }
+
+    /// Whether request `id`'s block `i` of group `g` is still mapped in the prefix cache.
+    fn hybrid_mapped(t: &SimpleBlockTracker, id: &str, g: usize, i: usize) -> bool {
+        let space = t.swa_groups.as_ref().unwrap()[g].space;
+        let slot = t.space_slot(space, t.get_blocks(id)[g][i]);
+        t.hybrid_id_to_key.contains_key(&slot)
+    }
+
+    /// The hybrid path's blocks taken from the cache: a request admitted onto a failed step's
+    /// blocks is found by them and fails with it, and the blocks it wrote are no hits either.
+    #[test]
+    fn a_request_admitted_onto_a_failed_steps_hybrid_blocks_fails_with_it() {
+        for stores in BOTH_STORES {
+            let mut t = wide_window_hybrid(stores);
+            let failed = t.new_step_starts();
+            t.allocate_slots(&hybrid_req("r1", 128), 128, 0, &[])
+                .unwrap();
+            t.new_step_starts();
+            let mut q = hybrid_req("q", 192);
+            let (hit, blocks) = t.get_computed_blocks(&q);
+            assert_eq!(hit, 128, "{stores:?}: q is admitted onto r1's blocks");
+            q.num_computed_tokens = hit;
+            t.allocate_slots(&q, 64, 0, &blocks).unwrap();
+            assert!(hybrid_mapped(&t, "q", 0, 4), "{stores:?}");
+
+            let failed = sorted(t.forget_unwritten(failed, &ids(&["r1"])));
+            assert_eq!(failed, ["q", "r1"], "{stores:?}");
+            assert_eq!(hybrid_hit(&t), 0, "{stores:?}");
+            assert!(!hybrid_mapped(&t, "q", 0, 4), "{stores:?}: q's own block");
+        }
+    }
+
+    /// The hybrid path's blocks taken from the cache are their writer's: a failed request's step
+    /// leaves them cached, and their writer runs on.
+    #[test]
+    fn a_failed_step_leaves_the_hybrid_blocks_it_took() {
+        for stores in BOTH_STORES {
+            let mut t = wide_window_hybrid(stores);
+            let ran = t.new_step_starts();
+            t.allocate_slots(&hybrid_req("p", 128), 128, 0, &[])
+                .unwrap();
+            t.commit_written(ran);
+            let failed = t.new_step_starts();
+            let mut r = hybrid_req("r1", 128);
+            let (hit, blocks) = t.get_computed_blocks(&r);
+            assert_eq!(hit, 96, "{stores:?}: never a whole request");
+            r.num_computed_tokens = hit;
+            t.allocate_slots(&r, 32, 0, &blocks).unwrap();
+
+            assert_eq!(
+                t.forget_unwritten(failed, &ids(&["r1"])),
+                ["r1"],
+                "p runs on"
+            );
+            assert!((0..3).all(|i| hybrid_mapped(&t, "p", 0, i)), "{stores:?}");
+            assert!((0..6).all(|i| hybrid_mapped(&t, "p", 1, i)), "{stores:?}");
+            assert_eq!(hybrid_hit(&t), 96, "{stores:?}");
+        }
+    }
+
+    /// A block of the failed step can slide out of its request's window before the step fails,
+    /// when the step behind it was scheduled past the window: out of the table, still mapped. It
+    /// goes too, whether freed or kept as the prompt's last window.
+    #[test]
+    fn a_failed_steps_block_that_slid_out_of_the_window_is_no_hit() {
+        let mut t = caching_hybrid(64, 64);
+        let mut r = hybrid_req("r1", 256);
+        let ran = t.new_step_starts();
+        t.allocate_slots(&r, 128, 0, &[]).unwrap();
+        t.commit_written(ran);
+        r.num_computed_tokens = 128;
+        let failed = t.new_step_starts();
+        t.allocate_slots(&r, 128, 0, &[]).unwrap();
+        // The sliding group's blocks of the failed step: tokens 128..256, blocks 8..16.
+        let hashes = &t.hybrid_req_hashes["r1"][1].hashes;
+        let written: Vec<((u32, u64), usize)> = (8..16)
+            .map(|i| ((1, hashes[i]), t.get_blocks("r1")[1][i]))
+            .collect();
+        t.new_step_starts();
+        r.num_computed_tokens = 256;
+        r.append_output_token_ids(&[7]);
+        t.allocate_slots(&r, 1, 0, &[]).unwrap();
+        let tables = t.get_blocks("r1");
+        assert!((tables[1][8..12].iter()).all(|&b| b == SimpleBlockTracker::NULL_BLOCK));
+        let mapped = |t: &SimpleBlockTracker| {
+            (written.iter())
+                .filter(|(key, bid)| t.hybrid_hash_to_id.get(key) == Some(bid))
+                .count()
+        };
+        assert!(mapped(&t) > 4, "some slid-out block is still mapped");
+
+        t.forget_unwritten(failed, &ids(&["r1"]));
+        assert_eq!(mapped(&t), 0);
+    }
+
+    /// `out`'s new request `id`'s prefix-cache hit, in tokens.
+    fn admitted_with(out: &SchedulerOutput, id: &str) -> Option<u32> {
+        (out.scheduled_new_reqs.iter())
+            .find(|r| r.req_id == id)
+            .map(|r| r.num_computed_tokens)
+    }
+
+    /// Through the scheduler, as the engine abandons a step: the request a step behind it admitted
+    /// onto its blocks fails with it, and the next copy of the prompt computes it from scratch.
+    #[test]
+    fn a_failed_step_takes_the_requests_admitted_onto_its_blocks() {
+        let kv: Box<dyn KVCacheManagerOps> = Box::new(SimpleBlockTracker::with_caching(100, 16));
+        let mut sched = Scheduler::new(&test_scheduler_config(), 8192, kv);
+        sched.add_request(make_request("r1", 64));
+        let failed = sched.schedule();
+        sched.add_request(make_request("r2", 80));
+        let behind = sched.schedule();
+        assert_eq!(admitted_with(&behind, "r2"), Some(64), "onto r1's blocks");
+
+        assert_eq!(sorted(sched.forget_unwritten(&failed)), ["r1", "r2"]);
+        sched.finish_requests(&["r1", "r2"], RequestStatus::FinishedAborted);
+        sched.add_request(make_request("r3", 64));
+        assert_eq!(admitted_with(&sched.schedule(), "r3"), Some(0));
+    }
+
+    /// Through the scheduler: a client abort frees the request while its step is in flight, and
+    /// the step failing still forgets its blocks.
+    #[test]
+    fn a_request_aborted_while_its_step_was_in_flight_is_forgotten_when_it_fails() {
+        let kv: Box<dyn KVCacheManagerOps> = Box::new(SimpleBlockTracker::with_caching(100, 16));
+        let mut sched = Scheduler::new(&test_scheduler_config(), 8192, kv);
+        sched.add_request(make_request("r1", 64));
+        let failed = sched.schedule();
+        sched.finish_requests(&["r1"], RequestStatus::FinishedAborted);
+        sched.add_request(make_request("r2", 80));
+        let behind = sched.schedule();
+        assert_eq!(
+            admitted_with(&behind, "r2"),
+            Some(64),
+            "onto r1's freed blocks"
+        );
+
+        assert_eq!(sorted(sched.forget_unwritten(&failed)), ["r1", "r2"]);
+        sched.finish_requests(&["r2"], RequestStatus::FinishedAborted);
+        sched.add_request(make_request("r3", 64));
+        assert_eq!(admitted_with(&sched.schedule(), "r3"), Some(0));
+    }
+
     /// A gemma-4-shaped scheduler (one full group, bs 32, + five sliding groups, window 1024,
     /// bs 16) over a `pool`-block pool.
     fn gemma4_scheduler(
@@ -8026,7 +8555,7 @@ mod tests {
     /// snapshots it saved, as `update_from_output` does.
     fn run_step(sched: &mut Scheduler) -> SchedulerOutput {
         let out = sched.schedule();
-        sched.commit_state_saves(&out.recurrent_state.saves);
+        sched.commit_step(&out);
         out
     }
 
@@ -8156,7 +8685,7 @@ mod tests {
         let turn1: Vec<u32> = (0..600).collect();
         sched.add_request(request_with("t1", turn1.clone()));
         let saved = sched.schedule();
-        sched.commit_state_saves(&saved.recurrent_state.saves);
+        sched.commit_step(&saved);
         prefill_and_finish(&mut sched, "t1");
 
         // The next turn extends the prompt; its KV hit is t1's 37 full blocks.
@@ -8234,7 +8763,7 @@ mod tests {
         );
 
         // Once it reports back, the next request with that prefix resumes from it.
-        sched.commit_state_saves(&first.recurrent_state.saves);
+        sched.commit_step(&first);
         sched.add_request(make_request("r3", 600));
         let out = sched.schedule();
         assert_eq!(out.recurrent_state.restores.len(), 1);
@@ -8263,10 +8792,10 @@ mod tests {
         );
         // r1's step ran after all (queued behind the failure) and reports back: it must not
         // make r2's reservation of the same prefix ready before r2's own step writes it.
-        sched.commit_state_saves(&failed.recurrent_state.saves);
+        sched.commit_step(&failed);
         sched.add_request(make_request("r3", 600));
         assert!(sched.schedule().recurrent_state.restores.is_empty());
-        sched.commit_state_saves(&retry.recurrent_state.saves);
+        sched.commit_step(&retry);
         sched.add_request(make_request("r4", 600));
         let out = sched.schedule();
         assert_eq!(out.recurrent_state.restores.len(), 1);

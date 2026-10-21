@@ -2254,11 +2254,12 @@ impl AsyncEngine {
                         }
                         Some((Err(e), sched)) => {
                             error!("Executor error: {}", e);
-                            // Aborts the step's requests in the engine, too.
-                            client.abandon_step(&sched);
+                            // Aborts the step's requests in the engine, too, and any a step behind
+                            // it admitted onto the KV it never wrote.
+                            let aborted = client.abandon_step(&sched);
                             let err_msg = format!("Executor error: {e}");
                             Self::fail_requests(&mut *requests.lock().await, &err_msg, |id| {
-                                sched.num_scheduled_tokens.contains_key(id)
+                                aborted.iter().any(|a| a == id)
                             });
                             notify.notify_waiters();
                             gpu_in_flight -= 1;
@@ -5890,7 +5891,8 @@ mod tests {
         fn abandon_step(
             &mut self,
             _sched: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
-        ) {
+        ) -> Vec<String> {
+            Vec::new()
         }
 
         fn abort_running_requests(&mut self) {}
@@ -6035,9 +6037,10 @@ mod tests {
         fn abandon_step(
             &mut self,
             sched: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
-        ) {
-            let ids = sched.num_scheduled_tokens.keys().cloned();
-            self.aborted.lock().unwrap().extend(ids);
+        ) -> Vec<String> {
+            let ids: Vec<String> = sched.num_scheduled_tokens.keys().cloned().collect();
+            self.aborted.lock().unwrap().extend_from_slice(&ids);
+            ids
         }
 
         fn abort_running_requests(&mut self) {}
