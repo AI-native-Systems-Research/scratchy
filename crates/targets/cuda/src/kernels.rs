@@ -30,13 +30,41 @@ unsafe extern "C" {
         k: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_rms_norm_bf16(
+        x: *const c_void,
+        gain: *const c_void,
+        y: *mut c_void,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_add_bf16(
+        a: *const c_void,
+        b: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_silu_mul_bf16(
+        gate: *const c_void,
+        up: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// Why a launcher did not launch, or the launch failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelError {
-    /// The kernel does not take this shape; nothing was launched.
+    /// The GEMM does not take this shape; nothing was launched.
     Shape { m: u32, n: u32, k: u32 },
+    /// A row kernel (RMSNorm, add, SiluMul) does not take this shape; nothing was launched.
+    RowShape { rows: u32, cols: u32 },
     /// The launcher's C++ host code threw (caught before it could reach Rust).
     HostException,
     /// A `cudaError_t` from the kernel's one-time setup or from its launch.
@@ -47,6 +75,9 @@ impl fmt::Display for KernelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             KernelError::Shape { m, n, k } => write!(f, "kernel refused shape m={m} n={n} k={k}"),
+            KernelError::RowShape { rows, cols } => {
+                write!(f, "kernel refused shape rows={rows} cols={cols}")
+            }
             KernelError::HostException => write!(f, "kernel launcher's host code threw"),
             KernelError::Cuda(code) => write!(f, "CUDA error {code}"),
         }
@@ -74,11 +105,12 @@ pub fn prepare_all() -> Result<(), (&'static str, KernelError)> {
     Ok(())
 }
 
-/// Shared tail of every launcher wrapper: the launcher's return code as a `Result`.
-fn check(code: i32, m: u32, n: u32, k: u32) -> Result<(), KernelError> {
+/// Shared tail of every launcher wrapper: the launcher's return code as a `Result`, `shape` the
+/// refusal its `SCRATCHY_CUDA_ERR_SHAPE` means.
+fn check(code: i32, shape: KernelError) -> Result<(), KernelError> {
     match code {
         0 => Ok(()),
-        ERR_SHAPE => Err(KernelError::Shape { m, n, k }),
+        ERR_SHAPE => Err(shape),
         ERR_HOST => Err(KernelError::HostException),
         code => Err(KernelError::Cuda(code)),
     }
@@ -112,5 +144,78 @@ pub unsafe fn gemm_bf16_abt(
     // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
     // shape and catches every C++ exception before returning.
     let code = unsafe { scratchy_cuda_gemm_bf16_abt(a, b, c, m, n, k, stream) };
-    check(code, m, n, k)
+    check(code, KernelError::Shape { m, n, k })
+}
+
+// THE ROW KERNELS (RMSNorm, add, SiluMul). Each launcher takes `(rows, cols)` and applies one
+// shape rule: `rows` and `cols` non-zero, `cols` a multiple of 8 (one 16-byte vector of bf16:
+// `step::RMS_NORM_BF16_COLS`, `ADD_BF16_COLS`, `SILU_MUL_BF16_COLS`), and `rows · cols` at most
+// `i32::MAX`. Any other shape returns `KernelError::RowShape` before any pointer is touched, and
+// launches nothing. A failed launch returns the launch's own `cudaError_t`. None needs a one-time
+// setup (each uses under 48 KiB of shared memory), so none is in `PREPARE`.
+
+/// Launch the bf16 RMSNorm: `y[r, c] = x[r, c] / sqrt(mean(x[r, :]²) + eps) · (gain_offset +
+/// gain[c])`, `x` and `y` `[rows, cols]`, `gain` `[cols]`, in f32 with one bf16 rounding per
+/// output. `gain_offset` is the convention's (`GainConvention::offset`). Asynchronous; the shape
+/// rule is the row kernels'.
+///
+/// # Safety
+///
+/// `x`, `gain` and `y` must be 16-byte-aligned device pointers to at least `rows·cols`, `cols`
+/// and `rows·cols` bf16 elements, valid for the whole kernel, with `y` overlapping neither input.
+/// `stream` must be a live `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn rms_norm_bf16(
+    x: *const c_void,
+    gain: *const c_void,
+    y: *mut c_void,
+    (rows, cols): (u32, u32),
+    eps: f32,
+    gain_offset: f32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer.
+    let code =
+        unsafe { scratchy_cuda_rms_norm_bf16(x, gain, y, rows, cols, eps, gain_offset, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the bf16 add `out = a + b` over `[rows, cols]`: one f32 add and one bf16 rounding per
+/// element. Asynchronous; the shape rule is the row kernels'.
+///
+/// # Safety
+///
+/// `a`, `b` and `out` must be 16-byte-aligned device pointers to at least `rows·cols` bf16
+/// elements each, valid for the whole kernel, with `out` overlapping neither input. `stream` must
+/// be a live `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn add_bf16(
+    a: *const c_void,
+    b: *const c_void,
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe { scratchy_cuda_add_bf16(a, b, out, rows, cols, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the bf16 `out = gate / (1 + e^(−gate)) · up` over `[rows, cols]`, in f32 with one bf16
+/// rounding per element. Asynchronous; the shape rule is the row kernels'.
+///
+/// # Safety
+///
+/// `gate`, `up` and `out` must be 16-byte-aligned device pointers to at least `rows·cols` bf16
+/// elements each, valid for the whole kernel, with `out` overlapping neither input. `stream` must
+/// be a live `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn silu_mul_bf16(
+    gate: *const c_void,
+    up: *const c_void,
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe { scratchy_cuda_silu_mul_bf16(gate, up, out, rows, cols, stream) };
+    check(code, KernelError::RowShape { rows, cols })
 }

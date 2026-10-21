@@ -3,7 +3,9 @@
 //!
 //! In metal's order (`scratchy-target-metal-compiler`'s `canonical::lower_canonical`), under CUDA's
 //! declared tables (`scratchy_target_cuda::op_abi`): the sampled rows, the graph and tape built
-//! from whole ops, the fold pass, the colourer. Then CUDA's opcode lowering ([`steps_from_tape`]).
+//! from whole ops, the fold pass, the colourer. Then CUDA's opcode lowering ([`steps_from_tape`]),
+//! by each step's fold role: a kept step lowers on its own, a step driving a fold lowers to the
+//! fused kernel, and a step a fold absorbed emits no launch.
 //!
 //! No KV codec (CUDA is bf16 only) and no wave order (that pass exists because metal's barriers
 //! drain everything in flight; CUDA runs one stream in order, so its tape has no barrier at all).
@@ -24,14 +26,14 @@ use scratchy_subtile::sample_rows::{SampleRowsError, expand_sample_rows};
 use scratchy_subtile::subtile_ir::{SubtileIR, ValidatedGraph, lower_region};
 use scratchy_subtile::subtile_tape::{Instr, SubtileTape, lower_dag_to_tape};
 use scratchy_subtile::tape_colouring::{Colour, ColourError, TapeColouring, colour_tape};
-use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, TapeFolds, fold_tape};
+use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, StepRole, TapeFolds, fold_tape};
 use scratchy_target_cuda::op_abi::{
     CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_FUSIONS, CUDA_SAMPLE_ROWS, CudaFusion,
 };
 use scratchy_target_cuda::step::CudaStep;
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN};
 
-use crate::steps_from_tape::{StepCx, TapeStep, lower_step};
+use crate::steps_from_tape::{StepCx, TapeStep, lower_fused, lower_step};
 
 /// Which canonical this is, for the refusals.
 #[derive(Clone, Copy, Debug)]
@@ -69,7 +71,8 @@ pub struct CudaCanonical {
     pub result: ArenaSpan,
     /// Per source index: its weight buffer's bytes; 0 for a source that is not a weight.
     pub weight_bytes: Vec<u64>,
-    /// One step per `Compute` on the tape, in tape order.
+    /// One step per launch, in tape order: each kept `Compute` and each fold's driver; a
+    /// `Compute` a fold absorbed has none.
     pub steps: Vec<CudaStep>,
 }
 
@@ -111,8 +114,63 @@ pub enum CanonicalRefusal {
         step: usize,
         op: &'static str,
     },
+    /// The `step`-th `Compute` is a row kernel's op (RmsNorm, Add, SiluMul) of a shape its kernel
+    /// does not take: the launcher's rule, stated at expansion time.
+    RowShape {
+        step: usize,
+        op: &'static str,
+        rows: u32,
+        cols: u32,
+        rule: RowShapeRule,
+    },
+    /// The `step`-th `Compute` is an RmsNorm whose `eps` is not finite, or not above 0.
+    NormEps {
+        step: usize,
+        eps: f32,
+    },
+    /// The `step`-th `Compute` is an RmsNorm whose gain is `[rows, cols]`, not `[1, want]`.
+    GainShape {
+        step: usize,
+        rows: u32,
+        cols: u32,
+        want: u32,
+    },
+    /// Operand `operand` of the `step`-th `Compute` is `[rows, cols]`, not the output's
+    /// `[want_rows, want_cols]`: the row kernels broadcast nothing.
+    OperandShape {
+        step: usize,
+        op: &'static str,
+        operand: u8,
+        rows: u32,
+        cols: u32,
+        want_rows: u32,
+        want_cols: u32,
+    },
+    /// The `step`-th `Compute` is half of SwiGLU outside the `SiluMul` fold (a `Silu` the fold did
+    /// not absorb, a `Mul` driving no fold) or the pre-fused `SiluMul`: CUDA has no standalone
+    /// kernel for it.
+    Unfused {
+        step: usize,
+        op: &'static str,
+    },
+    /// The `step`-th `Compute` drives a `SiluMul` fold that took the gate or up projection too;
+    /// CUDA's `SiluMul` kernel reads both as computed buffers.
+    FusionShape {
+        step: usize,
+    },
     /// The arena cannot be laid out.
     Arena(ArenaRefusal),
+}
+
+/// Which rule a row kernel's shape breaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowShapeRule {
+    /// `dim` is zero.
+    Empty { dim: &'static str },
+    /// `cols` is not a multiple of the kernel's vector width, `multiple` bf16 per 16-byte load.
+    OffVector { cols: u32, multiple: u32 },
+    /// `rows · cols` is above `i32::MAX`, the largest element count the launcher indexes.
+    TooManyElements { elements: u64 },
 }
 
 /// Which rule a GEMM's shape breaks.
@@ -205,7 +263,72 @@ impl std::fmt::Display for CanonicalRefusal {
                 f,
                 "step {step} ({op}) writes part of its output tensor; a kernel writes a whole one"
             ),
+            Self::RowShape {
+                step,
+                op,
+                rows,
+                cols,
+                rule,
+            } => write!(
+                f,
+                "step {step} ({op}) is rows={rows} cols={cols}, which its bf16 kernel refuses: \
+                 {rule}"
+            ),
+            Self::NormEps { step, eps } => write!(
+                f,
+                "step {step} (RmsNorm) has eps = {eps}; it must be finite and above 0"
+            ),
+            Self::GainShape {
+                step,
+                rows,
+                cols,
+                want,
+            } => write!(
+                f,
+                "step {step} (RmsNorm) has a gain of [{rows}, {cols}]; the kernel takes [1, {want}]"
+            ),
+            Self::OperandShape {
+                step,
+                op,
+                operand,
+                rows,
+                cols,
+                want_rows,
+                want_cols,
+            } => write!(
+                f,
+                "step {step} ({op}) operand {operand} is [{rows}, {cols}], not the output's \
+                 [{want_rows}, {want_cols}]; the bf16 kernel broadcasts nothing"
+            ),
+            Self::Unfused { step, op } => write!(
+                f,
+                "step {step} computes {op} on its own; the cuda backend has no standalone kernel \
+                 for it and runs SwiGLU only as the SiluMul fold of a Silu into the Mul it gates"
+            ),
+            Self::FusionShape { step } => write!(
+                f,
+                "step {step} drives a SiluMul fold that folded the gate or up projection in; the \
+                 cuda SiluMul kernel reads both as computed buffers"
+            ),
             Self::Arena(e) => write!(f, "the arena cannot be laid out: {e}"),
+        }
+    }
+}
+
+impl std::fmt::Display for RowShapeRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty { dim } => write!(f, "{dim} = 0"),
+            Self::OffVector { cols, multiple } => write!(
+                f,
+                "cols = {cols} must be a multiple of {multiple}, the kernel's 16-byte bf16 vector"
+            ),
+            Self::TooManyElements { elements } => write!(
+                f,
+                "rows·cols = {elements} is above {}, the largest element count the launcher \
+                 indexes",
+                i32::MAX
+            ),
         }
     }
 }
@@ -248,11 +371,11 @@ impl std::fmt::Display for OperandRefusal {
                 source: Some((source, binding)),
             } => write!(
                 f,
-                "it reads source {source} ({binding:?}); the GEMM's B must be a model weight"
+                "it reads source {source} ({binding:?}); a weight operand must be a model weight"
             ),
             Self::NotAWeight { source: None } => write!(
                 f,
-                "it reads a computed value; the GEMM's B must be a model weight"
+                "it reads a computed value; a weight operand must be a model weight"
             ),
         }
     }
@@ -295,7 +418,8 @@ pub fn plan_canonical(
             .map_err(|e| CanonicalRefusal::Graph(format!("{stem} m={m}: {e}")))?;
         lower_dag_to_tape(&valid)
     };
-    // The facts only gate patterns, and CUDA's table declares none.
+    // The facts only gate patterns. CUDA's one pattern, `Gated`, reads `fold_projections` alone,
+    // and CUDA has no kernel that folds the gate and up projections in, so every fact is off.
     let model = ModelFoldFacts {
         fold_projections: false,
         matvec_ends: false,
@@ -323,10 +447,13 @@ pub fn plan_canonical(
 }
 
 /// Lower one decode canonical: [`plan_canonical`], the arena laid out from the colouring, then
-/// every `Compute` on the tape through CUDA's opcode lowering, in tape order.
+/// every `Compute` on the tape, in tape order, by its fold role: a kept step through
+/// [`lower_step`], a fold's driver through [`lower_fused`], and an absorbed step (or an epilogue,
+/// which no CUDA fold makes) to no launch.
 ///
 /// A step's refusal comes before the arena's: a canonical whose first op has no lowering is
-/// refused for that op, whatever its bindings.
+/// refused for that op, whatever its bindings. A refusal's `step` is the step's position among
+/// the tape's `Compute`s, absorbed ones included.
 pub fn lower_canonical(
     l: &LoweredDecode,
     at: CanonicalAt<'_>,
@@ -342,7 +469,7 @@ pub fn lower_canonical(
             Err(e) => Err(*e),
         },
     };
-    let steps = (plan.tape.instrs().iter())
+    let computes: Vec<TapeStep<'_>> = (plan.tape.instrs().iter())
         .filter_map(|i| match i {
             Instr::Compute {
                 node,
@@ -353,14 +480,18 @@ pub fn lower_canonical(
             _ => None,
         })
         .enumerate()
-        .map(|(step, (node, writes, inputs))| {
-            let s = TapeStep {
-                step,
-                node,
-                writes,
-                inputs,
-            };
-            lower_step(&cx, &s)
+        .map(|(step, (node, writes, inputs))| TapeStep {
+            step,
+            node,
+            writes,
+            inputs,
+        })
+        .collect();
+    let steps = (computes.iter())
+        .filter_map(|s| match plan.folds.role(s.writes) {
+            StepRole::Kept => Some(lower_step(&cx, s)),
+            StepRole::Drives(f) => Some(lower_fused(&cx, s, f, &computes)),
+            StepRole::Absorbed { .. } | StepRole::Epilogue { .. } => None,
         })
         .collect::<Result<Vec<_>, _>>()?;
     let arena = arena.map_err(CanonicalRefusal::Arena)?;

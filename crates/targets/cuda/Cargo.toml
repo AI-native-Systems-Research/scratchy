@@ -40,7 +40,13 @@ scratchy-target-cuda-compiler = { path = "compiler" }
 name = "gemm_bf16"
 required-features = ["nvcc"]
 
-# The hand-written GEMM-chain tapes against what CUDA's compiler lowers. No toolchain needed.
+# The row kernels (RMSNorm, add, SiluMul) against a CPU reference, on the GPU. Not built without
+# `nvcc`.
+[[test]]
+name = "row_ops"
+required-features = ["nvcc"]
+
+# The hand-written tapes against what CUDA's compiler lowers. No toolchain needed.
 [[test]]
 name = "tape_layout"
 

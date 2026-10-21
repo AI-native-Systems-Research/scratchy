@@ -1,24 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The GEMM-chain tapes, with no CUDA toolchain: each hand-written `static` is exactly what CUDA's
-//! compiler lowers its canonical to, the numbers are the ones the layout rules give, and every
-//! GEMM the kernel cannot run is refused at expansion, naming the value and the rule.
+//! The hand-written tapes, with no CUDA toolchain: each `static` is exactly what CUDA's compiler
+//! lowers its canonical to, the numbers are the ones the layout rules give, every static passes
+//! `CudaTape::validate`, and every op a kernel cannot run is refused at expansion, naming the
+//! value and the rule.
 
 mod common {
     pub mod chains;
+    pub mod mlp;
 }
 
 use common::chains::{
     THREE_GEMM_M256, TWO_GEMM_M128, TWO_GEMM_M256, assert_tape_is_lowered, chain_input, three_gemm,
     two_gemm, with_hidden,
 };
-use scratchy_subtile::fixtures::{front_end_lowered, gemm_m1_only_input, one_layer_input};
-use scratchy_subtile::handoff::LoweredDecode;
-use scratchy_subtile::lower::{AffineInt4, GemmWeight, GemmWeightKind};
-use scratchy_subtile::subtile_ir::SubOp;
+use common::mlp::{EPS, H, I, MLP_M128, MLP_M256, mlp};
+use scratchy_subtile::fixtures::{
+    front_end_lowered, gemm_m1_only_input, one_layer_input, rope_rotate_only_input,
+    silu_mul_only_input,
+};
+use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
+use scratchy_subtile::lower::{
+    AffineInt4, GemmWeight, GemmWeightKind, InputRef, LoweringInput, OpDesc,
+};
+use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SourceShape, SubOp};
 use scratchy_target_cuda::step::{CudaStep, GemmBf16};
-use scratchy_target_cuda::tape::{CUDA_ARENA_ALIGN, CudaTape};
+use scratchy_target_cuda::tape::{ArenaOffset, CUDA_ARENA_ALIGN, CudaTape};
 use scratchy_target_cuda_compiler::canonical::{
-    ArenaRefusal, CanonicalAt, CanonicalRefusal, GemmShapeRule, lower_canonical,
+    ArenaRefusal, CanonicalAt, CanonicalRefusal, GemmShapeRule, OperandRefusal, RowShapeRule,
+    lower_canonical,
 };
 
 fn lower(
@@ -57,6 +66,7 @@ fn gemm_steps(tape: &CudaTape) -> Vec<GemmBf16> {
         .iter()
         .map(|s| match *s {
             CudaStep::Gemm(g) => g,
+            other => panic!("a GEMM chain holds only GEMMs, got {other:?}"),
         })
         .collect()
 }
@@ -210,14 +220,321 @@ fn a_canonical_with_no_embedded_hidden_is_refused() {
     ));
 }
 
+/// A llama decode layer lowers its first op, the norm, and is refused at the first op after it:
+/// a one-row (decode) GEMM.
 #[test]
-fn a_layer_is_still_refused_at_its_first_op() {
-    let e = refused(&front_end_lowered(one_layer_input()), &["RmsNorm"]);
+fn a_layer_lowers_its_norm_and_is_refused_at_its_first_gemm() {
+    let e = refused(&with_hidden(one_layer_input()), &["m=1", "decode GEMV"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GemmShape {
+            step: 1,
+            m: 1,
+            rule: GemmShapeRule::Decode,
+            ..
+        }
+    ));
+}
+
+/// An op with no lowering at all is refused by its name.
+#[test]
+fn an_op_with_no_lowering_is_refused_naming_it() {
+    let e = refused(&with_hidden(rope_rotate_only_input()), &["RopeRotate"]);
     assert!(matches!(
         e,
         CanonicalRefusal::NotLowered {
             step: 0,
-            op: "RmsNorm"
+            op: "RopeRotate"
+        }
+    ));
+}
+
+// ── The qwen3.5-0.8b MLP block ─────────────────────────────────────
+
+#[test]
+fn the_mlp_statics_are_what_their_canonicals_lower_to() {
+    assert_tape_is_lowered("mlp(128)", &MLP_M128, &mlp(128));
+    assert_tape_is_lowered("mlp(256)", &MLP_M256, &mlp(256));
+}
+
+#[test]
+fn every_static_validates() {
+    for (name, tape) in [
+        ("TWO_GEMM_M128", &TWO_GEMM_M128),
+        ("TWO_GEMM_M256", &TWO_GEMM_M256),
+        ("THREE_GEMM_M256", &THREE_GEMM_M256),
+        ("MLP_M128", &MLP_M128),
+        ("MLP_M256", &MLP_M256),
+    ] {
+        assert_eq!(tape.validate(), Ok(()), "{name}");
+    }
+}
+
+#[test]
+fn the_mlp_numbers() {
+    for (tape, m) in [(&MLP_M128, 128u64), (&MLP_M256, 256)] {
+        let (h, i) = (u64::from(H) * m * 2, u64::from(I) * m * 2);
+        // x, n (then d), gate, up, s, a, y.
+        assert_eq!(tape.arena.colour_bytes, [h, h, i, i, i, i, h]);
+        assert_eq!(tape.arena.total_bytes, 3 * h + 4 * i);
+        assert_eq!((tape.input.offset.0, tape.input.bytes), (0, h));
+        assert_eq!(
+            (tape.result.offset.0, tape.result.bytes),
+            (tape.arena.colour_offsets[6], h)
+        );
+        for &o in tape.arena.colour_offsets {
+            assert_eq!(o % CUDA_ARENA_ALIGN, 0);
+        }
+    }
+    assert_eq!(MLP_M256.arena.total_bytes, 8912896);
+    assert_eq!(MLP_M128.arena.total_bytes, 4456448);
+    let [
+        CudaStep::RmsNorm(n),
+        CudaStep::Gemm(gate),
+        CudaStep::Gemm(up),
+        CudaStep::SiluMul(sm),
+        CudaStep::Gemm(down),
+        CudaStep::Add(y),
+    ] = *MLP_M256.steps
+    else {
+        panic!("the MLP's steps are norm, gemm, gemm, silu_mul, gemm, add");
+    };
+    assert_eq!((n.eps(), n.convention), (EPS, GainConvention::OnePlusScale));
+    assert_eq!((gate.a, up.a), (n.y, n.y), "both projections read n");
+    assert_eq!((sm.gate, sm.up), (gate.c, up.c), "silu(gate) · up");
+    assert_eq!((sm.rows, sm.cols), (256, I));
+    assert_eq!(down.a, sm.out);
+    assert_eq!(down.c, n.y, "d is written over n's colour");
+    assert_eq!((y.a, y.b), (down.c, ArenaOffset(0)), "y = d + x");
+}
+
+/// The absorbed `Silu`'s colour (4) is minted where its driver runs, and no launch writes or reads
+/// it: the `SiluMul` kernel reads the gate and up GEMMs' colours and writes the `Mul`'s.
+#[test]
+fn no_mlp_step_touches_the_absorbed_silus_colour() {
+    for tape in [&MLP_M128, &MLP_M256] {
+        let s = tape.arena.colour_offsets[4];
+        for (k, step) in tape.steps.iter().enumerate() {
+            let e = step.extents().expect("an MLP step's bytes fit u64");
+            for span in e.reads.iter().flatten().chain([&e.writes]) {
+                assert_ne!(span.offset.0, s, "step {k} touches colour 4: {step:?}");
+            }
+        }
+    }
+}
+
+// ── The row kernels' refusals ──────────────────────────────────────
+
+const fn shape(rows: u32, cols: u32) -> SourceShape {
+    SourceShape { rows, cols }
+}
+
+/// `RmsNorm(x [m, cols], g)`, `x` the embedded hidden and `g` a weight of shape `gain`.
+fn norm_only(m: u32, cols: u32, eps: f32, gain: SourceShape) -> LoweredDecode {
+    with_hidden(LoweringInput {
+        exported: None,
+        sources: vec![shape(m, cols), gain],
+        ops: vec![OpDesc {
+            op: SubOp::RmsNorm {
+                eps,
+                gain: GainConvention::OnePlusScale,
+            },
+            m,
+            inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+        }],
+        result: 0,
+    })
+}
+
+/// One elementwise op of `kind` over `x [m, cols]` (the embedded hidden) and, for a binary op, a
+/// second source of shape `b`, bound as the front end binds it (to a weight).
+fn ew_only(kind: EwKind, m: u32, cols: u32, b: Option<SourceShape>) -> LoweredDecode {
+    let sources = [Some(shape(m, cols)), b].into_iter().flatten().collect();
+    let inputs = (0..1 + usize::from(b.is_some()))
+        .map(InputRef::Ext)
+        .collect();
+    with_hidden(LoweringInput {
+        exported: None,
+        sources,
+        ops: vec![OpDesc {
+            op: SubOp::Elementwise(kind),
+            m,
+            inputs,
+        }],
+        result: 0,
+    })
+}
+
+#[test]
+fn a_row_op_off_the_vector_width_is_refused() {
+    let e = refused(
+        &norm_only(256, 1004, EPS, shape(1, 1004)),
+        &["cols = 1004", "multiple of 8"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::RowShape {
+            step: 0,
+            op: "RmsNorm",
+            rows: 256,
+            cols: 1004,
+            rule: RowShapeRule::OffVector {
+                cols: 1004,
+                multiple: 8
+            },
+        }
+    ));
+}
+
+#[test]
+fn a_row_op_above_int_max_elements_is_refused() {
+    let (m, cols) = (32768, 65536);
+    let e = refused(
+        &ew_only(EwKind::Add, m, cols, Some(shape(m, cols))),
+        &["rows·cols = 2147483648", "2147483647"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::RowShape {
+            step: 0,
+            op: "Add",
+            rows: 32768,
+            cols: 65536,
+            rule: RowShapeRule::TooManyElements {
+                elements: 2147483648
+            },
+        }
+    ));
+}
+
+#[test]
+fn a_norm_eps_that_is_zero_or_nan_is_refused() {
+    let e = refused(&norm_only(256, H, 0.0, shape(1, H)), &["eps = 0"]);
+    assert!(matches!(e, CanonicalRefusal::NormEps { step: 0, eps } if eps == 0.0));
+    let e = refused(&norm_only(256, H, f32::NAN, shape(1, H)), &["eps = NaN"]);
+    assert!(matches!(e, CanonicalRefusal::NormEps { step: 0, eps } if eps.is_nan()));
+}
+
+#[test]
+fn a_norm_gain_not_one_row_of_cols_is_refused() {
+    let e = refused(
+        &norm_only(256, H, EPS, shape(1, 512)),
+        &["[1, 512]", "[1, 1024]"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GainShape {
+            step: 0,
+            rows: 1,
+            cols: 512,
+            want: 1024
+        }
+    ));
+}
+
+/// An add operand of another shape than the output. (One with fewer rows, a broadcast, never
+/// reaches CUDA: the shared graph validator refuses a read past its tensor first.)
+#[test]
+fn an_add_operand_of_another_shape_is_refused() {
+    let e = refused(
+        &ew_only(EwKind::Add, 256, H, Some(shape(512, H))),
+        &[
+            "operand 1",
+            "[512, 1024]",
+            "[256, 1024]",
+            "broadcasts nothing",
+        ],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::OperandShape {
+            step: 0,
+            op: "Add",
+            operand: 1,
+            rows: 512,
+            cols: 1024,
+            want_rows: 256,
+            want_cols: 1024
+        }
+    ));
+}
+
+/// A `Silu` no `Mul` reads, a `Mul` whose operand 0 is not a `Silu` (neither is folded), and the
+/// pre-fused `SiluMul`: CUDA runs SwiGLU only as the fold.
+#[test]
+fn swiglu_outside_the_fold_is_refused() {
+    for (l, op) in [
+        (ew_only(EwKind::Silu, 256, I, None), "Silu"),
+        (ew_only(EwKind::Mul, 256, I, Some(shape(256, I))), "Mul"),
+        (front_end_lowered(silu_mul_only_input()), "SiluMul"),
+    ] {
+        let e = refused(&l, &[op, "no standalone kernel", "SiluMul fold"]);
+        assert!(
+            matches!(e, CanonicalRefusal::Unfused { step: 0, op: o } if o == op),
+            "{op}: {e:?}"
+        );
+    }
+}
+
+// ── The operand bindings, through the new arms ─────────────────────
+
+#[test]
+fn a_row_op_activation_that_is_a_weight_is_refused() {
+    let e = refused(
+        &ew_only(EwKind::Add, 256, H, Some(shape(256, H))),
+        &[
+            "operand 1",
+            "source 1",
+            "computed slot or the embedded hidden",
+        ],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::Operand {
+            step: 0,
+            op: "Add",
+            operand: 1,
+            why: OperandRefusal::NotHiddenOrSlot { source: 1, .. },
+        }
+    ));
+}
+
+#[test]
+fn a_norm_gain_that_is_not_a_weight_is_refused() {
+    let mut l = norm_only(256, H, EPS, shape(1, H));
+    l.bindings[1] = SourceBinding::Cos { local: false };
+    let e = refused(&l, &["operand 1", "source 1", "must be a model weight"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::Operand {
+            step: 0,
+            op: "RmsNorm",
+            operand: 1,
+            why: OperandRefusal::NotAWeight {
+                source: Some((1, SourceBinding::Cos { local: false }))
+            },
+        }
+    ));
+
+    // A computed gain: the second norm's gain is the first norm's `[1, H]` output.
+    let mut input = norm_only(1, H, EPS, shape(1, H)).input;
+    input.ops.push(OpDesc {
+        op: SubOp::RmsNorm {
+            eps: EPS,
+            gain: GainConvention::OnePlusScale,
+        },
+        m: 1,
+        inputs: vec![InputRef::Ext(0), InputRef::Op(0)],
+    });
+    input.result = 1;
+    let e = refused(&with_hidden(input), &["operand 1", "computed value"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::Operand {
+            step: 1,
+            op: "RmsNorm",
+            operand: 1,
+            why: OperandRefusal::NotAWeight { source: None },
         }
     ));
 }

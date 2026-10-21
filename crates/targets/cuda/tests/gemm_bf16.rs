@@ -5,7 +5,8 @@
 //! kernel's only gate, and a skip that passes would let it pass silently. The reference and the
 //! bound are `common::numerics`'.
 
-mod common {
+// `pub`: each test binary uses a different part of `common`, and nothing in it is dead code.
+pub mod common {
     pub mod numerics;
 }
 
