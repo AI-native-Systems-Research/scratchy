@@ -218,7 +218,14 @@ pub struct SchedulerOutput {
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
-pub struct StepId(pub u64);
+pub struct StepId(u64);
+
+impl StepId {
+    /// The step after this one. Only the KV cache manager numbers steps.
+    pub(crate) fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
 
 /// A speculative step scheduled ahead (#240): the engine schedules the step after one that drafts
 /// before that one is finalized, and the worker picks what depends on its outcome on the device.

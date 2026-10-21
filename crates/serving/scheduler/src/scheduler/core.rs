@@ -311,6 +311,10 @@ pub struct SimpleBlockTracker {
     /// or a later step comes back ([`KVCacheManagerOps::commit_written`]).
     journal: VecDeque<StepJournal>,
 
+    /// The last step that came back: steps come back in the order they were
+    /// scheduled, which `journal` is dropped by.
+    committed: StepId,
+
     /// Spans (relocatable KV cache block) configuration.
     spans_config: SpansConfig,
 
@@ -562,6 +566,7 @@ impl SimpleBlockTracker {
             req_to_hashes: HashMap::new(),
             step: StepId::default(),
             journal: VecDeque::new(),
+            committed: StepId::default(),
             spans_config: SpansConfig::from_env(),
             swa_groups: None,
             hybrid_spaces: Vec::new(),
@@ -2458,7 +2463,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         if let Some(rec) = self.recurrent.as_mut() {
             rec.snapshots.tick();
         }
-        self.step = StepId(self.step.0 + 1);
+        self.step = self.step.next();
         self.step
     }
 
@@ -2692,6 +2697,12 @@ impl KVCacheManagerOps for SimpleBlockTracker {
     }
 
     fn commit_written(&mut self, step: StepId) {
+        debug_assert!(
+            step >= self.committed,
+            "{step:?} came back after {:?}: steps come back in order",
+            self.committed
+        );
+        self.committed = step;
         while self.journal.front().is_some_and(|j| j.step <= step) {
             self.journal.pop_front();
         }
@@ -7729,6 +7740,73 @@ mod tests {
 
             assert_eq!(t.forget_unwritten(failed, &ids(&["r1"])), ["r1"]);
             assert_eq!(hybrid_hit(&t), 64, "{stores:?}");
+        }
+    }
+
+    /// A gemma-4-shaped tracker with a window no prompt here leaves: one full group (bs 32) and
+    /// one sliding group (bs 16).
+    fn wide_window_hybrid(stores: HybridKvStores) -> SimpleBlockTracker {
+        let mut t = SimpleBlockTracker::with_caching(64, 16);
+        t.enable_hybrid(64, vec![(false, 0, 32), (true, 1024, 16)], stores);
+        t
+    }
+
+    /// Whether request `id`'s block `i` of group `g` is still mapped in the prefix cache.
+    fn hybrid_mapped(t: &SimpleBlockTracker, id: &str, g: usize, i: usize) -> bool {
+        let space = t.swa_groups.as_ref().unwrap()[g].space;
+        let slot = t.space_slot(space, t.get_blocks(id)[g][i]);
+        t.hybrid_id_to_key.contains_key(&slot)
+    }
+
+    /// The hybrid path's blocks taken from the cache: a request admitted onto a failed step's
+    /// blocks is found by them and fails with it, and the blocks it wrote are no hits either.
+    #[test]
+    fn a_request_admitted_onto_a_failed_steps_hybrid_blocks_fails_with_it() {
+        for stores in BOTH_STORES {
+            let mut t = wide_window_hybrid(stores);
+            let failed = t.new_step_starts();
+            t.allocate_slots(&hybrid_req("r1", 128), 128, 0, &[])
+                .unwrap();
+            t.new_step_starts();
+            let mut q = hybrid_req("q", 192);
+            let (hit, blocks) = t.get_computed_blocks(&q);
+            assert_eq!(hit, 128, "{stores:?}: q is admitted onto r1's blocks");
+            q.num_computed_tokens = hit;
+            t.allocate_slots(&q, 64, 0, &blocks).unwrap();
+            assert!(hybrid_mapped(&t, "q", 0, 4), "{stores:?}");
+
+            let failed = sorted(t.forget_unwritten(failed, &ids(&["r1"])));
+            assert_eq!(failed, ["q", "r1"], "{stores:?}");
+            assert_eq!(hybrid_hit(&t), 0, "{stores:?}");
+            assert!(!hybrid_mapped(&t, "q", 0, 4), "{stores:?}: q's own block");
+        }
+    }
+
+    /// The hybrid path's blocks taken from the cache are their writer's: a failed request's step
+    /// leaves them cached, and their writer runs on.
+    #[test]
+    fn a_failed_step_leaves_the_hybrid_blocks_it_took() {
+        for stores in BOTH_STORES {
+            let mut t = wide_window_hybrid(stores);
+            let ran = t.new_step_starts();
+            t.allocate_slots(&hybrid_req("p", 128), 128, 0, &[])
+                .unwrap();
+            t.commit_written(ran);
+            let failed = t.new_step_starts();
+            let mut r = hybrid_req("r1", 128);
+            let (hit, blocks) = t.get_computed_blocks(&r);
+            assert_eq!(hit, 96, "{stores:?}: never a whole request");
+            r.num_computed_tokens = hit;
+            t.allocate_slots(&r, 32, 0, &blocks).unwrap();
+
+            assert_eq!(
+                t.forget_unwritten(failed, &ids(&["r1"])),
+                ["r1"],
+                "p runs on"
+            );
+            assert!((0..3).all(|i| hybrid_mapped(&t, "p", 0, i)), "{stores:?}");
+            assert!((0..6).all(|i| hybrid_mapped(&t, "p", 1, i)), "{stores:?}");
+            assert_eq!(hybrid_hit(&t), 96, "{stores:?}");
         }
     }
 
