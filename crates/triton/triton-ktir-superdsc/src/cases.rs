@@ -79,8 +79,9 @@ pub const ALL: &[&str] = &[
     // partitioned parameters. The `to_ktir.rs` count fix's gate.
     "attention_banded_fold",
     "attention_banded_batch",
-    // ⭐ THE LADDER-FORM SAMPLER -- door kind `None` (see the `case` arm): numeric legs only,
-    // until the generic loop/scan door exists.
+    // ⭐ THE LADDER-FORM SAMPLER -- through the whole-function door (every op in the kernel
+    // crosses a generic arm; see the `case` row). The door-kind field carries a placeholder
+    // the walk never reads; the per-`Program` run refuses that row loudly at its arity check.
     "argmax_first_max",
 ];
 
