@@ -271,7 +271,9 @@ pub struct MtpDrafter {
 
 /// A head drafting over the token ids `0..prefix` of its target's vocabulary: a step drafts over
 /// the whole vocabulary while one of its drafting replies has a token past the prefix among its
-/// last `window` — its bake's (the head's `spec_wide_window`).
+/// last `window` — its bake's (the head's `spec_wide_window`). The window reads the reply alone,
+/// never the prompt: a chat template's tail (`<|im_start|>assistant\n<think>\n`, its special ids
+/// past every prefix) would otherwise widen every reply's first steps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DraftVocab {
     pub prefix: u32,
@@ -279,9 +281,9 @@ pub struct DraftVocab {
 }
 
 impl DraftVocab {
-    /// The reply whose tokens so far are `tokens` is past the prefix.
-    fn reaches_past(self, tokens: &[u32]) -> bool {
-        (tokens.iter().rev().take(self.window)).any(|&t| t >= self.prefix)
+    /// The reply whose tokens so far are `reply` is past the prefix.
+    fn reaches_past(self, reply: &[u32]) -> bool {
+        (reply.iter().rev().take(self.window)).any(|&t| t >= self.prefix)
     }
 }
 
@@ -300,6 +302,8 @@ pub struct StepRows<'a> {
     /// Each sequence's blocks.
     pub block_ids: &'a [Vec<u32>],
     pub block_size: usize,
+    /// Each sequence's prompt length: its tokens before its reply.
+    pub prompt_lens: &'a [u32],
 }
 
 impl StepRows<'_> {
@@ -567,8 +571,13 @@ impl MtpDrafter {
         // The step's sequences each draft what its verify rows leave room for.
         let passes = self.budget.drafts_at(step.req_ids.len());
         let past_gate = passes == 0;
-        let past_prefix =
-            |tokens: &[u32]| (self.draft_vocab).is_some_and(|v| v.reaches_past(tokens));
+        // The reply of sequence `i`, whose tokens so far are `tokens`: those past its prompt.
+        let past_prefix = |i: usize, tokens: &[u32]| {
+            let reply = tokens
+                .get(step.prompt_lens[i] as usize..)
+                .unwrap_or_default();
+            (self.draft_vocab).is_some_and(|v| v.reaches_past(reply))
+        };
         let mut wide = false;
         for i in (0..step.req_ids.len()).filter(|&i| plan.contains(&step.req_ids[i])) {
             let tokens = history(&step.req_ids[i]).unwrap_or_default();
@@ -600,7 +609,7 @@ impl MtpDrafter {
                     used,
                 );
                 drafting.push((i, first..one.token_rows.len()));
-                wide |= past_prefix(&tokens);
+                wide |= past_prefix(i, &tokens);
             }
         }
         one.has_spec_tokens = drafting.iter().any(|(_, tokens)| tokens.len() > 1);
@@ -790,6 +799,8 @@ mod tests {
                 block_table_stride: 2,
                 block_ids: &self.block_ids,
                 block_size: 16,
+                // `a`'s prompt its first 8 tokens, its reply the 3 after; `b`'s 8-token prompt.
+                prompt_lens: &[8, 8],
             }
         }
 
@@ -840,6 +851,7 @@ mod tests {
                 block_table_stride: 2,
                 block_ids: &self.block_ids,
                 block_size: 16,
+                prompt_lens: &[8, 8, 3],
             }
         }
 
@@ -957,15 +969,16 @@ mod tests {
     }
 
     /// A step drafts over its target's whole vocabulary exactly when a sequence that drafts in it
-    /// has a token past the head's draft prefix among its last `window`: `a` drafts, its newest
-    /// token 510 (and, in the second history, 900 three back); `b`, whose every token is 700 or
-    /// more, only primes its prompt, so it never widens the step; a head drafting over every id
-    /// never does.
+    /// has a token past the head's draft prefix among the last `window` of its reply: `a` drafts,
+    /// its prompt its first 8 tokens, its newest token 510 (and, in the second history, 900 three
+    /// back); its prompt's tokens never count, as a chat template's tail would widen every reply;
+    /// `b`, whose every token is 700 or more, only primes its prompt, so it never widens the step;
+    /// a head drafting over every id never does.
     #[test]
     fn a_step_drafts_wide_when_a_drafting_reply_reaches_past_the_prefix() {
         let step = TwoSequences::new();
         let three_back: Vec<u32> = (500..508).chain([900, 509, 510]).collect();
-        let wide = |a: &[u32], draft_vocab: Option<(u32, usize)>| {
+        let wide = |a: &[u32], prompt_a: u32, draft_vocab: Option<(u32, usize)>| {
             let drafter = MtpDrafter {
                 draft_vocab: draft_vocab.map(|(prefix, window)| DraftVocab { prefix, window }),
                 ..DRAFTER
@@ -974,33 +987,65 @@ mod tests {
                 "a" => Some(a.to_vec()),
                 _ => step.before()(id),
             };
-            (drafter.passes(&step.rows(), &history, &ids(&["a", "b"]), &mut any))
+            let prompt_lens = [prompt_a, 8];
+            let rows = StepRows {
+                prompt_lens: &prompt_lens,
+                ..step.rows()
+            };
+            (drafter.passes(&rows, &history, &ids(&["a", "b"]), &mut any))
                 .and_then(|p| p.drafting)
                 .expect("a drafts")
                 .wide
         };
         let newest = &step.history_a;
-        assert!(
-            wide(newest, Some((510, 1))),
-            "a's newest token is the prefix's first past it"
-        );
-        assert!(
-            !wide(newest, Some((511, 1))),
-            "a's newest token is the prefix's last"
-        );
-        assert!(
-            !wide(newest, Some((600, 8))),
-            "only b's tokens are past the prefix"
-        );
-        assert!(!wide(newest, None), "the head drafts over every id");
-        assert!(
-            !wide(&three_back, Some((600, 2))),
-            "900 is three back, past a window of two"
-        );
-        assert!(
-            wide(&three_back, Some((600, 3))),
-            "900 is within a window of three"
-        );
+        let cases = [
+            (
+                newest,
+                8,
+                Some((510, 1)),
+                true,
+                "a's newest token is the prefix's first past it",
+            ),
+            (
+                newest,
+                8,
+                Some((511, 1)),
+                false,
+                "a's newest token is the prefix's last",
+            ),
+            (
+                newest,
+                8,
+                Some((600, 8)),
+                false,
+                "only b's tokens are past the prefix",
+            ),
+            (newest, 8, None, false, "the head drafts over every id"),
+            (
+                &three_back,
+                8,
+                Some((600, 2)),
+                false,
+                "900 is three back, past a window of two",
+            ),
+            (
+                &three_back,
+                8,
+                Some((600, 3)),
+                true,
+                "900 is within a window of three",
+            ),
+            (
+                &three_back,
+                9,
+                Some((600, 4)),
+                false,
+                "900 is the prompt's, not the reply's",
+            ),
+        ];
+        for (a, prompt_a, vocab, want, why) in cases {
+            assert_eq!(wide(a, prompt_a, vocab), want, "{why}");
+        }
     }
 
     /// Pass 1 runs every row of each planned sequence, split by whether a draft can read it: the

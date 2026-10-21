@@ -6990,6 +6990,9 @@ impl Worker for MetalWorker {
         let block_ids_u32: Vec<Vec<u32>> = (attn.block_ids.iter())
             .map(|v| v.iter().map(|&b| b as u32).collect())
             .collect();
+        let prompt_lens: Vec<u32> = (req_ids_in_order.iter())
+            .map(|r| self.input_batch.history(r).0.len() as u32)
+            .collect();
         let step_rows = ::scratchy_serving_engine::spec_decode::StepRows {
             req_ids: &req_ids_in_order,
             input_ids: &input_ids_u32,
@@ -7001,6 +7004,7 @@ impl Worker for MetalWorker {
             block_table_stride: max_blocks_eff,
             block_ids: &block_ids_u32,
             block_size,
+            prompt_lens: &prompt_lens,
         };
         let head_passes = match self.mtp_drafter {
             Some(drafter) if !scheduler_output.draft_req_ids.is_empty() => {
