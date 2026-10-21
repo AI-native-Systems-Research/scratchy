@@ -11,29 +11,48 @@ use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{SourceShape, SubOp};
 use scratchy_target_cuda::step::{CudaStep, GemmBf16};
 use scratchy_target_cuda::tape::{ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, WeightIx};
-use scratchy_target_cuda_compiler::canonical::{CanonicalAt, lower_canonical};
+use scratchy_target_cuda_compiler::canonical::{CanonicalAt, CudaCanonical, lower_canonical};
 
 /// Panic unless `tape` is, field by field, what CUDA's compiler lowers `l` to.
+///
+/// Every struct is destructured with no `..`, so a field added to the tape, its layout or the
+/// canonical does not compile here until it is compared.
 pub fn assert_tape_is_lowered(name: &str, tape: &CudaTape, l: &LoweredDecode) {
+    let CudaTape {
+        bucket_m,
+        arena:
+            ArenaLayout {
+                colour_bytes,
+                colour_offsets,
+                total_bytes,
+            },
+        input,
+        result,
+        weight_bytes,
+        steps,
+    } = *tape;
     let at = CanonicalAt {
         stem: name,
-        m: u64::from(tape.bucket_m),
+        m: u64::from(bucket_m),
     };
-    let c = lower_canonical(l, at).unwrap_or_else(|e| panic!("{name}: lower_canonical: {e}"));
-    assert_eq!(tape.bucket_m, c.bucket_m, "{name}: bucket_m");
-    assert_eq!(
-        tape.arena.colour_bytes, c.colour_bytes,
-        "{name}: colour bytes"
-    );
-    assert_eq!(
-        tape.arena.colour_offsets, c.colour_offsets,
-        "{name}: offsets"
-    );
-    assert_eq!(tape.arena.total_bytes, c.total_bytes, "{name}: total");
-    assert_eq!(tape.input, c.input, "{name}: input");
-    assert_eq!(tape.result, c.result, "{name}: result");
-    assert_eq!(tape.weight_bytes, c.weight_bytes, "{name}: weight_bytes");
-    assert_eq!(tape.steps, c.steps, "{name}: steps");
+    let CudaCanonical {
+        bucket_m: lowered_m,
+        colour_bytes: lowered_bytes,
+        colour_offsets: lowered_offsets,
+        total_bytes: lowered_total,
+        input: lowered_input,
+        result: lowered_result,
+        weight_bytes: lowered_weights,
+        steps: lowered_steps,
+    } = lower_canonical(l, at).unwrap_or_else(|e| panic!("{name}: lower_canonical: {e}"));
+    assert_eq!(bucket_m, lowered_m, "{name}: bucket_m");
+    assert_eq!(colour_bytes, lowered_bytes, "{name}: colour bytes");
+    assert_eq!(colour_offsets, lowered_offsets, "{name}: offsets");
+    assert_eq!(total_bytes, lowered_total, "{name}: total");
+    assert_eq!(input, lowered_input, "{name}: input");
+    assert_eq!(result, lowered_result, "{name}: result");
+    assert_eq!(weight_bytes, lowered_weights, "{name}: weight_bytes");
+    assert_eq!(steps, lowered_steps, "{name}: steps");
 }
 
 /// The chains' activation width: `x` is `[M, HIDDEN]`.

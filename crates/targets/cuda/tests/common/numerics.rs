@@ -117,3 +117,122 @@ pub fn compare(gpu: &[u16], a: &[u16], b: &[u16], m: usize, n: usize, k: usize) 
         out_of_bound: bad,
     }
 }
+
+// ── The row kernels (RMSNorm, add, SiluMul) ─────────────────────────
+//
+// Each reference is computed in f64 from the same bf16 values the GPU read. RMSNorm and SiluMul
+// pass under `|gpu − ref| ≤ 2⁻⁸·|ref| + 2⁻²⁴`: 2⁻⁸ is twice the half-ulp of their one bf16
+// rounding, and covers the f32 arithmetic and the fast-math `rsqrtf`, `__expf` and division with
+// a wide margin; 2⁻²⁴ is the floor flush-to-zero needs. The add is bit-exact: its reference is the
+// kernel's own sequence (an exact widening, one f32 add, one rounding).
+
+/// The row kernels' relative bound, `2⁻⁸`.
+pub const ROW_REL: f64 = 1.0 / 256.0;
+/// The row kernels' absolute floor, `2⁻²⁴`.
+pub const ROW_ABS: f64 = 1.0 / 16_777_216.0;
+
+/// The row kernels' bound on an element whose reference is `r`.
+pub fn row_bound(r: f64) -> f64 {
+    r.abs() * ROW_REL + ROW_ABS
+}
+
+/// `x / sqrt(mean(x²) + eps) · (offset + g)` per element of `[rows, cols]`, in f64.
+pub fn rms_norm_reference(
+    x: &[u16],
+    g: &[u16],
+    (rows, cols): (usize, usize),
+    eps: f64,
+    offset: f64,
+) -> Vec<f64> {
+    let (x, g) = (widen(x), widen(g));
+    let mut out = Vec::with_capacity(rows * cols);
+    for r in 0..rows {
+        let row = &x[r * cols..][..cols];
+        let mean = row.iter().map(|v| v * v).sum::<f64>() / cols as f64;
+        let inv = 1.0 / (mean + eps).sqrt();
+        out.extend(row.iter().zip(&g).map(|(v, w)| v * inv * (offset + w)));
+    }
+    out
+}
+
+/// `g / (1 + e^(−g)) · u` per element, in f64.
+pub fn silu_mul_reference(gate: &[u16], up: &[u16]) -> Vec<f64> {
+    widen(gate)
+        .iter()
+        .zip(widen(up))
+        .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
+        .collect()
+}
+
+/// `bf16::from_f32(f32(a) + f32(b))` per element: the add kernel's own sequence.
+pub fn add_reference(a: &[u16], b: &[u16]) -> Vec<u16> {
+    a.iter()
+        .zip(b)
+        .map(|(&a, &b)| {
+            let sum = bf16::from_bits(a).to_f32() + bf16::from_bits(b).to_f32();
+            bf16::from_f32(sum).to_bits()
+        })
+        .collect()
+}
+
+/// Compare `gpu` (`[rows, cols]` bf16 bits) with `refs` under [`row_bound`]. A NaN or Inf in the
+/// GPU output fails.
+pub fn compare_rows(gpu: &[u16], refs: &[f64], cols: usize) -> Comparison {
+    assert_eq!(
+        gpu.len(),
+        refs.len(),
+        "the GPU output and the reference differ in length"
+    );
+    let (mut max_err, mut sum_err, mut bad) = (0.0f64, 0.0f64, 0usize);
+    let (mut worst, mut worst_ratio) = ((0, 0, 0.0f64, 0.0f64, 0.0f64), -1.0f64);
+    for (idx, (&bits, &r)) in gpu.iter().zip(refs).enumerate() {
+        let g = f64::from(bf16::from_bits(bits).to_f32());
+        let bound = row_bound(r);
+        let err = (g - r).abs();
+        if !(g.is_finite() && err <= bound) {
+            bad += 1;
+        }
+        let ratio = if g.is_finite() {
+            err / bound
+        } else {
+            f64::INFINITY
+        };
+        if ratio > worst_ratio {
+            worst_ratio = ratio;
+            worst = (idx / cols, idx % cols, g, r, bound);
+        }
+        if g.is_finite() {
+            max_err = max_err.max(err);
+            sum_err += err;
+        }
+    }
+    Comparison {
+        max_abs_err: max_err,
+        mean_abs_err: sum_err / gpu.len().max(1) as f64,
+        worst,
+        out_of_bound: bad,
+    }
+}
+
+/// How many of `gpu`'s elements differ in any bit from `want`'s.
+pub fn mismatched_bits(gpu: &[u16], want: &[u16]) -> usize {
+    assert_eq!(
+        gpu.len(),
+        want.len(),
+        "the GPU output and the reference differ in length"
+    );
+    gpu.iter().zip(want).filter(|(g, w)| g != w).count()
+}
+
+/// `f` as bf16 bits.
+pub fn bits(f: f32) -> u16 {
+    bf16::from_f32(f).to_bits()
+}
+
+/// `len` bf16 gains in [-1/4, 1/4], as zero-centred checkpoints store them.
+pub fn centred_gains(len: usize, seed: u64) -> Vec<u16> {
+    bf16_inputs(len, seed)
+        .into_iter()
+        .map(|b| bits(bf16::from_bits(b).to_f32() / 4.0))
+        .collect()
+}

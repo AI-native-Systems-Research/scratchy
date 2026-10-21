@@ -60,3 +60,481 @@ pub struct CudaTape {
     /// One step per launch, in launch order.
     pub steps: &'static [CudaStep],
 }
+
+/// Why a tape cannot be played: it would make a kernel read or write outside the arena, or read
+/// past a weight. No tape `scratchy-target-cuda-compiler` lowers is; [`CudaTape::validate`] makes
+/// that a checked fact rather than a promise, since every field of a tape is public.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TapeError {
+    /// The layout has a different number of colour sizes and colour offsets.
+    ColourCount { bytes: usize, offsets: usize },
+    /// A colour's offset is not a multiple of [`CUDA_ARENA_ALIGN`].
+    ColourMisaligned { colour: usize, offset: u64 },
+    /// A colour reaches past the arena's `total` bytes, or its end overflows `u64`.
+    ColourOutside {
+        colour: usize,
+        span: ArenaSpan,
+        total: u64,
+    },
+    /// The input span reaches past the arena.
+    InputOutside { span: ArenaSpan, total: u64 },
+    /// The result span reaches past the arena.
+    ResultOutside { span: ArenaSpan, total: u64 },
+    /// A byte count of the `step`-th step overflows `u64`.
+    StepOverflow { step: usize },
+    /// A span the `step`-th step reads or writes is not at a multiple of [`CUDA_ARENA_ALIGN`].
+    StepMisaligned { step: usize, offset: u64 },
+    /// A span the `step`-th step reads or writes reaches past the arena.
+    StepOutside {
+        step: usize,
+        span: ArenaSpan,
+        total: u64,
+    },
+    /// The span the `step`-th step writes overlaps one it reads.
+    WriteOverlapsRead {
+        step: usize,
+        write: ArenaSpan,
+        read: ArenaSpan,
+    },
+    /// The `step`-th step reads weight `ix`, and the tape declares `weights` weights.
+    WeightIndex {
+        step: usize,
+        ix: u32,
+        weights: usize,
+    },
+    /// The `step`-th step reads `need` bytes of weight `ix`; the tape declares `declared`.
+    WeightShort {
+        step: usize,
+        ix: u32,
+        need: u64,
+        declared: u64,
+    },
+}
+
+impl std::fmt::Display for TapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let at = |s: &ArenaSpan| (s.bytes, s.offset.0);
+        match self {
+            Self::ColourCount { bytes, offsets } => write!(
+                f,
+                "the arena layout has {bytes} colour sizes and {offsets} colour offsets"
+            ),
+            Self::ColourMisaligned { colour, offset } => write!(
+                f,
+                "colour {colour} is at offset {offset}, not a multiple of {CUDA_ARENA_ALIGN}"
+            ),
+            Self::ColourOutside {
+                colour,
+                span,
+                total,
+            } => {
+                let (bytes, offset) = at(span);
+                write!(
+                    f,
+                    "colour {colour} ({bytes} bytes at {offset}) reaches past the {total}-byte \
+                     arena"
+                )
+            }
+            Self::InputOutside { span, total } => {
+                let (bytes, offset) = at(span);
+                write!(
+                    f,
+                    "the input ({bytes} bytes at {offset}) reaches past the {total}-byte arena"
+                )
+            }
+            Self::ResultOutside { span, total } => {
+                let (bytes, offset) = at(span);
+                write!(
+                    f,
+                    "the result ({bytes} bytes at {offset}) reaches past the {total}-byte arena"
+                )
+            }
+            Self::StepOverflow { step } => write!(f, "step {step}'s byte counts overflow u64"),
+            Self::StepMisaligned { step, offset } => write!(
+                f,
+                "step {step} touches the arena at {offset}, not a multiple of {CUDA_ARENA_ALIGN}"
+            ),
+            Self::StepOutside { step, span, total } => {
+                let (bytes, offset) = at(span);
+                write!(
+                    f,
+                    "step {step} touches {bytes} bytes at {offset}, past the {total}-byte arena"
+                )
+            }
+            Self::WriteOverlapsRead { step, write, read } => {
+                let ((wb, wo), (rb, ro)) = (at(write), at(read));
+                write!(
+                    f,
+                    "step {step} writes {wb} bytes at {wo} over the {rb} bytes at {ro} it reads"
+                )
+            }
+            Self::WeightIndex { step, ix, weights } => write!(
+                f,
+                "step {step} reads weight {ix}, and the tape declares {weights} weights"
+            ),
+            Self::WeightShort {
+                step,
+                ix,
+                need,
+                declared,
+            } => write!(
+                f,
+                "step {step} reads {need} bytes of weight {ix}; the tape declares {declared}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TapeError {}
+
+impl CudaTape {
+    /// Check that playing this tape stays inside its arena and its declared weights.
+    ///
+    /// Every colour is aligned and inside `total_bytes`, and so are the input and result spans.
+    /// Every step's spans ([`CudaStep::extents`]) are aligned and inside `total_bytes`, its write
+    /// overlaps none of its reads, and each weight it reads is one the tape declares, declared at
+    /// least as large as the step reads. All arithmetic is checked. The worker runs this on every
+    /// tape before it allocates anything; its own weight checks then close the chain from each
+    /// step to the buffer it reads.
+    pub fn validate(&self) -> Result<(), TapeError> {
+        let total = self.arena.total_bytes;
+        let (bytes, offsets) = (self.arena.colour_bytes, self.arena.colour_offsets);
+        if bytes.len() != offsets.len() {
+            return Err(TapeError::ColourCount {
+                bytes: bytes.len(),
+                offsets: offsets.len(),
+            });
+        }
+        for (colour, (&bytes, &offset)) in bytes.iter().zip(offsets).enumerate() {
+            if !offset.is_multiple_of(CUDA_ARENA_ALIGN) {
+                return Err(TapeError::ColourMisaligned { colour, offset });
+            }
+            let span = ArenaSpan {
+                offset: ArenaOffset(offset),
+                bytes,
+            };
+            if !inside(span, total) {
+                return Err(TapeError::ColourOutside {
+                    colour,
+                    span,
+                    total,
+                });
+            }
+        }
+        if !inside(self.input, total) {
+            return Err(TapeError::InputOutside {
+                span: self.input,
+                total,
+            });
+        }
+        if !inside(self.result, total) {
+            return Err(TapeError::ResultOutside {
+                span: self.result,
+                total,
+            });
+        }
+        for (step, s) in self.steps.iter().enumerate() {
+            let e = s.extents().ok_or(TapeError::StepOverflow { step })?;
+            let reads = e.reads.iter().flatten();
+            for &span in reads.clone().chain([&e.writes]) {
+                if !span.offset.0.is_multiple_of(CUDA_ARENA_ALIGN) {
+                    return Err(TapeError::StepMisaligned {
+                        step,
+                        offset: span.offset.0,
+                    });
+                }
+                if !inside(span, total) {
+                    return Err(TapeError::StepOutside { step, span, total });
+                }
+            }
+            if let Some(&read) = reads.clone().find(|&&r| overlap(r, e.writes)) {
+                return Err(TapeError::WriteOverlapsRead {
+                    step,
+                    write: e.writes,
+                    read,
+                });
+            }
+            if let Some(w) = e.weight {
+                let weights = self.weight_bytes.len();
+                let ix = w.ix.0;
+                let &declared = (self.weight_bytes.get(ix as usize))
+                    .ok_or(TapeError::WeightIndex { step, ix, weights })?;
+                if declared < w.bytes {
+                    return Err(TapeError::WeightShort {
+                        step,
+                        ix,
+                        need: w.bytes,
+                        declared,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether `span` ends at or before `total`, its end not overflowing.
+fn inside(span: ArenaSpan, total: u64) -> bool {
+    (span.offset.0.checked_add(span.bytes)).is_some_and(|end| end <= total)
+}
+
+/// Whether two spans share a byte. Both lie inside the arena, so neither end overflows.
+fn overlap(a: ArenaSpan, b: ArenaSpan) -> bool {
+    let (a0, b0) = (a.offset.0, b.offset.0);
+    a.bytes > 0 && b.bytes > 0 && a0 < b0 + b.bytes && b0 < a0 + a.bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use scratchy_subtile::subtile_ir::GainConvention;
+
+    use super::*;
+    use crate::step::{AddBf16, GemmBf16, RmsNormBf16};
+
+    const fn span(offset: u64, bytes: u64) -> ArenaSpan {
+        ArenaSpan {
+            offset: ArenaOffset(offset),
+            bytes,
+        }
+    }
+
+    /// `x [256, 512] → W1 (N = 1024) → y [256, 1024] → RmsNorm(y, g) → n [256, 1024]`.
+    ///
+    /// Colours: 0 `x` [256, 512] at 0, 1 `y` [256, 1024] at 262144, 2 `n` [256, 1024] at 786432.
+    /// Weights: 1 `W1` [1024, 512], 2 `g` [1024].
+    const GOOD_STEPS: &[CudaStep] = &[
+        CudaStep::Gemm(GemmBf16 {
+            a: ArenaOffset(0),
+            b: WeightIx(1),
+            c: ArenaOffset(262144),
+            m: 256,
+            n: 1024,
+            k: 512,
+        }),
+        CudaStep::RmsNorm(RmsNormBf16 {
+            x: ArenaOffset(262144),
+            gain: WeightIx(2),
+            y: ArenaOffset(786432),
+            rows: 256,
+            cols: 1024,
+            eps_bits: 1e-6f32.to_bits(),
+            convention: GainConvention::OnePlusScale,
+        }),
+    ];
+
+    const GOOD: CudaTape = CudaTape {
+        bucket_m: 256,
+        arena: ArenaLayout {
+            colour_bytes: &[262144, 524288, 524288],
+            colour_offsets: &[0, 262144, 786432],
+            total_bytes: 1310720,
+        },
+        input: span(0, 262144),
+        result: span(786432, 524288),
+        weight_bytes: &[0, 1048576, 2048],
+        steps: GOOD_STEPS,
+    };
+
+    /// `GOOD` with its steps replaced by `step` alone.
+    fn with_step(step: CudaStep) -> CudaTape {
+        CudaTape {
+            steps: Box::leak(Box::new([step])),
+            ..GOOD
+        }
+    }
+
+    fn gemm(a: u64, b: u32, c: u64, (m, n, k): (u32, u32, u32)) -> CudaStep {
+        CudaStep::Gemm(GemmBf16 {
+            a: ArenaOffset(a),
+            b: WeightIx(b),
+            c: ArenaOffset(c),
+            m,
+            n,
+            k,
+        })
+    }
+
+    #[test]
+    fn a_well_formed_tape_validates() {
+        assert_eq!(GOOD.validate(), Ok(()));
+    }
+
+    #[test]
+    fn colour_count() {
+        let t = CudaTape {
+            arena: ArenaLayout {
+                colour_offsets: &[0, 262144],
+                ..GOOD.arena
+            },
+            ..GOOD
+        };
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::ColourCount {
+                bytes: 3,
+                offsets: 2
+            })
+        );
+    }
+
+    #[test]
+    fn colour_misaligned() {
+        let t = CudaTape {
+            arena: ArenaLayout {
+                colour_offsets: &[0, 262144, 786560],
+                ..GOOD.arena
+            },
+            ..GOOD
+        };
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::ColourMisaligned {
+                colour: 2,
+                offset: 786560
+            })
+        );
+    }
+
+    #[test]
+    fn colour_outside() {
+        let t = CudaTape {
+            arena: ArenaLayout {
+                total_bytes: 1048576,
+                ..GOOD.arena
+            },
+            ..GOOD
+        };
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::ColourOutside {
+                colour: 2,
+                span: span(786432, 524288),
+                total: 1048576
+            })
+        );
+        let t = CudaTape {
+            arena: ArenaLayout {
+                colour_offsets: &[0, 262144, u64::MAX - 255],
+                ..GOOD.arena
+            },
+            ..GOOD
+        };
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::ColourOutside {
+                colour: 2,
+                span: span(u64::MAX - 255, 524288),
+                total: 1310720
+            })
+        );
+    }
+
+    #[test]
+    fn input_outside() {
+        let t = CudaTape {
+            input: span(1310720, 256),
+            ..GOOD
+        };
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::InputOutside {
+                span: span(1310720, 256),
+                total: 1310720
+            })
+        );
+    }
+
+    #[test]
+    fn result_outside() {
+        let t = CudaTape {
+            result: span(786432, 524544),
+            ..GOOD
+        };
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::ResultOutside {
+                span: span(786432, 524544),
+                total: 1310720
+            })
+        );
+    }
+
+    #[test]
+    fn step_overflow() {
+        let t = with_step(gemm(0, 1, 262144, (u32::MAX, u32::MAX, 4)));
+        assert_eq!(t.validate(), Err(TapeError::StepOverflow { step: 0 }));
+    }
+
+    #[test]
+    fn step_misaligned() {
+        let t = with_step(gemm(128, 1, 262144, (256, 1024, 512)));
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::StepMisaligned {
+                step: 0,
+                offset: 128
+            })
+        );
+    }
+
+    #[test]
+    fn step_outside() {
+        let t = with_step(gemm(0, 1, 1048576, (256, 1024, 512)));
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::StepOutside {
+                step: 0,
+                span: span(1048576, 524288),
+                total: 1310720
+            })
+        );
+    }
+
+    #[test]
+    fn write_overlaps_read() {
+        // `out` starts inside `b`'s span: [262144, 786432) and [524288, 1048576).
+        let t = with_step(CudaStep::Add(AddBf16 {
+            a: ArenaOffset(0),
+            b: ArenaOffset(262144),
+            out: ArenaOffset(524288),
+            rows: 256,
+            cols: 1024,
+        }));
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::WriteOverlapsRead {
+                step: 0,
+                write: span(524288, 524288),
+                read: span(262144, 524288)
+            })
+        );
+    }
+
+    #[test]
+    fn weight_index() {
+        let t = with_step(gemm(0, 9, 262144, (256, 1024, 512)));
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::WeightIndex {
+                step: 0,
+                ix: 9,
+                weights: 3
+            })
+        );
+    }
+
+    #[test]
+    fn weight_short() {
+        // The norm's gain, read as the GEMM's B: 1048576 bytes needed, 2048 declared.
+        let t = with_step(gemm(0, 2, 262144, (256, 1024, 512)));
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::WeightShort {
+                step: 0,
+                ix: 2,
+                need: 1048576,
+                declared: 2048
+            })
+        );
+    }
+}

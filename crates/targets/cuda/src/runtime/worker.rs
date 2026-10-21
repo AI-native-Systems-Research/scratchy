@@ -19,14 +19,16 @@ use super::device::CudaDevice;
 use super::ffi;
 use super::{CudaError, check};
 use crate::kernels::{self, KernelError};
-use crate::step::{CudaStep, GemmBf16};
-use crate::tape::{ArenaOffset, ArenaSpan, CudaTape};
+use crate::step::{AddBf16, CudaStep, GemmBf16, RmsNormBf16, SiluMulBf16};
+use crate::tape::{ArenaOffset, ArenaSpan, CudaTape, TapeError};
 
 /// Why a worker could not be built.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkerError {
     /// The worker was given no tape.
     NoTapes,
+    /// The tape at `bucket` would read or write outside its arena or its weights.
+    Tape { bucket: usize, error: TapeError },
     /// A tape needs a weight at `ix` and the table has no buffer there.
     MissingWeight { ix: usize, need: u64 },
     /// The weight buffer at `ix` holds `have` bytes; a tape needs `need`.
@@ -39,6 +41,7 @@ impl fmt::Display for WorkerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoTapes => write!(f, "a CUDA worker needs at least one tape"),
+            Self::Tape { bucket, error } => write!(f, "the tape of bucket {bucket}: {error}"),
             Self::MissingWeight { ix, need } => {
                 write!(
                     f,
@@ -152,14 +155,23 @@ pub struct CudaWorker<'a> {
 }
 
 impl<'a> CudaWorker<'a> {
-    /// A worker for `tapes` reading `weights`: checks once that every weight a tape reads is
-    /// large enough, then makes the stream and the one arena allocation, of the largest tape's
+    /// A worker for `tapes` reading `weights`: validates every tape ([`CudaTape::validate`]) and
+    /// checks once that every weight a tape declares is large enough, before it allocates
+    /// anything; then makes the stream and the one arena allocation, of the largest tape's
     /// `total_bytes`.
+    ///
+    /// Together the two checks are what makes [`Self::forward`] safe to call with any tape: every
+    /// span a step touches lies inside its tape's arena, which is at most the worker's, and every
+    /// weight a step reads is at most its declared `weight_bytes`, which is at most the buffer.
     pub fn new(
         device: &CudaDevice,
         tapes: &'static [CudaTape],
         weights: &'a [DeviceBuffer],
     ) -> Result<Self, WorkerError> {
+        for (bucket, tape) in tapes.iter().enumerate() {
+            tape.validate()
+                .map_err(|error| WorkerError::Tape { bucket, error })?;
+        }
         for tape in tapes {
             for (ix, &need) in tape.weight_bytes.iter().enumerate() {
                 if need == 0 {
@@ -271,8 +283,8 @@ impl<'a> CudaWorker<'a> {
         input: &[u16],
         result: &mut [u16],
     ) -> Result<(), ForwardError> {
-        // SAFETY: the input span lies inside the arena (the tape's own layout, at most
-        // `arena_bytes`), `input` holds exactly its bytes, and `input` stays borrowed until the
+        // SAFETY: the input span lies inside the tape's arena (`new` validated it), which is at
+        // most `arena_bytes`; `input` holds exactly its bytes, and `input` stays borrowed until the
         // caller's stream wait has returned.
         check(
             unsafe {
@@ -287,14 +299,17 @@ impl<'a> CudaWorker<'a> {
             "cudaMemcpyAsync(host to device)",
         )
         .map_err(ForwardError::Cuda)?;
+        // SAFETY (every arm): `new` validated the tape (`CudaTape::validate`): each span a step
+        // reads or writes (`CudaStep::extents`, the kernel's own operand sizes) is 256-byte
+        // aligned and inside the tape's arena, which is at most this worker's; the span it writes
+        // overlaps none it reads; each weight it reads has an index the tape declares, declared at
+        // least as large as the step reads, and `new` checked every declared size against its
+        // buffer. cudaMalloc pointers are 256-byte aligned. The stream is live.
         for (step, s) in tape.steps.iter().enumerate() {
             let launched = match *s {
                 CudaStep::Gemm(GemmBf16 { a, b, c, m, n, k }) => {
                     let b = self.weights[b.0 as usize].ptr();
-                    // SAFETY: the tape's steps were lowered with its arena layout: `a` and `c`
-                    // are colours of `m*k` and `m*n` bf16 elements, 256-byte aligned, inside the
-                    // arena, and `c` is a colour neither operand holds; `b` is a weight `new`
-                    // checked to hold the tape's `n*k` elements. The stream is live.
+                    // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
                     unsafe {
                         kernels::gemm_bf16_abt(
                             self.slot(a),
@@ -303,6 +318,67 @@ impl<'a> CudaWorker<'a> {
                             m,
                             n,
                             k,
+                            self.stream.0,
+                        )
+                    }
+                }
+                CudaStep::RmsNorm(
+                    norm @ RmsNormBf16 {
+                        x,
+                        gain,
+                        y,
+                        rows,
+                        cols,
+                        convention,
+                        ..
+                    },
+                ) => {
+                    let gain = self.weights[gain.0 as usize].ptr();
+                    // SAFETY: as above, for `x` and `y` (`rows*cols`) and `gain` (`cols`).
+                    unsafe {
+                        kernels::rms_norm_bf16(
+                            self.slot(x),
+                            gain,
+                            self.slot(y),
+                            (rows, cols),
+                            norm.eps(),
+                            convention.offset(),
+                            self.stream.0,
+                        )
+                    }
+                }
+                CudaStep::Add(AddBf16 {
+                    a,
+                    b,
+                    out,
+                    rows,
+                    cols,
+                }) => {
+                    // SAFETY: as above, for `a`, `b` and `out` (`rows*cols` each).
+                    unsafe {
+                        kernels::add_bf16(
+                            self.slot(a),
+                            self.slot(b),
+                            self.slot(out),
+                            (rows, cols),
+                            self.stream.0,
+                        )
+                    }
+                }
+                CudaStep::SiluMul(SiluMulBf16 {
+                    gate,
+                    up,
+                    out,
+                    rows,
+                    cols,
+                }) => {
+                    // SAFETY: as above, for `gate`, `up` and `out` (`rows*cols` each).
+                    unsafe {
+                        kernels::silu_mul_bf16(
+                            self.slot(gate),
+                            self.slot(up),
+                            self.slot(out),
+                            (rows, cols),
                             self.stream.0,
                         )
                     }
