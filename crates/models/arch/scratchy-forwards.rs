@@ -350,6 +350,10 @@ fn main() {
     // a backend they support is on. Sorted for deterministic output.
     let dsl_dir = manifest.join("dsl");
     println!("cargo:rerun-if-changed={}", dsl_dir.display());
+    // A head that prefills at its target's chunk width must have a rung for the widest one, or the
+    // first chunk that wide panics at runtime: refuse the build instead, before any expansion.
+    scratchy_forward_compiler_macro::check_head_ladders(&manifest)
+        .unwrap_or_else(|e| panic!("head ladder: {e}"));
     let mut dsl_files: Vec<PathBuf> = std::fs::read_dir(&dsl_dir)
         .unwrap()
         .flatten()

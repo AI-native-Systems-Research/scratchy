@@ -408,10 +408,11 @@ jobs:
       # proc-macro crate cannot set, so those tests select zero configs — the
       # `config_of` doc comment in codegen.rs spells this out). Same class of
       # rot as the KTIR suites above; fixing them is its own change. Widen this
-      # filter as they are fixed.
+      # filter as they are fixed. `head_ladder_tests`: the check the models'
+      # build runs that an MTP head reaches its target's top rung (#600).
       - name: Variant-selection gate tests (forward-compiler macro)
         run: cargo test -p scratchy-forward-compiler-macro --features metal --lib
-          -- quantization::tests codegen::fingerprint_tests
+          -- quantization::tests codegen::fingerprint_tests head_ladder_tests
           --skip fp8_block_disambiguation
 
       # Type-check scratchy-models' INTEGRATION tests (`tests/*.rs`). Nothing
