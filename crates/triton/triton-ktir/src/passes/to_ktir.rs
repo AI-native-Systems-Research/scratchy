@@ -868,50 +868,60 @@ fn convert_all(
 /// ONLY COMBINERS WHOSE IDENTITY IS KNOWN are supported. The alternative is seeding an
 /// accumulator with a fabricated value, which produces a WRONG ANSWER SILENTLY rather
 /// than a diagnostic.
-fn combiner_identity(kind: &OpKind, elem: DType) -> Option<FloatBits> {
+///
+/// THE INTEGER TABLE is the sampler's extension (its index math is i32, so its pass-2
+/// reduce combines with `arith.maxsi`): one entry, measured -- `maxsi` at `I32`, whose
+/// identity is `i32::MIN`. Anything else integer refuses by falling to `None`, the same
+/// fail-closed edge the float arms leave.
+fn combiner_identity(kind: &OpKind, elem: DType) -> Option<Attr> {
     let f16 = elem == DType::F16;
     Some(match kind {
         OpKind::ArithAddf => {
             if f16 {
-                FloatBits {
+                Attr::Float(FloatBits {
                     bits: 0x0000,
                     width: 16,
-                }
+                })
             } else {
-                FloatBits::f32(0.0)
+                Attr::Float(FloatBits::f32(0.0))
             }
         }
         OpKind::ArithMulf => {
             if f16 {
-                FloatBits {
+                Attr::Float(FloatBits {
                     bits: 0x3c00,
                     width: 16,
-                }
+                })
             } else {
-                FloatBits::f32(1.0)
+                Attr::Float(FloatBits::f32(1.0))
             }
         }
         // -inf for a max, +inf for a min.
         OpKind::ArithMaxnumf => {
             if f16 {
-                FloatBits {
+                Attr::Float(FloatBits {
                     bits: 0xFC00,
                     width: 16,
-                }
+                })
             } else {
-                FloatBits::f32(f32::NEG_INFINITY)
+                Attr::Float(FloatBits::f32(f32::NEG_INFINITY))
             }
         }
         OpKind::ArithMinnumf => {
             if f16 {
-                FloatBits {
+                Attr::Float(FloatBits {
                     bits: 0x7C00,
                     width: 16,
-                }
+                })
             } else {
-                FloatBits::f32(f32::INFINITY)
+                Attr::Float(FloatBits::f32(f32::INFINITY))
             }
         }
+        // The least i32 -- every value the ramp product can hold is above it, so the
+        // seeded accumulator can never win. Exact in the emulator's f32 round trip
+        // (-2^31 is a power of two). The combiner rides `Other` (our `OpKind` has no
+        // `maxsi` variant), matched by spelling like every Other-riding op.
+        OpKind::Other(s) if s == "arith.maxsi" && elem == DType::I32 => Attr::Int(i32::MIN as i64),
         _ => return None,
     })
 }
@@ -960,12 +970,23 @@ fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Resul
     if axis < 0 || axis as usize >= src_rank {
         return Err(refuse(format!("tt.reduce axis {axis} is out of range")));
     }
-    let elem = src_ty.elem().filter(|e| e.is_float()).ok_or_else(|| {
-        refuse(
-            "only a float tt.reduce is supported (an integer reduction needs its own \
-             identity table)",
-        )
-    })?;
+    // Floats always; integers only for a combiner whose identity the table states (the
+    // sampler's i32 `maxsi`). The filter and the table agree by construction: an integer
+    // elem whose combiner has no entry falls to `combiner_identity`'s `None` below, which
+    // is the same refusal this pre-check states earlier and more plainly.
+    if !src_ty
+        .elem()
+        .is_some_and(|e| e.is_float() || e == DType::I32)
+    {
+        return Err(refuse(
+            "only a float tt.reduce is supported, or an i32 one whose combiner's \
+             identity is in the table (an integer reduction needs its own identity \
+             entry)",
+        ));
+    }
+    let elem = src_ty
+        .elem()
+        .expect("the filter above established an element type");
 
     // The combiner must be ONE recognized associative op plus the terminator.
     let region = op
@@ -1013,7 +1034,7 @@ fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Resul
     }
     let ident = combiner_identity(&combine.kind, elem).ok_or_else(|| {
         refuse(format!(
-            "tt.reduce combiner `{}` has no known identity element, so its \
+            "tt.reduce combiner `{}` has no known identity element at {elem:?}, so its \
              linalg.generic accumulator cannot be seeded; refusing rather than \
              fabricating a seed",
             combine.kind.spelling()
@@ -1026,7 +1047,7 @@ fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Resul
     let init = module.fresh_named(&hint);
     let ident_op = Op::new(OpKind::ArithConstant)
         .with_result(ident_scalar, IrType::Scalar(elem))
-        .with_attr(AttrKey::Value, Attr::Float(ident));
+        .with_attr(AttrKey::Value, ident);
     let init_op = Op::new(OpKind::TensorSplat)
         .with_result(init, res_ty.clone())
         .with_operands([ident_scalar]);

@@ -1,0 +1,54 @@
+{
+  "config": "argmax_first_max",
+  "fixture": "argmax_first_max",
+  "kernel": "argmax_first_max_kernel",
+  "inputs_fn": "inputs",
+  "reference_fn": "reference",
+  "seed": 0,
+  "torch": "2.14.1",
+  "generated_by": "test/numeric/gen_numeric_data.py",
+  "constexprs": {
+    "V": 49155,
+    "PAD_V": 49216,
+    "BLOCK": 64
+  },
+  "grid": [
+    1
+  ],
+  "inputs": [
+    {
+      "arg": "logits_ptr",
+      "file": "in_logits_ptr.bin",
+      "shape": [
+        49216
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "ramp_ptr",
+      "file": "in_ramp_ptr.bin",
+      "shape": [
+        49216
+      ],
+      "dtype": "i32"
+    },
+    {
+      "arg": "idx_ptr",
+      "file": "in_idx_ptr.bin",
+      "shape": [
+        64
+      ],
+      "dtype": "i32",
+      "zeroed": true
+    }
+  ],
+  "output": {
+    "arg": "idx_ptr",
+    "file": "ref_out.bin",
+    "shape": [
+      1
+    ],
+    "dtype": "i32"
+  },
+  "reference_note": "THE STIMULUS CARRIES A REAL TIE: lanes 100 and 5000 both hold the row's maximum, so `ref_out.bin`'s single lane is 100 -- FIRST-max pinned against a tie, not a vacuous uniqueness. THE NEGATIVE CONTROL IS PART OF THE CONTRACT: a last-max implementation answers 5000 against these same bytes and must not match `ref_out.bin`; a run that still matches cannot have taken the tie. The pad lanes past V=49155 hold -inf (the host obligation the fixture's own docstring states); a kernel that lets a pad lane win the equality answers PAD_V-adjacent garbage, never 100."
+}

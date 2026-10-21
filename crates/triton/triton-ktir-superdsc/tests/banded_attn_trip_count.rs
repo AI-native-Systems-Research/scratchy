@@ -53,8 +53,11 @@
 /// runs under `KTIR_WHOLE=1`, minus the bake directory. `Err` carries the first
 /// refusing stage's message.
 fn drive(name: &str) -> Result<Vec<String>, String> {
-    let (kspec, grid, program) = triton_ktir_superdsc::cases::case(name)
+    let (kspec, grid, door) = triton_ktir_superdsc::cases::case(name)
         .unwrap_or_else(|| panic!("`{name}` is not a configuration"));
+    // This test drives the DOOR, so a doorless row cannot run here by construction; the twin
+    // rows it names both have `Program::Attn`.
+    let program = door.unwrap_or_else(|| panic!("`{name}` has no door kind to drive"));
     let src = std::fs::read_to_string(&kspec.file).map_err(|e| format!("read: {e}"))?;
     let mut tt =
         triton_frontend::codegen::compile(&src, &kspec, triton_frontend::target::Target::spyre())

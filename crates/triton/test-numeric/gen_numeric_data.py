@@ -175,6 +175,12 @@ def _attn_ce_1tile():
             "BLOCK_M": 64, "BLOCK_N": 64, "GQA": 2, "STAGE": 1, "sm_scale": 1.0}
 
 
+def _argmax_ce():
+    # A copy of the `argmax` row in `triton-ktir-superdsc/src/cases.rs` (the authority).
+    # PAD_V is the host-side -inf padding of the vocab row to a whole stick.
+    return {"V": 49155, "PAD_V": 49216, "BLOCK": 64}
+
+
 CONFIGS = {
     "rmsnorm_granite": dict(fixture="rmsnorm", kernel="rmsnorm_fwd",
                             ce=_rmsnorm_ce(64, 4096), grid=[1]),
@@ -297,6 +303,32 @@ CONFIGS = {
         fixture="paged_attention_multiblock", kernel="paged_attn_multiblock_fwd",
         ce={"NUM_BLOCKS": 2, "BLOCK_N": 64, "HEAD_DIM": 64, "V": 1024,
             "BLOCK_M": 64}, grid=[1]),
+    # ⭐ THE FIRST INTEGER-OUTPUT CONFIG. The reference is ONE i32 lane (a token index,
+    # the gather ingestion dtype), so `OUT_DTYPE` below routes the ref dump around the
+    # fp16 truncation every other config takes -- a 49k index does not survive fp16
+    # (exact integers stop at 2048). The stimulus carries a deliberate tie at lanes
+    # 100/5000 so the golden pins FIRST-max.
+    "argmax_first_max": dict(fixture="argmax_first_max", kernel="argmax_first_max_kernel",
+                             ce=_argmax_ce(), grid=[1], out_dtype="i32"),
+}
+
+# Per-config output dtype for `ref_out.bin`. ABSENT means "f16" -- every config predating
+# `argmax_first_max` dumps its reference as fp16 and those bytes must not change. The one
+# row naming "i32" is an INDEX output: fp16 truncation would round a 49k index to a
+# multiple of 32, so the harness routes it through `dump`'s own little-endian i32
+# encoding instead, and `meta.json`'s output block records the dtype so a reader that
+# assumes fp16 refuses rather than misreads 4 bytes as two f16 lanes.
+OUT_DTYPE = {
+    "argmax_first_max": "i32",
+}
+
+# Per-config output-pointer ARG NAME -- the `.py` parameter the kernel writes its answer
+# through, which `meta.json`'s output block must name because the numeric reader keys its
+# read-back by it. ABSENT means "desc_o" (every config predating the argmax row); the one row
+# naming "idx_ptr" is the sampler, whose output stick is an i32 index table rather than an
+# fp16 tile. A wrong name here is a reader looking for an output the kernel never wrote.
+OUT_ARG = {
+    "argmax_first_max": "idx_ptr",
 }
 
 # Above this, the bytes are NOT checked in: `meta.json` carries `"oversized": true`, `"staging"`,
@@ -528,6 +560,34 @@ def _mul_scale_inputs(mod, ce):
     return ins, ref, note
 
 
+def _argmax_inputs(mod, ce):
+    row = mod.inputs(seed=SEED)
+    ref = mod.reference(row)
+    # THE OUTPUT IS ONE i32 LANE, not an fp16 tile: this is the first config whose
+    # reference is an INDEX (the gather ingestion dtype), so `out_dtype` below is
+    # "i32" and the ref dump does NOT pass through the fp16 truncation every other
+    # config takes. A 49k index does not survive fp16 (exact integers stop at 2048),
+    # which is the same law the kernel's i32 index arithmetic states.
+    # THE RAMP TABLE is the second host obligation (strictly decreasing, V - i on
+    # the real lanes, 0 on the pad lanes) -- constant across steps, staged once.
+    v, pad_v = ce["V"], ce["PAD_V"]
+    ramp = torch.tensor([v - i if i < v else 0 for i in range(pad_v)],
+                        dtype=torch.int32)
+    ins = [("logits_ptr", row, "f16"), ("ramp_ptr", ramp, "i32"),
+           ("idx_ptr", torch.zeros(64, dtype=torch.int32), "i32")]
+    note = (
+        f"THE STIMULUS CARRIES A REAL TIE: lanes 100 and 5000 both hold the row's "
+        f"maximum, so `ref_out.bin`'s single lane is 100 -- FIRST-max pinned against a "
+        f"tie, not a vacuous uniqueness. THE NEGATIVE CONTROL IS PART OF THE CONTRACT: "
+        f"a last-max implementation answers 5000 against these same bytes and must not "
+        f"match `ref_out.bin`; a run that still matches cannot have taken the tie. The "
+        f"pad lanes past V={ce['V']} hold -inf (the host obligation the fixture's own "
+        f"docstring states); a kernel that lets a pad lane win the equality answers "
+        f"PAD_V-adjacent garbage, never 100."
+    )
+    return ins, ref, note
+
+
 def _paged_score_inputs(mod, ce):
     p, v = mod.inputs(seed=SEED, m=ce["M"], k=ce["K"], v=ce["V"], head_dim=ce["HEAD_DIM"])
     # THE IDS ARE A PERMUTATION, NOT THE IDENTITY. A descriptor that reads the table's
@@ -719,6 +779,7 @@ BUILD = {
     "paged_score_small": _paged_score_inputs,
     "paged_attention_small": _paged_attention_inputs,
     "paged_attention_multiblock": _paged_attention_multiblock_inputs,
+    "argmax_first_max": _argmax_inputs,
 }
 
 # Which function produced each side, for `meta.json`. The default is the FIXTURE's own
@@ -911,6 +972,8 @@ def generate(config, out_dir, fixtures_dir):
     mod = fixture(cfg["fixture"], fixtures_dir)
     ins, ref, note = BUILD[config](mod, cfg["ce"])
     os.makedirs(out_dir, exist_ok=True)
+    out_dtype = OUT_DTYPE.get(config, "f16")
+    out_arg = OUT_ARG.get(config, "desc_o")
 
     entries, in_bytes, data_files = [], 0, []
     for spec in ins:
@@ -929,13 +992,13 @@ def generate(config, out_dir, fixtures_dir):
         else:
             n = dump(t, dtype, path)
         in_bytes += n
-        if arg == "desc_o":
+        if arg == out_arg:
             e["zeroed"] = True
         entries.append(e)
         data_files.append(name)
 
-    ref = ref.to(torch.float16).contiguous()
-    out_bytes = dump(ref, "f16", os.path.join(out_dir, "ref_out.bin"))
+    ref = ref.to(_TORCH[out_dtype]).contiguous()
+    out_bytes = dump(ref, out_dtype, os.path.join(out_dir, "ref_out.bin"))
     data_files.append("ref_out.bin")
 
     data_files.sort()
@@ -957,8 +1020,8 @@ def generate(config, out_dir, fixtures_dir):
         "constexprs": cfg["ce"],
         "grid": cfg["grid"],
         "inputs": entries,
-        "output": {"arg": "desc_o", "file": "ref_out.bin",
-                   "shape": list(ref.shape), "dtype": "f16"},
+        "output": {"arg": out_arg, "file": "ref_out.bin",
+                   "shape": list(ref.shape), "dtype": out_dtype},
     }
     if note:
         meta["reference_note"] = note
@@ -1010,7 +1073,7 @@ def generate(config, out_dir, fixtures_dir):
         elif "replicate" in e:
             extra = f"  REPLICATED factor={e['replicate']['factor']}"
         print(f"  in  {e['arg']:12} {e['dtype']:4} {tuple(e['shape'])}  <- {e['file']}{extra}")
-    print(f"  out {'desc_o':12} f16  {tuple(ref.shape)}  sha256={shas['ref_out.bin']}")
+    print(f"  out {out_arg:12} {out_dtype}  {tuple(ref.shape)}  sha256={shas['ref_out.bin']}")
     return meta
 
 

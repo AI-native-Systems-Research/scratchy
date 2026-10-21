@@ -744,8 +744,11 @@ module {
     /// receives it, not only as the pass writes it.
     #[test]
     fn the_door_reads_the_shipped_spelling() {
-        let (kspec, grid, program) =
+        let (kspec, grid, door) =
             cases::case("mul_scale_small").expect("the case table states the configuration");
+        // This bridge drives the DOOR (`assert_the_forms_agree` reads the kind); `mul_scale_small`
+        // is `Some(ScalarMul)`, and a row without a door cannot take this path at all.
+        let program = door.expect("`mul_scale_small` states its door kind");
         let src = std::fs::read_to_string(&kspec.file).expect("read the fixture");
         let mut tt = codegen::compile(&src, &kspec, Target::spyre()).expect("codegen");
         opt::make_ttir(&mut tt).expect("make_ttir");
