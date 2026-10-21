@@ -162,17 +162,13 @@ synth_prompt() { # $1 = target tokens
   for _ in $(seq 1 "$reps"); do printf '%s ' "$FILLER"; done
 }
 
-# Words of filler a $1-token budget buys. Measured on this filler: 316 repeats
-# ran to 27,502 tokens. Re-measure if FILLER's text changes. Approximate on
-# purpose — the rung check warns if the prompt misses its rung.
-natural_words() { # $1 = target tokens
-  echo $(( $1 * 316 * FILLER_WORDS / 27502 ))
-}
-
-# Natural-text prompt cut to a token budget.
+# Natural-text prompt cut to a token budget: the words of filler a $1-token
+# budget buys, measured on this filler (316 repeats ran to 27,502 tokens).
+# Re-measure if FILLER's text changes. Approximate on purpose — the rung check
+# warns if the prompt misses its rung.
 synth_natural() { # $1 = target tokens
   local k reps rem i
-  k=$(natural_words "$1")
+  k=$(( $1 * 316 * FILLER_WORDS / 27502 ))
   reps=$(( k / FILLER_WORDS )); rem=$(( k % FILLER_WORDS ))
   # while, not `seq 1 $reps`: BSD seq prints two lines for a zero-count range
   i=0
@@ -300,16 +296,15 @@ prompt_for_shape() { # $1 shape
   esac
 }
 
-# A rung shape whose budget past --template-pad buys no word of filler would
-# send an empty prompt: refuse it before anything is built or served.
+# Each shape's prompt is made up front too, so a shape that gets none is
+# refused before anything is built or served: a rung whose budget past
+# --template-pad buys no word of filler, a name that is neither a shape nor a
+# number, an empty --prompt-file.
 for shape in ${SHAPES//,/ }; do
-  case "$shape" in
-    long|short|batch) ;;
-    *) if [ "$(natural_words $(( shape - TEMPLATE_PAD )))" -lt 1 ]; then
-         echo "--shapes $shape leaves no room for a prompt past --template-pad $TEMPLATE_PAD" >&2
-         exit 2
-       fi ;;
-  esac
+  [ -n "$(prompt_for_shape "$shape")" ] || {
+    echo "--shapes $shape gives an empty prompt (--template-pad $TEMPLATE_PAD)" >&2
+    exit 2
+  }
 done
 
 # --- one-shot setup ------------------------------------------------------------
