@@ -208,6 +208,11 @@ const METAL_ONLY: &[&str] = &[
 /// Must agree with the arches `Cargo.toml`'s `spyre` feature enables; an arch listed there but not here
 /// is dropped by the `supported` gate below before its configs are read.
 const SPYRE_CAPABLE: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
+/// Arches the cuda backend lowers. Empty until the first arch's opcodes lower to CUDA.
+///
+/// Must agree with src/lib.rs gates; an arch selected under `cuda` but not listed here is refused
+/// by name below rather than silently dropped.
+const CUDA_CAPABLE: &[&str] = &[];
 
 /// A checkpoint config's identity for matching: its architecture and shape (hidden size, layers,
 /// vocab size; the text decoder's when `text_config` nests it).
@@ -331,6 +336,9 @@ fn main() {
     }
     let metal = std::env::var("CARGO_FEATURE_METAL").is_ok();
     let spyre = std::env::var("CARGO_FEATURE_SPYRE").is_ok();
+    let cuda = std::env::var("CARGO_FEATURE_CUDA").is_ok();
+    // Every arch whose `arch-<name>` feature is on, whether or not a selected backend emits it.
+    let mut selected: Vec<String> = Vec::new();
 
     // Each arch is a `dsl/<arch>.py` DSL carrier paired with a
     // `configs/<arch>/` dir; emit the ones whose `arch-<name>` feature is on AND
@@ -363,15 +371,16 @@ fn main() {
             if std::env::var(format!("CARGO_FEATURE_ARCH_{}", envify(&arch))).is_err() {
                 return None;
             }
+            selected.push(arch.clone());
             // Backend gate: mirror the `pub mod <name>` cfg in src/lib.rs, so we
             // never run the pipeline for an arch whose mod won't be compiled.
-            let supported = if METAL_ONLY.contains(&arch.as_str()) {
+            let supported = (if METAL_ONLY.contains(&arch.as_str()) {
                 metal
             } else if SPYRE_CAPABLE.contains(&arch.as_str()) {
                 metal || spyre
             } else {
                 metal
-            };
+            }) || (cuda && CUDA_CAPABLE.contains(&arch.as_str()));
             if !supported {
                 return None;
             }
@@ -450,6 +459,16 @@ fn main() {
     let unmatched = scratchy_forward_compiler_macro::unmatched_build_filter_tags();
     if !unmatched.is_empty() {
         panic!("SCRATCHY_BUILD_FILTER tag(s) matched no config in any arch: {unmatched:?}");
+    }
+
+    // Under `cuda`, a build that named models none of which the cuda backend lowers would
+    // otherwise reach the "no models selected" panic below, which blames the wrong thing.
+    if cuda && !selected.is_empty() && !selected.iter().any(|a| CUDA_CAPABLE.contains(&a.as_str()))
+    {
+        panic!(
+            "the cuda backend lowers none of the selected architectures \
+             (CUDA_CAPABLE = {CUDA_CAPABLE:?}); selected: {selected:?}"
+        );
     }
 
     // scratchy-models has no default model features (deliberately — see

@@ -26,6 +26,13 @@ metal = ["dep:scratchy-ir", "scratchy-ir/metal",
     "dep:scratchy-target-metal-compiler",
     "scratchy-forward-compiler/metal",
 ]
+# NVIDIA CUDA: the lowering lives in `scratchy-target-cuda-compiler`. This crate's source does not
+# call it yet — under `cuda` the macro compiles and enforces the mutual exclusion, and the model
+# crate's build script refuses every arch (`CUDA_CAPABLE` in scratchy-forwards.rs is empty).
+cuda = ["dep:scratchy-ir", "scratchy-ir/cuda",
+    "dep:scratchy-target-cuda-compiler",
+    "scratchy-forward-compiler/cuda",
+]
 # Spyre (IBM AIU / KTIR): no GPU dispatch codegen — under this feature the
 # macro emits the real model's KTIR (via scratchy-subtile, a non-optional dep)
 # at build time and the spyre worker runs it. Forwards into the compiler's
@@ -82,6 +89,8 @@ scratchy-target-metal = { path = "../../targets/metal", optional = true }
 # crate depends on it, never the reverse, which is what let the lowering leave
 # `compiler/macros` at all.
 scratchy-target-metal-compiler = { path = "../../targets/metal/compiler", optional = true }
+# CUDA's compile-time lowering, on the target side of the same edge.
+scratchy-target-cuda-compiler = { path = "../../targets/cuda/compiler", optional = true }
 # KTIR emission lives in the SPYRE target crate (M3): target-specific
 # emission belongs to its target, and the macro bakes the bundle at
 # expansion, so it consumes the emitter from there.
