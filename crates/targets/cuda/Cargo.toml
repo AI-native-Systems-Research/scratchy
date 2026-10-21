@@ -14,9 +14,10 @@ description = "NVIDIA CUDA backend for scratchy: the per-opcode ABI as declared 
 #            anywhere, with no nvcc and no GPU. This is the build CI and the Mac use.
 #   nvcc   — compiles `kernels/*.cu` (ThunderKittens vendored at `kernels/thunderkittens/`) with
 #            nvcc from CUDA 12.8+ on PATH for `sm_90a`, links them, and adds `kernels`, their
-#            launchers. Named for the toolchain it needs, not for a GPU: it compiles on any Linux
-#            host with nvcc. Its test (`gemm_bf16`) needs an sm_90 GPU and fails without one.
-#            Never built in CI; the GKE H100 run is its only gate.
+#            launchers and the runtime that plays a tape (`runtime`). Named for the toolchain it
+#            needs, not for a GPU: it compiles on any Linux host with nvcc. Its tests (`gemm_bf16`,
+#            `tape_player`) need an sm_90 GPU and fail without one. Never built in CI; the GKE
+#            H100 run is its only gate.
 [features]
 nvcc = []
 
@@ -26,10 +27,24 @@ nvcc = []
 scratchy-subtile = { path = "../../compiler/subtile" }
 
 [dev-dependencies]
-# bf16 <-> f32 for the GEMM test's inputs and output.
+# bf16 <-> f32 for the GEMM tests' inputs and outputs.
 half = { workspace = true }
+# The tape tests build their fixtures with the shared lowering types and lower them with CUDA's
+# compiler, which depends on this crate: a dev-only cycle Cargo allows. The integration tests link
+# one copy of this library, the one the compiler links too.
+scratchy-subtile = { path = "../../compiler/subtile" }
+scratchy-target-cuda-compiler = { path = "compiler" }
 
 # The bf16 GEMM against a CPU reference, on the GPU. Not built without `nvcc`.
 [[test]]
 name = "gemm_bf16"
+required-features = ["nvcc"]
+
+# The hand-written GEMM-chain tapes against what CUDA's compiler lowers. No toolchain needed.
+[[test]]
+name = "tape_layout"
+
+# The tape player on the GPU: GEMM chains through the arena against a CPU reference.
+[[test]]
+name = "tape_player"
 required-features = ["nvcc"]

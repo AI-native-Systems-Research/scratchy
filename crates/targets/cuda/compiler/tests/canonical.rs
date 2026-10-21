@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! CUDA's canonical lowering on the shared fixtures: the shared passes run under CUDA's tables,
-//! the conservative colour rule holds, and opcode lowering refuses the first op it meets.
+//! the conservative colour rule holds, and opcode lowering refuses the first op it cannot lower.
 
 use scratchy_subtile::fixtures::{
     add_only_input, front_end_lowered, gemm_m1_only_input, n_layer_input, one_layer_input,
@@ -10,7 +10,7 @@ use scratchy_subtile::lower::LoweringInput;
 use scratchy_subtile::subtile_ir::SubOp;
 use scratchy_subtile::subtile_tape::{ComputeInput, Instr};
 use scratchy_target_cuda_compiler::canonical::{
-    CanonicalAt, CanonicalRefusal, CudaPlan, lower_canonical, plan_canonical,
+    CanonicalAt, CanonicalRefusal, CudaPlan, GemmShapeRule, lower_canonical, plan_canonical,
 };
 
 const AT: CanonicalAt<'static> = CanonicalAt {
@@ -118,5 +118,22 @@ fn lower_canonical_refuses_the_first_computed_op() {
         Err(CanonicalRefusal::NotLowered { step: 0, op }) => assert_eq!(op, first),
         Err(e) => panic!("expected NotLowered at step 0 ({first}), got: {e}"),
         Ok(_) => panic!("lower_canonical lowered a tape CUDA has no opcode for"),
+    }
+}
+
+/// A decode GEMM (`m = 1`) lowers to the bf16 GEMM's shape rule, which refuses it: no decode GEMV
+/// kernel exists yet.
+#[test]
+fn lower_canonical_refuses_a_decode_gemm_by_its_shape() {
+    match lower_canonical(&front_end_lowered(gemm_m1_only_input()), AT) {
+        Err(CanonicalRefusal::GemmShape {
+            step: 0,
+            m: 1,
+            n: 2048,
+            k: 2048,
+            rule: GemmShapeRule::Decode,
+        }) => {}
+        Err(e) => panic!("expected the m = 1 shape refusal at step 0, got: {e}"),
+        Ok(_) => panic!("lower_canonical lowered a decode GEMM CUDA has no kernel for"),
     }
 }

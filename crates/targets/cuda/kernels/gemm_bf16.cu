@@ -19,6 +19,7 @@
 #include "kittens.cuh"
 #include "prototype.cuh"
 
+#include <climits>
 #include <cstdint>
 
 using namespace kittens;
@@ -132,39 +133,62 @@ struct matmul_template {
 
 using gemm_bf16_abt_mmt = matmul_template<2, 4, 8>;
 
+// The dynamic shared memory every launch asks for, and the attribute `_prepare` raises the
+// kernel's limit to: the whole H100 budget minus the 1024 bytes `lcf` reserves for alignment.
+constexpr int GEMM_BF16_ABT_SMEM_BYTES = kittens::MAX_SHARED_MEMORY - 1024;
+
+// The kernel's one-time setup: allow it `GEMM_BF16_ABT_SMEM_BYTES` of dynamic shared memory on the
+// current device (the default limit is 48 KB). Run once per device before any launch
+// (`kernels::prepare_all`, called by `CudaDevice::open`), never per launch.
+//
+// 0 = done; any other value = the cudaError_t of setting the attribute.
+extern "C" int scratchy_cuda_gemm_bf16_abt_prepare(void) {
+    return static_cast<int>(cudaFuncSetAttribute(kittens::prototype::lcf::kernel<gemm_bf16_abt_mmt>,
+                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 GEMM_BF16_ABT_SMEM_BYTES));
+}
+
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
 // SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode);
-// any other value = the cudaError_t from cudaFuncSetAttribute / cudaGetLastError.
+// any other value = the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads
+// or clears the runtime's last-error state, so an error an earlier, unrelated call left behind is
+// never reported as this launch's.
 //
 // `m`, `n` and `k` must be non-zero multiples of 128, 256 and 64: the tile order truncates
-// (`C.rows() / (M_BLOCK*64)`), so a tail would silently be left unwritten. The launch is
-// asynchronous on `stream`; the caller owns it and synchronizes.
+// (`C.rows() / (M_BLOCK*64)`), so a tail would silently be left unwritten. None may exceed INT_MAX:
+// ThunderKittens' `gl` stores each dimension as an `int`. Both are checked before any pointer is
+// touched. `scratchy_cuda_gemm_bf16_abt_prepare` must have succeeded on the current device. The
+// launch is asynchronous on `stream`; the caller owns it and synchronizes.
 extern "C" int scratchy_cuda_gemm_bf16_abt(const void* a, const void* b, void* c,
                                            uint32_t m, uint32_t n, uint32_t k,
                                            void* stream /* cudaStream_t; null = default stream */) {
     using mmt = gemm_bf16_abt_mmt;
     constexpr uint32_t M_TILE = mmt::M_BLOCK * 64, N_TILE = mmt::N_BLOCK * 64, K_TILE = 64;
-    if (m == 0 || n == 0 || k == 0 || m % M_TILE != 0 || n % N_TILE != 0 || k % K_TILE != 0) {
+    constexpr uint32_t DIM_MAX = static_cast<uint32_t>(INT_MAX);
+    if (m == 0 || n == 0 || k == 0 || m % M_TILE != 0 || n % N_TILE != 0 || k % K_TILE != 0 ||
+        m > DIM_MAX || n > DIM_MAX || k > DIM_MAX) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
         using global_layout = typename mmt::layout::global_layout;
         using globals       = typename mmt::layout::globals;
-        // Building each `gl` encodes its TMA tensor map (`cuTensorMapEncodeTiled`).
+        // Building each `gl` encodes its TMA tensor map (`cuTensorMapEncodeTiled`) into host
+        // memory; nothing is allocated on the device.
         global_layout Ag{static_cast<bf16*>(const_cast<void*>(a)), nullptr, nullptr, size_t(m), size_t(k)};
         global_layout Bg{static_cast<bf16*>(const_cast<void*>(b)), nullptr, nullptr, size_t(n), size_t(k)};
         global_layout Cg{static_cast<bf16*>(c),                    nullptr, nullptr, size_t(m), size_t(n)};
         globals G{Ag, Bg, Cg};
 
-        constexpr int SMEM_BYTES = MAX_SHARED_MEMORY - 1024;
-        cudaError_t err = cudaFuncSetAttribute(kittens::prototype::lcf::kernel<mmt>,
-                                               cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
-        if (err != cudaSuccess) return static_cast<int>(err);
-        // Three warpgroups: two consumers and one producer.
-        kittens::prototype::lcf::kernel<mmt><<<H100_SXM_SMS, kittens::prototype::detail::NUM_THREADS_v<mmt>,
-                                               SMEM_BYTES, static_cast<cudaStream_t>(stream)>>>(G);
-        return static_cast<int>(cudaGetLastError());
+        // Three warpgroups: two consumers and one producer. The kernel's one parameter is the
+        // `globals` struct by value (`__grid_constant__`); cudaLaunchKernel copies it from `&G`
+        // before returning. The `cuda_runtime.h` template overload takes the kernel itself, as
+        // `_prepare` names it, so no function-pointer cast is needed.
+        void* args[] = {&G};
+        const dim3 grid(H100_SXM_SMS), block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+        return static_cast<int>(cudaLaunchKernel(kittens::prototype::lcf::kernel<mmt>, grid, block,
+                                                 args, GEMM_BF16_ABT_SMEM_BYTES,
+                                                 static_cast<cudaStream_t>(stream)));
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
