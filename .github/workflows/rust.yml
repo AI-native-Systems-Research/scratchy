@@ -529,6 +529,12 @@ jobs:
       - name: Test (spyre worker unit tests)
         run: cargo test -p scratchy-serving-worker
           --features spyre-emu,scratchy-models/granite-3.1-8b-instruct --lib
+      # The same modules at -D warnings, all targets: no other step lints them, so lint debt
+      # piled up unseen (#616's 9 errors). llama-3.2-1b is the smallest model whose bundles bake
+      # clean here.
+      - name: Clippy (spyre worker, emulator)
+        run: cargo clippy -p scratchy-serving-worker
+          --features spyre-emu,scratchy-models/llama-3.2-1b --all-targets -- -D warnings
       # The spyre-side ktir-superdsc and spyre-bundle crates' TEST targets compile
       # under no other CI step: this job's clippy above is -p scratchy-target-spyre,
       # the triton clippy below is the five re-host crates, and the linux-cuda job's
@@ -539,6 +545,14 @@ jobs:
       # binary and no check was red. This leg is the compile cover for that class.
       - name: Test (spyre ktir-superdsc + bundle)
         run: cargo test -p ktir-superdsc -p scratchy-spyre-bundle
+      # scratchy-subtile's lib and integration tests ran in no step, so they rotted unseen (#542:
+      # a missing initializer field kept the lib tests from compiling). Pure Rust, no device, on
+      # the ktir-superdsc build the step above leaves. Under `spyre`, which gates no test out; and
+      # featureless, the build metal links, whose test targets must compile too.
+      - name: Test (scratchy-subtile, spyre)
+        run: cargo test -p scratchy-subtile --features spyre
+      - name: Test (scratchy-subtile, featureless)
+        run: cargo test -p scratchy-subtile
       - name: Clippy (triton re-host crates, all targets)
         run: cargo clippy -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice --all-targets -- -D warnings
       - name: Test (triton re-host crates)

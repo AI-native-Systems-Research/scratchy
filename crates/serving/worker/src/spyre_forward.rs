@@ -1701,6 +1701,17 @@ pub(crate) fn superdsc_forward_chunk(
     Ok(ChunkOut::Rows(logits_rows))
 }
 
+/// What a [`forward_chunk`] runs: one request's chunk, the tokens `toks` at absolute positions
+/// `start..start + toks.len()`, with the request's state, its id, and the store its tokens and
+/// token count live in.
+pub(crate) struct Chunk<'a> {
+    pub(crate) state: &'a mut ReqState,
+    pub(crate) id: &'a str,
+    pub(crate) tokens: &'a mut scratchy_serving_engine::input_batch::InputBatch,
+    pub(crate) start: usize,
+    pub(crate) toks: &'a [usize],
+}
+
 /// Run `b` ONCE for `toks` at absolute positions `start..start+toks.len()`
 /// against `req`'s KV cache (m=toks.len() query rows in one forward). `start` is
 /// the valid-prefix count AND the runtime `decode_position`. Appends the new
@@ -1713,12 +1724,13 @@ pub(crate) fn forward_chunk(
     // The preserved prefill meta for the batched-prefill path, bound to the distinct prefill SESSION
     // by run_prefill_batch. None for every non-batched path (they use `b`, the decode meta).
     prefill_meta: Option<&BundleMeta>,
-    req: &mut ReqState,
-    // The request's id and the store its tokens and token-count live in.
-    id: &str,
-    tokens: &mut scratchy_serving_engine::input_batch::InputBatch,
-    start: usize,
-    toks: &[usize],
+    Chunk {
+        state: req,
+        id,
+        tokens,
+        start,
+        toks,
+    }: Chunk<'_>,
     // The host's list + the pool's owner split: every bind DERIVES this request's page map, and the map's
     // fully-masked and hole pages come from the range the host is never told about.
     ctx: PageMapCtx<'_>,
@@ -1768,16 +1780,15 @@ pub(crate) fn forward_chunk(
     session: &mut SpyreSession,
     b: &BundleMeta,
     prefill_meta: Option<&BundleMeta>,
-    req: &mut ReqState,
-    // Unused here — the emulator is handed its `toks` and never re-slices the history — but present so
-    // the two `forward_chunk` definitions have ONE signature. A cfg pair that differs in shape is a
-    // second call site the other cfg never compiles.
-    id: &str,
-    tokens: &mut scratchy_serving_engine::input_batch::InputBatch,
-    start: usize,
-    toks: &[usize],
+    Chunk {
+        state: req,
+        id,
+        tokens,
+        start,
+        toks,
+    }: Chunk<'_>,
 ) -> ExecutorResult<ChunkOut> {
-    let _ = (prefill_meta, id); // the batched-prefill session pair is a sendnn-only shape
+    let _ = prefill_meta; // the batched-prefill session pair is a sendnn-only shape
     let n = toks.len();
     // KTIR caps a forward at the baked m_cap. The sendnn paged prefill runs the
     // WHOLE prompt in one forward (s0 = padded bucket up to capacity), so its only
@@ -1905,17 +1916,13 @@ pub(crate) fn forward_chunk(
         // source's class index is offset past the cos sources.
         let n_cos = b.cos_srcs.len();
         for (ci, &(cid, w, kind)) in b.cos_srcs.iter().enumerate() {
-            dynamic.push((
-                cid as u64,
-                tile(&cos_tab[ci], w as usize, kind),
-                vec![rows, w as usize],
-            ));
+            dynamic.push((cid as u64, tile(&cos_tab[ci], w, kind), vec![rows, w]));
         }
         for (ci, &(sid, w, kind)) in b.sin_srcs.iter().enumerate() {
             dynamic.push((
                 sid as u64,
-                tile(&sin_tab[n_cos + ci], w as usize, kind),
-                vec![rows, w as usize],
+                tile(&sin_tab[n_cos + ci], w, kind),
+                vec![rows, w],
             ));
         }
         dynamic
@@ -2231,11 +2238,13 @@ pub(crate) fn run_request_step(
             &mut model.session,
             b,
             model.batched_prefill.as_ref(),
-            req,
-            id,
-            tokens,
-            pos,
-            chunk,
+            Chunk {
+                state: req,
+                id,
+                tokens,
+                start: pos,
+                toks: chunk,
+            },
             #[cfg(feature = "spyre-hw")]
             ctx,
             #[cfg(feature = "spyre-hw")]

@@ -154,20 +154,6 @@ impl SpyreWorker {
     }
 }
 
-/// DEFAULT-mode single-graph forward: process `toks` ONE token at a time (the
-/// proven static-SDPA graph is m=1), growing the KV host-side and masking padding
-/// prefix rows via `attn_lenmask`. Each step `p` (absolute position `start+i`):
-///   • bind the embedding `t{embed}` `[1, hidden]` of `toks[i]`;
-///   • bind cos/sin `t{id}` `[1, width]` (per-position RoPE tables tiled across
-///     heads) for every cos/sin source;
-///   • bind each layer's prefix-KV `t{id}` `[cap, kv_dim]` = the host KV cache
-///     rows `0..p` (positions `0..p-1`), zero-padded to `cap`;
-///   • bind `attn_lenmask` `[1,1,cap+1]`: 0 for valid columns `0..p` and the
-///     new-token column `cap`, large-negative for the padding columns `p..cap-1`
-///     (PROVEN on dd2 — without it the padding rows flood the softmax and the
-///     argmax flips, e.g. 1217 vs the golden 7042);
-///   • Predict → logits `[1,vocab]` + grown-KV (each `[cap+1, kv_dim]`, layer
-
 /// Spyre / KTIR backend factory. Registered with `inventory::submit!` so the
 /// backend-neutral `create_worker` (engine's `WorkerFactory` registry) finds it
 /// without naming `SpyreWorker` — the same seam cuda/metal register through. In
