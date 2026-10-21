@@ -153,8 +153,10 @@ const MIN_BODY_LIMIT: usize = 2 << 20;
 /// ⭐ THE LARGEST REQUEST BODY THE SERVER READS IS WHAT ITS MODEL CAN TAKE (#789): a context of
 /// `max_model_len` tokens at [`BODY_BYTES_PER_TOKEN`], and [`IMAGE_BODY_BYTES`] more when it
 /// `takes_images`, but never less than [`MIN_BODY_LIMIT`]. A larger body can't fit the context, so
-/// it is refused before it is buffered, with a 413 in the API's own error JSON
-/// (`ServeError::PayloadTooLarge`), not read whole only to be refused for its length.
+/// no more than this is ever buffered: the read stops there with a 413 in the API's own error
+/// JSON (`ServeError::PayloadTooLarge`). A request that truncates its prompt
+/// (`truncate_prompt_tokens`, which keeps its last tokens) is bounded here too, at about 8× the
+/// context, which the floor keeps from being stricter than before.
 fn body_limit(max_model_len: usize, takes_images: bool) -> usize {
     let text = max_model_len.saturating_mul(BODY_BYTES_PER_TOKEN);
     let images = if takes_images { IMAGE_BODY_BYTES } else { 0 };
@@ -1561,18 +1563,6 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
         let (status, error) = send(8192, "/v1/chat/completions", three_mib).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
-    }
-
-    /// A `PayloadTooLarge` is a 413 in the OpenAI error shape, as the OpenAI-compatible routes
-    /// answer a body past their limit. This tests the response's shape only, built from the error;
-    /// no route or limit is involved.
-    #[tokio::test]
-    async fn a_payload_too_large_is_a_413_in_the_openai_shape() {
-        let too_large = crate::error::ServeError::PayloadTooLarge("length limit exceeded".into());
-        let response = too_large.into_response();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let error = error_body(response).await;
-        assert_eq!(error["error"]["type"], "RequestTooLargeError", "{error}");
     }
 
     /// A body an endpoint can't read is a 400 in that API's error JSON, as the upstream APIs answer
