@@ -203,6 +203,15 @@ pub enum Program {
     Reshape,
     ScalarMul,
     Matmul,
+    /// The greedy vocab scan — `kernels/argmax.py`: the FIRST-maximum index of one
+    /// `[1, PAD_V]` logits row, as the `[1, 64]` i32 idx stick. EIGHT tensor
+    /// parameters (the row, the six staged tables that are functions of the vocab
+    /// alone, and the output stick); the body is whole-row `tt.reduce` maxima,
+    /// equality compares and staged-table multiplies over generic ops, with one
+    /// fp32 island for the wide combine. The door reads NO fact off this program —
+    /// no epsilon, no scale, no geometry: the tables ride as ordinary tensor
+    /// operands — so its arm is the plain `whole_function::lower_function` route.
+    ArgMax,
     /// The last-row extraction half of an lm-head tail — see [`KtirNode::node_out_tid`].
     LmLast,
     Rope,

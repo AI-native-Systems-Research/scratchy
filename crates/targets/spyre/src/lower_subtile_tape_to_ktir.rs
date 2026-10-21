@@ -969,6 +969,16 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                 Err(reason) => Unhandled(reason),
             }
         }
+        // ⭐ THE GREEDY TOKEN PICK — one kernel, spliced like every other: the row, the
+        // six vocab-derived tables, the [1, 64] idx stick out. The tables are tape
+        // sources the expansion stages at load (functions of the vocab alone); the
+        // splice binds them positionally, exactly as it binds silumul's gate and up.
+        SubOp::ArgMax { .. } => {
+            match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
+                Ok(e) => Ops(vec![e]),
+                Err(reason) => Unhandled(reason),
+            }
+        }
         // ⭐ BOTH GAIN CONVENTIONS ARE ROWS NOW. The (1 + w) convention had its own
         // refusal here (the Scale kernel over a zero-centred gain scales every
         // normalized activation by roughly nothing — a model that loads, runs, and

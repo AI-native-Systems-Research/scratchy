@@ -144,6 +144,12 @@ macro_rules! for_each_subop {
             Mamba2 [SubOp::Mamba2 { .. }] arity = (|n| n == 2), cols = [field inner],
                 rows = [in0], gemm_w = [none];
             Mean [SubOp::Mean] arity = (|n| n == 1), cols = [one], rows = [in0], gemm_w = [none];
+            // The greedy token pick: one `[1, PAD_V]` logits row plus the six staged
+            // tables (functions of the vocab alone), out ONE `[1, 64]` idx stick — the
+            // output width is the device's own stick, never a shape read (the whole row
+            // is one tile in, one stick out, every lane equal).
+            ArgMax [SubOp::ArgMax { .. }] arity = (|n| n == 7), cols = [stick],
+                rows = [in0], gemm_w = [none];
             // The ops one construct expands to (a MoE block, a KV codec's steps, sampled rows) —
             // also generating `expansion_ops!()`, the pattern a target without them refuses by.
             @expansion
@@ -241,6 +247,9 @@ macro_rules! __out_cols_body {
     };
     ($w:ident, [one]) => {
         1u32
+    };
+    ($w:ident, [stick]) => {
+        64u32
     };
     ($w:ident, [field $f:ident]) => {
         *$f

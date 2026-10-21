@@ -666,7 +666,10 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         | Program::SiluMul
         | Program::LmLast
         | Program::Transpose
-        | Program::Matmul => None,
+        | Program::Matmul
+        // The argmax's six tables ride as ORDINARY tensor operands (the node's own
+        // inputs, placed like every staged buffer) — no reserved tid names one.
+        | Program::ArgMax => None,
         // ⭐ NO ENTRY POINT ON THIS LADDER, SO NO CONSTANTS TO NAME. None of these programs has a
         // body this crate's door can reach — the splice's registry produces none of them (its
         // by-name refusals stop their SubOps at the producer), and the door itself refuses them by
@@ -897,7 +900,10 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         | Program::LmLast
         | Program::Transpose
         | Program::Matmul
-        | Program::Rope => Vec::new(),
+        | Program::Rope
+        // The argmax's tables are tensor operands, never `scalarmul_scales` lookups —
+        // a value registered for it would occupy a slot nothing asks for.
+        | Program::ArgMax => Vec::new(),
         // ⭐ EMPTY FOR THE SAME REASON, ONE STEP EARLIER: none of these programs has a body on
         // this ladder (the splice produces none of them and the door refuses them by name), so
         // there is no body to ask which values it looks up. A value registered for a program that

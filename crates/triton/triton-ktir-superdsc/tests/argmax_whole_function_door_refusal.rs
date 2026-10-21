@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! ⛔ THE PLACEHOLDER DOOR KIND CANNOT LOWER — AND THE TEST THAT KEEPS IT HONEST.
+//! ⛔ THE WHOLE-FUNCTION BODY CANNOT CROSS THE PER-`Program` DOOR — AND THE TEST THAT KEEPS
+//! IT HONEST.
 //!
-//! `argmax_first_max`'s case row states a door kind only because the signature demands
-//! one: the kernel crosses through the WHOLE-FUNCTION door (`emit_whole`), which walks
-//! the function's ops and never reads the `Program`. The stated value is a placeholder,
-//! and a placeholder is honest only while the per-`Program` door REFUSES it loudly
-//! rather than lowering some wrong body over the kernel's parameters. With the DOORLESS
-//! set now empty, no row pins that refusal by merely existing — this file does.
+//! `argmax_first_max`'s case row states `Program::ArgMax` — the SPLICE's own classification
+//! for the production `kernels/argmax.py` (`SubOp::ArgMax`'s row), no longer a placeholder:
+//! the splice produces this body, so the kind is stated like every spliced family's. The
+//! kernel crosses through the WHOLE-FUNCTION door (`emit_whole`), which walks the function's
+//! ops and never dispatches on the `Program`; the per-`Program` door REFUSES the kind by
+//! name — an eight-parameter whole-function body (five whole-row reduces, the equality
+//! chain, the fp32 island) is not a single-descriptor dispatch, and building one would be a
+//! second, hand-rolled path. This file pins that refusal.
 //!
 //! The chain is driven from the configuration table (the same statement `bake_py` and
 //! the banded twin read — a test that restated the fixture, the constexprs, or the grid
@@ -16,12 +19,11 @@
 //! node. Then, over ONE node:
 //!
 //! * CONTROL — `emit_whole` with the node's own layout EMITS. The module is good, so
-//!   the per-`Program` refusal below is the door's verdict about the placeholder,
+//!   the per-`Program` refusal below is the door's verdict about the body's shape,
 //!   never a broken module masquerading as one.
-//! * THE PIN — `emit_node` over the SAME node REFUSES, stating the mismatch by number:
-//!   the placeholder's elementwise body reads 2 tensor inputs, the kernel stages 7, and
-//!   `split_regions` refuses exactly that. If a future row mints a placeholder whose
-//!   per-`Program` run silently lowers, this is the test that goes red.
+//! * THE PIN — `emit_node` over the SAME node REFUSES, naming the whole-function door
+//!   as the body's. If a future arm mints a per-`Program` dispatch for this kind, this
+//!   is the test that goes red.
 
 use ktir_superdsc::ktir_node::Program;
 
@@ -51,10 +53,10 @@ fn node_of(name: &str) -> ktir_superdsc::ktir_node::KtirNode {
 }
 
 #[test]
-fn the_placeholder_door_kind_refuses_while_the_whole_door_emits() {
+fn the_per_program_door_refuses_while_the_whole_door_emits() {
     let node = node_of("argmax_first_max");
     // CONTROL — the whole-function door emits over this node; a failure here means the
-    // module broke, and the refusal below would prove nothing about the placeholder.
+    // module broke, and the refusal below would prove nothing about the body's shape.
     let layout = triton_ktir_superdsc::layout::for_node(&node)
         .map_err(|e| format!("{}: {}", e.stage, e.message))
         .unwrap();
@@ -65,24 +67,23 @@ fn the_placeholder_door_kind_refuses_while_the_whole_door_emits() {
         !ops.is_empty(),
         "the whole-function door emitted no ops — an emission over nothing"
     );
-    // THE PIN — the per-`Program` door refuses the placeholder, naming the arity
-    // mismatch by number. Whatever door kind the row states, it cannot lower this
-    // kernel's 8-parameter function as one elementwise op.
+    // THE PIN — the per-`Program` door refuses the whole-function body BY NAME, naming
+    // `emit_whole` as its door. Whatever classification the row states, an eight-parameter
+    // multi-op body is not a single-descriptor dispatch.
     let err = match triton_ktir_superdsc::emit_node(&node) {
         Err(e) => e,
         Ok(ops) => panic!(
-            "the placeholder door kind must refuse the whole-kernel node, but the \
-             per-`Program` door emitted {} op(s) — a placeholder that lowers is a lying \
-             door kind, not a placeholder",
+            "the per-`Program` door must refuse the whole-kernel node, but it emitted {} \
+             op(s) — a per-`Program` dispatch over this body is a second, hand-rolled path",
             ops.len()
         ),
     };
     assert!(
-        err.message.contains("tensor input(s) for an op that reads"),
-        "the per-`Program` refusal must state the arity mismatch by number, got: \
+        err.message.contains("eight-parameter whole-function body"),
+        "the per-`Program` refusal must name the whole-function door as the body's, got: \
          [{}] {} (door kind: {:?})",
         err.stage,
         err.message,
-        Program::Elementwise(ktir_superdsc::ktir_node::Elementwise::Mul)
+        Program::ArgMax
     );
 }

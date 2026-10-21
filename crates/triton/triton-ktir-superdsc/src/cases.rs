@@ -763,13 +763,18 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Option<Program>)> {
         // op), the fp16 multiplies as `Elementwise(Mul)` (the `[1]`-answer widens through
         // the broadcast operand mode), and the island as `dl16tofp32` -> same-stick f32
         // multiply-add -> `fp32toint32` (the KSPLIT device recipe, `assemble_convert`).
-        // NO `Program::Argmax` exists or is wanted -- an algorithm name in the compiler is
-        // the exact hack the ladder law deletes. The door kind below is stated only
-        // because the signature demands one (`KTIR_WHOLE=1` walks the ops and never reads
-        // it, the decoder rows' own precedent); a per-`Program` run refuses loudly at the
-        // arity check. (⛔ NOT the vendor topk pair: `topk.ddl`'s ripple keeps the LAST
-        // index among equals -- `GREATERTHAN(running, candidate)` with an equal candidate
-        // displacing -- so `topkindex` at k=1 is LAST-max and cannot serve #631's law.)
+        // ⭐ THE DOOR KIND IS REAL NOW, not a placeholder: the SPLICE produces this body
+        // (the production `kernels/argmax.py`, `SubOp::ArgMax`'s row), and `Program::ArgMax`
+        // is its stated classification -- the same fact every spliced family states
+        // (`Program::RmsNorm`, `Program::SiluMul`, ...). The old "no algorithm name is
+        // wanted" ruling was the STANDALONE ladder's (a placeholder sufficed when nothing
+        // produced the kind); the splice changed the fact. The whole-function walk
+        // (`KTIR_WHOLE=1`) still never reads it; a per-`Program` run refuses loudly at
+        // the program arm (an eight-parameter whole-function body is `emit_whole`'s, not
+        // a single-descriptor dispatch's). (⛔ NOT the vendor topk pair: `topk.ddl`'s
+        // ripple keeps the LAST index among equals -- `GREATERTHAN(running, candidate)`
+        // with an equal candidate displacing -- so `topkindex` at k=1 is LAST-max and
+        // cannot serve #631's law.)
         "argmax_first_max" => (
             spec(
                 "argmax_first_max",
@@ -792,10 +797,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Option<Program>)> {
                 ],
             ),
             vec![1],
-            // A PLACEHOLDER THE SIGNATURE DEMANDS, never read by the whole-function walk
-            // (`KTIR_WHOLE=1`, the decoder rows' own law); the per-`Program` door refuses
-            // this function loudly at its arity check (8 parameters for an op that reads 2).
-            Some(Program::Elementwise(Elementwise::Mul)),
+            Some(Program::ArgMax),
         ),
         _ => return None,
     })

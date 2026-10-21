@@ -855,6 +855,9 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | SubOp::RouteGatherScores
             | SubOp::RouteRenorm
             | SubOp::ExpertUnsort => {}
+            // The vocab is class: two vocab widths are different programs (every
+            // staged table and the whole row's tile shape key off it).
+            SubOp::ArgMax { vocab } => vocab.hash(h),
             SubOp::Mamba2 { inner } => inner.hash(h),
             SubOp::RouterNorm { eps, router } => (eps.to_bits(), router).hash(h),
             SubOp::RouterLogits { experts, router } => (experts, router).hash(h),
@@ -1342,6 +1345,28 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// `inputs` = `[rows, over, weight…]`: the gathered activation, the output it replaces, and
     /// the matmul's weight operands.
     AllRowsMatmul,
+
+    // ── The greedy token pick (see `kernels/argmax.py`) ─────────────
+    /// The FIRST-maximum index of one logits row, as the `[1, BLOCK]` i32 idx
+    /// stick the device's index ingestion reads. `inputs` = `[logits, bramp,
+    /// lramp, binc, linc, ones, sixtyfour]`: the `[1, PAD_V]` fp16 row (pad
+    /// lanes at the fp16 floor) then the six staged tables, functions of
+    /// `vocab` alone, constant across decode steps — the two decreasing ramps
+    /// that make the maxima first-max by monotonicity, the two increasing
+    /// index tables that read the selection back out, and the two widen tables
+    /// that keep every broadcast a two-tensor multiply. An all-NaN row answers
+    /// past the last real lane (the sentinel); the consumer refuses `idx >
+    /// vocab` loudly rather than feed a NaN-born index to the detokenizer.
+    ArgMax { vocab: u32 },
+}
+
+/// The greedy token pick's padded row: the vocab rounded UP to a power-of-two
+/// whole row — the descriptor block's own law (the block must be a power of
+/// two), and the width every staged table and the `[1, PAD_V]` logits row
+/// share. ONE derivation, read by the host reference, the splice's constexpr
+/// flow, and the load-time table staging, so no two of them can disagree.
+pub fn argmax_pad_vocab(vocab: u32) -> u32 {
+    vocab.max(1).next_power_of_two()
 }
 
 // ── Nodes & graph ──────────────────────────────────────────────────
@@ -1532,6 +1557,35 @@ pub fn eval_node<F: RopeForm>(
                 }
             }
             out
+        }
+        SubOp::ArgMax { vocab } => {
+            // The HOST reference states the KERNEL'S OWN LAW, never a backend's
+            // argmax tie promise: FIRST-maximum by scan order (a NaN lane never
+            // wins the ordered max and never satisfies the equality, so an
+            // all-NaN row answers the sentinel past the last real lane — the
+            // consumer's `idx > vocab` refusal, #666's recorded divergence from
+            // host-argmax-over-NaN). The output is the `[1, 64]` idx stick with
+            // every lane equal (the store is a whole stick); the values are
+            // whole numbers below 2^24, exact in f32.
+            let (row, _, cols) = gather(&node.inputs[0], graph, bufs);
+            let vocab = vocab as usize;
+            assert!(
+                cols as usize >= vocab,
+                "argmax row is {cols} wide, narrower than the vocab {vocab}"
+            );
+            let mut m = f32::NEG_INFINITY;
+            for &x in &row[..vocab] {
+                if x > m {
+                    m = x;
+                }
+            }
+            let idx = match row[..vocab].iter().position(|&x| x == m) {
+                Some(first) => first as u32,
+                // The all-NaN sentinel: the pad region's staged tables answer
+                // NB·64 + 64 = PAD_V + BLOCK, one past the padded row.
+                None => argmax_pad_vocab(vocab as u32) + 64,
+            };
+            vec![idx as f32; (out_rows * out_cols) as usize]
         }
         SubOp::Reshape { .. } => {
             let (a, ar, ac) = gather(&node.inputs[0], graph, bufs);
@@ -2376,6 +2430,7 @@ pub fn lower_region(
         // prefix-K input (desc.inputs[1] in the fused decode shape).
         let subop: SubOp<NeoX> = match desc.op {
             SubOp::MatmulTile { n, weight } => SubOp::MatmulTile { n, weight },
+            SubOp::ArgMax { vocab } => SubOp::ArgMax { vocab },
             SubOp::SumReduce { minted }
             | SubOp::RmsNormReduce { minted, .. }
             | SubOp::RmsNormApply { minted, .. } => match minted {},

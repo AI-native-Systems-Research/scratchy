@@ -381,6 +381,16 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
             entry: "reshape_fwd",
             program: Program::Reshape,
         },
+        // ⭐ THE GREEDY TOKEN PICK — the whole vocab scan as ONE kernel: the row, the
+        // six staged tables (functions of the vocab alone, host-staged at load), and
+        // the `[1, 64]` i32 idx stick out. The vocab rides the node (never a model
+        // name); every constexpr below derives from it.
+        SubOp::ArgMax { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/argmax.py"),
+            file: "argmax.py",
+            entry: "argmax_fwd",
+            program: Program::ArgMax,
+        },
         // ⛔⭐ THE OPS `lower_one_node` NEVER ROUTES HERE — enumerated by NAME, never
         // `_`, so adding a SubOp is an E0004 in this crate too. `lower_one_node`'s own
         // match is the gate: these kinds have their own arms there (attention's
@@ -1137,6 +1147,11 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
         // refuses them before the splice — the MoE lowers only from
         // `kernels/moe.py` through KTIR.
         SubOp::ScalarWeightMul => 2,
+        // ⭐ THE ARGMAX'S ARITY IS 7: the logits row plus the six staged tables
+        // (two decreasing ramps, two increasing index tables, two widen tables) —
+        // every kernel parameter but the output is a tape operand, per the splice's
+        // own positional law.
+        SubOp::ArgMax { .. } => 7,
         SubOp::TanhSoftCap { .. } | SubOp::RmsNormUnit { .. } | SubOp::Reshape { .. } => 1,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
@@ -2341,6 +2356,43 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("C_OUT", Val::Int(i128::from(c_out)))?;
             ce("N_STICKS", Val::Int(i128::from(elems_in / u64::from(stk))))?;
         }
+        (SubOp::ArgMax { vocab }, "argmax_fwd") => {
+            // The vocab scan's own facts, all derived from the node's vocab — never a
+            // model name: PAD_V is the power-of-two padded row (the descriptor block's
+            // law, ONE derivation shared with the host reference and the load-time
+            // table staging), NB its block count (bramp's ceiling, fp16-exact at 1024),
+            // BLOCK the stick (the two-level split's lane width and the output stick).
+            // The signature states every kernel parameter's dtype: the row and the five
+            // f16 tables, the f32 widen table (the island's own dtype), and the i32
+            // output stick (the index-ingestion law).
+            let pad_v = scratchy_subtile::subtile_ir::argmax_pad_vocab(*vocab);
+            let nb = pad_v / 64;
+            for p in [
+                "logits_ptr", "bramp_ptr", "lramp_ptr", "binc_ptr", "linc_ptr", "ones_ptr",
+            ] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            signature.insert(
+                "sixtyfour_ptr".to_string(),
+                ArgSpec::parse("*fp32").map_err(|e| e.to_string())?,
+            );
+            signature.insert(
+                "idx_ptr".to_string(),
+                ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
+            );
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("V", Val::Int(i128::from(*vocab)))?;
+            ce("PAD_V", Val::Int(i128::from(pad_v)))?;
+            ce("NB", Val::Int(i128::from(nb)))?;
+            ce("BLOCK", Val::Int(64))?;
+        }
         (op, entry) => {
             return Err(format!(
                 "triton splice: no kernel signature for {op:?} at entry `{entry}` — the row is \
@@ -2493,6 +2545,9 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
         | SubOp::RmsNormUnit { .. }
         | SubOp::ScalarWeightMul
         | SubOp::Reshape { .. } => Ok(vec![1]),
+        // ONE PROGRAM: the sampler serves the solo greedy decode step's single
+        // row — the whole row is one tile in, one stick out.
+        SubOp::ArgMax { .. } => Ok(vec![1]),
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without a grid here is
         // an unreachable — the same discipline the arity match holds.
         _ => Err("triton splice: no grid for this op kind — the row is incomplete".to_string()),
@@ -2760,6 +2815,7 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::TanhSoftCap => "tanhsoftcap",
         Program::ScalarWeightMul => "scalarwmul",
         Program::Reshape => "reshape",
+        Program::ArgMax => "argmax",
         _ => "triton",
     }
 }

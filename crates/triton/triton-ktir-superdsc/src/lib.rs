@@ -254,6 +254,21 @@ fn emit_regions(
                 ),
             });
         }
+        // ⭐ THE ARGMAX IS THE ATTENTION'S OWN CLASS HERE: a multi-op whole-function
+        // body (five whole-row reduces, the equality chain, the fp32 island) over
+        // EIGHT parameters — lowered from its compiled ops through the whole-function
+        // door (`emit_whole`, the fixture ladder's own `argmax_first_max` path), and a
+        // per-`Program` dispatch would be a second, hand-rolled path. Do not add one.
+        Program::ArgMax => {
+            return Err(Error {
+                stage: "program",
+                message: format!(
+                    "{:?} is an eight-parameter whole-function body — `emit_whole` is its \
+                     door, and a per-`Program` dispatch would be a second, hand-rolled path",
+                    node.program
+                ),
+            });
+        }
         // THE MONOMORPHISATION DOOR. `rope_at::<HD>` is not reachable without the geometry, and
         // the geometry is a const parameter, so `Program::Rope` is refused here and driven from
         // `drive_rope` which takes it explicitly. Refused rather than defaulted: a wrong head
