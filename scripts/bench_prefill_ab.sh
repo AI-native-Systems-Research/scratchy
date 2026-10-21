@@ -146,7 +146,7 @@ wait_wired_settled() {
 
 # --- prompts and requests ----------------------------------------------------
 
-# Natural filler paragraph of FILLER_WORDS (74) words. Used for the long/batch
+# Natural filler paragraph of FILLER_WORDS words. Used for the long/batch
 # shapes (labels, not rung targets) and, cut to a token budget, for the rung
 # shapes: a prompt of repeated identical tokens routes MoE traffic to the same
 # few experts, so it times a workload real text never produces — the exact
@@ -162,13 +162,17 @@ synth_prompt() { # $1 = target tokens
   for _ in $(seq 1 "$reps"); do printf '%s ' "$FILLER"; done
 }
 
-# Natural-text prompt cut to a token budget: words-per-token calibrated on
-# this filler (316 repeats, 23,384 words -> 27,502 tokens => 0.8503
-# words/token), so a $1-token target becomes $1 * 0.8503 words of filler.
-# Approximate on purpose — the rung check warns if the prompt misses its rung.
+# Words of filler a $1-token budget buys. Measured on this filler: 316 repeats
+# ran to 27,502 tokens. Re-measure if FILLER's text changes. Approximate on
+# purpose — the rung check warns if the prompt misses its rung.
+natural_words() { # $1 = target tokens
+  echo $(( $1 * 316 * FILLER_WORDS / 27502 ))
+}
+
+# Natural-text prompt cut to a token budget.
 synth_natural() { # $1 = target tokens
   local k reps rem i
-  k=$(( $1 * 8503 / 10000 ))
+  k=$(natural_words "$1")
   reps=$(( k / FILLER_WORDS )); rem=$(( k % FILLER_WORDS ))
   # while, not `seq 1 $reps`: BSD seq prints two lines for a zero-count range
   i=0
@@ -295,6 +299,18 @@ prompt_for_shape() { # $1 shape
     *) synth_natural $(( $1 - TEMPLATE_PAD )) ;;
   esac
 }
+
+# A rung shape whose budget past --template-pad buys no word of filler would
+# send an empty prompt: refuse it before anything is built or served.
+for shape in ${SHAPES//,/ }; do
+  case "$shape" in
+    long|short|batch) ;;
+    *) if [ "$(natural_words $(( shape - TEMPLATE_PAD )))" -lt 1 ]; then
+         echo "--shapes $shape leaves no room for a prompt past --template-pad $TEMPLATE_PAD" >&2
+         exit 2
+       fi ;;
+  esac
+done
 
 # --- one-shot setup ------------------------------------------------------------
 
