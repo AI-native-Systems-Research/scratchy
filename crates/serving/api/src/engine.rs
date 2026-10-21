@@ -3400,6 +3400,7 @@ impl AsyncEngine {
         &self,
         request: &protocol::ChatCompletionRequest,
     ) -> ServeResult<SamplingParams> {
+        check_tool_choice(request)?;
         let stop = match &request.stop {
             Some(protocol::StopCondition::Single(s)) => vec![s.clone()],
             Some(protocol::StopCondition::Multiple(v)) => v.clone(),
@@ -3964,6 +3965,27 @@ fn build_completion_logprobs(
         token_logprobs,
         tokens,
         top_logprobs,
+    }
+}
+
+/// ⛔ A `tool_choice` THAT NEEDS A TOOL NAMES ONE THE REQUEST DECLARES. A forced tool missing
+/// from `tools` would have every call the model makes dropped, and its reply would come back as
+/// text with no error: #767's bug, through a misspelled name. `"required"` with no tools could be
+/// met by none. Both are refused, as vLLM's `check_tool_usage` and the upstream APIs refuse them.
+fn check_tool_choice(request: &protocol::ChatCompletionRequest) -> ServeResult<()> {
+    let tools = request.tools.as_deref().unwrap_or_default();
+    match &request.tool_choice {
+        Some(protocol::ToolChoice::Function(name))
+            if !tools.iter().any(|t| t.function.name == *name) =>
+        {
+            Err(ServeError::Validation(format!(
+                "tool_choice forces the tool `{name}`, which `tools` does not declare"
+            )))
+        }
+        Some(protocol::ToolChoice::Required) if tools.is_empty() => Err(ServeError::Validation(
+            "tool_choice requires a tool call, and `tools` declares none".to_string(),
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -5514,6 +5536,53 @@ mod tests {
     #[test]
     fn test_is_tool_choice_none_with_auto() {
         assert!(!is_tool_choice_none(&Some(protocol::ToolChoice::Auto)));
+    }
+
+    /// A forced tool `tools` doesn't declare (a misspelled or empty name), and `"required"` with
+    /// no tools, are refused as the request is read: a 400, not a reply with every call dropped.
+    /// A declared tool, `"auto"` and `"none"` pass, with tools or without.
+    #[test]
+    fn a_tool_choice_naming_an_undeclared_tool_is_refused() {
+        use protocol::ToolChoice;
+        let engine = make_test_engine();
+        let bash = protocol::ChatCompletionToolsParam {
+            tool_type: "function".to_string(),
+            function: protocol::FunctionDefinition {
+                name: "Bash".to_string(),
+                description: None,
+                parameters: None,
+            },
+        };
+        let check = |tools: Option<Vec<protocol::ChatCompletionToolsParam>>, choice| {
+            let request = protocol::ChatCompletionRequest {
+                tools,
+                tool_choice: Some(choice),
+                ..make_chat_request()
+            };
+            engine.build_sampling_params_from_chat(&request).err()
+        };
+        let declared = || Some(vec![bash.clone()]);
+        for (tools, choice) in [
+            (declared(), ToolChoice::Function("Bsh".into())),
+            (declared(), ToolChoice::Function(String::new())),
+            (None, ToolChoice::Function("Bash".into())),
+            (None, ToolChoice::Required),
+            (Some(vec![]), ToolChoice::Required),
+        ] {
+            let err = check(tools, choice.clone());
+            assert!(
+                matches!(err, Some(ServeError::Validation(_))),
+                "{choice:?}: {err:?}"
+            );
+        }
+        for (tools, choice) in [
+            (declared(), ToolChoice::Function("Bash".into())),
+            (declared(), ToolChoice::Required),
+            (None, ToolChoice::Auto),
+            (None, ToolChoice::None),
+        ] {
+            assert!(check(tools, choice.clone()).is_none(), "{choice:?}");
+        }
     }
 
     /// `tool_choice` forces a tool only when it names one.

@@ -292,10 +292,17 @@ fn last_breakpoint(req: &MessagesRequest) -> Option<Breakpoint> {
     })
 }
 
-/// A request's `tool_choice` in Anthropic's forms ([`protocol::ToolChoice::from_anthropic`]): one it
-/// does not know fails the request as it is parsed. Serialized in the chat completions' form.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// A request's `tool_choice` in Anthropic's forms ([`protocol::ToolChoice::from_anthropic`]), read
+/// and written in them (a client posts this type too, as the e2e one does): one it does not know
+/// fails the request as it is parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnthropicToolChoice(pub protocol::ToolChoice);
+
+impl Serialize for AnthropicToolChoice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.to_anthropic().serialize(serializer)
+    }
+}
 
 impl<'de> Deserialize<'de> for AnthropicToolChoice {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -1386,6 +1393,54 @@ mod tests {
         assert!(!spans_enabled(&empty_tools));
     }
 
+    /// The spans path's reply follows its `tool_choice` as the chat path's does (#758): a forced
+    /// tool drops another's call, leaving the text around it and `end_turn`; `"none"` reads no
+    /// call, so the text comes back as written; the forced tool's own call is a `tool_use` block.
+    #[cfg(feature = "tool-spans")]
+    #[test]
+    fn the_spans_reply_follows_its_tool_choice() {
+        use protocol::ToolChoice;
+        let parser = crate::tool_parser::get_tool_parser("hermes").unwrap();
+        let text = "Let me look.<tool_call>\n{\"name\": \"Bash\", \"arguments\": \
+                    {\"command\": \"ls\"}}\n</tool_call>";
+        let reply = |choice: ToolChoice| {
+            let choices = vec![protocol::CompletionResponseChoice {
+                index: 0,
+                text: text.to_string(),
+                logprobs: None,
+                finish_reason: Some("stop".to_string()),
+                stop_reason: None,
+                prompt_logprobs: None,
+            }];
+            let resp = protocol::CompletionResponse::new("m".into(), choices, Default::default());
+            let msg = completion_to_messages_response(resp, Some(&parser), &Some(choice));
+            let blocks: Vec<String> = (msg.content.iter())
+                .map(|b| match b {
+                    ResponseContentBlock::Text { text } => format!("text {text}"),
+                    ResponseContentBlock::ToolUse { name, .. } => format!("tool_use {name}"),
+                    other => format!("{other:?}"),
+                })
+                .collect();
+            (blocks, msg.stop_reason)
+        };
+        let end_turn = Some("end_turn".to_string());
+        let looked = "text Let me look.".to_string();
+        assert_eq!(
+            reply(ToolChoice::Function("Read".into())),
+            (vec![looked.clone()], end_turn.clone())
+        );
+        assert_eq!(
+            reply(ToolChoice::None),
+            (vec![format!("text {text}")], end_turn)
+        );
+        let bash = (
+            vec![looked, "tool_use Bash".to_string()],
+            Some("tool_use".into()),
+        );
+        assert_eq!(reply(ToolChoice::Function("Bash".into())), bash);
+        assert_eq!(reply(ToolChoice::Auto), bash);
+    }
+
     #[test]
     fn test_deserialize_simple_request() {
         let json = r#"{
@@ -1883,7 +1938,12 @@ mod tests {
         ];
         for (anthropic, choice) in cases {
             let read = serde_json::from_value::<AnthropicToolChoice>(anthropic.clone());
-            assert_eq!(read.ok(), Some(AnthropicToolChoice(choice)), "{anthropic}");
+            let choice = AnthropicToolChoice(choice);
+            assert_eq!(read.ok().as_ref(), Some(&choice), "{anthropic}");
+            // Written in Anthropic's form, so what a client posts reads back as itself.
+            let written = serde_json::to_value(&choice).unwrap();
+            let reread = serde_json::from_value::<AnthropicToolChoice>(written.clone());
+            assert_eq!(reread.ok(), Some(choice), "{written}");
         }
         for bad in [
             json!({"type": "mystery"}),

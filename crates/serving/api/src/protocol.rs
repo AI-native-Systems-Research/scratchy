@@ -314,6 +314,16 @@ impl ToolChoice {
         })
     }
 
+    /// The Anthropic Messages API's form of it: `{"type": …}`, `any` for [`Self::Required`].
+    pub fn to_anthropic(&self) -> serde_json::Value {
+        match self {
+            Self::None => serde_json::json!({ "type": "none" }),
+            Self::Auto => serde_json::json!({ "type": "auto" }),
+            Self::Required => serde_json::json!({ "type": "any" }),
+            Self::Function(name) => serde_json::json!({ "type": "tool", "name": name }),
+        }
+    }
+
     /// The Responses API's form of it.
     pub fn to_responses(&self) -> serde_json::Value {
         match self {
