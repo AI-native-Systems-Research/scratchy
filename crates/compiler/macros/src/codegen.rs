@@ -14747,14 +14747,17 @@ pub fn emit_model(
         // — the terminal slot's chain. A forward leaves only the rows its step samples there, so
         // they take that slot's bytes a row (`MetalBucketSpec::logits_row_bytes`), its rows
         // counted at load; an encoder's terminal rows are every row.
+        // A tile output the coloring did not register (a refused canonical's empty map, an input
+        // the tape's arena keys by another tile) is in no slot, so not the terminal's.
+        let in_terminal = |id: TileId, slot: u8| {
+            (slots_b.iter()).any(|(at, colour)| at == (id, slot) && colour == *terminal_slot_b)
+        };
         let logits_tiles: Vec<(TileId, u8)> = match layout {
             BackboneLayout::Decoder { .. } => {
                 let mut chain = vec![(last_node_id, 0u8)];
                 while let Some(&(tile, _)) = chain.last() {
                     let under = fuf.get(tile).inputs.iter().find_map(|i| match *i {
-                        crate::fuf::FufInput::Tile { id, slot }
-                            if slots_b.of(id, slot) == *terminal_slot_b =>
-                        {
+                        crate::fuf::FufInput::Tile { id, slot } if in_terminal(id, slot) => {
                             Some((id, slot))
                         }
                         _ => None,
