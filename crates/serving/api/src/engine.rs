@@ -838,7 +838,6 @@ impl AsyncEngine {
         // prompt, and each records its own hit on it (#580). The least of them: what the cache
         // held when the request came in, not a sibling's fresh prefill (`ChoiceUsage::totals`).
         let mut cached_tokens: Option<u32> = None;
-        let forced_tool = ForcedTool::of(&request.tool_choice);
 
         for (i, child_id) in child_ids.iter().enumerate() {
             let state = self.poll_until_done(child_id).await?;
@@ -892,42 +891,17 @@ impl AsyncEngine {
                 };
 
             // Try tool call extraction if parser is configured and request has tools.
-            let (final_content, final_tool_calls, final_finish_reason) = if let Some(ref parser) =
-                self.tool_parser
-            {
-                if request.tools.is_some() && !is_tool_choice_none(&request.tool_choice) {
-                    let extracted = parser.extract_tool_calls(&text_for_tools);
-                    if extracted.tools_called {
-                        let tool_calls: Vec<_> = (extracted.tool_calls.into_iter())
-                            .filter(|tc| {
-                                (forced_tool.as_ref()).is_none_or(|f| f.admits(&tc.function.name))
-                            })
-                            .collect();
-                        if tool_calls.is_empty() {
-                            // Every call named a tool other than the forced one: dropped,
-                            // as the stream drops them, so the reply is the text around them.
-                            (extracted.content, None, finish_reason_str)
-                        } else {
-                            (
-                                extracted.content,
-                                Some(tool_calls),
-                                "tool_calls".to_string(),
-                            )
-                        }
-                    } else {
-                        // No tool call: keep the parser's cleaned content (it
-                        // may strip control tokens) instead of the raw text.
-                        (
-                            extracted.content.or(Some(text_for_tools)),
-                            None,
-                            finish_reason_str,
-                        )
-                    }
-                } else {
-                    (Some(text_for_tools), None, finish_reason_str)
+            let (final_content, final_tool_calls, final_finish_reason) = match &self.tool_parser {
+                Some(parser) if request.tools.is_some() => {
+                    let reply =
+                        reply_tool_calls(parser.as_ref(), text_for_tools, &request.tool_choice);
+                    let finish = match reply.calls {
+                        Some(_) => "tool_calls".to_string(),
+                        None => finish_reason_str,
+                    };
+                    (reply.content, reply.calls, finish)
                 }
-            } else {
-                (Some(text_for_tools), None, finish_reason_str)
+                _ => (Some(text_for_tools), None, finish_reason_str),
             };
 
             // If reasoning parser returned content=None (everything was reasoning),
@@ -3993,28 +3967,68 @@ fn build_completion_logprobs(
     }
 }
 
-/// Check if tool_choice is set to "none" (disabling tool use).
-fn is_tool_choice_none(tool_choice: &Option<serde_json::Value>) -> bool {
-    tool_choice.as_ref().and_then(|v| v.as_str()) == Some("none")
+/// Whether `tool_choice` is `"none"`: the reply is never read for a tool call.
+fn is_tool_choice_none(tool_choice: &Option<protocol::ToolChoice>) -> bool {
+    matches!(tool_choice, Some(protocol::ToolChoice::None))
+}
+
+/// A whole reply as its `tool_choice` lets its tool calls out: read by `parser` unless the choice
+/// is `"none"`, and with a [`ForcedTool`] only that tool's calls, the reply then the text around
+/// the others. Both whole-reply paths apply it (the chat endpoint's, and `/v1/messages`' under
+/// `tool-spans`); the stream applies the same rule call by call ([`ToolCallStream`]).
+pub(crate) fn reply_tool_calls(
+    parser: &dyn ToolCallParser,
+    text: String,
+    tool_choice: &Option<protocol::ToolChoice>,
+) -> ToolReply {
+    if is_tool_choice_none(tool_choice) {
+        return ToolReply {
+            content: Some(text),
+            calls: None,
+        };
+    }
+    let extracted = parser.extract_tool_calls(&text);
+    if !extracted.tools_called {
+        // No tool call: keep the parser's cleaned content (it may strip control tokens) instead
+        // of the raw text.
+        return ToolReply {
+            content: extracted.content.or(Some(text)),
+            calls: None,
+        };
+    }
+    let forced = ForcedTool::of(tool_choice);
+    let calls: Vec<_> = (extracted.tool_calls.into_iter())
+        .filter(|tc| (forced.as_ref()).is_none_or(|f| f.admits(&tc.function.name)))
+        .collect();
+    // Every call named a tool other than the forced one: dropped, as the stream drops them, so
+    // the reply is the text around them.
+    ToolReply {
+        content: extracted.content,
+        calls: (!calls.is_empty()).then_some(calls),
+    }
+}
+
+/// A whole reply's text and the tool calls [`reply_tool_calls`] kept, `None` when it kept none.
+pub(crate) struct ToolReply {
+    pub content: Option<String>,
+    pub calls: Option<Vec<protocol::ToolCall>>,
 }
 
 /// The one tool a `tool_choice` makes the model call (OpenAI's
-/// `{"type": "function", "function": {"name": "get_weather"}}`; `/v1/messages` converts Anthropic's
-/// `{"type": "tool", "name": …}` to it), decoded once per request. Both replies drop a call to any
-/// other tool, so the reply is the text around it: the stream must decide a call at its first
-/// delta, before it can know whether a later call will be kept (#683).
+/// `{"type": "function", "function": {"name": "get_weather"}}`, Anthropic's
+/// `{"type": "tool", "name": …}`: [`protocol::ToolChoice::Function`]), decoded once per request.
+/// Both replies drop a call to any other tool, so the reply is the text around it: the stream must
+/// decide a call at its first delta, before it can know whether a later call will be kept (#683).
 #[derive(Clone, Debug, PartialEq)]
 struct ForcedTool(String);
 
 impl ForcedTool {
     /// The tool `tool_choice` forces, if it names one.
-    fn of(tool_choice: &Option<serde_json::Value>) -> Option<Self> {
-        let func = tool_choice
-            .as_ref()?
-            .as_object()?
-            .get("function")?
-            .as_object()?;
-        Some(Self(func.get("name")?.as_str()?.to_string()))
+    fn of(tool_choice: &Option<protocol::ToolChoice>) -> Option<Self> {
+        match tool_choice {
+            Some(protocol::ToolChoice::Function(name)) => Some(Self(name.clone())),
+            _ => None,
+        }
     }
 
     /// Whether a call to `name` is kept.
@@ -4392,7 +4406,7 @@ mod tests {
         let mut engine = make_test_engine();
         let template = "{% if tools %}TOOLS {% endif %}{{ messages[0]['content'] }}";
         engine.set_chat_template(Arc::new(ChatTemplate::new(template.to_string()).unwrap()));
-        let prompt = |tool_choice: Option<serde_json::Value>| {
+        let prompt = |tool_choice: Option<protocol::ToolChoice>| {
             let request = protocol::ChatCompletionRequest {
                 tools: Some(vec![protocol::ChatCompletionToolsParam {
                     tool_type: "function".to_string(),
@@ -4411,9 +4425,9 @@ mod tests {
                 .unwrap();
             ec_req.prompt_token_ids.unwrap()
         };
-        let auto = prompt(Some(serde_json::json!("auto")));
+        let auto = prompt(Some(protocol::ToolChoice::Auto));
         assert_eq!(auto, b"TOOLS Hello".map(u32::from), "the tools render");
-        assert_eq!(prompt(Some(serde_json::json!("none"))), auto);
+        assert_eq!(prompt(Some(protocol::ToolChoice::None)), auto);
         assert_eq!(prompt(None), auto);
     }
 
@@ -5494,30 +5508,24 @@ mod tests {
 
     #[test]
     fn test_is_tool_choice_none_with_none_string() {
-        assert!(is_tool_choice_none(&Some(serde_json::json!("none"))));
+        assert!(is_tool_choice_none(&Some(protocol::ToolChoice::None)));
     }
 
     #[test]
     fn test_is_tool_choice_none_with_auto() {
-        assert!(!is_tool_choice_none(&Some(serde_json::json!("auto"))));
+        assert!(!is_tool_choice_none(&Some(protocol::ToolChoice::Auto)));
     }
 
-    /// `tool_choice` forces a tool only when it names one, in OpenAI's object form.
+    /// `tool_choice` forces a tool only when it names one.
     #[test]
     fn a_forced_tool_is_read_from_a_named_function_only() {
-        let of = |tc: Option<serde_json::Value>| ForcedTool::of(&tc);
+        use protocol::ToolChoice;
+        let of = |tc: Option<ToolChoice>| ForcedTool::of(&tc);
         assert_eq!(of(None), None);
-        assert_eq!(of(Some(serde_json::json!("auto"))), None);
+        assert_eq!(of(Some(ToolChoice::Auto)), None);
+        assert_eq!(of(Some(ToolChoice::Required)), None);
         assert_eq!(
-            of(Some(
-                serde_json::json!({"type": "function", "function": {}})
-            )),
-            None
-        );
-        assert_eq!(
-            of(Some(
-                serde_json::json!({"type": "function", "function": {"name": "get_weather"}})
-            )),
+            of(Some(ToolChoice::Function("get_weather".into()))),
             Some(ForcedTool("get_weather".to_string()))
         );
     }
@@ -5551,6 +5559,34 @@ mod tests {
                 ..d.clone()
             })
             .collect()
+    }
+
+    /// A whole reply under each `tool_choice`, as both whole-reply paths take it (the chat
+    /// endpoint's, and `/v1/messages`' under `tool-spans`, #758): `"none"` reads no call, so the
+    /// text comes back as written; a forced tool keeps only its own calls, and the reply is the text
+    /// around the rest; anything else keeps every call.
+    #[test]
+    fn a_whole_reply_keeps_the_calls_its_tool_choice_lets_out() {
+        use protocol::ToolChoice;
+        let parser = crate::tool_parser::get_tool_parser("hermes").unwrap();
+        let text = format!("Let me look.{}", BASH_CALL.concat());
+        let reply = |choice: Option<ToolChoice>| {
+            let reply = reply_tool_calls(parser.as_ref(), text.clone(), &choice);
+            let names = (reply.calls.iter().flatten())
+                .map(|tc| tc.function.name.clone())
+                .collect::<Vec<_>>();
+            (reply.content, names)
+        };
+        let calls_bash = (Some("Let me look.".to_string()), vec!["Bash".to_string()]);
+        assert_eq!(reply(None), calls_bash);
+        assert_eq!(reply(Some(ToolChoice::Auto)), calls_bash);
+        assert_eq!(reply(Some(ToolChoice::Required)), calls_bash);
+        assert_eq!(reply(Some(ToolChoice::Function("Bash".into()))), calls_bash);
+        assert_eq!(
+            reply(Some(ToolChoice::Function("Read".into()))),
+            (Some("Let me look.".to_string()), vec![])
+        );
+        assert_eq!(reply(Some(ToolChoice::None)), (Some(text.clone()), vec![]));
     }
 
     /// A call to Bash, written across five tokens.
@@ -6542,9 +6578,7 @@ mod tests {
                     parameters: None,
                 },
             }]),
-            tool_choice: Some(
-                serde_json::json!({"type": "function", "function": {"name": forced}}),
-            ),
+            tool_choice: Some(protocol::ToolChoice::Function(forced.to_string())),
             max_tokens: Some(4),
             ..make_chat_request()
         };

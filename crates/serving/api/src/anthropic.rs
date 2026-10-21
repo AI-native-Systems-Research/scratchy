@@ -160,7 +160,7 @@ pub struct MessagesRequest {
     #[serde(default)]
     pub tools: Option<Vec<AnthropicTool>>,
     #[serde(default)]
-    pub tool_choice: Option<Value>,
+    pub tool_choice: Option<AnthropicToolChoice>,
     #[serde(default)]
     pub metadata: Option<Value>,
     /// Anthropic thinking control. `{"type": "adaptive"}` (what Claude Code
@@ -292,29 +292,18 @@ fn last_breakpoint(req: &MessagesRequest) -> Option<Breakpoint> {
     })
 }
 
-/// Anthropic's `tool_choice` as the chat endpoint's. Anthropic sends an object —
-/// `{"type": "auto" | "any" | "none"}`, or `{"type": "tool", "name": …}` — and the bare strings are
-/// accepted as well. `any` is the chat endpoint's `"required"`, which no endpoint enforces yet
-/// (#765). A form it doesn't know passes through as it came.
-fn convert_tool_choice(tc: Value) -> Value {
-    let kind = tc
-        .as_str()
-        .or_else(|| tc.get("type").and_then(Value::as_str));
-    let converted = match kind {
-        Some("auto") => "auto",
-        Some("any") => "required",
-        Some("none") => "none",
-        _ => {
-            return match tc.get("name").and_then(Value::as_str) {
-                Some(name) => serde_json::json!({
-                    "type": "function",
-                    "function": { "name": name }
-                }),
-                None => tc,
-            };
-        }
-    };
-    Value::String(converted.to_string())
+/// A request's `tool_choice` in Anthropic's forms ([`protocol::ToolChoice::from_anthropic`]): one it
+/// does not know fails the request as it is parsed. Serialized in the chat completions' form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AnthropicToolChoice(pub protocol::ToolChoice);
+
+impl<'de> Deserialize<'de> for AnthropicToolChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let form = Value::deserialize(deserializer)?;
+        protocol::ToolChoice::from_anthropic(&form)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
@@ -516,7 +505,7 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
             .collect()
     });
 
-    let tool_choice = req.tool_choice.map(convert_tool_choice);
+    let tool_choice = req.tool_choice.map(|AnthropicToolChoice(choice)| choice);
 
     let stop = req.stop_sequences.map(protocol::StopCondition::Multiple);
 
@@ -809,11 +798,13 @@ fn build_spnl_query(req: &MessagesRequest) -> String {
 
 /// Convert a raw completion response (from the spans path) into a `MessagesResponse`,
 /// applying the engine's tool-call parser so the model's tool calls surface as
-/// `tool_use` blocks (exactly what the flat chat path does internally).
+/// `tool_use` blocks, under the request's `tool_choice` through the chat path's own rule
+/// ([`crate::engine::reply_tool_calls`]).
 #[cfg(feature = "tool-spans")]
 fn completion_to_messages_response(
     resp: protocol::CompletionResponse,
     parser: Option<&std::sync::Arc<dyn crate::tool_parser::ToolCallParser>>,
+    tool_choice: &Option<protocol::ToolChoice>,
 ) -> MessagesResponse {
     let text = resp
         .choices
@@ -824,12 +815,16 @@ fn completion_to_messages_response(
 
     let (content, stop_reason) = match parser {
         Some(p) => {
-            let info = p.extract_tool_calls(&text);
+            let reply = crate::engine::reply_tool_calls(p.as_ref(), text, tool_choice);
             let mut blocks = Vec::new();
-            if let Some(c) = info.content.filter(|s| !s.is_empty()) {
+            if let Some(c) = reply.content.filter(|s| !s.is_empty()) {
                 blocks.push(ResponseContentBlock::Text { text: c });
             }
-            for tc in info.tool_calls {
+            let stop = match reply.calls {
+                Some(_) => "tool_use",
+                None => "end_turn",
+            };
+            for tc in reply.calls.into_iter().flatten() {
                 let input: Value = serde_json::from_str(&tc.function.arguments)
                     .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
                 blocks.push(ResponseContentBlock::ToolUse {
@@ -838,14 +833,6 @@ fn completion_to_messages_response(
                     input,
                 });
             }
-            if blocks.is_empty() {
-                blocks.push(ResponseContentBlock::Text { text });
-            }
-            let stop = if info.tools_called {
-                "tool_use"
-            } else {
-                "end_turn"
-            };
             (blocks, stop.to_string())
         }
         None => (
@@ -1021,8 +1008,9 @@ pub async fn messages(
         let spnl = build_spnl_query(&request);
         match crate::query::anthropic_spans_completion(&state, &spnl).await {
             Ok(resp) => {
-                let msg =
-                    completion_to_messages_response(resp, state.engine.tool_parser().as_ref());
+                let tool_choice = (request.tool_choice.clone()).map(|AnthropicToolChoice(c)| c);
+                let parser = state.engine.tool_parser();
+                let msg = completion_to_messages_response(resp, parser.as_ref(), &tool_choice);
                 return if is_stream {
                     stream_buffered_messages_response(msg).into_response()
                 } else {
@@ -1862,39 +1850,60 @@ mod tests {
             stop_sequences: None,
             stream: false,
             tools: None,
-            tool_choice: Some(Value::String("any".into())),
+            tool_choice: Some(AnthropicToolChoice(protocol::ToolChoice::Required)),
             metadata: None,
             thinking: None,
         };
         let chat = convert_request(req);
-        assert_eq!(chat.tool_choice, Some(Value::String("required".into())));
+        assert_eq!(chat.tool_choice, Some(protocol::ToolChoice::Required));
     }
 
-    /// Anthropic's object forms convert as its bare strings do, and a forced tool becomes the
-    /// chat endpoint's named function.
+    /// Anthropic's object forms read as its bare strings do, a forced tool as the named function,
+    /// and a form Anthropic doesn't define fails the request as it is parsed, as one naming no tool
+    /// does.
     #[test]
-    fn test_convert_tool_choice_object_forms() {
+    fn test_anthropic_tool_choice_forms() {
+        use protocol::ToolChoice;
         use serde_json::json;
         let cases = [
-            (json!({"type": "auto"}), json!("auto")),
-            (json!({"type": "any"}), json!("required")),
-            (json!({"type": "none"}), json!("none")),
+            (json!({"type": "auto"}), ToolChoice::Auto),
+            (json!({"type": "any"}), ToolChoice::Required),
+            (json!({"type": "none"}), ToolChoice::None),
             (
                 json!({"type": "auto", "disable_parallel_tool_use": true}),
-                json!("auto"),
+                ToolChoice::Auto,
             ),
             (
                 json!({"type": "tool", "name": "Read"}),
-                json!({"type": "function", "function": {"name": "Read"}}),
+                ToolChoice::Function("Read".into()),
             ),
-            (json!("auto"), json!("auto")),
-            (json!("any"), json!("required")),
-            (json!("none"), json!("none")),
-            (json!({"type": "mystery"}), json!({"type": "mystery"})),
+            (json!("auto"), ToolChoice::Auto),
+            (json!("any"), ToolChoice::Required),
+            (json!("none"), ToolChoice::None),
         ];
-        for (anthropic, chat) in cases {
-            assert_eq!(convert_tool_choice(anthropic.clone()), chat, "{anthropic}");
+        for (anthropic, choice) in cases {
+            let read = serde_json::from_value::<AnthropicToolChoice>(anthropic.clone());
+            assert_eq!(read.ok(), Some(AnthropicToolChoice(choice)), "{anthropic}");
         }
+        for bad in [
+            json!({"type": "mystery"}),
+            json!({"type": "tool"}),
+            json!("required"),
+            json!(3),
+        ] {
+            let err = serde_json::from_value::<AnthropicToolChoice>(bad.clone())
+                .expect_err("not an Anthropic tool_choice");
+            assert!(
+                err.to_string().contains(r#"{"type": "tool", "name""#),
+                "{bad}: {err}"
+            );
+        }
+        let request = json!({
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 50,
+            "tool_choice": {"type": "mystery"},
+        });
+        assert!(serde_json::from_value::<MessagesRequest>(request).is_err());
     }
 
     #[test]
