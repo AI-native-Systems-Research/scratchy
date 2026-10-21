@@ -7583,6 +7583,8 @@ fn metal_off_tape_tokens(
                 bits,
                 group,
                 scale,
+                verify_rows,
+                window,
             } = suffix;
             use scratchy_target_metal::tape::quantized::ScaleDtype;
             let scale = match scale {
@@ -7605,10 +7607,12 @@ fn metal_off_tape_tokens(
                     bits: #bits,
                     group: #group,
                     scale: #scale,
+                    verify_rows: #verify_rows,
+                    window: #window,
                 },
                 qmv: ::scratchy_target_metal::off_tape::ByCodes {
-                    as_written: [#(#as_written),*],
-                    offset8: [#(#offset8),*],
+                    as_written: &[#(#as_written),*],
+                    offset8: &[#(#offset8),*],
                 },
                 argmax: #argmax,
             })
@@ -7645,10 +7649,11 @@ fn metal_off_tape_tokens(
 }
 
 /// A multi-token-prediction head drafting over a prefix of its target's vocabulary — its logits
-/// `vocab_size` wide, its embedding `embed_vocab_size` — whose lm_head is MLX-affine: the rest
-/// of its target's lm_head (`scratchy_target_metal::off_tape::VocabSuffix`), at the widths its
-/// lm_head is quantized to. `None` for any other model; a head whose lm_head is stored otherwise
-/// (a dense bf16 build) has no kernel past its prefix, and drafts over the prefix alone.
+/// `vocab_size` wide, its target's `target_vocab_size` — whose lm_head is MLX-affine: the rest of
+/// its target's lm_head (`scratchy_target_metal::off_tape::VocabSuffix`), at the widths its
+/// lm_head is quantized to, a pass reading at most its `spec_verify_rows` rows. `None` for any
+/// other model; a head whose lm_head is stored otherwise (a dense bf16 build) has no kernel past
+/// its prefix, and drafts over the prefix alone.
 #[cfg(feature = "metal")]
 fn metal_vocab_suffix(
     program: &Program,
@@ -7658,11 +7663,18 @@ fn metal_vocab_suffix(
 ) -> Option<scratchy_target_metal::off_tape::VocabSuffix> {
     let (&prefix, &all) = (
         model.bounds.get("vocab_size")?,
-        model.bounds.get("embed_vocab_size")?,
+        model.bounds.get("target_vocab_size")?,
     );
     if all <= prefix {
         return None;
     }
+    let stem = &model.source_stem;
+    let bound = |name: &str| {
+        *(model.bounds.get(name)).unwrap_or_else(|| {
+            panic!("`{stem}`: a head drafting over a vocabulary prefix declares its `{name}`")
+        })
+    };
+    let (verify_rows, window) = (bound("spec_verify_rows"), bound("spec_wide_window"));
     let lm_head = lent_weight_prefix(
         program,
         fuf,
@@ -7679,6 +7691,8 @@ fn metal_vocab_suffix(
         bits,
         group,
         scale: mc.scale_dtype,
+        verify_rows: fits(verify_rows),
+        window: fits(window),
     })
 }
 

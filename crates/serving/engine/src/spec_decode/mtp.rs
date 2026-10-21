@@ -263,11 +263,26 @@ pub struct MtpDrafter {
     /// and KV. A head with KV of its own writes its row's KV at the row's position, and each
     /// chained draft is one position further.
     pub reads_target_kv: bool,
-    /// The token ids the head's own lm_head drafts over, a prefix of its target's vocabulary
-    /// (`Some(n)`: ids `0..n`); `None` when it drafts over all of them. A step one of whose
-    /// drafting sequences' newest token lies past the prefix drafts over the whole vocabulary
-    /// ([`Drafting::wide`]).
-    pub draft_vocab: Option<u32>,
+    /// The token ids the head's own lm_head drafts over, a prefix of its target's vocabulary;
+    /// `None` when it drafts over all of them. A step one of whose drafting sequences' last
+    /// tokens reach past the prefix drafts over the whole vocabulary ([`Drafting::wide`]).
+    pub draft_vocab: Option<DraftVocab>,
+}
+
+/// A head drafting over the token ids `0..prefix` of its target's vocabulary: a step drafts over
+/// the whole vocabulary while one of its drafting replies has a token past the prefix among its
+/// last `window` — its bake's (the head's `spec_wide_window`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftVocab {
+    pub prefix: u32,
+    pub window: usize,
+}
+
+impl DraftVocab {
+    /// The reply whose tokens so far are `tokens` is past the prefix.
+    fn reaches_past(self, tokens: &[u32]) -> bool {
+        (tokens.iter().rev().take(self.window)).any(|&t| t >= self.prefix)
+    }
 }
 
 /// A step's rows as its target runs them, in sequence order: what the head's passes read.
@@ -323,7 +338,7 @@ pub struct HeadPasses {
 pub struct Drafting {
     pub one: PassOne,
     pub chain: Chain,
-    /// Some drafting sequence's newest token the host has lies past the head's draft vocabulary
+    /// Some drafting sequence's last tokens the host has reach past the head's draft vocabulary
     /// ([`MtpDrafter::draft_vocab`]): its reply is in tokens the prefix cannot draft, so every
     /// pass's argmax runs over its target's whole vocabulary.
     pub wide: bool,
@@ -552,9 +567,8 @@ impl MtpDrafter {
         // The step's sequences each draft what its verify rows leave room for.
         let passes = self.budget.drafts_at(step.req_ids.len());
         let past_gate = passes == 0;
-        let past_prefix = |tokens: &[u32]| {
-            (self.draft_vocab).is_some_and(|n| tokens.last().is_some_and(|&t| t >= n))
-        };
+        let past_prefix =
+            |tokens: &[u32]| (self.draft_vocab).is_some_and(|v| v.reaches_past(tokens));
         let mut wide = false;
         for i in (0..step.req_ids.len()).filter(|&i| plan.contains(&step.req_ids[i])) {
             let tokens = history(&step.req_ids[i]).unwrap_or_default();
@@ -943,29 +957,50 @@ mod tests {
     }
 
     /// A step drafts over its target's whole vocabulary exactly when a sequence that drafts in it
-    /// has its newest token past the head's draft prefix: `a` drafts, its newest token 510; `b`,
-    /// whose newest is 707, only primes its prompt, so it never widens the step; a head drafting
-    /// over every id never does.
+    /// has a token past the head's draft prefix among its last `window`: `a` drafts, its newest
+    /// token 510 (and, in the second history, 900 three back); `b`, whose every token is 700 or
+    /// more, only primes its prompt, so it never widens the step; a head drafting over every id
+    /// never does.
     #[test]
-    fn a_step_drafts_wide_when_a_drafting_reply_is_past_the_prefix() {
+    fn a_step_drafts_wide_when_a_drafting_reply_reaches_past_the_prefix() {
         let step = TwoSequences::new();
-        let wide = |draft_vocab| {
+        let three_back: Vec<u32> = (500..508).chain([900, 509, 510]).collect();
+        let wide = |a: &[u32], draft_vocab: Option<(u32, usize)>| {
             let drafter = MtpDrafter {
-                draft_vocab,
+                draft_vocab: draft_vocab.map(|(prefix, window)| DraftVocab { prefix, window }),
                 ..DRAFTER
             };
-            (drafter.passes(&step.rows(), &step.before(), &ids(&["a", "b"]), &mut any))
+            let history = |id: &str| match id {
+                "a" => Some(a.to_vec()),
+                _ => step.before()(id),
+            };
+            (drafter.passes(&step.rows(), &history, &ids(&["a", "b"]), &mut any))
                 .and_then(|p| p.drafting)
                 .expect("a drafts")
                 .wide
         };
+        let newest = &step.history_a;
         assert!(
-            wide(Some(510)),
+            wide(newest, Some((510, 1))),
             "a's newest token is the prefix's first past it"
         );
-        assert!(!wide(Some(511)), "a's newest token is the prefix's last");
-        assert!(!wide(Some(600)), "only b's newest token is past the prefix");
-        assert!(!wide(None), "the head drafts over every id");
+        assert!(
+            !wide(newest, Some((511, 1))),
+            "a's newest token is the prefix's last"
+        );
+        assert!(
+            !wide(newest, Some((600, 8))),
+            "only b's tokens are past the prefix"
+        );
+        assert!(!wide(newest, None), "the head drafts over every id");
+        assert!(
+            !wide(&three_back, Some((600, 2))),
+            "900 is three back, past a window of two"
+        );
+        assert!(
+            wide(&three_back, Some((600, 3))),
+            "900 is within a window of three"
+        );
     }
 
     /// Pass 1 runs every row of each planned sequence, split by whether a draft can read it: the
