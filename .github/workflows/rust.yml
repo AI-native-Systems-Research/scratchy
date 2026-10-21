@@ -143,11 +143,12 @@ jobs:
 
       # The e2e tests' cuda half, type-checked and linted: the macOS e2e step
       # compiles their cuda-only files empty, and the workspace clippy above has
-      # no `--tests`, so no other step builds them.
+      # no `--tests`, so no other step builds them. `--keep-going` reports every
+      # failing test target, not just those in flight at the first failure.
       - name: Lint the cuda e2e tests
         run: cargo clippy -p scratchy-e2e -p scratchy-models
           --features e2e,cuda,scratchy-models/smollm2-135m
-          --tests -- -D warnings
+          --tests --keep-going -- -D warnings
 
       # The multi-node control plane, the rank rendezvous and the channel
       # that carries `ControlMessage` to followers, is plain TCP + serde: no
