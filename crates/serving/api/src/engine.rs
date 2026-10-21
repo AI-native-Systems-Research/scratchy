@@ -624,6 +624,18 @@ impl AsyncEngine {
         self.mm_processor = processor;
     }
 
+    /// Whether the engine takes image inputs: a multimodal processor is set.
+    #[cfg(feature = "multimodal")]
+    pub fn takes_images(&self) -> bool {
+        self.mm_processor.is_some()
+    }
+
+    /// Whether the engine takes image inputs: never, in a build without `multimodal`.
+    #[cfg(not(feature = "multimodal"))]
+    pub fn takes_images(&self) -> bool {
+        false
+    }
+
     /// Get the model name.
     pub fn model_name(&self) -> &str {
         &self.model_name
