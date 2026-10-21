@@ -1876,7 +1876,7 @@ pub struct TapeLoop {
 }
 
 /// What a scratch buffer a tape binds holds: one buffer a worker of each kind some tape needs.
-/// The last two scale with the KV cap rung.
+/// The last two scale with the KV cap rung ([`RungScratch`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScratchKind {
     /// Split-K partial sums, reduced by the next command.
@@ -2181,11 +2181,21 @@ pub enum LoweringError {
     /// A scratch buffer the KV cap rung `block_cap` sizes exceeds the 32-bit byte sizes and
     /// offsets its kernels bind: the rung cannot exist for this tape.
     ScratchTooLarge {
-        scratch: ScratchKind,
+        scratch: RungScratch,
         block_cap: MaxBlocksPerSeq,
     },
     /// The tape lists more distinct commands than a [`CommandIx`] can index.
     TooManyCommands(TooManyCommands),
+}
+
+/// A scratch buffer whose size scales with the KV cap rung: of the [`ScratchKind`]s, the ones a
+/// rung can outgrow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RungScratch {
+    /// The rope-once pre-roped K.
+    RopedK,
+    /// The hd512 unfused attention's dense K/V, scores and per-head Q/O.
+    AttnUnfused,
 }
 
 impl std::fmt::Display for LoweringError {

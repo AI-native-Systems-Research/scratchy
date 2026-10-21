@@ -915,7 +915,7 @@ fn roped_k_bytes(dims: [u32; 5], block_cap: u32) -> Result<u32, LoweringError> {
     let bytes = dims.iter().try_fold(1u64, |b, &d| b.checked_mul(d.into()));
     let bytes = bytes.and_then(|b| u32::try_from(b).ok());
     bytes.ok_or(LoweringError::ScratchTooLarge {
-        scratch: super::lowered::ScratchKind::RopedK,
+        scratch: super::lowered::RungScratch::RopedK,
         block_cap: super::ids::MaxBlocksPerSeq(block_cap),
     })
 }
@@ -3935,7 +3935,7 @@ fn lower_one(
                 let bs = block_size;
                 let lq = bucket_m;
                 let too_large = || LoweringError::ScratchTooLarge {
-                    scratch: super::lowered::ScratchKind::AttnUnfused,
+                    scratch: super::lowered::RungScratch::AttnUnfused,
                     block_cap: super::ids::MaxBlocksPerSeq(block_cap),
                 };
                 let max_kv = block_cap.checked_mul(bs).ok_or_else(too_large)?;

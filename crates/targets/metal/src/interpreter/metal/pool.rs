@@ -3598,14 +3598,9 @@ mod tests {
             tapes: test_empty_tapes(1, 3),
             kernels: &[],
         };
-        let host = test_rungs(
-            &[spec(&HOST_ARENA, 2)],
-            ArenaRanks::new(&[0, 2, 1], &[0, 1], &[2]),
-        );
-        let guest = test_rungs(
-            &[spec(&GUEST_ARENA, 0)],
-            ArenaRanks::new(&[2, 1, 0], &[2, 1], &[0]),
-        );
+        let (host, guest) = ([spec(&HOST_ARENA, 2)], [spec(&GUEST_ARENA, 0)]);
+        let host = test_rungs(&host, ArenaRanks::new(&[0, 2, 1], &[0, 1], &host));
+        let guest = test_rungs(&guest, ArenaRanks::new(&[2, 1, 0], &[2, 1], &guest));
         let pick = |rungs: &MetalRungs| {
             (rungs.pick(&device, None, 128, KvAddressing::Direct)).expect("a test rung")
         };

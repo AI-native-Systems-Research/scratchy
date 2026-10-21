@@ -14773,8 +14773,8 @@ pub fn emit_model(
     // THE ARENA RANKS: the slots by size at their largest bucket, largest first, ties by slot —
     // the order in which another model whose forwards never overlap this one's shares its arena
     // (`ArenaRanks`): every slot as a guest, all but the buckets' final hidden states as a host.
-    // `ArenaRanks::new` checks both against the hidden-states slots in the `static` they land in.
-    let (metal_ranks_all, metal_ranks_hosting, metal_ranks_hidden) = {
+    // `ArenaRanks::new` checks both against `METAL_BUCKETS` in the `static` they land in.
+    let (metal_ranks_all, metal_ranks_hosting) = {
         let mut all: Vec<u32> = (0..metal_ladder_arena.len() as u32).collect();
         all.sort_by_key(|&slot| (std::cmp::Reverse(metal_ladder_arena[slot as usize]), slot));
         let hosting: Vec<u32> = (all.iter().copied())
@@ -14786,8 +14786,7 @@ pub fn emit_model(
                 .map(proc_macro2::Literal::u32_unsuffixed)
                 .collect()
         };
-        let hidden = metal_hidden_slots.iter().copied().collect();
-        (lits(all), lits(hosting), lits(hidden))
+        (lits(all), lits(hosting))
     };
 
     // Largest `num_tokens` across all buckets — drives runtime
@@ -15082,12 +15081,12 @@ pub fn emit_model(
                         <Weights as ::scratchy_forward_compiler::CanonicalParams>::NUM_GLOBAL_KV_HEADS,
                     ),
                 },
-                // Checked as this static compiles: every slot ranked once, and no slot holding a
-                // bucket's final hidden states among the hosting ranks.
+                // Checked against the buckets as this static compiles: every slot of every bucket
+                // ranked once, and no bucket's final hidden states among the hosting ranks.
                 ranks: ::scratchy_target_metal::interpreter::metal::ArenaRanks::new(
                     &[#(#metal_ranks_all),*],
                     &[#(#metal_ranks_hosting),*],
-                    &[#(#metal_ranks_hidden),*],
+                    METAL_BUCKETS,
                 ),
             };
 

@@ -148,12 +148,25 @@ impl ArenaRanks {
     /// No slots: the ranks of a model whose arena is never shared (a test's).
     pub const NONE: Self = Self::new(&[], &[], &[]);
 
-    /// The ranks `all` — every slot of `0..all.len()` once — and `hosting` — `all` in its order
-    /// less `hidden`, the slots holding a bucket's final hidden states. Checked here, which the
-    /// `static` the macro emits them in evaluates as it compiles: ranks breaking either fail the
-    /// model's build.
-    pub const fn new(all: &'static [u32], hosting: &'static [u32], hidden: &[u32]) -> Self {
+    /// The ranks of the model whose buckets are `buckets`: `all`, every slot of `0..all.len()` once
+    /// — every slot of every bucket among them — and `hosting`, `all` in its order less each
+    /// bucket's final hidden states (`backbone_slot`, read off the buckets themselves). Checked
+    /// here, which the `static` the macro emits them in evaluates as it compiles: ranks breaking
+    /// any of it fail the model's build.
+    pub const fn new(
+        all: &'static [u32],
+        hosting: &'static [u32],
+        buckets: &[super::pool::MetalBucketSpec],
+    ) -> Self {
         let n = all.len();
+        let mut b = 0;
+        while b < buckets.len() {
+            assert!(
+                (buckets[b].num_arena_slots as usize) <= n,
+                "ArenaRanks: a bucket's slot is unranked"
+            );
+            b += 1;
+        }
         let mut i = 0;
         while i < n {
             assert!(
@@ -171,8 +184,8 @@ impl ArenaRanks {
         while a < n {
             let mut is_hidden = false;
             let mut k = 0;
-            while k < hidden.len() {
-                is_hidden |= hidden[k] == all[a];
+            while k < buckets.len() {
+                is_hidden |= buckets[k].backbone_slot == all[a];
                 k += 1;
             }
             if !is_hidden {
@@ -434,6 +447,9 @@ pub enum WorkerError {
     /// A guest's `part` needs `need` bytes of its host's arena, which holds `has`: the host was
     /// sized for another guest, or for none.
     HostShort { part: HostPart, need: u64, has: u64 },
+    /// A guest's slot `slot` has no rank, so no slot of its host's: its ranks are another
+    /// model's.
+    GuestSlotUnranked { slot: Slot },
 }
 
 /// What of its host's arena a guest takes: the slot of a rank, or the scratch of a kind.
@@ -441,6 +457,15 @@ pub enum WorkerError {
 pub enum HostPart {
     Slot(Rank),
     Scratch(ScratchKind),
+}
+
+impl std::fmt::Display for HostPart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Slot(Rank(rank)) => write!(f, "arena slot of rank {rank}"),
+            Self::Scratch(kind) => f.write_str(kind.what()),
+        }
+    }
 }
 
 impl std::fmt::Display for WorkerError {
@@ -523,8 +548,13 @@ impl std::fmt::Display for WorkerError {
             }
             Self::HostShort { part, need, has } => write!(
                 f,
-                "MetalWorker: a guest's {part:?} needs {need} bytes of its host's arena, which \
+                "MetalWorker: a guest's {part} needs {need} bytes of its host's arena, which \
                  holds {has}: the host was sized for another guest"
+            ),
+            Self::GuestSlotUnranked { slot: Slot(slot) } => write!(
+                f,
+                "MetalWorker: a guest's arena slot {slot} has no rank, so no slot of its host's: \
+                 its ranks are another model's"
             ),
         }
     }
@@ -763,6 +793,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         .ok_or(WorkerError::HostShort { part, need, has })?
                         .clone(),
                 );
+            }
+            // Every slot is its host's: one its ranks miss would be allocated beside the host's
+            // arena, unpriced.
+            if let Some(slot) = hosted.iter().position(Option::is_none) {
+                return Err(WorkerError::GuestSlotUnranked { slot: Slot(slot) });
             }
         }
         // Shared storage so test code can seed/inspect arena contents without staging copies, and
@@ -2720,13 +2755,32 @@ mod tests {
         }
     }
 
+    /// The buckets of a model whose arena has `slots` slots: one a slot of `hidden`, which holds its
+    /// final hidden states — what `ArenaRanks::new` reads those slots off.
+    fn buckets(slots: u32, hidden: &[u32]) -> Vec<super::super::pool::MetalBucketSpec> {
+        let bucket = |&backbone_slot: &u32| super::super::pool::MetalBucketSpec {
+            bucket_m: 1,
+            num_arena_slots: slots,
+            terminal_slot: 0,
+            backbone_slot,
+            arena_bytes: &[],
+            backbone: &[],
+            lm_head: &[],
+            backbone_barriers: &[],
+            lm_head_barriers: &[],
+            tapes: &[],
+            kernels: &[],
+        };
+        hidden.iter().map(bucket).collect()
+    }
+
     /// A host holds its guest rank by rank: each hosting slot grows to the guest rank's bytes, a
     /// slot outside the hosting ranks (a bucket's hidden states) and a slot past the host's arena
     /// (another canonical's, not kept) host nothing, and the ranks past the hosting slots take
     /// fresh slots; the scratch grows kind by kind. Pure arithmetic: no device.
     #[test]
     fn a_host_grows_its_arena_and_scratch_to_hold_its_guest() {
-        let ranks = ArenaRanks::new(&[3, 0, 2, 1], &[3, 0, 1], &[2]);
+        let ranks = ArenaRanks::new(&[3, 0, 2, 1], &[3, 0, 1], &buckets(4, &[2]));
         let slots = |s: ByRank<Slot>| s.iter().map(|(_, s)| s.0).collect::<Vec<_>>();
         // Slot 3 ranks first but lies past this 3-slot arena: its bucket is not kept.
         assert_eq!(slots(ranks.guest_slots(3)), [0, 2, 1]);
@@ -2762,7 +2816,7 @@ mod tests {
     #[test]
     fn a_guest_never_takes_its_hosts_hidden_states() {
         let hidden = [1, 4];
-        let ranks = ArenaRanks::new(&[4, 2, 0, 5, 1, 3], &[2, 0, 5, 3], &hidden);
+        let ranks = ArenaRanks::new(&[4, 2, 0, 5, 1, 3], &[2, 0, 5, 3], &buckets(6, &hidden));
         for len in 0..=6 {
             for count in 0..=8 {
                 let slots = ranks.hosting_slots(len, count);
@@ -2783,10 +2837,18 @@ mod tests {
         ArenaRanks::new(&[0, 1, 1], &[0, 1, 1], &[]);
     }
 
+    /// The hidden-states slots are read off the buckets, not taken on trust.
     #[test]
     #[should_panic(expected = "every slot but the hidden states'")]
     fn arena_ranks_refuse_hosting_a_hidden_states_slot() {
-        ArenaRanks::new(&[0, 1, 2], &[0, 1, 2], &[1]);
+        ArenaRanks::new(&[0, 1, 2], &[0, 1, 2], &buckets(3, &[1]));
+    }
+
+    /// Ranks naming fewer slots than a bucket's arena holds leave a slot no host would hold.
+    #[test]
+    #[should_panic(expected = "a bucket's slot is unranked")]
+    fn arena_ranks_refuse_a_bucket_slot_unranked() {
+        ArenaRanks::new(&[1, 0], &[1], &buckets(3, &[0]));
     }
 
     /// A host and its guest run in one arena: the guest's slot of each rank is the host's slot of
@@ -2829,9 +2891,9 @@ mod tests {
         const K: u64 = 1024;
         // The host's slot 2 holds its hidden states: it hosts in slots 0 and 1 only.
         let host_layout = vec![64 * K, 4 * K, 8 * K];
-        let host_ranks = ArenaRanks::new(&[0, 2, 1], &[0, 1], &[2]);
+        let host_ranks = ArenaRanks::new(&[0, 2, 1], &[0, 1], &buckets(3, &[2]));
         let guest_layout = vec![4 * K, 16 * K, 128 * K];
-        let guest_ranks = ArenaRanks::new(&[2, 1, 0], &[2, 1], &[0]);
+        let guest_ranks = ArenaRanks::new(&[2, 1, 0], &[2, 1], &buckets(3, &[0]));
         let guest = GuestArena {
             arena: [128 * K, 16 * K, 4 * K].into_iter().collect(),
             scratch: PerScratch::default(),
@@ -2879,6 +2941,17 @@ mod tests {
                     need,
                     has: 0,
                 }) if need == 4 * K
+            ),
+            "{refused:?}"
+        );
+        // A guest whose ranks are another model's, naming two of its three slots: its third would
+        // be allocated beside the host's arena, unpriced.
+        let short_ranks = ArenaRanks::new(&[1, 0], &[1], &buckets(2, &[0]));
+        let refused = build(&guest_layout, &tapes, &hosted, &short_ranks).err();
+        assert!(
+            matches!(
+                refused,
+                Some(WorkerError::GuestSlotUnranked { slot: Slot(2) })
             ),
             "{refused:?}"
         );
