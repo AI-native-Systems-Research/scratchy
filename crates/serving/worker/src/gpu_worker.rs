@@ -1567,7 +1567,11 @@ impl MetalWorker {
         let (share, hidden_reads, terminal_reads) = match self.model.as_deref() {
             Some(target) if self.draft_is_head() => {
                 let (hidden, terminal) = HEAD_READS;
-                (ArenaShare::In(Box::new(hosted_by(target)?)), hidden, terminal)
+                (
+                    ArenaShare::In(Box::new(hosted_by(target)?)),
+                    hidden,
+                    terminal,
+                )
             }
             // A draft model's arena is its own, and its argmax runs on the GPU, on the forward's
             // own command buffer.

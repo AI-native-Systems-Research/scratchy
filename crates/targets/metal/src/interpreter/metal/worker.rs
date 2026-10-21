@@ -148,7 +148,12 @@ pub struct GuestArena {
 pub fn hosted_layout(layout: &[u64], ranks: &ArenaRanks, guest: &GuestArena) -> ArenaLayout {
     let slots = ranks.hosting_slots(layout.len(), guest.arena.len());
     let mut out = layout.to_vec();
-    out.resize(layout.len().max(slots.iter().map(|s| s + 1).max().unwrap_or(0)), 0);
+    out.resize(
+        layout
+            .len()
+            .max(slots.iter().map(|s| s + 1).max().unwrap_or(0)),
+        0,
+    );
     for (&slot, &bytes) in slots.iter().zip(&guest.arena) {
         out[slot] = out[slot].max(bytes);
     }
@@ -644,7 +649,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
             ArenaShare::Own | ArenaShare::In(_) => (arena_layout.clone(), Vec::new()),
         };
         let host_read = |slot: usize| {
-            plan.is_none_or(|p| p.host_slots.contains(&(slot as u32))) || guest_reads.contains(&slot)
+            plan.is_none_or(|p| p.host_slots.contains(&(slot as u32)))
+                || guest_reads.contains(&slot)
         };
         // A guest's slots are its host's, rank by rank, which the host sized to hold them.
         let mut hosted: Vec<Option<Activation>> = vec![None; layout.len()];
