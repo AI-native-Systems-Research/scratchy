@@ -2933,16 +2933,14 @@ impl AsyncEngine {
                         // "Streaming response ended before any complete data was
                         // received").
                         if is_finished && !finish_sent {
-                            let finish_reason = if req_state.tool_calls_emitted {
-                                Some(FinishReason::Stop)
-                            } else {
-                                delta_finish_reason
-                            };
+                            // The step's own reason, a tool call's included: the stream encoder
+                            // makes a tool call's `Stop` `tool_calls`, and a `Length` stays
+                            // `length` (the call was cut off).
                             let finish_delta = StreamDelta {
                                 index: req_state.choice_index,
                                 new_token_ids: vec![],
                                 text: None,
-                                finish_reason,
+                                finish_reason: delta_finish_reason,
                                 stop_reason: delta_stop_reason.clone(),
                                 logprobs: None,
                                 tool_call_deltas: None,
@@ -2952,17 +2950,13 @@ impl AsyncEngine {
                             let _ = tx.send(finish_delta);
                         }
                     } else if is_finished {
-                        // No content text but finished — send finish delta.
-                        let fr = if req_state.tool_calls_emitted {
-                            Some(FinishReason::Stop)
-                        } else {
-                            delta_finish_reason
-                        };
+                        // No content text but finished — send finish delta, with the step's own
+                        // reason (see the finish above).
                         let delta = StreamDelta {
                             index: req_state.choice_index,
                             new_token_ids: output.new_token_ids.clone(),
                             text: None,
-                            finish_reason: fr,
+                            finish_reason: delta_finish_reason,
                             stop_reason: delta_stop_reason.clone(),
                             logprobs: step_logprobs.clone(),
                             tool_call_deltas: None,
@@ -7011,7 +7005,8 @@ mod tests {
     #[test]
     fn test_streaming_buffered_tool_call_reports_every_token() {
         for reasoning in [false, true] {
-            let (deltas, generated) = super::test_support::buffered_tool_call_deltas(reasoning);
+            let (deltas, generated) =
+                super::test_support::buffered_tool_call_deltas(reasoning, FinishReason::Stop);
             let summed: u32 = deltas.iter().map(|d| d.new_token_ids.len() as u32).sum();
             assert!(
                 summed < generated,
@@ -7026,6 +7021,21 @@ mod tests {
             );
         }
     }
+
+    /// A tool call's finish carries the step's own reason: one cut off by `max_tokens` streams
+    /// `Length`, which the encoders keep (`length`, `max_tokens`) rather than turning into a
+    /// tool-call finish. It used to stream `Stop` whatever ended the request.
+    #[test]
+    fn test_streaming_tool_call_finish_keeps_the_steps_reason() {
+        for reasoning in [false, true] {
+            for finish in [FinishReason::Stop, FinishReason::Length] {
+                let (deltas, _) = super::test_support::buffered_tool_call_deltas(reasoning, finish);
+                assert!(deltas.iter().any(|d| d.tool_call_deltas.is_some()));
+                let finishes: Vec<_> = deltas.iter().filter_map(|d| d.finish_reason).collect();
+                assert_eq!(finishes, [finish], "reasoning={reasoning}");
+            }
+        }
+    }
 }
 
 /// Engine-produced delta streams for the HTTP encoders' tests.
@@ -7035,11 +7045,15 @@ pub(crate) mod test_support {
 
     /// The deltas the engine streams for a qwen3_coder tool call the parser buffers for most of
     /// its steps — run through phases 1 and 3 as the step loop does — with the number of tokens
-    /// generated. `reasoning` puts a reasoning parser in front, with a short thought first.
+    /// generated. `reasoning` puts a reasoning parser in front, with a short thought first; the last
+    /// step ends the request with `finish`.
     ///
     /// The buffered steps send no delta, so the deltas' `new_token_ids` add up to fewer tokens
     /// than were generated: a consumer has to read the count from [`StreamUsage`].
-    pub(crate) fn buffered_tool_call_deltas(reasoning: bool) -> (Vec<StreamDelta>, u32) {
+    pub(crate) fn buffered_tool_call_deltas(
+        reasoning: bool,
+        finish: FinishReason,
+    ) -> (Vec<StreamDelta>, u32) {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut requests = HashMap::new();
         let mut state = super::tests::make_test_request_state(Some(tx));
@@ -7075,7 +7089,7 @@ pub(crate) mod test_support {
             let outputs = vec![EngineCoreOutput {
                 request_id: "req-1".to_string(),
                 new_token_ids: ids,
-                finish_reason: (i == last).then_some(FinishReason::Stop),
+                finish_reason: (i == last).then_some(finish),
                 stop_reason: None,
                 num_cached_tokens: 0,
                 events: None,

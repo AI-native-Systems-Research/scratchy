@@ -1459,7 +1459,10 @@ mod tests {
     async fn test_stream_tool_call_reports_buffered_tokens() {
         use http_body_util::BodyExt;
 
-        let (deltas, generated) = crate::engine::test_support::buffered_tool_call_deltas(false);
+        let (deltas, generated) = crate::engine::test_support::buffered_tool_call_deltas(
+            false,
+            scratchy_core_common::FinishReason::Stop,
+        );
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         for delta in deltas {
             tx.send(delta).unwrap();
