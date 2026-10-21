@@ -304,7 +304,11 @@ async fn test_anthropic_missing_max_tokens() {
         .unwrap();
 
     // A 400 in Anthropic's error shape, as Anthropic answers a request without max_tokens.
-    assert_eq!(resp.status().as_u16(), 400, "should fail without max_tokens");
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "should fail without max_tokens"
+    );
     let error: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(error["type"], "error", "{error}");
     assert_eq!(error["error"]["type"], "invalid_request_error", "{error}");
