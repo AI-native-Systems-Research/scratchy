@@ -23,9 +23,9 @@
 //! `cpu_golden::attention_via_cache`, `cpu_golden::attention_prefill_paged`,
 //! `interpreter::metal::pipelines` test harness).
 //!
-//! Lives at the crate root (not feature-gated) so both `cpu_golden`
-//! (unconditional) and the metal-feature-gated callers can share one
-//! definition. Args are bare `u32` to avoid pulling the metal-side
+//! Lives in `scratchy-subtile` (target-neutral, not feature-gated) so
+//! metal's `cpu_golden` (re-exported there) and the CUDA KV pool share
+//! one definition. Args are bare `u32` to avoid pulling the metal-side
 //! `ids` newtypes into CPU paths; metal call sites can wrap their
 //! `PhysicalBlockIdx(_)` / `SlotInBlock(_)` payloads at the boundary.
 

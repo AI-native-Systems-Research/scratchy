@@ -83,6 +83,36 @@ unsafe extern "C" {
         cols: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_kv_append_bf16(
+        k: *const c_void,
+        v: *const c_void,
+        slot_mapping: *const c_void,
+        k_cache: *mut c_void,
+        v_cache: *mut c_void,
+        rows: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_attn_prefill_bf16_prepare() -> i32;
+    fn scratchy_cuda_attn_prefill_bf16(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        block_table: *const c_void,
+        sequence: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// Why a launcher did not launch, or the launch failed.
@@ -105,6 +135,22 @@ pub enum KernelError {
         rows: u32,
         half_cols: u32,
         head_dim: u32,
+    },
+    /// The KV append does not take this shape; nothing was launched.
+    KvAppendShape {
+        rows: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+    },
+    /// The prefill attention does not take this shape or scale; nothing was launched.
+    AttnShape {
+        rows: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
     },
     /// The launcher's C++ host code threw (caught before it could reach Rust).
     HostException,
@@ -136,6 +182,29 @@ impl fmt::Display for KernelError {
                 f,
                 "gate split refused shape rows={rows} half_cols={half_cols} head_dim={head_dim}"
             ),
+            KernelError::KvAppendShape {
+                rows,
+                kv_heads,
+                head_dim,
+                block_size,
+            } => write!(
+                f,
+                "kv append refused shape rows={rows} kv_heads={kv_heads} head_dim={head_dim} \
+                 block_size={block_size}"
+            ),
+            KernelError::AttnShape {
+                rows,
+                q_heads,
+                kv_heads,
+                head_dim,
+                block_size,
+                num_blocks,
+            } => write!(
+                f,
+                "prefill attention refused shape rows={rows} q_heads={q_heads} \
+                 kv_heads={kv_heads} head_dim={head_dim} block_size={block_size} \
+                 num_blocks={num_blocks}, or its scale"
+            ),
             KernelError::HostException => write!(f, "kernel launcher's host code threw"),
             KernelError::Cuda(code) => write!(f, "CUDA error {code}"),
         }
@@ -146,8 +215,10 @@ impl std::error::Error for KernelError {}
 
 /// Every kernel's one-time setup, by kernel name: a later kernel with a setup of its own adds one
 /// row.
-const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] =
-    &[("gemm_bf16_abt", scratchy_cuda_gemm_bf16_abt_prepare)];
+const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
+    ("gemm_bf16_abt", scratchy_cuda_gemm_bf16_abt_prepare),
+    ("attn_prefill_bf16", scratchy_cuda_attn_prefill_bf16_prepare),
+];
 
 /// Run every kernel's one-time setup on the current device, stopping at the first failure, which
 /// names its kernel. Every launch on that device needs it to have succeeded first.
@@ -374,4 +445,118 @@ pub unsafe fn gate_apply_bf16(
     // SAFETY: as `rms_norm_bf16`'s.
     let code = unsafe { scratchy_cuda_gate_apply_bf16(attn, gate, out, rows, cols, stream) };
     check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the paged KV cache's write: for each token row `t` whose `slot_mapping[t]` is not
+/// `u32::MAX`, row `t` of `k` and of `v` (`[rows, kv_heads · head_dim]`) copied bit for bit into
+/// `k_cache` and `v_cache` (`[num_blocks, kv_heads, 64, head_dim]`) at that slot. A slot whose
+/// block is at or past `num_blocks` writes nothing. Asynchronous.
+///
+/// Refused with [`KernelError::KvAppendShape`], before any pointer is touched, unless `rows`,
+/// `kv_heads` and `head_dim` are non-zero, `head_dim` a multiple of 8, `block_size` 64
+/// (`step::CUDA_KV_BLOCK_SIZE`), and `rows · kv_heads · head_dim` at most `i32::MAX`. A failed
+/// launch returns the launch's own `cudaError_t`.
+///
+/// # Safety
+///
+/// `k` and `v` must be 16-byte-aligned device pointers to at least `rows · kv_heads · head_dim`
+/// bf16, `slot_mapping` to `rows` u32, `k_cache` and `v_cache` to `num_blocks · kv_heads · 64 ·
+/// head_dim` bf16 each, valid for the whole kernel, the caches overlapping no input. `stream`
+/// must be a live `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn kv_append_bf16(
+    (k, v): (*const c_void, *const c_void),
+    slot_mapping: *const c_void,
+    (k_cache, v_cache): (*mut c_void, *mut c_void),
+    (rows, kv_heads, head_dim): (u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_kv_append_bf16(
+            k,
+            v,
+            slot_mapping,
+            k_cache,
+            v_cache,
+            rows,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::KvAppendShape {
+            rows,
+            kv_heads,
+            head_dim,
+            block_size,
+        },
+    )
+}
+
+/// Launch the causal GQA prefill attention of `q` (`[rows, q_heads · 256]`) over one layer's
+/// paged `k_cache` and `v_cache` (`[num_blocks, kv_heads, 64, 256]`) into `out`, the keys read
+/// through `block_table`, `P` and `L` read from `sequence`: query row `i` attends to keys `0 ..=
+/// P + i` below `P + L`, query head `g` to kv head `g / (q_heads / kv_heads)`, the softmax scaled
+/// by `scale`. Asynchronous.
+///
+/// Refused with [`KernelError::AttnShape`], before any pointer is touched, unless `head_dim` is
+/// 256 (`step::ATTN_PREFILL_BF16_HEAD_DIM`), `rows` a non-zero multiple of 128
+/// (`step::ATTN_PREFILL_BF16_ROWS`), `q_heads` and `kv_heads` non-zero with `q_heads` a multiple
+/// of `kv_heads`, `block_size` 64, `num_blocks` non-zero, and `scale` finite and above 0. Returns
+/// [`KernelError::HostException`] if building a tensor map throws, and the launch's own
+/// `cudaError_t` if it fails.
+///
+/// # Safety
+///
+/// [`prepare_all`] must have succeeded on the current device. `q` and `out` must be
+/// 16-byte-aligned device pointers to `rows · q_heads · 256` bf16, `out` overlapping no input;
+/// `k_cache`, `v_cache` to `num_blocks · kv_heads · 64 · 256` bf16 each; `sequence` to `[P, L]`
+/// u32 with `1 ≤ L ≤ rows`; `block_table` to at least `ceil((P + L) / 64)` u32 block ids, each
+/// below `num_blocks`. All valid for the whole kernel. `stream` must be a live `cudaStream_t` of
+/// the current device, or null for the default stream.
+pub unsafe fn attn_prefill_bf16(
+    (q, out): (*const c_void, *mut c_void),
+    (k_cache, v_cache): (*const c_void, *const c_void),
+    (block_table, sequence): (*const c_void, *const c_void),
+    (rows, q_heads, kv_heads, head_dim): (u32, u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    scale: f32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape and scale before it touches a pointer and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_attn_prefill_bf16(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            sequence,
+            out,
+            rows,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+            scale,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::AttnShape {
+            rows,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+        },
+    )
 }

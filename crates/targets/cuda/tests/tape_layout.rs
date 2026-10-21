@@ -6,6 +6,7 @@
 
 mod common {
     pub mod attn_gate;
+    pub mod attn_layer;
     pub mod chains;
     pub mod mlp;
 }
@@ -13,6 +14,9 @@ mod common {
 use std::num::NonZeroU32;
 
 use common::attn_gate::{ATTN_GATE_M128, ATTN_GATE_M256, attn_gate, attn_gate_input};
+use common::attn_layer::{
+    ATTN_LAYER_M128, ATTN_LAYER_M256, LAYER, PREFIX_CAPACITY, attn_layer, attn_layer_input,
+};
 use common::chains::{
     QWEN3_5_FACTS, THREE_GEMM_M256, TWO_GEMM_M128, TWO_GEMM_M256, assert_tape_is_lowered,
     chain_input, three_gemm, two_gemm, with_hidden,
@@ -23,15 +27,18 @@ use scratchy_subtile::fixtures::{
 };
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{
-    AffineInt4, GemmWeight, GemmWeightKind, InputRef, LoweringInput, OpDesc,
+    AffineInt4, ArchOp, GemmWeight, GemmWeightKind, InputRef, LoweringInput, OpDesc,
 };
-use scratchy_subtile::model_geometry::HeadDim;
-use scratchy_subtile::subtile_ir::{EwKind, GainConvention, RowScale, SourceShape, SubOp};
+use scratchy_subtile::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
+use scratchy_subtile::subtile_ir::{
+    AttnMask, EwKind, GainConvention, RopeFormTag, RowScale, SourceShape, SubOp,
+};
 use scratchy_target_cuda::step::{CudaStep, GemmBf16};
 use scratchy_target_cuda::tape::{ArenaOffset, CUDA_ARENA_ALIGN, CudaTape};
 use scratchy_target_cuda_compiler::canonical::{
-    ArenaRefusal, CanonicalAt, CanonicalRefusal, CudaModelFacts, GateShapeRule, GemmShapeRule,
-    OperandRefusal, RopeShapeRule, RowShapeRule, ViewRefusal, lower_canonical,
+    ArenaRefusal, AttnShapeRule, CanonicalAt, CanonicalRefusal, CudaModelFacts, GateShapeRule,
+    GemmShapeRule, KvCacheRefusal, OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule,
+    ViewRefusal, lower_canonical,
 };
 
 fn lower_with(
@@ -280,9 +287,28 @@ fn every_static_validates() {
         ("MLP_M256", &MLP_M256),
         ("ATTN_GATE_M128", &ATTN_GATE_M128),
         ("ATTN_GATE_M256", &ATTN_GATE_M256),
+        ("ATTN_LAYER_M128", &ATTN_LAYER_M128),
+        ("ATTN_LAYER_M256", &ATTN_LAYER_M256),
     ] {
         assert_eq!(tape.validate(), Ok(()), "{name}");
     }
+}
+
+/// Only the attention layer binds a prefix cache, so only its tapes have a KV cache.
+#[test]
+fn only_the_attention_layer_has_a_kv_cache() {
+    for tape in [
+        &TWO_GEMM_M128,
+        &TWO_GEMM_M256,
+        &THREE_GEMM_M256,
+        &MLP_M128,
+        &MLP_M256,
+        &ATTN_GATE_M128,
+        &ATTN_GATE_M256,
+    ] {
+        assert_eq!(tape.kv, None);
+    }
+    assert!(ATTN_LAYER_M128.kv.is_some() && ATTN_LAYER_M256.kv.is_some());
 }
 
 /// The tapes before this one have no rope, so no rotary table.
@@ -689,8 +715,10 @@ fn a_rope_operand_that_is_not_the_global_table_is_refused() {
         e,
         CanonicalRefusal::RotaryOperand {
             step: 6,
+            op: "RopeRotate",
             operand: 1,
-            binding: Some(SourceBinding::Weight { .. })
+            binding: Some(SourceBinding::Weight { .. }),
+            ..
         }
     ));
     let mut l = attn_gate(256);
@@ -700,6 +728,7 @@ fn a_rope_operand_that_is_not_the_global_table_is_refused() {
         e,
         CanonicalRefusal::RotaryOperand {
             step: 6,
+            op: "RopeRotate",
             operand: 2,
             binding: Some(SourceBinding::Sin { local: true })
         }
@@ -907,6 +936,629 @@ fn a_row_op_with_no_rows_is_refused() {
             step: 0,
             op: "Add",
             rule: RowShapeRule::Empty { dim: "rows" },
+            ..
+        }
+    ));
+}
+
+// ── qwen3.5-0.8b's full-attention layer ────────────────────────────
+
+#[test]
+fn the_attention_layer_statics_are_what_their_canonicals_lower_to() {
+    assert_tape_is_lowered("attn_layer(128)", &ATTN_LAYER_M128, &attn_layer(128));
+    assert_tape_is_lowered("attn_layer(256)", &ATTN_LAYER_M256, &attn_layer(256));
+}
+
+/// Seventeen ops, thirteen launches: the four views emit none. The rope-append reads the rotated
+/// table and writes the rotated K (colour 8); the attention reads the rotated query, the tape's
+/// block table and sequence, and writes colour 9; the gate keeps `q`'s split live to the gate
+/// apply. After the colours: the rotary table, the block table, the slot mapping and the sequence.
+#[test]
+fn the_attention_layer_numbers() {
+    for (tape, m) in [(&ATTN_LAYER_M128, 128u64), (&ATTN_LAYER_M256, 256)] {
+        let (h, q, kv) = (1024 * m * 2, 2048 * m * 2, 512 * m * 2);
+        assert_eq!(
+            tape.arena.colour_bytes,
+            [h, h, 2 * q, q, q, kv, kv, q, kv, q, h, q]
+        );
+        let colours_end = 3 * h + 7 * q + 3 * kv;
+        let rotary = tape.rotary.expect("the tape has a rope");
+        assert_eq!(
+            (rotary.span.offset.0, rotary.span.bytes),
+            (colours_end, m * 64 * 2)
+        );
+        let kv_tape = tape.kv.expect("the tape has a KV cache");
+        let table_at = colours_end + m * 128;
+        assert_eq!(
+            (kv_tape.block_table.offset.0, kv_tape.block_table.bytes),
+            (table_at, 512)
+        );
+        assert_eq!(
+            (kv_tape.slot_mapping.offset.0, kv_tape.slot_mapping.bytes),
+            (table_at + 512, m * 4)
+        );
+        let seq_at = table_at + 512 + (m * 4).next_multiple_of(256);
+        assert_eq!(
+            (kv_tape.sequence.offset.0, kv_tape.sequence.bytes),
+            (seq_at, 8)
+        );
+        assert_eq!(tape.arena.total_bytes, seq_at + 256);
+        assert_eq!(kv_tape.layers, [LAYER]);
+        assert_eq!(
+            (kv_tape.kv_heads, kv_tape.head_dim, kv_tape.block_size),
+            (2, 256, 64)
+        );
+        assert_eq!(kv_tape.max_blocks_per_seq, 128);
+        assert_eq!(tape.steps.len(), 13);
+    }
+    assert_eq!(ATTN_LAYER_M256.arena.total_bytes, 9733888);
+    assert_eq!(ATTN_LAYER_M128.arena.total_bytes, 4867328);
+    let t = &ATTN_LAYER_M256;
+    let [
+        CudaStep::RmsNorm(n),
+        CudaStep::Gemm(qg),
+        CudaStep::GateSplit(split),
+        CudaStep::RmsNorm(qn),
+        CudaStep::Gemm(k),
+        CudaStep::RmsNorm(kn),
+        CudaStep::Gemm(v),
+        CudaStep::Rope(rope),
+        CudaStep::RopeAppend(append),
+        CudaStep::AttnPrefill(attn),
+        CudaStep::GateApply(ga),
+        CudaStep::Gemm(o),
+        CudaStep::Add(y),
+    ] = *t.steps
+    else {
+        panic!("the steps are the layer's thirteen launches, in order");
+    };
+    let colour = |c: usize| ArenaOffset(t.arena.colour_offsets[c]);
+    let kv_tape = t.kv.expect("the tape has a KV cache");
+    let table = t.rotary.expect("a rotary table").span.offset;
+    assert_eq!((qg.a, k.a, v.a), (n.y, n.y, n.y), "q, k and v project n");
+    assert_eq!(split.qg, qg.c);
+    assert_eq!((qn.x, qn.rows), (split.q, 2048), "the per-head view of q");
+    assert_eq!((kn.x, kn.rows), (k.c, 512), "the per-head view of k");
+    assert_eq!(
+        v.c, k.c,
+        "v is written over k's colour: k is dead after its norm"
+    );
+    assert_eq!((rope.x, rope.table), (qn.y, table));
+    assert_eq!(
+        (append.k, append.v, append.table, append.k_out),
+        (kn.y, v.c, table, colour(8))
+    );
+    assert_eq!(append.slot_mapping, kv_tape.slot_mapping.offset);
+    assert_eq!(
+        (
+            append.layer,
+            append.rows,
+            append.cols,
+            append.head_dim,
+            append.rot_dim
+        ),
+        (0, 256, 512, 256, 64)
+    );
+    assert_eq!(
+        (attn.q, attn.block_table, attn.sequence, attn.out),
+        (
+            rope.out,
+            kv_tape.block_table.offset,
+            kv_tape.sequence.offset,
+            colour(9)
+        )
+    );
+    assert_eq!(
+        (
+            attn.layer,
+            attn.rows,
+            attn.q_heads,
+            attn.kv_heads,
+            attn.head_dim
+        ),
+        (0, 256, 8, 2, 256)
+    );
+    assert_eq!(attn.scale_bits, 0.0625f32.to_bits());
+    assert_eq!(attn.scale(), 0.0625);
+    assert_eq!((ga.attn, ga.gate), (attn.out, split.gate));
+    assert_eq!(ga.out, rope.out, "ga is written over qr's colour");
+    assert_eq!((o.a, o.c), (ga.out, n.y), "o is written over n's colour");
+    assert_eq!((y.a, y.b), (o.c, ArenaOffset(0)), "y = o + x");
+}
+
+/// [`attn_layer`]`(256)` with op `ix` replaced by `op`.
+fn attn_layer_with(ix: usize, op: ArchOp) -> LoweredDecode {
+    let mut l = attn_layer(256);
+    l.input.ops[ix].op = op;
+    l
+}
+
+/// qwen3.5-0.8b's attention geometry, or another one.
+fn geom(q: u32, kv: u32, hd: u32) -> ModelAttnGeometry {
+    ModelAttnGeometry::mint(QueryHeads::new(q), KvHeads::new(kv), HeadDim::new(hd))
+        .expect("a valid geometry")
+}
+
+const fn rope_append_op(head_dim: u32, layer: u32, attn: AttnMask, pairing: RopeFormTag) -> ArchOp {
+    SubOp::rope_append(HeadDim::new(head_dim), layer, attn, pairing)
+}
+
+const WINDOW: AttnMask = AttnMask::SlidingWindow {
+    window: NonZeroU32::new(512).unwrap(),
+};
+
+#[test]
+fn an_interleaved_rope_append_is_refused() {
+    let l = attn_layer_with(
+        12,
+        rope_append_op(256, LAYER, AttnMask::Causal, RopeFormTag::Interleaved),
+    );
+    let e = refused(&l, &["RopeAppend", "interleaved"]);
+    assert!(matches!(e, CanonicalRefusal::RopePairing { step: 12 }));
+}
+
+#[test]
+fn a_sliding_window_rope_append_is_refused() {
+    let l = attn_layer_with(12, rope_append_op(256, LAYER, WINDOW, RopeFormTag::NeoX));
+    let e = refused(&l, &["RopeAppend", "sliding-window"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::SlidingWindow {
+            step: 12,
+            op: "RopeAppend"
+        }
+    ));
+}
+
+#[test]
+fn a_rope_append_of_another_head_dim_is_refused() {
+    let l = attn_layer_with(
+        12,
+        rope_append_op(128, LAYER, AttnMask::Causal, RopeFormTag::NeoX),
+    );
+    let e = refused(&l, &["RopeAppend", "head_dim = 128", "256"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::KvHeadDim {
+            step: 12,
+            op: "RopeAppend",
+            head_dim: 128,
+            want: 256
+        }
+    ));
+}
+
+/// `RopeAppend(k, cos, sin, v, pk, pv)` alone, every operand a source: `k` the embedded hidden
+/// `[tokens, cols]`, the global table, `v` a weight, layer 3's prefix cache.
+fn rope_append_only(tokens: u32, cols: u32) -> LoweredDecode {
+    let mut l = with_hidden(LoweringInput {
+        exported: None,
+        sources: vec![
+            shape(tokens, cols),
+            shape(tokens, cols),
+            shape(tokens, cols),
+            shape(tokens, cols),
+            shape(PREFIX_CAPACITY, cols),
+            shape(PREFIX_CAPACITY, cols),
+        ],
+        ops: vec![OpDesc {
+            op: rope_append_op(256, LAYER, AttnMask::Causal, RopeFormTag::NeoX),
+            m: tokens,
+            inputs: (0..6).map(InputRef::Ext).collect(),
+        }],
+        result: 0,
+    });
+    l.bindings[1] = SourceBinding::Cos { local: false };
+    l.bindings[2] = SourceBinding::Sin { local: false };
+    l.bindings[4] = SourceBinding::PrefixK {
+        layer: u64::from(LAYER),
+    };
+    l.bindings[5] = SourceBinding::PrefixV {
+        layer: u64::from(LAYER),
+    };
+    l
+}
+
+/// The rope's shape rule applied to K: a `rot_dim` off the vector, and K's `cols` not a whole
+/// number of heads. The RopeAppend is alone, so no `RopeRotate` refuses first.
+#[test]
+fn a_rope_append_off_the_rope_shape_is_refused() {
+    let facts = CudaModelFacts {
+        rot_dim: 24,
+        ..QWEN3_5_FACTS
+    };
+    let e = refused_with(
+        &rope_append_only(256, 512),
+        facts,
+        &["RopeAppend", "rot_dim=24"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::RopeShape {
+            step: 0,
+            op: "RopeAppend",
+            rule: RopeShapeRule::RotOffVector { multiple: 16 },
+            ..
+        }
+    ));
+    let e = refused(
+        &rope_append_only(256, 640),
+        &["RopeAppend", "whole number of heads"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::RopeShape {
+            step: 0,
+            op: "RopeAppend",
+            rule: RopeShapeRule::ColsOffHead,
+            ..
+        }
+    ));
+}
+
+/// A K that is not a computed slot: the kernel writes the rotated K into the step's own colour,
+/// reading K from one.
+#[test]
+fn a_rope_append_whose_k_is_a_source_is_refused() {
+    let e = refused(
+        &rope_append_only(256, 512),
+        &["RopeAppend", "operand 0", "computed slot"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::Operand {
+            step: 0,
+            op: "RopeAppend",
+            operand: 0,
+            why: OperandRefusal::NotASlot { source: 0, .. },
+        }
+    ));
+}
+
+#[test]
+fn a_rope_append_whose_rotary_operand_is_not_the_global_table_is_refused() {
+    let mut l = attn_layer(256);
+    l.bindings[9] = SourceBinding::Cos { local: true };
+    let e = refused(&l, &["RopeAppend", "operand 1", "local: true"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::RotaryOperand {
+            step: 12,
+            op: "RopeAppend",
+            operand: 1,
+            binding: Some(SourceBinding::Cos { local: true }),
+        }
+    ));
+}
+
+/// The RopeAppend's operands 4 and 5 must be its own layer's prefix cache: here it names layer 3's
+/// and says it appends layer 5's.
+#[test]
+fn a_rope_append_whose_prefix_operand_is_another_layers_is_refused() {
+    let l = attn_layer_with(
+        12,
+        rope_append_op(256, 5, AttnMask::Causal, RopeFormTag::NeoX),
+    );
+    let e = refused(
+        &l,
+        &[
+            "RopeAppend",
+            "operand 4",
+            "PrefixK { layer: 3 }",
+            "layer 5's PrefixK",
+        ],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::KvOperand {
+            step: 12,
+            op: "RopeAppend",
+            operand: 4,
+            layer: 5,
+            want: "PrefixK",
+            binding: Some(SourceBinding::PrefixK { layer: 3 }),
+        }
+    ));
+    let mut l = attn_layer(256);
+    l.bindings[12] = SourceBinding::Weight {
+        id: 12,
+        index: None,
+    };
+    l.bindings.push(SourceBinding::PrefixV {
+        layer: u64::from(LAYER),
+    });
+    l.input.sources.push(shape(PREFIX_CAPACITY, 512));
+    let e = refused(&l, &["RopeAppend", "operand 5", "PrefixV"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::KvOperand {
+            step: 12,
+            operand: 5,
+            binding: Some(SourceBinding::Weight { .. }),
+            ..
+        }
+    ));
+}
+
+/// A layer that binds a `PrefixK` and no `PrefixV` is not a cache: refused at the first KV step,
+/// though no step names that layer. A step naming one layer's `PrefixK` beside another's
+/// `PrefixV` is refused at its operand first.
+#[test]
+fn a_prefix_k_with_no_prefix_v_is_refused() {
+    let mut l = attn_layer(256);
+    l.input.sources.push(shape(PREFIX_CAPACITY, 512));
+    l.bindings.push(SourceBinding::PrefixK { layer: 7 });
+    let e = refused(
+        &l,
+        &["KV cache", "layer 7", "only one of PrefixK and PrefixV"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::KvCache(KvCacheRefusal::Unpaired { layer: 7 })
+    ));
+    let mut l = attn_layer(256);
+    l.bindings[12] = SourceBinding::PrefixV { layer: 4 };
+    let e = refused(&l, &["RopeAppend", "operand 5", "layer 3's PrefixV"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::KvOperand {
+            step: 12,
+            operand: 5,
+            want: "PrefixV",
+            binding: Some(SourceBinding::PrefixV { layer: 4 }),
+            ..
+        }
+    ));
+}
+
+/// Two layers' caches of different widths cannot be one pool; a cache that is not a whole number
+/// of heads cannot be addressed. The second layer here is unread by any step.
+#[test]
+fn a_kv_pool_of_two_widths_or_off_the_head_is_refused() {
+    let mut l = attn_layer(256);
+    l.input.sources.push(shape(PREFIX_CAPACITY, 768));
+    l.input.sources.push(shape(PREFIX_CAPACITY, 768));
+    l.bindings.push(SourceBinding::PrefixK { layer: 7 });
+    l.bindings.push(SourceBinding::PrefixV { layer: 7 });
+    let e = refused(&l, &["layer 7", "768", "512"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::KvCache(KvCacheRefusal::Width {
+            layer: 7,
+            cols: 768,
+            want: 512
+        })
+    ));
+    let facts = CudaModelFacts {
+        head_dim: 384,
+        ..QWEN3_5_FACTS
+    };
+    let e = refused_with(&rope_append_only(256, 512), facts, &["RopeAppend"]);
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::KvHeadDim { .. }
+                | CanonicalRefusal::KvCache(KvCacheRefusal::OffHead { .. })
+        ),
+        "{e:?}"
+    );
+}
+
+/// A layer id above `u32::MAX` cannot be a tape's KV layer.
+#[test]
+fn a_kv_layer_above_u32_is_refused() {
+    let mut l = attn_layer(256);
+    l.input.sources.push(shape(PREFIX_CAPACITY, 512));
+    l.input.sources.push(shape(PREFIX_CAPACITY, 512));
+    let big = u64::from(u32::MAX) + 1;
+    l.bindings.push(SourceBinding::PrefixK { layer: big });
+    l.bindings.push(SourceBinding::PrefixV { layer: big });
+    let e = refused(&l, &["4294967296", "u32"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::KvCache(KvCacheRefusal::LayerTooLarge { layer }) if layer == big
+    ));
+}
+
+/// `AttnDecode(q, pk, pv, k, v)` alone over sources at `m` rows of `geom`: refused by its shape
+/// before any operand is read.
+fn attn_only(m: u32, g: ModelAttnGeometry) -> LoweredDecode {
+    let mut l = with_hidden(LoweringInput {
+        exported: None,
+        sources: vec![
+            shape(m, g.q_width()),
+            shape(PREFIX_CAPACITY, g.kv_width()),
+            shape(PREFIX_CAPACITY, g.kv_width()),
+            shape(m, g.kv_width()),
+            shape(m, g.kv_width()),
+        ],
+        ops: vec![OpDesc {
+            op: SubOp::attn_decode(g, 0.0625, PREFIX_CAPACITY, AttnMask::Causal),
+            m,
+            inputs: (0..5).map(InputRef::Ext).collect(),
+        }],
+        result: 0,
+    });
+    l.bindings[1] = SourceBinding::PrefixK {
+        layer: u64::from(LAYER),
+    };
+    l.bindings[2] = SourceBinding::PrefixV {
+        layer: u64::from(LAYER),
+    };
+    l
+}
+
+/// One row is decode attention, the next issue's kernel.
+#[test]
+fn a_decode_attention_is_refused() {
+    let e = refused(
+        &attn_only(1, geom(8, 2, 256)),
+        &["AttnDecode", "rows=1", "decode"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::AttnShape {
+            step: 0,
+            rows: 1,
+            rule: AttnShapeRule::Decode,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn an_attention_off_the_cta_rows_is_refused() {
+    let e = refused(
+        &attn_only(192, geom(8, 2, 256)),
+        &["AttnDecode", "rows=192", "128"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::AttnShape {
+            step: 0,
+            rows: 192,
+            rule: AttnShapeRule::RowsOffTile { multiple: 128 },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn an_attention_of_another_head_dim_is_refused() {
+    let e = refused(
+        &attn_only(256, geom(16, 4, 128)),
+        &["AttnDecode", "head_dim=128", "256"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::AttnShape {
+            step: 0,
+            head_dim: 128,
+            rule: AttnShapeRule::HeadDim { want: 256 },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_sliding_window_attention_is_refused() {
+    let l = attn_layer_with(
+        13,
+        SubOp::attn_decode(geom(8, 2, 256), 0.0625, PREFIX_CAPACITY, WINDOW),
+    );
+    let e = refused(&l, &["AttnDecode", "sliding-window"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::SlidingWindow {
+            step: 13,
+            op: "AttnDecode"
+        }
+    ));
+}
+
+/// gpt-oss's sinks ride as a 6th input; CUDA's attention has none.
+#[test]
+fn an_attention_with_sinks_is_refused() {
+    let mut l = attn_layer(256);
+    l.input.sources.push(shape(1, 8));
+    l.bindings.push(SourceBinding::Weight {
+        id: 14,
+        index: None,
+    });
+    l.input.ops[13].inputs.push(InputRef::Ext(14));
+    let e = refused(&l, &["AttnDecode", "sinks"]);
+    assert!(matches!(e, CanonicalRefusal::AttnSinks { step: 13 }));
+}
+
+/// Operand 3 must be a `RopeAppend`, of the attention's own layer, and operand 4 the V that append
+/// read.
+#[test]
+fn an_attention_whose_new_k_or_v_is_not_its_rope_appends_is_refused() {
+    let mut input = attn_layer_input(256);
+    input.ops[13].inputs[3] = InputRef::Op(9);
+    let mut l = attn_layer(256);
+    l.input = input;
+    let e = refused(&l, &["AttnDecode", "operand 3", "not a RopeAppend"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::AttnProducer {
+            step: 13,
+            operand: 3,
+            why: ProducerRefusal::NotARopeAppend
+        }
+    ));
+
+    let mut l = attn_layer(256);
+    l.input.ops[13].inputs[4] = InputRef::Op(9);
+    let e = refused(&l, &["AttnDecode", "operand 4", "RopeAppend wrote"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::AttnProducer {
+            step: 13,
+            operand: 4,
+            why: ProducerRefusal::NotItsV
+        }
+    ));
+
+    // The append writes layer 5's cache (sources 14, 15); the attention reads layer 3's.
+    let mut l = attn_layer(256);
+    l.input.sources.push(shape(PREFIX_CAPACITY, 512));
+    l.input.sources.push(shape(PREFIX_CAPACITY, 512));
+    l.bindings.push(SourceBinding::PrefixK { layer: 5 });
+    l.bindings.push(SourceBinding::PrefixV { layer: 5 });
+    l.input.ops[12].op = rope_append_op(256, 5, AttnMask::Causal, RopeFormTag::NeoX);
+    l.input.ops[12].inputs[4] = InputRef::Ext(14);
+    l.input.ops[12].inputs[5] = InputRef::Ext(15);
+    let e = refused(&l, &["AttnDecode", "layer 5"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::AttnProducer {
+            step: 13,
+            operand: 3,
+            why: ProducerRefusal::OtherLayer { layer: 5 }
+        }
+    ));
+}
+
+/// The attention's operand 2 must be its layer's `PrefixV`.
+#[test]
+fn an_attention_whose_prefix_operand_is_not_its_layers_is_refused() {
+    let mut l = attn_layer(256);
+    l.input.sources.push(shape(PREFIX_CAPACITY, 512));
+    l.bindings.push(SourceBinding::Weight {
+        id: 14,
+        index: None,
+    });
+    l.input.ops[13].inputs[2] = InputRef::Ext(14);
+    let e = refused(&l, &["AttnDecode", "operand 2", "PrefixV"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::KvOperand {
+            step: 13,
+            op: "AttnDecode",
+            operand: 2,
+            layer: 3,
+            want: "PrefixV",
+            binding: Some(SourceBinding::Weight { .. }),
+        }
+    ));
+}
+
+/// An attention whose kv heads are not the cache's: 8 query heads over 1 kv head of 256 lanes
+/// read a cache the appends wrote as 2 heads.
+#[test]
+fn an_attention_of_another_kv_geometry_is_refused() {
+    let l = attn_layer_with(
+        13,
+        SubOp::attn_decode(geom(8, 1, 256), 0.0625, PREFIX_CAPACITY, AttnMask::Causal),
+    );
+    let e = refused(&l, &["AttnDecode", "1 kv heads"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::KvGeometry {
+            step: 13,
+            op: "AttnDecode",
+            kv_heads: 1,
             ..
         }
     ));

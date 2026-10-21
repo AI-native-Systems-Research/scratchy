@@ -18,7 +18,7 @@ use std::fmt;
 
 pub use buffer::DeviceBuffer;
 pub use device::{CudaDevice, DeviceError};
-pub use worker::{CudaWorker, ForwardError, WorkerError};
+pub use worker::{CudaWorker, ForwardError, KvHalf, KvPoolConfig, KvSequence, WorkerError};
 
 /// A failed CUDA runtime call: which one, its `cudaError_t`, and `cudaGetErrorString`'s text.
 #[derive(Clone, Debug, PartialEq, Eq)]

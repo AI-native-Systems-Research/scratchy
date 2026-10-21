@@ -235,6 +235,7 @@ pub static ATTN_GATE_M128: CudaTape = CudaTape {
         add(262144, 0, 3670016, 128),
     ],
     rotary: rotary(4456448, 16384),
+    kv: None,
 };
 
 /// [`attn_gate`]`(256)`: `x` 0, `n` (then `o`) 524288, `qg` 1048576, `q` 3145728, `qn` 4194304,
@@ -264,4 +265,5 @@ pub static ATTN_GATE_M256: CudaTape = CudaTape {
         add(524288, 0, 7340032, 256),
     ],
     rotary: rotary(8912896, 32768),
+    kv: None,
 };

@@ -398,3 +398,143 @@ pub fn gate_apply_reference(attn: &[u16], gate: &[u16]) -> Vec<f64> {
         .map(|(a, g)| a / (1.0 + (-g).exp()))
         .collect()
 }
+
+// ── Attention over the paged KV cache ──────────────────────────────
+//
+// The reference is f64, from the same bf16 Q, K and V the GPU read (the cache's contents read
+// back). With `s_ij = scale · Σ_d q_id k_jd`, the allowed keys `A_i = { j : j ≤ P + i, j <
+// kv_len }`, `p_ij = softmax_{j∈A_i}(s_ij)` and `ref_id = Σ_j p_ij v_jd`, every element passes
+// under
+//
+//     |gpu_id − ref_id| ≤ 2⁻⁸·|ref_id| + 2⁻⁷·Σ_j p_ij·|v_jd| + 2⁻²⁴.
+//
+// `2⁻⁸·|ref|` is the one rounding of `o` to bf16 at the store. The kernel rounds each `p` to bf16
+// before the P·V WGMMA, at most `2⁻⁸·Σ p |v|`; the other `2⁻⁸·Σ p |v|` is headroom for the score
+// error (256 bf16 products accumulated in f32), `exp2.approx` and the f32 accumulation and
+// rescales, each far smaller while `max scale · Σ_d |q k| ≤ 64` (printed by every case).
+
+/// The attention bound's relative term, `2⁻⁸`.
+pub const ATTN_REL: f64 = 1.0 / 256.0;
+/// The attention bound's `Σ p |v|` term, `2⁻⁷`.
+pub const ATTN_PV: f64 = 1.0 / 128.0;
+/// The largest `scale · Σ_d |q_id k_jd|` the bound covers.
+pub const ATTN_SCORE_MAX: f64 = 64.0;
+
+/// One attention's inputs as the reference reads them: `q [rows, q_heads · hd]` and the keys and
+/// values `[kv_len, kv_heads · hd]`, all bf16 bits; `P` and `L`.
+pub struct AttnCase<'a> {
+    pub q: &'a [u16],
+    pub k: &'a [u16],
+    pub v: &'a [u16],
+    pub q_heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub prefix_len: usize,
+    pub q_len: usize,
+    pub scale: f64,
+}
+
+/// `(ref, Σ p |v|)` for every element of the first `q_len` rows of the output `[q_len, q_heads ·
+/// hd]`, and the largest `scale · Σ_d |q k|` over the allowed scores.
+pub fn attention_reference(c: &AttnCase<'_>) -> (Vec<(f64, f64)>, f64) {
+    let (hd, qh, kvh) = (c.head_dim, c.q_heads, c.kv_heads);
+    let (q, k, v) = (widen(c.q), widen(c.k), widen(c.v));
+    let kv_len = c.prefix_len + c.q_len;
+    let hr = qh / kvh;
+    let mut out = vec![(0.0, 0.0); c.q_len * qh * hd];
+    let mut score_max = 0.0f64;
+    for i in 0..c.q_len {
+        let allowed = (c.prefix_len + i + 1).min(kv_len);
+        for g in 0..qh {
+            let kh = g / hr;
+            let qi = &q[(i * qh + g) * hd..][..hd];
+            let mut s = Vec::with_capacity(allowed);
+            for j in 0..allowed {
+                let kj = &k[(j * kvh + kh) * hd..][..hd];
+                let (mut dot, mut abs) = (0.0, 0.0);
+                for (a, b) in qi.iter().zip(kj) {
+                    dot += a * b;
+                    abs += (a * b).abs();
+                }
+                score_max = score_max.max(c.scale * abs);
+                s.push(c.scale * dot);
+            }
+            let m = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
+            let sum: f64 = e.iter().sum();
+            for d in 0..hd {
+                let (mut r, mut pv) = (0.0, 0.0);
+                for (j, ej) in e.iter().enumerate() {
+                    let p = ej / sum;
+                    let vj = v[(j * kvh + kh) * hd + d];
+                    r += p * vj;
+                    pv += p * vj.abs();
+                }
+                out[(i * qh + g) * hd + d] = (r, pv);
+            }
+        }
+    }
+    (out, score_max)
+}
+
+/// The attention's bound on an element whose reference is `r`, its `Σ p |v|` `pv`.
+pub fn attention_bound(r: f64, pv: f64) -> f64 {
+    r.abs() * ATTN_REL + pv * ATTN_PV + ROW_ABS
+}
+
+/// Compare the first `refs.len()` elements of `gpu` (rows of `cols`) with `refs`.
+pub fn compare_attention(gpu: &[u16], refs: &[(f64, f64)], cols: usize) -> Comparison {
+    let (mut max_err, mut sum_err, mut bad) = (0.0f64, 0.0f64, 0usize);
+    let (mut worst, mut worst_ratio) = ((0, 0, 0.0f64, 0.0f64, 0.0f64), -1.0f64);
+    for (idx, (&bits, &(r, pv))) in gpu.iter().zip(refs).enumerate() {
+        let g = f64::from(bf16::from_bits(bits).to_f32());
+        let bound = attention_bound(r, pv);
+        let err = (g - r).abs();
+        if !(g.is_finite() && err <= bound) {
+            bad += 1;
+        }
+        let ratio = if g.is_finite() {
+            err / bound
+        } else {
+            f64::INFINITY
+        };
+        if ratio > worst_ratio {
+            worst_ratio = ratio;
+            worst = (idx / cols, idx % cols, g, r, bound);
+        }
+        if g.is_finite() {
+            max_err = max_err.max(err);
+            sum_err += err;
+        }
+    }
+    Comparison {
+        max_abs_err: max_err,
+        mean_abs_err: sum_err / refs.len().max(1) as f64,
+        worst,
+        out_of_bound: bad,
+    }
+}
+
+/// The global slot of token `pos` of a sequence over `table`, with `block_size` slots per block.
+pub fn slot_of(table: &[u32], pos: usize, block_size: usize) -> usize {
+    table[pos / block_size] as usize * block_size + pos % block_size
+}
+
+/// Gather a sequence's first `tokens` rows of one layer's paged cache (`[num_blocks, kv_heads,
+/// block_size, hd]` bf16) into `[tokens, kv_heads · hd]`, through `table`.
+pub fn gather_paged(
+    cache: &[u16],
+    table: &[u32],
+    tokens: usize,
+    (kv_heads, block_size, hd): (usize, usize, usize),
+) -> Vec<u16> {
+    let mut out = Vec::with_capacity(tokens * kv_heads * hd);
+    for t in 0..tokens {
+        let (block, off) = (table[t / block_size] as usize, t % block_size);
+        for h in 0..kv_heads {
+            let at = ((block * kv_heads + h) * block_size + off) * hd;
+            out.extend_from_slice(&cache[at..][..hd]);
+        }
+    }
+    out
+}
