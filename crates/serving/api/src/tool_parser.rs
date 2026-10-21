@@ -424,57 +424,137 @@ fn json_value_to_tool_call(val: &serde_json::Value) -> Option<protocol::ToolCall
 // tool_choice "required"
 // ---------------------------------------------------------------------------
 
-/// ⭐ THE GRAMMAR `tool_choice: "required"` CONSTRAINS A REPLY TO (#765), as vLLM's
-/// `_get_json_schema_from_tool` does: a JSON array of at least one call, each
-/// `{"name": …, "parameters": {…}}` naming one of `tools` with that tool's own parameters
-/// schema. So the reply is a tool call by construction, whatever the model would have said, and
-/// [`RequiredToolCallsParser`] reads it.
+/// ⭐ THE GRAMMAR `tool_choice: "required"` CONSTRAINS A REPLY TO (#765), built as vLLM's
+/// `_get_json_schema_from_tools` builds it: a JSON array of at least one call, each
+/// `{"name": …, "parameters": {…}}` naming one of `tools` with that tool's own parameters schema
+/// (an empty object's for a tool that declares none).
+///
+/// A tool's `$defs` move to the array's root, where a `$ref: "#/$defs/…"` resolves (vLLM's
+/// `_get_tool_schema_defs`); nested models, as Pydantic, FastMCP and LangChain write them, would
+/// otherwise not compile. Refused, as vLLM refuses them: `$defs` that isn't an object, and two
+/// tools defining one name differently.
 pub(crate) fn required_tool_calls_schema(
     tools: &[protocol::ChatCompletionToolsParam],
-) -> serde_json::Value {
-    let calls: Vec<serde_json::Value> = (tools.iter())
-        .map(|tool| {
-            let parameters = (tool.function.parameters.as_ref())
-                .and_then(|p| serde_json::to_value(p).ok())
-                .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} }));
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "enum": [tool.function.name] },
-                    "parameters": parameters,
-                },
-                "required": ["name", "parameters"],
-            })
-        })
-        .collect();
-    serde_json::json!({ "type": "array", "minItems": 1, "items": { "anyOf": calls } })
+) -> Result<serde_json::Value, String> {
+    let mut defs = serde_json::Map::new();
+    let mut calls = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let name = &tool.function.name;
+        let mut parameters = (tool.function.parameters.as_ref())
+            .and_then(|p| serde_json::to_value(p).ok())
+            .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} }));
+        match parameters.as_object_mut().and_then(|p| p.remove("$defs")) {
+            None => {}
+            Some(serde_json::Value::Object(tool_defs)) => {
+                for (def, schema) in tool_defs {
+                    match defs.get(&def) {
+                        Some(known) if *known != schema => {
+                            return Err(format!(
+                                "tool definition '{def}' has multiple schemas, which is not \
+                                 supported"
+                            ));
+                        }
+                        _ => {
+                            defs.insert(def, schema);
+                        }
+                    }
+                }
+            }
+            Some(other) => {
+                return Err(format!(
+                    "`$defs` in the parameters of tool '{name}' must be an object, got {}",
+                    json_type_name(&other)
+                ));
+            }
+        }
+        calls.push(serde_json::json!({
+            "properties": {
+                "name": { "type": "string", "enum": [name] },
+                "parameters": parameters,
+            },
+            "required": ["name", "parameters"],
+        }));
+    }
+    let mut schema = serde_json::json!({
+        "type": "array",
+        "minItems": 1,
+        "items": { "type": "object", "anyOf": calls },
+    });
+    if !defs.is_empty() {
+        schema["$defs"] = serde_json::Value::Object(defs);
+    }
+    Ok(schema)
 }
 
-/// The parser for a `tool_choice: "required"` reply, which its grammar makes a JSON array of
-/// calls ([`required_tool_calls_schema`]), whatever tool-call format the model would use unasked.
-/// Each call reads as a Llama 3 JSON call does (`{"name", "parameters"}`); the array's own
-/// brackets and commas are never text.
-pub(crate) struct RequiredToolCallsParser;
+/// A JSON value's type, as JSON Schema names it.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// The parser for a `tool_choice: "required"` reply. Its grammar makes the reply a JSON array of
+/// calls ([`required_tool_calls_schema`]), each read as a Llama 3 JSON call is
+/// (`{"name", "parameters"}`), with the array's brackets and commas never text.
+///
+/// ⛔ BUT ONLY A REPLY IN THAT SHAPE IS READ AS ONE. A worker applies a grammar best-effort: it
+/// decodes unconstrained, with a warning, when the grammar won't compile, and the Spyre worker
+/// applies none. A reply is the grammar's only if it opens with `[` after whitespace, all the
+/// grammar allows; any other is read by `fallback`, the engine's own parser, as `"auto"` would
+/// read it, or is text when there is none. So a grammar that didn't hold costs the constraint,
+/// never the calls.
+pub(crate) struct RequiredToolCallsParser {
+    pub(crate) fallback: Option<Arc<dyn ToolCallParser>>,
+}
+
+/// Whether a reply that starts `text` is in the shape `"required"`'s grammar gives it, once its
+/// first character past whitespace has arrived.
+fn opens_a_call_array(text: &str) -> Option<bool> {
+    text.trim_start().chars().next().map(|c| c == '[')
+}
 
 impl ToolCallParser for RequiredToolCallsParser {
     fn extract_tool_calls(&self, model_output: &str) -> ExtractedToolCallInfo {
-        let mut extracted = llama_json_extract(model_output);
-        if extracted.tools_called {
-            extracted.content = None;
+        if opens_a_call_array(model_output) == Some(true) {
+            let mut extracted = llama_json_extract(model_output);
+            if extracted.tools_called {
+                extracted.content = None;
+            }
+            return extracted;
         }
-        extracted
+        match &self.fallback {
+            Some(fallback) => fallback.extract_tool_calls(model_output),
+            None => ExtractedToolCallInfo {
+                tools_called: false,
+                tool_calls: Vec::new(),
+                content: Some(model_output.to_string()),
+            },
+        }
     }
 
     fn create_streaming_state(&self) -> Box<dyn StreamingToolParserState + Send> {
-        Box::new(RequiredToolCallsStreamingState(
-            LlamaJsonStreamingState::new(),
-        ))
+        Box::new(RequiredToolCallsStreamingState::Undecided {
+            fallback: self.fallback.clone(),
+        })
     }
 }
 
-/// [`RequiredToolCallsParser`]'s stream: the Llama JSON one's calls, with no text, since all
-/// there is outside the calls is the array's punctuation.
-struct RequiredToolCallsStreamingState(LlamaJsonStreamingState);
+/// [`RequiredToolCallsParser`]'s stream. It holds the reply back until its first character past
+/// whitespace says whose it is. The grammar's array streams its calls, with no text; any other
+/// reply streams through the fallback parser, or as text.
+enum RequiredToolCallsStreamingState {
+    Undecided {
+        fallback: Option<Arc<dyn ToolCallParser>>,
+    },
+    Calls(LlamaJsonStreamingState),
+    Fallback(Box<dyn StreamingToolParserState + Send>),
+    Text,
+}
 
 impl StreamingToolParserState for RequiredToolCallsStreamingState {
     fn process_delta(
@@ -483,12 +563,30 @@ impl StreamingToolParserState for RequiredToolCallsStreamingState {
         current_text: &str,
         delta_text: &str,
     ) -> ToolParserDelta {
-        match self
-            .0
-            .process_delta(previous_text, current_text, delta_text)
-        {
-            ToolParserDelta::Content(_) => ToolParserDelta::None,
-            calls => calls,
+        match self {
+            Self::Undecided { fallback } => {
+                let decided = match opens_a_call_array(current_text) {
+                    None => return ToolParserDelta::None,
+                    Some(true) => Self::Calls(LlamaJsonStreamingState::new()),
+                    Some(false) => match fallback.take() {
+                        Some(fallback) => Self::Fallback(fallback.create_streaming_state()),
+                        None => Self::Text,
+                    },
+                };
+                *self = decided;
+                // Decided: everything so far is the decided reader's first delta.
+                self.process_delta("", current_text, current_text)
+            }
+            Self::Calls(calls) => {
+                match calls.process_delta(previous_text, current_text, delta_text) {
+                    ToolParserDelta::Content(_) => ToolParserDelta::None,
+                    delta => delta,
+                }
+            }
+            Self::Fallback(fallback) => {
+                fallback.process_delta(previous_text, current_text, delta_text)
+            }
+            Self::Text => ToolParserDelta::Content(delta_text.to_string()),
         }
     }
 }
@@ -2855,9 +2953,12 @@ mod tests {
             "required": ["command"],
         });
         let schema =
-            required_tool_calls_schema(&[tool("Bash", Some(command.clone())), tool("Read", None)]);
+            required_tool_calls_schema(&[tool("Bash", Some(command.clone())), tool("Read", None)])
+                .unwrap();
         assert_eq!(schema["type"], "array");
         assert_eq!(schema["minItems"], 1);
+        assert_eq!(schema["items"]["type"], "object");
+        assert!(schema.get("$defs").is_none(), "no tool defines any");
         let calls = schema["items"]["anyOf"].as_array().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(
@@ -2876,11 +2977,68 @@ mod tests {
         assert_eq!(calls[1]["properties"]["parameters"]["type"], "object");
     }
 
+    /// A tool's parameters with nested models, `$defs` and a `$ref` into them, as Pydantic writes
+    /// them.
+    fn moves_to_a_point() -> serde_json::Value {
+        serde_json::json!({
+            "$defs": {
+                "Point": {
+                    "type": "object",
+                    "properties": { "x": { "type": "integer" } },
+                    "required": ["x"],
+                },
+            },
+            "type": "object",
+            "properties": { "to": { "$ref": "#/$defs/Point" } },
+            "required": ["to"],
+        })
+    }
+
+    /// Each tool's `$defs` move to the array's root, where its `$ref`s resolve, as vLLM's
+    /// `_get_tool_schema_defs` moves them. Two tools defining one name alike share it; defining it
+    /// differently, or `$defs` that isn't an object, is refused.
+    #[test]
+    fn the_required_schema_hoists_each_tools_defs_to_its_root() {
+        let point = moves_to_a_point();
+        let schema = required_tool_calls_schema(&[
+            tool("Move", Some(point.clone())),
+            tool("Jump", Some(point)),
+        ])
+        .unwrap();
+        assert_eq!(
+            schema["$defs"]["Point"]["required"],
+            serde_json::json!(["x"])
+        );
+        for call in schema["items"]["anyOf"].as_array().unwrap() {
+            let parameters = &call["properties"]["parameters"];
+            assert!(parameters.get("$defs").is_none(), "{parameters}");
+            assert_eq!(parameters["properties"]["to"]["$ref"], "#/$defs/Point");
+        }
+
+        let mut other_point = moves_to_a_point();
+        other_point["$defs"]["Point"]["required"] = serde_json::json!([]);
+        let differ = [
+            tool("Move", Some(moves_to_a_point())),
+            tool("Jump", Some(other_point)),
+        ];
+        let err = required_tool_calls_schema(&differ).unwrap_err();
+        assert!(err.contains("'Point' has multiple schemas"), "{err}");
+
+        let mut listed = moves_to_a_point();
+        listed["$defs"] = serde_json::json!(["Point"]);
+        let err = required_tool_calls_schema(&[tool("Move", Some(listed))]).unwrap_err();
+        assert!(
+            err.contains("tool 'Move' must be an object, got array"),
+            "{err}"
+        );
+    }
+
     /// A whole `"required"` reply is its calls, in order, with no text: the array's brackets and
     /// commas are not content.
     #[test]
     fn a_required_reply_reads_as_its_calls() {
-        let extracted = RequiredToolCallsParser.extract_tool_calls(REQUIRED_REPLY);
+        let extracted =
+            RequiredToolCallsParser { fallback: None }.extract_tool_calls(REQUIRED_REPLY);
         assert!(extracted.tools_called);
         assert_eq!(extracted.content, None);
         let calls: Vec<(&str, serde_json::Value)> = (extracted.tool_calls.iter())
@@ -2902,15 +3060,37 @@ mod tests {
     /// pieces the reply arrives in: here, a character at a time.
     #[test]
     fn a_streamed_required_reply_streams_its_calls_and_no_text() {
-        let mut state = RequiredToolCallsParser.create_streaming_state();
-        let mut text = String::new();
+        let parser = RequiredToolCallsParser { fallback: None };
+        let (text, names, arguments) = stream_by_character(&parser, REQUIRED_REPLY);
+        assert_eq!(text, "", "no text");
+        assert_eq!(names, [(0, "Bash".to_string()), (1, "Read".to_string())]);
+        let arguments: Vec<serde_json::Value> = (arguments.iter())
+            .map(|a| serde_json::from_str(a).unwrap())
+            .collect();
+        assert_eq!(
+            arguments,
+            [
+                serde_json::json!({"command": "ls -l"}),
+                serde_json::json!({"path": "a.rs"})
+            ]
+        );
+    }
+
+    /// What `parser` streams for `reply` fed a character at a time: its text, and each call's
+    /// index and name with its arguments, each call named before its arguments.
+    fn stream_by_character(
+        parser: &dyn ToolCallParser,
+        reply: &str,
+    ) -> (String, Vec<(u32, String)>, Vec<String>) {
+        let mut state = parser.create_streaming_state();
+        let (mut current, mut text) = (String::new(), String::new());
         let mut names: Vec<(u32, String)> = Vec::new();
         let mut arguments: Vec<String> = Vec::new();
-        for c in REQUIRED_REPLY.chars() {
-            let previous = text.clone();
-            text.push(c);
-            match state.process_delta(&previous, &text, &c.to_string()) {
-                ToolParserDelta::Content(content) => panic!("text {content:?} after {previous:?}"),
+        for c in reply.chars() {
+            let previous = current.clone();
+            current.push(c);
+            match state.process_delta(&previous, &current, &c.to_string()) {
+                ToolParserDelta::Content(content) => text.push_str(&content),
                 ToolParserDelta::ToolCalls(calls) => {
                     for call in calls {
                         let index = call.index as usize;
@@ -2927,17 +3107,43 @@ mod tests {
                 ToolParserDelta::None => {}
             }
         }
-        assert_eq!(names, [(0, "Bash".to_string()), (1, "Read".to_string())]);
-        let arguments: Vec<serde_json::Value> = (arguments.iter())
-            .map(|a| serde_json::from_str(a).unwrap())
+        (text, names, arguments)
+    }
+
+    /// A reply the grammar didn't shape, as when a worker decodes unconstrained because the grammar
+    /// won't compile, or applies none (Spyre), is the engine's parser's to read, as `"auto"`
+    /// would read it, whole or streamed. With no engine parser, it is text. Either way its calls
+    /// and text are kept, never dropped as the array's punctuation would be.
+    #[test]
+    fn a_required_reply_the_grammar_did_not_shape_reads_as_auto() {
+        let native = "Let me look.<tool_call>\n{\"name\": \"Bash\", \"arguments\": \
+                      {\"command\": \"ls\"}}\n</tool_call>";
+        let hermes = get_tool_parser("hermes").unwrap();
+        let parser = RequiredToolCallsParser {
+            fallback: Some(hermes.clone()),
+        };
+        let whole = parser.extract_tool_calls(native);
+        let names: Vec<_> = (whole.tool_calls.iter())
+            .map(|tc| tc.function.name.as_str())
             .collect();
-        assert_eq!(
-            arguments,
-            [
-                serde_json::json!({"command": "ls -l"}),
-                serde_json::json!({"path": "a.rs"})
-            ]
-        );
+        assert_eq!(names, ["Bash"]);
+        assert_eq!(whole.content.as_deref(), Some("Let me look."));
+        let (text, names, _) = stream_by_character(&parser, native);
+        assert_eq!(text, "Let me look.");
+        assert_eq!(names, [(0, "Bash".to_string())]);
+
+        let bare = RequiredToolCallsParser { fallback: None };
+        let whole = bare.extract_tool_calls(native);
+        assert!(!whole.tools_called);
+        assert_eq!(whole.content.as_deref(), Some(native));
+        let (text, names, _) = stream_by_character(&bare, native);
+        assert_eq!(text, native, "streamed whole, as text");
+        assert!(names.is_empty());
+
+        // Leading whitespace doesn't decide it: the first character past it does.
+        let (text, names, _) = stream_by_character(&bare, &format!(" \n{REQUIRED_REPLY}"));
+        assert_eq!(text, "");
+        assert_eq!(names.len(), 2);
     }
 
     /// ⭐ `"required"`'s grammar, compiled by llguidance as the sampler compiles it, takes a call to
@@ -2982,7 +3188,11 @@ mod tests {
             "properties": { "command": { "type": "string" } },
             "required": ["command"],
         });
-        let schema = required_tool_calls_schema(&[tool("Bash", Some(command))]);
+        let tools = [
+            tool("Bash", Some(command)),
+            tool("Move", Some(moves_to_a_point())),
+        ];
+        let schema = required_tool_calls_schema(&tools).unwrap();
         // Where the grammar refuses `reply`: the first character it won't take, or the reply's end
         // when it won't let the reply end there. `None`: taken whole.
         let refused_at = |reply: &str| {
@@ -2998,11 +3208,18 @@ mod tests {
             // leaves to sample.
             (!guide.is_finished()).then_some(reply.len())
         };
-        let call = r#"[{"name":"Bash","parameters":{"command":"ls -l"}}]"#;
-        assert_eq!(refused_at(call), None, "{call}");
+        for call in [
+            r#"[{"name":"Bash","parameters":{"command":"ls -l"}}]"#,
+            // Through a `$ref` into the hoisted `$defs`.
+            r#"[{"name":"Move","parameters":{"to":{"x":3}}}]"#,
+            r#"[{"name":"Bash","parameters":{"command":"ls"}},{"name":"Move","parameters":{"to":{"x":1}}}]"#,
+        ] {
+            assert_eq!(refused_at(call), None, "{call}");
+        }
         for refused in [
             r#"[{"name":"Read","parameters":{"command":"ls"}}]"#,
             r#"[{"name":"Bash","parameters":{}}]"#,
+            r#"[{"name":"Move","parameters":{"to":{"y":3}}}]"#,
             "[]",
             "Sure, let me look.",
         ] {

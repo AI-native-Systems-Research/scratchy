@@ -586,14 +586,17 @@ impl AsyncEngine {
 
     /// The parser `request`'s reply is read with: under `tool_choice: "required"`, the one for
     /// the JSON its grammar makes the reply (`RequiredToolCallsParser`), with or without a parser
-    /// set on the engine; otherwise the engine's.
+    /// set on the engine, which reads any reply the grammar didn't shape; otherwise the engine's.
     fn request_tool_parser(
         &self,
         request: &protocol::ChatCompletionRequest,
     ) -> Option<Arc<dyn ToolCallParser>> {
         match request.tool_choice {
             Some(protocol::ToolChoice::Required) => {
-                Some(Arc::new(crate::tool_parser::RequiredToolCallsParser))
+                let fallback = self.tool_parser.clone();
+                Some(Arc::new(crate::tool_parser::RequiredToolCallsParser {
+                    fallback,
+                }))
             }
             _ => self.tool_parser.clone(),
         }
@@ -3456,11 +3459,12 @@ impl AsyncEngine {
         // the declared tools, so it is a tool call whatever the model would have said. It shapes
         // the whole reply, so a reply already shaped another way can't take it too.
         let guided_grammar = match (&request.tool_choice, guided_grammar) {
-            (Some(protocol::ToolChoice::Required), None) => Some(GuidedGrammar::JsonSchema {
-                schema: crate::tool_parser::required_tool_calls_schema(
-                    request.tools.as_deref().unwrap_or_default(),
-                ),
-            }),
+            (Some(protocol::ToolChoice::Required), None) => {
+                let tools = request.tools.as_deref().unwrap_or_default();
+                let schema = crate::tool_parser::required_tool_calls_schema(tools)
+                    .map_err(ServeError::Validation)?;
+                Some(GuidedGrammar::JsonSchema { schema })
+            }
             (Some(protocol::ToolChoice::Required), Some(_)) => {
                 return Err(ServeError::Validation(
                     "tool_choice \"required\" constrains the reply itself, so it can't be \
@@ -5612,7 +5616,8 @@ mod tests {
 
         // The grammar: the schema of calls to the declared tools.
         let params = engine.build_sampling_params_from_chat(&request(ToolChoice::Required, None));
-        let expected = crate::tool_parser::required_tool_calls_schema(std::slice::from_ref(&bash));
+        let expected =
+            crate::tool_parser::required_tool_calls_schema(std::slice::from_ref(&bash)).unwrap();
         assert!(
             matches!(
                 params.unwrap().guided_grammar,
@@ -5628,6 +5633,16 @@ mod tests {
             serde_json::from_value(serde_json::json!({"type": "json_object"})).unwrap();
         let both = request(ToolChoice::Required, Some(json_object));
         let err = engine.build_sampling_params_from_chat(&both).err();
+        assert!(matches!(err, Some(ServeError::Validation(_))), "{err:?}");
+
+        // A tool schema the grammar can't take (`$defs` that isn't an object) is a 400 too.
+        let mut listed = bash.clone();
+        listed.function.parameters = Some(serde_json::json!({ "$defs": ["Point"] }).into());
+        let bad_defs = protocol::ChatCompletionRequest {
+            tools: Some(vec![listed]),
+            ..request(ToolChoice::Required, None)
+        };
+        let err = engine.build_sampling_params_from_chat(&bad_defs).err();
         assert!(matches!(err, Some(ServeError::Validation(_))), "{err:?}");
 
         // Its reply is read as calls, with no tool parser set on the engine.
