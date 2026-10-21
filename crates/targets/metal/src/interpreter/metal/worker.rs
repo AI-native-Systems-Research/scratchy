@@ -951,11 +951,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // when W::ROPE_ON_READ, so pinned below like block_tables
                 // (16-byte placeholder + never bound on non-spans arches).
                 block_unrotated_flags,
-                // Written + read within the same encoder via setBuffer (not a
-                // baked dispatch address), so the lazy-pager hazard doesn't apply.
+                // Bound by no command.
                 num_tokens_u32: _,
-                num_sample_rows_u32: _,
-                sample_indices: _,
+                // The sampled rows the gather and its undoing read by baked gpuAddress — pinned
+                // below.
+                num_sample_rows_u32,
+                sample_indices,
                 // GDN persistent state pools and draft lanes — pinned by the GdnStatePool owner.
                 gdn_state_conv: _,
                 gdn_state_ssm: _,
@@ -988,6 +989,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // Span labels: bound by dispatch-baked address on rope-on-read
             // arches (slot 8 of the prefill attention), so pin like seq_used_k.
             pin(span_ids);
+            // The rows the forward samples: the lm_head slice's gather and the logits compaction
+            // bind them by dispatch-baked address, same lazy-pager hazard as the inputs.
+            pin(num_sample_rows_u32);
+            pin(sample_indices);
             // Per-KV-cache-group slot_mappings + block tables (vLLM hybrid
             // layout). One group on uniform models; full + N sliding on gemma4
             // SWA. Each is bound by dispatch-baked gpuAddress (same lazy-pager
