@@ -350,6 +350,10 @@ pub struct Model {
     /// Why the parity gate did not judge this model, where the runner skipped it on purpose.
     #[serde(default)]
     pub parity_skipped: Option<String>,
+    /// The gate's prompts that passed on near-ties, each with the logit gaps of the tokens where
+    /// scratchy's answer parted from mlx-lm's top; absent where every answer matched exactly.
+    #[serde(default)]
+    pub parity_ties: Option<BTreeMap<String, Vec<f64>>>,
     #[serde(default)]
     pub scaling_limits: Option<Limits>,
     /// Only its presence matters: whether scratchy served anything warm.
