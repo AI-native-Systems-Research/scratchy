@@ -18,23 +18,58 @@ an editor, needs the user at a terminal. Give them the exact lines to run in
 a separate terminal window, then wait until they say it's done. The agent
 runs everything else.
 
-**Two kinds of run:**
-- A **full run** is what goes on the site: a whole round of models, every
-  rung, the default engines, all of them pinned, and default reps, priming
-  and scaling. It takes hours. The default round is the MoE models
-  (qwen3.6-35b-a3b, gemma-4-26b-a4b-it, glm-4.5-air); `--models full` adds the
-  dense ones (qwen3.6-27b, gemma-4-31b-it), and `--models dense` runs those
-  alone. The default engines are oMLX and oMLX TurboQuant, and the default
-  sweeps are the prompt × answer grid at 1, 2, 4, 8 and 16 users (1, 2, 4
-  for glm-4.5-air) plus prompt length; the grid's users replace the old
-  separate users sweep. `--engines all` adds every other installed engine
-  (much longer), and `--scale-axes conc,grid,input` adds the users sweep back.
-  Each cell sends at least 4 rounds of its users count (64 requests at 16
-  users, 32 at 8), so the sweep takes up to twice as long as it did with a
-  flat 12 per cell: about 2.6 h on an M5 Max, 12 h on an M1 Max.
-- A **smoke run** checks the setup. It runs gemma-4-26b-a4b-it only, the
-  smallest model left, with one rep, no scaling and output in `/tmp`. Its
-  JSON never goes on the site, so after step 4 you're done.
+**Three kinds of run:**
+- A **quick run** is the default, and what the user means by "run the
+  benchmark" unless they say otherwise. **It asks no questions:** see
+  **Quick run** below. The script with no flags but `--unpinned`: this Mac's
+  four models (the small set below 64 GB, the large set at 64 GB), scratchy
+  alone, cold and warm, one rep, the users × prompt grid at 1, 4, 8 and 16
+  users and 64-token answers, two rounds of each users count a cell.
+  scratchy runs at its defaults on every Mac, and every cell runs: one
+  that runs out of memory is recorded as failed. The page keeps every
+  other engine's numbers, and scratchy's frozen launches, from the last full
+  run, each tagged with its date. About 40 minutes on the M3 Pro.
+- A **full run** renews every number: `--full` adds the comparison engines
+  (oMLX and oMLX TurboQuant), frozen (needs `sudo purge`), three reps, four
+  rounds of each users count a cell, and the 512- and 2048-token answers at
+  1 user (the decode-vs-answer-length curve). It takes hours; run it when the engines or the grid change, or
+  for a published study. It's pinned (`--pin`) and goes through every
+  pre-flight question in step 2.
+- A **smoke run** checks the setup: `--models gpt-oss-20b --no-scaling
+  --out-dir /tmp/metal-smoke`. Its JSON never goes on the site, so after
+  step 4 you're done.
+
+**The rounds:** one model per class, a small one for 36 GB and a large one
+for 64 GB. Sliding window: gpt-oss-20b / gpt-oss-120b-3bit. Mamba-2:
+nemotron-3-nano-30b-a3b / nemotron-3-super-120b-a12b. Gated DeltaNet:
+qwen3.6-35b-a3b / qwen3.5-122b-a10b. Dense: granite-4.2-8b / granite-4.2-30b. The large set is 2- and 3-bit (OptiQ or 3-bit), since no 4-bit 120B fits 64 GB: its numbers aren't comparable with the 4-bit small set on quality.
+`--models small`, `large` or `full` picks a set; glm-4.5-air and the gemma
+and qwen3.6-27b models run by name. The run file records the class table
+(`config.classes`), and the page's overview reads its columns from it.
+
+**Not on a 36 GB M3 Pro yet.** At scratchy's default budget it has panicked
+the kernel twice mid long prefill (#780), restarting the Mac. Don't run it
+there until #540 lands; tell the user why and stop.
+
+## Quick run
+
+Run it straight through. Don't ask about the commit, a dirty tree, the
+models or the flags: report them in the closing summary instead. Stop and
+tell the user only for:
+- **Battery:** `pmset -g batt | head -1` doesn't say `'AC Power'`. Battery
+  runs are throttled. Tell them to plug in, and wait.
+- **Something else running:** the `pgrep`/`lsof` lines in step 2 show a
+  process this skill didn't start. Ask before stopping it.
+
+Then:
+```bash
+caffeinate -dims ./scripts/bench_metal_matrix.sh --unpinned --fail-fast
+```
+and go on to step 4. In the closing summary say: the commit benchmarked and
+where it is against upstream `main`, whether the tree was dirty (the JSON
+records it as `repo.dirty`), the models run and skipped, and the run's
+length. A quick run goes on the site like a full one (step 5), unless the
+tree was dirty or the commit isn't on `main`: then say so and ask.
 
 ## 1. One-time setup (per Mac)
 
@@ -96,7 +131,10 @@ no frozen rung, so treat it like any partial run in step 5.
 shows them available, and the check prints `rule works` without asking for a
 password, or the user has chosen to run without the frozen rung.
 
-## 2. Pre-flight (every run)
+## 2. Pre-flight
+
+A quick run runs these commands and acts on them as **Quick run** above
+says, without the questions below. A full run asks them.
 
 Find the upstream remote. In a fork clone, `origin` is the fork, and its
 `main` can be well behind upstream.
@@ -152,7 +190,7 @@ lsof -nP -iTCP:8751 -sTCP:LISTEN               # the script's --port
 **Done when:** the user has chosen the commit to benchmark,
 `git status --short` prints nothing, `pmset` says `'AC Power'`, the
 `pkill`/`pgrep`/`lsof` lines leave nothing running, and you've decided on
-the `--models` flag (none for the default MoE round, or `--models full`).
+the `--models` flag (none for this Mac's set, or `--models full`).
 
 ## 3. Run
 
@@ -209,10 +247,11 @@ act on each one as it appears:
 - `skipped: needs N GB`: expected for glm-4.5-air on a Mac under 64 GB.
 - `--- mistral.rs: nothing to serve`: expected for every MoE model; it runs
   only the dense ones, since it runs out of memory on MoE GGUFs on Metal.
-- `N FAILED` on a cell, then `requests failed; skipping this server's
-  remaining cells`: that engine ran out of memory (or errored) at that size.
-  The run carries on, and the page marks the cell with ‡. Note which engine
-  and cell for the user; it's a finding, not a broken run.
+- `N FAILED` on a cell, then `requests failed`, or `timed out after 1200s`:
+  that engine ran out of memory (or errored, or was too slow) at that size.
+  The server is restarted and the next cell runs (`(server restarted)`); the
+  page marks the cell with ‡. Note which engine and cell for the user; it's
+  a finding, not a broken run. `server would not restart` ends that sweep.
 - `<engine> declined <model> — its own memory guard refused it: ...`: oMLX's
   admission guard refused to load the model outright (its dynamic ceiling
   from system-reclaimable memory — not the Metal cap, so the wired-limit
@@ -325,11 +364,14 @@ for m in d["models"]:
           "parity=" + str(m.get("parity_mlx_lm")), dict(reps))
 for x in d.get("skipped_models") or []:
     print("skipped", x["stem"], x["reason"])
-full = (c["scenarios"] == ["frozen", "cold", "warm"] and c["cold_priming_launches"] == 3
-        and c["scaling"] is not None and not c["scratchy_serve_args"]
-        and all(Counter(r["scenario"] for r in m.get("cache_ladder") or []).get("frozen") == 3
-                for m in d["models"]))
-print("scope  ", "full" if full else "PARTIAL (rungs, reps, priming, scaling or serve args not at defaults)")
+ladders = [Counter(r["scenario"] for r in m.get("cache_ladder") or []) for m in d["models"]]
+plain = c["scaling"] is not None and not c["scratchy_serve_args"]
+full = (plain and c["scenarios"] == ["frozen", "cold", "warm"] and c["cold_priming_launches"] == 3
+        and all(l.get("frozen") == 3 for l in ladders))
+quick = (plain and c["scenarios"] == ["cold", "warm"] and c["cold_priming_launches"] == 1
+         and all(l.get("cold") == 1 for l in ladders))
+print("scope  ", "full" if full else "quick" if quick else
+      "PARTIAL (rungs, reps, priming, scaling or serve args not at a quick or full run's)")
 EOF
 ```
 
@@ -348,11 +390,11 @@ A smoke run ends here.
 ## 5. Copy into the site
 
 Before copying, ask the user to confirm if any of these is true:
-- `scope` is `PARTIAL`
-- the run has fewer models than the round it ran (the three MoE models, or
-  all five with `--models full`), not counting a model skipped for memory
+- `scope` is `PARTIAL` (`quick` and `full` are both fine)
+- the run has fewer models than the round it ran (this Mac's four, or all
+  eight with `--models full`), not counting a model skipped for memory
 - `commit` isn't upstream `main`
-- any model's `parity` isn't `True`
+- any model's `parity` is `False`
 
 Never copy a smoke run, or anything under `/tmp/metal-smoke`.
 
