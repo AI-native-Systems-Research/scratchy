@@ -35,8 +35,8 @@
 
 use super::{
     EmittedOp, In, assemble_convert, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d,
-    bmm_site, check_pointwise_cols, check_pointwise_cols_df, emit_sdsc_tiled, fl,
-    op_func_from_str, pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
+    bmm_site, check_pointwise_cols, check_pointwise_cols_df, emit_sdsc_tiled, fl, op_func_from_str,
+    pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_attn, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
@@ -959,7 +959,13 @@ pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, y: u32, n_operands: u32) -
 /// rounds at its own stick, which is a no-op for a whole-stick `cols` and the fix for a
 /// sub-fp16-stick-but-whole-own-stick one (a per-row fp32 lane is 32, valid fp32, NOT a
 /// 64-multiple — `pointwise_broadcast_opspec_df`'s own note).
-pub(crate) fn pointwise_tile_op_df(rows: u32, cols: u32, y: u32, n_operands: u32, df: Df) -> TileOp {
+pub(crate) fn pointwise_tile_op_df(
+    rows: u32,
+    cols: u32,
+    y: u32,
+    n_operands: u32,
+    df: Df,
+) -> TileOp {
     let out_size = match df {
         Df::Fp16 => cols.max(1),
         Df::Fp32 => StickExtent::<Fp32>::new(cols)

@@ -1815,10 +1815,7 @@ impl Executor {
     /// simply binds that output's initial bytes into its
     /// own placement — the ops that overwrite it per step do so over these
     /// bytes, exactly as the card behaves.
-    pub fn bind_load_consts(
-        &mut self,
-        consts: &[(u32, crate::wiring::LoadConst)],
-    ) -> Result<()> {
+    pub fn bind_load_consts(&mut self, consts: &[(u32, crate::wiring::LoadConst)]) -> Result<()> {
         if self.prepared {
             bail!(
                 "bind_load_consts: session ALREADY PREPARED — load-time constants are resident, \
@@ -5252,7 +5249,7 @@ impl Executor {
             .as_ref()
             .ok_or_else(|| anyhow!("seg{} has no region", seg.get()))?;
         let tot = addr.total_size().as_u64();
-        let want = (p.size as u64).min(cap_bytes as u64);
+        let want = p.size.min(cap_bytes as u64);
         // The round-up to a flit is not optional (`Flits::from_bytes` TRUNCATES),
         // and the same two facts predict's window relies on hold here by the
         // same cargo-build guard (`audit_layout_addresses`): the offset is

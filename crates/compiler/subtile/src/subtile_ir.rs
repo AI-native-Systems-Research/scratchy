@@ -1571,9 +1571,7 @@ pub fn mint_argmax<F: RopeForm>(graph: &mut SubtileIR<F>) -> ArgmaxMint {
     }
     // 2) Insert the seven sources and widen the RESULT TAIL CHAIN to the padded
     //    width — the whole chain, per the mint's own law above.
-    graph
-        .tensors
-        .splice(n_src as usize..n_src as usize, tables);
+    graph.tensors.splice(n_src as usize..n_src as usize, tables);
     graph.num_sources += shift;
     let mut t = graph.result;
     loop {
@@ -4127,8 +4125,15 @@ mod tests {
 
         // The seven sources hold [2, 9); the old op output moved 2 -> 9; the stick is 10.
         assert_eq!(g.num_sources, 9, "seven table sources were inserted");
-        assert_eq!(g.result.0, 10, "the answer re-point: the rung's result is the idx stick");
-        assert_eq!(g.op_output, vec![TensorId(9)], "op_output moved with it (the ROW, still placed and readable by tid)");
+        assert_eq!(
+            g.result.0, 10,
+            "the answer re-point: the rung's result is the idx stick"
+        );
+        assert_eq!(
+            g.op_output,
+            vec![TensorId(9)],
+            "op_output moved with it (the ROW, still placed and readable by tid)"
+        );
         assert_eq!(
             (g.tensors[9].rows, g.tensors[9].cols),
             (1, 8),
@@ -4172,7 +4177,10 @@ mod tests {
             "the row first, then the seven tables in operand order"
         );
         assert_eq!(node.output.tensor.0, 10);
-        assert_eq!(node.output.tensor, g.result, "the stick is the graph result");
+        assert_eq!(
+            node.output.tensor, g.result,
+            "the stick is the graph result"
+        );
         for tr in node.inputs.iter().chain(std::iter::once(&node.output)) {
             assert_eq!(
                 (
@@ -4314,23 +4322,50 @@ mod tests {
         let matmul_out = TensorId(n_src + 7);
         let row = g.nodes.last().unwrap().inputs[0].tensor;
         assert_ne!(matmul_out, row, "the fixture is a two-link tail");
-        assert_eq!((g.tensors[matmul_out.index()].rows, g.tensors[matmul_out.index()].cols), (1, 8));
-        assert_eq!((g.tensors[row.index()].rows, g.tensors[row.index()].cols), (1, 8));
+        assert_eq!(
+            (
+                g.tensors[matmul_out.index()].rows,
+                g.tensors[matmul_out.index()].cols
+            ),
+            (1, 8)
+        );
+        assert_eq!(
+            (g.tensors[row.index()].rows, g.tensors[row.index()].cols),
+            (1, 8)
+        );
         // The writers' regions are UNTOUCHED — [0, vocab) exactly as before.
-        assert_eq!(g.nodes[0].output.region.cols.len, 5, "the matmul's writer region");
-        assert_eq!(g.nodes[1].output.region.cols.len, 5, "the epilogue's writer region");
-        assert_eq!(g.nodes[1].inputs[0].tensor, matmul_out, "the epilogue reads the matmul's output");
+        assert_eq!(
+            g.nodes[0].output.region.cols.len, 5,
+            "the matmul's writer region"
+        );
+        assert_eq!(
+            g.nodes[1].output.region.cols.len, 5,
+            "the epilogue's writer region"
+        );
+        assert_eq!(
+            g.nodes[1].inputs[0].tensor, matmul_out,
+            "the epilogue reads the matmul's output"
+        );
         // And the mint's argmax node reads the whole widened ROW — while the rung's
         // RESULT is the node's own stick (the answer re-point).
         let node = g.nodes.last().unwrap();
         assert_eq!(node.inputs[0].tensor, row);
         assert_eq!(node.inputs[0].region.cols.len, 8, "the whole widened row");
-        assert_eq!(g.result, node.output.tensor, "the answer re-point: the result is the stick");
         assert_eq!(
-            (g.tensors[g.result.index()].rows, g.tensors[g.result.index()].cols),
+            g.result, node.output.tensor,
+            "the answer re-point: the result is the stick"
+        );
+        assert_eq!(
+            (
+                g.tensors[g.result.index()].rows,
+                g.tensors[g.result.index()].cols
+            ),
             (1, ARGMAX_BLOCK),
             "the stick is the result, not the row"
         );
-        assert!(validate(&g).is_ok(), "the chain-widened graph must validate");
+        assert!(
+            validate(&g).is_ok(),
+            "the chain-widened graph must validate"
+        );
     }
 }

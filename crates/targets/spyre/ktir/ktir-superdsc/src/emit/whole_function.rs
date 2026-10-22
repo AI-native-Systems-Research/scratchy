@@ -1189,7 +1189,9 @@ fn convert_kind_of(
     let in_elem = elem_of(operand);
     let out_elem = op.result_type.and_then(|t| t.elem());
     match (op.op_type, in_elem, out_elem) {
-        (OpKind::ArithExtf, Some(DType::F16), Some(DType::F32)) => Ok(Some(ConvertKind::Dl16ToFp32)),
+        (OpKind::ArithExtf, Some(DType::F16), Some(DType::F32)) => {
+            Ok(Some(ConvertKind::Dl16ToFp32))
+        }
         (OpKind::ArithFptosi, Some(DType::F32), Some(DType::I32)) => {
             Ok(Some(ConvertKind::Fp32ToInt32))
         }
@@ -1286,9 +1288,10 @@ fn program_equal_masks(f: &IRFunction<'static>) -> Result<EqualMasks, Error> {
     {
         let Some(res) = op.result else { continue };
         // THE PREDICATE IS THE FUNCTION: ordered equality is `OpFunc::Equal`'s own semantics.
-        let oeq = op.attributes.iter().any(|(k, v)| {
-            matches!((k, v), (AttrKey::Predicate, Attr::Str(s)) if *s == "oeq")
-        });
+        let oeq = op
+            .attributes
+            .iter()
+            .any(|(k, v)| matches!((k, v), (AttrKey::Predicate, Attr::Str(s)) if *s == "oeq"));
         if !oeq {
             continue;
         }
@@ -1296,10 +1299,7 @@ fn program_equal_masks(f: &IRFunction<'static>) -> Result<EqualMasks, Error> {
         // ⛔ EXACTLY ONE READER, AND IT IS THE RETYPE — see the seal above.
         let mut consumers = deep.iter().copied().filter(|o| o.operands.contains(&res));
         let Some(u) = consumers.next() else { continue };
-        if consumers.next().is_some()
-            || u.op_type != OpKind::ArithUitofp
-            || u.operands != [res]
-        {
+        if consumers.next().is_some() || u.op_type != OpKind::ArithUitofp || u.operands != [res] {
             continue;
         }
         // ⛔ THE RETYPE'S TARGET IS F16 — the device op's wire result is the fp16 0/1 tensor.
@@ -2771,7 +2771,7 @@ pub fn lower_function(
     // `OpFunc::Equal` is ONE op and KTIR spells it as two (`cmpf` + `uitofp`), so the comparison
     // is chain-interior and the RETYPE is the terminal this walk lowers. See
     // [`program_equal_masks`].
-    let equal_masks = program_equal_masks(f)?;    // ⭐⭐⭐ THE GATHERS THE PROGRAM STATES, read ONCE and from [`gathers_of`] — the same joins the
+    let equal_masks = program_equal_masks(f)?; // ⭐⭐⭐ THE GATHERS THE PROGRAM STATES, read ONCE and from [`gathers_of`] — the same joins the
     // per-`Program` door's `gather_of` makes, so the two doors cannot disagree about which parameter
     // is the table or which is the index. A program with ONE indirect tile reads identically to
     // `gather_of`; a program with SEVERAL is either the unrolled-sweep shape (every tile over the
@@ -2868,7 +2868,10 @@ pub fn lower_function(
         // below). Checked before the 1:1 map, which has no `ArithUitofp` arm — an unfolded retype
         // falls to the by-name refusal, correctly.
         let equal = (op.op_type == OpKind::ArithUitofp)
-            .then(|| op.result.and_then(|r| equal_masks.by_retype.get(&r).copied()))
+            .then(|| {
+                op.result
+                    .and_then(|r| equal_masks.by_retype.get(&r).copied())
+            })
             .flatten();
         // A dtype-convert cast, 1:1 in (op kind, element pair) — see [`convert_kind_of`]. `Err` for
         // an `extf`/`fptosi` whose pair is outside the two recipes (the named refusal lives there);
@@ -3860,11 +3863,15 @@ fn emit_one(
                 },
             )?
         }
-        Program::Elementwise(e) => {
-            super::lower_ktir_to_superdsc::elementwise_df(
-                name, e, per_op, bcast, df, sym_id_base, layout,
-            )?
-        }
+        Program::Elementwise(e) => super::lower_ktir_to_superdsc::elementwise_df(
+            name,
+            e,
+            per_op,
+            bcast,
+            df,
+            sym_id_base,
+            layout,
+        )?,
         Program::Transpose => {
             super::lower_ktir_to_superdsc::transpose(name, per_op, sym_id_base, layout)?
         }

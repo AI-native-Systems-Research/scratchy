@@ -66,10 +66,7 @@ fn an_untied_dense_lm_head_admits_the_device_argmax() {
     // embedding bank, no tie fact anywhere — and the tail admits. #698 refused
     // exactly this shape; the spliced kernel has no gather link to demand a tie.
     assert!(
-        tail(
-            vec![matmul(GemmWeight::Dense, 2)],
-            0,
-        ),
+        tail(vec![matmul(GemmWeight::Dense, 2)], 0,),
         "an untied dense lm-head admits the device argmax — the tie conjunct is gone"
     );
 }
@@ -77,10 +74,7 @@ fn an_untied_dense_lm_head_admits_the_device_argmax() {
 #[test]
 fn an_fp8_dynamic_lm_head_does_not_admit() {
     assert!(
-        !tail(
-            vec![matmul(GemmWeight::Fp8Dynamic, 3)],
-            0,
-        ),
+        !tail(vec![matmul(GemmWeight::Fp8Dynamic, 3)], 0,),
         "an fp8-dynamic tail stages its scale as the matmul's third operand — no mint"
     );
 }

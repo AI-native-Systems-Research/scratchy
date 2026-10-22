@@ -1012,9 +1012,7 @@ pub fn argmax_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType
         ),
         // sixtyfour: [1, BLOCK] of 64.0 — the ONLY fp32 table.
         (
-            (0..block)
-                .flat_map(|_| 64.0f32.to_le_bytes())
-                .collect(),
+            (0..block).flat_map(|_| 64.0f32.to_le_bytes()).collect(),
             scratchy_tensors::DType::F32,
             [1, block],
         ),

@@ -8,7 +8,7 @@
 use ktir_superdsc::ktir_node::Program;
 use scratchy_subtile::lower::{GemmWeight, InputRef, OpDesc};
 use scratchy_subtile::subtile_ir::{
-    argmax_pad_vocab, lower_region, mint_argmax, SourceShape, SubOp,
+    SourceShape, SubOp, argmax_pad_vocab, lower_region, mint_argmax,
 };
 use scratchy_triton_splice::lower as splice_lower;
 
@@ -56,7 +56,11 @@ fn the_minted_argmax_lowers_through_the_splice_like_every_other_kernel() {
         9,
         "the compiled program takes the nine pointer parameters"
     );
-    assert_eq!(k.func.grid, (1, 1, 1), "one work item: the whole row is one tile");
+    assert_eq!(
+        k.func.grid,
+        (1, 1, 1),
+        "one work item: the whole row is one tile"
+    );
 
     // The buffer pairing: the tape's real tensor indices, the operand prefix,
     // the output LAST — the widened row (renumbered to 9), the seven minted table

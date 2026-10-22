@@ -161,9 +161,14 @@ fn the_stimulus_tie_discriminates() {
     // THE OFFSET ROW itself: 0.0 on the real lanes (x + 0 exact), -inf on the pads --
     // the host obligation that carries the pad law.
     let padoff = input_row(&f, "padoff_ptr");
-    assert_eq!(padoff.len(), row.len(), "the offset row covers the whole padded row");
+    assert_eq!(
+        padoff.len(),
+        row.len(),
+        "the offset row covers the whole padded row"
+    );
     assert!(
-        padoff[..v].iter().all(|&x| x == 0.0) && padoff[v..].iter().all(|&x| x == f64::NEG_INFINITY),
+        padoff[..v].iter().all(|&x| x == 0.0)
+            && padoff[v..].iter().all(|&x| x == f64::NEG_INFINITY),
         "the offset row is 0.0 on the real lanes and -inf on the pads (the pad law the \
          kernel adds before its first max)"
     );

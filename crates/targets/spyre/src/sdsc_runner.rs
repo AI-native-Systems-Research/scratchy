@@ -150,7 +150,7 @@ impl SuperDscSession {
     /// prepare, resident like a weight (each is a function of the graph
     /// alone); a session that binds none passes an empty slice, and every
     /// borrowing session gets the owner's copy through the seg1 alias.
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn new(
         code: &'static crate::bundle_code::BundleCode<'static>,
         vocab: usize,
@@ -758,7 +758,7 @@ impl SuperDscSession {
         id: crate::bundle_code::PlaceId,
         cap_bytes: usize,
     ) -> Result<Vec<u8>> {
-        Ok(self.exec.read_tensor_raw(id, cap_bytes)?)
+        self.exec.read_tensor_raw(id, cap_bytes)
     }
 
     /// Zero a whole tensor segment ON THE DEVICE, without a host mirror of it.

@@ -34,16 +34,22 @@ fn node_of(name: &str) -> ktir_superdsc::ktir_node::KtirNode {
         .unwrap_or_else(|| panic!("`{name}` is not a configuration"));
     // This test drives BOTH doors, so a doorless row cannot run here by construction.
     let program = door.unwrap_or_else(|| panic!("`{name}` has no door kind to drive"));
-    let src = std::fs::read_to_string(&kspec.file).map_err(|e| format!("read: {e}")).unwrap();
+    let src = std::fs::read_to_string(&kspec.file)
+        .map_err(|e| format!("read: {e}"))
+        .unwrap();
     let mut tt =
         triton_frontend::codegen::compile(&src, &kspec, triton_frontend::target::Target::spyre())
             .map_err(|e| format!("codegen: {e}"))
             .unwrap();
-    triton_frontend::opt::make_ttir(&mut tt).map_err(|e| format!("make_ttir: {e}")).unwrap();
+    triton_frontend::opt::make_ttir(&mut tt)
+        .map_err(|e| format!("make_ttir: {e}"))
+        .unwrap();
     let mut m = triton_ktir::from_ttir::convert(&tt)
         .map_err(|e| format!("from_ttir: {e}"))
         .unwrap();
-    triton_ktir::make_ktir(&mut m, &grid).map_err(|e| format!("make_ktir: {e}")).unwrap();
+    triton_ktir::make_ktir(&mut m, &grid)
+        .map_err(|e| format!("make_ktir: {e}"))
+        .unwrap();
     triton_ktir::passes::to_ktir::run(&mut m, &grid)
         .map_err(|e| format!("to_ktir: {e}"))
         .unwrap();

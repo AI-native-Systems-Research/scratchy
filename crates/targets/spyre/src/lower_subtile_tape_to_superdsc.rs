@@ -3246,9 +3246,7 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
     let off_f16_sticks: std::collections::HashSet<u64> = ir
         .nodes
         .iter()
-        .filter(|n| {
-            !crate::lower_subtile_tape_to_ktir::node_output_on_f16_stick(n, ir)
-        })
+        .filter(|n| !crate::lower_subtile_tape_to_ktir::node_output_on_f16_stick(n, ir))
         .map(|n| n.output.tensor.index() as u64)
         .collect();
     for node in &ir.nodes {
@@ -3583,9 +3581,7 @@ fn teacher_forced_walk<F: RopeForm>(
     let off_f16_sticks: std::collections::HashSet<u64> = ir
         .nodes
         .iter()
-        .filter(|n| {
-            !crate::lower_subtile_tape_to_ktir::node_output_on_f16_stick(n, ir)
-        })
+        .filter(|n| !crate::lower_subtile_tape_to_ktir::node_output_on_f16_stick(n, ir))
         .map(|n| n.output.tensor.index() as u64)
         .collect();
     let mut rows: Vec<TeacherForcedRow> = Vec::new();
@@ -4149,8 +4145,7 @@ pub fn numeric_gate<F: RopeForm>(
     // with its own initial bytes at every consumer (measured: the argmax
     // mint's widened row read back as its staged zeros, golden idx 0 against
     // a true argmax of 12358 on both legs).
-    let load_consts = crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir)
-        .map_err(|e| e.0)?;
+    let load_consts = crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir).map_err(|e| e.0)?;
     let load_const_tids: std::collections::HashSet<u32> =
         load_consts.iter().map(|&(tid, _)| tid).collect();
     let weights_ref = emu_weights.clone();

@@ -2371,7 +2371,12 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             let pad_v = scratchy_subtile::subtile_ir::argmax_pad_vocab(*vocab);
             let nb = pad_v / scratchy_subtile::subtile_ir::ARGMAX_BLOCK;
             for p in [
-                "logits_ptr", "bramp_ptr", "lramp_ptr", "binc_ptr", "linc_ptr", "ones_ptr",
+                "logits_ptr",
+                "bramp_ptr",
+                "lramp_ptr",
+                "binc_ptr",
+                "linc_ptr",
+                "ones_ptr",
                 "padoff_ptr",
             ] {
                 signature.insert(
@@ -2395,7 +2400,10 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("V", Val::Int(i128::from(*vocab)))?;
             ce("PAD_V", Val::Int(i128::from(pad_v)))?;
             ce("NB", Val::Int(i128::from(nb)))?;
-            ce("BLOCK", Val::Int(i128::from(scratchy_subtile::subtile_ir::ARGMAX_BLOCK)))?;
+            ce(
+                "BLOCK",
+                Val::Int(i128::from(scratchy_subtile::subtile_ir::ARGMAX_BLOCK)),
+            )?;
         }
         (op, entry) => {
             return Err(format!(
@@ -2774,7 +2782,10 @@ pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
         return Ok(None);
     }
     let row = row(&node.op);
-    let TritonKernelRow::Spliced { src, file, entry, .. } = &row else {
+    let TritonKernelRow::Spliced {
+        src, file, entry, ..
+    } = &row
+    else {
         return Ok(None);
     };
     let spec = kernel_spec(node, ir, file, entry)?;
@@ -2838,7 +2849,7 @@ fn df_of_stated_type(param: &str, t: &triton_frontend::ttir::Type) -> Result<Df,
                  device format — the placement would be sized at some other format's bytes and \
                  the footprint guard would then compare an access against a fiction. Give the \
                  buffer a dtype the device has (f16, bf16, f32, f8E4M3FN, i32)."
-            ))
+            ));
         }
     })
 }

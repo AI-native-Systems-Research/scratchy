@@ -162,11 +162,14 @@ pub(crate) fn collect_view_shapes(
             // `[1, 65536]` spans 131072 bytes but the tensor holds only 102400). An
             // allocation must hold EVERY view that addresses it; the widest is the
             // safe stage, and over-allocation is never wrong.
-            shapes.entry(tid).and_modify(|old| {
-                if shape.iter().product::<usize>() > old.iter().product::<usize>() {
-                    *old = shape.clone();
-                }
-            }).or_insert(shape);
+            shapes
+                .entry(tid)
+                .and_modify(|old| {
+                    if shape.iter().product::<usize>() > old.iter().product::<usize>() {
+                        *old = shape.clone();
+                    }
+                })
+                .or_insert(shape);
         }
         for rg in op.regions {
             collect_view_shapes(rg, arg_to_tensor, shapes);
