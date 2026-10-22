@@ -28,7 +28,8 @@ use objc2_metal::{
 use crate::specialized_pipeline_cache::SpecializedPipelineCache;
 
 use super::forward::{
-    Deferral, DeviceInputInto, ForwardError, ForwardInputs, ForwardReads, InFlight,
+    CommitFeedback, Deferral, Delivered, DeviceInputInto, ForwardError, ForwardInputs,
+    ForwardReads, InFlight,
 };
 use super::lowered::{LoweredMetalTape, ModelSources};
 use super::pipelines::SpecializedPipelines;
@@ -1232,7 +1233,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             if event.signaledValue() < before {
                 queue.waitForEvent_value(ProtocolObject::from_ref(&**event), before);
             }
-            let error = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let error = std::sync::Arc::new(CommitFeedback::default());
             let feedback = commit_options(&error);
             let cb_protocol: &ProtocolObject<dyn ::objc2_metal::MTL4CommandBuffer> = &cb;
             let mut cb_array = [NonNull::from(cb_protocol)];
@@ -1781,16 +1782,17 @@ impl<W: CanonicalParams> Onto<'_, W> {
     }
 }
 
-/// Commit options for ONE command buffer, whose feedback handler records that command buffer's GPU
-/// execution error (e.g. kIOGPUCommandBufferCallbackErrorOutOfMemory) in `error`. It is checked after
-/// the wait — a silently-failed command buffer otherwise produces all-zero outputs and degenerate
-/// logits (the macOS 26.5.1 Qwen3.5-MoE "!!!!" failure mode) — and a slot of its own means a later
-/// command buffer's error can neither be taken for it nor consumed by it.
+/// Commit options for ONE command buffer, whose feedback handler delivers how that command buffer
+/// went into `feedback`: its GPU execution error (e.g. kIOGPUCommandBufferCallbackErrorOutOfMemory),
+/// or that it had none. Every wait waits for it — a silently-failed command buffer otherwise
+/// produces all-zero outputs and degenerate logits (the macOS 26.5.1 Qwen3.5-MoE "!!!!" failure
+/// mode), and the handler is not ordered before the event the queue signals — and one of its own
+/// means a later command buffer's error can neither be taken for it nor consumed by it.
 fn commit_options(
-    error: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    feedback: &std::sync::Arc<CommitFeedback>,
 ) -> objc2::rc::Retained<objc2_metal::MTL4CommitOptions> {
     let options = objc2_metal::MTL4CommitOptions::new();
-    let err_slot = std::sync::Arc::clone(error);
+    let err_slot = std::sync::Arc::clone(feedback);
     let block = block2::RcBlock::new(
         move |feedback: std::ptr::NonNull<
             objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4CommitFeedback>,
@@ -1823,7 +1825,9 @@ fn commit_options(
                         unsafe { objc2::msg_send![ui_obj, description] };
                     eprintln!("[scratchy-target-metal] GPU COMMIT ERROR userInfo: {desc}");
                 }
-                *err_slot.lock().expect("commit_error mutex") = Some(msg);
+                err_slot.deliver(Delivered::Err(msg));
+            } else {
+                err_slot.deliver(Delivered::Ok);
             }
         },
     );
@@ -2897,7 +2901,8 @@ mod tests {
         let event = pool.device.newSharedEvent().expect("shared event");
         event.setSignaledValue(2);
         let failed = |value| {
-            let error = Arc::new(Mutex::new(Some(format!("command buffer {value} failed"))));
+            let error = Arc::new(CommitFeedback::default());
+            error.deliver(Delivered::Err(format!("command buffer {value} failed")));
             InFlight {
                 event: event.clone(),
                 value,
@@ -3014,6 +3019,7 @@ mod tests {
             stride: 2,
             len: 2,
             selector: ((*picked).clone(), 0),
+            variants: 3,
             to: crate::select_rows::SelectInto::Input(DeviceInputInto::InputIds),
             at: size_of::<u32>(),
         }];

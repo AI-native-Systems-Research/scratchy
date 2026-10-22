@@ -15680,6 +15680,7 @@ pub fn emit_model(
             num_tokens: u64,
         ) -> crate::__gpu::OwnedTensor {
             unsafe { forward_with_metal_followup(wm, ctx, device, num_tokens, None) }
+                .unwrap_or_else(|e| ::core::panic!("{e}"))
         }
 
         /// The runtime inputs `ctx` carries for a forward of `num_tokens` tokens, handed to `run`:
@@ -15956,7 +15957,7 @@ pub fn emit_model(
             device: &mut crate::__gpu::GpuDevice,
             num_tokens: u64,
             followup: ::core::option::Option<::scratchy_forward_compiler::MetalForwardFollowup<'_>>,
-        ) -> crate::__gpu::OwnedTensor {
+        ) -> ::core::result::Result<crate::__gpu::OwnedTensor, ::scratchy_forward_compiler::GpuExecutionFailed> {
             let pool = resident_metal_pool(wm, ctx, device);
             // A guest's slots are its host's, which may be sparse: the host reads none of them.
             assert!(
@@ -16056,7 +16057,17 @@ pub fn emit_model(
                     tail_adapter,
                 )
             })
-            .expect("MetalWorkerPool::forward")
+            // A command buffer the GPU failed (an out-of-memory, say) fails this step, not the
+            // worker thread: the executor fails its requests and schedules again. Any other error
+            // is an invariant the forward broke (no bucket fits, a block table of the wrong width,
+            // KV not mapped), which still stops the server.
+            .map_err(|e| match e {
+                ::scratchy_target_metal::interpreter::metal::ForwardError::ExecutionFailed(_) => {
+                    ::scratchy_forward_compiler::GpuExecutionFailed(e.to_string())
+                }
+                // Its `Display` names `MetalWorkerPool::forward` already.
+                other => ::core::panic!("{other}"),
+            })
         }
 
         /// One forward encoded onto `encoder` — another model's command buffer, after that model's

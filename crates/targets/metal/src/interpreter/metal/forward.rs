@@ -280,12 +280,60 @@ pub enum DeviceInputInto {
     GdnSteps,
 }
 
+/// What one command buffer's commit feedback said, once it has said it. The handler sets it once
+/// and no wait consumes it, so every wait on the command buffer, and only on it, sees the same.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delivered {
+    Ok,
+    Err(String),
+}
+
+/// One command buffer's commit feedback, which its handler delivers on a thread of Metal's own,
+/// not ordered against the shared event the queue signals after the command buffer. A wait that
+/// read it the moment that event fired could find it not yet delivered, and take a failed command
+/// buffer for a finished one.
+#[derive(Default)]
+pub struct CommitFeedback {
+    delivered: std::sync::Mutex<Option<Delivered>>,
+    arrived: std::sync::Condvar,
+}
+
+impl CommitFeedback {
+    /// Delivered: the handler's word, once.
+    pub fn deliver(&self, d: Delivered) {
+        *self.delivered.lock().expect("commit feedback mutex") = Some(d);
+        self.arrived.notify_all();
+    }
+
+    /// What it said, waiting for the handler to say it.
+    fn wait(&self) -> Delivered {
+        let started = std::time::Instant::now();
+        let mut d = self.delivered.lock().expect("commit feedback mutex");
+        loop {
+            if let Some(d) = d.as_ref() {
+                return d.clone();
+            }
+            let (next, timeout) = (self.arrived)
+                .wait_timeout(d, std::time::Duration::from_secs(60))
+                .expect("commit feedback mutex");
+            d = next;
+            if timeout.timed_out() && d.is_none() {
+                eprintln!(
+                    "[scratchy-target-metal] a command buffer's commit feedback is {:?} late; \
+                     waiting for it",
+                    started.elapsed(),
+                );
+            }
+        }
+    }
+}
+
 /// A committed command buffer the host has not waited for.
 pub struct InFlight {
     pub(super) event: super::__re::SharedEvent,
     pub(super) value: u64,
-    /// Its GPU execution error, recorded by its own commit feedback handler.
-    pub(super) error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Its GPU execution error, or none, delivered by its own commit feedback handler.
+    pub(super) error: std::sync::Arc<CommitFeedback>,
     /// The commit options carrying that handler, kept until the command buffer is done.
     pub(super) _feedback: objc2::rc::Retained<objc2_metal::MTL4CommitOptions>,
     /// Every registered kernel-time heap's cursor at this command buffer's
@@ -307,11 +355,12 @@ unsafe impl Sync for InFlight {}
 static KERNEL_TIME_CB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl InFlight {
-    /// Block until the GPU is done with it. `Err`: the execution error its commit feedback reported
-    /// — a failed command buffer otherwise yields all-zero outputs silently.
+    /// Block until the GPU is done with it and its commit feedback has said how it went. `Err`: the
+    /// execution error that feedback reported — a failed command buffer otherwise yields all-zero
+    /// outputs silently.
     pub fn wait(&self) -> Result<(), ForwardError> {
         crate::mtl4_dispatch::wait_drained(&self.event, self.value);
-        if let Some(msg) = &*self.error.lock().expect("commit error mutex") {
+        if let Delivered::Err(msg) = self.error.wait() {
             eprintln!("[scratchy-target-metal] GPU commit error surfaced: {msg}");
             return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
         }
