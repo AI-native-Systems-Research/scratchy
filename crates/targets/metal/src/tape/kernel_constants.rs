@@ -479,12 +479,13 @@ impl From<TqCodebookPart> for Vec<ConstantValue> {
             TqCodebookPart::Signs(head_dim) => {
                 let dim = head_dim.get() as usize;
                 assert!(
-                    dim % 32 == 0 && dim / 32 <= TqCodebookPart::SIGN_WORDS,
+                    dim.is_multiple_of(32) && dim / 32 <= TqCodebookPart::SIGN_WORDS,
                     "a TurboQuant head of {dim}: whole sign words, at most {}",
                     TqCodebookPart::SIGN_WORDS
                 );
                 let signs = random_diagonal_sign(dim, crate::turboquant::TQ_CODEBOOK_SEED);
-                let words = signs.chunks_exact(32).map(|w| {
+                let (words, _) = signs.as_chunks::<32>();
+                let words = words.iter().map(|w| {
                     (w.iter().enumerate())
                         .fold(0u32, |word, (b, &s)| word | u32::from(s < 0.0) << b)
                 });
