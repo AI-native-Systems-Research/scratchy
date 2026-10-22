@@ -453,9 +453,15 @@ const GEMV_SHAPES: &[(u32, u32, &str)] = &[
     (1, 8, "one column"),
 ];
 
-/// Shapes the GEMV launcher refuses: `k` zero or off the 8-wide vector, `n` zero, `n` above
-/// `INT_MAX` (refused before any pointer is touched, so its buffers are small).
-const GEMV_REFUSED: &[(u32, u32)] = &[(1024, 0), (1024, 100), (0, 1024), (2_147_483_648, 1024)];
+/// Shapes the GEMV launcher refuses: `k` zero or off the 8-wide vector, `n` zero, `n` or `k`
+/// above `INT_MAX` (refused before any pointer is touched, so its buffers are small).
+const GEMV_REFUSED: &[(u32, u32)] = &[
+    (1024, 0),
+    (1024, 100),
+    (0, 1024),
+    (2_147_483_648, 1024),
+    (8, 2_147_483_648),
+];
 
 /// Launch the GEMV on the default stream, then wait for it.
 ///

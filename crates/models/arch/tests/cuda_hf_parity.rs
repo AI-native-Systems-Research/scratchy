@@ -33,9 +33,8 @@
 //!   near-tie, the max |difference| printed). A one-token prompt is skipped, saying so.
 //!
 //! The thresholds are the issues' (AI-native-Systems-Research/scratchy#816 and #830), read not
-//! run. Built
-//! only under `nvcc` and `qwen3.5-0.8b`, and needs an sm_90 GPU and the goldens: a missing goldens
-//! dir fails with the command that makes it, never skips. `prompt_1_one_shot` is one forward
+//! run. Built only under `nvcc` and `qwen3.5-0.8b`, and needs an sm_90 GPU and the goldens: a
+//! missing goldens dir fails with the command that makes it, never skips. `prompt_1_one_shot` is one forward
 //! alone, and `prompt_1_decode` a prefill and 7 decodes alone, for the sanitizers. Every check
 //! prints its line before a test fails.
 

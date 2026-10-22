@@ -23,11 +23,13 @@
 //     `((block · kv_heads + kvh) · 64 + slot) · 256 + 8l`. The dot product sums the lane's 8
 //     products in ascending order with `fmaf`, then a fixed xor butterfly (16, 8, 4, 2, 1) gives
 //     every lane the same sum.
-//   - The online softmax runs in f32 with `c = scale · log2(e)`: `m_new = max(m, s·c)`; the
-//     rescale is taken as a difference first, `r = (m == m_new) ? 1 : exp2(m − m_new)` (#812's
-//     fast-math lesson: an unchanged max rescales by exactly 1, never by an `exp2` of a rounded
-//     difference); `p = exp2(s·c − m_new)`; `l = l·r + p`; `o[i] = o[i]·r + p·v[i]`, V's 16 bytes
-//     loaded from the same cache row. `p` stays f32, as in metal's decode.
+//   - The online softmax runs in f32 with `c = scale · log2(e)`. The score `s = dot · c` is rounded
+//     on its own (`__fmul_rn`), so fast-math cannot contract it into `fma(dot, c, −m_new)` and the
+//     max key's `p` is exactly 1. `m_new = max(m, s)`; the rescale is taken as a difference first,
+//     `r = (m == m_new) ? 1 : exp2(m − m_new)` (#812's fast-math lesson: an unchanged max rescales
+//     by exactly 1, never by an `exp2` of a rounded difference); `p = exp2(s − m_new)`;
+//     `l = l·r + p`; `o[i] = o[i]·r + p·v[i]`, V's 16 bytes loaded from the same cache row. `p`
+//     stays f32, as in metal's decode.
 //   - Merge: each warp writes `(m, l, o[256])` to static shared memory (8 × 258 f32 = 8,256 bytes,
 //     under 48 KiB, so no attribute and no one-time setup). After `__syncthreads`, thread d (one
 //     per output lane) merges warps 0..7 in ascending order: `M = max m_w`, `L = Σ l_w · r_w`,
@@ -139,7 +141,9 @@ attn_decode_bf16_kernel(const __nv_bfloat16* __restrict__ q,
         for (int offset = 16; offset > 0; offset >>= 1) {
             dot += __shfl_xor_sync(0xffffffffu, dot, offset);
         }
-        const float s = dot * c;
+        // `__fmul_rn` is never contracted into the `exp2f` argument below: a contracted
+        // `fma(dot, c, −m_new)` would give the max key `exp2(rounding error)`, not exactly 1.
+        const float s = __fmul_rn(dot, c);
         const float m_new = fmaxf(m, s);
         // The first key: the empty state has no sum to rescale. An unchanged max: exactly 1.
         const float r = (m == m_new) ? 1.0f : (m == -INFINITY ? 0.0f : exp2f(m - m_new));

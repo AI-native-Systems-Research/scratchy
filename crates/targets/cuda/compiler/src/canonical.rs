@@ -463,7 +463,8 @@ pub enum RopeShapeRule {
     RowsNotTokens { tokens: u32 },
 }
 
-/// Which rule an attention's shape breaks: the prefill kernel's, stated at expansion time.
+/// Which rule an attention's shape breaks: the decode or prefill kernel's (the one its rows
+/// choose), stated at expansion time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttnShapeRule {
     /// `rows` is neither 1 (the decode kernel's) nor a non-zero multiple of `multiple`, the query

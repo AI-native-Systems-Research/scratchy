@@ -6,8 +6,8 @@
 //! matrix uniform in ±1/√K, a norm's zero-centred gain in ±0.1, a GDN layer's packed f32 bundle
 //! in the ranges the GDN kernel tests use, the embedding table's rows uniform in ±1/32 (which the
 //! tied lm_head reads too, a `[vocab, hidden]` matrix, so it is filled as a matrix of `k =
-//! hidden`: ±1/√1024). The input is token ids, uniform over the vocabulary and seeded; padding rows are id
-//! 0. Checks:
+//! hidden`: ±1/√1024). The input is token ids, uniform over the vocabulary and seeded; padding
+//! rows are id 0. Checks:
 //!
 //! - (a) the worker takes every tape, and its arena is the largest tape's;
 //! - (b) a fresh 300-token forward in the m=512 bucket gives finite logits on every real row;
@@ -32,6 +32,9 @@
 //!   308-token forward: finite, cosine ≥ 0.999 (a bound, not bits: the decode runs the GEMV and
 //!   the decode attention, the prefill the tiled GEMM and the prefill attention); the last
 //!   decode's lm_head GEMV within the GEMM bound of f64 over every column;
+//!   (k, teacher-forced) each decode one step off the one-shot trajectory (300 + i prefilled fresh,
+//!   then one decode at 300 + i) at cosine ≥ 0.999; (k-diag) prints, per decode, every KV layer's
+//!   K/V and every GDN layer's state against the one-shot's, for the chain and teacher-forced;
 //! - (l) the prefill and 8 decodes repeated in disjoint blocks and slot are bit-identical;
 //! - (m) the 8 decodes leave the cache at positions 0..300 bit-unchanged;
 //! - (n) decodes at P = 319 and P = 320 (a new block) are finite and within (k)'s cosine;
@@ -836,6 +839,40 @@ fn k_decodes_agree_with_one_shot_rows() {
     assert!(
         pass,
         "a decode is out of agreement with the one-shot row: see the lines above"
+    );
+}
+
+/// (k), teacher-forced: for each of the 8 positions 300 + i, a fresh prefill of 300 + i tokens,
+/// then one decode at 300 + i, against row 300 + i of one 308-token forward in disjoint blocks and
+/// slot. Each decode is one step off the one-shot trajectory, so the difference is one step's (the
+/// GEMV and the decode attention against the tiled GEMM and the prefill attention): every logit
+/// finite and cosine ≥ 0.999 at every step, the max |difference| printed. (k)'s chain compounds
+/// those steps through the cache and GDN state; this isolates one.
+#[test]
+fn k_teacher_forced_decodes_agree_with_one_shot_rows() {
+    let r = rig();
+    let mut worker = r.worker();
+    let rows = sequence_rows((Q + DECODES) as usize);
+    let one_shot = forward(&mut worker, 512, &rows, 0, SEAT_B).expect("308 tokens in one forward");
+    let mut pass = true;
+    for i in 0..DECODES as usize {
+        let p = Q as usize + i;
+        forward(&mut worker, 512, &rows[..p], 0, SEAT_A).expect("the prefill");
+        let row = forward(&mut worker, 1, &[rows[p]], p as u32, SEAT_A).expect("the decode");
+        let want = &one_shot[p * VOCAB..][..VOCAB];
+        let (cos, diff, finite) = (cosine(&row, want), max_diff(&row, want), all_finite(&row));
+        let ok = finite && cos >= 0.999;
+        eprintln!(
+            "(k teacher-forced) {p} tokens prefilled, decode at {p}, against row {p} of one \
+             308-token forward: finite={finite} cosine={cos:.6} (need >= 0.999) \
+             max|diff|={diff:e} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "a teacher-forced decode is out of agreement with the one-shot row: see the lines above"
     );
 }
 
