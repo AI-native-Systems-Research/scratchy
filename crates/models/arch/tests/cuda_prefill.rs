@@ -30,10 +30,11 @@
 //!   266 + 3 allocations at setup and none across one prefill and 8 decodes;
 //! - (k) 300 tokens prefilled, then a chain of decodes of positions 300..307, each against the same
 //!   row of one 308-token forward: finite, and the same greedy token (argmax) unless that one-shot
-//!   row is a near-tie (top-1 − top-2 ≤ 2 × the step's max |difference|), at most one near-tie;
-//!   cosine, max |difference| and relative L2 printed, not asserted (the chain compounds the
-//!   per-step difference: see the test); the last decode's lm_head GEMV within the GEMM bound of
-//!   f64 over every column;
+//!   row is a near-tie (top-1 − top-2 ≤ 2 × the step's max |difference|); the near-tie count,
+//!   cosine, max |difference| and relative L2 printed, not asserted (on these near-flat synthetic
+//!   logits most steps are near-ties, so this is a smoke check; P7 is the chain-token check that
+//!   carries weight); the last decode's lm_head GEMV within the GEMM bound of f64 over every
+//!   column;
 //!   (k, teacher-forced) each decode one step off the one-shot trajectory (300 + i prefilled fresh,
 //!   then one decode at 300 + i) at cosine ≥ 0.999; (k-diag) prints, per decode, every KV layer's
 //!   K/V and every GDN layer's state against the one-shot's, for the chain and teacher-forced;
@@ -800,17 +801,14 @@ fn top1_margin(row: &[u16]) -> (usize, f32) {
     (first, second.map_or(f32::INFINITY, |s| v(first) - v(s)))
 }
 
-/// The most near-tie steps (k)'s chain may have, where its token may differ.
-const K_NEAR_TIES: usize = 1;
-
 /// (k): 300 fresh tokens prefilled in m=512, then a chain of decodes of positions 300..307 one at a
 /// time, each against row 300 + i of one 308-token m=512 forward in disjoint blocks and slot. Per
 /// step: every logit finite, and the decode's greedy token (argmax) the one-shot row's, unless
 /// that one-shot row is a near-tie, its top-1 − top-2 margin at most twice the step's max
-/// |difference| (#816's P3 rule, with the step's own difference as the noise); at most
-/// [`K_NEAR_TIES`] near-ties over the 8 steps. Cosine, max |difference| and relative L2 are
-/// printed for information and not asserted. And the last decode's lm_head GEMV, read back from
-/// the arena, within #761's bound of f64 over every column.
+/// |difference| (#816's P3 rule, with the step's own difference as the noise). The near-tie count,
+/// cosine, max |difference| and relative L2 are printed for information and not asserted. And the
+/// last decode's lm_head GEMV, read back from the arena, within #761's bound of f64 over every
+/// column.
 ///
 /// Why tokens and not a cosine floor per step (the user's choice, option 1 on #830): the decode
 /// and the one-shot prefill run different kernels with different rounding (the GEMV and the
@@ -820,8 +818,17 @@ const K_NEAR_TIES: usize = 1;
 /// cosine fell 0.99963 → 0.99794 over the 8 steps, its K/V and GDN state differences growing every
 /// step with the deepest layers worst and no single-step jump, while every teacher-forced step
 /// stayed ≥ 0.99935. Per-step accuracy is held by
-/// `k_teacher_forced_decodes_agree_with_one_shot_rows`; end-to-end correctness by the token
-/// agreement here and by P7 on the real checkpoint.
+/// `k_teacher_forced_decodes_agree_with_one_shot_rows`.
+///
+/// This token check is a smoke check: it catches a decode that picks another token where the
+/// choice is clear. On these synthetic random weights the one-shot logits are nearly flat, so most
+/// steps are near-ties. At cf3c7f8a the H100 measured one-shot top-1 margins of 0.016–0.55 (mostly
+/// ≤ 0.11) against chained differences of 0.07–0.19 (max |difference|): 7 of the 8 steps were
+/// near-ties, and the two steps whose tokens differed (303 and 307) were both near-ties. A cap of
+/// one near-tie, which that run had, cannot hold at this scale, so the coordinator removed it
+/// after that run. The end-to-end chain-token check that carries weight is P7 in
+/// `cuda_hf_parity`, on the real checkpoint: a prefill and 7 decodes give HF-f32's 8 greedy
+/// tokens on all 5 prompts.
 #[test]
 fn k_chained_decodes_pick_the_one_shot_tokens() {
     let r = rig();
@@ -880,15 +887,14 @@ fn k_chained_decodes_pick_the_one_shot_tokens() {
         );
         pass &= ok;
     }
-    let ties_ok = near_ties <= K_NEAR_TIES;
     eprintln!(
-        "(k) near-tie steps {near_ties} (at most {K_NEAR_TIES}) {}",
-        verdict(ties_ok)
+        "(k) near-tie steps {near_ties} of {DECODES} (printed, not asserted: a near-tie's token \
+         may differ)"
     );
     assert!(
-        pass && ties_ok,
-        "a chained decode picked another token than the one-shot row, gave a non-finite logit, or \
-         too many steps are near-ties: see the lines above"
+        pass,
+        "a chained decode gave a non-finite logit, or picked another token than the one-shot row \
+         where that row is not a near-tie: see the lines above"
     );
 }
 
