@@ -340,43 +340,41 @@ pub(crate) fn gpu_tensor_bytes(t: &scratchy_tensors::GpuTensor) -> &[u8] {
 /// What remains is staging: orientation, device-width padding, K-splitting and
 /// the bf16→f16 narrow — h2d work, which is spyre's to do.
 #[allow(clippy::type_complexity)]
-/// The prefix-KV source ids of a wiring — placed, inside `0..num_sources`, and DEVICE-RESIDENT.
+/// The resident source ids of a BUNDLE — its own stamped list, plus the spilled weight tail.
 ///
-/// ⛔ THEY ARE NOT BOUND PER STEP. The cache lives in seg2 and is filled by the pool and by the
-/// device's own cachewr, so `Executor::require_sources_filled` must know to skip them or it
-/// refuses every launch. Derived from the wiring rather than listed by hand, so a model with a
-/// different layer count cannot desync it.
+/// ⭐ THE LIST IS THE BUNDLE'S, NOT THE WIRING'S (#813 review). The prefix-KV caches and the
+/// load-time constant tables are GRAPH-LOCAL facts — the argmax mint inserts its seven tables
+/// at `[num_sources, num_sources+7)` of the ONE-REQUEST graph, so the minted wiring's ids name
+/// different tensors, or none, in an unminted rung, and handing a rung the wiring's list made
+/// the rung's completeness walk excuse seven ids past its own graph that only cancelled because
+/// the wiring's source count was seven high to match. Each bundle states its own resident set
+/// at the bake (derived from the same nodes the wiring's `layers`/`load_consts` lists come from,
+/// asserted inside its own `0..num_sources`), so a session reads it off the bundle it runs.
+///
+/// ⛔ THE PREFIX-KV IDS ARE NOT BOUND PER STEP. The cache lives in seg2 and is filled by the pool
+/// and by the device's own cachewr, so `Executor::require_sources_filled` must know to skip them
+/// or it refuses every launch.
+///
+/// ⛔ THE SPILLED WEIGHT TAIL IS CHAINED ON HERE, and leaving it out is a REFUSED LAUNCH, not a
+/// silent wrong answer — `require_sources_filled` classifies it `SourceFiller::Nobody` and stops.
+///
+/// 🛑 MEASURED: `superdsc prefill run_step (mq=21, start=0): predict: 1 caller-filled source(s)
+/// were never written this step — t446`. A borrowing session binds NOTHING (that is the point:
+/// one stage+H2D for the whole ladder), so a weight normally classifies as
+/// `SourceFiller::SegmentOwner` — its segment is ALIASED and the owner filled it. A spilled tail
+/// cannot be aliased (its slot also holds an intermediate color, whose extent is m-dependent, so
+/// no two bundles agree on the segment's size), so it is handed over as a COPY into this session's
+/// own region instead — `adopt_from_owner`. Nothing binds it and nothing aliases it, so the only
+/// accurate answer left is that the LOADER declared it resident, which is what this list says.
 #[cfg(feature = "spyre-hw")]
 fn resident_source_ids(
-    w: &scratchy_target_spyre::wiring::Wiring,
-    // ⛔ THE SPILLED WEIGHT TAIL BELONGS HERE, and leaving it out is a REFUSED LAUNCH, not a silent
-    // wrong answer — `require_sources_filled` classifies it `SourceFiller::Nobody` and stops.
-    //
-    // 🛑 MEASURED: `superdsc prefill run_step (mq=21, start=0): predict: 1 caller-filled source(s)
-    // were never written this step — t446`. A borrowing session binds NOTHING (that is the point:
-    // one stage+H2D for the whole ladder), so a weight normally classifies as
-    // `SourceFiller::SegmentOwner` — its segment is ALIASED and the owner filled it. A spilled tail
-    // cannot be aliased (its slot also holds an intermediate color, whose extent is m-dependent, so
-    // no two bundles agree on the segment's size), so it is handed over as a COPY into this session's
-    // own region instead — `adopt_from_owner`. Nothing binds it and nothing aliases it, so the only
-    // accurate answer left is that the LOADER declared it resident, which is what this list says.
+    l: &scratchy_target_spyre::bundle_code::BundleLayout<'_>,
     spilled_weight_tail: &[u32],
 ) -> Vec<u32> {
-    w.layers
+    l.resident_source_tids
         .iter()
-        .flat_map(|l| [l.prefix_k, l.prefix_v])
+        .copied()
         .chain(spilled_weight_tail.iter().copied())
-        // ⭐ THE LOAD-CONST TIDS — the staged tables are bound ONCE at load on the
-        // owner session (`bind_load_consts`, before prepare, resident like a
-        // weight). A BORROWING rung never binds them itself, so a table whose
-        // placement sits outside the aliased segments classifies `Nobody` and
-        // every launch on that rung is refused; the loader's declaration is the
-        // accurate answer for them exactly as it is for the spilled tail. Keyed
-        // on the wiring's own list (op-blind: a second kernel with staged
-        // tables rides the same union), and it can only excuse ids at or past
-        // the graph's own source count — a real source can never collide with
-        // a minted table id.
-        .chain(w.load_consts.iter().map(|&(tid, _)| tid))
         .collect()
 }
 
@@ -2025,15 +2023,11 @@ impl SpyreWorker {
                                 vocab,
                                 kv_dim,
                                 num_blocks,
-                                wirings
-                                    .prefill
-                                    .as_ref()
-                                    .unwrap_or(&wirings.decode)
-                                    .num_sources,
-                                &resident_source_ids(
-                                    wirings.prefill.as_ref().unwrap_or(&wirings.decode),
-                                    &spill_tids,
-                                ),
+                                // ⭐ THE PREFILL BUNDLE'S OWN FACTS, not a wiring's — this session
+                                // runs `pcode`, and the bundle states its source count and resident
+                                // ids where the mint's renumbering cannot reach them.
+                                pcode.layout.num_sources,
+                                &resident_source_ids(&pcode.layout, &spill_tids),
                             )
                         } else {
                             SuperDscSession::new_borrowing(
@@ -2041,15 +2035,8 @@ impl SpyreWorker {
                                 vocab,
                                 kv_dim,
                                 num_blocks,
-                                wirings
-                                    .prefill
-                                    .as_ref()
-                                    .unwrap_or(&wirings.decode)
-                                    .num_sources,
-                                &resident_source_ids(
-                                    wirings.prefill.as_ref().unwrap_or(&wirings.decode),
-                                    &spill_tids,
-                                ),
+                                pcode.layout.num_sources,
+                                &resident_source_ids(&pcode.layout, &spill_tids),
                                 &RESIDENT_SEGS.map(|(seg, _)| seg),
                             )
                         }
@@ -2166,13 +2153,18 @@ impl SpyreWorker {
                                 std::thread::spawn(move || {
                                     part.into_iter()
                                         .map(|(rm, rcode)| {
+                                            // ⭐ THE RUNG'S OWN FACTS, not the decode wiring's —
+                                            // the minted wiring's source count and resident ids
+                                            // are seven high (its ArgMax tables), which on this
+                                            // unminted rung only cancelled by coincidence. The
+                                            // bundle states its own.
                                             let r = SuperDscSession::new_borrowing(
                                                 rcode,
                                                 vocab,
                                                 kv_dim,
                                                 num_blocks,
-                                                wirings.decode.num_sources,
-                                                &resident_source_ids(&wirings.decode, &rung_spill),
+                                                rcode.layout.num_sources,
+                                                &resident_source_ids(&rcode.layout, &rung_spill),
                                                 &[1, 2],
                                             );
                                             (rm, r)
@@ -2198,8 +2190,13 @@ impl SpyreWorker {
                     vocab,
                     kv_dim,
                     num_blocks,
-                    wirings.decode.num_sources,
-                    &resident_source_ids(&wirings.decode, &spill_tids),
+                    // ⭐ THE OWNER READS ITS OWN BUNDLE'S FACTS TOO — the same law as every rung
+                    // below. The decode wiring and the decode bundle derive from the same minted
+                    // graph so the numbers agree, but the SESSION's contract is with the bundle it
+                    // runs, and stating it that way is what keeps a wiring↔bundle desync a loud
+                    // refusal here rather than a silent divergence between owner and rung.
+                    code.layout.num_sources,
+                    &resident_source_ids(&code.layout, &spill_tids),
                     weights,
                     // The decode graph's staged tables (the mint's seven, or
                     // any other kernel's): bound once HERE, on the owner,
@@ -2387,15 +2384,10 @@ impl SpyreWorker {
                             vocab,
                             kv_dim,
                             num_blocks,
-                            wirings
-                                .prefill
-                                .as_ref()
-                                .unwrap_or(&wirings.decode)
-                                .num_sources,
-                            &resident_source_ids(
-                                wirings.prefill.as_ref().unwrap_or(&wirings.decode),
-                                &spill_tids,
-                            ),
+                            // ⭐ THE PREFIX BUNDLE'S OWN FACTS — this session runs `pcode2`, a
+                            // continuation-chunk graph the decode wiring never described.
+                            pcode2.layout.num_sources,
+                            &resident_source_ids(&pcode2.layout, &spill_tids),
                             &[1, 2],
                         ) {
                             Ok(mut ps) => match adopt_from_owner(&mut ps, &ss, &spill_images) {
@@ -2594,8 +2586,12 @@ impl SpyreWorker {
                         vocab,
                         kv_dim,
                         num_blocks,
-                        wirings.decode.num_sources,
-                        &resident_source_ids(&wirings.decode, &spill_tids),
+                        // ⭐ THE RUNG'S OWN FACTS — same law as the `logits` stamp above: the
+                        // minted decode wiring's source count and resident ids are seven high for
+                        // this unminted rung's graph, and the bundle states the numbers that walk
+                        // ITS OWN source range.
+                        rcode.layout.num_sources,
+                        &resident_source_ids(&rcode.layout, &spill_tids),
                         &[1, 2],
                     ) {
                         Ok(mut rs) => {

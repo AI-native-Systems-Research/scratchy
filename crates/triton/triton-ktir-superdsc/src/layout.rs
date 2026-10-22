@@ -527,6 +527,21 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
             .collect::<std::collections::BTreeMap<_, _>>(),
     );
 
+    // ⭐ THE GRAPH'S OWN SOURCE BOUND — the kernel's own tensor parameters: every Activation-role
+    // placement that is not a reserved const (P, the scale consts and the fp8 bounds are
+    // producer-staged, not caller-filled). The exclusive bound of those tids, the same fact
+    // `bundle_run`'s launch-time `declare_sources` derives from the bound inputs — stated here so
+    // the bundle carries it, per the `SegRole::Logits` law that a session reads a bundle's facts
+    // off the bundle. Computed BEFORE the literal, which moves `placements`.
+    let num_sources = placements
+        .values()
+        .filter(|p| {
+            p.role == SegRole::Activation && !ktir_superdsc::reserved_tids::is_reserved(p.tid)
+        })
+        .map(|p| p.tid + 1)
+        .max()
+        .unwrap_or(0);
+
     Ok(BundleLayout {
         placements,
         ids,
@@ -573,6 +588,12 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // No paged KV in a single Triton kernel's parameter list; 0 is the documented "no paged KV"
         // value, not a placeholder.
         kv_request_stride_bytes: 0,
+        // ⭐ THE GRAPH'S OWN SOURCE BOUND — computed above the literal (which moves `placements`).
+        num_sources,
+        // No source is resident: a single Triton kernel has no prefix-KV cache for the device to
+        // fill and no load-time constant tables for an owner session to bind — the consts above
+        // are staged by the runner, not excused from the bind walk.
+        resident_source_tids: Vec::new(),
     })
 }
 

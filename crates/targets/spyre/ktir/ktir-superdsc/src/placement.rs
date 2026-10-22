@@ -328,6 +328,26 @@ pub struct BundleLayout {
     /// [`PagedKvPool::request_stride`]: crate::sdsc_abstract::PagedKvPool::request_stride
     #[serde(default)]
     pub kv_request_stride_bytes: u64,
+    /// ⭐ THE GRAPH'S OWN CALLER-FILLED SOURCE COUNT — ids `0..num_sources` are host-filled every
+    /// forward, and the runtime's completeness check (`Executor::require_sources_filled`) walks
+    /// exactly that range. Stamped on the LAYOUT because the count is GRAPH-LOCAL: the argmax
+    /// mint inserts its seven staged tables at `[num_sources, num_sources+7)` of the ONE-REQUEST
+    /// graph, so the minted wiring's count is seven higher than an unminted rung's, and a session
+    /// built on another graph's number walks ids its own bundle never defined — the seven extra
+    /// ids canceling against seven minted table ids is correctness by coincidence, the same class
+    /// as the `SegRole::Logits` re-point. Every session reads the count off the bundle it
+    /// actually runs.
+    #[serde(default)]
+    pub num_sources: u32,
+    /// ⭐ THE SOURCES NO PER-STEP BIND FILLS — the prefix-KV caches (the pool and the device's
+    /// own cachewr write them) and the load-time constant tables (the owner session binds them
+    /// once at load). The runtime's completeness check excuses exactly these ids, so the list is
+    /// stamped where the graph itself is: derived from the same nodes the wiring's `layers` and
+    /// `load_consts` lists derive from, and asserted inside `0..num_sources` at the stamp — an id
+    /// at or past the count would excuse a REAL source and turn a refused launch into a silent
+    /// read of unfilled memory.
+    #[serde(default)]
+    pub resident_source_tids: Vec<u32>,
 }
 
 /// Bump allocator for synthetic-intermediate offsets within the Intermediate

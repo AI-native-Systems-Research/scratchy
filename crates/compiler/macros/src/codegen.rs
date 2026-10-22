@@ -10084,6 +10084,8 @@ fn layout_tokens(
         kv_request_stride_bytes,
         lx_op_local_bytes,
         lx_prob_pin_bytes,
+        num_sources,
+        resident_source_tids,
     } = l;
     let segs = segment_bytes
         .iter()
@@ -10118,6 +10120,13 @@ fn layout_tokens(
     // budget, summed beside the gathers at the bake's `lx_form` admission. 0 for a bundle whose
     // chunk form mints none.
     let lxpp = proc_macro2::Literal::u64_unsuffixed(*lx_prob_pin_bytes);
+    // The graph's own wiring facts — the source count and the resident ids, so every session
+    // reads them off the bundle it runs rather than off another graph's wiring (the mint's
+    // renumbering makes the two differ; see the layout field's own doc).
+    let nsrc = proc_macro2::Literal::u32_unsuffixed(*num_sources);
+    let res = resident_source_tids
+        .iter()
+        .map(|t| proc_macro2::Literal::u32_unsuffixed(*t));
     // The segment budget's verdict, as a variant: every reader matches on it.
     let tail = match weight_tail {
         scratchy_target_spyre::bundle_code::WeightTail::InPlace => {
@@ -10147,6 +10156,8 @@ fn layout_tokens(
             kv_request_stride_bytes: #krs,
             lx_op_local_bytes: #lxol,
             lx_prob_pin_bytes: #lxpp,
+            num_sources: #nsrc,
+            resident_source_tids: ::std::borrow::Cow::Borrowed(&[#(#res),*]),
         }
     }
 }

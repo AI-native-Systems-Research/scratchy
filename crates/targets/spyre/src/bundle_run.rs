@@ -436,6 +436,21 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         lx_op_local_bytes: 0,
         // No chunk form either, so no probability-part pins beside absent gathers.
         lx_prob_pin_bytes: 0,
+        // The graph's own source bound, read off the parse with the same KIND split the
+        // launch-time `declare_sources` below applies to the bound inputs (activation-role,
+        // below the reserved-const floor): a run that binds every kernel tensor states exactly
+        // this bound, and the layout — not the run — is where the bundle states it.
+        num_sources: pf
+            .places
+            .iter()
+            .filter(|p| p.role == "Activation" && p.tid < RESERVED_TID_FLOOR)
+            .map(|p| p.tid + 1)
+            .max()
+            .unwrap_or(0),
+        // No source is resident here — the launch-time list is empty for the same reason: a
+        // single-kernel bundle has no prefix-KV cache for the device to fill and no load-time
+        // constant tables for an owner to bind.
+        resident_source_tids: std::borrow::Cow::Owned(Vec::new()),
     };
 
     println!("  parsed segment_bytes {:?}", segment_bytes);
