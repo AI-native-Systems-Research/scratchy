@@ -259,6 +259,10 @@ template <typename T>
           ssm_state + uint(state_indices[i_n].saves[sv].y) * entry_len + (i_hv * Vd + i_v) * K;
       for (uint ki = 0; ki < K; ki++) {
         snap[ki] = half(b_h[ki]);
+        // The snapshot is the entry's f16 — a restore loads exactly this. The cold run carries
+        // on in registers, so round them through the same store: a prefix-cache hit resumes
+        // from what a miss computed, bit for bit.
+        b_h[ki] = float(snap[ki]);
       }
     }
   }
@@ -481,6 +485,10 @@ template <typename T>
         device half* snap = row_in(seq_slots.saves[sv].y);
         for (uint i = 0; i < NPT; i++) {
           snap[i] = half(st[i]);
+          // The snapshot is the entry's f16 — a restore loads exactly this. The cold run
+          // carries on in registers, so round them through the same store: a prefix-cache
+          // hit resumes from what a miss computed, bit for bit.
+          st[i] = float(snap[i]);
         }
       }
     }

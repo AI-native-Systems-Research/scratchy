@@ -2760,10 +2760,6 @@ fn check_snapshots(what: &str, layouts: &[Slots], t: usize, mid: usize, step: Sn
         (0..layouts.len()).map(|p| slot(pools, p, s)).collect()
     };
     let plain = GdnSeqSlots::plain(GdnSlot::new(LIVE as usize));
-    // The live slot's entries after a plain step of the first `rows` rows on `pools`.
-    let live_after = |pools: &[Vec<f32>], rows: usize| {
-        step(pools, 0..rows, plain, GdnStart::Slot).map(|(_, after)| entries(&after, LIVE))
-    };
     // Slot 0 and the snapshots are as they were, but for each `(snapshot, entries)` stored, whose
     // entries hold those.
     let check_slots = |case: &str, after: &[Vec<f32>], stored: &[(i32, Vec<Vec<f32>>)]| {
@@ -2812,15 +2808,34 @@ fn check_snapshots(what: &str, layouts: &[Slots], t: usize, mid: usize, step: Sn
         let Some((out, after)) = step(&pools, 0..t, seq, GdnStart::Slot) else {
             return;
         };
-        assert_bits(&out, &out_plain, &format!("{what}, {case}: output"));
-        live_slot_is(&case, &after, &after_plain);
+        // A save rounds the carried registers through the entry's f16 where it stores, so a
+        // step with saves is the plain steps its save rows chunk — each boundary the store
+        // and load a restore resumes from — bit for bit: the outputs, the live slot, and
+        // each snapshot the chunked run's live slot at its row.
+        let mut chunked_out = Vec::new();
+        let mut chunked = pools.clone();
+        let mut at = 0usize;
         let mut stored = Vec::new();
         for &(through, snap) in saves {
-            let Some(want) = live_after(&pools, through) else {
+            if at < through {
+                let Some((o, after_c)) = step(&chunked, at..through, plain, GdnStart::Slot) else {
+                    return;
+                };
+                chunked_out.extend(o);
+                chunked = after_c;
+                at = through;
+            }
+            stored.push((snap, entries(&chunked, LIVE)));
+        }
+        if at < t {
+            let Some((o, after_c)) = step(&chunked, at..t, plain, GdnStart::Slot) else {
                 return;
             };
-            stored.push((snap, want));
+            chunked_out.extend(o);
+            chunked = after_c;
         }
+        assert_bits(&out, &chunked_out, &format!("{what}, {case}: output"));
+        live_slot_is(&case, &after, &chunked);
         check_slots(&case, &after, &stored);
     }
 
@@ -2858,21 +2873,36 @@ fn check_snapshots(what: &str, layouts: &[Slots], t: usize, mid: usize, step: Sn
         assert_bits(got, want, &format!("{what}, fresh with a source: pool {p}"));
     }
 
-    // A restore that saves.
+    // A restore that saves — the save rounds the carried registers through the entry's f16,
+    // so the run is the plain steps its save row chunks on the restored state, bit for bit.
     let seq = restore.saving([save(mid, s1), None]);
-    let (Some((out_rs, after_rs)), Some(want)) = (
+    let (Some((out_rs, after_rs)), Some((mut out_m, after_m))) = (
         step(&pools, 0..t, seq, GdnStart::Slot),
-        live_after(&copied, mid),
+        step(&copied, 0..mid, plain, GdnStart::Slot),
     ) else {
         return;
     };
+    // The snapshot is the chunk's end state — what a restore of s1 would load.
+    let stored_s1 = entries(&after_m, LIVE);
+    // The continuation restarts from it, as a restore of s1 would; a save at the step's
+    // end stores the final state, and nothing follows it.
+    let want;
+    if mid < t {
+        let Some((out_c2, after_c2)) = step(&after_m, mid..t, plain, GdnStart::Slot) else {
+            return;
+        };
+        out_m.extend(out_c2);
+        want = after_c2;
+    } else {
+        want = after_m;
+    }
     assert_bits(
         &out_rs,
-        &out_c,
+        &out_m,
         &format!("{what}, restore and save: output"),
     );
-    live_slot_is("restore and save", &after_rs, &after_c);
-    check_slots("restore and save", &after_rs, &[(s1, want)]);
+    live_slot_is("restore and save", &after_rs, &want);
+    check_slots("restore and save", &after_rs, &[(s1, stored_s1)]);
 }
 
 /// [`check_snapshots`] for `gdn_conv1d_varlen_f32`, in its GDN form and its Mamba-2 one (a column

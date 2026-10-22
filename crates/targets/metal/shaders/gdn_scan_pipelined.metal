@@ -433,6 +433,13 @@ template <typename T>
           ((device half4*)snap)[8u * i] = half4(st0[i]);
           ((device half4*)(snap + RS * K))[8u * i] = half4(st1[i]);
         }
+        // The snapshot is the entry's f16 — a restore loads exactly this. The cold run
+        // carries on in registers, so round them through the same store: a prefix-cache
+        // hit resumes from what a miss computed, bit for bit.
+        for (uint i = 0; i < 4; i++) {
+          st0[i] = float4(half4(st0[i]));
+          st1[i] = float4(half4(st1[i]));
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

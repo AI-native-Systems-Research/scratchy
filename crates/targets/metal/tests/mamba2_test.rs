@@ -695,30 +695,14 @@ fn assert_bits(got: &[f32], want: &[f32], what: &str) {
     }
 }
 
-/// `got` is `want` up to the ssm entry's f16: the two arms round the same registers except
-/// where their f32 divergence straddles a boundary — one half ULP through the scan, which the
-/// output's own dtype rounding may step to a full ULP. `tol` names the arm's bound.
-fn assert_close(got: &[f32], want: &[f32], what: &str, tol: impl Fn(f32) -> f32) {
-    assert_eq!(got.len(), want.len(), "{what}: length");
-    let straddled = |(g, r): (&f32, &f32)| (g - r).abs() > tol(*r);
-    if let Some((i, _)) = got
-        .iter()
-        .zip(want)
-        .enumerate()
-        .find(|&(_, p)| straddled(p))
-    {
-        panic!("{what}: [{i}] = {}, reference {}", got[i], want[i]);
-    }
-}
-
 /// Prefix-cache snapshots (`shaders/gdn_state.h`) through the whole mixer, dispatched as the
 /// lowering dispatches it. A prefill on slot 1 — beside a fresh neighbour's on slot 2 — saves its
 /// state after row 2 (a block junction) into snapshot slot 3 and after its last row into slot 4:
 /// slot 3 holds what a step of just those two rows leaves, slot 4 what the prefill leaves. A later
 /// step on slot 0 restores slot 3 and runs the prefill's remaining rows: its output is the
-/// prefill's rows past the junction and its state the prefill's, the snapshot as it was — each up
-/// to the ssm entry's f16, the one rounding between a save's registers and a restore's load. The
-/// rest bit for bit: a save stores the registers the scan carries on, a restore loads them back.
+/// prefill's rows past the junction and its state the prefill's, the snapshot as it was. All bit
+/// for bit: a save stores the registers the scan carries on — rounded through the entry's f16, so
+/// the cold run continues from what it stored — and a restore loads them back.
 fn snapshots(geo: Geometry, dtype: Dtype, routed: bool) {
     let Some(di) = detect_device() else {
         eprintln!("skipping: no Metal device");
@@ -793,31 +777,17 @@ fn snapshots(geo: Geometry, dtype: Dtype, routed: bool) {
     };
     let inner = geo.inner();
     let past_junction = &out[junction * inner..t * inner];
-    // The restore loads the snapshot's f16 rounding while the prefill carried unrounded
-    // registers past the junction: the resumed rows differ only where that state straddled
-    // a rounding boundary — the state's half ULP, which the output's own dtype rounding may
-    // step to a full ULP.
-    assert_close(
+    // The scan rounds its carried registers through the entry's f16 at the save, so the
+    // restore resumes from exactly what the cold run carried on from: the resumed rows
+    // are the prefill's rows past the junction, bit for bit.
+    assert_bits(
         &resumed,
         past_junction,
         &format!("{what}: the resumed rows"),
-        |r| dtype.tol(r).max(1e-3 * (1.0 + r.abs())),
     );
     let restored = gpu.pools();
-    // The ring the restore carries is f32: exact. The ssm state came from the snapshot's
-    // rounding — the same straddle as the rows above, the entries themselves the entry's
-    // f16.
-    assert_bits(
-        &slot(&restored, 0)[0],
-        &slot(&after, 1)[0],
-        &format!("{what}: the resumed state's conv ring"),
-    );
-    assert_close(
-        &slot(&restored, 0)[1],
-        &slot(&after, 1)[1],
-        &format!("{what}: the resumed state's ssm"),
-        |r| 1e-3 * (1.0 + r.abs()),
-    );
+    // The whole resumed state — the ring and the ssm entry — is the prefill's, bit for bit.
+    same(slot(&restored, 0), slot(&after, 1), "the resumed state");
     same(slot(&restored, 3), slot(&after, 3), "the restored snapshot");
 }
 
