@@ -149,7 +149,10 @@ fn tail_at(vocab: u32) -> bool {
         exported: None,
         sources: vec![
             SourceShape { rows: 1, cols: 4 },
-            SourceShape { rows: 4, cols: vocab },
+            SourceShape {
+                rows: 4,
+                cols: vocab,
+            },
         ],
         ops: vec![OpDesc {
             op: SubOp::MatmulTile {
