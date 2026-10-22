@@ -229,8 +229,12 @@ first scratchy build or parity-gate failure, instead of going on to the next
 model.
 
 Before timing each model, the script runs a blocking **parity gate**: `scr
-chat` and `mlx_lm.generate`, both greedy, must give exactly the same answer
-to a few short prompts that have one right answer. A model that fails the
+chat` and `mlx_lm.generate`, both greedy, must give the same answer to a few
+short prompts that have one right answer. Where the text differs,
+`scripts/parity_ties.py` runs mlx-lm over scratchy's own answer and judges
+each token scratchy picked: one within a logit of mlx-lm's top is a near-tie
+(reasoning models' thoughts open on them), and the prompt passes as `TIE`.
+A token further behind, or more than a few near-ties, fails. A model that fails the
 gate isn't timed on any engine, because there would be no scratchy numbers
 to compare against. The gate needs mlx-lm, so it runs on every full and
 smoke run. Rules and rationale are in `docs/BENCHMARKING.md` (fairness
@@ -265,7 +269,8 @@ act on each one as it appears:
 - `BUILD FAILED`: the run stops by itself with `--fail-fast`. Go to **On a
   build failure** below.
 - `--- parity gate vs mlx-lm (blocking)`, followed by either `PARITY OK` or
-  `PARITY FAILED — not timing <stem>`. On a failure, tell the user right
+  `PARITY FAILED — not timing <stem>`. A `TIE` line, with its `token N:`
+  lines under it, is a pass: note the gaps for the user, nothing to do. On a failure, tell the user right
   away: that model has no numbers, and with `--fail-fast` the run stops
   there (without it, it moves on and exits 1 at the end). The lines under it
   show both answers; `the ... child crashed` means one side crashed rather
@@ -294,9 +299,10 @@ commands to get it through. A mismatch on these prompts means scratchy and
 mlx-lm computed different things, and timing either of them would compare
 different computations. The gate's full output is in
 `<out-dir>/<machine>/parity-<stem>.log`; the path is on the `PARITY FAILED`
-line. For each prompt it shows `OK` or `FAIL`, then `a:` (scratchy) and `b:`
-(mlx-lm) for every `FAIL`. Report the `FAIL` lines to the user, and say
-which of these the outputs look like:
+line. For each prompt it shows `OK`, `TIE` or `FAIL`, then `a:` (scratchy)
+and `b:` (mlx-lm) for every `FAIL`, with the reason in brackets: a token some
+logits behind mlx-lm's top, too many near-ties, or no score at all. Report
+the `FAIL` lines to the user, and say which of these the outputs look like:
 
 - **The two sides were given different prompts.** One side starts with a
   thought or reasoning block, or with template text the other doesn't have,

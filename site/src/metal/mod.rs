@@ -563,7 +563,18 @@ fn served_as(m: &Model, e: Engine) -> Option<String> {
 fn parity(m: &Model) -> Option<String> {
     m.parity_mlx_lm.map(|p| match (p, &m.parity_skipped) {
         (None, Some(why)) => format!("output not checked against mlx-lm: {why}"),
-        (Some(true), _) => "output matches mlx-lm".to_string(),
+        (Some(true), _) => match &m.parity_ties {
+            Some(ties) if !ties.is_empty() => {
+                let (n, max) = (ties.values().flatten())
+                    .fold((0, 0.0_f64), |(n, max), &g| (n + 1, max.max(g)));
+                format!(
+                    "output matches mlx-lm up to {n} near-tie token{} (at most {max:.2} logits \
+                     behind mlx-lm's top)",
+                    if n == 1 { "" } else { "s" }
+                )
+            }
+            _ => "output matches mlx-lm".to_string(),
+        },
         (Some(false), _) => "output does not match mlx-lm".to_string(),
         (None, None) => "output not checked (no mlx-lm)".to_string(),
     })
@@ -574,8 +585,10 @@ fn parity_info() -> Element {
         "",
         rsx! {
             "Before anything is timed, scratchy and mlx-lm answer the same short prompts with greedy decoding, \
-             and the answers must match exactly. A mismatch points at a wrong load path (quant preset, group \
-             size, dequant), so that model is not timed at all."
+             and the answers must match. Where they part, mlx-lm is run over scratchy's own answer and judges \
+             each token scratchy picked: one within a logit of mlx-lm's top is a near-tie two correct stacks \
+             break differently, and passes. A token further behind points at a wrong load path (quant preset, \
+             group size, dequant), so that model is not timed at all."
         },
     )
 }

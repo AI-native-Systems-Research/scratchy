@@ -49,9 +49,11 @@
 # --scale-grid-users-output "" runs the whole cube.
 #
 # With mlx-lm, a blocking parity gate runs first: `scr chat` vs mlx_lm.generate,
-# greedy, CLI mode (the ladder is server mode, so the gate is its own call). A
-# failure skips every timing stage (all engines) for that model and is recorded as
-# "parity_mlx_lm": false.
+# greedy, CLI mode (the ladder is server mode, so the gate is its own call).
+# Where the two answers' text differs, scripts/parity_ties.py has mlx-lm judge
+# each token scratchy picked: a near-tie two correct stacks break differently
+# passes, and the run records it as "parity_ties". A failure skips every timing
+# stage (all engines) for that model and is recorded as "parity_mlx_lm": false.
 # Comparison engines. By default oMLX and oMLX TurboQuant, the strongest MLX
 # rival, so the time goes into the users dimension of the grid instead
 # (#349); --engines all runs every installed one, --engines a,b names some:
@@ -1254,13 +1256,16 @@ PY
                 --child-cmd "${model_bin} chat -m ${id} --device metal -q {prompt} --max-tokens {output_len} --temperature 0" \
                 --backend scratchy \
                 --parity-cmd "${MLX_PYTHON} -m mlx_lm.generate --model ${id} --prompt {prompt} --max-tokens {output_len} --temp 0${pconfig:+ --chat-template-config ${pconfig}}" \
-                --parity-backend mlx-lm >"${RAW}/parity-${stem}.log" 2>&1; then
-            # One line per prompt (name, OK, agree n/m chars), whatever the prompts are.
-            grep -E "^ +[^ ]+ +OK +agree |PARITY OK" "${RAW}/parity-${stem}.log" | sed 's/^/    /'
+                --parity-backend mlx-lm \
+                --parity-score-cmd "${MLX_PYTHON} -I ${ROOT}/scripts/parity_ties.py --model ${id} --prompt {prompt} --tokens {tokens}${pconfig:+ --chat-template-config ${pconfig}}" \
+                >"${RAW}/parity-${stem}.log" 2>&1; then
+            # One line per prompt (name, OK or TIE, agree n/m chars), whatever the prompts are,
+            # and each near-tie token.
+            grep -E "^ +[^ ]+ +(OK|TIE) +(agree|every) |^ +token +[0-9]+:|PARITY OK" "${RAW}/parity-${stem}.log" | sed 's/^/    /'
         else
             parity_ok=0
             echo "    PARITY FAILED — not timing ${stem}; ${RAW}/parity-${stem}.log" >&2
-            grep -E " (OK|FAIL) +agree | a: | b: |crashed|Error" "${RAW}/parity-${stem}.log" | head -12 | sed 's/^/    /' >&2
+            grep -E " (OK|TIE|FAIL) +(agree|every) |^ +token +[0-9]+:| a: | b: |crashed|Error" "${RAW}/parity-${stem}.log" | head -16 | sed 's/^/    /' >&2
             (( FAIL_FAST )) && die "--fail-fast: stopping at ${stem}'s parity-gate failure"
         fi
     fi
@@ -1342,6 +1347,18 @@ def scaling(engine):
                  if axis == "grid" else {"rung": int(a)})
         cells.append({"axis": axis, **where, **metrics(j)})
     return cells or None
+def parity_ties():
+    """From the gate's log: {prompt: [gap, ...]} for each prompt that passed as a near-tie."""
+    p = os.path.join(raw, f"parity-{stem}.log")
+    if parity_ok != "1" or not os.path.exists(p):
+        return None
+    ties, name = {}, None
+    for line in open(p):
+        if m := re.match(r"\s+(\S+)\s+(OK|TIE|FAIL)\s+agree ", line):
+            name = m.group(1) if m.group(2) == "TIE" else None
+        elif name and (m := re.match(r"\s+token\s+\d+:.*?([0-9.]+) logits behind", line)):
+            ties.setdefault(name, []).append(float(m.group(1)))
+    return ties or None
 d = json.load(open(js))
 keys = env["ENGINE_KEYS"].split()
 engines = {f"cache_ladder_{k}": load(f"exec-{k}-{stem}.json") for k in keys}
@@ -1378,6 +1395,8 @@ d["models"].append({
     "built": built == "1",
     # null = gate not run (no mlx-lm, or no build); false = gate failed, nothing timed.
     "parity_mlx_lm": (parity_ok == "1") if (mlx_python and built == "1") else None,
+    # The prompts that passed on near-ties, each with its tokens' logit gaps; null for none.
+    "parity_ties": parity_ties(),
     "footprint": {"build_seconds": int(secs) if secs else None,
                   "binary_bytes": int(size) if size else None,
                   "container_image_bytes": None,
