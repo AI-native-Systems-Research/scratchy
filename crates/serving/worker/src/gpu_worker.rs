@@ -6031,9 +6031,10 @@ impl Worker for MetalWorker {
             let lanes = self.gdn_lanes(&gdn_cfg);
             let dims = gdn_cfg.state_dims();
             let t_gdn = std::time::Instant::now();
-            // f32 conv/ssm state, placement-sparse like the KV pool: one store per linear layer's
-            // conv and ssm buffer, a block per slot, pinned in the KV pool's set so the lazy pager
-            // can't drop it mid-scan. A live slot is mapped once a sequence first takes it
+            // Conv f32, ssm at the worker's declared dtype, placement-sparse like the KV pool:
+            // one store per linear layer's conv and ssm buffer, a block per slot, pinned in
+            // the KV pool's set so the lazy pager can't drop it mid-scan. A live slot is
+            // mapped once a sequence first takes it
             // (`gdn_step`; the allocator hands out the lowest free slot, so what is mapped is the
             // most sequences ever resident at once), snapshot slots a unit at a time as the
             // scheduler maps them out of the KV budget they share (`SharedKv`) — an unused one
