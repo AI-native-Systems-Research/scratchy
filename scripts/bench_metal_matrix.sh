@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Metal benchmark matrix — one Mac in, one JSON out.
 #
-#     scripts/bench_metal_matrix.sh                 # the MoE models, the default round
-#     scripts/bench_metal_matrix.sh --models dense  # the dense models
-#     scripts/bench_metal_matrix.sh --models full   # both, the complete round
-#     scripts/bench_metal_matrix.sh --models qwen3.6-27b,gemma-4-31b-it   # any from MODELS_ALL
+#     scripts/bench_metal_matrix.sh                 # a quick run: this Mac's models, scratchy alone
+#     scripts/bench_metal_matrix.sh --full          # the full run: every engine, frozen (sudo), 3 reps
+#     scripts/bench_metal_matrix.sh --models small  # the 36 GB set
+#     scripts/bench_metal_matrix.sh --models large  # the 64 GB set
+#     scripts/bench_metal_matrix.sh --models full   # both, where each fits
+#     scripts/bench_metal_matrix.sh --models glm-4.5-air,gemma-4-26b-a4b-it   # any from MODELS_ALL
 #     scripts/bench_metal_matrix.sh --models all
-#     scripts/bench_metal_matrix.sh --scenarios cold,warm   # no sudo needed
 #
 # A RUNNER, not a measurement tool: every number comes from a `scr bench`
 # subcommand, except BUILD TIME and BINARY SIZE per model. scratchy compiles one
@@ -19,8 +20,9 @@
 #   warm: send -> first token, median over unique prompts to a resident server
 #   peak RSS, major faults             scr bench startup --exec (per child, wait4)
 #   TTFT/TPOT/ITL p50+p99, tok/s       scr bench serve (warm, conc 1)
-#   concurrency curve                  scr bench serve (input 512, output 128)
-#   input x output grid (heat maps)    scr bench serve (conc 8)
+#   prompt x answer x users grid       scr bench serve (1, 4, 8, 16 users;
+#     (heat maps, every curve)           128 to 32768 in;
+#                                        64 out, --full adds 512 and 2048 at 1)
 #
 # Rung definitions and fairness rules: docs/BENCHMARKING.md.
 #
@@ -32,14 +34,19 @@
 # one seed per (model, axis, rung) — unique so the prefix cache cannot serve a
 # later cell, shared across engines so all see the same prompts. Concurrency is
 # offered (--max-concurrency), not the effective decode batch. The default
-# sweeps are grid and input. The prompt x answer grid runs at every one of
-# --scale-grid-conc's user counts (1, 2, 4, 8 and 16 by default), so it is
-# prompt x answer x users and the separate users sweep (conc) is not needed;
-# one user at a time is what most Macs see (#349). input sweeps prompt length
-# up to each model's context. --scale-axes conc,grid,input adds the old users
-# sweep back. A cell sends --scale-rounds rounds of its users count (4), and
-# at least --scale-num-prompts requests (12): 12 at 1 to 2 users, 64 at 16, so
-# its medians are of the users count kept full, not one ramp-up and drain.
+# sweep is the grid: prompt x answer x users, at --scale-grid-conc's user
+# counts (1, 4, 8 and 16 by default), so neither the separate users sweep
+# (conc) nor the prompt sweep (input) is needed: the grid's prompts reach 32k
+# and its 1-user row is the prompt sweep. One user at a time is what most Macs
+# see (#349). --scale-axes conc,grid,input adds the other sweeps back. A cell
+# sends --scale-rounds rounds of its users count (4; a quick run, 2), and at least
+# --scale-num-prompts requests (12): 12 at 1 user, 64 at 16, so its medians are
+# of the users count kept full, not one ramp-up and drain.
+# Above 1 user the grid runs only --scale-grid-users-output's answer lengths
+# (64): the users x prompt heat maps read 64-token answers, and long answers at
+# many users were half a sweep. With --full, 1 user runs every answer length
+# (64, 512 and 2048), the decode-vs-answer-length curve; a quick run, 64 alone.
+# --scale-grid-users-output "" runs the whole cube.
 #
 # With mlx-lm, a blocking parity gate runs first: `scr chat` vs mlx_lm.generate,
 # greedy, CLI mode (the ladder is server mode, so the gate is its own call). A
@@ -70,8 +77,10 @@
 # --serve-args "..." adds extra `scr serve` flags (recorded in the JSON). None
 # by default: `scr serve` sizes --max-num-batched-tokens to the largest resident
 # prefill bucket, the same as any user gets.
-# --cell-timeout-s bounds each scaling cell; a timed-out cell skips the rest of
-# that server's cells, since a hung server would hang them all.
+# --cell-timeout-s bounds each scaling cell. A cell that times out or has failed
+# requests is recorded as it ended, and the server is restarted for the next
+# cell: a server that ran out of memory on one cell has not measured the
+# others, and an engine's out-of-memory stays on the page as failed cells.
 # --fail-fast stops at the first scratchy build or parity-gate failure instead
 # of going on to the next model. Either way, a model with no scratchy numbers
 # fails the run (exit 1).
@@ -82,19 +91,41 @@ ROOT="$(cd -- "${HERE}/.." &>/dev/null && pwd)"
 
 # Every id verified against the HuggingFace API with its download size.
 MODELS_ALL=(
-  "qwen3.6-27b=mlx-community/Qwen3.6-27B-4bit:mlx-affine-b4-g64-qembed"          # 16.1 GB, dense, GDN hybrid
-  "qwen3.6-35b-a3b=mlx-community/Qwen3.6-35B-A3B-4bit:mlx-affine-b4-g64-qembed"  # 20.4 GB, MoE, GDN hybrid
-  "gemma-4-26b-a4b-it=mlx-community/gemma-4-26b-a4b-it-4bit:mlx-affine-b4-g64"   # 15.4 GB, MoE, sliding window
-  "gemma-4-31b-it=mlx-community/gemma-4-31b-it-4bit:mlx-affine-b4-g64"           # 18.4 GB, dense, sliding window
-  "glm-4.5-air=mlx-community/GLM-4.5-Air-3bit:mlx-affine-b3-g64-qembed"          # 46.8 GB, MoE (12B active), 3-bit
+  # One model per class, small for a 36 GB Mac and large for a 64 GB one:
+  # sliding-window attention, Mamba-2 hybrid, Gated DeltaNet hybrid, dense.
+  "gpt-oss-20b=jesusoctavioas/gpt-oss-20b-mlx-4Bit:mlx-affine-b4-g64-qembed"          # 11.8 GB, MoE, alternating sliding window
+  "gpt-oss-120b-3bit=scratchery/gpt-oss-120b-3bit:"                                    # 51.4 GB, MoE, alternating sliding window, 3-bit
+  "nemotron-3-nano-30b-a3b=mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-4bit:mlx-affine-b4-g64-qembed"             # 17.8 GB, MoE, Mamba-2 hybrid
+  "nemotron-3-super-120b-a12b=mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-OptiQ-2bit:mlx-affine-b4-g64-qembed" # 47.5 GB, latent MoE, Mamba-2 hybrid, OptiQ 2-bit
+  "qwen3.6-35b-a3b=mlx-community/Qwen3.6-35B-A3B-4bit:mlx-affine-b4-g64-qembed"        # 20.4 GB, MoE, GDN hybrid
+  "qwen3.5-122b-a10b=scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp:mlx-affine-b4-g64-qembed" # 48.3 GB, MoE, GDN hybrid, OptiQ 2-bit, MTP head
+  "granite-4.2-8b=ibm-granite/granite-4.2-8b-q4-mlx:mlx-affine-b4-g64-qembed"             # 4.9 GB, dense
+  "granite-4.2-30b=ibm-granite/granite-4.2-30b-q4-mlx:mlx-affine-b4-g64-qembed"           # 16.5 GB, dense
+  # By name only (--models <stem>): the earlier rounds' models.
+  "gemma-4-26b-a4b-it=mlx-community/gemma-4-26b-a4b-it-4bit:mlx-affine-b4-g64"         # 15.4 GB, MoE, sliding window
+  "qwen3.6-27b=mlx-community/Qwen3.6-27B-4bit:mlx-affine-b4-g64-qembed"                # 16.1 GB, dense, GDN hybrid
+  "gemma-4-31b-it=mlx-community/gemma-4-31b-it-4bit:mlx-affine-b4-g64"                 # 18.4 GB, dense, sliding window
+  "glm-4.5-air=mlx-community/GLM-4.5-Air-3bit:mlx-affine-b3-g64-qembed"                # 46.8 GB, MoE (12B active), 3-bit
+  "granite-4.1-8b=mlx-community/granite-4.1-8b-4bit:mlx-affine-b4-g32"                 # 5.2 GB, dense
+  "granite-4.1-30b=mlx-community/granite-4.1-30b-4bit:mlx-affine-b4-g32"               # 18.0 GB, dense
 )
-# The default round is the MoE models, the ones that make most sense on a
-# laptop: 3B, 4B and 12B active (GLM-4.5-Air only where it fits). --models
-# dense runs the dense ones, --models full both.
-MODELS_MOE="qwen3.6-35b-a3b,gemma-4-26b-a4b-it,glm-4.5-air"
-MODELS_DENSE="qwen3.6-27b,gemma-4-31b-it"
-MODELS_FULL="${MODELS_MOE},${MODELS_DENSE}"
-MODELS_DEFAULT="${MODELS_MOE}"
+# The default round is one model per class, sized to the Mac: the small set
+# below 64 GB of memory, the large set at 64 GB and above. --models small or
+# --models large names one; --models full runs both, where each fits. Each
+# run file records this table (config.classes), and the page reads its
+# overview's columns from it.
+CLASSES=(
+  # class | small | large
+  "sliding window|gpt-oss-20b|gpt-oss-120b-3bit"
+  "Mamba-2|nemotron-3-nano-30b-a3b|nemotron-3-super-120b-a12b"
+  "Gated DeltaNet|qwen3.6-35b-a3b|qwen3.5-122b-a10b"
+  "dense|granite-4.2-8b|granite-4.2-30b"
+)
+MODELS_SMALL="$(for c in "${CLASSES[@]}"; do IFS='|' read -r _ s _ <<<"${c}"; echo "${s}"; done | paste -sd, -)"
+MODELS_LARGE="$(for c in "${CLASSES[@]}"; do IFS='|' read -r _ _ l <<<"${c}"; echo "${l}"; done | paste -sd, -)"
+MODELS_FULL="${MODELS_SMALL},${MODELS_LARGE}"
+# The MoE models: mistral.rs runs out of memory in its MoE expert path.
+MODELS_MOE="gpt-oss-20b,gpt-oss-120b-3bit,nemotron-3-nano-30b-a3b,nemotron-3-super-120b-a12b,qwen3.6-35b-a3b,qwen3.5-122b-a10b,gemma-4-26b-a4b-it,glm-4.5-air"
 
 # What each engine serves per stem; no entry, no column for that engine.
 # ollama runs its MLX engine (the -mlx tags), as scratchy and mlx-lm do.
@@ -142,10 +173,16 @@ model_preset() {
     esac
 }
 
-# What a model needs beyond the defaults (0: no limit). GLM-4.5-Air's 47 GB of
-# weights fit only a 64 GB Mac, and its fp16 KV (about 190 KB a token) leaves
-# room there for 4 users at the longest prompts, not 8 or 16.
-model_min_gb()   { case "$1" in glm-4.5-air) echo 64 ;; *) echo 0 ;; esac; }
+# What a model needs beyond the defaults (0: no limit). The large set's 47 to
+# 51 GB of weights, and GLM-4.5-Air's, fit only a 64 GB Mac, and GLM's fp16 KV
+# (about 190 KB a token) leaves room there for 4 users at the longest prompts,
+# not 8 or 16.
+model_min_gb() {
+    case "$1" in
+        glm-4.5-air|gpt-oss-120b-3bit|nemotron-3-super-120b-a12b|qwen3.5-122b-a10b) echo 64 ;;
+        *) echo 0 ;;
+    esac
+}
 model_max_conc() { case "$1" in glm-4.5-air) echo 4 ;;  *) echo 0 ;; esac; }
 
 # Extra --chat-template-config for the parity gate's mlx-lm side, per stem;
@@ -168,12 +205,23 @@ mlx_parity_config() {
 }
 
 MODELS=()
-SCENARIOS="frozen,cold,warm"
-REPS=3
-# Discarded launches before cold, so it measures a settled cache: scratchy's
-# Metal aligned-weights cache takes about three launches to settle. The harness
-# does one on its own; more come from a throwaway cold call, so 2 rounds up to 3.
-PRIME=3
+# Two kinds of run. By default a quick one, about 25 minutes:
+# scratchy alone, cold and warm, one rep, 64-token answers. The page
+# keeps every other engine's numbers, and scratchy's frozen launches, from the
+# last run that measured them. --full is the complete one, every engine's
+# numbers renewed: the default comparison engines, frozen (sudo purge), three
+# reps, and the 512- and 2048-token answers at 1 user. Any flag after it still
+# wins.
+FULL=0
+for a in "$@"; do [[ "${a}" == --full ]] && FULL=1; done
+SCENARIOS="cold,warm"
+REPS=1
+# Discarded launches before cold, so it measures a settled cache: since #740
+# the aligned-weights cache is written by the first launch's graceful shutdown,
+# so one does. The harness does one on its own; more come from a throwaway cold
+# call.
+PRIME=1
+if (( FULL )); then SCENARIOS="frozen,cold,warm"; REPS=3; PRIME=3; fi
 PORT=8751
 NUM_PROMPTS=20
 INPUT_LEN=64
@@ -198,22 +246,26 @@ OLLAMA_AUTO=1
 ENGINES=""               # --engines: unset for DEFAULT_ENGINES, all for every installed one
 ENGINES_GIVEN=0          # --engines was passed (even as "": scratchy alone)
 LEGACY_NO=0              # --no-mlx / --no-ollama was passed
-DEFAULT_ENGINES="omlx,omlx_tq"
+DEFAULT_ENGINES=""       # scratchy alone; --full: oMLX and oMLX TurboQuant
+(( FULL )) && DEFAULT_ENGINES="omlx,omlx_tq"
 PINS=()
 UNPINNED=0
 SCALING=1
-SCALE_AXES="grid,input"
+SCALE_AXES="grid"
 SCALE_CONC="1,4,16"
 SCALE_INPUT="128,512,2048,8192"
 SCALE_OUTPUT="16,64,256,1024"
-SCALE_GRID_INPUT="128,1024,4096"
-SCALE_GRID_OUTPUT="16,128,512"
-SCALE_GRID_CONC="1,2,4,8,16"   # the grid's users dimension; empty: 1 and the base count
-SCALE_BASE_INPUT=512
-SCALE_BASE_OUTPUT=128
+SCALE_GRID_INPUT="128,1024,4096,32768"
+SCALE_GRID_OUTPUT="64"         # --full: 64,512,2048, the 1-user decode-vs-answer-length curve
+(( FULL )) && SCALE_GRID_OUTPUT="64,512,2048"
+SCALE_GRID_CONC="1,4,8,16"     # the grid's users dimension; empty: 1 and the base count
+SCALE_GRID_USERS_OUTPUT="64"   # the answer lengths above 1 user; empty: every --scale-grid-output
+SCALE_BASE_INPUT=1024
+SCALE_BASE_OUTPUT=64
 SCALE_BASE_CONC=8
 SCALE_NUM_PROMPTS=12     # a cell's requests: at least this many,
-SCALE_ROUNDS=4           # and at least this many rounds of its users count
+SCALE_ROUNDS=2           # and at least this many rounds of its users count; --full: 4
+(( FULL )) && SCALE_ROUNDS=4
 SCALE_WARMUPS=2
 SCALE_SEED_BASE=20260927
 
@@ -248,6 +300,7 @@ while [[ $# -gt 0 ]]; do
         --scale-grid-input)  SCALE_GRID_INPUT="$2"; shift 2 ;;
         --scale-grid-output) SCALE_GRID_OUTPUT="$2"; shift 2 ;;
         --scale-grid-conc)   SCALE_GRID_CONC="$2"; shift 2 ;;
+        --scale-grid-users-output) SCALE_GRID_USERS_OUTPUT="$2"; shift 2 ;;
         --scale-num-prompts) SCALE_NUM_PROMPTS="$2"; shift 2 ;;
         --scale-rounds)      SCALE_ROUNDS="$2"; shift 2 ;;
         --scale-warmups)     SCALE_WARMUPS="$2"; shift 2 ;;
@@ -260,16 +313,20 @@ while [[ $# -gt 0 ]]; do
         --offline)           OFFLINE=1; shift ;;
         --skip-build)        SKIP_BUILD=1; shift ;;
         --fail-fast)         FAIL_FAST=1; shift ;;
+        --full)              shift ;;   # read before the defaults above
         --out-dir)           OUT_DIR="$2"; shift 2 ;;
         -h|--help)           awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; exit 0 ;;
         *)                   echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
+# This Mac's set: the large models need 64 GB, the small ones are the round below that.
+MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+if (( MEM_GB >= 64 )); then MODELS_DEFAULT="${MODELS_LARGE}"; else MODELS_DEFAULT="${MODELS_SMALL}"; fi
 [[ ${#MODELS[@]} -eq 0 ]] && IFS=',' read -r -a MODELS <<<"${MODELS_DEFAULT}"
 case "${MODELS[*]}" in
     all)   MODELS=("${MODELS_ALL[@]}") ;;
-    moe)   IFS=',' read -r -a MODELS <<<"${MODELS_MOE}" ;;
-    dense) IFS=',' read -r -a MODELS <<<"${MODELS_DENSE}" ;;
+    small) IFS=',' read -r -a MODELS <<<"${MODELS_SMALL}" ;;
+    large) IFS=',' read -r -a MODELS <<<"${MODELS_LARGE}" ;;
     full)  IFS=',' read -r -a MODELS <<<"${MODELS_FULL}" ;;
 esac
 # A bare stem resolves against MODELS_ALL; a full stem=id[:quant] is used as is.
@@ -368,7 +425,6 @@ STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 stamp="${STARTED_UTC//:/}"
 JSON="${OUT_DIR}/${slug}-${stamp}-$(git -C "${ROOT}" rev-parse HEAD | cut -c1-8).json"
 mkdir -p "${RAW}"
-MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 
 die() { echo "error: $*" >&2; exit 1; }
 command -v cargo >/dev/null || die "cargo not on PATH"
@@ -468,9 +524,10 @@ for row in "${ENGINE_ROWS[@]}"; do
     ENGINE_INFO+=$'\n'"${key}|${label}|$(engine_on "${key}" "${binvar}" && echo 1 || echo 0)|${!v:-}|$(pin_for "${pl}")"
 done
 PIN_PROBLEMS="$(printf '%s\n' ${pin_problems[@]+"${pin_problems[@]}"})"
-export ENGINE_INFO PIN_PROBLEMS UNPINNED
+CLASS_TABLE="$(printf '%s\n' "${CLASSES[@]}")"
+export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE
 export STARTED_UTC PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
-       SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS \
+       SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS \
        MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S MODELS_FULL
 python3 - "${JSON}" "${chip}" <<'PY'
 import json, os, subprocess, sys
@@ -506,6 +563,10 @@ json.dump({
              # so the page retires a dropped one while a subset (the MoE-only
              # default round, or any --models list) hides none.
              "current_models": e["MODELS_FULL"].split(","),
+             # One model per architecture class, small (below 64 GB) and large: the page's
+             # overview columns.
+             "classes": [dict(zip(("class", "small", "large"), row.split("|")))
+                         for row in e["CLASS_TABLE"].splitlines()],
              "cold_priming_launches": int(e["PRIME_LAUNCHES"]),
              "startup_request": {"input_len": int(e["INPUT_LEN"]), "output_len": int(e["OUTPUT_LEN"]),
                                  "warm_requests": int(e["WARM_REQUESTS"])},
@@ -517,6 +578,7 @@ json.dump({
                  "input": ints("SCALE_INPUT"), "output": ints("SCALE_OUTPUT"),
                  "grid_input": ints("SCALE_GRID_INPUT"), "grid_output": ints("SCALE_GRID_OUTPUT"),
                  "grid_conc": ints("SCALE_GRID_CONC") or sorted({1, int(e["SCALE_BASE_CONC"])}),
+                 "grid_users_output": ints("SCALE_GRID_USERS_OUTPUT") or ints("SCALE_GRID_OUTPUT"),
                  "base": {"input": int(e["SCALE_BASE_INPUT"]), "output": int(e["SCALE_BASE_OUTPUT"]),
                           "conc": int(e["SCALE_BASE_CONC"])},
                  "min_prompts_per_cell": int(e["SCALE_NUM_PROMPTS"]),
@@ -738,7 +800,21 @@ print(f"{j['output_throughput']:7.1f} tok/s · TTFT p50 {f(j['median_ttft_ms'], 
 PY
 }
 run_cell() { # prefix axis rung input output conc
-    (( cells_hung )) && return 0
+    # The cell before this one timed out or had failed requests: a fresh server, so a server
+    # that ran out of memory there is not what this cell measures. One that will not come back
+    # leaves the rest of the sweep unmeasured.
+    if (( cells_hung )); then
+        (( cells_dead )) && return 0
+        serve_down
+        if "${cell_restart}"; then
+            cells_hung=0
+            echo "    (server restarted)"
+        else
+            cells_dead=1
+            echo "    server would not restart; skipping this sweep's remaining cells"
+            return 0
+        fi
+    fi
     local out_json="$1.$2-$3.json" seed rc=0
     # Enough requests that the users count is kept full: one round alone is
     # a ramp-up and a drain, and fewer requests than users never fill it.
@@ -766,23 +842,28 @@ json.dump(j, open(sys.argv[1], "w"), indent=2)
 PY
     if (( rc == 142 )); then
         cells_hung=1
-        echo "timed out after ${CELL_TIMEOUT_S}s; skipping this server's remaining cells"
+        echo "timed out after ${CELL_TIMEOUT_S}s"
+        # The client wrote nothing: record the cell as one whose every request failed.
+        python3 - "${out_json}" "${n}" <<'PY2'
+import json, sys
+json.dump({"completed": 0, "failed": int(sys.argv[2]), "timed_out": True}, open(sys.argv[1], "w"), indent=2)
+PY2
     elif (( rc )); then
+        cells_hung=1
         echo "failed (see ${RAW}/cells-${stem}.log)"
     else
         numbers "${out_json}"
-        # A server that dropped requests has usually run out of memory, and the
-        # cells after this one only grow: stop its sweep rather than wait out a
-        # timeout per cell on a server whose generation has died.
+        # A server that dropped requests has usually run out of memory, and may
+        # answer the next cell at once with nothing: the next cell gets a fresh one.
         if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("failed") else 1)' "${out_json}" 2>/dev/null; then
             cells_hung=1
-            echo "    requests failed; skipping this server's remaining cells (see ${RAW}/cells-${stem}.log)"
+            echo "    requests failed (see ${RAW}/cells-${stem}.log)"
         fi
     fi
 }
-run_scale_cells() { # prefix [axes]
-    local prefix="$1" axes=",${2:-${SCALE_AXES}}," x o
-    cells_hung=0
+run_scale_cells() { # prefix restart-function [axes]
+    local prefix="$1" axes=",${3:-${SCALE_AXES}}," x o
+    cell_restart="$2"; cells_hung=0; cells_dead=0
     local -a xs os
     if [[ "${axes}" == *",conc,"* ]]; then
         IFS=',' read -r -a xs <<<"${CONC_LIST}"
@@ -806,12 +887,20 @@ run_scale_cells() { # prefix [axes]
     if [[ "${axes}" == *",grid,"* ]]; then
         IFS=',' read -r -a xs <<<"${SCALE_GRID_INPUT}"
         IFS=',' read -r -a os <<<"${SCALE_GRID_OUTPUT}"
-        local c gmax; local -a cs
+        local c gmax uos=",${SCALE_GRID_USERS_OUTPUT:-${SCALE_GRID_OUTPUT}},"; local -a cs
         IFS=',' read -r -a cs <<<"${GRID_CONC_LIST}"
         gmax=$(model_max_ctx "${id}")
         # Fewest users first: the whole 1-user grid is in hand before a larger
         # count can run a server out of memory and end its sweep.
+        # Above 1 user, only the answer lengths the users axis is read at
+        # (--scale-grid-users-output): the overview's heat maps are users x
+        # prompt at 64-token answers, and the long answers at many users
+        # are most of a sweep's time. 1 user keeps every answer length, the
+        # prompt x answer slice the sparklines read.
         for c in "${cs[@]}"; do for x in "${xs[@]}"; do for o in "${os[@]}"; do
+            if (( c > 1 )) && [[ "${uos}" != *",${o},"* ]]; then
+                continue
+            fi
             if (( gmax && x + o + 256 > gmax )); then
                 printf '    %-16s skipped: past the model'"'"'s %s-token context\n' "grid=${x}x${o}@${c}" "${gmax}"
                 continue
@@ -919,8 +1008,9 @@ run_engine() { # key label
         par=""; ctx=""; read -r par ctx <<<"$(axis_size "${ax}")"
         [[ -n "${par}" ]] || { echo "--- scaling sweep, ${label}: no axis called ${ax}, skipped"; continue; }
         echo "--- scaling sweep, ${label} ${ax} (${par} at once, context ${ctx})"
-        if serve_up "${RAW}/serve-${key}-${stem}.log" "$("${key}_ready")" bash -c "exec $("${key}_cmd" "${model}" "${par}" "${ctx}")"; then
-            run_scale_cells "${RAW}/scale-${key}-${stem}" "${ax}"
+        engine_axis_up() { serve_up "${RAW}/serve-${key}-${stem}.log" "$("${key}_ready")" bash -c "exec $("${key}_cmd" "${model}" "${par}" "${ctx}")"; }
+        if engine_axis_up; then
+            run_scale_cells "${RAW}/scale-${key}-${stem}" engine_axis_up "${ax}"
         else
             echo "    ${label} server never became ready — ${RAW}/serve-${key}-${stem}.log" >&2
         fi
@@ -1190,7 +1280,7 @@ PY
                 for ax in "${scratchy_axes[@]}"; do
                     echo "--- scaling sweep, scratchy ${ax}"
                     if scratchy_up; then
-                        run_scale_cells "${RAW}/scale-${stem}" "${ax}"
+                        run_scale_cells "${RAW}/scale-${stem}" scratchy_up "${ax}"
                     else
                         echo "    server never became ready — ${RAW}/serve-${stem}.log" >&2
                     fi

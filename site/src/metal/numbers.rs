@@ -95,34 +95,41 @@ impl Engine {
         }
     }
 
-    pub fn ladder(self, m: &Model) -> &[Rep] {
+    /// Its startup launches and its scaling cells in a run's model: the one table of which fields
+    /// are whose.
+    fn fields(self, m: &Model) -> (&Option<Vec<Rep>>, &Option<Vec<Cell>>) {
         match self {
-            Engine::Scratchy => &m.cache_ladder,
-            Engine::OmlxTq => &m.cache_ladder_omlx_tq,
-            Engine::Omlx => &m.cache_ladder_omlx,
-            Engine::MlxLm => &m.cache_ladder_mlx_lm,
-            Engine::VllmMetal => &m.cache_ladder_vllm_metal,
-            Engine::Ollama => &m.cache_ladder_ollama,
-            Engine::LlamaCpp => &m.cache_ladder_llama_cpp,
-            Engine::Mistralrs => &m.cache_ladder_mistralrs,
+            Engine::Scratchy => (&m.cache_ladder, &m.scaling),
+            Engine::OmlxTq => (&m.cache_ladder_omlx_tq, &m.scaling_omlx_tq),
+            Engine::Omlx => (&m.cache_ladder_omlx, &m.scaling_omlx),
+            Engine::MlxLm => (&m.cache_ladder_mlx_lm, &m.scaling_mlx_lm),
+            Engine::VllmMetal => (&m.cache_ladder_vllm_metal, &m.scaling_vllm_metal),
+            Engine::Ollama => (&m.cache_ladder_ollama, &m.scaling_ollama),
+            Engine::LlamaCpp => (&m.cache_ladder_llama_cpp, &m.scaling_llama_cpp),
+            Engine::Mistralrs => (&m.cache_ladder_mistralrs, &m.scaling_mistralrs),
         }
-        .as_deref()
-        .unwrap_or_default()
+    }
+
+    /// [`Engine::fields`], to fill them from an earlier run ([`super::borrow_earlier`]).
+    pub fn fields_mut(self, m: &mut Model) -> (&mut Option<Vec<Rep>>, &mut Option<Vec<Cell>>) {
+        match self {
+            Engine::Scratchy => (&mut m.cache_ladder, &mut m.scaling),
+            Engine::OmlxTq => (&mut m.cache_ladder_omlx_tq, &mut m.scaling_omlx_tq),
+            Engine::Omlx => (&mut m.cache_ladder_omlx, &mut m.scaling_omlx),
+            Engine::MlxLm => (&mut m.cache_ladder_mlx_lm, &mut m.scaling_mlx_lm),
+            Engine::VllmMetal => (&mut m.cache_ladder_vllm_metal, &mut m.scaling_vllm_metal),
+            Engine::Ollama => (&mut m.cache_ladder_ollama, &mut m.scaling_ollama),
+            Engine::LlamaCpp => (&mut m.cache_ladder_llama_cpp, &mut m.scaling_llama_cpp),
+            Engine::Mistralrs => (&mut m.cache_ladder_mistralrs, &mut m.scaling_mistralrs),
+        }
+    }
+
+    pub fn ladder(self, m: &Model) -> &[Rep] {
+        self.fields(m).0.as_deref().unwrap_or_default()
     }
 
     pub fn cells(self, m: &Model) -> &[Cell] {
-        match self {
-            Engine::Scratchy => &m.scaling,
-            Engine::OmlxTq => &m.scaling_omlx_tq,
-            Engine::Omlx => &m.scaling_omlx,
-            Engine::MlxLm => &m.scaling_mlx_lm,
-            Engine::VllmMetal => &m.scaling_vllm_metal,
-            Engine::Ollama => &m.scaling_ollama,
-            Engine::LlamaCpp => &m.scaling_llama_cpp,
-            Engine::Mistralrs => &m.scaling_mistralrs,
-        }
-        .as_deref()
-        .unwrap_or_default()
+        self.fields(m).1.as_deref().unwrap_or_default()
     }
 
     /// Whether this run measured the engine for this model at all.

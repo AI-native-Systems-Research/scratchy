@@ -72,7 +72,7 @@ impl fmt::Display for NonEmpty {
 }
 
 /// When a run started, `YYYY-MM-DDTHH:MM:SSZ`.
-#[derive(Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(try_from = "String")]
 pub struct Utc(String);
 
@@ -149,6 +149,9 @@ pub struct Config {
     pub cold_priming_launches: Option<u32>,
     pub kv_cache_dtype: Option<String>,
     pub scratchy_serve_args: Option<String>,
+    /// scratchy's `--gpu-memory-utilization` where the runner set it for the Mac's memory.
+    #[serde(default)]
+    pub scratchy_memory_util: Option<f64>,
     pub scaling: Option<Scaling>,
     /// Every engine with its version and pin; runs before pins have only
     /// `engine_versions` (mlx-lm and ollama).
@@ -165,8 +168,31 @@ pub struct Config {
     /// record a list kept only the default round, as `default_models`.
     #[serde(default)]
     pub current_models: Option<Vec<String>>,
+    /// The lineup this version of the runner measures, one model per architecture class
+    /// (`CLASSES` in the bench script); absent in runs from before it.
+    #[serde(default)]
+    pub classes: Option<Vec<Class>>,
     #[serde(default)]
     pub default_models: Option<Vec<String>>,
+}
+
+/// One architecture class of the lineup: its model below 64 GB of memory and at 64 GB and above.
+#[derive(Deserialize, Clone, PartialEq, Eq)]
+pub struct Class {
+    pub class: String,
+    pub small: String,
+    pub large: String,
+}
+
+impl Class {
+    /// The class's model on a Mac with `memory_gb` of memory.
+    pub fn model(&self, memory_gb: u32) -> &str {
+        if memory_gb >= 64 {
+            &self.large
+        } else {
+            &self.small
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -183,11 +209,28 @@ impl Config {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq)]
 pub struct Scaling {
+    /// The sweeps it ran (`grid`, `input`, ...).
+    #[serde(default)]
+    pub axes: Option<Vec<String>>,
     pub base: Option<Base>,
     pub grid_input: Option<Vec<u32>>,
     pub grid_output: Option<Vec<u32>>,
+    /// The grid's users counts; absent in runs from before the grid had its own.
+    #[serde(default)]
+    pub grid_conc: Option<Vec<u32>>,
+    /// The answer lengths the grid ran at above 1 user (`--scale-grid-users-output`); absent
+    /// in runs from before it, which ran every `grid_output` at every users count.
+    pub grid_users_output: Option<Vec<u32>>,
+    /// The longest grid prompt the Mac's memory held (`--scale-max-prompt`): longer
+    /// `grid_input` lengths were not run. None: every one was.
+    #[serde(default)]
+    pub max_prompt: Option<u32>,
+    /// The longest grid prompt run above 1 user (`--scale-max-prompt-users`); longer prompts
+    /// ran at 1 user only. None: every prompt `max_prompt` allows.
+    #[serde(default)]
+    pub max_prompt_users: Option<u32>,
 }
 
 /// What a model ran at when a limit lowered it (GLM-4.5-Air: 4 users).
@@ -215,7 +258,7 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<bool>>, D::E
 }
 
 /// The shape every non-grid measurement uses.
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq)]
 pub struct Base {
     pub input: Option<u32>,
     pub output: Option<u32>,
@@ -272,11 +315,22 @@ pub struct Model {
     /// failed (nothing timed), Some(None) not run, None from before the gate.
     #[serde(default, deserialize_with = "present")]
     pub parity_mlx_lm: Option<Option<bool>>,
+    /// Why the parity gate did not judge this model, where the runner skipped it on purpose.
+    #[serde(default)]
+    pub parity_skipped: Option<String>,
     #[serde(default)]
     pub scaling_limits: Option<Limits>,
     /// Only its presence matters: whether scratchy served anything warm.
     pub warm_serving: Option<serde_json::Map<String, serde_json::Value>>,
+    /// What an earlier run of this model on this machine filled in, and when that run was made:
+    /// an engine this run did not measure (by its key), or scratchy's frozen launches
+    /// ([`BORROWED_FROZEN`]). Empty for the numbers this run measured itself.
+    #[serde(skip)]
+    pub borrowed: BTreeMap<String, Utc>,
 }
+
+/// The [`Model::borrowed`] key for scratchy's frozen launches.
+pub const BORROWED_FROZEN: &str = "scratchy frozen";
 
 #[derive(Deserialize)]
 pub struct Footprint {
@@ -303,7 +357,7 @@ pub enum Scenario {
 }
 
 /// One launch (or request) of a cache ladder.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct Rep {
     pub scenario: Scenario,
     pub t_ready_s: Option<f64>,
@@ -327,7 +381,7 @@ impl Bytes {
 /// Each MLX checkpoint's weights: the `.safetensors` files scratchy and mlx-lm
 /// load, summed from the Hugging Face API (main, 2026-10-12). ollama runs its
 /// own build of the same model, named on its row.
-const WEIGHTS: [(&str, Bytes); 7] = [
+const WEIGHTS: [(&str, Bytes); 16] = [
     (
         "mlx-community/granite-3.3-2b-instruct-4bit",
         Bytes(1_425_458_043),
@@ -345,6 +399,25 @@ const WEIGHTS: [(&str, Bytes); 7] = [
     ("mlx-community/Qwen3.6-27B-4bit", Bytes(16_054_541_599)),
     ("mlx-community/gemma-4-31b-it-4bit", Bytes(18_412_016_676)),
     ("mlx-community/GLM-4.5-Air-3bit", Bytes(46_786_574_771)),
+    // The one-model-per-class round, small and large, from the same API (main, 2026-10-20).
+    ("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Bytes(11_774_668_888)),
+    ("scratchery/gpt-oss-120b-3bit", Bytes(51_448_416_856)),
+    (
+        "mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-4bit",
+        Bytes(17_775_428_300),
+    ),
+    (
+        "mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-OptiQ-2bit",
+        Bytes(47_460_151_014),
+    ),
+    (
+        "scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp",
+        Bytes(48_263_329_425),
+    ),
+    ("mlx-community/granite-4.1-8b-4bit", Bytes(5_238_406_779)),
+    ("mlx-community/granite-4.1-30b-4bit", Bytes(18_041_976_573)),
+    ("ibm-granite/granite-4.2-8b-q4-mlx", Bytes(4_945_853_970)),
+    ("ibm-granite/granite-4.2-30b-q4-mlx", Bytes(16_469_111_945)),
 ];
 
 impl Model {
@@ -372,7 +445,7 @@ pub enum At {
 }
 
 /// One `bench serve` cell of the scaling sweep.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(try_from = "RawCell")]
 pub struct Cell {
     pub at: At,
