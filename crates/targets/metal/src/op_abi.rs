@@ -143,7 +143,12 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         | L::AttnDecode { .. }
         | L::LoadRows { .. }
         | L::EmbeddingGather { .. }
-        | L::ExpertCombine { .. } => FRESH,
+        | L::ExpertCombine { .. }
+        // The greedy pick's idx stick (#603): the kernel reads the widened logits row and the
+        // seven staged tables and writes its OWN stick — a fresh buffer, never an alias of any
+        // operand. Metal never mints the argmax (the mint is the spyre bake's), but the rule
+        // table is exhaustive by law, and the stick's colour is FRESH whichever target runs it.
+        | L::ArgMax { .. } => FRESH,
         // The rest of a MoE block lives in the op scratch (`moe_write`), not the arena.
         L::RouterNorm { .. }
         | L::RouterLogits { .. }
