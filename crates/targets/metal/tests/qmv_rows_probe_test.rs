@@ -176,3 +176,113 @@ fn qmv_rows_plain_and_normalizing_on_load() {
         println!("{line}   ({:.1} MB of codes)", bytes as f64 / 1e6);
     }
 }
+
+/// Qwen3.6-35B-A3B's 4-bit dense projections a decode bucket's matvecs run.
+const BUCKET_SHAPES: &[Shape] = &[
+    shape("qwen3.6 lm_head", 248320, 2048, 4),
+    shape("qwen3.6 gdn in_proj", 12288, 2048, 4),
+    shape("qwen3.6 q+gate", 8192, 2048, 4),
+    shape("qwen3.6 gdn out_proj", 2048, 4096, 4),
+];
+
+/// A decode bucket's dense matvec, as the tape bakes it at the bucket's rows: the wide matvec
+/// (`AffineQmvWide`, its rows in tiles of at most 5 — one weight stream at 4 rows, two at 8)
+/// against the small-M matrix-unit twin (`AffineQmmSmallM`, one 8-row tile), which the tape runs
+/// instead on a `SMALL_M_TOKENS` step. This is what `SMALL_M_TOKENS`' bucket floor is measured on;
+/// NAX devices only.
+#[test]
+#[ignore = "measurement probe, not an assertion: run with --ignored --nocapture"]
+fn qmv_wide_against_small_m_twin_by_bucket() {
+    use scratchy_target_metal::tape::quantized::{
+        SMALL_M_SIMDGROUPS, SMALL_M_TILE_COLS, SmallMTile, small_m_kernel_static_name,
+    };
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    if !scratchy_target_metal::targets::is_nax_capable(di.profile.generation) {
+        eprintln!("skipping: no NAX matrix unit");
+        return;
+    }
+    let device = di.device.clone();
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
+    println!("µs a dispatch at a bucket's rows: wide matvec (w) and small-M twin (t)");
+    for s in BUCKET_SHAPES {
+        let (n, k) = (s.n as usize, s.k as usize);
+        let bytes = n * k * s.bits as usize / 8;
+        let copies = ROTATED_BYTES / bytes + 1;
+        let groups = n * k / GROUP as usize;
+        let weights: Vec<_> = (0..copies)
+            .map(|c| {
+                let codes: Vec<u32> = (0..bytes as u32 / 4)
+                    .map(|i| i.wrapping_mul(2654435761).wrapping_add(c as u32))
+                    .collect();
+                (
+                    shared_slice(&device, &codes),
+                    shared_slice(&device, &bf16_row(groups, 0.002)),
+                    shared_slice(&device, &bf16_row(groups, -0.015)),
+                )
+            })
+            .collect();
+        let x = shared_slice(&device, &bf16_row(8 * k, 0.5));
+        let y = shared_zeroed(&device, 8 * n * 2);
+        let mut line = format!("{:<22}", s.name);
+        for bucket in [4u32, 8] {
+            let kernel = pick_qmv_kernel_wide(s.n, s.k, s.bits, bucket, true);
+            let wide_name =
+                qmv_kernel_static_name(kernel, DequantDtype::Bf16, ScaleDtype::Bf16, s.bits, GROUP);
+            let wide_constants: Vec<ConstantValue> = AffineQmvWideConstants {
+                k: KDimI32(s.k as i32),
+                n: NDimI32(s.n as i32),
+                m: MDimI32(bucket as i32),
+                codes: AffineCodes::AsWritten,
+            }
+            .into();
+            let wide = baked_build(
+                &cache,
+                &PipelineKey::new("quantized_qmv", wide_name, wide_constants),
+            )
+            .expect(wide_name);
+            let tile = SmallMTile::for_bucket(bucket).expect("a small-M bucket");
+            let twin_name =
+                small_m_kernel_static_name(DequantDtype::Bf16, ScaleDtype::Bf16, GROUP, tile);
+            let twin = baked_build(
+                &cache,
+                &PipelineKey::new(
+                    "quantized_qmm_nax",
+                    twin_name,
+                    vec![
+                        ConstantValue::int(0, s.k as i32),
+                        ConstantValue::int(1, s.n as i32),
+                        ConstantValue::int(2, bucket as i32),
+                    ],
+                ),
+            )
+            .expect(twin_name);
+            let wide_shape = qmv_dispatch_shape(kernel, bucket, s.n, 1);
+            let twin_shape = (
+                (s.n / SMALL_M_TILE_COLS, bucket.div_ceil(tile.rows()), 1),
+                (32 * SMALL_M_SIMDGROUPS, 1, 1),
+            );
+            for (tag, pso, (grid, threads)) in [('w', &wide, wide_shape), ('t', &twin, twin_shape)]
+            {
+                let time = || {
+                    let mut batch = Mtl4DispatchBatch::begin(&device).expect("mtl4 batch");
+                    for i in 0..ITERS {
+                        let (w, scales, biases) = &weights[i % copies];
+                        let binds = [(w, 0), (scales, 1), (biases, 2), (&x, 3), (&y, 4)];
+                        batch.encode(pso, &binds, &[], &[], &[], size(grid), size(threads));
+                        batch.barrier();
+                    }
+                    let t0 = std::time::Instant::now();
+                    batch.commit(true);
+                    t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64
+                };
+                time();
+                let best = (0..3).map(|_| time()).fold(f64::MAX, f64::min);
+                line += &format!("  {bucket}{tag} {best:8.1}");
+            }
+        }
+        println!("{line}   ({:.1} MB of codes)", bytes as f64 / 1e6);
+    }
+}
