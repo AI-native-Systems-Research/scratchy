@@ -23,7 +23,9 @@ Writes to `--out`:
                      top-2 margin and the bfloat16 run's max |error| on that step's last row
 
 Needs only torch and transformers. The plain-torch path must be the one that runs, so this refuses
-to start when `fla`, `causal_conv1d` or `kernels` is importable.
+to start when `fla`, `causal_conv1d` or `kernels` is importable. It also refuses a `--revision` other
+than `PINNED_REVISION`, and a checkpoint whose one safetensors file's sha256 is not `PINNED_SHA256`,
+before it loads anything: the goldens are of that checkpoint only.
 """
 
 import argparse
@@ -34,6 +36,8 @@ import os
 import sys
 
 PINNED_REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
+# The sha256 of the pinned revision's one safetensors file.
+PINNED_SHA256 = "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
 GREEDY_PROMPTS = 5
 GREEDY_STEPS = 8
 
@@ -61,6 +65,18 @@ def safetensors_files(checkpoint):
         with open(index) as f:
             return sorted(set(json.load(f)["weight_map"].values()))
     return ["model.safetensors"]
+
+
+def refuse_unpinned(revision, shas):
+    """Exit unless `revision` is the pinned one and `shas` (file -> sha256) is one file of the
+    pinned sha256."""
+    if revision != PINNED_REVISION:
+        sys.exit(f"cuda_hf_reference: --revision {revision}; the goldens are of {PINNED_REVISION}")
+    if sorted(shas.values()) != [PINNED_SHA256]:
+        sys.exit(
+            f"cuda_hf_reference: the checkpoint's safetensors sha256 are {shas}; the pinned "
+            f"revision's one file is {PINNED_SHA256}"
+        )
 
 
 def prompts(path):
@@ -98,6 +114,9 @@ def main():
     ap.add_argument("--revision", default=PINNED_REVISION)
     args = ap.parse_args()
     refuse_kernel_packages()
+    files = safetensors_files(args.checkpoint)
+    shas = {f: sha256(os.path.join(args.checkpoint, f)) for f in files}
+    refuse_unpinned(args.revision, shas)
 
     import torch
     import transformers
@@ -111,11 +130,10 @@ def main():
         m = Qwen3_5ForConditionalGeneration.from_pretrained(args.checkpoint, dtype=dtype)
         m.eval()
         models[name] = m
-    files = safetensors_files(args.checkpoint)
     meta = {
         "checkpoint": os.path.abspath(args.checkpoint),
         "revision": args.revision,
-        "safetensors_sha256": {f: sha256(os.path.join(args.checkpoint, f)) for f in files},
+        "safetensors_sha256": shas,
         "torch": torch.__version__,
         "transformers": transformers.__version__,
         "vocab": models["f32"].config.text_config.vocab_size,

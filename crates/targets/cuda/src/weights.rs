@@ -61,6 +61,14 @@ struct Read {
 }
 
 impl CudaWeight {
+    /// The tensor that names this entry: a bf16 entry's one tensor, a bundle's conv1d.
+    pub fn lead(&self) -> &'static str {
+        match *self {
+            Self::Bf16 { tensor, .. } => tensor,
+            Self::GdnBundle { conv1d, .. } => conv1d,
+        }
+    }
+
     /// The tensors this entry reads, each with its dtypes and shape.
     fn reads(&self) -> Vec<Read> {
         match *self {
@@ -138,10 +146,12 @@ pub enum LoadError {
         got: Vec<u64>,
         want: Vec<u64>,
     },
-    /// Weight `ix` packs to `packed` bytes; the largest any tape declares is `declared`. An index
-    /// with no entry packs to 0.
+    /// Weight `ix`, which reads `tensor` (a bundle's first, its conv1d; `None` for an index with
+    /// no entry, which packs to 0), packs to `packed` bytes; the largest any tape declares is
+    /// `declared`.
     Bytes {
         ix: usize,
+        tensor: Option<&'static str>,
         packed: u64,
         declared: u64,
     },
@@ -195,11 +205,22 @@ impl std::fmt::Display for LoadError {
             ),
             Self::Bytes {
                 ix,
+                tensor: Some(tensor),
                 packed,
                 declared,
             } => write!(
                 f,
-                "weight {ix} packs to {packed} bytes; the tapes declare {declared}"
+                "weight {ix} ({tensor}) packs to {packed} bytes; the tapes declare {declared}"
+            ),
+            Self::Bytes {
+                ix,
+                tensor: None,
+                packed,
+                declared,
+            } => write!(
+                f,
+                "weight {ix} (no entry, no tensor) packs to {packed} bytes; the tapes declare \
+                 {declared}"
             ),
             #[cfg(feature = "nvcc")]
             Self::Upload { ix, error } => write!(f, "weight {ix}: the upload failed: {error}"),
@@ -338,6 +359,7 @@ pub fn check<A: DeviceAllocator>(
             if declared != 0 {
                 return Err(LoadError::Bytes {
                     ix,
+                    tensor: None,
                     packed: 0,
                     declared,
                 });
@@ -349,6 +371,7 @@ pub fn check<A: DeviceAllocator>(
         if packed != declared {
             return Err(LoadError::Bytes {
                 ix,
+                tensor: Some(entry.lead()),
                 packed,
                 declared,
             });
@@ -385,6 +408,7 @@ pub fn stage<A: DeviceAllocator>(
         } => {
             let layout = gdn_bundle(conv_dim, conv_kernel, nv, head_v).ok_or(LoadError::Bytes {
                 ix,
+                tensor: Some(conv1d),
                 packed: u64::MAX,
                 declared: 0,
             })?;

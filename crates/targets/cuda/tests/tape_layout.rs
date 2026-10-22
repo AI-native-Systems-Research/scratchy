@@ -38,13 +38,16 @@ use scratchy_subtile::subtile_ir::{
 };
 use scratchy_subtile::subtile_tape::Instr;
 use scratchy_target_cuda::step::{CudaStep, GemmBf16};
-use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, CUDA_ARENA_ALIGN, CudaTape, TapeInput};
+use scratchy_target_cuda::tape::{
+    ArenaOffset, ArenaSpan, CUDA_ARENA_ALIGN, CudaTape, TapeInput, WeightIx,
+};
 use scratchy_target_cuda_compiler::canonical::{
     ArenaRefusal, AttnShapeRule, CanonicalAt, CanonicalRefusal, CudaGdnFacts, CudaModelFacts,
     GateShapeRule, GdnRegions, GdnShapeRule, GdnWidths, GemmShapeRule, KvCacheRefusal,
     OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule, ViewRefusal, lower_canonical,
     plan_canonical,
 };
+use scratchy_target_cuda_compiler::emit::static_tape;
 use scratchy_target_cuda_compiler::steps_from_tape::{StepCx, TapeStep, lower_step};
 
 const fn span(offset: u64, bytes: u64) -> ArenaSpan {
@@ -156,18 +159,36 @@ fn the_three_gemm_chain_reuses_y1s_colour_for_y3() {
     assert!(t.arena.total_bytes < per_value);
 }
 
+/// A decode GEMM (`m = 1`) lowers to the GEMV, the tiled GEMM's operands at one row; a `k` off
+/// the GEMV's 8-wide vector is refused by its rule, naming it.
 #[test]
-fn a_decode_gemm_is_refused_naming_m_1() {
+fn a_decode_gemm_lowers_to_the_gemv() {
+    let c = lower_with(&with_hidden(gemm_m1_only_input()), QWEN3_5_FACTS)
+        .expect("a one-row GEMM lowers");
+    assert!(matches!(
+        c.steps.as_slice(),
+        [CudaStep::Gemv(GemmBf16 {
+            a: ArenaOffset(0),
+            b: WeightIx(1),
+            m: 1,
+            n: 2048,
+            k: 2048,
+            ..
+        })]
+    ));
     let e = refused(
-        &front_end_lowered(gemm_m1_only_input()),
-        &["m=1", "decode GEMV"],
+        &with_hidden(chain_input(1, 100, &[1024])),
+        &["m=1", "k = 100", "multiple of 8", "GEMV"],
     );
     assert!(matches!(
         e,
         CanonicalRefusal::GemmShape {
             step: 0,
             m: 1,
-            rule: GemmShapeRule::Decode,
+            rule: GemmShapeRule::GemvOffVector {
+                value: 100,
+                multiple: 8
+            },
             ..
         }
     ));
@@ -250,17 +271,19 @@ fn a_canonical_with_no_embedded_hidden_is_refused() {
     ));
 }
 
-/// A llama decode layer lowers its first op, the norm, and is refused at the first op after it:
-/// a one-row (decode) GEMM.
+/// A llama decode layer lowers its norm and its three one-row GEMMs (GEMVs), and is refused at
+/// the first op after them: its rope, whose cos the shared fixture binds as a weight.
 #[test]
-fn a_layer_lowers_its_norm_and_is_refused_at_its_first_gemm() {
-    let e = refused(&with_hidden(one_layer_input()), &["m=1", "decode GEMV"]);
+fn a_layer_lowers_its_norm_and_gemvs_and_is_refused_at_its_rope() {
+    let e = refused(
+        &with_hidden(one_layer_input()),
+        &["step 4", "RopeRotate", "rotary table"],
+    );
     assert!(matches!(
         e,
-        CanonicalRefusal::GemmShape {
-            step: 1,
-            m: 1,
-            rule: GemmShapeRule::Decode,
+        CanonicalRefusal::RotaryOperand {
+            step: 4,
+            operand: 1,
             ..
         }
     ));
@@ -1403,39 +1426,100 @@ fn attn_only(m: u32, g: ModelAttnGeometry) -> LoweredDecode {
     l
 }
 
-/// One row is decode attention, the next issue's kernel.
+/// One row is decode attention: the layer at `m = 1` lowers its attention to the decode kernel,
+/// with the prefill kernel's operands at one row and the tape's KV regions.
 #[test]
-fn a_decode_attention_is_refused() {
-    let e = refused(
-        &attn_only(1, geom(8, 2, 256)),
-        &["AttnDecode", "rows=1", "decode"],
+fn a_one_row_attention_lowers_to_the_decode_attention() {
+    let c = lower_with(&attn_layer(1), QWEN3_5_FACTS).expect("the attention layer lowers at m = 1");
+    let attn: Vec<_> = (c.steps.iter())
+        .filter_map(|s| match s {
+            CudaStep::AttnDecode(a) => Some(*a),
+            CudaStep::AttnPrefill(_) => panic!("a one-row attention on the prefill kernel"),
+            _ => None,
+        })
+        .collect();
+    let kv = c.kv.as_ref().expect("the layer has a KV cache");
+    let [a] = attn.as_slice() else {
+        panic!("one decode attention, got {attn:?}");
+    };
+    assert_eq!(
+        (
+            a.rows,
+            a.q_heads,
+            a.kv_heads,
+            a.head_dim,
+            a.layer,
+            a.scale()
+        ),
+        (1, 8, 2, 256, 0, 0.0625)
     );
+    assert_eq!(a.block_table, kv.block_table.offset);
+    assert_eq!(a.sequence, kv.sequence.offset);
+    // The steps `tape_player`'s decode test reads: the query's rope, the append, the attention;
+    // the projections GEMVs.
     assert!(matches!(
-        e,
-        CanonicalRefusal::AttnShape {
-            step: 0,
-            rows: 1,
-            rule: AttnShapeRule::Decode,
-            ..
-        }
+        c.steps[7..10],
+        [
+            CudaStep::Rope(_),
+            CudaStep::RopeAppend(_),
+            CudaStep::AttnDecode(_)
+        ]
     ));
+    for i in [1, 4, 6, 11] {
+        assert!(
+            matches!(c.steps[i], CudaStep::Gemv(GemmBf16 { m: 1, .. })),
+            "step {i}: {:?}",
+            c.steps[i]
+        );
+    }
+    // That test reads `qn` (the rope's input), `kr` and `v` (the append's) and `attn` back from
+    // the arena after the forward: no step after the one writing each overwrites it.
+    let (CudaStep::Rope(rope), CudaStep::RopeAppend(append)) = (c.steps[7], c.steps[8]) else {
+        unreachable!("matched above");
+    };
+    let row = |at: ArenaOffset, cols: u32| span(at.0, 2 * u64::from(cols));
+    for (what, read, from) in [
+        ("qn", row(rope.x, rope.cols), 7),
+        ("kr", row(append.k_out, append.cols), 8),
+        ("v", row(append.v, append.cols), 8),
+        ("attn", row(a.out, a.q_heads * a.head_dim), 9),
+    ] {
+        for (i, s) in c.steps.iter().enumerate().skip(from + 1) {
+            let e = s.extents().expect("extents fit");
+            for w in [Some(e.writes), e.second_write].into_iter().flatten() {
+                let (r0, w0) = (read.offset.0, w.offset.0);
+                assert!(
+                    w0 + w.bytes <= r0 || r0 + read.bytes <= w0,
+                    "step {i} overwrites {what}, which the decode player test reads"
+                );
+            }
+        }
+    }
+    let tape = static_tape(&c);
+    tape.validate().expect("the one-row layer validates");
 }
 
+/// Rows that are neither one (the decode kernel's) nor a multiple of the prefill CTA's 128.
 #[test]
 fn an_attention_off_the_cta_rows_is_refused() {
-    let e = refused(
-        &attn_only(192, geom(8, 2, 256)),
-        &["AttnDecode", "rows=192", "128"],
-    );
-    assert!(matches!(
-        e,
-        CanonicalRefusal::AttnShape {
-            step: 0,
-            rows: 192,
-            rule: AttnShapeRule::RowsOffTile { multiple: 128 },
-            ..
-        }
-    ));
+    for rows in [2, 192] {
+        let e = refused(
+            &attn_only(rows, geom(8, 2, 256)),
+            &["AttnDecode", &format!("rows={rows}"), "1", "128"],
+        );
+        assert!(
+            matches!(
+                e,
+                CanonicalRefusal::AttnShape {
+                    step: 0,
+                    rows: r,
+                    rule: AttnShapeRule::RowsOffTile { multiple: 128 },
+                    ..
+                } if r == rows
+            ),
+            "rows = {rows}"
+        );
+    }
 }
 
 #[test]
@@ -1732,10 +1816,11 @@ fn a_narrow_gemm_off_the_vector_is_refused() {
     ));
 }
 
-/// The narrow GEMM's rows are not tiled: any `m` above 1 lowers to it, and `m = 1` is still the
-/// decode GEMV.
+/// The narrow GEMM's rows are not tiled: any `m` lowers to it, one row included (its bits for a
+/// row do not depend on the row's place, so a decode's `a` and `b` projections keep the
+/// prefill's).
 #[test]
-fn a_narrow_gemm_takes_any_rows_but_one() {
+fn a_narrow_gemm_takes_any_rows() {
     let c = lower_with(&with_hidden(chain_input(37, 8, &[64])), QWEN3_5_FACTS)
         .expect("a 37-row narrow GEMM lowers");
     assert!(matches!(
@@ -1747,13 +1832,16 @@ fn a_narrow_gemm_takes_any_rows_but_one() {
             ..
         })]
     ));
-    let e = refused(&with_hidden(chain_input(1, 1024, &[16])), &["m=1"]);
+    let c = lower_with(&with_hidden(chain_input(1, 1024, &[16])), QWEN3_5_FACTS)
+        .expect("a one-row narrow GEMM lowers");
     assert!(matches!(
-        e,
-        CanonicalRefusal::GemmShape {
-            rule: GemmShapeRule::Decode,
+        c.steps.as_slice(),
+        [CudaStep::GemmNarrow(GemmBf16 {
+            m: 1,
+            n: 16,
+            k: 1024,
             ..
-        }
+        })]
     ));
 }
 

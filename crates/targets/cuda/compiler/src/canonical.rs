@@ -466,11 +466,10 @@ pub enum RopeShapeRule {
 /// Which rule an attention's shape breaks: the prefill kernel's, stated at expansion time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttnShapeRule {
-    /// One row: decode attention, which has no kernel yet.
-    Decode,
-    /// `rows` is zero or not a multiple of `multiple`, the query rows of one CTA.
+    /// `rows` is neither 1 (the decode kernel's) nor a non-zero multiple of `multiple`, the query
+    /// rows of one prefill CTA.
     RowsOffTile { multiple: u32 },
-    /// `head_dim` is not the one the kernel is instantiated for.
+    /// `head_dim` is not the one the bucket's kernel is instantiated for.
     HeadDim { want: u32 },
 }
 
@@ -519,8 +518,6 @@ pub enum GateShapeRule {
 /// Which rule a GEMM's shape breaks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GemmShapeRule {
-    /// `m = 1`: a decode GEMV, which has no kernel yet.
-    Decode,
     /// `dim` is zero or not a multiple of the kernel's `tile`.
     OffTile {
         dim: &'static str,
@@ -536,6 +533,9 @@ pub enum GemmShapeRule {
         value: u32,
         multiple: u32,
     },
+    /// `m = 1` and `n` is not the narrow GEMM's, and the GEMV's `k` is zero or not a multiple of
+    /// its `multiple`.
+    GemvOffVector { value: u32, multiple: u32 },
 }
 
 /// Why an operand cannot be bound.
@@ -756,7 +756,7 @@ impl std::fmt::Display for CanonicalRefusal {
             } => write!(
                 f,
                 "step {step} (AttnDecode) is rows={rows} head_dim={head_dim}, which the bf16 \
-                 prefill attention refuses: {rule}"
+                 attention refuses: {rule}"
             ),
             Self::AttnSinks { step } => write!(
                 f,
@@ -961,13 +961,10 @@ impl std::fmt::Display for RopeShapeRule {
 impl std::fmt::Display for AttnShapeRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Decode => write!(
-                f,
-                "rows = 1 is decode attention, and CUDA has no decode attention kernel yet"
-            ),
             Self::RowsOffTile { multiple } => write!(
                 f,
-                "rows must be a non-zero multiple of {multiple}, the query rows of one CTA"
+                "rows must be 1, the decode kernel's one query row, or a non-zero multiple of \
+                 {multiple}, the query rows of one prefill CTA"
             ),
             Self::HeadDim { want } => write!(
                 f,
@@ -1039,10 +1036,6 @@ impl std::fmt::Display for GateShapeRule {
 impl std::fmt::Display for GemmShapeRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Decode => write!(
-                f,
-                "m = 1 is a decode GEMV, and CUDA has no decode GEMV kernel yet"
-            ),
             Self::OffTile { dim, value, tile } => write!(
                 f,
                 "{dim} = {value} must be a non-zero multiple of {tile}, the bf16 GEMM's tile"
@@ -1060,6 +1053,11 @@ impl std::fmt::Display for GemmShapeRule {
                 f,
                 "{dim} = {value} must be a non-zero multiple of {multiple}, the narrow bf16 \
                  GEMM's 16-byte vector"
+            ),
+            Self::GemvOffVector { value, multiple } => write!(
+                f,
+                "k = {value} must be a non-zero multiple of {multiple}, the bf16 GEMV's 16-byte \
+                 vector"
             ),
         }
     }

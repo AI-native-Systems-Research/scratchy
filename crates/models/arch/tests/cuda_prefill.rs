@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-//! One whole-model prefill forward of qwen3.5-0.8b's emitted CUDA tapes on the H100.
+//! Whole-model prefill and decode forwards of qwen3.5-0.8b's emitted CUDA tapes on the H100.
 //!
 //! The tapes are `CUDA_TAPES`, exactly as `#[forward]` emitted them; the weights are synthetic,
 //! each buffer sized from the tapes' `weight_bytes` and filled by what reads it: a GEMM's `[N, K]`
 //! matrix uniform in ±1/√K, a norm's zero-centred gain in ±0.1, a GDN layer's packed f32 bundle
-//! in the ranges the GDN kernel tests use, the embedding table's rows uniform in ±1 (which the
+//! in the ranges the GDN kernel tests use, the embedding table's rows uniform in ±1/32 (which the
 //! tied lm_head reads too, a `[vocab, hidden]` matrix, so it is filled as a matrix of `k =
-//! hidden`). The input is token ids, uniform over the vocabulary and seeded; padding rows are id
+//! hidden`: ±1/√1024). The input is token ids, uniform over the vocabulary and seeded; padding rows are id
 //! 0. Checks:
 //!
-//! - (a) the worker takes all four tapes, and its arena is the largest tape's;
+//! - (a) the worker takes every tape, and its arena is the largest tape's;
 //! - (b) a fresh 300-token forward in the m=512 bucket gives finite logits on every real row;
 //! - (c) the lm_head GEMM, read back from the arena, against an f64 reference on six rows over
 //!   every column, under the GEMM bound of `numerics.rs`;
@@ -25,7 +25,18 @@
 //! - (g) a KV sequence and a GDN sequence that disagree on fresh are refused before any copy;
 //! - (h) the worker allocates the weights, the arena and the two pools, and a forward nothing;
 //! - (i) a token id outside the vocabulary, a count other than the bucket's and hidden rows are
-//!   refused before any copy.
+//!   refused before any copy;
+//! - (j) the worker takes all five tapes (the m=1 decode tape among them), its arena the largest's,
+//!   266 + 3 allocations at setup and none across one prefill and 8 decodes;
+//! - (k) 300 tokens prefilled, then decodes of positions 300..307, each against the same row of one
+//!   308-token forward: finite, cosine ≥ 0.999 (a bound, not bits: the decode runs the GEMV and
+//!   the decode attention, the prefill the tiled GEMM and the prefill attention); the last
+//!   decode's lm_head GEMV within the GEMM bound of f64 over every column;
+//! - (l) the prefill and 8 decodes repeated in disjoint blocks and slot are bit-identical;
+//! - (m) the 8 decodes leave the cache at positions 0..300 bit-unchanged;
+//! - (n) decodes at P = 319 and P = 320 (a new block) are finite and within (k)'s cosine;
+//! - (o) at m=1, a wrong position, a short block table, fresh at P > 0 and q_len = 2 are refused
+//!   before any copy.
 //!
 //! Built only under `nvcc` (`required-features`), and needs an sm_90 GPU: no GPU fails rather
 //! than skips. Every check prints its line before a test fails, so one run reports every number.
@@ -40,7 +51,7 @@ use half::bf16;
 use numerics::{bf16_inputs, compare, f32_inputs, f32_to_halves};
 use scratchy_models::qwen3_5::qwen3_5_0_8b::CUDA_TAPES;
 use scratchy_target_cuda::runtime::{
-    CudaDevice, CudaWorker, DeviceBuffer, ForwardError, GdnPoolConfig, GdnSequence, Input,
+    CudaDevice, CudaWorker, DeviceBuffer, ForwardError, GdnPoolConfig, GdnSequence, Input, KvHalf,
     KvPoolConfig, KvSequence,
 };
 use scratchy_target_cuda::step::{
@@ -102,7 +113,8 @@ fn roles() -> Vec<Option<Role>> {
                     set(table.0, Role::Matrix { k: hidden })
                 }
                 CudaStep::Gemm(GemmBf16 { b, k, .. })
-                | CudaStep::GemmNarrow(GemmBf16 { b, k, .. }) => set(b.0, Role::Matrix { k }),
+                | CudaStep::GemmNarrow(GemmBf16 { b, k, .. })
+                | CudaStep::Gemv(GemmBf16 { b, k, .. }) => set(b.0, Role::Matrix { k }),
                 CudaStep::RmsNorm(n) => set(n.gain.0, Role::Gain),
                 CudaStep::GatedDeltaNet(GatedDeltaNetBf16 {
                     bundle,
@@ -568,16 +580,13 @@ fn h_the_worker_allocates_once() {
     let after_worker = r.device.allocations();
     let weights = after_weights - r.before_weights;
     let worker_allocs = after_worker - after_weights;
-    let nonzero = (0..CUDA_TAPES[0].weight_bytes.len())
-        .filter(|&ix| CUDA_TAPES.iter().any(|t| t.weight_bytes[ix] > 0))
-        .count() as u64;
     for _ in 0..5 {
         let _ = fresh_300(&mut worker, SEAT_A);
     }
     let forwards = r.device.allocations() - after_worker;
-    let ok = weights == nonzero && worker_allocs == 3 && forwards == 0;
+    let ok = weights == 266 && worker_allocs == 3 && forwards == 0;
     eprintln!(
-        "(h) allocations: weights={weights} (expect {nonzero}) worker={worker_allocs} (expect 3: \
+        "(h) allocations: weights={weights} (expect 266) worker={worker_allocs} (expect 3: \
          arena, KV pool, GDN pool) after five forwards={forwards} (expect 0) {}",
         verdict(ok)
     );
@@ -653,4 +662,338 @@ fn i_token_ids_are_checked_before_any_copy() {
         pass &= ok;
     }
     assert!(pass, "a bad token-id input was not refused before any copy");
+}
+
+// ── Decode: one token at a time through the m=1 tape ───────────────
+
+/// The decodes (k) through (n) run after their prefill.
+const DECODES: u32 = 8;
+
+/// The cosine of two bf16 rows, in f64.
+fn cosine(a: &[u16], b: &[u16]) -> f64 {
+    let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+    for (&x, &y) in a.iter().zip(b) {
+        let (x, y) = (
+            f64::from(bf16::from_bits(x).to_f32()),
+            f64::from(bf16::from_bits(y).to_f32()),
+        );
+        ab += x * y;
+        aa += x * x;
+        bb += y * y;
+    }
+    ab / (aa.sqrt() * bb.sqrt())
+}
+
+/// The largest |a − b| over two bf16 rows, as f32.
+fn max_diff(a: &[u16], b: &[u16]) -> f32 {
+    (a.iter().zip(b))
+        .map(|(&x, &y)| (bf16::from_bits(x).to_f32() - bf16::from_bits(y).to_f32()).abs())
+        .fold(0f32, f32::max)
+}
+
+fn all_finite(row: &[u16]) -> bool {
+    row.iter().all(|&b| bf16::from_bits(b).to_f32().is_finite())
+}
+
+/// A fresh `prefill`-token forward in the m=512 bucket, then one decode per token of `decodes`
+/// (one row, the m=1 tape) at positions `prefill, prefill + 1, …`, in `seat`: each decode's
+/// logits, `[VOCAB]`.
+fn prefill_then_decode(
+    worker: &mut CudaWorker<'_>,
+    (prefill, decodes): (&[u32], &[u32]),
+    seat: Seat,
+) -> Vec<Vec<u16>> {
+    forward(worker, 512, prefill, 0, seat).expect("the prefill");
+    (decodes.iter().enumerate())
+        .map(|(i, &token)| {
+            let p = (prefill.len() + i) as u32;
+            forward(worker, 1, &[token], p, seat).unwrap_or_else(|e| panic!("decode at {p}: {e}"))
+        })
+        .collect()
+}
+
+/// Every KV layer's K and V of `seat`'s first `tokens` positions, read back from the pool:
+/// per layer and half, `[tokens, kv_heads · head_dim]` bf16.
+fn cached_rows(worker: &mut CudaWorker<'_>, seat: Seat, tokens: usize) -> Vec<Vec<u16>> {
+    let kv = CUDA_TAPES[bucket(1)].kv.expect("a KV cache");
+    let (heads, bs, hd) = (
+        kv.kv_heads as usize,
+        kv.block_size as usize,
+        kv.head_dim as usize,
+    );
+    let mut out = Vec::new();
+    for layer in 0..kv.layers.len() {
+        for half in [KvHalf::K, KvHalf::V] {
+            let blocks: Vec<Vec<u16>> = (seat.blocks[..tokens.div_ceil(bs)].iter())
+                .map(|&b| {
+                    let mut block = vec![0u16; heads * bs * hd];
+                    worker.read_kv(layer, half, b, &mut block).expect("read_kv");
+                    block
+                })
+                .collect();
+            let mut rows = Vec::with_capacity(tokens * heads * hd);
+            for t in 0..tokens {
+                for h in 0..heads {
+                    rows.extend_from_slice(&blocks[t / bs][(h * bs + t % bs) * hd..][..hd]);
+                }
+            }
+            out.push(rows);
+        }
+    }
+    out
+}
+
+/// (j): the worker takes all five tapes (the m=1 decode tape among them) in the arena of the
+/// largest; the weights, the arena and the two pools are the setup's 266 + 3 allocations, and one
+/// prefill and eight decodes allocate nothing.
+#[test]
+fn j_the_decode_tape_allocates_nothing() {
+    let r = rig();
+    let after_weights = r.device.allocations();
+    let mut worker = r.worker();
+    let after_worker = r.device.allocations();
+    let (weights, setup) = (
+        after_weights - r.before_weights,
+        after_worker - after_weights,
+    );
+    let ms: Vec<u32> = CUDA_TAPES.iter().map(|t| t.bucket_m).collect();
+    let arena = worker.arena_bytes();
+    let rows = sequence_rows((Q + DECODES) as usize);
+    let (prefill, decodes) = rows.split_at(Q as usize);
+    let _ = prefill_then_decode(&mut worker, (prefill, decodes), SEAT_A);
+    let during = r.device.allocations() - after_worker;
+    let ok = ms == [1, 512, 1024, 2048, 4096]
+        && arena == 2_585_035_776
+        && weights == 266
+        && setup == 3
+        && during == 0;
+    eprintln!(
+        "(j) tapes {ms:?} arena_bytes={arena} (expect 2585035776) allocations weights={weights} \
+         (expect 266) worker={setup} (expect 3) across one prefill and {DECODES} decodes={during} \
+         (expect 0) {}",
+        verdict(ok)
+    );
+    assert!(
+        ok,
+        "the decode worker's tapes, arena or allocations are wrong"
+    );
+}
+
+/// (k): 300 fresh tokens prefilled in m=512, then the decodes of positions 300..307 one at a
+/// time, against rows 300..307 of one 308-token m=512 forward in disjoint blocks and slot: two
+/// different kernel paths (the GEMV and the decode attention against the tiled GEMM and the
+/// prefill attention), so a bound, not bits: every logit finite, cosine ≥ 0.999 per row, the max
+/// |difference| printed. And the last decode's lm_head GEMV, read back from the arena, within
+/// #761's bound of f64 over every column.
+#[test]
+fn k_decodes_agree_with_one_shot_rows() {
+    let r = rig();
+    let mut worker = r.worker();
+    let rows = sequence_rows((Q + DECODES) as usize);
+    let (prefill, decodes) = rows.split_at(Q as usize);
+    let decoded = prefill_then_decode(&mut worker, (prefill, decodes), SEAT_A);
+    // The last decode's lm_head: its `a` is the final norm's one row, still in the arena.
+    let tape = &CUDA_TAPES[bucket(1)];
+    let Some(CudaStep::Gemv(GemmBf16 { a, b, c, m, n, k })) = tape.steps.last().copied() else {
+        panic!("the m=1 tape does not end with a Gemv");
+    };
+    assert_eq!((m, n, k), (1, VOCAB as u32, HIDDEN as u32), "the lm_head");
+    assert_eq!(c, tape.result.offset, "the lm_head writes the result");
+    let mut normed = vec![0u16; HIDDEN];
+    worker
+        .read_arena(
+            ArenaSpan {
+                offset: a,
+                bytes: (HIDDEN * 2) as u64,
+            },
+            &mut normed,
+        )
+        .expect("read the final norm's row");
+    let w = host_weights()[b.0 as usize]
+        .as_ref()
+        .expect("the lm_head's weight");
+    let last = decoded.last().expect("eight decodes");
+    let cmp = compare(last, &normed, w, 1, VOCAB, HIDDEN);
+    let mut pass = cmp.pass();
+    eprintln!(
+        "(k) the last decode's lm_head GEMV over {VOCAB} columns: {} {}",
+        cmp.line(),
+        verdict(cmp.pass())
+    );
+    let one_shot = forward(&mut worker, 512, &rows, 0, SEAT_B).expect("308 tokens in one forward");
+    for (i, row) in decoded.iter().enumerate() {
+        let at = Q as usize + i;
+        let want = &one_shot[at * VOCAB..][..VOCAB];
+        let (cos, diff, finite) = (cosine(row, want), max_diff(row, want), all_finite(row));
+        let ok = finite && cos >= 0.999;
+        eprintln!(
+            "(k) decode at position {at} against row {at} of one 308-token forward: \
+             finite={finite} cosine={cos:.6} (need >= 0.999) max|diff|={diff:e} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "a decode is out of agreement with the one-shot row: see the lines above"
+    );
+}
+
+/// (l): the prefill and eight decodes, repeated in disjoint KV blocks and GDN slot, give the same
+/// eight rows of logits, bit for bit.
+#[test]
+fn l_repeated_decodes_are_bit_identical() {
+    let r = rig();
+    let mut worker = r.worker();
+    let rows = sequence_rows((Q + DECODES) as usize);
+    let (prefill, decodes) = rows.split_at(Q as usize);
+    let first = prefill_then_decode(&mut worker, (prefill, decodes), SEAT_A);
+    let again = prefill_then_decode(&mut worker, (prefill, decodes), SEAT_B);
+    let ok = bit_identical(
+        "(l) a prefill and 8 decodes repeated in disjoint blocks and slot",
+        &first.concat(),
+        &again.concat(),
+    );
+    assert!(ok, "repeated decodes differ");
+}
+
+/// (m): the eight decodes leave every cache row at positions 0..300, K and V of every KV layer,
+/// bit-unchanged.
+#[test]
+fn m_decodes_leave_the_prefix_cache_unchanged() {
+    let r = rig();
+    let mut worker = r.worker();
+    let rows = sequence_rows((Q + DECODES) as usize);
+    let (prefill, decodes) = rows.split_at(Q as usize);
+    forward(&mut worker, 512, prefill, 0, SEAT_A).expect("the prefill");
+    let before = cached_rows(&mut worker, SEAT_A, Q as usize);
+    for (i, &token) in decodes.iter().enumerate() {
+        let p = Q + i as u32;
+        forward(&mut worker, 1, &[token], p, SEAT_A).unwrap_or_else(|e| panic!("decode {p}: {e}"));
+    }
+    let after = cached_rows(&mut worker, SEAT_A, Q as usize);
+    let changed: usize = (before.iter().zip(&after))
+        .map(|(a, b)| a.iter().zip(b).filter(|(x, y)| x != y).count())
+        .sum();
+    let ok = changed == 0;
+    eprintln!(
+        "(m) the cache at positions 0..{Q} (K and V of {} layers) after {DECODES} decodes: \
+         changed elements={changed} {}",
+        before.len() / 2,
+        verdict(ok)
+    );
+    assert!(ok, "a decode wrote over the prefix's cache");
+}
+
+/// (n): a decode at P = 319 (kv_len 320, the last slot of block 4) and at P = 320 (kv_len 321, the
+/// first slot of a new block), each finite and within (k)'s cosine of the same row of one
+/// 321-token forward in disjoint blocks and slot.
+#[test]
+fn n_decodes_at_a_block_boundary() {
+    let r = rig();
+    let mut worker = r.worker();
+    let rows = sequence_rows(321);
+    let decoded = prefill_then_decode(&mut worker, (&rows[..319], &rows[319..]), SEAT_A);
+    let one_shot = forward(&mut worker, 512, &rows, 0, SEAT_B).expect("321 tokens in one forward");
+    let mut pass = true;
+    for (i, row) in decoded.iter().enumerate() {
+        let at = 319 + i;
+        let want = &one_shot[at * VOCAB..][..VOCAB];
+        let (cos, diff, finite) = (cosine(row, want), max_diff(row, want), all_finite(row));
+        let ok = finite && cos >= 0.999;
+        eprintln!(
+            "(n) decode at P={at} (kv_len {}) against row {at} of one 321-token forward: \
+             finite={finite} cosine={cos:.6} (need >= 0.999) max|diff|={diff:e} {}",
+            at + 1,
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(pass, "a decode at the block boundary is out of agreement");
+}
+
+/// (o): at m=1, a position other than `prefix_len`, a block table too short for `P + 1`, a GDN
+/// sequence called fresh at `P > 0`, and `q_len = 2` are each refused before any copy, the
+/// result untouched.
+#[test]
+fn o_a_bad_decode_is_refused_before_any_copy() {
+    let r = rig();
+    let mut worker = r.worker();
+    let b = bucket(1);
+    let blocks = SEAT_A.blocks;
+    let p = 64u32;
+    let kv = |block_table, q_len| KvSequence {
+        block_table,
+        prefix_len: p,
+        q_len,
+    };
+    let gdn = |fresh, q_len| GdnSequence {
+        slot: SEAT_A.slot,
+        q_len,
+        fresh,
+    };
+    let cases: [(&str, KvSequence<'_>, GdnSequence, u32, ForwardError); 4] = [
+        (
+            "position P + 1",
+            kv(blocks, 1),
+            gdn(false, 1),
+            p + 1,
+            ForwardError::PositionsDisagree {
+                row: 0,
+                got: p + 1,
+                want: u64::from(p),
+            },
+        ),
+        (
+            "a one-block table for 65 tokens",
+            kv(&blocks[..1], 1),
+            gdn(false, 1),
+            p,
+            ForwardError::KvBlockTable {
+                got: 1,
+                need: 2,
+                max: 128,
+            },
+        ),
+        (
+            "fresh at P = 64",
+            kv(blocks, 1),
+            gdn(true, 1),
+            p,
+            ForwardError::FreshDisagrees {
+                prefix_len: p,
+                fresh: true,
+            },
+        ),
+        (
+            "q_len = 2",
+            kv(blocks, 2),
+            gdn(false, 2),
+            p,
+            ForwardError::KvQueryLength {
+                q_len: 2,
+                bucket_m: 1,
+            },
+        ),
+    ];
+    let mut pass = true;
+    for (what, kv, gdn, position, want) in cases {
+        let mut out = vec![0u16; VOCAB];
+        let got = worker.forward(
+            b,
+            Input::TokenIds(&[7]),
+            &[position],
+            Some(&kv),
+            Some(&gdn),
+            &mut out,
+        );
+        let untouched = out.iter().all(|&x| x == 0);
+        let ok = got == Err(want.clone()) && untouched;
+        eprintln!(
+            "(o) m=1 {what}: {got:?} result_untouched={untouched} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(pass, "a bad decode was not refused before any copy");
 }

@@ -29,6 +29,10 @@ pub enum CudaStep {
     /// [`GEMM_NARROW_BF16_MAX_N`] (`kernels/gemm_narrow_bf16.cu`): the operands of
     /// [`Self::Gemm`], another kernel. The lowering's `MatmulTile` arm chooses it at expansion.
     GemmNarrow(GemmBf16),
+    /// The bf16 GEMV, a one-row GEMM, lowered from `SubOp::MatmulTile` of a one-row bucket whose
+    /// `n` the narrow GEMM does not take (`kernels/gemv_bf16.cu`): the operands of [`Self::Gemm`]
+    /// with `m = 1`, another kernel. The lowering's `MatmulTile` arm chooses it at expansion.
+    Gemv(GemmBf16),
     /// The bf16 RMSNorm, lowered from `SubOp::RmsNorm` (`kernels/rms_norm_bf16.cu`).
     RmsNorm(RmsNormBf16),
     /// The bf16 elementwise add, lowered from `Elementwise(Add)` (`kernels/add_bf16.cu`).
@@ -50,6 +54,10 @@ pub enum CudaStep {
     /// Causal grouped-query attention of a prefill bucket over the paged KV cache, lowered from
     /// `SubOp::AttnDecode` when the bucket has more than one row (`kernels/attn_prefill_bf16.cu`).
     AttnPrefill(AttnPrefillBf16),
+    /// One query row's grouped-query attention over the paged KV cache, lowered from
+    /// `SubOp::AttnDecode` when the bucket has one row (`kernels/attn_decode_bf16.cu`): the
+    /// operands of [`Self::AttnPrefill`] with `rows = 1`, another kernel.
+    AttnDecode(AttnPrefillBf16),
     /// One prefill chunk of a Gated-DeltaNet linear-attention layer, lowered from
     /// `SubOp::GatedDeltaNet`: four stream-ordered launches, `kernels/gdn_conv1d.cu`,
     /// `kernels/gdn_gating.cu`, `kernels/gdn_scan.cu` then `kernels/gdn_rms_norm_gated.cu`.
@@ -102,6 +110,10 @@ pub const GEMM_NARROW_BF16_MAX_N: u32 = 64;
 /// The narrow GEMM's `n` and `k` are non-zero multiples of this: `k` is read in 16-byte vectors of
 /// 8 bf16, and `n` keeps every row of `C` 16-byte aligned.
 pub const GEMM_NARROW_BF16_MULTIPLE: u32 = 8;
+
+/// The GEMV's `k` is a non-zero multiple of this: each lane reads 16-byte vectors of 8 bf16
+/// (`kernels/gemv_bf16.cu`). `n` is non-zero, and `n` and `k` are at most `i32::MAX`; `m` is 1.
+pub const GEMV_BF16_MULTIPLE: u32 = 8;
 
 /// The RMSNorm's `cols` is a non-zero multiple of this: each thread loads and stores 16-byte
 /// vectors of 8 bf16 (`kernels/rms_norm_bf16.cu`). `rows` is non-zero and `rows · cols` at most
@@ -244,6 +256,10 @@ pub const CUDA_MAX_BLOCKS_PER_SEQ: u32 = 128;
 pub const ATTN_PREFILL_BF16_ROWS: u32 = 128;
 /// The one head dim the attention kernel is instantiated for.
 pub const ATTN_PREFILL_BF16_HEAD_DIM: u32 = 256;
+/// The one head dim the decode attention kernel is instantiated for: each of a warp's 32 lanes
+/// holds one 16-byte vector of 8 lanes (`kernels/attn_decode_bf16.cu`). It takes one query row,
+/// `q_heads` a non-zero multiple of `kv_heads`, and `block_size` [`CUDA_KV_BLOCK_SIZE`].
+pub const ATTN_DECODE_BF16_HEAD_DIM: u32 = 256;
 
 /// K's partial rope, then the paged-cache write of the rotated K and the unrotated V.
 ///
@@ -592,7 +608,8 @@ impl CudaStep {
                 })
             }
             Self::Gemm(GemmBf16 { a, b, c, m, n, k })
-            | Self::GemmNarrow(GemmBf16 { a, b, c, m, n, k }) => {
+            | Self::GemmNarrow(GemmBf16 { a, b, c, m, n, k })
+            | Self::Gemv(GemmBf16 { a, b, c, m, n, k }) => {
                 let (Some(ab), Some(bb), Some(cb)) =
                     (bf16_bytes(m, k), bf16_bytes(n, k), bf16_bytes(m, n))
                 else {
@@ -748,6 +765,17 @@ impl CudaStep {
                 q_heads,
                 head_dim,
                 ..
+            })
+            | Self::AttnDecode(AttnPrefillBf16 {
+                q,
+                block_table,
+                sequence,
+                out,
+                layer,
+                rows,
+                q_heads,
+                head_dim,
+                ..
             }) => {
                 let Some(cols) = q_heads.checked_mul(head_dim) else {
                     return None;
@@ -824,7 +852,9 @@ impl CudaStep {
     pub fn weight_mut(&mut self) -> Option<&mut WeightIx> {
         match self {
             Self::Embed(EmbedBf16 { table, .. }) => Some(table),
-            Self::Gemm(GemmBf16 { b, .. }) | Self::GemmNarrow(GemmBf16 { b, .. }) => Some(b),
+            Self::Gemm(GemmBf16 { b, .. })
+            | Self::GemmNarrow(GemmBf16 { b, .. })
+            | Self::Gemv(GemmBf16 { b, .. }) => Some(b),
             Self::RmsNorm(RmsNormBf16 { gain, .. }) => Some(gain),
             Self::GatedDeltaNet(GatedDeltaNetBf16 { bundle, .. }) => Some(bundle),
             Self::Add(_)
@@ -833,7 +863,8 @@ impl CudaStep {
             | Self::GateSplit(_)
             | Self::GateApply(_)
             | Self::RopeAppend(_)
-            | Self::AttnPrefill(_) => None,
+            | Self::AttnPrefill(_)
+            | Self::AttnDecode(_) => None,
         }
     }
 }
