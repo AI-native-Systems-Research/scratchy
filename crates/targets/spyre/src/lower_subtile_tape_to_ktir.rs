@@ -1547,6 +1547,19 @@ pub struct RungFacts {
 ///   never the preset's PRESENCE: granite's own fp8-dynamic-per-channel IGNORES the
 ///   lm_head, so the dense tail persists under it and the mint survives the preset.
 ///
+/// * THE TABLE RANGE LAW — the staged bramp/binc carry BLOCK NUMBERS as fp16
+///   (`NB − b` and `b`), and fp16's exact-integer range ENDS AT 2048: above it the
+///   spacing is 2, two adjacent block numbers round together, and the ramp's
+///   equality selects the LATER block — a WRONG TOKEN, silently. `NB > 2048`
+///   (gemma-4 and nemotron at vocab 262144 bake NB = 4096) refuses here.
+///
+/// * THE PAD-LANE LAW — the sentinel (all-NaN row ⇒ idx past V) lives in padoff's
+///   `−inf` lanes; `argmax_pad_vocab` of a power-of-two vocab (262144, 131072) is
+///   the vocab ITSELF, so no pad lane exists, padoff is all zeros, and an all-NaN
+///   row answers lane 0 while the host reference answers the sentinel — a law
+///   broken, not a rounding. `PAD_V == V` refuses here (mistral-nemo's 131072 has
+///   NB = 2048 and is refused by THIS conjunct alone).
+///
 /// An unrecognizable tail (no lm-head matmul under the single-input post-op chain)
 /// simply does not mint — the model keeps the host argmax exactly as a staged tail
 /// does, never a build refusal: unlike #698's composite, the kernel demands NOTHING
@@ -1559,7 +1572,15 @@ pub fn lm_head_admits_the_argmax<F: RopeForm>(ir: &SubtileIR<F>) -> bool {
     let SubOp::MatmulTile { weight, .. } = &node.op else {
         unreachable!("the tail walk breaks only on a MatmulTile");
     };
-    node.inputs.len() == 2 && matches!(weight, scratchy_subtile::lower::GemmWeight::Dense)
+    if !(node.inputs.len() == 2 && matches!(weight, scratchy_subtile::lower::GemmWeight::Dense)) {
+        return false;
+    }
+    // Both range laws read the RESULT ROW's own width — the emitted vocab, the same
+    // number the mint and the staged tables derive from — never the config's word.
+    let vocab = ir.tensors[ir.result.index()].cols;
+    let pad_vocab = scratchy_subtile::subtile_ir::argmax_pad_vocab(vocab);
+    let nb = pad_vocab / scratchy_subtile::subtile_ir::ARGMAX_BLOCK;
+    nb <= 2048 && pad_vocab != vocab
 }
 
 /// The result tail's lm-head matmul, when the result ends in one: back through the

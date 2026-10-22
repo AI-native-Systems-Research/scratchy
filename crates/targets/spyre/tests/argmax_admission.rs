@@ -21,6 +21,14 @@
 //! ScalarMul and gemma's TanhSoftCap are walked through, exactly where they sit
 //! in the real tails.
 //!
+//! ⭐ THE TWO RANGE LAWS (#813 review), pinned from both sides at real vocabs:
+//! the staged bramp/binc carry BLOCK NUMBERS as fp16, exact only to 2048 — a
+//! vocab past that (gemma-4/nemotron's 262144) would collide adjacent block
+//! numbers and answer the LATER block, a silent wrong token; and a POWER-OF-TWO
+//! vocab (262144, mistral-nemo's 131072) has no pad lane, so the all-NaN
+//! sentinel has nowhere to live. Both refuse here and the model keeps the host
+//! argmax; the boundary case (NB exactly 2048, one pad lane) still admits.
+//!
 //! No device, no emulator session: these are pure facts of the graph, so the
 //! file runs at default features.
 
@@ -130,5 +138,66 @@ fn a_tail_without_an_lm_head_matmul_does_not_admit_quietly() {
             1,
         ),
         "a non-matmul result tail does not mint — the model keeps the host argmax"
+    );
+}
+
+/// The one-request dense tail at a given VOCAB — the range laws read the result
+/// row's own width (the emitted vocab, the same number the mint and the staged
+/// tables derive from), so this number alone moves the two new conjuncts.
+fn tail_at(vocab: u32) -> bool {
+    let input = LoweringInput {
+        exported: None,
+        sources: vec![
+            SourceShape { rows: 1, cols: 4 },
+            SourceShape { rows: 4, cols: vocab },
+        ],
+        ops: vec![OpDesc {
+            op: SubOp::MatmulTile {
+                n: vocab,
+                weight: GemmWeight::Dense,
+            },
+            m: 1,
+            inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+        }],
+        result: 0,
+    };
+    let g = lower_region(&input, std::num::NonZeroU32::new(64).unwrap());
+    lm_head_admits_the_argmax(&g)
+}
+
+#[test]
+fn a_vocab_past_the_fp16_block_range_does_not_admit() {
+    // 200000 rounds to PAD_V 262144 with NB 4096 > 2048 while PAD_V != V, so ONLY
+    // the block-range law refuses here — fp16's exact-integer range ends at 2048
+    // (spacing 2 above it), and the staged bramp/binc would collide adjacent
+    // block numbers into a silently later-block answer. gemma-4/nemotron's
+    // 262144 violates this AND the pad-lane law; this case isolates the range law.
+    assert!(
+        !tail_at(200_000),
+        "a vocab baking NB > 2048 does not mint — the staged block numbers leave fp16's \
+         exact-integer range and the model keeps the host argmax"
+    );
+}
+
+#[test]
+fn a_power_of_two_vocab_does_not_admit() {
+    // mistral-nemo's 131072: NB is exactly 2048 (in range) but PAD_V == V — there
+    // is no pad lane, padoff is all zeros, and an all-NaN row answers lane 0 while
+    // the host reference answers the sentinel. The pad-lane law refuses alone here.
+    assert!(
+        !tail_at(131_072),
+        "a power-of-two vocab has no pad lane, so the all-NaN sentinel law has nowhere to \
+         live — the model keeps the host argmax"
+    );
+}
+
+#[test]
+fn the_widest_in_range_vocab_still_admits() {
+    // 131071 rounds to PAD_V 131072: NB is exactly 2048 and one pad lane exists —
+    // the boundary case on the ADMITTING side, so neither law refuses a hair early.
+    assert!(
+        tail_at(131_071),
+        "NB exactly 2048 with a pad lane still admits — the boundary is the law, not a \
+         margin"
     );
 }
