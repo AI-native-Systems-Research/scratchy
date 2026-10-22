@@ -11,22 +11,24 @@
 //!
 //! THE ALGORITHM'S OP FOOTPRINT, pinned (see the fixture's docstring for the arithmetic):
 //!
-//!   * `tt.reduce` × 5 — the whole-row maxima: the global max `m`, the first-block
-//!     combine `jA`, the first-lane combine `jB`, and the two read-out combines `b*`
-//!     and `l*`. Each is the golden rank-2 → rank-1 reduce over the [1, PAD_V] tile's
-//!     second axis, and the WHOLE ROW IS ONE TILE (the rmsnorm whole-row block), so
-//!     there is NO per-stick loop to unroll — the program the door receives is
-//!     STRAIGHT-LINE, ~20 ops, which is the door-lowerable form (a per-stick-loop
-//!     kernel would splice to ~2300 trips);
+//!   * `tt.reduce` × 7 — the whole-row maxima: the global max `m`, the first-group
+//!     combine `jG`, the first-block combine `jA`, the first-lane combine `jB`, and
+//!     the three read-out combines `g*`, `b*` and `l*`. Each is the golden rank-2 →
+//!     rank-1 reduce over the [1, PAD_V] tile's second axis, and the WHOLE ROW IS
+//!     ONE TILE (the rmsnorm whole-row block), so there is NO per-stick loop to
+//!     unroll — the program the door receives is STRAIGHT-LINE, ~25 ops, which is
+//!     the door-lowerable form (a per-stick-loop kernel would splice to ~2300
+//!     trips);
 //!   * `arith.maxnumf`/`arith.truncf` — each f16 reduce runs in f32 (upstream's own
 //!     promotion) and narrows straight back, moe.py's spelling; the max of f16 values
 //!     is exactly representable, so the round trip is exact;
-//!   * `arith.cmpf` × 3 — the equality mask `(x == m)`, the block one-hot
-//!     `(bramp == jA)`, and the lane one-hot `(lramp == jB)`;
-//!   * `arith.uitofp` × 3 — the i1 masks' → f16 widening (the 0/1 selectands);
-//!   * `arith.mulf` — `mask · bramp`, `mask · sel · lramp`, the one-hot `sel · selL`,
-//!     the two read-outs `onehot · binc`/`onehot · linc`, and the two `ones`-table
-//!     widens of the [1] answers to the [1, BLOCK] output stick;
+//!   * `arith.cmpf` × 4 — the equality mask `(x == m)`, the group one-hot
+//!     `(gramp == jG)`, the block one-hot `(bramp == jA)`, and the lane one-hot
+//!     `(lramp == jB)`;
+//!   * `arith.uitofp` × 4 — the i1 masks' → f16 widening (the 0/1 selectands);
+//!   * `arith.mulf` — `mask · gramp`, `mask · selG · bramp`, `mask · selG · sel ·
+//!     lramp`, the one-hot `selG · sel · selL`, the three read-outs, and the three
+//!     `ones`-table widens of the [1] answers to the [1, BLOCK] output stick;
 //!   * ⛔ NO `arith.subf` ANYWHERE — the v5 form inverted the ramps by subtraction
 //!     (`NB - jA`, `BLOCK - jB`), but those `[1]`-shaped `splat - tensor` subs have no
 //!     whole-stick door emission, so the inversion rides the EQUALITY selection
@@ -37,7 +39,7 @@
 //!     the final `b*64 + l*` reaches 49154 (past fp16's exact range), so it
 //!     widens, multiply-adds in f32 (exact below 2^24), and casts to i32 —
 //!     moe.py's gelu island and the KSPLIT pair's own device recipe;
-//!   * `tt.descriptor_load` × 8 / `tt.descriptor_store` — the row, the four
+//!   * `tt.descriptor_load` × 10 / `tt.descriptor_store` — the row, the six
 //!     staged index tables, the two widen tables and the pad law's offset
 //!     row in, the i32 stick out;
 //!   * `tt.expand_dims`/`tt.broadcast` — the [1] → [1,1] → [1, BLOCK] seams (the golden
@@ -107,29 +109,30 @@ fn argmax_first_max_compiles_and_states_the_algorithm_in_generic_ops() {
     eprintln!("argmax_first_max op census: {census:?}");
     eprintln!("argmax_first_max op sequence: {ops:?}");
 
-    // Every link of the algorithm, as the generic op that carries it. FIVE whole-row
-    // reduces: the global max, the first-block combine, the first-lane combine, and
-    // the two read-out combines.
-    assert!(count(&ops, "tt.reduce") >= 5, "the five whole-row maxima");
+    // Every link of the algorithm, as the generic op that carries it. SEVEN
+    // whole-row reduces: the global max, the first-group combine, the
+    // first-block combine, the first-lane combine, and the three read-out
+    // combines.
+    assert!(count(&ops, "tt.reduce") >= 7, "the seven whole-row maxima");
     assert!(
-        count(&ops, "arith.maxnumf") >= 5,
+        count(&ops, "arith.maxnumf") >= 7,
         "the reduces' f32 combine (the promotion)"
     );
     assert!(
-        count(&ops, "arith.truncf") >= 5,
+        count(&ops, "arith.truncf") >= 7,
         "the reduces' narrow back to f16"
     );
     assert!(
         count(&ops, "arith.extf") >= 2,
         "the fp32 island's two widens"
     );
-    assert!(count(&ops, "arith.cmpf") >= 3, "the three equality masks");
+    assert!(count(&ops, "arith.cmpf") >= 4, "the four equality masks");
     assert!(
-        count(&ops, "arith.uitofp") >= 3,
+        count(&ops, "arith.uitofp") >= 4,
         "the masks' i1 -> f16 widening"
     );
     assert!(
-        count(&ops, "arith.mulf") >= 8,
+        count(&ops, "arith.mulf") >= 11,
         "mask * ramp, the one-hot, the read-outs, and the ones-table widens"
     );
     // ⛔ AND NO SUBTRACTION: the inversion rides the equality selection, so a subf
@@ -150,8 +153,8 @@ fn argmax_first_max_compiles_and_states_the_algorithm_in_generic_ops() {
         "the island's f32 -> i32 cast"
     );
     assert!(
-        count(&ops, "tt.descriptor_load") >= 8,
-        "the row loads (x, bramp, lramp, binc, linc, ones, sixtyfour, padoff)"
+        count(&ops, "tt.descriptor_load") >= 10,
+        "the row loads (x, bramp, lramp, binc, linc, ones, sixtyfour, padoff, gramp, ginc)"
     );
     assert!(
         count(&ops, "tt.descriptor_store") >= 1,

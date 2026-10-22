@@ -49,12 +49,12 @@ fn the_minted_argmax_lowers_through_the_splice_like_every_other_kernel() {
     assert!(op.op.is_none(), "a spliced op has no SuperDSC descriptor");
     let k = op.ktir.as_ref().expect("a spliced op carries its program");
     assert_eq!(k.program, Program::ArgMax);
-    // Nine kernel parameters: the row, the seven tables, the idx stick out — the
+    // Eleven kernel parameters: the row, the nine tables, the idx stick out — the
     // constexprs (V, PAD_V, NB, BLOCK) fold into the program, not the signature.
     assert_eq!(
         k.func.arguments.len(),
-        9,
-        "the compiled program takes the nine pointer parameters"
+        11,
+        "the compiled program takes the eleven pointer parameters"
     );
     assert_eq!(
         k.func.grid,
@@ -63,13 +63,13 @@ fn the_minted_argmax_lowers_through_the_splice_like_every_other_kernel() {
     );
 
     // The buffer pairing: the tape's real tensor indices, the operand prefix,
-    // the output LAST — the widened row (renumbered to 9), the seven minted table
-    // sources [2, 9), the idx stick 10.
+    // the output LAST — the widened row (renumbered to 11), the nine minted table
+    // sources [2, 11), the idx stick 12.
     let bound: Vec<u32> = k.bindings.iter().map(|b| b.get()).collect();
     assert_eq!(
         bound,
-        vec![9, 2, 3, 4, 5, 6, 7, 8, 10],
-        "the row first, the seven tables in operand order, the stick LAST"
+        vec![11, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12],
+        "the row first, the nine tables in operand order, the stick LAST"
     );
     assert!(k.mask.is_none(), "the argmax reads no runtime length mask");
 }

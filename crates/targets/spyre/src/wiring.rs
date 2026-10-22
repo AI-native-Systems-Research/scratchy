@@ -903,7 +903,7 @@ pub struct Wiring {
 /// choosing fp32-verbatim vs fp16-convert off the ENTRY'S OWN dtype.
 #[derive(Clone, Copy, Debug)]
 pub enum LoadConst {
-    /// One of the device argmax's seven operand tables, by the kernel's operand
+    /// One of the device argmax's nine operand tables, by the kernel's operand
     /// order (1-based over the ArgMax node's inputs; input 0 is the row).
     /// Bytes from [`argmax_staged_tables`] — the one derivation every stager
     /// reads, so a table defect cannot hide on one leg only.
@@ -921,14 +921,14 @@ impl LoadConst {
                 let (bytes, dt, shape) = argmax_staged_tables(vocab)
                     .into_iter()
                     .nth((operand - 1) as usize)
-                    .expect("the mint emits operand 1..=7 — the registry's own row");
+                    .expect("the mint emits operand 1..=9 — the registry's own row");
                 (bytes, dt, shape)
             }
         }
     }
 }
 
-/// ⭐ THE DEVICE ARGMAX'S SEVEN STAGED TABLES — the kernel's own host contract
+/// ⭐ THE DEVICE ARGMAX'S NINE STAGED TABLES — the kernel's own host contract
 /// (`kernels/argmax.py`'s docstring), stated ONCE for every stager: the
 /// bake-time numeric gate and the worker's load-time staging read this same
 /// fn, so a table defect cannot hide on one leg only (the synth weights' own
@@ -936,36 +936,54 @@ impl LoadConst {
 /// steps, staged ONCE.
 ///
 /// In the kernel's OPERAND ORDER — `bramp, lramp, binc, linc, ones, sixtyfour,
-/// padoff` — each entry is `(bytes, dtype, [rows, cols])`:
+/// padoff, gramp, ginc` — each entry is `(bytes, dtype, [rows, cols])`:
 ///
-/// * `bramp` — strictly DECREASING in the block index (`NB - b`), so the first
-///   `max` lands on the FIRST block holding the row's maximum; 0 on the pad
-///   lanes, which can never win a max the real lanes contest.
+/// * `bramp` — strictly DECREASING in the block index WITHIN EACH GROUP and
+///   PERIODIC across groups (`GROUP_BLOCKS - (b % GROUP_BLOCKS)`), so the
+///   second `max` lands on the FIRST block holding the row's maximum inside
+///   the first maximal group; its lane values top out at 64, fp16-exact at
+///   ANY vocab. 0 on the pad lanes, which can never win a max the real lanes
+///   contest.
 /// * `lramp` — strictly decreasing within each block, PERIODIC (`BLOCK - l`),
-///   so the second `max` lands on the first lane of that block.
-/// * `binc` / `linc` — the INCREASING 0-based block / lane index tables the
-///   one-hot reads the selected numbers back out through; on the pad lanes
-///   they stage `NB` / `BLOCK` — the SENTINEL's own values, so a row whose
-///   one-hot falls on the pads (all-NaN, #666) answers
-///   `idx = NB·BLOCK + BLOCK = PAD_V + BLOCK`, past the last real lane.
+///   so the third `max` lands on the first lane of that block.
+/// * `binc` / `linc` — the INCREASING 0-based block-within-group / lane index
+///   tables the one-hot reads the selected numbers back out through
+///   (`binc` periodic, `GROUP_BLOCKS` wide); on the pad lanes they stage
+///   `GROUP_BLOCKS` / `BLOCK` — the SENTINEL's own values.
 /// * `ones` / `sixtyfour` — the `[1, BLOCK]` widen tables: the fp16 ones
 ///   broadcast the selected numbers out to the output stick, the fp32 scale
-///   row carries the `·64` of the wide integer combine (past fp16's exact
-///   range; exact in f32 below 2^24).
+///   row carries the `·64` of the wide integer combine (used twice: once for
+///   the block term, once squared for the group term's `·4096`; exact in f32
+///   below 2^24).
 /// * `padoff` — THE PAD LAW: 0.0 on `[0, vocab)`, −inf on the pads. The
 ///   kernel adds it to the row before its first max, so a pad lane can never
 ///   win whatever the row's pad bytes hold (the lm-head's zero-pad columns
 ///   write 0.0 there every step; NaN rides through, keeping the all-NaN
 ///   sentinel intact). Carried as a staged table — the same host contract as
 ///   every other constant — never a V-constexpr mask.
+/// * `gramp` — the TWO-LEVEL RAMP's outer level: strictly DECREASING in the
+///   group index (`G - g`), constant across each group's 4096 lanes, 0 on the
+///   pad lanes. Its ceiling is the group count, which the admission gate
+///   keeps ≤ 2048 — fp16-exact — so the FIRST maximal GROUP wins the first
+///   `max` at any vocab the gate admits (a single flat block ramp would need
+///   NB = 8192 at gemma-4's PAD_V 524288, past fp16's exact range: that is
+///   why the ramp is two-level).
+/// * `ginc` — the INCREASING 0-based group index table; `G` on the pad lanes
+///   (the sentinel's group half).
 ///
-/// Every value is a small exact integer on the fp16 grid (`NB ≤ 1024` at
-/// granite's PAD_V 65536; `padoff` stages only 0.0 and −inf), so the staging
+/// The SENTINEL (all-NaN row, #666): the one-hot falls on the pad lanes,
+/// where the tables stage `ginc = G`, `binc = GROUP_BLOCKS`, `linc = BLOCK`,
+/// so idx = `G·4096 + GROUP_BLOCKS·64 + BLOCK = PAD_V + 4160`, past the last
+/// real lane.
+///
+/// Every value is a small exact integer on the fp16 grid (`G ≤ 2048` by the
+/// admission gate; `padoff` stages only 0.0 and −inf), so the staging
 /// round trips bit-exactly.
 pub fn argmax_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType, [usize; 2])> {
     let pad_v = scratchy_subtile::subtile_ir::argmax_pad_vocab(vocab) as usize;
     let block = scratchy_subtile::subtile_ir::ARGMAX_BLOCK as usize;
-    let nb = pad_v / block;
+    let group_blocks = scratchy_subtile::subtile_ir::ARGMAX_GROUP_BLOCKS as usize;
+    let groups = scratchy_subtile::subtile_ir::argmax_groups(pad_v as u32) as usize;
     let v = vocab as usize;
     // A whole-row fp16 table under a per-lane rule: lane `i < vocab` takes
     // `real(i)`, a pad lane takes `pad`.
@@ -978,9 +996,9 @@ pub fn argmax_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType
             .collect()
     };
     vec![
-        // bramp: NB - b, pads 0.
+        // bramp: GROUP_BLOCKS - (b % GROUP_BLOCKS), periodic, pads 0.
         (
-            f16_row(&|i| nb - i / block, 0),
+            f16_row(&|i| group_blocks - (i / block) % group_blocks, 0),
             scratchy_tensors::DType::F16,
             [1, pad_v],
         ),
@@ -990,9 +1008,9 @@ pub fn argmax_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType
             scratchy_tensors::DType::F16,
             [1, pad_v],
         ),
-        // binc: the block index, pads NB.
+        // binc: the block-within-group index, periodic, pads GROUP_BLOCKS.
         (
-            f16_row(&|i| i / block, nb),
+            f16_row(&|i| (i / block) % group_blocks, group_blocks),
             scratchy_tensors::DType::F16,
             [1, pad_v],
         ),
@@ -1025,6 +1043,19 @@ pub fn argmax_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType
                     half::f16::from_f32(x).to_le_bytes()
                 })
                 .collect(),
+            scratchy_tensors::DType::F16,
+            [1, pad_v],
+        ),
+        // gramp: G - g, constant per group, pads 0 — the two-level ramp's
+        // outer level.
+        (
+            f16_row(&|i| groups - i / (block * group_blocks), 0),
+            scratchy_tensors::DType::F16,
+            [1, pad_v],
+        ),
+        // ginc: the group index, pads G — the sentinel's group half.
+        (
+            f16_row(&|i| i / (block * group_blocks), groups),
             scratchy_tensors::DType::F16,
             [1, pad_v],
         ),

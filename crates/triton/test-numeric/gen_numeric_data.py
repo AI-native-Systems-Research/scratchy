@@ -563,19 +563,20 @@ def _mul_scale_inputs(mod, ce):
 
 
 def _argmax_inputs(mod, ce):
-    row, bramp, lramp, binc, linc, ones, sixtyfour, padoff = mod.inputs(seed=SEED)
+    row, bramp, lramp, binc, linc, ones, sixtyfour, padoff, gramp, ginc = mod.inputs(seed=SEED)
     ref = mod.reference(row)
     # THE OUTPUT IS ONE i32 LANE, not an fp16 tile: this is the first config whose
     # reference is an INDEX (the gather ingestion dtype), so `out_dtype` below is
     # "i32" and the ref dump does NOT pass through the fp16 truncation every other
     # config takes. A 49k index does not survive fp16 (exact integers stop at 2048),
     # which is the same law the kernel's fp32-island combine routes around.
-    # THE FOUR INDEX TABLES are the host obligations (the two DECREASING ramps pick
-    # first-block/first-lane; the two INCREASING 0-based tables read the selected
-    # numbers back out through the one-hot, with NB/BLOCK on the pad lanes so an
-    # all-NaN row answers the sentinel) -- constants across steps, staged once.
-    # All ride fp16: every lane value stays under 2048 (the docstring's two-level
-    # law -- a single V - i ramp would need 49155 in a lane). THE TWO WIDEN TABLES
+    # THE SIX INDEX TABLES are the host obligations (the THREE DECREASING ramps pick
+    # first-group/first-block/first-lane; the THREE INCREASING 0-based tables read
+    # the selected numbers back out through the one-hot, with G/64/BLOCK on the pad
+    # lanes so an all-NaN row answers the sentinel) -- constants across steps, staged
+    # once. All ride fp16: every lane value stays under 2048 (the docstring's
+    # two-level law -- a single flat block ramp would need NB in a lane at wide
+    # vocabs, and a single V - i ramp would need 49155). THE TWO WIDEN TABLES
     # are the [1, BLOCK] ones row (f16) and 64.0 row (f32) the output-stick widen
     # and the island's scale read -- loaded, never splatted, so every multiply in
     # the kernel stays a two-tensor op. THE OFFSET ROW is the pad law: 0.0 on the
@@ -584,6 +585,7 @@ def _argmax_inputs(mod, ce):
            ("lramp_ptr", lramp, "f16"), ("binc_ptr", binc, "f16"),
            ("linc_ptr", linc, "f16"), ("ones_ptr", ones, "f16"),
            ("sixtyfour_ptr", sixtyfour, "f32"), ("padoff_ptr", padoff, "f16"),
+           ("gramp_ptr", gramp, "f16"), ("ginc_ptr", ginc, "f16"),
            ("idx_ptr", torch.zeros(64, dtype=torch.int32), "i32")]
     note = (
         f"THE STIMULUS CARRIES A REAL TIE AT HIGH LANES: 40017 and 48000 both hold the "

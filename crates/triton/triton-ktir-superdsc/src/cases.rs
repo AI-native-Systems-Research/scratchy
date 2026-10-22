@@ -788,6 +788,8 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Option<Program>)> {
                     ("ones_ptr", "*fp16"),
                     ("sixtyfour_ptr", "*fp32"),
                     ("padoff_ptr", "*fp16"),
+                    ("gramp_ptr", "*fp16"),
+                    ("ginc_ptr", "*fp16"),
                     ("idx_ptr", "*i32"),
                 ],
                 &[

@@ -1365,13 +1365,20 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     ArgMax { vocab: u32 },
 }
 
-/// The greedy token pick's padded row: the vocab rounded UP to a power-of-two
-/// whole row — the descriptor block's own law (the block must be a power of
-/// two), and the width every staged table and the `[1, PAD_V]` logits row
-/// share. ONE derivation, read by the host reference, the splice's constexpr
+/// The greedy token pick's padded row: the vocab rounded up to a power-of-two
+/// whole row, STRICTLY ABOVE the vocab — the descriptor block's own law (the
+/// block must be a power of two) AND the sentinel law's (a power-of-two vocab
+/// still needs pad lanes to land its all-NaN one-hot on, so a vocab that is
+/// already a power of two rounds to the NEXT one up: gemma-4's 262144 pads to
+/// 524288). ONE derivation, read by the host reference, the splice's constexpr
 /// flow, and the load-time table staging, so no two of them can disagree.
 pub fn argmax_pad_vocab(vocab: u32) -> u32 {
-    vocab.max(1).next_power_of_two()
+    let pad = vocab.max(1).next_power_of_two();
+    if pad == vocab {
+        pad * 2
+    } else {
+        pad
+    }
 }
 
 /// The greedy token pick's stick width — the idx stick's own lane count and the
@@ -1380,6 +1387,22 @@ pub fn argmax_pad_vocab(vocab: u32) -> u32 {
 /// constexprs, the host reference's sentinel arithmetic, and the mint's output
 /// tensor — four sites that must all move together if the stick ever widens.
 pub const ARGMAX_BLOCK: u32 = 64;
+
+/// The greedy token pick's GROUP width — the number of 64-lane blocks per
+/// group in the two-level ramp. The staged block ramp is PERIODIC with this
+/// period (strictly decreasing within each group, restarting per group), so
+/// its lane values top out at 64 — fp16-exact at ANY vocab — while the group
+/// ramp above it tops out at the group count, which the admission gate keeps
+/// ≤ 2048 (fp16-exact). ONE derivation shared by the staged tables, the
+/// admission gate, and the sentinel arithmetic.
+pub const ARGMAX_GROUP_BLOCKS: u32 = 64;
+
+/// The greedy token pick's group count — `pad_vocab` split into
+/// [`ARGMAX_GROUP_BLOCKS`]-block groups. The two-level ramp's outer level and
+/// the group index table's ceiling.
+pub fn argmax_groups(pad_vocab: u32) -> u32 {
+    pad_vocab / (ARGMAX_BLOCK * ARGMAX_GROUP_BLOCKS)
+}
 
 // ── Nodes & graph ──────────────────────────────────────────────────
 
@@ -1511,11 +1534,13 @@ pub fn mint_argmax<F: RopeForm>(graph: &mut SubtileIR<F>) -> ArgmaxMint {
     );
     let vocab = graph.tensors[graph.result.index()].cols;
     let pad_vocab = argmax_pad_vocab(vocab);
-    // The seven staged tables, in the kernel's operand order: the two decreasing
+    // The nine staged tables, in the kernel's operand order: the two decreasing
     // ramps and the two increasing index tables (whole-row `[1, PAD_V]`), the
-    // two per-lane widen tables (`[1, BLOCK]`), then the pad law's offset row
-    // (whole-row `[1, PAD_V]`, the LAST operand before the output). The
-    // array's LENGTH is the single derivation of the renumber shift below.
+    // two per-lane widen tables (`[1, BLOCK]`), the pad law's offset row
+    // (whole-row `[1, PAD_V]`), then the two-level ramp's group pair — the
+    // group ramp and the group index table (whole-row `[1, PAD_V]`, the LAST
+    // operands before the output). The array's LENGTH is the single derivation
+    // of the renumber shift below.
     let tables = [
         TensorShape {
             rows: 1,
@@ -1545,6 +1570,14 @@ pub fn mint_argmax<F: RopeForm>(graph: &mut SubtileIR<F>) -> ArgmaxMint {
             rows: 1,
             cols: pad_vocab,
         },
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
     ];
     let shift = tables.len() as u32;
     let n_src = graph.num_sources;
@@ -1569,7 +1602,7 @@ pub fn mint_argmax<F: RopeForm>(graph: &mut SubtileIR<F>) -> ArgmaxMint {
     if graph.result.0 >= n_src {
         graph.result.0 += shift;
     }
-    // 2) Insert the seven sources and widen the RESULT TAIL CHAIN to the padded
+    // 2) Insert the nine sources and widen the RESULT TAIL CHAIN to the padded
     //    width — the whole chain, per the mint's own law above.
     graph.tensors.splice(n_src as usize..n_src as usize, tables);
     graph.num_sources += shift;
@@ -1594,7 +1627,7 @@ pub fn mint_argmax<F: RopeForm>(graph: &mut SubtileIR<F>) -> ArgmaxMint {
         }
     }
     // 3) The idx stick's op-output tensor, then the node reading the whole
-    //    widened row and the seven whole tables.
+    // widened row and the nine whole tables.
     let idx = TensorId(graph.tensors.len() as u32);
     graph.tensors.push(TensorShape {
         rows: 1,
@@ -1607,7 +1640,7 @@ pub fn mint_argmax<F: RopeForm>(graph: &mut SubtileIR<F>) -> ArgmaxMint {
             cols: Range::new(0, graph.tensors[t.index()].cols),
         },
     };
-    let mut inputs = Vec::with_capacity(8);
+    let mut inputs = Vec::with_capacity(10);
     inputs.push(whole(graph.result));
     for s in n_src..graph.num_sources {
         inputs.push(whole(TensorId(s)));

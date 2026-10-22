@@ -237,12 +237,12 @@ pub fn expert_slab() -> Case {
 /// `argmax_first_max.py`'s signature: the solo greedy decode step's vocab scan. The idx
 /// output is `*i32` (the gather ingestion dtype); `PAD_V` is the vocab padded to a whole
 /// power-of-two row whose pads hold 0.0 (the production shape — the lm-head's zero-pad
-/// columns) with FOUR fp16 index tables staged (the two decreasing ramps pick
-/// first-block/first-lane; the two increasing 0-based tables read the numbers back
-/// out), the [1, BLOCK] ones row (f16) and 64.0 row (f32) the widen and the island's
-/// scale read, and the fp16 OFFSET row that carries the pad law (0.0 on the real lanes,
-/// -inf on the pads; the kernel adds it before its first max) -- HOST obligations the
-/// fixture's docstring states.
+/// columns) with SIX fp16 index tables staged (the three decreasing ramps pick
+/// first-group/first-block/first-lane; the three increasing 0-based tables read the
+/// numbers back out), the [1, BLOCK] ones row (f16) and 64.0 row (f32) the widen and
+/// the island's scale read, and the fp16 OFFSET row that carries the pad law (0.0 on
+/// the real lanes, -inf on the pads; the kernel adds it before its first max) -- HOST
+/// obligations the fixture's docstring states.
 const ARGMAX: &[(&str, &str)] = &[
     ("logits_ptr", "*fp16"),
     ("bramp_ptr", "*fp16"),
@@ -252,6 +252,8 @@ const ARGMAX: &[(&str, &str)] = &[
     ("ones_ptr", "*fp16"),
     ("sixtyfour_ptr", "*fp32"),
     ("padoff_ptr", "*fp16"),
+    ("gramp_ptr", "*fp16"),
+    ("ginc_ptr", "*fp16"),
     ("idx_ptr", "*i32"),
     ("V", "constexpr"),
     ("PAD_V", "constexpr"),

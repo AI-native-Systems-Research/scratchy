@@ -11065,7 +11065,7 @@ fn dump_wavefront_mega(
                     let mint = scratchy_subtile::subtile_ir::mint_argmax(&mut krg);
                     eprintln!(
                         "[spyre-superdsc] {base}: the device argmax minted — vocab {} (padded \
-                         row {}), seven staged tables + the [1, 64] idx stick appended to the \
+                         row {}), nine staged tables + the [1, 64] idx stick appended to the \
                          one-request graph, and the rung's RESULT re-pointed to the stick (the \
                          row stays placed and readable by tid)",
                         mint.vocab, mint.pad_vocab

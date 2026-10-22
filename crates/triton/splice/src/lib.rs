@@ -2360,13 +2360,15 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
         }
         (SubOp::ArgMax { vocab }, "argmax_fwd") => {
             // The vocab scan's own facts, all derived from the node's vocab — never a
-            // model name: PAD_V is the power-of-two padded row (the descriptor block's
-            // law, ONE derivation shared with the host reference and the load-time
-            // table staging), NB its block count (bramp's ceiling, fp16-exact at 1024),
-            // BLOCK the stick (the two-level split's lane width and the output stick).
-            // The signature states every kernel parameter's dtype: the row and the six
-            // f16 tables, the f32 widen table (the island's own dtype), the pad law's
-            // f16 offset row (the seventh table), and the i32 output stick (the
+            // model name: PAD_V is the power-of-two padded row, STRICTLY above the
+            // vocab (the descriptor block's law and the sentinel's — a power-of-two
+            // vocab still needs pad lanes), ONE derivation shared with the host
+            // reference and the load-time table staging), NB its block count, BLOCK
+            // the stick (the two-level ramp's lane width and the output stick). The
+            // signature states every kernel parameter's dtype: the row and the eight
+            // f16 tables (the periodic block pair, the lane pair, the two-level
+            // ramp's group pair), the f32 widen table (the island's own dtype), the
+            // pad law's f16 offset row, and the i32 output stick (the
             // index-ingestion law).
             let pad_v = scratchy_subtile::subtile_ir::argmax_pad_vocab(*vocab);
             let nb = pad_v / scratchy_subtile::subtile_ir::ARGMAX_BLOCK;
@@ -2378,6 +2380,8 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 "linc_ptr",
                 "ones_ptr",
                 "padoff_ptr",
+                "gramp_ptr",
+                "ginc_ptr",
             ] {
                 signature.insert(
                     p.to_string(),

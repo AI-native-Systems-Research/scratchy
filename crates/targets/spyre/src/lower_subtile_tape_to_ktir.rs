@@ -1547,23 +1547,31 @@ pub struct RungFacts {
 ///   never the preset's PRESENCE: granite's own fp8-dynamic-per-channel IGNORES the
 ///   lm_head, so the dense tail persists under it and the mint survives the preset.
 ///
-/// * THE TABLE RANGE LAW — the staged bramp/binc carry BLOCK NUMBERS as fp16
-///   (`NB − b` and `b`), and fp16's exact-integer range ENDS AT 2048: above it the
-///   spacing is 2, two adjacent block numbers round together, and the ramp's
-///   equality selects the LATER block — a WRONG TOKEN, silently. `NB > 2048`
-///   (gemma-4 and nemotron at vocab 262144 bake NB = 4096) refuses here.
+/// * THE TABLE RANGE LAW — the staged tables carry SMALL integers as fp16, and
+///   fp16's exact-integer range ENDS AT 2048: above it the spacing is 2, two
+///   adjacent values round together, and a ramp's equality selects the LATER
+///   entry — a WRONG TOKEN, silently. The two-level ramp keeps every table
+///   inside that range at ANY admitted vocab: the periodic block ramp tops out
+///   at 64, the lane tables at 64, and only the GROUP ramp grows with the
+///   vocab — so the gate bounds the GROUP COUNT (`G = NB / 64 ≤ 2048`, i.e.
+///   `NB ≤ 131072`, `PAD_V ≤ 2^23`). Gemma-4 and nemotron at vocab 262144 bake
+///   PAD_V 524288 (the strict round-up), NB 8192, G 128 — ADMITTED (a single
+///   flat block ramp would need 8192 in a lane, past fp16's exact range: that
+///   is why the ramp is two-level).
 ///
-/// * THE PAD-LANE LAW — the sentinel (all-NaN row ⇒ idx past V) lives in padoff's
-///   `−inf` lanes; `argmax_pad_vocab` of a power-of-two vocab (262144, 131072) is
-///   the vocab ITSELF, so no pad lane exists, padoff is all zeros, and an all-NaN
-///   row answers lane 0 while the host reference answers the sentinel — a law
-///   broken, not a rounding. `PAD_V == V` refuses here (mistral-nemo's 131072 has
-///   NB = 2048 and is refused by THIS conjunct alone).
+/// * THE PAD-LANE LAW — the sentinel (all-NaN row ⇒ idx past V) lives in
+///   padoff's `−inf` lanes; `argmax_pad_vocab` rounds a power-of-two vocab
+///   STRICTLY UP (262144 → 524288), so pad lanes always exist and the law
+///   holds. `PAD_V == V` stays as a conjunct anyway — the invariant stated,
+///   not assumed, so a future round-up change that breaks it fails HERE
+///   instead of on the card.
 ///
-/// An unrecognizable tail (no lm-head matmul under the single-input post-op chain)
-/// simply does not mint — the model keeps the host argmax exactly as a staged tail
-/// does, never a build refusal: unlike #698's composite, the kernel demands NOTHING
-/// from the lm-head, so absence of the recognized form is a quiet boundary, not an
+/// An unrecognizable tail (no lm-head matmul under the single-input post-op
+/// chain) simply does not mint — under hw that rung then reaches the worker's
+/// stated unminted-rung defect at its first pick (no host pick exists to fall
+/// back to); under emu the model keeps the host argmax exactly as a staged
+/// tail does. Unlike #698's composite, the kernel demands NOTHING from the
+/// lm-head, so absence of the recognized form is a quiet boundary, not an
 /// inconsistency.
 pub fn lm_head_admits_the_argmax<F: RopeForm>(ir: &SubtileIR<F>) -> bool {
     let Some(node) = result_tail_lm_head(ir) else {
@@ -1579,8 +1587,8 @@ pub fn lm_head_admits_the_argmax<F: RopeForm>(ir: &SubtileIR<F>) -> bool {
     // number the mint and the staged tables derive from — never the config's word.
     let vocab = ir.tensors[ir.result.index()].cols;
     let pad_vocab = scratchy_subtile::subtile_ir::argmax_pad_vocab(vocab);
-    let nb = pad_vocab / scratchy_subtile::subtile_ir::ARGMAX_BLOCK;
-    nb <= 2048 && pad_vocab != vocab
+    let groups = scratchy_subtile::subtile_ir::argmax_groups(pad_vocab);
+    groups <= 2048 && pad_vocab != vocab
 }
 
 /// The result tail's lm-head matmul, when the result ends in one: back through the
@@ -1646,8 +1654,8 @@ pub fn load_consts_of_ir<F: RopeForm>(
             };
             assert_eq!(
                 node.inputs.len(),
-                8,
-                "the ArgMax node's arity is the registry's own row (logits + seven tables)"
+                10,
+                "the ArgMax node's arity is the registry's own row (logits + nine tables)"
             );
             Ok(node.inputs[1..]
                 .iter()
