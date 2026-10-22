@@ -701,8 +701,9 @@ pub fn qmm_t_kernel_static_name(
 /// tokens, 393 vs 343 at 4); above, a second M tile re-reads the weights and
 /// NAX `qmm_t`'s 64-row tile wins (a 32-row tile loses too). Within it, a
 /// bucket gets the twin only where its own matvec streams the weights more
-/// than once (`route_small_m`): not the 4-token bucket's wide matvec, so on an
-/// M3-or-later device no 4-token step runs it.
+/// than once (`route_small_m`): not the 4-token bucket's wide matvec (every K
+/// but 64 and 128), so on a NAX device a 4-token step runs it only where its
+/// matvec is quad.
 pub const SMALL_M_TOKENS: std::ops::RangeInclusive<u32> = 4..=16;
 
 /// Output columns per small-M threadgroup.
