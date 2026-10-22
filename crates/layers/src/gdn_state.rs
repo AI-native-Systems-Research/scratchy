@@ -552,9 +552,10 @@ impl<M: PoolMemory> GdnStatePool<M> {
         let total_mb = (num_linear * per_layer) as f64 / (1024.0 * 1024.0);
         tracing::info!(
             "GdnStatePool: {num_linear}/{num_layers} linear layers × {num_slots} slots, {} draft \
-             lanes of {} draft rows ({dims:?}) = {total_mb:.0} MB f32",
+             lanes of {} draft rows ({dims:?}, conv {:?} / ssm {ssm_dtype:?}) = {total_mb:.0} MB",
             lanes.map_or(0, DraftLanes::count),
             lanes.map_or(0, |l| l.rows().0),
+            GDN_STATE_DTYPE,
         );
 
         Ok(Self {
