@@ -3771,9 +3771,13 @@ dependencies = [
 name = "scratchy-target-cuda"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "half",
+ "safetensors",
+ "scratchy-layers",
  "scratchy-subtile",
  "scratchy-target-cuda-compiler",
+ "scratchy-tensors",
  "serde",
 ]
 

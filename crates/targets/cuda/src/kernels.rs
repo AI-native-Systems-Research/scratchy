@@ -20,6 +20,15 @@ const ERR_SHAPE: i32 = -1;
 const ERR_HOST: i32 = -2;
 
 unsafe extern "C" {
+    fn scratchy_cuda_embed_bf16(
+        tokens: *const c_void,
+        table: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        hidden: u32,
+        vocab: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gemm_bf16_abt_prepare() -> i32;
     fn scratchy_cuda_gemm_bf16_abt(
         a: *const c_void,
@@ -179,6 +188,8 @@ unsafe extern "C" {
 /// Why a launcher did not launch, or the launch failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelError {
+    /// The embed does not take this shape; nothing was launched.
+    EmbedShape { rows: u32, hidden: u32, vocab: u32 },
     /// The GEMM does not take this shape; nothing was launched.
     Shape { m: u32, n: u32, k: u32 },
     /// A row kernel (RMSNorm, add, SiluMul, GateApply) does not take this shape; nothing was
@@ -242,6 +253,14 @@ pub enum KernelError {
 impl fmt::Display for KernelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            KernelError::EmbedShape {
+                rows,
+                hidden,
+                vocab,
+            } => write!(
+                f,
+                "embed refused shape rows={rows} hidden={hidden} vocab={vocab}"
+            ),
             KernelError::Shape { m, n, k } => write!(f, "kernel refused shape m={m} n={n} k={k}"),
             KernelError::RowShape { rows, cols } => {
                 write!(f, "kernel refused shape rows={rows} cols={cols}")
@@ -354,6 +373,41 @@ fn check(code: i32, shape: KernelError) -> Result<(), KernelError> {
         ERR_HOST => Err(KernelError::HostException),
         code => Err(KernelError::Cuda(code)),
     }
+}
+
+/// Launch the bf16 token-embedding gather: `out[r, :] = table[tokens[r], :]` for every one of the
+/// `rows` rows, padding rows included, the table's bits copied as they are; an id at or above
+/// `vocab` writes a `+0.0` row and reads nothing. Asynchronous.
+///
+/// Refused with [`KernelError::EmbedShape`], before any pointer is touched, unless `rows`,
+/// `hidden` and `vocab` are non-zero and at most `i32::MAX`, `hidden` a multiple of 8
+/// (`step::EMBED_BF16_COLS`), and `rows · hidden` at most `i32::MAX`. A failed launch returns the
+/// launch's own `cudaError_t`. No one-time setup, so it is not in [`PREPARE`].
+///
+/// # Safety
+///
+/// `tokens` must be a 4-byte-aligned device pointer to `rows` u32; `table` and `out`
+/// 16-byte-aligned device pointers to at least `vocab·hidden` and `rows·hidden` bf16, valid for
+/// the whole kernel, with `out` overlapping neither input. `stream` must be a live
+/// `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn embed_bf16(
+    tokens: *const c_void,
+    table: *const c_void,
+    out: *mut c_void,
+    (rows, hidden, vocab): (u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer.
+    let code = unsafe { scratchy_cuda_embed_bf16(tokens, table, out, rows, hidden, vocab, stream) };
+    check(
+        code,
+        KernelError::EmbedShape {
+            rows,
+            hidden,
+            vocab,
+        },
+    )
 }
 
 /// Launch the bf16 GEMM `C = A · Bᵀ` on the H100: `A` is `[m, k]`, `B` is `[n, k]` and `C` is

@@ -768,6 +768,9 @@ scratchy-forward-compiler-macro = { path = "../../compiler/macros" }
 scratchy-subtile = { path = "../../compiler/subtile" }
 scratchy-target-cuda-compiler = { path = "../../targets/cuda/compiler" }
 half = { workspace = true }
+# tests/cuda_hf_parity.rs reads the HF reference's `meta.json` and `greedy_<p>.json` goldens. It
+# runs on Linux (the H100), so not under the macOS-only section below.
+serde_json = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLAllocation", "MTLBuffer", "MTLDevice", "MTLResource"] }
@@ -813,5 +816,12 @@ required-features = ["cuda", "qwen3.5-0.8b"]
 # Needs nvcc to build and an H100 to run.
 [[test]]
 name = "cuda_prefill"
+required-features = ["nvcc", "qwen3.5-0.8b"]
+
+# qwen3.5-0.8b's prefill from the real checkpoint against HF transformers' logits
+# (tests/cuda_hf_reference.py's goldens). Needs nvcc to build, and an H100, the checkpoint and the
+# goldens to run.
+[[test]]
+name = "cuda_hf_parity"
 required-features = ["nvcc", "qwen3.5-0.8b"]
 

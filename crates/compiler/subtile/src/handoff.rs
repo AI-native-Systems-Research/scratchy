@@ -337,6 +337,13 @@ pub struct TargetModelInput {
     /// that means for it.
     pub unlowered: Vec<(TargetPoint, String)>,
     pub facts: TargetModelFacts,
+    /// Each model weight a canonical binds (`SourceBinding::Weight { id, index }`), and the
+    /// checkpoint prefix it loads from (without the leaf, e.g. `.weight`). A tied `lm_head`'s is
+    /// the embedding table's: the checkpoint stores the one tensor once.
+    pub weight_prefixes: Vec<(u32, Option<UnrollIndex>, String)>,
+    /// The token-embedding table's prefix, which `SourceBinding::EmbeddedHidden` reads; `None`
+    /// when the model has no embedding table.
+    pub embed_prefix: Option<String>,
 }
 
 /// One workload point: `m` token rows, `sk` the KV-length bucket.

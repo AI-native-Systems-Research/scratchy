@@ -22,18 +22,18 @@ use scratchy_subtile::tape_folding::{FusedShape, Fusion};
 use scratchy_target_cuda::op_abi::CudaFusion;
 use scratchy_target_cuda::step::{
     ADD_BF16_COLS, ATTN_PREFILL_BF16_HEAD_DIM, ATTN_PREFILL_BF16_ROWS, AddBf16, AttnPrefillBf16,
-    CudaStep, GATE_APPLY_BF16_COLS, GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE,
-    GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_NARROW_BF16_MAX_N,
-    GEMM_NARROW_BF16_MULTIPLE, GateApplyBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16,
-    RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16,
-    RopeAppendBf16, RopeBf16, SILU_MUL_BF16_COLS, SiluMulBf16,
+    CudaStep, EMBED_BF16_COLS, EmbedBf16, GATE_APPLY_BF16_COLS, GATE_SPLIT_BF16_HEAD_MULTIPLE,
+    GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE,
+    GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE, GateApplyBf16, GateSplitBf16,
+    GatedDeltaNetBf16, GemmBf16, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE,
+    ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RopeAppendBf16, RopeBf16, SILU_MUL_BF16_COLS, SiluMulBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, WeightIx};
 
 use crate::canonical::{
-    ArenaRefusal, AttnShapeRule, CanonicalRefusal, CudaModelFacts, GateShapeRule, GdnRegions,
-    GdnShapeRule, GdnWidths, GemmShapeRule, KvCacheRefusal, KvPool, KvRegions, OperandRefusal,
-    ProducerRefusal, RopeShapeRule, RowShapeRule, ViewRefusal,
+    ArenaRefusal, AttnShapeRule, CanonicalRefusal, CudaModelFacts, EmbedShapeRule, GateShapeRule,
+    GdnRegions, GdnShapeRule, GdnWidths, GemmShapeRule, KvCacheRefusal, KvPool, KvRegions,
+    OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule, ViewRefusal,
 };
 
 /// What a step's lowering reads besides the step itself: the planned canonical, the model facts,
@@ -154,6 +154,49 @@ pub fn lower_step(
         }),
     };
     step.map(Some)
+}
+
+/// The head's embed: `out [rows, hidden]` (colour 0, the embedded hidden) gathered from the
+/// `[vocab, hidden]` bf16 `table` by the `rows` u32 token ids at `tokens`. Not lowered from a tape
+/// op: the shared tape's first ops read the embedded hidden as a source, which this step fills.
+/// The shape rule is the launcher's ([`EMBED_BF16_COLS`]), stated at expansion.
+pub fn embed(
+    tokens: ArenaOffset,
+    table: WeightIx,
+    out: ArenaOffset,
+    (rows, hidden, vocab): (u32, u32, u32),
+) -> Result<CudaStep, CanonicalRefusal> {
+    let refuse = |rule| CanonicalRefusal::EmbedShape {
+        rows,
+        hidden,
+        vocab,
+        rule,
+    };
+    for (dim, value) in [("rows", rows), ("hidden", hidden), ("vocab", vocab)] {
+        if value == 0 {
+            return Err(refuse(EmbedShapeRule::Empty { dim }));
+        }
+        if value > i32::MAX as u32 {
+            return Err(refuse(EmbedShapeRule::AboveIntMax { dim, value }));
+        }
+    }
+    if !hidden.is_multiple_of(EMBED_BF16_COLS) {
+        return Err(refuse(EmbedShapeRule::OffVector {
+            multiple: EMBED_BF16_COLS,
+        }));
+    }
+    let elements = u64::from(rows) * u64::from(hidden);
+    if elements > i32::MAX as u64 {
+        return Err(refuse(EmbedShapeRule::TooManyElements { elements }));
+    }
+    Ok(CudaStep::Embed(EmbedBf16 {
+        tokens,
+        table,
+        out,
+        rows,
+        hidden,
+        vocab,
+    }))
 }
 
 /// Lower the `Compute` driving `fusion` to the fused kernel's CUDA step. `computes` is every

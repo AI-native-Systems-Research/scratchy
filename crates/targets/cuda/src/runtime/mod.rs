@@ -11,6 +11,7 @@
 mod buffer;
 mod device;
 mod ffi;
+mod loader;
 mod worker;
 
 use std::ffi::CStr;
@@ -18,8 +19,9 @@ use std::fmt;
 
 pub use buffer::DeviceBuffer;
 pub use device::{CudaDevice, DeviceError};
+pub use loader::load_weights;
 pub use worker::{
-    CudaWorker, ForwardError, GdnPoolConfig, GdnSequence, KvHalf, KvPoolConfig, KvSequence,
+    CudaWorker, ForwardError, GdnPoolConfig, GdnSequence, Input, KvHalf, KvPoolConfig, KvSequence,
     WorkerError,
 };
 

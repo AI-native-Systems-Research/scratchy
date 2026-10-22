@@ -41,7 +41,7 @@ use scratchy_subtile::subtile_ir::GainConvention;
 use scratchy_target_cuda::kernels::{gemm_bf16_abt, rms_norm_bf16, rope_bf16};
 use scratchy_target_cuda::rotary::rotary_rows;
 use scratchy_target_cuda::runtime::{
-    CudaDevice, CudaWorker, DeviceBuffer, ForwardError, GdnPoolConfig, GdnSequence, KvHalf,
+    CudaDevice, CudaWorker, DeviceBuffer, ForwardError, GdnPoolConfig, GdnSequence, Input, KvHalf,
     KvPoolConfig, KvSequence, WorkerError,
 };
 use scratchy_target_cuda::step::{CudaStep, gdn_bundle, gdn_scratch};
@@ -151,7 +151,7 @@ fn a_two_gemm_chain_matches_the_cpu_reference_in_each_bucket() {
         let x = input(m);
         let mut y2 = vec![0u16; m * H];
         worker
-            .forward(bucket, &x, &[], None, None, &mut y2)
+            .forward(bucket, Input::Hidden(&x), &[], None, None, &mut y2)
             .expect("forward");
         let y1 = read(&mut worker, colour(tape, 1));
         pass &= check_stage("y1 = x·W1ᵀ", &y1, &x, &w.w1, (m, WIDE, H));
@@ -191,7 +191,14 @@ fn the_worker_allocates_once_and_no_forward_allocates() {
         let m = TWO_GEMM_BUCKETS[bucket].bucket_m as usize;
         let mut y2 = vec![0u16; m * H];
         worker
-            .forward(bucket, &inputs[bucket], &[], None, None, &mut y2)
+            .forward(
+                bucket,
+                Input::Hidden(&inputs[bucket]),
+                &[],
+                None,
+                None,
+                &mut y2,
+            )
             .expect("forward");
         if i == 0 {
             free_after_first = Some(device.mem_info().expect("cudaMemGetInfo").0);
@@ -236,7 +243,7 @@ fn the_three_gemm_chain_reuses_a_colour_and_stays_right() {
         CudaWorker::new(&device, two, &table[..3], None, None).expect("two-GEMM worker");
     let mut two_y2 = vec![0u16; 256 * H];
     worker
-        .forward(0, &x, &[], None, None, &mut two_y2)
+        .forward(0, Input::Hidden(&x), &[], None, None, &mut two_y2)
         .expect("two-GEMM forward");
     drop(worker);
 
@@ -245,7 +252,7 @@ fn the_three_gemm_chain_reuses_a_colour_and_stays_right() {
         CudaWorker::new(&device, three, &table, None, None).expect("three-GEMM worker");
     let mut y3 = vec![0u16; 256 * WIDE];
     worker
-        .forward(0, &x, &[], None, None, &mut y3)
+        .forward(0, Input::Hidden(&x), &[], None, None, &mut y3)
         .expect("three-GEMM forward");
     let y2 = read(&mut worker, colour(&THREE_GEMM_M256, 2));
     let pass = check_stage(
@@ -264,8 +271,8 @@ fn the_three_gemm_chain_reuses_a_colour_and_stays_right() {
     assert!(same, "y2 differs from the two-GEMM chain's result");
 }
 
-/// A short input is refused before anything is enqueued, and the worker still plays after it; a
-/// short weight is refused at construction.
+/// A short input, and an input of the wrong kind, are refused before anything is enqueued, and
+/// the worker still plays after them; a short weight is refused at construction.
 #[test]
 fn short_inputs_and_short_weights_are_refused() {
     let device = h100();
@@ -279,15 +286,34 @@ fn short_inputs_and_short_weights_are_refused() {
         CudaWorker::new(&device, &TWO_GEMM_BUCKETS, &table, None, None).expect("worker");
     let x = input(256);
     let mut y2 = vec![0u16; 256 * H];
-    let got = worker.forward(1, &x[..x.len() - 1], &[], None, None, &mut y2);
+    let got = worker.forward(
+        1,
+        Input::Hidden(&x[..x.len() - 1]),
+        &[],
+        None,
+        None,
+        &mut y2,
+    );
     let want = Err(ForwardError::InputSize {
         expected: 262144,
         got: 262142,
     });
     eprintln!("input one element short: {got:?} {}", verdict(got == want));
     assert_eq!(got, want);
+    // Token ids for a tape whose input is the embedded hidden: refused before any copy.
+    let ids = vec![0u32; 256];
+    let got = worker.forward(1, Input::TokenIds(&ids), &[], None, None, &mut y2);
+    let want = Err(ForwardError::InputKind {
+        expected: "hidden rows",
+        got: "token ids",
+    });
+    eprintln!(
+        "token ids for a hidden tape: {got:?} {}",
+        verdict(got == want)
+    );
+    assert_eq!(got, want);
     worker
-        .forward(1, &x, &[], None, None, &mut y2)
+        .forward(1, Input::Hidden(&x), &[], None, None, &mut y2)
         .expect("the next valid forward");
     let y1 = read(&mut worker, colour(&TWO_GEMM_M256, 1));
     let pass = check_stage(
@@ -417,7 +443,7 @@ fn the_mlp_block_matches_the_cpu_reference_in_each_bucket() {
         let x = mlp_input(m);
         let mut y = vec![0u16; m * MLP_H];
         worker
-            .forward(bucket, &x, &[], None, None, &mut y)
+            .forward(bucket, Input::Hidden(&x), &[], None, None, &mut y)
             .expect("forward");
         let n = n_direct(&device, tape, &x, &w.g);
         let n_ref = rms_norm_reference(&x, &w.g, (m, MLP_H), f64::from(EPS), 1.0);
@@ -469,7 +495,14 @@ fn the_mlp_worker_allocates_once_and_no_forward_allocates() {
         let m = MLP_BUCKETS[bucket].bucket_m as usize;
         let mut y = vec![0u16; m * MLP_H];
         worker
-            .forward(bucket, &inputs[bucket], &[], None, None, &mut y)
+            .forward(
+                bucket,
+                Input::Hidden(&inputs[bucket]),
+                &[],
+                None,
+                None,
+                &mut y,
+            )
             .expect("forward");
         if i == 0 {
             free_after_first = Some(device.mem_info().expect("cudaMemGetInfo").0);
@@ -614,7 +647,7 @@ fn the_attention_gate_matches_the_cpu_reference_in_each_bucket() {
         let positions = attn_positions(m);
         let mut y = vec![0u16; m * AG_H];
         worker
-            .forward(bucket, &x, &positions, None, None, &mut y)
+            .forward(bucket, Input::Hidden(&x), &positions, None, None, &mut y)
             .expect("forward");
         let n = n_direct(&device, tape, &x, &w.g_in);
         let n_ref = rms_norm_reference(&x, &w.g_in, (m, AG_H), f64::from(EPS), 1.0);
@@ -705,7 +738,7 @@ fn the_attention_gate_worker_allocates_once_and_no_forward_allocates() {
         worker
             .forward(
                 bucket,
-                &inputs[bucket],
+                Input::Hidden(&inputs[bucket]),
                 &positions[bucket],
                 None,
                 None,
@@ -747,7 +780,14 @@ fn a_forward_with_the_wrong_positions_is_refused() {
     let mut worker = CudaWorker::new(&device, &ATTN_BUCKETS, &table, None, None).expect("worker");
     let x = attn_input(256);
     let mut y = vec![0u16; 256 * AG_H];
-    let got = worker.forward(1, &x, &attn_positions(255), None, None, &mut y);
+    let got = worker.forward(
+        1,
+        Input::Hidden(&x),
+        &attn_positions(255),
+        None,
+        None,
+        &mut y,
+    );
     let want = Err(ForwardError::Positions {
         expected: 256,
         got: 255,
@@ -767,7 +807,7 @@ fn a_forward_with_the_wrong_positions_is_refused() {
         CudaWorker::new(&device, &MLP_BUCKETS, &table, None, None).expect("MLP worker");
     let got = worker.forward(
         1,
-        &mlp_input(256),
+        Input::Hidden(&mlp_input(256)),
         &[7],
         None,
         None,
@@ -977,7 +1017,14 @@ fn the_attention_layer_matches_the_cpu_reference_in_each_bucket() {
         };
         let mut y = vec![0u16; m * AL_H];
         worker
-            .forward(bucket, &x, &positions, Some(&seq), None, &mut y)
+            .forward(
+                bucket,
+                Input::Hidden(&x),
+                &positions,
+                Some(&seq),
+                None,
+                &mut y,
+            )
             .expect("forward");
         // `n` (colour 1) holds `o` by the forward's end: the norm kernel is run alone.
         let n = n_direct(&device, tape, &x, &w.g_in);
@@ -1145,7 +1192,7 @@ fn a_second_chunk_reads_the_first_from_the_cache() {
     worker
         .forward(
             1,
-            &layer_input(256, 0xC4A),
+            Input::Hidden(&layer_input(256, 0xC4A)),
             &seq_positions(256, 0),
             Some(&a),
             None,
@@ -1165,7 +1212,7 @@ fn a_second_chunk_reads_the_first_from_the_cache() {
     worker
         .forward(
             1,
-            &layer_input(256, 0xC4B),
+            Input::Hidden(&layer_input(256, 0xC4B)),
             &positions,
             Some(&b),
             None,
@@ -1231,7 +1278,7 @@ fn a_short_chunk_pads() {
     worker
         .forward(
             0,
-            &layer_input(128, 0x5401),
+            Input::Hidden(&layer_input(128, 0x5401)),
             &seq_positions(128, 0),
             Some(&f1),
             None,
@@ -1249,7 +1296,7 @@ fn a_short_chunk_pads() {
     worker
         .forward(
             0,
-            &layer_input(128, 0x5402),
+            Input::Hidden(&layer_input(128, 0x5402)),
             &seq_positions(128, 0),
             Some(&f2),
             None,
@@ -1276,7 +1323,7 @@ fn a_short_chunk_pads() {
     worker
         .forward(
             0,
-            &layer_input(128, 0x5403),
+            Input::Hidden(&layer_input(128, 0x5403)),
             &positions,
             Some(&f3),
             None,
@@ -1363,7 +1410,7 @@ fn the_attention_layer_worker_allocates_once_and_no_forward_allocates() {
         worker
             .forward(
                 bucket,
-                &inputs[bucket],
+                Input::Hidden(&inputs[bucket]),
                 &seq_positions(m, 0),
                 Some(&seq),
                 None,
@@ -1480,7 +1527,7 @@ fn a_bad_sequence_is_refused_before_any_copy() {
     let mut pass = true;
     for (kv, positions, want) in &cases {
         let mut y = vec![0u16; 128 * AL_H];
-        let got = worker.forward(0, &x, positions, kv.as_ref(), None, &mut y);
+        let got = worker.forward(0, Input::Hidden(&x), positions, kv.as_ref(), None, &mut y);
         let untouched = y.iter().all(|&b| b == 0);
         eprintln!(
             "refused {want:?}: got={got:?} result_untouched={untouched} {}",
@@ -1490,7 +1537,14 @@ fn a_bad_sequence_is_refused_before_any_copy() {
     }
     // Too few entries for the tokens.
     let mut y = vec![0u16; 128 * AL_H];
-    let got = worker.forward(0, &x, &pos, Some(&seq(&[11], 0, 128)), None, &mut y);
+    let got = worker.forward(
+        0,
+        Input::Hidden(&x),
+        &pos,
+        Some(&seq(&[11], 0, 128)),
+        None,
+        &mut y,
+    );
     let want = Err(ForwardError::KvBlockTable {
         got: 1,
         need: 2,
@@ -1504,13 +1558,27 @@ fn a_bad_sequence_is_refused_before_any_copy() {
     // A good forward after them is the same as on a fresh worker.
     let mut after = vec![0u16; 128 * AL_H];
     worker
-        .forward(0, &x, &pos, Some(&seq(good, 0, 128)), None, &mut after)
+        .forward(
+            0,
+            Input::Hidden(&x),
+            &pos,
+            Some(&seq(good, 0, 128)),
+            None,
+            &mut after,
+        )
         .expect("a good forward after the refusals");
     let mut fresh_worker =
         CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL, None).expect("a fresh worker");
     let mut fresh = vec![0u16; 128 * AL_H];
     fresh_worker
-        .forward(0, &x, &pos, Some(&seq(good, 0, 128)), None, &mut fresh)
+        .forward(
+            0,
+            Input::Hidden(&x),
+            &pos,
+            Some(&seq(good, 0, 128)),
+            None,
+            &mut fresh,
+        )
         .expect("the fresh forward");
     let same = after == fresh;
     eprintln!(
@@ -1529,7 +1597,7 @@ fn a_bad_sequence_is_refused_before_any_copy() {
     let mut y = vec![0u16; 256 * AG_H];
     let got = gate_worker.forward(
         1,
-        &attn_input(256),
+        Input::Hidden(&attn_input(256)),
         &attn_positions(256),
         Some(&seq(good, 0, 128)),
         None,
@@ -2021,7 +2089,7 @@ fn the_gdn_layer_matches_the_cpu_reference_in_each_bucket() {
         };
         let mut y = vec![0u16; m * GL_H];
         worker
-            .forward(bucket, &x, &[], None, Some(&seq), &mut y)
+            .forward(bucket, Input::Hidden(&x), &[], None, Some(&seq), &mut y)
             .expect("forward");
         let start = ScanStart { state: None, t0: 0 };
         let (ok, _) = check_gdn_forward(
@@ -2058,7 +2126,7 @@ fn the_gdn_layer_carries_its_state_across_two_chunks() {
         fresh: true,
     };
     worker
-        .forward(1, &x1, &[], None, Some(&s1), &mut y)
+        .forward(1, Input::Hidden(&x1), &[], None, Some(&s1), &mut y)
         .expect("chunk 1");
     let fresh = ScanStart { state: None, t0: 0 };
     let (ok1, scan1) = check_gdn_forward(
@@ -2078,7 +2146,7 @@ fn the_gdn_layer_carries_its_state_across_two_chunks() {
         fresh: false,
     };
     worker
-        .forward(1, &x2, &[], None, Some(&s2), &mut y)
+        .forward(1, Input::Hidden(&x2), &[], None, Some(&s2), &mut y)
         .expect("chunk 2");
     let (st1, sm1) = (to_f64(&state1), scan1.smax.clone());
     let cont = ScanStart {
@@ -2162,7 +2230,7 @@ fn the_gdn_layer_does_not_leak_state_into_a_fresh_sequence() {
     let run = |worker: &mut CudaWorker<'_>, x: &[u16], seq: GdnSequence| {
         let mut y = vec![0u16; 256 * GL_H];
         worker
-            .forward(1, x, &[], None, Some(&seq), &mut y)
+            .forward(1, Input::Hidden(x), &[], None, Some(&seq), &mut y)
             .expect("forward");
         y
     };
@@ -2243,7 +2311,14 @@ fn the_gdn_layer_worker_allocates_once_and_no_forward_allocates() {
         };
         let mut y = vec![0u16; m as usize * GL_H];
         worker
-            .forward(bucket, &inputs[bucket], &[], None, Some(&seq), &mut y)
+            .forward(
+                bucket,
+                Input::Hidden(&inputs[bucket]),
+                &[],
+                None,
+                Some(&seq),
+                &mut y,
+            )
             .expect("forward");
         if i == 0 {
             free_after_first = Some(device.mem_info().expect("cudaMemGetInfo").0);
@@ -2289,7 +2364,7 @@ fn a_bad_gdn_sequence_is_refused_before_any_copy() {
     worker
         .forward(
             0,
-            &x,
+            Input::Hidden(&x),
             &[],
             None,
             Some(&GdnSequence {
@@ -2340,7 +2415,7 @@ fn a_bad_gdn_sequence_is_refused_before_any_copy() {
     let mut pass = true;
     for (gdn, want) in &cases {
         let mut out = vec![0u16; 128 * GL_H];
-        let got = worker.forward(0, &x, &[], None, gdn.as_ref(), &mut out);
+        let got = worker.forward(0, Input::Hidden(&x), &[], None, gdn.as_ref(), &mut out);
         let untouched = out.iter().all(|&b| b == 0);
         let arena_same = read(
             &mut worker,
@@ -2364,7 +2439,7 @@ fn a_bad_gdn_sequence_is_refused_before_any_copy() {
     let mut mlp_worker = CudaWorker::new(&device, &MLP_BUCKETS, &mt, None, None).expect("mlp");
     let got = mlp_worker.forward(
         1,
-        &mlp_input(256),
+        Input::Hidden(&mlp_input(256)),
         &[],
         None,
         Some(&seq(0, 256)),

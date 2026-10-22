@@ -5,10 +5,13 @@
 //! model's module holds what came back: `CUDA_TAPES`, one `static` tape per prefill bucket, and
 //! `CUDA_UNLOWERED`, the buckets left out. Two checks:
 //!
-//! - every emitted tape is, field by field, what `lower_canonical` gives for the same canonical
-//!   (the canonical the seam was handed, recaptured here through the same pipeline);
+//! - every emitted tape is, field by field, what CUDA's compiler lowers the same canonicals to
+//!   (`lower_model`: `lower_canonical` per bucket, then the weight table's tie rewrite), and the
+//!   emitted `CUDA_WEIGHTS` is its weight table;
 //! - the tapes carry the numbers measured for this model: the step histogram, the colours, the
-//!   arena, input and result spans per bucket, the weights, and the KV and GDN layers.
+//!   arena, input and result spans per bucket, the weights, and the KV and GDN layers;
+//! - the weight table names the checkpoint's tensors: 266 entries, 18 of them GDN bundles, 320
+//!   distinct tensors, none named twice, and the tied lm_head reads the embedding table.
 
 #[path = "../../../targets/cuda/tests/common/chains.rs"]
 pub mod chains;
@@ -16,11 +19,12 @@ pub mod chains;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use scratchy_models::qwen3_5::qwen3_5_0_8b::{CUDA_TAPES, CUDA_UNLOWERED};
+use scratchy_models::qwen3_5::qwen3_5_0_8b::{CUDA_TAPES, CUDA_UNLOWERED, CUDA_WEIGHTS};
 use scratchy_subtile::handoff::TargetModelInput;
-use scratchy_target_cuda::step::CudaStep;
-use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, CudaTape};
-use scratchy_target_cuda_compiler::emit::model_facts;
+use scratchy_target_cuda::step::{CudaStep, EmbedBf16, GemmBf16};
+use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, CudaTape, TapeInput, WeightIx};
+use scratchy_target_cuda::weights::CudaWeight;
+use scratchy_target_cuda_compiler::emit::{lower_model, model_facts};
 
 /// The 0.8b's canonicals, as `#[forward]` handed them to the seam.
 ///
@@ -65,7 +69,9 @@ const fn span(offset: u64, bytes: u64) -> ArenaSpan {
     }
 }
 
-/// Per bucket: the arena's `total_bytes`, the input span (colour 0), the result span.
+/// Per bucket: the arena's `total_bytes` before the token ids (#812's), colour 0 (the embedded
+/// hidden), the result span. The token ids, `4·bucket_m` bytes, sit at that total, and the arena
+/// grows by exactly them.
 const ARENAS: [(u32, u64, ArenaSpan, ArenaSpan); 4] = [
     (
         512,
@@ -93,11 +99,18 @@ const ARENAS: [(u32, u64, ArenaSpan, ArenaSpan); 4] = [
     ),
 ];
 
+/// Per bucket, the arena's `total_bytes` with the token ids.
+const TOTALS: [u64; 4] = [323_130_368, 646_259_712, 1_292_518_400, 2_585_035_776];
+
+const VOCAB: u32 = 248_320;
+const HIDDEN: u32 = 1024;
+
 /// One tape's steps, by kind.
 fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
     let mut h = BTreeMap::new();
     for step in tape.steps {
         let kind = match step {
+            CudaStep::Embed(_) => "Embed",
             CudaStep::Gemm(_) => "Gemm",
             CudaStep::GemmNarrow(_) => "GemmNarrow",
             CudaStep::RmsNorm(_) => "RmsNorm",
@@ -130,16 +143,20 @@ fn every_emitted_tape_is_what_cuda_lowers_from_the_same_canonical() {
         (16, 128, 4, 1e-6),
         "the 0.8b's GDN facts"
     );
-    for tape in CUDA_TAPES {
-        let m = tape.bucket_m;
-        // Every sk of the bucket: the tape is one per m because it reads no sk.
-        let canonicals: Vec<_> = (input.buckets.iter()).filter(|b| b.point.m == m).collect();
-        assert!(!canonicals.is_empty(), "m={m}: no canonical");
-        for b in canonicals {
-            let name = format!("qwen3.5-0.8b m={m} sk={}", b.point.sk);
-            chains::assert_tape_is_lowered_with(&name, tape, &b.lowered, facts);
-        }
+    assert_eq!(
+        facts.embed.map(|e| e.vocab),
+        Some(VOCAB),
+        "the 0.8b's embedding table"
+    );
+    // The whole model as the seam lowers it: every bucket, every sk (one tape per m, which
+    // `lower_model` checks), then the weight table.
+    let model = lower_model(&input).unwrap_or_else(|e| panic!("lower_model: {e}"));
+    assert_eq!(model.tapes.len(), CUDA_TAPES.len(), "tapes");
+    for (tape, lowered) in CUDA_TAPES.iter().zip(&model.tapes) {
+        let name = format!("qwen3.5-0.8b m={}", tape.bucket_m);
+        chains::assert_tape_is(&name, tape, lowered);
     }
+    assert_eq!(CUDA_WEIGHTS, model.weights.as_slice(), "CUDA_WEIGHTS");
 }
 
 #[test]
@@ -170,6 +187,7 @@ fn the_buckets_below_the_gemm_tile_are_left_out_and_named() {
 fn every_tape_has_the_measured_layout() {
     let want_steps: BTreeMap<&str, usize> = [
         ("Add", 48),
+        ("Embed", 1),
         ("AttnPrefill", 6),
         ("GateApply", 6),
         ("GateSplit", 6),
@@ -187,11 +205,38 @@ fn every_tape_has_the_measured_layout() {
     let gdn_layers: Vec<u32> = (0..24).filter(|l| !kv_layers.contains(l)).collect();
     for (tape, &(m, total, input, result)) in CUDA_TAPES.iter().zip(&ARENAS) {
         assert_eq!(tape.bucket_m, m);
-        assert_eq!(tape.steps.len(), 368, "m={m}: steps");
+        assert_eq!(tape.steps.len(), 369, "m={m}: steps");
         assert_eq!(histogram(tape), want_steps, "m={m}: step histogram");
         assert_eq!(tape.arena.colour_bytes.len(), 26, "m={m}: colours");
-        assert_eq!(tape.arena.total_bytes, total, "m={m}: arena total_bytes");
-        assert_eq!(tape.input, input, "m={m}: input span");
+        let with_ids = TOTALS[BUCKETS.iter().position(|&b| b == m).expect("a bucket")];
+        assert_eq!(tape.arena.total_bytes, with_ids, "m={m}: arena total_bytes");
+        assert_eq!(
+            with_ids,
+            total + 4 * u64::from(m),
+            "m={m}: the arena grows by 4·m"
+        );
+        let ids = span(total, 4 * u64::from(m));
+        assert_eq!(
+            tape.input,
+            TapeInput::TokenIds {
+                span: ids,
+                vocab: VOCAB
+            },
+            "m={m}: input"
+        );
+        assert_eq!(
+            tape.steps[0],
+            CudaStep::Embed(EmbedBf16 {
+                tokens: ids.offset,
+                table: WeightIx(0),
+                out: input.offset,
+                rows: m,
+                hidden: HIDDEN,
+                vocab: VOCAB,
+            }),
+            "m={m}: the embed writes colour 0, {input:?}"
+        );
+        assert_eq!(tape.arena.colour_bytes[0], input.bytes, "m={m}: colour 0");
         assert_eq!(tape.result, result, "m={m}: result span");
         // The result is the full logits, `[m, 248320]` bf16.
         assert_eq!(result.bytes, u64::from(m) * 248_320 * 2, "m={m}: logits");
@@ -219,6 +264,139 @@ fn every_tape_has_the_measured_layout() {
             ),
             (16, 16, 128, 128, 4),
             "m={m}: GDN geometry"
+        );
+    }
+}
+
+/// The weight table: one entry per weight index the tapes read, 266 of them, from the
+/// checkpoint's 320 decoder tensors (247 bf16 tensors, 18 GDN bundles of four, the embedding
+/// table); none named twice, because the tied lm_head reads the embedding table's index.
+#[test]
+fn the_weight_table_names_the_checkpoints_tensors() {
+    assert_eq!(
+        CUDA_WEIGHTS.len(),
+        CUDA_TAPES[0].weight_bytes.len(),
+        "one entry per index"
+    );
+    let entries: Vec<(usize, CudaWeight)> = (CUDA_WEIGHTS.iter().enumerate())
+        .filter_map(|(ix, w)| w.map(|w| (ix, w)))
+        .collect();
+    assert_eq!(entries.len(), 266, "Some entries");
+    let bundles = (entries.iter())
+        .filter(|(_, w)| matches!(w, CudaWeight::GdnBundle { .. }))
+        .count();
+    assert_eq!(bundles, 18, "GDN bundles");
+    let mut names = std::collections::BTreeSet::new();
+    let mut leads = std::collections::BTreeSet::new();
+    for (ix, w) in &entries {
+        let tensors = match *w {
+            CudaWeight::Bf16 { tensor, .. } => vec![tensor],
+            CudaWeight::GdnBundle {
+                conv1d,
+                a_log,
+                dt_bias,
+                norm,
+                ..
+            } => vec![conv1d, a_log, dt_bias, norm],
+        };
+        assert!(
+            leads.insert(tensors[0]),
+            "weight {ix}: {} named twice",
+            tensors[0]
+        );
+        names.extend(tensors);
+        for tape in CUDA_TAPES {
+            assert_eq!(
+                Some(tape.weight_bytes[*ix]),
+                w.packed_bytes(),
+                "m={}: weight {ix}'s declared bytes",
+                tape.bucket_m
+            );
+        }
+    }
+    assert_eq!(names.len(), 320, "distinct tensors");
+    for (ix, w) in CUDA_WEIGHTS.iter().enumerate() {
+        if w.is_none() {
+            for tape in CUDA_TAPES {
+                assert_eq!(tape.weight_bytes[ix], 0, "m={}: weight {ix}", tape.bucket_m);
+            }
+        }
+    }
+    let bytes: u64 = (entries.iter())
+        .map(|(_, w)| w.packed_bytes().expect("fits"))
+        .sum();
+    assert_eq!(bytes, 1_505_683_456, "the table's bytes");
+    let by_name = |name: &str| {
+        (entries.iter())
+            .find(|(_, w)| matches!(w, CudaWeight::Bf16 { tensor, .. } if *tensor == name))
+            .copied()
+            .unwrap_or_else(|| panic!("no entry for {name}"))
+    };
+    let shape = |w: CudaWeight| match w {
+        CudaWeight::Bf16 { shape, .. } => shape,
+        CudaWeight::GdnBundle { .. } => panic!("a bundle"),
+    };
+    let (e, embed) = by_name("language_model.model.embed_tokens.weight");
+    assert_eq!(e, 0, "the embedding table is the embedded hidden's index");
+    assert_eq!(shape(embed), [248_320, 1024], "the embedding table");
+    for (name, want) in [
+        (
+            "language_model.model.layers.0.linear_attn.in_proj_qkv.weight",
+            &[6144, 1024][..],
+        ),
+        (
+            "language_model.model.layers.3.self_attn.q_proj.weight",
+            &[4096, 1024][..],
+        ),
+        ("language_model.model.norm.weight", &[1024][..]),
+    ] {
+        assert_eq!(shape(by_name(name).1), want, "{name}");
+    }
+    let bundle = (entries.iter())
+        .find_map(|(_, w)| match *w {
+            b @ CudaWeight::GdnBundle {
+                conv1d: "language_model.model.layers.0.linear_attn.conv1d.weight",
+                ..
+            } => Some(b),
+            _ => None,
+        })
+        .expect("layer 0's bundle");
+    assert_eq!(
+        bundle,
+        CudaWeight::GdnBundle {
+            conv1d: "language_model.model.layers.0.linear_attn.conv1d.weight",
+            a_log: "language_model.model.layers.0.linear_attn.A_log",
+            dt_bias: "language_model.model.layers.0.linear_attn.dt_bias",
+            norm: "language_model.model.layers.0.linear_attn.norm.weight",
+            conv_dim: 6144,
+            conv_kernel: 4,
+            nv: 16,
+            head_v: 128,
+        }
+    );
+    assert_eq!(bundle.packed_bytes(), Some(99_328), "a bundle's bytes");
+    let layout = scratchy_target_cuda::step::gdn_bundle(6144, 4, 16, 128).expect("fits");
+    assert_eq!(
+        (
+            layout.conv1d,
+            layout.a_log,
+            layout.dt_bias,
+            layout.norm,
+            layout.bytes
+        ),
+        (0, 98_304, 98_560, 98_816, 99_328),
+        "the bundle's regions"
+    );
+    // The tied lm_head: the last step reads the embedding table's index, and its own is empty.
+    for tape in CUDA_TAPES {
+        let m = tape.bucket_m;
+        let Some(&CudaStep::Gemm(GemmBf16 { b, n, k, .. })) = tape.steps.last() else {
+            panic!("m={m}: the tape ends with the lm_head GEMM");
+        };
+        assert_eq!(
+            (b, n, k),
+            (WeightIx(e as u32), VOCAB, HIDDEN),
+            "m={m}: the lm_head"
         );
     }
 }

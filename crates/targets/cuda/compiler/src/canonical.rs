@@ -35,10 +35,10 @@ use scratchy_target_cuda::step::{
     CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GDN_SEQUENCE_BYTES, gdn_scratch,
 };
 use scratchy_target_cuda::tape::{
-    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, RotaryTable,
+    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, RotaryTable, TapeInput, WeightIx,
 };
 
-use crate::steps_from_tape::{StepCx, TapeStep, gdn_bundle_layer, lower_fused, lower_step};
+use crate::steps_from_tape::{StepCx, TapeStep, embed, gdn_bundle_layer, lower_fused, lower_step};
 
 /// The model facts CUDA's opcode lowering reads, beside the canonical: expansion-time constants,
 /// the counterpart of the `MetalModelConsts` fields metal's rope and gate lowerings read.
@@ -46,13 +46,23 @@ use crate::steps_from_tape::{StepCx, TapeStep, gdn_bundle_layer, lower_fused, lo
 /// `GateSplit` carries only `half_cols`, so its `head_dim` is this one; `RopeRotate` carries its
 /// `head_dim` but not its rotated width, so `rot_dim` (`partial_rotary_factor · head_dim`) is this
 /// one, and `rope_theta` builds the rotary table's rows. `GatedDeltaNet` carries none of its
-/// key-head geometry, so `gdn` is it, for a model with linear-attention layers.
+/// key-head geometry, so `gdn` is it, for a model with linear-attention layers. `embed` is the
+/// token-embedding table the forward gathers its input rows from, for a model whose input is token
+/// ids; with none, the input is the embedded hidden itself (the layer-level fixtures).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CudaModelFacts {
     pub head_dim: u32,
     pub rot_dim: u32,
     pub rope_theta: f64,
     pub gdn: Option<CudaGdnFacts>,
+    pub embed: Option<CudaEmbedFacts>,
+}
+
+/// The token-embedding table the embedded hidden is gathered from: `vocab` rows of the hidden's
+/// width. The table is the embedded hidden source's weight index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CudaEmbedFacts {
+    pub vocab: u32,
 }
 
 /// The Gated-DeltaNet geometry the op does not carry: `linear_num_key_heads`,
@@ -98,8 +108,9 @@ pub struct CudaCanonical {
     pub colour_offsets: Vec<u64>,
     /// Every colour's aligned size, summed, and the rotary table's after them.
     pub total_bytes: u64,
-    /// Colour 0, the embedded hidden the forward uploads.
-    pub input: ArenaSpan,
+    /// What the forward uploads: colour 0, the embedded hidden, or the token ids the first step
+    /// embeds into colour 0.
+    pub input: TapeInput,
     /// The colourer's result colour, which the forward downloads.
     pub result: ArenaSpan,
     /// Per source index: its weight buffer's bytes; 0 for a source that is not a weight.
@@ -362,8 +373,29 @@ pub enum CanonicalRefusal {
     GdnPool {
         step: usize,
     },
+    /// The embedding table cannot be gathered from: the embedded hidden is `rows × hidden` and
+    /// the table `vocab` rows, a shape the bf16 embed does not take.
+    EmbedShape {
+        rows: u32,
+        hidden: u32,
+        vocab: u32,
+        rule: EmbedShapeRule,
+    },
     /// The arena cannot be laid out.
     Arena(ArenaRefusal),
+}
+
+/// Which rule an embed's shape breaks: the launcher's, stated at expansion time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbedShapeRule {
+    /// `dim` is zero.
+    Empty { dim: &'static str },
+    /// `hidden` is not a multiple of `multiple`, the kernel's 16-byte bf16 vector.
+    OffVector { multiple: u32 },
+    /// `dim` is above `i32::MAX`.
+    AboveIntMax { dim: &'static str, value: u32 },
+    /// `rows · hidden` is above `i32::MAX`, the largest element count the launcher indexes.
+    TooManyElements { elements: u64 },
 }
 
 /// Which rule a `GatedDeltaNet`'s geometry breaks: the four kernels', stated at expansion time.
@@ -785,7 +817,38 @@ impl std::fmt::Display for CanonicalRefusal {
                  op, which the GDN scratch is sized by; one scratch and one state pool cannot hold \
                  both"
             ),
+            Self::EmbedShape {
+                rows,
+                hidden,
+                vocab,
+                rule,
+            } => write!(
+                f,
+                "the embed is rows={rows} hidden={hidden} vocab={vocab}, which the bf16 embed \
+                 refuses: {rule}"
+            ),
             Self::Arena(e) => write!(f, "the arena cannot be laid out: {e}"),
+        }
+    }
+}
+
+impl std::fmt::Display for EmbedShapeRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty { dim } => write!(f, "{dim} = 0"),
+            Self::OffVector { multiple } => write!(
+                f,
+                "hidden must be a multiple of {multiple}, the kernel's 16-byte bf16 vector"
+            ),
+            Self::AboveIntMax { dim, value } => {
+                write!(f, "{dim} = {value} is above {}", i32::MAX)
+            }
+            Self::TooManyElements { elements } => write!(
+                f,
+                "rows·hidden = {elements} is above {}, the largest element count the launcher \
+                 indexes",
+                i32::MAX
+            ),
         }
     }
 }
@@ -1147,7 +1210,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         gdn_regions: arena.as_ref().ok().and_then(|a| a.gdn),
     };
     let computes: Vec<TapeStep<'_>> = tape_steps(&plan).collect();
-    let steps = (computes.iter())
+    let mut steps = (computes.iter())
         .filter_map(|s| match plan.folds.role(s.writes) {
             StepRole::Kept => lower_step(&cx, s, &computes).transpose(),
             StepRole::Drives(f) => Some(lower_fused(&cx, s, f, &computes)),
@@ -1155,12 +1218,33 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     let arena = arena.map_err(CanonicalRefusal::Arena)?;
+    // The head, as metal's: with an embedding table, the forward's input is token ids, and its
+    // first step gathers them into colour 0, the embedded hidden, from the table at the embedded
+    // hidden source's index.
+    let head = match (plan.facts.embed, arena.tokens) {
+        (Some(CudaEmbedFacts { vocab }), Some(tokens)) => {
+            let (e, hidden) = embedded_hidden_source(&plan).map_err(CanonicalRefusal::Arena)?;
+            let step = embed(
+                tokens.offset,
+                WeightIx(e as u32),
+                ArenaOffset(arena.offsets[0]),
+                (hidden.rows, hidden.cols, vocab),
+            )?;
+            steps.insert(0, step);
+            Some((e, tokens, vocab, hidden))
+        }
+        _ => None,
+    };
     let kv = kv.map_err(CanonicalRefusal::KvCache)?;
     let span = |c: Colour| ArenaSpan {
         offset: ArenaOffset(arena.offsets[c.index() as usize]),
         bytes: arena.bytes[c.index() as usize],
     };
-    let (input, result) = (span(Colour::ZERO), span(plan.colouring.result()));
+    let result = span(plan.colouring.result());
+    let input = match head {
+        Some((_, span, vocab, _)) => TapeInput::TokenIds { span, vocab },
+        None => TapeInput::Hidden(span(Colour::ZERO)),
+    };
     // A GDN step's bundle is a `[1, 1]` source in the IR; on the device it is the packed f32
     // `gdn_bundle` of the step's geometry, which its extents read.
     let bundles: BTreeMap<u32, u64> = (steps.iter())
@@ -1177,6 +1261,13 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
                     let shape = plan.graph.tensors[t];
                     elements_bytes(shape.rows, shape.cols).ok_or(ArenaRefusal::TooLarge)
                 }
+            },
+            // The embedded hidden's source holds the embedding table the head gathers from.
+            SourceBinding::EmbeddedHidden => match head {
+                Some((e, _, vocab, hidden)) if e == t => {
+                    elements_bytes(vocab, hidden.cols).ok_or(ArenaRefusal::TooLarge)
+                }
+                _ => Ok(0),
             },
             _ => Ok(0),
         })
@@ -1305,6 +1396,9 @@ struct Arena {
     rotary: Option<ArenaSpan>,
     kv: Option<KvRegions>,
     gdn: Option<GdnRegions>,
+    /// The token ids, `bucket_m` u32 after every other region: `Some` exactly when the model has
+    /// an embedding table (`CudaModelFacts::embed`).
+    tokens: Option<ArenaSpan>,
     total: u64,
 }
 
@@ -1321,6 +1415,8 @@ pub struct KvRegions {
 
 /// Bytes of one u32 entry of a KV region.
 const KV_ENTRY_BYTES: u64 = 4;
+/// Bytes of one token id.
+const TOKEN_ID_BYTES: u64 = 4;
 
 /// Where the forward's GDN sequence data and the GDN steps' scratch live in the arena, after the
 /// KV regions.
@@ -1401,9 +1497,14 @@ fn gdn_scratch_bytes(plan: &CudaPlan, rows: u32) -> Option<Result<(u64, GdnWidth
 
 /// The shape of the one source bound to the embedded hidden: colour 0, the bucket's tokens.
 fn embedded_hidden(plan: &CudaPlan) -> Result<TensorShape, ArenaRefusal> {
+    embedded_hidden_source(plan).map(|(_, shape)| shape)
+}
+
+/// The index and shape of the one source bound to the embedded hidden.
+fn embedded_hidden_source(plan: &CudaPlan) -> Result<(usize, TensorShape), ArenaRefusal> {
     let mut hidden = (plan.lowered.bindings.iter().enumerate())
         .filter(|(_, b)| **b == SourceBinding::EmbeddedHidden)
-        .map(|(t, _)| plan.graph.tensors[t]);
+        .map(|(t, _)| (t, plan.graph.tensors[t]));
     match (hidden.next(), hidden.next()) {
         (Some(h), None) => Ok(h),
         (None, _) => Err(ArenaRefusal::NoEmbeddedHidden),
@@ -1418,7 +1519,8 @@ fn embedded_hidden(plan: &CudaPlan) -> Result<TensorShape, ArenaRefusal> {
 /// when it binds a `PrefixK`, the block table (`CUDA_MAX_BLOCKS_PER_SEQ` u32), the slot mapping
 /// (`bucket_m` u32) and the sequence (2 u32) follow, in that order, each aligned the same way;
 /// when a step is a `GatedDeltaNet`, the GDN sequence (4 u32) and the GDN scratch
-/// (`gdn_scratch(bucket_m, …)`) follow, aligned the same way.
+/// (`gdn_scratch(bucket_m, …)`) follow, aligned the same way; when the model has an embedding
+/// table, the token ids (`bucket_m` u32) come last, aligned the same way.
 fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
     let hidden = embedded_hidden(plan)?;
     // Every colour the tape's steps were given, by index: a slot's colour, and a two-output
@@ -1501,6 +1603,15 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
             })
         })
         .transpose()?;
+    let tokens = (plan.facts.embed)
+        .map(|_| {
+            let bytes = u64::from(hidden.rows) * TOKEN_ID_BYTES;
+            Ok(ArenaSpan {
+                offset: ArenaOffset(place(bytes)?),
+                bytes,
+            })
+        })
+        .transpose()?;
     Ok(Arena {
         bucket_m: hidden.rows,
         bytes,
@@ -1508,6 +1619,7 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
         rotary,
         kv,
         gdn,
+        tokens,
         total,
     })
 }

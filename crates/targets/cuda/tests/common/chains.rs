@@ -11,7 +11,7 @@ use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{SourceShape, SubOp};
 use scratchy_target_cuda::step::{CudaStep, GemmBf16};
 use scratchy_target_cuda::tape::{
-    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, WeightIx,
+    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, TapeInput, WeightIx,
 };
 use scratchy_target_cuda_compiler::canonical::{
     CanonicalAt, CanonicalGdn, CanonicalKv, CudaCanonical, CudaGdnFacts, CudaModelFacts,
@@ -19,13 +19,14 @@ use scratchy_target_cuda_compiler::canonical::{
 };
 
 /// qwen3.5's model facts: `head_dim` 256, a quarter of it rotated, `rope_theta` 1e7, no linear
-/// attention. Every fixture but the GDN layer lowers with them; one with no rope or gate reads
-/// none of them.
+/// attention, and no embedding table (the fixtures' input is the embedded hidden). Every fixture
+/// but the GDN layer lowers with them; one with no rope or gate reads none of them.
 pub const QWEN3_5_FACTS: CudaModelFacts = CudaModelFacts {
     head_dim: 256,
     rot_dim: 64,
     rope_theta: 1e7,
     gdn: None,
+    embed: None,
 };
 
 /// [`QWEN3_5_FACTS`] with qwen3.5-0.8b's linear attention: 16 key heads of 128, a 4-tap conv,
@@ -55,6 +56,17 @@ pub fn assert_tape_is_lowered_with(
     l: &LoweredDecode,
     facts: CudaModelFacts,
 ) {
+    let at = CanonicalAt {
+        stem: name,
+        m: u64::from(tape.bucket_m),
+    };
+    let lowered =
+        lower_canonical(l, facts, at).unwrap_or_else(|e| panic!("{name}: lower_canonical: {e}"));
+    assert_tape_is(name, tape, &lowered);
+}
+
+/// Panic unless `tape` is, field by field, `lowered`.
+pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
     let CudaTape {
         bucket_m,
         arena:
@@ -71,10 +83,6 @@ pub fn assert_tape_is_lowered_with(
         kv,
         gdn,
     } = *tape;
-    let at = CanonicalAt {
-        stem: name,
-        m: u64::from(bucket_m),
-    };
     let CudaCanonical {
         bucket_m: lowered_m,
         colour_bytes: lowered_bytes,
@@ -87,16 +95,16 @@ pub fn assert_tape_is_lowered_with(
         rotary: lowered_rotary,
         kv: lowered_kv,
         gdn: lowered_gdn,
-    } = lower_canonical(l, facts, at).unwrap_or_else(|e| panic!("{name}: lower_canonical: {e}"));
-    assert_eq!(bucket_m, lowered_m, "{name}: bucket_m");
+    } = lowered;
+    assert_eq!(bucket_m, *lowered_m, "{name}: bucket_m");
     assert_eq!(colour_bytes, lowered_bytes, "{name}: colour bytes");
     assert_eq!(colour_offsets, lowered_offsets, "{name}: offsets");
-    assert_eq!(total_bytes, lowered_total, "{name}: total");
-    assert_eq!(input, lowered_input, "{name}: input");
-    assert_eq!(result, lowered_result, "{name}: result");
+    assert_eq!(total_bytes, *lowered_total, "{name}: total");
+    assert_eq!(input, *lowered_input, "{name}: input");
+    assert_eq!(result, *lowered_result, "{name}: result");
     assert_eq!(weight_bytes, lowered_weights, "{name}: weight_bytes");
     assert_eq!(steps, lowered_steps, "{name}: steps");
-    assert_eq!(rotary, lowered_rotary, "{name}: rotary");
+    assert_eq!(rotary, *lowered_rotary, "{name}: rotary");
     let kv = kv.map(
         |KvTape {
              layers,
@@ -118,7 +126,7 @@ pub fn assert_tape_is_lowered_with(
             sequence,
         },
     );
-    assert_eq!(kv, lowered_kv, "{name}: kv");
+    assert_eq!(kv.as_ref(), lowered_kv.as_ref(), "{name}: kv");
     let gdn = gdn.map(
         |GdnTape {
              layers,
@@ -140,7 +148,7 @@ pub fn assert_tape_is_lowered_with(
             scratch,
         },
     );
-    assert_eq!(gdn, lowered_gdn, "{name}: gdn");
+    assert_eq!(gdn.as_ref(), lowered_gdn.as_ref(), "{name}: gdn");
 }
 
 /// The chains' activation width: `x` is `[M, HIDDEN]`.
@@ -219,7 +227,7 @@ pub static TWO_GEMM_M128: CudaTape = CudaTape {
         colour_offsets: &[0, 131072, 393216],
         total_bytes: 524288,
     },
-    input: span(0, 131072),
+    input: TapeInput::Hidden(span(0, 131072)),
     result: span(393216, 131072),
     weight_bytes: &[0, 1048576, 1048576],
     steps: &[
@@ -239,7 +247,7 @@ pub static TWO_GEMM_M256: CudaTape = CudaTape {
         colour_offsets: &[0, 262144, 786432],
         total_bytes: 1048576,
     },
-    input: span(0, 262144),
+    input: TapeInput::Hidden(span(0, 262144)),
     result: span(786432, 262144),
     weight_bytes: &[0, 1048576, 1048576],
     steps: &[
@@ -260,7 +268,7 @@ pub static THREE_GEMM_M256: CudaTape = CudaTape {
         colour_offsets: &[0, 262144, 786432],
         total_bytes: 1048576,
     },
-    input: span(0, 262144),
+    input: TapeInput::Hidden(span(0, 262144)),
     result: span(262144, 524288),
     weight_bytes: &[0, 1048576, 1048576, 1048576],
     steps: &[

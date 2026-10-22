@@ -15,7 +15,9 @@ use scratchy_subtile::handoff::LoweredDecode;
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SourceShape, SubOp};
 use scratchy_target_cuda::step::{AddBf16, CudaStep, GemmBf16, RmsNormBf16, SiluMulBf16};
-use scratchy_target_cuda::tape::{ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, WeightIx};
+use scratchy_target_cuda::tape::{
+    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, TapeInput, WeightIx,
+};
 
 use super::chains::with_hidden;
 
@@ -145,7 +147,7 @@ pub static MLP_M128: CudaTape = CudaTape {
         colour_offsets: &[0, 262144, 524288, 1441792, 2359296, 3276800, 4194304],
         total_bytes: 4456448,
     },
-    input: span(0, 262144),
+    input: TapeInput::Hidden(span(0, 262144)),
     result: span(4194304, 262144),
     weight_bytes: MLP_WEIGHT_BYTES,
     steps: &[
@@ -170,7 +172,7 @@ pub static MLP_M256: CudaTape = CudaTape {
         colour_offsets: &[0, 524288, 1048576, 2883584, 4718592, 6553600, 8388608],
         total_bytes: 8912896,
     },
-    input: span(0, 524288),
+    input: TapeInput::Hidden(span(0, 524288)),
     result: span(8388608, 524288),
     weight_bytes: MLP_WEIGHT_BYTES,
     steps: &[

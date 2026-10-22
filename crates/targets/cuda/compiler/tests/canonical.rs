@@ -9,7 +9,9 @@ use scratchy_subtile::fixtures::{
 };
 use std::num::NonZeroU32;
 
-use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
+use scratchy_subtile::handoff::{
+    LoweredDecode, SourceBinding, TargetBucket, TargetModelFacts, TargetModelInput, TargetPoint,
+};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::model_geometry::HeadDim;
 use scratchy_subtile::subtile_ir::{
@@ -19,16 +21,25 @@ use scratchy_subtile::subtile_tape::{ComputeInput, ComputeInputs, Instr};
 use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, colour_tape};
 use scratchy_subtile::tape_folding::FusedShape;
 use scratchy_target_cuda::op_abi::{CUDA_COLOUR_FACTS, CudaFusion, cuda_colour_rule};
-use scratchy_target_cuda::step::CudaStep;
+use scratchy_target_cuda::step::{CudaStep, EmbedBf16};
+use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, TapeInput, WeightIx};
+use scratchy_target_cuda::weights::CudaWeight;
 use scratchy_target_cuda_compiler::canonical::{
-    ArenaRefusal, CanonicalAt, CanonicalRefusal, CudaModelFacts, CudaPlan, GateShapeRule,
-    GemmShapeRule, OperandRefusal, RopeShapeRule, lower_canonical, lower_plan, plan_canonical,
+    ArenaRefusal, CanonicalAt, CanonicalRefusal, CudaEmbedFacts, CudaModelFacts, CudaPlan,
+    EmbedShapeRule, GateShapeRule, GemmShapeRule, OperandRefusal, RopeShapeRule, lower_canonical,
+    lower_plan, plan_canonical,
 };
+use scratchy_target_cuda_compiler::emit::{ModelRefusal, lower_model, static_tape};
 use scratchy_target_cuda_compiler::steps_from_tape::{StepCx, TapeStep, lower_fused, lower_step};
 
 const AT: CanonicalAt<'static> = CanonicalAt {
     stem: "fixture",
     m: 1,
+};
+
+const AT_128: CanonicalAt<'static> = CanonicalAt {
+    stem: "fixture",
+    m: 128,
 };
 
 /// qwen3.5's model facts: `head_dim` 256, a quarter of it rotated, `rope_theta` 1e7. A fixture
@@ -38,6 +49,7 @@ const FACTS: CudaModelFacts = CudaModelFacts {
     rot_dim: 64,
     rope_theta: 1e7,
     gdn: None,
+    embed: None,
 };
 
 fn fixtures() -> Vec<(&'static str, LoweringInput)> {
@@ -202,6 +214,7 @@ fn a_rope_on_the_hidden_with_the_global_table_lowers_to_one_rope() {
         rot_dim: 32,
         rope_theta: 1e4,
         gdn: None,
+        embed: None,
     };
     let c = lower_canonical(&l, facts, AT).expect("the rope lowers");
     let [CudaStep::Rope(rope)] = c.steps.as_slice() else {
@@ -827,6 +840,258 @@ fn a_colour_with_no_shape_is_refused() {
     assert!(e.to_string().contains("has no shape"), "{e}");
     assert!(
         matches!(e, CanonicalRefusal::Arena(ArenaRefusal::UnsizedColour(_))),
+        "{e}"
+    );
+}
+
+// THE HEAD AND THE WEIGHT TABLE: a model whose input is token ids, embedded from a table, with a
+// tied lm_head that reads the same table.
+
+/// `x [m, 512]` (the embedded hidden, source 0) → `RmsNorm(x, g)` (`g` source 1) → `lm_head`
+/// (`[512, 256]`, source 2): a tied head's shape, the table's `[256, 512]`.
+fn tied_head(m: u32) -> LoweredDecode {
+    let h = 512;
+    with_hidden(LoweringInput {
+        exported: None,
+        sources: vec![
+            SourceShape { rows: m, cols: h },
+            SourceShape { rows: 1, cols: h },
+            SourceShape { rows: h, cols: 256 },
+        ],
+        ops: vec![
+            OpDesc {
+                op: SubOp::RmsNorm {
+                    eps: 1e-6,
+                    gain: GainConvention::OnePlusScale,
+                },
+                m,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            },
+            OpDesc {
+                op: SubOp::MatmulTile {
+                    n: 256,
+                    weight: GemmWeight::Dense,
+                },
+                m,
+                inputs: vec![InputRef::Op(0), InputRef::Ext(2)],
+            },
+        ],
+        result: 1,
+    })
+}
+
+/// [`tied_head`] at `ms`, as the macro hands it over: the norm under `model.norm`, the lm_head
+/// under `head` (the embedding table's prefix when tied), a `vocab`-row table.
+fn tied_model(ms: &[u32], head: &str, vocab: u32) -> TargetModelInput {
+    TargetModelInput {
+        stem: "fixture".to_string(),
+        buckets: (ms.iter())
+            .map(|&m| TargetBucket {
+                point: TargetPoint { m, sk: 1 },
+                lowered: tied_head(m),
+            })
+            .collect(),
+        unlowered: Vec::new(),
+        facts: TargetModelFacts {
+            head_dim: 0,
+            rot_dim: 0,
+            rope_theta: None,
+            rms_norm_eps: 1e-6,
+            vocab_size: vocab,
+            gdn: None,
+        },
+        weight_prefixes: vec![
+            (1, None, "model.norm".to_string()),
+            (2, None, head.to_string()),
+        ],
+        embed_prefix: Some("model.embed_tokens".to_string()),
+    }
+}
+
+/// With a table, the tape's first step gathers the token ids into colour 0, the ids sit after
+/// every other region, and the embedded hidden's source declares the table's bytes.
+#[test]
+fn a_model_with_a_table_embeds_its_token_ids_first() {
+    let l = tied_head(128);
+    let hidden = lower_canonical(&l, FACTS, AT_128).expect("the hidden-input tape lowers");
+    let facts = CudaModelFacts {
+        embed: Some(CudaEmbedFacts { vocab: 256 }),
+        ..FACTS
+    };
+    let c = lower_canonical(&l, facts, AT_128).expect("the token-id tape lowers");
+    assert_eq!(c.steps.len(), hidden.steps.len() + 1, "one more step");
+    assert_eq!(
+        &c.steps[1..],
+        hidden.steps.as_slice(),
+        "then the same steps"
+    );
+    let tokens = ArenaSpan {
+        offset: ArenaOffset(hidden.total_bytes),
+        bytes: 128 * 4,
+    };
+    assert_eq!(
+        c.steps[0],
+        CudaStep::Embed(EmbedBf16 {
+            tokens: tokens.offset,
+            table: WeightIx(0),
+            out: ArenaOffset(0),
+            rows: 128,
+            hidden: 512,
+            vocab: 256,
+        })
+    );
+    assert_eq!(
+        c.input,
+        TapeInput::TokenIds {
+            span: tokens,
+            vocab: 256
+        }
+    );
+    let colour_0 = ArenaSpan {
+        offset: ArenaOffset(0),
+        bytes: 128 * 512 * 2,
+    };
+    assert_eq!(hidden.input, TapeInput::Hidden(colour_0));
+    assert_eq!(
+        c.total_bytes,
+        hidden.total_bytes + 512,
+        "the arena grows by 4·bucket_m"
+    );
+    assert_eq!(c.weight_bytes[0], 256 * 512 * 2, "the table's bytes");
+    assert_eq!(hidden.weight_bytes[0], 0, "no table without one");
+    assert_eq!(&c.weight_bytes[1..], &hidden.weight_bytes[1..]);
+}
+
+/// An embed of a vocabulary above `i32::MAX` rows.
+#[test]
+fn an_embed_above_int_max_rows_is_refused() {
+    let facts = CudaModelFacts {
+        embed: Some(CudaEmbedFacts { vocab: 1 << 31 }),
+        ..FACTS
+    };
+    let e = match lower_canonical(&tied_head(128), facts, AT_128) {
+        Err(e) => e,
+        Ok(c) => panic!("lowered an embed the kernel cannot run: {c:?}"),
+    };
+    assert!(e.to_string().contains("vocab = 2147483648"), "{e}");
+    assert!(matches!(
+        e,
+        CanonicalRefusal::EmbedShape {
+            rule: EmbedShapeRule::AboveIntMax { dim: "vocab", .. },
+            ..
+        }
+    ));
+}
+
+/// The tied lm_head names the table's tensor: it reads the table's buffer, and its own index is
+/// emptied. Both buckets are rewritten, and each tape still validates.
+#[test]
+fn a_tied_head_reads_the_tables_buffer() {
+    let model = lower_model(&tied_model(&[128, 256], "model.embed_tokens", 256)).expect("lowers");
+    let table = |tensor, shape| Some(CudaWeight::Bf16 { tensor, shape });
+    assert_eq!(
+        model.weights,
+        [
+            table("model.embed_tokens.weight", &[256, 512][..]),
+            table("model.norm.weight", &[512][..]),
+            None,
+        ]
+    );
+    for c in &model.tapes {
+        let m = c.bucket_m;
+        assert_eq!(c.weight_bytes, [256 * 512 * 2, 1024, 0], "m={m}");
+        let Some(CudaStep::Gemm(head)) = c.steps.last() else {
+            panic!("m={m}: the tape ends with the lm_head");
+        };
+        assert_eq!(head.b, WeightIx(0), "m={m}: the lm_head reads the table");
+        static_tape(c)
+            .validate()
+            .unwrap_or_else(|e| panic!("m={m}: {e}"));
+    }
+}
+
+/// An untied head is its own tensor and keeps its index.
+#[test]
+fn an_untied_head_keeps_its_own_buffer() {
+    let model = lower_model(&tied_model(&[128], "lm_head", 256)).expect("lowers");
+    assert_eq!(
+        model.weights[2],
+        Some(CudaWeight::Bf16 {
+            tensor: "lm_head.weight",
+            shape: &[256, 512],
+        })
+    );
+    assert_eq!(
+        model.tapes[0].weight_bytes,
+        [256 * 512 * 2, 1024, 256 * 512 * 2]
+    );
+}
+
+/// The head names the table's tensor at another shape (a 512-row table, a 256-column head).
+#[test]
+fn one_tensor_at_two_shapes_is_refused() {
+    let e = lower_model(&tied_model(&[128], "model.embed_tokens", 512)).expect_err("refused");
+    assert!(e.to_string().contains("model.embed_tokens.weight"), "{e}");
+    assert!(matches!(
+        e,
+        ModelRefusal::SharedTensor {
+            ix: 2,
+            first: 0,
+            ..
+        }
+    ));
+}
+
+/// A config with no vocabulary has no table to embed its token ids from.
+#[test]
+fn a_model_with_no_vocab_is_refused() {
+    let e = lower_model(&tied_model(&[128], "lm_head", 0)).expect_err("refused");
+    assert!(e.to_string().contains("vocab_size"), "{e}");
+    assert!(matches!(e, ModelRefusal::NoVocab));
+}
+
+/// A weight the handoff names no checkpoint prefix for, and a table with no prefix.
+#[test]
+fn a_weight_with_no_prefix_is_refused() {
+    let mut input = tied_model(&[128], "lm_head", 256);
+    input.weight_prefixes.remove(0);
+    let e = lower_model(&input).expect_err("refused");
+    assert!(matches!(e, ModelRefusal::NoPrefix { ix: 1, .. }), "{e}");
+    let mut input = tied_model(&[128], "lm_head", 256);
+    input.embed_prefix = None;
+    let e = lower_model(&input).expect_err("refused");
+    assert!(
+        matches!(
+            e,
+            ModelRefusal::NoPrefix {
+                ix: 0,
+                binding: SourceBinding::EmbeddedHidden
+            }
+        ),
+        "{e}"
+    );
+}
+
+/// Two buckets binding another source at one index cannot share a weight table.
+#[test]
+fn buckets_binding_other_sources_are_refused() {
+    let mut input = tied_model(&[128, 256], "lm_head", 256);
+    input.buckets[1].lowered.bindings[1] = SourceBinding::Weight { id: 7, index: None };
+    let e = lower_model(&input).expect_err("refused");
+    assert!(matches!(e, ModelRefusal::Bindings { m: 256, ix: 1 }), "{e}");
+}
+
+/// A weight source that declares bytes and that no step reads.
+#[test]
+fn a_weight_no_step_reads_is_refused() {
+    let mut input = tied_model(&[128], "lm_head", 256);
+    let l = &mut input.buckets[0].lowered;
+    l.input.sources.push(SourceShape { rows: 1, cols: 512 });
+    l.bindings
+        .push(SourceBinding::Weight { id: 3, index: None });
+    let e = lower_model(&input).expect_err("refused");
+    assert!(
+        matches!(e, ModelRefusal::UnreadWeight { ix: 3, bytes: 1024 }),
         "{e}"
     );
 }

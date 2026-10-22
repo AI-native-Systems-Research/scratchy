@@ -38,7 +38,7 @@ use scratchy_target_cuda::step::{
     AddBf16, CudaStep, GatedDeltaNetBf16, GemmBf16, RmsNormBf16, gdn_bundle,
 };
 use scratchy_target_cuda::tape::{
-    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, WeightIx,
+    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, TapeInput, WeightIx,
 };
 
 use super::chains::with_hidden;
@@ -246,7 +246,7 @@ pub static GDN_LAYER_M128: CudaTape = CudaTape {
         ],
         total_bytes: 7627008,
     },
-    input: span(0, 262144),
+    input: TapeInput::Hidden(span(0, 262144)),
     result: span(3153920, 262144),
     weight_bytes: GDN_LAYER_WEIGHT_BYTES,
     steps: &[
@@ -284,7 +284,7 @@ pub static GDN_LAYER_M256: CudaTape = CudaTape {
         ],
         total_bytes: 15253760,
     },
-    input: span(0, 524288),
+    input: TapeInput::Hidden(span(0, 524288)),
     result: span(6307840, 524288),
     weight_bytes: GDN_LAYER_WEIGHT_BYTES,
     steps: &[

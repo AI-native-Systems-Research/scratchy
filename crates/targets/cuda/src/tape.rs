@@ -11,7 +11,7 @@
 use serde::Serialize;
 
 use crate::step::{
-    AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
+    AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, EmbedBf16, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
     GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, RopeAppendBf16,
     RopeBf16, gdn_conv_dim, gdn_scratch,
 };
@@ -137,18 +137,44 @@ impl GdnTape {
     }
 }
 
+/// What a forward uploads as its input, and where it lands in the arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum TapeInput {
+    /// Colour 0, the embedded hidden, `[bucket_m, hidden]` bf16: a tape whose canonical has no
+    /// embedding table to gather from (the layer-level fixtures).
+    Hidden(ArenaSpan),
+    /// `bucket_m` u32 token ids, one per row, at an aligned region after every other: the tape's
+    /// first step is the one [`CudaStep::Embed`], which gathers them from the `vocab`-row table
+    /// into colour 0. Every id is below `vocab`; the worker checks that before any copy.
+    TokenIds { span: ArenaSpan, vocab: u32 },
+}
+
+impl TapeInput {
+    /// The input's span in the arena.
+    pub const fn span(&self) -> ArenaSpan {
+        match *self {
+            Self::Hidden(span) | Self::TokenIds { span, .. } => span,
+        }
+    }
+}
+
+/// Bytes of one token id.
+const TOKEN_ID_BYTES: u64 = 4;
+
 /// One bucket's forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct CudaTape {
     /// The token count `M` the tape is compiled for.
     pub bucket_m: u32,
     pub arena: ArenaLayout,
-    /// Colour 0: the embedded hidden, `[bucket_m, hidden]` bf16, which the forward uploads.
-    pub input: ArenaSpan,
+    /// What the forward uploads: the embedded hidden (colour 0), or the token ids its first step
+    /// embeds into colour 0.
+    pub input: TapeInput,
     /// The colourer's result colour, which the forward downloads.
     pub result: ArenaSpan,
-    /// Per source index: the bytes its weight buffer must hold; 0 for a source that is not a
-    /// dense weight.
+    /// Per source index: the bytes its weight buffer must hold (a dense weight's bf16 bytes, a
+    /// GDN layer's packed f32 bundle, the embedding table at the embedded hidden's index); 0 for a
+    /// source no step reads as a weight.
     pub weight_bytes: &'static [u64],
     /// One step per launch, in launch order.
     pub steps: &'static [CudaStep],
@@ -166,6 +192,7 @@ pub struct CudaTape {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Region {
     Rotary,
+    TokenIds,
     BlockTable,
     SlotMapping,
     Sequence,
@@ -177,6 +204,7 @@ impl std::fmt::Display for Region {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Rotary => "the rotary table",
+            Self::TokenIds => "the token ids",
             Self::BlockTable => "the block table",
             Self::SlotMapping => "the slot mapping",
             Self::Sequence => "the sequence region",
@@ -203,6 +231,21 @@ pub enum TapeError {
     },
     /// The input span reaches past the arena.
     InputOutside { span: ArenaSpan, total: u64 },
+    /// The token-id input is not `bucket_m` u32 at a multiple of [`CUDA_ARENA_ALIGN`], or names a
+    /// vocabulary of no rows.
+    TokenIdsShape {
+        span: ArenaSpan,
+        bucket_m: u32,
+        vocab: u32,
+    },
+    /// The tape's input is token ids and its first step is not an embed (`None`: it has no step).
+    EmbedMissing { first: Option<usize> },
+    /// The `step`-th step is an embed, and it is not the first step of a token-id tape: an embed
+    /// after the first step, or in a tape whose input is the embedded hidden.
+    EmbedMisplaced { step: usize },
+    /// The `step`-th step, the embed, reads other token ids, rows or vocabulary than the tape's
+    /// input: its `tokens` offset, `rows` or `vocab` disagree with the tape's.
+    EmbedInput { step: usize },
     /// The result span reaches past the arena.
     ResultOutside { span: ArenaSpan, total: u64 },
     /// A byte count of the `step`-th step overflows `u64`.
@@ -371,6 +414,35 @@ impl std::fmt::Display for TapeError {
                     "the input ({bytes} bytes at {offset}) reaches past the {total}-byte arena"
                 )
             }
+            Self::TokenIdsShape {
+                span,
+                bucket_m,
+                vocab,
+            } => {
+                let (bytes, offset) = at(span);
+                write!(
+                    f,
+                    "the token ids are {bytes} bytes at {offset}, over a vocabulary of {vocab};                      the forward fills {bucket_m} u32 at a multiple of {CUDA_ARENA_ALIGN}, from                      a vocabulary of at least one row"
+                )
+            }
+            Self::EmbedMissing { first: Some(step) } => write!(
+                f,
+                "the tape's input is token ids and its first step, step {step}, is not the embed"
+            ),
+            Self::EmbedMissing { first: None } => {
+                write!(
+                    f,
+                    "the tape's input is token ids and it has no step to embed them"
+                )
+            }
+            Self::EmbedMisplaced { step } => write!(
+                f,
+                "step {step} is an embed; a tape embeds only as its first step, and only when its                  input is token ids"
+            ),
+            Self::EmbedInput { step } => write!(
+                f,
+                "step {step}, the embed, reads other token ids, rows or vocabulary than the                  tape's input"
+            ),
             Self::ResultOutside { span, total } => {
                 let (bytes, offset) = at(span);
                 write!(
@@ -586,16 +658,17 @@ impl CudaTape {
     /// Check that playing this tape stays inside its arena, its declared weights and its KV pool.
     ///
     /// Every colour is aligned and inside `total_bytes`, and so are the input and result spans,
-    /// the rotary table and the KV regions, each region the size the forward fills. Every step's
-    /// spans ([`CudaStep::extents`]) are aligned and inside `total_bytes`, each span it writes
-    /// overlaps none of its reads, nor its other write, nor a region the forward fills, and each
-    /// weight it reads is one the tape declares, declared at least as large as the step reads. A
-    /// rope reads the tape's rotary table, a KV step the tape's regions, at a KV layer the tape
-    /// has, with the tape's KV geometry; a GDN step the tape's GDN regions, at a GDN layer the
-    /// tape has, with its GDN geometry, and no other step touches the GDN scratch. All arithmetic
-    /// is checked. The worker runs this on every
-    /// tape before it allocates anything; its own weight and pool checks then close the chain
-    /// from each step to the buffer it reads.
+    /// the rotary table, the KV regions and the GDN regions, each region the size its users take.
+    /// A token-id input is `bucket_m` u32 and its first step the one embed reading it; a hidden
+    /// input has no embed. Every step's spans ([`CudaStep::extents`]) are aligned and inside
+    /// `total_bytes`, each span it writes overlaps none of its reads, nor its other write, nor a
+    /// region the forward fills (the token ids, the rotary table, the KV regions, the GDN
+    /// sequence), and each weight it reads is one the tape declares, declared at least as large as
+    /// the step reads. A rope reads the tape's rotary table, a KV step the tape's regions, at a KV
+    /// layer the tape has, with the tape's KV geometry; a GDN step the tape's GDN regions, at a GDN
+    /// layer the tape has, with its GDN geometry, and no other step touches the GDN scratch. All
+    /// arithmetic is checked. The worker runs this on every tape before it allocates anything; its
+    /// own weight and pool checks then close the chain from each step to the buffer it reads.
     pub fn validate(&self) -> Result<(), TapeError> {
         let total = self.arena.total_bytes;
         let (bytes, offsets) = (self.arena.colour_bytes, self.arena.colour_offsets);
@@ -621,12 +694,11 @@ impl CudaTape {
                 });
             }
         }
-        if !inside(self.input, total) {
-            return Err(TapeError::InputOutside {
-                span: self.input,
-                total,
-            });
+        let input = self.input.span();
+        if !inside(input, total) {
+            return Err(TapeError::InputOutside { span: input, total });
         }
+        self.check_embed()?;
         if !inside(self.result, total) {
             return Err(TapeError::ResultOutside {
                 span: self.result,
@@ -653,6 +725,9 @@ impl CudaTape {
             }
         }
         let mut regions = self.kv_regions(total)?;
+        if let TapeInput::TokenIds { span, .. } = self.input {
+            regions.push((Region::TokenIds, span));
+        }
         let scratch = self.gdn_regions(total, &mut regions)?;
         for (step, s) in self.steps.iter().enumerate() {
             let e = s.extents().ok_or(TapeError::StepOverflow { step })?;
@@ -748,6 +823,50 @@ impl CudaTape {
             }
         }
         Ok(())
+    }
+
+    /// A token-id input is `bucket_m` u32 at an aligned offset, and the tape's first step is the
+    /// embed reading it, with its rows and vocabulary; no other step embeds, and a tape whose
+    /// input is the embedded hidden has no embed.
+    fn check_embed(&self) -> Result<(), TapeError> {
+        let embeds =
+            (self.steps.iter().enumerate()).filter(|(_, s)| matches!(s, CudaStep::Embed(_)));
+        match self.input {
+            TapeInput::Hidden(_) => match embeds.map(|(step, _)| step).next() {
+                Some(step) => Err(TapeError::EmbedMisplaced { step }),
+                None => Ok(()),
+            },
+            TapeInput::TokenIds { span, vocab } => {
+                let want = u64::from(self.bucket_m) * TOKEN_ID_BYTES;
+                if !span.offset.0.is_multiple_of(CUDA_ARENA_ALIGN)
+                    || span.bytes != want
+                    || vocab == 0
+                {
+                    return Err(TapeError::TokenIdsShape {
+                        span,
+                        bucket_m: self.bucket_m,
+                        vocab,
+                    });
+                }
+                if let Some((step, _)) = embeds.clone().find(|&(step, _)| step > 0) {
+                    return Err(TapeError::EmbedMisplaced { step });
+                }
+                let Some(&CudaStep::Embed(EmbedBf16 {
+                    tokens,
+                    rows,
+                    vocab: embed_vocab,
+                    ..
+                })) = self.steps.first()
+                else {
+                    let first = (!self.steps.is_empty()).then_some(0);
+                    return Err(TapeError::EmbedMissing { first });
+                };
+                if (tokens, rows, embed_vocab) != (span.offset, self.bucket_m, vocab) {
+                    return Err(TapeError::EmbedInput { step: 0 });
+                }
+                Ok(())
+            }
+        }
     }
 
     /// The regions the forward fills before the steps run: the rotary table and the KV regions,
@@ -976,7 +1095,8 @@ impl CudaTape {
                 }
                 Ok(())
             }
-            CudaStep::Gemm(_)
+            CudaStep::Embed(_)
+            | CudaStep::Gemm(_)
             | CudaStep::GemmNarrow(_)
             | CudaStep::RmsNorm(_)
             | CudaStep::Add(_)
@@ -1046,7 +1166,7 @@ mod tests {
             colour_offsets: &[0, 262144, 786432],
             total_bytes: 1310720,
         },
-        input: span(0, 262144),
+        input: TapeInput::Hidden(span(0, 262144)),
         result: span(786432, 524288),
         weight_bytes: &[0, 1048576, 2048],
         steps: GOOD_STEPS,
@@ -1077,6 +1197,174 @@ mod tests {
     #[test]
     fn a_well_formed_tape_validates() {
         assert_eq!(GOOD.validate(), Ok(()));
+    }
+
+    /// [`GOOD`]'s token-id form: `x` gathered from a `[100, 512]` table (weight 0) by 256 ids at
+    /// the region after the colours, then [`GOOD_STEPS`].
+    const TOKENS: u64 = 1310720;
+    const VOCAB: u32 = 100;
+
+    fn embed_step(tokens: u64, rows: u32, vocab: u32) -> CudaStep {
+        CudaStep::Embed(EmbedBf16 {
+            tokens: ArenaOffset(tokens),
+            table: WeightIx(0),
+            out: ArenaOffset(0),
+            rows,
+            hidden: 512,
+            vocab,
+        })
+    }
+
+    fn token_tape(steps: &[CudaStep]) -> CudaTape {
+        CudaTape {
+            arena: ArenaLayout {
+                total_bytes: TOKENS + 1024,
+                ..GOOD.arena
+            },
+            input: TapeInput::TokenIds {
+                span: span(TOKENS, 1024),
+                vocab: VOCAB,
+            },
+            weight_bytes: &[102400, 1048576, 2048],
+            steps: Box::leak(steps.to_vec().into_boxed_slice()),
+            ..GOOD
+        }
+    }
+
+    fn embedded(rest: &[CudaStep]) -> CudaTape {
+        let mut steps = vec![embed_step(TOKENS, 256, VOCAB)];
+        steps.extend_from_slice(rest);
+        token_tape(&steps)
+    }
+
+    #[test]
+    fn a_token_id_tape_validates() {
+        assert_eq!(embedded(GOOD_STEPS).validate(), Ok(()));
+        let e = embed_step(TOKENS, 256, VOCAB)
+            .extents()
+            .expect("the embed's extents");
+        assert_eq!(
+            e.reads[0],
+            Some(span(TOKENS, 1024)),
+            "the embed reads the token ids"
+        );
+        assert_eq!(e.writes, span(0, 262144), "the embed writes colour 0");
+        assert_eq!(
+            e.weight,
+            Some(WeightRead {
+                ix: WeightIx(0),
+                bytes: 102400
+            }),
+            "the embed reads the whole table"
+        );
+    }
+
+    /// A token-id tape whose first step is not the embed, or that has no step.
+    #[test]
+    fn a_token_id_tape_starts_with_its_embed() {
+        assert_eq!(
+            token_tape(GOOD_STEPS).validate(),
+            Err(TapeError::EmbedMissing { first: Some(0) })
+        );
+        assert_eq!(
+            token_tape(&[]).validate(),
+            Err(TapeError::EmbedMissing { first: None })
+        );
+    }
+
+    /// An embed in a hidden-input tape, or after the first step of a token-id tape.
+    #[test]
+    fn an_embed_is_only_a_token_id_tapes_first_step() {
+        assert_eq!(
+            with_step(embed_step(TOKENS, 256, VOCAB)).validate(),
+            Err(TapeError::EmbedMisplaced { step: 0 })
+        );
+        let mut steps = vec![embed_step(TOKENS, 256, VOCAB)];
+        steps.extend_from_slice(GOOD_STEPS);
+        steps.push(embed_step(TOKENS, 256, VOCAB));
+        assert_eq!(
+            token_tape(&steps).validate(),
+            Err(TapeError::EmbedMisplaced { step: 3 })
+        );
+    }
+
+    /// An embed reading other token ids, rows or vocabulary than the tape's input.
+    #[test]
+    fn the_embed_reads_the_tapes_input() {
+        for embed in [
+            embed_step(0, 256, VOCAB),
+            embed_step(TOKENS, 128, VOCAB),
+            embed_step(TOKENS, 256, VOCAB + 1),
+        ] {
+            assert_eq!(
+                token_tape(&[embed]).validate(),
+                Err(TapeError::EmbedInput { step: 0 }),
+                "{embed:?}"
+            );
+        }
+    }
+
+    /// Token ids that are not `bucket_m` u32 at an aligned offset, or a vocabulary of no rows.
+    #[test]
+    fn token_ids_shape() {
+        for (input_span, vocab) in [
+            (span(TOKENS, 512), VOCAB),
+            (span(TOKENS + 4, 1024), VOCAB),
+            (span(TOKENS, 1024), 0),
+        ] {
+            let t = CudaTape {
+                arena: ArenaLayout {
+                    total_bytes: TOKENS + 2048,
+                    ..GOOD.arena
+                },
+                input: TapeInput::TokenIds {
+                    span: input_span,
+                    vocab,
+                },
+                ..embedded(GOOD_STEPS)
+            };
+            assert_eq!(
+                t.validate(),
+                Err(TapeError::TokenIdsShape {
+                    span: input_span,
+                    bucket_m: 256,
+                    vocab
+                }),
+                "{input_span:?} vocab {vocab}"
+            );
+        }
+    }
+
+    /// A step writing over the token ids, which the forward fills before the steps run.
+    #[test]
+    fn nothing_writes_the_token_ids() {
+        let t = embedded(&[gemm(0, 1, TOKENS, (1, 256, 512))]);
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::WriteOverRegion {
+                step: 1,
+                write: span(TOKENS, 512),
+                region: Region::TokenIds,
+            })
+        );
+    }
+
+    /// An embedding table declared shorter than `vocab · hidden` bf16.
+    #[test]
+    fn an_embed_table_declared_short_is_refused() {
+        let t = CudaTape {
+            weight_bytes: &[102400 - 2, 1048576, 2048],
+            ..embedded(GOOD_STEPS)
+        };
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::WeightShort {
+                step: 0,
+                ix: 0,
+                need: 102400,
+                declared: 102398
+            })
+        );
     }
 
     #[test]
@@ -1152,7 +1440,7 @@ mod tests {
     #[test]
     fn input_outside() {
         let t = CudaTape {
-            input: span(1310720, 256),
+            input: TapeInput::Hidden(span(1310720, 256)),
             ..GOOD
         };
         assert_eq!(
@@ -1762,7 +2050,7 @@ mod tests {
                 colour_offsets: &[0, 36864, 40960, 41216, 41472],
                 total_bytes: GDN_TOTAL,
             },
-            input: span(0, 36864),
+            input: TapeInput::Hidden(span(0, 36864)),
             result: span(41472, 4096),
             weight_bytes: &[0, GDN_BUNDLE_BYTES],
             steps: Box::leak(steps.to_vec().into_boxed_slice()),
