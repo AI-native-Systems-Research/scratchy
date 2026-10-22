@@ -863,7 +863,8 @@ pub fn w4a8_quant_static_name(rows: W4a8Rows, dtype: DequantDtype) -> &'static s
 pub enum W4a8Act {
     Silu,
     Gelu,
-    SwigluOai,
+    /// Its clamp is compiled in (`W4A8_SWIGLU_LIMIT`, slot 8).
+    SwigluOai(scratchy_subtile::subtile_ir::SwigluLimit),
     /// `relu(x)²` — the ungated expert's one in-projection.
     Relu2,
 }
@@ -877,8 +878,8 @@ pub fn w4a8_act_quant_static_name(act: W4a8Act, dtype: DequantDtype) -> &'static
         (W4a8Act::Silu, DequantDtype::Bf16) => "affine_gather_w4a8_quant_silu_bf16",
         (W4a8Act::Gelu, DequantDtype::F16) => "affine_gather_w4a8_quant_gelu_f16",
         (W4a8Act::Gelu, DequantDtype::Bf16) => "affine_gather_w4a8_quant_gelu_bf16",
-        (W4a8Act::SwigluOai, DequantDtype::F16) => "affine_gather_w4a8_quant_swiglu_oai_f16",
-        (W4a8Act::SwigluOai, DequantDtype::Bf16) => "affine_gather_w4a8_quant_swiglu_oai_bf16",
+        (W4a8Act::SwigluOai(_), DequantDtype::F16) => "affine_gather_w4a8_quant_swiglu_oai_f16",
+        (W4a8Act::SwigluOai(_), DequantDtype::Bf16) => "affine_gather_w4a8_quant_swiglu_oai_bf16",
         (W4a8Act::Relu2, DequantDtype::F16) => "affine_gather_w4a8_quant_relu2_f16",
         (W4a8Act::Relu2, DequantDtype::Bf16) => "affine_gather_w4a8_quant_relu2_bf16",
     }

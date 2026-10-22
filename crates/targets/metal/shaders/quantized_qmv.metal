@@ -1986,6 +1986,9 @@ INST_NVFP4_QMV(bf16, bfloat, f16, half, 16)
 // `fc1`), bound as the gate — no up projection is bound or run.
 SCRATCHY_CONSTANT(int, GATED_ACT, 3);
 constant constexpr bool UNGATED = GATED_ACT == 3;
+// 22: SwiGLU-OAI's clamp, the model's `swiglu_limit` — set exactly when the act is SwiGLU-OAI.
+SCRATCHY_CONSTANT_OPTIONAL(float, GATED_SWIGLU_LIMIT, 22);
+static_assert((GATED_ACT == 2) == GATED_SWIGLU_LIMIT_SET, "SwiGLU-OAI takes its limit compiled in");
 
 // A dense gated MLP's gate and up projections and its activation, one row:
 // `y = act(gate · x) * (up · x)`, as the two matvecs and `silu_mul` / `gelu_mul` compute it.
@@ -2039,7 +2042,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     float u = float(rows[1][simd_lid]);
     y[row0 + simd_lid] =
         static_cast<T_act>(GATED_ACT == 1 ? gelu_mul_f(g, u)
-                             : GATED_ACT == 2 ? swiglu_oai_mul_f(g, u)
+                             : GATED_ACT == 2 ? swiglu_oai_mul_f(g, u, GATED_SWIGLU_LIMIT)
                              : silu_mul_f(g, u));
   }
 }
@@ -2256,7 +2259,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
         u += float(b[OUT_VEC_SIZE + row]);
       }
       gate_y[at] = static_cast<T_act>(GATED_ACT == 1 ? gelu_mul_f(g, u)
-                                : GATED_ACT == 2 ? swiglu_oai_mul_f(g, u)
+                                : GATED_ACT == 2 ? swiglu_oai_mul_f(g, u, GATED_SWIGLU_LIMIT)
                                 : silu_mul_f(g, u));
     }
   }

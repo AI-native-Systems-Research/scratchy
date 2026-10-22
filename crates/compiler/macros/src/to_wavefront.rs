@@ -42,7 +42,7 @@ use scratchy_subtile::lower::{
 use scratchy_subtile::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 use scratchy_subtile::subtile_ir::{
     AttnMask, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention, GatedAct, NumExperts,
-    RopeFormTag, RouterBundle, RowScale, SharedExpertBound, SourceShape, SubOp, TopK,
+    RopeFormTag, RouterBundle, RowScale, SharedExpertBound, SourceShape, SubOp, SwigluLimit, TopK,
 };
 
 use crate::assignment::Assignment;
@@ -1775,12 +1775,8 @@ pub fn lower_decode_to_wavefront(
                         });
                     }
                 };
-                // The SwiGLU-OAI limit is BAKED as 7.0 into the kernels
-                // (`swiglu_oai_mul_f`, the GATED_ACT==2 epilogue); gpt-oss is
-                // the only consumer, so a config carrying any other limit is
-                // refused here at build time rather than silently computed
-                // with the wrong clamp. The upgrade path if a second consumer
-                // appears is a `CanonicalParams` scalar.
+                // The SwiGLU-OAI clamp: the config's `swiglu_limit`, which
+                // its kernels take compiled in.
                 let limit = bx.model.scalars.get("swiglu_limit").copied().ok_or(
                     BridgeError::MalformedOp {
                         tile,
@@ -1788,14 +1784,11 @@ pub fn lower_decode_to_wavefront(
                         detail: "gptoss_moe requires a `swiglu_limit` config scalar",
                     },
                 )?;
-                if limit != 7.0 {
-                    return Err(BridgeError::MalformedOp {
-                        tile,
-                        op: OpKind::GptOssMoe,
-                        detail: "gptoss_moe kernels bake swiglu_limit = 7.0; this config \
-                                 carries another value",
-                    });
-                }
+                let limit = SwigluLimit::new(limit as f32).ok_or(BridgeError::MalformedOp {
+                    tile,
+                    op: OpKind::GptOssMoe,
+                    detail: "gptoss_moe's `swiglu_limit` is not a finite positive clamp",
+                })?;
                 let (experts, k) = moe_counts(tile, num_experts, top_k)?;
                 let router = RouterBundle::GptOss;
                 bx.expand();
@@ -1816,7 +1809,7 @@ pub fn lower_decode_to_wavefront(
                     hidden,
                     quant: ExpertQuant::declared(group_size, bits),
                     bundle: ExpertBundle::GptOss,
-                    body: ExpertBody::Gated(GatedAct::SwigluOai),
+                    body: ExpertBody::Gated(GatedAct::SwigluOai(limit)),
                     shared: SharedExpertBound(None),
                 };
                 // The fused MoE bundle is ONE source (its affine scales resolve by tensor

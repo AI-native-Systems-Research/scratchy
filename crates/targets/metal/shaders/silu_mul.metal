@@ -41,6 +41,12 @@ SCRATCHY_CONSTANT_OPTIONAL(uint, SILU_MUL_EXPERTS, 2);
 SCRATCHY_CONSTANT_OPTIONAL(bool, SILU_MUL_LINEAR_BIAS_FC, 3);
 constant constexpr bool SILU_MUL_LINEAR_BIAS =
     SILU_MUL_LINEAR_BIAS_FC_SET && SILU_MUL_LINEAR_BIAS_FC;
+// 4 (`SILU_MUL_SWIGLU_LIMIT`): SwiGLU-OAI's clamp, the model's `swiglu_limit` — set exactly on
+// the `swiglu_oai_mul_*` kernels.
+SCRATCHY_CONSTANT_OPTIONAL(float, SILU_MUL_SWIGLU_LIMIT, 4);
+static_assert((SCRATCHY_COMPILES(swiglu_oai_mul_f16) || SCRATCHY_COMPILES(swiglu_oai_mul_bf16)) ==
+                  SILU_MUL_SWIGLU_LIMIT_SET,
+              "SwiGLU-OAI takes its limit compiled in");
 
 inline bool silu_mul_skips(const device uint* row_expert, uint gid) {
   return gid >= SILU_MUL_N ||
@@ -118,7 +124,7 @@ template <typename T>
     g += float(b[col]);
     u += float(b[row + col]);
   }
-  out[gid] = static_cast<T>(swiglu_oai_mul_f(g, u));
+  out[gid] = static_cast<T>(swiglu_oai_mul_f(g, u, SILU_MUL_SWIGLU_LIMIT));
 }
 
 #define INST_SWIGLU_OAI_MUL(dtype_tag, mtl_type) \

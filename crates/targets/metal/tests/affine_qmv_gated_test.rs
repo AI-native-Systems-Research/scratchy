@@ -171,14 +171,14 @@ fn run(c: Case) -> Option<(Vec<u16>, Vec<u16>)> {
     let act_name = match c.gated {
         GatedAct::Silu => "silu_mul",
         GatedAct::Gelu => "gelu_mul",
-        GatedAct::SwigluOai => "swiglu_oai_mul",
+        GatedAct::SwigluOai(_) => "swiglu_oai_mul",
     };
     let n = HiddenSize(c.n as u32);
-    let act = pso(
-        "silu_mul",
-        format!("{act_name}_{a}"),
-        SiluMulConstants { n }.into(),
-    );
+    let mut act_constants: Vec<ConstantValue> = SiluMulConstants { n }.into();
+    if let GatedAct::SwigluOai(limit) = c.gated {
+        act_constants.push(ConstantValue::float(4, limit.get()));
+    }
+    let act = pso("silu_mul", format!("{act_name}_{a}"), act_constants);
 
     let mut rng = Lcg(c.k as u64 * 31 + c.n as u64);
     let (gate, up) = (
@@ -337,6 +337,8 @@ fn gpt_oss_2bit_swiglu_oai() {
         bits: 2,
         k: 2880,
         n: 2880,
-        gated: GatedAct::SwigluOai,
+        gated: GatedAct::SwigluOai(
+            scratchy_subtile::subtile_ir::SwigluLimit::new(7.0).expect("a clamp"),
+        ),
     });
 }

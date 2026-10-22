@@ -88,6 +88,13 @@ SCRATCHY_CONSTANT_OPTIONAL(int, NAX_PV_W_LD, 6);
 // ([E, 2·K], buffer(4)), the same switch `silu_mul.metal`'s `SILU_MUL_LINEAR_BIAS`
 // makes. Unset: no buffer(4), and the adds const-fold away.
 SCRATCHY_CONSTANT_OPTIONAL(bool, W4A8GQ_LINEAR_BIAS, 7);
+// 8: SwiGLU-OAI's clamp, the model's `swiglu_limit` — set exactly on the
+// `affine_gather_w4a8_quant_swiglu_oai_*` kernels.
+SCRATCHY_CONSTANT_OPTIONAL(float, W4A8_SWIGLU_LIMIT, 8);
+static_assert((SCRATCHY_COMPILES(affine_gather_w4a8_quant_swiglu_oai_f16) ||
+               SCRATCHY_COMPILES(affine_gather_w4a8_quant_swiglu_oai_bf16)) ==
+                  W4A8_SWIGLU_LIMIT_SET,
+              "SwiGLU-OAI takes its limit compiled in");
 
 // ─────────────────────────────────────────────────────────────────
 // NVFP4 E2M1 decode (sign-magnitude 4-bit). Same byte layout as affine
@@ -1244,7 +1251,7 @@ template <int ACT>
 METAL_FUNC float w4a8_act_mul(float g, float u) {
     if (ACT == 0) return silu_mul_f(g, u);
     if (ACT == 1) return gelu_mul_f(g, u);
-    if (ACT == 2) return swiglu_oai_mul_f(g, u);
+    if (ACT == 2) return swiglu_oai_mul_f(g, u, W4A8_SWIGLU_LIMIT);
     const float r = metal::max(g, 0.0f);
     return r * r;
 }

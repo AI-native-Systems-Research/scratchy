@@ -899,15 +899,16 @@ impl<Q: Into<Vec<ConstantValue>>> From<AffineGatedQmvConstants<Q>> for Vec<Const
         let act = match c.act {
             ExpertBody::Gated(GatedAct::Silu) => 0,
             ExpertBody::Gated(GatedAct::Gelu) => 1,
-            // gpt-oss SwiGLU-OAI: `y = (clamp(u, ±7)+1) · min(g,7) ·
-            // sigmoid(1.702·g)` — the ±7 limits are baked into the kernel's
-            // `swiglu_oai_mul_f`, asserted equal to the config's
-            // `swiglu_limit` at the bridge.
-            ExpertBody::Gated(GatedAct::SwigluOai) => 2,
+            // gpt-oss SwiGLU-OAI: `y = (clamp(u, ±limit)+1) · min(g, limit) · sigmoid(1.702·g)`.
+            ExpertBody::Gated(GatedAct::SwigluOai(_)) => 2,
             ExpertBody::Ungated(UngatedAct::Relu2) => 3,
         };
         let mut v: Vec<ConstantValue> = c.qmv.into();
         v.push(ConstantValue::int(ConstSlot(3), act));
+        // Slot 22 (`GATED_SWIGLU_LIMIT`): its clamp, the model's `swiglu_limit`.
+        if let ExpertBody::Gated(GatedAct::SwigluOai(limit)) = c.act {
+            v.push(ConstantValue::float(ConstSlot(22), limit.get()));
+        }
         v
     }
 }

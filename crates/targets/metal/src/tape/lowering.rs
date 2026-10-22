@@ -7556,6 +7556,9 @@ fn lower_moe_step(
             ));
             constants.push(C::boolean(7, true));
         }
+        if let W4a8Act::SwigluOai(limit) = tag {
+            constants.push(C::float(8, limit.get()));
+        }
         Ok(cmd(
             KernelId::AffineGatherW4a8ActQuant,
             "quantized_qmm_nax",
@@ -7579,7 +7582,7 @@ fn lower_moe_step(
                 let tag = match act {
                     GatedAct::Silu => W4a8Act::Silu,
                     GatedAct::Gelu => W4a8Act::Gelu,
-                    GatedAct::SwigluOai => W4a8Act::SwigluOai,
+                    GatedAct::SwigluOai(limit) => W4a8Act::SwigluOai(limit),
                 };
                 return Ok(vec![fused_act_quant_command(
                     tag,
@@ -7590,7 +7593,9 @@ fn lower_moe_step(
             let (kernel, symbol) = match act {
                 GatedAct::Silu => (KernelId::SiluMul, silu_mul_static_name(dtype)),
                 GatedAct::Gelu => (KernelId::GeluMul, gelu_mul_static_name(dtype)),
-                GatedAct::SwigluOai => (KernelId::SwigluOaiMul, swiglu_oai_mul_static_name(dtype)),
+                GatedAct::SwigluOai(_) => {
+                    (KernelId::SwigluOaiMul, swiglu_oai_mul_static_name(dtype))
+                }
             };
             let (rows, m_scaling) = match s.grouping {
                 MoeGrouping::Gathered => (pairs, ms(A::X)),
@@ -7615,6 +7620,10 @@ fn lower_moe_step(
                     4,
                 ));
                 constants.push(C::boolean(3, true));
+            }
+            // Slot 4 (`SILU_MUL_SWIGLU_LIMIT`): SwiGLU-OAI's clamp, the model's `swiglu_limit`.
+            if let GatedAct::SwigluOai(limit) = act {
+                constants.push(C::float(4, limit.get()));
             }
             Ok(vec![cmd(
                 kernel, "silu_mul", symbol, constants, shape, bindings,
@@ -12216,10 +12225,11 @@ mod tests {
         };
 
         // The act: the GateUpAct decomposition's tail after its two NAX GEMMs.
+        let limit = scratchy_subtile::subtile_ir::SwigluLimit::new(7.0).expect("a clamp");
         let commands = lower(MoeStep::GateUpAct(
             gate,
             ExpertWidth::OpUniform(three),
-            GatedAct::SwigluOai,
+            GatedAct::SwigluOai(limit),
             None,
         ));
         assert_eq!(commands.len(), 3, "gate GEMM, up GEMM, act");
@@ -12233,6 +12243,7 @@ mod tests {
                 C::uint(1, 2880),
                 C::uint(2, 128),
                 C::boolean(3, true),
+                C::float(4, 7.0),
             ]
         );
         let bias = src(WeightKind::GptOssMoe, 0);

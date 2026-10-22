@@ -658,12 +658,40 @@ pub enum ExpertProj {
 pub enum GatedAct {
     Silu,
     Gelu,
-    /// gpt-oss's SwiGLU-OAI: `gate = min(g, 7)`, `up = clamp(u, -7, 7)`,
-    /// `y = (up + 1) · gate · sigmoid(1.702 · gate)`. The ±7 clamps are
-    /// the reference's hard limits (transformers `SwiGLUOAI`, mlx
-    /// `SwigluOAI` at `limit` 7.0 — asserted at config parse), part of
-    /// the activation itself, not a softcap.
-    SwigluOai,
+    /// gpt-oss's SwiGLU-OAI: `gate = min(g, limit)`, `up = clamp(u, -limit, limit)`,
+    /// `y = (up + 1) · gate · sigmoid(1.702 · gate)`. The clamps are part of the
+    /// activation itself, not a softcap (transformers `SwiGLUOAI`, mlx `SwigluOAI`).
+    SwigluOai(SwigluLimit),
+}
+
+/// SwiGLU-OAI's clamp: the model's `swiglu_limit` config scalar (7 in gpt-oss), a finite
+/// positive `f32`, compared and hashed by its bits — what the kernels take compiled in.
+#[derive(Clone, Copy, Debug)]
+pub struct SwigluLimit(f32);
+
+impl SwigluLimit {
+    /// `None` for a limit no clamp means: not finite, or not positive.
+    pub fn new(limit: f32) -> Option<Self> {
+        (limit.is_finite() && limit > 0.0).then_some(Self(limit))
+    }
+
+    pub const fn get(self) -> f32 {
+        self.0
+    }
+}
+
+impl PartialEq for SwigluLimit {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for SwigluLimit {}
+
+impl std::hash::Hash for SwigluLimit {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
 }
 
 /// The activation an ungated expert applies to its one in-projection: `act(fc1 · x)`.

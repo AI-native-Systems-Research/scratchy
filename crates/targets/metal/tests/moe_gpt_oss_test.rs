@@ -72,12 +72,14 @@ impl Lcg {
     }
 }
 
-/// `swiglu_oai_mul_f` (`gated_act.h`) in f32: `y = (clamp(u, ±7)+1) · min(g, 7) ·
-/// sigmoid(1.702·min(g, 7))` — the ±7 limit is gpt-oss's `swiglu_limit`, baked into the kernel.
+/// gpt-oss's `swiglu_limit`, which the gated kernel takes compiled in (slot 22).
+const SWIGLU_LIMIT: f32 = 7.0;
+
+/// `swiglu_oai_mul_f` (`gated_act.h`) in f32: `y = (clamp(u, ±limit)+1) · min(g, limit) ·
+/// sigmoid(1.702·min(g, limit))`.
 fn swiglu_oai(g: f32, u: f32) -> f32 {
-    const LIMIT: f32 = 7.0;
-    let gate = g.min(LIMIT);
-    let up = u.clamp(-LIMIT, LIMIT);
+    let gate = g.min(SWIGLU_LIMIT);
+    let up = u.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT);
     (up + 1.0) * gate / (1.0 + (-1.702 * gate).exp())
 }
 
@@ -173,6 +175,7 @@ impl Experts {
         let mut c = self.constants(rows);
         c.push(ConstantValue::int(ConstSlot(3), 2));
         c.push(ConstantValue::boolean(ConstSlot(4), true));
+        c.push(ConstantValue::float(ConstSlot(22), SWIGLU_LIMIT));
         c
     }
 

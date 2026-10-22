@@ -428,19 +428,27 @@ fn w4a8_grouped_expert_runs() {
 #[test]
 fn w4a8_act_quant_matches_the_separated_pair() {
     with_nax(|device, cache| {
+        // gpt-oss's `swiglu_limit`.
+        let limit = scratchy_subtile::subtile_ir::SwigluLimit::new(7.0).expect("a clamp");
         for dtype in [Dtype::Bf16, Dtype::F16] {
             // Every act the fused pre-pass serves, plus gpt-oss's bias case.
             for (act, bias) in [
                 (W4a8Act::Silu, false),
                 (W4a8Act::Gelu, false),
-                (W4a8Act::SwigluOai, false),
-                (W4a8Act::SwigluOai, true),
+                (W4a8Act::SwigluOai(limit), false),
+                (W4a8Act::SwigluOai(limit), true),
                 (W4a8Act::Relu2, false),
             ] {
                 let (k, experts, run) = (512, 5, 64);
                 let m = experts * run;
                 let counts = [5, 16, 17, 40, 0];
-                let mut rng = Rng(0xa17 ^ dtype as u64 ^ (act as u64) << 8 ^ (bias as u64) << 16);
+                let act_seed: u64 = match act {
+                    W4a8Act::Silu => 0,
+                    W4a8Act::Gelu => 1,
+                    W4a8Act::SwigluOai(_) => 2,
+                    W4a8Act::Relu2 => 3,
+                };
+                let mut rng = Rng(0xa17 ^ dtype as u64 ^ act_seed << 8 ^ (bias as u64) << 16);
                 let gate: Vec<u16> = (0..m * k)
                     .map(|_| dtype.bits(4.0 * rng.unit() - 2.0))
                     .collect();
@@ -486,8 +494,8 @@ fn w4a8_act_quant_matches_the_separated_pair() {
                     (W4a8Act::Silu, Dtype::Bf16) => ("silu_mul", "silu_mul_bf16"),
                     (W4a8Act::Gelu, Dtype::F16) => ("silu_mul", "gelu_mul_f16"),
                     (W4a8Act::Gelu, Dtype::Bf16) => ("silu_mul", "gelu_mul_bf16"),
-                    (W4a8Act::SwigluOai, Dtype::F16) => ("silu_mul", "swiglu_oai_mul_f16"),
-                    (W4a8Act::SwigluOai, Dtype::Bf16) => ("silu_mul", "swiglu_oai_mul_bf16"),
+                    (W4a8Act::SwigluOai(_), Dtype::F16) => ("silu_mul", "swiglu_oai_mul_f16"),
+                    (W4a8Act::SwigluOai(_), Dtype::Bf16) => ("silu_mul", "swiglu_oai_mul_bf16"),
                     (W4a8Act::Relu2, Dtype::F16) => ("activation", "relu2_f16"),
                     (W4a8Act::Relu2, Dtype::Bf16) => ("activation", "relu2_bf16"),
                 };
@@ -503,6 +511,9 @@ fn w4a8_act_quant_matches_the_separated_pair() {
                     if bias {
                         elem_bindings.push((&b_buf, 4));
                         elem_consts.push(ConstantValue::boolean(3, true));
+                    }
+                    if let W4a8Act::SwigluOai(limit) = act {
+                        elem_consts.push(ConstantValue::float(4, limit.get()));
                     }
                 } else {
                     elem_bindings.push((&u_buf, 1));
@@ -554,6 +565,9 @@ fn w4a8_act_quant_matches_the_separated_pair() {
                 if bias {
                     fused_bindings.push((&b_buf, 4));
                     fused_consts.push(ConstantValue::boolean(7, true));
+                }
+                if let W4a8Act::SwigluOai(limit) = act {
+                    fused_consts.push(ConstantValue::float(8, limit.get()));
                 }
                 let fused = PipelineKey::new(
                     "quantized_qmm_nax",
