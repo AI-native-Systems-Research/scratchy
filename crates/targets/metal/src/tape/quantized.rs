@@ -98,6 +98,17 @@ pub enum QmvKernel {
     Wide { nv: u32 },
 }
 
+impl QmvKernel {
+    /// The times the kernel streams a matrix's weights over `rows` rows: the wide band once a
+    /// vector tile, every other kernel once a row.
+    pub fn weight_streams(self, rows: u32) -> u32 {
+        match self {
+            Self::Wide { nv } => rows.div_ceil(nv),
+            Self::Quad { .. } | Self::Fast | Self::FastFold | Self::Generic | Self::Tiny => rows,
+        }
+    }
+}
+
 /// Pick the right qmv variant per MLX `quantized.cpp:1826 dispatch_qmv`:
 /// quad first (tiny K), then the small-M wide band (`M ≥ 2` on gen-15+ —
 /// M3 and later, [`affine_qmv_wide_ok`](crate::targets::affine_qmv_wide_ok)),

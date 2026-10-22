@@ -1053,6 +1053,19 @@ fn route_small_m(
         }
         _ => return Ok(cmds),
     };
+    // The twin pays where the bucket's own matvec streams the weights more than once. The wide
+    // band streams them once a vector tile, and where one tile covers the bucket the twin's
+    // padded matrix tile only costs more (`qmv_rows_probe_test`, Qwen3.6-35B-A3B's 4-row bucket,
+    // µs base M5 / M5 Max, wide vs twin: lm_head 2182 / 540 vs 2333 / 604, gdn out_proj
+    // 70.8 / 31.8 vs 71.1 / 90.1; its 8-row bucket streams them twice, lm_head 4368 / 1049 vs
+    // 2369 / 572).
+    if cmds
+        .iter()
+        .any(|c| c.command.kernel == KernelId::AffineQmvWide)
+        && pick_qmv_kernel_wide(n, k, 4, bucket_m, true).weight_streams(bucket_m) == 1
+    {
+        return Ok(cmds);
+    }
     let small_m = LoweredCommand {
         kernel: KernelId::AffineQmmSmallM,
         library: "quantized_qmm_nax",
@@ -10323,8 +10336,9 @@ mod tests {
     /// On NAX, an MLX-affine 4-bit GEMM in a bucket that can see a 4–16-token
     /// step gets its small-M twin — the 8-row tile in the 8-token bucket, the
     /// 16-row one in the 64-token bucket — gated against the GEMM it replaces,
-    /// with the GEMM's own weights and slots. Batch 1, the prefill buckets,
-    /// 8-bit weights and non-NAX devices are left as they were.
+    /// with the GEMM's own weights and slots. Batch 1, the 4-token bucket (whose
+    /// wide matvec streams its weights once), the prefill buckets, 8-bit weights
+    /// and non-NAX devices are left as they were.
     #[test]
     fn small_m_twin_serves_decode_batches_on_nax() {
         use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
@@ -10408,6 +10422,7 @@ mod tests {
         }
         for (instruction, bucket_m, profile) in [
             (gemm(4), 1, m5),
+            (gemm(4), 4, m5),
             (gemm(4), 512, m5),
             (gemm(8), 8, m5),
             (gemm(4), 8, Some(&crate::targets::M1_8CORE)),
