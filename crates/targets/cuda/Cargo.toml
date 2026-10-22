@@ -28,6 +28,9 @@ scratchy-subtile = { path = "../../compiler/subtile" }
 # bf16 round-to-nearest-even for the rotary table the worker builds on the host (`rotary`), and
 # bf16 <-> f32 for the GPU tests' inputs and outputs.
 half = { workspace = true }
+# `Serialize` on the tape and step types, so CUDA's compiler renders a lowered tape as the tokens
+# of a `static` (`scratchy-const-tokens`). Plain Rust: no toolchain.
+serde = { workspace = true }
 
 [dev-dependencies]
 # The tape tests build their fixtures with the shared lowering types and lower them with CUDA's

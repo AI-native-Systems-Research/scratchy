@@ -378,6 +378,43 @@ impl CompileMode {
     };
 }
 
+/// What the target-emitter seam was handed, while [`target_model_inputs`] is collecting it.
+#[cfg(feature = "target-emitter")]
+static TARGET_INPUTS: std::sync::Mutex<Option<Vec<scratchy_subtile::handoff::TargetModelInput>>> =
+    std::sync::Mutex::new(None);
+
+/// Keep a copy of `input` when [`target_model_inputs`] is collecting; nothing otherwise.
+#[cfg(feature = "target-emitter")]
+pub(crate) fn record_target_input(input: &scratchy_subtile::handoff::TargetModelInput) {
+    let mut inputs = TARGET_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(inputs) = inputs.as_mut() {
+        inputs.push(input.clone());
+    }
+}
+
+/// [`compile_carrier`], returning every [`scratchy_subtile::handoff::TargetModelInput`] it
+/// handed the target-emitter seam, one per emitted model, instead of the tokens: so a test can
+/// check what a target emitted against what that target lowers from the same canonicals.
+#[cfg(feature = "target-emitter")]
+pub fn target_model_inputs(
+    carrier: PythonCarrier,
+    models_dir: &std::path::Path,
+) -> syn::Result<Vec<scratchy_subtile::handoff::TargetModelInput>> {
+    let collecting = |on: bool| {
+        let mut inputs = TARGET_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+        if on {
+            *inputs = Some(Vec::new());
+            Vec::new()
+        } else {
+            inputs.take().unwrap_or_default()
+        }
+    };
+    collecting(true);
+    let compiled = compile_carrier(carrier, models_dir);
+    let inputs = collecting(false);
+    compiled.map(|_| inputs)
+}
+
 /// The whole pipeline: a parsed `dsl/<arch>.py` carrier, compiled against
 /// its arch's `configs/<arch>/` directory — in vision mode for a
 /// `@vision_forward` carrier, decoder mode for `@forward`.

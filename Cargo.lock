@@ -3421,6 +3421,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-const-tokens"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde",
+ "syn 3.0.8",
+]
+
+[[package]]
 name = "scratchy-core-common"
 version = "0.1.0"
 dependencies = [
@@ -3566,7 +3576,9 @@ dependencies = [
  "scratchy-forward-compiler-macro",
  "scratchy-layers",
  "scratchy-quantizations",
+ "scratchy-subtile",
  "scratchy-target-cuda",
+ "scratchy-target-cuda-compiler",
  "scratchy-target-metal",
  "scratchy-target-spyre",
  "scratchy-tensors",
@@ -3762,12 +3774,16 @@ dependencies = [
  "half",
  "scratchy-subtile",
  "scratchy-target-cuda-compiler",
+ "serde",
 ]
 
 [[package]]
 name = "scratchy-target-cuda-compiler"
 version = "0.1.0"
 dependencies = [
+ "proc-macro2",
+ "quote",
+ "scratchy-const-tokens",
  "scratchy-subtile",
  "scratchy-target-cuda",
 ]
@@ -3808,6 +3824,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
+ "scratchy-const-tokens",
  "scratchy-ir",
  "scratchy-subtile",
  "scratchy-target-metal",

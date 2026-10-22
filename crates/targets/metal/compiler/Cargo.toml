@@ -33,3 +33,6 @@ syn = { version = "3", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
 serde = { version = "1", features = ["derive"] }
+# The shared const-constructor serializer the bake renders the static tapes with, under metal's
+# module table (`const_tokens::METAL_MODULES`).
+scratchy-const-tokens = { path = "../../../compiler/const-tokens" }

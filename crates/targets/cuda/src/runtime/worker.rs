@@ -115,6 +115,12 @@ pub enum WorkerError {
     /// The tape at `bucket`'s GDN layers, heads, head dims or conv kernel are not the first GDN
     /// tape's: one pool cannot hold both.
     GdnGeometry { bucket: usize },
+    /// The KV pool's bytes (`layers · 2 · num_blocks` blocks of `kv_heads · block_size ·
+    /// head_dim` bf16) overflow `u64`: `num_blocks` is too large for the tapes' geometry.
+    KvPoolTooLarge { num_blocks: u32 },
+    /// The GDN pool's bytes (per GDN layer, `num_slots` slots of conv and ssm state) overflow
+    /// `u64`: `num_slots` is too large for the tapes' geometry.
+    GdnPoolTooLarge { num_slots: u32 },
     /// Creating the stream or allocating the arena or a pool failed.
     Cuda(CudaError),
 }
@@ -157,6 +163,14 @@ impl fmt::Display for WorkerError {
             Self::GdnGeometry { bucket } => write!(
                 f,
                 "the tape of bucket {bucket} has another GDN geometry than the first GDN tape's"
+            ),
+            Self::KvPoolTooLarge { num_blocks } => write!(
+                f,
+                "a KV pool of {num_blocks} blocks overflows u64 bytes for the tapes' KV geometry"
+            ),
+            Self::GdnPoolTooLarge { num_slots } => write!(
+                f,
+                "a GDN pool of {num_slots} slots overflows u64 bytes for the tapes' GDN geometry"
             ),
             Self::Cuda(e) => write!(f, "cannot build the CUDA worker: {e}"),
         }
@@ -223,6 +237,12 @@ pub enum ForwardError {
     GdnSlotOutsidePool { slot: u32, num_slots: u32 },
     /// The GDN sequence's `q_len` is not in `1 ..= bucket_m`; nothing was enqueued.
     GdnQueryLength { q_len: u32, bucket_m: u32 },
+    /// The forward has both a KV sequence and a GDN sequence, and they disagree on whether it is
+    /// the sequence's first forward: the KV sequence has `prefix_len` cached tokens and the GDN
+    /// sequence says `fresh`. A fresh sequence has no prefix and a continued one has one, so one
+    /// of the two is wrong, and the KV and GDN layers would see different histories. Nothing was
+    /// enqueued.
+    FreshDisagrees { prefix_len: u32, fresh: bool },
     /// A GDN state read names a layer index or a slot outside the pool, or a host buffer that is
     /// not one slot's size; nothing was enqueued.
     GdnRead {
@@ -335,6 +355,11 @@ impl fmt::Display for ForwardError {
                 f,
                 "the GDN sequence has {q_len} rows; the bucket takes 1 to {bucket_m}"
             ),
+            Self::FreshDisagrees { prefix_len, fresh } => write!(
+                f,
+                "the KV sequence has {prefix_len} cached tokens and the GDN sequence says \
+                 fresh={fresh}: a fresh sequence has no prefix, a continued one has one"
+            ),
             Self::GdnRead {
                 layer,
                 slot,
@@ -437,11 +462,6 @@ struct GdnPool {
     sequence_host: [u32; 4],
 }
 
-/// The bytes of `elems` f32.
-fn f32_bytes(elems: usize) -> u64 {
-    elems as u64 * std::mem::size_of::<f32>() as u64
-}
-
 impl GdnPool {
     /// The device address of layer index `layer`'s conv buffer, and of its ssm buffer. Computed,
     /// not dereferenced.
@@ -459,8 +479,18 @@ impl GdnPool {
 /// each at a multiple of [`CUDA_ARENA_ALIGN`]. Returns each layer's two offsets and the total
 /// bytes, or `None` on overflow.
 fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, u64)>, u64)> {
-    let conv = f32_bytes(layout.conv_buffer_elems()).checked_next_multiple_of(CUDA_ARENA_ALIGN)?;
-    let ssm = f32_bytes(layout.ssm_buffer_elems()).checked_next_multiple_of(CUDA_ARENA_ALIGN)?;
+    // The buffers' bytes from the layout's u32 fields, every product checked: the layout's own
+    // element counts multiply unchecked in `usize`.
+    let f32_buffer = |factors: &[u32]| {
+        (factors.iter())
+            .try_fold(std::mem::size_of::<f32>() as u64, |acc, &f| {
+                acc.checked_mul(u64::from(f))
+            })?
+            .checked_next_multiple_of(CUDA_ARENA_ALIGN)
+    };
+    let l = layout;
+    let conv = f32_buffer(&[l.num_slots, l.conv_dim, l.conv_kernel.checked_sub(1)?])?;
+    let ssm = f32_buffer(&[l.num_slots, l.num_v_heads, l.head_v_dim, l.head_k_dim])?;
     let per_layer = conv.checked_add(ssm)?;
     let offsets = (0..layers as u64)
         .map(|l| {
@@ -469,6 +499,23 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
         })
         .collect::<Option<Vec<_>>>()?;
     Some((offsets, per_layer.checked_mul(layers as u64)?))
+}
+
+/// The KV pool's bytes: `layers` layers of a K and a V buffer of `num_blocks` blocks of `kv_heads ·
+/// block_size · head_dim` bf16 each, or `None` when the count overflows `u64`. Every factor is
+/// widened and multiplied checked, so no step wraps.
+fn kv_pool_bytes(layers: usize, layout: &PagedKvLayout) -> Option<u64> {
+    [
+        layout.num_blocks,
+        layout.num_kv_heads,
+        layout.block_size,
+        layout.head_dim,
+    ]
+    .into_iter()
+    .try_fold(u64::try_from(layers).ok()?.checked_mul(2)?, |acc, f| {
+        acc.checked_mul(u64::from(f))
+    })?
+    .checked_mul(std::mem::size_of::<u16>() as u64)
 }
 
 /// The one GDN geometry of `tapes`: the first GDN tape's, which every other GDN tape must share.
@@ -601,15 +648,17 @@ impl<'a> CudaWorker<'a> {
         }
         let geometry = kv_geometry(tapes)?;
         let pool = match (geometry, kv_pool) {
-            (Some(kv), Some(KvPoolConfig { num_blocks })) if num_blocks >= 1 => Some((
-                kv,
-                PagedKvLayout {
+            (Some(kv), Some(KvPoolConfig { num_blocks })) if num_blocks >= 1 => {
+                let layout = PagedKvLayout {
                     num_blocks,
                     num_kv_heads: kv.kv_heads,
                     block_size: kv.block_size,
                     head_dim: kv.head_dim,
-                },
-            )),
+                };
+                let bytes = kv_pool_bytes(kv.layers.len(), &layout)
+                    .ok_or(WorkerError::KvPoolTooLarge { num_blocks })?;
+                Some((kv, layout, bytes))
+            }
             (Some(_), _) => return Err(WorkerError::KvPoolMissing),
             (None, Some(_)) => return Err(WorkerError::KvPoolUnused),
             (None, None) => None,
@@ -624,8 +673,8 @@ impl<'a> CudaWorker<'a> {
                     g.head_v,
                     g.conv_kernel,
                 );
-                let (offsets, bytes) =
-                    gdn_pool_layout(&layout, g.layers.len()).expect("the GDN pool's bytes fit u64");
+                let (offsets, bytes) = gdn_pool_layout(&layout, g.layers.len())
+                    .ok_or(WorkerError::GdnPoolTooLarge { num_slots })?;
                 Some((layout, g.layers.len(), offsets, bytes))
             }
             (Some(_), _) => return Err(WorkerError::GdnPoolMissing),
@@ -643,11 +692,7 @@ impl<'a> CudaWorker<'a> {
         let stream = Stream::new().map_err(WorkerError::Cuda)?;
         let arena = DeviceBuffer::alloc(device, arena_bytes).map_err(WorkerError::Cuda)?;
         let kv = match pool {
-            Some((kv, layout)) => {
-                let bytes = (kv.layers.len() as u64)
-                    .checked_mul(2 * layout.buffer_elems() as u64)
-                    .and_then(|e| e.checked_mul(std::mem::size_of::<u16>() as u64))
-                    .expect("the KV pool's bytes fit u64");
+            Some((kv, layout, bytes)) => {
                 let buffer = DeviceBuffer::alloc(device, bytes).map_err(WorkerError::Cuda)?;
                 let slots = (tapes.iter())
                     .filter(|t| t.kv.is_some())
@@ -782,6 +827,9 @@ impl<'a> CudaWorker<'a> {
     /// copy it is checked: its slot is one of the pool's, and `1 ≤ q_len ≤ bucket_m`. Then
     /// `[slot, q_len, fresh as u32, 0]` is uploaded into the tape's GDN sequence region with the
     /// input.
+    ///
+    /// Given both, they must agree on whether this is the sequence's first forward: `fresh`
+    /// exactly when `prefix_len` is 0, else [`ForwardError::FreshDisagrees`], before any copy.
     pub fn forward(
         &mut self,
         bucket: usize,
@@ -814,6 +862,14 @@ impl<'a> CudaWorker<'a> {
             return Err(ForwardError::Positions {
                 expected,
                 got: positions.len(),
+            });
+        }
+        if let (Some(kv), Some(gdn)) = (kv, gdn)
+            && (kv.prefix_len == 0) != gdn.fresh
+        {
+            return Err(ForwardError::FreshDisagrees {
+                prefix_len: kv.prefix_len,
+                fresh: gdn.fresh,
             });
         }
         let sequence = match (tape.kv, kv) {

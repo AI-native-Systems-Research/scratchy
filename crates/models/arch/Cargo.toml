@@ -677,13 +677,17 @@ metal = [
     "dep:scratchy-target-metal",
     "scratchy-vision?/metal",
 ]
-# NVIDIA CUDA. Builds no model yet: the build script refuses every arch (`CUDA_CAPABLE` in
-# scratchy-forwards.rs is empty) until one lowers.
+# NVIDIA CUDA. Builds the arches `CUDA_CAPABLE` in scratchy-forwards.rs lists, each model with its
+# per-bucket `static` CUDA prefill tapes (`CUDA_TAPES`); the build script refuses any other arch by
+# name. Toolchain-free: no nvcc, no GPU.
 cuda = [
     "scratchy-forward-compiler-macro/cuda",
     "scratchy-forward-compiler/cuda",
     "dep:scratchy-target-cuda",
 ]
+# `cuda` plus the kernels and the runtime that plays a tape (`scratchy-target-cuda`'s `nvcc`): needs
+# nvcc from CUDA 12.8+ on PATH to build, and an sm_90 GPU (H100) to run the tests that use it.
+nvcc = ["cuda", "scratchy-target-cuda/nvcc"]
 # A CARD: the macro compiles the device image from the bundle's KTIR at bake time.
 spyre-hw = ["spyre", "scratchy-forward-compiler-macro/spyre-hw"]
 # THE EMULATOR + the bake-time numeric gate (see the macro crate's `spyre-emu`):
@@ -755,6 +759,16 @@ rayon = { workspace = true }
 # the build script at all and cannot reach the network even by accident.
 ureq = { workspace = true, optional = true }
 
+[dev-dependencies]
+# tests/cuda_tapes.rs and tests/cuda_prefill.rs: the canonicals `#[forward]` hands the
+# target-emitter seam (`target_model_inputs`), recaptured to check the emitted tapes against what
+# CUDA's compiler lowers from them, and the cuda target's own test helpers (`#[path]`, not a copy:
+# `chains.rs`, `numerics.rs`), which name these crates.
+scratchy-forward-compiler-macro = { path = "../../compiler/macros" }
+scratchy-subtile = { path = "../../compiler/subtile" }
+scratchy-target-cuda-compiler = { path = "../../targets/cuda/compiler" }
+half = { workspace = true }
+
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLAllocation", "MTLBuffer", "MTLDevice", "MTLResource"] }
 # bf16 logits readback in the qwen3 py-carrier parity test
@@ -781,4 +795,23 @@ tokenizers = { workspace = true }
 [[test]]
 name = "qwen3_py_parity"
 required-features = ["qwen3-0.6b"]
+
+# The carrier parity gate runs a carrier on Metal (its `imp` is macOS-only, and names the metal
+# target). Built under `metal`: a `cuda` build on a Mac, which now expands a model, has no Metal
+# target to link it against.
+[[test]]
+name = "carrier_parity"
+required-features = ["metal"]
+
+# qwen3.5-0.8b's emitted CUDA tapes against what CUDA's compiler lowers, and the issue's numbers.
+# No toolchain needed.
+[[test]]
+name = "cuda_tapes"
+required-features = ["cuda", "qwen3.5-0.8b"]
+
+# One whole-model prefill forward of qwen3.5-0.8b's emitted tapes on the GPU, synthetic weights.
+# Needs nvcc to build and an H100 to run.
+[[test]]
+name = "cuda_prefill"
+required-features = ["nvcc", "qwen3.5-0.8b"]
 

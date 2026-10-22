@@ -8,6 +8,8 @@
 //! analyses nothing. Plain `Copy` data with no pointer, so it builds in a `const` context and on a
 //! host with no CUDA toolchain.
 
+use serde::Serialize;
+
 use crate::step::{
     AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
     GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, RopeAppendBf16,
@@ -23,22 +25,22 @@ pub const CUDA_ACT_BYTES: u64 = 2;
 pub const CUDA_ARENA_ALIGN: u64 = 256;
 
 /// A byte offset into the worker's arena.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct ArenaOffset(pub u64);
 
 /// A weight, by its source's index in the canonical: the index into the worker's weight buffers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct WeightIx(pub u32);
 
 /// One colour's bytes in the arena.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct ArenaSpan {
     pub offset: ArenaOffset,
     pub bytes: u64,
 }
 
 /// Where every colour lives in one tape's arena.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct ArenaLayout {
     /// Per colour: its value's `rows × cols × CUDA_ACT_BYTES`.
     pub colour_bytes: &'static [u64],
@@ -55,7 +57,7 @@ pub struct ArenaLayout {
 /// data, built on the host from the token positions (`crate::rotary::rotary_rows`) and uploaded
 /// with the input, as token ids are. It is not a colour, and not a weight: every `Cos`/`Sin`
 /// source the canonical binds reads this one table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct RotaryTable {
     /// Where the table lives in the arena, after every colour.
     pub span: ArenaSpan,
@@ -79,7 +81,7 @@ impl RotaryTable {
 /// (`runtime::KvPoolConfig`), sized once at construction. What the forward writes into the
 /// regions (the block table, the slot of each token row, the prefix and query lengths) is its
 /// runtime data, uploaded as the rotary table's rows are.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct KvTape {
     /// Model layer ids whose K/V this tape reads or writes, in pool order (ascending); a step's
     /// `layer` is an index into this list.
@@ -109,7 +111,7 @@ const KV_ENTRY_BYTES: u64 = 4;
 /// `scratchy_subtile::gdn_state_layout::GdnStateLayout`. What the forward writes into the
 /// sequence region (the slot, the real row count, the fresh flag) is its runtime data, uploaded as
 /// the KV sequence is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct GdnTape {
     /// Model layer ids whose GDN state this tape reads and writes, in pool order (ascending); a
     /// step's `layer` is an index into this list.
@@ -136,7 +138,7 @@ impl GdnTape {
 }
 
 /// One bucket's forward.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct CudaTape {
     /// The token count `M` the tape is compiled for.
     pub bucket_m: u32,
