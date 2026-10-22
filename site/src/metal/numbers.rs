@@ -95,6 +95,39 @@ impl Engine {
         }
     }
 
+    /// Whether it serves an `ignore_eos` request to its full length, so a live server delivers
+    /// every answer token asked for ([`super::data::Run::mark_dead`]). In every published run,
+    /// scratchy's live cells deliver 99% or more of them and mlx-lm's 84% or more. oMLX stops at
+    /// EOS regardless (#479), as does ollama, at as little as 36% and 15%; vllm-metal, llama.cpp
+    /// and mistral.rs have no published cells to show either, so they are not judged.
+    pub fn honours_ignore_eos(self) -> bool {
+        match self {
+            Engine::Scratchy | Engine::MlxLm => true,
+            Engine::OmlxTq
+            | Engine::Omlx
+            | Engine::VllmMetal
+            | Engine::Ollama
+            | Engine::LlamaCpp
+            | Engine::Mistralrs => false,
+        }
+    }
+
+    /// Its scaling cells, to mark as a run loads ([`super::data::Run::mark_dead`]).
+    pub fn cells_mut(self, m: &mut Model) -> &mut [Cell] {
+        match self {
+            Engine::Scratchy => &mut m.scaling,
+            Engine::OmlxTq => &mut m.scaling_omlx_tq,
+            Engine::Omlx => &mut m.scaling_omlx,
+            Engine::MlxLm => &mut m.scaling_mlx_lm,
+            Engine::VllmMetal => &mut m.scaling_vllm_metal,
+            Engine::Ollama => &mut m.scaling_ollama,
+            Engine::LlamaCpp => &mut m.scaling_llama_cpp,
+            Engine::Mistralrs => &mut m.scaling_mistralrs,
+        }
+        .as_deref_mut()
+        .unwrap_or_default()
+    }
+
     pub fn ladder(self, m: &Model) -> &[Rep] {
         match self {
             Engine::Scratchy => &m.cache_ladder,
@@ -276,9 +309,10 @@ pub fn streamed(c: Option<&Cell>) -> bool {
     c.is_some_and(|c| c.median_tpot_ms.unwrap_or(0.0) > 0.0)
 }
 
-/// A cell's value, or None where it was not really measured.
+/// A cell's value, or None where it was not really measured: a timing from an answer that never
+/// streamed, or any number from a server that had stopped answering ([`Cell::dead`]).
 pub fn timing(c: Option<&Cell>, metric: Metric) -> Option<f64> {
-    let c = c?;
+    let c = c.filter(|c| !c.dead)?;
     if metric.is_timing() && !streamed(Some(c)) {
         return None;
     }
@@ -291,15 +325,25 @@ fn untimed(c: Option<&Cell>) -> u32 {
 
 /// Whether a timing is real but taken from only some of the cell's requests.
 pub fn partial(c: Option<&Cell>, metric: Metric) -> bool {
-    metric.is_timing() && streamed(c) && untimed(c) > 0
+    metric.is_timing() && c.is_some_and(|c| !c.dead) && streamed(c) && untimed(c) > 0
 }
 
-/// Requests in a cell that errored or timed out.
+/// Requests in a cell that errored or timed out; every one, where its server had stopped
+/// answering ([`Cell::dead`]).
 pub fn failed(c: Option<&Cell>) -> u32 {
-    c.and_then(|c| c.failed).unwrap_or(0)
+    match c {
+        Some(c) if c.dead => c.failed.unwrap_or(0) + c.completed.unwrap_or(0),
+        _ => c.and_then(|c| c.failed).unwrap_or(0),
+    }
 }
 
 pub fn failed_note(c: Option<&Cell>) -> String {
+    if let Some(c) = c.filter(|c| c.dead) {
+        return format!(
+            "the server had stopped answering: {} answer tokens in all",
+            c.total_output_tokens.unwrap_or(0)
+        );
+    }
     let n = failed(c);
     format!(
         "{n} of {} requests failed",
@@ -343,6 +387,9 @@ pub fn untimed_note(c: Option<&Cell>) -> String {
 /// engine never produced, and marks one taken from only some requests, or
 /// from a cell where requests failed.
 pub fn cfmt(c: Option<&Cell>, metric: Metric) -> String {
+    if c.is_some_and(|c| c.dead) {
+        return DASH.to_string() + FAILED;
+    }
     if c.is_some() && metric.is_timing() && !streamed(c) {
         return NO_STREAM.to_string() + if failed(c) > 0 { FAILED } else { "" };
     }
