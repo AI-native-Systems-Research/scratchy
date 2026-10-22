@@ -2201,6 +2201,11 @@ impl SpyreWorker {
                     wirings.decode.num_sources,
                     &resident_source_ids(&wirings.decode, &spill_tids),
                     weights,
+                    // The decode graph's staged tables (the mint's seven, or
+                    // any other kernel's): bound once HERE, on the owner,
+                    // before prepare — every borrowing rung reads them through
+                    // the seg1 alias.
+                    wirings.decode.load_consts,
                 )
                 .map_err(|e| werr(format!("build SuperDSC dxp session: {e}")))?;
                 // ⭐ THE SPILLED WEIGHT TAIL'S DEVICE IMAGE, read back from the OWNER once its

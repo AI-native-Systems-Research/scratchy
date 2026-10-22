@@ -144,6 +144,12 @@ pub struct SuperDscSession {
 impl SuperDscSession {
     /// Load the bundle, bind the weights, and prepare (allocate + upload the resident program,
     /// weights and KV pool).
+    ///
+    /// `load_consts` is the wiring's OWN staged-constant list — the tables a
+    /// spliced kernel declares as sources. They are bound ONCE here, before
+    /// prepare, resident like a weight (each is a function of the graph
+    /// alone); a session that binds none passes an empty slice, and every
+    /// borrowing session gets the owner's copy through the seg1 alias.
     #[allow(clippy::type_complexity)]
     pub fn new(
         code: &'static crate::bundle_code::BundleCode<'static>,
@@ -153,6 +159,7 @@ impl SuperDscSession {
         num_sources: u32,
         resident_sources: &[u32],
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
+        load_consts: &[(u32, crate::wiring::LoadConst)],
     ) -> Result<Self> {
         Self::new_inner(
             code,
@@ -164,6 +171,7 @@ impl SuperDscSession {
             num_sources,
             resident_sources,
             weights,
+            load_consts,
             &[],
         )
     }
@@ -196,6 +204,7 @@ impl SuperDscSession {
             num_sources,
             resident_sources,
             Vec::new(),
+            &[],
             borrowed,
         )
     }
@@ -230,6 +239,7 @@ impl SuperDscSession {
             resident_sources,
             Vec::new(),
             &[],
+            &[],
         )
     }
 
@@ -241,6 +251,10 @@ impl SuperDscSession {
         // no per-step bind names them.
         resident_sources: &[u32],
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
+        // The wiring's staged-constant list — bound once before prepare by the
+        // OWNER only (see [`Self::new`]); borrowers pass none and read the
+        // owner's bytes through the alias.
+        load_consts: &[(u32, crate::wiring::LoadConst)],
         borrowed: &[i64],
     ) -> Result<Self> {
         let SessionDims {
@@ -276,6 +290,15 @@ impl SuperDscSession {
             };
             exec.bind_weight(crate::bundle_code::PlaceId::Act(id as u32), bytes);
         }
+        // ⭐ THE STAGED CONSTANTS ride the same law: bound once, before
+        // prepare, into the same weight channel `stage_weights` converts and
+        // uploads — a table the owner never binds reads as ZEROS on card, and
+        // the kernel composes its answer from zeros (measured: the argmax
+        // mint's first card run answered token 0 — EOS — on every decode
+        // step, while the build's own numeric gate passed, because the gate's
+        // emulator binds its own sources and never crosses this seat).
+        exec.bind_load_consts(load_consts)?;
+        let n_staged = n_bound + load_consts.len();
         debug!(
             "[timing] bind weights loop took {:.2}s",
             t_bind.elapsed().as_secs_f64()
@@ -288,7 +311,7 @@ impl SuperDscSession {
         //
         // NOTHING BOUND is the same situation as BORROWED: with no weights this call only zero-fills
         // a host shadow of a segment that is about to be replaced by an alias.
-        if !borrowed.is_empty() || n_bound == 0 {
+        if !borrowed.is_empty() || n_staged == 0 {
             debug!(
                 "[timing] weight bind + stage SKIPPED ({})",
                 if borrowed.is_empty() {
