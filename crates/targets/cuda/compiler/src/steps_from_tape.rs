@@ -9,7 +9,7 @@
 //! (E0004) as it does in the colour rule. Each opcode issue moves exactly one variant out of the
 //! refusing arm into an arm of its own.
 
-use scratchy_subtile::handoff::SourceBinding;
+use scratchy_subtile::handoff::{SourceBinding, UnrollIndex};
 use scratchy_subtile::lower::GemmWeight;
 use scratchy_subtile::model_geometry::ModelAttnGeometry;
 use scratchy_subtile::subtile_ir::{
@@ -22,16 +22,18 @@ use scratchy_subtile::tape_folding::{FusedShape, Fusion};
 use scratchy_target_cuda::op_abi::CudaFusion;
 use scratchy_target_cuda::step::{
     ADD_BF16_COLS, ATTN_PREFILL_BF16_HEAD_DIM, ATTN_PREFILL_BF16_ROWS, AddBf16, AttnPrefillBf16,
-    CudaStep, GATE_APPLY_BF16_COLS, GATE_SPLIT_BF16_HEAD_MULTIPLE, GEMM_BF16_TILE, GateApplyBf16,
-    GateSplitBf16, GemmBf16, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE,
-    RmsNormBf16, RopeAppendBf16, RopeBf16, SILU_MUL_BF16_COLS, SiluMulBf16,
+    CudaStep, GATE_APPLY_BF16_COLS, GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE,
+    GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_NARROW_BF16_MAX_N,
+    GEMM_NARROW_BF16_MULTIPLE, GateApplyBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16,
+    RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16,
+    RopeAppendBf16, RopeBf16, SILU_MUL_BF16_COLS, SiluMulBf16, gdn_scratch,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, WeightIx};
 
 use crate::canonical::{
-    ArenaRefusal, AttnShapeRule, CanonicalRefusal, CudaModelFacts, GateShapeRule, GemmShapeRule,
-    KvCacheRefusal, KvPool, KvRegions, OperandRefusal, ProducerRefusal, RopeShapeRule,
-    RowShapeRule, ViewRefusal,
+    ArenaRefusal, AttnShapeRule, CanonicalRefusal, CudaModelFacts, GateShapeRule, GdnRegions,
+    GdnShapeRule, GemmShapeRule, KvCacheRefusal, KvPool, KvRegions, OperandRefusal,
+    ProducerRefusal, RopeShapeRule, RowShapeRule, ViewRefusal,
 };
 
 /// What a step's lowering reads besides the step itself: the planned canonical, the model facts,
@@ -53,6 +55,11 @@ pub struct StepCx<'a> {
     pub kv: Result<Option<&'a KvPool>, KvCacheRefusal>,
     /// The KV regions' spans, when the arena has them.
     pub kv_regions: Option<KvRegions>,
+    /// The model layer ids of the canonical's GDN bundles, ascending: a GDN step's `layer` is its
+    /// index here.
+    pub gdn_layers: &'a [u32],
+    /// The GDN regions' spans, when the arena has them.
+    pub gdn_regions: Option<GdnRegions>,
 }
 
 /// One `Compute` of the tape: its position among the `Compute`s, its node, the slot it writes and
@@ -76,7 +83,7 @@ pub fn lower_step(
     use SubOp as L;
     let op = &s.node.op;
     let step = match op {
-        L::MatmulTile { n, weight } => gemm(cx, s, *n, *weight).map(CudaStep::Gemm),
+        L::MatmulTile { n, weight } => gemm(cx, s, *n, *weight),
         L::RmsNorm { eps, gain } => rms_norm(cx, s, *eps, *gain).map(CudaStep::RmsNorm),
         L::Elementwise(E::Add) => add(cx, s).map(CudaStep::Add),
         L::Reshape { .. } => return view(cx, s).map(|()| None),
@@ -93,6 +100,7 @@ pub fn lower_step(
         L::AttnDecode {
             geom, scale, mask, ..
         } => attn_prefill(cx, s, *geom, *scale, *mask, computes).map(CudaStep::AttnPrefill),
+        L::GatedDeltaNet => gated_delta_net(cx, s).map(CudaStep::GatedDeltaNet),
         // SwiGLU runs only as the `SiluMul` fold: a `Silu` the fold left, a `Mul` driving none,
         // and the pre-fused op (which only spyre's `fuse_silu_mul` makes) have no kernel.
         L::Elementwise(E::Silu | E::Mul) | L::SiluMul => Err(CanonicalRefusal::Unfused {
@@ -115,7 +123,6 @@ pub fn lower_step(
         | L::VisionRope
         | L::VarlenAttention { .. }
         | L::EncoderAttn { .. }
-        | L::GatedDeltaNet
         | L::Mamba2 { .. }
         | L::Mean
         | L::RouterNorm { .. }
@@ -162,25 +169,29 @@ pub fn lower_fused(
     }
 }
 
-/// `MatmulTile` as the bf16 GEMM `C[m, n] = A[m, k] · B[n, k]ᵀ`.
+/// `MatmulTile` as a bf16 GEMM `C[m, n] = A[m, k] · B[n, k]ᵀ`: the tiled GEMM when `n` is a
+/// multiple of its tile's, else the narrow GEMM when `n` is at most [`GEMM_NARROW_BF16_MAX_N`]
+/// (the gated delta net's `a` and `b` projections, one column per value head). The choice is the
+/// shape rule's ([`gemm_kernel`]), made here at expansion.
 ///
 /// The IR states the weight as `[K, N]`; the bytes are the checkpoint's `[N, K]`, which is what
-/// the kernel takes (metal's `gemm.metal` the same). So `k` is the weight's IR rows (as metal's
+/// both kernels take (metal's `gemm.metal` the same). So `k` is the weight's IR rows (as metal's
 /// `steps_from_tape::matmul` reads it), `n` the op's, and `m` the output's rows.
 fn gemm(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     n: u32,
     weight: GemmWeight,
-) -> Result<GemmBf16, CanonicalRefusal> {
+) -> Result<CudaStep, CanonicalRefusal> {
     let (step, node) = (s.step, s.node);
     let (act, wt) = match node.inputs.as_slice() {
-        [act, wt, ..] => (act, wt),
-        _ => return Err(operand(s, 1, OperandRefusal::Missing)),
+        [act, wt] => (act, wt),
+        [_] | [] => return Err(operand(s, 1, OperandRefusal::Missing)),
+        [_, _, ..] => return Err(operand(s, 2, OperandRefusal::Extra)),
     };
     let m = cx.graph.shape(node.output.tensor).rows;
     let k = cx.graph.shape(wt.tensor).rows;
-    gemm_shape(m, n, k).map_err(|rule| CanonicalRefusal::GemmShape {
+    let kernel = gemm_kernel(m, n, k).map_err(|rule| CanonicalRefusal::GemmShape {
         step,
         m,
         n,
@@ -198,14 +209,15 @@ fn gemm(
     let mut inputs = s.inputs.iter();
     let a = activation(cx, s, 0, inputs.next())?;
     let b = weight_operand(cx, s, 1, inputs.next())?;
-    Ok(GemmBf16 {
+    let gemm = GemmBf16 {
         a: at(a),
         b,
         c: at(colour_of(cx, s.writes)),
         m,
         n,
         k,
-    })
+    };
+    Ok(kernel(gemm))
 }
 
 /// `RmsNorm { eps, gain }` as the bf16 RMSNorm: `x` (operand 0) a computed slot or the embedded
@@ -716,6 +728,114 @@ fn attn_prefill(
     })
 }
 
+/// The model layer of a `GatedDeltaNet`'s weight bundle (operand 4): a `SourceBinding::Weight`
+/// with an unroll index that fits a `u32`. `None` for any other operand.
+pub fn gdn_bundle_layer(bindings: &[SourceBinding], s: &TapeStep<'_>) -> Option<u32> {
+    match s.inputs.iter().nth(4) {
+        Some(ComputeInput::External { tensor, .. }) => match bindings[tensor.index()] {
+            SourceBinding::Weight {
+                index: Some(UnrollIndex(layer)),
+                ..
+            } => u32::try_from(layer).ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `GatedDeltaNet(qkv, z, a, b, bundle)` as one prefill chunk of the Gated-DeltaNet layer: four
+/// launches (conv1d, gating, recurrent scan, gated norm). Operands 0-3 are computed slots or the
+/// embedded hidden, `qkv [rows, conv_dim]`, `z [rows, value_dim]`, `a` and `b [rows, nv]`;
+/// operand 4 is the layer's weight bundle, a `[1, 1]` source bound to a model layer's weight,
+/// which the device holds packed as `gdn_bundle`. The op carries no geometry: the value heads
+/// and their dim are the operands', the key heads, their dim, the conv kernel and `eps` the
+/// model's (`CudaModelFacts::gdn`).
+fn gated_delta_net(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+) -> Result<GatedDeltaNetBf16, CanonicalRefusal> {
+    let (step, node) = (s.step, s.node);
+    let (qkv, z, a, b, bundle) = match node.inputs.as_slice() {
+        [qkv, z, a, b, bundle] => (qkv, z, a, b, bundle),
+        [_, _, _, _, _, _, ..] => return Err(operand(s, 5, OperandRefusal::Extra)),
+        _ => return Err(operand(s, 4, OperandRefusal::Missing)),
+    };
+    let facts = cx.facts.gdn.ok_or(CanonicalRefusal::GdnFacts { step })?;
+    let refuse = |rule| CanonicalRefusal::GdnShape { step, rule };
+    let shape = |r: &TensorRegion| cx.graph.shape(r.tensor);
+    let TensorShape {
+        rows,
+        cols: out_cols,
+    } = shape(&node.output);
+    let (conv_dim, value_dim, nv) = (shape(qkv).cols, shape(z).cols, shape(a).cols);
+    let (nk, head_k, conv_kernel) = (facts.num_k_heads, facts.head_k, facts.conv_kernel);
+    if head_k != GDN_HEAD_K {
+        return Err(refuse(GdnShapeRule::HeadK { head_k }));
+    }
+    if nk == 0 || nv == 0 || !nv.is_multiple_of(nk) || !value_dim.is_multiple_of(nv) {
+        return Err(refuse(GdnShapeRule::HeadsNotGrouped { nk, nv }));
+    }
+    let head_v = value_dim / nv;
+    if head_v == 0 || !head_v.is_multiple_of(GDN_HEAD_V_MULTIPLE) || head_v > GDN_HEAD_V_MAX {
+        return Err(refuse(GdnShapeRule::HeadV { head_v }));
+    }
+    let (kmin, kmax) = GDN_CONV_KERNEL_RANGE;
+    if !(kmin..=kmax).contains(&conv_kernel) {
+        return Err(refuse(GdnShapeRule::ConvKernel { k: conv_kernel }));
+    }
+    // `nk · head_k ≤ nv · 128 ≤ value_dim`, so `want` is at most `3 · u32::MAX`; in u64 it fits.
+    let want = 2 * u64::from(nk) * u64::from(head_k) + u64::from(value_dim);
+    if u64::from(conv_dim) != want {
+        let want = u32::try_from(want).unwrap_or(u32::MAX);
+        return Err(refuse(GdnShapeRule::Widths { conv_dim, want }));
+    }
+    // The scratch is sized at the bucket's rows, so the op's rows must be those too.
+    let operand_rows = [qkv, z, a, b].map(|r| shape(r).rows);
+    if operand_rows.iter().any(|&r| r != rows) || cx.tokens.is_some_and(|t| t != rows) {
+        return Err(refuse(GdnShapeRule::RowsDisagree));
+    }
+    let elements = u64::from(rows) * u64::from(conv_dim);
+    if rows == 0 || elements > i32::MAX as u64 {
+        return Err(refuse(GdnShapeRule::TooManyElements { elements }));
+    }
+    same_shape(cx, s, 1, z, rows, out_cols)?;
+    same_shape(cx, s, 3, b, rows, nv)?;
+    whole_tensors(cx, s, &[(0, qkv), (1, z), (2, a), (3, b), (4, bundle)])?;
+    let mut inputs = s.inputs.iter();
+    let [qc, zc, ac, bc] = [0, 1, 2, 3].map(|k| activation(cx, s, k, inputs.next()));
+    let (qc, zc, ac, bc) = (qc?, zc?, ac?, bc?);
+    let bundle = weight_operand(cx, s, 4, inputs.next())?;
+    let layer = gdn_bundle_layer(cx.bindings, s).ok_or(CanonicalRefusal::GdnLayer { step })?;
+    let at = arena(cx)?;
+    // The arena sized the scratch by the canonical's first GDN op; one of another geometry would
+    // need another scratch and another state pool.
+    let regions = (cx.gdn_regions).ok_or(CanonicalRefusal::GdnPool { step })?;
+    let scratch_bytes = gdn_scratch(rows, conv_dim, nv, value_dim).map(|l| l.bytes);
+    if scratch_bytes != Some(regions.scratch.bytes) {
+        return Err(CanonicalRefusal::GdnPool { step });
+    }
+    let index = (cx.gdn_layers.iter().position(|&l| l == layer))
+        .ok_or(CanonicalRefusal::GdnLayer { step })?;
+    Ok(GatedDeltaNetBf16 {
+        qkv: at(qc),
+        z: at(zc),
+        a: at(ac),
+        b: at(bc),
+        bundle,
+        out: at(colour_of(cx, s.writes)),
+        scratch: regions.scratch.offset,
+        sequence: regions.sequence.offset,
+        layer: index as u32,
+        rows,
+        num_k_heads: nk,
+        num_v_heads: nv,
+        head_k,
+        head_v,
+        conv_kernel,
+        eps_bits: facts.eps.to_bits(),
+    })
+}
+
 /// `GateSplit { half_cols }` as the bf16 per-head split: `qg` (operand 0) `[rows, 2·half_cols]`,
 /// the query this step's colour and the gate its second colour. `head_dim` is the model's: the op
 /// carries only `half_cols`.
@@ -873,12 +993,53 @@ fn gate_shape(rows: u32, half_cols: u32, head_dim: u32) -> Result<(), GateShapeR
     Ok(())
 }
 
-/// The bf16 GEMM's shape rule: `m`, `n` and `k` non-zero multiples of [`GEMM_BF16_TILE`], and
-/// each at most `i32::MAX` (ThunderKittens' `gl` stores dimensions as `int`).
-fn gemm_shape(m: u32, n: u32, k: u32) -> Result<(), GemmShapeRule> {
+/// Which bf16 GEMM takes `(m, n, k)`, as the step constructor: `m = 1` is a decode GEMV, which
+/// neither takes; an `n` that is a multiple of the tile's goes to the tiled GEMM under its rule
+/// ([`gemm_shape`]); an `n` of at most [`GEMM_NARROW_BF16_MAX_N`] to the narrow GEMM under its
+/// rule ([`gemm_narrow_shape`]); any other `n` is refused as off the tile.
+fn gemm_kernel(m: u32, n: u32, k: u32) -> Result<fn(GemmBf16) -> CudaStep, GemmShapeRule> {
     if m == 1 {
         return Err(GemmShapeRule::Decode);
     }
+    if n != 0 && n <= GEMM_NARROW_BF16_MAX_N && !n.is_multiple_of(GEMM_BF16_TILE.1) {
+        gemm_narrow_shape(m, n, k)?;
+        return Ok(CudaStep::GemmNarrow);
+    }
+    gemm_shape(m, n, k)?;
+    Ok(CudaStep::Gemm)
+}
+
+/// The narrow bf16 GEMM's shape rule: `m` non-zero, `n` and `k` non-zero multiples of
+/// [`GEMM_NARROW_BF16_MULTIPLE`] (`n` at most [`GEMM_NARROW_BF16_MAX_N`], which the caller
+/// chose it by), and `m` and `k` at most `i32::MAX`.
+fn gemm_narrow_shape(m: u32, n: u32, k: u32) -> Result<(), GemmShapeRule> {
+    if m == 0 {
+        return Err(GemmShapeRule::OffTile {
+            dim: "m",
+            value: m,
+            tile: 1,
+        });
+    }
+    for (dim, value) in [("n", n), ("k", k)] {
+        if value == 0 || !value.is_multiple_of(GEMM_NARROW_BF16_MULTIPLE) {
+            return Err(GemmShapeRule::NarrowOffVector {
+                dim,
+                value,
+                multiple: GEMM_NARROW_BF16_MULTIPLE,
+            });
+        }
+    }
+    for (dim, value) in [("m", m), ("k", k)] {
+        if i32::try_from(value).is_err() {
+            return Err(GemmShapeRule::AboveIntMax { dim, value });
+        }
+    }
+    Ok(())
+}
+
+/// The bf16 GEMM's shape rule: `m`, `n` and `k` non-zero multiples of [`GEMM_BF16_TILE`], and
+/// each at most `i32::MAX` (ThunderKittens' `gl` stores dimensions as `int`).
+fn gemm_shape(m: u32, n: u32, k: u32) -> Result<(), GemmShapeRule> {
     let (tm, tn, tk) = GEMM_BF16_TILE;
     for (dim, value, tile) in [("m", m, tm), ("n", n, tn), ("k", k, tk)] {
         if value == 0 || !value.is_multiple_of(tile) {

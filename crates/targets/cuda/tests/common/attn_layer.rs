@@ -364,6 +364,7 @@ pub static ATTN_LAYER_M128: CudaTape = CudaTape {
     ],
     rotary: rotary(4849664, 16384),
     kv: kv(4866048, (4866560, 512), 4867072),
+    gdn: None,
 };
 
 /// [`attn_layer`]`(256)`: `x` 0, `n` (then `o`) 524288, `qg` 1048576, `q` 3145728, `qn` 4194304,
@@ -404,4 +405,5 @@ pub static ATTN_LAYER_M256: CudaTape = CudaTape {
     ],
     rotary: rotary(9699328, 32768),
     kv: kv(9732096, (9732608, 1024), 9733632),
+    gdn: None,
 };

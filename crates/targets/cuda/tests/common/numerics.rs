@@ -538,3 +538,377 @@ pub fn gather_paged(
     }
     out
 }
+
+// ── The Gated-DeltaNet kernels ─────────────────────────────────────
+//
+// Every reference is f64, from the same values the GPU read: bf16 activations widened exactly,
+// the f32 bundle, and the GPU's own f32 scratch for a stage's inputs, so each check measures one
+// kernel's error. The bounds:
+//
+// - conv1d (f32): `|gpu − ref| ≤ 2⁻¹⁶·(|ref| + Σ_j |w_j·x_j|) + 2⁻²⁴`; the ring bit-exact.
+// - gating (f32): `|gpu − ref| ≤ 2⁻¹⁶·|ref| + 2⁻²²` for `g` and for `β`.
+// - scan (f32), the long-recurrence bound: for token `t` (counting earlier chunks), value head
+//   `h`, row `i`, `|o_gpu − o_ref| ≤ 2⁻¹⁴·|o_ref| + 2⁻¹⁷·(t+1)·scale·Smax[t,h,i]`, `Smax` the
+//   largest `‖S_ref,s[h,i,:]‖₂` over `s ≤ t`; the state after the last token
+//   `|S_gpu − S_ref| ≤ 2⁻¹⁷·(t_last+1)·Smax[t_last,h,i]` elementwise. Each token's transition
+//   `α·(I − β·k̂·k̂ᵀ)` has 2-norm at most 1, so an error made at token `s` is never amplified and
+//   the errors at most add; `|δo| ≤ scale·‖δS row‖₂`. `2⁻¹⁷` is 4× over one token's error.
+// - gated norm (bf16): the row kernels' `2⁻⁸·|ref| + 2⁻²⁴`; padding rows exactly `+0.0`.
+
+/// `2⁻¹⁶`.
+pub const GDN_CONV_REL: f64 = 1.0 / 65_536.0;
+/// The gating's absolute floor, `2⁻²²`.
+pub const GDN_GATING_ABS: f64 = 1.0 / 4_194_304.0;
+/// The scan's relative term, `2⁻¹⁴`.
+pub const GDN_SCAN_REL: f64 = 1.0 / 16_384.0;
+/// The scan's per-token term, `2⁻¹⁷`.
+pub const GDN_SCAN_STEP: f64 = 1.0 / 131_072.0;
+
+/// One GDN chunk's geometry.
+#[derive(Clone, Copy, Debug)]
+pub struct GdnDims {
+    pub nk: usize,
+    pub nv: usize,
+    pub head_k: usize,
+    pub head_v: usize,
+    pub conv_kernel: usize,
+}
+
+impl GdnDims {
+    pub fn key_dim(&self) -> usize {
+        self.nk * self.head_k
+    }
+    pub fn value_dim(&self) -> usize {
+        self.nv * self.head_v
+    }
+    pub fn conv_dim(&self) -> usize {
+        2 * self.key_dim() + self.value_dim()
+    }
+    pub fn scale(&self) -> f64 {
+        1.0 / (self.head_k as f64).sqrt()
+    }
+}
+
+/// `x [q_len, conv_dim]`'s conv1d after `ring` (`[conv_dim, K−1]`, oldest first; zeros on a fresh
+/// start) under `w [conv_dim, K]`: `(ref, Σ_j |w_j·x_j|)` per element of `[q_len, conv_dim]`, and
+/// the new ring. `reversed` applies the taps newest first: the self-check's wrong kernel.
+pub fn gdn_conv_reference(
+    x: &[f64],
+    w: &[f64],
+    ring: &[f64],
+    (q_len, conv_dim, k): (usize, usize, usize),
+    reversed: bool,
+) -> (Vec<(f64, f64)>, Vec<f64>) {
+    let state = k - 1;
+    let mut out = vec![(0.0, 0.0); q_len * conv_dim];
+    let mut new_ring = vec![0.0; conv_dim * state];
+    for c in 0..conv_dim {
+        // `[ring ++ x[.., c]]`.
+        let mut stream: Vec<f64> = ring[c * state..][..state].to_vec();
+        stream.extend((0..q_len).map(|t| x[t * conv_dim + c]));
+        for t in 0..q_len {
+            let (mut sum, mut mag) = (0.0, 0.0);
+            for j in 0..k {
+                let tap = if reversed { k - 1 - j } else { j };
+                let p = w[c * k + tap] * stream[t + j];
+                sum += p;
+                mag += p.abs();
+            }
+            out[t * conv_dim + c] = (sum / (1.0 + (-sum).exp()), mag);
+        }
+        new_ring[c * state..][..state].copy_from_slice(&stream[q_len..]);
+    }
+    (out, new_ring)
+}
+
+/// The conv's bound on an element whose reference is `r`, its taps' magnitudes `s`.
+pub fn gdn_conv_bound(r: f64, s: f64) -> f64 {
+    GDN_CONV_REL * (r.abs() + s) + ROW_ABS
+}
+
+/// `softplus(x)`: `ln(1 + eˣ)` for `x ≤ 20`, else `x`.
+pub fn softplus(x: f64) -> f64 {
+    if x <= 20.0 { x.exp().ln_1p() } else { x }
+}
+
+/// The gating of `a`, `b` (`[q_len, nv]`): `(g, β)` per element. `sigmoid` false is the
+/// self-check's wrong gate, `β = b`.
+pub fn gdn_gating_reference(
+    a: &[f64],
+    b: &[f64],
+    a_log: &[f64],
+    dt_bias: &[f64],
+    nv: usize,
+    sigmoid: bool,
+) -> (Vec<f64>, Vec<f64>) {
+    let g = (a.iter().enumerate())
+        .map(|(i, &x)| -a_log[i % nv].exp() * softplus(x + dt_bias[i % nv]))
+        .collect();
+    let beta = (b.iter())
+        .map(|&x| if sigmoid { 1.0 / (1.0 + (-x).exp()) } else { x })
+        .collect();
+    (g, beta)
+}
+
+/// The gating's bound on an element whose reference is `r`.
+pub fn gdn_gating_bound(r: f64) -> f64 {
+    GDN_CONV_REL * r.abs() + GDN_GATING_ABS
+}
+
+/// Which mutation of the scan a reference computes: the real one, or a self-check's wrong kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanVariant {
+    Real,
+    /// `u = β·v`: no `− S·k̂`.
+    NoCorrection,
+    /// The decay after the update instead of before.
+    DecayLast,
+    /// Key head `h % nk` instead of `h / (nv/nk)`.
+    ModuloHeads,
+}
+
+/// The scan's f64 reference over `q_len` tokens of `conv_out [q_len, conv_dim]` (the GPU's f32
+/// values), `g` and `beta` (`[q_len, nv]`), from `state` (`[nv, head_v, head_k]`), starting at
+/// token `t0` of the sequence: per element of `o [q_len, value_dim]`, `(ref, (t0 + t + 1) · scale ·
+/// Smax)`, the bound's second factor; and the final state with each row's `(t_last + 1) · Smax`.
+pub struct ScanReference {
+    pub o: Vec<(f64, f64)>,
+    pub state: Vec<f64>,
+    /// Per state row `(h, i)`: `(t_last + 1) · Smax`.
+    pub state_scale: Vec<f64>,
+    /// Per state row: the running `Smax`, for a continuation's reference.
+    pub smax: Vec<f64>,
+}
+
+/// One scan reference's inputs: the GPU's f32 `conv_out`, `g` and `beta` of the chunk, the start
+/// `state` and, for a continuation, the running `Smax` it left (`None` starts it from `state`),
+/// and the chunk's first token `t0` within the sequence and its `q_len`.
+pub struct ScanInputs<'a> {
+    pub conv_out: &'a [f64],
+    pub g: &'a [f64],
+    pub beta: &'a [f64],
+    pub state: &'a [f64],
+    pub smax: Option<&'a [f64]>,
+    pub t0: usize,
+    pub q_len: usize,
+}
+
+pub fn gdn_scan_reference(x: &ScanInputs<'_>, d: GdnDims, variant: ScanVariant) -> ScanReference {
+    let ScanInputs {
+        conv_out,
+        g,
+        beta,
+        state,
+        smax: smax0,
+        t0,
+        q_len,
+    } = *x;
+    let (kd, vd, cd, hk, hv) = (d.key_dim(), d.value_dim(), d.conv_dim(), d.head_k, d.head_v);
+    let scale = d.scale();
+    let l2 = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>();
+    // Each value head's recurrence is independent of the others': one thread per head.
+    let per_head = |h: usize| {
+        let kh = match variant {
+            ScanVariant::ModuloHeads => h % d.nk,
+            _ => h / (d.nv / d.nk),
+        };
+        let mut s = state[h * hv * hk..][..hv * hk].to_vec();
+        let mut smax: Vec<f64> = match smax0 {
+            Some(m) => m[h * hv..][..hv].to_vec(),
+            None => (0..hv).map(|i| l2(&s[i * hk..][..hk]).sqrt()).collect(),
+        };
+        let mut o = vec![(0.0, 0.0); q_len * hv];
+        for t in 0..q_len {
+            let row = &conv_out[t * cd..][..cd];
+            let q = &row[kh * hk..][..hk];
+            let k = &row[kd + kh * hk..][..hk];
+            let qn = 1.0 / (l2(q) + 1e-6).sqrt() * scale;
+            let kn = 1.0 / (l2(k) + 1e-6).sqrt();
+            let alpha = g[t * d.nv + h].exp();
+            let b = beta[t * d.nv + h];
+            for i in 0..hv {
+                let sr = &mut s[i * hk..][..hk];
+                let v = row[2 * kd + h * hv + i];
+                if variant != ScanVariant::DecayLast {
+                    sr.iter_mut().for_each(|x| *x *= alpha);
+                }
+                let sk: f64 = sr.iter().zip(k).map(|(a, b)| a * b * kn).sum();
+                let u = match variant {
+                    ScanVariant::NoCorrection => b * v,
+                    _ => b * (v - sk),
+                };
+                sr.iter_mut().zip(k).for_each(|(x, kj)| *x += u * kj * kn);
+                if variant == ScanVariant::DecayLast {
+                    sr.iter_mut().for_each(|x| *x *= alpha);
+                }
+                let out: f64 = sr.iter().zip(q).map(|(a, b)| a * b * qn).sum();
+                smax[i] = smax[i].max(l2(sr).sqrt());
+                o[t * hv + i] = (out, (t0 + t + 1) as f64 * scale * smax[i]);
+            }
+        }
+        (o, s, smax)
+    };
+    let heads: Vec<_> = std::thread::scope(|sc| {
+        let handles: Vec<_> = (0..d.nv).map(|h| sc.spawn(move || per_head(h))).collect();
+        handles
+            .into_iter()
+            .map(|j| j.join().expect("a scan reference thread panicked"))
+            .collect()
+    });
+    let mut o = vec![(0.0, 0.0); q_len * vd];
+    let (mut s, mut smax) = (Vec::with_capacity(vd * hk), Vec::with_capacity(vd));
+    for (h, (ho, hs, hm)) in heads.into_iter().enumerate() {
+        for t in 0..q_len {
+            o[t * vd + h * hv..][..hv].copy_from_slice(&ho[t * hv..][..hv]);
+        }
+        s.extend(hs);
+        smax.extend(hm);
+    }
+    let t_last = t0 + q_len;
+    let state_scale = smax.iter().map(|m| t_last as f64 * m).collect();
+    ScanReference {
+        o,
+        state: s,
+        state_scale,
+        smax,
+    }
+}
+
+/// The scan's bound on an output element `(ref, linear)`.
+pub fn gdn_scan_bound(r: f64, linear: f64) -> f64 {
+    GDN_SCAN_REL * r.abs() + GDN_SCAN_STEP * linear
+}
+
+/// The gated norm's reference of `o [q_len, value_dim]` (the GPU's f32) under `z` (bf16 widened)
+/// and `w [head_v]`: one value per element. `silu` false is the self-check's sigmoid gate.
+pub fn gdn_norm_reference(
+    o: &[f64],
+    z: &[f64],
+    w: &[f64],
+    (q_len, nv, head_v): (usize, usize, usize),
+    eps: f64,
+    silu: bool,
+) -> Vec<f64> {
+    let mut out = Vec::with_capacity(q_len * nv * head_v);
+    for row in 0..q_len * nv {
+        let ov = &o[row * head_v..][..head_v];
+        let zv = &z[row * head_v..][..head_v];
+        let mean = ov.iter().map(|v| v * v).sum::<f64>() / head_v as f64;
+        let inv = 1.0 / (mean + eps).sqrt();
+        for i in 0..head_v {
+            let sig = 1.0 / (1.0 + (-zv[i]).exp());
+            let gate = if silu { zv[i] * sig } else { sig };
+            out.push(ov[i] * inv * w[i] * gate);
+        }
+    }
+    out
+}
+
+/// How an f32 GPU output compares with `(ref, bound)` pairs: out-of-bound count, worst ratio,
+/// non-finite count.
+pub struct F32Comparison {
+    pub out_of_bound: usize,
+    pub worst_ratio: f64,
+    pub worst: usize,
+    pub non_finite: usize,
+    pub n: usize,
+}
+
+impl F32Comparison {
+    pub fn pass(&self) -> bool {
+        self.out_of_bound == 0
+    }
+
+    pub fn fraction(&self) -> f64 {
+        self.out_of_bound as f64 / self.n.max(1) as f64
+    }
+
+    pub fn line(&self) -> String {
+        format!(
+            "n={} out_of_bound={} ({:.4}) worst_ratio={:.4} at {} non_finite={}",
+            self.n,
+            self.out_of_bound,
+            self.fraction(),
+            self.worst_ratio,
+            self.worst,
+            self.non_finite
+        )
+    }
+}
+
+/// Compare `gpu` with `refs` under `bound`, over the indices `keep` admits.
+pub fn compare_f32(
+    gpu: &[f32],
+    refs: &[f64],
+    bound: impl Fn(usize) -> f64,
+    keep: impl Fn(usize) -> bool,
+) -> F32Comparison {
+    let mut c = F32Comparison {
+        out_of_bound: 0,
+        worst_ratio: -1.0,
+        worst: 0,
+        non_finite: 0,
+        n: 0,
+    };
+    for (i, (&g, &r)) in gpu.iter().zip(refs).enumerate() {
+        if !keep(i) {
+            continue;
+        }
+        c.n += 1;
+        let g = f64::from(g);
+        let b = bound(i);
+        let ratio = if g.is_finite() {
+            (g - r).abs() / b.max(f64::MIN_POSITIVE)
+        } else {
+            c.non_finite += 1;
+            f64::INFINITY
+        };
+        // NaN's ratio is infinite, so it is out of bound too.
+        if ratio > 1.0 {
+            c.out_of_bound += 1;
+        }
+        if ratio > c.worst_ratio {
+            c.worst_ratio = ratio;
+            c.worst = i;
+        }
+    }
+    c
+}
+
+/// `bits` (f32 bit patterns as u16 pairs, little-endian) as f32.
+pub fn f32_from_halves(halves: &[u16]) -> Vec<f32> {
+    let (pairs, _) = halves.as_chunks::<2>();
+    pairs
+        .iter()
+        .map(|&[lo, hi]| f32::from_bits(u32::from(lo) | (u32::from(hi) << 16)))
+        .collect()
+}
+
+/// `f` as the u16 pairs `DeviceBuffer::upload` takes (little-endian).
+pub fn f32_to_halves(f: &[f32]) -> Vec<u16> {
+    f.iter()
+        .flat_map(|v| {
+            let b = v.to_bits();
+            [b as u16, (b >> 16) as u16]
+        })
+        .collect()
+}
+
+/// splitmix64 values uniform in `[lo, hi]`, as f32.
+pub fn f32_inputs(len: usize, seed: u64, (lo, hi): (f64, f64)) -> Vec<f32> {
+    bf16_inputs(len, seed)
+        .into_iter()
+        .map(|b| {
+            let unit = (f64::from(bf16::from_bits(b).to_f32()) + 1.0) / 2.0;
+            (lo + (hi - lo) * unit) as f32
+        })
+        .collect()
+}
+
+/// splitmix64 bf16 uniform in `[lo, hi]`.
+pub fn bf16_in(len: usize, seed: u64, (lo, hi): (f64, f64)) -> Vec<u16> {
+    f32_inputs(len, seed, (lo, hi))
+        .into_iter()
+        .map(|v| bf16::from_f32(v).to_bits())
+        .collect()
+}

@@ -24,31 +24,46 @@ use std::collections::BTreeMap;
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::GemmWeightKind;
 use scratchy_subtile::sample_rows::{SampleRowsError, expand_sample_rows};
-use scratchy_subtile::subtile_ir::{SubtileIR, TensorShape, ValidatedGraph, lower_region};
+use scratchy_subtile::subtile_ir::{SubOp, SubtileIR, TensorShape, ValidatedGraph, lower_region};
 use scratchy_subtile::subtile_tape::{Instr, SubtileTape, lower_dag_to_tape};
 use scratchy_subtile::tape_colouring::{Colour, ColourError, TapeColouring, colour_tape};
 use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, StepRole, TapeFolds, fold_tape};
 use scratchy_target_cuda::op_abi::{
     CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_FUSIONS, CUDA_SAMPLE_ROWS, CudaFusion,
 };
-use scratchy_target_cuda::step::{CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep};
+use scratchy_target_cuda::step::{
+    CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GDN_SEQUENCE_BYTES, gdn_scratch,
+};
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, RotaryTable,
 };
 
-use crate::steps_from_tape::{StepCx, TapeStep, lower_fused, lower_step};
+use crate::steps_from_tape::{StepCx, TapeStep, gdn_bundle_layer, lower_fused, lower_step};
 
 /// The model facts CUDA's opcode lowering reads, beside the canonical: expansion-time constants,
 /// the counterpart of the `MetalModelConsts` fields metal's rope and gate lowerings read.
 ///
 /// `GateSplit` carries only `half_cols`, so its `head_dim` is this one; `RopeRotate` carries its
 /// `head_dim` but not its rotated width, so `rot_dim` (`partial_rotary_factor · head_dim`) is this
-/// one, and `rope_theta` builds the rotary table's rows.
+/// one, and `rope_theta` builds the rotary table's rows. `GatedDeltaNet` carries none of its
+/// key-head geometry, so `gdn` is it, for a model with linear-attention layers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CudaModelFacts {
     pub head_dim: u32,
     pub rot_dim: u32,
     pub rope_theta: f64,
+    pub gdn: Option<CudaGdnFacts>,
+}
+
+/// The Gated-DeltaNet geometry the op does not carry: `linear_num_key_heads`,
+/// `linear_key_head_dim`, `linear_conv_kernel_dim`, and the gated norm's `rms_norm_eps`. The value
+/// heads and their dim are the op's operand widths.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CudaGdnFacts {
+    pub num_k_heads: u32,
+    pub head_k: u32,
+    pub conv_kernel: u32,
+    pub eps: f32,
 }
 
 /// Which canonical this is, for the refusals.
@@ -98,6 +113,24 @@ pub struct CudaCanonical {
     /// The paged KV cache and its regions, after the rotary table: `Some` exactly when the
     /// canonical binds a `PrefixK` source. The fields of a `scratchy_target_cuda::tape::KvTape`.
     pub kv: Option<CanonicalKv>,
+    /// The Gated-DeltaNet layers and their regions, after the KV regions: `Some` exactly when a
+    /// step is a `GatedDeltaNet`. The fields of a `scratchy_target_cuda::tape::GdnTape`.
+    pub gdn: Option<CanonicalGdn>,
+}
+
+/// One canonical's Gated-DeltaNet layers: the fields of a `scratchy_target_cuda::tape::GdnTape`,
+/// its layer list owned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalGdn {
+    /// The model layer ids of the GDN bundles, ascending: a step's `layer` indexes it.
+    pub layers: Vec<u32>,
+    pub num_k_heads: u32,
+    pub num_v_heads: u32,
+    pub head_k: u32,
+    pub head_v: u32,
+    pub conv_kernel: u32,
+    pub sequence: ArenaSpan,
+    pub scratch: ArenaSpan,
 }
 
 /// One canonical's paged KV cache: the fields of a `scratchy_target_cuda::tape::KvTape`, its
@@ -309,8 +342,49 @@ pub enum CanonicalRefusal {
     SecondOutput {
         step: usize,
     },
+    /// The `step`-th `Compute` is a `GatedDeltaNet` whose weight bundle is not one model layer's
+    /// (`SourceBinding::Weight` with no unroll index): the state pool is per layer.
+    GdnLayer {
+        step: usize,
+    },
+    /// The `step`-th `Compute` is a `GatedDeltaNet` and the model facts carry no GDN geometry.
+    GdnFacts {
+        step: usize,
+    },
+    /// The `step`-th `Compute` is a `GatedDeltaNet` of a geometry the four GDN kernels do not take.
+    GdnShape {
+        step: usize,
+        rule: GdnShapeRule,
+    },
+    /// The `step`-th `Compute` is a `GatedDeltaNet` of another geometry than the canonical's
+    /// first, which the arena sized the GDN scratch by: one scratch and one state pool cannot
+    /// hold both.
+    GdnPool {
+        step: usize,
+    },
     /// The arena cannot be laid out.
     Arena(ArenaRefusal),
+}
+
+/// Which rule a `GatedDeltaNet`'s geometry breaks: the four kernels', stated at expansion time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GdnShapeRule {
+    /// `head_k` is not `GDN_HEAD_K`, the scan's register layout.
+    HeadK { head_k: u32 },
+    /// `head_v` is zero, not a multiple of `GDN_HEAD_V_MULTIPLE`, or above `GDN_HEAD_V_MAX`.
+    HeadV { head_v: u32 },
+    /// The value heads are not a whole number per key head (`nv % nk ≠ 0`), or the value width is
+    /// not a whole number of value heads.
+    HeadsNotGrouped { nk: u32, nv: u32 },
+    /// The conv kernel width is outside `GDN_CONV_KERNEL_RANGE`.
+    ConvKernel { k: u32 },
+    /// `qkv` is `conv_dim` wide; `q | k | v` is `want`.
+    Widths { conv_dim: u32, want: u32 },
+    /// An operand's rows are not the output's, or the output's are not the bucket's (the GDN
+    /// scratch is sized at the bucket's).
+    RowsDisagree,
+    /// `rows · conv_dim` is above `i32::MAX`, the largest element count the kernels index.
+    TooManyElements { elements: u64 },
 }
 
 /// Which rule a row kernel's shape breaks.
@@ -423,6 +497,13 @@ pub enum GemmShapeRule {
     },
     /// `dim` is above `i32::MAX`, the largest dimension ThunderKittens' `gl` stores.
     AboveIntMax { dim: &'static str, value: u32 },
+    /// `n` is at most the narrow GEMM's largest, and `dim` (`n` or `k`) is zero or not a multiple
+    /// of its `multiple`.
+    NarrowOffVector {
+        dim: &'static str,
+        value: u32,
+        multiple: u32,
+    },
 }
 
 /// Why an operand cannot be bound.
@@ -450,6 +531,8 @@ pub enum OperandRefusal {
     NotAWeight {
         source: Option<(usize, SourceBinding)>,
     },
+    /// The step has more operands than its kernel binds.
+    Extra,
 }
 
 /// Why the arena cannot be laid out.
@@ -682,7 +765,67 @@ impl std::fmt::Display for CanonicalRefusal {
                 f,
                 "step {step} (GateSplit) has no second colour, so its gate has no buffer"
             ),
+            Self::GdnLayer { step } => write!(
+                f,
+                "step {step} (GatedDeltaNet) reads a weight bundle of no model layer; the GDN \
+                 state pool is per layer"
+            ),
+            Self::GdnFacts { step } => write!(
+                f,
+                "step {step} (GatedDeltaNet) needs the model's GDN geometry (key heads, key head \
+                 dim, conv kernel, eps), and the facts carry none"
+            ),
+            Self::GdnShape { step, rule } => write!(
+                f,
+                "step {step} (GatedDeltaNet) has a geometry the CUDA GDN kernels refuse: {rule}"
+            ),
+            Self::GdnPool { step } => write!(
+                f,
+                "step {step} (GatedDeltaNet) has another geometry than the canonical's first GDN \
+                 op, which the GDN scratch is sized by; one scratch and one state pool cannot hold \
+                 both"
+            ),
             Self::Arena(e) => write!(f, "the arena cannot be laid out: {e}"),
+        }
+    }
+}
+
+impl std::fmt::Display for GdnShapeRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use scratchy_target_cuda::step::{
+            GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE,
+        };
+        match self {
+            Self::HeadK { head_k } => write!(
+                f,
+                "head_k = {head_k} must be {GDN_HEAD_K}, the scan's register layout"
+            ),
+            Self::HeadV { head_v } => write!(
+                f,
+                "head_v = {head_v} must be a non-zero multiple of {GDN_HEAD_V_MULTIPLE} and at \
+                 most {GDN_HEAD_V_MAX}"
+            ),
+            Self::HeadsNotGrouped { nk, nv } => write!(
+                f,
+                "{nv} value heads over {nk} key heads: the value heads must be a whole number per \
+                 key head, and the value width a whole number of value heads"
+            ),
+            Self::ConvKernel { k } => write!(
+                f,
+                "conv kernel = {k} must be in {}..={}",
+                GDN_CONV_KERNEL_RANGE.0, GDN_CONV_KERNEL_RANGE.1
+            ),
+            Self::Widths { conv_dim, want } => write!(
+                f,
+                "qkv is {conv_dim} wide; q | k | v of this geometry is {want}"
+            ),
+            Self::RowsDisagree => write!(f, "an operand's rows are not the output's"),
+            Self::TooManyElements { elements } => write!(
+                f,
+                "rows·conv_dim = {elements} is above {}, the largest element count the kernels \
+                 index",
+                i32::MAX
+            ),
         }
     }
 }
@@ -846,6 +989,15 @@ impl std::fmt::Display for GemmShapeRule {
                 "{dim} = {value} is above {}, the largest dimension ThunderKittens' `gl` stores",
                 i32::MAX
             ),
+            Self::NarrowOffVector {
+                dim,
+                value,
+                multiple,
+            } => write!(
+                f,
+                "{dim} = {value} must be a non-zero multiple of {multiple}, the narrow bf16 \
+                 GEMM's 16-byte vector"
+            ),
         }
     }
 }
@@ -878,6 +1030,7 @@ impl std::fmt::Display for OperandRefusal {
                 f,
                 "it reads a computed value; a weight operand must be a model weight"
             ),
+            Self::Extra => write!(f, "it is past the operands the kernel binds"),
         }
     }
 }
@@ -962,9 +1115,16 @@ pub fn lower_canonical(
     facts: CudaModelFacts,
     at: CanonicalAt<'_>,
 ) -> Result<CudaCanonical, CanonicalRefusal> {
-    let plan = plan_canonical(l, facts, at)?;
+    lower_plan(plan_canonical(l, facts, at)?)
+}
+
+/// [`lower_canonical`] after its shared passes: the arena laid out from `plan`'s colouring, then
+/// every `Compute` of its tape lowered by its fold role. Public so a test can lower a plan whose
+/// colouring no CUDA canonical produces (the arena's `UnsizedColour`).
+pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     let arena = arena_layout(&plan);
     let kv = kv_cache(&plan);
+    let gdn_layers = gdn_layers(&plan);
     let cx = StepCx {
         graph: &plan.graph,
         bindings: &plan.lowered.bindings,
@@ -981,25 +1141,10 @@ pub fn lower_canonical(
             Err(e) => Err(*e),
         },
         kv_regions: arena.as_ref().ok().and_then(|a| a.kv),
+        gdn_layers: &gdn_layers,
+        gdn_regions: arena.as_ref().ok().and_then(|a| a.gdn),
     };
-    let computes: Vec<TapeStep<'_>> = (plan.tape.instrs().iter())
-        .filter_map(|i| match i {
-            Instr::Compute {
-                node,
-                writes,
-                inputs,
-                ..
-            } => Some((&plan.graph.nodes[node.index()], *writes, inputs)),
-            _ => None,
-        })
-        .enumerate()
-        .map(|(step, (node, writes, inputs))| TapeStep {
-            step,
-            node,
-            writes,
-            inputs,
-        })
-        .collect();
+    let computes: Vec<TapeStep<'_>> = tape_steps(&plan).collect();
     let steps = (computes.iter())
         .filter_map(|s| match plan.folds.role(s.writes) {
             StepRole::Kept => lower_step(&cx, s, &computes).transpose(),
@@ -1014,16 +1159,44 @@ pub fn lower_canonical(
         bytes: arena.bytes[c.index() as usize],
     };
     let (input, result) = (span(Colour::ZERO), span(plan.colouring.result()));
+    // A GDN step's bundle is a `[1, 1]` source in the IR; on the device it is the packed f32
+    // `gdn_bundle` of the step's geometry, which its extents read.
+    let bundles: BTreeMap<u32, u64> = (steps.iter())
+        .filter_map(|s| match s {
+            CudaStep::GatedDeltaNet(g) => Some((g.bundle.0, g.bundle_layout()?.bytes)),
+            _ => None,
+        })
+        .collect();
     let weight_bytes = (plan.lowered.bindings.iter().enumerate())
         .map(|(t, binding)| match binding {
-            SourceBinding::Weight { .. } => {
-                let shape = plan.graph.tensors[t];
-                elements_bytes(shape.rows, shape.cols).ok_or(ArenaRefusal::TooLarge)
-            }
+            SourceBinding::Weight { .. } => match bundles.get(&(t as u32)) {
+                Some(&bytes) => Ok(bytes),
+                None => {
+                    let shape = plan.graph.tensors[t];
+                    elements_bytes(shape.rows, shape.cols).ok_or(ArenaRefusal::TooLarge)
+                }
+            },
             _ => Ok(0),
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(CanonicalRefusal::Arena)?;
+    // The arena placed the GDN regions exactly when a step is a `GatedDeltaNet`, and every one
+    // lowered with the first's geometry.
+    let gdn = arena.gdn.and_then(|r| {
+        steps.iter().find_map(|s| match s {
+            CudaStep::GatedDeltaNet(g) => Some(CanonicalGdn {
+                layers: gdn_layers.clone(),
+                num_k_heads: g.num_k_heads,
+                num_v_heads: g.num_v_heads,
+                head_k: g.head_k,
+                head_v: g.head_v,
+                conv_kernel: g.conv_kernel,
+                sequence: r.sequence,
+                scratch: r.scratch,
+            }),
+            _ => None,
+        })
+    });
     Ok(CudaCanonical {
         bucket_m: arena.bucket_m,
         colour_bytes: arena.bytes,
@@ -1050,6 +1223,7 @@ pub fn lower_canonical(
             slot_mapping: r.slot_mapping,
             sequence: r.sequence,
         }),
+        gdn,
     })
 }
 
@@ -1128,6 +1302,7 @@ struct Arena {
     offsets: Vec<u64>,
     rotary: Option<ArenaSpan>,
     kv: Option<KvRegions>,
+    gdn: Option<GdnRegions>,
     total: u64,
 }
 
@@ -1144,6 +1319,66 @@ pub struct KvRegions {
 
 /// Bytes of one u32 entry of a KV region.
 const KV_ENTRY_BYTES: u64 = 4;
+
+/// Where the forward's GDN sequence data and the GDN steps' scratch live in the arena, after the
+/// KV regions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdnRegions {
+    /// `[slot, q_len, start, 0]` u32.
+    pub sequence: ArenaSpan,
+    /// `gdn_scratch(bucket_m, …)`.
+    pub scratch: ArenaSpan,
+}
+
+/// The canonical's `GatedDeltaNet` steps, in tape order.
+fn gdn_steps<'p>(plan: &'p CudaPlan) -> impl Iterator<Item = TapeStep<'p>> + 'p {
+    tape_steps(plan).filter(|s| matches!(s.node.op, SubOp::GatedDeltaNet))
+}
+
+/// Every `Compute` of the plan's tape, numbered by its position among them.
+fn tape_steps<'p>(plan: &'p CudaPlan) -> impl Iterator<Item = TapeStep<'p>> + 'p {
+    (plan.tape.instrs().iter())
+        .filter_map(|i| match i {
+            Instr::Compute {
+                node,
+                writes,
+                inputs,
+                ..
+            } => Some((&plan.graph.nodes[node.index()], *writes, inputs)),
+            _ => None,
+        })
+        .enumerate()
+        .map(|(step, (node, writes, inputs))| TapeStep {
+            step,
+            node,
+            writes,
+            inputs,
+        })
+}
+
+/// The model layers of the canonical's GDN weight bundles, ascending and once each: the GDN state
+/// pool's layers, which a GDN step's `layer` indexes. A bundle of no model layer is left out (its
+/// step is refused as `GdnLayer`).
+fn gdn_layers(plan: &CudaPlan) -> Vec<u32> {
+    let layers: std::collections::BTreeSet<u32> = gdn_steps(plan)
+        .filter_map(|s| gdn_bundle_layer(&plan.lowered.bindings, &s))
+        .collect();
+    layers.into_iter().collect()
+}
+
+/// The GDN scratch's bytes at the bucket's rows, sized by the canonical's first `GatedDeltaNet`
+/// (`qkv`'s, `z`'s and `a`'s widths), or `None` when it has none. A later GDN op of another
+/// geometry is refused by its lowering (`GdnPool`).
+fn gdn_scratch_bytes(plan: &CudaPlan, rows: u32) -> Option<Result<u64, ArenaRefusal>> {
+    let first = gdn_steps(plan).next()?;
+    let cols = |k: usize| (first.node.inputs.get(k)).map_or(0, |r| plan.graph.shape(r.tensor).cols);
+    let (conv_dim, value_dim, nv) = (cols(0), cols(1), cols(2));
+    Some(
+        gdn_scratch(rows, conv_dim, nv, value_dim)
+            .map(|s| s.bytes)
+            .ok_or(ArenaRefusal::TooLarge),
+    )
+}
 
 /// The shape of the one source bound to the embedded hidden: colour 0, the bucket's tokens.
 fn embedded_hidden(plan: &CudaPlan) -> Result<TensorShape, ArenaRefusal> {
@@ -1162,7 +1397,9 @@ fn embedded_hidden(plan: &CudaPlan) -> Result<TensorShape, ArenaRefusal> {
 /// buffer, so it is sized from the source bound to it. When the canonical binds the global rotary
 /// `cos`, the rotary table (`[bucket_m, rot_dim]` bf16) follows the colours, aligned the same way;
 /// when it binds a `PrefixK`, the block table (`CUDA_MAX_BLOCKS_PER_SEQ` u32), the slot mapping
-/// (`bucket_m` u32) and the sequence (2 u32) follow, in that order, each aligned the same way.
+/// (`bucket_m` u32) and the sequence (2 u32) follow, in that order, each aligned the same way;
+/// when a step is a `GatedDeltaNet`, the GDN sequence (4 u32) and the GDN scratch
+/// (`gdn_scratch(bucket_m, …)`) follow, aligned the same way.
 fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
     let hidden = embedded_hidden(plan)?;
     // Every colour the tape's steps were given, by index: a slot's colour, and a two-output
@@ -1229,12 +1466,28 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
             })
         })
         .transpose()?;
+    let gdn = gdn_scratch_bytes(plan, hidden.rows)
+        .map(|scratch| {
+            let scratch = scratch?;
+            Ok(GdnRegions {
+                sequence: ArenaSpan {
+                    offset: ArenaOffset(place(GDN_SEQUENCE_BYTES)?),
+                    bytes: GDN_SEQUENCE_BYTES,
+                },
+                scratch: ArenaSpan {
+                    offset: ArenaOffset(place(scratch)?),
+                    bytes: scratch,
+                },
+            })
+        })
+        .transpose()?;
     Ok(Arena {
         bucket_m: hidden.rows,
         bytes,
         offsets,
         rotary,
         kv,
+        gdn,
         total,
     })
 }

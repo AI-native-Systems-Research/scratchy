@@ -15,8 +15,13 @@ use crate::tape::{ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, WeightIx};
 /// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CudaStep {
-    /// The bf16 GEMM, lowered from `SubOp::MatmulTile` (`kernels/gemm_bf16.cu`).
+    /// The bf16 GEMM, lowered from `SubOp::MatmulTile` when `n` is a multiple of its tile's
+    /// (`kernels/gemm_bf16.cu`).
     Gemm(GemmBf16),
+    /// The narrow bf16 GEMM, lowered from `SubOp::MatmulTile` when `n` is at most
+    /// [`GEMM_NARROW_BF16_MAX_N`] (`kernels/gemm_narrow_bf16.cu`): the operands of
+    /// [`Self::Gemm`], another kernel. The lowering's `MatmulTile` arm chooses it at expansion.
+    GemmNarrow(GemmBf16),
     /// The bf16 RMSNorm, lowered from `SubOp::RmsNorm` (`kernels/rms_norm_bf16.cu`).
     RmsNorm(RmsNormBf16),
     /// The bf16 elementwise add, lowered from `Elementwise(Add)` (`kernels/add_bf16.cu`).
@@ -38,6 +43,10 @@ pub enum CudaStep {
     /// Causal grouped-query attention of a prefill bucket over the paged KV cache, lowered from
     /// `SubOp::AttnDecode` when the bucket has more than one row (`kernels/attn_prefill_bf16.cu`).
     AttnPrefill(AttnPrefillBf16),
+    /// One prefill chunk of a Gated-DeltaNet linear-attention layer, lowered from
+    /// `SubOp::GatedDeltaNet`: four stream-ordered launches, `kernels/gdn_conv1d.cu`,
+    /// `kernels/gdn_gating.cu`, `kernels/gdn_scan.cu` then `kernels/gdn_rms_norm_gated.cu`.
+    GatedDeltaNet(GatedDeltaNetBf16),
 }
 
 /// The bf16 GEMM's tile `(m, n, k)`: every `m`, `n` and `k` it takes is a non-zero multiple of
@@ -59,6 +68,13 @@ pub struct GemmBf16 {
     pub n: u32,
     pub k: u32,
 }
+
+/// The narrow GEMM's largest `n`: each lane of its warp keeps `n` f32 partial sums in registers
+/// (`kernels/gemm_narrow_bf16.cu`).
+pub const GEMM_NARROW_BF16_MAX_N: u32 = 64;
+/// The narrow GEMM's `n` and `k` are non-zero multiples of this: `k` is read in 16-byte vectors of
+/// 8 bf16, and `n` keeps every row of `C` 16-byte aligned.
+pub const GEMM_NARROW_BF16_MULTIPLE: u32 = 8;
 
 /// The RMSNorm's `cols` is a non-zero multiple of this: each thread loads and stores 16-byte
 /// vectors of 8 bf16 (`kernels/rms_norm_bf16.cu`). `rows` is non-zero and `rows · cols` at most
@@ -240,6 +256,240 @@ impl AttnPrefillBf16 {
     }
 }
 
+/// The one key-head dim the GDN scan takes: each value row of `S` is 4 lanes of 32 f32 registers
+/// (`kernels/gdn_scan.cu`).
+pub const GDN_HEAD_K: u32 = 128;
+/// The GDN value-head dim is a non-zero multiple of this, the value rows of one scan CTA
+/// (`kernels/gdn_scan.cu`), and at most [`GDN_HEAD_V_MAX`].
+pub const GDN_HEAD_V_MULTIPLE: u32 = 32;
+/// The largest GDN value-head dim: the gated norm's one warp per row holds at most 8 lanes per
+/// thread (`kernels/gdn_rms_norm_gated.cu`).
+pub const GDN_HEAD_V_MAX: u32 = 256;
+/// The causal conv's kernel width is in this inclusive range: its window lives in registers
+/// (`kernels/gdn_conv1d.cu`; metal's `GDN_CONV_KMAX` is 8).
+pub const GDN_CONV_KERNEL_RANGE: (u32, u32) = (2, 8);
+/// The tokens one conv thread walks. At least `conv_kernel − 1`, so only block 0 reads or writes a
+/// slot's conv ring.
+pub const GDN_CONV_TOKEN_BLOCK: u32 = 64;
+/// The tokens the scan stages in shared memory at once.
+pub const GDN_SCAN_TOKEN_BLOCK: u32 = 32;
+
+/// Bytes of one f32: the GDN scratch, bundle and state are f32.
+const F32_BYTES: u64 = 4;
+/// Every region of the GDN scratch and bundle starts at a multiple of this.
+const GDN_ALIGN: u64 = 256;
+
+/// The causal conv's channels, `2 · num_k_heads · head_k + num_v_heads · head_v` (`q | k | v`), or
+/// `None` on overflow.
+pub const fn gdn_conv_dim(
+    num_k_heads: u32,
+    head_k: u32,
+    num_v_heads: u32,
+    head_v: u32,
+) -> Option<u32> {
+    let (Some(key), Some(value)) = (
+        num_k_heads.checked_mul(head_k),
+        num_v_heads.checked_mul(head_v),
+    ) else {
+        return None;
+    };
+    let Some(qk) = key.checked_mul(2) else {
+        return None;
+    };
+    qk.checked_add(value)
+}
+
+/// The f32 scratch a GDN step's four launches pass their intermediates through: the byte offsets
+/// of `conv_out [rows, conv_dim]`, `g [rows, nv]`, `beta [rows, nv]` and `o [rows, value_dim]`,
+/// each a multiple of 256, and the total. Metal's `GdnScratchLayout`: the same regions in the same
+/// order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdnScratch {
+    pub conv_out: u64,
+    pub g: u64,
+    pub beta: u64,
+    pub o: u64,
+    pub bytes: u64,
+}
+
+/// [`GdnScratch`] for `rows` tokens, or `None` when a byte count overflows `u64`.
+pub const fn gdn_scratch(rows: u32, conv_dim: u32, nv: u32, value_dim: u32) -> Option<GdnScratch> {
+    let rows = rows as u64;
+    let Some(g) = f32_region(0, rows * conv_dim as u64) else {
+        return None;
+    };
+    let Some(beta) = f32_region(g, rows * nv as u64) else {
+        return None;
+    };
+    let Some(o) = f32_region(beta, rows * nv as u64) else {
+        return None;
+    };
+    let Some(bytes) = f32_region(o, rows * value_dim as u64) else {
+        return None;
+    };
+    Some(GdnScratch {
+        conv_out: 0,
+        g,
+        beta,
+        o,
+        bytes,
+    })
+}
+
+/// A GDN layer's packed weight bundle, all f32: the byte offsets of `conv1d [conv_dim, K]` (row
+/// `c` channel `c`'s taps, oldest first, as the checkpoint's `[conv_dim, 1, K]`), `a_log [nv]`,
+/// `dt_bias [nv]` and `norm [head_v]` (the gated norm's plain gain), each a multiple of 256, and
+/// the total. f32 throughout, so no on-disk dtype reaches a kernel: bf16 to f32 is exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdnBundle {
+    pub conv1d: u64,
+    pub a_log: u64,
+    pub dt_bias: u64,
+    pub norm: u64,
+    pub bytes: u64,
+}
+
+/// [`GdnBundle`] for one layer's geometry, or `None` when a byte count overflows `u64`.
+pub const fn gdn_bundle(
+    conv_dim: u32,
+    conv_kernel: u32,
+    nv: u32,
+    head_v: u32,
+) -> Option<GdnBundle> {
+    let Some(a_log) = f32_region(0, conv_dim as u64 * conv_kernel as u64) else {
+        return None;
+    };
+    let Some(dt_bias) = f32_region(a_log, nv as u64) else {
+        return None;
+    };
+    let Some(norm) = f32_region(dt_bias, nv as u64) else {
+        return None;
+    };
+    let Some(bytes) = f32_region(norm, head_v as u64) else {
+        return None;
+    };
+    Some(GdnBundle {
+        conv1d: 0,
+        a_log,
+        dt_bias,
+        norm,
+        bytes,
+    })
+}
+
+/// The 256-aligned end of `elems` f32 placed at `at`, or `None` on overflow.
+const fn f32_region(at: u64, elems: u64) -> Option<u64> {
+    let Some(bytes) = elems.checked_mul(F32_BYTES) else {
+        return None;
+    };
+    let Some(end) = at.checked_add(bytes) else {
+        return None;
+    };
+    end.checked_next_multiple_of(GDN_ALIGN)
+}
+
+/// The bytes of the GDN sequence region every GDN launch reads: `[slot, q_len, start, 0]` u32.
+pub const GDN_SEQUENCE_BYTES: u64 = 16;
+
+/// The scan's query scale, `head_k^-½`, in f64 by Newton's iteration (a `const fn` has no `sqrt`)
+/// and rounded once to f32: exactly `2^-3.5` rounded for the one `head_k` the scan takes, 128.
+pub const fn gdn_scale(head_k: u32) -> f32 {
+    if head_k == 0 {
+        return f32::INFINITY;
+    }
+    let x = head_k as f64;
+    // y ← y·(3 − x·y²)/2 converges to x^-½ from any start in (0, √(3/x)); 1/x is in it for x ≥ 1.
+    let mut y = 1.0 / x;
+    let mut i = 0;
+    while i < 64 {
+        y = y * (3.0 - x * y * y) / 2.0;
+        i += 1;
+    }
+    y as f32
+}
+
+/// One prefill chunk of a Gated-DeltaNet layer: `1 ≤ q_len ≤ rows` real tokens of one sequence.
+///
+/// Four launches, in order on the stream, each reading `[slot, q_len, start, 0]` u32 from the
+/// tape's `sequence` region (`start` is 1 on a sequence's first chunk, 0 to continue from its
+/// slot: `scratchy_layers::gdn_state::GdnStep::encode`'s bits 0-7):
+///
+/// 1. the causal depthwise conv of `qkv [rows, conv_dim]` after the slot's conv ring (zero, never
+///    read, when fresh), then SiLU, into the scratch's f32 `conv_out`; the ring updated;
+/// 2. the gating, `g = −exp(a_log)·softplus(a + dt_bias)` and `β = sigmoid(b)`, into `g`, `beta`;
+/// 3. the recurrent gated delta-rule scan from the slot's f32 state `S` (zero, never read, when
+///    fresh), into the f32 `o`; `S` written back once;
+/// 4. the gated RMSNorm `o / rms(o) · norm · SiLU(z)` per value head, into `out [rows, value_dim]`
+///    bf16; rows `q_len..rows` written `+0.0`.
+///
+/// `bundle` is the packed f32 weight bundle ([`gdn_bundle`]), `scratch` the tape's GDN scratch
+/// ([`gdn_scratch`] at `rows`), `layer` an index into [`crate::tape::GdnTape::layers`]. Value head
+/// `h` reads key head `h / (num_v_heads / num_k_heads)`. No launch reads a padding row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GatedDeltaNetBf16 {
+    /// bf16 `[rows, conv_dim]`: `q | k | v`.
+    pub qkv: ArenaOffset,
+    /// bf16 `[rows, value_dim]`: the gated norm's gate.
+    pub z: ArenaOffset,
+    /// bf16 `[rows, num_v_heads]`: the decay's input.
+    pub a: ArenaOffset,
+    /// bf16 `[rows, num_v_heads]`: the write strength's input.
+    pub b: ArenaOffset,
+    pub bundle: WeightIx,
+    /// bf16 `[rows, value_dim]`.
+    pub out: ArenaOffset,
+    pub scratch: ArenaOffset,
+    pub sequence: ArenaOffset,
+    pub layer: u32,
+    pub rows: u32,
+    pub num_k_heads: u32,
+    pub num_v_heads: u32,
+    pub head_k: u32,
+    pub head_v: u32,
+    pub conv_kernel: u32,
+    /// The gated norm's `eps` (`rms_norm_eps`) as its bits (`f32::to_bits`), so the step is `Eq`;
+    /// [`Self::eps`] reads it back.
+    pub eps_bits: u32,
+}
+
+impl GatedDeltaNetBf16 {
+    /// The gated norm's `eps`.
+    pub const fn eps(&self) -> f32 {
+        f32::from_bits(self.eps_bits)
+    }
+
+    /// The query scale, `head_k^-½`.
+    pub const fn scale(&self) -> f32 {
+        gdn_scale(self.head_k)
+    }
+
+    /// The conv's channels, or `None` on overflow.
+    pub const fn conv_dim(&self) -> Option<u32> {
+        gdn_conv_dim(self.num_k_heads, self.head_k, self.num_v_heads, self.head_v)
+    }
+
+    /// The value width, `num_v_heads · head_v`, or `None` on overflow.
+    pub const fn value_dim(&self) -> Option<u32> {
+        self.num_v_heads.checked_mul(self.head_v)
+    }
+
+    /// The scratch's regions at this step's rows, or `None` on overflow.
+    pub const fn scratch_layout(&self) -> Option<GdnScratch> {
+        let (Some(conv_dim), Some(value_dim)) = (self.conv_dim(), self.value_dim()) else {
+            return None;
+        };
+        gdn_scratch(self.rows, conv_dim, self.num_v_heads, value_dim)
+    }
+
+    /// The bundle's regions for this step's geometry, or `None` on overflow.
+    pub const fn bundle_layout(&self) -> Option<GdnBundle> {
+        let Some(conv_dim) = self.conv_dim() else {
+            return None;
+        };
+        gdn_bundle(conv_dim, self.conv_kernel, self.num_v_heads, self.head_v)
+    }
+}
+
 /// How a step uses a layer's paged KV cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvUse {
@@ -257,8 +507,9 @@ pub struct WeightRead {
 }
 
 /// What one step touches: the arena spans it reads, in operand order, the span it writes, a
-/// second span it writes (a two-output kernel's), the weight it reads, and the KV-cache layer it
-/// writes or reads (an index into [`crate::tape::KvTape::layers`]).
+/// second span it writes (a two-output kernel's), the weight it reads, the KV-cache layer it
+/// writes or reads (an index into [`crate::tape::KvTape::layers`]), and the GDN state layer it
+/// reads and writes (an index into [`crate::tape::GdnTape::layers`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepExtents {
     pub reads: [Option<ArenaSpan>; 4],
@@ -266,6 +517,7 @@ pub struct StepExtents {
     pub second_write: Option<ArenaSpan>,
     pub weight: Option<WeightRead>,
     pub kv: Option<(u32, KvUse)>,
+    pub gdn: Option<u32>,
 }
 
 impl CudaStep {
@@ -274,7 +526,8 @@ impl CudaStep {
     /// `CudaTape::validate` checks a tape against it.
     pub const fn extents(&self) -> Option<StepExtents> {
         match *self {
-            Self::Gemm(GemmBf16 { a, b, c, m, n, k }) => {
+            Self::Gemm(GemmBf16 { a, b, c, m, n, k })
+            | Self::GemmNarrow(GemmBf16 { a, b, c, m, n, k }) => {
                 let (Some(ab), Some(bb), Some(cb)) =
                     (bf16_bytes(m, k), bf16_bytes(n, k), bf16_bytes(m, n))
                 else {
@@ -286,6 +539,7 @@ impl CudaStep {
                     second_write: None,
                     weight: Some(WeightRead { ix: b, bytes: bb }),
                     kv: None,
+                    gdn: None,
                 })
             }
             Self::RmsNorm(RmsNormBf16 {
@@ -308,6 +562,7 @@ impl CudaStep {
                         bytes: gb,
                     }),
                     kv: None,
+                    gdn: None,
                 })
             }
             Self::Add(AddBf16 {
@@ -340,6 +595,7 @@ impl CudaStep {
                     second_write: None,
                     weight: None,
                     kv: None,
+                    gdn: None,
                 })
             }
             Self::Rope(RopeBf16 {
@@ -361,6 +617,7 @@ impl CudaStep {
                     second_write: None,
                     weight: None,
                     kv: None,
+                    gdn: None,
                 })
             }
             Self::GateSplit(GateSplitBf16 {
@@ -383,6 +640,7 @@ impl CudaStep {
                     second_write: Some(span(gate, hb)),
                     weight: None,
                     kv: None,
+                    gdn: None,
                 })
             }
             Self::RopeAppend(RopeAppendBf16 {
@@ -412,6 +670,7 @@ impl CudaStep {
                     second_write: None,
                     weight: None,
                     kv: Some((layer, KvUse::Write)),
+                    gdn: None,
                 })
             }
             Self::AttnPrefill(AttnPrefillBf16 {
@@ -442,6 +701,52 @@ impl CudaStep {
                     second_write: None,
                     weight: None,
                     kv: Some((layer, KvUse::Read)),
+                    gdn: None,
+                })
+            }
+            Self::GatedDeltaNet(
+                g @ GatedDeltaNetBf16 {
+                    qkv,
+                    z,
+                    a,
+                    b,
+                    bundle,
+                    out,
+                    scratch,
+                    layer,
+                    rows,
+                    num_v_heads,
+                    ..
+                },
+            ) => {
+                let (Some(conv_dim), Some(value_dim)) = (g.conv_dim(), g.value_dim()) else {
+                    return None;
+                };
+                let (Some(qb), Some(vb), Some(hb)) = (
+                    bf16_bytes(rows, conv_dim),
+                    bf16_bytes(rows, value_dim),
+                    bf16_bytes(rows, num_v_heads),
+                ) else {
+                    return None;
+                };
+                let (Some(sc), Some(bu)) = (g.scratch_layout(), g.bundle_layout()) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [
+                        Some(span(qkv, qb)),
+                        Some(span(z, vb)),
+                        Some(span(a, hb)),
+                        Some(span(b, hb)),
+                    ],
+                    writes: span(out, vb),
+                    second_write: Some(span(scratch, sc.bytes)),
+                    weight: Some(WeightRead {
+                        ix: bundle,
+                        bytes: bu.bytes,
+                    }),
+                    kv: None,
+                    gdn: Some(layer),
                 })
             }
         }

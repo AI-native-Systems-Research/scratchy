@@ -8,6 +8,7 @@ mod common {
     pub mod attn_gate;
     pub mod attn_layer;
     pub mod chains;
+    pub mod gdn_layer;
     pub mod mlp;
 }
 
@@ -18,14 +19,16 @@ use common::attn_layer::{
     ATTN_LAYER_M128, ATTN_LAYER_M256, LAYER, PREFIX_CAPACITY, attn_layer, attn_layer_input,
 };
 use common::chains::{
-    QWEN3_5_FACTS, THREE_GEMM_M256, TWO_GEMM_M128, TWO_GEMM_M256, assert_tape_is_lowered,
-    chain_input, three_gemm, two_gemm, with_hidden,
+    QWEN3_5_FACTS, QWEN3_5_GDN_FACTS, THREE_GEMM_M256, TWO_GEMM_M128, TWO_GEMM_M256,
+    assert_tape_is_lowered, assert_tape_is_lowered_with, chain_input, three_gemm, two_gemm,
+    with_hidden,
 };
+use common::gdn_layer::{BUNDLE_BYTES, GDN_LAYER_M128, GDN_LAYER_M256, gdn_layer};
 use common::mlp::{EPS, H, I, MLP_M128, MLP_M256, mlp};
 use scratchy_subtile::fixtures::{
     front_end_lowered, gemm_m1_only_input, one_layer_input, silu_mul_only_input,
 };
-use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
+use scratchy_subtile::handoff::{LoweredDecode, SourceBinding, UnrollIndex};
 use scratchy_subtile::lower::{
     AffineInt4, ArchOp, GemmWeight, GemmWeightKind, InputRef, LoweringInput, OpDesc,
 };
@@ -36,9 +39,9 @@ use scratchy_subtile::subtile_ir::{
 use scratchy_target_cuda::step::{CudaStep, GemmBf16};
 use scratchy_target_cuda::tape::{ArenaOffset, CUDA_ARENA_ALIGN, CudaTape};
 use scratchy_target_cuda_compiler::canonical::{
-    ArenaRefusal, AttnShapeRule, CanonicalAt, CanonicalRefusal, CudaModelFacts, GateShapeRule,
-    GemmShapeRule, KvCacheRefusal, OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule,
-    ViewRefusal, lower_canonical,
+    ArenaRefusal, AttnShapeRule, CanonicalAt, CanonicalRefusal, CudaGdnFacts, CudaModelFacts,
+    GateShapeRule, GdnShapeRule, GemmShapeRule, KvCacheRefusal, OperandRefusal, ProducerRefusal,
+    RopeShapeRule, RowShapeRule, ViewRefusal, lower_canonical,
 };
 
 fn lower_with(
@@ -289,6 +292,8 @@ fn every_static_validates() {
         ("ATTN_GATE_M256", &ATTN_GATE_M256),
         ("ATTN_LAYER_M128", &ATTN_LAYER_M128),
         ("ATTN_LAYER_M256", &ATTN_LAYER_M256),
+        ("GDN_LAYER_M128", &GDN_LAYER_M128),
+        ("GDN_LAYER_M256", &GDN_LAYER_M256),
     ] {
         assert_eq!(tape.validate(), Ok(()), "{name}");
     }
@@ -1562,4 +1567,450 @@ fn an_attention_of_another_kv_geometry_is_refused() {
             ..
         }
     ));
+}
+
+// ── The qwen3.5-0.8b linear-attention (GDN) layer ──────────────────
+
+/// The refusal of `l` under the GDN facts, its message naming every value in `names`.
+fn gdn_refused(l: &LoweredDecode, names: &[&str]) -> CanonicalRefusal {
+    refused_with(l, QWEN3_5_GDN_FACTS, names)
+}
+
+/// [`QWEN3_5_GDN_FACTS`] with the GDN facts `f` changes.
+fn gdn_facts(f: impl FnOnce(&mut CudaGdnFacts)) -> CudaModelFacts {
+    let mut facts = QWEN3_5_GDN_FACTS;
+    if let Some(g) = facts.gdn.as_mut() {
+        f(g);
+    }
+    facts
+}
+
+#[test]
+fn the_gdn_layer_statics_are_what_their_canonicals_lower_to() {
+    for (name, tape, m) in [
+        ("gdn_layer(128)", &GDN_LAYER_M128, 128),
+        ("gdn_layer(256)", &GDN_LAYER_M256, 256),
+    ] {
+        assert_tape_is_lowered_with(name, tape, &gdn_layer(m), QWEN3_5_GDN_FACTS);
+    }
+}
+
+/// The issue's predicted layout, read back from the lowering: 8 steps (the `a` and `b`
+/// projections on the narrow GEMM), the arena totals, the bundle's 99,328 bytes, the GDN
+/// sequence and scratch after the colours, and the scratch's four regions.
+#[test]
+fn the_gdn_layer_numbers() {
+    use scratchy_target_cuda::step::gdn_scratch;
+    for (tape, m, total, seq, scratch) in [
+        (&GDN_LAYER_M128, 128u32, 7627008, 3416064, 3416320),
+        (&GDN_LAYER_M256, 256, 15253760, 6832128, 6832384),
+    ] {
+        let c = lower_with(&gdn_layer(m), QWEN3_5_GDN_FACTS).expect("the GDN layer lowers");
+        assert_eq!(c.total_bytes, total, "m = {m}");
+        assert_eq!(c.weight_bytes[6], BUNDLE_BYTES, "m = {m}: the bundle");
+        let names: Vec<_> = (c.steps.iter())
+            .map(|s| match s {
+                CudaStep::RmsNorm(_) => "RmsNorm",
+                CudaStep::Gemm(_) => "Gemm",
+                CudaStep::GemmNarrow(_) => "GemmNarrow",
+                CudaStep::GatedDeltaNet(_) => "GatedDeltaNet",
+                CudaStep::Add(_) => "Add",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "RmsNorm",
+                "Gemm",
+                "Gemm",
+                "GemmNarrow",
+                "GemmNarrow",
+                "GatedDeltaNet",
+                "Gemm",
+                "Add"
+            ],
+            "m = {m}"
+        );
+        let gdn = tape.gdn.expect("the GDN layer has GDN state");
+        assert_eq!((gdn.sequence.offset.0, gdn.sequence.bytes), (seq, 16));
+        assert_eq!(gdn.scratch.offset.0, scratch);
+        let m64 = u64::from(m);
+        let s = gdn_scratch(m, 6144, 16, 2048).expect("the scratch fits u64");
+        assert_eq!(
+            (s.conv_out, s.g, s.beta, s.o, s.bytes),
+            (
+                0,
+                m64 * 24576,
+                m64 * 24576 + m64 * 64,
+                m64 * 24576 + m64 * 128,
+                m64 * 24576 + m64 * 128 + m64 * 8192
+            ),
+            "m = {m}"
+        );
+        assert_eq!(gdn.scratch.bytes, s.bytes);
+        // The colours end where the sequence starts; the scratch is in the arena's last bytes.
+        let colours_end = tape.arena.colour_offsets[7] + tape.arena.colour_bytes[7];
+        assert_eq!(colours_end, seq);
+        assert_eq!(scratch + s.bytes, total);
+    }
+}
+
+/// Only the GDN layer's tapes have GDN state.
+#[test]
+fn only_the_gdn_layer_has_gdn_state() {
+    for tape in [
+        &TWO_GEMM_M128,
+        &TWO_GEMM_M256,
+        &THREE_GEMM_M256,
+        &MLP_M128,
+        &MLP_M256,
+        &ATTN_GATE_M128,
+        &ATTN_GATE_M256,
+        &ATTN_LAYER_M128,
+        &ATTN_LAYER_M256,
+    ] {
+        assert_eq!(tape.gdn, None);
+    }
+}
+
+/// A narrow GEMM's `n` or `k` off its 8-wide vector, and an `n` between the narrow GEMM's 64 and
+/// the tile's 256, which neither kernel takes.
+#[test]
+fn a_narrow_gemm_off_the_vector_is_refused() {
+    let e = refused(
+        &with_hidden(chain_input(256, 1024, &[12])),
+        &["n = 12", "multiple of 8", "narrow"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GemmShape {
+            step: 0,
+            n: 12,
+            rule: GemmShapeRule::NarrowOffVector {
+                dim: "n",
+                value: 12,
+                multiple: 8
+            },
+            ..
+        }
+    ));
+    let e = refused(
+        &with_hidden(chain_input(256, 100, &[16])),
+        &["k = 100", "multiple of 8"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GemmShape {
+            step: 0,
+            k: 100,
+            rule: GemmShapeRule::NarrowOffVector { dim: "k", .. },
+            ..
+        }
+    ));
+    let e = refused(
+        &with_hidden(chain_input(256, 1024, &[128])),
+        &["n = 128", "multiple of 256"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GemmShape {
+            n: 128,
+            rule: GemmShapeRule::OffTile { dim: "n", .. },
+            ..
+        }
+    ));
+}
+
+/// The narrow GEMM's rows are not tiled: any `m` above 1 lowers to it, and `m = 1` is still the
+/// decode GEMV.
+#[test]
+fn a_narrow_gemm_takes_any_rows_but_one() {
+    let c = lower_with(&with_hidden(chain_input(37, 8, &[64])), QWEN3_5_FACTS)
+        .expect("a 37-row narrow GEMM lowers");
+    assert!(matches!(
+        c.steps.as_slice(),
+        [CudaStep::GemmNarrow(GemmBf16 {
+            m: 37,
+            n: 64,
+            k: 8,
+            ..
+        })]
+    ));
+    let e = refused(&with_hidden(chain_input(1, 1024, &[16])), &["m=1"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GemmShape {
+            rule: GemmShapeRule::Decode,
+            ..
+        }
+    ));
+}
+
+/// A GEMM with an operand after its weight (the old `[act, wt, ..]` match took it silently). The
+/// shared graph keeps a third `MatmulTile` input only for an fp8 weight's per-channel scale, so
+/// that is the canonical: the operand count is refused before the weight's kind.
+#[test]
+fn a_gemm_with_an_extra_operand_is_refused() {
+    let mut l = two_gemm(256);
+    l.input.sources.push(shape(1, 1024));
+    l.bindings
+        .push(SourceBinding::WeightScale { id: 1, index: None });
+    l.input.ops[0].op = SubOp::MatmulTile {
+        n: 1024,
+        weight: GemmWeight::Fp8Dynamic,
+    };
+    l.input.ops[0].inputs.push(InputRef::Ext(3));
+    let e = refused(&l, &["MatmulTile", "operand 2", "past the operands"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::Operand {
+            step: 0,
+            op: "MatmulTile",
+            operand: 2,
+            why: OperandRefusal::Extra,
+        }
+    ));
+}
+
+/// The GDN op on facts with no GDN geometry.
+#[test]
+fn a_gdn_op_with_no_gdn_facts_is_refused() {
+    let e = refused(&gdn_layer(256), &["GatedDeltaNet", "GDN geometry"]);
+    assert!(matches!(e, CanonicalRefusal::GdnFacts { step: 5 }));
+}
+
+/// A bundle bound to a weight of no layer: the state pool is per layer.
+#[test]
+fn a_gdn_bundle_of_no_layer_is_refused() {
+    let mut l = gdn_layer(256);
+    l.bindings[6] = SourceBinding::Weight { id: 6, index: None };
+    let e = gdn_refused(&l, &["GatedDeltaNet", "no model layer"]);
+    assert!(matches!(e, CanonicalRefusal::GdnLayer { step: 5 }));
+}
+
+/// A bundle that is not a weight at all.
+#[test]
+fn a_gdn_bundle_that_is_not_a_weight_is_refused() {
+    let mut l = gdn_layer(256);
+    l.bindings[6] = SourceBinding::Cos { local: false };
+    let e = gdn_refused(&l, &["GatedDeltaNet", "operand 4"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::Operand {
+            step: 5,
+            operand: 4,
+            why: OperandRefusal::NotAWeight { .. },
+            ..
+        }
+    ));
+}
+
+/// Every geometry rule of the GDN kernels, one at a time.
+#[test]
+fn every_gdn_shape_rule_is_refused() {
+    let l = gdn_layer(256);
+    let case = |facts: CudaModelFacts, names: &[&str]| match refused_with(&l, facts, names) {
+        CanonicalRefusal::GdnShape { step: 5, rule } => rule,
+        e => panic!("expected a GdnShape refusal at step 5, got: {e}"),
+    };
+    assert_eq!(
+        case(gdn_facts(|g| g.head_k = 64), &["head_k = 64", "128"]),
+        GdnShapeRule::HeadK { head_k: 64 }
+    );
+    assert_eq!(
+        case(gdn_facts(|g| g.num_k_heads = 3), &["16 value heads over 3"]),
+        GdnShapeRule::HeadsNotGrouped { nk: 3, nv: 16 }
+    );
+    assert_eq!(
+        case(
+            gdn_facts(|g| g.conv_kernel = 9),
+            &["conv kernel = 9", "2..=8"]
+        ),
+        GdnShapeRule::ConvKernel { k: 9 }
+    );
+    assert_eq!(
+        case(gdn_facts(|g| g.conv_kernel = 1), &["conv kernel = 1"]),
+        GdnShapeRule::ConvKernel { k: 1 }
+    );
+    // 8 key heads of 128 with 2048 value lanes: q | k | v would be 4096, and qkv is 6144.
+    assert_eq!(
+        case(gdn_facts(|g| g.num_k_heads = 8), &["qkv is 6144", "4096"]),
+        GdnShapeRule::Widths {
+            conv_dim: 6144,
+            want: 4096
+        }
+    );
+}
+
+/// A GDN layer of `nv` value heads over `value_dim` lanes (`a`, `b` `[m, nv]`, `z` and `core`
+/// `[m, value_dim]`), its `qkv` `[m, conv_dim]`.
+fn gdn_layer_of(m: u32, conv_dim: u32, value_dim: u32, nv: u32) -> LoweredDecode {
+    let mut l = gdn_layer(m);
+    l.input.sources[2] = shape(H, conv_dim);
+    l.input.sources[3] = shape(H, value_dim);
+    l.input.sources[4] = shape(H, nv);
+    l.input.sources[5] = shape(H, nv);
+    l.input.sources[7] = shape(value_dim, H);
+    let matmul = |n| SubOp::MatmulTile {
+        n,
+        weight: GemmWeight::Dense,
+    };
+    l.input.ops[1].op = matmul(conv_dim);
+    l.input.ops[2].op = matmul(value_dim);
+    l.input.ops[3].op = matmul(nv);
+    l.input.ops[4].op = matmul(nv);
+    l
+}
+
+/// A value head dim off the scan's 32-row slice, or above the norm's 256 lanes; a value width
+/// that is not a whole number of value heads. Every projection's width is one a GEMM takes, so
+/// the GDN op is the first refused.
+#[test]
+fn a_gdn_value_head_off_the_rules_is_refused() {
+    // 32 heads of 40 lanes: value 1280, qkv 2·2048 + 1280 = 5376 (both multiples of 256).
+    let e = gdn_refused(&gdn_layer_of(256, 5376, 1280, 32), &["head_v = 40"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GdnShape {
+            step: 5,
+            rule: GdnShapeRule::HeadV { head_v: 40 }
+        }
+    ));
+    // 16 heads of 512 lanes.
+    let e = gdn_refused(&gdn_layer_of(256, 12288, 8192, 16), &["head_v = 512"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GdnShape {
+            rule: GdnShapeRule::HeadV { head_v: 512 },
+            ..
+        }
+    ));
+    // 2048 value lanes over 48 heads (three per key head): not a whole number per head.
+    let e = gdn_refused(
+        &gdn_layer_of(256, 6144, 2048, 48),
+        &["48 value heads over 16 key heads"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GdnShape {
+            rule: GdnShapeRule::HeadsNotGrouped { nk: 16, nv: 48 },
+            ..
+        }
+    ));
+}
+
+/// A GDN op whose `z` has other rows than the output: `z` is a per-head view `[2m, 2048]` of a
+/// `[m, 4096]` projection, so every step before the GDN op lowers.
+#[test]
+fn a_gdn_op_whose_rows_disagree_is_refused() {
+    use InputRef::{Ext, Op};
+    let m = 256;
+    let matmul = |n| SubOp::MatmulTile {
+        n,
+        weight: GemmWeight::Dense,
+    };
+    let op = |op, inputs| OpDesc { op, m, inputs };
+    let mut l = with_hidden(LoweringInput {
+        exported: None,
+        sources: vec![
+            shape(m, H),
+            shape(H, 6144),
+            shape(H, 4096),
+            shape(H, 16),
+            shape(1, 1),
+        ],
+        ops: vec![
+            op(matmul(6144), vec![Ext(0), Ext(1)]),
+            op(matmul(4096), vec![Ext(0), Ext(2)]),
+            op(
+                SubOp::Reshape {
+                    rows: RowScale::Times(NonZeroU32::new(2).expect("2")),
+                    cols: 2048,
+                },
+                vec![Op(1)],
+            ),
+            op(matmul(16), vec![Ext(0), Ext(3)]),
+            op(
+                SubOp::GatedDeltaNet,
+                vec![Op(0), Op(2), Op(3), Op(3), Ext(4)],
+            ),
+        ],
+        result: 4,
+    });
+    l.bindings[4] = SourceBinding::Weight {
+        id: 4,
+        index: Some(UnrollIndex(0)),
+    };
+    let e = gdn_refused(&l, &["GatedDeltaNet", "rows"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GdnShape {
+            step: 4,
+            rule: GdnShapeRule::RowsDisagree,
+        }
+    ));
+}
+
+/// A GDN op over more than `i32::MAX` elements of `qkv`: 349568 rows (a multiple of the GEMM's
+/// 128, so the projections lower) of 6144 lanes.
+#[test]
+fn a_gdn_op_above_int_max_elements_is_refused() {
+    let e = gdn_refused(&gdn_layer(349568), &["2147745792"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GdnShape {
+            step: 5,
+            rule: GdnShapeRule::TooManyElements {
+                elements: 2147745792
+            }
+        }
+    ));
+}
+
+/// Two GDN layers of different value widths in one canonical: one scratch and one state pool
+/// cannot hold both. The second layer has 9b's 32 value heads over 16 key heads, and reads the
+/// first's output.
+#[test]
+fn two_gdn_layers_of_two_geometries_are_refused() {
+    use InputRef::{Ext, Op};
+    let mut input = common::gdn_layer::gdn_layer_input(256);
+    let base = input.sources.len();
+    input.sources.extend([
+        shape(1, H),
+        shape(H, 8192),
+        shape(H, 4096),
+        shape(H, 32),
+        shape(H, 32),
+        shape(1, 1),
+    ]);
+    let matmul = |n| SubOp::MatmulTile {
+        n,
+        weight: GemmWeight::Dense,
+    };
+    let op = |op, inputs| OpDesc { op, m: 256, inputs };
+    input.ops.push(op(
+        SubOp::RmsNorm {
+            eps: 1e-6,
+            gain: GainConvention::OnePlusScale,
+        },
+        vec![Op(7), Ext(base)],
+    ));
+    for (n, w) in [(8192, 1), (4096, 2), (32, 3), (32, 4)] {
+        input.ops.push(op(matmul(n), vec![Op(8), Ext(base + w)]));
+    }
+    input.ops.push(op(
+        SubOp::GatedDeltaNet,
+        vec![Op(9), Op(10), Op(11), Op(12), Ext(base + 5)],
+    ));
+    input.result = input.ops.len() - 1;
+    let mut l = with_hidden(input);
+    for (ix, layer) in [(6, 0), (base + 5, 1)] {
+        l.bindings[ix] = SourceBinding::Weight {
+            id: ix as u32,
+            index: Some(UnrollIndex(layer)),
+        };
+    }
+    let e = gdn_refused(&l, &["another geometry"]);
+    assert!(matches!(e, CanonicalRefusal::GdnPool { step: 13 }), "{e}");
 }

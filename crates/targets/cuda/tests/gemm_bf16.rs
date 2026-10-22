@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The bf16 GEMM (`kernels/gemm_bf16.cu`, `C = A · Bᵀ`) against a CPU reference, on the H100.
+//! The bf16 GEMMs (`kernels/gemm_bf16.cu` and the narrow `kernels/gemm_narrow_bf16.cu`, both
+//! `C = A · Bᵀ`) against a CPU reference, on the H100.
 //!
 //! Built only under `nvcc` (`required-features`). No GPU fails rather than skips: this test is the
 //! kernel's only gate, and a skip that passes would let it pass silently. The reference and the
@@ -10,8 +11,8 @@ pub mod common {
     pub mod numerics;
 }
 
-use common::numerics::{bf16_inputs, compare};
-use scratchy_target_cuda::kernels::{KernelError, gemm_bf16_abt};
+use common::numerics::{bf16_inputs, compare, widen};
+use scratchy_target_cuda::kernels::{KernelError, gemm_bf16_abt, gemm_narrow_bf16_abt};
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 
 /// `(M, N, K)`, each a multiple of the kernel's (128, 256, 64).
@@ -192,4 +193,159 @@ fn gemm_bf16_abt_ignores_an_earlier_unrelated_error() {
         if pass { "PASS" } else { "FAIL" }
     );
     assert!(pass, "a launch after an unrelated error failed");
+}
+
+// ── The narrow GEMM (n ≤ 64) ───────────────────────────────────────
+
+/// `(M, N, K)` for the narrow GEMM: qwen3.5-0.8b's `a`/`b` projection at a 128-token bucket, 9b's
+/// at 256, rows that are no multiple of a warp's CTA with the smallest `k`, and 8 columns.
+const NARROW_SHAPES: &[(u32, u32, u32, &str)] = &[
+    (128, 16, 1024, "qwen3.5-0.8b a/b projection, 128 tokens"),
+    (256, 32, 4096, "qwen3.5-9b a/b projection, 256 tokens"),
+    (
+        37,
+        64,
+        8,
+        "37 rows (a partial CTA), the widest n, one k vector",
+    ),
+    (256, 8, 2048, "the narrowest n"),
+];
+
+/// Shapes the narrow launcher refuses: `n` not a multiple of 8, above 64, `k` off the vector, zero
+/// rows.
+const NARROW_REFUSED: &[(u32, u32, u32)] =
+    &[(128, 12, 64), (128, 72, 64), (128, 16, 100), (0, 16, 64)];
+
+/// Launch the narrow GEMM on the default stream, then wait for it.
+///
+/// # Safety
+///
+/// As [`gemm_narrow_bf16_abt`]'s, for the default stream.
+unsafe fn narrow_and_wait(
+    a: &DeviceBuffer,
+    b: &DeviceBuffer,
+    c: &DeviceBuffer,
+    (m, n, k): (u32, u32, u32),
+) -> Result<(), KernelError> {
+    // SAFETY: the caller's contract.
+    let launched =
+        unsafe { gemm_narrow_bf16_abt(a.ptr(), b.ptr(), c.ptr(), (m, n, k), std::ptr::null_mut()) };
+    c.download().expect("waiting for the launch");
+    launched
+}
+
+/// `B` read as `[k, n]` instead of `[n, k]`: the self-check's wrong layout, `C'[i, j] = Σ_l
+/// A[i, l] · B[l·n + j]`, under the GEMM bound of its own products.
+fn transposed_misses(gpu: &[u16], a: &[u16], b: &[u16], (m, n, k): (usize, usize, usize)) -> usize {
+    let (a, b) = (widen(a), widen(b));
+    let mut missed = 0;
+    for i in 0..m {
+        for j in 0..n {
+            let (mut dot, mut abs) = (0.0f64, 0.0f64);
+            for l in 0..k {
+                let p = a[i * k + l] * b[l * n + j];
+                dot += p;
+                abs += p.abs();
+            }
+            let g = f64::from(half::bf16::from_bits(gpu[i * n + j]).to_f32());
+            missed += usize::from((g - dot).abs() > dot.abs() / 128.0 + abs / 16384.0);
+        }
+    }
+    missed
+}
+
+/// Run one narrow shape; print its line and the transposed-B self-check's; return whether both
+/// passed.
+fn run_narrow(device: &CudaDevice, m: u32, n: u32, k: u32, what: &str) -> bool {
+    let (mu, nu, ku) = (m as usize, n as usize, k as usize);
+    let a_bits = bf16_inputs(mu * ku, 0xA11A_0000 ^ (u64::from(m) << 32) ^ u64::from(k));
+    let b_bits = bf16_inputs(nu * ku, 0xB11B_0000 ^ (u64::from(n) << 32) ^ u64::from(k));
+    let a = DeviceBuffer::upload(device, &a_bits).expect("upload A");
+    let b = DeviceBuffer::upload(device, &b_bits).expect("upload B");
+    let c = DeviceBuffer::upload(device, &vec![SENTINEL; mu * nu + TAIL]).expect("upload C");
+    // SAFETY: the buffers hold m*k, n*k and m*n + TAIL bf16, cudaMalloc pointers are 256-byte
+    // aligned and `c` overlaps neither input.
+    if let Err(e) = unsafe { narrow_and_wait(&a, &b, &c, (m, n, k)) } {
+        eprintln!("gemm_narrow_bf16_abt m={m} n={n} k={k}: launch failed: {e} FAIL");
+        return false;
+    }
+    let c_bits = c.download().expect("download C");
+    let tail_intact = c_bits[mu * nu..].iter().all(|&x| x == SENTINEL);
+    let cmp = compare(&c_bits[..mu * nu], &a_bits, &b_bits, mu, nu, ku);
+    // The wrong layout must miss: for k = 8 and n = 64 the two readings of B share no element in
+    // most positions, so at least half of C is out of bound.
+    let missed = transposed_misses(&c_bits[..mu * nu], &a_bits, &b_bits, (mu, nu, ku));
+    let fraction = missed as f64 / (mu * nu) as f64;
+    let self_check = fraction >= 0.5;
+    let pass = cmp.pass() && tail_intact && self_check;
+    eprintln!(
+        "gemm_narrow_bf16_abt m={m} n={n} k={k}: {} tail_intact={tail_intact} \
+         transposed_b_out_of_bound={missed}/{} ({fraction:.4}, need >= 0.5) {} ({what})",
+        cmp.line(),
+        mu * nu,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    pass
+}
+
+#[test]
+fn gemm_narrow_bf16_abt_matches_the_cpu_reference() {
+    let device = h100();
+    let failed: Vec<_> = NARROW_SHAPES
+        .iter()
+        .filter(|&&(m, n, k, what)| !run_narrow(&device, m, n, k, what))
+        .map(|&(m, n, k, _)| (m, n, k))
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "gemm_narrow_bf16_abt failed for (m, n, k) = {failed:?}"
+    );
+}
+
+/// Two runs of the same input give the same bits: the reduction order is fixed.
+#[test]
+fn gemm_narrow_bf16_abt_is_deterministic() {
+    let device = h100();
+    let (m, n, k) = (256u32, 32u32, 4096u32);
+    let (mu, nu, ku) = (m as usize, n as usize, k as usize);
+    let a = DeviceBuffer::upload(&device, &bf16_inputs(mu * ku, 0xDE7)).expect("upload A");
+    let b = DeviceBuffer::upload(&device, &bf16_inputs(nu * ku, 0xDE8)).expect("upload B");
+    let run = || {
+        let c = DeviceBuffer::upload(&device, &vec![SENTINEL; mu * nu]).expect("upload C");
+        // SAFETY: as `run_narrow`'s.
+        unsafe { narrow_and_wait(&a, &b, &c, (m, n, k)) }.expect("launch");
+        c.download().expect("download C")
+    };
+    let (first, second) = (run(), run());
+    let differ = first.iter().zip(&second).filter(|(x, y)| x != y).count();
+    eprintln!(
+        "gemm_narrow_bf16_abt repeat m={m} n={n} k={k}: bit_mismatches={differ} {}",
+        if differ == 0 { "PASS" } else { "FAIL" }
+    );
+    assert_eq!(differ, 0);
+}
+
+#[test]
+fn gemm_narrow_bf16_abt_refuses_shapes_it_does_not_take() {
+    let device = h100();
+    for &(m, n, k) in NARROW_REFUSED {
+        let len = |rows: u32, cols: u32| (rows as usize * cols as usize).clamp(1, REFUSED_BUFFER);
+        let a = DeviceBuffer::upload(&device, &vec![0; len(m, k)]).expect("upload A");
+        let b = DeviceBuffer::upload(&device, &vec![0; len(n, k)]).expect("upload B");
+        let c = DeviceBuffer::upload(&device, &vec![SENTINEL; len(m, n) + TAIL]).expect("upload C");
+        // SAFETY: the launcher refuses each of these shapes before it touches any pointer.
+        let got = unsafe { narrow_and_wait(&a, &b, &c, (m, n, k)) };
+        let unchanged = (c.download().expect("download C").iter()).all(|&x| x == SENTINEL);
+        let want = Err(KernelError::NarrowShape { m, n, k });
+        eprintln!(
+            "gemm_narrow_bf16_abt m={m} n={n} k={k}: {got:?} c_unchanged={unchanged} {}",
+            if got == want && unchanged {
+                "PASS"
+            } else {
+                "FAIL"
+            }
+        );
+        assert_eq!(got, want, "m={m} n={n} k={k}");
+        assert!(unchanged, "m={m} n={n} k={k}: a refused launch wrote C");
+    }
 }

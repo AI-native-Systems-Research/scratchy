@@ -113,6 +113,67 @@ unsafe extern "C" {
         scale: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gemm_narrow_bf16_abt(
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gdn_conv1d(
+        x: *const c_void,
+        w: *const c_void,
+        conv_state: *mut c_void,
+        slot_elems: u64,
+        sequence: *const c_void,
+        conv_out: *mut c_void,
+        rows: u32,
+        conv_dim: u32,
+        kernel: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gdn_gating(
+        a: *const c_void,
+        b: *const c_void,
+        a_log: *const c_void,
+        dt_bias: *const c_void,
+        sequence: *const c_void,
+        g: *mut c_void,
+        beta: *mut c_void,
+        rows: u32,
+        nv: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gdn_scan(
+        conv_out: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        ssm_state: *mut c_void,
+        slot_elems: u64,
+        sequence: *const c_void,
+        o: *mut c_void,
+        rows: u32,
+        nk: u32,
+        nv: u32,
+        head_k: u32,
+        head_v: u32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gdn_rms_norm_gated(
+        o: *const c_void,
+        z: *const c_void,
+        w: *const c_void,
+        sequence: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        nv: u32,
+        head_v: u32,
+        eps: f32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// Why a launcher did not launch, or the launch failed.
@@ -152,6 +213,26 @@ pub enum KernelError {
         block_size: u32,
         num_blocks: u32,
     },
+    /// The narrow GEMM does not take this shape; nothing was launched.
+    NarrowShape { m: u32, n: u32, k: u32 },
+    /// The GDN conv1d does not take this shape or state stride; nothing was launched.
+    GdnConvShape {
+        rows: u32,
+        conv_dim: u32,
+        kernel: u32,
+    },
+    /// The GDN gating does not take this shape; nothing was launched.
+    GdnGatingShape { rows: u32, nv: u32 },
+    /// The GDN scan does not take this geometry, state stride or scale; nothing was launched.
+    GdnScanShape {
+        rows: u32,
+        nk: u32,
+        nv: u32,
+        head_k: u32,
+        head_v: u32,
+    },
+    /// The GDN gated norm does not take this shape or eps; nothing was launched.
+    GdnNormShape { rows: u32, nv: u32, head_v: u32 },
     /// The launcher's C++ host code threw (caught before it could reach Rust).
     HostException,
     /// A `cudaError_t` from the kernel's one-time setup or from its launch.
@@ -204,6 +285,36 @@ impl fmt::Display for KernelError {
                 "prefill attention refused shape rows={rows} q_heads={q_heads} \
                  kv_heads={kv_heads} head_dim={head_dim} block_size={block_size} \
                  num_blocks={num_blocks}, or its scale"
+            ),
+            KernelError::NarrowShape { m, n, k } => {
+                write!(f, "narrow GEMM refused shape m={m} n={n} k={k}")
+            }
+            KernelError::GdnConvShape {
+                rows,
+                conv_dim,
+                kernel,
+            } => write!(
+                f,
+                "GDN conv1d refused shape rows={rows} conv_dim={conv_dim} kernel={kernel}, or its \
+                 state stride"
+            ),
+            KernelError::GdnGatingShape { rows, nv } => {
+                write!(f, "GDN gating refused shape rows={rows} nv={nv}")
+            }
+            KernelError::GdnScanShape {
+                rows,
+                nk,
+                nv,
+                head_k,
+                head_v,
+            } => write!(
+                f,
+                "GDN scan refused shape rows={rows} nk={nk} nv={nv} head_k={head_k} \
+                 head_v={head_v}, or its state stride or scale"
+            ),
+            KernelError::GdnNormShape { rows, nv, head_v } => write!(
+                f,
+                "GDN gated norm refused shape rows={rows} nv={nv} head_v={head_v}, or its eps"
             ),
             KernelError::HostException => write!(f, "kernel launcher's host code threw"),
             KernelError::Cuda(code) => write!(f, "CUDA error {code}"),
@@ -559,4 +670,177 @@ pub unsafe fn attn_prefill_bf16(
             num_blocks,
         },
     )
+}
+
+/// Launch the narrow bf16 GEMM `C = A · Bᵀ` for at most 64 output columns: `A` is `[m, k]`, `B`
+/// `[n, k]` and `C` `[m, n]`, row-major bf16, accumulated in f32 and rounded once. One warp per
+/// row of `C`, a fixed reduction order, so the bits do not depend on the launch. Asynchronous.
+///
+/// Refused with [`KernelError::NarrowShape`], before any pointer is touched, unless `m` is
+/// non-zero, `n` a non-zero multiple of 8 and at most 64 (`step::GEMM_NARROW_BF16_MULTIPLE`,
+/// `GEMM_NARROW_BF16_MAX_N`), `k` a non-zero multiple of 8, and `m` and `k` at most `i32::MAX`.
+///
+/// # Safety
+///
+/// `a`, `b` and `c` must be 16-byte-aligned device pointers to at least `m*k`, `n*k` and `m*n`
+/// bf16, valid for the whole kernel, with `c` overlapping neither input. `stream` must be a live
+/// `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn gemm_narrow_bf16_abt(
+    a: *const c_void,
+    b: *const c_void,
+    c: *mut c_void,
+    (m, n, k): (u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer.
+    let code = unsafe { scratchy_cuda_gemm_narrow_bf16_abt(a, b, c, m, n, k, stream) };
+    check(code, KernelError::NarrowShape { m, n, k })
+}
+
+// THE GDN KERNELS. Four launches make one `GatedDeltaNet` step, in this order on one stream, each
+// reading `[slot, q_len, start, 0]` u32 from `sequence` (`start` 1 on a sequence's first chunk, 0
+// to continue from its slot) and touching only the `q_len` real rows. Each is plain CUDA with
+// under 48 KiB of static shared memory, so none is in `PREPARE`.
+
+/// Launch the GDN causal depthwise conv1d, then SiLU: `conv_out[t, c]` (f32) for the real rows of
+/// `x [rows, conv_dim]` (bf16) under the taps `w [conv_dim, kernel]` (f32), the rows before 0 the
+/// slot's conv ring (zero, never read, on a fresh start); then the ring updated to the last
+/// `kernel − 1` inputs. Asynchronous.
+///
+/// Refused with [`KernelError::GdnConvShape`], before any pointer is touched, unless `rows` and
+/// `conv_dim` are non-zero, `kernel` in `step::GDN_CONV_KERNEL_RANGE`, `rows · conv_dim` at most
+/// `i32::MAX`, and `slot_elems` exactly `conv_dim · (kernel − 1)`.
+///
+/// # Safety
+///
+/// `x`, `w`, `conv_out` must be 16-byte-aligned device pointers to `rows·conv_dim` bf16,
+/// `conv_dim·kernel` f32 and `rows·conv_dim` f32; `sequence` to 4 u32 with `1 ≤ q_len ≤ rows` and
+/// `slot` a slot of `conv_state`, which must hold `(slot + 1) · slot_elems` f32. All valid for
+/// the whole kernel; `conv_out` and `conv_state` overlap nothing else. `stream` must be a live
+/// `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn gdn_conv1d(
+    (x, w): (*const c_void, *const c_void),
+    (conv_state, slot_elems): (*mut c_void, u64),
+    sequence: *const c_void,
+    conv_out: *mut c_void,
+    (rows, conv_dim, kernel): (u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_gdn_conv1d(
+            x, w, conv_state, slot_elems, sequence, conv_out, rows, conv_dim, kernel, stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GdnConvShape {
+            rows,
+            conv_dim,
+            kernel,
+        },
+    )
+}
+
+/// Launch the GDN gating: for the real rows of `a` and `b` (`[rows, nv]` bf16), `g = −exp(a_log)
+/// · softplus(a + dt_bias)` and `beta = sigmoid(b)`, f32 `[rows, nv]` each. Asynchronous.
+///
+/// Refused with [`KernelError::GdnGatingShape`], before any pointer is touched, unless `rows` and
+/// `nv` are non-zero and `rows · nv` at most `i32::MAX`.
+///
+/// # Safety
+///
+/// `a`, `b` must be device pointers to `rows·nv` bf16, `a_log`, `dt_bias` to `nv` f32, `g`,
+/// `beta` to `rows·nv` f32, `sequence` to 4 u32 with `1 ≤ q_len ≤ rows`; all 4-byte aligned and
+/// valid for the whole kernel, `g` and `beta` overlapping nothing else. `stream` must be a live
+/// `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn gdn_gating(
+    (a, b): (*const c_void, *const c_void),
+    (a_log, dt_bias): (*const c_void, *const c_void),
+    sequence: *const c_void,
+    (g, beta): (*mut c_void, *mut c_void),
+    (rows, nv): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_gdn_gating(a, b, a_log, dt_bias, sequence, g, beta, rows, nv, stream)
+    };
+    check(code, KernelError::GdnGatingShape { rows, nv })
+}
+
+/// Launch the GDN recurrent gated delta-rule scan: per value head, the slot's f32 state (zero,
+/// never read, on a fresh start) through the real tokens of `conv_out` (`q | k | v`), `g` and
+/// `beta`, each token's output into `o [rows, nv·head_v]` (f32); the state written back once.
+/// Value head `h` reads key head `h / (nv / nk)`. Asynchronous.
+///
+/// Refused with [`KernelError::GdnScanShape`], before any pointer is touched, unless `head_k` is
+/// 128 (`step::GDN_HEAD_K`), `head_v` a non-zero multiple of 32 and at most 256, `nk` and `nv`
+/// non-zero with `nv` a multiple of `nk`, `rows` non-zero, `rows · conv_dim` at most `i32::MAX`
+/// (`conv_dim = 2·nk·128 + nv·head_v`), `scale` finite and above 0, and `slot_elems` exactly
+/// `nv · head_v · 128`.
+///
+/// # Safety
+///
+/// `conv_out` must be a device pointer to `rows·conv_dim` f32, `g` and `beta` to `rows·nv` f32,
+/// `o` to `rows·nv·head_v` f32, `sequence` to 4 u32 with `1 ≤ q_len ≤ rows` and `slot` a slot of
+/// `ssm_state`, which must hold `(slot + 1) · slot_elems` f32. All 16-byte aligned and valid for
+/// the whole kernel; `o` and `ssm_state` overlap nothing else. `stream` must be a live
+/// `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn gdn_scan(
+    (conv_out, g, beta): (*const c_void, *const c_void, *const c_void),
+    (ssm_state, slot_elems): (*mut c_void, u64),
+    sequence: *const c_void,
+    o: *mut c_void,
+    (rows, nk, nv): (u32, u32, u32),
+    (head_k, head_v, scale): (u32, u32, f32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_gdn_scan(
+            conv_out, g, beta, ssm_state, slot_elems, sequence, o, rows, nk, nv, head_k, head_v,
+            scale, stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GdnScanShape {
+            rows,
+            nk,
+            nv,
+            head_k,
+            head_v,
+        },
+    )
+}
+
+/// Launch the GDN gated RMSNorm: per real row and value head, `o / sqrt(mean(o²) + eps) · w ·
+/// SiLU(z)` over the head's `head_v` lanes, rounded once to bf16 into `out`; every padding row of
+/// `out` written `+0.0` without reading `o` or `z`. Asynchronous.
+///
+/// Refused with [`KernelError::GdnNormShape`], before any pointer is touched, unless `rows` and
+/// `nv` are non-zero, `head_v` a non-zero multiple of 32 and at most 256, `rows · nv · head_v` at
+/// most `i32::MAX`, and `eps` finite and above 0.
+///
+/// # Safety
+///
+/// `o` must be a device pointer to `rows·nv·head_v` f32, `z` and `out` to that many bf16, `w` to
+/// `head_v` f32, `sequence` to 4 u32 with `q_len ≤ rows`; all 4-byte aligned and valid for the
+/// whole kernel, `out` overlapping no input. `stream` must be a live `cudaStream_t` of the
+/// current device, or null for the default stream.
+pub unsafe fn gdn_rms_norm_gated(
+    (o, z, w): (*const c_void, *const c_void, *const c_void),
+    sequence: *const c_void,
+    out: *mut c_void,
+    (rows, nv, head_v): (u32, u32, u32),
+    eps: f32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_gdn_rms_norm_gated(o, z, w, sequence, out, rows, nv, head_v, eps, stream)
+    };
+    check(code, KernelError::GdnNormShape { rows, nv, head_v })
 }
