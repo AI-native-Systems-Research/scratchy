@@ -529,8 +529,9 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 ///
 /// ⛔ BUT ONLY A REPLY IN THAT SHAPE IS READ AS ONE. A worker applies a grammar best-effort: it
 /// decodes unconstrained, with a warning, when the grammar won't compile, and the Spyre worker
-/// applies none. A reply is the grammar's only if it opens with `[` and then `{`, past
-/// whitespace, all the grammar allows; any other, Mistral's `[TOOL_CALLS]` and a pythonic
+/// applies none. A reply is the grammar's only if it opens with `[` and then `{`, as the grammar
+/// writes it (an unconstrained reply may put whitespace before either); any other, Mistral's
+/// `[TOOL_CALLS]` and a pythonic
 /// `[f(…)]` among them, is read by `fallback`, the engine's own parser, as `"auto"` would read it,
 /// or is text when there is none. So a grammar that didn't hold costs the constraint, never the
 /// calls.
@@ -2990,11 +2991,12 @@ mod tests {
         .unwrap();
         assert_eq!(schema["type"], "array");
         assert_eq!(schema["minItems"], 1);
-        assert_eq!(
-            schema["x-guidance"],
-            required_json_format(),
-            "written one way"
-        );
+        let one_way = serde_json::json!({
+            "whitespace_flexible": false,
+            "item_separator": ", ",
+            "key_separator": ": ",
+        });
+        assert_eq!(schema["x-guidance"], one_way, "written one way");
         assert_eq!(schema["items"]["type"], "object");
         assert!(schema.get("$defs").is_none(), "no tool defines any");
         let calls = schema["items"]["anyOf"].as_array().unwrap();
@@ -3246,15 +3248,9 @@ mod tests {
     #[test]
     fn the_required_grammar_takes_a_call_to_a_declared_tool_and_nothing_else() {
         use scratchy_serving_engine::grammar::{GrammarGuide, build_parser_factory};
-        // Byte-level BPE writes a space as `Ġ` and a newline as `Ċ`; every other printable
-        // character is itself.
-        let piece = |c: char| match c {
-            ' ' => 'Ġ',
-            '\n' => 'Ċ',
-            c => c,
-        };
+        // Byte-level BPE writes a space as `Ġ`; every other printable character is itself.
+        let piece = |c: char| if c == ' ' { 'Ġ' } else { c };
         let vocab: serde_json::Map<String, serde_json::Value> = (' '..='~')
-            .chain(['\n'])
             .zip(1u32..)
             .map(|(c, id)| (piece(c).to_string(), serde_json::json!(id)))
             .collect();
@@ -3328,8 +3324,9 @@ mod tests {
         }
 
         // The calls are written one way, `json.dumps`'s: no whitespace but its separators, so no
-        // loop on whitespace between `[` and `{` (#820).
-        let looping = "[\n\n   \n\n";
+        // loop on whitespace between `[` and `{` (#820). Flexible whitespace takes the spaces,
+        // and refuses only at the reply's end, unfinished.
+        let looping = "[   ";
         assert_eq!(refused_at(&schema, looping), Some(1), "whitespace after [");
         let compact = r#"[{"name":"Bash","parameters":{"command":"ls"}}]"#;
         let after_colon = compact.find(':').unwrap() + 1;
@@ -3337,12 +3334,6 @@ mod tests {
             refused_at(&schema, compact),
             Some(after_colon),
             "a key's colon wants its space"
-        );
-        let leading = format!(" {one_call}");
-        assert_eq!(
-            refused_at(&schema, &leading),
-            Some(0),
-            "whitespace before ["
         );
 
         // Under `parallel_tool_calls: false`, one call: a second is refused at the comma before it.
