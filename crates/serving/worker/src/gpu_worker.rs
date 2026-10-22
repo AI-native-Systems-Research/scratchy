@@ -1226,6 +1226,7 @@ impl MetalWorker {
                             slots,
                             lanes,
                             cfg.state_dims(),
+                            scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE,
                         )
                     })
                 };
@@ -2753,8 +2754,10 @@ impl MetalWorker {
             1,
             None,
             dims,
+            scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE,
         );
-        let (conv, ssm) = dims.slot_bytes();
+        let (conv, ssm) =
+            dims.slot_bytes(scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE);
         let unit = scratchy_target_metal::sparse_kv::whole_tile_blocks(&dev.device, [conv, ssm]);
         (bytes > 0).then_some((bytes, unit))
     }
@@ -5877,7 +5880,8 @@ impl Worker for MetalWorker {
             // one is not zeroed. A model that drafts keeps its draft lanes apart, in plain
             // buffers: as many as the sequences that draft at once, and every lane in use while
             // they do.
-            let (conv_slot, ssm_slot) = dims.slot_bytes();
+            let (conv_slot, ssm_slot) =
+                dims.slot_bytes(scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE);
             let layout: Vec<(usize, bool)> = (0..gdn_cfg.num_linear_layers())
                 .flat_map(|_| [(conv_slot, false), (ssm_slot, false)])
                 .collect();
@@ -5903,6 +5907,7 @@ impl Worker for MetalWorker {
                     num_slots,
                     lanes,
                     dims,
+                    scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE,
                     // `new` takes each linear layer's conv then ssm slot buffer, in `layout`'s
                     // order, then — with lanes — its conv and ssm lane buffers.
                     |bytes| {
@@ -6041,6 +6046,7 @@ impl Worker for MetalWorker {
                     self.max_num_seqs_resolved(),
                     self.gdn_lanes(&cfg),
                     cfg.state_dims(),
+                    scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE,
                 )
             })
             .unwrap_or(0);

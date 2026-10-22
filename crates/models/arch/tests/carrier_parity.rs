@@ -448,8 +448,10 @@ mod imp {
                 // A lane for a model that drafts: its tapes bind one, though this one never does.
                 scratchy_target_metal::gdn_state::DraftLanes::new(gdn_cfg.checkpoint_rows(), 1),
                 gdn_cfg.state_dims(),
+                scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE,
                 |bytes| {
-                    // f32 conv/ssm state; MUST be StorageModeShared.
+                    // The conv ring f32, the ssm state the kernels' dtype; MUST be
+                    // StorageModeShared.
                     Ok(MetalMem::new_pinned(
                         device_arc,
                         allocator.residency(),

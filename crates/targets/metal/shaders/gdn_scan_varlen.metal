@@ -20,7 +20,8 @@
 // memory — cheaper register pressure than CUDA's three K-arrays, identical
 // math). GVA: the key head is `i_hv / (HV/H)`.
 //
-// `conv_out` is model dtype (`T`); `g`/`beta`/`ssm_state`/`o` are f32.
+// `conv_out` is model dtype (`T`); `g`/`beta`/`o` and the lane records are f32; `ssm_state` is
+// `half`, cast at its loads and stores (the arithmetic f32).
 // State layout (cuda-symmetric): `state_indices[seq]` is the sequence's `GdnSeqSlots`
 //   (`gdn_state.h`), its slot the one its state lives in; a slot is its state
 //   entry ssm[HV, head_v, head_k] (row ((i_hv*head_v + i_v)*head_k)). When the model drafts, the
@@ -30,7 +31,9 @@
 //   `gdn_step[seq]` is `scratchy_layers::gdn_state::GdnStep::encode`:
 //   - a step starts from the slot's state, zero (fresh), or (start = checkpoint r) the slot's state
 //     replayed through the previous verify step's rows 0..=r from the lane's record area its bit 16
-//     names, through the same loop body that first computed them (no output);
+//     names, through the same loop body that first computed them (no output), its state rounded
+//     through the entry's dtype after the last replayed row — where the plain run's store and its
+//     next step's load sat, so it leaves the same state;
 //   - a verify step (drafts) leaves the state it starts from in the slot and records each of its
 //     rows in the lane's other area; any other step writes its last row's state to the slot.
 //   - a slot start restoring a snapshot (the record's source) reads its start state from the
@@ -95,7 +98,7 @@ template <typename T>
     const device T*     conv_out      [[buffer(1)]],
     const device float* g             [[buffer(2)]],
     const device float* beta          [[buffer(3)]],
-    device       float* ssm_state     [[buffer(4)]],
+    device       half*  ssm_state     [[buffer(4)]],
     const device int*   cu_seqlens    [[buffer(5)]],
     const device GdnSeqSlots* state_indices [[buffer(6)]],
     const device uint*  gdn_step      [[buffer(7)]],
@@ -145,18 +148,18 @@ template <typename T>
   uint entry_len = HV * Vd * K;
   uint rec_len = conv_dim + 2u * HV;
   uint area_len = (GDN_SCAN_DRAFTS + 1u) * rec_len;
-  device float* state_row = ssm_state + uint(slot_ix) * entry_len + (i_hv * Vd + i_v) * K;
+  device half* state_row = ssm_state + uint(slot_ix) * entry_len + (i_hv * Vd + i_v) * K;
   device float* lane = ssm_lanes + (code >> 17) * 2u * area_len;
   const device float* kept = lane + area * area_len;
   device float* recorded = lane + (1u - area) * area_len;
   int replayed = GDN_SCAN_DRAFTS > 0u && start >= 2u ? int(start - 1u) : 0;
   // The start state's row: the slot's, or a restore's snapshot's.
-  const device float* start_row =
+  const device half* start_row =
       ssm_state + uint(gdn_start_slot(seq_slots, start)) * entry_len + (i_hv * Vd + i_v) * K;
 
   float b_h[GDN_SCAN_KMAX];
   for (uint ki = 0; ki < K; ki++) {
-    b_h[ki] = start == 1u ? 0.0f : start_row[ki];
+    b_h[ki] = start == 1u ? 0.0f : float(start_row[ki]);
   }
 
   // The previous verify step's kept rows (replayed: no output), then this step's: in
@@ -165,11 +168,19 @@ template <typename T>
   int i_t = -replayed;
   for (uint stretch = 0; stretch <= GDN_SAVES; stretch++) {
     for (const int stop = gdn_stretch_end(saves_through, stretch, seq_len); i_t < stop; i_t++) {
+      if (i_t == 0 && replayed > 0) {
+        // The plain run of the replayed rows left their state in the slot and its next step
+        // loaded it back — the f16 entry's round-trip; the replay holds the rows in registers,
+        // so round the state through the entry's dtype to leave the same state.
+        for (uint ki = 0; ki < K; ki++) {
+          b_h[ki] = float(half(b_h[ki]));
+        }
+      }
       if (i_t == 0 && drafts > 0u && start != 0u) {
         // A verify step leaves the state it starts from in the slot (a slot start's is already
         // there).
         for (uint ki = 0; ki < K; ki++) {
-          state_row[ki] = b_h[ki];
+          state_row[ki] = half(b_h[ki]);
         }
       }
       uint t = uint(bos + i_t);
@@ -244,10 +255,10 @@ template <typename T>
     }
     const int sv = gdn_stretch_save(saves_through, stretch, seq_len);
     if (sv >= 0) {
-      device float* snap =
+      device half* snap =
           ssm_state + uint(state_indices[i_n].saves[sv].y) * entry_len + (i_hv * Vd + i_v) * K;
       for (uint ki = 0; ki < K; ki++) {
-        snap[ki] = b_h[ki];
+        snap[ki] = half(b_h[ki]);
       }
     }
   }
@@ -255,7 +266,7 @@ template <typename T>
   // Any step but a verify step leaves its last row's state in the slot.
   if (drafts == 0u) {
     for (uint ki = 0; ki < K; ki++) {
-      state_row[ki] = b_h[ki];
+      state_row[ki] = half(b_h[ki]);
     }
   }
 }
@@ -282,7 +293,7 @@ template <typename T>
     const device float* conv_out      [[buffer(1)]],
     const device T*     a             [[buffer(2)]],
     const device T*     b             [[buffer(3)]],
-    device       float* ssm_state     [[buffer(4)]],
+    device       half*  ssm_state     [[buffer(4)]],
     const device int*   cu_seqlens    [[buffer(5)]],
     const device GdnSeqSlots* state_indices [[buffer(6)]],
     const device uint*  gdn_step      [[buffer(7)]],
@@ -335,28 +346,36 @@ template <typename T>
   auto row_in = [&](int s) {
     return ssm_state + uint(s) * entry_len + (i_hv * Vd + i_v) * K + lane * NPT;
   };
-  device float* state_row = row_in(slot_ix);
+  device half* state_row = row_in(slot_ix);
   device float* draft_lane = ssm_lanes + (code >> 17) * 2u * area_len;
   const device float* kept = draft_lane + area * area_len;
   device float* recorded = draft_lane + (1u - area) * area_len;
   const int replayed = GDN_SCAN_DRAFTS > 0u && start >= 2u ? int(start - 1u) : 0;
 
   // The start state: the slot's, or a restore's snapshot's.
-  const device float* start_row = row_in(gdn_start_slot(seq_slots, start));
+  const device half* start_row = row_in(gdn_start_slot(seq_slots, start));
   float st[NPT];
   for (uint i = 0; i < NPT; i++) {
-    st[i] = start == 1u ? 0.0f : start_row[i];
+    st[i] = start == 1u ? 0.0f : float(start_row[i]);
   }
   const float neg_a = -exp(float(a_log[i_hv]));
 
   // One row of the scan: a kept row the previous verify step recorded (`i_t < 0`, replayed: no
   // output), or this step's row `i_t`.
   auto scan_row = [&](int i_t) {
+    if (i_t == 0 && replayed > 0) {
+      // The plain run of the replayed rows left their state in the slot and its next step
+      // loaded it back — the f16 entry's round-trip; the replay holds the rows in registers,
+      // so round the state through the entry's dtype to leave the same state.
+      for (uint i = 0; i < NPT; i++) {
+        st[i] = float(half(st[i]));
+      }
+    }
     if (i_t == 0 && drafts > 0u && start != 0u) {
       // A verify step leaves the state it starts from in the slot (a slot start's is already
       // there).
       for (uint i = 0; i < NPT; i++) {
-        state_row[i] = st[i];
+        state_row[i] = half(st[i]);
       }
     }
     const uint t = uint(bos + i_t);
@@ -444,9 +463,9 @@ template <typename T>
     }
     for (uint j = 0; j < GDN_SAVES; j++) {
       if (saves_through[j] == seq_len) {
-        device float* snap = row_in(seq_slots.saves[j].y);
+        device half* snap = row_in(seq_slots.saves[j].y);
         for (uint i = 0; i < NPT; i++) {
-          snap[i] = st[i];
+          snap[i] = half(st[i]);
         }
       }
     }
@@ -459,9 +478,9 @@ template <typename T>
       }
       const int sv = gdn_stretch_save(saves_through, stretch, seq_len);
       if (sv >= 0) {
-        device float* snap = row_in(seq_slots.saves[sv].y);
+        device half* snap = row_in(seq_slots.saves[sv].y);
         for (uint i = 0; i < NPT; i++) {
-          snap[i] = st[i];
+          snap[i] = half(st[i]);
         }
       }
     }
@@ -470,7 +489,7 @@ template <typename T>
   // Any step but a verify step leaves its last row's state in the slot.
   if (drafts == 0u) {
     for (uint i = 0; i < NPT; i++) {
-      state_row[i] = st[i];
+      state_row[i] = half(st[i]);
     }
   }
 }

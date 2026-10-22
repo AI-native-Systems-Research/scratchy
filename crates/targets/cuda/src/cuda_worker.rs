@@ -1862,6 +1862,7 @@ impl CudaWorker {
                             1,
                             None,
                             cfg.state_dims(),
+                            crate::gdn_state::GDN_SSM_STATE_DTYPE,
                         )
                     });
                 let (budget, allocated) = match total_bytes {
@@ -4047,6 +4048,7 @@ impl Worker for CudaWorker {
                     num_slots,
                     None,
                     gdn_cfg.state_dims(),
+                    crate::gdn_state::GDN_SSM_STATE_DTYPE,
                     |bytes| {
                         // f32 conv/ssm state, GPU-resident across forwards
                         // (no CPU touches). Same alloc path as the KV pool
@@ -4124,6 +4126,7 @@ impl Worker for CudaWorker {
                         self.max_num_seqs_resolved(),
                         None,
                         cfg.state_dims(),
+                        crate::gdn_state::GDN_SSM_STATE_DTYPE,
                     )
                 })
                 .unwrap_or(0);
