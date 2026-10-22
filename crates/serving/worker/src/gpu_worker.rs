@@ -1570,6 +1570,42 @@ impl MetalWorker {
         gdn_draft_lanes(self.config.verify_seqs, cfg, self.max_num_seqs_resolved())
     }
 
+    /// A KV pool's block-table width (`KvCachePool::max_blocks_per_seq`) as the KV cap rung its
+    /// kernels are baked for.
+    fn rung_cap(
+        max_blocks_per_seq: usize,
+    ) -> ExecutorResult<scratchy_target_metal::tape::ids::MaxBlocksPerSeq> {
+        u32::try_from(max_blocks_per_seq)
+            .map(scratchy_target_metal::tape::ids::MaxBlocksPerSeq)
+            .map_err(|_| {
+                ExecutorError::WorkerInit(format!(
+                    "a KV block table {max_blocks_per_seq} blocks wide exceeds u32"
+                ))
+            })
+    }
+
+    /// The draft's spec-decode chain advance over the block tables of the pool it runs on, `cap`
+    /// blocks wide (`KvCachePool::max_blocks_per_seq`), baked for that rung.
+    fn build_draft_chain_advance(&mut self, cap: usize) -> ExecutorResult<()> {
+        let draft = self.draft_model.as_ref().ok_or_else(|| {
+            ExecutorError::WorkerInit("draft chain advance before the draft model loads".into())
+        })?;
+        let dev = self
+            .gpu_device
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerInit("gpu_device not initialized".into()))?;
+        let off_tape = scratchy_target_metal::off_tape::OffTapeKernels::of(draft.metal_off_tape())
+            .map_err(|e| ExecutorError::WorkerInit(format!("draft off-tape kernels: {e}")))?;
+        let kernel = scratchy_target_metal::chain_advance::ChainAdvanceKernel::new(
+            &dev.device,
+            off_tape,
+            Self::rung_cap(cap)?,
+        )
+        .map_err(|e| ExecutorError::WorkerInit(format!("draft chain_advance: {e:?}")))?;
+        self.draft_chain_advance_kernel = Some(kernel);
+        Ok(())
+    }
+
     /// The KV cap rung `model`'s pool runs on for a capacity of `block_cap` blocks per sequence,
     /// on this worker's device and workload (`MetalRungs::pick`): `(cap, scratch bytes)`. The cap
     /// is the KV pool's block-table width; the scratch counts in the memory budget.
@@ -1971,15 +2007,6 @@ impl MetalWorker {
         self.draft_argmax_kernels = Some(
             scratchy_target_metal::argmax::ArgmaxKernels::new(&gpu_device.device, draft_off_tape)
                 .map_err(|e| ExecutorError::WorkerInit(format!("draft argmax compile: {e:?}")))?,
-        );
-        self.draft_chain_advance_kernel = Some(
-            scratchy_target_metal::chain_advance::ChainAdvanceKernel::new(
-                &gpu_device.device,
-                draft_off_tape,
-            )
-            .map_err(|e| {
-                ExecutorError::WorkerInit(format!("draft chain_advance compile: {e:?}"))
-            })?,
         );
         self.mtp_chain_kernel = scratchy_target_metal::mtp_chain::MtpChainKernel::new(
             &gpu_device.device,
@@ -2942,9 +2969,15 @@ impl MetalWorker {
     }
 
     fn initialize_draft_cache_metal(&mut self, num_gpu_blocks: usize) -> ExecutorResult<()> {
-        // A head reading its target's KV has no pool: its forwards run on the target's.
+        // A head reading its target's KV has no pool: its forwards run on the target's, and so
+        // does its chain advance.
         if self.head_reads_target_kv() {
-            return Ok(());
+            let target = self.kv_cache.as_ref().ok_or_else(|| {
+                ExecutorError::WorkerInit(
+                    "a head reading its target's KV before the target's pool".into(),
+                )
+            })?;
+            return self.build_draft_chain_advance(target.max_blocks_per_seq);
         }
         let model = self.draft_model.as_ref().ok_or_else(|| {
             ExecutorError::WorkerInit(
@@ -3074,8 +3107,9 @@ impl MetalWorker {
             blocks_per_chunk,
             num_gpu_blocks,
         );
+        let cap = pool.max_blocks_per_seq;
         self.draft_kv_cache = Some(pool);
-        Ok(())
+        self.build_draft_chain_advance(cap)
     }
 
     /// Allocate a `StorageModeShared` u32 buffer and memcpy `data` into it.
@@ -3260,14 +3294,13 @@ fn metal_chain_dispatch(
     let argmax_bufs: Vec<scratchy_target_metal::mtl4_dispatch::Buffer> =
         pinned_argmax.iter().map(|b| (**b).clone()).collect();
 
-    // ── 3. Pack constants ───────────────────────────────────────
-    let pinned_consts = pin_zeroed(8);
+    // ── 3. Pack the step's row count (argmax's batch, chain_advance's num_reqs) ──
+    let pinned_consts = pin_zeroed(4);
     residency.commit();
     let consts_buf = (*pinned_consts).clone();
     unsafe {
         let p = consts_buf.contents().as_ptr() as *mut u32;
         *p.add(0) = req.num_tokens as u32;
-        *p.add(1) = req.block_table_stride as u32;
     }
 
     // ── 4. Build K argmax_dual_write argument tables ────────────
@@ -3382,7 +3415,6 @@ fn metal_chain_dispatch(
                 chain_arg_table_for_closure.setAddress_atIndex(runtime.seq_used_k.gpuAddress(), 2);
                 chain_arg_table_for_closure
                     .setAddress_atIndex(runtime.block_tables[0].gpuAddress(), 3);
-                chain_arg_table_for_closure.setAddress_atIndex(consts_addr + 4, 4);
                 chain_arg_table_for_closure.setAddress_atIndex(consts_addr, 5);
             }
 
@@ -4357,7 +4389,7 @@ impl ChainLayout {
     const SEQS: usize = 0;
     const DRAFTED: usize = 1;
     const NEXT: usize = 2;
-    /// Per argmax `batch`, then per chain pass its depth, then pass 1's window start.
+    /// Per argmax `batch`, then pass 1's window start (each chain's pass is compiled into it).
     const CONSTS: usize = 3;
     const PICKED: usize = 4;
     const ACCEPTED: usize = 5;
@@ -4397,7 +4429,7 @@ impl ChainLayout {
             u32s(3 * n),
             u32s(drafted),
             u32s(passes * n * (k + 1) * 3),
-            u32s(2 * passes + 1),
+            u32s(passes + 1),
             u32s((window.len()).max(n)),
             u32s(n),
             u32s(n),
@@ -4468,8 +4500,7 @@ impl ChainLayout {
         }
         let batches = std::iter::once(self.window.len() as u32)
             .chain((1..self.passes).map(|_| self.n as u32));
-        let depths = 1..=self.passes as u32;
-        let consts: Vec<u32> = batches.chain(depths).chain([self.window.start]).collect();
+        let consts: Vec<u32> = batches.chain([self.window.start]).collect();
         put(Self::CONSTS, &consts);
     }
 
@@ -4746,19 +4777,21 @@ impl<'a> HeadPassesEncoder<'a> {
                 at(ChainLayout::USED),
                 at(ChainLayout::HIDDEN),
                 at(ChainLayout::DRAFTS),
-                consts(layout.passes + depth - 1),
-                consts(2 * layout.passes),
+                consts(layout.passes),
                 rope,
                 at(ChainLayout::NEXT_ROPE),
             ];
             let chain_table = argument_table(&self.device, &bindings)?;
             let n = n as u32;
+            let pass = scratchy_target_metal::tape::ids::HeadPass(depth as u32);
             scratchy_target_metal::mtp_chain::encode_mtp_chain_into_mtl4(
                 kernel,
                 enc,
                 &chain_table,
                 n,
-            );
+                pass,
+            )
+            .map_err(|e| format!("encode mtp_chain: {e:?}"))?;
         }
         Ok(onto)
     }
@@ -5663,20 +5696,6 @@ impl Worker for MetalWorker {
             t_arena.elapsed()
         );
 
-        // Phase 6 chain-advance pipeline. Tiny kernel — one-time build
-        // alongside argmax so the K-step chain driver never falls into
-        // pipeline-compile latency on the first call.
-        let t_chain = std::time::Instant::now();
-        let chain_advance = scratchy_target_metal::chain_advance::ChainAdvanceKernel::new(
-            &gpu_device.device,
-            off_tape,
-        )
-        .map_err(|e| ExecutorError::WorkerInit(format!("chain_advance kernel compile: {e:?}")))?;
-        info!(
-            "ScratchyWorker(metal): ChainAdvanceKernel::new in {:?}",
-            t_chain.elapsed()
-        );
-
         // Grammar-mask pipeline for constrained / guided decoding. Built
         // once here (negligible cost, no llguidance dependency) so the
         // first masked decode step never pays pipeline-compile latency.
@@ -5711,7 +5730,6 @@ impl Worker for MetalWorker {
         self.argmax_kernels = Some(argmax);
         self.sampler_kernels = Some(sampler);
         self.sampler_arena = Some(sampler_arena);
-        self.chain_advance_kernel = Some(chain_advance);
         self.pooling_strategy = scratchy_core_model::embedding::resolve_pooling_strategy(
             &self.config.pooling_strategy,
             &model_dir,
@@ -6013,6 +6031,20 @@ impl Worker for MetalWorker {
             model.num_hidden_layers(),
             num_gpu_blocks,
             self.config.block_size,
+        );
+        // The spec-decode chain advance over this pool's block tables, baked for its KV cap rung
+        // (their row stride). Tiny kernel — built here, once, so the K-step chain driver never
+        // falls into pipeline-compile latency on the first call.
+        let off_tape = scratchy_target_metal::off_tape::OffTapeKernels::of(model.metal_off_tape())
+            .map_err(|e| ExecutorError::WorkerInit(format!("off-tape kernels: {e}")))?;
+        let cap = Self::rung_cap(pool.max_blocks_per_seq)?;
+        self.chain_advance_kernel = Some(
+            scratchy_target_metal::chain_advance::ChainAdvanceKernel::new(
+                &device.device,
+                off_tape,
+                cap,
+            )
+            .map_err(|e| ExecutorError::WorkerInit(format!("chain_advance kernel: {e:?}")))?,
         );
         self.kv_cache = Some(pool);
 

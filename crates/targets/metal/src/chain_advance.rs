@@ -8,7 +8,7 @@
 //! roundtrip. Encoded onto the SAME MTL4 compute encoder as the
 //! adjacent forward dispatches; Metal's intra-encoder hazard tracking
 //! serializes the write→read on the shared buffers. Baked per model with
-//! its KV block size ([`crate::off_tape`]).
+//! its KV block size, once per rung of its KV cap ladder ([`crate::off_tape`]).
 
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLSize;
@@ -16,15 +16,36 @@ use objc2_metal::MTLSize;
 use crate::off_tape::{OffTapeKernels, OffTapePipeline};
 use crate::shader_cache::Device;
 use crate::stream::MetalStreamError;
+use crate::tape::ids::MaxBlocksPerSeq;
+use crate::tape::kernel_constants::ChainAdvanceConstants;
 
 pub struct ChainAdvanceKernel {
     pub pipeline: OffTapePipeline,
 }
 
 impl ChainAdvanceKernel {
-    pub fn new(device: &Device, kernels: &OffTapeKernels) -> Result<Self, MetalStreamError> {
+    /// The chain advance over block tables `cap` wide — the KV cap rung of the pool it advances,
+    /// which its kernel is baked for.
+    pub fn new(
+        device: &Device,
+        kernels: &OffTapeKernels,
+        cap: MaxBlocksPerSeq,
+    ) -> Result<Self, MetalStreamError> {
+        let stride = |k: &&crate::tape::lowered::BakedKernel| {
+            (k.constants.iter())
+                .find(|c| c.index == ChainAdvanceConstants::STRIDE.get())
+                .map(|c| c.bits)
+        };
+        let kernel = (kernels.chain_advance.iter())
+            .find(|k| stride(k) == Some(cap.get()))
+            .ok_or_else(|| {
+                MetalStreamError::ShaderCompilationFailed(format!(
+                    "chain_advance: no kernel baked for KV cap rung {}",
+                    cap.get()
+                ))
+            })?;
         Ok(Self {
-            pipeline: OffTapePipeline::new(device, &kernels.chain_advance)?,
+            pipeline: OffTapePipeline::new(device, kernel)?,
         })
     }
 }
@@ -34,8 +55,7 @@ impl ChainAdvanceKernel {
 ///   index 0: positions     [num_reqs]  read+write u32
 ///   index 1: slot_mapping  [num_reqs]  write u32
 ///   index 2: seqused_k     [num_reqs]  write u32
-///   index 3: block_table   [num_reqs * block_table_stride]  read u32
-///   index 4: block_table_stride   constant uint
+///   index 3: block_table   [num_reqs * the baked stride]  read u32
 ///   index 5: num_reqs             constant uint
 ///
 /// A barrier is inserted before the dispatch so the previous iter's

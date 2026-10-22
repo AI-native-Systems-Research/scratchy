@@ -4190,14 +4190,18 @@ fn lower_one(
                         kernel: KernelId::AttnCausalSoftmax,
                         library: "attention_causal_softmax",
                         function: "causal_softmax_prod_bf16",
-                        // SOFT_SPAN_BLOCK = span_ids block size (gather's `bs`).
-                        constants: baked(vec![CV::float(1, p.attn_scale), CV::uint(3, bs)]),
-                        // One 64-thread threadgroup per row (== the kernel's
-                        // SOFT_T): cooperative row max/sum, not one thread
+                        // SOFT_SPAN_BLOCK = span_ids block size (gather's `bs`); SOFT_T (slot 4)
+                        // the threads of a row's threadgroup, as dispatched.
+                        constants: baked(vec![
+                            CV::float(1, p.attn_scale),
+                            CV::uint(3, bs),
+                            CV::uint(4, CAUSAL_SOFTMAX_THREADS),
+                        ]),
+                        // One threadgroup per row: cooperative row max/sum, not one thread
                         // streaming kv_len serially ×3 passes.
                         dispatch: DispatchShape {
                             threadgroups: (lq, 1, 1),
-                            threads_per_threadgroup: (64, 1, 1),
+                            threads_per_threadgroup: (CAUSAL_SOFTMAX_THREADS, 1, 1),
                             m_scaling: None,
                         },
                         bindings: baked(vec![
@@ -5378,6 +5382,7 @@ fn lower_one(
                     ConstantValue::uint(1, width.get()),
                     ConstantValue::float(2, p.rms_norm_eps),
                     ConstantValue::uint(3, 0),
+                    ConstantValue::uint(4, THREADS_PER_GROUP),
                 ]),
                 dispatch: DispatchShape {
                     threadgroups: (eff_m, 1, 1),
@@ -5427,6 +5432,7 @@ fn lower_one(
                     ConstantValue::uint(1, width.get()),
                     ConstantValue::float(2, p.rms_norm_eps),
                     ConstantValue::uint(3, 1),
+                    ConstantValue::uint(4, THREADS_PER_GROUP),
                 ]),
                 dispatch: DispatchShape {
                     threadgroups: (eff_m, 1, 1),
@@ -5915,6 +5921,10 @@ fn lower_one(
 /// 5.B specialized-pipeline cache may pick a different value per
 /// kernel + bucket once measured.
 const THREADS_PER_GROUP: u32 = 256;
+
+/// The threads of a causal-softmax row's threadgroup (`attention_causal_softmax.metal`'s
+/// `SOFT_T`): its dispatch's, compiled in.
+const CAUSAL_SOFTMAX_THREADS: u32 = 64;
 
 /// 2D GEMM tile dims (M × N axes). Placeholder — kept narrow so the
 /// dispatch math stays sensible at small buckets; will be replaced
@@ -6916,6 +6926,8 @@ fn recurrent_norm(
             width.next_power_of_two().min(THREADS_PER_GROUP),
         )
     };
+    // Slot 7 (`GDN_RMS_THREADS`): the dispatch's threads, compiled in.
+    constants.push(ConstantValue::uint(7, threads_x));
     LoweredCommand {
         kernel: KernelId::GatedDeltaNet,
         library: "gdn_rms_norm_gated",
@@ -7581,63 +7593,62 @@ fn lower_moe_step(
     // gate and up LINEAR biases first — the [E, 2·inter] concat the loader interleaves, at 4 with
     // the kernel's switch at slot 3; the grouped GEMMs cannot. Every other bundle's `None` leaves
     // both unset and the kernel const-folds the adds away.
-    let gated_act_command =
-        |act, bias_layer: Option<LayerId>| -> Result<Vec<LoweredCommand>, LoweringError> {
-            // A grouped W4A8 bake fuses the act into the quant pre-pass the down projection
-            // would run. The down projection then emits no quant of its own: the same
-            // `moe_w4a8` every step of the block runs decides both, so the pair cannot
-            // disagree.
-            if moe_w4a8(b, at, &s) {
-                let tag = match act {
-                    GatedAct::Silu => W4a8Act::Silu,
-                    GatedAct::Gelu => W4a8Act::Gelu,
-                    GatedAct::SwigluOai(limit) => W4a8Act::SwigluOai(limit),
-                };
-                return Ok(vec![fused_act_quant_command(
-                    tag,
-                    R::ExpertGate,
-                    bias_layer,
-                )?]);
-            }
-            let (kernel, symbol) = match act {
-                GatedAct::Silu => (KernelId::SiluMul, silu_mul_static_name(dtype)),
-                GatedAct::Gelu => (KernelId::GeluMul, gelu_mul_static_name(dtype)),
-                GatedAct::SwigluOai(_) => {
-                    (KernelId::SwigluOaiMul, swiglu_oai_mul_static_name(dtype))
-                }
+    let gated_act_command = |act,
+                             bias_layer: Option<LayerId>|
+     -> Result<Vec<LoweredCommand>, LoweringError> {
+        // A grouped W4A8 bake fuses the act into the quant pre-pass the down projection
+        // would run. The down projection then emits no quant of its own: the same
+        // `moe_w4a8` every step of the block runs decides both, so the pair cannot
+        // disagree.
+        if moe_w4a8(b, at, &s) {
+            let tag = match act {
+                GatedAct::Silu => W4a8Act::Silu,
+                GatedAct::Gelu => W4a8Act::Gelu,
+                GatedAct::SwigluOai(limit) => W4a8Act::SwigluOai(limit),
             };
-            let (rows, m_scaling) = match s.grouping {
-                MoeGrouping::Gathered => (pairs, ms(A::X)),
-                MoeGrouping::Sorted | MoeGrouping::Grouped => (s.l.mpad_max, None),
-            };
-            let n = rows * inter;
-            let shape = grid((n.div_ceil(256), 1, 1), (256, 1, 1), m_scaling);
-            let gate = |i| s.at(i, R::ExpertGate);
-            let mut bindings = vec![gate(0), gate(1), s.at(2, R::ExpertUp)];
-            let mut constants = vec![C::uint(0, n)];
-            // The row's expert, when a kernel reads it: a grouped bake's sentinel skip, or the bias
-            // epilogue's lookup — `gather_indices`' buffer, the pair's own top-k index gathered.
-            if s.grouping == MoeGrouping::Grouped || bias_layer.is_some() {
-                bindings.push(gather_indices(&s, 3));
-                constants.extend([C::uint(1, inter), C::uint(2, e)]);
-            }
-            if let Some(l) = bias_layer {
-                bindings.push(source(
-                    router()?,
-                    WeightTensor::MoeExpertGateUpLinearBias,
-                    l,
-                    4,
-                ));
-                constants.push(C::boolean(3, true));
-            }
-            // Slot 4 (`SILU_MUL_SWIGLU_LIMIT`): SwiGLU-OAI's clamp, the model's `swiglu_limit`.
-            if let GatedAct::SwigluOai(limit) = act {
-                constants.push(C::float(4, limit.get()));
-            }
-            Ok(vec![cmd(
-                kernel, "silu_mul", symbol, constants, shape, bindings,
-            )])
+            return Ok(vec![fused_act_quant_command(
+                tag,
+                R::ExpertGate,
+                bias_layer,
+            )?]);
+        }
+        let (kernel, symbol) = match act {
+            GatedAct::Silu => (KernelId::SiluMul, silu_mul_static_name(dtype)),
+            GatedAct::Gelu => (KernelId::GeluMul, gelu_mul_static_name(dtype)),
+            GatedAct::SwigluOai(_) => (KernelId::SwigluOaiMul, swiglu_oai_mul_static_name(dtype)),
         };
+        let (rows, m_scaling) = match s.grouping {
+            MoeGrouping::Gathered => (pairs, ms(A::X)),
+            MoeGrouping::Sorted | MoeGrouping::Grouped => (s.l.mpad_max, None),
+        };
+        let n = rows * inter;
+        let shape = grid((n.div_ceil(256), 1, 1), (256, 1, 1), m_scaling);
+        let gate = |i| s.at(i, R::ExpertGate);
+        let mut bindings = vec![gate(0), gate(1), s.at(2, R::ExpertUp)];
+        let mut constants = vec![C::uint(0, n)];
+        // The row's expert, when a kernel reads it: a grouped bake's sentinel skip, or the bias
+        // epilogue's lookup — `gather_indices`' buffer, the pair's own top-k index gathered.
+        if s.grouping == MoeGrouping::Grouped || bias_layer.is_some() {
+            bindings.push(gather_indices(&s, 3));
+            constants.extend([C::uint(1, inter), C::uint(2, e)]);
+        }
+        if let Some(l) = bias_layer {
+            bindings.push(source(
+                router()?,
+                WeightTensor::MoeExpertGateUpLinearBias,
+                l,
+                4,
+            ));
+            constants.push(C::boolean(3, true));
+        }
+        // Slot 4 (`SILU_MUL_SWIGLU_LIMIT`): SwiGLU-OAI's clamp, the model's `swiglu_limit`.
+        if let GatedAct::SwigluOai(limit) = act {
+            constants.push(C::float(4, limit.get()));
+        }
+        Ok(vec![cmd(
+            kernel, "silu_mul", symbol, constants, shape, bindings,
+        )])
+    };
     // The combine of the experts' down rows, at `bias_layer` the gpt-oss pair's expert adding its
     // down LINEAR bias before its score weights it — [E, hidden] at 5, TopKIndices at 4 naming the
     // pair's expert, switch at slot 3; the grouped GEMM cannot. Same `None` contract as the act's.
@@ -8043,16 +8054,14 @@ fn lower_moe_step(
             let (mpad, one) = (s.l.mpad_max as i32, (1, 1, 1));
             let pad = s.grouping.pad().expect("a sorted bake pads");
             let sentinel = s.grouping.sentinel(e) as i32;
+            // The offsets' one threadgroup's threads, compiled in (slot 8) as dispatched.
             let offsets = vec![
                 C::int(0, pairs as i32),
                 C::int(1, e as i32),
                 C::int(6, pad as i32),
+                C::uint(8, THREADS_PER_GROUP),
             ];
             let init = vec![C::int(1, e as i32), C::int(2, mpad), C::int(7, sentinel)];
-            let scatter = [0, 1, 2, 3, 4]
-                .into_iter()
-                .zip([pairs, e, s.l.mpad_max, k, hidden]);
-            let scatter = scatter.map(|(i, v)| C::int(i, v as i32)).collect();
             let (l, lib) = (&s.l, "moe_group");
             // W4A8: the bucket's token rows are quantized once, into the `down_out` region
             // (unused until the unsort), and scattered as int8 rows + scales into `x_pad` — not
@@ -8087,6 +8096,13 @@ fn lower_moe_step(
                     hidden.min(256),
                 )
             };
+            // The scatter's threads, compiled in (slot 8) as dispatched.
+            let scatter = [0, 1, 2, 3, 4]
+                .into_iter()
+                .zip([pairs, e, s.l.mpad_max, k, hidden]);
+            let scatter = (scatter.map(|(i, v)| C::int(i, v as i32)))
+                .chain([C::uint(8, scatter_threads)])
+                .collect();
             let at = |i, off| scratch_at(i, off);
             quant
                 .into_iter()
@@ -8096,7 +8112,7 @@ fn lower_moe_step(
                         lib,
                         "moe_group_offsets",
                         offsets,
-                        grid(one, (256, 1, 1), None),
+                        grid(one, (THREADS_PER_GROUP, 1, 1), None),
                         vec![
                             s.at(0, R::TopKIndices),
                             at(1, l.grp_count),
@@ -8842,8 +8858,7 @@ mod tests {
             // The writer's encode, run here, takes its codebook's boundaries compiled in.
             let boundaries = (cmd.constants.iter())
                 .filter(|k| {
-                    crate::tape::kernel_constants::TqCodebookPart::BOUNDARY_SLOTS
-                        .contains(&k.index)
+                    crate::tape::kernel_constants::TqCodebookPart::BOUNDARY_SLOTS.contains(&k.index)
                 })
                 .count();
             let want = (1usize << TQ_BITS.get()) - 1;
@@ -9140,8 +9155,10 @@ mod tests {
         {
             use crate::tape::ids::{HeadDim, TqCodeBits};
             use crate::tape::kernel_constants::TqCodebookPart::{Boundaries, Signs};
-            let codebook: Vec<ConstantValue> =
-                (c.constants.iter()).filter(|k| k.index >= 40).copied().collect();
+            let codebook: Vec<ConstantValue> = (c.constants.iter())
+                .filter(|k| k.index >= 40)
+                .copied()
+                .collect();
             let want = [
                 Vec::from(Signs(HeadDim(hd as u32))),
                 Vec::from(Boundaries(TqCodeBits(TQ_BITS.get()))),
@@ -9343,7 +9360,9 @@ mod tests {
                     C::boolean(5, true),
                     // Two groups a token is not a multiple of four: the simdgroup
                     // form takes one row a threadgroup, its baseline exact.
-                    C::uint(6, 1)
+                    C::uint(6, 1),
+                    // Its threads, compiled in: one simdgroup.
+                    C::uint(7, 32)
                 ]
             );
             let norm = binds(&tiny[3]);
@@ -9571,7 +9590,9 @@ mod tests {
         // centroids of the code width.
         let codebook = |c: &LoweredCommand| {
             use crate::tape::kernel_constants::TqCodebookPart;
-            let hd = (c.constants.iter()).find(|k| k.index == 0).expect("head dim");
+            let hd = (c.constants.iter())
+                .find(|k| k.index == 0)
+                .expect("head dim");
             let mut v = Vec::from(TqCodebookPart::Signs(crate::tape::ids::HeadDim(hd.bits)));
             v.extend(Vec::from(TqCodebookPart::Centroids(
                 crate::tape::ids::TqCodeBits(bits),
@@ -11559,7 +11580,9 @@ mod tests {
         // boundaries (`turboquant::tests` pins both to the quantizer's tables).
         use crate::tape::kernel_constants::TqCodebookPart;
         let signs = Vec::from(TqCodebookPart::Signs(crate::tape::ids::HeadDim(hd)));
-        let boundaries = Vec::from(TqCodebookPart::Boundaries(crate::tape::ids::TqCodeBits(bits)));
+        let boundaries = Vec::from(TqCodebookPart::Boundaries(crate::tape::ids::TqCodeBits(
+            bits,
+        )));
         assert_eq!(
             encode,
             [

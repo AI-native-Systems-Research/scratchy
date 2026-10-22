@@ -406,6 +406,7 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
                 int(0, pairs as i32),
                 int(1, experts as i32),
                 int(6, 1), // MG_BM = 1: no padding — a sorted bake.
+                ConstantValue::uint(ConstSlot(8), 256), // MG_THREADS: as dispatched.
             ],
         )
         .expect("offsets");
@@ -430,6 +431,7 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
                 int(2, pairs as i32),
                 int(3, TOP_K as i32),
                 int(4, HIDDEN as i32),
+                ConstantValue::uint(ConstSlot(8), HIDDEN.min(256) as u32), // MG_THREADS.
             ],
         )
         .expect("scatter");
@@ -768,6 +770,7 @@ fn moe_group_offsets_count_every_expert_at_256() {
             int(0, pairs as i32),
             int(1, QWEN_EXPERTS as i32),
             int(6, BM as i32),
+            ConstantValue::uint(ConstSlot(8), 256), // MG_THREADS: as dispatched.
         ],
     )
     .expect("offsets");

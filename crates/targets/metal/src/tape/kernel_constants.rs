@@ -1453,18 +1453,43 @@ impl From<FusedGateUpSiluMulPrefillConstants> for Vec<ConstantValue> {
 
 // ── Off-tape logits kernels ────────────────────────────────────────
 
-/// `argmax.metal` slot 0: the logits per row.
+/// The threads of an argmax row's threadgroup (`argmax.metal`'s `ARGMAX_THREADS`, slot 2): its
+/// dispatch's, compiled in.
+pub const ARGMAX_THREADS: u32 = 1024;
+
+/// `argmax.metal`: slot 0 the logits per row, slot 2 [`ARGMAX_THREADS`].
 pub struct ArgmaxConstants {
     pub vocab: crate::tape::ids::LogitsWidth,
 }
 
 impl From<ArgmaxConstants> for Vec<ConstantValue> {
     fn from(c: ArgmaxConstants) -> Self {
-        vec![ConstantValue::uint(ConstSlot(0), c.vocab.get())]
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.vocab.get()),
+            ConstantValue::uint(ConstSlot(2), ARGMAX_THREADS),
+        ]
     }
 }
 
-/// `grammar_mask.metal`: slot 0 the logits per row, slot 1 the allow-bitset row stride.
+/// The threads of a grammar-mask row's threadgroup (`grammar_mask.metal`'s `GRAMMAR_THREADS`,
+/// slot 2): its dispatch's, compiled in.
+pub const GRAMMAR_MASK_THREADS: u32 = 256;
+
+/// The threads of a `select_rows` op's threadgroup (`select_rows.metal`'s `SELECT_THREADS`, slot 0):
+/// its dispatch's, compiled in.
+pub const SELECT_ROWS_THREADS: u32 = 64;
+
+/// `select_rows.metal`: slot 0 [`SELECT_ROWS_THREADS`].
+pub struct SelectRowsConstants;
+
+impl From<SelectRowsConstants> for Vec<ConstantValue> {
+    fn from(_: SelectRowsConstants) -> Self {
+        vec![ConstantValue::uint(ConstSlot(0), SELECT_ROWS_THREADS)]
+    }
+}
+
+/// `grammar_mask.metal`: slot 0 the logits per row, slot 1 the allow-bitset row stride, slot 2
+/// [`GRAMMAR_MASK_THREADS`].
 pub struct GrammarMaskConstants {
     pub vocab: crate::tape::ids::LogitsWidth,
     pub words_per_row: crate::tape::ids::BitsetWords,
@@ -1475,12 +1500,18 @@ impl From<GrammarMaskConstants> for Vec<ConstantValue> {
         vec![
             ConstantValue::uint(ConstSlot(0), c.vocab.get()),
             ConstantValue::uint(ConstSlot(1), c.words_per_row.get()),
+            ConstantValue::uint(ConstSlot(2), GRAMMAR_MASK_THREADS),
         ]
     }
 }
 
+/// The top candidates a row's telemetry spill holds (`sampling.metal`'s `SAMPLER_TELEM_K`, slot
+/// 2, compiled into the stages that spill).
+pub const SAMPLER_TELEM_K: u32 = 8;
+
 /// `sampling.metal`: slot 0 the logits per row, slot 1 whether the telemetry spill is compiled
-/// in (`sample_softmax_materialize` / `sample_finalize` only).
+/// in (`sample_softmax_materialize` / `sample_finalize` only), and with it slot 2 the candidates
+/// it spills ([`SAMPLER_TELEM_K`]).
 pub struct SamplerConstants {
     pub vocab: crate::tape::ids::LogitsWidth,
     pub telemetry: Option<bool>,
@@ -1490,12 +1521,17 @@ impl From<SamplerConstants> for Vec<ConstantValue> {
     fn from(c: SamplerConstants) -> Self {
         let vocab = ConstantValue::uint(ConstSlot(0), c.vocab.get());
         let telemetry = c.telemetry.map(|t| ConstantValue::boolean(ConstSlot(1), t));
-        std::iter::once(vocab).chain(telemetry).collect()
+        let spill =
+            (c.telemetry == Some(true)).then(|| ConstantValue::uint(ConstSlot(2), SAMPLER_TELEM_K));
+        std::iter::once(vocab)
+            .chain(telemetry)
+            .chain(spill)
+            .collect()
     }
 }
 
-/// `mtp_chain.metal`: slot 0 a multi-token-prediction head's hidden width, slot 1 its drafts a
-/// step, slot 2 the width of its rotary cos/sin rows (0: its rope reads positions).
+/// A multi-token-prediction head's chain between its passes (`mtp_chain.metal`): its hidden width,
+/// its drafts a step and the width of its rotary cos/sin rows (0: its rope reads positions).
 #[derive(Clone, Copy)]
 pub struct MtpChainConstants {
     pub hidden: HiddenSize,
@@ -1503,23 +1539,45 @@ pub struct MtpChainConstants {
     pub rope: crate::tape::ids::RotDim,
 }
 
-impl From<MtpChainConstants> for Vec<ConstantValue> {
-    fn from(c: MtpChainConstants) -> Self {
+/// The threads of an `mtp_chain` threadgroup (`MTP_THREADS`): its dispatch's, compiled in.
+pub const MTP_CHAIN_THREADS: u32 = 256;
+
+impl MtpChainConstants {
+    /// The chain after its pass `depth`: slots 0-2 the head's, 3 the pass, 4 its threads.
+    pub fn after(self, depth: crate::tape::ids::HeadPass) -> Vec<ConstantValue> {
+        assert!(
+            (1..=self.drafts.get()).contains(&depth.get()),
+            "pass {} of a head drafting {} a step",
+            depth.get(),
+            self.drafts.get()
+        );
         vec![
-            ConstantValue::uint(ConstSlot(0), c.hidden.get()),
-            ConstantValue::uint(ConstSlot(1), c.drafts.get()),
-            ConstantValue::uint(ConstSlot(2), c.rope.get()),
+            ConstantValue::uint(ConstSlot(0), self.hidden.get()),
+            ConstantValue::uint(ConstSlot(1), self.drafts.get()),
+            ConstantValue::uint(ConstSlot(2), self.rope.get()),
+            ConstantValue::uint(ConstSlot(3), depth.get()),
+            ConstantValue::uint(ConstSlot(4), MTP_CHAIN_THREADS),
         ]
     }
 }
 
-/// `chain_advance.metal` slot 0: the model's KV block size.
+/// `chain_advance.metal`: slot 0 the model's KV block size, slot 1 the block table's row stride —
+/// a KV cap rung, one kernel each.
 pub struct ChainAdvanceConstants {
     pub block_size: BlockSize,
+    pub block_table_stride: crate::tape::ids::MaxBlocksPerSeq,
+}
+
+impl ChainAdvanceConstants {
+    /// `CHAIN_BLOCK_TABLE_STRIDE` (slot 1).
+    pub const STRIDE: ConstSlot = ConstSlot(1);
 }
 
 impl From<ChainAdvanceConstants> for Vec<ConstantValue> {
     fn from(c: ChainAdvanceConstants) -> Self {
-        vec![ConstantValue::uint(ConstSlot(0), c.block_size.get())]
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.block_size.get()),
+            ConstantValue::uint(ChainAdvanceConstants::STRIDE, c.block_table_stride.get()),
+        ]
     }
 }

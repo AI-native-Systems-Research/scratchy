@@ -334,6 +334,9 @@ u32_newtype!(
     BitsetWords,
     /// Drafts a multi-token-prediction head makes a speculative step (its `spec_drafts`).
     NumDrafts,
+    /// A multi-token-prediction head's pass over a speculative step, from 1 — the draft it
+    /// picks; at most its [`NumDrafts`].
+    HeadPass,
 );
 
 impl TqDecodeHeads {

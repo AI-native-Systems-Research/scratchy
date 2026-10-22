@@ -7528,13 +7528,14 @@ enum BackboneLayout {
 /// nodes via [`last_non_splice_node`] — those are
 /// appended by lowering passes but aren't the body's actual terminal.
 /// The model's `METAL_OFF_TAPE` static: its argmax, grammar mask and sampler kernels baked for its
-/// logits `width` and `dtype`, and — `head`, a multi-token-prediction head's drafts a step and the
-/// width of the hidden rows its passes read — its chain between passes
-/// (`scratchy_target_metal::off_tape`).
+/// logits `width` and `dtype`, its chain advance for each rung of its KV `caps`, and — `head`, a
+/// multi-token-prediction head's drafts a step and the width of the hidden rows its passes read —
+/// its chain between passes (`scratchy_target_metal::off_tape`).
 #[cfg(feature = "metal")]
 fn metal_off_tape_tokens(
     width: u64,
     mc: &scratchy_target_metal::tape::model_consts::MetalModelConsts,
+    caps: &[scratchy_target_metal::tape::ids::MaxBlocksPerSeq],
     head: Option<(u32, u32)>,
     vocab_suffix: Option<scratchy_target_metal::off_tape::VocabSuffix>,
 ) -> TokenStream {
@@ -7554,6 +7555,7 @@ fn metal_off_tape_tokens(
         LogitsWidth(width),
         mc.metal_dtype,
         block_size,
+        caps,
         head,
         mc.spec_drafts > 0,
         vocab_suffix,
@@ -7627,6 +7629,7 @@ fn metal_off_tape_tokens(
         Some(k) => quote!(::core::option::Option::Some(#k)),
         None => quote!(::core::option::Option::None),
     };
+    let mtp_chain = mtp_chain.map(|after| quote!(&[#(#after),*]));
     let (mtp_chain, select_rows, vocab_suffix) =
         (option(mtp_chain), option(select_rows), option(vocab_suffix));
     quote! {
@@ -7639,7 +7642,7 @@ fn metal_off_tape_tokens(
                 argmax_dual_write: #argmax_dual_write,
                 grammar_mask: #grammar_mask,
                 sampler: [#(#sampler),*],
-                chain_advance: #chain_advance,
+                chain_advance: &[#(#chain_advance),*],
                 mtp_chain: #mtp_chain,
                 select_rows: #select_rows,
                 vocab_suffix: #vocab_suffix,
@@ -15132,7 +15135,13 @@ pub fn emit_model(
             (drafts, hidden)
         });
         let vocab_suffix = metal_vocab_suffix(program, fuf, model, mc);
-        metal_arena_bytes_statics.push(metal_off_tape_tokens(logits_width, mc, head, vocab_suffix));
+        metal_arena_bytes_statics.push(metal_off_tape_tokens(
+            logits_width,
+            mc,
+            &metal_cap_ladder,
+            head,
+            vocab_suffix,
+        ));
     }
     let metal_emission = quote! {
         #(#metal_arena_bytes_statics)*

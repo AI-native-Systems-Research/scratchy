@@ -31,7 +31,8 @@ pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 
 /// Threads per threadgroup; one threadgroup masks one constrained row,
 /// striding the threads over the vocab axis (no reduction).
-pub const GRAMMAR_MASK_TG_SIZE: usize = 256;
+pub const GRAMMAR_MASK_TG_SIZE: usize =
+    crate::tape::kernel_constants::GRAMMAR_MASK_THREADS as usize;
 
 pub struct GrammarMaskKernels {
     pub mask: OffTapePipeline,

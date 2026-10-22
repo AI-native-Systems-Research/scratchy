@@ -34,6 +34,8 @@ using namespace metal;
 
 SCRATCHY_CONSTANT(uint, GRAMMAR_VOCAB, 0);
 SCRATCHY_CONSTANT(uint, GRAMMAR_WORDS_PER_ROW, 1);
+// 2: the threads of a row's threadgroup — the dispatch's, compiled in.
+SCRATCHY_CONSTANT(uint, GRAMMAR_THREADS, 2);
 
 template <typename T>
 [[kernel]] void grammar_mask(
@@ -41,15 +43,14 @@ template <typename T>
     device const uint*  allow_bits [[buffer(1)]],
     device const uint*  rows       [[buffer(2)]],
     uint  gid [[threadgroup_position_in_grid]],
-    uint  tid [[thread_position_in_threadgroup]],
-    uint  tg  [[threads_per_threadgroup]])
+    uint  tid [[thread_position_in_threadgroup]])
 {
     uint logits_row = rows[gid];
     device       T*    row  = logits     + uint(logits_row) * GRAMMAR_VOCAB;
     device const uint* bits = allow_bits + uint(gid) * GRAMMAR_WORDS_PER_ROW;
     uint bitset_cap = GRAMMAR_WORDS_PER_ROW * 32u;
 
-    for (uint v = tid; v < GRAMMAR_VOCAB; v += tg) {
+    for (uint v = tid; v < GRAMMAR_VOCAB; v += GRAMMAR_THREADS) {
         // Slots beyond the bitset (vocab padding the lm_head emits past the
         // tokenizer vocab) are never grammar-allowed → always -inf. Guarding
         // here also keeps the bits[] read in bounds when vocab > bitset_cap.

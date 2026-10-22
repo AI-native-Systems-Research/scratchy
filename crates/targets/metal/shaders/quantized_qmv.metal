@@ -4,23 +4,23 @@
 // `affine_qmv` decode-matvec kernels from
 // `mlx/backend/metal/kernels/quantized.h` (lines 692-975 for the
 // `*_impl` helpers, 1444-1597 for the `[[kernel]]` entry points,
-// 28-392 for the qdot / load_vector helpers, 1351-1387 for
-// `adjust_matrix_offsets`).
+// 28-392 for the qdot / load_vector helpers). Single matrices only: every dimension is
+// compiled in, so MLX's batched form (runtime shapes and strides) has no instantiation.
 //
 // Per `INT4_PARITY_PLAN.md` §P3, instantiations cover:
 //   bits = 4
 //   group_size in {32, 64, 128}
 //   dtype in {f16, bf16}
-//   qmv_quad: D in {64, 128} × batched in {0, 1}
-//   qmv_fast: batched in {0, 1}; its _t8 fold twin: batch 0 only
-//   qmv:      batched in {0, 1}
+//   qmv_quad: D in {64, 128}
+//   qmv_fast, and its _t8 fold twin
+//   qmv
 //
 // Symbol naming follows the existing scratchy-target-metal precedent
 // (`affine_dequantize_<dtype>_gs_<gs>_b_<bits>`):
-//   affine_qmv_quad_<dtype>_gs_<gs>_b_<bits>_d_<D>_batch_<batched>
-//   affine_qmv_fast_<dtype>_gs_<gs>_b_<bits>_batch_<batched>
+//   affine_qmv_quad_<dtype>_gs_<gs>_b_<bits>_d_<D>_batch_0
+//   affine_qmv_fast_<dtype>_gs_<gs>_b_<bits>_batch_0
 //   affine_qmv_fast_<dtype>_gs_<gs>_b_<bits>_t8_batch_0
-//   affine_qmv_<dtype>_gs_<gs>_b_<bits>_batch_<batched>
+//   affine_qmv_<dtype>_gs_<gs>_b_<bits>_batch_0
 //
 // The helper templates (load_vector / qdot / etc.) keep the full
 // `bits in {2,3,4,5,6,8}` switch so the body is byte-identical to
@@ -524,86 +524,6 @@ inline U qdot_safe(
 }
 
 // ─────────────────────────────────────────────────────────────────
-// elem_to_loc helpers — utils.h:97-125 + steel/utils.h:7-42
-// ─────────────────────────────────────────────────────────────────
-
-template <typename IdxT = int64_t>
-METAL_FUNC IdxT elem_to_loc(
-    uint elem,
-    constant const int* shape,
-    constant const int64_t* strides,
-    int ndim) {
-  IdxT loc = 0;
-  for (int i = ndim - 1; i >= 0 && elem > 0; --i) {
-    loc += (elem % shape[i]) * IdxT(strides[i]);
-    elem /= shape[i];
-  }
-  return loc;
-}
-
-METAL_FUNC ulong3 elem_to_loc_broadcast(
-    uint elem,
-    constant const int* shape,
-    constant const int64_t* a_strides,
-    constant const int64_t* b_strides,
-    constant const int64_t* c_strides,
-    int ndim) {
-  ulong loc_a{0};
-  ulong loc_b{0};
-  ulong loc_c{0};
-  for (int i = ndim - 1; i >= 0 && elem > 0; --i) {
-    int pos_in_dim = (elem % shape[i]);
-    elem /= shape[i];
-    loc_a += pos_in_dim * a_strides[i];
-    loc_b += pos_in_dim * b_strides[i];
-    loc_c += pos_in_dim * c_strides[i];
-  }
-  return ulong3(loc_a, loc_b, loc_c);
-}
-
-// ─────────────────────────────────────────────────────────────────
-// adjust_matrix_offsets — quantized.h:1351-1387 (single-array form)
-// ─────────────────────────────────────────────────────────────────
-
-template <typename T_act, typename T_scale>
-METAL_FUNC void adjust_matrix_offsets(
-    const device T_act*& x,
-    const device uint32_t*& w,
-    const device T_scale*& scales,
-    const device T_scale*& biases,
-    device T_act*& y,
-    int output_stride,
-    const constant int& x_batch_ndims,
-    const constant int* x_shape,
-    const constant int64_t* x_strides,
-    const constant int& w_batch_ndims,
-    const constant int* w_shape,
-    const constant int64_t* w_strides,
-    const constant int64_t* s_strides,
-    const constant int64_t* b_strides,
-    uint3 tid [[threadgroup_position_in_grid]]) {
-  uint32_t x_idx = tid.z;
-  uint32_t w_idx = tid.z;
-  if (x_batch_ndims == 1) {
-    x += x_idx * x_strides[0];
-  } else {
-    x += elem_to_loc(x_idx, x_shape, x_strides, x_batch_ndims);
-  }
-  if (w_batch_ndims == 1) {
-    w += w_idx * w_strides[0];
-    scales += w_idx * s_strides[0];
-    biases += w_idx * b_strides[0];
-  } else {
-    ulong3 idx = elem_to_loc_broadcast(
-        w_idx, w_shape, w_strides, s_strides, b_strides, w_batch_ndims);
-    w += idx.x;
-    scales += idx.y;
-    biases += idx.z;
-  }
-  y += tid.z * output_stride;
-}
-
-// ─────────────────────────────────────────────────────────────────
 // qmv_quad_impl — quantized.h:692-747
 // ─────────────────────────────────────────────────────────────────
 
@@ -976,7 +896,7 @@ METAL_FUNC void qmv_impl(
 // affine_qmv_quad — quantized.h:1443-1493
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T_act, typename T_scale, int group_size, int bits, int D, bool batched>
+template <typename T_act, typename T_scale, int group_size, int bits, int D>
 [[kernel]] void affine_qmv_quad(
     const device uint32_t* w [[buffer(0)]],
     const device T_scale* scales [[buffer(1)]],
@@ -987,38 +907,11 @@ template <typename T_act, typename T_scale, int group_size, int bits, int D, boo
     // file-scope constants IN_VEC_SIZE / OUT_VEC_SIZE so this
     // kernel is recordable into an MTLIndirectComputeCommand (which
     // exposes setKernelBuffer but not setKernelBytes).
-    const constant int& x_batch_ndims [[buffer(7)]],
-    const constant int* x_shape [[buffer(8)]],
-    const constant int64_t* x_strides [[buffer(9)]],
-    const constant int& w_batch_ndims [[buffer(10)]],
-    const constant int* w_shape [[buffer(11)]],
-    const constant int64_t* w_strides [[buffer(12)]],
-    const constant int64_t* s_strides [[buffer(13)]],
-    const constant int64_t* b_strides [[buffer(14)]],
     const device T_scale* gain [[buffer(15)]],
     const device T_act* bias [[buffer(16)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint quad_gid [[quadgroup_index_in_threadgroup]],
     uint quad_lid [[thread_index_in_quadgroup]]) {
-  if (batched) {
-    int M = x_shape[x_batch_ndims];
-    adjust_matrix_offsets<T_act, T_scale>(
-        x,
-        w,
-        scales,
-        biases,
-        y,
-        OUT_VEC_SIZE * M,
-        x_batch_ndims,
-        x_shape,
-        x_strides,
-        w_batch_ndims,
-        w_shape,
-        w_strides,
-        s_strides,
-        b_strides,
-        tid);
-  }
   qmv_quad_impl<T_act, T_scale, group_size, bits, D>(
       w,
       scales,
@@ -1038,7 +931,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, int D, boo
 // affine_qmv_fast — quantized.h:1495-1545
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T_act, typename T_scale, int group_size, int bits, bool batched,
+template <typename T_act, typename T_scale, int group_size, int bits,
           int results_per_simdgroup = QMV_FAST_ROWS>
 [[kernel]] void affine_qmv_fast(
     const device uint32_t* w [[buffer(0)]],
@@ -1048,38 +941,11 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool batch
     device T_act* y [[buffer(4)]],
     // buffer(5) / buffer(6): see note on affine_qmv_quad above —
     // K / N are the compiled-in IN_VEC_SIZE / OUT_VEC_SIZE.
-    const constant int& x_batch_ndims [[buffer(7)]],
-    const constant int* x_shape [[buffer(8)]],
-    const constant int64_t* x_strides [[buffer(9)]],
-    const constant int& w_batch_ndims [[buffer(10)]],
-    const constant int* w_shape [[buffer(11)]],
-    const constant int64_t* w_strides [[buffer(12)]],
-    const constant int64_t* s_strides [[buffer(13)]],
-    const constant int64_t* b_strides [[buffer(14)]],
     const device T_scale* gain [[buffer(15)]],
     const device T_act* bias [[buffer(16)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  if (batched) {
-    int M = x_shape[x_batch_ndims];
-    adjust_matrix_offsets<T_act, T_scale>(
-        x,
-        w,
-        scales,
-        biases,
-        y,
-        OUT_VEC_SIZE * M,
-        x_batch_ndims,
-        x_shape,
-        x_strides,
-        w_batch_ndims,
-        w_shape,
-        w_strides,
-        s_strides,
-        b_strides,
-        tid);
-  }
   qmv_fast_impl<T_act, T_scale, group_size, bits, device T_act*, results_per_simdgroup>(
       w, scales, biases, x, y, IN_VEC_SIZE, OUT_VEC_SIZE, tid, simd_gid, simd_lid, gain, bias);
 }
@@ -1088,7 +954,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool batch
 // affine_qmv — quantized.h:1547-1597
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T_act, typename T_scale, const int group_size, const int bits, bool batched>
+template <typename T_act, typename T_scale, const int group_size, const int bits>
 [[kernel]] void affine_qmv(
     const device uint32_t* w [[buffer(0)]],
     const device T_scale* scales [[buffer(1)]],
@@ -1097,38 +963,11 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
     device T_act* y [[buffer(4)]],
     // buffer(5) / buffer(6): see note on affine_qmv_quad above —
     // K / N are the compiled-in IN_VEC_SIZE / OUT_VEC_SIZE.
-    const constant int& x_batch_ndims [[buffer(7)]],
-    const constant int* x_shape [[buffer(8)]],
-    const constant int64_t* x_strides [[buffer(9)]],
-    const constant int& w_batch_ndims [[buffer(10)]],
-    const constant int* w_shape [[buffer(11)]],
-    const constant int64_t* w_strides [[buffer(12)]],
-    const constant int64_t* s_strides [[buffer(13)]],
-    const constant int64_t* b_strides [[buffer(14)]],
     const device T_scale* gain [[buffer(15)]],
     const device T_act* bias [[buffer(16)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  if (batched) {
-    int M = x_shape[x_batch_ndims];
-    adjust_matrix_offsets<T_act, T_scale>(
-        x,
-        w,
-        scales,
-        biases,
-        y,
-        OUT_VEC_SIZE * M,
-        x_batch_ndims,
-        x_shape,
-        x_strides,
-        w_batch_ndims,
-        w_shape,
-        w_strides,
-        s_strides,
-        b_strides,
-        tid);
-  }
   qmv_impl<T_act, T_scale, group_size, bits>(
       w,
       scales,
@@ -1248,7 +1087,7 @@ METAL_FUNC void qmv_tiny_impl(
   }
 }
 
-template <typename T_act, typename T_scale, const int group_size, const int bits, bool batched>
+template <typename T_act, typename T_scale, const int group_size, const int bits>
 [[kernel]] void affine_qmv_tiny(
     const device uint32_t* w [[buffer(0)]],
     const device T_scale* scales [[buffer(1)]],
@@ -1257,14 +1096,6 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
     device T_act* y [[buffer(4)]],
     // buffer(5) / buffer(6): see note on affine_qmv_quad above —
     // K / N are the compiled-in IN_VEC_SIZE / OUT_VEC_SIZE.
-    const constant int& x_batch_ndims [[buffer(7)]],
-    const constant int* x_shape [[buffer(8)]],
-    const constant int64_t* x_strides [[buffer(9)]],
-    const constant int& w_batch_ndims [[buffer(10)]],
-    const constant int* w_shape [[buffer(11)]],
-    const constant int64_t* w_strides [[buffer(12)]],
-    const constant int64_t* s_strides [[buffer(13)]],
-    const constant int64_t* b_strides [[buffer(14)]],
     const device T_scale* gain [[buffer(15)]],
     const device T_act* bias [[buffer(16)]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -1282,25 +1113,6 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
       "affine_qmv_tiny: K must be a whole multiple of the 16-value lane chunk");
   // One row's two simdgroup partials (+ the norm's sum of squares at [7]).
   threadgroup float red[16];
-  if (batched) {
-    int M = x_shape[x_batch_ndims];
-    adjust_matrix_offsets<T_act, T_scale>(
-        x,
-        w,
-        scales,
-        biases,
-        y,
-        OUT_VEC_SIZE * M,
-        x_batch_ndims,
-        x_shape,
-        x_strides,
-        w_batch_ndims,
-        w_shape,
-        w_strides,
-        s_strides,
-        b_strides,
-        tid);
-  }
   qmv_tiny_impl<T_act, T_scale, group_size, bits>(
       w,
       scales,
@@ -1574,14 +1386,14 @@ template <
 // Instantiations — bits=4, gs in {32, 64, 128}, dtype in {f16, bf16}
 // ─────────────────────────────────────────────────────────────────
 
-#define INST_QMV_BATCHED(name, act_tag, act_type, scale_tag, scale_type, gs, bits, batched) \
-  SCRATCHY_KERNEL(name##_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_batch_##batched,  \
-                  name<act_type, scale_type, gs, bits, batched>)
+#define INST_QMV(name, act_tag, act_type, scale_tag, scale_type, gs, bits) \
+  SCRATCHY_KERNEL(name##_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_batch_0, \
+                  name<act_type, scale_type, gs, bits>)
 
-#define INST_QMV_QUAD(name, act_tag, act_type, scale_tag, scale_type, gs, bits, D, batched) \
-  SCRATCHY_KERNEL(                                                                          \
-      name##_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_d_##D##_batch_##batched,      \
-      name<act_type, scale_type, gs, bits, D, batched>)
+#define INST_QMV_QUAD(name, act_tag, act_type, scale_tag, scale_type, gs, bits, D) \
+  SCRATCHY_KERNEL(                                                                \
+      name##_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_d_##D##_batch_0,     \
+      name<act_type, scale_type, gs, bits, D>)
 
 // The fold twin: `affine_qmv_fast` at MLX's 4 rows a simdgroup (8-row threadgroups), for the
 // m>=2 buckets a pre-gen-15 GPU decodes with — the small-M wide band that would take them needs
@@ -1591,19 +1403,15 @@ template <
 #define INST_QMV_FAST_T8(act_tag, act_type, scale_tag, scale_type, gs, bits)                  \
   SCRATCHY_KERNEL(                                                                            \
       affine_qmv_fast_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_t8_batch_0,            \
-      affine_qmv_fast<act_type, scale_type, gs, bits, /*batched=*/false, /*rows a simdgroup=*/4>)
+      affine_qmv_fast<act_type, scale_type, gs, bits, /*rows a simdgroup=*/4>)
 
 #define INST_QMV_ALL(act_tag, act_type, scale_tag, scale_type, gs)                          \
-  INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 4, 0)     \
-  INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 4, 1)     \
+  INST_QMV(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 4)     \
   INST_QMV_FAST_T8(act_tag, act_type, scale_tag, scale_type, gs, 4)                         \
-  INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 4, 0)     \
-  INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 4, 1)     \
-  INST_QMV_BATCHED(affine_qmv_tiny, act_tag, act_type, scale_tag, scale_type, gs, 4, 0)     \
-  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 64, 0) \
-  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 64, 1) \
-  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 128,0) \
-  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 128,1)
+  INST_QMV(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 4)     \
+  INST_QMV(affine_qmv_tiny, act_tag, act_type, scale_tag, scale_type, gs, 4)     \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 64) \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 128)
 
 // Coverage: T_scale=half always (every sampled mlx-community 4bit ships
 // F16 scales — `INT4_PARITY_PROBES.md:73,287`). T_act per `torch_dtype`.
@@ -1628,15 +1436,14 @@ INST_QMV_ALL(f16,  half,   bf16, bfloat, 128)
 // qdot template bodies are bits-generic (faithful MLX port — bits ∈
 // {2,3,4,5,6,8} branches); only the entry-point symbols were 4-bit
 // until now. bf16/bf16 = the Gemma4 production combo; f16/f16 kept
-// for unit tests. batch_0 only (the decode/prefill paths never use
-// the batched variants for the MLP).
+// for unit tests.
 #define INST_QMV_ALL_B8(act_tag, act_type, scale_tag, scale_type, gs)                       \
-  INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 8, 0)     \
+  INST_QMV(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 8)     \
   INST_QMV_FAST_T8(act_tag, act_type, scale_tag, scale_type, gs, 8)                         \
-  INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 8, 0)     \
-  INST_QMV_BATCHED(affine_qmv_tiny, act_tag, act_type, scale_tag, scale_type, gs, 8, 0)     \
-  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 8, 64, 0) \
-  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 8, 128,0)
+  INST_QMV(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 8)     \
+  INST_QMV(affine_qmv_tiny, act_tag, act_type, scale_tag, scale_type, gs, 8)     \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 8, 64) \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 8, 128)
 
 INST_QMV_ALL_B8(bf16, bfloat, bf16, bfloat, 64)
 INST_QMV_ALL_B8(f16,  half,   f16,  half,   64)
@@ -1646,17 +1453,14 @@ INST_QMV_ALL_B8(f16,  half,   f16,  half,   64)
 // packing (a continuous LSB-first bitstream — 8 elements per 3 bytes, so
 // packed cols are ceil(K*3/32), NOT K/(32/3)); only the entry points were
 // missing. bf16/bf16 = the GLM production combo; f16/f16 for unit tests.
-// batch_0 + batch_1 for the fast/plain qmv (attention projections decode
-// at both). NO quad rows: qmv_quad_impl's `pack_factor = 32 / bits` index
+// NO quad rows: qmv_quad_impl's `pack_factor = 32 / bits` index
 // math is only exact for power-of-two bits — MLX never dispatches quad at
 // odd widths (`dispatch_qmv` gates on `is_power_of_2(bits)`) and neither
 // do we (`pick_qmv_kernel_wide`'s `pow2_bits`).
 #define INST_QMV_ALL_B3(act_tag, act_type, scale_tag, scale_type, gs)                       \
-  INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 3, 0)     \
-  INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 3, 1)     \
+  INST_QMV(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 3)     \
   INST_QMV_FAST_T8(act_tag, act_type, scale_tag, scale_type, gs, 3)                         \
-  INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 3, 0)     \
-  INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 3, 1)
+  INST_QMV(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 3)
 
 INST_QMV_ALL_B3(bf16, bfloat, bf16, bfloat, 64)
 INST_QMV_ALL_B3(f16,  half,   f16,  half,   64)
@@ -1669,19 +1473,13 @@ INST_QMV_ALL_B3(f16,  half,   f16,  half,   64)
 // at K∈{64,128} — the 120b itself never hits it (every affine K is
 // 2880/4096) but a parity-tiny config can shrink K into the quad band.
 // bf16/bf16 = the gpt-oss production combo; f16/f16 for unit tests.
-// batch_0 + batch_1 for the fast/plain qmv (attention projections decode
-// at both).
 #define INST_QMV_ALL_B2(act_tag, act_type, scale_tag, scale_type, gs)                       \
-  INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 2, 0)     \
-  INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 2, 1)     \
+  INST_QMV(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 2)     \
   INST_QMV_FAST_T8(act_tag, act_type, scale_tag, scale_type, gs, 2)                         \
-  INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 2, 0)     \
-  INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 2, 1)     \
-  INST_QMV_BATCHED(affine_qmv_tiny, act_tag, act_type, scale_tag, scale_type, gs, 2, 0)     \
-  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 64, 0) \
-  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 64, 1) \
-  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 128,0) \
-  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 128,1)
+  INST_QMV(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 2)     \
+  INST_QMV(affine_qmv_tiny, act_tag, act_type, scale_tag, scale_type, gs, 2)     \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 64) \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 128)
 
 INST_QMV_ALL_B2(bf16, bfloat, bf16, bfloat, 64)
 INST_QMV_ALL_B2(f16,  half,   f16,  half,   64)

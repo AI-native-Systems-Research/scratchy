@@ -45,6 +45,8 @@ fn offsets_count_every_expert() {
             ConstantValue::int(ConstSlot(0), pairs as i32),
             ConstantValue::int(ConstSlot(1), experts as i32),
             ConstantValue::int(ConstSlot(6), BM as i32),
+            // MG_THREADS: the dispatch's 256.
+            ConstantValue::uint(ConstSlot(8), 256),
         ];
         let pso = baked_pipeline(&device, "moe_group", "moe_group_offsets", constants)
             .expect("moe_group_offsets");

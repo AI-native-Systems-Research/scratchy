@@ -84,6 +84,10 @@ using namespace metal;
 SCRATCHY_CONSTANT(uint, SAMPLER_VOCAB, 0);
 // The telemetry spill (`sample_softmax_materialize` / `sample_finalize`): slot 1, compiled in.
 #define SAMPLER_TELEMETRY SCRATCHY_CONSTANT_1
+#if SAMPLER_TELEMETRY
+// 2: the top candidates a row's spill holds, compiled in.
+SCRATCHY_CONSTANT(uint, SAMPLER_TELEM_K, 2);
+#endif
 
 #define SAMPLING_BLOCK_SIZE 256
 #define MAX_CANDIDATES 1024
@@ -779,7 +783,7 @@ kernel void sample_finalize(
 #if SAMPLER_TELEMETRY
         uint telem_on = telem_consts[0];
         if (telem_on != 0u) {
-            uint telem_k = telem_consts[1];
+            constexpr uint telem_k = SAMPLER_TELEM_K;
             uint base = row * telem_k;
             for (uint i = 0; i < telem_k; i++) {
                 bool valid = (int)i < num_candidates;

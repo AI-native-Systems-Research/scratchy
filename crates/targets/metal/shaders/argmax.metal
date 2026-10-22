@@ -12,7 +12,7 @@ using namespace metal;
 // Output: token  [batch]                (uint)
 //
 // Dispatch: threadgroups (batch, 1, 1), threads_per_threadgroup
-// (TG_SIZE, 1, 1) where TG_SIZE is a multiple of 32, at most 1024. One
+// (ARGMAX_THREADS, 1, 1), compiled in: a multiple of 32, at most 1024. One
 // threadgroup per batch row; threads in a group cooperate over the
 // vocab axis. Each thread keeps a (max_val, max_idx) running pair
 // over its 4-wide strided chunks; simdgroup shuffles and one
@@ -23,7 +23,7 @@ using namespace metal;
 // deterministic across thread schedule changes (e.g. different
 // threadgroup sizes for the same input).
 //
-// Vocab can exceed `TG_SIZE` (50K-150K is typical for LLMs); each
+// Vocab can exceed `ARGMAX_THREADS` (50K-150K is typical for LLMs); each
 // thread may walk many elements. The reduction takes one barrier.
 //
 // Bindings:
@@ -34,6 +34,11 @@ using namespace metal;
 // ---------------------------------------------------------------------------
 
 SCRATCHY_CONSTANT(uint, ARGMAX_VOCAB, 0);
+// 2: the threads of a row's threadgroup — the dispatch's, compiled in: whole simdgroups, at most
+// 1024.
+SCRATCHY_CONSTANT(uint, ARGMAX_THREADS, 2);
+static_assert(ARGMAX_THREADS % 32u == 0u && ARGMAX_THREADS > 0u && ARGMAX_THREADS <= 1024u,
+              "a row's threads are whole simdgroups a threadgroup holds");
 
 // A thread's running argmax: `v` at `i` replaces `best` at `best_i` when larger, or equal at a
 // smaller index; NaN never replaces.
@@ -126,12 +131,12 @@ template <typename T>
     constant     uint& batch  [[buffer(2)]],
     device const T*  suffix [[buffer(3)]],
     uint  gid [[threadgroup_position_in_grid]],
-    uint  tid [[thread_position_in_threadgroup]],
-    uint  tg  [[threads_per_threadgroup]])
+    uint  tid [[thread_position_in_threadgroup]])
 {
+    constexpr uint tg = ARGMAX_THREADS;
     if (gid >= batch) return;
-    threadgroup float shared_max[1024];
-    threadgroup uint  shared_idx[1024];
+    threadgroup float shared_max[ARGMAX_THREADS / 32u];
+    threadgroup uint  shared_idx[ARGMAX_THREADS / 32u];
     float best = -INFINITY;
     uint  best_i = 0;
     argmax_scan(best, best_i, prefix + gid * ARGMAX_VOCAB, ARGMAX_VOCAB, 0u, tid, tg);
@@ -148,12 +153,12 @@ template <typename T>
     device       uint* output [[buffer(1)]],
     constant     uint& batch  [[buffer(2)]],
     uint  gid [[threadgroup_position_in_grid]],
-    uint  tid [[thread_position_in_threadgroup]],
-    uint  tg  [[threads_per_threadgroup]])
+    uint  tid [[thread_position_in_threadgroup]])
 {
+    constexpr uint tg = ARGMAX_THREADS;
     if (gid >= batch) return;
-    threadgroup float shared_max[1024];
-    threadgroup uint  shared_idx[1024];
+    threadgroup float shared_max[ARGMAX_THREADS / 32u];
+    threadgroup uint  shared_idx[ARGMAX_THREADS / 32u];
     uint v = argmax_row(logits, gid, tid, tg, shared_max, shared_idx);
     if (tid == 0) {
         output[gid] = v;
@@ -185,12 +190,12 @@ template <typename T>
     constant     uint& batch   [[buffer(2)]],
     device       uint* next_in [[buffer(3)]],
     uint  gid [[threadgroup_position_in_grid]],
-    uint  tid [[thread_position_in_threadgroup]],
-    uint  tg  [[threads_per_threadgroup]])
+    uint  tid [[thread_position_in_threadgroup]])
 {
+    constexpr uint tg = ARGMAX_THREADS;
     if (gid >= batch) return;
-    threadgroup float shared_max[1024];
-    threadgroup uint  shared_idx[1024];
+    threadgroup float shared_max[ARGMAX_THREADS / 32u];
+    threadgroup uint  shared_idx[ARGMAX_THREADS / 32u];
     uint v = argmax_row(logits, gid, tid, tg, shared_max, shared_idx);
     if (tid == 0) {
         output[gid]  = v;

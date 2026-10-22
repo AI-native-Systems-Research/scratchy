@@ -3058,7 +3058,7 @@ mod tests {
             &crate::specialized_pipeline_cache::PipelineKey::new(
                 "select_rows",
                 "select_rows",
-                Vec::new(),
+                crate::tape::kernel_constants::SelectRowsConstants.into(),
             ),
         )
         .expect("select_rows");

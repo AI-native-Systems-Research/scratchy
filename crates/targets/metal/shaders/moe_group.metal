@@ -52,6 +52,8 @@ SCRATCHY_CONSTANT_OPTIONAL(int, MG_BM, 6);
 // gathered matvecs have no such guard, so their bake fills 0 (a real
 // expert's slab — garbage compute on rows nothing reads).
 SCRATCHY_CONSTANT_OPTIONAL(int, MG_SENTINEL, 7);
+// 8: the threads of the offsets' and the scatters' threadgroups — their dispatch's, compiled in.
+SCRATCHY_CONSTANT_OPTIONAL(uint, MG_THREADS, 8);
 
 #if SCRATCHY_COMPILES(moe_group_offsets)
 kernel void moe_group_offsets(
@@ -59,8 +61,9 @@ kernel void moe_group_offsets(
     device uint*       count     [[buffer(1)]],
     device uint*       offset    [[buffer(2)]],
     device uint*       total     [[buffer(3)]],
-    uint tid     [[thread_position_in_threadgroup]],
-    uint tgsize  [[threads_per_threadgroup]]) {
+    uint tid     [[thread_position_in_threadgroup]]) {
+  static_assert(MG_THREADS_SET && MG_THREADS > 0u, "the offsets take their threads compiled in");
+  constexpr uint tgsize = MG_THREADS;
   // One bin per expert: the bake compiles this kernel at its block's expert count.
   threadgroup atomic_uint local[MG_NUM_EXPERTS];
   const uint E = uint(MG_NUM_EXPERTS);
@@ -131,8 +134,9 @@ kernel void moe_group_scatter(
     device uint*       indices_pad [[buffer(5)]],
     device T*          x_pad     [[buffer(6)]],
     uint2 tid  [[thread_position_in_threadgroup]],
-    uint2 tgid [[threadgroup_position_in_grid]],
-    uint2 tgsz [[threads_per_threadgroup]]) {
+    uint2 tgid [[threadgroup_position_in_grid]]) {
+  static_assert(sizeof(T) && MG_THREADS_SET && MG_THREADS > 0u,
+                "a scatter takes its threads compiled in");
   const uint i = tgid.y;
   if (i >= uint(MG_M)) return;
   threadgroup uint p_shared;
@@ -151,7 +155,7 @@ kernel void moe_group_scatter(
   const uint token = i / uint(MG_TOP_K);
   const device T* x_row = x + size_t(token) * uint(MG_K);
   device T* xp_row = x_pad + size_t(p) * uint(MG_K);
-  for (uint d = tid.x; d < uint(MG_K); d += tgsz.x) {
+  for (uint d = tid.x; d < uint(MG_K); d += MG_THREADS) {
     xp_row[d] = x_row[d];
   }
 }
@@ -179,8 +183,8 @@ kernel void moe_group_scatter_q8(
     device uint*       indices_pad [[buffer(5)]],
     device uchar*      x_pad     [[buffer(6)]],
     uint2 tid  [[thread_position_in_threadgroup]],
-    uint2 tgid [[threadgroup_position_in_grid]],
-    uint2 tgsz [[threads_per_threadgroup]]) {
+    uint2 tgid [[threadgroup_position_in_grid]]) {
+  static_assert(MG_THREADS_SET && MG_THREADS > 0u, "a scatter takes its threads compiled in");
   const uint i = tgid.y;
   if (i >= uint(MG_M)) return;
   threadgroup uint p_shared;
@@ -199,12 +203,12 @@ kernel void moe_group_scatter_q8(
   const uint K = uint(MG_K), KC = K / 64, rows = uint(MG_M) / uint(MG_TOP_K);
   const device uint4* src = (const device uint4*)(x + size_t(token) * K);
   device uint4* dst = (device uint4*)(x_pad + size_t(p) * K);
-  for (uint d = tid.x; d < K / 16; d += tgsz.x) {
+  for (uint d = tid.x; d < K / 16; d += MG_THREADS) {
     dst[d] = src[d];
   }
   const device float2* qa = (const device float2*)(x + size_t(rows) * K) + size_t(token) * KC;
   device float2* qa_pad = (device float2*)(x_pad + size_t(uint(MG_MPAD_MAX)) * K) + size_t(p) * KC;
-  for (uint c = tid.x; c < KC; c += tgsz.x) {
+  for (uint c = tid.x; c < KC; c += MG_THREADS) {
     qa_pad[c] = qa[c];
   }
 }

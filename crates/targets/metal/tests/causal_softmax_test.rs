@@ -32,7 +32,8 @@ fn causal_softmax_matches_reference() {
         &device,
         "attention_causal_softmax",
         "causal_softmax_f16",
-        Vec::new(),
+        // SOFT_SCALE, compiled in.
+        vec![ConstantValue::float(1, SCALE)],
     )
     .expect("causal_softmax_f16");
 
@@ -51,14 +52,12 @@ fn causal_softmax_matches_reference() {
     let scores: Vec<u16> = raw.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
     let scores_buf = common::shared_slice(&device, &scores);
     let params_buf = common::shared_slice(&device, &[LQ, KV_LEN]);
-    let scale_buf = common::shared_f32(&device, SCALE);
-
-    // buffer(0)=scores (in-place), buffer(1)=params[Lq,kv_len], buffer(2)=scale;
+    // buffer(0)=scores (in-place), buffer(1)=params[Lq,kv_len];
     // grid (Lq, q_heads, 1) threadgroups, one thread each.
     if !common::dispatch_threadgroups(
         &device,
         &pipeline,
-        &[&scores_buf, &params_buf, &scale_buf],
+        &[&scores_buf, &params_buf],
         MTLSize {
             width: LQ as usize,
             height: Q_HEADS as usize,
@@ -124,7 +123,8 @@ fn causal_softmax_prod_handles_bucket_larger_than_kv() {
         &device,
         "attention_causal_softmax",
         "causal_softmax_prod_bf16",
-        vec![ConstantValue::float(1, SCALE)],
+        // SOFT_T: the dispatch's 64 threads a row.
+        vec![ConstantValue::float(1, SCALE), ConstantValue::uint(4, 64)],
     )
     .expect("causal_softmax_prod_bf16");
 
@@ -224,6 +224,7 @@ fn causal_softmax_prod_strided_rows_and_span() {
         vec![
             ConstantValue::float(1, SCALE),
             ConstantValue::uint(3, 128), // SOFT_SPAN_BLOCK: any nonzero enables
+            ConstantValue::uint(4, 64),  // SOFT_T: the dispatch's 64 threads a row.
         ],
     )
     .expect("causal_softmax_prod_bf16");

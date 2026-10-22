@@ -35,7 +35,8 @@ template <typename T>
     uint2 grid [[threads_per_grid]]) {
   uint k = gid.x;
   uint n = gid.y;
-  if (k >= grid.x || n >= grid.y) return;
+  // A row's picks are the index row's width; its rows, the step's live rows (the grid's height).
+  if (k >= uint(IDX_AXIS_SIZE) || n >= grid.y) return;
   uint idx = indices[n * uint(IDX_AXIS_SIZE) + k];
   // No negative-index normalization: argpartition outputs u32 in
   // [0, SRC_AXIS_SIZE). MLX's `is_signed_v<IdxT>` branch is dead

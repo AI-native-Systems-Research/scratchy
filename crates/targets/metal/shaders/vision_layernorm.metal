@@ -32,6 +32,11 @@ SCRATCHY_CONSTANT(float, LN_EPS, 2);
 // LayerNorm (ModernBERT's `norm_bias=False`), where the `bias` buffer
 // is bound to a valid-but-unread allocation and must NOT be applied.
 SCRATCHY_CONSTANT(uint, LN_HAS_BIAS, 3);
+// The threads of a row's threadgroup: its dispatch's, compiled in — a power of two, its tree
+// reduction's width.
+SCRATCHY_CONSTANT(uint, LN_THREADS, 4);
+static_assert(LN_THREADS != 0u && (LN_THREADS & (LN_THREADS - 1u)) == 0u && LN_THREADS <= 1024u,
+              "a row's threads are a power of two a threadgroup holds");
 
 template <typename T, typename T_scale>
 [[kernel]] void vision_layernorm(
@@ -40,17 +45,16 @@ template <typename T, typename T_scale>
     device const T_scale* weight [[buffer(2)]],
     device const T_scale* bias   [[buffer(3)]],
     uint gid     [[threadgroup_position_in_grid]],
-    uint tid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint tid     [[thread_position_in_threadgroup]])
 {
   if (gid >= LN_M) {
     return;
   }
-  threadgroup float sh_sum[1024];
-  threadgroup float sh_sq[1024];
+  threadgroup float sh_sum[LN_THREADS];
+  threadgroup float sh_sq[LN_THREADS];
 
   float ls = 0.0f, lsq = 0.0f;
-  for (uint i = tid; i < LN_HIDDEN; i += tg_size) {
+  for (uint i = tid; i < LN_HIDDEN; i += LN_THREADS) {
     float v = float(input[gid * LN_HIDDEN + i]);
     ls += v;
     lsq += v * v;
@@ -59,7 +63,7 @@ template <typename T, typename T_scale>
   sh_sq[tid] = lsq;
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  for (uint stride = tg_size / 2u; stride > 0u; stride >>= 1) {
+  for (uint stride = LN_THREADS / 2u; stride > 0u; stride >>= 1) {
     if (tid < stride) {
       sh_sum[tid] += sh_sum[tid + stride];
       sh_sq[tid] += sh_sq[tid + stride];
@@ -73,7 +77,7 @@ template <typename T, typename T_scale>
   var = max(var, 0.0f);                  // guard fp cancellation
   float inv = rsqrt(var + LN_EPS);
 
-  for (uint i = tid; i < LN_HIDDEN; i += tg_size) {
+  for (uint i = tid; i < LN_HIDDEN; i += LN_THREADS) {
     float v = float(input[gid * LN_HIDDEN + i]);
     float w = float(weight[i]);
     float b = (LN_HAS_BIAS != 0u) ? float(bias[i]) : 0.0f;

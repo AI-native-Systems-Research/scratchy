@@ -130,5 +130,6 @@ pub fn encode_select_rows(
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(size(count), size(64));
+    let threads = crate::tape::kernel_constants::SELECT_ROWS_THREADS as usize;
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(size(count), size(threads));
 }

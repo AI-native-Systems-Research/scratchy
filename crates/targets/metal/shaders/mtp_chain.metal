@@ -28,13 +28,15 @@
 //   10 next_used    uint  [n]
 //   11 next_hidden  2-byte elements, [n, MTP_HIDDEN]
 //   12 drafts       uint  [n, MTP_DRAFTS]
-//   13 depth        uint
-//   14 window_start uint: the first of pass 1's rows its argmax ran
-//   15 rope         2-byte elements, [n, MTP_DRAFTS + 1, MTP_ROPE]: per sequence and accepted
+//   13 window_start uint: the first of pass 1's rows its argmax ran
+//   14 rope         2-byte elements, [n, MTP_DRAFTS + 1, MTP_ROPE]: per sequence and accepted
 //                   count, the next pass's rotary cos/sin row (MTP_ROPE 0: none)
-//   16 next_rope    2-byte elements, [n, MTP_ROPE]
+//   15 next_rope    2-byte elements, [n, MTP_ROPE]
 //
-// Dispatch: n threadgroups of 256 threads; thread 0 picks, every thread copies the rows.
+// Baked: the head's hidden width, drafts a step and rotary width, the pass it follows
+// (`MTP_DEPTH`, one kernel a pass) and its threadgroup's threads (`MTP_THREADS`).
+//
+// Dispatch: n threadgroups of MTP_THREADS threads; thread 0 picks, every thread copies the rows.
 
 #include <metal_stdlib>
 #include "baked.h"
@@ -43,6 +45,9 @@ using namespace metal;
 SCRATCHY_CONSTANT(uint, MTP_HIDDEN, 0);
 SCRATCHY_CONSTANT(uint, MTP_DRAFTS, 1);
 SCRATCHY_CONSTANT(uint, MTP_ROPE, 2);
+SCRATCHY_CONSTANT(uint, MTP_DEPTH, 3);
+SCRATCHY_CONSTANT(uint, MTP_THREADS, 4);
+static_assert(MTP_DEPTH >= 1u && MTP_DEPTH <= MTP_DRAFTS, "a pass picks one of the step's drafts");
 
 kernel void mtp_chain(
     device const uint*   picked       [[buffer(0)]],
@@ -58,20 +63,18 @@ kernel void mtp_chain(
     device       uint*   next_used    [[buffer(10)]],
     device       ushort* next_hidden  [[buffer(11)]],
     device       uint*   drafts       [[buffer(12)]],
-    constant     uint&   depth        [[buffer(13)]],
-    constant     uint&   window_start [[buffer(14)]],
-    device const ushort* rope         [[buffer(15)]],
-    device       ushort* next_rope    [[buffer(16)]],
+    constant     uint&   window_start [[buffer(13)]],
+    device const ushort* rope         [[buffer(14)]],
+    device       ushort* next_rope    [[buffer(15)]],
     uint s   [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg  [[threads_per_threadgroup]])
+    uint tid [[thread_position_in_threadgroup]])
 {
     threadgroup uint row_shared;
     threadgroup uint kept_shared;
     if (tid == 0) {
         uint row = s;
         uint kept = 0;
-        if (depth == 1) {
+        if (MTP_DEPTH == 1u) {
             const uint first = seqs[s * 3], rows = seqs[s * 3 + 1];
             while (kept + 1 < rows && target[first + kept] == drafted[first + kept]) {
                 ++kept;
@@ -81,8 +84,8 @@ kernel void mtp_chain(
         } else {
             kept = accepted[s];
         }
-        const uint token = picked[depth == 1 ? row - window_start : row];
-        drafts[s * MTP_DRAFTS + depth - 1] = token;
+        const uint token = picked[MTP_DEPTH == 1u ? row - window_start : row];
+        drafts[s * MTP_DRAFTS + MTP_DEPTH - 1u] = token;
         device const uint* at = next + (s * (MTP_DRAFTS + 1) + kept) * 3;
         next_ids[s] = token;
         next_pos[s] = at[0];
@@ -94,11 +97,11 @@ kernel void mtp_chain(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device const ushort* from = hidden + ulong(row_shared) * MTP_HIDDEN;
     device ushort* to = next_hidden + ulong(s) * MTP_HIDDEN;
-    for (uint i = tid; i < MTP_HIDDEN; i += tg) {
+    for (uint i = tid; i < MTP_HIDDEN; i += MTP_THREADS) {
         to[i] = from[i];
     }
     device const ushort* rope_row = rope + ulong(s * (MTP_DRAFTS + 1) + kept_shared) * MTP_ROPE;
-    for (uint i = tid; i < MTP_ROPE; i += tg) {
+    for (uint i = tid; i < MTP_ROPE; i += MTP_THREADS) {
         next_rope[ulong(s) * MTP_ROPE + i] = rope_row[i];
     }
 }

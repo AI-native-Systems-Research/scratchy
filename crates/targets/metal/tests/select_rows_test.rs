@@ -13,6 +13,7 @@ use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::{read_slice, shared_slice, shared_zeroed};
 use scratchy_target_metal::select_rows::{SelectFrom, SelectInto, SelectOp, Selection};
 use scratchy_target_metal::specialized_pipeline_cache::{PipelineKey, SpecializedPipelineCache};
+use scratchy_target_metal::tape::kernel_constants::{SELECT_ROWS_THREADS, SelectRowsConstants};
 
 #[test]
 fn select_rows_copies_the_variant_each_selector_names() {
@@ -24,7 +25,7 @@ fn select_rows_copies_the_variant_each_selector_names() {
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
     let pso = baked_build(
         &cache,
-        &PipelineKey::new("select_rows", "select_rows", Vec::new()),
+        &PipelineKey::new("select_rows", "select_rows", SelectRowsConstants.into()),
     )
     .expect("select_rows");
 
@@ -82,7 +83,13 @@ fn select_rows_copies_the_variant_each_selector_names() {
     // Bound past the kernel's two so the buffers its ops address are resident.
     let mut bufs = vec![&region, &region, &selectors, &tokens, &drafts];
     bufs.extend(dsts.iter());
-    if !common::dispatch_threadgroups(&device, &pso, &bufs, size(ops.len()), size(64)) {
+    if !common::dispatch_threadgroups(
+        &device,
+        &pso,
+        &bufs,
+        size(ops.len()),
+        size(SELECT_ROWS_THREADS as usize),
+    ) {
         return;
     }
     let read = |i: usize, n| read_slice::<u32>(&dsts[i], n);

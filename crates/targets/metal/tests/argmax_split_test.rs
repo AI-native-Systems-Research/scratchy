@@ -81,7 +81,11 @@ fn run(rows: &[Vec<f32>], prefix: Option<usize>) -> Option<Vec<u32>> {
             PipelineKey::new(
                 "argmax",
                 "argmax_bf16",
-                vec![ConstantValue::uint(0, width as u32)],
+                // ARGMAX_THREADS (slot 2): the dispatch's threads.
+                vec![
+                    ConstantValue::uint(0, width as u32),
+                    ConstantValue::uint(2, THREADS as u32),
+                ],
             ),
             vec![segment(0, width)],
         ),
@@ -92,6 +96,7 @@ fn run(rows: &[Vec<f32>], prefix: Option<usize>) -> Option<Vec<u32>> {
                 vec![
                     ConstantValue::uint(0, p as u32),
                     ConstantValue::uint(1, (width - p) as u32),
+                    ConstantValue::uint(2, THREADS as u32),
                 ],
             ),
             vec![segment(0, p), segment(p, width)],

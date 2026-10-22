@@ -18,10 +18,12 @@ use crate::sampling::{CastDtype, SamplerStage};
 use crate::shader_cache::{ComputePipelineState, Device, Library, load_library_from_bytes};
 use crate::specialized_pipeline_cache::{ConstantValue, PipelineKey};
 use crate::stream::MetalStreamError;
-use crate::tape::ids::{BitsetWords, BlockSize, KDimI32, LogitsWidth, MDimI32, NDimI32};
+use crate::tape::ids::{
+    BitsetWords, BlockSize, HeadPass, KDimI32, LogitsWidth, MDimI32, MaxBlocksPerSeq, NDimI32,
+};
 use crate::tape::kernel_constants::{
     AffineCodes, AffineQmvConstants, AffineQmvWideConstants, ArgmaxConstants,
-    ChainAdvanceConstants, GrammarMaskConstants, MtpChainConstants,
+    ChainAdvanceConstants, GrammarMaskConstants, MtpChainConstants, SelectRowsConstants,
 };
 use crate::tape::lowered::{BakedKernel, MetalDtype};
 use crate::tape::quantized::{
@@ -88,6 +90,7 @@ impl VocabSuffix {
                 vec![
                     ConstantValue::uint(0, self.prefix),
                     ConstantValue::uint(1, self.rows),
+                    ConstantValue::uint(2, crate::tape::kernel_constants::ARGMAX_THREADS),
                 ],
             ),
         }
@@ -158,10 +161,13 @@ pub struct OffTape<K, L> {
     /// Every sampler stage, `[telemetry spill compiled in][stage]`; the `sampler-telemetry`
     /// feature picks the row ([`OffTapeKernels::sampler`]).
     pub sampler: [[K; SamplerStage::COUNT]; 2],
-    /// The spec-decode chain advance, the model's KV block size compiled in.
-    pub chain_advance: K,
-    /// A multi-token-prediction head's chain between its passes; `None` for any other model.
-    pub mtp_chain: Option<K>,
+    /// The spec-decode chain advance, one per rung of the model's KV cap ladder, ascending: the
+    /// model's KV block size and the rung — its block table's row stride — compiled in. The
+    /// worker runs its pool's ([`crate::chain_advance::ChainAdvanceKernel::new`]).
+    pub chain_advance: L,
+    /// A multi-token-prediction head's chain between its passes, one after each pass in order (the
+    /// pass compiled in); `None` for any other model.
+    pub mtp_chain: Option<L>,
     /// A drafting model's pick of a step's inputs by the step before it; `None` for any other.
     pub select_rows: Option<K>,
     /// A multi-token-prediction head drafting over a prefix of its target's vocabulary: its
@@ -173,13 +179,14 @@ pub type OffTapeKernels = OffTape<BakedKernel, &'static [BakedKernel]>;
 
 impl OffTape<PipelineKey, Vec<PipelineKey>> {
     /// The keys of the off-tape kernels reading logits `vocab` wide, of activation `dtype`, over a
-    /// KV cache paged in blocks of `block_size`; `head`: a multi-token-prediction head's chain;
-    /// `drafts`: the model drafts; `vocab_suffix`: a head drafting over a prefix of its target's
-    /// vocabulary, the rest of it.
+    /// KV cache paged in blocks of `block_size` whose block tables are a rung of `caps` wide;
+    /// `head`: a multi-token-prediction head's chain; `drafts`: the model drafts; `vocab_suffix`:
+    /// a head drafting over a prefix of its target's vocabulary, the rest of it.
     pub fn keys(
         vocab: LogitsWidth,
         dtype: MetalDtype,
         block_size: BlockSize,
+        caps: &[MaxBlocksPerSeq],
         head: Option<MtpChainConstants>,
         drafts: bool,
         vocab_suffix: Option<VocabSuffix>,
@@ -219,13 +226,23 @@ impl OffTape<PipelineKey, Vec<PipelineKey>> {
             argmax_dual_write: argmax_key(dual_write),
             grammar_mask: PipelineKey::new("grammar_mask", grammar_mask, grammar.into()),
             sampler: [false, true].map(|t| SamplerStage::ALL.map(|s| s.key(vocab, cast, t))),
-            chain_advance: PipelineKey::new(
-                "chain_advance",
-                "chain_advance",
-                ChainAdvanceConstants { block_size }.into(),
-            ),
-            mtp_chain: head.map(|c| PipelineKey::new("mtp_chain", "mtp_chain", c.into())),
-            select_rows: drafts.then(|| PipelineKey::new("select_rows", "select_rows", Vec::new())),
+            chain_advance: (caps.iter())
+                .map(|&block_table_stride| {
+                    let constants = ChainAdvanceConstants {
+                        block_size,
+                        block_table_stride,
+                    };
+                    PipelineKey::new("chain_advance", "chain_advance", constants.into())
+                })
+                .collect(),
+            mtp_chain: head.map(|c| {
+                (1..=c.drafts.get())
+                    .map(|d| PipelineKey::new("mtp_chain", "mtp_chain", c.after(HeadPass(d))))
+                    .collect()
+            }),
+            select_rows: drafts.then(|| {
+                PipelineKey::new("select_rows", "select_rows", SelectRowsConstants.into())
+            }),
             vocab_suffix,
         }
     }
@@ -239,8 +256,8 @@ impl<K> OffTape<K, Vec<K>> {
             argmax_dual_write: f(self.argmax_dual_write),
             grammar_mask: f(self.grammar_mask),
             sampler: self.sampler.map(|row| row.map(&mut f)),
-            chain_advance: f(self.chain_advance),
-            mtp_chain: self.mtp_chain.map(&mut f),
+            chain_advance: self.chain_advance.into_iter().map(&mut f).collect(),
+            mtp_chain: (self.mtp_chain).map(|after| after.into_iter().map(&mut f).collect()),
             select_rows: self.select_rows.map(&mut f),
             vocab_suffix: self.vocab_suffix.map(|s| SuffixKernels {
                 suffix: s.suffix,

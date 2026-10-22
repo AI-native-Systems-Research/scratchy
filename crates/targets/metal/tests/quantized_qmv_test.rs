@@ -62,14 +62,7 @@ fn dispatch_qmv(
     wide_ok: bool,
 ) -> bool {
     let kernel = pick_qmv_kernel_wide(n as u32, k as u32, 4, m as u32, wide_ok);
-    let kernel_name = qmv_kernel_name(
-        kernel,
-        DequantDtype::Bf16,
-        scale_dtype,
-        group_size,
-        4,
-        false,
-    );
+    let kernel_name = qmv_kernel_name(kernel, DequantDtype::Bf16, scale_dtype, group_size, 4);
     let wide_m = matches!(kernel, QmvKernel::Wide { .. }).then(|| ConstantValue::int(7, m as i32));
     let constants: Vec<ConstantValue> = [
         ConstantValue::int(0, k as i32),

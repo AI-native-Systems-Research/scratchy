@@ -51,8 +51,25 @@ SCRATCHY_CONSTANT(float, GDN_RMS_EPS, 2);
 SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_RMS_Z_STRIDE, 3);
 SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_RMS_GROUPS, 4);
 SCRATCHY_CONSTANT_OPTIONAL(bool, GDN_RMS_GATE_BEFORE, 5);
+// 7: the threads of a threadgroup — its dispatch's, compiled in: a power of two.
+SCRATCHY_CONSTANT(uint, GDN_RMS_THREADS, 7);
+static_assert(GDN_RMS_THREADS != 0u && (GDN_RMS_THREADS & (GDN_RMS_THREADS - 1u)) == 0u &&
+                  GDN_RMS_THREADS <= 1024u,
+              "a threadgroup's threads are a power of two it holds");
 
 constant constexpr uint GDN_RMS_TOKEN_ROWS = GDN_RMS_GROUPS_SET ? GDN_RMS_GROUPS : 1u;
+
+// One output element: `x` normed by `inv`, gained by `w` and gated by SiLU(z), after the norm
+// (GDN) or before it (Mamba-2, whose squares took the gate). Both forms store through it, and
+// with contraction and reassociation off fast math cannot fuse or reorder its multiplies
+// differently in their two loop shapes (the threadgroup form's runs a bound off `tid`, the
+// simdgroup form's a fixed count off the lane): they keep the same bits.
+template <typename T>
+inline T gdn_rms_store(float x, float z, float w, float inv) {
+#pragma clang fp contract(off) reassociate(off)
+  const float silu_z = z / (1.0f + exp(-z));  // SiLU(z) = z * sigmoid(z)
+  return GDN_RMS_GATE_BEFORE ? T(x * silu_z * inv * w) : T(x * inv * w * silu_z);
+}
 
 template <typename T>
 [[kernel]] void gdn_rms_norm_gated(
@@ -61,12 +78,12 @@ template <typename T>
     const device T*     z      [[buffer(2)]],
     const device float* weight [[buffer(3)]],
     uint gid     [[threadgroup_position_in_grid]],
-    uint tid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint tid     [[thread_position_in_threadgroup]])
 {
   if (gid >= GDN_RMS_ROWS) {
     return;
   }
+  constexpr uint tg_size = GDN_RMS_THREADS;
   uint d = GDN_RMS_D;
   const uint group = gid % GDN_RMS_TOKEN_ROWS;
   const device float* x_row = x + gid * d;
@@ -76,7 +93,7 @@ template <typename T>
   const device float* w_row = weight + group * d;
   device T*           o_row = out + gid * d;
 
-  threadgroup float sdata[1024];
+  threadgroup float sdata[tg_size];
   float ss = 0.0f;
   for (uint i = tid; i < d; i += tg_size) {
     float v = x_row[i];
@@ -97,10 +114,7 @@ template <typename T>
   float inv = rsqrt(sdata[0] / float(d) + GDN_RMS_EPS);
 
   for (uint i = tid; i < d; i += tg_size) {
-    float zi = float(z_row[i]);
-    float silu_z = zi / (1.0f + exp(-zi));  // SiLU(z) = z * sigmoid(z)
-    o_row[i] = GDN_RMS_GATE_BEFORE ? T(x_row[i] * silu_z * inv * float(w_row[i]))
-                                   : T(x_row[i] * inv * float(w_row[i]) * silu_z);
+    o_row[i] = gdn_rms_store<T>(x_row[i], float(z_row[i]), float(w_row[i]), inv);
   }
 }
 
@@ -154,9 +168,10 @@ template <typename T>
     const device T*     z      [[buffer(2)]],
     const device float* weight [[buffer(3)]],
     uint gid     [[threadgroup_position_in_grid]],
-    uint tid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint tid     [[thread_position_in_threadgroup]])
 {
+  constexpr uint tg_size = GDN_RMS_THREADS;
+  static_assert(tg_size == 32u * GDN_RMS_ROWS_PER_TG, "a simdgroup a row");
   uint d = GDN_RMS_D;
   uint row = gid * GDN_RMS_ROWS_PER_TG + tid / 32;
   if (row >= GDN_RMS_ROWS) {
@@ -216,16 +231,10 @@ template <typename T>
   }
   float inv = rsqrt(simd_broadcast(v, 0) / float(d) + GDN_RMS_EPS);
 
-  // The store loop is the threadgroup form's own shape — a runtime stride off
-  // the thread id (here the lane, strided by the simdgroup width, a runtime
-  // quotient of `tg_size`) — so the compiler lowers its `exp`, division and
-  // multiply chain exactly as the threadgroup form's, bit for bit.
-  uint simdw = tg_size / GDN_RMS_ROWS_PER_TG;
+  // Each element stored as the threadgroup form stores it (`gdn_rms_store`), bit for bit.
+  constexpr uint simdw = tg_size / GDN_RMS_ROWS_PER_TG;
   for (uint i = lane; i < d; i += simdw) {
-    float zi = float(z_row[i]);
-    float silu_z = zi / (1.0f + exp(-zi));  // SiLU(z) = z * sigmoid(z)
-    o_row[i] = GDN_RMS_GATE_BEFORE ? T(x_row[i] * silu_z * inv * float(w_row[i]))
-                                   : T(x_row[i] * inv * float(w_row[i]) * silu_z);
+    o_row[i] = gdn_rms_store<T>(x_row[i], float(z_row[i]), float(w_row[i]), inv);
   }
 }
 

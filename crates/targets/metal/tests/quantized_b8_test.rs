@@ -149,7 +149,6 @@ fn run_case_bf16(op: Op, m: usize, n: usize, k: usize, group_size: usize, seed: 
                 ScaleDtype::Bf16,
                 group_size as u32,
                 bits,
-                false,
             );
             let constants = vec![
                 ConstantValue::int(0, k as i32),
@@ -353,14 +352,7 @@ fn qmv_b8_f16_matches_cpu() {
 
     let bits = 8u32;
     let kernel = pick_qmv_kernel(n as u32, k as u32, bits);
-    let name = qmv_kernel_name(
-        kernel,
-        DequantDtype::F16,
-        ScaleDtype::F16,
-        gs as u32,
-        bits,
-        false,
-    );
+    let name = qmv_kernel_name(kernel, DequantDtype::F16, ScaleDtype::F16, gs as u32, bits);
     let constants = vec![
         ConstantValue::int(0, k as i32),
         ConstantValue::int(1, n as i32),

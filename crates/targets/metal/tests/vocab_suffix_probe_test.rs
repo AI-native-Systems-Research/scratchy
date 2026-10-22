@@ -18,9 +18,9 @@ use scratchy_target_metal::off_tape::VocabSuffix;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
-use scratchy_target_metal::tape::ids::{KDimI32, MDimI32, NDimI32};
+use scratchy_target_metal::tape::ids::{KDimI32, LogitsWidth, MDimI32, NDimI32};
 use scratchy_target_metal::tape::kernel_constants::{
-    AffineCodes, AffineQmvConstants, AffineQmvWideConstants,
+    AffineCodes, AffineQmvConstants, AffineQmvWideConstants, ArgmaxConstants,
 };
 use scratchy_target_metal::tape::lowered::MetalDtype;
 use scratchy_target_metal::tape::quantized::{
@@ -112,7 +112,10 @@ fn a_wide_pass_whole_vocabulary_vs_prefix_and_suffix() {
         let argmax = build(&PipelineKey::new(
             "argmax",
             "argmax_bf16",
-            vec![ConstantValue::uint(0, V)],
+            ArgmaxConstants {
+                vocab: LogitsWidth(V),
+            }
+            .into(),
         ));
         let one = |w: usize| MTLSize {
             width: w,

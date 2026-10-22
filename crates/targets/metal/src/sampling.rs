@@ -26,6 +26,8 @@ use crate::residency::{MetalResidencySet, Pinned};
 use crate::specialized_pipeline_cache::PipelineKey;
 use crate::stream::MetalStreamError;
 use crate::tape::ids::LogitsWidth;
+#[cfg(feature = "sampler-telemetry")]
+use crate::tape::kernel_constants::SAMPLER_TELEM_K;
 use crate::tape::kernel_constants::SamplerConstants;
 use crate::tape::lowered::BakedKernel;
 
@@ -308,12 +310,6 @@ pub fn gather_gpu_sample_params<'h>(
     params
 }
 
-/// Number of top candidates the sampler spills for the live "soul" panel when
-/// [`SamplerTelemetry`](scratchy_core_common::sampler_telemetry::SamplerTelemetry)
-/// is enabled.
-#[cfg(feature = "sampler-telemetry")]
-const SAMPLER_TELEM_K: u32 = 8;
-
 /// `row_state` word count per row — MUST equal `ROW_STATE_LEN` in
 /// `shaders/sampling.metal`.
 const ROW_STATE_LEN: usize = 16;
@@ -520,7 +516,7 @@ impl SamplerArena {
                 mk(n * k * 4, "topk_probs"),
                 mk(n * k * 4, "topk_indices"),
                 mk(n * 2 * 4, "stats"),
-                mk(2 * 4, "telem_consts"),
+                mk(4, "telem_consts"),
             )
         };
 
@@ -775,7 +771,7 @@ impl SamplerArena {
             let telem_on = u32::from(
                 scratchy_core_common::sampler_telemetry::SamplerTelemetry::global().is_enabled(),
             );
-            write(&self.telem_consts_buf, &u32s(&[telem_on, SAMPLER_TELEM_K]));
+            write(&self.telem_consts_buf, &u32s(&[telem_on]));
         }
 
         PendingSampler {

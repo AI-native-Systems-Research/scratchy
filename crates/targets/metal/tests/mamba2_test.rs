@@ -512,6 +512,7 @@ impl Gpu {
                 ConstantValue::uint(3, row as u32),
                 ConstantValue::uint(4, groups),
                 ConstantValue::boolean(5, true),
+                ConstantValue::uint(7, width.next_power_of_two().min(THREADS) as u32),
             ],
         );
         batch.encode(
@@ -874,6 +875,7 @@ fn mamba2_gate_before_norm_matches_reference() {
                     ConstantValue::uint(3, row as u32),
                     ConstantValue::uint(4, groups as u32),
                     ConstantValue::boolean(5, true),
+                    ConstantValue::uint(7, width.next_power_of_two().min(THREADS) as u32),
                 ],
             );
             let pipeline = baked_build(&cache, &key).expect("norm pipeline");

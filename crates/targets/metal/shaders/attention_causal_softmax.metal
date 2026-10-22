@@ -19,18 +19,19 @@
 // that are masked; their probability is written as 0 so the downstream PV GEMM
 // (which spans all kv_len columns) ignores them.
 //
-// params[0] = Lq, params[1] = kv_len. scale = attention softmax scale
-// (gemma4 = 1.0; passed explicitly so other arches reuse the kernel).
+// params[0] = Lq, params[1] = kv_len (the step's). SOFT_SCALE = the attention softmax scale
+// (gemma4 = 1.0), compiled in.
 
 #include <metal_stdlib>
 #include "baked.h"
 using namespace metal;
 
+SCRATCHY_CONSTANT(float, SOFT_SCALE, 1);
+
 template <typename T>
 inline void causal_softmax_body(
     device T*           scores, // [q_heads, Lq, kv_len], in place
     const device uint*  params, // [Lq, kv_len]
-    constant float&     scale,
     uint2               gid)    // x = query i, y = head h
 {
     const uint lq     = params[0];
@@ -48,17 +49,17 @@ inline void causal_softmax_body(
     // Pass 1: row max of the scaled scores.
     float m = -INFINITY;
     for (uint j = 0u; j < valid; j++) {
-        m = max(m, float(row[j]) * scale);
+        m = max(m, float(row[j]) * SOFT_SCALE);
     }
     // Pass 2: denominator (fp32 accumulate).
     float l = 0.0f;
     for (uint j = 0u; j < valid; j++) {
-        l += exp(float(row[j]) * scale - m);
+        l += exp(float(row[j]) * SOFT_SCALE - m);
     }
     const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
     // Pass 3: write normalized probabilities; zero the masked tail.
     for (uint j = 0u; j < valid; j++) {
-        row[j] = T(exp(float(row[j]) * scale - m) * inv);
+        row[j] = T(exp(float(row[j]) * SOFT_SCALE - m) * inv);
     }
     for (uint j = valid; j < kv_len; j++) {
         row[j] = T(0.0f);
@@ -68,19 +69,17 @@ inline void causal_softmax_body(
 kernel void causal_softmax_f16(
     device half*       scores [[buffer(0)]],
     const device uint* params [[buffer(1)]],
-    constant float&    scale  [[buffer(2)]],
     uint2              gid    [[thread_position_in_grid]])
 {
-    causal_softmax_body<half>(scores, params, scale, gid);
+    causal_softmax_body<half>(scores, params, gid);
 }
 
 kernel void causal_softmax_bf16(
     device bfloat*     scores [[buffer(0)]],
     const device uint* params [[buffer(1)]],
-    constant float&    scale  [[buffer(2)]],
     uint2              gid    [[thread_position_in_grid]])
 {
-    causal_softmax_body<bfloat>(scores, params, scale, gid);
+    causal_softmax_body<bfloat>(scores, params, gid);
 }
 
 // ── Production variant: scale compiled in; the ACTUAL query count
@@ -99,7 +98,6 @@ kernel void causal_softmax_bf16(
 // dtype. All early-outs are per-ROW (uniform across the threadgroup), so the
 // barriers below never see a partially-returned group.
 #if SCRATCHY_COMPILES(causal_softmax_prod_bf16)
-SCRATCHY_CONSTANT(float, SOFT_SCALE, 1);
 
 // Block-diagonal span attention: lower-bound each query's valid key range at its
 // own span's first block (mirrors the QKᵀ gemm bound, so the skipped band is
@@ -107,9 +105,10 @@ SCRATCHY_CONSTANT(float, SOFT_SCALE, 1);
 // full causal range, byte-identical).
 SCRATCHY_CONSTANT_OPTIONAL(uint, SOFT_SPAN_BLOCK, 3);
 
-// Threads cooperating on one row. MUST match the lowering's
-// threads_per_threadgroup for this kernel (the stride and reduce assume it).
-constant constexpr uint SOFT_T = 64;
+// 4: the threads cooperating on one row — the dispatch's, compiled in: whole simdgroups.
+SCRATCHY_CONSTANT(uint, SOFT_T, 4);
+static_assert(SOFT_T % 32u == 0u && SOFT_T > 0u && SOFT_T <= 1024u,
+              "a row's threads are whole simdgroups a threadgroup holds");
 
 template <typename T>
 inline void causal_softmax_prod_body(

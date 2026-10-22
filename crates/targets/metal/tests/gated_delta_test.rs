@@ -454,6 +454,8 @@ fn gdn_rms_norm_gated_matches_reference() {
             ConstantValue::uint(0, d as u32),
             ConstantValue::uint(1, total_rows as u32),
             ConstantValue::float(2, eps),
+            // GDN_RMS_THREADS: the dispatch's 256 threads.
+            ConstantValue::uint(7, 256),
         ],
     );
     let pipeline = baked_build(&cache, &key).expect("gdn_rms_norm_gated pipeline");
@@ -511,22 +513,27 @@ fn gdn_rms_norm_gated_sums_alike_at_every_covering_threadgroup() {
         let rows = 512usize;
         let shifted = |n: usize, by: usize| fill(n + by)[by..].to_vec();
         let (x, z, weight) = (shifted(rows * d, 7), shifted(rows * d, 3), shifted(d, 5));
-        let key = PipelineKey::new(
-            "gdn_rms_norm_gated",
-            "gdn_rms_norm_gated_f32",
-            vec![
-                ConstantValue::uint(0, d as u32),
-                ConstantValue::uint(1, rows as u32),
-                ConstantValue::float(2, 1e-6),
-            ],
-        );
-        let pipeline = baked_build(&cache, &key).expect("gdn_rms_norm_gated pipeline");
+        // A threadgroup's threads are compiled in: each width its own pipeline.
+        let pipeline = |width: usize| {
+            let key = PipelineKey::new(
+                "gdn_rms_norm_gated",
+                "gdn_rms_norm_gated_f32",
+                vec![
+                    ConstantValue::uint(0, d as u32),
+                    ConstantValue::uint(1, rows as u32),
+                    ConstantValue::float(2, 1e-6),
+                    ConstantValue::uint(7, width as u32),
+                ],
+            );
+            baked_build(&cache, &key).expect("gdn_rms_norm_gated pipeline")
+        };
         let (x_buf, z_buf, w_buf) = (
             buf_f32(&device, &x),
             buf_f32(&device, &z),
             buf_f32(&device, &weight),
         );
         let run = |width: usize| {
+            let pipeline = pipeline(width);
             let out = buf_zero_f32(&device, rows * d);
             let tg = MTLSize {
                 width,
@@ -636,30 +643,34 @@ fn gdn_rms_norm_gated_simd_is_bit_identical_to_the_threadgroup_form() {
                 common::shared_bytes(&device, &dt.bytes(&z)),
                 buf_f32(&device, &weight),
             );
-            let run =
-                |function: &'static str, constants: Vec<ConstantValue>, grid: usize, tg: usize| {
-                    let key = PipelineKey::new("gdn_rms_norm_gated", function, constants);
-                    let pipeline = baked_build(&cache, &key).expect("norm pipeline");
-                    // f32-sized whatever the dtype: 16-bit outputs just use half of it.
-                    let out = buf_zero_f32(&device, rows * d as usize);
-                    let bufs = [&out, &x_buf, &z_buf, &w_buf];
-                    common::dispatch_threadgroups(
-                        &device,
-                        &pipeline,
-                        &bufs,
-                        MTLSize {
-                            width: grid,
-                            height: 1,
-                            depth: 1,
-                        },
-                        MTLSize {
-                            width: tg,
-                            height: 1,
-                            depth: 1,
-                        },
-                    )
-                    .then(|| dt.bits(&out, rows * d as usize))
-                };
+            let run = |function: &'static str,
+                       mut constants: Vec<ConstantValue>,
+                       grid: usize,
+                       tg: usize| {
+                // GDN_RMS_THREADS: the dispatch's threads, compiled in.
+                constants.push(ConstantValue::uint(7, tg as u32));
+                let key = PipelineKey::new("gdn_rms_norm_gated", function, constants);
+                let pipeline = baked_build(&cache, &key).expect("norm pipeline");
+                // f32-sized whatever the dtype: 16-bit outputs just use half of it.
+                let out = buf_zero_f32(&device, rows * d as usize);
+                let bufs = [&out, &x_buf, &z_buf, &w_buf];
+                common::dispatch_threadgroups(
+                    &device,
+                    &pipeline,
+                    &bufs,
+                    MTLSize {
+                        width: grid,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: tg,
+                        height: 1,
+                        depth: 1,
+                    },
+                )
+                .then(|| dt.bits(&out, rows * d as usize))
+            };
             // The threadgroup form at the covering threadgroup is the oracle.
             let consts = if mamba { mamba_consts() } else { base.clone() };
             let Some(want) = run(
@@ -714,6 +725,8 @@ fn gdn_rms_norm_gated_simd_key(d: u32) -> PipelineKey {
             ConstantValue::uint(1, 512),
             ConstantValue::float(2, 1e-6),
             ConstantValue::uint(6, 4),
+            // GDN_RMS_THREADS: four simdgroups.
+            ConstantValue::uint(7, 128),
         ],
     )
 }
@@ -1668,6 +1681,8 @@ fn gdn_decode_is_the_conv_scan_norm() {
             ConstantValue::uint(0, hv as u32),
             ConstantValue::uint(1, (t * nv) as u32),
             ConstantValue::float(2, eps),
+            // GDN_RMS_THREADS: the dispatch's 256.
+            ConstantValue::uint(7, 256),
         ];
         let norm = build("gdn_rms_norm_gated", "gdn_rms_norm_gated_f32", norm_consts);
         let chain_out = buf_zero_f32(&device, t * value_dim);

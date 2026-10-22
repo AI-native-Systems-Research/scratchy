@@ -232,35 +232,27 @@ pub fn qmv_kernel_name(
     scale_dtype: ScaleDtype,
     group_size: u32,
     bits: u32,
-    batched: bool,
 ) -> String {
     let dtype = dtype.symbol_infix();
     let sdt = scale_dtype.symbol_infix();
-    let batch = if batched { 1 } else { 0 };
     match kernel {
         QmvKernel::Quad { d } => {
-            format!("affine_qmv_quad_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_d_{d}_batch_{batch}",)
+            format!("affine_qmv_quad_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_d_{d}_batch_0")
         }
         QmvKernel::Fast => {
-            format!("affine_qmv_fast_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_{batch}",)
+            format!("affine_qmv_fast_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_0")
         }
         QmvKernel::FastFold => {
-            assert!(
-                !batched,
-                "FastFold is the fold (m≥2) decode matvec — never batched"
-            );
             format!("affine_qmv_fast_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_t8_batch_0")
         }
         QmvKernel::Generic => {
-            format!("affine_qmv_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_{batch}",)
+            format!("affine_qmv_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_0")
         }
         QmvKernel::Tiny => {
-            format!("affine_qmv_tiny_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_{batch}",)
+            format!("affine_qmv_tiny_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_0")
         }
         QmvKernel::Wide { nv } => {
-            format!(
-                "affine_qmv_wide_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_nv_{nv}_kl_8_batch_{batch}",
-            )
+            format!("affine_qmv_wide_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_nv_{nv}_kl_8_batch_0",)
         }
     }
 }
@@ -1390,14 +1382,7 @@ mod tests {
 
         // Decoded against the INST_QMV_* rows in shaders/quantized_qmv.metal.
         assert_eq!(
-            qmv_kernel_name(
-                QmvKernel::Tiny,
-                DequantDtype::Bf16,
-                ScaleDtype::Bf16,
-                64,
-                8,
-                false
-            ),
+            qmv_kernel_name(QmvKernel::Tiny, DequantDtype::Bf16, ScaleDtype::Bf16, 64, 8,),
             "affine_qmv_tiny_bf16_s_bf16_gs_64_b_8_batch_0"
         );
     }
@@ -1430,14 +1415,7 @@ mod tests {
         // Decoded against the actual exported symbols in
         // shaders/quantized_qmv.metal's INST_QMV_* macros.
         assert_eq!(
-            qmv_kernel_name(
-                QmvKernel::Fast,
-                DequantDtype::Bf16,
-                ScaleDtype::F16,
-                64,
-                4,
-                false
-            ),
+            qmv_kernel_name(QmvKernel::Fast, DequantDtype::Bf16, ScaleDtype::F16, 64, 4,),
             "affine_qmv_fast_bf16_s_f16_gs_64_b_4_batch_0"
         );
         assert_eq!(
@@ -1447,7 +1425,6 @@ mod tests {
                 ScaleDtype::F16,
                 64,
                 4,
-                false
             ),
             "affine_qmv_fast_bf16_s_f16_gs_64_b_4_t8_batch_0"
         );
@@ -1458,9 +1435,8 @@ mod tests {
                 ScaleDtype::F16,
                 32,
                 4,
-                true
             ),
-            "affine_qmv_f16_s_f16_gs_32_b_4_batch_1"
+            "affine_qmv_f16_s_f16_gs_32_b_4_batch_0"
         );
         assert_eq!(
             qmv_kernel_name(
@@ -1469,7 +1445,6 @@ mod tests {
                 ScaleDtype::F16,
                 128,
                 4,
-                false
             ),
             "affine_qmv_quad_bf16_s_f16_gs_128_b_4_d_128_batch_0"
         );

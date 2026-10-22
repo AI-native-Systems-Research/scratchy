@@ -74,6 +74,8 @@ fn vision_layernorm_matches_reference() {
             ConstantValue::float(2, eps),
             // LN_HAS_BIAS: the norm carries its `.bias`.
             ConstantValue::uint(3, 1),
+            // LN_THREADS: the dispatch's 256 threads a row.
+            ConstantValue::uint(4, 256),
         ],
     );
     let pipeline = baked_build(&cache, &key).expect("vision_layernorm pipeline");

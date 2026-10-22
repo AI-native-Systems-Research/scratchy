@@ -711,44 +711,6 @@ INST_GATHER_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat,  64, 2)
 INST_GATHER_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat, 128, 2)
 
 // ─────────────────────────────────────────────────────────────────
-// Buffer-dims variant: K/N/M as `const constant int&` buffer args
-// (5/6/7) exactly like MLX — no baked dims, so one kernel serves every
-// shape. It exists to A/B baked dims against runtime dims on MPP
-// cooperative-tensor code.
-// ─────────────────────────────────────────────────────────────────
-template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N>
-[[kernel]] void affine_qmm_t_nax_dims_kernel(
-    const device uint32_t*  w        [[buffer(0)]],
-    const device T_scale*   scales   [[buffer(1)]],
-    const device T_scale*   biases   [[buffer(2)]],
-    const device T_act*     x        [[buffer(3)]],
-    device T_act*           y        [[buffer(4)]],
-    const constant int&     K        [[buffer(5)]],
-    const constant int&     N        [[buffer(6)]],
-    const constant int&     M        [[buffer(7)]],
-    uint  simd_gid [[simdgroup_index_in_threadgroup]],
-    uint  simd_lid [[thread_index_in_simdgroup]],
-    uint3 tgid     [[threadgroup_position_in_grid]])
-{
-    constexpr int BN = 64;
-    constexpr int BK = 64;
-    constexpr int BK_padded = BK + 16 / int(sizeof(T_act));
-    threadgroup T_act Ws[BN * BK_padded];
-    dispatch_bool(bits == 4 && AFFINE_CODES_OFFSET8, [&](auto kOffset8) {
-    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
-        w, scales, biases, x, y, Ws,
-        K, N, M,
-        simd_gid, simd_lid, tgid);
-    });
-}
-
-#define INST_QMM_T_NAX_DIMS(act_tag, act_type, scale_tag, scale_type, gs, bits, aln_tag, aln_val) \
-  SCRATCHY_KERNEL(affine_qmm_t_nax_dims_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_alN_##aln_tag##_batch_0, affine_qmm_t_nax_dims_kernel<act_type, scale_type, gs, bits, aln_val>)
-
-INST_QMM_T_NAX_DIMS(bf16, bfloat, bf16, bfloat, 64, 8, true, true)
-INST_QMM_T_NAX_DIMS(bf16, bfloat, bf16, bfloat, 64, 4, true, true)
-
-// ─────────────────────────────────────────────────────────────────
 // nvfp4_qmm_t_nax — NVFP4 NAX prefill matmul
 //
 // Reuses qmm_t_nax_impl with the `nvfp4` flag: E2M1 LUT decode, no
