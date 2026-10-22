@@ -97,13 +97,15 @@ impl Engine {
 
     /// Whether it serves an `ignore_eos` request to its full length, so a live server delivers
     /// every answer token asked for ([`super::data::Run::mark_dead`]). In every published run,
-    /// scratchy's live cells deliver 99% or more of them and mlx-lm's 84% or more. oMLX stops at
-    /// EOS regardless (#479), as does ollama, at as little as 36% and 15%; vllm-metal, llama.cpp
+    /// scratchy's live cells deliver 99% or more of them. mlx_lm.server has no `ignore_eos` and
+    /// stops at EOS: granite-3.3-2b's 128x512 cell delivers 89% on it, 100% on scratchy. oMLX stops
+    /// at EOS regardless (#479), as does ollama, at as little as 36% and 15%; vllm-metal, llama.cpp
     /// and mistral.rs have no published cells to show either, so they are not judged.
     pub fn honours_ignore_eos(self) -> bool {
         match self {
-            Engine::Scratchy | Engine::MlxLm => true,
-            Engine::OmlxTq
+            Engine::Scratchy => true,
+            Engine::MlxLm
+            | Engine::OmlxTq
             | Engine::Omlx
             | Engine::VllmMetal
             | Engine::Ollama

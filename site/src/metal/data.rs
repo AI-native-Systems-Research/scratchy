@@ -32,7 +32,7 @@ pub struct Run {
 /// The least share of its answer tokens a live server delivers to an engine that honours
 /// `ignore_eos` ([`Engine::honours_ignore_eos`]), below which the cell measured one that had
 /// stopped answering (#413). In every published run, scratchy's live cells deliver 99% or more and
-/// its dead ones 0 to 19.8%; mlx-lm's cells all deliver 84% or more.
+/// its dead ones 0 to 19.8%.
 const LIVE_SHARE: f64 = 0.5;
 
 impl Run {

@@ -512,6 +512,9 @@ json.dump({
              "kv_cache_dtype": e["KV_CACHE_DTYPE"] or "default (TurboQuant)",
              "scratchy_serve_args": e["SERVE_ARGS"] or None,
              "cell_timeout_s": int(e["CELL_TIMEOUT_S"]),
+             # bench serve counts a request whose stream ended aborted or errored
+             # as failed (#510), so the page takes each cell's `failed` as recorded.
+             "failures_counted": True,
              "scaling": None if e["SCALING"] != "1" else {
                  "axes": e["SCALE_AXES"].split(","), "conc": ints("SCALE_CONC"),
                  "input": ints("SCALE_INPUT"), "output": ints("SCALE_OUTPUT"),

@@ -553,3 +553,27 @@ impl From<WorkerError> for ForwardError {
         Self::Worker(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CommitFeedback, Delivered};
+
+    /// A wait that starts before the commit feedback arrives, as it can once the shared event has
+    /// fired, waits for it, and every wait after sees the same: a failed command buffer is never
+    /// taken for a finished one.
+    #[test]
+    fn a_wait_before_the_feedback_arrives_gets_its_answer() {
+        let feedback = std::sync::Arc::new(CommitFeedback::default());
+        let handler = std::thread::spawn({
+            let feedback = std::sync::Arc::clone(&feedback);
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                feedback.deliver(Delivered::Err("out of memory".into()));
+            }
+        });
+        let failed = Delivered::Err("out of memory".into());
+        assert_eq!(feedback.wait(), failed, "the first wait");
+        assert_eq!(feedback.wait(), failed, "a later wait");
+        handler.join().expect("the handler thread");
+    }
+}
