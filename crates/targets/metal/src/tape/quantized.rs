@@ -684,12 +684,13 @@ pub fn qmm_t_kernel_static_name(
 // ─────────────────────────────────────────────────────────────────
 
 /// Step token counts the small-M matrix-unit GEMM (`affine_qmm_small_m_*`)
-/// serves on NAX devices. Below, `qmv_fast`'s per-row weight re-reads cost
-/// no more than the matrix unit's padding (base M5, Granite-3.3-2B: 333 vs
-/// 346 µs of GEMM per layer at 3 tokens, 393 vs 343 at 4); above, a second
-/// M tile re-reads the weights and NAX `qmm_t`'s 64-row tile wins (a 32-row
-/// tile loses too).
-pub const SMALL_M_TOKENS: std::ops::RangeInclusive<u32> = 4..=16;
+/// serves on NAX devices. From 3, a 2-draft MTP verify step's rows: an M5 Max
+/// experiment (#826) — on the base M5 3 tokens lose to the matvec (Granite-3.3-2B:
+/// 333 µs of `qmv_fast` GEMM per layer vs 346; Qwen3.6-35B-A3B's 3-row verify
+/// step: 13.30 ms of `AffineQmvWide` vs 14.27 with the twin), 4 win (393 vs 343).
+/// Above 16, a second M tile re-reads the weights and NAX `qmm_t`'s 64-row tile
+/// wins (a 32-row tile loses too).
+pub const SMALL_M_TOKENS: std::ops::RangeInclusive<u32> = 3..=16;
 
 /// Output columns per small-M threadgroup.
 pub const SMALL_M_TILE_COLS: u32 = 16;
