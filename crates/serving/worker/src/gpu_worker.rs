@@ -971,6 +971,43 @@ pub use scratchy_serving_engine::gpu_budget::{
     PrefillBucketSelection, compute_available_kv_bytes, select_prefill_bucket,
 };
 
+/// The share of the headroom past what is resident a prefill bucket's activations may take; the
+/// KV cache takes the rest.
+#[cfg(feature = "metal")]
+const METAL_ARENA_FRACTION: f64 = 0.6;
+
+/// The bytes past the resident set and the activations the KV budget also subtracts: 64 MiB of
+/// runtime and staging buffers, 150 MiB of redundancy.
+#[cfg(feature = "metal")]
+const METAL_ACTIVATION_PAD: u64 = (64 + 150) * 1024 * 1024;
+
+/// What a pool pruned to one prefill bucket allocates beside its KV cache
+/// ([`MetalWorker::metal_bucket_prices`]): every arena that runs at the bucket, and the KV cap
+/// rungs' scratch at it.
+#[cfg(feature = "metal")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MetalBucketPrice {
+    bucket_m: u32,
+    arena: u64,
+    scratch: u64,
+}
+
+#[cfg(feature = "metal")]
+impl MetalBucketPrice {
+    fn bytes(self) -> u64 {
+        self.arena.saturating_add(self.scratch)
+    }
+}
+
+/// The memory a prefill bucket is selected under ([`MetalWorker::metal_select_bucket`]): the
+/// whole budget, and the bytes already resident in it.
+#[cfg(feature = "metal")]
+#[derive(Clone, Copy, Debug)]
+struct MetalBudget {
+    total: usize,
+    resident: usize,
+}
+
 // ---------------------------------------------------------------------------
 // Metal arm (Phase F: cfg-mutex extension; Step 2 = instantiate-only).
 // ---------------------------------------------------------------------------
@@ -1326,12 +1363,10 @@ impl MetalWorker {
     /// The peak-activation estimate BOTH the unset-`--max-num-seqs` resolver
     /// (at the end of `load_model`) and the OOM guard
     /// (`determine_available_memory`) budget against — ONE record of the
-    /// fact: the prefill-bucket arena the budget can afford, every arena that
-    /// runs at it priced in ([`Self::metal_bucket_costs`]; the full-ladder
-    /// peak when the model emits no cost table, doubled when a draft model
-    /// rides along), plus the KV cap rungs' scratch at `block_cap` blocks a
-    /// sequence ([`Self::metal_rung_scratch`]), and the 64 MiB
-    /// runtime/staging pad.
+    /// fact: the arenas of the prefill bucket the budget affords
+    /// ([`Self::metal_select_bucket`]), plus the KV cap rungs' scratch at it at
+    /// `block_cap` blocks a sequence ([`Self::metal_rung_scratch`]), and the
+    /// 64 MiB runtime/staging pad.
     fn metal_peak_activation_estimate(
         &self,
         // `load_model` runs this BEFORE `self.model`/`self.gpu_device` take
@@ -1340,14 +1375,15 @@ impl MetalWorker {
         // (after field assignment) passes `None` and the fields serve.
         model: Option<&dyn scratchy_forward_compiler::ScratchyWeights>,
         gpu_device: Option<&scratchy_target_metal::GpuDevice>,
-        // The budget the internal bucket selection prunes against. `None` =
-        // the raw `working_set × utilization` figure — the load-time
-        // `--max-num-seqs` resolver's view, which wants the conservative
-        // pre-floor estimate. `determine_available_memory` passes its
-        // KV-floored total so the arena returned here matches the bucket
-        // its ladder will actually run (and the KV split subtracts exactly
-        // that arena, not a stale collapsed one).
-        budget: Option<usize>,
+        // The budget the bucket selection prunes against. `None` = the raw
+        // `working_set × utilization` figure past what is allocated now —
+        // the load-time `--max-num-seqs` resolver's view, which wants the
+        // conservative pre-floor estimate and prices the GDN state per slot
+        // apart. `determine_available_memory` passes its KV-floored total
+        // and the resident bytes its KV split subtracts, so the bucket
+        // selected here is the one its ladder will actually run (and the KV
+        // split subtracts exactly its activations, not a stale bucket's).
+        budget: Option<MetalBudget>,
         block_cap: usize,
     ) -> ExecutorResult<usize> {
         let model = model
@@ -1356,33 +1392,67 @@ impl MetalWorker {
         let dev = gpu_device.or(self.gpu_device.as_ref()).ok_or_else(|| {
             ExecutorError::WorkerInit("peak estimate: gpu_device not initialized".into())
         })?;
-        let total = budget.unwrap_or_else(|| {
-            self.metal_device
-                .as_ref()
-                .map(|dev| {
+        let budget = budget.unwrap_or_else(|| {
+            let device = self.metal_device.as_ref();
+            MetalBudget {
+                total: device.map_or(0, |dev| {
                     (dev.device.recommendedMaxWorkingSetSize() as f64
                         * self.config.gpu_memory_utilization) as usize
-                })
-                .unwrap_or(0)
+                }),
+                resident: device.map_or(0, |dev| dev.device.currentAllocatedSize()),
+            }
         });
-        let weights_and_overhead = self
-            .metal_device
-            .as_ref()
-            .map(|dev| dev.device.currentAllocatedSize())
-            .unwrap_or(0);
-        let bucket_costs = self.metal_bucket_costs(model, dev)?;
-        // The same 0.6 arena-fraction split `determine_available_memory`
-        // runs; the pad mirrors the non-arena terms the KV formula
-        // subtracts so the headroom here equals what is actually left. A
-        // selected bucket's price already counts the draft's arena.
-        const ARENA_FRACTION: f64 = 0.6;
-        let pad = (64 + 150) * 1024 * 1024usize;
-        let fixed = weights_and_overhead.saturating_add(pad);
-        let sel = select_prefill_bucket(total as u64, fixed as u64, &bucket_costs, ARENA_FRACTION);
-        let arena_peak = sel.arena_bytes as usize;
-        let rung_scratch = self.metal_rung_scratch(model, dev, block_cap)?;
-        Ok((arena_peak.saturating_add(64 * 1024 * 1024))
-            .saturating_add(usize::try_from(rung_scratch).unwrap_or(usize::MAX)))
+        let selected =
+            self.metal_select_bucket(model, dev, budget.total as u64, budget.resident as u64)?;
+        let (max_m, arena) = selected.map_or((None, 0), |(sel, price)| {
+            (Some(sel.max_bucket_m), price.arena)
+        });
+        let rung_scratch = self.metal_rung_scratch(model, dev, max_m, block_cap)?;
+        Ok(usize::try_from(arena.saturating_add(rung_scratch))
+            .unwrap_or(usize::MAX)
+            .saturating_add(64 * 1024 * 1024))
+    }
+
+    /// The prefill bucket the memory `budget` affords with `resident` bytes already allocated: the
+    /// largest whose whole price — every arena that runs at it and the KV cap rungs' scratch at it
+    /// ([`Self::metal_bucket_prices`]) — fits [`METAL_ARENA_FRACTION`] of the headroom past
+    /// `resident` and the pads, the KV cache taking the rest. One selection for every reader of
+    /// it: the bucket the pool runs, and the activations the KV budget is left beside. `None` for
+    /// a model with no buckets.
+    fn metal_select_bucket(
+        &self,
+        target: &dyn scratchy_forward_compiler::ScratchyWeights,
+        dev: &scratchy_target_metal::GpuDevice,
+        budget: u64,
+        resident: u64,
+    ) -> ExecutorResult<Option<(PrefillBucketSelection, MetalBucketPrice)>> {
+        let prices = self.metal_bucket_prices(target, dev)?;
+        let costs: Vec<(u32, u64)> = (prices.iter()).map(|p| (p.bucket_m, p.bytes())).collect();
+        let fixed = resident.saturating_add(METAL_ACTIVATION_PAD);
+        let sel = select_prefill_bucket(budget, fixed, &costs, METAL_ARENA_FRACTION);
+        let price = prices.into_iter().find(|p| p.bucket_m == sel.max_bucket_m);
+        Ok(price.map(|price| (sel, price)))
+    }
+
+    /// Each prefill bucket's price ([`MetalBucketPrice`]): every arena that runs at it, and the
+    /// KV cap rungs' scratch at it — at the rung a sequence reaches at max_model_len, the most a
+    /// pool pruned to the bucket allocates beside its KV cache whatever the cache holds.
+    fn metal_bucket_prices(
+        &self,
+        target: &dyn scratchy_forward_compiler::ScratchyWeights,
+        dev: &scratchy_target_metal::GpuDevice,
+    ) -> ExecutorResult<Vec<MetalBucketPrice>> {
+        let full_cap = self.kv_block_cap(usize::MAX);
+        (self.metal_bucket_costs(target, dev)?.into_iter())
+            .map(|(bucket_m, arena)| {
+                let scratch = self.metal_rung_scratch(target, dev, Some(bucket_m), full_cap)?;
+                Ok(MetalBucketPrice {
+                    bucket_m,
+                    arena,
+                    scratch,
+                })
+            })
+            .collect()
     }
 
     /// Each prefill bucket's arena price: the target's, and every arena that runs at it — each the
@@ -1435,17 +1505,18 @@ impl MetalWorker {
             .collect()
     }
 
-    /// The scratch of the KV cap rung each pool runs on at `block_cap` blocks a sequence: the
-    /// target's, and a draft's — a head's only what the target's scratch grows by to hold it, as
-    /// its arena.
+    /// The scratch of the KV cap rung each pool runs on at `block_cap` blocks a sequence, its
+    /// ladder pruned to `max_m` rows (`None`: every bucket): the target's, and a draft's — a
+    /// head's only what the target's scratch grows by to hold it, as its arena.
     fn metal_rung_scratch(
         &self,
         target: &dyn scratchy_forward_compiler::ScratchyWeights,
         dev: &scratchy_target_metal::GpuDevice,
+        max_m: Option<u32>,
         block_cap: usize,
     ) -> ExecutorResult<u64> {
         let pick = |m: &dyn scratchy_forward_compiler::ScratchyWeights| {
-            Self::metal_pick(m, dev, dev.metal_bucket_max_m, block_cap)
+            Self::metal_pick(m, dev, max_m, block_cap)
         };
         let target_rung = pick(target)?;
         let rows = dev.max_decode_rows;
@@ -6171,8 +6242,13 @@ impl Worker for MetalWorker {
         // The fixed point prices the KV cap rung a sequence can reach at max_model_len — the
         // largest, so the floor it settles on covers every rung below.
         let full_cap = self.kv_block_cap(usize::MAX);
+        // Every selection prices the bucket past the resident set the KV split subtracts.
+        let budget = |total| MetalBudget {
+            total,
+            resident: weights_and_overhead,
+        };
         let mut peak_activation_estimate =
-            self.metal_peak_activation_estimate(None, None, Some(total), full_cap)?;
+            self.metal_peak_activation_estimate(None, None, Some(budget(total)), full_cap)?;
         for _ in 0..8 {
             let floored = utilization_budget
                 .max(
@@ -6186,47 +6262,37 @@ impl Worker for MetalWorker {
             }
             total = floored;
             peak_activation_estimate =
-                self.metal_peak_activation_estimate(None, None, Some(total), full_cap)?;
+                self.metal_peak_activation_estimate(None, None, Some(budget(total)), full_cap)?;
         }
         // ── Target-reactive prefill-bucket selection ─────────────────────
         // The forward macro now compiles a full bucket ladder for every arch
         // (no per-model `workloads` cap). Pick the largest bucket THIS device
-        // can afford: the activation arena may use up to ARENA_FRACTION of the
+        // can afford ([`Self::metal_select_bucket`]): its activations — arena
+        // and rung scratch — may use up to METAL_ARENA_FRACTION of the
         // headroom left after weights + GDN reserve + pads, and KV gets the
         // rest. The chosen cap is stashed on the GpuDevice the forward path
         // uses, so the lazy `MetalWorkerPool::for_buckets` prunes the ladder to
         // match — the same binary runs 512 on a 32 GiB box and 4096 on a
-        // 192 GiB one, with nothing Apple-specific about the policy. An empty
-        // cost table (older arches that never emitted it) falls back to the
-        // prior "reserve the full-ladder arena peak" behavior.
-        const ARENA_FRACTION: f64 = 0.6;
-        let bucket_costs = match (self.model.as_deref(), self.gpu_device.as_ref()) {
-            (Some(target), Some(dev)) => self.metal_bucket_costs(target, dev)?,
-            _ => Vec::new(),
+        // 192 GiB one, with nothing Apple-specific about the policy. `total`
+        // is ALREADY the final budget (working_set·util, KV-floored by the
+        // fixed point above), so it is used as is: re-applying `utilization`
+        // would shrink the budget twice.
+        let selection = match (self.model.as_deref(), self.gpu_device.as_ref()) {
+            (Some(target), Some(dev)) => {
+                self.metal_select_bucket(target, dev, total as u64, weights_and_overhead as u64)?
+            }
+            _ => None,
         };
-        let selection = if bucket_costs.is_empty() {
-            None
-        } else {
-            // `pad` mirrors the non-arena, non-KV terms the KV formula
-            // subtracts (64 MiB runtime/staging + 150 MiB redundancy) so the
-            // headroom the selector splits equals what is actually left.
-            let pad = (64 + 150) * 1024 * 1024u64;
-            // `total` is ALREADY the final budget (working_set·util,
-            // KV-floored by the fixed point above), so use it directly —
-            // do NOT re-apply `utilization` here or it would shrink the
-            // budget twice.
-            let budget = total as u64;
-            let fixed = (weights_and_overhead as u64).saturating_add(pad);
-            let sel = select_prefill_bucket(budget, fixed, &bucket_costs, ARENA_FRACTION);
+        if let Some((sel, price)) = selection {
             tracing::info!(
                 "ScratchyWorker(metal): target-reactive prefill bucket = {} \
-                 (arena {:.1} MiB, KV ~{:.1} MiB; candidate ladder {:?} pruned \
-                 to fit {:.2} GiB budget)",
+                 (arena {:.1} MiB + rung scratch {:.1} MiB at the longest context, KV ~{:.1} \
+                 MiB; pruned to fit {:.2} GiB budget)",
                 sel.max_bucket_m,
-                sel.arena_bytes as f64 / 1_048_576.0,
+                price.arena as f64 / 1_048_576.0,
+                price.scratch as f64 / 1_048_576.0,
                 sel.kv_bytes as f64 / 1_048_576.0,
-                bucket_costs.iter().map(|(m, _)| *m).collect::<Vec<_>>(),
-                budget as f64 / 1_073_741_824.0,
+                total as f64 / 1_073_741_824.0,
             );
             // Stash the cap on the metal `gpu_device` (the GpuDevice every
             // metal forward path runs through — `self.device` is the
@@ -6236,11 +6302,10 @@ impl Worker for MetalWorker {
                 dev.metal_bucket_max_m = Some(sel.max_bucket_m);
             }
             self.metal_prefill_bucket_max_m = Some(sel.max_bucket_m);
-            Some(sel)
-        };
+        }
         // Without a loaded model and device there is no ladder to price: a 512 MiB placeholder.
         let arena_peak = match selection {
-            Some(sel) => sel.arena_bytes as usize,
+            Some((_, price)) => price.arena as usize,
             None => 512 * 1024 * 1024,
         };
         // The selected bucket's price already counts the draft's arena. Without one, take the
@@ -6281,16 +6346,18 @@ impl Worker for MetalWorker {
                 let draft_pb = (draft.filter(|_| !self.head_reads_target_kv()))
                     .map_or(0, |d| draft_block_bytes(d, bs, self.draft_scratch()));
                 let pair = target_block_bytes(target, bs) + draft_pb;
-                kv_left(self.metal_peak_activation_estimate(None, None, Some(total), 1)?)
+                kv_left(self.metal_peak_activation_estimate(None, None, Some(budget(total)), 1)?)
                     / pair.max(1)
             }
             _ => usize::MAX,
         };
         let reach_cap = self.kv_block_cap(reach);
         let peak_activation_estimate =
-            self.metal_peak_activation_estimate(None, None, Some(total), reach_cap)?;
+            self.metal_peak_activation_estimate(None, None, Some(budget(total)), reach_cap)?;
         let rung_scratch = match (self.model.as_deref(), self.gpu_device.as_ref()) {
-            (Some(target), Some(dev)) => self.metal_rung_scratch(target, dev, reach_cap)?,
+            (Some(target), Some(dev)) => {
+                self.metal_rung_scratch(target, dev, dev.metal_bucket_max_m, reach_cap)?
+            }
             _ => 0,
         };
         let available = kv_left(peak_activation_estimate);
