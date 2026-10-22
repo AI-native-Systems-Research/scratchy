@@ -40,12 +40,8 @@ const THREADS: usize = 256;
 /// dispatch `Dtype`: the harness' ssm buffers and the reference's carry-rounding go through it,
 /// so the constant and these tests cannot drift apart.
 fn ssm_entry_dtype() -> Dtype {
-    match GDN_SSM_STATE_DTYPE {
-        scratchy_tensors::DType::F16 => Dtype::F16,
-        scratchy_tensors::DType::BF16 => Dtype::Bf16,
-        scratchy_tensors::DType::F32 => Dtype::F32,
-        other => panic!("the ssm state's dtype {other:?} has no dispatch form"),
-    }
+    Dtype::try_from(GDN_SSM_STATE_DTYPE)
+        .unwrap_or_else(|dt| panic!("the ssm state's dtype {dt:?} has no dispatch form"))
 }
 
 /// The GPU, one test at a time. Apple's driver corrupts its own heap when these tests build their

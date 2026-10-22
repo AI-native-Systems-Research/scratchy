@@ -66,12 +66,8 @@ fn read_f32(buf: &Buffer, n: usize) -> Vec<f32> {
 /// dispatch `Dtype`: every ssm buffer, fixture and read below goes through it, so the constant
 /// and these tests cannot drift apart.
 fn ssm_entry_dtype() -> Dtype {
-    match GDN_SSM_STATE_DTYPE {
-        scratchy_tensors::DType::F16 => Dtype::F16,
-        scratchy_tensors::DType::BF16 => Dtype::Bf16,
-        scratchy_tensors::DType::F32 => Dtype::F32,
-        other => panic!("the ssm state's dtype {other:?} has no dispatch form"),
-    }
+    Dtype::try_from(GDN_SSM_STATE_DTYPE)
+        .unwrap_or_else(|dt| panic!("the ssm state's dtype {dt:?} has no dispatch form"))
 }
 
 /// The ssm state's entry buffer: `data` packed at the entry's dtype — the store's rounding is
