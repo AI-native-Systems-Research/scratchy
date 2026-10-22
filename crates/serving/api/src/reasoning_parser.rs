@@ -14,6 +14,8 @@
 //! `qwen3_reasoning_parser.py`
 
 use std::collections::HashMap;
+
+use scratchy_core_common::sampling::ThinkTokens;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -110,6 +112,11 @@ pub trait ReasoningParser: Send + Sync {
     fn requires_special_tokens(&self) -> bool {
         false
     }
+
+    /// The tokens this parser's thinking opens and closes on, when they are single tokens
+    /// (`<think>` and `</think>`): a request's guided grammar waits for the close (#793). `None`
+    /// for a parser that reads its markers as text, so the grammar applies from the first token.
+    fn think_tokens(&self) -> Option<ThinkTokens>;
 }
 
 /// Per-request state for streaming reasoning extraction.
@@ -199,6 +206,13 @@ impl DeepSeekR1ReasoningParser {
 }
 
 impl ReasoningParser for DeepSeekR1ReasoningParser {
+    fn think_tokens(&self) -> Option<ThinkTokens> {
+        Some(ThinkTokens {
+            open: self.start_token_id,
+            close: self.end_token_id,
+        })
+    }
+
     fn extract_reasoning(&self, model_output: &str) -> ExtractedReasoning {
         // Strip <think> if present.
         let output = if let Some(after) = strip_start_token(model_output, self.start_token) {
@@ -369,6 +383,13 @@ impl Qwen3ReasoningParser {
 }
 
 impl ReasoningParser for Qwen3ReasoningParser {
+    fn think_tokens(&self) -> Option<ThinkTokens> {
+        Some(ThinkTokens {
+            open: self.start_token_id,
+            close: self.end_token_id,
+        })
+    }
+
     fn extract_reasoning(&self, model_output: &str) -> ExtractedReasoning {
         // Strip <think> if present in the generated output.
         let output = if let Some(after) = strip_start_token(model_output, self.start_token) {
@@ -634,6 +655,11 @@ fn reasoning_delta(reasoning: String, content: String) -> ReasoningDelta {
 }
 
 impl ReasoningParser for GptOssReasoningParser {
+    /// Harmony's channel markers are read as text: they aren't single tokens on every port.
+    fn think_tokens(&self) -> Option<ThinkTokens> {
+        None
+    }
+
     fn extract_reasoning(&self, model_output: &str) -> ExtractedReasoning {
         let mut scanner = HarmonyScanner::default();
         let (mut reasoning, mut content) = (String::new(), String::new());
@@ -725,6 +751,11 @@ impl Gemma4ReasoningParser {
 }
 
 impl ReasoningParser for Gemma4ReasoningParser {
+    /// Its channel markers are read as text, atom by atom.
+    fn think_tokens(&self) -> Option<ThinkTokens> {
+        None
+    }
+
     fn extract_reasoning(&self, model_output: &str) -> ExtractedReasoning {
         let mut state = Gemma4StreamingState::default();
         let mut reasoning = String::new();

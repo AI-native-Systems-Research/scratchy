@@ -602,6 +602,29 @@ impl AsyncEngine {
         }
     }
 
+    /// Where `prompt` leaves its model's thinking ([`PromptThinking::of`]), whitespace judged by
+    /// decoding: a prompt that ends with a closed think block closed thinking (thinking off).
+    ///
+    /// ⛔ A TAIL IS DECODED A TOKEN AT A TIME, TO ITS FIRST TOKEN THAT ISN'T WHITESPACE. A tool
+    /// loop's tail after its last `</think>` is every call and result since, thousands of tokens on
+    /// the request path. A thinking-off tail is a token or two, and a long one costs one decode. A
+    /// whitespace token decodes alone: it splits no character.
+    ///
+    /// [`PromptThinking::of`]: scratchy_core_common::sampling::PromptThinking::of
+    fn prompt_thinking(
+        &self,
+        tokens: scratchy_core_common::sampling::ThinkTokens,
+        prompt: &[u32],
+    ) -> scratchy_core_common::sampling::PromptThinking {
+        let blank = |tail: &[u32]| match &self.tokenizer {
+            Some(tokenizer) => (tail.iter()).all(|&token| {
+                (tokenizer.decode(&[token], false)).is_ok_and(|s| s.trim().is_empty())
+            }),
+            None => tail.is_empty(),
+        };
+        scratchy_core_common::sampling::PromptThinking::of(tokens, prompt, blank)
+    }
+
     /// Set the reasoning parser on this engine.
     pub fn set_reasoning_parser(&mut self, parser: Arc<dyn ReasoningParser>) {
         self.reasoning_parser = Some(parser);
@@ -777,12 +800,8 @@ impl AsyncEngine {
         let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
 
         // Tokenize prompt once.
-        let mut ec_request = self.chat_to_engine_request(&base_id, &request, &sampling_params)?;
-        let mut prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
-
-        // Truncate prompt tokens from the left (keep the last N).
-        truncate_prompt(&mut prompt_token_ids, request.truncate_prompt_tokens)?;
-        ec_request.prompt_token_ids = Some(prompt_token_ids.clone());
+        let ec_request = self.chat_to_engine_request(&base_id, &request, &mut sampling_params)?;
+        let prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
 
         let num_prompt_tokens = prompt_token_ids.len() as u32;
 
@@ -1049,8 +1068,8 @@ impl AsyncEngine {
             .request_id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let sampling_params = self.build_sampling_params_from_chat(&request)?;
-        let ec_request = self.chat_to_engine_request(&base_id, &request, &sampling_params)?;
+        let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
+        let ec_request = self.chat_to_engine_request(&base_id, &request, &mut sampling_params)?;
         let token_ids = ec_request.prompt_token_ids.unwrap_or_default();
 
         // Decode token IDs back to text for the prompt field.
@@ -1095,12 +1114,8 @@ impl AsyncEngine {
         let n = validate_n(request.n)?;
 
         let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
-        let mut ec_request = self.chat_to_engine_request(&base_id, &request, &sampling_params)?;
-        let mut prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
-
-        // Truncate prompt tokens from the left (keep the last N).
-        truncate_prompt(&mut prompt_token_ids, request.truncate_prompt_tokens)?;
-        ec_request.prompt_token_ids = Some(prompt_token_ids.clone());
+        let ec_request = self.chat_to_engine_request(&base_id, &request, &mut sampling_params)?;
+        let prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
 
         let num_prompt_tokens = prompt_token_ids.len() as u32;
 
@@ -3116,7 +3131,7 @@ impl AsyncEngine {
         &self,
         request_id: &str,
         request: &protocol::ChatCompletionRequest,
-        sampling_params: &SamplingParams,
+        sampling_params: &mut SamplingParams,
     ) -> ServeResult<EngineCoreRequest> {
         // Build text from chat messages — using chat template if available.
         let text = if let Some(template) = &self.chat_template {
@@ -3198,6 +3213,20 @@ impl AsyncEngine {
         if mm_data.is_some() {
             cache_breakpoints.clear();
         }
+
+        // Truncate prompt tokens from the left (keep the last N): the prompt the model reads.
+        truncate_prompt(&mut token_ids, request.truncate_prompt_tokens)?;
+
+        // ⭐ A REASONING MODEL THINKS BEFORE ITS GRAMMAR APPLIES (#793), where the prompt it reads
+        // leaves it thinking or lets it start to.
+        sampling_params.think_first =
+            match (&sampling_params.guided_grammar, &self.reasoning_parser) {
+                (Some(_), Some(parser)) => (parser.think_tokens()).and_then(|tokens| {
+                    let prompt = self.prompt_thinking(tokens, &token_ids);
+                    scratchy_core_common::sampling::ThinkFirst::of(tokens, prompt)
+                }),
+                _ => None,
+            };
 
         Ok(EngineCoreRequest {
             request_id: request_id.to_string(),
@@ -4481,13 +4510,104 @@ mod tests {
         assert!(engine.check_prompt_fits(1024).is_ok());
     }
 
+    /// A reasoning model's grammar waits for it to think (#793). On an engine whose reasoning
+    /// parser thinks in `<think>` tokens, a request with a grammar carries where its reply starts
+    /// thinking: here, where it may open it, as the prompt has neither token. A request without a
+    /// grammar, or an engine whose parser reads its markers as text (harmony), carries none.
+    #[test]
+    fn a_grammar_request_on_a_reasoning_model_thinks_first() {
+        use scratchy_core_common::sampling::{ThinkFirst, ThinkTokens};
+        let vocab = HashMap::from([
+            ("<think>".to_string(), 1000),
+            ("</think>".to_string(), 1001),
+        ]);
+        let think = |engine: &AsyncEngine, response_format: Option<serde_json::Value>| {
+            let request = protocol::ChatCompletionRequest {
+                response_format: response_format.map(|f| serde_json::from_value(f).unwrap()),
+                ..make_chat_request()
+            };
+            let mut params = engine.build_sampling_params_from_chat(&request).unwrap();
+            let ec_request = engine
+                .chat_to_engine_request("test-1", &request, &mut params)
+                .unwrap();
+            let sent = ec_request.sampling_params.unwrap().think_first;
+            assert_eq!(
+                sent, params.think_first,
+                "the request carries what the params do"
+            );
+            params.think_first
+        };
+        let json = Some(serde_json::json!({"type": "json_object"}));
+
+        let mut qwen3 = make_test_engine();
+        let parser = crate::reasoning_parser::get_reasoning_parser("qwen3", &vocab).unwrap();
+        qwen3.set_reasoning_parser(parser);
+        let tokens = ThinkTokens {
+            open: 1000,
+            close: 1001,
+        };
+        assert_eq!(
+            think(&qwen3, json.clone()),
+            Some(ThinkFirst::MayOpen(tokens))
+        );
+        assert_eq!(think(&qwen3, None), None, "no grammar");
+
+        let mut harmony = make_test_engine();
+        let parser = crate::reasoning_parser::get_reasoning_parser("gpt_oss", &vocab).unwrap();
+        harmony.set_reasoning_parser(parser);
+        assert_eq!(think(&harmony, json.clone()), None, "markers read as text");
+
+        assert_eq!(
+            think(&make_test_engine(), json),
+            None,
+            "no reasoning parser"
+        );
+    }
+
+    /// The engine reads a prompt as having closed thinking only where it ends with a closed think
+    /// block, judging the tail by decoding it: whitespace alone after the close (a template with
+    /// thinking off), not an earlier turn's thinking with the conversation after it. Byte-level
+    /// test tokenizer; `T` and `U` stand in for `<think>` and `</think>`.
+    #[test]
+    fn a_prompt_closes_thinking_only_where_it_ends_with_a_closed_think_block() {
+        use scratchy_core_common::sampling::{PromptThinking, ThinkTokens};
+        let engine = make_test_engine_with_tokenizer();
+        let tokenizer = engine.tokenizer.clone().unwrap();
+        let ids = |text: &str| tokenizer.encode(text, false).unwrap();
+        let [open, close] = [ids("T")[0], ids("U")[0]];
+        let tokens = ThinkTokens { open, close };
+        let reads = |text: &str| engine.prompt_thinking(tokens, &ids(text));
+        assert_eq!(reads("hi T"), PromptThinking::Open);
+        assert_eq!(
+            reads("hi T\n\nU\n\n"),
+            PromptThinking::Closed,
+            "thinking off"
+        );
+        assert_eq!(
+            reads("hi TaU"),
+            PromptThinking::Closed,
+            "closed at the very end"
+        );
+        assert_eq!(
+            reads("hi TaU then a tool call"),
+            PromptThinking::Absent,
+            "an earlier turn's"
+        );
+        assert_eq!(
+            reads(&format!("hi TaU \n {}", "tool result ".repeat(4096))),
+            PromptThinking::Absent,
+            "a long tail, its first text deciding it"
+        );
+        assert_eq!(reads("hi"), PromptThinking::Absent);
+    }
+
     #[test]
     fn test_chat_to_engine_request_without_tokenizer() {
         let engine = make_test_engine();
         let request = make_chat_request();
-        let params = engine.build_sampling_params_from_chat(&request).unwrap();
+        let mut params = engine.build_sampling_params_from_chat(&request).unwrap();
         let ec_req = engine
-            .chat_to_engine_request("test-1", &request, &params)
+            .chat_to_engine_request("test-1", &request, &mut params)
             .unwrap();
         assert_eq!(ec_req.request_id, "test-1");
         assert!(ec_req.prompt_token_ids.is_some());
@@ -4519,9 +4639,9 @@ mod tests {
                 tool_choice,
                 ..make_chat_request()
             };
-            let params = engine.build_sampling_params_from_chat(&request).unwrap();
+            let mut params = engine.build_sampling_params_from_chat(&request).unwrap();
             let ec_req = engine
-                .chat_to_engine_request("test-1", &request, &params)
+                .chat_to_engine_request("test-1", &request, &mut params)
                 .unwrap();
             ec_req.prompt_token_ids.unwrap()
         };
@@ -4535,9 +4655,9 @@ mod tests {
     fn test_chat_to_engine_request_with_tokenizer() {
         let engine = make_test_engine_with_tokenizer();
         let request = make_chat_request();
-        let params = engine.build_sampling_params_from_chat(&request).unwrap();
+        let mut params = engine.build_sampling_params_from_chat(&request).unwrap();
         let ec_req = engine
-            .chat_to_engine_request("test-1", &request, &params)
+            .chat_to_engine_request("test-1", &request, &mut params)
             .unwrap();
         assert_eq!(ec_req.request_id, "test-1");
         let ids = ec_req.prompt_token_ids.unwrap();

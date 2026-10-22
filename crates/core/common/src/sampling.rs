@@ -37,6 +37,69 @@ pub enum GuidedGrammar {
     StructuralTag { spec: String },
 }
 
+/// The tokens a reasoning model's thinking opens and closes on, when it thinks in single tokens
+/// (`<think>` and `</think>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkTokens {
+    pub open: u32,
+    pub close: u32,
+}
+
+/// Where a prompt leaves its model's thinking, read from its last `open` and `close`
+/// ([`Self::of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptThinking {
+    /// Its last `open` has no `close` after it: the template opened thinking.
+    Open,
+    /// It ends with a closed think block, `close` and nothing but whitespace after it: the
+    /// template closed thinking, as one with thinking off writes `<think>\n\n</think>\n\n`.
+    Closed,
+    /// Neither: no thinking, or an earlier turn's finished thinking with the conversation after it
+    /// (a tool loop's kept `<think>…</think>`), which the reply's own thinking may follow.
+    Absent,
+}
+
+impl PromptThinking {
+    /// Where `prompt` leaves thinking. `blank` says whether tokens are whitespace alone: the
+    /// engine decodes them.
+    pub fn of(tokens: ThinkTokens, prompt: &[u32], blank: impl Fn(&[u32]) -> bool) -> Self {
+        let last = |id: u32| prompt.iter().rposition(|&t| t == id);
+        match (last(tokens.open), last(tokens.close)) {
+            (Some(open), close) if close.is_none_or(|close| close < open) => Self::Open,
+            (_, Some(close)) if blank(&prompt[close + 1..]) => Self::Closed,
+            _ => Self::Absent,
+        }
+    }
+}
+
+/// ⭐ A REASONING MODEL THINKS BEFORE ITS GRAMMAR APPLIES (#793), as vLLM holds a request's
+/// grammar back until its reasoning parser sees reasoning end. Where a reply starts, which the
+/// prompt decides ([`Self::of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThinkFirst {
+    /// The prompt left the model thinking (a template that opens `<think>`): no grammar until
+    /// `close`, then the grammar from the next token.
+    Thinking { close: u32 },
+    /// The prompt has no thinking: the reply's first token may open it (`open`), and the grammar
+    /// waits for its close; any other first token is the grammar's.
+    MayOpen(ThinkTokens),
+}
+
+impl ThinkFirst {
+    /// Where a reply starts after a prompt that leaves thinking `prompt`: thinking where the
+    /// prompt opened it, under the grammar from the first token where the prompt closed it
+    /// (thinking off: `None`), and free to open it otherwise.
+    pub fn of(tokens: ThinkTokens, prompt: PromptThinking) -> Option<Self> {
+        match prompt {
+            PromptThinking::Open => Some(Self::Thinking {
+                close: tokens.close,
+            }),
+            PromptThinking::Closed => None,
+            PromptThinking::Absent => Some(Self::MayOpen(tokens)),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SamplingType
 // ---------------------------------------------------------------------------
@@ -156,6 +219,11 @@ pub struct SamplingParams {
     /// the grammar are sampled.
     pub guided_grammar: Option<GuidedGrammar>,
 
+    /// Where the reply starts thinking, for a reasoning model whose `guided_grammar` waits until
+    /// thinking ends ([`ThinkFirst`]). `None`: the grammar applies from the first token.
+    #[serde(default)]
+    pub think_first: Option<ThinkFirst>,
+
     /// When set, only these token IDs may be sampled. All other logits
     /// are masked to `-inf`. Similar to grammar masking but static.
     pub allowed_token_ids: Option<Vec<u32>>,
@@ -203,6 +271,7 @@ impl Default for SamplingParams {
             output_kind: RequestOutputKind::default(),
             logit_bias: None,
             guided_grammar: None,
+            think_first: None,
             allowed_token_ids: None,
             bad_words_token_ids: None,
             seal: false,
@@ -440,6 +509,40 @@ pub struct LogprobsOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A prompt opens thinking where its last `<think>` has no `</think>` after it, and closes it
+    /// where it ends with a closed think block (whitespace alone after the close). An earlier
+    /// turn's finished thinking, with the conversation after it, closes nothing: the reply's own
+    /// thinking may follow (a tool loop). A reply starts thinking, under the grammar, or free to
+    /// open thinking, accordingly.
+    #[test]
+    fn a_reply_starts_thinking_where_its_prompt_leaves_it() {
+        use PromptThinking::{Absent, Closed, Open};
+        let tokens = ThinkTokens { open: 7, close: 8 };
+        // 0 is whitespace here; every other token is text.
+        let blank = |tail: &[u32]| tail.iter().all(|&t| t == 0);
+        let of = |prompt: &[u32]| PromptThinking::of(tokens, prompt, blank);
+        assert_eq!(of(&[1, 2, 7]), Open, "opened by the template");
+        assert_eq!(of(&[1, 2, 7, 0]), Open, "with whitespace after");
+        assert_eq!(of(&[1, 7, 3, 8, 4, 7, 5]), Open, "opened again");
+        assert_eq!(of(&[1, 7, 0, 8, 0, 0]), Closed, "closed: thinking off");
+        assert_eq!(of(&[1, 7, 8]), Closed, "closed at the very end");
+        assert_eq!(
+            of(&[1, 7, 3, 8, 4, 5]),
+            Absent,
+            "an earlier turn's thinking"
+        );
+        assert_eq!(of(&[1, 2, 3]), Absent);
+        assert_eq!(of(&[]), Absent);
+
+        let thinking = Some(ThinkFirst::Thinking { close: 8 });
+        assert_eq!(ThinkFirst::of(tokens, Open), thinking);
+        assert_eq!(ThinkFirst::of(tokens, Closed), None);
+        assert_eq!(
+            ThinkFirst::of(tokens, Absent),
+            Some(ThinkFirst::MayOpen(tokens))
+        );
+    }
 
     #[test]
     fn test_default_sampling_params() {

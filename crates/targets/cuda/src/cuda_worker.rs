@@ -5342,8 +5342,10 @@ impl CudaWorker {
                 if let Some(ref grammar) = params.guided_grammar
                     && let Some(ref factory) = self.grammar_factory
                 {
-                    match scratchy_serving_engine::grammar::GrammarGuide::from_guided_grammar(
-                        grammar, factory,
+                    match scratchy_serving_engine::grammar::GrammarGuide::for_request(
+                        grammar,
+                        params.think_first,
+                        factory,
                     ) {
                         Ok(guide) => {
                             self.grammar_states.insert(new_req.req_id.clone(), guide);
