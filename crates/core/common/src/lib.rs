@@ -18,6 +18,7 @@ pub mod forward_telemetry;
 pub mod kv;
 pub mod multimodal;
 pub mod request;
+pub mod sampled_rows;
 #[cfg(feature = "sampler-telemetry")]
 pub mod sampler_telemetry;
 pub mod sampling;

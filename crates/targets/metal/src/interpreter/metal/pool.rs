@@ -85,10 +85,15 @@ pub struct MetalBucketSpec {
     pub backbone_slot: u32,
     /// Per-arena-slot byte sizes derived from the FUF tile shapes
     /// at macro-expansion time (post-coloring, with bucket-specific
-    /// `num_tokens` baked in). `len() == num_arena_slots`. The
-    /// pool takes the elementwise max across every bucket to size
-    /// the single per-worker arena.
+    /// `num_tokens` baked in), but for the logits in the terminal slot,
+    /// which hold the rows a step samples ([`Self::logits_row_bytes`]).
+    /// `len() == num_arena_slots`. The pool takes the elementwise max
+    /// across every bucket's [`Self::slot_bytes`] to size the single
+    /// per-worker arena.
     pub arena_bytes: &'static [u64],
+    /// Bytes of one row of the logits the terminal slot holds (0 for an encoder layout, whose
+    /// terminal rows are in [`Self::arena_bytes`]).
+    pub logits_row_bytes: u64,
     pub backbone: &'static [Instruction],
     pub lm_head: &'static [Instruction],
     /// MTL4 encoder barrier flags computed at macro time from the
@@ -109,6 +114,20 @@ pub struct MetalBucketSpec {
     /// Every kernel of a baked library ([`crate::aot::baked_library`]) the model's tapes name,
     /// compiled with its constants: the model's one table, which each of its buckets names.
     pub kernels: &'static [crate::tape::lowered::BakedKernel],
+}
+
+impl MetalBucketSpec {
+    /// Each arena slot's bytes when this bucket runs `tape` and no step samples more than
+    /// `sampled` rows (`None`: every row): the terminal slot holds what the tape writes of the
+    /// logits ([`LoweredMetalTape::logits_slot_rows`]) beside what else it holds.
+    pub fn slot_bytes(&self, tape: &LoweredMetalTape, sampled: Option<DecodeRows>) -> Vec<u64> {
+        let logits = self.logits_row_bytes * u64::from(tape.logits_slot_rows(sampled));
+        let mut bytes = self.arena_bytes.to_vec();
+        if let Some(terminal) = bytes.get_mut(self.terminal_slot as usize) {
+            *terminal = (*terminal).max(logits);
+        }
+        bytes
+    }
 }
 
 impl Clone for MetalBucketSpec {
@@ -495,22 +514,31 @@ impl PickedRung<'_> {
     /// instead of in place to avoid a cross-threadgroup race — carries more colored slots than a
     /// bucket that didn't. A bucket's tape only ever references slots in `0..its own
     /// num_arena_slots`, so an arena sized to the max serves every bucket; smaller buckets simply
-    /// leave the tail slots resident and idle. `arena_bytes` is elementwise-maxed over whatever
-    /// slots each spec defines.
-    pub fn arena_layout(&self) -> ArenaLayout {
+    /// leave the tail slots resident and idle. Each bucket's [`MetalBucketSpec::slot_bytes`] — its
+    /// logits for at most `sampled` rows a step — is elementwise-maxed over whatever slots each
+    /// spec defines.
+    pub fn arena_layout(&self, sampled: Option<DecodeRows>) -> ArenaLayout {
         let num_slots = (self.tapes.iter())
             .map(|(s, _)| s.num_arena_slots as usize)
             .max()
             .unwrap_or(0);
         let mut arena_layout: ArenaLayout = vec![0u64; num_slots];
-        for (spec, _) in &self.tapes {
-            for (slot, &bytes) in spec.arena_bytes.iter().enumerate() {
+        for bytes in self.bucket_arena(sampled) {
+            for (slot, bytes) in bytes.into_iter().enumerate() {
                 if bytes > arena_layout[slot] {
                     arena_layout[slot] = bytes;
                 }
             }
         }
         arena_layout
+    }
+
+    /// Each picked bucket's arena slots' bytes ([`MetalBucketSpec::slot_bytes`]), in bucket order:
+    /// its logits for at most `sampled` rows a step.
+    pub fn bucket_arena(&self, sampled: Option<DecodeRows>) -> Vec<Vec<u64>> {
+        (self.tapes.iter())
+            .map(|(spec, rung)| spec.slot_bytes(&rung.tape, sampled))
+            .collect()
     }
 
     /// The slots the host reads by pointer, which stay allocated in full and shared: each kept
@@ -531,9 +559,9 @@ impl PickedRung<'_> {
     }
 
     /// What this rung needs of its host's arena as a guest: each slot's bytes rank by rank, its
-    /// scratch by kind, the decode split's partials for at most `decode_rows` rows.
+    /// logits and the decode split's partials for at most `decode_rows` rows, its scratch by kind.
     pub fn guest(&self, decode_rows: Option<DecodeRows>) -> GuestArena {
-        let layout = self.arena_layout();
+        let layout = self.arena_layout(decode_rows);
         let slots = self.ranks.guest_slots(layout.len());
         GuestArena {
             arena: slots.iter().map(|(_, &Slot(slot))| layout[slot]).collect(),
@@ -541,10 +569,11 @@ impl PickedRung<'_> {
         }
     }
 
-    /// The bytes this rung's arena grows by to hold `guest`'s ([`Hosting`]): what its pool
-    /// allocates for the guest, which the memory budget prices.
-    pub fn hosting_arena_bytes(&self, guest: &GuestArena) -> u64 {
-        let own = self.arena_layout();
+    /// The bytes this rung's arena, its logits for at most `decode_rows` rows, grows by to hold
+    /// `guest`'s ([`Hosting`]): what its pool allocates for the guest, which the memory budget
+    /// prices.
+    pub fn hosting_arena_bytes(&self, decode_rows: Option<DecodeRows>, guest: &GuestArena) -> u64 {
+        let own = self.arena_layout(decode_rows);
         let hosted = Hosting::of(&own, &self.ranks, guest).layout;
         hosted.iter().sum::<u64>() - own.iter().sum::<u64>()
     }
@@ -796,7 +825,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
         let rung = pick_rung(&device, rungs, max_bucket_m, block_cap, addressing)?;
         let variant = rung.variant();
-        let arena_layout = rung.arena_layout();
+        let arena_layout = rung.arena_layout(decode_rows);
+        let bucket_arena = rung.bucket_arena(decode_rows);
         let host_slots = rung.host_slots(&share, terminal);
         let ranks = rung.ranks;
         let picked = rung.tapes;
@@ -814,7 +844,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
         let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache), variant));
         let sparse_plan = SparsePlan {
-            bucket_arena: picked.iter().map(|(spec, _)| spec.arena_bytes).collect(),
+            bucket_arena,
             host_slots,
         };
 
@@ -988,6 +1018,18 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         })
     }
 
+    /// [`Self::pick_bucket`] for `inputs`' step, whose logits its bucket's buffer must hold
+    /// ([`LoweredMetalTape::logits_overflow`]): a step writing more would write past it.
+    pub fn pick_bucket_for(&self, inputs: &ForwardInputs<'_>) -> Result<usize, ForwardError> {
+        let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
+        let sampled = inputs.sampled_row_count();
+        let tape = &self.bucket_tapes[bucket_idx];
+        match tape.logits_overflow(self.decode_rows, sampled) {
+            Some(overflow) => Err(ForwardError::TooManySampledRows { sampled, overflow }),
+            None => Ok(bucket_idx),
+        }
+    }
+
     /// Lazily build the pool's MTL4 surface (queue + allocator +
     /// shared event). Panics if MTL4 is unavailable on this host
     /// (requires macOS 15+ on Apple Family 7+).
@@ -1036,7 +1078,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         bucket_idx: usize,
         num_tokens: usize,
         num_seqs: u32,
-        has_spec_tokens: bool,
+        sampled_rows: crate::tape::ids::SampledRowCount,
         reads: ForwardReads,
         tail: Option<F>,
         writes: &InputWrites,
@@ -1086,7 +1128,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                     bucket_idx,
                     num_tokens,
                     num_seqs,
-                    has_spec_tokens,
+                    sampled_rows,
                     start..end,
                     (start == 0).then_some(writes),
                 )?;
@@ -1103,7 +1145,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                     bucket_idx,
                     num_tokens as u32,
                     num_seqs,
-                    has_spec_tokens,
+                    sampled_rows,
                     reads,
                     enc,
                 )
@@ -1274,7 +1316,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         bucket_idx: usize,
         num_tokens: usize,
         num_seqs: u32,
-        has_spec_tokens: bool,
+        sampled_rows: crate::tape::ids::SampledRowCount,
         range: std::ops::Range<usize>,
         writes: Option<&InputWrites>,
     ) -> Result<(), ForwardError> {
@@ -1284,7 +1326,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                     bucket_idx,
                     num_tokens as u32,
                     num_seqs,
-                    has_spec_tokens,
+                    sampled_rows,
                     enc,
                     range,
                 )
@@ -1387,9 +1429,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             usize,
         ) -> Result<(), ForwardError>,
     {
-        let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
+        let bucket_idx = self.pick_bucket_for(inputs)?;
         let num_seqs = num_seqs(inputs);
-        let has_spec_tokens = inputs.has_spec_tokens;
+        let sampled_rows = inputs.sampled_row_count();
         self.attach_residency();
 
         let guard = self.checkout()?;
@@ -1412,7 +1454,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             bucket_idx,
             inputs.num_tokens as usize,
             num_seqs,
-            has_spec_tokens,
+            sampled_rows,
             inputs.reads,
             tail,
             &writes,
@@ -1724,7 +1766,7 @@ impl<W: CanonicalParams> Onto<'_, W> {
             "a forward played in another's command buffer is waited for with it"
         );
         let pool = self.guard.pool;
-        let bucket_idx = pool.pick_bucket(inputs.num_tokens)?;
+        let bucket_idx = pool.pick_bucket_for(inputs)?;
         assert!(
             !self.guard.worker.bucket_has_avg_pool_2d(bucket_idx),
             "a serialized forward runs in command buffers of its own"
@@ -1755,7 +1797,7 @@ impl<W: CanonicalParams> Onto<'_, W> {
                 bucket_idx,
                 inputs.num_tokens,
                 num_seqs(inputs),
-                inputs.has_spec_tokens,
+                inputs.sampled_row_count(),
                 inputs.reads,
                 enc,
             )
@@ -2111,38 +2153,28 @@ fn write_runtime_inputs(
             return Err(ForwardError::KvNotMapped { block, mapped });
         }
     }
-    // Tell the gather kernel (used right before lm_head) what the
-    // actual num_tokens of this forward is so it can pick the
-    // last-token source row.
+    // The forward's actual num_tokens, for a kernel that reads M at runtime.
     write(
         "num_tokens",
         &runtime.num_tokens_u32,
         bytes_of(&[inputs.num_tokens]),
         Padding::Zero,
     )?;
-    // Plumb the lm_head sample-row index list. When the caller
-    // supplies `last_token_indices` (the common case: every forward
-    // that produces a sampled token) the slice trio uses these as
-    // the gather sources and scatter destinations; otherwise the
-    // count is 0 and the slice is a no-op for this step.
-    let num_sample_rows = inputs
-        .last_token_indices
-        .map(|s| s.len() as u32)
-        .unwrap_or(0);
+    // The rows the forward samples: the lm_head slice gathers them and puts them back, a
+    // compaction moves their logits to the front.
+    let sampled = inputs.sampled_rows;
     write(
         "num_sample_rows",
         &runtime.num_sample_rows_u32,
-        bytes_of(&[num_sample_rows]),
+        bytes_of(&[sampled.len() as u32]),
         Padding::Zero,
     )?;
-    if let Some(s) = inputs.last_token_indices {
-        write(
-            "last_token_indices",
-            &runtime.sample_indices,
-            bytes_of(s),
-            Padding::Zero,
-        )?;
-    }
+    write(
+        "sampled_rows",
+        &runtime.sample_indices,
+        bytes_of(sampled),
+        Padding::Zero,
+    )?;
     // GDN per-forward indices (hybrid arches only): a `GdnSeqSlots` record
     // (6 i32s) + a u32 step code per batched sequence in cu_seqlens order.
     if let Some(idx) = inputs.gdn_state_indices {
@@ -2263,6 +2295,10 @@ mod tests {
     use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    /// The rows a step of at most 9 one-row sequences samples, its first `n` for `n` rows: every
+    /// row, each its sequence's last.
+    const EVERY_ROW: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 
     /// The test tapes' variant: `TestWeights`' block capacity, no TurboQuant decode attention.
     const TEST_VARIANT: TapeVariant = TapeVariant {
@@ -2429,8 +2465,33 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             cache_live: &[],
         }
+    }
+
+    /// A step's logits fit its bucket's buffer only if every row its tape writes does. A 96-row
+    /// bucket tiled by 64 (NAX) whose buffer is sized for 40 sampled rows holds one tile, 64 rows:
+    /// a step sampling 64 rows passes that count, but the matmul over every row runs
+    /// `⌈2 · 64 / 96⌉ = 2` tiles, the bucket's 96 rows, so it is refused.
+    #[test]
+    fn a_step_whose_tiles_pass_the_logits_buffer_is_refused() {
+        use crate::tape::ids::{DecodeRows, SampledRowCount};
+        use crate::tape::lowered::{LogitsOverflow, LogitsRows, RowTile};
+        let tape = LoweredMetalTape {
+            logits_rows: LogitsRows::Sampled {
+                tile: RowTile::Rows64,
+            },
+            ..synthetic_tape(96)
+        };
+        let decode_rows = Some(DecodeRows(40));
+        assert_eq!(tape.logits_slot_rows(decode_rows), 64);
+        let overflow = |n| tape.logits_overflow(decode_rows, SampledRowCount(n));
+        assert_eq!(overflow(40), None);
+        let (writes, holds) = (96, 64);
+        assert_eq!(overflow(64), Some(LogitsOverflow { writes, holds }));
+        // A buffer of the bucket's rows holds every row the bucket runs.
+        assert_eq!(tape.logits_overflow(None, SampledRowCount(96)), None);
     }
 
     /// Build a pool with `max_workers = max` for a one-bucket
@@ -2788,8 +2849,7 @@ mod tests {
             cu_seqlens_q: Some(cu),
             seq_used_k: Some(used),
             block_tables: vec![table],
-            has_spec_tokens: false,
-            last_token_indices: None,
+            sampled_rows: &EVERY_ROW[..2],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -2852,8 +2912,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            has_spec_tokens: false,
-            last_token_indices: None,
+            sampled_rows: &EVERY_ROW[..1],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -2952,8 +3011,7 @@ mod tests {
                 cu_seqlens_q: None,
                 seq_used_k: None,
                 block_tables: Vec::new(),
-                has_spec_tokens: false,
-                last_token_indices: None,
+                sampled_rows: &EVERY_ROW[..ids.len()],
                 gdn_state_indices: None,
                 gdn_is_fresh: None,
                 vision_rope_freqs: None,
@@ -3033,8 +3091,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            has_spec_tokens: false,
-            last_token_indices: None,
+            sampled_rows: &EVERY_ROW[..4],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -3091,8 +3148,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            has_spec_tokens: false,
-            last_token_indices: None,
+            sampled_rows: &EVERY_ROW[..<[u32]>::len(ids)],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -3196,8 +3252,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            has_spec_tokens: false,
-            last_token_indices: None,
+            sampled_rows: &EVERY_ROW[..0],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -3240,8 +3295,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            has_spec_tokens: false,
-            last_token_indices: None,
+            sampled_rows: &EVERY_ROW[..9],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -3294,8 +3348,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            has_spec_tokens: false,
-            last_token_indices: None,
+            sampled_rows: &EVERY_ROW[..1],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -3365,6 +3418,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             cache_live: &[],
         };
         let mut v = Vec::new();
@@ -3475,6 +3529,7 @@ mod tests {
             terminal_slot: 1,
             backbone_slot: 0,
             arena_bytes: TEST_ARENA_BYTES,
+            logits_row_bytes: 0,
             backbone: EMPTY_BACKBONE,
             lm_head: EMPTY_LM_HEAD,
             backbone_barriers: EMPTY_BARRIERS,
@@ -3506,6 +3561,7 @@ mod tests {
             terminal_slot: 1,
             backbone_slot: 0,
             arena_bytes: TEST_ARENA_BYTES,
+            logits_row_bytes: 0,
             backbone: EMPTY_BACKBONE,
             lm_head: EMPTY_LM_HEAD,
             backbone_barriers: EMPTY_BARRIERS,
@@ -3541,6 +3597,7 @@ mod tests {
                 terminal_slot: 1,
                 backbone_slot: 0,
                 arena_bytes: TEST_ARENA_BYTES,
+                logits_row_bytes: 0,
                 backbone: EMPTY_BACKBONE,
                 lm_head: EMPTY_LM_HEAD,
                 backbone_barriers: EMPTY_BARRIERS,
@@ -3554,6 +3611,7 @@ mod tests {
                 terminal_slot: 1,
                 backbone_slot: 0,
                 arena_bytes: TEST_ARENA_BYTES,
+                logits_row_bytes: 0,
                 backbone: EMPTY_BACKBONE,
                 lm_head: EMPTY_LM_HEAD,
                 backbone_barriers: EMPTY_BARRIERS,
@@ -3597,6 +3655,7 @@ mod tests {
             terminal_slot: 1,
             backbone_slot,
             arena_bytes: arena,
+            logits_row_bytes: 0,
             backbone: EMPTY_BACKBONE,
             lm_head: EMPTY_LM_HEAD,
             backbone_barriers: EMPTY_BARRIERS,
@@ -3611,7 +3670,7 @@ mod tests {
             (rungs.pick(&device, None, 128, KvAddressing::Direct)).expect("a test rung")
         };
         let needs = pick(guest).guest(None);
-        let priced = pick(host).hosting_arena_bytes(&needs);
+        let priced = pick(host).hosting_arena_bytes(None, &needs);
         let (weights, allocator) = build_test_weights(&device);
         let build = |rungs, share, terminal| {
             let factory = RuntimeFactory::new(|d, _| empty_runtime(d, 1));

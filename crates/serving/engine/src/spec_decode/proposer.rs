@@ -315,8 +315,7 @@ impl DraftModelProposer {
                 max_seqlen_q: seed.max_seqlen_q,
                 max_seqlen_k: seed.max_seqlen_k,
                 num_tokens: seed.num_tokens,
-                has_spec_tokens: false,
-                last_token_indices: None,
+                sampled_rows: None,
                 target_hidden: None,
             };
             if backend
@@ -482,8 +481,7 @@ impl DraftModelProposer {
                 max_seqlen_q: 1,
                 max_seqlen_k: iter0_max_k,
                 num_tokens: num_reqs,
-                has_spec_tokens: false,
-                last_token_indices: None,
+                sampled_rows: None,
                 target_hidden: None,
             };
             match backend.forward_chain_k(DRAFT_MODEL, DRAFT_KV, &iter0_req, seed.block_size, k) {
@@ -549,8 +547,7 @@ impl DraftModelProposer {
                 max_seqlen_q: 1,
                 max_seqlen_k: step_max_k,
                 num_tokens: num_reqs,
-                has_spec_tokens: false,
-                last_token_indices: None,
+                sampled_rows: None,
                 target_hidden: None,
             };
             let step_argmax =

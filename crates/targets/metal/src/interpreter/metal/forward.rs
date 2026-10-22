@@ -20,6 +20,7 @@ use crate::interpreter::metal::__re::MTLCommandBufferStatus;
 
 use super::worker::WorkerError;
 use crate::tape::ids::MaxBlocksPerSeq;
+use scratchy_core_common::sampled_rows::{EmptySequence, SampledRows};
 
 /// One forward step's runtime inputs.
 ///
@@ -68,22 +69,11 @@ pub struct ForwardInputs<'a> {
     /// order; group 0 = full). Empty when no paged read. Same single-vs-N
     /// contract as [`Self::slot_mappings`].
     pub block_tables: Vec<&'a [u32]>,
-    /// `true` when this forward is a spec-decode verify batch (one
-    /// or more reqs carries `spec_token_ids`). Currently informational —
-    /// the lm_head slice trio reads `last_token_indices` for its row
-    /// list whether or not spec-decode is active, so this flag has no
-    /// effect on slice dispatch today. Retained for callers that pass
-    /// it; may be wired to additional gates in the future.
-    pub has_spec_tokens: bool,
-    /// `[num_sample_rows]` u32 — per-sample-row source index into the
-    /// `[num_tokens, hidden]` lm_head input. Mirrors Python vLLM's
-    /// `logits_indices = query_start_loc[1:] - 1` and the CUDA path's
-    /// `ForwardCtx.last_token_indices`. When `Some`, the lm_head slice
-    /// trio gathers these rows, runs the GEMM at `M = len`, scatters
-    /// back. `None` falls back to the full `M = bucket_m` lm_head
-    /// GEMM (used by chunked-prefill intermediate chunks that produce
-    /// no sampled tokens).
-    pub last_token_indices: Option<&'a [u32]>,
+    /// `[num_sample_rows]` u32 — the rows the forward samples, ascending: each sequence's last,
+    /// every row of a sequence verifying drafts. Python vLLM's `logits_indices`. The forward
+    /// leaves their logits at the front of its logits buffer, row `i` sampled row `i`'s. A caller
+    /// that names none samples each sequence's last ([`Self::last_rows`]).
+    pub sampled_rows: &'a [u32],
     /// `[num_seqs * 6]` i32 — a [`GdnSeqSlots`](crate::gdn_state::GdnSeqSlots) record per
     /// batched sequence (cu_seqlens order), flattened as `GdnSeqSlots::words`. `None` for
     /// non-hybrid arches; required for any bucket that runs `Instruction::GatedDeltaNet`.
@@ -154,6 +144,27 @@ pub struct ForwardInputs<'a> {
     pub deferred: Option<&'a Deferral>,
     /// What the caller reads of this forward.
     pub reads: ForwardReads,
+}
+
+impl ForwardInputs<'_> {
+    /// How many rows the forward samples ([`Self::sampled_rows`]).
+    pub fn sampled_row_count(&self) -> crate::tape::ids::SampledRowCount {
+        crate::tape::ids::SampledRowCount(self.sampled_rows.len() as u32)
+    }
+
+    /// The rows a forward samples when its caller names none: each sequence `cu_seqlens_q` bounds'
+    /// last row, as the serving engine's steps sample them ([`SampledRows::of`]) — every row of
+    /// `num_tokens`, a step that names no sequences being one token each. Refused for a sequence
+    /// of no rows, which has none to sample.
+    pub fn last_rows(
+        cu_seqlens_q: Option<&[u32]>,
+        num_tokens: u32,
+    ) -> Result<SampledRows, EmptySequence> {
+        match cu_seqlens_q {
+            Some(cu) => SampledRows::of(cu, |_| false),
+            None => SampledRows::of(&(0..=num_tokens).collect::<Vec<u32>>(), |_| false),
+        }
+    }
 }
 
 /// What a forward's caller reads of it.
@@ -496,6 +507,14 @@ pub enum ForwardError {
     /// through: its caller grows them first (`SparseRegistry::reach`), or the forward would read
     /// un-wired memory.
     KvNotMapped { block: u32, mapped: usize },
+    /// A step samples `sampled` rows, whose logits its tape writes past its bucket's logits buffer
+    /// (sized for the rows a step samples at most, `GpuDevice::max_decode_rows`).
+    TooManySampledRows {
+        sampled: crate::tape::ids::SampledRowCount,
+        overflow: crate::tape::lowered::LogitsOverflow,
+    },
+    /// A step's sequence of no rows, which has no last row to sample.
+    EmptySequence(EmptySequence),
 }
 
 impl std::fmt::Display for ForwardError {
@@ -542,6 +561,15 @@ impl std::fmt::Display for ForwardError {
                 "MetalWorkerPool::forward: block {block} is past the {mapped} blocks the \
                  TurboQuant KV stores are mapped through (`SparseRegistry::reach` them first)"
             ),
+            Self::TooManySampledRows { sampled, overflow } => write!(
+                f,
+                "MetalWorkerPool::forward: the step samples {} rows, whose logits fill {} rows, \
+                 past the {} its bucket's logits buffer holds",
+                sampled.get(),
+                overflow.writes,
+                overflow.holds
+            ),
+            Self::EmptySequence(e) => write!(f, "MetalWorkerPool::forward: {e}"),
         }
     }
 }

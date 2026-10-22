@@ -494,7 +494,7 @@ fn create_worker(
         eos_token_ids: vec![],
         max_model_len: config.max_model_len,
         draft: speculation.worker_draft(),
-        verify_seqs: speculation.verify_seqs(),
+        verify_seqs: speculation.verify_seqs(config),
         draft_model_dtype: config.draft_model_dtype.clone(),
     };
 
@@ -746,12 +746,14 @@ impl Speculation {
     }
 
     /// The sequences a step may verify drafts for: a head drafts for as many as its budget does,
-    /// an n-gram or draft model for every sequence the engine schedules.
-    fn verify_seqs(&self) -> VerifySeqs {
+    /// an n-gram or draft model for every sequence the engine schedules, its `drafts` each.
+    fn verify_seqs(&self, config: &VllmConfig) -> VerifySeqs {
         match self {
             Self::Off => VerifySeqs::Off,
             Self::Head { head, .. } => VerifySeqs::Head(Self::budget(head)),
-            Self::Ngram | Self::DraftModel(_) => VerifySeqs::Every,
+            Self::Ngram | Self::DraftModel(_) => VerifySeqs::Every {
+                drafts: self.drafts(config),
+            },
         }
     }
 
@@ -1777,7 +1779,7 @@ fn initialize_core_tp(config: &VllmConfig, speculation: &Speculation) -> Result<
                 eos_token_ids: vec![],
                 max_model_len: config.max_model_len,
                 draft: speculation.worker_draft(),
-                verify_seqs: speculation.verify_seqs(),
+                verify_seqs: speculation.verify_seqs(config),
                 draft_model_dtype: config.draft_model_dtype.clone(),
             })
             .collect();
@@ -2343,7 +2345,7 @@ fn initialize_stack_multinode(
             eos_token_ids: vec![],
             max_model_len: config.max_model_len,
             draft: speculation.worker_draft(),
-            verify_seqs: speculation.verify_seqs(),
+            verify_seqs: speculation.verify_seqs(config),
             draft_model_dtype: config.draft_model_dtype.clone(),
         };
 
@@ -2639,7 +2641,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
         eos_token_ids: vec![],
         max_model_len: config.max_model_len,
         draft: speculation.worker_draft(),
-        verify_seqs: speculation.verify_seqs(),
+        verify_seqs: speculation.verify_seqs(config),
         draft_model_dtype: config.draft_model_dtype.clone(),
     };
 
@@ -2836,7 +2838,7 @@ fn initialize_stack_tp_pp(
                         eos_token_ids: vec![],
                         max_model_len: config.max_model_len,
                         draft: speculation.worker_draft(),
-                        verify_seqs: speculation.verify_seqs(),
+                        verify_seqs: speculation.verify_seqs(config),
                         draft_model_dtype: config.draft_model_dtype.clone(),
                     }
                 })
@@ -3209,7 +3211,7 @@ fn initialize_stack_tp(
                 eos_token_ids: vec![],
                 max_model_len: config.max_model_len,
                 draft: speculation.worker_draft(),
-                verify_seqs: speculation.verify_seqs(),
+                verify_seqs: speculation.verify_seqs(config),
                 draft_model_dtype: config.draft_model_dtype.clone(),
             })
             .collect();
@@ -3642,7 +3644,7 @@ fn initialize_stack_external(
             eos_token_ids: vec![],
             max_model_len: config.max_model_len,
             draft: speculation.worker_draft(),
-            verify_seqs: speculation.verify_seqs(),
+            verify_seqs: speculation.verify_seqs(config),
             draft_model_dtype: config.draft_model_dtype.clone(),
         };
 

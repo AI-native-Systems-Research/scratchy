@@ -17,17 +17,17 @@
 //! compile here (E0004) until its arm exists.
 
 use crate::tape::ids::ArenaSlotIdx as Slot;
-use crate::tape::ids::{QSize, SourceIx};
+use crate::tape::ids::{QSize, RowStride, SourceIx};
 use crate::tape::kernel_bindings::{CosSinTable, source};
 use crate::tape::kernel_constants::{QueryRows, norm_threads};
 use crate::tape::model_consts::MetalModelConsts;
 use crate::tape::step::{
     AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertBundle,
     ExpertMatmul, ExpertProj, GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize,
-    KDim, KvOffsets, KvOperand, KvWrite, LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion,
-    MoeRows, MoeScores, MoeStep, NDim, QmvBatchLimit, QmvEnds, RopeFormTag, RotaryTables,
-    RotatedRows, RouterInput, RowSource, RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
-    UnaryAct, UngatedAct,
+    KDim, KvOffsets, KvOperand, KvWrite, LayerId, LogitOp, MetalStep, MetalStepTape, MoeBlock,
+    MoeRegion, MoeRows, MoeScores, MoeStep, NDim, QmvBatchLimit, QmvEnds, RopeFormTag,
+    RotaryTables, RotatedRows, RouterInput, RowSource, RowsDivisor, RowsPerToken, SampleRowsStep,
+    SampledMatmul, Scale, StepRow, UnaryAct, UngatedAct,
 };
 use scratchy_ir::{KvCodec, TqBits};
 use scratchy_subtile::handoff::WeightKind;
@@ -55,9 +55,9 @@ use crate::quantized::{
 use crate::specialized_pipeline_cache::ConstantValue;
 
 use crate::tape::lowered::{
-    Binding, DispatchShape, Fence, GatedCommand, GemmDims, IntoBaked, KernelId, LoweredCommand,
-    LoweredMetalTape, LoweringError, MetalDtype, RuntimeBindingKind, WeightTensor, baked,
-    baked_commands,
+    Binding, DispatchShape, Fence, GatedCommand, GemmDims, IntoBaked, KernelId, LogitsRows,
+    LoweredCommand, LoweredMetalTape, LoweringError, MScaleAxis, MScaling, MetalDtype, RowTile,
+    RuntimeBindingKind, SetAxis, WeightTensor, baked, baked_commands,
 };
 
 /// Where one bucket's tape is baked: the bucket, its two halves' tape
@@ -152,14 +152,14 @@ pub fn lower_subtile_tape_to_metal(
     at: BakePoint<'_>,
 ) -> Result<LoweredMetalTape, LoweringError> {
     let half = |rows, barriers, sources, live| lower(p, rows, barriers, sources, live, &at);
-    let bb = half(
+    let (bb, bb_logits) = half(
         &steps.backbone,
         &steps.backbone_barriers,
         &steps.backbone_sources,
         &steps.backbone_cache_live,
     )?;
     // A cache-only forward runs none of the lm_head.
-    let lh = half(
+    let (lh, lh_logits) = half(
         &steps.lm_head,
         &steps.lm_head_barriers,
         &steps.lm_head_sources,
@@ -199,6 +199,9 @@ pub fn lower_subtile_tape_to_metal(
         attn_unfused_scratch_bytes: bb
             .attn_unfused_scratch_bytes
             .max(lh.attn_unfused_scratch_bytes),
+        // A tape without the sampled rows (a one-row bucket, an encoder) writes the logits — or
+        // its terminal rows — at every row.
+        logits_rows: writes_logits(bb_logits, lh_logits).unwrap_or(LogitsRows::Bucket),
     })
 }
 
@@ -245,13 +248,18 @@ fn writes_cache(c: &GatedCommand) -> bool {
 }
 
 /// A sample-rows step at this bake point, from its matmul's plain lowering `plain` (with its
-/// small-M twin). The sampler reads one logits row per sequence, so on a prefill bucket the
-/// lm_head's full-M GEMM is mostly waste (~31× at 1024 tokens: ~325 ms of Llama-3.2-3B's TTFT on
-/// M4). The rows slice when [`slices`] holds: the gather, the matmul's qmv at the sampled rows and
-/// the scatter run on a step with rows to drop and no speculative tokens (`OnlyIfNoSpec`); a
-/// speculative verify reads every row, so there the plain matmul runs over them (`OnlyIfSpec`).
-/// The two gates never both hold, so the all-rows matmul reads the gathered buffer as the norm
-/// left it. Otherwise the matmul runs plain and the rest emits nothing. Every other step's
+/// small-M twin), and what it writes of the logits ([`LogitsRows`]; `None`: none of them). The
+/// sampler reads the logits of the rows a step samples (`SampleIndices`: each sequence's last,
+/// every row of a sequence verifying drafts) at the front of the buffer, in order.
+///
+/// On a prefill bucket the lm_head's full-M GEMM is mostly waste (~31× at 1024 tokens: ~325 ms of
+/// Llama-3.2-3B's TTFT on M4), so where [`slices`] holds, a step that samples fewer rows than it
+/// runs (`UnlessEveryRowSampled`) gathers them to the front of the input, runs the matvec at them
+/// (a row of logits each) and puts the input back; a step that samples every row
+/// (`OnlyIfEveryRowSampled`: a decode step, a verify step of drafting sequences alone) runs the
+/// plain matmul, whose rows are its sampled rows. The two gates never both hold, so the all-rows
+/// matmul reads the input as the norm left it. Otherwise the plain matmul runs over every row, and
+/// on a step that samples fewer the sampled rows' logits move to the front. Every other step's
 /// commands pass through.
 fn sample_rows(
     p: &MetalModelConsts,
@@ -260,91 +268,107 @@ fn sample_rows(
     bucket_m: u32,
     w: RowSources<'_>,
     profile: Option<&crate::targets::MetalTargetProfile>,
-) -> Result<Vec<GatedCommand>, LoweringError> {
-    use crate::tape::lowered::RuntimeGate::{OnlyIfNoSpec, OnlyIfSpec};
+) -> Result<(Vec<GatedCommand>, Option<LogitsRows>), LoweringError> {
+    use crate::tape::lowered::RuntimeGate::{OnlyIfEveryRowSampled, UnlessEveryRowSampled};
     use SampleRowsStep as R;
     let MetalStep::SampleRows(g, s) = *step else {
-        return Ok(plain);
+        return Ok((plain, None));
     };
-    let sampled = |c| vec![GatedCommand::gated(c, OnlyIfNoSpec)];
-    Ok(match (slices(&plain, bucket_m), s) {
-        (false, R::Matmul) => plain,
-        (false, R::Gather | R::Scatter | R::AllRows) => Vec::new(),
-        (true, R::Gather) => sampled(gather_last_token_command(p, g.input, g.k.get())),
-        (true, R::Matmul) => {
-            let x = Some(crate::tape::lowered::MScaleAxis::X);
+    let ((input, output), (k, n)) = (g.slots(), g.widths());
+    let sliced = |c| vec![GatedCommand::gated(c, UnlessEveryRowSampled)];
+    let sliced_matmul = match g {
+        SampledMatmul::Affine(a) if slices(&plain, bucket_m) => Some(a),
+        SampledMatmul::Affine(_) | SampledMatmul::Dense(..) => None,
+    };
+    Ok(match (sliced_matmul, s) {
+        (None, R::Matmul) => (plain, Some(LogitsRows::Bucket)),
+        (None, R::Gather | R::AllRows) => (Vec::new(), None),
+        (None, R::Scatter) => {
+            let compact = gather_sampled_rows_command(p, output, RowStride(n.get()));
+            (sliced(compact), Some(LogitsRows::Bucket))
+        }
+        (Some(_), R::Gather) => (
+            sliced(gather_sampled_rows_command(p, input, RowStride(k.get()))),
+            None,
+        ),
+        (Some(a), R::Matmul) => {
+            let x = Some(SetAxis::SampledRows(crate::tape::lowered::MScaleAxis::X));
             let ix = w.of(WeightKind::Linear, 0)?;
-            let codes = super::kernel_constants::AffineCodes::of(profile, g.bits.get());
-            sampled(affine_qmv_command(
+            let codes = super::kernel_constants::AffineCodes::of(profile, a.bits.get());
+            let qmv = affine_qmv_command(
                 p,
-                &g,
+                &a,
                 1,
                 x,
-                g.layer,
+                a.layer,
                 ix,
                 codes,
                 /*wide_ok=*/ false,
                 Vec::new(),
-            ))
+            );
+            let one = LogitsRows::Sampled { tile: RowTile::Row };
+            (sliced(qmv), Some(one))
         }
-        // The logits onto the sampled rows, and the gathered activation put back.
-        (true, R::Scatter) => [(g.output, g.n.get()), (g.input, g.k.get())]
-            .map(|(slot, width)| scatter_first_to_last_row_command(p, slot, width))
-            .into_iter()
-            .flat_map(sampled)
-            .collect(),
-        (true, R::AllRows) => plain
-            .into_iter()
-            .map(|c| GatedCommand::gated(c.command, OnlyIfSpec))
-            .collect(),
+        (Some(_), R::Scatter) => {
+            let back = put_sampled_rows_back_command(p, input, RowStride(k.get()));
+            (sliced(back), None)
+        }
+        (Some(_), R::AllRows) => {
+            let rows = rows_written(&plain, output);
+            let all = (plain.into_iter())
+                .map(|c| GatedCommand::gated(c.command, OnlyIfEveryRowSampled))
+                .collect();
+            (all, Some(rows))
+        }
     })
 }
 
-/// The logit soft cap at a multi-row bake point, from its plain lowering `plain` (every row): a step
-/// that samples — no speculative tokens — caps only the rows it samples, one a sequence, as the
-/// sampler reads no other (and a sliced lm_head computed no other); a speculative verify reads
-/// every row, so there `plain` runs.
-fn sampled_soft_cap(
-    p: &MetalModelConsts,
-    step: &MetalStep,
-    plain: Vec<GatedCommand>,
-    bucket_m: u32,
-) -> Vec<GatedCommand> {
-    use crate::tape::lowered::RuntimeGate::{OnlyIfNoSpec, OnlyIfSpec};
-    use crate::tape::lowered::{MScaleAxis, MScaling};
-    let (MetalStep::TanhSoftCap(.., width), [all]) = (step, plain.as_slice()) else {
-        return plain;
+/// What `commands` write of `slot` — the logits of a step that samples every row it runs, its
+/// grid scaled by them: each command's kernel tile ([`RowTile::of`]) where its grid tiles the
+/// bucket's rows in it (`⌈bucket_m / tile⌉` threadgroups on the scaled axis), the largest of them
+/// ([`LogitsRows::Sampled`]); the bucket's rows ([`LogitsRows::Bucket`]) when a command writing it
+/// has no tile in the table, scales no row axis, sets one, or tiles otherwise.
+fn rows_written(commands: &[GatedCommand], slot: Slot) -> LogitsRows {
+    let binds = |c: &&GatedCommand| {
+        (c.command.bindings.iter())
+            .any(|b| matches!(*b, Binding::ArenaSlot { slot: s, .. } if s == slot.get()))
     };
-    if bucket_m == 1 {
-        return plain;
+    let tiles = commands.iter().filter(binds).map(|c| {
+        let tile = RowTile::of(c.command.kernel)?;
+        let Some(MScaling {
+            axis,
+            bucket_m,
+            set_axis: None,
+        }) = c.command.dispatch.m_scaling
+        else {
+            return None;
+        };
+        let (x, y, z) = c.command.dispatch.threadgroups;
+        let groups = match axis {
+            MScaleAxis::X => x,
+            MScaleAxis::Y => y,
+            MScaleAxis::Z => z,
+        };
+        (groups == bucket_m.get().div_ceil(tile.get())).then_some(tile)
+    });
+    match tiles.collect::<Option<Vec<RowTile>>>() {
+        Some(tiles) => LogitsRows::Sampled {
+            tile: tiles.into_iter().max().unwrap_or(RowTile::Row),
+        },
+        None => LogitsRows::Bucket,
     }
-    let width = width.get();
-    let mut sampled = all.command;
-    sampled.function = pick_specialized_symbol(
-        "tanh_soft_cap_sampled_f16",
-        "tanh_soft_cap_sampled_bf16",
-        p.metal_dtype,
-    );
-    let constants = all.command.constants.iter().copied();
-    sampled.constants = baked(constants.chain([ConstantValue::uint(6, width)]).collect());
-    let rows = Binding::Runtime {
-        kind: RuntimeBindingKind::CuSeqlensQ,
-        binding_index: 2,
-    };
-    sampled.bindings = baked(all.command.bindings.iter().copied().chain([rows]).collect());
-    sampled.dispatch = DispatchShape {
-        threadgroups: (width.div_ceil(THREADS_PER_GROUP), bucket_m, 1),
-        threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
-        m_scaling: Some(MScaling {
-            axis: MScaleAxis::Y,
-            bucket_m: super::ids::BucketM(bucket_m),
-            seq_axis: Some(MScaleAxis::Y),
-        }),
-    };
-    vec![
-        GatedCommand::gated(all.command, OnlyIfSpec),
-        GatedCommand::gated(sampled, OnlyIfNoSpec),
-    ]
+}
+
+/// A step's [`LogitsRows`] beside the tape's so far: the bucket's rows if either writes them,
+/// else the larger tile.
+fn writes_logits(tape: Option<LogitsRows>, step: Option<LogitsRows>) -> Option<LogitsRows> {
+    match (tape, step) {
+        (Some(LogitsRows::Bucket), _) | (_, Some(LogitsRows::Bucket)) => Some(LogitsRows::Bucket),
+        (Some(LogitsRows::Sampled { tile: a }), Some(LogitsRows::Sampled { tile: b })) => {
+            Some(LogitsRows::Sampled { tile: a.max(b) })
+        }
+        (rows, None) | (None, rows) => rows,
+    }
 }
 
 /// Whether the sampled rows slice at this bake point: a multi-row bucket whose matmul lowers to
@@ -364,14 +388,14 @@ fn slices(plain: &[GatedCommand], bucket_m: u32) -> bool {
 /// The kernel is MLX's `dispatch_qmv` pick for the shape (quad for K∈{64,128}, fast when N%8 = 0 ∧
 /// K%512 = 0, else generic; without the wide band — a pre-M5 target — the m≥2 buckets take the
 /// fast kernel's fold twin, `_t8`); the grid `(rows, ⌈N/bn⌉, 1)` scales along X with the live
-/// token count, or — `seq_axis` — is SET to the live sequence count: the lm_head slice's qmv
-/// reads just the gathered sampled rows, one threadgroup row per sequence, instead of sweeping
-/// the `⌈bucket_m/32⌉` qmm_t tiles.
+/// token count, or — `set_axis` — is SET to the live sampled rows: the lm_head slice's qmv reads
+/// just the gathered sampled rows, one threadgroup row each, instead of sweeping the
+/// `⌈bucket_m/32⌉` qmm_t tiles.
 fn affine_qmv_command(
     p: &MetalModelConsts,
     g: &AffineMatmul,
     rows: u32,
-    seq_axis: Option<crate::tape::lowered::MScaleAxis>,
+    set_axis: Option<SetAxis>,
     layer: LayerId,
     ix: SourceIx,
     codes: super::kernel_constants::AffineCodes,
@@ -448,14 +472,14 @@ fn affine_qmv_command(
     // The wide kernel's grid is exact for the bucket (nv covers rows)
     // and over-dispatch is safe — the kernel clamps every row index
     // against the baked M — so it takes no m_scaling. The others take
-    // the X-axis runtime m_scaling; `seq_axis` SETs the live sequence
-    // count for the lm_head slice (a rows=1 path, never Wide).
+    // the X-axis runtime m_scaling; `set_axis` SETs the live sampled
+    // rows for the lm_head slice (a rows=1 path, never Wide).
     let m_scaling = match kernel {
         QmvKernel::Wide { .. } => None,
         _ => Some(crate::tape::lowered::MScaling {
             axis: crate::tape::lowered::MScaleAxis::X,
             bucket_m: super::ids::BucketM(rows),
-            seq_axis,
+            set_axis,
         }),
     };
     LoweredCommand {
@@ -497,59 +521,57 @@ fn qmv_end_weights(
     Ok(v)
 }
 
-/// The sampled rows' gather and scatter kernels, each with its f16 and bf16 symbols.
+/// The sampled rows' gather and put-back kernels, each with its f16 and bf16 symbols.
 const GATHER: (KernelId, [&str; 2]) = (
-    KernelId::GatherLastToken,
+    KernelId::GatherSampledRows,
     [
-        "gather_last_token_f16_specialized",
-        "gather_last_token_bf16_specialized",
+        "gather_sampled_rows_f16_specialized",
+        "gather_sampled_rows_bf16_specialized",
     ],
 );
-const SCATTER: (KernelId, [&str; 2]) = (
-    KernelId::ScatterFirstToLastRow,
+const PUT_BACK: (KernelId, [&str; 2]) = (
+    KernelId::PutSampledRowsBack,
     [
-        "scatter_first_to_last_row_f16_specialized",
-        "scatter_first_to_last_row_bf16_specialized",
+        "put_sampled_rows_back_f16_specialized",
+        "put_sampled_rows_back_bf16_specialized",
     ],
 );
 
-/// The lm_head slice's input: each sequence's last row of `slot` swapped into row `i`, in place.
-pub(crate) fn gather_last_token_command(
+/// The step's sampled rows of `slot` to its front, in order, in place: row `i` swapped with
+/// sampled row `i` — the lm_head slice's input, or every row's logits compacted.
+pub(crate) fn gather_sampled_rows_command(
     p: &MetalModelConsts,
     slot: Slot,
-    hidden_size: u32,
+    row_stride: RowStride,
 ) -> LoweredCommand {
-    sample_slice_command(p, slot, hidden_size, GATHER)
+    sample_slice_command(p, slot, row_stride, GATHER)
 }
 
-/// The gather undone over `slot`, in place: row `i` swapped back to sequence `i`'s last row.
-pub(crate) fn scatter_first_to_last_row_command(
+/// The gather undone over `slot`, in place: row `i` swapped back to sampled row `i`.
+pub(crate) fn put_sampled_rows_back_command(
     p: &MetalModelConsts,
     slot: Slot,
-    vocab_size: u32,
+    row_stride: RowStride,
 ) -> LoweredCommand {
-    sample_slice_command(p, slot, vocab_size, SCATTER)
+    sample_slice_command(p, slot, row_stride, PUT_BACK)
 }
 
 fn sample_slice_command(
     p: &MetalModelConsts,
     slot: Slot,
-    row_stride: u32,
+    row_stride: RowStride,
     (kernel, [f16_symbol, bf16_symbol]): (KernelId, [&'static str; 2]),
 ) -> LoweredCommand {
-    // One thread per column, walking the sequences in order: the rows
+    // One thread per column, walking the sampled rows in order: the rows
     // move in place, so one thread per row would race (see the shader).
     const THREADS_PER_TG: u32 = 256;
     LoweredCommand {
         kernel,
-        library: "gather_last_token",
+        library: "sample_rows",
         function: pick_specialized_symbol(f16_symbol, bf16_symbol, p.metal_dtype),
-        constants: super::kernel_constants::GatherLastTokenConstants {
-            row_stride: super::ids::HiddenSize(row_stride),
-        }
-        .into_baked(),
+        constants: super::kernel_constants::SampleRowsConstants { row_stride }.into_baked(),
         dispatch: DispatchShape {
-            threadgroups: (row_stride.div_ceil(THREADS_PER_TG), 1, 1),
+            threadgroups: (row_stride.get().div_ceil(THREADS_PER_TG), 1, 1),
             threads_per_threadgroup: (THREADS_PER_TG, 1, 1),
             m_scaling: None,
         },
@@ -559,11 +581,11 @@ fn sample_slice_command(
                 binding_index: 0,
             },
             Binding::Runtime {
-                kind: RuntimeBindingKind::CuSeqlensQ,
+                kind: RuntimeBindingKind::SampleIndices,
                 binding_index: 1,
             },
             Binding::Runtime {
-                kind: RuntimeBindingKind::NumSeqsU32,
+                kind: RuntimeBindingKind::NumSampleRowsU32,
                 binding_index: 2,
             },
         ]),
@@ -730,7 +752,7 @@ fn tq_rotate_command(
             threadgroups: (bucket_m, p.num_q_heads, 1),
             threads_per_threadgroup: (32, 1, 1),
             m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                seq_axis: None,
+                set_axis: None,
                 axis: crate::tape::lowered::MScaleAxis::X,
                 bucket_m: super::ids::BucketM(bucket_m),
             }),
@@ -995,7 +1017,8 @@ fn route_small_m(
 ) -> Result<Vec<GatedCommand>, LoweringError> {
     use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
     // A sample-rows step lowered its matmul, twin included.
-    let (MetalStep::AffineQmm(g) | MetalStep::SampleRows(g, _)) = *step else {
+    let (MetalStep::AffineQmm(g) | MetalStep::SampleRows(SampledMatmul::Affine(g), _)) = *step
+    else {
         return Ok(cmds);
     };
     let AffineMatmul {
@@ -1050,7 +1073,7 @@ fn route_small_m(
             threadgroups: (n / SMALL_M_TILE_COLS, bucket_m.div_ceil(tile.rows()), 1),
             threads_per_threadgroup: (32 * crate::quantized::SMALL_M_SIMDGROUPS, 1, 1),
             m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                seq_axis: None,
+                set_axis: None,
                 axis: crate::tape::lowered::MScaleAxis::Y,
                 bucket_m: super::ids::BucketM(bucket_m),
             }),
@@ -1192,7 +1215,7 @@ fn route_gdn(
             m_scaling: Some(MScaling {
                 axis: MScaleAxis::Z,
                 bucket_m: BucketM(1),
-                seq_axis: Some(MScaleAxis::Z),
+                set_axis: Some(crate::tape::lowered::SetAxis::Seqs(MScaleAxis::Z)),
             }),
         },
         bindings: baked(
@@ -1500,6 +1523,8 @@ fn advance_shape(rows: &[StepRow], times: u32, m_divisor: &mut u32) {
 /// `at.num_arena_slots` is the colored slot count; the lowered tape
 /// carries it through verbatim — the worker uses it to size its
 /// per-shape-class arena. `sources` is each row's weight site.
+///
+/// Beside the tape, what its sampled rows' steps write of the logits (`None`: it has none).
 fn lower(
     p: &MetalModelConsts,
     rows: &[StepRow],
@@ -1507,7 +1532,7 @@ fn lower(
     sources: &[Vec<RowSource>],
     live_rows: &[bool],
     at: &BakePoint<'_>,
-) -> Result<LoweredMetalTape, LoweringError> {
+) -> Result<(LoweredMetalTape, Option<LogitsRows>), LoweringError> {
     let BakePoint {
         chunked,
         bucket_m,
@@ -1532,6 +1557,10 @@ fn lower(
     let mut decode_partials_row_bytes: u32 = 0;
     let mut roped_k_scratch_bytes: u32 = 0;
     let mut attn_unfused_scratch_bytes: u32 = 0;
+    // What the sampled rows' steps write of the logits, and the slot they sit in; `None` until
+    // one does.
+    let mut logits_rows: Option<LogitsRows> = None;
+    let mut logits_slot: Option<Slot> = None;
     // The merger's row reduction: `m_divisor` tracks the row-count divisor
     // in force (1 normally, `vision_merge_factor` after the merger
     // reshape). Updated by `update_shape_state` after each step is
@@ -1635,8 +1664,25 @@ fn lower(
                 let cmds = route_gdn(p, step, cmds, bucket_m);
                 let cmds =
                     decode_attention_per_kv_head(p, step, cmds, at, &mut decode_partials_row_bytes);
-                let cmds = sample_rows(p, step, cmds, bucket_m, w, profile)?;
-                let cmds = sampled_soft_cap(p, step, cmds, bucket_m);
+                let (cmds, rows) = sample_rows(p, step, cmds, bucket_m, w, profile)?;
+                logits_rows = writes_logits(logits_rows, rows);
+                // Past the sampled rows, a command over their logits other than the logit tail's
+                // (a fold the tail joined) runs over the step's every row: the buffer holds them.
+                match step {
+                    MetalStep::SampleRows(g, _) => logits_slot = Some(g.slots().1),
+                    MetalStep::SampledLogits(..) => {}
+                    _ => {
+                        let binds = |c: &GatedCommand| {
+                            (c.command.bindings.iter()).any(|b| {
+                                matches!(*b, Binding::ArenaSlot { slot, .. }
+                                    if Some(Slot(slot)) == logits_slot)
+                            })
+                        };
+                        if cmds.iter().any(binds) {
+                            logits_rows = writes_logits(logits_rows, Some(LogitsRows::Bucket));
+                        }
+                    }
+                }
                 let cmds = row_gate(cmds, *gate, i)?;
                 let mut cmds = route_by_sequence_count(i, cmds)?;
                 update_shape_state(step, &mut m_divisor);
@@ -1707,7 +1753,7 @@ fn lower(
     loops.sort_by_key(|l| (l.start, std::cmp::Reverse(l.period)));
     debug_assert_eq!(commands.len(), barrier_before.len());
     debug_assert_eq!(commands.len(), cache_live.len());
-    Ok(LoweredMetalTape {
+    let tape = LoweredMetalTape {
         bucket_m,
         num_arena_slots,
         cache_live: baked(cache_live),
@@ -1719,7 +1765,9 @@ fn lower(
         decode_partials_row_bytes,
         roped_k_scratch_bytes,
         attn_unfused_scratch_bytes,
-    })
+        logits_rows: logits_rows.unwrap_or(LogitsRows::Bucket),
+    };
+    Ok((tape, logits_rows))
 }
 
 /// Abstract-interpret the row count across the step stream so the
@@ -1781,7 +1829,7 @@ fn rope_on_read_params(
 /// The sdpa-paged prefill attention: one threadgroup per (q head, query
 /// token). Each query token finds its sequence in `cu_seqlens_q` and reads K
 /// through that sequence's own block-table row, so it is right for any number
-/// of sequences; it leaves grid Z alone (see `MScaling::seq_axis`).
+/// of sequences; it leaves grid Z alone (see `MScaling::set_axis`).
 fn sdpa_paged_command(
     p: &MetalModelConsts,
     constants: super::kernel_constants::AttentionPrefillPagedConstants,
@@ -1793,7 +1841,7 @@ fn sdpa_paged_command(
         threadgroups: (p.num_q_heads, bucket_m, 1),
         threads_per_threadgroup: (1024, 1, 1),
         m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-            seq_axis: None,
+            set_axis: None,
             axis: crate::tape::lowered::MScaleAxis::Y,
             bucket_m: super::ids::BucketM(bucket_m),
         }),
@@ -1819,7 +1867,9 @@ fn steel_paged_dispatch(
         threadgroups: (bucket_m.div_ceil(bq), p.num_q_heads, 1),
         threads_per_threadgroup: (threads, 1, 1),
         m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-            seq_axis: Some(crate::interpreter::metal::lowered::MScaleAxis::Z),
+            set_axis: Some(crate::tape::lowered::SetAxis::Seqs(
+                crate::interpreter::metal::lowered::MScaleAxis::Z,
+            )),
             axis: crate::tape::lowered::MScaleAxis::X,
             bucket_m: super::ids::BucketM(bucket_m),
         }),
@@ -2030,7 +2080,7 @@ fn lower_one(
                     threadgroups: (bucket_m, 1, 1),
                     threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -2063,7 +2113,7 @@ fn lower_one(
             dispatch: {
                 let mut d = DispatchShape::dispatch_1d(bucket_m, THREADS_PER_GROUP);
                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                    seq_axis: None,
+                    set_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(bucket_m),
                 });
@@ -2137,7 +2187,7 @@ fn lower_one(
                 threadgroups: (bucket_m * *m_multiplier, 1, 1),
                 threads_per_threadgroup: (norm_threads(QSize(*hidden_size)), 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                    seq_axis: None,
+                    set_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(bucket_m),
                 }),
@@ -2189,7 +2239,7 @@ fn lower_one(
                 threadgroups: (bucket_m * *m_multiplier, 1, 1),
                 threads_per_threadgroup: (norm_threads(QSize(*hidden_size)), 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                    seq_axis: None,
+                    set_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(bucket_m),
                 }),
@@ -2245,7 +2295,7 @@ fn lower_one(
                 threadgroups: (bucket_m * *m_multiplier, 1, 1),
                 threads_per_threadgroup: (norm_threads(QSize(*hidden_size)), 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                    seq_axis: None,
+                    set_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(bucket_m),
                 }),
@@ -2280,7 +2330,7 @@ fn lower_one(
                 let mut d =
                     DispatchShape::dispatch_1d(eff_m * (p.hidden_size as u32), THREADS_PER_GROUP);
                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                    seq_axis: None,
+                    set_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(bucket_m),
                 });
@@ -2332,7 +2382,7 @@ fn lower_one(
                     threadgroups: (bucket_m, 1, 1),
                     threads_per_threadgroup: (norm_threads(QSize(*hidden_size)), 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -2385,7 +2435,7 @@ fn lower_one(
                 threadgroups: (bucket_m, 1, 1),
                 threads_per_threadgroup: (norm_threads(QSize(p.hidden_size as u32)), 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                    seq_axis: None,
+                    set_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(bucket_m),
                 }),
@@ -2433,7 +2483,7 @@ fn lower_one(
                     threadgroups: (bucket_m, 1, 1),
                     threads_per_threadgroup: (norm_threads(QSize(*hidden)), 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -2476,7 +2526,7 @@ fn lower_one(
                     threadgroups: (bucket_m, 1, 1),
                     threads_per_threadgroup: (norm_threads(QSize(*hidden_size)), 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -2517,7 +2567,11 @@ fn lower_one(
         }
 
         // ── Generic dense GEMM ─────────────────────────────────────
-        I::Gemm(Slot(in_slot), Slot(out_slot), LayerId(layer), NDim(n), KDim(k)) => {
+        I::Gemm(Slot(in_slot), Slot(out_slot), LayerId(layer), NDim(n), KDim(k))
+        | I::SampleRows(
+            SampledMatmul::Dense(Slot(in_slot), Slot(out_slot), LayerId(layer), NDim(n), KDim(k)),
+            _,
+        ) => {
             // The worker reads `gemm_dims` and dispatches the kernel
             // `pipeline_for_gemm` picks for them (M/N/K baked into
             // function constants), so this tile-shape hint is a
@@ -2543,7 +2597,7 @@ fn lower_one(
                     threadgroups: (tg_x, tg_y, 1),
                     threads_per_threadgroup: (GEMM_TILE_M, GEMM_TILE_N, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -2596,7 +2650,7 @@ fn lower_one(
         // setBytes — required for dispatch recording.
         //
         // Every sample-rows step lowers its matmul over every row; `sample_rows` realizes it.
-        I::AffineQmm(g) | I::SampleRows(g, _) => {
+        I::AffineQmm(g) | I::SampleRows(SampledMatmul::Affine(g), _) => {
             let AffineMatmul {
                 input: Slot(in_slot),
                 output: Slot(out_slot),
@@ -2743,7 +2797,7 @@ fn lower_one(
                     };
                     let rows = || {
                         Some(crate::interpreter::metal::lowered::MScaling {
-                            seq_axis: None,
+                            set_axis: None,
                             axis: crate::tape::lowered::MScaleAxis::Y,
                             bucket_m: super::ids::BucketM(bucket_m),
                         })
@@ -2840,7 +2894,7 @@ fn lower_one(
                                 threads_per_threadgroup: tpg,
                                 // qmm_t NAX grid = (n_tiles, m_tiles=ceil(M/64), B)
                                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                                    seq_axis: None,
+                                    set_axis: None,
                                     axis: crate::tape::lowered::MScaleAxis::Y,
                                     bucket_m: super::ids::BucketM(bucket_m),
                                 }),
@@ -2880,7 +2934,7 @@ fn lower_one(
                                 threads_per_threadgroup: tpg,
                                 // qmm_t Standard grid = (n_tiles, m_tiles=ceil(M/32), B)
                                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                                    seq_axis: None,
+                                    set_axis: None,
                                     axis: crate::tape::lowered::MScaleAxis::Y,
                                     bucket_m: super::ids::BucketM(bucket_m),
                                 }),
@@ -2947,7 +3001,7 @@ fn lower_one(
                                 threads_per_threadgroup: tpg,
                                 // qmm_t SplitK grid = (n_tiles, m_tiles=ceil(M/32), split_k)
                                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                                    seq_axis: None,
+                                    set_axis: None,
                                     axis: crate::tape::lowered::MScaleAxis::Y,
                                     bucket_m: super::ids::BucketM(bucket_m),
                                 }),
@@ -2981,7 +3035,7 @@ fn lower_one(
                                 // in M; proportional scaling shrinks it for
                                 // actual num_tokens.
                                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                                    seq_axis: None,
+                                    set_axis: None,
                                     axis: crate::tape::lowered::MScaleAxis::X,
                                     bucket_m: super::ids::BucketM(bucket_m),
                                 });
@@ -3042,7 +3096,7 @@ fn lower_one(
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     });
@@ -3086,7 +3140,7 @@ fn lower_one(
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     });
@@ -3127,7 +3181,7 @@ fn lower_one(
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     });
@@ -3173,7 +3227,7 @@ fn lower_one(
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     });
@@ -3220,7 +3274,7 @@ fn lower_one(
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     });
@@ -3323,7 +3377,7 @@ fn lower_one(
                     threadgroups: (groups_x, bucket_m, 1),
                     threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::Y,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -3553,7 +3607,7 @@ fn lower_one(
                     threadgroups: (bucket_m, n_q_heads, 1),
                     threads_per_threadgroup: (hd, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -3611,7 +3665,7 @@ fn lower_one(
                     threadgroups: (bucket_m, n_kv, 1),
                     threads_per_threadgroup: (hd, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -3698,7 +3752,7 @@ fn lower_one(
                     threadgroups: (bucket_m, n_q_heads, 1),
                     threads_per_threadgroup: (hd, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -3799,7 +3853,7 @@ fn lower_one(
                     // (decode bucket). Scaling is a no-op but kept
                     // for uniformity in case decode shares a bucket.
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -4573,7 +4627,7 @@ fn lower_one(
                             threadgroups: (num_kv_heads, bucket_m, 1),
                             threads_per_threadgroup: (32 * gqa, 1, 1),
                             m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                                seq_axis: None,
+                                set_axis: None,
                                 axis: crate::tape::lowered::MScaleAxis::Y,
                                 bucket_m: super::ids::BucketM(bucket_m),
                             }),
@@ -4701,7 +4755,7 @@ fn lower_one(
                     threadgroups: (bucket_m, n_q_heads / served.get(), 1),
                     threads_per_threadgroup: (1024, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -4738,7 +4792,7 @@ fn lower_one(
             dispatch: {
                 let mut d = DispatchShape::dispatch_1d(eff_m * width.get(), THREADS_PER_GROUP);
                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                    seq_axis: None,
+                    set_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(bucket_m),
                 });
@@ -4809,15 +4863,69 @@ fn lower_one(
             gemm_dims: None,
         },
 
+        // ── The logit tail over the sampled rows (Gemma's soft cap, Granite's scale) ──
+        //
+        // The sampled rows' logits sit at the buffer's front: one row of the
+        // grid a row, Y SET to the live sampled rows, so the tail writes them
+        // alone — the rows the logits buffer holds.
+        I::SampledLogits(Slot(in_slot), Slot(out_slot), op, width) => {
+            let width = width.get();
+            let (kernel, symbols, constants, [input, output]) = match op {
+                LogitOp::SoftCap => {
+                    debug_assert!(
+                        p.final_logit_softcapping > 0.0,
+                        "a sampled soft cap lowered with FINAL_LOGIT_SOFTCAPPING <= 0"
+                    );
+                    (
+                        KernelId::TanhSoftCap,
+                        ["tanh_soft_cap_sampled_f16", "tanh_soft_cap_sampled_bf16"],
+                        ConstantValue::float(1, p.final_logit_softcapping),
+                        [0, 1],
+                    )
+                }
+                LogitOp::Scale(Scale(scale)) => (
+                    KernelId::ScalarMul,
+                    ["scalar_mul_sampled_f16", "scalar_mul_sampled_bf16"],
+                    ConstantValue::float(2, *scale),
+                    [1, 0],
+                ),
+            };
+            let [f16, bf16] = symbols;
+            LoweredCommand {
+                kernel,
+                library: "elementwise",
+                function: pick_specialized_symbol(f16, bf16, p.metal_dtype),
+                constants: baked(vec![constants, ConstantValue::uint(6, width)]),
+                dispatch: DispatchShape {
+                    threadgroups: (width.div_ceil(THREADS_PER_GROUP), bucket_m, 1),
+                    threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                    m_scaling: Some(MScaling {
+                        axis: MScaleAxis::Y,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                        set_axis: Some(SetAxis::SampledRows(MScaleAxis::Y)),
+                    }),
+                },
+                bindings: baked(vec![
+                    Binding::ArenaSlot {
+                        slot: *in_slot,
+                        binding_index: input,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: output,
+                    },
+                ]),
+                gemm_dims: None,
+            }
+        }
+
         // ── Final logit softcapping (Gemma2/Gemma4) ────────────────
         //
         // `out = cap * tanh(x / cap)` with cap =
         // `p.final_logit_softcapping` baked as constant 1.
         // Runs on the logits (`width` = vocab); token-parallel
-        // exact-thread dispatch like `Add`.
-        // Always full-M: under a sampled lm_head it caps the scattered
-        // sample rows (the rest are stale, never read) or the all-rows
-        // matmul's every row.
+        // exact-thread dispatch like `Add` — a one-row bucket's, whose
+        // row is the one it samples.
         I::TanhSoftCap(Slot(in_slot), Slot(out_slot), width) => {
             debug_assert!(
                 p.final_logit_softcapping > 0.0,
@@ -4892,7 +5000,7 @@ fn lower_one(
                     // rescale stays relative to the whole bucket.
                     let mut d = DispatchShape::dispatch_1d(eff_m * *n, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     });
@@ -5095,7 +5203,7 @@ fn lower_one(
                             m_scaling: Some(MScaling {
                                 axis: MScaleAxis::Z,
                                 bucket_m: BucketM(1),
-                                seq_axis: Some(MScaleAxis::Z),
+                                set_axis: Some(crate::tape::lowered::SetAxis::Seqs(MScaleAxis::Z)),
                             }),
                         },
                         bindings: baked(bindings),
@@ -5253,7 +5361,7 @@ fn lower_one(
                     threadgroups: (eff_m, 1, 1),
                     threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -5302,7 +5410,7 @@ fn lower_one(
                     threadgroups: (eff_m, 1, 1),
                     threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -5349,7 +5457,7 @@ fn lower_one(
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     });
@@ -5388,7 +5496,7 @@ fn lower_one(
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     });
@@ -5441,7 +5549,7 @@ fn lower_one(
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     });
@@ -5490,7 +5598,7 @@ fn lower_one(
             let dispatch = || {
                 let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                    seq_axis: None,
+                    set_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(bucket_m),
                 });
@@ -5566,7 +5674,7 @@ fn lower_one(
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(eff_m * nh, 64);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     });
@@ -5634,7 +5742,7 @@ fn lower_one(
                     // 1 thread per (query token, head); 64 threads/tg.
                     let mut d = DispatchShape::dispatch_1d(eff_m * nh, 64);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     });
@@ -5693,7 +5801,7 @@ fn lower_one(
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     });
@@ -5753,7 +5861,7 @@ fn lower_one(
                     threadgroups: (hidden.div_ceil(THREADS_PER_GROUP), bucket_m, 1),
                     threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
+                        set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::Y,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -6071,7 +6179,7 @@ fn fused_gate_up_mul_cmd(
                 None
             } else {
                 Some(crate::interpreter::metal::lowered::MScaling {
-                    seq_axis: None,
+                    set_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::Y,
                     bucket_m: super::ids::BucketM(bucket_m),
                 })
@@ -6455,7 +6563,7 @@ impl ColumnSlice {
 /// A recurrent mixer's causal depthwise conv1d (+SiLU), varlen + stateful (`gdn_conv1d_varlen`),
 /// into the f32 scratch `conv_out`: over GDN's qkv rows, or over the `xBC` column slice of
 /// Mamba-2's in-projection rows with its conv bias (`sliced`). One thread a (sequence, channel,
-/// `GDN_CONV_BLOCK`-token block) — grid (num_seqs[set via seq_axis=X], ceil(conv_dim/tg_y),
+/// `GDN_CONV_BLOCK`-token block) — grid (num_seqs[set via set_axis=X], ceil(conv_dim/tg_y),
 /// ceil(bucket_m/GDN_CONV_BLOCK) [scaled by num_tokens]; blocks past a sequence's end early out).
 fn recurrent_conv(
     p: &MetalModelConsts,
@@ -6523,12 +6631,12 @@ fn recurrent_conv(
             ),
             threads_per_threadgroup: (1, tg_y, 1),
             // Z scales with the step's tokens (one layer per GDN_CONV_BLOCK of them, always at
-            // least any one sequence's blocks — blocks past a sequence's end early out); seq_axis
+            // least any one sequence's blocks — blocks past a sequence's end early out); set_axis
             // SETS X = num_seqs.
             m_scaling: Some(MScaling {
                 axis: MScaleAxis::Z,
                 bucket_m: BucketM(bucket_m),
-                seq_axis: Some(MScaleAxis::X),
+                set_axis: Some(crate::tape::lowered::SetAxis::Seqs(MScaleAxis::X)),
             }),
         },
         bindings: baked(bindings),
@@ -6624,7 +6732,7 @@ fn recurrent_scan(
     let seqs = Some(MScaling {
         axis: MScaleAxis::Z,
         bucket_m: BucketM(1),
-        seq_axis: Some(MScaleAxis::Z),
+        set_axis: Some(crate::tape::lowered::SetAxis::Seqs(MScaleAxis::Z)),
     });
     // `inputs` at 2 and 3, the ssm state at 4..=7, then `tail`, then (selective) `D` at `skip`,
     // then — a model that drafts — the draft lanes' records at `skip + 1`.
@@ -6690,7 +6798,7 @@ fn recurrent_scan(
             d.m_scaling = Some(MScaling {
                 axis: MScaleAxis::X,
                 bucket_m: BucketM(bucket_m),
-                seq_axis: None,
+                set_axis: None,
             });
             d
         },
@@ -6797,7 +6905,7 @@ fn recurrent_norm(
             m_scaling: Some(MScaling {
                 axis: MScaleAxis::X,
                 bucket_m: BucketM(bucket_m),
-                seq_axis: None,
+                set_axis: None,
             }),
         },
         bindings: baked(vec![
@@ -7334,9 +7442,8 @@ fn lower_moe_step(
     let layer = |l: &LayerId| LayerId(l.0 + at.layer_offset);
     let ms = |axis| {
         let bucket_m = super::ids::BucketM(bucket_m);
-        let seq_axis = None;
         Some(MScaling {
-            seq_axis,
+            set_axis: None,
             axis,
             bucket_m,
         })
@@ -10411,7 +10518,12 @@ mod tests {
     /// with its `flags` entry.
     fn sampled_rows(flags: [Fence; 4]) -> MetalStepTape {
         use SampleRowsStep::{AllRows, Gather, Matmul, Scatter};
-        let row = |s| StepRow::Step(MetalStep::SampleRows(q_proj(), s), None);
+        let row = |s| {
+            StepRow::Step(
+                MetalStep::SampleRows(SampledMatmul::Affine(q_proj()), s),
+                None,
+            )
+        };
         MetalStepTape {
             lm_head: [Gather, Matmul, Scatter, AllRows].map(row).to_vec(),
             lm_head_barriers: flags.to_vec(),
@@ -10426,65 +10538,100 @@ mod tests {
         lower_subtile_tape_to_metal(&rows, &tp(), at).expect("lowers")
     }
 
-    /// Where the matmul lowers to one qmm_t command (bucket 512: Standard), the rows slice: the
-    /// gather, the matmul's qmv at the sampled rows and the scatter — of the logits, then of the
-    /// gathered activation back — run on a step with rows to drop and no speculative tokens; the
-    /// plain matmul over every row on a speculative step. Each row's flag rides its first
-    /// command.
+    /// Where the matmul lowers to one qmm_t command (bucket 512: Standard), the rows slice: on a
+    /// step that samples fewer rows than it runs, the gather, the matmul's qmv at the sampled rows
+    /// — their logits at the front of the output, in order — and the gathered activation put
+    /// back; the plain matmul over every row on a step that samples each. Each row's flag rides
+    /// its first command. The logits buffer then holds the sampled rows, in whole tiles of the
+    /// plain matmul's rows.
     #[test]
     fn sampled_rows_slice_where_the_matmul_is_one_qmm_t() {
+        use crate::tape::ids::DecodeRows;
         use crate::tape::lowered::Fence as F;
-        use crate::tape::lowered::MScaleAxis;
-        use crate::tape::lowered::RuntimeGate::{OnlyIfNoSpec, OnlyIfSpec};
+        use crate::tape::lowered::RowTile;
+        use crate::tape::lowered::RuntimeGate::{OnlyIfEveryRowSampled, UnlessEveryRowSampled};
         let rows = sampled_rows([F::Coherent, F::None, F::Coherent, F::None]);
         let at = bake_point(512, None);
         let tape = lower_subtile_tape_to_metal(&rows, &tp(), at).expect("lowers");
         assert_eq!(
             gated_steps(&tape),
             [
-                (KernelId::GatherLastToken, Some(OnlyIfNoSpec)),
-                (KernelId::AffineQmvFast, Some(OnlyIfNoSpec)),
-                (KernelId::ScatterFirstToLastRow, Some(OnlyIfNoSpec)),
-                (KernelId::ScatterFirstToLastRow, Some(OnlyIfNoSpec)),
-                (KernelId::AffineQmmT, Some(OnlyIfSpec)),
+                (KernelId::GatherSampledRows, Some(UnlessEveryRowSampled)),
+                (KernelId::AffineQmvFast, Some(UnlessEveryRowSampled)),
+                (KernelId::PutSampledRowsBack, Some(UnlessEveryRowSampled)),
+                (KernelId::AffineQmmT, Some(OnlyIfEveryRowSampled)),
             ]
         );
         assert_eq!(
             tape.barrier_before,
-            [F::Coherent, F::None, F::Coherent, F::Coherent, F::None]
+            [F::Coherent, F::None, F::Coherent, F::None]
         );
         // The all-rows command IS the plain matmul's.
         let plain = plain_q_proj(at);
-        assert!(plain.commands.len() == 1 && tape.commands[4].command == plain.commands[0].command);
-        // The gather over the matmul's input, `k` wide; the scatter over its output, `n` wide, and
-        // back over its input; one thread per column, walking the sequences in order (the rows
-        // swap in place).
-        let [gather, qmv, scatter, restore] = [0, 1, 2, 3].map(|i| tape.commands[i].command);
-        for (c, slot, width) in [(gather, 7, 2048), (scatter, 11, 2048), (restore, 7, 2048)] {
-            assert!(
-                matches!(c.bindings[0], Binding::ArenaSlot { slot: s, binding_index: 0 } if s == slot)
+        assert!(plain.commands.len() == 1 && tape.commands[3].command == plain.commands[0].command);
+        // The gather over the matmul's input, `k` wide, and back over it; one thread per column,
+        // walking the sampled rows in order (the rows swap in place). The logits stay at the
+        // front: nothing moves them back.
+        let [gather, qmv, restore] = [0, 1, 2].map(|i| tape.commands[i].command);
+        for c in [gather, restore] {
+            assert!(matches!(
+                c.bindings[0],
+                Binding::ArenaSlot {
+                    slot: 7,
+                    binding_index: 0
+                }
+            ));
+            assert_eq!(
+                c.bindings[1..],
+                [
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::SampleIndices,
+                        binding_index: 1
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::NumSampleRowsU32,
+                        binding_index: 2
+                    },
+                ]
             );
-            assert_eq!(c.dispatch.threadgroups, (width / 256, 1, 1));
+            assert_eq!(c.dispatch.threadgroups, (2048 / 256, 1, 1));
             assert_eq!(c.dispatch.m_scaling, None);
         }
-        // The qmv: one row baked, the live sequence count at dispatch; the matmul's weight and
+        // The qmv: one row baked, the live sampled rows at dispatch; the matmul's weight and
         // slots.
         assert_eq!(qmv.function, "affine_qmv_fast_bf16_s_f16_gs_64_b_4_batch_0");
         assert_eq!(qmv.dispatch.threadgroups, (1, 2048 / 4, 1));
-        let ms = qmv.dispatch.m_scaling.expect("scales with the sequences");
-        assert_eq!(ms.seq_axis, Some(MScaleAxis::X));
+        let ms = qmv
+            .dispatch
+            .m_scaling
+            .expect("scales with the sampled rows");
+        assert_eq!(ms.set_axis, Some(SetAxis::SampledRows(MScaleAxis::X)));
         let bindings = affine_qmm_bindings(7, 11, LayerId(3), src(WeightKind::Linear, 0));
         assert_eq!(qmv.bindings, bindings);
         assert_eq!(tape.splitk_scratch_bytes, 0);
+        // qmm_t's tile is 32 rows: a step of 33 sampled rows writes 64 of them.
+        assert_eq!(
+            tape.logits_rows,
+            LogitsRows::Sampled {
+                tile: RowTile::Rows32
+            }
+        );
+        assert_eq!(tape.logits_slot_rows(Some(DecodeRows(33))), 64);
+        assert_eq!(tape.logits_slot_rows(Some(DecodeRows(4096))), 512);
+        assert_eq!(tape.logits_slot_rows(None), 512);
     }
 
-    /// Where the matmul does not lower to one qmm_t command it runs plain and ungated, and the
-    /// gather, the scatter and the all-rows matmul emit nothing: one row (bucket 1), qmv (bucket
-    /// 8, under its batch limit), SplitK's pair (bucket 64), the small-M twin (bucket 64 on a NAX
-    /// device). It runs under its own row's flag and the fence its elided gather carried.
+    /// Where the matmul does not lower to one qmm_t command it runs plain and ungated over every
+    /// row, the gather and the all-rows matmul emit nothing, and the scatter moves the sampled
+    /// rows' logits to the front on a step that samples fewer rows than it runs: one row (bucket
+    /// 1), qmv (bucket 8, under its batch limit), SplitK's pair (bucket 64), the small-M twin
+    /// (bucket 64 on a NAX device). The matmul runs under its own row's flag and the fence its
+    /// elided gather carried, the compaction under its row's. The logits buffer holds the bucket's
+    /// rows.
     #[test]
     fn sampled_rows_run_plain_where_the_matmul_does_not_slice() {
         use crate::tape::lowered::Fence as F;
+        use crate::tape::lowered::RuntimeGate::UnlessEveryRowSampled;
         use KernelId as K;
         let m5 = Some(&crate::targets::M5_10CORE);
         let cases = [
@@ -10501,8 +10648,28 @@ mod tests {
             let at = bake_point(bucket_m, profile);
             let tape = lower_subtile_tape_to_metal(&rows, &tp(), at).expect("lowers");
             let plain = plain_q_proj(at);
-            assert!(tape.commands == plain.commands, "bucket {bucket_m}: plain");
-            assert_eq!(tape.commands.last().map(|c| c.command.kernel), Some(last));
+            let n = plain.commands.len();
+            let commands: Vec<GatedCommand> = tape.commands.iter().copied().collect();
+            let (matmul, compact) = commands.split_at(n);
+            let plain_commands: Vec<GatedCommand> = plain.commands.iter().copied().collect();
+            assert!(matmul == plain_commands, "bucket {bucket_m}: plain");
+            assert_eq!(matmul.last().map(|c| c.command.kernel), Some(last));
+            // The compaction: the gather over the matmul's output, `n` wide.
+            let [compact] = compact else {
+                panic!("bucket {bucket_m}: one compaction after the matmul");
+            };
+            assert_eq!(compact.gate, Some(UnlessEveryRowSampled));
+            assert_eq!(compact.command.kernel, K::GatherSampledRows);
+            assert!(matches!(
+                compact.command.bindings[0],
+                Binding::ArenaSlot {
+                    slot: 11,
+                    binding_index: 0
+                }
+            ));
+            assert_eq!(compact.command.dispatch.threadgroups, (2048 / 256, 1, 1));
+            assert_eq!(tape.barrier_before[n], F::Coherent);
+            assert_eq!(tape.logits_rows, LogitsRows::Bucket);
             // A first command that writes the shared scratch (split-K's partial, a W4A8
             // pre-pass) waits out its last reader whatever its row's flag.
             let writes_scratch = tape.commands.first().is_some_and(|c| {
@@ -10511,7 +10678,7 @@ mod tests {
                     .iter()
                     .any(|b| matches!(b, Binding::Scratch { .. }))
             });
-            let flags: Vec<F> = (0..tape.commands.len())
+            let flags: Vec<F> = (0..n)
                 .map(|c| {
                     if c == 0 && writes_scratch {
                         // A scratch write fences Ordered on its own; the
@@ -10527,7 +10694,8 @@ mod tests {
                 })
                 .collect();
             assert_eq!(
-                tape.barrier_before, flags,
+                tape.barrier_before[..n],
+                flags,
                 "bucket {bucket_m}, {gather_fences:?}"
             );
             assert_eq!(tape.splitk_scratch_bytes, plain.splitk_scratch_bytes);
@@ -10544,7 +10712,7 @@ mod tests {
     #[test]
     fn w4a8_serves_prefill_gemms_on_m5() {
         use crate::tape::kernel_constants::AffineCodes;
-        use crate::tape::lowered::RuntimeGate::{OnlyIfNoSpec, OnlyIfSpec};
+        use crate::tape::lowered::RuntimeGate::{OnlyIfEveryRowSampled, UnlessEveryRowSampled};
         let gemm = |gs, bits| AffineMatmul {
             input: Slot(0),
             output: Slot(1),
@@ -10633,9 +10801,13 @@ mod tests {
             assert!(codes(&tape).iter().all(|&c| c == want), "{g:?}");
         }
 
-        // The lm_head's sampled rows replace the pair on a non-spec step and keep it for spec.
+        // The lm_head's sampled rows replace the pair on a step that samples fewer rows than it
+        // runs, and keep it for one that samples each.
         use SampleRowsStep::{AllRows, Gather, Matmul, Scatter};
-        let row = |s| StepRow::Step(MetalStep::SampleRows(gemm(64, 4), s), None);
+        let row = |s| {
+            let g = SampledMatmul::Affine(gemm(64, 4));
+            StepRow::Step(MetalStep::SampleRows(g, s), None)
+        };
         let sampled = MetalStepTape {
             lm_head: [Gather, Matmul, Scatter, AllRows].map(row).to_vec(),
             lm_head_barriers: vec![Fence::Coherent; 4],
@@ -10643,10 +10815,10 @@ mod tests {
             ..MetalStepTape::default()
         };
         let steps = gated_steps(&lower_at(sampled, m5));
-        assert!(steps.contains(&(KernelId::GatherLastToken, Some(OnlyIfNoSpec))));
+        assert!(steps.contains(&(KernelId::GatherSampledRows, Some(UnlessEveryRowSampled))));
         assert!(steps.ends_with(&[
-            (KernelId::AffineW4a8Quant, Some(OnlyIfSpec)),
-            (KernelId::AffineQmmW4a8, Some(OnlyIfSpec)),
+            (KernelId::AffineW4a8Quant, Some(OnlyIfEveryRowSampled)),
+            (KernelId::AffineQmmW4a8, Some(OnlyIfEveryRowSampled)),
         ]));
     }
 
@@ -10716,46 +10888,65 @@ mod tests {
         );
     }
 
-    /// The logit soft cap of a multi-row bucket caps every row on a speculative verify and only
-    /// the sampled rows — one a sequence, read through `cu_seqlens_q` — on any other step: the
-    /// same in-place command, its grid one row of threadgroups a live sequence.
+    /// The logit tail over the sampled rows — the soft cap, the scale — is one ungated in-place
+    /// command over the logits at the buffer's front: its grid one row of threadgroups a live
+    /// sampled row, its constants the plain op's and the row width. A soft cap outside the tail
+    /// caps its every row.
     #[test]
-    fn soft_cap_caps_the_sampled_rows_off_speculative_steps() {
-        use crate::tape::lowered::RuntimeGate::{OnlyIfNoSpec, OnlyIfSpec};
-        use crate::tape::lowered::{ActivationWidth, MScaleAxis};
+    fn the_logit_tail_runs_over_the_sampled_rows() {
+        use crate::tape::lowered::ActivationWidth;
         let mut p = tp();
         p.final_logit_softcapping = 30.0;
-        let cap = MetalStep::TanhSoftCap(Slot(2), Slot(2), ActivationWidth::of_cols(1000));
-        let at = |bucket_m| {
-            let tape = row_tape(plain(&[cap.clone()]));
-            lower_subtile_tape_to_metal(&tape, &p, bake_point(bucket_m, None)).expect("lowers")
+        let width = ActivationWidth::of_cols(1000);
+        let at = |step: &MetalStep| {
+            let tape = row_tape(plain(std::slice::from_ref(step)));
+            lower_subtile_tape_to_metal(&tape, &p, bake_point(512, None)).expect("lowers")
         };
-        let one = at(1);
-        assert_eq!(gated_steps(&one), [(KernelId::TanhSoftCap, None)]);
-        let tape = at(512);
+        let every = at(&MetalStep::TanhSoftCap(Slot(2), Slot(2), width));
+        assert_eq!(gated_steps(&every), [(KernelId::TanhSoftCap, None)]);
         assert_eq!(
-            gated_steps(&tape),
-            [
-                (KernelId::TanhSoftCap, Some(OnlyIfSpec)),
-                (KernelId::TanhSoftCap, Some(OnlyIfNoSpec)),
-            ]
+            every.commands[0].command.function,
+            "tanh_soft_cap_bf16_specialized"
         );
-        let (every, sampled) = (&tape.commands[0].command, &tape.commands[1].command);
-        assert_eq!(every.function, "tanh_soft_cap_bf16_specialized");
-        assert_eq!(sampled.function, "tanh_soft_cap_sampled_bf16");
-        assert_eq!(&sampled.bindings[..2], every.bindings);
-        assert_eq!(
-            sampled.bindings[2],
-            Binding::Runtime {
-                kind: RuntimeBindingKind::CuSeqlensQ,
-                binding_index: 2
-            }
-        );
-        assert_eq!(&sampled.constants[..1], every.constants);
-        assert_eq!(sampled.constants[1], ConstantValue::uint(6, 1000));
-        assert_eq!(sampled.dispatch.threadgroups, (4, 512, 1));
-        let scaling = sampled.dispatch.m_scaling.expect("seq-scaled");
-        assert_eq!(scaling.seq_axis, Some(MScaleAxis::Y));
+        let scale = LogitOp::Scale(Scale(0.25));
+        for (op, kernel, function, constant, [input, output]) in [
+            (
+                LogitOp::SoftCap,
+                KernelId::TanhSoftCap,
+                "tanh_soft_cap_sampled_bf16",
+                ConstantValue::float(1, 30.0),
+                [0, 1],
+            ),
+            (
+                scale,
+                KernelId::ScalarMul,
+                "scalar_mul_sampled_bf16",
+                ConstantValue::float(2, 0.25),
+                [1, 0],
+            ),
+        ] {
+            let tape = at(&MetalStep::SampledLogits(Slot(2), Slot(2), op, width));
+            assert_eq!(gated_steps(&tape), [(kernel, None)]);
+            let c = tape.commands[0].command;
+            assert_eq!(c.function, function);
+            assert_eq!(c.constants, [constant, ConstantValue::uint(6, 1000)]);
+            assert_eq!(
+                c.bindings,
+                [
+                    Binding::ArenaSlot {
+                        slot: 2,
+                        binding_index: input
+                    },
+                    Binding::ArenaSlot {
+                        slot: 2,
+                        binding_index: output
+                    },
+                ]
+            );
+            assert_eq!(c.dispatch.threadgroups, (4, 512, 1));
+            let scaling = c.dispatch.m_scaling.expect("row-scaled");
+            assert_eq!(scaling.set_axis, Some(SetAxis::SampledRows(MScaleAxis::Y)));
+        }
     }
 
     /// A multi-token tape runs its own attention off decode steps, in the
@@ -11420,7 +11611,7 @@ mod tests {
         assert_eq!(d.threads_per_threadgroup, (256, 1, 1));
         let scaling = d.m_scaling.expect("row m_scaling");
         assert!(matches!(scaling.axis, crate::tape::lowered::MScaleAxis::Y));
-        assert!(scaling.seq_axis.is_none());
+        assert!(scaling.set_axis.is_none());
     }
 
     /// At `bucket_m < vector_limit` we should land in the qmv branch

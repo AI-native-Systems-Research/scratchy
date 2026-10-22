@@ -16,7 +16,7 @@ use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
 use scratchy_subtile::handoff::{LoweredDecode, SlotMap, WeightKind, WeightSlot};
 use scratchy_subtile::kv_codec::{KvCodecError, expand_kv_codec};
-use scratchy_subtile::sample_rows::{SampleRowsError, expand_sample_rows};
+use scratchy_subtile::sample_rows::{ResultRows, SampleRowsError, expand_sample_rows};
 use scratchy_subtile::subtile_ir::ExpertBody;
 use scratchy_subtile::tape_colouring::{Colour, ColourCount, ColourError, colour_tape};
 use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, fold_tape};
@@ -193,6 +193,9 @@ pub struct CanonicalAt<'a> {
     pub m: u64,
     /// The buckets it stands for, `m` among them: each runs its tape, codec guards realized at `m`.
     pub buckets: &'a [u64],
+    /// The rows of its result the forward's caller reads: a decoder's sampled logits, an
+    /// encoder's every row.
+    pub rows: ResultRows,
 }
 
 /// Where the backbone's layer loop was cut.
@@ -260,7 +263,8 @@ fn decode_barriers(t: &Assembled, flags: &[Fence], m: u64) -> usize {
     let decode = StepFacts {
         num_tokens: rows,
         num_seqs: rows,
-        has_spec_tokens: false,
+        // A decode step samples its every row.
+        sampled_rows: scratchy_target_metal::tape::ids::SampledRowCount(rows),
         unrotated_blocks: false,
         gdn_plain: true,
         // A decode step's sequences are one row each.
@@ -282,7 +286,12 @@ pub fn lower_canonical(
     sources: &mut SourceManifest,
 ) -> Result<MetalCanonical, CanonicalRefusal> {
     use CanonicalRefusal::Steps;
-    let CanonicalAt { stem, m, buckets } = at;
+    let CanonicalAt {
+        stem,
+        m,
+        buckets,
+        rows,
+    } = at;
     let guards = |m: u64| metal_guard_gates(m as u32);
     if let Some(&bucket) = buckets.iter().find(|&&b| guards(b) != guards(m)) {
         return Err(CanonicalRefusal::Guards { bucket });
@@ -297,7 +306,8 @@ pub fn lower_canonical(
         l
     };
     // Metal's lm_head slice: the sampled rows its declared facts insert.
-    let l = &expand_sample_rows(l, &METAL_SAMPLE_ROWS).map_err(CanonicalRefusal::SampleRows)?;
+    let l =
+        &expand_sample_rows(l, &METAL_SAMPLE_ROWS, rows).map_err(CanonicalRefusal::SampleRows)?;
     // Whether the gate/up projections fold is this model's fact: a dense preset has the fused
     // projection kernel, and an affine one the fused one-row matvec, for its one-row bucket.
     let fold_projections = facts.mlp == MlpForm::Packed || m == 1;

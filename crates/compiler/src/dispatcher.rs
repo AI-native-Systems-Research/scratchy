@@ -320,34 +320,6 @@ pub trait ScratchyWeights: Send + Sync {
         )
     }
 
-    /// Per-worker arena peak in bytes (metal only).
-    ///
-    /// `MetalWorkerPool::for_buckets` derives the per-worker arena
-    /// layout as the elementwise-max across [`METAL_BUCKETS`]'
-    /// `arena_bytes` rows; the peak resident bytes per worker is
-    /// the sum of that elementwise-max. The metal worker reads
-    /// this to size `peak_activation_bytes` in
-    /// `determine_available_memory`, replacing the 512 MiB
-    /// placeholder from Step 3.B.
-    ///
-    /// Default returns 512 MiB so cuda-backed arches that never
-    /// override this still surface a sane placeholder if the
-    /// trait method is reached on a non-metal build path.
-    #[cfg(feature = "metal")]
-    fn metal_arena_peak_bytes(&self) -> u64 {
-        512 * 1024 * 1024
-    }
-
-    /// `(bucket_m, total_arena_bytes)` for every compiled prefill bucket,
-    /// ascending by `bucket_m`. The macro overrides this per-arch from the
-    /// canonical's `METAL_BUCKET_ARENA_COSTS`; the load-time selector uses
-    /// it to prune the global ladder to what the device can afford. Default
-    /// empty → the selector falls back to keeping all compiled buckets.
-    #[cfg(feature = "metal")]
-    fn metal_bucket_arena_costs(&self) -> &'static [(u32, u64)] {
-        &[]
-    }
-
     /// The kernels this model runs on its logits outside its tape (argmax,
     /// grammar mask, sampler), baked at expansion with its logits width and
     /// dtype: a `scratchy_target_metal::off_tape::OffTapeKernels`, typed `Any`
@@ -482,10 +454,11 @@ impl std::error::Error for GpuExecutionFailed {}
 /// forward) so they run inside the same command buffer with one
 /// commit and one host wait. Receives:
 ///   - the MTL4 compute encoder to append dispatches onto;
-///   - the logits MTLBuffer (the bucket's terminal arena slot);
-///   - the final (post-norm) hidden states, `[total_n, hidden]` (the
+///   - the logits MTLBuffer (the bucket's terminal arena slot): the logits of the rows the
+///     step samples, at its front, in order;
+///   - the final (post-norm) hidden states, `[num_tokens, hidden]` (the
 ///     bucket's backbone slot);
-///   - `total_n` (logits row count) and `vocab` (column count).
+///   - `total_n` (the sampled rows: the logits row count) and `vocab` (column count).
 ///
 /// MTL4 only.
 #[cfg(feature = "metal")]
@@ -520,11 +493,26 @@ pub trait MetalForwardOnto {
     /// The final (post-norm) hidden states, `[num_tokens, hidden]` (the bucket's backbone slot).
     fn hidden(&self) -> &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>;
 
-    /// The lm_head output, `[num_tokens, vocab]` rows (the bucket's terminal arena slot).
+    /// The lm_head output (the bucket's terminal arena slot): the logits of the rows the forward
+    /// sampled, at its front, `vocab` wide.
     fn logits(&self) -> &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>;
 
     /// The logits' row width.
     fn vocab(&self) -> u32;
+}
+
+/// The rows one forward samples (its sampled rows' count): one a sequence, every row of a
+/// sequence verifying drafts — the logits it leaves at the front of its output, what a metal
+/// tape's runtime gates and sampled-rows grids read.
+#[cfg(feature = "metal")]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct SampledRowCount(pub u32);
+
+#[cfg(feature = "metal")]
+impl SampledRowCount {
+    pub fn get(self) -> u32 {
+        self.0
+    }
 }
 
 /// Non-generic view of the macro-emitted MetalWorker for the
@@ -538,13 +526,14 @@ pub trait MetalForwardOnto {
 pub trait ChainStepHandle {
     /// Encode one bucket forward dispatch onto the chain encoder.
     /// `num_tokens` is real (the bucket is fixed across iters
-    /// because the K-step decode shape doesn't change).
+    /// because the K-step decode shape doesn't change); `sampled_rows`
+    /// the rows whose logits it leaves, at the front.
     fn run_forward_step(
         &self,
         encoder: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         num_tokens: u32,
         num_seqs: u32,
-        has_spec_tokens: bool,
+        sampled_rows: SampledRowCount,
     ) -> Result<(), String>;
 
     /// The bucket's terminal arena slot (lm_head output). Stable

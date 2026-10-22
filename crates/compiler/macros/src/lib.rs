@@ -2551,23 +2551,6 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
-    // Per-variant `METAL_ARENA_PEAK_BYTES` reads. Each canonical mod
-    // emits this const from the macro's per-canonical metal_emission;
-    // shim variants re-export the canonical's. The trait impl below
-    // dispatches on `Weights` variant and returns the matched module's
-    // const so `determine_available_memory` reads the right per-arch
-    // peak rather than a 512 MiB placeholder.
-    let metal_arena_peak_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(_) => #model_ident::METAL_ARENA_PEAK_BYTES,
-            }
-        })
-        .collect();
-
     // Per-variant `CanonicalParams::METAL_DTYPE` reads.
     let metal_dtype_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
@@ -2631,20 +2614,6 @@ fn emit_arch_dispatcher(
             let model_ident = &a.model_ident;
             quote! {
                 Weights::#variant_ident(_) => &#model_ident::METAL_RUNGS,
-            }
-        })
-        .collect();
-
-    // Per-variant `METAL_BUCKET_ARENA_COSTS` reads — the `(bucket_m, bytes)`
-    // table the worker feeds to `select_prefill_bucket` for target-reactive
-    // bucket pruning. Mirrors `metal_arena_peak_arms`.
-    let metal_bucket_costs_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(_) => #model_ident::METAL_BUCKET_ARENA_COSTS,
             }
         })
         .collect();
@@ -3273,20 +3242,6 @@ fn emit_arch_dispatcher(
                 // worker downcasts it back.
                 let runner = unsafe { forward_piecewise_capture(self, ctx, device, num_tokens) }?;
                 ::core::result::Result::Ok(::std::boxed::Box::new(runner))
-            }
-
-            #[cfg(feature = "metal")]
-            fn metal_arena_peak_bytes(&self) -> u64 {
-                match self {
-                    #(#metal_arena_peak_arms)*
-                }
-            }
-
-            #[cfg(feature = "metal")]
-            fn metal_bucket_arena_costs(&self) -> &'static [(u32, u64)] {
-                match self {
-                    #(#metal_bucket_costs_arms)*
-                }
             }
 
             #[cfg(feature = "metal")]

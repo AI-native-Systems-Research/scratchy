@@ -65,7 +65,7 @@ impl ExecPath {
 /// Which rows of the step's terminal slot are the oracle.
 #[derive(Clone, Copy)]
 enum Rows {
-    /// Decoder: the one row the lm_head slice samples (the last token of the step).
+    /// Decoder: the one row the step samples (its last token's), at the front of the terminal slot.
     Sampled,
     /// Encoder: the terminal slot is `[n, hidden]` hidden states — every row. Compiled with the
     /// one case that runs an encoder.
@@ -93,8 +93,8 @@ const PROMPTS: &[&str] = &[
 ];
 
 /// One prompt of 65-512 tokens: with [`LONG_BUCKET_CAP`] its prefill runs in bucket 512, the
-/// smallest bucket whose baked M5 tapes carry the lm_head last-token slice
-/// (`GatherLastToken` → qmv → `ScatterFirstToLastRow`); buckets ≤ 64 run without it on M5.
+/// smallest bucket whose baked M5 tapes carry the lm_head slice (`GatherSampledRows` → qmv →
+/// `PutSampledRowsBack`); buckets ≤ 64 compact every row's logits on M5 instead.
 /// Compiled with the one case that reads it.
 #[cfg(feature = "llama-3.2-3b")]
 const LONG_PROMPTS: &[&str] = &[
@@ -431,7 +431,7 @@ struct StepInputs {
     block_tables: Vec<Vec<u32>>,
     cu_seqlens_q: Vec<u32>,
     seqused_k: Vec<u32>,
-    last_token_indices: Vec<u32>,
+    sampled_rows: Vec<u32>,
     gdn_indices: Vec<i32>,
     gdn_fresh: Vec<u32>,
 }
@@ -471,7 +471,7 @@ fn step_inputs(
         block_tables,
         cu_seqlens_q: vec![0, n as u32],
         seqused_k: vec![ctx_len as u32],
-        last_token_indices: vec![n as u32 - 1],
+        sampled_rows: vec![n as u32 - 1],
         gdn_indices: GdnSeqSlots::plain(GdnSlot::new(0)).words().to_vec(),
         gdn_fresh: vec![u32::from(fresh)],
     }
@@ -538,8 +538,7 @@ fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) 
             .as_ref()
             .map(|_| view(&s.gdn_indices, &[s.gdn_indices.len()], DType::I32)),
         gdn_is_fresh: l.gdn.as_ref().map(|_| view(&s.gdn_fresh, &[1], u32t)),
-        has_spec_tokens: false,
-        last_token_indices: Some(view(&s.last_token_indices, &[1], u32t)),
+        sampled_rows: Some(view(&s.sampled_rows, &[1], u32t)),
         device_inputs: &[],
         deferred: None,
         reads: scratchy_target_metal::ForwardReads::Outputs,
@@ -557,13 +556,13 @@ fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) 
     };
     let t = out.as_gpu_tensor();
     let shape = t.shape().to_vec();
-    assert_eq!(shape.len(), 2, "terminal slot is not [n, width]: {shape:?}");
     assert_eq!(
-        shape[0] as usize, n,
-        "terminal slot rows != step tokens: {shape:?}"
+        shape.len(),
+        2,
+        "terminal slot is not [rows, width]: {shape:?}"
     );
-    let width = shape[1] as usize;
-    let bytes = unsafe { std::slice::from_raw_parts(t.raw_ptr() as *const u8, n * width * 2) };
+    let (rows, width) = (shape[0] as usize, shape[1] as usize);
+    let bytes = unsafe { std::slice::from_raw_parts(t.raw_ptr() as *const u8, rows * width * 2) };
     (bytes.to_vec(), width)
 }
 
@@ -661,7 +660,16 @@ fn run_case(case: Case, paths: &[ExecPath]) {
                 let (bytes, width) = run_step(&mut l, path, &s);
                 let n = input.len();
                 let row_bytes = width * 2;
-                let sampled = &bytes[(n - 1) * row_bytes..n * row_bytes];
+                // A decoder leaves the one row its step samples (the last token's); an encoder,
+                // every row.
+                let rows = bytes.len() / row_bytes;
+                let want_rows = match case.rows {
+                    Rows::Sampled => 1,
+                    #[cfg(feature = "modernbert-base")]
+                    Rows::All => n,
+                };
+                assert_eq!(rows, want_rows, "terminal rows of a {n}-token step");
+                let sampled = &bytes[(rows - 1) * row_bytes..];
                 let hashed = match case.rows {
                     Rows::Sampled => sampled,
                     #[cfg(feature = "modernbert-base")]

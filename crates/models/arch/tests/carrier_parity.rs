@@ -548,7 +548,6 @@ mod imp {
                     .as_ref()
                     .map(|_| host_view(&gdn_idx, &[gdn_idx.len()], DType::I32)),
                 gdn_is_fresh: gdn_pool.as_ref().map(|_| host_view(&fresh, &[1], u32t)),
-                has_spec_tokens: false,
                 mm_embeds: None,
                 embed_patches: &[],
                 vision_rope_cos: None,
@@ -565,7 +564,7 @@ mod imp {
                 vision_window_index: None,
                 vision_reverse_indices: None,
                 vision_position_ids: None,
-                last_token_indices: Some(host_view(&lti, &[1], u32t)),
+                sampled_rows: Some(host_view(&lti, &[1], u32t)),
                 device_inputs: &[],
                 deferred: None,
                 reads: scratchy_target_metal::ForwardReads::Outputs,
@@ -576,14 +575,13 @@ mod imp {
             let dev_h = scratchy_tensors::ForwardDeviceHandle::new(&mut device);
             let out = unsafe { model.forward(ctx_h, dev_h, len as u64) };
 
-            // ── readback: logits bf16 [len, vocab]; compare the LAST row ──
+            // ── readback: logits bf16 [1, vocab], the one sampled row: the LAST token's ──
             let t = out.as_gpu_tensor();
-            assert_eq!(t.dim(0), len, "{}: logits rows", case.stem);
+            assert_eq!(t.dim(0), 1, "{}: logits rows", case.stem);
             assert_eq!(t.dim(1), vocab, "{}: logits cols", case.stem);
             let raw = t.raw_ptr() as *const u16;
-            let got_row = (len - 1) * vocab;
             let got: Vec<f32> = (0..vocab)
-                .map(|i| bf16::from_bits(unsafe { *raw.add(got_row + i) }).to_f32())
+                .map(|i| bf16::from_bits(unsafe { *raw.add(i) }).to_f32())
                 .collect();
             let gold_row = &golden[(end - 1) * vocab..end * vocab];
 

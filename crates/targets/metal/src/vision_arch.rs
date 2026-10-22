@@ -363,10 +363,9 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             vision_window_index: window_index_view,
             vision_reverse_indices: reverse_indices_view,
             vision_position_ids: position_ids_view,
-            last_token_indices: None,
             // The vision tape is text-/GDN-free, so the decoder-specific slots
             // are inert.
-            has_spec_tokens: false,
+            sampled_rows: None,
             device_inputs: &[],
             deferred: None,
             reads: crate::ForwardReads::Outputs,
