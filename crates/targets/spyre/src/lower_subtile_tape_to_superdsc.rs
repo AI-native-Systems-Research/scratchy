@@ -4386,6 +4386,24 @@ pub fn numeric_gate<F: RopeForm>(
     // reference to every kernel's internals — the wrong direction for a shared
     // `eval_node` law — so the slack IS the instrument for this class.
     const FP8_TOL: f32 = 2e-2;
+
+    /// The tolerance one compared tensor grades at. ⭐ THE INDEX LAW IS ASKED
+    /// FIRST (#813 review, item 3): the re-pointed result is an i32 stick read
+    /// RAW, never fp8-quantized, so a stick that lands in a TAINTED (fp8)
+    /// graph still grades at 0 — asking `is_fp8` first graded the stick at
+    /// FP8_TOL on granite fp8-dynamic, where one whole wrong token is a
+    /// 1-in-vocab rel that passes the fp8 bucket. Any divergence on the stick
+    /// is a wrong token, whichever graph holds it.
+    fn compare_tol(is_result_stick: bool, is_fp8: bool) -> f32 {
+        if is_result_stick {
+            0.0
+        } else if is_fp8 {
+            FP8_TOL
+        } else {
+            CLEAN_TOL
+        }
+    }
+
     let mut failures: Vec<String> = Vec::new();
     let mut worst_clean = 0f32;
     let mut worst_fp8 = 0f32;
@@ -4499,16 +4517,9 @@ pub fn numeric_gate<F: RopeForm>(
             .sum();
         let rel = dsum / gsum.max(1e-6);
         let is_fp8 = tainted.contains(&(tid as u32));
-        // The index stick's exact law above: tolerance 0 for the re-pointed
-        // result when its dtype is an integer — any divergence at all is a
-        // wrong token.
-        let tol = if is_fp8 {
-            FP8_TOL
-        } else if result_is_index && tid == ir.result.index() as u64 {
-            0.0
-        } else {
-            CLEAN_TOL
-        };
+        // The index stick's exact law above — and the index law is asked FIRST
+        // (#813 review, item 3): see [`compare_tol`].
+        let tol = compare_tol(result_is_index && tid == ir.result.index() as u64, is_fp8);
         verdicts.push(ComparedVerdict {
             tid,
             n,
