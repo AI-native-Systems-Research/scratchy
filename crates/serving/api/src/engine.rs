@@ -625,6 +625,22 @@ impl AsyncEngine {
         scratchy_core_common::sampling::PromptThinking::of(tokens, prompt, blank)
     }
 
+    /// ⭐ THE REASONING PARSER THAT READS A REQUEST'S REPLY (#819): none where its prompt closed
+    /// the model's thinking ([`PromptThinking::Closed`]: a template with thinking off ends the
+    /// prompt `<think>\n\n</think>\n\n`), so the reply is content, whole and streamed, as vLLM
+    /// reads a reply after a prompt that ends reasoning. A stream's parser never sees the prompt,
+    /// and read alone the qwen3 parser takes an output with no `</think>` for reasoning.
+    ///
+    /// [`PromptThinking::Closed`]: scratchy_core_common::sampling::PromptThinking::Closed
+    fn request_reasoning_parser(&self, prompt: &[u32]) -> Option<&Arc<dyn ReasoningParser>> {
+        let parser = self.reasoning_parser.as_ref()?;
+        let closed = (parser.think_tokens()).is_some_and(|tokens| {
+            self.prompt_thinking(tokens, prompt)
+                == scratchy_core_common::sampling::PromptThinking::Closed
+        });
+        (!closed).then_some(parser)
+    }
+
     /// Set the reasoning parser on this engine.
     pub fn set_reasoning_parser(&mut self, parser: Arc<dyn ReasoningParser>) {
         self.reasoning_parser = Some(parser);
@@ -924,7 +940,7 @@ impl AsyncEngine {
 
             // Extract reasoning content if parser is configured.
             let (reasoning_text, text_for_tools, content_was_none) =
-                if let Some(ref rp) = self.reasoning_parser {
+                if let Some(rp) = self.request_reasoning_parser(&prompt_token_ids) {
                     let extracted = rp.extract_reasoning(&text);
                     let reasoning = if request.include_reasoning {
                         extracted.reasoning
@@ -1190,9 +1206,7 @@ impl AsyncEngine {
             };
 
             // Create streaming reasoning parser state if applicable.
-            let reasoning_state = self
-                .reasoning_parser
-                .as_ref()
+            let reasoning_state = (self.request_reasoning_parser(&prompt_token_ids))
                 .map(|p| p.create_streaming_state());
 
             self.submit_request(
@@ -4599,6 +4613,40 @@ mod tests {
             "a long tail, its first text deciding it"
         );
         assert_eq!(reads("hi"), PromptThinking::Absent);
+    }
+
+    /// A reply after a prompt that closed its model's thinking is content, whole and streamed: no
+    /// reasoning parser reads it (#819). One after a prompt that opened thinking, or has none, or
+    /// keeps an earlier turn's thinking, is read by the engine's parser. A parser whose markers are
+    /// text reads every reply. Byte-level test tokenizer; `T` and `U` stand in for `<think>` and
+    /// `</think>`.
+    #[test]
+    fn a_reply_after_a_prompt_that_closed_thinking_is_content() {
+        let mut engine = make_test_engine_with_tokenizer();
+        let tokenizer = engine.tokenizer.clone().unwrap();
+        let ids = |text: &str| tokenizer.encode(text, false).unwrap();
+        let vocab = HashMap::from([
+            ("<think>".to_string(), ids("T")[0]),
+            ("</think>".to_string(), ids("U")[0]),
+        ]);
+        let reads = |engine: &AsyncEngine, prompt: &str| {
+            engine.request_reasoning_parser(&ids(prompt)).is_some()
+        };
+        assert!(!reads(&engine, "hi"), "no parser");
+
+        let qwen3 = crate::reasoning_parser::get_reasoning_parser("qwen3", &vocab).unwrap();
+        engine.set_reasoning_parser(qwen3);
+        assert!(!reads(&engine, "hi T\n\nU\n\n"), "thinking off: content");
+        assert!(reads(&engine, "hi T"), "thinking open");
+        assert!(reads(&engine, "hi"), "no thinking in the prompt");
+        assert!(
+            reads(&engine, "hi TaU and a tool call"),
+            "an earlier turn's thinking"
+        );
+
+        let harmony = crate::reasoning_parser::get_reasoning_parser("gpt_oss", &vocab).unwrap();
+        engine.set_reasoning_parser(harmony);
+        assert!(reads(&engine, "hi T\n\nU\n\n"), "text markers: always read");
     }
 
     #[test]
