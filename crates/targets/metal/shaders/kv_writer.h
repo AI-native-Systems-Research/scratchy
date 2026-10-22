@@ -9,12 +9,11 @@
 #include "turboquant_encode.h"
 #include "turboquant_offset.h"
 
-// The packed store a KV writer's folded-in encode writes, by binding: the codebook (16, 17), K's
-// codes and norms (18, 19), V's (20, 21), and each operand's offset bias (22, 23) with the rotary
-// table a rotated K bias uses (24). Every KV writer (rope.metal, kv_append.metal) binds it alike.
+// The packed store a KV writer's folded-in encode writes, by binding: K's codes and norms
+// (18, 19), V's (20, 21), and each operand's offset bias (22, 23) with the rotary table a rotated
+// K bias uses (24) — the codebook is compiled in (`tq_codebook.h`). Every KV writer (rope.metal,
+// kv_append.metal) binds it alike.
 #define KV_WRITER_TQ_BUFFERS(T)                                                  \
-    device const float* tq_signs      [[buffer(16)]],                            \
-    device const float* tq_boundaries [[buffer(17)]],                            \
     device       uint*  tq_packed_k   [[buffer(18)]],                            \
     device       float* tq_norms_k    [[buffer(19)]],                            \
     device       uint*  tq_packed_v   [[buffer(20)]],                            \
@@ -37,7 +36,7 @@ template <typename T>
 inline void kv_row_encode(float k, float v, uint d, uint dim, uint num_kv, uint kv_head,
                           uint slot_raw, uint pos, uint bits, uint vals_per_word, uint packed_dim,
                           uint k_offset, uint v_offset, uint rot_dim, uint pair_off,
-                          device const float* signs, device const float* boundaries,
+                          constant const uint* sign_words, constant const float* boundaries,
                           device uint* packed_k, device float* norms_k, device uint* packed_v,
                           device float* norms_v, device const T* k_bias, device const T* v_bias,
                           device const T* cos_sin, threadgroup float* scratch,
@@ -51,7 +50,7 @@ inline void kv_row_encode(float k, float v, uint d, uint dim, uint num_kv, uint 
     const float v_off = live ? tq_offset<T>(v_offset, v_bias + kv_head * dim, cos_sin, rot_dim,
                                             pair_off, pos, unrotated, d)
                              : 0.0f;
-    tq_encode<2>({k - k_off, v - v_off}, d, dim, bits, vals_per_word, packed_dim, 1u << bits, signs,
-                 boundaries, {packed_k + store * packed_dim, packed_v + store * packed_dim},
+    tq_encode<2>({k - k_off, v - v_off}, d, dim, bits, vals_per_word, packed_dim, 1u << bits,
+                 sign_words, boundaries, {packed_k + store * packed_dim, packed_v + store * packed_dim},
                  {norms_k + store, norms_v + store}, scratch, codes);
 }

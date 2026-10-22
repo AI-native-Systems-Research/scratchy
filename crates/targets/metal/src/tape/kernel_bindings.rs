@@ -255,8 +255,8 @@ impl From<AttentionViaCacheBindingSet> for Vec<Binding> {
 }
 
 /// `KernelId::AttentionViaCacheTq`: the bindings its `AttentionViaCache`
-/// twin's set gains — the layer's packed K/V codes + norms, the shared
-/// signs/codebook, and `slot_mapping` (slots 7..=13).
+/// twin's set gains — the layer's packed K/V codes + norms (slots 7..=10) and
+/// `slot_mapping` (13). Its codebook is compiled in.
 pub struct TqAttentionBindingSet {
     pub kv_layer: LayerId,
 }
@@ -265,17 +265,14 @@ impl From<TqAttentionBindingSet> for Vec<Binding> {
     fn from(s: TqAttentionBindingSet) -> Vec<Binding> {
         let layer = s.kv_layer;
         [
-            RuntimeBindingKind::TqPackedK { layer },
-            RuntimeBindingKind::TqPackedV { layer },
-            RuntimeBindingKind::TqNormsK { layer },
-            RuntimeBindingKind::TqNormsV { layer },
-            RuntimeBindingKind::TqSigns,
-            RuntimeBindingKind::TqCentroids,
-            RuntimeBindingKind::SlotMapping { layer },
+            (7, RuntimeBindingKind::TqPackedK { layer }),
+            (8, RuntimeBindingKind::TqPackedV { layer }),
+            (9, RuntimeBindingKind::TqNormsK { layer }),
+            (10, RuntimeBindingKind::TqNormsV { layer }),
+            (13, RuntimeBindingKind::SlotMapping { layer }),
         ]
         .into_iter()
-        .zip(7u8..)
-        .map(|(kind, binding_index)| Binding::Runtime {
+        .map(|(binding_index, kind)| Binding::Runtime {
             kind,
             binding_index,
         })
@@ -284,8 +281,9 @@ impl From<TqAttentionBindingSet> for Vec<Binding> {
 }
 
 /// `KernelId::TqStageRotated`: the layer's K (or V) scratch, the step's
-/// addressing, the layer's packed codes + norms, the codebook, and — for K
-/// under rope-on-read — the class-resolved cos_sin (slot 9).
+/// addressing, the layer's packed codes + norms, and — for K under
+/// rope-on-read — the class-resolved cos_sin (slot 9). Its codebook is
+/// compiled in.
 pub struct TqStageBindingSet {
     pub kv_layer: LayerId,
     pub is_v: bool,
@@ -317,8 +315,6 @@ impl From<TqStageBindingSet> for Vec<Binding> {
             RuntimeBindingKind::SlotMapping { layer },
             packed,
             norms,
-            RuntimeBindingKind::TqSigns,
-            RuntimeBindingKind::TqCentroids,
         ]
         .into_iter()
         .zip(0u8..)
@@ -334,23 +330,17 @@ impl From<TqStageBindingSet> for Vec<Binding> {
     }
 }
 
-/// `KernelId::TqRotateRows`: the rows (in/out, arena) and the codebook signs.
+/// `KernelId::TqRotateRows`: the rows (in/out, arena). Its codebook's signs are compiled in.
 pub struct TqRotateRowsBindingSet {
     pub rows: ArenaSlotIdx,
 }
 
 impl From<TqRotateRowsBindingSet> for Vec<Binding> {
     fn from(s: TqRotateRowsBindingSet) -> Vec<Binding> {
-        vec![
-            Binding::ArenaSlot {
-                slot: s.rows.get(),
-                binding_index: 0,
-            },
-            Binding::Runtime {
-                kind: RuntimeBindingKind::TqSigns,
-                binding_index: 1,
-            },
-        ]
+        vec![Binding::ArenaSlot {
+            slot: s.rows.get(),
+            binding_index: 0,
+        }]
     }
 }
 

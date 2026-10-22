@@ -12,8 +12,9 @@
 //!   10-14 = the folded-in TurboQuant encode (`MetalFusion::KvEncoded`), the
 //!       rope writer's slots (`RopeTqConstants`): the threadgroup that writes a
 //!       K/V row also encodes it into the packed store (`kv_writer.h`, buffers
-//!       16-21). Its operands carry no offset (an un-rotated writer's codec
-//!       restores none), so the rotary table and the biases are unread.
+//!       18-21), with its codebook compiled in (`tq_codebook.h`). Its operands
+//!       carry no offset (an un-rotated writer's codec restores none), so the
+//!       rotary table and the biases are unread.
 //!
 //! Bindings:
 //!   buffer(0) = k            [bucket_m, NUM_KV_HEADS * HEAD_DIM]
@@ -28,6 +29,7 @@
 #include <metal_stdlib>
 #include "baked.h"
 #include "kv_writer.h"
+#include "tq_codebook.h"
 using namespace metal;
 
 SCRATCHY_CONSTANT(uint, KVA_HEAD_DIM, 0);
@@ -41,6 +43,11 @@ SCRATCHY_CONSTANT_OPTIONAL(uint, KVA_TQ_K_OFFSET, 13);
 SCRATCHY_CONSTANT_OPTIONAL(uint, KVA_TQ_V_OFFSET, 14);
 constant constexpr uint KVA_TQ_FLOATS = KVA_TQ_BITS_SET ? tq_encode_floats(2, KVA_HEAD_DIM) : 1u;
 constant constexpr uint KVA_TQ_CODES = KVA_TQ_BITS_SET ? 2u * KVA_HEAD_DIM : 1u;
+// The encode's codebook (`tq_codebook.h`): the signs and the boundaries, exactly when it encodes.
+static_assert(TQ_CB_SIGN_WORD_COUNT == (KVA_TQ_BITS_SET ? KVA_HEAD_DIM / 32u : 0u) &&
+                  TQ_CB_BOUNDARY_COUNT == (KVA_TQ_BITS_SET ? (1u << KVA_TQ_BITS) - 1u : 0u) &&
+                  TQ_CB_CENTROID_COUNT == 0u,
+              "a KV writer's encode takes its codebook's signs and boundaries compiled in");
 
 template <typename T>
 [[kernel]] void kv_append(
@@ -82,8 +89,8 @@ template <typename T>
         // No rotation: the offset restore's position and rotary window are unread.
         kv_row_encode<T>(float(k[src]), float(v[src]), d, KVA_HEAD_DIM, KVA_NUM_KV_HEADS, kv_head,
                          slot_raw, 0u, KVA_TQ_BITS, KVA_TQ_VALS_PER_WORD, KVA_TQ_PACKED_DIM,
-                         KVA_TQ_K_OFFSET, KVA_TQ_V_OFFSET, 0u, 0u, tq_signs, tq_boundaries,
-                         tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias, tq_v_bias,
+                         KVA_TQ_K_OFFSET, KVA_TQ_V_OFFSET, 0u, 0u, TQ_CB_SIGN_WORDS,
+                         TQ_CB_BOUNDARIES, tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias, tq_v_bias,
                          tq_cos_sin, tq_scratch, tq_codes);
     }
 }

@@ -40,9 +40,17 @@ use scratchy_target_metal::tape::ids::{
     TqDecodeHeads,
 };
 use scratchy_target_metal::tape::kernel_constants::{
-    TqCompressConstants, TqOffset, TqStagePass, TqWriteback,
+    TqCodebookPart, TqCompressConstants, TqOffset, TqStagePass, TqWriteback,
 };
 use scratchy_target_metal::targets::is_nax_capable;
+
+/// The codebook a TurboQuant kernel compiles in: the signs over a `hd` head and, given a code
+/// width, its centroids — what the lowering's TurboQuant attention, stage and rotation carry.
+fn codebook(hd: usize, bits: Option<u32>) -> Vec<ConstantValue> {
+    let mut v = Vec::from(TqCodebookPart::Signs(HeadDim(hd as u32)));
+    v.extend(bits.into_iter().flat_map(|b| Vec::from(TqCodebookPart::Centroids(TqCodeBits(b)))));
+    v
+}
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
 type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>;
@@ -571,17 +579,9 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
     let n_q = *f.cu_seqlens.last().unwrap() as usize;
     let decode = c.seqs.iter().all(|&(_, new)| new == 1);
     let quant = PolarQuantizer::new(hd, c.bits, SEED);
-    let boundaries: Vec<f32> = quant
-        .centroids()
-        .windows(2)
-        .map(|w| (w[0] + w[1]) / 2.0)
-        .collect();
     let pdim = packed_dim(hd, c.bits);
     let n_slots = f.n_blocks * bs;
 
-    let signs = shared(&device, quant.signs());
-    let centroids = shared(&device, quant.centroids());
-    let bounds = shared(&device, &boundaries);
     let block_table = shared(&device, &f.block_table);
     let seq_used = shared(
         &device,
@@ -642,9 +642,6 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
             &[
                 (&src.table, 0),
                 (&quant_slots_buf, 1),
-                (&signs, 2),
-                (&bounds, 3),
-                (&centroids, 4),
                 (packed, 5),
                 (norms, 6),
                 (&quant_slots_buf, 16),
@@ -678,6 +675,7 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
     );
     if let (true, Some(splits)) = (decode, c.gqa) {
         let mut consts = f.attn_constants(&[bits, ConstantValue::uint(18, splits)]);
+        consts.extend(codebook(hd, Some(c.bits)));
         if c.rope.is_some_and(|r| r.coresident) {
             consts.push(ConstantValue::uint(12, 1));
         }
@@ -695,8 +693,6 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
             (&packed_v, 8),
             (&norms_k, 9),
             (&norms_v, 10),
-            (&signs, 11),
-            (&centroids, 12),
             (&slot_mapping, 13),
         ];
         if offset_on {
@@ -719,7 +715,7 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
             ),
             consts,
         );
-        let mut binds = vec![(&out, 0), (&signs, 11)];
+        let mut binds = vec![(&out, 0)];
         if offset_on {
             binds.push((&vb, 15));
         }
@@ -740,6 +736,7 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
     } else if decode {
         let heads = c.decode_heads;
         let mut consts = f.attn_constants(&[bits, ConstantValue::uint(16, heads)]);
+        consts.extend(codebook(hd, Some(c.bits)));
         if c.rope.is_some_and(|r| r.coresident) {
             consts.push(ConstantValue::uint(12, 1));
         }
@@ -761,8 +758,6 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
             (&packed_v, 8),
             (&norms_k, 9),
             (&norms_v, 10),
-            (&signs, 11),
-            (&centroids, 12),
             (&slot_mapping, 13),
         ];
         if offset_on {
@@ -801,6 +796,7 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
             if offset_on {
                 v.push(if rope { k_bias } else { v_bias });
             }
+            v.extend(codebook(hd, Some(c.bits)));
             v
         };
         let stage_name = format!("tq_stage_rotated_{}", c.dtype.tag());
@@ -823,8 +819,6 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
                         (&slot_mapping, 4),
                         (packed, 5),
                         (norms, 6),
-                        (&signs, 7),
-                        (&centroids, 8),
                         (&cos_sin, 9),
                         (bias, 10),
                     ],
@@ -837,10 +831,14 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
             }
             batch.barrier();
         }
-        let rotate_consts = vec![
-            ConstantValue::uint(0, hd as u32),
-            ConstantValue::uint(1, c.num_q_heads as u32),
-        ];
+        let rotate_consts = [
+            vec![
+                ConstantValue::uint(0, hd as u32),
+                ConstantValue::uint(1, c.num_q_heads as u32),
+            ],
+            codebook(hd, None),
+        ]
+        .concat();
         let rotate = |dir: &str| {
             pso(
                 "attention",
@@ -850,7 +848,7 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
         };
         batch.encode(
             &rotate("rotate"),
-            &[(&q, 0), (&signs, 1)],
+            &[(&q, 0)],
             &[],
             &[],
             &[],
@@ -894,7 +892,7 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
         batch.barrier();
         batch.encode(
             &rotate("unrotate"),
-            &[(&out, 0), (&signs, 1)],
+            &[(&out, 0)],
             &[],
             &[],
             &[],
@@ -1498,11 +1496,6 @@ fn gemma4_global_decode_timing() {
         baked_build(&cache, &PipelineKey::new("attention", name, consts)).expect("pipeline")
     };
     let (hd, nq, nkv, bs, bits) = (512usize, 16usize, 2usize, 16usize, 4u32);
-    let quant = PolarQuantizer::new(hd, bits, SEED);
-    let (signs, centroids) = (
-        shared(&device, quant.signs()),
-        shared(&device, quant.centroids()),
-    );
     for kv_len in [1024usize, 16384] {
         let blocks = kv_len.div_ceil(bs);
         let n_rows = blocks * bs * nkv;
@@ -1522,17 +1515,21 @@ fn gemma4_global_decode_timing() {
         let table = shared(&device, &[0u64]);
         let out = shared(&device, &vec![0u16; nq * hd]);
         let partials = shared(&device, &vec![0f32; nq * 32 * (hd + 2)]);
-        let base = vec![
-            ConstantValue::uint(0, hd as u32),
-            ConstantValue::uint(1, nq as u32),
-            ConstantValue::uint(2, nkv as u32),
-            ConstantValue::float(3, 1.0 / (hd as f32).sqrt()),
-            ConstantValue::uint(4, bs as u32),
-            ConstantValue::uint(5, blocks as u32),
-            ConstantValue::uint(6, 0),
-            ConstantValue::int(7, 0),
-            ConstantValue::uint(13, bits),
-        ];
+        let base = [
+            vec![
+                ConstantValue::uint(0, hd as u32),
+                ConstantValue::uint(1, nq as u32),
+                ConstantValue::uint(2, nkv as u32),
+                ConstantValue::float(3, 1.0 / (hd as f32).sqrt()),
+                ConstantValue::uint(4, bs as u32),
+                ConstantValue::uint(5, blocks as u32),
+                ConstantValue::uint(6, 0),
+                ConstantValue::int(7, 0),
+                ConstantValue::uint(13, bits),
+            ],
+            codebook(hd, Some(bits)),
+        ]
+        .concat();
         let binds = [
             (&out, 0),
             (&q, 1),
@@ -1545,8 +1542,6 @@ fn gemma4_global_decode_timing() {
             (&packed_v, 8),
             (&norms_k, 9),
             (&norms_v, 10),
-            (&signs, 11),
-            (&centroids, 12),
             (&slot_mapping, 13),
             (&partials, 16),
         ];
@@ -2103,17 +2098,8 @@ fn verify_rows(c: Case, kernel: VerifyKernel) {
     let f = &Fixture::new(&c);
     let (hd, nkv) = (c.head_dim, c.num_kv_heads);
     let n_q = *f.cu_seqlens.last().unwrap() as usize;
-    let quant = PolarQuantizer::new(hd, c.bits, SEED);
-    let boundaries: Vec<f32> = (quant.centroids().windows(2))
-        .map(|w| (w[0] + w[1]) / 2.0)
-        .collect();
     let n_slots = f.n_blocks * c.block_size;
     let pdim = packed_dim(hd, c.bits);
-    let (signs, centroids, bounds) = (
-        shared(&device, quant.signs()),
-        shared(&device, quant.centroids()),
-        shared(&device, &boundaries),
-    );
     let cos_sin = shared(&device, &f.cos_sin);
     let q = shared(
         &device,
@@ -2146,9 +2132,6 @@ fn verify_rows(c: Case, kernel: VerifyKernel) {
             &[
                 (&src.table, 0),
                 (&slots_buf, 1),
-                (&signs, 2),
-                (&bounds, 3),
-                (&centroids, 4),
                 (packed, 5),
                 (nrm, 6),
                 (&slots_buf, 16),
@@ -2213,6 +2196,9 @@ fn verify_rows(c: Case, kernel: VerifyKernel) {
                     ConstantValue::uint(18, splits),
                 ]),
             }
+            if coded {
+                consts.extend(codebook(hd, Some(c.bits)));
+            }
             if c.rope.is_some_and(|r| r.coresident) {
                 consts.push(ConstantValue::uint(12, 1));
             }
@@ -2243,8 +2229,6 @@ fn verify_rows(c: Case, kernel: VerifyKernel) {
                     (&packed_v, 8),
                     (&norms_k, 9),
                     (&norms_v, 10),
-                    (&signs, 11),
-                    (&centroids, 12),
                     (&slot_mapping, 13),
                 ]);
             }
@@ -2279,7 +2263,7 @@ fn verify_rows(c: Case, kernel: VerifyKernel) {
                     batch.encode(&attention, &binds, &[], &[], &resident, grid, tg(hd, 1, 1));
                     batch.barrier();
                     let combine = pso("attention_via_cache_v2_combine", consts);
-                    let binds = [(&out, 0), (&signs, 11), (&partials, 16)];
+                    let binds = [(&out, 0), (&partials, 16)];
                     let grid = tg(n_q, c.num_q_heads, 1);
                     batch.encode(&combine, &binds, &[], &[], &[], grid, tg(128, 1, 1));
                 }

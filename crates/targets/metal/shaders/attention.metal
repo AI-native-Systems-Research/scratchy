@@ -29,6 +29,7 @@
 #include <metal_stdlib>
 #include "baked.h"
 #include "kv_writer.h"
+#include "tq_codebook.h"
 using namespace metal;
 
 
@@ -438,8 +439,9 @@ inline void tq_rope_slice(thread float* x, uint qk_per_thread, uint simd_lid, ui
 // num_kv_heads, num_seqs), rows past `seq_used_k` skipped. Bindings:
 //   0 cache (the layer's K or V scratch, chunk table)  1 block_table
 //   2 seq_used_k  3 cu_seqlens_q  4 slot_mapping  5 packed codes  6 norms
-//   7 signs  8 centroids  9 cos_sin (K under ATTN_ROPE_ON_READ only)
+//   9 cos_sin (K under ATTN_ROPE_ON_READ only)
 //   10 the projection bias (ATTN_TQ_K_BIAS on K / ATTN_TQ_V_BIAS on V only)
+// The codebook's signs and centroids are compiled in (`tq_codebook.h`).
 template <typename T>
 kernel void tq_stage_rotated(
     device const uint64_t* cache        [[buffer(0)]],
@@ -449,13 +451,14 @@ kernel void tq_stage_rotated(
     device const uint*     slot_mapping [[buffer(4)]],
     device const uint*     packed       [[buffer(5)]],
     device const float*    norms        [[buffer(6)]],
-    device const float*    signs        [[buffer(7)]],
-    device const float*    centroids    [[buffer(8)]],
     device const T*        cos_sin      [[buffer(9)]],
     device const T*        bias         [[buffer(10)]],
     uint3 tg       [[threadgroup_position_in_grid]],
     uint  simd_lid [[thread_index_in_simdgroup]])
 {
+    static_assert(sizeof(T) && TQ_CB_SIGN_WORD_COUNT * 32u == ATTN_HEAD_DIM &&
+                      TQ_CB_CENTROID_COUNT == 1u << ATTN_TQ && TQ_CB_BOUNDARY_COUNT == 0u,
+                  "the stage takes its codebook's signs and centroids compiled in");
     const uint head_dim = ATTN_HEAD_DIM;
     const uint num_kv = ATTN_NUM_KV_HEADS;
     const uint block_size = ATTN_BLOCK_SIZE;
@@ -490,7 +493,7 @@ kernel void tq_stage_rotated(
     float rb[16];
     if (off_mode == 1u) {
         for (uint j = 0; j < qk_per_thread; ++j) {
-            rb[j] = float(b[e0 + j]) * signs[e0 + j];
+            rb[j] = float(b[e0 + j]) * tq_cb_sign(e0 + j);
         }
         tq_wht(rb, qk_per_thread, simd_lid);
         for (uint j = 0; j < qk_per_thread; ++j) {
@@ -516,13 +519,13 @@ kernel void tq_stage_rotated(
             const uint store_row = (physical_block * block_size + t) * num_kv + kv_head;
             const float n = norms[store_row] * s;
             for (uint j = 0; j < qk_per_thread; ++j) {
-                x[j] = centroids[tq_code(packed, store_row * pdim, e0 + j)] * n;
+                x[j] = TQ_CB_CENTROIDS[tq_code(packed, store_row * pdim, e0 + j)] * n;
             }
             if (!span) {
                 if (off_mode == 2u) {
                     for (uint j = 0; j < qk_per_thread; ++j) {
                         rb[j] = tq_offset<T>(2u, b, cos_sin, ATTN_ROT_DIM, ATTN_PAIR_OFF, i, false,
-                                             e0 + j) * signs[e0 + j];
+                                             e0 + j) * tq_cb_sign(e0 + j);
                     }
                     tq_wht(rb, qk_per_thread, simd_lid);
                     for (uint j = 0; j < qk_per_thread; ++j) {
@@ -538,7 +541,7 @@ kernel void tq_stage_rotated(
             // key, stored unrotated, gets its bias back unrotated.
             tq_wht(x, qk_per_thread, simd_lid);
             for (uint j = 0; j < qk_per_thread; ++j) {
-                x[j] *= s * signs[e0 + j];
+                x[j] *= s * tq_cb_sign(e0 + j);
                 if (off_mode != 0u) {
                     x[j] += tq_offset<T>(off_mode, b, cos_sin, ATTN_ROT_DIM, ATTN_PAIR_OFF, i,
                                          true, e0 + j);
@@ -553,7 +556,7 @@ kernel void tq_stage_rotated(
             tq_rope_slice<T>(x, qk_per_thread, simd_lid, i, cos_sin, 1.0f);
         }
         for (uint j = 0; j < qk_per_thread; ++j) {
-            x[j] *= signs[e0 + j];
+            x[j] *= tq_cb_sign(e0 + j);
         }
         tq_wht(x, qk_per_thread, simd_lid);
         for (uint j = 0; j < qk_per_thread; ++j) {
@@ -573,10 +576,12 @@ kernel void tq_stage_rotated(
 template <typename T, bool INVERSE>
 kernel void tq_rotate_rows(
     device T*           rows  [[buffer(0)]],
-    device const float* signs [[buffer(1)]],
     uint2 tg       [[threadgroup_position_in_grid]],
     uint  simd_lid [[thread_index_in_simdgroup]])
 {
+    static_assert(sizeof(T) && TQ_CB_SIGN_WORD_COUNT * 32u == ATTN_HEAD_DIM &&
+                      TQ_CB_CENTROID_COUNT == 0u && TQ_CB_BOUNDARY_COUNT == 0u,
+                  "the rotation takes its codebook's signs compiled in");
     const uint head_dim = ATTN_HEAD_DIM;
     const uint qk_per_thread = head_dim / 32u;
     const uint e0 = simd_lid * qk_per_thread;
@@ -584,11 +589,11 @@ kernel void tq_rotate_rows(
     const float s = 1.0f / sqrt(float(head_dim));
     float x[16];
     for (uint j = 0; j < qk_per_thread; ++j) {
-        x[j] = float(row[j]) * (INVERSE ? 1.0f : signs[e0 + j]);
+        x[j] = float(row[j]) * (INVERSE ? 1.0f : tq_cb_sign(e0 + j));
     }
     tq_wht(x, qk_per_thread, simd_lid);
     for (uint j = 0; j < qk_per_thread; ++j) {
-        row[j] = T(x[j] * s * (INVERSE ? signs[e0 + j] : 1.0f));
+        row[j] = T(x[j] * s * (INVERSE ? tq_cb_sign(e0 + j) : 1.0f));
     }
 }
 
@@ -609,8 +614,7 @@ inline void attn_decode_merge(thread float* o_reg, thread float* max_score,
                               thread float* sum_exp_score, uint heads, uint simd_gid,
                               uint simd_lid, threadgroup float* tg_outputs,
                               threadgroup float* tg_max, threadgroup float* tg_sum,
-                              device T* o_row, device const float* tq_signs,
-                              device const T* vb)
+                              device T* o_row, device const T* vb)
 {
     constexpr int BN = 32; // simdgroups per threadgroup
     constexpr int BD = 32; // lanes per simdgroup
@@ -686,7 +690,7 @@ inline void attn_decode_merge(thread float* o_reg, thread float* max_score,
             }
             tq_wht(o_loc, qk_per_thread, simd_lid);
             for (uint j = 0; j < qk_per_thread; ++j) {
-                const U o = o_loc[j] * tq_signs[tq_e + j] / U(head_dim);
+                const U o = o_loc[j] * tq_cb_sign(tq_e + j) / U(head_dim);
                 o_row[simd_gid * head_dim + tq_e + j] = T(ATTN_TQ_VB ? o + U(vb[tq_e + j]) : o);
             }
         }
@@ -736,9 +740,9 @@ inline void attn_decode_merge(thread float* o_reg, thread float* max_score,
 //   buffer(4)  = k_cache     chunk table → [num_blocks, num_kv_heads, BLOCK_SIZE, HEAD_DIM]
 //   buffer(5)  = v_cache     chunk table → same
 //   buffer(6)  = cos_sin     (ATTN_ROPE_ON_READ only)
-//   buffer(7..13) (ATTN_TQ only) = packed K codes, packed V codes, K norms,
-//                V norms ([slot, num_kv_heads, ...], by physical slot), signs
-//                [head_dim], centroids [2^bits], slot_mapping [batch].
+//   buffer(7..10, 13) (ATTN_TQ only) = packed K codes, packed V codes, K norms,
+//                V norms ([slot, num_kv_heads, ...], by physical slot),
+//                slot_mapping [batch]; the codebook is compiled in (`tq_codebook.h`).
 //   buffer(14/15) (ATTN_TQ_K_BIAS / ATTN_TQ_V_BIAS) = K / V projection bias
 //                [num_kv_heads * head_dim].
 //   buffer(16) (ATTN_SINKS) = the layer's sink logits [num_q_heads], the
@@ -780,8 +784,6 @@ template <typename T>
     device       uint*  tq_packed_v  [[buffer(8)]],
     device       float* tq_norms_k   [[buffer(9)]],
     device       float* tq_norms_v   [[buffer(10)]],
-    device const float* tq_signs     [[buffer(11)]],
-    device const float* tq_centroids [[buffer(12)]],
     device const uint*  slot_mapping [[buffer(13)]],
     device const T*     tq_k_bias    [[buffer(14)]],
     device const T*     tq_v_bias    [[buffer(15)]],
@@ -792,7 +794,6 @@ template <typename T>
     device const T*     fold_k        [[buffer(17)]],
     device const T*     fold_v        [[buffer(18)]],
     device const uint*  positions     [[buffer(19)]],
-    device const float* tq_boundaries [[buffer(20)]],
     device const T*     fold_cos_sin  [[buffer(21)]],
     device const T*     tq_bias_cos_sin [[buffer(22)]],
     device const uint*  cu_seqlens_q  [[buffer(23)]],
@@ -800,6 +801,11 @@ template <typename T>
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
     uint   simd_lid  [[thread_index_in_simdgroup]])
 {
+    static_assert(sizeof(T) && TQ_CB_SIGN_WORD_COUNT == (ATTN_TQ ? ATTN_HEAD_DIM / 32u : 0u) &&
+                      TQ_CB_CENTROID_COUNT == (ATTN_TQ ? 1u << ATTN_TQ : 0u) &&
+                      TQ_CB_BOUNDARY_COUNT == (ATTN_TQ && ATTN_FOLD ? (1u << ATTN_TQ) - 1u : 0u),
+                  "a TurboQuant decode takes its codebook compiled in: the signs and centroids, "
+                  "and the boundaries when it runs its writer's encode");
     constexpr int BN = 32; // simdgroups per threadgroup
     constexpr int BD = 32; // lanes per simdgroup
     typedef float U;
@@ -915,9 +921,10 @@ template <typename T>
                 kv_row_encode<T>(live ? float(fk[tid]) : 0.0f, live ? float(fv[tid]) : 0.0f, tid,
                                  head_dim, num_kv, kv_head_idx, fold_slot, pos, ATTN_TQ, vpw,
                                  (head_dim + vpw - 1u) / vpw, ATTN_TQ_KB ? 2u : 0u,
-                                 ATTN_TQ_VB ? 1u : 0u, ATTN_FOLD_ROT_DIM, pair_off, tq_signs,
-                                 tq_boundaries, tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v,
-                                 tq_k_bias, tq_v_bias, tq_bias_cos_sin, scratch, codes);
+                                 ATTN_TQ_VB ? 1u : 0u, ATTN_FOLD_ROT_DIM, pair_off,
+                                 TQ_CB_SIGN_WORDS, TQ_CB_BOUNDARIES, tq_packed_k, tq_norms_k,
+                                 tq_packed_v, tq_norms_v, tq_k_bias, tq_v_bias, tq_bias_cos_sin,
+                                 scratch, codes);
             }
         }
     }
@@ -959,7 +966,7 @@ template <typename T>
         for (uint h = 0; h < heads; ++h) {
             thread U* qt = qt_reg + h * qk_per_thread;
             for (uint j = 0; j < qk_per_thread; ++j) {
-                qt[j] = U(scale) * U(q_row[h * head_dim + tq_e + j]) * tq_signs[tq_e + j];
+                qt[j] = U(scale) * U(q_row[h * head_dim + tq_e + j]) * tq_cb_sign(tq_e + j);
             }
             tq_wht(qt, qk_per_thread, simd_lid);
             for (uint j = 0; j < qk_per_thread; ++j) {
@@ -968,7 +975,7 @@ template <typename T>
         }
         const uint tid = simd_gid * uint(BD) + simd_lid;
         if (tid < (1u << ATTN_TQ)) {
-            tq_lut[tid] = tq_centroids[tid];
+            tq_lut[tid] = TQ_CB_CENTROIDS[tid];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -1084,7 +1091,7 @@ template <typename T>
                 const U k_norm = tq_norms_k[tq_row] / U(head_dim);
                 for (uint j = 0; j < qk_per_thread; ++j) {
                     const uint e = attn_elem_off(simd_lid, j, qk_per_thread, head_dim);
-                    const U x = k_loc[j] * tq_signs[e] * k_norm;
+                    const U x = k_loc[j] * tq_cb_sign(e) * k_norm;
                     k_loc[j] = U(T(ATTN_TQ_KB ? x + U(kb[e]) : x));
                 }
                 attn_rope_on_read<T>(k_loc, qk_per_thread, simd_lid, i, cos_sin);
@@ -1218,7 +1225,7 @@ template <typename T>
             // Centered like the packed codes; the bias returns at the output.
             for (uint j = 0; j < qk_per_thread; ++j) {
                 const U v = U(fold_tail ? fold_kv[ATTN_FOLD_DIM + tq_e + j] : v_ptr[tq_e + j]);
-                v_loc[j] = (ATTN_TQ_VB ? v - U(vb[tq_e + j]) : v) * tq_signs[tq_e + j];
+                v_loc[j] = (ATTN_TQ_VB ? v - U(vb[tq_e + j]) : v) * tq_cb_sign(tq_e + j);
             }
             tq_wht(v_loc, qk_per_thread, simd_lid);
         } else {
@@ -1254,7 +1261,7 @@ template <typename T>
             if (ATTN_TQ != 0u && ATTN_TQ_VB) {
                 U v_loc[16];
                 for (uint j = 0; j < qk_per_thread; ++j) {
-                    v_loc[j] = -U(vb[tq_e + j]) * tq_signs[tq_e + j];
+                    v_loc[j] = -U(vb[tq_e + j]) * tq_cb_sign(tq_e + j);
                 }
                 tq_wht(v_loc, qk_per_thread, simd_lid);
                 for (uint j = 0; j < qk_per_thread; ++j) {
@@ -1265,7 +1272,7 @@ template <typename T>
     }
 
     attn_decode_merge<T>(o_reg, max_score, sum_exp_score, heads, simd_gid, simd_lid, tg_outputs,
-                         tg_max, tg_sum, o_row, tq_signs, vb);
+                         tg_max, tg_sum, o_row, vb);
 }
 
 SCRATCHY_KERNEL(attention_via_cache_v2_f16_specialized, attention_via_cache_v2<half>)
@@ -1284,13 +1291,14 @@ template <typename T>
 [[kernel, max_total_threads_per_threadgroup(32 * ATTN_COMBINE_GROUPS)]] void
 attention_via_cache_v2_combine(
     device       T*     output        [[buffer(0)]],
-    device const float* tq_signs      [[buffer(11)]],
     device const T*     tq_v_bias     [[buffer(15)]],
     device const float* attn_partials [[buffer(16)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
     uint   simd_lid  [[thread_index_in_simdgroup]])
 {
+    static_assert(sizeof(T) && TQ_CB_SIGN_WORD_COUNT == (ATTN_TQ ? ATTN_HEAD_DIM / 32u : 0u),
+                  "the combine takes its codebook's signs compiled in");
     typedef float U;
     const uint head_dim = ATTN_HEAD_DIM;
     const uint num_q = ATTN_NUM_Q_HEADS;
@@ -1346,7 +1354,7 @@ attention_via_cache_v2_combine(
         device const T* vb = tq_v_bias + kv_head_idx * head_dim;
         tq_wht(o_loc, qk_per_thread, simd_lid);
         for (uint j = 0; j < qk_per_thread; ++j) {
-            const U o = o_loc[j] * tq_signs[e0 + j] / U(head_dim);
+            const U o = o_loc[j] * tq_cb_sign(e0 + j) / U(head_dim);
             o_row[e0 + j] = T(ATTN_TQ_VB ? o + U(vb[e0 + j]) : o);
         }
     } else {
@@ -1395,8 +1403,6 @@ template <typename T>
     device       uint*  tq_packed_v   [[buffer(8)]],
     device       float* tq_norms_k    [[buffer(9)]],
     device       float* tq_norms_v    [[buffer(10)]],
-    device const float* tq_signs      [[buffer(11)]],
-    device const float* tq_centroids  [[buffer(12)]],
     device const uint*  slot_mapping  [[buffer(13)]],
     device const T*     tq_k_bias     [[buffer(14)]],
     device const T*     tq_v_bias     [[buffer(15)]],
@@ -1404,7 +1410,6 @@ template <typename T>
     device const T*     fold_k        [[buffer(17)]],
     device const T*     fold_v        [[buffer(18)]],
     device const uint*  positions     [[buffer(19)]],
-    device const float* tq_boundaries [[buffer(20)]],
     device const T*     fold_cos_sin  [[buffer(21)]],
     device const T*     tq_bias_cos_sin [[buffer(22)]],
     device const uint*  cu_seqlens_q  [[buffer(23)]],
@@ -1412,6 +1417,11 @@ template <typename T>
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
     uint   simd_lid  [[thread_index_in_simdgroup]])
 {
+    static_assert(sizeof(T) && TQ_CB_SIGN_WORD_COUNT * 32u == ATTN_HEAD_DIM &&
+                      TQ_CB_CENTROID_COUNT == 1u << ATTN_TQ &&
+                      TQ_CB_BOUNDARY_COUNT == (ATTN_FOLD ? (1u << ATTN_TQ) - 1u : 0u),
+                  "a TurboQuant decode takes its codebook compiled in: the signs and centroids, "
+                  "and the boundaries when it runs its writer's encode");
     // G is the matrix units' row count — the fragment geometry, qb's padded row count, ml's
     // layout, and this kernel's per-head array sizes: the bake compiles the file whole, so a
     // staging pass's constant set (which carries no query heads) reaches this one, and a group
@@ -1491,7 +1501,7 @@ template <typename T>
     threadgroup float ml[2u * KG * G];
     threadgroup float own_s[G];
     if (tid < 16u) {
-        lut[tid] = tq_centroids[tid];
+        lut[tid] = TQ_CB_CENTROIDS[tid];
     }
 
     // The query heads' element `e` as the writer leaves it: roped under the fold, rounded to T.
@@ -1554,8 +1564,9 @@ template <typename T>
             kv_row_encode<T>(float(fold_kv[tid]), float(fold_kv[ATTN_FOLD_DIM + tid]), tid, D,
                              num_kv, kvh, slot, fold_pos, ATTN_TQ, vpw, pdim,
                              ATTN_TQ_KB ? 2u : 0u, ATTN_TQ_VB ? 1u : 0u,
-                             ATTN_FOLD_ROT_DIM, ATTN_FOLD_PAIR_OFF, tq_signs, tq_boundaries,
-                             tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias,
+                             ATTN_FOLD_ROT_DIM, ATTN_FOLD_PAIR_OFF, TQ_CB_SIGN_WORDS,
+                             TQ_CB_BOUNDARIES, tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v,
+                             tq_k_bias,
                              tq_v_bias, tq_bias_cos_sin, xs, codes);
         }
         return;
@@ -1572,7 +1583,7 @@ template <typename T>
         float x[HQ];
         for (uint j = 0; j < HQ; ++j) {
             const uint e = hi * (D / 2u) + simd_lid * HQ + j;
-            x[j] = ATTN_SCALE_FC * q_plain(h, e) * tq_signs[e];
+            x[j] = ATTN_SCALE_FC * q_plain(h, e) * tq_cb_sign(e);
         }
         tq_wht(x, HQ, simd_lid);
         for (uint j = 0; j < HQ; ++j) {
@@ -1593,7 +1604,7 @@ template <typename T>
             float x[QK];
             for (uint j = 0; j < QK; ++j) {
                 const uint e = simd_lid * QK + j;
-                x[j] = ATTN_SCALE_FC * q_plain(h, e) * tq_signs[e];
+                x[j] = ATTN_SCALE_FC * q_plain(h, e) * tq_cb_sign(e);
             }
             tq_wht(x, QK, simd_lid);
             for (uint j = 0; j < QK; ++j) {
@@ -1786,7 +1797,7 @@ template <typename T>
                     const float n = tq_norms_k[r] / float(D);
                     for (uint j = 0; j < QK; ++j) {
                         const uint e = simd_lid * QK + j;
-                        const float x0 = x[j] * tq_signs[e] * n;
+                        const float x0 = x[j] * tq_cb_sign(e) * n;
                         // The span's codes are centered too: the bias back before the re-rope,
                         // rounded as the dequant pass leaves the key (the twin's span path).
                         x[j] = float(T(ATTN_TQ_KB ? x0 + float(kbias[e]) : x0));
@@ -1874,7 +1885,7 @@ template <typename T>
             // The cache holds the true V; the partials hold the centered one every packed key
             // contributes, so the combine's one vb add stays right (the twin's tail path).
             const float v = float(ATTN_FOLD ? fold_kv[ATTN_FOLD_DIM + e] : v_ptr[e]);
-            y[j] = (ATTN_TQ_VB ? v - float(vbias[e]) : v) * tq_signs[e];
+            y[j] = (ATTN_TQ_VB ? v - float(vbias[e]) : v) * tq_cb_sign(e);
         }
         if (do_rot) {
             rope_row(x, i);

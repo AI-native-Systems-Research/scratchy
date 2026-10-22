@@ -773,9 +773,10 @@ fn runtime_at(first: u8, kinds: impl IntoIterator<Item = RuntimeBindingKind>) ->
         .collect()
 }
 
-/// A KV writer's folded-in TurboQuant encode ([`KvWrite::PoolAndPacked`]): the codebook, the
-/// layer's packed stores and each operand's offset, as the writer's constants and the bindings it
-/// adds from 16 (`kv_writer.h`'s `KV_WRITER_TQ_BUFFERS`). `None` for a writer that writes the pool alone.
+/// A KV writer's folded-in TurboQuant encode ([`KvWrite::PoolAndPacked`]): the codebook (compiled
+/// in), the layer's packed stores and each operand's offset, as the writer's constants and the
+/// bindings it adds from 18 (`kv_writer.h`'s `KV_WRITER_TQ_BUFFERS`). `None` for a writer that
+/// writes the pool alone.
 /// The coded layers are the GLOBAL class (every layer on uniform arches).
 fn kv_writer_codec(
     p: &MetalModelConsts,
@@ -794,10 +795,8 @@ fn kv_writer_codec(
     let ops = TqOperands::of(p, offsets, layer, w)?;
     let li = super::ids::LayerId(layer.get() + layer_offset);
     let mut bindings = runtime_at(
-        16,
+        18,
         [
-            RB::TqSigns,
-            RB::TqBoundaries,
             RB::TqPackedK { layer: li },
             RB::TqNormsK { layer: li },
             RB::TqPackedV { layer: li },
@@ -839,8 +838,15 @@ fn tq_attention_command(
     // count so the variant-bound entry below is slot 16's only value.
     let heads_slot = super::kernel_constants::AttentionViaCacheTqConstants::HEADS.0;
     constants.retain(|k| k.index != heads_slot);
+    // The codebook's signs span the plain command's own head dim.
+    let head_dim_slot = super::kernel_constants::AttentionViaCacheConstants::HEAD_DIM.0;
+    let head_dim = (attn.constants.iter())
+        .find(|k| k.index == head_dim_slot)
+        .map(|k| super::ids::HeadDim(k.bits))
+        .expect("a decode attention carries its head dim");
     constants.extend(Vec::from(
         super::kernel_constants::AttentionViaCacheTqConstants {
+            head_dim,
             bits: super::ids::TqCodeBits(bits.get()),
             k_bias: ops.k.0.is_some(),
             v_bias: ops.v.0.is_some(),
@@ -871,9 +877,9 @@ const ATTN_FOLD: (u16, u16) = (19, 20);
 
 /// Where a decode attention running its KV writer (`attention.metal`'s `ATTN_FOLD`) binds the
 /// writer's buffers, by the writer's binding index (`rope.metal`): `None` where the attention
-/// binds that buffer itself — the query it ropes in place, the layer's cache and packed store, the
-/// codebook's signs and the operands' biases.
-const FOLD_WRITER_BINDINGS: [(u8, Option<u8>); 17] = [
+/// binds that buffer itself — the query it ropes in place, the layer's cache and packed store, and
+/// the operands' biases.
+const FOLD_WRITER_BINDINGS: [(u8, Option<u8>); 15] = [
     (0, None),
     (1, Some(17)),
     (2, Some(18)),
@@ -882,8 +888,6 @@ const FOLD_WRITER_BINDINGS: [(u8, Option<u8>); 17] = [
     (5, Some(13)),
     (6, None),
     (7, None),
-    (16, None),
-    (17, Some(20)),
     (18, None),
     (19, None),
     (20, None),
@@ -895,13 +899,15 @@ const FOLD_WRITER_BINDINGS: [(u8, Option<u8>); 17] = [
 
 /// The decode attention `attention` running its KV `writer`'s work (`MetalFusion::RopedAttention`):
 /// its own constants and bindings, the writer's rotation ([`ATTN_FOLD`], from the writer's slots
-/// 3 / 6), and the writer's buffers where [`FOLD_WRITER_BINDINGS`]
+/// 3 / 6), its encode's codebook boundaries (the attention's own codebook holds the signs and
+/// centroids), and the writer's buffers where [`FOLD_WRITER_BINDINGS`]
 /// places them. `None` when the writer binds a buffer the table has no place for, or one the
 /// attention already binds there to another.
 fn roped_attention_command(
     attention: &LoweredCommand,
     writer: &LoweredCommand,
 ) -> Option<LoweredCommand> {
+    use super::kernel_constants::TqCodebookPart;
     let writer_constant = |slot: u16| writer.constants.iter().find(|c| c.index == slot);
     let (rot_dim, pair_off) = (writer_constant(3)?, writer_constant(6)?);
     let mut constants = attention.constants.to_vec();
@@ -909,6 +915,8 @@ fn roped_attention_command(
         ConstantValue::uint(ATTN_FOLD.0, rot_dim.bits),
         ConstantValue::uint(ATTN_FOLD.1, pair_off.bits),
     ]);
+    let boundaries = writer.constants.iter();
+    constants.extend(boundaries.filter(|c| TqCodebookPart::BOUNDARY_SLOTS.contains(&c.index)));
     let mut bindings = attention.bindings.to_vec();
     for b in writer.bindings.iter() {
         let (_, to) = FOLD_WRITER_BINDINGS
@@ -1364,7 +1372,7 @@ fn decode_attention_per_kv_head(
         c.kernel == KernelId::AttentionViaCacheTq
             // A sinks dispatch stays on its one-pass twin: the split pair
             // (`attention_decode_gqa_tq` + combine) has no sink math, and the
-            // combine keeps only buffers 0/11/15 — the sink column would be
+            // combine keeps only buffers 0/15 — the sink column would be
             // silently dropped. This is what keeps gpt-oss (head_dim 64, GA 8,
             // sinks) on the twin now that head_dim 64 takes the geometry below.
             && !c.bindings.iter().any(|b| b.index() == 16)
@@ -1428,9 +1436,10 @@ fn decode_attention_per_kv_head(
             ),
             ..command
         };
-        // The output, the rotation's signs and the V bias: the combine's buffers 0, 11 and 15.
+        // The output and the V bias: the combine's buffers 0 and 15 (the rotation's signs are
+        // among its constants).
         let kept = (command.bindings.iter())
-            .filter(|b| matches!(b.index(), 0 | 11 | 15))
+            .filter(|b| matches!(b.index(), 0 | 15))
             .copied();
         let combine = LoweredCommand {
             kernel: KernelId::AttentionDecodeCombine,
@@ -8829,7 +8838,16 @@ mod tests {
             for i in [13, 17, 18, 19, 21] {
                 assert!(bound(i), "binding {i}");
             }
-            assert_eq!((bound(20), bound(22)), (tq, false));
+            assert_eq!((bound(20), bound(22)), (false, false));
+            // The writer's encode, run here, takes its codebook's boundaries compiled in.
+            let boundaries = (cmd.constants.iter())
+                .filter(|k| {
+                    crate::tape::kernel_constants::TqCodebookPart::BOUNDARY_SLOTS
+                        .contains(&k.index)
+                })
+                .count();
+            let want = (1usize << TQ_BITS.get()) - 1;
+            assert_eq!(boundaries, if tq { want } else { 0 });
             let two = lower_subtile_tape_to_metal(&tape, &p, bake_point(2, None));
             assert!(matches!(
                 two,
@@ -8866,7 +8884,18 @@ mod tests {
         for i in [13, 17, 18, 19, 21] {
             assert!(bound(i), "binding {i}");
         }
-        assert_eq!((bound(20), bound(22)), (true, false));
+        assert_eq!((bound(20), bound(22)), (false, false));
+        // The writer's encode, run in the split's last threadgroup, takes its codebook's
+        // boundaries compiled in — the writer's own.
+        let boundaries = |c: &LoweredCommand| -> Vec<ConstantValue> {
+            let slots = crate::tape::kernel_constants::TqCodebookPart::BOUNDARY_SLOTS;
+            (c.constants.iter())
+                .filter(|k| slots.contains(&k.index))
+                .copied()
+                .collect()
+        };
+        assert_eq!(boundaries(split).len(), (1 << TQ_BITS.get()) - 1);
+        assert_eq!(boundaries(split), boundaries(writer));
         let splits = (128 * p.global_block_size).div_ceil(ATTN_SPLIT_KEYS);
         assert_eq!(split.dispatch.threadgroups.2, splits + 1);
         let two = lower_subtile_tape_to_metal(&tape, &p, bake_point(2, None));
@@ -9107,6 +9136,18 @@ mod tests {
                 Some(0)
             ]
         );
+        // Its encode's codebook, compiled in: the signs over the head, the code width's boundaries.
+        {
+            use crate::tape::ids::{HeadDim, TqCodeBits};
+            use crate::tape::kernel_constants::TqCodebookPart::{Boundaries, Signs};
+            let codebook: Vec<ConstantValue> =
+                (c.constants.iter()).filter(|k| k.index >= 40).copied().collect();
+            let want = [
+                Vec::from(Signs(HeadDim(hd as u32))),
+                Vec::from(Boundaries(TqCodeBits(TQ_BITS.get()))),
+            ];
+            assert_eq!(codebook, want.concat());
+        }
         let mut tq: Vec<u8> = c
             .bindings
             .iter()
@@ -9114,7 +9155,7 @@ mod tests {
             .filter(|&i| i >= 16)
             .collect();
         tq.sort_unstable();
-        assert_eq!(tq, [16, 17, 18, 19, 20, 21]);
+        assert_eq!(tq, [18, 19, 20, 21]);
         // Plain on a dense model (a coded model refuses a writer that encodes nothing).
         let plain_writer = try_lower_tq(&tp(), plain(&[writer(LLAMA_KV, KvWrite::Pool)]), 1);
         let plain_writer = plain_writer.expect("lowers");
@@ -9526,24 +9567,37 @@ mod tests {
             ((1, p.num_q_heads, 1), (64, 1, 1))
         );
         let bits = TQ_BITS.get();
+        // The codebook a decode attention compiles in: the signs over its own head dim and the
+        // centroids of the code width.
+        let codebook = |c: &LoweredCommand| {
+            use crate::tape::kernel_constants::TqCodebookPart;
+            let hd = (c.constants.iter()).find(|k| k.index == 0).expect("head dim");
+            let mut v = Vec::from(TqCodebookPart::Signs(crate::tape::ids::HeadDim(hd.bits)));
+            v.extend(Vec::from(TqCodebookPart::Centroids(
+                crate::tape::ids::TqCodeBits(bits),
+            )));
+            v
+        };
         // The split keeps the twin's constants — the plain set's less its baked heads (slot
-        // 16, the twin's variant-bound one is dropped too), plus the codebook width and the
-        // rung's split count — and its bindings are the twin's plus the partials at the op
-        // scratch's front.
+        // 16, the twin's variant-bound one is dropped too), plus the codebook width, the
+        // codebook and the rung's split count — and its bindings are the twin's plus the
+        // partials at the op scratch's front.
         let mut dense = fp16.constants.to_vec();
         assert_eq!(dense.pop(), Some(ConstantValue::uint(16, 8)));
         assert_eq!(split.constants[..dense.len()], *dense);
         assert_eq!(
             split.constants[dense.len()..],
             [
-                ConstantValue::uint(13, bits),
-                ConstantValue::uint(18, splits)
+                vec![ConstantValue::uint(13, bits)],
+                codebook(fp16),
+                vec![ConstantValue::uint(18, splits)]
             ]
+            .concat()
         );
         assert_eq!(split.bindings[..fp16.bindings.len()], *fp16.bindings);
         let layer = crate::tape::ids::LayerId(0);
         let n = fp16.bindings.len();
-        let tq_kinds: Vec<(u8, RuntimeBindingKind)> = split.bindings[n..n + 7]
+        let tq_kinds: Vec<(u8, RuntimeBindingKind)> = split.bindings[n..n + 5]
             .iter()
             .map(|b| match b {
                 Binding::Runtime {
@@ -9560,17 +9614,14 @@ mod tests {
                 (8, RuntimeBindingKind::TqPackedV { layer }),
                 (9, RuntimeBindingKind::TqNormsK { layer }),
                 (10, RuntimeBindingKind::TqNormsV { layer }),
-                (11, RuntimeBindingKind::TqSigns),
-                (12, RuntimeBindingKind::TqCentroids),
                 (13, RuntimeBindingKind::SlotMapping { layer }),
             ]
         );
         let partials = scratch_at(16, 0);
         assert_eq!(split.bindings.last(), Some(&partials));
-        // The combine keeps the output, the rotation's signs and (a biased layer's) the V
-        // bias, plus the partials.
+        // The combine keeps the output and (a biased layer's) the V bias, plus the partials.
         let kept = (split.bindings.iter())
-            .filter(|b| matches!(b.index(), 0 | 11 | 15))
+            .filter(|b| matches!(b.index(), 0 | 15))
             .copied();
         assert_eq!(
             *combine.bindings,
@@ -9600,13 +9651,17 @@ mod tests {
             tq.dispatch.threads_per_threadgroup
         );
         // The twin drops the plain set's baked heads (slot 16, its last
-        // entry) for its variant-bound one, then adds the codebook width.
+        // entry) for its variant-bound one, then adds the codebook width and the codebook.
         let mut dense = fp16.constants.to_vec();
         assert_eq!(dense.pop(), Some(ConstantValue::uint(16, 8)));
         assert_eq!(tq.constants[..dense.len()], *dense);
         assert_eq!(
             tq.constants[dense.len()..],
-            [ConstantValue::uint(13, bits), ConstantValue::tq_heads(16)]
+            [
+                vec![ConstantValue::uint(13, bits), ConstantValue::tq_heads(16)],
+                codebook(fp16)
+            ]
+            .concat()
         );
         assert_eq!(tq.bindings[..fp16.bindings.len()], *fp16.bindings);
         let tq_kinds: Vec<(u8, RuntimeBindingKind)> = tq.bindings[fp16.bindings.len()..]
@@ -9626,8 +9681,6 @@ mod tests {
                 (8, RuntimeBindingKind::TqPackedV { layer }),
                 (9, RuntimeBindingKind::TqNormsK { layer }),
                 (10, RuntimeBindingKind::TqNormsV { layer }),
-                (11, RuntimeBindingKind::TqSigns),
-                (12, RuntimeBindingKind::TqCentroids),
                 (13, RuntimeBindingKind::SlotMapping { layer }),
             ]
         );
@@ -9734,7 +9787,10 @@ mod tests {
             Some(&ConstantValue::uint(16, 8))
         );
         assert_eq!(tq.dispatch.threadgroups, (x, p.num_q_heads, z));
-        assert_eq!(tq.constants.last(), Some(&ConstantValue::tq_heads(16)));
+        assert_eq!(
+            (tq.constants.iter()).find(|k| k.index == 16),
+            Some(&ConstantValue::tq_heads(16))
+        );
         let bound_heads = |c: &LoweredCommand| {
             (c.constants.iter()).any(|k| k.ty == super::super::constants::ConstantType::TqHeads)
         };
@@ -9758,7 +9814,10 @@ mod tests {
                 .map(|k| k.resolve(variant))
                 .collect::<Result<Vec<_>, _>>()
                 .expect("the variant binds the heads");
-            assert_eq!(served.last(), Some(&ConstantValue::uint(16, heads)));
+            assert_eq!(
+                served.iter().find(|k| k.index == 16),
+                Some(&ConstantValue::uint(16, heads))
+            );
         }
     }
 
@@ -11486,8 +11545,6 @@ mod tests {
         assert_eq!(
             bound_from(&writer, 16),
             [
-                rt(16, RB::TqSigns),
-                rt(17, RB::TqBoundaries),
                 rt(18, RB::TqPackedK { layer }),
                 rt(19, RB::TqNormsK { layer }),
                 rt(20, RB::TqPackedV { layer }),
@@ -11498,15 +11555,25 @@ mod tests {
             .filter(|c| c.index >= 10)
             .copied()
             .collect();
+        // The encode's codebook, compiled in: the signs over the head and the code width's
+        // boundaries (`turboquant::tests` pins both to the quantizer's tables).
+        use crate::tape::kernel_constants::TqCodebookPart;
+        let signs = Vec::from(TqCodebookPart::Signs(crate::tape::ids::HeadDim(hd)));
+        let boundaries = Vec::from(TqCodebookPart::Boundaries(crate::tape::ids::TqCodeBits(bits)));
         assert_eq!(
             encode,
             [
-                k(10, bits),
-                k(11, vpw),
-                k(12, hd.div_ceil(vpw)),
-                k(13, 0),
-                k(14, 0)
+                vec![
+                    k(10, bits),
+                    k(11, vpw),
+                    k(12, hd.div_ceil(vpw)),
+                    k(13, 0),
+                    k(14, 0)
+                ],
+                signs,
+                boundaries
             ]
+            .concat()
         );
     }
 

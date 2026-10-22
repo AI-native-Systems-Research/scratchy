@@ -15,30 +15,24 @@ use crate::argmax::Buffer;
 /// Seed of the production codebook's rotation signs.
 pub const TQ_CODEBOOK_SEED: u64 = 42;
 
-/// A model's TurboQuant codebook at its GLOBAL head dim (`signs.len()`): the rotation signs, the
-/// `bits`-bit centroids, their midpoints and the packed words per head — computed at expansion
-/// ([`TqCodebook::compute`]) and emitted as a static per model.
+/// A model's TurboQuant codebook, by what determines it: its code width at its GLOBAL head dim,
+/// and the packed words per head — computed at expansion ([`TqCodebook::compute`]) and emitted as
+/// a static per model. Its tables (signs, centroids, boundaries) are the kernels' compiled-in
+/// constants ([`crate::tape::kernel_constants::TqCodebookPart`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TqCodebook {
     pub bits: TqBits,
+    pub head_dim: u32,
     pub packed_dim: u32,
-    pub signs: &'static [f32],
-    pub centroids: &'static [f32],
-    pub boundaries: &'static [f32],
 }
 
 impl TqCodebook {
     pub fn compute(head_dim: usize, bits: TqBits) -> Self {
-        use scratchy_layers::turboquant::{PolarQuantizer, packed_dim};
-        let q = PolarQuantizer::new(head_dim, bits.get(), TQ_CODEBOOK_SEED);
-        let boundaries = q.centroids().windows(2).map(|w| (w[0] + w[1]) / 2.0);
-        let baked = crate::tape::lowered::baked;
+        use scratchy_layers::turboquant::packed_dim;
         Self {
             bits,
+            head_dim: head_dim as u32,
             packed_dim: packed_dim(head_dim, bits.get()) as u32,
-            signs: baked(q.signs().to_vec()),
-            centroids: baked(q.centroids().to_vec()),
-            boundaries: baked(boundaries.collect()),
         }
     }
 }
@@ -87,7 +81,7 @@ pub fn build_tq_provision(
     } = pool;
     use objc2_metal::{MTLBuffer, MTLResourceOptions};
     let device = allocator.device();
-    let (bits, head_dim) = (codebook.bits.get(), codebook.signs.len());
+    let (bits, head_dim) = (codebook.bits.get(), codebook.head_dim as usize);
     let num_layers = is_global.len();
     let n_global = is_global.iter().filter(|&&g| g).count();
     let pdim = codebook.packed_dim as usize;
@@ -183,9 +177,6 @@ pub fn build_tq_provision(
         packed_v,
         norms_k,
         norms_v,
-        signs: crate::argmax::upload_shared_buffer(device, codebook.signs),
-        boundaries: crate::argmax::upload_shared_buffer(device, codebook.boundaries),
-        centroids: crate::argmax::upload_shared_buffer(device, codebook.centroids),
         scratch,
         mapped,
     }
@@ -229,25 +220,20 @@ mod tests {
         batch.commit(true);
     }
 
-    /// One (dim, bits) codebook, uploaded exactly as `build_tq_provision` does.
+    /// One (dim, bits) codebook: its host quantizer and its packing (the kernels compile its tables
+    /// in).
     struct Codebook {
         q: PolarQuantizer,
         dim: usize,
         bits: u32,
         pdim: usize,
-        signs: Buffer,
-        boundaries: Buffer,
-        centroids: Buffer,
     }
 
     impl Codebook {
-        fn new(device: &Device, dim: usize, bits: u32) -> Self {
+        fn new(dim: usize, bits: u32) -> Self {
             let cb = TqCodebook::compute(dim, TqBits::new(bits));
             Self {
                 pdim: cb.packed_dim as usize,
-                signs: upload_shared_buffer(device, cb.signs),
-                boundaries: upload_shared_buffer(device, cb.boundaries),
-                centroids: upload_shared_buffer(device, cb.centroids),
                 q: PolarQuantizer::new(dim, bits, TQ_CODEBOOK_SEED),
                 dim,
                 bits,
@@ -301,9 +287,6 @@ mod tests {
                 &[
                     (kv.table, 0),
                     (slots, 1),
-                    (&cb.signs, 2),
-                    (&cb.boundaries, 3),
-                    (&cb.centroids, 4),
                     (kv.packed, 5),
                     (kv.norms, 6),
                     (slots, 16),
@@ -465,7 +448,7 @@ mod tests {
     }
 
     fn compress_in_place_at(device: &Device, dim: usize, bits: u32) {
-        let cb = Codebook::new(device, dim, bits);
+        let cb = Codebook::new(dim, bits);
         // Paged pool: 1 chunk of `bpc` blocks, layout [block, kv_head, tok, dim].
         let (num_kv_heads, block_size, bpc) = (2usize, 16usize, 8usize);
         let kv_blk_stride = num_kv_heads * block_size * dim;
@@ -580,11 +563,15 @@ mod tests {
         })
     }
 
-    /// The baked codebook equals what `build_tq_provision` computed at load (a `PolarQuantizer` at
-    /// the production seed, centroid midpoints, `packed_dim`), bit for bit, at every gate-model
-    /// geometry; the digests pin those tables.
+    /// The codebook the kernels compile in (`TqCodebookPart`, read back as `tq_codebook.h` reads
+    /// it: a set sign bit -1) is what a `PolarQuantizer` at the production seed computes — its
+    /// signs, centroids and their midpoints — bit for bit, at every gate-model geometry, and
+    /// `TqCodebook` packs as it does; the digests pin those tables.
     #[test]
-    fn baked_codebook_equals_load_time_tables() {
+    fn compiled_in_codebook_equals_the_quantizer_tables() {
+        use crate::tape::constants::ConstantValue;
+        use crate::tape::ids::{HeadDim, TqCodeBits};
+        use crate::tape::kernel_constants::TqCodebookPart;
         let golden: [(usize, u32, u64); 4] = [
             (128, 3, 0xc6f921dfd2b14ed1),
             (128, 4, 0xc7badbedda5da1f3),
@@ -592,31 +579,43 @@ mod tests {
             (512, 4, 0xcda751c0cdee0bf3),
         ];
         for (dim, bits, want) in golden {
-            let cb = TqCodebook::compute(dim, TqBits::new(bits));
             let q = PolarQuantizer::new(dim, bits, TQ_CODEBOOK_SEED);
             let mids: Vec<f32> = q
                 .centroids()
                 .windows(2)
                 .map(|w| (w[0] + w[1]) / 2.0)
                 .collect();
+            let floats = |part| -> Vec<f32> {
+                let constants = Vec::<ConstantValue>::from(part);
+                constants.iter().map(|c| f32::from_bits(c.bits)).collect()
+            };
+            let words = Vec::<ConstantValue>::from(TqCodebookPart::Signs(HeadDim(dim as u32)));
+            let signs: Vec<f32> = (0..dim)
+                .map(|e| match words[e / 32].bits >> (e % 32) & 1 {
+                    1 => -1.0,
+                    _ => 1.0,
+                })
+                .collect();
+            let centroids = floats(TqCodebookPart::Centroids(TqCodeBits(bits)));
+            let boundaries = floats(TqCodebookPart::Boundaries(TqCodeBits(bits)));
             let bits_of = |t: &[f32]| t.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
-            assert_eq!(bits_of(cb.signs), bits_of(q.signs()), "signs {dim}/{bits}");
+            assert_eq!(bits_of(&signs), bits_of(q.signs()), "signs {dim}/{bits}");
             assert_eq!(
-                bits_of(cb.centroids),
+                bits_of(&centroids),
                 bits_of(q.centroids()),
                 "centroids {dim}/{bits}"
             );
             assert_eq!(
-                bits_of(cb.boundaries),
+                bits_of(&boundaries),
                 bits_of(&mids),
                 "boundaries {dim}/{bits}"
             );
             assert_eq!(
-                cb.packed_dim as usize,
+                TqCodebook::compute(dim, TqBits::new(bits)).packed_dim as usize,
                 packed_dim(dim, bits),
                 "packed_dim {dim}/{bits}"
             );
-            let got = digest(&[cb.signs, cb.centroids, cb.boundaries]);
+            let got = digest(&[&signs, &centroids, &boundaries]);
             assert_eq!(got, want, "codebook digest {dim}/{bits}: {got:#018x}");
         }
     }

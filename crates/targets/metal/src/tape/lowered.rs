@@ -1384,11 +1384,6 @@ pub enum RuntimeBindingKind {
     TqNormsV {
         layer: LayerId,
     },
-    /// TurboQuant codebook buffers (shared across layers): the random ±1 sign
-    /// vector, the Lloyd-Max boundaries, and the N(0,1) centroids.
-    TqSigns,
-    TqBoundaries,
-    TqCentroids,
 }
 
 pub fn baked<T>(v: Vec<T>) -> &'static [T] {
@@ -1735,10 +1730,7 @@ impl RuntimeBindingKind {
             | Self::VisionCuSeqlensWindow
             | Self::VisionWindowIndex
             | Self::VisionReverseIndices
-            | Self::VisionPositionIds
-            | Self::TqSigns
-            | Self::TqBoundaries
-            | Self::TqCentroids => self,
+            | Self::VisionPositionIds => self,
         }
     }
 }

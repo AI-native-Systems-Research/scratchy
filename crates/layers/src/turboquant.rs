@@ -113,7 +113,7 @@ pub fn unpack_indices(packed: &[u32], bits: u32, dim: usize) -> Vec<u8> {
 /// rounded f32 of its 4-decimal value: bit-identical to the decimal literal.
 /// Written as decimals, the 4-bit table's ±1.6180 trips clippy's
 /// `approx_constant` as the golden ratio, which it only resembles.
-fn gaussian_codebook(bits: u32) -> Vec<f32> {
+pub fn gaussian_codebook(bits: u32) -> Vec<f32> {
     let ten_thousandths: &[i16] = match bits {
         1 => &[-7979, 7979],
         2 => &[-15104, -4528, 4528, 15104],
@@ -128,6 +128,13 @@ fn gaussian_codebook(bits: u32) -> Vec<f32> {
         .iter()
         .map(|&n| f32::from(n) / 1e4)
         .collect()
+}
+
+/// The midpoints between adjacent [`gaussian_codebook`] centroids (port of
+/// `_compute_gaussian_boundaries`): a value codes to the count of them it exceeds.
+pub fn gaussian_boundaries(bits: u32) -> Vec<f32> {
+    let centroids = gaussian_codebook(bits);
+    centroids.windows(2).map(|w| (w[0] + w[1]) / 2.0).collect()
 }
 
 /// PolarQuant quantizer for a fixed dim + bit width. Port of `PolarQuantizer`.
@@ -146,14 +153,12 @@ pub struct PolarQuantizer {
 impl PolarQuantizer {
     pub fn new(dim: usize, bits: u32, seed: u64) -> Self {
         assert!(dim.is_power_of_two(), "dim must be power of 2 (got {dim})");
-        let centroids = gaussian_codebook(bits);
-        let boundaries = centroids.windows(2).map(|w| (w[0] + w[1]) / 2.0).collect();
         Self {
             dim,
             bits,
             signs: random_diagonal_sign(dim, seed),
-            centroids,
-            boundaries,
+            centroids: gaussian_codebook(bits),
+            boundaries: gaussian_boundaries(bits),
             scale: 1.0 / (dim as f32).sqrt(),
         }
     }

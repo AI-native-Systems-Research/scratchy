@@ -352,17 +352,6 @@ fn run_coded(c: &Case, bits: u32, fused: bool) -> Option<(Encoded, Vec<u16>, Vec
     let v_rows: Vec<u16> = (0..n_tok).flat_map(|t| row(t, 1)).collect();
     let (k, v) = (shared(&device, &k_rows), shared(&device, &v_rows));
     let slots = shared(&device, c.slots);
-    let quant = PolarQuantizer::new(hd, bits, TQ_SEED);
-    let boundaries: Vec<f32> = quant
-        .centroids()
-        .windows(2)
-        .map(|w| (w[0] + w[1]) / 2.0)
-        .collect();
-    let (signs, centroids, bounds) = (
-        shared(&device, quant.signs()),
-        shared(&device, quant.centroids()),
-        shared(&device, &boundaries),
-    );
     let n_rows = c.n_blocks * c.block_size * nkv;
     let pdim = packed_dim(hd, bits);
     // Stale codes and norms in every row (a reused block): a row neither run writes stays as is.
@@ -386,8 +375,6 @@ fn run_coded(c: &Case, bits: u32, fused: bool) -> Option<(Encoded, Vec<u16>, Vec
     if fused {
         // The lowering's `kv_writer_codec` set for an offset-free operand pair: 16-21.
         binds.extend([
-            (&signs, 16),
-            (&bounds, 17),
             (&packed_k, 18),
             (&norms_k, 19),
             (&packed_v, 20),
@@ -432,9 +419,6 @@ fn run_coded(c: &Case, bits: u32, fused: bool) -> Option<(Encoded, Vec<u16>, Vec
                 &[
                     (&pool.table, 0),
                     (&slots, 1),
-                    (&signs, 2),
-                    (&bounds, 3),
-                    (&centroids, 4),
                     (packed, 5),
                     (norms, 6),
                     (&slots, 16),

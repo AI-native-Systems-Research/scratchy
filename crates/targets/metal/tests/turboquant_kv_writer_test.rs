@@ -8,7 +8,7 @@
 
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
-use scratchy_layers::turboquant::{PolarQuantizer, packed_dim};
+use scratchy_layers::turboquant::packed_dim;
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
@@ -27,8 +27,6 @@ use scratchy_target_metal::tape::kernel_constants::{
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
 type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>;
 
-/// The production codebook seed (`build_tq_provision(.., 42)`).
-const SEED: u64 = 42;
 /// A padding token's slot: the writers write nothing for it.
 const PAD: u32 = u32::MAX;
 /// A span block's slot flag: its K is stored unrotated.
@@ -264,17 +262,6 @@ fn run(c: &Case, fused: bool) -> Option<Written> {
     let positions = shared(&device, &positions);
     let slots = shared(&device, c.slots);
 
-    let quant = PolarQuantizer::new(hd, c.bits, SEED);
-    let boundaries: Vec<f32> = quant
-        .centroids()
-        .windows(2)
-        .map(|w| (w[0] + w[1]) / 2.0)
-        .collect();
-    let (signs, centroids) = (
-        shared(&device, quant.signs()),
-        shared(&device, quant.centroids()),
-    );
-    let bounds = shared(&device, &boundaries);
     let n_rows = N_BLOCKS * BLOCK_SIZE * nkv;
     let pdim = packed_dim(hd, c.bits);
     // Stale codes and norms in every row (a reused block): a row neither run writes stays as is.
@@ -301,8 +288,6 @@ fn run(c: &Case, fused: bool) -> Option<Written> {
     }
     if fused {
         binds.extend([
-            (&signs, 16),
-            (&bounds, 17),
             (&packed_k, 18),
             (&norms_k, 19),
             (&packed_v, 20),
@@ -347,9 +332,6 @@ fn run(c: &Case, fused: bool) -> Option<Written> {
                 &[
                     (&pool.table, 0),
                     (&slots, 1),
-                    (&signs, 2),
-                    (&bounds, 3),
-                    (&centroids, 4),
                     (packed, 5),
                     (norms, 6),
                     (&slots, 16),

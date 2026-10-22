@@ -7708,18 +7708,11 @@ fn metal_tq_codebook_tokens(
         scratchy_forward_compiler::KvCodec::Dense => quote!(::core::option::Option::None),
         scratchy_forward_compiler::KvCodec::TurboQuant(bits) => {
             let cb = TqCodebook::compute(global_head_dim as usize, bits);
-            let table = |t: &[f32]| {
-                let words = t.iter().map(|v| v.to_bits());
-                quote!(&[#(f32::from_bits(#words)),*])
-            };
-            let (signs, centroids) = (table(cb.signs), table(cb.centroids));
-            let (boundaries, bits, packed_dim) = (table(cb.boundaries), bits.get(), cb.packed_dim);
+            let (bits, head_dim, packed_dim) = (bits.get(), cb.head_dim, cb.packed_dim);
             quote!(::core::option::Option::Some(::scratchy_target_metal::turboquant::TqCodebook {
                 bits: ::scratchy_forward_compiler::TqBits::new(#bits),
+                head_dim: #head_dim,
                 packed_dim: #packed_dim,
-                signs: #signs,
-                centroids: #centroids,
-                boundaries: #boundaries,
             }))
         }
     };

@@ -29,6 +29,12 @@ constant constexpr uint TQ_SIMD = 32;
 // butterfly then reuses), the butterfly's other buffer, and each vector's squared norm.
 constexpr uint tq_encode_floats(uint n, uint dim) { return 2u * n * dim + n; }
 
+// The random diagonal's sign at element `e` from its sign bits (`tq_codebook.h`'s
+// `TQ_CB_SIGN_WORDS`, a set bit -1): ±1.
+inline float tq_sign(constant const uint* sign_words, uint e) {
+    return as_type<float>(0x3f800000u | ((sign_words[e >> 5] >> (e & 31u)) & 1u) << 31);
+}
+
 // An encoded element: its code, and its vector's L2 norm.
 struct TqEncoded {
     uint code;
@@ -37,7 +43,8 @@ struct TqEncoded {
 
 // Encode `N` `dim`-vectors together — vector `n`'s element `x[n]` (its offset removed) on thread
 // `elem` — sharing every barrier: its codes bit-packed `vals_per_word` to a word into
-// `packed[n][0, packed_dim)`, its norm into `*norm[n]`. `scratch` is `tq_encode_floats(N, dim)`
+// `packed[n][0, packed_dim)`, its norm into `*norm[n]`. `sign_words` and `boundaries` are the
+// kernel's compiled-in codebook (`tq_codebook.h`). `scratch` is `tq_encode_floats(N, dim)`
 // threadgroup floats, `codes` `N * dim` threadgroup uints. Each vector's arithmetic is the same
 // op for op, in the same order — the norm's pairwise sums widest stride first, the butterfly's
 // stages narrowest first — whichever way a stage's partners exchange and however many vectors
@@ -47,7 +54,8 @@ struct TqEncoded {
 template <uint N>
 inline array<TqEncoded, N> tq_encode(array<float, N> x, uint elem, uint dim, uint bits,
                                      uint vals_per_word, uint packed_dim, uint centroids,
-                                     device const float* signs, device const float* boundaries,
+                                     constant const uint* sign_words,
+                                     constant const float* boundaries,
                                      array<device uint*, N> packed, array<device float*, N> norm,
                                      threadgroup float* scratch, threadgroup uint* codes) {
     threadgroup float* sq = scratch;
@@ -88,7 +96,7 @@ inline array<TqEncoded, N> tq_encode(array<float, N> x, uint elem, uint dim, uin
     for (uint n = 0; n < N; n++) {
         const float vec_norm = sqrt(total[n]);
         const float safe_norm = max(vec_norm, 1e-8f);
-        y[n] = live ? (x[n] / safe_norm) * signs[elem] : 0.0f;
+        y[n] = live ? (x[n] / safe_norm) * tq_sign(sign_words, elem) : 0.0f;
         out[n].norm = vec_norm;
     }
 

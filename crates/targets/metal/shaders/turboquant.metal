@@ -34,6 +34,7 @@
 #include "baked.h"
 #include "turboquant_encode.h"
 #include "turboquant_offset.h"
+#include "tq_codebook.h"
 using namespace metal;
 
 // `TqCompressConstants`, compiled in.
@@ -51,6 +52,10 @@ SCRATCHY_CONSTANT(uint,  TQ_WRITEBACK,        9);
 SCRATCHY_CONSTANT(uint,  TQ_OFFSET_MODE,      10);
 SCRATCHY_CONSTANT(uint,  TQ_ROT_DIM,          11);
 SCRATCHY_CONSTANT(uint,  TQ_PAIR_OFF,         12);
+// Its codebook, whole (`tq_codebook.h`).
+static_assert(TQ_CB_SIGN_WORD_COUNT == TQ_DIM / 32u && TQ_CB_CENTROID_COUNT == TQ_CENTROIDS &&
+                  TQ_CB_BOUNDARY_COUNT == TQ_CENTROIDS - 1u,
+              "the compress takes its whole codebook compiled in");
 
 // tq_compress_paged: for each (KV slot, kv_head), read the vector IN PLACE from
 // the paged pool (chunk-table addressing, identical to the attention kernels),
@@ -62,9 +67,6 @@ template <typename T>
 [[kernel]] void tq_compress_paged(
     device const uint64_t* chunk_table [[buffer(0)]],  // per-(tensor) chunk-addr table
     device const uint*  slots        [[buffer(1)]],    // [n_slots] physical KV slots written this fwd
-    device const float* signs        [[buffer(2)]],    // [TQ_DIM]
-    device const float* boundaries   [[buffer(3)]],    // [TQ_CENTROIDS-1]
-    device const float* centroids    [[buffer(4)]],    // [TQ_CENTROIDS]
     device       uint*  packed_store [[buffer(5)]],    // [max_slots, TQ_NUM_KV_HEADS, TQ_PACKED_DIM]
     device       float* norms_store  [[buffer(6)]],    // [max_slots, TQ_NUM_KV_HEADS]
     device const uint*  logical_slots [[buffer(16)]],  // [n_slots] LOGICAL slot for the packed-store index (= slots for in-place)
@@ -105,17 +107,17 @@ template <typename T>
     threadgroup uint codes[TQ_DIM];
     const uint store = logical_slot * TQ_NUM_KV_HEADS + kv_head;
     const TqEncoded e = tq_encode<1>({(float)vec[elem] - off}, elem, TQ_DIM, TQ_BITS, TQ_VALS_PER_WORD,
-                                     TQ_PACKED_DIM, TQ_CENTROIDS, signs, boundaries,
+                                     TQ_PACKED_DIM, TQ_CENTROIDS, TQ_CB_SIGN_WORDS, TQ_CB_BOUNDARIES,
                                      {packed_store + store * TQ_PACKED_DIM}, {norms_store + store},
                                      scratch, codes)[0];
 
     // ── dequant the codes back into the pool, offset restored ──
     if (TQ_WRITEBACK != 0u) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        scratch[elem] = centroids[e.code] * TQ_SCALE;
+        scratch[elem] = TQ_CB_CENTROIDS[e.code] * TQ_SCALE;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         tq_wht_tg(scratch, TQ_DIM, elem);
-        vec[elem] = (T)(scratch[elem] * TQ_SCALE * signs[elem] * e.norm + off);
+        vec[elem] = (T)(scratch[elem] * TQ_SCALE * tq_cb_sign(elem) * e.norm + off);
     }
 }
 

@@ -28,17 +28,14 @@ use super::lowered::RuntimeBindingKind;
 /// payload on the matching [`RuntimeBindingKind`] variant). The
 /// constructor walks model meta + bucket layout to size every field
 /// for the worker's largest bucket; the worker itself only borrows.
-/// TurboQuant per-forward buffers (packed canonical KV stores + codebook).
-/// `packed_*`/`norms_*` are `[num_layers]`; codebook buffers are shared.
+/// TurboQuant per-forward buffers (the packed canonical KV stores; the codebook is the kernels'
+/// compiled-in constants). `packed_*`/`norms_*` are `[num_layers]`.
 #[derive(Clone)]
 pub struct TqRuntimeBuffers {
     pub packed_k: Vec<Buffer>,
     pub packed_v: Vec<Buffer>,
     pub norms_k: Vec<Buffer>,
     pub norms_v: Vec<Buffer>,
-    pub signs: Buffer,
-    pub boundaries: Buffer,
-    pub centroids: Buffer,
     /// The reused per-layer fp16 scratch ([`TqScratch`]).
     pub scratch: TqScratch,
     /// The group-0 blocks every store above is mapped through (`SparseStores::mapped`).
@@ -352,9 +349,6 @@ impl RuntimeBindings {
             RuntimeBindingKind::TqPackedV { layer } => &self.tq().packed_v[layer.get() as usize],
             RuntimeBindingKind::TqNormsK { layer } => &self.tq().norms_k[layer.get() as usize],
             RuntimeBindingKind::TqNormsV { layer } => &self.tq().norms_v[layer.get() as usize],
-            RuntimeBindingKind::TqSigns => &self.tq().signs,
-            RuntimeBindingKind::TqBoundaries => &self.tq().boundaries,
-            RuntimeBindingKind::TqCentroids => &self.tq().centroids,
             RuntimeBindingKind::NumTokensU32 => &self.num_tokens_u32,
             RuntimeBindingKind::NumSampleRowsU32 => &self.num_sample_rows_u32,
             RuntimeBindingKind::SampleIndices => &self.sample_indices,

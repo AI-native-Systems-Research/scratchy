@@ -16,6 +16,7 @@
 #include "baked.h"
 #include "kv_writer.h"
 #include "row_sum.h"
+#include "tq_codebook.h"
 using namespace metal;
 
 // ---------------------------------------------------------------------------
@@ -114,20 +115,25 @@ SCRATCHY_CONSTANT_OPTIONAL(uint, ROPE_Q_ONLY, 15);
 constant bool ROPE_QUERY_ONLY = ROPE_Q_ONLY_SET && ROPE_Q_ONLY != 0u;
 constant constexpr uint ROPE_TQ_FLOATS = ROPE_TQ_BITS_SET ? tq_encode_floats(2, ROPE_HEAD_DIM) : 1u;
 constant constexpr uint ROPE_TQ_CODES = ROPE_TQ_BITS_SET ? 2u * ROPE_HEAD_DIM : 1u;
+// The encode's codebook (`tq_codebook.h`): the signs and the boundaries, exactly when it encodes.
+static_assert(TQ_CB_SIGN_WORD_COUNT == (ROPE_TQ_BITS_SET ? ROPE_HEAD_DIM / 32u : 0u) &&
+                  TQ_CB_BOUNDARY_COUNT == (ROPE_TQ_BITS_SET ? (1u << ROPE_TQ_BITS) - 1u : 0u) &&
+                  TQ_CB_CENTROID_COUNT == 0u,
+              "a KV writer's encode takes its codebook's signs and boundaries compiled in");
 
 // Encode the row pair this owning threadgroup just wrote to the pool — element `d` of K and of V —
 // into the packed store at the token's slot (`kv_writer.h`). Threadgroup-uniform.
 template <typename T>
 inline void rope_tq_encode(float k, float v, uint d, uint kv_head, uint slot_raw, uint pos,
-                           device const float* signs, device const float* boundaries,
                            device uint* packed_k, device float* norms_k, device uint* packed_v,
                            device float* norms_v, device const T* k_bias, device const T* v_bias,
                            device const T* cos_sin, threadgroup float* scratch,
                            threadgroup uint* codes) {
     kv_row_encode<T>(k, v, d, ROPE_HEAD_DIM, ROPE_NUM_KV_HEADS, kv_head, slot_raw, pos,
                      ROPE_TQ_BITS, ROPE_TQ_VALS_PER_WORD, ROPE_TQ_PACKED_DIM, ROPE_TQ_K_OFFSET,
-                     ROPE_TQ_V_OFFSET, ROPE_ROT_DIM, ROPE_PAIR_OFF, signs, boundaries, packed_k,
-                     norms_k, packed_v, norms_v, k_bias, v_bias, cos_sin, scratch, codes);
+                     ROPE_TQ_V_OFFSET, ROPE_ROT_DIM, ROPE_PAIR_OFF, TQ_CB_SIGN_WORDS,
+                     TQ_CB_BOUNDARIES, packed_k, norms_k, packed_v, norms_v, k_bias, v_bias,
+                     cos_sin, scratch, codes);
 }
 
 #if SCRATCHY_COMPILES(rope_append_f16_specialized)
@@ -243,7 +249,7 @@ kernel void rope_append_f16_specialized(
     k_dst[d] = k_row[d];
     v_dst[d] = v_row[d];
     if (ROPE_TQ_BITS_SET) {
-        rope_tq_encode<half>(float(k_row[d]), float(v_row[d]), d, kv_head, slot, pos, tq_signs, tq_boundaries, tq_packed_k,
+        rope_tq_encode<half>(float(k_row[d]), float(v_row[d]), d, kv_head, slot, pos, tq_packed_k,
                               tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias, tq_v_bias, tq_cos_sin,
                               tq_scratch, tq_codes);
     }
@@ -354,7 +360,7 @@ kernel void rope_append_bf16_specialized(
     k_dst[d] = k_row[d];
     v_dst[d] = v_row[d];
     if (ROPE_TQ_BITS_SET) {
-        rope_tq_encode<bfloat>(float(k_row[d]), float(v_row[d]), d, kv_head, slot, pos, tq_signs, tq_boundaries, tq_packed_k,
+        rope_tq_encode<bfloat>(float(k_row[d]), float(v_row[d]), d, kv_head, slot, pos, tq_packed_k,
                               tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias, tq_v_bias, tq_cos_sin,
                               tq_scratch, tq_codes);
     }
@@ -578,7 +584,7 @@ template <typename T_act, typename T_scale>
     k_dst[d] = k_tg[d];
     v_dst[d] = v_final;
     if (ROPE_TQ_BITS_SET) {
-        rope_tq_encode<T_act>(float(k_tg[d]), float(v_final), d, kv_head, slot, pos, tq_signs, tq_boundaries, tq_packed_k,
+        rope_tq_encode<T_act>(float(k_tg[d]), float(v_final), d, kv_head, slot, pos, tq_packed_k,
                               tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias, tq_v_bias, tq_cos_sin,
                               tq_scratch, tq_codes);
     }

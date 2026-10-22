@@ -9,7 +9,7 @@
 
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
-use scratchy_layers::turboquant::{PolarQuantizer, packed_dim};
+use scratchy_layers::turboquant::packed_dim;
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
@@ -20,14 +20,12 @@ use scratchy_target_metal::tape::ids::{
     BlockSize, BlocksPerChunk, HeadDim, NumKvHeads, NumQHeads, RopePairOff, RotDim, TqCodeBits,
 };
 use scratchy_target_metal::tape::kernel_constants::{
-    RopeAppendConstants, RopeTqConstants, TqOffset,
+    RopeAppendConstants, RopeTqConstants, TqCodebookPart, TqOffset,
 };
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
 type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>;
 
-/// The production codebook seed (`build_tq_provision(.., 42)`).
-const SEED: u64 = 42;
 const N_BLOCKS: usize = 12;
 const BLOCK_SIZE: usize = 16;
 const MAX_POS: usize = 256;
@@ -221,17 +219,6 @@ fn run(c: &Case, how: Run) -> Option<Left> {
     let (pool_k, pool_v) = (Pool::new(&device, c, 21), Pool::new(&device, c, 22));
 
     let bits = c.bits.unwrap_or(4);
-    let quant = PolarQuantizer::new(hd, bits, SEED);
-    let boundaries: Vec<f32> = quant
-        .centroids()
-        .windows(2)
-        .map(|w| (w[0] + w[1]) / 2.0)
-        .collect();
-    let (signs, centroids, bounds) = (
-        shared(&device, quant.signs()),
-        shared(&device, quant.centroids()),
-        shared(&device, &boundaries),
-    );
     let n_rows = N_BLOCKS * BLOCK_SIZE * nkv;
     let pdim = packed_dim(hd, bits);
     // Earlier keys' codes and norms: any bits, the same in every run.
@@ -307,11 +294,20 @@ fn run(c: &Case, how: Run) -> Option<Left> {
         }
         (None, _) => 1,
     };
+    // A TurboQuant decode's codebook, compiled in: the signs over the head and the centroids.
+    if let Some(b) = c.bits {
+        attn_constants.extend(Vec::from(TqCodebookPart::Signs(HeadDim(hd as u32))));
+        attn_constants.extend(Vec::from(TqCodebookPart::Centroids(TqCodeBits(b))));
+    }
     if how == Run::Fold {
         attn_constants.extend([
             ConstantValue::uint(19, c.rot_dim as u32),
             ConstantValue::uint(20, c.pair_off as u32),
         ]);
+        // The writer's encode, run here: its codebook's boundaries.
+        if let Some(b) = c.bits {
+            attn_constants.extend(Vec::from(TqCodebookPart::Boundaries(TqCodeBits(b))));
+        }
     }
     let kernel = match c.gqa {
         Some(_) => "attention_decode_gqa_tq",
@@ -351,8 +347,6 @@ fn run(c: &Case, how: Run) -> Option<Left> {
         ];
         if c.bits.is_some() {
             binds.extend([
-                (&signs, 16),
-                (&bounds, 17),
                 (&packed_k, 18),
                 (&norms_k, 19),
                 (&packed_v, 20),
@@ -377,8 +371,6 @@ fn run(c: &Case, how: Run) -> Option<Left> {
         (&packed_v, 8),
         (&norms_k, 9),
         (&norms_v, 10),
-        (&signs, 11),
-        (&centroids, 12),
         (&slots, 13),
         (&kb, 14),
         (&vb, 15),
@@ -389,7 +381,6 @@ fn run(c: &Case, how: Run) -> Option<Left> {
             (&k, 17),
             (&v, 18),
             (&positions, 19),
-            (&bounds, 20),
             (&cos_sin, 21),
             (&cos_sin, 22),
         ]);
@@ -404,7 +395,7 @@ fn run(c: &Case, how: Run) -> Option<Left> {
             };
             batch.encode(&attention, &binds, &[], &[], &resident, grid, tg(hd, 1));
             batch.barrier();
-            let binds = [(&out, 0), (&signs, 11), (&partials, 16)];
+            let binds = [(&out, 0), (&partials, 16)];
             batch.encode(&combine, &binds, &[], &[], &[], tg(1, nq), tg(128, 1));
         }
         None => batch.encode(
