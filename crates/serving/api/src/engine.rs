@@ -605,6 +605,11 @@ impl AsyncEngine {
     /// Where `prompt` leaves its model's thinking ([`PromptThinking::of`]), whitespace judged by
     /// decoding: a prompt that ends with a closed think block closed thinking (thinking off).
     ///
+    /// ⛔ A TAIL IS DECODED A TOKEN AT A TIME, TO ITS FIRST TOKEN THAT ISN'T WHITESPACE. A tool
+    /// loop's tail after its last `</think>` is every call and result since, thousands of tokens on
+    /// the request path. A thinking-off tail is a token or two, and a long one costs one decode. A
+    /// whitespace token decodes alone: it splits no character.
+    ///
     /// [`PromptThinking::of`]: scratchy_core_common::sampling::PromptThinking::of
     fn prompt_thinking(
         &self,
@@ -612,9 +617,9 @@ impl AsyncEngine {
         prompt: &[u32],
     ) -> scratchy_core_common::sampling::PromptThinking {
         let blank = |tail: &[u32]| match &self.tokenizer {
-            Some(tokenizer) => tokenizer
-                .decode(tail, false)
-                .is_ok_and(|s| s.trim().is_empty()),
+            Some(tokenizer) => (tail.iter()).all(|&token| {
+                (tokenizer.decode(&[token], false)).is_ok_and(|s| s.trim().is_empty())
+            }),
             None => tail.is_empty(),
         };
         scratchy_core_common::sampling::PromptThinking::of(tokens, prompt, blank)
@@ -4587,6 +4592,11 @@ mod tests {
             reads("hi TaU then a tool call"),
             PromptThinking::Absent,
             "an earlier turn's"
+        );
+        assert_eq!(
+            reads(&format!("hi TaU \n {}", "tool result ".repeat(4096))),
+            PromptThinking::Absent,
+            "a long tail, its first text deciding it"
         );
         assert_eq!(reads("hi"), PromptThinking::Absent);
     }
