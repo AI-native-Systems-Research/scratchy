@@ -1752,13 +1752,29 @@ const TIMELINE_METRICS: [(Metric, &str); 2] = [
 /// run measured each itself.
 fn timeline_steps(kept: &[&Entry], rival: Option<Engine>, metric: Metric) -> Vec<Step> {
     (kept.iter().enumerate())
+        // A power of two a run: the sparkline's x axis is a log one, so runs at 1, 2, 3, ...
+        // would crowd the newest to the right edge. The spyre timeline spaces its sweeps so too.
         .map(|(i, e)| Step {
-            x: (i + 1) as f64,
+            x: 2f64.powi(i as i32),
             scratchy: timing(own_cell(e, Engine::Scratchy), metric),
             rival: rival.and_then(|r| timing(own_cell(e, r), metric)),
             highlight: false,
         })
         .collect()
+}
+
+/// A timeline's two labelled ×-factors. Where scratchy started: the first run that measured
+/// both, since a quick run's borrowed rival is no point of its own and the carry runs only
+/// forward. Where it stands: the newest run scratchy measured, against the rival carried to it.
+fn timeline_highlights(steps: &mut [Step]) {
+    let measured = |s: &Step| s.scratchy.is_some();
+    let both = |s: &Step| s.scratchy.is_some() && s.rival.is_some();
+    if let Some(first) = steps.iter().position(both) {
+        steps[first].highlight = true;
+    }
+    if let Some(last) = steps.iter().rposition(measured) {
+        steps[last].highlight = true;
+    }
 }
 
 /// An engine's one-user cell in a run, where that run measured it itself (not borrowed).
@@ -1799,13 +1815,7 @@ fn model_timelines(entries: &[Entry]) -> Vec<(&'static str, Element)> {
         .iter()
         .map(|&(metric, value)| {
             let mut steps = timeline_steps(&kept, rival, metric);
-            let measured = |s: &Step| s.scratchy.is_some();
-            if let Some(first) = steps.iter().position(measured) {
-                steps[first].highlight = true;
-            }
-            if let Some(last) = steps.iter().rposition(measured) {
-                steps[last].highlight = true;
-            }
+            timeline_highlights(&mut steps);
             let chart = sparkline(
                 &steps,
                 SparkAxes {
@@ -1845,8 +1855,7 @@ fn over_time_charts(machines: &BTreeMap<&str, MachineRuns>) -> Vec<(String, Elem
 /// The Over time section: every machine's models over their runs, a small timeline a machine,
 /// model and metric, as the spyre page shows its cells. Nothing until some model has two runs of
 /// one shape on one machine.
-fn over_time(machines: &BTreeMap<&str, MachineRuns>) -> Element {
-    let charts = over_time_charts(machines);
+fn over_time(charts: Vec<(String, Element)>) -> Element {
     if charts.is_empty() {
         return rsx! {};
     }
@@ -2753,14 +2762,15 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     } else {
         sections.push(("glance".to_string(), "At a glance".to_string()));
         // No link to a section that is not there.
-        if !over_time_charts(&machines).is_empty() {
+        let timelines = over_time_charts(&machines);
+        if !timelines.is_empty() {
             sections.push(("over-time".to_string(), "Over time".to_string()));
         }
         let order = in_order(&machines);
         sections.extend(order.iter().map(|chip| (slug(chip), chip.to_string())));
         rsx! {
             {glance(&machines)}
-            {over_time(&machines)}
+            {over_time(timelines)}
             for chip in &order { {machine_section(chip, &machines[chip])} }
         }
     };
@@ -3264,6 +3274,14 @@ mod tests {
             [false, true, false],
             "oMLX only where it was measured"
         );
+        // Evenly spaced on the sparkline's log axis.
+        let xs: Vec<f64> = steps.iter().map(|s| s.x).collect();
+        assert_eq!(xs, [1.0, 2.0, 4.0]);
+        // Where scratchy started is the first run with both engines, not the quick run before it.
+        let mut steps = steps;
+        super::timeline_highlights(&mut steps);
+        let labelled: Vec<bool> = steps.iter().map(|s| s.highlight).collect();
+        assert_eq!(labelled, [false, true, true]);
         assert_eq!(super::model_timelines(entries).len(), 2);
     }
 }
