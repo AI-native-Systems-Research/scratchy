@@ -11,7 +11,7 @@ pub mod common {
     pub mod numerics;
 }
 
-use common::numerics::{bf16_inputs, compare, widen};
+use common::numerics::{bf16_inputs, compare, mismatched_bits, widen};
 use scratchy_target_cuda::kernels::{KernelError, gemm_bf16_abt, gemm_narrow_bf16_abt};
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 
@@ -348,4 +348,84 @@ fn gemm_narrow_bf16_abt_refuses_shapes_it_does_not_take() {
         assert_eq!(got, want, "m={m} n={n} k={k}");
         assert!(unchanged, "m={m} n={n} k={k}: a refused launch wrote C");
     }
+}
+
+/// A GEMM launch that waits for itself: [`launch_and_wait`] or [`narrow_and_wait`].
+type Launch = unsafe fn(
+    &DeviceBuffer,
+    &DeviceBuffer,
+    &DeviceBuffer,
+    (u32, u32, u32),
+) -> Result<(), KernelError>;
+
+/// The same 212 rows of `A` placed at row offsets 0, 37, 88 and 300 of an `M`-row operand (the
+/// rest of `A` other values): each placement's output rows bit-identical to offset 0's. An
+/// element's K-accumulation must not depend on which row of the 128-row tile, which consumer
+/// warpgroup, or which tile of the grid its row lands in. `cuda_prefill`'s (e) moves no row; its
+/// (f) moves sequence rows 300..512 to bucket rows 0..212.
+fn placement_misses(
+    device: &CudaDevice,
+    (n, k): (u32, u32),
+    m: u32,
+    run: Launch,
+    what: &str,
+) -> bool {
+    let (mu, nu, ku) = (m as usize, n as usize, k as usize);
+    let rows = 212usize;
+    let block = bf16_inputs(rows * ku, 0x0F5E_0001 ^ u64::from(n));
+    let b = DeviceBuffer::upload(device, &bf16_inputs(nu * ku, 0x0F5E_0002 ^ u64::from(k)))
+        .expect("upload B");
+    let mut placed: Vec<Vec<u16>> = Vec::new();
+    let mut pass = true;
+    for (i, off) in [0usize, 37, 88, 300].into_iter().enumerate() {
+        let mut a = bf16_inputs(mu * ku, 0x0F5E_0100 ^ i as u64);
+        a[off * ku..][..rows * ku].copy_from_slice(&block);
+        let a = DeviceBuffer::upload(device, &a).expect("upload A");
+        let c = DeviceBuffer::upload(device, &vec![SENTINEL; mu * nu]).expect("upload C");
+        // SAFETY: the buffers hold m*k, n*k and m*n bf16, cudaMalloc pointers are 256-byte
+        // aligned, and `c` overlaps neither input.
+        unsafe { run(&a, &b, &c, (m, n, k)) }.expect("launch");
+        let out = c.download().expect("download C");
+        placed.push(out[off * nu..][..rows * nu].to_vec());
+        let mismatched = mismatched_bits(&placed[i], &placed[0]);
+        let worst_row = (0..rows)
+            .max_by_key(|&r| {
+                mismatched_bits(&placed[i][r * nu..][..nu], &placed[0][r * nu..][..nu])
+            })
+            .filter(|_| mismatched > 0);
+        let ok = mismatched == 0;
+        eprintln!(
+            "{what} m={m} n={n} k={k}: rows at offset {off} vs offset 0: \
+             mismatched_bits={mismatched}/{} worst_row={worst_row:?} {}",
+            rows * nu,
+            if ok { "PASS" } else { "FAIL" }
+        );
+        pass &= ok;
+    }
+    pass
+}
+
+#[test]
+fn an_output_row_does_not_depend_on_where_its_input_row_sits() {
+    let device = h100();
+    let mut pass = true;
+    // The 0.8b's shapes: the QKV/gate projection, the down projection, the lm_head's K, at the
+    // m=512 bucket.
+    for (n, k) in [(6144u32, 1024u32), (1024, 3584), (2048, 1024)] {
+        pass &= placement_misses(&device, (n, k), 512, launch_and_wait, "gemm_bf16_abt");
+    }
+    // The narrow GEMM: the GDN a/b projections (n = 16).
+    for (n, k) in [(16u32, 1024u32), (64, 1024)] {
+        pass &= placement_misses(
+            &device,
+            (n, k),
+            512,
+            narrow_and_wait,
+            "gemm_narrow_bf16_abt",
+        );
+    }
+    assert!(
+        pass,
+        "an output row depends on where its input row sits: see the lines above"
+    );
 }

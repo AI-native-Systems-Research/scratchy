@@ -314,6 +314,72 @@ pub struct LoweredDecode {
     pub unnamed_reads: Vec<(usize, usize)>,
 }
 
+/// ⭐ ONE MODEL, HANDED TO A TARGET'S EMITTER: the input of the macro's target-emitter seam.
+///
+/// The macro does not know which target compiler it is linked against. Cargo decides that: the
+/// macro crate's manifest renames a target compiler crate to the optional `target-emitter`
+/// dependency key (the backend feature that turns the key on names the crate), and the macro calls that
+/// crate's `emit::emit_model(&TargetModelInput) -> proc_macro2::TokenStream` and splices the
+/// tokens it returns into the model's module. Any target compiler crate can implement that
+/// function; what it lowers, what it refuses and what it emits are its own, and nothing about them
+/// crosses back.
+///
+/// So this carries only what the macro alone knows, all of it a fact about the MODEL: the
+/// canonical it lowered at each workload point, and the config facts a target reads beside a
+/// canonical. It names no backend.
+#[derive(Debug, Clone)]
+pub struct TargetModelInput {
+    /// The config stem (`qwen3.5-0.8b`), for the target's diagnostics.
+    pub stem: String,
+    /// One per workload point the shared front end lowered, in the macro's `(m, sk)` order.
+    pub buckets: Vec<TargetBucket>,
+    /// A workload point the shared front end refused, with its refusal; a target decides what
+    /// that means for it.
+    pub unlowered: Vec<(TargetPoint, String)>,
+    pub facts: TargetModelFacts,
+}
+
+/// One workload point: `m` token rows, `sk` the KV-length bucket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TargetPoint {
+    pub m: u32,
+    pub sk: u32,
+}
+
+/// One workload point's canonical, from the shared front end.
+#[derive(Debug, Clone)]
+pub struct TargetBucket {
+    pub point: TargetPoint,
+    pub lowered: LoweredDecode,
+}
+
+/// The config facts a target reads beside a canonical: the ones an op of the canonical does not
+/// carry. Each is resolved once, by the macro, from the model's config.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TargetModelFacts {
+    /// `head_dim`.
+    pub head_dim: u32,
+    /// The rotated lanes of a head: `partial_rotary_factor · head_dim`, else `head_dim`.
+    pub rot_dim: u32,
+    /// `rope_theta`; `None` when the config declares none.
+    pub rope_theta: Option<f64>,
+    /// `rms_norm_eps` (or the config's equivalent).
+    pub rms_norm_eps: f32,
+    /// `vocab_size`; 0 when the config declares none.
+    pub vocab_size: u32,
+    /// The linear-attention geometry: `Some` exactly when the model has a Gated-DeltaNet layer.
+    pub gdn: Option<TargetGdnFacts>,
+}
+
+/// A Gated-DeltaNet model's key-head geometry: `linear_num_key_heads`, `linear_key_head_dim`,
+/// `linear_conv_kernel_dim`. The value heads and their width are the op's operand widths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TargetGdnFacts {
+    pub num_k_heads: u32,
+    pub head_k: u32,
+    pub conv_kernel: u32,
+}
+
 /// One construct's expansion into ops (see [`LoweredDecode::op_expansion`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExpansionId(pub u32);

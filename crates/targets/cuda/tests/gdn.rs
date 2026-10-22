@@ -937,7 +937,15 @@ fn two_chunks_are_bit_identical_to_one_forward() {
     for d in [G08, G9] {
         let bu = bundle(d, 0xC0C0);
         let bb = upload_bundle(&device, &bu);
-        for (l1, l2) in [(1, 1), (2, 1), (3, 5), (64, 64), (100, 200), (300, 1)] {
+        for (l1, l2) in [
+            (1, 1),
+            (2, 1),
+            (3, 5),
+            (64, 64),
+            (100, 200),
+            (300, 1),
+            (300, 212),
+        ] {
             let x = inputs(d, l1 + l2, 0xC0C1 ^ (l1 as u64) << 16 ^ l2 as u64);
             let pool_one = Pool::new(&device, d, NAN_F32);
             let one = chunk(&x, d, 0, l1 + l2, l1 + l2);

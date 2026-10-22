@@ -2,7 +2,10 @@
 //! CUDA's step: one or two kernel launches of a lowered tape, the counterpart of metal's
 //! `MetalStep`.
 
-use scratchy_subtile::subtile_ir::GainConvention;
+/// Re-exported so a static tape names it beside the steps that carry it
+/// (`scratchy_target_cuda::step::GainConvention`).
+pub use scratchy_subtile::subtile_ir::GainConvention;
+use serde::Serialize;
 
 use crate::tape::{ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, WeightIx};
 
@@ -13,7 +16,7 @@ use crate::tape::{ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, WeightIx};
 /// kernel, beside that kernel's registry row and its arm of [`CudaStep::extents`]. The tape
 /// player matches it exhaustively, so a new variant does not compile until the player launches
 /// it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum CudaStep {
     /// The bf16 GEMM, lowered from `SubOp::MatmulTile` when `n` is a multiple of its tile's
     /// (`kernels/gemm_bf16.cu`).
@@ -59,7 +62,7 @@ pub const GEMM_BF16_TILE: (u32, u32, u32) = (128, 256, 64);
 /// `A` and `C` are arena slots; `B` is a weight buffer in the checkpoint's `[N, K]` storage order
 /// (the IR states it as `[K, N]`; the bytes are the checkpoint's). `C` overlaps neither operand:
 /// CUDA's colour rule for a matmul reads its inputs across the step.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct GemmBf16 {
     pub a: ArenaOffset,
     pub b: WeightIx,
@@ -86,7 +89,7 @@ pub const RMS_NORM_BF16_COLS: u32 = 8;
 ///
 /// `x` and `y` are `[rows, cols]` arena slots; `gain` is a `[cols]` bf16 weight. `offset` is the
 /// convention's ([`GainConvention::offset`]): 0 for a stored gain, 1 for a zero-centred one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct RmsNormBf16 {
     pub x: ArenaOffset,
     pub gain: WeightIx,
@@ -95,7 +98,21 @@ pub struct RmsNormBf16 {
     pub cols: u32,
     /// `eps` as its bits (`f32::to_bits`), so the step is `Eq`; [`Self::eps`] reads it back.
     pub eps_bits: u32,
+    #[serde(serialize_with = "serialize_gain_convention")]
     pub convention: GainConvention,
+}
+
+/// [`GainConvention`] as the unit variant it is: `scratchy_subtile` has no serde, so the static
+/// tape names it `GainConvention::Scale` or `GainConvention::OnePlusScale` through this.
+fn serialize_gain_convention<S: serde::Serializer>(
+    convention: &GainConvention,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    let (index, variant) = match convention {
+        GainConvention::Scale => (0, "Scale"),
+        GainConvention::OnePlusScale => (1, "OnePlusScale"),
+    };
+    s.serialize_unit_variant("GainConvention", index, variant)
 }
 
 impl RmsNormBf16 {
@@ -111,7 +128,7 @@ pub const ADD_BF16_COLS: u32 = 8;
 
 /// `out = a + b` over `[rows, cols]`, bf16 in and out: one f32 add, one rounding. No broadcast:
 /// all three are arena slots of the same shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct AddBf16 {
     pub a: ArenaOffset,
     pub b: ArenaOffset,
@@ -126,7 +143,7 @@ pub const SILU_MUL_BF16_COLS: u32 = 8;
 
 /// `out = gate / (1 + e^(−gate)) · up` over `[rows, cols]`, bf16 in and out, computed in f32 and
 /// rounded once. No broadcast: all three are arena slots of the same shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct SiluMulBf16 {
     pub gate: ArenaOffset,
     pub up: ArenaOffset,
@@ -150,7 +167,7 @@ pub const ROPE_BF16_HEAD_MULTIPLE: u32 = 8;
 /// with `c = table[r, d]` and `s = table[r, rot_dim/2 + d]`. Lanes `rot_dim..head_dim` are copied
 /// bit for bit. `table` is the tape's rotary table ([`crate::tape::RotaryTable`]), `[rows,
 /// rot_dim]` bf16; `out` overlaps neither input.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct RopeBf16 {
     pub x: ArenaOffset,
     pub table: ArenaOffset,
@@ -169,7 +186,7 @@ pub const GATE_SPLIT_BF16_HEAD_MULTIPLE: u32 = 8;
 /// Per head `h` and lane `d`: `q[r, h·hd + d] = qg[r, 2h·hd + d]` and `gate[r, h·hd + d] =
 /// qg[r, 2h·hd + hd + d]`, bf16 copies. `qg` is `[rows, 2·half_cols]`, `q` and `gate` are `[rows,
 /// half_cols]`, and neither output overlaps `qg` or the other.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct GateSplitBf16 {
     pub qg: ArenaOffset,
     pub q: ArenaOffset,
@@ -185,7 +202,7 @@ pub const GATE_APPLY_BF16_COLS: u32 = 8;
 
 /// `out = attn / (1 + e^(−gate))` over `[rows, cols]`, bf16 in and out, computed in f32 and
 /// rounded once. No broadcast: all three are arena slots of the same shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct GateApplyBf16 {
     pub attn: ArenaOffset,
     pub gate: ArenaOffset,
@@ -212,7 +229,7 @@ pub const ATTN_PREFILL_BF16_HEAD_DIM: u32 = 256;
 /// V cache at that slot, bit for bit (`kernels/kv_append_bf16.cu`). `slot_mapping` is the tape's
 /// region ([`crate::tape::KvTape::slot_mapping`], `rows` u32); `layer` is an index into
 /// [`crate::tape::KvTape::layers`]. `k_out` overlaps no input.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct RopeAppendBf16 {
     pub k: ArenaOffset,
     pub v: ArenaOffset,
@@ -233,7 +250,7 @@ pub struct RopeAppendBf16 {
 /// row `i` attends to keys `0 ..= P + i` (`P`, `L` read from the tape's `sequence` region). Query
 /// head `g` reads kv head `g / (q_heads / kv_heads)`. `block_table` and `sequence` are the tape's
 /// regions ([`crate::tape::KvTape`]); `out` overlaps no input.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct AttnPrefillBf16 {
     pub q: ArenaOffset,
     pub block_table: ArenaOffset,
@@ -425,7 +442,7 @@ pub const fn gdn_scale(head_k: u32) -> f32 {
 /// `bundle` is the packed f32 weight bundle ([`gdn_bundle`]), `scratch` the tape's GDN scratch
 /// ([`gdn_scratch`] at `rows`), `layer` an index into [`crate::tape::GdnTape::layers`]. Value head
 /// `h` reads key head `h / (num_v_heads / num_k_heads)`. No launch reads a padding row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct GatedDeltaNetBf16 {
     /// bf16 `[rows, conv_dim]`: `q | k | v`.
     pub qkv: ArenaOffset,

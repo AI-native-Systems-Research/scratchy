@@ -2021,6 +2021,29 @@ fn plan_field_load(
     }
 }
 
+/// The rope base frequency the config DECLARES: `scalars["rope_theta"]`, else
+/// `bounds["rope_theta"]`, and `None` when it declares neither — no default is invented here
+/// (a caller that needs one picks it, and says why).
+pub(crate) fn declared_rope_theta(model: &ModelParams) -> Option<f64> {
+    model
+        .scalars
+        .get("rope_theta")
+        .copied()
+        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+}
+
+/// The rotated lanes of a `head_dim`-wide head: `partial_rotary_factor · head_dim` for a
+/// partial-rope arch (Qwen3.5: 0.25 · 256 = 64), else the full `head_dim`.
+pub(crate) fn rot_dim(model: &ModelParams, head_dim: u32) -> u32 {
+    model
+        .scalars
+        .get("partial_rotary_factor")
+        .copied()
+        .filter(|&f| (f - 1.0).abs() > 1e-9)
+        .map(|f| (f * head_dim as f64).round() as u32)
+        .unwrap_or(head_dim)
+}
+
 pub(crate) fn rms_norm_eps(model: &ModelParams) -> f32 {
     // HF configs carry `rms_norm_eps` (RMSNorm convention used by
     // Llama/Qwen2/Mistral/etc.) or `layer_norm_eps` (CohereLayerNorm
@@ -2529,12 +2552,7 @@ fn emit_fingerprint_check(
     // code is a single compare against two literals — and so a config spelling
     // `1000000` where the checkpoint spells `1000000.0` cannot trip it. It is far
     // tighter than any real theta gap (the closest in-tree pair differs by 2×).
-    let rope_theta_check: TokenStream = match model
-        .scalars
-        .get("rope_theta")
-        .copied()
-        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-    {
+    let rope_theta_check: TokenStream = match declared_rope_theta(model) {
         Some(theta) => {
             let theta_lit = proc_macro2::Literal::f64_unsuffixed(theta);
             let tol_lit = proc_macro2::Literal::f64_unsuffixed(theta.abs() * 1e-9);
@@ -7207,6 +7225,77 @@ fn bounds_for_wp(
     bounds
 }
 
+/// The model as the target-emitter seam takes it: the shared front end's canonical at every
+/// workload point (or its refusal), and the config facts a target reads beside a canonical.
+/// Target-neutral: every value is a fact about the model.
+#[cfg(feature = "target-emitter")]
+fn target_model_input(
+    model: &ModelParams,
+    fuf: &Fuf,
+    inferred: &crate::shape::Inferred,
+    workloads: &WorkloadPoints,
+    tp_world_size: u8,
+) -> scratchy_subtile::handoff::TargetModelInput {
+    use scratchy_subtile::handoff::{
+        TargetBucket, TargetGdnFacts, TargetModelFacts, TargetModelInput, TargetPoint,
+    };
+    let stem = &model.source_stem;
+    let point = |wp: &WorkloadPoint| {
+        let fit = |what: &str, v: u64| {
+            u32::try_from(v).unwrap_or_else(|_| panic!("[target-emitter] {stem}: {what} {v}"))
+        };
+        TargetPoint {
+            m: fit("num_tokens", wp.num_tokens),
+            sk: fit("sk_bucket", wp.sk_bucket),
+        }
+    };
+    let mut buckets = Vec::new();
+    let mut unlowered = Vec::new();
+    for wp in workloads.iter() {
+        let bounds = bounds_for_wp(model, *wp, tp_world_size);
+        let prefix =
+            crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap());
+        let at = point(wp);
+        match crate::to_wavefront::lower_decode_to_wavefront(
+            fuf, inferred, &bounds, model, prefix, at.m,
+        ) {
+            Ok(lowered) => buckets.push(TargetBucket { point: at, lowered }),
+            Err(e) => unlowered.push((at, e.to_string())),
+        }
+    }
+    let bound = |k: &str| model.bounds.get(k).map(|&v| v as u32);
+    let head_dim = bound("head_dim").unwrap_or(0);
+    let gdn = fuf
+        .nodes
+        .iter()
+        .any(|n| n.op == OpKind::GatedDeltaNet)
+        .then(|| {
+            let need = |k: &str| {
+                bound(k).unwrap_or_else(|| {
+                    panic!("[target-emitter] {stem}: a Gated-DeltaNet model with no `{k}`")
+                })
+            };
+            TargetGdnFacts {
+                num_k_heads: need("linear_num_key_heads"),
+                head_k: need("linear_key_head_dim"),
+                conv_kernel: need("linear_conv_kernel_dim"),
+            }
+        });
+    TargetModelInput {
+        stem: stem.clone(),
+        buckets,
+        unlowered,
+        facts: TargetModelFacts {
+            head_dim,
+            rot_dim: rot_dim(model, head_dim),
+            rope_theta: declared_rope_theta(model),
+            rms_norm_eps: rms_norm_eps(model),
+            vocab_size: bound("vocab_size").unwrap_or(0),
+            gdn,
+        },
+    }
+}
+
 /// Whether this model uses rotary position embeddings — any `Rotary` extern
 /// input in the Fuf. Drives `CanonicalParams::ROPE_ON_READ` (rope-on-read is
 /// the universal default for rope models) and the matching
@@ -7539,13 +7628,7 @@ fn emit_canonical_params_impl(
     // the full `head_dim`. Without this the impl falls back to the trait
     // default `ROT_DIM = HEAD_DIM`, so the kernel rotates head_dim dims
     // against a rotary_dim-wide cos/sin cache → partial-rope arches break.
-    let rot_dim_val: u32 = model
-        .scalars
-        .get("partial_rotary_factor")
-        .copied()
-        .filter(|&f| (f - 1.0).abs() > 1e-9)
-        .map(|f| (f * head_dim as f64).round() as u32)
-        .unwrap_or(head_dim);
+    let rot_dim_val: u32 = rot_dim(model, head_dim);
     let rot_dim_lit = proc_macro2::Literal::u32_unsuffixed(rot_dim_val);
     // Per-layer-class geometry for hybrid sliding/global arches whose
     // classes differ in dims (Gemma4: sliding 256×8kv full-rope vs
@@ -15260,10 +15343,24 @@ pub fn emit_model(
             (quote! {}, quote! {}, quote! {}, quote! {})
         };
 
+    // ⭐ THE TARGET-EMITTER SEAM. The target compiler Cargo linked under the `target-emitter` key
+    // gets the model as neutral data and hands back the items it emits for it; they are spliced
+    // into the module as they come. Nothing here knows which target that is.
+    #[cfg(feature = "target-emitter")]
+    let target_tokens = {
+        let input = target_model_input(model, fuf, inferred, workloads, tp_world_size);
+        crate::record_target_input(&input);
+        target_emitter::emit::emit_model(&input)
+    };
+    #[cfg(not(feature = "target-emitter"))]
+    let target_tokens = TokenStream::new();
+
     let tokens = quote! {
         #weights
 
         #ktir_bundle_const
+
+        #target_tokens
 
         #canonical_params_impl
 

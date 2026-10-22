@@ -208,11 +208,17 @@ const METAL_ONLY: &[&str] = &[
 /// Must agree with the arches `Cargo.toml`'s `spyre` feature enables; an arch listed there but not here
 /// is dropped by the `supported` gate below before its configs are read.
 const SPYRE_CAPABLE: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
-/// Arches the cuda backend lowers. Empty until the first arch's opcodes lower to CUDA.
+/// Arches the cuda backend lowers: every op of their prefill canonicals has a CUDA kernel. Each
+/// model of one emits its per-bucket `static` CUDA tapes (`CUDA_TAPES`).
+///
+/// Listed per arch, built per stem: not every config of a listed arch lowers. qwen3-5's
+/// `qwen3.5-0.8b-parity-tiny` has GEMMs of n = 128, off the bf16 GEMM's 256-column tile, so the
+/// arch-wide `model/qwen3-5` panics at build time naming that refusal; build `model/qwen3.5-0.8b`
+/// (CLAUDE.md asks for a per-stem build anyway).
 ///
 /// Must agree with src/lib.rs gates; an arch selected under `cuda` but not listed here is refused
 /// by name below rather than silently dropped.
-const CUDA_CAPABLE: &[&str] = &[];
+const CUDA_CAPABLE: &[&str] = &["qwen3-5"];
 
 /// A checkpoint config's identity for matching: its architecture and shape (hidden size, layers,
 /// vocab size; the text decoder's when `text_config` nests it).
