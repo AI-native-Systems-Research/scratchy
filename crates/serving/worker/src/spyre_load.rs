@@ -2568,18 +2568,27 @@ impl SpyreWorker {
                             continue;
                         }
                     };
+                    // ⭐ THE RUNG'S OWN RESULT STAMP, not the solo wiring's `result_id`. The argmax
+                    // mint renumbers the ONE-REQUEST graph — seven staged tables spliced into the
+                    // source range shift every op output up — so a tid stated on the minted wiring
+                    // names a different tensor, or none, in this unminted rung's layout (the load
+                    // WARN that fired when the re-point landed: the stick's tid is past the rung's
+                    // whole tensor range). A wiring fact is graph-local; the row this loop needs is
+                    // the rung's own graph result, which its bake stated the one way that survives
+                    // renumbering: the `SegRole::Logits` stamp, read here as `layout.logits()`. The
+                    // geometry check below stays a CHECK — refusing a rung whose result is not N
+                    // whole rows — never the search that finds it.
                     let logits = rcode
                         .layout
-                        .place_of_tid(dparsed.result_id as u32)
+                        .logits()
                         .and_then(|p| {
                             LogitsGeom::from_placement(p.size, rung_width, vocab as usize)
                         });
                     let Some(logits) = logits else {
                         warn!(
-                            "[spyre-worker] sendnn: decode batch rung seqs={rn}: its baked logits \
-                             placement (t{}) is missing or is not {rn} whole rows of >= {vocab} — \
-                             SKIPPED",
-                            dparsed.result_id
+                            "[spyre-worker] sendnn: decode batch rung seqs={rn}: its own baked \
+                             logits placement (the SegRole::Logits stamp) is missing or is not \
+                             {rn} whole rows of >= {vocab} — SKIPPED"
                         );
                         continue;
                     };
