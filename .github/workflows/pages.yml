@@ -11,6 +11,8 @@ on:
   # Every pull request builds the site and checks its links without deploying: the site renders
   # files from all over the repo (docs/, the DSLs, site data), so any change can break it.
   pull_request:
+  # Also started on a metal round's branch by its bot (metal-round.yml), which builds without
+  # deploying: only main deploys.
   workflow_dispatch:
 
 permissions:
@@ -18,11 +20,12 @@ permissions:
   pages: write
   id-token: write
 
-# One deploy at a time; let an in-flight run finish rather than cancelling it. A pull request's
-# build is its own group, superseded by its next push.
+# One deploy at a time; let an in-flight run finish rather than cancelling it. Anything but main
+# (a pull request, or a dispatch on a metal round's branch) only builds, in a group of its own
+# superseded by its next run, so it never queues behind or cancels a deploy.
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('pages-{0}', github.ref) || 'pages' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && 'pages' || format('pages-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' || github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -50,16 +53,16 @@ jobs:
       - name: Build site
         run: cargo run --release --manifest-path site/Cargo.toml
 
-      - if: github.event_name != 'pull_request'
+      - if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: actions/configure-pages@v6
 
-      - if: github.event_name != 'pull_request'
+      - if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v5
         with:
           path: site/_site
 
   deploy:
-    if: github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment:

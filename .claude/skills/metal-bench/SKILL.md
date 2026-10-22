@@ -68,8 +68,8 @@ caffeinate -dims ./scripts/bench_metal_matrix.sh --unpinned --fail-fast
 and go on to step 4. In the closing summary say: the commit benchmarked and
 where it is against upstream `main`, whether the tree was dirty (the JSON
 records it as `repo.dirty`), the models run and skipped, and the run's
-length. A quick run goes on the site like a full one (step 5), unless the
-tree was dirty or the commit isn't on `main`: then say so and ask.
+length. A clean quick run goes to the round issue (step 7, quick run), not
+straight into `site/data/metal`: skip steps 5 and 6.
 
 ## 1. One-time setup (per Mac)
 
@@ -436,11 +436,67 @@ new run's date and commit.
 
 ## 7. Share or commit
 
-Either send the JSON to whoever collects the runs from all the Macs, or
-commit it on a new branch and open a PR titled:
+**A full run** goes in its own PR. Commit it on a new branch and open a PR
+titled:
 
 ```
 data(site): <machine> Metal run at <short-sha>
 ```
 
-**Done when:** the user has the JSON or the PR link.
+**A quick run** goes to the metal quick round: one open issue, labelled
+`metal-round`, whose comments collect a quick run from each of the four Macs
+(base M5, M3 Pro, M4 Max, M5 Max). Once all four are in, a workflow
+(`.github/workflows/metal-round.yml`) opens a PR adding the newest run per Mac
+to `site/data/metal` and closes the issue; an admin merges the PR. Post only a
+run that exited 0; a run that went wrong is not posted. A second run of the
+same Mac before the round closes is posted too: the newest run, by when it
+ran, is the one committed. Only runs from the repo's owners, members and
+collaborators count.
+
+First check it can go in a round: a quick run, scratchy alone at its
+defaults, one of the four Macs, a clean tree, and a commit on upstream `main`:
+
+```bash
+git fetch -q "$up" main
+python3 scripts/metal_round.py check "$f" --main-ref "$up/main"
+```
+
+If it says `not for a round`, tell the user why and stop: nothing is
+posted. Otherwise ask the user whether to post it, and post only on a yes.
+Then find the round's open issue, or open one:
+
+```bash
+repo=AI-native-Systems-Research/scratchy
+n=$(gh issue list -R "$repo" --label metal-round --state open --json number --jq '.[0].number')
+if [ -z "$n" ]; then
+  n=$(gh issue create -R "$repo" --label metal-round \
+    --title "Metal quick round $(date -u +%F)" \
+    --body "Collects one scratchy quick run from each Mac (base M5, M3 Pro, M4 Max, M5 Max) as comments, posted by the metal-bench skill. Once all four are in, the Metal round workflow opens a PR adding the newest run per Mac to site/data/metal, and closes this issue." \
+    | grep -o '[0-9]*$')
+fi
+```
+
+Two people opening a round at once makes two issues: post to the lower
+number, and close the other.
+
+Post the run as a comment: one line, then the JSON, compact (no indents: a
+64 GB Mac's run with every cell is about 64 KB indented, at GitHub's comment
+limit), in a collapsed block:
+
+```bash
+{
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["machine"]["chip"], "quick run,", d["generated_utc"] + ", at", d["repo"]["sha"][:8])' "$f"
+  printf '\n<details><summary>run JSON</summary>\n\n```json\n'
+  python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), separators=(",", ":")))' "$f"
+  printf '```\n</details>\n'
+} > /tmp/metal-round-comment.md
+wc -c < /tmp/metal-round-comment.md
+[ "$(wc -c < /tmp/metal-round-comment.md)" -le 65536 ] && gh issue comment "$n" -R "$repo" --body-file /tmp/metal-round-comment.md
+```
+
+If it's over 65,536 bytes, GitHub won't take it: tell the user, and don't
+split it. Within a minute the round's status comment on the issue lists this Mac
+as in, or a reply says why the run wasn't counted.
+
+**Done when:** the user has the PR link (a full run) or the comment's link
+and the round's status (a quick run).

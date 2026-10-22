@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The metal round's bot commit (metal-round.yml) starts no workflows by itself, so the bot
+  # starts this one on the round's branch.
+  workflow_dispatch:
 
 permissions:
   contents: read
