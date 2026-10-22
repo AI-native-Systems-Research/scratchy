@@ -602,6 +602,24 @@ impl AsyncEngine {
         }
     }
 
+    /// Where `prompt` leaves its model's thinking ([`PromptThinking::of`]), whitespace judged by
+    /// decoding: a prompt that ends with a closed think block closed thinking (thinking off).
+    ///
+    /// [`PromptThinking::of`]: scratchy_core_common::sampling::PromptThinking::of
+    fn prompt_thinking(
+        &self,
+        tokens: scratchy_core_common::sampling::ThinkTokens,
+        prompt: &[u32],
+    ) -> scratchy_core_common::sampling::PromptThinking {
+        let blank = |tail: &[u32]| match &self.tokenizer {
+            Some(tokenizer) => tokenizer
+                .decode(tail, false)
+                .is_ok_and(|s| s.trim().is_empty()),
+            None => tail.is_empty(),
+        };
+        scratchy_core_common::sampling::PromptThinking::of(tokens, prompt, blank)
+    }
+
     /// Set the reasoning parser on this engine.
     pub fn set_reasoning_parser(&mut self, parser: Arc<dyn ReasoningParser>) {
         self.reasoning_parser = Some(parser);
@@ -777,13 +795,8 @@ impl AsyncEngine {
         let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
 
         // Tokenize prompt once.
-        let mut ec_request =
-            self.chat_to_engine_request(&base_id, &request, &mut sampling_params)?;
-        let mut prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
-
-        // Truncate prompt tokens from the left (keep the last N).
-        truncate_prompt(&mut prompt_token_ids, request.truncate_prompt_tokens)?;
-        ec_request.prompt_token_ids = Some(prompt_token_ids.clone());
+        let ec_request = self.chat_to_engine_request(&base_id, &request, &mut sampling_params)?;
+        let prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
 
         let num_prompt_tokens = prompt_token_ids.len() as u32;
 
@@ -1096,13 +1109,8 @@ impl AsyncEngine {
         let n = validate_n(request.n)?;
 
         let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
-        let mut ec_request =
-            self.chat_to_engine_request(&base_id, &request, &mut sampling_params)?;
-        let mut prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
-
-        // Truncate prompt tokens from the left (keep the last N).
-        truncate_prompt(&mut prompt_token_ids, request.truncate_prompt_tokens)?;
-        ec_request.prompt_token_ids = Some(prompt_token_ids.clone());
+        let ec_request = self.chat_to_engine_request(&base_id, &request, &mut sampling_params)?;
+        let prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
 
         let num_prompt_tokens = prompt_token_ids.len() as u32;
 
@@ -3201,12 +3209,16 @@ impl AsyncEngine {
             cache_breakpoints.clear();
         }
 
-        // ⭐ A REASONING MODEL THINKS BEFORE ITS GRAMMAR APPLIES (#793), where the prompt leaves
-        // it thinking or lets it start to.
+        // Truncate prompt tokens from the left (keep the last N): the prompt the model reads.
+        truncate_prompt(&mut token_ids, request.truncate_prompt_tokens)?;
+
+        // ⭐ A REASONING MODEL THINKS BEFORE ITS GRAMMAR APPLIES (#793), where the prompt it reads
+        // leaves it thinking or lets it start to.
         sampling_params.think_first =
             match (&sampling_params.guided_grammar, &self.reasoning_parser) {
                 (Some(_), Some(parser)) => (parser.think_tokens()).and_then(|tokens| {
-                    scratchy_core_common::sampling::ThinkFirst::of(tokens, &token_ids)
+                    let prompt = self.prompt_thinking(tokens, &token_ids);
+                    scratchy_core_common::sampling::ThinkFirst::of(tokens, prompt)
                 }),
                 _ => None,
             };
@@ -4545,6 +4557,38 @@ mod tests {
             None,
             "no reasoning parser"
         );
+    }
+
+    /// The engine reads a prompt as having closed thinking only where it ends with a closed think
+    /// block, judging the tail by decoding it: whitespace alone after the close (a template with
+    /// thinking off), not an earlier turn's thinking with the conversation after it. Byte-level
+    /// test tokenizer; `T` and `U` stand in for `<think>` and `</think>`.
+    #[test]
+    fn a_prompt_closes_thinking_only_where_it_ends_with_a_closed_think_block() {
+        use scratchy_core_common::sampling::{PromptThinking, ThinkTokens};
+        let engine = make_test_engine_with_tokenizer();
+        let tokenizer = engine.tokenizer.clone().unwrap();
+        let ids = |text: &str| tokenizer.encode(text, false).unwrap();
+        let [open, close] = [ids("T")[0], ids("U")[0]];
+        let tokens = ThinkTokens { open, close };
+        let reads = |text: &str| engine.prompt_thinking(tokens, &ids(text));
+        assert_eq!(reads("hi T"), PromptThinking::Open);
+        assert_eq!(
+            reads("hi T\n\nU\n\n"),
+            PromptThinking::Closed,
+            "thinking off"
+        );
+        assert_eq!(
+            reads("hi TaU"),
+            PromptThinking::Closed,
+            "closed at the very end"
+        );
+        assert_eq!(
+            reads("hi TaU then a tool call"),
+            PromptThinking::Absent,
+            "an earlier turn's"
+        );
+        assert_eq!(reads("hi"), PromptThinking::Absent);
     }
 
     #[test]

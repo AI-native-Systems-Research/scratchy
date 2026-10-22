@@ -45,6 +45,33 @@ pub struct ThinkTokens {
     pub close: u32,
 }
 
+/// Where a prompt leaves its model's thinking, read from its last `open` and `close`
+/// ([`Self::of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptThinking {
+    /// Its last `open` has no `close` after it: the template opened thinking.
+    Open,
+    /// It ends with a closed think block, `close` and nothing but whitespace after it: the
+    /// template closed thinking, as one with thinking off writes `<think>\n\n</think>\n\n`.
+    Closed,
+    /// Neither: no thinking, or an earlier turn's finished thinking with the conversation after it
+    /// (a tool loop's kept `<think>…</think>`), which the reply's own thinking may follow.
+    Absent,
+}
+
+impl PromptThinking {
+    /// Where `prompt` leaves thinking. `blank` says whether tokens are whitespace alone: the
+    /// engine decodes them.
+    pub fn of(tokens: ThinkTokens, prompt: &[u32], blank: impl Fn(&[u32]) -> bool) -> Self {
+        let last = |id: u32| prompt.iter().rposition(|&t| t == id);
+        match (last(tokens.open), last(tokens.close)) {
+            (Some(open), close) if close.is_none_or(|close| close < open) => Self::Open,
+            (_, Some(close)) if blank(&prompt[close + 1..]) => Self::Closed,
+            _ => Self::Absent,
+        }
+    }
+}
+
 /// ⭐ A REASONING MODEL THINKS BEFORE ITS GRAMMAR APPLIES (#793), as vLLM holds a request's
 /// grammar back until its reasoning parser sees reasoning end. Where a reply starts, which the
 /// prompt decides ([`Self::of`]).
@@ -59,18 +86,16 @@ pub enum ThinkFirst {
 }
 
 impl ThinkFirst {
-    /// Where a reply after `prompt` starts. The prompt's last `open` with no `close` after it
-    /// leaves the model thinking. A `close` after the last `open` means the template closed
-    /// thinking (thinking off): the grammar applies from the first token, so `None`. A prompt with
-    /// neither lets the reply open thinking.
-    pub fn of(tokens: ThinkTokens, prompt: &[u32]) -> Option<Self> {
-        let last = |id: u32| prompt.iter().rposition(|&t| t == id);
-        match (last(tokens.open), last(tokens.close)) {
-            (None, None) => Some(Self::MayOpen(tokens)),
-            (Some(open), close) if close.is_none_or(|close| close < open) => Some(Self::Thinking {
+    /// Where a reply starts after a prompt that leaves thinking `prompt`: thinking where the
+    /// prompt opened it, under the grammar from the first token where the prompt closed it
+    /// (thinking off: `None`), and free to open it otherwise.
+    pub fn of(tokens: ThinkTokens, prompt: PromptThinking) -> Option<Self> {
+        match prompt {
+            PromptThinking::Open => Some(Self::Thinking {
                 close: tokens.close,
             }),
-            _ => None,
+            PromptThinking::Closed => None,
+            PromptThinking::Absent => Some(Self::MayOpen(tokens)),
         }
     }
 }
@@ -485,35 +510,36 @@ pub struct LogprobsOutput {
 mod tests {
     use super::*;
 
-    /// A reply starts thinking where its prompt left thinking open, may open it where the prompt
-    /// has none, and is the grammar's from the first token where the prompt closed thinking
-    /// (thinking off).
+    /// A prompt opens thinking where its last `<think>` has no `</think>` after it, and closes it
+    /// where it ends with a closed think block (whitespace alone after the close). An earlier
+    /// turn's finished thinking, with the conversation after it, closes nothing: the reply's own
+    /// thinking may follow (a tool loop). A reply starts thinking, under the grammar, or free to
+    /// open thinking, accordingly.
     #[test]
     fn a_reply_starts_thinking_where_its_prompt_leaves_it() {
+        use PromptThinking::{Absent, Closed, Open};
         let tokens = ThinkTokens { open: 7, close: 8 };
+        // 0 is whitespace here; every other token is text.
+        let blank = |tail: &[u32]| tail.iter().all(|&t| t == 0);
+        let of = |prompt: &[u32]| PromptThinking::of(tokens, prompt, blank);
+        assert_eq!(of(&[1, 2, 7]), Open, "opened by the template");
+        assert_eq!(of(&[1, 2, 7, 0]), Open, "with whitespace after");
+        assert_eq!(of(&[1, 7, 3, 8, 4, 7, 5]), Open, "opened again");
+        assert_eq!(of(&[1, 7, 0, 8, 0, 0]), Closed, "closed: thinking off");
+        assert_eq!(of(&[1, 7, 8]), Closed, "closed at the very end");
+        assert_eq!(
+            of(&[1, 7, 3, 8, 4, 5]),
+            Absent,
+            "an earlier turn's thinking"
+        );
+        assert_eq!(of(&[1, 2, 3]), Absent);
+        assert_eq!(of(&[]), Absent);
+
         let thinking = Some(ThinkFirst::Thinking { close: 8 });
+        assert_eq!(ThinkFirst::of(tokens, Open), thinking);
+        assert_eq!(ThinkFirst::of(tokens, Closed), None);
         assert_eq!(
-            ThinkFirst::of(tokens, &[1, 2, 7]),
-            thinking,
-            "opened by the template"
-        );
-        assert_eq!(
-            ThinkFirst::of(tokens, &[1, 7, 3, 8, 4, 7, 5]),
-            thinking,
-            "opened again"
-        );
-        assert_eq!(
-            ThinkFirst::of(tokens, &[1, 7, 8, 2]),
-            None,
-            "closed: thinking off"
-        );
-        assert_eq!(ThinkFirst::of(tokens, &[1, 8]), None, "closed alone");
-        assert_eq!(
-            ThinkFirst::of(tokens, &[1, 2, 3]),
-            Some(ThinkFirst::MayOpen(tokens))
-        );
-        assert_eq!(
-            ThinkFirst::of(tokens, &[]),
+            ThinkFirst::of(tokens, Absent),
             Some(ThinkFirst::MayOpen(tokens))
         );
     }
