@@ -3,6 +3,6 @@
   "tagline": "One short recorded session, replayed on both engines, to prove the measuring chain works end to end.",
   "notice": {
     "label": "Smoke test.",
-    "text": "These numbers come from one 6-turn toy session (a one-line bug fix), recorded once and replayed 3 times on each engine to check that recording, replay and this page work together. They are not a benchmark result. ollama's figures are optimistic: it cannot clear its cache between repeats, so its repeats 2 and 3 were served from cache, while scratchy's were not. On the first repeat, where both engines started cold, median time to first token was 115 ms on scratchy and 173 ms on ollama, and time per token was 7.4 ms on both. Every cell not measured here says why. The real results go on the main leaderboard."
+    "text": "These numbers come from one 6-turn toy session (a one-line bug fix), recorded once and replayed on each engine to check that recording, replay and this page work together. They are not a benchmark result. Each engine ran one warm-up pass, reported separately and kept out of these numbers, then 3 measured repeats, each starting with an empty cache: scratchy clears its cache, and ollama's model is unloaded and loaded again. Every cell not measured here says why. The real results go on the main leaderboard."
   }
 }
