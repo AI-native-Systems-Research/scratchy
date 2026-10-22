@@ -43,7 +43,7 @@ use scratchy_target_cuda::step::{
     GateSplitBf16, GemmBf16, RmsNormBf16, RopeAppendBf16, RopeBf16,
 };
 use scratchy_target_cuda::tape::{
-    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, KvTape, RotaryTable, WeightIx,
+    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, KvTape, RotaryTable, TapeInput, WeightIx,
 };
 
 use super::chains::with_hidden;
@@ -344,7 +344,7 @@ pub static ATTN_LAYER_M128: CudaTape = CudaTape {
         ],
         total_bytes: 4867328,
     },
-    input: span(0, 262144),
+    input: TapeInput::Hidden(span(0, 262144)),
     result: span(4063232, 262144),
     weight_bytes: ATTN_LAYER_WEIGHT_BYTES,
     steps: &[
@@ -385,7 +385,7 @@ pub static ATTN_LAYER_M256: CudaTape = CudaTape {
         ],
         total_bytes: 9733888,
     },
-    input: span(0, 524288),
+    input: TapeInput::Hidden(span(0, 524288)),
     result: span(8126464, 524288),
     weight_bytes: ATTN_LAYER_WEIGHT_BYTES,
     steps: &[

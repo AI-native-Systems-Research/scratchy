@@ -31,6 +31,13 @@ half = { workspace = true }
 # `Serialize` on the tape and step types, so CUDA's compiler renders a lowered tape as the tokens
 # of a `static` (`scratchy-const-tokens`). Plain Rust: no toolchain.
 serde = { workspace = true }
+# The weight loader (`weights`, `runtime::load_weights`) reads the checkpoint through the shared
+# safetensors reader, `GpuWeights` (one reader, and the VL name aliases), for its host-side reads
+# only; `scratchy-tensors` holds the `DeviceAllocator` trait its stub allocator implements, and
+# `anyhow` that trait's error type. All three are plain Rust, with no backend code.
+scratchy-layers = { path = "../../layers" }
+scratchy-tensors = { path = "../../tensors" }
+anyhow = { workspace = true }
 
 [dev-dependencies]
 # The tape tests build their fixtures with the shared lowering types and lower them with CUDA's
@@ -38,6 +45,8 @@ serde = { workspace = true }
 # one copy of this library, the one the compiler links too.
 scratchy-subtile = { path = "../../compiler/subtile" }
 scratchy-target-cuda-compiler = { path = "compiler" }
+# `weight_table` writes a tiny synthetic checkpoint with `safetensors::serialize`.
+safetensors = { workspace = true }
 
 # The bf16 GEMM against a CPU reference, on the GPU. Not built without `nvcc`.
 [[test]]
@@ -72,6 +81,17 @@ required-features = ["nvcc"]
 # The hand-written tapes against what CUDA's compiler lowers. No toolchain needed.
 [[test]]
 name = "tape_layout"
+
+# The weight table's checks and host staging against a synthetic checkpoint, in both VL name
+# orderings. No toolchain needed.
+[[test]]
+name = "weight_table"
+
+# The embed row gather against an exact reference over a NaN-poisoned output, and its launcher's
+# refusals, on the GPU. Not built without `nvcc`.
+[[test]]
+name = "embed"
+required-features = ["nvcc"]
 
 # The tape player on the GPU: GEMM chains through the arena against a CPU reference.
 [[test]]

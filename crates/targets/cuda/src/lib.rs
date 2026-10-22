@@ -27,3 +27,5 @@ pub mod runtime;
 pub mod step;
 /// One bucket's tape as static data: the arena layout and the steps.
 pub mod tape;
+/// One model's weight table, and the host half of its loader: the checks and the staging.
+pub mod weights;

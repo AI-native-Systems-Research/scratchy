@@ -39,15 +39,37 @@ impl DeviceBuffer {
 
     /// A device copy of `host` (bf16 bits), allocated through `device`; returns once it landed.
     pub fn upload(device: &CudaDevice, host: &[u16]) -> Result<Self, CudaError> {
-        let buf = Self::alloc(device, std::mem::size_of_val(host) as u64)?;
-        // SAFETY: `buf` holds exactly `size_of_val(host)` bytes, and `host` stays borrowed until
-        // the stream wait below has returned.
+        // SAFETY: `host` is `size_of_val(host)` bytes, borrowed for the call.
+        unsafe { Self::upload_raw(device, host.as_ptr().cast(), std::mem::size_of_val(host)) }
+    }
+
+    /// A device copy of `host`'s bytes, allocated through `device` (one `cudaMalloc` and one
+    /// copy, as [`Self::upload`]); returns once it landed. The weight loader's upload: a weight's
+    /// staged bytes, whatever its element type.
+    pub fn upload_bytes(device: &CudaDevice, host: &[u8]) -> Result<Self, CudaError> {
+        // SAFETY: `host` is `host.len()` bytes, borrowed for the call.
+        unsafe { Self::upload_raw(device, host.as_ptr().cast(), host.len()) }
+    }
+
+    /// A device copy of the `bytes` host bytes at `host`.
+    ///
+    /// # Safety
+    ///
+    /// `host` must point to `bytes` readable host bytes for the whole call.
+    unsafe fn upload_raw(
+        device: &CudaDevice,
+        host: *const c_void,
+        bytes: usize,
+    ) -> Result<Self, CudaError> {
+        let buf = Self::alloc(device, bytes as u64)?;
+        // SAFETY: `buf` holds exactly `bytes` bytes, and the caller keeps `host`'s `bytes` bytes
+        // readable until the stream wait below has returned.
         check(
             unsafe {
                 ffi::cudaMemcpyAsync(
                     buf.ptr,
-                    host.as_ptr().cast(),
-                    std::mem::size_of_val(host),
+                    host,
+                    bytes,
                     ffi::MEMCPY_HOST_TO_DEVICE,
                     DEFAULT_STREAM,
                 )

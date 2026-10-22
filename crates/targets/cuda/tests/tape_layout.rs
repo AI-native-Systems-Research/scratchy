@@ -38,7 +38,7 @@ use scratchy_subtile::subtile_ir::{
 };
 use scratchy_subtile::subtile_tape::Instr;
 use scratchy_target_cuda::step::{CudaStep, GemmBf16};
-use scratchy_target_cuda::tape::{ArenaOffset, CUDA_ARENA_ALIGN, CudaTape};
+use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, CUDA_ARENA_ALIGN, CudaTape, TapeInput};
 use scratchy_target_cuda_compiler::canonical::{
     ArenaRefusal, AttnShapeRule, CanonicalAt, CanonicalRefusal, CudaGdnFacts, CudaModelFacts,
     GateShapeRule, GdnRegions, GdnShapeRule, GdnWidths, GemmShapeRule, KvCacheRefusal,
@@ -46,6 +46,13 @@ use scratchy_target_cuda_compiler::canonical::{
     plan_canonical,
 };
 use scratchy_target_cuda_compiler::steps_from_tape::{StepCx, TapeStep, lower_step};
+
+const fn span(offset: u64, bytes: u64) -> ArenaSpan {
+    ArenaSpan {
+        offset: ArenaOffset(offset),
+        bytes,
+    }
+}
 
 fn lower_with(
     l: &LoweredDecode,
@@ -105,7 +112,7 @@ fn the_two_gemm_numbers() {
             [0, bytes[0], bytes[0] + bytes[1]]
         );
         assert_eq!(tape.arena.total_bytes, bytes.iter().sum::<u64>());
-        assert_eq!((tape.input.offset.0, tape.input.bytes), (0, bytes[0]));
+        assert_eq!(tape.input, TapeInput::Hidden(span(0, bytes[0])));
         assert_eq!(
             (tape.result.offset.0, tape.result.bytes),
             (bytes[0] + bytes[1], bytes[2])
@@ -340,7 +347,7 @@ fn the_mlp_numbers() {
         // x, n (then d), gate, up, s, a, y.
         assert_eq!(tape.arena.colour_bytes, [h, h, i, i, i, i, h]);
         assert_eq!(tape.arena.total_bytes, 3 * h + 4 * i);
-        assert_eq!((tape.input.offset.0, tape.input.bytes), (0, h));
+        assert_eq!(tape.input, TapeInput::Hidden(span(0, h)));
         assert_eq!(
             (tape.result.offset.0, tape.result.bytes),
             (tape.arena.colour_offsets[6], h)

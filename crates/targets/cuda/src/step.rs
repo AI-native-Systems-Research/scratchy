@@ -18,6 +18,10 @@ use crate::tape::{ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, WeightIx};
 /// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum CudaStep {
+    /// The token-embedding row gather, the forward's first step when its input is token ids
+    /// (`kernels/embed_bf16.cu`): metal's `MetalStep::Embed`. Not lowered from an op of the
+    /// shared tape: it fills the embedded hidden, colour 0, which the tape's first ops read.
+    Embed(EmbedBf16),
     /// The bf16 GEMM, lowered from `SubOp::MatmulTile` when `n` is a multiple of its tile's
     /// (`kernels/gemm_bf16.cu`).
     Gemm(GemmBf16),
@@ -50,6 +54,26 @@ pub enum CudaStep {
     /// `SubOp::GatedDeltaNet`: four stream-ordered launches, `kernels/gdn_conv1d.cu`,
     /// `kernels/gdn_gating.cu`, `kernels/gdn_scan.cu` then `kernels/gdn_rms_norm_gated.cu`.
     GatedDeltaNet(GatedDeltaNetBf16),
+}
+
+/// The embed's `hidden` is a non-zero multiple of this (`kernels/embed_bf16.cu`: one 16-byte
+/// vector of 8 bf16 per thread and step); `rows`, `hidden` and `vocab` are non-zero, none above
+/// `i32::MAX`, and `rows · hidden` at most `i32::MAX`.
+pub const EMBED_BF16_COLS: u32 = 8;
+
+/// `out[r, :] = table[tokens[r], :]` for every one of the bucket's `rows`, padding rows included,
+/// bf16 copied bit for bit. `tokens` is the tape's token region (`rows` u32,
+/// [`crate::tape::TapeInput::TokenIds`]); `table` the `[vocab, hidden]` bf16 embedding table;
+/// `out` the embedded hidden, `[rows, hidden]`. An id at or above `vocab` writes a `+0.0` row and
+/// reads nothing: the worker refuses such an id before any copy, so this is defence in depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct EmbedBf16 {
+    pub tokens: ArenaOffset,
+    pub table: WeightIx,
+    pub out: ArenaOffset,
+    pub rows: u32,
+    pub hidden: u32,
+    pub vocab: u32,
 }
 
 /// The bf16 GEMM's tile `(m, n, k)`: every `m`, `n` and `k` it takes is a non-zero multiple of
@@ -543,6 +567,30 @@ impl CudaStep {
     /// `CudaTape::validate` checks a tape against it.
     pub const fn extents(&self) -> Option<StepExtents> {
         match *self {
+            Self::Embed(EmbedBf16 {
+                tokens,
+                table,
+                out,
+                rows,
+                hidden,
+                vocab,
+            }) => {
+                let (Some(ob), Some(tb)) = (bf16_bytes(rows, hidden), bf16_bytes(vocab, hidden))
+                else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [Some(span(tokens, u32_bytes(rows))), None, None, None],
+                    writes: span(out, ob),
+                    second_write: None,
+                    weight: Some(WeightRead {
+                        ix: table,
+                        bytes: tb,
+                    }),
+                    kv: None,
+                    gdn: None,
+                })
+            }
             Self::Gemm(GemmBf16 { a, b, c, m, n, k })
             | Self::GemmNarrow(GemmBf16 { a, b, c, m, n, k }) => {
                 let (Some(ab), Some(bb), Some(cb)) =
@@ -766,6 +814,26 @@ impl CudaStep {
                     gdn: Some(layer),
                 })
             }
+        }
+    }
+}
+
+impl CudaStep {
+    /// The weight index the step reads, for the compiler to rewrite (two indices naming one
+    /// checkpoint tensor become one). Each arm is [`Self::extents`]' `weight`.
+    pub fn weight_mut(&mut self) -> Option<&mut WeightIx> {
+        match self {
+            Self::Embed(EmbedBf16 { table, .. }) => Some(table),
+            Self::Gemm(GemmBf16 { b, .. }) | Self::GemmNarrow(GemmBf16 { b, .. }) => Some(b),
+            Self::RmsNorm(RmsNormBf16 { gain, .. }) => Some(gain),
+            Self::GatedDeltaNet(GatedDeltaNetBf16 { bundle, .. }) => Some(bundle),
+            Self::Add(_)
+            | Self::SiluMul(_)
+            | Self::Rope(_)
+            | Self::GateSplit(_)
+            | Self::GateApply(_)
+            | Self::RopeAppend(_)
+            | Self::AttnPrefill(_) => None,
         }
     }
 }

@@ -7230,6 +7230,7 @@ fn bounds_for_wp(
 /// Target-neutral: every value is a fact about the model.
 #[cfg(feature = "target-emitter")]
 fn target_model_input(
+    program: &Program,
     model: &ModelParams,
     fuf: &Fuf,
     inferred: &crate::shape::Inferred,
@@ -7281,10 +7282,36 @@ fn target_model_input(
                 conv_kernel: need("linear_conv_kernel_dim"),
             }
         });
+    // Every weight a canonical binds, named as the checkpoint names it. A tied lm_head is lent the
+    // embedding table's prefix, as every target's loader reads it.
+    use scratchy_forward_compiler::LentWeight;
+    let lm_head = program.weights.find(&["lm_head"]);
+    let weights: std::collections::BTreeSet<(u32, Option<UnrollIndex>)> = (buckets.iter())
+        .flat_map(|b| b.lowered.bindings.iter())
+        .filter_map(|b| match *b {
+            scratchy_subtile::handoff::SourceBinding::Weight { id, index } => Some((id, index)),
+            _ => None,
+        })
+        .collect();
+    let weight_prefixes = (weights.into_iter())
+        .map(|(id, index)| {
+            let own =
+                || safetensors_prefix(program.weight_naming(), &model.arch, WeightId(id), index);
+            let prefix = match (lm_head, index) {
+                (Some(head), None) if head == WeightId(id) => {
+                    lent_weight_prefix(program, fuf, model, LentWeight::LmHead).unwrap_or_else(own)
+                }
+                _ => own(),
+            };
+            (id, index, prefix)
+        })
+        .collect();
     TargetModelInput {
         stem: stem.clone(),
         buckets,
         unlowered,
+        weight_prefixes,
+        embed_prefix: lent_weight_prefix(program, fuf, model, LentWeight::EmbedTokens),
         facts: TargetModelFacts {
             head_dim,
             rot_dim: rot_dim(model, head_dim),
@@ -15348,7 +15375,7 @@ pub fn emit_model(
     // into the module as they come. Nothing here knows which target that is.
     #[cfg(feature = "target-emitter")]
     let target_tokens = {
-        let input = target_model_input(model, fuf, inferred, workloads, tp_world_size);
+        let input = target_model_input(program, model, fuf, inferred, workloads, tp_world_size);
         crate::record_target_input(&input);
         target_emitter::emit::emit_model(&input)
     };

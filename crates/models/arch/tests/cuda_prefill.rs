@@ -4,8 +4,10 @@
 //! The tapes are `CUDA_TAPES`, exactly as `#[forward]` emitted them; the weights are synthetic,
 //! each buffer sized from the tapes' `weight_bytes` and filled by what reads it: a GEMM's `[N, K]`
 //! matrix uniform in ±1/√K, a norm's zero-centred gain in ±0.1, a GDN layer's packed f32 bundle
-//! in the ranges the GDN kernel tests use. The input is the embedded hidden, rows uniform in ±1
-//! (embedding is not a tape step yet). Checks:
+//! in the ranges the GDN kernel tests use, the embedding table's rows uniform in ±1 (which the
+//! tied lm_head reads too, a `[vocab, hidden]` matrix, so it is filled as a matrix of `k =
+//! hidden`). The input is token ids, uniform over the vocabulary and seeded; padding rows are id
+//! 0. Checks:
 //!
 //! - (a) the worker takes all four tapes, and its arena is the largest tape's;
 //! - (b) a fresh 300-token forward in the m=512 bucket gives finite logits on every real row;
@@ -21,7 +23,9 @@
 //! disjoint from the first's, so a run that failed to write its cache or state cannot pass by
 //! reading the other's.
 //! - (g) a KV sequence and a GDN sequence that disagree on fresh are refused before any copy;
-//! - (h) the worker allocates the weights, the arena and the two pools, and a forward nothing.
+//! - (h) the worker allocates the weights, the arena and the two pools, and a forward nothing;
+//! - (i) a token id outside the vocabulary, a count other than the bucket's and hidden rows are
+//!   refused before any copy.
 //!
 //! Built only under `nvcc` (`required-features`), and needs an sm_90 GPU: no GPU fails rather
 //! than skips. Every check prints its line before a test fails, so one run reports every number.
@@ -36,10 +40,12 @@ use half::bf16;
 use numerics::{bf16_inputs, compare, f32_inputs, f32_to_halves};
 use scratchy_models::qwen3_5::qwen3_5_0_8b::CUDA_TAPES;
 use scratchy_target_cuda::runtime::{
-    CudaDevice, CudaWorker, DeviceBuffer, ForwardError, GdnPoolConfig, GdnSequence, KvPoolConfig,
-    KvSequence,
+    CudaDevice, CudaWorker, DeviceBuffer, ForwardError, GdnPoolConfig, GdnSequence, Input,
+    KvPoolConfig, KvSequence,
 };
-use scratchy_target_cuda::step::{CudaStep, GatedDeltaNetBf16, GemmBf16, gdn_bundle, gdn_conv_dim};
+use scratchy_target_cuda::step::{
+    CudaStep, EmbedBf16, GatedDeltaNetBf16, GemmBf16, gdn_bundle, gdn_conv_dim,
+};
 use scratchy_target_cuda::tape::{ArenaSpan, CudaTape};
 
 const VOCAB: usize = 248_320;
@@ -91,6 +97,10 @@ fn roles() -> Vec<Option<Role>> {
     for tape in CUDA_TAPES {
         for step in tape.steps {
             match *step {
+                // The table the tied lm_head reads too: a `[vocab, hidden]` matrix.
+                CudaStep::Embed(EmbedBf16 { table, hidden, .. }) => {
+                    set(table.0, Role::Matrix { k: hidden })
+                }
                 CudaStep::Gemm(GemmBf16 { b, k, .. })
                 | CudaStep::GemmNarrow(GemmBf16 { b, k, .. }) => set(b.0, Role::Matrix { k }),
                 CudaStep::RmsNorm(n) => set(n.gain.0, Role::Gain),
@@ -219,15 +229,23 @@ impl Rig {
     }
 }
 
-/// The embedded hidden of a `tokens`-token sequence, rows uniform in ±1.
-fn sequence_rows(tokens: usize) -> Vec<u16> {
-    bf16_inputs(tokens * HIDDEN, 0x0812_E3B0)
+/// The token ids of a `tokens`-token sequence, uniform over the vocabulary, seeded.
+fn sequence_rows(tokens: usize) -> Vec<u32> {
+    let mut state = 0x0816_E3B0u64;
+    (0..tokens)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((state >> 33) % VOCAB as u64) as u32
+        })
+        .collect()
 }
 
-/// `rows` of hidden padded to a `tape`'s bucket: the padding rows are zero.
-fn padded(tape: &CudaTape, rows: &[u16]) -> Vec<u16> {
-    let mut x = vec![0u16; tape.input.bytes as usize / 2];
-    x[..rows.len()].copy_from_slice(rows);
+/// `ids` padded to a `tape`'s bucket: the padding rows are id 0.
+fn padded(tape: &CudaTape, ids: &[u32]) -> Vec<u32> {
+    let mut x = vec![0u32; tape.bucket_m as usize];
+    x[..ids.len()].copy_from_slice(ids);
     x
 }
 
@@ -256,17 +274,18 @@ const SEAT_B: Seat = Seat {
     slot: 1,
 };
 
-/// One forward of `rows` (`q` real rows) at `prefix_len`, in `seat`: the full result.
+/// One forward of `rows` (`q` real rows of token ids) at `prefix_len`, in `seat`: the full
+/// result.
 fn forward(
     worker: &mut CudaWorker<'_>,
     m: u32,
-    rows: &[u16],
+    rows: &[u32],
     prefix_len: u32,
     seat: Seat,
 ) -> Result<Vec<u16>, ForwardError> {
     let b = bucket(m);
     let tape = &CUDA_TAPES[b];
-    let q = (rows.len() / HIDDEN) as u32;
+    let q = rows.len() as u32;
     let slot = seat.slot;
     let kv = KvSequence {
         block_table: seat.blocks,
@@ -281,7 +300,7 @@ fn forward(
     let mut out = vec![0u16; tape.result.bytes as usize / 2];
     worker.forward(
         b,
-        &padded(tape, rows),
+        Input::TokenIds(&padded(tape, rows)),
         &positions(tape, prefix_len),
         Some(&kv),
         Some(&gdn),
@@ -364,14 +383,14 @@ fn a_the_worker_takes_every_tape() {
     let arena = w.arena_bytes();
     let largest = CUDA_TAPES.iter().map(|t| t.arena.total_bytes).max();
     eprintln!(
-        "(a) tapes={} arena_bytes={arena} (expect 2585019392, the largest tape's) kv_pool={:?} \
+        "(a) tapes={} arena_bytes={arena} (expect 2585035776, the largest tape's) kv_pool={:?} \
          gdn_pool={:?} {}",
         CUDA_TAPES.len(),
         w.kv_pool_bytes(),
         w.gdn_pool_bytes(),
-        verdict(arena == 2_585_019_392 && Some(arena) == largest)
+        verdict(arena == 2_585_035_776 && Some(arena) == largest)
     );
-    assert_eq!(arena, 2_585_019_392, "the worker's arena");
+    assert_eq!(arena, 2_585_035_776, "the worker's arena");
 }
 
 #[test]
@@ -488,8 +507,8 @@ fn f_a_chunked_sequence_matches_one_shot() {
     let one_shot = forward(&mut w, 512, &rows, 0, SEAT_A).expect("512 tokens in one forward");
     // The chunked run in the other blocks and slot: its continuation reads only what its own
     // first chunk wrote.
-    forward(&mut w, 512, &rows[..Q as usize * HIDDEN], 0, SEAT_B).expect("the first 300 tokens");
-    let rest = forward(&mut w, 512, &rows[Q as usize * HIDDEN..], Q, SEAT_B).expect("the last 212");
+    forward(&mut w, 512, &rows[..Q as usize], 0, SEAT_B).expect("the first 300 tokens");
+    let rest = forward(&mut w, 512, &rows[Q as usize..], Q, SEAT_B).expect("the last 212");
     let tail = 512 - Q as usize;
     let ok = bit_identical(
         "(f) rows 300..512: 300 fresh then 212 continuing, against one 512-token forward",
@@ -520,7 +539,7 @@ fn g_kv_and_gdn_must_agree_on_fresh() {
         let mut out = vec![0u16; tape.result.bytes as usize / 2];
         let got = worker.forward(
             bucket(512),
-            &x,
+            Input::TokenIds(&x),
             &positions(tape, prefix_len),
             Some(&kv),
             Some(&gdn),
@@ -563,4 +582,75 @@ fn h_the_worker_allocates_once() {
         verdict(ok)
     );
     assert!(ok, "the allocation counts are wrong");
+}
+
+/// The forward's token ids are checked before any copy: an id at or above the vocabulary, a count
+/// other than the bucket's rows, and hidden rows for a tape that takes ids are refused, and the
+/// result is untouched.
+#[test]
+fn i_token_ids_are_checked_before_any_copy() {
+    let r = rig();
+    let mut worker = r.worker();
+    let tape = &CUDA_TAPES[bucket(512)];
+    let mut ids = padded(tape, &sequence_rows(Q as usize));
+    ids[17] = VOCAB as u32;
+    let kv = KvSequence {
+        block_table: SEAT_A.blocks,
+        prefix_len: 0,
+        q_len: Q,
+    };
+    let gdn = GdnSequence {
+        slot: 0,
+        q_len: Q,
+        fresh: true,
+    };
+    let hidden = vec![0u16; 512 * HIDDEN];
+    let short = &ids[..511];
+    let cases: [(&str, Input<'_>, ForwardError); 3] = [
+        (
+            "id = vocab",
+            Input::TokenIds(&ids),
+            ForwardError::TokenOutOfVocab {
+                row: 17,
+                id: VOCAB as u32,
+                vocab: VOCAB as u32,
+            },
+        ),
+        (
+            "511 ids",
+            Input::TokenIds(short),
+            ForwardError::InputSize {
+                expected: 2048,
+                got: 2044,
+            },
+        ),
+        (
+            "hidden rows",
+            Input::Hidden(&hidden),
+            ForwardError::InputKind {
+                expected: "token ids",
+                got: "hidden rows",
+            },
+        ),
+    ];
+    let mut pass = true;
+    for (what, input, want) in cases {
+        let mut out = vec![0u16; tape.result.bytes as usize / 2];
+        let got = worker.forward(
+            bucket(512),
+            input,
+            &positions(tape, 0),
+            Some(&kv),
+            Some(&gdn),
+            &mut out,
+        );
+        let untouched = out.iter().all(|&b| b == 0);
+        let ok = got == Err(want.clone()) && untouched;
+        eprintln!(
+            "(i) {what}: {got:?} result_untouched={untouched} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(pass, "a bad token-id input was not refused before any copy");
 }

@@ -37,10 +37,47 @@ use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 use crate::kernels::{self, KernelError};
 use crate::rotary::fill_rotary_rows;
 use crate::step::{
-    AddBf16, AttnPrefillBf16, CudaStep, GateApplyBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16,
-    RmsNormBf16, RopeAppendBf16, RopeBf16, SiluMulBf16,
+    AddBf16, AttnPrefillBf16, CudaStep, EmbedBf16, GateApplyBf16, GateSplitBf16, GatedDeltaNetBf16,
+    GemmBf16, RmsNormBf16, RopeAppendBf16, RopeBf16, SiluMulBf16,
 };
-use crate::tape::{ArenaOffset, ArenaSpan, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape, TapeError};
+use crate::tape::{
+    ArenaOffset, ArenaSpan, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape, TapeError, TapeInput,
+};
+
+/// A forward's input, of the kind its tape takes ([`TapeInput`]).
+#[derive(Clone, Copy, Debug)]
+pub enum Input<'a> {
+    /// The embedded hidden, `[bucket_m, hidden]` bf16 bits.
+    Hidden(&'a [u16]),
+    /// One token id per bucket row, padding rows included (the caller pads).
+    TokenIds(&'a [u32]),
+}
+
+impl Input<'_> {
+    /// The input's name, for [`ForwardError::InputKind`].
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Hidden(_) => "hidden rows",
+            Self::TokenIds(_) => "token ids",
+        }
+    }
+
+    /// The input's bytes, as the forward uploads them.
+    fn bytes(&self) -> u64 {
+        match self {
+            Self::Hidden(h) => std::mem::size_of_val(*h) as u64,
+            Self::TokenIds(t) => std::mem::size_of_val(*t) as u64,
+        }
+    }
+
+    /// The host pointer the input copy reads.
+    fn ptr(&self) -> *const c_void {
+        match self {
+            Self::Hidden(h) => h.as_ptr().cast(),
+            Self::TokenIds(t) => t.as_ptr().cast(),
+        }
+    }
+}
 
 /// The KV pool a worker allocates when its tapes attend: how many blocks each layer's K and V
 /// buffers hold.
@@ -186,6 +223,15 @@ pub enum ForwardError {
     Bucket { bucket: usize, buckets: usize },
     /// The input is not the bucket's input span, in bytes; nothing was enqueued.
     InputSize { expected: u64, got: u64 },
+    /// The input is `got` and the bucket's tape takes `expected` (hidden rows or token ids);
+    /// nothing was enqueued.
+    InputKind {
+        expected: &'static str,
+        got: &'static str,
+    },
+    /// Row `row`'s token id is `id`, outside the tape's `vocab`-row embedding table; nothing was
+    /// enqueued.
+    TokenOutOfVocab { row: usize, id: u32, vocab: u32 },
     /// The result buffer is not the bucket's result span, in bytes; nothing was enqueued.
     ResultSize { expected: u64, got: u64 },
     /// The forward was given `got` positions; the bucket's tape takes `expected` (its `bucket_m`
@@ -271,6 +317,13 @@ impl fmt::Display for ForwardError {
             Self::InputSize { expected, got } => {
                 write!(f, "the input is {got} bytes; the bucket takes {expected}")
             }
+            Self::InputKind { expected, got } => {
+                write!(f, "the input is {got}; the bucket takes {expected}")
+            }
+            Self::TokenOutOfVocab { row, id, vocab } => write!(
+                f,
+                "row {row}'s token id is {id}; the embedding table has {vocab} rows"
+            ),
             Self::ResultSize { expected, got } => {
                 write!(
                     f,
@@ -813,6 +866,11 @@ impl<'a> CudaWorker<'a> {
     /// order, download its result span into `result`, and wait once. Returns once the GPU is done,
     /// error or not, so nothing the forward touched is still in use.
     ///
+    /// `input` is of the kind the tape takes ([`TapeInput`]), else [`ForwardError::InputKind`],
+    /// before any copy: the embedded hidden rows, exactly the input span's bytes, or one token id
+    /// per bucket row, each below the tape's `vocab` ([`ForwardError::TokenOutOfVocab`]); a count
+    /// other than `bucket_m` is [`ForwardError::InputSize`].
+    ///
     /// `positions` holds one position per token when the tape has a rotary table, and is empty
     /// when it has none; anything else is [`ForwardError::Positions`], before any copy.
     ///
@@ -833,7 +891,7 @@ impl<'a> CudaWorker<'a> {
     pub fn forward(
         &mut self,
         bucket: usize,
-        input: &[u16],
+        input: Input<'_>,
         positions: &[u32],
         kv: Option<&KvSequence<'_>>,
         gdn: Option<&GdnSequence>,
@@ -843,12 +901,30 @@ impl<'a> CudaWorker<'a> {
             bucket,
             buckets: self.tapes.len(),
         })?;
-        let got = std::mem::size_of_val(input) as u64;
-        if got != tape.input.bytes {
-            return Err(ForwardError::InputSize {
-                expected: tape.input.bytes,
-                got,
-            });
+        let ids = match (tape.input, input) {
+            (TapeInput::Hidden(_), Input::Hidden(_)) => None,
+            (TapeInput::TokenIds { vocab, .. }, Input::TokenIds(ids)) => Some((ids, vocab)),
+            (TapeInput::Hidden(_), got) => {
+                return Err(ForwardError::InputKind {
+                    expected: "hidden rows",
+                    got: got.kind(),
+                });
+            }
+            (TapeInput::TokenIds { .. }, got) => {
+                return Err(ForwardError::InputKind {
+                    expected: "token ids",
+                    got: got.kind(),
+                });
+            }
+        };
+        let (got, expected) = (input.bytes(), tape.input.span().bytes);
+        if got != expected {
+            return Err(ForwardError::InputSize { expected, got });
+        }
+        if let Some((ids, vocab)) = ids
+            && let Some((row, &id)) = ids.iter().enumerate().find(|&(_, &id)| id >= vocab)
+        {
+            return Err(ForwardError::TokenOutOfVocab { row, id, vocab });
         }
         let got = std::mem::size_of_val(result) as u64;
         if got != tape.result.bytes {
@@ -1052,14 +1128,14 @@ impl<'a> CudaWorker<'a> {
         } = uploads;
         let slot = |offset| Self::slot_of(arena, offset);
         // SAFETY: the input span lies inside the tape's arena (`new` validated it), which is at
-        // most `arena_bytes`; `input` holds exactly its bytes, and `input` stays borrowed until the
-        // caller's stream wait has returned.
+        // most `arena_bytes`; `input` holds exactly its bytes (`forward` checked), and `input`
+        // stays borrowed until the caller's stream wait has returned.
         check(
             unsafe {
                 ffi::cudaMemcpyAsync(
-                    slot(tape.input.offset),
-                    input.as_ptr().cast(),
-                    std::mem::size_of_val(input),
+                    slot(tape.input.span().offset),
+                    input.ptr(),
+                    input.bytes() as usize,
                     ffi::MEMCPY_HOST_TO_DEVICE,
                     stream.0,
                 )
@@ -1157,6 +1233,28 @@ impl<'a> CudaWorker<'a> {
         // `forward` checked is inside the pool.
         for (step, s) in tape.steps.iter().enumerate() {
             let launched = match *s {
+                CudaStep::Embed(EmbedBf16 {
+                    tokens,
+                    table,
+                    out,
+                    rows,
+                    hidden,
+                    vocab,
+                }) => {
+                    let table = weights[table.0 as usize].ptr();
+                    // SAFETY: as above, for `tokens` (`rows` u32, the token ids uploaded above,
+                    // every one below `vocab`), `table` (`vocab*hidden`) and `out`
+                    // (`rows*hidden`).
+                    unsafe {
+                        kernels::embed_bf16(
+                            slot(tokens),
+                            table,
+                            slot(out),
+                            (rows, hidden, vocab),
+                            stream.0,
+                        )
+                    }
+                }
                 CudaStep::Gemm(GemmBf16 { a, b, c, m, n, k }) => {
                     let b = weights[b.0 as usize].ptr();
                     // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
@@ -1479,7 +1577,7 @@ impl<'a> CudaWorker<'a> {
 /// tape has one, the KV regions when it has a KV cache, and the GDN sequence region and its 4 u32
 /// when it has GDN layers.
 struct Uploads<'h> {
-    input: &'h [u16],
+    input: Input<'h>,
     table: Option<(ArenaSpan, &'h [u16])>,
     kv: Option<KvUpload<'h>>,
     gdn: Option<(ArenaSpan, &'h [u32; 4])>,
