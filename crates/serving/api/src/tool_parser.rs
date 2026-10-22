@@ -433,8 +433,12 @@ fn json_value_to_tool_call(val: &serde_json::Value) -> Option<protocol::ToolCall
 /// `_get_tool_schema_defs`); nested models, as Pydantic, FastMCP and LangChain write them, would
 /// otherwise not compile. Refused, as vLLM refuses them: `$defs` that isn't an object, and two
 /// tools defining one name differently.
+///
+/// Under [`protocol::CallLimit::One`] the array holds one call (`maxItems: 1`, as vLLM sets it for
+/// `parallel_tool_calls: false`).
 pub(crate) fn required_tool_calls_schema(
     tools: &[protocol::ChatCompletionToolsParam],
+    limit: protocol::CallLimit,
 ) -> Result<serde_json::Value, String> {
     let mut defs = serde_json::Map::new();
     let mut calls = Vec::with_capacity(tools.len());
@@ -480,6 +484,9 @@ pub(crate) fn required_tool_calls_schema(
         "minItems": 1,
         "items": { "type": "object", "anyOf": calls },
     });
+    if limit == protocol::CallLimit::One {
+        schema["maxItems"] = serde_json::json!(1);
+    }
     if !defs.is_empty() {
         schema["$defs"] = serde_json::Value::Object(defs);
     }
@@ -2928,6 +2935,7 @@ pub fn detect_tool_parser(arch: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::CallLimit;
 
     // -- tool_choice "required" (#765) --
 
@@ -2957,9 +2965,11 @@ mod tests {
             "properties": { "command": { "type": "string" } },
             "required": ["command"],
         });
-        let schema =
-            required_tool_calls_schema(&[tool("Bash", Some(command.clone())), tool("Read", None)])
-                .unwrap();
+        let schema = required_tool_calls_schema(
+            &[tool("Bash", Some(command.clone())), tool("Read", None)],
+            CallLimit::Any,
+        )
+        .unwrap();
         assert_eq!(schema["type"], "array");
         assert_eq!(schema["minItems"], 1);
         assert_eq!(schema["items"]["type"], "object");
@@ -2980,6 +2990,13 @@ mod tests {
             serde_json::json!(["Read"])
         );
         assert_eq!(calls[1]["properties"]["parameters"]["type"], "object");
+        assert!(schema.get("maxItems").is_none(), "any number of calls");
+
+        // `parallel_tool_calls: false`: the same array, of one call.
+        let one = required_tool_calls_schema(&[tool("Bash", Some(command))], CallLimit::One);
+        let one = one.unwrap();
+        assert_eq!(one["minItems"], 1);
+        assert_eq!(one["maxItems"], 1);
     }
 
     /// A tool's parameters with nested models, `$defs` and a `$ref` into them, as Pydantic writes
@@ -3005,10 +3022,10 @@ mod tests {
     #[test]
     fn the_required_schema_hoists_each_tools_defs_to_its_root() {
         let point = moves_to_a_point();
-        let schema = required_tool_calls_schema(&[
-            tool("Move", Some(point.clone())),
-            tool("Jump", Some(point)),
-        ])
+        let schema = required_tool_calls_schema(
+            &[tool("Move", Some(point.clone())), tool("Jump", Some(point))],
+            CallLimit::Any,
+        )
         .unwrap();
         assert_eq!(
             schema["$defs"]["Point"]["required"],
@@ -3026,12 +3043,13 @@ mod tests {
             tool("Move", Some(moves_to_a_point())),
             tool("Jump", Some(other_point)),
         ];
-        let err = required_tool_calls_schema(&differ).unwrap_err();
+        let err = required_tool_calls_schema(&differ, CallLimit::Any).unwrap_err();
         assert!(err.contains("'Point' has multiple schemas"), "{err}");
 
         let mut listed = moves_to_a_point();
         listed["$defs"] = serde_json::json!(["Point"]);
-        let err = required_tool_calls_schema(&[tool("Move", Some(listed))]).unwrap_err();
+        let err =
+            required_tool_calls_schema(&[tool("Move", Some(listed))], CallLimit::Any).unwrap_err();
         assert!(
             err.contains("tool 'Move' must be an object, got array"),
             "{err}"
@@ -3244,11 +3262,11 @@ mod tests {
             tool("Bash", Some(command)),
             tool("Move", Some(moves_to_a_point())),
         ];
-        let schema = required_tool_calls_schema(&tools).unwrap();
-        // Where the grammar refuses `reply`: the first character it won't take, or the reply's end
-        // when it won't let the reply end there. `None`: taken whole.
-        let refused_at = |reply: &str| {
-            let mut guide = GrammarGuide::from_json_schema(&schema, &factory).unwrap();
+        let schema = required_tool_calls_schema(&tools, CallLimit::Any).unwrap();
+        // Where `schema`'s grammar refuses `reply`: the first character it won't take, or the
+        // reply's end when it won't let the reply end there. `None`: taken whole.
+        let refused_at = |schema: &serde_json::Value, reply: &str| {
+            let mut guide = GrammarGuide::from_json_schema(schema, &factory).unwrap();
             for (at, c) in reply.char_indices() {
                 let allowed = guide.allowed_tokens().unwrap_or_default();
                 if !allowed.contains(&id_of(c)) {
@@ -3260,13 +3278,15 @@ mod tests {
             // leaves to sample.
             (!guide.is_finished()).then_some(reply.len())
         };
+        let one_call = r#"[{"name":"Bash","parameters":{"command":"ls -l"}}]"#;
+        let two_calls = r#"[{"name":"Bash","parameters":{"command":"ls"}},{"name":"Move","parameters":{"to":{"x":1}}}]"#;
         for call in [
-            r#"[{"name":"Bash","parameters":{"command":"ls -l"}}]"#,
+            one_call,
             // Through a `$ref` into the hoisted `$defs`.
             r#"[{"name":"Move","parameters":{"to":{"x":3}}}]"#,
-            r#"[{"name":"Bash","parameters":{"command":"ls"}},{"name":"Move","parameters":{"to":{"x":1}}}]"#,
+            two_calls,
         ] {
-            assert_eq!(refused_at(call), None, "{call}");
+            assert_eq!(refused_at(&schema, call), None, "{call}");
         }
         for refused in [
             r#"[{"name":"Read","parameters":{"command":"ls"}}]"#,
@@ -3275,8 +3295,14 @@ mod tests {
             "[]",
             "Sure, let me look.",
         ] {
-            assert!(refused_at(refused).is_some(), "{refused}");
+            assert!(refused_at(&schema, refused).is_some(), "{refused}");
         }
+
+        // Under `parallel_tool_calls: false`, one call: a second is refused at the comma before it.
+        let one = required_tool_calls_schema(&tools, CallLimit::One).unwrap();
+        assert_eq!(refused_at(&one, one_call), None);
+        let comma = two_calls.find("},{").unwrap() + 1;
+        assert_eq!(refused_at(&one, two_calls), Some(comma));
     }
 
     // -- Parser auto-detection from model id --

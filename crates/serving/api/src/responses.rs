@@ -113,6 +113,9 @@ pub struct ResponsesRequest {
     pub tools: Vec<FunctionToolDef>,
     #[serde(default)]
     pub tool_choice: Option<ResponsesToolChoice>,
+    /// `false` limits the reply to one tool call ([`protocol::CallLimit`]).
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
     #[serde(default)]
     pub metadata: Option<Value>,
     #[serde(default)]
@@ -404,6 +407,7 @@ fn convert_request(req: &ResponsesRequest) -> protocol::ChatCompletionRequest {
         response_format,
         tools,
         tool_choice,
+        parallel_tool_calls: req.parallel_tool_calls,
         user: None,
         top_k: req.top_k,
         min_p: None,
@@ -1104,6 +1108,7 @@ mod tests {
             stream: false,
             tools: vec![],
             tool_choice: None,
+            parallel_tool_calls: None,
             metadata: None,
             stop: None,
             seed: None,
@@ -1176,6 +1181,7 @@ mod tests {
             stream: false,
             tools: vec![],
             tool_choice: None,
+            parallel_tool_calls: None,
             metadata: None,
             stop: None,
             seed: None,
@@ -1221,6 +1227,7 @@ mod tests {
             stream: false,
             tools: vec![],
             tool_choice: None,
+            parallel_tool_calls: None,
             metadata: None,
             stop: None,
             seed: None,
@@ -1257,6 +1264,7 @@ mod tests {
                 strict: None,
             }],
             tool_choice: None,
+            parallel_tool_calls: None,
             metadata: None,
             stop: None,
             seed: None,
@@ -1284,6 +1292,7 @@ mod tests {
             stream: false,
             tools: vec![],
             tool_choice: None,
+            parallel_tool_calls: None,
             metadata: None,
             stop: None,
             seed: None,
@@ -1347,6 +1356,7 @@ mod tests {
             stream: false,
             tools: vec![],
             tool_choice: None,
+            parallel_tool_calls: None,
             metadata: None,
             stop: None,
             seed: None,
@@ -1420,6 +1430,7 @@ mod tests {
             stream: false,
             tools: vec![],
             tool_choice: None,
+            parallel_tool_calls: None,
             metadata: None,
             stop: None,
             seed: None,

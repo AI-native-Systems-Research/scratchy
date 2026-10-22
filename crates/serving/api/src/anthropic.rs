@@ -295,22 +295,57 @@ fn last_breakpoint(req: &MessagesRequest) -> Option<Breakpoint> {
 
 /// A request's `tool_choice` in Anthropic's forms ([`protocol::ToolChoice::from_anthropic`]), read
 /// and written in them (a client posts this type too, as the e2e one does): one it does not know
-/// fails the request as it is parsed.
+/// fails the request as it is parsed. Its `disable_parallel_tool_use: true` is
+/// [`protocol::CallLimit::One`], OpenAI's `parallel_tool_calls: false` (#794).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnthropicToolChoice(pub protocol::ToolChoice);
+pub struct AnthropicToolChoice {
+    pub choice: protocol::ToolChoice,
+    pub limit: protocol::CallLimit,
+}
+
+impl AnthropicToolChoice {
+    /// A request's choice and call limit: with none, no choice and any number of calls.
+    fn parts(tool_choice: Option<Self>) -> (Option<protocol::ToolChoice>, protocol::CallLimit) {
+        tool_choice.map_or((None, protocol::CallLimit::Any), |c| {
+            (Some(c.choice), c.limit)
+        })
+    }
+}
+
+impl From<protocol::ToolChoice> for AnthropicToolChoice {
+    fn from(choice: protocol::ToolChoice) -> Self {
+        Self {
+            choice,
+            limit: protocol::CallLimit::Any,
+        }
+    }
+}
 
 impl Serialize for AnthropicToolChoice {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.to_anthropic().serialize(serializer)
+        let mut form = self.choice.to_anthropic();
+        if self.limit == protocol::CallLimit::One {
+            form["disable_parallel_tool_use"] = Value::Bool(true);
+        }
+        form.serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for AnthropicToolChoice {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let form = Value::deserialize(deserializer)?;
-        protocol::ToolChoice::from_anthropic(&form)
-            .map(Self)
-            .map_err(serde::de::Error::custom)
+        let choice =
+            protocol::ToolChoice::from_anthropic(&form).map_err(serde::de::Error::custom)?;
+        let limit = match form.get("disable_parallel_tool_use") {
+            None | Some(Value::Bool(false)) => protocol::CallLimit::Any,
+            Some(Value::Bool(true)) => protocol::CallLimit::One,
+            Some(other) => {
+                return Err(serde::de::Error::custom(format!(
+                    "tool_choice's disable_parallel_tool_use must be a boolean, not {other}"
+                )));
+            }
+        };
+        Ok(Self { choice, limit })
     }
 }
 
@@ -513,7 +548,7 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
             .collect()
     });
 
-    let tool_choice = req.tool_choice.map(|AnthropicToolChoice(choice)| choice);
+    let (tool_choice, limit) = AnthropicToolChoice::parts(req.tool_choice);
 
     let stop = req.stop_sequences.map(protocol::StopCondition::Multiple);
 
@@ -538,6 +573,7 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
         response_format: None,
         tools,
         tool_choice,
+        parallel_tool_calls: (limit == protocol::CallLimit::One).then_some(false),
         user: None,
         top_k: req.top_k.map(|k| k as i32),
         min_p: None,
@@ -806,13 +842,14 @@ fn build_spnl_query(req: &MessagesRequest) -> String {
 
 /// Convert a raw completion response (from the spans path) into a `MessagesResponse`,
 /// applying the engine's tool-call parser so the model's tool calls surface as
-/// `tool_use` blocks, under the request's `tool_choice` through the chat path's own rule
-/// ([`crate::engine::reply_tool_calls`]).
+/// `tool_use` blocks, under the request's `tool_choice` and call limit through the chat path's
+/// own rule ([`crate::engine::reply_tool_calls`]).
 #[cfg(feature = "tool-spans")]
 fn completion_to_messages_response(
     resp: protocol::CompletionResponse,
     parser: Option<&std::sync::Arc<dyn crate::tool_parser::ToolCallParser>>,
     tool_choice: &Option<protocol::ToolChoice>,
+    limit: protocol::CallLimit,
 ) -> MessagesResponse {
     let text = resp
         .choices
@@ -823,7 +860,7 @@ fn completion_to_messages_response(
 
     let (content, stop_reason) = match parser {
         Some(p) => {
-            let reply = crate::engine::reply_tool_calls(p.as_ref(), text, tool_choice);
+            let reply = crate::engine::reply_tool_calls(p.as_ref(), text, tool_choice, limit);
             let mut blocks = Vec::new();
             if let Some(c) = reply.content.filter(|s| !s.is_empty()) {
                 blocks.push(ResponseContentBlock::Text { text: c });
@@ -1041,7 +1078,7 @@ pub async fn messages(
     // feature — see the spans section above for why it is not shipped.
     #[cfg(feature = "tool-spans")]
     if spans_enabled(&request) {
-        let tool_choice = (request.tool_choice.clone()).map(|AnthropicToolChoice(c)| c);
+        let (tool_choice, limit) = AnthropicToolChoice::parts(request.tool_choice.clone());
         let tools: Vec<&str> = (request.tools.iter().flatten())
             .map(|t| t.name.as_str())
             .collect();
@@ -1052,7 +1089,8 @@ pub async fn messages(
         match crate::query::anthropic_spans_completion(&state, &spnl).await {
             Ok(resp) => {
                 let parser = state.engine.tool_parser();
-                let msg = completion_to_messages_response(resp, parser.as_ref(), &tool_choice);
+                let msg =
+                    completion_to_messages_response(resp, parser.as_ref(), &tool_choice, limit);
                 return if is_stream {
                     stream_buffered_messages_response(msg).into_response()
                 } else {
@@ -1448,7 +1486,8 @@ mod tests {
                 prompt_logprobs: None,
             }];
             let resp = protocol::CompletionResponse::new("m".into(), choices, Default::default());
-            let msg = completion_to_messages_response(resp, Some(&parser), &Some(choice));
+            let any = protocol::CallLimit::Any;
+            let msg = completion_to_messages_response(resp, Some(&parser), &Some(choice), any);
             let blocks: Vec<String> = (msg.content.iter())
                 .map(|b| match b {
                     ResponseContentBlock::Text { text } => format!("text {text}"),
@@ -1924,9 +1963,11 @@ mod tests {
         assert_eq!(tools[0].tool_type, "function");
     }
 
+    /// `{"type": "any"}` is `"required"`, and its `disable_parallel_tool_use: true` is
+    /// `parallel_tool_calls: false` (#794).
     #[test]
     fn test_convert_tool_choice_any() {
-        let req = MessagesRequest {
+        let req = |limit| MessagesRequest {
             model: None,
             messages: vec![AnthropicMessage {
                 role: AnthropicRole::User,
@@ -1940,40 +1981,60 @@ mod tests {
             stop_sequences: None,
             stream: false,
             tools: None,
-            tool_choice: Some(AnthropicToolChoice(protocol::ToolChoice::Required)),
+            tool_choice: Some(AnthropicToolChoice {
+                choice: protocol::ToolChoice::Required,
+                limit,
+            }),
             metadata: None,
             thinking: None,
         };
-        let chat = convert_request(req);
+        let chat = convert_request(req(protocol::CallLimit::Any));
         assert_eq!(chat.tool_choice, Some(protocol::ToolChoice::Required));
+        assert_eq!(chat.parallel_tool_calls, None);
+        let chat = convert_request(req(protocol::CallLimit::One));
+        assert_eq!(chat.tool_choice, Some(protocol::ToolChoice::Required));
+        assert_eq!(chat.parallel_tool_calls, Some(false));
     }
 
     /// Anthropic's object forms read as its bare strings do, a forced tool as the named function,
-    /// and a form Anthropic doesn't define fails the request as it is parsed, as one naming no tool
-    /// does.
+    /// and `disable_parallel_tool_use: true` as one call. A form Anthropic doesn't define fails the
+    /// request as it is parsed, as one naming no tool does, and so does a
+    /// `disable_parallel_tool_use` that isn't a boolean.
     #[test]
     fn test_anthropic_tool_choice_forms() {
-        use protocol::ToolChoice;
+        use protocol::{CallLimit, ToolChoice};
         use serde_json::json;
+        let any = AnthropicToolChoice::from;
+        let one = |choice| AnthropicToolChoice {
+            choice,
+            limit: CallLimit::One,
+        };
         let cases = [
-            (json!({"type": "auto"}), ToolChoice::Auto),
-            (json!({"type": "any"}), ToolChoice::Required),
-            (json!({"type": "none"}), ToolChoice::None),
+            (json!({"type": "auto"}), any(ToolChoice::Auto)),
+            (json!({"type": "any"}), any(ToolChoice::Required)),
+            (json!({"type": "none"}), any(ToolChoice::None)),
             (
                 json!({"type": "auto", "disable_parallel_tool_use": true}),
-                ToolChoice::Auto,
+                one(ToolChoice::Auto),
+            ),
+            (
+                json!({"type": "any", "disable_parallel_tool_use": true}),
+                one(ToolChoice::Required),
+            ),
+            (
+                json!({"type": "auto", "disable_parallel_tool_use": false}),
+                any(ToolChoice::Auto),
             ),
             (
                 json!({"type": "tool", "name": "Read"}),
-                ToolChoice::Function("Read".into()),
+                any(ToolChoice::Function("Read".into())),
             ),
-            (json!("auto"), ToolChoice::Auto),
-            (json!("any"), ToolChoice::Required),
-            (json!("none"), ToolChoice::None),
+            (json!("auto"), any(ToolChoice::Auto)),
+            (json!("any"), any(ToolChoice::Required)),
+            (json!("none"), any(ToolChoice::None)),
         ];
         for (anthropic, choice) in cases {
             let read = serde_json::from_value::<AnthropicToolChoice>(anthropic.clone());
-            let choice = AnthropicToolChoice(choice);
             assert_eq!(read.ok().as_ref(), Some(&choice), "{anthropic}");
             // Written in Anthropic's form, so what a client posts reads back as itself.
             let written = serde_json::to_value(&choice).unwrap();
@@ -1993,6 +2054,9 @@ mod tests {
                 "{bad}: {err}"
             );
         }
+        let not_bool = json!({"type": "auto", "disable_parallel_tool_use": "yes"});
+        let err = serde_json::from_value::<AnthropicToolChoice>(not_bool).unwrap_err();
+        assert!(err.to_string().contains("must be a boolean"), "{err}");
         let request = json!({
             "messages": [{"role": "user", "content": "Hi"}],
             "max_tokens": 50,
