@@ -1328,12 +1328,27 @@ pub(crate) fn superdsc_forward_chunk(
                     // page), and its `KV_BLOCK_INDEX` placement is the chunk ceiling's.
                     step.gathers(),
                     chunk_start,
-                    // ⛔ NO LOGITS READBACK UNDER HW, final chunk included: the folded
-                    // tail's row used to come back for the HOST to argmax (token 1 of
-                    // every request). The pick now comes from the re-pick rung step
-                    // (`run_request_step`'s completion arm), so every chunk — final or
-                    // not — discards its logits.
-                    LogitsWanted::None,
+                    // ⛔ NO LOGITS READBACK UNDER HW: the folded tail's row used to
+                    // come back for the HOST to argmax (token 1 of every request).
+                    // Under hw the pick is the re-pick rung step
+                    // (`run_request_step`'s completion arm), so every chunk — final
+                    // included — discards its logits. EMU keeps the final chunk's
+                    // LastRow: its sampler still picks on the host, and an empty
+                    // hand at completion would argmax nothing.
+                    {
+                        #[cfg(not(feature = "spyre-hw"))]
+                        {
+                            if is_prompt_final_chunk {
+                                LogitsWanted::LastRow
+                            } else {
+                                LogitsWanted::None
+                            }
+                        }
+                        #[cfg(feature = "spyre-hw")]
+                        {
+                            LogitsWanted::None
+                        }
+                    },
                 )?;
                 // UNCONDITIONAL truth-signal per chunk: `chunk_len` prompt tokens went through ONE
                 // mq=N forward. This is the ONLY line that lets verify_prefill_real.sh print
@@ -1420,12 +1435,18 @@ pub(crate) fn superdsc_forward_chunk(
             // straight to the sampler. A mid-prompt wave asks for no logits (see
             // `is_prompt_final_chunk`), so an empty hand with the prompt unfinished is the
             // expected shape — `run_request_step`'s sample guard returns before reading it.
-            // `None` with the prompt DONE means the loop never ran — impossible under `n > 1`,
-            // but refuse loudly rather than fall through to a decode path that would now
-            // re-forward zero tokens.
+            // ⛔ UNDER HW AN EMPTY HAND AT COMPLETION IS ALSO THE EXPECTED SHAPE: no readback
+            // exists, so the pick is the re-pick rung step's (`run_request_step`'s completion
+            // arm), not a row this loop owes anyone. EMU still reads its LastRow back, so an
+            // empty hand at completion there means the loop never ran — impossible under
+            // `n > 1`, but refuse loudly rather than fall through to a decode path that would
+            // now re-forward zero tokens.
             let row = match prefill_logits {
                 Some(row) => row,
                 None if tok_end < tokens.prompt_len(id) => return Ok(ChunkOut::Rows(Vec::new())),
+                #[cfg(feature = "spyre-hw")]
+                None => return Ok(ChunkOut::Rows(Vec::new())),
+                #[cfg(not(feature = "spyre-hw"))]
                 None => {
                     return Err(werr(format!(
                         "superdsc batched prefill: covered {real_total} tokens but produced no \
@@ -2417,8 +2438,7 @@ pub(crate) fn run_request_step(
                     })? as usize;
                     // THE WINDOW, one slot back: the step below sees [0, p_last)
                     // as its resident prefix and writes at p_last.
-                    req.kv_hist =
-                        scratchy_subtile::sdsc_abstract::KvHistory::contiguous(p_last as u32);
+                    req.kv_hist = scratchy_subtile::sdsc_abstract::KvHistory::contiguous(p_last);
                     let b_step = select_decode(&model.decode, p_last + 1);
                     match forward_chunk(
                         &sh,
