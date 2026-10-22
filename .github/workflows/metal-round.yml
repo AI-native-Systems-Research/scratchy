@@ -1,0 +1,168 @@
+name: Metal round
+
+# A metal quick round is one open issue, labelled metal-round, whose comments carry each Mac's
+# quick run of scripts/bench_metal_matrix.sh (the metal-bench skill, step 7). On every comment
+# this reads them all again, keeps the newest accepted run per Mac, and keeps one status comment
+# up to date. Once every Mac in scripts/metal_round.py's MACHINES is in, it makes a branch from
+# main, commits those runs into site/data/metal there in one commit, opens a PR for an admin to
+# merge, and closes the issue: a closed issue is a finished round.
+#
+# issue_comment runs this file as it is on main, and nothing here runs code from anywhere else.
+# The runs it reads are data, checked by the site build before they are committed.
+on:
+  issue_comment:
+    types: [created, edited, deleted]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: The round issue's number
+        required: true
+
+permissions:
+  contents: read
+
+# One pass per round at a time, in order: each reads every comment, so none is lost.
+concurrency:
+  group: metal-round-${{ github.event.issue.number || inputs.issue }}
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  ISSUE: ${{ github.event.issue.number || inputs.issue }}
+
+jobs:
+  collect:
+    # An open round issue, and a comment from someone other than the bot. Who may post a run is
+    # judged per comment in metal_round.py, which replies to a run it does not count.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (!github.event.issue.pull_request &&
+       github.event.issue.state == 'open' &&
+       contains(github.event.issue.labels.*.name, 'metal-round') &&
+       github.event.comment.user.login != 'github-actions[bot]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      commit: ${{ steps.collect.outputs.commit }}
+      files: ${{ steps.collect.outputs.files }}
+    steps:
+      # main with its whole history: a run's commit must be on it.
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - id: collect
+        run: |
+          state=$(gh issue view "$ISSUE" -R "$REPO" --json state,labels \
+            --jq 'if .state == "OPEN" and any(.labels[]; .name == "metal-round") then "open" else "no" end')
+          if [ "$state" != open ]; then
+            echo "#$ISSUE is not an open metal-round issue"
+            echo "commit=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p round
+          gh api --paginate "repos/$REPO/issues/$ISSUE/comments" --jq '.[]' | jq -s . > comments.json
+          python3 scripts/metal_round.py collect --comments comments.json --out-dir round \
+            --main-ref origin/main > summary.json
+          jq '{complete, files, replies: [.replies[].id]}' summary.json
+
+          jq -c '.replies[]' summary.json | while read -r r; do
+            gh api "repos/$REPO/issues/$ISSUE/comments" -f body="$(jq -r .body <<<"$r")" > /dev/null
+          done
+
+          body=$(jq -r .status_body summary.json)
+          id=$(jq -r '.status_comment_id // empty' summary.json)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -f body="$body" > /dev/null
+          else
+            gh api "repos/$REPO/issues/$ISSUE/comments" -f body="$body" > /dev/null
+          fi
+
+          echo "commit=$(jq -r .complete summary.json)" >> "$GITHUB_OUTPUT"
+          echo "files=$(jq -c .files summary.json)" >> "$GITHUB_OUTPUT"
+
+      # The site build reads every field the page needs, so it is the check that the runs render.
+      - if: steps.collect.outputs.commit == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - if: steps.collect.outputs.commit == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: site
+
+      - if: steps.collect.outputs.commit == 'true'
+        name: Build the site with the round's runs
+        run: |
+          cp round/*.json site/data/metal/
+          cargo clippy --manifest-path site/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path site/Cargo.toml
+          cargo run --release --manifest-path site/Cargo.toml
+
+      - if: steps.collect.outputs.commit == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: round
+          path: round/*.json
+
+  commit:
+    needs: collect
+    if: needs.collect.outputs.commit == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          sparse-checkout: scripts
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: round
+          path: round
+
+      # A branch from main named for the issue, and the runs on it in one commit made through the
+      # API rather than git push: GitHub signs a commit made this way, and main's rules take
+      # signed commits only.
+      - name: Commit the runs to a new branch
+        env:
+          FILES: ${{ needs.collect.outputs.files }}
+        run: |
+          branch="metal-round/$ISSUE"
+          main=$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)
+          gh api "repos/$REPO/git/refs" -f ref="refs/heads/$branch" -f sha="$main" > /dev/null
+          python3 scripts/metal_round.py commit-input --repo "$REPO" --branch "$branch" \
+            --head "$main" --dir round \
+            --headline "data(site): Metal quick round, #$ISSUE" \
+            $(jq -r '.[]' <<<"$FILES") > commit.json
+          gh api graphql --input commit.json --jq .data.createCommitOnBranch.commit.url
+          echo "BRANCH=$branch" >> "$GITHUB_ENV"
+
+      - name: Open the PR
+        run: |
+          pr=$(gh pr create -R "$REPO" --head "$BRANCH" --base main \
+            --title "data(site): Metal quick round, #$ISSUE" \
+            --body "The newest quick run of each Mac, as collected on #$ISSUE. Rust CI and Pages were started on this branch by the bot. If their checks do not show here, push a signed empty commit to $BRANCH to start them.")
+          echo "PR=$pr" >> "$GITHUB_ENV"
+
+      # A push made with this token starts no workflows, so start the required checks on the
+      # branch by hand. If they do not count toward the branch rules, a signed empty commit
+      # pushed to the branch starts them the usual way.
+      - name: Start the checks
+        run: |
+          gh workflow run rust.yml -R "$REPO" --ref "$BRANCH"
+          gh workflow run pages.yml -R "$REPO" --ref "$BRANCH"
+
+      - name: Close the round
+        run: |
+          gh issue close "$ISSUE" -R "$REPO" \
+            --comment "All four Macs are in: $PR adds the newest run per Mac to site/data/metal, for an admin to merge. A run posted from here on goes to the next round."
