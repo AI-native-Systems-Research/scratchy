@@ -2437,8 +2437,14 @@ pub(crate) fn run_request_step(
                         ))
                     })? as usize;
                     // THE WINDOW, one slot back: the step below sees [0, p_last)
-                    // as its resident prefix and writes at p_last.
+                    // as its resident prefix and writes at p_last. The pool
+                    // bookkeeping steps back WITH the window — the step's
+                    // idempotent slot rewrite (same token, same slot) then
+                    // re-appends p_last and restores the count, keeping the
+                    // decode path's "holds exactly `start` positions" law true
+                    // at the call.
                     req.kv_hist = scratchy_subtile::sdsc_abstract::KvHistory::contiguous(p_last);
+                    tokens.set_tokens_in_pool(id, p_last);
                     let b_step = select_decode(&model.decode, p_last + 1);
                     match forward_chunk(
                         &sh,
