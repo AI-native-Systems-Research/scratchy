@@ -318,7 +318,7 @@ pub struct LoweredDecode {
 ///
 /// The macro does not know which target compiler it is linked against. Cargo decides that: the
 /// macro crate's manifest renames a target compiler crate to the optional `target-emitter`
-/// dependency key (today CUDA's, turned on by the `cuda` feature), and the macro calls that
+/// dependency key (the backend feature that turns the key on names the crate), and the macro calls that
 /// crate's `emit::emit_model(&TargetModelInput) -> proc_macro2::TokenStream` and splices the
 /// tokens it returns into the model's module. Any target compiler crate can implement that
 /// function; what it lowers, what it refuses and what it emits are its own, and nothing about them

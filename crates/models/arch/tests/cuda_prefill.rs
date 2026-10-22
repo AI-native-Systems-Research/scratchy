@@ -11,10 +11,15 @@
 //! - (b) a fresh 300-token forward in the m=512 bucket gives finite logits on every real row;
 //! - (c) the lm_head GEMM, read back from the arena, against an f64 reference on six rows over
 //!   every column, under the GEMM bound of `numerics.rs`;
-//! - (d) repeating (b) on the same slot gives the same logits, bit for bit;
+//! - (d) repeating (b) in other KV blocks and another GDN slot gives the same logits, bit for
+//!   bit;
 //! - (e) the same 300 rows in the m=1024 bucket give the same real-row logits, bit for bit;
 //! - (f) a 512-token sequence in one forward, and as 300 fresh tokens then 212 continuing, agree
 //!   bit for bit on rows 300..512;
+//!
+//! Each compared pair of (d), (e) and (f) runs its second sequence in KV blocks and a GDN slot
+//! disjoint from the first's, so a run that failed to write its cache or state cannot pass by
+//! reading the other's.
 //! - (g) a KV sequence and a GDN sequence that disagree on fresh are refused before any copy;
 //! - (h) the worker allocates the weights, the arena and the two pools, and a forward nothing.
 //!
@@ -231,22 +236,40 @@ fn positions(tape: &CudaTape, from: u32) -> Vec<u32> {
     (from..from + tape.bucket_m).collect()
 }
 
-/// The block table every forward here uses: blocks 0..8, enough for 512 tokens of 64.
-const BLOCKS: [u32; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+/// A sequence's place in the pools: its block table and its GDN slot. The two halves of the
+/// 16-block pool and the two slots are disjoint, so the second run of a compared pair (d, e, f)
+/// cannot read what the first wrote: a chunk whose K/V or state went missing shows.
+#[derive(Clone, Copy)]
+struct Seat {
+    blocks: &'static [u32; 8],
+    slot: u32,
+}
 
-/// One forward of `rows` (`q` real rows) at `prefix_len`, on GDN slot `slot`: the full result.
+/// Blocks 0..8 and slot 0; each is enough for 512 tokens of 64.
+const SEAT_A: Seat = Seat {
+    blocks: &[0, 1, 2, 3, 4, 5, 6, 7],
+    slot: 0,
+};
+/// Blocks 8..16 and slot 1: no block or slot of [`SEAT_A`]'s.
+const SEAT_B: Seat = Seat {
+    blocks: &[8, 9, 10, 11, 12, 13, 14, 15],
+    slot: 1,
+};
+
+/// One forward of `rows` (`q` real rows) at `prefix_len`, in `seat`: the full result.
 fn forward(
     worker: &mut CudaWorker<'_>,
     m: u32,
     rows: &[u16],
     prefix_len: u32,
-    slot: u32,
+    seat: Seat,
 ) -> Result<Vec<u16>, ForwardError> {
     let b = bucket(m);
     let tape = &CUDA_TAPES[b];
     let q = (rows.len() / HIDDEN) as u32;
+    let slot = seat.slot;
     let kv = KvSequence {
-        block_table: &BLOCKS,
+        block_table: seat.blocks,
         prefix_len,
         q_len: q,
     };
@@ -272,24 +295,55 @@ fn real(logits: &[u16], q: usize) -> &[u16] {
     &logits[..q * VOCAB]
 }
 
-/// The first element at which `a` and `b` differ, and the largest |difference| (as f32).
-fn first_difference(a: &[u16], b: &[u16]) -> Option<(usize, usize, f32)> {
+/// How two logits results (`[rows, VOCAB]`) differ: the elements that differ in any bit, the
+/// first such, the row with the most, and the largest |difference| (as f32).
+struct Difference {
+    mismatched: usize,
+    rows: usize,
+    first: (usize, usize),
+    worst_row: (usize, usize),
+    widest: f32,
+}
+
+fn difference(a: &[u16], b: &[u16]) -> Option<Difference> {
     let first = a.iter().zip(b).position(|(x, y)| x != y)?;
+    let per_row: Vec<usize> = (a.chunks(VOCAB).zip(b.chunks(VOCAB)))
+        .map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p != q).count())
+        .collect();
+    let (row, &count) = (per_row.iter().enumerate())
+        .max_by_key(|&(_, c)| *c)
+        .expect("a non-empty result");
     let widest = (a.iter().zip(b))
         .map(|(&x, &y)| (bf16::from_bits(x).to_f32() - bf16::from_bits(y).to_f32()).abs())
         .fold(0f32, f32::max);
-    Some((first / VOCAB, first % VOCAB, widest))
+    Some(Difference {
+        mismatched: per_row.iter().sum(),
+        rows: per_row.iter().filter(|&&c| c > 0).count(),
+        first: (first / VOCAB, first % VOCAB),
+        worst_row: (row, count),
+        widest,
+    })
 }
 
 fn bit_identical(what: &str, a: &[u16], b: &[u16]) -> bool {
-    match first_difference(a, b) {
+    match difference(a, b) {
         None => {
             eprintln!("{what}: bit-identical {}", verdict(true));
             true
         }
-        Some((row, col, widest)) => {
+        Some(d) => {
             eprintln!(
-                "{what}: first differs at row {row} col {col}, largest |difference| {widest:e} {}",
+                "{what}: mismatched_bits={}/{} in {} of {} rows, first at row {} col {}, worst \
+                 row {} ({} elements), largest |difference| {:e} {}",
+                d.mismatched,
+                a.len(),
+                d.rows,
+                a.len() / VOCAB,
+                d.first.0,
+                d.first.1,
+                d.worst_row.0,
+                d.worst_row.1,
+                d.widest,
                 verdict(false)
             );
             false
@@ -297,10 +351,10 @@ fn bit_identical(what: &str, a: &[u16], b: &[u16]) -> bool {
     }
 }
 
-/// (b): the fresh 300-token forward in the m=512 bucket, on GDN slot 0.
-fn fresh_300(worker: &mut CudaWorker<'_>) -> Vec<u16> {
+/// (b): the fresh 300-token forward in the m=512 bucket, in `seat`.
+fn fresh_300(worker: &mut CudaWorker<'_>, seat: Seat) -> Vec<u16> {
     let rows = sequence_rows(Q as usize);
-    forward(worker, 512, &rows, 0, 0).expect("the 300-token forward")
+    forward(worker, 512, &rows, 0, seat).expect("the 300-token forward")
 }
 
 #[test]
@@ -323,7 +377,7 @@ fn a_the_worker_takes_every_tape() {
 #[test]
 fn b_a_fresh_forward_gives_finite_logits() {
     let r = rig();
-    let logits = fresh_300(&mut r.worker());
+    let logits = fresh_300(&mut r.worker(), SEAT_A);
     let real = real(&logits, Q as usize);
     let non_finite = real
         .iter()
@@ -348,7 +402,7 @@ fn b_a_fresh_forward_gives_finite_logits() {
 fn c_the_lm_head_against_an_f64_reference() {
     let r = rig();
     let mut worker = r.worker();
-    let logits = fresh_300(&mut worker);
+    let logits = fresh_300(&mut worker, SEAT_A);
     let tape = &CUDA_TAPES[bucket(512)];
     // The last step is the lm_head GEMM; its `a` is the final norm's output, still in the arena.
     let Some(CudaStep::Gemm(GemmBf16 { a, b, c, m, n, k })) = tape.steps.last().copied() else {
@@ -398,10 +452,10 @@ fn c_the_lm_head_against_an_f64_reference() {
 fn d_repeating_the_forward_is_bit_identical() {
     let r = rig();
     let mut worker = r.worker();
-    let first = fresh_300(&mut worker);
-    let again = fresh_300(&mut worker);
+    let first = fresh_300(&mut worker, SEAT_A);
+    let again = fresh_300(&mut worker, SEAT_B);
     let ok = bit_identical(
-        "(d) the 300-token forward repeated on slot 0",
+        "(d) the 300-token forward repeated in disjoint blocks and slot",
         real(&first, Q as usize),
         real(&again, Q as usize),
     );
@@ -412,9 +466,9 @@ fn d_repeating_the_forward_is_bit_identical() {
 fn e_the_bucket_does_not_change_the_real_rows() {
     let r = rig();
     let mut worker = r.worker();
-    let in_512 = fresh_300(&mut worker);
+    let in_512 = fresh_300(&mut worker, SEAT_A);
     let rows = sequence_rows(Q as usize);
-    let in_1024 = forward(&mut worker, 1024, &rows, 0, 0).expect("the m=1024 forward");
+    let in_1024 = forward(&mut worker, 1024, &rows, 0, SEAT_B).expect("the m=1024 forward");
     let ok = bit_identical(
         "(e) 300 rows in m=1024 against m=512",
         real(&in_1024, Q as usize),
@@ -431,9 +485,11 @@ fn f_a_chunked_sequence_matches_one_shot() {
     let r = rig();
     let mut w = r.worker();
     let rows = sequence_rows(512);
-    let one_shot = forward(&mut w, 512, &rows, 0, 0).expect("512 tokens in one forward");
-    forward(&mut w, 512, &rows[..Q as usize * HIDDEN], 0, 1).expect("the first 300 tokens");
-    let rest = forward(&mut w, 512, &rows[Q as usize * HIDDEN..], Q, 1).expect("the last 212");
+    let one_shot = forward(&mut w, 512, &rows, 0, SEAT_A).expect("512 tokens in one forward");
+    // The chunked run in the other blocks and slot: its continuation reads only what its own
+    // first chunk wrote.
+    forward(&mut w, 512, &rows[..Q as usize * HIDDEN], 0, SEAT_B).expect("the first 300 tokens");
+    let rest = forward(&mut w, 512, &rows[Q as usize * HIDDEN..], Q, SEAT_B).expect("the last 212");
     let tail = 512 - Q as usize;
     let ok = bit_identical(
         "(f) rows 300..512: 300 fresh then 212 continuing, against one 512-token forward",
@@ -452,7 +508,7 @@ fn g_kv_and_gdn_must_agree_on_fresh() {
     let mut pass = true;
     for (prefix_len, fresh) in [(0, false), (64, true)] {
         let kv = KvSequence {
-            block_table: &BLOCKS,
+            block_table: SEAT_A.blocks,
             prefix_len,
             q_len: Q,
         };
@@ -497,7 +553,7 @@ fn h_the_worker_allocates_once() {
         .filter(|&ix| CUDA_TAPES.iter().any(|t| t.weight_bytes[ix] > 0))
         .count() as u64;
     for _ in 0..5 {
-        let _ = fresh_300(&mut worker);
+        let _ = fresh_300(&mut worker, SEAT_A);
     }
     let forwards = r.device.allocations() - after_worker;
     let ok = weights == nonzero && worker_allocs == 3 && forwards == 0;

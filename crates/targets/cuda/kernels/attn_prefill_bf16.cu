@@ -126,6 +126,24 @@ static_assert(SMEM_TILES == 196608, "2 q + 2 K + 2 V tiles of [64, 256] bf16");
 constexpr int ATTN_SMEM_BYTES = int(SMEM_TILES) + 1024;
 static_assert(ATTN_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
 
+// The online softmax's rescale of one tile, per row: `exp2((m_old − m_new) · c)`, or exactly 1
+// when `m_new == m_old` (the tile raised no score above the running max, as for a tile masked out
+// for the row). `(m_old − m_new) · c` has no product feeding a sum, so nothing contracts into an
+// FMA; the select makes the unchanged case exact without relying on `exp2(0)`'s rounding.
+// `m_old = −inf` (the first tile) gives `exp2(−inf) = 0`. Element-wise over the vectors' own
+// registers: the three vectors share one type, so index `[i][k]` is the same row in each.
+template <typename V>
+__device__ inline void rescale(V& dst, const V& m_old, const V& m_new, float c) {
+#pragma unroll
+    for (int i = 0; i < V::outer_dim; i++) {
+#pragma unroll
+        for (int k = 0; k < V::inner_dim; k++) {
+            const float o = m_old.data[i][k], n = m_new.data[i][k];
+            dst.data[i][k] = o == n ? 1.0f : exp2f((o - n) * c);
+        }
+    }
+}
+
 __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
     const __grid_constant__ attn_globals g) {
     extern __shared__ int __shm[];
@@ -191,7 +209,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
         rt_fl<16, KV_HEIGHT> att_block;
         rt_bf<16, KV_HEIGHT> att_block_mma;
         rt_fl<16, HEAD_DIM> o_reg;
-        col_vec<rt_fl<16, KV_HEIGHT>> max_vec, norm_vec, max_vec_last_scaled, max_vec_scaled;
+        // `max_vec_last` holds the max before a tile, then (after `rescale`) the tile's rescale.
+        col_vec<rt_fl<16, KV_HEIGHT>> max_vec, norm_vec, max_vec_last, max_vec_scaled;
 
         warp::neg_infty(max_vec);
         warp::zero(norm_vec);
@@ -208,7 +227,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
             wait(k_smem_arrived[stage], phase);
             warpgroup::mm_ABt(att_block, q_smem[warpgroupid], k_smem[stage]);
 
-            warp::mul(max_vec_last_scaled, max_vec, g.scale_log2);
+            // The running max before this tile, unscaled (the rescale below reads it).
+            warp::copy(max_vec_last, max_vec);
 
             // The WGMMA writes `att_block` asynchronously: wait before reading it.
             warpgroup::mma_async_wait();
@@ -224,14 +244,20 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
             warp::mul(max_vec_scaled, max_vec, g.scale_log2);
             warp::sub_row(att_block, att_block, max_vec_scaled);
             warp::exp2(att_block, att_block);
-            // The rescale of the running sum and output by exp2(m_old − m_new), before this tile
-            // is accumulated into them.
-            warp::sub(max_vec_last_scaled, max_vec_last_scaled, max_vec_scaled);
-            warp::exp2(max_vec_last_scaled, max_vec_last_scaled);
-            warp::mul(norm_vec, norm_vec, max_vec_last_scaled);
+            // The rescale of the running sum and output, before this tile is accumulated into
+            // them: exp2((m_old − m_new) · scale_log2), and EXACTLY 1 for a row whose max this
+            // tile left unchanged. That makes a tile masked out for a row (every score −inf, every
+            // p exactly 0) an exact no-op on it, whatever the tile count: how many tiles a CTA
+            // reads depends on where its rows sit in the bucket (`kv_iters`), so the same row of a
+            // sequence reads more or fewer masked trailing tiles in one forward than in a chunk of
+            // it. Upstream's `exp2(m_old·c − m_new·c)` is not exactly 1 there: nvcc contracts the
+            // product and the difference into `fma(m_old, c, −round(m_new·c))`, which is the
+            // rounding error of `m·c`, not 0, so each masked tile scaled the row by 1 ± an f32 ulp.
+            rescale(max_vec_last, max_vec_last, max_vec, g.scale_log2);
+            warp::mul(norm_vec, norm_vec, max_vec_last);
             warp::row_sum(norm_vec, att_block, norm_vec);
             warp::copy(att_block_mma, att_block);
-            warp::mul_row(o_reg, o_reg, max_vec_last_scaled);
+            warp::mul_row(o_reg, o_reg, max_vec_last);
 
             wait(v_smem_arrived[stage], phase);
             // A partial last tile: zero the V rows of the slots at or past kv_len, which no append

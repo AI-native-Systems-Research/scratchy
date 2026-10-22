@@ -502,3 +502,67 @@ fn the_attention_launcher_refuses_each_bad_shape() {
     }
     assert!(pass, "a refusal launched or wrote");
 }
+
+/// Test 7: the rows of a chunk are bit-identical to the same rows of one forward over the whole
+/// sequence, over the same cache. A row's query and keys are the same either way; what changes is
+/// where it sits in the bucket, and so how many KV tiles its CTA reads. In one 512-row forward
+/// (P = 0, L = 512) sequence rows 256..383 are one CTA reading 6 tiles; as a chunk (P = 300,
+/// L = 212) sequence rows 300..427 are one CTA reading 7. A tile past a row's last key is masked
+/// out for it, so it must change that row's output by nothing, to the bit: the online softmax's
+/// rescale must be exactly 1 there. qwen3.5-0.8b's geometry (8 q heads, 2 kv heads) and the
+/// sequence of `cuda_prefill`'s (f).
+#[test]
+fn a_chunk_is_bit_identical_to_the_same_rows_of_one_forward() {
+    let device = h100();
+    let (qh, kvh) = (8usize, 2usize);
+    let mut pass = true;
+    for (tokens, p) in [(512usize, 300usize), (512, 64), (256, 100), (448, 383)] {
+        let len = tokens - p;
+        let rows_one = tokens.next_multiple_of(128);
+        let rows_chunk = len.next_multiple_of(128);
+        let k = bf16_inputs(tokens * kvh * HD, 0x0D08_0001 ^ tokens as u64);
+        let v = bf16_inputs(tokens * kvh * HD, 0x0D08_0002 ^ tokens as u64);
+        let q = bf16_inputs(tokens * qh * HD, 0x0D08_0003 ^ tokens as u64);
+        let (kc, vc) = filled_caches(&device, (&k, &v), tokens, kvh, POISON);
+        let width = qh * HD;
+        let mut q_one = vec![0u16; rows_one * width];
+        q_one[..tokens * width].copy_from_slice(&q);
+        let mut q_chunk = vec![0u16; rows_chunk * width];
+        q_chunk[..len * width].copy_from_slice(&q[p * width..]);
+        let one = attend(
+            &device,
+            &q_one,
+            (&kc, &vc),
+            &TABLE,
+            (0, tokens),
+            (rows_one, qh, kvh),
+        )
+        .expect("one forward");
+        let chunk = attend(
+            &device,
+            &q_chunk,
+            (&kc, &vc),
+            &TABLE,
+            (p, len),
+            (rows_chunk, qh, kvh),
+        )
+        .expect("the chunk");
+        let (a, b) = (&chunk[..len * width], &one[p * width..tokens * width]);
+        let mismatched = mismatched_bits(a, b);
+        let worst_row = (0..len)
+            .max_by_key(|&r| mismatched_bits(&a[r * width..][..width], &b[r * width..][..width]))
+            .filter(|_| mismatched > 0);
+        let ok = mismatched == 0;
+        eprintln!(
+            "attention chunk (P={p}, L={len}) vs rows {p}..{tokens} of one {tokens}-row forward: \
+             mismatched_bits={mismatched}/{} worst_row={worst_row:?} {}",
+            a.len(),
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "a chunk's attention differs from one forward's: see the lines above"
+    );
+}
