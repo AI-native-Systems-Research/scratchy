@@ -26,13 +26,13 @@ use scratchy_target_cuda::step::{
     GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_NARROW_BF16_MAX_N,
     GEMM_NARROW_BF16_MULTIPLE, GateApplyBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16,
     RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16,
-    RopeAppendBf16, RopeBf16, SILU_MUL_BF16_COLS, SiluMulBf16, gdn_scratch,
+    RopeAppendBf16, RopeBf16, SILU_MUL_BF16_COLS, SiluMulBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, WeightIx};
 
 use crate::canonical::{
     ArenaRefusal, AttnShapeRule, CanonicalRefusal, CudaModelFacts, GateShapeRule, GdnRegions,
-    GdnShapeRule, GemmShapeRule, KvCacheRefusal, KvPool, KvRegions, OperandRefusal,
+    GdnShapeRule, GdnWidths, GemmShapeRule, KvCacheRefusal, KvPool, KvRegions, OperandRefusal,
     ProducerRefusal, RopeShapeRule, RowShapeRule, ViewRefusal,
 };
 
@@ -807,11 +807,15 @@ fn gated_delta_net(
     let bundle = weight_operand(cx, s, 4, inputs.next())?;
     let layer = gdn_bundle_layer(cx.bindings, s).ok_or(CanonicalRefusal::GdnLayer { step })?;
     let at = arena(cx)?;
-    // The arena sized the scratch by the canonical's first GDN op; one of another geometry would
-    // need another scratch and another state pool.
+    // The arena sized the scratch, and the worker sizes the state pool, by the canonical's first
+    // GDN op's geometry; one of another geometry would need another scratch and another pool.
     let regions = (cx.gdn_regions).ok_or(CanonicalRefusal::GdnPool { step })?;
-    let scratch_bytes = gdn_scratch(rows, conv_dim, nv, value_dim).map(|l| l.bytes);
-    if scratch_bytes != Some(regions.scratch.bytes) {
+    let geometry = GdnWidths {
+        conv_dim,
+        value_dim,
+        nv,
+    };
+    if geometry != regions.geometry {
         return Err(CanonicalRefusal::GdnPool { step });
     }
     let index = (cx.gdn_layers.iter().position(|&l| l == layer))

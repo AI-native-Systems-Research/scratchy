@@ -1121,6 +1121,8 @@ pub fn lower_canonical(
 /// [`lower_canonical`] after its shared passes: the arena laid out from `plan`'s colouring, then
 /// every `Compute` of its tape lowered by its fold role. Public so a test can lower a plan whose
 /// colouring no CUDA canonical produces (the arena's `UnsizedColour`).
+// Public only so tests can reach refusals `lower_canonical` cannot; not part of the crate's API.
+#[doc(hidden)]
 pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     let arena = arena_layout(&plan);
     let kv = kv_cache(&plan);
@@ -1328,6 +1330,19 @@ pub struct GdnRegions {
     pub sequence: ArenaSpan,
     /// `gdn_scratch(bucket_m, …)`.
     pub scratch: ArenaSpan,
+    /// The geometry the scratch was sized by: the canonical's first `GatedDeltaNet`'s operand
+    /// widths, which every GDN op must share. The key heads, their dim and the conv kernel are the
+    /// model's (`CudaModelFacts::gdn`), the same for every op.
+    pub geometry: GdnWidths,
+}
+
+/// A `GatedDeltaNet`'s own geometry, its operand widths: `qkv`'s `conv_dim`, `z`'s `value_dim`
+/// and `a`'s value heads `nv` (so `head_v = value_dim / nv`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdnWidths {
+    pub conv_dim: u32,
+    pub value_dim: u32,
+    pub nv: u32,
 }
 
 /// The canonical's `GatedDeltaNet` steps, in tape order.
@@ -1369,13 +1384,17 @@ fn gdn_layers(plan: &CudaPlan) -> Vec<u32> {
 /// The GDN scratch's bytes at the bucket's rows, sized by the canonical's first `GatedDeltaNet`
 /// (`qkv`'s, `z`'s and `a`'s widths), or `None` when it has none. A later GDN op of another
 /// geometry is refused by its lowering (`GdnPool`).
-fn gdn_scratch_bytes(plan: &CudaPlan, rows: u32) -> Option<Result<u64, ArenaRefusal>> {
+fn gdn_scratch_bytes(plan: &CudaPlan, rows: u32) -> Option<Result<(u64, GdnWidths), ArenaRefusal>> {
     let first = gdn_steps(plan).next()?;
     let cols = |k: usize| (first.node.inputs.get(k)).map_or(0, |r| plan.graph.shape(r.tensor).cols);
-    let (conv_dim, value_dim, nv) = (cols(0), cols(1), cols(2));
+    let geometry = GdnWidths {
+        conv_dim: cols(0),
+        value_dim: cols(1),
+        nv: cols(2),
+    };
     Some(
-        gdn_scratch(rows, conv_dim, nv, value_dim)
-            .map(|s| s.bytes)
+        gdn_scratch(rows, geometry.conv_dim, geometry.nv, geometry.value_dim)
+            .map(|s| (s.bytes, geometry))
             .ok_or(ArenaRefusal::TooLarge),
     )
 }
@@ -1467,8 +1486,8 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
         })
         .transpose()?;
     let gdn = gdn_scratch_bytes(plan, hidden.rows)
-        .map(|scratch| {
-            let scratch = scratch?;
+        .map(|sized| {
+            let (scratch, geometry) = sized?;
             Ok(GdnRegions {
                 sequence: ArenaSpan {
                     offset: ArenaOffset(place(GDN_SEQUENCE_BYTES)?),
@@ -1478,6 +1497,7 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
                     offset: ArenaOffset(place(scratch)?),
                     bytes: scratch,
                 },
+                geometry,
             })
         })
         .transpose()?;

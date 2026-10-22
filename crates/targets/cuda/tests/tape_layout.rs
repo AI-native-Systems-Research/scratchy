@@ -36,13 +36,16 @@ use scratchy_subtile::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, Quer
 use scratchy_subtile::subtile_ir::{
     AttnMask, EwKind, GainConvention, RopeFormTag, RowScale, SourceShape, SubOp,
 };
+use scratchy_subtile::subtile_tape::Instr;
 use scratchy_target_cuda::step::{CudaStep, GemmBf16};
 use scratchy_target_cuda::tape::{ArenaOffset, CUDA_ARENA_ALIGN, CudaTape};
 use scratchy_target_cuda_compiler::canonical::{
     ArenaRefusal, AttnShapeRule, CanonicalAt, CanonicalRefusal, CudaGdnFacts, CudaModelFacts,
-    GateShapeRule, GdnShapeRule, GemmShapeRule, KvCacheRefusal, OperandRefusal, ProducerRefusal,
-    RopeShapeRule, RowShapeRule, ViewRefusal, lower_canonical,
+    GateShapeRule, GdnRegions, GdnShapeRule, GdnWidths, GemmShapeRule, KvCacheRefusal,
+    OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule, ViewRefusal, lower_canonical,
+    plan_canonical,
 };
+use scratchy_target_cuda_compiler::steps_from_tape::{StepCx, TapeStep, lower_step};
 
 fn lower_with(
     l: &LoweredDecode,
@@ -2013,4 +2016,75 @@ fn two_gdn_layers_of_two_geometries_are_refused() {
     }
     let e = gdn_refused(&l, &["another geometry"]);
     assert!(matches!(e, CanonicalRefusal::GdnPool { step: 13 }), "{e}");
+}
+
+/// `GdnPool` compares the GDN op's geometry with the one the scratch was sized by, not the
+/// scratch's bytes: `lower_step` on the GDN layer's step 5, given regions of the right bytes but a
+/// recorded geometry of 32 value heads, refuses it; given its own geometry, lowers it. No real
+/// canonical reaches the first case (no other geometry at 256 rows has the same scratch bytes), so
+/// the lowering function is called directly.
+#[test]
+fn a_gdn_op_is_checked_against_the_scratchs_geometry_not_its_bytes() {
+    let l = gdn_layer(256);
+    let at = CanonicalAt {
+        stem: "gdn_layer",
+        m: 256,
+    };
+    let c = lower_canonical(&l, QWEN3_5_GDN_FACTS, at).expect("the GDN layer lowers");
+    let gdn = c.gdn.expect("the GDN layer has GDN state");
+    let p = plan_canonical(&l, QWEN3_5_GDN_FACTS, at).expect("the GDN layer plans");
+    let computes: Vec<TapeStep<'_>> = (p.tape.instrs().iter())
+        .filter_map(|i| match i {
+            Instr::Compute {
+                node,
+                writes,
+                inputs,
+                ..
+            } => Some((&p.graph.nodes[node.index()], *writes, inputs)),
+            _ => None,
+        })
+        .enumerate()
+        .map(|(step, (node, writes, inputs))| TapeStep {
+            step,
+            node,
+            writes,
+            inputs,
+        })
+        .collect();
+    let lower = |geometry| {
+        let cx = StepCx {
+            graph: &p.graph,
+            bindings: &p.lowered.bindings,
+            colouring: &p.colouring,
+            facts: p.facts,
+            tokens: Some(256),
+            offsets: Ok(&c.colour_offsets),
+            rotary: None,
+            kv: Ok(None),
+            kv_regions: None,
+            gdn_layers: &[0],
+            gdn_regions: Some(GdnRegions {
+                sequence: gdn.sequence,
+                scratch: gdn.scratch,
+                geometry,
+            }),
+        };
+        lower_step(&cx, &computes[5], &computes)
+    };
+    let own = GdnWidths {
+        conv_dim: 6144,
+        value_dim: 2048,
+        nv: 16,
+    };
+    let lowered = lower(own);
+    assert!(
+        matches!(lowered, Ok(Some(CudaStep::GatedDeltaNet(_)))),
+        "{lowered:?}"
+    );
+    let other = lower(GdnWidths { nv: 32, ..own });
+    eprintln!("refused: {other:?}");
+    assert!(
+        matches!(other, Err(CanonicalRefusal::GdnPool { step: 5 })),
+        "{other:?}"
+    );
 }

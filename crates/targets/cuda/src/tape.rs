@@ -9,8 +9,9 @@
 //! host with no CUDA toolchain.
 
 use crate::step::{
-    AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, GDN_SEQUENCE_BYTES, GatedDeltaNetBf16,
-    RopeAppendBf16, RopeBf16, gdn_conv_dim, gdn_scratch,
+    AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
+    GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, RopeAppendBf16,
+    RopeBf16, gdn_conv_dim, gdn_scratch,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -322,6 +323,19 @@ pub enum TapeError {
     /// its kernels would address the state pool with other strides than the worker allocated it
     /// with.
     GdnStepGeometry { step: usize },
+    /// The tape's own GDN geometry is one the kernels do not take: `conv_kernel` outside
+    /// [`GDN_CONV_KERNEL_RANGE`] (0 included, which `GdnStateLayout::new` asserts against), no
+    /// key or value heads, value heads not a whole number per key head, `head_k` not
+    /// [`GDN_HEAD_K`], `head_v` not a non-zero multiple of [`GDN_HEAD_V_MULTIPLE`] up to
+    /// [`GDN_HEAD_V_MAX`], or a `conv_dim` that overflows `u32`. The worker would size its state
+    /// pool from it.
+    GdnGeometry {
+        num_k_heads: u32,
+        num_v_heads: u32,
+        head_k: u32,
+        head_v: u32,
+        conv_kernel: u32,
+    },
 }
 
 impl std::fmt::Display for TapeError {
@@ -547,6 +561,18 @@ impl std::fmt::Display for TapeError {
             Self::GdnStepGeometry { step } => write!(
                 f,
                 "step {step}'s heads, head dims or conv kernel are not the tape's GDN geometry"
+            ),
+            Self::GdnGeometry {
+                num_k_heads,
+                num_v_heads,
+                head_k,
+                head_v,
+                conv_kernel,
+            } => write!(
+                f,
+                "the tape's GDN geometry ({num_v_heads} value heads of {head_v} over \
+                 {num_k_heads} key heads of {head_k}, conv kernel {conv_kernel}) is not one the \
+                 CUDA GDN kernels take"
             ),
         }
     }
@@ -778,6 +804,33 @@ impl CudaTape {
         let Some(gdn) = self.gdn else {
             return Ok(None);
         };
+        let GdnTape {
+            num_k_heads,
+            num_v_heads,
+            head_k,
+            head_v,
+            conv_kernel,
+            ..
+        } = gdn;
+        let (kmin, kmax) = GDN_CONV_KERNEL_RANGE;
+        let takes = (kmin..=kmax).contains(&conv_kernel)
+            && num_k_heads > 0
+            && num_v_heads > 0
+            && num_v_heads.is_multiple_of(num_k_heads)
+            && head_k == GDN_HEAD_K
+            && head_v > 0
+            && head_v.is_multiple_of(GDN_HEAD_V_MULTIPLE)
+            && head_v <= GDN_HEAD_V_MAX
+            && gdn_conv_dim(num_k_heads, head_k, num_v_heads, head_v).is_some();
+        if !takes {
+            return Err(TapeError::GdnGeometry {
+                num_k_heads,
+                num_v_heads,
+                head_k,
+                head_v,
+                conv_kernel,
+            });
+        }
         // A scratch whose size overflows is one no span can match: `want` 0 never equals a
         // non-empty scratch's bytes, and an empty scratch is refused as shape below.
         let scratch_want = gdn.scratch_bytes(self.bucket_m).unwrap_or(0);
@@ -1877,25 +1930,78 @@ mod tests {
         );
     }
 
-    /// A GDN step whose conv kernel or head layout is not the tape's (each change keeps the tape's
-    /// own scratch the size it declares, so only the step disagrees).
+    /// A GDN step whose conv kernel or head layout is not the tape's, both valid geometries (each
+    /// change keeps the scratch the size both declare, so only the step and the tape disagree).
     #[test]
     fn gdn_step_geometry() {
+        let k3 = GdnTape {
+            conv_kernel: 3,
+            ..GDN
+        };
+        assert_eq!(
+            gdn_tape(Some(k3), &[good_gdn_step()]).validate(),
+            Err(TapeError::GdnStepGeometry { step: 0 })
+        );
+        // The step claims a 3-tap conv over the tape's 4: another ring stride than the pool's.
+        let step = CudaStep::GatedDeltaNet(GatedDeltaNetBf16 {
+            conv_kernel: 3,
+            ..gdn_step(0, GDN_SEQ, GDN_SCRATCH)
+        });
+        assert_eq!(
+            gdn_tape(Some(GDN), &[step]).validate(),
+            Err(TapeError::GdnStepGeometry { step: 0 })
+        );
+    }
+
+    /// A hand-written tape whose own GDN geometry the kernels do not take is refused by `validate`,
+    /// before `CudaWorker::new` would size a pool from it (and `GdnStateLayout::new` assert on a
+    /// conv kernel of 0).
+    #[test]
+    fn gdn_geometry() {
         for gdn in [
             GdnTape {
-                conv_kernel: 3,
+                conv_kernel: 0,
                 ..GDN
             },
-            // 2 key heads of 64 lanes: the same `conv_dim`, so the same scratch.
+            GdnTape {
+                conv_kernel: 1,
+                ..GDN
+            },
+            GdnTape {
+                conv_kernel: 9,
+                ..GDN
+            },
+            GdnTape {
+                num_k_heads: 0,
+                ..GDN
+            },
+            GdnTape {
+                num_v_heads: 0,
+                ..GDN
+            },
             GdnTape {
                 num_k_heads: 2,
-                head_k: 64,
+                num_v_heads: 3,
+                ..GDN
+            },
+            GdnTape { head_k: 64, ..GDN },
+            GdnTape { head_v: 40, ..GDN },
+            GdnTape { head_v: 512, ..GDN },
+            GdnTape {
+                num_v_heads: u32::MAX,
                 ..GDN
             },
         ] {
             assert_eq!(
-                gdn_tape(Some(gdn), &[good_gdn_step()]).validate(),
-                Err(TapeError::GdnStepGeometry { step: 0 })
+                gdn_tape(Some(gdn), &[]).validate(),
+                Err(TapeError::GdnGeometry {
+                    num_k_heads: gdn.num_k_heads,
+                    num_v_heads: gdn.num_v_heads,
+                    head_k: gdn.head_k,
+                    head_v: gdn.head_v,
+                    conv_kernel: gdn.conv_kernel,
+                }),
+                "{gdn:?}"
             );
         }
     }
