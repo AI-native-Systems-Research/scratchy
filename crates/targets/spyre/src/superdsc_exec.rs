@@ -905,8 +905,8 @@ pub struct Executor {
     staged: BTreeMap<bundle::PlaceId, u64>,
     /// ⭐⭐⭐⭐⭐ IDS BOUND THROUGH [`Executor::bind_const_fp32`] — fp32 constants whose LE host
     /// bytes ARE the device encoding (`Df::Fp32` is IEEE_FP32), so staging copies them VERBATIM:
-    /// no IEEE→SEN re-encode, no tile walk. The composite argmax's descending ramp and scalar-V
-    /// stick (#603 PR3a), and nothing else today.
+    /// no IEEE→SEN re-encode, no tile walk. The spliced argmax kernel's staged f32 constants
+    /// (the one-request rung's exactness island), and nothing else today.
     ///
     /// A set for the same reason [`Self::raw_ids`] is one: the staging loop consults it, and a
     /// flag remembered by the bind call alone is a flag the loop can forget.
@@ -1749,8 +1749,8 @@ impl Executor {
     }
 
     /// ⭐⭐⭐⭐⭐ Bind a RESIDENT FP32 CONSTANT at load — staged VERBATIM, once, never re-bound.
-    /// The composite argmax's descending ramp and scalar-V stick (#603 PR3a), and nothing else
-    /// today.
+    /// The spliced argmax kernel's staged f32 constants (the one-request rung's
+    /// exactness island), and nothing else today.
     ///
     /// ⛔ THIS IS NOT [`Self::bind_input_raw`], AND NOT A LAZIER [`Self::bind_weight`]. The raw
     /// channel is PER-STEP (a raw id bound before prepare is exactly the raw+weight combination
@@ -1775,7 +1775,7 @@ impl Executor {
             bail!(
                 "bind_const_fp32({id}): NO placement in this bundle — the layout did not place \
                  this const, so the caller's bind and the bundle's layout disagree about the \
-                 composite argmax. REFUSING"
+                 staged constants. REFUSING"
             );
         };
         if !bytes.len().is_multiple_of(4) {
