@@ -120,6 +120,14 @@ impl Dtype {
         }
     }
 
+    /// The dtype's element width in bytes.
+    pub fn size_bytes(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::F16 | Self::Bf16 => 2,
+        }
+    }
+
     /// `x` as this dtype holds it: an f16/bf16 store-and-reload, identity at f32.
     pub fn round(self, x: f32) -> f32 {
         match self {

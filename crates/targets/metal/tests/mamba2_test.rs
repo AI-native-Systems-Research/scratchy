@@ -23,7 +23,7 @@ use common::{Dtype, shared_bytes};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::gdn_state::{GdnSave, GdnSeqSlots, GdnSlot};
+use scratchy_target_metal::gdn_state::{GDN_SSM_STATE_DTYPE, GdnSave, GdnSeqSlots, GdnSlot};
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -35,6 +35,18 @@ type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>
 const EPS: f32 = 1e-5;
 /// The lowering's 1-D / channel threadgroup cap (`THREADS_PER_GROUP`).
 const THREADS: usize = 256;
+
+/// The pool's ssm entry dtype the GDN kernels read and write (`GDN_SSM_STATE_DTYPE`), as the
+/// dispatch `Dtype`: the harness' ssm buffers and the reference's carry-rounding go through it,
+/// so the constant and these tests cannot drift apart.
+fn ssm_entry_dtype() -> Dtype {
+    match GDN_SSM_STATE_DTYPE {
+        scratchy_tensors::DType::F16 => Dtype::F16,
+        scratchy_tensors::DType::BF16 => Dtype::Bf16,
+        scratchy_tensors::DType::F32 => Dtype::F32,
+        other => panic!("the ssm state's dtype {other:?} has no dispatch form"),
+    }
+}
 
 /// The GPU, one test at a time. Apple's driver corrupts its own heap when these tests build their
 /// pipelines at the same time, each through its own `SpecializedPipelineCache` (crash reports: in
@@ -260,7 +272,7 @@ impl Gpu {
             cache: SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders"),
             conv_state: shared(&device, conv),
             // The pool's ssm entry is f16, the kernels' `device half*`.
-            ssm_state: shared_bytes(&device, &Dtype::F16.bytes(ssm)),
+            ssm_state: shared_bytes(&device, &ssm_entry_dtype().bytes(ssm)),
             conv_w: shared(&device, &dtype.bytes(&w.conv_w)),
             conv_b: shared(&device, &dtype.bytes(&w.conv_b)),
             a_log: shared(&device, &w.a_log),
@@ -288,13 +300,16 @@ impl Gpu {
         let floats = |b: &Buffer| b.length() / 4;
         (
             read(&self.conv_state, floats(&self.conv_state)),
-            Dtype::F16.decode(&self.ssm_state, self.ssm_state.length() / 2),
+            ssm_entry_dtype().decode(
+                &self.ssm_state,
+                self.ssm_state.length() / ssm_entry_dtype().size_bytes(),
+            ),
         )
     }
 
     /// Make the pools hold `conv` and `ssm`, the ssm rounded through its f16 entry.
     fn load(&self, conv: &[f32], ssm: &[f32]) {
-        let ssm = Dtype::F16.bytes(ssm);
+        let ssm = ssm_entry_dtype().bytes(ssm);
         assert_eq!(
             self.conv_state.length(),
             std::mem::size_of_val(conv),
@@ -553,7 +568,7 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step], routed: bool) 
             // entry and the next step loads it back; the reference carries f32 registers, so
             // round its state at the same point.
             for v in states[slot].ssm.iter_mut() {
-                *v = Dtype::F16.round(*v);
+                *v = ssm_entry_dtype().round(*v);
             }
             carried.extend(std::iter::repeat_n(!fresh, n * geo.inner()));
         }
@@ -585,7 +600,7 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step], routed: bool) 
         }
     }
     let conv = read::<f32>(&gpu.conv_state, slots * ring);
-    let ssm_got = Dtype::F16.decode(&gpu.ssm_state, slots * ssm);
+    let ssm_got = ssm_entry_dtype().decode(&gpu.ssm_state, slots * ssm);
     for slot in steps.iter().flatten().map(|s| s.0) {
         for (j, (&g, &r)) in conv[slot * ring..][..ring]
             .iter()
@@ -764,7 +779,7 @@ fn snapshots(geo: Geometry, dtype: Dtype, routed: bool) {
     let start = (
         conv0,
         ssm0.iter()
-            .map(|&x| Dtype::F16.round(x))
+            .map(|&x| ssm_entry_dtype().round(x))
             .collect::<Vec<_>>(),
     );
     same(slot(&after, 0), slot(&start, 0), "slot 0");
