@@ -65,6 +65,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 using namespace kittens;
 
@@ -130,16 +131,28 @@ static_assert(ATTN_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 22
 // when `m_new == m_old` (the tile raised no score above the running max, as for a tile masked out
 // for the row). `(m_old − m_new) · c` has no product feeding a sum, so nothing contracts into an
 // FMA; the select makes the unchanged case exact without relying on `exp2(0)`'s rounding.
-// `m_old = −inf` (the first tile) gives `exp2(−inf) = 0`. Element-wise over the vectors' own
-// registers: the three vectors share one type, so index `[i][k]` is the same row in each.
+// `m_old = −inf` (the first tile) gives `exp2(−inf) = 0`.
+//
+// The vectors are `col_vec<rt_fl<16, 64>>`: a row-layout tile's column vector, whose layout is
+// `ortho` (`rt_base::col_vec_layout`), so `inner_dim` is 1 and `dtype` is the packed `float2`
+// (`rv::dtype`: `is_naive` is false). Each `[i][0]` holds two rows of subtile `i`: `.x` the top
+// row and `.y` the bottom one, as `row_reduce` writes them (`accum_packed.x` from the top row,
+// `.y` from the bottom) and `row_map` reads them (`row_values[i][0].x` scales the top row, `.y`
+// the bottom). So the select and the exp2 run on `.x` and `.y` separately. The loops are TK's own
+// vector `bin_op`'s (`ops/group/register/vec/maps.cuh`): `i < outer_dim`, `j < inner_dim`.
+__device__ inline float rescale_one(float o, float n, float c) {
+    return o == n ? 1.0f : exp2f((o - n) * c);
+}
+
 template <typename V>
 __device__ inline void rescale(V& dst, const V& m_old, const V& m_new, float c) {
+    static_assert(std::is_same_v<typename V::dtype, float2>, "a packed f32 column vector");
 #pragma unroll
     for (int i = 0; i < V::outer_dim; i++) {
 #pragma unroll
-        for (int k = 0; k < V::inner_dim; k++) {
-            const float o = m_old.data[i][k], n = m_new.data[i][k];
-            dst.data[i][k] = o == n ? 1.0f : exp2f((o - n) * c);
+        for (int j = 0; j < V::inner_dim; j++) {
+            dst[i][j].x = rescale_one(m_old[i][j].x, m_new[i][j].x, c);
+            dst[i][j].y = rescale_one(m_old[i][j].y, m_new[i][j].y, c);
         }
     }
 }
