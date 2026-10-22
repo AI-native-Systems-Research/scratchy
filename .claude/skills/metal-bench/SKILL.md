@@ -28,7 +28,10 @@ runs everything else.
   scratchy runs at its defaults on every Mac, and every cell runs: one
   that runs out of memory is recorded as failed. The page keeps every
   other engine's numbers, and scratchy's frozen launches, from the last full
-  run, each tagged with its date. About 40 minutes on the M3 Pro.
+  run, each tagged with its date. About 40 minutes on the M3 Pro. A later run
+  into the same `--out-dir` reuses each model's binary when it was built from
+  the same commit and features with a clean tree, so it skips the builds; the
+  run records `build_reused` and no build time for it.
 - A **full run** renews every number: `--full` adds the comparison engines
   (oMLX and oMLX TurboQuant), frozen (needs `sudo purge`), three reps, four
   rounds of each users count a cell, and the 512- and 2048-token answers at

@@ -1131,9 +1131,21 @@ PY
     [[ -n "${GRID_CONC_LIST}" ]] || GRID_CONC_LIST=${BASE_CONC}
 
     feats="metal,serve,bench,model/$(model_preset "${stem}")${quant:+,quant/${quant}}"
-    build_secs=""; bytes=""; built=1
-    if (( ! SKIP_BUILD )); then
+    build_secs=""; bytes=""; built=1; reused=0
+    # A binary an earlier run into this directory built from this commit, with these features
+    # and a clean tree, is this build: reuse it rather than compile the model again.
+    model_bin="${RAW}/scr-${stem}"
+    stamp_want="$(git -C "${ROOT}" rev-parse HEAD) ${feats}"
+    if (( ! SKIP_BUILD )) && [[ -x "${model_bin}" && -z "$(git -C "${ROOT}" status --porcelain)" ]] \
+            && [[ "$(cat "${model_bin}.built" 2>/dev/null)" == "${stamp_want}" ]]; then
+        echo "--- build -F ${feats}: reused ${model_bin} (built from this commit)"
+        reused=1
+        cp "${model_bin}" "${BIN}"
+        bytes=$(stat -f%z "${BIN}")
+    elif (( ! SKIP_BUILD )); then
         echo "--- build -F ${feats}"
+        # Only a build from a clean tree is this commit's, so only it is stamped for reuse.
+        [[ -z "$(git -C "${ROOT}" status --porcelain)" ]] || stamp_want=""
         t0=$(date +%s)
         if cargo build --release -p scratchy-cli --features "${feats}" >"${RAW}/build-${stem}.log" 2>&1; then
             build_secs=$(( $(date +%s) - t0 ))
@@ -1146,9 +1158,13 @@ PY
             (( FAIL_FAST )) && die "--fail-fast: stopping at ${stem}'s build failure"
         fi
     fi
-    # The next build overwrites ${BIN}, so each model keeps its own copy.
-    model_bin="${RAW}/scr-${stem}"
-    (( built )) && cp "${BIN}" "${model_bin}"
+    # The next build overwrites ${BIN}, so each model keeps its own copy, stamped with what built it.
+    if (( built )) && [[ -n "${build_secs}" ]]; then
+        cp "${BIN}" "${model_bin}"
+        if [[ -n "${stamp_want}" ]]; then echo "${stamp_want}" > "${model_bin}.built"; else rm -f "${model_bin}.built"; fi
+    elif (( built && SKIP_BUILD )); then
+        cp "${BIN}" "${model_bin}"   # --skip-build: whatever ${BIN} is, as before; no stamp
+    fi
 
     # Every per-model file an earlier run into this directory left, a declined
     # engine's included: a decline is this run's finding, not a sticky one.
@@ -1302,7 +1318,7 @@ PY
     fi
 
     ENGINE_KEYS="$(for row in "${ENGINE_ROWS[@]}"; do echo "${row%%|*}"; done)"; export ENGINE_KEYS
-    OFFLINE="${OFFLINE}" BASE_CONC="${BASE_CONC}" CONC_LIST="${CONC_LIST}" GRID_CONC_LIST="${GRID_CONC_LIST}" \
+    OFFLINE="${OFFLINE}" BUILD_REUSED="${reused}" BASE_CONC="${BASE_CONC}" CONC_LIST="${CONC_LIST}" GRID_CONC_LIST="${GRID_CONC_LIST}" \
     python3 - "${JSON}" "${RAW}" "${stem}" "${id}" "${quant}" "${feats}" "${built}" \
               "${build_secs}" "${bytes}" "${parity_ok}" "${MLX_PYTHON}" <<'PY'
 import glob, json, os, re, sys
@@ -1369,7 +1385,10 @@ d["models"].append({
     "built": built == "1",
     # null = gate not run (no mlx-lm, or no build); false = gate failed, nothing timed.
     "parity_mlx_lm": (parity_ok == "1") if (mlx_python and built == "1") else None,
+    # build_seconds is null for a binary an earlier run into the same --out-dir built from
+    # this commit and these features (build_reused), as it is for --skip-build.
     "footprint": {"build_seconds": int(secs) if secs else None,
+                  "build_reused": env.get("BUILD_REUSED") == "1",
                   "binary_bytes": int(size) if size else None,
                   "container_image_bytes": None,
                   "note": "no container image: Metal is not available in Linux containers"},
