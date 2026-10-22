@@ -5219,6 +5219,17 @@ impl Executor {
     /// index stick, read at the dtype its producer's kernel signature stated)
     /// is decoded by the CALLER, because only the wiring knows the dtype. Same
     /// clamps: to `cap_bytes`, and to what the transfer actually brought back.
+    ///
+    /// ⭐ THE TRANSFER IS THE PLACEMENT'S OWN WINDOW, never its segment's
+    /// allocation — the same law [`Self::predict`] states for the row: this
+    /// sits on the TOKEN critical path (the answer re-point's whole point is
+    /// that the ~100 KB row readback collapses to the stick's own bytes), and
+    /// a whole-segment D2H would price the token by whatever else the segment
+    /// packs (measured: the whole-segment read held mean ITL at the row
+    /// readback's level — the collapse never reached the wire). Rides the
+    /// COMPUTE pipeline for the same #544 reason the row's readback does: its
+    /// CB queues behind the step's compute CBs and the FIFO carries the
+    /// ordering the host-side wait used to.
     pub fn read_tensor_raw(&mut self, id: bundle::PlaceId, cap_bytes: usize) -> Result<Vec<u8>> {
         let p = self
             .places
@@ -5237,12 +5248,37 @@ impl Executor {
                 p.bank
             );
         }
-        let got = self.d2h_seg_clamped(seg)?;
-        let mut bytes = p.size as usize;
-        bytes = bytes.min(cap_bytes);
+        let addr = self.seg_addr[seg.get()]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{} has no region", seg.get()))?;
+        let tot = addr.total_size().as_u64();
+        let want = (p.size as u64).min(cap_bytes as u64);
+        // The round-up to a flit is not optional (`Flits::from_bytes` TRUNCATES),
+        // and the same two facts predict's window relies on hold here by the
+        // same cargo-build guard (`audit_layout_addresses`): the offset is
+        // 128-aligned and offset+size stays inside the region.
+        let len = crate::lower_subtile_tape_to_superdsc::align128(want).min(tot - p.offset);
+        // A multi-chunk region has no addressable sub-window; fall back to the
+        // whole-region read, exactly as predict does.
+        let win = (len < tot)
+            .then(|| addr.window(ByteOffset(p.offset), ByteSize(len)))
+            .flatten();
+        let (src, a, b) = match win.as_ref() {
+            Some(w) => (w, p.offset, p.offset + len),
+            None => (addr, 0, tot),
+        };
+        let host = &mut self.seg_host[seg.get()][a as usize..b as usize];
+        self.stream
+            .as_ref()
+            .ok_or_else(|| anyhow!("no stream — prepare was not called"))?
+            .d2h_on_compute(host, src)
+            .map_err(|e| anyhow!("read_tensor_raw({id}) D2H: {e}"))?;
+        self.stream_ref()?
+            .synchronize()
+            .map_err(|e| anyhow!("read_tensor_raw({id}) sync: {e}"))?;
         // May only return the bytes the transfer actually brought back.
-        let avail = (got as u64).saturating_sub(p.offset) as usize;
-        let n = bytes.min(avail);
+        let avail = (b - p.offset) as usize;
+        let n = (p.size as usize).min(cap_bytes).min(avail);
         if n == 0 {
             return Ok(Vec::new()); // a wholly-unreadable placement also has no valid base
         }
