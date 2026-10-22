@@ -1728,6 +1728,142 @@ fn commit(run: &Run) -> Element {
     rsx! { a { href: "{REPO}/commit/{run.repo.sha}", code { "{run.repo.sha8()}" } } }
 }
 
+/// The numbers a model's timeline follows across its runs on a machine: its one-user throughput
+/// and time to first token at the base cell, each run's own.
+const TIMELINE_METRICS: [(Metric, &str); 2] = [
+    (Metric::Throughput, "tok/s, 1 user"),
+    (Metric::Ttft, "TTFT ms, 1 user"),
+];
+
+/// A timeline's steps at one metric: a step a run, scratchy's value and the rival's where that
+/// run measured each itself.
+fn timeline_steps(kept: &[&Entry], rival: Option<Engine>, metric: Metric) -> Vec<Step> {
+    (kept.iter().enumerate())
+        .map(|(i, e)| Step {
+            x: (i + 1) as f64,
+            scratchy: timing(own_cell(e, Engine::Scratchy), metric),
+            rival: rival.and_then(|r| timing(own_cell(e, r), metric)),
+            highlight: false,
+        })
+        .collect()
+}
+
+/// An engine's one-user cell in a run, where that run measured it itself (not borrowed).
+fn own_cell<'a>(e: &Entry<'a>, engine: Engine) -> Option<&'a Cell> {
+    (engine == Engine::Scratchy || !e.m.borrowed.contains_key(engine.key()))
+        .then(|| by_users(e.m, e.run, engine).get(&1).copied())
+        .flatten()
+}
+
+/// A model's timelines over its runs on a machine, oldest first, one a metric
+/// ([`TIMELINE_METRICS`]): scratchy's line and the first rival any run measured, each a run's own
+/// measurement. A rival a run borrowed ([`Model::borrowed`]) is no measurement of that run's, so
+/// its line continues dotted there, carried from the last run that measured it. Runs whose
+/// one-user cell is at another shape (another answer length) measured something else, so a
+/// timeline keeps the newest run's shape. The fill carries its ×-factor at the first and the last
+/// run, as the spyre page's do: where scratchy started, and where it stands. Empty with fewer than
+/// two runs: one point is not a line.
+fn model_timelines(entries: &[Entry]) -> Vec<(&'static str, Element)> {
+    let Some(newest) = entries.last() else {
+        return Vec::new();
+    };
+    let shape = users_shape(newest.m, newest.run);
+    let kept: Vec<&Entry> = (entries.iter())
+        .filter(|e| users_shape(e.m, e.run) == shape)
+        .collect();
+    if kept.len() < 2 {
+        return Vec::new();
+    }
+    let rival = Engine::RIVALS
+        .into_iter()
+        .find(|&r| kept.iter().any(|e| own_cell(e, r).is_some()));
+    let names: Vec<String> = (kept.iter())
+        .map(|e| e.run.generated_utc.month_day().to_string())
+        .collect();
+    let rival_side = rival.unwrap_or(Engine::Scratchy).side();
+    let against = rival.map_or("alone".to_string(), |r| format!("against {}", r.label()));
+    TIMELINE_METRICS
+        .iter()
+        .map(|&(metric, value)| {
+            let mut steps = timeline_steps(&kept, rival, metric);
+            let measured = |s: &Step| s.scratchy.is_some();
+            if let Some(first) = steps.iter().position(measured) {
+                steps[first].highlight = true;
+            }
+            if let Some(last) = steps.iter().rposition(measured) {
+                steps[last].highlight = true;
+            }
+            let chart = sparkline(
+                &steps,
+                SparkAxes {
+                    better: metric.better(),
+                    along: "run",
+                    value,
+                    carry: true,
+                },
+                Engine::Scratchy.side(),
+                rival_side,
+                Some(names.clone()),
+                "5rem",
+                &format!("{value} over its runs, scratchy {against}"),
+            );
+            (value, chart)
+        })
+        .collect()
+}
+
+/// The Over time section's charts, titled: none until some model of the current lineup has two
+/// runs of one shape on one machine. Only the current lineup, as in the overview ([`lineup`]): a
+/// model an older round ran keeps its runs in its machine's own section.
+fn over_time_charts(machines: &BTreeMap<&str, MachineRuns>) -> Vec<(String, Element)> {
+    let lineup = lineup(machines).unwrap_or_default();
+    let current = |stem: &str| lineup.iter().any(|c| c.small == stem || c.large == stem);
+    let mut charts = Vec::new();
+    for chip in in_order(machines) {
+        for (stem, entries) in machines[chip].models.iter().filter(|(s, _)| current(s)) {
+            for (value, chart) in model_timelines(entries) {
+                charts.push((format!("{chip} · {stem} · {value}"), chart));
+            }
+        }
+    }
+    charts
+}
+
+/// The Over time section: every machine's models over their runs, a small timeline a machine,
+/// model and metric, as the spyre page shows its cells. Nothing until some model has two runs of
+/// one shape on one machine.
+fn over_time(machines: &BTreeMap<&str, MachineRuns>) -> Element {
+    let charts = over_time_charts(machines);
+    if charts.is_empty() {
+        return rsx! {};
+    }
+    let grid = "display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); \
+                column-gap: 1.5rem; row-gap: 1.25rem; align-items: start";
+    rsx! {
+        Section { id: "over-time", level: 2,
+            Stack { gap: 4,
+                Heading { "Over time" }
+                p {
+                    "Each model's one-user throughput and time to first token at its base cell, a \
+                     point a run on its Mac, oldest first, scratchy against the first engine any \
+                     run there measured. A run of scratchy alone (a quick run) takes the other \
+                     engine's line dotted, carried from the last run that measured it, and the fill \
+                     between the lines follows it. The fill is labelled with its ×-factor at the \
+                     first run and the newest: where scratchy started, and where it stands now."
+                }
+                div { style: "{grid}",
+                    for (title, chart) in charts {
+                        div {
+                            p { style: "font-size: 0.875rem; margin: 0 0 0.25rem", "{title}" }
+                            {chart}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn history(entries: &[Entry]) -> Element {
     if entries.len() < 2 {
         return rsx! {};
@@ -2603,10 +2739,15 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
         }
     } else {
         sections.push(("glance".to_string(), "At a glance".to_string()));
+        // No link to a section that is not there.
+        if !over_time_charts(&machines).is_empty() {
+            sections.push(("over-time".to_string(), "Over time".to_string()));
+        }
         let order = in_order(&machines);
         sections.extend(order.iter().map(|chip| (slug(chip), chip.to_string())));
         rsx! {
             {glance(&machines)}
+            {over_time(&machines)}
             for chip in &order { {machine_section(chip, &machines[chip])} }
         }
     };
@@ -3061,5 +3202,55 @@ mod tests {
         );
         json["config"]["failures_counted"] = true.into();
         assert_eq!(judged(&json), 0, "a run that counted its failures is not");
+    }
+
+    /// A timeline steps through a machine's runs of one shape: scratchy at every run, the rival
+    /// only at the run that measured it, so a quick run's carried oMLX is no point of its own.
+    #[test]
+    fn a_timeline_takes_the_rival_only_from_the_runs_that_measured_it() {
+        use super::data::Run;
+        use super::numbers::{Engine, Metric};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
+        );
+        let full: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let quick = |when: &str| {
+            let mut v = full.clone();
+            v["generated_utc"] = when.into();
+            for m in v["models"].as_array_mut().unwrap() {
+                m.as_object_mut()
+                    .unwrap()
+                    .retain(|k, _| !(k.starts_with("scaling_") || k.starts_with("cache_ladder_")));
+            }
+            v
+        };
+        let mut runs: Vec<Run> = [
+            quick("2026-10-13T12:00:00Z"),
+            full.clone(),
+            quick("2026-10-15T12:00:00Z"),
+        ]
+        .into_iter()
+        .map(|v| serde_json::from_value(v).unwrap())
+        .collect();
+        super::borrow_earlier(&mut runs);
+        let machines = super::index(&runs);
+        let mr = &machines["Apple M5 Max"];
+        let (stem, entries) = &mr.models[0];
+        let kept: Vec<&super::Entry> = entries.iter().collect();
+        assert_eq!(kept.len(), 3, "{stem}");
+        let steps = super::timeline_steps(&kept, Some(Engine::OmlxTq), Metric::Throughput);
+        assert!(
+            steps.iter().all(|s| s.scratchy.is_some()),
+            "scratchy at every run"
+        );
+        let rival: Vec<bool> = steps.iter().map(|s| s.rival.is_some()).collect();
+        assert_eq!(
+            rival,
+            [false, true, false],
+            "oMLX only where it was measured"
+        );
+        assert_eq!(super::model_timelines(entries).len(), 2);
     }
 }
