@@ -515,6 +515,10 @@ pub(crate) struct Rep {
     /// rather than comparing a half-written answer.
     #[serde(skip)]
     pub crash: Option<String>,
+    /// CLI mode: the end of the child's stderr, however it exited. The parity gate reads
+    /// scratchy's answer token ids from it (`[diag] token_ids=`).
+    #[serde(skip)]
+    pub stderr_tail: String,
 }
 
 /// How much of a CLI child's stderr an error message carries.
@@ -650,6 +654,7 @@ fn run_cli(argv: &[String], backend: Backend) -> Result<Rep> {
         major_faults: usage.major_faults,
         text,
         crash,
+        stderr_tail: tail,
         ..Default::default()
     })
 }
@@ -1198,12 +1203,103 @@ fn normalize(s: &str, backend: Backend) -> String {
         .join(" ")
 }
 
+/// The largest logit gap, from the reference's top token to the one scratchy picked, that still
+/// counts as a near-tie two correct stacks break differently. Measured on gpt-oss-20b and
+/// Nemotron-3-Nano-30B, whose thought preambles tie on every prompt (M3 Pro, mlx-lm 0.31.3): each
+/// token where they part from mlx-lm is 0.0 to 0.75 logits behind its top, and every other token
+/// is its top. A wrong computation is nowhere near: the same answer with its token ids shifted
+/// by one is 28.1 behind, on 34 of its 35 later tokens.
+const TIE_LOGITS: f64 = 1.0;
+
+/// How many of an answer's tokens may be near-ties. The measured answers part on at most 3 of
+/// 12; a load path that drifts many tokens each a little off is no tie.
+const MAX_TIES: usize = 4;
+
+/// What the score command found on one answer ([`TIE_LOGITS`]).
+#[derive(serde::Deserialize)]
+struct Ties {
+    tokens: usize,
+    differ: Vec<Tie>,
+    max_gap: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct Tie {
+    at: usize,
+    scratchy: String,
+    mlx_lm: String,
+    gap: f64,
+}
+
+impl Ties {
+    /// None when the answer is the reference's up to near-ties, else why not. No token
+    /// differing is the reference's own greedy answer, whose text differs only in how the two
+    /// print it (mlx_lm.generate shows gpt-oss's special tokens, `scr chat` drops them).
+    fn defect(&self) -> Option<String> {
+        if self.max_gap > TIE_LOGITS {
+            return Some(format!(
+                "a token {:.3} logits behind the reference's top (a near-tie is at most {TIE_LOGITS})",
+                self.max_gap
+            ));
+        }
+        if self.differ.len() > MAX_TIES {
+            return Some(format!(
+                "{} of {} tokens differ (at most {MAX_TIES} near-ties)",
+                self.differ.len(),
+                self.tokens
+            ));
+        }
+        None
+    }
+}
+
+/// The answer token ids `scr chat` prints with `VLLM_PRINT_TOKEN_IDS` set (`[diag] token_ids=[..]`).
+fn diag_token_ids(stderr: &str) -> Option<Vec<u32>> {
+    let line = stderr
+        .lines()
+        .rev()
+        .find(|l| l.contains("[diag] token_ids="))?;
+    let list = line.split("token_ids=").nth(1)?;
+    let list = &list[..=list.find(']')?];
+    serde_json::from_str(list).ok()
+}
+
+/// Score an answer whose text differs: run `score_cmd` on its token ids.
+fn score_ties(score_cmd: &[String], prompt: &str, tokens: &[u32]) -> Result<Ties> {
+    let file = std::env::temp_dir().join(format!("parity-tokens-{}.json", std::process::id()));
+    std::fs::write(&file, serde_json::to_string(tokens)?)?;
+    let argv: Vec<String> = score_cmd
+        .iter()
+        .map(|a| {
+            a.replace("{prompt}", prompt)
+                .replace("{tokens}", &file.to_string_lossy())
+        })
+        .collect();
+    let out = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stderr(Stdio::inherit())
+        .output()
+        .with_context(|| format!("failed to exec {}", argv[0]));
+    let _ = std::fs::remove_file(&file);
+    let out = out?;
+    anyhow::ensure!(
+        out.status.success(),
+        "the parity score command {}",
+        out.status
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let last = text.lines().rev().find(|l| l.trim_start().starts_with('{'));
+    serde_json::from_str(last.unwrap_or_default())
+        .with_context(|| format!("the parity score command printed no result: {text}"))
+}
+
 fn parity_gate(
     a_cmd: &[String],
     a_backend: Backend,
     b_cmd: &[String],
     b_backend: Backend,
     model: &str,
+    score_cmd: Option<&[String]>,
 ) -> Result<()> {
     println!("=== parity gate: same model, greedy, high-confidence prompts ===");
     let mut failures = Vec::new();
@@ -1215,22 +1311,70 @@ fn parity_gate(
         if let Some(why) = rep.crash {
             anyhow::bail!("the {backend:?} child crashed on the {name} prompt: {why}");
         }
-        Ok(normalize(&rep.text, backend))
+        Ok((normalize(&rep.text, backend), rep.stderr_tail))
+    };
+    // `scr chat` prints its answer's token ids with VLLM_PRINT_TOKEN_IDS set, which the score
+    // command reads; only that child gets it.
+    let a_cmd: Vec<String> = match score_cmd {
+        Some(_) => ["/usr/bin/env", "VLLM_PRINT_TOKEN_IDS=1"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(a_cmd.iter().cloned())
+            .collect(),
+        None => a_cmd.to_vec(),
     };
     for (name, prompt, ntok) in parity_prompts(model) {
-        let a = answer(a_cmd, a_backend, name, prompt, *ntok)?;
-        let b = answer(b_cmd, b_backend, name, prompt, *ntok)?;
+        let (a, a_err) = answer(&a_cmd, a_backend, name, prompt, *ntok)?;
+        let (b, _) = answer(b_cmd, b_backend, name, prompt, *ntok)?;
         let agree = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
         let common = a.chars().count().min(b.chars().count());
         let exact = common > 0 && agree == common;
-        println!(
-            "  {name:<9} {:<5} agree {agree}/{common} chars",
-            if exact { "OK" } else { "FAIL" }
-        );
-        if !exact {
-            println!("      a: {a}");
-            println!("      b: {b}");
-            failures.push(*name);
+        if exact {
+            println!("  {name:<9} OK    agree {agree}/{common} chars");
+            continue;
+        }
+        // Where the text differs, the reference judges each token scratchy picked: a near-tie
+        // passes, anything else fails.
+        let judged = score_cmd.map(|cmd| -> Result<Ties> {
+            let ids = diag_token_ids(&a_err).with_context(|| {
+                format!("the {a_backend:?} child printed no token ids on the {name} prompt")
+            })?;
+            score_ties(cmd, prompt, &ids)
+        });
+        let verdict = match judged {
+            Some(Ok(t)) if t.differ.is_empty() => {
+                println!(
+                    "  {name:<9} OK    every one of its {} tokens is mlx-lm's top (the text differs \
+                     only in how it prints)",
+                    t.tokens
+                );
+                continue;
+            }
+            None => Err("no score command".to_string()),
+            Some(Err(e)) => Err(format!("{e:#}")),
+            Some(Ok(t)) => match t.defect() {
+                None => Ok(t),
+                Some(why) => {
+                    print_ties(&t);
+                    Err(why)
+                }
+            },
+        };
+        match verdict {
+            Ok(t) => {
+                println!(
+                    "  {name:<9} TIE   agree {agree}/{common} chars; {} near-tie token(s), at most {:.3} logits",
+                    t.differ.len(),
+                    t.max_gap
+                );
+                print_ties(&t);
+            }
+            Err(why) => {
+                println!("  {name:<9} FAIL  agree {agree}/{common} chars ({why})");
+                println!("      a: {a}");
+                println!("      b: {b}");
+                failures.push(*name);
+            }
         }
     }
     anyhow::ensure!(
@@ -1240,8 +1384,17 @@ fn parity_gate(
          Every timing below would be measuring a different computation. Refusing to benchmark.",
         failures.join(", ")
     );
-    println!("  PARITY OK — all high-confidence prompts match exactly.");
+    println!("  PARITY OK — all high-confidence prompts match, up to near-ties.");
     Ok(())
+}
+
+fn print_ties(t: &Ties) {
+    for d in &t.differ {
+        println!(
+            "      token {:>3}: scratchy {:?}, mlx-lm {:?}, {:.3} logits behind",
+            d.at, d.scratchy, d.mlx_lm, d.gap
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1322,7 +1475,15 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
     };
 
     if let Some(ref other) = ex.parity_cmd {
-        parity_gate(&argv, ex.backend, &other.argv, ex.parity_backend, &model)?;
+        let score = ex.parity_score_cmd.as_ref().map(|c| c.argv.as_slice());
+        parity_gate(
+            &argv,
+            ex.backend,
+            &other.argv,
+            ex.parity_backend,
+            &model,
+            score,
+        )?;
     }
 
     // Provenance: a number without its machine state is not a result.
@@ -1743,6 +1904,7 @@ mod tests {
             &crashing,
             Backend::Scratchy,
             "mlx-community/Qwen3.6-35B-A3B-4bit",
+            None,
         )
         .expect_err("a crashing side fails the gate");
         let msg = format!("{err:#}");
@@ -1751,6 +1913,99 @@ mod tests {
             "{msg}"
         );
         assert!(!msg.contains("load path"), "reported as a mismatch: {msg}");
+    }
+
+    /// The token ids `scr chat` prints with VLLM_PRINT_TOKEN_IDS set, from the end of its stderr.
+    #[test]
+    fn the_gate_reads_scratchys_token_ids_from_its_stderr() {
+        let err = "INFO loading\n[diag] token_ids=[200005, 35644, 976] text=\"x\" finish_reason=Some(Length)\n";
+        assert_eq!(diag_token_ids(err), Some(vec![200005, 35644, 976]));
+        assert_eq!(diag_token_ids("INFO nothing here"), None);
+    }
+
+    /// A near-tie is a token at most TIE_LOGITS behind the reference's top, on few tokens; a
+    /// token far behind, or many a little behind, is a defect.
+    #[test]
+    fn a_near_tie_passes_and_a_far_or_many_token_difference_fails() {
+        let tie = |at, gap| Tie {
+            at,
+            scratchy: "We".into(),
+            mlx_lm: "The".into(),
+            gap,
+        };
+        // gpt-oss-20b's arith answer, as mlx-lm scored it on the M3 Pro.
+        let gpt_oss = Ties {
+            tokens: 12,
+            differ: vec![tie(3, 0.375), tie(4, 0.0), tie(7, 0.75)],
+            max_gap: 0.75,
+        };
+        assert!(gpt_oss.defect().is_none());
+        let far = Ties {
+            tokens: 40,
+            differ: vec![tie(5, 28.125)],
+            max_gap: 28.125,
+        };
+        assert!(far.defect().unwrap().contains("28.125 logits"));
+        let many = Ties {
+            tokens: 40,
+            differ: (0..5).map(|i| tie(i, 0.5)).collect(),
+            max_gap: 0.5,
+        };
+        assert!(many.defect().unwrap().contains("5 of 40"));
+        let none = Ties {
+            tokens: 12,
+            differ: vec![],
+            max_gap: 0.0,
+        };
+        assert!(
+            none.defect().is_none(),
+            "no token differing is the reference's own answer"
+        );
+    }
+
+    /// Text that differs passes when the score command calls every differing token a near-tie,
+    /// and fails when it does not; without a score command, any difference fails.
+    #[test]
+    fn the_gate_passes_a_near_tie_the_score_command_measured() {
+        let sh = |cmd: &str| -> Vec<String> { ["/bin/sh", "-c", cmd].map(String::from).to_vec() };
+        let scratchy = sh("echo We need {prompt}; echo '[diag] token_ids=[1, 2, 3]' >&2");
+        let reference = sh("echo The user {prompt}");
+        let scored = |json: &str| sh(&format!("cat {{tokens}} >/dev/null && echo '{json}'"));
+        let model = "mlx-community/some-model-4bit";
+        let near = scored(
+            r#"{"tokens": 3, "differ": [{"at": 0, "scratchy": "We", "mlx_lm": "The", "gap": 0.375}], "max_gap": 0.375}"#,
+        );
+        parity_gate(
+            &scratchy,
+            Backend::Scratchy,
+            &reference,
+            Backend::Scratchy,
+            model,
+            Some(&near),
+        )
+        .expect("a near-tie passes");
+        let far = scored(
+            r#"{"tokens": 3, "differ": [{"at": 0, "scratchy": "We", "mlx_lm": "The", "gap": 9.5}], "max_gap": 9.5}"#,
+        );
+        let err = parity_gate(
+            &scratchy,
+            Backend::Scratchy,
+            &reference,
+            Backend::Scratchy,
+            model,
+            Some(&far),
+        )
+        .expect_err("a token far behind fails");
+        assert!(format!("{err:#}").contains("load path"));
+        parity_gate(
+            &scratchy,
+            Backend::Scratchy,
+            &reference,
+            Backend::Scratchy,
+            model,
+            None,
+        )
+        .expect_err("without a score command any difference fails");
     }
 
     /// The gate asks GLM-4.5-Air-3bit and Qwen3.6-35B-A3B questions their

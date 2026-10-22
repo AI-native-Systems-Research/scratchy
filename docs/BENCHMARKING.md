@@ -205,8 +205,28 @@ bimodal ITL distribution in this repo for a week
    reach the argmax: its set swaps the count prompt, whose procedural
    preamble ties at 0.0–0.5 logits at 3 bits, for a third short factual one
    with a 1.25-logit minimum margin (`parity_prompts` in
-   `crates/benches/src/startup_exec/mod.rs`). Every model keeps the exact-match
-   comparison; only the questions are chosen per model.
+   `crates/benches/src/startup_exec/mod.rs`).
+
+   Some models tie on every prompt: gpt-oss and Nemotron-3 think before they
+   answer, and their thought opens on near-ties of 0.0–0.75 logits whatever
+   the question. For them no prompt choice helps, so where the two answers'
+   text differs the gate asks the reference to judge (`--parity-score-cmd`,
+   `scripts/parity_ties.py`): mlx-lm runs one forward over the prompt and
+   scratchy's own answer token ids, teacher-forced, and at each token takes
+   its logit gap from its own top to the token scratchy picked. A prompt
+   passes as a near-tie when every such gap is at most `TIE_LOGITS` (1.0) and
+   at most `MAX_TIES` (4) tokens differ. Teacher-forcing goes on comparing past
+   a split instead of ending at it, so a defect after a tie is still caught.
+   On the M3 Pro the measured ties sit at 0.0–0.75, every other token is the
+   reference's top, and the same answer with its ids shifted by one is 28.1
+   logits behind on 34 of its 35 later tokens. The gap is the reference's,
+   not scratchy's: it says whether a correct model is undecided at that
+   token, which is the question a tie asks. The run records each tie's gaps
+   as `parity_ties`, and the page says the model matched up to near-ties.
+   Where no token differs at all, scratchy's answer is the reference's own
+   greedy answer and the prompt passes as `OK`: the text differs only in how
+   the two print it (mlx_lm.generate shows gpt-oss's `<|channel|>` tokens,
+   `scr chat` drops them).
 4. **Same weights, matching preset.** scratchy must be built with the preset
    matching the checkpoint's `config.json`.
 5. **One model resident at a time**, and `HF_HUB_OFFLINE=1` for both — left
