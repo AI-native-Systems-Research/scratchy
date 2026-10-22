@@ -87,11 +87,11 @@ template <typename T>
     ((device T*)kv_cache_v[chunk])[dst] = v[src];
     if (KVA_TQ_BITS_SET) {
         // No rotation: the offset restore's position and rotary window are unread.
-        kv_row_encode<T>(float(k[src]), float(v[src]), d, KVA_HEAD_DIM, KVA_NUM_KV_HEADS, kv_head,
-                         slot_raw, 0u, KVA_TQ_BITS, KVA_TQ_VALS_PER_WORD, KVA_TQ_PACKED_DIM,
-                         KVA_TQ_K_OFFSET, KVA_TQ_V_OFFSET, 0u, 0u, TQ_CB_SIGN_WORDS,
-                         TQ_CB_BOUNDARIES, tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias, tq_v_bias,
-                         tq_cos_sin, tq_scratch, tq_codes);
+        kv_row_encode<T, TqCodebook>(
+            float(k[src]), float(v[src]), d, KVA_HEAD_DIM, KVA_NUM_KV_HEADS, kv_head, slot_raw, 0u,
+            KVA_TQ_BITS, KVA_TQ_VALS_PER_WORD, KVA_TQ_PACKED_DIM, KVA_TQ_K_OFFSET,
+            KVA_TQ_V_OFFSET, 0u, 0u, tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias,
+            tq_v_bias, tq_cos_sin, tq_scratch, tq_codes);
     }
 }
 

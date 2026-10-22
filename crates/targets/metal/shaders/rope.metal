@@ -129,11 +129,11 @@ inline void rope_tq_encode(float k, float v, uint d, uint kv_head, uint slot_raw
                            device float* norms_v, device const T* k_bias, device const T* v_bias,
                            device const T* cos_sin, threadgroup float* scratch,
                            threadgroup uint* codes) {
-    kv_row_encode<T>(k, v, d, ROPE_HEAD_DIM, ROPE_NUM_KV_HEADS, kv_head, slot_raw, pos,
-                     ROPE_TQ_BITS, ROPE_TQ_VALS_PER_WORD, ROPE_TQ_PACKED_DIM, ROPE_TQ_K_OFFSET,
-                     ROPE_TQ_V_OFFSET, ROPE_ROT_DIM, ROPE_PAIR_OFF, TQ_CB_SIGN_WORDS,
-                     TQ_CB_BOUNDARIES, packed_k, norms_k, packed_v, norms_v, k_bias, v_bias,
-                     cos_sin, scratch, codes);
+    kv_row_encode<T, TqCodebook>(k, v, d, ROPE_HEAD_DIM, ROPE_NUM_KV_HEADS, kv_head, slot_raw,
+                                 pos, ROPE_TQ_BITS, ROPE_TQ_VALS_PER_WORD, ROPE_TQ_PACKED_DIM,
+                                 ROPE_TQ_K_OFFSET, ROPE_TQ_V_OFFSET, ROPE_ROT_DIM, ROPE_PAIR_OFF,
+                                 packed_k, norms_k, packed_v, norms_v, k_bias, v_bias, cos_sin,
+                                 scratch, codes);
 }
 
 #if SCRATCHY_COMPILES(rope_append_f16_specialized)

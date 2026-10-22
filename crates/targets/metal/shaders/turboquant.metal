@@ -106,15 +106,15 @@ template <typename T>
     threadgroup float scratch[tq_encode_floats(1, TQ_DIM)];
     threadgroup uint codes[TQ_DIM];
     const uint store = logical_slot * TQ_NUM_KV_HEADS + kv_head;
-    const TqEncoded e = tq_encode<1>({(float)vec[elem] - off}, elem, TQ_DIM, TQ_BITS, TQ_VALS_PER_WORD,
-                                     TQ_PACKED_DIM, TQ_CENTROIDS, TQ_CB_SIGN_WORDS, TQ_CB_BOUNDARIES,
-                                     {packed_store + store * TQ_PACKED_DIM}, {norms_store + store},
-                                     scratch, codes)[0];
+    const TqEncoded e = tq_encode<1, TqCodebook>({(float)vec[elem] - off}, elem, TQ_DIM, TQ_BITS,
+                                                 TQ_VALS_PER_WORD, TQ_PACKED_DIM,
+                                                 {packed_store + store * TQ_PACKED_DIM},
+                                                 {norms_store + store}, scratch, codes)[0];
 
     // ── dequant the codes back into the pool, offset restored ──
     if (TQ_WRITEBACK != 0u) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        scratch[elem] = TQ_CB_CENTROIDS[e.code] * TQ_SCALE;
+        scratch[elem] = tq_cb_centroid(e.code) * TQ_SCALE;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         tq_wht_tg(scratch, TQ_DIM, elem);
         vec[elem] = (T)(scratch[elem] * TQ_SCALE * tq_cb_sign(elem) * e.norm + off);

@@ -519,7 +519,7 @@ kernel void tq_stage_rotated(
             const uint store_row = (physical_block * block_size + t) * num_kv + kv_head;
             const float n = norms[store_row] * s;
             for (uint j = 0; j < qk_per_thread; ++j) {
-                x[j] = TQ_CB_CENTROIDS[tq_code(packed, store_row * pdim, e0 + j)] * n;
+                x[j] = tq_cb_centroid(tq_code(packed, store_row * pdim, e0 + j)) * n;
             }
             if (!span) {
                 if (off_mode == 2u) {
@@ -918,13 +918,12 @@ template <typename T>
                 threadgroup float* scratch = tg_outputs;
                 threadgroup uint* codes = (threadgroup uint*)(tg_outputs + tq_encode_floats(2u, head_dim));
                 const bool live = tid < head_dim;
-                kv_row_encode<T>(live ? float(fk[tid]) : 0.0f, live ? float(fv[tid]) : 0.0f, tid,
-                                 head_dim, num_kv, kv_head_idx, fold_slot, pos, ATTN_TQ, vpw,
-                                 (head_dim + vpw - 1u) / vpw, ATTN_TQ_KB ? 2u : 0u,
-                                 ATTN_TQ_VB ? 1u : 0u, ATTN_FOLD_ROT_DIM, pair_off,
-                                 TQ_CB_SIGN_WORDS, TQ_CB_BOUNDARIES, tq_packed_k, tq_norms_k,
-                                 tq_packed_v, tq_norms_v, tq_k_bias, tq_v_bias, tq_bias_cos_sin,
-                                 scratch, codes);
+                kv_row_encode<T, TqCodebook>(
+                    live ? float(fk[tid]) : 0.0f, live ? float(fv[tid]) : 0.0f, tid, head_dim,
+                    num_kv, kv_head_idx, fold_slot, pos, ATTN_TQ, vpw, (head_dim + vpw - 1u) / vpw,
+                    ATTN_TQ_KB ? 2u : 0u, ATTN_TQ_VB ? 1u : 0u, ATTN_FOLD_ROT_DIM, pair_off,
+                    tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias, tq_v_bias,
+                    tq_bias_cos_sin, scratch, codes);
             }
         }
     }
@@ -975,7 +974,7 @@ template <typename T>
         }
         const uint tid = simd_gid * uint(BD) + simd_lid;
         if (tid < (1u << ATTN_TQ)) {
-            tq_lut[tid] = TQ_CB_CENTROIDS[tid];
+            tq_lut[tid] = tq_cb_centroid(tid);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -1501,7 +1500,7 @@ template <typename T>
     threadgroup float ml[2u * KG * G];
     threadgroup float own_s[G];
     if (tid < 16u) {
-        lut[tid] = TQ_CB_CENTROIDS[tid];
+        lut[tid] = tq_cb_centroid(tid);
     }
 
     // The query heads' element `e` as the writer leaves it: roped under the fold, rounded to T.
@@ -1561,13 +1560,11 @@ template <typename T>
             ((device T*)v_cache[chunk])[at + tid] = fold_kv[ATTN_FOLD_DIM + tid];
             const uint vpw = 32u / ATTN_TQ;
             threadgroup uint* codes = (threadgroup uint*)(xs + tq_encode_floats(2u, D));
-            kv_row_encode<T>(float(fold_kv[tid]), float(fold_kv[ATTN_FOLD_DIM + tid]), tid, D,
-                             num_kv, kvh, slot, fold_pos, ATTN_TQ, vpw, pdim,
-                             ATTN_TQ_KB ? 2u : 0u, ATTN_TQ_VB ? 1u : 0u,
-                             ATTN_FOLD_ROT_DIM, ATTN_FOLD_PAIR_OFF, TQ_CB_SIGN_WORDS,
-                             TQ_CB_BOUNDARIES, tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v,
-                             tq_k_bias,
-                             tq_v_bias, tq_bias_cos_sin, xs, codes);
+            kv_row_encode<T, TqCodebook>(
+                float(fold_kv[tid]), float(fold_kv[ATTN_FOLD_DIM + tid]), tid, D, num_kv, kvh,
+                slot, fold_pos, ATTN_TQ, vpw, pdim, ATTN_TQ_KB ? 2u : 0u, ATTN_TQ_VB ? 1u : 0u,
+                ATTN_FOLD_ROT_DIM, ATTN_FOLD_PAIR_OFF, tq_packed_k, tq_norms_k, tq_packed_v,
+                tq_norms_v, tq_k_bias, tq_v_bias, tq_bias_cos_sin, xs, codes);
         }
         return;
     }
