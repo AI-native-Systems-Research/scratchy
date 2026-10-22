@@ -145,21 +145,26 @@ impl SuperDscSession {
     /// Load the bundle, bind the weights, and prepare (allocate + upload the resident program,
     /// weights and KV pool).
     ///
+    /// ⭐ THE GRAPH'S OWN SOURCE FACTS ARE READ OFF `code`, NEVER ARGUED: the
+    /// source count and the resident source ids are stamped on the bundle's
+    /// layout at the bake, so a session built here walks exactly the source
+    /// range of the graph it runs — a caller cannot hand it another graph's
+    /// numbers. Only the spilled weight tail is an argument (a load-time copy
+    /// decision the layout cannot make for the caller).
+    ///
     /// `load_consts` is the wiring's OWN staged-constant list — the tables a
     /// spliced kernel declares as sources. They are bound ONCE here, before
     /// prepare, resident like a weight (each is a function of the graph
     /// alone); a session that binds none passes an empty slice, and every
     /// borrowing session gets the owner's copy through the seg1 alias.
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn new(
         code: &'static crate::bundle_code::BundleCode<'static>,
         vocab: usize,
         kv_dim: usize,
         num_blocks: usize,
-        num_sources: u32,
-        resident_sources: &[u32],
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
         load_consts: &[(u32, crate::wiring::LoadConst)],
+        spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
             code,
@@ -168,11 +173,10 @@ impl SuperDscSession {
                 kv_dim,
                 num_blocks,
             },
-            num_sources,
-            resident_sources,
             weights,
             load_consts,
             &[],
+            spilled_tail,
         )
     }
 
@@ -190,9 +194,8 @@ impl SuperDscSession {
         vocab: usize,
         kv_dim: usize,
         num_blocks: usize,
-        num_sources: u32,
-        resident_sources: &[u32],
         borrowed: &[i64],
+        spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
             code,
@@ -201,11 +204,10 @@ impl SuperDscSession {
                 kv_dim,
                 num_blocks,
             },
-            num_sources,
-            resident_sources,
             Vec::new(),
             &[],
             borrowed,
+            spilled_tail,
         )
     }
 
@@ -222,11 +224,7 @@ impl SuperDscSession {
         vocab: usize,
         kv_dim: usize,
         num_blocks: usize,
-        // ⛔ REQUIRED, from the generated wiring. Ids `0..num_sources` are host-filled every
-        // forward; the executor refuses to launch with one unwritten. Passing it as an ARGUMENT
-        // rather than a setter is the lock: a new session site cannot forget it.
-        num_sources: u32,
-        resident_sources: &[u32],
+        spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
             code,
@@ -235,27 +233,29 @@ impl SuperDscSession {
                 kv_dim,
                 num_blocks,
             },
-            num_sources,
-            resident_sources,
             Vec::new(),
             &[],
             &[],
+            spilled_tail,
         )
     }
 
     fn new_inner(
         code: &'static crate::bundle_code::BundleCode<'static>,
         dims: SessionDims,
-        num_sources: u32,
-        // The prefix-KV source ids — placed and inside `0..num_sources`, but device-resident, so
-        // no per-step bind names them.
-        resident_sources: &[u32],
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
         // The wiring's staged-constant list — bound once before prepare by the
         // OWNER only (see [`Self::new`]); borrowers pass none and read the
         // owner's bytes through the alias.
         load_consts: &[(u32, crate::wiring::LoadConst)],
         borrowed: &[i64],
+        // The spilled weight tail's tids — the ONE resident slice the layout cannot state: the
+        // spill is a load-time copy decision (a weight whose slot also holds an m-dependent
+        // intermediate color cannot be aliased, so `adopt_from_owner` copies it into this
+        // session's own region), so the LOADER declares it resident here, exactly as it hands it
+        // over. Leaving it out is a REFUSED LAUNCH, not a silent wrong answer — the completeness
+        // check classifies the un-copied tail `SourceFiller::Nobody` and stops.
+        spilled_tail: &[u32],
     ) -> Result<Self> {
         let SessionDims {
             vocab,
@@ -269,7 +269,18 @@ impl SuperDscSession {
             KvDim(kv_dim),
             PoolPages(num_blocks as i64),
         )?;
-        exec.declare_sources(num_sources, resident_sources.iter().copied());
+        // ⭐ THE GRAPH'S OWN SOURCE FACTS — the count and the resident ids are stamped on the
+        // layout this session's `code` carries, so the completeness walk covers exactly the
+        // source range of the graph being run: prefix-KV caches and load-const tables excused
+        // by the bundle's own list, the spilled tail by the caller's, and nothing else.
+        exec.declare_sources(
+            code.layout.num_sources,
+            code.layout
+                .resident_source_tids
+                .iter()
+                .copied()
+                .chain(spilled_tail.iter().copied()),
+        );
         // BORROWED segments must be declared BEFORE prepare — afterwards the full region is already
         // allocated and transferred, so the flag would be a silent no-op (the executor refuses).
         for &seg in borrowed {
