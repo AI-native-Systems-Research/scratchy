@@ -23,7 +23,7 @@ use scratchy_target_metal::specialized_pipeline_cache::{
 };
 use scratchy_target_metal::tape::ids::{KDimI32, LayerId, MDimI32, NDimI32};
 use scratchy_target_metal::tape::kernel_constants::{
-    AffineCodes, AffineQmvConstants, AffineQmvWideConstants,
+    AffineCodes, AffineQmmTConstants, AffineQmvConstants, AffineQmvWideConstants,
 };
 use scratchy_target_metal::tape::quantized::{
     DequantDtype, QmvKernel, ScaleDtype, pick_qmv_kernel, pick_qmv_kernel_wide, qmv_dispatch_shape,
@@ -172,6 +172,141 @@ fn qmv_rows_plain_and_normalizing_on_load() {
                 let tag = if ends.norm.is_some() { 'n' } else { 'p' };
                 line += &format!("  {m}{tag} {best:7.1}");
             }
+        }
+        println!("{line}   ({:.1} MB of codes)", bytes as f64 / 1e6);
+    }
+}
+
+/// Rounds of a shape's by-bucket cells, after a warm-up round.
+const ROUNDS: usize = 5;
+
+/// Qwen3.6-35B-A3B's 4-bit dense projections a decode bucket's matvecs run.
+const BUCKET_SHAPES: &[Shape] = &[
+    shape("qwen3.6 lm_head", 248320, 2048, 4),
+    shape("qwen3.6 gdn in_proj", 12288, 2048, 4),
+    shape("qwen3.6 q+gate", 8192, 2048, 4),
+    shape("qwen3.6 gdn out_proj", 2048, 4096, 4),
+];
+
+/// A decode bucket's dense matvec, as the tape bakes it at the bucket's rows and codes: the wide
+/// matvec (`AffineQmvWide`, its rows in tiles of at most 5 — one weight stream at 4 rows, two at
+/// 8) against the small-M matrix-unit twin (`AffineQmmSmallM`, one 8-row tile), which the tape
+/// runs instead on a `SMALL_M_TOKENS` step where the bucket's wide matvec streams the weights more
+/// than once (`route_small_m`). A shape's four cells run in alternating rounds, best of `ROUNDS`.
+/// NAX devices only.
+#[test]
+#[ignore = "measurement probe, not an assertion: run with --ignored --nocapture"]
+fn qmv_wide_against_small_m_twin_by_bucket() {
+    use scratchy_target_metal::tape::quantized::{
+        SMALL_M_SIMDGROUPS, SMALL_M_TILE_COLS, SmallMTile, small_m_kernel_static_name,
+    };
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    if !scratchy_target_metal::targets::is_nax_capable(di.profile.generation) {
+        eprintln!("skipping: no NAX matrix unit");
+        return;
+    }
+    let device = di.device.clone();
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
+    println!("µs a dispatch at a bucket's rows: wide matvec (w) and small-M twin (t)");
+    for s in BUCKET_SHAPES {
+        let (n, k) = (s.n as usize, s.k as usize);
+        let bytes = n * k * s.bits as usize / 8;
+        let copies = ROTATED_BYTES / bytes + 1;
+        let groups = n * k / GROUP as usize;
+        let weights: Vec<_> = (0..copies)
+            .map(|c| {
+                let codes: Vec<u32> = (0..bytes as u32 / 4)
+                    .map(|i| i.wrapping_mul(2654435761).wrapping_add(c as u32))
+                    .collect();
+                (
+                    shared_slice(&device, &codes),
+                    shared_slice(&device, &bf16_row(groups, 0.002)),
+                    shared_slice(&device, &bf16_row(groups, -0.015)),
+                )
+            })
+            .collect();
+        let x = shared_slice(&device, &bf16_row(8 * k, 0.5));
+        let y = shared_zeroed(&device, 8 * n * 2);
+        let mut line = format!("{:<22}", s.name);
+        // Both kernels read the codes as the tape's do on this device (offset-8 wherever the twin
+        // exists).
+        let codes = AffineCodes::of(Some(&di.profile), s.bits);
+        let (k_dim, n_dim) = (KDimI32(s.k as i32), NDimI32(s.n as i32));
+        let mut cells = Vec::new();
+        for bucket in [4u32, 8] {
+            let m = MDimI32(bucket as i32);
+            let kernel = pick_qmv_kernel_wide(s.n, s.k, s.bits, bucket, true);
+            let wide_name =
+                qmv_kernel_static_name(kernel, DequantDtype::Bf16, ScaleDtype::Bf16, s.bits, GROUP);
+            let wide_constants: Vec<ConstantValue> = AffineQmvWideConstants {
+                k: k_dim,
+                n: n_dim,
+                m,
+                codes,
+            }
+            .into();
+            let wide = baked_build(
+                &cache,
+                &PipelineKey::new("quantized_qmv", wide_name, wide_constants),
+            )
+            .expect(wide_name);
+            cells.push((
+                format!("{bucket}w"),
+                wide,
+                qmv_dispatch_shape(kernel, bucket, s.n, 1),
+            ));
+            let tile = SmallMTile::for_bucket(bucket).expect("a small-M bucket");
+            let twin_name =
+                small_m_kernel_static_name(DequantDtype::Bf16, ScaleDtype::Bf16, GROUP, tile);
+            let twin_constants: Vec<ConstantValue> = AffineQmmTConstants {
+                k: k_dim,
+                n: n_dim,
+                m,
+                codes,
+            }
+            .into();
+            let twin = baked_build(
+                &cache,
+                &PipelineKey::new("quantized_qmm_nax", twin_name, twin_constants),
+            )
+            .expect(twin_name);
+            cells.push((
+                format!("{bucket}t"),
+                twin,
+                (
+                    (s.n / SMALL_M_TILE_COLS, bucket.div_ceil(tile.rows()), 1),
+                    (32 * SMALL_M_SIMDGROUPS, 1, 1),
+                ),
+            ));
+        }
+        let time = |pso, (grid, threads)| {
+            let mut batch = Mtl4DispatchBatch::begin(&device).expect("mtl4 batch");
+            for i in 0..ITERS {
+                let (w, scales, biases) = &weights[i % copies];
+                let binds = [(w, 0), (scales, 1), (biases, 2), (&x, 3), (&y, 4)];
+                batch.encode(pso, &binds, &[], &[], &[], size(grid), size(threads));
+                batch.barrier();
+            }
+            let t0 = std::time::Instant::now();
+            batch.commit(true);
+            t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64
+        };
+        // The shape's cells in alternating rounds, a warm-up round first: a GPU clock band's
+        // shift lands on every cell of a round, not on whichever cell it falls in.
+        let mut best = vec![f64::MAX; cells.len()];
+        for round in 0..=ROUNDS {
+            for (b, (_, pso, shape)) in best.iter_mut().zip(&cells) {
+                let us = time(pso, *shape);
+                if round > 0 {
+                    *b = b.min(us);
+                }
+            }
+        }
+        for ((tag, _, _), us) in cells.iter().zip(&best) {
+            line += &format!("  {tag} {us:8.1}");
         }
         println!("{line}   ({:.1} MB of codes)", bytes as f64 / 1e6);
     }
