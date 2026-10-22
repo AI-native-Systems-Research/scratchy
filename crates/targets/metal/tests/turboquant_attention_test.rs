@@ -47,12 +47,9 @@ use scratchy_target_metal::targets::is_nax_capable;
 /// The codebook a TurboQuant kernel compiles in: the signs over a `hd` head and, given a code
 /// width, its centroids — what the lowering's TurboQuant attention, stage and rotation carry.
 fn codebook(hd: usize, bits: Option<u32>) -> Vec<ConstantValue> {
-    let mut v = Vec::from(TqCodebookPart::Signs(HeadDim(hd as u32)));
-    v.extend(
-        bits.into_iter()
-            .flat_map(|b| Vec::from(TqCodebookPart::Centroids(TqCodeBits(b)))),
-    );
-    v
+    let centroids = bits.map(|b| TqCodebookPart::Centroids(TqCodeBits(b)));
+    let parts = [TqCodebookPart::Signs(HeadDim(hd as u32))].into_iter();
+    parts.chain(centroids).map(ConstantValue::from).collect()
 }
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;

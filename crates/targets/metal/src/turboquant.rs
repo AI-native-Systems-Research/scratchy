@@ -585,19 +585,32 @@ mod tests {
                 .windows(2)
                 .map(|w| (w[0] + w[1]) / 2.0)
                 .collect();
-            let floats = |part| -> Vec<f32> {
-                let constants = Vec::<ConstantValue>::from(part);
-                constants.iter().map(|c| f32::from_bits(c.bits)).collect()
+            let parts = [
+                TqCodebookPart::Signs(HeadDim(dim as u32)),
+                TqCodebookPart::Centroids(TqCodeBits(bits)),
+                TqCodebookPart::Boundaries(TqCodeBits(bits)),
+            ];
+            for part in parts {
+                let carried = ConstantValue::from(part);
+                assert_eq!(
+                    TqCodebookPart::of(&carried),
+                    Some(part),
+                    "{part:?} round-trips"
+                );
+            }
+            let floats = |part: TqCodebookPart| -> Vec<f32> {
+                (part.slots().iter())
+                    .map(|c| f32::from_bits(c.bits))
+                    .collect()
             };
-            let words = Vec::<ConstantValue>::from(TqCodebookPart::Signs(HeadDim(dim as u32)));
+            let words = parts[0].slots();
             let signs: Vec<f32> = (0..dim)
                 .map(|e| match words[e / 32].bits >> (e % 32) & 1 {
                     1 => -1.0,
                     _ => 1.0,
                 })
                 .collect();
-            let centroids = floats(TqCodebookPart::Centroids(TqCodeBits(bits)));
-            let boundaries = floats(TqCodebookPart::Boundaries(TqCodeBits(bits)));
+            let (centroids, boundaries) = (floats(parts[1]), floats(parts[2]));
             let bits_of = |t: &[f32]| t.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
             assert_eq!(bits_of(&signs), bits_of(q.signs()), "signs {dim}/{bits}");
             assert_eq!(

@@ -244,8 +244,8 @@ impl RopeTqConstants {
             ConstantValue::uint(ConstSlot(14), t.v_offset as u32),
         ]);
         // The encode's codebook: the signs it rotates by and the boundaries it codes against.
-        v.extend(Vec::from(TqCodebookPart::Signs(head_dim)));
-        v.extend(Vec::from(TqCodebookPart::Boundaries(t.bits)));
+        v.push(ConstantValue::from(TqCodebookPart::Signs(head_dim)));
+        v.push(ConstantValue::from(TqCodebookPart::Boundaries(t.bits)));
     }
 }
 
@@ -444,6 +444,14 @@ impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
 /// A part of the TurboQuant codebook a kernel reads, compiled in (`tq_codebook.h`). Each is a
 /// function of one constant the kernel already carries
 /// ([`scratchy_layers::turboquant::PolarQuantizer`] at [`crate::turboquant::TQ_CODEBOOK_SEED`]).
+/// A command carries a part as ONE constant ([`ConstantType::TqSigns`] /
+/// [`ConstantType::TqCentroids`] / [`ConstantType::TqBoundaries`], the head dim or code width its
+/// value); the bake expands it into its [`Self::slots`], each its own kernel constant — so the
+/// tape does not repeat the codebook's ~47 values in every TurboQuant command.
+///
+/// [`ConstantType::TqSigns`]: crate::tape::constants::ConstantType::TqSigns
+/// [`ConstantType::TqCentroids`]: crate::tape::constants::ConstantType::TqCentroids
+/// [`ConstantType::TqBoundaries`]: crate::tape::constants::ConstantType::TqBoundaries
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TqCodebookPart {
     /// The random diagonal's signs over a head (slots 71-86): a bit an element, set where the
@@ -459,32 +467,23 @@ impl TqCodebookPart {
     const CENTROIDS: u16 = 40;
     const BOUNDARIES: u16 = 56;
     const SIGNS: u16 = 71;
-    /// The slots [`Self::Boundaries`] fills, of the widest code.
-    pub const BOUNDARY_SLOTS: std::ops::Range<u16> = Self::BOUNDARIES..Self::SIGNS;
     /// The sign words `tq_codebook.h` declares: a head of at most 512.
     const SIGN_WORDS: usize = 16;
-}
 
-impl From<TqCodebookPart> for Vec<ConstantValue> {
-    fn from(part: TqCodebookPart) -> Self {
-        use scratchy_layers::turboquant::{
-            gaussian_boundaries, gaussian_codebook, random_diagonal_sign,
-        };
-        // The centroids' 16 slots and the boundaries' 15 hold a code of at most 4 bits.
-        let code_width = |bits: TqCodeBits| {
-            let bits = bits.get();
-            assert!(
-                (1..=4).contains(&bits),
-                "a TurboQuant code of {bits} bits: the codebook's slots hold codes of 1 to 4 bits"
-            );
-            bits
-        };
-        let floats = |first: u16, table: Vec<f32>| -> Vec<ConstantValue> {
-            (table.into_iter().zip(first..))
-                .map(|(f, slot)| ConstantValue::float(ConstSlot(slot), f))
-                .collect()
-        };
-        match part {
+    /// The part a command's constant `c` carries; `None` for any other constant.
+    pub fn of(c: &ConstantValue) -> Option<Self> {
+        use crate::tape::constants::ConstantType as T;
+        match c.ty {
+            T::TqSigns => Some(Self::Signs(HeadDim(c.bits))),
+            T::TqCentroids => Some(Self::Centroids(TqCodeBits(c.bits))),
+            T::TqBoundaries => Some(Self::Boundaries(TqCodeBits(c.bits))),
+            T::UInt | T::Int | T::Float | T::Bool | T::KvCap | T::TqHeads => None,
+        }
+    }
+
+    /// `self`, its head whole sign words the slots hold and its code at most 4 bits.
+    fn checked(self) -> Self {
+        match self {
             TqCodebookPart::Signs(head_dim) => {
                 let dim = head_dim.get() as usize;
                 assert!(
@@ -492,7 +491,34 @@ impl From<TqCodebookPart> for Vec<ConstantValue> {
                     "a TurboQuant head of {dim}: whole sign words, at most {}",
                     TqCodebookPart::SIGN_WORDS
                 );
-                let signs = random_diagonal_sign(dim, crate::turboquant::TQ_CODEBOOK_SEED);
+            }
+            TqCodebookPart::Centroids(bits) | TqCodebookPart::Boundaries(bits) => {
+                let bits = bits.get();
+                assert!(
+                    (1..=4).contains(&bits),
+                    "a TurboQuant code of {bits} bits: the codebook's slots hold codes of 1 to 4 bits"
+                );
+            }
+        }
+        self
+    }
+
+    /// The kernel constants the part expands into, one a value: what the bake compiles in.
+    pub fn slots(self) -> Vec<ConstantValue> {
+        use scratchy_layers::turboquant::{
+            gaussian_boundaries, gaussian_codebook, random_diagonal_sign,
+        };
+        let floats = |first: u16, table: Vec<f32>| -> Vec<ConstantValue> {
+            (table.into_iter().zip(first..))
+                .map(|(f, slot)| ConstantValue::float(ConstSlot(slot), f))
+                .collect()
+        };
+        match self.checked() {
+            TqCodebookPart::Signs(head_dim) => {
+                let signs = random_diagonal_sign(
+                    head_dim.get() as usize,
+                    crate::turboquant::TQ_CODEBOOK_SEED,
+                );
                 let (words, _) = signs.as_chunks::<32>();
                 let words = words.iter().map(|w| {
                     (w.iter().enumerate())
@@ -502,15 +528,30 @@ impl From<TqCodebookPart> for Vec<ConstantValue> {
                     .map(|(word, slot)| ConstantValue::uint(ConstSlot(slot), word))
                     .collect()
             }
-            TqCodebookPart::Centroids(bits) => floats(
-                TqCodebookPart::CENTROIDS,
-                gaussian_codebook(code_width(bits)),
-            ),
-            TqCodebookPart::Boundaries(bits) => floats(
-                TqCodebookPart::BOUNDARIES,
-                gaussian_boundaries(code_width(bits)),
-            ),
+            TqCodebookPart::Centroids(bits) => {
+                floats(TqCodebookPart::CENTROIDS, gaussian_codebook(bits.get()))
+            }
+            TqCodebookPart::Boundaries(bits) => {
+                floats(TqCodebookPart::BOUNDARIES, gaussian_boundaries(bits.get()))
+            }
         }
+    }
+}
+
+/// The one constant a command carries for `part` ([`TqCodebookPart::of`] reads it back).
+impl From<TqCodebookPart> for ConstantValue {
+    fn from(part: TqCodebookPart) -> Self {
+        use crate::tape::constants::ConstantType as T;
+        let (index, bits, ty) = match part.checked() {
+            TqCodebookPart::Signs(dim) => (TqCodebookPart::SIGNS, dim.get(), T::TqSigns),
+            TqCodebookPart::Centroids(bits) => {
+                (TqCodebookPart::CENTROIDS, bits.get(), T::TqCentroids)
+            }
+            TqCodebookPart::Boundaries(bits) => {
+                (TqCodebookPart::BOUNDARIES, bits.get(), T::TqBoundaries)
+            }
+        };
+        Self { index, bits, ty }
     }
 }
 
@@ -540,8 +581,8 @@ impl From<AttentionViaCacheTqConstants> for Vec<ConstantValue> {
         v.extend(c.k_bias.then(|| ConstantValue::uint(ConstSlot(14), 1)));
         v.extend(c.v_bias.then(|| ConstantValue::uint(ConstSlot(15), 1)));
         v.push(ConstantValue::tq_heads(AttentionViaCacheTqConstants::HEADS));
-        v.extend(Vec::from(TqCodebookPart::Signs(c.head_dim)));
-        v.extend(Vec::from(TqCodebookPart::Centroids(c.bits)));
+        v.push(ConstantValue::from(TqCodebookPart::Signs(c.head_dim)));
+        v.push(ConstantValue::from(TqCodebookPart::Centroids(c.bits)));
         v
     }
 }
@@ -591,8 +632,8 @@ impl From<TqStageConstants> for Vec<ConstantValue> {
         v.extend(c.k_bias.then(|| ConstantValue::uint(ConstSlot(14), 1)));
         v.extend(c.v_bias.then(|| ConstantValue::uint(ConstSlot(15), 1)));
         v.push(ConstantValue::uint(ConstSlot(17), c.pass as u32));
-        v.extend(Vec::from(TqCodebookPart::Signs(c.head_dim)));
-        v.extend(Vec::from(TqCodebookPart::Centroids(c.bits)));
+        v.push(ConstantValue::from(TqCodebookPart::Signs(c.head_dim)));
+        v.push(ConstantValue::from(TqCodebookPart::Centroids(c.bits)));
         v
     }
 }
@@ -650,9 +691,9 @@ impl From<TqCompressConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(11), c.rot_dim.get()),
             ConstantValue::uint(ConstSlot(12), c.pair_off.get()),
         ];
-        v.extend(Vec::from(TqCodebookPart::Signs(c.head_dim)));
-        v.extend(Vec::from(TqCodebookPart::Centroids(c.bits)));
-        v.extend(Vec::from(TqCodebookPart::Boundaries(c.bits)));
+        v.push(ConstantValue::from(TqCodebookPart::Signs(c.head_dim)));
+        v.push(ConstantValue::from(TqCodebookPart::Centroids(c.bits)));
+        v.push(ConstantValue::from(TqCodebookPart::Boundaries(c.bits)));
         v
     }
 }
@@ -670,7 +711,7 @@ impl From<TqRotateRowsConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(0), c.head_dim.get()),
             ConstantValue::uint(ConstSlot(1), c.num_q_heads.get()),
         ];
-        v.extend(Vec::from(TqCodebookPart::Signs(c.head_dim)));
+        v.push(ConstantValue::from(TqCodebookPart::Signs(c.head_dim)));
         v
     }
 }

@@ -296,8 +296,11 @@ fn run(c: &Case, how: Run) -> Option<Left> {
     };
     // A TurboQuant decode's codebook, compiled in: the signs over the head and the centroids.
     if let Some(b) = c.bits {
-        attn_constants.extend(Vec::from(TqCodebookPart::Signs(HeadDim(hd as u32))));
-        attn_constants.extend(Vec::from(TqCodebookPart::Centroids(TqCodeBits(b))));
+        let parts = [
+            TqCodebookPart::Signs(HeadDim(hd as u32)),
+            TqCodebookPart::Centroids(TqCodeBits(b)),
+        ];
+        attn_constants.extend(parts.map(ConstantValue::from));
     }
     if how == Run::Fold {
         attn_constants.extend([
@@ -306,7 +309,8 @@ fn run(c: &Case, how: Run) -> Option<Left> {
         ]);
         // The writer's encode, run here: its codebook's boundaries.
         if let Some(b) = c.bits {
-            attn_constants.extend(Vec::from(TqCodebookPart::Boundaries(TqCodeBits(b))));
+            let boundaries = TqCodebookPart::Boundaries(TqCodeBits(b));
+            attn_constants.push(boundaries.into());
         }
     }
     let kernel = match c.gqa {

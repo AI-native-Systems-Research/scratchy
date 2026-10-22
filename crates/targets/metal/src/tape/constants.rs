@@ -26,6 +26,16 @@ pub enum ConstantType {
     /// A `uint` the tape variant supplies ([`TapeVariant::tq_heads`]): the query heads one
     /// TurboQuant decode threadgroup serves.
     TqHeads,
+    /// The TurboQuant codebook's signs over a head of `bits` elements: one entry the bake expands
+    /// into the sign-word slots it fills, each its own kernel constant
+    /// ([`crate::tape::kernel_constants::TqCodebookPart::Signs`]).
+    TqSigns,
+    /// The codebook's centroids of a `bits`-bit code, expanded by the bake into one slot each
+    /// ([`crate::tape::kernel_constants::TqCodebookPart::Centroids`]).
+    TqCentroids,
+    /// The boundaries between those centroids, expanded by the bake into one slot each
+    /// ([`crate::tape::kernel_constants::TqCodebookPart::Boundaries`]).
+    TqBoundaries,
 }
 
 /// The values a tape variant binds ([`ConstantType::KvCap`], [`ConstantType::TqHeads`]). One tape
@@ -154,9 +164,13 @@ impl ConstantValue {
             ConstantType::TqHeads => (variant.tq_heads)
                 .map(|h| Self::uint(self.index, h.get()))
                 .ok_or(unbound),
-            ConstantType::UInt | ConstantType::Int | ConstantType::Float | ConstantType::Bool => {
-                Ok(self)
-            }
+            ConstantType::UInt
+            | ConstantType::Int
+            | ConstantType::Float
+            | ConstantType::Bool
+            | ConstantType::TqSigns
+            | ConstantType::TqCentroids
+            | ConstantType::TqBoundaries => Ok(self),
         }
     }
 }

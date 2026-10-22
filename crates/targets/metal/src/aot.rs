@@ -22,6 +22,7 @@ use crate::specialized_pipeline_cache::{
 };
 use crate::stream::MetalStreamError;
 use crate::tape::constants::{TapeVariant, UnboundConstant};
+use crate::tape::kernel_constants::TqCodebookPart;
 use crate::tape::lowered::{
     BakedKernel, KernelId, LoweredCommand, LoweredMetalTape, MetalDtype, baked,
 };
@@ -238,13 +239,18 @@ pub fn bake(keys: &[PipelineKey]) -> Bake {
 /// and the kernel's own flag.
 type Macros = Vec<(String, String)>;
 
-/// `key`'s [`Macros`].
+/// `key`'s [`Macros`]. A codebook part ([`TqCodebookPart`]) is one constant on the key and a
+/// constant a slot here.
 fn macros(key: &PipelineKey) -> Macros {
     let set = || "~, 1".to_owned();
-    let constants = key.constants.iter().flat_map(|c| {
+    let expanded = key
+        .constants
+        .iter()
+        .flat_map(|c| TqCodebookPart::of(c).map_or_else(|| vec![*c], TqCodebookPart::slots));
+    let constants = expanded.flat_map(|c| {
         let slot = c.index;
         [
-            (format!("SCRATCHY_CONSTANT_{slot}"), msl_literal(c)),
+            (format!("SCRATCHY_CONSTANT_{slot}"), msl_literal(&c)),
             (format!("SCRATCHY_SET_{slot}"), set()),
         ]
     });
@@ -457,6 +463,10 @@ fn msl_literal(c: &ConstantValue) -> String {
         ConstantType::Bool => (c.bits != 0).to_string(),
         ConstantType::KvCap | ConstantType::TqHeads => panic!(
             "bake: constant slot {} is bound to its tape variant; `bake_keys` resolves it",
+            c.index
+        ),
+        ConstantType::TqSigns | ConstantType::TqCentroids | ConstantType::TqBoundaries => panic!(
+            "bake: constant slot {} is a codebook part; `macros` expands it",
             c.index
         ),
     }

@@ -915,8 +915,9 @@ fn roped_attention_command(
         ConstantValue::uint(ATTN_FOLD.0, rot_dim.bits),
         ConstantValue::uint(ATTN_FOLD.1, pair_off.bits),
     ]);
-    let boundaries = writer.constants.iter();
-    constants.extend(boundaries.filter(|c| TqCodebookPart::BOUNDARY_SLOTS.contains(&c.index)));
+    let boundaries =
+        |c: &&ConstantValue| matches!(TqCodebookPart::of(c), Some(TqCodebookPart::Boundaries(_)));
+    constants.extend(writer.constants.iter().filter(boundaries));
     let mut bindings = attention.bindings.to_vec();
     for b in writer.bindings.iter() {
         let (_, to) = FOLD_WRITER_BINDINGS
@@ -8856,13 +8857,13 @@ mod tests {
             }
             assert_eq!((bound(20), bound(22)), (false, false));
             // The writer's encode, run here, takes its codebook's boundaries compiled in.
-            let boundaries = (cmd.constants.iter())
-                .filter(|k| {
-                    crate::tape::kernel_constants::TqCodebookPart::BOUNDARY_SLOTS.contains(&k.index)
-                })
-                .count();
-            let want = (1usize << TQ_BITS.get()) - 1;
-            assert_eq!(boundaries, if tq { want } else { 0 });
+            use crate::tape::{ids::TqCodeBits, kernel_constants::TqCodebookPart};
+            let boundaries: Vec<TqCodebookPart> = (cmd.constants.iter())
+                .filter_map(TqCodebookPart::of)
+                .filter(|part| matches!(part, TqCodebookPart::Boundaries(_)))
+                .collect();
+            let want = [TqCodebookPart::Boundaries(TqCodeBits(TQ_BITS.get()))];
+            assert_eq!(boundaries, if tq { &want[..] } else { &[] });
             let two = lower_subtile_tape_to_metal(&tape, &p, bake_point(2, None));
             assert!(matches!(
                 two,
@@ -8902,14 +8903,15 @@ mod tests {
         assert_eq!((bound(20), bound(22)), (false, false));
         // The writer's encode, run in the split's last threadgroup, takes its codebook's
         // boundaries compiled in — the writer's own.
-        let boundaries = |c: &LoweredCommand| -> Vec<ConstantValue> {
-            let slots = crate::tape::kernel_constants::TqCodebookPart::BOUNDARY_SLOTS;
+        use crate::tape::kernel_constants::TqCodebookPart;
+        let boundaries = |c: &LoweredCommand| -> Vec<TqCodebookPart> {
             (c.constants.iter())
-                .filter(|k| slots.contains(&k.index))
-                .copied()
+                .filter_map(TqCodebookPart::of)
+                .filter(|part| matches!(part, TqCodebookPart::Boundaries(_)))
                 .collect()
         };
-        assert_eq!(boundaries(split).len(), (1 << TQ_BITS.get()) - 1);
+        let want = TqCodebookPart::Boundaries(crate::tape::ids::TqCodeBits(TQ_BITS.get()));
+        assert_eq!(boundaries(split), [want]);
         assert_eq!(boundaries(split), boundaries(writer));
         let splits = (128 * p.global_block_size).div_ceil(ATTN_SPLIT_KEYS);
         assert_eq!(split.dispatch.threadgroups.2, splits + 1);
@@ -9160,10 +9162,10 @@ mod tests {
                 .copied()
                 .collect();
             let want = [
-                Vec::from(Signs(HeadDim(hd as u32))),
-                Vec::from(Boundaries(TqCodeBits(TQ_BITS.get()))),
+                ConstantValue::from(Signs(HeadDim(hd as u32))),
+                ConstantValue::from(Boundaries(TqCodeBits(TQ_BITS.get()))),
             ];
-            assert_eq!(codebook, want.concat());
+            assert_eq!(codebook, want);
         }
         let mut tq: Vec<u8> = c
             .bindings
@@ -9589,15 +9591,16 @@ mod tests {
         // The codebook a decode attention compiles in: the signs over its own head dim and the
         // centroids of the code width.
         let codebook = |c: &LoweredCommand| {
+            use crate::tape::ids::{HeadDim, TqCodeBits};
             use crate::tape::kernel_constants::TqCodebookPart;
             let hd = (c.constants.iter())
                 .find(|k| k.index == 0)
                 .expect("head dim");
-            let mut v = Vec::from(TqCodebookPart::Signs(crate::tape::ids::HeadDim(hd.bits)));
-            v.extend(Vec::from(TqCodebookPart::Centroids(
-                crate::tape::ids::TqCodeBits(bits),
-            )));
-            v
+            [
+                TqCodebookPart::Signs(HeadDim(hd.bits)),
+                TqCodebookPart::Centroids(TqCodeBits(bits)),
+            ]
+            .map(ConstantValue::from)
         };
         // The split keeps the twin's constants — the plain set's less its baked heads (slot
         // 16, the twin's variant-bound one is dropped too), plus the codebook width, the
@@ -9610,7 +9613,7 @@ mod tests {
             split.constants[dense.len()..],
             [
                 vec![ConstantValue::uint(13, bits)],
-                codebook(fp16),
+                codebook(fp16).to_vec(),
                 vec![ConstantValue::uint(18, splits)]
             ]
             .concat()
@@ -9680,7 +9683,7 @@ mod tests {
             tq.constants[dense.len()..],
             [
                 vec![ConstantValue::uint(13, bits), ConstantValue::tq_heads(16)],
-                codebook(fp16)
+                codebook(fp16).to_vec()
             ]
             .concat()
         );
@@ -11579,24 +11582,19 @@ mod tests {
         // The encode's codebook, compiled in: the signs over the head and the code width's
         // boundaries (`turboquant::tests` pins both to the quantizer's tables).
         use crate::tape::kernel_constants::TqCodebookPart;
-        let signs = Vec::from(TqCodebookPart::Signs(crate::tape::ids::HeadDim(hd)));
-        let boundaries = Vec::from(TqCodebookPart::Boundaries(crate::tape::ids::TqCodeBits(
-            bits,
-        )));
+        let signs = TqCodebookPart::Signs(crate::tape::ids::HeadDim(hd));
+        let boundaries = TqCodebookPart::Boundaries(crate::tape::ids::TqCodeBits(bits));
         assert_eq!(
             encode,
             [
-                vec![
-                    k(10, bits),
-                    k(11, vpw),
-                    k(12, hd.div_ceil(vpw)),
-                    k(13, 0),
-                    k(14, 0)
-                ],
-                signs,
-                boundaries
+                k(10, bits),
+                k(11, vpw),
+                k(12, hd.div_ceil(vpw)),
+                k(13, 0),
+                k(14, 0),
+                signs.into(),
+                boundaries.into()
             ]
-            .concat()
         );
     }
 
