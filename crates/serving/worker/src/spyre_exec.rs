@@ -1479,8 +1479,11 @@ impl Worker for SpyreWorker {
                     model.decode.last().expect("at least one decode bucket"),
                     &toks,
                     seqs,
-                    // ⭐ THE RUNG'S OWN ANSWER, riding with the rung's own `seqs` for the same reason:
-                    // the meta above is borrowed for tensor ids and describes neither.
+                    // ⭐ THE RUNG'S OWN ANSWER, riding with the rung's own `seqs`: the meta above
+                    // is borrowed and describes neither. Its tensor ids are shared facts only
+                    // BELOW the mint boundary (`num_sources`); the logits read below takes the
+                    // rung's own stamped tid (`LogitsGeom::place`), never the meta's `result_id`,
+                    // which on a minted model is the one-request graph's re-pointed argmax stick.
                     gathers_kv,
                     launch_pos,
                     // Every row is a different request and every row is sampled — the tail runs

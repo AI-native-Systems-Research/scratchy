@@ -383,8 +383,13 @@ pub(crate) fn run_prefill_batch(
     // A decode batch rung is the same tape baked at `B` rows, addressed by FINGERPRINT rather than
     // through a wiring, so `Wirings.decode` describes every rung's tensor ids but only the
     // single-request graph's ROW COUNT. The batched caller passes the rung's own `seqs` as `prefill_m`
-    // and `model.decode.last()`'s wiring for the ids — correct, because it is the same tape — and the
-    // wiring then answers 1 for a launch that is legitimately `B` rows wide.
+    // and `model.decode.last()`'s wiring for the ids — correct ONLY BELOW THE MINT BOUNDARY: ids
+    // under the original `num_sources` are shared facts of the tape, but ids at or above it are
+    // GRAPH-LOCAL, and the argmax mint's spliced tables shift every one-request op output up past
+    // that line — so on a minted model the wiring's `result_id` (the re-pointed argmax stick)
+    // names nothing in an unminted rung's layout, and the PerRequest logits read takes its tid
+    // from the rung's own `SegRole::Logits` stamp (`LogitsGeom::place`), never from this wiring.
+    // For the ROW COUNT the wiring then answers 1 for a launch that is legitimately `B` rows wide.
     //
     // Before the KTIR unification the wiring slot was last-write-wins and, because rungs bake
     // ASCENDING, it happened to hold the WIDEST rung's wiring — so this check passed by accident.
@@ -549,7 +554,13 @@ pub(crate) fn run_prefill_batch(
             //
             // Gated because a per-step D2H of this buffer is not free. `read_tensor` yields f32 from the
             // device's f16, so compare against the staged bytes reinterpreted the same way.
-            let name = scratchy_target_spyre::bundle_code::PlaceId::Act((b.result_id) as u32);
+            // ⭐ THE RUNG'S OWN STAMPED TID, never `b.result_id`: on a minted model the borrowed
+            // meta's result is the ONE-REQUEST graph's re-pointed argmax stick, which this
+            // unminted rung's layout does not place — "unknown tensor t…", every batched step
+            // (the #813 sweep regression). The stamp rides WITH the geometry (`LogitsGeom::place`)
+            // so the read and the de-interleave below address one tensor by one authority —
+            // see `StampedLogits` for the mint boundary.
+            let name = geom.place.0;
             // TIMED, because `predict`'s own phase timer CANNOT see this. Moving the logits readback
             // out of `predict` (the shim converts one row, so it cannot serve a batch) also moved it
             // outside `logits_d2h`, which is why that column reads 0.00 for a batched decode while

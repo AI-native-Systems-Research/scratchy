@@ -2512,9 +2512,10 @@ impl SpyreWorker {
                     // renumbering: the `SegRole::Logits` stamp, read here as `layout.logits()`. The
                     // geometry check below stays a CHECK — refusing a rung whose result is not N
                     // whole rows — never the search that finds it.
-                    let logits = rcode.layout.logits().and_then(|p| {
-                        LogitsGeom::from_placement(p.size, rung_width, vocab as usize)
-                    });
+                    let logits = rcode
+                        .layout
+                        .logits()
+                        .and_then(|p| LogitsGeom::from_placement(p, rung_width, vocab as usize));
                     let Some(logits) = logits else {
                         warn!(
                             "[spyre-worker] sendnn: decode batch rung seqs={rn}: its own baked \
