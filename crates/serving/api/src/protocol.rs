@@ -112,7 +112,14 @@ pub struct JsonSchemaResponseFormat {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The schema, under OpenAI's key, `schema`, as vLLM reads it
+    /// (`response_format: {"type": "json_schema", "json_schema": {"name": …, "schema": {…}}}`).
+    /// `json_schema` is read too, the key this read before.
+    #[serde(
+        rename = "schema",
+        alias = "json_schema",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub json_schema: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,

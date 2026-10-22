@@ -353,30 +353,26 @@ fn convert_request(req: &ResponsesRequest) -> protocol::ChatCompletionRequest {
         StopParam::Multiple(v) => protocol::StopCondition::Multiple(v.clone()),
     });
 
-    // Extract json_schema from text.format if present
+    // `text.format`, in the Responses API's form: a json_schema format carries its name, schema
+    // and strictness itself, `{"type": "json_schema", "name": …, "schema": {…}, "strict": …}`. One
+    // without a `schema` reaches the chat path as a json_schema format without one, which refuses
+    // it (a 400), rather than being read as no format.
     let response_format = req.text.as_ref().and_then(|text| {
         let format = text.get("format")?;
         let fmt_type = format.get("type")?.as_str()?;
+        let string = |key: &str| format.get(key).and_then(|v| v.as_str()).map(str::to_string);
         match fmt_type {
-            "json_schema" => {
-                let schema = format.get("json_schema")?;
-                let name = schema
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("response")
-                    .to_string();
-                Some(protocol::ResponseFormat::Standard(
-                    protocol::StandardResponseFormat {
-                        format_type: "json_schema".to_string(),
-                        json_schema: Some(protocol::JsonSchemaResponseFormat {
-                            name,
-                            description: None,
-                            json_schema: Some(schema.clone()),
-                            strict: schema.get("strict").and_then(|s| s.as_bool()),
-                        }),
-                    },
-                ))
-            }
+            "json_schema" => Some(protocol::ResponseFormat::Standard(
+                protocol::StandardResponseFormat {
+                    format_type: "json_schema".to_string(),
+                    json_schema: Some(protocol::JsonSchemaResponseFormat {
+                        name: string("name").unwrap_or_else(|| "response".to_string()),
+                        description: string("description"),
+                        json_schema: format.get("schema").cloned(),
+                        strict: format.get("strict").and_then(|s| s.as_bool()),
+                    }),
+                },
+            )),
             "json_object" => Some(protocol::ResponseFormat::Standard(
                 protocol::StandardResponseFormat {
                     format_type: "json_object".to_string(),
@@ -1121,6 +1117,50 @@ mod tests {
         assert_eq!(chat.messages[0].role, "user");
         assert_eq!(chat.max_tokens, Some(100));
         assert_eq!(chat.temperature, Some(0.7));
+    }
+
+    /// A json_schema `text.format` is read as the Responses API writes it, with its name, schema
+    /// and strictness on the format itself: the schema is the format's `schema`, not the format
+    /// object.
+    #[test]
+    fn a_json_schema_text_format_carries_its_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        });
+        let text = serde_json::json!({"format": {
+            "type": "json_schema", "name": "city", "schema": schema, "strict": true,
+        }});
+        let req: ResponsesRequest = serde_json::from_value(
+            serde_json::json!({"input": "Where is the Eiffel Tower?", "text": text}),
+        )
+        .unwrap();
+        let Some(protocol::ResponseFormat::Standard(format)) =
+            convert_request(&req).response_format
+        else {
+            panic!("a json_schema format");
+        };
+        assert_eq!(format.format_type, "json_schema");
+        let json_schema = format.json_schema.unwrap();
+        assert_eq!(json_schema.name, "city");
+        assert_eq!(json_schema.json_schema, Some(schema));
+        assert_eq!(json_schema.strict, Some(true));
+
+        // Without a schema it is still a json_schema format, one the chat path refuses (a 400).
+        let bare = serde_json::json!({"format": {"type": "json_schema", "name": "city"}});
+        let req: ResponsesRequest =
+            serde_json::from_value(serde_json::json!({"input": "Hi", "text": bare})).unwrap();
+        let response_format = convert_request(&req).response_format;
+        let Some(protocol::ResponseFormat::Standard(format)) = &response_format else {
+            panic!("a json_schema format");
+        };
+        assert_eq!(format.json_schema.as_ref().unwrap().json_schema, None);
+        let refused = crate::engine::parse_response_format(&response_format);
+        assert!(
+            matches!(refused, Err(crate::error::ServeError::Validation(_))),
+            "{refused:?}"
+        );
     }
 
     #[test]
