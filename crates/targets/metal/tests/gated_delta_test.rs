@@ -1042,7 +1042,18 @@ fn gdn_scan_varlen_continuity() {
     let beta_full = fill(t_full * nv);
     let (q, k, v) = split_conv(&conv_full, nk, nv, hk, hv, t_full);
     let o_full = recurrent_ref(
-        &q, &k, &v, &g_full, &beta_full, nk, nv, hk, hv, t_full, scale, &[4],
+        &q,
+        &k,
+        &v,
+        &g_full,
+        &beta_full,
+        nk,
+        nv,
+        hk,
+        hv,
+        t_full,
+        scale,
+        &[4],
     );
 
     let state_buf = buf_zero_f16(&device, nv * hv * hk);
@@ -2034,7 +2045,12 @@ fn gdn_conv1d_varlen_ring_survives_a_short_replayed_verify() {
     ) else {
         return;
     };
-    assert_close(&next, &out_full[7 * conv_dim..], "slot row after replay", 1e-4);
+    assert_close(
+        &next,
+        &out_full[7 * conv_dim..],
+        "slot row after replay",
+        1e-4,
+    );
     let slot0 = read_f32(&state_buf, entry_len);
     assert!(
         slot0.iter().all(|&v| v == 0.0),
@@ -2172,7 +2188,18 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
     // (row 4's end — the replay's boundary).
     let o_full = |slot_after_rows: &[usize]| {
         recurrent_ref(
-            &q, &k, &v, &g_full, &beta_full, nk, nv, hk, hv, t_full, scale, slot_after_rows,
+            &q,
+            &k,
+            &v,
+            &g_full,
+            &beta_full,
+            nk,
+            nv,
+            hk,
+            hv,
+            t_full,
+            scale,
+            slot_after_rows,
         )
     };
     // Rows `3..5` of the kept sequence, then two rejected drafts.

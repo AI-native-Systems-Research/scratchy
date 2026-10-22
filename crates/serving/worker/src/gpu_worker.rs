@@ -2756,8 +2756,7 @@ impl MetalWorker {
             dims,
             scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE,
         );
-        let (conv, ssm) =
-            dims.slot_bytes(scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE);
+        let (conv, ssm) = dims.slot_bytes(scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE);
         let unit = scratchy_target_metal::sparse_kv::whole_tile_blocks(&dev.device, [conv, ssm]);
         (bytes > 0).then_some((bytes, unit))
     }

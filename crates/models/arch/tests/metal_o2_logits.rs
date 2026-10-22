@@ -34,9 +34,7 @@ use scratchy_core_model::weight::HfModelConfig;
 use scratchy_forward_compiler::{
     ArchLoad, HfFingerprint, ScratchyWeights, hash_json_value, try_load,
 };
-use scratchy_target_metal::gdn_state::{
-    GDN_SSM_STATE_DTYPE, GdnSeqSlots, GdnSlot, GdnStatePool,
-};
+use scratchy_target_metal::gdn_state::{GDN_SSM_STATE_DTYPE, GdnSeqSlots, GdnSlot, GdnStatePool};
 use scratchy_target_metal::interpreter::metal::{BLOCKS_PER_CHUNK, MetalDtype, MetalRungs};
 use scratchy_target_metal::kv_cache::KvCachePool;
 use scratchy_target_metal::sparse_kv::{KvMapper, SparseStores};
