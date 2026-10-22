@@ -12,10 +12,14 @@
 //! steps of one token a sequence, and a slot re-taken fresh mid-run. Both scan mappings run — the
 //! per-thread scan (state 16, the parity-tiny geometry) and the simd scan (state 128, the real
 //! checkpoints'). The tests take turns on the GPU ([`gpu_turn`]).
+//!
+//! The ssm slot is the pool's f16 entry (the kernels' `device half*`): a step's last-row state
+//! rounds through it at its store and the next step's load, the reference modeling the same
+//! rounding where it carries a sequence across steps. The conv ring stays f32, exact.
 
 mod common;
 
-use common::Dtype;
+use common::{Dtype, shared_bytes};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
@@ -255,7 +259,8 @@ impl Gpu {
         Self {
             cache: SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders"),
             conv_state: shared(&device, conv),
-            ssm_state: shared(&device, ssm),
+            // The pool's ssm entry is f16, the kernels' `device half*`.
+            ssm_state: shared_bytes(&device, &Dtype::F16.bytes(ssm)),
             conv_w: shared(&device, &dtype.bytes(&w.conv_w)),
             conv_b: shared(&device, &dtype.bytes(&w.conv_b)),
             a_log: shared(&device, &w.a_log),
@@ -278,27 +283,36 @@ impl Gpu {
         }
     }
 
-    /// The pools' contents, conv then ssm.
+    /// The pools' contents, conv then ssm — the ssm entry's halves widened.
     fn pools(&self) -> (Vec<f32>, Vec<f32>) {
         let floats = |b: &Buffer| b.length() / 4;
         (
             read(&self.conv_state, floats(&self.conv_state)),
-            read(&self.ssm_state, floats(&self.ssm_state)),
+            Dtype::F16.decode(&self.ssm_state, self.ssm_state.length() / 2),
         )
     }
 
-    /// Make the pools hold `conv` and `ssm`.
+    /// Make the pools hold `conv` and `ssm`, the ssm rounded through its f16 entry.
     fn load(&self, conv: &[f32], ssm: &[f32]) {
-        for (buf, data) in [(&self.conv_state, conv), (&self.ssm_state, ssm)] {
-            assert_eq!(buf.length(), std::mem::size_of_val(data), "a whole pool");
-            // SAFETY: `buf` holds exactly `data`'s bytes and does not overlap it.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr() as *const u8,
-                    buf.contents().as_ptr() as *mut u8,
-                    std::mem::size_of_val(data),
-                );
-            }
+        let ssm = Dtype::F16.bytes(ssm);
+        assert_eq!(
+            self.conv_state.length(),
+            std::mem::size_of_val(conv),
+            "a whole pool"
+        );
+        assert_eq!(self.ssm_state.length(), ssm.len(), "a whole pool");
+        // SAFETY: each buffer holds exactly its data's bytes and does not overlap it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                conv.as_ptr() as *const u8,
+                self.conv_state.contents().as_ptr() as *mut u8,
+                std::mem::size_of_val(conv),
+            );
+            std::ptr::copy_nonoverlapping(
+                ssm.as_ptr(),
+                self.ssm_state.contents().as_ptr() as *mut u8,
+                ssm.len(),
+            );
         }
     }
 
@@ -526,6 +540,7 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step], routed: bool) 
             .collect();
         let mut cu = vec![0i32];
         let mut want = Vec::with_capacity(tokens * geo.inner());
+        let mut carried = Vec::with_capacity(tokens * geo.inner());
         for &(slot, n, fresh) in step {
             let at = *cu.last().unwrap() as usize;
             cu.push((at + n) as i32);
@@ -534,6 +549,13 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step], routed: bool) 
             }
             let rows = &zx[at * geo.row()..(at + n) * geo.row()];
             want.extend(reference(geo, &w, rows, n, &mut states[slot]));
+            // The kernel leaves each step's last-row state in the slot through the pool's f16
+            // entry and the next step loads it back; the reference carries f32 registers, so
+            // round its state at the same point.
+            for v in states[slot].ssm.iter_mut() {
+                *v = Dtype::F16.round(*v);
+            }
+            carried.extend(std::iter::repeat_n(!fresh, n * geo.inner()));
         }
         let seqs: Vec<GdnSeqSlots> = step
             .iter()
@@ -544,9 +566,18 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step], routed: bool) 
             eprintln!("skipping: no MTL4 queue");
             return;
         };
-        for (j, (&g, &r)) in got.iter().zip(&want).enumerate() {
+        for (j, ((&g, &r), &c)) in got.iter().zip(&want).zip(&carried).enumerate() {
+            // A carried row's state crossed the entry's rounding between steps: the two arms
+            // round the same registers except where their f32 divergence straddles a boundary
+            // — one half ULP, ~1e-3 relative through the scan. A fresh row's state is zero:
+            // the model dtype's tolerance alone.
+            let tol = if c {
+                dtype.tol(r).max(1e-3 * (1.0 + r.abs()))
+            } else {
+                dtype.tol(r)
+            };
             assert!(
-                (g - r).abs() <= dtype.tol(r),
+                (g - r).abs() <= tol,
                 "{geo:?} {dtype:?} step {i}: out[{j}] (token {}, col {}) = {g}, reference {r}",
                 j / geo.inner(),
                 j % geo.inner(),
@@ -554,7 +585,7 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step], routed: bool) 
         }
     }
     let conv = read::<f32>(&gpu.conv_state, slots * ring);
-    let ssm_got = read::<f32>(&gpu.ssm_state, slots * ssm);
+    let ssm_got = Dtype::F16.decode(&gpu.ssm_state, slots * ssm);
     for slot in steps.iter().flatten().map(|s| s.0) {
         for (j, (&g, &r)) in conv[slot * ring..][..ring]
             .iter()
@@ -569,8 +600,10 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step], routed: bool) 
             .zip(&states[slot].ssm)
             .enumerate()
         {
+            // Both arms round the carried state at the same steps; they differ only where
+            // their f32 registers straddled a rounding boundary — one half ULP.
             assert!(
-                (g - r).abs() <= 1e-4 * (1.0 + r.abs()),
+                (g - r).abs() <= 1e-3 * (1.0 + r.abs()),
                 "{geo:?} {dtype:?} slot {slot}: ssm state [{j}] = {g}, reference {r}"
             );
         }
@@ -668,7 +701,8 @@ fn assert_bits(got: &[f32], want: &[f32], what: &str) {
 /// slot 3 holds what a step of just those two rows leaves, slot 4 what the prefill leaves. A later
 /// step on slot 0 restores slot 3 and runs the prefill's remaining rows: its output is the
 /// prefill's rows past the junction and its state the prefill's, the snapshot as it was. All bit
-/// for bit: a save stores the registers the scan carries on, a restore loads them back.
+/// for bit: a save stores the registers the scan carries on — rounded through the entry's f16, so
+/// the cold run continues from what it stored — and a restore loads them back.
 fn snapshots(geo: Geometry, dtype: Dtype, routed: bool) {
     let Some(di) = detect_device() else {
         eprintln!("skipping: no Metal device");
@@ -726,7 +760,13 @@ fn snapshots(geo: Geometry, dtype: Dtype, routed: bool) {
     let after = gpu.pools();
     same(slot(&after, 3), at_junction, "the junction's snapshot");
     same(slot(&after, 4), slot(&after, 1), "the last row's snapshot");
-    let start = (conv0, ssm0);
+    // The untouched-slot arm: the entry's f16 rounds what `load` uploads, the ring exact.
+    let start = (
+        conv0,
+        ssm0.iter()
+            .map(|&x| Dtype::F16.round(x))
+            .collect::<Vec<_>>(),
+    );
     same(slot(&after, 0), slot(&start, 0), "slot 0");
 
     // The junction restored on slot 0, running the prefill's rows past it.
@@ -737,12 +777,16 @@ fn snapshots(geo: Geometry, dtype: Dtype, routed: bool) {
     };
     let inner = geo.inner();
     let past_junction = &out[junction * inner..t * inner];
+    // The scan rounds its carried registers through the entry's f16 at the save, so the
+    // restore resumes from exactly what the cold run carried on from: the resumed rows
+    // are the prefill's rows past the junction, bit for bit.
     assert_bits(
         &resumed,
         past_junction,
         &format!("{what}: the resumed rows"),
     );
     let restored = gpu.pools();
+    // The whole resumed state — the ring and the ssm entry — is the prefill's, bit for bit.
     same(slot(&restored, 0), slot(&after, 1), "the resumed state");
     same(slot(&restored, 3), slot(&after, 3), "the restored snapshot");
 }

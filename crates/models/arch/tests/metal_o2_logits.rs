@@ -34,7 +34,7 @@ use scratchy_core_model::weight::HfModelConfig;
 use scratchy_forward_compiler::{
     ArchLoad, HfFingerprint, ScratchyWeights, hash_json_value, try_load,
 };
-use scratchy_target_metal::gdn_state::{GdnSeqSlots, GdnSlot, GdnStatePool};
+use scratchy_target_metal::gdn_state::{GDN_SSM_STATE_DTYPE, GdnSeqSlots, GdnSlot, GdnStatePool};
 use scratchy_target_metal::interpreter::metal::{BLOCKS_PER_CHUNK, MetalDtype, MetalRungs};
 use scratchy_target_metal::kv_cache::KvCachePool;
 use scratchy_target_metal::sparse_kv::{KvMapper, SparseStores};
@@ -386,6 +386,7 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
                 // A lane for a model that drafts: its tapes bind one, though this one never does.
                 scratchy_target_metal::gdn_state::DraftLanes::new(cfg.checkpoint_rows(), 1),
                 cfg.state_dims(),
+                GDN_SSM_STATE_DTYPE,
                 |bytes| Ok(MetalMem::new_pinned(&device, &residency, bytes)),
             )
         }
