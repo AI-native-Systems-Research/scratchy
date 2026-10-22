@@ -348,8 +348,9 @@ pub struct MetalWorker {
     /// The chain buffer and layout `execute_model` laid this step's head passes out in, and whether
     /// the step is behind a speculative one in flight, for `forward_argmax_then`.
     pending_chain: Option<(ChainLayout, Arc<ChainBuffer>, bool)>,
-    /// The chain of the deferred step `forward_argmax_then` committed, back for `execute_model`.
-    committed_chain: Option<(ChainLayout, Arc<ChainBuffer>)>,
+    /// The chain of the deferred step `forward_argmax_then` committed, back for `execute_model`, and
+    /// whether that step is behind a speculative one in flight (as `pending_chain` had it).
+    committed_chain: Option<(ChainLayout, Arc<ChainBuffer>, bool)>,
     /// The last speculative step committed without waiting: what a step behind it reads.
     spec_tail: Option<SpecTail>,
     /// Steps committed without waiting for them, oldest first.
@@ -2036,6 +2037,7 @@ impl MetalWorker {
         }
         let tokens = sampled(
             &step.done,
+            step.lead.as_deref(),
             &step.argmax,
             step.rows.iter().map(|&(_, row)| row),
         )
@@ -2110,12 +2112,15 @@ impl MetalWorker {
         let (rows, first) = (positions.len(), 0usize);
         let k = rows - 1;
         let selector = || ((*tail.chain.0).clone(), tail.accepted_at);
+        // The selector is how many of its `k` drafts the step before kept: `0..=k`.
+        let kept_counts = k + 1;
         let table =
             |words: Vec<u32>, stride: usize, len: usize, to: SelectInto, at: usize| Selection {
                 source: SelectFrom::Table(words),
                 stride,
                 len,
                 selector: selector(),
+                variants: kept_counts,
                 to,
                 at,
             };
@@ -2165,6 +2170,7 @@ impl MetalWorker {
                 stride: 1,
                 len: 1,
                 selector: selector(),
+                variants: kept_counts,
                 to: SelectInto::Input(Into::InputIds),
                 at: first * 4,
             },
@@ -2173,6 +2179,7 @@ impl MetalWorker {
                 stride: 0,
                 len: k,
                 selector: selector(),
+                variants: kept_counts,
                 to: SelectInto::Input(Into::InputIds),
                 at: (first + 1) * 4,
             },
@@ -2226,6 +2233,7 @@ impl MetalWorker {
             stride: 0,
             len: k,
             selector: selector(),
+            variants: kept_counts,
             to: to(),
             at: at(ChainLayout::DRAFTED) + first * 4,
         });
@@ -2331,6 +2339,8 @@ impl MetalWorker {
                 stride: 1,
                 len: 1,
                 selector: ((*tail.chain.0).clone(), tail.accepted_at),
+                // One uniform per kept count `0..=k`.
+                variants: k + 1,
                 to: SelectInto::Buffer(buffer),
                 at,
             });
@@ -2341,12 +2351,27 @@ impl MetalWorker {
     /// A speculative step the engine pipelined, committed without waiting: its one request's rows
     /// in flight, what a step behind it reads ([`SpecTail`]), and its output once its device work is
     /// done — the tokens it keeps and the drafts its head made.
+    /// The command buffer a step behind the speculative one before it (`spec_tail`) waits on
+    /// before it reads its own: its rows were picked on the device by that one's chain, so if that
+    /// one failed, so does it. `None` for a step not behind one. Behind a different request is a
+    /// broken pipeline, an error.
+    fn lead_of(&self, behind: bool, req_ids: &[String]) -> ExecutorResult<Option<Arc<InFlight>>> {
+        match (behind, self.spec_tail.as_ref(), req_ids) {
+            (false, _, _) => Ok(None),
+            (true, Some(tail), [one]) if tail.req_id == *one => Ok(Some(Arc::clone(&tail.done))),
+            (true, tail, ids) => Err(ExecutorError::WorkerExecution(format!(
+                "{ids:?}: a step behind a speculative one, but the step before it ran {}",
+                tail.map_or("none", |t| t.req_id.as_str())
+            ))),
+        }
+    }
+
     fn commit_speculative(
         &mut self,
         done: InFlight,
         argmax: Arc<ArgmaxSlot>,
-        layout: &ChainLayout,
-        chain: Arc<ChainBuffer>,
+        // Its chain, and whether the step is behind the speculative one before it (`spec_tail`).
+        (layout, chain, behind): (ChainLayout, Arc<ChainBuffer>, bool),
         req_ids: &[String],
         q_lens: &[usize],
     ) -> ExecutorResult<ModelRunnerOutput> {
@@ -2356,6 +2381,8 @@ impl MetalWorker {
                 req_ids.len()
             )));
         };
+        let lead = self.lead_of(behind, std::slice::from_ref(req_id))?;
+        let done = Arc::new(done);
         let spec = SpecFlight {
             req_id: req_id.clone(),
             first: 0,
@@ -2364,6 +2391,7 @@ impl MetalWorker {
             chain,
             accepted_at: layout.at[ChainLayout::ACCEPTED],
             drafts_at: layout.at[ChainLayout::DRAFTS],
+            lead,
         };
         self.input_batch.commit_in_flight_rows(req_id, *rows, *rows);
         self.spec_tail = Some(SpecTail {
@@ -2373,8 +2401,8 @@ impl MetalWorker {
             chain: Arc::clone(&spec.chain),
             accepted_at: spec.accepted_at,
             drafts_at: spec.drafts_at,
+            done: Arc::clone(&done),
         });
-        let done = Arc::new(done);
         let resolver: ::scratchy_serving_engine::executor::SpecResolver = {
             let (done, argmax, spec) = (Arc::clone(&done), Arc::clone(&argmax), spec.clone());
             Box::new(move || {
@@ -2388,6 +2416,8 @@ impl MetalWorker {
             argmax,
             rows: Vec::new(),
             spec: Some(spec),
+            // Its lead, if any, is the speculative read's (`SpecFlight::lead`).
+            lead: None,
         });
         Ok(ModelRunnerOutput::deferred_speculative(
             vec![req_id.clone()],
@@ -4116,7 +4146,8 @@ impl MetalWorker {
                 req.num_tokens as u64,
                 Some(followup),
             )
-        };
+        }
+        .map_err(|e| BackendError::Backend(e.0))?;
         let _ = logits; // argmax_out is what we read
         if let Some(deferral) = deferral.as_mut() {
             let in_flight = deferral.take_in_flight().ok_or_else(|| {
@@ -4125,7 +4156,7 @@ impl MetalWorker {
             self.committed = Some((in_flight, argmax));
             // The head's worker goes back now: its staging slot outlives this step (`Onto`).
             self.committed_chain = (head.borrow().as_ref())
-                .and_then(|h| h.buffer.clone().map(|b| (h.layout.clone(), b)));
+                .and_then(|h| h.buffer.clone().map(|b| (h.layout.clone(), b, h.behind)));
             return Ok(Forwarded::default());
         }
 
@@ -4988,6 +5019,9 @@ struct InFlightStep {
     rows: Vec<(String, usize)>,
     /// A speculative step's: its tokens are the drafts it keeps and the target's next.
     spec: Option<SpecFlight>,
+    /// A step's behind a speculative one without a chain of its own: waited on before its tokens
+    /// are read ([`MetalWorker::lead_of`]).
+    lead: Option<Arc<InFlight>>,
 }
 
 /// A speculative step committed without waiting ([`SpecPipeline`]): its one request's rows, from
@@ -5002,6 +5036,8 @@ struct SpecFlight {
     chain: Arc<ChainBuffer>,
     accepted_at: usize,
     drafts_at: usize,
+    /// The step this one is behind ([`SpecTail`]), whose chain its rows were selected by.
+    lead: Option<Arc<InFlight>>,
 }
 
 #[cfg(feature = "metal")]
@@ -5012,7 +5048,12 @@ impl SpecFlight {
         &self,
         done: &InFlight,
         argmax: &ArgmaxSlot,
-    ) -> Result<(Vec<u32>, Vec<u32>), ForwardError> {
+    ) -> Result<(Vec<u32>, Vec<u32>), SpecReadError> {
+        // A step behind another selected its rows on the device by that one's chain: if that
+        // one failed, so does this one, its rows picked by words the failed step never wrote.
+        if let Some(lead) = &self.lead {
+            lead.wait()?;
+        }
         done.wait()?;
         let words = |at: usize, len: usize| -> Vec<u32> {
             // SAFETY: `at..at + 4 len` lies in the chain's sections, which the done command buffer
@@ -5029,10 +5070,49 @@ impl SpecFlight {
                 std::slice::from_raw_parts(base, len).to_vec()
             }
         };
+        // The count of drafts kept is the GPU's own word, and sizes an unchecked host read of the
+        // argmax buffer, which holds this step's `rows`: the read through `first + kept + 1` must
+        // stay within them (the bound the chain kernel keeps, and `resolve_oldest`'s draft count).
         let kept = words(self.accepted_at, 1)[0] as usize;
+        if self.first + kept + 1 > self.rows {
+            return Err(SpecReadError::KeptPastRows {
+                kept,
+                rows: self.rows,
+            });
+        }
         let out: Vec<u32> =
             scratchy_target_metal::mtl4_dispatch::read_slice(&argmax.out, self.first + kept + 1);
         Ok((out[self.first..].to_vec(), words(self.drafts_at, self.k)))
+    }
+}
+
+/// Why a speculative step's tokens could not be read: its command buffer failed, or its chain says
+/// it kept more drafts than the step has rows for, a word no chain pass that ran writes.
+#[cfg(feature = "metal")]
+enum SpecReadError {
+    Forward(ForwardError),
+    KeptPastRows { kept: usize, rows: usize },
+}
+
+#[cfg(feature = "metal")]
+impl From<ForwardError> for SpecReadError {
+    fn from(e: ForwardError) -> Self {
+        Self::Forward(e)
+    }
+}
+
+#[cfg(feature = "metal")]
+impl std::fmt::Display for SpecReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Forward(e) => write!(f, "{e}"),
+            Self::KeptPastRows { kept, rows } => {
+                write!(
+                    f,
+                    "a speculative step's chain kept {kept} drafts of its {rows} rows"
+                )
+            }
+        }
     }
 }
 
@@ -5046,6 +5126,8 @@ struct SpecTail {
     chain: Arc<ChainBuffer>,
     accepted_at: usize,
     drafts_at: usize,
+    /// Its command buffer, which a step behind it waits on before it reads its own.
+    done: Arc<InFlight>,
 }
 
 /// A step's [`ChainLayout`] buffer.
@@ -5084,13 +5166,18 @@ fn free_chain_buffer(
     buffer
 }
 
-/// The tokens at `rows` of a step's argmax, once its command buffer is done.
+/// The tokens at `rows` of a step's argmax, once its command buffer is done, and the lead's it is
+/// behind, whose words its first row was read from on the device.
 #[cfg(feature = "metal")]
 fn sampled(
     done: &InFlight,
+    lead: Option<&InFlight>,
     argmax: &ArgmaxSlot,
     rows: impl Iterator<Item = usize>,
 ) -> Result<Vec<u32>, ForwardError> {
+    if let Some(lead) = lead {
+        lead.wait()?;
+    }
     done.wait()?;
     let out: Vec<u32> = scratchy_target_metal::mtl4_dispatch::read_slice(
         &argmax.out,
@@ -7260,9 +7347,9 @@ impl Worker for MetalWorker {
                 let spec9_block_size_thread = spec9_block_size;
                 let spec9_block_table_stride_thread = lock_block_table_stride;
                 let (v, spec9_seeds_out, spec9_drafts_out): (Vec<u32>, Vec<u32>, Vec<Vec<u32>>) =
-                    std::thread::scope(|s| {
+                    std::thread::scope(|s| -> ExecutorResult<_> {
                         let lockstep_handle =
-                        s.spawn(move || -> (Vec<u32>, Vec<Vec<u32>>) {
+                        s.spawn(move || -> Result<(Vec<u32>, Vec<Vec<u32>>), String> {
                         // Build shadow GpuDevice on draft_queue.
                         let mut shadow_device = GpuDevice {
                             device: mtl_device_clone,
@@ -7365,13 +7452,17 @@ impl Worker for MetalWorker {
                             deferred: None,
                             reads: Reads::Outputs,
                         };
+                        // A GPU failure fails the step, as the target's forward does, rather than
+                        // panicking this thread and, through its join, the executor's.
                         let logits = unsafe {
-                            dm.forward(
+                            dm.forward_with_metal_followup(
                                 scratchy_target_metal::ForwardCtxHandle::new(&ctx),
                                 scratchy_target_metal::ForwardDeviceHandle::new(&mut shadow_device),
                                 lock_num_tokens as u64,
+                                None,
                             )
-                        };
+                        }
+                        .map_err(|e| e.0)?;
 
                         // Phase-9: argmax of the last verify position
                         // per req IS draft's prediction of what target
@@ -7497,7 +7588,7 @@ impl Worker for MetalWorker {
                             Vec::new()
                         };
 
-                        (spec_seeds, spec_drafts)
+                        Ok((spec_seeds, spec_drafts))
                     });
 
                         let r = self
@@ -7510,10 +7601,15 @@ impl Worker for MetalWorker {
                                 ExecutorError::WorkerExecution(format!("spec verify forward: {e}"))
                             });
                         // join propagates any panic the lockstep thread
-                        // raised; treat as worker execution failure.
-                        let (spec_seeds, spec_drafts) =
-                            lockstep_handle.join().expect("lockstep thread panicked");
-                        let target_argmax = r.unwrap_or_else(|_| Vec::new());
+                        // raised; treat as worker execution failure. Each side's error keeps its
+                        // own label, and the target's fails the step rather than reading as an
+                        // empty argmax (the scope joins the draft thread on the way out).
+                        let (spec_seeds, spec_drafts) = (lockstep_handle.join())
+                            .expect("lockstep thread panicked")
+                            .map_err(|e| {
+                                ExecutorError::WorkerExecution(format!("draft forward: {e}"))
+                            })?;
+                        let target_argmax = r?;
                         if !spec_seeds.is_empty() && !target_argmax.is_empty() {
                             // Probe: compare draft's predicted bonus
                             // vs target's actual bonus (per req).
@@ -7535,8 +7631,8 @@ impl Worker for MetalWorker {
                                 }
                             }
                         }
-                        (target_argmax, spec_seeds, spec_drafts)
-                    });
+                        Ok((target_argmax, spec_seeds, spec_drafts))
+                    })?;
                 async_lockstep_done = true;
                 spec9_seeds_final = spec9_seeds_out;
                 spec9_drafts_final = spec9_drafts_out;
@@ -7561,12 +7657,11 @@ impl Worker for MetalWorker {
         // the next step but one, wait for them.
         if let Some((done, argmax)) = self.committed.take() {
             self.sampler_logits = None;
-            if let Some((layout, chain)) = self.committed_chain.take() {
+            if let Some(committed_chain) = self.committed_chain.take() {
                 return self.commit_speculative(
                     done,
                     argmax,
-                    &layout,
-                    chain,
+                    committed_chain,
                     &req_ids_in_order,
                     &q_lens,
                 );
@@ -7585,13 +7680,19 @@ impl Worker for MetalWorker {
                 argmax,
                 rows,
                 spec: None,
+                lead: self.lead_of(behind, &req_ids_in_order)?,
             };
-            let (done, argmax) = (Arc::clone(&step.done), Arc::clone(&step.argmax));
+            let (done, lead, argmax) = (
+                Arc::clone(&step.done),
+                step.lead.clone(),
+                Arc::clone(&step.argmax),
+            );
             let rows: Vec<usize> = step.rows.iter().map(|&(_, row)| row).collect();
             let output = ModelRunnerOutput::deferred(
                 step.rows.iter().map(|(req_id, _)| req_id.clone()).collect(),
                 Box::new(move || {
-                    sampled(&done, &argmax, rows.into_iter()).map_err(|e| e.to_string())
+                    sampled(&done, lead.as_deref(), &argmax, rows.into_iter())
+                        .map_err(|e| e.to_string())
                 }),
             );
             self.in_flight.push_back(step);

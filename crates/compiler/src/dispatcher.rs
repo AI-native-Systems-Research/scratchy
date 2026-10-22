@@ -391,6 +391,10 @@ pub trait ScratchyWeights: Send + Sync {
     /// hook — non-metal builds and arches that haven't been
     /// re-emitted with the metal followup glue still build.
     ///
+    /// `Err` only when the forward's command buffer failed on the GPU (an
+    /// out-of-memory, say): the executor fails the step and goes on. A
+    /// forward that breaks an invariant still panics.
+    ///
     /// # Safety
     /// Same as [`Self::forward`].
     #[cfg(feature = "metal")]
@@ -400,8 +404,8 @@ pub trait ScratchyWeights: Send + Sync {
         device: ForwardDeviceHandle<'_>,
         num_tokens: u64,
         _followup: Option<MetalForwardFollowup<'_>>,
-    ) -> OwnedTensor {
-        unsafe { self.forward(ctx, device, num_tokens) }
+    ) -> Result<OwnedTensor, GpuExecutionFailed> {
+        Ok(unsafe { self.forward(ctx, device, num_tokens) })
     }
 
     /// The rotary cos/sin rows a forward at `positions` (one a token) reads in place of a
@@ -453,6 +457,23 @@ pub trait ScratchyWeights: Send + Sync {
         Err("metal_chain_with_encoder: not implemented for this arch".into())
     }
 }
+
+/// A metal forward whose command buffer the GPU failed to run (an out-of-memory, say): the one
+/// failure `forward_with_metal_followup` returns rather than panics on, so the executor can fail
+/// the step and go on. Its text is the pool's error.
+#[cfg(feature = "metal")]
+#[derive(Debug)]
+pub struct GpuExecutionFailed(pub String);
+
+#[cfg(feature = "metal")]
+impl std::fmt::Display for GpuExecutionFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(feature = "metal")]
+impl std::error::Error for GpuExecutionFailed {}
 
 /// Box for a Metal forward-encoder tail hook. Invoked on the same
 /// MTL4 compute encoder used to encode the forward, AFTER the

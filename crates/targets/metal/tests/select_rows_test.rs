@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `select_rows`: each op copies the variant its selector names — variants a stride apart,
 //! overlapping where the stride is shorter than the copy — from a staged table or a device buffer,
-//! to its destination at its offset; ops of one dispatch pick independently. GPU test — run with
+//! to its destination at its offset; ops of one dispatch pick independently, and a selector past
+//! its variants takes the last. GPU test — run with
 //! `--test-threads=1` (standing rule).
 
 mod common;
@@ -32,24 +33,27 @@ fn select_rows_copies_the_variant_each_selector_names() {
     // An earlier step's outputs: its rows' tokens, and its drafts.
     let tokens = shared_slice(&device, &[300u32, 301, 302, 303]);
     let drafts = shared_slice(&device, &[400u32, 401]);
-    let dsts: Vec<_> = (0..4).map(|_| shared_zeroed(&device, 64)).collect();
-    let selection = |source, stride, len, selector, to: usize, at| Selection {
+    let dsts: Vec<_> = (0..5).map(|_| shared_zeroed(&device, 64)).collect();
+    let selection = |source, stride, len, selector, variants, to: usize, at| Selection {
         source,
         stride,
         len,
         selector: (selectors.clone(), selector),
+        variants,
         to: SelectInto::Buffer(dsts[to].clone()),
         at,
     };
     let selections = [
         // Three variants of four words.
-        selection(SelectFrom::Table((100..112).collect()), 4, 4, 0, 0, 0),
+        selection(SelectFrom::Table((100..112).collect()), 4, 4, 0, 3, 0, 0),
         // A window over five two-word rows, three rows a copy, 8 bytes into its destination.
-        selection(SelectFrom::Table((200..210).collect()), 2, 6, 4, 1, 8),
+        selection(SelectFrom::Table((200..210).collect()), 2, 6, 4, 3, 1, 8),
         // The token at the row sequence 0 kept up to, from row 1 on.
-        selection(SelectFrom::Device(tokens.clone(), 4), 1, 1, 0, 2, 0),
+        selection(SelectFrom::Device(tokens.clone(), 4), 1, 1, 0, 3, 2, 0),
         // The drafts whole: stride 0.
-        selection(SelectFrom::Device(drafts.clone(), 0), 0, 2, 4, 3, 4),
+        selection(SelectFrom::Device(drafts.clone(), 0), 0, 2, 4, 1, 3, 4),
+        // Sequence 0's selector (2) past two variants of two words: the last, variant 1.
+        selection(SelectFrom::Table((500..504).collect()), 2, 2, 0, 2, 4, 0),
     ];
     // The staged region: the ops, then each table.
     let ops_bytes = selections.len() * size_of::<SelectOp>();
@@ -93,5 +97,10 @@ fn select_rows_copies_the_variant_each_selector_names() {
         read(3, 3),
         [0, 400, 401],
         "the drafts, past the op's offset"
+    );
+    assert_eq!(
+        read(4, 2),
+        [502, 503],
+        "a selector past its variants takes the last"
     );
 }
