@@ -52,6 +52,22 @@ window, a request counter that disagrees with what was sent, a cache reset that
 failed or a cache that survived it, and a turn that returned no tokens or no
 content, timed out, answered 4xx, was cut short at max_tokens, or counted a
 prompt shorter than the recording's by more than the tolerance.
+
+`live` is Lane B: it runs headless Claude Code on a graded task several times,
+records each session through the relay above, grades it, and writes one run in
+the leaderboard's Lane B shape. Replay owns every latency claim and live every
+outcome claim, and neither writes the other's metrics.
+
+    scripts/cc_trace.py live --task tasks/01-bugfix-python-phone-number \\
+        --endpoint http://127.0.0.1:8000 --engine scratchy --model qwen3.6-35b-a3b \\
+        --served-model mlx-community/Qwen3.6-35B-A3B-4bit --machine m5max-64 --rung R1 \\
+        --scr target/release/scr --scratchy-sha "$(git rev-parse HEAD)" ... --out run-laneB.json
+
+A tool call counts as failed when the engine broke it (arguments that are not
+JSON, a call Claude Code rejected, call markup its parser left in plain text),
+never when the agent's own command failed. A session that never reached the
+engine, or that the engine's request counter does not account for, voids the
+run.
 Standard library only.
 """
 
@@ -61,8 +77,10 @@ import hashlib
 import http.client
 import http.server
 import json
+import os
 import re
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -1328,6 +1346,371 @@ def cmd_replay(args):
         raise SystemExit(f"VOID: {run['void']}")
 
 
+# ------------------------------------------------------------------------ live
+
+# Lane B (#164 T2.2). Where replay owns every latency claim, live owns every
+# outcome claim: it runs the real agent on a graded task and reports whether the
+# job got done. Its runs never carry a Lane A metric, and replay's never carry
+# one of these.
+#
+# A task is a directory holding its own git repo (so it is copied fresh for every
+# session), a TASK.md whose text is the prompt, and a grade.sh that prints PASS
+# or FAIL. A grader the agent must not read lives outside the task and is passed
+# with --grader; it is run with the session's working copy as its argument.
+TASK_PROMPT = "TASK.md"
+TASK_GRADER = "grade.sh"
+# Lane B's minimum session count, from board.json's lanes.B.min_n.
+LIVE_MIN_SESSIONS = 5
+# Claude Code's own rejection of a tool call, as it phrases it in the tool
+# result. Anything else marked is_error is the agent's command failing (a test
+# that fails, a file that does not exist), which is the agent working.
+TOOL_REJECTED = ("InputValidationError", "No such tool available")
+# Tool-call markup left in a reply's text: the engine produced a call and its
+# parser did not turn it into a tool_use block, so the agent never received it.
+TOOL_MARKUP = ("<tool_call>", "<function=")
+# Seconds between the end of one session and the start of the next (#161 rule 6).
+LIVE_COOLDOWN_S = 30
+# 80% interval on a pass rate, matching the p10-p90 band the page draws.
+WILSON_Z = 1.2816
+# Routes scratchy leaves out of requests_served (server.rs COUNTED_EXCLUDED_ROUTES).
+UNCOUNTED_PATHS = frozenset({"/health", "/version", "/server_info", "/is_sleeping",
+                             "/gpu_memory", "/metrics"})
+
+
+def load_task(task):
+    """(task dir, prompt) for a task directory. Raises SystemExit."""
+    d = Path(task)
+    if not (d / ".git").exists():
+        raise SystemExit(f"{d}: not a task (no git repo, so it cannot be reset between sessions)")
+    prompt = d / TASK_PROMPT
+    if not prompt.is_file() or not prompt.read_text().strip():
+        raise SystemExit(f"{d}: no {TASK_PROMPT} to use as the prompt")
+    return d, prompt.read_text().strip()
+
+
+def fresh_copy(task, dest):
+    """A clean working copy of the task's committed state at `dest`: what the
+    agent sees, with nothing from an earlier session."""
+    dest = Path(dest)
+    if dest.exists():
+        raise SystemExit(f"{dest} already exists; every session needs a fresh copy")
+    subprocess.run(["git", "clone", "--quiet", "--no-hardlinks", str(Path(task).resolve()),
+                    str(dest)], check=True)
+    return dest
+
+
+def grade(workdir, grader):
+    """(passed, the grader's last line) for one session's working copy.
+
+    The grader is the task's own grade.sh unless `grader` names another; it runs
+    with the working copy as its argument and in it as its directory, and passes
+    when it exits 0 and its last line is PASS.
+    """
+    cmd = [str(Path(grader).resolve())] if grader else [str(Path(workdir) / TASK_GRADER)]
+    if not Path(cmd[0]).is_file():
+        raise SystemExit(f"no grader at {cmd[0]}")
+    p = subprocess.run(cmd + [str(workdir)], cwd=workdir, capture_output=True, text=True,
+                       timeout=600)
+    last = (p.stdout.strip().splitlines() or [""])[-1]
+    return p.returncode == 0 and last == "PASS", last or f"exit {p.returncode}"
+
+
+def session_stats(corpus):
+    """Lane B facts read from one session's recording.
+
+    The recorder keeps every request and response, so this needs nothing the
+    session did not already write: turns, tokens, and tool calls, of which a
+    failed one is a failure of the engine, never of the agent (see TOOL_REJECTED
+    and TOOL_MARKUP).
+    """
+    d = Path(corpus)
+    if not (d / "index.jsonl").exists():
+        # Nothing reached the relay, so nothing was recorded.
+        manifest = json.loads((d / "manifest.json").read_text())
+        return {"claude_version": manifest.get("agent_version"), "turns": 0, "skipped": 0,
+                "tool_calls": 0, "tool_calls_lost": 0, "tool_call_failures": 0,
+                "tool_call_parse_failure_rate": 0.0, "tokens_in": 0, "tokens_out": 0,
+                "wall_clock_s": 0.0}
+    manifest, turns, skipped = load_corpus(corpus)
+    rows = {}
+    for line in (d / "index.jsonl").read_text().splitlines():
+        if line.strip():
+            row = json.loads(line)
+            rows[row["seq"]] = row
+    calls = broken = lost = tokens_in = tokens_out = 0
+    for t in turns:
+        raw = (d / "responses" / f"{t['seq']:06d}.body")
+        data = raw.read_bytes() if raw.exists() else b""
+        if (rows[t["seq"]].get("resp_content_encoding") or "").lower() == "gzip":
+            data = gzip.decompress(data)
+        args, text = {}, []
+        try:
+            for ev, _ in sse_events(data.splitlines(keepends=True) + [b"\n"]):
+                kind = ev.get("type")
+                if kind == "content_block_start":
+                    block = ev.get("content_block") or {}
+                    if block.get("type") == "tool_use":
+                        args[ev.get("index")] = ""
+                elif kind == "content_block_delta":
+                    delta = ev.get("delta") or {}
+                    if delta.get("type") == "input_json_delta":
+                        i = ev.get("index")
+                        args[i] = args.get(i, "") + (delta.get("partial_json") or "")
+                    elif delta.get("type") == "text_delta":
+                        text.append(delta.get("text") or "")
+        except TurnFailed:
+            broken += 1  # an unreadable stream is a failure of whatever produced it
+            continue
+        calls += len(args)
+        for a in args.values():
+            if _json_or_none((a or "{}").encode()) is None:
+                broken += 1
+        reply = "".join(text)
+        lost += reply.count(TOOL_MARKUP[0]) or int(TOOL_MARKUP[1] in reply)
+        usage = t["recorded"]
+        tokens_in += usage.get("prompt_tokens") or 0
+        tokens_out += usage.get("output_tokens") or 0
+    # Claude Code's rejections come back as tool results, so the last request's
+    # history holds every one the session got.
+    rejected = 0
+    if turns:
+        for m in turns[-1]["body"].get("messages") or []:
+            for b in m.get("content") if isinstance(m.get("content"), list) else []:
+                if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"):
+                    c = b.get("content")
+                    c = c if isinstance(c, str) else " ".join(
+                        x.get("text", "") for x in c or [] if isinstance(x, dict))
+                    rejected += any(k in c for k in TOOL_REJECTED)
+    times = [r for r in rows.values() if r.get("t_end")]
+    failures = broken + rejected + lost
+    return {
+        "claude_version": manifest.get("agent_version"),
+        "turns": len(turns),
+        "skipped": sum(skipped.values()),
+        "tool_calls": calls,
+        "tool_calls_lost": lost,
+        "tool_call_failures": failures,
+        "tool_call_parse_failure_rate": failures / (calls + lost) if calls + lost else 0.0,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "wall_clock_s": (max(r["t_end"] for r in times) - min(r["t_start"] for r in times))
+                        if times else 0.0,
+    }
+
+
+def pass_rate_stat(passes):
+    """Pass rate with an 80% Wilson interval as its p10-p90, clamped to contain it."""
+    n, k = len(passes), sum(passes)
+    p, z = k / n, WILSON_Z
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * (p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5 / (1 + z * z / n)
+    return {"median": round(p, 4), "p10": round(min(p, max(0.0, centre - half)), 4),
+            "p90": round(max(p, min(1.0, centre + half)), 4), "samples": n}
+
+
+def run_session(task, workdir, corpus, endpoint, *, scr, model, served_model, engine_sha,
+                prompt, max_turns, timeout_s, env, log):
+    """One live session: record it through an in-process relay, then grade it.
+
+    Returns the session's record, with `void` set when it cannot be trusted.
+    """
+    server = make_server(("127.0.0.1", 0), endpoint, corpus, engine_sha=engine_sha)
+    relay = f"http://127.0.0.1:{server.server_address[1]}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    info_url = endpoint.rstrip("/") + "/server_info"
+    served_before = requests_served(info_url)
+    cmd = [scr, "launch", "claude", "-m", served_model, "--server-url", relay, "--",
+           "-p", prompt, "--max-turns", str(max_turns), "--permission-mode", "acceptEdits",
+           "--allowedTools", "Read,Write,Edit,Bash"]
+    t0 = time.monotonic()
+    try:
+        p = subprocess.run(cmd, cwd=workdir, env=env, capture_output=True, text=True,
+                           timeout=timeout_s)
+        exit_code, timed_out, output = p.returncode, False, p.stdout + p.stderr
+    except subprocess.TimeoutExpired as e:
+        # text=True does not decode what a timeout leaves behind.
+        exit_code, timed_out = None, True
+        output = b"".join(x or b"" for x in (e.stdout, e.stderr)).decode("utf-8", "replace")
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.corpus.drain(DRAIN_SECONDS)
+        if server.corpus.manifest["engine"] is None:
+            server.corpus.manifest["engine"] = probe_engine(server.upstream)
+        server.corpus.close()
+    seconds = time.monotonic() - t0
+    served_after = requests_served(info_url)
+    (Path(corpus) / "claude.log").write_text(output)
+    passed, grader_said = grade(workdir, task["grader"])
+    stats = session_stats(corpus)
+    relayed = server.corpus.manifest["relayed"]
+    void = None
+    if stats["turns"] == 0:
+        void = "no /v1/messages turn reached the engine: the agent never talked to it"
+    elif served_before is not None and served_after is not None:
+        # Every request the relay forwarded is one the engine should have counted,
+        # less the introspection routes it never counts.
+        index = Path(corpus) / "index.jsonl"
+        expected = relayed - sum(
+            1 for line in (index.read_text().splitlines() if index.exists() else [])
+            if line.strip() and json.loads(line)["path"] in UNCOUNTED_PATHS)
+        if served_after - served_before < expected:
+            void = (f"the engine counted {served_after - served_before} requests but the relay "
+                    f"forwarded {expected}: it did not serve this session (#161 fairness rule 7)")
+    log(f"  pass={passed} ({grader_said}) turns={stats['turns']} "
+        f"tool calls={stats['tool_calls']} failed={stats['tool_call_failures']} "
+        f"{seconds:.0f}s exit={exit_code}{' TIMED OUT' if timed_out else ''}"
+        + (f" VOID: {void}" if void else ""))
+    return {"corpus": Path(corpus).name, "pass": passed, "grader": grader_said,
+            "claude_exit": exit_code, "timed_out": timed_out, "void": void,
+            "requests_served_before": served_before, "requests_served_after": served_after,
+            **stats}
+
+
+def live(task, endpoint, *, engine, model, machine, rung, scratchy_sha, engine_provenance,
+         out_dir, sessions=LIVE_MIN_SESSIONS, scr="scr", served_model=None, grader=None,
+         ollama_version=None, context_length=None, max_turns=30, timeout_s=1800,
+         cooldown_s=LIVE_COOLDOWN_S, run_id=None, env=None,
+         log=lambda msg: print(msg, file=sys.stderr, flush=True)):
+    """Run `sessions` live Claude Code sessions of `task` against one engine.
+
+    Each session gets a fresh copy of the task and the engine's prefix cache
+    cleared, is recorded into `out_dir/session-N/`, and graded. Returns
+    (run, detail): the run in the leaderboard's Lane B shape. Configuration
+    problems raise SystemExit before any session starts.
+    """
+    if engine not in ENGINES:
+        raise SystemExit(f"--engine must be one of {sorted(ENGINES)}, got {engine!r}")
+    if sessions < 1:
+        raise SystemExit("--sessions must be at least 1")
+    if not scratchy_sha:
+        raise SystemExit("--scratchy-sha is required: the commit the scratchy side was built from")
+    for key in PER_ENGINE_PROVENANCE:
+        if sorted(engine_provenance.get(key) or {}) != sorted(ENGINES):
+            raise SystemExit(f"{key} must name every engine in {sorted(ENGINES)}")
+    task_dir, prompt = load_task(task)
+    if grader is None and not (task_dir / TASK_GRADER).is_file():
+        raise SystemExit(f"{task_dir}: no {TASK_GRADER}, and no --grader given")
+    scr_path = shutil.which(scr) or (scr if Path(scr).is_file() else None)
+    if not scr_path:
+        raise SystemExit(f"no scr binary at {scr!r}; build it with the `claude` feature")
+    if not shutil.which("claude"):
+        raise SystemExit("`claude` (Claude Code) is not on PATH")
+    up = _parse_url(endpoint, "--endpoint")
+    # `scr launch claude --server-url` starts Claude Code even when nothing
+    # answers there, so find out here, before any session.
+    served_model = served_model or model
+    ollama_version, context_length = check_endpoint(
+        up, endpoint, engine, ollama_version=ollama_version, context_length=context_length,
+        model_name=served_model)
+    reset_name, reset, _ = make_reset(engine, endpoint, model=served_model, timeout_s=timeout_s)
+    out_dir = Path(out_dir)
+    if out_dir.exists() and any(out_dir.iterdir()):
+        raise SystemExit(f"{out_dir} is not empty; every run needs its own --out-dir")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Claude Code compacts at its own idea of the window unless told the
+    # server's; and holds back 32000 tokens for its reply unless capped.
+    session_env = dict(os.environ if env is None else env)
+    session_env.setdefault("CLAUDE_CODE_MAX_CONTEXT_TOKENS", str(context_length))
+    session_env.setdefault("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "8192")
+
+    results, resets = [], []
+    for i in range(1, sessions + 1):
+        log(f"[session {i}/{sessions}]")
+        if reset:
+            try:
+                resets.append({"session": i, "seconds": round(reset(), 3)})
+            except ResetFailed as e:
+                raise SystemExit(f"session {i}: cache reset ({reset_name}) failed: {e}") from None
+        workdir = fresh_copy(task_dir, out_dir / f"session-{i}" / "workdir")
+        results.append(run_session(
+            {"grader": grader}, workdir, out_dir / f"session-{i}" / "corpus", endpoint,
+            scr=scr_path, model=model, served_model=served_model, engine_sha=scratchy_sha,
+            prompt=prompt, max_turns=max_turns, timeout_s=timeout_s, env=session_env, log=log))
+        if i < sessions and cooldown_s:
+            time.sleep(cooldown_s)
+
+    versions = {r["claude_version"] for r in results if r["claude_version"]}
+    disclosed = [d for d, applies in (
+        (DISCLOSE_KV, len(set(engine_provenance["kv_cache_dtype"].values())) > 1),
+        (DISCLOSE_QUANT, len(set(engine_provenance["quantization"].values())) > 1),
+        (DISCLOSE_NO_COUNTER, not ENGINES[engine]["counts_requests"]),
+    ) if applies]
+    prov = {
+        "machine": machine, "rung": rung, "scratchy_sha": scratchy_sha,
+        "claude_version": sorted(versions)[0] if len(versions) == 1 else None,
+        "ollama_version": ollama_version, "context_length_tokens": context_length,
+        **engine_provenance,
+        # Live runs cannot pin sampling: Claude Code sends its own.
+        "sampling": {"temperature": "as sent by Claude Code"},
+        "trace_corpus": {
+            "id": task_dir.name,
+            "claude_version": sorted(versions)[0] if len(versions) == 1 else None,
+            "turns": sum(r["turns"] for r in results),
+            "live": {"sessions": sessions, "max_turns": max_turns, "cooldown_s": cooldown_s,
+                     "cache_reset": reset_name, "cache_reset_seconds": resets,
+                     "served_model": served_model,
+                     "grader": str(grader) if grader else f"{task_dir.name}/{TASK_GRADER}",
+                     "task_commit": subprocess.run(
+                         ["git", "-C", str(task_dir), "rev-parse", "HEAD"],
+                         capture_output=True, text=True).stdout.strip()},
+        },
+        "artifacts": [f"session-{i}" for i in range(1, sessions + 1)],
+        "disclosed": disclosed,
+    }
+    run = {"schema": SCHEMA, "run_id": run_id or f"laneB-{engine}-{model}-{machine}-{rung}",
+           "lane": "B", "status": "published", "provenance": prov,
+           "measurements": [], "gaps": [], "ablations": []}
+    void = next((f"session {i}: {r['void']}" for i, r in enumerate(results, 1) if r["void"]), None)
+    if len(versions) > 1:
+        void = void or (f"sessions ran under different Claude Code versions {sorted(versions)}: "
+                        "a release changes the prompt and the tools, so they are not one run")
+    if void:
+        run["status"], run["void"] = "void", void
+    else:
+        base = {"lane": "B", "engine": engine, "model": model, "n": sessions}
+        run["measurements"].append(
+            {**base, "metric": "task_pass", "stat": pass_rate_stat([r["pass"] for r in results])})
+        for metric, field in (("tool_call_parse_failure_rate", "tool_call_parse_failure_rate"),
+                              ("turns_to_completion", "turns"), ("wall_clock_s", "wall_clock_s"),
+                              ("tokens_in", "tokens_in"), ("tokens_out", "tokens_out")):
+            run["measurements"].append(
+                {**base, "metric": metric, "stat": _stat([r[field] for r in results])})
+        gap = {"lane": "B", "engine": engine, "model": model, "state": "not-run",
+               "reason": "energy needs powermetrics, which live does not sample yet",
+               "issue": 164}
+        run["gaps"] = [{**gap, "metric": m}
+                       for m in ("joules_per_task", "joules_per_1k_output_tokens")]
+    detail = {"sessions": results}
+    return run, detail
+
+
+def cmd_live(args):
+    out = Path(args.out)
+    run, detail = live(
+        args.task, args.endpoint, engine=args.engine, model=args.model, machine=args.machine,
+        rung=args.rung, scratchy_sha=args.scratchy_sha,
+        engine_provenance={k: parse_per_engine("--" + k.replace("_", "-"), getattr(args, k))
+                           for k in PER_ENGINE_PROVENANCE},
+        out_dir=args.out_dir or out.with_name(out.stem + ".sessions"), sessions=args.sessions,
+        scr=args.scr, served_model=args.served_model, grader=args.grader,
+        ollama_version=args.ollama_version, context_length=args.context_length,
+        max_turns=args.max_turns, timeout_s=args.timeout_s, cooldown_s=args.cooldown_s,
+        run_id=args.run_id or out.stem)
+    detail_path = out.with_name(out.stem + ".sessions.json")
+    run["provenance"]["artifacts"] = [detail_path.name] + run["provenance"]["artifacts"]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    detail_path.write_text(json.dumps(detail, indent=2) + "\n")
+    out.write_text(json.dumps(run, indent=2) + "\n")
+    s = detail["sessions"]
+    print(f"{len(s)} sessions: {sum(r['pass'] for r in s)} passed, "
+          f"{sum(r['tool_call_failures'] for r in s)} failed tool calls of "
+          f"{sum(r['tool_calls'] for r in s)}; wrote {out} and {detail_path}", file=sys.stderr)
+    if run["status"] == "void":
+        raise SystemExit(f"VOID: {run['void']}")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1378,6 +1761,47 @@ def main(argv=None):
     a.add_argument("--timeout-s", type=float, default=600,
                    help="per-turn ceiling; a timeout voids the run (default 600)")
     a.set_defaults(func=cmd_replay)
+
+    v = sub.add_parser("live", help="run Claude Code on a graded task, several times, and score it")
+    v.add_argument("--task", required=True,
+                   help=f"task directory: a git repo with {TASK_PROMPT} (the prompt) and, unless "
+                        f"--grader is given, {TASK_GRADER}")
+    v.add_argument("--endpoint", required=True, help="engine base URL, e.g. http://127.0.0.1:8000")
+    v.add_argument("--engine", required=True, choices=sorted(ENGINES),
+                   help="which engine the endpoint is; checked against what it answers as")
+    v.add_argument("--model", required=True, help="leaderboard model id, e.g. qwen3.6-35b-a3b")
+    v.add_argument("--served-model",
+                   help="model name Claude Code asks for, e.g. mlx-community/Qwen3.6-35B-A3B-4bit "
+                        "or qwen3.6:35b (default: --model)")
+    v.add_argument("--machine", required=True, help="leaderboard machine id, e.g. m5max-64")
+    v.add_argument("--rung", required=True, help="leaderboard rung id, e.g. R1")
+    v.add_argument("--sessions", type=int, default=LIVE_MIN_SESSIONS,
+                   help=f"live sessions to run (default {LIVE_MIN_SESSIONS}, the leaderboard's "
+                        "minimum)")
+    v.add_argument("--out", required=True, help="Lane B run JSON to write")
+    v.add_argument("--out-dir",
+                   help="where each session's working copy and recording go "
+                        "(default: <out>.sessions/)")
+    v.add_argument("--run-id", help="run_id (default: the --out file's stem)")
+    v.add_argument("--grader",
+                   help=f"grader to run instead of the task's own {TASK_GRADER}, for one the "
+                        "agent must not see; called with the session's working copy")
+    v.add_argument("--scr", default="scr", help="the scr binary that runs `launch claude`")
+    v.add_argument("--max-turns", type=int, default=30, help="Claude Code's turn limit (default 30)")
+    v.add_argument("--timeout-s", type=float, default=1800,
+                   help="per-session ceiling; a timed-out session is graded as it stands "
+                        "(default 1800)")
+    v.add_argument("--cooldown-s", type=float, default=LIVE_COOLDOWN_S,
+                   help=f"pause between sessions (default {LIVE_COOLDOWN_S})")
+    v.add_argument("--scratchy-sha", required=True, help="commit the scratchy side was built from")
+    v.add_argument("--ollama-version",
+                   help="the ollama side's version (default: asked of an ollama endpoint)")
+    v.add_argument("--context-length", type=int,
+                   help="context window in tokens, when GET /v1/models reports no max_model_len")
+    for flag in ("--kv-cache-dtype", "--quantization", "--checkpoint-revision"):
+        v.add_argument(flag, required=True, metavar="scratchy=X,ollama=Y",
+                       help="per-engine provenance the tool cannot discover")
+    v.set_defaults(func=cmd_live)
     args = p.parse_args(argv)
     args.func(args)
 
