@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use llguidance::api::TopLevelGrammar;
 use llguidance::{Matcher, ParserFactory};
-use scratchy_core_common::sampling::GuidedGrammar;
+use scratchy_core_common::sampling::{GuidedGrammar, ThinkFirst};
 use toktrie::TokenId;
 use toktrie_hf_tokenizers::ByteTokenizer;
 
@@ -33,6 +33,9 @@ pub struct GrammarGuide {
     /// Set to `true` once EOS has been consumed while the matcher is stopped.
     /// Mirrors Python's `GuidanceGrammar.terminated`.
     terminated: bool,
+    /// Where the reply is before its grammar applies ([`ThinkFirst`]): `None` once the grammar
+    /// does, or from the start.
+    think: Option<ThinkFirst>,
 }
 
 /// A generic JSON schema that matches any valid JSON object.
@@ -251,6 +254,7 @@ impl GrammarGuide {
             Ok(Self {
                 matcher: Matcher::new(Ok(parser)),
                 terminated: false,
+                think: None,
             })
         } else {
             Self::from_ebnf(&lark, factory)
@@ -267,6 +271,7 @@ impl GrammarGuide {
         Ok(Self {
             matcher: Matcher::new(Ok(parser)),
             terminated: false,
+            think: None,
         })
     }
 
@@ -277,6 +282,7 @@ impl GrammarGuide {
         Ok(Self {
             matcher: Matcher::new(Ok(parser)),
             terminated: false,
+            think: None,
         })
     }
 
@@ -294,7 +300,20 @@ impl GrammarGuide {
         Ok(Self {
             matcher: Matcher::new(Ok(parser)),
             terminated: false,
+            think: None,
         })
+    }
+
+    /// A request's grammar, as both workers build it: `grammar`, applied once a reasoning model
+    /// has thought, where `think_first` says it would (`SamplingParams::think_first`).
+    pub fn for_request(
+        grammar: &GuidedGrammar,
+        think_first: Option<ThinkFirst>,
+        factory: &Arc<ParserFactory>,
+    ) -> Result<Self, String> {
+        let mut guide = Self::from_guided_grammar(grammar, factory)?;
+        guide.think = think_first;
+        Ok(guide)
     }
 
     /// Create a `GrammarGuide` from a `GuidedGrammar` specification.
@@ -319,14 +338,23 @@ impl GrammarGuide {
     ///
     /// Matches Python's `_fill_bitmasks` + `fill_next_token_bitmask` flow:
     /// `compute_mask_or_eos()` returns EOS-only when stopped, normal mask otherwise.
+    ///
+    /// While a reasoning model thinks, `None`: no mask until its thinking closes. At a reply's
+    /// first token, when it may open thinking, the grammar's tokens and the one that opens it.
     pub fn allowed_tokens(&mut self) -> Option<Vec<TokenId>> {
         if self.terminated {
             return None;
         }
+        let open = match self.think {
+            Some(ThinkFirst::Thinking { .. }) => return None,
+            Some(ThinkFirst::MayOpen(tokens)) => Some(tokens.open),
+            None => None,
+        };
         match self.matcher.compute_mask_or_eos() {
             Ok(mask) => {
                 let mut tokens = Vec::new();
                 mask.iter_set_entries(|idx| tokens.push(idx as TokenId));
+                tokens.extend(open.filter(|open| !tokens.contains(open)));
                 Some(tokens)
             }
             Err(_) => None,
@@ -341,7 +369,27 @@ impl GrammarGuide {
     /// - Otherwise, consumes the token normally.
     ///
     /// Returns `true` if the transition was valid, `false` on error.
+    ///
+    /// While a reasoning model thinks, its tokens aren't the grammar's: the one that closes its
+    /// thinking starts the grammar from the next token. At a reply's first token, the one that
+    /// opens thinking starts it; any other is the grammar's first.
     pub fn advance(&mut self, token_id: TokenId) -> bool {
+        match self.think {
+            Some(ThinkFirst::Thinking { close }) => {
+                if token_id == close {
+                    self.think = None;
+                }
+                return true;
+            }
+            Some(ThinkFirst::MayOpen(tokens)) if token_id == tokens.open => {
+                self.think = Some(ThinkFirst::Thinking {
+                    close: tokens.close,
+                });
+                return true;
+            }
+            Some(ThinkFirst::MayOpen(_)) => self.think = None,
+            None => {}
+        }
         if self.matcher.is_stopped() {
             // Grammar already stopped — this token is EOS (or garbage after
             // stopped). Mark terminated so `allowed_tokens()` returns None.
@@ -453,7 +501,9 @@ mod tests {
             "added_tokens": [
                 {"id": 0, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
                 {"id": 31, "content": "</s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
-                {"id": 32, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+                {"id": 32, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 33, "content": "<think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 34, "content": "</think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
             ],
             "normalizer": null,
             "pre_tokenizer": {
@@ -639,6 +689,85 @@ mod tests {
         }
 
         assert_eq!(finished(&[]).allowed_tokens().unwrap(), [31], "</s>");
+    }
+
+    /// ⭐ A reasoning model thinks before its grammar applies (#793). Left thinking by its prompt,
+    /// it is unmasked until `</think>`, and the grammar applies from the next token. Where it may
+    /// open thinking, its first token may be `<think>` or the grammar's; `<think>` holds the
+    /// grammar until `</think>`, a grammar token starts it. Without a gate, the grammar applies from
+    /// the first token, as before.
+    #[test]
+    fn a_reasoning_model_thinks_before_its_grammar_applies() {
+        use scratchy_core_common::sampling::ThinkTokens;
+        let factory = make_test_factory_ending_on(&[32]);
+        let tokens = ThinkTokens {
+            open: 33,
+            close: 34,
+        };
+        let digit = GuidedGrammar::Regex {
+            pattern: "[0-9]".to_string(),
+        };
+        let (a, one) = (11, 8);
+        let allowed = |guide: &mut GrammarGuide| {
+            guide.allowed_tokens().map(|mut ids| {
+                ids.sort();
+                ids
+            })
+        };
+        // The grammar's own tokens, ungated, and with others besides.
+        let grammar = allowed(&mut GrammarGuide::for_request(&digit, None, &factory).unwrap());
+        let grammar = grammar.expect("a mask");
+        assert!(!grammar.contains(&33) && grammar.contains(&one));
+        let digits_and = |extra: &[u32]| {
+            let mut ids = grammar.clone();
+            ids.extend(extra);
+            ids.sort();
+            ids
+        };
+
+        // Left thinking by the prompt.
+        let thinking = Some(ThinkFirst::Thinking { close: 34 });
+        let mut guide = GrammarGuide::for_request(&digit, thinking, &factory).unwrap();
+        for token in [a, one, a] {
+            assert_eq!(allowed(&mut guide), None, "thinking: unmasked");
+            assert!(guide.advance(token));
+        }
+        assert!(guide.advance(34), "</think>");
+        assert_eq!(
+            allowed(&mut guide),
+            Some(digits_and(&[])),
+            "then the grammar"
+        );
+        assert!(guide.advance(one));
+        assert!(guide.is_finished());
+
+        // May open thinking with its first token.
+        let may_open = Some(ThinkFirst::MayOpen(tokens));
+        let mut guide = GrammarGuide::for_request(&digit, may_open, &factory).unwrap();
+        assert_eq!(
+            allowed(&mut guide),
+            Some(digits_and(&[33])),
+            "the grammar's, or <think>"
+        );
+        assert!(guide.advance(33));
+        assert_eq!(allowed(&mut guide), None, "thinking");
+        assert!(guide.advance(a) && guide.advance(34));
+        assert_eq!(
+            allowed(&mut guide),
+            Some(digits_and(&[])),
+            "<think> no longer"
+        );
+        assert!(guide.advance(one));
+        assert!(guide.is_finished());
+
+        // Or answer at once: the first token is the grammar's.
+        let mut guide = GrammarGuide::for_request(&digit, may_open, &factory).unwrap();
+        assert!(guide.advance(one));
+        assert!(guide.is_finished());
+
+        // No gate: the grammar from the first token.
+        let mut guide = GrammarGuide::for_request(&digit, None, &factory).unwrap();
+        assert_eq!(allowed(&mut guide), Some(digits_and(&[])));
     }
 
     #[test]

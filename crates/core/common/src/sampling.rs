@@ -37,6 +37,44 @@ pub enum GuidedGrammar {
     StructuralTag { spec: String },
 }
 
+/// The tokens a reasoning model's thinking opens and closes on, when it thinks in single tokens
+/// (`<think>` and `</think>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkTokens {
+    pub open: u32,
+    pub close: u32,
+}
+
+/// ⭐ A REASONING MODEL THINKS BEFORE ITS GRAMMAR APPLIES (#793), as vLLM holds a request's
+/// grammar back until its reasoning parser sees reasoning end. Where a reply starts, which the
+/// prompt decides ([`Self::of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThinkFirst {
+    /// The prompt left the model thinking (a template that opens `<think>`): no grammar until
+    /// `close`, then the grammar from the next token.
+    Thinking { close: u32 },
+    /// The prompt has no thinking: the reply's first token may open it (`open`), and the grammar
+    /// waits for its close; any other first token is the grammar's.
+    MayOpen(ThinkTokens),
+}
+
+impl ThinkFirst {
+    /// Where a reply after `prompt` starts. The prompt's last `open` with no `close` after it
+    /// leaves the model thinking. A `close` after the last `open` means the template closed
+    /// thinking (thinking off): the grammar applies from the first token, so `None`. A prompt with
+    /// neither lets the reply open thinking.
+    pub fn of(tokens: ThinkTokens, prompt: &[u32]) -> Option<Self> {
+        let last = |id: u32| prompt.iter().rposition(|&t| t == id);
+        match (last(tokens.open), last(tokens.close)) {
+            (None, None) => Some(Self::MayOpen(tokens)),
+            (Some(open), close) if close.is_none_or(|close| close < open) => Some(Self::Thinking {
+                close: tokens.close,
+            }),
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SamplingType
 // ---------------------------------------------------------------------------
@@ -156,6 +194,11 @@ pub struct SamplingParams {
     /// the grammar are sampled.
     pub guided_grammar: Option<GuidedGrammar>,
 
+    /// Where the reply starts thinking, for a reasoning model whose `guided_grammar` waits until
+    /// thinking ends ([`ThinkFirst`]). `None`: the grammar applies from the first token.
+    #[serde(default)]
+    pub think_first: Option<ThinkFirst>,
+
     /// When set, only these token IDs may be sampled. All other logits
     /// are masked to `-inf`. Similar to grammar masking but static.
     pub allowed_token_ids: Option<Vec<u32>>,
@@ -203,6 +246,7 @@ impl Default for SamplingParams {
             output_kind: RequestOutputKind::default(),
             logit_bias: None,
             guided_grammar: None,
+            think_first: None,
             allowed_token_ids: None,
             bad_words_token_ids: None,
             seal: false,
@@ -440,6 +484,39 @@ pub struct LogprobsOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reply starts thinking where its prompt left thinking open, may open it where the prompt
+    /// has none, and is the grammar's from the first token where the prompt closed thinking
+    /// (thinking off).
+    #[test]
+    fn a_reply_starts_thinking_where_its_prompt_leaves_it() {
+        let tokens = ThinkTokens { open: 7, close: 8 };
+        let thinking = Some(ThinkFirst::Thinking { close: 8 });
+        assert_eq!(
+            ThinkFirst::of(tokens, &[1, 2, 7]),
+            thinking,
+            "opened by the template"
+        );
+        assert_eq!(
+            ThinkFirst::of(tokens, &[1, 7, 3, 8, 4, 7, 5]),
+            thinking,
+            "opened again"
+        );
+        assert_eq!(
+            ThinkFirst::of(tokens, &[1, 7, 8, 2]),
+            None,
+            "closed: thinking off"
+        );
+        assert_eq!(ThinkFirst::of(tokens, &[1, 8]), None, "closed alone");
+        assert_eq!(
+            ThinkFirst::of(tokens, &[1, 2, 3]),
+            Some(ThinkFirst::MayOpen(tokens))
+        );
+        assert_eq!(
+            ThinkFirst::of(tokens, &[]),
+            Some(ThinkFirst::MayOpen(tokens))
+        );
+    }
 
     #[test]
     fn test_default_sampling_params() {
