@@ -2,14 +2,16 @@
 //! qwen3.5-0.8b's emitted CUDA tapes, checked with no toolchain.
 //!
 //! `#[forward]` hands every model to CUDA's compiler through the target-emitter seam, and the
-//! model's module holds what came back: `CUDA_TAPES`, one `static` tape per prefill bucket, and
-//! `CUDA_UNLOWERED`, the buckets left out. Two checks:
+//! model's module holds what came back: `CUDA_TAPES`, one `static` tape per bucket (the one-row
+//! decode bucket and the four prefill buckets), and `CUDA_UNLOWERED`, the buckets left out. The
+//! checks:
 //!
 //! - every emitted tape is, field by field, what CUDA's compiler lowers the same canonicals to
 //!   (`lower_model`: `lower_canonical` per bucket, then the weight table's tie rewrite), and the
 //!   emitted `CUDA_WEIGHTS` is its weight table;
 //! - the tapes carry the numbers measured for this model: the step histogram, the colours, the
-//!   arena, input and result spans per bucket, the weights, and the KV and GDN layers;
+//!   arena, input and result spans per bucket, the weights, and the KV and GDN layers; the
+//!   one-row tape the layout #830 predicted, its GEMMs GEMVs and its attention the decode kernel;
 //! - the weight table names the checkpoint's tensors: 266 entries, 18 of them GDN bundles, 320
 //!   distinct tensors, none named twice, and the tied lm_head reads the embedding table.
 
@@ -21,7 +23,7 @@ use std::path::PathBuf;
 
 use scratchy_models::qwen3_5::qwen3_5_0_8b::{CUDA_TAPES, CUDA_UNLOWERED, CUDA_WEIGHTS};
 use scratchy_subtile::handoff::TargetModelInput;
-use scratchy_target_cuda::step::{CudaStep, EmbedBf16, GemmBf16};
+use scratchy_target_cuda::step::{AttnPrefillBf16, CudaStep, EmbedBf16, GemmBf16};
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, CudaTape, TapeInput, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
 use scratchy_target_cuda_compiler::emit::{lower_model, model_facts};
@@ -60,7 +62,10 @@ fn capture() -> TargetModelInput {
     inputs.remove(0)
 }
 
+/// The prefill buckets.
 const BUCKETS: [u32; 4] = [512, 1024, 2048, 4096];
+/// Every lowered bucket, ascending: decode's one row, then the prefill buckets.
+const TAPE_BUCKETS: [u32; 5] = [1, 512, 1024, 2048, 4096];
 
 const fn span(offset: u64, bytes: u64) -> ArenaSpan {
     ArenaSpan {
@@ -105,6 +110,13 @@ const TOTALS: [u64; 4] = [323_130_368, 646_259_712, 1_292_518_400, 2_585_035_776
 const VOCAB: u32 = 248_320;
 const HIDDEN: u32 = 1024;
 
+/// The lowered tape of bucket `m`, looked up by its `bucket_m`, never by position.
+fn tape_of(m: u32) -> &'static CudaTape {
+    (CUDA_TAPES.iter())
+        .find(|t| t.bucket_m == m)
+        .unwrap_or_else(|| panic!("no m={m} tape"))
+}
+
 /// One tape's steps, by kind.
 fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
     let mut h = BTreeMap::new();
@@ -113,6 +125,7 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
             CudaStep::Embed(_) => "Embed",
             CudaStep::Gemm(_) => "Gemm",
             CudaStep::GemmNarrow(_) => "GemmNarrow",
+            CudaStep::Gemv(_) => "Gemv",
             CudaStep::RmsNorm(_) => "RmsNorm",
             CudaStep::Add(_) => "Add",
             CudaStep::SiluMul(_) => "SiluMul",
@@ -121,6 +134,7 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
             CudaStep::GateApply(_) => "GateApply",
             CudaStep::RopeAppend(_) => "RopeAppend",
             CudaStep::AttnPrefill(_) => "AttnPrefill",
+            CudaStep::AttnDecode(_) => "AttnDecode",
             CudaStep::GatedDeltaNet(_) => "GatedDeltaNet",
         };
         *h.entry(kind).or_default() += 1;
@@ -160,31 +174,139 @@ fn every_emitted_tape_is_what_cuda_lowers_from_the_same_canonical() {
 }
 
 #[test]
-fn the_tapes_are_the_four_prefill_buckets_and_validate() {
+fn the_tapes_are_the_decode_and_prefill_buckets_and_validate() {
     let ms: Vec<u32> = CUDA_TAPES.iter().map(|t| t.bucket_m).collect();
-    assert_eq!(ms, BUCKETS, "CUDA_TAPES' buckets");
+    assert_eq!(ms, TAPE_BUCKETS, "CUDA_TAPES' buckets");
     for tape in CUDA_TAPES {
         tape.validate()
             .unwrap_or_else(|e| panic!("m={}: {e}", tape.bucket_m));
     }
 }
 
+/// The buckets above one row and below the GEMM's tile are left out, each by its first GEMM's
+/// `m`; the one-row bucket is not among them, it lowers (the GEMV).
 #[test]
 fn the_buckets_below_the_gemm_tile_are_left_out_and_named() {
     let ms: Vec<u32> = CUDA_UNLOWERED.iter().map(|&(m, _)| m).collect();
-    assert_eq!(ms, [1, 2, 4, 8, 64], "CUDA_UNLOWERED's buckets");
+    assert_eq!(ms, [2, 4, 8, 64], "CUDA_UNLOWERED's buckets");
     for &(m, why) in CUDA_UNLOWERED {
-        let want = if m == 1 {
-            "m = 1 is a decode GEMV, and CUDA has no decode GEMV kernel yet".to_string()
-        } else {
-            format!("m = {m} must be a non-zero multiple of 128, the bf16 GEMM's tile")
-        };
+        let want = format!("m = {m} must be a non-zero multiple of 128, the bf16 GEMM's tile");
         assert!(why.contains(&want), "m={m}: {why}");
     }
 }
 
+/// The one-row decode tape: the layout #830 predicted from the shared colouring and arena passes.
+/// Every GEMM whose `n` the narrow GEMM does not take is a GEMV, the attentions are the decode
+/// kernel's, and the steps, colours and regions sit where the prefill buckets' rules put them.
 #[test]
-fn every_tape_has_the_measured_layout() {
+fn the_decode_tape_has_the_predicted_layout() {
+    let tape = tape_of(1);
+    let want_steps: BTreeMap<&str, usize> = [
+        ("Add", 48),
+        ("AttnDecode", 6),
+        ("Embed", 1),
+        ("GateApply", 6),
+        ("GateSplit", 6),
+        ("GatedDeltaNet", 18),
+        ("GemmNarrow", 36),
+        ("Gemv", 151),
+        ("RmsNorm", 61),
+        ("Rope", 6),
+        ("RopeAppend", 6),
+        ("SiluMul", 24),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(tape.steps.len(), 369, "steps");
+    assert_eq!(histogram(tape), want_steps, "step histogram");
+    assert_eq!(
+        tape.arena.colour_bytes,
+        [
+            2048, 2048, 12288, 4096, 32, 32, 4096, 2048, 7168, 7168, 7168, 7168, 2048, 8192, 1024,
+            1024, 1024, 4096, 4096, 496640, 4096, 4096, 4096, 4096, 4096, 4096
+        ],
+        "colour bytes"
+    );
+    assert_eq!(tape.arena.total_bytes, 633_600, "arena total_bytes");
+    assert_eq!(
+        tape.result,
+        span(77_312, 496_640),
+        "the logits, [1, 248320] bf16"
+    );
+    let ids = span(633_344, 4);
+    assert_eq!(
+        tape.input,
+        TapeInput::TokenIds {
+            span: ids,
+            vocab: VOCAB
+        },
+        "input"
+    );
+    assert_eq!(
+        tape.steps[0],
+        CudaStep::Embed(EmbedBf16 {
+            tokens: ids.offset,
+            table: WeightIx(0),
+            out: ArenaOffset(0),
+            rows: 1,
+            hidden: HIDDEN,
+            vocab: VOCAB,
+        }),
+        "the embed"
+    );
+    let rotary = tape.rotary.expect("a rotary table");
+    assert_eq!(
+        (rotary.span, rotary.rot_dim),
+        (span(598_528, 128), 64),
+        "rotary"
+    );
+    let kv = tape.kv.expect("a KV cache");
+    assert_eq!(
+        (kv.block_table, kv.slot_mapping, kv.sequence),
+        (span(598_784, 512), span(599_296, 4), span(599_552, 8)),
+        "KV regions"
+    );
+    let gdn = tape.gdn.expect("GDN layers");
+    assert_eq!(
+        (gdn.sequence, gdn.scratch),
+        (span(599_808, 16), span(600_064, 33_280)),
+        "GDN regions"
+    );
+    for (i, step) in tape.steps.iter().enumerate() {
+        match *step {
+            CudaStep::Gemv(GemmBf16 { m, .. }) | CudaStep::GemmNarrow(GemmBf16 { m, .. }) => {
+                assert_eq!(m, 1, "step {i}");
+            }
+            CudaStep::AttnDecode(AttnPrefillBf16 {
+                rows,
+                q_heads,
+                kv_heads,
+                head_dim,
+                block_table,
+                sequence,
+                ..
+            }) => {
+                assert_eq!(
+                    (rows, q_heads, kv_heads, head_dim),
+                    (1, 8, 2, 256),
+                    "step {i}"
+                );
+                assert_eq!(
+                    (block_table, sequence),
+                    (kv.block_table.offset, kv.sequence.offset)
+                );
+            }
+            CudaStep::Gemm(_) | CudaStep::AttnPrefill(_) => {
+                panic!("step {i}: a prefill kernel in the one-row tape: {step:?}")
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The four prefill tapes, each looked up by its bucket.
+#[test]
+fn every_prefill_tape_has_the_measured_layout() {
     let want_steps: BTreeMap<&str, usize> = [
         ("Add", 48),
         ("Embed", 1),
@@ -203,8 +325,8 @@ fn every_tape_has_the_measured_layout() {
     .collect();
     let kv_layers = [3, 7, 11, 15, 19, 23];
     let gdn_layers: Vec<u32> = (0..24).filter(|l| !kv_layers.contains(l)).collect();
-    for (tape, &(m, total, input, result)) in CUDA_TAPES.iter().zip(&ARENAS) {
-        assert_eq!(tape.bucket_m, m);
+    for &(m, total, input, result) in &ARENAS {
+        let tape = tape_of(m);
         assert_eq!(tape.steps.len(), 369, "m={m}: steps");
         assert_eq!(histogram(tape), want_steps, "m={m}: step histogram");
         assert_eq!(tape.arena.colour_bytes.len(), 26, "m={m}: colours");
@@ -388,11 +510,19 @@ fn the_weight_table_names_the_checkpoints_tensors() {
         "the bundle's regions"
     );
     // The tied lm_head: the last step reads the embedding table's index, and its own is empty.
+    // The decode tape's is the GEMV, every prefill tape's the tiled GEMM.
     for tape in CUDA_TAPES {
         let m = tape.bucket_m;
-        let Some(&CudaStep::Gemm(GemmBf16 { b, n, k, .. })) = tape.steps.last() else {
+        let (Some(&CudaStep::Gemm(GemmBf16 { b, n, k, .. }))
+        | Some(&CudaStep::Gemv(GemmBf16 { b, n, k, .. }))) = tape.steps.last()
+        else {
             panic!("m={m}: the tape ends with the lm_head GEMM");
         };
+        assert_eq!(
+            matches!(tape.steps.last(), Some(CudaStep::Gemv(_))),
+            m == 1,
+            "m={m}: the lm_head's kernel"
+        );
         assert_eq!(
             (b, n, k),
             (WeightIx(e as u32), VOCAB, HIDDEN),

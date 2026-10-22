@@ -21,7 +21,7 @@ use scratchy_subtile::subtile_tape::{ComputeInput, ComputeInputs, Instr};
 use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, colour_tape};
 use scratchy_subtile::tape_folding::FusedShape;
 use scratchy_target_cuda::op_abi::{CUDA_COLOUR_FACTS, CudaFusion, cuda_colour_rule};
-use scratchy_target_cuda::step::{CudaStep, EmbedBf16};
+use scratchy_target_cuda::step::{CudaStep, EmbedBf16, GemmBf16};
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, TapeInput, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
 use scratchy_target_cuda_compiler::canonical::{
@@ -139,9 +139,10 @@ fn no_output_shares_a_colour_with_its_input() {
 
 /// `one_layer_input`'s first op, a norm, has a lowering now. As the front end binds it (every
 /// source a weight) the norm reaches the arena, which has no embedded hidden. With `x` rebound
-/// to the embedded hidden, the norm lowers and the layer is refused at its first GEMM, a decode
-/// one. `rope_rotate_only_input`'s rope has a lowering too, and is refused at its `x`, a weight;
-/// an op with no lowering at all (`Gelu`) is refused as `NotLowered`.
+/// to the embedded hidden, the norm and the three one-row GEMMs (GEMVs) lower, and the layer is
+/// refused at its rope, whose cos the front end binds as a weight. `rope_rotate_only_input`'s
+/// rope has a lowering too, and is refused at its `x`, a weight; an op with no lowering at all
+/// (`Gelu`) is refused as `NotLowered`.
 #[test]
 fn lower_canonical_refuses_the_first_computed_op() {
     let l = front_end_lowered(one_layer_input());
@@ -162,14 +163,14 @@ fn lower_canonical_refuses_the_first_computed_op() {
         Ok(_) => panic!("lower_canonical lowered a layer with no embedded hidden"),
     }
     match lower_canonical(&with_hidden(one_layer_input()), FACTS, AT) {
-        Err(CanonicalRefusal::GemmShape {
-            step: 1,
-            m: 1,
-            rule: GemmShapeRule::Decode,
+        Err(CanonicalRefusal::RotaryOperand {
+            step: 4,
+            op: "RopeRotate",
+            operand: 1,
             ..
         }) => {}
-        Err(e) => panic!("expected the decode GEMM's refusal at step 1, got: {e}"),
-        Ok(_) => panic!("lower_canonical lowered a decode GEMM CUDA has no kernel for"),
+        Err(e) => panic!("expected the rope's cos refused at step 4 (a weight), got: {e}"),
+        Ok(_) => panic!("lower_canonical lowered a rope whose cos is a weight"),
     }
     match lower_canonical(&front_end_lowered(rope_rotate_only_input()), FACTS, AT) {
         Err(CanonicalRefusal::Operand {
@@ -413,20 +414,106 @@ fn the_silu_folds_into_the_mul_it_gates() {
     assert_eq!(c.steps.len(), 6, "seven ops, one absorbed: {:?}", c.steps);
 }
 
-/// A decode GEMM (`m = 1`) lowers to the bf16 GEMM's shape rule, which refuses it: no decode GEMV
-/// kernel exists yet.
+/// A one-row GEMM over the embedded hidden: `x [1, k] · W` (`W` the IR's `[k, n]`).
+fn gemm_m1(n: u32, k: u32) -> LoweredDecode {
+    with_hidden(LoweringInput {
+        exported: None,
+        sources: vec![
+            SourceShape { rows: 1, cols: k },
+            SourceShape { rows: k, cols: n },
+        ],
+        ops: vec![OpDesc {
+            op: SubOp::MatmulTile {
+                n,
+                weight: GemmWeight::Dense,
+            },
+            m: 1,
+            inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+        }],
+        result: 0,
+    })
+}
+
+/// A decode GEMM (`m = 1`) of an `n` the narrow GEMM does not take lowers to the GEMV, with the
+/// tiled GEMM's operands at `m = 1`: `x` colour 0, the weight source 1, the output colour 1.
 #[test]
-fn lower_canonical_refuses_a_decode_gemm_by_its_shape() {
-    match lower_canonical(&front_end_lowered(gemm_m1_only_input()), FACTS, AT) {
-        Err(CanonicalRefusal::GemmShape {
-            step: 0,
+fn a_decode_gemm_lowers_to_the_gemv() {
+    let c = lower_canonical(&gemm_m1(1024, 1024), FACTS, AT).expect("the one-row GEMM lowers");
+    assert_eq!(
+        c.steps,
+        [CudaStep::Gemv(GemmBf16 {
+            a: ArenaOffset(0),
+            b: WeightIx(1),
+            c: ArenaOffset(c.colour_offsets[1]),
+            m: 1,
+            n: 1024,
+            k: 1024,
+        })]
+    );
+    assert_eq!(
+        c.weight_bytes,
+        [0, 1024 * 1024 * 2],
+        "the weight's [n, k] bf16"
+    );
+    // The shared fixture's Llama-1B q_proj shape lowers the same way.
+    let c = lower_canonical(&front_end_lowered(gemm_m1_only_input()), FACTS, AT);
+    match c {
+        Err(CanonicalRefusal::Arena(ArenaRefusal::NoEmbeddedHidden)) => {}
+        other => panic!("expected the fixture's x refused as no embedded hidden, got {other:?}"),
+    }
+    let c = lower_canonical(&with_hidden(gemm_m1_only_input()), FACTS, AT)
+        .expect("gemm_m1_only lowers");
+    assert!(matches!(
+        c.steps.as_slice(),
+        [CudaStep::Gemv(GemmBf16 {
             m: 1,
             n: 2048,
             k: 2048,
-            rule: GemmShapeRule::Decode,
-        }) => {}
-        Err(e) => panic!("expected the m = 1 shape refusal at step 0, got: {e}"),
-        Ok(_) => panic!("lower_canonical lowered a decode GEMM CUDA has no kernel for"),
+            ..
+        })]
+    ));
+}
+
+/// A one-row GEMM whose `n` the narrow GEMM takes stays on the narrow GEMM, as at every other
+/// `m`: the GDN `a` and `b` projections keep the prefill row's bits.
+#[test]
+fn a_decode_gemm_of_a_narrow_n_stays_on_the_narrow_gemm() {
+    let c = lower_canonical(&gemm_m1(16, 1024), FACTS, AT).expect("the narrow one-row GEMM lowers");
+    assert!(matches!(
+        c.steps.as_slice(),
+        [CudaStep::GemmNarrow(GemmBf16 {
+            a: ArenaOffset(0),
+            b: WeightIx(1),
+            m: 1,
+            n: 16,
+            k: 1024,
+            ..
+        })]
+    ));
+}
+
+/// A GEMV's `k` off its 8-wide vector is refused by the GEMV's rule.
+#[test]
+fn a_gemv_off_the_vector_is_refused() {
+    match lower_canonical(&gemm_m1(1024, 100), FACTS, AT) {
+        Err(
+            e @ CanonicalRefusal::GemmShape {
+                step: 0,
+                m: 1,
+                n: 1024,
+                k: 100,
+                rule:
+                    GemmShapeRule::GemvOffVector {
+                        value: 100,
+                        multiple: 8,
+                    },
+            },
+        ) => {
+            let text = e.to_string();
+            assert!(text.contains("k = 100") && text.contains("GEMV"), "{text}");
+        }
+        Err(e) => panic!("expected the GEMV's k refusal at step 0, got: {e}"),
+        Ok(c) => panic!("lowered a GEMV off its vector: {:?}", c.steps),
     }
 }
 

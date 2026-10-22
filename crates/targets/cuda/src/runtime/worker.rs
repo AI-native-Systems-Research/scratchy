@@ -1267,6 +1267,12 @@ impl<'a> CudaWorker<'a> {
                         kernels::gemm_narrow_bf16_abt(slot(a), b, slot(c), (m, n, k), stream.0)
                     }
                 }
+                CudaStep::Gemv(GemmBf16 { a, b, c, n, k, .. }) => {
+                    let b = weights[b.0 as usize].ptr();
+                    // SAFETY: as above, for `a` (`k`, its `m` is 1: `validate`), `b` (`n*k`) and
+                    // `c` (`n`).
+                    unsafe { kernels::gemv_bf16_abt(slot(a), b, slot(c), (n, k), stream.0) }
+                }
                 CudaStep::GatedDeltaNet(g) => {
                     let pool = gdn.expect("`new` made a pool for a GDN tape");
                     Self::gated_delta_net(&g, pool, slot, weights, stream)
@@ -1455,6 +1461,38 @@ impl<'a> CudaWorker<'a> {
                             (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
                             (slot(block_table), slot(sequence)),
                             (rows, q_heads, kv_heads, head_dim),
+                            (layout.block_size, layout.num_blocks),
+                            attn.scale(),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::AttnDecode(
+                    attn @ AttnPrefillBf16 {
+                        q,
+                        block_table,
+                        sequence,
+                        out,
+                        layer,
+                        q_heads,
+                        kv_heads,
+                        head_dim,
+                        ..
+                    },
+                ) => {
+                    let pool = kv.expect("`new` made a pool for a KV tape");
+                    let l = layer as usize;
+                    let layout = pool.layout;
+                    // SAFETY: as the prefill attention's, for `q` and `out` (`q_heads*head_dim`,
+                    // its rows are 1: `validate`), and the block table and sequence uploaded
+                    // above, which `forward` checked: every block the keys `0 .. P + L` need is a
+                    // table entry inside the pool, and `L ≥ 1`. The cache halves are layer `l`'s.
+                    unsafe {
+                        kernels::attn_decode_bf16(
+                            (slot(q), slot(out)),
+                            (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
+                            (slot(block_table), slot(sequence)),
+                            (q_heads, kv_heads, head_dim),
                             (layout.block_size, layout.num_blocks),
                             attn.scale(),
                             stream.0,

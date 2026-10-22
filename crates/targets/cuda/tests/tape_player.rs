@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The tape player on the H100: the GEMM-chain tapes of `common::chains` and the qwen3.5-0.8b MLP
 //! block of `common::mlp` played through the arena and compared with an f64 CPU reference, one
-//! arena allocation per worker, no allocation per forward, colour reuse, and the refusals.
+//! arena allocation per worker, no allocation per forward, colour reuse, and the refusals; and the
+//! attention layer's one-row (decode) tape over the cache its 128-row tape prefilled.
 //!
 //! Built only under `nvcc` (`required-features`); no GPU fails rather than skips. Each stage is
 //! checked against its own GPU input (`common::numerics`' bounds), so the bound never compounds
@@ -20,7 +21,7 @@ pub mod common {
 use common::attn_gate::{ATTN_GATE_M128, ATTN_GATE_M256, attn_gate};
 use common::attn_layer::{ATTN_LAYER_M128, ATTN_LAYER_M256, attn_layer};
 use common::chains::{
-    HIDDEN, QWEN3_5_GDN_FACTS, THREE_GEMM_M256, TWO_GEMM_M128, TWO_GEMM_M256,
+    HIDDEN, QWEN3_5_FACTS, QWEN3_5_GDN_FACTS, THREE_GEMM_M256, TWO_GEMM_M128, TWO_GEMM_M256,
     assert_tape_is_lowered, assert_tape_is_lowered_with, three_gemm, two_gemm,
 };
 use common::gdn_layer::{GDN_LAYER_M128, GDN_LAYER_M256, gdn_layer};
@@ -48,6 +49,8 @@ use scratchy_target_cuda::step::{CudaStep, gdn_bundle, gdn_scratch};
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, RotaryTable, TapeError, WeightIx,
 };
+use scratchy_target_cuda_compiler::canonical::{CanonicalAt, lower_canonical};
+use scratchy_target_cuda_compiler::emit::static_tape;
 
 /// One worker's buckets: `M = 128` and `M = 256` of the same two-GEMM graph.
 static TWO_GEMM_BUCKETS: [CudaTape; 2] = [TWO_GEMM_M128, TWO_GEMM_M256];
@@ -2529,4 +2532,133 @@ fn the_gdn_pool_is_given_exactly_when_a_tape_needs_it() {
     );
     assert!(pass, "a GDN pool refusal is wrong");
     assert_eq!(allocated, 0, "a refused worker allocated");
+}
+
+// ── The one-row (decode) attention layer ───────────────────────────
+
+/// The attention layer at one row as CUDA's compiler lowers it (its GEMMs GEMVs, its attention
+/// the decode kernel's), beside the 128-row tape that prefills the same cache: one worker plays
+/// both.
+fn decode_layer_buckets() -> &'static [CudaTape] {
+    let one = lower_canonical(
+        &attn_layer(1),
+        QWEN3_5_FACTS,
+        CanonicalAt {
+            stem: "attn_layer(1)",
+            m: 1,
+        },
+    )
+    .expect("the attention layer lowers at one row");
+    Box::leak(Box::new([static_tape(&one), ATTN_LAYER_M128]))
+}
+
+/// A 128-row prefill of `P = 100` tokens over `[11, 3, 14]`, then decodes at positions 100..107
+/// one token at a time through the one-row tape: each decode's attention against the f64
+/// reference over the `P + 1` keys read back from the cache (the query its GEMV-projected,
+/// normed and rotated row, read from the arena), each decode's K and V at its slot, and every
+/// cache row below its position bit-unchanged by it.
+#[test]
+fn a_decode_step_attends_over_the_prefilled_cache() {
+    let device = h100();
+    let w = layer_weights();
+    let table = layer_table(&device, &w);
+    let buckets = decode_layer_buckets();
+    let mut worker = CudaWorker::new(&device, buckets, &table, POOL, None).expect("worker");
+    let one = &buckets[0];
+    let (CudaStep::Rope(rope), CudaStep::RopeAppend(append), CudaStep::AttnDecode(decode)) =
+        (one.steps[7], one.steps[8], one.steps[9])
+    else {
+        panic!("steps 7, 8 and 9 of the one-row tape are the rope, the append and the attention");
+    };
+    // One row of `cols` bf16 at `at`.
+    let span_of = |at: ArenaOffset, cols: usize| ArenaSpan {
+        offset: at,
+        bytes: 2 * cols as u64,
+    };
+    let block_table = [11u32, 3, 14];
+    let p0 = 100u32;
+    let mut y = vec![0u16; 128 * AL_H];
+    let prefill = KvSequence {
+        block_table: &block_table[..2],
+        prefix_len: 0,
+        q_len: p0,
+    };
+    worker
+        .forward(
+            1,
+            Input::Hidden(&layer_input(128, 0xDEC0)),
+            &seq_positions(128, 0),
+            Some(&prefill),
+            None,
+            &mut y,
+        )
+        .expect("the prefill");
+    let mut pass = true;
+    for step in 0..8u32 {
+        let p = p0 + step;
+        let (kb0, vb0) = (
+            read_pool(&mut worker, KvHalf::K),
+            read_pool(&mut worker, KvHalf::V),
+        );
+        let seq = KvSequence {
+            block_table: &block_table[..(p as usize + 1).div_ceil(64)],
+            prefix_len: p,
+            q_len: 1,
+        };
+        let mut y1 = vec![0u16; AL_H];
+        worker
+            .forward(
+                0,
+                Input::Hidden(&layer_input(1, 0xDEC1 + u64::from(step))),
+                &[p],
+                Some(&seq),
+                None,
+                &mut y1,
+            )
+            .expect("a decode");
+        let (kb, vb) = (
+            read_pool(&mut worker, KvHalf::K),
+            read_pool(&mut worker, KvHalf::V),
+        );
+        let tokens = p as usize + 1;
+        let (k_before, v_before) = (
+            gather(&kb0, &block_table, p as usize),
+            gather(&vb0, &block_table, p as usize),
+        );
+        let (k_rows, v_rows) = (
+            gather(&kb, &block_table, tokens),
+            gather(&vb, &block_table, tokens),
+        );
+        let n = p as usize * AL_KV;
+        let below =
+            mismatched_bits(&k_rows[..n], &k_before) + mismatched_bits(&v_rows[..n], &v_before);
+        let kr = read(&mut worker, span_of(append.k_out, AL_KV));
+        let v = read(&mut worker, span_of(append.v, AL_KV));
+        let appended = cache_mismatches((&kb, &vb), (&kr, &v), &block_table, (p as usize, 1));
+        let finite = y1
+            .iter()
+            .all(|&b| half::bf16::from_bits(b).to_f32().is_finite());
+        let qn = read(&mut worker, span_of(rope.x, AL_Q));
+        let uploaded = read(&mut worker, one.rotary.expect("a rotary table").span);
+        let qr = qr_direct(&device, one, &qn, &uploaded);
+        let attn = read(&mut worker, span_of(decode.out, AL_Q));
+        let ok = check_attention(
+            &format!("decode {step}: attn = AttnDecode(qr, cache)"),
+            &attn,
+            &qr,
+            (&k_rows, &v_rows),
+            (p as usize, 1),
+        );
+        eprintln!(
+            "decode {step} at position {p}: rows_below_changed_bits={below} \
+             appended_mismatched_bits={appended} y_finite={finite} {}",
+            verdict(below == 0 && appended == 0 && finite)
+        );
+        pass &= ok && below == 0 && appended == 0 && finite;
+    }
+    pass &= decode.rows == 1 && decode.scale_bits == 0.0625f32.to_bits();
+    assert!(
+        pass,
+        "a decode step of the attention layer failed: see the lines above"
+    );
 }

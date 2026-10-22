@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! qwen3.5-0.8b's CUDA prefill, run from the real `Qwen/Qwen3.5-0.8B` checkpoint on the H100,
-//! against HuggingFace transformers on the same token ids.
+//! qwen3.5-0.8b's CUDA prefill and decode, run from the real `Qwen/Qwen3.5-0.8B` checkpoint on the
+//! H100, against HuggingFace transformers on the same token ids.
 //!
 //! The reference is `tests/cuda_hf_reference.py`'s goldens (`tests/goldens/qwen3-5-qwen3.5-0.8b-hf/`):
 //! per prompt, HF's float32 logits (the reference), its bfloat16 logits (the noise yardstick: how
@@ -24,11 +24,19 @@
 //!   max |noise| makes the prompt a near-tie, and at most 1 of the 5 may be.
 //! - P6 chunked: prompt 6 as 128 fresh tokens, then the rest continuing in the same blocks and
 //!   slot, gives rows 128.. bit-identical to one forward of it (in disjoint blocks and slot).
+//! - P7 greedy via decode: prompts 1-5, one fresh m=512 prefill (its argmax is token 1), then 7
+//!   one-token decodes through the m=1 tape: the 8 tokens equal HF-f32's under P5's near-tie
+//!   rule.
+//! - P8 decode row: prompts 1-5, the first L − 1 tokens prefilled, then token L − 1 decoded: that
+//!   row against HF-f32's last row under P1-P4 (cosine, 2 × noise, top-1 unless near-tie, top-5
+//!   ≥ 4), and against CUDA's own one-shot last row (cosine ≥ 0.999, the same argmax unless
+//!   near-tie, the max |difference| printed). A one-token prompt is skipped, saying so.
 //!
-//! The thresholds are the issue's (AI-native-Systems-Research/scratchy#816), read not run. Built
-//! only under `nvcc` and `qwen3.5-0.8b`, and needs an sm_90 GPU and the goldens: a missing goldens
-//! dir fails with the command that makes it, never skips. `prompt_1_one_shot` is one forward
-//! alone, for the sanitizers. Every check prints its line before a test fails.
+//! The thresholds are the issues' (AI-native-Systems-Research/scratchy#816 and #830), read not
+//! run. Built only under `nvcc` and `qwen3.5-0.8b`, and needs an sm_90 GPU and the goldens: a
+//! missing goldens dir fails with the command that makes it, never skips. `prompt_1_one_shot` is one forward
+//! alone, and `prompt_1_decode` a prefill and 7 decodes alone, for the sanitizers. Every check
+//! prints its line before a test fails.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -555,4 +563,191 @@ fn prompt_1_one_shot() {
         verdict(ok)
     );
     assert!(ok, "non-finite logits");
+}
+
+// ── Decode on real weights ─────────────────────────────────────────
+
+/// One decode of `token` at position `prefix_len` in `seat` (the m=1 tape, one row): its logits,
+/// widened to f32.
+fn decode(w: &mut CudaWorker<'_>, token: u32, prefix_len: u32, seat: (&[u32], u32)) -> Vec<f32> {
+    let b = (CUDA_TAPES.iter().position(|t| t.bucket_m == 1)).expect("the m=1 tape");
+    let kv = KvSequence {
+        block_table: seat.0,
+        prefix_len,
+        q_len: 1,
+    };
+    let gdn = GdnSequence {
+        slot: seat.1,
+        q_len: 1,
+        fresh: false,
+    };
+    let mut out = vec![0u16; VOCAB];
+    w.forward(
+        b,
+        Input::TokenIds(&[token]),
+        &[prefix_len],
+        Some(&kv),
+        Some(&gdn),
+        &mut out,
+    )
+    .unwrap_or_else(|e| panic!("decode at {prefix_len}: {e}"));
+    out.iter().map(|&b| bf16::from_bits(b).to_f32()).collect()
+}
+
+/// Greedy through decode: one fresh m=512 prefill of the prompt (its last row's argmax is token
+/// 1), then `steps − 1` decodes, each of the token just chosen: the tokens.
+fn greedy_by_decode(w: &mut CudaWorker<'_>, ids: &[u32], steps: usize) -> Vec<u32> {
+    let logits = forward(w, ids, 0, SEAT_A);
+    let mut token = top_k(&logits[(ids.len() - 1) * VOCAB..], 1)[0] as u32;
+    let mut got = vec![token];
+    for step in 1..steps {
+        let p = (ids.len() + step - 1) as u32;
+        token = top_k(&decode(w, token, p, SEAT_A), 1)[0] as u32;
+        got.push(token);
+    }
+    got
+}
+
+/// P7: prompts 1-5, one fresh m=512 prefill then 7 decodes give HF-f32's 8 greedy tokens, under
+/// P5's near-tie rule (at most 1 prompt diverging, only at a step whose f32 margin is at most
+/// twice that step's `bf16_max_err`). Both sides printed.
+#[test]
+fn p7_greedy_via_decode_matches_hf_f32() {
+    let r = rig();
+    let mut w = r.worker();
+    let mut near_ties = 0;
+    let mut pass = true;
+    for p in prompts().iter().take(5) {
+        let path = goldens_dir().join(format!("greedy_{}.json", p.p));
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let golden: serde_json::Value = serde_json::from_str(&text).expect("greedy json");
+        let steps = golden["steps"].as_array().expect("steps");
+        let want: Vec<u32> = (steps.iter())
+            .map(|s| s["token"].as_u64().expect("a token") as u32)
+            .collect();
+        let got = greedy_by_decode(&mut w, &p.ids, want.len());
+        let ok = match got.iter().zip(&want).position(|(g, w)| g != w) {
+            None => true,
+            Some(step) => {
+                let margin = steps[step]["margin"].as_f64().expect("a margin");
+                let noise = steps[step]["bf16_max_err"].as_f64().expect("a noise");
+                let tie = margin <= 2.0 * noise;
+                eprintln!(
+                    "P7 prompt {}: first divergence at step {step}, f32 margin {margin:.4e} vs \
+                     2x noise {:.4e}: {}",
+                    p.p,
+                    2.0 * noise,
+                    if tie { "near-tie" } else { "NOT a near-tie" }
+                );
+                near_ties += usize::from(tie);
+                tie
+            }
+        };
+        eprintln!(
+            "P7 prompt {}: CUDA prefill + 7 decodes {got:?} HF-f32 {want:?} {}",
+            p.p,
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    let ok = near_ties <= 1;
+    eprintln!(
+        "P7: near-tie prompts {near_ties} (at most 1) {}",
+        verdict(ok)
+    );
+    assert!(
+        pass && ok,
+        "the greedy tokens via decode differ from HF-f32's"
+    );
+}
+
+/// P8: for prompts 1-5, prefill the first L − 1 tokens, then decode token L − 1. That row against
+/// HF-f32's last row: cosine ≥ 0.999, RMS and max error ≤ 2 × HF-bf16's on that row, the same
+/// top-1 unless the f32 margin is at most twice the row's max noise, top-5 overlap ≥ 4. Against
+/// CUDA's own one-shot last row: cosine ≥ 0.999, the same argmax unless near-tie, max |diff|
+/// printed. A one-token prompt has no prefix to prefill, and is skipped, saying so.
+#[test]
+fn p8_the_decode_row_matches_hf_f32() {
+    let r = rig();
+    let mut w = r.worker();
+    let mut pass = true;
+    for p in prompts().iter().take(5) {
+        let n = p.ids.len();
+        if n < 2 {
+            eprintln!(
+                "P8 prompt {}: one token, no prefix to prefill: SKIPPED",
+                p.p
+            );
+            continue;
+        }
+        let one_shot = forward(&mut w, &p.ids, 0, SEAT_B);
+        let one_shot = &one_shot[(n - 1) * VOCAB..];
+        forward(&mut w, &p.ids[..n - 1], 0, SEAT_A);
+        let row = decode(&mut w, p.ids[n - 1], (n - 1) as u32, SEAT_A);
+        let (f32_row, bf16_row) = (&p.f32[(n - 1) * VOCAB..], &p.bf16[(n - 1) * VOCAB..]);
+        let cos = cosine(&row, f32_row);
+        let (rms, max) = error(&row, f32_row);
+        let (noise_rms, noise_max) = error(bf16_row, f32_row);
+        let top = top_k(f32_row, 2);
+        let margin = f64::from(f32_row[top[0]] - f32_row[top[1]]);
+        let tie = margin <= 2.0 * noise_max;
+        let same = top_k(&row, 1)[0] == top[0];
+        let c5: BTreeSet<usize> = top_k(&row, 5).into_iter().collect();
+        let f5: BTreeSet<usize> = top_k(f32_row, 5).into_iter().collect();
+        let shared = c5.intersection(&f5).count();
+        let ok_hf = cos >= 0.999
+            && rms <= 2.0 * noise_rms
+            && max <= 2.0 * noise_max
+            && (same || tie)
+            && shared >= 4;
+        eprintln!(
+            "P8 prompt {} decode row {} vs HF-f32: cosine={cos:.6} (need >= 0.999) \
+             RMS={rms:.6e} (HF-bf16 {noise_rms:.6e}) max={max:.6e} (HF-bf16 {noise_max:.6e}) \
+             (need <= 2x each) top-1 same={same} (f32 margin {margin:.4e}, near-tie={tie}) \
+             top-5 shared={shared} (need >= 4) {}",
+            p.p,
+            n - 1,
+            verdict(ok_hf)
+        );
+        let cos_own = cosine(&row, one_shot);
+        let (_, diff_own) = error(&row, one_shot);
+        let same_own = top_k(&row, 1)[0] == top_k(one_shot, 1)[0];
+        let ok_own = cos_own >= 0.999 && (same_own || tie);
+        eprintln!(
+            "P8 prompt {} decode row {} vs CUDA's one-shot last row: cosine={cos_own:.6} (need \
+             >= 0.999) argmax same={same_own} (near-tie={tie}) max|diff|={diff_own:.6e} {}",
+            p.p,
+            n - 1,
+            verdict(ok_own)
+        );
+        pass &= ok_hf && ok_own;
+    }
+    assert!(
+        pass,
+        "a decode row is out of agreement: see the lines above"
+    );
+}
+
+/// Prompt 1's prefill then 7 decodes alone, for `compute-sanitizer --tool memcheck`
+/// (`cuda_hf_parity prompt_1_decode --exact`): the load, the forwards, finite logits.
+#[test]
+fn prompt_1_decode() {
+    let r = rig();
+    let mut w = r.worker();
+    let p = &prompts()[0];
+    let logits = forward(&mut w, &p.ids, 0, SEAT_A);
+    let mut token = top_k(&logits[(p.ids.len() - 1) * VOCAB..], 1)[0] as u32;
+    let mut non_finite = 0;
+    for step in 0..7 {
+        let row = decode(&mut w, token, (p.ids.len() + step) as u32, SEAT_A);
+        non_finite += row.iter().filter(|v| !v.is_finite()).count();
+        token = top_k(&row, 1)[0] as u32;
+    }
+    let ok = non_finite == 0;
+    eprintln!(
+        "prompt 1 prefill + 7 decodes: non-finite decode logits={non_finite} {}",
+        verdict(ok)
+    );
+    assert!(ok, "non-finite decode logits");
 }

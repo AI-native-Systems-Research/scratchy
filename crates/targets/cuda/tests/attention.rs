@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The paged KV cache's kernels on the H100, against an f64 CPU reference and exact probes: the
-//! cache write (`kernels/kv_append_bf16.cu`) and the causal GQA prefill attention over the cache
-//! (`kernels/attn_prefill_bf16.cu`), and their launchers' refusals.
+//! cache write (`kernels/kv_append_bf16.cu`), the causal GQA prefill attention over the cache
+//! (`kernels/attn_prefill_bf16.cu`), the one-row decode attention over it
+//! (`kernels/attn_decode_bf16.cu`), and their launchers' refusals.
 //!
 //! Built only under `nvcc` (`required-features`). No GPU fails rather than skips: this test is the
 //! kernels' only gate. Each test owns its device buffers and calls the launchers directly, with no
@@ -13,12 +14,14 @@ pub mod common {
 }
 
 use common::numerics::{
-    ATTN_SCORE_MAX, AttnCase, attention_reference, bf16_inputs, bits, compare_attention,
-    gather_paged, mismatched_bits, slot_of,
+    ATTN_SCORE_MAX, AttnCase, attention_bound, attention_reference, bf16_inputs, bits,
+    compare_attention, gather_paged, mismatched_bits, slot_of,
 };
 use half::bf16;
 use scratchy_subtile::paged_kv_layout::PagedKvLayout;
-use scratchy_target_cuda::kernels::{KernelError, attn_prefill_bf16, kv_append_bf16};
+use scratchy_target_cuda::kernels::{
+    KernelError, attn_decode_bf16, attn_prefill_bf16, kv_append_bf16,
+};
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 
 /// qwen3.5's head dim, and the KV block size.
@@ -565,4 +568,440 @@ fn a_chunk_is_bit_identical_to_the_same_rows_of_one_forward() {
         pass,
         "a chunk's attention differs from one forward's: see the lines above"
     );
+}
+
+// ── The decode attention (one query row) ───────────────────────────
+
+/// The decode tests' pool: room for 8192 keys (128 blocks) and spare blocks a shuffled table can
+/// pick from.
+const DEC_BLOCKS: usize = 160;
+/// Every decode `kv_len` the random cases run: one key, one warp's worth and less, each side of a
+/// block boundary, the parity lengths, and the codegen capacity.
+const DEC_KV_LENS: [usize; 12] = [1, 2, 7, 8, 9, 63, 64, 65, 300, 1000, 4096, 8192];
+
+/// The decode pool's layout: `DEC_BLOCKS` blocks of `kv_heads` heads.
+fn dec_layout(kv_heads: usize) -> PagedKvLayout {
+    PagedKvLayout {
+        num_blocks: DEC_BLOCKS as u32,
+        ..layout(kv_heads)
+    }
+}
+
+/// A permutation of the pool's blocks (splitmix64 Fisher-Yates, fixed by `seed`): a block table
+/// whose logical order is not the physical one.
+fn shuffled_blocks(seed: u64) -> Vec<u32> {
+    let mut table: Vec<u32> = (0..DEC_BLOCKS as u32).collect();
+    let mut state = seed;
+    for i in (1..table.len()).rev() {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        table.swap(i, (z % (i as u64 + 1)) as usize);
+    }
+    table
+}
+
+/// Fresh decode caches, every element `fill`, then the `tokens` keys and values written over
+/// `table` with the append kernel.
+fn dec_caches(
+    device: &CudaDevice,
+    (k, v): (&[u16], &[u16]),
+    (tokens, kvh): (usize, usize),
+    table: &[u32],
+    fill: u16,
+) -> (DeviceBuffer, DeviceBuffer) {
+    let elems = dec_layout(kvh).buffer_elems();
+    let (kc, vc) = (
+        up(device, &vec![fill; elems]),
+        up(device, &vec![fill; elems]),
+    );
+    let slot_map = slots(table, 0, tokens, tokens);
+    let sb = up_u32(device, &slot_map);
+    let (kb, vb) = (up(device, k), up(device, v));
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `k` and `v` hold tokens·kvh·HD bf16,
+    // `slots` tokens u32, the caches DEC_BLOCKS·kvh·BS·HD bf16 each, every slot in a block below
+    // DEC_BLOCKS; null is the default stream, which the download below waits for.
+    unsafe {
+        kv_append_bf16(
+            (kb.ptr(), vb.ptr()),
+            sb.ptr(),
+            (kc.ptr(), vc.ptr()),
+            (tokens as u32, kvh as u32, HD as u32),
+            (BS as u32, DEC_BLOCKS as u32),
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("kv_append_bf16 fills the decode cache");
+    sb.download().expect("wait for the append");
+    (kc, vc)
+}
+
+/// The decode attention of one query row `q` (`[1, q_heads · HD]`) over the decode caches, the
+/// sequence `[P, L]` and `table`; the output, downloaded.
+fn attend_decode(
+    device: &CudaDevice,
+    q: &[u16],
+    caches: (&DeviceBuffer, &DeviceBuffer),
+    table: &[u32],
+    (prefix_len, q_len): (usize, usize),
+    (q_heads, kv_heads): (usize, usize),
+) -> Result<Vec<u16>, KernelError> {
+    let qb = up(device, q);
+    let out = up(device, &vec![SENTINEL; q_heads * HD]);
+    let tb = up_u32(device, table);
+    let sb = up_u32(device, &[prefix_len as u32, q_len as u32]);
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `q` and `out` hold q_heads·HD bf16, `out`
+    // its own allocation; the caches DEC_BLOCKS·kv_heads·BS·HD each; `table` covers the
+    // ceil((P+L)/64) blocks the keys need, each below DEC_BLOCKS; null is the default stream.
+    unsafe {
+        attn_decode_bf16(
+            (qb.ptr(), out.ptr()),
+            (caches.0.ptr(), caches.1.ptr()),
+            (tb.ptr(), sb.ptr()),
+            (q_heads as u32, kv_heads as u32, HD as u32),
+            (BS as u32, DEC_BLOCKS as u32),
+            SCALE,
+            std::ptr::null_mut(),
+        )
+    }?;
+    Ok(out.download().expect("download the output"))
+}
+
+/// One decode case's inputs: the query row, and the sequence's keys and values.
+fn decode_inputs(kv_len: usize, (qh, kvh): (usize, usize), seed: u64) -> [Vec<u16>; 3] {
+    [
+        bf16_inputs(qh * HD, seed),
+        bf16_inputs(kv_len * kvh * HD, seed ^ 0x100),
+        bf16_inputs(kv_len * kvh * HD, seed ^ 0x200),
+    ]
+}
+
+/// Test 8: every decode `kv_len` within #791's f64 bound at L = 1 (the score-max condition
+/// printed), no output non-finite, over a shuffled block table whose unused slots are NaN. The
+/// same output, bit for bit, over the identity table with a clean (zero) pool, and on a repeat.
+/// K and V are read back from the cache, so the reference uses exactly the bits the kernel read.
+#[test]
+fn the_decode_attention_is_within_the_f64_bound() {
+    let device = h100();
+    let (qh, kvh) = (8usize, 2usize);
+    let mut pass = true;
+    for (case, &kv_len) in DEC_KV_LENS.iter().enumerate() {
+        let seed = 0x0DEC_0000 + case as u64;
+        let [q, k, v] = decode_inputs(kv_len, (qh, kvh), seed);
+        let shuffled = shuffled_blocks(seed);
+        let need = kv_len.div_ceil(BS);
+        let (kc, vc) = dec_caches(&device, (&k, &v), (kv_len, kvh), &shuffled, POISON);
+        let (kr, vr) = (
+            gather_paged(&kc.download().expect("K"), &shuffled, kv_len, (kvh, BS, HD)),
+            gather_paged(&vc.download().expect("V"), &shuffled, kv_len, (kvh, BS, HD)),
+        );
+        let seq = (kv_len - 1, 1);
+        let out = attend_decode(&device, &q, (&kc, &vc), &shuffled[..need], seq, (qh, kvh))
+            .expect("attn_decode_bf16");
+        let repeat = attend_decode(&device, &q, (&kc, &vc), &shuffled[..need], seq, (qh, kvh))
+            .expect("attn_decode_bf16, again");
+        let identity: Vec<u32> = (0..need as u32).collect();
+        let (kc0, vc0) = dec_caches(&device, (&k, &v), (kv_len, kvh), &identity, 0);
+        let clean = attend_decode(&device, &q, (&kc0, &vc0), &identity, seq, (qh, kvh))
+            .expect("attn_decode_bf16, identity table, clean pool");
+        let (refs, score_max) = attention_reference(&AttnCase {
+            q: &q,
+            k: &kr,
+            v: &vr,
+            q_heads: qh,
+            kv_heads: kvh,
+            head_dim: HD,
+            prefix_len: kv_len - 1,
+            q_len: 1,
+            scale: f64::from(SCALE),
+        });
+        let cmp = compare_attention(&out, &refs, qh * HD);
+        let nonfinite = (out.iter())
+            .filter(|&&b| !bf16::from_bits(b).to_f32().is_finite())
+            .count();
+        let (re, cl) = (
+            mismatched_bits(&out, &repeat),
+            mismatched_bits(&out, &clean),
+        );
+        let ok = cmp.pass() && nonfinite == 0 && score_max <= ATTN_SCORE_MAX && re == 0 && cl == 0;
+        eprintln!(
+            "decode attention heads={qh}/{kvh} kv_len={kv_len}: {} nonfinite={nonfinite} \
+             score_max={score_max:.4} (≤ {ATTN_SCORE_MAX}) repeat_mismatched_bits={re} \
+             shuffled_poisoned_vs_identity_clean_mismatched_bits={cl} {}",
+            cmp.line(),
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(pass, "a decode attention case failed: see the lines above");
+}
+
+/// Test 9: #791's probes at L = 1. With K = 0 every score is 0 and every p is 1. (a) GQA: kv head
+/// h's V the constant h + 1, so query head g's output is exactly g / hr + 1. (b) Mask and table:
+/// V of key j one-hot at lane j, every slot the appends did not write poisoned (one-hot 64 at lane
+/// `slot % 256`, or NaN), so the output is `1/kv_len` in lanes `0 .. kv_len` and exactly `+0.0`
+/// elsewhere, unless the kernel reads a key at or past kv_len or through a wrong block.
+#[test]
+fn the_decode_attention_probes_are_exact() {
+    let device = h100();
+    let mut pass = true;
+    for (qh, kvh) in [(8usize, 2usize), (16, 4)] {
+        let kv_len = 300usize;
+        let k = vec![0u16; kv_len * kvh * HD];
+        let v: Vec<u16> = (0..kv_len * kvh * HD)
+            .map(|e| bits(((e / HD) % kvh + 1) as f32))
+            .collect();
+        let table = shuffled_blocks(0x0DEC_6000 + qh as u64);
+        let (kc, vc) = dec_caches(&device, (&k, &v), (kv_len, kvh), &table, POISON);
+        let q = bf16_inputs(qh * HD, 0x0DEC_6100 + qh as u64);
+        let need = kv_len.div_ceil(BS);
+        let out = attend_decode(
+            &device,
+            &q,
+            (&kc, &vc),
+            &table[..need],
+            (kv_len - 1, 1),
+            (qh, kvh),
+        )
+        .expect("attn_decode_bf16");
+        let hr = qh / kvh;
+        let want: Vec<u16> = (0..qh * HD)
+            .map(|e| bits((e / HD / hr + 1) as f32))
+            .collect();
+        let mismatched = mismatched_bits(&out, &want);
+        eprintln!(
+            "decode GQA probe heads={qh}/{kvh} kv_len={kv_len}: mismatched_bits={mismatched} {}",
+            verdict(mismatched == 0)
+        );
+        pass &= mismatched == 0;
+    }
+    let (qh, kvh) = (8usize, 2usize);
+    let l = dec_layout(kvh);
+    for poison in [VPoison::OneHot, VPoison::Nan] {
+        for kv_len in [1usize, 7, 64, 65, 137, 256] {
+            let table = shuffled_blocks(0x0DEC_7000 + kv_len as u64);
+            let mut vpool = match poison {
+                VPoison::OneHot => vec![0u16; l.buffer_elems()],
+                VPoison::Nan => vec![POISON; l.buffer_elems()],
+            };
+            if let VPoison::OneHot = poison {
+                for slot in 0..DEC_BLOCKS * BS {
+                    for h in 0..kvh {
+                        vpool[l.elem_offset_for_global_slot(slot as u32, h as u32) + slot % HD] =
+                            bits(64.0);
+                    }
+                }
+            }
+            let kc = up(&device, &vec![0u16; l.buffer_elems()]);
+            let vc = up(&device, &vpool);
+            let k = vec![0u16; kv_len * kvh * HD];
+            let mut v = vec![0u16; kv_len * kvh * HD];
+            for j in 0..kv_len {
+                for h in 0..kvh {
+                    v[(j * kvh + h) * HD + j] = bits(1.0);
+                }
+            }
+            let sb = up_u32(&device, &slots(&table, 0, kv_len, kv_len));
+            let (kb, vb) = (up(&device, &k), up(&device, &v));
+            // SAFETY: as `dec_caches`'.
+            unsafe {
+                kv_append_bf16(
+                    (kb.ptr(), vb.ptr()),
+                    sb.ptr(),
+                    (kc.ptr(), vc.ptr()),
+                    (kv_len as u32, kvh as u32, HD as u32),
+                    (BS as u32, DEC_BLOCKS as u32),
+                    std::ptr::null_mut(),
+                )
+            }
+            .expect("kv_append_bf16");
+            sb.download().expect("wait for the append");
+            let q = bf16_inputs(qh * HD, 0x0DEC_7100 + kv_len as u64);
+            let need = kv_len.div_ceil(BS);
+            let out = attend_decode(
+                &device,
+                &q,
+                (&kc, &vc),
+                &table[..need],
+                (kv_len - 1, 1),
+                (qh, kvh),
+            )
+            .expect("attn_decode_bf16");
+            let want = bits(1.0 / kv_len as f32);
+            let (mut nonzero, mut off) = (0usize, 0usize);
+            let nonfinite = (out.iter())
+                .filter(|&&b| !bf16::from_bits(b).to_f32().is_finite())
+                .count();
+            for g in 0..qh {
+                for d in 0..HD {
+                    let got = out[g * HD + d];
+                    if d < kv_len {
+                        off += usize::from(got.abs_diff(want) > 1);
+                    } else {
+                        nonzero += usize::from(got != 0);
+                    }
+                }
+            }
+            let ok = nonzero == 0 && off == 0 && nonfinite == 0;
+            eprintln!(
+                "decode mask/table probe poison={poison:?} kv_len={kv_len}: \
+                 nonzero_in_zero_lanes={nonzero} one_over_n_lanes_off={off} \
+                 nonfinite_outputs={nonfinite} {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(pass, "a decode probe is not exact: see the lines above");
+}
+
+/// Test 10: the decode attention against the prefill attention's row for the same query at the
+/// same position over the same cache: the prefill launched with 128 rows, `L = min(kv_len, 128)`
+/// and `P = kv_len − L`, so its row `L − 1` is the query at position `kv_len − 1`. Two different
+/// kernels (the prefill rounds `p` to bf16 before P·V, the decode stays in f32), so no bit
+/// requirement: their difference is within the sum of their two #791 bounds.
+#[test]
+fn the_decode_attention_is_within_two_bounds_of_the_prefill_row() {
+    let device = h100();
+    let (qh, kvh, rows) = (8usize, 2usize, 128usize);
+    let mut pass = true;
+    for kv_len in [65usize, 300, 1000] {
+        let seed = 0x0DEC_8000 + kv_len as u64;
+        let len = kv_len.min(rows);
+        let p = kv_len - len;
+        let q_rows = bf16_inputs(rows * qh * HD, seed);
+        let q = &q_rows[(len - 1) * qh * HD..][..qh * HD];
+        let k = bf16_inputs(kv_len * kvh * HD, seed ^ 0x100);
+        let v = bf16_inputs(kv_len * kvh * HD, seed ^ 0x200);
+        let table = shuffled_blocks(seed);
+        let need = kv_len.div_ceil(BS);
+        let (kc, vc) = dec_caches(&device, (&k, &v), (kv_len, kvh), &table, POISON);
+        let decode = attend_decode(
+            &device,
+            q,
+            (&kc, &vc),
+            &table[..need],
+            (kv_len - 1, 1),
+            (qh, kvh),
+        )
+        .expect("attn_decode_bf16");
+        let qb = up(&device, &q_rows);
+        let out = up(&device, &vec![SENTINEL; rows * qh * HD]);
+        let tb = up_u32(&device, &table[..need]);
+        let sb = up_u32(&device, &[p as u32, len as u32]);
+        // SAFETY: as `attend`'s, over the decode pool of DEC_BLOCKS blocks.
+        unsafe {
+            attn_prefill_bf16(
+                (qb.ptr(), out.ptr()),
+                (kc.ptr(), vc.ptr()),
+                (tb.ptr(), sb.ptr()),
+                (rows as u32, qh as u32, kvh as u32, HD as u32),
+                (BS as u32, DEC_BLOCKS as u32),
+                SCALE,
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("attn_prefill_bf16");
+        let prefill = out.download().expect("download the prefill output");
+        let prefill = &prefill[(len - 1) * qh * HD..][..qh * HD];
+        let (kr, vr) = (
+            gather_paged(&kc.download().expect("K"), &table, kv_len, (kvh, BS, HD)),
+            gather_paged(&vc.download().expect("V"), &table, kv_len, (kvh, BS, HD)),
+        );
+        let (refs, score_max) = attention_reference(&AttnCase {
+            q,
+            k: &kr,
+            v: &vr,
+            q_heads: qh,
+            kv_heads: kvh,
+            head_dim: HD,
+            prefix_len: kv_len - 1,
+            q_len: 1,
+            scale: f64::from(SCALE),
+        });
+        let (mut bad, mut worst, mut ulps) = (0usize, 0.0f64, 0u16);
+        for ((&d, &f), &(r, pv)) in decode.iter().zip(prefill).zip(&refs) {
+            let (df, ff) = (
+                f64::from(bf16::from_bits(d).to_f32()),
+                f64::from(bf16::from_bits(f).to_f32()),
+            );
+            let bound = 2.0 * attention_bound(r, pv);
+            let diff = (df - ff).abs();
+            bad += usize::from(!(df.is_finite() && ff.is_finite() && diff <= bound));
+            worst = worst.max(diff / bound);
+            ulps = ulps.max(d.abs_diff(f));
+        }
+        let ok = bad == 0 && score_max <= ATTN_SCORE_MAX;
+        eprintln!(
+            "decode vs prefill row {} (P={p}, L={len}) kv_len={kv_len}: out_of_bound={bad} \
+             worst_ratio={worst:.4} max_ulps={ulps} score_max={score_max:.4} {}",
+            len - 1,
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "the decode attention is outside two bounds of the prefill row"
+    );
+}
+
+/// A refused decode launch: `(q_heads, kv_heads, head_dim)` and `(block_size, num_blocks)`.
+type DecodeRefusal = ((u32, u32, u32), (u32, u32));
+
+/// Test 11: each decode launcher refusal returns the shape code and leaves `out` untouched.
+#[test]
+fn the_decode_attention_launcher_refuses_each_bad_shape() {
+    let device = h100();
+    let elems = dec_layout(2).buffer_elems();
+    let (kc, vc) = (
+        up(&device, &vec![0u16; elems]),
+        up(&device, &vec![0u16; elems]),
+    );
+    let q = up(&device, &vec![0u16; 16 * HD]);
+    let out = up(&device, &vec![SENTINEL; 16 * HD]);
+    let tb = up_u32(&device, &[0, 1]);
+    let sb = up_u32(&device, &[99, 1]);
+    let mut pass = true;
+    let cases: [(DecodeRefusal, f32, &str); 7] = [
+        (((8, 2, 128), (64, 16)), SCALE, "head_dim 128"),
+        (((8, 3, 256), (64, 16)), SCALE, "q_heads % kv_heads ≠ 0"),
+        (((8, 0, 256), (64, 16)), SCALE, "kv_heads 0"),
+        (((8, 2, 256), (16, 16)), SCALE, "block_size 16"),
+        (((8, 2, 256), (64, 0)), SCALE, "num_blocks 0"),
+        (((8, 2, 256), (64, 16)), f32::NAN, "scale NaN"),
+        (((8, 2, 256), (64, 16)), 0.0, "scale 0"),
+    ];
+    for (((qh, kvh, hd), (block_size, num_blocks)), scale, what) in cases {
+        // SAFETY: refused before any pointer is touched.
+        let got = unsafe {
+            attn_decode_bf16(
+                (q.ptr(), out.ptr()),
+                (kc.ptr(), vc.ptr()),
+                (tb.ptr(), sb.ptr()),
+                (qh, kvh, hd),
+                (block_size, num_blocks),
+                scale,
+                std::ptr::null_mut(),
+            )
+        };
+        let want = Err(KernelError::AttnDecodeShape {
+            q_heads: qh,
+            kv_heads: kvh,
+            head_dim: hd,
+            block_size,
+            num_blocks,
+        });
+        let untouched = (out.download().expect("out"))
+            .iter()
+            .all(|&b| b == SENTINEL);
+        eprintln!(
+            "decode attention refusal ({what}): {got:?} out_untouched={untouched} {}",
+            verdict(got == want && untouched)
+        );
+        pass &= got == want && untouched;
+    }
+    assert!(pass, "a decode refusal launched or wrote");
 }

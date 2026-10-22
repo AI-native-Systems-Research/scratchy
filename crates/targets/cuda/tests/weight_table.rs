@@ -386,7 +386,11 @@ fn bytes_other_than_declared_are_refused() {
     let short: &'static [u64] = Box::leak(Box::new([256, 0, 16, bundle_bytes() - 256]));
     let e = refusal("bytes", &table, &[tape(short)]);
     assert!(
-        matches!(e, LoadError::Bytes { ix: 3, packed, declared } if packed == bundle_bytes() && declared == bundle_bytes() - 256),
+        matches!(e, LoadError::Bytes { ix: 3, tensor: Some(t), packed, declared } if t == table[3].expect("an entry").lead() && packed == bundle_bytes() && declared == bundle_bytes() - 256),
+        "{e}"
+    );
+    assert!(
+        e.to_string().contains(table[3].expect("an entry").lead()),
         "{e}"
     );
     let unread: &'static [u64] = Box::leak(Box::new([256, 2, 16, bundle_bytes()]));
@@ -396,6 +400,7 @@ fn bytes_other_than_declared_are_refused() {
             e,
             LoadError::Bytes {
                 ix: 1,
+                tensor: None,
                 packed: 0,
                 declared: 2
             }
@@ -417,6 +422,7 @@ fn the_largest_declared_size_is_the_one_checked() {
             e,
             LoadError::Bytes {
                 ix: 0,
+                tensor: Some(_),
                 packed: 256,
                 declared: 512
             }

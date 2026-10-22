@@ -12,8 +12,8 @@ use serde::Serialize;
 
 use crate::step::{
     AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, EmbedBf16, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
-    GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, RopeAppendBf16,
-    RopeBf16, gdn_conv_dim, gdn_scratch,
+    GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, GemmBf16,
+    RopeAppendBf16, RopeBf16, gdn_conv_dim, gdn_scratch,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -246,6 +246,10 @@ pub enum TapeError {
     /// The `step`-th step, the embed, reads other token ids, rows or vocabulary than the tape's
     /// input: its `tokens` offset, `rows` or `vocab` disagree with the tape's.
     EmbedInput { step: usize },
+    /// The `step`-th step, the embed, does not write exactly colour 0, the embedded hidden the
+    /// tape's first ops read: its `out` is not colour 0's offset, or `rows · hidden` bf16 are not
+    /// colour 0's bytes.
+    EmbedOutput { step: usize },
     /// The result span reaches past the arena.
     ResultOutside { span: ArenaSpan, total: u64 },
     /// A byte count of the `step`-th step overflows `u64`.
@@ -321,6 +325,9 @@ pub enum TapeError {
     /// The `step`-th step's kv heads or head dim are not the tape's KV geometry, so its kernel
     /// would address the pool with other strides than the worker allocated it with.
     KvStepGeometry { step: usize },
+    /// The `step`-th step is a one-row kernel's (a GEMV or the decode attention) and its rows are
+    /// `rows`, not 1, or the tape's bucket is not one row.
+    OneRowStep { step: usize, rows: u32 },
     /// The `step`-th step's rope reads `table`, which is not the tape's rotary table (`None`
     /// when the tape has none).
     RotaryMismatch {
@@ -422,7 +429,9 @@ impl std::fmt::Display for TapeError {
                 let (bytes, offset) = at(span);
                 write!(
                     f,
-                    "the token ids are {bytes} bytes at {offset}, over a vocabulary of {vocab};                      the forward fills {bucket_m} u32 at a multiple of {CUDA_ARENA_ALIGN}, from                      a vocabulary of at least one row"
+                    "the token ids are {bytes} bytes at {offset}, over a vocabulary of {vocab}; \
+                     the forward fills {bucket_m} u32 at a multiple of {CUDA_ARENA_ALIGN}, from \
+                     a vocabulary of at least one row"
                 )
             }
             Self::EmbedMissing { first: Some(step) } => write!(
@@ -437,11 +446,17 @@ impl std::fmt::Display for TapeError {
             }
             Self::EmbedMisplaced { step } => write!(
                 f,
-                "step {step} is an embed; a tape embeds only as its first step, and only when its                  input is token ids"
+                "step {step} is an embed; a tape embeds only as its first step, and only when its \
+                 input is token ids"
             ),
             Self::EmbedInput { step } => write!(
                 f,
-                "step {step}, the embed, reads other token ids, rows or vocabulary than the                  tape's input"
+                "step {step}, the embed, reads other token ids, rows or vocabulary than the \
+                 tape's input"
+            ),
+            Self::EmbedOutput { step } => write!(
+                f,
+                "step {step}, the embed, does not write exactly colour 0, the embedded hidden"
             ),
             Self::ResultOutside { span, total } => {
                 let (bytes, offset) = at(span);
@@ -559,6 +574,11 @@ impl std::fmt::Display for TapeError {
             Self::KvStepGeometry { step } => write!(
                 f,
                 "step {step}'s kv heads or head dim are not the tape's KV cache geometry"
+            ),
+            Self::OneRowStep { step, rows } => write!(
+                f,
+                "step {step} is a one-row kernel's (the GEMV or the decode attention) at \
+                 {rows} rows, or in a bucket of more than one row"
             ),
             Self::RotaryMismatch { step, table, tape } => match tape {
                 Some(t) => write!(
@@ -853,7 +873,9 @@ impl CudaTape {
                 }
                 let Some(&CudaStep::Embed(EmbedBf16 {
                     tokens,
+                    out,
                     rows,
+                    hidden,
                     vocab: embed_vocab,
                     ..
                 })) = self.steps.first()
@@ -864,7 +886,18 @@ impl CudaTape {
                 if (tokens, rows, embed_vocab) != (span.offset, self.bucket_m, vocab) {
                     return Err(TapeError::EmbedInput { step: 0 });
                 }
-                Ok(())
+                // The embed fills colour 0 and nothing else: its offset, and its bytes exactly.
+                let colour0 =
+                    (self.arena.colour_offsets.first()).zip(self.arena.colour_bytes.first());
+                let writes = (u64::from(rows) * u64::from(hidden)).checked_mul(CUDA_ACT_BYTES);
+                match colour0 {
+                    Some((&offset, &bytes))
+                        if out == ArenaOffset(offset) && writes == Some(bytes) =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(TapeError::EmbedOutput { step: 0 }),
+                }
             }
         }
     }
@@ -1029,7 +1062,15 @@ impl CudaTape {
                 kv_heads,
                 head_dim,
                 ..
+            })
+            | CudaStep::AttnDecode(AttnPrefillBf16 {
+                block_table,
+                sequence,
+                kv_heads,
+                head_dim,
+                ..
             }) => {
+                self.one_row(step, s)?;
                 let kv = self.kv;
                 let table = ArenaSpan {
                     offset: block_table,
@@ -1095,6 +1136,7 @@ impl CudaTape {
                 }
                 Ok(())
             }
+            CudaStep::Gemv(_) => self.one_row(step, s),
             CudaStep::Embed(_)
             | CudaStep::Gemm(_)
             | CudaStep::GemmNarrow(_)
@@ -1103,6 +1145,21 @@ impl CudaTape {
             | CudaStep::SiluMul(_)
             | CudaStep::GateSplit(_)
             | CudaStep::GateApply(_) => Ok(()),
+        }
+    }
+
+    /// A one-row kernel's step (the GEMV, the decode attention) is one row, in a one-row bucket:
+    /// those kernels index no row past the first. Any other step passes.
+    fn one_row(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
+        let rows = match *s {
+            CudaStep::Gemv(GemmBf16 { m, .. }) => m,
+            CudaStep::AttnDecode(AttnPrefillBf16 { rows, .. }) => rows,
+            _ => return Ok(()),
+        };
+        if rows == 1 && self.bucket_m == 1 {
+            Ok(())
+        } else {
+            Err(TapeError::OneRowStep { step, rows })
         }
     }
 }
@@ -2359,5 +2416,317 @@ mod tests {
                 declared: GDN_BUNDLE_BYTES - 256
             })
         );
+    }
+
+    // ── Display, and the checks #830 added ─────────────────────────
+
+    /// One of every [`TapeError`], each region named where an arm takes one. The match below has
+    /// no wildcard, so a new variant does not compile until it is listed here.
+    fn every_tape_error() -> Vec<TapeError> {
+        let s = span(256, 512);
+        let all = vec![
+            TapeError::ColourCount {
+                bytes: 2,
+                offsets: 3,
+            },
+            TapeError::ColourMisaligned {
+                colour: 1,
+                offset: 4,
+            },
+            TapeError::ColourOutside {
+                colour: 1,
+                span: s,
+                total: 8,
+            },
+            TapeError::InputOutside { span: s, total: 8 },
+            TapeError::TokenIdsShape {
+                span: s,
+                bucket_m: 1,
+                vocab: 0,
+            },
+            TapeError::EmbedMissing { first: Some(0) },
+            TapeError::EmbedMissing { first: None },
+            TapeError::EmbedMisplaced { step: 3 },
+            TapeError::EmbedInput { step: 0 },
+            TapeError::EmbedOutput { step: 0 },
+            TapeError::ResultOutside { span: s, total: 8 },
+            TapeError::StepOverflow { step: 1 },
+            TapeError::StepMisaligned { step: 1, offset: 4 },
+            TapeError::StepOutside {
+                step: 1,
+                span: s,
+                total: 8,
+            },
+            TapeError::WriteOverlapsRead {
+                step: 1,
+                write: s,
+                read: s,
+            },
+            TapeError::WritesOverlap { step: 1 },
+            TapeError::RotaryOutside { span: s, total: 8 },
+            TapeError::RotaryShape {
+                span: s,
+                bucket_m: 1,
+                rot_dim: 64,
+            },
+            TapeError::WeightIndex {
+                step: 1,
+                ix: 9,
+                weights: 3,
+            },
+            TapeError::WeightShort {
+                step: 1,
+                ix: 2,
+                need: 8,
+                declared: 4,
+            },
+            TapeError::KvRegionOutside {
+                region: Region::BlockTable,
+                span: s,
+                total: 8,
+            },
+            TapeError::KvRegionShape {
+                region: Region::Sequence,
+                span: s,
+                want: 8,
+            },
+            TapeError::KvBlockSize { block_size: 16 },
+            TapeError::KvLayer {
+                step: 1,
+                layer: 2,
+                layers: 1,
+            },
+            TapeError::KvRegionMismatch {
+                step: 1,
+                region: Region::SlotMapping,
+                span: s,
+                tape: Some(s),
+            },
+            TapeError::KvRegionMismatch {
+                step: 1,
+                region: Region::SlotMapping,
+                span: s,
+                tape: None,
+            },
+            TapeError::KvStepGeometry { step: 1 },
+            TapeError::OneRowStep { step: 1, rows: 2 },
+            TapeError::RotaryMismatch {
+                step: 1,
+                table: ArenaOffset(256),
+                tape: Some(ArenaOffset(512)),
+            },
+            TapeError::RotaryMismatch {
+                step: 1,
+                table: ArenaOffset(256),
+                tape: None,
+            },
+            TapeError::WriteOverRegion {
+                step: 1,
+                write: s,
+                region: Region::TokenIds,
+            },
+            TapeError::GdnRegionOutside {
+                region: Region::GdnScratch,
+                span: s,
+                total: 8,
+            },
+            TapeError::GdnRegionShape {
+                region: Region::GdnSequence,
+                span: s,
+                want: 16,
+            },
+            TapeError::GdnLayer {
+                step: 1,
+                layer: 2,
+                layers: 1,
+            },
+            TapeError::GdnRegionMismatch {
+                step: 1,
+                region: Region::GdnScratch,
+                span: s,
+                tape: Some(s),
+            },
+            TapeError::GdnRegionMismatch {
+                step: 1,
+                region: Region::GdnScratch,
+                span: s,
+                tape: None,
+            },
+            TapeError::GdnStepGeometry { step: 1 },
+            TapeError::GdnGeometry {
+                num_k_heads: 16,
+                num_v_heads: 16,
+                head_k: 64,
+                head_v: 128,
+                conv_kernel: 4,
+            },
+        ];
+        for e in &all {
+            match e {
+                TapeError::ColourCount { .. }
+                | TapeError::ColourMisaligned { .. }
+                | TapeError::ColourOutside { .. }
+                | TapeError::InputOutside { .. }
+                | TapeError::TokenIdsShape { .. }
+                | TapeError::EmbedMissing { .. }
+                | TapeError::EmbedMisplaced { .. }
+                | TapeError::EmbedInput { .. }
+                | TapeError::EmbedOutput { .. }
+                | TapeError::ResultOutside { .. }
+                | TapeError::StepOverflow { .. }
+                | TapeError::StepMisaligned { .. }
+                | TapeError::StepOutside { .. }
+                | TapeError::WriteOverlapsRead { .. }
+                | TapeError::WritesOverlap { .. }
+                | TapeError::RotaryOutside { .. }
+                | TapeError::RotaryShape { .. }
+                | TapeError::WeightIndex { .. }
+                | TapeError::WeightShort { .. }
+                | TapeError::KvRegionOutside { .. }
+                | TapeError::KvRegionShape { .. }
+                | TapeError::KvBlockSize { .. }
+                | TapeError::KvLayer { .. }
+                | TapeError::KvRegionMismatch { .. }
+                | TapeError::KvStepGeometry { .. }
+                | TapeError::OneRowStep { .. }
+                | TapeError::RotaryMismatch { .. }
+                | TapeError::WriteOverRegion { .. }
+                | TapeError::GdnRegionOutside { .. }
+                | TapeError::GdnRegionShape { .. }
+                | TapeError::GdnLayer { .. }
+                | TapeError::GdnRegionMismatch { .. }
+                | TapeError::GdnStepGeometry { .. }
+                | TapeError::GdnGeometry { .. } => {}
+            }
+        }
+        all
+    }
+
+    /// No `TapeError` text has two consecutive spaces: a string literal split across lines without
+    /// a `\` continuation keeps the next line's indentation (#9's three embed messages did).
+    #[test]
+    fn no_display_string_has_two_consecutive_spaces() {
+        for e in every_tape_error() {
+            let text = e.to_string();
+            assert!(!text.contains("  "), "{e:?}: {text:?}");
+        }
+        for region in [
+            Region::Rotary,
+            Region::TokenIds,
+            Region::BlockTable,
+            Region::SlotMapping,
+            Region::Sequence,
+            Region::GdnSequence,
+            Region::GdnScratch,
+        ] {
+            assert!(!region.to_string().contains("  "), "{region:?}");
+        }
+    }
+
+    /// The embed writes exactly colour 0: an `out` at another colour's offset, or a `hidden` whose
+    /// rows are not colour 0's bytes, is refused.
+    #[test]
+    fn the_embed_writes_exactly_colour_0() {
+        let elsewhere = CudaStep::Embed(EmbedBf16 {
+            out: ArenaOffset(262144),
+            ..match embed_step(TOKENS, 256, VOCAB) {
+                CudaStep::Embed(e) => e,
+                _ => unreachable!("an embed"),
+            }
+        });
+        let narrow = CudaStep::Embed(EmbedBf16 {
+            hidden: 256,
+            ..match embed_step(TOKENS, 256, VOCAB) {
+                CudaStep::Embed(e) => e,
+                _ => unreachable!("an embed"),
+            }
+        });
+        for embed in [elsewhere, narrow] {
+            assert_eq!(
+                token_tape(&[embed]).validate(),
+                Err(TapeError::EmbedOutput { step: 0 }),
+                "{embed:?}"
+            );
+        }
+    }
+
+    /// `x [1, 512] → GEMV (N = 1024) → y [1, 1024]`, the one-row tape: colours 0 `x` at 0 and 1
+    /// `y` at 1024 (256-aligned), weight 1 `W [1024, 512]`.
+    const ONE_ROW: CudaTape = CudaTape {
+        bucket_m: 1,
+        arena: ArenaLayout {
+            colour_bytes: &[1024, 2048],
+            colour_offsets: &[0, 1024],
+            total_bytes: 3072,
+        },
+        input: TapeInput::Hidden(span(0, 1024)),
+        result: span(1024, 2048),
+        weight_bytes: &[0, 1048576],
+        steps: &[CudaStep::Gemv(GemmBf16 {
+            a: ArenaOffset(0),
+            b: WeightIx(1),
+            c: ArenaOffset(1024),
+            m: 1,
+            n: 1024,
+            k: 512,
+        })],
+        rotary: None,
+        kv: None,
+        gdn: None,
+    };
+
+    /// A one-row GEMV tape validates; a GEMV of more than one row, or one in a bucket of more
+    /// than one row, is refused: the kernel reads one row of `a`.
+    #[test]
+    fn a_gemv_is_one_row_of_a_one_row_bucket() {
+        assert_eq!(ONE_ROW.validate(), Ok(()));
+        let two = CudaTape {
+            steps: Box::leak(Box::new([CudaStep::Gemv(GemmBf16 {
+                a: ArenaOffset(0),
+                b: WeightIx(1),
+                c: ArenaOffset(1024),
+                m: 2,
+                n: 512,
+                k: 256,
+            })])),
+            ..ONE_ROW
+        };
+        assert_eq!(
+            two.validate(),
+            Err(TapeError::OneRowStep { step: 0, rows: 2 })
+        );
+        let bucket = CudaTape {
+            bucket_m: 2,
+            ..ONE_ROW
+        };
+        assert_eq!(
+            bucket.validate(),
+            Err(TapeError::OneRowStep { step: 0, rows: 1 })
+        );
+    }
+
+    /// A decode attention is one row of a one-row bucket, and reads the KV regions the prefill
+    /// attention reads.
+    #[test]
+    fn a_decode_attention_is_one_row_of_a_one_row_bucket() {
+        let decode = |rows, kv_heads| match attn(KV_TABLE, KV_SEQ, kv_heads) {
+            CudaStep::AttnPrefill(a) => CudaStep::AttnDecode(AttnPrefillBf16 { rows, ..a }),
+            _ => unreachable!("an attention"),
+        };
+        // `kv_tape` is a 256-row bucket: a one-row decode in it is refused for the bucket, a
+        // 256-row one for its rows. (The whole one-row qwen3.5 tape validates: `cuda_tapes`.)
+        assert_eq!(
+            kv_tape(KV, &[decode(1, 2)]).validate(),
+            Err(TapeError::OneRowStep { step: 0, rows: 1 })
+        );
+        assert_eq!(
+            kv_tape(KV, &[decode(256, 2)]).validate(),
+            Err(TapeError::OneRowStep { step: 0, rows: 256 })
+        );
+        let e = decode(1, 2).extents().expect("the decode's extents");
+        assert_eq!(e.kv, Some((0, KvUse::Read)));
+        assert_eq!(e.reads[1], Some(span(KV_TABLE, 512)), "the block table");
+        assert_eq!(e.reads[2], Some(span(KV_SEQ, 8)), "the sequence");
+        assert_eq!(e.writes, span(786432, 1024), "one row of 2 · 256 bf16");
     }
 }

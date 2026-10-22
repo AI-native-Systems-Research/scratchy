@@ -9,9 +9,10 @@
 //! - the model facts ([`model_facts`]): the neutral facts as [`CudaModelFacts`];
 //! - the lowering: [`crate::canonical::lower_canonical`] at every point, one tape per `m`, after
 //!   checking that every `sk` of that `m` lowers to the same tape (CUDA's tape reads no `sk`);
-//! - the refusal policy: a bucket whose first GEMM CUDA has no kernel for — the decode GEMV
-//!   (`m = 1`) or an `m` off the GEMM's 128-row tile — is left out and named in
-//!   `CUDA_UNLOWERED`; any other refusal panics the build with its text;
+//! - the refusal policy: a bucket whose first GEMM CUDA has no kernel for — an `m` above 1 and
+//!   off the GEMM's 128-row tile — is left out and named in `CUDA_UNLOWERED`; any other refusal
+//!   panics the build with its text. A one-row bucket (`m = 1`, decode) lowers: its GEMMs are
+//!   GEMVs and its attention the decode attention;
 //! - the weight table ([`weight_table`]): per weight index the tapes read, the checkpoint tensor
 //!   that fills it, its shape and its conversion, named from the neutral `weight_prefixes`; two
 //!   indices naming one tensor (a tied `lm_head` and the embedding table) become one buffer;
@@ -263,14 +264,14 @@ impl std::fmt::Display for ModelRefusal {
 
 impl std::error::Error for ModelRefusal {}
 
-/// A refusal that leaves its bucket out: the bucket's first GEMM is the decode GEMV (`m = 1`) or
-/// has an `m` off the bf16 GEMM's tile, which CUDA has no kernel for yet. Every other refusal is
+/// A refusal that leaves its bucket out: the bucket's first GEMM has an `m` off the bf16 GEMM's
+/// tile (above 1, which the GEMV takes), which CUDA has no kernel for yet. Every other refusal is
 /// an error.
 pub fn leaves_bucket_out(r: &CanonicalRefusal) -> bool {
     matches!(
         r,
         CanonicalRefusal::GemmShape {
-            rule: GemmShapeRule::Decode | GemmShapeRule::OffTile { dim: "m", .. },
+            rule: GemmShapeRule::OffTile { dim: "m", .. },
             ..
         }
     )
@@ -393,7 +394,8 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             ..
         }) => Some((table, Role::Bf16([u64::from(vocab), u64::from(hidden)], 2))),
         CudaStep::Gemm(GemmBf16 { b, n, k, .. })
-        | CudaStep::GemmNarrow(GemmBf16 { b, n, k, .. }) => {
+        | CudaStep::GemmNarrow(GemmBf16 { b, n, k, .. })
+        | CudaStep::Gemv(GemmBf16 { b, n, k, .. }) => {
             Some((b, Role::Bf16([u64::from(n), u64::from(k)], 2)))
         }
         CudaStep::RmsNorm(RmsNormBf16 { gain, cols, .. }) => {
@@ -423,7 +425,8 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         | CudaStep::GateSplit(_)
         | CudaStep::GateApply(_)
         | CudaStep::RopeAppend(_)
-        | CudaStep::AttnPrefill(_) => None,
+        | CudaStep::AttnPrefill(_)
+        | CudaStep::AttnDecode(_) => None,
     }
 }
 
@@ -697,8 +700,9 @@ pub fn emit_model(input: &TargetModelInput) -> TokenStream {
     let preamble = CUDA_MODULES.preamble();
     let unlowered = (model.unlowered.iter()).map(|(m, why)| quote! { (#m, #why) });
     quote! {
-        /// This model's CUDA prefill tapes, one per bucket, ascending `bucket_m`: what
-        /// `CudaWorker::new` takes. Every field a constant lowered at expansion.
+        /// This model's CUDA tapes, one per bucket, ascending `bucket_m`: the one-row decode
+        /// bucket, then the prefill buckets. What `CudaWorker::new` takes. Every field a
+        /// constant lowered at expansion.
         pub static CUDA_TAPES: &[::scratchy_target_cuda::tape::CudaTape] = {
             #preamble
             &[ #(#tapes),* ]
@@ -709,7 +713,7 @@ pub fn emit_model(input: &TargetModelInput) -> TokenStream {
             #preamble
             #weights
         };
-        /// The buckets CUDA did not lower, and why: today the decode bucket and the buckets below
+        /// The buckets CUDA did not lower, and why: today the buckets above one row and below
         /// the GEMM's 128-row tile.
         pub static CUDA_UNLOWERED: &[(u32, &str)] = &[ #(#unlowered),* ];
     }

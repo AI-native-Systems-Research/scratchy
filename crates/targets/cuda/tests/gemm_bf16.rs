@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The bf16 GEMMs (`kernels/gemm_bf16.cu` and the narrow `kernels/gemm_narrow_bf16.cu`, both
-//! `C = A · Bᵀ`) against a CPU reference, on the H100.
+//! The bf16 GEMMs (`kernels/gemm_bf16.cu`, the narrow `kernels/gemm_narrow_bf16.cu` and the
+//! one-row GEMV `kernels/gemv_bf16.cu`, all `C = A · Bᵀ`) against a CPU reference, on the H100.
 //!
 //! Built only under `nvcc` (`required-features`). No GPU fails rather than skips: this test is the
 //! kernel's only gate, and a skip that passes would let it pass silently. The reference and the
@@ -11,8 +11,10 @@ pub mod common {
     pub mod numerics;
 }
 
-use common::numerics::{bf16_inputs, compare, mismatched_bits, widen};
-use scratchy_target_cuda::kernels::{KernelError, gemm_bf16_abt, gemm_narrow_bf16_abt};
+use common::numerics::{bf16_inputs, compare, mismatched_bits, reference, widen};
+use scratchy_target_cuda::kernels::{
+    KernelError, gemm_bf16_abt, gemm_narrow_bf16_abt, gemv_bf16_abt,
+};
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 
 /// `(M, N, K)`, each a multiple of the kernel's (128, 256, 64).
@@ -427,5 +429,227 @@ fn an_output_row_does_not_depend_on_where_its_input_row_sits() {
     assert!(
         pass,
         "an output row depends on where its input row sits: see the lines above"
+    );
+}
+
+// ── The GEMV (m = 1) ───────────────────────────────────────────────
+
+/// `(n, k)` for the GEMV: every qwen3.5-0.8b decode shape (the q projection with its gate, k and
+/// v, the attention's o and the GDN out projection, the MLP's gate/up and down, the GDN QKV and z
+/// projections, the lm_head), then grid tails: one CTA of 8 columns, three warps of one CTA, a
+/// partial last CTA with a `k` of 9 vectors (a lane takes 0 or 1), and one column.
+const GEMV_SHAPES: &[(u32, u32, &str)] = &[
+    (4096, 1024, "q_proj with its gate"),
+    (512, 1024, "k_proj / v_proj"),
+    (1024, 2048, "o_proj, the GDN out_proj"),
+    (3584, 1024, "gate_proj / up_proj"),
+    (1024, 3584, "down_proj"),
+    (6144, 1024, "the GDN in_proj_qkv"),
+    (2048, 1024, "the GDN in_proj_z"),
+    (248_320, 1024, "the lm_head"),
+    (8, 8, "one CTA, one k vector"),
+    (24, 64, "three warps of a CTA"),
+    (1000, 72, "a partial last CTA, 9 k vectors"),
+    (1, 8, "one column"),
+];
+
+/// Shapes the GEMV launcher refuses: `k` zero or off the 8-wide vector, `n` zero, `n` or `k`
+/// above `INT_MAX` (refused before any pointer is touched, so its buffers are small).
+const GEMV_REFUSED: &[(u32, u32)] = &[
+    (1024, 0),
+    (1024, 100),
+    (0, 1024),
+    (2_147_483_648, 1024),
+    (8, 2_147_483_648),
+];
+
+/// Launch the GEMV on the default stream, then wait for it.
+///
+/// # Safety
+///
+/// As [`gemv_bf16_abt`]'s, for the default stream.
+unsafe fn gemv_and_wait(
+    a: &DeviceBuffer,
+    b: &DeviceBuffer,
+    c: &DeviceBuffer,
+    (n, k): (u32, u32),
+) -> Result<(), KernelError> {
+    // SAFETY: the caller's contract.
+    let launched =
+        unsafe { gemv_bf16_abt(a.ptr(), b.ptr(), c.ptr(), (n, k), std::ptr::null_mut()) };
+    c.download().expect("waiting for the launch");
+    launched
+}
+
+/// One GEMV of `(n, k)`: the output under the GEMM bound, its tail untouched, and a repeat
+/// bit-identical. Prints its line; returns whether it passed.
+fn run_gemv(device: &CudaDevice, n: u32, k: u32, what: &str) -> bool {
+    let (nu, ku) = (n as usize, k as usize);
+    let a_bits = bf16_inputs(ku, 0x6E70_0000 ^ u64::from(k));
+    let b_bits = bf16_inputs(nu * ku, 0x6E71_0000 ^ (u64::from(n) << 32) ^ u64::from(k));
+    let a = DeviceBuffer::upload(device, &a_bits).expect("upload a");
+    let b = DeviceBuffer::upload(device, &b_bits).expect("upload B");
+    let run = || {
+        let c = DeviceBuffer::upload(device, &vec![SENTINEL; nu + TAIL]).expect("upload c");
+        // SAFETY: the buffers hold k, n*k and n + TAIL bf16, cudaMalloc pointers are 256-byte
+        // aligned and `c` overlaps neither input.
+        unsafe { gemv_and_wait(&a, &b, &c, (n, k)) }.map(|()| c.download().expect("download c"))
+    };
+    let (first, second) = match (run(), run()) {
+        (Ok(x), Ok(y)) => (x, y),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("gemv_bf16_abt n={n} k={k}: launch failed: {e} FAIL");
+            return false;
+        }
+    };
+    let tail_intact = first[nu..].iter().all(|&x| x == SENTINEL);
+    let cmp = compare(&first[..nu], &a_bits, &b_bits, 1, nu, ku);
+    let repeat = mismatched_bits(&first, &second);
+    let pass = cmp.pass() && tail_intact && repeat == 0;
+    eprintln!(
+        "gemv_bf16_abt n={n} k={k}: {} tail_intact={tail_intact} repeat_mismatched_bits={repeat} \
+         {} ({what})",
+        cmp.line(),
+        if pass { "PASS" } else { "FAIL" }
+    );
+    pass
+}
+
+/// Every decode shape and every grid tail within #761's bound of f64, bit-identical on a repeat.
+#[test]
+fn gemv_bf16_abt_matches_the_cpu_reference() {
+    let device = h100();
+    let failed: Vec<_> = GEMV_SHAPES
+        .iter()
+        .filter(|&&(n, k, what)| !run_gemv(&device, n, k, what))
+        .map(|&(n, k, _)| (n, k))
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "gemv_bf16_abt failed for (n, k) = {failed:?}"
+    );
+}
+
+/// Each refused shape returns `GemvShape`, and the poisoned output is left as it was.
+#[test]
+fn gemv_bf16_abt_refuses_shapes_it_does_not_take() {
+    let device = h100();
+    let mut pass = true;
+    for &(n, k) in GEMV_REFUSED {
+        let len = |count: usize| count.clamp(1, REFUSED_BUFFER);
+        let a = DeviceBuffer::upload(&device, &vec![0; len(k as usize)]).expect("upload a");
+        let b = DeviceBuffer::upload(&device, &vec![0; len(n as usize * k as usize)])
+            .expect("upload B");
+        let c = DeviceBuffer::upload(&device, &vec![SENTINEL; len(n as usize) + TAIL])
+            .expect("upload c");
+        // SAFETY: the launcher refuses each of these shapes before it touches any pointer.
+        let got = unsafe { gemv_and_wait(&a, &b, &c, (n, k)) };
+        let unchanged = (c.download().expect("download c").iter()).all(|&x| x == SENTINEL);
+        let want = Err(KernelError::GemvShape { n, k });
+        let ok = got == want && unchanged;
+        eprintln!(
+            "gemv_bf16_abt n={n} k={k}: {got:?} c_unchanged={unchanged} {}",
+            if ok { "PASS" } else { "FAIL" }
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "a GEMV refusal launched or wrote: see the lines above"
+    );
+}
+
+/// The GEMV against row `r` of the tiled GEMM at `m = 128` over the same vector (the other rows
+/// of `A` other values): two different kernels, so no bit requirement, but their difference is
+/// within the sum of their two bounds, `2·(2⁻⁷·|ref| + 2⁻¹⁴·S)`. The worst ratio and the largest
+/// difference in bf16 ulps are printed.
+#[test]
+fn the_gemv_is_within_two_bounds_of_the_tiled_gemms_row() {
+    let device = h100();
+    let mut pass = true;
+    for (n, k) in [(4096u32, 1024u32), (1024, 3584), (6144, 1024), (2048, 1024)] {
+        let (nu, ku, m) = (n as usize, k as usize, 128usize);
+        let b_bits = bf16_inputs(nu * ku, 0x6E72_0000 ^ u64::from(n));
+        let b = DeviceBuffer::upload(&device, &b_bits).expect("upload B");
+        for r in [0usize, 37, 127] {
+            let row = bf16_inputs(ku, 0x6E73_0000 ^ r as u64 ^ u64::from(k));
+            let mut a_bits = bf16_inputs(m * ku, 0x6E74_0000 ^ r as u64);
+            a_bits[r * ku..][..ku].copy_from_slice(&row);
+            let a = DeviceBuffer::upload(&device, &a_bits).expect("upload A");
+            let x = DeviceBuffer::upload(&device, &row).expect("upload a");
+            let c = DeviceBuffer::upload(&device, &vec![SENTINEL; m * nu]).expect("upload C");
+            let g = DeviceBuffer::upload(&device, &vec![SENTINEL; nu]).expect("upload c");
+            // SAFETY: the buffers hold m*k, n*k, m*n, k and n bf16; cudaMalloc pointers are
+            // 256-byte aligned; neither output overlaps an input; `h100` ran `prepare_all`.
+            unsafe { launch_and_wait(&a, &b, &c, (m as u32, n, k)) }.expect("the tiled GEMM");
+            // SAFETY: as above.
+            unsafe { gemv_and_wait(&x, &b, &g, (n, k)) }.expect("the GEMV");
+            let tiled = c.download().expect("download C")[r * nu..][..nu].to_vec();
+            let gemv = g.download().expect("download c");
+            let refs = reference(&widen(&row), &widen(&b_bits), 1, nu, ku);
+            let (mut worst, mut ulps, mut bad) = (0.0f64, 0u16, 0usize);
+            for ((&t, &v), &(re, s)) in tiled.iter().zip(&gemv).zip(&refs) {
+                let (tf, vf) = (
+                    f64::from(half::bf16::from_bits(t).to_f32()),
+                    f64::from(half::bf16::from_bits(v).to_f32()),
+                );
+                let bound = 2.0 * (re.abs() / 128.0 + s / 16384.0);
+                let diff = (tf - vf).abs();
+                bad += usize::from(!(tf.is_finite() && vf.is_finite() && diff <= bound));
+                worst = worst.max(diff / bound.max(f64::MIN_POSITIVE));
+                ulps = ulps.max(t.abs_diff(v));
+            }
+            let ok = bad == 0;
+            eprintln!(
+                "gemv vs gemm_bf16_abt row {r} of m=128, n={n} k={k}: out_of_bound={bad} \
+                 worst_ratio={worst:.4} max_ulps={ulps} {}",
+                if ok { "PASS" } else { "FAIL" }
+            );
+            pass &= ok;
+        }
+    }
+    assert!(
+        pass,
+        "the GEMV is outside two bounds of the tiled GEMM's row"
+    );
+}
+
+/// The narrow GEMM at `m = 1` is bit-identical to the same row at `m = 128`: the decode's GDN
+/// `a` and `b` projections stay on the narrow GEMM, and its bits for a row do not depend on the
+/// rows around it.
+#[test]
+fn the_narrow_gemm_at_one_row_is_its_row_at_128() {
+    let device = h100();
+    let mut pass = true;
+    for (n, k) in [(16u32, 1024u32), (32, 4096), (64, 1024)] {
+        let (nu, ku, m) = (n as usize, k as usize, 128usize);
+        let b = DeviceBuffer::upload(&device, &bf16_inputs(nu * ku, 0x6E75_0000 ^ u64::from(n)))
+            .expect("upload B");
+        let a_bits = bf16_inputs(m * ku, 0x6E76_0000 ^ u64::from(k));
+        let a = DeviceBuffer::upload(&device, &a_bits).expect("upload A");
+        let c = DeviceBuffer::upload(&device, &vec![SENTINEL; m * nu]).expect("upload C");
+        // SAFETY: the buffers hold m*k, n*k and m*n bf16; cudaMalloc pointers are 256-byte
+        // aligned and `c` overlaps neither input.
+        unsafe { narrow_and_wait(&a, &b, &c, (m as u32, n, k)) }.expect("m = 128");
+        let all = c.download().expect("download C");
+        for r in [0usize, 37, 127] {
+            let x = DeviceBuffer::upload(&device, &a_bits[r * ku..][..ku]).expect("upload a");
+            let one = DeviceBuffer::upload(&device, &vec![SENTINEL; nu]).expect("upload c");
+            // SAFETY: as above, at one row.
+            unsafe { narrow_and_wait(&x, &b, &one, (1, n, k)) }.expect("m = 1");
+            let mismatched =
+                mismatched_bits(&one.download().expect("download c"), &all[r * nu..][..nu]);
+            let ok = mismatched == 0;
+            eprintln!(
+                "gemm_narrow_bf16_abt m=1 vs row {r} of m=128, n={n} k={k}: \
+                 mismatched_bits={mismatched}/{nu} {}",
+                if ok { "PASS" } else { "FAIL" }
+            );
+            pass &= ok;
+        }
+    }
+    assert!(
+        pass,
+        "the narrow GEMM's one-row output differs from its row at m = 128"
     );
 }

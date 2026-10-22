@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-//! One whole-model prefill forward of qwen3.5-0.8b's emitted CUDA tapes on the H100.
+//! Whole-model prefill and decode forwards of qwen3.5-0.8b's emitted CUDA tapes on the H100.
 //!
 //! The tapes are `CUDA_TAPES`, exactly as `#[forward]` emitted them; the weights are synthetic,
 //! each buffer sized from the tapes' `weight_bytes` and filled by what reads it: a GEMM's `[N, K]`
 //! matrix uniform in ±1/√K, a norm's zero-centred gain in ±0.1, a GDN layer's packed f32 bundle
-//! in the ranges the GDN kernel tests use, the embedding table's rows uniform in ±1 (which the
+//! in the ranges the GDN kernel tests use, the embedding table's rows uniform in ±1/32 (which the
 //! tied lm_head reads too, a `[vocab, hidden]` matrix, so it is filled as a matrix of `k =
-//! hidden`). The input is token ids, uniform over the vocabulary and seeded; padding rows are id
-//! 0. Checks:
+//! hidden`: ±1/√1024). The input is token ids, uniform over the vocabulary and seeded; padding
+//! rows are id 0. Checks:
 //!
-//! - (a) the worker takes all four tapes, and its arena is the largest tape's;
+//! - (a) the worker takes every tape, and its arena is the largest tape's;
 //! - (b) a fresh 300-token forward in the m=512 bucket gives finite logits on every real row;
 //! - (c) the lm_head GEMM, read back from the arena, against an f64 reference on six rows over
 //!   every column, under the GEMM bound of `numerics.rs`;
@@ -25,7 +25,24 @@
 //! - (g) a KV sequence and a GDN sequence that disagree on fresh are refused before any copy;
 //! - (h) the worker allocates the weights, the arena and the two pools, and a forward nothing;
 //! - (i) a token id outside the vocabulary, a count other than the bucket's and hidden rows are
-//!   refused before any copy.
+//!   refused before any copy;
+//! - (j) the worker takes all five tapes (the m=1 decode tape among them), its arena the largest's,
+//!   266 + 3 allocations at setup and none across one prefill and 8 decodes;
+//! - (k) 300 tokens prefilled, then a chain of decodes of positions 300..307, each against the same
+//!   row of one 308-token forward: finite, and the same greedy token (argmax) unless that one-shot
+//!   row is a near-tie (top-1 − top-2 ≤ 2 × the step's max |difference|); the near-tie count,
+//!   cosine, max |difference| and relative L2 printed, not asserted (on these near-flat synthetic
+//!   logits most steps are near-ties, so this is a smoke check; P7 is the chain-token check that
+//!   carries weight); the last decode's lm_head GEMV within the GEMM bound of f64 over every
+//!   column;
+//!   (k, teacher-forced) each decode one step off the one-shot trajectory (300 + i prefilled fresh,
+//!   then one decode at 300 + i) at cosine ≥ 0.999; (k-diag) prints, per decode, every KV layer's
+//!   K/V and every GDN layer's state against the one-shot's, for the chain and teacher-forced;
+//! - (l) the prefill and 8 decodes repeated in disjoint blocks and slot are bit-identical;
+//! - (m) the 8 decodes leave the cache at positions 0..300 bit-unchanged;
+//! - (n) decodes at P = 319 and P = 320 (a new block) are finite and at cosine ≥ 0.999;
+//! - (o) at m=1, a wrong position, a short block table, fresh at P > 0 and q_len = 2 are refused
+//!   before any copy.
 //!
 //! Built only under `nvcc` (`required-features`), and needs an sm_90 GPU: no GPU fails rather
 //! than skips. Every check prints its line before a test fails, so one run reports every number.
@@ -40,7 +57,7 @@ use half::bf16;
 use numerics::{bf16_inputs, compare, f32_inputs, f32_to_halves};
 use scratchy_models::qwen3_5::qwen3_5_0_8b::CUDA_TAPES;
 use scratchy_target_cuda::runtime::{
-    CudaDevice, CudaWorker, DeviceBuffer, ForwardError, GdnPoolConfig, GdnSequence, Input,
+    CudaDevice, CudaWorker, DeviceBuffer, ForwardError, GdnPoolConfig, GdnSequence, Input, KvHalf,
     KvPoolConfig, KvSequence,
 };
 use scratchy_target_cuda::step::{
@@ -102,7 +119,8 @@ fn roles() -> Vec<Option<Role>> {
                     set(table.0, Role::Matrix { k: hidden })
                 }
                 CudaStep::Gemm(GemmBf16 { b, k, .. })
-                | CudaStep::GemmNarrow(GemmBf16 { b, k, .. }) => set(b.0, Role::Matrix { k }),
+                | CudaStep::GemmNarrow(GemmBf16 { b, k, .. })
+                | CudaStep::Gemv(GemmBf16 { b, k, .. }) => set(b.0, Role::Matrix { k }),
                 CudaStep::RmsNorm(n) => set(n.gain.0, Role::Gain),
                 CudaStep::GatedDeltaNet(GatedDeltaNetBf16 {
                     bundle,
@@ -568,16 +586,13 @@ fn h_the_worker_allocates_once() {
     let after_worker = r.device.allocations();
     let weights = after_weights - r.before_weights;
     let worker_allocs = after_worker - after_weights;
-    let nonzero = (0..CUDA_TAPES[0].weight_bytes.len())
-        .filter(|&ix| CUDA_TAPES.iter().any(|t| t.weight_bytes[ix] > 0))
-        .count() as u64;
     for _ in 0..5 {
         let _ = fresh_300(&mut worker, SEAT_A);
     }
     let forwards = r.device.allocations() - after_worker;
-    let ok = weights == nonzero && worker_allocs == 3 && forwards == 0;
+    let ok = weights == 266 && worker_allocs == 3 && forwards == 0;
     eprintln!(
-        "(h) allocations: weights={weights} (expect {nonzero}) worker={worker_allocs} (expect 3: \
+        "(h) allocations: weights={weights} (expect 266) worker={worker_allocs} (expect 3: \
          arena, KV pool, GDN pool) after five forwards={forwards} (expect 0) {}",
         verdict(ok)
     );
@@ -653,4 +668,622 @@ fn i_token_ids_are_checked_before_any_copy() {
         pass &= ok;
     }
     assert!(pass, "a bad token-id input was not refused before any copy");
+}
+
+// ── Decode: one token at a time through the m=1 tape ───────────────
+
+/// The decodes (k) through (n) run after their prefill.
+const DECODES: u32 = 8;
+
+/// The cosine of two bf16 rows, in f64.
+fn cosine(a: &[u16], b: &[u16]) -> f64 {
+    let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+    for (&x, &y) in a.iter().zip(b) {
+        let (x, y) = (
+            f64::from(bf16::from_bits(x).to_f32()),
+            f64::from(bf16::from_bits(y).to_f32()),
+        );
+        ab += x * y;
+        aa += x * x;
+        bb += y * y;
+    }
+    ab / (aa.sqrt() * bb.sqrt())
+}
+
+/// The largest |a − b| over two bf16 rows, as f32.
+fn max_diff(a: &[u16], b: &[u16]) -> f32 {
+    (a.iter().zip(b))
+        .map(|(&x, &y)| (bf16::from_bits(x).to_f32() - bf16::from_bits(y).to_f32()).abs())
+        .fold(0f32, f32::max)
+}
+
+fn all_finite(row: &[u16]) -> bool {
+    row.iter().all(|&b| bf16::from_bits(b).to_f32().is_finite())
+}
+
+/// A fresh `prefill`-token forward in the m=512 bucket, then one decode per token of `decodes`
+/// (one row, the m=1 tape) at positions `prefill, prefill + 1, …`, in `seat`: each decode's
+/// logits, `[VOCAB]`.
+fn prefill_then_decode(
+    worker: &mut CudaWorker<'_>,
+    (prefill, decodes): (&[u32], &[u32]),
+    seat: Seat,
+) -> Vec<Vec<u16>> {
+    forward(worker, 512, prefill, 0, seat).expect("the prefill");
+    (decodes.iter().enumerate())
+        .map(|(i, &token)| {
+            let p = (prefill.len() + i) as u32;
+            forward(worker, 1, &[token], p, seat).unwrap_or_else(|e| panic!("decode at {p}: {e}"))
+        })
+        .collect()
+}
+
+/// Every KV layer's K and V of `seat`'s first `tokens` positions, read back from the pool:
+/// per layer and half, `[tokens, kv_heads · head_dim]` bf16.
+fn cached_rows(worker: &mut CudaWorker<'_>, seat: Seat, tokens: usize) -> Vec<Vec<u16>> {
+    let kv = CUDA_TAPES[bucket(1)].kv.expect("a KV cache");
+    let (heads, bs, hd) = (
+        kv.kv_heads as usize,
+        kv.block_size as usize,
+        kv.head_dim as usize,
+    );
+    let mut out = Vec::new();
+    for layer in 0..kv.layers.len() {
+        for half in [KvHalf::K, KvHalf::V] {
+            let blocks: Vec<Vec<u16>> = (seat.blocks[..tokens.div_ceil(bs)].iter())
+                .map(|&b| {
+                    let mut block = vec![0u16; heads * bs * hd];
+                    worker.read_kv(layer, half, b, &mut block).expect("read_kv");
+                    block
+                })
+                .collect();
+            let mut rows = Vec::with_capacity(tokens * heads * hd);
+            for t in 0..tokens {
+                for h in 0..heads {
+                    rows.extend_from_slice(&blocks[t / bs][(h * bs + t % bs) * hd..][..hd]);
+                }
+            }
+            out.push(rows);
+        }
+    }
+    out
+}
+
+/// (j): the worker takes all five tapes (the m=1 decode tape among them) in the arena of the
+/// largest; the weights, the arena and the two pools are the setup's 266 + 3 allocations, and one
+/// prefill and eight decodes allocate nothing.
+#[test]
+fn j_the_decode_tape_allocates_nothing() {
+    let r = rig();
+    let after_weights = r.device.allocations();
+    let mut worker = r.worker();
+    let after_worker = r.device.allocations();
+    let (weights, setup) = (
+        after_weights - r.before_weights,
+        after_worker - after_weights,
+    );
+    let ms: Vec<u32> = CUDA_TAPES.iter().map(|t| t.bucket_m).collect();
+    let arena = worker.arena_bytes();
+    let rows = sequence_rows((Q + DECODES) as usize);
+    let (prefill, decodes) = rows.split_at(Q as usize);
+    let _ = prefill_then_decode(&mut worker, (prefill, decodes), SEAT_A);
+    let during = r.device.allocations() - after_worker;
+    let ok = ms == [1, 512, 1024, 2048, 4096]
+        && arena == 2_585_035_776
+        && weights == 266
+        && setup == 3
+        && during == 0;
+    eprintln!(
+        "(j) tapes {ms:?} arena_bytes={arena} (expect 2585035776) allocations weights={weights} \
+         (expect 266) worker={setup} (expect 3) across one prefill and {DECODES} decodes={during} \
+         (expect 0) {}",
+        verdict(ok)
+    );
+    assert!(
+        ok,
+        "the decode worker's tapes, arena or allocations are wrong"
+    );
+}
+
+/// The index of `row`'s largest value (the lowest on a tie) and its margin over the second
+/// largest, as f32.
+fn top1_margin(row: &[u16]) -> (usize, f32) {
+    let v = |i: usize| bf16::from_bits(row[i]).to_f32();
+    let (mut first, mut second) = (0usize, None::<usize>);
+    for i in 1..row.len() {
+        if v(i) > v(first) {
+            second = Some(first);
+            first = i;
+        } else if second.is_none_or(|s| v(i) > v(s)) {
+            second = Some(i);
+        }
+    }
+    (first, second.map_or(f32::INFINITY, |s| v(first) - v(s)))
+}
+
+/// (k): 300 fresh tokens prefilled in m=512, then a chain of decodes of positions 300..307 one at a
+/// time, each against row 300 + i of one 308-token m=512 forward in disjoint blocks and slot. Per
+/// step: every logit finite, and the decode's greedy token (argmax) the one-shot row's, unless
+/// that one-shot row is a near-tie, its top-1 − top-2 margin at most twice the step's max
+/// |difference| (#816's P3 rule, with the step's own difference as the noise). The near-tie count,
+/// cosine, max |difference| and relative L2 are printed for information and not asserted. And the
+/// last decode's lm_head GEMV, read back from the arena, within #761's bound of f64 over every
+/// column.
+///
+/// Why tokens and not a cosine floor per step (the user's choice, option 1 on #830): the decode
+/// and the one-shot prefill run different kernels with different rounding (the GEMV and the
+/// decode attention against the tiled GEMM and the prefill attention), and each decode of the
+/// chain reads the K/V and GDN state earlier decodes wrote, so the difference compounds. The
+/// H100 diagnostic at cc1177dc (`k_diag_decode_drift_against_one_shot`) measured it: the chain's
+/// cosine fell 0.99963 → 0.99794 over the 8 steps, its K/V and GDN state differences growing every
+/// step with the deepest layers worst and no single-step jump, while every teacher-forced step
+/// stayed ≥ 0.99935. Per-step accuracy is held by
+/// `k_teacher_forced_decodes_agree_with_one_shot_rows`.
+///
+/// This token check is a smoke check: it catches a decode that picks another token where the
+/// choice is clear. On these synthetic random weights the one-shot logits are nearly flat, so most
+/// steps are near-ties. At cf3c7f8a the H100 measured one-shot top-1 margins of 0.016–0.55 (mostly
+/// ≤ 0.11) against chained differences of 0.07–0.19 (max |difference|): 7 of the 8 steps were
+/// near-ties, and the two steps whose tokens differed (303 and 307) were both near-ties. A cap of
+/// one near-tie, which that run had, cannot hold at this scale, so the coordinator removed it
+/// after that run. The end-to-end chain-token check that carries weight is P7 in
+/// `cuda_hf_parity`, on the real checkpoint: a prefill and 7 decodes give HF-f32's 8 greedy
+/// tokens on all 5 prompts.
+#[test]
+fn k_chained_decodes_pick_the_one_shot_tokens() {
+    let r = rig();
+    let mut worker = r.worker();
+    let rows = sequence_rows((Q + DECODES) as usize);
+    let (prefill, decodes) = rows.split_at(Q as usize);
+    let decoded = prefill_then_decode(&mut worker, (prefill, decodes), SEAT_A);
+    // The last decode's lm_head: its `a` is the final norm's one row, still in the arena.
+    let tape = &CUDA_TAPES[bucket(1)];
+    let Some(CudaStep::Gemv(GemmBf16 { a, b, c, m, n, k })) = tape.steps.last().copied() else {
+        panic!("the m=1 tape does not end with a Gemv");
+    };
+    assert_eq!((m, n, k), (1, VOCAB as u32, HIDDEN as u32), "the lm_head");
+    assert_eq!(c, tape.result.offset, "the lm_head writes the result");
+    let mut normed = vec![0u16; HIDDEN];
+    worker
+        .read_arena(
+            ArenaSpan {
+                offset: a,
+                bytes: (HIDDEN * 2) as u64,
+            },
+            &mut normed,
+        )
+        .expect("read the final norm's row");
+    let w = host_weights()[b.0 as usize]
+        .as_ref()
+        .expect("the lm_head's weight");
+    let last = decoded.last().expect("eight decodes");
+    let cmp = compare(last, &normed, w, 1, VOCAB, HIDDEN);
+    let mut pass = cmp.pass();
+    eprintln!(
+        "(k) the last decode's lm_head GEMV over {VOCAB} columns: {} {}",
+        cmp.line(),
+        verdict(cmp.pass())
+    );
+    let one_shot = forward(&mut worker, 512, &rows, 0, SEAT_B).expect("308 tokens in one forward");
+    let mut near_ties = 0usize;
+    for (i, row) in decoded.iter().enumerate() {
+        let at = Q as usize + i;
+        let want = &one_shot[at * VOCAB..][..VOCAB];
+        let (cos, diff, finite) = (cosine(row, want), max_diff(row, want), all_finite(row));
+        let rel = rel_bf16(row, want).0;
+        let (got_token, _) = top1_margin(row);
+        let (want_token, margin) = top1_margin(want);
+        let tie = margin <= 2.0 * diff;
+        let same = got_token == want_token;
+        near_ties += usize::from(tie);
+        let ok = finite && (same || tie);
+        eprintln!(
+            "(k) chained decode at position {at} against row {at} of one 308-token forward: \
+             finite={finite} token={got_token} one-shot token={want_token} same={same} \
+             one-shot margin={margin:e} (near-tie when <= 2 x max|diff| = {:e}: {tie}) \
+             cosine={cos:.6} max|diff|={diff:e} rel L2={rel:.3e} (printed, not asserted) {}",
+            2.0 * diff,
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    eprintln!(
+        "(k) near-tie steps {near_ties} of {DECODES} (printed, not asserted: a near-tie's token \
+         may differ)"
+    );
+    assert!(
+        pass,
+        "a chained decode gave a non-finite logit, or picked another token than the one-shot row \
+         where that row is not a near-tie: see the lines above"
+    );
+}
+
+/// (k), teacher-forced: for each of the 8 positions 300 + i, a fresh prefill of 300 + i tokens,
+/// then one decode at 300 + i, against row 300 + i of one 308-token forward in disjoint blocks and
+/// slot. Each decode is one step off the one-shot trajectory, so the difference is one step's (the
+/// GEMV and the decode attention against the tiled GEMM and the prefill attention): every logit
+/// finite and cosine ≥ 0.999 at every step, the max |difference| printed. (k)'s chain compounds
+/// those steps through the cache and GDN state; this isolates one.
+#[test]
+fn k_teacher_forced_decodes_agree_with_one_shot_rows() {
+    let r = rig();
+    let mut worker = r.worker();
+    let rows = sequence_rows((Q + DECODES) as usize);
+    let one_shot = forward(&mut worker, 512, &rows, 0, SEAT_B).expect("308 tokens in one forward");
+    let mut pass = true;
+    for i in 0..DECODES as usize {
+        let p = Q as usize + i;
+        forward(&mut worker, 512, &rows[..p], 0, SEAT_A).expect("the prefill");
+        let row = forward(&mut worker, 1, &[rows[p]], p as u32, SEAT_A).expect("the decode");
+        let want = &one_shot[p * VOCAB..][..VOCAB];
+        let (cos, diff, finite) = (cosine(&row, want), max_diff(&row, want), all_finite(&row));
+        let ok = finite && cos >= 0.999;
+        eprintln!(
+            "(k teacher-forced) {p} tokens prefilled, decode at {p}, against row {p} of one \
+             308-token forward: finite={finite} cosine={cos:.6} (need >= 0.999) \
+             max|diff|={diff:e} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "a teacher-forced decode is out of agreement with the one-shot row: see the lines above"
+    );
+}
+
+/// (l): the prefill and eight decodes, repeated in disjoint KV blocks and GDN slot, give the same
+/// eight rows of logits, bit for bit.
+#[test]
+fn l_repeated_decodes_are_bit_identical() {
+    let r = rig();
+    let mut worker = r.worker();
+    let rows = sequence_rows((Q + DECODES) as usize);
+    let (prefill, decodes) = rows.split_at(Q as usize);
+    let first = prefill_then_decode(&mut worker, (prefill, decodes), SEAT_A);
+    let again = prefill_then_decode(&mut worker, (prefill, decodes), SEAT_B);
+    let ok = bit_identical(
+        "(l) a prefill and 8 decodes repeated in disjoint blocks and slot",
+        &first.concat(),
+        &again.concat(),
+    );
+    assert!(ok, "repeated decodes differ");
+}
+
+/// (m): the eight decodes leave every cache row at positions 0..300, K and V of every KV layer,
+/// bit-unchanged.
+#[test]
+fn m_decodes_leave_the_prefix_cache_unchanged() {
+    let r = rig();
+    let mut worker = r.worker();
+    let rows = sequence_rows((Q + DECODES) as usize);
+    let (prefill, decodes) = rows.split_at(Q as usize);
+    forward(&mut worker, 512, prefill, 0, SEAT_A).expect("the prefill");
+    let before = cached_rows(&mut worker, SEAT_A, Q as usize);
+    for (i, &token) in decodes.iter().enumerate() {
+        let p = Q + i as u32;
+        forward(&mut worker, 1, &[token], p, SEAT_A).unwrap_or_else(|e| panic!("decode {p}: {e}"));
+    }
+    let after = cached_rows(&mut worker, SEAT_A, Q as usize);
+    let changed: usize = (before.iter().zip(&after))
+        .map(|(a, b)| a.iter().zip(b).filter(|(x, y)| x != y).count())
+        .sum();
+    let ok = changed == 0;
+    eprintln!(
+        "(m) the cache at positions 0..{Q} (K and V of {} layers) after {DECODES} decodes: \
+         changed elements={changed} {}",
+        before.len() / 2,
+        verdict(ok)
+    );
+    assert!(ok, "a decode wrote over the prefix's cache");
+}
+
+/// (n): a decode at P = 319 (kv_len 320, the last slot of block 4) and at P = 320 (kv_len 321, the
+/// first slot of a new block), each finite and at cosine ≥ 0.999 to the same row of one
+/// 321-token forward in disjoint blocks and slot.
+#[test]
+fn n_decodes_at_a_block_boundary() {
+    let r = rig();
+    let mut worker = r.worker();
+    let rows = sequence_rows(321);
+    let decoded = prefill_then_decode(&mut worker, (&rows[..319], &rows[319..]), SEAT_A);
+    let one_shot = forward(&mut worker, 512, &rows, 0, SEAT_B).expect("321 tokens in one forward");
+    let mut pass = true;
+    for (i, row) in decoded.iter().enumerate() {
+        let at = 319 + i;
+        let want = &one_shot[at * VOCAB..][..VOCAB];
+        let (cos, diff, finite) = (cosine(row, want), max_diff(row, want), all_finite(row));
+        let ok = finite && cos >= 0.999;
+        eprintln!(
+            "(n) decode at P={at} (kv_len {}) against row {at} of one 321-token forward: \
+             finite={finite} cosine={cos:.6} (need >= 0.999) max|diff|={diff:e} {}",
+            at + 1,
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(pass, "a decode at the block boundary is out of agreement");
+}
+
+/// (o): at m=1, a position other than `prefix_len`, a block table too short for `P + 1`, a GDN
+/// sequence called fresh at `P > 0`, and `q_len = 2` are each refused before any copy, the
+/// result untouched.
+#[test]
+fn o_a_bad_decode_is_refused_before_any_copy() {
+    let r = rig();
+    let mut worker = r.worker();
+    let b = bucket(1);
+    let blocks = SEAT_A.blocks;
+    let p = 64u32;
+    let kv = |block_table, q_len| KvSequence {
+        block_table,
+        prefix_len: p,
+        q_len,
+    };
+    let gdn = |fresh, q_len| GdnSequence {
+        slot: SEAT_A.slot,
+        q_len,
+        fresh,
+    };
+    let cases: [(&str, KvSequence<'_>, GdnSequence, u32, ForwardError); 4] = [
+        (
+            "position P + 1",
+            kv(blocks, 1),
+            gdn(false, 1),
+            p + 1,
+            ForwardError::PositionsDisagree {
+                row: 0,
+                got: p + 1,
+                want: u64::from(p),
+            },
+        ),
+        (
+            "a one-block table for 65 tokens",
+            kv(&blocks[..1], 1),
+            gdn(false, 1),
+            p,
+            ForwardError::KvBlockTable {
+                got: 1,
+                need: 2,
+                max: 128,
+            },
+        ),
+        (
+            "fresh at P = 64",
+            kv(blocks, 1),
+            gdn(true, 1),
+            p,
+            ForwardError::FreshDisagrees {
+                prefix_len: p,
+                fresh: true,
+            },
+        ),
+        (
+            "q_len = 2",
+            kv(blocks, 2),
+            gdn(false, 2),
+            p,
+            ForwardError::KvQueryLength {
+                q_len: 2,
+                bucket_m: 1,
+            },
+        ),
+    ];
+    let mut pass = true;
+    for (what, kv, gdn, position, want) in cases {
+        let mut out = vec![0u16; VOCAB];
+        let got = worker.forward(
+            b,
+            Input::TokenIds(&[7]),
+            &[position],
+            Some(&kv),
+            Some(&gdn),
+            &mut out,
+        );
+        let untouched = out.iter().all(|&x| x == 0);
+        let ok = got == Err(want.clone()) && untouched;
+        eprintln!(
+            "(o) m=1 {what}: {got:?} result_untouched={untouched} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(pass, "a bad decode was not refused before any copy");
+}
+
+// ── (k) diagnostic: where the decode chain leaves the one-shot trajectory ──
+
+/// Layer `layer`'s K and V of position `pos` in `seat`'s blocks: `[kv_heads · head_dim]` bf16
+/// each, for every KV layer.
+fn kv_at(worker: &mut CudaWorker<'_>, seat: Seat, pos: usize) -> Vec<[Vec<u16>; 2]> {
+    let kv = CUDA_TAPES[bucket(1)].kv.expect("a KV cache");
+    let (heads, bs, hd) = (
+        kv.kv_heads as usize,
+        kv.block_size as usize,
+        kv.head_dim as usize,
+    );
+    let block = seat.blocks[pos / bs];
+    (0..kv.layers.len())
+        .map(|layer| {
+            [KvHalf::K, KvHalf::V].map(|half| {
+                let mut b = vec![0u16; heads * bs * hd];
+                worker.read_kv(layer, half, block, &mut b).expect("read_kv");
+                (0..heads)
+                    .flat_map(|h| b[(h * bs + pos % bs) * hd..][..hd].to_vec())
+                    .collect()
+            })
+        })
+        .collect()
+}
+
+/// Every GDN layer's conv ring and recurrent state in `slot`: `[conv, ssm]` f32 each.
+fn gdn_at(worker: &mut CudaWorker<'_>, slot: u32) -> Vec<[Vec<f32>; 2]> {
+    let g = CUDA_TAPES[bucket(1)].gdn.expect("GDN layers");
+    let conv_dim = gdn_conv_dim(g.num_k_heads, g.head_k, g.num_v_heads, g.head_v).expect("fits");
+    let conv = conv_dim as usize * (g.conv_kernel as usize - 1);
+    let ssm = (g.num_v_heads * g.head_v * g.head_k) as usize;
+    (0..g.layers.len())
+        .map(|layer| {
+            let (mut c, mut s) = (vec![0f32; conv], vec![0f32; ssm]);
+            worker
+                .read_gdn_state(layer, slot, &mut c, &mut s)
+                .expect("read_gdn_state");
+            [c, s]
+        })
+        .collect()
+}
+
+/// `‖a − b‖₂ / ‖b‖₂` and `max |a − b|`, in f64; infinite when either holds a non-finite value.
+fn rel(a: impl Iterator<Item = f64> + Clone, b: impl Iterator<Item = f64> + Clone) -> (f64, f64) {
+    let (mut d2, mut b2, mut max) = (0f64, 0f64, 0f64);
+    for (x, y) in a.zip(b) {
+        if !(x.is_finite() && y.is_finite()) {
+            return (f64::INFINITY, f64::INFINITY);
+        }
+        d2 += (x - y) * (x - y);
+        b2 += y * y;
+        max = max.max((x - y).abs());
+    }
+    ((d2 / b2.max(f64::MIN_POSITIVE)).sqrt(), max)
+}
+
+fn rel_bf16(a: &[u16], b: &[u16]) -> (f64, f64) {
+    let w = |v: &[u16]| {
+        v.iter()
+            .map(|&x| f64::from(bf16::from_bits(x).to_f32()))
+            .collect::<Vec<_>>()
+    };
+    let (a, b) = (w(a), w(b));
+    rel(a.iter().copied(), b.iter().copied())
+}
+
+fn rel_f32(a: &[f32], b: &[f32]) -> (f64, f64) {
+    rel(
+        a.iter().map(|&x| f64::from(x)),
+        b.iter().map(|&x| f64::from(x)),
+    )
+}
+
+/// One trajectory's state after a decode at one position: every KV layer's `[K, V]` at that
+/// position, every GDN layer's `[conv ring, recurrent state]`, and the logits.
+struct Snapshot {
+    kv: Vec<[Vec<u16>; 2]>,
+    gdn: Vec<[Vec<f32>; 2]>,
+    logits: Vec<u16>,
+}
+
+fn snapshot(worker: &mut CudaWorker<'_>, seat: Seat, pos: usize, logits: Vec<u16>) -> Snapshot {
+    Snapshot {
+        kv: kv_at(worker, seat, pos),
+        gdn: gdn_at(worker, seat.slot),
+        logits,
+    }
+}
+
+/// One trajectory's difference from the one-shot's at one step: per KV layer K and V at the
+/// step's position, per GDN layer the conv ring and the recurrent state, as relative L2 `‖Δ‖/‖ref‖`
+/// (the largest, and its layer, printed with every layer's), and the logits' cosine and max
+/// |difference|.
+fn report(what: &str, step: usize, got: &Snapshot, want: &Snapshot) -> f64 {
+    let line = |kind: &str, v: Vec<(f64, f64)>| {
+        let (worst, at) = (v.iter().enumerate())
+            .map(|(i, &(r, _))| (r, i))
+            .fold((0f64, 0usize), |a, b| if b.0 > a.0 { b } else { a });
+        let all: Vec<String> = v.iter().map(|(r, _)| format!("{r:.1e}")).collect();
+        eprintln!(
+            "(k-diag) {what} step {step} {kind}: worst rel L2 {worst:.3e} at layer index {at}, \
+             per layer [{}]",
+            all.join(" ")
+        );
+    };
+    for (half, name) in [(0, "K"), (1, "V")] {
+        line(
+            name,
+            (got.kv.iter().zip(&want.kv))
+                .map(|(g, w)| rel_bf16(&g[half], &w[half]))
+                .collect(),
+        );
+    }
+    for (part, name) in [(0, "GDN conv ring"), (1, "GDN recurrent state")] {
+        line(
+            name,
+            (got.gdn.iter().zip(&want.gdn))
+                .map(|(g, w)| rel_f32(&g[part], &w[part]))
+                .collect(),
+        );
+    }
+    let (g, w) = (&got.logits, &want.logits);
+    let cos = cosine(g, w);
+    eprintln!(
+        "(k-diag) {what} step {step} logits: cosine={cos:.6} max|diff|={:e} rel L2 {:.3e}",
+        max_diff(g, w),
+        rel_bf16(g, w).0
+    );
+    cos
+}
+
+/// (k)'s diagnostic. The chain (300 prefilled, then decodes at 300..307, each reading the K/V and
+/// GDN state earlier decodes wrote) and a teacher-forced variant (for each i, 300 + i tokens
+/// prefilled fresh, then one decode at 300 + i: one step off the one-shot trajectory), each
+/// compared after its decode at 300 + i with a fresh one-shot forward of 301 + i tokens (in
+/// disjoint blocks and slot): the K and V the decode wrote at 300 + i in every KV layer, every
+/// GDN layer's conv ring and recurrent state, and the logits. The one-shot of 301 + i tokens is
+/// checked bit-identical, on its last row, to row 300 + i of one 308-token forward, so it is the
+/// one-shot trajectory (k) compares against. Asserted: every value finite, the references
+/// bit-identical, and every teacher-forced decode's logits at cosine ≥ 0.999 (one step's
+/// difference, which is (k)'s criterion for one step); the chain's numbers are printed.
+#[test]
+fn k_diag_decode_drift_against_one_shot() {
+    let r = rig();
+    let mut worker = r.worker();
+    let rows = sequence_rows((Q + DECODES) as usize);
+    let one_shot = forward(&mut worker, 512, &rows, 0, SEAT_B).expect("308 tokens in one forward");
+    let reference = |worker: &mut CudaWorker<'_>, i: usize| {
+        let n = Q as usize + i + 1;
+        let out = forward(worker, 512, &rows[..n], 0, SEAT_B).expect("the one-shot reference");
+        let last = out[(n - 1) * VOCAB..][..VOCAB].to_vec();
+        snapshot(worker, SEAT_B, n - 1, last)
+    };
+    let mut pass = true;
+    let mut refs_identical = true;
+    // The chain.
+    forward(&mut worker, 512, &rows[..Q as usize], 0, SEAT_A).expect("the prefill");
+    let mut chain_cos = Vec::new();
+    for i in 0..DECODES as usize {
+        let p = Q as usize + i;
+        let logits = forward(&mut worker, 1, &[rows[p]], p as u32, SEAT_A).expect("a decode");
+        pass &= all_finite(&logits);
+        let got = snapshot(&mut worker, SEAT_A, p, logits);
+        let want = reference(&mut worker, i);
+        refs_identical &= want.logits[..] == one_shot[p * VOCAB..][..VOCAB];
+        chain_cos.push(report("chain", i, &got, &want));
+    }
+    // Teacher-forced: each decode one step off the one-shot trajectory.
+    let mut forced_cos = Vec::new();
+    for i in 0..DECODES as usize {
+        let p = Q as usize + i;
+        forward(&mut worker, 512, &rows[..p], 0, SEAT_A).expect("the teacher-forced prefill");
+        let logits = forward(&mut worker, 1, &[rows[p]], p as u32, SEAT_A).expect("a decode");
+        pass &= all_finite(&logits);
+        let got = snapshot(&mut worker, SEAT_A, p, logits);
+        let want = reference(&mut worker, i);
+        refs_identical &= want.logits[..] == one_shot[p * VOCAB..][..VOCAB];
+        forced_cos.push(report("teacher-forced", i, &got, &want));
+    }
+    let forced_ok = forced_cos.iter().all(|&c| c >= 0.999);
+    eprintln!(
+        "(k-diag) logits cosine per step: chain {chain_cos:.6?} teacher-forced {forced_cos:.6?}; \
+         references bit-identical to the 308-token forward's rows={refs_identical} \
+         teacher-forced all >= 0.999={forced_ok} {}",
+        verdict(pass && refs_identical && forced_ok)
+    );
+    assert!(
+        refs_identical,
+        "a one-shot reference differs from the 308-token forward's row"
+    );
+    assert!(pass, "a decode gave a non-finite logit");
+    assert!(
+        forced_ok,
+        "a teacher-forced decode is below cosine 0.999: one step is wrong"
+    );
 }

@@ -131,6 +131,29 @@ unsafe extern "C" {
         k: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gemv_bf16_abt(
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        n: u32,
+        k: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_attn_decode_bf16(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        block_table: *const c_void,
+        sequence: *const c_void,
+        out: *mut c_void,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gdn_conv1d(
         x: *const c_void,
         w: *const c_void,
@@ -226,6 +249,16 @@ pub enum KernelError {
     },
     /// The narrow GEMM does not take this shape; nothing was launched.
     NarrowShape { m: u32, n: u32, k: u32 },
+    /// The GEMV does not take this shape; nothing was launched.
+    GemvShape { n: u32, k: u32 },
+    /// The decode attention does not take this shape or scale; nothing was launched.
+    AttnDecodeShape {
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
+    },
     /// The GDN conv1d does not take this shape or state stride; nothing was launched.
     GdnConvShape {
         rows: u32,
@@ -308,6 +341,18 @@ impl fmt::Display for KernelError {
             KernelError::NarrowShape { m, n, k } => {
                 write!(f, "narrow GEMM refused shape m={m} n={n} k={k}")
             }
+            KernelError::GemvShape { n, k } => write!(f, "GEMV refused shape n={n} k={k}"),
+            KernelError::AttnDecodeShape {
+                q_heads,
+                kv_heads,
+                head_dim,
+                block_size,
+                num_blocks,
+            } => write!(
+                f,
+                "decode attention refused shape q_heads={q_heads} kv_heads={kv_heads} \
+                 head_dim={head_dim} block_size={block_size} num_blocks={num_blocks}, or its scale"
+            ),
             KernelError::GdnConvShape {
                 rows,
                 conv_dim,
@@ -750,6 +795,90 @@ pub unsafe fn gemm_narrow_bf16_abt(
     // shape before it touches a pointer.
     let code = unsafe { scratchy_cuda_gemm_narrow_bf16_abt(a, b, c, m, n, k, stream) };
     check(code, KernelError::NarrowShape { m, n, k })
+}
+
+/// Launch the bf16 GEMV `c = a · Bᵀ`, the one-row GEMM: `a` is `[1, k]`, `B` `[n, k]` and `c`
+/// `[1, n]`, row-major bf16, accumulated in f32 and rounded once. One warp per column of `c`, a
+/// fixed reduction order, so the bits do not depend on the launch. Asynchronous.
+///
+/// Refused with [`KernelError::GemvShape`], before any pointer is touched, unless `n` is
+/// non-zero, `k` a non-zero multiple of 8 (`step::GEMV_BF16_MULTIPLE`), and both at most
+/// `i32::MAX`.
+///
+/// # Safety
+///
+/// `a`, `b` and `c` must be 16-byte-aligned device pointers to at least `k`, `n*k` and `n` bf16,
+/// valid for the whole kernel, with `c` overlapping neither input. `stream` must be a live
+/// `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn gemv_bf16_abt(
+    a: *const c_void,
+    b: *const c_void,
+    c: *mut c_void,
+    (n, k): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer.
+    let code = unsafe { scratchy_cuda_gemv_bf16_abt(a, b, c, n, k, stream) };
+    check(code, KernelError::GemvShape { n, k })
+}
+
+/// Launch the GQA decode attention of one query row `q` (`[1, q_heads · 256]`) over one layer's
+/// paged `k_cache` and `v_cache` (`[num_blocks, kv_heads, 64, 256]`) into `out`, the keys
+/// `0 .. P + L` read through `block_table`, `P` and `L` read from `sequence`; query head `g` reads
+/// kv head `g / (q_heads / kv_heads)`, the softmax scaled by `scale`. No key at or past `P + L` is
+/// loaded. Asynchronous.
+///
+/// Refused with [`KernelError::AttnDecodeShape`], before any pointer is touched, unless
+/// `head_dim` is 256 (`step::ATTN_DECODE_BF16_HEAD_DIM`), `q_heads` and `kv_heads` non-zero with
+/// `q_heads` a multiple of `kv_heads`, `block_size` 64, `num_blocks` non-zero, and `scale` finite
+/// and above 0. Returns the launch's own `cudaError_t` if it fails.
+///
+/// # Safety
+///
+/// `q` and `out` must be 16-byte-aligned device pointers to `q_heads · 256` bf16, `out`
+/// overlapping no input; `k_cache`, `v_cache` to `num_blocks · kv_heads · 64 · 256` bf16 each;
+/// `sequence` to `[P, L]` u32 with `L ≥ 1`; `block_table` to at least `ceil((P + L) / 64)` u32
+/// block ids, each below `num_blocks`. All valid for the whole kernel. `stream` must be a live
+/// `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn attn_decode_bf16(
+    (q, out): (*const c_void, *mut c_void),
+    (k_cache, v_cache): (*const c_void, *const c_void),
+    (block_table, sequence): (*const c_void, *const c_void),
+    (q_heads, kv_heads, head_dim): (u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    scale: f32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape and scale before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_attn_decode_bf16(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            sequence,
+            out,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+            scale,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::AttnDecodeShape {
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+        },
+    )
 }
 
 // THE GDN KERNELS. Four launches make one `GatedDeltaNet` step, in this order on one stream, each

@@ -1239,3 +1239,71 @@ fn every_launcher_refuses_what_it_does_not_take() {
         "a launcher took a shape it must refuse, or wrote its output"
     );
 }
+
+/// A decode's GDN step: the same four launches at `rows = 1` exactly, with no padding row (every
+/// other GDN case runs `rows = q_len + PAD`). One forward of `L1 + 1` tokens, then the same tokens
+/// as a first chunk of `L1` and a one-token chunk launched with `rows = 1`, from the state the
+/// first left: the one token's outputs and the final state bit-identical to the one forward's,
+/// in the 0.8b and 9b geometries. `(1, 1)` launches both chunks at `rows = 1`.
+#[test]
+fn a_one_row_step_with_no_padding_is_bit_identical_to_one_forward() {
+    let device = h100();
+    let mut pass = true;
+    for d in [G08, G9] {
+        let bu = bundle(d, 0xDEC1);
+        let bb = upload_bundle(&device, &bu);
+        for l1 in [300usize, 1] {
+            let x = inputs(d, l1 + 1, 0xDEC2 ^ (l1 as u64) << 16);
+            let pool_one = Pool::new(&device, d, NAN_F32);
+            let one = chunk(&x, d, 0, l1 + 1, l1 + 1);
+            let so = run_step(&device, &pool_one, &bb, d, &one, (3, true)).expect("one forward");
+            let pool_two = Pool::new(&device, d, NAN_F32);
+            let c1 = chunk(&x, d, 0, l1, l1);
+            let first = run_step(&device, &pool_two, &bb, d, &c1, (3, true));
+            let c2 = chunk(&x, d, l1, 1, 1);
+            let second = first.and_then(|_| run_step(&device, &pool_two, &bb, d, &c2, (3, false)));
+            let s2 = match second {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "one-row step {} ({l1}, 1) at rows = 1: a launcher refused: {e} FAIL",
+                        name(d)
+                    );
+                    pass = false;
+                    continue;
+                }
+            };
+            let vd = d.value_dim();
+            let out = mismatched(&so.out[l1 * vd..][..vd], &s2.out);
+            let o = (so.o[l1 * vd..][..vd].iter().zip(&s2.o))
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let state = (bits_of(&pool_one.ssm_slot(3)).iter())
+                .zip(bits_of(&pool_two.ssm_slot(3)))
+                .filter(|(a, b)| **a != *b)
+                .count()
+                + (bits_of(&pool_one.conv_slot(3)).iter())
+                    .zip(bits_of(&pool_two.conv_slot(3)))
+                    .filter(|(a, b)| **a != *b)
+                    .count();
+            let ok = out + o + state == 0;
+            eprintln!(
+                "one-row step {} ({l1}, 1) at rows = 1, no padding: out_mismatched={out} \
+                 o_mismatched={o} state_mismatched_bits={state} {}",
+                name(d),
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(
+        pass,
+        "a one-row GDN step differs from one forward, or was refused: stop and report"
+    );
+}
+
+/// How many bf16 elements of `a` and `b` differ in any bit.
+fn mismatched(a: &[u16], b: &[u16]) -> usize {
+    assert_eq!(a.len(), b.len(), "the two outputs differ in length");
+    a.iter().zip(b).filter(|(x, y)| x != y).count()
+}
