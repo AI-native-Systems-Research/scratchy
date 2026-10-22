@@ -436,6 +436,13 @@ fn json_value_to_tool_call(val: &serde_json::Value) -> Option<protocol::ToolCall
 ///
 /// Under [`protocol::CallLimit::One`] the array holds one call (`maxItems: 1`, as vLLM sets it for
 /// `parallel_tool_calls: false`).
+///
+/// ⛔ THE CALLS ARE WRITTEN ONE WAY: `json.dumps`'s, with `", "` and `": "` between items and keys
+/// and no other whitespace (llguidance's `x-guidance`, [`required_json_format`]). llguidance's JSON
+/// takes any whitespace between any two tokens by default, and a model under it can loop on
+/// whitespace between `[` and `{` until `max_tokens` (#820). This grammar is the server's own: no
+/// client asked for a formatting, so it takes the one models write. A client's `response_format`
+/// keeps the whitespace its JSON Schema allows.
 pub(crate) fn required_tool_calls_schema(
     tools: &[protocol::ChatCompletionToolsParam],
     limit: protocol::CallLimit,
@@ -483,6 +490,7 @@ pub(crate) fn required_tool_calls_schema(
         "type": "array",
         "minItems": 1,
         "items": { "type": "object", "anyOf": calls },
+        "x-guidance": required_json_format(),
     });
     if limit == protocol::CallLimit::One {
         schema["maxItems"] = serde_json::json!(1);
@@ -491,6 +499,16 @@ pub(crate) fn required_tool_calls_schema(
         schema["$defs"] = serde_json::Value::Object(defs);
     }
     Ok(schema)
+}
+
+/// llguidance's JSON options for `"required"`'s calls ([`required_tool_calls_schema`]): no free
+/// whitespace, `", "` between items and `": "` between a key and its value.
+fn required_json_format() -> serde_json::Value {
+    serde_json::json!({
+        "whitespace_flexible": false,
+        "item_separator": ", ",
+        "key_separator": ": ",
+    })
 }
 
 /// A JSON value's type, as JSON Schema names it.
@@ -2972,6 +2990,11 @@ mod tests {
         .unwrap();
         assert_eq!(schema["type"], "array");
         assert_eq!(schema["minItems"], 1);
+        assert_eq!(
+            schema["x-guidance"],
+            required_json_format(),
+            "written one way"
+        );
         assert_eq!(schema["items"]["type"], "object");
         assert!(schema.get("$defs").is_none(), "no tool defines any");
         let calls = schema["items"]["anyOf"].as_array().unwrap();
@@ -3223,9 +3246,15 @@ mod tests {
     #[test]
     fn the_required_grammar_takes_a_call_to_a_declared_tool_and_nothing_else() {
         use scratchy_serving_engine::grammar::{GrammarGuide, build_parser_factory};
-        // Byte-level BPE writes a space as `Ġ`; every other printable character is itself.
-        let piece = |c: char| if c == ' ' { 'Ġ' } else { c };
+        // Byte-level BPE writes a space as `Ġ` and a newline as `Ċ`; every other printable
+        // character is itself.
+        let piece = |c: char| match c {
+            ' ' => 'Ġ',
+            '\n' => 'Ċ',
+            c => c,
+        };
         let vocab: serde_json::Map<String, serde_json::Value> = (' '..='~')
+            .chain(['\n'])
             .zip(1u32..)
             .map(|(c, id)| (piece(c).to_string(), serde_json::json!(id)))
             .collect();
@@ -3278,30 +3307,48 @@ mod tests {
             // leaves to sample.
             (!guide.is_finished()).then_some(reply.len())
         };
-        let one_call = r#"[{"name":"Bash","parameters":{"command":"ls -l"}}]"#;
-        let two_calls = r#"[{"name":"Bash","parameters":{"command":"ls"}},{"name":"Move","parameters":{"to":{"x":1}}}]"#;
+        let one_call = r#"[{"name": "Bash", "parameters": {"command": "ls -l"}}]"#;
+        let two_calls = r#"[{"name": "Bash", "parameters": {"command": "ls"}}, {"name": "Move", "parameters": {"to": {"x": 1}}}]"#;
         for call in [
             one_call,
             // Through a `$ref` into the hoisted `$defs`.
-            r#"[{"name":"Move","parameters":{"to":{"x":3}}}]"#,
+            r#"[{"name": "Move", "parameters": {"to": {"x": 3}}}]"#,
             two_calls,
         ] {
             assert_eq!(refused_at(&schema, call), None, "{call}");
         }
         for refused in [
-            r#"[{"name":"Read","parameters":{"command":"ls"}}]"#,
-            r#"[{"name":"Bash","parameters":{}}]"#,
-            r#"[{"name":"Move","parameters":{"to":{"y":3}}}]"#,
+            r#"[{"name": "Read", "parameters": {"command": "ls"}}]"#,
+            r#"[{"name": "Bash", "parameters": {}}]"#,
+            r#"[{"name": "Move", "parameters": {"to": {"y": 3}}}]"#,
             "[]",
             "Sure, let me look.",
         ] {
             assert!(refused_at(&schema, refused).is_some(), "{refused}");
         }
 
+        // The calls are written one way, `json.dumps`'s: no whitespace but its separators, so no
+        // loop on whitespace between `[` and `{` (#820).
+        let looping = "[\n\n   \n\n";
+        assert_eq!(refused_at(&schema, looping), Some(1), "whitespace after [");
+        let compact = r#"[{"name":"Bash","parameters":{"command":"ls"}}]"#;
+        let after_colon = compact.find(':').unwrap() + 1;
+        assert_eq!(
+            refused_at(&schema, compact),
+            Some(after_colon),
+            "a key's colon wants its space"
+        );
+        let leading = format!(" {one_call}");
+        assert_eq!(
+            refused_at(&schema, &leading),
+            Some(0),
+            "whitespace before ["
+        );
+
         // Under `parallel_tool_calls: false`, one call: a second is refused at the comma before it.
         let one = required_tool_calls_schema(&tools, CallLimit::One).unwrap();
         assert_eq!(refused_at(&one, one_call), None);
-        let comma = two_calls.find("},{").unwrap() + 1;
+        let comma = two_calls.find("}, {").unwrap() + 1;
         assert_eq!(refused_at(&one, two_calls), Some(comma));
     }
 
