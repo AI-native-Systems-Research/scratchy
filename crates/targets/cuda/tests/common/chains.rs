@@ -10,17 +10,34 @@ use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{SourceShape, SubOp};
 use scratchy_target_cuda::step::{CudaStep, GemmBf16};
-use scratchy_target_cuda::tape::{ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, KvTape, WeightIx};
+use scratchy_target_cuda::tape::{
+    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, WeightIx,
+};
 use scratchy_target_cuda_compiler::canonical::{
-    CanonicalAt, CanonicalKv, CudaCanonical, CudaModelFacts, lower_canonical,
+    CanonicalAt, CanonicalGdn, CanonicalKv, CudaCanonical, CudaGdnFacts, CudaModelFacts,
+    lower_canonical,
 };
 
-/// qwen3.5's model facts: `head_dim` 256, a quarter of it rotated, `rope_theta` 1e7. Every fixture
-/// lowers with them; one with no rope or gate reads none of them.
+/// qwen3.5's model facts: `head_dim` 256, a quarter of it rotated, `rope_theta` 1e7, no linear
+/// attention. Every fixture but the GDN layer lowers with them; one with no rope or gate reads
+/// none of them.
 pub const QWEN3_5_FACTS: CudaModelFacts = CudaModelFacts {
     head_dim: 256,
     rot_dim: 64,
     rope_theta: 1e7,
+    gdn: None,
+};
+
+/// [`QWEN3_5_FACTS`] with qwen3.5-0.8b's linear attention: 16 key heads of 128, a 4-tap conv,
+/// `rms_norm_eps` 1e-6. The GDN layer's fixture lowers with them.
+pub const QWEN3_5_GDN_FACTS: CudaModelFacts = CudaModelFacts {
+    gdn: Some(CudaGdnFacts {
+        num_k_heads: 16,
+        head_k: 128,
+        conv_kernel: 4,
+        eps: 1e-6,
+    }),
+    ..QWEN3_5_FACTS
 };
 
 /// Panic unless `tape` is, field by field, what CUDA's compiler lowers `l` to.
@@ -28,6 +45,16 @@ pub const QWEN3_5_FACTS: CudaModelFacts = CudaModelFacts {
 /// Every struct is destructured with no `..`, so a field added to the tape, its layout or the
 /// canonical does not compile here until it is compared.
 pub fn assert_tape_is_lowered(name: &str, tape: &CudaTape, l: &LoweredDecode) {
+    assert_tape_is_lowered_with(name, tape, l, QWEN3_5_FACTS);
+}
+
+/// [`assert_tape_is_lowered`] under `facts`.
+pub fn assert_tape_is_lowered_with(
+    name: &str,
+    tape: &CudaTape,
+    l: &LoweredDecode,
+    facts: CudaModelFacts,
+) {
     let CudaTape {
         bucket_m,
         arena:
@@ -42,6 +69,7 @@ pub fn assert_tape_is_lowered(name: &str, tape: &CudaTape, l: &LoweredDecode) {
         steps,
         rotary,
         kv,
+        gdn,
     } = *tape;
     let at = CanonicalAt {
         stem: name,
@@ -58,8 +86,8 @@ pub fn assert_tape_is_lowered(name: &str, tape: &CudaTape, l: &LoweredDecode) {
         steps: lowered_steps,
         rotary: lowered_rotary,
         kv: lowered_kv,
-    } = lower_canonical(l, QWEN3_5_FACTS, at)
-        .unwrap_or_else(|e| panic!("{name}: lower_canonical: {e}"));
+        gdn: lowered_gdn,
+    } = lower_canonical(l, facts, at).unwrap_or_else(|e| panic!("{name}: lower_canonical: {e}"));
     assert_eq!(bucket_m, lowered_m, "{name}: bucket_m");
     assert_eq!(colour_bytes, lowered_bytes, "{name}: colour bytes");
     assert_eq!(colour_offsets, lowered_offsets, "{name}: offsets");
@@ -91,6 +119,28 @@ pub fn assert_tape_is_lowered(name: &str, tape: &CudaTape, l: &LoweredDecode) {
         },
     );
     assert_eq!(kv, lowered_kv, "{name}: kv");
+    let gdn = gdn.map(
+        |GdnTape {
+             layers,
+             num_k_heads,
+             num_v_heads,
+             head_k,
+             head_v,
+             conv_kernel,
+             sequence,
+             scratch,
+         }| CanonicalGdn {
+            layers: layers.to_vec(),
+            num_k_heads,
+            num_v_heads,
+            head_k,
+            head_v,
+            conv_kernel,
+            sequence,
+            scratch,
+        },
+    );
+    assert_eq!(gdn, lowered_gdn, "{name}: gdn");
 }
 
 /// The chains' activation width: `x` is `[M, HIDDEN]`.
@@ -178,6 +228,7 @@ pub static TWO_GEMM_M128: CudaTape = CudaTape {
     ],
     rotary: None,
     kv: None,
+    gdn: None,
 };
 
 /// [`two_gemm`]`(256)`: colours x, y1, y2.
@@ -197,6 +248,7 @@ pub static TWO_GEMM_M256: CudaTape = CudaTape {
     ],
     rotary: None,
     kv: None,
+    gdn: None,
 };
 
 /// [`three_gemm`]: `y1` is dead after step 1, so `y3` takes its colour, and the arena is the
@@ -218,4 +270,5 @@ pub static THREE_GEMM_M256: CudaTape = CudaTape {
     ],
     rotary: None,
     kv: None,
+    gdn: None,
 };

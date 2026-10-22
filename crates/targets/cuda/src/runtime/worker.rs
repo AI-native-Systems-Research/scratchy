@@ -16,6 +16,13 @@
 //! `PagedKvLayout` (`scratchy-subtile`) says. A forward's sequence data (the block table, the
 //! prefix and query lengths) is checked on the host and uploaded into the tape's regions, with
 //! the slot of each row derived from it, before any step runs.
+//!
+//! A worker whose tapes have Gated-DeltaNet layers also owns the GDN state pool: one more device
+//! allocation, sized at construction from the tapes' GDN geometry and the pool's slot count, laid
+//! out per layer as `GdnStateLayout` (`scratchy-subtile`) says, f32. It is never cleared. A
+//! forward's GDN sequence (its slot, its real rows, whether it is the sequence's first) is
+//! checked on the host and uploaded into the tape's GDN sequence region before any step runs; a
+//! first forward's kernels start from zero without reading the slot, then overwrite it in full.
 
 use std::ffi::c_void;
 use std::fmt;
@@ -24,21 +31,43 @@ use super::buffer::DeviceBuffer;
 use super::device::CudaDevice;
 use super::ffi;
 use super::{CudaError, check};
+use scratchy_subtile::gdn_state_layout::GdnStateLayout;
 use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 
 use crate::kernels::{self, KernelError};
 use crate::rotary::fill_rotary_rows;
 use crate::step::{
-    AddBf16, AttnPrefillBf16, CudaStep, GateApplyBf16, GateSplitBf16, GemmBf16, RmsNormBf16,
-    RopeAppendBf16, RopeBf16, SiluMulBf16,
+    AddBf16, AttnPrefillBf16, CudaStep, GateApplyBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16,
+    RmsNormBf16, RopeAppendBf16, RopeBf16, SiluMulBf16,
 };
-use crate::tape::{ArenaOffset, ArenaSpan, CudaTape, KvTape, TapeError};
+use crate::tape::{ArenaOffset, ArenaSpan, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape, TapeError};
 
 /// The KV pool a worker allocates when its tapes attend: how many blocks each layer's K and V
 /// buffers hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvPoolConfig {
     pub num_blocks: u32,
+}
+
+/// The GDN state pool a worker allocates when its tapes have Gated-DeltaNet layers: how many
+/// sequences' state each layer holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdnPoolConfig {
+    pub num_slots: u32,
+}
+
+/// One forward's GDN sequence: its state's `slot` in the pool, its `q_len` real rows, and whether
+/// this is the sequence's first forward (`fresh`), whose kernels start from zero without reading
+/// the slot.
+///
+/// The caller passes `fresh: true` on a sequence's first forward (whenever the slot is handed to a
+/// new sequence); the worker cannot tell sequences apart, so `fresh: false` for a new sequence
+/// continues from whatever the slot holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdnSequence {
+    pub slot: u32,
+    pub q_len: u32,
+    pub fresh: bool,
 }
 
 /// One forward's sequence: the block table of its cached and new tokens, `prefix_len` tokens
@@ -79,7 +108,14 @@ pub enum WorkerError {
     /// The tape at `bucket`'s KV layers, kv heads, head dim or block size are not the first KV
     /// tape's: one pool cannot hold both.
     KvGeometry { bucket: usize },
-    /// Creating the stream or allocating the arena or the pool failed.
+    /// A tape has GDN layers and the worker was given no GDN pool, or a pool of no slots.
+    GdnPoolMissing,
+    /// No tape has GDN layers and the worker was given a GDN pool.
+    GdnPoolUnused,
+    /// The tape at `bucket`'s GDN layers, heads, head dims or conv kernel are not the first GDN
+    /// tape's: one pool cannot hold both.
+    GdnGeometry { bucket: usize },
+    /// Creating the stream or allocating the arena or a pool failed.
     Cuda(CudaError),
 }
 
@@ -109,6 +145,18 @@ impl fmt::Display for WorkerError {
             Self::KvGeometry { bucket } => write!(
                 f,
                 "the tape of bucket {bucket} has another KV geometry than the first KV tape's"
+            ),
+            Self::GdnPoolMissing => write!(
+                f,
+                "a tape has GDN layers and the worker was given no GDN pool of at least one slot"
+            ),
+            Self::GdnPoolUnused => write!(
+                f,
+                "the worker was given a GDN pool and no tape has GDN layers"
+            ),
+            Self::GdnGeometry { bucket } => write!(
+                f,
+                "the tape of bucket {bucket} has another GDN geometry than the first GDN tape's"
             ),
             Self::Cuda(e) => write!(f, "cannot build the CUDA worker: {e}"),
         }
@@ -166,6 +214,22 @@ pub enum ForwardError {
         block: u32,
         expected: usize,
         got: usize,
+    },
+    /// The tape has GDN layers and the forward was given no GDN sequence; nothing was enqueued.
+    GdnMissing,
+    /// The tape has no GDN layers and the forward was given a GDN sequence; nothing was enqueued.
+    GdnUnexpected,
+    /// The GDN sequence's slot is not one of the pool's `num_slots`; nothing was enqueued.
+    GdnSlotOutsidePool { slot: u32, num_slots: u32 },
+    /// The GDN sequence's `q_len` is not in `1 ..= bucket_m`; nothing was enqueued.
+    GdnQueryLength { q_len: u32, bucket_m: u32 },
+    /// A GDN state read names a layer index or a slot outside the pool, or a host buffer that is
+    /// not one slot's size; nothing was enqueued.
+    GdnRead {
+        layer: usize,
+        slot: u32,
+        conv: (usize, usize),
+        ssm: (usize, usize),
     },
     /// An arena read's span reaches past the arena; nothing was enqueued.
     SpanOutsideArena { span: ArenaSpan, arena_bytes: u64 },
@@ -255,6 +319,33 @@ impl fmt::Display for ForwardError {
                 "cannot read layer {layer}'s block {block} into {got} elements: the pool has no \
                  such layer or block, or a block is {expected} elements"
             ),
+            Self::GdnMissing => write!(
+                f,
+                "the bucket has GDN layers and the forward was given no GDN sequence"
+            ),
+            Self::GdnUnexpected => write!(
+                f,
+                "the bucket has no GDN layers and the forward was given a GDN sequence"
+            ),
+            Self::GdnSlotOutsidePool { slot, num_slots } => write!(
+                f,
+                "the GDN sequence's slot is {slot}, outside the pool's {num_slots} slots"
+            ),
+            Self::GdnQueryLength { q_len, bucket_m } => write!(
+                f,
+                "the GDN sequence has {q_len} rows; the bucket takes 1 to {bucket_m}"
+            ),
+            Self::GdnRead {
+                layer,
+                slot,
+                conv,
+                ssm,
+            } => write!(
+                f,
+                "cannot read GDN layer {layer}'s slot {slot} into {} conv and {} ssm elements: \
+                 the pool has no such layer or slot, or a slot is {} and {}",
+                conv.1, ssm.1, conv.0, ssm.0
+            ),
             Self::SpanOutsideArena { span, arena_bytes } => write!(
                 f,
                 "the span of {} bytes at {} reaches past the {arena_bytes}-byte arena",
@@ -331,6 +422,86 @@ impl KvPool {
     }
 }
 
+/// The worker's GDN state pool: one allocation of every GDN layer's conv and ssm buffers (f32),
+/// and the host side of the forward's GDN sequence region.
+struct GdnPool {
+    buffer: DeviceBuffer,
+    /// One layer's layout; every layer's is the same.
+    layout: GdnStateLayout,
+    /// The GDN layers, as the tapes' [`GdnTape::layers`].
+    layers: usize,
+    /// Per layer, in `layers` order: the byte offsets of its conv buffer and its ssm buffer in
+    /// `buffer`, each a multiple of [`CUDA_ARENA_ALIGN`].
+    offsets: Vec<(u64, u64)>,
+    /// The host side of the sequence region, `[slot, q_len, start, 0]`, sized once.
+    sequence_host: [u32; 4],
+}
+
+/// The bytes of `elems` f32.
+fn f32_bytes(elems: usize) -> u64 {
+    elems as u64 * std::mem::size_of::<f32>() as u64
+}
+
+impl GdnPool {
+    /// The device address of layer index `layer`'s conv buffer, and of its ssm buffer. Computed,
+    /// not dereferenced.
+    fn layer_ptrs(&self, layer: usize) -> (*mut c_void, *mut c_void) {
+        let (conv, ssm) = self.offsets[layer];
+        let at = |b: u64| {
+            let b = usize::try_from(b).expect("a pool offset fits the host's usize");
+            self.buffer.ptr().wrapping_byte_add(b)
+        };
+        (at(conv), at(ssm))
+    }
+}
+
+/// The GDN pool of `layers` layers of `layout`: per layer, the conv buffer then the ssm buffer,
+/// each at a multiple of [`CUDA_ARENA_ALIGN`]. Returns each layer's two offsets and the total
+/// bytes, or `None` on overflow.
+fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, u64)>, u64)> {
+    let conv = f32_bytes(layout.conv_buffer_elems()).checked_next_multiple_of(CUDA_ARENA_ALIGN)?;
+    let ssm = f32_bytes(layout.ssm_buffer_elems()).checked_next_multiple_of(CUDA_ARENA_ALIGN)?;
+    let per_layer = conv.checked_add(ssm)?;
+    let offsets = (0..layers as u64)
+        .map(|l| {
+            let at = l.checked_mul(per_layer)?;
+            Some((at, at.checked_add(conv)?))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((offsets, per_layer.checked_mul(layers as u64)?))
+}
+
+/// The one GDN geometry of `tapes`: the first GDN tape's, which every other GDN tape must share.
+fn gdn_geometry(tapes: &[CudaTape]) -> Result<Option<GdnTape>, WorkerError> {
+    let mut first: Option<GdnTape> = None;
+    for (bucket, tape) in tapes.iter().enumerate() {
+        let Some(g) = tape.gdn else { continue };
+        match first {
+            None => first = Some(g),
+            Some(f) => {
+                if (
+                    f.layers,
+                    f.num_k_heads,
+                    f.num_v_heads,
+                    f.head_k,
+                    f.head_v,
+                    f.conv_kernel,
+                ) != (
+                    g.layers,
+                    g.num_k_heads,
+                    g.num_v_heads,
+                    g.head_k,
+                    g.head_v,
+                    g.conv_kernel,
+                ) {
+                    return Err(WorkerError::GdnGeometry { bucket });
+                }
+            }
+        }
+    }
+    Ok(first)
+}
+
 /// Plays a set of tapes (one per bucket) over one arena on one stream.
 ///
 /// Neither `Send` nor `Sync`: it holds raw CUDA handles. Sharing is the worker pool's decision.
@@ -345,6 +516,8 @@ pub struct CudaWorker<'a> {
     rotary_host: Vec<u16>,
     /// The KV pool, when a tape has a KV cache.
     kv: Option<KvPool>,
+    /// The GDN state pool, when a tape has GDN layers.
+    gdn: Option<GdnPool>,
 }
 
 /// The one KV geometry of `tapes`: the first KV tape's, which every other KV tape must share.
@@ -393,11 +566,20 @@ impl<'a> CudaWorker<'a> {
     /// sequence, masks their scores, and zeroes their V rows in shared memory before P·V
     /// (`kernels/attn_prefill_bf16.cu`), so they reach no output. When no tape has one,
     /// `kv_pool` must be `None`.
+    ///
+    /// When a tape has GDN layers, `gdn_pool` must be given with at least one slot, and every GDN
+    /// tape must share one geometry; the pool is then one more allocation: per GDN layer, in
+    /// [`GdnTape::layers`] order, the conv buffer (`GdnStateLayout::conv_buffer_elems` f32) then
+    /// the ssm buffer (`ssm_buffer_elems` f32), each at a multiple of 256. It is never cleared: a
+    /// sequence's first forward starts from zero without reading its slot (the `fresh` flag of
+    /// [`GdnSequence`]), and overwrites it in full. When no tape has GDN layers, `gdn_pool` must
+    /// be `None`.
     pub fn new(
         device: &CudaDevice,
         tapes: &'static [CudaTape],
         weights: &'a [DeviceBuffer],
         kv_pool: Option<KvPoolConfig>,
+        gdn_pool: Option<GdnPoolConfig>,
     ) -> Result<Self, WorkerError> {
         for (bucket, tape) in tapes.iter().enumerate() {
             tape.validate()
@@ -432,6 +614,24 @@ impl<'a> CudaWorker<'a> {
             (None, Some(_)) => return Err(WorkerError::KvPoolUnused),
             (None, None) => None,
         };
+        let gdn_layout = match (gdn_geometry(tapes)?, gdn_pool) {
+            (Some(g), Some(GdnPoolConfig { num_slots })) if num_slots >= 1 => {
+                let layout = GdnStateLayout::new(
+                    num_slots,
+                    g.num_k_heads,
+                    g.num_v_heads,
+                    g.head_k,
+                    g.head_v,
+                    g.conv_kernel,
+                );
+                let (offsets, bytes) =
+                    gdn_pool_layout(&layout, g.layers.len()).expect("the GDN pool's bytes fit u64");
+                Some((layout, g.layers.len(), offsets, bytes))
+            }
+            (Some(_), _) => return Err(WorkerError::GdnPoolMissing),
+            (None, Some(_)) => return Err(WorkerError::GdnPoolUnused),
+            (None, None) => None,
+        };
         let arena_bytes =
             (tapes.iter().map(|t| t.arena.total_bytes).max()).ok_or(WorkerError::NoTapes)?;
         // Each table's span lies inside its arena (`validate`), so its byte count fits a usize.
@@ -462,6 +662,16 @@ impl<'a> CudaWorker<'a> {
             }
             None => None,
         };
+        let gdn = match gdn_layout {
+            Some((layout, layers, offsets, bytes)) => Some(GdnPool {
+                buffer: DeviceBuffer::alloc(device, bytes).map_err(WorkerError::Cuda)?,
+                layout,
+                layers,
+                offsets,
+                sequence_host: [0; 4],
+            }),
+            None => None,
+        };
         Ok(Self {
             tapes,
             weights,
@@ -469,7 +679,78 @@ impl<'a> CudaWorker<'a> {
             arena,
             rotary_host: vec![0; rotary_elements],
             kv,
+            gdn,
         })
+    }
+
+    /// The GDN state pool's bytes, when the worker has one: its one allocation.
+    pub fn gdn_pool_bytes(&self) -> Option<u64> {
+        self.gdn.as_ref().map(|p| p.buffer.bytes())
+    }
+
+    /// Copy slot `slot` of GDN layer index `layer`'s state into `conv` (`conv_elems_per_slot`
+    /// f32, `[conv_dim, conv_kernel − 1]`) and `ssm` (`ssm_elems_per_slot` f32, `[nv, head_v,
+    /// head_k]`), synchronously: the pool's bytes, for a check after a forward.
+    pub fn read_gdn_state(
+        &mut self,
+        layer: usize,
+        slot: u32,
+        conv: &mut [f32],
+        ssm: &mut [f32],
+    ) -> Result<(), ForwardError> {
+        let refuse = |want: (usize, usize)| ForwardError::GdnRead {
+            layer,
+            slot,
+            conv: (want.0, conv.len()),
+            ssm: (want.1, ssm.len()),
+        };
+        let Some(pool) = &self.gdn else {
+            return Err(refuse((0, 0)));
+        };
+        let l = pool.layout;
+        let want = (l.conv_elems_per_slot(), l.ssm_elems_per_slot());
+        if layer >= pool.layers || slot >= l.num_slots || (conv.len(), ssm.len()) != want {
+            return Err(refuse(want));
+        }
+        let (conv_buf, ssm_buf) = pool.layer_ptrs(layer);
+        let src = |base: *mut c_void, elems: usize| {
+            base.wrapping_byte_add(elems * std::mem::size_of::<f32>())
+        };
+        let copies = [
+            (
+                conv.as_mut_ptr().cast::<c_void>(),
+                src(conv_buf, l.conv_slot_offset(slot)),
+                std::mem::size_of_val(conv),
+            ),
+            (
+                ssm.as_mut_ptr().cast::<c_void>(),
+                src(ssm_buf, l.ssm_slot_offset(slot)),
+                std::mem::size_of_val(ssm),
+            ),
+        ];
+        let mut copied = Ok(());
+        for (dst, src, bytes) in copies {
+            // SAFETY: the layer and slot lie inside the pool, `dst` holds exactly one slot's
+            // bytes of its buffer, and both host buffers stay borrowed until the stream wait
+            // below has returned.
+            copied = copied.and_then(|()| {
+                check(
+                    unsafe {
+                        ffi::cudaMemcpyAsync(
+                            dst,
+                            src,
+                            bytes,
+                            ffi::MEMCPY_DEVICE_TO_HOST,
+                            self.stream.0,
+                        )
+                    },
+                    "cudaMemcpyAsync(GDN state, device to host)",
+                )
+                .map_err(ForwardError::Cuda)
+            });
+        }
+        let drained = self.stream.synchronize().map_err(ForwardError::Cuda);
+        copied.and(drained)
     }
 
     /// The KV pool's bytes, when the worker has one: its one allocation.
@@ -496,12 +777,18 @@ impl<'a> CudaWorker<'a> {
     /// every used entry is a distinct block inside the pool, and the real rows' positions are
     /// `prefix_len, prefix_len + 1, …`. Then the used entries (the rest `u32::MAX`), each row's
     /// slot (`u32::MAX` for a padding row) and `[prefix_len, q_len]` are uploaded with the input.
+    ///
+    /// `gdn` is the forward's GDN sequence, given exactly when the tape has GDN layers. Before any
+    /// copy it is checked: its slot is one of the pool's, and `1 ≤ q_len ≤ bucket_m`. Then
+    /// `[slot, q_len, fresh as u32, 0]` is uploaded into the tape's GDN sequence region with the
+    /// input.
     pub fn forward(
         &mut self,
         bucket: usize,
         input: &[u16],
         positions: &[u32],
         kv: Option<&KvSequence<'_>>,
+        gdn: Option<&GdnSequence>,
         result: &mut [u16],
     ) -> Result<(), ForwardError> {
         let tape = self.tapes.get(bucket).ok_or(ForwardError::Bucket {
@@ -539,6 +826,30 @@ impl<'a> CudaWorker<'a> {
             (None, Some(_)) => return Err(ForwardError::KvUnexpected),
             (None, None) => None,
         };
+        let gdn_sequence = match (tape.gdn, gdn) {
+            (Some(gdn_tape), Some(seq)) => {
+                let pool = self.gdn.as_mut().expect("`new` made a pool for a GDN tape");
+                let num_slots = pool.layout.num_slots;
+                if seq.slot >= num_slots {
+                    return Err(ForwardError::GdnSlotOutsidePool {
+                        slot: seq.slot,
+                        num_slots,
+                    });
+                }
+                let bucket_m = tape.bucket_m;
+                if seq.q_len == 0 || seq.q_len > bucket_m {
+                    return Err(ForwardError::GdnQueryLength {
+                        q_len: seq.q_len,
+                        bucket_m,
+                    });
+                }
+                pool.sequence_host = [seq.slot, seq.q_len, u32::from(seq.fresh), 0];
+                Some(gdn_tape.sequence)
+            }
+            (Some(_), None) => return Err(ForwardError::GdnMissing),
+            (None, Some(_)) => return Err(ForwardError::GdnUnexpected),
+            (None, None) => None,
+        };
         let table = match tape.rotary {
             Some(r) => {
                 let rows = &mut self.rotary_host[..positions.len() * r.rot_dim as usize];
@@ -556,16 +867,21 @@ impl<'a> CudaWorker<'a> {
             }),
             _ => None,
         };
+        let gdn_upload = match (gdn_sequence, &self.gdn) {
+            (Some(span), Some(pool)) => Some((span, &pool.sequence_host)),
+            _ => None,
+        };
         let enqueued = Self::enqueue(
             &self.stream,
             &self.arena,
             self.weights,
-            self.kv.as_ref(),
+            (self.kv.as_ref(), self.gdn.as_ref()),
             tape,
             Uploads {
                 input,
                 table,
                 kv: kv_upload,
+                gdn: gdn_upload,
             },
             result,
         );
@@ -667,7 +983,7 @@ impl<'a> CudaWorker<'a> {
         stream: &Stream,
         arena: &DeviceBuffer,
         weights: &[DeviceBuffer],
-        kv: Option<&KvPool>,
+        (kv, gdn): (Option<&KvPool>, Option<&GdnPool>),
         tape: &CudaTape,
         uploads: Uploads<'_>,
         result: &mut [u16],
@@ -676,6 +992,7 @@ impl<'a> CudaWorker<'a> {
             input,
             table,
             kv: kv_upload,
+            gdn: gdn_upload,
         } = uploads;
         let slot = |offset| Self::slot_of(arena, offset);
         // SAFETY: the input span lies inside the tape's arena (`new` validated it), which is at
@@ -753,6 +1070,26 @@ impl<'a> CudaWorker<'a> {
                 .map_err(ForwardError::Cuda)?;
             }
         }
+        if let Some((span, data)) = gdn_upload {
+            debug_assert_eq!(std::mem::size_of_val(data) as u64, span.bytes);
+            // SAFETY: the GDN sequence region lies inside the tape's arena (`new` validated it),
+            // which is at most `arena_bytes`; `data` is its 16 bytes (`validate` checked the
+            // region's size), the worker's own buffer, which no forward touches until the
+            // caller's stream wait has returned.
+            check(
+                unsafe {
+                    ffi::cudaMemcpyAsync(
+                        slot(span.offset),
+                        data.as_ptr().cast(),
+                        std::mem::size_of_val(data),
+                        ffi::MEMCPY_HOST_TO_DEVICE,
+                        stream.0,
+                    )
+                },
+                "cudaMemcpyAsync(GDN sequence, host to device)",
+            )
+            .map_err(ForwardError::Cuda)?;
+        }
         // SAFETY (every arm): `new` validated the tape (`CudaTape::validate`): each span a step
         // reads or writes (`CudaStep::extents`, the kernel's own operand sizes) is 256-byte
         // aligned and inside the tape's arena, which is at most this worker's; each span it
@@ -768,6 +1105,17 @@ impl<'a> CudaWorker<'a> {
                     let b = weights[b.0 as usize].ptr();
                     // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
                     unsafe { kernels::gemm_bf16_abt(slot(a), b, slot(c), m, n, k, stream.0) }
+                }
+                CudaStep::GemmNarrow(GemmBf16 { a, b, c, m, n, k }) => {
+                    let b = weights[b.0 as usize].ptr();
+                    // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
+                    unsafe {
+                        kernels::gemm_narrow_bf16_abt(slot(a), b, slot(c), (m, n, k), stream.0)
+                    }
+                }
+                CudaStep::GatedDeltaNet(g) => {
+                    let pool = gdn.expect("`new` made a pool for a GDN tape");
+                    Self::gated_delta_net(&g, pool, slot, weights, stream)
                 }
                 CudaStep::RmsNorm(
                     norm @ RmsNormBf16 {
@@ -978,6 +1326,86 @@ impl<'a> CudaWorker<'a> {
         .map_err(ForwardError::Cuda)
     }
 
+    /// A GDN step's four launches, in order on the stream: conv1d, gating, scan, gated norm. Each
+    /// reads the GDN sequence region this forward uploaded; the first that fails stops the rest.
+    fn gated_delta_net(
+        g: &GatedDeltaNetBf16,
+        pool: &GdnPool,
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        weights: &[DeviceBuffer],
+        stream: &Stream,
+    ) -> Result<(), KernelError> {
+        // `validate` checked that the step's geometry is the tape's and its scratch and bundle
+        // sizes fit u64 (`extents`), and `new` that the tape's geometry is the pool's; were one
+        // to overflow, the conv launcher refuses the shape and nothing launches.
+        let (Some(conv_dim), Some(scratch), Some(bundle)) =
+            (g.conv_dim(), g.scratch_layout(), g.bundle_layout())
+        else {
+            return Err(KernelError::GdnConvShape {
+                rows: g.rows,
+                conv_dim: 0,
+                kernel: g.conv_kernel,
+            });
+        };
+        let at = |base: ArenaOffset, off: u64| slot(ArenaOffset(base.0 + off));
+        let w = weights[g.bundle.0 as usize].ptr();
+        let wat = |off: u64| {
+            let off = usize::try_from(off).expect("a bundle offset fits the host's usize");
+            w.wrapping_byte_add(off).cast_const()
+        };
+        let (conv_state, ssm_state) = pool.layer_ptrs(g.layer as usize);
+        let layout = pool.layout;
+        let seq = slot(g.sequence).cast_const();
+        let (conv_out, gate, beta, o) = (
+            at(g.scratch, scratch.conv_out),
+            at(g.scratch, scratch.g),
+            at(g.scratch, scratch.beta),
+            at(g.scratch, scratch.o),
+        );
+        // SAFETY: as `enqueue`'s, for the step's arena operands (`extents`: `qkv`, `z`, `a`, `b`,
+        // `out` and the scratch, whose four regions lie inside its span) and its bundle
+        // (`gdn_bundle`'s bytes, which `new` checked the buffer holds). The state buffers are
+        // layer `g.layer`'s, which `validate` checked is one of the tape's GDN layers and `new`
+        // allocated with this geometry; the uploaded slot is below the pool's `num_slots` and
+        // `q_len` in `1 ..= rows` (`forward` checked both), and the strides passed are the
+        // pool's own layout's.
+        unsafe {
+            kernels::gdn_conv1d(
+                (slot(g.qkv).cast_const(), wat(bundle.conv1d)),
+                (conv_state, layout.conv_elems_per_slot() as u64),
+                seq,
+                conv_out,
+                (g.rows, conv_dim, g.conv_kernel),
+                stream.0,
+            )?;
+            kernels::gdn_gating(
+                (slot(g.a).cast_const(), slot(g.b).cast_const()),
+                (wat(bundle.a_log), wat(bundle.dt_bias)),
+                seq,
+                (gate, beta),
+                (g.rows, g.num_v_heads),
+                stream.0,
+            )?;
+            kernels::gdn_scan(
+                (conv_out.cast_const(), gate.cast_const(), beta.cast_const()),
+                (ssm_state, layout.ssm_elems_per_slot() as u64),
+                seq,
+                o,
+                (g.rows, g.num_k_heads, g.num_v_heads),
+                (g.head_k, g.head_v, g.scale()),
+                stream.0,
+            )?;
+            kernels::gdn_rms_norm_gated(
+                (o.cast_const(), slot(g.z).cast_const(), wat(bundle.norm)),
+                seq,
+                slot(g.out),
+                (g.rows, g.num_v_heads, g.head_v),
+                g.eps(),
+                stream.0,
+            )
+        }
+    }
+
     /// The device address of an arena offset. The arena is device memory Rust never reads, so the
     /// address is computed, not dereferenced.
     fn slot(&self, offset: ArenaOffset) -> *mut c_void {
@@ -992,11 +1420,13 @@ impl<'a> CudaWorker<'a> {
 }
 
 /// What one forward uploads before its steps: the input, the rotary table's span and rows when the
-/// tape has one, and the KV regions when it has a KV cache.
+/// tape has one, the KV regions when it has a KV cache, and the GDN sequence region and its 4 u32
+/// when it has GDN layers.
 struct Uploads<'h> {
     input: &'h [u16],
     table: Option<(ArenaSpan, &'h [u16])>,
     kv: Option<KvUpload<'h>>,
+    gdn: Option<(ArenaSpan, &'h [u32; 4])>,
 }
 
 /// One forward's KV regions, filled on the host: the tape's spans and the bytes for each.

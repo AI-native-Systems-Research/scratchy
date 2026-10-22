@@ -12,16 +12,19 @@ use std::num::NonZeroU32;
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::model_geometry::HeadDim;
-use scratchy_subtile::subtile_ir::{EwKind, GainConvention, RowScale, SourceShape, SubOp};
-use scratchy_subtile::subtile_tape::{ComputeInput, Instr};
+use scratchy_subtile::subtile_ir::{
+    EwKind, GainConvention, RowScale, SourceShape, SubOp, SubtileIR,
+};
+use scratchy_subtile::subtile_tape::{ComputeInput, ComputeInputs, Instr};
+use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, colour_tape};
 use scratchy_subtile::tape_folding::FusedShape;
-use scratchy_target_cuda::op_abi::CudaFusion;
+use scratchy_target_cuda::op_abi::{CUDA_COLOUR_FACTS, CudaFusion, cuda_colour_rule};
 use scratchy_target_cuda::step::CudaStep;
 use scratchy_target_cuda_compiler::canonical::{
     ArenaRefusal, CanonicalAt, CanonicalRefusal, CudaModelFacts, CudaPlan, GateShapeRule,
-    GemmShapeRule, OperandRefusal, RopeShapeRule, lower_canonical, plan_canonical,
+    GemmShapeRule, OperandRefusal, RopeShapeRule, lower_canonical, lower_plan, plan_canonical,
 };
-use scratchy_target_cuda_compiler::steps_from_tape::{StepCx, TapeStep, lower_fused};
+use scratchy_target_cuda_compiler::steps_from_tape::{StepCx, TapeStep, lower_fused, lower_step};
 
 const AT: CanonicalAt<'static> = CanonicalAt {
     stem: "fixture",
@@ -34,6 +37,7 @@ const FACTS: CudaModelFacts = CudaModelFacts {
     head_dim: 256,
     rot_dim: 64,
     rope_theta: 1e7,
+    gdn: None,
 };
 
 fn fixtures() -> Vec<(&'static str, LoweringInput)> {
@@ -197,6 +201,7 @@ fn a_rope_on_the_hidden_with_the_global_table_lowers_to_one_rope() {
         head_dim: 64,
         rot_dim: 32,
         rope_theta: 1e4,
+        gdn: None,
     };
     let c = lower_canonical(&l, facts, AT).expect("the rope lowers");
     let [CudaStep::Rope(rope)] = c.steps.as_slice() else {
@@ -566,6 +571,8 @@ fn a_fold_whose_absorbed_step_is_not_on_the_tape_is_refused() {
         rotary: None,
         kv: Ok(None),
         kv_regions: None,
+        gdn_layers: &[],
+        gdn_regions: None,
     };
     let computes: Vec<TapeStep<'_>> = (p.tape.instrs().iter())
         .filter_map(|i| match i {
@@ -604,4 +611,222 @@ fn a_fold_whose_absorbed_step_is_not_on_the_tape_is_refused() {
         e,
         CanonicalRefusal::ProducerMissing { step: 4, op: "Mul" }
     ));
+}
+
+// ── The carried refusals of #762's review ──────────────────────────
+//
+// `PerLayer`, `SplitWriters`, `PartialRead`, `PartialWrite` and `UnsizedColour` cannot come out of
+// a canonical under CUDA's tables: CUDA does not re-roll (so no operand has a `per_layer` table),
+// its column block is the whole width (one writer per value), `lower_region` binds whole regions,
+// and its colour rule gives a second output only to an op that states a second shape. Each is
+// reached by changing one fact of a real plan and lowering that plan (`lower_plan`), or by calling
+// `lower_step` on a step with one input replaced. `SeveralEmbeddedHidden` comes out of
+// `lower_canonical` itself.
+
+/// `y = x + x`, then `y + x`, over `[256, 2048]`: step 1's operand 0 is a computed slot, operand 1
+/// the embedded hidden.
+fn two_adds() -> LoweredDecode {
+    let shape = SourceShape {
+        rows: 256,
+        cols: 2048,
+    };
+    let add = |inputs| OpDesc {
+        op: SubOp::Elementwise(EwKind::Add),
+        m: 256,
+        inputs,
+    };
+    with_hidden(LoweringInput {
+        exported: None,
+        sources: vec![shape, shape],
+        ops: vec![
+            add(vec![InputRef::Ext(0), InputRef::Ext(0)]),
+            add(vec![InputRef::Op(0), InputRef::Ext(0)]),
+        ],
+        result: 1,
+    })
+}
+
+/// Two sources bound to the embedded hidden: colour 0 is one buffer.
+#[test]
+fn two_embedded_hidden_sources_are_refused() {
+    let mut l = two_adds();
+    l.bindings[1] = SourceBinding::EmbeddedHidden;
+    let e = refusal(&l, FACTS);
+    assert!(e.to_string().contains("several sources"), "{e}");
+    assert!(matches!(
+        e,
+        CanonicalRefusal::Arena(ArenaRefusal::SeveralEmbeddedHidden)
+    ));
+}
+
+/// Step 1's second operand reads only part of its tensor.
+#[test]
+fn an_operand_reading_part_of_its_tensor_is_refused() {
+    let mut p = plan_canonical(&two_adds(), FACTS, AT).expect("the adds plan");
+    p.graph.nodes[1].inputs[1].region.cols.len -= 8;
+    let e = lower_plan(p).expect_err("a partial read");
+    assert!(e.to_string().contains("part of its tensor"), "{e}");
+    assert!(matches!(
+        e,
+        CanonicalRefusal::Operand {
+            step: 1,
+            op: "Add",
+            operand: 1,
+            why: OperandRefusal::PartialRead,
+        }
+    ));
+}
+
+/// Step 1 writes only part of its output tensor.
+#[test]
+fn a_step_writing_part_of_its_output_is_refused() {
+    let mut p = plan_canonical(&two_adds(), FACTS, AT).expect("the adds plan");
+    p.graph.nodes[1].output.region.rows.len -= 1;
+    let e = lower_plan(p).expect_err("a partial write");
+    assert!(e.to_string().contains("part of its output"), "{e}");
+    assert!(matches!(
+        e,
+        CanonicalRefusal::PartialWrite { step: 1, op: "Add" }
+    ));
+}
+
+/// The plan's `Compute`s, numbered as `lower_canonical` numbers them.
+fn computes(p: &CudaPlan) -> Vec<TapeStep<'_>> {
+    (p.tape.instrs().iter())
+        .filter_map(|i| match i {
+            Instr::Compute {
+                node,
+                writes,
+                inputs,
+                ..
+            } => Some((&p.graph.nodes[node.index()], *writes, inputs)),
+            _ => None,
+        })
+        .enumerate()
+        .map(|(step, (node, writes, inputs))| TapeStep {
+            step,
+            node,
+            writes,
+            inputs,
+        })
+        .collect()
+}
+
+/// `lower_step` of [`two_adds`]'s step 1 with its inputs replaced by `inputs(original)`.
+fn lower_second_add(
+    inputs: impl FnOnce(&SubtileIR, &[TapeStep<'_>]) -> ComputeInputs,
+) -> CanonicalRefusal {
+    let p = plan_canonical(&two_adds(), FACTS, AT).expect("the adds plan");
+    let cx = StepCx {
+        graph: &p.graph,
+        bindings: &p.lowered.bindings,
+        colouring: &p.colouring,
+        facts: p.facts,
+        tokens: Some(256),
+        offsets: Ok(&[0, 1048576, 2097152]),
+        rotary: None,
+        kv: Ok(None),
+        kv_regions: None,
+        gdn_layers: &[],
+        gdn_regions: None,
+    };
+    let all = computes(&p);
+    let replaced = inputs(&p.graph, &all);
+    let s = TapeStep {
+        step: 1,
+        node: all[1].node,
+        writes: all[1].writes,
+        inputs: &replaced,
+    };
+    match lower_step(&cx, &s, &all) {
+        Err(e) => {
+            eprintln!("refused: {e}");
+            e
+        }
+        Ok(step) => panic!("lowered a step CUDA cannot bind: {step:?}"),
+    }
+}
+
+/// An operand that is a re-rolled per-layer source: CUDA does not re-roll, so its tapes never
+/// carry a `per_layer` table.
+#[test]
+fn a_per_layer_operand_is_refused() {
+    let e = lower_second_add(|graph, all| {
+        let first = all[1].inputs.iter().next().cloned().expect("operand 0");
+        let x = graph.nodes[0].inputs[0];
+        ComputeInputs::A2([
+            first,
+            ComputeInput::External {
+                tensor: x.tensor,
+                region: x.region,
+                per_layer: vec![x.tensor, x.tensor],
+            },
+        ])
+    });
+    assert!(e.to_string().contains("per-layer"), "{e}");
+    assert!(matches!(
+        e,
+        CanonicalRefusal::Operand {
+            step: 1,
+            operand: 1,
+            why: OperandRefusal::PerLayer,
+            ..
+        }
+    ));
+}
+
+/// An operand written by two steps: CUDA's column block is the whole width, so one step writes
+/// each value.
+#[test]
+fn an_operand_of_two_writers_is_refused() {
+    let e = lower_second_add(|_, all| {
+        let second = all[1].inputs.iter().nth(1).cloned().expect("operand 1");
+        ComputeInputs::A2([
+            ComputeInput::Computed(vec![all[0].writes, all[0].writes]),
+            second,
+        ])
+    });
+    assert!(e.to_string().contains("2 writers"), "{e}");
+    assert!(matches!(
+        e,
+        CanonicalRefusal::Operand {
+            step: 1,
+            operand: 0,
+            why: OperandRefusal::SplitWriters(2),
+            ..
+        }
+    ));
+}
+
+/// CUDA's colour rule, but with an add writing two buffers. An add states no second shape, so
+/// its second colour has none.
+fn add_with_two_outputs(op: &SubOp) -> ColourRule {
+    match op {
+        SubOp::Elementwise(EwKind::Add) => ColourRule::FRESH.reads_across().two_outputs(),
+        op => cuda_colour_rule(op),
+    }
+}
+
+/// A colour the colourer reports no shape for cannot be sized.
+#[test]
+fn a_colour_with_no_shape_is_refused() {
+    let mut p = plan_canonical(&two_adds(), FACTS, AT).expect("the adds plan");
+    let facts = ColourFacts {
+        rule: add_with_two_outputs,
+        ..CUDA_COLOUR_FACTS
+    };
+    p.colouring = colour_tape(
+        &p.graph,
+        &p.tape,
+        &p.lowered.bindings,
+        &p.folds.fold_facts(),
+        &facts,
+    )
+    .expect("the colourer colours both adds' two outputs");
+    let e = lower_plan(p).expect_err("an unsized colour");
+    assert!(e.to_string().contains("has no shape"), "{e}");
+    assert!(
+        matches!(e, CanonicalRefusal::Arena(ArenaRefusal::UnsizedColour(_))),
+        "{e}"
+    );
 }

@@ -59,6 +59,13 @@ required-features = ["nvcc"]
 name = "attention"
 required-features = ["nvcc"]
 
+# The Gated-DeltaNet kernels (conv1d, gating, recurrent scan, gated norm) against f64 CPU
+# references, self-checks and exact probes, over a NaN-poisoned state pool, on the GPU. Not built
+# without `nvcc`.
+[[test]]
+name = "gdn"
+required-features = ["nvcc"]
+
 # The hand-written tapes against what CUDA's compiler lowers. No toolchain needed.
 [[test]]
 name = "tape_layout"

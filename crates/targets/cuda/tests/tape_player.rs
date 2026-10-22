@@ -12,6 +12,7 @@ pub mod common {
     pub mod attn_gate;
     pub mod attn_layer;
     pub mod chains;
+    pub mod gdn_layer;
     pub mod mlp;
     pub mod numerics;
 }
@@ -19,9 +20,10 @@ pub mod common {
 use common::attn_gate::{ATTN_GATE_M128, ATTN_GATE_M256, attn_gate};
 use common::attn_layer::{ATTN_LAYER_M128, ATTN_LAYER_M256, attn_layer};
 use common::chains::{
-    HIDDEN, THREE_GEMM_M256, TWO_GEMM_M128, TWO_GEMM_M256, assert_tape_is_lowered, three_gemm,
-    two_gemm,
+    HIDDEN, QWEN3_5_GDN_FACTS, THREE_GEMM_M256, TWO_GEMM_M128, TWO_GEMM_M256,
+    assert_tape_is_lowered, assert_tape_is_lowered_with, three_gemm, two_gemm,
 };
+use common::gdn_layer::{GDN_LAYER_M128, GDN_LAYER_M256, gdn_layer};
 use common::mlp::{EPS, MLP_M128, MLP_M256, mlp};
 use common::numerics::{
     ATTN_SCORE_MAX, AttnCase, add_reference, attention_reference, bf16_inputs, centred_gains,
@@ -29,16 +31,22 @@ use common::numerics::{
     gate_split_reference, gather_paged, mismatched_bits, rms_norm_reference, rope_reference,
     silu_mul_reference,
 };
+use common::numerics::{
+    GDN_SCAN_STEP, GdnDims, ScanInputs, ScanReference, ScanVariant, compare_f32, f32_from_halves,
+    f32_inputs, f32_to_halves, gdn_conv_bound, gdn_conv_reference, gdn_gating_bound,
+    gdn_gating_reference, gdn_norm_reference, gdn_scan_bound, gdn_scan_reference, widen,
+};
+use scratchy_subtile::gdn_state_layout::GdnStateLayout;
 use scratchy_subtile::subtile_ir::GainConvention;
 use scratchy_target_cuda::kernels::{gemm_bf16_abt, rms_norm_bf16, rope_bf16};
 use scratchy_target_cuda::rotary::rotary_rows;
 use scratchy_target_cuda::runtime::{
-    CudaDevice, CudaWorker, DeviceBuffer, ForwardError, KvHalf, KvPoolConfig, KvSequence,
-    WorkerError,
+    CudaDevice, CudaWorker, DeviceBuffer, ForwardError, GdnPoolConfig, GdnSequence, KvHalf,
+    KvPoolConfig, KvSequence, WorkerError,
 };
-use scratchy_target_cuda::step::CudaStep;
+use scratchy_target_cuda::step::{CudaStep, gdn_bundle, gdn_scratch};
 use scratchy_target_cuda::tape::{
-    ArenaOffset, ArenaSpan, CudaTape, KvTape, RotaryTable, TapeError, WeightIx,
+    ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, RotaryTable, TapeError, WeightIx,
 };
 
 /// One worker's buckets: `M = 128` and `M = 256` of the same two-GEMM graph.
@@ -135,14 +143,15 @@ fn a_two_gemm_chain_matches_the_cpu_reference_in_each_bucket() {
         DeviceBuffer::upload(&device, &w.w1).expect("upload W1"),
         DeviceBuffer::upload(&device, &w.w2).expect("upload W2"),
     ];
-    let mut worker = CudaWorker::new(&device, &TWO_GEMM_BUCKETS, &table, None).expect("worker");
+    let mut worker =
+        CudaWorker::new(&device, &TWO_GEMM_BUCKETS, &table, None, None).expect("worker");
     let mut pass = true;
     for (bucket, tape) in TWO_GEMM_BUCKETS.iter().enumerate() {
         let m = tape.bucket_m as usize;
         let x = input(m);
         let mut y2 = vec![0u16; m * H];
         worker
-            .forward(bucket, &x, &[], None, &mut y2)
+            .forward(bucket, &x, &[], None, None, &mut y2)
             .expect("forward");
         let y1 = read(&mut worker, colour(tape, 1));
         pass &= check_stage("y1 = x·W1ᵀ", &y1, &x, &w.w1, (m, WIDE, H));
@@ -162,7 +171,8 @@ fn the_worker_allocates_once_and_no_forward_allocates() {
         DeviceBuffer::upload(&device, &w.w1).expect("upload W1"),
         DeviceBuffer::upload(&device, &w.w2).expect("upload W2"),
     ];
-    let mut worker = CudaWorker::new(&device, &TWO_GEMM_BUCKETS, &table, None).expect("worker");
+    let mut worker =
+        CudaWorker::new(&device, &TWO_GEMM_BUCKETS, &table, None, None).expect("worker");
     let built = device.allocations() - before;
     let arena = worker.arena_bytes();
     eprintln!(
@@ -181,7 +191,7 @@ fn the_worker_allocates_once_and_no_forward_allocates() {
         let m = TWO_GEMM_BUCKETS[bucket].bucket_m as usize;
         let mut y2 = vec![0u16; m * H];
         worker
-            .forward(bucket, &inputs[bucket], &[], None, &mut y2)
+            .forward(bucket, &inputs[bucket], &[], None, None, &mut y2)
             .expect("forward");
         if i == 0 {
             free_after_first = Some(device.mem_info().expect("cudaMemGetInfo").0);
@@ -222,18 +232,20 @@ fn the_three_gemm_chain_reuses_a_colour_and_stays_right() {
     let x = input(256);
 
     let two = std::slice::from_ref(&TWO_GEMM_M256);
-    let mut worker = CudaWorker::new(&device, two, &table[..3], None).expect("two-GEMM worker");
+    let mut worker =
+        CudaWorker::new(&device, two, &table[..3], None, None).expect("two-GEMM worker");
     let mut two_y2 = vec![0u16; 256 * H];
     worker
-        .forward(0, &x, &[], None, &mut two_y2)
+        .forward(0, &x, &[], None, None, &mut two_y2)
         .expect("two-GEMM forward");
     drop(worker);
 
     let three = std::slice::from_ref(&THREE_GEMM_M256);
-    let mut worker = CudaWorker::new(&device, three, &table, None).expect("three-GEMM worker");
+    let mut worker =
+        CudaWorker::new(&device, three, &table, None, None).expect("three-GEMM worker");
     let mut y3 = vec![0u16; 256 * WIDE];
     worker
-        .forward(0, &x, &[], None, &mut y3)
+        .forward(0, &x, &[], None, None, &mut y3)
         .expect("three-GEMM forward");
     let y2 = read(&mut worker, colour(&THREE_GEMM_M256, 2));
     let pass = check_stage(
@@ -263,10 +275,11 @@ fn short_inputs_and_short_weights_are_refused() {
         DeviceBuffer::upload(&device, &w.w1).expect("upload W1"),
         DeviceBuffer::upload(&device, &w.w2).expect("upload W2"),
     ];
-    let mut worker = CudaWorker::new(&device, &TWO_GEMM_BUCKETS, &table, None).expect("worker");
+    let mut worker =
+        CudaWorker::new(&device, &TWO_GEMM_BUCKETS, &table, None, None).expect("worker");
     let x = input(256);
     let mut y2 = vec![0u16; 256 * H];
-    let got = worker.forward(1, &x[..x.len() - 1], &[], None, &mut y2);
+    let got = worker.forward(1, &x[..x.len() - 1], &[], None, None, &mut y2);
     let want = Err(ForwardError::InputSize {
         expected: 262144,
         got: 262142,
@@ -274,7 +287,7 @@ fn short_inputs_and_short_weights_are_refused() {
     eprintln!("input one element short: {got:?} {}", verdict(got == want));
     assert_eq!(got, want);
     worker
-        .forward(1, &x, &[], None, &mut y2)
+        .forward(1, &x, &[], None, None, &mut y2)
         .expect("the next valid forward");
     let y1 = read(&mut worker, colour(&TWO_GEMM_M256, 1));
     let pass = check_stage(
@@ -292,7 +305,7 @@ fn short_inputs_and_short_weights_are_refused() {
         DeviceBuffer::upload(&device, &w.w1[..w.w1.len() - 1]).expect("upload short W1"),
         DeviceBuffer::upload(&device, &w.w2).expect("upload W2"),
     ];
-    let got = CudaWorker::new(&device, &TWO_GEMM_BUCKETS, &short, None).map(|_| ());
+    let got = CudaWorker::new(&device, &TWO_GEMM_BUCKETS, &short, None, None).map(|_| ());
     let want = Err(WorkerError::WeightTooSmall {
         ix: 1,
         need: 1048576,
@@ -397,14 +410,14 @@ fn the_mlp_block_matches_the_cpu_reference_in_each_bucket() {
     let device = h100();
     let w = mlp_weights();
     let table = mlp_table(&device, &w);
-    let mut worker = CudaWorker::new(&device, &MLP_BUCKETS, &table, None).expect("worker");
+    let mut worker = CudaWorker::new(&device, &MLP_BUCKETS, &table, None, None).expect("worker");
     let mut pass = true;
     for (bucket, tape) in MLP_BUCKETS.iter().enumerate() {
         let m = tape.bucket_m as usize;
         let x = mlp_input(m);
         let mut y = vec![0u16; m * MLP_H];
         worker
-            .forward(bucket, &x, &[], None, &mut y)
+            .forward(bucket, &x, &[], None, None, &mut y)
             .expect("forward");
         let n = n_direct(&device, tape, &x, &w.g);
         let n_ref = rms_norm_reference(&x, &w.g, (m, MLP_H), f64::from(EPS), 1.0);
@@ -436,7 +449,7 @@ fn the_mlp_worker_allocates_once_and_no_forward_allocates() {
     let w = mlp_weights();
     let before = device.allocations();
     let table = mlp_table(&device, &w);
-    let mut worker = CudaWorker::new(&device, &MLP_BUCKETS, &table, None).expect("worker");
+    let mut worker = CudaWorker::new(&device, &MLP_BUCKETS, &table, None, None).expect("worker");
     let built = device.allocations() - before;
     let arena = worker.arena_bytes();
     eprintln!(
@@ -456,7 +469,7 @@ fn the_mlp_worker_allocates_once_and_no_forward_allocates() {
         let m = MLP_BUCKETS[bucket].bucket_m as usize;
         let mut y = vec![0u16; m * MLP_H];
         worker
-            .forward(bucket, &inputs[bucket], &[], None, &mut y)
+            .forward(bucket, &inputs[bucket], &[], None, None, &mut y)
             .expect("forward");
         if i == 0 {
             free_after_first = Some(device.mem_info().expect("cudaMemGetInfo").0);
@@ -510,7 +523,7 @@ fn a_tape_reading_an_undeclared_weight_is_refused_before_any_allocation() {
     let w = mlp_weights();
     let table = mlp_table(&device, &w);
     let before = device.allocations();
-    let got = CudaWorker::new(&device, &BAD_WEIGHT, &table, None).map(|_| ());
+    let got = CudaWorker::new(&device, &BAD_WEIGHT, &table, None, None).map(|_| ());
     let allocated = device.allocations() - before;
     let want = Err(WorkerError::Tape {
         bucket: 0,
@@ -593,7 +606,7 @@ fn the_attention_gate_matches_the_cpu_reference_in_each_bucket() {
     let device = h100();
     let w = attn_weights();
     let table = attn_table(&device, &w);
-    let mut worker = CudaWorker::new(&device, &ATTN_BUCKETS, &table, None).expect("worker");
+    let mut worker = CudaWorker::new(&device, &ATTN_BUCKETS, &table, None, None).expect("worker");
     let mut pass = true;
     for (bucket, tape) in ATTN_BUCKETS.iter().enumerate() {
         let m = tape.bucket_m as usize;
@@ -601,7 +614,7 @@ fn the_attention_gate_matches_the_cpu_reference_in_each_bucket() {
         let positions = attn_positions(m);
         let mut y = vec![0u16; m * AG_H];
         worker
-            .forward(bucket, &x, &positions, None, &mut y)
+            .forward(bucket, &x, &positions, None, None, &mut y)
             .expect("forward");
         let n = n_direct(&device, tape, &x, &w.g_in);
         let n_ref = rms_norm_reference(&x, &w.g_in, (m, AG_H), f64::from(EPS), 1.0);
@@ -669,7 +682,7 @@ fn the_attention_gate_worker_allocates_once_and_no_forward_allocates() {
     let w = attn_weights();
     let before = device.allocations();
     let table = attn_table(&device, &w);
-    let mut worker = CudaWorker::new(&device, &ATTN_BUCKETS, &table, None).expect("worker");
+    let mut worker = CudaWorker::new(&device, &ATTN_BUCKETS, &table, None, None).expect("worker");
     let built = device.allocations() - before;
     let arena = worker.arena_bytes();
     eprintln!(
@@ -690,7 +703,14 @@ fn the_attention_gate_worker_allocates_once_and_no_forward_allocates() {
         let m = ATTN_BUCKETS[bucket].bucket_m as usize;
         let mut y = vec![0u16; m * AG_H];
         worker
-            .forward(bucket, &inputs[bucket], &positions[bucket], None, &mut y)
+            .forward(
+                bucket,
+                &inputs[bucket],
+                &positions[bucket],
+                None,
+                None,
+                &mut y,
+            )
             .expect("forward");
         if i == 0 {
             free_after_first = Some(device.mem_info().expect("cudaMemGetInfo").0);
@@ -724,10 +744,10 @@ fn a_forward_with_the_wrong_positions_is_refused() {
     let device = h100();
     let w = attn_weights();
     let table = attn_table(&device, &w);
-    let mut worker = CudaWorker::new(&device, &ATTN_BUCKETS, &table, None).expect("worker");
+    let mut worker = CudaWorker::new(&device, &ATTN_BUCKETS, &table, None, None).expect("worker");
     let x = attn_input(256);
     let mut y = vec![0u16; 256 * AG_H];
-    let got = worker.forward(1, &x, &attn_positions(255), None, &mut y);
+    let got = worker.forward(1, &x, &attn_positions(255), None, None, &mut y);
     let want = Err(ForwardError::Positions {
         expected: 256,
         got: 255,
@@ -743,8 +763,16 @@ fn a_forward_with_the_wrong_positions_is_refused() {
 
     let w = mlp_weights();
     let table = mlp_table(&device, &w);
-    let mut worker = CudaWorker::new(&device, &MLP_BUCKETS, &table, None).expect("MLP worker");
-    let got = worker.forward(1, &mlp_input(256), &[7], None, &mut vec![0u16; 256 * MLP_H]);
+    let mut worker =
+        CudaWorker::new(&device, &MLP_BUCKETS, &table, None, None).expect("MLP worker");
+    let got = worker.forward(
+        1,
+        &mlp_input(256),
+        &[7],
+        None,
+        None,
+        &mut vec![0u16; 256 * MLP_H],
+    );
     let want = Err(ForwardError::Positions {
         expected: 0,
         got: 1,
@@ -775,7 +803,7 @@ fn a_tape_whose_rotary_table_reaches_past_the_arena_is_refused() {
     let w = attn_weights();
     let table = attn_table(&device, &w);
     let before = device.allocations();
-    let got = CudaWorker::new(&device, &BAD_ROTARY, &table, None).map(|_| ());
+    let got = CudaWorker::new(&device, &BAD_ROTARY, &table, None, None).map(|_| ());
     let allocated = device.allocations() - before;
     let want = Err(WorkerError::Tape {
         bucket: 0,
@@ -935,7 +963,7 @@ fn the_attention_layer_matches_the_cpu_reference_in_each_bucket() {
     let device = h100();
     let w = layer_weights();
     let table = layer_table(&device, &w);
-    let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL).expect("worker");
+    let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL, None).expect("worker");
     let mut pass = true;
     for (bucket, tape) in LAYER_BUCKETS.iter().enumerate() {
         let m = tape.bucket_m as usize;
@@ -949,7 +977,7 @@ fn the_attention_layer_matches_the_cpu_reference_in_each_bucket() {
         };
         let mut y = vec![0u16; m * AL_H];
         worker
-            .forward(bucket, &x, &positions, Some(&seq), &mut y)
+            .forward(bucket, &x, &positions, Some(&seq), None, &mut y)
             .expect("forward");
         // `n` (colour 1) holds `o` by the forward's end: the norm kernel is run alone.
         let n = n_direct(&device, tape, &x, &w.g_in);
@@ -1105,7 +1133,7 @@ fn a_second_chunk_reads_the_first_from_the_cache() {
     let device = h100();
     let w = layer_weights();
     let table = layer_table(&device, &w);
-    let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL).expect("worker");
+    let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL, None).expect("worker");
     let tape = &ATTN_LAYER_M256;
     let block_table = [11u32, 3, 14, 0, 7, 9, 2, 5];
     let mut y = vec![0u16; 256 * AL_H];
@@ -1120,6 +1148,7 @@ fn a_second_chunk_reads_the_first_from_the_cache() {
             &layer_input(256, 0xC4A),
             &seq_positions(256, 0),
             Some(&a),
+            None,
             &mut y,
         )
         .expect("forward A");
@@ -1134,7 +1163,14 @@ fn a_second_chunk_reads_the_first_from_the_cache() {
     };
     let positions = seq_positions(256, 256);
     worker
-        .forward(1, &layer_input(256, 0xC4B), &positions, Some(&b), &mut y)
+        .forward(
+            1,
+            &layer_input(256, 0xC4B),
+            &positions,
+            Some(&b),
+            None,
+            &mut y,
+        )
         .expect("forward B");
     let (kb, vb) = (
         read_pool(&mut worker, KvHalf::K),
@@ -1182,7 +1218,7 @@ fn a_short_chunk_pads() {
     let device = h100();
     let w = layer_weights();
     let table = layer_table(&device, &w);
-    let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL).expect("worker");
+    let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL, None).expect("worker");
     let tape = &ATTN_LAYER_M128;
     let block_table = [11u32, 3, 14];
     let mut y = vec![0u16; 128 * AL_H];
@@ -1198,6 +1234,7 @@ fn a_short_chunk_pads() {
             &layer_input(128, 0x5401),
             &seq_positions(128, 0),
             Some(&f1),
+            None,
             &mut y,
         )
         .expect("forward 1");
@@ -1215,6 +1252,7 @@ fn a_short_chunk_pads() {
             &layer_input(128, 0x5402),
             &seq_positions(128, 0),
             Some(&f2),
+            None,
             &mut y,
         )
         .expect("forward 2");
@@ -1236,7 +1274,14 @@ fn a_short_chunk_pads() {
     };
     let positions = seq_positions(128, 37);
     worker
-        .forward(0, &layer_input(128, 0x5403), &positions, Some(&f3), &mut y)
+        .forward(
+            0,
+            &layer_input(128, 0x5403),
+            &positions,
+            Some(&f3),
+            None,
+            &mut y,
+        )
         .expect("forward 3");
     let kb = read_pool(&mut worker, KvHalf::K);
     let vb = read_pool(&mut worker, KvHalf::V);
@@ -1284,7 +1329,7 @@ fn the_attention_layer_worker_allocates_once_and_no_forward_allocates() {
     let w = layer_weights();
     let before = device.allocations();
     let table = layer_table(&device, &w);
-    let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL).expect("worker");
+    let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL, None).expect("worker");
     let built = device.allocations() - before;
     let arena = worker.arena_bytes();
     let pool = worker.kv_pool_bytes();
@@ -1321,6 +1366,7 @@ fn the_attention_layer_worker_allocates_once_and_no_forward_allocates() {
                 &inputs[bucket],
                 &seq_positions(m, 0),
                 Some(&seq),
+                None,
                 &mut y,
             )
             .expect("forward");
@@ -1356,7 +1402,7 @@ fn a_bad_sequence_is_refused_before_any_copy() {
     let device = h100();
     let w = layer_weights();
     let table = layer_table(&device, &w);
-    let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL).expect("worker");
+    let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL, None).expect("worker");
     let x = layer_input(128, 0xBAD);
     let pos = seq_positions(128, 0);
     let good: &[u32] = &[11, 3];
@@ -1434,7 +1480,7 @@ fn a_bad_sequence_is_refused_before_any_copy() {
     let mut pass = true;
     for (kv, positions, want) in &cases {
         let mut y = vec![0u16; 128 * AL_H];
-        let got = worker.forward(0, &x, positions, kv.as_ref(), &mut y);
+        let got = worker.forward(0, &x, positions, kv.as_ref(), None, &mut y);
         let untouched = y.iter().all(|&b| b == 0);
         eprintln!(
             "refused {want:?}: got={got:?} result_untouched={untouched} {}",
@@ -1444,7 +1490,7 @@ fn a_bad_sequence_is_refused_before_any_copy() {
     }
     // Too few entries for the tokens.
     let mut y = vec![0u16; 128 * AL_H];
-    let got = worker.forward(0, &x, &pos, Some(&seq(&[11], 0, 128)), &mut y);
+    let got = worker.forward(0, &x, &pos, Some(&seq(&[11], 0, 128)), None, &mut y);
     let want = Err(ForwardError::KvBlockTable {
         got: 1,
         need: 2,
@@ -1458,13 +1504,13 @@ fn a_bad_sequence_is_refused_before_any_copy() {
     // A good forward after them is the same as on a fresh worker.
     let mut after = vec![0u16; 128 * AL_H];
     worker
-        .forward(0, &x, &pos, Some(&seq(good, 0, 128)), &mut after)
+        .forward(0, &x, &pos, Some(&seq(good, 0, 128)), None, &mut after)
         .expect("a good forward after the refusals");
     let mut fresh_worker =
-        CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL).expect("a fresh worker");
+        CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL, None).expect("a fresh worker");
     let mut fresh = vec![0u16; 128 * AL_H];
     fresh_worker
-        .forward(0, &x, &pos, Some(&seq(good, 0, 128)), &mut fresh)
+        .forward(0, &x, &pos, Some(&seq(good, 0, 128)), None, &mut fresh)
         .expect("the fresh forward");
     let same = after == fresh;
     eprintln!(
@@ -1478,13 +1524,15 @@ fn a_bad_sequence_is_refused_before_any_copy() {
     // `KvUnexpected` on the attention-gate tape, which has no KV cache.
     let gw = attn_weights();
     let gt = attn_table(&device, &gw);
-    let mut gate_worker = CudaWorker::new(&device, &ATTN_BUCKETS, &gt, None).expect("gate worker");
+    let mut gate_worker =
+        CudaWorker::new(&device, &ATTN_BUCKETS, &gt, None, None).expect("gate worker");
     let mut y = vec![0u16; 256 * AG_H];
     let got = gate_worker.forward(
         1,
         &attn_input(256),
         &attn_positions(256),
         Some(&seq(good, 0, 128)),
+        None,
         &mut y,
     );
     eprintln!(
@@ -1502,7 +1550,7 @@ fn a_kv_read_outside_the_pool_is_refused() {
     let device = h100();
     let w = layer_weights();
     let table = layer_table(&device, &w);
-    let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL).expect("worker");
+    let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL, None).expect("worker");
     let mut pass = true;
     for (layer, block, len) in [
         (1usize, 0u32, BLOCK_ELEMS),
@@ -1528,7 +1576,8 @@ fn a_kv_read_outside_the_pool_is_refused() {
     drop(worker);
     let gw = attn_weights();
     let gt = attn_table(&device, &gw);
-    let mut gate_worker = CudaWorker::new(&device, &ATTN_BUCKETS, &gt, None).expect("gate worker");
+    let mut gate_worker =
+        CudaWorker::new(&device, &ATTN_BUCKETS, &gt, None, None).expect("gate worker");
     let mut out = vec![0u16; BLOCK_ELEMS];
     let got = gate_worker.read_kv(0, KvHalf::K, 0, &mut out);
     let want = Err(ForwardError::KvRead {
@@ -1578,7 +1627,7 @@ fn the_kv_pool_is_given_exactly_when_a_tape_needs_it() {
     ];
     let mut pass = true;
     for ((tapes, weights, pool), want) in cases {
-        let got = CudaWorker::new(&device, tapes, weights, pool).map(|_| ());
+        let got = CudaWorker::new(&device, tapes, weights, pool, None).map(|_| ());
         eprintln!(
             "{want:?}: got={got:?} {}",
             verdict(got == Err(want.clone()))
@@ -1606,3 +1655,803 @@ static OTHER_KV: [CudaTape; 2] = [
         ..ATTN_LAYER_M256
     },
 ];
+
+// ── qwen3.5-0.8b's linear-attention (GDN) layer ────────────────────
+
+/// One worker's buckets: `M = 128` and `M = 256` of the GDN layer.
+static GDN_BUCKETS: [CudaTape; 2] = [GDN_LAYER_M128, GDN_LAYER_M256];
+
+const GL_H: usize = common::gdn_layer::H as usize;
+const GL_NV: usize = common::gdn_layer::NV as usize;
+const GL_VALUE: usize = common::gdn_layer::VALUE_DIM as usize;
+const GL_CONV: usize = common::gdn_layer::CONV_DIM as usize;
+/// The GDN pool's slots in every GDN-layer test.
+const GDN_SLOTS: u32 = 4;
+const GDN_POOL: Option<GdnPoolConfig> = Some(GdnPoolConfig {
+    num_slots: GDN_SLOTS,
+});
+const G08: GdnDims = GdnDims {
+    nk: 16,
+    nv: 16,
+    head_k: 128,
+    head_v: 128,
+    conv_kernel: 4,
+};
+
+#[test]
+fn the_played_gdn_tapes_are_the_lowered_ones() {
+    assert_tape_is_lowered_with(
+        "gdn_layer(128)",
+        &GDN_LAYER_M128,
+        &gdn_layer(128),
+        QWEN3_5_GDN_FACTS,
+    );
+    assert_tape_is_lowered_with(
+        "gdn_layer(256)",
+        &GDN_LAYER_M256,
+        &gdn_layer(256),
+        QWEN3_5_GDN_FACTS,
+    );
+}
+
+/// The layer's weights: `g_in [H]` zero-centred, `Wqkv [CONV, H]`, `Wz [VALUE, H]`, `Wa` and `Wb
+/// [NV, H]`, `Wo [H, VALUE]` (bf16); the packed f32 bundle's four parts.
+struct GdnWeights {
+    g_in: Vec<u16>,
+    wqkv: Vec<u16>,
+    wz: Vec<u16>,
+    wa: Vec<u16>,
+    wb: Vec<u16>,
+    wo: Vec<u16>,
+    conv1d: Vec<f32>,
+    a_log: Vec<f32>,
+    dt_bias: Vec<f32>,
+    norm: Vec<f32>,
+}
+
+/// `len` bf16 in `[-scale, scale]`.
+fn scaled(len: usize, seed: u64, scale: f32) -> Vec<u16> {
+    bf16_inputs(len, seed)
+        .into_iter()
+        .map(|b| common::numerics::bits(half::bf16::from_bits(b).to_f32() * scale))
+        .collect()
+}
+
+fn gdn_weights() -> GdnWeights {
+    // Scaled so the projections of `n` (whose rows have unit RMS) land in about [-1, 1] for qkv
+    // and z and [-2, 2] for a and b: the issue's test ranges.
+    GdnWeights {
+        g_in: centred_gains(GL_H, 0x6DA0_0001),
+        wqkv: scaled(GL_CONV * GL_H, 0x6DA0_0002, 1.0 / 32.0),
+        wz: scaled(GL_VALUE * GL_H, 0x6DA0_0003, 1.0 / 32.0),
+        wa: scaled(GL_NV * GL_H, 0x6DA0_0004, 1.0 / 16.0),
+        wb: scaled(GL_NV * GL_H, 0x6DA0_0005, 1.0 / 16.0),
+        wo: scaled(GL_H * GL_VALUE, 0x6DA0_0006, 1.0 / 32.0),
+        conv1d: f32_inputs(GL_CONV * 4, 0x6DA0_0007, (-0.5, 0.5)),
+        a_log: f32_inputs(GL_NV, 0x6DA0_0008, (-1.0, 0.5)),
+        dt_bias: f32_inputs(GL_NV, 0x6DA0_0009, (-0.5, 0.5)),
+        norm: f32_inputs(128, 0x6DA0_000A, (0.5, 1.5)),
+    }
+}
+
+/// The bundle packed as `gdn_bundle` lays it out, as the u16 pairs `DeviceBuffer` uploads.
+fn pack_bundle(w: &GdnWeights) -> Vec<u16> {
+    let layout = gdn_bundle(GL_CONV as u32, 4, GL_NV as u32, 128).expect("the bundle fits");
+    let mut f = vec![0f32; layout.bytes as usize / 4];
+    for (at, part) in [
+        (layout.conv1d, &w.conv1d),
+        (layout.a_log, &w.a_log),
+        (layout.dt_bias, &w.dt_bias),
+        (layout.norm, &w.norm),
+    ] {
+        f[at as usize / 4..][..part.len()].copy_from_slice(part);
+    }
+    f32_to_halves(&f)
+}
+
+/// The weight table, by source index (the fixture's): 0 is the embedded hidden.
+fn gdn_table(device: &CudaDevice, w: &GdnWeights) -> Vec<DeviceBuffer> {
+    let up = |b: &[u16]| DeviceBuffer::upload(device, b).expect("upload a weight");
+    vec![
+        DeviceBuffer::empty(),
+        up(&w.g_in),
+        up(&w.wqkv),
+        up(&w.wz),
+        up(&w.wa),
+        up(&w.wb),
+        up(&pack_bundle(w)),
+        up(&w.wo),
+    ]
+}
+
+/// The embedded hidden of an `m`-row GDN bucket, under `seed`.
+fn gdn_input(m: usize, seed: u64) -> Vec<u16> {
+    bf16_inputs(m * GL_H, seed ^ m as u64)
+}
+
+/// The GDN scratch's four regions after a forward, f32, read through `read_arena`.
+struct Scratch {
+    conv_out: Vec<f32>,
+    g: Vec<f32>,
+    beta: Vec<f32>,
+    o: Vec<f32>,
+}
+
+fn read_scratch(worker: &mut CudaWorker<'_>, tape: &CudaTape) -> Scratch {
+    let gdn = tape.gdn.expect("a GDN tape");
+    let m = tape.bucket_m;
+    let s = gdn_scratch(m, GL_CONV as u32, GL_NV as u32, GL_VALUE as u32).expect("fits");
+    let base = gdn.scratch.offset.0;
+    let mut part = |at: u64, elems: usize| {
+        let span = ArenaSpan {
+            offset: ArenaOffset(base + at),
+            bytes: (elems * 4) as u64,
+        };
+        f32_from_halves(&read(worker, span))
+    };
+    let m = m as usize;
+    Scratch {
+        conv_out: part(s.conv_out, m * GL_CONV),
+        g: part(s.g, m * GL_NV),
+        beta: part(s.beta, m * GL_NV),
+        o: part(s.o, m * GL_VALUE),
+    }
+}
+
+/// Layer 0's slot `slot`: `(conv ring, ssm state)`.
+fn read_gdn(worker: &mut CudaWorker<'_>, slot: u32) -> (Vec<f32>, Vec<f32>) {
+    let l = GdnStateLayout::new(GDN_SLOTS, 16, 16, 128, 128, 4);
+    let mut conv = vec![0f32; l.conv_elems_per_slot()];
+    let mut ssm = vec![0f32; l.ssm_elems_per_slot()];
+    worker
+        .read_gdn_state(0, slot, &mut conv, &mut ssm)
+        .expect("read_gdn_state");
+    (conv, ssm)
+}
+
+/// Every slot's state, as bits.
+fn gdn_snapshot(worker: &mut CudaWorker<'_>) -> Vec<Vec<u32>> {
+    (0..GDN_SLOTS)
+        .map(|s| {
+            let (c, m) = read_gdn(worker, s);
+            c.iter().chain(&m).map(|v| v.to_bits()).collect()
+        })
+        .collect()
+}
+
+fn to_f64(v: &[f32]) -> Vec<f64> {
+    v.iter().map(|&x| f64::from(x)).collect()
+}
+
+/// Where a forward's scan starts: the state and running `Smax` before this chunk (`None` for a
+/// fresh start, from zero), and its first token within the sequence.
+struct ScanStart<'a> {
+    state: Option<(&'a [f64], &'a [f64])>,
+    t0: usize,
+}
+
+/// One forward's checks, every stage from its own GPU input: the norm (run alone, since `o`
+/// overwrites `n`), the four projections, conv_out (from the ring `ring`, zeros when fresh), g and
+/// β, o (from `start`), core, the output projection and the add. Rows past `q_len` of `core` must
+/// be exactly `+0.0`. Returns whether all passed and the scan's reference, for a continuation.
+fn check_gdn_forward(
+    what: &str,
+    (device, worker): (&CudaDevice, &mut CudaWorker<'_>),
+    (tape, w): (&CudaTape, &GdnWeights),
+    (x, y): (&[u16], &[u16]),
+    (q_len, ring): (usize, &[f64]),
+    start: &ScanStart<'_>,
+) -> (bool, ScanReference) {
+    let m = tape.bucket_m as usize;
+    let mut pass = true;
+    let n = n_direct(device, tape, x, &w.g_in);
+    let n_ref = rms_norm_reference(x, &w.g_in, (m, GL_H), f64::from(EPS), 1.0);
+    pass &= check_rows(
+        &format!("{what} n = RmsNorm(x, g_in)"),
+        &n,
+        &n_ref,
+        (m, GL_H),
+    );
+    let qkv = read(worker, colour(tape, 2));
+    pass &= check_stage(
+        &format!("{what} qkv = n·Wqkvᵀ"),
+        &qkv,
+        &n,
+        &w.wqkv,
+        (m, GL_CONV, GL_H),
+    );
+    let z = read(worker, colour(tape, 3));
+    pass &= check_stage(
+        &format!("{what} z = n·Wzᵀ"),
+        &z,
+        &n,
+        &w.wz,
+        (m, GL_VALUE, GL_H),
+    );
+    let a = read(worker, colour(tape, 4));
+    pass &= check_stage(
+        &format!("{what} a = n·Waᵀ (narrow)"),
+        &a,
+        &n,
+        &w.wa,
+        (m, GL_NV, GL_H),
+    );
+    let b = read(worker, colour(tape, 5));
+    pass &= check_stage(
+        &format!("{what} b = n·Wbᵀ (narrow)"),
+        &b,
+        &n,
+        &w.wb,
+        (m, GL_NV, GL_H),
+    );
+    let s = read_scratch(worker, tape);
+    // conv_out from the real rows of qkv after the ring.
+    let (refs, _) = gdn_conv_reference(
+        &widen(&qkv[..q_len * GL_CONV]),
+        &to_f64(&w.conv1d),
+        ring,
+        (q_len, GL_CONV, 4),
+        false,
+    );
+    let r: Vec<f64> = refs.iter().map(|p| p.0).collect();
+    let n_conv = q_len * GL_CONV;
+    let cmp = compare_f32(
+        &s.conv_out[..n_conv],
+        &r,
+        |i| gdn_conv_bound(refs[i].0, refs[i].1),
+        |_| true,
+    );
+    eprintln!(
+        "{what} conv_out L={q_len}: {} {}",
+        cmp.line(),
+        verdict(cmp.pass())
+    );
+    pass &= cmp.pass();
+    let nh = q_len * GL_NV;
+    let (g_ref, beta_ref) = gdn_gating_reference(
+        &widen(&a[..nh]),
+        &widen(&b[..nh]),
+        &to_f64(&w.a_log),
+        &to_f64(&w.dt_bias),
+        GL_NV,
+        true,
+    );
+    let gc = compare_f32(&s.g[..nh], &g_ref, |i| gdn_gating_bound(g_ref[i]), |_| true);
+    let bc = compare_f32(
+        &s.beta[..nh],
+        &beta_ref,
+        |i| gdn_gating_bound(beta_ref[i]),
+        |_| true,
+    );
+    eprintln!(
+        "{what} g, beta L={q_len}: g {} beta {} {}",
+        gc.line(),
+        bc.line(),
+        verdict(gc.pass() && bc.pass())
+    );
+    pass &= gc.pass() && bc.pass();
+    let zero_state = vec![0.0; GL_VALUE * 128];
+    let (state, smax) = match start.state {
+        Some((st, sm)) => (st, Some(sm)),
+        None => (&zero_state[..], None),
+    };
+    let conv_out = to_f64(&s.conv_out[..n_conv]);
+    let (gg, bb) = (to_f64(&s.g[..nh]), to_f64(&s.beta[..nh]));
+    let scan = gdn_scan_reference(
+        &ScanInputs {
+            conv_out: &conv_out,
+            g: &gg,
+            beta: &bb,
+            state,
+            smax,
+            t0: start.t0,
+            q_len,
+        },
+        G08,
+        ScanVariant::Real,
+    );
+    let o_ref: Vec<f64> = scan.o.iter().map(|p| p.0).collect();
+    let oc = compare_f32(
+        &s.o[..q_len * GL_VALUE],
+        &o_ref,
+        |i| gdn_scan_bound(scan.o[i].0, scan.o[i].1),
+        |_| true,
+    );
+    eprintln!(
+        "{what} o (scan) L={q_len} t0={}: {} {}",
+        start.t0,
+        oc.line(),
+        verdict(oc.pass())
+    );
+    pass &= oc.pass();
+    let core = read(worker, colour(tape, 6));
+    let nv_rows = q_len * GL_VALUE;
+    let core_ref = gdn_norm_reference(
+        &to_f64(&s.o[..nv_rows]),
+        &widen(&z[..nv_rows]),
+        &to_f64(&w.norm),
+        (q_len, GL_NV, 128),
+        f64::from(EPS),
+        true,
+    );
+    let cc = compare_rows(&core[..nv_rows], &core_ref, GL_VALUE);
+    let not_zero = core[nv_rows..].iter().filter(|&&v| v != 0).count();
+    eprintln!(
+        "{what} core (gated norm) L={q_len}: {} padding_rows_not_plus_zero={not_zero} {}",
+        cc.line(),
+        verdict(cc.pass() && not_zero == 0)
+    );
+    pass &= cc.pass() && not_zero == 0;
+    let o = read(worker, colour(tape, 1));
+    pass &= check_stage(
+        &format!("{what} o = core·Woᵀ"),
+        &o,
+        &core,
+        &w.wo,
+        (m, GL_H, GL_VALUE),
+    );
+    let mismatched = mismatched_bits(y, &add_reference(&o, x));
+    eprintln!(
+        "{what} y = o + x: mismatched_bits={mismatched} {}",
+        verdict(mismatched == 0)
+    );
+    pass &= mismatched == 0;
+    (pass, scan)
+}
+
+/// A fresh sequence's conv ring: zeros.
+static FRESH_RING: [f64; GL_CONV * 3] = [0.0; GL_CONV * 3];
+
+/// Both buckets, `q_len = M`, fresh in slot 1: every stage within bound of its own GPU input.
+#[test]
+fn the_gdn_layer_matches_the_cpu_reference_in_each_bucket() {
+    let device = h100();
+    let w = gdn_weights();
+    let table = gdn_table(&device, &w);
+    let mut worker =
+        CudaWorker::new(&device, &GDN_BUCKETS, &table, None, GDN_POOL).expect("worker");
+    let mut pass = true;
+    for (bucket, tape) in GDN_BUCKETS.iter().enumerate() {
+        let m = tape.bucket_m as usize;
+        let x = gdn_input(m, 0x6D1);
+        let seq = GdnSequence {
+            slot: 1,
+            q_len: m as u32,
+            fresh: true,
+        };
+        let mut y = vec![0u16; m * GL_H];
+        worker
+            .forward(bucket, &x, &[], None, Some(&seq), &mut y)
+            .expect("forward");
+        let start = ScanStart { state: None, t0: 0 };
+        let (ok, _) = check_gdn_forward(
+            &format!("gdn M={m}"),
+            (&device, &mut worker),
+            (tape, &w),
+            (&x, &y),
+            (m, &FRESH_RING),
+            &start,
+        );
+        pass &= ok;
+    }
+    assert!(pass, "a stage of the GDN layer is out of bound");
+}
+
+/// Bucket 256: chunk 1 (`q_len = 200`, fresh, slot 2), then chunk 2 (`q_len = 150`, continued).
+/// Chunk 2's stages within bound, its scan against the reference from the state chunk 1 left; the
+/// state after chunk 2 within the long-recurrence bound of a reference over all 350 tokens;
+/// chunk 2's padding rows of `core` `+0.0`; slots 0, 1 and 3 bit-unchanged.
+#[test]
+fn the_gdn_layer_carries_its_state_across_two_chunks() {
+    let device = h100();
+    let w = gdn_weights();
+    let table = gdn_table(&device, &w);
+    let mut worker =
+        CudaWorker::new(&device, &GDN_BUCKETS, &table, None, GDN_POOL).expect("worker");
+    let tape = &GDN_LAYER_M256;
+    let before = gdn_snapshot(&mut worker);
+    let mut y = vec![0u16; 256 * GL_H];
+    let x1 = gdn_input(256, 0xC41);
+    let s1 = GdnSequence {
+        slot: 2,
+        q_len: 200,
+        fresh: true,
+    };
+    worker
+        .forward(1, &x1, &[], None, Some(&s1), &mut y)
+        .expect("chunk 1");
+    let fresh = ScanStart { state: None, t0: 0 };
+    let (ok1, scan1) = check_gdn_forward(
+        "gdn chunk 1",
+        (&device, &mut worker),
+        (tape, &w),
+        (&x1, &y),
+        (200, &FRESH_RING),
+        &fresh,
+    );
+    let chunk1_scratch = read_scratch(&mut worker, tape);
+    let (ring1, state1) = read_gdn(&mut worker, 2);
+    let x2 = gdn_input(256, 0xC42);
+    let s2 = GdnSequence {
+        slot: 2,
+        q_len: 150,
+        fresh: false,
+    };
+    worker
+        .forward(1, &x2, &[], None, Some(&s2), &mut y)
+        .expect("chunk 2");
+    let (st1, sm1) = (to_f64(&state1), scan1.smax.clone());
+    let cont = ScanStart {
+        state: Some((&st1, &sm1)),
+        t0: 200,
+    };
+    let (ok2, _) = check_gdn_forward(
+        "gdn chunk 2",
+        (&device, &mut worker),
+        (tape, &w),
+        (&x2, &y),
+        (150, &to_f64(&ring1)),
+        &cont,
+    );
+    // The state after chunk 2 against one reference over all 350 tokens, from both chunks' GPU
+    // conv_out, g and β.
+    let chunk2_scratch = read_scratch(&mut worker, tape);
+    let cat = |a: &[f32], b: &[f32], cols: usize, (l1, l2): (usize, usize)| {
+        let mut v = to_f64(&a[..l1 * cols]);
+        v.extend(to_f64(&b[..l2 * cols]));
+        v
+    };
+    let lens = (200, 150);
+    let conv_out = cat(
+        &chunk1_scratch.conv_out,
+        &chunk2_scratch.conv_out,
+        GL_CONV,
+        lens,
+    );
+    let g = cat(&chunk1_scratch.g, &chunk2_scratch.g, GL_NV, lens);
+    let beta = cat(&chunk1_scratch.beta, &chunk2_scratch.beta, GL_NV, lens);
+    let zero = vec![0.0; GL_VALUE * 128];
+    let whole = gdn_scan_reference(
+        &ScanInputs {
+            conv_out: &conv_out,
+            g: &g,
+            beta: &beta,
+            state: &zero,
+            smax: None,
+            t0: 0,
+            q_len: 350,
+        },
+        G08,
+        ScanVariant::Real,
+    );
+    let (_, state2) = read_gdn(&mut worker, 2);
+    let sc = compare_f32(
+        &state2,
+        &whole.state,
+        |i| GDN_SCAN_STEP * whole.state_scale[i / 128],
+        |_| true,
+    );
+    let after = gdn_snapshot(&mut worker);
+    let others: usize = [0usize, 1, 3]
+        .iter()
+        .map(|&s| {
+            (before[s].iter().zip(&after[s]))
+                .filter(|(a, b)| a != b)
+                .count()
+        })
+        .sum();
+    eprintln!(
+        "gdn state after 350 tokens vs one reference: {} other_slots_mismatched_bits={others} {}",
+        sc.line(),
+        verdict(sc.pass() && others == 0)
+    );
+    assert!(ok1 && ok2, "a chunk's stage is out of bound");
+    assert!(sc.pass(), "the state after two chunks is out of bound");
+    assert_eq!(others, 0, "a chunk touched another slot");
+}
+
+/// Sequence A (two chunks in slot 2), then sequence B fresh in slot 2: B's result and state
+/// bit-identical to B fresh in slot 0 of the same worker, and to B on a second worker.
+#[test]
+fn the_gdn_layer_does_not_leak_state_into_a_fresh_sequence() {
+    let device = h100();
+    let w = gdn_weights();
+    let table = gdn_table(&device, &w);
+    let mut worker =
+        CudaWorker::new(&device, &GDN_BUCKETS, &table, None, GDN_POOL).expect("worker");
+    let run = |worker: &mut CudaWorker<'_>, x: &[u16], seq: GdnSequence| {
+        let mut y = vec![0u16; 256 * GL_H];
+        worker
+            .forward(1, x, &[], None, Some(&seq), &mut y)
+            .expect("forward");
+        y
+    };
+    let seq = |slot, q_len, fresh| GdnSequence { slot, q_len, fresh };
+    run(&mut worker, &gdn_input(256, 0xA01), seq(2, 256, true));
+    run(&mut worker, &gdn_input(256, 0xA02), seq(2, 100, false));
+    let xb = gdn_input(256, 0xB01);
+    let in_2 = run(&mut worker, &xb, seq(2, 180, true));
+    let state_2 = read_gdn(&mut worker, 2);
+    let in_0 = run(&mut worker, &xb, seq(0, 180, true));
+    let state_0 = read_gdn(&mut worker, 0);
+    let mut other = CudaWorker::new(&device, &GDN_BUCKETS, &table, None, GDN_POOL).expect("other");
+    let on_other = run(&mut other, &xb, seq(3, 180, true));
+    let state_other = read_gdn(&mut other, 3);
+    let bits = |a: &(Vec<f32>, Vec<f32>), b: &(Vec<f32>, Vec<f32>)| {
+        (a.0.iter().chain(&a.1).zip(b.0.iter().chain(&b.1)))
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count()
+    };
+    let (y0, s0) = (mismatched_bits(&in_2, &in_0), bits(&state_2, &state_0));
+    let (y1, s1) = (
+        mismatched_bits(&in_2, &on_other),
+        bits(&state_2, &state_other),
+    );
+    eprintln!(
+        "B fresh in slot 2 after A vs slot 0: y_mismatched={y0} state_mismatched_bits={s0}; vs a \
+         second worker: y_mismatched={y1} state_mismatched_bits={s1} {}",
+        verdict(y0 + s0 + y1 + s1 == 0)
+    );
+    assert_eq!(
+        y0 + s0 + y1 + s1,
+        0,
+        "a fresh sequence saw a previous one's state"
+    );
+}
+
+/// Arena 15253760 and pool 4489216 bytes; 9 allocations (7 weights, the arena, the pool), then 0
+/// over five forwards (256, 128, 256, 128, 256; fresh and continued); free memory equal after
+/// forwards 1 and 5; repeated identical fresh forwards bit-identical.
+#[test]
+fn the_gdn_layer_worker_allocates_once_and_no_forward_allocates() {
+    let device = h100();
+    let w = gdn_weights();
+    let before = device.allocations();
+    let table = gdn_table(&device, &w);
+    let mut worker =
+        CudaWorker::new(&device, &GDN_BUCKETS, &table, None, GDN_POOL).expect("worker");
+    let built = device.allocations() - before;
+    let arena = worker.arena_bytes();
+    let pool = worker.gdn_pool_bytes();
+    eprintln!(
+        "gdn layer arena_bytes={arena} (expect 15253760) pool_bytes={pool:?} (expect 4489216) \
+         allocations(weights + arena + pool)={built} (expect 9) {}",
+        verdict(arena == 15253760 && pool == Some(4489216) && built == 9)
+    );
+    assert_eq!(arena, 15253760, "the arena is the larger bucket's total");
+    assert_eq!(
+        pool,
+        Some(4489216),
+        "4 slots: conv 294912 + ssm 4194304 bytes"
+    );
+    assert_eq!(built, 9, "seven weights, one arena, one pool");
+
+    let inputs = [gdn_input(128, 0xA110), gdn_input(256, 0xA110)];
+    let mut firsts: [Option<Vec<u16>>; 2] = [None, None];
+    let at_forwards = device.allocations();
+    let mut free_after_first = None;
+    let mut identical = true;
+    for (i, (bucket, fresh)) in [(1usize, true), (0, true), (1, false), (0, true), (1, true)]
+        .into_iter()
+        .enumerate()
+    {
+        let m = GDN_BUCKETS[bucket].bucket_m;
+        let seq = GdnSequence {
+            slot: bucket as u32,
+            q_len: m,
+            fresh,
+        };
+        let mut y = vec![0u16; m as usize * GL_H];
+        worker
+            .forward(bucket, &inputs[bucket], &[], None, Some(&seq), &mut y)
+            .expect("forward");
+        if i == 0 {
+            free_after_first = Some(device.mem_info().expect("cudaMemGetInfo").0);
+        }
+        if fresh {
+            match &firsts[bucket] {
+                Some(first) => identical &= *first == y,
+                None => firsts[bucket] = Some(y),
+            }
+        }
+    }
+    let free_after_first = free_after_first.expect("forward 1 ran");
+    let free_after_last = device.mem_info().expect("cudaMemGetInfo").0;
+    let during = device.allocations() - at_forwards;
+    eprintln!(
+        "gdn layer five forwards (256, 128, 256, 128, 256): allocations={during} (expect 0) \
+         free_after_forward_1={free_after_first} free_after_forward_5={free_after_last} \
+         fresh_results_bit_identical={identical} {}",
+        verdict(during == 0 && free_after_first == free_after_last && identical)
+    );
+    assert_eq!(during, 0, "a forward allocated device memory");
+    assert_eq!(
+        free_after_first, free_after_last,
+        "device free memory moved"
+    );
+    assert!(
+        identical,
+        "a fresh bucket's result changed between forwards"
+    );
+}
+
+/// Each GDN `ForwardError`, before any copy: the result, the arena's GDN regions and every slot
+/// of the pool unchanged; `GdnUnexpected` on the MLP tape. A bad state read is refused too.
+#[test]
+fn a_bad_gdn_sequence_is_refused_before_any_copy() {
+    let device = h100();
+    let w = gdn_weights();
+    let table = gdn_table(&device, &w);
+    let mut worker =
+        CudaWorker::new(&device, &GDN_BUCKETS, &table, None, GDN_POOL).expect("worker");
+    let x = gdn_input(128, 0xBAD);
+    let mut y = vec![0u16; 128 * GL_H];
+    worker
+        .forward(
+            0,
+            &x,
+            &[],
+            None,
+            Some(&GdnSequence {
+                slot: 1,
+                q_len: 128,
+                fresh: true,
+            }),
+            &mut y,
+        )
+        .expect("a good forward first");
+    let arena_before = read(
+        &mut worker,
+        ArenaSpan {
+            offset: ArenaOffset(0),
+            bytes: GDN_LAYER_M128.arena.total_bytes,
+        },
+    );
+    let pool_before = gdn_snapshot(&mut worker);
+    let seq = |slot, q_len| GdnSequence {
+        slot,
+        q_len,
+        fresh: false,
+    };
+    let cases: [(Option<GdnSequence>, ForwardError); 4] = [
+        (None, ForwardError::GdnMissing),
+        (
+            Some(seq(4, 128)),
+            ForwardError::GdnSlotOutsidePool {
+                slot: 4,
+                num_slots: 4,
+            },
+        ),
+        (
+            Some(seq(1, 0)),
+            ForwardError::GdnQueryLength {
+                q_len: 0,
+                bucket_m: 128,
+            },
+        ),
+        (
+            Some(seq(1, 129)),
+            ForwardError::GdnQueryLength {
+                q_len: 129,
+                bucket_m: 128,
+            },
+        ),
+    ];
+    let mut pass = true;
+    for (gdn, want) in &cases {
+        let mut out = vec![0u16; 128 * GL_H];
+        let got = worker.forward(0, &x, &[], None, gdn.as_ref(), &mut out);
+        let untouched = out.iter().all(|&b| b == 0);
+        let arena_same = read(
+            &mut worker,
+            ArenaSpan {
+                offset: ArenaOffset(0),
+                bytes: GDN_LAYER_M128.arena.total_bytes,
+            },
+        ) == arena_before;
+        let pool_same = gdn_snapshot(&mut worker) == pool_before;
+        let ok = got.as_ref() == Err(want) && untouched && arena_same && pool_same;
+        eprintln!(
+            "refused {want:?}: got={got:?} result_untouched={untouched} arena_unchanged=\
+             {arena_same} pool_unchanged={pool_same} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    // A GDN sequence to a tape with no GDN layers.
+    let mw = mlp_weights();
+    let mt = mlp_table(&device, &mw);
+    let mut mlp_worker = CudaWorker::new(&device, &MLP_BUCKETS, &mt, None, None).expect("mlp");
+    let got = mlp_worker.forward(
+        1,
+        &mlp_input(256),
+        &[],
+        None,
+        Some(&seq(0, 256)),
+        &mut vec![0u16; 256 * MLP_H],
+    );
+    eprintln!(
+        "refused GdnUnexpected: {got:?} {}",
+        verdict(got == Err(ForwardError::GdnUnexpected))
+    );
+    pass &= got == Err(ForwardError::GdnUnexpected);
+    // A state read of a slot, a layer or a size the pool does not have.
+    let l = GdnStateLayout::new(GDN_SLOTS, 16, 16, 128, 128, 4);
+    let (ce, se) = (l.conv_elems_per_slot(), l.ssm_elems_per_slot());
+    for (layer, slot, conv_len, ssm_len) in [(0, 4, ce, se), (1, 0, ce, se), (0, 0, ce - 1, se)] {
+        let (mut c, mut s) = (vec![0f32; conv_len], vec![0f32; ssm_len]);
+        let got = worker.read_gdn_state(layer, slot, &mut c, &mut s);
+        let want = Err(ForwardError::GdnRead {
+            layer,
+            slot,
+            conv: (ce, conv_len),
+            ssm: (se, ssm_len),
+        });
+        eprintln!(
+            "refused a GDN state read layer={layer} slot={slot}: {got:?} {}",
+            verdict(got == want)
+        );
+        pass &= got == want;
+    }
+    assert!(pass, "a GDN refusal is wrong, or touched the device");
+}
+
+/// [`GDN_LAYER_M128`] beside a copy of [`GDN_LAYER_M256`] whose GDN state claims layer 4: one pool
+/// cannot hold both.
+static OTHER_GDN: [CudaTape; 2] = [
+    GDN_LAYER_M128,
+    CudaTape {
+        gdn: match GDN_LAYER_M256.gdn {
+            Some(g) => Some(GdnTape { layers: &[4], ..g }),
+            None => None,
+        },
+        ..GDN_LAYER_M256
+    },
+];
+
+/// A worker's tapes, weights and GDN pool.
+type WorkerCase<'w> = (
+    &'static [CudaTape],
+    &'w [DeviceBuffer],
+    Option<GdnPoolConfig>,
+);
+
+/// Each GDN `WorkerError`, before any allocation: no pool, a pool of 0 slots, a pool no tape uses,
+/// two GDN geometries.
+#[test]
+fn the_gdn_pool_is_given_exactly_when_a_tape_needs_it() {
+    let device = h100();
+    let w = gdn_weights();
+    let table = gdn_table(&device, &w);
+    let mw = mlp_weights();
+    let mt = mlp_table(&device, &mw);
+    let before = device.allocations();
+    let cases: [(WorkerCase<'_>, WorkerError); 4] = [
+        ((&GDN_BUCKETS, &table, None), WorkerError::GdnPoolMissing),
+        (
+            (&GDN_BUCKETS, &table, Some(GdnPoolConfig { num_slots: 0 })),
+            WorkerError::GdnPoolMissing,
+        ),
+        ((&MLP_BUCKETS, &mt, GDN_POOL), WorkerError::GdnPoolUnused),
+        (
+            (&OTHER_GDN, &table, GDN_POOL),
+            WorkerError::GdnGeometry { bucket: 1 },
+        ),
+    ];
+    let mut pass = true;
+    for ((tapes, weights, pool), want) in cases {
+        let got = CudaWorker::new(&device, tapes, weights, None, pool).map(|_| ());
+        eprintln!(
+            "{want:?}: got={got:?} {}",
+            verdict(got == Err(want.clone()))
+        );
+        pass &= got == Err(want);
+    }
+    let allocated = device.allocations() - before;
+    eprintln!(
+        "allocations by the refused workers={allocated} (expect 0) {}",
+        verdict(allocated == 0)
+    );
+    assert!(pass, "a GDN pool refusal is wrong");
+    assert_eq!(allocated, 0, "a refused worker allocated");
+}

@@ -8,7 +8,11 @@
 //! analyses nothing. Plain `Copy` data with no pointer, so it builds in a `const` context and on a
 //! host with no CUDA toolchain.
 
-use crate::step::{AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, RopeAppendBf16, RopeBf16};
+use crate::step::{
+    AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
+    GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, RopeAppendBf16,
+    RopeBf16, gdn_conv_dim, gdn_scratch,
+};
 
 /// Bytes per activation element: CUDA's activations are bf16.
 pub const CUDA_ACT_BYTES: u64 = 2;
@@ -97,6 +101,40 @@ pub struct KvTape {
 /// Bytes of one u32 entry of a KV region.
 const KV_ENTRY_BYTES: u64 = 4;
 
+/// The tape's Gated-DeltaNet layers: which layers' recurrent state it reads and writes, their
+/// geometry, and the two arena regions its GDN steps use.
+///
+/// Every field is fixed at expansion. The pool's slot count is not here: it is the worker's
+/// (`runtime::GdnPoolConfig`), sized once at construction, its per-layer buffers laid out by
+/// `scratchy_subtile::gdn_state_layout::GdnStateLayout`. What the forward writes into the
+/// sequence region (the slot, the real row count, the fresh flag) is its runtime data, uploaded as
+/// the KV sequence is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdnTape {
+    /// Model layer ids whose GDN state this tape reads and writes, in pool order (ascending); a
+    /// step's `layer` is an index into this list.
+    pub layers: &'static [u32],
+    pub num_k_heads: u32,
+    pub num_v_heads: u32,
+    pub head_k: u32,
+    pub head_v: u32,
+    pub conv_kernel: u32,
+    /// `[slot, q_len, start, 0]` u32: exactly 16 bytes at an aligned offset of its own.
+    pub sequence: ArenaSpan,
+    /// The f32 scratch every GDN step passes its intermediates through:
+    /// `crate::step::gdn_scratch(bucket_m, …)`'s bytes.
+    pub scratch: ArenaSpan,
+}
+
+impl GdnTape {
+    /// The scratch's bytes at `bucket_m` rows of this geometry, or `None` on overflow.
+    fn scratch_bytes(&self, bucket_m: u32) -> Option<u64> {
+        let value_dim = self.num_v_heads.checked_mul(self.head_v)?;
+        let conv_dim = gdn_conv_dim(self.num_k_heads, self.head_k, self.num_v_heads, self.head_v)?;
+        gdn_scratch(bucket_m, conv_dim, self.num_v_heads, value_dim).map(|s| s.bytes)
+    }
+}
+
 /// One bucket's forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CudaTape {
@@ -117,6 +155,9 @@ pub struct CudaTape {
     /// The paged KV cache and its regions, when the canonical binds a `PrefixK` source; `None`
     /// for a tape with no attention.
     pub kv: Option<KvTape>,
+    /// The Gated-DeltaNet layers and their regions, exactly when a step is a
+    /// [`CudaStep::GatedDeltaNet`]; `None` for a tape with no linear attention.
+    pub gdn: Option<GdnTape>,
 }
 
 /// Which of the tape's reserved regions a [`TapeError`] names.
@@ -126,6 +167,8 @@ pub enum Region {
     BlockTable,
     SlotMapping,
     Sequence,
+    GdnSequence,
+    GdnScratch,
 }
 
 impl std::fmt::Display for Region {
@@ -135,6 +178,8 @@ impl std::fmt::Display for Region {
             Self::BlockTable => "the block table",
             Self::SlotMapping => "the slot mapping",
             Self::Sequence => "the sequence region",
+            Self::GdnSequence => "the GDN sequence region",
+            Self::GdnScratch => "the GDN scratch",
         })
     }
 }
@@ -244,6 +289,52 @@ pub enum TapeError {
         step: usize,
         write: ArenaSpan,
         region: Region,
+    },
+    /// A GDN region (the sequence or the scratch) is not at a multiple of [`CUDA_ARENA_ALIGN`], or
+    /// reaches past the arena.
+    GdnRegionOutside {
+        region: Region,
+        span: ArenaSpan,
+        total: u64,
+    },
+    /// A GDN region is not the bytes its users take: the sequence exactly 16, the scratch
+    /// `gdn_scratch(bucket_m, …)`'s.
+    GdnRegionShape {
+        region: Region,
+        span: ArenaSpan,
+        want: u64,
+    },
+    /// The `step`-th step uses GDN layer index `layer`; the tape has `layers` (none when it has
+    /// no [`GdnTape`]).
+    GdnLayer {
+        step: usize,
+        layer: u32,
+        layers: usize,
+    },
+    /// The `step`-th step's GDN `region` operand is not the tape's region of that name (`None`
+    /// when the tape has no [`GdnTape`]).
+    GdnRegionMismatch {
+        step: usize,
+        region: Region,
+        span: ArenaSpan,
+        tape: Option<ArenaSpan>,
+    },
+    /// The `step`-th step's heads, head dims or conv kernel are not the tape's GDN geometry, so
+    /// its kernels would address the state pool with other strides than the worker allocated it
+    /// with.
+    GdnStepGeometry { step: usize },
+    /// The tape's own GDN geometry is one the kernels do not take: `conv_kernel` outside
+    /// [`GDN_CONV_KERNEL_RANGE`] (0 included, which `GdnStateLayout::new` asserts against), no
+    /// key or value heads, value heads not a whole number per key head, `head_k` not
+    /// [`GDN_HEAD_K`], `head_v` not a non-zero multiple of [`GDN_HEAD_V_MULTIPLE`] up to
+    /// [`GDN_HEAD_V_MAX`], or a `conv_dim` that overflows `u32`. The worker would size its state
+    /// pool from it.
+    GdnGeometry {
+        num_k_heads: u32,
+        num_v_heads: u32,
+        head_k: u32,
+        head_v: u32,
+        conv_kernel: u32,
     },
 }
 
@@ -419,6 +510,70 @@ impl std::fmt::Display for TapeError {
                      forward fills"
                 )
             }
+            Self::GdnRegionOutside {
+                region,
+                span,
+                total,
+            } => {
+                let (bytes, offset) = at(span);
+                write!(
+                    f,
+                    "{region} ({bytes} bytes at {offset}) is misaligned or reaches past the \
+                     {total}-byte arena"
+                )
+            }
+            Self::GdnRegionShape { region, span, want } => write!(
+                f,
+                "{region} is {} bytes; the GDN steps use {want}",
+                span.bytes
+            ),
+            Self::GdnLayer {
+                step,
+                layer,
+                layers,
+            } => write!(
+                f,
+                "step {step} uses GDN layer index {layer}, and the tape has {layers} GDN layers"
+            ),
+            Self::GdnRegionMismatch {
+                step,
+                region,
+                span,
+                tape,
+            } => {
+                let (bytes, offset) = at(span);
+                match tape {
+                    Some(t) => {
+                        let (tb, to) = at(t);
+                        write!(
+                            f,
+                            "step {step} uses {region} as {bytes} bytes at {offset}; the tape's \
+                             is {tb} bytes at {to}"
+                        )
+                    }
+                    None => write!(
+                        f,
+                        "step {step} uses {region} as {bytes} bytes at {offset}; the tape has no \
+                         GDN layers"
+                    ),
+                }
+            }
+            Self::GdnStepGeometry { step } => write!(
+                f,
+                "step {step}'s heads, head dims or conv kernel are not the tape's GDN geometry"
+            ),
+            Self::GdnGeometry {
+                num_k_heads,
+                num_v_heads,
+                head_k,
+                head_v,
+                conv_kernel,
+            } => write!(
+                f,
+                "the tape's GDN geometry ({num_v_heads} value heads of {head_v} over \
+                 {num_k_heads} key heads of {head_k}, conv kernel {conv_kernel}) is not one the \
+                 CUDA GDN kernels take"
+            ),
         }
     }
 }
@@ -434,7 +589,9 @@ impl CudaTape {
     /// overlaps none of its reads, nor its other write, nor a region the forward fills, and each
     /// weight it reads is one the tape declares, declared at least as large as the step reads. A
     /// rope reads the tape's rotary table, a KV step the tape's regions, at a KV layer the tape
-    /// has, with the tape's KV geometry. All arithmetic is checked. The worker runs this on every
+    /// has, with the tape's KV geometry; a GDN step the tape's GDN regions, at a GDN layer the
+    /// tape has, with its GDN geometry, and no other step touches the GDN scratch. All arithmetic
+    /// is checked. The worker runs this on every
     /// tape before it allocates anything; its own weight and pool checks then close the chain
     /// from each step to the buffer it reads.
     pub fn validate(&self) -> Result<(), TapeError> {
@@ -493,7 +650,8 @@ impl CudaTape {
                 });
             }
         }
-        let regions = self.kv_regions(total)?;
+        let mut regions = self.kv_regions(total)?;
+        let scratch = self.gdn_regions(total, &mut regions)?;
         for (step, s) in self.steps.iter().enumerate() {
             let e = s.extents().ok_or(TapeError::StepOverflow { step })?;
             let reads = e.reads.iter().flatten();
@@ -527,7 +685,41 @@ impl CudaTape {
                     });
                 }
             }
+            // The GDN scratch holds one GDN step's intermediates between its launches: only a GDN
+            // step reads or writes it. A write over it is refused as a write over a region, a
+            // read of it as a step using it that is not the tape's GDN step.
+            if let Some(scratch) = scratch
+                && !matches!(s, CudaStep::GatedDeltaNet(_))
+            {
+                for &write in [Some(e.writes), e.second_write].iter().flatten() {
+                    if overlap(scratch, write) {
+                        return Err(TapeError::WriteOverRegion {
+                            step,
+                            write,
+                            region: Region::GdnScratch,
+                        });
+                    }
+                }
+                if let Some(&read) = reads.clone().find(|&&r| overlap(r, scratch)) {
+                    return Err(TapeError::GdnRegionMismatch {
+                        step,
+                        region: Region::GdnScratch,
+                        span: read,
+                        tape: Some(scratch),
+                    });
+                }
+            }
             self.check_step_operands(step, s)?;
+            if let Some(layer) = e.gdn {
+                let layers = self.gdn.map_or(0, |g| g.layers.len());
+                if layer as usize >= layers {
+                    return Err(TapeError::GdnLayer {
+                        step,
+                        layer,
+                        layers,
+                    });
+                }
+            }
             if let Some((layer, _)) = e.kv {
                 let layers = self.kv.map_or(0, |kv| kv.layers.len());
                 if layer as usize >= layers {
@@ -601,8 +793,68 @@ impl CudaTape {
         Ok(regions)
     }
 
-    /// A rope's or rope-append's table is the tape's rotary table, and a KV step's regions and
-    /// geometry are the tape's.
+    /// The GDN regions, when the tape has GDN layers: the sequence region (which the forward
+    /// fills, so it joins `regions`) and the scratch, each checked to be aligned, inside the
+    /// arena, and the size its users take. Returns the scratch's span.
+    fn gdn_regions(
+        &self,
+        total: u64,
+        regions: &mut Vec<(Region, ArenaSpan)>,
+    ) -> Result<Option<ArenaSpan>, TapeError> {
+        let Some(gdn) = self.gdn else {
+            return Ok(None);
+        };
+        let GdnTape {
+            num_k_heads,
+            num_v_heads,
+            head_k,
+            head_v,
+            conv_kernel,
+            ..
+        } = gdn;
+        let (kmin, kmax) = GDN_CONV_KERNEL_RANGE;
+        let takes = (kmin..=kmax).contains(&conv_kernel)
+            && num_k_heads > 0
+            && num_v_heads > 0
+            && num_v_heads.is_multiple_of(num_k_heads)
+            && head_k == GDN_HEAD_K
+            && head_v > 0
+            && head_v.is_multiple_of(GDN_HEAD_V_MULTIPLE)
+            && head_v <= GDN_HEAD_V_MAX
+            && gdn_conv_dim(num_k_heads, head_k, num_v_heads, head_v).is_some();
+        if !takes {
+            return Err(TapeError::GdnGeometry {
+                num_k_heads,
+                num_v_heads,
+                head_k,
+                head_v,
+                conv_kernel,
+            });
+        }
+        // A scratch whose size overflows is one no span can match: `want` 0 never equals a
+        // non-empty scratch's bytes, and an empty scratch is refused as shape below.
+        let scratch_want = gdn.scratch_bytes(self.bucket_m).unwrap_or(0);
+        for (region, span, want) in [
+            (Region::GdnSequence, gdn.sequence, GDN_SEQUENCE_BYTES),
+            (Region::GdnScratch, gdn.scratch, scratch_want),
+        ] {
+            if !(span.offset.0.is_multiple_of(CUDA_ARENA_ALIGN) && inside(span, total)) {
+                return Err(TapeError::GdnRegionOutside {
+                    region,
+                    span,
+                    total,
+                });
+            }
+            if want == 0 || span.bytes != want {
+                return Err(TapeError::GdnRegionShape { region, span, want });
+            }
+        }
+        regions.push((Region::GdnSequence, gdn.sequence));
+        Ok(Some(gdn.scratch))
+    }
+
+    /// A rope's or rope-append's table is the tape's rotary table, a KV step's regions and
+    /// geometry are the tape's, and a GDN step's regions and geometry are the tape's GDN ones.
     fn check_step_operands(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
         let rotary = |table: ArenaOffset| {
             let tape = self.rotary.map(|t| t.span.offset);
@@ -673,7 +925,57 @@ impl CudaTape {
                     _ => Err(TapeError::KvStepGeometry { step }),
                 }
             }
+            CudaStep::GatedDeltaNet(
+                g @ GatedDeltaNetBf16 {
+                    sequence,
+                    scratch,
+                    num_k_heads,
+                    num_v_heads,
+                    head_k,
+                    head_v,
+                    conv_kernel,
+                    ..
+                },
+            ) => {
+                let mismatch = |region, span, tape| TapeError::GdnRegionMismatch {
+                    step,
+                    region,
+                    span,
+                    tape,
+                };
+                let seq = ArenaSpan {
+                    offset: sequence,
+                    bytes: GDN_SEQUENCE_BYTES,
+                };
+                let Some(gdn) = self.gdn else {
+                    return Err(mismatch(Region::GdnSequence, seq, None));
+                };
+                if (num_k_heads, num_v_heads, head_k, head_v, conv_kernel)
+                    != (
+                        gdn.num_k_heads,
+                        gdn.num_v_heads,
+                        gdn.head_k,
+                        gdn.head_v,
+                        gdn.conv_kernel,
+                    )
+                {
+                    return Err(TapeError::GdnStepGeometry { step });
+                }
+                if gdn.sequence != seq {
+                    return Err(mismatch(Region::GdnSequence, seq, Some(gdn.sequence)));
+                }
+                // `extents` already sized the scratch, so its layout does not overflow.
+                let sc = ArenaSpan {
+                    offset: scratch,
+                    bytes: g.scratch_layout().map_or(0, |l| l.bytes),
+                };
+                if gdn.scratch != sc {
+                    return Err(mismatch(Region::GdnScratch, sc, Some(gdn.scratch)));
+                }
+                Ok(())
+            }
             CudaStep::Gemm(_)
+            | CudaStep::GemmNarrow(_)
             | CudaStep::RmsNorm(_)
             | CudaStep::Add(_)
             | CudaStep::SiluMul(_)
@@ -700,8 +1002,8 @@ mod tests {
 
     use super::*;
     use crate::step::{
-        AddBf16, AttnPrefillBf16, CUDA_MAX_BLOCKS_PER_SEQ, GateSplitBf16, GemmBf16, KvUse,
-        RmsNormBf16, RopeAppendBf16, RopeBf16,
+        AddBf16, AttnPrefillBf16, CUDA_MAX_BLOCKS_PER_SEQ, GateSplitBf16, GatedDeltaNetBf16,
+        GemmBf16, KvUse, RmsNormBf16, RopeAppendBf16, RopeBf16, WeightRead,
     };
 
     const fn span(offset: u64, bytes: u64) -> ArenaSpan {
@@ -748,6 +1050,7 @@ mod tests {
         steps: GOOD_STEPS,
         rotary: None,
         kv: None,
+        gdn: None,
     };
 
     /// `GOOD` with its steps replaced by `step` alone.
@@ -1397,6 +1700,373 @@ mod tests {
                 step: 0,
                 span: span(1245184, 131072),
                 total: 1310720
+            })
+        );
+    }
+
+    // ── The GDN state's regions ────────────────────────────────────
+
+    /// A 64-row GDN tape of one key head and one value head of 32: `qkv [64, 288]` at 0, `z [64,
+    /// 32]` at 36864, `a` and `b [64, 1]` at 40960 and 41216, `out [64, 32]` at 41472; the GDN
+    /// sequence at 45568 and the scratch (82432 bytes) at 45824. Weight 1 is the bundle.
+    const GDN_SEQ: u64 = 45568;
+    const GDN_SCRATCH: u64 = 45824;
+    const GDN_SCRATCH_BYTES: u64 = 82432;
+    const GDN_TOTAL: u64 = GDN_SCRATCH + GDN_SCRATCH_BYTES;
+    const GDN_BUNDLE_BYTES: u64 = 5376;
+
+    const GDN: GdnTape = GdnTape {
+        layers: &[0],
+        num_k_heads: 1,
+        num_v_heads: 1,
+        head_k: 128,
+        head_v: 32,
+        conv_kernel: 4,
+        sequence: span(GDN_SEQ, 16),
+        scratch: span(GDN_SCRATCH, GDN_SCRATCH_BYTES),
+    };
+
+    fn gdn_step(layer: u32, sequence: u64, scratch: u64) -> GatedDeltaNetBf16 {
+        GatedDeltaNetBf16 {
+            qkv: ArenaOffset(0),
+            z: ArenaOffset(36864),
+            a: ArenaOffset(40960),
+            b: ArenaOffset(41216),
+            bundle: WeightIx(1),
+            out: ArenaOffset(41472),
+            scratch: ArenaOffset(scratch),
+            sequence: ArenaOffset(sequence),
+            layer,
+            rows: 64,
+            num_k_heads: 1,
+            num_v_heads: 1,
+            head_k: 128,
+            head_v: 32,
+            conv_kernel: 4,
+            eps_bits: 1e-6f32.to_bits(),
+        }
+    }
+
+    fn good_gdn_step() -> CudaStep {
+        CudaStep::GatedDeltaNet(gdn_step(0, GDN_SEQ, GDN_SCRATCH))
+    }
+
+    /// The GDN tape of `gdn` and `steps`.
+    fn gdn_tape(gdn: Option<GdnTape>, steps: &[CudaStep]) -> CudaTape {
+        CudaTape {
+            bucket_m: 64,
+            arena: ArenaLayout {
+                colour_bytes: &[36864, 4096, 128, 128, 4096],
+                colour_offsets: &[0, 36864, 40960, 41216, 41472],
+                total_bytes: GDN_TOTAL,
+            },
+            input: span(0, 36864),
+            result: span(41472, 4096),
+            weight_bytes: &[0, GDN_BUNDLE_BYTES],
+            steps: Box::leak(steps.to_vec().into_boxed_slice()),
+            rotary: None,
+            kv: None,
+            gdn,
+        }
+    }
+
+    #[test]
+    fn a_gdn_tape_validates() {
+        let t = gdn_tape(Some(GDN), &[good_gdn_step()]);
+        assert_eq!(t.validate(), Ok(()));
+        let Some(e) = good_gdn_step().extents() else {
+            panic!("the GDN step's extents fit u64");
+        };
+        assert_eq!(e.gdn, Some(0));
+        assert_eq!(e.second_write, Some(span(GDN_SCRATCH, GDN_SCRATCH_BYTES)));
+        assert_eq!(
+            e.weight,
+            Some(WeightRead {
+                ix: WeightIx(1),
+                bytes: GDN_BUNDLE_BYTES
+            })
+        );
+        assert_eq!(
+            e.reads,
+            [
+                Some(span(0, 36864)),
+                Some(span(36864, 4096)),
+                Some(span(40960, 128)),
+                Some(span(41216, 128)),
+            ]
+        );
+    }
+
+    #[test]
+    fn gdn_region_outside() {
+        for (gdn, region, at) in [
+            (
+                GdnTape {
+                    sequence: span(GDN_SEQ + 16, 16),
+                    ..GDN
+                },
+                Region::GdnSequence,
+                span(GDN_SEQ + 16, 16),
+            ),
+            (
+                GdnTape {
+                    scratch: span(GDN_SCRATCH + 256, GDN_SCRATCH_BYTES),
+                    ..GDN
+                },
+                Region::GdnScratch,
+                span(GDN_SCRATCH + 256, GDN_SCRATCH_BYTES),
+            ),
+        ] {
+            assert_eq!(
+                gdn_tape(Some(gdn), &[]).validate(),
+                Err(TapeError::GdnRegionOutside {
+                    region,
+                    span: at,
+                    total: GDN_TOTAL
+                }),
+                "{region}"
+            );
+        }
+    }
+
+    #[test]
+    fn gdn_region_shape() {
+        for (gdn, region, at, want) in [
+            (
+                GdnTape {
+                    sequence: span(GDN_SEQ, 8),
+                    ..GDN
+                },
+                Region::GdnSequence,
+                span(GDN_SEQ, 8),
+                16,
+            ),
+            (
+                GdnTape {
+                    scratch: span(GDN_SCRATCH, GDN_SCRATCH_BYTES - 256),
+                    ..GDN
+                },
+                Region::GdnScratch,
+                span(GDN_SCRATCH, GDN_SCRATCH_BYTES - 256),
+                GDN_SCRATCH_BYTES,
+            ),
+        ] {
+            assert_eq!(
+                gdn_tape(Some(gdn), &[]).validate(),
+                Err(TapeError::GdnRegionShape {
+                    region,
+                    span: at,
+                    want
+                }),
+                "{region}"
+            );
+        }
+    }
+
+    /// A GDN step at a layer index past the tape's layers, and one on a tape with none.
+    #[test]
+    fn gdn_layer() {
+        let step = CudaStep::GatedDeltaNet(gdn_step(1, GDN_SEQ, GDN_SCRATCH));
+        assert_eq!(
+            gdn_tape(Some(GDN), &[step]).validate(),
+            Err(TapeError::GdnLayer {
+                step: 0,
+                layer: 1,
+                layers: 1
+            })
+        );
+    }
+
+    /// A GDN step whose sequence or scratch is not the tape's, and one on a tape with no GDN.
+    #[test]
+    fn gdn_region_mismatch() {
+        let step = CudaStep::GatedDeltaNet(gdn_step(0, GDN_SEQ - 256, GDN_SCRATCH));
+        let t = CudaTape {
+            arena: ArenaLayout {
+                colour_bytes: &[36864, 4096, 128, 128, 4096, 0],
+                colour_offsets: &[0, 36864, 40960, 41216, 41472, 45312],
+                total_bytes: GDN_TOTAL,
+            },
+            ..gdn_tape(Some(GDN), &[step])
+        };
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::GdnRegionMismatch {
+                step: 0,
+                region: Region::GdnSequence,
+                span: span(GDN_SEQ - 256, 16),
+                tape: Some(GDN.sequence),
+            })
+        );
+        // The tape's scratch moved one slot later, the step's left where it was.
+        let later = GdnTape {
+            scratch: span(GDN_SCRATCH + 256, GDN_SCRATCH_BYTES),
+            ..GDN
+        };
+        let t = CudaTape {
+            arena: ArenaLayout {
+                total_bytes: GDN_TOTAL + 256,
+                ..gdn_tape(None, &[]).arena
+            },
+            ..gdn_tape(Some(later), &[good_gdn_step()])
+        };
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::GdnRegionMismatch {
+                step: 0,
+                region: Region::GdnScratch,
+                span: span(GDN_SCRATCH, GDN_SCRATCH_BYTES),
+                tape: Some(later.scratch),
+            })
+        );
+        assert_eq!(
+            gdn_tape(None, &[good_gdn_step()]).validate(),
+            Err(TapeError::GdnRegionMismatch {
+                step: 0,
+                region: Region::GdnSequence,
+                span: span(GDN_SEQ, 16),
+                tape: None,
+            })
+        );
+    }
+
+    /// A GDN step whose conv kernel or head layout is not the tape's, both valid geometries (each
+    /// change keeps the scratch the size both declare, so only the step and the tape disagree).
+    #[test]
+    fn gdn_step_geometry() {
+        let k3 = GdnTape {
+            conv_kernel: 3,
+            ..GDN
+        };
+        assert_eq!(
+            gdn_tape(Some(k3), &[good_gdn_step()]).validate(),
+            Err(TapeError::GdnStepGeometry { step: 0 })
+        );
+        // The step claims a 3-tap conv over the tape's 4: another ring stride than the pool's.
+        let step = CudaStep::GatedDeltaNet(GatedDeltaNetBf16 {
+            conv_kernel: 3,
+            ..gdn_step(0, GDN_SEQ, GDN_SCRATCH)
+        });
+        assert_eq!(
+            gdn_tape(Some(GDN), &[step]).validate(),
+            Err(TapeError::GdnStepGeometry { step: 0 })
+        );
+    }
+
+    /// A hand-written tape whose own GDN geometry the kernels do not take is refused by `validate`,
+    /// before `CudaWorker::new` would size a pool from it (and `GdnStateLayout::new` assert on a
+    /// conv kernel of 0).
+    #[test]
+    fn gdn_geometry() {
+        for gdn in [
+            GdnTape {
+                conv_kernel: 0,
+                ..GDN
+            },
+            GdnTape {
+                conv_kernel: 1,
+                ..GDN
+            },
+            GdnTape {
+                conv_kernel: 9,
+                ..GDN
+            },
+            GdnTape {
+                num_k_heads: 0,
+                ..GDN
+            },
+            GdnTape {
+                num_v_heads: 0,
+                ..GDN
+            },
+            GdnTape {
+                num_k_heads: 2,
+                num_v_heads: 3,
+                ..GDN
+            },
+            GdnTape { head_k: 64, ..GDN },
+            GdnTape { head_v: 40, ..GDN },
+            GdnTape { head_v: 512, ..GDN },
+            GdnTape {
+                num_v_heads: u32::MAX,
+                ..GDN
+            },
+        ] {
+            assert_eq!(
+                gdn_tape(Some(gdn), &[]).validate(),
+                Err(TapeError::GdnGeometry {
+                    num_k_heads: gdn.num_k_heads,
+                    num_v_heads: gdn.num_v_heads,
+                    head_k: gdn.head_k,
+                    head_v: gdn.head_v,
+                    conv_kernel: gdn.conv_kernel,
+                }),
+                "{gdn:?}"
+            );
+        }
+    }
+
+    /// A step writing the GDN sequence region, which the forward fills; a step that is not the
+    /// GDN step writing or reading the GDN scratch.
+    #[test]
+    fn nothing_but_the_gdn_step_touches_its_regions() {
+        let over_seq = gemm(0, 1, GDN_SEQ, (1, 8, 64));
+        assert_eq!(
+            gdn_tape(Some(GDN), &[over_seq]).validate(),
+            Err(TapeError::WriteOverRegion {
+                step: 0,
+                write: span(GDN_SEQ, 16),
+                region: Region::GdnSequence,
+            })
+        );
+        let over_scratch = CudaStep::Add(AddBf16 {
+            a: ArenaOffset(0),
+            b: ArenaOffset(36864),
+            out: ArenaOffset(GDN_SCRATCH),
+            rows: 8,
+            cols: 256,
+        });
+        assert_eq!(
+            gdn_tape(Some(GDN), &[over_scratch]).validate(),
+            Err(TapeError::WriteOverRegion {
+                step: 0,
+                write: span(GDN_SCRATCH, 4096),
+                region: Region::GdnScratch,
+            })
+        );
+        let reads_scratch = CudaStep::Add(AddBf16 {
+            a: ArenaOffset(GDN_SCRATCH),
+            b: ArenaOffset(36864),
+            out: ArenaOffset(0),
+            rows: 8,
+            cols: 256,
+        });
+        assert_eq!(
+            gdn_tape(Some(GDN), &[reads_scratch]).validate(),
+            Err(TapeError::GdnRegionMismatch {
+                step: 0,
+                region: Region::GdnScratch,
+                span: span(GDN_SCRATCH, 4096),
+                tape: Some(GDN.scratch),
+            })
+        );
+    }
+
+    /// The GDN step's bundle read at its packed bytes: a weight declared one region short is
+    /// refused.
+    #[test]
+    fn a_gdn_bundle_declared_short_is_refused() {
+        let t = CudaTape {
+            weight_bytes: &[0, GDN_BUNDLE_BYTES - 256],
+            ..gdn_tape(Some(GDN), &[good_gdn_step()])
+        };
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::WeightShort {
+                step: 0,
+                ix: 1,
+                need: GDN_BUNDLE_BYTES,
+                declared: GDN_BUNDLE_BYTES - 256
             })
         );
     }
