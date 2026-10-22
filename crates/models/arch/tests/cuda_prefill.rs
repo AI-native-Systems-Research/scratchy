@@ -997,3 +997,200 @@ fn o_a_bad_decode_is_refused_before_any_copy() {
     }
     assert!(pass, "a bad decode was not refused before any copy");
 }
+
+// ── (k) diagnostic: where the decode chain leaves the one-shot trajectory ──
+
+/// Layer `layer`'s K and V of position `pos` in `seat`'s blocks: `[kv_heads · head_dim]` bf16
+/// each, for every KV layer.
+fn kv_at(worker: &mut CudaWorker<'_>, seat: Seat, pos: usize) -> Vec<[Vec<u16>; 2]> {
+    let kv = CUDA_TAPES[bucket(1)].kv.expect("a KV cache");
+    let (heads, bs, hd) = (
+        kv.kv_heads as usize,
+        kv.block_size as usize,
+        kv.head_dim as usize,
+    );
+    let block = seat.blocks[pos / bs];
+    (0..kv.layers.len())
+        .map(|layer| {
+            [KvHalf::K, KvHalf::V].map(|half| {
+                let mut b = vec![0u16; heads * bs * hd];
+                worker.read_kv(layer, half, block, &mut b).expect("read_kv");
+                (0..heads)
+                    .flat_map(|h| b[(h * bs + pos % bs) * hd..][..hd].to_vec())
+                    .collect()
+            })
+        })
+        .collect()
+}
+
+/// Every GDN layer's conv ring and recurrent state in `slot`: `[conv, ssm]` f32 each.
+fn gdn_at(worker: &mut CudaWorker<'_>, slot: u32) -> Vec<[Vec<f32>; 2]> {
+    let g = CUDA_TAPES[bucket(1)].gdn.expect("GDN layers");
+    let conv_dim = gdn_conv_dim(g.num_k_heads, g.head_k, g.num_v_heads, g.head_v).expect("fits");
+    let conv = conv_dim as usize * (g.conv_kernel as usize - 1);
+    let ssm = (g.num_v_heads * g.head_v * g.head_k) as usize;
+    (0..g.layers.len())
+        .map(|layer| {
+            let (mut c, mut s) = (vec![0f32; conv], vec![0f32; ssm]);
+            worker
+                .read_gdn_state(layer, slot, &mut c, &mut s)
+                .expect("read_gdn_state");
+            [c, s]
+        })
+        .collect()
+}
+
+/// `‖a − b‖₂ / ‖b‖₂` and `max |a − b|`, in f64; infinite when either holds a non-finite value.
+fn rel(a: impl Iterator<Item = f64> + Clone, b: impl Iterator<Item = f64> + Clone) -> (f64, f64) {
+    let (mut d2, mut b2, mut max) = (0f64, 0f64, 0f64);
+    for (x, y) in a.zip(b) {
+        if !(x.is_finite() && y.is_finite()) {
+            return (f64::INFINITY, f64::INFINITY);
+        }
+        d2 += (x - y) * (x - y);
+        b2 += y * y;
+        max = max.max((x - y).abs());
+    }
+    ((d2 / b2.max(f64::MIN_POSITIVE)).sqrt(), max)
+}
+
+fn rel_bf16(a: &[u16], b: &[u16]) -> (f64, f64) {
+    let w = |v: &[u16]| {
+        v.iter()
+            .map(|&x| f64::from(bf16::from_bits(x).to_f32()))
+            .collect::<Vec<_>>()
+    };
+    let (a, b) = (w(a), w(b));
+    rel(a.iter().copied(), b.iter().copied())
+}
+
+fn rel_f32(a: &[f32], b: &[f32]) -> (f64, f64) {
+    rel(
+        a.iter().map(|&x| f64::from(x)),
+        b.iter().map(|&x| f64::from(x)),
+    )
+}
+
+/// One trajectory's state after a decode at one position: every KV layer's `[K, V]` at that
+/// position, every GDN layer's `[conv ring, recurrent state]`, and the logits.
+struct Snapshot {
+    kv: Vec<[Vec<u16>; 2]>,
+    gdn: Vec<[Vec<f32>; 2]>,
+    logits: Vec<u16>,
+}
+
+fn snapshot(worker: &mut CudaWorker<'_>, seat: Seat, pos: usize, logits: Vec<u16>) -> Snapshot {
+    Snapshot {
+        kv: kv_at(worker, seat, pos),
+        gdn: gdn_at(worker, seat.slot),
+        logits,
+    }
+}
+
+/// One trajectory's difference from the one-shot's at one step: per KV layer K and V at the
+/// step's position, per GDN layer the conv ring and the recurrent state, as relative L2 `‖Δ‖/‖ref‖`
+/// (the largest, and its layer, printed with every layer's), and the logits' cosine and max
+/// |difference|.
+fn report(what: &str, step: usize, got: &Snapshot, want: &Snapshot) -> f64 {
+    let line = |kind: &str, v: Vec<(f64, f64)>| {
+        let (worst, at) = (v.iter().enumerate())
+            .map(|(i, &(r, _))| (r, i))
+            .fold((0f64, 0usize), |a, b| if b.0 > a.0 { b } else { a });
+        let all: Vec<String> = v.iter().map(|(r, _)| format!("{r:.1e}")).collect();
+        eprintln!(
+            "(k-diag) {what} step {step} {kind}: worst rel L2 {worst:.3e} at layer index {at}, \
+             per layer [{}]",
+            all.join(" ")
+        );
+    };
+    for (half, name) in [(0, "K"), (1, "V")] {
+        line(
+            name,
+            (got.kv.iter().zip(&want.kv))
+                .map(|(g, w)| rel_bf16(&g[half], &w[half]))
+                .collect(),
+        );
+    }
+    for (part, name) in [(0, "GDN conv ring"), (1, "GDN recurrent state")] {
+        line(
+            name,
+            (got.gdn.iter().zip(&want.gdn))
+                .map(|(g, w)| rel_f32(&g[part], &w[part]))
+                .collect(),
+        );
+    }
+    let (g, w) = (&got.logits, &want.logits);
+    let cos = cosine(g, w);
+    eprintln!(
+        "(k-diag) {what} step {step} logits: cosine={cos:.6} max|diff|={:e} rel L2 {:.3e}",
+        max_diff(g, w),
+        rel_bf16(g, w).0
+    );
+    cos
+}
+
+/// (k)'s diagnostic. The chain (300 prefilled, then decodes at 300..307, each reading the K/V and
+/// GDN state earlier decodes wrote) and a teacher-forced variant (for each i, 300 + i tokens
+/// prefilled fresh, then one decode at 300 + i: one step off the one-shot trajectory), each
+/// compared after its decode at 300 + i with a fresh one-shot forward of 301 + i tokens (in
+/// disjoint blocks and slot): the K and V the decode wrote at 300 + i in every KV layer, every
+/// GDN layer's conv ring and recurrent state, and the logits. The one-shot of 301 + i tokens is
+/// checked bit-identical, on its last row, to row 300 + i of one 308-token forward, so it is the
+/// one-shot trajectory (k) compares against. Asserted: every value finite, the references
+/// bit-identical, and every teacher-forced decode's logits at cosine ≥ 0.999 (one step's
+/// difference, which is (k)'s criterion for one step); the chain's numbers are printed.
+#[test]
+fn k_diag_decode_drift_against_one_shot() {
+    let r = rig();
+    let mut worker = r.worker();
+    let rows = sequence_rows((Q + DECODES) as usize);
+    let one_shot = forward(&mut worker, 512, &rows, 0, SEAT_B).expect("308 tokens in one forward");
+    let reference = |worker: &mut CudaWorker<'_>, i: usize| {
+        let n = Q as usize + i + 1;
+        let out = forward(worker, 512, &rows[..n], 0, SEAT_B).expect("the one-shot reference");
+        let last = out[(n - 1) * VOCAB..][..VOCAB].to_vec();
+        snapshot(worker, SEAT_B, n - 1, last)
+    };
+    let mut pass = true;
+    let mut refs_identical = true;
+    // The chain.
+    forward(&mut worker, 512, &rows[..Q as usize], 0, SEAT_A).expect("the prefill");
+    let mut chain_cos = Vec::new();
+    for i in 0..DECODES as usize {
+        let p = Q as usize + i;
+        let logits = forward(&mut worker, 1, &[rows[p]], p as u32, SEAT_A).expect("a decode");
+        pass &= all_finite(&logits);
+        let got = snapshot(&mut worker, SEAT_A, p, logits);
+        let want = reference(&mut worker, i);
+        refs_identical &= want.logits[..] == one_shot[p * VOCAB..][..VOCAB];
+        chain_cos.push(report("chain", i, &got, &want));
+    }
+    // Teacher-forced: each decode one step off the one-shot trajectory.
+    let mut forced_cos = Vec::new();
+    for i in 0..DECODES as usize {
+        let p = Q as usize + i;
+        forward(&mut worker, 512, &rows[..p], 0, SEAT_A).expect("the teacher-forced prefill");
+        let logits = forward(&mut worker, 1, &[rows[p]], p as u32, SEAT_A).expect("a decode");
+        pass &= all_finite(&logits);
+        let got = snapshot(&mut worker, SEAT_A, p, logits);
+        let want = reference(&mut worker, i);
+        refs_identical &= want.logits[..] == one_shot[p * VOCAB..][..VOCAB];
+        forced_cos.push(report("teacher-forced", i, &got, &want));
+    }
+    let forced_ok = forced_cos.iter().all(|&c| c >= 0.999);
+    eprintln!(
+        "(k-diag) logits cosine per step: chain {chain_cos:.6?} teacher-forced {forced_cos:.6?}; \
+         references bit-identical to the 308-token forward's rows={refs_identical} \
+         teacher-forced all >= 0.999={forced_ok} {}",
+        verdict(pass && refs_identical && forced_ok)
+    );
+    assert!(
+        refs_identical,
+        "a one-shot reference differs from the 308-token forward's row"
+    );
+    assert!(pass, "a decode gave a non-finite logit");
+    assert!(
+        forced_ok,
+        "a teacher-forced decode is below cosine 0.999: one step is wrong"
+    );
+}
