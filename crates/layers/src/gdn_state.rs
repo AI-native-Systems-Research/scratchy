@@ -63,7 +63,7 @@ use scratchy_tensors::{DType, GpuTensor, PoolMemory, TensorView};
 
 /// The conv-state ring and the draft lanes' records are f32: every GDN kernel, metal's and
 /// cuda's, reads and writes them as `device float*`.
-pub const GDN_STATE_DTYPE: DType = DType::F32;
+pub const GDN_CONV_AND_RECORD_DTYPE: DType = DType::F32;
 
 /// The drafts a verify step carries: it checkpoints the conv state after, and records the ssm
 /// inputs of, each of its `drafts + 1` rows (module docs).
@@ -426,7 +426,7 @@ impl GdnStateDims {
         lanes: Option<DraftLanes>,
         ssm_dtype: DType,
     ) -> ([usize; 2], [usize; 2]) {
-        let sz = GDN_STATE_DTYPE.size_bytes();
+        let sz = GDN_CONV_AND_RECORD_DTYPE.size_bytes();
         let elems = |dims: &[usize]| dims.iter().product::<usize>() * sz;
         let (conv, ssm) = self.slot_shapes(slots);
         let ssm_slot = ssm.iter().product::<usize>() * ssm_dtype.size_bytes();
@@ -503,7 +503,7 @@ impl<M: PoolMemory> GdnStatePool<M> {
             dims.conv_kernel >= 1,
             "GdnStatePool: conv_kernel must be >= 1"
         );
-        let dtype = GDN_STATE_DTYPE;
+        let dtype = GDN_CONV_AND_RECORD_DTYPE;
         let (conv_shape, ssm_shape) = dims.slot_shapes(num_slots);
         let ([conv_bytes, ssm_bytes], [conv_lane_bytes, ssm_lane_bytes]) =
             dims.bytes(num_slots, lanes, ssm_dtype);
@@ -555,7 +555,7 @@ impl<M: PoolMemory> GdnStatePool<M> {
              lanes of {} draft rows ({dims:?}, conv {:?} / ssm {ssm_dtype:?}) = {total_mb:.0} MB",
             lanes.map_or(0, DraftLanes::count),
             lanes.map_or(0, |l| l.rows().0),
-            GDN_STATE_DTYPE,
+            GDN_CONV_AND_RECORD_DTYPE,
         );
 
         Ok(Self {
