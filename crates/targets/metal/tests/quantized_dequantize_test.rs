@@ -13,6 +13,8 @@ use objc2_metal::{MTLComputePipelineState, MTLSize};
 use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{DequantDtype, ScaleDtype};
+use scratchy_target_metal::tape::ids::ElementCount;
+use scratchy_target_metal::tape::kernel_constants::AffineDequantizeConstants;
 
 /// CPU reference: `out[oindex] = scale * nibble + bias` with FMA-style
 /// single-rounding semantics (f32 multiply + add, then one round to the
@@ -159,7 +161,8 @@ fn affine_dequantize_b4_bf16_kernel_matches_cpu_reference() {
 /// `MetalAffineDequantize::execute`): `buffer(0)=packed_weight,
 /// buffer(1)=scales, buffer(2)=biases, buffer(3)=output`. group_size,
 /// dtype, scale_dtype, and bits are baked into the kernel name (function
-/// specialization) — there are no `setBytes` scalars. The grid is a 1D
+/// specialization) and the packed bytes into its constants — there are no `setBytes` scalars. The
+/// grid is a 1D
 /// dispatch of `nthreads = out_n_elements / 2` threads (2 nibbles/byte),
 /// `threads_per_threadgroup = min(nthreads, maxTotalThreadsPerThreadgroup)`.
 ///
@@ -187,11 +190,19 @@ fn run_affine_dequant(
         group_size,
         4,
     );
-    let pipeline = baked_pipeline(&device, "quantized_dequantize", &kernel_name, Vec::new())
-        .expect("dequant pipeline");
-
-    // nthreads = out_n_elements / packs_per_int (packs_per_int = 2 for bits=4).
+    // nthreads = out_n_elements / packs_per_int (packs_per_int = 2 for bits=4): one a packed byte,
+    // compiled into the kernel.
     let nthreads = n_out / 2;
+    let constants = AffineDequantizeConstants {
+        packed_bytes: ElementCount(nthreads as u32),
+    };
+    let pipeline = baked_pipeline(
+        &device,
+        "quantized_dequantize",
+        &kernel_name,
+        constants.into(),
+    )
+    .expect("dequant pipeline");
     let tpt = nthreads.min(pipeline.maxTotalThreadsPerThreadgroup());
     let threads_per_threadgroup = MTLSize {
         width: tpt,

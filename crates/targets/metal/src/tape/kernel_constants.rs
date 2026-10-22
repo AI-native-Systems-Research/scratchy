@@ -470,6 +470,15 @@ impl From<TqCodebookPart> for Vec<ConstantValue> {
         use scratchy_layers::turboquant::{
             gaussian_boundaries, gaussian_codebook, random_diagonal_sign,
         };
+        // The centroids' 16 slots and the boundaries' 15 hold a code of at most 4 bits.
+        let code_width = |bits: TqCodeBits| {
+            let bits = bits.get();
+            assert!(
+                (1..=4).contains(&bits),
+                "a TurboQuant code of {bits} bits: the codebook's slots hold codes of 1 to 4 bits"
+            );
+            bits
+        };
         let floats = |first: u16, table: Vec<f32>| -> Vec<ConstantValue> {
             (table.into_iter().zip(first..))
                 .map(|(f, slot)| ConstantValue::float(ConstSlot(slot), f))
@@ -493,12 +502,14 @@ impl From<TqCodebookPart> for Vec<ConstantValue> {
                     .map(|(word, slot)| ConstantValue::uint(ConstSlot(slot), word))
                     .collect()
             }
-            TqCodebookPart::Centroids(bits) => {
-                floats(TqCodebookPart::CENTROIDS, gaussian_codebook(bits.get()))
-            }
-            TqCodebookPart::Boundaries(bits) => {
-                floats(TqCodebookPart::BOUNDARIES, gaussian_boundaries(bits.get()))
-            }
+            TqCodebookPart::Centroids(bits) => floats(
+                TqCodebookPart::CENTROIDS,
+                gaussian_codebook(code_width(bits)),
+            ),
+            TqCodebookPart::Boundaries(bits) => floats(
+                TqCodebookPart::BOUNDARIES,
+                gaussian_boundaries(code_width(bits)),
+            ),
         }
     }
 }
@@ -1373,6 +1384,18 @@ impl From<GateScaleConstants> for Vec<ConstantValue> {
 }
 
 // ── AffineEmbed (MLX-affine int4 embedding lookup) ────────────────
+
+/// `quantized_dequantize.metal::affine_dequantize_<dtype>_s_<scale>_gs_<gs>_b_4`: slot 1 the bytes
+/// the 4-bit weight packs, one thread each.
+pub struct AffineDequantizeConstants {
+    pub packed_bytes: ElementCount,
+}
+
+impl From<AffineDequantizeConstants> for Vec<ConstantValue> {
+    fn from(c: AffineDequantizeConstants) -> Self {
+        vec![ConstantValue::uint(ConstSlot(1), c.packed_bytes.get())]
+    }
+}
 
 /// `KernelId::AffineEmbed`
 /// (`quantized_dequantize.metal::affine_embed_<dtype>_gs_<gs>_b_4`).

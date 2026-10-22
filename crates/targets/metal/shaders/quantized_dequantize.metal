@@ -13,13 +13,16 @@
 //   out[oindex + 0] = scale * (byte        & 0x0f) + bias
 //   out[oindex + 1] = scale * ((byte >> 4) & 0x0f) + bias
 //
-// The 2D grid matches MLX (`offset = x + grid_dim.x * y`) so callers
-// can use the same `get_2d_grid_dims` pattern for large tensors;
-// 1D dispatches still work — set `grid_dim.y == 1`, `index.y == 0`.
+// One thread a packed byte over a 1D grid; the bytes the weight packs (`DEQUANT_PACKED_BYTES`,
+// slot 1) are compiled in, its bound for the threads past it the dispatch rounds up to.
 
 #include <metal_stdlib>
 #include "baked.h"
 using namespace metal;
+
+// 1: the bytes the dequantized weight packs (`AffineDequantizeConstants`), set on the dequantize
+// kernels alone.
+SCRATCHY_CONSTANT_OPTIONAL(uint, DEQUANT_PACKED_BYTES, 1);
 
 // `T_act` is the activation / output dtype (f16 or bf16). `T_scale` is the
 // scales/biases storage dtype on disk (always f16 in every sampled
@@ -32,12 +35,16 @@ inline void affine_dequantize_b4_kernel(
     const device T_scale* scales,
     const device T_scale* biases,
     device T_act* out,
-    uint2 index,
-    uint2 grid_dim) {
+    uint index) {
     // pack_factor = 8 / bits = 2 for bits=4.
     constexpr int pack_factor = 2;
 
-    size_t offset = index.x + grid_dim.x * size_t(index.y);
+    static_assert(group_size > 0 && DEQUANT_PACKED_BYTES_SET,
+                  "the dequantize takes its packed bytes compiled in");
+    if (index >= DEQUANT_PACKED_BYTES) {
+        return;
+    }
+    size_t offset = index;
     size_t oindex = offset * pack_factor;
     size_t gindex = oindex / group_size;
 
@@ -56,10 +63,8 @@ template <typename T_act, typename T_scale, const int group_size>
     const device T_scale* scales   [[buffer(1)]],
     const device T_scale* biases   [[buffer(2)]],
     device T_act* out              [[buffer(3)]],
-    uint2 index    [[thread_position_in_grid]],
-    uint2 grid_dim [[threads_per_grid]]) {
-    affine_dequantize_b4_kernel<T_act, T_scale, group_size>(
-        w, scales, biases, out, index, grid_dim);
+    uint index [[thread_position_in_grid]]) {
+    affine_dequantize_b4_kernel<T_act, T_scale, group_size>(w, scales, biases, out, index);
 }
 
 #define DEFINE_AFFINE_DEQUANTIZE_B4(act_tag, act_type, scale_tag, scale_type, gs) \
