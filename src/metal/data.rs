@@ -8,6 +8,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer};
 
+use super::numbers::Engine;
+
 #[derive(Deserialize)]
 pub struct Run {
     #[serde(rename = "schema")]
@@ -25,6 +27,32 @@ pub struct Run {
     /// The file it was read from, for the link to it.
     #[serde(skip)]
     pub file: PathBuf,
+}
+
+/// The least share of its answer tokens a live server delivers to an engine that honours
+/// `ignore_eos` ([`Engine::honours_ignore_eos`]), below which the cell measured one that had
+/// stopped answering (#413). In every published run, scratchy's live cells deliver 99% or more and
+/// its dead ones 0 to 19.8%; mlx-lm's cells all deliver 84% or more.
+const LIVE_SHARE: f64 = 0.5;
+
+impl Run {
+    /// Mark the cells that measured a server which had stopped answering (#413), in a run file
+    /// whose bench did not count those requests as failed itself (`config.failures_counted`,
+    /// #510). Only an engine that honours `ignore_eos` can be judged by its answer tokens: one
+    /// that stops at EOS delivers short answers from a live server too.
+    pub fn mark_dead(&mut self) {
+        if self.config.failures_counted == Some(true) {
+            return;
+        }
+        let base = self.config.base().and_then(|b| b.output);
+        for m in &mut self.models {
+            for e in Engine::ALL.into_iter().filter(|e| e.honours_ignore_eos()) {
+                for c in e.cells_mut(m) {
+                    c.dead = c.delivered(base).is_some_and(|share| share < LIVE_SHARE);
+                }
+            }
+        }
+    }
 }
 
 /// The only schema this page reads.
@@ -150,6 +178,10 @@ pub struct Config {
     pub kv_cache_dtype: Option<String>,
     pub scratchy_serve_args: Option<String>,
     pub scaling: Option<Scaling>,
+    /// Whether the bench counted a request whose stream ended aborted or errored as failed
+    /// (#510); absent before it, where [`Run::mark_dead`] judges by the answer tokens instead.
+    #[serde(default)]
+    pub failures_counted: Option<bool>,
     /// Every engine with its version and pin; runs before pins have only
     /// `engine_versions` (mlx-lm and ollama).
     #[serde(default)]
@@ -391,6 +423,32 @@ pub struct Cell {
     /// A grid cell's users at once; None in runs from before the grid had its
     /// own, which ran it at the base users count.
     pub users: Option<u32>,
+    /// The answer tokens its requests delivered; None in runs from before
+    /// the run file kept it.
+    pub total_output_tokens: Option<u64>,
+    /// Whether the server it measured had stopped answering, in a run from before the bench
+    /// counted that itself ([`Run::mark_dead`]).
+    pub dead: bool,
+}
+
+impl Cell {
+    /// The share of the answer tokens its completed requests asked for that they delivered: its
+    /// answer length is its rung's, or the run's `base` one. None where it can't say: no count in
+    /// the file, no request completed, or a count of 0 from requests that each got a first token,
+    /// which is a server that sent no usage (the bench takes the count from it), not a dead one.
+    fn delivered(&self, base: Option<u32>) -> Option<f64> {
+        let asked = match self.at {
+            At::Grid { output, .. } | At::Output(output) => Some(output),
+            At::Conc(_) | At::Input(_) => base,
+        };
+        let asked = u64::from(asked?) * u64::from(self.completed.filter(|&n| n > 0)?);
+        let got = self.total_output_tokens?;
+        if got == 0 && self.median_ttft_ms.is_some_and(|t| t > 0.0) && self.median_tpot_ms.is_some()
+        {
+            return None;
+        }
+        (asked > 0).then(|| got as f64 / asked as f64)
+    }
 }
 
 #[derive(Deserialize)]
@@ -424,6 +482,8 @@ struct RawCell {
     server_mem_peak_mib: Option<f64>,
     #[serde(default)]
     conc: Option<u32>,
+    #[serde(default)]
+    total_output_tokens: Option<u64>,
 }
 
 impl TryFrom<RawCell> for Cell {
@@ -458,6 +518,8 @@ impl TryFrom<RawCell> for Cell {
             failed: c.failed,
             server_mem_peak_mib: c.server_mem_peak_mib,
             users: c.conc,
+            total_output_tokens: c.total_output_tokens,
+            dead: false,
         })
     }
 }
