@@ -28,16 +28,18 @@
 //!   refused before any copy;
 //! - (j) the worker takes all five tapes (the m=1 decode tape among them), its arena the largest's,
 //!   266 + 3 allocations at setup and none across one prefill and 8 decodes;
-//! - (k) 300 tokens prefilled, then decodes of positions 300..307, each against the same row of one
-//!   308-token forward: finite, cosine ≥ 0.999 (a bound, not bits: the decode runs the GEMV and
-//!   the decode attention, the prefill the tiled GEMM and the prefill attention); the last
-//!   decode's lm_head GEMV within the GEMM bound of f64 over every column;
+//! - (k) 300 tokens prefilled, then a chain of decodes of positions 300..307, each against the same
+//!   row of one 308-token forward: finite, and the same greedy token (argmax) unless that one-shot
+//!   row is a near-tie (top-1 − top-2 ≤ 2 × the step's max |difference|), at most one near-tie;
+//!   cosine, max |difference| and relative L2 printed, not asserted (the chain compounds the
+//!   per-step difference: see the test); the last decode's lm_head GEMV within the GEMM bound of
+//!   f64 over every column;
 //!   (k, teacher-forced) each decode one step off the one-shot trajectory (300 + i prefilled fresh,
 //!   then one decode at 300 + i) at cosine ≥ 0.999; (k-diag) prints, per decode, every KV layer's
 //!   K/V and every GDN layer's state against the one-shot's, for the chain and teacher-forced;
 //! - (l) the prefill and 8 decodes repeated in disjoint blocks and slot are bit-identical;
 //! - (m) the 8 decodes leave the cache at positions 0..300 bit-unchanged;
-//! - (n) decodes at P = 319 and P = 320 (a new block) are finite and within (k)'s cosine;
+//! - (n) decodes at P = 319 and P = 320 (a new block) are finite and at cosine ≥ 0.999;
 //! - (o) at m=1, a wrong position, a short block table, fresh at P > 0 and q_len = 2 are refused
 //!   before any copy.
 //!
@@ -782,14 +784,46 @@ fn j_the_decode_tape_allocates_nothing() {
     );
 }
 
-/// (k): 300 fresh tokens prefilled in m=512, then the decodes of positions 300..307 one at a
-/// time, against rows 300..307 of one 308-token m=512 forward in disjoint blocks and slot: two
-/// different kernel paths (the GEMV and the decode attention against the tiled GEMM and the
-/// prefill attention), so a bound, not bits: every logit finite, cosine ≥ 0.999 per row, the max
-/// |difference| printed. And the last decode's lm_head GEMV, read back from the arena, within
-/// #761's bound of f64 over every column.
+/// The index of `row`'s largest value (the lowest on a tie) and its margin over the second
+/// largest, as f32.
+fn top1_margin(row: &[u16]) -> (usize, f32) {
+    let v = |i: usize| bf16::from_bits(row[i]).to_f32();
+    let (mut first, mut second) = (0usize, None::<usize>);
+    for i in 1..row.len() {
+        if v(i) > v(first) {
+            second = Some(first);
+            first = i;
+        } else if second.is_none_or(|s| v(i) > v(s)) {
+            second = Some(i);
+        }
+    }
+    (first, second.map_or(f32::INFINITY, |s| v(first) - v(s)))
+}
+
+/// The most near-tie steps (k)'s chain may have, where its token may differ.
+const K_NEAR_TIES: usize = 1;
+
+/// (k): 300 fresh tokens prefilled in m=512, then a chain of decodes of positions 300..307 one at a
+/// time, each against row 300 + i of one 308-token m=512 forward in disjoint blocks and slot. Per
+/// step: every logit finite, and the decode's greedy token (argmax) the one-shot row's, unless
+/// that one-shot row is a near-tie, its top-1 − top-2 margin at most twice the step's max
+/// |difference| (#816's P3 rule, with the step's own difference as the noise); at most
+/// [`K_NEAR_TIES`] near-ties over the 8 steps. Cosine, max |difference| and relative L2 are
+/// printed for information and not asserted. And the last decode's lm_head GEMV, read back from
+/// the arena, within #761's bound of f64 over every column.
+///
+/// Why tokens and not a cosine floor per step (the user's choice, option 1 on #830): the decode
+/// and the one-shot prefill run different kernels with different rounding (the GEMV and the
+/// decode attention against the tiled GEMM and the prefill attention), and each decode of the
+/// chain reads the K/V and GDN state earlier decodes wrote, so the difference compounds. The
+/// H100 diagnostic at cc1177dc (`k_diag_decode_drift_against_one_shot`) measured it: the chain's
+/// cosine fell 0.99963 → 0.99794 over the 8 steps, its K/V and GDN state differences growing every
+/// step with the deepest layers worst and no single-step jump, while every teacher-forced step
+/// stayed ≥ 0.99935. Per-step accuracy is held by
+/// `k_teacher_forced_decodes_agree_with_one_shot_rows`; end-to-end correctness by the token
+/// agreement here and by P7 on the real checkpoint.
 #[test]
-fn k_decodes_agree_with_one_shot_rows() {
+fn k_chained_decodes_pick_the_one_shot_tokens() {
     let r = rig();
     let mut worker = r.worker();
     let rows = sequence_rows((Q + DECODES) as usize);
@@ -824,21 +858,37 @@ fn k_decodes_agree_with_one_shot_rows() {
         verdict(cmp.pass())
     );
     let one_shot = forward(&mut worker, 512, &rows, 0, SEAT_B).expect("308 tokens in one forward");
+    let mut near_ties = 0usize;
     for (i, row) in decoded.iter().enumerate() {
         let at = Q as usize + i;
         let want = &one_shot[at * VOCAB..][..VOCAB];
         let (cos, diff, finite) = (cosine(row, want), max_diff(row, want), all_finite(row));
-        let ok = finite && cos >= 0.999;
+        let rel = rel_bf16(row, want).0;
+        let (got_token, _) = top1_margin(row);
+        let (want_token, margin) = top1_margin(want);
+        let tie = margin <= 2.0 * diff;
+        let same = got_token == want_token;
+        near_ties += usize::from(tie);
+        let ok = finite && (same || tie);
         eprintln!(
-            "(k) decode at position {at} against row {at} of one 308-token forward: \
-             finite={finite} cosine={cos:.6} (need >= 0.999) max|diff|={diff:e} {}",
+            "(k) chained decode at position {at} against row {at} of one 308-token forward: \
+             finite={finite} token={got_token} one-shot token={want_token} same={same} \
+             one-shot margin={margin:e} (near-tie when <= 2 x max|diff| = {:e}: {tie}) \
+             cosine={cos:.6} max|diff|={diff:e} rel L2={rel:.3e} (printed, not asserted) {}",
+            2.0 * diff,
             verdict(ok)
         );
         pass &= ok;
     }
+    let ties_ok = near_ties <= K_NEAR_TIES;
+    eprintln!(
+        "(k) near-tie steps {near_ties} (at most {K_NEAR_TIES}) {}",
+        verdict(ties_ok)
+    );
     assert!(
-        pass,
-        "a decode is out of agreement with the one-shot row: see the lines above"
+        pass && ties_ok,
+        "a chained decode picked another token than the one-shot row, gave a non-finite logit, or \
+         too many steps are near-ties: see the lines above"
     );
 }
 
@@ -923,7 +973,7 @@ fn m_decodes_leave_the_prefix_cache_unchanged() {
 }
 
 /// (n): a decode at P = 319 (kv_len 320, the last slot of block 4) and at P = 320 (kv_len 321, the
-/// first slot of a new block), each finite and within (k)'s cosine of the same row of one
+/// first slot of a new block), each finite and at cosine ≥ 0.999 to the same row of one
 /// 321-token forward in disjoint blocks and slot.
 #[test]
 fn n_decodes_at_a_block_boundary() {
