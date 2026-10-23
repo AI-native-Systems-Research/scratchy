@@ -15199,8 +15199,10 @@ pub fn emit_model(
         #(#metal_arena_bytes_statics)*
 
         /// Per-canonical tape_index plan for the Metal pool. One row per
-        /// `num_tokens` point, ordered ascending. `MetalWorkerPool::pick_bucket`
-        /// is a linear smallest-fit scan, so order matters.
+        /// `num_tokens` point per routed fold band (`FoldBand`), ordered ascending, a
+        /// bucket's band rows adjacent. A pool keeps one band's rows (`pick_rung`), so its
+        /// bucket index is no index into this table: a forward's slots come from the pool's
+        /// own rows (`MetalWorkerPool::bucket_spec`).
         #[cfg(feature = "metal")]
         pub static METAL_BUCKETS:
             &[::scratchy_target_metal::interpreter::metal::MetalBucketSpec]

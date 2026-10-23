@@ -767,8 +767,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         weights: &W,
         allocator: Arc<MetalAllocator>,
         pipelines: Arc<SpecializedPipelines>,
-        bucket_tapes: Arc<[LoweredMetalTape]>,
-        bucket_specs: Arc<[&'static MetalBucketSpec]>,
+        // Each bucket's row and the tape it runs, in bucket order: a forward's output slots are
+        // read off the row of the tape it ran ([`Self::bucket_spec`]).
+        buckets: &[(&'static MetalBucketSpec, LoweredMetalTape)],
         block_table_stride: MaxBlocksPerSeq,
         arena_layout: ArenaLayout,
         runtime_factory: RuntimeFactory,
@@ -782,12 +783,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         W: ModelSources,
     {
         assert!(max_workers >= 1, "max_workers must be >= 1");
-        assert!(
-            bucket_specs.len() == bucket_tapes.len()
-                && (bucket_specs.iter().zip(bucket_tapes.iter()))
-                    .all(|(spec, tape)| spec.bucket_m == tape.bucket_m),
-            "MetalWorkerPool::new: the bucket rows are not the tapes' own, index for index"
-        );
+        let bucket_tapes: Arc<[LoweredMetalTape]> = buckets.iter().map(|&(_, tape)| tape).collect();
+        let bucket_specs: Arc<[&'static MetalBucketSpec]> =
+            buckets.iter().map(|&(spec, _)| spec).collect();
         let sources = ResolvedSources::resolve(weights, &allocator, &bucket_tapes)?;
 
         // The shared `MetalResidencySet` lives on the allocator now —
@@ -898,10 +896,10 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 cache.register_baked(spec.kernels);
             }
         }
-        let tapes: Vec<LoweredMetalTape> = picked.iter().map(|(_, rung)| rung.tape).collect();
-        let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
-        let bucket_specs: Arc<[&'static MetalBucketSpec]> =
-            picked.iter().map(|&(spec, _)| spec).collect();
+        let buckets: Vec<_> = picked
+            .iter()
+            .map(|&(spec, rung)| (spec, rung.tape))
+            .collect();
         let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache), variant));
         let sparse_plan = SparsePlan {
             bucket_arena,
@@ -913,8 +911,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             weights,
             allocator,
             pipelines,
-            bucket_tapes,
-            bucket_specs,
+            &buckets,
             variant.cap,
             arena_layout,
             runtime_factory,
@@ -2585,8 +2582,7 @@ mod tests {
             &weights,
             allocator,
             pipelines,
-            tapes.clone(),
-            test_specs(&tapes),
+            &test_buckets(&tapes),
             MaxBlocksPerSeq(128),
             arena_layout,
             runtime_factory,
@@ -2832,8 +2828,7 @@ mod tests {
             &weights,
             allocator,
             pipelines,
-            tapes.clone(),
-            test_specs(&tapes),
+            &test_buckets(&tapes),
             MaxBlocksPerSeq(128),
             arena_layout,
             runtime_factory,
@@ -3545,12 +3540,14 @@ mod tests {
     // are empty here so the barrier slices are empty too.
     const EMPTY_BARRIERS: &[bool] = &[];
 
-    /// The bucket rows of `tapes`, index for index (leaked: a pool's rows are `'static`). A test's
-    /// forwards read no output slot, so each row's are slot 0.
-    fn test_specs(tapes: &[LoweredMetalTape]) -> Arc<[&'static MetalBucketSpec]> {
+    /// Each of `tapes` with its bucket row (leaked: a pool's rows are `'static`). A test's forwards
+    /// read no output slot, so each row's are slot 0.
+    fn test_buckets(
+        tapes: &[LoweredMetalTape],
+    ) -> Vec<(&'static MetalBucketSpec, LoweredMetalTape)> {
         (tapes.iter())
-            .map(|tape| {
-                &*Box::leak(Box::new(MetalBucketSpec {
+            .map(|&tape| {
+                let spec = &*Box::leak(Box::new(MetalBucketSpec {
                     bucket_m: tape.bucket_m,
                     band: FoldBand::Narrow,
                     num_arena_slots: tape.num_arena_slots,
@@ -3564,7 +3561,8 @@ mod tests {
                     lm_head_barriers: EMPTY_BARRIERS,
                     tapes: &[],
                     kernels: &[],
-                }))
+                }));
+                (spec, tape)
             })
             .collect()
     }
