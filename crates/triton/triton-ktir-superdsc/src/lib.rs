@@ -254,6 +254,21 @@ fn emit_regions(
                 ),
             });
         }
+        // ⭐ THE ARGMAX IS THE ATTENTION'S OWN CLASS HERE: a multi-op whole-function
+        // body (five whole-row reduces, the equality chain, the fp32 island) over
+        // NINE parameters — lowered from its compiled ops through the whole-function
+        // door (`emit_whole`, the fixture ladder's own `argmax_first_max` path), and a
+        // per-`Program` dispatch would be a second, hand-rolled path. Do not add one.
+        Program::ArgMax => {
+            return Err(Error {
+                stage: "program",
+                message: format!(
+                    "{:?} is an eleven-parameter whole-function body — `emit_whole` is its \
+                     door, and a per-`Program` dispatch would be a second, hand-rolled path",
+                    node.program
+                ),
+            });
+        }
         // THE MONOMORPHISATION DOOR. `rope_at::<HD>` is not reachable without the geometry, and
         // the geometry is a const parameter, so `Program::Rope` is refused here and driven from
         // `drive_rope` which takes it explicitly. Refused rather than defaulted: a wrong head
@@ -744,8 +759,11 @@ module {
     /// receives it, not only as the pass writes it.
     #[test]
     fn the_door_reads_the_shipped_spelling() {
-        let (kspec, grid, program) =
+        let (kspec, grid, door) =
             cases::case("mul_scale_small").expect("the case table states the configuration");
+        // This bridge drives the DOOR (`assert_the_forms_agree` reads the kind); `mul_scale_small`
+        // is `Some(ScalarMul)`, and a row without a door cannot take this path at all.
+        let program = door.expect("`mul_scale_small` states its door kind");
         let src = std::fs::read_to_string(&kspec.file).expect("read the fixture");
         let mut tt = codegen::compile(&src, &kspec, Target::spyre()).expect("codegen");
         opt::make_ttir(&mut tt).expect("make_ttir");

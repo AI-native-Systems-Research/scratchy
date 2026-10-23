@@ -70,6 +70,18 @@ pub(crate) struct BundleMeta {
     pub(crate) cos_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
     pub(crate) sin_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
     pub(crate) result_id: usize,
+    /// ⭐ WHETHER THIS RUNG'S RESULT IS AN INDEX STICK — the answer re-point
+    /// ([`crate::spyre_forward::ChunkOut::Picked`]): the minted argmax rung's
+    /// result is the kernel's own `[1, 64]` i32 stick, every plain rung's is
+    /// the f16 logits row. A copy out of the wiring (like every field here)
+    /// taken at parse, so the KTIR emulator path — which carries no `wiring`
+    /// reference in its [`BundleMeta`] — still reads the bake's own statement
+    /// of what the result IS.
+    pub(crate) result_is_index: bool,
+    /// The result's readback extent in ELEMENTS: the vocab row on a plain
+    /// rung, the idx stick's own count on a minted one. Asking the stick for
+    /// `vocab` elems would claim a width the bundle never made.
+    pub(crate) result_want: usize,
     /// One per layer, in layer order.
     pub(crate) layers: Vec<LayerWiring>,
     /// Tensors read back from each forward, in a stable order: `result_id`
@@ -114,31 +126,54 @@ pub(crate) struct BundleMeta {
 /// At `rows == 1` that formula collapses to `c`, which is why the one-request path can slice
 /// `..vocab` straight off the buffer — and why the same slice at `r * vocab` for `r > 0` reads
 /// mostly request 0's logits instead of request `r`'s. Fluent, wrong, and per-request.
+/// The identity a bake STATED for its own graph result: the [`PlaceId`] of the placement whose
+/// `SegRole::Logits` stamp the layout read. ⛔⛔ NOT A WIRING FACT, AND NEVER EXCHANGEABLE WITH
+/// ONE: the argmax mint splices its tables into the ONE-REQUEST graph's source range, shifting
+/// every op output at or above the original `num_sources` up, so a minted wiring's `result_id`
+/// is the re-pointed argmax stick and names NOTHING in an unminted rung's layout ("unknown
+/// tensor", every batched step). Ids BELOW `num_sources` are shared across the mint boundary;
+/// ids at or above are graph-local, and each bundle states its own — the same law
+/// `BundleLayout::num_sources` and `BundleLayout::logits` ride on. Constructible only beside
+/// the geometry, from the placement the stamp was read from, so the two cannot name different
+/// tensors.
+///
+/// [`PlaceId`]: scratchy_target_spyre::bundle_code::PlaceId
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct StampedLogits(pub(crate) scratchy_target_spyre::bundle_code::PlaceId);
+
 #[cfg(feature = "spyre-hw")]
 pub(crate) struct LogitsGeom {
     pub(crate) rows: usize,
     pub(crate) width: usize,
+    /// ⭐ THE TENSOR THIS GEOMETRY DESCRIBES — the rung's own stamped result, never a wiring
+    /// `result_id`. See [`StampedLogits`] for the mint boundary that makes the two differ.
+    pub(crate) place: StampedLogits,
 }
 
 #[cfg(feature = "spyre-hw")]
 impl LogitsGeom {
-    /// From the result tensor's baked `bundle_layout.json` placement (BYTES) and the rung's row
-    /// count — the BAKED width, because the tail runs unfolded at the rung's `m` whatever is live.
-    /// `None` when the placement is not a whole number of fp16 rows, or is narrower than the
-    /// vocab it must hold — either means this is not the tensor we think it is, and gathering from
-    /// it would read neighbouring placements.
+    /// From the result tensor's baked `bundle_layout.json` placement and the rung's row count —
+    /// the placement arrives WHOLE, so the geometry and [`StampedLogits`] identity come from one
+    /// placement and cannot name different tensors. The width is the BAKED one, because the tail
+    /// runs unfolded at the rung's `m` whatever is live. `None` when the placement is not a whole
+    /// number of fp16 rows, or is narrower than the vocab it must hold — either means this is not
+    /// the tensor we think it is, and gathering from it would read neighbouring placements.
     pub(crate) fn from_placement(
-        size_bytes: u64,
+        stamp: &scratchy_target_spyre::bundle_code::Placement,
         rung: scratchy_subtile::sdsc_abstract::RungWidth,
         vocab: usize,
     ) -> Option<LogitsGeom> {
-        let elems = (size_bytes / 2) as usize;
+        let elems = (stamp.size / 2) as usize;
         let rows = rung.count();
-        if size_bytes % 2 != 0 || elems % rows != 0 {
+        if stamp.size % 2 != 0 || elems % rows != 0 {
             return None;
         }
         let width = elems / rows;
-        (width >= vocab).then_some(LogitsGeom { rows, width })
+        (width >= vocab).then_some(LogitsGeom {
+            rows,
+            width,
+            place: StampedLogits(stamp.id),
+        })
     }
 
     /// Element count of the whole placement — what to ask [`SuperDscSession::read_tensor`] for.

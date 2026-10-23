@@ -2555,6 +2555,27 @@ impl<'a> CodeGen<'a> {
                     .map(Val::Ir)
                     .map_err(|e| Self::located(e, pos))
             }
+            // `tl.expand_dims(input, axis)` -> `tt.expand_dims` (the axis attribute). The
+            // unit-dim insertion a reduced [1] needs before a unit-dim broadcast can meet
+            // the tile domain -- see `census::TL_FUNCTIONS`'s entry for the construct's
+            // first use.
+            "expand_dims" => {
+                let x = self.ir_arg(&get(0, "input"), "tl.expand_dims", pos)?;
+                let axis = get(1, "axis")
+                    .and_then(|v| v.as_int())
+                    .and_then(|a| i64::try_from(a).ok())
+                    .ok_or_else(|| {
+                        Error::new(
+                            "tl.expand_dims needs a compile-time `axis`",
+                            pos.line,
+                            pos.col,
+                        )
+                    })?;
+                self.sem
+                    .expand_dims(x, axis)
+                    .map(Val::Ir)
+                    .map_err(|e| Self::located(e, pos))
+            }
             "arange" => {
                 let a = get(0, "start")
                     .and_then(|v| v.as_int())

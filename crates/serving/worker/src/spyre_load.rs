@@ -194,6 +194,12 @@ pub(crate) struct Parsed {
     pub(crate) cos_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
     pub(crate) sin_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
     pub(crate) result_id: usize,
+    /// See [`crate::spyre_types::BundleMeta::result_is_index`] — the bake's
+    /// own statement of whether this rung's result is the idx stick.
+    pub(crate) result_is_index: bool,
+    /// See [`crate::spyre_types::BundleMeta::result_want`] — the result's
+    /// readback extent in elements.
+    pub(crate) result_want: usize,
     pub(crate) capacity: usize,
     pub(crate) m_cap: usize,
     pub(crate) hidden: usize,
@@ -253,11 +259,24 @@ pub(crate) fn wiring_to_parsed(
             .collect()
     };
     let embed_src = w.embed_src as usize;
+    // The result's own answer shape, off the wiring's one derivation — the
+    // stick's element count on a minted rung, the vocab row otherwise. Both
+    // flow into the BundleMeta as plain copies (the emulator path carries no
+    // `wiring` reference to re-ask).
+    let result_is_index = w.result_is_index();
+    let result_want = if result_is_index {
+        let (rows, cols) = w.tensor_shapes[w.result as usize];
+        (rows * cols) as usize
+    } else {
+        w.geometry.vocab as usize
+    };
     Ok(Parsed {
         embed_src,
         cos_srcs: triples(w.cos_srcs),
         sin_srcs: triples(w.sin_srcs),
         result_id: w.result as usize,
+        result_is_index,
+        result_want,
         capacity,
         m_cap: (w.tensor_shapes[embed_src].0 as usize).max(1),
         hidden: w.geometry.hidden as usize,
@@ -321,35 +340,6 @@ pub(crate) fn gpu_tensor_bytes(t: &scratchy_tensors::GpuTensor) -> &[u8] {
 /// What remains is staging: orientation, device-width padding, K-splitting and
 /// the bf16→f16 narrow — h2d work, which is spyre's to do.
 #[allow(clippy::type_complexity)]
-/// The prefix-KV source ids of a wiring — placed, inside `0..num_sources`, and DEVICE-RESIDENT.
-///
-/// ⛔ THEY ARE NOT BOUND PER STEP. The cache lives in seg2 and is filled by the pool and by the
-/// device's own cachewr, so `Executor::require_sources_filled` must know to skip them or it
-/// refuses every launch. Derived from the wiring rather than listed by hand, so a model with a
-/// different layer count cannot desync it.
-#[cfg(feature = "spyre-hw")]
-fn resident_source_ids(
-    w: &scratchy_target_spyre::wiring::Wiring,
-    // ⛔ THE SPILLED WEIGHT TAIL BELONGS HERE, and leaving it out is a REFUSED LAUNCH, not a silent
-    // wrong answer — `require_sources_filled` classifies it `SourceFiller::Nobody` and stops.
-    //
-    // 🛑 MEASURED: `superdsc prefill run_step (mq=21, start=0): predict: 1 caller-filled source(s)
-    // were never written this step — t446`. A borrowing session binds NOTHING (that is the point:
-    // one stage+H2D for the whole ladder), so a weight normally classifies as
-    // `SourceFiller::SegmentOwner` — its segment is ALIASED and the owner filled it. A spilled tail
-    // cannot be aliased (its slot also holds an intermediate color, whose extent is m-dependent, so
-    // no two bundles agree on the segment's size), so it is handed over as a COPY into this session's
-    // own region instead — `adopt_from_owner`. Nothing binds it and nothing aliases it, so the only
-    // accurate answer left is that the LOADER declared it resident, which is what this list says.
-    spilled_weight_tail: &[u32],
-) -> Vec<u32> {
-    w.layers
-        .iter()
-        .flat_map(|l| [l.prefix_k, l.prefix_v])
-        .chain(spilled_weight_tail.iter().copied())
-        .collect()
-}
-
 /// The tensor ids of the spilled weight tail — the companion of [`spilled_weight_spans`], which
 /// carries the same decision as byte ranges. Both key on the bake's verdict, `layout.weight_tail`:
 /// a bound weight is in the tail exactly when it is placed in the slot that verdict names.
@@ -1995,15 +1985,7 @@ impl SpyreWorker {
                                 vocab,
                                 kv_dim,
                                 num_blocks,
-                                wirings
-                                    .prefill
-                                    .as_ref()
-                                    .unwrap_or(&wirings.decode)
-                                    .num_sources,
-                                &resident_source_ids(
-                                    wirings.prefill.as_ref().unwrap_or(&wirings.decode),
-                                    &spill_tids,
-                                ),
+                                &spill_tids,
                             )
                         } else {
                             SuperDscSession::new_borrowing(
@@ -2011,16 +1993,8 @@ impl SpyreWorker {
                                 vocab,
                                 kv_dim,
                                 num_blocks,
-                                wirings
-                                    .prefill
-                                    .as_ref()
-                                    .unwrap_or(&wirings.decode)
-                                    .num_sources,
-                                &resident_source_ids(
-                                    wirings.prefill.as_ref().unwrap_or(&wirings.decode),
-                                    &spill_tids,
-                                ),
                                 &RESIDENT_SEGS.map(|(seg, _)| seg),
+                                &spill_tids,
                             )
                         }
                         .map_err(|e| werr(format!("build SuperDSC PREFILL dxp session: {e}")))?;
@@ -2141,9 +2115,8 @@ impl SpyreWorker {
                                                 vocab,
                                                 kv_dim,
                                                 num_blocks,
-                                                wirings.decode.num_sources,
-                                                &resident_source_ids(&wirings.decode, &rung_spill),
                                                 &[1, 2],
+                                                &rung_spill,
                                             );
                                             (rm, r)
                                         })
@@ -2168,9 +2141,13 @@ impl SpyreWorker {
                     vocab,
                     kv_dim,
                     num_blocks,
-                    wirings.decode.num_sources,
-                    &resident_source_ids(&wirings.decode, &spill_tids),
                     weights,
+                    // The decode graph's staged tables (the mint's seven, or
+                    // any other kernel's): bound once HERE, on the owner,
+                    // before prepare — every borrowing rung reads them through
+                    // the seg1 alias.
+                    wirings.decode.load_consts,
+                    &spill_tids,
                 )
                 .map_err(|e| werr(format!("build SuperDSC dxp session: {e}")))?;
                 // ⭐ THE SPILLED WEIGHT TAIL'S DEVICE IMAGE, read back from the OWNER once its
@@ -2352,16 +2329,8 @@ impl SpyreWorker {
                             vocab,
                             kv_dim,
                             num_blocks,
-                            wirings
-                                .prefill
-                                .as_ref()
-                                .unwrap_or(&wirings.decode)
-                                .num_sources,
-                            &resident_source_ids(
-                                wirings.prefill.as_ref().unwrap_or(&wirings.decode),
-                                &spill_tids,
-                            ),
                             &[1, 2],
+                            &spill_tids,
                         ) {
                             Ok(mut ps) => match adopt_from_owner(&mut ps, &ss, &spill_images) {
                                 Ok(()) => {
@@ -2533,18 +2502,25 @@ impl SpyreWorker {
                             continue;
                         }
                     };
+                    // ⭐ THE RUNG'S OWN RESULT STAMP, not the solo wiring's `result_id`. The argmax
+                    // mint renumbers the ONE-REQUEST graph — nine staged tables spliced into the
+                    // source range shift every op output up — so a tid stated on the minted wiring
+                    // names a different tensor, or none, in this unminted rung's layout (the load
+                    // WARN that fired when the re-point landed: the stick's tid is past the rung's
+                    // whole tensor range). A wiring fact is graph-local; the row this loop needs is
+                    // the rung's own graph result, which its bake stated the one way that survives
+                    // renumbering: the `SegRole::Logits` stamp, read here as `layout.logits()`. The
+                    // geometry check below stays a CHECK — refusing a rung whose result is not N
+                    // whole rows — never the search that finds it.
                     let logits = rcode
                         .layout
-                        .place_of_tid(dparsed.result_id as u32)
-                        .and_then(|p| {
-                            LogitsGeom::from_placement(p.size, rung_width, vocab as usize)
-                        });
+                        .logits()
+                        .and_then(|p| LogitsGeom::from_placement(p, rung_width, vocab as usize));
                     let Some(logits) = logits else {
                         warn!(
-                            "[spyre-worker] sendnn: decode batch rung seqs={rn}: its baked logits \
-                             placement (t{}) is missing or is not {rn} whole rows of >= {vocab} — \
-                             SKIPPED",
-                            dparsed.result_id
+                            "[spyre-worker] sendnn: decode batch rung seqs={rn}: its own baked \
+                             logits placement (the SegRole::Logits stamp) is missing or is not \
+                             {rn} whole rows of >= {vocab} — SKIPPED"
                         );
                         continue;
                     };
@@ -2553,9 +2529,8 @@ impl SpyreWorker {
                         vocab,
                         kv_dim,
                         num_blocks,
-                        wirings.decode.num_sources,
-                        &resident_source_ids(&wirings.decode, &spill_tids),
                         &[1, 2],
+                        &spill_tids,
                     ) {
                         Ok(mut rs) => {
                             let mut ok = true;
@@ -2732,6 +2707,8 @@ impl SpyreWorker {
                 cos_srcs: p.cos_srcs,
                 sin_srcs: p.sin_srcs,
                 result_id: p.result_id,
+                result_is_index: p.result_is_index,
+                result_want: p.result_want,
                 layers: p.layers,
                 #[cfg(not(feature = "spyre-hw"))]
                 output_ids: p.output_ids,

@@ -905,8 +905,8 @@ pub struct Executor {
     staged: BTreeMap<bundle::PlaceId, u64>,
     /// ⭐⭐⭐⭐⭐ IDS BOUND THROUGH [`Executor::bind_const_fp32`] — fp32 constants whose LE host
     /// bytes ARE the device encoding (`Df::Fp32` is IEEE_FP32), so staging copies them VERBATIM:
-    /// no IEEE→SEN re-encode, no tile walk. The composite argmax's descending ramp and scalar-V
-    /// stick (#603 PR3a), and nothing else today.
+    /// no IEEE→SEN re-encode, no tile walk. The spliced argmax kernel's staged f32 constants
+    /// (the one-request rung's exactness island), and nothing else today.
     ///
     /// A set for the same reason [`Self::raw_ids`] is one: the staging loop consults it, and a
     /// flag remembered by the bind call alone is a flag the loop can forget.
@@ -1749,8 +1749,8 @@ impl Executor {
     }
 
     /// ⭐⭐⭐⭐⭐ Bind a RESIDENT FP32 CONSTANT at load — staged VERBATIM, once, never re-bound.
-    /// The composite argmax's descending ramp and scalar-V stick (#603 PR3a), and nothing else
-    /// today.
+    /// The spliced argmax kernel's staged f32 constants (the one-request rung's
+    /// exactness island), and nothing else today.
     ///
     /// ⛔ THIS IS NOT [`Self::bind_input_raw`], AND NOT A LAZIER [`Self::bind_weight`]. The raw
     /// channel is PER-STEP (a raw id bound before prepare is exactly the raw+weight combination
@@ -1775,7 +1775,7 @@ impl Executor {
             bail!(
                 "bind_const_fp32({id}): NO placement in this bundle — the layout did not place \
                  this const, so the caller's bind and the bundle's layout disagree about the \
-                 composite argmax. REFUSING"
+                 staged constants. REFUSING"
             );
         };
         if !bytes.len().is_multiple_of(4) {
@@ -1797,6 +1797,40 @@ impl Executor {
         self.weight_ids.insert(id);
         self.const_fp32_ids.insert(id);
         self.bound.insert(id, bytes);
+        Ok(())
+    }
+
+    /// ⭐⭐⭐ STAGE THE LOAD-TIME CONSTANTS — every entry of the wiring's
+    /// [`load_consts`](crate::wiring::Wiring::load_consts) list, bound ONCE at
+    /// load, before prepare (each is a function of the graph alone, so
+    /// re-binding per step would re-upload constants). Must be called before
+    /// [`Executor::prepare`], exactly like [`Self::bind_weight`].
+    ///
+    /// The fp32-verbatim vs fp16-convert choice keys off the ENTRY'S OWN
+    /// dtype, never off the op that minted it: a resident fp32 constant's LE
+    /// bytes are the device's own (`Df::Fp32` = IEEE_FP32 —
+    /// [`Self::bind_const_fp32`]), and everything else rides the weight
+    /// channel's IEEE→SEN convert ([`Self::bind_weight`]), bit-exact for every
+    /// value a staged table states. An entry whose tid is a graph OUTPUT
+    /// simply binds that output's initial bytes into its
+    /// own placement — the ops that overwrite it per step do so over these
+    /// bytes, exactly as the card behaves.
+    pub fn bind_load_consts(&mut self, consts: &[(u32, crate::wiring::LoadConst)]) -> Result<()> {
+        if self.prepared {
+            bail!(
+                "bind_load_consts: session ALREADY PREPARED — load-time constants are resident, \
+                 staged once at load"
+            );
+        }
+        for &(tid, kind) in consts {
+            let (bytes, dt, _shape) = kind.build();
+            let id = bundle::PlaceId::Act(tid);
+            if matches!(dt, scratchy_tensors::DType::F32) {
+                self.bind_const_fp32(id, bytes)?;
+            } else {
+                self.bind_weight(id, bytes);
+            }
+        }
         Ok(())
     }
 
@@ -5175,6 +5209,77 @@ impl Executor {
         let mut out = vec![0u8; elems * 2];
         sen_convert::sen_to_ieee_bytes(src, &mut out);
         Ok(out)
+    }
+
+    /// ⭐ THE RAW TWIN OF [`Self::read_tensor`] — the placement's own bytes,
+    /// VERBATIM, no f16 convert: a rung whose result is not the f16 row (an
+    /// index stick, read at the dtype its producer's kernel signature stated)
+    /// is decoded by the CALLER, because only the wiring knows the dtype. Same
+    /// clamps: to `cap_bytes`, and to what the transfer actually brought back.
+    ///
+    /// ⭐ THE TRANSFER IS THE PLACEMENT'S OWN WINDOW, never its segment's
+    /// allocation — the same law [`Self::predict`] states for the row: this
+    /// sits on the TOKEN critical path (the answer re-point's whole point is
+    /// that the ~100 KB row readback collapses to the stick's own bytes), and
+    /// a whole-segment D2H would price the token by whatever else the segment
+    /// packs (measured: the whole-segment read held mean ITL at the row
+    /// readback's level — the collapse never reached the wire). Rides the
+    /// COMPUTE pipeline for the same #544 reason the row's readback does: its
+    /// CB queues behind the step's compute CBs and the FIFO carries the
+    /// ordering the host-side wait used to.
+    pub fn read_tensor_raw(&mut self, id: bundle::PlaceId, cap_bytes: usize) -> Result<Vec<u8>> {
+        let p = self
+            .places
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown tensor {id}"))?;
+        let seg = SegIdx::checked(p.segment as i64)
+            .ok_or_else(|| anyhow!("tensor '{id}' segment {} out of range", p.segment))?;
+        // The bank law is read_tensor's own: a segment read addresses bank 0's
+        // region only, and handing back another bank's bytes at this offset is
+        // worse than refusing.
+        if p.bank != 0 {
+            bail!(
+                "read_tensor_raw('{id}'): it is in weight bank {}, and a segment read addresses \
+                 only bank 0's region — REFUSING rather than returning another bank's bytes",
+                p.bank
+            );
+        }
+        let addr = self.seg_addr[seg.get()]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{} has no region", seg.get()))?;
+        let tot = addr.total_size().as_u64();
+        let want = p.size.min(cap_bytes as u64);
+        // The round-up to a flit is not optional (`Flits::from_bytes` TRUNCATES),
+        // and the same two facts predict's window relies on hold here by the
+        // same cargo-build guard (`audit_layout_addresses`): the offset is
+        // 128-aligned and offset+size stays inside the region.
+        let len = crate::lower_subtile_tape_to_superdsc::align128(want).min(tot - p.offset);
+        // A multi-chunk region has no addressable sub-window; fall back to the
+        // whole-region read, exactly as predict does.
+        let win = (len < tot)
+            .then(|| addr.window(ByteOffset(p.offset), ByteSize(len)))
+            .flatten();
+        let (src, a, b) = match win.as_ref() {
+            Some(w) => (w, p.offset, p.offset + len),
+            None => (addr, 0, tot),
+        };
+        let host = &mut self.seg_host[seg.get()][a as usize..b as usize];
+        self.stream
+            .as_ref()
+            .ok_or_else(|| anyhow!("no stream — prepare was not called"))?
+            .d2h_on_compute(host, src)
+            .map_err(|e| anyhow!("read_tensor_raw({id}) D2H: {e}"))?;
+        self.stream_ref()?
+            .synchronize()
+            .map_err(|e| anyhow!("read_tensor_raw({id}) sync: {e}"))?;
+        // May only return the bytes the transfer actually brought back.
+        let avail = (b - p.offset) as usize;
+        let n = (p.size as usize).min(cap_bytes).min(avail);
+        if n == 0 {
+            return Ok(Vec::new()); // a wholly-unreadable placement also has no valid base
+        }
+        Ok(self.seg_host[seg.get()][p.offset as usize..][..n].to_vec())
     }
 
     /// The host shadow's byte size for `seg` — what to size a [`Executor::read_seg`] buffer at.

@@ -36,6 +36,7 @@ use flex_rs::scheduler::{
     SchedulerBackendConfig, SchedulerFactoryError, SenlibHardwareSubmit, SenlibQueueCapacity,
     build_compute_cb, create_scheduler,
 };
+use flex_rs::shared_host_pool::{SharedHostPool, SharedHostPoolError};
 use flex_rs::stream::{
     RuntimeStream, RuntimeStreamError, RuntimeStreamMode, RuntimeStreamPriority, SchedulerError,
     StreamId,
@@ -304,6 +305,10 @@ pub enum HwError {
     /// encoder cannot express an operand ([`Stream::render_compute_batch`]).
     /// Never a submission: nothing was sent to the device.
     CbRender(SchedulerError),
+    /// A #606 pooled copy ([`Stream::pooled_copy_on_compute`]) was refused by the
+    /// pool's own validation set — slot range, single-chunk device, the
+    /// slot-capacity transfer law — or the submission it built was rejected.
+    PooledCopy(SharedHostPoolError),
 }
 
 impl fmt::Display for HwError {
@@ -325,6 +330,7 @@ impl fmt::Display for HwError {
             Self::Alloc(e) => write!(f, "{e}"),
             Self::Reset(e) => write!(f, "{e}"),
             Self::CbRender(e) => write!(f, "CB image render (no submission): {e}"),
+            Self::PooledCopy(e) => write!(f, "pooled copy: {e}"),
         }
     }
 }
@@ -576,6 +582,36 @@ impl Stream {
                 ..Default::default()
             },
         )
+    }
+
+    /// ⭐ #603 PR3b — a #606-POOLED, pre-mapped copy on the COMPUTE pipeline: the decode
+    /// window's idx-stick D2H into (and any future preamble H2D out of) a
+    /// [`SharedHostPool`] slot. The compute shaping is [`Self::d2h_on_compute`]'s own law
+    /// (#544: the copy is the step's LAST op, FIFO-behind the step's compute CBs, its
+    /// barrier draining the empty DMA deques instead of host-blocking on compute); the
+    /// slot's STABLE IOVA is the pool's whole point — the copy rides the scheduler's
+    /// pre-mapped path with no per-step pin, no fresh mapping, no shadow buffer, which is
+    /// what keeps the per-step DMA a replay candidate instead of a re-render.
+    ///
+    /// The transfer length is the device object's own `total_size` (the pool door's law),
+    /// so the caller passes the PLACEMENT WINDOW, never the whole segment — a window that
+    /// cannot form must be refused by the caller, not papered over with the region.
+    ///
+    /// # Errors
+    /// [`HwError`]: [`HwError::StreamGone`] when the stream is no longer live, or
+    /// [`HwError::PooledCopy`] carrying the pool's own validation set (slot range,
+    /// single-chunk device, the slot-capacity transfer law) or the submission's
+    /// rejection.
+    pub fn pooled_copy_on_compute(
+        &self,
+        pool: &SharedHostPool,
+        slot: usize,
+        addr: &DevAddr,
+        to_device: bool,
+    ) -> Result<(), HwError> {
+        let stream = self.live()?;
+        pool.enqueue_copy_on_compute(&stream, slot, Some(addr.0.clone()), to_device)
+            .map_err(HwError::PooledCopy)
     }
 
     /// The one body behind [`Self::d2h`] and [`Self::d2h_on_compute`].

@@ -79,6 +79,10 @@ pub const ALL: &[&str] = &[
     // partitioned parameters. The `to_ktir.rs` count fix's gate.
     "attention_banded_fold",
     "attention_banded_batch",
+    // ⭐ THE LADDER-FORM SAMPLER -- through the whole-function door (every op in the kernel
+    // crosses a generic arm; see the `case` row). The door-kind field carries a placeholder
+    // the walk never reads; the per-`Program` run refuses that row loudly at its arity check.
+    "argmax_first_max",
 ];
 
 pub fn root() -> PathBuf {
@@ -115,11 +119,20 @@ pub fn spec(fixture: &str, kernel: &str, ptrs: &[(&str, &str)], ces: &[(&str, Va
     }
 }
 
-/// One configuration: which `.py`, which kernel, the constexprs, the grid, and the node kind.
+/// One configuration: which `.py`, which kernel, the constexprs, the grid, and the door kind.
 ///
 /// The constexprs and grid are the SAME VALUES as `test/experiment1/index.json` and
 /// `pure_rust_ktir.rs`'s case table. `Program` is stated, not inferred -- see the crate docs.
-pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+///
+/// ⚠️ THE THIRD FIELD IS `Option<Program>`, AND `None` IS A STAGE, NOT AN ABSENCE. A `Some(kind)`
+/// row has a KTIR→SuperDSC door: `bake_py` and the emit tests can drive it to descriptors. A
+/// `None` row has NONE YET -- its kernel is stated in generic Triton ops (`tt.reduce`,
+/// `arith.cmpf`, `scf.for`, …) whose door lowering is the open rung, and minting a
+/// kernel-specific `Program` variant to fill the hole is exactly what the ladder forbids: the
+/// row is registered so the NUMERIC legs (`.py` → TTIR → KTIR → executor) run on it today, and
+/// the door consumers REFUSE it loudly rather than guessing a kind. When the generic scan/loop
+/// door exists, the row flips to `Some(...)` and this paragraph shrinks.
+pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Option<Program>)> {
     Some(match name {
         "rmsnorm_granite" => (
             spec(
@@ -139,7 +152,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 ],
             ),
             vec![1],
-            Program::RmsNorm,
+            Some(Program::RmsNorm),
         ),
         // THE SAME NORM AT 32 ROWS -- the control for the `mb` FOLD.
         //
@@ -169,7 +182,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 ],
             ),
             vec![1],
-            Program::RmsNorm,
+            Some(Program::RmsNorm),
         ),
         // SWIGLU AT TWO BLOCKINGS, to separate two problems that look like one.
         //
@@ -190,7 +203,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &swiglu_ce(128, 256, 64, 128),
             ),
             vec![1],
-            Program::Matmul,
+            Some(Program::Matmul),
         ),
         "swiglu_mlp_flat" => (
             spec(
@@ -200,7 +213,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &swiglu_ce(128, 256, 256, 128),
             ),
             vec![1],
-            Program::Matmul,
+            Some(Program::Matmul),
         ),
         // GRANITE WIDTH, FLAT. D_FF=12800, so this states a [64, 12800] f16 extent = 1.56 MiB --
         // more than an LX tile. THE POINT IS THAT WE DO NOT MATERIALISE IT: their
@@ -216,7 +229,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &swiglu_ce(4096, 12800, 12800, 4096),
             ),
             vec![1],
-            Program::Matmul,
+            Some(Program::Matmul),
         ),
         // SWIGLU AS `pure_rust_ktir.rs` STATES IT -- the BLOCKED forms, kept beside the flat ones
         // so "does un-blocking clear this?" is a question one binary answers twice.
@@ -228,7 +241,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &swiglu_ce_m(16, 128, 256, 128, 64),
             ),
             vec![1],
-            Program::Matmul,
+            Some(Program::Matmul),
         ),
         "swiglu_mlp_granite" => (
             spec(
@@ -238,7 +251,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &swiglu_ce(4096, 12800, 64, 4096),
             ),
             vec![1],
-            Program::Matmul,
+            Some(Program::Matmul),
         ),
         // ⭐⭐ GRANITE WIDTH AT THE BLOCKING WHOSE TILES ACTUALLY FIT A 2 MiB LX, which is the
         // configuration `triton-numeric` gets a NUMBER from. The two above do not: `_flat` refuses
@@ -306,7 +319,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &swiglu_ce(4096, 12800, 64, 2048),
             ),
             vec![1],
-            Program::Matmul,
+            Some(Program::Matmul),
         ),
         // ROPE. THE GRID IS ONE WORK ITEM PER TOKEN POSITION -- `vec![N_TOK]` -- and it is ONE
         // DIMENSION, not two.
@@ -325,12 +338,12 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         "rope_q32" => (
             spec("rope", "rope_fwd", ROPE, &rope_ce(32)),
             vec![256],
-            Program::Rope,
+            Some(Program::Rope),
         ),
         "rope_kv8" => (
             spec("rope", "rope_fwd", ROPE, &rope_ce(8)),
             vec![256],
-            Program::Rope,
+            Some(Program::Rope),
         ),
         // EMBEDDING. `Program::ScalarMul` is the kind of the one COMPUTE op (`rows * EMB_SCALE`);
         // the gather itself is addressing, and whether this crate has a door for an INDIRECT access
@@ -367,7 +380,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &embedding_ce(256, 64),
             ),
             vec![4],
-            Program::ScalarMul,
+            Some(Program::ScalarMul),
         ),
         "embedding_granite_bm128" => (
             spec(
@@ -377,7 +390,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &embedding_ce(256, 128),
             ),
             vec![2],
-            Program::ScalarMul,
+            Some(Program::ScalarMul),
         ),
         // ⭐⭐⭐ THE ACCEPTING SIDE, AND THE ONE CONFIGURATION THAT MAKES THE GUARD A GUARD RATHER THAN
         // A WITHDRAWAL. N_TOK = 32 is exactly ONE index stick (`CopyDims::ENTRIES_PER_OP`, the
@@ -396,7 +409,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &embedding_ce(32, 32),
             ),
             vec![1],
-            Program::ScalarMul,
+            Some(Program::ScalarMul),
         ),
         // THE DECODER BLOCK -- 12 matmuls in one function for one layer, 24 for two, so it is the
         // whole-function door's real case. `Program` is stated only because the signature demands
@@ -412,7 +425,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &dec_ce(64),
             ),
             vec![1],
-            Program::Matmul,
+            Some(Program::Matmul),
         ),
         "decoder_layer_one_flat" => (
             spec(
@@ -422,7 +435,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &dec_ce(256),
             ),
             vec![1],
-            Program::Matmul,
+            Some(Program::Matmul),
         ),
         "decoder_two_layers" => (
             spec(
@@ -432,7 +445,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &dec_ce(64),
             ),
             vec![1],
-            Program::Matmul,
+            Some(Program::Matmul),
         ),
         "decoder_two_layers_flat" => (
             spec(
@@ -442,7 +455,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &dec_ce(256),
             ),
             vec![1],
-            Program::Matmul,
+            Some(Program::Matmul),
         ),
         // ⭐ ATTENTION, THE ONE KERNEL THIS TABLE HAD NO ROW FOR — so no attention descriptor has
         // ever gone down the from-source ladder (`bake_py`), only the ttir-golden path that
@@ -466,7 +479,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &attn_ce(1),
             ),
             vec![4, 4],
-            Program::Attn,
+            Some(Program::Attn),
         ),
         // ⭐ THE ONE-TILE FORM OF THE SAME KERNEL — the whole recurrence at the smallest launch that
         // states it. `attn_ce(1)` is untouched (N_CTX=256, BLOCK_M=BLOCK_N=64), so this is ONE query
@@ -489,12 +502,12 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &attn_ce(1),
             ),
             vec![1, 1],
-            Program::Attn,
+            Some(Program::Attn),
         ),
         "attention_flash_causal" => (
             spec("attention_flash", "attn_fwd", ATTN, &attn_ce(3)),
             vec![4, 4],
-            Program::Attn,
+            Some(Program::Attn),
         ),
         // ⭐ fp8 W8A8 AT THE SMALL TWIN'S SHAPES -- the whole contract is the four
         // buffers (x f16 [M,K], w PACKED fp8 [N,K], ws f16 [1,N], o f16 [M,N]) and the
@@ -525,7 +538,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 ],
             ),
             vec![1],
-            Program::Matmul,
+            Some(Program::Matmul),
         ),
         // ⭐ RUNG 3, THE MEASUREMENT. The kernel is `mul` with the second pointer
         // replaced by ONE runtime fp32 scalar (`a * scale`), so the whole case is the
@@ -555,7 +568,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("n", Val::Int(1024)), ("BLOCK", Val::Int(64))],
             ),
             vec![16],
-            Program::Elementwise(Elementwise::Mul),
+            Some(Program::Elementwise(Elementwise::Mul)),
         ),
         // ⭐ RUNG 2 IN TWO DIMENSIONS. `mul_scale_small` states the per-core uniform
         // corner (`pid * BLOCK`) on a 1-D window; this row states the same rung on a 2-D
@@ -588,7 +601,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             ),
             // M / BLOCK_M: the grid tiles `a`'s rows exactly, one row band per core.
             vec![8],
-            Program::Matmul,
+            Some(Program::Matmul),
         ),
         // ⭐⭐⭐ RUNG 4 OF THE ADDRESS-PROVENANCE LADDER, THE MEASUREMENT: `q @ gather(k,
         // ids).T` -- a row index read from DEVICE MEMORY, the gathered rows feeding a
@@ -626,7 +639,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 ],
             ),
             vec![1],
-            Program::Matmul,
+            Some(Program::Matmul),
         ),
         // ⭐⭐⭐ TASK 27 — PAGED FLASH ATTENTION, THE ONE-BLOCK STEP: the full flash body
         // around rung 4's gathered V-leg contraction. The block table (`desc_ids`) picks
@@ -662,7 +675,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 ],
             ),
             vec![1],
-            Program::Matmul,
+            Some(Program::Matmul),
         ),
         // ⭐ TASK 28: the paged form PROPER — the KV sweep over a DEVICE-RESIDENT block
         // table with the flash recurrence (m, l, acc) carried across blocks in ONE
@@ -696,7 +709,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 ],
             ),
             vec![1],
-            Program::Matmul,
+            Some(Program::Matmul),
         ),
         // ⭐ THE DOUBLE-UNROLL COUNT TWIN — `banded_attn_fwd` is the production
         // paged-decode arm's body at granite-3.1-2b's real decode geometry (GQA=4,
@@ -729,8 +742,66 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // stays multi-dot so `dot_to_linalg`'s single-dot canonical verifiers (which
         // refuse a computed A-offset) never gate it — the same exemption the
         // production kernel rides.
-        "attention_banded_fold" => (banded_attn_spec(1), vec![1, 8, 4], Program::Attn),
-        "attention_banded_batch" => (banded_attn_spec(2), vec![2, 8, 4], Program::Attn),
+        "attention_banded_fold" => (banded_attn_spec(1), vec![1, 8, 4], Some(Program::Attn)),
+        "attention_banded_batch" => (banded_attn_spec(2), vec![2, 8, 4], Some(Program::Attn)),
+        // ⭐ THE LADDER FORM OF THE GREEDY SAMPLER (#603/#500, #714's nuke ruling): the vocab
+        // scan as ONE Triton kernel stated in generic ops -- the whole padded row as ONE
+        // descriptor tile (rmsnorm's whole-row block), five whole-row `tt.reduce` maxima,
+        // three equality masks, four staged fp16 index tables (the two DECREASING ramps
+        // pick first-block then first-lane; the two INCREASING 0-based tables read the
+        // selected numbers back out through the one-hot, so the kernel states NO
+        // subtraction anywhere), and ONE fp32 island for the final `b*64 + l`. FIRST-max
+        // by arithmetic (the ramps' monotonicity), STRAIGHT-LINE (no loops at all -- the
+        // door receives ~20 generic ops, not a spliced trip bomb), one program over the
+        // solo decode step's [PAD_V] row. See the fixture's own docstring for the full
+        // algorithm and host contract.
+        //
+        // ⭐ THE DOOR IS THE WHOLE-FUNCTION WALK, and every op in the kernel crosses it
+        // through a GENERIC arm: the five maxima as bare `Reduce(Max)`, the three
+        // `cmpf(oeq)`+`uitofp` pairs folded to `Elementwise(Equal)` (the vendor's own
+        // `OpFunc::Equal` -- the device HAS the primitive and KTIR cannot name it in one
+        // op), the fp16 multiplies as `Elementwise(Mul)` (the `[1]`-answer widens through
+        // the broadcast operand mode), and the island as `dl16tofp32` -> same-stick f32
+        // multiply-add -> `fp32toint32` (the KSPLIT device recipe, `assemble_convert`).
+        // ⭐ THE DOOR KIND IS REAL NOW, not a placeholder: the SPLICE produces this body
+        // (the production `kernels/argmax.py`, `SubOp::ArgMax`'s row), and `Program::ArgMax`
+        // is its stated classification -- the same fact every spliced family states
+        // (`Program::RmsNorm`, `Program::SiluMul`, ...). The old "no algorithm name is
+        // wanted" ruling was the STANDALONE ladder's (a placeholder sufficed when nothing
+        // produced the kind); the splice changed the fact. The whole-function walk
+        // (`KTIR_WHOLE=1`) still never reads it; a per-`Program` run refuses loudly at
+        // the program arm (an eleven-parameter whole-function body is `emit_whole`'s, not
+        // a single-descriptor dispatch's). (⛔ NOT the vendor topk pair: `topk.ddl`'s
+        // ripple keeps the LAST index among equals -- `GREATERTHAN(running, candidate)`
+        // with an equal candidate displacing -- so `topkindex` at k=1 is LAST-max and
+        // cannot serve #631's law.)
+        "argmax_first_max" => (
+            spec(
+                "argmax_first_max",
+                "argmax_first_max_kernel",
+                &[
+                    ("logits_ptr", "*fp16"),
+                    ("bramp_ptr", "*fp16"),
+                    ("lramp_ptr", "*fp16"),
+                    ("binc_ptr", "*fp16"),
+                    ("linc_ptr", "*fp16"),
+                    ("ones_ptr", "*fp16"),
+                    ("sixtyfour_ptr", "*fp32"),
+                    ("padoff_ptr", "*fp16"),
+                    ("gramp_ptr", "*fp16"),
+                    ("ginc_ptr", "*fp16"),
+                    ("idx_ptr", "*i32"),
+                ],
+                &[
+                    ("V", Val::Int(49155)),
+                    ("PAD_V", Val::Int(65536)),
+                    ("NB", Val::Int(1024)),
+                    ("BLOCK", Val::Int(64)),
+                ],
+            ),
+            vec![1],
+            Some(Program::ArgMax),
+        ),
         _ => return None,
     })
 }
@@ -973,9 +1044,32 @@ mod tests {
         }
         assert_eq!(
             super::ALL.len(),
-            28,
+            29,
             "a configuration was added or removed: update ALL (and the module title) deliberately"
         );
+    }
+
+    /// ⛔ A `None` DOOR KIND IS A STAGE, NOT A DEFAULT. Every row whose third field is `None`
+    /// must SAY SO in its arm's comment (why no `Program` variant is honest for it yet), and this
+    /// test pins the SET of such rows by name -- so a new `None` row is a deliberate act that
+    /// updates this list, not a copy-paste of another arm's trailing field. When a row gains
+    /// its door it leaves this list and the list shrinks toward empty, which is the direction
+    /// the ladder runs. ⭐ THE LIST IS NOW EMPTY: `argmax_first_max` was the last doorless row,
+    /// and its kernel crosses the whole-function door through generic arms only -- the ladder's
+    /// stated destination. A new `None` row starts the list over and must say why.
+    #[test]
+    fn the_rows_without_a_door_are_exactly_the_named_set() {
+        const DOORLESS: &[&str] = &[];
+        for name in super::ALL {
+            let (_, _, door) = super::case(name).expect("a name from ALL");
+            let doorless = door.is_none();
+            assert_eq!(
+                doorless,
+                DOORLESS.contains(name),
+                "`{name}`'s door-kind is {door:?}; the DOORLESS set says {}",
+                DOORLESS.contains(name)
+            );
+        }
     }
 
     /// A name that is NOT a configuration comes back `None` rather than resolving to a neighbour.
