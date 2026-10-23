@@ -405,6 +405,9 @@ pub fn failed_note(c: Option<&Cell>) -> String {
             c.total_output_tokens.unwrap_or(0)
         );
     }
+    if c.is_some_and(|c| c.timed_out) {
+        return "it did not finish within the run's cell timeout".to_string();
+    }
     let n = failed(c);
     format!(
         "{n} of {} requests failed",

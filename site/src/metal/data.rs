@@ -222,6 +222,9 @@ pub struct Config {
     /// (`CLASSES` in the bench script); absent in runs from before it.
     #[serde(default)]
     pub classes: Option<Vec<Class>>,
+    /// The memory from which a Mac runs the large set of [`Config::classes`].
+    #[serde(default)]
+    pub large_from_gb: Option<u32>,
     #[serde(default)]
     pub default_models: Option<Vec<String>>,
 }
@@ -235,9 +238,9 @@ pub struct Class {
 }
 
 impl Class {
-    /// The class's model on a Mac with `memory_gb` of memory.
-    pub fn model(&self, memory_gb: u32) -> &str {
-        if memory_gb >= 64 {
+    /// The class's model on a Mac with `memory_gb` of memory, the large one from `large_from_gb`.
+    pub fn model(&self, memory_gb: u32, large_from_gb: u32) -> &str {
+        if memory_gb >= large_from_gb {
             &self.large
         } else {
             &self.small
@@ -273,11 +276,13 @@ pub struct Scaling {
     /// The answer lengths the grid ran at above 1 user (`--scale-grid-users-output`); absent
     /// in runs from before it, which ran every `grid_output` at every users count.
     pub grid_users_output: Option<Vec<u32>>,
-    /// The longest grid prompt the Mac's memory held (`--scale-max-prompt`): longer
+    /// The longest grid prompt the Mac's memory held (the runner's `--scale-max-prompt`, before
+    /// every cell ran): longer
     /// `grid_input` lengths were not run. None: every one was.
     #[serde(default)]
     pub max_prompt: Option<u32>,
-    /// The longest grid prompt run above 1 user (`--scale-max-prompt-users`); longer prompts
+    /// The longest grid prompt run above 1 user (the runner's `--scale-max-prompt-users`, before
+    /// every cell ran); longer prompts
     /// ran at 1 user only. None: every prompt `max_prompt` allows.
     #[serde(default)]
     pub max_prompt_users: Option<u32>,
@@ -532,6 +537,9 @@ pub struct Cell {
     /// Whether its peak memory reads below the model's own weights ([`Run::mark_mem_below_weights`]),
     /// so it is no reading of the process.
     pub mem_below_weights: bool,
+    /// The client never finished it (the run's `cell_timeout_s`), so every request counts as
+    /// failed: too slow, not out of memory.
+    pub timed_out: bool,
 }
 
 impl Cell {
@@ -587,6 +595,8 @@ struct RawCell {
     conc: Option<u32>,
     #[serde(default)]
     total_output_tokens: Option<u64>,
+    #[serde(default)]
+    timed_out: bool,
 }
 
 impl TryFrom<RawCell> for Cell {
@@ -624,6 +634,7 @@ impl TryFrom<RawCell> for Cell {
             total_output_tokens: c.total_output_tokens,
             dead: false,
             mem_below_weights: false,
+            timed_out: c.timed_out,
         })
     }
 }

@@ -119,8 +119,9 @@ MODELS_ALL=(
 # The default round is one model per class, sized to the Mac: the small set
 # below 64 GB of memory, the large set at 64 GB and above. --models small or
 # --models large names one; --models full runs both, where each fits. Each
-# run file records this table (config.classes), and the page reads its
-# overview's columns from it.
+# run file records this table (config.classes) and the cut-off
+# (config.large_from_gb), and the page reads its overview's columns from them.
+LARGE_GB=64
 CLASSES=(
   # class | small | large
   "sliding window|gpt-oss-20b|gpt-oss-120b-3bit"
@@ -212,7 +213,8 @@ mlx_parity_config() {
 }
 
 MODELS=()
-# Two kinds of run. By default a quick one, about 25 minutes:
+# Two kinds of run. By default a quick one, aimed at about 25 minutes (not yet
+# measured as it now runs):
 # scratchy alone, cold and warm, one rep, 64-token answers. The page
 # keeps every other engine's numbers, and scratchy's frozen launches, from the
 # last run that measured them. --full is the complete one, every engine's
@@ -225,8 +227,11 @@ SCENARIOS="cold,warm"
 REPS=1
 # Discarded launches before cold, so it measures a settled cache: since #740
 # the aligned-weights cache is written by the first launch's graceful shutdown,
-# so one does. The harness does one on its own; more come from a throwaway cold
-# call.
+# so one does, and a quick run primes once. The harness does one on its own;
+# more come from a throwaway cold call. A full run keeps three: it is the
+# baseline every quick run's borrowed numbers come from, so it is measured as
+# the earlier full runs were, and the skill's and metal_round.py's scope check
+# reads its three priming launches.
 PRIME=1
 if (( FULL )); then SCENARIOS="frozen,cold,warm"; REPS=3; PRIME=3; fi
 PORT=8751
@@ -330,7 +335,7 @@ while [[ $# -gt 0 ]]; do
 done
 # This Mac's set: the large models need 64 GB, the small ones are the round below that.
 MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
-if (( MEM_GB >= 64 )); then MODELS_DEFAULT="${MODELS_LARGE}"; else MODELS_DEFAULT="${MODELS_SMALL}"; fi
+if (( MEM_GB >= LARGE_GB )); then MODELS_DEFAULT="${MODELS_LARGE}"; else MODELS_DEFAULT="${MODELS_SMALL}"; fi
 [[ ${#MODELS[@]} -eq 0 ]] && IFS=',' read -r -a MODELS <<<"${MODELS_DEFAULT}"
 case "${MODELS[*]}" in
     all)   MODELS=("${MODELS_ALL[@]}") ;;
@@ -546,7 +551,7 @@ for row in "${ENGINE_ROWS[@]}"; do
 done
 PIN_PROBLEMS="$(printf '%s\n' ${pin_problems[@]+"${pin_problems[@]}"})"
 CLASS_TABLE="$(printf '%s\n' "${CLASSES[@]}")"
-export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE
+export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB
 export STARTED_UTC PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
        SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS \
        MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S MODELS_FULL
@@ -588,6 +593,8 @@ json.dump({
              # overview columns.
              "classes": [dict(zip(("class", "small", "large"), row.split("|")))
                          for row in e["CLASS_TABLE"].splitlines()],
+             # The memory from which a Mac runs the large set.
+             "large_from_gb": int(e["LARGE_GB"]),
              "cold_priming_launches": int(e["PRIME_LAUNCHES"]),
              "startup_request": {"input_len": int(e["INPUT_LEN"]), "output_len": int(e["OUTPUT_LEN"]),
                                  "warm_requests": int(e["WARM_REQUESTS"])},
@@ -886,17 +893,33 @@ PY2
         echo "failed (see ${RAW}/cells-${stem}.log)"
     else
         numbers "${out_json}"
-        # A server that dropped requests has usually run out of memory, and may
-        # answer the next cell at once with nothing: the next cell gets a fresh one.
-        if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("failed") else 1)' "${out_json}" 2>/dev/null; then
+        # A server that dropped requests has usually run out of memory, and may answer the
+        # next cell at once with nothing: the next cell gets a fresh one. So does one that
+        # came back short. #775's out-of-memory fails no request: the server answers each
+        # with no tokens. Short is under half the answer tokens asked for, #684's rule, judged
+        # only for scratchy, the one engine that serves ignore_eos to full length (#821): mlx-lm,
+        # oMLX and ollama stop at EOS on a live server, at as little as 89%, 36% and 15%.
+        local why
+        why=$(python3 - "${out_json}" "$(( n * $5 ))" "${cell_full_length}" <<'PY2' 2>/dev/null
+import json, sys
+j, asked, full = json.load(open(sys.argv[1])), int(sys.argv[2]), sys.argv[3] == "1"
+if j.get("failed"):
+    print("requests failed")
+elif full and asked and (j.get("total_output_tokens") or 0) < asked / 2:
+    print(f"came back short ({j.get('total_output_tokens') or 0} of {asked} answer tokens)")
+PY2
+)
+        if [[ -n "${why}" ]]; then
             cells_hung=1
-            echo "    requests failed (see ${RAW}/cells-${stem}.log)"
+            echo "    ${why} (see ${RAW}/cells-${stem}.log)"
         fi
     fi
 }
-run_scale_cells() { # prefix restart-function [axes]
-    local prefix="$1" axes=",${3:-${SCALE_AXES}}," x o
-    cell_restart="$2"; cells_hung=0; cells_dead=0
+run_scale_cells() { # prefix restart-function full-length [axes]
+    # full-length: 1 where the engine serves ignore_eos to full length (scratchy), so a short
+    # cell is a dead server's (run_cell).
+    local prefix="$1" axes=",${4:-${SCALE_AXES}}," x o
+    cell_restart="$2"; cell_full_length="$3"; cells_hung=0; cells_dead=0
     local -a xs os
     if [[ "${axes}" == *",conc,"* ]]; then
         IFS=',' read -r -a xs <<<"${CONC_LIST}"
@@ -1043,7 +1066,7 @@ run_engine() { # key label
         echo "--- scaling sweep, ${label} ${ax} (${par} at once, context ${ctx})"
         engine_axis_up() { serve_up "${RAW}/serve-${key}-${stem}.log" "$("${key}_ready")" bash -c "exec $("${key}_cmd" "${model}" "${par}" "${ctx}")"; }
         if engine_axis_up; then
-            run_scale_cells "${RAW}/scale-${key}-${stem}" engine_axis_up "${ax}"
+            run_scale_cells "${RAW}/scale-${key}-${stem}" engine_axis_up 0 "${ax}"
         else
             echo "    ${label} server never became ready — ${RAW}/serve-${key}-${stem}.log" >&2
         fi
@@ -1320,7 +1343,7 @@ PY
                 for ax in "${scratchy_axes[@]}"; do
                     echo "--- scaling sweep, scratchy ${ax}"
                     if scratchy_up; then
-                        run_scale_cells "${RAW}/scale-${stem}" scratchy_up "${ax}"
+                        run_scale_cells "${RAW}/scale-${stem}" scratchy_up 1 "${ax}"
                     else
                         echo "    server never became ready — ${RAW}/serve-${stem}.log" >&2
                     fi
@@ -1354,7 +1377,9 @@ env = os.environ
 KEEP = ["median_ttft_ms", "p99_ttft_ms", "median_tpot_ms", "p99_tpot_ms",
         "median_e2el_ms", "output_throughput", "request_throughput",
         "completed", "failed", "total_output_tokens", "duration", "unstreamed_requests",
-        "server_mem_peak_mib", "server_mem_median_mib"]
+        "server_mem_peak_mib", "server_mem_median_mib",
+        # A cell the client never finished (--cell-timeout-s), so its requests count as failed.
+        "timed_out"]
 CELL = re.compile(r"\.(conc|input|output|grid)-(\d+)(?:x(\d+))?(?:@(\d+))?\.json$")
 def load(name):
     p = os.path.join(raw, name)
