@@ -207,13 +207,6 @@ bimodal ITL distribution in this repo for a week
    with a 1.25-logit minimum margin (`parity_prompts` in
    `crates/benches/src/startup_exec/mod.rs`).
 
-   The gate runs where its verdict guards a comparison: any run timing a
-   comparison engine (every full run), or `--parity` forcing it (the smoke
-   run's setup check). A scratchy-only quick run skips it — the mlx-lm side
-   reloads the whole checkpoint once per gate prompt, which on the large
-   models can outlast the run itself — and records `parity_mlx_lm: null`
-   with `parity_skipped` saying why.
-
    Some models tie on every prompt: gpt-oss and Nemotron-3 think before they
    answer, and their thought opens on near-ties of 0.0–0.75 logits whatever
    the question. For them no prompt choice helps, so where the two answers'

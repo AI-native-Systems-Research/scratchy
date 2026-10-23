@@ -31,8 +31,8 @@ use crate::charts::{
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
 use data::{At, Bytes, Cell, Model, Run, Scenario};
 use numbers::{
-    DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, Startup, cfmt, failed_note, fmt, lfmt, marks,
-    marks_note, med, served, timing,
+    BELOW_WEIGHTS, DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, Startup, cfmt, failed_note, fmt,
+    lfmt, marks, marks_note, med, peak_rss, rss_fmt, served, timing,
 };
 
 /// The run files, relative to site/; copied to the same place under _site/,
@@ -91,6 +91,7 @@ fn load(site: &Site) -> Result<Vec<Run>, String> {
             ));
         }
         run.mark_dead();
+        run.mark_mem_below_weights();
         run.file = f;
         runs.push(run);
     }
@@ -335,7 +336,7 @@ fn summary_raw(m: &Model, run: &Run) -> [(Option<f64>, bool); 8] {
         (timing(one, Metric::Ttft), false),
         (timing(one, Metric::Tpot), false),
         (timing(one, Metric::Throughput), true),
-        (med(ladder, Scenario::Cold, Startup::PeakRss), false),
+        (peak_rss(m, Engine::Scratchy, Scenario::Cold).mib(), false),
     ]
 }
 
@@ -541,13 +542,12 @@ fn served_as(m: &Model, e: Engine) -> Option<String> {
         }
         None => return None,
     };
-    // The MLX engines serve scratchy's own checkpoint: nothing to add.
+    // The MLX engines serve scratchy's own checkpoint (`Engine::serves_mlx_checkpoint`): nothing to
+    // add. The others serve their own build, named here.
     let model = match e {
+        _ if e.serves_mlx_checkpoint() => None,
         Engine::Ollama => model,
-        Engine::LlamaCpp | Engine::Mistralrs => {
-            model.map(|m| m.rsplit(':').next().unwrap_or_default().to_string())
-        }
-        _ => None,
+        _ => model.map(|m| m.rsplit(':').next().unwrap_or_default().to_string()),
     };
     let parts: Vec<String> = [model, quant]
         .into_iter()
@@ -626,7 +626,12 @@ fn timing_info() -> Element {
 fn rss_info() -> Element {
     info(
         "",
-        rsx! { "The server process at its peak. For ollama, " code { "ollama serve" } " only; its runner process is not counted." },
+        rsx! {
+            "The server process at its peak. For ollama, " code { "ollama serve" } " only; its runner process is not counted. "
+            strong { "{BELOW_WEIGHTS}" } ": less than the model's own weights. A process serving the model holds at \
+                       least those, so the reading can't be all of its memory, and is left out (#414). The same rule \
+                       leaves out a peak-memory reading on the prompt-length chart."
+        },
     )
 }
 
@@ -706,7 +711,7 @@ fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
             cfmt(one, Metric::Ttft),
             cfmt(one, Metric::Tpot),
             cfmt(one, Metric::Throughput),
-            fmt(med(ladder, Scenario::Cold, Startup::PeakRss), 0),
+            rss_fmt(m, e, Scenario::Cold),
         ];
         let now = summary_raw(m, run);
         let then = prev
@@ -3265,5 +3270,83 @@ mod tests {
             "oMLX only where it was measured"
         );
         assert_eq!(super::model_timelines(entries).len(), 2);
+    }
+
+    /// A published run with one model's memory readings set to `rss` (every launch's peak RSS)
+    /// and `mem` (every scaling cell's peak memory), in MiB, for the rule tests below: the run's
+    /// other fields stay real, so it loads as one does. Returns the run and the model's index.
+    fn with_memory(rss: f64, mem: f64) -> (Run, usize) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let file = root
+            .join(DATA)
+            .join("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).expect("a published run"))
+                .expect("json");
+        let at = (json["models"].as_array().expect("models").iter())
+            .position(|m| m["model_id"] == "mlx-community/Qwen3.6-35B-A3B-4bit")
+            .expect("qwen3.6-35b-a3b in the run");
+        let m = &mut json["models"][at];
+        for key in ["cache_ladder", "cache_ladder_omlx"] {
+            for rep in m[key].as_array_mut().into_iter().flatten() {
+                rep["peak_rss_mib"] = rss.into();
+            }
+        }
+        for key in ["scaling", "scaling_omlx"] {
+            for c in m[key].as_array_mut().into_iter().flatten() {
+                c["server_mem_peak_mib"] = mem.into();
+            }
+        }
+        let mut run: Run = serde_json::from_value(json).expect("a run");
+        run.mark_mem_below_weights();
+        (run, at)
+    }
+
+    /// A memory reading below the model's own weights is left out, and one at or above them is
+    /// kept: the comparison and its MiB-to-bytes conversion, on either side of the line (#414).
+    #[test]
+    fn a_memory_reading_below_the_weights_is_left_out_and_one_above_is_kept() {
+        use super::Scenario;
+        use super::numbers::{Engine, Memory, Metric, peak_rss};
+        let w = {
+            let (run, at) = with_memory(0.0, 0.0);
+            run.models[at].weights().expect("qwen's weights").mib()
+        };
+        for (mib, below) in [(w - 1.0, true), (w + 1.0, false)] {
+            let (run, at) = with_memory(mib, mib);
+            let m = &run.models[at];
+            let rss = peak_rss(m, Engine::Scratchy, Scenario::Cold);
+            assert_eq!(
+                rss == Memory::BelowWeights,
+                below,
+                "peak RSS {mib} MiB, weights {w}: {rss:?}"
+            );
+            for c in m.scaling.iter().flatten() {
+                let shown = super::numbers::timing(Some(c), Metric::PeakMem);
+                assert_eq!(
+                    shown.is_none(),
+                    below,
+                    "peak memory {mib} MiB, weights {w}: {shown:?}"
+                );
+            }
+        }
+    }
+
+    /// Only an engine that serves the MLX checkpoint is judged against its weights: ollama,
+    /// llama.cpp and mistral.rs serve their own builds, so a low reading of theirs is still one.
+    #[test]
+    fn only_an_engine_serving_the_mlx_checkpoint_is_judged_by_its_weights() {
+        use super::numbers::{Engine, below_weights};
+        let (run, at) = with_memory(0.0, 0.0);
+        let m = &run.models[at];
+        let low = m.weights().expect("qwen's weights").mib() - 1.0;
+        for e in Engine::ALL {
+            assert_eq!(
+                below_weights(m, e, low),
+                e.serves_mlx_checkpoint(),
+                "{}",
+                e.label()
+            );
+        }
     }
 }
