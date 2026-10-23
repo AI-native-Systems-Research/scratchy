@@ -26,10 +26,17 @@
 //! pub static CUDA_TAPES: &[::scratchy_target_cuda::tape::CudaTape];   // ascending bucket_m
 //! pub static CUDA_WEIGHTS: &[Option<::scratchy_target_cuda::weights::CudaWeight>]; // per WeightIx
 //! pub static CUDA_UNLOWERED: &[(u32, &str)];                          // (m, why)
+//! ::scratchy_target_cuda::inventory::submit! {                         // its registry entry
+//!     ::scratchy_target_cuda::registry::CudaModelEntry {
+//!         stem, tapes: CUDA_TAPES, weights: CUDA_WEIGHTS,
+//!     }
+//! }
 //! ```
 //!
 //! `CUDA_TAPES` is what `CudaWorker::new` takes, and `CUDA_WEIGHTS` what
-//! `runtime::load_weights` plays against a checkpoint to make its weight buffers.
+//! `runtime::load_weights` plays against a checkpoint to make its weight buffers. The entry puts
+//! both, under the model's stem, in `scratchy_target_cuda::registry`, where the serving worker
+//! finds them without naming the model crate.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -660,8 +667,9 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
     }
 }
 
-/// The seam: `input`'s CUDA tapes as the tokens of `CUDA_TAPES` and `CUDA_UNLOWERED`, spliced
-/// into the model's module by the macro. Panics, naming the model, on any refusal
+/// The seam: `input`'s CUDA tapes as the tokens of `CUDA_TAPES` and `CUDA_UNLOWERED`, its weight
+/// table as `CUDA_WEIGHTS`, and the three under its stem as a registry entry, spliced into the
+/// model's module by the macro. Panics, naming the model, on any refusal
 /// ([`lower_model`]) and on a tape that does not validate.
 pub fn emit_model(input: &TargetModelInput) -> TokenStream {
     let stem = &input.stem;
@@ -716,5 +724,14 @@ pub fn emit_model(input: &TargetModelInput) -> TokenStream {
         /// The buckets CUDA did not lower, and why: today the buckets above one row and below
         /// the GEMM's 128-row tile.
         pub static CUDA_UNLOWERED: &[(u32, &str)] = &[ #(#unlowered),* ];
+        // This model in the CUDA registry, under its config stem: what the serving worker finds
+        // it by.
+        ::scratchy_target_cuda::inventory::submit! {
+            ::scratchy_target_cuda::registry::CudaModelEntry {
+                stem: #stem,
+                tapes: CUDA_TAPES,
+                weights: CUDA_WEIGHTS,
+            }
+        }
     }
 }

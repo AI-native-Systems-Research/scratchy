@@ -12,9 +12,16 @@ default = []
 forward-telemetry = ["scratchy-target-metal?/forward-telemetry", "scratchy-core-common/forward-telemetry"]
 sampler-telemetry = ["scratchy-target-metal?/sampler-telemetry", "scratchy-core-common/sampler-telemetry"]
 metal = ["dep:scratchy-forward-compiler", "dep:scratchy-models", "dep:scratchy-target-metal", "dep:objc2", "dep:objc2-metal", "scratchy-forward-compiler/metal", "scratchy-models/metal"]
-# NVIDIA CUDA: the compiler and model crates under `cuda`. No target dependency and no worker yet —
-# both come with the CUDA worker factory.
-cuda = ["dep:scratchy-forward-compiler", "dep:scratchy-models", "scratchy-forward-compiler/cuda", "scratchy-models/cuda"]
+# NVIDIA CUDA: the compiler and model crates under `cuda`, and the CUDA backend's worker crate under
+# the neutral `backend-worker` key (below), which registers its `WorkerFactory`. Toolchain-free: the
+# factory claims `--device cuda` and refuses to build a worker without `nvcc`.
+cuda = ["dep:scratchy-forward-compiler", "dep:scratchy-models", "scratchy-forward-compiler/cuda", "scratchy-models/cuda", "backend-worker"]
+# `cuda` plus the kernels and the worker that plays them: needs nvcc from CUDA 12.8+ on PATH.
+nvcc = ["cuda", "backend-worker/nvcc"]
+# Link the backend's worker crate (the `backend-worker` dependency below), whose `WorkerFactory`
+# registers in the neutral registry. `backend-worker` is a dependency KEY, not a crate: the backend
+# feature that turns this on decides which worker crate it is.
+backend-worker = ["dep:backend-worker"]
 # Multimodal capability, forwarded from `scr`'s `multimodal` feature via
 # scratchy-serving-api. No-op unless a backend that has one is also active.
 vision = ["scratchy-target-metal?/vision"]
@@ -58,6 +65,10 @@ scratchy-tensors = { path = "../../tensors", optional = true }
 # feature (see the feature list above), so its build.rs runs at `cargo build` rather than at load.
 scratchy-builder-spyre = { path = "../../targets/spyre/builder", optional = true }
 scratchy-target-metal = { path = "../../targets/metal", optional = true }
+# A backend's worker crate, linked under a NEUTRAL key so this crate's source names no backend: it
+# registers its `WorkerFactory` with `inventory`, which `create_worker` walks, and `lib.rs` only
+# keeps it linked. Pulled in by `cuda`.
+backend-worker = { package = "scratchy-target-cuda-worker", path = "../../targets/cuda/worker", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-metal = { version = "0.3", optional = true, default-features = false, features = ["std", "MTLAllocation", "MTLBuffer", "MTLCommandQueue", "MTLDevice", "MTLResource", "MTL4ArgumentTable"] }
 half = { workspace = true }

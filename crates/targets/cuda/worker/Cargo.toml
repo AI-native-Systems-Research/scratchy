@@ -1,0 +1,44 @@
+[package]
+name = "scratchy-target-cuda-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The CUDA backend's serving worker: its WorkerFactory registration and, under `nvcc`, the Worker that plays the emitted tapes."
+
+# ⭐ WHY THIS CRATE EXISTS.
+#
+# The serving engine builds its worker through the neutral `WorkerFactory` registry
+# (`scratchy-serving-engine`'s `worker_factory`, collected by `inventory`): `create_worker` walks
+# the registered factories and never names a backend. This crate is CUDA's entry in that registry.
+# The serving worker links it under its neutral `backend-worker` dependency key, so no shared crate
+# names it; everything CUDA knows about serving is here.
+#
+# It must NOT depend on `scratchy-models`: a `--workspace` build with spyre features would unify
+# that crate's `cuda` feature with `spyre` and hit the macro's backend `compile_error!`. The models
+# reach it through the CUDA model registry (`scratchy-target-cuda`'s `registry`), which the models
+# crate fills at link time.
+#
+# THE FEATURE TIERS, as `scratchy-target-cuda`'s:
+#
+#   (none) — toolchain-free. The factory registers and claims `--device cuda`, and refuses to
+#            build a worker with a message naming the `nvcc` feature. The step planning (`plan`)
+#            and its tests build here.
+#   nvcc   — the `Worker` itself (`serving`), which plays the tapes through the CUDA runtime.
+[features]
+nvcc = ["scratchy-target-cuda/nvcc"]
+
+[dependencies]
+scratchy-target-cuda = { path = ".." }
+# The traits this crate implements (`Worker`, `WorkerFactory`), the shared per-request store
+# (`InputBatch`) and the GDN slot key: all below the target crates, so a backend can register.
+scratchy-serving-engine = { workspace = true }
+scratchy-serving-scheduler = { workspace = true }
+scratchy-core-common = { workspace = true }
+scratchy-core-model = { workspace = true }
+# The shared GDN slot allocator (`gdn_slot_allocator`) and the step codes it hands out
+# (`scratchy-layers`' `gdn_state`). No backend feature: the allocator is host bookkeeping.
+scratchy-forward-compiler = { path = "../../../compiler" }
+scratchy-layers = { path = "../../../layers" }
+inventory = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

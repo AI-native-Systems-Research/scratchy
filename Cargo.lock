@@ -3726,6 +3726,7 @@ dependencies = [
  "scratchy-serving-scheduler",
  "scratchy-serving-transport",
  "scratchy-subtile",
+ "scratchy-target-cuda-worker",
  "scratchy-target-metal",
  "scratchy-target-spyre",
  "scratchy-tensors",
@@ -3773,6 +3774,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "half",
+ "inventory",
  "safetensors",
  "scratchy-layers",
  "scratchy-subtile",
@@ -3790,6 +3792,22 @@ dependencies = [
  "scratchy-const-tokens",
  "scratchy-subtile",
  "scratchy-target-cuda",
+]
+
+[[package]]
+name = "scratchy-target-cuda-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "inventory",
+ "scratchy-core-common",
+ "scratchy-core-model",
+ "scratchy-forward-compiler",
+ "scratchy-layers",
+ "scratchy-serving-engine",
+ "scratchy-serving-scheduler",
+ "scratchy-target-cuda",
+ "tracing",
 ]
 
 [[package]]
