@@ -1677,11 +1677,6 @@ def live(task, endpoint, *, engine, model, machine, rung, scratchy_sha, engine_p
                               ("tokens_in", "tokens_in"), ("tokens_out", "tokens_out")):
             run["measurements"].append(
                 {**base, "metric": metric, "stat": _stat([r[field] for r in results])})
-        gap = {"lane": "B", "engine": engine, "model": model, "state": "not-run",
-               "reason": "energy needs powermetrics, which live does not sample yet",
-               "issue": 164}
-        run["gaps"] = [{**gap, "metric": m}
-                       for m in ("joules_per_task", "joules_per_1k_output_tokens")]
     detail = {"sessions": results}
     return run, detail
 

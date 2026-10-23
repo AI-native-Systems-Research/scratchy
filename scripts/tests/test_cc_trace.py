@@ -1148,14 +1148,14 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(FakeAnthropic.resets, 2)
         self.assertEqual(run["provenance"]["claude_version"], "2.1.295")
 
-    def test_only_lane_b_metrics_and_energy_as_a_gap(self):
+    def test_only_lane_b_metrics(self):
         run, _ = self._live()
         metrics = {m["metric"] for m in run["measurements"]}
         self.assertEqual(metrics, {"task_pass", "tool_call_parse_failure_rate",
                                    "turns_to_completion", "wall_clock_s", "tokens_in",
                                    "tokens_out"})
-        self.assertEqual({g["metric"] for g in run["gaps"]},
-                         {"joules_per_task", "joules_per_1k_output_tokens"})
+        # Energy is deferred (#158), and the board no longer declares it.
+        self.assertEqual(run["gaps"], [])
         lane_a = {"ttft_ms", "tpot_ms", "reprefill_ratio", "turn_e2e_ms", "e2e_star_ms"}
         self.assertFalse(metrics & lane_a)
 
