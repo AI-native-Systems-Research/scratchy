@@ -898,15 +898,22 @@ PY2
         # came back short. #775's out-of-memory fails no request: the server answers each
         # with no tokens. Short is under half the answer tokens asked for, #684's rule, judged
         # only for scratchy, the one engine that serves ignore_eos to full length (#821): mlx-lm,
-        # oMLX and ollama stop at EOS on a live server, at as little as 89%, 36% and 15%.
+        # oMLX and ollama stop at EOS on a live server, at as little as 89%, 36% and 15%. A short
+        # cell is recorded as the dead server's it is: dead_server, every request failed. That
+        # is the one judgment of it, which the page reads; its numbers are no measurement.
         local why
         why=$(python3 - "${out_json}" "$(( n * $5 ))" "${cell_full_length}" <<'PY2' 2>/dev/null
 import json, sys
-j, asked, full = json.load(open(sys.argv[1])), int(sys.argv[2]), sys.argv[3] == "1"
+p, asked, full = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "1"
+j = json.load(open(p))
+got = j.get("total_output_tokens") or 0
 if j.get("failed"):
     print("requests failed")
-elif full and asked and (j.get("total_output_tokens") or 0) < asked / 2:
-    print(f"came back short ({j.get('total_output_tokens') or 0} of {asked} answer tokens)")
+elif full and asked and got < asked / 2:
+    j["dead_server"] = True
+    j["failed"], j["completed"] = (j.get("completed") or 0), 0
+    json.dump(j, open(p, "w"), indent=2)
+    print(f"came back short ({got} of {asked} answer tokens): recorded as a dead server's")
 PY2
 )
         if [[ -n "${why}" ]]; then
@@ -1379,7 +1386,9 @@ KEEP = ["median_ttft_ms", "p99_ttft_ms", "median_tpot_ms", "p99_tpot_ms",
         "completed", "failed", "total_output_tokens", "duration", "unstreamed_requests",
         "server_mem_peak_mib", "server_mem_median_mib",
         # A cell the client never finished (--cell-timeout-s), so its requests count as failed.
-        "timed_out"]
+        "timed_out",
+        # A cell whose server answered with almost nothing (run_cell): no measurement.
+        "dead_server"]
 CELL = re.compile(r"\.(conc|input|output|grid)-(\d+)(?:x(\d+))?(?:@(\d+))?\.json$")
 def load(name):
     p = os.path.join(raw, name)

@@ -2013,12 +2013,11 @@ impl GlanceGrid {
     }
 }
 
-/// The overview's shape, as the newest run that records its lineup (`config.classes`) ran it: a
-/// column per class, each Mac on the class's small model or, from `large_from_gb`, its large one,
-/// and each map that run's users counts by its prompts (`grid_conc`, `grid_input`), one shape for
-/// every model on every machine: users at once down the side, prompt tokens across. A square its
-/// run did not measure (a run of another shape, or a prompt the Mac's memory did not hold) is
-/// blank. None before any run records a lineup.
+/// The overview's shape: a column per class of the lineup (`config.classes`), each Mac on the
+/// class's small model or, from `large_from_gb`, its large one, and each map a users count by a
+/// prompt length (`grid_conc`, `grid_input`), one shape for every model on every machine: users at
+/// once down the side, prompt tokens across. A square its run did not measure (a run of another
+/// shape, or a prompt the Mac's memory did not hold) is blank.
 struct Lineup<'a> {
     classes: &'a [data::Class],
     large_from_gb: u32,
@@ -2034,18 +2033,28 @@ impl Lineup<'_> {
     }
 }
 
+/// The overview's [`Lineup`]: the classes and cut-off of the newest run that records a lineup, and
+/// the grid of the newest such run that has one, so a `--no-scaling` run (no grid) after it does
+/// not empty every map. None before any run records a lineup.
 fn lineup<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Option<Lineup<'a>> {
-    let run = (machines.values())
-        .flat_map(|mr| mr.runs.iter())
+    let mut with_lineup: Vec<&Run> = (machines.values())
+        .flat_map(|mr| mr.runs.iter().copied())
         .filter(|r| r.config.classes.is_some())
-        .max_by(|a, b| a.generated_utc.cmp(&b.generated_utc))?;
-    let sc = run.config.scaling.as_ref();
+        .collect();
+    with_lineup.sort_by(|a, b| b.generated_utc.cmp(&a.generated_utc));
+    let newest = with_lineup.first()?;
+    let grid = (with_lineup.iter())
+        .find_map(|r| {
+            let sc = r.config.scaling.as_ref()?;
+            Some((sc.grid_conc.clone()?, sc.grid_input.clone()?))
+        })
+        .unwrap_or_default();
     Some(Lineup {
-        classes: run.config.classes.as_deref()?,
+        classes: newest.config.classes.as_deref()?,
         // Runs from before `large_from_gb` split the sets at 64 GB.
-        large_from_gb: run.config.large_from_gb.unwrap_or(64),
-        users: sc.and_then(|s| s.grid_conc.clone()).unwrap_or_default(),
-        prompts: sc.and_then(|s| s.grid_input.clone()).unwrap_or_default(),
+        large_from_gb: newest.config.large_from_gb.unwrap_or(64),
+        users: grid.0,
+        prompts: grid.1,
     })
 }
 
@@ -2053,10 +2062,9 @@ fn lineup<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Option<Lineup<'a>> 
 /// one table per metric: a machine per row, a model per column, each cell that
 /// model's grid as a tiny heatmap coloured like the full ones.
 fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
-    // A column per architecture class, as the newest run that records the lineup has it
-    // (`config.classes`); each machine's row shows the class's model for its memory, the small
-    // set below 64 GB and the large one at 64 GB, run or not yet. A model an older round ran
-    // stays in its machine's own section, not here.
+    // A column per architecture class ([`Lineup`]); each machine's row shows the class's model
+    // for its memory, the small set below the lineup's `large_from_gb` and the large one from it,
+    // run or not yet. A model an older round ran stays in its machine's own section, not here.
     let Some(lineup) = lineup(machines) else {
         return rsx! {};
     };
@@ -3232,6 +3240,39 @@ mod tests {
             (ratio - 0.95).abs() < 0.01,
             "scratchy against oMLX TurboQuant: {ratio:.3}x"
         );
+    }
+
+    /// The bench's own verdict on a cell is the one the page takes: a scratchy cell it recorded as
+    /// a dead server's (`dead_server`, under half its answer tokens) shows no number, even in a
+    /// run that counted its failures itself, where the page judges no cell by its tokens. Without
+    /// it the dead server's ~0 tok/s went on the Decode heat map, and as the square furthest from
+    /// x1 it took a highlight. A cell the client never finished says so.
+    #[test]
+    fn the_benchs_dead_server_and_timeout_verdicts_reach_the_page() {
+        use super::numbers::{Metric, failed_note, timing};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/metal/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
+        );
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        json["config"]["failures_counted"] = true.into();
+        let cells = json["models"][0]["scaling"].as_array_mut().unwrap();
+        // As the bench writes them: a dead server's cell, and one that timed out.
+        cells[0]["dead_server"] = true.into();
+        cells[0]["failed"] = cells[0]["completed"].clone();
+        cells[0]["completed"] = 0.into();
+        cells[1] = serde_json::json!({"axis": "grid", "rung": cells[1]["rung"].clone(),
+            "conc": cells[1]["conc"].clone(), "completed": 0, "failed": 12, "timed_out": true});
+        let mut run: Run = serde_json::from_value(json).unwrap();
+        run.mark_dead();
+        let scaling = run.models[0].scaling.as_deref().unwrap();
+        let (dead, slow, live) = (&scaling[0], &scaling[1], &scaling[2]);
+        assert!(dead.dead, "the bench's dead-server verdict is taken");
+        assert_eq!(timing(Some(dead), Metric::Throughput), None);
+        assert!(failed_note(Some(dead)).contains("stopped answering"));
+        assert!(failed_note(Some(slow)).contains("did not finish"));
+        assert!(!live.dead && timing(Some(live), Metric::Throughput).is_some());
     }
 
     /// A run whose bench counted aborted and errored requests itself (#510) keeps what it

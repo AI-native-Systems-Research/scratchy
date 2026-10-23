@@ -65,7 +65,6 @@
         "large": "granite-4.2-30b"
       }
     ],
-    "large_from_gb": 64,
     "cold_priming_launches": 3,
     "startup_request": {
       "input_len": 64,
