@@ -733,12 +733,23 @@ fn uitofp(
     ctx: &mut CoreContext,
     _env: &ExecutionEnv,
 ) -> Result<Option<Value>, String> {
-    // Unsigned int -> f32.
+    // Unsigned int -> float, target dtype from result_type (default f32) — the
+    // signed sibling `sitofp`'s own law, which this handler missed. The argmax
+    // kernel's equality masks are `uitofp` i1 -> f16 in the KTIR, and the
+    // device path folds each `cmpf(oeq)` + `uitofp` pair into ONE
+    // `Elementwise(Equal)` whose wire result is the fp16 0/1 tensor — so an
+    // f32 materialization here charges LX 2x the wire width per mask, and
+    // `result_float_dtype` then keeps the indicator products in f32 too (the
+    // llama-3.2-1b decode expansion at PAD_V 131072 crossed core 0's brim
+    // exactly this way; granite's 65536 stayed under only by width luck).
+    // Values are 0/1, exact in either width — the dtype moves the charge, not
+    // a single bit of the numerics.
+    let dtype = op.result_type.and_then(IrType::elem).unwrap_or(DType::F32);
     let v = unary_operand(op, ctx, "arith.uitofp")?;
     match v {
         Value::Tile(t) => {
             let data: Vec<f32> = t.as_f32().iter().map(|&x| round_i64(x) as f32).collect();
-            Ok(Some(Value::Tile(Tile::compute(data, DType::F32, t.shape))))
+            Ok(Some(Value::Tile(Tile::compute(data, dtype, t.shape))))
         }
         Value::Scalar(s) => {
             let x = s.as_i64().ok_or("arith.uitofp: non-int scalar")? as f32;
@@ -1969,6 +1980,35 @@ mod tests {
         };
         let sseed = [("%a", si(9))];
         assert_eq!(expect_f32(&run(&mut ops, op, &sseed)), 9.0);
+    }
+
+    #[test]
+    fn uitofp_with_result_type() {
+        // The argmax masks' law: the retype DECLARES f16 (the device fold's
+        // own wire width — `Elementwise(Equal)` answers the fp16 0/1 tensor),
+        // so the materialized tile is f16 and charges LX at the wire width.
+        // An f32 materialization here over-charges 2x per mask, which crossed
+        // core 0's brim on llama-3.2-1b's decode expansion at PAD_V 131072.
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::ArithUitofp, &["%a"]);
+        let op = Operation {
+            result_type: Some(IrType::Tensor {
+                dims: &[2],
+                elem: DType::F16,
+            }),
+            ..op
+        };
+        let seed = [("%a", tile(vec![1.0, 0.0], DType::I32, vec![2]))];
+        let r = run(&mut ops, op, &seed);
+        assert_eq!(expect_tile(&r).dtype, DType::F16);
+        assert_eq!(expect_tile(&r).size_bytes(), 4);
+        assert_eq!(expect_tile(&r).as_f32().to_vec(), vec![1.0, 0.0]);
+        // No declared result -> the f32 fallback (the behavior ops without a
+        // result_type have always had).
+        let op = ops.op(Some("%r"), OpKind::ArithUitofp, &["%a"]);
+        let seed = [("%a", tile(vec![1.0, 0.0], DType::I32, vec![2]))];
+        let r = run(&mut ops, op, &seed);
+        assert_eq!(expect_tile(&r).dtype, DType::F32);
     }
 
     #[test]
