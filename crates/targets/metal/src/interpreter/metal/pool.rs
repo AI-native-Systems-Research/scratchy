@@ -3490,21 +3490,21 @@ mod tests {
     /// stands one worker up eagerly.
     const EMPTY_BACKBONE: &[Instruction] = &[];
 
-    /// Baked tape rungs for an empty test bucket — what the macro
-    /// would emit for `(empty, empty)` instruction streams: an
-    /// empty-command tape per (gen class × chunked) pair at KV cap 128.
     /// A bucket's two band rows, identical — the twin rows a real model emits when its bands
     /// fold the same step tape, so whichever band the device picks serves it.
     fn twin_rows(spec: &MetalBucketSpec) -> Vec<MetalBucketSpec> {
         vec![
-            spec.clone(),
+            *spec,
             MetalBucketSpec {
                 band: FoldBand::Wide,
-                ..spec.clone()
+                ..*spec
             },
         ]
     }
 
+    /// Baked tape rungs for an empty test bucket — what the macro
+    /// would emit for `(empty, empty)` instruction streams: an
+    /// empty-command tape per (gen class × chunked) pair at KV cap 128.
     fn test_empty_tapes(
         bucket_m: u32,
         num_arena_slots: u32,
