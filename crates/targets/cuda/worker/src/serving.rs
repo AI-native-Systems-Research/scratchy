@@ -19,7 +19,6 @@ use std::time::Instant;
 use scratchy_core_common::SamplingParams;
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_forward_compiler::gdn_slot_allocator::{GdnRow, GdnSlotAllocator};
-use scratchy_layers::gdn_state::{GdnStart, GdnStep};
 use scratchy_serving_engine::error::{ExecutorError, ExecutorResult};
 use scratchy_serving_engine::executor::ModelRunnerOutput;
 use scratchy_serving_engine::gpu_budget::gdn_slot_key;
@@ -39,8 +38,8 @@ use scratchy_target_cuda::weights::{check, open_checkpoint};
 use tracing::info;
 
 use crate::plan::{
-    block_table_u32, check_sampling, choose_bucket, emits_token, fill_inputs, greedy_token,
-    kv_block_bytes, logits_row, scheduled_request,
+    block_table_u32, check_sampling, choose_bucket, emits_token, fill_inputs, gdn_fresh,
+    greedy_token, kv_block_bytes, logits_row, scheduled_request,
 };
 
 /// The GDN slots, and the sequences running at once: one.
@@ -244,14 +243,8 @@ impl CudaServingWorker {
             Some(_) => {
                 let row = GdnRow::new(gdn_slot_key(req_id), 0, start);
                 let (slots, codes) = running.gdn.step([row]).map_err(exec)?;
-                let step = GdnStep::decode(codes[0]);
-                let fresh = step.start == GdnStart::Fresh;
-                if !step.is_plain() || fresh != (start == 0) {
-                    return Err(exec(format!(
-                        "request {req_id}'s GDN step from token {start} is {step:?}: a plain \
-                         step is fresh exactly at token 0"
-                    )));
-                }
+                let fresh = gdn_fresh(codes[0], start)
+                    .map_err(|e| exec(format!("request {req_id}: {e}")))?;
                 Some(GdnSequence {
                     slot: slots[0].slot().index() as u32,
                     q_len,

@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use scratchy_core_common::SamplingParams;
+use scratchy_layers::gdn_state::{GdnStart, GdnStep};
 use scratchy_target_cuda::tape::KvTape;
 
 /// Why a step could not be planned, or a request is refused. Every message names what to change.
@@ -51,6 +52,9 @@ pub enum PlanError {
     PromptLogprobs,
     /// A transform that moves the argmax: `field` names it.
     LogitTransform { field: &'static str },
+    /// The GDN slot allocator's step code for a sequence at token `start` is `code`: not a plain
+    /// step, or fresh other than exactly at token 0.
+    GdnStart { start: u32, code: u32 },
 }
 
 impl fmt::Display for PlanError {
@@ -121,6 +125,11 @@ impl fmt::Display for PlanError {
             Self::LogitTransform { field } => write!(
                 f,
                 "{GREEDY} and applies no {field}: drop \"{field}\" from the request"
+            ),
+            Self::GdnStart { start, code } => write!(
+                f,
+                "the GDN step from token {start} is {:?}: a plain step is fresh exactly at token 0",
+                GdnStep::decode(*code)
             ),
         }
     }
@@ -282,4 +291,17 @@ pub fn kv_block_bytes(kv: &KvTape, block_size: usize) -> Option<usize> {
         .into_iter()
         .try_fold(kv.layers.len().checked_mul(2)?, |acc, f| acc.checked_mul(f))?
         .checked_mul(std::mem::size_of::<u16>())
+}
+
+/// Whether a sequence's GDN state starts from zero this step, from the slot allocator's step
+/// `code` (`GdnSlotAllocator::step`) for a sequence at token `start`: fresh exactly at token 0,
+/// whatever the step's bucket (a one-token prompt runs fresh on the one-row decode tape), and a
+/// plain step, with no drafts or checkpoints. Anything else is refused.
+pub fn gdn_fresh(code: u32, start: u32) -> Result<bool, PlanError> {
+    let step = GdnStep::decode(code);
+    let fresh = step.start == GdnStart::Fresh;
+    if !step.is_plain() || fresh != (start == 0) {
+        return Err(PlanError::GdnStart { start, code });
+    }
+    Ok(fresh)
 }

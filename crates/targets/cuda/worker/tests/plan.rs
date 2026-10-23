@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The CUDA worker's step planning, with no toolchain: the bucket a step runs in, its padded
-//! inputs, the one-request rule, the greedy token, and the sampling it refuses.
+//! inputs, the one-request rule, the GDN start, the greedy token, and the sampling it refuses;
+//! and the edge prompts planned step by step (one token; one past the largest bucket).
 
 use std::collections::HashMap;
 
 use scratchy_core_common::SamplingParams;
+use scratchy_forward_compiler::gdn_slot_allocator::{GdnRow, GdnSlotAllocator};
 use scratchy_serving_engine::worker_factory::WorkerFactory;
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, KvTape};
 use scratchy_target_cuda_worker::plan::{
-    PlanError, block_table_u32, check_sampling, choose_bucket, emits_token, fill_inputs,
+    PlanError, block_table_u32, check_sampling, choose_bucket, emits_token, fill_inputs, gdn_fresh,
     greedy_token, kv_block_bytes, logits_row, scheduled_request,
 };
 use scratchy_target_cuda_worker::{CudaWorkerFactory, NO_NVCC};
@@ -274,6 +276,111 @@ fn the_factory_claims_cuda_and_auto() {
     assert!(!f.supports_prefix_caching());
     assert!(NO_NVCC.contains("built without the `nvcc` feature"));
     assert!(NO_NVCC.contains("--features nvcc,model/<stem>"));
+}
+
+/// One planned step of a request: its bucket's rows, whether it starts its GDN state from zero,
+/// and whether it samples.
+#[derive(Debug, PartialEq)]
+struct Planned {
+    bucket_m: u32,
+    fresh: bool,
+    samples: bool,
+}
+
+/// Plan a request of `prompt` tokens through `decodes` decode steps, chunked by the step budget
+/// of 4096, through the shared GDN slot allocator, as the worker plans each step.
+fn plan_request(prompt: usize, decodes: usize) -> Vec<Planned> {
+    let mut gdn = GdnSlotAllocator::new(1, None);
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < prompt {
+        let n = (prompt - start).min(4096);
+        chunks.push((start, n, prompt));
+        start += n;
+    }
+    for d in 0..decodes {
+        chunks.push((prompt + d, 1, prompt + d + 1));
+    }
+    let (mut ids, mut positions) = (Vec::new(), Vec::new());
+    (chunks.into_iter())
+        .map(|(start, n, history)| {
+            let (_, bucket_m) = choose_bucket(&BUCKETS, n).unwrap();
+            fill_inputs(
+                &vec![7; n],
+                start as u32,
+                bucket_m,
+                &mut ids,
+                &mut positions,
+            )
+            .unwrap();
+            assert_eq!(ids.len(), bucket_m as usize);
+            assert_eq!(positions[0], start as u32);
+            let (_, codes) = gdn.step([GdnRow::new(42, 0, start as u32)]).unwrap();
+            Planned {
+                bucket_m,
+                fresh: gdn_fresh(codes[0], start as u32).unwrap(),
+                samples: emits_token(start, n, history),
+            }
+        })
+        .collect()
+}
+
+/// A one-token prompt runs its first, fresh step on the one-row decode tape, samples from it, and
+/// decodes on from the slot.
+#[test]
+fn a_one_token_prompt_starts_fresh_on_the_decode_tape() {
+    let plan = plan_request(1, 2);
+    let step = |fresh| Planned {
+        bucket_m: 1,
+        fresh,
+        samples: true,
+    };
+    assert_eq!(plan, [step(true), step(false), step(false)]);
+}
+
+/// A 4097-token prompt is a full 4096 chunk that samples nothing and a one-token remainder, on the
+/// decode tape, that continues the state and samples the first token.
+#[test]
+fn a_prompt_one_past_the_largest_bucket_ends_on_a_one_token_chunk() {
+    let plan = plan_request(4097, 1);
+    assert_eq!(
+        plan,
+        [
+            Planned {
+                bucket_m: 4096,
+                fresh: true,
+                samples: false
+            },
+            Planned {
+                bucket_m: 1,
+                fresh: false,
+                samples: true
+            },
+            Planned {
+                bucket_m: 1,
+                fresh: false,
+                samples: true
+            },
+        ]
+    );
+}
+
+/// A step code that is not plain, or fresh away from token 0, is refused.
+#[test]
+fn a_gdn_start_other_than_fresh_at_zero_is_refused() {
+    let mut gdn = GdnSlotAllocator::new(1, None);
+    let (_, codes) = gdn.step([GdnRow::new(1, 0, 0)]).unwrap();
+    assert_eq!(gdn_fresh(codes[0], 0), Ok(true));
+    assert_eq!(
+        gdn_fresh(codes[0], 5),
+        Err(PlanError::GdnStart {
+            start: 5,
+            code: codes[0]
+        })
+    );
+    let (_, codes) = gdn.step([GdnRow::new(1, 0, 5)]).unwrap();
+    assert_eq!(gdn_fresh(codes[0], 5), Ok(false));
+    assert!(gdn_fresh(codes[0], 0).is_err());
 }
 
 /// The factory states the greedy-only limit to the engine, which checks it when a request is
