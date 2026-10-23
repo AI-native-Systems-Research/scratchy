@@ -13,7 +13,8 @@
 //!   arena, input and result spans per bucket, the weights, and the KV and GDN layers; the
 //!   one-row tape the layout #830 predicted, its GEMMs GEMVs and its attention the decode kernel;
 //! - the weight table names the checkpoint's tensors: 266 entries, 18 of them GDN bundles, 320
-//!   distinct tensors, none named twice, and the tied lm_head reads the embedding table.
+//!   distinct tensors, none named twice, and the tied lm_head reads the embedding table;
+//! - the model is in the CUDA registry once, under its stem, with these very tapes and table.
 
 #[path = "../../../targets/cuda/tests/common/chains.rs"]
 pub mod chains;
@@ -529,4 +530,19 @@ fn the_weight_table_names_the_checkpoints_tensors() {
             "m={m}: the lm_head"
         );
     }
+}
+
+/// The model is in the CUDA registry exactly once, under its stem, holding the emitted tapes and
+/// weight table themselves (the same statics, not copies): what the serving worker finds it by.
+#[test]
+fn the_model_is_registered_under_its_stem() {
+    let entries: Vec<_> = scratchy_target_cuda::registry::entries().collect();
+    let stems: Vec<&str> = entries.iter().map(|e| e.stem).collect();
+    assert_eq!(stems, ["qwen3.5-0.8b"], "the registry");
+    let entry = entries[0];
+    assert!(std::ptr::eq(entry.tapes, CUDA_TAPES), "the entry's tapes");
+    assert!(
+        std::ptr::eq(entry.weights, CUDA_WEIGHTS),
+        "the entry's weight table"
+    );
 }

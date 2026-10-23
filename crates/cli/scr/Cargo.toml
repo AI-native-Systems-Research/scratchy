@@ -40,9 +40,13 @@ bench = ["scratchy-bench"]
 # heads (add `mtp-heads` back for drafting over a dense cache).
 metal-base = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/metal"]
 metal = ["metal-base", "turboquant", "mtp-heads"]
-# NVIDIA CUDA: the engine under `cuda`, like `metal-base`. Builds no model yet — scratchy-models'
-# build script refuses every arch until one lowers to CUDA.
+# NVIDIA CUDA: the engine under `cuda`, like `metal-base`. Toolchain-free: `--device cuda` is
+# claimed and refused with the rebuild command, since no kernel is linked. Only a model whose arch
+# lowers to CUDA builds (qwen3.5-0.8b today).
 cuda = ["scratchy-serving-api/cuda", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/cuda"]
+# `cuda` plus the H100 kernels and the worker that runs them: needs nvcc from CUDA 12.8+ on PATH.
+# `cargo build --release -p scratchy-cli --features nvcc,serve,model/qwen3.5-0.8b`.
+nvcc = ["cuda", "scratchy-serving-api/nvcc"]
 # IBM Spyre, BASE tier: the target crate and the `SubtileIR -> KTIR` producer, no
 # GPU toolchain and NO device — neither a card nor the host emulator. On its own it
 # builds and type-checks the whole lowering; pick `spyre-emu` or a card tier below to

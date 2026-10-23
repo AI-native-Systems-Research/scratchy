@@ -28,6 +28,7 @@ use scratchy_core_common::EngineCoreRequest;
 pub use scratchy_core_common::SamplingParams;
 use scratchy_serving_engine::core_client::{EngineCoreClient, InprocClient};
 use scratchy_serving_engine::engine_core::StepOutcome;
+use scratchy_serving_engine::worker_factory::WorkerFactory;
 
 use crate::chat_template::ChatTemplate;
 use crate::detokenizer::IncrementalDetokenizer;
@@ -365,6 +366,9 @@ pub struct LLM {
     generation_defaults: scratchy_core_common::sampling::GenerationDefaults,
     /// Set by [`Interrupter::interrupt`]; the running generation reads it between steps.
     interrupt: Arc<AtomicBool>,
+    /// The factory serving `--device`, whose sampling limit every request is checked against
+    /// before it is added ([`WorkerFactory::check_sampling`]).
+    backend: Option<&'static dyn WorkerFactory>,
 }
 
 /// Stops an [`LLM`]'s generation from another thread: the one running, or — when none is — the
@@ -448,7 +452,20 @@ impl LLM {
             block_size: stack.block_size,
             generation_defaults: stack.generation_defaults,
             interrupt: Arc::default(),
+            backend: scratchy_serving_engine::worker_factory::factory_for(&config.device),
         })
+    }
+
+    /// `params` checked as [`SamplingParams::validate`] does, and against what the backend can
+    /// serve ([`WorkerFactory::check_sampling`]), before any request is added.
+    fn check_params(&self, params: &SamplingParams) -> Result<()> {
+        params
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid sampling params: {e}"))?;
+        if let Some(backend) = self.backend {
+            backend.check_sampling(params).map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
     }
 
     /// A handle that stops this LLM's running generation from another thread (a signal
@@ -733,9 +750,7 @@ impl LLM {
     ) -> Result<Vec<RequestOutput>> {
         let _generation = self.generation();
         let params = params.unwrap_or_else(|| self.generation_defaults.as_base());
-        params
-            .validate()
-            .map_err(|e| anyhow::anyhow!("invalid sampling params: {e}"))?;
+        self.check_params(&params)?;
 
         let n = params.n.max(1) as usize;
         let detokenize = params.detokenize;
@@ -1039,9 +1054,7 @@ impl LLM {
         let _d_render = _t_render.elapsed();
 
         let params = params.unwrap_or_else(|| self.generation_defaults.as_base());
-        params
-            .validate()
-            .map_err(|e| anyhow::anyhow!("invalid sampling params: {e}"))?;
+        self.check_params(&params)?;
 
         // Tokenize the rendered prompt.
         let _t_tok = std::time::Instant::now();
