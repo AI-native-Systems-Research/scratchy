@@ -18,6 +18,7 @@ from pathlib import Path
 import fixture
 
 import build_leaderboard as L
+import charts
 
 HEADER = '<cds-header aria-label="scratchy"></cds-header>'
 VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link",
@@ -159,8 +160,16 @@ class GapsCarryReasons(unittest.TestCase):
     def test_committed_board_footnotes_every_gap(self):
         b = L.load()
         html, _problems, _ = L.page(HEADER, b)
-        self.assertIn("lb-notes", html)
-        self.assertIn("No energy measurement exists in the tree", html)
+        for run in b["runs"]:
+            for g in run["gaps"]:
+                self.assertIn(charts.esc(g["reason"]), html, g["metric"])
+
+    def test_energy_is_not_on_the_board(self):
+        # Deferred to future work (#158, 2026-10-22): no metric, cell or disclosure.
+        b = L.load()
+        ids = {m["id"] for m in b["metrics"]} | set(b["expects"]["metrics"])
+        self.assertFalse({"joules_per_task", "joules_per_1k_output_tokens"} & ids)
+        self.assertNotIn("powermetrics-estimates", {d["id"] for d in b["disclosures"]})
 
 
 class LanePurity(unittest.TestCase):

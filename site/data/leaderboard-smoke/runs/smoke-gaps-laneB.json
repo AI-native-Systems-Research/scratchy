@@ -55,28 +55,6 @@
     },
     {
       "lane": "B",
-      "metric": "joules_per_task",
-      "engine": "scratchy",
-      "model": "gemma-4-12b-it",
-      "machine": "m5max-64",
-      "rung": "R1",
-      "state": "not-run",
-      "reason": "smoke test: Lane B needs live graded runs from `scr bench claude` (#164 T2.2), which is not built yet",
-      "issue": 164
-    },
-    {
-      "lane": "B",
-      "metric": "joules_per_task",
-      "engine": "ollama",
-      "model": "gemma-4-12b-it",
-      "machine": "m5max-64",
-      "rung": "R1",
-      "state": "not-run",
-      "reason": "smoke test: Lane B needs live graded runs from `scr bench claude` (#164 T2.2), which is not built yet",
-      "issue": 164
-    },
-    {
-      "lane": "B",
       "metric": "task_pass",
       "engine": "scratchy",
       "model": "gemma-4-26b-a4b-it",
@@ -121,28 +99,6 @@
     },
     {
       "lane": "B",
-      "metric": "joules_per_task",
-      "engine": "scratchy",
-      "model": "gemma-4-26b-a4b-it",
-      "machine": "m5max-64",
-      "rung": "R1",
-      "state": "not-run",
-      "reason": "smoke test: Lane B needs live graded runs from `scr bench claude` (#164 T2.2), which is not built yet",
-      "issue": 164
-    },
-    {
-      "lane": "B",
-      "metric": "joules_per_task",
-      "engine": "ollama",
-      "model": "gemma-4-26b-a4b-it",
-      "machine": "m5max-64",
-      "rung": "R1",
-      "state": "not-run",
-      "reason": "smoke test: Lane B needs live graded runs from `scr bench claude` (#164 T2.2), which is not built yet",
-      "issue": 164
-    },
-    {
-      "lane": "B",
       "metric": "task_pass",
       "engine": "scratchy",
       "model": "qwen3.6-35b-a3b",
@@ -177,28 +133,6 @@
     {
       "lane": "B",
       "metric": "tool_call_parse_failure_rate",
-      "engine": "ollama",
-      "model": "qwen3.6-35b-a3b",
-      "machine": "m5max-64",
-      "rung": "R1",
-      "state": "not-run",
-      "reason": "smoke test: Lane B needs live graded runs from `scr bench claude` (#164 T2.2), which is not built yet",
-      "issue": 164
-    },
-    {
-      "lane": "B",
-      "metric": "joules_per_task",
-      "engine": "scratchy",
-      "model": "qwen3.6-35b-a3b",
-      "machine": "m5max-64",
-      "rung": "R1",
-      "state": "not-run",
-      "reason": "smoke test: Lane B needs live graded runs from `scr bench claude` (#164 T2.2), which is not built yet",
-      "issue": 164
-    },
-    {
-      "lane": "B",
-      "metric": "joules_per_task",
       "engine": "ollama",
       "model": "qwen3.6-35b-a3b",
       "machine": "m5max-64",

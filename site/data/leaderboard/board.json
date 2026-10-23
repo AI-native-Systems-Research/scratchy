@@ -14,7 +14,7 @@
     "why": "Claude Code re-sends the whole prompt every turn, mutates its tool schemas between turns and tiers, and emits bimodal output — ~30-token tool calls, then long file writes that echo the input back verbatim. None of that is what a synthetic fixed-shape benchmark measures."
   },
   "correctness_gate": "tool_call_parse_failure_rate",
-  "no_composite_score": "The board ranks within a metric, inside a (model, machine, rung) group, and nowhere else. A single score would need TTFT weighted against joules against pass rate, and that weighting is where a thumb goes on the scale.",
+  "no_composite_score": "The board ranks within a metric, inside a (model, machine, rung) group, and nowhere else. A single score would need TTFT weighted against pass rate, and that weighting is where a thumb goes on the scale.",
   "lanes": {
     "A": {
       "name": "trace replay",
@@ -42,8 +42,6 @@
         "peak_rss_mib",
         "peak_gpu_bytes",
         "context_ceiling_tokens",
-        "joules_per_task",
-        "joules_per_1k_output_tokens",
         "tokens_in",
         "tokens_out"
       ]
@@ -89,14 +87,6 @@
       "lower_is_better": true,
       "digits": 3,
       "note": "Malformed tool calls divided by tool calls. The metric that can make a faster engine lose: a fast wrong answer costs a whole turn."
-    },
-    {
-      "id": "joules_per_task",
-      "label": "joules / task",
-      "unit": "",
-      "lower_is_better": true,
-      "digits": 1,
-      "note": "Whole-machine energy over the task window minus a measured idle baseline. This is where wasted prefill shows up when agent think-time hides it in the wall clock."
     },
     {
       "id": "itl_p99_ms",
@@ -164,13 +154,6 @@
       "unit": "tok",
       "lower_is_better": false,
       "digits": 0
-    },
-    {
-      "id": "joules_per_1k_output_tokens",
-      "label": "joules / 1k out",
-      "unit": "",
-      "lower_is_better": true,
-      "digits": 2
     },
     {
       "id": "tokens_in",
@@ -364,8 +347,7 @@
       "tpot_ms",
       "reprefill_ratio",
       "task_pass",
-      "tool_call_parse_failure_rate",
-      "joules_per_task"
+      "tool_call_parse_failure_rate"
     ],
     "engines": [
       "scratchy",
@@ -434,18 +416,13 @@
       "source": "#161 fairness rule 5"
     },
     {
-      "id": "powermetrics-estimates",
-      "text": "Apple's own help text: average power values reported by powermetrics are estimated and may be inaccurate, so they should not be used for comparison between devices, but can be used to help optimize apps for energy efficiency. Back-to-back A/B on one machine with idle subtracted is valid; absolute or cross-machine energy claims are not.",
-      "source": "#161 disclosures"
-    },
-    {
       "id": "vision-tower-footprint",
       "text": "Both MoE checkpoints carry a vision tower Claude Code never exercises. It is disclosed as footprint rather than excluded, because a user loading the checkpoint pays for it.",
       "source": "#158 deferred / out of scope"
     },
     {
       "id": "thermal-order",
-      "text": "This is a laptop: a long run heats the SoC, so whichever engine is measured second can be throttled, corrupting both its energy and its latency. Arms cool to a fixed idle state between runs, engine order alternates across repeats, and the starting thermal state is recorded per cell.",
+      "text": "This is a laptop: a long run heats the SoC, so whichever engine is measured second can be throttled, slowing it down. Arms cool to a fixed idle state between runs, engine order alternates across repeats, and the starting thermal state is recorded per cell.",
       "source": "#161 fairness rule 6"
     },
     {

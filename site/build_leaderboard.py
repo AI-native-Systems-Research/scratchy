@@ -99,7 +99,7 @@ GAP_KEYS = {"lane", "metric", "engine", "model", "machine", "rung", "state",
 ABL_KEYS = {"optimization", "model", "metric", "delta_pct", "ci_pct", "n",
             "attribution", "quality_check"}
 PROV_KEYS = set(REQUIRED_PROVENANCE) | {
-    "trace_corpus", "engine_order", "thermal_state_start", "powermetrics",
+    "trace_corpus", "engine_order", "thermal_state_start",
     "artifacts", "disclosed",
 }
 
