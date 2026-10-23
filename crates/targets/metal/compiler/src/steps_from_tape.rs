@@ -1312,7 +1312,7 @@ impl Recording<'_> {
                 }
                 Ok(e)
             }
-            // A gated command routing its token itself: the expert fold it extends.
+            // A gated command routing each of its tokens itself: the expert fold it extends.
             (F::MoeRouted, Sh::Routed { .. }) => {
                 let driven = self.folds.driven(self.steps.slot[i]);
                 let expert = driven.iter().rev().find(|f| f.kernel != F::MoeRouted);

@@ -31,7 +31,7 @@ use crate::tape::lowered::{RuntimeGate, WeightTensor};
 use crate::tape::step::MoeRegion;
 use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, OutputAlias};
 use scratchy_subtile::tape_folding::{
-    CountedOperands, FoldPattern, FusionTable, GatedKernel, NormReader, RowFold,
+    CountedOperands, FoldPattern, FusionTable, GatedKernel, NormReader, RoutedBands, RowFold,
 };
 use scratchy_subtile::tape_steps::OperandIx;
 
@@ -350,7 +350,8 @@ pub const METAL_SORTED_PAIRS_PER_EXPERT: std::ops::Range<f32> = 0.5..1.0;
 
 /// The bucket rows from which a gathered bake's gate/up command runs the pairs that share an
 /// expert in the expert's first pair (`SharedExperts::InFirstPair`, up to [`METAL_VERIFY_ROWS`]):
-/// one row's picks are distinct experts.
+/// one row's picks are distinct experts. A bake whose gate/up command routes its tokens
+/// (`MetalFusion::MoeRouted`) runs its pairs apart whatever its rows.
 pub const METAL_SHARED_EXPERTS_FROM: u32 = 2;
 
 /// The baked (row, pick) pairs at and above which even a verify-sized gathered bake runs its
@@ -421,8 +422,8 @@ pub enum MetalFusion {
     QmvEpilogue,
     /// A one-row router's logits that normalize its input as they load it.
     NormedRouter,
-    /// A one-row MoE block's gated expert command that routes its token itself, from the logits,
-    /// and stores the picks and scores the later ones read.
+    /// A gathered MoE block's gated expert command, up to verify-sized rows, that routes each of
+    /// its tokens itself, from the logits, and stores the picks and scores the later commands read.
     MoeRouted,
     /// `residual + rmsnorm(delta)`.
     NormAdd,
@@ -595,8 +596,13 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                 FoldPattern::RoutedExperts {
                     top_k: K::RouteTopK,
                     sort: K::ExpertSort,
-                    gathered_below: METAL_SORTED_PAIRS,
-                    shared_from: METAL_SHARED_EXPERTS_FROM,
+                    bands: &RoutedBands {
+                        rows_through: METAL_VERIFY_ROWS,
+                        grouped_pairs: METAL_SORTED_PAIRS,
+                        grouped_bundles: METAL_GROUPED_EXPERTS,
+                        sorted_per_expert: METAL_SORTED_PAIRS_PER_EXPERT,
+                        grouped_per_expert: METAL_GROUPED_PAIRS_PER_EXPERT,
+                    },
                     kernel: F::MoeRouted,
                 },
                 // `attention_via_cache_v2`'s `ATTN_FOLD`: the plain writer, encoding or not.

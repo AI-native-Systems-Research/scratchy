@@ -28,7 +28,9 @@ use std::collections::BTreeMap;
 use crate::handoff::{LoweredDecode, SourceBinding};
 use crate::lower::GemmWeightKind;
 use crate::ops::SubOpKind;
-use crate::subtile_ir::{KvOperand, SubOp, SubtileIR, TensorId};
+use crate::subtile_ir::{
+    ExpertBundle, KvOperand, NumExperts, SubOp, SubtileIR, TensorId, TopK,
+};
 use crate::subtile_tape::{SlotId, SubtileTape};
 use crate::tape_colouring::FoldFacts;
 use crate::tape_steps::{Operand, OperandIx, StepPos, TapeReadError, read_steps};
@@ -169,18 +171,17 @@ pub enum FoldPattern<K: 'static> {
     },
     /// A routing — its `top_k` step's [`Route`](Self::Route) fold — whose picks only the `sort`
     /// reads, for steps other folds took into commands, and whose scores only such commands read,
-    /// folds into the first of those commands: it routes its rows itself, from the logits, and
-    /// stores the picks and scores the later ones read. Apply it after those folds and the
-    /// routing's. Only on a model whose matvecs take their ends, at fewer than `gathered_below`
-    /// (row, pick) pairs: where the target's expert steps read each row by its picks, with no
-    /// sorted copy of the rows the routing would have to make first. And under `shared_from`
-    /// rows: from there the target's expert command reads an expert the rows share once, which
-    /// needs every row's picks before it runs, not just its own row's.
+    /// folds into the first of those commands: it routes each of its rows itself, from the
+    /// logits, and stores the picks and scores the later ones read. Apply it after those folds
+    /// and the routing's. Only in [`RoutedBands`]: through the bands' rows, and never over a bake
+    /// that groups its pairs by expert — its sorted copy of the rows needs every row's picks
+    /// before it runs, not just the routing row's own. No model fact of its own: the expert
+    /// command reads the logits where the routing command did, and the fold moves none of their
+    /// producers, so whatever ends the logits carry are already on them.
     RoutedExperts {
         top_k: SubOpKind,
         sort: SubOpKind,
-        gathered_below: u32,
-        shared_from: u32,
+        bands: &'static RoutedBands,
         kernel: K,
     },
     /// An `anchor` (of `weights`, when it carries one) read by one step alone, down a chain of
@@ -216,6 +217,42 @@ pub enum FoldPattern<K: 'static> {
 
 /// The stages a routing fold's scores may pass through after the gather.
 pub const ROUTE_TAIL_STAGES: usize = 4;
+
+/// The bakes a [`FoldPattern::RoutedExperts`] fold runs in: a target's declared facts, the same
+/// bands its own expert-grouping rule uses. Through `rows_through` rows the expert command routes
+/// each of its rows itself, from the logits — its pairs run apart, each knowing its own row's
+/// picks only. A bake that groups its pairs by expert is refused whatever its rows: its sorted
+/// copy of the rows is made from every row's picks, which the routing command must write first.
+#[derive(Clone, Debug)]
+pub struct RoutedBands {
+    /// The rows through which the expert command routes each row itself: the verify-sized
+    /// buckets, whose few (row, pick) pairs each routed threadgroup re-derives cheaply. Past
+    /// them the pairs are many enough that the routing command's one dispatch is the cheaper
+    /// form.
+    pub rows_through: u32,
+    /// The (row, pick) pairs from which a bake may group a `grouped_bundles` bundle's pairs.
+    pub grouped_pairs: u32,
+    /// The bundles whose pairs a bake may group.
+    pub grouped_bundles: &'static [ExpertBundle],
+    /// The pairs per expert at which a bake sorts a groupable bundle's pairs (its exclusive
+    /// upper half tiles them instead): the sorted band, `[start, end)`.
+    pub sorted_per_expert: std::ops::Range<f32>,
+    /// The pairs per expert from which a bake tiles a groupable bundle's pairs instead.
+    pub grouped_per_expert: f32,
+}
+
+impl RoutedBands {
+    /// Whether a bake of `rows` tokens over `experts`, each row picking `k`, runs `bundle`'s
+    /// (row, pick) pairs grouped by expert — sorted or tiled, through a copy of the rows the
+    /// routing must exist to make.
+    pub fn groups_pairs(&self, rows: u32, experts: NumExperts, k: TopK, bundle: ExpertBundle) -> bool {
+        let pairs = rows.saturating_mul(k.get());
+        let per_expert = pairs as f32 / experts.get() as f32;
+        self.grouped_bundles.contains(&bundle)
+            && pairs >= self.grouped_pairs
+            && (self.sorted_per_expert.contains(&per_expert) || per_expert >= self.grouped_per_expert)
+    }
+}
 
 /// A step that normalizes a norm's input as it loads it ([`FoldPattern::NormedMatvecs`]).
 #[derive(Clone, Copy, Debug)]
@@ -862,12 +899,11 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
             } => self.normed_matvecs(i, readers, kernel),
             FoldPattern::RoutedExperts {
                 sort,
-                gathered_below,
-                shared_from,
+                bands,
                 kernel,
                 ..
             } => {
-                self.routed_experts(i, sort, (gathered_below, shared_from), kernel);
+                self.routed_experts(i, sort, bands, kernel);
                 Ok(())
             }
             FoldPattern::MatvecEpilogue {
@@ -1235,18 +1271,15 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
 
     /// Routing `i` into the first command reading it ([`FoldPattern::RoutedExperts`]): `i` and
     /// the steps its routing took are absorbed into it.
-    fn routed_experts(&mut self, i: usize, sort: SubOpKind, below: (u32, u32), kernel: K) {
-        let (gathered_below, shared_from) = below;
+    fn routed_experts(&mut self, i: usize, sort: SubOpKind, bands: &RoutedBands, kernel: K) {
         let ops = &self.ops;
-        let SubOp::RouteTopK { k } = *ops.op(i) else {
+        let SubOp::RouteTopK { .. } = *ops.op(i) else {
             return;
         };
         let routes = |f: &Fusion<K>| matches!(f.shape, FusedShape::Route { .. });
-        if !self.model.matvec_ends
-            || self.absorbed[i].is_some()
+        if self.absorbed[i].is_some()
             || !self.fusions[i].iter().any(routes)
-            || ops.rows[i].saturating_mul(k.get()) >= gathered_below
-            || ops.rows[i] >= shared_from
+            || ops.rows[i] > bands.rows_through
         {
             return;
         }
@@ -1261,6 +1294,18 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
         let mut drivers = Vec::new();
         for c in (0..n).filter(|&c| !own(c) && (0..n).any(|p| own(p) && reads(c, p))) {
             if ops.kind(c) == sort {
+                // The sort names the bake's own grouping: a bake that groups its pairs by
+                // expert reads them through the sorted copy the sort makes from every row's
+                // picks, so the routing command must run first — refuse.
+                if let SubOp::ExpertSort {
+                    experts,
+                    k: sort_k,
+                    bundle,
+                } = *ops.op(c)
+                    && bands.groups_pairs(ops.rows[c], experts, sort_k, bundle)
+                {
+                    return;
+                }
                 // The picks' reader: every step reading its rows was taken into a command.
                 for r in (0..n).filter(|&r| reads(r, c)) {
                     match self.absorbed[r] {
@@ -1831,8 +1876,13 @@ mod tests {
                 FoldPattern::RoutedExperts {
                     top_k: K::RouteTopK,
                     sort: K::ExpertSort,
-                    gathered_below: 64,
-                    shared_from: 2,
+                    bands: &RoutedBands {
+                        rows_through: 8,
+                        grouped_pairs: 64,
+                        grouped_bundles: &[crate::subtile_ir::ExpertBundle::SwitchGlu],
+                        sorted_per_expert: 0.5..1.0,
+                        grouped_per_expert: 4.0,
+                    },
                     kernel: Kern::Routed,
                 },
             ],
@@ -2124,29 +2174,29 @@ mod tests {
             ExpertBundle, ExpertProj, GatedAct, NumExperts, RouterBundle, SharedExpertBound, TopK,
         };
         use std::num::NonZeroU32;
-        let experts = NumExperts::new(NonZeroU32::new(16).expect("16 experts"));
-        let k = TopK::new(NonZeroU32::new(2).expect("top 2"));
+        let nz = |n: u32| NonZeroU32::new(n).expect("nonzero");
         let (router, bundle) = (RouterBundle::Gemma, ExpertBundle::SwitchGlu);
-        let matmul = |proj, n, inputs, rows| {
-            let quant = ExpertQuant::declared(64, 4);
-            let m = SubOp::ExpertMatmul {
-                proj,
-                n,
-                k,
-                quant,
-                bundle,
-            };
-            op(m, rows, inputs)
-        };
-        let sort = SubOp::ExpertSort { experts, k, bundle };
-        let combine = SubOp::ExpertCombine {
-            hidden: 64,
-            shared: SharedExpertBound(None),
-        };
-        let (gate, up, down) = (ExpertProj::Gate, ExpertProj::Up, ExpertProj::Down);
         // Gemma's block: logits, the routing, then the experts reading its picks and scores; over
-        // `rows` rows.
-        let ops = |scores_read_again: bool, rows: u32| {
+        // `rows` rows, each picking `top_k` of `experts`.
+        let ops = |scores_read_again: bool, rows: u32, experts: u32, top_k: u32| {
+            let (experts, k) = (NumExperts::new(nz(experts)), TopK::new(nz(top_k)));
+            let matmul = |proj, n, inputs| {
+                let quant = ExpertQuant::declared(64, 4);
+                let m = SubOp::ExpertMatmul {
+                    proj,
+                    n,
+                    k,
+                    quant,
+                    bundle,
+                };
+                op(m, rows, inputs)
+            };
+            let sort = SubOp::ExpertSort { experts, k, bundle };
+            let combine = SubOp::ExpertCombine {
+                hidden: 64,
+                shared: SharedExpertBound(None),
+            };
+            let (gate, up, down) = (ExpertProj::Gate, ExpertProj::Up, ExpertProj::Down);
             let mut v = vec![
                 op(
                     SubOp::RouterLogits { experts, router },
@@ -2158,8 +2208,8 @@ mod tests {
                 op(SubOp::RouteGatherScores, rows, vec![Op(0), Op(2)]),
                 op(SubOp::RouteSoftmax, rows, vec![Op(3)]),
                 op(sort, rows, vec![Ext(0), Op(2)]),
-                matmul(gate, 32, vec![Op(5), Op(5), Ext(2)], rows),
-                matmul(up, 32, vec![Op(5), Op(5), Ext(2)], rows),
+                matmul(gate, 32, vec![Op(5), Op(5), Ext(2)]),
+                matmul(up, 32, vec![Op(5), Op(5), Ext(2)]),
                 op(
                     SubOp::ExpertGatedAct {
                         act: GatedAct::Gelu,
@@ -2167,7 +2217,7 @@ mod tests {
                     rows,
                     vec![Op(6), Op(7)],
                 ),
-                matmul(down, 64, vec![Op(8), Op(5), Ext(2)], rows),
+                matmul(down, 64, vec![Op(8), Op(5), Ext(2)]),
                 op(SubOp::ExpertUnsort, rows, vec![Op(9), Op(5)]),
                 op(combine, rows, vec![Op(10), Op(4)]),
             ];
@@ -2176,27 +2226,24 @@ mod tests {
             }
             v
         };
-        let src = [(1, 64), (16, 64), (32, 64)];
-        let (s, f) = fold(&src, weights(3), ops(false, 1), &[], &TABLE, ENDS);
-        // The routing's steps run in the gated activation's command, the first reading them.
-        for j in [1, 2, 3, 4] {
-            assert_eq!(f.role(s[j]), StepRole::Absorbed { into: s[8] }, "step {j}");
-        }
-        let routed = Fusion {
-            kernel: Kern::Routed,
-            shape: FusedShape::Routed { top_k: s[2] },
+        let bands = |scores_read_again, rows, experts, top_k| {
+            let src = [(rows, 64), (experts, 64), (64, 64)];
+            fold(
+                &src,
+                weights(3),
+                ops(scores_read_again, rows, experts, top_k),
+                &[],
+                &TABLE,
+                ENDS,
+            )
         };
-        assert_eq!(f.role(s[8]), StepRole::Drives(&routed));
-        assert!(matches!(
-            f.role(s[11]),
+        let routed = |f: &TapeFolds<Kern>, s: &[SlotId]| match f.role(s[8]) {
             StepRole::Drives(Fusion {
-                kernel: Kern::ExpertCombined,
-                ..
-            })
-        ));
-        assert_eq!(f.role(s[5]), StepRole::Kept);
-        // Its scores read by a step no command took, or a model whose matvecs do not take their
-        // ends: the routing is its own command.
+                kernel: Kern::Routed,
+                shape: FusedShape::Routed { top_k },
+            }) => *top_k == s[2],
+            _ => false,
+        };
         let route = |f: &TapeFolds<Kern>, s: &[SlotId]| {
             matches!(
                 f.role(s[2]),
@@ -2206,15 +2253,53 @@ mod tests {
                 })
             )
         };
-        let (s, f) = fold(&src, weights(3), ops(true, 1), &[], &TABLE, ENDS);
+        // One row: the routing's steps run in the gated activation's command, the first reading them.
+        let (s, f) = bands(false, 1, 16, 2);
+        for j in [1, 2, 3, 4] {
+            assert_eq!(f.role(s[j]), StepRole::Absorbed { into: s[8] }, "step {j}");
+        }
+        let routed_fusion = Fusion {
+            kernel: Kern::Routed,
+            shape: FusedShape::Routed { top_k: s[2] },
+        };
+        assert_eq!(f.role(s[8]), StepRole::Drives(&routed_fusion));
+        assert!(matches!(
+            f.role(s[11]),
+            StepRole::Drives(Fusion {
+                kernel: Kern::ExpertCombined,
+                ..
+            })
+        ));
+        assert_eq!(f.role(s[5]), StepRole::Kept);
+        // The verify-sized rows too, their pairs still gathered: a routed command's pairs run
+        // apart, each knowing its own row's picks only. Qwen3.6's bucket 8 — 256 experts, top 8,
+        // a quarter pair an expert — is the widest of them.
+        for (rows, experts, top_k) in [(2, 16, 2), (8, 16, 2), (8, 256, 8)] {
+            let (s, f) = bands(false, rows, experts, top_k);
+            assert!(routed(&f, &s), "{rows} rows, {experts} experts");
+        }
+        // Past the bands' rows, or a bake that groups its pairs by expert — Gemma-4's bucket 8,
+        // 128 experts at top 8, one pair in two, the sorted band: the sort's copy needs every
+        // row's picks, so the routing is its own command before it.
+        for (rows, experts, top_k) in [(16, 16, 2), (8, 128, 8)] {
+            let (s, f) = bands(false, rows, experts, top_k);
+            assert!(route(&f, &s), "{rows} rows, {experts} experts");
+        }
+        // Its scores read by a step no command took: the routing is its own command.
+        let (s, f) = bands(true, 1, 16, 2);
         assert!(route(&f, &s));
-        let (s, f) = fold(&src, weights(3), ops(false, 1), &[], &TABLE, SPLIT);
-        assert!(route(&f, &s));
-        // Two rows, their pairs still under `gathered_below`: from `shared_from` rows the expert
-        // command shares the rows' experts, so the routing is its own command.
-        let src = [(2, 64), (16, 64), (32, 64)];
-        let (s, f) = fold(&src, weights(3), ops(false, 2), &[], &TABLE, ENDS);
-        assert!(route(&f, &s));
+        // No model fact of its own: even a model whose matvecs take no ends folds — the
+        // verify-sized buckets sit past the matvec band, and the expert command reads the
+        // logits where the routing command did, on values already complete.
+        let (s, f) = fold(
+            &[(1, 64), (16, 64), (32, 64)],
+            weights(3),
+            ops(false, 1, 16, 2),
+            &[],
+            &TABLE,
+            SPLIT,
+        );
+        assert!(routed(&f, &s));
     }
 
     const ROWS: FusionTable<Kern> = FusionTable {
