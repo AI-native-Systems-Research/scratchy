@@ -120,6 +120,14 @@ impl Dtype {
         }
     }
 
+    /// The dtype's element width in bytes.
+    pub fn size_bytes(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::F16 | Self::Bf16 => 2,
+        }
+    }
+
     /// `x` as this dtype holds it: an f16/bf16 store-and-reload, identity at f32.
     pub fn round(self, x: f32) -> f32 {
         match self {
@@ -193,6 +201,24 @@ impl Dtype {
                 .into_iter()
                 .map(u32::from)
                 .collect(),
+        }
+    }
+}
+
+/// The dispatch form of a worker-declared tensor dtype (`scratchy_tensors::DType`),
+/// when it has one: the float forms map to their kernel-suffixed twins; every other
+/// form (ints, fp8) has none. The error is the dtype that has no form, so a caller
+/// can name it in its own panic — the GDN tests do exactly that for
+/// `GDN_SSM_STATE_DTYPE`.
+impl TryFrom<scratchy_tensors::DType> for Dtype {
+    type Error = scratchy_tensors::DType;
+
+    fn try_from(dt: scratchy_tensors::DType) -> Result<Self, Self::Error> {
+        match dt {
+            scratchy_tensors::DType::F32 => Ok(Self::F32),
+            scratchy_tensors::DType::F16 => Ok(Self::F16),
+            scratchy_tensors::DType::BF16 => Ok(Self::Bf16),
+            other => Err(other),
         }
     }
 }

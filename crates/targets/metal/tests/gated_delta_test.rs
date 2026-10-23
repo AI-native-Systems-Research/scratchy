@@ -19,8 +19,8 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::{bake, baked_build};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::gdn_state::{
-    CheckpointRows, DraftLane, DraftLanes, GDN_SAVES, GdnSave, GdnSeqSlots, GdnSlot, GdnStart,
-    GdnStateDims, GdnStep, RecordArea,
+    CheckpointRows, DraftLane, DraftLanes, GDN_SAVES, GDN_SSM_STATE_DTYPE, GdnSave, GdnSeqSlots,
+    GdnSlot, GdnStart, GdnStateDims, GdnStep, RecordArea,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -62,27 +62,22 @@ fn read_f32(buf: &Buffer, n: usize) -> Vec<f32> {
     unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const f32, n) }.to_vec()
 }
 
-/// The ssm state's element dtype the GDN kernels read and write (`GDN_SSM_STATE_DTYPE`): uploaded
-/// from and read back to f32 through f16 — the store's rounding is the state's per-step
-/// quantization.
-fn buf_f16(device: &Device, data: &[f32]) -> Buffer {
-    let half: Vec<half::f16> = data.iter().map(|&x| half::f16::from_f32(x)).collect();
-    let bytes = std::mem::size_of_val(half.as_slice()).max(4);
-    let buf = device
-        .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-        .expect("newBuffer");
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            half.as_ptr() as *const u8,
-            buf.contents().as_ptr() as *mut u8,
-            std::mem::size_of_val(half.as_slice()),
-        );
-    }
-    buf
+/// The pool's ssm entry dtype the GDN kernels read and write (`GDN_SSM_STATE_DTYPE`), as the
+/// dispatch `Dtype`: every ssm buffer, fixture and read below goes through it, so the constant
+/// and these tests cannot drift apart.
+fn ssm_entry_dtype() -> Dtype {
+    Dtype::try_from(GDN_SSM_STATE_DTYPE)
+        .unwrap_or_else(|dt| panic!("the ssm state's dtype {dt:?} has no dispatch form"))
 }
 
-fn buf_zero_f16(device: &Device, n: usize) -> Buffer {
-    let bytes = (n * 2).max(4);
+/// The ssm state's entry buffer: `data` packed at the entry's dtype — the store's rounding is
+/// the state's per-step quantization.
+fn buf_ssm(device: &Device, data: &[f32]) -> Buffer {
+    common::shared_bytes(device, &ssm_entry_dtype().bytes(data))
+}
+
+fn buf_zero_ssm(device: &Device, n: usize) -> Buffer {
+    let bytes = (n * ssm_entry_dtype().size_bytes()).max(4);
     let buf = device
         .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
         .expect("newBuffer");
@@ -90,18 +85,13 @@ fn buf_zero_f16(device: &Device, n: usize) -> Buffer {
     buf
 }
 
-fn read_f16(buf: &Buffer, n: usize) -> Vec<f32> {
-    unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const half::f16, n) }
-        .iter()
-        .map(|h| h.to_f32())
-        .collect()
+fn read_ssm(buf: &Buffer, n: usize) -> Vec<f32> {
+    ssm_entry_dtype().decode(buf, n)
 }
 
-/// A state fixture the kernels' f16 store reproduces bit for bit.
-fn q16(data: &[f32]) -> Vec<f32> {
-    data.iter()
-        .map(|&x| half::f16::from_f32(x).to_f32())
-        .collect()
+/// A state fixture the kernels' entry-dtype store reproduces bit for bit.
+fn q_ssm(data: &[f32]) -> Vec<f32> {
+    data.iter().map(|&x| ssm_entry_dtype().round(x)).collect()
 }
 
 fn buf_i32(device: &Device, data: &[i32]) -> Buffer {
@@ -209,7 +199,7 @@ fn recurrent_ref(
         }
         if slot_after_rows.contains(&ti) {
             for s in state.iter_mut() {
-                *s = half::f16::from_f32(*s).to_f32();
+                *s = ssm_entry_dtype().round(*s);
             }
         }
     }
@@ -932,7 +922,7 @@ fn gdn_scan_varlen_matches_reference() {
     let (q, k, v) = split_conv(&conv_out, nk, nv, hk, hv, t);
     let o_ref = recurrent_ref(&q, &k, &v, &g, &beta, nk, nv, hk, hv, t, scale, &[]);
 
-    let state_buf = buf_zero_f16(&device, nv * hv * hk); // 1 slot
+    let state_buf = buf_zero_ssm(&device, nv * hv * hk); // 1 slot
     let Some(o) = dispatch_scan(
         &device,
         &cache,
@@ -987,7 +977,7 @@ fn gdn_scan_varlen_production_head_dim() {
     let (q, k, v) = split_conv(&conv_out, nk, nv, hk, hv, t);
     let o_ref = recurrent_ref(&q, &k, &v, &g, &beta, nk, nv, hk, hv, t, scale, &[]);
 
-    let state_buf = buf_zero_f16(&device, nv * hv * hk);
+    let state_buf = buf_zero_ssm(&device, nv * hv * hk);
     let Some(o) = dispatch_scan(
         &device,
         &cache,
@@ -1056,7 +1046,7 @@ fn gdn_scan_varlen_continuity() {
         &[4],
     );
 
-    let state_buf = buf_zero_f16(&device, nv * hv * hk);
+    let state_buf = buf_zero_ssm(&device, nv * hv * hk);
 
     // Run A: first 5 tokens, fresh → seeds ssm_state.
     let Some(_a) = dispatch_scan(
@@ -1186,7 +1176,7 @@ fn gdn_scan_simd_is_the_gating_then_scan() {
         }
         let scan = build("gdn_scan_varlen", "gdn_scan_varlen_f32", scan_consts());
         let chain_o = buf_zero_f32(&device, t * value_dim);
-        let chain_state = buf_f16(&device, &state0);
+        let chain_state = buf_ssm(&device, &state0);
         let bufs = [
             &chain_o,
             &conv_buf,
@@ -1205,7 +1195,7 @@ fn gdn_scan_simd_is_the_gating_then_scan() {
         // The simdgroup scan.
         let simd = build("gdn_scan_varlen", "gdn_scan_simd_f32", scan_consts());
         let simd_o = buf_zero_f32(&device, t * value_dim);
-        let simd_state = buf_f16(&device, &state0);
+        let simd_state = buf_ssm(&device, &state0);
         let bufs = [
             &simd_o,
             &conv_buf,
@@ -1239,12 +1229,12 @@ fn gdn_scan_simd_is_the_gating_then_scan() {
         // boundary, a half ULP apart.
         close(
             "state",
-            read_f16(&simd_state, s),
-            read_f16(&chain_state, s),
+            read_ssm(&simd_state, s),
+            read_ssm(&chain_state, s),
             1e-3,
         );
         // The state moved: a scan that left it would pass the comparison above only by accident.
-        assert_ne!(read_f16(&simd_state, s), q16(&state0), "cu {cu:?}");
+        assert_ne!(read_ssm(&simd_state, s), q_ssm(&state0), "cu {cu:?}");
     }
 }
 
@@ -1336,7 +1326,7 @@ fn gdn_scan_pipelined_is_the_gating_then_scan() {
         }
         let scan = build("gdn_scan_varlen", "gdn_scan_varlen_f32", scan_consts());
         let chain_o = buf_zero_f32(&device, t * value_dim);
-        let chain_state = buf_f16(&device, &state0);
+        let chain_state = buf_ssm(&device, &state0);
         let bufs = [
             &chain_o,
             &conv_buf,
@@ -1359,7 +1349,7 @@ fn gdn_scan_pipelined_is_the_gating_then_scan() {
             pipe_consts(),
         );
         let pipe_o = buf_zero_f32(&device, t * value_dim);
-        let pipe_state = buf_f16(&device, &state0);
+        let pipe_state = buf_ssm(&device, &state0);
         let bufs = [
             &pipe_o,
             &conv_buf,
@@ -1394,11 +1384,11 @@ fn gdn_scan_pipelined_is_the_gating_then_scan() {
         // boundary, a half ULP apart.
         close(
             "state",
-            read_f16(&pipe_state, s),
-            read_f16(&chain_state, s),
+            read_ssm(&pipe_state, s),
+            read_ssm(&chain_state, s),
             1e-3,
         );
-        assert_ne!(read_f16(&pipe_state, s), q16(&state0), "cu {cu:?}");
+        assert_ne!(read_ssm(&pipe_state, s), q_ssm(&state0), "cu {cu:?}");
     }
 }
 
@@ -1425,7 +1415,7 @@ fn gdn_scan_pipelined_keeps_a_drafting_models_slots() {
     let shifted = |n: usize, by: usize| fill(n + by)[by..].to_vec();
     let (a_log, dt_bias) = (fill(nv), shifted(nv, 5));
     let (alog_buf, dt_buf) = (buf_f32(&device, &a_log), buf_f32(&device, &dt_bias));
-    let pool0 = q16(&shifted(2 * entry_len, 11));
+    let pool0 = q_ssm(&shifted(2 * entry_len, 11));
     let lanes0 = shifted(2 * lane_len, 13);
     let scan_consts = vec![
         ConstantValue::uint(0, nk as u32),
@@ -1488,7 +1478,7 @@ fn gdn_scan_pipelined_keeps_a_drafting_models_slots() {
         let run = |kernel, grid, threads, binds_lanes: bool| {
             let (o, state) = (
                 buf_zero_f32(&device, t * value_dim),
-                buf_f16(&device, &pool0),
+                buf_ssm(&device, &pool0),
             );
             let (unread, lanes) = (buf_zero_f32(&device, 1), buf_f32(&device, &lanes0));
             let mut bufs = vec![
@@ -1500,7 +1490,7 @@ fn gdn_scan_pipelined_keeps_a_drafting_models_slots() {
             }
             common::dispatch_threadgroups(&device, kernel, &bufs, grid, threads).then(|| {
                 assert_eq!(read_f32(&lanes, lanes0.len()), lanes0, "the lanes moved");
-                (read_f32(&o, t * value_dim), read_f16(&state, pool0.len()))
+                (read_f32(&o, t * value_dim), read_ssm(&state, pool0.len()))
             })
         };
         let (Some((simd_o, simd_pool)), Some((pipe_o, pipe_pool))) = (
@@ -1603,7 +1593,7 @@ fn gdn_decode_is_the_conv_scan_norm() {
         let (a_log, dt_bias, norm_w) = (fill(nv), shifted(nv, 5), shifted(hv, 17));
         let conv_w = shifted(conv_dim * kernel, 19);
         let conv0 = shifted(slots * conv_slot, 23);
-        let ssm0 = q16(&shifted(slots * ssm_slot, 11));
+        let ssm0 = q_ssm(&shifted(slots * ssm_slot, 11));
         let build = |lib: &'static str, name: &'static str, c: Vec<ConstantValue>| {
             baked_build(&cache, &PipelineKey::new(lib, name, c)).expect(name)
         };
@@ -1648,7 +1638,7 @@ fn gdn_decode_is_the_conv_scan_norm() {
         ];
         let conv = build("gdn_conv1d_varlen", "gdn_conv1d_varlen_f32", conv_consts);
         let conv_out = buf_zero_f32(&device, t * conv_dim);
-        let (chain_conv, chain_ssm) = (buf_f32(&device, &conv0), buf_f16(&device, &ssm0));
+        let (chain_conv, chain_ssm) = (buf_f32(&device, &conv0), buf_ssm(&device, &ssm0));
         let mut bufs = vec![&conv_out, &qkv_buf, &w_buf, &chain_conv, &cu, &si, &fresh];
         if drafts > 0 {
             bufs.extend([&unread, &conv_lanes]);
@@ -1695,7 +1685,7 @@ fn gdn_decode_is_the_conv_scan_norm() {
         ]);
         let decode = build("gdn_decode", "gdn_decode_f32", consts);
         let out = buf_zero_f32(&device, t * value_dim);
-        let (conv_state, ssm) = (buf_f32(&device, &conv0), buf_f16(&device, &ssm0));
+        let (conv_state, ssm) = (buf_f32(&device, &conv0), buf_ssm(&device, &ssm0));
         let bufs = [
             &out,
             &qkv_buf,
@@ -1742,7 +1732,7 @@ fn gdn_decode_is_the_conv_scan_norm() {
         // The ssm entries are stored f16: the two kernels' f32 registers agree to f32 rounding,
         // and the store rounds each to the same half — except where the two straddle a rounding
         // boundary, a half ULP apart.
-        close("ssm state", read_f16, &ssm, &chain_ssm, ssm0.len(), 1e-3);
+        close("ssm state", read_ssm, &ssm, &chain_ssm, ssm0.len(), 1e-3);
         close("out", read_f32, &out, &chain_out, t * value_dim, 1e-5);
         assert_eq!(
             read_f32(&conv_lanes, conv_lanes0.len()),
@@ -1756,7 +1746,7 @@ fn gdn_decode_is_the_conv_scan_norm() {
         );
         // The step moved both states and wrote every output: agreeing on untouched buffers
         // would pass the comparisons above by accident.
-        assert_ne!(read_f16(&ssm, ssm0.len()), ssm0, "{geometry}");
+        assert_ne!(read_ssm(&ssm, ssm0.len()), ssm0, "{geometry}");
         assert_ne!(read_f32(&conv_state, conv0.len()), conv0, "{geometry}");
         assert!(
             read_f32(&out, t * value_dim).iter().all(|v| *v != 0.0),
@@ -2114,7 +2104,7 @@ fn gdn_scan_varlen_replays_a_fully_kept_verify_step() {
     let (r0, r1) = (RecordArea::First, RecordArea::Second);
     let pool = || {
         (
-            buf_zero_f16(&device, 2 * entry_len),
+            buf_zero_ssm(&device, 2 * entry_len),
             buf_zero_f32(&device, 2 * lane_len),
         )
     };
@@ -2212,7 +2202,7 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
     let entry = [GdnSeqSlots::plain(GdnSlot::new(1))];
     let pool = || {
         (
-            buf_zero_f16(&device, 2 * entry_len),
+            buf_zero_ssm(&device, 2 * entry_len),
             buf_zero_f32(&device, 2 * lane_len),
         )
     };
@@ -2306,7 +2296,7 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
         "resumed row",
         1e-3,
     );
-    let slot0 = read_f16(&state, entry_len);
+    let slot0 = read_ssm(&state, entry_len);
     assert!(
         slot0.iter().all(|&v| v == 0.0),
         "slot 0's entry was written"
@@ -2483,7 +2473,7 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
         };
     let pool = || {
         (
-            buf_zero_f16(&device, 2 * entry_len),
+            buf_zero_ssm(&device, 2 * entry_len),
             buf_zero_f32(&device, 2 * lane_len),
         )
     };
@@ -2633,12 +2623,12 @@ fn save(rows: usize, snapshot: i32) -> Option<GdnSave> {
 }
 
 /// A pool's slots, for [`check_snapshots`]: `len` entries a slot, its state entry (a drafting
-/// model's checkpoints and records live in its draft lanes, apart) — f32 for a conv pool, f16
-/// for an ssm pool, the dtype its kernels store.
+/// model's checkpoints and records live in its draft lanes, apart) — f32 for a conv pool, an
+/// ssm pool's at `GDN_SSM_STATE_DTYPE`, each the dtype its kernels store.
 #[derive(Clone, Copy, Debug)]
 struct Slots {
     len: usize,
-    half: bool,
+    ssm: bool,
 }
 
 impl Slots {
@@ -2653,7 +2643,7 @@ impl Slots {
         };
         Self {
             len: dims.conv_entry_len(),
-            half: false,
+            ssm: false,
         }
     }
 
@@ -2668,7 +2658,7 @@ impl Slots {
         };
         Self {
             len: dims.ssm_entry_len(),
-            half: true,
+            ssm: true,
         }
     }
 }
@@ -2747,9 +2737,9 @@ fn check_snapshots(what: &str, layouts: &[Slots], t: usize, mid: usize, step: Sn
         .map(|(p, l)| {
             let by = 11 + 7 * p;
             let entries = fill(POOL_SLOTS * l.len + by)[by..].to_vec();
-            // An f16 pool's fixtures are the values its kernels store, so a slot no step
-            // touches reads back bit for bit.
-            l.half.then(|| q16(&entries)).unwrap_or(entries)
+            // An ssm pool's fixtures are rounded through its entry's dtype — the values its
+            // kernels store — so a slot no step touches reads back bit for bit.
+            if l.ssm { q_ssm(&entries) } else { entries }
         })
         .collect();
     let slot = |pools: &[Vec<f32>], p: usize, s: i32| {
@@ -2886,16 +2876,15 @@ fn check_snapshots(what: &str, layouts: &[Slots], t: usize, mid: usize, step: Sn
     let stored_s1 = entries(&after_m, LIVE);
     // The continuation restarts from it, as a restore of s1 would; a save at the step's
     // end stores the final state, and nothing follows it.
-    let want;
-    if mid < t {
+    let want = if mid < t {
         let Some((out_c2, after_c2)) = step(&after_m, mid..t, plain, GdnStart::Slot) else {
             return;
         };
         out_m.extend(out_c2);
-        want = after_c2;
+        after_c2
     } else {
-        want = after_m;
-    }
+        after_m
+    };
     assert_bits(
         &out_rs,
         &out_m,
@@ -3009,7 +2998,7 @@ fn gdn_scan_varlen_saves_and_restores_snapshots() {
                 buf_f32(&device, &row_range(&g, nv, r.clone())),
                 buf_f32(&device, &row_range(&beta, nv, r)),
             );
-            let state = buf_f16(&device, &pools[0]);
+            let state = buf_ssm(&device, &pools[0]);
             let [cu, si, code] = second_of_two(&device, n, seq, start);
             let mut bufs = vec![
                 &o, &conv_buf, &g_buf, &beta_buf, &state, &cu, &si, &code, &d_buf,
@@ -3017,7 +3006,7 @@ fn gdn_scan_varlen_saves_and_restores_snapshots() {
             bufs.extend((drafts > 0).then_some(&unread_lanes));
             let (grid, threads) = (dims(1, nv, 2), dims(hv, 1, 1));
             common::dispatch_threadgroups(&device, &pipeline, &bufs, grid, threads).then(|| {
-                let after = vec![read_f16(&state, pools[0].len())];
+                let after = vec![read_ssm(&state, pools[0].len())];
                 (read_f32(&o, n * value_dim), after)
             })
         };
@@ -3096,7 +3085,7 @@ fn gdn_scan_simd_saves_and_restores_snapshots() {
                 buf_f32(&device, &row_range(&a, nv, r.clone())),
                 buf_f32(&device, &row_range(&b, nv, r)),
             );
-            let state = buf_f16(&device, &pools[0]);
+            let state = buf_ssm(&device, &pools[0]);
             let [cu, si, code] = second_of_two_coded(&device, n, seq, code);
             let mut bufs = vec![
                 &o, &conv_buf, &a_buf, &b_buf, &state, &cu, &si, &code, &alog_buf, &dt_buf, &d_buf,
@@ -3104,7 +3093,7 @@ fn gdn_scan_simd_saves_and_restores_snapshots() {
             bufs.extend((drafts > 0).then_some(&unread_lanes));
             let (grid, threads) = (dims(1, value_dim / 4, 2), dims(32, 4, 1));
             common::dispatch_threadgroups(&device, &pipeline, &bufs, grid, threads).then(|| {
-                let after = vec![read_f16(&state, pools[0].len())];
+                let after = vec![read_ssm(&state, pools[0].len())];
                 (read_f32(&o, n * value_dim), after)
             })
         };
@@ -3117,7 +3106,7 @@ fn gdn_scan_simd_saves_and_restores_snapshots() {
         }
         check_snapshots(&what, &slots, 1, 1, &step);
         // A plain step of more than one row is the pipelined scan's: no output, no state.
-        let pools = vec![q16(&fill(POOL_SLOTS * slots[0].len))];
+        let pools = vec![q_ssm(&fill(POOL_SLOTS * slots[0].len))];
         let live = GdnSeqSlots::plain(GdnSlot::new(LIVE as usize));
         let Some((out, after)) = step(&pools, 0..t, live, GdnStart::Slot) else {
             return;
@@ -3185,20 +3174,20 @@ fn gdn_scan_pipelined_saves_and_restores_snapshots() {
                 buf_f32(&device, &row_range(&a, nv, r.clone())),
                 buf_f32(&device, &row_range(&b, nv, r)),
             );
-            let state = buf_f16(&device, &pools[0]);
+            let state = buf_ssm(&device, &pools[0]);
             let [cu, si, code] = second_of_two_coded(&device, n, seq, code);
             let bufs = [
                 &o, &conv_buf, &a_buf, &b_buf, &state, &cu, &si, &code, &alog_buf, &dt_buf,
             ];
             let (grid, threads) = (dims(value_dim / 32, 1, 2), dims(128, 1, 1));
             common::dispatch_threadgroups(&device, &pipeline, &bufs, grid, threads).then(|| {
-                let after = vec![read_f16(&state, pools[0].len())];
+                let after = vec![read_ssm(&state, pools[0].len())];
                 (read_f32(&o, n * value_dim), after)
             })
         };
         let step = |pools: &[Vec<f32>], r, seq, start| coded(pools, r, seq, plain_code(start));
         let slots = [Slots::ssm(nk, nv, hk, hv)];
-        let pools = vec![q16(&fill(POOL_SLOTS * slots[0].len))];
+        let pools = vec![q_ssm(&fill(POOL_SLOTS * slots[0].len))];
         let live = GdnSeqSlots::plain(GdnSlot::new(LIVE as usize));
         // A prefill chunk restoring a snapshot and saving mid-block and at its end: the beside
         // twin's output, live slot and snapshots are the plain twin's, bit for bit.
@@ -3281,7 +3270,7 @@ fn gdn_decode_saves_and_restores_snapshots() {
     let step = |pools: &[Vec<f32>], r: std::ops::Range<usize>, seq, start| {
         assert_eq!(r, 0..1, "a decode step is one row");
         let out = buf_zero_f32(&device, value_dim);
-        let (conv, ssm) = (buf_f32(&device, &pools[0]), buf_f16(&device, &pools[1]));
+        let (conv, ssm) = (buf_f32(&device, &pools[0]), buf_ssm(&device, &pools[1]));
         let [cu, si, code] = second_of_two(&device, 1, seq, start);
         let bufs = [
             &out, &qkv, &z, &a, &b, &conv_w, &conv, &ssm, &cu, &si, &code, &a_log, &dt_bias,
@@ -3291,7 +3280,7 @@ fn gdn_decode_saves_and_restores_snapshots() {
         common::dispatch_threadgroups(&device, &pipeline, &bufs, grid, threads).then(|| {
             let after = vec![
                 read_f32(&conv, pools[0].len()),
-                read_f16(&ssm, pools[1].len()),
+                read_ssm(&ssm, pools[1].len()),
             ];
             (read_f32(&out, value_dim), after)
         })
