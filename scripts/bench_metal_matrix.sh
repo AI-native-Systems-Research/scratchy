@@ -54,11 +54,6 @@
 # each token scratchy picked: a near-tie two correct stacks break differently
 # passes, and the run records it as "parity_ties". A failure skips every timing
 # stage (all engines) for that model and is recorded as "parity_mlx_lm": false.
-# The gate reloads the whole checkpoint on the mlx-lm side once per prompt, so
-# it runs only where its verdict guards a comparison: a run timing any
-# comparison engine (every --full run), or --parity forcing it (the smoke
-# run's setup check). A scratchy-only run — the quick form — skips it and
-# records "parity_skipped" instead.
 # Comparison engines. By default oMLX and oMLX TurboQuant, the strongest MLX
 # rival, so the time goes into the users dimension of the grid instead
 # (#349); --engines all runs every installed one, --engines a,b names some:
@@ -237,7 +232,6 @@ WARM_REQUESTS=20
 OFFLINE=0
 SKIP_BUILD=0
 FAIL_FAST=0
-PARITY_GIVEN=0          # --parity: force the mlx-lm parity gate in a scratchy-only run
 OUT_DIR=""
 KV_CACHE_DTYPE=""
 EVICT=""                 # --exec picks purge on macOS by itself
@@ -321,7 +315,6 @@ while [[ $# -gt 0 ]]; do
         --offline)           OFFLINE=1; shift ;;
         --skip-build)        SKIP_BUILD=1; shift ;;
         --fail-fast)         FAIL_FAST=1; shift ;;
-        --parity)            PARITY_GIVEN=1; shift ;;
         --full)              shift ;;   # read before the defaults above
         --out-dir)           OUT_DIR="$2"; shift 2 ;;
         -h|--help)           awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; exit 0 ;;
@@ -420,13 +413,6 @@ engine_on() { # key binvar: does this row run? Installed, and selected.
     [[ -n "${!2}" ]] || return 1
     [[ "${ENGINES_ON}," == *",$1,"* ]]
 }
-# The parity gate's mlx-lm side reloads the whole checkpoint once per prompt,
-# which on the large models can outlast a scratchy-only run, and its verdict
-# only guards a comparison. So it runs when a comparison engine is timed (the
-# --full run's default pair) or --parity forces it; the quick form, scratchy
-# alone, skips it.
-PARITY=${PARITY_GIVEN}
-if [[ -n "${ENGINES_ON}" ]]; then PARITY=1; fi
 
 BIN="${ROOT}/target/release/scr"
 chip="$(sysctl -n machdep.cpu.brand_string)"
@@ -515,11 +501,6 @@ echo "machine : ${chip}"
 echo "models  : ${#MODELS[@]}"
 echo "rungs   : ${SCENARIOS}"
 echo "scratchy: ${V_scratchy:0:12}"
-if (( PARITY )) && [[ -n "${MLX_PYTHON}" ]]; then
-    echo "parity  : gate on (blocking, vs mlx-lm)"
-else
-    echo "parity  : gate off (scratchy alone, or no mlx-lm; --parity forces it)"
-fi
 for row in "${ENGINE_ROWS[@]}"; do
     IFS='|' read -r key label binvar <<<"${row}"
     v="V_${key}"
@@ -1266,11 +1247,9 @@ PY
     # anything is timed. The gate needs `{prompt}` in both commands, so it is
     # its own CLI-mode call, not part of the server-mode ladder; only its exit
     # code matters. A failure skips every engine for this model: with no
-    # scratchy numbers there is nothing to compare against. PARITY gates it:
-    # the mlx-lm side reloads the whole checkpoint once per prompt, so a
-    # scratchy-only run — the quick form — skips it (see PARITY above).
+    # scratchy numbers there is nothing to compare against.
     parity_ok=1
-    if (( built && PARITY )) && [[ -n "${MLX_PYTHON}" ]]; then
+    if (( built )) && [[ -n "${MLX_PYTHON}" ]]; then
         echo "--- parity gate vs mlx-lm (blocking)"
         # The gate only means "same load path" if both sides render the SAME
         # prompt; see mlx_parity_config for where mlx-lm's defaults diverge
@@ -1292,8 +1271,6 @@ PY
             grep -E " (OK|TIE|FAIL) +(agree|every) |^ +token +[0-9]+:| a: | b: |crashed|Error" "${RAW}/parity-${stem}.log" | head -16 | sed 's/^/    /' >&2
             (( FAIL_FAST )) && die "--fail-fast: stopping at ${stem}'s parity-gate failure"
         fi
-    elif (( built )) && [[ -n "${MLX_PYTHON}" ]]; then
-        echo "--- parity gate vs mlx-lm: skipped (scratchy alone; --parity forces it)"
     fi
 
     # ---- scratchy
@@ -1342,7 +1319,7 @@ PY
     fi
 
     ENGINE_KEYS="$(for row in "${ENGINE_ROWS[@]}"; do echo "${row%%|*}"; done)"; export ENGINE_KEYS
-    OFFLINE="${OFFLINE}" BASE_CONC="${BASE_CONC}" CONC_LIST="${CONC_LIST}" GRID_CONC_LIST="${GRID_CONC_LIST}" PARITY="${PARITY}" \
+    OFFLINE="${OFFLINE}" BASE_CONC="${BASE_CONC}" CONC_LIST="${CONC_LIST}" GRID_CONC_LIST="${GRID_CONC_LIST}" \
     python3 - "${JSON}" "${RAW}" "${stem}" "${id}" "${quant}" "${feats}" "${built}" \
               "${build_secs}" "${bytes}" "${parity_ok}" "${MLX_PYTHON}" <<'PY'
 import glob, json, os, re, sys
@@ -1376,9 +1353,7 @@ def scaling(engine):
 def parity_ties():
     """From the gate's log: {prompt: [gap, ...]} for each prompt that passed as a near-tie."""
     p = os.path.join(raw, f"parity-{stem}.log")
-    # PARITY too: a skipped gate leaves the previous run's log in place (RAW is
-    # shared across runs), and parity_ok alone cannot tell stale ties from none.
-    if parity_ok != "1" or env.get("PARITY") != "1" or not os.path.exists(p):
+    if parity_ok != "1" or not os.path.exists(p):
         return None
     ties, name = {}, None
     for line in open(p):
@@ -1421,13 +1396,8 @@ declined = {k: open(os.path.join(raw, f"declined-{k}-{stem}")).read().strip()
 d["models"].append({
     "stem": stem, "model_id": mid, "model_files": revision(mid), "quant": quant or None, "features": feats,
     "built": built == "1",
-    # null = gate not run (no mlx-lm, no build, or a scratchy-only run —
-    # parity_skipped says which); false = gate failed, nothing timed.
-    "parity_mlx_lm": ((parity_ok == "1") if (env.get("PARITY") == "1" and mlx_python and built == "1") else None),
-    # Why the gate did not judge this model, where the runner skipped it on
-    # purpose; the site's model line renders it next to the null above.
-    "parity_skipped": ("scratchy alone in this run; --parity forces the gate"
-                       if built == "1" and mlx_python and env.get("PARITY") != "1" else None),
+    # null = gate not run (no mlx-lm, or no build); false = gate failed, nothing timed.
+    "parity_mlx_lm": (parity_ok == "1") if (mlx_python and built == "1") else None,
     # The prompts that passed on near-ties, each with its tokens' logit gaps; null for none.
     "parity_ties": parity_ties(),
     "footprint": {"build_seconds": int(secs) if secs else None,
