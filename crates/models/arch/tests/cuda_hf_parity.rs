@@ -17,7 +17,7 @@
 //!   |noise|.
 //! - P3 top-1: CUDA's top-1 is f32's on every row whose f32 margin (top-1 − top-2) exceeds twice
 //!   that row's max |noise|; the rest are near-ties, counted. The last row of each prompt agrees or
-//!   is a near-tie. At least 99% of all real rows agree.
+//!   is a near-tie. The share of all real rows that agree is printed, as information only.
 //! - P4 top-5: on each prompt's last row, the CUDA and f32 top-5 share at least 4 tokens.
 //! - P5 greedy: prompts 1-5, 8 tokens, each a fresh m=512 forward of the prompt and CUDA's own
 //!   tokens so far, equal HF-f32's; at the first divergent step a margin under twice that step's

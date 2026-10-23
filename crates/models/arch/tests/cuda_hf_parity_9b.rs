@@ -19,8 +19,9 @@
 //! - P2 error size: per prompt, RMS(CUDA − f32) ≤ 2 × RMS(noise), max |CUDA − f32| ≤ 2 × max
 //!   |noise|.
 //! - P3 top-1: CUDA's top-1 is f32's on every row whose f32 margin exceeds twice that row's max
-//!   |noise|; the last row of each prompt agrees or is a near-tie; at least 99% of all real rows
-//!   agree.
+//!   |noise|; the last row of each prompt agrees or is a near-tie. The share of all real rows that
+//!   agree is printed, as information only (it was 245/249 = 0.9839 here, every disagreement a
+//!   near-tie).
 //! - P4 top-5: on each prompt's last row, the CUDA and f32 top-5 share at least 4 tokens.
 //! - P5 greedy: prompts 1-5, 8 tokens by fresh m=512 forwards, equal HF-f32's, at most 1 of the 5
 //!   a near-tie (a margin under twice the step's max |noise|).

@@ -4,7 +4,8 @@
 // with `include!` at the binary's root, not as a module, so every test keeps its name. The
 // including binary supplies the model: its `CUDA_TAPES`, the `numerics` module
 // (`targets/cuda/tests/common/numerics.rs`), and the constants `HIDDEN`, `WEIGHTS` (the weight
-// buffers the rig uploads) and `ARENA` (the largest tape's arena bytes).
+// buffers the rig uploads), `ARENA` (the largest tape's arena bytes) and
+// `BOUNDARY_DECODE_COSINE` ((n)'s cosine floor).
 
 use std::sync::OnceLock;
 
@@ -933,8 +934,8 @@ fn m_decodes_leave_the_prefix_cache_unchanged() {
 }
 
 /// (n): a decode at P = 319 (kv_len 320, the last slot of block 4) and at P = 320 (kv_len 321, the
-/// first slot of a new block), each finite and at cosine ≥ 0.999 to the same row of one
-/// 321-token forward in disjoint blocks and slot.
+/// first slot of a new block), each finite and at cosine ≥ the model's `BOUNDARY_DECODE_COSINE`
+/// to the same row of one 321-token forward in disjoint blocks and slot.
 #[test]
 fn n_decodes_at_a_block_boundary() {
     let r = rig();
@@ -947,10 +948,11 @@ fn n_decodes_at_a_block_boundary() {
         let at = 319 + i;
         let want = &one_shot[at * VOCAB..][..VOCAB];
         let (cos, diff, finite) = (cosine(row, want), max_diff(row, want), all_finite(row));
-        let ok = finite && cos >= 0.999;
+        let ok = finite && cos >= BOUNDARY_DECODE_COSINE;
         eprintln!(
             "(n) decode at P={at} (kv_len {}) against row {at} of one 321-token forward: \
-             finite={finite} cosine={cos:.6} (need >= 0.999) max|diff|={diff:e} {}",
+             finite={finite} cosine={cos:.6} (need >= {BOUNDARY_DECODE_COSINE}) \
+             max|diff|={diff:e} {}",
             at + 1,
             verdict(ok)
         );

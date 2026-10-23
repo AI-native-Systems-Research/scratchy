@@ -40,7 +40,8 @@
 //!   K/V and every GDN layer's state against the one-shot's, for the chain and teacher-forced;
 //! - (l) the prefill and 8 decodes repeated in disjoint blocks and slot are bit-identical;
 //! - (m) the 8 decodes leave the cache at positions 0..300 bit-unchanged;
-//! - (n) decodes at P = 319 and P = 320 (a new block) are finite and at cosine ≥ 0.999;
+//! - (n) decodes at P = 319 and P = 320 (a new block) are finite and at cosine ≥
+//!   `BOUNDARY_DECODE_COSINE` (0.999);
 //! - (o) at m=1, a wrong position, a short block table, fresh at P > 0 and q_len = 2 are refused
 //!   before any copy.
 //!
@@ -63,3 +64,5 @@ const HIDDEN: usize = 1024;
 const WEIGHTS: u64 = 266;
 /// The worker's arena: the largest tape's, m=4096.
 const ARENA: u64 = 2_585_035_776;
+/// (n)'s floor: each decode at the block boundary against the same row of one forward.
+const BOUNDARY_DECODE_COSINE: f64 = 0.999;
