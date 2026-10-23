@@ -89,6 +89,7 @@ jobs:
           cargo clippy -p scratchy-models --features cuda,qwen3.5-0.8b --all-targets -- -D warnings
           cargo clippy -p scratchy-models --features cuda,qwen3.5-9b-text-only --all-targets -- -D warnings
           cargo test -p scratchy-target-cuda -p scratchy-target-cuda-compiler
+          cargo test -p scratchy-target-cuda --test kernels_use_thunderkittens
           cargo test -p scratchy-models --features cuda,qwen3.5-0.8b --test cuda_tapes
           cargo test -p scratchy-models --features cuda,qwen3.5-9b-text-only --test cuda_tapes_9b
 
