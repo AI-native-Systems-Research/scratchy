@@ -40,14 +40,15 @@ use scratchy_subtile::handoff::{
     SourceBinding, TargetModelFacts, TargetModelInput, TargetPoint, UnrollIndex,
 };
 use scratchy_target_cuda::step::{
-    CudaStep, EmbedBf16, GatedDeltaNetBf16, GemmBf16, RmsNormBf16, gdn_conv_dim,
+    CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GatedDeltaNetBf16, GemmBf16, RmsNormBf16,
+    RouterLogitsBf16, gdn_conv_dim,
 };
 use scratchy_target_cuda::tape::{ArenaLayout, CudaTape, GdnTape, KvTape, TapeError, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
 
 use crate::canonical::{
     CanonicalAt, CanonicalGdn, CanonicalKv, CanonicalRefusal, CudaCanonical, CudaEmbedFacts,
-    CudaGdnFacts, CudaModelFacts, GemmShapeRule, lower_canonical,
+    CudaGdnFacts, CudaModelFacts, GemmShapeRule, SharedExpertOwner, lower_canonical,
 };
 
 /// The modules of the CUDA tape types, and the aliases the emitted tapes name them by: the one
@@ -67,6 +68,8 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "RotaryTable",
                 "KvTape",
                 "GdnTape",
+                "MoeTape",
+                "MoeSortTape",
                 "TapeInput",
             ],
         },
@@ -86,6 +89,16 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "RopeAppendBf16",
                 "AttnPrefillBf16",
                 "GatedDeltaNetBf16",
+                "RouterLogitsBf16",
+                "MatmulKernel",
+                "MoeRouteBf16",
+                "ExpertSortBf16",
+                "ExpertGemmBf16",
+                "ExpertGemvBf16",
+                "ExpertProjection",
+                "PairRows",
+                "ExpertCombineBf16",
+                "GateScaleBf16",
                 "GainConvention",
             ],
         },
@@ -103,9 +116,10 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
 /// table is then refused ([`ModelRefusal::NoRopeTheta`]), and a tape with none reads no theta. A
 /// model's input is its token ids, embedded from a table of `vocab_size` rows; a config that
 /// declares none gets no embedding table here, and [`lower_model`] refuses it
-/// ([`ModelRefusal::NoVocab`]).
+/// ([`ModelRefusal::NoVocab`]). The shared expert's owner is [`shared_expert_owner`]'s.
 pub fn model_facts(f: &TargetModelFacts) -> CudaModelFacts {
     CudaModelFacts {
+        shared_expert: shared_expert_owner(f),
         embed: (f.vocab_size > 0).then_some(CudaEmbedFacts {
             vocab: f.vocab_size,
         }),
@@ -118,6 +132,18 @@ pub fn model_facts(f: &TargetModelFacts) -> CudaModelFacts {
             conv_kernel: g.conv_kernel,
             eps: f.rms_norm_eps,
         }),
+    }
+}
+
+/// Who computes the model's MoE shared expert: the DSL when it declares a `shared_expert` subtree
+/// under the MoE bundle's base (the handoff's `dsl_shared_expert_bases`, which the macro computes
+/// as metal's facts do); otherwise no one CUDA knows of, and a combine of a bundle with one is
+/// refused. CUDA has one MoE bundle per layer, all under one base (`mlp`): the bases are the
+/// DSL's, not per layer.
+pub fn shared_expert_owner(f: &TargetModelFacts) -> SharedExpertOwner {
+    match f.dsl_shared_expert_bases.is_empty() {
+        true => SharedExpertOwner::Undeclared,
+        false => SharedExpertOwner::Dsl,
     }
 }
 
@@ -373,13 +399,15 @@ enum Role {
     Bf16([u64; 2], usize),
     /// One GDN layer's packed bundle of this geometry: `conv_dim`, `conv_kernel`, `nv`, `head_v`.
     Bundle([u32; 4]),
+    /// One MoE layer's dense bundle of this geometry: `experts`, `hidden`, `inter`.
+    MoeBundle([u32; 3]),
 }
 
 impl Role {
     fn shape(&self) -> &[u64] {
         match self {
             Self::Bf16(dims, rank) => &dims[..*rank],
-            Self::Bundle(_) => &[],
+            Self::Bundle(_) | Self::MoeBundle(_) => &[],
         }
     }
 }
@@ -419,6 +447,27 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
                 Role::Bundle([conv_dim, conv_kernel, num_v_heads, head_v]),
             ))
         }
+        CudaStep::RouterLogits(RouterLogitsBf16 {
+            bundle,
+            experts,
+            hidden,
+            inter,
+            ..
+        })
+        | CudaStep::ExpertGemm(ExpertGemmBf16 {
+            bundle,
+            experts,
+            hidden,
+            inter,
+            ..
+        })
+        | CudaStep::ExpertGemv(ExpertGemvBf16 {
+            bundle,
+            experts,
+            hidden,
+            inter,
+            ..
+        }) => Some((bundle, Role::MoeBundle([experts, hidden, inter]))),
         CudaStep::Add(_)
         | CudaStep::SiluMul(_)
         | CudaStep::Rope(_)
@@ -426,7 +475,11 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         | CudaStep::GateApply(_)
         | CudaStep::RopeAppend(_)
         | CudaStep::AttnPrefill(_)
-        | CudaStep::AttnDecode(_) => None,
+        | CudaStep::AttnDecode(_)
+        | CudaStep::MoeRoute(_)
+        | CudaStep::ExpertSort(_)
+        | CudaStep::ExpertCombine(_)
+        | CudaStep::GateScale(_) => None,
     }
 }
 
@@ -441,8 +494,11 @@ fn baked_str(s: String) -> &'static str {
 ///
 /// Every bucket binds the same source at every index (one table serves them all). Each index a
 /// step reads is read as one thing ([`role`]): a GEMM's `[n, k]`, a norm's `[cols]`, the embed's
-/// `[vocab, hidden]` (all bf16 tensors `{prefix}.weight`), or a GDN bundle (`{prefix}.conv1d.weight`,
-/// `{prefix}.A_log`, `{prefix}.dt_bias`, `{prefix}.norm.weight`). The prefix is the handoff's: a
+/// `[vocab, hidden]` (all bf16 tensors `{prefix}.weight`), a GDN bundle (`{prefix}.conv1d.weight`,
+/// `{prefix}.A_log`, `{prefix}.dt_bias`, `{prefix}.norm.weight`), or a MoE bundle
+/// (`{prefix}.gate.weight`, `{prefix}.experts.gate_up_proj`, `{prefix}.experts.down_proj`, the
+/// router, every expert's fused gate and up, and every expert's down, by role [`Role::MoeBundle`]
+/// of the router and every expert step naming it). The prefix is the handoff's: a
 /// model weight's `weight_prefixes` entry, the embedding table's `embed_prefix`. An index whose
 /// declared bytes no step reads, or whose entry packs to other bytes than it declares, is refused.
 /// Then the dedup: a later index whose tensor an earlier index already names is read through the
@@ -530,6 +586,14 @@ pub fn weight_table(
                 nv,
                 head_v,
             },
+            Role::MoeBundle([experts, hidden, inter]) => CudaWeight::MoeBundle {
+                router: baked_str(format!("{prefix}.gate.weight")),
+                gate_up: baked_str(format!("{prefix}.experts.gate_up_proj")),
+                down: baked_str(format!("{prefix}.experts.down_proj")),
+                experts,
+                hidden,
+                inter,
+            },
         };
         let (packed, declared) = (entry.packed_bytes().unwrap_or(u64::MAX), declared(ix));
         if packed != declared {
@@ -546,10 +610,7 @@ pub fn weight_table(
     let mut remap: Vec<usize> = (0..n).collect();
     for ix in 0..n {
         let Some(entry) = table[ix] else { continue };
-        let tensor = match entry {
-            CudaWeight::Bf16 { tensor, .. } => tensor,
-            CudaWeight::GdnBundle { conv1d, .. } => conv1d,
-        };
+        let tensor = entry.lead();
         match first_of.get(tensor) {
             None => {
                 first_of.insert(tensor, ix);
@@ -602,6 +663,7 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
         rotary,
         kv,
         gdn,
+        moe,
     } = c;
     CudaTape {
         bucket_m: *bucket_m,
@@ -657,6 +719,7 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
                 scratch: *scratch,
             },
         ),
+        moe: *moe,
     }
 }
 
@@ -687,6 +750,13 @@ pub fn emit_model(input: &TargetModelInput) -> TokenStream {
             c.steps.len(),
             c.total_bytes
         );
+        if let Some(moe) = &c.moe {
+            let span = moe.span();
+            eprintln!(
+                "[cuda emit] {stem}: m={}: MoE scratch {} bytes at {}",
+                c.bucket_m, span.bytes, span.offset.0
+            );
+        }
     }
     for (m, why) in &model.unlowered {
         eprintln!("[cuda emit] {stem}: m={m} left out: {why}");

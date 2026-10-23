@@ -2041,7 +2041,7 @@ mod tests {
 
     #[test]
     fn a_norm_a_router_gathered_experts_and_a_shared_matvec_read_folds_into_each() {
-        use crate::lower::ExpertQuant;
+        use crate::lower::{ExpertQuant, ExpertWeight};
         use crate::subtile_ir::{
             ExpertBundle, ExpertProj, GatedAct, NumExperts, RouterBundle, TopK,
         };
@@ -2050,14 +2050,14 @@ mod tests {
         let k = TopK::new(NonZeroU32::new(2).expect("top 2"));
         let (router, bundle) = (RouterBundle::SharedFused, ExpertBundle::SharedFused);
         let matmul = |proj, m, inputs| {
-            let quant = ExpertQuant::declared(64, 4);
+            let weight = ExpertWeight::Affine(ExpertQuant::declared(64, 4));
             let n = 32;
             op(
                 SubOp::ExpertMatmul {
                     proj,
                     n,
                     k,
-                    quant,
+                    weight,
                     bundle,
                 },
                 m,
@@ -2119,7 +2119,7 @@ mod tests {
 
     #[test]
     fn a_routing_only_expert_commands_read_folds_into_each_of_them() {
-        use crate::lower::ExpertQuant;
+        use crate::lower::{ExpertQuant, ExpertWeight};
         use crate::subtile_ir::{
             ExpertBundle, ExpertProj, GatedAct, NumExperts, RouterBundle, SharedExpertBound, TopK,
         };
@@ -2128,12 +2128,12 @@ mod tests {
         let k = TopK::new(NonZeroU32::new(2).expect("top 2"));
         let (router, bundle) = (RouterBundle::Gemma, ExpertBundle::SwitchGlu);
         let matmul = |proj, n, inputs, rows| {
-            let quant = ExpertQuant::declared(64, 4);
+            let weight = ExpertWeight::Affine(ExpertQuant::declared(64, 4));
             let m = SubOp::ExpertMatmul {
                 proj,
                 n,
                 k,
-                quant,
+                weight,
                 bundle,
             };
             op(m, rows, inputs)
@@ -2480,18 +2480,18 @@ mod tests {
 
     #[test]
     fn expert_projections_fold_into_their_activation_and_combine_only_when_read_once() {
-        use crate::lower::ExpertQuant;
+        use crate::lower::{ExpertQuant, ExpertWeight};
         use crate::subtile_ir::{ExpertBundle, ExpertProj, GatedAct, SharedExpertBound, TopK};
         let matmul = |proj, n, inputs| {
             let k = TopK::new(std::num::NonZeroU32::new(2).expect("two experts"));
-            let quant = ExpertQuant::declared(64, 4);
+            let weight = ExpertWeight::Affine(ExpertQuant::declared(64, 4));
             let bundle = ExpertBundle::SwitchGlu;
             op(
                 SubOp::ExpertMatmul {
                     proj,
                     n,
                     k,
-                    quant,
+                    weight,
                     bundle,
                 },
                 1,
@@ -2552,17 +2552,20 @@ mod tests {
 
     #[test]
     fn an_ungated_experts_one_projection_folds_into_its_activation() {
-        use crate::lower::ExpertQuant;
+        use crate::lower::{ExpertQuant, ExpertWeight};
         use crate::subtile_ir::{ExpertBundle, ExpertProj, SharedExpertBound, TopK, UngatedAct};
         let k = TopK::new(std::num::NonZeroU32::new(2).expect("two experts"));
         let matmul = |proj, n, inputs| {
-            let (quant, bundle) = (ExpertQuant::declared(64, 4), ExpertBundle::SharedFused);
+            let (weight, bundle) = (
+                ExpertWeight::Affine(ExpertQuant::declared(64, 4)),
+                ExpertBundle::SharedFused,
+            );
             op(
                 SubOp::ExpertMatmul {
                     proj,
                     n,
                     k,
-                    quant,
+                    weight,
                     bundle,
                 },
                 1,

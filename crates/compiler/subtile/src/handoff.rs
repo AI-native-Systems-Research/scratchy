@@ -362,7 +362,7 @@ pub struct TargetBucket {
 
 /// The config facts a target reads beside a canonical: the ones an op of the canonical does not
 /// carry. Each is resolved once, by the macro, from the model's config.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TargetModelFacts {
     /// `head_dim`.
     pub head_dim: u32,
@@ -376,6 +376,10 @@ pub struct TargetModelFacts {
     pub vocab_size: u32,
     /// The linear-attention geometry: `Some` exactly when the model has a Gated-DeltaNet layer.
     pub gdn: Option<TargetGdnFacts>,
+    /// The weight bases the DSL declares a `shared_expert` subtree under (`mlp`), ascending: an
+    /// expert bundle whose shared expert the DSL states as ops of its own, which a target's
+    /// expert combine therefore must not add again (the single-owner rule).
+    pub dsl_shared_expert_bases: Vec<String>,
 }
 
 /// A Gated-DeltaNet model's key-head geometry: `linear_num_key_heads`, `linear_key_head_dim`,

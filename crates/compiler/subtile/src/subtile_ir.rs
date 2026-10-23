@@ -885,7 +885,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 proj,
                 n,
                 k,
-                quant: _,
+                weight: _,
                 bundle,
             } => {
                 std::mem::discriminant(self).hash(h);
@@ -939,9 +939,14 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 proj,
                 n,
                 k,
-                quant,
+                weight,
                 bundle,
-            } => (proj, n, k, quant.group().get(), quant.bits().get(), bundle).hash(h),
+            } => match weight {
+                crate::lower::ExpertWeight::Affine(quant) => {
+                    (proj, n, k, quant.group().get(), quant.bits().get(), bundle).hash(h)
+                }
+                crate::lower::ExpertWeight::Dense => (proj, n, k, bundle).hash(h),
+            },
             SubOp::ExpertGatedAct { act } => act.hash(h),
             SubOp::ExpertAct { act } => act.hash(h),
             SubOp::ExpertCombine { hidden, shared } => (hidden, shared).hash(h),
@@ -1360,12 +1365,13 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
         k: TopK,
         bundle: ExpertBundle,
     },
-    /// One projection of each pair's expert, `n` wide. `inputs` = `[rows, routing, experts]`.
+    /// One projection of each pair's expert, `n` wide. `inputs` = `[rows, routing, experts]`,
+    /// with a 4th, the bank's scale source, for an affine bank whose front end binds one.
     ExpertMatmul {
         proj: ExpertProj,
         n: u32,
         k: TopK,
-        quant: crate::lower::ExpertQuant,
+        weight: crate::lower::ExpertWeight,
         bundle: ExpertBundle,
     },
     /// `act(gate) * up` over the pair rows. `inputs` = `[gate, up]`.
@@ -2598,13 +2604,13 @@ pub fn lower_region(
                 proj,
                 n,
                 k,
-                quant,
+                weight,
                 bundle,
             } => SubOp::ExpertMatmul {
                 proj,
                 n,
                 k,
-                quant,
+                weight,
                 bundle,
             },
             SubOp::ExpertGatedAct { act } => SubOp::ExpertGatedAct { act },

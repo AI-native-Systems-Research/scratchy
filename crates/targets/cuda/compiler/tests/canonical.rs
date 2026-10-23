@@ -26,8 +26,8 @@ use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, TapeInput, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
 use scratchy_target_cuda_compiler::canonical::{
     ArenaRefusal, CanonicalAt, CanonicalRefusal, CudaEmbedFacts, CudaModelFacts, CudaPlan,
-    EmbedShapeRule, GateShapeRule, GemmShapeRule, OperandRefusal, RopeShapeRule, lower_canonical,
-    lower_plan, plan_canonical,
+    EmbedShapeRule, GateShapeRule, GemmShapeRule, OperandRefusal, RopeShapeRule, SharedExpertOwner,
+    lower_canonical, lower_plan, plan_canonical,
 };
 use scratchy_target_cuda_compiler::emit::{ModelRefusal, lower_model, static_tape};
 use scratchy_target_cuda_compiler::steps_from_tape::{StepCx, TapeStep, lower_fused, lower_step};
@@ -50,6 +50,7 @@ const FACTS: CudaModelFacts = CudaModelFacts {
     rope_theta: 1e7,
     gdn: None,
     embed: None,
+    shared_expert: SharedExpertOwner::Undeclared,
 };
 
 fn fixtures() -> Vec<(&'static str, LoweringInput)> {
@@ -216,6 +217,7 @@ fn a_rope_on_the_hidden_with_the_global_table_lowers_to_one_rope() {
         rope_theta: 1e4,
         gdn: None,
         embed: None,
+        shared_expert: SharedExpertOwner::Undeclared,
     };
     let c = lower_canonical(&l, facts, AT).expect("the rope lowers");
     let [CudaStep::Rope(rope)] = c.steps.as_slice() else {
@@ -673,6 +675,7 @@ fn a_fold_whose_absorbed_step_is_not_on_the_tape_is_refused() {
         kv_regions: None,
         gdn_layers: &[],
         gdn_regions: None,
+        moe: None,
     };
     let computes: Vec<TapeStep<'_>> = (p.tape.instrs().iter())
         .filter_map(|i| match i {
@@ -829,6 +832,7 @@ fn lower_second_add(
         kv_regions: None,
         gdn_layers: &[],
         gdn_regions: None,
+        moe: None,
     };
     let all = computes(&p);
     let replaced = inputs(&p.graph, &all);
@@ -986,6 +990,7 @@ fn tied_model(ms: &[u32], head: &str, vocab: u32) -> TargetModelInput {
             rms_norm_eps: 1e-6,
             vocab_size: vocab,
             gdn: None,
+            dsl_shared_expert_bases: Vec::new(),
         },
         weight_prefixes: vec![
             (1, None, "model.norm".to_string()),

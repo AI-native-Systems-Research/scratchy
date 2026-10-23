@@ -2044,6 +2044,18 @@ pub(crate) fn rot_dim(model: &ModelParams, head_dim: u32) -> u32 {
         .unwrap_or(head_dim)
 }
 
+/// The weight bases the DSL declares a `shared_expert` subtree under (`mlp` for
+/// `mlp.shared_expert.gate_proj`): the bundles whose shared expert the DSL states as ops of its
+/// own, so a target's expert combine must not add it again (the single-owner rule). Ascending.
+pub(crate) fn dsl_shared_expert_bases(program: &Program) -> Vec<String> {
+    (0..program.weights.len())
+        .filter_map(|i| program.weights.path(WeightId(i as u32)).first().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|b| program.weights.has_subtree(&[b, "shared_expert"]))
+        .collect()
+}
+
 pub(crate) fn rms_norm_eps(model: &ModelParams) -> f32 {
     // HF configs carry `rms_norm_eps` (RMSNorm convention used by
     // Llama/Qwen2/Mistral/etc.) or `layer_norm_eps` (CohereLayerNorm
@@ -7258,7 +7270,13 @@ fn target_model_input(
             crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap());
         let at = point(wp);
         match crate::to_wavefront::lower_decode_to_wavefront(
-            fuf, inferred, &bounds, model, prefix, at.m,
+            fuf,
+            inferred,
+            &bounds,
+            model,
+            prefix,
+            at.m,
+            crate::to_wavefront::DenseExperts::Lower,
         ) {
             Ok(lowered) => buckets.push(TargetBucket { point: at, lowered }),
             Err(e) => unlowered.push((at, e.to_string())),
@@ -7319,6 +7337,7 @@ fn target_model_input(
             rms_norm_eps: rms_norm_eps(model),
             vocab_size: bound("vocab_size").unwrap_or(0),
             gdn,
+            dsl_shared_expert_bases: dsl_shared_expert_bases(program),
         },
     }
 }
@@ -10157,6 +10176,7 @@ fn dump_wavefront_mega(
         model,
         crate::to_wavefront::PrefixCapacity::new(prefix_len),
         primary_m,
+        crate::to_wavefront::DenseExperts::Refuse,
     ) {
         // A quant weight scheme the wavefront/superdsc lowering does not emit (int4/ggml, or fp8 until
         // wired) genuinely has NO superdsc bundle — skip THIS preset (return no bundle). This
@@ -12103,6 +12123,7 @@ fn dump_wavefront_mega(
                         std::num::NonZeroU32::new(cap).expect("cap bucket is non-zero"),
                     ),
                     primary_m,
+                    crate::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(l) => l,
                     Err(e) => panic!("[wavefront] {stem}: decode (cap={cap}) NOT LOWERED — {e}"),
@@ -12171,6 +12192,7 @@ fn dump_wavefront_mega(
                     model,
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
                     seqs,
+                    crate::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(lwd_b) => {
                         emit_bundle(
@@ -12420,6 +12442,7 @@ fn dump_wavefront_mega(
                 // causally, and chunk k attends the k*mq rows written so far.
                 crate::to_wavefront::PrefixCapacity::new(prefix_len),
                 pl,
+                crate::to_wavefront::DenseExperts::Refuse,
             );
             match lowered {
                 Ok(lwd_p) => {
@@ -12534,6 +12557,7 @@ fn dump_wavefront_mega(
                     model,
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
                     m,
+                    crate::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(lwd_p) => {
                         emit_bundle(
@@ -12640,6 +12664,7 @@ fn dump_wavefront_mega(
                 model,
                 crate::to_wavefront::PrefixCapacity::new(prefix_len),
                 decode_mq,
+                crate::to_wavefront::DenseExperts::Refuse,
             ) {
                 Ok(lwd_cb) => {
                     let (_m, _n, sg, groups) = emit_bundle(
@@ -13154,6 +13179,7 @@ pub fn emit_model(
                         std::num::NonZeroU32::new(8192).expect("8192 != 0"),
                     ),
                     wp.num_tokens as u32,
+                    crate::to_wavefront::DenseExperts::Refuse,
                 )
                 .ok()
             });
@@ -13251,6 +13277,7 @@ pub fn emit_model(
                 model,
                 crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap()),
                 wp.num_tokens as u32,
+                crate::to_wavefront::DenseExperts::Refuse,
             ) {
                 Ok(l) => {
                     let m = wp.num_tokens as u32;
@@ -13535,7 +13562,13 @@ pub fn emit_model(
         let prefix =
             crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap());
         let l = match crate::to_wavefront::lower_decode_to_wavefront(
-            fuf, inferred, &bounds, model, prefix, m as u32,
+            fuf,
+            inferred,
+            &bounds,
+            model,
+            prefix,
+            m as u32,
+            crate::to_wavefront::DenseExperts::Refuse,
         ) {
             Ok(l) => l,
             // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,
@@ -13577,13 +13610,7 @@ pub fn emit_model(
             .map(|p| p.join("_"))
             .find(|p| p.contains("embed"));
         let embed_base = embed_base.unwrap_or_else(|| "embed_tokens".into());
-        let dsl_shared_expert_bases: Vec<String> = weight_paths
-            .iter()
-            .filter_map(|p| p.first().cloned())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .filter(|b| program.weights.has_subtree(&[b, "shared_expert"]))
-            .collect();
+        let dsl_shared_expert_bases = dsl_shared_expert_bases(program);
         let quant = model.quantization.as_ref();
         let widths = |base: &str, layer: st::LayerId, body| {
             let qc = quant.expect("MoE widths are read for a quantized model only");

@@ -10,31 +10,36 @@
 //! refusing arm into an arm of its own.
 
 use scratchy_subtile::handoff::{SourceBinding, UnrollIndex};
-use scratchy_subtile::lower::GemmWeight;
+use scratchy_subtile::lower::{ExpertWeight, GemmWeight};
 use scratchy_subtile::model_geometry::ModelAttnGeometry;
 use scratchy_subtile::subtile_ir::{
-    AttnMask, EwKind, GainConvention, RopeFormTag, SubOp, SubtileIR, SubtileNode,
+    AttnMask, EwKind, ExpertBundle, ExpertProj, GainConvention, GatedAct, RopeFormTag,
+    RouterBundle, SubOp, SubtileIR, SubtileNode,
 };
 use scratchy_subtile::subtile_ir::{TensorRegion, TensorShape};
 use scratchy_subtile::subtile_tape::{ComputeInput, ComputeInputs, SlotId};
 use scratchy_subtile::tape_colouring::{Colour, TapeColouring};
 use scratchy_subtile::tape_folding::{FusedShape, Fusion};
-use scratchy_target_cuda::op_abi::CudaFusion;
+use scratchy_target_cuda::op_abi::{CUDA_GROUPED_EXPERTS, CudaFusion};
 use scratchy_target_cuda::step::{
     ADD_BF16_COLS, ATTN_DECODE_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, ATTN_PREFILL_BF16_ROWS,
-    AddBf16, AttnPrefillBf16, CudaStep, EMBED_BF16_COLS, EmbedBf16, GATE_APPLY_BF16_COLS,
-    GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX,
-    GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE,
-    GEMV_BF16_MULTIPLE, GateApplyBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16,
-    RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16,
-    RopeAppendBf16, RopeBf16, SILU_MUL_BF16_COLS, SiluMulBf16,
+    AddBf16, AttnPrefillBf16, CudaStep, EMBED_BF16_COLS, EmbedBf16, ExpertCombineBf16,
+    ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GATE_APPLY_BF16_COLS,
+    GATE_SCALE_BF16_COLS, GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
+    GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_NARROW_BF16_MAX_N,
+    GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16,
+    GateScaleBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16, MOE_ROUTE_EXPERTS,
+    MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, PairRows, RMS_NORM_BF16_COLS,
+    ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RopeAppendBf16, RopeBf16,
+    RouterLogitsBf16, SILU_MUL_BF16_COLS, SiluMulBf16,
 };
-use scratchy_target_cuda::tape::{ArenaOffset, WeightIx};
+use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
 use crate::canonical::{
     ArenaRefusal, AttnShapeRule, CanonicalRefusal, CudaModelFacts, EmbedShapeRule, GateShapeRule,
     GdnRegions, GdnShapeRule, GdnWidths, GemmShapeRule, KvCacheRefusal, KvPool, KvRegions,
-    OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule, ViewRefusal,
+    MoeShapeRule, OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule, SharedExpertOwner,
+    ViewRefusal,
 };
 
 /// What a step's lowering reads besides the step itself: the planned canonical, the model facts,
@@ -61,6 +66,8 @@ pub struct StepCx<'a> {
     pub gdn_layers: &'a [u32],
     /// The GDN regions' spans, when the arena has them.
     pub gdn_regions: Option<GdnRegions>,
+    /// The MoE scratch, when the arena has one.
+    pub moe: Option<MoeTape>,
 }
 
 /// One `Compute` of the tape: its position among the `Compute`s, its node, the slot it writes and
@@ -102,6 +109,39 @@ pub fn lower_step(
             geom, scale, mask, ..
         } => attention(cx, s, *geom, *scale, *mask, computes),
         L::GatedDeltaNet => gated_delta_net(cx, s).map(CudaStep::GatedDeltaNet),
+        L::RouterLogits { experts, router } => {
+            router_logits(cx, s, experts.get(), *router).map(CudaStep::RouterLogits)
+        }
+        L::ExpertSort { experts, k, bundle } => {
+            return expert_sort(cx, s, (experts.get(), k.get()), *bundle, computes)
+                .map(|e| e.map(CudaStep::ExpertSort));
+        }
+        L::ExpertMatmul {
+            proj,
+            n,
+            k,
+            weight,
+            bundle,
+        } => expert_matmul(cx, s, (*proj, *n, k.get()), (*weight, *bundle), computes),
+        L::ExpertGatedAct { act } => expert_gated_act(cx, s, *act, computes).map(CudaStep::SiluMul),
+        L::ExpertUnsort => return expert_unsort(cx, s, computes).map(|()| None),
+        L::ExpertCombine { hidden, shared } => {
+            expert_combine(cx, s, *hidden, shared.0.is_some(), computes)
+                .map(CudaStep::ExpertCombine)
+        }
+        L::GateScale => gate_scale(cx, s).map(CudaStep::GateScale),
+        // A routing runs only as the `MoeRoute` fold its top-k drives: one the fold left (a
+        // softmax or argsort it did not absorb, a top-k driving none, a gather or renorm no
+        // top-k took as its epilogue) has no kernel.
+        L::RouteSoftmax
+        | L::RouteArgsort
+        | L::RouteTopK { .. }
+        | L::RouteGatherScores
+        | L::RouteRenorm => Err(CanonicalRefusal::MoeShape {
+            step: s.step,
+            op: op.name(),
+            rule: MoeShapeRule::Routing,
+        }),
         // SwiGLU runs only as the `SiluMul` fold: a `Silu` the fold left, a `Mul` driving none,
         // and the pre-fused op (which only spyre's `fuse_silu_mul` makes) have no kernel.
         L::Elementwise(E::Silu | E::Mul) | L::SiluMul => Err(CanonicalRefusal::Unfused {
@@ -118,7 +158,6 @@ pub fn lower_step(
         | L::RmsNormUnit { .. }
         | L::ScalarWeightMul
         | L::Concat { .. }
-        | L::GateScale
         | L::LoadRows { .. }
         | L::EmbeddingGather { .. }
         | L::VisionRope
@@ -127,22 +166,11 @@ pub fn lower_step(
         | L::Mamba2 { .. }
         | L::Mean
         | L::RouterNorm { .. }
-        | L::RouterLogits { .. }
-        | L::RouteSoftmax
         | L::RouteSigmoidBias { .. }
         | L::RouteBias { .. }
-        | L::RouteArgsort
-        | L::RouteTopK { .. }
-        | L::RouteGatherScores
         | L::RouteScale { .. }
-        | L::RouteRenorm
         | L::RouteExpertScale { .. }
-        | L::ExpertSort { .. }
-        | L::ExpertMatmul { .. }
-        | L::ExpertGatedAct { .. }
         | L::ExpertAct { .. }
-        | L::ExpertUnsort
-        | L::ExpertCombine { .. }
         | L::KvEncode { .. }
         | L::KvStage { .. }
         | L::RotateRows { .. }
@@ -210,6 +238,7 @@ pub fn lower_fused(
 ) -> Result<CudaStep, CanonicalRefusal> {
     match fusion.kernel {
         CudaFusion::SiluMul => silu_mul(cx, s, fusion.shape, computes).map(CudaStep::SiluMul),
+        CudaFusion::MoeRoute => moe_route(cx, s, fusion.shape, computes).map(CudaStep::MoeRoute),
     }
 }
 
@@ -963,6 +992,442 @@ fn gate_apply(
     })
 }
 
+// ── The MoE block ───────────────────────────────────────────────────
+
+/// A MoE op's refusal.
+fn moe_refusal(s: &TapeStep<'_>, rule: MoeShapeRule) -> CanonicalRefusal {
+    CanonicalRefusal::MoeShape {
+        step: s.step,
+        op: s.node.op.name(),
+        rule,
+    }
+}
+
+/// The tape's MoE scratch, which the arena placed because the canonical has a MoE op; or the
+/// arena's refusal.
+fn moe_tape(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<MoeTape, CanonicalRefusal> {
+    cx.offsets.map_err(CanonicalRefusal::Arena)?;
+    cx.moe.ok_or(moe_refusal(s, MoeShapeRule::Geometry))
+}
+
+/// The step writing operand `k` of `s`, which must be a computed slot written by a step whose op
+/// `is` accepts: the MoE dataflow `op_abi::cuda_moe_write` states, checked rather than trusted.
+fn moe_producer<'c, 'a>(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    k: u8,
+    computes: &'c [TapeStep<'a>],
+    is: impl Fn(&SubOp) -> bool,
+) -> Result<&'c TapeStep<'a>, CanonicalRefusal> {
+    let slot = slot_operand(cx, s, k)?;
+    (computes.iter().find(|c| c.writes == slot))
+        .filter(|c| is(&c.node.op))
+        .ok_or(CanonicalRefusal::MoeOperand {
+            step: s.step,
+            op: s.node.op.name(),
+            operand: k,
+        })
+}
+
+/// The bucket's MoE geometry checks: `experts` and `top_k` the scratch's, the routing kernel's
+/// expert count and top-k, and `rows` the bucket's tokens.
+fn moe_counts(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    moe: &MoeTape,
+    (experts, top_k): (u32, u32),
+) -> Result<(), CanonicalRefusal> {
+    if experts != MOE_ROUTE_EXPERTS || top_k == 0 || top_k > MOE_ROUTE_MAX_TOP_K {
+        return Err(moe_refusal(s, MoeShapeRule::Experts { experts, top_k }));
+    }
+    if (experts, top_k) != (moe.experts, moe.top_k) {
+        return Err(moe_refusal(s, MoeShapeRule::Geometry));
+    }
+    let rows = cx.graph.shape(s.node.output.tensor).rows;
+    if cx.tokens != Some(rows) {
+        return Err(moe_refusal(s, MoeShapeRule::Rows));
+    }
+    Ok(())
+}
+
+/// `RouterLogits { experts, router }` as the bf16 GEMM over the router at byte 0 of the layer's
+/// MoE bundle: `x` (operand 0) a computed slot or the embedded hidden, `[m, hidden]`; the bundle
+/// (operand 1) a `[1, 1]` source bound to the layer's MoE weight. The tiled GEMM, or the GEMV at
+/// one row, as [`gemm_kernel`] chooses for a `MatmulTile` (the router's `n` is its experts, never
+/// narrow). Only the shared-fused router: its bundle is the one `op_abi::CUDA_GROUPED_EXPERTS`
+/// names.
+fn router_logits(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    experts: u32,
+    router: RouterBundle,
+) -> Result<RouterLogitsBf16, CanonicalRefusal> {
+    let (step, node) = (s.step, s.node);
+    if router != RouterBundle::SharedFused
+        || !CUDA_GROUPED_EXPERTS.contains(&ExpertBundle::SharedFused)
+    {
+        return Err(moe_refusal(s, MoeShapeRule::Bundle));
+    }
+    let (x, w) = match node.inputs.as_slice() {
+        [x, w] => (x, w),
+        _ => return Err(operand(s, 1, OperandRefusal::Missing)),
+    };
+    let moe = moe_tape(cx, s)?;
+    moe_counts(cx, s, &moe, (experts, moe.top_k))?;
+    let TensorShape { rows: m, cols } = cx.graph.shape(node.output.tensor);
+    let hidden = cx.graph.shape(x.tensor).cols;
+    if cols != experts || hidden != moe.hidden {
+        return Err(moe_refusal(s, MoeShapeRule::Geometry));
+    }
+    same_shape(cx, s, 0, x, m, hidden)?;
+    whole_tensors(cx, s, &[(0, x), (1, w)])?;
+    let kernel = match m {
+        1 => gemv_shape(experts, hidden).map(|()| MatmulKernel::Gemv),
+        _ => gemm_shape(m, experts, hidden).map(|()| MatmulKernel::Tiled),
+    }
+    .map_err(|rule| CanonicalRefusal::GemmShape {
+        step,
+        m,
+        n: experts,
+        k: hidden,
+        rule,
+    })?;
+    let at = arena(cx)?;
+    let mut inputs = s.inputs.iter();
+    let xc = activation(cx, s, 0, inputs.next())?;
+    let bundle = weight_operand(cx, s, 1, inputs.next())?;
+    Ok(RouterLogitsBf16 {
+        x: at(xc),
+        bundle,
+        logits: moe.logits.offset,
+        m,
+        experts,
+        hidden,
+        inter: moe.inter,
+        kernel,
+    })
+}
+
+/// The `MoeRoute` fold its `RouteTopK { k }` drives, as the one routing launch: the folded
+/// softmax (the fold's `pre`) over the `RouterLogits` it reads, its argsort (the fold's `sort`),
+/// the top-k, the gathered scores and, when the fold took one as tail stage 1, their renorm.
+/// No other pre or tail stage: CUDA routes Qwen's softmax-first way only.
+fn moe_route(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    shape: FusedShape,
+    computes: &[TapeStep<'_>],
+) -> Result<MoeRouteBf16, CanonicalRefusal> {
+    let routing = || moe_refusal(s, MoeShapeRule::Routing);
+    let FusedShape::Route {
+        pre: Some(pre),
+        tail: [None, renorm, None, None],
+        ..
+    } = shape
+    else {
+        return Err(routing());
+    };
+    let SubOp::RouteTopK { k } = s.node.op else {
+        return Err(routing());
+    };
+    let softmax = (computes.iter().find(|c| c.writes == pre))
+        .filter(|c| matches!(c.node.op, SubOp::RouteSoftmax))
+        .ok_or_else(routing)?;
+    let logits = moe_producer(cx, softmax, 0, computes, |op| {
+        matches!(op, SubOp::RouterLogits { .. })
+    })?;
+    let SubOp::RouterLogits { experts, .. } = logits.node.op else {
+        return Err(routing());
+    };
+    if renorm.is_some_and(|r| {
+        !(computes.iter()).any(|c| c.writes == r && matches!(c.node.op, SubOp::RouteRenorm))
+    }) {
+        return Err(routing());
+    }
+    let moe = moe_tape(cx, s)?;
+    moe_counts(cx, s, &moe, (experts.get(), k.get()))?;
+    Ok(MoeRouteBf16 {
+        logits: moe.logits.offset,
+        topk_idx: moe.topk_idx.offset,
+        scores: moe.scores.offset,
+        m: cx.tokens.unwrap_or(0),
+        experts: moe.experts,
+        top_k: moe.top_k,
+        renorm: renorm.is_some(),
+    })
+}
+
+/// The bundle and geometry checks every expert op shares: its bundle is one
+/// `op_abi::CUDA_GROUPED_EXPERTS` names, and its experts and top-k the scratch's.
+fn expert_bundle(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    bundle: ExpertBundle,
+    (experts, top_k): (u32, u32),
+) -> Result<MoeTape, CanonicalRefusal> {
+    if !CUDA_GROUPED_EXPERTS.contains(&bundle) {
+        return Err(moe_refusal(s, MoeShapeRule::Bundle));
+    }
+    let moe = moe_tape(cx, s)?;
+    moe_counts(cx, s, &moe, (experts, top_k))?;
+    Ok(moe)
+}
+
+/// `ExpertSort { experts, k, bundle }`: the pairs of `x` (operand 0, `[m, hidden]`, a computed
+/// slot or the embedded hidden) sorted by the experts the routing (operand 1, the `RouteTopK`)
+/// picked. A sorted bucket's stable counting sort; a gathered bucket's no launch, its expert GEMVs
+/// reading each pair's token row of `x` directly.
+fn expert_sort(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    (experts, top_k): (u32, u32),
+    bundle: ExpertBundle,
+    computes: &[TapeStep<'_>],
+) -> Result<Option<ExpertSortBf16>, CanonicalRefusal> {
+    let moe = expert_bundle(cx, s, bundle, (experts, top_k))?;
+    let [x, _] = s.node.inputs.as_slice() else {
+        return Err(operand(s, 1, OperandRefusal::Missing));
+    };
+    moe_producer(cx, s, 1, computes, |op| {
+        matches!(op, SubOp::RouteTopK { .. })
+    })?;
+    let m = cx.tokens.unwrap_or(0);
+    same_shape(cx, s, 0, x, m, moe.hidden)?;
+    whole_tensors(cx, s, &[(0, x)])?;
+    let xc = activation(cx, s, 0, s.inputs.iter().next())?;
+    let Some(sort) = moe.sort else {
+        return Ok(None);
+    };
+    let at = arena(cx)?;
+    Ok(Some(ExpertSortBf16 {
+        x: at(xc),
+        topk_idx: moe.topk_idx.offset,
+        chunk_hist: sort.chunk_hist.offset,
+        counts: sort.counts.offset,
+        offsets: sort.offsets.offset,
+        tile_expert: sort.tile_expert.offset,
+        pos: sort.pos.offset,
+        rows: sort.rows.offset,
+        m,
+        experts,
+        top_k,
+        hidden: moe.hidden,
+        max_tiles: moe.max_tiles,
+    }))
+}
+
+/// `ExpertMatmul { proj, n, k, weight, bundle }` over a dense bundle: every pair's `proj`
+/// projection by its expert's `[n, k]` slab of the bundle (operand 2). The gate and up read the
+/// sort's rows (operand 0, the `ExpertSort`), the down the activation's (operand 0, the
+/// `ExpertGatedAct`); operand 1 is the sort, whose picks name each pair's expert. A sorted
+/// bucket's grouped GEMM over the expert-padded tiles; a gathered bucket's expert GEMV, the gate
+/// and up reading each pair's token row of the sort's `x`.
+fn expert_matmul(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    (proj, n, top_k): (ExpertProj, u32, u32),
+    (weight, bundle): (ExpertWeight, ExpertBundle),
+    computes: &[TapeStep<'_>],
+) -> Result<CudaStep, CanonicalRefusal> {
+    if let ExpertWeight::Affine(_) = weight {
+        return Err(moe_refusal(s, MoeShapeRule::Affine));
+    }
+    let sort_op = |op: &SubOp| matches!(op, SubOp::ExpertSort { .. });
+    let sort = moe_producer(cx, s, 1, computes, sort_op)?;
+    let SubOp::ExpertSort { experts, .. } = sort.node.op else {
+        return Err(moe_refusal(s, MoeShapeRule::Routing));
+    };
+    let moe = expert_bundle(cx, s, bundle, (experts.get(), top_k))?;
+    let (projection, reads) = match proj {
+        ExpertProj::Gate => (ExpertProjection::Gate, PairRows::Token),
+        ExpertProj::Up => (ExpertProjection::Up, PairRows::Token),
+        ExpertProj::Down => (ExpertProjection::Down, PairRows::Pair),
+    };
+    let (want_n, k) = projection.n_k(moe.hidden, moe.inter);
+    if n != want_n {
+        return Err(moe_refusal(s, MoeShapeRule::Geometry));
+    }
+    let rows = match proj {
+        ExpertProj::Gate | ExpertProj::Up => moe_producer(cx, s, 0, computes, sort_op)?,
+        ExpertProj::Down => moe_producer(cx, s, 0, computes, |op| {
+            matches!(op, SubOp::ExpertGatedAct { .. })
+        })?,
+    };
+    let [_, _, w] = s.node.inputs.as_slice() else {
+        return Err(operand(s, 3, OperandRefusal::Extra));
+    };
+    whole_tensors(cx, s, &[(2, w)])?;
+    let bundle = weight_operand(cx, s, 2, s.inputs.iter().nth(2))?;
+    let (_, out) = moe.projection_regions(projection, moe.sort.map(|t| t.rows));
+    let Some(sorted) = moe.sort else {
+        if !k.is_multiple_of(GEMV_BF16_MULTIPLE) {
+            return Err(moe_refusal(s, MoeShapeRule::OffTile { dim: "k", value: k }));
+        }
+        // Gathered: the gate and up read each pair's token row, the sort's `x`; the down its own
+        // row of the activation.
+        let a = match reads {
+            PairRows::Token => {
+                let at = arena(cx)?;
+                at(activation(cx, rows, 0, rows.inputs.iter().next())?)
+            }
+            PairRows::Pair => moe.act.offset,
+        };
+        return Ok(CudaStep::ExpertGemv(ExpertGemvBf16 {
+            a,
+            rows: reads,
+            bundle,
+            proj: projection,
+            topk_idx: moe.topk_idx.offset,
+            c: out.1.offset,
+            m: cx.tokens.unwrap_or(0),
+            top_k,
+            experts: moe.experts,
+            hidden: moe.hidden,
+            inter: moe.inter,
+        }));
+    };
+    let (_, tn, tk) = GEMM_BF16_TILE;
+    for (dim, value, tile) in [("n", n, tn), ("k", k, tk)] {
+        if !value.is_multiple_of(tile) {
+            return Err(moe_refusal(s, MoeShapeRule::OffTile { dim, value }));
+        }
+    }
+    let a = match reads {
+        PairRows::Token => sorted.rows.offset,
+        PairRows::Pair => moe.act.offset,
+    };
+    Ok(CudaStep::ExpertGemm(ExpertGemmBf16 {
+        a,
+        bundle,
+        proj: projection,
+        offsets: sorted.offsets.offset,
+        tile_expert: sorted.tile_expert.offset,
+        c: out.1.offset,
+        max_tiles: moe.max_tiles,
+        experts: moe.experts,
+        hidden: moe.hidden,
+        inter: moe.inter,
+    }))
+}
+
+/// `ExpertGatedAct { act: Silu }` as the bf16 `SiluMul` over the MoE scratch's rows: `silu(gate)
+/// · up` from the gate and up projections (operands 0 and 1) into the activation rows, every row
+/// of the regions (a sorted bucket's padding rows hold `+0.0`, its rows past the live tiles stale
+/// data no step reads). Any other activation is refused.
+fn expert_gated_act(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    act: GatedAct,
+    computes: &[TapeStep<'_>],
+) -> Result<SiluMulBf16, CanonicalRefusal> {
+    if act != GatedAct::Silu {
+        return Err(moe_refusal(s, MoeShapeRule::Activation));
+    }
+    let proj_is = |p: ExpertProj| move |op: &SubOp| matches!(op, SubOp::ExpertMatmul { proj, .. } if *proj == p);
+    moe_producer(cx, s, 0, computes, proj_is(ExpertProj::Gate))?;
+    moe_producer(cx, s, 1, computes, proj_is(ExpertProj::Up))?;
+    let moe = moe_tape(cx, s)?;
+    let rows = moe.expert_rows(cx.tokens.unwrap_or(0));
+    row_shape(s, rows, moe.inter, SILU_MUL_BF16_COLS)?;
+    Ok(SiluMulBf16 {
+        gate: moe.gate.offset,
+        up: moe.up.offset,
+        out: moe.act.offset,
+        rows,
+        cols: moe.inter,
+    })
+}
+
+/// `ExpertUnsort`: no launch. The combine reads each pair's down row through the sort's `pos`
+/// (sorted) or at the pair's own row (gathered), so the rows are never put back in token order;
+/// metal elides it the same way. Its operands are checked: the down projection (operand 0) and
+/// the sort (operand 1).
+fn expert_unsort(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    computes: &[TapeStep<'_>],
+) -> Result<(), CanonicalRefusal> {
+    moe_producer(cx, s, 0, computes, |op| {
+        matches!(
+            op,
+            SubOp::ExpertMatmul {
+                proj: ExpertProj::Down,
+                ..
+            }
+        )
+    })?;
+    moe_producer(cx, s, 1, computes, |op| {
+        matches!(op, SubOp::ExpertSort { .. })
+    })?;
+    moe_tape(cx, s).map(|_| ())
+}
+
+/// `ExpertCombine { hidden, shared }`: each token's `top_k` down rows (operand 0, the
+/// `ExpertUnsort`) summed by its routing weights (operand 1, the gathered scores or their renorm)
+/// into this step's `[m, hidden]` colour. It never adds a shared expert: one the bundle has must
+/// be the DSL's own ops (the single-owner rule, metal's `shared_expert_owned`), or it is refused.
+fn expert_combine(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    hidden: u32,
+    shared: bool,
+    computes: &[TapeStep<'_>],
+) -> Result<ExpertCombineBf16, CanonicalRefusal> {
+    if shared && cx.facts.shared_expert != SharedExpertOwner::Dsl {
+        return Err(CanonicalRefusal::UndeclaredSharedExpert { step: s.step });
+    }
+    moe_producer(cx, s, 0, computes, |op| matches!(op, SubOp::ExpertUnsort))?;
+    moe_producer(cx, s, 1, computes, |op| {
+        matches!(op, SubOp::RouteGatherScores | SubOp::RouteRenorm)
+    })?;
+    let moe = moe_tape(cx, s)?;
+    let m = cx.tokens.unwrap_or(0);
+    let TensorShape { rows, cols } = cx.graph.shape(s.node.output.tensor);
+    if (rows, cols) != (m, hidden) || hidden != moe.hidden {
+        return Err(moe_refusal(s, MoeShapeRule::Geometry));
+    }
+    row_shape(s, rows, cols, ADD_BF16_COLS)?;
+    let at = arena(cx)?;
+    Ok(ExpertCombineBf16 {
+        down: moe.down.offset,
+        pos: moe.sort.map(|t| t.pos.offset),
+        scores: moe.scores.offset,
+        out: at(colour_of(cx, s.writes)),
+        m,
+        top_k: moe.top_k,
+        hidden,
+        down_rows: moe.expert_rows(m),
+    })
+}
+
+/// `GateScale` as the bf16 `routed + shared · sigmoid(g)`: `routed` and `shared` (operands 0 and
+/// 1) `[rows, cols]`, `g` (operand 2) `[rows, 1]`, each a computed slot or the embedded hidden.
+fn gate_scale(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<GateScaleBf16, CanonicalRefusal> {
+    let (r, sh, g) = match s.node.inputs.as_slice() {
+        [r, sh, g] => (r, sh, g),
+        _ => return Err(operand(s, 2, OperandRefusal::Missing)),
+    };
+    let TensorShape { rows, cols } = cx.graph.shape(s.node.output.tensor);
+    row_shape(s, rows, cols, GATE_SCALE_BF16_COLS)?;
+    same_shape(cx, s, 0, r, rows, cols)?;
+    same_shape(cx, s, 1, sh, rows, cols)?;
+    same_shape(cx, s, 2, g, rows, 1)?;
+    whole_tensors(cx, s, &[(0, r), (1, sh), (2, g)])?;
+    let at = arena(cx)?;
+    let mut inputs = s.inputs.iter();
+    let rc = activation(cx, s, 0, inputs.next())?;
+    let sc = activation(cx, s, 1, inputs.next())?;
+    let gc = activation(cx, s, 2, inputs.next())?;
+    Ok(GateScaleBf16 {
+        routed: at(rc),
+        shared: at(sc),
+        g: at(gc),
+        out: at(colour_of(cx, s.writes)),
+        rows,
+        cols,
+    })
+}
+
 /// The bf16 rope's shape rule, the one its launcher applies, and the table's: `rows`, `cols`,
 /// `head_dim` and `rot_dim` non-zero; `rot_dim` a multiple of [`ROPE_BF16_ROT_MULTIPLE`] and at
 /// most `head_dim`; `head_dim` a multiple of [`ROPE_BF16_HEAD_MULTIPLE`]; `cols` a whole number
@@ -1082,9 +1547,10 @@ fn gemv_shape(n: u32, k: u32) -> Result<(), GemmShapeRule> {
     Ok(())
 }
 
-/// The narrow bf16 GEMM's shape rule: `m` non-zero, `n` and `k` non-zero multiples of
-/// [`GEMM_NARROW_BF16_MULTIPLE`] (`n` at most [`GEMM_NARROW_BF16_MAX_N`], which the caller
-/// chose it by), and `m` and `k` at most `i32::MAX`.
+/// The narrow bf16 GEMM's shape rule: `m` non-zero, `k` a non-zero multiple of
+/// [`GEMM_NARROW_BF16_MULTIPLE`], `n` [`GEMM_NARROW_BF16_ONE`] or a non-zero multiple of it (`n`
+/// at most [`GEMM_NARROW_BF16_MAX_N`], which the caller chose it by), and `m` and `k` at most
+/// `i32::MAX`.
 fn gemm_narrow_shape(m: u32, n: u32, k: u32) -> Result<(), GemmShapeRule> {
     if m == 0 {
         return Err(GemmShapeRule::OffTile {
@@ -1094,6 +1560,9 @@ fn gemm_narrow_shape(m: u32, n: u32, k: u32) -> Result<(), GemmShapeRule> {
         });
     }
     for (dim, value) in [("n", n), ("k", k)] {
+        if dim == "n" && value == GEMM_NARROW_BF16_ONE {
+            continue;
+        }
         if value == 0 || !value.is_multiple_of(GEMM_NARROW_BF16_MULTIPLE) {
             return Err(GemmShapeRule::NarrowOffVector {
                 dim,

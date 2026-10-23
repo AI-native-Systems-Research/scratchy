@@ -150,6 +150,7 @@ fn tape(weight_bytes: &'static [u64]) -> CudaTape {
         rotary: None,
         kv: None,
         gdn: None,
+        moe: None,
     }
 }
 
