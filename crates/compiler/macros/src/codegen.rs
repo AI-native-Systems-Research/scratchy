@@ -16024,7 +16024,7 @@ pub fn emit_model(
                         (),
                         ::scratchy_target_metal::interpreter::metal::ForwardError,
                     > {
-                        let spec = &METAL_BUCKETS[bucket_idx];
+                        let spec = pool.bucket_spec(bucket_idx);
                         let logits_buf = &worker.arena[spec.terminal_slot as usize];
                         let hidden_buf = &worker.arena[spec.backbone_slot as usize];
                         let vocab = METAL_VOCAB_SIZE as u32;
@@ -16036,7 +16036,7 @@ pub fn emit_model(
                 pool.forward_with_tail(
                     inputs,
                     |worker, bucket_idx| {
-                        let spec = &METAL_BUCKETS[bucket_idx];
+                        let spec = pool.bucket_spec(bucket_idx);
                         use ::scratchy_target_metal::interpreter::metal::__re::MTLBuffer as _;
                         // The caller's rows of the final hidden states (an MTP head's next input),
                         // before the worker goes back to the pool and its arena is reused.
@@ -16138,8 +16138,7 @@ pub fn emit_model(
                 ) -> &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
                     dyn ::scratchy_forward_compiler::metal_followup_reexports::MTLBuffer,
                 > {
-                    let spec = &METAL_BUCKETS[self.0.bucket_idx()];
-                    &self.0.worker().arena[spec.backbone_slot as usize]
+                    &self.0.worker().arena[self.0.bucket_spec().backbone_slot as usize]
                 }
 
                 fn logits(
@@ -16147,8 +16146,7 @@ pub fn emit_model(
                 ) -> &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
                     dyn ::scratchy_forward_compiler::metal_followup_reexports::MTLBuffer,
                 > {
-                    let spec = &METAL_BUCKETS[self.0.bucket_idx()];
-                    &self.0.worker().arena[spec.terminal_slot as usize]
+                    &self.0.worker().arena[self.0.bucket_spec().terminal_slot as usize]
                 }
 
                 fn vocab(&self) -> u32 {
@@ -16192,8 +16190,7 @@ pub fn emit_model(
                 let bucket_idx = pool
                     .pick_bucket_for(inputs)
                     .map_err(|e| format!("MetalWorkerPool::pick_bucket_for: {e}"))?;
-                let terminal_slot =
-                    METAL_BUCKETS[bucket_idx].terminal_slot as usize;
+                let terminal_slot = pool.bucket_spec(bucket_idx).terminal_slot as usize;
                 let vocab = METAL_VOCAB_SIZE as u32;
 
                 pool.with_chain_encoder(
