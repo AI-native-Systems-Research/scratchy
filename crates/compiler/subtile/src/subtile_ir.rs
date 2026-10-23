@@ -1378,11 +1378,7 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
 /// flow, and the load-time table staging, so no two of them can disagree.
 pub fn argmax_pad_vocab(vocab: u32) -> u32 {
     let pad = vocab.max(1).next_power_of_two();
-    if pad == vocab {
-        pad * 2
-    } else {
-        pad
-    }
+    if pad == vocab { pad * 2 } else { pad }
 }
 
 /// The greedy token pick's stick width — the idx stick's own lane count and the
