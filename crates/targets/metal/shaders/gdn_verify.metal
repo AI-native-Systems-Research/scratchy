@@ -136,6 +136,8 @@ template <typename T>
   if (seq_len <= 0 || slot < 0) {
     return;
   }
+  // A bucket's rows bound every sequence's (`cu_seqlens` spans at most the bucket), so this is
+  // `seq_len`; the min keeps the threadgroup arrays' row index in bounds regardless.
   const uint rows = min(uint(seq_len), ROWS);
   const uint code = gdn_step[n];
   const uint start = code & 0xffu;
