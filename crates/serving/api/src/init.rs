@@ -1800,6 +1800,10 @@ pub fn initialize_stack(
         config.chat_template.as_deref(),
     )?;
     engine.set_generation_defaults(load_generation_defaults(core.model_dir.as_deref()));
+    // The backend's sampling limit, checked as each request is submitted.
+    if let Some(backend) = scratchy_serving_engine::worker_factory::factory_for(&config.device) {
+        engine.set_sampling_check(backend);
+    }
     if !config.disable_async_scheduling && !speculation.requires_sync() {
         engine.set_async_scheduling(true);
     }

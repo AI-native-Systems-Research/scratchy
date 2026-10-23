@@ -276,6 +276,28 @@ fn the_factory_claims_cuda_and_auto() {
     assert!(NO_NVCC.contains("--features nvcc,model/<stem>"));
 }
 
+/// The factory states the greedy-only limit to the engine, which checks it when a request is
+/// submitted: non-greedy sampling is refused there, before scheduling, with the worker's message.
+#[test]
+fn the_factory_reports_the_greedy_only_limit() {
+    let f = CudaWorkerFactory;
+    assert_eq!(f.check_sampling(&greedy()), Ok(()));
+    let hot = SamplingParams {
+        temperature: 0.7,
+        ..greedy()
+    };
+    let msg = f.check_sampling(&hot).unwrap_err();
+    assert_eq!(
+        msg,
+        PlanError::NotGreedy { temperature: 0.7 }.to_string(),
+        "the worker's own message"
+    );
+    assert!(msg.contains("--temperature 0"), "{msg}");
+    let found = scratchy_serving_engine::worker_factory::factory_for("cuda")
+        .expect("a registered factory claims --device cuda");
+    assert!(found.check_sampling(&hot).is_err(), "the registered one");
+}
+
 /// The factory is in the neutral registry `create_worker` walks.
 #[test]
 fn the_factory_is_registered() {

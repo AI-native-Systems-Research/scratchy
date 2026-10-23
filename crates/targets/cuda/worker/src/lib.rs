@@ -22,7 +22,7 @@ pub mod plan;
 #[cfg(feature = "nvcc")]
 mod serving;
 
-use scratchy_core_common::KvBlockTokens;
+use scratchy_core_common::{KvBlockTokens, SamplingParams};
 use scratchy_serving_engine::worker_factory::{
     ProgressCallback, WorkerCreateConfig, WorkerCreationResult, WorkerFactory,
 };
@@ -62,6 +62,12 @@ impl WorkerFactory for CudaWorkerFactory {
     /// scheduler's `slot = block_id * block_size + offset` must address too.
     fn required_block_size(&self) -> Option<KvBlockTokens> {
         KvBlockTokens::new(CUDA_KV_BLOCK_SIZE as usize)
+    }
+
+    /// Greedy only ([`plan::check_sampling`]): the engine refuses anything else when the request
+    /// is submitted, so the scheduler never admits it.
+    fn check_sampling(&self, params: &SamplingParams) -> Result<(), String> {
+        plan::check_sampling(Some(params)).map_err(|e| e.to_string())
     }
 }
 

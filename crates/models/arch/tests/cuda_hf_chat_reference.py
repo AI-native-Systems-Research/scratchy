@@ -9,7 +9,9 @@ renders it), it runs `--steps` greedy steps of `Qwen3_5ForConditionalGeneration`
 float32, each a fresh full forward (no cache) of the ids so far. It never stops early, so every
 prompt has `--steps` tokens; the compare decides where a stop would have ended each side. At each
 step it also records the float32 top-1 minus top-2 margin, and how far a bfloat16 forward of the
-same ids lands from the float32 one on that row (`bf16_max_err`): the near-tie yardstick.
+same ids lands from the float32 one on that row (`bf16_max_err`): the near-tie yardstick. It
+also runs HF-bf16's own `--steps` greedy tokens on the same ids (`bf16_tokens`), so the compare can
+show where a bf16 forward alone already departs from float32.
 
 The stop ids each side honours are recorded with the reason, because they differ for this
 checkpoint:
@@ -187,8 +189,26 @@ def main():
             seq.append(token)
         tokens = [s["token"] for s in steps]
         reply = tok.decode(tokens, skip_special_tokens=True)
-        out["prompts"].append({"prompt": p, "text": text, "ids": ids, "steps": steps, "reply": reply})
+        # HF-bf16's own greedy run on the same ids, the same fresh full forwards: the yardstick for
+        # how far a bf16 forward of these weights strays from the float32 one, token by token.
+        seq16, bf16_tokens = list(ids), []
+        for _ in range(args.steps):
+            token = int(torch.argmax(last_row(models["bf16"], seq16)))
+            bf16_tokens.append(token)
+            seq16.append(token)
+        out["prompts"].append(
+            {
+                "prompt": p,
+                "text": text,
+                "ids": ids,
+                "steps": steps,
+                "reply": reply,
+                "bf16_tokens": bf16_tokens,
+                "bf16_reply": tok.decode(bf16_tokens, skip_special_tokens=True),
+            }
+        )
         print(f"prompt {p}: {len(ids)} ids, tokens {tokens}, reply {reply!r}", flush=True)
+        print(f"prompt {p}: HF-bf16 tokens {bf16_tokens}", flush=True)
     with open(args.out, "w") as f:
         json.dump(out, f, indent=1)
 

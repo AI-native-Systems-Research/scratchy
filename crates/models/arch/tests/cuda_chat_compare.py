@@ -31,6 +31,10 @@ THE NEAR-TIE RULE (#816 P5): at most one of the five prompts may diverge before 
 whose float32 top-1 minus top-2 margin is below twice that step's bfloat16 max error, and the text
 before the divergence must match.
 
+THE YARDSTICK (evidence for that rule, no verdict): when the reference carries HF-bf16's own greedy
+tokens, each chat prompt also prints where HF-bf16 departs from HF-f32, and where CUDA departs from
+HF-f32 and from HF-bf16 (CUDA's tokens need `VLLM_PRINT_TOKEN_IDS=1` on the `scr chat` run).
+
 Needs `transformers` (the tokenizer only) and the standard library.
 """
 
@@ -117,6 +121,42 @@ def compare(name, ref, got_text, got_tokens=None):
     return j
 
 
+def first_diff(a, b):
+    """The first index where `a` and `b` differ, or None when the shorter is a prefix of the longer."""
+    return next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), None)
+
+
+def text_diff(tok, got_text, tokens):
+    """From text alone: the first step j whose decoded tokens[:j+1] no longer prefix `got_text`,
+    or None when all of `tokens` do."""
+    got = got_text.strip()
+    j = 0
+    while j < len(tokens) and got.startswith(tok.decode(tokens[: j + 1], skip_special_tokens=True).strip()):
+        j += 1
+    return None if j == len(tokens) else j
+
+
+def yardstick(name, entry, got_tokens, ref, got_text=None):
+    """Evidence only, no verdict: where HF-bf16 departs from HF-f32 on this prompt, and where CUDA
+    departs from each. Printed per prompt when the reference has `bf16_tokens`."""
+    bf16 = entry.get("bf16_tokens")
+    if bf16 is None:
+        return
+    f32 = ref.tokens
+    show = lambda d: "none" if d is None else f"step {d}"  # noqa: E731
+    line = f"    yardstick {name}: HF-bf16 vs HF-f32 {show(first_diff(bf16, f32))}"
+    if got_tokens is not None:
+        line += (f"; CUDA vs HF-f32 {show(first_diff(got_tokens, f32))}"
+                 f"; CUDA vs HF-bf16 {show(first_diff(got_tokens, bf16))}")
+    elif got_text is not None:
+        line += (f"; CUDA vs HF-f32 {show(text_diff(ref.tok, got_text, f32))}"
+                 f"; CUDA vs HF-bf16 {show(text_diff(ref.tok, got_text, bf16))} (from the text)")
+    else:
+        line += "; CUDA's tokens not logged (run with VLLM_PRINT_TOKEN_IDS=1)"
+    print(line)
+    print(f"      HF-bf16 tokens {bf16}")
+
+
 def judge(cases):
     """`cases`: (name, ref, divergence) per prompt. Applies the near-tie rule."""
     diverged = [(n, r, d) for n, r, d in cases if d is not None]
@@ -160,6 +200,7 @@ def mode_chat(args, chat, tok):
             report(f"chat prompt {p}", False, "no `Using model:` line in the log")
             continue
         cases.append((f"chat prompt {p} (--device cuda)", ref, compare(f"chat {p}", ref, text, tokens)))
+        yardstick(f"chat {p}", entry, tokens, ref, text)
     judge(cases)
     ref = Ref(tok, chat["prompts"][0]["steps"], chat["stop_ids"])
     text, tokens = reply_of(os.path.join(args.logs, "chatauto.log"))
@@ -233,6 +274,7 @@ def mode_serve(args, chat, tok):
         msg = body["choices"][0]["message"]
         print(f"    reasoning field: {msg.get('reasoning_content') or msg.get('reasoning')!r}")
         d = compare("chat/completions 1", ref, msg.get("content") or "")
+        yardstick("chat/completions 1", entry, None, ref, msg.get("content") or "")
         report("/v1/chat/completions prompt 1", d is None, "matches" if d is None else f"diverges at {d}")
     # 4. Two at once.
     got = {}
