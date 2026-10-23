@@ -21,13 +21,17 @@
 //! ScalarMul and gemma's TanhSoftCap are walked through, exactly where they sit
 //! in the real tails.
 //!
-//! ⭐ THE TWO RANGE LAWS (#813 review), pinned from both sides at real vocabs:
-//! the staged bramp/binc carry BLOCK NUMBERS as fp16, exact only to 2048 — a
-//! vocab past that (gemma-4/nemotron's 262144) would collide adjacent block
-//! numbers and answer the LATER block, a silent wrong token; and a POWER-OF-TWO
-//! vocab (262144, mistral-nemo's 131072) has no pad lane, so the all-NaN
-//! sentinel has nowhere to live. Both refuse here and the model keeps the host
-//! argmax; the boundary case (NB exactly 2048, one pad lane) still admits.
+//! ⭐ THE TWO RANGE LAWS, RESTATED FOR THE TWO-LEVEL RAMP (08c4485ee): the
+//! staged tables carry SMALL integers as fp16 — the periodic block ramp and
+//! the lane tables top out at 64, and only the GROUP ramp grows with the
+//! vocab — so the gate bounds the GROUP COUNT (`G = PAD_V / 4096 ≤ 2048`),
+//! not the flat block count; and the pad round-up is STRICT (a power-of-two
+//! vocab pads to twice itself: 262144 → 524288), so pad lanes always exist
+//! and mistral-nemo's 131072 ADMITS where the flat ramp's pad-lane law
+//! refused it. Both pinned from both sides at real vocabs: gemma-4's 262144
+//! and mistral-nemo's 131072 admit through the strict round-up, a vocab past
+//! the group range (G > 2048) does not, and the boundary (G exactly 2048)
+//! still admits.
 //!
 //! No device, no emulator session: these are pure facts of the graph, so the
 //! file runs at default features.
@@ -169,38 +173,46 @@ fn tail_at(vocab: u32) -> bool {
 }
 
 #[test]
-fn a_vocab_past_the_fp16_block_range_does_not_admit() {
-    // 200000 rounds to PAD_V 262144 with NB 4096 > 2048 while PAD_V != V, so ONLY
-    // the block-range law refuses here — fp16's exact-integer range ends at 2048
-    // (spacing 2 above it), and the staged bramp/binc would collide adjacent
-    // block numbers into a silently later-block answer. gemma-4/nemotron's
-    // 262144 violates this AND the pad-lane law; this case isolates the range law.
+fn a_vocab_past_the_group_range_does_not_admit() {
+    // 8388609 rounds to PAD_V 16777216 with G 4096 > 2048 while a pad lane
+    // exists, so ONLY the group-range law refuses here — the two-level ramp
+    // keeps the block and lane tables at 64 and only the GROUP ramp grows
+    // with the vocab, so fp16's exact-integer range (it ends at 2048, spacing
+    // 2 above it) bounds the GROUP COUNT, not the block count: past it the
+    // staged gramp/ginc would collide adjacent group numbers into a silently
+    // later-group answer.
     assert!(
-        !tail_at(200_000),
-        "a vocab baking NB > 2048 does not mint — the staged block numbers leave fp16's \
+        !tail_at(8_388_609),
+        "a vocab baking G > 2048 does not mint — the staged group numbers leave fp16's \
          exact-integer range and the model keeps the host argmax"
     );
 }
 
 #[test]
-fn a_power_of_two_vocab_does_not_admit() {
-    // mistral-nemo's 131072: NB is exactly 2048 (in range) but PAD_V == V — there
-    // is no pad lane, padoff is all zeros, and an all-NaN row answers lane 0 while
-    // the host reference answers the sentinel. The pad-lane law refuses alone here.
+fn a_power_of_two_vocab_pads_strictly_up_and_admits() {
+    // mistral-nemo's 131072 and gemma-4's 262144: `argmax_pad_vocab` rounds a
+    // power-of-two vocab STRICTLY UP to twice itself (131072 → 262144,
+    // 262144 → 524288), so pad lanes exist by construction and the all-NaN
+    // sentinel always has somewhere to live — the flat ramp's pad-lane
+    // refusal is gone, deliberately (08c4485ee's strict round-up).
     assert!(
-        !tail_at(131_072),
-        "a power-of-two vocab has no pad lane, so the all-NaN sentinel law has nowhere to \
-         live — the model keeps the host argmax"
+        tail_at(131_072),
+        "a power-of-two vocab pads strictly up to twice itself and admits — the pad lanes \
+         exist by construction"
+    );
+    assert!(
+        tail_at(262_144),
+        "gemma-4's own vocab admits — PAD_V 524288, NB 8192, G 128, every staged lane ≤ 128"
     );
 }
 
 #[test]
 fn the_widest_in_range_vocab_still_admits() {
-    // 131071 rounds to PAD_V 131072: NB is exactly 2048 and one pad lane exists —
-    // the boundary case on the ADMITTING side, so neither law refuses a hair early.
+    // 8388607 rounds to PAD_V 8388608: G is exactly 2048 (in range) and one
+    // pad lane exists — the boundary case on the ADMITTING side, so the
+    // group law refuses a hair past it, not a hair before.
     assert!(
-        tail_at(131_071),
-        "NB exactly 2048 with a pad lane still admits — the boundary is the law, not a \
-         margin"
+        tail_at(8_388_607),
+        "G exactly 2048 with a pad lane still admits — the boundary is the law, not a margin"
     );
 }
