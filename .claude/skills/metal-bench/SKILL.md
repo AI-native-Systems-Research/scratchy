@@ -36,7 +36,7 @@ runs everything else.
   for a published study. It's pinned (`--pin`) and goes through every
   pre-flight question in step 2.
 - A **smoke run** checks the setup: `--models gpt-oss-20b --no-scaling
-  --out-dir /tmp/metal-smoke`. Its JSON never goes on the site, so after
+  --parity --out-dir /tmp/metal-smoke`. Its JSON never goes on the site, so after
   step 4 you're done.
 
 **The rounds:** one model per class, a small one for 36 GB and a large one
@@ -219,7 +219,7 @@ Smoke run (a few minutes when the builds are cached):
 ```bash
 source ~/.venvs/mlx/bin/activate
 caffeinate -dims ./scripts/bench_metal_matrix.sh --fail-fast --unpinned --models gemma-4-26b-a4b-it \
-  --reps 1 --prime 1 --no-scaling --out-dir /tmp/metal-smoke 2>&1 | tee /tmp/metal-smoke.log
+  --reps 1 --prime 1 --no-scaling --parity --out-dir /tmp/metal-smoke 2>&1 | tee /tmp/metal-smoke.log
 echo "exit ${PIPESTATUS[0]}"
 ```
 
@@ -236,8 +236,12 @@ each token scratchy picked: one within a logit of mlx-lm's top is a near-tie
 (reasoning models' thoughts open on them), and the prompt passes as `TIE`.
 A token further behind, or more than a few near-ties, fails. A model that fails the
 gate isn't timed on any engine, because there would be no scratchy numbers
-to compare against. The gate needs mlx-lm, so it runs on every full and
-smoke run. Rules and rationale are in `docs/BENCHMARKING.md` (fairness
+to compare against. The gate needs mlx-lm, and runs wherever a comparison
+engine is timed — every full run — or wherever `--parity` forces it (the
+smoke run passes it). A scratchy-only quick run skips it — the mlx-lm side
+reloads the whole checkpoint once per gate prompt, which on the large models
+can outlast the run — and records `parity_mlx_lm: null` with `parity_skipped`
+saying why. Rules and rationale are in `docs/BENCHMARKING.md` (fairness
 rule 3).
 
 Run the command in the background, so a full run doesn't hit a shell timeout,
@@ -269,7 +273,8 @@ act on each one as it appears:
 - `BUILD FAILED`: the run stops by itself with `--fail-fast`. Go to **On a
   build failure** below.
 - `--- parity gate vs mlx-lm (blocking)`, followed by either `PARITY OK` or
-  `PARITY FAILED — not timing <stem>`. A `TIE` line, with its `token N:`
+  `PARITY FAILED — not timing <stem>` (full and `--parity` runs; a quick run
+  prints a `skipped` line instead). A `TIE` line, with its `token N:`
   lines under it, is a pass: note the gaps for the user, nothing to do. On a failure, tell the user right
   away: that model has no numbers, and with `--fail-fast` the run stops
   there (without it, it moves on and exits 1 at the end). The lines under it
@@ -386,7 +391,9 @@ hold for a run to go on the site: `AC Power`, `dirty=False`, `installed=True`
 for every engine the user meant to run, `pinned True` (each version equal to
 its pin), and every model `built=True` and `parity=True`. `parity=False`
 means the model failed the gate and has no numbers. `parity=None` on a built
-model means the gate didn't run, so its numbers were never checked. A
+model means the gate didn't run, so its numbers were never checked —
+expected on a quick run, which skips the gate for scratchy alone
+(`parity_skipped` says so). A
 `skipped` model is fine when its reason is memory. If any of these fails,
 report it and let the user decide whether the run is usable. Report the
 `commit` and `scope` lines too, but they don't fail the run on their own;
