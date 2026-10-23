@@ -78,8 +78,14 @@ fn reference(table: &[u16], ids: &[u32], hidden: usize) -> Vec<u16> {
 fn the_gather_is_bit_exact_on_every_row() {
     let device = h100();
     let mut pass = true;
-    // (vocab, hidden, rows): qwen3.5-0.8b's table at a 512-row bucket, a narrow table, one row.
-    for (vocab, hidden, rows) in [(248_320u32, 1024usize, 512usize), (37, 8, 300), (5, 64, 1)] {
+    // (vocab, hidden, rows): qwen3.5-0.8b's table and qwen3.5-9b's (2 GB) at a 512-row bucket, a
+    // narrow table, one row.
+    for (vocab, hidden, rows) in [
+        (248_320u32, 1024usize, 512usize),
+        (248_320, 4096, 512),
+        (37, 8, 300),
+        (5, 64, 1),
+    ] {
         let table = bf16_inputs(vocab as usize * hidden, 0x0816_0000 ^ u64::from(vocab));
         // 0, vocab − 1, a repeated id and a spread of the rest; the padding rows id 0, as the
         // caller pads.

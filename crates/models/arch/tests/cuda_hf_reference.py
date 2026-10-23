@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""HuggingFace transformers' qwen3.5-0.8b logits: the reference `cuda_hf_parity.rs` checks the
-CUDA forward against.
+"""HuggingFace transformers' qwen3.5 logits: the reference `cuda_hf_parity.rs` (qwen3.5-0.8b) and
+`cuda_hf_parity_9b.rs` (qwen3.5-9b) check the CUDA forward against.
 
 Runs `Qwen3_5ForConditionalGeneration` from a local checkpoint on the CPU, twice: in float32 (the
 reference) and in bfloat16 (the noise yardstick: how far a bf16 forward of the same weights lands
@@ -13,8 +13,10 @@ cannot make a false mismatch.
 
 Prompts: the first 5 lines of `--prompts`, and prompt 6, all its lines joined with a newline.
 
+`--model` names the checkpoint (`qwen3.5-0.8b` or `qwen3.5-9b`) and picks its row of `PINNED`.
+
 Writes to `--out`:
-  meta.json          checkpoint dir, revision, safetensors sha256, versions, and per prompt its
+  meta.json          model, checkpoint dir, revision, safetensors sha256, versions, and per prompt its
                      text, ids, and the bf16-vs-f32 statistics (minimum row cosine, RMS, max)
   ref_f32_<p>.bin    logits of every row, [L, vocab] float32 little-endian
   ref_bf16_<p>.bin   the same, from the bfloat16 run
@@ -24,8 +26,8 @@ Writes to `--out`:
 
 Needs only torch and transformers. The plain-torch path must be the one that runs, so this refuses
 to start when `fla`, `causal_conv1d` or `kernels` is importable. It also refuses a `--revision` other
-than `PINNED_REVISION`, and a checkpoint whose one safetensors file's sha256 is not `PINNED_SHA256`,
-before it loads anything: the goldens are of that checkpoint only.
+than the model's pinned one, and a checkpoint whose safetensors files' sha256s, sorted, are not the
+model's pinned list, before it loads anything: the goldens are of that checkpoint only.
 """
 
 import argparse
@@ -35,9 +37,26 @@ import json
 import os
 import sys
 
-PINNED_REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
-# The sha256 of the pinned revision's one safetensors file.
-PINNED_SHA256 = "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+# Per `--model`: the pinned revision, and the sorted sha256s of its safetensors files.
+PINNED = {
+    # Qwen/Qwen3.5-0.8B: one file.
+    "qwen3.5-0.8b": (
+        "2fc06364715b967f1860aea9cf38778875588b17",
+        ["04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"],
+    ),
+    # Qwen/Qwen3.5-9B: four shards, model.safetensors-0000{1,2,3,4}-of-00004.safetensors.
+    "qwen3.5-9b": (
+        "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        sorted(
+            [
+                "db6f444b43d318c92f360a13a25561a6a65b10c0631b8ed305a426dbaa6c380e",
+                "31c7d7e2dd5d207840b31cc59083c8f4c4718959149e0358c0364052bb9a0330",
+                "7ec36ba3a4176a44c3c0876ad80c56a2f70c84bf008d82e9501df642f17dadec",
+                "b62b0c4cd7e44edee103ee8f4fe225f246d5e768e07bfd5f25b63a8aa1fdd0c6",
+            ]
+        ),
+    ),
+}
 GREEDY_PROMPTS = 5
 GREEDY_STEPS = 8
 
@@ -67,15 +86,18 @@ def safetensors_files(checkpoint):
     return ["model.safetensors"]
 
 
-def refuse_unpinned(revision, shas):
-    """Exit unless `revision` is the pinned one and `shas` (file -> sha256) is one file of the
-    pinned sha256."""
-    if revision != PINNED_REVISION:
-        sys.exit(f"cuda_hf_reference: --revision {revision}; the goldens are of {PINNED_REVISION}")
-    if sorted(shas.values()) != [PINNED_SHA256]:
+def refuse_unpinned(model, revision, shas):
+    """Exit unless `revision` is `model`'s pinned one and `shas` (file -> sha256), sorted, is its
+    pinned list."""
+    pinned_revision, pinned_shas = PINNED[model]
+    if revision != pinned_revision:
+        sys.exit(
+            f"cuda_hf_reference: --revision {revision}; the {model} goldens are of {pinned_revision}"
+        )
+    if sorted(shas.values()) != pinned_shas:
         sys.exit(
             f"cuda_hf_reference: the checkpoint's safetensors sha256 are {shas}; the pinned "
-            f"revision's one file is {PINNED_SHA256}"
+            f"{model} revision's are {pinned_shas}"
         )
 
 
@@ -108,15 +130,17 @@ def write_bin(path, t):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", required=True, choices=sorted(PINNED))
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--prompts", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--revision", default=PINNED_REVISION)
+    ap.add_argument("--revision", help="default: the model's pinned revision")
     args = ap.parse_args()
+    revision = args.revision or PINNED[args.model][0]
     refuse_kernel_packages()
     files = safetensors_files(args.checkpoint)
     shas = {f: sha256(os.path.join(args.checkpoint, f)) for f in files}
-    refuse_unpinned(args.revision, shas)
+    refuse_unpinned(args.model, revision, shas)
 
     import torch
     import transformers
@@ -131,8 +155,9 @@ def main():
         m.eval()
         models[name] = m
     meta = {
+        "model": args.model,
         "checkpoint": os.path.abspath(args.checkpoint),
-        "revision": args.revision,
+        "revision": revision,
         "safetensors_sha256": shas,
         "torch": torch.__version__,
         "transformers": transformers.__version__,

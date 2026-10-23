@@ -79,15 +79,18 @@ jobs:
 
       # The CUDA scaffold: no nvcc, no GPU. Lints the target crates and the
       # macro under `cuda`, runs the lowering tests, and expands qwen3.5-0.8b
-      # (the one model `CUDA_CAPABLE` builds today) to its static CUDA tapes,
-      # checked against what CUDA's compiler lowers.
+      # and qwen3.5-9b (`qwen3.5-9b-text-only`: the bare stem selects the
+      # vision arch) to their static CUDA tapes, checked against what CUDA's
+      # compiler lowers.
       - name: CUDA scaffold (no toolchain)
         run: |
           cargo clippy -p scratchy-target-cuda -p scratchy-target-cuda-compiler --all-targets -- -D warnings
           cargo clippy -p scratchy-forward-compiler-macro --features cuda -- -D warnings
           cargo clippy -p scratchy-models --features cuda,qwen3.5-0.8b --all-targets -- -D warnings
+          cargo clippy -p scratchy-models --features cuda,qwen3.5-9b-text-only --all-targets -- -D warnings
           cargo test -p scratchy-target-cuda -p scratchy-target-cuda-compiler
           cargo test -p scratchy-models --features cuda,qwen3.5-0.8b --test cuda_tapes
+          cargo test -p scratchy-models --features cuda,qwen3.5-9b-text-only --test cuda_tapes_9b
 
       # The multi-node control plane, the rank rendezvous and the channel
       # that carries `ControlMessage` to followers, is plain TCP + serde: no
