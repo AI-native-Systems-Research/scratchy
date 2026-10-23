@@ -53,6 +53,24 @@ impl Run {
             }
         }
     }
+
+    /// Mark the scaling cells whose peak memory reads below the model's own weights (#414): a
+    /// process serving them holds at least that much, so the reading can't be all of it. Done as
+    /// the run loads, so every chart and table drops the number at once ([`Cell::mem_below_weights`]).
+    pub fn mark_mem_below_weights(&mut self) {
+        for m in &mut self.models {
+            let weights = m.weights();
+            for e in Engine::ALL
+                .into_iter()
+                .filter(|e| e.serves_mlx_checkpoint())
+            {
+                for c in e.cells_mut(m) {
+                    c.mem_below_weights = (c.server_mem_peak_mib)
+                        .is_some_and(|mib| weights.is_some_and(|w| mib < w.mib()));
+                }
+            }
+        }
+    }
 }
 
 /// The only schema this page reads.
@@ -412,6 +430,11 @@ impl Bytes {
     pub fn gb(self) -> f64 {
         self.0 as f64 / 1e9
     }
+
+    /// In MiB (2²⁰ bytes), as the runner records memory.
+    pub fn mib(self) -> f64 {
+        self.0 as f64 / (1u64 << 20) as f64
+    }
 }
 
 /// Each MLX checkpoint's weights: the `.safetensors` files scratchy and mlx-lm
@@ -506,6 +529,9 @@ pub struct Cell {
     /// Whether the server it measured had stopped answering, in a run from before the bench
     /// counted that itself ([`Run::mark_dead`]).
     pub dead: bool,
+    /// Whether its peak memory reads below the model's own weights ([`Run::mark_mem_below_weights`]),
+    /// so it is no reading of the process.
+    pub mem_below_weights: bool,
 }
 
 impl Cell {
@@ -597,6 +623,7 @@ impl TryFrom<RawCell> for Cell {
             users: c.conc,
             total_output_tokens: c.total_output_tokens,
             dead: false,
+            mem_below_weights: false,
         })
     }
 }

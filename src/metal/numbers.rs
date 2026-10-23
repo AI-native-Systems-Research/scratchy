@@ -148,6 +148,20 @@ impl Engine {
         }
     }
 
+    /// Whether it serves scratchy's own MLX checkpoint, the files [`Model::weights`] measures.
+    /// ollama, llama.cpp and mistral.rs serve their own builds of the model (`served_as` names
+    /// them), so its weights say nothing about their memory.
+    pub fn serves_mlx_checkpoint(self) -> bool {
+        match self {
+            Engine::Scratchy
+            | Engine::OmlxTq
+            | Engine::Omlx
+            | Engine::MlxLm
+            | Engine::VllmMetal => true,
+            Engine::Ollama | Engine::LlamaCpp | Engine::Mistralrs => false,
+        }
+    }
+
     pub fn ladder(self, m: &Model) -> &[Rep] {
         self.fields(m).0.as_deref().unwrap_or_default()
     }
@@ -206,7 +220,7 @@ impl Metric {
             Metric::Ttft => c.median_ttft_ms,
             Metric::Tpot => c.median_tpot_ms,
             Metric::Throughput => c.output_throughput,
-            Metric::PeakMem => c.server_mem_peak_mib,
+            Metric::PeakMem => c.server_mem_peak_mib.filter(|_| !c.mem_below_weights),
         }
     }
 
@@ -270,6 +284,8 @@ pub const NO_STREAM: &str = "no stream";
 pub const PARTIAL: &str = "†";
 /// Marks any number from a cell where some requests failed.
 pub const FAILED: &str = "‡";
+/// Stands in for a peak RSS below the model's own weights ([`peak_rss`]).
+pub const BELOW_WEIGHTS: &str = "below weights";
 
 pub fn fmt(v: Option<f64>, decimals: usize) -> String {
     v.map_or_else(|| DASH.to_string(), |v| thousands_f(v, decimals))
@@ -289,6 +305,53 @@ pub fn lfmt(
         return "no first token".to_string();
     }
     fmt(v.map(|v| v * scale), decimals)
+}
+
+/// A memory reading of an engine serving a model: its MiB, below the model's own weights (so it
+/// can't be all the process holds), or not measured.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Memory {
+    Reading(f64),
+    BelowWeights,
+    NotMeasured,
+}
+
+impl Memory {
+    /// `mib` as read for engine `e` serving `m`: below its weights, for an engine that loads the
+    /// checkpoint they measure ([`Engine::serves_mlx_checkpoint`]), is not a reading.
+    pub fn of(m: &Model, e: Engine, mib: Option<f64>) -> Self {
+        match mib {
+            None => Memory::NotMeasured,
+            Some(mib) if below_weights(m, e, mib) => Memory::BelowWeights,
+            Some(mib) => Memory::Reading(mib),
+        }
+    }
+
+    /// The MiB, where it is a reading.
+    pub fn mib(self) -> Option<f64> {
+        match self {
+            Memory::Reading(mib) => Some(mib),
+            Memory::BelowWeights | Memory::NotMeasured => None,
+        }
+    }
+}
+
+/// Whether `mib` reads below `m`'s weights for an engine that loads them.
+pub fn below_weights(m: &Model, e: Engine, mib: f64) -> bool {
+    e.serves_mlx_checkpoint() && m.weights().is_some_and(|w| mib < w.mib())
+}
+
+/// An engine's median peak RSS over a model's launches of one scenario (#414).
+pub fn peak_rss(m: &Model, e: Engine, scenario: Scenario) -> Memory {
+    Memory::of(m, e, med(e.ladder(m), scenario, Startup::PeakRss))
+}
+
+/// [`peak_rss`] as text: says it reads below the weights rather than show the number.
+pub fn rss_fmt(m: &Model, e: Engine, scenario: Scenario) -> String {
+    match peak_rss(m, e, scenario) {
+        Memory::BelowWeights => BELOW_WEIGHTS.to_string(),
+        r => fmt(r.mib(), 0),
+    }
 }
 
 /// Whether scratchy produced any number for this model.
