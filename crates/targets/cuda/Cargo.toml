@@ -38,6 +38,9 @@ serde = { workspace = true }
 scratchy-layers = { path = "../../layers" }
 scratchy-tensors = { path = "../../tensors" }
 anyhow = { workspace = true }
+# The model registry (`registry`): each model's emitted tapes and weight table, submitted at link
+# time and walked by the serving worker. Plain Rust: no toolchain.
+inventory = { workspace = true }
 
 [dev-dependencies]
 # The tape tests build their fixtures with the shared lowering types and lower them with CUDA's

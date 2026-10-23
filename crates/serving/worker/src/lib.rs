@@ -39,3 +39,8 @@ pub mod threadpool;
 pub mod uniproc;
 pub mod worker;
 pub mod worker_factory;
+
+// Keep the backend worker crate linked: its `WorkerFactory` registration (`inventory::submit!`) is
+// all this crate needs of it, and nothing here names it.
+#[cfg(feature = "backend-worker")]
+extern crate backend_worker as _;

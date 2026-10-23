@@ -458,3 +458,18 @@ fn the_weight_table_names_the_checkpoints_tensors() {
         assert_eq!((b, n, k), (lm_head, VOCAB, HIDDEN), "m={m}: the lm_head");
     }
 }
+
+/// The model is in the CUDA registry exactly once, under its stem, holding the emitted tapes and
+/// weight table themselves (the same statics, not copies): what the serving worker finds it by.
+#[test]
+fn the_model_is_registered_under_its_stem() {
+    let entries: Vec<_> = scratchy_target_cuda::registry::entries().collect();
+    let stems: Vec<&str> = entries.iter().map(|e| e.stem).collect();
+    assert_eq!(stems, [STEM], "the registry");
+    let entry = entries[0];
+    assert!(std::ptr::eq(entry.tapes, CUDA_TAPES), "the entry's tapes");
+    assert!(
+        std::ptr::eq(entry.weights, CUDA_WEIGHTS),
+        "the entry's weight table"
+    );
+}

@@ -13,7 +13,8 @@
 //!   arena, input and result spans per bucket, the weights, and the KV and GDN layers; the
 //!   one-row tape the layout #830 predicted, its GEMMs GEMVs and its attention the decode kernel;
 //! - the weight table names the checkpoint's tensors: 266 entries, 18 of them GDN bundles, 320
-//!   distinct tensors, none named twice, and the tied lm_head reads the embedding table.
+//!   distinct tensors, none named twice, and the tied lm_head reads the embedding table;
+//! - the model is in the CUDA registry once, under its stem, with these very tapes and table.
 //!
 //! The tests are `common/cuda_tapes_body.rs`, shared with qwen3.5-9b's `cuda_tapes_9b.rs`; this
 //! file is the 0.8b's module and its numbers.

@@ -26,6 +26,7 @@
 
 use std::ffi::c_void;
 use std::fmt;
+use std::marker::PhantomData;
 
 use super::buffer::DeviceBuffer;
 use super::device::CudaDevice;
@@ -604,11 +605,17 @@ fn gdn_geometry(tapes: &[CudaTape]) -> Result<Option<GdnTape>, WorkerError> {
 
 /// Plays a set of tapes (one per bucket) over one arena on one stream.
 ///
+/// `W` holds the weight buffers: borrowed by default ([`Self::new`]), or owned, a
+/// `Vec<DeviceBuffer>` ([`CudaWorker::owning`]), for a caller that keeps the worker and its
+/// weights together.
+///
 /// Neither `Send` nor `Sync`: it holds raw CUDA handles. Sharing is the worker pool's decision.
-pub struct CudaWorker<'a> {
+pub struct CudaWorker<'a, W: AsRef<[DeviceBuffer]> = &'a [DeviceBuffer]> {
     tapes: &'static [CudaTape],
     /// Indexed by each step's `WeightIx`.
-    weights: &'a [DeviceBuffer],
+    weights: W,
+    /// The borrow a borrowed `W` holds.
+    borrow: PhantomData<&'a [DeviceBuffer]>,
     stream: Stream,
     arena: DeviceBuffer,
     /// The host side of the rotary table, sized once for the largest tape's: each forward with a
@@ -650,10 +657,10 @@ fn kv_geometry(tapes: &[CudaTape]) -> Result<Option<KvTape>, WorkerError> {
 }
 
 impl<'a> CudaWorker<'a> {
-    /// A worker for `tapes` reading `weights`: validates every tape ([`CudaTape::validate`]) and
-    /// checks once that every weight a tape declares is large enough, before it allocates
-    /// anything; then makes the stream and the one arena allocation, of the largest tape's
-    /// `total_bytes`.
+    /// A worker for `tapes` reading the borrowed `weights`: validates every tape
+    /// ([`CudaTape::validate`]) and checks once that every weight a tape declares is large
+    /// enough, before it allocates anything; then makes the stream and the one arena allocation,
+    /// of the largest tape's `total_bytes`.
     ///
     /// Together the two checks are what makes [`Self::forward`] safe to call with any tape: every
     /// span a step touches lies inside its tape's arena, which is at most the worker's, and every
@@ -681,6 +688,34 @@ impl<'a> CudaWorker<'a> {
         kv_pool: Option<KvPoolConfig>,
         gdn_pool: Option<GdnPoolConfig>,
     ) -> Result<Self, WorkerError> {
+        Self::build(device, tapes, weights, kv_pool, gdn_pool)
+    }
+}
+
+impl CudaWorker<'static, Vec<DeviceBuffer>> {
+    /// A worker for `tapes` that owns `weights`, the buffers `load_weights` made: the same
+    /// checks and allocations as [`CudaWorker::new`].
+    pub fn owning(
+        device: &CudaDevice,
+        tapes: &'static [CudaTape],
+        weights: Vec<DeviceBuffer>,
+        kv_pool: Option<KvPoolConfig>,
+        gdn_pool: Option<GdnPoolConfig>,
+    ) -> Result<Self, WorkerError> {
+        Self::build(device, tapes, weights, kv_pool, gdn_pool)
+    }
+}
+
+impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
+    /// The one constructor behind [`CudaWorker::new`] and [`CudaWorker::owning`], which
+    /// differ only in how they hold `weights`.
+    fn build(
+        device: &CudaDevice,
+        tapes: &'static [CudaTape],
+        weights: W,
+        kv_pool: Option<KvPoolConfig>,
+        gdn_pool: Option<GdnPoolConfig>,
+    ) -> Result<Self, WorkerError> {
         for (bucket, tape) in tapes.iter().enumerate() {
             tape.validate()
                 .map_err(|error| WorkerError::Tape { bucket, error })?;
@@ -690,7 +725,7 @@ impl<'a> CudaWorker<'a> {
                 if need == 0 {
                     continue;
                 }
-                let have = weights
+                let have = (weights.as_ref())
                     .get(ix)
                     .ok_or(WorkerError::MissingWeight { ix, need })?
                     .bytes();
@@ -773,6 +808,7 @@ impl<'a> CudaWorker<'a> {
         Ok(Self {
             tapes,
             weights,
+            borrow: PhantomData,
             stream,
             arena,
             rotary_host: vec![0; rotary_elements],
@@ -1006,7 +1042,7 @@ impl<'a> CudaWorker<'a> {
         let enqueued = Self::enqueue(
             &self.stream,
             &self.arena,
-            self.weights,
+            self.weights.as_ref(),
             (self.kv.as_ref(), self.gdn.as_ref()),
             tape,
             Uploads {

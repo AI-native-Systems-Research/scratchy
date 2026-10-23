@@ -12,7 +12,8 @@
 //!   and its attention the decode kernel;
 //! - the weight table names the checkpoint's tensors: 355 entries, 24 of them GDN bundles, 427
 //!   distinct tensors, none named twice. The 9b's lm_head is untied: `lm_head.weight` at its own
-//!   index 374, and nothing but the embed reads the embedding table.
+//!   index 374, and nothing but the embed reads the embedding table;
+//! - the model is in the CUDA registry once, under its stem, with these very tapes and table.
 //!
 //! The 9b builds as `qwen3.5-9b-text-only` (this binary's required feature). The bare
 //! `qwen3.5-9b` feature selects the vision architecture `qwen3-5-vl`, whose config is the same

@@ -51,6 +51,7 @@ members = [
     "crates/targets/metal/compiler",
     "crates/targets/cuda",
     "crates/targets/cuda/compiler",
+    "crates/targets/cuda/worker",
 ]
 # scratchy-tui pulls goose from git (not published to crates.io) and stands
 # entirely on its own as the `scr-tui` binary — excluded so its resolution
