@@ -5265,7 +5265,12 @@ fn lower_one(
                         ConstantValue::uint(7, bucket_m),
                         ConstantValue::uint(8, p.spec_drafts),
                     ];
-                    fused("gdn_verify", gdn_verify_static_name(dtype), &rows, p.spec_drafts > 0)
+                    fused(
+                        "gdn_verify",
+                        gdn_verify_static_name(dtype),
+                        &rows,
+                        p.spec_drafts > 0,
+                    )
                 });
             if let Some(verify) = verify {
                 return Ok(vec![verify]);

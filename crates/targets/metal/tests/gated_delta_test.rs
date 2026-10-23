@@ -1785,14 +1785,44 @@ fn gdn_verify_is_the_conv_scan_norm() {
         depth,
     };
     let cases = [
-        ((2usize, 4usize), 7u8, GdnStart::Checkpoint(2), RecordArea::First, GdnStart::Slot),
-        ((2, 2), 7, GdnStart::Checkpoint(0), RecordArea::Second, GdnStart::Fresh),
+        (
+            (2usize, 4usize),
+            7u8,
+            GdnStart::Checkpoint(2),
+            RecordArea::First,
+            GdnStart::Slot,
+        ),
+        (
+            (2, 2),
+            7,
+            GdnStart::Checkpoint(0),
+            RecordArea::Second,
+            GdnStart::Fresh,
+        ),
         // Three value heads a key head fit threadgroup memory at an MTP head's rows.
         ((2, 6), 2, GdnStart::Slot, RecordArea::First, GdnStart::Slot),
-        ((2, 4), 2, GdnStart::Checkpoint(1), RecordArea::Second, GdnStart::Slot),
-        ((2, 4), 7, GdnStart::Fresh, RecordArea::First, GdnStart::Fresh),
+        (
+            (2, 4),
+            2,
+            GdnStart::Checkpoint(1),
+            RecordArea::Second,
+            GdnStart::Slot,
+        ),
+        (
+            (2, 4),
+            7,
+            GdnStart::Fresh,
+            RecordArea::First,
+            GdnStart::Fresh,
+        ),
         // Four (Qwen3.5-122B-A10B's ratio) at an MTP head's rows.
-        ((2, 8), 2, GdnStart::Checkpoint(1), RecordArea::First, GdnStart::Slot),
+        (
+            (2, 8),
+            2,
+            GdnStart::Checkpoint(1),
+            RecordArea::First,
+            GdnStart::Slot,
+        ),
     ];
     for ((nk, nv), drafts, start, records, plain_start) in cases {
         let (key_dim, value_dim) = (nk * hk, nv * hv);
@@ -1806,7 +1836,12 @@ fn gdn_verify_is_the_conv_scan_norm() {
         let conv_lanes0 = shifted(lanes * rows.rows() * conv_slot, 29);
         let ssm_lanes0 = shifted(lanes * 2 * rows.rows() * (conv_dim + 2 * nv), 31);
         let codes = [
-            code(start, rows, records, DraftLanes::new(rows, 2).and_then(|l| l.lanes().nth(1))),
+            code(
+                start,
+                rows,
+                records,
+                DraftLanes::new(rows, 2).and_then(|l| l.lanes().nth(1)),
+            ),
             code(plain_start, CheckpointRows::NONE, records, None),
         ];
         let qkv = shifted(t * conv_dim, 7);
@@ -1855,10 +1890,20 @@ fn gdn_verify_is_the_conv_scan_norm() {
         let conv = build("gdn_conv1d_varlen", "gdn_conv1d_varlen_f32", conv_consts);
         let conv_out = buf_zero_f32(&device, t * conv_dim);
         let (chain_conv, chain_ssm) = (buf_f32(&device, &conv0), buf_ssm(&device, &ssm0));
-        let (chain_conv_lanes, chain_ssm_lanes) =
-            (buf_f32(&device, &conv_lanes0), buf_f32(&device, &ssm_lanes0));
+        let (chain_conv_lanes, chain_ssm_lanes) = (
+            buf_f32(&device, &conv_lanes0),
+            buf_f32(&device, &ssm_lanes0),
+        );
         let bufs = vec![
-            &conv_out, &qkv_buf, &w_buf, &chain_conv, &cu, &si, &step, &unread, &chain_conv_lanes,
+            &conv_out,
+            &qkv_buf,
+            &w_buf,
+            &chain_conv,
+            &cu,
+            &si,
+            &step,
+            &unread,
+            &chain_conv_lanes,
         ];
         let grid = size(2, conv_dim.div_ceil(256), 1);
         if !common::dispatch_threadgroups(&device, &conv, &bufs, grid, size(1, 256, 1)) {
@@ -1897,8 +1942,13 @@ fn gdn_verify_is_the_conv_scan_norm() {
         let norm = build("gdn_rms_norm_gated", "gdn_rms_norm_gated_f32", norm_consts);
         let chain_out = buf_zero_f32(&device, t * value_dim);
         let bufs = [&chain_out, &o, &z_buf, &norm_buf];
-        if !common::dispatch_threadgroups(&device, &norm, &bufs, size(t * nv, 1, 1), size(256, 1, 1))
-        {
+        if !common::dispatch_threadgroups(
+            &device,
+            &norm,
+            &bufs,
+            size(t * nv, 1, 1),
+            size(256, 1, 1),
+        ) {
             return;
         }
 
@@ -1913,8 +1963,10 @@ fn gdn_verify_is_the_conv_scan_norm() {
         let verify = build("gdn_verify", "gdn_verify_f32", consts);
         let out = buf_zero_f32(&device, t * value_dim);
         let (conv_state, ssm) = (buf_f32(&device, &conv0), buf_ssm(&device, &ssm0));
-        let (conv_lanes, ssm_lanes) =
-            (buf_f32(&device, &conv_lanes0), buf_f32(&device, &ssm_lanes0));
+        let (conv_lanes, ssm_lanes) = (
+            buf_f32(&device, &conv_lanes0),
+            buf_f32(&device, &ssm_lanes0),
+        );
         let bufs = [
             &out,
             &qkv_buf,
@@ -1964,7 +2016,14 @@ fn gdn_verify_is_the_conv_scan_norm() {
             read_f32(&chain_conv_lanes, conv_lanes0.len()),
             "conv checkpoints, {geometry}"
         );
-        close("records", read_f32, &ssm_lanes, &chain_ssm_lanes, ssm_lanes0.len(), 1e-6);
+        close(
+            "records",
+            read_f32,
+            &ssm_lanes,
+            &chain_ssm_lanes,
+            ssm_lanes0.len(),
+            1e-6,
+        );
         // The ssm entries are stored f16: the f32 registers agree to f32 rounding, and the
         // store rounds each to the same half but where the two straddle a rounding boundary.
         close("ssm state", read_ssm, &ssm, &chain_ssm, ssm0.len(), 1e-3);
@@ -1975,8 +2034,16 @@ fn gdn_verify_is_the_conv_scan_norm() {
         // The step moved the state and the lanes and wrote every output: agreeing on untouched
         // buffers would pass the comparisons above by accident.
         assert_ne!(read_ssm(&ssm, ssm0.len()), ssm0, "{geometry}");
-        assert_ne!(read_f32(&ssm_lanes, ssm_lanes0.len()), ssm_lanes0, "{geometry}");
-        assert_ne!(read_f32(&conv_lanes, conv_lanes0.len()), conv_lanes0, "{geometry}");
+        assert_ne!(
+            read_f32(&ssm_lanes, ssm_lanes0.len()),
+            ssm_lanes0,
+            "{geometry}"
+        );
+        assert_ne!(
+            read_f32(&conv_lanes, conv_lanes0.len()),
+            conv_lanes0,
+            "{geometry}"
+        );
         assert!(
             read_f32(&out, t * value_dim).iter().all(|v| *v != 0.0),
             "{geometry}"
