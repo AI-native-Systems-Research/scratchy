@@ -42,13 +42,24 @@ scr must give HF's first k tokens exactly; past k it may stop (a stop it honours
 does not), and only the first k are compared. Per prompt it prints k, which stop id ended each
 side, and whether the comparison was truncated.
 
-THE NEAR-TIE RULE (#816 P5): at most one of the five prompts may diverge before k, only at a step
-whose float32 top-1 minus top-2 margin is below twice that step's bfloat16 max error, and the text
-before the divergence must match.
+THE DIVERGENCE RULE. Each prompt is judged on its own; there is no cap on how many may diverge.
+A prompt that diverges from HF-f32 before k PASSES, reported as accepted with its reason, when
+either holds:
+  * HF-bf16: CUDA's reply equals HF-bf16's own greedy reply over the same compared span (the first
+    k tokens, and token k too when that is where they part; by ids when the run logs them, else by
+    the decoded text). A bf16 forward lands there too, so the divergence is bf16 rounding, not the
+    kernels. Needs the reference's `bf16_tokens` (the chat reference has them; the
+    `/v1/completions` goldens do not).
+  * near-tie (#816 P5): the first divergent step's float32 top-1 minus top-2 margin is below twice
+    that step's bfloat16 max error, the text before it matching.
+Any other divergence FAILS, and so do the failures that are not a divergence (scr running past a
+stop it honours, or its text past the reference). Every divergence prints its step, margin, bf16
+max error and both answers. The input-id check above stays a hard precondition: a prompt whose ids
+differ is a FAIL and is not compared.
 
-THE YARDSTICK (evidence for that rule, no verdict): when the reference carries HF-bf16's own greedy
-tokens, each chat prompt also prints where HF-bf16 departs from HF-f32, and where CUDA departs from
-HF-f32 and from HF-bf16 (CUDA's tokens need `VLLM_PRINT_TOKEN_IDS=1` on the `scr chat` run).
+THE YARDSTICK: when the reference carries HF-bf16's own greedy tokens, each chat prompt also prints
+where HF-bf16 departs from HF-f32, and where CUDA departs from HF-f32 and from HF-bf16 (CUDA's
+tokens need `VLLM_PRINT_TOKEN_IDS=1` on the `scr chat` run).
 
 Needs `transformers` (the tokenizer only) and the standard library.
 """
@@ -102,7 +113,7 @@ class Ref:
 
 def compare(name, ref, got_text, got_tokens=None):
     """One prompt: `None` when it matches through k, else the divergence step (an int), or
-    `False` when it differs in a way the near-tie rule cannot excuse."""
+    `False` when it differs in a way no divergence rule can accept (see the module docs)."""
     k = ref.k
     hf_end = ref.tokens[k] if k < len(ref.tokens) else None
     truncated = k < len(ref.tokens)
@@ -179,25 +190,48 @@ def yardstick(name, entry, got_tokens, ref, got_text=None):
     print(f"      HF-bf16 tokens {bf16}")
 
 
+def bf16_match(ref, entry, d, got_text, got_tokens=None):
+    """Whether CUDA's reply equals HF-bf16's own greedy reply over the compared span: the first k
+    tokens, and through the divergent step `d` when that is k itself (scr not giving HF's stop
+    there). By ids when `got_tokens` is given, else by the decoded text under `compare`'s text rule.
+    None when the reference has no `bf16_tokens` or `d` is not a divergence step."""
+    bf16 = entry.get("bf16_tokens")
+    if bf16 is None or d is None or d is False:
+        return None
+    k = ref.k
+    if got_tokens is not None:
+        span = max(k, d + 1)
+        return len(got_tokens) >= span and len(bf16) >= span and got_tokens[:span] == bf16[:span]
+    truncated = k < len(ref.tokens)
+    hf_end = ref.tokens[k] if truncated else None
+    got = got_text.strip()
+    want = ref.tok.decode(bf16[:k], skip_special_tokens=True).strip()
+    return got == want or (truncated and hf_end not in ref.scr_stops and got.startswith(want))
+
+
 def judge(cases):
-    """`cases`: (name, ref, divergence) per prompt. Applies the near-tie rule."""
-    diverged = [(n, r, d) for n, r, d in cases if d is not None]
-    for name, ref, d in cases:
+    """`cases`: (name, ref, divergence, bf16) per prompt, `bf16` [`bf16_match`]'s answer. Each
+    prompt on its own: the divergence rule (see the module docs), with no cap on how many diverge."""
+    diverged = sum(1 for _, _, d, _ in cases if d is not None)
+    for name, ref, d, bf16 in cases:
         if d is None:
             report(name, True, f"matches HF's first {ref.k} tokens")
-    if any(d is False for _, _, d in diverged):
-        for name, _, d in diverged:
-            if d is False:
-                report(name, False, "differs from HF beyond the near-tie rule")
-        return
-    for name, ref, d in diverged:
-        if d >= len(ref.steps):
-            report(name, False, f"differs at step {d}, past the reference's {len(ref.steps)} steps")
             continue
-        tie, margin, noise = ref.near_tie(d)
-        ok = tie and len(diverged) <= 1
-        report(name, ok, f"diverges at step {d}: f32 margin {margin:.4g}, bf16 max err {noise:.4g}, "
-               f"{'a near-tie' if tie else 'NOT a near-tie'} ({len(diverged)} of {len(cases)} diverge)")
+        if d is False:
+            report(name, False, "differs from HF in a way no divergence rule covers (see above)")
+            continue
+        same = {None: "not recorded", True: "yes", False: "no"}[bf16]
+        if d >= len(ref.steps):
+            why = f"differs at step {d}, past the reference's {len(ref.steps)} steps"
+            tie = False
+        else:
+            tie, margin, noise = ref.near_tie(d)
+            why = (f"diverges at step {d}: f32 margin {margin:.4g}, bf16 max err {noise:.4g}, "
+                   f"{'a near-tie' if tie else 'NOT a near-tie'}")
+        accepted = [r for r, ok in (("equals HF-bf16", bf16 is True), ("near-tie", tie)) if ok]
+        verdict = f"accepted ({', '.join(accepted)})" if accepted else "not accepted"
+        report(name, bool(accepted), f"{why}; CUDA equals HF-bf16 over the first {ref.k} tokens: "
+               f"{same}; {verdict} ({diverged} of {len(cases)} diverge)")
 
 
 def ids_of_line(pattern, lines):
@@ -262,16 +296,18 @@ def mode_chat(args, chat, tok):
             continue
         if not check_input(f"chat prompt {p}", entry["ids"], prompt_ids):
             continue
-        cases.append((f"chat prompt {p} (--device cuda)", ref, compare(f"chat {p}", ref, text, tokens)))
+        d = compare(f"chat {p}", ref, text, tokens)
+        cases.append((f"chat prompt {p} (--device cuda)", ref, d, bf16_match(ref, entry, d, text, tokens)))
         yardstick(f"chat {p}", entry, tokens, ref, text)
     judge(cases)
-    ref = Ref(tok, chat["prompts"][0]["steps"], chat["stop_ids"])
+    entry = chat["prompts"][0]
+    ref = Ref(tok, entry["steps"], chat["stop_ids"])
     text, tokens, prompt_ids, _ = read_log(os.path.join(args.logs, "chatauto.log"))
     if text is None:
         report("chat prompt 1 (no --device)", False, "no `Using model:` line in the log")
-    elif check_input("chat prompt 1 (no --device)", chat["prompts"][0]["ids"], prompt_ids):
+    elif check_input("chat prompt 1 (no --device)", entry["ids"], prompt_ids):
         d = compare("chat 1, auto", ref, text, tokens)
-        report("chat prompt 1 (no --device)", d is None, "matches" if d is None else f"diverges at {d}")
+        judge([("chat prompt 1 (no --device)", ref, d, bf16_match(ref, entry, d, text, tokens))])
 
 
 def mode_edges(args):
@@ -366,7 +402,9 @@ def mode_serve(args, chat, tok):
             report(f"/v1/completions prompt {p}", False, f"status {status}: {body}")
             continue
         texts[p] = body["choices"][0]["text"]
-        cases.append((f"/v1/completions prompt {p}", ref, compare(f"completions {p}", ref, texts[p])))
+        # The goldens carry no HF-bf16 tokens: only the near-tie rule can accept a divergence.
+        d = compare(f"completions {p}", ref, texts[p])
+        cases.append((f"/v1/completions prompt {p}", ref, d, None))
     judge(cases)
     # 3. /v1/chat/completions on prompts 1-5: their ids are the ones `/tokenize` checked.
     cases = []
@@ -385,7 +423,7 @@ def mode_serve(args, chat, tok):
         print(f"    reasoning field: {msg.get('reasoning_content') or msg.get('reasoning')!r}")
         d = compare(f"chat/completions {p}", ref, content)
         yardstick(f"chat/completions {p}", entry, None, ref, content)
-        cases.append((f"/v1/chat/completions prompt {p}", ref, d))
+        cases.append((f"/v1/chat/completions prompt {p}", ref, d, bf16_match(ref, entry, d, content)))
     judge(cases)
     # 4. Two at once.
     got = {}
