@@ -45,6 +45,8 @@ const G08: GdnDims = GdnDims {
 const G9: GdnDims = GdnDims { nv: 32, ..G08 };
 /// The chunk lengths every stage is checked at.
 const LENGTHS: [usize; 8] = [1, 2, 63, 64, 65, 300, 1024, 2048];
+/// The lengths only the 9b geometry is also checked at: qwen3.5-9b's largest prefill bucket.
+const LENGTHS_9B: [usize; 1] = [4096];
 /// Padding rows past every chunk's real rows: NaN in every input.
 const PAD: usize = 3;
 /// The pool's slots in every test.
@@ -543,18 +545,26 @@ fn name(d: GdnDims) -> &'static str {
 
 // ── Every stage at every length, both geometries, fresh ───────────
 
-/// Fresh in slot 1 of a pool NaN-poisoned everywhere: every stage within bound at every length,
-/// the padding rows unread and unwritten, and the other slots bit-unchanged.
+/// Fresh in slot 1 of a pool NaN-poisoned everywhere: every stage within bound at every length
+/// (the 9b geometry also at [`LENGTHS_9B`]), the padding rows unread and unwritten, and the other
+/// slots bit-unchanged.
 #[test]
 fn every_gdn_stage_matches_its_reference_at_every_length() {
     let device = h100();
     let mut pass = true;
-    for d in [G08, G9] {
+    for (d, extra) in [(G08, &[][..]), (G9, &LENGTHS_9B[..])] {
         let bu = bundle(d, 0x6D00);
         let bb = upload_bundle(&device, &bu);
-        let x = inputs(d, 2048, 0x6D01);
+        // A longer sequence of the same seed: its first 2048 tokens are the shorter one's.
+        let tokens = LENGTHS
+            .iter()
+            .chain(extra)
+            .copied()
+            .max()
+            .expect("a length");
+        let x = inputs(d, tokens, 0x6D01);
         let (ring, state) = zeros(d);
-        for &l in &LENGTHS {
+        for &l in LENGTHS.iter().chain(extra) {
             let pool = Pool::new(&device, d, NAN_F32);
             let before = pool.snapshot();
             let c = chunk(&x, d, 0, l, l + PAD);
@@ -1237,6 +1247,146 @@ fn every_launcher_refuses_what_it_does_not_take() {
     assert!(
         pass,
         "a launcher took a shape it must refuse, or wrote its output"
+    );
+}
+
+/// Each launcher at every zero dimension it takes, and at a count above `INT_MAX` (the 9b's
+/// geometry at a `rows` that overflows it): the launch refused before it touches a pointer, its
+/// output and the state buffer left as they were (#807).
+#[test]
+fn every_launcher_refuses_zero_dimensions_and_counts_above_int_max() {
+    let device = h100();
+    let small = |n: usize| up_f32_bits(&device, n, NAN_F32);
+    let (x, w, st, seq, out) = (
+        small(1 << 12),
+        small(1 << 12),
+        small(1 << 12),
+        small(4),
+        small(1 << 12),
+    );
+    let unchanged = |b: &DeviceBuffer| down_f32(b).iter().all(|v| v.to_bits() == NAN_F32);
+    let null = std::ptr::null_mut();
+    let mut pass = true;
+    let mut report = |what: &str, got: Result<(), KernelError>, want: KernelError| {
+        let (o, s) = (unchanged(&out), unchanged(&st));
+        let ok = got == Err(want) && o && s;
+        eprintln!(
+            "refused {what}: {got:?} output_unchanged={o} state_unchanged={s} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    };
+    let (cd9, nv9) = (G9.conv_dim() as u32, G9.nv as u32);
+    // The conv: no rows, no channels, and `rows · conv_dim` = 2¹⁸ · 8192 = 2³¹.
+    for (rows, cd) in [(0u32, cd9), (4, 0), (1 << 18, cd9)] {
+        let se = u64::from(cd) * 3;
+        // SAFETY: the launcher refuses each shape before it touches a pointer.
+        let got = unsafe {
+            gdn_conv1d(
+                (x.ptr(), w.ptr()),
+                (st.ptr(), se),
+                seq.ptr(),
+                out.ptr(),
+                (rows, cd, 4),
+                null,
+            )
+        };
+        report(
+            &format!("conv1d rows={rows} conv_dim={cd} kernel=4 slot_elems={se}"),
+            got,
+            KernelError::GdnConvShape {
+                rows,
+                conv_dim: cd,
+                kernel: 4,
+            },
+        );
+    }
+    // The gating: no rows, no heads, and `rows · nv` = 2²⁶ · 32 = 2³¹.
+    for (rows, nv) in [(0u32, nv9), (4, 0), (1 << 26, nv9)] {
+        // SAFETY: as above.
+        let got = unsafe {
+            gdn_gating(
+                (x.ptr(), x.ptr()),
+                (w.ptr(), w.ptr()),
+                seq.ptr(),
+                (out.ptr(), out.ptr()),
+                (rows, nv),
+                null,
+            )
+        };
+        report(
+            &format!("gating rows={rows} nv={nv}"),
+            got,
+            KernelError::GdnGatingShape { rows, nv },
+        );
+    }
+    // The scan: no rows, no key heads, no value heads, a zero head_v, and `rows · conv_dim` =
+    // 2¹⁸ · 8192 = 2³¹ in the 9b's geometry.
+    let scale = gdn_scale(128);
+    for (rows, nk, nv, hv) in [
+        (0u32, 16u32, nv9, 128u32),
+        (4, 0, nv9, 128),
+        (4, 16, 0, 128),
+        (4, 16, nv9, 0),
+        (1 << 18, 16, nv9, 128),
+    ] {
+        let se = u64::from(nv) * u64::from(hv) * 128;
+        // SAFETY: as above.
+        let got = unsafe {
+            gdn_scan(
+                (x.ptr(), x.ptr(), x.ptr()),
+                (st.ptr(), se),
+                seq.ptr(),
+                out.ptr(),
+                (rows, nk, nv),
+                (128, hv, scale),
+                null,
+            )
+        };
+        report(
+            &format!("scan rows={rows} nk={nk} nv={nv} head_v={hv} slot_elems={se}"),
+            got,
+            KernelError::GdnScanShape {
+                rows,
+                nk,
+                nv,
+                head_k: 128,
+                head_v: hv,
+            },
+        );
+    }
+    // The gated norm: no rows, no heads, a zero head_v, and `rows · nv · head_v` = 2¹⁹ · 32 · 128
+    // = 2³¹.
+    for (rows, nv, hv) in [
+        (0u32, nv9, 128u32),
+        (4, 0, 128),
+        (4, nv9, 0),
+        (1 << 19, nv9, 128),
+    ] {
+        // SAFETY: as above.
+        let got = unsafe {
+            gdn_rms_norm_gated(
+                (x.ptr(), x.ptr(), w.ptr()),
+                seq.ptr(),
+                out.ptr(),
+                (rows, nv, hv),
+                EPS,
+                null,
+            )
+        };
+        report(
+            &format!("gated norm rows={rows} nv={nv} head_v={hv}"),
+            got,
+            KernelError::GdnNormShape {
+                rows,
+                nv,
+                head_v: hv,
+            },
+        );
+    }
+    assert!(
+        pass,
+        "a launcher took a zero dimension or a count above INT_MAX, or wrote its output"
     );
 }
 

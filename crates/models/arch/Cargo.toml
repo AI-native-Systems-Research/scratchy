@@ -825,3 +825,17 @@ required-features = ["nvcc", "qwen3.5-0.8b"]
 name = "cuda_hf_parity"
 required-features = ["nvcc", "qwen3.5-0.8b"]
 
+# The same three for qwen3.5-9b, sharing their bodies with the 0.8b's (tests/common/). The 9b is
+# `qwen3.5-9b-text-only`: the bare `qwen3.5-9b` feature selects the vision arch `qwen3-5-vl`.
+[[test]]
+name = "cuda_tapes_9b"
+required-features = ["cuda", "qwen3.5-9b-text-only"]
+
+[[test]]
+name = "cuda_prefill_9b"
+required-features = ["nvcc", "qwen3.5-9b-text-only"]
+
+[[test]]
+name = "cuda_hf_parity_9b"
+required-features = ["nvcc", "qwen3.5-9b-text-only"]
+

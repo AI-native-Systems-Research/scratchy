@@ -436,8 +436,9 @@ fn an_output_row_does_not_depend_on_where_its_input_row_sits() {
 
 /// `(n, k)` for the GEMV: every qwen3.5-0.8b decode shape (the q projection with its gate, k and
 /// v, the attention's o and the GDN out projection, the MLP's gate/up and down, the GDN QKV and z
-/// projections, the lm_head), then grid tails: one CTA of 8 columns, three warps of one CTA, a
-/// partial last CTA with a `k` of 9 vectors (a lane takes 0 or 1), and one column.
+/// projections, the lm_head), every qwen3.5-9b one (the same projections at hidden 4096 and
+/// intermediate 12288), then grid tails: one CTA of 8 columns, three warps of one CTA, a partial
+/// last CTA with a `k` of 9 vectors (a lane takes 0 or 1), and one column.
 const GEMV_SHAPES: &[(u32, u32, &str)] = &[
     (4096, 1024, "q_proj with its gate"),
     (512, 1024, "k_proj / v_proj"),
@@ -447,6 +448,12 @@ const GEMV_SHAPES: &[(u32, u32, &str)] = &[
     (6144, 1024, "the GDN in_proj_qkv"),
     (2048, 1024, "the GDN in_proj_z"),
     (248_320, 1024, "the lm_head"),
+    (1024, 4096, "9b: k_proj / v_proj"),
+    (4096, 4096, "9b: o_proj, the GDN in_proj_z and out_proj"),
+    (8192, 4096, "9b: q_proj with its gate, the GDN in_proj_qkv"),
+    (12288, 4096, "9b: gate_proj / up_proj"),
+    (4096, 12288, "9b: down_proj"),
+    (248_320, 4096, "9b: the lm_head"),
     (8, 8, "one CTA, one k vector"),
     (24, 64, "three warps of a CTA"),
     (1000, 72, "a partial last CTA, 9 k vectors"),
