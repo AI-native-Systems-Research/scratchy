@@ -10,21 +10,36 @@
 //! | rule | what it refuses |
 //! |---|---|
 //! | T1 | a kernel that does not include `"kittens.cuh"`, or includes anything but `"kittens.cuh"`, `"prototype.cuh"`, `"scratchy_ops.cuh"`, `<climits>`, `<cstdint>`, `<cmath>`, `<type_traits>` |
-//! | T2 | a `*` in a `__global__` parameter list; a line declaring a pointer with no initialiser, however many declarators it has; a `using`/`typedef` of a pointer type; any pointer member of a kernel's argument struct |
-//! | T3 | the constructs plain CUDA kernels move and convert data with: warp shuffles and votes, atomics, `__ldg`, PTX loads and stores, `__nv_bfloat16` and its conversions, `make_*` vector constructors, a `reinterpret_cast` or C-style cast to a scalar or vector pointer (but `(int*)&__shm[0]` as a TK allocator's argument) |
-//! | T4 | a math intrinsic in a kernel: any `__name(` call but synchronisation, and any libm function (`sqrtf`, `std::exp2`) outside a host launcher; those live in `kernels/scratchy_ops.cuh` |
+//! | T2 | a `*` in a `__global__` parameter list; a statement declaring a pointer with no initialiser, however many declarators it has and however it wraps; a `using`/`typedef` of a pointer type; any pointer member of a kernel's argument struct |
+//! | T3 | the constructs plain CUDA kernels move and convert data with: warp shuffles and votes, atomics, cache-hinted loads and stores, PTX loads and stores, the CUDA bf16/half types and every conversion, `make_*` vector constructors, a `reinterpret_cast` or C-style cast to a scalar or vector pointer (but `(int*)&__shm[0]` as a TK allocator's argument), type punning (`memcpy`, `bit_cast`, `union`); in device code, a raw pointer out of a TK object (`.ptr`, `.raw_ptr`, `&g.x[…]`) and a `static_cast`/`const_cast` to a pointer |
+//! | T4 | a math intrinsic in a kernel: any `__name(` call but synchronisation and the launch and alignment attributes, a namespace alias, and in device code any libm function (`sqrtf`, `std::exp2`, `isnan`) called or taken by address; those live in `kernels/scratchy_ops.cuh` |
 //! | T5 | `asm` anywhere but an exact `(file, PTX string)` pair of [`ASM_ALLOWLIST`], each at most as often as it is listed |
-//! | T6 | `__shared__` of anything but TK semaphores, `st`/`sv` tiles and vectors, or the `extern __shared__` buffer TK's allocators carve |
+//! | T6 | `__shared__` of anything but TK semaphores, `st`/`sv` tiles and vectors, or the `extern __shared__` buffer TK's allocators carve; that buffer named anywhere but its declaration and a TK allocator's argument; a type of the file named as a TK allocator |
 //! | T7 | a kernel file with no kernel, or a `__global__` body that names no TK scope, nor a TK tile, vector or view type as a whole identifier |
 //! | T8 | a `.cu`/`.cuh` outside `kernels/` (but the vendored tree), a `.cuh` there but the op header, a `__global__` in the op header |
 //! | T9 | a T3/T5 construct in the op header outside a `// TK-GAP(<name>)` block, or a gap name not on [`TK_GAPS`] |
-//! | T10 | the checker itself: plain-CUDA fixtures must be refused, a TK fixture accepted |
+//! | T10 | the checker itself: plain-CUDA fixtures must be refused, TK fixtures accepted |
 //!
 //! T1-T4, T6 and T7 read the text with its comments blanked (string literals kept); T5 and the
 //! gap markers read it raw. Listed tokens match on word boundaries, as `cfg_neutrality.rs`'s
 //! `has_word` does, except the prefixes `__shfl_` and `atomic`, which match anywhere; the CUDA
 //! intrinsic families (conversions, cache hints, warp collectives, math) match by pattern, so a
 //! spelling no list names is refused too.
+//!
+//! Device code is the body of every function marked `__global__` or `__device__` (and of every
+//! `constexpr` function, which `--expt-relaxed-constexpr` lets device code call), and every
+//! `__device__`, `__constant__` or `__managed__` variable. Everything else is host code: the
+//! `extern "C"` launchers and host helpers, which may use what kernels may not (PLAN-tk100 §1.3:
+//! `static_cast` of the launch arguments, libm such as `std::ceil` or `std::isfinite`).
+//!
+//! What this check does not see, and leaves to the verifier's reading (PLAN-tk100 §1.5: it reads
+//! source text, so it can be gamed):
+//! - macros: a `#define` can spell any construct, and a function marked device through a macro is
+//!   not seen as device code;
+//! - scalar loops over a TK register vector's or tile's data (`row[i][0] = row[i][0] * w + 1`),
+//!   which the text cannot tell from the element access TK's own maps make;
+//! - an initialised pointer member of a struct no kernel takes, and a libm function reached through
+//!   a plain-named function pointer (`auto f = sqrtf;`).
 //!
 //! Kernels not yet rewritten are on [`NOT_YET_PORTED`]: each must still fail some rule (so the
 //! list cannot go stale), and every kernel off it must pass every rule. Each port removes its
@@ -105,8 +120,15 @@ const T4_WORDS: &[&str] = &[
     "fmaxf",
 ];
 
-/// T4: the `__name(` calls a kernel may make: synchronisation and the launch bounds.
-const T4_ALLOWED_DUNDER: &[&str] = &["__syncthreads", "__syncwarp", "__launch_bounds__"];
+/// T4: the `__name(` calls a kernel may make: synchronisation, and the launch and alignment
+/// attributes (`__cluster_dims__` is how TK's `lcf` asks for a cluster).
+const T4_ALLOWED_DUNDER: &[&str] = &[
+    "__syncthreads",
+    "__syncwarp",
+    "__launch_bounds__",
+    "__cluster_dims__",
+    "__align__",
+];
 
 /// T4: the libm and CUDA math functions, by stem: each is refused unqualified or `std::`/`::`
 /// qualified, and with an `f` or `l` suffix (`sqrtf`, `tanhl`), outside a host launcher.
@@ -463,6 +485,250 @@ const GAP_ACCEPTED: &[(&str, &str)] = &[
     ),
 ];
 
+/// T10's second-review fixtures (PR #13): statements the body of [`GAP_KERNEL`] must accept, TK
+/// ops and the attributes and arithmetic a TK kernel uses.
+const GAP_ACCEPTED_2: &[(&str, &str)] = &[
+    ("group4_exp2", "group<4>::exp2(row, row);"),
+    ("kittens_group4_exp2", "kittens::group<4>::exp2(row, row);"),
+    ("warpgroup_exp2", "warpgroup::exp2(row, row);"),
+    ("warp_sqrt", "warp::sqrt(row, row);"),
+    ("kittens_warp_exp", "kittens::warp::exp(row, row);"),
+    (
+        "wrapped_multiplication",
+        "const int width = 3 +\n        HEADS *\n        DIM;",
+    ),
+    ("align_attribute", "__align__(16) float pad[4] = {};"),
+];
+
+/// T10's second-review fixtures: whole sources that must pass.
+const GAP_ACCEPTED_SOURCES_2: &[(&str, &str)] = &[
+    (
+        "cluster_dims_attribute",
+        r##"#include "kittens.cuh"
+using namespace kittens;
+namespace {
+using row_gl = gl<float, 1, 1, -1, -1>;
+struct gap_globals {
+    row_gl x;
+};
+__global__ void __cluster_dims__(2, 1, 1) gap_ker(const __grid_constant__ gap_globals g) {
+    rv_fl<256> row;
+    warp::load(row, g.x, {0, 0, 0, 0});
+}
+}  // namespace
+"##,
+    ),
+    (
+        "static_host_helper_math",
+        r##"#include "kittens.cuh"
+#include <cmath>
+using namespace kittens;
+namespace {
+using row_gl = gl<float, 1, 1, -1, -1>;
+struct gap_globals {
+    row_gl x;
+};
+__global__ void gap_ker(const __grid_constant__ gap_globals g) {
+    rv_fl<256> row;
+    warp::load(row, g.x, {0, 0, 0, 0});
+}
+static int tiles_for(float rows) {
+    return int(std::ceil(rows / 64.0f)) + int(std::isfinite(rows));
+}
+}  // namespace
+"##,
+    ),
+];
+
+/// T10's second-review fixtures: statements in the body of [`GAP_KERNEL`] that must be refused,
+/// with the rule.
+const GAP_STATEMENTS_2: &[(&str, &str, &str)] = &[
+    ("isnan_in_device_code", "if (isnan(w)) { w = 0.0f; }", "T4"),
+    (
+        "std_isnan_in_device_code",
+        "if (std::isnan(w)) { w = 0.0f; }",
+        "T4",
+    ),
+    ("sqrtf_by_address", "auto f = &sqrtf; w = f(w);", "T4"),
+    (
+        "namespace_alias_of_std",
+        "namespace m = std; w = m::exp(w);",
+        "T4",
+    ),
+    ("using_std_sqrt", "using std::sqrt; w = sqrt(w);", "T4"),
+    ("raw_ptr_member", "float v = g.y.raw_ptr[0];", "T3"),
+    ("ptr_member_arrow", "auto p = (&g.y)->raw_ptr;", "T3"),
+    (
+        "address_of_gl_element",
+        "float* p = nullptr; p = &g.y[{0, 0, 0, 0}];",
+        "T3",
+    ),
+    (
+        "auto_address_of_gl_element",
+        "auto p = &g.y[{0, 0, 0, 0}];",
+        "T3",
+    ),
+    (
+        "static_cast_through_void",
+        "extern __shared__ int __shm[]; auto s = static_cast<float*>(static_cast<void*>(__shm));",
+        "T3",
+    ),
+    (
+        "static_cast_pointer",
+        "auto p = static_cast<const float*>(nullptr);",
+        "T3",
+    ),
+    (
+        "const_cast_pointer",
+        "auto p = const_cast<float*>(&w);",
+        "T3",
+    ),
+    ("c_cast_through_void", "auto p = (float*)(void*)&w;", "T3"),
+    ("memcpy", "float v; memcpy(&v, &w, sizeof(v));", "T3"),
+    (
+        "std_memcpy",
+        "float v; std::memcpy(&v, &w, sizeof(v));",
+        "T3",
+    ),
+    ("bit_cast", "auto bits = std::bit_cast<unsigned>(w);", "T3"),
+    (
+        "union_pun",
+        "union { float f; unsigned u; } pun; pun.f = w;",
+        "T3",
+    ),
+    (
+        "shm_write",
+        "extern __shared__ int __shm[]; __shm[threadIdx.x] = int(w);",
+        "T6",
+    ),
+    (
+        "shm_read",
+        "extern __shared__ int __shm[]; w = float(__shm[0]);",
+        "T6",
+    ),
+    (
+        "shm_alias",
+        "extern __shared__ int __shm[]; int* s = __shm;",
+        "T6",
+    ),
+    (
+        "shm_written_after_allocator",
+        "extern __shared__ int __shm[]; tma_swizzle_allocator al((int*)&__shm[0]); __shm[1] = 0;",
+        "T6",
+    ),
+    (
+        "tk_allocator_ptr_member",
+        "extern __shared__ int __shm[]; tma_swizzle_allocator al((int*)&__shm[0]); al.ptr[0] = 1;",
+        "T3",
+    ),
+];
+
+/// T10's second-review fixtures: whole sources that must be refused, with the rule.
+const GAP_SOURCES_2: &[(&str, &str, &str)] = &[
+    (
+        "own_shared_allocator_struct",
+        r##"#include "kittens.cuh"
+using namespace kittens;
+namespace {
+struct shared_allocator {
+    int n;
+    __device__ shared_allocator(int* p) : n(p[0]) {}
+};
+using row_gl = gl<float, 1, 1, -1, -1>;
+struct gap_globals {
+    row_gl x;
+};
+__global__ void gap_ker(const __grid_constant__ gap_globals g) {
+    extern __shared__ int __shm[];
+    shared_allocator al((int*)&__shm[0]);
+    rv_fl<256> row;
+    warp::load(row, g.x, {0, 0, 0, 0});
+}
+}  // namespace
+"##,
+        "T6",
+    ),
+    (
+        "own_tma_allocator_class",
+        r##"#include "kittens.cuh"
+using namespace kittens;
+namespace {
+class tma_allocator {
+  public:
+    __device__ tma_allocator(int*) {}
+};
+using row_gl = gl<float, 1, 1, -1, -1>;
+struct gap_globals {
+    row_gl x;
+};
+__global__ void gap_ker(const __grid_constant__ gap_globals g) {
+    rv_fl<256> row;
+    warp::load(row, g.x, {0, 0, 0, 0});
+}
+}  // namespace
+"##,
+        "T6",
+    ),
+    (
+        "own_tma_swizzle_allocator_alias",
+        r##"#include "kittens.cuh"
+using namespace kittens;
+namespace {
+struct carve {
+    __device__ carve(int*) {}
+};
+using tma_swizzle_allocator = carve;
+using row_gl = gl<float, 1, 1, -1, -1>;
+struct gap_globals {
+    row_gl x;
+};
+__global__ void gap_ker(const __grid_constant__ gap_globals g) {
+    rv_fl<256> row;
+    warp::load(row, g.x, {0, 0, 0, 0});
+}
+}  // namespace
+"##,
+        "T6",
+    ),
+    (
+        "wrapped_pointer_declaration",
+        r##"#include "kittens.cuh"
+using namespace kittens;
+namespace {
+using row_gl = gl<float, 1, 1, -1, -1>;
+struct gap_globals {
+    row_gl x;
+    const float
+        *y;
+};
+__global__ void gap_ker(const __grid_constant__ gap_globals g) {
+    rv_fl<256> row;
+    warp::load(row, g.x, {0, 0, 0, 0});
+}
+}  // namespace
+"##,
+        "T2",
+    ),
+    (
+        "device_helper_sqrtf",
+        r##"#include "kittens.cuh"
+using namespace kittens;
+namespace {
+__device__ inline float root(float x) { return sqrtf(x); }
+using row_gl = gl<float, 1, 1, -1, -1>;
+struct gap_globals {
+    row_gl x;
+};
+__global__ void gap_ker(const __grid_constant__ gap_globals g) {
+    rv_fl<256> row;
+    warp::load(row, g.x, {0, 0, 0, 0});
+}
+}  // namespace
+"##,
+        "T4",
+    ),
+];
+
 /// `(name, a whole kernel source, the rule that must refuse it)`: the verifier's constructs that
 /// live outside a body.
 const GAP_SOURCES: &[(&str, &str, &str)] = &[
@@ -804,10 +1070,29 @@ fn identifiers(text: &str) -> Vec<(usize, &str)> {
     out
 }
 
-/// The namespace an identifier at `at` is qualified with: `None` unqualified, `Some("")` for a
-/// global `::name`, else the last qualifier (`std` for `std::sqrt`, `warp` for `warp::exp2`).
+/// The scope an identifier at `at` is qualified with: `None` unqualified, `Some("")` for a global
+/// `::name`, else the last qualifier (`std` for `std::sqrt`, `warp` for `warp::exp2`, `group` for
+/// `group<4>::exp2` and `kittens::group<4>::exp2`: a template's arguments are not its name).
 fn qualifier(text: &str, at: usize) -> Option<&str> {
-    let before = text[..at].trim_end().strip_suffix("::")?.trim_end();
+    let mut before = text[..at].trim_end().strip_suffix("::")?.trim_end();
+    if before.ends_with('>') {
+        let mut depth = 0i32;
+        let open = before.char_indices().rev().find_map(|(i, c)| {
+            match c {
+                '>' => depth += 1,
+                '<' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+            None
+        });
+        // An unmatched `>` names no scope: read as global, which refuses rather than accepts.
+        before = open.map_or("", |i| before[..i].trim_end());
+    }
     let start = before
         .rfind(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
         .map_or(0, |i| i + 1);
@@ -825,32 +1110,107 @@ fn starts_with_word(s: &str, w: &str) -> bool {
         .is_some_and(|r| !r.bytes().next().is_some_and(is_word))
 }
 
-/// The byte ranges of the bodies of `extern "C"` functions (and blocks): the host launchers,
-/// which may use what kernels may not (`aa-personal-space/cuda-moonshot/PLAN-tk100.md` §1.3).
-fn host_ranges(bare: &str) -> Vec<(usize, usize)> {
+/// Whether `text` ends with the word `w`.
+fn ends_with_word(text: &str, w: &str) -> bool {
+    text.strip_suffix(w)
+        .is_some_and(|r| !r.bytes().last().is_some_and(is_word))
+}
+
+/// The words that mark device code: a function's body after them, or a variable's declaration.
+const DEVICE_MARKS: &[&str] = &[
+    "__global__",
+    "__device__",
+    "__constant__",
+    "__managed__",
+    "constexpr",
+    "consteval",
+];
+
+/// The byte ranges of device code in `bare` (see the module docs): for each of [`DEVICE_MARKS`],
+/// the body that the first `{` outside parentheses after it opens, or, for a `__device__`,
+/// `__constant__` or `__managed__` variable, its declaration up to the `;`. A `constexpr` that
+/// ends in `;` is a constant, not a function, and `if constexpr` is a branch: neither is a range.
+fn device_ranges(bare: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
-    for at in words(bare, "extern") {
-        if !bare[at + "extern".len()..].trim_start().starts_with('"') {
+    for mark in DEVICE_MARKS {
+        let function_only = matches!(*mark, "constexpr" | "consteval");
+        for at in words(bare, mark) {
+            if function_only && ends_with_word(bare[..at].trim_end(), "if") {
+                continue;
+            }
+            let mut depth = 0i32;
+            let end = bare[at..].char_indices().find_map(|(i, c)| {
+                match c {
+                    '(' | '[' => depth += 1,
+                    ')' | ']' => depth -= 1,
+                    '{' | ';' if depth == 0 => return Some((i, c)),
+                    _ => {}
+                }
+                None
+            });
+            match end {
+                Some((i, '{')) => {
+                    let body = body_of(bare, at + i);
+                    out.push((at, at + i + body.len()));
+                }
+                Some((i, _)) if !function_only => out.push((at, at + i + 1)),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Whether byte `at` lies in one of `ranges`.
+fn within(ranges: &[(usize, usize)], at: usize) -> bool {
+    ranges.iter().any(|&(a, b)| (a..b).contains(&at))
+}
+
+/// Whether the text `before` an operator ends with an operand (a word, `)` or `]`, but `return`),
+/// so the operator is binary, not unary.
+fn after_operand(before: &str) -> bool {
+    let before = before.trim_end();
+    before
+        .bytes()
+        .last()
+        .is_some_and(|c| is_word(c) || c == b')' || c == b']')
+        && !ends_with_word(before, "return")
+}
+
+/// `s` past its leading whitespace and attributes: `__align__(…)`, `alignas(…)`,
+/// `__attribute__((…))`, `__declspec(…)` and `[[…]]`.
+fn skip_attributes(s: &str) -> &str {
+    let mut s = s.trim_start();
+    loop {
+        if let Some(r) = s.strip_prefix("[[") {
+            s = r.find("]]").map_or("", |e| &r[e + 2..]).trim_start();
             continue;
         }
-        let rest = &bare[at..];
-        let mut depth = 0i32;
-        let open = rest.char_indices().find_map(|(i, c)| {
+        let Some(kw) = ["__align__", "alignas", "__attribute__", "__declspec"]
+            .iter()
+            .find(|k| starts_with_word(s, k))
+        else {
+            return s;
+        };
+        let Some(r) = s[kw.len()..].trim_start().strip_prefix('(') else {
+            return s;
+        };
+        let mut depth = 1i32;
+        let end = r.char_indices().find_map(|(i, c)| {
             match c {
                 '(' => depth += 1,
-                ')' => depth -= 1,
-                ';' if depth == 0 => return Some(None),
-                '{' if depth == 0 => return Some(Some(i)),
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
                 _ => {}
             }
             None
         });
-        if let Some(Some(open)) = open {
-            let body = body_of(bare, at + open);
-            out.push((at + open, at + open + body.len()));
-        }
+        s = end.map_or("", |e| &r[e + 1..]).trim_start();
     }
-    out
 }
 
 /// Whether identifier `name` is one of the constructs T3 refuses by pattern, and which.
@@ -951,22 +1311,20 @@ fn ends_with_allocator(text: &str) -> bool {
     TK_ALLOCATORS.contains(&name.strip_prefix("kittens::").unwrap_or(name))
 }
 
-/// Whether the cast opening at byte `at` of `bare` is TK's own idiom for carving shared memory
-/// (`aa-personal-space/cuda-moonshot/PLAN-tk100.md` §1.2 item 5), as upstream's `mha_h100.cu`
-/// spells it: exactly `(int*)&__shm[0]` or `(int*)__shm` (spaces aside), as the whole argument of
-/// a TK allocator's constructor, `tma_swizzle_allocator al((int*)&__shm[0]);`. Stored anywhere
-/// else, or passed to anything else, the cast is refused like any other.
-fn allocator_argument(bare: &str, at: usize) -> bool {
+/// The `)` that closes the call, when the cast opening at byte `at` of `bare` is TK's own idiom
+/// for carving shared memory (`aa-personal-space/cuda-moonshot/PLAN-tk100.md` §1.2 item 5), as
+/// upstream's `mha_h100.cu` spells it: exactly `(int*)&__shm[0]` or `(int*)__shm` (spaces aside),
+/// as the whole argument of a TK allocator's constructor, `tma_swizzle_allocator
+/// al((int*)&__shm[0]);`. Stored anywhere else, or passed to anything else, the cast is refused
+/// like any other, and a file that defines its own type of an allocator's name is refused (T6).
+fn allocator_close(bare: &str, at: usize) -> Option<usize> {
     // The callee: `(` right before the cast, after `ALLOCATOR name` or `ALLOCATOR`.
-    let Some(callee) = bare[..at].trim_end().strip_suffix('(') else {
-        return false;
-    };
-    let callee = callee.trim_end();
+    let callee = bare[..at].trim_end().strip_suffix('(')?.trim_end();
     let name_start = callee
         .rfind(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
         .map_or(0, |i| i + 1);
     if !(ends_with_allocator(callee) || ends_with_allocator(&callee[..name_start])) {
-        return false;
+        return None;
     }
     // The argument: from the cast to the `)` that closes the call, which then ends the statement.
     let mut depth = 0i32;
@@ -978,13 +1336,55 @@ fn allocator_argument(bare: &str, at: usize) -> bool {
             _ => {}
         }
         None
-    });
-    let Some(close) = close else {
-        return false;
-    };
+    })?;
     let arg: String = bare[at..close].split_whitespace().collect();
-    (arg == "(int*)&__shm[0]" || arg == "(int*)__shm")
-        && bare[close + 1..].trim_start().starts_with(';')
+    ((arg == "(int*)&__shm[0]" || arg == "(int*)__shm")
+        && bare[close + 1..].trim_start().starts_with(';'))
+    .then_some(close)
+}
+
+/// Whether the cast opening at byte `at` of `bare` is TK's allocator idiom ([`allocator_close`]).
+fn allocator_argument(bare: &str, at: usize) -> bool {
+    allocator_close(bare, at).is_some()
+}
+
+/// Every TK allocator argument of `bare`, from its cast to the `)` that closes the call.
+fn allocator_spans(bare: &str) -> Vec<(usize, usize)> {
+    (bare.match_indices('('))
+        .filter_map(|(at, _)| allocator_close(bare, at).map(|close| (at, close)))
+        .collect()
+}
+
+/// Every type `bare` defines or aliases under a TK allocator's name (`struct shared_allocator`,
+/// `using tma_swizzle_allocator = …`), as `(offset, name)`: such a type would take the allocator
+/// idiom's exemption without being TK's.
+fn own_allocators(bare: &str) -> Vec<(usize, String)> {
+    let tk = |n: &str| TK_ALLOCATORS.contains(&n.strip_prefix("kittens::").unwrap_or(n));
+    let mut out = Vec::new();
+    for kw in ["struct", "class", "union"] {
+        for at in words(bare, kw) {
+            let (name, _) = ident(skip_attributes(&bare[at + kw.len()..]));
+            if tk(name) {
+                out.push((at, name.to_string()));
+            }
+        }
+    }
+    for at in words(bare, "using") {
+        let (name, after) = ident(bare[at + "using".len()..].trim_start());
+        if tk(name) && after.trim_start().starts_with('=') {
+            out.push((at, name.to_string()));
+        }
+    }
+    for at in words(bare, "typedef") {
+        let rest = &bare[at + "typedef".len()..];
+        let stmt = &rest[..rest.find(';').unwrap_or(rest.len())];
+        if let Some(&(_, name)) = identifiers(stmt).last()
+            && tk(name)
+        {
+            out.push((at, name.to_string()));
+        }
+    }
+    out
 }
 
 /// Every C-style cast to a pointer or reference type in `bare`, `(T*)x` or `(const T&)x`, as
@@ -1027,6 +1427,88 @@ fn c_style_casts(bare: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// T3: the type-punning constructs, anywhere: they read memory as another type.
+const T3_PUNNING: &[&str] = &["memcpy", "memmove", "bit_cast", "union"];
+
+/// T3 in device code: a raw pointer taken out of a TK object (`.ptr`, `->raw_ptr`), the address
+/// of an element (`&g.x[{…}]`, `&__shm[i]`) but the allocator idiom's, and a `static_cast`,
+/// `const_cast` or `dynamic_cast` to a pointer. As `(offset, what)`.
+fn t3_device_hits(bare: &str) -> Vec<(usize, String)> {
+    let device = device_ranges(bare);
+    let alloc = allocator_spans(bare);
+    let mut out = Vec::new();
+    for (at, name) in identifiers(bare) {
+        if !within(&device, at) {
+            continue;
+        }
+        let before = bare[..at].trim_end();
+        if ["ptr", "raw_ptr"].contains(&name) && (before.ends_with('.') || before.ends_with("->")) {
+            out.push((
+                at,
+                format!("takes the raw pointer `{name}` out of a TK object"),
+            ));
+        }
+        if ["static_cast", "const_cast", "dynamic_cast"].contains(&name)
+            && let Some(arg) = template_argument(&bare[at + name.len()..])
+            && (arg.match_indices('*')).any(|(s, _)| pointer_star(arg, s))
+        {
+            out.push((
+                at,
+                format!("uses `{name}<{}>`, a cast to a pointer", arg.trim()),
+            ));
+        }
+    }
+    for (at, _) in bare.match_indices('&') {
+        let (prev, next) = (bare[..at].bytes().last(), bare[at + 1..].bytes().next());
+        if prev == Some(b'&') || next == Some(b'&') || next == Some(b'=') {
+            continue;
+        }
+        if !within(&device, at) || within(&alloc, at) || after_operand(&bare[..at]) {
+            continue;
+        }
+        // `&` then a name chain (`g.y`, `p->x`, `a::b`), then `[`: the address of an element.
+        let mut rest = bare[at + 1..].trim_start();
+        loop {
+            let (word, after) = ident(rest);
+            if word.is_empty() {
+                break;
+            }
+            rest = after.trim_start();
+            match [".", "->"].iter().find(|s| rest.starts_with(**s)) {
+                Some(s) => rest = rest[s.len()..].trim_start(),
+                None => break,
+            }
+        }
+        if rest.starts_with('[') && bare[at + 1..].trim_start().len() != rest.len() {
+            out.push((
+                at,
+                "takes the address of an element, a raw pointer".to_string(),
+            ));
+        }
+    }
+    out
+}
+
+/// The text between the `<` that opens `s` (after spaces) and its matching `>`.
+fn template_argument(s: &str) -> Option<&str> {
+    let s = s.trim_start().strip_prefix('<')?;
+    let mut depth = 1i32;
+    let end = s.char_indices().find_map(|(i, c)| {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        None
+    })?;
+    Some(&s[..end])
+}
+
 /// T3: the plain-CUDA data movement and conversion constructs, as `(line, token)`.
 fn t3_hits(src: &Source) -> Vec<(usize, String)> {
     let mut out = Vec::new();
@@ -1067,56 +1549,152 @@ fn t3_hits(src: &Source) -> Vec<(usize, String)> {
         }
     }
     bare.extend(c_style_casts(&src.bare));
+    for w in T3_PUNNING {
+        bare.extend(
+            (words(&src.bare, w).into_iter()).map(|at| (at, format!("uses `{w}`, type punning"))),
+        );
+    }
+    bare.extend(t3_device_hits(&src.bare));
     lines.extend((bare.into_iter()).map(|(at, what)| (line_of(&src.bare, at), what)));
     lines.sort();
     lines.dedup();
     lines
 }
 
-/// T4: math intrinsics and libm functions, which belong in the op header: the listed names
-/// anywhere; any other `__name(` call but synchronisation and launch bounds anywhere; and a libm
-/// function, unqualified or `std::`/`::`-qualified, anywhere but a host launcher's body. A call
-/// qualified with any other namespace (`warp::exp2`) is TK's or the op header's.
+/// T4: math intrinsics and libm functions, which belong in the op header:
+/// - the listed names, anywhere;
+/// - any other `__name(` call but synchronisation and the launch and alignment attributes,
+///   anywhere;
+/// - in device code, a libm function, unqualified or `std::`/`::`-qualified, called or taken by
+///   address (`&sqrtf`); a call qualified with any other scope (`warp::exp2`, `group<4>::exp2`)
+///   is TK's or the op header's;
+/// - a using-declaration of a libm function (`using std::sqrt;`), and a namespace alias of `std`
+///   (`namespace m = std;`), anywhere: each would make a libm call look qualified or unqualified
+///   at will.
 fn t4_intrinsics(src: &Source) -> Vec<Violation> {
     let mut hits: BTreeSet<(usize, String)> = BTreeSet::new();
     for w in T4_WORDS {
         for at in words(&src.code, w) {
-            hits.insert((line_of(&src.code, at), w.to_string()));
+            hits.insert((line_of(&src.code, at), format!("calls `{w}`")));
         }
     }
-    let host = host_ranges(&src.bare);
-    let in_host = |at: usize| host.iter().any(|&(a, b)| (a..b).contains(&at));
+    let device = device_ranges(&src.bare);
+    let stem = |n: &str| {
+        LIBM.contains(&n)
+            || n.strip_suffix(['f', 'l'])
+                .is_some_and(|s| LIBM.contains(&s))
+    };
     for (at, name) in identifiers(&src.bare) {
         // `x.exp(…)`, `p->exp(…)`: a member of a TK object, not a free function.
         let before = src.bare[..at].trim_end();
         let member = before.ends_with('.') || before.ends_with("->");
-        if member || !called(&src.bare, at + name.len()) || t3_family(name).is_some() {
+        if member || t3_family(name).is_some() {
             continue;
         }
-        let dunder = name.starts_with("__")
+        let call = called(&src.bare, at + name.len());
+        let dunder = call
+            && name.starts_with("__")
             && name.as_bytes().get(2).is_some_and(u8::is_ascii_lowercase)
             && !T4_ALLOWED_DUNDER.contains(&name);
-        let stem = |n: &str| {
-            LIBM.contains(&n)
-                || n.strip_suffix(['f', 'l'])
-                    .is_some_and(|s| LIBM.contains(&s))
+        let qualified = qualifier(&src.bare, at);
+        // The text before the name and its `std::`/`::` qualification.
+        let lead = match qualified {
+            Some(q) => {
+                let b = before.strip_suffix("::").unwrap_or(before).trim_end();
+                b.strip_suffix(q).unwrap_or(b).trim_end()
+            }
+            None => before,
         };
-        let libm = stem(name)
-            && matches!(qualifier(&src.bare, at), None | Some("") | Some("std"))
-            && !in_host(at);
-        if dunder || libm {
-            hits.insert((line_of(&src.bare, at), name.to_string()));
+        let address =
+            lead.ends_with('&') && !lead.ends_with("&&") && !after_operand(&lead[..lead.len() - 1]);
+        let libm = stem(name) && matches!(qualified, None | Some("") | Some("std"));
+        if dunder {
+            hits.insert((line_of(&src.bare, at), format!("calls `{name}`")));
+        } else if libm && within(&device, at) && (call || address) {
+            let how = if call {
+                "calls"
+            } else {
+                "takes the address of"
+            };
+            hits.insert((line_of(&src.bare, at), format!("{how} `{name}`")));
+        } else if libm && qualified.is_some() && ends_with_word(lead, "using") {
+            hits.insert((
+                line_of(&src.bare, at),
+                format!("declares `using` of `{name}`"),
+            ));
+        }
+    }
+    for at in words(&src.bare, "namespace") {
+        let (alias, after) = ident(src.bare[at + "namespace".len()..].trim_start());
+        let Some(target) = after.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let target = &target[..target.find(';').unwrap_or(target.len())];
+        if target.split("::").any(|c| c.trim() == "std") {
+            hits.insert((
+                line_of(&src.bare, at),
+                format!("aliases `{alias}` to `{}`", target.trim()),
+            ));
         }
     }
     (hits.into_iter())
-        .map(|(line, w)| {
-            violation(
-                line,
-                "T4",
-                format!("calls `{w}`, which only `{OP_HEADER}` may"),
-            )
-        })
+        .map(|(line, what)| violation(line, "T4", format!("{what}, which only `{OP_HEADER}` may")))
         .collect()
+}
+
+/// The statements of `bare` that end in `;` at bracket depth 0, as `(offset of the first
+/// character, text without the `;`)`: split at `;`, `{` and `}`, so a statement wrapped over
+/// several lines is one, and a `for (…; …; …)` header is not split. Preprocessor lines are
+/// skipped, and so are the access labels (`public:`) a member statement may start with.
+fn statements(bare: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0i32, 0usize);
+    let mut line_start = true;
+    let mut skip_line = false;
+    for (i, c) in bare.char_indices() {
+        if line_start && !c.is_whitespace() {
+            skip_line = c == '#';
+            line_start = false;
+            if skip_line {
+                start = i;
+            }
+        }
+        if c == '\n' {
+            line_start = true;
+            if skip_line {
+                skip_line = false;
+                start = i + 1;
+            }
+            continue;
+        }
+        if skip_line {
+            continue;
+        }
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ';' | '{' | '}' if depth == 0 => {
+                if c == ';' {
+                    let mut text = &bare[start..i];
+                    loop {
+                        let t = text.trim_start();
+                        match ["public:", "private:", "protected:"]
+                            .iter()
+                            .find(|l| t.starts_with(**l))
+                        {
+                            Some(l) => text = &t[l.len()..],
+                            None => break,
+                        }
+                    }
+                    let lead = text.len() - text.trim_start().len();
+                    out.push((i - text.len() + lead, text.trim_start()));
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Words that open a statement which is not a declaration, though a type-like run and a `*`
@@ -1138,12 +1716,13 @@ const NOT_DECLARATIONS: &[&str] = &[
 /// `float *y, *z;`. A `*` between two operands (`st_bf<64, 64*N>`, `a * b`) declares nothing: no
 /// name follows it.
 fn declares_pointer(stmt: &str, init: bool) -> bool {
-    let t = stmt.trim();
+    let t = skip_attributes(stmt.trim());
     if NOT_DECLARATIONS.iter().any(|k| starts_with_word(t, k)) {
         return false;
     }
-    // `[\w:<>, ]+`: the type, `const` included, and any declarators before the first `*`.
-    let ty = |c: char| c == '_' || c.is_ascii_alphanumeric() || ":<>, ".contains(c);
+    // `[\w:<>, ]+`: the type, `const` included, and any declarators before the first `*`. Line
+    // breaks are whitespace: `statements` joins a wrapped statement.
+    let ty = |c: char| c == '_' || c.is_ascii_alphanumeric() || ":<>, \n\t".contains(c);
     let run = t.find(|c: char| !ty(c)).unwrap_or(t.len());
     if run == 0 || !t[run..].starts_with('*') || identifiers(&t[..run]).is_empty() {
         return false;
@@ -1242,8 +1821,9 @@ fn structs(bare: &str) -> Vec<(String, usize)> {
     out
 }
 
-/// T2: no `*` from a `__global__` to the `{` (or `;`) after its parameters; no line declaring a
-/// pointer with no initialiser, however many declarators it has; no `using`/`typedef` of a
+/// T2: no `*` from a `__global__` to the `{` (or `;`) after its parameters; no statement
+/// ([`statements`], so however it wraps) declaring a pointer with no initialiser, however many
+/// declarators it has; no `using`/`typedef` of a
 /// pointer type; and no pointer member, initialised or not, in a kernel's argument struct (every
 /// struct of the file a `__global__` names before its body, or, when the file instantiates
 /// `lcf::kernel<`, its `globals`), nor in a struct of the file such a struct holds.
@@ -1269,16 +1849,15 @@ fn t2_pointers(src: &Source) -> Vec<Violation> {
     if src.bare.contains("lcf::kernel<") {
         roots.push("globals".to_string());
     }
-    for (n, line) in src.bare.lines().enumerate() {
-        if let Some(stmt) = line.trim_end().strip_suffix(';')
-            && declares_pointer(stmt, false)
-        {
+    for (at, stmt) in statements(&src.bare) {
+        if declares_pointer(stmt, false) {
+            let one_line: Vec<&str> = stmt.split_whitespace().collect();
             out.push(violation(
-                n + 1,
+                line_of(&src.bare, at),
                 "T2",
                 format!(
-                    "declares a raw pointer with no initialiser: `{}`",
-                    line.trim()
+                    "declares a raw pointer with no initialiser: `{};`",
+                    one_line.join(" ")
                 ),
             ));
         }
@@ -1402,9 +1981,13 @@ fn t5_asm(name: &str, src: &Source) -> Vec<Violation> {
     out
 }
 
-/// T6: `__shared__` declares TK semaphores, `st`/`sv` objects, or TK's `extern __shared__` buffer.
+/// T6: `__shared__` declares TK semaphores, `st`/`sv` objects, or TK's `extern __shared__` buffer;
+/// that buffer is named only in its declaration and as a TK allocator's argument
+/// ([`allocator_spans`]), so no raw read or write of shared memory goes around TK's types; and the
+/// file defines no type of a TK allocator's name ([`own_allocators`]).
 fn t6_shared(src: &Source) -> Vec<Violation> {
     let mut out = Vec::new();
+    let mut buffers: Vec<(String, usize)> = Vec::new();
     for at in words(&src.bare, "__shared__") {
         let before = src.bare[..at].trim_end();
         let external = before.ends_with("extern")
@@ -1419,11 +2002,16 @@ fn t6_shared(src: &Source) -> Vec<Violation> {
         let (ty, after) = ident(rest);
         let ty_short = ty.strip_prefix("kittens::").unwrap_or(ty);
         let ok = if external {
+            let name_at = src.bare.len() - after.trim_start().len();
             let (name, tail) = ident(after.trim_start());
-            ["int", "alignment_dummy"].contains(&ty_short)
+            let ok = ["int", "alignment_dummy"].contains(&ty_short)
                 && !name.is_empty()
                 && tail.trim_start().starts_with('[')
-                && tail.trim_start()[1..].trim_start().starts_with(']')
+                && tail.trim_start()[1..].trim_start().starts_with(']');
+            if ok {
+                buffers.push((name.to_string(), name_at));
+            }
+            ok
         } else {
             ty_short == "semaphore"
                 || ty_short.starts_with("st_")
@@ -1437,6 +2025,28 @@ fn t6_shared(src: &Source) -> Vec<Violation> {
                 format!("`__shared__` of `{ty}`, not a TK semaphore, tile or vector"),
             ));
         }
+    }
+    let alloc = allocator_spans(&src.bare);
+    for (name, declared) in &buffers {
+        for at in words(&src.bare, name) {
+            if at != *declared && !within(&alloc, at) {
+                out.push(violation(
+                    line_of(&src.bare, at),
+                    "T6",
+                    format!(
+                        "names the `extern __shared__` buffer `{name}` outside a TK allocator's \
+                         argument: raw shared memory"
+                    ),
+                ));
+            }
+        }
+    }
+    for (at, name) in own_allocators(&src.bare) {
+        out.push(violation(
+            line_of(&src.bare, at),
+            "T6",
+            format!("defines its own `{name}`, the name of a TK allocator"),
+        ));
     }
     out
 }
@@ -1779,6 +2389,34 @@ fn the_checker_refuses_every_construct_the_review_slipped_past_it() {
     assert!(
         pass,
         "a construct the review found is not refused by its rule: see the lines above"
+    );
+}
+
+/// T10: the second review's cases (PR #13). TK ops qualified with a group scope, the cluster and
+/// alignment attributes, math in a host helper and a multiplication wrapped over lines all pass;
+/// libm in device code (`isnan` included), raw pointers out of TK objects, pointer casts, type
+/// punning, raw `extern __shared__` traffic, a file's own allocator type and a wrapped pointer
+/// declaration are each refused by their rule.
+#[test]
+fn the_checker_accepts_tk_scopes_and_refuses_the_second_reviews_constructs() {
+    let mut pass = true;
+    for (name, stmt) in GAP_ACCEPTED_2 {
+        let text = GAP_KERNEL.replace("{}", stmt);
+        pass &= self_test(&format!("gap2_{name}.cu"), &text, &[]);
+    }
+    for (name, text) in GAP_ACCEPTED_SOURCES_2 {
+        pass &= self_test(&format!("gap2_{name}.cu"), text, &[]);
+    }
+    for (name, stmt, rule) in GAP_STATEMENTS_2 {
+        let text = GAP_KERNEL.replace("{}", stmt);
+        pass &= self_test(&format!("gap2_{name}.cu"), &text, &[rule]);
+    }
+    for (name, text, rule) in GAP_SOURCES_2 {
+        pass &= self_test(&format!("gap2_{name}.cu"), text, &[rule]);
+    }
+    assert!(
+        pass,
+        "a second-review case is accepted or refused wrongly: see the lines above"
     );
 }
 
