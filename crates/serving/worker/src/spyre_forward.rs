@@ -2468,7 +2468,7 @@ pub(crate) fn run_request_step(
                                  decode rung's lm-head does not admit the argmax mint and the \
                                  host may not pick"
                                     .to_string(),
-                            ))
+                            ));
                         }
                     }
                 }

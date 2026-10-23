@@ -8314,13 +8314,14 @@ mod tests {
     }
 
     /// ⭐ THE BUNDLE STATES ITS OWN WIRING FACTS (#813 review) — `num_sources` and the resident
-    /// source ids are GRAPH-LOCAL, and the mint is the graph that proves it: its seven staged
-    /// tables sit at `[num_sources, num_sources+7)` of the ONE-REQUEST graph, so a minted
-    /// bundle's stamp and an unminted bundle's stamp differ by exactly those seven. The worker
-    /// used to hand every rung the minted wiring's numbers — the rung's completeness walk then
-    /// covered seven ids past its own graph, excused by seven minted table ids that only
-    /// cancelled by coincidence. Pinned from both sides of the mint, plus the one-derivation
-    /// law: the stamp's resident list IS [`load_consts_of_ir`]'s, the same derivation the
+    /// source ids are GRAPH-LOCAL, and the mint is the graph that proves it: its nine staged
+    /// tables (the two-level ramp's seven flat-era tables plus the group pair) sit at
+    /// `[num_sources, num_sources+9)` of the ONE-REQUEST graph, so a minted bundle's stamp and
+    /// an unminted bundle's stamp differ by exactly those nine. The worker used to hand every
+    /// rung the minted wiring's numbers — the rung's completeness walk then covered nine ids
+    /// past its own graph, excused by nine minted table ids that only cancelled by
+    /// coincidence. Pinned from both sides of the mint, plus the one-derivation law: the
+    /// stamp's resident list IS [`load_consts_of_ir`]'s, the same derivation the
     /// wiring's `load_consts` reads, so the layout's list and the wiring's cannot disagree.
     #[test]
     fn the_bundle_states_its_own_source_facts_across_the_mint() {
@@ -8359,12 +8360,13 @@ mod tests {
         assert_eq!(l_minted.num_sources, minted.num_sources);
         assert_eq!(
             l_minted.num_sources,
-            l_plain.num_sources + 7,
-            "the mint's seven tables are the whole difference between the two graphs' source \
-             counts — the seven ids an unminted rung was handed and did not have"
+            l_plain.num_sources + 9,
+            "the mint's nine tables (the two-level ramp's seven flat-era tables plus the group \
+             pair) are the whole difference between the two graphs' source counts — the nine \
+             ids an unminted rung was handed and did not have"
         );
         // The unminted graph has no resident source (no prefix-KV, no load-const tables), and
-        // the minted graph's resident list is EXACTLY the seven tables, at
+        // the minted graph's resident list is EXACTLY the nine tables, at
         // `[plain's count, minted's count)` — the range the review's coincidence lived in.
         assert!(
             l_plain.resident_source_tids.is_empty(),
@@ -8373,7 +8375,7 @@ mod tests {
         let tables: Vec<u32> = (l_plain.num_sources..l_minted.num_sources).collect();
         assert_eq!(
             l_minted.resident_source_tids, tables,
-            "the minted graph's resident stamp is its seven tables and nothing else"
+            "the minted graph's resident stamp is its nine tables and nothing else"
         );
         // ⛔ AND EVERY STAMPED ID IS A SOURCE OF ITS OWN GRAPH — the bake asserts this where it
         // stamps (an id at or past the count would excuse a REAL source from the runtime's
