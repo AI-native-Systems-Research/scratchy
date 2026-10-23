@@ -5169,12 +5169,63 @@ fn lower_one(
             // head_k a multiple of 32: lanes split it (`gdn_scan_simd`, `gdn_decode`).
             let simd_scan = hk.is_multiple_of(32) && hv.is_multiple_of(4);
 
+            // A layer's step in one command, a threadgroup of 1024 per (sequence, key head): its
+            // conv channels, its value heads' scan and their norm (`gdn_decode`, `gdn_verify`).
+            // The scan's constants (0-4), the conv width (5), the norm's eps (6), then `extra`;
+            // `gdn_decode`'s bindings (0-13), then — a model that drafts, at `gdn_verify` — its
+            // draft lanes (14, 15).
+            let fused = |library, function, extra: &[ConstantValue], lanes: bool| {
+                let mut constants = scan_constants();
+                constants.extend([
+                    ConstantValue::uint(5, kernel),
+                    ConstantValue::float(6, p.rms_norm_eps),
+                ]);
+                constants.extend_from_slice(extra);
+                let mut bindings = vec![
+                    arena(out_slot, 0),
+                    arena(qkv_slot, 1),
+                    arena(z_slot, 2),
+                    arena(a_slot, 3),
+                    arena(b_slot, 4),
+                    weight(WeightTensor::GdnConv1d, 5),
+                    runtime(RuntimeBindingKind::GdnConvState { layer: layer_id }, 6),
+                    runtime(RuntimeBindingKind::GdnSsmState { layer: layer_id }, 7),
+                    runtime(RuntimeBindingKind::CuSeqlensQ, 8),
+                    runtime(RuntimeBindingKind::GdnStateIndices, 9),
+                    runtime(RuntimeBindingKind::GdnIsFresh, 10),
+                    weight(WeightTensor::GdnALog, 11),
+                    weight(WeightTensor::GdnDtBias, 12),
+                    weight(WeightTensor::GdnNorm, 13),
+                ];
+                if lanes {
+                    bindings.extend([
+                        runtime(RuntimeBindingKind::GdnConvLanes { layer: layer_id }, 14),
+                        runtime(RuntimeBindingKind::GdnSsmLanes { layer: layer_id }, 15),
+                    ]);
+                }
+                LoweredCommand {
+                    kernel: KernelId::GatedDeltaNet,
+                    library,
+                    function,
+                    constants: baked(constants),
+                    dispatch: DispatchShape {
+                        threadgroups: (1, nk, 1),
+                        threads_per_threadgroup: (1024, 1, 1),
+                        m_scaling: Some(MScaling {
+                            axis: MScaleAxis::Z,
+                            bucket_m: BucketM(1),
+                            set_axis: Some(crate::tape::lowered::SetAxis::Seqs(MScaleAxis::Z)),
+                        }),
+                    },
+                    bindings: baked(bindings),
+                    gemm_dims: None,
+                }
+            };
+
             // A decode step's token — every sequence's one — is one command, not three a
-            // barrier apart (`gdn_decode`): a threadgroup of 1024 per (sequence, key head) runs its
-            // conv channels, its value heads' scan and their norm. Its shader's static asserts are
-            // these bounds. `route_gdn` runs it on plain decode steps and the commands below on
-            // the rest; where it runs every step — a one-row bucket of a model without drafts —
-            // it runs alone.
+            // barrier apart (`gdn_decode`). Its shader's static asserts are these bounds.
+            // `route_gdn` runs it on plain decode steps and the commands below on the rest; where
+            // it runs every step — a one-row bucket of a model without drafts — it runs alone.
             let per_key = nv / nk.max(1);
             let decode = (simd_scan
                 && nv.is_multiple_of(nk)
@@ -5183,50 +5234,41 @@ fn lower_one(
                 && hv.is_multiple_of(32)
                 && hv <= 256
                 && kernel <= 8)
-                .then(|| {
-                    let mut constants = scan_constants();
-                    constants.extend([
-                        ConstantValue::uint(5, kernel),
-                        ConstantValue::float(6, p.rms_norm_eps),
-                    ]);
-                    let bindings = vec![
-                        arena(out_slot, 0),
-                        arena(qkv_slot, 1),
-                        arena(z_slot, 2),
-                        arena(a_slot, 3),
-                        arena(b_slot, 4),
-                        weight(WeightTensor::GdnConv1d, 5),
-                        runtime(RuntimeBindingKind::GdnConvState { layer: layer_id }, 6),
-                        runtime(RuntimeBindingKind::GdnSsmState { layer: layer_id }, 7),
-                        runtime(RuntimeBindingKind::CuSeqlensQ, 8),
-                        runtime(RuntimeBindingKind::GdnStateIndices, 9),
-                        runtime(RuntimeBindingKind::GdnIsFresh, 10),
-                        weight(WeightTensor::GdnALog, 11),
-                        weight(WeightTensor::GdnDtBias, 12),
-                        weight(WeightTensor::GdnNorm, 13),
-                    ];
-                    LoweredCommand {
-                        kernel: KernelId::GatedDeltaNet,
-                        library: "gdn_decode",
-                        function: gdn_decode_static_name(dtype),
-                        constants: baked(constants),
-                        dispatch: DispatchShape {
-                            threadgroups: (1, nk, 1),
-                            threads_per_threadgroup: (1024, 1, 1),
-                            m_scaling: Some(MScaling {
-                                axis: MScaleAxis::Z,
-                                bucket_m: BucketM(1),
-                                set_axis: Some(crate::tape::lowered::SetAxis::Seqs(MScaleAxis::Z)),
-                            }),
-                        },
-                        bindings: baked(bindings),
-                        gemm_dims: None,
-                    }
-                });
+                .then(|| fused("gdn_decode", gdn_decode_static_name(dtype), &[], false));
             if let Some(decode) = decode
                 && GdnStepsKnown::at(p, bucket_m).run(|d, q| d && q) == GuardRun::Gated(None)
             {
                 return Ok(vec![decode]);
+            }
+
+            // A bucket of at most GDN_VERIFY_ROWS rows holds no sequence of more: every step it
+            // runs — a verify step's token and drafts, a few sequences' decode tokens, a short
+            // plain chunk — is one command (`gdn_verify`), each row's conv, norms and gates
+            // computed once for its threadgroup and handed to the scan and the norm in
+            // threadgroup memory, where the three commands below pass them through device
+            // scratch a barrier apart. Its shader's static asserts are these bounds.
+            let verify = (simd_scan
+                && nv.is_multiple_of(nk)
+                && 2 * hk + per_key * hv <= 1024
+                && (per_key * hv).is_multiple_of(32 * 4)
+                && hv == 128
+                && kernel <= 8
+                && (2..=GDN_VERIFY_ROWS).contains(&bucket_m)
+                && bucket_m * per_key <= 32
+                && p.spec_drafts < GDN_VERIFY_ROWS
+                && bucket_m + p.spec_drafts < 32
+                && bucket_m * (2 * hk + 2 * per_key * hv) * 4
+                    + (2 * bucket_m + p.spec_drafts + 1 + 3 * bucket_m * per_key) * 4
+                    <= 32768)
+                .then(|| {
+                    let rows = [
+                        ConstantValue::uint(7, bucket_m),
+                        ConstantValue::uint(8, p.spec_drafts),
+                    ];
+                    fused("gdn_verify", gdn_verify_static_name(dtype), &rows, p.spec_drafts > 0)
+                });
+            if let Some(verify) = verify {
+                return Ok(vec![verify]);
             }
 
             let layout = GdnScratchLayout::compute(bucket_m, conv_dim, nv, value_dim);
@@ -6046,6 +6088,17 @@ fn gdn_decode_static_name(dtype: DequantDtype) -> &'static str {
     match dtype {
         DequantDtype::F16 => "gdn_decode_f16",
         DequantDtype::Bf16 => "gdn_decode_bf16",
+    }
+}
+
+/// The most rows a bucket of `gdn_verify` steps holds (its shader's `GDN_VER_ROWS`, at most 8: a
+/// simdgroup a row's norms): the verify-sized buckets.
+const GDN_VERIFY_ROWS: u32 = crate::op_abi::METAL_VERIFY_ROWS;
+
+fn gdn_verify_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "gdn_verify_f16",
+        DequantDtype::Bf16 => "gdn_verify_bf16",
     }
 }
 
