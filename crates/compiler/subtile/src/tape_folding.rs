@@ -28,9 +28,7 @@ use std::collections::BTreeMap;
 use crate::handoff::{LoweredDecode, SourceBinding};
 use crate::lower::GemmWeightKind;
 use crate::ops::SubOpKind;
-use crate::subtile_ir::{
-    ExpertBundle, KvOperand, NumExperts, SubOp, SubtileIR, TensorId, TopK,
-};
+use crate::subtile_ir::{ExpertBundle, KvOperand, NumExperts, SubOp, SubtileIR, TensorId, TopK};
 use crate::subtile_tape::{SlotId, SubtileTape};
 use crate::tape_colouring::FoldFacts;
 use crate::tape_steps::{Operand, OperandIx, StepPos, TapeReadError, read_steps};
@@ -245,12 +243,19 @@ impl RoutedBands {
     /// Whether a bake of `rows` tokens over `experts`, each row picking `k`, runs `bundle`'s
     /// (row, pick) pairs grouped by expert — sorted or tiled, through a copy of the rows the
     /// routing must exist to make.
-    pub fn groups_pairs(&self, rows: u32, experts: NumExperts, k: TopK, bundle: ExpertBundle) -> bool {
+    pub fn groups_pairs(
+        &self,
+        rows: u32,
+        experts: NumExperts,
+        k: TopK,
+        bundle: ExpertBundle,
+    ) -> bool {
         let pairs = rows.saturating_mul(k.get());
         let per_expert = pairs as f32 / experts.get() as f32;
         self.grouped_bundles.contains(&bundle)
             && pairs >= self.grouped_pairs
-            && (self.sorted_per_expert.contains(&per_expert) || per_expert >= self.grouped_per_expert)
+            && (self.sorted_per_expert.contains(&per_expert)
+                || per_expert >= self.grouped_per_expert)
     }
 }
 

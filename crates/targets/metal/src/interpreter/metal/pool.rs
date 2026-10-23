@@ -48,6 +48,29 @@ use crate::tape::lowered::{ClassedTape, KvAddressing};
 use objc2::runtime::ProtocolObject;
 use scratchy_ir::{CanonicalParams, Instruction};
 
+/// The routed fold band a bucket row carries: which band's step tape its slots, terminal and
+/// arena were coloured under ([`crate::op_abi::METAL_FUSIONS`] wide,
+/// [`crate::op_abi::METAL_FUSIONS_NARROW`] narrow). One row per bucket per band — a bucket
+/// whose bands fold the same step tape (every dense model, and every bucket the routed fold
+/// refuses) carries twin rows, whose facts serve every class alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum FoldBand {
+    /// The band every chip but the wide-M5 class lowers: the fold's one-row origin.
+    Narrow,
+    /// The band the wide-M5 class lowers: the fold through the verify-sized rows.
+    Wide,
+}
+
+impl FoldBand {
+    /// The band a device of `class` runs.
+    pub fn for_class(class: crate::tape::lowered::GenClass) -> Self {
+        match class {
+            crate::tape::lowered::GenClass::M5Wide => FoldBand::Wide,
+            _ => FoldBand::Narrow,
+        }
+    }
+}
+
 /// One bucket's compile-time data, ready to be lowered + handed to a
 /// [`MetalWorkerPool`].
 ///
@@ -72,6 +95,9 @@ use scratchy_ir::{CanonicalParams, Instruction};
 /// an `Arc<[MetalBucketSpec]>` cheaply.
 pub struct MetalBucketSpec {
     pub bucket_m: u32,
+    /// The routed fold band this row's slots, terminal and arena were coloured under; the pool
+    /// keeps the rows whose band its device's class lowers. See [`FoldBand`].
+    pub band: FoldBand,
     pub num_arena_slots: u32,
     /// Index in the colored arena where this bucket's terminal
     /// activation lands (lm_head output for decoder layouts; the
@@ -613,20 +639,32 @@ pub fn pick_rung(
         tq,
         ranks,
     } = *rungs;
-    let smallest = bucket_specs
+    // The bucket rows whose band this device lowers — one per bucket, the other band's row
+    // dropped here — kept to those the memory budget affords, at least the smallest.
+    let band_specs = |band: FoldBand| {
+        bucket_specs
+            .iter()
+            .filter(|s| s.band == band)
+            .collect::<Vec<_>>()
+    };
+    let profile = crate::device::known_profile(device)
+        .ok_or_else(|| PoolBuildError::UnknownDevice(device.name().to_string()))?;
+    let gpu_cores = crate::device::gpu_cores(device).ok_or(PoolBuildError::UnknownGpuCores)?;
+    // The class the routed fold's band rides on: a Max-scale M5 (enough GPU cores) takes the
+    // wide band, every other chip the narrow one — selection only, both bands baked at expansion.
+    let gen_class = crate::tape::lowered::GenClass::for_device(profile.generation, gpu_cores);
+    let band = FoldBand::for_class(gen_class);
+    let band_buckets = band_specs(band);
+    let smallest = band_buckets
         .iter()
         .min_by_key(|s| s.bucket_m)
         .ok_or(PoolBuildError::NoBuckets)?;
     let affords = |s: &&MetalBucketSpec| max_bucket_m.is_none_or(|cap| s.bucket_m <= cap);
-    let mut buckets: Vec<&MetalBucketSpec> = bucket_specs.iter().filter(affords).collect();
+    let mut buckets: Vec<&MetalBucketSpec> = band_buckets.iter().copied().filter(affords).collect();
     if buckets.is_empty() {
         buckets.push(smallest);
     }
-    let profile = crate::device::known_profile(device)
-        .ok_or_else(|| PoolBuildError::UnknownDevice(device.name().to_string()))?;
-    let gen_class = crate::tape::lowered::GenClass::of(profile.generation);
     let need = MaxBlocksPerSeq(u32::try_from(block_cap).unwrap_or(u32::MAX));
-    let gpu_cores = crate::device::gpu_cores(device).ok_or(PoolBuildError::UnknownGpuCores)?;
     let tq_heads = TqDecodeHeads::for_group(tq.head_dim, tq.q_heads, tq.kv_heads, gpu_cores);
     let serves = |t: &&ClassedTape| {
         t.gen_class == gen_class
@@ -2801,6 +2839,28 @@ mod tests {
         assert!(matches!(pool.pick_bucket(0), Err(ForwardError::ZeroTokens)));
     }
 
+    /// The wide class is the M5 generation at Max-scale core counts alone: the class the routed
+    /// fold's wide band rides on (`M5_WIDE_MIN_CORES` — measured on a 40-core M5 Max, PR #847,
+    /// and lost on a 10-core base M5, its review). Every other chip, and an M5 under the
+    /// threshold, lowers the narrow band.
+    #[test]
+    fn the_wide_class_is_a_max_scale_m5_alone() {
+        use crate::tape::ids::GpuCores;
+        use crate::tape::lowered::GenClass;
+        use crate::tape::targets::AppleSiliconGen as G;
+        let class = |generation, cores| GenClass::for_device(generation, GpuCores(cores));
+        assert_eq!(class(G::M5, 10), GenClass::M5);
+        // The unmeasured 20-core M5 Pro stays narrow until benched.
+        assert_eq!(class(G::M5, 20), GenClass::M5);
+        assert_eq!(class(G::M5, 40), GenClass::M5Wide);
+        assert_eq!(class(G::M4, 40), GenClass::Mid);
+        assert_eq!(class(G::M1, 32), GenClass::M1);
+        let band = |generation, cores| FoldBand::for_class(class(generation, cores));
+        assert_eq!(band(G::M5, 40), FoldBand::Wide);
+        assert_eq!(band(G::M5, 10), FoldBand::Narrow);
+        assert_eq!(band(G::M2, 10), FoldBand::Narrow);
+    }
+
     #[test]
     fn pick_bucket_overflow_errors() {
         let Some(pool) = build_multi_bucket_pool(&[1, 8], 1) else {
@@ -3401,6 +3461,18 @@ mod tests {
     /// Baked tape rungs for an empty test bucket — what the macro
     /// would emit for `(empty, empty)` instruction streams: an
     /// empty-command tape per (gen class × chunked) pair at KV cap 128.
+    /// A bucket's two band rows, identical — the twin rows a real model emits when its bands
+    /// fold the same step tape, so whichever band the device picks serves it.
+    fn twin_rows(spec: &MetalBucketSpec) -> Vec<MetalBucketSpec> {
+        vec![
+            spec.clone(),
+            MetalBucketSpec {
+                band: FoldBand::Wide,
+                ..spec.clone()
+            },
+        ]
+    }
+
     fn test_empty_tapes(
         bucket_m: u32,
         num_arena_slots: u32,
@@ -3422,7 +3494,7 @@ mod tests {
             cache_live: &[],
         };
         let mut v = Vec::new();
-        for gen_class in [GenClass::M1, GenClass::Mid, GenClass::M5] {
+        for gen_class in [GenClass::M1, GenClass::Mid, GenClass::M5, GenClass::M5Wide] {
             for addressing in [KvAddressing::Direct, KvAddressing::Chunked] {
                 v.push(ClassedTape {
                     gen_class,
@@ -3523,8 +3595,9 @@ mod tests {
     /// pipeline cache / lowering / pool spawn end-to-end.
     #[test]
     fn for_buckets_builds_pool_for_single_empty_bucket() {
-        let specs = [MetalBucketSpec {
+        let spec = MetalBucketSpec {
             bucket_m: 1,
+            band: FoldBand::Narrow,
             num_arena_slots: 2,
             terminal_slot: 1,
             backbone_slot: 0,
@@ -3536,7 +3609,8 @@ mod tests {
             lm_head_barriers: EMPTY_BARRIERS,
             tapes: test_empty_tapes(1, 2),
             kernels: &[],
-        }];
+        };
+        let specs = twin_rows(&spec);
         let Some(res) = build_via_for_buckets(&specs, 2) else {
             eprintln!("skipping: no Metal device");
             return;
@@ -3555,8 +3629,9 @@ mod tests {
     /// contract: "the POOL refuses at load".
     #[test]
     fn for_buckets_refuses_bucket_with_no_tape_variants() {
-        let specs = [MetalBucketSpec {
+        let spec = MetalBucketSpec {
             bucket_m: 1,
+            band: FoldBand::Narrow,
             num_arena_slots: 2,
             terminal_slot: 1,
             backbone_slot: 0,
@@ -3568,7 +3643,8 @@ mod tests {
             lm_head_barriers: EMPTY_BARRIERS,
             tapes: &[],
             kernels: &[],
-        }];
+        };
+        let specs = twin_rows(&spec);
         let Some(res) = build_via_for_buckets(&specs, 1) else {
             eprintln!("skipping: no Metal device");
             return;
@@ -3590,9 +3666,10 @@ mod tests {
     /// `Arc<[…]>`.
     #[test]
     fn for_buckets_preserves_bucket_order() {
-        let specs = [
+        let narrow = [
             MetalBucketSpec {
                 bucket_m: 1,
+                band: FoldBand::Narrow,
                 num_arena_slots: 2,
                 terminal_slot: 1,
                 backbone_slot: 0,
@@ -3607,6 +3684,7 @@ mod tests {
             },
             MetalBucketSpec {
                 bucket_m: 8,
+                band: FoldBand::Narrow,
                 num_arena_slots: 2,
                 terminal_slot: 1,
                 backbone_slot: 0,
@@ -3620,6 +3698,7 @@ mod tests {
                 kernels: &[],
             },
         ];
+        let specs = narrow.iter().flat_map(twin_rows).collect::<Vec<_>>();
         let Some(res) = build_via_for_buckets(&specs, 1) else {
             eprintln!("skipping: no Metal device");
             return;
@@ -3651,6 +3730,7 @@ mod tests {
         static GUEST_ARENA: [u64; 3] = [64 * K, 128 * K, 512 * K];
         let spec = |arena: &'static [u64], backbone_slot| MetalBucketSpec {
             bucket_m: 1,
+            band: FoldBand::Narrow,
             num_arena_slots: 3,
             terminal_slot: 1,
             backbone_slot,
@@ -3663,7 +3743,10 @@ mod tests {
             tapes: test_empty_tapes(1, 3),
             kernels: &[],
         };
-        let (host, guest) = ([spec(&HOST_ARENA, 2)], [spec(&GUEST_ARENA, 0)]);
+        let (host, guest) = (
+            twin_rows(&spec(&HOST_ARENA, 2)),
+            twin_rows(&spec(&GUEST_ARENA, 0)),
+        );
         let host = test_rungs(&host, ArenaRanks::new(&[0, 2, 1], &[0, 1], &host));
         let guest = test_rungs(&guest, ArenaRanks::new(&[2, 1, 0], &[2, 1], &guest));
         let pick = |rungs: &MetalRungs| {

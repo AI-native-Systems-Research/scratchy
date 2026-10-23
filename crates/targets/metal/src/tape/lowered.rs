@@ -2375,8 +2375,11 @@ impl std::error::Error for LoweringError {}
 
 /// Device-generation class a baked tape variant targets. The lowering's
 /// only device-profile dependence is `AppleSiliconGen` (NAX capability
-/// and the M1 bf16-simdgroup slow path), so three classes cover every
-/// chip; variants that lower identically are deduped at expansion.
+/// and the M1 bf16-simdgroup slow path), so the generation classes cover
+/// every chip; variants that lower identically are deduped at expansion.
+/// [`M5Wide`](GenClass::M5Wide) splits the M5 generation by GPU-core
+/// width, the one fact the routed fold's band rides on — it lowers under
+/// every M5 fact and differs only in which step tape it bakes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum GenClass {
     /// M1 family (no NAX, bf16 simdgroup emulated).
@@ -2385,6 +2388,10 @@ pub enum GenClass {
     Mid,
     /// M5+ (NAX hardware MMA).
     M5,
+    /// Max-scale M5 (≥ [`M5_WIDE_MIN_CORES`] GPU cores): the M5 lowering
+    /// under the routed fold's wide band, whose per-threadgroup routing
+    /// has the cores to hide behind.
+    M5Wide,
 }
 
 impl GenClass {
@@ -2397,6 +2404,20 @@ impl GenClass {
         }
     }
 
+    /// The class a device with `generation` and `gpu_cores` runs: the generation class, widened
+    /// to [`M5Wide`](GenClass::M5Wide) when an M5 has the cores the routed fold's wide band
+    /// needs. `gpu_cores` comes from the IO registry (`device::gpu_cores`) — the chip's name does
+    /// not determine it.
+    pub fn for_device(
+        generation: crate::tape::targets::AppleSiliconGen,
+        gpu_cores: crate::tape::ids::GpuCores,
+    ) -> Self {
+        match Self::of(generation) {
+            GenClass::M5 if gpu_cores.get() >= M5_WIDE_MIN_CORES => GenClass::M5Wide,
+            class => class,
+        }
+    }
+
     /// Whether this class stores MLX-affine 4-bit weight codes XOR 0x88
     /// (signed q - 8): the matrix unit's int8 x int4 lane reads them as
     /// stored (the W4A8 GEMM). The weight loader flips them on load and the
@@ -2404,9 +2425,16 @@ impl GenClass {
     /// ([`AffineCodes`](super::kernel_constants::AffineCodes)) — one fact,
     /// read by both.
     pub fn stores_affine_b4_offset8(self) -> bool {
-        matches!(self, GenClass::M5)
+        matches!(self, GenClass::M5 | GenClass::M5Wide)
     }
 }
+
+/// The fewest GPU cores an M5 needs before the wide class serves it: the routed fold's wide
+/// band folds the routing into the expert command through the verify-sized rows, which pays
+/// only where the fold's per-threadgroup routing has cores to hide behind — measured on a
+/// 40-core M5 Max (PR #847: −4.1% TPOT) and lost on a 10-core base M5 (its review: +4.7%
+/// verify ITL). An unmeasured chip — the 20-core M5 Pro — stays narrow until benched.
+pub const M5_WIDE_MIN_CORES: u32 = 32;
 
 /// How a tape's KV readers address the paged cache: a workload fact the caller names when it
 /// picks a rung.
