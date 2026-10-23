@@ -3831,7 +3831,10 @@ mod tests {
             tapes: &[],
             kernels: &[],
         };
-        let specs = [spec(1), spec(8)].iter().flat_map(twin_rows).collect::<Vec<_>>();
+        let specs = [spec(1), spec(8)]
+            .iter()
+            .flat_map(twin_rows)
+            .collect::<Vec<_>>();
         assert_eq!(specs.len(), 4);
         assert_eq!(test_rungs(&specs, ArenaRanks::NONE).bucket_ms(), [1, 8]);
     }
