@@ -2,7 +2,7 @@
 //! every other spliced Triton kernel takes, over the SAME mint the codegen seam
 //! performs — the op_name by the builder's naming law, the program, the
 //! parameter count, the grid, and the buffer pairing (the widened row first,
-//! the seven tables in operand order, the idx stick LAST). The golden's own
+//! the nine tables in operand order, the idx stick LAST). The golden's own
 //! discipline: what the card launches is what this test pins.
 
 use ktir_superdsc::ktir_node::Program;

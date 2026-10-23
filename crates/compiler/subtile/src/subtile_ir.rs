@@ -1349,16 +1349,20 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     // ── The greedy token pick (see `kernels/argmax.py`) ─────────────
     /// The FIRST-maximum index of one logits row, as the `[1, BLOCK]` i32 idx
     /// stick the device's index ingestion reads. `inputs` = `[logits, bramp,
-    /// lramp, binc, linc, ones, sixtyfour, padoff]`: the `[1, PAD_V]` fp16 row
+    /// lramp, binc, linc, ones, sixtyfour, padoff, gramp, ginc]`: the `[1,
+    /// PAD_V]` fp16 row
     /// (whose pad bytes are NOT this op's contract — the lm-head's zero-pad
-    /// columns write 0.0 there every step) then the seven staged tables,
+    /// columns write 0.0 there every step) then the nine staged tables,
     /// functions of `vocab` alone, constant across decode steps — the two
     /// decreasing ramps that make the maxima first-max by monotonicity, the
     /// two increasing index tables that read the selection back out, the two
-    /// widen tables that keep every broadcast a two-tensor multiply, and the
+    /// widen tables that keep every broadcast a two-tensor multiply, the
     /// OFFSET row that carries the pad law (0.0 on the real lanes, −inf on
     /// the pads; the kernel adds it before its first max, so a pad lane can
-    /// never win and an all-−inf row still answers lane 0). An all-NaN row
+    /// never win and an all-−inf row still answers lane 0), and the
+    /// two-level ramp's GROUP pair (the outer group ramp and group index
+    /// table that keep every staged lane value fp16-exact at wide vocabs).
+    /// An all-NaN row
     /// answers past the last real lane (the sentinel); the consumer refuses
     /// `idx > vocab` loudly rather than feed a NaN-born index to the
     /// detokenizer.
@@ -1475,11 +1479,11 @@ pub struct ArgmaxMint {
     /// the consumer refuses past. Never the model config's word for it.
     pub vocab: u32,
     /// `argmax_pad_vocab(vocab)` — the width the result row was widened to and
-    /// the five whole-row tables share.
+    /// the seven whole-row tables share.
     pub pad_vocab: u32,
 }
 
-/// Append the greedy token pick to a ONE-REQUEST decode graph: seven staged-table
+/// Append the greedy token pick to a ONE-REQUEST decode graph: nine staged-table
 /// sources, the result tail chain's tensors widened to `[1, PAD_V]`, the
 /// `ArgMax` node reading the whole widened row, and the graph's RESULT re-pointed
 /// to the node's idx stick. Pure graph surgery — the GATE
@@ -1497,9 +1501,9 @@ pub struct ArgmaxMint {
 /// contract's redirect of the ANSWER, never a removal of the row it was picked
 /// from (the wiring's own doc records this contract).
 ///
-/// ⭐ THE SEVEN SOURCES ARE INSERTED AT `[num_sources, num_sources+7)`, NOT APPENDED:
+/// ⭐ THE NINE SOURCES ARE INSERTED AT `[num_sources, num_sources+9)`, NOT APPENDED:
 /// sources must hold `tensors[0..num_sources]`, so the insert renumbers every
-/// op-output `TensorId` up by seven — nodes' input/output regions, `op_output`, and
+/// op-output `TensorId` up by nine — nodes' input/output regions, `op_output`, and
 /// `result` (validate demands the result is an op output, so it always moves).
 /// Source ids below the old `num_sources` are UNTOUCHED, which is what keeps the
 /// caller's `weight_ids` and the wiring's binding scan valid against the minted
@@ -1811,9 +1815,18 @@ pub fn eval_node<F: RopeForm>(
             }
             let idx = match row[..vocab].iter().position(|&x| x == m) {
                 Some(first) => first as u32,
-                // The all-NaN sentinel: the pad region's staged tables answer
-                // NB·64 + 64 = PAD_V + BLOCK, one past the padded row.
-                None => argmax_pad_vocab(vocab as u32) + ARGMAX_BLOCK,
+                // The all-NaN sentinel: the pad lanes stage ginc = G, binc =
+                // GROUP_BLOCKS and linc = BLOCK, so the combine answers
+                // G·4096 + 64·64 + 64 — at every admitted production shape
+                // (PAD_V a whole number of 4096-lane groups) that is PAD_V +
+                // 4160, far past the last real lane. The kernel's own
+                // arithmetic, not the flat ramp's PAD_V + BLOCK.
+                None => {
+                    argmax_groups(argmax_pad_vocab(vocab as u32))
+                        * (ARGMAX_BLOCK * ARGMAX_GROUP_BLOCKS)
+                        + ARGMAX_GROUP_BLOCKS * ARGMAX_BLOCK
+                        + ARGMAX_BLOCK
+                }
             };
             vec![idx as f32; (out_rows * out_cols) as usize]
         }
@@ -4117,10 +4130,10 @@ mod tests {
         assert!(validate(&bad).is_err(), "use-before-def must be rejected");
     }
 
-    /// ⭐ THE ARGMAX MINT'S SURGERY, stated as the graph's own invariants: seven table
-    /// sources INSERTED at `[num_sources, num_sources+7)` (so sources still hold
+    /// ⭐ THE ARGMAX MINT'S SURGERY, stated as the graph's own invariants: nine table
+    /// sources INSERTED at `[num_sources, num_sources+9)` (so sources still hold
     /// `tensors[0..num_sources]`), every op-output tid — the result included —
-    /// renumbered up by seven while the source ids below the old `num_sources` stay
+    /// renumbered up by nine while the source ids below the old `num_sources` stay
     /// UNTOUCHED (what keeps the caller's `weight_ids` and the wiring's binding scan
     /// valid against the minted graph), the result row widened to PAD_V with the
     /// per-step writer still covering `[0, vocab)` only (the pad tail is written by
@@ -4130,7 +4143,7 @@ mod tests {
     /// the wiring's guard and the splice's lower both consume; pinned here so a
     /// surgery regression is a test failure, not a card divergence.
     #[test]
-    fn the_argmax_mint_inserts_seven_tables_and_renumbers_the_op_outputs() {
+    fn the_argmax_mint_inserts_nine_tables_and_renumbers_the_op_outputs() {
         let nz = |k| std::num::NonZeroU32::new(k).unwrap();
         let input = crate::lower::LoweringInput {
             exported: None,
@@ -4156,24 +4169,25 @@ mod tests {
         let minted = mint_argmax(&mut g);
         assert_eq!((minted.vocab, minted.pad_vocab), (5, 8));
 
-        // The seven sources hold [2, 9); the old op output moved 2 -> 9; the stick is 10.
-        assert_eq!(g.num_sources, 9, "seven table sources were inserted");
+        // The nine sources hold [2, 11); the old op output moved 2 -> 11; the
+        // stick is 12.
+        assert_eq!(g.num_sources, 11, "nine table sources were inserted");
         assert_eq!(
-            g.result.0, 10,
+            g.result.0, 12,
             "the answer re-point: the rung's result is the idx stick"
         );
         assert_eq!(
             g.op_output,
-            vec![TensorId(9)],
+            vec![TensorId(11)],
             "op_output moved with it (the ROW, still placed and readable by tid)"
         );
         assert_eq!(
-            (g.tensors[9].rows, g.tensors[9].cols),
+            (g.tensors[11].rows, g.tensors[11].cols),
             (1, 8),
             "the result row is widened to PAD_V"
         );
         assert_eq!(
-            (g.tensors[10].rows, g.tensors[10].cols),
+            (g.tensors[12].rows, g.tensors[12].cols),
             (1, ARGMAX_BLOCK),
             "the idx stick"
         );
@@ -4185,6 +4199,8 @@ mod tests {
             (6, ARGMAX_BLOCK),
             (7, ARGMAX_BLOCK),
             (8, 8),
+            (9, 8),
+            (10, 8),
         ] {
             assert_eq!(
                 (g.tensors[t].rows, g.tensors[t].cols),
@@ -4196,7 +4212,7 @@ mod tests {
         assert_eq!((g.tensors[0].rows, g.tensors[0].cols), (1, 1));
         assert_eq!((g.tensors[1].rows, g.tensors[1].cols), (1, 5));
 
-        // The node: whole regions at corner 0, the widened row first, the seven
+        // The node: whole regions at corner 0, the widened row first, the nine
         // tables in operand order, the stick out.
         let node = g.nodes.last().unwrap();
         assert!(
@@ -4206,10 +4222,10 @@ mod tests {
         let tids = node.inputs.iter().map(|tr| tr.tensor.0).collect::<Vec<_>>();
         assert_eq!(
             tids,
-            vec![9, 2, 3, 4, 5, 6, 7, 8],
-            "the row first, then the seven tables in operand order"
+            vec![11, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            "the row first, then the nine tables in operand order"
         );
-        assert_eq!(node.output.tensor.0, 10);
+        assert_eq!(node.output.tensor.0, 12);
         assert_eq!(
             node.output.tensor, g.result,
             "the stick is the graph result"
@@ -4229,7 +4245,7 @@ mod tests {
         // The matmul's writer region still covers [0, vocab) — the widening adds an
         // unwritten tail, never a wider writer.
         let matmul = &g.nodes[0];
-        assert_eq!(matmul.output.tensor.0, 9);
+        assert_eq!(matmul.output.tensor.0, 11);
         assert_eq!(
             matmul.output.region.cols.len, 5,
             "the per-step writer keeps writing [0, vocab)"
@@ -4240,8 +4256,9 @@ mod tests {
     /// ⭐ THE HOST REFERENCE IS THE KERNEL'S OWN LAW — the contract the card compare
     /// anchors on, stated through the SAME mint the codegen seam performs. FIRST-max
     /// by scan order; a tie answered by the FIRST lane; an all-NaN row answered by
-    /// the sentinel (one past the padded row, the consumer's `idx > vocab`
-    /// refusal); an all-−inf row answered by lane 0 (−inf == −inf satisfies the
+    /// the sentinel (the two-level ramp's pad arithmetic, G·4096 + 64·64 + 64 —
+    /// PAD_V + 4160 at every admitted production shape — the consumer's `idx >
+    /// vocab` refusal); an all-−inf row answered by lane 0 (−inf == −inf satisfies the
     /// equality — this is WHY the offset row stages −inf on the pads and not a
     /// finite floor, which would out-max them and flip the answer to the sentinel);
     /// and the `[1, 64]` stick carrying the SAME idx in every lane.
@@ -4268,14 +4285,14 @@ mod tests {
             };
             let mut g = lower_region(&input, nz(64));
             mint_argmax(&mut g);
-            // The seven tables are the WORKER's load-time staging, not the host
+            // The nine tables are the WORKER's load-time staging, not the host
             // reference's (eval gathers inputs[0] only) — but eval_dag sizes every
             // source buffer, so they ride as zeros.
             let pad = argmax_pad_vocab(5) as usize;
             let tables: Vec<Vec<f32>> = (0..4)
                 .map(|_| vec![0.0; pad])
                 .chain((0..2).map(|_| vec![0.0; ARGMAX_BLOCK as usize]))
-                .chain(std::iter::once(vec![0.0; pad]))
+                .chain((0..3).map(|_| vec![0.0; pad]))
                 .collect();
             let act = [1.0f32];
             let srcs: Vec<&[f32]> = std::iter::once(&act[..])
@@ -4303,8 +4320,14 @@ mod tests {
         );
         assert_eq!(
             eval(&[f32::NAN; 5]),
-            stick((argmax_pad_vocab(5) + ARGMAX_BLOCK) as f32),
-            "an all-NaN row answers the sentinel, one past the padded row"
+            stick(
+                (argmax_groups(argmax_pad_vocab(5)) * (ARGMAX_BLOCK * ARGMAX_GROUP_BLOCKS)
+                    + ARGMAX_GROUP_BLOCKS * ARGMAX_BLOCK
+                    + ARGMAX_BLOCK) as f32
+            ),
+            "an all-NaN row answers the sentinel, the two-level ramp's pad \
+             arithmetic (G·4096 + 64·64 + 64 — at vocab 5, G = 0, so 4160; \
+             PAD_V + 4160 at every admitted production shape)"
         );
         assert_eq!(
             eval(&[f32::NEG_INFINITY; 5]),
@@ -4350,9 +4373,9 @@ mod tests {
         let n_src = g.num_sources;
         mint_argmax(&mut g);
 
-        // The matmul's output (tid n_src, renumbered up by seven) AND the ScalarMul's
+        // The matmul's output (tid n_src, renumbered up by nine) AND the ScalarMul's
         // result are BOTH [1, PAD_V] now — the epilogue's chunks cannot disagree.
-        let matmul_out = TensorId(n_src + 7);
+        let matmul_out = TensorId(n_src + 9);
         let row = g.nodes.last().unwrap().inputs[0].tensor;
         assert_ne!(matmul_out, row, "the fixture is a two-link tail");
         assert_eq!(

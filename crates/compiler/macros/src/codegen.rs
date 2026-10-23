@@ -11052,7 +11052,7 @@ fn dump_wavefront_mega(
                 // lm-head the emitted tail admits (arity-2 Dense fp16 — the ruling's
                 // admission, the #698 tie conjunct DROPPED: no gather link exists to
                 // demand it). The splice is the kernel's ONLY entry — this mint appends
-                // the node and its seven staged-table sources to the graph, and everything
+                // the node and its nine staged-table sources to the graph, and everything
                 // downstream (the splice's row, the door's whole-function walk, the
                 // placement pass, the wiring's argmax facts) is the same machinery every
                 // other Triton kernel takes. Batched rungs, prefill and every staged or

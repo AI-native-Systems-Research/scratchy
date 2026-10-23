@@ -770,7 +770,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Option<Program>)> {
         // wanted" ruling was the STANDALONE ladder's (a placeholder sufficed when nothing
         // produced the kind); the splice changed the fact. The whole-function walk
         // (`KTIR_WHOLE=1`) still never reads it; a per-`Program` run refuses loudly at
-        // the program arm (a nine-parameter whole-function body is `emit_whole`'s, not
+        // the program arm (an eleven-parameter whole-function body is `emit_whole`'s, not
         // a single-descriptor dispatch's). (⛔ NOT the vendor topk pair: `topk.ddl`'s
         // ripple keeps the LAST index among equals -- `GREATERTHAN(running, candidate)`
         // with an equal candidate displacing -- so `topkindex` at k=1 is LAST-max and

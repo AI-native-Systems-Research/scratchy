@@ -383,7 +383,7 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
             program: Program::Reshape,
         },
         // ⭐ THE GREEDY TOKEN PICK — the whole vocab scan as ONE kernel: the row, the
-        // seven staged tables (functions of the vocab alone, host-staged at load —
+        // nine staged tables (functions of the vocab alone, host-staged at load —
         // the seventh is the pad law's offset row), and the `[1, 64]` i32 idx stick
         // out. The vocab rides the node (never a model name); every constexpr below
         // derives from it.
@@ -1149,11 +1149,12 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
         // refuses them before the splice — the MoE lowers only from
         // `kernels/moe.py` through KTIR.
         SubOp::ScalarWeightMul => 2,
-        // ⭐ THE ARGMAX'S ARITY IS 8: the logits row plus the seven staged tables
+        // ⭐ THE ARGMAX'S ARITY IS 10: the logits row plus the nine staged tables
         // (two decreasing ramps, two increasing index tables, two widen tables,
-        // the pad law's offset row) — every kernel parameter but the output is a
-        // tape operand, per the splice's own positional law.
-        SubOp::ArgMax { .. } => 8,
+        // the pad law's offset row, the two-level ramp's group pair) — every
+        // kernel parameter but the output is a tape operand, per the splice's
+        // own positional law.
+        SubOp::ArgMax { .. } => 10,
         SubOp::TanhSoftCap { .. } | SubOp::RmsNormUnit { .. } | SubOp::Reshape { .. } => 1,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.

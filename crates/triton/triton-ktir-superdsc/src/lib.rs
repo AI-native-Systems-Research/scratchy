@@ -263,7 +263,7 @@ fn emit_regions(
             return Err(Error {
                 stage: "program",
                 message: format!(
-                    "{:?} is a nine-parameter whole-function body — `emit_whole` is its \
+                    "{:?} is an eleven-parameter whole-function body — `emit_whole` is its \
                      door, and a per-`Program` dispatch would be a second, hand-rolled path",
                     node.program
                 ),

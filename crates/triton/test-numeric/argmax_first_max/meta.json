@@ -84,6 +84,22 @@
       "dtype": "f16"
     },
     {
+      "arg": "gramp_ptr",
+      "file": "in_gramp_ptr.bin",
+      "shape": [
+        65536
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "ginc_ptr",
+      "file": "in_ginc_ptr.bin",
+      "shape": [
+        65536
+      ],
+      "dtype": "f16"
+    },
+    {
       "arg": "idx_ptr",
       "file": "in_idx_ptr.bin",
       "shape": [

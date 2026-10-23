@@ -8,7 +8,7 @@
 //! the splice produces this body, so the kind is stated like every spliced family's. The
 //! kernel crosses through the WHOLE-FUNCTION door (`emit_whole`), which walks the function's
 //! ops and never dispatches on the `Program`; the per-`Program` door REFUSES the kind by
-//! name — a nine-parameter whole-function body (five whole-row reduces, the equality
+//! name — an eleven-parameter whole-function body (seven whole-row reduces, the equality
 //! chain, the fp32 island) is not a single-descriptor dispatch, and building one would be a
 //! second, hand-rolled path. This file pins that refusal.
 //!
@@ -74,7 +74,7 @@ fn the_per_program_door_refuses_while_the_whole_door_emits() {
         "the whole-function door emitted no ops — an emission over nothing"
     );
     // THE PIN — the per-`Program` door refuses the whole-function body BY NAME, naming
-    // `emit_whole` as its door. Whatever classification the row states, a nine-parameter
+    // `emit_whole` as its door. Whatever classification the row states, an eleven-parameter
     // multi-op body is not a single-descriptor dispatch.
     let err = match triton_ktir_superdsc::emit_node(&node) {
         Err(e) => e,
@@ -85,7 +85,7 @@ fn the_per_program_door_refuses_while_the_whole_door_emits() {
         ),
     };
     assert!(
-        err.message.contains("nine-parameter whole-function body"),
+        err.message.contains("eleven-parameter whole-function body"),
         "the per-`Program` refusal must name the whole-function door as the body's, got: \
          [{}] {} (door kind: {:?})",
         err.stage,

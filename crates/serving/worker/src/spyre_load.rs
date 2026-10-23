@@ -2503,7 +2503,7 @@ impl SpyreWorker {
                         }
                     };
                     // ⭐ THE RUNG'S OWN RESULT STAMP, not the solo wiring's `result_id`. The argmax
-                    // mint renumbers the ONE-REQUEST graph — seven staged tables spliced into the
+                    // mint renumbers the ONE-REQUEST graph — nine staged tables spliced into the
                     // source range shift every op output up — so a tid stated on the minted wiring
                     // names a different tensor, or none, in this unminted rung's layout (the load
                     // WARN that fired when the re-point landed: the stick's tid is past the rung's

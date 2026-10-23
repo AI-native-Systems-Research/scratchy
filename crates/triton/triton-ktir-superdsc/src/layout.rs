@@ -688,7 +688,7 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         | Program::LmLast
         | Program::Transpose
         | Program::Matmul
-        // The argmax's seven tables ride as ORDINARY tensor operands (the node's own
+        // The argmax's nine tables ride as ORDINARY tensor operands (the node's own
         // inputs, placed like every staged buffer) — no reserved tid names one.
         | Program::ArgMax => None,
         // ⭐ NO ENTRY POINT ON THIS LADDER, SO NO CONSTANTS TO NAME. None of these programs has a

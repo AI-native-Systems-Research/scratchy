@@ -204,9 +204,10 @@ pub enum Program {
     ScalarMul,
     Matmul,
     /// The greedy vocab scan — `kernels/argmax.py`: the FIRST-maximum index of one
-    /// `[1, PAD_V]` logits row, as the `[1, 64]` i32 idx stick. NINE tensor
-    /// parameters (the row, the seven staged tables that are functions of the vocab
-    /// alone — the seventh carries the pad law's offset row — and the output stick);
+    /// `[1, PAD_V]` logits row, as the `[1, 64]` i32 idx stick. ELEVEN tensor
+    /// parameters (the row, the nine staged tables that are functions of the vocab
+    /// alone — the seventh carries the pad law's offset row, the eighth and ninth
+    /// are the two-level ramp's group pair — and the output stick);
     /// the body is whole-row `tt.reduce` maxima,
     /// equality compares and staged-table multiplies over generic ops, with one
     /// fp32 island for the wide combine. The door reads NO fact off this program —
