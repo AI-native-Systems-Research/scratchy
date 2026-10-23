@@ -122,6 +122,7 @@ unsafe extern "C" {
         scale: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gemm_narrow_bf16_abt_prepare() -> i32;
     fn scratchy_cuda_gemm_narrow_bf16_abt(
         a: *const c_void,
         b: *const c_void,
@@ -131,12 +132,34 @@ unsafe extern "C" {
         k: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gemv_bf16_abt_prepare() -> i32;
     fn scratchy_cuda_gemv_bf16_abt(
         a: *const c_void,
         b: *const c_void,
         c: *mut c_void,
         n: u32,
         k: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_tma_box_probe_load(
+        src: *const c_void,
+        poison: *const c_void,
+        dump: *mut c_void,
+        rows: u32,
+        cols: u32,
+        tile_row: u32,
+        tile_col: u32,
+        swizzled: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_tma_box_probe_store(
+        pattern: *const c_void,
+        dst: *mut c_void,
+        rows: u32,
+        cols: u32,
+        tile_row: u32,
+        tile_col: u32,
+        swizzled: u32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_attn_decode_bf16(
@@ -393,6 +416,11 @@ impl std::error::Error for KernelError {}
 const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gemm_bf16_abt", scratchy_cuda_gemm_bf16_abt_prepare),
     ("attn_prefill_bf16", scratchy_cuda_attn_prefill_bf16_prepare),
+    (
+        "gemm_narrow_bf16_abt",
+        scratchy_cuda_gemm_narrow_bf16_abt_prepare,
+    ),
+    ("gemv_bf16_abt", scratchy_cuda_gemv_bf16_abt_prepare),
 ];
 
 /// Run every kernel's one-time setup on the current device, stopping at the first failure, which
@@ -772,8 +800,10 @@ pub unsafe fn attn_prefill_bf16(
 }
 
 /// Launch the narrow bf16 GEMM `C = A · Bᵀ` for at most 64 output columns: `A` is `[m, k]`, `B`
-/// `[n, k]` and `C` `[m, n]`, row-major bf16, accumulated in f32 and rounded once. One warp per
-/// row of `C`, a fixed reduction order, so the bits do not depend on the launch. Asynchronous.
+/// `[n, k]` and `C` `[m, n]`, row-major bf16, accumulated in f32 and rounded once. ThunderKittens'
+/// WGMMA over 64-row tiles of `A` against all of `B`'s rows, in a fixed K order, so an output
+/// row's bits depend only on its own row of `A` and on `B`, not on the launch or on `m`.
+/// Asynchronous.
 ///
 /// Refused with [`KernelError::NarrowShape`], before any pointer is touched, unless `m` is
 /// non-zero, `n` a non-zero multiple of 8 and at most 64 (`step::GEMM_NARROW_BF16_MULTIPLE`,
@@ -781,9 +811,10 @@ pub unsafe fn attn_prefill_bf16(
 ///
 /// # Safety
 ///
-/// `a`, `b` and `c` must be 16-byte-aligned device pointers to at least `m*k`, `n*k` and `m*n`
-/// bf16, valid for the whole kernel, with `c` overlapping neither input. `stream` must be a live
-/// `cudaStream_t` of the current device, or null for the default stream.
+/// [`prepare_all`] must have succeeded on the current device. `a`, `b` and `c` must be
+/// 16-byte-aligned device pointers to at least `m*k`, `n*k` and `m*n` bf16, valid for the whole
+/// kernel, with `c` overlapping neither input. `stream` must be a live `cudaStream_t` of the
+/// current device, or null for the default stream.
 pub unsafe fn gemm_narrow_bf16_abt(
     a: *const c_void,
     b: *const c_void,
@@ -792,14 +823,15 @@ pub unsafe fn gemm_narrow_bf16_abt(
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
     // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
-    // shape before it touches a pointer.
+    // shape before it touches a pointer and catches every C++ exception.
     let code = unsafe { scratchy_cuda_gemm_narrow_bf16_abt(a, b, c, m, n, k, stream) };
     check(code, KernelError::NarrowShape { m, n, k })
 }
 
 /// Launch the bf16 GEMV `c = a · Bᵀ`, the one-row GEMM: `a` is `[1, k]`, `B` `[n, k]` and `c`
-/// `[1, n]`, row-major bf16, accumulated in f32 and rounded once. One warp per column of `c`, a
-/// fixed reduction order, so the bits do not depend on the launch. Asynchronous.
+/// `[1, n]`, row-major bf16, accumulated in f32 and rounded once. ThunderKittens' WGMMA over 64
+/// columns of `c` per CTA, in a fixed K order, so the bits do not depend on the launch; only the
+/// `n` elements of `c` are written. Asynchronous.
 ///
 /// Refused with [`KernelError::GemvShape`], before any pointer is touched, unless `n` is
 /// non-zero, `k` a non-zero multiple of 8 (`step::GEMV_BF16_MULTIPLE`), and both at most
@@ -807,9 +839,10 @@ pub unsafe fn gemm_narrow_bf16_abt(
 ///
 /// # Safety
 ///
-/// `a`, `b` and `c` must be 16-byte-aligned device pointers to at least `k`, `n*k` and `n` bf16,
-/// valid for the whole kernel, with `c` overlapping neither input. `stream` must be a live
-/// `cudaStream_t` of the current device, or null for the default stream.
+/// [`prepare_all`] must have succeeded on the current device. `a`, `b` and `c` must be
+/// 16-byte-aligned device pointers to at least `k`, `n*k` and `n` bf16, valid for the whole
+/// kernel, with `c` overlapping neither input. `stream` must be a live `cudaStream_t` of the
+/// current device, or null for the default stream.
 pub unsafe fn gemv_bf16_abt(
     a: *const c_void,
     b: *const c_void,
@@ -818,9 +851,91 @@ pub unsafe fn gemv_bf16_abt(
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
     // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
-    // shape before it touches a pointer.
+    // shape before it touches a pointer and catches every C++ exception.
     let code = unsafe { scratchy_cuda_gemv_bf16_abt(a, b, c, n, k, stream) };
     check(code, KernelError::GemvShape { n, k })
+}
+
+// THE TMA BOX PROBE (`kernels/tma_box_probe.cu`): test support, for `tests/tma_bounds.rs` only.
+// No `CudaStep` and no lowering use it. It records what a ThunderKittens TMA tile load and store
+// do with a 64×64 bf16 box that runs past its array's edge, swizzled or plain: the facts the GEMV's
+// and the narrow GEMM's choice of tiles rests on. Its shared memory is under 48 KiB, so it is not
+// in `PREPARE`.
+
+/// Test support for `tests/tma_bounds.rs` only. TMA-load the 64×64 box at tile `(tile_row,
+/// tile_col)` of `src` (`[rows, cols]` bf16) into a swizzled (`swizzled`) or plain shared tile,
+/// over the tile first loaded from `poison` (`[64, 64]` bf16), then TMA-store the tile into `dump`
+/// (`[64, 64]` bf16). Refused with [`KernelError::RowShape`] when `rows` or `cols` is zero, `cols`
+/// is not a multiple of 8, or a dimension or tile coordinate is at or above `i32::MAX / 64`.
+/// Asynchronous.
+///
+/// # Safety
+///
+/// `src`, `poison` and `dump` must be 16-byte-aligned device pointers to `rows · cols`, 4096 and
+/// 4096 bf16, valid for the whole kernel; `dump` overlaps neither input. A swizzled load may read
+/// past `src`'s `rows · cols` elements, up to the next 64-element boundary of its last row (that
+/// is what it records), so `src` must be readable that far. `stream` must be a live
+/// `cudaStream_t` of the current device, or null for the default stream.
+#[doc(hidden)]
+pub unsafe fn tma_box_probe_load(
+    (src, poison, dump): (*const c_void, *const c_void, *mut c_void),
+    (rows, cols): (u32, u32),
+    (tile_row, tile_col): (u32, u32),
+    swizzled: bool,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_tma_box_probe_load(
+            src,
+            poison,
+            dump,
+            rows,
+            cols,
+            tile_row,
+            tile_col,
+            u32::from(swizzled),
+            stream,
+        )
+    };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Test support for `tests/tma_bounds.rs` only. TMA-load `pattern` (`[64, 64]` bf16) into a
+/// swizzled (`swizzled`) or plain shared tile, then TMA-store it at tile `(tile_row, tile_col)` of
+/// `dst` (`[rows, cols]` bf16). Refused as [`tma_box_probe_load`]. Asynchronous.
+///
+/// # Safety
+///
+/// `pattern` and `dst` must be 16-byte-aligned device pointers to 4096 and `rows · cols` bf16,
+/// valid for the whole kernel, not overlapping. A swizzled store may write past `dst`'s
+/// `rows · cols` elements, up to the next 64-element boundary of its last row (that is what it
+/// records), so `dst` must be writable that far. `stream` must be a live `cudaStream_t` of the
+/// current device, or null for the default stream.
+#[doc(hidden)]
+pub unsafe fn tma_box_probe_store(
+    (pattern, dst): (*const c_void, *mut c_void),
+    (rows, cols): (u32, u32),
+    (tile_row, tile_col): (u32, u32),
+    swizzled: bool,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_tma_box_probe_store(
+            pattern,
+            dst,
+            rows,
+            cols,
+            tile_row,
+            tile_col,
+            u32::from(swizzled),
+            stream,
+        )
+    };
+    check(code, KernelError::RowShape { rows, cols })
 }
 
 /// Launch the GQA decode attention of one query row `q` (`[1, q_heads · 256]`) over one layer's
