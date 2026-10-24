@@ -249,13 +249,15 @@ fn kv_append_writes_the_mapped_slots_bit_exactly() {
 }
 
 /// The random-input attention cases: `(q_heads, kv_heads, rows, P, L)`.
-const CASES: [(usize, usize, usize, usize, usize); 6] = [
+const CASES: [(usize, usize, usize, usize, usize); 7] = [
     (8, 2, 128, 0, 128),
     (8, 2, 256, 0, 256),
     (8, 2, 128, 300, 128),
     (8, 2, 128, 300, 1),
     (8, 2, 128, 37, 100),
     (16, 4, 256, 64, 256),
+    // Qwen3.6-35B-A3B's attention layers: 16 query heads over 2 kv heads (#857).
+    (16, 2, 256, 64, 256),
 ];
 
 /// The keys and values of a sequence of `tokens`, `[tokens, kv_heads · HD]`, written into fresh
@@ -433,7 +435,7 @@ fn the_mask_and_block_table_probe_is_exact() {
 fn the_gqa_probe_is_exact() {
     let device = h100();
     let mut pass = true;
-    for (qh, kvh) in [(8usize, 2usize), (16, 4)] {
+    for (qh, kvh) in [(8usize, 2usize), (16, 4), (16, 2)] {
         let (rows, p, len) = (128usize, 0usize, 128usize);
         let tokens = p + len;
         let k = vec![0u16; tokens * kvh * HD];
@@ -714,11 +716,12 @@ fn decode_inputs(kv_len: usize, (qh, kvh): (usize, usize), seed: u64) -> [Vec<u1
 /// same output, bit for bit, over the identity table with a clean (zero) pool, and on a repeat.
 /// K and V are read back from the cache, so the reference uses exactly the bits the kernel read.
 /// At qwen3.5-0.8b's heads (8 / 2) and qwen3.5-9b's (16 / 4).
+/// And Qwen3.6-35B-A3B's (16 / 2), a GQA group of 8 (#857).
 #[test]
 fn the_decode_attention_is_within_the_f64_bound() {
     let device = h100();
     let mut pass = true;
-    for (qh, kvh) in [(8usize, 2usize), (16, 4)] {
+    for (qh, kvh) in [(8usize, 2usize), (16, 4), (16, 2)] {
         for (case, &kv_len) in DEC_KV_LENS.iter().enumerate() {
             let seed = 0x0DEC_0000 + case as u64;
             let [q, k, v] = decode_inputs(kv_len, (qh, kvh), seed);
@@ -781,7 +784,7 @@ fn the_decode_attention_is_within_the_f64_bound() {
 fn the_decode_attention_probes_are_exact() {
     let device = h100();
     let mut pass = true;
-    for (qh, kvh) in [(8usize, 2usize), (16, 4)] {
+    for (qh, kvh) in [(8usize, 2usize), (16, 4), (16, 2)] {
         let kv_len = 300usize;
         let k = vec![0u16; kv_len * kvh * HD];
         let v: Vec<u16> = (0..kv_len * kvh * HD)
