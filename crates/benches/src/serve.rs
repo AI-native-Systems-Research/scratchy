@@ -41,10 +41,15 @@ struct RequestResult {
     /// Timestamp (seconds since benchmark start) when request was sent.
     start_time: f64,
     success: bool,
+    /// The text the stream carried, for `--save-detailed`.
+    generated_text: String,
+    /// Why the request failed; empty when it didn't (vLLM's `errors` entry).
+    error: String,
 }
 
 impl RequestResult {
-    fn failed(start_time: f64, e2el: f64) -> Self {
+    fn failed(start_time: f64, e2el: f64, error: String) -> Self {
+        eprintln!("Request failed: {error}");
         RequestResult {
             ttft: 0.0,
             itl: vec![],
@@ -53,7 +58,15 @@ impl RequestResult {
             chunks: 0,
             start_time,
             success: false,
+            generated_text: String::new(),
+            error,
         }
+    }
+
+    /// Output tokens per text chunk: 1 where the server sends a token a chunk, more where a
+    /// chunk carries several (speculative decoding, a server holding tokens back).
+    fn tokens_per_chunk(&self) -> Option<f64> {
+        (self.chunks > 0).then(|| self.output_tokens as f64 / self.chunks as f64)
     }
 }
 
@@ -61,6 +74,8 @@ impl RequestResult {
 struct Run {
     /// Every request sent.
     results: Vec<RequestResult>,
+    /// Each request's prompt tokens, in `results`' order.
+    input_lens: Vec<usize>,
     /// Prompt tokens over the successful requests.
     total_input_tokens: usize,
     /// Wall time of the measured requests (seconds).
@@ -157,8 +172,11 @@ fn send_request(
     let resp = match client.post(&body, request_id) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Request failed: {e}");
-            return RequestResult::failed(start_time, request_start.elapsed().as_secs_f64());
+            return RequestResult::failed(
+                start_time,
+                request_start.elapsed().as_secs_f64(),
+                e.to_string(),
+            );
         }
     };
 
@@ -167,8 +185,11 @@ fn send_request(
     if !resp.status().is_success() {
         let status = resp.status();
         let body_text = resp.into_body().read_to_string().unwrap_or_default();
-        eprintln!("Request failed with status {status}: {body_text}");
-        return RequestResult::failed(start_time, request_start.elapsed().as_secs_f64());
+        return RequestResult::failed(
+            start_time,
+            request_start.elapsed().as_secs_f64(),
+            format!("status {status}: {body_text}"),
+        );
     }
 
     // Parse SSE stream. Reading straight off the body reader keeps the
@@ -178,6 +199,7 @@ fn send_request(
     let mut buf = String::new();
     let mut usage_completion_tokens: Option<usize> = None;
     let mut chunks = 0usize;
+    let mut generated_text = String::new();
     let mut last_choices_time: Option<Instant> = None;
     // Why the stream says the request failed, if it does: the first one wins.
     let mut failure: Option<String> = None;
@@ -222,9 +244,10 @@ fn send_request(
                     if has_choices(&parsed) {
                         last_choices_time = Some(Instant::now());
                     }
-                    if chunk_has_text(&parsed) {
+                    if let Some(text) = chunk_text(&parsed) {
                         let now = Instant::now();
                         chunks += 1;
+                        generated_text.push_str(text);
                         if first_token_time.is_none() {
                             first_token_time = Some(now);
                         } else {
@@ -244,8 +267,7 @@ fn send_request(
     // A stream that ends the request as aborted or errored failed, whatever it streamed before:
     // a server whose engine stopped answers every request at once with an empty `abort`.
     if let Some(why) = failure {
-        eprintln!("Request failed: {why}");
-        return RequestResult::failed(start_time, request_start.elapsed().as_secs_f64());
+        return RequestResult::failed(start_time, request_start.elapsed().as_secs_f64(), why);
     }
 
     // No chunk carried text, but the server did answer: mlx_lm.server holds
@@ -278,6 +300,8 @@ fn send_request(
         chunks,
         start_time,
         success: first_token_time.is_some(),
+        generated_text,
+        error: String::new(),
     }
 }
 
@@ -318,13 +342,11 @@ fn chunk_failure(chunk: &serde_json::Value) -> Option<String> {
 
 /// Whether a streamed chunk carries generated text: `text` on the completions
 /// API, `delta.content` on chat. Keepalive and closing chunks carry none.
-fn chunk_has_text(chunk: &serde_json::Value) -> bool {
-    let Some(first) = chunk["choices"].as_array().and_then(|a| a.first()) else {
-        return false;
-    };
+fn chunk_text(chunk: &serde_json::Value) -> Option<&str> {
+    let first = chunk["choices"].as_array()?.first()?;
     [&first["text"], &first["delta"]["content"]]
-        .iter()
-        .any(|t| t.as_str().is_some_and(|s| !s.is_empty()))
+        .into_iter()
+        .find_map(|t| t.as_str().filter(|s| !s.is_empty()))
 }
 
 /// A request whose whole multi-token output arrived in one `choices` chunk
@@ -499,6 +521,9 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
     };
 
     if args.is_multi_turn() {
+        if args.save_detailed {
+            anyhow::bail!("--save-detailed keeps single-turn requests; a multi-turn run has none");
+        }
         return run_multi_turn(&args, agent, api_url, &model, &tokenizer);
     }
 
@@ -548,6 +573,7 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
 
     let mut itls: Vec<f64> = timed.iter().flat_map(|r| r.itl.iter().copied()).collect();
     itls.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let chunking = Chunking::of(&timed);
 
     let mut e2els: Vec<f64> = successful.iter().map(|r| r.e2el).collect();
     e2els.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -653,7 +679,10 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         match *metric {
             "ttft" => print_metric("TTFT", "Time to First Token", &ttfts),
             "tpot" => print_metric("TPOT", "Time per Output Token (excl. 1st token)", &tpots),
-            "itl" => print_metric("ITL", "Inter-token Latency", &itls),
+            "itl" => {
+                print_metric("ITL", "Inter-token Latency", &itls);
+                chunking.print();
+            }
             "e2el" => print_metric("E2EL", "End-to-end Latency", &e2els),
             _ => eprintln!("Unknown metric: {metric}"),
         }
@@ -677,6 +706,10 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         "unstreamed_requests": num_unstreamed,
     });
     let obj = json.as_object_mut().unwrap();
+    chunking.add_json(obj);
+    if args.save_detailed {
+        add_detailed_json(obj, &run);
+    }
 
     // No samples is "not measured" (null), never 0 ms.
     let add_metric_json =
@@ -705,6 +738,110 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
     }
 
     write_results(&args, &model, &json)
+}
+
+/// How many tokens a stream chunk carried, over the timed requests.
+///
+/// ITL is the gap between text chunks, whatever the server packs into one: a token per chunk
+/// for most engines, several under speculative decoding (scratchy sends a step's accepted
+/// tokens together), and a held-back flush when a server defers undecodable bytes. A chunk
+/// count alone can't tell those apart, so ITL stays per chunk, one rule for every engine
+/// (#161), and this reports how many tokens a chunk carried beside it. ITL reads per token
+/// only where a chunk is one token.
+struct Chunking {
+    /// The median of the requests' output tokens per chunk; `None` with no timed request.
+    median_tokens_per_chunk: Option<f64>,
+    /// Timed requests averaging more than [`Chunking::MULTI_TOKEN`] tokens a chunk.
+    multi_token_requests: usize,
+}
+
+impl Chunking {
+    /// Tokens a chunk above which a request's chunks carry several tokens.
+    const MULTI_TOKEN: f64 = 1.5;
+
+    fn of(timed: &[&RequestResult]) -> Self {
+        let mut per_chunk: Vec<f64> = timed.iter().filter_map(|r| r.tokens_per_chunk()).collect();
+        per_chunk.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        Chunking {
+            median_tokens_per_chunk: (!per_chunk.is_empty()).then(|| percentile(&per_chunk, 50.0)),
+            multi_token_requests: per_chunk.iter().filter(|&&t| t > Self::MULTI_TOKEN).count(),
+        }
+    }
+
+    fn print(&self) {
+        let Some(median) = self.median_tokens_per_chunk else {
+            return;
+        };
+        println!("{:<40} {:<10.2}", "Median tokens per chunk:", median);
+        println!(
+            "{:<40} {:<10}",
+            format!("Requests over {} tokens/chunk:", Self::MULTI_TOKEN),
+            self.multi_token_requests
+        );
+        if self.multi_token_requests > 0 {
+            eprintln!(
+                "note: ITL is the gap between stream chunks; {} requests averaged more than {} \
+                 tokens a chunk, so their gaps span several tokens each",
+                self.multi_token_requests,
+                Self::MULTI_TOKEN
+            );
+        }
+    }
+
+    fn add_json(&self, obj: &mut serde_json::Map<String, serde_json::Value>) {
+        obj.insert(
+            "median_tokens_per_chunk".into(),
+            serde_json::json!(self.median_tokens_per_chunk),
+        );
+        obj.insert(
+            "multi_token_chunk_requests".into(),
+            serde_json::json!(self.multi_token_requests),
+        );
+    }
+}
+
+/// `--save-detailed`: every request's own figures, as vLLM's `vllm bench serve --save-detailed`
+/// keeps them — parallel arrays in request order, latencies in seconds, `errors` empty for a
+/// request that succeeded — plus `chunks`, which vLLM doesn't keep: the text chunks each stream
+/// carried, so an ITL can be read per token afterwards.
+fn add_detailed_json(obj: &mut serde_json::Map<String, serde_json::Value>, run: &Run) {
+    let rs = &run.results;
+    let mut put = |key: &str, v: serde_json::Value| {
+        obj.insert(key.into(), v);
+    };
+    put("input_lens", serde_json::json!(run.input_lens));
+    put(
+        "output_lens",
+        serde_json::json!(rs.iter().map(|r| r.output_tokens).collect::<Vec<_>>()),
+    );
+    put(
+        "ttfts",
+        serde_json::json!(rs.iter().map(|r| r.ttft).collect::<Vec<_>>()),
+    );
+    put(
+        "itls",
+        serde_json::json!(rs.iter().map(|r| &r.itl).collect::<Vec<_>>()),
+    );
+    put(
+        "latencies",
+        serde_json::json!(rs.iter().map(|r| r.e2el).collect::<Vec<_>>()),
+    );
+    put(
+        "start_times",
+        serde_json::json!(rs.iter().map(|r| r.start_time).collect::<Vec<_>>()),
+    );
+    put(
+        "generated_texts",
+        serde_json::json!(rs.iter().map(|r| &r.generated_text).collect::<Vec<_>>()),
+    );
+    put(
+        "errors",
+        serde_json::json!(rs.iter().map(|r| &r.error).collect::<Vec<_>>()),
+    );
+    put(
+        "chunks",
+        serde_json::json!(rs.iter().map(|r| r.chunks).collect::<Vec<_>>()),
+    );
 }
 
 /// Write the results JSON where `--output-json` and `--save-result` say.
@@ -1283,6 +1420,7 @@ fn run_prompts(args: &BenchServeArgs, client: &Arc<Client>, tokenizer: &Tokenize
         .sum();
     Ok(Run {
         results,
+        input_lens: prompt_lens,
         total_input_tokens,
         total_time,
     })
@@ -1435,21 +1573,30 @@ mod tests {
     fn only_chunks_with_text_are_tokens() {
         let c = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
         // oMLX's keepalive while it prefills, and llama.cpp's closing chunk.
-        assert!(!chunk_has_text(&c(
-            r#"{"model":"keepalive","choices":[{"index":0,"text":""}]}"#
-        )));
-        assert!(!chunk_has_text(&c(
-            r#"{"choices":[{"text":"","finish_reason":"length"}],"usage":{"completion_tokens":5}}"#
-        )));
-        assert!(!chunk_has_text(&c(
-            r#"{"choices":[],"usage":{"completion_tokens":4}}"#
-        )));
-        assert!(chunk_has_text(&c(
-            r#"{"choices":[{"index":0,"text":" four"}]}"#
-        )));
-        assert!(chunk_has_text(&c(
-            r#"{"choices":[{"delta":{"content":"hi"}}]}"#
-        )));
+        assert_eq!(
+            chunk_text(&c(
+                r#"{"model":"keepalive","choices":[{"index":0,"text":""}]}"#
+            )),
+            None
+        );
+        assert_eq!(
+            chunk_text(&c(
+                r#"{"choices":[{"text":"","finish_reason":"length"}],"usage":{"completion_tokens":5}}"#
+            )),
+            None
+        );
+        assert_eq!(
+            chunk_text(&c(r#"{"choices":[],"usage":{"completion_tokens":4}}"#)),
+            None
+        );
+        assert_eq!(
+            chunk_text(&c(r#"{"choices":[{"index":0,"text":" four"}]}"#)),
+            Some(" four")
+        );
+        assert_eq!(
+            chunk_text(&c(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)),
+            Some("hi")
+        );
         assert!(has_choices(&c(r#"{"choices":[{"text":""}]}"#)));
     }
 
@@ -1551,7 +1698,67 @@ mod tests {
             chunks,
             start_time: 0.0,
             success: true,
+            generated_text: String::new(),
+            error: String::new(),
         }
+    }
+
+    /// Tokens per chunk sit beside ITL: a token a chunk reads 1.0, a speculative stream's
+    /// accepted runs and a held-back flush read more, and the count of such requests says how
+    /// many ITL gaps span several tokens.
+    #[test]
+    fn chunking_reports_how_many_tokens_a_chunk_carried() {
+        let one = req(48, 48, 0.1, 1.0);
+        let spec = req(48, 16, 0.1, 1.0);
+        let held_back = req(128, 3, 0.1, 4.0);
+        let c = Chunking::of(&[&one, &spec, &held_back]);
+        assert_eq!(c.median_tokens_per_chunk, Some(3.0));
+        assert_eq!(c.multi_token_requests, 2);
+        let c = Chunking::of(&[&one]);
+        assert_eq!(
+            (c.median_tokens_per_chunk, c.multi_token_requests),
+            (Some(1.0), 0)
+        );
+        let mut obj = serde_json::Map::new();
+        Chunking::of(&[]).add_json(&mut obj);
+        assert_eq!(obj["median_tokens_per_chunk"], serde_json::Value::Null);
+        assert_eq!(obj["multi_token_chunk_requests"], 0);
+    }
+
+    /// `--save-detailed` keeps vLLM's layout: parallel arrays in request order, seconds, an
+    /// empty error for a request that succeeded; plus each stream's chunk count.
+    #[test]
+    fn detailed_json_is_vllms_layout_plus_chunks() {
+        let ok = RequestResult {
+            itl: vec![0.02, 0.03],
+            start_time: 0.5,
+            generated_text: "Hi there".into(),
+            ..req(3, 3, 0.1, 0.15)
+        };
+        let failed = RequestResult::failed(0.7, 2.0, "status 500: boom".into());
+        let run = Run {
+            results: vec![ok, failed],
+            input_lens: vec![12, 40],
+            total_input_tokens: 12,
+            total_time: 2.5,
+        };
+        let mut obj = serde_json::Map::new();
+        add_detailed_json(&mut obj, &run);
+        let j = serde_json::Value::Object(obj);
+        assert_eq!(
+            j,
+            serde_json::json!({
+                "input_lens": [12, 40],
+                "output_lens": [3, 0],
+                "ttfts": [0.1, 0.0],
+                "itls": [[0.02, 0.03], []],
+                "latencies": [0.15, 2.0],
+                "start_times": [0.5, 0.7],
+                "generated_texts": ["Hi there", ""],
+                "errors": ["", "status 500: boom"],
+                "chunks": [3, 0],
+            })
+        );
     }
 
     #[test]
