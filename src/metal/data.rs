@@ -36,11 +36,20 @@ pub struct Run {
 const LIVE_SHARE: f64 = 0.5;
 
 impl Run {
-    /// Mark the cells that measured a server which had stopped answering (#413), in a run file
-    /// whose bench did not count those requests as failed itself (`config.failures_counted`,
-    /// #510). Only an engine that honours `ignore_eos` can be judged by its answer tokens: one
-    /// that stops at EOS delivers short answers from a live server too.
+    /// Mark the cells that measured a server which had stopped answering (#413). The bench judges
+    /// that itself where it can (`dead_server` on a cell, from a scratchy cell that came back with
+    /// under half its answer tokens), and that verdict is the one the page takes. A run file from
+    /// before the bench counted such requests as failed (`config.failures_counted`, #510) is
+    /// judged here by its answer tokens instead, and only for an engine that honours
+    /// `ignore_eos`: one that stops at EOS delivers short answers from a live server too.
     pub fn mark_dead(&mut self) {
+        for m in &mut self.models {
+            for e in Engine::ALL {
+                for c in e.cells_mut(m) {
+                    c.dead |= c.dead_server;
+                }
+            }
+        }
         if self.config.failures_counted == Some(true) {
             return;
         }
@@ -48,7 +57,7 @@ impl Run {
         for m in &mut self.models {
             for e in Engine::ALL.into_iter().filter(|e| e.honours_ignore_eos()) {
                 for c in e.cells_mut(m) {
-                    c.dead = c.delivered(base).is_some_and(|share| share < LIVE_SHARE);
+                    c.dead |= c.delivered(base).is_some_and(|share| share < LIVE_SHARE);
                 }
             }
         }
@@ -222,6 +231,9 @@ pub struct Config {
     /// (`CLASSES` in the bench script); absent in runs from before it.
     #[serde(default)]
     pub classes: Option<Vec<Class>>,
+    /// The memory from which a Mac runs the large set of [`Config::classes`].
+    #[serde(default)]
+    pub large_from_gb: Option<u32>,
     #[serde(default)]
     pub default_models: Option<Vec<String>>,
 }
@@ -235,9 +247,9 @@ pub struct Class {
 }
 
 impl Class {
-    /// The class's model on a Mac with `memory_gb` of memory.
-    pub fn model(&self, memory_gb: u32) -> &str {
-        if memory_gb >= 64 {
+    /// The class's model on a Mac with `memory_gb` of memory, the large one from `large_from_gb`.
+    pub fn model(&self, memory_gb: u32, large_from_gb: u32) -> &str {
+        if memory_gb >= large_from_gb {
             &self.large
         } else {
             &self.small
@@ -273,11 +285,13 @@ pub struct Scaling {
     /// The answer lengths the grid ran at above 1 user (`--scale-grid-users-output`); absent
     /// in runs from before it, which ran every `grid_output` at every users count.
     pub grid_users_output: Option<Vec<u32>>,
-    /// The longest grid prompt the Mac's memory held (`--scale-max-prompt`): longer
+    /// The longest grid prompt the Mac's memory held (the runner's `--scale-max-prompt`, before
+    /// every cell ran): longer
     /// `grid_input` lengths were not run. None: every one was.
     #[serde(default)]
     pub max_prompt: Option<u32>,
-    /// The longest grid prompt run above 1 user (`--scale-max-prompt-users`); longer prompts
+    /// The longest grid prompt run above 1 user (the runner's `--scale-max-prompt-users`, before
+    /// every cell ran); longer prompts
     /// ran at 1 user only. None: every prompt `max_prompt` allows.
     #[serde(default)]
     pub max_prompt_users: Option<u32>,
@@ -534,6 +548,12 @@ pub struct Cell {
     /// Whether its peak memory reads below the model's own weights ([`Run::mark_mem_below_weights`]),
     /// so it is no reading of the process.
     pub mem_below_weights: bool,
+    /// The client never finished it (the run's `cell_timeout_s`), so every request counts as
+    /// failed: too slow, not out of memory.
+    pub timed_out: bool,
+    /// The bench's verdict that the server it measured answered with almost nothing (a scratchy
+    /// cell under half its answer tokens): its requests are recorded failed ([`Run::mark_dead`]).
+    pub dead_server: bool,
 }
 
 impl Cell {
@@ -589,6 +609,10 @@ struct RawCell {
     conc: Option<u32>,
     #[serde(default)]
     total_output_tokens: Option<u64>,
+    #[serde(default)]
+    timed_out: bool,
+    #[serde(default)]
+    dead_server: bool,
 }
 
 impl TryFrom<RawCell> for Cell {
@@ -626,6 +650,8 @@ impl TryFrom<RawCell> for Cell {
             total_output_tokens: c.total_output_tokens,
             dead: false,
             mem_below_weights: false,
+            timed_out: c.timed_out,
+            dead_server: c.dead_server,
         })
     }
 }

@@ -1844,8 +1844,8 @@ fn model_timelines(entries: &[Entry]) -> Vec<(&'static str, Element)> {
 /// runs of one shape on one machine. Only the current lineup, as in the overview ([`lineup`]): a
 /// model an older round ran keeps its runs in its machine's own section.
 fn over_time_charts(machines: &BTreeMap<&str, MachineRuns>) -> Vec<(String, Element)> {
-    let lineup = lineup(machines).unwrap_or_default();
-    let current = |stem: &str| lineup.iter().any(|c| c.small == stem || c.large == stem);
+    let classes = lineup(machines).map_or(&[][..], |l| l.classes);
+    let current = |stem: &str| classes.iter().any(|c| c.small == stem || c.large == stem);
     let mut charts = Vec::new();
     for chip in in_order(machines) {
         for (stem, entries) in machines[chip].models.iter().filter(|(s, _)| current(s)) {
@@ -1986,51 +1986,85 @@ struct GlanceGrid {
     cells: Vec<(u32, u32, Option<f64>)>,
 }
 
-/// The overview's heat maps, one shape for every model on every machine: users at once down
-/// the side, prompt tokens across. A square its run did not measure (a run of another shape, or
-/// a prompt the Mac's memory does not hold) is blank.
-const GLANCE_USERS: [u32; 4] = [1, 4, 8, 16];
-const GLANCE_PROMPTS: [u32; 4] = [128, 1024, 4096, 32768];
-
 impl GlanceGrid {
-    /// A model's grid at a metric on a machine's latest run, on [`GLANCE_USERS`] by
-    /// [`GLANCE_PROMPTS`], or why none.
-    fn of(mr: &MachineRuns, stem: &str, metric: Metric) -> Result<Self, &'static str> {
+    /// A model's grid at a metric on a machine's latest run, on the overview's users counts by
+    /// its prompts ([`Lineup`]), or why none.
+    fn of(
+        mr: &MachineRuns,
+        stem: &str,
+        metric: Metric,
+        users: &[u32],
+        prompts: &[u32],
+    ) -> Result<Self, &'static str> {
         let Entry { run, m } = mr.latest(stem).ok_or("not run")?;
         let g = ShapeGrid::of(m, run, Slice::Answer(glance_answer(run))).ok_or("no grid")?;
         let rival = g
             .rival
             .ok_or("scratchy alone so far: no engine to compare")?;
-        let cells = (GLANCE_USERS.iter())
-            .flat_map(|&u| GLANCE_PROMPTS.iter().map(move |&i| (u, i)))
+        let cells = (users.iter())
+            .flat_map(|&u| prompts.iter().map(move |&i| (u, i)))
             .map(|(u, i)| (u, i, g.versus(metric, (u, i), rival).0))
             .collect();
         Ok(GlanceGrid {
-            prompts: GLANCE_PROMPTS.to_vec(),
+            prompts: prompts.to_vec(),
             rival,
             cells,
         })
     }
 }
 
-/// The lineup the overview's columns follow: `config.classes` of the newest run, on any machine,
-/// that records it. None before any run does.
-fn lineup<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Option<&'a [data::Class]> {
-    (machines.values())
-        .flat_map(|mr| mr.runs.iter())
-        .filter_map(|r| Some((&r.generated_utc, r.config.classes.as_deref()?)))
-        .max_by(|a, b| a.0.cmp(b.0))
-        .map(|(_, c)| c)
+/// The overview's shape: a column per class of the lineup (`config.classes`), each Mac on the
+/// class's small model or, from `large_from_gb`, its large one, and each map a users count by a
+/// prompt length (`grid_conc`, `grid_input`), one shape for every model on every machine: users at
+/// once down the side, prompt tokens across. A square its run did not measure (a run of another
+/// shape, or a prompt the Mac's memory did not hold) is blank.
+struct Lineup<'a> {
+    classes: &'a [data::Class],
+    large_from_gb: u32,
+    users: Vec<u32>,
+    prompts: Vec<u32>,
+}
+
+impl Lineup<'_> {
+    fn model(&self, class: &str, memory_gb: u32) -> Option<&str> {
+        (self.classes.iter())
+            .find(|c| c.class == class)
+            .map(|c| c.model(memory_gb, self.large_from_gb))
+    }
+}
+
+/// The overview's [`Lineup`]: the classes and cut-off of the newest run that records a lineup, and
+/// the grid of the newest such run that has one, so a `--no-scaling` run (no grid) after it does
+/// not empty every map. None before any run records a lineup.
+fn lineup<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Option<Lineup<'a>> {
+    let mut with_lineup: Vec<&Run> = (machines.values())
+        .flat_map(|mr| mr.runs.iter().copied())
+        .filter(|r| r.config.classes.is_some())
+        .collect();
+    with_lineup.sort_by(|a, b| b.generated_utc.cmp(&a.generated_utc));
+    let newest = with_lineup.first()?;
+    let grid = (with_lineup.iter())
+        .find_map(|r| {
+            let sc = r.config.scaling.as_ref()?;
+            Some((sc.grid_conc.clone()?, sc.grid_input.clone()?))
+        })
+        .unwrap_or_default();
+    Some(Lineup {
+        classes: newest.config.classes.as_deref()?,
+        // Runs from before `large_from_gb` split the sets at 64 GB.
+        large_from_gb: newest.config.large_from_gb.unwrap_or(64),
+        users: grid.0,
+        prompts: grid.1,
+    })
 }
 
 /// Every model's users-by-prompt grid on every machine as small multiples,
 /// one table per metric: a machine per row, a model per column, each cell that
 /// model's grid as a tiny heatmap coloured like the full ones.
 fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
-    // A column per architecture class, as the newest run that records the lineup has it
-    // (`config.classes`); each machine's row shows the class's model for its memory, the small
-    // set below 64 GB and the large one at 64 GB, run or not yet. A model an older round ran
-    // stays in its machine's own section, not here.
+    // A column per architecture class ([`Lineup`]); each machine's row shows the class's model
+    // for its memory, the small set below the lineup's `large_from_gb` and the large one from it,
+    // run or not yet. A model an older round ran stays in its machine's own section, not here.
     let Some(lineup) = lineup(machines) else {
         return rsx! {};
     };
@@ -2039,31 +2073,30 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             .machine
             .memory_gb
     };
-    let model_of = |chip: &str, class: &str| {
-        (lineup.iter())
-            .find(|c| c.class == class)
-            .map(|c| c.model(memory(chip)))
-    };
-    let classes: Vec<&str> = lineup.iter().map(|c| c.class.as_str()).collect();
-    let mut stems: Vec<&str> = Vec::new();
-    for &chip in machines.keys() {
-        for &class in &classes {
-            if let Some(stem) = model_of(chip, class)
-                && !stems.contains(&stem)
-            {
-                stems.push(stem);
-            }
-        }
-    }
-    if stems.is_empty() {
+    let model_of = |chip: &str, class: &str| lineup.model(class, memory(chip));
+    let classes: Vec<&str> = lineup.classes.iter().map(|c| c.class.as_str()).collect();
+    // Each machine's own row: (machine, model) for its set only, so another set's model it ran in
+    // an earlier round sets neither the intro's answer lengths nor the highlights.
+    let shown: Vec<(&str, &str)> = (machines.keys())
+        .flat_map(|&chip| {
+            (classes.iter()).filter_map(move |&class| Some((chip, model_of(chip, class)?)))
+        })
+        .collect();
+    if shown.is_empty() {
         return rsx! {};
     }
+    // The scaling and startup panels are a column per model: every model any row shows.
+    let mut stems: Vec<&str> = Vec::new();
+    for &(_, stem) in &shown {
+        if !stems.contains(&stem) {
+            stems.push(stem);
+        }
+    }
     let metrics = [(Metric::Ttft, "Prefill"), (Metric::Throughput, "Decode")];
-    let users: Vec<u32> = GLANCE_USERS.to_vec();
+    let users: Vec<u32> = lineup.users.clone();
     // The answer lengths the maps are at: one, unless machines are on runs of different shapes.
-    let answers: BTreeSet<u32> = machines
-        .values()
-        .flat_map(|mr| stems.iter().filter_map(|&stem| mr.latest(stem)))
+    let answers: BTreeSet<u32> = (shown.iter())
+        .filter_map(|&(chip, stem)| machines[chip].latest(stem))
         .map(|Entry { run, .. }| glance_answer(run))
         .collect();
     let answers = (answers.iter())
@@ -2073,14 +2106,18 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     // Every grid's ratios first, keyed by machine, model and metric, or why
     // the grid has none: the highlights are picked from all of them.
     let mut grids: BTreeMap<(&str, &str, &str), Result<GlanceGrid, &str>> = BTreeMap::new();
-    for &chip in machines.keys() {
-        for &stem in &stems {
-            for (metric, name) in metrics {
-                grids.insert(
-                    (chip, stem, name),
-                    GlanceGrid::of(&machines[chip], stem, metric),
-                );
-            }
+    for &(chip, stem) in &shown {
+        for (metric, name) in metrics {
+            grids.insert(
+                (chip, stem, name),
+                GlanceGrid::of(
+                    &machines[chip],
+                    stem,
+                    metric,
+                    &lineup.users,
+                    &lineup.prompts,
+                ),
+            );
         }
     }
     let squares: BTreeMap<Square, f64> = grids
@@ -2172,7 +2209,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     // Every prompt length any shown grid has: a grid with none of its own
     // (the model not run on that machine, say) keeps its place as a map of
     // blank squares this wide, over why it has nothing to show.
-    let prompts: Vec<u32> = GLANCE_PROMPTS.to_vec();
+    let prompts: Vec<u32> = lineup.prompts.clone();
     let mini = |chip: &str, stem: &str, name: &str| -> Element {
         let (ins, cells, total_label, none) = match &grids[&(chip, stem, name)] {
             Ok(g) => (
@@ -3089,10 +3126,12 @@ mod tests {
         );
         // The overview's columns are the full run's recorded lineup, each Mac on its set.
         let lineup = super::lineup(&machines).expect("the M3 Pro's run records its lineup");
-        let dense = lineup.iter().find(|c| c.class == "dense").unwrap();
-        assert_eq!(dense.model(32), "granite-4.2-8b");
-        assert_eq!(dense.model(36), "granite-4.2-8b");
-        assert_eq!(dense.model(64), "granite-4.2-30b");
+        assert_eq!(lineup.users, [1, 4, 8, 16]);
+        assert_eq!(lineup.prompts, [128, 1024, 4096, 32768]);
+        let dense = lineup.classes.iter().find(|c| c.class == "dense").unwrap();
+        assert_eq!(dense.model(32, lineup.large_from_gb), "granite-4.2-8b");
+        assert_eq!(dense.model(36, lineup.large_from_gb), "granite-4.2-8b");
+        assert_eq!(dense.model(64, lineup.large_from_gb), "granite-4.2-30b");
     }
 
     /// The published runs' cells a dead server measured (#413) are marked, and no other: the
@@ -3201,6 +3240,39 @@ mod tests {
             (ratio - 0.95).abs() < 0.01,
             "scratchy against oMLX TurboQuant: {ratio:.3}x"
         );
+    }
+
+    /// The bench's own verdict on a cell is the one the page takes: a scratchy cell it recorded as
+    /// a dead server's (`dead_server`, under half its answer tokens) shows no number, even in a
+    /// run that counted its failures itself, where the page judges no cell by its tokens. Without
+    /// it the dead server's ~0 tok/s went on the Decode heat map, and as the square furthest from
+    /// x1 it took a highlight. A cell the client never finished says so.
+    #[test]
+    fn the_benchs_dead_server_and_timeout_verdicts_reach_the_page() {
+        use super::numbers::{Metric, failed_note, timing};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/metal/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
+        );
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        json["config"]["failures_counted"] = true.into();
+        let cells = json["models"][0]["scaling"].as_array_mut().unwrap();
+        // As the bench writes them: a dead server's cell, and one that timed out.
+        cells[0]["dead_server"] = true.into();
+        cells[0]["failed"] = cells[0]["completed"].clone();
+        cells[0]["completed"] = 0.into();
+        cells[1] = serde_json::json!({"axis": "grid", "rung": cells[1]["rung"].clone(),
+            "conc": cells[1]["conc"].clone(), "completed": 0, "failed": 12, "timed_out": true});
+        let mut run: Run = serde_json::from_value(json).unwrap();
+        run.mark_dead();
+        let scaling = run.models[0].scaling.as_deref().unwrap();
+        let (dead, slow, live) = (&scaling[0], &scaling[1], &scaling[2]);
+        assert!(dead.dead, "the bench's dead-server verdict is taken");
+        assert_eq!(timing(Some(dead), Metric::Throughput), None);
+        assert!(failed_note(Some(dead)).contains("stopped answering"));
+        assert!(failed_note(Some(slow)).contains("did not finish"));
+        assert!(!live.dead && timing(Some(live), Metric::Throughput).is_some());
     }
 
     /// A run whose bench counted aborted and errored requests itself (#510) keeps what it
