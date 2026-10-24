@@ -1168,9 +1168,11 @@ impl EngineCore {
 
         let params = &request.sampling_params;
 
-        // A stop token before `min_tokens` stops nothing (vLLM's `check_stop`). A backend that
-        // masks the stop tokens until then never samples one; this holds for one that doesn't.
-        if num_output_tokens < params.min_tokens {
+        // A stop token among the first `min_tokens` outputs stops nothing: the first one that can
+        // is output `min_tokens + 1`, this token counted, as a backend that masks the stop tokens
+        // until `min_tokens` are generated samples it (vLLM's `MinTokensLogitsProcessor`; its
+        // `check_stop` never meets the boundary). This holds for a backend that doesn't mask.
+        if num_output_tokens <= params.min_tokens {
             return (None, None);
         }
 
@@ -1698,8 +1700,8 @@ mod tests {
         }
     }
 
-    /// An EOS or stop token among the first `min_tokens` outputs stops nothing, as vLLM's
-    /// `check_stop` skips it; the first one after them stops the request.
+    /// An EOS or stop token among the first `min_tokens` outputs stops nothing, the last of them
+    /// (index `min_tokens - 1`) included; the first one after them stops the request.
     #[test]
     fn min_tokens_holds_the_stop_until_it_is_reached() {
         for stop in [Stop::Eos, Stop::Token] {
@@ -1722,7 +1724,7 @@ mod tests {
             let model_output = ModelRunnerOutput {
                 req_ids: vec!["req-1".to_string()],
                 req_id_to_index: [("req-1".to_string(), 0)].into_iter().collect(),
-                sampled_token_ids: vec![vec![42, s, 43, s, 44]],
+                sampled_token_ids: vec![vec![42, s, s, 43, s, 44]],
                 logprobs: None,
                 prompt_logprobs_dict: std::collections::HashMap::new(),
                 draft_token_ids: None,
@@ -1736,7 +1738,7 @@ mod tests {
 
             let outputs = engine.update_from_output(&scheduler_output, &model_output);
             let req_out = &outputs[&0].outputs[0];
-            assert_eq!(req_out.new_token_ids, [42, s, 43, s], "{stop:?}");
+            assert_eq!(req_out.new_token_ids, [42, s, s, 43, s], "{stop:?}");
             assert_eq!(req_out.finish_reason, Some(FinishReason::Stop), "{stop:?}");
             assert_eq!(req_out.stop_reason, Some(StopReason::Token(s)), "{stop:?}");
         }
