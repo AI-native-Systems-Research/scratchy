@@ -449,7 +449,8 @@ const ROPED_ATTENTION_WRITERS: &[MetalFusion] = &[MetalFusion::RopeAppend, Metal
 /// Metal's fusions, in the order the shared fold pass applies them. An attention reads its new K/V
 /// (operands 1..) out of the cache its rope wrote, so only its query is a consumer edge.
 ///
-/// Two tables share every pattern but one: the routed-experts fold's band. The wide band
+/// Two tables share every pattern but two: the routed-experts fold's band, and the combine
+/// epilogue's gate deferral that band's fold makes necessary. The wide band
 /// ([`METAL_FUSIONS`]) folds through the verify-sized rows on Max-scale M5 silicon, where the
 /// fold's per-threadgroup routing has the cores to hide behind (measured, M5 Max 40-core:
 /// −4.1% TPOT at conc-1 MTP-on). The narrow band ([`METAL_FUSIONS_NARROW`]) keeps the fold's
