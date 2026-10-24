@@ -204,6 +204,24 @@ __device__ inline float2 gdn_g::op<float2>(const float2& x, const float2& a_log)
     return float2{gdn_g::op<float>(x.x, a_log.x), gdn_g::op<float>(x.y, a_log.y)};
 }
 
+// The MoE route's top-k key: a NaN probability as −inf, every other value as it is. TK's
+// `base_ops::max` is `::max`, which returns the non-NaN operand, so a NaN key would never be the
+// round's max; as −inf it is the lowest, and the round's index pick still takes it in turn.
+struct nan_to_neg_inf {
+    template <typename T>
+    static __device__ inline T op(const T& x) {
+        return x != x ? kittens::base_types::constants<T>::neg_infty() : x;
+    }
+};
+template <>
+__device__ inline float nan_to_neg_inf::op<float>(const float& x) {
+    return x != x ? kittens::base_types::constants<float>::neg_infty() : x;
+}
+template <>
+__device__ inline float2 nan_to_neg_inf::op<float2>(const float2& x) {
+    return float2{nan_to_neg_inf::op<float>(x.x), nan_to_neg_inf::op<float>(x.y)};
+}
+
 // TK-GAP(rv_fma) begin
 // A register-vector map over three vectors, `dst[i][j] = op(a[i][j], b[i][j], c[i][j])`: TK's own
 // vector `bin_op` (`ops/group/register/vec/maps.cuh`) takes one vector and a scalar, or two

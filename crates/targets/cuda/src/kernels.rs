@@ -239,6 +239,28 @@ unsafe extern "C" {
         out: *mut c_void,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_moe_route_bf16(
+        logits: *const c_void,
+        topk_idx: *mut c_void,
+        scores: *mut c_void,
+        m: u32,
+        experts: u32,
+        top_k: u32,
+        renorm: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_moe_combine_bf16(
+        down: *const c_void,
+        pos: *const c_void,
+        scores: *const c_void,
+        out: *mut c_void,
+        m: u32,
+        top_k: u32,
+        hidden: u32,
+        down_rows: u32,
+        sorted: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gdn_rms_norm_gated(
         o: *const c_void,
         z: *const c_void,
@@ -322,6 +344,12 @@ pub enum KernelError {
     },
     /// The GDN gated norm does not take this shape or eps; nothing was launched.
     GdnNormShape { rows: u32, nv: u32, head_v: u32 },
+    /// A MoE kernel (`kernel`, its file's stem) does not take this shape; `dims` are its launch
+    /// dimensions in its launcher's order. Nothing was launched.
+    MoeShape {
+        kernel: &'static str,
+        dims: [u32; 4],
+    },
     /// The launcher's C++ host code threw (caught before it could reach Rust).
     HostException,
     /// A `cudaError_t` from the kernel's one-time setup or from its launch.
@@ -425,6 +453,9 @@ impl fmt::Display for KernelError {
                 f,
                 "GDN gated norm refused shape rows={rows} nv={nv} head_v={head_v}, or its eps"
             ),
+            KernelError::MoeShape { kernel, dims } => {
+                write!(f, "{kernel} refused shape {dims:?}")
+            }
             KernelError::HostException => write!(f, "kernel launcher's host code threw"),
             KernelError::Cuda(code) => write!(f, "CUDA error {code}"),
         }
@@ -1238,4 +1269,93 @@ pub unsafe fn gdn_rms_norm_gated(
         scratchy_cuda_gdn_rms_norm_gated(o, z, w, sequence, out, rows, nv, head_v, eps, stream)
     };
     check(code, KernelError::GdnNormShape { rows, nv, head_v })
+}
+
+// THE MOE KERNELS (#857): the qwen3-5-moe block's steps. Each is a ThunderKittens kernel; a shape
+// it does not take is refused with [`KernelError::MoeShape`] naming it.
+
+/// Launch the MoE routing (`kernels/moe_route_bf16.cu`): per token row of `logits` (`[m, 256]`
+/// bf16), `softmax` in f32, its `top_k` largest picked (equal probabilities by the higher expert
+/// index, a NaN lowest; always `top_k` distinct indices in `0..256`), stored ascending (slot
+/// `top_k − 1` the best) as i32 into `topk_idx` and their probabilities, divided by their sum when
+/// `renorm`, as f32 into `scores` (`[m, top_k]` each). Asynchronous.
+///
+/// Refused with [`KernelError::MoeShape`] `{ kernel: "moe_route_bf16", dims: [m, experts, top_k,
+/// 0] }`, before any pointer is touched, unless `m` is non-zero and at most `i32::MAX`, `experts`
+/// is 256 (`step::MOE_ROUTE_EXPERTS`) and `top_k` in `1..=32` (`step::MOE_ROUTE_MAX_TOP_K`).
+///
+/// # Safety
+///
+/// `logits` must be a device pointer to `m · 256` bf16, `topk_idx` to `m · top_k` i32 and `scores`
+/// to `m · top_k` f32, 16-byte aligned and valid for the whole kernel, the outputs overlapping
+/// nothing. `stream` must be a live `cudaStream_t` of the current device, or null for the default
+/// stream.
+pub unsafe fn moe_route_bf16(
+    logits: *const c_void,
+    (topk_idx, scores): (*mut c_void, *mut c_void),
+    (m, experts, top_k): (u32, u32, u32),
+    renorm: bool,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_moe_route_bf16(
+            logits,
+            topk_idx,
+            scores,
+            m,
+            experts,
+            top_k,
+            u32::from(renorm),
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MoeShape {
+            kernel: "moe_route_bf16",
+            dims: [m, experts, top_k, 0],
+        },
+    )
+}
+
+/// Launch the MoE combine (`kernels/moe_combine_bf16.cu`): `out[t, :] = Σ_j scores[t, j] ·
+/// down[row(t, j), :]` over the `top_k` slots in order, in f32, rounded once to bf16, every token
+/// row written; `row(t, j)` is `pos[t · top_k + j]` when `pos` is given (sorted pairs), else
+/// `t · top_k + j` (gathered). Asynchronous.
+///
+/// Refused with [`KernelError::MoeShape`] `{ kernel: "moe_combine_bf16", dims: [m, top_k, hidden,
+/// down_rows] }`, before any pointer is touched, unless `m` is non-zero, `top_k` in `1..=32`,
+/// `hidden` a non-zero multiple of 256 (`step::MOE_COMBINE_BF16_CHUNK`), `down_rows` at least
+/// `m · top_k`, and `m · top_k` and `down_rows · hidden` at most `i32::MAX`.
+///
+/// # Safety
+///
+/// `down` must be a device pointer to `down_rows · hidden` bf16, `pos` (when given) to
+/// `m · top_k` u32 each below `down_rows`, `scores` to `m · top_k` f32 and `out` to `m · hidden`
+/// bf16, 16-byte aligned and valid for the whole kernel, `out` overlapping no input. `stream`
+/// must be a live `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn moe_combine_bf16(
+    (down, pos, scores): (*const c_void, Option<*const c_void>, *const c_void),
+    out: *mut c_void,
+    (m, top_k, hidden, down_rows): (u32, u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let (pos, sorted) = match pos {
+        Some(p) => (p, 1),
+        None => (std::ptr::null(), 0),
+    };
+    // SAFETY: as `rms_norm_bf16`'s; a null `pos` is never read (`sorted` 0).
+    let code = unsafe {
+        scratchy_cuda_moe_combine_bf16(
+            down, pos, scores, out, m, top_k, hidden, down_rows, sorted, stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MoeShape {
+            kernel: "moe_combine_bf16",
+            dims: [m, top_k, hidden, down_rows],
+        },
+    )
 }

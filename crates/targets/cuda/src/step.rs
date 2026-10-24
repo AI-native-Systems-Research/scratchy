@@ -637,8 +637,12 @@ pub struct RouterLogitsBf16 {
 /// The one expert count the routing kernel takes: one warp per token row, 8 logits per lane
 /// (`kernels/moe_route_bf16.cu`).
 pub const MOE_ROUTE_EXPERTS: u32 = 256;
-/// The routing kernel's largest top-k: one lane holds each pick.
+/// The routing kernel's largest top-k: one pick per round of its warp reductions
+/// (`kernels/moe_route_bf16.cu`).
 pub const MOE_ROUTE_MAX_TOP_K: u32 = 32;
+/// The combine's `hidden` is a non-zero multiple of this: one naive `rv_fl<256>` per column chunk
+/// (`kernels/moe_combine_bf16.cu`). Checked by the launcher only; qwen3-5-moe's `hidden` is 2048.
+pub const MOE_COMBINE_BF16_CHUNK: u32 = 256;
 
 /// The routing of `m` tokens over `experts` (one warp per token row, `experts` = 256): `p =
 /// softmax(logits)` in f32, its `top_k` largest picked (equal probabilities by the higher expert
