@@ -472,6 +472,9 @@ pub enum AttnShapeRule {
     RowsOffTile { multiple: u32 },
     /// `head_dim` is not the one the bucket's kernel is instantiated for.
     HeadDim { want: u32 },
+    /// A one-row bucket's GQA group `q_heads / kv_heads` is `group`, above `max`, the query rows
+    /// the decode kernel merges per kv head.
+    GroupAboveMax { group: u32, max: u32 },
 }
 
 /// Why an attention's new K or V is not its layer's `RopeAppend`'s.
@@ -972,6 +975,11 @@ impl std::fmt::Display for AttnShapeRule {
             Self::HeadDim { want } => write!(
                 f,
                 "head_dim must be {want}, the one the kernel is instantiated for"
+            ),
+            Self::GroupAboveMax { group, max } => write!(
+                f,
+                "q_heads / kv_heads = {group} must be at most {max}, the query rows the decode \
+                 kernel merges per kv head"
             ),
         }
     }

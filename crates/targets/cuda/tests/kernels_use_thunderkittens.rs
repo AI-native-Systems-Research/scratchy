@@ -54,7 +54,6 @@ use std::path::{Path, PathBuf};
 
 /// The kernels not yet rewritten with ThunderKittens. Each port PR removes its own.
 const NOT_YET_PORTED: &[&str] = &[
-    "attn_decode_bf16.cu",
     "gdn_conv1d.cu",
     "gdn_gating.cu",
     "gdn_rms_norm_gated.cu",
@@ -64,8 +63,10 @@ const NOT_YET_PORTED: &[&str] = &[
 /// The inline PTX a kernel may hold, as `(file, PTX string)`: the async-proxy fence after the
 /// prefill's consumers zero a partial V tile, which TK at the pin emits only inside
 /// `warpgroup::mma_fence` and its TMA stores, never on its own.
-const ASM_ALLOWLIST: &[(&str, &str)] =
-    &[("attn_prefill_bf16.cu", "fence.proxy.async.shared::cta;\n")];
+const ASM_ALLOWLIST: &[(&str, &str)] = &[
+    ("attn_prefill_bf16.cu", "fence.proxy.async.shared::cta;\n"),
+    ("attn_decode_bf16.cu", "fence.proxy.async.shared::cta;\n"),
+];
 
 /// The op header's gap helpers: operations TK has no map for, written once against TK types.
 const TK_GAPS: &[&str] = &["rv_ternary_map"];

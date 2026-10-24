@@ -270,10 +270,15 @@ pub const CUDA_MAX_BLOCKS_PER_SEQ: u32 = 128;
 pub const ATTN_PREFILL_BF16_ROWS: u32 = 128;
 /// The one head dim the attention kernel is instantiated for.
 pub const ATTN_PREFILL_BF16_HEAD_DIM: u32 = 256;
-/// The one head dim the decode attention kernel is instantiated for: each of a warp's 32 lanes
-/// holds one 16-byte vector of 8 lanes (`kernels/attn_decode_bf16.cu`). It takes one query row,
-/// `q_heads` a non-zero multiple of `kv_heads`, and `block_size` [`CUDA_KV_BLOCK_SIZE`].
+/// The one head dim the decode attention kernel is instantiated for: its query, K and V tiles are
+/// `st_bf<64, 256>`, the prefill's (`kernels/attn_decode_bf16.cu`). It takes one query row,
+/// `q_heads` a non-zero multiple of `kv_heads` by at most [`ATTN_DECODE_BF16_MAX_GROUP`], and
+/// `block_size` [`CUDA_KV_BLOCK_SIZE`].
 pub const ATTN_DECODE_BF16_HEAD_DIM: u32 = 256;
+/// The decode attention's largest GQA group `q_heads / kv_heads`: a kv head's query heads are
+/// stacked as the rows of one query tile, and only the 16 rows of each consumer warpgroup's warp 0
+/// are merged and stored (`kernels/attn_decode_bf16.cu`). The target models' groups are 2 to 12.
+pub const ATTN_DECODE_BF16_MAX_GROUP: u32 = 16;
 /// The one head dim the KV append is instantiated for (`kernels/kv_append_bf16.cu`): a head's row
 /// is one `sv_bf<256>`, one 512-byte box of the cache's vector tensor map. The lowering already
 /// refuses any other head dim for a `RopeAppend` (`CanonicalRefusal::KvHeadDim`).

@@ -166,6 +166,7 @@ unsafe extern "C" {
         swizzled: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_attn_decode_bf16_prepare() -> i32;
     fn scratchy_cuda_attn_decode_bf16(
         q: *const c_void,
         k_cache: *const c_void,
@@ -429,6 +430,7 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("add_bf16", scratchy_cuda_add_bf16_prepare),
     ("silu_mul_bf16", scratchy_cuda_silu_mul_bf16_prepare),
     ("gate_apply_bf16", scratchy_cuda_gate_apply_bf16_prepare),
+    ("attn_decode_bf16", scratchy_cuda_attn_decode_bf16_prepare),
 ];
 
 /// Run every kernel's one-time setup on the current device, stopping at the first failure, which
@@ -953,17 +955,19 @@ pub unsafe fn tma_box_probe_store(
 /// Launch the GQA decode attention of one query row `q` (`[1, q_heads · 256]`) over one layer's
 /// paged `k_cache` and `v_cache` (`[num_blocks, kv_heads, 64, 256]`) into `out`, the keys
 /// `0 .. P + L` read through `block_table`, `P` and `L` read from `sequence`; query head `g` reads
-/// kv head `g / (q_heads / kv_heads)`, the softmax scaled by `scale`. No key at or past `P + L` is
-/// loaded. Asynchronous.
+/// kv head `g / (q_heads / kv_heads)`, the softmax scaled by `scale`. Whole 64-slot blocks are
+/// loaded; the slots at or past `P + L` are neutralised before use (their scores set to −inf,
+/// their V rows zeroed), so no unwritten slot reaches the output. Asynchronous.
 ///
 /// Refused with [`KernelError::AttnDecodeShape`], before any pointer is touched, unless
 /// `head_dim` is 256 (`step::ATTN_DECODE_BF16_HEAD_DIM`), `q_heads` and `kv_heads` non-zero with
-/// `q_heads` a multiple of `kv_heads`, `block_size` 64, `num_blocks` non-zero, and `scale` finite
-/// and above 0. Returns the launch's own `cudaError_t` if it fails.
+/// `q_heads` a multiple of `kv_heads` by at most 16 (`step::ATTN_DECODE_BF16_MAX_GROUP`),
+/// `block_size` 64, `num_blocks` non-zero, and `scale` finite and above 0. Returns the launch's
+/// own `cudaError_t` if it fails.
 ///
 /// # Safety
 ///
-/// `q` and `out` must be 16-byte-aligned device pointers to `q_heads · 256` bf16, `out`
+/// [`prepare_all`] must have succeeded on the current device. `q` and `out` must be 16-byte-aligned device pointers to `q_heads · 256` bf16, `out`
 /// overlapping no input; `k_cache`, `v_cache` to `num_blocks · kv_heads · 64 · 256` bf16 each;
 /// `sequence` to `[P, L]` u32 with `L ≥ 1`; `block_table` to at least `ceil((P + L) / 64)` u32
 /// block ids, each below `num_blocks`. All valid for the whole kernel. `stream` must be a live
