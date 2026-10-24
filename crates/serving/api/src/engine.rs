@@ -281,6 +281,16 @@ struct Choice {
     prompt: PromptIndex,
 }
 
+/// One child of a completion request: a (prompt, n) pair with its engine request, checked before
+/// any child is submitted ([`AsyncEngine::completion_children`]).
+struct CompletionChild {
+    id: String,
+    choice: Choice,
+    num_prompt_tokens: u32,
+    detokenizer: Option<IncrementalDetokenizer>,
+    request: EngineCoreRequest,
+}
+
 /// Which of a request's prompts a choice answers: its position in a completion request's prompt
 /// list (0 for chat, which has one). Its own type, so it cannot be swapped for a choice index.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -1236,6 +1246,77 @@ impl AsyncEngine {
     /// Add a non-streaming completion request.
     ///
     /// Supports `n > 1` and multi-prompt: generates `num_prompts * n` choices.
+    /// A completion request's children, one per (prompt, n) pair, every one resolved and checked
+    /// ([`Self::check_admissible`]) before any is submitted. `max_tokens` is resolved against each
+    /// prompt's length, so a later prompt can be refused where the first is not, and a refusal
+    /// partway through submitting would leave the earlier children running with no one polling
+    /// them.
+    fn completion_children(
+        &self,
+        request: &protocol::CompletionRequest,
+        prompts: &[Vec<u32>],
+        n: usize,
+        base_id: &str,
+        sampling_params: &SamplingParams,
+    ) -> ServeResult<Vec<CompletionChild>> {
+        let total = prompts.len() * n;
+        let mut children = Vec::with_capacity(total);
+        for (p_idx, prompt_ids) in prompts.iter().enumerate() {
+            for n_idx in 0..n {
+                let choice_index = (p_idx * n + n_idx) as u32;
+                let id = match total {
+                    1 => base_id.to_string(),
+                    _ => format!("{base_id}-{choice_index}"),
+                };
+                let mut sp = sampling_params.clone();
+                sp.seed = sp.seed.map(|s| s.wrapping_add(n_idx as u64));
+                sp.seal = request.seal;
+                self.resolve_max_tokens(&mut sp, prompt_ids.len());
+                self.check_admissible(prompt_ids.len() as u32, Some(&sp))?;
+                let detokenizer = self.tokenizer.as_ref().map(|tok| {
+                    IncrementalDetokenizer::new(
+                        Arc::clone(tok),
+                        prompt_ids,
+                        sp.stop.clone(),
+                        sp.min_tokens,
+                        sp.include_stop_str_in_output,
+                        sp.skip_special_tokens,
+                    )
+                });
+                let request = EngineCoreRequest {
+                    request_id: id.clone(),
+                    prompt_token_ids: Some(prompt_ids.clone()),
+                    sampling_params: Some(sp),
+                    arrival_time: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs_f64(),
+                    client_index: 0,
+                    priority: request.priority,
+                    cache_salt: request.cache_salt.clone(),
+                    data_parallel_rank: None,
+                    is_pooling: false,
+                    mm_data: None,
+                    block_annotations: request.block_annotations.clone(),
+                    seal: request.seal,
+                    volatile: request.volatile,
+                    cache_breakpoints: Vec::new(),
+                };
+                children.push(CompletionChild {
+                    id,
+                    choice: Choice {
+                        index: choice_index,
+                        prompt: PromptIndex(p_idx as u32),
+                    },
+                    num_prompt_tokens: prompt_ids.len() as u32,
+                    detokenizer,
+                    request,
+                });
+            }
+        }
+        Ok(children)
+    }
+
     pub async fn completion(
         &self,
         request: protocol::CompletionRequest,
@@ -1265,8 +1346,10 @@ impl AsyncEngine {
             truncate_prompt(p, request.truncate_prompt_tokens)?;
         }
         let total = prompts.len() * n;
+        let children =
+            self.completion_children(&request, &prompts, n, &base_id, &sampling_params)?;
 
-        // Per-HTTP-request metrics (once).
+        // Per-HTTP-request metrics (once), for a request every child of which is admitted.
         let total_prompt_tokens: u32 = prompts.iter().map(|p| p.len() as u32).sum();
         #[cfg(feature = "metrics")]
         {
@@ -1279,73 +1362,22 @@ impl AsyncEngine {
 
         // Submit all child requests.
         let mut child_ids: Vec<(String, u32)> = Vec::with_capacity(total);
-
-        for (p_idx, prompt_ids) in prompts.iter().enumerate() {
-            let num_prompt_tokens = prompt_ids.len() as u32;
-
-            for n_idx in 0..n {
-                let choice_index = (p_idx * n + n_idx) as u32;
-                let child_id = if total == 1 {
-                    base_id.clone()
-                } else {
-                    format!("{base_id}-{choice_index}")
-                };
-
-                let mut sp = sampling_params.clone();
-                sp.seed = sp.seed.map(|s| s.wrapping_add(n_idx as u64));
-                sp.seal = request.seal;
-                self.resolve_max_tokens(&mut sp, prompt_ids.len());
-
-                let ec_req = EngineCoreRequest {
-                    request_id: child_id.clone(),
-                    prompt_token_ids: Some(prompt_ids.clone()),
-                    sampling_params: Some(sp.clone()),
-                    arrival_time: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs_f64(),
-                    client_index: 0,
-                    priority: request.priority,
-                    cache_salt: request.cache_salt.clone(),
-                    data_parallel_rank: None,
-                    is_pooling: false,
-                    mm_data: None,
-                    block_annotations: request.block_annotations.clone(),
-                    seal: request.seal,
-                    volatile: request.volatile,
-                    cache_breakpoints: Vec::new(),
-                };
-
-                let detokenizer = self.tokenizer.as_ref().map(|tok| {
-                    IncrementalDetokenizer::new(
-                        Arc::clone(tok),
-                        prompt_ids,
-                        sp.stop.clone(),
-                        sp.min_tokens,
-                        sp.include_stop_str_in_output,
-                        sp.skip_special_tokens,
-                    )
-                });
-
-                self.submit_request(
-                    child_id.clone(),
-                    ec_req,
-                    num_prompt_tokens,
-                    None,
-                    detokenizer,
-                    Choice {
-                        index: choice_index,
-                        prompt: PromptIndex(p_idx as u32),
-                    },
-                    None, // no tool parsing for completions
-                    ToolCallStream::default(),
-                    None, // no reasoning parsing for completions
-                    true,
-                )
-                .await?;
-
-                child_ids.push((child_id, choice_index));
-            }
+        for child in children {
+            let index = child.choice.index;
+            self.submit_request(
+                child.id.clone(),
+                child.request,
+                child.num_prompt_tokens,
+                None,
+                child.detokenizer,
+                child.choice,
+                None, // no tool parsing for completions
+                ToolCallStream::default(),
+                None, // no reasoning parsing for completions
+                true,
+            )
+            .await?;
+            child_ids.push((child.id, index));
         }
 
         // Poll all children and build choices.
@@ -1456,10 +1488,10 @@ impl AsyncEngine {
         for p in &mut prompts {
             truncate_prompt(p, request.truncate_prompt_tokens)?;
         }
-        let total = prompts.len() * n;
+        let children =
+            self.completion_children(&request, &prompts, n, &base_id, &sampling_params)?;
 
-        // Per-HTTP-request metrics (once).
-        // Per-HTTP-request metrics (once).
+        // Per-HTTP-request metrics (once), for a request every child of which is admitted.
         #[cfg(feature = "metrics")]
         {
             let total_prompt_tokens: u32 = prompts.iter().map(|p| p.len() as u32).sum();
@@ -1472,71 +1504,20 @@ impl AsyncEngine {
 
         // All children share one channel.
         let (tx, rx) = mpsc::unbounded_channel();
-
-        for (p_idx, prompt_ids) in prompts.iter().enumerate() {
-            let num_prompt_tokens = prompt_ids.len() as u32;
-
-            for n_idx in 0..n {
-                let choice_index = (p_idx * n + n_idx) as u32;
-                let child_id = if total == 1 {
-                    base_id.clone()
-                } else {
-                    format!("{base_id}-{choice_index}")
-                };
-
-                let mut sp = sampling_params.clone();
-                sp.seed = sp.seed.map(|s| s.wrapping_add(n_idx as u64));
-                sp.seal = request.seal;
-                self.resolve_max_tokens(&mut sp, prompt_ids.len());
-
-                let ec_req = EngineCoreRequest {
-                    request_id: child_id.clone(),
-                    prompt_token_ids: Some(prompt_ids.clone()),
-                    sampling_params: Some(sp.clone()),
-                    arrival_time: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs_f64(),
-                    client_index: 0,
-                    priority: request.priority,
-                    cache_salt: request.cache_salt.clone(),
-                    data_parallel_rank: None,
-                    is_pooling: false,
-                    mm_data: None,
-                    block_annotations: request.block_annotations.clone(),
-                    seal: request.seal,
-                    volatile: request.volatile,
-                    cache_breakpoints: Vec::new(),
-                };
-
-                let detokenizer = self.tokenizer.as_ref().map(|tok| {
-                    IncrementalDetokenizer::new(
-                        Arc::clone(tok),
-                        prompt_ids,
-                        sp.stop.clone(),
-                        sp.min_tokens,
-                        sp.include_stop_str_in_output,
-                        sp.skip_special_tokens,
-                    )
-                });
-
-                self.submit_request(
-                    child_id,
-                    ec_req,
-                    num_prompt_tokens,
-                    Some(tx.clone()),
-                    detokenizer,
-                    Choice {
-                        index: choice_index,
-                        prompt: PromptIndex(p_idx as u32),
-                    },
-                    None, // no tool parsing for completions
-                    ToolCallStream::default(),
-                    None, // no reasoning parsing for completions
-                    true,
-                )
-                .await?;
-            }
+        for child in children {
+            self.submit_request(
+                child.id,
+                child.request,
+                child.num_prompt_tokens,
+                Some(tx.clone()),
+                child.detokenizer,
+                child.choice,
+                None, // no tool parsing for completions
+                ToolCallStream::default(),
+                None, // no reasoning parsing for completions
+                true,
+            )
+            .await?;
         }
 
         // Drop the original sender so rx closes when all children finish.
@@ -2434,6 +2415,31 @@ impl AsyncEngine {
     /// Note: `requests_total` and `prompt_tokens_total` metrics are the
     /// caller's responsibility (once per HTTP request). This method only
     /// increments `requests_active` (once per engine-core request).
+    /// Whether a request this long, sampling with `params`, may be submitted: its prompt within
+    /// the model's context, and its params within the ranges vLLM's `SamplingParams` checks
+    /// (temperature, top_p / top_k / min_p, the penalties, max_tokens against min_tokens, …).
+    /// [`Self::submit_request`] checks every request; a completion checks all its children first
+    /// ([`Self::completion_children`]).
+    fn check_admissible(
+        &self,
+        num_prompt_tokens: u32,
+        params: Option<&SamplingParams>,
+    ) -> ServeResult<()> {
+        if num_prompt_tokens as usize > self.max_model_len {
+            return Err(crate::error::ServeError::Validation(format!(
+                "prompt is {num_prompt_tokens} tokens but this model serves at most {} — the \
+                 limit is what the backend's KV memory funds and its prefix mask addresses",
+                self.max_model_len
+            )));
+        }
+        if let Some(params) = params {
+            params
+                .validate()
+                .map_err(|e| ServeError::Validation(e.into_owned()))?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn submit_request(
         &self,
@@ -2463,21 +2469,7 @@ impl AsyncEngine {
         // cap it never fires, because capping the config is not the same as validating a request against it.
         // HERE it fails exactly one request, before any batch is formed, and every other request in the
         // file is served normally.
-        if num_prompt_tokens as usize > self.max_model_len {
-            return Err(crate::error::ServeError::Validation(format!(
-                "prompt is {num_prompt_tokens} tokens but this model serves at most {} — the \
-                 limit is what the backend's KV memory funds and its prefix mask addresses",
-                self.max_model_len
-            )));
-        }
-        // Its sampling params hold to the ranges vLLM's `SamplingParams` checks (temperature,
-        // top_p / top_k / min_p, the penalties, max_tokens against min_tokens, …), refused here
-        // with the rest of a request's validation — every endpoint's request passes through.
-        if let Some(params) = &ec_request.sampling_params {
-            params
-                .validate()
-                .map_err(|e| ServeError::Validation(e.into_owned()))?;
-        }
+        self.check_admissible(num_prompt_tokens, ec_request.sampling_params.as_ref())?;
         #[cfg(feature = "metrics")]
         {
             let metrics = crate::metrics::VllmMetrics::global();
@@ -4417,6 +4409,32 @@ mod tests {
         let client = Box::new(InprocClient::new(make_engine_config(), executor));
         let tok = Arc::new(make_test_tokenizer());
         AsyncEngine::with_tokenizer(client, "test-model".to_string(), 4096, tok)
+    }
+
+    /// A completion's prompts are all checked before any is submitted: a later prompt whose
+    /// remaining context can't hold `min_tokens` is a 400, and leaves no earlier prompt's child in
+    /// the engine, streamed or not.
+    #[tokio::test]
+    async fn a_refused_completion_prompt_leaves_no_child_behind() {
+        for stream in [false, true] {
+            let engine = make_test_engine_with_tokenizer();
+            let request: protocol::CompletionRequest = serde_json::from_value(serde_json::json!({
+                "prompt": ["hi", "x".repeat(4000)],
+                "max_tokens": 1000,
+                "min_tokens": 200,
+            }))
+            .unwrap();
+            let refused = match stream {
+                false => engine.completion(request).await.err(),
+                true => engine.completion_stream(request).await.err(),
+            };
+            assert!(
+                matches!(refused, Some(ServeError::Validation(_))),
+                "stream={stream}: {refused:?}"
+            );
+            let left = engine.requests.lock().await.len();
+            assert_eq!(left, 0, "stream={stream}: children left in the engine");
+        }
     }
 
     fn make_chat_request() -> protocol::ChatCompletionRequest {
