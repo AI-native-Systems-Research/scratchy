@@ -1510,13 +1510,28 @@ def session_stats(corpus):
         if line.strip():
             row = json.loads(line)
             rows[row["seq"]] = row
-    calls = broken = lost = tokens_in = tokens_out = 0
+    calls = lost = tokens_in = tokens_out = 0
+    broken, rejected = 0, set()
+    # Ids of the calls already counted as broken, so the rejection Claude Code
+    # sends back for one is not counted again.
+    broken_ids = set()
     for t in turns:
+        # Claude Code's rejections come back as tool results in the next
+        # request's history. Every turn's is read: compaction drops old ones, and
+        # the last request may be a side request with none.
+        for m in t["body"].get("messages") or []:
+            for b in m.get("content") if isinstance(m.get("content"), list) else []:
+                if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"):
+                    c = b.get("content")
+                    c = c if isinstance(c, str) else " ".join(
+                        x.get("text", "") for x in c or [] if isinstance(x, dict))
+                    if any(k in c for k in TOOL_REJECTED):
+                        rejected.add(b.get("tool_use_id"))
         raw = (d / "responses" / f"{t['seq']:06d}.body")
         data = raw.read_bytes() if raw.exists() else b""
         if (rows[t["seq"]].get("resp_content_encoding") or "").lower() == "gzip":
             data = gzip.decompress(data)
-        args, text = {}, []
+        args, ids, text = {}, {}, []
         try:
             for ev, _ in sse_events(data.splitlines(keepends=True) + [b"\n"]):
                 kind = ev.get("type")
@@ -1524,6 +1539,7 @@ def session_stats(corpus):
                     block = ev.get("content_block") or {}
                     if block.get("type") == "tool_use":
                         args[ev.get("index")] = ""
+                        ids[ev.get("index")] = block.get("id")
                 elif kind == "content_block_delta":
                     delta = ev.get("delta") or {}
                     if delta.get("type") == "input_json_delta":
@@ -1535,25 +1551,16 @@ def session_stats(corpus):
             broken += 1  # an unreadable stream is a failure of whatever produced it
             continue
         calls += len(args)
-        for a in args.values():
+        for i, a in args.items():
             if _json_or_none((a or "{}").encode()) is None:
                 broken += 1
+                broken_ids.add(ids.get(i))
         reply = "".join(text)
         lost += reply.count(TOOL_MARKUP[0]) or int(TOOL_MARKUP[1] in reply)
         usage = t["recorded"]
         tokens_in += usage.get("prompt_tokens") or 0
         tokens_out += usage.get("output_tokens") or 0
-    # Claude Code's rejections come back as tool results, so the last request's
-    # history holds every one the session got.
-    rejected = 0
-    if turns:
-        for m in turns[-1]["body"].get("messages") or []:
-            for b in m.get("content") if isinstance(m.get("content"), list) else []:
-                if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"):
-                    c = b.get("content")
-                    c = c if isinstance(c, str) else " ".join(
-                        x.get("text", "") for x in c or [] if isinstance(x, dict))
-                    rejected += any(k in c for k in TOOL_REJECTED)
+    rejected = len(rejected - broken_ids)
     times = [r for r in rows.values() if r.get("t_end")]
     failures = broken + rejected + lost
     return {

@@ -1070,6 +1070,16 @@ def _text_stream(text):
             (0, _ev("message_stop"))]
 
 
+def _rejection(tid, text):
+    """A tool result Claude Code marked is_error, with `text` as what it said."""
+    return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid,
+                                         "is_error": True, "content": text}]}
+
+
+REJECTED = ("<tool_use_error>InputValidationError: Read failed due to the following issue:\n"
+            "The required parameter `file_path` is missing</tool_use_error>")
+
+
 def make_task(root):
     """The smoke task as a task directory: a bug in m.py, a test in t.py, a grader."""
     d = Path(root)
@@ -1188,7 +1198,6 @@ class LiveTest(unittest.TestCase):
         run, detail = self._live(sessions=1)
         self.assertEqual(detail["sessions"][0]["tool_call_failures"], 1)
         self.assertEqual(detail["sessions"][0]["tool_calls"], 2)
-        # A command that failed (is_error in the history) is the agent working.
         self.assertEqual(self._meas(run, "tool_call_parse_failure_rate")["stat"]["median"], 0.5)
 
     def test_a_call_left_as_text_counts_as_lost(self):
@@ -1309,6 +1318,38 @@ class LiveTest(unittest.TestCase):
         time.sleep(3)
         work = self.root / "out" / "session-1" / "workdir"
         self.assertEqual((work / "m.py").read_text(), TASK_BROKEN)
+
+    def _history(self, *histories):
+        """FAKE_TURNS whose requests carry these message lists after the first prompt."""
+        first = conversation()[0]
+        self.env["FAKE_TURNS"] = json.dumps(
+            [first] + [{**first, "messages": first["messages"] + h} for h in histories])
+
+    def test_a_failing_command_does_not_count_but_a_rejected_call_does(self):
+        self._history([_assistant(_tool("Read", "r1")), _rejection("r1", REJECTED),
+                       _assistant(_tool("Bash", "b1")),
+                       _rejection("b1", "Exit code 1\nAssertionError: add(2, 3) == -1")])
+        _, detail = self._live(sessions=1)
+        self.assertEqual(detail["sessions"][0]["tool_call_failures"], 1)
+
+    def test_a_rejection_counts_when_the_last_request_does_not_carry_it(self):
+        # The rejection is in the second request's history; the last one is a
+        # side request (or a compacted history) that no longer has it.
+        rejected = [_assistant(_tool("Read", "r1")), _rejection("r1", REJECTED)]
+        self._history(rejected, [_user("summarize this conversation in 5 words")])
+        _, detail = self._live(sessions=1)
+        self.assertEqual(detail["sessions"][0]["tool_call_failures"], 1)
+
+    def test_a_broken_call_that_claude_code_then_rejects_counts_once(self):
+        # _tool_stream's call has id "t": its arguments are not JSON, and Claude
+        # Code sends back a rejection for that same id in every later request.
+        self.replies[0] = _tool_stream("Read", '{"file_path": "m.py"')
+        it = iter(self.replies * 10)
+        FakeAnthropic.reply = staticmethod(lambda body: next(it))
+        rejected = [_assistant(_tool("Read", "t")), _rejection("t", REJECTED)]
+        self._history(rejected, rejected + [_assistant(_tool("Edit", "u")), _result("u")])
+        _, detail = self._live(sessions=1)
+        self.assertEqual(detail["sessions"][0]["tool_call_failures"], 1)
 
     @unittest.skipUnless(VALIDATOR.exists() and BOARD.exists(),
                          "needs site/build_leaderboard.py and board.json (#176)")
