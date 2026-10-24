@@ -3488,6 +3488,7 @@ impl AsyncEngine {
         &self,
         request: &protocol::ChatCompletionRequest,
     ) -> ServeResult<SamplingParams> {
+        check_messages(&request.messages)?;
         let tools: Vec<&str> = (request.tools.iter().flatten())
             .map(|t| t.function.name.as_str())
             .collect();
@@ -4076,6 +4077,18 @@ fn build_completion_logprobs(
         token_logprobs,
         tokens,
         top_logprobs,
+    }
+}
+
+/// A chat request has a message to answer. An empty list would render the template's generation
+/// prompt alone and be answered; the OpenAI API refuses it with a 400, in its own words. Checked
+/// with `tool_choice`, as every chat request's sampling params are built.
+fn check_messages(messages: &[protocol::ChatCompletionMessageParam]) -> ServeResult<()> {
+    match messages.is_empty() {
+        true => Err(ServeError::Validation(
+            "[] is too short - 'messages'".to_string(),
+        )),
+        false => Ok(()),
     }
 }
 

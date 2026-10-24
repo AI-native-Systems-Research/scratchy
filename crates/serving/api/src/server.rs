@@ -1481,6 +1481,35 @@ mod tests {
         assert_eq!(error["error"]["type"], "BadRequestError", "{error}");
     }
 
+    /// An empty `messages` list is the OpenAI API's 400 too, on every chat endpoint. It used to
+    /// render the template's generation prompt alone and be answered.
+    #[tokio::test]
+    async fn test_chat_completions_empty_messages() {
+        for (uri, body) in [
+            ("/v1/chat/completions", r#"{"messages": []}"#),
+            (
+                "/v1/chat/completions",
+                r#"{"messages": [], "stream": true}"#,
+            ),
+            ("/v1/chat/completions/render", r#"{"messages": []}"#),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let response = build_router(make_test_state())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri} {body}");
+            let error = error_body(response).await;
+            let message = error["error"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains("[] is too short - 'messages'"), "{error}");
+        }
+    }
+
     /// The body of an error response, as JSON.
     async fn error_body(response: axum::response::Response) -> serde_json::Value {
         let body = response.into_body().collect().await.unwrap().to_bytes();

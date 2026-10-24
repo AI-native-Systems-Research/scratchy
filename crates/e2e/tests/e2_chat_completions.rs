@@ -486,15 +486,15 @@ async fn test_chat_missing_messages() {
 async fn test_chat_empty_messages() {
     let (_server, client) = start_smollm().await;
 
-    let request = ChatCompletionRequest {
-        messages: vec![],
-        max_tokens: Some(10),
-        ..default_chat_request()
-    };
-
-    // Empty messages may be refused with a 400 or produce an error response.
-    // We just verify the server doesn't crash.
-    let _resp = client.chat_completion(&request).await;
+    let resp = client
+        .chat_completion_raw(&serde_json::json!({"messages": [], "max_tokens": 10}))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "empty messages should return 400, as the OpenAI API answers it"
+    );
 }
 
 // ===========================================================================
