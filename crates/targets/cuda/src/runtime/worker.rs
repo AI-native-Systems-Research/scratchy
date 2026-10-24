@@ -40,8 +40,9 @@ use crate::rotary::fill_rotary_rows;
 use crate::step::{
     AddBf16, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16,
     ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GatedDeltaNetBf16, GemmBf16, MatmulKernel, MoeRouteBf16, PairRows, RmsNormBf16, RopeAppendBf16,
-    RopeBf16, RouterLogitsBf16, SiluMulBf16, moe_bundle,
+    GatedDeltaNetBf16, GemmBf16, KV_APPEND_BF16_HEAD_DIM, MOE_ROUTE_EXPERTS, MatmulKernel,
+    MoeRouteBf16, PairRows, RmsNormBf16, RopeAppendBf16, RopeBf16, RouterLogitsBf16, SiluMulBf16,
+    moe_bundle,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape, TapeError,
@@ -305,6 +306,10 @@ pub enum ForwardError {
     SpanOutsideArena { span: ArenaSpan, arena_bytes: u64 },
     /// The `step`-th launch failed; nothing after it was enqueued, and the stream was drained.
     Launch { step: usize, error: KernelError },
+    /// The `step`-th step is `op`, a step the lowering emits for Gemma 4 26B-A4B and no kernel
+    /// launches yet (#885's 13b and 13c remove this piece by piece; 13c deletes it). Checked over
+    /// the whole tape before anything is uploaded or enqueued.
+    NotLaunched { step: usize, op: &'static str },
     /// A copy or the stream wait failed; the stream was drained.
     Cuda(CudaError),
 }
@@ -434,6 +439,9 @@ impl fmt::Display for ForwardError {
                 span.bytes, span.offset.0
             ),
             Self::Launch { step, error } => write!(f, "step {step} did not launch: {error}"),
+            Self::NotLaunched { step, op } => {
+                write!(f, "step {step} is {op}, which no kernel launches yet")
+            }
             Self::Cuda(e) => write!(f, "the forward failed: {e}"),
         }
     }
@@ -556,6 +564,57 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
         })
         .collect::<Option<Vec<_>>>()?;
     Some((offsets, per_layer.checked_mul(layers as u64)?))
+}
+
+/// The name of `s` when it is a step the lowering emits and no kernel launches yet: every Gemma
+/// step (#885's 13b and 13c), a rope or attention of a class with a window or a head dim not 256
+/// or a half-head pairing, a Gemma routing, an expert step at another count than 256 or on
+/// 64-column tiles. `None` for every step a Qwen tape holds.
+fn not_launched(tape: &CudaTape, s: &CudaStep) -> Option<&'static str> {
+    use crate::step::{RopePairing, RouteProgram};
+    let qwen_class = |layer: u32| {
+        tape.kv_class(layer)
+            .is_some_and(|c| c.window.is_none() && c.head_dim == KV_APPEND_BF16_HEAD_DIM)
+    };
+    match *s {
+        CudaStep::Scale(_) => Some("Scale"),
+        CudaStep::RmsNormUnit(_) => Some("RmsNormUnit"),
+        CudaStep::GeluMul(_) => Some("GeluMul"),
+        CudaStep::LayerScale(_) => Some("LayerScale"),
+        CudaStep::SoftCap(_) => Some("SoftCap"),
+        CudaStep::RouterNorm(_) => Some("RouterNorm"),
+        CudaStep::GemmCol64(_) => Some("GemmCol64"),
+        CudaStep::Rope(RopeBf16 { pairing, .. }) if pairing != RopePairing::HalfRotated => {
+            Some("Rope")
+        }
+        CudaStep::RopeAppend(RopeAppendBf16 { layer, pairing, .. })
+            if pairing != RopePairing::HalfRotated || !qwen_class(layer) =>
+        {
+            Some("RopeAppend")
+        }
+        CudaStep::AttnPrefill(AttnPrefillBf16 { layer, window, .. })
+            if window.is_some() || !qwen_class(layer) =>
+        {
+            Some("AttnPrefill")
+        }
+        CudaStep::AttnDecode(AttnPrefillBf16 { layer, window, .. })
+            if window.is_some() || !qwen_class(layer) =>
+        {
+            Some("AttnDecode")
+        }
+        CudaStep::MoeRoute(MoeRouteBf16 {
+            program, experts, ..
+        }) if program != RouteProgram::QwenSoftmax || experts != MOE_ROUTE_EXPERTS => {
+            Some("MoeRoute")
+        }
+        CudaStep::RouterLogits(r) if r.experts != MOE_ROUTE_EXPERTS => Some("RouterLogits"),
+        CudaStep::ExpertSort(e) if e.experts != MOE_ROUTE_EXPERTS => Some("ExpertSort"),
+        CudaStep::ExpertGemm(e) if e.experts != MOE_ROUTE_EXPERTS || e.n_tile != 256 => {
+            Some("ExpertGemm")
+        }
+        CudaStep::ExpertGemv(e) if e.experts != MOE_ROUTE_EXPERTS => Some("ExpertGemv"),
+        _ => None,
+    }
 }
 
 /// The KV pool's bytes: `layers` layers of a K and a V buffer of `num_blocks` blocks of `kv_heads ·
@@ -940,6 +999,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             bucket,
             buckets: self.tapes.len(),
         })?;
+        if let Some((step, op)) = (tape.steps.iter().enumerate())
+            .find_map(|(step, s)| not_launched(tape, s).map(|op| (step, op)))
+        {
+            return Err(ForwardError::NotLaunched { step, op });
+        }
         let ids = match (tape.input, input) {
             (TapeInput::Hidden(_), Input::Hidden(_)) => None,
             (TapeInput::TokenIds { vocab, .. }, Input::TokenIds(ids)) => Some((ids, vocab)),
@@ -1272,6 +1336,17 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // `forward` checked is inside the pool.
         for (step, s) in tape.steps.iter().enumerate() {
             let launched = match *s {
+                // Refused above, before anything was enqueued (`not_launched`).
+                CudaStep::Scale(_)
+                | CudaStep::RmsNormUnit(_)
+                | CudaStep::GeluMul(_)
+                | CudaStep::LayerScale(_)
+                | CudaStep::SoftCap(_)
+                | CudaStep::RouterNorm(_)
+                | CudaStep::GemmCol64(_) => {
+                    let op = not_launched(tape, s).unwrap_or("a Gemma step");
+                    return Err(ForwardError::NotLaunched { step, op });
+                }
                 CudaStep::Embed(EmbedBf16 {
                     tokens,
                     table,
@@ -1355,6 +1430,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     experts,
                     top_k,
                     renorm,
+                    ..
                 }) => {
                     // SAFETY: as above, for `logits` (`m*experts`), `topk_idx` and `scores`
                     // (`m*top_k` each).
@@ -1478,6 +1554,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     cols,
                     head_dim,
                     rot_dim,
+                    ..
                 }) => {
                     // SAFETY: as above, for `x` and `out` (`rows*cols`) and `table`
                     // (`rows*rot_dim`), whose rows this forward uploaded above.
@@ -1543,6 +1620,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     cols,
                     head_dim,
                     rot_dim,
+                    ..
                 }) => {
                     let pool = kv.expect("`new` made a pool for a KV tape");
                     let l = layer as usize;

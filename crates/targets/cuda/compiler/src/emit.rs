@@ -47,8 +47,8 @@ use scratchy_subtile::handoff::{
     SourceBinding, TargetModelFacts, TargetModelInput, TargetPoint, UnrollIndex,
 };
 use scratchy_target_cuda::step::{
-    CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GatedDeltaNetBf16, GemmBf16, RmsNormBf16,
-    RouterLogitsBf16, gdn_conv_dim,
+    CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GatedDeltaNetBf16, GemmBf16,
+    LayerScaleBf16, MoeRouteBf16, RmsNormBf16, RouterLogitsBf16, gdn_conv_dim,
 };
 use scratchy_target_cuda::tape::{ArenaLayout, CudaTape, GdnTape, KvTape, TapeError, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
@@ -74,6 +74,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "WeightIx",
                 "RotaryTable",
                 "KvTape",
+                "KvClass",
                 "GdnTape",
                 "MoeTape",
                 "MoeSortTape",
@@ -107,6 +108,12 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "ExpertCombineBf16",
                 "GateScaleBf16",
                 "GainConvention",
+                "RopePairing",
+                "RouteProgram",
+                "ScaleBf16",
+                "RmsNormUnitBf16",
+                "LayerScaleBf16",
+                "SoftCapBf16",
             ],
         },
         ModuleRow {
@@ -429,13 +436,21 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             ..
         }) => Some((table, Role::Bf16([u64::from(vocab), u64::from(hidden)], 2))),
         CudaStep::Gemm(GemmBf16 { b, n, k, .. })
+        | CudaStep::GemmCol64(GemmBf16 { b, n, k, .. })
         | CudaStep::GemmNarrow(GemmBf16 { b, n, k, .. })
         | CudaStep::Gemv(GemmBf16 { b, n, k, .. }) => {
             Some((b, Role::Bf16([u64::from(n), u64::from(k)], 2)))
         }
-        CudaStep::RmsNorm(RmsNormBf16 { gain, cols, .. }) => {
+        CudaStep::RmsNorm(RmsNormBf16 { gain, cols, .. })
+        | CudaStep::RouterNorm(RmsNormBf16 { gain, cols, .. }) => {
             Some((gain, Role::Bf16([u64::from(cols), 0], 1)))
         }
+        CudaStep::LayerScale(LayerScaleBf16 { scale, .. }) => Some((scale, Role::Bf16([1, 0], 1))),
+        CudaStep::MoeRoute(MoeRouteBf16 {
+            expert_scale: Some(ix),
+            experts,
+            ..
+        }) => Some((ix, Role::Bf16([u64::from(experts), 0], 1))),
         CudaStep::GatedDeltaNet(GatedDeltaNetBf16 {
             bundle,
             num_k_heads,
@@ -486,7 +501,11 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         | CudaStep::MoeRoute(_)
         | CudaStep::ExpertSort(_)
         | CudaStep::ExpertCombine(_)
-        | CudaStep::GateScale(_) => None,
+        | CudaStep::GateScale(_)
+        | CudaStep::Scale(_)
+        | CudaStep::RmsNormUnit(_)
+        | CudaStep::GeluMul(_)
+        | CudaStep::SoftCap(_) => None,
     }
 }
 
@@ -668,6 +687,7 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
         weight_bytes,
         steps,
         rotary,
+        rotary_local,
         kv,
         gdn,
         moe,
@@ -684,6 +704,7 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
         weight_bytes: baked(weight_bytes),
         steps: baked(steps),
         rotary: *rotary,
+        rotary_local: *rotary_local,
         kv: kv.as_ref().map(
             |CanonicalKv {
                  layers,
@@ -694,6 +715,8 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
                  block_table,
                  slot_mapping,
                  sequence,
+                 classes,
+                 layer_class,
              }| KvTape {
                 layers: baked(layers),
                 kv_heads: *kv_heads,
@@ -703,6 +726,8 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
                 block_table: *block_table,
                 slot_mapping: *slot_mapping,
                 sequence: *sequence,
+                classes: baked(classes),
+                layer_class: baked(layer_class),
             },
         ),
         gdn: gdn.as_ref().map(

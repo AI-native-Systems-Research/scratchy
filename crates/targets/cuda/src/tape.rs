@@ -12,11 +12,11 @@ use serde::Serialize;
 
 use crate::op_abi::CUDA_EXPERT_TILE_ROWS;
 use crate::step::{
-    AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16,
-    ExpertGemvBf16, ExpertSortBf16, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX,
-    GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, GemmBf16, MoeRouteBf16,
-    RopeAppendBf16, RopeBf16, RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch,
-    sort_index_regions,
+    ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep,
+    EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertSortBf16,
+    GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES,
+    GatedDeltaNetBf16, GemmBf16, MoeRouteBf16, RmsNormBf16, RopeAppendBf16, RopeBf16,
+    RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, sort_index_regions,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -101,6 +101,21 @@ pub struct KvTape {
     pub slot_mapping: ArenaSpan,
     /// `[prefix_len, q_len]` u32: 8 bytes at an aligned offset of its own.
     pub sequence: ArenaSpan,
+    /// The attention classes of the layers: one for a uniform model (every Qwen tape: its
+    /// `kv_heads`, `head_dim`, no window), two for Gemma 4 (sliding, then global). Class 0 is
+    /// `kv_heads` and `head_dim`'s.
+    pub classes: &'static [KvClass],
+    /// Per entry of `layers`, its class: an index into `classes`.
+    pub layer_class: &'static [u8],
+}
+
+/// One attention class's KV geometry: each layer of it caches `kv_heads` heads of `head_dim`,
+/// and its queries see their last `window` keys (`None`: every key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct KvClass {
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub window: Option<u32>,
 }
 
 /// Bytes of one u32 entry of a KV region.
@@ -170,6 +185,9 @@ pub struct MoeTape {
     pub up: ArenaSpan,
     pub act: ArenaSpan,
     pub down: ArenaSpan,
+    /// `[m, hidden]` bf16, Gemma's router pre-norm, after `down`; `None` for a block whose router
+    /// reads the hidden itself (every Qwen tape).
+    pub router_norm: Option<ArenaSpan>,
 }
 
 /// The sort's regions of a [`MoeTape`]: `chunk_hist` `[⌈P/256⌉, experts]` u32, `counts`
@@ -267,6 +285,7 @@ impl MoeTape {
             (Region::MoeAct, self.act),
             (Region::MoeDown, self.down),
         ]);
+        out.extend(self.router_norm.map(|r| (Region::MoeRouterNorm, r)));
         out
     }
 
@@ -274,7 +293,8 @@ impl MoeTape {
     /// (`CudaTape::validate` checks it), so it covers every one.
     pub fn span(&self) -> ArenaSpan {
         let start = self.logits.offset.0;
-        let end = self.down.offset.0.saturating_add(self.down.bytes);
+        let last = self.router_norm.unwrap_or(self.down);
+        let end = last.offset.0.saturating_add(last.bytes);
         ArenaSpan {
             offset: self.logits.offset,
             bytes: end.saturating_sub(start),
@@ -349,7 +369,11 @@ pub struct CudaTape {
     /// One step per launch, in launch order.
     pub steps: &'static [CudaStep],
     /// The rotary table the forward fills, when a step reads one; `None` for a tape with no rope.
+    /// It is the `Cos { local: false }` table: a uniform model's only one, Gemma's global layers'.
     pub rotary: Option<RotaryTable>,
+    /// The second rotary table, the `Cos { local: true }` one (Gemma's sliding layers), placed
+    /// after [`Self::rotary`]; `None` for every model with one rope class.
+    pub rotary_local: Option<RotaryTable>,
     /// The paged KV cache and its regions, when the canonical binds a `PrefixK` source; `None`
     /// for a tape with no attention.
     pub kv: Option<KvTape>,
@@ -384,6 +408,7 @@ pub enum Region {
     MoeUp,
     MoeAct,
     MoeDown,
+    MoeRouterNorm,
 }
 
 impl std::fmt::Display for Region {
@@ -409,6 +434,7 @@ impl std::fmt::Display for Region {
             Self::MoeUp => "the MoE up rows",
             Self::MoeAct => "the MoE activation rows",
             Self::MoeDown => "the MoE down rows",
+            Self::MoeRouterNorm => "the MoE router-norm rows",
         })
     }
 }
@@ -524,6 +550,10 @@ pub enum TapeError {
     /// The `step`-th step's kv heads or head dim are not the tape's KV geometry, so its kernel
     /// would address the pool with other strides than the worker allocated it with.
     KvStepGeometry { step: usize },
+    /// The KV attention classes are not a geometry the kernels take: none, class 0 not the
+    /// tape's `kv_heads` and `head_dim`, a head dim or window off the rules, a layer without a
+    /// class or naming one the tape lacks; or a local rotary table without a global one.
+    KvClasses,
     /// The `step`-th step is a one-row kernel's (a GEMV or the decode attention) and its rows are
     /// `rows`, not 1, or the tape's bucket is not one row.
     OneRowStep { step: usize, rows: u32 },
@@ -803,6 +833,11 @@ impl std::fmt::Display for TapeError {
                 f,
                 "step {step}'s kv heads or head dim are not the tape's KV cache geometry"
             ),
+            Self::KvClasses => write!(
+                f,
+                "the tape's KV attention classes are not a geometry the kernels take, or a layer \
+                 names no class"
+            ),
             Self::OneRowStep { step, rows } => write!(
                 f,
                 "step {step} is a one-row kernel's (the GEMV or the decode attention) at \
@@ -1001,7 +1036,10 @@ impl CudaTape {
                 total,
             });
         }
-        if let Some(t) = self.rotary {
+        if self.rotary_local.is_some() && self.rotary.is_none() {
+            return Err(TapeError::KvClasses);
+        }
+        for t in self.rotary.into_iter().chain(self.rotary_local) {
             if !(t.span.offset.0.is_multiple_of(CUDA_ARENA_ALIGN) && inside(t.span, total)) {
                 return Err(TapeError::RotaryOutside {
                     span: t.span,
@@ -1182,18 +1220,74 @@ impl CudaTape {
         }
     }
 
+    /// The KV classes: at least one, each a geometry the kernels take (non-zero heads, a head dim
+    /// of [`ATTN_BF16_HEAD_DIMS`] or the tape's own, a window a non-zero multiple of
+    /// [`ATTN_WINDOW_MULTIPLE`]) whose K (or V) row fits the pool's, `kv_heads · head_dim`, which
+    /// sizes every layer's region; and one class per layer naming a class the tape has.
+    fn kv_classes(&self, kv: &KvTape) -> Result<(), TapeError> {
+        if kv.classes.is_empty()
+            || kv.layer_class.len() != kv.layers.len()
+            || kv
+                .layer_class
+                .iter()
+                .any(|&c| usize::from(c) >= kv.classes.len())
+        {
+            return Err(TapeError::KvClasses);
+        }
+        for c in kv.classes {
+            let window_ok = c
+                .window
+                .is_none_or(|w| w != 0 && w.is_multiple_of(ATTN_WINDOW_MULTIPLE));
+            let head_ok = c.head_dim == kv.head_dim || ATTN_BF16_HEAD_DIMS.contains(&c.head_dim);
+            let row = u64::from(c.kv_heads) * u64::from(c.head_dim);
+            let fits = row <= u64::from(kv.kv_heads) * u64::from(kv.head_dim);
+            if c.kv_heads == 0 || c.head_dim == 0 || !head_ok || !window_ok || !fits {
+                return Err(TapeError::KvClasses);
+            }
+        }
+        Ok(())
+    }
+
+    /// The class of KV layer index `layer`, when the tape has it.
+    pub fn kv_class(&self, layer: u32) -> Option<KvClass> {
+        let kv = self.kv?;
+        let c = *kv.layer_class.get(layer as usize)?;
+        kv.classes.get(usize::from(c)).copied()
+    }
+
+    /// Whether a KV step of `(kv_heads, head_dim, window)` at KV layer index `layer` has its
+    /// layer's class geometry; a class-0 layer's is also the tape's `kv_heads` and `head_dim`, the
+    /// pool's. A layer the tape lacks is checked against class 0 here, and refused as `KvLayer`
+    /// by the extents check, which runs first.
+    fn kv_step_fits(&self, layer: u32, step: (u32, u32, Option<u32>)) -> bool {
+        let Some(kv) = self.kv else {
+            return false;
+        };
+        let c = (kv.layer_class.get(layer as usize)).map_or(0, |&c| usize::from(c));
+        let Some(class) = kv.classes.get(c) else {
+            return false;
+        };
+        step == (class.kv_heads, class.head_dim, class.window)
+            && (c != 0 || (step.0, step.1) == (kv.kv_heads, kv.head_dim))
+    }
+
     /// The regions the forward fills before the steps run: the rotary table and the KV regions,
     /// each checked to be aligned, inside the arena, and the size the forward writes. The rotary
     /// table's own checks ran before this.
     fn kv_regions(&self, total: u64) -> Result<Vec<(Region, ArenaSpan)>, TapeError> {
-        let mut regions: Vec<(Region, ArenaSpan)> = self
-            .rotary
+        let mut regions: Vec<(Region, ArenaSpan)> = (self.rotary.into_iter())
+            .chain(self.rotary_local)
             .map(|t| (Region::Rotary, t.span))
-            .into_iter()
             .collect();
+        if let [(_, a), (_, b)] = regions[..]
+            && overlap(a, b)
+        {
+            return Err(TapeError::RotaryOutside { span: b, total });
+        }
         let Some(kv) = self.kv else {
             return Ok(regions);
         };
+        self.kv_classes(&kv)?;
         if kv.block_size != CUDA_KV_BLOCK_SIZE {
             return Err(TapeError::KvBlockSize {
                 block_size: kv.block_size,
@@ -1292,7 +1386,7 @@ impl CudaTape {
     fn check_step_operands(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
         let rotary = |table: ArenaOffset| {
             let tape = self.rotary.map(|t| t.span.offset);
-            if tape == Some(table) {
+            if tape == Some(table) || self.rotary_local.map(|t| t.span.offset) == Some(table) {
                 Ok(())
             } else {
                 Err(TapeError::RotaryMismatch { step, table, tape })
@@ -1315,6 +1409,7 @@ impl CudaTape {
             CudaStep::RopeAppend(RopeAppendBf16 {
                 table,
                 slot_mapping,
+                layer,
                 rows,
                 cols,
                 head_dim,
@@ -1326,28 +1421,31 @@ impl CudaTape {
                     bytes: u64::from(rows) * KV_ENTRY_BYTES,
                 };
                 region(Region::SlotMapping, span, self.kv.map(|k| k.slot_mapping))?;
-                match self.kv {
-                    Some(kv)
-                        if head_dim == kv.head_dim
-                            && Some(cols) == kv.kv_heads.checked_mul(kv.head_dim) =>
-                    {
-                        Ok(())
-                    }
-                    _ => Err(TapeError::KvStepGeometry { step }),
+                let kv_heads = cols.checked_div(head_dim).unwrap_or(0);
+                let window = self.kv_class(layer).and_then(|c| c.window);
+                match cols.is_multiple_of(head_dim.max(1))
+                    && self.kv_step_fits(layer, (kv_heads, head_dim, window))
+                {
+                    true => Ok(()),
+                    false => Err(TapeError::KvStepGeometry { step }),
                 }
             }
             CudaStep::AttnPrefill(AttnPrefillBf16 {
                 block_table,
                 sequence,
+                layer,
                 kv_heads,
                 head_dim,
+                window,
                 ..
             })
             | CudaStep::AttnDecode(AttnPrefillBf16 {
                 block_table,
                 sequence,
+                layer,
                 kv_heads,
                 head_dim,
+                window,
                 ..
             }) => {
                 self.one_row(step, s)?;
@@ -1362,9 +1460,9 @@ impl CudaTape {
                     bytes: 2 * KV_ENTRY_BYTES,
                 };
                 region(Region::Sequence, seq, kv.map(|k| k.sequence))?;
-                match kv {
-                    Some(kv) if (kv_heads, head_dim) == (kv.kv_heads, kv.head_dim) => Ok(()),
-                    _ => Err(TapeError::KvStepGeometry { step }),
+                match self.kv_step_fits(layer, (kv_heads, head_dim, window)) {
+                    true => Ok(()),
+                    false => Err(TapeError::KvStepGeometry { step }),
                 }
             }
             CudaStep::GatedDeltaNet(
@@ -1417,6 +1515,25 @@ impl CudaTape {
                 Ok(())
             }
             CudaStep::Gemv(_) => self.one_row(step, s),
+            // Gemma's router norm writes the scratch's router-norm region, whole.
+            CudaStep::RouterNorm(RmsNormBf16 { y, rows, cols, .. }) => match self.moe {
+                Some(moe)
+                    if Some(y) == moe.router_norm.map(|r| r.offset)
+                        && (rows, cols) == (self.bucket_m, moe.hidden) =>
+                {
+                    Ok(())
+                }
+                Some(moe) => Err(TapeError::MoeRegionMismatch {
+                    step,
+                    region: Region::MoeRouterNorm,
+                    span: ArenaSpan {
+                        offset: y,
+                        bytes: u64::from(rows) * u64::from(cols) * CUDA_ACT_BYTES,
+                    },
+                    tape: moe.router_norm.unwrap_or(moe.logits),
+                }),
+                None => Err(TapeError::MoeStepGeometry { step }),
+            },
             CudaStep::RouterLogits(_)
             | CudaStep::MoeRoute(_)
             | CudaStep::ExpertSort(_)
@@ -1431,7 +1548,13 @@ impl CudaTape {
             | CudaStep::SiluMul(_)
             | CudaStep::GateSplit(_)
             | CudaStep::GateApply(_)
-            | CudaStep::GateScale(_) => Ok(()),
+            | CudaStep::GateScale(_)
+            | CudaStep::Scale(_)
+            | CudaStep::RmsNormUnit(_)
+            | CudaStep::GeluMul(_)
+            | CudaStep::LayerScale(_)
+            | CudaStep::SoftCap(_)
+            | CudaStep::GemmCol64(_) => Ok(()),
         }
     }
 
@@ -1460,8 +1583,12 @@ impl CudaTape {
         {
             return Err(TapeError::MoeGeometry);
         }
-        let want =
+        let mut want =
             moe_region_bytes(self.bucket_m, geometry, sorted).ok_or(TapeError::MoeGeometry)?;
+        if moe.router_norm.is_some() {
+            let bytes = u64::from(self.bucket_m) * u64::from(moe.hidden) * CUDA_ACT_BYTES;
+            want.push(bytes);
+        }
         let mut next = 0u64;
         for (&(region, span), want) in moe.regions().iter().zip(want) {
             let outside = TapeError::MoeRegionOutside {
@@ -1497,6 +1624,7 @@ impl CudaTape {
         let moe_step = matches!(
             s,
             CudaStep::RouterLogits(_)
+                | CudaStep::RouterNorm(_)
                 | CudaStep::MoeRoute(_)
                 | CudaStep::ExpertSort(_)
                 | CudaStep::ExpertGemm(_)
@@ -1513,7 +1641,12 @@ impl CudaTape {
         let Some(&span) = touched else {
             return Ok(());
         };
-        if let (CudaStep::SiluMul(SiluMulBf16 { gate, up, out, .. }), Some(moe)) = (s, self.moe) {
+        if let (
+            CudaStep::SiluMul(SiluMulBf16 { gate, up, out, .. })
+            | CudaStep::GeluMul(SiluMulBf16 { gate, up, out, .. }),
+            Some(moe),
+        ) = (s, self.moe)
+        {
             let (g, u, a) = (e.reads[0], e.reads[1], e.writes);
             if (*gate, *up, *out) == (moe.gate.offset, moe.up.offset, moe.act.offset)
                 && g == Some(moe.gate)
@@ -1728,7 +1861,8 @@ mod tests {
     use super::*;
     use crate::step::{
         AddBf16, AttnPrefillBf16, CUDA_MAX_BLOCKS_PER_SEQ, GateSplitBf16, GatedDeltaNetBf16,
-        GemmBf16, KvUse, MoeRouteBf16, RmsNormBf16, RopeAppendBf16, RopeBf16, WeightRead,
+        GemmBf16, KvUse, MoeRouteBf16, RmsNormBf16, RopeAppendBf16, RopeBf16, RopePairing,
+        RouteProgram, WeightRead,
     };
 
     const fn span(offset: u64, bytes: u64) -> ArenaSpan {
@@ -1777,6 +1911,7 @@ mod tests {
         kv: None,
         gdn: None,
         moe: None,
+        rotary_local: None,
     };
 
     /// `GOOD` with its steps replaced by `step` alone.
@@ -2234,6 +2369,7 @@ mod tests {
             cols: 2048,
             head_dim: 256,
             rot_dim: 64,
+            pairing: RopePairing::HalfRotated,
         })
     }
 
@@ -2306,6 +2442,7 @@ mod tests {
             cols: 512,
             head_dim: 256,
             rot_dim: 64,
+            pairing: RopePairing::HalfRotated,
         })
     }
 
@@ -2322,6 +2459,7 @@ mod tests {
             kv_heads,
             head_dim: 256,
             scale_bits: 0.0625f32.to_bits(),
+            window: None,
         })
     }
 
@@ -2334,6 +2472,12 @@ mod tests {
         block_table: span(KV_TABLE, 512),
         slot_mapping: span(KV_SLOTS, 1024),
         sequence: span(KV_SEQ, 8),
+        classes: &[KvClass {
+            kv_heads: 2,
+            head_dim: 256,
+            window: None,
+        }],
+        layer_class: &[0],
     };
 
     /// `GOOD`'s colours with the rotary table and the three KV regions after them, and `steps`.
@@ -2662,6 +2806,7 @@ mod tests {
             kv: None,
             gdn,
             moe: None,
+            rotary_local: None,
         }
     }
 
@@ -3155,6 +3300,7 @@ mod tests {
                 | TapeError::KvLayer { .. }
                 | TapeError::KvRegionMismatch { .. }
                 | TapeError::KvStepGeometry { .. }
+                | TapeError::KvClasses
                 | TapeError::OneRowStep { .. }
                 | TapeError::RotaryMismatch { .. }
                 | TapeError::WriteOverRegion { .. }
@@ -3260,6 +3406,7 @@ mod tests {
         kv: None,
         gdn: None,
         moe: None,
+        rotary_local: None,
     };
 
     /// A one-row GEMV tape validates; a GEMV of more than one row, or one in a bucket of more
@@ -3338,6 +3485,7 @@ mod tests {
         up: span(1536, 128),
         act: span(1792, 128),
         down: span(2048, 256),
+        router_norm: None,
     };
     const MOE_TOTAL: u64 = 2304;
 
@@ -3350,6 +3498,8 @@ mod tests {
         experts: 4,
         top_k: 2,
         renorm: true,
+        expert_scale: None,
+        program: RouteProgram::QwenSoftmax,
     };
 
     fn moe_tape(moe: Option<MoeTape>, steps: &[CudaStep]) -> CudaTape {
@@ -3368,6 +3518,7 @@ mod tests {
             kv: None,
             gdn: None,
             moe,
+            rotary_local: None,
         }
     }
 

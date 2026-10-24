@@ -40,10 +40,11 @@ use scratchy_subtile::subtile_ir::{
 };
 use scratchy_target_cuda::step::{
     AddBf16, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GateApplyBf16,
-    GateSplitBf16, GemmBf16, RmsNormBf16, RopeAppendBf16, RopeBf16,
+    GateSplitBf16, GemmBf16, RmsNormBf16, RopeAppendBf16, RopeBf16, RopePairing,
 };
 use scratchy_target_cuda::tape::{
-    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, KvTape, RotaryTable, TapeInput, WeightIx,
+    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, KvClass, KvTape, RotaryTable, TapeInput,
+    WeightIx,
 };
 
 use super::chains::with_hidden;
@@ -240,6 +241,7 @@ const fn rope(x: u64, table: u64, out: u64, rows: u32) -> CudaStep {
         cols: Q,
         head_dim: HD,
         rot_dim: R,
+        pairing: RopePairing::HalfRotated,
     })
 }
 
@@ -261,6 +263,7 @@ const fn rope_append(
         cols: KV,
         head_dim: HD,
         rot_dim: R,
+        pairing: RopePairing::HalfRotated,
     })
 }
 
@@ -276,6 +279,7 @@ const fn attn(q: u64, block_table: u64, sequence: u64, out: u64, rows: u32) -> C
         kv_heads: KV_HEADS,
         head_dim: HD,
         scale_bits: SCALE.to_bits(),
+        window: None,
     })
 }
 
@@ -318,6 +322,12 @@ const fn kv(table: u64, (slots, slot_bytes): (u64, u64), seq: u64) -> Option<KvT
         block_table: span(table, 512),
         slot_mapping: span(slots, slot_bytes),
         sequence: span(seq, 8),
+        classes: &[KvClass {
+            kv_heads: KV_HEADS,
+            head_dim: HD,
+            window: None,
+        }],
+        layer_class: &[0],
     })
 }
 
@@ -366,6 +376,7 @@ pub static ATTN_LAYER_M128: CudaTape = CudaTape {
     kv: kv(4866048, (4866560, 512), 4867072),
     gdn: None,
     moe: None,
+    rotary_local: None,
 };
 
 /// [`attn_layer`]`(256)`: `x` 0, `n` (then `o`) 524288, `qg` 1048576, `q` 3145728, `qn` 4194304,
@@ -408,4 +419,5 @@ pub static ATTN_LAYER_M256: CudaTape = CudaTape {
     kv: kv(9732096, (9732608, 1024), 9733632),
     gdn: None,
     moe: None,
+    rotary_local: None,
 };

@@ -25,7 +25,7 @@ use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::model_geometry::HeadDim;
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, RowScale, SourceShape, SubOp};
 use scratchy_target_cuda::step::{
-    AddBf16, CudaStep, GateApplyBf16, GateSplitBf16, GemmBf16, RmsNormBf16, RopeBf16,
+    AddBf16, CudaStep, GateApplyBf16, GateSplitBf16, GemmBf16, RmsNormBf16, RopeBf16, RopePairing,
 };
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, RotaryTable, TapeInput, WeightIx,
@@ -173,6 +173,7 @@ const fn rope(x: u64, table: u64, out: u64, rows: u32) -> CudaStep {
         cols: Q,
         head_dim: HD,
         rot_dim: R,
+        pairing: RopePairing::HalfRotated,
     })
 }
 
@@ -238,6 +239,7 @@ pub static ATTN_GATE_M128: CudaTape = CudaTape {
     kv: None,
     gdn: None,
     moe: None,
+    rotary_local: None,
 };
 
 /// [`attn_gate`]`(256)`: `x` 0, `n` (then `o`) 524288, `qg` 1048576, `q` 3145728, `qn` 4194304,
@@ -270,4 +272,5 @@ pub static ATTN_GATE_M256: CudaTape = CudaTape {
     kv: None,
     gdn: None,
     moe: None,
+    rotary_local: None,
 };

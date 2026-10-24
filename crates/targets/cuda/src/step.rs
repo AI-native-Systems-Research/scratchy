@@ -4,6 +4,7 @@
 
 /// Re-exported so a static tape names it beside the steps that carry it
 /// (`scratchy_target_cuda::step::GainConvention`).
+pub use scratchy_subtile::handoff::RopePairing;
 pub use scratchy_subtile::subtile_ir::GainConvention;
 use serde::Serialize;
 
@@ -85,6 +86,112 @@ pub enum CudaStep {
     /// `routed + shared · sigmoid(g)`, `g` broadcast across the row, lowered from
     /// `SubOp::GateScale` (`kernels/gate_scale_bf16.cu`).
     GateScale(GateScaleBf16),
+    /// `x · scale`, a compile-time scalar (Gemma's embedding scale), lowered from
+    /// `SubOp::ScalarMul`. Its kernel is #885's 13b.
+    Scale(ScaleBf16),
+    /// The RMSNorm with no gain (Gemma's `v_norm`), lowered from `SubOp::RmsNormUnit`. Its kernel
+    /// is #885's 13b.
+    RmsNormUnit(RmsNormUnitBf16),
+    /// `gelu_tanh(gate) · up` in one launch, lowered from the `GeluMul` fold of an
+    /// `Elementwise(Gelu)` into the `Elementwise(Mul)` it gates, and from Gemma's
+    /// `ExpertGatedAct { act: Gelu }`: the operands of [`Self::SiluMul`], another kernel (#885's
+    /// 13b).
+    GeluMul(SiluMulBf16),
+    /// `x · w[0]`, `w` a `[1]` bf16 weight (Gemma's `layer_scalar`), lowered from
+    /// `SubOp::ScalarWeightMul`. Its kernel is #885's 13b.
+    LayerScale(LayerScaleBf16),
+    /// `cap · tanh(x / cap)` (Gemma's final logits), lowered from `SubOp::TanhSoftCap`. Its
+    /// kernel is #885's 13b.
+    SoftCap(SoftCapBf16),
+    /// Gemma's router pre-norm, `x̂ · router.scale` into the MoE scratch's router-norm region,
+    /// lowered from `SubOp::RouterNorm`: the operands of [`Self::RmsNorm`], its gain the bundle's
+    /// `router.scale` (`kernels/rms_norm_bf16.cu`'s structure; #885's 13b).
+    RouterNorm(RmsNormBf16),
+    /// The bf16 GEMM on 64-column tiles, lowered from `SubOp::MatmulTile` when `n` is a multiple
+    /// of [`GEMM_COL64_TILE`]'s and not of [`GEMM_BF16_TILE`]'s, above
+    /// [`GEMM_NARROW_BF16_MAX_N`]: the operands of [`Self::Gemm`], another kernel (#885's 13b).
+    GemmCol64(GemmBf16),
+}
+
+/// The 64-column GEMM's tile `(m, n, k)`: `gemm_bf16.cu`'s template at one 64-column B tile.
+/// Every `m`, `n` and `k` it takes is a non-zero multiple of these; no 64-column box crosses an
+/// array's column edge (a TMA box past it needs a plain tile, TK-1's R1). Gemma's 128, 704 and
+/// 2112 are multiples of 64, not of 256.
+pub const GEMM_COL64_TILE: (u32, u32, u32) = (128, 64, 64);
+
+/// The expert GEMM's column tiles: 256 (`kernels/expert_gemm_bf16.cu`, Qwen's 512 and 2048) or 64
+/// (Gemma's 704, #885's 13b), chosen at expansion by the projection's `n`.
+pub const EXPERT_GEMM_N_TILES: &[u32] = &[64, 256];
+
+/// The head dims the attention, rope-append and KV-append kernels take: 256 (every Qwen layer,
+/// Gemma's sliding layers) and 512 (Gemma's global layers, #885's 13c).
+pub const ATTN_BF16_HEAD_DIMS: &[u32] = &[256, 512];
+
+/// A sliding window is a non-zero multiple of this many keys, [`CUDA_KV_BLOCK_SIZE`]: a KV tile
+/// is then wholly inside or wholly below the window but at the window's lower edge. Gemma's 1024
+/// is 16 blocks.
+pub const ATTN_WINDOW_MULTIPLE: u32 = CUDA_KV_BLOCK_SIZE;
+
+/// The soft-cap's `cols` is a non-zero multiple of this (one 16-byte vector of 8 bf16), `rows`
+/// non-zero, and `rows · cols` at most `i32::MAX`.
+pub const SOFT_CAP_BF16_COLS: u32 = 8;
+
+/// `out = x · scale` over `[rows, cols]`, bf16 in and out, computed in f32 and rounded once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ScaleBf16 {
+    pub x: ArenaOffset,
+    pub out: ArenaOffset,
+    pub rows: u32,
+    pub cols: u32,
+    /// `scale` as its bits (`f32::to_bits`), so the step is `Eq`.
+    pub scale_bits: u32,
+}
+
+/// `y[r, c] = x[r, c] / rms(x[r, :])`, `rms(x) = sqrt(mean(x²) + eps)`, bf16 in and out, computed
+/// in f32 and rounded once: [`RmsNormBf16`] with a unit gain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct RmsNormUnitBf16 {
+    pub x: ArenaOffset,
+    pub y: ArenaOffset,
+    pub rows: u32,
+    pub cols: u32,
+    /// `eps` as its bits (`f32::to_bits`).
+    pub eps_bits: u32,
+}
+
+/// `out = x · scale[0]` over `[rows, cols]`, `scale` a `[1]` bf16 weight, computed in f32 and
+/// rounded once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct LayerScaleBf16 {
+    pub x: ArenaOffset,
+    pub scale: WeightIx,
+    pub out: ArenaOffset,
+    pub rows: u32,
+    pub cols: u32,
+}
+
+/// `out = cap · tanh(x / cap)` over `[rows, cols]`, bf16 in and out, computed in f32 and rounded
+/// once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct SoftCapBf16 {
+    pub x: ArenaOffset,
+    pub out: ArenaOffset,
+    pub rows: u32,
+    pub cols: u32,
+    /// `cap` as its bits (`f32::to_bits`).
+    pub cap_bits: u32,
+}
+
+/// [`RopePairing`] as the unit variant it is: `scratchy_subtile` has no serde.
+fn serialize_rope_pairing<S: serde::Serializer>(
+    pairing: &RopePairing,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    let (index, variant) = match pairing {
+        RopePairing::HalfRotated => (0, "HalfRotated"),
+        RopePairing::HalfHead => (1, "HalfHead"),
+    };
+    s.serialize_unit_variant("RopePairing", index, variant)
 }
 
 /// The embed's `hidden` is a non-zero multiple of this (`kernels/embed_bf16.cu`: one 16-byte
@@ -254,6 +361,10 @@ pub struct RopeBf16 {
     pub cols: u32,
     pub head_dim: u32,
     pub rot_dim: u32,
+    /// Which lane a rotated lane pairs with: `HalfRotated` (the kernel's today), or `HalfHead`
+    /// (Gemma's proportional rope, #885's 13c). `table` is the tape's table of the step's class.
+    #[serde(serialize_with = "serialize_rope_pairing")]
+    pub pairing: RopePairing,
 }
 
 /// The gate split's `head_dim` is a non-zero multiple of this (`kernels/gate_split_bf16.cu`: one
@@ -337,6 +448,9 @@ pub struct RopeAppendBf16 {
     pub cols: u32,
     pub head_dim: u32,
     pub rot_dim: u32,
+    /// As [`RopeBf16::pairing`].
+    #[serde(serialize_with = "serialize_rope_pairing")]
+    pub pairing: RopePairing,
 }
 
 /// Causal GQA attention of `q [rows, q_heads · head_dim]` over layer `layer`'s paged K/V cache,
@@ -360,6 +474,10 @@ pub struct AttnPrefillBf16 {
     /// `scale` as its bits (`f32::to_bits`), so the step is `Eq`; [`Self::scale`] reads it back.
     /// The kernel folds it into `log2(e)`.
     pub scale_bits: u32,
+    /// The keys a query row sees, its last `window` positions (a non-zero multiple of
+    /// [`ATTN_WINDOW_MULTIPLE`]); `None` for full causal attention. The windowed kernels are
+    /// #885's 13c.
+    pub window: Option<u32>,
 }
 
 impl AttnPrefillBf16 {
@@ -657,6 +775,23 @@ pub struct MoeRouteBf16 {
     pub experts: u32,
     pub top_k: u32,
     pub renorm: bool,
+    pub program: RouteProgram,
+    /// Gemma's `router.per_expert_scale` (`[experts]` bf16), each pick's weight multiplied by its
+    /// expert's entry last; `None` for Qwen.
+    pub expert_scale: Option<WeightIx>,
+}
+
+/// Which routing a [`MoeRouteBf16`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum RouteProgram {
+    /// Qwen: a softmax over every expert, the top-k, renormalised when `renorm`.
+    QwenSoftmax,
+    /// Gemma: the top-k of the raw logits, each scaled by `scale` (`hidden^-0.5`), a softmax over
+    /// the picks, then the per-expert scale. #885's 13b.
+    GemmaScaledSoftmax {
+        /// `scale` as its bits (`f32::to_bits`).
+        scale_bits: u32,
+    },
 }
 
 /// The `P = m · top_k` (token, pick) pairs sorted by expert, stably: every live tile of the
@@ -737,6 +872,8 @@ pub struct ExpertGemmBf16 {
     pub experts: u32,
     pub hidden: u32,
     pub inter: u32,
+    /// The column tile, one of [`EXPERT_GEMM_N_TILES`]: 256 for every Qwen tape.
+    pub n_tile: u32,
 }
 
 impl ExpertGemmBf16 {
@@ -918,6 +1055,7 @@ impl CudaStep {
                 })
             }
             Self::Gemm(GemmBf16 { a, b, c, m, n, k })
+            | Self::GemmCol64(GemmBf16 { a, b, c, m, n, k })
             | Self::GemmNarrow(GemmBf16 { a, b, c, m, n, k })
             | Self::Gemv(GemmBf16 { a, b, c, m, n, k }) => {
                 let (Some(ab), Some(bb), Some(cb)) =
@@ -935,6 +1073,14 @@ impl CudaStep {
                 })
             }
             Self::RmsNorm(RmsNormBf16 {
+                x,
+                gain,
+                y,
+                rows,
+                cols,
+                ..
+            })
+            | Self::RouterNorm(RmsNormBf16 {
                 x,
                 gain,
                 y,
@@ -965,6 +1111,13 @@ impl CudaStep {
                 cols,
             })
             | Self::SiluMul(SiluMulBf16 {
+                gate: a,
+                up: b,
+                out,
+                rows,
+                cols,
+            })
+            | Self::GeluMul(SiluMulBf16 {
                 gate: a,
                 up: b,
                 out,
@@ -1188,16 +1341,24 @@ impl CudaStep {
                 m,
                 experts,
                 top_k,
+                expert_scale,
                 ..
             }) => {
                 let (Some(lb), Some(pairs)) = (bf16_bytes(m, experts), m.checked_mul(top_k)) else {
                     return None;
                 };
+                let weight = match expert_scale {
+                    Some(ix) => Some(WeightRead {
+                        ix,
+                        bytes: experts as u64 * CUDA_ACT_BYTES,
+                    }),
+                    None => None,
+                };
                 Some(StepExtents {
                     reads: [Some(span(logits, lb)), None, None, None],
                     writes: span(topk_idx, u32_bytes(pairs)),
                     second_write: Some(span(scores, u32_bytes(pairs))),
-                    weight: None,
+                    weight,
                     kv: None,
                     gdn: None,
                 })
@@ -1344,6 +1505,53 @@ impl CudaStep {
                     gdn: None,
                 })
             }
+            Self::Scale(ScaleBf16 {
+                x, out, rows, cols, ..
+            })
+            | Self::SoftCap(SoftCapBf16 {
+                x, out, rows, cols, ..
+            })
+            | Self::RmsNormUnit(RmsNormUnitBf16 {
+                x,
+                y: out,
+                rows,
+                cols,
+                ..
+            }) => {
+                let Some(bytes) = bf16_bytes(rows, cols) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [Some(span(x, bytes)), None, None, None],
+                    writes: span(out, bytes),
+                    second_write: None,
+                    weight: None,
+                    kv: None,
+                    gdn: None,
+                })
+            }
+            Self::LayerScale(LayerScaleBf16 {
+                x,
+                scale,
+                out,
+                rows,
+                cols,
+            }) => {
+                let Some(bytes) = bf16_bytes(rows, cols) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [Some(span(x, bytes)), None, None, None],
+                    writes: span(out, bytes),
+                    second_write: None,
+                    weight: Some(WeightRead {
+                        ix: scale,
+                        bytes: CUDA_ACT_BYTES,
+                    }),
+                    kv: None,
+                    gdn: None,
+                })
+            }
         }
     }
 }
@@ -1432,9 +1640,13 @@ impl CudaStep {
         match self {
             Self::Embed(EmbedBf16 { table, .. }) => Some(table),
             Self::Gemm(GemmBf16 { b, .. })
+            | Self::GemmCol64(GemmBf16 { b, .. })
             | Self::GemmNarrow(GemmBf16 { b, .. })
             | Self::Gemv(GemmBf16 { b, .. }) => Some(b),
-            Self::RmsNorm(RmsNormBf16 { gain, .. }) => Some(gain),
+            Self::RmsNorm(RmsNormBf16 { gain, .. })
+            | Self::RouterNorm(RmsNormBf16 { gain, .. }) => Some(gain),
+            Self::LayerScale(LayerScaleBf16 { scale, .. }) => Some(scale),
+            Self::MoeRoute(MoeRouteBf16 { expert_scale, .. }) => expert_scale.as_mut(),
             Self::GatedDeltaNet(GatedDeltaNetBf16 { bundle, .. }) => Some(bundle),
             Self::RouterLogits(RouterLogitsBf16 { bundle, .. }) => Some(bundle),
             Self::ExpertGemm(ExpertGemmBf16 { bundle, .. })
@@ -1447,10 +1659,13 @@ impl CudaStep {
             | Self::RopeAppend(_)
             | Self::AttnPrefill(_)
             | Self::AttnDecode(_)
-            | Self::MoeRoute(_)
             | Self::ExpertSort(_)
             | Self::ExpertCombine(_)
-            | Self::GateScale(_) => None,
+            | Self::GateScale(_)
+            | Self::Scale(_)
+            | Self::RmsNormUnit(_)
+            | Self::GeluMul(_)
+            | Self::SoftCap(_) => None,
         }
     }
 }

@@ -37,8 +37,8 @@ use scratchy_target_cuda::step::{
     CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GDN_SEQUENCE_BYTES, gdn_scratch,
 };
 use scratchy_target_cuda::tape::{
-    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, MoeSortTape, MoeTape, RotaryTable,
-    TapeInput, WeightIx, moe_region_bytes, moe_tiles,
+    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, KvClass, MoeSortTape, MoeTape,
+    RotaryTable, TapeInput, WeightIx, moe_region_bytes, moe_tiles,
 };
 
 use crate::steps_from_tape::{StepCx, TapeStep, embed, gdn_bundle_layer, lower_fused, lower_step};
@@ -139,6 +139,9 @@ pub struct CudaCanonical {
     /// The rotary table, after every colour: `Some` exactly when the canonical binds a
     /// `Cos { local: false }` source.
     pub rotary: Option<RotaryTable>,
+    /// The second rotary table, the `Cos { local: true }` one, after the first: `Some` exactly
+    /// when the canonical binds a `Cos { local: true }` source.
+    pub rotary_local: Option<RotaryTable>,
     /// The paged KV cache and its regions, after the rotary table: `Some` exactly when the
     /// canonical binds a `PrefixK` source. The fields of a `scratchy_target_cuda::tape::KvTape`.
     pub kv: Option<CanonicalKv>,
@@ -177,6 +180,10 @@ pub struct CanonicalKv {
     pub block_table: ArenaSpan,
     pub slot_mapping: ArenaSpan,
     pub sequence: ArenaSpan,
+    /// The attention classes, class 0 `kv_heads` and `head_dim`'s.
+    pub classes: Vec<KvClass>,
+    /// Per entry of `layers`, its class.
+    pub layer_class: Vec<u8>,
 }
 
 /// Why a canonical could not be lowered.
@@ -1435,10 +1442,10 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             rot_dim: plan.facts.rot_dim,
             theta_bits: plan.facts.rope_theta.to_bits(),
         }),
+        rotary_local: None,
         // The arena placed the regions exactly when a `PrefixK` is bound, and `kv_cache` found
         // the pool exactly then.
         kv: kv.zip(arena.kv).map(|(k, r)| CanonicalKv {
-            layers: k.layers,
             kv_heads: k.kv_heads,
             head_dim: k.head_dim,
             block_size: CUDA_KV_BLOCK_SIZE,
@@ -1446,6 +1453,13 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             block_table: r.block_table,
             slot_mapping: r.slot_mapping,
             sequence: r.sequence,
+            layer_class: vec![0; k.layers.len()],
+            classes: vec![KvClass {
+                kv_heads: k.kv_heads,
+                head_dim: k.head_dim,
+                window: None,
+            }],
+            layers: k.layers,
         }),
         gdn,
         moe,
@@ -1660,6 +1674,7 @@ fn moe_scratch(
         up: experts[1],
         act: experts[2],
         down: experts[3],
+        router_norm: None,
     })
 }
 

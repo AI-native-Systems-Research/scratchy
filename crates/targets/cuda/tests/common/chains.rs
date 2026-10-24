@@ -84,6 +84,7 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
         kv,
         gdn,
         moe,
+        rotary_local,
     } = *tape;
     let CudaCanonical {
         bucket_m: lowered_m,
@@ -98,6 +99,7 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
         kv: lowered_kv,
         gdn: lowered_gdn,
         moe: lowered_moe,
+        rotary_local: lowered_rotary_local,
     } = lowered;
     assert_eq!(bucket_m, *lowered_m, "{name}: bucket_m");
     assert_eq!(colour_bytes, lowered_bytes, "{name}: colour bytes");
@@ -108,6 +110,7 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
     assert_eq!(weight_bytes, lowered_weights, "{name}: weight_bytes");
     assert_eq!(steps, lowered_steps, "{name}: steps");
     assert_eq!(rotary, *lowered_rotary, "{name}: rotary");
+    assert_eq!(rotary_local, *lowered_rotary_local, "{name}: rotary_local");
     let kv = kv.map(
         |KvTape {
              layers,
@@ -118,6 +121,8 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
              block_table,
              slot_mapping,
              sequence,
+             classes,
+             layer_class,
          }| CanonicalKv {
             layers: layers.to_vec(),
             kv_heads,
@@ -127,6 +132,8 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
             block_table,
             slot_mapping,
             sequence,
+            classes: classes.to_vec(),
+            layer_class: layer_class.to_vec(),
         },
     );
     assert_eq!(kv.as_ref(), lowered_kv.as_ref(), "{name}: kv");
@@ -242,6 +249,7 @@ pub static TWO_GEMM_M128: CudaTape = CudaTape {
     kv: None,
     gdn: None,
     moe: None,
+    rotary_local: None,
 };
 
 /// [`two_gemm`]`(256)`: colours x, y1, y2.
@@ -263,6 +271,7 @@ pub static TWO_GEMM_M256: CudaTape = CudaTape {
     kv: None,
     gdn: None,
     moe: None,
+    rotary_local: None,
 };
 
 /// [`three_gemm`]: `y1` is dead after step 1, so `y3` takes its colour, and the arena is the
@@ -286,4 +295,5 @@ pub static THREE_GEMM_M256: CudaTape = CudaTape {
     kv: None,
     gdn: None,
     moe: None,
+    rotary_local: None,
 };

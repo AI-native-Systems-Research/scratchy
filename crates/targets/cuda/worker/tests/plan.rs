@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use scratchy_core_common::SamplingParams;
 use scratchy_forward_compiler::gdn_slot_allocator::{GdnRow, GdnSlotAllocator};
 use scratchy_serving_engine::worker_factory::WorkerFactory;
-use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, KvTape};
+use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, KvClass, KvTape};
 use scratchy_target_cuda_worker::plan::{
     PlanError, block_table_u32, check_sampling, choose_bucket, emits_token, fill_inputs, gdn_fresh,
     greedy_token, kv_block_bytes, logits_row, scheduled_request,
@@ -166,6 +166,12 @@ fn a_kv_block_costs_k_and_v_per_layer() {
         block_table: span,
         slot_mapping: span,
         sequence: span,
+        classes: &[KvClass {
+            kv_heads: 2,
+            head_dim: 256,
+            window: None,
+        }],
+        layer_class: &[0, 0, 0, 0, 0, 0],
     };
     assert_eq!(kv_block_bytes(&kv, 64), Some(786_432));
 }

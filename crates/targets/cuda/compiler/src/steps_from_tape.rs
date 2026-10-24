@@ -32,7 +32,7 @@ use scratchy_target_cuda::step::{
     GateScaleBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16, MOE_ROUTE_EXPERTS,
     MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, PairRows, RMS_NORM_BF16_COLS,
     ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RopeAppendBf16, RopeBf16,
-    RouterLogitsBf16, SILU_MUL_BF16_COLS, SiluMulBf16,
+    RopePairing, RouteProgram, RouterLogitsBf16, SILU_MUL_BF16_COLS, SiluMulBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
@@ -494,6 +494,7 @@ fn rope(cx: &StepCx<'_>, s: &TapeStep<'_>, head_dim: u32) -> Result<RopeBf16, Ca
         cols,
         head_dim,
         rot_dim,
+        pairing: RopePairing::HalfRotated,
     })
 }
 
@@ -679,6 +680,7 @@ fn rope_append(
         cols,
         head_dim,
         rot_dim,
+        pairing: RopePairing::HalfRotated,
     })
 }
 
@@ -817,6 +819,7 @@ fn attention(
         kv_heads,
         head_dim,
         scale_bits: scale.to_bits(),
+        window: None,
     }))
 }
 
@@ -1174,6 +1177,8 @@ fn moe_route(
         experts: moe.experts,
         top_k: moe.top_k,
         renorm: renorm.is_some(),
+        program: RouteProgram::QwenSoftmax,
+        expert_scale: None,
     })
 }
 
@@ -1327,6 +1332,7 @@ fn expert_matmul(
         experts: moe.experts,
         hidden: moe.hidden,
         inter: moe.inter,
+        n_tile: tn,
     }))
 }
 
