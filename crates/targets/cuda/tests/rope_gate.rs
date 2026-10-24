@@ -445,3 +445,37 @@ fn every_launcher_refuses_a_shape_it_cannot_run() {
     }
     assert!(pass, "a launcher did not refuse a shape it cannot run");
 }
+
+/// `(7, 1000)`: 1000 is a multiple of 8 but not of 256, so the gate apply's last column tile is
+/// partial (`kernels/gate_apply_bf16.cu`: a plain ThunderKittens tile reads zeros past `cols` and
+/// stores nothing there), and 7 rows leave its 16-row block partial. Under the existing bound, the
+/// output's tail intact; then a repeat on `(256, 2048)` gives the same bits.
+#[test]
+fn gate_apply_bf16_takes_a_partial_last_column_tile_and_repeats() {
+    let device = h100();
+    let (rows, cols) = (7usize, 1000usize);
+    let attn = bf16_inputs(rows * cols, 0x6A77_1000);
+    let gate: Vec<u16> = bf16_inputs(rows * cols, 0x6A77_1001)
+        .into_iter()
+        .map(|b| bits(half::bf16::from_bits(b).to_f32() * 8.0))
+        .collect();
+    let (gpu, tail) = run_apply(&device, &attn, &gate, (rows, cols));
+    let cmp = compare_rows(&gpu, &gate_apply_reference(&attn, &gate), cols);
+    let mut pass = cmp.pass() && tail;
+    eprintln!(
+        "gate_apply_bf16 rows={rows} cols={cols} (partial last column tile): {} tail_intact={tail} {}",
+        cmp.line(),
+        verdict(pass)
+    );
+    let (rows, cols) = (256usize, 2048usize);
+    let attn = bf16_inputs(rows * cols, 0x6A77_2000);
+    let gate = bf16_inputs(rows * cols, 0x6A77_2001);
+    let run = || run_apply(&device, &attn, &gate, (rows, cols)).0;
+    let mismatched = mismatched_bits(&run(), &run());
+    eprintln!(
+        "gate_apply_bf16 rows={rows} cols={cols} repeat mismatched_bits={mismatched} {}",
+        verdict(mismatched == 0)
+    );
+    pass &= mismatched == 0;
+    assert!(pass, "the gate apply's partial tile or repeat failed");
+}
