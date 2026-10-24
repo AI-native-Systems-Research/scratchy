@@ -368,8 +368,8 @@ fn test_relocatable_recombination_reuse_matches_fresh() {
 /// Q-tile is span-uniform and the block-diagonal skip fires. This exactly
 /// mirrors launch-claude, whose tools are hundreds of tokens each.
 ///
-/// REPRODUCE (Metal). `SPANS_BENCH_MODEL` overrides the model (SmolLM caps at
-/// 2048 tokens, so long-context runs need a 128k model). Build with the
+/// REPRODUCE (Metal). `SPANS_BENCH_MODEL` overrides the model (SmolLM2 serves
+/// 8192 tokens, so longer runs need a 128k model). Build with the
 /// matching `scratchy-models/<stem>` feature (a mismatched
 /// build panics with a GPU commit error) — llama-3.2-1b is
 /// `llama-3.2-1b`, on by default:
@@ -387,8 +387,8 @@ fn test_relocatable_recombination_reuse_matches_fresh() {
 /// SPANS_TTFT_LENS to override the lengths.
 fn run_first_ttft_bench(model: &str, default_lens: &[usize]) {
     scratchy_core_common::telemetry::init_tracing("off");
-    // SPANS_BENCH_MODEL overrides the model id — SmolLM-135M caps at a 2048-tok
-    // context (128 blocks), so measuring the asymptotic span win at 8k/16k needs
+    // SPANS_BENCH_MODEL overrides the model id — SmolLM2-135M serves an 8192-tok
+    // context, so measuring the asymptotic span win at 16k and beyond needs
     // a large-context model (e.g. Llama-3.2-1B = 128k, `llama-3.2-1b`,
     // on by default).
     let model_override = std::env::var("SPANS_BENCH_MODEL").ok();
@@ -404,10 +404,17 @@ fn run_first_ttft_bench(model: &str, default_lens: &[usize]) {
         )
         .expect("encode");
 
+    // A default length past this model's context runs at the longest prompt it serves
+    // instead: whole blocks, short of `max_model_len` by the one token each run decodes.
+    let longest = (llm.max_model_len() - 1) / block_size * block_size;
     let lens: Vec<usize> = std::env::var("SPANS_TTFT_LENS")
         .ok()
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
-        .unwrap_or_else(|| default_lens.to_vec());
+        .unwrap_or_else(|| {
+            let mut lens: Vec<usize> = default_lens.iter().map(|&n| n.min(longest)).collect();
+            lens.dedup();
+            lens
+        });
 
     for target_len in lens {
         let mut padded = Vec::new();
