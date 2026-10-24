@@ -28,7 +28,9 @@ runs everything else.
   scratchy runs at its defaults on every Mac, and every cell runs: one
   that runs out of memory is recorded as failed. The page keeps every
   other engine's numbers, and scratchy's frozen launches, from the last full
-  run, each tagged with its date. About 40 minutes on the M3 Pro.
+  run, each tagged with its date. Its length is not measured yet in this
+  form: the one M3 Pro quick run took 43 minutes, before every cell ran and
+  at four rounds a cell. The aim is about 25 minutes. Report the run's length.
 - A **full run** renews every number: `--full` adds the comparison engines
   (oMLX and oMLX TurboQuant), frozen (needs `sudo purge`), three reps, four
   rounds of each users count a cell, and the 512- and 2048-token answers at
@@ -61,9 +63,11 @@ tell the user only for:
 - **Something else running:** the `pgrep`/`lsof` lines in step 2 show a
   process this skill didn't start. Ask before stopping it.
 
-Then:
+Then, without `--fail-fast`, so one model's build failure does not stop the
+models after it. A quick run is scratchy alone, so it skips the mlx-lm parity
+gate and needs no mlx venv: each model records `parity_skipped` instead.
 ```bash
-caffeinate -dims ./scripts/bench_metal_matrix.sh --unpinned --fail-fast
+caffeinate -dims ./scripts/bench_metal_matrix.sh --unpinned
 ```
 and go on to step 4. In the closing summary say: the commit benchmarked and
 where it is against upstream `main`, whether the tree was dirty (the JSON
@@ -218,7 +222,7 @@ Smoke run (a few minutes when the builds are cached):
 
 ```bash
 source ~/.venvs/mlx/bin/activate
-caffeinate -dims ./scripts/bench_metal_matrix.sh --fail-fast --unpinned --models gemma-4-26b-a4b-it \
+caffeinate -dims ./scripts/bench_metal_matrix.sh --fail-fast --unpinned --models gpt-oss-20b \
   --reps 1 --prime 1 --no-scaling --parity --out-dir /tmp/metal-smoke 2>&1 | tee /tmp/metal-smoke.log
 echo "exit ${PIPESTATUS[0]}"
 ```
@@ -407,7 +411,10 @@ Before copying, ask the user to confirm if any of these is true:
 - the run has fewer models than the round it ran (this Mac's four, or all
   eight with `--models full`), not counting a model skipped for memory
 - `commit` isn't upstream `main`
-- any model's `parity` is `False`
+- any model's `parity` is `False` (it failed the gate), or `None` with no
+  `parity_skipped` reason (the gate should have run but didn't, as on a full
+  run without mlx-lm). `None` with `parity_skipped` is a quick run, as
+  expected.
 
 Never copy a smoke run, or anything under `/tmp/metal-smoke`.
 
