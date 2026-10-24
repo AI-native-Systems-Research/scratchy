@@ -60,7 +60,7 @@ const ASM_ALLOWLIST: &[(&str, &str)] = &[
 ];
 
 /// The op header's gap helpers: operations TK has no map for, written once against TK types.
-const TK_GAPS: &[&str] = &["rv_ternary_map", "rv_fma"];
+const TK_GAPS: &[&str] = &["rv_ternary_map", "rv_fma", "exclusive_scan_sv"];
 
 /// The one extension header, directly under `kernels/`.
 const OP_HEADER: &str = "scratchy_ops.cuh";
