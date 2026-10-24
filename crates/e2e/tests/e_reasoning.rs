@@ -9,6 +9,9 @@
 //! vocabulary has no think tokens (as vLLM's does), so these cannot run on SmolLM. The two
 //! no-parser tests run on SmolLM, whose architecture installs no parser of its own.
 //!
+//! The parser tests rely on Qwen3-0.6B's greedy decode of "Say hello." finishing, thinking and
+//! answer, within `MAX_TOKENS`; a reply cut off at the budget fails as a decode problem.
+//!
 //! On metal the two models need two builds, as `TestModels::QWEN3` is MLX 4-bit there and a
 //! quant preset replaces SmolLM2's dense emission. The parser tests (on cuda drop the quant
 //! feature; QWEN3 is dense there):
@@ -23,7 +26,8 @@
 
 use scratchy_e2e::{Client, TestModels, TestServer};
 use scratchy_serving_api::protocol::{
-    ChatCompletionMessageParam, ChatCompletionRequest, ChatCompletionStreamResponse,
+    ChatCompletionMessageParam, ChatCompletionRequest, ChatCompletionResponse,
+    ChatCompletionStreamResponse, ChatMessage,
 };
 
 // ---------------------------------------------------------------------------
@@ -45,11 +49,14 @@ fn default_chat_request() -> ChatCompletionRequest {
     serde_json::from_str(r#"{"messages": []}"#).unwrap()
 }
 
+/// The token budget Qwen3-0.6B thinks about "Say hello." and answers within, greedily.
+const MAX_TOKENS: u32 = 1024;
+
 /// A short question Qwen3-0.6B thinks about and then answers within the token budget.
 fn thinking_request(stream: bool) -> ChatCompletionRequest {
     ChatCompletionRequest {
         messages: vec![user_msg("Say hello.")],
-        max_tokens: Some(1024),
+        max_tokens: Some(MAX_TOKENS),
         temperature: Some(0.0),
         stream,
         ..default_chat_request()
@@ -77,13 +84,35 @@ async fn start_qwen3(parser: &str) -> (TestServer, Client) {
     (server, client)
 }
 
+/// A reply cut off at the budget has no whole thinking-then-answer for a parser to split, so
+/// that failure is the decode's, not the parser's.
+fn assert_finished(finish_reason: Option<&str>) {
+    assert_eq!(
+        finish_reason,
+        Some("stop"),
+        "Qwen3-0.6B did not finish within {MAX_TOKENS} tokens: a decode problem, not a parser one"
+    );
+}
+
+/// The one message of a non-streamed reply, which Qwen3 finished within the budget.
+fn finished_message(resp: &ChatCompletionResponse) -> &ChatMessage {
+    assert_eq!(resp.choices.len(), 1, "one choice: {resp:?}");
+    let choice = &resp.choices[0];
+    assert_finished(choice.finish_reason.as_deref());
+    &choice.message
+}
+
 /// What the deltas of a streamed reply carried: its reasoning and its content, concatenated.
 fn streamed(chunks: &[ChatCompletionStreamResponse]) -> (String, String) {
     let (mut reasoning, mut content) = (String::new(), String::new());
+    let mut finish_reason = None;
     for choice in chunks.iter().flat_map(|c| &c.choices) {
+        assert_eq!(choice.index, 0, "one choice");
         reasoning.push_str(choice.delta.reasoning.as_deref().unwrap_or(""));
         content.push_str(choice.delta.content.as_deref().unwrap_or(""));
+        finish_reason = choice.finish_reason.as_deref().or(finish_reason);
     }
+    assert_finished(finish_reason);
     (reasoning, content)
 }
 
@@ -107,7 +136,7 @@ async fn test_reasoning_parser_deepseek_r1_nonstreaming() {
         .chat_completion(&thinking_request(false))
         .await
         .unwrap();
-    let msg = &resp.choices[0].message;
+    let msg = finished_message(&resp);
     let reasoning = msg.reasoning.as_deref().unwrap_or("");
     let content = msg.content.as_deref().unwrap_or("");
     assert!(
@@ -146,7 +175,7 @@ async fn test_reasoning_parser_qwen3_nonstreaming() {
         .chat_completion(&thinking_request(false))
         .await
         .unwrap();
-    let msg = &resp.choices[0].message;
+    let msg = finished_message(&resp);
     let reasoning = msg.reasoning.as_deref().unwrap_or("");
     let content = msg.content.as_deref().unwrap_or("");
     assert!(
@@ -163,7 +192,7 @@ async fn test_reasoning_parser_qwen3_nonstreaming() {
     // `enable_thinking: false`: the template closes thinking, so the request has no parser and
     // the whole reply is content.
     let resp = client.chat_completion(&no_thinking(false)).await.unwrap();
-    let msg = &resp.choices[0].message;
+    let msg = finished_message(&resp);
     assert!(
         msg.reasoning.is_none(),
         "thinking off: no reasoning: {msg:?}"
@@ -213,7 +242,7 @@ async fn test_include_reasoning_false_nonstreaming() {
         ..thinking_request(false)
     };
     let resp = client.chat_completion(&request).await.unwrap();
-    let msg = &resp.choices[0].message;
+    let msg = finished_message(&resp);
     assert!(msg.reasoning.is_none(), "reasoning suppressed: {msg:?}");
     let content = msg.content.as_deref().unwrap_or("");
     assert!(!content.trim().is_empty(), "the answer is kept: {msg:?}");
