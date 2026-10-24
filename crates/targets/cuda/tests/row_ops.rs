@@ -460,3 +460,36 @@ fn every_row_kernel_repeats_bit_identically() {
     }
     assert!(pass, "a row kernel's repeat differs");
 }
+
+/// For the base-against-change comparison (#850): the SiluMul's output at each of its test shapes
+/// (the seeds of `silu_mul_bf16_matches_the_cpu_reference`, then `(7, 1000)`), written as raw
+/// little-endian bf16 to `<CARGO_TARGET_TMPDIR>/row_ops_dump/<case>.bin`, with `case= elems=
+/// fnv1a=` printed. The same file run at two commits gives the `base_vs_pr mismatched_bits=` per
+/// case; this test asserts only that each launch ran.
+#[test]
+fn silu_mul_bf16_outputs_are_dumped_for_a_base_comparison() {
+    let device = h100();
+    for (rows, cols) in [(1usize, 12288usize), (256, 12288), (256, 3584), (7, 1000)] {
+        let seed = (rows as u64) << 32 | cols as u64;
+        let gate: Vec<u16> = bf16_inputs(rows * cols, 0x5150_0000 ^ seed)
+            .into_iter()
+            .map(|b| bits(half::bf16::from_bits(b).to_f32() * 8.0))
+            .collect();
+        let up = bf16_inputs(rows * cols, 0x5150_FFFF ^ seed);
+        let dims = (rows as u32, cols as u32);
+        let (gpu, _) = run_binary(&device, Binary::SiluMul, &gate, &up, dims);
+        dump_case(&format!("silu_mul_bf16_r{rows}_c{cols}"), &gpu);
+    }
+}
+
+/// Write `out` as `<case>.bin` under `<CARGO_TARGET_TMPDIR>/row_ops_dump/`, and print its line.
+pub fn dump_case(case: &str, out: &[u16]) {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("row_ops_dump");
+    std::fs::create_dir_all(&dir).expect("create the dump directory");
+    let bytes: Vec<u8> = out.iter().flat_map(|e| e.to_le_bytes()).collect();
+    std::fs::write(dir.join(format!("{case}.bin")), &bytes).expect("write a dump");
+    let fnv = (bytes.iter()).fold(0xCBF2_9CE4_8422_2325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+    });
+    eprintln!("case={case} elems={} fnv1a={fnv:016x}", out.len());
+}
