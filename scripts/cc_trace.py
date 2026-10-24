@@ -71,6 +71,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 FORMAT = 1
@@ -753,7 +754,7 @@ class RunConfig:
     engine_provenance: dict
     temperature: float
     warmup: bool
-    served_model: str | None
+    served_model: Optional[str]
     ollama_version: str
     context_length: int
     # "/v1/models" when the endpoint reported its window (and any --context-length
