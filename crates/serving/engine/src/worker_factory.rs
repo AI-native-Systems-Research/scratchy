@@ -186,6 +186,27 @@ pub trait WorkerFactory: Sync {
     fn required_block_size(&self) -> Option<scratchy_core_common::KvBlockTokens> {
         None
     }
+
+    /// THE SAMPLING THIS BACKEND CAN SERVE, checked against each request before it is admitted.
+    /// `Err` carries the message the client gets, naming what to change. The default serves
+    /// everything.
+    ///
+    /// ⛔ ASKED BEFORE SCHEDULING, NOT IN THE WORKER. A worker that refuses a request it was
+    /// handed fails a step the scheduler already formed: the client gets a server error, and the
+    /// step queued behind it finds a request the worker never admitted. Asked here, the request
+    /// is refused alone, as a validation error, and the scheduler never sees it.
+    fn check_sampling(&self, _params: &scratchy_core_common::SamplingParams) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The registered factory that claims `device`, if any: the one `create_worker` builds the
+/// worker with.
+pub fn factory_for(device: &str) -> Option<&'static dyn WorkerFactory> {
+    inventory::iter::<&'static dyn WorkerFactory>
+        .into_iter()
+        .copied()
+        .find(|f| f.matches(device))
 }
 
 inventory::collect!(&'static dyn WorkerFactory);

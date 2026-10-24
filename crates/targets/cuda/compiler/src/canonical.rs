@@ -538,6 +538,9 @@ pub enum AttnShapeRule {
     RowsOffTile { multiple: u32 },
     /// `head_dim` is not the one the bucket's kernel is instantiated for.
     HeadDim { want: u32 },
+    /// A one-row bucket's GQA group `q_heads / kv_heads` is `group`, above `max`, the query rows
+    /// the decode kernel merges per kv head.
+    GroupAboveMax { group: u32, max: u32 },
 }
 
 /// Why an attention's new K or V is not its layer's `RopeAppend`'s.
@@ -580,6 +583,8 @@ pub enum GateShapeRule {
     HalfOffHead,
     /// `rows · 2·half_cols` is above `i32::MAX`, the largest element count the launcher indexes.
     TooManyElements { elements: u64 },
+    /// `head_dim` is not `want`, the one head dim the kernel is instantiated for.
+    HeadNotInstantiated { want: u32 },
 }
 
 /// Which rule a GEMM's shape breaks.
@@ -1083,6 +1088,11 @@ impl std::fmt::Display for AttnShapeRule {
                 f,
                 "head_dim must be {want}, the one the kernel is instantiated for"
             ),
+            Self::GroupAboveMax { group, max } => write!(
+                f,
+                "q_heads / kv_heads = {group} must be at most {max}, the query rows the decode \
+                 kernel merges per kv head"
+            ),
         }
     }
 }
@@ -1141,6 +1151,10 @@ impl std::fmt::Display for GateShapeRule {
                 "rows·2·half_cols = {elements} is above {}, the largest element count the \
                  launcher indexes",
                 i32::MAX
+            ),
+            Self::HeadNotInstantiated { want } => write!(
+                f,
+                "head_dim must be {want}, the one head dim the kernel is instantiated for"
             ),
         }
     }

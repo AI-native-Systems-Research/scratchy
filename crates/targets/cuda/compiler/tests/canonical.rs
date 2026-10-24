@@ -3,6 +3,7 @@
 //! the one fold fires where it should and nowhere else, the conservative colour rule holds, and
 //! opcode lowering refuses the first op it cannot lower.
 
+use scratchy_subtile::fixtures::one_layer_input_shaped;
 use scratchy_subtile::fixtures::{
     add_only_input, front_end_lowered, gemm_m1_only_input, n_layer_input, one_layer_input,
     rmsnorm_only_input, rope_rotate_only_input, silu_mul_only_input,
@@ -24,6 +25,7 @@ use scratchy_target_cuda::op_abi::{CUDA_COLOUR_FACTS, CudaFusion, cuda_colour_ru
 use scratchy_target_cuda::step::{CudaStep, EmbedBf16, GemmBf16};
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, TapeInput, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
+use scratchy_target_cuda_compiler::canonical::AttnShapeRule;
 use scratchy_target_cuda_compiler::canonical::{
     ArenaRefusal, CanonicalAt, CanonicalRefusal, CudaEmbedFacts, CudaModelFacts, CudaPlan,
     EmbedShapeRule, GateShapeRule, GemmShapeRule, OperandRefusal, RopeShapeRule, SharedExpertOwner,
@@ -650,6 +652,54 @@ fn a_gate_split_above_int_max_elements_is_refused() {
             rule: GateShapeRule::TooManyElements {
                 elements: 2147483648
             },
+            ..
+        }
+    ));
+}
+
+/// A gate split at a head dim the kernel is not instantiated for: 128 is a multiple of 8 and
+/// `half_cols` 2048 is whole heads of it, so only the last check, the one head dim 256 the kernel
+/// takes (#853), refuses it.
+#[test]
+fn a_gate_split_off_the_instantiated_head_dim_is_refused() {
+    let facts = CudaModelFacts {
+        head_dim: 128,
+        ..FACTS
+    };
+    let e = refusal(&attn_gate(256), facts);
+    assert!(e.to_string().contains("head_dim must be 256"), "{e}");
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GateShape {
+            step: 2,
+            half_cols: 2048,
+            head_dim: 128,
+            rule: GateShapeRule::HeadNotInstantiated { want: 256 },
+            ..
+        }
+    ));
+}
+
+/// A one-row attention whose GQA group is above the decode kernel's 16 (#854): the shared
+/// one-layer fixture at head_dim 256 with 34 query heads over 2 kv heads (`hr` 17), `x` the
+/// embedded hidden, its rope pair the global table and its caches layer 0's, so every step before
+/// the attention lowers and the attention passes every earlier check. Only the last one, the
+/// decode group's, refuses it.
+#[test]
+fn a_decode_attention_above_the_largest_group_is_refused() {
+    let mut l = with_hidden(one_layer_input_shaped(34 * 256, 2 * 256, 1024, 256));
+    l.bindings[5] = SourceBinding::Cos { local: false };
+    l.bindings[6] = SourceBinding::Sin { local: false };
+    l.bindings[7] = SourceBinding::PrefixK { layer: 0 };
+    l.bindings[8] = SourceBinding::PrefixV { layer: 0 };
+    let e = refusal(&l, FACTS);
+    assert!(e.to_string().contains("q_heads / kv_heads = 17"), "{e}");
+    assert!(matches!(
+        e,
+        CanonicalRefusal::AttnShape {
+            rows: 1,
+            head_dim: 256,
+            rule: AttnShapeRule::GroupAboveMax { group: 17, max: 16 },
             ..
         }
     ));

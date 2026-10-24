@@ -38,6 +38,9 @@ serde = { workspace = true }
 scratchy-layers = { path = "../../layers" }
 scratchy-tensors = { path = "../../tensors" }
 anyhow = { workspace = true }
+# The model registry (`registry`): each model's emitted tapes and weight table, submitted at link
+# time and walked by the serving worker. Plain Rust: no toolchain.
+inventory = { workspace = true }
 
 [dev-dependencies]
 # The tape tests build their fixtures with the shared lowering types and lower them with CUDA's
@@ -51,6 +54,13 @@ safetensors = { workspace = true }
 # The bf16 GEMM against a CPU reference, on the GPU. Not built without `nvcc`.
 [[test]]
 name = "gemm_bf16"
+required-features = ["nvcc"]
+
+# What a ThunderKittens TMA tile load and store do with a box past its array's edge, swizzled and
+# plain (`kernels/tma_box_probe.cu`): the GKE probe's R1 cases, the GEMV's and the narrow GEMM's
+# first gate, on the GPU. Not built without `nvcc`.
+[[test]]
+name = "tma_bounds"
 required-features = ["nvcc"]
 
 # The row kernels (RMSNorm, add, SiluMul) against a CPU reference, on the GPU. Not built without
@@ -86,6 +96,17 @@ name = "tape_layout"
 # orderings. No toolchain needed.
 [[test]]
 name = "weight_table"
+
+# Every kernel is written with ThunderKittens: a check of the kernels' source text (rules T1-T10),
+# with kernels not yet rewritten on its `NOT_YET_PORTED` list. No toolchain needed.
+[[test]]
+name = "kernels_use_thunderkittens"
+
+# The prefill attention's full output per case, dumped for a bit-identity comparison across two
+# commits (#845), on the GPU. Not built without `nvcc`.
+[[test]]
+name = "attn_prefill_dump"
+required-features = ["nvcc"]
 
 # The embed row gather against an exact reference over a NaN-poisoned output, and its launcher's
 # refusals, on the GPU. Not built without `nvcc`.

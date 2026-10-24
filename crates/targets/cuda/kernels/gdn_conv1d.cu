@@ -11,183 +11,235 @@
 // `[seed ++ x[0 .. q_len)]`, the CORRECT general shift (metal's `gdn_conv1d_varlen.metal`), so
 // `forward(T)` then `forward(1)` equals `forward(T + 1)`, a chunk shorter than `K − 1` included.
 //
-// Plain CUDA, not ThunderKittens: 4 taps per channel, no matrix multiply.
+// ThunderKittens' warp vector (PLAN-tk100 §2 S4, §3.12): TK adds the container and the loads and
+// stores here, no matrix multiply. One warp per (group of 128 channels, block of 64 tokens), 4
+// warps per CTA: grid (ceil(conv_dim / 128 / 4), ceil(rows / 64)). The warp's channels
+// `c0 .. c0 + 128` are a naive `rv_fl<128>` (lane `l` holds channels `c0 + l + 32i`). The kernel is
+// instantiated for each `K` in 2..=8, so every window and tap vector is indexed by a compile-time
+// constant. The warp keeps the causal window (`K − 1` vectors) in registers and walks its block's
+// tokens in order:
+//   - the taps `w_j[c] = w[c, j]` are strided by `K` in memory, so each is gathered with TK's
+//     vector `apply` over `gl::operator[]`, once;
+//   - the window is seeded in block 0 from the slot's ring (the same `apply` form, `[slot][c][j]`),
+//     or with `warp::zero` WITHOUT READING THE RING on a fresh start: the pool is never cleared,
+//     so a fresh slot may hold anything, NaN included, and a select keeps it out where
+//     `0 · ring` would not; in any other block from `x` rows `t0 − K + 1 .. t0 − 1` by
+//     `warp::load` (bf16 to f32, exact), real rows since `t0 ≥ 64 ≥ K − 1` and `t0 < q_len`;
+//   - per token, `xt` by `warp::load`, then the taps in ascending `j`: `sum = w_0 · win_0`, then
+//     `sum = fma(w_j, win_j, sum)`, the token's tap last, each through the op
+//     `scratchy::ops::fma_acc` (`fmaf`, one rounding per tap, the plain-CUDA kernel's order and
+//     rounding) by the `rv_fma` gap; then `unary_op<scratchy::ops::silu>` and `warp::store` (f32);
+//     then the window shifted left by `warp::copy`, the token entering last.
+// Only block 0's warp then writes the new ring, with the same `apply` form over a `gl<float>`
+// (each lane writes its own channels' entries). So each channel's ring has one reader and one
+// writer, the same lane, and no race (metal's argument, `gdn_conv1d_varlen.metal:8-25`). No shared
+// memory, so no shared-tile hand-off needs a barrier.
 //
-// One thread per (channel, block of 64 tokens): grid (ceil(conv_dim / 128), ceil(rows / 64)), 128
-// threads. The thread keeps the causal window (`K − 1` f32) in registers and walks its block's
-// tokens in order. Its window is seeded
-//   - in block 0, from the slot's ring, or with zeros WITHOUT READING THE RING on a fresh start:
-//     the pool is never cleared, so a fresh slot may hold anything, NaN included, and a select
-//     keeps it out where `0 · ring` would not;
-//   - in any other block, from `x` rows `t0 − K + 1 .. t0 − 1`, which are real rows (`t0 ≥ 64 ≥
-//     K − 1` and `t0 < q_len`).
-// Only block 0's thread then writes the new ring. So each channel's ring has one reader and one
-// writer, the same thread, and no race (metal's argument, `gdn_conv1d_varlen.metal:8-25`).
-//
-// A block with `t0 ≥ q_len` returns before reading anything else, and no thread reads a row at or
-// past `q_len`: padding rows are never read, so a NaN in one cannot reach an output. The taps are
-// summed in ascending `j`, each token's arithmetic the same wherever the token sits in a chunk, so
-// a chunked sequence gives the same bits as one forward of it. The ring holds copies of widened
-// bf16 inputs (or the seed's), so it is bit-exact.
+// A block with `t0 ≥ q_len` returns before reading anything else, and no lane reads a row at or
+// past `q_len`: padding rows are never read, so a NaN in one cannot reach an output. Each token's
+// arithmetic is the same wherever the token sits in a chunk, so a chunked sequence gives the same
+// bits as one forward of it. The ring holds copies of widened bf16 inputs (or the seed's), so it is
+// bit-exact.
 //
 // Built with `--use_fast_math` (build.rs): `expf` and the division in SiLU are the approximate
 // ones; the tests' bound (2⁻¹⁶·(|ref| + Σ|w·x|) + 2⁻²⁴) allows for both.
 
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include "kittens.cuh"
+#include "scratchy_ops.cuh"
 
 #include <climits>
 #include <cstdint>
 
-// The launcher's return code that is not a `cudaError_t` (which is non-negative). `src/kernels.rs`
-// mirrors it.
+using namespace kittens;
+
+// Launcher return codes that are not a `cudaError_t`. `src/kernels.rs` mirrors these two values.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
+#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
-constexpr int THREADS = 128;
+// `step::GDN_CONV_CHANNEL_GROUP`: one warp's channels, a naive `rv_fl<128>`.
+constexpr int GROUP = 128;
+constexpr int WARPS = 4;
+constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 // `step::GDN_CONV_TOKEN_BLOCK`.
 constexpr int TOKEN_BLOCK = 64;
 // `step::GDN_CONV_KERNEL_RANGE`.
 constexpr uint32_t KMIN = 2;
 constexpr uint32_t KMAX = 8;
 
-__global__ void __launch_bounds__(THREADS)
-gdn_conv1d_kernel(const __nv_bfloat16* __restrict__ x, const float* __restrict__ w,
-                  float* __restrict__ conv_state, unsigned long long slot_elems,
-                  const uint32_t* __restrict__ sequence, float* __restrict__ conv_out,
-                  int conv_dim, int kernel) {
-    const int c = blockIdx.x * THREADS + threadIdx.x;
-    if (c >= conv_dim) {
+using chan_vec = rv_fl<GROUP>;
+using x_gl = gl<bf16, 1, 1, -1, -1>;
+using f_gl = gl<float, 1, 1, -1, -1>;
+// `[slot, q_len, start, 0]`.
+using seq_gl = gl<int, 1, 1, 1, -1>;
+
+struct conv_globals {
+    // `[rows, conv_dim]` bf16.
+    x_gl x;
+    // `[conv_dim, K]` f32.
+    f_gl w;
+    // `[slots, conv_dim · (K − 1)]` f32: slot s's ring, `[c][j]`.
+    f_gl ring;
+    seq_gl sequence;
+    // `[rows, conv_dim]` f32.
+    f_gl conv_out;
+    int rows;
+    int groups;
+};
+
+template <int K>
+__global__ __launch_bounds__(NUM_THREADS) void gdn_conv1d_ker(const __grid_constant__ conv_globals g) {
+    constexpr int STATE = K - 1;
+    const int group = blockIdx.x * WARPS + kittens::warpid();
+    if (group >= g.groups) {
         return;
     }
-    const int q_len = int(sequence[1]);
+    const int q_len = g.sequence[{0, 0, 0, 1}];
     const int t0 = blockIdx.y * TOKEN_BLOCK;
     if (t0 >= q_len) {
         return;
     }
-    const uint32_t slot = sequence[0];
-    const bool fresh = sequence[2] == 1u;
-    const int state_len = kernel - 1;
-    float* ring = conv_state + (unsigned long long)slot * slot_elems + size_t(c) * state_len;
-    const size_t stride = size_t(conv_dim);
+    const int slot = g.sequence[{0, 0, 0, 0}];
+    const bool fresh = g.sequence[{0, 0, 0, 2}] == 1;
+    const int c0 = group * GROUP;
 
-    float wl[KMAX];
+    chan_vec taps[K];
 #pragma unroll
-    for (int j = 0; j < int(KMAX); ++j) {
-        wl[j] = j < kernel ? w[size_t(c) * kernel + j] : 0.0f;
+    for (int j = 0; j < K; ++j) {
+        warp::apply(taps[j], taps[j], [&](int i, float) { return g.w[{0, 0, c0 + i, j}]; });
     }
 
-    // The window before row t0: the last `state_len` entries of `[seed ++ x]`. Block 0's seed is
-    // kept for the ring write below.
-    float seed[KMAX - 1];
-    float win[KMAX - 1];
+    // The window before row t0: the last `STATE` entries of `[seed ++ x]`. Block 0's seed is kept
+    // for the ring write below.
+    chan_vec seed[STATE];
+    chan_vec win[STATE];
 #pragma unroll
-    for (int j = 0; j < int(KMAX) - 1; ++j) {
-        float v = 0.0f;
-        if (j < state_len) {
-            if (t0 == 0) {
+    for (int j = 0; j < STATE; ++j) {
+        if (t0 == 0) {
+            if (fresh) {
                 // A fresh start keeps the 0: the ring is not read (a branch every thread of the
                 // grid takes the same way, not `fresh · ring`).
-                if (!fresh) {
-                    v = ring[j];
-                }
+                warp::zero(seed[j]);
             } else {
-                v = __bfloat162float(x[size_t(t0 - state_len + j) * stride + c]);
+                warp::apply(seed[j], seed[j], [&](int i, float) {
+                    return g.ring[{0, 0, slot, (c0 + i) * STATE + j}];
+                });
             }
+        } else {
+            warp::load(seed[j], g.x, {0, 0, t0 - STATE + j, group});
         }
-        seed[j] = v;
-        win[j] = v;
+        warp::copy(win[j], seed[j]);
     }
 
-    // Every register array is indexed by unrolled constants only (selects, not `win[state_len -
-    // 1]`), so the window stays in registers.
     const int t_end = min(t0 + TOKEN_BLOCK, q_len);
     for (int t = t0; t < t_end; ++t) {
-        const float xt = __bfloat162float(x[size_t(t) * stride + c]);
-        // The taps in ascending j: the window's `state_len`, then the token's own.
-        float sum = 0.0f;
+        chan_vec xt, sum;
+        warp::load(xt, g.x, {0, 0, t, group});
+        // The taps in ascending j: the window's `STATE`, then the token's own.
+        warp::mul(sum, taps[0], win[0]);
 #pragma unroll
-        for (int j = 0; j < int(KMAX) - 1; ++j) {
-            if (j < state_len) {
-                sum = fmaf(wl[j], win[j], sum);
-            }
+        for (int j = 1; j < STATE; ++j) {
+            scratchy::ops::rv_fma<scratchy::ops::fma_acc>(sum, taps[j], win[j], sum);
         }
+        scratchy::ops::rv_fma<scratchy::ops::fma_acc>(sum, taps[STATE], xt, sum);
+        warp::unary_op<scratchy::ops::silu>(sum, sum);
+        warp::store(g.conv_out, sum, {0, 0, t, group});
+        // Shift left, the token entering last.
 #pragma unroll
-        for (int j = 0; j < int(KMAX); ++j) {
-            if (j == state_len) {
-                sum = fmaf(wl[j], xt, sum);
-            }
+        for (int j = 0; j + 1 < STATE; ++j) {
+            warp::copy(win[j], win[j + 1]);
         }
-        conv_out[size_t(t) * stride + c] = sum / (1.0f + expf(-sum));
-        // Shift left, the token entering last. Ascending j reads `win[j + 1]` before it is
-        // written.
-#pragma unroll
-        for (int j = 0; j < int(KMAX) - 1; ++j) {
-            if (j + 1 < state_len) {
-                win[j] = win[j + 1];
-            } else if (j + 1 == state_len) {
-                win[j] = xt;
-            }
-        }
+        warp::copy(win[STATE - 1], xt);
     }
 
     if (t0 == 0) {
         // The new ring: entry j is `[seed ++ x[0 .. q_len)]`'s `q_len + j`-th, a seed entry when
-        // `q_len + j < state_len`, else row `q_len + j − state_len` of x, a real row.
+        // `q_len + j < STATE`, else row `q_len + j − STATE` of x, a real row.
 #pragma unroll
-        for (int j = 0; j < int(KMAX) - 1; ++j) {
-            if (j < state_len) {
-                const int p = q_len + j - state_len;
-                float v = 0.0f;
-                if (p < 0) {
+        for (int j = 0; j < STATE; ++j) {
+            const int p = q_len + j - STATE;
+            chan_vec entry;
+            if (p < 0) {
 #pragma unroll
-                    for (int i = 0; i < int(KMAX) - 1; ++i) {
-                        if (i == q_len + j) {
-                            v = seed[i];
-                        }
+                for (int i = 0; i < STATE; ++i) {
+                    if (i == q_len + j) {
+                        warp::copy(entry, seed[i]);
                     }
-                } else {
-                    v = __bfloat162float(x[size_t(p) * stride + c]);
                 }
-                ring[j] = v;
+            } else {
+                warp::load(entry, g.x, {0, 0, p, group});
             }
+            warp::apply(entry, entry, [&](int i, float v) {
+                g.ring[{0, 0, slot, (c0 + i) * STATE + j}] = v;
+                return v;
+            });
         }
     }
 }
 
+template <int K>
+int launch(const conv_globals& G, uint32_t rows, cudaStream_t stream) {
+    void* args[] = {const_cast<conv_globals*>(&G)};
+    const dim3 grid((uint32_t(G.groups) + uint32_t(WARPS) - 1) / uint32_t(WARPS),
+                    (rows + uint32_t(TOKEN_BLOCK) - 1) / uint32_t(TOKEN_BLOCK));
+    return static_cast<int>(
+        cudaLaunchKernel(gdn_conv1d_ker<K>, grid, dim3(NUM_THREADS), args, 0, stream));
+}
+
 }  // namespace
 
-// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched; any other value = the
-// cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
-// runtime's last-error state.
+// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
+// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught; any other value = the cudaError_t
+// cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the runtime's last-error
+// state.
 //
-// `rows` and `conv_dim` must be non-zero, `kernel` in 2..=8, `rows · conv_dim` at most INT_MAX,
-// and `slot_elems` (`GdnStateLayout::conv_elems_per_slot`) exactly `conv_dim · (kernel − 1)`; all
-// are checked before any pointer is touched. `x` is `[rows, conv_dim]` bf16, `w` `[conv_dim,
-// kernel]` f32, `conv_out` `[rows, conv_dim]` f32, `sequence` `[slot, q_len, start, 0]` u32 with
-// `1 ≤ q_len ≤ rows`, and `conv_state` one layer's conv buffer, holding slot `slot`'s
-// `slot_elems` f32 at `slot · slot_elems`. `conv_out` and `conv_state` overlap nothing else. No
-// shared memory, so no one-time setup. The launch is asynchronous on `stream`.
+// `rows` and `conv_dim` must be non-zero, `conv_dim` a multiple of 128
+// (`step::GDN_CONV_CHANNEL_GROUP`, one warp's channels), `kernel` in 2..=8, `rows · conv_dim` at
+// most INT_MAX, and `slot_elems` (`GdnStateLayout::conv_elems_per_slot`) exactly
+// `conv_dim · (kernel − 1)`; all are checked before any pointer is touched. `x` is `[rows,
+// conv_dim]` bf16, `w` `[conv_dim, kernel]` f32, `conv_out` `[rows, conv_dim]` f32, `sequence`
+// `[slot, q_len, start, 0]` u32 with `1 ≤ q_len ≤ rows`, and `conv_state` one layer's conv buffer,
+// holding slot `slot`'s `slot_elems` f32 at `slot · slot_elems`. `conv_out` and `conv_state`
+// overlap nothing else. No shared memory, so no one-time setup. The launch is asynchronous on
+// `stream`.
 extern "C" int scratchy_cuda_gdn_conv1d(const void* x, const void* w, void* conv_state,
                                         uint64_t slot_elems, const void* sequence, void* conv_out,
                                         uint32_t rows, uint32_t conv_dim, uint32_t kernel,
                                         void* stream /* cudaStream_t; null = default stream */) {
     if (rows == 0 || conv_dim == 0 || kernel < KMIN || kernel > KMAX ||
         uint64_t(rows) * uint64_t(conv_dim) > uint64_t(INT_MAX) ||
-        slot_elems != uint64_t(conv_dim) * uint64_t(kernel - 1)) {
+        slot_elems != uint64_t(conv_dim) * uint64_t(kernel - 1) ||
+        conv_dim % uint32_t(GROUP) != 0) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
-    const __nv_bfloat16* xp = static_cast<const __nv_bfloat16*>(x);
-    const float* wp = static_cast<const float*>(w);
-    float* sp = static_cast<float*>(conv_state);
-    unsigned long long se = slot_elems;
-    const uint32_t* qp = static_cast<const uint32_t*>(sequence);
-    float* op = static_cast<float*>(conv_out);
-    int icd = static_cast<int>(conv_dim), ik = static_cast<int>(kernel);
-    void* args[] = {&xp, &wp, &sp, &se, &qp, &op, &icd, &ik};
-    const dim3 grid((conv_dim + THREADS - 1) / THREADS, (rows + TOKEN_BLOCK - 1) / TOKEN_BLOCK);
-    const dim3 block(THREADS);
-    return static_cast<int>(cudaLaunchKernel(gdn_conv1d_kernel, grid, block, args, 0,
-                                             static_cast<cudaStream_t>(stream)));
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        // No view carries a TMA type, so building them encodes nothing: they are the pointers and
+        // the dimensions the kernel indexes with. The ring is viewed one slot per row, as wide as
+        // a slot: `slot · slot_elems` is its row `slot`, and the slot count is the most a slot
+        // index can name.
+        x_gl xg{static_cast<bf16*>(const_cast<void*>(x)), nullptr, nullptr, size_t(rows),
+                size_t(conv_dim)};
+        f_gl wg{static_cast<float*>(const_cast<void*>(w)), nullptr, nullptr, size_t(conv_dim),
+                size_t(kernel)};
+        f_gl rg{static_cast<float*>(conv_state), nullptr, nullptr, size_t(INT_MAX),
+                size_t(slot_elems)};
+        seq_gl qg{static_cast<int*>(const_cast<void*>(sequence)), nullptr, nullptr, nullptr,
+                  size_t(4)};
+        f_gl og{static_cast<float*>(conv_out), nullptr, nullptr, size_t(rows), size_t(conv_dim)};
+        conv_globals G{xg, wg, rg, qg, og, int(rows), int(conv_dim / uint32_t(GROUP))};
+        const cudaStream_t s = static_cast<cudaStream_t>(stream);
+        switch (kernel) {
+            case 2: return launch<2>(G, rows, s);
+            case 3: return launch<3>(G, rows, s);
+            case 4: return launch<4>(G, rows, s);
+            case 5: return launch<5>(G, rows, s);
+            case 6: return launch<6>(G, rows, s);
+            case 7: return launch<7>(G, rows, s);
+            default: return launch<8>(G, rows, s);
+        }
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
 }

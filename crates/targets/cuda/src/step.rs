@@ -127,23 +127,25 @@ pub struct GemmBf16 {
     pub k: u32,
 }
 
-/// The narrow GEMM's largest `n`: each lane of its warp keeps `n` f32 partial sums in registers
-/// (`kernels/gemm_narrow_bf16.cu`).
+/// The narrow GEMM's largest `n`: all of `B`'s rows are one 64-row ThunderKittens tile, and every
+/// column of `C` one 64-column output tile (`kernels/gemm_narrow_bf16.cu`).
 pub const GEMM_NARROW_BF16_MAX_N: u32 = 64;
 /// The narrow GEMM's `k`, and its `n` but for [`GEMM_NARROW_BF16_ONE`], are non-zero multiples of
-/// this: `k` is read in 16-byte vectors of 8 bf16, and `n` keeps every row of `C` 16-byte aligned.
+/// this: 8 bf16 is 16 bytes, so every row stride of `A`, `B` and `C` is a multiple of 16 bytes, as
+/// their TMA tensor maps need.
 pub const GEMM_NARROW_BF16_MULTIPLE: u32 = 8;
 /// The one `n` the narrow GEMM takes off [`GEMM_NARROW_BF16_MULTIPLE`]: a one-column projection
 /// (a shared expert's gate), stored one bf16 per row.
 pub const GEMM_NARROW_BF16_ONE: u32 = 1;
 
-/// The GEMV's `k` is a non-zero multiple of this: each lane reads 16-byte vectors of 8 bf16
-/// (`kernels/gemv_bf16.cu`). `n` is non-zero, and `n` and `k` are at most `i32::MAX`; `m` is 1.
+/// The GEMV's `k` is a non-zero multiple of this: 8 bf16 is 16 bytes, so every row stride of `a`
+/// and `B` is a multiple of 16 bytes, as their TMA tensor maps need (`kernels/gemv_bf16.cu`). `n`
+/// is non-zero (any value: `c` is written without a tensor map), and `n` and `k` are at most
+/// `i32::MAX`; `m` is 1.
 pub const GEMV_BF16_MULTIPLE: u32 = 8;
 
-/// The RMSNorm's `cols` is a non-zero multiple of this: each thread loads and stores 16-byte
-/// vectors of 8 bf16 (`kernels/rms_norm_bf16.cu`). `rows` is non-zero and `rows · cols` at most
-/// `i32::MAX`.
+/// The RMSNorm's `cols` is a non-zero multiple of this: 8 bf16 is 16 bytes, so every row stride is a multiple of 16 bytes, as the ThunderKittens 16-row tile's TMA tensor maps need (`kernels/rms_norm_bf16.cu`). `rows`
+/// is non-zero and `rows · cols` at most `i32::MAX`.
 pub const RMS_NORM_BF16_COLS: u32 = 8;
 
 /// `y[r, c] = x[r, c] / rms(x[r, :]) · (offset + gain[c])`, `rms(x) = sqrt(mean(x²) + eps)`,
@@ -184,8 +186,8 @@ impl RmsNormBf16 {
     }
 }
 
-/// The add's `cols` is a non-zero multiple of this (`kernels/add_bf16.cu`: one 8-wide bf16
-/// vector per thread), `rows` non-zero, and `rows · cols` at most `i32::MAX`.
+/// The add's `cols` is a non-zero multiple of this (8 bf16 is 16 bytes, so every row stride is a multiple of 16 bytes, as the ThunderKittens 16-row tile's TMA tensor maps need, `kernels/add_bf16.cu`), `rows`
+/// non-zero, and `rows · cols` at most `i32::MAX`.
 pub const ADD_BF16_COLS: u32 = 8;
 
 /// `out = a + b` over `[rows, cols]`, bf16 in and out: one f32 add, one rounding. No broadcast:
@@ -199,8 +201,8 @@ pub struct AddBf16 {
     pub cols: u32,
 }
 
-/// The SiluMul's `cols` is a non-zero multiple of this (`kernels/silu_mul_bf16.cu`: one 8-wide
-/// bf16 vector per thread), `rows` non-zero, and `rows · cols` at most `i32::MAX`.
+/// The SiluMul's `cols` is a non-zero multiple of this (8 bf16 is 16 bytes, so every row stride is a multiple of 16 bytes, as the ThunderKittens 16-row tile's TMA tensor maps need, `kernels/silu_mul_bf16.cu`),
+/// `rows` non-zero, and `rows · cols` at most `i32::MAX`.
 pub const SILU_MUL_BF16_COLS: u32 = 8;
 
 /// `out = gate / (1 + e^(−gate)) · up` over `[rows, cols]`, bf16 in and out, computed in f32 and
@@ -221,6 +223,15 @@ pub const ROPE_BF16_ROT_MULTIPLE: u32 = 16;
 /// vectors), and its `cols` a multiple of `head_dim`. `rows` is non-zero and `rows · cols` at most
 /// `i32::MAX`.
 pub const ROPE_BF16_HEAD_MULTIPLE: u32 = 8;
+/// The one `rot_dim` the rope kernel is instantiated for (`kernels/rope_bf16.cu`): one plain
+/// `st_bf<16, 64>` box, each half two 16-column base tiles. Its launcher refuses any other, so the
+/// kernel's rule is tighter than the lowering's [`ROPE_BF16_ROT_MULTIPLE`]; every lowered tape of
+/// the target models has `rot_dim` 64.
+pub const ROPE_BF16_KERNEL_ROT_DIM: u32 = 64;
+/// The rope kernel's `head_dim` is a non-zero multiple of this: whole 64-column boxes, so every
+/// head starts at a box (`kernels/rope_bf16.cu`). Tighter than the lowering's
+/// [`ROPE_BF16_HEAD_MULTIPLE`], and checked by the launcher only.
+pub const ROPE_BF16_KERNEL_HEAD_MULTIPLE: u32 = 64;
 
 /// Partial rotary embedding over `[rows, cols]`, `cols = heads · head_dim`, bf16 in and out.
 ///
@@ -244,6 +255,10 @@ pub struct RopeBf16 {
 /// 16-byte vector per thread, never straddling a head), and `half_cols` a non-zero multiple of
 /// `head_dim`. `rows` is non-zero and `rows · 2·half_cols` at most `i32::MAX`.
 pub const GATE_SPLIT_BF16_HEAD_MULTIPLE: u32 = 8;
+/// The one `head_dim` the gate split is instantiated for (`kernels/gate_split_bf16.cu`): one plain
+/// `st_bf<16, 256>` tile per head. Checked after [`GATE_SPLIT_BF16_HEAD_MULTIPLE`] and the
+/// whole-heads rule, so a shape those refuse keeps its refusal.
+pub const GATE_SPLIT_BF16_HEAD_DIM: u32 = 256;
 
 /// Per head `h` and lane `d`: `q[r, h·hd + d] = qg[r, 2h·hd + d]` and `gate[r, h·hd + d] =
 /// qg[r, 2h·hd + hd + d]`, bf16 copies. `qg` is `[rows, 2·half_cols]`, `q` and `gate` are `[rows,
@@ -258,8 +273,8 @@ pub struct GateSplitBf16 {
     pub head_dim: u32,
 }
 
-/// The gate apply's `cols` is a non-zero multiple of this (`kernels/gate_apply_bf16.cu`: one
-/// 8-wide bf16 vector per thread), `rows` non-zero, and `rows · cols` at most `i32::MAX`.
+/// The gate apply's `cols` is a non-zero multiple of this (8 bf16 is 16 bytes, so every row stride is a multiple of 16 bytes, as the ThunderKittens 16-row tile's TMA tensor maps need, `kernels/gate_apply_bf16.cu`),
+/// `rows` non-zero, and `rows · cols` at most `i32::MAX`.
 pub const GATE_APPLY_BF16_COLS: u32 = 8;
 
 /// `out = attn / (1 + e^(−gate))` over `[rows, cols]`, bf16 in and out, computed in f32 and
@@ -282,17 +297,27 @@ pub const CUDA_MAX_BLOCKS_PER_SEQ: u32 = 128;
 pub const ATTN_PREFILL_BF16_ROWS: u32 = 128;
 /// The one head dim the attention kernel is instantiated for.
 pub const ATTN_PREFILL_BF16_HEAD_DIM: u32 = 256;
-/// The one head dim the decode attention kernel is instantiated for: each of a warp's 32 lanes
-/// holds one 16-byte vector of 8 lanes (`kernels/attn_decode_bf16.cu`). It takes one query row,
-/// `q_heads` a non-zero multiple of `kv_heads`, and `block_size` [`CUDA_KV_BLOCK_SIZE`].
+/// The one head dim the decode attention kernel is instantiated for: its query, K and V tiles are
+/// `st_bf<64, 256>`, the prefill's (`kernels/attn_decode_bf16.cu`). It takes one query row,
+/// `q_heads` a non-zero multiple of `kv_heads` by at most [`ATTN_DECODE_BF16_MAX_GROUP`], and
+/// `block_size` [`CUDA_KV_BLOCK_SIZE`].
 pub const ATTN_DECODE_BF16_HEAD_DIM: u32 = 256;
+/// The decode attention's largest GQA group `q_heads / kv_heads`: a kv head's query heads are
+/// stacked as the rows of one query tile, and only the 16 rows of each consumer warpgroup's warp 0
+/// are merged and stored (`kernels/attn_decode_bf16.cu`). The target models' groups are 2 to 12.
+pub const ATTN_DECODE_BF16_MAX_GROUP: u32 = 16;
+/// The one head dim the KV append is instantiated for (`kernels/kv_append_bf16.cu`): a head's row
+/// is one `sv_bf<256>`, one 512-byte box of the cache's vector tensor map. The lowering already
+/// refuses any other head dim for a `RopeAppend` (`CanonicalRefusal::KvHeadDim`).
+pub const KV_APPEND_BF16_HEAD_DIM: u32 = 256;
 
 /// K's partial rope, then the paged-cache write of the rotated K and the unrotated V.
 ///
 /// Launch 1 is [`RopeBf16`]'s kernel, unchanged: `k [rows, cols]` rotated by `table` into
 /// `k_out`, `cols = kv_heads · head_dim`. Launch 2 copies, for each token row `t` whose
 /// `slot_mapping[t]` is not `u32::MAX`, row `t` of `k_out` and of `v` into layer `layer`'s K and
-/// V cache at that slot, bit for bit (`kernels/kv_append_bf16.cu`). `slot_mapping` is the tape's
+/// V cache at that slot, bit for bit (`kernels/kv_append_bf16.cu`); its `head_dim` is
+/// [`KV_APPEND_BF16_HEAD_DIM`]. `slot_mapping` is the tape's
 /// region ([`crate::tape::KvTape::slot_mapping`], `rows` u32); `layer` is an index into
 /// [`crate::tape::KvTape::layers`]. `k_out` overlaps no input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -345,15 +370,23 @@ pub const GDN_HEAD_K: u32 = 128;
 /// The GDN value-head dim is a non-zero multiple of this, the value rows of one scan CTA
 /// (`kernels/gdn_scan.cu`), and at most [`GDN_HEAD_V_MAX`].
 pub const GDN_HEAD_V_MULTIPLE: u32 = 32;
-/// The largest GDN value-head dim: the gated norm's one warp per row holds at most 8 lanes per
-/// thread (`kernels/gdn_rms_norm_gated.cu`).
+/// The largest GDN value-head dim: the gated norm's one warp per row is a naive `rv_fl<head_v>`,
+/// instantiated for 32, 64, …, 256 (`kernels/gdn_rms_norm_gated.cu`).
 pub const GDN_HEAD_V_MAX: u32 = 256;
 /// The causal conv's kernel width is in this inclusive range: its window lives in registers
 /// (`kernels/gdn_conv1d.cu`; metal's `GDN_CONV_KMAX` is 8).
 pub const GDN_CONV_KERNEL_RANGE: (u32, u32) = (2, 8);
-/// The tokens one conv thread walks. At least `conv_kernel − 1`, so only block 0 reads or writes a
+/// The tokens one conv warp walks. At least `conv_kernel − 1`, so only block 0 reads or writes a
 /// slot's conv ring.
 pub const GDN_CONV_TOKEN_BLOCK: u32 = 64;
+/// The causal conv's `conv_dim` is a non-zero multiple of this: one warp's channels, a naive
+/// `rv_fl<128>` (`kernels/gdn_conv1d.cu`). Checked by the launcher only; qwen3.5's `conv_dim`
+/// (6144 at the 0.8b, 8192 at the 9b) is a multiple, so no lowered tape is refused.
+pub const GDN_CONV_CHANNEL_GROUP: u32 = 128;
+/// The GDN gating's `nv` is a multiple of this, at most twice it: one warp per row holds the row as
+/// a naive `rv_fl<nv>`, instantiated for 16 and 32 (`kernels/gdn_gating.cu`). Checked by the
+/// launcher only; qwen3.5's `nv` is 16 at the 0.8b and 32 at the 9b.
+pub const GDN_GATING_NV_MULTIPLE: u32 = 16;
 /// The tokens the scan stages in shared memory at once.
 pub const GDN_SCAN_TOKEN_BLOCK: u32 = 32;
 

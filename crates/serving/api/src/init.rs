@@ -459,7 +459,7 @@ fn create_worker(
         anyhow::bail!(
             "No inference backend is compiled into this binary. Rebuild with a \
              backend feature:\n    --features metal   (Apple Silicon)\n    --features \
-             spyre   (IBM Spyre)\ne.g. `cargo build --release \
+             spyre   (IBM Spyre)\n    --features nvcc    (NVIDIA H100, Linux)\ne.g. `cargo build --release \
              -p scratchy-cli --features metal`.\n(If you DID build with a \
              backend, an empty registry instead means the linker GC'd its \
              `inventory::submit!` — ensure scratchy-serving-worker stays linked via \
@@ -472,7 +472,8 @@ fn create_worker(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "No backend available for device '{}'. \
-                 Build with --features metal (Apple Silicon) or --features spyre (IBM Spyre).",
+                 Build with --features metal (Apple Silicon), --features spyre (IBM Spyre) or \
+                 --features nvcc (NVIDIA H100, Linux).",
                 config.device
             )
         })?;
@@ -1637,12 +1638,12 @@ fn initialize_core(
     })
 }
 
-/// Metal and spyre each run a model on exactly one device: refuse tensor /
+/// Metal, spyre and cuda each run a model on exactly one device: refuse tensor /
 /// pipeline parallelism up front rather than silently serving on one device.
 fn refuse_multi_device(config: &VllmConfig) -> Result<()> {
     if config.tensor_parallel_size > 1 || config.pipeline_parallel_size > 1 {
         anyhow::bail!(
-            "multi-device serving is not supported: metal and spyre run on one device \
+            "multi-device serving is not supported: metal, spyre and cuda run on one device \
              (got --tensor-parallel-size {}, --pipeline-parallel-size {})",
             config.tensor_parallel_size,
             config.pipeline_parallel_size,
@@ -1799,6 +1800,10 @@ pub fn initialize_stack(
         config.chat_template.as_deref(),
     )?;
     engine.set_generation_defaults(load_generation_defaults(core.model_dir.as_deref()));
+    // The backend's sampling limit, checked as each request is submitted.
+    if let Some(backend) = scratchy_serving_engine::worker_factory::factory_for(&config.device) {
+        engine.set_sampling_check(backend);
+    }
     if !config.disable_async_scheduling && !speculation.requires_sync() {
         engine.set_async_scheduling(true);
     }

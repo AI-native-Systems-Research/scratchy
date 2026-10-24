@@ -107,7 +107,7 @@ pub struct LaunchClaudeArgs {
     #[arg(short = 'm', long, env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
+    /// Device: "cpu", "metal", "spyre", "cuda", or "auto" (the backend this binary was built with).
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -337,7 +337,7 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
 
-    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
+    /// Device: "cpu", "metal", "spyre", "cuda", or "auto" (the backend this binary was built with).
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -587,7 +587,7 @@ pub struct ChatArgs {
     #[arg(long)]
     pub bench: bool,
 
-    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
+    /// Device: "cpu", "metal", "spyre", "cuda", or "auto" (the backend this binary was built with).
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -683,7 +683,7 @@ pub struct BatchArgs {
     #[arg(short = 'o', long)]
     pub output: String,
 
-    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
+    /// Device: "cpu", "metal", "spyre", "cuda", or "auto" (the backend this binary was built with).
     #[arg(long, default_value = "auto")]
     pub device: String,
 

@@ -78,8 +78,14 @@ fn reference(table: &[u16], ids: &[u32], hidden: usize) -> Vec<u16> {
 fn the_gather_is_bit_exact_on_every_row() {
     let device = h100();
     let mut pass = true;
-    // (vocab, hidden, rows): qwen3.5-0.8b's table at a 512-row bucket, a narrow table, one row.
-    for (vocab, hidden, rows) in [(248_320u32, 1024usize, 512usize), (37, 8, 300), (5, 64, 1)] {
+    // (vocab, hidden, rows): qwen3.5-0.8b's table and qwen3.5-9b's (2 GB) at a 512-row bucket, a
+    // narrow table, one row.
+    for (vocab, hidden, rows) in [
+        (248_320u32, 1024usize, 512usize),
+        (248_320, 4096, 512),
+        (37, 8, 300),
+        (5, 64, 1),
+    ] {
         let table = bf16_inputs(vocab as usize * hidden, 0x0816_0000 ^ u64::from(vocab));
         // 0, vocab − 1, a repeated id and a spread of the rest; the padding rows id 0, as the
         // caller pads.
@@ -185,4 +191,27 @@ fn the_launcher_refuses_a_shape_it_cannot_run() {
         pass,
         "the embed launcher did not refuse a shape it cannot run"
     );
+}
+
+/// The same gather twice gives the same bits, over qwen3.5-9b's table width at a 512-row bucket:
+/// the bulk copies are bytes, so nothing about the launch can change them.
+#[test]
+fn the_gather_repeats_bit_for_bit() {
+    let device = h100();
+    let (vocab, hidden, rows) = (4096u32, 4096usize, 512usize);
+    let table = bf16_inputs(vocab as usize * hidden, 0x0816_2000);
+    let ids: Vec<u32> = (0..rows as u32)
+        .map(|r| r.wrapping_mul(2_654_435_761) % vocab)
+        .collect();
+    let (a, a_tail) = run(&device, &table, &ids, hidden, vocab);
+    let (b, b_tail) = run(&device, &table, &ids, hidden, vocab);
+    let mismatched = mismatched_bits(&a, &b);
+    let ok = mismatched == 0 && a_tail && b_tail;
+    eprintln!(
+        "embed_bf16 vocab={vocab} hidden={hidden} rows={rows} repeat \
+         mismatched_bits={mismatched} tail_intact={} {}",
+        a_tail && b_tail,
+        verdict(ok)
+    );
+    assert!(ok, "the embed gather did not repeat bit for bit");
 }
