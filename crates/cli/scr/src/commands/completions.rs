@@ -506,8 +506,10 @@ _scr_complete() {{
     case "$path" in
 {arms}    esac
 
-    # A flag whose value is a model.
+    # A flag whose value is a model. The names come most downloaded first; bash 4.4+
+    # keeps that order (`nosort`), older bash (macOS's 3.2 has no `compopt`) sorts.
     if [ -n "$model_opts" ] && [[ " $model_opts " == *" $prev "* ]]; then
+        compopt -o nosort 2>/dev/null
         COMPREPLY=( $(compgen -W "$("$scr" model names --source "$model_source" -- "$cur" 2>/dev/null)" -- "$cur") )
         return
     fi
@@ -532,6 +534,7 @@ _scr_complete() {{
         COMPREPLY=( $(compgen -W "$subs $positional_values" -- "$cur") )
     fi
     if [ -n "$positional" ]; then
+        [ -z "$subs" ] && [ -z "$positional_values" ] && compopt -o nosort 2>/dev/null
         COMPREPLY+=( $(compgen -W "$("$scr" model names --source "$positional" -- "$cur" 2>/dev/null)" -- "$cur") )
     fi
 }}
@@ -568,8 +571,9 @@ _scr() {{
     case "$path" in
 {arms}    esac
 
+    # Model names, in the order they come (most downloaded first): an unsorted group.
     if [ -n "$model_opts" ] && [[ " $model_opts " == *" $prev "* ]]; then
-        compadd -- ${{(f)"$("$scr" model names --source "$model_source" -- "$cur" 2>/dev/null)"}}
+        compadd -V scr-models -- ${{(f)"$("$scr" model names --source "$model_source" -- "$cur" 2>/dev/null)"}}
         return
     fi
     if [ -n "$enum_map" ] && [[ "$enum_map" == *"|$prev:"* ]]; then
@@ -589,7 +593,7 @@ _scr() {{
     fi
     [ -n "$subs" ] && compadd -- ${{=subs}}
     [ -n "$positional_values" ] && compadd -- ${{=positional_values}}
-    [ -n "$positional" ] && compadd -- ${{(f)"$("$scr" model names --source "$positional" -- "$cur" 2>/dev/null)"}}
+    [ -n "$positional" ] && compadd -V scr-models -- ${{(f)"$("$scr" model names --source "$positional" -- "$cur" 2>/dev/null)"}}
 }}
 _scr "$@"
 "#
@@ -695,6 +699,35 @@ mod tests {
         assert!(arm.contains("--help"), "clap's own args missing: {arm}");
         assert!(arm.contains("model_opts=\"--model -m\""), "{arm}");
         assert!(arm.contains("positional=\"compiled\""), "{arm}");
+    }
+
+    /// Model names come most downloaded first, and the shell must not re-sort
+    /// them: zsh adds them as an unsorted group, and bash (4.4+) turns sorting
+    /// off for that completion. Every site that offers model names does both.
+    #[test]
+    fn model_names_keep_the_order_they_come_in() {
+        let zsh = script(CompletionShell::Zsh);
+        let zsh_sites: Vec<&str> = (zsh.lines())
+            .filter(|l| l.contains("model names --source"))
+            .collect();
+        assert_eq!(zsh_sites.len(), 2, "{zsh_sites:?}");
+        for site in zsh_sites {
+            assert!(site.contains("compadd -V scr-models --"), "{site}");
+        }
+
+        let bash = script(CompletionShell::Bash);
+        let lines: Vec<&str> = bash.lines().collect();
+        let sites: Vec<usize> = (0..lines.len())
+            .filter(|&i| lines[i].contains("model names --source"))
+            .collect();
+        assert_eq!(sites.len(), 2, "{bash}");
+        for i in sites {
+            assert!(
+                lines[i - 1].contains("compopt -o nosort 2>/dev/null"),
+                "no nosort before: {}",
+                lines[i]
+            );
+        }
     }
 
     /// `model rm` takes an id that "must match the model ID shown by `scr model
