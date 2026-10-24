@@ -40,6 +40,7 @@
 
 #include "attn.h"
 #include "paged_resolve.h"
+#include "spans.h"
 
 using namespace metal;
 using namespace mlx::steel;
@@ -168,8 +169,9 @@ void attention_steel_paged_wide(
     if (first_k > 0) kb_start = first_k / BK;
   }
   // Block-diagonal span attention, as `attention_paged`: a span-uniform Q
-  // tile starts at its span's first K-tile (ROR-gated; folds away on
-  // non-spans so span_ids is never read unbound).
+  // tile starts at its span's first K-tile, and each row's keys before its
+  // span's first token are masked (ROR-gated; folds away on non-spans so
+  // span_ids is never read unbound).
   if (ATTN_PAGED_ROR != 0u || ATTN_PAGED_SELFONLY != 0u) {
     const uint sf = span_ids[uint(abs_q_first)];
     const uint sl = span_ids[uint(abs_q_max_excl - 1)];
@@ -177,6 +179,16 @@ void attention_steel_paged_wide(
       const int span_kb = (int(sf) - 1) / int(BK);
       if (span_kb > kb_start) kb_start = span_kb;
     }
+  }
+  int span_lo[TQ];
+  int span_lo_max = 0;
+  STEEL_PRAGMA_UNROLL
+  for (short iq = 0; iq < TQ; iq++) {
+    const int r = abs_q_min + sm + iq * kU;
+    span_lo[iq] = ((ATTN_PAGED_ROR != 0u || ATTN_PAGED_SELFONLY != 0u) && r < abs_q_max_excl)
+        ? span_first_key(span_ids, r)
+        : 0;
+    span_lo_max = max(span_lo_max, span_lo[iq]);
   }
 
   // The first row of the KQ-key group `g`'s page, for K (pre-roped scratch
@@ -265,7 +277,7 @@ void attention_steel_paged_wide(
     }
   };
 
-  // ── scale + the partial tail / causal / window masks on Stile
+  // ── scale + the partial tail / causal / window / span masks on Stile
   //    (register-only; per-element r/c exactly as the NAX wide kernel). ──
   auto scale_and_mask = [&](int kb_, thread stile_t& Stile) {
     STEEL_PRAGMA_UNROLL
@@ -278,7 +290,8 @@ void attention_steel_paged_wide(
     const bool causal = key0 + BK - 1 > abs_q_min;
     const bool window =
         ATTN_PAGED_WINDOW > 0 && (abs_q_max_excl - 1 - key0) >= ATTN_PAGED_WINDOW;
-    if (tail || causal || window) {
+    const bool span = key0 < span_lo_max;
+    if (tail || causal || window || span) {
       constexpr auto neg_inf = Limits<AccumType>::finite_min;
       STEEL_PRAGMA_UNROLL
       for (short iq = 0; iq < TQ; iq++) {
@@ -290,7 +303,7 @@ void attention_steel_paged_wide(
             const int r = abs_q_min + sm + iq * kU;
             const int c = key0 + ik * kU + sn + jj;
             const bool dead = c >= int(kv_len) || r < c ||
-                (ATTN_PAGED_WINDOW > 0 && (r - c) >= ATTN_PAGED_WINDOW);
+                (ATTN_PAGED_WINDOW > 0 && (r - c) >= ATTN_PAGED_WINDOW) || c < span_lo[iq];
             fg[jj] = dead ? neg_inf : fg[jj];
           }
         }

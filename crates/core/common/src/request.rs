@@ -122,9 +122,10 @@ pub fn compute_block_flags_rope_on_read(
 /// context-independent. That is exactly what the `Relocatable` cache key already
 /// promises (parent hash reset to `NONE_HASH`), so isolated-prefilling a span
 /// this way makes the existing content-addressed reuse CORRECT under any
-/// recombination. (Today a `Relocatable` span is prefilled FULL-CAUSAL yet reused
-/// content-addressed → it silently returns K/V computed for the wrong
-/// neighbors.) A richer `[shared-prefix + self]`
+/// recombination. The metal prefill kernels mask each span row's keys before
+/// `first_token` ([`span_ids_per_token`]), for spans of any length and
+/// alignment, on a step that prefills one sequence: a step with several carries
+/// no labels yet (#893). A richer `[shared-prefix + self]`
 /// mode is possible later but would require folding that prefix into the
 /// content-address — it is NOT self-only and is out of scope here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

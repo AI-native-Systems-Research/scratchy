@@ -2697,9 +2697,11 @@ kernel void attention_prefill_sdpa_gqa_shared_f16_specialized(
     //     redundancy the scratch path replaces).
     // The unrotated flag rides in block_table bit 31 (no flag buffer).
     device const half*     cos_sin               [[buffer(7)]],
+    // Block-diagonal span attention: the per-token span labels
+    // (`span_ids_per_token`), read only under ATTN_ROR.
+    device const uint*     span_ids             [[buffer(8)]],
     // gpt-oss attention sinks (ATTN_SINKS): the layer's [num_q_heads] sink
-    // logits, model dtype. Only dereferenced when ATTN_SINKS. Slot 9 — the
-    // binding set's SpanIds rides 8.
+    // logits, model dtype. Only dereferenced when ATTN_SINKS.
     device const half*     sinks                [[buffer(9)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint3  tid       [[thread_position_in_threadgroup]],
@@ -2792,6 +2794,12 @@ kernel void attention_prefill_sdpa_gqa_shared_f16_specialized(
     uint first_key = 0;
     if (ATTN_WINDOW > 0 && int(q_abs_pos) - ATTN_WINDOW + 1 > 0) {
         first_key = uint(int(q_abs_pos) - ATTN_WINDOW + 1);
+    }
+    // Spans: a query inside a Relocatable span attends from its span's first
+    // token (label - 1; 0 outside a span), as the sdpa-paged kernel does.
+    if (ATTN_ROR != 0u) {
+        const uint label = span_ids[q_abs_pos];
+        if (label != 0u) { first_key = max(first_key, label - 1u); }
     }
     const uint blk_lo = first_key / block_size;
     const uint blk_hi = last_key / block_size;          // inclusive
@@ -2985,6 +2993,8 @@ kernel void attention_prefill_sdpa_gqa_shared_bf16_specialized(
     // Spans, slot 7 = cos_sin (in-kernel rope) OR the pre-roped K scratch
     // (ATTN_K_SCRATCH). See the f16 sibling. Unrotated flag rides in bit 31.
     device const bfloat*   cos_sin               [[buffer(7)]],
+    // Block-diagonal span attention: see the f16 sibling (slot 8).
+    device const uint*     span_ids             [[buffer(8)]],
     // gpt-oss attention sinks (ATTN_SINKS): see the f16 sibling (slot 9).
     device const bfloat*   sinks                [[buffer(9)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
@@ -3078,6 +3088,12 @@ kernel void attention_prefill_sdpa_gqa_shared_bf16_specialized(
     uint first_key = 0;
     if (ATTN_WINDOW > 0 && int(q_abs_pos) - ATTN_WINDOW + 1 > 0) {
         first_key = uint(int(q_abs_pos) - ATTN_WINDOW + 1);
+    }
+    // Spans: a query inside a Relocatable span attends from its span's first
+    // token (label - 1; 0 outside a span), as the sdpa-paged kernel does.
+    if (ATTN_ROR != 0u) {
+        const uint label = span_ids[q_abs_pos];
+        if (label != 0u) { first_key = max(first_key, label - 1u); }
     }
     const uint blk_lo = first_key / block_size;
     const uint blk_hi = last_key / block_size;          // inclusive

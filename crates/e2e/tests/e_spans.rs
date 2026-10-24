@@ -246,14 +246,13 @@ fn test_relocatable_cache_hit_produces_same_output() {
     );
 }
 
-/// Bug gate (RECOMBINATION transparency): a Relocatable span reused in a
-/// DIFFERENT document order than it was first prefilled must produce the same
-/// output as computing that order fresh. Today spans prefill FULL-CAUSAL but are
-/// reused CONTENT-ADDRESSED (parent hash reset to NONE), so a reordered reuse
-/// returns each doc's K/V computed for the WRONG neighbors → silent corruption.
-/// Self-only span isolation makes the
-/// reuse transparent. EXPECTED: this FAILS today (it captures the bug) and
-/// PASSES once Relocatable spans are prefilled block-diagonally (self-only).
+/// RECOMBINATION transparency: a Relocatable span reused in a DIFFERENT
+/// document order than it was first prefilled must produce the same output as
+/// computing that order fresh. Spans are reused CONTENT-ADDRESSED (parent hash
+/// reset to NONE), so this holds only if a span's K/V is a function of its own
+/// tokens: every prefill kernel masks a span row's keys before the span's first
+/// token. Each doc here is one 16-token block, shorter than the steel (32-row)
+/// and NAX (64-row) Q tiles, which their tile seek alone could not isolate.
 ///
 /// Distinct from `test_relocatable_cache_hit_produces_same_output`, which only
 /// reuses the SAME order (where full-causal reuse happens to be correct).
@@ -345,7 +344,8 @@ fn test_relocatable_recombination_reuse_matches_fresh() {
         text_b_cached, text_b_fresh,
         "Reordered span reuse must match a fresh compute of the same order.\n  \
          cached (after order A): {text_b_cached:?}\n  fresh (cold cache):     {text_b_fresh:?}\n  \
-         Divergence = the full-causal-prefill + content-addressed-reuse bug; self-only isolation fixes it."
+         A divergence means a span's K/V depended on its neighbours: a prefill kernel let a span row \
+         attend keys before its span."
     );
 }
 

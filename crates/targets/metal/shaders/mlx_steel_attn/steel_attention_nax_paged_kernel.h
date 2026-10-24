@@ -82,6 +82,7 @@
 
 #include "metal_nax.h"  // NAXTile + BaseNAXFrag + tile_matmad_nax
 #include "paged_resolve.h"  // paged_resolve_block / paged_resolve_scratch
+#include "spans.h"  // span_first_key
 
 using namespace metal;
 using namespace mlx::steel;
@@ -393,7 +394,9 @@ void attention_nax_paged(
   // the first KV TILE via `/ BK` — the KB-LOOP stride (NAX BK != BLOCK_SIZE_,
   // e.g. BK=32 at BD=128), NOT the page size — flooring a mid-tile span start
   // to its containing tile. A tile straddling a span boundary (sf != sl) keeps
-  // the full causal range. Raising kb_start skips leading tiles directly (the
+  // the full causal range of tiles. Either way the span mask in
+  // `scale_and_mask` bounds each row exactly (spans.h); the seek only skips
+  // whole tiles. Raising kb_start skips leading tiles directly (the
   // kb-loop honors it; no loader.seek() — NAX resolves per-block each iter).
   if (NAXP_ROR != 0u) {
     const uint sf = span_ids[uint(abs_q_min)];
@@ -409,6 +412,18 @@ void attention_nax_paged(
   const short lim_rows_q = short(int(q_tile_rows) - int(tm));
 
   using stile_t = NAXTile<AccumType, TQ, TK>;
+
+  // The first key each of this thread's rows attends (`span_first_key`; TQ is 1), and the latest
+  // of them: a K-tile starting at or past it needs no span mask. A row past the tile's attends
+  // from 0.
+  int span_lo[stile_t::kFragThrRows];
+  int span_lo_max = 0;
+  STEEL_PRAGMA_UNROLL
+  for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+    const int r = abs_q_min + sm + ii * stile_t::kFragRowsJump;
+    span_lo[ii] = (NAXP_ROR != 0u && r < abs_q_max_excl) ? span_first_key(span_ids, r) : 0;
+    span_lo_max = max(span_lo_max, span_lo[ii]);
+  }
 
   // Resolve the K base pointer for logical block `lb`. Spans (NAXP_ROR != 0):
   // K comes PRE-ROPED from the dense scratch (rope_once_nax wrote it). Else:
@@ -546,6 +561,25 @@ void attention_nax_paged(
               const auto loc = ii * stile_t::kFragThrCols + jj;
               fg[loc] = ((r - c) >= NAXP_WINDOW) ? neg_inf : fg[loc];
             }
+          }
+        }
+      }
+    }
+
+    // Spans: a row inside a span attends no key before its span's first token.
+    if (NAXP_ROR != 0u && kb_ * BK < span_lo_max) {
+      constexpr auto neg_inf = NaxLimits<AccumType>::finite_min;
+      const int base_col = kb_ * BK + sn;
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        thread auto& fg = Stile.frag_at(0, ik);
+        STEEL_PRAGMA_UNROLL
+        for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
+            const int c = base_col + ik * kU + jj;
+            const auto loc = ii * stile_t::kFragThrCols + jj;
+            fg[loc] = (c < span_lo[ii]) ? neg_inf : fg[loc];
           }
         }
       }
@@ -782,7 +816,7 @@ void attention_nax_paged_wide(
     if (first_k > 0) kb_start = first_k / BK;
   }
   // Block-diagonal span attention, as in `attention_nax_paged`: a span-uniform Q tile starts at
-  // its span's first K-tile.
+  // its span's first K-tile, and each row's keys before its span's first token are masked.
   if (NAXP_ROR != 0u) {
     const uint sf = span_ids[uint(abs_q_first)];
     const uint sl = span_ids[uint(abs_q_max_excl - 1)];
@@ -790,6 +824,14 @@ void attention_nax_paged_wide(
       const int span_kb = (int(sf) - 1) / int(BK);
       if (span_kb > kb_start) { kb_start = span_kb; }
     }
+  }
+  int span_lo[stile_t::kFragThrRows];
+  int span_lo_max = 0;
+  STEEL_PRAGMA_UNROLL
+  for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+    const int r = abs_q_min + sm + ii * stile_t::kFragRowsJump;
+    span_lo[ii] = (NAXP_ROR != 0u && r < abs_q_max_excl) ? span_first_key(span_ids, r) : 0;
+    span_lo_max = max(span_lo_max, span_lo[ii]);
   }
 
   // The first row of the `KQ`-key group `g`'s page, for K (pre-roped scratch for spans, else the
@@ -886,7 +928,8 @@ void attention_nax_paged_wide(
         Stile.elems()[i] = part[(rb * WN * (KQ / 2) + t * (BK / 2) + i) * 32 + simd_lane_id];
       }
 
-      // Scale, then mask the partial tail, the causal diagonal and keys past the window.
+      // Scale, then mask the partial tail, the causal diagonal, keys past the window and keys
+      // before a row's span.
       STEEL_PRAGMA_UNROLL
       for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
         Stile.elems()[ii] *= scale2;
@@ -894,7 +937,8 @@ void attention_nax_paged_wide(
       const bool tail = key0 + BK > int(kv_len);
       const bool causal = key0 + BK - 1 > abs_q_min;
       const bool window = NAXP_WINDOW > 0 && (abs_q_max_excl - 1 - key0) >= NAXP_WINDOW;
-      if (tail || causal || window) {
+      const bool span = NAXP_ROR != 0u && key0 < span_lo_max;
+      if (tail || causal || window || span) {
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < TK; ik++) {
           thread auto& fg = Stile.frag_at(0, ik);
@@ -906,7 +950,7 @@ void attention_nax_paged_wide(
               const int c = key0 + ik * kU + sn + jj;
               const auto loc = ii * stile_t::kFragThrCols + jj;
               const bool dead = c >= int(kv_len) || r < c ||
-                  (NAXP_WINDOW > 0 && (r - c) >= NAXP_WINDOW);
+                  (NAXP_WINDOW > 0 && (r - c) >= NAXP_WINDOW) || c < span_lo[ii];
               fg[loc] = dead ? neg_inf : fg[loc];
             }
           }

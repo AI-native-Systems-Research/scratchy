@@ -348,8 +348,6 @@ struct AttnCase {
 /// CPU reference: causal (+ optional window) softmax attention over a
 /// contiguous K/V laid out `[block, kv_head, tok_in_block, head_dim]`
 /// (the paged layout with an identity block table).
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::needless_range_loop)]
 fn attn_ref(
     q: &[f32], // [num_q, num_q_heads, head_dim] (one row per query token)
     k: &[f32], // paged layout, f16-rounded
@@ -357,6 +355,31 @@ fn attn_ref(
     case: &AttnCase,
     block_size: usize,
     q_positions: &[usize], // absolute K-axis position per query row
+    scale: f32,
+) -> Vec<f32> {
+    let first_keys = vec![0; q_positions.len()];
+    let rows = QueryRows {
+        positions: q_positions,
+        first_keys: &first_keys,
+    };
+    attn_ref_rows(q, k, v, case, block_size, &rows, scale)
+}
+
+/// The query rows a reference attention computes: each row's absolute K-axis position, and the
+/// first key it attends (0, or its span's first token under block-diagonal span attention).
+struct QueryRows<'a> {
+    positions: &'a [usize],
+    first_keys: &'a [usize],
+}
+
+/// [`attn_ref`] with each row's keys before its first key masked too.
+fn attn_ref_rows(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    case: &AttnCase,
+    block_size: usize,
+    rows: &QueryRows,
     scale: f32,
 ) -> Vec<f32> {
     let &AttnCase {
@@ -367,50 +390,44 @@ fn attn_ref(
         window,
     } = case;
     let group = num_q_heads / num_kv_heads;
-    let kv_at = |tok: usize, kvh: usize, d: usize| -> f32 {
-        let blk = tok / block_size;
-        let tib = tok % block_size;
-        let idx = ((blk * num_kv_heads + kvh) * block_size + tib) * head_dim + d;
-        k[idx]
+    // Where a token's head_dim row of K or V for one KV head lies.
+    let row_of = |tok: usize, kvh: usize| -> std::ops::Range<usize> {
+        let (blk, tib) = (tok / block_size, tok % block_size);
+        let at = ((blk * num_kv_heads + kvh) * block_size + tib) * head_dim;
+        at..at + head_dim
     };
-    let vv_at = |tok: usize, kvh: usize, d: usize| -> f32 {
-        let blk = tok / block_size;
-        let tib = tok % block_size;
-        let idx = ((blk * num_kv_heads + kvh) * block_size + tib) * head_dim + d;
-        v[idx]
-    };
-    let mut out = vec![0f32; q_positions.len() * num_q_heads * head_dim];
-    for (qi, &q_abs) in q_positions.iter().enumerate() {
+    let mut out = vec![0f32; rows.positions.len() * num_q_heads * head_dim];
+    for (qi, (&q_abs, &first_key)) in rows.positions.iter().zip(rows.first_keys).enumerate() {
         for h in 0..num_q_heads {
             let kvh = h / group;
             let qrow = &q[(qi * num_q_heads + h) * head_dim..][..head_dim];
-            let mut scores = Vec::with_capacity(kv_len);
-            for t in 0..kv_len {
-                if t > q_abs {
-                    scores.push(f32::NEG_INFINITY);
-                    continue;
-                }
-                if window > 0 && (q_abs - t) as i64 >= window as i64 {
-                    scores.push(f32::NEG_INFINITY);
-                    continue;
-                }
-                let mut s = 0f32;
-                for d in 0..head_dim {
-                    s += qrow[d] * kv_at(t, kvh, d);
-                }
-                scores.push(s * scale);
-            }
+            let scores: Vec<f32> = (0..kv_len)
+                .map(|t| {
+                    let masked = t > q_abs
+                        || t < first_key
+                        || (window > 0 && (q_abs - t) as i64 >= window as i64);
+                    if masked {
+                        return f32::NEG_INFINITY;
+                    }
+                    let s: f32 = qrow
+                        .iter()
+                        .zip(&k[row_of(t, kvh)])
+                        .map(|(a, b)| a * b)
+                        .sum();
+                    s * scale
+                })
+                .collect();
             let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = scores.iter().map(|&s| (s - m).exp()).collect();
             let denom: f32 = exps.iter().sum();
             let orow = &mut out[(qi * num_q_heads + h) * head_dim..][..head_dim];
-            for t in 0..kv_len {
-                if exps[t] == 0.0 {
+            for (t, &e) in exps.iter().enumerate() {
+                if e == 0.0 {
                     continue;
                 }
-                let w = exps[t] / denom;
-                for d in 0..head_dim {
-                    orow[d] += w * vv_at(t, kvh, d);
+                let w = e / denom;
+                for (o, &x) in orow.iter_mut().zip(&v[row_of(t, kvh)]) {
+                    *o += w * x;
                 }
             }
         }
@@ -1053,6 +1070,8 @@ fn run_rope_on_read_nax_case(case: NaxRopeCase) {
     // v_tab). A prior dispatch fully completes before the next, so the
     // roped scratch is visible to this pass.
     let nq_blocks = total_q.div_ceil(nax.bq as usize);
+    // No spans: every token's label 0, so every row attends from key 0.
+    let no_spans = buf_u32(&device, &vec![0u32; kv_len]);
     if !common::dispatch_threadgroups(
         &device,
         &pipeline,
@@ -1065,6 +1084,8 @@ fn run_rope_on_read_nax_case(case: NaxRopeCase) {
             &k_tab,
             &v_tab,
             &scratch_buf,
+            &no_spans,
+            // The sinks slot, unread: binds V so the GPU can read it through `v_tab`.
             &v_buf,
         ],
         MTLSize {
@@ -2445,6 +2466,8 @@ fn run_rope_on_read_gqa_shared_case(case: GqaRopeCase) {
     );
     let pipeline = baked_build(&cache, &key).expect("gqa_shared rope-on-read pipeline");
 
+    // No spans: every token's label 0, so every row attends from key 0.
+    let no_spans = buf_u32(&device, &vec![0u32; kv_len]);
     if !common::dispatch_threadgroups(
         &device,
         &pipeline,
@@ -2457,6 +2480,9 @@ fn run_rope_on_read_gqa_shared_case(case: GqaRopeCase) {
             &k_tab,
             &v_tab,
             &cos_sin_buf,
+            &no_spans,
+            // Past the span labels, unread: binds K and V so the GPU can read them through the
+            // tables.
             &k_buf,
             &v_buf,
         ],
@@ -2669,6 +2695,8 @@ fn run_rope_once_gqa_shared_case(case: GqaScratchRopeCase) {
 
     // ── Pass 2: gqa_shared attention reads PRE-ROPED K from the scratch
     // (v_buf via v_tab); pass 1 has fully completed.
+    // No spans: every token's label 0, so every row attends from key 0.
+    let no_spans = buf_u32(&device, &vec![0u32; kv_len]);
     if !common::dispatch_threadgroups(
         &device,
         &attn_pipe,
@@ -2681,6 +2709,8 @@ fn run_rope_once_gqa_shared_case(case: GqaScratchRopeCase) {
             &k_tab,
             &v_tab,
             &scratch_buf,
+            &no_spans,
+            // The sinks slot, unread: binds V so the GPU can read it through `v_tab`.
             &v_buf,
         ],
         MTLSize {
@@ -2904,6 +2934,8 @@ fn run_rope_on_read_steel_case(case: SteelRopeCase) {
     // ── Pass 2: attention reads PRE-ROPED K from the scratch (v_buf via
     // v_tab); pass 1 has fully completed.
     let nq_blocks = total_q.div_ceil(32);
+    // No spans: every token's label 0, so every row attends from key 0.
+    let no_spans = buf_u32(&device, &vec![0u32; kv_len]);
     if !common::dispatch_threadgroups(
         &device,
         &pipeline,
@@ -2916,6 +2948,8 @@ fn run_rope_on_read_steel_case(case: SteelRopeCase) {
             &k_tab,
             &v_tab,
             &scratch_buf,
+            &no_spans,
+            // The sinks slot, unread: binds V so the GPU can read it through `v_tab`.
             &v_buf,
         ],
         MTLSize {
@@ -3156,6 +3190,8 @@ fn run_rope_on_read_steel_gqa_case(case: SteelGqaRopeCase) {
     // v_tab); pass 1 has fully completed. Steel grid Y axis is PER-Q-HEAD;
     // the kernel maps kv_head = q_head / gqa.
     let nq_blocks = total_q.div_ceil(32);
+    // No spans: every token's label 0, so every row attends from key 0.
+    let no_spans = buf_u32(&device, &vec![0u32; kv_len]);
     if !common::dispatch_threadgroups(
         &device,
         &pipeline,
@@ -3168,6 +3204,8 @@ fn run_rope_on_read_steel_gqa_case(case: SteelGqaRopeCase) {
             &k_tab,
             &v_tab,
             &scratch_buf,
+            &no_spans,
+            // The sinks slot, unread: binds V so the GPU can read it through `v_tab`.
             &v_buf,
         ],
         MTLSize {
@@ -3804,5 +3842,297 @@ fn steel_nax_paged_ignores_rows_past_kv_len() {
             );
         eprintln!("steel nax paged hd{head_dim}, NaN past kv_len: max_err {max_err}");
         assert!(max_err < 2e-2, "hd{head_dim} max_err {max_err}");
+    }
+}
+
+// ── Block-diagonal span attention parity ────────────────────────────
+
+/// A paged prefill kernel the span tests run: its library and symbol, its grid, and its page
+/// size.
+struct SpanKernel {
+    name: &'static str,
+    library: &'static str,
+    symbol: &'static str,
+    grid: SpanGrid,
+    head_dim: usize,
+    block_size: usize,
+}
+
+/// How a paged prefill kernel tiles the queries.
+#[derive(Clone, Copy)]
+enum SpanGrid {
+    /// A threadgroup of `threads` a `bq`-row Q tile of one query head: the steel and NAX family.
+    QTiles { bq: usize, threads: usize },
+    /// A threadgroup a (KV head, query), one simdgroup a query head of the group: gqa_shared,
+    /// which reads the rope-once scratch on its own gate (`ATTN_K_SCRATCH`).
+    PerQuery,
+}
+
+/// How a span test feeds the kernel its K: from the rope-once scratch (rope-on-read, every rope
+/// model's prefill), or from the cache with rope-on-read off and the span bound on its own gate
+/// (`ATTN_PAGED_SELFONLY`, the sliding layers' arm).
+#[derive(Clone, Copy, Debug)]
+enum SpanSource {
+    RopeOnRead,
+    SelfOnly,
+}
+
+/// The spans every case runs: a shared prefix (tokens 0..10), three Relocatable spans that start
+/// mid-page and mid-tile (one shorter than a page, one over several tiles, one of 7 tokens), and
+/// the query from 97 on. As the host builds them (`span_ids_per_token`) from block annotations.
+fn span_test_labels(kv_len: usize) -> Vec<u32> {
+    use scratchy_core_common::{BlockAnnotations, BlockKind};
+    let annotations: BlockAnnotations =
+        [(0, 10, true), (1, 27, true), (5, 90, true), (6, 97, false)]
+            .into_iter()
+            .map(|(block, first_token, relocatable)| {
+                let kind = if relocatable {
+                    BlockKind::Relocatable { first_token }
+                } else {
+                    BlockKind::Prefixed { first_token }
+                };
+                (block, kind)
+            })
+            .collect();
+    scratchy_core_common::request::span_ids_per_token(&annotations, kv_len)
+}
+
+/// Run `kernel` over 150 keys, the whole prompt new (`prefix` 0) or a continuation chunk after
+/// `prefix` cached keys, with [`span_test_labels`]; check each row against the reference with its
+/// keys before its span's first token masked. The same rows without that mask differ, so the
+/// check has power.
+fn run_span_case(kernel: &SpanKernel, source: SpanSource, prefix: usize) {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
+
+    // Eight query heads a KV head: gqa_shared's least.
+    let case = AttnCase {
+        num_q_heads: 16,
+        num_kv_heads: 2,
+        head_dim: kernel.head_dim,
+        kv_len: 150,
+        window: 0,
+    };
+    let block_size = kernel.block_size;
+    let num_blocks = case.kv_len.div_ceil(block_size);
+    let kv_elems = num_blocks * case.num_kv_heads * block_size * case.head_dim;
+    let k_host = pseudo(701, kv_elems, 1.0);
+    let v_host = pseudo(703, kv_elems, 1.0);
+    let k_buf = buf_f16(&device, &k_host);
+    let v_buf = buf_f16(&device, &v_host);
+    let k_r: Vec<f32> = k_host.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
+    let v_r: Vec<f32> = v_host.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
+    let k_tab = buf_u64(&device, &[k_buf.gpuAddress()]);
+    let v_tab = buf_u64(&device, &[v_buf.gpuAddress()]);
+    let bt_buf = buf_u32(&device, &(0..num_blocks as u32).collect::<Vec<_>>());
+    let labels = span_test_labels(case.kv_len);
+    let span_buf = buf_u32(&device, &labels);
+
+    let new_q = case.kv_len - prefix;
+    let q_host = pseudo(709, new_q * case.num_q_heads * case.head_dim, 1.0);
+    let q_buf = buf_f16(&device, &q_host);
+    let q_r: Vec<f32> = q_host.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
+    let out_buf = buf_zero(&device, new_q * case.num_q_heads * case.head_dim * 2);
+    let cu_seqlens = buf_u32(&device, &[0, new_q as u32, 0, 0]);
+    let seq_used = buf_u32(&device, &[case.kv_len as u32]);
+
+    let mut consts = attn_constants(&case, block_size, num_blocks);
+    consts[6] = ConstantValue::uint(6, 128); // BPC: every block in chunk 0
+    consts.push(ConstantValue::uint(99, 0)); // DEBUG_MODE
+    match source {
+        // K from the scratch, which holds the cache's K as is: the rope is not under test.
+        SpanSource::RopeOnRead => consts.extend([
+            ConstantValue::uint(8, case.head_dim as u32),
+            ConstantValue::uint(9, case.head_dim as u32 / 2),
+            ConstantValue::uint(10, 1),
+        ]),
+        SpanSource::SelfOnly => consts.push(ConstantValue::uint(14, 1)),
+    }
+    if let (SpanGrid::PerQuery, SpanSource::RopeOnRead) = (kernel.grid, source) {
+        consts.push(ConstantValue::uint(11, 1)); // ATTN_K_SCRATCH
+    }
+    let (threadgroups, threads) = match kernel.grid {
+        SpanGrid::QTiles { bq, threads } => ((new_q.div_ceil(bq), case.num_q_heads), threads),
+        SpanGrid::PerQuery => (
+            (case.num_kv_heads, new_q),
+            32 * case.num_q_heads / case.num_kv_heads,
+        ),
+    };
+    let key = PipelineKey::new(kernel.library, kernel.symbol, consts);
+    let pipeline = baked_build(&cache, &key).expect("paged prefill pipeline");
+    if !common::dispatch_threadgroups(
+        &device,
+        &pipeline,
+        &[
+            &out_buf,
+            &q_buf,
+            &cu_seqlens,
+            &seq_used,
+            &bt_buf,
+            &k_tab,
+            &v_tab,
+            &k_buf,
+            &span_buf,
+            // The sinks slot, unread: binds V so the GPU can read it through `v_tab`.
+            &v_buf,
+        ],
+        MTLSize {
+            width: threadgroups.0,
+            height: threadgroups.1,
+            depth: 1,
+        },
+        MTLSize {
+            width: threads,
+            height: 1,
+            depth: 1,
+        },
+    ) {
+        return;
+    }
+    let got = read_f16(&out_buf, new_q * case.num_q_heads * case.head_dim);
+
+    let positions: Vec<usize> = (prefix..case.kv_len).collect();
+    let first_keys: Vec<usize> = positions
+        .iter()
+        .map(|&p| labels[p].checked_sub(1).map_or(0, |first| first as usize))
+        .collect();
+    let rows = QueryRows {
+        positions: &positions,
+        first_keys: &first_keys,
+    };
+    let want = attn_ref_rows(&q_r, &k_r, &v_r, &case, block_size, &rows, scale_of(&case));
+    let causal = attn_ref(
+        &q_r,
+        &k_r,
+        &v_r,
+        &case,
+        block_size,
+        &positions,
+        scale_of(&case),
+    );
+    let max_diff = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    };
+    let (err, span_effect) = (max_diff(&got, &want), max_diff(&causal, &want));
+    eprintln!(
+        "{} {source:?} prefix {prefix}: max_err {err}, span mask moves the reference {span_effect}",
+        kernel.name
+    );
+    assert!(
+        span_effect > 0.2,
+        "the spans must change the answer for the check to mean anything"
+    );
+    assert!(
+        err < 2e-2,
+        "{} {source:?} prefix {prefix}: max_err {err}",
+        kernel.name
+    );
+}
+
+fn scale_of(case: &AttnCase) -> f32 {
+    1.0 / (case.head_dim as f32).sqrt()
+}
+
+fn simdgroup_steel_span_kernel(head_dim: u32) -> SpanKernel {
+    SpanKernel {
+        name: "steel",
+        library: "attention_steel_paged",
+        symbol: scratchy_target_metal::steel_paged::steel_paged_symbol("f16", head_dim)
+            .expect("steel instance"),
+        grid: SpanGrid::QTiles {
+            bq: 32,
+            threads: 128,
+        },
+        head_dim: head_dim as usize,
+        block_size: 16,
+    }
+}
+
+/// The simdgroup steel kernel bounds every row of a span at the span's first token, for spans
+/// shorter than its 32-row Q tile and starting mid-tile, on both the rope-on-read and the
+/// self-only gate, for a whole prompt and a continuation chunk.
+#[test]
+fn steel_paged_span_rows_attend_their_span_only() {
+    for head_dim in [64, 128] {
+        let kernel = simdgroup_steel_span_kernel(head_dim);
+        for source in [SpanSource::RopeOnRead, SpanSource::SelfOnly] {
+            for prefix in [0, 40] {
+                run_span_case(&kernel, source, prefix);
+            }
+        }
+    }
+}
+
+/// The simdgroup wide kernel (head_dim 512 over 32-token pages) bounds every span row the same.
+#[test]
+fn steel_wide_paged_span_rows_attend_their_span_only() {
+    let wide = scratchy_target_metal::steel_paged::steel_wide_paged_kernel("f16", 512, 32)
+        .expect("steel wide instance");
+    let kernel = SpanKernel {
+        name: "steel wide",
+        library: "attention_steel_wide_paged",
+        symbol: wide.symbol,
+        grid: SpanGrid::QTiles {
+            bq: wide.bq as usize,
+            threads: wide.threads as usize,
+        },
+        head_dim: 512,
+        block_size: 32,
+    };
+    for source in [SpanSource::RopeOnRead, SpanSource::SelfOnly] {
+        for prefix in [0, 40] {
+            run_span_case(&kernel, source, prefix);
+        }
+    }
+}
+
+/// Both NAX kernels (head_dims 64 / 128 one warp a Q block; 256 / 512 on the wide one) bound every
+/// span row at its span's first token, inside their 64-row Q tiles.
+#[test]
+fn steel_nax_paged_span_rows_attend_their_span_only() {
+    if detect_nax_device().is_none() {
+        return;
+    }
+    for (head_dim, block_size) in [(64, 16), (128, 16), (256, 16), (512, 32)] {
+        let nax = scratchy_target_metal::steel_paged::nax_paged_kernel("f16", head_dim, block_size)
+            .expect("NAX instance");
+        let kernel = SpanKernel {
+            name: "nax",
+            library: "attention_steel_nax_paged",
+            symbol: nax.symbol,
+            grid: SpanGrid::QTiles {
+                bq: nax.bq as usize,
+                threads: nax.threads as usize,
+            },
+            head_dim: head_dim as usize,
+            block_size: block_size as usize,
+        };
+        for prefix in [0, 40] {
+            run_span_case(&kernel, SpanSource::RopeOnRead, prefix);
+        }
+    }
+}
+
+/// The GQA-cooperative kernel (one threadgroup a query, the steel family's fallback below its Q
+/// tile) bounds each span query at its span's first token, reading K from its rope-once scratch.
+#[test]
+fn gqa_shared_span_rows_attend_their_span_only() {
+    let kernel = SpanKernel {
+        name: "gqa_shared",
+        library: "attention",
+        symbol: "attention_prefill_sdpa_gqa_shared_f16_specialized",
+        grid: SpanGrid::PerQuery,
+        head_dim: 128,
+        block_size: 16,
+    };
+    for prefix in [0, 40] {
+        run_span_case(&kernel, SpanSource::RopeOnRead, prefix);
     }
 }

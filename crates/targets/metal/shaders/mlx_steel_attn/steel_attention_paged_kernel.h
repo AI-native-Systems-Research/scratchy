@@ -47,6 +47,7 @@
 
 #include "attn.h"
 #include "paged_loader.h"
+#include "spans.h"
 
 using namespace mlx::steel;
 
@@ -571,9 +572,9 @@ void attention_paged(
   // Block-diagonal span attention: a SPAN-UNIFORM Q tile (all its rows in one
   // span) attends ONLY that span's K-blocks → start the kb-loop at the span's
   // first block, reusing the same seek/fast-forward the sliding window uses.
-  // This is the real O(T^2)->O(T*span) cut for the tools/spans region, AND it
-  // means the kb-loop never sees a sibling-span block (no all-masked rows → no
-  // softmax NaN), so the in-tile score mask stays unnecessary. ATTN_PAGED_ROR-
+  // This is the real O(T^2)->O(T*span) cut for the tools/spans region. It only
+  // skips whole tiles, so the span mask in `scale_and_mask` bounds each row
+  // exactly (spans.h), straddling tiles included. ATTN_PAGED_ROR-
   // gated (folds away on non-spans). span_ids is PER-TOKEN: label = (span's
   // first TOKEN + 1), 0 = shared/attends-all. Index by ABSOLUTE TOKEN position
   // (matching the host `span_ids_per_token` builder + the sibling kernels), NOT
@@ -588,6 +589,19 @@ void attention_paged(
       const int span_kb = (int(sf) - 1) / int(BK);
       if (span_kb > kb_start) { kb_start = span_kb; }
     }
+  }
+  // The first key each of this thread's rows attends (`span_first_key`), and the latest of them:
+  // a K-tile starting at or past it needs no span mask. A row past the tile's attends from 0.
+  using span_tile_t = decltype(Stile);
+  int span_lo[span_tile_t::kTileRows];
+  int span_lo_max = 0;
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < span_tile_t::kTileRows; i++) {
+    const int r = abs_q_min + tm + sm + (i * span_tile_t::kFragRows);
+    span_lo[i] = ((ATTN_PAGED_ROR != 0u || ATTN_PAGED_SELFONLY != 0u) && r < abs_q_max_excl)
+        ? span_first_key(span_ids, r)
+        : 0;
+    span_lo_max = max(span_lo_max, span_lo[i]);
   }
   // Last kb that's a full BK-wide tile (the rest of kv_len fits
   // in this block partially).
@@ -677,28 +691,21 @@ void attention_paged(
       }
     }
 
-    // Block-diagonal span mask: a query inside a span (q_span != 0) attends ONLY
-    // keys with the same span label; q_span == 0 (shared prefix / query) attends
-    // all. Mirrors the causal block's row_pos/col_pos. ATTN_PAGED_ROR-gated so
-    // the non-spans pipeline const-folds it (and span_ids unbound) entirely.
-    if (false && ATTN_PAGED_ROR != 0u) {  // TEMP: steel-mask isolation toggle
+    // Spans: a row inside a span attends no key before its span's first token (spans.h). The
+    // keys from there up to the row are all the span's, as a span is contiguous.
+    if ((ATTN_PAGED_ROR != 0u || ATTN_PAGED_SELFONLY != 0u) && kb_ * BK < span_lo_max) {
       using stile_t = decltype(Stile);
       using selem_t = typename stile_t::elem_type;
       constexpr auto neg_inf = Limits<selem_t>::finite_min;
       STEEL_PRAGMA_UNROLL
       for (short i = 0; i < stile_t::kTileRows; i++) {
-        const int row_pos = int(prefix_len) + int(q_block_base)
-                          + tm + sm + (i * stile_t::kFragRows);
-        const uint q_span = span_ids[uint(row_pos) / uint(BLOCK_SIZE_)];
-        if (q_span != 0u) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < stile_t::kTileCols; j++) {
+          const int col_pos = kb_ * BK + sn + (j * stile_t::kFragCols);
           STEEL_PRAGMA_UNROLL
-          for (short j = 0; j < stile_t::kTileCols; j++) {
-            const int col_pos = kb_ * BK + sn + (j * stile_t::kFragCols);
-            STEEL_PRAGMA_UNROLL
-            for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
-              if (span_ids[uint(col_pos + jj) / uint(BLOCK_SIZE_)] != q_span) {
-                Stile.frag_at(i, j)[jj] = neg_inf;
-              }
+          for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
+            if ((col_pos + jj) < span_lo[i]) {
+              Stile.frag_at(i, j)[jj] = neg_inf;
             }
           }
         }
