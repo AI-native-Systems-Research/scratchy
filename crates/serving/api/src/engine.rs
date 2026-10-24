@@ -3619,8 +3619,18 @@ impl AsyncEngine {
             (_, guided_grammar) => guided_grammar,
         };
 
-        // Tokenize bad_words strings into token sequences.
-        let bad_words_token_ids = self.tokenize_bad_words(&request.bad_words)?;
+        // Tokenize bad_words strings into token sequences: the request's, and its reasoning
+        // parser's (Gemma 4 re-opening a channel the moment one closes, #429).
+        let parser_bad_words = (self.reasoning_parser.as_ref()).map_or(&[][..], |p| p.bad_words());
+        let bad_words = match (&request.bad_words, parser_bad_words) {
+            (words, []) => words.clone(),
+            (words, parser) => Some(
+                (words.iter().flatten().cloned())
+                    .chain(parser.iter().map(|w| w.to_string()))
+                    .collect(),
+            ),
+        };
+        let bad_words_token_ids = self.tokenize_bad_words(&bad_words)?;
 
         // Some tool parsers (Gemma 4's `<|tool_call>` / `<|"|>`) key on real
         // added tokens that `skip_special_tokens` (default true) would strip
@@ -4838,6 +4848,45 @@ mod tests {
                 "the client's own flag"
             );
         }
+    }
+
+    /// Under Gemma 4's reasoning parser every chat request bans a channel re-opening the moment
+    /// one closes (#429), beside the bad words it asked for itself: after a long tool result the
+    /// model loops on empty thought channels, each making the next likelier, until the window
+    /// is full. Without the parser, or with another, a request's bad words are its own.
+    /// Byte-level test tokenizer: the markers are ordinary text in it, so their ids are bytes.
+    #[test]
+    fn gemma4_bans_a_channel_reopening_where_one_closes() {
+        let mut engine = make_test_engine_with_tokenizer();
+        let tokenizer = engine.tokenizer.clone().unwrap();
+        let reopen = tokenizer.encode("<channel|><|channel>", false).unwrap();
+        let bad_words = |engine: &AsyncEngine, own: Option<Vec<String>>| {
+            let request = protocol::ChatCompletionRequest {
+                bad_words: own,
+                ..make_chat_request()
+            };
+            (engine.build_sampling_params_from_chat(&request).unwrap()).bad_words_token_ids
+        };
+        assert_eq!(bad_words(&engine, None), None, "no parser");
+
+        let vocab = reasoning_test_vocab();
+        let qwen3 = crate::reasoning_parser::get_reasoning_parser("qwen3", &vocab).unwrap();
+        engine.set_reasoning_parser(qwen3);
+        assert_eq!(
+            bad_words(&engine, None),
+            None,
+            "another parser bans nothing"
+        );
+
+        let gemma4 = crate::reasoning_parser::get_reasoning_parser("gemma4", &vocab).unwrap();
+        engine.set_reasoning_parser(gemma4);
+        assert_eq!(bad_words(&engine, None), Some(vec![reopen.clone()]));
+        let own = tokenizer.encode("x", false).unwrap();
+        assert_eq!(
+            bad_words(&engine, Some(vec!["x".to_string()])),
+            Some(vec![own, reopen]),
+            "the request's own first"
+        );
     }
 
     #[test]
