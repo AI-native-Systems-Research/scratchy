@@ -188,11 +188,13 @@ impl Tokenizer {
         Ok((encoding.get_ids().to_vec(), through))
     }
 
-    /// A chat prompt the template rendered, encoded as [`Self::encode_through`] does, with the
-    /// post-processor's special tokens: the one rule for every path that encodes one, so
-    /// `/tokenize` counts the ids the prefill reads.
+    /// A chat prompt the template rendered, encoded as [`Self::encode_through`] does, with no
+    /// special tokens added: the template wrote the ones it wants, its BOS among them, and the
+    /// post-processor's would read that BOS twice (vLLM and transformers encode a templated prompt
+    /// so too). The one rule for every path that encodes one, so `/tokenize` counts the ids the
+    /// prefill reads.
     pub fn encode_chat(&self, text: &str, marks: &[usize]) -> ServeResult<(Vec<u32>, Vec<u32>)> {
-        self.encode_through(text, true, marks)
+        self.encode_through(text, false, marks)
     }
 
     /// Decode token IDs back into text.
@@ -366,6 +368,8 @@ mod tests {
         assert_eq!(tok.encode("hi", true).unwrap(), bos_hi);
         assert_eq!(tok.encode("<s>hi", false).unwrap(), bos_hi);
         assert_eq!(tok.num_special_tokens_to_add(false), 1);
+        // A rendered chat prompt keeps the template's BOS and gets no second one.
+        assert_eq!(tok.encode_chat("<s>hi", &[]).unwrap().0, bos_hi);
     }
 
     #[test]

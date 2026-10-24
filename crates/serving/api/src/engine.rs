@@ -3170,6 +3170,9 @@ impl AsyncEngine {
             request.chat_template_kwargs.as_ref(),
             true,
         );
+        // A rendered prompt carries the template's own special tokens; the fallback's plain text
+        // gets the tokenizer's, as a completion prompt does.
+        let templated = rendered.is_some();
         let text = if let Some(rendered) = rendered {
             rendered?
         } else {
@@ -3215,7 +3218,11 @@ impl AsyncEngine {
             if text.is_empty() {
                 vec![]
             } else {
-                let (ids, through) = tok.encode_chat(&text, &marks)?;
+                let (ids, through) = if templated {
+                    tok.encode_chat(&text, &marks)?
+                } else {
+                    tok.encode_through(&text, true, &marks)?
+                };
                 cache_breakpoints = through;
                 ids
             }
@@ -4662,9 +4669,10 @@ mod tests {
 
     /// `/tokenize` counts a chat request's prompt as the prefill builds it (#214): its tools, its
     /// chat-template kwargs merged over the server's defaults, and the special tokens the prefill
-    /// encodes it with, also on a tokenizer whose post-processor adds a BOS. The handler's count
-    /// is the prefill's prompt ids, `chat_to_engine_request`'s; without the tools it falls short,
-    /// as it did before, and a client's own `add_special_tokens` is still honored.
+    /// encodes it with, also on a tokenizer whose post-processor adds a BOS: none, so the BOS the
+    /// template writes is read once, not twice. The handler's count is the prefill's prompt ids,
+    /// `chat_to_engine_request`'s; without the tools it falls short, as it did before, and a
+    /// client's own `add_special_tokens` is still honored.
     #[cfg(feature = "serve")]
     #[tokio::test]
     async fn tokenize_counts_a_chat_prompt_as_the_prefill_builds_it() {
@@ -4743,12 +4751,18 @@ mod tests {
                 count(serde_json::json!({"messages": messages, "chat_template_kwargs": kwargs}))
                     .await;
             assert!(without_tools < counted, "{without_tools} without the tools");
-            let mut plain = body;
-            plain["add_special_tokens"] = serde_json::json!(false);
+            // The template's `<s>` is the BOS on that tokenizer, and the prefill reads it once.
             let posted = usize::from(posts_bos);
+            let bos = prefill.iter().take_while(|&&id| id == 256).count();
             assert_eq!(
-                count(plain).await,
-                prefill.len() - posted,
+                bos, posted,
+                "leading BOS ids, BOS post-processor: {posts_bos}"
+            );
+            let mut added = body;
+            added["add_special_tokens"] = serde_json::json!(true);
+            assert_eq!(
+                count(added).await,
+                prefill.len() + posted,
                 "the client's own flag"
             );
         }

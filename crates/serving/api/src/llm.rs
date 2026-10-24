@@ -597,6 +597,16 @@ impl LLM {
         }
     }
 
+    /// A rendered chat prompt's ids, as every chat path encodes one ([`Tokenizer::encode_chat`]).
+    ///
+    /// [`Tokenizer::encode_chat`]: crate::tokenizer::Tokenizer::encode_chat
+    fn tokenize_chat(&self, prompt: &str) -> Result<Vec<u32>> {
+        match &self.tokenizer {
+            Some(tok) => Ok(tok.encode_chat(prompt, &[])?.0),
+            None => self.tokenize_text(prompt),
+        }
+    }
+
     /// Resolve `max_tokens` to fit within `max_model_len - prompt_len`.
     fn resolve_max_tokens(&self, sp: &mut SamplingParams, num_prompt_tokens: usize) {
         let remaining = self.max_model_len.saturating_sub(num_prompt_tokens);
@@ -1061,7 +1071,8 @@ impl LLM {
             .apply(&msg_values, true, None)
             .map_err(|e| anyhow::anyhow!("chat template render failed: {e}"))?;
 
-        let mut results = self.generate(&[prompt.as_str()], params)?;
+        let prompt = Prompt::TokenIds(self.tokenize_chat(&prompt)?);
+        let mut results = self.generate(&[prompt], params)?;
         results
             .pop()
             .ok_or_else(|| anyhow::anyhow!("generate returned no results"))
@@ -1112,7 +1123,7 @@ impl LLM {
 
         // Tokenize the rendered prompt.
         let _t_tok = std::time::Instant::now();
-        let prompt_token_ids = self.tokenize_text(&prompt)?;
+        let prompt_token_ids = self.tokenize_chat(&prompt)?;
         let _d_tok = _t_tok.elapsed();
         let mut sp = params.clone();
         self.check_prompt_fits(prompt_token_ids.len())?;

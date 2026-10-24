@@ -186,7 +186,7 @@ fn tokenize_message(
             .push(TemplateMessage { role, content });
     }
     let rendered = template.apply_simple(&state.rendered_messages, false)?;
-    let all_ids = tokenizer.encode(&rendered, false)?;
+    let (all_ids, _) = tokenizer.encode_chat(&rendered, &[])?;
 
     // When consolidating, the previous rendering's template suffix (e.g.,
     // <|eot_id|> in Llama 3, <|im_end|>\n in ChatML) is still in
@@ -326,7 +326,7 @@ fn add_generation_prompt(
     // computes message deltas (full-string encoding, not isolated substring),
     // avoiding BPE boundary mismatches.
     let with = template.apply_simple(&messages, true)?;
-    let all_ids = tokenizer.encode(&with, false)?;
+    let (all_ids, _) = tokenizer.encode_chat(&with, &[])?;
     let new_ids = &all_ids[state.rendered_token_count..];
     if !new_ids.is_empty() {
         state.tokens.extend_from_slice(new_ids);
