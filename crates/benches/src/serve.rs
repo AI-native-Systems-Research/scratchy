@@ -340,13 +340,22 @@ fn chunk_failure(chunk: &serde_json::Value) -> Option<String> {
         .map(|r| format!("finish_reason {r}"))
 }
 
-/// Whether a streamed chunk carries generated text: `text` on the completions
-/// API, `delta.content` on chat. Keepalive and closing chunks carry none.
+/// The generated text a streamed chunk carries: `text` on the completions API;
+/// on chat, `delta.content`, or a reasoning model's thinking, which scratchy
+/// streams as `delta.reasoning` and vLLM as `delta.reasoning_content`. A
+/// thinking chunk is a generated token like any other, as vLLM's bench counts
+/// it. Keepalive and closing chunks carry none.
 fn chunk_text(chunk: &serde_json::Value) -> Option<&str> {
     let first = chunk["choices"].as_array()?.first()?;
-    [&first["text"], &first["delta"]["content"]]
-        .into_iter()
-        .find_map(|t| t.as_str().filter(|s| !s.is_empty()))
+    let delta = &first["delta"];
+    [
+        &first["text"],
+        &delta["content"],
+        &delta["reasoning"],
+        &delta["reasoning_content"],
+    ]
+    .into_iter()
+    .find_map(|t| t.as_str().filter(|s| !s.is_empty()))
 }
 
 /// A request whose whole multi-token output arrived in one `choices` chunk
@@ -1596,6 +1605,17 @@ mod tests {
         assert_eq!(
             chunk_text(&c(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)),
             Some("hi")
+        );
+        // A reasoning model's thinking, as scratchy and vLLM stream it, is generated text too.
+        assert_eq!(
+            chunk_text(&c(r#"{"choices":[{"delta":{"reasoning":"Hmm"}}]}"#)),
+            Some("Hmm")
+        );
+        assert_eq!(
+            chunk_text(&c(
+                r#"{"choices":[{"delta":{"content":null,"reasoning_content":"so"}}]}"#
+            )),
+            Some("so")
         );
         assert!(has_choices(&c(r#"{"choices":[{"text":""}]}"#)));
     }
