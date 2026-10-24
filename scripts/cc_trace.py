@@ -1588,8 +1588,8 @@ def pass_rate_stat(passes):
             "p90": round(max(p, min(1.0, centre + half)), 4), "samples": n}
 
 
-def run_session(task, workdir, corpus, endpoint, *, scr, model, served_model, engine_sha,
-                prompt, max_turns, timeout_s, env, log):
+def run_session(task, workdir, corpus, endpoint, *, engine, scr, model, served_model,
+                engine_sha, prompt, max_turns, timeout_s, env, log):
     """One live session: record it through an in-process relay, then grade it.
 
     Returns the session's record, with `void` set when it cannot be trusted.
@@ -1626,7 +1626,11 @@ def run_session(task, workdir, corpus, endpoint, *, scr, model, served_model, en
         void = "no /v1/messages turn reached the engine: the agent never talked to it"
     elif passed is None:
         void = f"the session could not be graded: {grader_said}"
-    elif served_before is not None and served_after is not None:
+    elif served_before is None or served_after is None:
+        if ENGINES[engine]["counts_requests"]:
+            void = (f"{info_url} reported requests_served {served_before} -> {served_after}, "
+                    "so nothing proves this engine served the session (#161 fairness rule 7)")
+    else:
         # Every request the relay forwarded is one the engine should have counted,
         # less the introspection routes it never counts.
         index = Path(corpus) / "index.jsonl"
@@ -1715,8 +1719,8 @@ def live(task, endpoint, *, engine, model, machine, rung, scratchy_sha, engine_p
         workdir = fresh_copy(task_dir, out_dir / f"session-{i}" / "workdir")
         results.append(run_session(
             {"grader": grader, "dir": task_dir, "commit": task_commit}, workdir,
-            out_dir / f"session-{i}" / "corpus", endpoint, scr=scr_path, model=model,
-            served_model=served_model, engine_sha=scratchy_sha, prompt=prompt,
+            out_dir / f"session-{i}" / "corpus", endpoint, engine=engine, scr=scr_path,
+            model=model, served_model=served_model, engine_sha=scratchy_sha, prompt=prompt,
             max_turns=max_turns, timeout_s=timeout_s, env=session_env, log=log))
         if i < sessions and cooldown_s:
             time.sleep(cooldown_s)

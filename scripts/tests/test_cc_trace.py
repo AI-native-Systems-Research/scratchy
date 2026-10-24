@@ -366,13 +366,14 @@ class FakeAnthropic(http.server.BaseHTTPRequestHandler):
     Class attributes steer it: `reply(body)` returns the stream (or an HTTP
     status to fail with), and `counting = False` leaves /v1/messages out of
     `requests_served` — what a replay that reached some other server looks like
-    from here.
+    from here. `has_counter = False` leaves `requests_served` off /server_info.
     """
 
     protocol_version = "HTTP/1.1"
     served = 0
     resets = 0
     counting = True
+    has_counter = True
     seen = []
     reply = staticmethod(lambda body: _stream())
 
@@ -392,8 +393,10 @@ class FakeAnthropic(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         cls = type(self)
         if self.path == "/server_info":
-            self._send(200, {"requests_served": cls.served,
-                             "system_env": {"vllm_version": "0.1.0"}})
+            info = {"system_env": {"vllm_version": "0.1.0"}}
+            if cls.has_counter:
+                info["requests_served"] = cls.served
+            self._send(200, info)
             return
         cls.served += 1
         if self.path == "/v1/models":
@@ -1100,6 +1103,7 @@ class LiveTest(unittest.TestCase):
         FakeAnthropic.served = 0
         FakeAnthropic.resets = 0
         FakeAnthropic.counting = True
+        self.addCleanup(setattr, FakeAnthropic, "has_counter", True)
         FakeAnthropic.seen = []
         self.engine = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeAnthropic)
         self.engine.daemon_threads = True
@@ -1309,8 +1313,8 @@ class LiveTest(unittest.TestCase):
         # What Claude Code looks like to `scr launch`: a child that keeps editing
         # the working copy after scr itself is gone.
         self.env["FAKE_FIX"] = TASK_BROKEN
-        self.env["FAKE_SHELL"] = ("(sleep 2; printf 'def add(a, b):\\n    return a + b\\n' > m.py) & "
-                                  "sleep 6")
+        self.env["FAKE_SHELL"] = ("(sleep 2; printf 'def add(a, b):\\n    return a + b\\n' "
+                                  "> m.py) & sleep 6")
         run, detail = self._live(sessions=1, timeout_s=1)
         s = detail["sessions"][0]
         self.assertTrue(s["timed_out"])
@@ -1350,6 +1354,13 @@ class LiveTest(unittest.TestCase):
         self._history(rejected, rejected + [_assistant(_tool("Edit", "u")), _result("u")])
         _, detail = self._live(sessions=1)
         self.assertEqual(detail["sessions"][0]["tool_call_failures"], 1)
+
+    def test_scratchy_with_no_counter_is_void(self):
+        FakeAnthropic.has_counter = False
+        run, _ = self._live(sessions=1)
+        self.assertEqual(run["status"], "void")
+        self.assertIn("fairness rule 7", run["void"])
+        self.assertEqual(run["measurements"], [])
 
     @unittest.skipUnless(VALIDATOR.exists() and BOARD.exists(),
                          "needs site/build_leaderboard.py and board.json (#176)")
