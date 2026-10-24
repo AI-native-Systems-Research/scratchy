@@ -42,7 +42,7 @@ use scratchy_core_common::engine_io::EmbeddingData;
 use scratchy_core_common::multimodal::{ImageData, MultimodalData};
 use scratchy_core_common::sampling::GuidedGrammar;
 use scratchy_core_common::{
-    EngineCoreOutput, EngineCoreRequest, FinishReason, SamplingParams, StopReason,
+    EngineCoreOutput, EngineCoreRequest, FinishReason, SamplingParams, SamplingType, StopReason,
 };
 use scratchy_serving_engine::core_client::EngineCoreClient;
 use scratchy_serving_engine::engine_core::StepOutcome;
@@ -66,10 +66,18 @@ use crate::tool_parser::{
 /// directly — an attacker-controlled allocation size (CWE-789).
 const MAX_N: u32 = 128;
 
-fn validate_n(n: u32) -> ServeResult<usize> {
+fn validate_n(n: u32, params: &SamplingParams) -> ServeResult<usize> {
     if n > MAX_N {
         return Err(ServeError::Validation(format!(
             "n={n} exceeds the maximum of {MAX_N}"
+        )));
+    }
+    // Greedy sampling gives every choice the same tokens, so vLLM refuses `n > 1` there
+    // (`SamplingParams._verify_greedy_sampling`); `params` carries the temperature the request
+    // samples at, generation defaults applied.
+    if n > 1 && params.sampling_type() == SamplingType::Greedy {
+        return Err(ServeError::Validation(format!(
+            "n must be 1 when using greedy sampling, got {n}."
         )));
     }
     Ok(n.max(1) as usize)
@@ -811,9 +819,8 @@ impl AsyncEngine {
             .model
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
-        let n = validate_n(request.n)?;
-
         let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
+        let n = validate_n(request.n, &sampling_params)?;
 
         // Tokenize prompt once.
         let ec_request = self.chat_to_engine_request(&base_id, &request, &mut sampling_params)?;
@@ -1127,9 +1134,8 @@ impl AsyncEngine {
             .model
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
-        let n = validate_n(request.n)?;
-
         let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
+        let n = validate_n(request.n, &sampling_params)?;
         let ec_request = self.chat_to_engine_request(&base_id, &request, &mut sampling_params)?;
         let prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
 
@@ -1253,9 +1259,8 @@ impl AsyncEngine {
             .model
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
-        let n = validate_n(request.n)?;
-
         let sampling_params = self.build_sampling_params_from_completion(&request)?;
+        let n = validate_n(request.n, &sampling_params)?;
 
         // Normalize prompt to Vec<Vec<u32>>.
         let mut prompts = self.tokenize_completion_prompts(&request)?;
@@ -1445,9 +1450,8 @@ impl AsyncEngine {
             .model
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
-        let n = validate_n(request.n)?;
-
         let sampling_params = self.build_sampling_params_from_completion(&request)?;
+        let n = validate_n(request.n, &sampling_params)?;
 
         // Normalize prompt to Vec<Vec<u32>>.
         let mut prompts = self.tokenize_completion_prompts(&request)?;
@@ -5311,6 +5315,75 @@ mod tests {
         assert_eq!(response.usage.prompt_tokens, 3);
         // completion_tokens summed across all 3.
         assert!(response.usage.completion_tokens.unwrap_or(0) > 0);
+    }
+
+    /// `n > 1` under greedy sampling is a 400, as vLLM refuses it ("n must be 1 when using greedy
+    /// sampling"), on the chat and the completion path, streamed or not. The temperature that
+    /// decides it is the one the request samples at: a request with none takes the model's
+    /// generation default. A sampled `n > 1`, and a greedy `n: 1`, are served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn greedy_n_above_one_is_a_400_on_chat_and_completion() {
+        let mut engine = make_test_engine();
+        let greedy_n3 = |err: Option<ServeError>| {
+            assert!(
+                matches!(
+                    err,
+                    Some(ServeError::Validation(ref msg))
+                        if msg == "n must be 1 when using greedy sampling, got 3."
+                ),
+                "{err:?}"
+            );
+        };
+        let chat = protocol::ChatCompletionRequest {
+            n: 3,
+            temperature: Some(0.0),
+            ..make_chat_request()
+        };
+        greedy_n3(engine.chat_completion(chat.clone()).await.err());
+        let stream = protocol::ChatCompletionRequest {
+            stream: true,
+            ..chat
+        };
+        greedy_n3(engine.chat_completion_stream(stream).await.err());
+        let completion = protocol::CompletionRequest {
+            n: 3,
+            temperature: Some(0.0),
+            ..make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1, 2, 3])))
+        };
+        greedy_n3(engine.completion(completion.clone()).await.err());
+        let stream = protocol::CompletionRequest {
+            stream: true,
+            ..completion
+        };
+        greedy_n3(engine.completion_stream(stream).await.err());
+
+        // No temperature in the request: the generation default decides.
+        let defaulted = protocol::CompletionRequest {
+            n: 3,
+            ..make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1, 2, 3])))
+        };
+        let greedy_default = scratchy_core_common::sampling::GenerationDefaults {
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+        engine.set_generation_defaults(greedy_default);
+        greedy_n3(engine.completion(defaulted.clone()).await.err());
+
+        // Sampled, three choices are served; greedy, one is.
+        engine.set_generation_defaults(Default::default());
+        let engine = Arc::new(engine);
+        engine.spawn_step_loop();
+        let sampled = engine.completion(defaulted.clone()).await.unwrap();
+        assert_eq!(sampled.choices.len(), 3);
+        let greedy_one = protocol::CompletionRequest {
+            n: 1,
+            temperature: Some(0.0),
+            ..defaulted
+        };
+        assert_eq!(
+            engine.completion(greedy_one).await.unwrap().choices.len(),
+            1
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
