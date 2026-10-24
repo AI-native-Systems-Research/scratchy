@@ -375,6 +375,26 @@ impl SamplingParams {
         !penalty_free
     }
 
+    /// Whether which tokens a step may sample depends on the tokens before it: a bad word of
+    /// more than one token bans its last only after the rest ([`Self::banned_after`]). The host
+    /// reads those tokens to build the ban, so such a request's steps are neither deferred nor
+    /// pipelined, leaving their tokens on the device.
+    pub fn bans_after_tokens(&self) -> bool {
+        (self.bad_words_token_ids.iter().flatten()).any(|word| word.len() > 1)
+    }
+
+    /// The tokens the next sampled token must not be, after `generated` (the tokens the request
+    /// has generated so far): the last token of each bad word whose other tokens end `generated`
+    /// — a one-token bad word always. vLLM's `bad_words`, read against the generated tokens alone.
+    pub fn banned_after(&self, generated: &[u32]) -> Vec<u32> {
+        (self.bad_words_token_ids.iter().flatten())
+            .filter_map(|word| {
+                let (&last, prefix) = word.split_last()?;
+                generated.ends_with(prefix).then_some(last)
+            })
+            .collect()
+    }
+
     /// Validate the sampling parameters, returning an error message on failure.
     ///
     /// This mirrors the `_verify_args` logic from the Python implementation.
@@ -509,6 +529,40 @@ pub struct LogprobsOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bad word bans its last token where its other tokens end what the request has generated;
+    /// a one-token bad word bans its token everywhere, an empty one nothing.
+    #[test]
+    fn a_bad_word_bans_its_last_token_after_the_rest() {
+        let params = SamplingParams {
+            bad_words_token_ids: Some(vec![vec![101, 100], vec![7], vec![]]),
+            ..Default::default()
+        };
+        assert_eq!(params.banned_after(&[]), [7], "no prefix generated yet");
+        assert_eq!(params.banned_after(&[5, 101]), [100, 7], "after the prefix");
+        assert_eq!(
+            params.banned_after(&[101, 5]),
+            [7],
+            "the prefix is not last"
+        );
+        assert!(SamplingParams::default().banned_after(&[101]).is_empty());
+        assert!(
+            params.bans_after_tokens(),
+            "a two-token bad word waits on the token before"
+        );
+        assert!(
+            !params.reads_history(),
+            "a ban is no penalty: the sampler reads no history"
+        );
+        let one_token = SamplingParams {
+            bad_words_token_ids: Some(vec![vec![7]]),
+            ..Default::default()
+        };
+        assert!(
+            !one_token.bans_after_tokens(),
+            "a one-token bad word bans everywhere"
+        );
+    }
 
     /// A prompt opens thinking where its last `<think>` has no `</think>` after it, and closes it
     /// where it ends with a closed think block (whitespace alone after the close). An earlier

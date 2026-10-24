@@ -637,8 +637,8 @@ impl EngineCore {
     /// beside its own; leading, when the executor pipelines and `sched` is one request that
     /// verifies drafts and drafts again, with nothing waiting: its next step's drafts are then
     /// placeholders, so that step can be scheduled now. A request whose steps need the host between
-    /// them — a grammar's state, an image's — leads nothing; the executor defers every step this
-    /// marks.
+    /// them — a grammar's state, an image's, a bad word banned after the tokens before it — leads
+    /// nothing; the executor defers every step this marks.
     fn mark_pipeline(&mut self, sched: &mut SchedulerOutput) {
         let mut ids = sched.num_scheduled_tokens.iter();
         let (Some((req_id, &scheduled)), None) = (ids.next(), ids.next()) else {
@@ -652,8 +652,9 @@ impl EngineCore {
         let (Some(drafts), true) = (self.head_drafts, self.pipelines_speculative) else {
             return;
         };
-        let on_device =
-            request.sampling_params.guided_grammar.is_none() && request.mm_data.is_none();
+        let on_device = request.sampling_params.guided_grammar.is_none()
+            && request.mm_data.is_none()
+            && !request.sampling_params.bans_after_tokens();
         if on_device
             && sched.draft_req_ids.contains(req_id)
             && sched.scheduled_spec_decode_tokens.contains_key(req_id)
@@ -2045,13 +2046,18 @@ mod tests {
         assert!(!next.spec_pipeline.leads, "two requests lead nothing");
 
         // A sampled request leads as a greedy one does; one whose steps need the host between
-        // them — its grammar's state, its image's — leads nothing.
+        // them — its grammar's state, its image's, the ban of a bad word's last token after the
+        // rest — leads nothing. A one-token bad word bans the same token every step: it leads.
         let sampled = SamplingParams {
             temperature: 0.8,
             ..greedy.clone()
         };
         let grammar = SamplingParams {
             guided_grammar: Some(scratchy_core_common::sampling::GuidedGrammar::Json),
+            ..greedy.clone()
+        };
+        let bad_words = |words: Vec<Vec<u32>>| SamplingParams {
+            bad_words_token_ids: Some(words),
             ..greedy.clone()
         };
         let mut image = request("a", &greedy);
@@ -2063,6 +2069,16 @@ mod tests {
             ("sampled", request("a", &sampled), true),
             ("grammar", request("a", &grammar), false),
             ("image", image, false),
+            (
+                "bad word after a token",
+                request("a", &bad_words(vec![vec![101, 100]])),
+                false,
+            ),
+            (
+                "one-token bad word",
+                request("a", &bad_words(vec![vec![7]])),
+                true,
+            ),
         ];
         for (name, a, leads) in cases {
             let mut engine = EngineCore::new(config(), pipelining());

@@ -2066,11 +2066,16 @@ impl MetalWorker {
     /// Whether this step can be committed without waiting for it: its rows
     /// pick their tokens on the GPU from the logits alone, so nothing on the
     /// host needs its tokens before the next step is queued. Penalties (the
-    /// token history), grammar, speculative decoding, pooling, multimodal
-    /// input, a draft model and live sampler telemetry all do.
+    /// token history), grammar, a bad word banned after the tokens before it,
+    /// speculative decoding, pooling, multimodal input, a draft model and live
+    /// sampler telemetry all do.
     fn deferrable(&self, sched: &SchedulerOutput) -> bool {
         #[cfg(feature = "guided-decoding")]
-        let constrained = |req_id: &String| self.grammar_states.contains_key(req_id);
+        let constrained = |req_id: &String| {
+            self.grammar_states.contains_key(req_id)
+                || (self.sampling_params_map.get(req_id))
+                    .is_some_and(SamplingParams::bans_after_tokens)
+        };
         #[cfg(not(feature = "guided-decoding"))]
         let constrained = |_: &String| false;
         #[cfg(feature = "sampler-telemetry")]
@@ -7025,10 +7030,22 @@ impl Worker for MetalWorker {
         // is constrained. Speculative-verify rows are excluded: grammar needs
         // a host `advance()` between every token, which the K-row verify can't
         // provide, so a grammar request must not also carry spec drafts.
+        //
+        // ⭐ A BAD WORD'S BAN RIDES THE SAME MASK (#429): a request whose bad word's other tokens
+        // end what it has generated may not sample that word's last token. Its row's bitset is
+        // every token but those (or the grammar's allow-set without them). The ban needs the
+        // tokens before it on the host, so such a request's steps are never deferred
+        // (`deferrable`) nor pipelined (the engine's `mark_pipeline`). A verify step's row `r`
+        // reads its drafts before `r` after the generated tokens, so each row has a ban of its
+        // own; a grammar still leaves verify rows unmasked.
         #[cfg(feature = "guided-decoding")]
         {
             self.grammar_pending = None;
-            if !self.grammar_states.is_empty() {
+            let bans = |req_id: &String| {
+                (self.sampling_params_map.get(req_id))
+                    .is_some_and(|p| p.bad_words_token_ids.is_some())
+            };
+            if !self.grammar_states.is_empty() || req_ids_in_order.iter().any(bans) {
                 let vocab = self.model.as_deref().map(|m| m.vocab_size()).unwrap_or(0) as u32;
                 if vocab > 0 {
                     let mut rows: Vec<u32> = Vec::new();
@@ -7039,15 +7056,42 @@ impl Worker for MetalWorker {
                             continue;
                         }
                         // Speculative verify batch → unsupported with grammar.
-                        if !prepared.req_inputs[i].spec_token_ids.is_empty() {
+                        let drafts = &prepared.req_inputs[i].spec_token_ids;
+                        if !drafts.is_empty() {
+                            let Some(params) = self.sampling_params_map.get(req_id.as_str()) else {
+                                continue;
+                            };
+                            let generated = self.input_batch.history(req_id).1;
+                            for (r, row) in sampled_rows.of_seq(i).enumerate() {
+                                let before = [generated, &drafts[..r]].concat();
+                                let banned = params.banned_after(&before);
+                                if banned.is_empty() {
+                                    continue;
+                                }
+                                let allowed: Vec<u32> =
+                                    (0..vocab).filter(|t| !banned.contains(t)).collect();
+                                rows.push(row as u32);
+                                scratchy_target_metal::grammar_mask::push_allow_bitset_row(
+                                    &mut allow_bits,
+                                    &allowed,
+                                    vocab,
+                                );
+                            }
                             continue;
                         }
-                        let Some(guide) = self.grammar_states.get_mut(req_id) else {
-                            continue;
-                        };
-                        // `None` => grammar terminated; leave the row unmasked.
-                        let Some(allowed) = guide.allowed_tokens() else {
-                            continue;
+                        let banned = (self.sampling_params_map.get(req_id.as_str()))
+                            .map(|p| p.banned_after(self.input_batch.history(req_id).1))
+                            .unwrap_or_default();
+                        // `None` => no grammar, or a terminated one: every token is allowed.
+                        let allowed = (self.grammar_states.get_mut(req_id))
+                            .and_then(|guide| guide.allowed_tokens());
+                        let allowed = match (allowed, banned.is_empty()) {
+                            (None, true) => continue,
+                            (Some(allowed), true) => allowed,
+                            (allowed, false) => (allowed.unwrap_or_else(|| (0..vocab).collect()))
+                                .into_iter()
+                                .filter(|t| !banned.contains(t))
+                                .collect(),
                         };
                         rows.push(sampled_rows.last_of(i) as u32);
                         scratchy_target_metal::grammar_mask::push_allow_bitset_row(
