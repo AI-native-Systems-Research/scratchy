@@ -3582,12 +3582,46 @@ impl AsyncEngine {
             skip_special_tokens: request.skip_special_tokens && !keep_special_tokens,
             logprobs,
             prompt_logprobs: request.prompt_logprobs.map(|n| n as i32),
-            logit_bias: parse_logit_bias(&request.logit_bias),
+            logit_bias: self.logit_bias(&request.logit_bias)?,
             guided_grammar,
             allowed_token_ids: request.allowed_token_ids.clone(),
             bad_words_token_ids,
             ..Default::default()
         })
+    }
+
+    /// A request's `logit_bias` (OpenAI's string token-id keys) keyed by token id. A key that is
+    /// not a token id, or names one outside the vocabulary, is a 400, as vLLM refuses both (its
+    /// `int(token)` and `_validate_logit_bias`), rather than a bias silently dropped.
+    fn logit_bias(
+        &self,
+        api_bias: &Option<HashMap<String, f64>>,
+    ) -> ServeResult<Option<HashMap<u32, f32>>> {
+        let Some(bias) = api_bias.as_ref().filter(|b| !b.is_empty()) else {
+            return Ok(None);
+        };
+        let parsed = (bias.iter())
+            .map(|(key, &value)| match key.parse::<u32>() {
+                Ok(id) => Ok((id, value as f32)),
+                Err(_) => Err(ServeError::Validation(format!(
+                    "logit_bias key {key:?} is not a token id"
+                ))),
+            })
+            .collect::<ServeResult<HashMap<u32, f32>>>()?;
+        if let Some(tokenizer) = &self.tokenizer {
+            let vocab = tokenizer.vocab_size();
+            let mut outside: Vec<u32> = (parsed.keys().copied())
+                .filter(|&id| id as usize >= vocab)
+                .collect();
+            if !outside.is_empty() {
+                outside.sort_unstable();
+                return Err(ServeError::Validation(format!(
+                    "token_id(s) {outside:?} in logit_bias contain out-of-vocab token ids. \
+                     Vocabulary size: {vocab}"
+                )));
+            }
+        }
+        Ok(Some(parsed))
     }
 
     /// Build SamplingParams from a completion request.
@@ -3632,7 +3666,7 @@ impl AsyncEngine {
             skip_special_tokens: request.skip_special_tokens,
             logprobs,
             prompt_logprobs: request.prompt_logprobs.map(|n| n as i32),
-            logit_bias: parse_logit_bias(&request.logit_bias),
+            logit_bias: self.logit_bias(&request.logit_bias)?,
             guided_grammar,
             allowed_token_ids: request.allowed_token_ids.clone(),
             bad_words_token_ids,
@@ -3868,10 +3902,6 @@ async fn route_step_outputs(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Convert API-style logit_bias (string keys, f64 values) to sampler format.
-///
-/// OpenAI API uses string token IDs as keys; we parse them to u32.
-/// Invalid keys are silently ignored.
 /// Truncate prompt token IDs from the left, keeping the last N tokens.
 ///
 /// `truncate` values: `None` → no-op, `Some(-1)` → no-op (model max),
@@ -3894,24 +3924,6 @@ fn truncate_prompt(tokens: &mut Vec<u32>, truncate: Option<i64>) -> ServeResult<
         tokens.drain(..start);
     }
     Ok(())
-}
-
-fn parse_logit_bias(
-    api_bias: &Option<std::collections::HashMap<String, f64>>,
-) -> Option<std::collections::HashMap<u32, f32>> {
-    let bias = api_bias.as_ref()?;
-    if bias.is_empty() {
-        return None;
-    }
-    let parsed: std::collections::HashMap<u32, f32> = bias
-        .iter()
-        .filter_map(|(k, &v)| k.parse::<u32>().ok().map(|tid| (tid, v as f32)))
-        .collect();
-    if parsed.is_empty() {
-        None
-    } else {
-        Some(parsed)
-    }
 }
 
 /// Parse `response_format` from an API request into a `GuidedGrammar`.
@@ -5880,6 +5892,57 @@ mod tests {
             auto_parser.is_none(),
             "otherwise the engine's own: none here"
         );
+    }
+
+    /// A `logit_bias` key naming a token outside the vocabulary is a 400 naming it, in vLLM's
+    /// words, on the chat and the completion path; so is a key that is not a token id. A bias on
+    /// a token in the vocabulary is kept, as its id.
+    #[test]
+    fn a_logit_bias_outside_the_vocabulary_is_refused() {
+        let engine = make_test_engine_with_tokenizer();
+        let vocab = engine.tokenizer.as_ref().unwrap().vocab_size();
+        let bias = |keys: &[String]| Some(keys.iter().map(|k| (k.clone(), 2.0)).collect());
+        // The chat path's params (`chat`), or the completion path's.
+        let params = |chat: bool, keys: &[String]| {
+            if chat {
+                let request = protocol::ChatCompletionRequest {
+                    logit_bias: bias(keys),
+                    ..make_chat_request()
+                };
+                engine.build_sampling_params_from_chat(&request)
+            } else {
+                let request = protocol::CompletionRequest {
+                    logit_bias: bias(keys),
+                    ..make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1])))
+                };
+                engine.build_sampling_params_from_completion(&request)
+            }
+        };
+        for chat in [true, false] {
+            let build = |keys: &[String]| params(chat, keys);
+            let kept = build(&["5".to_string()]).unwrap().logit_bias;
+            assert_eq!(kept, Some(HashMap::from([(5, 2.0)])));
+
+            let outside = [vocab.to_string(), "5".to_string(), (vocab + 7).to_string()];
+            let err = build(&outside).err();
+            let want = format!(
+                "token_id(s) [{vocab}, {}] in logit_bias contain out-of-vocab token ids. \
+                 Vocabulary size: {vocab}",
+                vocab + 7
+            );
+            assert!(
+                matches!(err, Some(ServeError::Validation(ref msg)) if *msg == want),
+                "{err:?}"
+            );
+
+            for key in ["abc", "-5"] {
+                let err = build(&[key.to_string()]).err();
+                assert!(
+                    matches!(err, Some(ServeError::Validation(ref msg)) if msg.contains(key)),
+                    "{key}: {err:?}"
+                );
+            }
+        }
     }
 
     /// A forced tool `tools` doesn't declare (a misspelled or empty name), and `"required"` with
