@@ -122,19 +122,35 @@ pub async fn run_batch_from_config(
             .set_default_chat_template_kwargs(kwargs);
     }
 
-    // 3. Spawn the engine step loop.
-    let _step_handle = stack.engine.spawn_step_loop();
+    // 3. Spawn the engine step loop, holding its first step until every request is in.
+    let (open, gate) = tokio::sync::oneshot::channel::<()>();
+    let _step_handle = stack.engine.spawn_step_loop_after(async {
+        let _ = gate.await;
+    });
 
-    // 4. Process all requests concurrently.
+    // 4. Submit every request in input order, then let the loop step. Each request waits for its
+    //    reply concurrently. Started while the requests were still arriving, the loop's first steps
+    //    took whichever had been tokenized by then, so the batches, and with them greedy replies,
+    //    differed run to run (#840). An offline vLLM batch adds every request before its first step.
     let engine = stack.engine.clone();
     let mut handles = Vec::with_capacity(num_requests);
 
     for req_input in requests {
-        let engine = engine.clone();
-        handles.push(tokio::spawn(async move {
-            process_single_request(&engine, req_input).await
-        }));
+        let generates = generates(&req_input);
+        let before = engine.calls_submitted();
+        let task_engine = engine.clone();
+        let handle =
+            tokio::spawn(async move { process_single_request(&task_engine, req_input).await });
+        // A chat or completion line is in once its call has handed the step loop every request
+        // it makes, or has returned (refused). Nothing before that point waits on the gated loop,
+        // so the wait ends. An embedding line takes its own channel, which the loop drains once
+        // it runs: it doesn't wait.
+        while generates && !handle.is_finished() && engine.calls_submitted() == before {
+            tokio::task::yield_now().await;
+        }
+        handles.push(handle);
     }
+    let _ = open.send(());
 
     // 5. Collect results.
     let mut outputs = Vec::with_capacity(num_requests);
@@ -257,6 +273,15 @@ async fn process_single_request(
             })),
         },
     }
+}
+
+/// Whether a batch line generates through the step loop's request channel: a chat or completion,
+/// not an embedding.
+fn generates(input: &BatchRequestInput) -> bool {
+    matches!(
+        input.url.as_str(),
+        "/v1/chat/completions" | "/v1/completions"
+    )
 }
 
 /// Dispatch a request to the appropriate engine method based on the URL.
