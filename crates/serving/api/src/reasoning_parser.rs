@@ -117,6 +117,12 @@ pub trait ReasoningParser: Send + Sync {
     /// (`<think>` and `</think>`): a request's guided grammar waits for the close (#793). `None`
     /// for a parser that reads its markers as text, so the grammar applies from the first token.
     fn think_tokens(&self) -> Option<ThinkTokens>;
+
+    /// Token sequences a reply must never generate, as text: the request bans each one's last
+    /// token right after the rest (`SamplingParams::bad_words_token_ids`). None by default.
+    fn bad_words(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// Per-request state for streaming reasoning extraction.
@@ -776,6 +782,21 @@ impl ReasoningParser for Gemma4ReasoningParser {
 
     fn requires_special_tokens(&self) -> bool {
         true
+    }
+
+    /// ⭐ NO CHANNEL OPENS RIGHT AFTER ONE CLOSES (#429). After a long tool result the model
+    /// falls into writing empty thought channels back to back — `<|channel>thought\n<channel|>`
+    /// and again — and each one it writes makes the next likelier: measured on gemma-4-12b-it
+    /// after Claude Code's first Read, the next token after one empty channel re-opens 33% of the
+    /// time, after two 62%, after three 100%. One such reply ran 26,650 tokens to the end of the
+    /// window. A real reply never opens a channel the moment one closes (it answers, calls a
+    /// tool or ends the turn), so banning that one token pair ends the loop where it starts and
+    /// leaves every reply that does not loop as it was. ollama, running the same MLX 4-bit
+    /// weights on the same prompts, loops too (5 replies in 8 after 40 lines of tool result, 8 in
+    /// 8 after 80), and the prompt is the template's own, so the loop is the model's: a sampler
+    /// ban, not a template or parser change, is what ends it.
+    fn bad_words(&self) -> &'static [&'static str] {
+        &["<channel|><|channel>"]
     }
 }
 
