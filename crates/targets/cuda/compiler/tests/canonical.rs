@@ -53,6 +53,7 @@ const FACTS: CudaModelFacts = CudaModelFacts {
     gdn: None,
     embed: None,
     shared_expert: SharedExpertOwner::Undeclared,
+    classes: None,
 };
 
 fn fixtures() -> Vec<(&'static str, LoweringInput)> {
@@ -220,6 +221,7 @@ fn a_rope_on_the_hidden_with_the_global_table_lowers_to_one_rope() {
         gdn: None,
         embed: None,
         shared_expert: SharedExpertOwner::Undeclared,
+        classes: None,
     };
     let c = lower_canonical(&l, facts, AT).expect("the rope lowers");
     let [CudaStep::Rope(rope)] = c.steps.as_slice() else {
@@ -721,6 +723,7 @@ fn a_fold_whose_absorbed_step_is_not_on_the_tape_is_refused() {
         tokens: Some(256),
         offsets: Err(ArenaRefusal::TooLarge),
         rotary: None,
+        rotary_local: None,
         kv: Ok(None),
         kv_regions: None,
         gdn_layers: &[],
@@ -878,6 +881,7 @@ fn lower_second_add(
         tokens: Some(256),
         offsets: Ok(&[0, 1048576, 2097152]),
         rotary: None,
+        rotary_local: None,
         kv: Ok(None),
         kv_regions: None,
         gdn_layers: &[],

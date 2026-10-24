@@ -2155,6 +2155,7 @@ fn a_gdn_op_is_checked_against_the_scratchs_geometry_not_its_bytes() {
             tokens: Some(256),
             offsets: Ok(&c.colour_offsets),
             rotary: None,
+            rotary_local: None,
             kv: Ok(None),
             kv_regions: None,
             gdn_layers: &[0],

@@ -28,6 +28,7 @@ pub const QWEN3_5_FACTS: CudaModelFacts = CudaModelFacts {
     gdn: None,
     embed: None,
     shared_expert: SharedExpertOwner::Undeclared,
+    classes: None,
 };
 
 /// [`QWEN3_5_FACTS`] with qwen3.5-0.8b's linear attention: 16 key heads of 128, a 4-tap conv,

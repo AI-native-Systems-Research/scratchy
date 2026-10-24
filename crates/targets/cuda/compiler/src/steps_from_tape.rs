@@ -9,6 +9,8 @@
 //! (E0004) as it does in the colour rule. Each opcode issue moves exactly one variant out of the
 //! refusing arm into an arm of its own.
 
+use std::num::NonZeroU32;
+
 use scratchy_subtile::handoff::{SourceBinding, UnrollIndex};
 use scratchy_subtile::lower::{ExpertWeight, GemmWeight};
 use scratchy_subtile::model_geometry::ModelAttnGeometry;
@@ -22,26 +24,26 @@ use scratchy_subtile::tape_colouring::{Colour, TapeColouring};
 use scratchy_subtile::tape_folding::{FusedShape, Fusion};
 use scratchy_target_cuda::op_abi::{CUDA_GROUPED_EXPERTS, CudaFusion};
 use scratchy_target_cuda::step::{
-    ADD_BF16_COLS, ATTN_DECODE_BF16_HEAD_DIM, ATTN_DECODE_BF16_MAX_GROUP,
-    ATTN_PREFILL_BF16_HEAD_DIM, ATTN_PREFILL_BF16_ROWS, AddBf16, AttnPrefillBf16, CudaStep,
-    EMBED_BF16_COLS, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16,
-    ExpertProjection, ExpertSortBf16, GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS,
-    GATE_SPLIT_BF16_HEAD_DIM, GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
-    GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_NARROW_BF16_MAX_N,
-    GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16,
-    GateScaleBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_EXPERTS,
-    MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, PairRows, RMS_NORM_BF16_COLS,
-    ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16,
-    RopeBf16, RopePairing, RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS,
-    SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
+    ADD_BF16_COLS, ATTN_BF16_HEAD_DIMS, ATTN_DECODE_BF16_MAX_GROUP, ATTN_PREFILL_BF16_ROWS,
+    ATTN_WINDOW_MULTIPLE, AddBf16, AttnPrefillBf16, CudaStep, EMBED_BF16_COLS, EmbedBf16,
+    ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16,
+    GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS, GATE_SPLIT_BF16_HEAD_DIM,
+    GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX,
+    GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE,
+    GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16, GateScaleBf16, GateSplitBf16,
+    GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_EXPERTS, MOE_ROUTE_MAX_TOP_K,
+    MatmulKernel, MoeRouteBf16, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE,
+    ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
+    RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16,
+    SiluMulBf16, SoftCapBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
 use crate::canonical::{
-    ArenaRefusal, AttnShapeRule, CanonicalRefusal, CudaModelFacts, EmbedShapeRule, GateShapeRule,
-    GdnRegions, GdnShapeRule, GdnWidths, GemmShapeRule, KvCacheRefusal, KvPool, KvRegions,
-    MoeShapeRule, OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule, SharedExpertOwner,
-    ViewRefusal,
+    ArenaRefusal, AttnShapeRule, CanonicalRefusal, CudaAttnClass, CudaModelFacts, EmbedShapeRule,
+    GateShapeRule, GdnRegions, GdnShapeRule, GdnWidths, GemmShapeRule, KvCacheRefusal, KvPool,
+    KvRegions, MoeShapeRule, OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule,
+    SharedExpertOwner, ViewRefusal,
 };
 
 /// What a step's lowering reads besides the step itself: the planned canonical, the model facts,
@@ -58,6 +60,8 @@ pub struct StepCx<'a> {
     pub offsets: Result<&'a [u64], ArenaRefusal>,
     /// The rotary table's offset, when the arena has one.
     pub rotary: Option<ArenaOffset>,
+    /// The local rotary table's offset (a two-class model's base class), when the arena has one.
+    pub rotary_local: Option<ArenaOffset>,
     /// The KV pool the `PrefixK` / `PrefixV` sources describe (`None` when there are none), or
     /// why they cannot be one.
     pub kv: Result<Option<&'a KvPool>, KvCacheRefusal>,
@@ -457,15 +461,17 @@ fn view(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<(), CanonicalRefusal> {
 }
 
 /// `RopeRotate { head_dim }` as the bf16 partial rope: `x` (operand 0) a computed slot or the
-/// embedded hidden; operands 1 and 2 the global rotary `cos` and `sin`, which CUDA does not upload
-/// as sources but reads as the tape's one rotary table. The rotated width is the model's
-/// (`CudaModelFacts::rot_dim`); the op carries only `head_dim`.
+/// embedded hidden; operands 1 and 2 a rotary `cos` and `sin`, which CUDA does not upload as
+/// sources but reads as the tape's rotary table of their class. The rotated width and the pairing
+/// are that class's (`CudaModelFacts::table_class`); the op carries only `head_dim`.
 fn rope(cx: &StepCx<'_>, s: &TapeStep<'_>, head_dim: u32) -> Result<RopeBf16, CanonicalRefusal> {
     let (step, node) = (s.step, s.node);
-    let rot_dim = cx.facts.rot_dim;
     let [x, ..] = node.inputs.as_slice() else {
         return Err(operand(s, 0, OperandRefusal::Missing));
     };
+    let class = cx.facts.table_class(table_is_local(cx, s));
+    let class = class.expect("the global table's class is every model's");
+    let rot_dim = class.rot_dim;
     let TensorShape { rows, cols } = cx.graph.shape(node.output.tensor);
     rope_shape(rows, cols, head_dim, rot_dim, cx.tokens).map_err(|rule| {
         CanonicalRefusal::RopeShape {
@@ -481,7 +487,7 @@ fn rope(cx: &StepCx<'_>, s: &TapeStep<'_>, head_dim: u32) -> Result<RopeBf16, Ca
     same_shape(cx, s, 0, x, rows, cols)?;
     whole_tensors(cx, s, &[(0, x)])?;
     let xc = activation(cx, s, 0, s.inputs.iter().next())?;
-    let table = rotary_table(cx, s)?;
+    let table = rotary_table(cx, s, table_is_local(cx, s))?;
     let at = arena(cx)?;
     Ok(RopeBf16 {
         x: at(xc),
@@ -491,19 +497,46 @@ fn rope(cx: &StepCx<'_>, s: &TapeStep<'_>, head_dim: u32) -> Result<RopeBf16, Ca
         cols,
         head_dim,
         rot_dim,
-        pairing: RopePairing::HalfRotated,
+        pairing: class.pairing,
     })
 }
 
-/// Operands 1 and 2 of a rope (`RopeRotate` or `RopeAppend`): the global rotary `cos` and
-/// `sin`, which CUDA does not upload as sources but reads as the tape's one rotary table. Its
-/// offset.
-fn rotary_table(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<ArenaOffset, CanonicalRefusal> {
+/// Whether a rope's operand 1 is the local rotary `cos` of a model that has a local table (a
+/// two-class model's base class). Any other operand 1 reads as the global table's, which
+/// [`rotary_table`] then checks.
+fn table_is_local(cx: &StepCx<'_>, s: &TapeStep<'_>) -> bool {
+    let local = match s.inputs.iter().nth(1) {
+        Some(ComputeInput::External { tensor, .. }) => {
+            cx.bindings[tensor.index()] == SourceBinding::Cos { local: true }
+        }
+        _ => false,
+    };
+    local && cx.facts.table_class(true).is_some()
+}
+
+/// The attention class whose window is `mask`'s, and whether it reads the local rotary table:
+/// a layer's class is its attention ops' own fact. A uniform model's one class has no window.
+fn attn_class(cx: &StepCx<'_>, mask: AttnMask) -> Option<(CudaAttnClass, bool)> {
+    let window = mask.window().map(NonZeroU32::get);
+    [true, false]
+        .into_iter()
+        .filter_map(|local| cx.facts.table_class(local).map(|c| (c, local)))
+        .find(|(c, _)| c.window == window)
+}
+
+/// Operands 1 and 2 of a rope (`RopeRotate` or `RopeAppend`): the rotary `cos` and `sin` of the
+/// `local` or the global table, which CUDA does not upload as sources but reads as the tape's
+/// rotary table of that class. Its offset.
+fn rotary_table(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    local: bool,
+) -> Result<ArenaOffset, CanonicalRefusal> {
     let (step, op) = (s.step, s.node.op.name());
     let mut inputs = s.inputs.iter().skip(1);
     for (k, want) in [
-        (1, SourceBinding::Cos { local: false }),
-        (2, SourceBinding::Sin { local: false }),
+        (1, SourceBinding::Cos { local }),
+        (2, SourceBinding::Sin { local }),
     ] {
         let binding = match inputs.next() {
             Some(ComputeInput::External { tensor, .. }) => {
@@ -521,10 +554,14 @@ fn rotary_table(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<ArenaOffset, Canoni
             });
         }
     }
-    // Operand 1 is the global `cos`, so the arena placed the table, unless the arena has no
+    // Operand 1 is the table's `cos`, so the arena placed the table, unless the arena has no
     // layout at all (refused below, by the caller's `arena`).
+    let table = match local {
+        true => cx.rotary_local,
+        false => cx.rotary,
+    };
     match cx.offsets {
-        Ok(_) => cx.rotary.ok_or(CanonicalRefusal::RotaryOperand {
+        Ok(_) => table.ok_or(CanonicalRefusal::RotaryOperand {
             step,
             op,
             operand: 1,
@@ -605,9 +642,11 @@ fn slot_operand(cx: &StepCx<'_>, s: &TapeStep<'_>, k: u8) -> Result<SlotId, Cano
 }
 
 /// `RopeAppend { head_dim, layer }` as two launches: K (operand 0, a computed slot) rotated by
-/// the tape's rotary table (operands 1 and 2, as a `RopeRotate`'s) into this step's colour, then
-/// the rotated K and V (operand 3, a computed slot) written into the KV cache of `layer`, whose
-/// `PrefixK` and `PrefixV` are operands 4 and 5. The rope's shape rule is K's `[rows, cols]`.
+/// the tape's rotary table of its class (operands 1 and 2, as a `RopeRotate`'s) into this step's
+/// colour, then the rotated K and V (operand 3, a computed slot) written into the KV cache of
+/// `layer`, whose `PrefixK` and `PrefixV` are operands 4 and 5. Its class is the one of its mask's
+/// window ([`attn_class`]), the same as its attention's. The rope's shape rule is K's
+/// `[rows, cols]`.
 fn rope_append(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
@@ -621,18 +660,18 @@ fn rope_append(
     if pairing == RopeFormTag::Interleaved {
         return Err(CanonicalRefusal::RopePairing { step });
     }
-    if attn.window().is_some() {
-        return Err(CanonicalRefusal::SlidingWindow { step, op });
-    }
-    if head_dim != cx.facts.head_dim {
+    let (class, local) =
+        attn_class(cx, attn).ok_or(CanonicalRefusal::SlidingWindow { step, op })?;
+    window_rule(s, rows_of(cx, s), head_dim, class.window)?;
+    if head_dim != class.head_dim {
         return Err(CanonicalRefusal::KvHeadDim {
             step,
             op,
             head_dim,
-            want: cx.facts.head_dim,
+            want: class.head_dim,
         });
     }
-    let rot_dim = cx.facts.rot_dim;
+    let rot_dim = class.rot_dim;
     let (k, v) = match node.inputs.as_slice() {
         [k, _, _, v, _, _] => (k, v),
         _ => return Err(operand(s, 5, OperandRefusal::Missing)),
@@ -654,14 +693,15 @@ fn rope_append(
     whole_tensors(cx, s, &[(0, k), (3, v)])?;
     let kc = colour_of(cx, slot_operand(cx, s, 0)?);
     let vc = colour_of(cx, slot_operand(cx, s, 3)?);
-    let table = rotary_table(cx, s)?;
+    let table = rotary_table(cx, s, local)?;
     prefix_operands(s, cx, 4, u64::from(layer))?;
     let (pool, regions, index) = kv_pool(cx, layer)?;
-    if cols != pool.kv_heads * pool.head_dim {
+    let cache = pool.class_of(index).expect("every pool layer has a class");
+    if cols != cache.kv_heads * cache.head_dim || cache.head_dim != head_dim {
         return Err(CanonicalRefusal::KvGeometry {
             step,
             op,
-            kv_heads: pool.kv_heads,
+            kv_heads: cache.kv_heads,
             cols,
         });
     }
@@ -677,14 +717,45 @@ fn rope_append(
         cols,
         head_dim,
         rot_dim,
-        pairing: RopePairing::HalfRotated,
+        pairing: class.pairing,
     })
+}
+
+/// The rows of `s`'s output.
+fn rows_of(cx: &StepCx<'_>, s: &TapeStep<'_>) -> u32 {
+    cx.graph.shape(s.node.output.tensor).rows
+}
+
+/// Refuse a window that is not a non-zero multiple of [`ATTN_WINDOW_MULTIPLE`] keys: the
+/// windowed kernels skip whole KV tiles below the window, so a tile never sits across its edge.
+fn window_rule(
+    s: &TapeStep<'_>,
+    rows: u32,
+    head_dim: u32,
+    window: Option<u32>,
+) -> Result<(), CanonicalRefusal> {
+    match window {
+        Some(w) if w == 0 || !w.is_multiple_of(ATTN_WINDOW_MULTIPLE) => {
+            Err(CanonicalRefusal::AttnShape {
+                step: s.step,
+                rows,
+                head_dim,
+                rule: AttnShapeRule::WindowOffBlock {
+                    window: w,
+                    multiple: ATTN_WINDOW_MULTIPLE,
+                },
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 /// `AttnDecode` as attention over the paged KV cache: the bf16 decode attention for a one-row
 /// bucket, the bf16 causal prefill attention for a bucket of a multiple of
 /// [`ATTN_PREFILL_BF16_ROWS`] rows, chosen here at expansion; any other row count is refused, and
-/// so, last, is a one-row bucket whose GQA group is above [`ATTN_DECODE_BF16_MAX_GROUP`].
+/// so, last, is a one-row bucket whose GQA group is above [`ATTN_DECODE_BF16_MAX_GROUP`]. The
+/// layer's attention class is the one of the mask's window ([`attn_class`]): its head dim one of
+/// [`ATTN_BF16_HEAD_DIMS`], its window (the step's) a multiple of [`ATTN_WINDOW_MULTIPLE`].
 /// `q` (operand 0) is a computed slot `[rows, q_heads · head_dim]`; operands 1 and 2 the layer's
 /// `PrefixK` and `PrefixV`; operand 3 that layer's `RopeAppend` and operand 4 the V it read. Both
 /// kernels read K and V from the cache the `RopeAppend` wrote, not from operands 3 and 4, which
@@ -701,26 +772,23 @@ fn attention(
     let op = node.op.name();
     let rows = cx.graph.shape(node.output.tensor).rows;
     let head_dim = geom.hd().get();
-    let (kernel, want_head_dim): (fn(AttnPrefillBf16) -> CudaStep, u32) = if rows == 1 {
-        (CudaStep::AttnDecode, ATTN_DECODE_BF16_HEAD_DIM)
-    } else {
-        (CudaStep::AttnPrefill, ATTN_PREFILL_BF16_HEAD_DIM)
+    let kernel: fn(AttnPrefillBf16) -> CudaStep = match rows {
+        1 => CudaStep::AttnDecode,
+        _ => CudaStep::AttnPrefill,
     };
-    if mask.window().is_some() {
-        return Err(CanonicalRefusal::SlidingWindow { step, op });
-    }
+    let (class, _) = attn_class(cx, mask).ok_or(CanonicalRefusal::SlidingWindow { step, op })?;
     let q = match node.inputs.as_slice() {
         [q, _, _, _, _] => q,
         [_, _, _, _, _, _] => return Err(CanonicalRefusal::AttnSinks { step }),
         _ => return Err(operand(s, 4, OperandRefusal::Missing)),
     };
-    if head_dim != want_head_dim {
+    if !ATTN_BF16_HEAD_DIMS.contains(&head_dim) {
         return Err(CanonicalRefusal::AttnShape {
             step,
             rows,
             head_dim,
             rule: AttnShapeRule::HeadDim {
-                want: want_head_dim,
+                want: class.head_dim,
             },
         });
     }
@@ -734,12 +802,13 @@ fn attention(
             },
         });
     }
-    if head_dim != cx.facts.head_dim {
+    window_rule(s, rows, head_dim, class.window)?;
+    if head_dim != class.head_dim {
         return Err(CanonicalRefusal::KvHeadDim {
             step,
             op,
             head_dim,
-            want: cx.facts.head_dim,
+            want: class.head_dim,
         });
     }
     let q_width = geom.q_width();
@@ -784,7 +853,8 @@ fn attention(
     prefix_operands(s, cx, 1, u64::from(layer))?;
     let (pool, regions, index) = kv_pool(cx, layer)?;
     let (q_heads, kv_heads) = (geom.nqh().get(), geom.nkvh().get());
-    if kv_heads != pool.kv_heads {
+    let cache = pool.class_of(index).expect("every pool layer has a class");
+    if kv_heads != cache.kv_heads || head_dim != cache.head_dim {
         return Err(CanonicalRefusal::KvGeometry {
             step,
             op,
@@ -816,7 +886,7 @@ fn attention(
         kv_heads,
         head_dim,
         scale_bits: scale.to_bits(),
-        window: None,
+        window: class.window,
     }))
 }
 

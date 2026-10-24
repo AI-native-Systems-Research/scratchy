@@ -44,7 +44,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_const_tokens::{ModuleRow, ModuleTable, const_tokens};
 use scratchy_subtile::handoff::{
-    SourceBinding, TargetModelFacts, TargetModelInput, TargetPoint, UnrollIndex,
+    SourceBinding, TargetAttnClass, TargetModelFacts, TargetModelInput, TargetPoint, UnrollIndex,
 };
 use scratchy_target_cuda::step::{
     CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GatedDeltaNetBf16, GemmBf16,
@@ -54,8 +54,9 @@ use scratchy_target_cuda::tape::{ArenaLayout, CudaTape, GdnTape, KvTape, TapeErr
 use scratchy_target_cuda::weights::CudaWeight;
 
 use crate::canonical::{
-    CanonicalAt, CanonicalGdn, CanonicalKv, CanonicalRefusal, CudaCanonical, CudaEmbedFacts,
-    CudaGdnFacts, CudaModelFacts, GemmShapeRule, SharedExpertOwner, lower_canonical,
+    CanonicalAt, CanonicalGdn, CanonicalKv, CanonicalRefusal, CudaAttnClass, CudaAttnClasses,
+    CudaCanonical, CudaEmbedFacts, CudaGdnFacts, CudaModelFacts, GemmShapeRule, SharedExpertOwner,
+    lower_canonical,
 };
 
 /// The modules of the CUDA tape types, and the aliases the emitted tapes name them by: the one
@@ -146,6 +147,26 @@ pub fn model_facts(f: &TargetModelFacts) -> CudaModelFacts {
             conv_kernel: g.conv_kernel,
             eps: f.rms_norm_eps,
         }),
+        classes: match f.attn_classes.as_slice() {
+            [base, global] => Some(CudaAttnClasses {
+                base: attn_class(base),
+                global: attn_class(global),
+            }),
+            _ => None,
+        },
+    }
+}
+
+/// One of the handoff's attention classes as CUDA's, its theta NaN when the config declares none
+/// (as [`model_facts`]' `rope_theta`).
+fn attn_class(c: &TargetAttnClass) -> CudaAttnClass {
+    CudaAttnClass {
+        head_dim: c.head_dim,
+        kv_heads: c.kv_heads,
+        rot_dim: c.rot_dim,
+        rope_theta: c.rope_theta.unwrap_or(f64::NAN),
+        pairing: c.pairing,
+        window: c.window.map(std::num::NonZeroU32::get),
     }
 }
 
@@ -390,7 +411,8 @@ pub fn lower_model(input: &TargetModelInput) -> Result<CudaModel, ModelRefusal> 
                         bucket_m: tape.bucket_m,
                     });
                 }
-                if tape.rotary.is_some() && input.facts.rope_theta.is_none() {
+                let tables = tape.rotary.iter().chain(&tape.rotary_local);
+                if tables.into_iter().any(|t| t.theta().is_nan()) {
                     return Err(ModelRefusal::NoRopeTheta { m });
                 }
                 model.tapes.push(tape);
