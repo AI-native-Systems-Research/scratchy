@@ -149,23 +149,40 @@ impl ChatTemplate {
         if template_str.trim().is_empty() {
             return Ok(None);
         }
-        let mut tpl = Self::new(template_str)?;
-        // bos/eos still come from tokenizer_config.json when present —
-        // the .jinja file carries only the template body, and Gemma 4's
-        // template opens with `{{ bos_token }}` (an empty render here
-        // silently drops <bos> and shifts every prompt token).
-        if tokenizer_config_path.exists()
-            && let Ok(data) = std::fs::read_to_string(tokenizer_config_path)
-            && let Ok(config) = serde_json::from_str::<TokenizerConfig>(&data)
-        {
-            if let Some(bos) = extract_token_string(config.bos_token) {
-                tpl = tpl.with_bos_token(bos);
-            }
-            if let Some(eos) = extract_token_string(config.eos_token) {
-                tpl = tpl.with_eos_token(eos);
-            }
+        // The .jinja file carries only the template body, and Gemma 4's opens with
+        // `{{ bos_token }}`.
+        Ok(Some(
+            Self::new(template_str)?.with_special_tokens_from(tokenizer_config_path),
+        ))
+    }
+
+    /// `{{ bos_token }}` and `{{ eos_token }}`, as a model's `tokenizer_config.json` names them.
+    fn with_special_tokens(
+        mut self,
+        bos: Option<serde_json::Value>,
+        eos: Option<serde_json::Value>,
+    ) -> Self {
+        if let Some(bos) = extract_token_string(bos) {
+            self.bos_token = Some(bos);
         }
-        Ok(Some(tpl))
+        if let Some(eos) = extract_token_string(eos) {
+            self.eos_token = Some(eos);
+        }
+        self
+    }
+
+    /// [`Self::with_special_tokens`] from the `tokenizer_config.json` at `path`, when one is there
+    /// and parses. A template from anywhere else (a `chat_template.jinja` beside it, a
+    /// `--chat-template` override) still renders the model's own BOS and EOS. An empty one would
+    /// drop the BOS from every prompt, since a rendered chat prompt gets no specials added
+    /// ([`crate::tokenizer::Tokenizer::encode_chat`]).
+    pub fn with_special_tokens_from(self, path: &Path) -> Self {
+        let config = (std::fs::read_to_string(path).ok())
+            .and_then(|data| serde_json::from_str::<TokenizerConfig>(&data).ok());
+        match config {
+            Some(config) => self.with_special_tokens(config.bos_token, config.eos_token),
+            None => self,
+        }
     }
 
     /// Load a `ChatTemplate` from a `tokenizer_config.json` file.
@@ -223,18 +240,10 @@ impl ChatTemplate {
             return Self::from_sibling_jinja(path);
         }
 
-        let bos_token = extract_token_string(config.bos_token);
-        let eos_token = extract_token_string(config.eos_token);
-
-        let mut tpl = ChatTemplate::new(template_str)?;
-        if let Some(bos) = bos_token {
-            tpl = tpl.with_bos_token(bos);
-        }
-        if let Some(eos) = eos_token {
-            tpl = tpl.with_eos_token(eos);
-        }
-
-        Ok(Some(tpl))
+        let tpl = ChatTemplate::new(template_str)?;
+        Ok(Some(
+            tpl.with_special_tokens(config.bos_token, config.eos_token),
+        ))
     }
 
     /// Apply the chat template to rich JSON messages, with optional tool definitions

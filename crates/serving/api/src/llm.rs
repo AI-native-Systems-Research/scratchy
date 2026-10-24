@@ -1071,11 +1071,11 @@ impl LLM {
             .apply(&msg_values, true, None)
             .map_err(|e| anyhow::anyhow!("chat template render failed: {e}"))?;
 
-        let prompt = Prompt::TokenIds(self.tokenize_chat(&prompt)?);
-        let mut results = self.generate(&[prompt], params)?;
-        results
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("generate returned no results"))
+        let ids = Prompt::TokenIds(self.tokenize_chat(&prompt)?);
+        let mut result = (self.generate(&[ids], params)?.pop())
+            .ok_or_else(|| anyhow::anyhow!("generate returned no results"))?;
+        result.prompt = Some(prompt);
+        Ok(result)
     }
 
     /// Generate a single streaming chat turn: yields token strings as they

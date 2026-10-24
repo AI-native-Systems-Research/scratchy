@@ -3889,7 +3889,10 @@ pub(crate) fn resolve_chat_template(
     } else {
         trimmed.to_string()
     };
-    let mut tpl = ChatTemplate::new(template_str).context("the --chat-template override")?;
+    let tpl = ChatTemplate::new(template_str).context("the --chat-template override")?;
+    // The model's own BOS and EOS, as vLLM renders an override with the tokenizer's: the override
+    // brings only a template body.
+    let mut tpl = tpl.with_special_tokens_from(&model_dir.join("tokenizer_config.json"));
     // GGUFs almost always lack bos/eos at the template-string level —
     // the original tokenizer_config.json renders them via
     // `{{- bos_token }}` / `{{ eos_token }}`. When the override is paired
@@ -4767,6 +4770,42 @@ mod tests {
         assert!(resolve_chat_template(None, jinja.path()).is_err());
 
         assert!(resolve_chat_template(Some(BROKEN_TEMPLATE), none.path()).is_err());
+    }
+
+    /// A `--chat-template` override renders the model's BOS and EOS from its
+    /// `tokenizer_config.json`: the override brings only a body, and a rendered chat prompt gets
+    /// no specials added, so an empty `{{ bos_token }}` would leave the prompt with no BOS.
+    #[test]
+    fn test_resolve_chat_template_override_renders_the_models_bos_and_eos() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            serde_json::json!({
+                "chat_template": "unused",
+                "bos_token": {"content": "<|begin_of_text|>"},
+                "eos_token": "<|eot_id|>",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let body =
+            "{{ bos_token }}{% for m in messages %}{{ m.content }}{% endfor %}{{ eos_token }}";
+        let tpl = resolve_chat_template(Some(body), dir.path())
+            .unwrap()
+            .unwrap();
+        let messages = [serde_json::json!({"role": "user", "content": "hi"})];
+        let rendered = tpl.apply(&messages, false, None).unwrap();
+        assert_eq!(rendered, "<|begin_of_text|>hi<|eot_id|>");
+
+        let none = tempfile::tempdir().unwrap();
+        let tpl = resolve_chat_template(Some(body), none.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tpl.apply(&messages, false, None).unwrap(),
+            "hi",
+            "no config, no tokens"
+        );
     }
 
     /// An empty embedded `chat_template` falls through to the
