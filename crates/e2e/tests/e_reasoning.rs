@@ -56,6 +56,17 @@ fn thinking_request(stream: bool) -> ChatCompletionRequest {
     }
 }
 
+/// The same question with `enable_thinking: false`, which the template answers by closing the
+/// thinking itself.
+fn no_thinking(stream: bool) -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        chat_template_kwargs: Some(
+            [("enable_thinking".to_string(), serde_json::json!(false))].into(),
+        ),
+        ..thinking_request(stream)
+    }
+}
+
 async fn start_qwen3(parser: &str) -> (TestServer, Client) {
     let server = TestServer::builder(TestModels::QWEN3)
         .with_reasoning_parser(parser)
@@ -136,28 +147,25 @@ async fn test_reasoning_parser_qwen3_nonstreaming() {
         .await
         .unwrap();
     let msg = &resp.choices[0].message;
+    let reasoning = msg.reasoning.as_deref().unwrap_or("");
+    let content = msg.content.as_deref().unwrap_or("");
     assert!(
-        msg.reasoning
-            .as_deref()
-            .is_some_and(|r| !r.trim().is_empty()),
+        !reasoning.trim().is_empty(),
         "thinking on: reasoning populated: {msg:?}"
     );
     assert!(
-        msg.content.as_deref().is_some_and(|c| !c.trim().is_empty()),
+        !content.trim().is_empty(),
         "thinking on: the answer is content: {msg:?}"
     );
+    assert_no_markers(reasoning, "reasoning");
+    assert_no_markers(content, "content");
 
-    // `enable_thinking: false`: the template closes thinking, and the whole reply is content.
-    let no_thinking = ChatCompletionRequest {
-        chat_template_kwargs: Some(
-            [("enable_thinking".to_string(), serde_json::json!(false))].into(),
-        ),
-        ..thinking_request(false)
-    };
-    let resp = client.chat_completion(&no_thinking).await.unwrap();
+    // `enable_thinking: false`: the template closes thinking, so the request has no parser and
+    // the whole reply is content.
+    let resp = client.chat_completion(&no_thinking(false)).await.unwrap();
     let msg = &resp.choices[0].message;
     assert!(
-        msg.reasoning.as_deref().is_none_or(|r| r.trim().is_empty()),
+        msg.reasoning.is_none(),
         "thinking off: no reasoning: {msg:?}"
     );
     let content = msg.content.as_deref().unwrap_or("");
@@ -176,7 +184,20 @@ async fn test_reasoning_parser_qwen3_streaming() {
     let (reasoning, content) = streamed(&chunks);
     assert!(!reasoning.trim().is_empty(), "reasoning deltas");
     assert!(!content.trim().is_empty(), "content deltas");
+    assert_no_markers(&reasoning, "streamed reasoning");
     assert_no_markers(&content, "streamed content");
+
+    let chunks = client
+        .chat_completion_stream(&no_thinking(true))
+        .await
+        .unwrap();
+    let (reasoning, content) = streamed(&chunks);
+    assert!(
+        reasoning.is_empty(),
+        "thinking off: no reasoning deltas: {reasoning:?}"
+    );
+    assert!(!content.trim().is_empty(), "thinking off: content deltas");
+    assert_no_markers(&content, "streamed content with thinking off");
 }
 
 // ===========================================================================
