@@ -302,6 +302,10 @@ pub enum ForwardError {
     SpanOutsideArena { span: ArenaSpan, arena_bytes: u64 },
     /// The `step`-th launch failed; nothing after it was enqueued, and the stream was drained.
     Launch { step: usize, error: KernelError },
+    /// The `step`-th step is a mixture-of-experts step (`op`), which the lowering emits but no
+    /// kernel launches yet (#841's kernels issue replaces this): nothing from it on was enqueued,
+    /// and the stream was drained.
+    NotLaunched { step: usize, op: &'static str },
     /// A copy or the stream wait failed; the stream was drained.
     Cuda(CudaError),
 }
@@ -431,6 +435,10 @@ impl fmt::Display for ForwardError {
                 span.bytes, span.offset.0
             ),
             Self::Launch { step, error } => write!(f, "step {step} did not launch: {error}"),
+            Self::NotLaunched { step, op } => write!(
+                f,
+                "step {step} is {op}, a mixture-of-experts step no kernel launches yet"
+            ),
             Self::Cuda(e) => write!(f, "the forward failed: {e}"),
         }
     }
@@ -1308,6 +1316,26 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     // SAFETY: as above, for `a` (`k`, its `m` is 1: `validate`), `b` (`n*k`) and
                     // `c` (`n`).
                     unsafe { kernels::gemv_bf16_abt(slot(a), b, slot(c), (n, k), stream.0) }
+                }
+                // The MoE steps lower (#841) but have no kernels yet: refused here, before
+                // anything of theirs is enqueued. #841's kernels issue replaces this arm.
+                CudaStep::RouterLogits(_)
+                | CudaStep::MoeRoute(_)
+                | CudaStep::ExpertSort(_)
+                | CudaStep::ExpertGemm(_)
+                | CudaStep::ExpertGemv(_)
+                | CudaStep::ExpertCombine(_)
+                | CudaStep::GateScale(_) => {
+                    let op = match *s {
+                        CudaStep::RouterLogits(_) => "RouterLogits",
+                        CudaStep::MoeRoute(_) => "MoeRoute",
+                        CudaStep::ExpertSort(_) => "ExpertSort",
+                        CudaStep::ExpertGemm(_) => "ExpertGemm",
+                        CudaStep::ExpertGemv(_) => "ExpertGemv",
+                        CudaStep::ExpertCombine(_) => "ExpertCombine",
+                        _ => "GateScale",
+                    };
+                    return Err(ForwardError::NotLaunched { step, op });
                 }
                 CudaStep::GatedDeltaNet(g) => {
                     let pool = gdn.expect("`new` made a pool for a GDN tape");
