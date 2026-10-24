@@ -79,9 +79,12 @@ fn test_llm_generate_max_tokens() {
 
     let mut llm = LLM::new(TestModels::SMOLLM).expect("LLM should initialize");
 
+    // `ignore_eos`: SmolLM2 reads this raw prompt as a finished user turn and ends at once, as
+    // mlx-lm's greedy decode does too, so only the cap can stop it here.
     let params = SamplingParams {
         max_tokens: Some(3),
         temperature: 0.0,
+        ignore_eos: true,
         ..SamplingParams::default()
     };
 
@@ -92,6 +95,7 @@ fn test_llm_generate_max_tokens() {
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
     assert!(output.finished);
+    assert_eq!(output.outputs[0].token_ids.len(), 3, "the cap's tokens");
     assert!(
         output.outputs[0].finish_reason.as_deref() == Some("length"),
         "should stop due to length, got: {:?}",
@@ -188,19 +192,16 @@ fn test_llm_chat_stream_deltas_not_cumulative() {
         "concatenated deltas must equal final text"
     );
 
-    // No individual chunk should contain a previous chunk's text (i.e., no
-    // cumulative re-emission). Check that no chunk is a prefix of a later
-    // chunk — the bug was that each "delta" was actually the full text so far.
-    if chunks.len() >= 2 {
-        for i in 1..chunks.len() {
-            assert!(
-                !chunks[i].starts_with(&chunks[0]),
-                "chunk {} ({:?}) looks like cumulative text (starts with first chunk {:?})",
-                i,
-                chunks[i],
-                chunks[0],
-            );
-        }
+    // No chunk re-emits the text before it — the bug was that each "delta" was
+    // actually the full text so far. A later chunk may repeat an earlier one's
+    // text ("1. 1\n2. 2…"); it must not start with everything streamed so far.
+    for i in 1..chunks.len() {
+        let so_far = chunks[..i].concat();
+        assert!(
+            !chunks[i].starts_with(&so_far),
+            "chunk {i} ({:?}) looks like cumulative text (starts with all of {so_far:?})",
+            chunks[i],
+        );
     }
 }
 
