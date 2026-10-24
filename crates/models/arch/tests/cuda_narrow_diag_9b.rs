@@ -101,6 +101,7 @@ fn narrow_line(step: usize, g: &GemmBf16, rows: usize, a: &[u16], b: &[u16], c: 
     let (n, k) = (g.n as usize, g.k as usize);
     let (a, b) = (widen(a), widen(b));
     let (mut worst, mut at, mut sum, mut bad, mut nonfinite) = (0.0f64, (0, 0), 0.0f64, 0, 0);
+    let mut signed = 0.0f64;
     for i in 0..rows {
         for j in 0..n {
             let (mut dot, mut abs) = (0.0f64, 0.0f64);
@@ -117,6 +118,7 @@ fn narrow_line(step: usize, g: &GemmBf16, rows: usize, a: &[u16], b: &[u16], c: 
             }
             let (err, bound) = ((gpu - dot).abs(), dot.abs() / 128.0 + abs / 16384.0);
             sum += err;
+            signed += gpu - dot;
             bad += usize::from(err > bound);
             let ratio = err / bound.max(f64::MIN_POSITIVE);
             if ratio > worst {
@@ -125,10 +127,11 @@ fn narrow_line(step: usize, g: &GemmBf16, rows: usize, a: &[u16], b: &[u16], c: 
         }
     }
     format!(
-        "narrow step {step} m={} n={n} k={k}: max_err_over_bound={worst:.4} mean_abs_err={:.6e} \
+        "narrow step {step} m={} n={n} k={k}: max_err_over_bound={worst:.4} mean_abs_err={:.6e} mean_signed_err={:+.6e} \
          worst=(row {}, col {}) out_of_bound={bad} nonfinite={nonfinite} ({rows} real rows)",
         g.m,
         sum / (rows * n) as f64,
+        signed / (rows * n) as f64,
         at.0,
         at.1
     )
