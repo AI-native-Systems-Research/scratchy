@@ -1385,7 +1385,7 @@ fn plan_field_load(
         // shared tensors and the DSL leaf accessors keep sole ownership.
         let moe_base = program.weights.path(only_src).first().cloned();
         let shared_expert_intermediate_size = match &moe_base {
-            Some(b) if program.weights.has_subtree(&[b.as_str(), "shared_expert"]) => 0,
+            Some(b) if program.weights.shared_expert_bases().contains(b) => 0,
             _ => shared_expert_intermediate_size,
         };
         let (affine, gate_bits) = moe_affine_plan(program, fuf, model, &prefix, accessor);
@@ -2042,18 +2042,6 @@ pub(crate) fn rot_dim(model: &ModelParams, head_dim: u32) -> u32 {
         .filter(|&f| (f - 1.0).abs() > 1e-9)
         .map(|f| (f * head_dim as f64).round() as u32)
         .unwrap_or(head_dim)
-}
-
-/// The weight bases the DSL declares a `shared_expert` subtree under (`mlp` for
-/// `mlp.shared_expert.gate_proj`): the bundles whose shared expert the DSL states as ops of its
-/// own, so a target's expert combine must not add it again (the single-owner rule). Ascending.
-pub(crate) fn dsl_shared_expert_bases(program: &Program) -> Vec<String> {
-    (0..program.weights.len())
-        .filter_map(|i| program.weights.path(WeightId(i as u32)).first().cloned())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .filter(|b| program.weights.has_subtree(&[b, "shared_expert"]))
-        .collect()
 }
 
 pub(crate) fn rms_norm_eps(model: &ModelParams) -> f32 {
@@ -7337,7 +7325,7 @@ fn target_model_input(
             rms_norm_eps: rms_norm_eps(model),
             vocab_size: bound("vocab_size").unwrap_or(0),
             gdn,
-            dsl_shared_expert_bases: dsl_shared_expert_bases(program),
+            dsl_shared_expert_bases: program.weights.shared_expert_bases(),
         },
     }
 }
@@ -13610,7 +13598,7 @@ pub fn emit_model(
             .map(|p| p.join("_"))
             .find(|p| p.contains("embed"));
         let embed_base = embed_base.unwrap_or_else(|| "embed_tokens".into());
-        let dsl_shared_expert_bases = dsl_shared_expert_bases(program);
+        let dsl_shared_expert_bases = program.weights.shared_expert_bases();
         let quant = model.quantization.as_ref();
         let widths = |base: &str, layer: st::LayerId, body| {
             let qc = quant.expect("MoE widths are read for a quantized model only");
