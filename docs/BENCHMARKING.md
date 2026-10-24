@@ -109,6 +109,16 @@ nothing is self-reported.
   under multi-token prediction or speculative decoding. ITL, the gap between
   chunks, does not: one gap then spans several tokens, so it reads slow. The
   Metal matrix neither asks `bench serve` for ITL nor keeps it.
+  - `bench serve` keeps ITL per chunk, one rule for every engine, and reports
+    beside it how many tokens a chunk carried: `median_tokens_per_chunk`, and
+    `multi_token_chunk_requests`, the requests averaging over 1.5. ITL reads per
+    token only where a chunk is one token. A chunk count can't tell speculative
+    decoding from a server holding tokens back.
+  - `--save-detailed` adds every request's own figures to the results JSON, in
+    `vllm bench serve --save-detailed`'s layout: `input_lens`, `output_lens`,
+    `ttfts`, `itls`, `latencies`, `start_times`, `generated_texts` and `errors`,
+    parallel arrays in seconds. It also adds `chunks`, which vLLM doesn't keep,
+    so an odd aggregate can be checked afterwards.
 - **`peak_rss`** / **`major_faults`** — the child's own `ru_maxrss` /
   `ru_majflt`, read via `wait4(2)` when it is reaped, same call for every
   backend. It has to be `wait4` rather than `getrusage(RUSAGE_CHILDREN)`: the
