@@ -149,7 +149,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_bf16_ker(
     }
     row_values inv;
     warp::div(inv, total, g.cols);
-    warp::bin_map<scratchy::ops::rms_inv>(inv, inv, g.eps);
+    warp::bin_op<scratchy::ops::rms_inv>(inv, inv, g.eps);
 
     // Pass 2: the output of this warp's tiles.
     for (int i = mine; i < 2 * mine; i++) {
