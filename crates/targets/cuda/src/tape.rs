@@ -1728,7 +1728,7 @@ mod tests {
     use super::*;
     use crate::step::{
         AddBf16, AttnPrefillBf16, CUDA_MAX_BLOCKS_PER_SEQ, GateSplitBf16, GatedDeltaNetBf16,
-        GemmBf16, KvUse, RmsNormBf16, RopeAppendBf16, RopeBf16, WeightRead,
+        GemmBf16, KvUse, MoeRouteBf16, RmsNormBf16, RopeAppendBf16, RopeBf16, WeightRead,
     };
 
     const fn span(offset: u64, bytes: u64) -> ArenaSpan {
@@ -3315,5 +3315,198 @@ mod tests {
         assert_eq!(e.reads[1], Some(span(KV_TABLE, 512)), "the block table");
         assert_eq!(e.reads[2], Some(span(KV_SEQ, 8)), "the sequence");
         assert_eq!(e.writes, span(786432, 1024), "one row of 2 · 256 bf16");
+    }
+
+    // ── The MoE scratch's refusals ─────────────────────────────────
+
+    /// A gathered MoE scratch (`bucket_m` 1, 4 experts, top-2, hidden 64, inter 32) after two
+    /// colours, `x [1, 64]` at 0 and `y [1, 64]` at 256: logits 8 bytes at 512, the picks and
+    /// scores 8 each at 768 and 1024, gate, up and act 128 each at 1280, 1536 and 1792, down 256
+    /// at 2048.
+    const MOE: MoeTape = MoeTape {
+        experts: 4,
+        top_k: 2,
+        hidden: 64,
+        inter: 32,
+        tile_rows: CUDA_EXPERT_TILE_ROWS,
+        max_tiles: 0,
+        logits: span(512, 8),
+        topk_idx: span(768, 8),
+        scores: span(1024, 8),
+        sort: None,
+        gate: span(1280, 128),
+        up: span(1536, 128),
+        act: span(1792, 128),
+        down: span(2048, 256),
+    };
+    const MOE_TOTAL: u64 = 2304;
+
+    /// The routing over [`MOE`]'s regions.
+    const MOE_ROUTE: MoeRouteBf16 = MoeRouteBf16 {
+        logits: ArenaOffset(512),
+        topk_idx: ArenaOffset(768),
+        scores: ArenaOffset(1024),
+        m: 1,
+        experts: 4,
+        top_k: 2,
+        renorm: true,
+    };
+
+    fn moe_tape(moe: Option<MoeTape>, steps: &[CudaStep]) -> CudaTape {
+        CudaTape {
+            bucket_m: 1,
+            arena: ArenaLayout {
+                colour_bytes: &[128, 128],
+                colour_offsets: &[0, 256],
+                total_bytes: MOE_TOTAL,
+            },
+            input: TapeInput::Hidden(span(0, 128)),
+            result: span(256, 128),
+            weight_bytes: &[],
+            steps: Box::leak(steps.to_vec().into_boxed_slice()),
+            rotary: None,
+            kv: None,
+            gdn: None,
+            moe,
+        }
+    }
+
+    #[test]
+    fn a_moe_tape_validates() {
+        let t = moe_tape(Some(MOE), &[CudaStep::MoeRoute(MOE_ROUTE)]);
+        assert_eq!(t.validate(), Ok(()));
+    }
+
+    #[test]
+    fn moe_geometry() {
+        for moe in [
+            MoeTape {
+                tile_rows: 64,
+                ..MOE
+            },
+            MoeTape { top_k: 5, ..MOE },
+            MoeTape {
+                max_tiles: 1,
+                ..MOE
+            },
+        ] {
+            assert_eq!(
+                moe_tape(Some(moe), &[]).validate(),
+                Err(TapeError::MoeGeometry),
+                "{moe:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn moe_region_outside() {
+        for (moe, region, at) in [
+            (
+                MoeTape {
+                    logits: span(640, 8),
+                    ..MOE
+                },
+                Region::MoeLogits,
+                span(640, 8),
+            ),
+            (
+                MoeTape {
+                    down: span(2304, 256),
+                    ..MOE
+                },
+                Region::MoeDown,
+                span(2304, 256),
+            ),
+            // Before the previous region's end: the picks over the logits.
+            (
+                MoeTape {
+                    topk_idx: span(512, 8),
+                    ..MOE
+                },
+                Region::MoeTopKIdx,
+                span(512, 8),
+            ),
+        ] {
+            let t = moe_tape(Some(moe), &[]);
+            assert_eq!(
+                t.validate(),
+                Err(TapeError::MoeRegionOutside {
+                    region,
+                    span: at,
+                    total: MOE_TOTAL
+                }),
+                "{region}"
+            );
+        }
+    }
+
+    #[test]
+    fn moe_region_shape() {
+        let t = moe_tape(
+            Some(MoeTape {
+                scores: span(1024, 16),
+                ..MOE
+            }),
+            &[],
+        );
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::MoeRegionShape {
+                region: Region::MoeScores,
+                span: span(1024, 16),
+                want: 8
+            })
+        );
+    }
+
+    #[test]
+    fn moe_step_geometry() {
+        let other_k = CudaStep::MoeRoute(MoeRouteBf16 {
+            top_k: 3,
+            ..MOE_ROUTE
+        });
+        assert_eq!(
+            moe_tape(Some(MOE), &[other_k]).validate(),
+            Err(TapeError::MoeStepGeometry { step: 0 })
+        );
+        assert_eq!(
+            moe_tape(None, &[CudaStep::MoeRoute(MOE_ROUTE)]).validate(),
+            Err(TapeError::MoeStepGeometry { step: 0 })
+        );
+    }
+
+    #[test]
+    fn moe_region_mismatch() {
+        let elsewhere = CudaStep::MoeRoute(MoeRouteBf16 {
+            logits: ArenaOffset(1280),
+            ..MOE_ROUTE
+        });
+        assert_eq!(
+            moe_tape(Some(MOE), &[elsewhere]).validate(),
+            Err(TapeError::MoeRegionMismatch {
+                step: 0,
+                region: Region::MoeLogits,
+                span: span(1280, 8),
+                tape: MOE.logits
+            })
+        );
+    }
+
+    #[test]
+    fn moe_scratch_touched() {
+        let add = CudaStep::Add(AddBf16 {
+            a: ArenaOffset(2048),
+            b: ArenaOffset(0),
+            out: ArenaOffset(256),
+            rows: 1,
+            cols: 64,
+        });
+        assert_eq!(
+            moe_tape(Some(MOE), &[add]).validate(),
+            Err(TapeError::MoeScratchTouched {
+                step: 0,
+                span: span(2048, 128)
+            })
+        );
     }
 }
