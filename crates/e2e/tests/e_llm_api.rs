@@ -79,8 +79,8 @@ fn test_llm_generate_max_tokens() {
 
     let mut llm = LLM::new(TestModels::SMOLLM).expect("LLM should initialize");
 
-    // `ignore_eos`: SmolLM2 reads this raw prompt as a finished user turn and ends at once, as
-    // mlx-lm's greedy decode does too, so only the cap can stop it here.
+    // `ignore_eos`: greedy's first token on this raw prompt is SmolLM2's EOS (id 2), in mlx-lm's
+    // decode too, so only the cap can stop it here.
     let params = SamplingParams {
         max_tokens: Some(3),
         temperature: 0.0,
