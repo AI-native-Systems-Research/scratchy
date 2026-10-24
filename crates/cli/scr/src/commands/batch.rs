@@ -16,7 +16,7 @@ use scratchy_serving_api::engine::AsyncEngine;
 use scratchy_serving_api::init::{VllmConfig, initialize_stack};
 use scratchy_serving_api::protocol::{
     BatchRequestInput, BatchRequestOutput, BatchResponseData, ChatCompletionRequest,
-    CompletionPrompt, CompletionRequest, EmbeddingRequest,
+    CompletionRequest, EmbeddingRequest,
 };
 use tracing::info;
 use uuid::Uuid;
@@ -136,13 +136,16 @@ pub async fn run_batch_from_config(
     let mut handles = Vec::with_capacity(num_requests);
 
     for req_input in requests {
-        let submits = engine_requests(&req_input);
-        let before = engine.num_unfinished_requests().await;
+        let generates = generates(&req_input);
+        let before = engine.calls_submitted();
         let task_engine = engine.clone();
         let handle =
             tokio::spawn(async move { process_single_request(&task_engine, req_input).await });
-        // In once all of its engine requests are, or refused before them.
-        while !handle.is_finished() && engine.num_unfinished_requests().await < before + submits {
+        // A chat or completion line is in once its call has handed the step loop every request
+        // it makes, or has returned (refused). Nothing before that point waits on the gated loop,
+        // so the wait ends. An embedding line takes its own channel, which the loop drains once
+        // it runs: it doesn't wait.
+        while generates && !handle.is_finished() && engine.calls_submitted() == before {
             tokio::task::yield_now().await;
         }
         handles.push(handle);
@@ -272,27 +275,13 @@ async fn process_single_request(
     }
 }
 
-/// How many engine requests a batch line submits: a chat request's `n` choices; a completion's
-/// `n` for each of its prompts; none for an embedding, which takes its own channel, or for a line
-/// whose body doesn't parse, which is refused before it submits anything.
-fn engine_requests(input: &BatchRequestInput) -> usize {
-    match input.url.as_str() {
-        "/v1/chat/completions" => {
-            serde_json::from_value::<ChatCompletionRequest>(input.body.clone())
-                .map_or(0, |req| req.n.max(1) as usize)
-        }
-        "/v1/completions" => serde_json::from_value::<CompletionRequest>(input.body.clone())
-            .map_or(0, |req| {
-                let prompts = match &req.prompt {
-                    Some(CompletionPrompt::Single(_) | CompletionPrompt::TokenIds(_)) => 1,
-                    Some(CompletionPrompt::Multiple(p)) => p.len(),
-                    Some(CompletionPrompt::MultipleTokenIds(p)) => p.len(),
-                    None => 0,
-                };
-                prompts * req.n.max(1) as usize
-            }),
-        _ => 0,
-    }
+/// Whether a batch line generates through the step loop's request channel: a chat or completion,
+/// not an embedding.
+fn generates(input: &BatchRequestInput) -> bool {
+    matches!(
+        input.url.as_str(),
+        "/v1/chat/completions" | "/v1/completions"
+    )
 }
 
 /// Dispatch a request to the appropriate engine method based on the URL.
@@ -345,48 +334,6 @@ async fn dispatch_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The engine requests a batch line submits, which `run_batch` waits for before the loop
-    /// steps: a chat request's `n`, a completion's `n` per prompt, no embedding, and nothing for a
-    /// body that doesn't parse.
-    #[test]
-    fn engine_requests_counts_what_a_line_submits() {
-        let line = |url: &str, body: serde_json::Value| BatchRequestInput {
-            custom_id: "r".into(),
-            method: "POST".into(),
-            url: url.into(),
-            body,
-        };
-        let chat = "/v1/chat/completions";
-        let completions = "/v1/completions";
-        for (input, want) in [
-            (line(chat, serde_json::json!({"messages": []})), 1),
-            (line(chat, serde_json::json!({"messages": [], "n": 3})), 3),
-            (line(completions, serde_json::json!({"prompt": "a"})), 1),
-            (
-                line(
-                    completions,
-                    serde_json::json!({"prompt": [1, 2, 3], "n": 2}),
-                ),
-                2,
-            ),
-            (
-                line(
-                    completions,
-                    serde_json::json!({"prompt": ["a", "b"], "n": 2}),
-                ),
-                4,
-            ),
-            (
-                line(completions, serde_json::json!({"prompt": [[1], [2], [3]]})),
-                3,
-            ),
-            (line("/v1/embeddings", serde_json::json!({"input": "a"})), 0),
-            (line(chat, serde_json::json!({"messages": 7})), 0),
-        ] {
-            assert_eq!(engine_requests(&input), want, "{}", input.body);
-        }
-    }
 
     #[test]
     fn test_parse_input_jsonl_empty() {

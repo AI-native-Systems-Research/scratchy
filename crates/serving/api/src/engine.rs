@@ -422,6 +422,9 @@ pub struct AsyncEngine {
     generation_defaults: scratchy_core_common::sampling::GenerationDefaults,
     /// Whether async scheduling is enabled (overlap GPU execution with CPU scheduling).
     async_scheduling: bool,
+    /// Non-streamed chat and completion calls that have handed every one of their requests to
+    /// the step loop's channel ([`calls_submitted`](Self::calls_submitted)).
+    calls_submitted: std::sync::atomic::AtomicUsize,
     /// Where the step loop is. `poll_until_done` reads it to see a dead loop, and the server
     /// watches it to shut down when the loop ends, since nothing can then be served.
     step_loop: Arc<watch::Sender<StepLoop>>,
@@ -471,6 +474,7 @@ impl AsyncEngine {
             default_chat_template_kwargs: None,
             generation_defaults: Default::default(),
             async_scheduling: false,
+            calls_submitted: std::sync::atomic::AtomicUsize::new(0),
             step_loop: Arc::new(watch::Sender::new(StepLoop::Pending)),
             #[cfg(feature = "multimodal")]
             mm_processor: None,
@@ -896,6 +900,7 @@ impl AsyncEngine {
             child_ids.push(child_id);
         }
 
+        self.handed_over();
         // Poll all children and build choices.
         let mut choices = Vec::with_capacity(n);
         let mut total_completion_tokens = 0u32;
@@ -1348,6 +1353,7 @@ impl AsyncEngine {
             }
         }
 
+        self.handed_over();
         // Poll all children and build choices.
         let mut choices = Vec::with_capacity(total);
         let mut total_completion_tokens = 0u32;
@@ -1825,9 +1831,24 @@ impl AsyncEngine {
         }
     }
 
-    /// How many requests are submitted and not yet finished.
-    pub async fn num_unfinished_requests(&self) -> usize {
-        self.requests.lock().await.len()
+    /// How many non-streamed chat and completion calls have handed every one of their
+    /// requests to the step loop: each counts once its choices (and, for a completion, every
+    /// prompt's) are in the loop's channel, before it waits for any reply. A call refused before
+    /// that never counts. An offline batch submits behind [`spawn_step_loop_after`]'s gate by
+    /// this: a line is in once the count moves, or its call has returned.
+    ///
+    /// [`spawn_step_loop_after`]: Self::spawn_step_loop_after
+    pub fn calls_submitted(&self) -> usize {
+        self.calls_submitted
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A call's requests are all in the step loop's channel ([`calls_submitted`]).
+    ///
+    /// [`calls_submitted`]: Self::calls_submitted
+    fn handed_over(&self) {
+        self.calls_submitted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Run a step loop to its end, however it ends, then fail every request it was still
@@ -5288,20 +5309,40 @@ mod tests {
                 .await
         });
         let deadline = Instant::now() + Duration::from_secs(5);
-        while engine.num_unfinished_requests().await == 0 && Instant::now() < deadline {
+        while engine.calls_submitted() == 0 && Instant::now() < deadline {
             tokio::task::yield_now().await;
         }
-        assert_eq!(
-            engine.num_unfinished_requests().await,
-            1,
-            "submitted behind the gate"
-        );
+        assert_eq!(engine.calls_submitted(), 1, "submitted behind the gate");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!reply.is_finished(), "served before the gate opened");
         open.send(()).unwrap();
         let reply = tokio::time::timeout(Duration::from_secs(5), reply).await;
         assert_eq!(reply.unwrap().unwrap().unwrap().choices.len(), 1);
-        assert_eq!(engine.num_unfinished_requests().await, 0);
+    }
+
+    /// A call counts as submitted once, however many requests it fans out to, and only once
+    /// every one is in the step loop's channel; a refused call never counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_counts_as_submitted_once_all_its_requests_are_in() {
+        let engine = Arc::new(make_test_engine());
+        engine.spawn_step_loop();
+        let prompts = protocol::CompletionPrompt::MultipleTokenIds(vec![vec![1, 2], vec![3]]);
+        let fanned = protocol::CompletionRequest {
+            n: 2,
+            ..make_completion_request(Some(prompts))
+        };
+        assert_eq!(engine.completion(fanned).await.unwrap().choices.len(), 4);
+        assert_eq!(engine.calls_submitted(), 1, "four requests, one call");
+        let chat = protocol::ChatCompletionRequest {
+            n: 3,
+            ..make_chat_request()
+        };
+        assert_eq!(engine.chat_completion(chat).await.unwrap().choices.len(), 3);
+        assert_eq!(engine.calls_submitted(), 2);
+        let too_long =
+            make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1; 5000])));
+        assert!(engine.completion(too_long).await.is_err());
+        assert_eq!(engine.calls_submitted(), 2, "a refused call never counts");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
