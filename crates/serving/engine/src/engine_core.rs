@@ -223,12 +223,14 @@ impl<T> StepOutcome<T> {
     }
 }
 
-/// Whether `req_id` takes speculative drafts: it is running, and its sampling does not read its
-/// history (a verify row's would need the drafts before it).
+/// Whether `req_id` takes speculative drafts: it is running, its sampling does not read its
+/// history (a verify row's would need the drafts before it), and it has no logit bias (a
+/// drafting step runs ahead on the device, and a bias's lists are staged on the host each step).
 fn takes_drafts(scheduler: &Scheduler, req_id: &str) -> bool {
-    scheduler
-        .get_request(req_id)
-        .is_some_and(|r| !r.status.is_finished() && !r.sampling_params.reads_history())
+    scheduler.get_request(req_id).is_some_and(|r| {
+        let p = &r.sampling_params;
+        !r.status.is_finished() && !p.reads_history() && p.logit_bias.is_none()
+    })
 }
 
 impl EngineCore {
@@ -778,11 +780,9 @@ impl EngineCore {
                     continue;
                 }
                 // Still running, and drafting (`takes_drafts`).
-                let keeps_drafts = self.scheduler.get_request(&req_id).is_some_and(|r| {
-                    !r.status.is_finished()
-                        && !r.all_token_ids.is_empty()
-                        && !r.sampling_params.reads_history()
-                });
+                let keeps_drafts = self::takes_drafts(&self.scheduler, &req_id)
+                    && (self.scheduler.get_request(&req_id))
+                        .is_some_and(|r| !r.all_token_ids.is_empty());
                 if !keeps_drafts {
                     continue;
                 }

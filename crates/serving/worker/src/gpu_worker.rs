@@ -319,6 +319,10 @@ pub struct MetalWorker {
     /// pure waste. Buffers are pinned in the allocator's residency set, so
     /// every forward command buffer sees them resident.
     sampler_arena: Option<std::sync::Arc<scratchy_target_metal::sampling::SamplerArena>>,
+    /// The sampler's logit-bias lists, grown to the most entries a step has needed and
+    /// rewritten by each step that has a biased row. Such a step is never deferred (see
+    /// [`MetalWorker::deferrable`]), so no command buffer still in flight reads a list that grows.
+    sampler_bias: SamplerBiasBuffers,
     /// Terminal logits slot + its runtime column count, captured by the
     /// `forward_argmax_blocking` followup on the last TARGET forward. The
     /// sampler reads sampling requests' logits rows out of this buffer (on the
@@ -1088,6 +1092,7 @@ impl MetalWorker {
             mtp_drafter: None,
             sampler_kernels: None,
             sampler_arena: None,
+            sampler_bias: SamplerBiasBuffers::default(),
             sampler_logits: None,
             pending_sampler: None,
             argmax_slots: Vec::new(),
@@ -2066,8 +2071,9 @@ impl MetalWorker {
     /// Whether this step can be committed without waiting for it: its rows
     /// pick their tokens on the GPU from the logits alone, so nothing on the
     /// host needs its tokens before the next step is queued. Penalties (the
-    /// token history), grammar, speculative decoding, pooling, multimodal
-    /// input, a draft model and live sampler telemetry all do.
+    /// token history), grammar, a logit bias (its lists are staged on the host,
+    /// `stage_sampler_bias`), speculative decoding, pooling, multimodal input, a
+    /// draft model and live sampler telemetry all do.
     fn deferrable(&self, sched: &SchedulerOutput) -> bool {
         #[cfg(feature = "guided-decoding")]
         let constrained = |req_id: &String| self.grammar_states.contains_key(req_id);
@@ -2096,10 +2102,8 @@ impl MetalWorker {
                         None => self.draft_model.is_none(),
                     }
                     && sched.num_scheduled_tokens.keys().all(|req_id| {
-                        !self
-                            .sampling_params_map
-                            .get(req_id)
-                            .is_some_and(SamplingParams::reads_history)
+                        !(self.sampling_params_map.get(req_id))
+                            .is_some_and(|p| p.reads_history() || p.logit_bias.is_some())
                             && !self.mm_data_buffers.contains_key(req_id)
                             && !constrained(req_id)
                     }))
@@ -3133,9 +3137,7 @@ impl MetalWorker {
             })?;
             model.vocab_size() as u32
         };
-        let arena = self
-            .sampler_arena
-            .as_ref()
+        let arena = (self.sampler_arena.clone())
             .ok_or_else(|| ExecutorError::WorkerExecution("gpu sampler: arena not built".into()))?;
 
         // Assemble this step's sampler inputs (metal's `GpuSampleParams` layout)
@@ -3151,8 +3153,65 @@ impl MetalWorker {
             |id| self.input_batch.num_generated(id),
             vocab,
         );
+        let bias = match params.bias_offsets.is_empty() {
+            true => None,
+            false => Some(self.stage_sampler_bias(&params)?),
+        };
         let record = self.deferral.as_mut().map(|(d, _)| &mut d.host_writes);
-        Ok(arena.prepare_step(&params, jobs.len() as u32, record))
+        Ok(arena.prepare_step(&params, jobs.len() as u32, record, bias))
+    }
+
+    /// Write this step's logit-bias lists into [`Self::sampler_bias`], growing each to fit, and
+    /// hand back their addresses for the sampler to bind. The step is not deferred, so nothing in
+    /// flight still reads a buffer replaced here.
+    fn stage_sampler_bias(
+        &mut self,
+        params: &scratchy_core_common::GpuSampleParams,
+    ) -> ExecutorResult<scratchy_target_metal::sampling::BiasLists> {
+        use ::objc2_metal::MTLBuffer;
+        if self.deferral.is_some() {
+            return Err(ExecutorError::WorkerExecution(
+                "gpu sampler: a step with a logit bias is deferred".into(),
+            ));
+        }
+        let dev = (self.gpu_device.as_ref())
+            .ok_or_else(|| ExecutorError::WorkerExecution("gpu sampler: no device".into()))?;
+        let (device, residency) = (dev.device.clone(), dev.allocator.residency().clone());
+        let le = |words: &mut dyn Iterator<Item = [u8; 4]>| words.flatten().collect::<Vec<u8>>();
+        let lists = [
+            le(&mut params.bias_offsets.iter().map(|x| x.to_le_bytes())),
+            le(&mut params.bias_token_ids.iter().map(|x| x.to_le_bytes())),
+            le(&mut params.bias_values.iter().map(|x| x.to_le_bytes())),
+        ];
+        let b = &mut self.sampler_bias;
+        let mut grew = false;
+        for (slot, bytes) in [&mut b.offsets, &mut b.token_ids, &mut b.values]
+            .into_iter()
+            .zip(&lists)
+        {
+            grew |= reserve_pinned(slot, &device, &residency, bytes.len());
+            let buf = slot.as_ref().expect("reserved");
+            // SAFETY: shared storage of at least `bytes.len()` bytes, read by no command buffer
+            // in flight (the step is not deferred).
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    buf.contents().as_ptr() as *mut u8,
+                    bytes.len(),
+                );
+            }
+        }
+        if grew {
+            residency.commit();
+        }
+        let addr = |slot: &Option<scratchy_target_metal::residency::Pinned>| {
+            slot.as_ref().map_or(0, |p| p.gpuAddress())
+        };
+        Ok(scratchy_target_metal::sampling::BiasLists {
+            offsets: addr(&b.offsets),
+            token_ids: addr(&b.token_ids),
+            values: addr(&b.values),
+        })
     }
 }
 
@@ -5264,10 +5323,20 @@ fn sampled(
     Ok(rows.map(|row| out[row]).collect())
 }
 
+/// The sampler's logit-bias lists on the device ([`scratchy_target_metal::sampling::BiasLists`]):
+/// CSR offsets, token ids and biases.
+#[cfg(feature = "metal")]
+#[derive(Default)]
+struct SamplerBiasBuffers {
+    offsets: Option<scratchy_target_metal::residency::Pinned>,
+    token_ids: Option<scratchy_target_metal::residency::Pinned>,
+    values: Option<scratchy_target_metal::residency::Pinned>,
+}
+
 /// Grow `slot` to a pinned, zeroed buffer of at least `bytes`, replacing (and
 /// so unpinning) a smaller one. Returns whether it allocated, i.e. whether
 /// `residency` needs a commit before the next command buffer.
-#[cfg(all(feature = "metal", feature = "guided-decoding"))]
+#[cfg(feature = "metal")]
 fn reserve_pinned(
     slot: &mut Option<scratchy_target_metal::residency::Pinned>,
     device: &scratchy_target_metal::mtl4_dispatch::Device,
@@ -8106,6 +8175,7 @@ impl Worker for MetalWorker {
         self.kv_cache = None; // drops the file-backed store(s) → Drop msyncs their codes
         self.model = None;
         self.argmax_kernels = None;
+        self.sampler_bias = SamplerBiasBuffers::default();
         self.draft_vocab_suffix = None;
         self.argmax_slots.clear();
         #[cfg(feature = "guided-decoding")]

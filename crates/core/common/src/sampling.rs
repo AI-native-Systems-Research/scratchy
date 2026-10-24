@@ -304,18 +304,13 @@ pub struct GpuSampleParams {
     pub max_output_len: u32,
     pub max_prompt_len: u32,
     pub any_penalty: bool,
-    /// Each row's `logit_bias`, row-major `[njobs, max_bias]`: token ids padded with `vocab`
-    /// (no token), and the bias added to each one's logit, padded with 0.
-    pub bias_token_ids: Vec<i32>,
+    /// The step's `logit_bias`, CSR: row `r`'s entries are `bias_offsets[r]..bias_offsets[r + 1]`
+    /// of `bias_token_ids` (ascending, each in the vocabulary) and `bias_values`. All three are
+    /// empty when no row has a bias.
+    pub bias_offsets: Vec<u32>,
+    pub bias_token_ids: Vec<u32>,
     pub bias_values: Vec<f32>,
-    /// The most `logit_bias` entries any row names this step (at most [`MAX_LOGIT_BIAS`]); 0 when
-    /// none does.
-    pub max_bias: u32,
 }
-
-/// The most tokens a request's `logit_bias` may name: the sampler's per-row bias lists are sized
-/// for this many once, at load.
-pub const MAX_LOGIT_BIAS: usize = 300;
 
 /// Deterministic per-request seed for an UNSEEDED GPU-sampling request:
 /// FNV-1a(req_id bytes, then `position` LE bytes) with a fixed basis. Backend-
@@ -366,7 +361,7 @@ impl SamplingParams {
     /// Whether plain argmax decoding is exactly correct for these params — no
     /// sampling transform (temperature, top-k / top-p / min-p, a repetition /
     /// presence / frequency penalty, or a logit bias) would move the argmax token. Backend-neutral:
-    /// both the cuda and metal workers use this to route a row to the argmax fast
+    /// the metal worker uses this to route a row to the argmax fast
     /// path vs the on-GPU sampler. Stricter than `sampling_type() == Greedy`,
     /// which only looks at temperature.
     pub fn is_greedy(&self) -> bool {
@@ -464,15 +459,6 @@ impl SamplingParams {
             && ids.is_empty()
         {
             return Err("allowed_token_ids must not be empty when set".into());
-        }
-        if let Some(bias) = &self.logit_bias
-            && bias.len() > MAX_LOGIT_BIAS
-        {
-            return Err(format!(
-                "logit_bias may name at most {MAX_LOGIT_BIAS} tokens, got {}",
-                bias.len()
-            )
-            .into());
         }
         if let Some(ref seqs) = self.bad_words_token_ids {
             if seqs.is_empty() {
@@ -879,13 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn a_logit_bias_past_the_samplers_cap_is_invalid_and_moves_off_the_argmax_path() {
-        let bias = |n: usize| SamplingParams {
-            logit_bias: Some((0..n as u32).map(|t| (t, 1.0)).collect()),
-            ..Default::default()
-        };
-        assert!(bias(MAX_LOGIT_BIAS).validate().is_ok());
-        assert!(bias(MAX_LOGIT_BIAS + 1).validate().is_err());
+    fn a_logit_bias_moves_a_request_off_the_argmax_path() {
         let greedy = SamplingParams {
             temperature: 0.0,
             ..Default::default()
@@ -893,7 +873,8 @@ mod tests {
         assert!(greedy.is_greedy());
         let biased = SamplingParams {
             temperature: 0.0,
-            ..bias(1)
+            logit_bias: Some([(7, 1.0)].into()),
+            ..Default::default()
         };
         assert!(!biased.is_greedy(), "a bias can move the argmax");
     }

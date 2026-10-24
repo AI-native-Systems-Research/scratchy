@@ -305,33 +305,44 @@ pub fn gather_gpu_sample_params<'h>(
         params.max_prompt_len = max_prompt as u32;
     }
 
-    // Logit biases: each row's `logit_bias`, row-major `njobs * max_bias`, token ids padded with
-    // `vocab` and biases with 0, as the penalty histories are.
-    let biases: Vec<Vec<(u32, f32)>> = (jobs.iter())
-        .map(|&(i, _)| {
-            let bias = sampling_params_map
-                .get(&req_ids[i])
-                .and_then(|p| p.logit_bias.as_ref());
-            let mut bias: Vec<(u32, f32)> =
-                bias.into_iter().flatten().map(|(&t, &b)| (t, b)).collect();
-            bias.sort_unstable_by_key(|&(t, _)| t);
-            bias
-        })
-        .collect();
-    let max_bias = biases.iter().map(Vec::len).max().unwrap_or(0);
-    if max_bias > 0 {
-        params.bias_token_ids = vec![vocab as i32; njobs * max_bias];
-        params.bias_values = vec![0.0; njobs * max_bias];
-        for (r, bias) in biases.iter().enumerate() {
-            for (j, &(token, value)) in bias.iter().enumerate() {
-                params.bias_token_ids[r * max_bias + j] = token as i32;
-                params.bias_values[r * max_bias + j] = value;
-            }
-        }
-        params.max_bias = max_bias as u32;
+    // Logit biases, CSR: each row's `logit_bias` entries in the vocabulary, ascending by token so
+    // the reduce can search them. Left empty when no row has one.
+    let mut offsets = Vec::with_capacity(njobs + 1);
+    offsets.push(0u32);
+    let (mut ids, mut values) = (Vec::new(), Vec::new());
+    for &(i, _) in jobs {
+        let bias = sampling_params_map
+            .get(&req_ids[i])
+            .and_then(|p| p.logit_bias.as_ref());
+        let mut row: Vec<(u32, f32)> = (bias.into_iter().flatten())
+            .filter(|&(&t, _)| t < vocab)
+            .map(|(&t, &b)| (t, b))
+            .collect();
+        row.sort_unstable_by_key(|&(t, _)| t);
+        ids.extend(row.iter().map(|&(t, _)| t));
+        values.extend(row.iter().map(|&(_, b)| b));
+        offsets.push(ids.len() as u32);
+    }
+    if !ids.is_empty() {
+        params.bias_offsets = offsets;
+        params.bias_token_ids = ids;
+        params.bias_values = values;
     }
 
     params
+}
+
+/// A step's logit biases on the device, in [`GpuSampleParams`]' CSR form: the GPU addresses of
+/// its offsets, token ids and biases. The caller owns the buffers (they grow with the step's
+/// entries, and are not this arena's to size) and keeps them resident and unchanged until the
+/// step's command buffer is done.
+///
+/// [`GpuSampleParams`]: scratchy_core_common::GpuSampleParams
+#[derive(Clone, Copy, Debug)]
+pub struct BiasLists {
+    pub offsets: u64,
+    pub token_ids: u64,
+    pub values: u64,
 }
 
 /// Number of top candidates the sampler spills for the live "soul" panel when
@@ -379,14 +390,13 @@ pub struct SamplerArena {
     reps_buf: Buffer, // [max_rows] f32 each
     freqs_buf: Buffer,
     press_buf: Buffer,
-    bias_ids_buf: Buffer,    // logit biases, [max_rows, MAX_LOGIT_BIAS] i32
-    bias_values_buf: Buffer, // [max_rows, MAX_LOGIT_BIAS] f32
-    row_state_buf: Buffer,   // [max_rows, ROW_STATE_LEN]
-    partials_buf: Buffer,    // [sliced_max, 3]
-    hist_buf: Buffer,        // [max_rows, DESCENT_HIST_LEN]
-    counts_buf: Buffer,      // [sliced_max, 4]
-    staging_buf: Buffer,     // [sliced_max, 4 * MAX_CANDIDATES]
-    consts_buf: Buffer,      // (nslices, nrows, max_out, max_prompt, max_bias)
+    bias_unset_buf: Buffer, // the bias slots' binding on a step without biases (never read)
+    row_state_buf: Buffer,  // [max_rows, ROW_STATE_LEN]
+    partials_buf: Buffer,   // [sliced_max, 3]
+    hist_buf: Buffer,       // [max_rows, DESCENT_HIST_LEN]
+    counts_buf: Buffer,     // [sliced_max, 4]
+    staging_buf: Buffer,    // [sliced_max, 4 * MAX_CANDIDATES]
+    consts_buf: Buffer,     // (nslices, nrows, max_out, max_prompt, biased)
     max_hist: u32,
     // Sampler-telemetry spill (only compiled under `sampler-telemetry`).
     #[cfg(feature = "sampler-telemetry")]
@@ -430,6 +440,8 @@ pub struct PendingSampler {
     nslices: u32,
     /// Each job's logits row.
     rows: Vec<u32>,
+    /// The step's logit biases, bound into the reduce's slots 12-14 per step.
+    bias: Option<BiasLists>,
 }
 
 /// Threadgroups the sliced passes aim to occupy: two per GPU core, at least 8.
@@ -475,15 +487,8 @@ impl SamplerArena {
         let n = 1usize; // per-row terms only
         let h = max_hist.max(1) as usize;
         // `mk(n * vocab * 4, "scratch")` + row_idx/reps/freqs/press (4·n)
-        // + out_ids + prompt_ids (2·n·h) + the bias ids and values
-        // (2·n·MAX_LOGIT_BIAS) + row_state (16·n) + hist.
-        let bias = scratchy_core_common::MAX_LOGIT_BIAS;
-        n * (vocab as usize * 4
-            + 4 * 3
-            + 2 * h * 4
-            + 2 * bias * 4
-            + 16 * 4
-            + DESCENT_HIST_LEN * 4)
+        // + out_ids + prompt_ids (2·n·h) + row_state (16·n) + hist.
+        n * (vocab as usize * 4 + 4 * 3 + 2 * h * 4 + 16 * 4 + DESCENT_HIST_LEN * 4)
             // The sliced buffers scale with `sliced_max(nrows)` — the slice
             // target while rows are interior, `nrows` once they alone fill
             // the machine. Their per-row slope at small `n` is the slice
@@ -540,9 +545,7 @@ impl SamplerArena {
         let reps_buf = mk(n * 4, "reps");
         let freqs_buf = mk(n * 4, "freqs");
         let press_buf = mk(n * 4, "press");
-        let bias = scratchy_core_common::MAX_LOGIT_BIAS;
-        let bias_ids_buf = mk(n * bias * 4, "bias_ids");
-        let bias_values_buf = mk(n * bias * 4, "bias_values");
+        let bias_unset_buf = mk(16, "bias_unset");
         let row_state_buf = mk(n * ROW_STATE_LEN * 4, "row_state");
         let partials_buf = mk(sliced_max * 3 * 4, "partials");
         let hist_buf = mk(n * DESCENT_HIST_LEN * 4, "hist");
@@ -570,7 +573,7 @@ impl SamplerArena {
                 .newArgumentTableWithDescriptor_error(&desc)
                 .expect("sampler arg table alloc")
         };
-        let softmax_reduce_at = mk_table(14);
+        let softmax_reduce_at = mk_table(15);
         let softmax_materialize_at = mk_table(5);
         let descent_at = mk_table(4);
         let count_compact_at = mk_table(6);
@@ -593,8 +596,7 @@ impl SamplerArena {
             reps_buf,
             freqs_buf,
             press_buf,
-            bias_ids_buf,
-            bias_values_buf,
+            bias_unset_buf,
             row_state_buf,
             partials_buf,
             hist_buf,
@@ -653,8 +655,9 @@ impl SamplerArena {
             partials,
             consts,
             hist,
-            a(&self.bias_ids_buf),
-            a(&self.bias_values_buf),
+            a(&self.bias_unset_buf),
+            a(&self.bias_unset_buf),
+            a(&self.bias_unset_buf),
         ];
         let finalize = [
             staging, counts, row_state, scratch, row_idx, forward, consts,
@@ -707,6 +710,7 @@ impl SamplerArena {
         params: &scratchy_core_common::GpuSampleParams,
         njobs: u32,
         mut record: Option<&mut Vec<(Buffer, Vec<u8>)>>,
+        bias: Option<BiasLists>,
     ) -> PendingSampler {
         assert!(
             njobs <= self.max_rows,
@@ -808,22 +812,15 @@ impl SamplerArena {
         } else {
             (0, 0)
         };
-        // Logit biases: only a step with a biased row writes them, as the penalties are written;
-        // every other step reads none.
-        let max_bias = params.max_bias;
-        if max_bias > 0 {
-            assert!(
-                max_bias as usize <= scratchy_core_common::MAX_LOGIT_BIAS,
-                "sampler logit_bias ({max_bias}) exceeds MAX_LOGIT_BIAS ({})",
-                scratchy_core_common::MAX_LOGIT_BIAS
-            );
-            let i32s = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-            write(&self.bias_ids_buf, &i32s(&params.bias_token_ids));
-            write(&self.bias_values_buf, &f32s(&params.bias_values));
-        }
         write(
             &self.consts_buf,
-            &u32s(&[nslices, njobs, max_out, max_prompt, max_bias]),
+            &u32s(&[
+                nslices,
+                njobs,
+                max_out,
+                max_prompt,
+                u32::from(bias.is_some()),
+            ]),
         );
         #[cfg(feature = "sampler-telemetry")]
         {
@@ -838,6 +835,7 @@ impl SamplerArena {
             njobs,
             nslices,
             rows: params.row_indices.clone(),
+            bias,
         }
     }
 }
@@ -861,9 +859,16 @@ impl PendingSampler {
     ) {
         use objc2_metal::MTL4ArgumentTable;
         let a = &self.arena;
+        let unset = a.bias_unset_buf.gpuAddress();
+        let bias = self
+            .bias
+            .map_or([unset; 3], |b| [b.offsets, b.token_ids, b.values]);
         unsafe {
             a.softmax_reduce_at.setAddress_atIndex(logits_addr, 1);
             a.finalize_at.setAddress_atIndex(tokens.gpuAddress(), 5);
+            for (slot, addr) in (12..).zip(bias) {
+                a.softmax_reduce_at.setAddress_atIndex(addr, slot);
+            }
         }
         let (rows, sliced) = (self.njobs, self.njobs * self.nslices);
         let stages = [
@@ -1007,15 +1012,29 @@ mod tests {
             .max()
             .map_or(1, |&r| r as usize + 1);
         let tokens = shared_slice(device, &vec![u32::MAX; rows]);
+        let bias_bufs = (!params.bias_offsets.is_empty()).then(|| {
+            [
+                shared_slice(device, &params.bias_offsets),
+                shared_slice(device, &params.bias_token_ids),
+                shared_slice(device, &params.bias_values),
+            ]
+        });
+        let bias = bias_bufs.as_ref().map(|[o, t, v]| {
+            use objc2_metal::MTLBuffer as _;
+            BiasLists {
+                offsets: o.gpuAddress(),
+                token_ids: t.gpuAddress(),
+                values: v.gpuAddress(),
+            }
+        });
         let (pending, pins) = {
             let res = batch.residency();
             let max_hist = params.max_output_len.max(params.max_prompt_len).max(1);
             let arena = SamplerArena::new(device, res, njobs, kernels, max_hist);
-            let pending = arena.prepare_step(params, njobs, None);
-            (
-                pending,
-                [res.pin(logits_buf.clone()), res.pin(tokens.clone())],
-            )
+            let pending = arena.prepare_step(params, njobs, None, bias);
+            let mut pins = vec![res.pin(logits_buf.clone()), res.pin(tokens.clone())];
+            pins.extend(bias_bufs.iter().flatten().map(|b| res.pin(b.clone())));
+            (pending, pins)
         };
         use objc2_metal::MTLBuffer as _;
         let logits_addr = logits_buf.gpuAddress();
@@ -1063,20 +1082,20 @@ mod tests {
 
     /// A row's logit bias moves its logits before the softmax: +bias on a low token makes it the
     /// near-zero-temperature draw, and -100 on the argmax hands the draw to the runner-up. With
-    /// no bias, the argmax wins (the control).
+    /// no bias, the argmax wins (the control). The bias goes before the penalties, as cuda and
+    /// vLLM apply it: a token at logit 1.0 in the history, biased -3 under a repetition penalty
+    /// of 2, is (1 - 3) * 2 = -4, below a -3.0 rival, where penalty-then-bias would leave it at
+    /// 1.0 / 2 - 3 = -2.5, above it.
     #[test]
-    fn a_logit_bias_moves_the_draw() {
+    fn a_logit_bias_moves_the_draw_before_the_penalties() {
         let Some(device) = crate::device::detect_device() else {
             eprintln!("skipping: no metal device");
             return;
         };
         let device = device.device.clone();
         let vocab: u32 = 4096;
-        let mut logits = vec![0.1f32; vocab as usize];
-        logits[1234] = 9.0;
-        logits[7] = 3.0;
-        let kernels = baked(&device, logits.len(), CastDtype::F32);
-        let draw = |bias: &[(i32, f32)]| {
+        let draw = |logits: &[f32], bias: &[(u32, f32)], rep: f32, history: &[i32]| {
+            let kernels = baked(&device, logits.len(), CastDtype::F32);
             let params = scratchy_core_common::GpuSampleParams {
                 row_indices: vec![0],
                 temperatures: vec![0.01],
@@ -1084,36 +1103,48 @@ mod tests {
                 top_ps: vec![1.0],
                 min_ps: vec![0.0],
                 uniforms: vec![0.73],
-                rep_penalties: vec![1.0],
+                rep_penalties: vec![rep],
                 freq_penalties: vec![0.0],
                 pres_penalties: vec![0.0],
+                output_token_ids: history.to_vec(),
+                max_output_len: history.len() as u32,
+                any_penalty: !history.is_empty(),
+                bias_offsets: if bias.is_empty() {
+                    vec![]
+                } else {
+                    vec![0, bias.len() as u32]
+                },
                 bias_token_ids: bias.iter().map(|&(t, _)| t).collect(),
                 bias_values: bias.iter().map(|&(_, b)| b).collect(),
-                max_bias: bias.len() as u32,
                 ..Default::default()
             };
-            run_pipeline(&device, &kernels, &params, &logits, 1).map(|(t, _)| t)
+            run_pipeline(&device, &kernels, &params, logits, 1).map(|(t, _)| t)
         };
-        let Some(plain) = draw(&[]) else {
+        let mut logits = vec![0.1f32; vocab as usize];
+        logits[1234] = 9.0;
+        logits[7] = 3.0;
+        let Some(plain) = draw(&logits, &[], 1.0, &[]) else {
             eprintln!("skipping: no MTL4 queue");
             return;
         };
         assert_eq!(plain, 1234, "no bias: the argmax");
         assert_eq!(
-            draw(&[(42, 20.0)]),
+            draw(&logits, &[(42, 20.0)], 1.0, &[]),
             Some(42),
-            "+20 on a 0.1 logit outranks 9.0"
+            "+20 on 0.1 outranks 9.0"
         );
-        assert_eq!(
-            draw(&[(1234, -100.0)]),
-            Some(7),
-            "-100 on the argmax: the runner-up"
-        );
-        assert_eq!(
-            draw(&[(1234, -100.0), (99, 50.0)]),
-            Some(99),
-            "two biases, both applied"
-        );
+        let sunk = draw(&logits, &[(1234, -100.0)], 1.0, &[]);
+        assert_eq!(sunk, Some(7), "-100 on the argmax: the runner-up");
+        let two = draw(&logits, &[(99, 50.0), (1234, -100.0)], 1.0, &[]);
+        assert_eq!(two, Some(99), "two biases, both applied");
+
+        let mut ordered = vec![-10.0f32; vocab as usize];
+        ordered[5] = 1.0;
+        ordered[6] = -3.0;
+        let unbiased = draw(&ordered, &[], 2.0, &[5]);
+        assert_eq!(unbiased, Some(5), "penalized alone, 1.0 / 2 still leads");
+        let first = draw(&ordered, &[(5, -3.0)], 2.0, &[5]);
+        assert_eq!(first, Some(6), "bias first: (1 - 3) * 2 = -4 < -3");
     }
 
     // =======================================================================
@@ -1536,7 +1567,7 @@ mod tests {
             let res = batch.residency();
             let max_hist = params.max_output_len.max(params.max_prompt_len).max(1);
             let arena = SamplerArena::new(device, res, njobs, &kernels, max_hist);
-            let pending = arena.prepare_step(params, njobs, None);
+            let pending = arena.prepare_step(params, njobs, None, None);
             (pending, arena, res.pin(logits_buf.clone()))
         };
         let enc = batch.encoder();
@@ -1857,7 +1888,7 @@ mod tests {
         let res = batch.residency();
         let max_hist = params.max_output_len.max(params.max_prompt_len).max(1);
         let arena = SamplerArena::new(device, res, n as u32, kernels, max_hist);
-        let pending = arena.prepare_step(params, n as u32, None);
+        let pending = arena.prepare_step(params, n as u32, None, None);
         let pins = [res.pin(logits_buf.clone()), res.pin(tokens.clone())];
         pending.encode_into(batch.encoder(), logits_buf.gpuAddress(), &tokens, kernels);
         batch.commit(true);

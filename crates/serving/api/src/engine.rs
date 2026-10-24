@@ -3893,21 +3893,13 @@ fn truncate_prompt(tokens: &mut Vec<u32>, truncate: Option<i64>) -> ServeResult<
 }
 
 /// API-style `logit_bias` (string token-id keys, f64 values) as the sampler takes it: each bias
-/// clamped to [-100, 100], as vLLM clamps it. A key that is not a token id, or more than
-/// [`scratchy_core_common::MAX_LOGIT_BIAS`] of them, is a 400.
+/// clamped to [-100, 100], as vLLM clamps it. A key that is not a token id is a 400.
 fn parse_logit_bias(
     api_bias: &Option<std::collections::HashMap<String, f64>>,
 ) -> ServeResult<Option<std::collections::HashMap<u32, f32>>> {
     let Some(bias) = api_bias.as_ref().filter(|b| !b.is_empty()) else {
         return Ok(None);
     };
-    let max = scratchy_core_common::MAX_LOGIT_BIAS;
-    if bias.len() > max {
-        return Err(ServeError::Validation(format!(
-            "logit_bias may name at most {max} tokens, got {}",
-            bias.len()
-        )));
-    }
     let parsed = bias.iter().map(|(k, &v)| match k.parse::<u32>() {
         Ok(token) => Ok((token, v.clamp(-100.0, 100.0) as f32)),
         Err(_) => Err(ServeError::Validation(format!(
@@ -4415,7 +4407,7 @@ mod tests {
     }
 
     /// `logit_bias` keys are token ids and each bias is clamped to [-100, 100], as vLLM clamps
-    /// it; a key that is not a token id, or more entries than the sampler holds, is a 400.
+    /// it; a key that is not a token id is a 400, and there is no cap on how many.
     #[test]
     fn logit_bias_is_parsed_clamped_and_capped() {
         let bias =
@@ -4428,10 +4420,11 @@ mod tests {
         assert_eq!(parse_logit_bias(&None).unwrap(), None);
         assert_eq!(parse_logit_bias(&bias(&[])).unwrap(), None);
         assert!(parse_logit_bias(&bias(&[("abc", 1.0)])).is_err());
-        let many: Vec<(String, f64)> = (0..=scratchy_core_common::MAX_LOGIT_BIAS)
-            .map(|t| (t.to_string(), 1.0))
-            .collect();
-        assert!(parse_logit_bias(&Some(many.into_iter().collect())).is_err());
+        let many: HashMap<String, f64> = (0..5000).map(|t| (t.to_string(), 1.0)).collect();
+        assert_eq!(
+            parse_logit_bias(&Some(many)).unwrap().map(|b| b.len()),
+            Some(5000)
+        );
     }
 
     fn make_chat_request() -> protocol::ChatCompletionRequest {

@@ -42,6 +42,6 @@ pub use request::{
     compute_block_flags_rope_on_read,
 };
 pub use sampling::{
-    GpuSampleParams, LogprobsOutput, MAX_LOGIT_BIAS, RequestOutputKind, SamplingParams,
-    SamplingType, TokenLogprob, fnv_seed, seed_to_uniform,
+    GpuSampleParams, LogprobsOutput, RequestOutputKind, SamplingParams, SamplingType, TokenLogprob,
+    fnv_seed, seed_to_uniform,
 };

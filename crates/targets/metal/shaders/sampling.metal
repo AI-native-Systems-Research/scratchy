@@ -315,9 +315,12 @@ inline uint2 descent_pick(device const uint* h, uint round, uint k, uint2 prior,
 //                 logit -= freq * count + pres
 // Token id == vocab_size is padding (never matches a real vocab index); a
 // step without penalties has empty histories (consts[2], consts[3] = 0).
-// Then each row's logit bias (OpenAI `logit_bias`), after the penalties as
-// vLLM applies it: logit += bias_values[j] for bias_token_ids[j] == token, the
-// row's `consts[4]` entries padded the same way (0 on a step without one).
+// Each row's logit bias (OpenAI `logit_bias`) is added FIRST, before the
+// penalties, as cuda's processor pipeline and vLLM v1's sampler order them (the
+// repetition penalty is multiplicative and sign-dependent, so the order shows).
+// The biases are CSR: row r's entries bias_offsets[r]..bias_offsets[r + 1] of
+// bias_token_ids (ascending) and bias_values, searched per token. consts[4] is
+// 0 on a step without a biased row, and the lists are then not read.
 // ---------------------------------------------------------------------------
 
 template <typename T>
@@ -334,8 +337,9 @@ template <typename T>
     device       uint*  partials          [[buffer(9)]],
     constant     uint*  consts            [[buffer(10)]],
     device       uint*  hist              [[buffer(11)]],
-    device const int*   bias_token_ids    [[buffer(12)]],
-    device const float* bias_values       [[buffer(13)]],
+    device const uint*  bias_offsets      [[buffer(12)]],
+    device const uint*  bias_token_ids    [[buffer(13)]],
+    device const float* bias_values       [[buffer(14)]],
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
@@ -343,7 +347,7 @@ template <typename T>
     uint nslices = consts[0];
     uint max_output_len = consts[2];
     uint max_prompt_len = consts[3];
-    uint max_bias = consts[4];
+    bool biased = consts[4] != 0;
     uint row = tgp / nslices;
     uint slice = tgp % nslices;
     device const uint* state = row_state + (size_t)row * ROW_STATE_LEN;
@@ -351,8 +355,8 @@ template <typename T>
     device float* rowp = scratch + (size_t)row * vocab;
     device const int* out_ids    = output_token_ids + (size_t)row * max_output_len;
     device const int* prompt_ids = prompt_token_ids + (size_t)row * max_prompt_len;
-    device const int*   bias_ids  = bias_token_ids + (size_t)row * max_bias;
-    device const float* bias_vals = bias_values + (size_t)row * max_bias;
+    uint bias_begin = biased ? bias_offsets[row] : 0u;
+    uint bias_end = biased ? bias_offsets[row + 1] : 0u;
     float rep_pen  = rep_penalties[row];
     float freq_pen = freq_penalties[row];
     float pres_pen = pres_penalties[row];
@@ -368,6 +372,18 @@ template <typename T>
     float local_max = -INFINITY;
     for (uint v = b.x + tid; v < b.y; v += SAMPLING_BLOCK_SIZE) {
         float logit = float(in[v]);
+        uint lo = bias_begin, hi = bias_end;
+        while (lo < hi) {
+            uint mid = (lo + hi) / 2;
+            if (bias_token_ids[mid] < v) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo < bias_end && bias_token_ids[lo] == v) {
+            logit += bias_values[lo];
+        }
         int count = 0;
         for (uint j = 0; j < max_output_len; j++) {
             if (out_ids[j] == (int)v) count++;
@@ -382,9 +398,6 @@ template <typename T>
                 logit *= rep_pen;
             }
             logit -= freq_pen * (float)count + pres_pen;
-        }
-        for (uint j = 0; j < max_bias; j++) {
-            if (bias_ids[j] == (int)v) logit += bias_vals[j];
         }
         rowp[v] = logit;
         local_max = max(local_max, logit * inv_temp);
