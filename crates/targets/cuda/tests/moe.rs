@@ -14,9 +14,12 @@ pub mod common {
 use common::numerics::{bf16_inputs, bits, mismatched_bits};
 use half::bf16;
 use scratchy_target_cuda::kernels::{
-    KernelError, gate_scale_bf16, moe_combine_bf16, moe_route_bf16,
+    KernelError, SortRegions, expert_gemm_bf16, expert_gemv_bf16, gate_scale_bf16, gemm_bf16_abt,
+    gemv_bf16_abt, moe_combine_bf16, moe_route_bf16, moe_sort,
 };
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
+use scratchy_target_cuda::step::sort_index_regions;
+use scratchy_target_cuda::tape::moe_tiles;
 
 /// Extra output elements past the shape, which a kernel must leave untouched.
 const TAIL: usize = 4096;
@@ -478,4 +481,685 @@ fn moe_combine_bf16_matches_the_f64_sum() {
         pass &= ok;
     }
     assert!(pass, "the combine failed: see the lines above");
+}
+
+// ── M2 ExpertSort ──────────────────────────────────────────────────
+
+/// The grouped GEMM's row tile (`op_abi::CUDA_EXPERT_TILE_ROWS`).
+const TILE_ROWS: usize = 128;
+
+/// One sort's outputs, downloaded: its index regions and its sorted rows.
+#[derive(PartialEq, Eq)]
+struct Sorted {
+    counts: Vec<u32>,
+    offsets: Vec<u32>,
+    tile_expert: Vec<u32>,
+    pos: Vec<u32>,
+    rows: Vec<u16>,
+}
+
+/// The exact host counting sort of `topk_idx` (`P` picks of `m` tokens over 256 experts): stable,
+/// each run padded to 128 rows. `tile_expert` and `rows` are `[max_tiles]` and `[max_tiles · 128,
+/// hidden]`, `u32::MAX` and `SENTINEL` where no live tile reaches.
+fn sort_reference(topk_idx: &[u32], x: &[u16], hidden: usize, max_tiles: usize) -> Sorted {
+    let mut counts = vec![0u32; EXPERTS];
+    for &e in topk_idx {
+        counts[e as usize] += 1;
+    }
+    let mut offsets = vec![0u32; EXPERTS + 1];
+    for e in 0..EXPERTS {
+        offsets[e + 1] = offsets[e] + ((counts[e] as usize).div_ceil(TILE_ROWS) * TILE_ROWS) as u32;
+    }
+    let mut tile_expert = vec![u32::MAX; max_tiles];
+    for e in 0..EXPERTS {
+        let tiles = offsets[e] as usize / TILE_ROWS..offsets[e + 1] as usize / TILE_ROWS;
+        tile_expert[tiles].fill(e as u32);
+    }
+    let mut next = offsets.clone();
+    let mut pos = vec![0u32; topk_idx.len()];
+    let mut rows = vec![SENTINEL; max_tiles * TILE_ROWS * hidden];
+    for (p, &e) in topk_idx.iter().enumerate() {
+        let r = next[e as usize] as usize;
+        next[e as usize] += 1;
+        pos[p] = r as u32;
+        let t = p / TOP_K;
+        rows[r * hidden..(r + 1) * hidden].copy_from_slice(&x[t * hidden..(t + 1) * hidden]);
+    }
+    for e in 0..EXPERTS {
+        for r in next[e] as usize..offsets[e + 1] as usize {
+            rows[r * hidden..(r + 1) * hidden].fill(0);
+        }
+    }
+    Sorted {
+        counts,
+        offsets,
+        tile_expert,
+        pos,
+        rows,
+    }
+}
+
+/// The device buffers of one sort's inputs and outputs, outputs at their sentinels.
+struct SortBuffers {
+    x: DeviceBuffer,
+    topk_idx: DeviceBuffer,
+    index: DeviceBuffer,
+    rows: DeviceBuffer,
+    regions: [usize; 6],
+    max_tiles: usize,
+}
+
+/// Upload a sort's inputs (`m` tokens' rows `x` and `topk_idx`) and its sentinel outputs, at the
+/// tape's `max_tiles` for `m` (`tape::moe_tiles`).
+fn sort_buffers(device: &CudaDevice, x: &[u16], topk_idx: &[u32], m: usize) -> SortBuffers {
+    let (pairs, max_tiles, _) = moe_tiles(m as u32, EXPERTS as u32, TOP_K as u32).expect("tiles");
+    let regions = sort_index_regions(pairs, EXPERTS as u32, max_tiles)
+        .expect("regions")
+        .map(|b| b as usize);
+    SortBuffers {
+        x: up(device, x),
+        topk_idx: up_u32(device, topk_idx),
+        index: up_u32(device, &vec![u32::MAX; regions[5] / 4]),
+        rows: up(
+            device,
+            &vec![SENTINEL; max_tiles as usize * TILE_ROWS * HIDDEN],
+        ),
+        regions,
+        max_tiles: max_tiles as usize,
+    }
+}
+
+/// Launch the sort on `b` (`m` tokens), asynchronously on the default stream.
+fn launch_sort(b: &SortBuffers, m: usize) {
+    let at = |i: usize| b.index.ptr().wrapping_byte_add(b.regions[i]);
+    let regions = SortRegions {
+        chunk_hist: at(0),
+        counts: at(1),
+        offsets: at(2),
+        tile_expert: at(3),
+        pos: at(4),
+    };
+    // SAFETY: cudaMalloc pointers are 256-byte aligned and every region of `sort_index_regions`
+    // is 256-aligned inside `index`; `x` holds m·HIDDEN bf16, `topk_idx` m·TOP_K u32 below 256,
+    // `rows` max_tiles·128·HIDDEN bf16; the outputs are their own allocations; null is the
+    // default stream, which the downloads below wait for.
+    unsafe {
+        moe_sort(
+            (b.x.ptr(), b.topk_idx.ptr()),
+            regions,
+            b.rows.ptr(),
+            (
+                m as u32,
+                EXPERTS as u32,
+                TOP_K as u32,
+                HIDDEN as u32,
+                b.max_tiles as u32,
+            ),
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("moe_sort launch");
+}
+
+/// Launch the sort on `b` (`m` tokens), wait, and download what it wrote.
+fn run_sort(b: &SortBuffers, m: usize) -> Sorted {
+    launch_sort(b, m);
+    let index = down_u32(&b.index);
+    let region = |i: usize, len: usize| index[b.regions[i] / 4..][..len].to_vec();
+    Sorted {
+        counts: region(1, EXPERTS),
+        offsets: region(2, EXPERTS + 1),
+        tile_expert: region(3, b.max_tiles),
+        pos: region(4, m * TOP_K),
+        rows: b.rows.download().expect("rows"),
+    }
+}
+
+/// `m` tokens' picks: 8 distinct experts each, from `pick(t, j)` (deduplicated by stepping on).
+fn picks(m: usize, pick: impl Fn(usize, usize) -> usize) -> Vec<u32> {
+    let mut out = Vec::with_capacity(m * TOP_K);
+    for t in 0..m {
+        let mut row: Vec<u32> = Vec::with_capacity(TOP_K);
+        for j in 0..TOP_K {
+            let mut e = pick(t, j) % EXPERTS;
+            while row.contains(&(e as u32)) {
+                e = (e + 1) % EXPERTS;
+            }
+            row.push(e as u32);
+        }
+        out.extend(row);
+    }
+    out
+}
+
+/// A splitmix64 stream, for routings.
+fn mix(seed: u64) -> impl FnMut() -> u64 {
+    let mut state = seed;
+    move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
+/// The sort's routing cases at `m` tokens: every token to the same 8 experts (one long run each,
+/// 248 empty experts), uniform random picks, and runs of exactly 128 and 129 pairs.
+fn sort_cases(m: usize) -> Vec<(&'static str, Vec<u32>)> {
+    let mut r = mix(0x5027_0000 ^ m as u64);
+    let random: Vec<usize> = (0..m * TOP_K).map(|_| r() as usize).collect();
+    vec![
+        ("skewed", picks(m, |_, j| 200 + j)),
+        ("uniform", picks(m, |t, j| random[t * TOP_K + j])),
+        // Expert 7 gets tokens 0..128 (a run of exactly 128), expert 9 tokens 0..129; the rest
+        // spread.
+        (
+            "runs_128_129",
+            picks(m, |t, j| match j {
+                0 if t < 128 => 7,
+                1 if t < 129 => 9,
+                _ => 16 + random[t * TOP_K + j] % 200,
+            }),
+        ),
+    ]
+}
+
+/// The sort at P = 4,096 (m = 512) and P = 32,768 (m = 4,096), on each routing case: every index
+/// region and every live row bit-exact against the host counting sort, padding rows `+0.0`, rows
+/// past the live tiles never written; a repeat bit-identical; and the launcher's refusals.
+#[test]
+fn moe_sort_matches_the_host_counting_sort() {
+    let device = h100();
+    let mut pass = true;
+    for m in [512usize, 4096] {
+        let x = bf16_inputs(m * HIDDEN, 0x5027 ^ m as u64);
+        for (name, topk_idx) in sort_cases(m) {
+            let b = sort_buffers(&device, &x, &topk_idx, m);
+            let got = run_sort(&b, m);
+            let want = sort_reference(&topk_idx, &x, HIDDEN, b.max_tiles);
+            let live = want.offsets[EXPERTS] as usize / TILE_ROWS;
+            let regions_ok = got.counts == want.counts
+                && got.offsets == want.offsets
+                && got.tile_expert[..live] == want.tile_expert[..live]
+                && got.pos == want.pos;
+            let rows_bad = mismatched_bits(&got.rows, &want.rows);
+            let repeat = run_sort(&b, m);
+            let same = repeat == got;
+            let ok = regions_ok && rows_bad == 0 && same;
+            eprintln!(
+                "moe_sort m={m} pairs={} {name}: live_tiles={live}/{} regions_exact={regions_ok} \
+                 rows_mismatched_bits={rows_bad} repeat_identical={same} {}",
+                m * TOP_K,
+                b.max_tiles,
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    let rows = up(&device, &vec![SENTINEL; 1 << 16]);
+    for (m, e, k, h, tiles) in [
+        (512u32, 255u32, 8u32, 2048u32, 286u32),
+        (512, 256, 0, 2048, 286),
+        (512, 256, 33, 2048, 286),
+        (512, 256, 8, 2044, 286),
+        // One tile under `tape::moe_tiles(512, 256, 8)`'s 286.
+        (512, 256, 8, 2048, 285),
+        (0, 256, 8, 2048, 286),
+    ] {
+        let none = SortRegions {
+            chunk_hist: rows.ptr(),
+            counts: rows.ptr(),
+            offsets: rows.ptr(),
+            tile_expert: rows.ptr(),
+            pos: rows.ptr(),
+        };
+        // SAFETY: the launcher refuses these shapes before it touches any pointer.
+        let got = unsafe {
+            moe_sort(
+                (rows.ptr(), rows.ptr()),
+                none,
+                rows.ptr(),
+                (m, e, k, h, tiles),
+                std::ptr::null_mut(),
+            )
+        };
+        let kept = (rows.download().expect("rows").iter()).all(|&b| b == SENTINEL);
+        let want = Err(KernelError::MoeShape {
+            kernel: "moe_sort",
+            dims: [m, k, h, tiles],
+        });
+        let ok = got == want && kept;
+        eprintln!(
+            "moe_sort refusal {:?}: {got:?} out_unchanged={kept} {}",
+            [m, e, k, h, tiles],
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(pass, "the sort failed: see the lines above");
+}
+
+// ── M3 ExpertGemm ──────────────────────────────────────────────────
+
+/// qwen3-5-moe's expert width.
+const INTER: usize = 512;
+
+/// The grouped GEMM over the sorted `rows` (`max_tiles · 128` rows of `k`) and the sort's
+/// `offsets`/`tile_expert`, B `[256, n, k]`; its output `[max_tiles · 128, n]` from a sentinel.
+fn run_expert_gemm(
+    device: &CudaDevice,
+    (a, b): (&DeviceBuffer, &DeviceBuffer),
+    (offsets, tile_expert): (&[u32], &[u32]),
+    (max_tiles, n, k): (usize, usize, usize),
+) -> Vec<u16> {
+    let ob = up_u32(device, offsets);
+    let tb = up_u32(device, tile_expert);
+    let c = up(device, &vec![SENTINEL; max_tiles * TILE_ROWS * n]);
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `a` holds max_tiles·128·k bf16, `b`
+    // 256·n·k, `offsets` 257 u32 and `tile_expert` max_tiles (the live ones below 256); `c` is its
+    // own allocation of max_tiles·128·n; null is the default stream, which the download waits for.
+    unsafe {
+        expert_gemm_bf16(
+            (a.ptr(), b.ptr()),
+            (ob.ptr(), tb.ptr()),
+            c.ptr(),
+            (
+                max_tiles as u32,
+                n as u32,
+                k as u32,
+                EXPERTS as u32,
+                n as u32,
+            ),
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("expert_gemm_bf16 launch");
+    c.download().expect("download C")
+}
+
+/// The grouped GEMM on the sort's skewed and uniform outputs at m = 512 and 4,096, for the gate
+/// and up's shape (`n` 512, `k` 2,048) and the down's (`n` 2,048, `k` 512): every live tile's rows
+/// bit-identical to `gemm_bf16` on the same 128 rows against the same expert's `[n, k]`, within
+/// the #761 GEMM bound against f64 (one tile per case, sampled), every dead tile's rows still at
+/// the sentinel; and the launcher's refusals.
+#[test]
+fn expert_gemm_bf16_is_gemm_bf16_per_expert_tile() {
+    let device = h100();
+    let mut pass = true;
+    for m in [512usize, 4096] {
+        for (name, topk_idx) in sort_cases(m).into_iter().take(2) {
+            let x = bf16_inputs(m * HIDDEN, 0x3E33 ^ m as u64);
+            let sb = sort_buffers(&device, &x, &topk_idx, m);
+            let sorted = run_sort(&sb, m);
+            let live = sorted.offsets[EXPERTS] as usize / TILE_ROWS;
+            let max_tiles = sb.max_tiles;
+            for (proj, n, k) in [("gate_up", INTER, HIDDEN), ("down", HIDDEN, INTER)] {
+                // The gate and up read the sorted rows; the down reads an activation of their
+                // shape, here fresh inputs.
+                let a_bits = if k == HIDDEN {
+                    sorted.rows.clone()
+                } else {
+                    bf16_inputs(max_tiles * TILE_ROWS * k, 0xAC7 ^ m as u64)
+                };
+                let b_bits = bf16_inputs(EXPERTS * n * k, 0xB3 ^ n as u64);
+                let (a, b) = (up(&device, &a_bits), up(&device, &b_bits));
+                let gpu = run_expert_gemm(
+                    &device,
+                    (&a, &b),
+                    (&sorted.offsets, &sorted.tile_expert),
+                    (max_tiles, n, k),
+                );
+                let (mut bits_bad, mut bound_bad, mut worst) = (0usize, 0usize, 0.0f64);
+                let tile_len = TILE_ROWS * n;
+                let mut sampled = false;
+                for t in 0..live {
+                    let e = sorted.tile_expert[t] as usize;
+                    let at = t * TILE_ROWS;
+                    let a_t = up(&device, &a_bits[at * k..(at + TILE_ROWS) * k]);
+                    let b_e = b.ptr().wrapping_byte_add(e * n * k * 2);
+                    let c_t = up(&device, &vec![SENTINEL; tile_len]);
+                    // SAFETY: `a_t` holds 128·k bf16, `b_e` expert e's n·k inside `b`, `c_t` its
+                    // own allocation of 128·n; null is the default stream.
+                    unsafe {
+                        gemm_bf16_abt(
+                            a_t.ptr(),
+                            b_e,
+                            c_t.ptr(),
+                            TILE_ROWS as u32,
+                            n as u32,
+                            k as u32,
+                            std::ptr::null_mut(),
+                        )
+                    }
+                    .expect("gemm_bf16_abt launch");
+                    let tiled = c_t.download().expect("download");
+                    bits_bad += mismatched_bits(&gpu[at * n..][..tile_len], &tiled);
+                    // One tile per case against f64, the first that is not all padding.
+                    if !sampled && sorted.counts[e] > 0 {
+                        sampled = true;
+                        let cmp = common::numerics::compare(
+                            &gpu[at * n..][..tile_len],
+                            &a_bits[at * k..(at + TILE_ROWS) * k],
+                            &b_bits[e * n * k..(e + 1) * n * k],
+                            TILE_ROWS,
+                            n,
+                            k,
+                        );
+                        bound_bad += cmp.out_of_bound;
+                        let (_, _, g, r, bd) = cmp.worst;
+                        worst = (g - r).abs() / bd.max(f64::MIN_POSITIVE);
+                    }
+                }
+                let dead_untouched = gpu[live * tile_len..].iter().all(|&v| v == SENTINEL);
+                let ok = bits_bad == 0 && bound_bad == 0 && dead_untouched;
+                eprintln!(
+                    "expert_gemm_bf16 m={m} {name} {proj} n={n} k={k}: live_tiles={live}/\
+                     {max_tiles} mismatched_bits={bits_bad} sampled_out_of_bound={bound_bad} \
+                     sampled_worst_ratio={worst:.4} dead_tiles_untouched={dead_untouched} {}",
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    let c = up(&device, &vec![SENTINEL; 1 << 16]);
+    for (tiles, n, k, e, rows) in [
+        (0u32, 512u32, 2048u32, 256u32, 512u32),
+        (4, 500, 2048, 256, 512),
+        (4, 512, 2000, 256, 512),
+        (4, 512, 2048, 255, 512),
+        (4, 512, 2048, 256, 256),
+    ] {
+        // SAFETY: the launcher refuses these shapes before it touches any pointer.
+        let got = unsafe {
+            expert_gemm_bf16(
+                (c.ptr(), c.ptr()),
+                (c.ptr(), c.ptr()),
+                c.ptr(),
+                (tiles, n, k, e, rows),
+                std::ptr::null_mut(),
+            )
+        };
+        let kept = (c.download().expect("c").iter()).all(|&b| b == SENTINEL);
+        let want = Err(KernelError::MoeShape {
+            kernel: "expert_gemm_bf16",
+            dims: [tiles, n, k, rows],
+        });
+        let ok = got == want && kept;
+        eprintln!(
+            "expert_gemm_bf16 refusal {:?}: {got:?} out_unchanged={kept} {}",
+            [tiles, n, k, e, rows],
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(pass, "the grouped expert GEMM failed: see the lines above");
+}
+
+// ── M4 ExpertGemv ──────────────────────────────────────────────────
+
+/// The gathered expert GEMV at m = 1 for the gate and up's shape (token rows, `n` 512, `k` 2,048)
+/// and the down's (pair rows, `n` 2,048, `k` 512), with the 8 pairs on 8 distinct experts and on
+/// one repeated expert: each pair's row bit-identical to `gemv_bf16` on the same row and expert
+/// slice, within the #761 GEMM bound against f64, the tail intact; and the launcher's refusals.
+#[test]
+fn expert_gemv_bf16_is_gemv_bf16_per_pair() {
+    let device = h100();
+    let mut pass = true;
+    let pairs = TOP_K;
+    for (case, topk_idx) in [
+        ("distinct", vec![3u32, 250, 17, 128, 0, 255, 64, 99]),
+        ("repeated", vec![42u32; TOP_K]),
+    ] {
+        for (proj, n, k, pair_rows) in [
+            ("gate_up", INTER, HIDDEN, false),
+            ("down", HIDDEN, INTER, true),
+        ] {
+            let a_rows = if pair_rows { pairs } else { 1 };
+            let a_bits = bf16_inputs(a_rows * k, 0x6E3 ^ n as u64);
+            let b_bits = bf16_inputs(EXPERTS * n * k, 0xB4 ^ n as u64);
+            let (a, b) = (up(&device, &a_bits), up(&device, &b_bits));
+            let ib = up_u32(&device, &topk_idx);
+            let c = up(&device, &vec![SENTINEL; pairs * n + TAIL]);
+            // SAFETY: cudaMalloc pointers are 256-byte aligned; `a` holds a_rows·k bf16, `b`
+            // 256·n·k, `topk_idx` 8 u32 below 256, `c` its own allocation of 8·n and the tail;
+            // null is the default stream, which the download below waits for.
+            unsafe {
+                expert_gemv_bf16(
+                    (a.ptr(), b.ptr(), ib.ptr()),
+                    c.ptr(),
+                    (1, TOP_K as u32, n as u32, k as u32),
+                    (EXPERTS as u32, n as u32),
+                    pair_rows,
+                    std::ptr::null_mut(),
+                )
+            }
+            .expect("expert_gemv_bf16 launch");
+            let mut gpu = c.download().expect("download");
+            let tail = gpu[pairs * n..].iter().all(|&v| v == SENTINEL);
+            gpu.truncate(pairs * n);
+            let (mut bits_bad, mut bound_bad, mut worst) = (0usize, 0usize, 0.0f64);
+            for (p, &e) in topk_idx.iter().enumerate() {
+                let (e, row) = (e as usize, if pair_rows { p } else { 0 });
+                let a_p = &a_bits[row * k..(row + 1) * k];
+                let a_up = up(&device, a_p);
+                let b_e = b.ptr().wrapping_byte_add(e * n * k * 2);
+                let c_p = up(&device, &vec![SENTINEL; n]);
+                // SAFETY: `a_up` holds k bf16, `b_e` expert e's n·k inside `b`, `c_p` its own
+                // allocation of n; null is the default stream.
+                unsafe {
+                    gemv_bf16_abt(
+                        a_up.ptr(),
+                        b_e,
+                        c_p.ptr(),
+                        (n as u32, k as u32),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("gemv_bf16_abt launch");
+                let gemv = c_p.download().expect("download");
+                bits_bad += mismatched_bits(&gpu[p * n..(p + 1) * n], &gemv);
+                let cmp = common::numerics::compare(
+                    &gpu[p * n..(p + 1) * n],
+                    a_p,
+                    &b_bits[e * n * k..(e + 1) * n * k],
+                    1,
+                    n,
+                    k,
+                );
+                bound_bad += cmp.out_of_bound;
+                let (_, _, g, r, bd) = cmp.worst;
+                worst = worst.max((g - r).abs() / bd.max(f64::MIN_POSITIVE));
+            }
+            let ok = bits_bad == 0 && bound_bad == 0 && tail;
+            eprintln!(
+                "expert_gemv_bf16 m=1 {case} {proj} n={n} k={k}: mismatched_bits={bits_bad} \
+                 out_of_bound={bound_bad} worst_ratio={worst:.4} tail_intact={tail} {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    let c = up(&device, &vec![SENTINEL; 1 << 16]);
+    for (m, k, n, kk, e, rows) in [
+        (0u32, 8u32, 512u32, 2048u32, 256u32, 512u32),
+        (1, 0, 512, 2048, 256, 512),
+        (1, 33, 512, 2048, 256, 512),
+        (1, 8, 500, 2048, 256, 512),
+        (1, 8, 512, 2000, 256, 512),
+        (1, 8, 512, 2048, 255, 512),
+        (1, 8, 512, 2048, 256, 256),
+        (8192, 8, 512, 2048, 256, 512),
+    ] {
+        // SAFETY: the launcher refuses these shapes before it touches any pointer.
+        let got = unsafe {
+            expert_gemv_bf16(
+                (c.ptr(), c.ptr(), c.ptr()),
+                c.ptr(),
+                (m, k, n, kk),
+                (e, rows),
+                false,
+                std::ptr::null_mut(),
+            )
+        };
+        let kept = (c.download().expect("c").iter()).all(|&b| b == SENTINEL);
+        let want = Err(KernelError::MoeShape {
+            kernel: "expert_gemv_bf16",
+            dims: [m, k, n, kk],
+        });
+        let ok = got == want && kept;
+        eprintln!(
+            "expert_gemv_bf16 refusal {:?}: {got:?} out_unchanged={kept} {}",
+            [m, k, n, kk, e, rows],
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(pass, "the gathered expert GEMV failed: see the lines above");
+}
+
+// ── Timing ─────────────────────────────────────────────────────────
+
+/// The median of 20 runs of `launch` after 3 warm-ups, each timed from the host to its completion
+/// (`wait`, a download), in microseconds, and the minimum.
+fn median_us(mut launch: impl FnMut(), wait: impl Fn()) -> (f64, f64) {
+    let mut times = Vec::new();
+    for i in 0..23 {
+        let start = std::time::Instant::now();
+        launch();
+        wait();
+        if i >= 3 {
+            times.push(start.elapsed().as_secs_f64() * 1e6);
+        }
+    }
+    times.sort_by(f64::total_cmp);
+    (times[times.len() / 2], times[0])
+}
+
+/// The MoE kernels' time per launch at m = 1 and m = 4,096 (the sort and the grouped GEMM only
+/// at 4,096, the GEMV only at 1: the buckets each runs on), printed and not asserted.
+#[test]
+fn the_moe_kernel_times_are_recorded() {
+    let device = h100();
+    for m in [1usize, 4096] {
+        let topk_idx = picks(m, |t, j| t * 31 + j * 7);
+        let logits = up(&device, &bf16_inputs(m * EXPERTS, 0x7E));
+        let idx = up_u32(&device, &vec![0; m * TOP_K]);
+        let sc = up_u32(&device, &vec![0; m * TOP_K]);
+        let (med, min) = median_us(
+            // SAFETY: as `run_route`'s.
+            || {
+                unsafe {
+                    moe_route_bf16(
+                        logits.ptr(),
+                        (idx.ptr(), sc.ptr()),
+                        (m as u32, EXPERTS as u32, TOP_K as u32),
+                        true,
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("route")
+            },
+            || drop(sc.download()),
+        );
+        eprintln!("moe_route_bf16 time m={m}: median={med:.1}us min={min:.1}us (not asserted)");
+        let down = up(&device, &bf16_inputs(m * TOP_K * HIDDEN, 0x7F));
+        let out = up(&device, &vec![0; m * HIDDEN]);
+        let (med, min) = median_us(
+            // SAFETY: as `run_combine`'s, gathered.
+            || {
+                unsafe {
+                    moe_combine_bf16(
+                        (down.ptr(), None, sc.ptr()),
+                        out.ptr(),
+                        (m as u32, TOP_K as u32, HIDDEN as u32, (m * TOP_K) as u32),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("combine")
+            },
+            || drop(out.download()),
+        );
+        eprintln!("moe_combine_bf16 time m={m}: median={med:.1}us min={min:.1}us (not asserted)");
+        let g = up(&device, &bf16_inputs(m, 0x80));
+        let (med, min) = median_us(
+            // SAFETY: as `run_gate_scale`'s.
+            || {
+                unsafe {
+                    gate_scale_bf16(
+                        (down.ptr(), down.ptr(), g.ptr()),
+                        out.ptr(),
+                        (m as u32, HIDDEN as u32),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("gate scale")
+            },
+            || drop(out.download()),
+        );
+        eprintln!("gate_scale_bf16 time m={m}: median={med:.1}us min={min:.1}us (not asserted)");
+        let b = up(&device, &bf16_inputs(EXPERTS * HIDDEN * INTER, 0x81));
+        if m == 1 {
+            let ib = up_u32(&device, &topk_idx);
+            let x = up(&device, &bf16_inputs(HIDDEN, 0x82));
+            let c = up(&device, &vec![0; TOP_K * INTER]);
+            let (med, min) = median_us(
+                // SAFETY: as `expert_gemv_bf16_is_gemv_bf16_per_pair`'s, the gate's shape.
+                || {
+                    unsafe {
+                        expert_gemv_bf16(
+                            (x.ptr(), b.ptr(), ib.ptr()),
+                            c.ptr(),
+                            (1, TOP_K as u32, INTER as u32, HIDDEN as u32),
+                            (EXPERTS as u32, INTER as u32),
+                            false,
+                            std::ptr::null_mut(),
+                        )
+                    }
+                    .expect("gemv")
+                },
+                || drop(c.download()),
+            );
+            eprintln!(
+                "expert_gemv_bf16 time m=1 n={INTER} k={HIDDEN}: median={med:.1}us \
+                 min={min:.1}us (not asserted)"
+            );
+            continue;
+        }
+        let x = bf16_inputs(m * HIDDEN, 0x83);
+        let sb = sort_buffers(&device, &x, &topk_idx, m);
+        let (med, min) = median_us(|| launch_sort(&sb, m), || drop(sb.index.download()));
+        eprintln!("moe_sort time m={m}: median={med:.1}us min={min:.1}us (not asserted)");
+        let sorted = run_sort(&sb, m);
+        let ob = up_u32(&device, &sorted.offsets);
+        let tb = up_u32(&device, &sorted.tile_expert);
+        let c = up(&device, &vec![0; sb.max_tiles * TILE_ROWS * INTER]);
+        let (med, min) = median_us(
+            // SAFETY: as `run_expert_gemm`'s, the gate's shape.
+            || {
+                unsafe {
+                    expert_gemm_bf16(
+                        (sb.rows.ptr(), b.ptr()),
+                        (ob.ptr(), tb.ptr()),
+                        c.ptr(),
+                        (
+                            sb.max_tiles as u32,
+                            INTER as u32,
+                            HIDDEN as u32,
+                            EXPERTS as u32,
+                            INTER as u32,
+                        ),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("grouped gemm")
+            },
+            || drop(c.download()),
+        );
+        eprintln!(
+            "expert_gemm_bf16 time m={m} n={INTER} k={HIDDEN}: median={med:.1}us min={min:.1}us \
+             (not asserted)"
+        );
+    }
 }
