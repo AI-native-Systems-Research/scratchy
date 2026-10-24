@@ -134,6 +134,94 @@ __device__ inline float2 exp_of::op<float2>(const float2& x) {
     return float2{exp_of::op<float>(x.x), exp_of::op<float>(x.y)};
 }
 
+// One tap of the GDN conv1d's sum: `fmaf(a, b, c)`, `a·b + c` with one rounding, as the plain-CUDA
+// kernel's `fmaf(w, x, sum)`. Applied through the `rv_fma` gap below (three vector operands).
+struct fma_acc {
+    template <typename T>
+    static __device__ inline T op(const T& a, const T& b, const T& c) {
+        return fmaf(a, b, c);
+    }
+};
+template <>
+__device__ inline float fma_acc::op<float>(const float& a, const float& b, const float& c) {
+    return fmaf(a, b, c);
+}
+template <>
+__device__ inline float2 fma_acc::op<float2>(const float2& a, const float2& b, const float2& c) {
+    return float2{fma_acc::op<float>(a.x, b.x, c.x), fma_acc::op<float>(a.y, b.y, c.y)};
+}
+
+// SiLU: `x / (1 + e^(−x))`, the GDN conv1d's and gated norm's expression (`expf`, `__expf` under
+// `--use_fast_math`). For `x ≤ −88`, `e^(−x)` overflows to +inf and the result is a signed zero.
+struct silu {
+    template <typename T>
+    static __device__ inline T op(const T& x) {
+        return x / (1.0f + expf(-x));
+    }
+};
+template <>
+__device__ inline float silu::op<float>(const float& x) {
+    return x / (1.0f + expf(-x));
+}
+template <>
+__device__ inline float2 silu::op<float2>(const float2& x) {
+    return float2{silu::op<float>(x.x), silu::op<float>(x.y)};
+}
+
+// The sigmoid: `1 / (1 + e^(−x))`, the GDN gating's β, its expression.
+struct sigmoid {
+    template <typename T>
+    static __device__ inline T op(const T& x) {
+        return 1.0f / (1.0f + expf(-x));
+    }
+};
+template <>
+__device__ inline float sigmoid::op<float>(const float& x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+template <>
+__device__ inline float2 sigmoid::op<float2>(const float2& x) {
+    return float2{sigmoid::op<float>(x.x), sigmoid::op<float>(x.y)};
+}
+
+// The GDN gating's log decay: `−exp(a_log) · softplus(x)`, with `x = a + dt_bias` and
+// `softplus(x) = log1p(exp(x))` for `x ≤ 20`, else `x` (metal's threshold, and torch's default).
+// The whole expression is one op, the plain-CUDA kernel's, so its evaluation order and rounding
+// are kept exactly.
+struct gdn_g {
+    static constexpr float SOFTPLUS_THRESHOLD = 20.0f;
+    template <typename T>
+    static __device__ inline T op(const T& x, const T& a_log) {
+        return -expf(a_log) * (x <= SOFTPLUS_THRESHOLD ? log1pf(expf(x)) : x);
+    }
+};
+template <>
+__device__ inline float gdn_g::op<float>(const float& x, const float& a_log) {
+    return -expf(a_log) * (x <= SOFTPLUS_THRESHOLD ? log1pf(expf(x)) : x);
+}
+template <>
+__device__ inline float2 gdn_g::op<float2>(const float2& x, const float2& a_log) {
+    return float2{gdn_g::op<float>(x.x, a_log.x), gdn_g::op<float>(x.y, a_log.y)};
+}
+
+// TK-GAP(rv_fma) begin
+// A register-vector map over three vectors, `dst[i][j] = op(a[i][j], b[i][j], c[i][j])`: TK's own
+// vector `bin_op` (`ops/group/register/vec/maps.cuh`) takes one vector and a scalar, or two
+// vectors, never three. Written as TK writes `bin_op`: loops over `outer_dim` and `inner_dim`,
+// calling `op::template op<typename V::dtype>`. The GDN conv1d's `fma_acc` taps go through it, so
+// each tap is one `fmaf`, one rounding.
+template <typename op, kittens::ducks::rv::all V>
+__device__ static inline void rv_fma(V& dst, const V& a, const V& b, const V& c) {
+#pragma unroll
+    for (int i = 0; i < V::outer_dim; i++) {
+#pragma unroll
+        for (int j = 0; j < V::inner_dim; j++) {
+            dst[i][j] = op::template op<typename V::dtype>(a[i][j], b[i][j], c[i][j]);
+        }
+    }
+}
+// TK-GAP(rv_fma) end
+
 // TK-GAP(rv_ternary_map) begin
 // A register-vector map over two vectors and one scalar, `dst[i][j] = op(a[i][j], b[i][j], c)`:
 // TK's own vector `bin_op` (`ops/group/register/vec/maps.cuh`) takes one vector and a scalar, or

@@ -1021,17 +1021,19 @@ pub unsafe fn attn_decode_bf16(
 
 // THE GDN KERNELS. Four launches make one `GatedDeltaNet` step, in this order on one stream, each
 // reading `[slot, q_len, start, 0]` u32 from `sequence` (`start` 1 on a sequence's first chunk, 0
-// to continue from its slot) and touching only the `q_len` real rows. Each is plain CUDA with
-// under 48 KiB of static shared memory, so none is in `PREPARE`.
+// to continue from its slot) and touching only the `q_len` real rows. Each is a ThunderKittens
+// kernel with under 48 KiB of static shared memory, so none is in `PREPARE`.
 
 /// Launch the GDN causal depthwise conv1d, then SiLU: `conv_out[t, c]` (f32) for the real rows of
 /// `x [rows, conv_dim]` (bf16) under the taps `w [conv_dim, kernel]` (f32), the rows before 0 the
 /// slot's conv ring (zero, never read, on a fresh start); then the ring updated to the last
-/// `kernel − 1` inputs. Asynchronous.
+/// `kernel − 1` inputs. One warp per 128 channels and 64 tokens, the channels a ThunderKittens
+/// warp vector, each tap one `fmaf` in ascending order (`kernels/gdn_conv1d.cu`). Asynchronous.
 ///
 /// Refused with [`KernelError::GdnConvShape`], before any pointer is touched, unless `rows` and
-/// `conv_dim` are non-zero, `kernel` in `step::GDN_CONV_KERNEL_RANGE`, `rows · conv_dim` at most
-/// `i32::MAX`, and `slot_elems` exactly `conv_dim · (kernel − 1)`.
+/// `conv_dim` are non-zero, `conv_dim` a multiple of 128 (`step::GDN_CONV_CHANNEL_GROUP`),
+/// `kernel` in `step::GDN_CONV_KERNEL_RANGE`, `rows · conv_dim` at most `i32::MAX`, and
+/// `slot_elems` exactly `conv_dim · (kernel − 1)`.
 ///
 /// # Safety
 ///
@@ -1065,10 +1067,12 @@ pub unsafe fn gdn_conv1d(
 }
 
 /// Launch the GDN gating: for the real rows of `a` and `b` (`[rows, nv]` bf16), `g = −exp(a_log)
-/// · softplus(a + dt_bias)` and `beta = sigmoid(b)`, f32 `[rows, nv]` each. Asynchronous.
+/// · softplus(a + dt_bias)` and `beta = sigmoid(b)`, f32 `[rows, nv]` each. One warp per real
+/// row, the row a ThunderKittens warp vector (`kernels/gdn_gating.cu`). Asynchronous.
 ///
 /// Refused with [`KernelError::GdnGatingShape`], before any pointer is touched, unless `rows` and
-/// `nv` are non-zero and `rows · nv` at most `i32::MAX`.
+/// `nv` are non-zero, `nv` 16 or 32 (a multiple of `step::GDN_GATING_NV_MULTIPLE`, the widths the
+/// kernel is instantiated for), and `rows · nv` at most `i32::MAX`.
 ///
 /// # Safety
 ///
@@ -1169,7 +1173,9 @@ pub unsafe fn gdn_rank_one_probe(
 
 /// Launch the GDN gated RMSNorm: per real row and value head, `o / sqrt(mean(o²) + eps) · w ·
 /// SiLU(z)` over the head's `head_v` lanes, rounded once to bf16 into `out`; every padding row of
-/// `out` written `+0.0` without reading `o` or `z`. Asynchronous.
+/// `out` written `+0.0` without reading `o` or `z`. One warp per row, the row a ThunderKittens
+/// warp vector, its sum of squares by `warp::mul` then `warp::sum` (`kernels/gdn_rms_norm_gated.cu`).
+/// Asynchronous.
 ///
 /// Refused with [`KernelError::GdnNormShape`], before any pointer is touched, unless `rows` and
 /// `nv` are non-zero, `head_v` a non-zero multiple of 32 and at most 256, `rows · nv · head_v` at

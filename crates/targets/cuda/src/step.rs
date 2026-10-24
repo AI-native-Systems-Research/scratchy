@@ -343,15 +343,23 @@ pub const GDN_HEAD_K: u32 = 128;
 /// The GDN value-head dim is a non-zero multiple of this, the value rows of one scan CTA
 /// (`kernels/gdn_scan.cu`), and at most [`GDN_HEAD_V_MAX`].
 pub const GDN_HEAD_V_MULTIPLE: u32 = 32;
-/// The largest GDN value-head dim: the gated norm's one warp per row holds at most 8 lanes per
-/// thread (`kernels/gdn_rms_norm_gated.cu`).
+/// The largest GDN value-head dim: the gated norm's one warp per row is a naive `rv_fl<head_v>`,
+/// instantiated for 32, 64, …, 256 (`kernels/gdn_rms_norm_gated.cu`).
 pub const GDN_HEAD_V_MAX: u32 = 256;
 /// The causal conv's kernel width is in this inclusive range: its window lives in registers
 /// (`kernels/gdn_conv1d.cu`; metal's `GDN_CONV_KMAX` is 8).
 pub const GDN_CONV_KERNEL_RANGE: (u32, u32) = (2, 8);
-/// The tokens one conv thread walks. At least `conv_kernel − 1`, so only block 0 reads or writes a
+/// The tokens one conv warp walks. At least `conv_kernel − 1`, so only block 0 reads or writes a
 /// slot's conv ring.
 pub const GDN_CONV_TOKEN_BLOCK: u32 = 64;
+/// The causal conv's `conv_dim` is a non-zero multiple of this: one warp's channels, a naive
+/// `rv_fl<128>` (`kernels/gdn_conv1d.cu`). Checked by the launcher only; qwen3.5's `conv_dim`
+/// (6144 at the 0.8b, 8192 at the 9b) is a multiple, so no lowered tape is refused.
+pub const GDN_CONV_CHANNEL_GROUP: u32 = 128;
+/// The GDN gating's `nv` is a multiple of this, at most twice it: one warp per row holds the row as
+/// a naive `rv_fl<nv>`, instantiated for 16 and 32 (`kernels/gdn_gating.cu`). Checked by the
+/// launcher only; qwen3.5's `nv` is 16 at the 0.8b and 32 at the 9b.
+pub const GDN_GATING_NV_MULTIPLE: u32 = 16;
 /// The tokens the scan stages in shared memory at once.
 pub const GDN_SCAN_TOKEN_BLOCK: u32 = 32;
 

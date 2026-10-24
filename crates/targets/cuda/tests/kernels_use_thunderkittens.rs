@@ -44,16 +44,12 @@
 //!   reference), `__device__`/`__constant__` arrays, a home-made op struct inside a kernel file,
 //!   and loops over a view's elements.
 //!
-//! Kernels not yet rewritten are on [`NOT_YET_PORTED`]: each must still fail some rule (so the
-//! list cannot go stale), and every kernel off it must pass every rule. Each port removes its
-//! kernels from the list.
+//! Every kernel must pass every rule: the ports (TK-0 to TK-5b) emptied the list of kernels not yet
+//! rewritten, and the last one deleted it (PLAN-tk100 §1.5).
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-/// The kernels not yet rewritten with ThunderKittens. Each port PR removes its own.
-const NOT_YET_PORTED: &[&str] = &["gdn_conv1d.cu", "gdn_gating.cu", "gdn_rms_norm_gated.cu"];
 
 /// The inline PTX a kernel may hold, as `(file, PTX string)`: the async-proxy fence after the
 /// prefill's consumers zero a partial V tile, which TK at the pin emits only inside
@@ -64,7 +60,7 @@ const ASM_ALLOWLIST: &[(&str, &str)] = &[
 ];
 
 /// The op header's gap helpers: operations TK has no map for, written once against TK types.
-const TK_GAPS: &[&str] = &["rv_ternary_map"];
+const TK_GAPS: &[&str] = &["rv_ternary_map", "rv_fma"];
 
 /// The one extension header, directly under `kernels/`.
 const OP_HEADER: &str = "scratchy_ops.cuh";
@@ -2256,14 +2252,11 @@ fn kernels() -> Vec<(String, String)> {
     out
 }
 
-/// Every kernel off [`NOT_YET_PORTED`] passes every rule.
+/// Every kernel passes every rule.
 #[test]
-fn every_ported_kernel_passes_every_rule() {
+fn every_kernel_passes_every_rule() {
     let mut failures = Vec::new();
     for (name, text) in kernels() {
-        if NOT_YET_PORTED.contains(&name.as_str()) {
-            continue;
-        }
         let found = check(&name, &text, Kind::Kernel);
         let path = format!("kernels/{name}");
         if found.is_empty() {
@@ -2278,53 +2271,6 @@ fn every_ported_kernel_passes_every_rule() {
         failures.is_empty(),
         "{} violation(s) of the ThunderKittens-only rule: see the lines above",
         failures.len()
-    );
-}
-
-/// Every kernel on [`NOT_YET_PORTED`] exists and still fails some rule; the rules each fails are
-/// printed, for its port's issue to quote.
-#[test]
-fn every_kernel_not_yet_ported_still_fails() {
-    let all = kernels();
-    let names: BTreeSet<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
-    let mut problems = Vec::new();
-    let listed: BTreeSet<&str> = NOT_YET_PORTED.iter().copied().collect();
-    if listed.len() != NOT_YET_PORTED.len() {
-        problems.push("NOT_YET_PORTED names a kernel twice".to_string());
-    }
-    for name in NOT_YET_PORTED {
-        if !names.contains(name) {
-            problems.push(format!(
-                "NOT_YET_PORTED names {name}, which is not a kernel"
-            ));
-        }
-    }
-    for (name, text) in &all {
-        if !listed.contains(name.as_str()) {
-            continue;
-        }
-        let found = check(name, text, Kind::Kernel);
-        let failed: Vec<&str> = rules(&found).into_iter().collect();
-        eprintln!(
-            "kernels/{name} (not yet ported) fails {}",
-            if failed.is_empty() {
-                "nothing".to_string()
-            } else {
-                failed.join(" ")
-            }
-        );
-        if found.is_empty() {
-            problems.push(format!(
-                "kernels/{name} passes every rule: remove it from NOT_YET_PORTED"
-            ));
-        }
-    }
-    for p in &problems {
-        eprintln!("{p}");
-    }
-    assert!(
-        problems.is_empty(),
-        "NOT_YET_PORTED is stale: see the lines above"
     );
 }
 
