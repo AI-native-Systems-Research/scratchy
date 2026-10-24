@@ -4409,7 +4409,7 @@ mod tests {
     /// `logit_bias` keys are token ids and each bias is clamped to [-100, 100], as vLLM clamps
     /// it; a key that is not a token id is a 400, and there is no cap on how many.
     #[test]
-    fn logit_bias_is_parsed_clamped_and_capped() {
+    fn logit_bias_is_parsed_and_clamped_with_no_cap_on_its_size() {
         let bias =
             |pairs: &[(&str, f64)]| Some(pairs.iter().map(|&(k, v)| (k.to_string(), v)).collect());
         let parsed = parse_logit_bias(&bias(&[("7", 3.5), ("9", 1e9), ("11", -1e9)])).unwrap();
