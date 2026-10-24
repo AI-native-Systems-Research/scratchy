@@ -783,8 +783,8 @@ o2_cases! {
     // stem's own config carries the recipe (the qwen2.5-vl-3b-mlx
     // convention), so no quant feature is needed to build this case.
     "gpt-oss-120b-3bit" => o2_gpt_oss_120b_3bit_mlx("scratchery/gpt-oss-120b-3bit", Sampled);
-    "gpt-oss-20b" => o2_gpt_oss_20b_mlx("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Sampled);
-    "gpt-oss-20b" => o2_gpt_oss_20b_mlx_long("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Sampled, GPT_OSS_LONG_PROMPTS @ GPT_OSS_LONG_BUCKET_CAP);
-    "gpt-oss-20b" => o2_gpt_oss_20b_mlx_window("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Sampled, GPT_OSS_WINDOW_PROMPTS @ GPT_OSS_WINDOW_BUCKET_CAP);
-    "gpt-oss-20b" => o2_gpt_oss_20b_mlx_harmony("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Sampled, GPT_OSS_HARMONY_PROMPTS @ GPT_OSS_HARMONY_BUCKET_CAP);
+    "gpt-oss-20b" => o2_gpt_oss_20b_mlx("scratchery/gpt-oss-20b-4bit", Sampled);
+    "gpt-oss-20b" => o2_gpt_oss_20b_mlx_long("scratchery/gpt-oss-20b-4bit", Sampled, GPT_OSS_LONG_PROMPTS @ GPT_OSS_LONG_BUCKET_CAP);
+    "gpt-oss-20b" => o2_gpt_oss_20b_mlx_window("scratchery/gpt-oss-20b-4bit", Sampled, GPT_OSS_WINDOW_PROMPTS @ GPT_OSS_WINDOW_BUCKET_CAP);
+    "gpt-oss-20b" => o2_gpt_oss_20b_mlx_harmony("scratchery/gpt-oss-20b-4bit", Sampled, GPT_OSS_HARMONY_PROMPTS @ GPT_OSS_HARMONY_BUCKET_CAP);
 }
