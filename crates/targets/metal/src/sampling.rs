@@ -1099,9 +1099,21 @@ mod tests {
             return;
         };
         assert_eq!(plain, 1234, "no bias: the argmax");
-        assert_eq!(draw(&[(42, 20.0)]), Some(42), "+20 on a 0.1 logit outranks 9.0");
-        assert_eq!(draw(&[(1234, -100.0)]), Some(7), "-100 on the argmax: the runner-up");
-        assert_eq!(draw(&[(1234, -100.0), (99, 50.0)]), Some(99), "two biases, both applied");
+        assert_eq!(
+            draw(&[(42, 20.0)]),
+            Some(42),
+            "+20 on a 0.1 logit outranks 9.0"
+        );
+        assert_eq!(
+            draw(&[(1234, -100.0)]),
+            Some(7),
+            "-100 on the argmax: the runner-up"
+        );
+        assert_eq!(
+            draw(&[(1234, -100.0), (99, 50.0)]),
+            Some(99),
+            "two biases, both applied"
+        );
     }
 
     // =======================================================================
