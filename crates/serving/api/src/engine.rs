@@ -42,7 +42,7 @@ use scratchy_core_common::engine_io::EmbeddingData;
 use scratchy_core_common::multimodal::{ImageData, MultimodalData};
 use scratchy_core_common::sampling::GuidedGrammar;
 use scratchy_core_common::{
-    EngineCoreOutput, EngineCoreRequest, FinishReason, SamplingParams, SamplingType, StopReason,
+    EngineCoreOutput, EngineCoreRequest, FinishReason, SamplingParams, StopReason,
 };
 use scratchy_serving_engine::core_client::EngineCoreClient;
 use scratchy_serving_engine::engine_core::StepOutcome;
@@ -72,14 +72,8 @@ fn validate_n(n: u32, params: &SamplingParams) -> ServeResult<usize> {
             "n={n} exceeds the maximum of {MAX_N}"
         )));
     }
-    // Greedy sampling gives every choice the same tokens, so vLLM refuses `n > 1` there
-    // (`SamplingParams._verify_greedy_sampling`); `params` carries the temperature the request
-    // samples at, generation defaults applied.
-    if n > 1 && params.sampling_type() == SamplingType::Greedy {
-        return Err(ServeError::Validation(format!(
-            "n must be 1 when using greedy sampling, got {n}."
-        )));
-    }
+    // `params` carries the temperature the request samples at, generation defaults applied.
+    (params.check_greedy_n(n)).map_err(|msg| ServeError::Validation(msg.into_owned()))?;
     Ok(n.max(1) as usize)
 }
 
