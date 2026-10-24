@@ -85,6 +85,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -1355,8 +1356,8 @@ def cmd_replay(args):
 #
 # A task is a directory holding its own git repo (so it is copied fresh for every
 # session), a TASK.md whose text is the prompt, and a grade.sh that prints PASS
-# or FAIL. A grader the agent must not read lives outside the task and is passed
-# with --grader; it is run with the session's working copy as its argument.
+# or FAIL. A grader not in the agent's working copy lives outside the task and is
+# passed with --grader; it is run with the session's working copy as its argument.
 TASK_PROMPT = "TASK.md"
 TASK_GRADER = "grade.sh"
 # Lane B's minimum session count, from board.json's lanes.B.min_n.
@@ -1370,6 +1371,9 @@ TOOL_REJECTED = ("InputValidationError", "No such tool available")
 TOOL_MARKUP = ("<tool_call>", "<function=")
 # Seconds between the end of one session and the start of the next (#161 rule 6).
 LIVE_COOLDOWN_S = 30
+# Seconds a grader may run. One that takes longer fails the session: what it
+# grades is the agent's code, which may hang.
+GRADER_TIMEOUT_S = 600
 # 80% interval on a pass rate, matching the p10-p90 band the page draws.
 WILSON_Z = 1.2816
 # Routes scratchy leaves out of requests_served (server.rs COUNTED_EXCLUDED_ROUTES).
@@ -1399,20 +1403,89 @@ def fresh_copy(task, dest):
     return dest
 
 
-def grade(workdir, grader):
-    """(passed, the grader's last line) for one session's working copy.
+def run_own_group(cmd, *, cwd, timeout, stdout, stderr, env=None):
+    """(exit code, timed out) for `cmd`, run as a process group of its own that is
+    killed once `cmd` exits or times out. The exit code is None on a timeout.
 
-    The grader is the task's own grade.sh unless `grader` names another; it runs
-    with the working copy as its argument and in it as its directory, and passes
-    when it exits 0 and its last line is PASS.
+    `scr launch` starts Claude Code as its own child, and the agent may leave a
+    command running in the background; killing only `cmd` would leave either one
+    editing the working copy while it is graded. Output goes to files, not pipes,
+    so a process that escaped the group cannot hold this open.
     """
-    cmd = [str(Path(grader).resolve())] if grader else [str(Path(workdir) / TASK_GRADER)]
-    if not Path(cmd[0]).is_file():
-        raise SystemExit(f"no grader at {cmd[0]}")
-    p = subprocess.run(cmd + [str(workdir)], cwd=workdir, capture_output=True, text=True,
-                       timeout=600)
-    last = (p.stdout.strip().splitlines() or [""])[-1]
-    return p.returncode == 0 and last == "PASS", last or f"exit {p.returncode}"
+    p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=stdout,
+                         stderr=stderr, start_new_session=True)
+    try:
+        code, timed_out = p.wait(timeout=timeout), False
+    except subprocess.TimeoutExpired:
+        code, timed_out = None, True
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass  # nothing of it is left
+    p.wait()
+    return code, timed_out
+
+
+def restore_task_git(task_dir, commit, workdir, aside):
+    """Put the task's own git metadata, at `commit`, under the agent's files in `workdir`.
+
+    The agent has Bash in its working copy, so it can commit there, rewrite the
+    history or delete it, and a grader that checks a file against HEAD would then
+    check it against the agent's commit. The agent's .git is moved to `aside`,
+    where it can still be read, and the task's takes its place: HEAD at `commit`,
+    and everything the agent changed shows as uncommitted.
+    """
+    workdir = Path(workdir)
+    git = workdir / ".git"
+    if git.is_symlink() or git.exists():
+        os.rename(git, aside)
+    clone = Path(aside).with_name(Path(aside).name + ".clone")
+    subprocess.run(["git", "clone", "--quiet", "--no-checkout", "--no-hardlinks",
+                    str(Path(task_dir).resolve()), str(clone)], check=True)
+    os.rename(clone / ".git", git)
+    shutil.rmtree(clone)
+    # HEAD and the index at the task's commit; the files stay as the agent left them.
+    subprocess.run(["git", "-C", str(workdir), "reset", "--quiet", commit], check=True)
+
+
+def grade(workdir, grader, *, task_dir, commit, aside):
+    """(passed, the grader's last line) for one session's working copy. `passed`
+    is None when there is no grader left to run, so the session cannot be graded.
+
+    The grader the agent could edit is never the one that runs. The working copy
+    first gets the task's git history back (restore_task_git), and then, unless
+    `grader` names another, the task's grade.sh from `commit`, over whatever the
+    agent left in its place. A `grader` lives outside the agent's working copy,
+    though the agent can still read it: Bash runs on the host. Either one runs
+    with the working copy as its argument and in it as its directory, and passes
+    when it exits 0 and its last line is PASS. One that times out fails.
+    """
+    workdir = Path(workdir)
+    if not workdir.is_dir():
+        return False, "the agent removed its working copy"
+    restore_task_git(task_dir, commit, workdir, aside)
+    if grader:
+        cmd = Path(grader).resolve()
+        if not cmd.is_file():
+            return None, f"no grader at {cmd}"
+    else:
+        cmd = workdir / TASK_GRADER
+        if cmd.is_dir() and not cmd.is_symlink():
+            shutil.rmtree(cmd)
+        elif cmd.is_symlink() or cmd.exists():
+            cmd.unlink()
+        subprocess.run(["git", "-C", str(workdir), "checkout", "--quiet", commit, "--",
+                        TASK_GRADER], check=True)
+    with tempfile.TemporaryFile("w+", errors="replace") as out:
+        code, timed_out = run_own_group([str(cmd), str(workdir)], cwd=workdir,
+                                        timeout=GRADER_TIMEOUT_S, stdout=out,
+                                        stderr=subprocess.DEVNULL)
+        out.seek(0)
+        out = out.read()
+    if timed_out:
+        return False, f"grader timed out after {GRADER_TIMEOUT_S}s"
+    last = (out.strip().splitlines() or [""])[-1]
+    return code == 0 and last == "PASS", last or f"exit {code}"
 
 
 def session_stats(corpus):
@@ -1542,12 +1615,15 @@ def run_session(task, workdir, corpus, endpoint, *, scr, model, served_model, en
     seconds = time.monotonic() - t0
     served_after = requests_served(info_url)
     (Path(corpus) / "claude.log").write_text(output)
-    passed, grader_said = grade(workdir, task["grader"])
+    passed, grader_said = grade(workdir, task["grader"], task_dir=task["dir"],
+                                commit=task["commit"], aside=Path(corpus).parent / "agent.git")
     stats = session_stats(corpus)
     relayed = server.corpus.manifest["relayed"]
     void = None
     if stats["turns"] == 0:
         void = "no /v1/messages turn reached the engine: the agent never talked to it"
+    elif passed is None:
+        void = f"the session could not be graded: {grader_said}"
     elif served_before is not None and served_after is not None:
         # Every request the relay forwarded is one the engine should have counted,
         # less the introspection routes it never counts.
@@ -1562,7 +1638,7 @@ def run_session(task, workdir, corpus, endpoint, *, scr, model, served_model, en
         f"tool calls={stats['tool_calls']} failed={stats['tool_call_failures']} "
         f"{seconds:.0f}s exit={exit_code}{' TIMED OUT' if timed_out else ''}"
         + (f" VOID: {void}" if void else ""))
-    return {"corpus": Path(corpus).name, "pass": passed, "grader": grader_said,
+    return {"corpus": Path(corpus).name, "pass": bool(passed), "grader": grader_said,
             "claude_exit": exit_code, "timed_out": timed_out, "void": void,
             "requests_served_before": served_before, "requests_served_after": served_after,
             **stats}
@@ -1590,8 +1666,16 @@ def live(task, endpoint, *, engine, model, machine, rung, scratchy_sha, engine_p
         if sorted(engine_provenance.get(key) or {}) != sorted(ENGINES):
             raise SystemExit(f"{key} must name every engine in {sorted(ENGINES)}")
     task_dir, prompt = load_task(task)
-    if grader is None and not (task_dir / TASK_GRADER).is_file():
-        raise SystemExit(f"{task_dir}: no {TASK_GRADER}, and no --grader given")
+    task_dir = task_dir.resolve()
+    task_commit = subprocess.run(["git", "-C", str(task_dir), "rev-parse", "HEAD"],
+                                 capture_output=True, text=True, check=True).stdout.strip()
+    if grader is not None:
+        grader = Path(grader).resolve()
+        if not grader.is_file():
+            raise SystemExit(f"--grader {grader}: no such file")
+    elif subprocess.run(["git", "-C", str(task_dir), "cat-file", "-e",
+                         f"{task_commit}:{TASK_GRADER}"], capture_output=True).returncode:
+        raise SystemExit(f"{task_dir}: no {TASK_GRADER} committed, and no --grader given")
     # Every session runs in its own working copy, so a relative path would be
     # read from there.
     scr_path = shutil.which(scr) or (scr if Path(scr).is_file() else None)
@@ -1628,9 +1712,10 @@ def live(task, endpoint, *, engine, model, machine, rung, scratchy_sha, engine_p
                 raise SystemExit(f"session {i}: cache reset ({reset_name}) failed: {e}") from None
         workdir = fresh_copy(task_dir, out_dir / f"session-{i}" / "workdir")
         results.append(run_session(
-            {"grader": grader}, workdir, out_dir / f"session-{i}" / "corpus", endpoint,
-            scr=scr_path, model=model, served_model=served_model, engine_sha=scratchy_sha,
-            prompt=prompt, max_turns=max_turns, timeout_s=timeout_s, env=session_env, log=log))
+            {"grader": grader, "dir": task_dir, "commit": task_commit}, workdir,
+            out_dir / f"session-{i}" / "corpus", endpoint, scr=scr_path, model=model,
+            served_model=served_model, engine_sha=scratchy_sha, prompt=prompt,
+            max_turns=max_turns, timeout_s=timeout_s, env=session_env, log=log))
         if i < sessions and cooldown_s:
             time.sleep(cooldown_s)
 
@@ -1655,9 +1740,7 @@ def live(task, endpoint, *, engine, model, machine, rung, scratchy_sha, engine_p
                      "cache_reset": reset_name, "cache_reset_seconds": resets,
                      "served_model": served_model,
                      "grader": str(grader) if grader else f"{task_dir.name}/{TASK_GRADER}",
-                     "task_commit": subprocess.run(
-                         ["git", "-C", str(task_dir), "rev-parse", "HEAD"],
-                         capture_output=True, text=True).stdout.strip()},
+                     "task_commit": task_commit},
         },
         "artifacts": [f"session-{i}" for i in range(1, sessions + 1)],
         "disclosed": disclosed,
@@ -1782,8 +1865,8 @@ def main(argv=None):
                         "(default: <out>.sessions/)")
     v.add_argument("--run-id", help="run_id (default: the --out file's stem)")
     v.add_argument("--grader",
-                   help=f"grader to run instead of the task's own {TASK_GRADER}, for one the "
-                        "agent must not see; called with the session's working copy")
+                   help=f"grader to run instead of the task's own {TASK_GRADER}, for one not "
+                        "in the agent's working copy; called with that working copy")
     v.add_argument("--scr", default="scr", help="the scr binary that runs `launch claude`")
     v.add_argument("--max-turns", type=int, default=30, help="Claude Code's turn limit (default 30)")
     v.add_argument("--timeout-s", type=float, default=1800,

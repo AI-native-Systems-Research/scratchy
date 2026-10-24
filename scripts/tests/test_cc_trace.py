@@ -1016,9 +1016,10 @@ class HelperTest(unittest.TestCase):
 # Stands in for `scr launch claude` in the live tests: it reads `--server-url`,
 # sends the turns in $FAKE_TURNS (a JSON list of request bodies) to it as
 # Claude Code would, then applies $FAKE_FIX to the working copy the way an agent
-# edits files. No real Claude Code, no GPU.
+# edits files, and runs $FAKE_SHELL there the way an agent runs Bash. No real
+# Claude Code, no GPU.
 FAKE_SCR = r'''#!/usr/bin/env python3
-import json, os, sys, urllib.request
+import json, os, subprocess, sys, urllib.request
 args = sys.argv[1:]
 url = args[args.index("--server-url") + 1]
 for body in json.loads(os.environ.get("FAKE_TURNS", "[]")):
@@ -1029,6 +1030,8 @@ for body in json.loads(os.environ.get("FAKE_TURNS", "[]")):
 fix = os.environ.get("FAKE_FIX")
 if fix:
     open("m.py", "w").write(fix)
+if os.environ.get("FAKE_SHELL"):
+    subprocess.run(os.environ["FAKE_SHELL"], shell=True, check=True)
 '''
 
 TASK_BROKEN = "def add(a, b):\n    return a - b\n"
@@ -1246,6 +1249,52 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(run["status"], "published", run.get("void"))
         self.assertEqual(detail["sessions"][0]["pass"], True)
         self.assertTrue((self.root / "out" / "session-1" / "corpus" / "manifest.json").exists())
+
+    def test_the_agent_cannot_change_the_grader_that_grades_it(self):
+        commit = ["git", "-c", "user.name=a", "-c", "user.email=a@a", "commit", "-qam", "agent"]
+        cheat_t = "printf 'print(\"OK\")\\n' > t.py && " + " ".join(commit)
+        cases = [
+            # (what the agent's Bash did, its fix of m.py, graded as)
+            ("printf '#!/bin/sh\\necho PASS\\n' > grade.sh", TASK_BROKEN, False),
+            ("rm grade.sh", TASK_FIXED, True),
+            ("rm grade.sh", TASK_BROKEN, False),
+            # A test the agent rewrote and committed, so `git diff HEAD` is clean.
+            (cheat_t, TASK_BROKEN, False),
+            # No history left for the grader's `git diff HEAD`.
+            ("rm -rf .git", TASK_FIXED, True),
+            # A history of the agent's own, with its grade.sh committed in it.
+            ("rm -rf .git && printf '#!/bin/sh\\necho PASS\\n' > grade.sh && git init -q && "
+             "git add -A && " + " ".join(commit), TASK_BROKEN, False),
+        ]
+        for i, (shell, fix, passed) in enumerate(cases):
+            with self.subTest(shell=shell, fixed=fix == TASK_FIXED):
+                self.env.update(FAKE_SHELL=shell, FAKE_FIX=fix)
+                run, detail = self._live(sessions=1, out_dir=self.root / f"out-{i}")
+                self.assertEqual(run["status"], "published", run.get("void"))
+                self.assertEqual(detail["sessions"][0]["pass"], passed,
+                                 detail["sessions"][0]["grader"])
+        self.assertEqual((self.task / "grade.sh").read_text(), TASK_GRADE)
+
+    def test_a_grader_that_hangs_fails_the_session(self):
+        hung = self.root / "hung.sh"
+        hung.write_text("#!/bin/sh\nsleep 30\necho PASS\n")
+        hung.chmod(0o755)
+        saved = cc_trace.GRADER_TIMEOUT_S
+        self.addCleanup(setattr, cc_trace, "GRADER_TIMEOUT_S", saved)
+        cc_trace.GRADER_TIMEOUT_S = 1
+        t0 = time.monotonic()
+        run, detail = self._live(sessions=2, grader=hung)
+        self.assertLess(time.monotonic() - t0, 20)
+        self.assertEqual(run["status"], "published", run.get("void"))
+        self.assertEqual([r["pass"] for r in detail["sessions"]], [False, False])
+        self.assertIn("timed out", detail["sessions"][0]["grader"])
+
+    def test_a_missing_grader_is_refused_before_any_session(self):
+        with self.assertRaises(SystemExit) as e:
+            self._live(grader=self.root / "nowhere.sh")
+        self.assertIn("nowhere.sh", str(e.exception))
+        self.assertEqual(FakeAnthropic.seen, [])
+        self.assertFalse((self.root / "out").exists())
 
     @unittest.skipUnless(VALIDATOR.exists() and BOARD.exists(),
                          "needs site/build_leaderboard.py and board.json (#176)")
