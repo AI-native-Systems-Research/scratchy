@@ -319,9 +319,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_decode_bf16_ker(
             warp::store(r_part[1], max_vec_last);
             warp::store(l_part[0], norm_vec);
             __syncwarp();
+            // `mul_row`/`div_row` (`row_map`) index each shared tile through its swizzled
+            // `operator[]`, and `add` (`bin_map`) through its raw `data[i]`, so a lane reads words
+            // other lanes just wrote: a warp barrier between each hand-off. Only this warp is here,
+            // so it is `__syncwarp`, never a group or named barrier.
             warp::mul_row(o_part[0], o_part[0], r_part[0]);
             warp::mul_row(o_part[1], o_part[1], r_part[1]);
+            __syncwarp();
             warp::add(o_part[0], o_part[0], o_part[1]);
+            __syncwarp();
             warp::div_row(o_part[0], o_part[0], l_part[0]);
             __syncwarp();
             warp::load(o_reg, o_part[0]);
