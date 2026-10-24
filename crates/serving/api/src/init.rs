@@ -1287,6 +1287,82 @@ fn effective_prefix_caching(requested: bool, recurrent_hybrid: bool, snapshots: 
     requested && (!recurrent_hybrid || snapshots)
 }
 
+/// ⭐ WHETHER THE ENGINE SERVES CACHED PREFIXES, as EVERY entry point decides it (#435): asked for,
+/// honoured by the backend ([`requested_prefix_caching`]), and, for a recurrent hybrid
+/// ([`is_recurrent_hybrid_arch`]), with `snapshots` of its recurrent state that a hit resumes
+/// from ([`effective_prefix_caching`]). `snapshots` is what the engine's executor reports
+/// (`Executor::snapshot_budget`): an executor that forwards none keeps a hybrid's caching off.
+fn prefix_caching(
+    config: &VllmConfig,
+    architectures: &[String],
+    worker_snapshots: Option<scratchy_serving_scheduler::scheduler::SnapshotBudget>,
+) -> bool {
+    let hybrid = is_recurrent_hybrid_arch(architectures);
+    let requested = requested_prefix_caching(config);
+    if hybrid && requested {
+        if let Some(budget) = worker_snapshots {
+            info!(
+                "Prefix caching on for {:?}, a recurrent/hybrid (Mamba/Gated-DeltaNet) \
+                 architecture: the worker keeps up to {} snapshots of its recurrent state in \
+                 the KV budget, and a hit resumes only where one exists",
+                architectures, budget.max_slots
+            );
+        } else {
+            info!(
+                "Prefix caching disabled: {:?} is a recurrent/hybrid (Mamba/Gated-DeltaNet) \
+                 architecture and the worker keeps no snapshots of its conv/ssm state, which a \
+                 cached KV prefix cannot reconstruct (a backend without them, a pooling or \
+                 draft-model run, or no memory for one beside the KV floor)",
+                architectures
+            );
+        }
+    }
+    // ⛔ AND THE BACKEND MUST BE ABLE TO HONOUR IT — asked HERE, where every entry point passes.
+    //
+    // A worker that cannot serve a cached prefix (`WorkerFactory::supports_prefix_caching`) gets a
+    // scheduler that SKIPS the prefill for a prefix it believes is resident, while the worker holds
+    // no KV for those slots. The rows then attend UNWRITTEN pool pages.
+    //
+    // ⭐ THIS CHECK ALREADY EXISTED — in `LlmEngine::from_config` ONLY. `scr batch` builds its stack
+    // through `initialize_stack` -> `initialize_core` and never reached it, so batch runs had prefix
+    // caching ON against a backend that declares it unsupported. Measured cost: rows whose prefill was
+    // skipped read unwritten pages, and the resulting garbage was indistinguishable from a batched-decode
+    // bug — it cost most of a session's debugging before `Prefix caching enabled` in the log gave it away.
+    // ⛔⛔⛔ AND WHEN A BACKEND REFUSES, THE REFUSAL MUST NAME A PROPERTY OF THE BACKEND — NOT A
+    // FEATURE SWITCHED OFF SO A TEST WOULD PASS.
+    //
+    // The comment that used to sit here said the spyre pool "cannot support it BY CONSTRUCTION"
+    // because `PageRun::physical(lp) = row * pages_per_row + lp` gave every row an exclusive page
+    // stripe. The striping was real; "by construction" was not — it described OUR construction, a
+    // layout picked so one launch could stride the whole batch. The device's actual limit is that it
+    // has no indirect addressing, which forbids nothing here. That `row *` term was also exactly the
+    // "request concept below the host" the KV design forbids, so prefix caching was never a separate
+    // feature to decline: it was blocked by a defect in the pool's addressing.
+    //
+    // ⭐ IT IS SUPPORTED NOW (`SpyreWorkerFactory::supports_prefix_caching`), by three changes that
+    // between them make a shared prefix real rather than promised:
+    //   1. a request's pages ARE the scheduler's `block_ids` (`install_host_blocks` + `BlockTable`,
+    //      whose only constructor takes host ids), so the worker's own free-list allocator — a second
+    //      allocator over the scheduler's pool, and the actual blocker — no longer exists;
+    //   2. the block size and the block COUNT come from the pool that addresses them
+    //      (`WorkerFactory::required_block_size`, `Worker::kv_cache_num_blocks_override`), so a block
+    //      id is a page and never one the pool lacks;
+    //   3. the worker reports, per request and per step, the SLOT SPAN its blocks must cover and the
+    //      leading tokens a token-indexed cache may hash (`ModelRunnerOutput::kv_extent`) — because a
+    //      batched step appends every row at one slot, so a short request's keys spread past its token
+    //      count and only its first contiguous run is token-addressed.
+    //
+    // Asked at the ONE point that computes the flag, so no future entry point can skip it.
+    if config.enable_prefix_caching && !requested {
+        info!(
+            "Prefix caching disabled: the {} backend's worker does not support it — the scheduler \
+             would skip the prefill for a prefix the worker holds no KV for",
+            config.device
+        );
+    }
+    effective_prefix_caching(requested, hybrid, worker_snapshots.is_some())
+}
+
 /// Common initialization: worker → cache → executor → InprocClient → tokenizer.
 ///
 /// Handles both single-GPU (TP=1) and multi-GPU (TP>1) transparently.
@@ -1533,72 +1609,7 @@ fn initialize_core(
     // the worker keeps snapshots (`Worker::snapshot_budget`) — see
     // `effective_prefix_caching`. (Per-layer linear-attention is the marker;
     // detect by arch string.)
-    let enable_prefix_caching = {
-        let hybrid = is_recurrent_hybrid_arch(&hf_config.architectures);
-        let requested = requested_prefix_caching(config);
-        if hybrid && requested {
-            if let Some(budget) = worker_snapshots {
-                info!(
-                    "Prefix caching on for {:?}, a recurrent/hybrid (Mamba/Gated-DeltaNet) \
-                     architecture: the worker keeps up to {} snapshots of its recurrent state in \
-                     the KV budget, and a hit resumes only where one exists",
-                    hf_config.architectures, budget.max_slots
-                );
-            } else {
-                info!(
-                    "Prefix caching disabled: {:?} is a recurrent/hybrid (Mamba/Gated-DeltaNet) \
-                     architecture and the worker keeps no snapshots of its conv/ssm state, which a \
-                     cached KV prefix cannot reconstruct (a backend without them, a pooling or \
-                     draft-model run, or no memory for one beside the KV floor)",
-                    hf_config.architectures
-                );
-            }
-        }
-        // ⛔ AND THE BACKEND MUST BE ABLE TO HONOUR IT — asked HERE, where every entry point passes.
-        //
-        // A worker that cannot serve a cached prefix (`WorkerFactory::supports_prefix_caching`) gets a
-        // scheduler that SKIPS the prefill for a prefix it believes is resident, while the worker holds
-        // no KV for those slots. The rows then attend UNWRITTEN pool pages.
-        //
-        // ⭐ THIS CHECK ALREADY EXISTED — in `LlmEngine::from_config` ONLY. `scr batch` builds its stack
-        // through `initialize_stack` -> `initialize_core` and never reached it, so batch runs had prefix
-        // caching ON against a backend that declares it unsupported. Measured cost: rows whose prefill was
-        // skipped read unwritten pages, and the resulting garbage was indistinguishable from a batched-decode
-        // bug — it cost most of a session's debugging before `Prefix caching enabled` in the log gave it away.
-        // ⛔⛔⛔ AND WHEN A BACKEND REFUSES, THE REFUSAL MUST NAME A PROPERTY OF THE BACKEND — NOT A
-        // FEATURE SWITCHED OFF SO A TEST WOULD PASS.
-        //
-        // The comment that used to sit here said the spyre pool "cannot support it BY CONSTRUCTION"
-        // because `PageRun::physical(lp) = row * pages_per_row + lp` gave every row an exclusive page
-        // stripe. The striping was real; "by construction" was not — it described OUR construction, a
-        // layout picked so one launch could stride the whole batch. The device's actual limit is that it
-        // has no indirect addressing, which forbids nothing here. That `row *` term was also exactly the
-        // "request concept below the host" the KV design forbids, so prefix caching was never a separate
-        // feature to decline: it was blocked by a defect in the pool's addressing.
-        //
-        // ⭐ IT IS SUPPORTED NOW (`SpyreWorkerFactory::supports_prefix_caching`), by three changes that
-        // between them make a shared prefix real rather than promised:
-        //   1. a request's pages ARE the scheduler's `block_ids` (`install_host_blocks` + `BlockTable`,
-        //      whose only constructor takes host ids), so the worker's own free-list allocator — a second
-        //      allocator over the scheduler's pool, and the actual blocker — no longer exists;
-        //   2. the block size and the block COUNT come from the pool that addresses them
-        //      (`WorkerFactory::required_block_size`, `Worker::kv_cache_num_blocks_override`), so a block
-        //      id is a page and never one the pool lacks;
-        //   3. the worker reports, per request and per step, the SLOT SPAN its blocks must cover and the
-        //      leading tokens a token-indexed cache may hash (`ModelRunnerOutput::kv_extent`) — because a
-        //      batched step appends every row at one slot, so a short request's keys spread past its token
-        //      count and only its first contiguous run is token-addressed.
-        //
-        // Asked at the ONE point that computes the flag, so no future entry point can skip it.
-        if config.enable_prefix_caching && !requested {
-            info!(
-                "Prefix caching disabled: the {} backend's worker does not support it — the scheduler \
-                 would skip the prefill for a prefix the worker holds no KV for",
-                config.device
-            );
-        }
-        effective_prefix_caching(requested, hybrid, worker_snapshots.is_some())
-    };
+    let enable_prefix_caching = prefix_caching(config, &hf_config.architectures, worker_snapshots);
 
     // Device-specific `max_num_batched_tokens` default — no flat constant on any
     // backend. On backends that prune a compiled prefill-bucket ladder
@@ -1941,23 +1952,30 @@ fn initialize_core_tp(config: &VllmConfig, speculation: &Speculation) -> Result<
         let executor = ThreadPoolExecutor::new(workers, parallel_config);
 
         let use_async_scheduling = !config.disable_async_scheduling && !speculation.requires_sync();
-        let enable_prefix_caching = config.enable_prefix_caching;
+        let enable_prefix_caching = prefix_caching(
+            config,
+            &hf_config.architectures,
+            scratchy_serving_engine::executor::Executor::snapshot_budget(&executor),
+        );
 
-        let eos_token_ids: Vec<u32> = hf_config
-            .extra
-            .get("eos_token_id")
-            .map(|v| {
-                if let Some(id) = v.as_u64() {
-                    vec![id as u32]
-                } else if let Some(arr) = v.as_array() {
-                    arr.iter()
-                        .filter_map(|v| v.as_u64().map(|id| id as u32))
-                        .collect()
-                } else {
-                    vec![]
-                }
+        // Prefer the GGUF-preloaded tokenizer harvested from rank 0's
+        // worker above. Falls back to `try_load_tokenizer(dir)` for
+        // safetensors where a sibling `tokenizer.json` lives next to
+        // the weights. Mirrors `initialize_core`'s tp=1 flow.
+        let tokenizer = preloaded_tokenizer
+            .map(Tokenizer::from_hf_tokenizer)
+            .or_else(|| {
+                model_dir
+                    .as_ref()
+                    .and_then(|dir| try_load_tokenizer(dir).ok())
             })
-            .unwrap_or_default();
+            .map(|tok| {
+                info!("Tokenizer loaded");
+                Arc::new(tok)
+            });
+
+        let eos_token_ids =
+            resolve_eos_token_ids(&hf_config, model_dir.as_deref(), tokenizer.as_deref());
 
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
@@ -1986,22 +2004,6 @@ fn initialize_core_tp(config: &VllmConfig, speculation: &Speculation) -> Result<
         };
 
         let client = InprocClient::new(engine_config, Box::new(executor));
-
-        // Prefer the GGUF-preloaded tokenizer harvested from rank 0's
-        // worker above. Falls back to `try_load_tokenizer(dir)` for
-        // safetensors where a sibling `tokenizer.json` lives next to
-        // the weights. Mirrors `initialize_core`'s tp=1 flow.
-        let tokenizer = preloaded_tokenizer
-            .map(Tokenizer::from_hf_tokenizer)
-            .or_else(|| {
-                model_dir
-                    .as_ref()
-                    .and_then(|dir| try_load_tokenizer(dir).ok())
-            })
-            .map(|tok| {
-                info!("Tokenizer loaded");
-                Arc::new(tok)
-            });
 
         Ok(InitializedCore {
             client,
@@ -2490,24 +2492,20 @@ fn initialize_stack_multinode(
         let multi_executor = MultiNodeExecutor::new(Box::new(executor), channel);
 
         // Step 11: Build engine.
-        let eos_token_ids: Vec<u32> = hf_config
-            .extra
-            .get("eos_token_id")
-            .map(|v| {
-                if let Some(id) = v.as_u64() {
-                    vec![id as u32]
-                } else if let Some(arr) = v.as_array() {
-                    arr.iter()
-                        .filter_map(|v| v.as_u64().map(|id| id as u32))
-                        .collect()
-                } else {
-                    vec![]
-                }
-            })
-            .unwrap_or_default();
+        // Load tokenizer and build engine.
+        let tokenizer = model_dir
+            .as_ref()
+            .and_then(|dir| try_load_tokenizer(dir).ok());
+
+        let eos_token_ids =
+            resolve_eos_token_ids(&hf_config, model_dir.as_deref(), tokenizer.as_ref());
 
         let use_async_scheduling = !config.disable_async_scheduling && !speculation.requires_sync();
-        let enable_prefix_caching = config.enable_prefix_caching;
+        let enable_prefix_caching = prefix_caching(
+            config,
+            &hf_config.architectures,
+            scratchy_serving_engine::executor::Executor::snapshot_budget(&multi_executor),
+        );
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
@@ -2534,11 +2532,6 @@ fn initialize_stack_multinode(
 
         let client: Box<dyn scratchy_serving_engine::core_client::EngineCoreClient + Send> =
             Box::new(InprocClient::new(engine_config, Box::new(multi_executor)));
-
-        // Load tokenizer and build engine.
-        let tokenizer = model_dir
-            .as_ref()
-            .and_then(|dir| try_load_tokenizer(dir).ok());
 
         let mut engine = build_engine(
             client,
@@ -3041,26 +3034,22 @@ fn initialize_stack_tp_pp(
             let executor = ThreadPoolExecutor::new(workers, parallel_config);
 
             // Build engine (same as TP-only path).
-            let eos_token_ids: Vec<u32> = hf_config
-                .extra
-                .get("eos_token_id")
-                .map(|v| {
-                    if let Some(id) = v.as_u64() {
-                        vec![id as u32]
-                    } else if let Some(arr) = v.as_array() {
-                        arr.iter()
-                            .filter_map(|v| v.as_u64().map(|id| id as u32))
-                            .collect()
-                    } else {
-                        vec![]
-                    }
-                })
-                .unwrap_or_default();
+            // Load tokenizer and build engine.
+            let tokenizer = model_dir
+                .as_ref()
+                .and_then(|dir| try_load_tokenizer(dir).ok());
+
+            let eos_token_ids =
+                resolve_eos_token_ids(&hf_config, model_dir.as_deref(), tokenizer.as_ref());
 
             // PP: force sync scheduling — async scheduling with PP requires token broadcast
             // from last stage to non-last stages, which is not yet implemented.
             let use_async_scheduling = false;
-            let enable_prefix_caching = config.enable_prefix_caching;
+            let enable_prefix_caching = prefix_caching(
+                config,
+                &hf_config.architectures,
+                scratchy_serving_engine::executor::Executor::snapshot_budget(&executor),
+            );
             let engine_config = EngineCoreConfig {
                 scheduler_config: SchedulerConfig {
                     max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
@@ -3094,11 +3083,6 @@ fn initialize_stack_tp_pp(
 
             let client: Box<dyn scratchy_serving_engine::core_client::EngineCoreClient + Send> =
                 Box::new(InprocClient::new(engine_config, Box::new(executor)));
-
-            // Load tokenizer and build engine.
-            let tokenizer = model_dir
-                .as_ref()
-                .and_then(|dir| try_load_tokenizer(dir).ok());
 
             let mut engine = build_engine(
                 client,
@@ -3378,24 +3362,28 @@ fn initialize_stack_tp(
         let executor = ThreadPoolExecutor::new(workers, parallel_config);
 
         // Build engine.
-        let eos_token_ids: Vec<u32> = hf_config
-            .extra
-            .get("eos_token_id")
-            .map(|v| {
-                if let Some(id) = v.as_u64() {
-                    vec![id as u32]
-                } else if let Some(arr) = v.as_array() {
-                    arr.iter()
-                        .filter_map(|v| v.as_u64().map(|id| id as u32))
-                        .collect()
-                } else {
-                    vec![]
-                }
+        // Load tokenizer. Apply the same `additional_special_tokens`
+        // patch as the single-rank path — Qwen2-VL chat templates
+        // reference `<|image_pad|>` / `<|video_pad|>` which live on
+        // `tokenizer_config.json::additional_special_tokens` but are
+        // missing from `tokenizer.json` for some HF mirrors, so the
+        // chat renderer errors out without this patch.
+        let tokenizer = model_dir.as_ref().and_then(|dir| {
+            try_load_tokenizer(dir).ok().map(|mut tok| {
+                patch_additional_special_tokens(&mut tok, dir);
+                tok
             })
-            .unwrap_or_default();
+        });
+
+        let eos_token_ids =
+            resolve_eos_token_ids(&hf_config, model_dir.as_deref(), tokenizer.as_ref());
 
         let use_async_scheduling = !config.disable_async_scheduling && !speculation.requires_sync();
-        let enable_prefix_caching = config.enable_prefix_caching;
+        let enable_prefix_caching = prefix_caching(
+            config,
+            &hf_config.architectures,
+            scratchy_serving_engine::executor::Executor::snapshot_budget(&executor),
+        );
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
@@ -3424,19 +3412,6 @@ fn initialize_stack_tp(
 
         let client: Box<dyn scratchy_serving_engine::core_client::EngineCoreClient + Send> =
             Box::new(InprocClient::new(engine_config, Box::new(executor)));
-
-        // Load tokenizer. Apply the same `additional_special_tokens`
-        // patch as the single-rank path — Qwen2-VL chat templates
-        // reference `<|image_pad|>` / `<|video_pad|>` which live on
-        // `tokenizer_config.json::additional_special_tokens` but are
-        // missing from `tokenizer.json` for some HF mirrors, so the
-        // chat renderer errors out without this patch.
-        let tokenizer = model_dir.as_ref().and_then(|dir| {
-            try_load_tokenizer(dir).ok().map(|mut tok| {
-                patch_additional_special_tokens(&mut tok, dir);
-                tok
-            })
-        });
 
         let mut engine = build_engine(
             client,
@@ -3754,24 +3729,20 @@ fn initialize_stack_external(
         let executor = UniProcExecutor::new_pre_initialized(worker);
 
         // Step 9: Build engine.
-        let eos_token_ids: Vec<u32> = hf_config
-            .extra
-            .get("eos_token_id")
-            .map(|v| {
-                if let Some(id) = v.as_u64() {
-                    vec![id as u32]
-                } else if let Some(arr) = v.as_array() {
-                    arr.iter()
-                        .filter_map(|v| v.as_u64().map(|id| id as u32))
-                        .collect()
-                } else {
-                    vec![]
-                }
-            })
-            .unwrap_or_default();
+        // Load tokenizer and build engine.
+        let tokenizer = model_dir
+            .as_ref()
+            .and_then(|dir| try_load_tokenizer(dir).ok());
+
+        let eos_token_ids =
+            resolve_eos_token_ids(&hf_config, model_dir.as_deref(), tokenizer.as_ref());
 
         let use_async_scheduling = !config.disable_async_scheduling && !speculation.requires_sync();
-        let enable_prefix_caching = config.enable_prefix_caching;
+        let enable_prefix_caching = prefix_caching(
+            config,
+            &hf_config.architectures,
+            scratchy_serving_engine::executor::Executor::snapshot_budget(&executor),
+        );
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
@@ -3800,11 +3771,6 @@ fn initialize_stack_external(
 
         let client: Box<dyn scratchy_serving_engine::core_client::EngineCoreClient + Send> =
             Box::new(InprocClient::new(engine_config, Box::new(executor)));
-
-        // Load tokenizer and build engine.
-        let tokenizer = model_dir
-            .as_ref()
-            .and_then(|dir| try_load_tokenizer(dir).ok());
 
         let mut engine = build_engine(
             client,
@@ -4317,6 +4283,45 @@ mod tests {
             !effective_prefix_caching(false, true, true),
             "never past the request"
         );
+    }
+
+    /// The decision every entry point makes (#435), from the config, the model's architectures
+    /// and the snapshots the engine's executor reports. An executor that forwards none (the
+    /// multi-GPU ones) keeps a recurrent hybrid's caching off; an attention-only model is cached
+    /// as asked.
+    #[test]
+    fn every_entry_point_decides_prefix_caching_by_one_rule() {
+        let config = VllmConfig {
+            device: "test-no-backend".to_string(),
+            ..VllmConfig::default()
+        };
+        let hybrid = ["Qwen3_5ForConditionalGeneration".to_string()];
+        let llama = ["LlamaForCausalLM".to_string()];
+        let snapshots = scratchy_serving_scheduler::scheduler::SnapshotBudget {
+            kv_block_bytes: 1,
+            kv_granule_blocks: std::num::NonZeroUsize::MIN,
+            slot_bytes: 0,
+            unit_slots: std::num::NonZeroUsize::MIN,
+            max_slots: 4,
+        };
+        assert!(config.enable_prefix_caching, "on by default");
+        assert!(
+            prefix_caching(&config, &llama, None),
+            "attention-only: as asked"
+        );
+        assert!(
+            !prefix_caching(&config, &hybrid, None),
+            "a hybrid without snapshots"
+        );
+        assert!(
+            prefix_caching(&config, &hybrid, Some(snapshots)),
+            "with them"
+        );
+        let off = VllmConfig {
+            enable_prefix_caching: false,
+            ..config.clone()
+        };
+        assert!(!prefix_caching(&off, &llama, None), "--no-prefix-caching");
     }
 
     #[test]
