@@ -330,10 +330,10 @@ fn resolve_eos_token_ids(
     };
 
     // (1) config.json::eos_token_id, or its text backbone's.
-    let config_eos = (hf_config.extra.get("eos_token_id")).or_else(|| {
-        let text_config = hf_config.extra.get("text_config")?;
-        text_config.get("eos_token_id")
-    });
+    // A `null` top level is none, as HF drops it before falling back.
+    let config_eos = (hf_config.extra.get("eos_token_id"))
+        .filter(|v| !v.is_null())
+        .or_else(|| hf_config.extra.get("text_config")?.get("eos_token_id"));
     if let Some(v) = config_eos {
         for id in extract_ids(v) {
             push(id, &mut out);
@@ -4387,6 +4387,9 @@ mod tests {
         assert_eq!(composite(nested), vec![248044], "the text backbone's");
         let both = serde_json::json!({"eos_token_id": 2, "text_config": {"eos_token_id": 248044}});
         assert_eq!(composite(both), vec![2], "the top level's, as before");
+        let null =
+            serde_json::json!({"eos_token_id": null, "text_config": {"eos_token_id": 248044}});
+        assert_eq!(composite(null), vec![248044], "a null top level is none");
         let neither = serde_json::json!({"text_config": {"hidden_size": 1024}});
         assert!(composite(neither).is_empty());
     }
