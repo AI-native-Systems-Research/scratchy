@@ -582,13 +582,15 @@ impl LLM {
         self.tokenizer.as_ref()
     }
 
-    /// Tokenize a text string, using the tokenizer if available.
+    /// Tokenize a text prompt with the tokenizer's special tokens (its BOS, on a post-processor
+    /// that adds one), as `/v1/completions` encodes one by default and vLLM's `LLM.generate` does.
+    /// A chat prompt is not one: it gets only its template's ([`Self::tokenize_chat`]).
     fn tokenize_text(&self, text: &str) -> Result<Vec<u32>> {
         if let Some(tok) = &self.tokenizer {
             if text.is_empty() {
                 Ok(vec![])
             } else {
-                Ok(tok.encode(text, false)?)
+                Ok(tok.encode(text, true)?)
             }
         } else if text.is_empty() {
             Ok(vec![0])
@@ -1667,6 +1669,31 @@ mod tests {
             },
             interrupt: Arc::default(),
         }
+    }
+
+    /// A text prompt is encoded with the tokenizer's BOS, as `/v1/completions` and vLLM's
+    /// `LLM.generate` encode one; a chat prompt reads only its template's, once.
+    #[test]
+    fn a_text_prompt_gets_the_tokenizers_bos_and_a_chat_prompt_only_its_templates() {
+        let tok = crate::tokenizer::make_test_tokenizer_with_bos();
+        let hi = tok.encode("hi", false).unwrap();
+        let mut llm = scripted_llm(hi.clone(), Arc::default());
+        llm.tokenizer = Some(Arc::new(tok));
+        let template = "{{ bos_token }}{% for m in messages %}{{ m.content }}{% endfor %}";
+        let template = ChatTemplate::new(template.to_string()).unwrap();
+        llm.chat_template = Some(template.with_bos_token("<s>".to_string()));
+        let params = || {
+            Some(SamplingParams {
+                max_tokens: Some(1),
+                temperature: 0.0,
+                ..SamplingParams::default()
+            })
+        };
+
+        let generated = llm.generate(&["hi"], params()).unwrap();
+        assert_eq!(generated[0].prompt_token_ids, [&[256], &hi[..]].concat());
+        let chat = llm.chat(&[ChatMessage::user("hi")], params()).unwrap();
+        assert_eq!(chat.prompt_token_ids, [&[256], &hi[..]].concat(), "one BOS");
     }
 
     #[test]
