@@ -603,11 +603,11 @@ pub unsafe fn silu_mul_bf16(
 /// with one bf16 rounding per output; the lanes `rot_dim..head_dim` copied bit for bit.
 /// Asynchronous.
 ///
-/// Refused with [`KernelError::RopeShape`], before any pointer is touched, unless `rows`, `cols`,
-/// `head_dim` and `rot_dim` are non-zero, `rot_dim` is a multiple of 16
-/// (`step::ROPE_BF16_ROT_MULTIPLE`) and at most `head_dim`, `head_dim` a multiple of 8, `cols` a
-/// multiple of `head_dim`, and `rows · cols` at most `i32::MAX`. A failed launch returns the
-/// launch's own `cudaError_t`.
+/// Refused with [`KernelError::RopeShape`], before any pointer is touched, unless `rows`, `cols`
+/// and `head_dim` are non-zero, `rot_dim` is 64 (`step::ROPE_BF16_KERNEL_ROT_DIM`, the one width
+/// the kernel is instantiated for), `head_dim` a multiple of 64
+/// (`step::ROPE_BF16_KERNEL_HEAD_MULTIPLE`), `cols` a multiple of `head_dim`, and `rows · cols`
+/// at most `i32::MAX`. A failed launch returns the launch's own `cudaError_t`.
 ///
 /// # Safety
 ///
@@ -641,9 +641,9 @@ pub unsafe fn rope_bf16(
 /// qg[r, 2h·hd + d]` and `gate[r, h·hd + d] = qg[r, 2h·hd + hd + d]`, `qg` `[rows, 2·half_cols]`
 /// and `q`, `gate` `[rows, half_cols]`. Copies, so bit-exact. Asynchronous.
 ///
-/// Refused with [`KernelError::GateShape`], before any pointer is touched, unless `rows`,
-/// `half_cols` and `head_dim` are non-zero, `head_dim` a multiple of 8
-/// (`step::GATE_SPLIT_BF16_HEAD_MULTIPLE`), `half_cols` a multiple of `head_dim`, and
+/// Refused with [`KernelError::GateShape`], before any pointer is touched, unless `rows` and
+/// `half_cols` are non-zero, `head_dim` is 256 (`step::GATE_SPLIT_BF16_HEAD_DIM`, the one head dim
+/// the kernel is instantiated for), `half_cols` a multiple of `head_dim`, and
 /// `rows · 2·half_cols` at most `i32::MAX`. A failed launch returns the launch's own
 /// `cudaError_t`.
 ///
@@ -700,9 +700,11 @@ pub unsafe fn gate_apply_bf16(
 /// `k_cache` and `v_cache` (`[num_blocks, kv_heads, 64, head_dim]`) at that slot. A slot whose
 /// block is at or past `num_blocks` writes nothing. Asynchronous.
 ///
-/// Refused with [`KernelError::KvAppendShape`], before any pointer is touched, unless `rows`,
-/// `kv_heads` and `head_dim` are non-zero, `head_dim` a multiple of 8, `block_size` 64
-/// (`step::CUDA_KV_BLOCK_SIZE`), and `rows · kv_heads · head_dim` at most `i32::MAX`. A failed
+/// Refused with [`KernelError::KvAppendShape`], before any pointer is touched, unless `rows` and
+/// `kv_heads` are non-zero, `head_dim` is 256 (`step::KV_APPEND_BF16_HEAD_DIM`, the one head dim
+/// the kernel is instantiated for), `block_size` 64 (`step::CUDA_KV_BLOCK_SIZE`), and
+/// `rows · kv_heads · head_dim` at most `i32::MAX`. A `num_blocks` of 0 writes nothing and
+/// launches nothing. A failed
 /// launch returns the launch's own `cudaError_t`.
 ///
 /// # Safety

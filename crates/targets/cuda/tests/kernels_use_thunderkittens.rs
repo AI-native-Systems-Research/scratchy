@@ -55,14 +55,10 @@ use std::path::{Path, PathBuf};
 /// The kernels not yet rewritten with ThunderKittens. Each port PR removes its own.
 const NOT_YET_PORTED: &[&str] = &[
     "attn_decode_bf16.cu",
-    "embed_bf16.cu",
-    "gate_split_bf16.cu",
     "gdn_conv1d.cu",
     "gdn_gating.cu",
     "gdn_rms_norm_gated.cu",
     "gdn_scan.cu",
-    "kv_append_bf16.cu",
-    "rope_bf16.cu",
 ];
 
 /// The inline PTX a kernel may hold, as `(file, PTX string)`: the async-proxy fence after the

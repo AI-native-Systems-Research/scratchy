@@ -23,10 +23,10 @@ use scratchy_target_cuda::op_abi::CudaFusion;
 use scratchy_target_cuda::step::{
     ADD_BF16_COLS, ATTN_DECODE_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, ATTN_PREFILL_BF16_ROWS,
     AddBf16, AttnPrefillBf16, CudaStep, EMBED_BF16_COLS, EmbedBf16, GATE_APPLY_BF16_COLS,
-    GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX,
-    GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE,
-    GEMV_BF16_MULTIPLE, GateApplyBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16,
-    RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16,
+    GATE_SPLIT_BF16_HEAD_DIM, GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
+    GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_NARROW_BF16_MAX_N,
+    GEMM_NARROW_BF16_MULTIPLE, GEMV_BF16_MULTIPLE, GateApplyBf16, GateSplitBf16, GatedDeltaNetBf16,
+    GemmBf16, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16,
     RopeAppendBf16, RopeBf16, SILU_MUL_BF16_COLS, SiluMulBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, WeightIx};
@@ -1014,7 +1014,8 @@ fn rope_shape(
 
 /// The bf16 gate split's shape rule, the one its launcher applies: `rows`, `half_cols` and
 /// `head_dim` non-zero; `head_dim` a multiple of [`GATE_SPLIT_BF16_HEAD_MULTIPLE`]; `half_cols` a
-/// whole number of heads; `rows · 2·half_cols` at most `i32::MAX`.
+/// whole number of heads; `rows · 2·half_cols` at most `i32::MAX`; and, last, `head_dim`
+/// [`GATE_SPLIT_BF16_HEAD_DIM`], the one the kernel is instantiated for.
 fn gate_shape(rows: u32, half_cols: u32, head_dim: u32) -> Result<(), GateShapeRule> {
     for (dim, value) in [
         ("rows", rows),
@@ -1036,6 +1037,11 @@ fn gate_shape(rows: u32, half_cols: u32, head_dim: u32) -> Result<(), GateShapeR
     let elements = u64::from(rows) * 2 * u64::from(half_cols);
     if elements > i32::MAX as u64 {
         return Err(GateShapeRule::TooManyElements { elements });
+    }
+    if head_dim != GATE_SPLIT_BF16_HEAD_DIM {
+        return Err(GateShapeRule::HeadNotInstantiated {
+            want: GATE_SPLIT_BF16_HEAD_DIM,
+        });
     }
     Ok(())
 }

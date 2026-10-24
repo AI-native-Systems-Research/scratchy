@@ -514,6 +514,8 @@ pub enum GateShapeRule {
     HalfOffHead,
     /// `rows · 2·half_cols` is above `i32::MAX`, the largest element count the launcher indexes.
     TooManyElements { elements: u64 },
+    /// `head_dim` is not `want`, the one head dim the kernel is instantiated for.
+    HeadNotInstantiated { want: u32 },
 }
 
 /// Which rule a GEMM's shape breaks.
@@ -1029,6 +1031,10 @@ impl std::fmt::Display for GateShapeRule {
                 "rows·2·half_cols = {elements} is above {}, the largest element count the \
                  launcher indexes",
                 i32::MAX
+            ),
+            Self::HeadNotInstantiated { want } => write!(
+                f,
+                "head_dim must be {want}, the one head dim the kernel is instantiated for"
             ),
         }
     }
