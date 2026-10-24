@@ -93,7 +93,7 @@ async fn test_prefix_caching_many_repeats() {
 
 #[cfg(target_os = "macos")]
 async fn start_metal_server() -> (TestServer, Client) {
-    let server = TestServer::builder(scratchy_e2e::TestModels::SMOLLM)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_device("metal")
         .start()
         .await

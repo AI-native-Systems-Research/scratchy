@@ -14,8 +14,8 @@ use spnl_core::ir::{Augment, Document, Generate, GenerateMetadata, Message, Quer
 
 /// A small model for sidecar embedding tests — must differ from the generate
 /// model so the sidecar path triggers. Any decoder model works with
-/// `--runner pooling`; we use the F16 SmolLM2 variant which differs from the
-/// 4-bit SmolLM used for generation.
+/// `--runner pooling`; we use the mlx-community copy of SmolLM2, a different
+/// model id from the HuggingFaceTB one used for generation.
 const EMBEDDING_MODEL: &str = TestModels::SMOLLM_135M_F16;
 
 /// Build an Augment query JSON that wraps a Generate around the augmented body.
