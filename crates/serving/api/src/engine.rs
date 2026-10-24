@@ -1765,6 +1765,17 @@ impl AsyncEngine {
     ///
     /// Must be called exactly once. Panics if called twice.
     pub fn spawn_step_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        self.spawn_step_loop_after(std::future::ready(()))
+    }
+
+    /// [`spawn_step_loop`](Self::spawn_step_loop), holding the loop's first step until `gate`
+    /// resolves. The loop is running for every waiter at once, and requests submitted meanwhile
+    /// queue in the order they came. An offline batch submits all of its requests behind the gate,
+    /// so the first steps batch them the same way every run, as an offline vLLM batch's do.
+    pub fn spawn_step_loop_after(
+        self: &Arc<Self>,
+        gate: impl Future<Output = ()> + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
         let (client, rx, embed_rx, control_rx) = self
             .pending_loop
             .lock()
@@ -1790,20 +1801,33 @@ impl AsyncEngine {
         let state = Arc::clone(&self.step_loop);
         if self.async_scheduling {
             info!("Async scheduling enabled — overlapping GPU execution with CPU scheduling");
+            let step_loop = Self::step_loop_async(args);
             tokio::spawn(Self::run_to_end(
-                Self::step_loop_async(args),
+                async move {
+                    gate.await;
+                    step_loop.await
+                },
                 requests,
                 notify,
                 state,
             ))
         } else {
+            let step_loop = Self::step_loop_sync(args);
             tokio::spawn(Self::run_to_end(
-                Self::step_loop_sync(args),
+                async move {
+                    gate.await;
+                    step_loop.await
+                },
                 requests,
                 notify,
                 state,
             ))
         }
+    }
+
+    /// How many requests are submitted and not yet finished.
+    pub async fn num_unfinished_requests(&self) -> usize {
+        self.requests.lock().await.len()
     }
 
     /// Run a step loop to its end, however it ends, then fail every request it was still
@@ -5245,6 +5269,39 @@ mod tests {
     fn test_truncate_prompt_negative_invalid() {
         let mut tokens = vec![1, 2, 3];
         assert!(truncate_prompt(&mut tokens, Some(-2)).is_err());
+    }
+
+    /// `spawn_step_loop_after` holds the loop's first step until its gate opens: a request
+    /// submitted behind it waits, counted as unfinished, and is served once the gate opens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gated_step_loop_takes_no_step_until_the_gate_opens() {
+        let engine = Arc::new(make_test_engine());
+        let (open, gate) = tokio::sync::oneshot::channel::<()>();
+        engine.spawn_step_loop_after(async {
+            let _ = gate.await;
+        });
+        let task_engine = Arc::clone(&engine);
+        let reply = tokio::spawn(async move {
+            let prompt = protocol::CompletionPrompt::TokenIds(vec![1, 2, 3]);
+            task_engine
+                .completion(make_completion_request(Some(prompt)))
+                .await
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.num_unfinished_requests().await == 0 && Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            engine.num_unfinished_requests().await,
+            1,
+            "submitted behind the gate"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!reply.is_finished(), "served before the gate opened");
+        open.send(()).unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), reply).await;
+        assert_eq!(reply.unwrap().unwrap().unwrap().choices.len(), 1);
+        assert_eq!(engine.num_unfinished_requests().await, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
