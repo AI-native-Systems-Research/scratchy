@@ -2179,6 +2179,19 @@ impl AsyncEngine {
             // scheduled behind it until it is finalized.
             let mut awaits_step = false;
             let mut last_progress = Instant::now();
+            // TTFT ATTRIBUTION (SCRATCHY_TTFT_PHASE): the `[ttft-step]` breakdown lives in
+            // `EngineCore::step` (sync) and `InprocClient::get_output` (pipelined), and this loop
+            // calls neither — without a port of the print here the flag is silently dead on
+            // `scr serve` (#394). `exec_wait` pairs with the step finalized NEXT iteration (it is
+            // the recv round trip that produced that result, resolve included); `sched_next` is
+            // the schedule wall of the iteration that waited for this step: after the previous
+            // finalize, before this step's recv (≈0 when nothing was scheduled then: a speculative
+            // step in flight, or two steps already). Decode-only steps print too when they carry
+            // more than one row — tokens==reqs distinguishes them from prefill, except under
+            // speculative decoding, where a verify step's drafts count as scheduled tokens.
+            let ttft_phase = std::env::var_os("SCRATCHY_TTFT_PHASE").is_some();
+            let mut last_exec_wait = Duration::ZERO;
+            let mut last_sched_wall = Duration::ZERO;
 
             'step: loop {
                 // 0. Drain pending embedding requests.
@@ -2219,6 +2232,9 @@ impl AsyncEngine {
                 //    already running (or about to run) the next batch, so
                 //    this CPU work overlaps with GPU execution.
                 if let Some((prev_sched, prev_output)) = deferred.take() {
+                    let t_finalize = Instant::now();
+                    let finalized_tokens = prev_sched.total_num_scheduled_tokens;
+                    let finalized_reqs = prev_sched.num_scheduled_tokens.len();
                     match client.finalize_step(&prev_sched, &prev_output) {
                         Ok(outputs) => {
                             let stop_string_finished = route_step_outputs(&requests, outputs).await;
@@ -2241,12 +2257,24 @@ impl AsyncEngine {
                             error!("finalize_step error: {}", e);
                         }
                     }
+                    if ttft_phase && finalized_tokens > 1 {
+                        eprintln!(
+                            "[ttft-step] exec_wait={:.2} finalize={:.2} sched_next={:.2} ms  \
+                             ({} scheduled tokens, {} reqs)",
+                            last_exec_wait.as_secs_f64() * 1e3,
+                            t_finalize.elapsed().as_secs_f64() * 1e3,
+                            last_sched_wall.as_secs_f64() * 1e3,
+                            finalized_tokens,
+                            finalized_reqs
+                        );
+                    }
                     notify.notify_waiters();
                 }
 
                 // 3. Pre-schedule: fill the pipeline up to 2 in-flight
                 //    batches. With placeholder tracking, the scheduler
                 //    correctly accounts for tokens still on the GPU.
+                let t_schedule = Instant::now();
                 while gpu_in_flight < 2 && !awaits_step {
                     match client.schedule_next() {
                         Ok(Some(sched)) => {
@@ -2270,6 +2298,7 @@ impl AsyncEngine {
                         }
                     }
                 }
+                last_sched_wall = t_schedule.elapsed();
 
                 // 4. Wait for the oldest GPU result. A deferred one is waited
                 //    for here — the batch queued behind it keeps the GPU busy —
@@ -2282,6 +2311,7 @@ impl AsyncEngine {
                 //    until the loop next yielded, and their chunks went out
                 //    in bursts.
                 if gpu_in_flight > 0 {
+                    let t_recv = Instant::now();
                     let received = match model_rx.recv().await {
                         Some(ExecutorResult::Model(result, sched)) => {
                             let resolved = tokio::task::spawn_blocking(move || {
@@ -2295,6 +2325,7 @@ impl AsyncEngine {
                         }
                         None => None,
                     };
+                    last_exec_wait = t_recv.elapsed();
                     match received {
                         Some((Ok(model_output), sched)) => {
                             deferred = Some((sched, model_output));
