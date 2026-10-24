@@ -2058,8 +2058,9 @@ impl MetalWorker {
     /// Whether this step can be committed without waiting for it: its rows
     /// pick their tokens on the GPU from the logits alone, so nothing on the
     /// host needs its tokens before the next step is queued. Penalties (the
-    /// token history), grammar, speculative decoding, pooling, multimodal
-    /// input, a draft model and live sampler telemetry all do.
+    /// token history), grammar, a restricted next token
+    /// (`SamplingParams::restricts_tokens`), speculative decoding, pooling,
+    /// multimodal input, a draft model and live sampler telemetry all do.
     fn deferrable(&self, sched: &SchedulerOutput) -> bool {
         #[cfg(feature = "guided-decoding")]
         let constrained = |req_id: &String| self.grammar_states.contains_key(req_id);
@@ -2088,8 +2089,9 @@ impl MetalWorker {
                         None => self.draft_model.is_none(),
                     }
                     && sched.num_scheduled_tokens.keys().all(|req_id| {
+                        let generated = self.input_batch.num_generated(req_id);
                         !(self.sampling_params_map.get(req_id))
-                            .is_some_and(|p| p.reads_history() || p.restricts_tokens())
+                            .is_some_and(|p| p.reads_history() || p.restricts_tokens(generated))
                             && !self.mm_data_buffers.contains_key(req_id)
                             && !constrained(req_id)
                     }))
@@ -4044,8 +4046,13 @@ impl MetalWorker {
         let argmax_kernels_addr = argmax_kernels_ptr as usize;
         // Stage this step's token mask (a grammar's, or sampling params') into
         // its pinned buffers. The closure binds these by gpuAddress and runs
-        // the mask on the forward encoder before argmax.
-        let token_mask_pending = self.token_mask_pending.take();
+        // the mask on the forward encoder before argmax. The target's rows are
+        // the ones it masks, so a draft forward leaves it for the target's.
+        let token_mask_pending = if matches!(model, ModelHandle::TARGET) {
+            self.token_mask_pending.take()
+        } else {
+            None
+        };
         let token_mask_ctx: Option<TokenMaskGpu> = if let (Some(h), Some(kernels)) =
             (token_mask_pending, self.token_mask_kernels.as_ref())
         {

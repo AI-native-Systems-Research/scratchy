@@ -3536,6 +3536,7 @@ impl AsyncEngine {
 
         // Tokenize bad_words strings into token sequences.
         let bad_words_token_ids = self.tokenize_bad_words(&request.bad_words)?;
+        self.check_allowed_token_ids(&request.allowed_token_ids)?;
 
         // Some tool parsers (Gemma 4's `<|tool_call>` / `<|"|>`) key on real
         // added tokens that `skip_special_tokens` (default true) would strip
@@ -3609,6 +3610,7 @@ impl AsyncEngine {
 
         // Tokenize bad_words strings into token sequences.
         let bad_words_token_ids = self.tokenize_bad_words(&request.bad_words)?;
+        self.check_allowed_token_ids(&request.allowed_token_ids)?;
 
         let d = &self.generation_defaults;
         Ok(SamplingParams {
@@ -3638,6 +3640,21 @@ impl AsyncEngine {
             bad_words_token_ids,
             ..Default::default()
         })
+    }
+
+    /// `allowed_token_ids` name tokens of the vocabulary, as vLLM refuses any that doesn't: a set
+    /// with none of them would leave a masked row no token to sample.
+    fn check_allowed_token_ids(&self, allowed: &Option<Vec<u32>>) -> ServeResult<()> {
+        let (Some(allowed), Some(tokenizer)) = (allowed, &self.tokenizer) else {
+            return Ok(());
+        };
+        let vocab = tokenizer.vocab_size();
+        match allowed.iter().find(|&&id| id as usize >= vocab) {
+            Some(id) => Err(ServeError::Validation(format!(
+                "allowed_token_ids contains out-of-vocab token id {id} (vocabulary size {vocab})"
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Tokenize bad_words strings into token ID sequences, as vLLM does: each word as it starts a
@@ -4459,6 +4476,26 @@ mod tests {
             .unwrap();
         assert_eq!(lo.len(), 1, "\" lo\" is one token longer: {lo:?}");
         assert_eq!(engine.tokenize_bad_words(&words(&[""])).unwrap(), None);
+    }
+
+    /// An allowed token outside the vocabulary is refused, as vLLM refuses it; one inside passes.
+    #[test]
+    fn an_allowed_token_outside_the_vocabulary_is_refused() {
+        let engine = make_test_engine_with_tokenizer();
+        let vocab = engine.tokenizer.as_ref().unwrap().vocab_size() as u32;
+        assert!(
+            engine
+                .check_allowed_token_ids(&Some(vec![0, vocab - 1]))
+                .is_ok()
+        );
+        let err = engine
+            .check_allowed_token_ids(&Some(vec![1, vocab]))
+            .unwrap_err();
+        assert!(
+            matches!(err, ServeError::Validation(ref m) if m.contains("out-of-vocab")),
+            "{err}"
+        );
+        assert!(engine.check_allowed_token_ids(&None).is_ok());
     }
 
     fn make_chat_request() -> protocol::ChatCompletionRequest {

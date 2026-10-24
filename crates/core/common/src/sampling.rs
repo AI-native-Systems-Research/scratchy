@@ -398,14 +398,15 @@ impl SamplingParams {
         !penalty_free
     }
 
-    /// Whether the tokens this request may sample next are fewer than the vocabulary: an allowed
-    /// set, a bad word, or stop tokens it may not end on yet ([`Self::next_tokens`]). A draft or a
-    /// step on the device ahead of the host cannot honor that, since `next_tokens` is decided
-    /// token by token.
-    pub fn restricts_tokens(&self) -> bool {
+    /// Whether the tokens this request may sample next, `generated` tokens in, are fewer than the
+    /// vocabulary: an allowed set, a bad word, or stop tokens it may not end on yet
+    /// ([`Self::next_tokens`]). A draft or a step on the device ahead of the host cannot honor
+    /// that, since `next_tokens` is decided token by token; once `min_tokens` are generated, they
+    /// no longer restrict it.
+    pub fn restricts_tokens(&self, generated: usize) -> bool {
         self.allowed_token_ids.is_some()
             || self.bad_words_token_ids.is_some()
-            || self.min_tokens > 0
+            || generated < self.min_tokens as usize
     }
 
     /// What this request may sample after its `generated` tokens, `eos` the model's own stop
@@ -940,7 +941,7 @@ mod tests {
     fn next_tokens_bans_bad_words_and_early_stops_within_the_allowed_set() {
         let eos = [2];
         let free = SamplingParams::default();
-        assert!(!free.restricts_tokens());
+        assert!(!free.restricts_tokens(0));
         assert!(free.next_tokens(&[7, 8], &eos).is_free());
 
         let p = SamplingParams {
@@ -950,7 +951,18 @@ mod tests {
             min_tokens: 3,
             ..Default::default()
         };
-        assert!(p.restricts_tokens());
+        assert!(
+            p.restricts_tokens(5),
+            "the allowed set and the bad words, always"
+        );
+        let early = SamplingParams {
+            min_tokens: 3,
+            ..Default::default()
+        };
+        assert!(
+            early.restricts_tokens(2) && !early.restricts_tokens(3),
+            "min_tokens, until met"
+        );
         let next = p.next_tokens(&[10, 20], &eos);
         assert_eq!(next.only, Some(&[2, 3, 4, 30][..]));
         assert_eq!(

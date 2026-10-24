@@ -229,7 +229,8 @@ impl<T> StepOutcome<T> {
 fn takes_drafts(scheduler: &Scheduler, req_id: &str) -> bool {
     scheduler.get_request(req_id).is_some_and(|r| {
         let p = &r.sampling_params;
-        !r.status.is_finished() && !p.reads_history() && !p.restricts_tokens()
+        let generated = r.output_token_ids.len();
+        !r.status.is_finished() && !p.reads_history() && !p.restricts_tokens(generated)
     })
 }
 
