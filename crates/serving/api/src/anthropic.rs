@@ -107,6 +107,37 @@ pub struct AnthropicMessage {
     pub content: MessageContent,
 }
 
+/// A request's messages: at least one, as the Messages API requires. An empty list is its 400,
+/// `messages: at least one message is required`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "Vec<AnthropicMessage>")]
+pub struct Messages(Vec<AnthropicMessage>);
+
+impl TryFrom<Vec<AnthropicMessage>> for Messages {
+    type Error = &'static str;
+    fn try_from(messages: Vec<AnthropicMessage>) -> Result<Self, Self::Error> {
+        if messages.is_empty() {
+            return Err("messages: at least one message is required");
+        }
+        Ok(Self(messages))
+    }
+}
+
+impl std::ops::Deref for Messages {
+    type Target = [AnthropicMessage];
+    fn deref(&self) -> &[AnthropicMessage] {
+        &self.0
+    }
+}
+
+impl IntoIterator for Messages {
+    type Item = AnthropicMessage;
+    type IntoIter = std::vec::IntoIter<AnthropicMessage>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 /// Who a message of the conversation is from. Claude Code (2.1+) sends `system` messages
 /// inside `messages` too — its environment block after the first user turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,7 +175,7 @@ pub struct AnthropicTool {
 pub struct MessagesRequest {
     #[serde(default)]
     pub model: Option<String>,
-    pub messages: Vec<AnthropicMessage>,
+    pub messages: Messages,
     #[serde(default)]
     pub system: Option<SystemParam>,
     pub max_tokens: u32,
@@ -1636,7 +1667,9 @@ mod tests {
             messages: vec![AnthropicMessage {
                 role: AnthropicRole::User,
                 content: MessageContent::Text("Hello".into()),
-            }],
+            }]
+            .try_into()
+            .unwrap(),
             system: None,
             max_tokens: 100,
             temperature: Some(0.7),
@@ -1819,7 +1852,9 @@ mod tests {
             messages: vec![AnthropicMessage {
                 role: AnthropicRole::User,
                 content: MessageContent::Text("Hi".into()),
-            }],
+            }]
+            .try_into()
+            .unwrap(),
             system: Some(SystemParam::Text("Be helpful.".into())),
             max_tokens: 50,
             temperature: None,
@@ -1848,7 +1883,9 @@ mod tests {
             messages: vec![AnthropicMessage {
                 role: AnthropicRole::User,
                 content: MessageContent::Text("Hi".into()),
-            }],
+            }]
+            .try_into()
+            .unwrap(),
             system: None,
             max_tokens: 50,
             temperature: None,
@@ -1881,7 +1918,9 @@ mod tests {
                     name: "get_weather".into(),
                     input: serde_json::json!({"city": "NYC"}),
                 }]),
-            }],
+            }]
+            .try_into()
+            .unwrap(),
             system: None,
             max_tokens: 50,
             temperature: None,
@@ -1912,7 +1951,9 @@ mod tests {
                     content: Some(ToolResultContent::Text("72°F".into())),
                     cache_control: None,
                 }]),
-            }],
+            }]
+            .try_into()
+            .unwrap(),
             system: None,
             max_tokens: 50,
             temperature: None,
@@ -1938,7 +1979,9 @@ mod tests {
             messages: vec![AnthropicMessage {
                 role: AnthropicRole::User,
                 content: MessageContent::Text("Hi".into()),
-            }],
+            }]
+            .try_into()
+            .unwrap(),
             system: None,
             max_tokens: 50,
             temperature: None,
@@ -1972,7 +2015,9 @@ mod tests {
             messages: vec![AnthropicMessage {
                 role: AnthropicRole::User,
                 content: MessageContent::Text("Hi".into()),
-            }],
+            }]
+            .try_into()
+            .unwrap(),
             system: None,
             max_tokens: 50,
             temperature: None,

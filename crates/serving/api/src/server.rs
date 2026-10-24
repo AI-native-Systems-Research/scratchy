@@ -1610,6 +1610,17 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
         anthropic_error(&error);
 
+        // Anthropic's API refuses a request with no messages; it used to render a prompt of the
+        // template's generation prompt alone and answer 200.
+        let none = r#"{"max_tokens": 8, "messages": []}"#;
+        let (status, error) = send(post("/v1/messages", none)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let message = anthropic_error(&error);
+        assert!(
+            message.contains("at least one message is required"),
+            "{error}"
+        );
+
         let undeclared = r#"{"max_tokens": 8, "messages": [{"role": "user", "content": "Hi"}],
             "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
             "tool_choice": {"type": "tool", "name": "Raed"}}"#;
