@@ -53,12 +53,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The kernels not yet rewritten with ThunderKittens. Each port PR removes its own.
-const NOT_YET_PORTED: &[&str] = &[
-    "gdn_conv1d.cu",
-    "gdn_gating.cu",
-    "gdn_rms_norm_gated.cu",
-    "gdn_scan.cu",
-];
+const NOT_YET_PORTED: &[&str] = &["gdn_conv1d.cu", "gdn_gating.cu", "gdn_rms_norm_gated.cu"];
 
 /// The inline PTX a kernel may hold, as `(file, PTX string)`: the async-proxy fence after the
 /// prefill's consumers zero a partial V tile, which TK at the pin emits only inside

@@ -98,6 +98,42 @@ __device__ inline float2 gate_apply::op<float2>(const float2& a, const float2& g
     return float2{gate_apply::op<float>(a.x, g.x), gate_apply::op<float>(a.y, g.y)};
 }
 
+// The gated delta-rule scan's inverse L2 norm of one q or k vector: `rsqrtf(x + 1e-6)`, `x` the
+// vector's sum of squares (`warp::sum`), the expression the plain-CUDA scan computed (metal's and
+// fla's eps, inside the sqrt). The scan multiplies q's by `scale` after.
+struct l2_inv {
+    static constexpr float EPS = 1e-6f;
+    template <typename T>
+    static __device__ inline T op(const T& x) {
+        return rsqrtf(x + EPS);
+    }
+};
+template <>
+__device__ inline float l2_inv::op<float>(const float& x) {
+    return rsqrtf(x + EPS);
+}
+template <>
+__device__ inline float2 l2_inv::op<float2>(const float2& x) {
+    return float2{l2_inv::op<float>(x.x), l2_inv::op<float>(x.y)};
+}
+
+// The gated delta-rule scan's decay of one token: `expf(g)`, `g` the gating's log decay, the
+// expression the plain-CUDA scan computed (`__expf` under `--use_fast_math`).
+struct exp_of {
+    template <typename T>
+    static __device__ inline T op(const T& x) {
+        return expf(x);
+    }
+};
+template <>
+__device__ inline float exp_of::op<float>(const float& x) {
+    return expf(x);
+}
+template <>
+__device__ inline float2 exp_of::op<float2>(const float2& x) {
+    return float2{exp_of::op<float>(x.x), exp_of::op<float>(x.y)};
+}
+
 // TK-GAP(rv_ternary_map) begin
 // A register-vector map over two vectors and one scalar, `dst[i][j] = op(a[i][j], b[i][j], c)`:
 // TK's own vector `bin_op` (`ops/group/register/vec/maps.cuh`) takes one vector and a scalar, or

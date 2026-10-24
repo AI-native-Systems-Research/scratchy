@@ -222,6 +222,13 @@ unsafe extern "C" {
         scale: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gdn_rank_one_probe(
+        s: *const c_void,
+        t: *const c_void,
+        u: *const c_void,
+        out: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gdn_rms_norm_gated(
         o: *const c_void,
         z: *const c_void,
@@ -1087,7 +1094,9 @@ pub unsafe fn gdn_gating(
 /// Launch the GDN recurrent gated delta-rule scan: per value head, the slot's f32 state (zero,
 /// never read, on a fresh start) through the real tokens of `conv_out` (`q | k | v`), `g` and
 /// `beta`, each token's output into `o [rows, nv·head_v]` (f32); the state written back once.
-/// Value head `h` reads key head `h / (nv / nk)`. Asynchronous.
+/// Value head `h` reads key head `h / (nv / nk)`. Each warp holds 16 state rows as one
+/// ThunderKittens `rt_fl<16, 128>`: the matrix-vector products are `mul_col` then `row_sum`, the
+/// rank-1 update `row_map<fma_AxCtB>` (`kernels/gdn_scan.cu`). Asynchronous.
 ///
 /// Refused with [`KernelError::GdnScanShape`], before any pointer is touched, unless `head_k` is
 /// 128 (`step::GDN_HEAD_K`), `head_v` a non-zero multiple of 32 and at most 256, `nk` and `nv`
@@ -1099,8 +1108,8 @@ pub unsafe fn gdn_gating(
 ///
 /// `conv_out` must be a device pointer to `rows·conv_dim` f32, `g` and `beta` to `rows·nv` f32,
 /// `o` to `rows·nv·head_v` f32, `sequence` to 4 u32 with `1 ≤ q_len ≤ rows` and `slot` a slot of
-/// `ssm_state`, which must hold `(slot + 1) · slot_elems` f32. All 16-byte aligned and valid for
-/// the whole kernel; `o` and `ssm_state` overlap nothing else. `stream` must be a live
+/// `ssm_state`, which must hold `(slot + 1) · slot_elems` f32. All 16-byte aligned (`conv_out`'s
+/// q, k and v rows are staged by bulk copy) and valid for the whole kernel; `o` and `ssm_state` overlap nothing else. `stream` must be a live
 /// `cudaStream_t` of the current device, or null for the default stream.
 pub unsafe fn gdn_scan(
     (conv_out, g, beta): (*const c_void, *const c_void, *const c_void),
@@ -1126,6 +1135,34 @@ pub unsafe fn gdn_scan(
             nv,
             head_k,
             head_v,
+        },
+    )
+}
+
+/// Test support for `tests/gdn.rs` only (R8): `out = T · u + S` by the GDN scan's own rank-1
+/// update, `warp::row_map<base_ops::fma_AxCtB>(S, T, S, u)` on its `rt_fl<16, 128>` state tile
+/// (`kernels/gdn_scan.cu`), `u` one value per row. No `CudaStep` uses it. Never refused: a failed
+/// launch returns its `cudaError_t`. Asynchronous.
+///
+/// # Safety
+///
+/// `s`, `t` and `out` must be 16-byte-aligned device pointers to 16 · 128 f32 and `u` to 16 f32,
+/// valid for the whole kernel, `out` overlapping no input. `stream` must be a live `cudaStream_t`
+/// of the current device, or null for the default stream.
+#[doc(hidden)]
+pub unsafe fn gdn_rank_one_probe(
+    (s, t, u): (*const c_void, *const c_void, *const c_void),
+    out: *mut c_void,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher catches
+    // every C++ exception.
+    let code = unsafe { scratchy_cuda_gdn_rank_one_probe(s, t, u, out, stream) };
+    check(
+        code,
+        KernelError::RowShape {
+            rows: 16,
+            cols: 128,
         },
     )
 }
