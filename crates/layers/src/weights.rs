@@ -40,27 +40,82 @@ fn safetensors_dtype(dtype: safetensors::Dtype) -> Result<DType> {
 }
 
 // ---------------------------------------------------------------------------
+// Typed reads of tensor bytes
+// ---------------------------------------------------------------------------
+
+mod plain {
+    /// The float types a checkpoint stores, read straight out of its bytes.
+    pub trait Sealed {}
+    impl Sealed for f32 {}
+    impl Sealed for half::f16 {}
+    impl Sealed for half::bf16 {}
+}
+
+/// A number type every bit pattern of which is a value, so the right number of bytes is always
+/// one: what makes reading it out of tensor bytes sound.
+trait Plain: Copy + Default + plain::Sealed {}
+impl Plain for f32 {}
+impl Plain for half::f16 {}
+impl Plain for half::bf16 {}
+
+/// The first `n` `T`s in `bytes`: borrowed when `bytes` is aligned for `T`, else copied once into
+/// an aligned buffer. A tensor in a safetensors file starts wherever its neighbours end, so its
+/// mmap'd bytes need not be aligned for its dtype, and a misaligned typed slice is undefined
+/// behaviour (a debug build aborts on it).
+fn typed<T: Plain>(bytes: &[u8], n: usize) -> std::borrow::Cow<'_, [T]> {
+    let bytes = &bytes[..n * size_of::<T>()];
+    if bytes.as_ptr().cast::<T>().is_aligned() {
+        // SAFETY: aligned for `T`, `n` of them in bounds, and every bit pattern is a `T`.
+        let typed = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), n) };
+        return std::borrow::Cow::Borrowed(typed);
+    }
+    let mut out = vec![T::default(); n];
+    // SAFETY: `out` is `n` `T`s, `bytes.len()` bytes, apart from `bytes`; every bit pattern is a `T`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr().cast::<u8>(), bytes.len());
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Host scratch the loader casts or gathers weights into, aligned for every float it writes
+/// there (4 bytes, `f32`'s), which a `Vec<u8>`'s allocation need not be. Grows, never shrinks.
+#[derive(Default)]
+struct CastScratch(Vec<u32>);
+
+impl CastScratch {
+    /// At least `bytes` long.
+    fn reserve_bytes(&mut self, bytes: usize) {
+        let words = bytes.div_ceil(size_of::<u32>());
+        if self.0.len() < words {
+            self.0.resize(words, 0);
+        }
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.0.as_ptr().cast()
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr().cast()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CPU dtype conversion helpers (for LoRA merging)
 // ---------------------------------------------------------------------------
 
 /// Read raw bytes in `dtype` into a pre-allocated f32 slice.
 fn read_to_f32(data: &[u8], dtype: DType, out: &mut [f32]) {
     match dtype {
-        DType::F32 => {
-            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, out.len()) };
-            out.copy_from_slice(src);
-        }
+        DType::F32 => out.copy_from_slice(&typed::<f32>(data, out.len())),
         DType::F16 => {
-            let src =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, out.len()) };
+            let src = typed::<half::f16>(data, out.len());
             for (s, d) in src.iter().zip(out.iter_mut()) {
                 *d = s.to_f32();
             }
         }
         DType::BF16 => {
-            let src = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, out.len())
-            };
+            let src = typed::<half::bf16>(data, out.len());
             for (s, d) in src.iter().zip(out.iter_mut()) {
                 *d = s.to_f32();
             }
@@ -376,7 +431,7 @@ pub struct GpuWeights<A: DeviceAllocator> {
     /// pageable memory blocks the CPU but correctness is fine, and
     /// the slow path is rare (precast handles the hot path).
     /// Grows as needed, never shrinks.
-    cast_scratch: Vec<u8>,
+    cast_scratch: CastScratch,
     /// Directory the safetensors shards were loaded from. Feeds the
     /// QD-sidecar key (the filesystem device backing the weights);
     /// `None` for GGUF/`empty()`-constructed instances.
@@ -531,7 +586,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             tensors: HashMap::new(),
             target_dtype: None,
             rmsnorm_scale_dtype: None,
-            cast_scratch: Vec::new(),
+            cast_scratch: CastScratch::default(),
             source_dir: None,
             precast: None,
             precast_handles: Vec::new(),
@@ -571,7 +626,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             tensors: HashMap::new(),
             target_dtype: None,
             rmsnorm_scale_dtype: None,
-            cast_scratch: Vec::new(),
+            cast_scratch: CastScratch::default(),
             source_dir: None,
             precast: None,
             precast_handles: Vec::new(),
@@ -618,7 +673,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
                 tensors: HashMap::new(),
                 target_dtype: None,
                 rmsnorm_scale_dtype: None,
-                cast_scratch: Vec::new(),
+                cast_scratch: CastScratch::default(),
                 source_dir: None,
                 precast: None,
                 precast_handles: Vec::new(),
@@ -673,7 +728,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             tensors,
             target_dtype: None,
             rmsnorm_scale_dtype: None,
-            cast_scratch: Vec::new(),
+            cast_scratch: CastScratch::default(),
             source_dir: None,
             precast: None,
             precast_handles: Vec::new(),
@@ -722,11 +777,10 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         // Vec::resize is grow-only-cheap when capacity already
         // satisfies; the slow path is rare, so an occasional realloc
         // is fine.
-        if self.cast_scratch.len() < cast_size {
-            self.cast_scratch.resize(cast_size, 0);
-        }
+        self.cast_scratch.reserve_bytes(cast_size);
 
         let src = cpu_ref.data();
+        // 4-byte aligned (`CastScratch`), so every float the casts below write through it is.
         let dst = self.cast_scratch.as_mut_ptr();
 
         // Dispatch cast. The common case is F32 → BF16/F16. Each
@@ -741,8 +795,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
 
         match (cpu_ref.dtype, target) {
             (DType::F32, DType::BF16) => {
-                let src_f32 =
-                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, numel) };
+                let src_f32 = &*typed::<f32>(src, numel);
                 let dst_bf16 =
                     unsafe { std::slice::from_raw_parts_mut(dst as *mut half::bf16, numel) };
                 if numel >= PAR_THRESHOLD {
@@ -756,8 +809,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
                 }
             }
             (DType::F32, DType::F16) => {
-                let src_f32 =
-                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, numel) };
+                let src_f32 = &*typed::<f32>(src, numel);
                 let dst_f16 =
                     unsafe { std::slice::from_raw_parts_mut(dst as *mut half::f16, numel) };
                 if numel >= PAR_THRESHOLD {
@@ -771,8 +823,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
                 }
             }
             (DType::F16, DType::BF16) => {
-                let src_f16 =
-                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const half::f16, numel) };
+                let src_f16 = &*typed::<half::f16>(src, numel);
                 let dst_bf16 =
                     unsafe { std::slice::from_raw_parts_mut(dst as *mut half::bf16, numel) };
                 // Two-step: f16 → f32 (SIMD via convert_to_f32_slice) → bf16.
@@ -786,8 +837,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
                     });
             }
             (DType::BF16, DType::F16) => {
-                let src_bf16 =
-                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const half::bf16, numel) };
+                let src_bf16 = &*typed::<half::bf16>(src, numel);
                 let dst_f16 =
                     unsafe { std::slice::from_raw_parts_mut(dst as *mut half::f16, numel) };
                 src_bf16
@@ -800,8 +850,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
                     });
             }
             (DType::BF16, DType::F32) => {
-                let src_bf16 =
-                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const half::bf16, numel) };
+                let src_bf16 = &*typed::<half::bf16>(src, numel);
                 let dst_f32 = unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
                 if numel >= PAR_THRESHOLD {
                     let chunk = numel.div_ceil(rayon::current_num_threads().max(1));
@@ -814,8 +863,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
                 }
             }
             (DType::F16, DType::F32) => {
-                let src_f16 =
-                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const half::f16, numel) };
+                let src_f16 = &*typed::<half::f16>(src, numel);
                 let dst_f32 = unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
                 if numel >= PAR_THRESHOLD {
                     let chunk = numel.div_ceil(rayon::current_num_threads().max(1));
@@ -1315,11 +1363,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         let mut result = Vec::with_capacity(num_elems);
 
         match cpu_ref.dtype {
-            DType::F32 => {
-                let src =
-                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, num_elems) };
-                result.extend_from_slice(src);
-            }
+            DType::F32 => result.extend_from_slice(&typed::<f32>(data, num_elems)),
             // Unaligned byte reads: mmap'd safetensors tensors are NOT
             // guaranteed 2-byte aligned (a tensor can start at an odd
             // offset after an odd-sized neighbor), so reinterpreting the
@@ -2469,9 +2513,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             let col_start = rank * shard_size;
             let shard_row_bytes = shard_size * elem_size;
             let needed = rows * shard_row_bytes;
-            if self.cast_scratch.len() < needed {
-                self.cast_scratch.resize(needed, 0);
-            }
+            self.cast_scratch.reserve_bytes(needed);
             let dst = self.cast_scratch.as_mut_ptr();
             for r in 0..rows {
                 let src_offset = (r * cols + col_start) * elem_size;
@@ -2530,7 +2572,7 @@ impl<A: DeviceAllocator> Drop for GpuWeights<A> {
         for handle in self.precast_handles.drain(..) {
             handle.join().ok();
         }
-        // `cast_scratch: Vec<u8>` drops itself.
+        // `cast_scratch` drops itself.
         // `allocator` drops itself (CUDA: frees GPU mem; Metal: frees MTLBuffers).
         // GPU memory allocated by take()/take_into() is owned by model layers
         //   on the cuda path (transferred via take_gpu_allocs); on metal it's
@@ -3080,6 +3122,34 @@ mod affine_width_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Floats are read out of tensor bytes wherever those start: in place when aligned for the
+    /// type, copied when not (a tensor after an odd-sized neighbour). A misaligned typed slice is
+    /// undefined behaviour, and a debug build aborts on one.
+    #[test]
+    fn floats_are_read_out_of_bytes_at_any_alignment() {
+        let values = [1.5f32, -2.25, 3.0];
+        let le: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut words = [0u32; 5];
+        // SAFETY: the words' 20 bytes, 4-byte aligned, as bytes; every byte is a `u8`.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), 20) };
+        for at in [0, 1, 2] {
+            bytes[at..at + 12].copy_from_slice(&le);
+            let read = typed::<f32>(&bytes[at..], 3);
+            assert_eq!(*read, values, "at {at}");
+            let borrowed = matches!(read, std::borrow::Cow::Borrowed(_));
+            assert_eq!(borrowed, at == 0, "borrowed exactly when aligned, at {at}");
+            let mut out = [0.0f32; 3];
+            read_to_f32(&bytes[at..], DType::F32, &mut out);
+            assert_eq!(out, values, "at {at}");
+        }
+        let halves = [half::bf16::from_f32(1.5), half::bf16::from_f32(-2.0)];
+        let le: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+        bytes[1..5].copy_from_slice(&le);
+        let mut out = [0.0f32; 2];
+        read_to_f32(&bytes[1..], DType::BF16, &mut out);
+        assert_eq!(out, [1.5, -2.0]);
+    }
 
     /// A tensor's leading rows are its leading bytes, under its own shape; asking for more rows
     /// than it has is an error.
