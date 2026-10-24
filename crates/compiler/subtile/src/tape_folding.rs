@@ -190,12 +190,22 @@ pub enum FoldPattern<K: 'static> {
     /// stores its rows: the steps before the last are absorbed, the last is its epilogue. A chain
     /// without an add ends before a step of `gated` kinds (the gated folds take a matmul whole).
     /// Only on a model whose matvecs take their ends ([`ModelFoldFacts::matvec_ends`]).
+    ///
+    /// A `gate_scale` the tape order refuses — its `shared` and `g` operands computed after the
+    /// anchor — still folds when `defer_gates` is set: the gate's absorption is then only input
+    /// to the target's wave order, which the gate joins the anchor's command through, pulling
+    /// that command past the producers the tape order put after it, so the re-fold on the waved
+    /// tape takes the chain the position checks refused. A table may set it only where
+    /// that re-fold runs wherever this pattern's gate stage can — the whole
+    /// [`ModelFoldFacts::matvec_ends`] band inside the target's wave-order rows — for the
+    /// deferring fold's decisions never ship, and where no re-fold runs they would.
     MatvecEpilogue {
         anchor: SubOpKind,
         weights: Option<GemmWeightKind>,
         bias: Option<SubOpKind>,
         scale: Option<SubOpKind>,
         gate_scale: Option<SubOpKind>,
+        defer_gates: bool,
         add: SubOpKind,
         gated: &'static [SubOpKind],
         kernel: K,
@@ -917,12 +927,13 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
                 bias,
                 scale,
                 gate_scale,
+                defer_gates,
                 add,
                 gated,
                 kernel,
             } => self.matvec_epilogue(
                 i,
-                (anchor, weights),
+                (anchor, weights, defer_gates),
                 [bias, scale, gate_scale],
                 add,
                 gated,
@@ -1121,7 +1132,7 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
     fn matvec_epilogue(
         &mut self,
         i: usize,
-        (anchor, weights): (SubOpKind, Option<GemmWeightKind>),
+        (anchor, weights, defer_gates): (SubOpKind, Option<GemmWeightKind>, bool),
         [bias, scale, gate_scale]: [Option<SubOpKind>; 3],
         add: SubOpKind,
         gated: &[SubOpKind],
@@ -1163,8 +1174,10 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
             && self.ops.kind(c) == kind
             && free(self, c)
             && self.ops.first_op(c) == Some(cur)
-            && ready(self, c, 1)?
-            && ready(self, c, 2)?
+            // A deferred gate (`defer_gates`) folds though the tape order puts its operands
+            // after the anchor: its absorption is input to the wave order, whose re-fold the
+            // positions are then legal for — never a decision that ships.
+            && (ready(self, c, 1)? && ready(self, c, 2)? || defer_gates)
         {
             gate = Some((c, [self.ops.operand(c, 1), self.ops.operand(c, 2)]));
             cur = c;
@@ -1737,6 +1750,7 @@ mod tests {
         lower_region,
     };
     use crate::subtile_tape::{Instr, lower_dag_to_tape};
+    use crate::tape_colouring::{ColourRule, OutputAlias};
     use InputRef::{Ext, Op};
 
     /// A neutral kernel identity per fold.
@@ -1748,6 +1762,8 @@ mod tests {
         Residual,
         GeluSplit,
         GeluFused,
+        SiluSplit,
+        SiluFused,
         NormedRope,
         NormAddScale,
         ExpertGated,
@@ -1785,6 +1801,7 @@ mod tests {
                     bias: Some(K::BiasAdd),
                     scale: Some(K::ScalarMul),
                     gate_scale: None,
+                    defer_gates: false,
                     add: K::Add,
                     gated: &[K::Gelu, K::Mul],
                     kernel: Kern::Epilogue,
@@ -1822,11 +1839,18 @@ mod tests {
                 },
                 FoldPattern::Gated {
                     mul: K::Mul,
-                    activations: &[GatedKernel {
-                        activation: K::Gelu,
-                        split: Kern::GeluSplit,
-                        fused: Kern::GeluFused,
-                    }],
+                    activations: &[
+                        GatedKernel {
+                            activation: K::Gelu,
+                            split: Kern::GeluSplit,
+                            fused: Kern::GeluFused,
+                        },
+                        GatedKernel {
+                            activation: K::Silu,
+                            split: Kern::SiluSplit,
+                            fused: Kern::SiluFused,
+                        },
+                    ],
                 },
             ],
             &[
@@ -2170,6 +2194,381 @@ mod tests {
         // whole fold stands down — every reader takes the norm or none does.
         let (s, f) = fold(&src(1), weights(5), ops(1), &[], &TABLE, BAND);
         assert_eq!(f.role(s[0]), StepRole::Kept);
+    }
+
+    /// Qwen3.6's MoE block: the routed experts, the always-on shared expert (a SwiGLU MLP), the
+    /// per-token sigmoid gate `g`, `gate_scale(routed, shared_y, g)`, and the residual add — folded
+    /// under metal's sweep order, at the verify-sized rows, on both routed bands. The wide band
+    /// (rows_through 8) is what an M5 Max lowers under; the narrow band (rows_through 1) is main's
+    /// decision at every bucket.
+    #[test]
+    fn the_shared_experts_gate_scale_folds_into_the_routed_combine() {
+        use crate::lower::ExpertQuant;
+        use crate::subtile_ir::{
+            ExpertBundle, ExpertProj, GatedAct, NumExperts, RouterBundle, SharedExpertBound, TopK,
+        };
+        use SubOpKind as K;
+        use std::num::NonZeroU32;
+        let nz = |n: u32| NonZeroU32::new(n).expect("nonzero");
+        let (router, bundle) = (RouterBundle::SharedFused, ExpertBundle::SwitchGlu);
+        let (experts, k) = (NumExperts::new(nz(256)), TopK::new(nz(8)));
+        // The block, in the tape's own order: the routing, the shared expert and its gate, the
+        // routed experts, the combine, the gate scale, the residual add.
+        let ops = |rows: u32| {
+            let matmul = |proj, n, inputs| {
+                let quant = ExpertQuant::declared(64, 4);
+                op(
+                    SubOp::ExpertMatmul {
+                        proj,
+                        n,
+                        k,
+                        quant,
+                        bundle,
+                    },
+                    rows,
+                    inputs,
+                )
+            };
+            let sort = SubOp::ExpertSort { experts, k, bundle };
+            let combine = SubOp::ExpertCombine {
+                hidden: 64,
+                shared: SharedExpertBound(None),
+            };
+            let (gate, up, down) = (ExpertProj::Gate, ExpertProj::Up, ExpertProj::Down);
+            let matvec = |n: u32, inputs: Vec<InputRef>| {
+                op(
+                    SubOp::MatmulTile {
+                        n,
+                        weight: GemmWeight::Dense,
+                    },
+                    rows,
+                    inputs,
+                )
+            };
+            vec![
+                op(RMS, rows, vec![Ext(0), Ext(1)]),
+                op(
+                    SubOp::RouterLogits { experts, router },
+                    rows,
+                    vec![Op(0), Ext(2)],
+                ),
+                op(SubOp::RouteSoftmax, rows, vec![Op(1)]),
+                op(SubOp::RouteArgsort, rows, vec![Op(2)]),
+                op(SubOp::RouteTopK { k }, rows, vec![Op(3)]),
+                op(SubOp::RouteGatherScores, rows, vec![Op(2), Op(4)]),
+                op(SubOp::RouteRenorm, rows, vec![Op(5)]),
+                op(sort, rows, vec![Op(0), Op(4)]),
+                matmul(gate, 32, vec![Op(7), Op(7), Ext(3)]),
+                matmul(up, 32, vec![Op(7), Op(7), Ext(3)]),
+                op(
+                    SubOp::ExpertGatedAct {
+                        act: GatedAct::Silu,
+                    },
+                    rows,
+                    vec![Op(8), Op(9)],
+                ),
+                matmul(down, 64, vec![Op(10), Op(7), Ext(3)]),
+                op(SubOp::ExpertUnsort, rows, vec![Op(11), Op(7)]),
+                op(combine, rows, vec![Op(12), Op(6)]),
+                matvec(32, vec![Op(0), Ext(4)]),
+                matvec(32, vec![Op(0), Ext(5)]),
+                op(SubOp::Elementwise(EwKind::Silu), rows, vec![Op(14)]),
+                op(MUL, rows, vec![Op(16), Op(15)]),
+                matvec(64, vec![Op(17), Ext(6)]),
+                matvec(1, vec![Op(0), Ext(7)]),
+                op(SubOp::GateScale, rows, vec![Op(13), Op(18), Op(19)]),
+                op(ADD, rows, vec![Op(20), Ext(0)]),
+            ]
+        };
+        const AFTER_ROPE_WIDE: &[FoldPattern<Kern>] = &[
+            FoldPattern::NormAdd {
+                add: K::Add,
+                norm: K::RmsNorm,
+                kernel: Kern::NormAddScale,
+            },
+            FoldPattern::RoutedExperts {
+                top_k: K::RouteTopK,
+                sort: K::ExpertSort,
+                bands: &RoutedBands {
+                    rows_through: 8,
+                    grouped_pairs: 64,
+                    grouped_bundles: &[crate::subtile_ir::ExpertBundle::SwitchGlu],
+                    sorted_per_expert: 0.5..1.0,
+                    grouped_per_expert: 4.0,
+                },
+                kernel: Kern::Routed,
+            },
+            FoldPattern::MatvecEpilogue {
+                anchor: K::ExpertCombine,
+                weights: None,
+                bias: None,
+                scale: None,
+                gate_scale: Some(K::GateScale),
+                defer_gates: true,
+                add: K::Add,
+                gated: &[],
+                kernel: Kern::Epilogue,
+            },
+        ];
+        // The wide band without the deferral: #847's routed fold collapses the routed chain's
+        // wave levels, which pulls the combine's command ahead of the shared expert's down
+        // matvec — the gate's `shared` operand — and the gate scale stands alone (PR #847's
+        // review).
+        const AFTER_ROPE_STRICT: &[FoldPattern<Kern>] = &[
+            FoldPattern::NormAdd {
+                add: K::Add,
+                norm: K::RmsNorm,
+                kernel: Kern::NormAddScale,
+            },
+            FoldPattern::RoutedExperts {
+                top_k: K::RouteTopK,
+                sort: K::ExpertSort,
+                bands: &RoutedBands {
+                    rows_through: 8,
+                    grouped_pairs: 64,
+                    grouped_bundles: &[crate::subtile_ir::ExpertBundle::SwitchGlu],
+                    sorted_per_expert: 0.5..1.0,
+                    grouped_per_expert: 4.0,
+                },
+                kernel: Kern::Routed,
+            },
+            FoldPattern::MatvecEpilogue {
+                anchor: K::ExpertCombine,
+                weights: None,
+                bias: None,
+                scale: None,
+                gate_scale: Some(K::GateScale),
+                defer_gates: false,
+                add: K::Add,
+                gated: &[],
+                kernel: Kern::Epilogue,
+            },
+        ];
+        const AFTER_ROPE_NARROW: &[FoldPattern<Kern>] = &[
+            FoldPattern::NormAdd {
+                add: K::Add,
+                norm: K::RmsNorm,
+                kernel: Kern::NormAddScale,
+            },
+            FoldPattern::RoutedExperts {
+                top_k: K::RouteTopK,
+                sort: K::ExpertSort,
+                bands: &RoutedBands {
+                    rows_through: 1,
+                    grouped_pairs: 64,
+                    grouped_bundles: &[crate::subtile_ir::ExpertBundle::SwitchGlu],
+                    sorted_per_expert: 0.5..1.0,
+                    grouped_per_expert: 4.0,
+                },
+                kernel: Kern::Routed,
+            },
+            FoldPattern::MatvecEpilogue {
+                anchor: K::ExpertCombine,
+                weights: None,
+                bias: None,
+                scale: None,
+                gate_scale: Some(K::GateScale),
+                defer_gates: false,
+                add: K::Add,
+                gated: &[],
+                kernel: Kern::Epilogue,
+            },
+        ];
+        const WIDE: FusionTable<Kern> = FusionTable {
+            counted: &[],
+            sweeps: &[SWEEPS[0], SWEEPS[1], AFTER_ROPE_WIDE],
+            rows: None,
+        };
+        const STRICT: FusionTable<Kern> = FusionTable {
+            counted: &[],
+            sweeps: &[SWEEPS[0], SWEEPS[1], AFTER_ROPE_STRICT],
+            rows: None,
+        };
+        const NARROW: FusionTable<Kern> = FusionTable {
+            counted: &[],
+            sweeps: &[SWEEPS[0], SWEEPS[1], AFTER_ROPE_NARROW],
+            rows: None,
+        };
+        let (wide, strict, narrow) = (&WIDE, &STRICT, &NARROW);
+        let src = |rows| {
+            [
+                (rows, 64),
+                (1, 64),
+                (256, 64),
+                (64, 64),
+                (64, 32),
+                (64, 32),
+                (32, 64),
+                (64, 1),
+            ]
+        };
+        // Metal's colour rule, the part the wave order reads: which ops write over an operand.
+        fn rule(op: &ArchOp) -> ColourRule {
+            use SubOp as L;
+            match op {
+                L::Elementwise(EwKind::Add) => ColourRule::FRESH
+                    .output(OutputAlias::Operand(OperandIx(1)))
+                    .pinned_on(1)
+                    .delta_when_absorbed(0),
+                L::RmsNorm { .. } => ColourRule::FRESH
+                    .output(OutputAlias::AbsorbedDelta)
+                    .peel_through(0),
+                L::MatmulTile { .. } => ColourRule::FRESH.reads_across(),
+                _ => ColourRule::FRESH,
+            }
+        }
+        let lowered = |rows: u32| LoweredDecode {
+            input: LoweringInput {
+                sources: src(rows)
+                    .iter()
+                    .map(|&(r, c)| SourceShape { rows: r, cols: c })
+                    .collect(),
+                result: ops(rows).len() - 1,
+                exported: None,
+                ops: ops(rows),
+            },
+            bindings: weights(8),
+            op_tiles: vec![None; ops(rows).len()],
+            norm_gain_add_tiles: Default::default(),
+            op_expansion: vec![None; ops(rows).len()],
+            unnamed_reads: Vec::new(),
+        };
+        // Metal's verify buckets: the fold runs once, its decisions wave-order the tape, and the
+        // fold runs again on the reordered tape.
+        let bands = |table: &FusionTable<Kern>, rows: u32| {
+            let l = lowered(rows);
+            let (_, first) = fold_lowered(&l, table, BAND);
+            let mut free = vec![false; l.input.ops.len()];
+            for &(a, _) in first.absorbed_ops() {
+                free[a] = true;
+            }
+            for (j, od) in l.input.ops.iter().enumerate() {
+                if let SubOp::ExpertSort { k, .. } = od.op {
+                    free[j] |= od.m.saturating_mul(k.get()) < 64;
+                }
+            }
+            let waved = crate::wave_schedule::wave_order(
+                &l,
+                rule,
+                first.absorbed_ops(),
+                first.epilogue_ops(),
+                &free,
+            );
+            let folded = fold_lowered(&waved, table, BAND);
+            (waved, folded)
+        };
+        // The slot of the first op of `kind` in `l`'s tape.
+        let at = |l: &LoweredDecode, s: &[SlotId], kind: &str| {
+            let j = l
+                .input
+                .ops
+                .iter()
+                .position(|od| od.op.name() == kind)
+                .unwrap_or_else(|| panic!("no {kind} in the waved tape"));
+            s[j]
+        };
+        // The narrow band keeps the fold's one-row origin, so the routing still runs as commands
+        // and the combine's command stays deep enough to follow the shared expert: main's
+        // decision, the gate scale and the residual add inside the combine's command.
+        let (w, (s, f)) = bands(&narrow, 2);
+        let combine = at(&w, &s, "ExpertCombine");
+        let gate = at(&w, &s, "GateScale");
+        let add = at(&w, &s, "Add");
+        assert_eq!(f.role(gate), StepRole::Absorbed { into: combine });
+        assert_eq!(f.role(add), StepRole::Epilogue { of: combine });
+        let chain = f.driven(combine);
+        assert!(matches!(
+            chain,
+            [
+                Fusion {
+                    kernel: Kern::ExpertCombined,
+                    ..
+                },
+                Fusion {
+                    kernel: Kern::Epilogue,
+                    shape: FusedShape::MatvecEpilogue {
+                        gate_scale: Some(_),
+                        add: Some(_),
+                        ..
+                    }
+                }
+            ]
+        ));
+        // The wide band without the deferral: the gate scale and the add stand alone.
+        let (w, (s, f)) = bands(&strict, 2);
+        let combine = at(&w, &s, "ExpertCombine");
+        let gate = at(&w, &s, "GateScale");
+        let add = at(&w, &s, "Add");
+        assert_eq!(f.role(gate), StepRole::Kept);
+        assert_eq!(f.role(add), StepRole::Kept);
+        // The combine still drives the expert folds — only the epilogue is missing.
+        assert!(matches!(
+            f.driven(combine),
+            [Fusion {
+                kernel: Kern::ExpertCombined,
+                ..
+            }]
+        ));
+        // The wide band with it: the first fold's deferred absorption pulls the combine's
+        // command past the shared expert's down matvec in the wave order, and the re-fold takes
+        // the same chain the narrow band does — the routed command untouched.
+        let (w, (s, f)) = bands(&wide, 2);
+        let combine = at(&w, &s, "ExpertCombine");
+        let gate = at(&w, &s, "GateScale");
+        let add = at(&w, &s, "Add");
+        let act = at(&w, &s, "ExpertGatedAct");
+        assert_eq!(f.role(gate), StepRole::Absorbed { into: combine });
+        assert_eq!(f.role(add), StepRole::Epilogue { of: combine });
+        let chain = f.driven(combine);
+        assert!(matches!(
+            chain,
+            [
+                Fusion {
+                    kernel: Kern::ExpertCombined,
+                    ..
+                },
+                Fusion {
+                    kernel: Kern::Epilogue,
+                    shape: FusedShape::MatvecEpilogue {
+                        gate_scale: Some(_),
+                        add: Some(_),
+                        ..
+                    }
+                }
+            ]
+        ));
+        // The routed command is untouched: the gated act still drives both its own expert fold
+        // and the routed fold.
+        assert!(matches!(
+            f.driven(act),
+            [
+                Fusion {
+                    kernel: Kern::ExpertGated,
+                    ..
+                },
+                Fusion {
+                    kernel: Kern::Routed,
+                    ..
+                }
+            ]
+        ));
+        // The shared expert's down matvec runs before the combine's command.
+        let down = w
+            .input
+            .ops
+            .iter()
+            .position(|od| matches!(od.op, SubOp::MatmulTile { n: 64, .. }))
+            .expect("the shared expert's down matvec");
+        let combine_at = w
+            .input
+            .ops
+            .iter()
+            .position(|od| od.op.name() == "ExpertCombine")
+            .expect("the combine");
+        assert!(
+            down < combine_at,
+            "shared down at {down}, combine at {combine_at}"
+        );
     }
 
     #[test]

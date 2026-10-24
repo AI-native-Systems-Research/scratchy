@@ -477,6 +477,7 @@ const SWEEP_ELEMENTWISE: &[FoldPattern<MetalFusion>] = &[
         bias: Some(SubOpKind::BiasAdd),
         scale: Some(SubOpKind::ScalarMul),
         gate_scale: None,
+        defer_gates: false,
         add: SubOpKind::Add,
         gated: &[SubOpKind::Silu, SubOpKind::Gelu, SubOpKind::Mul],
         kernel: MetalFusion::QmvEpilogue,
@@ -615,17 +616,42 @@ const F_ROPED_PACKED: FoldPattern<MetalFusion> = FoldPattern::RopedAttention {
     writers: ROPED_ATTENTION_WRITERS,
     kernel: MetalFusion::RopedAttention,
 };
-// After the expert folds: the combine's command is the down's and the unsort's.
-const F_COMBINE_EPILOGUE: FoldPattern<MetalFusion> = FoldPattern::MatvecEpilogue {
+// After the expert folds: the combine's command is the down's and the unsort's. The wide band
+// defers the gate: its routed fold (#847) collapses the routed chain's wave levels, which pulls
+// the combine's command ahead of the shared expert's down matvec — the gate's `shared` operand —
+// so the first fold's refusal is the wave order's to repair (the gate joins the combine's
+// command, pulling it back past the shared expert) and the re-fold fires it. The narrow band's
+// routed chain still runs the routing as commands, keeping the combine deep enough to follow the
+// shared expert: main's decision, never deferred.
+const F_COMBINE_EPILOGUE_WIDE: FoldPattern<MetalFusion> = FoldPattern::MatvecEpilogue {
     anchor: SubOpKind::ExpertCombine,
     weights: None,
     bias: None,
     scale: None,
     gate_scale: Some(SubOpKind::GateScale),
+    defer_gates: true,
     add: SubOpKind::Add,
     gated: &[],
     kernel: MetalFusion::CombineEpilogue,
 };
+const F_COMBINE_EPILOGUE_NARROW: FoldPattern<MetalFusion> = FoldPattern::MatvecEpilogue {
+    anchor: SubOpKind::ExpertCombine,
+    weights: None,
+    bias: None,
+    scale: None,
+    gate_scale: Some(SubOpKind::GateScale),
+    defer_gates: false,
+    add: SubOpKind::Add,
+    gated: &[],
+    kernel: MetalFusion::CombineEpilogue,
+};
+
+// A deferring gate's absorption only ever feeds the wave order, whose re-fold must then run
+// wherever the gate stage can — the whole matvec-ends band (the QMV matvec rows, the least `m`
+// a `matvec_ends` fact is ever true at) inside the wave-order rows. Breaking this ordering
+// would let a deferred gate ship as a decision, reading operands nothing computed yet.
+const _: () =
+    assert!((crate::tape::quantized::QMV_MATVEC_BAND_ROWS as u64) < METAL_WAVE_ORDER_ROWS);
 
 /// The wide band's routed-experts fold: through the verify-sized rows.
 const F_ROUTED_WIDE: FoldPattern<MetalFusion> = FoldPattern::RoutedExperts {
@@ -663,7 +689,7 @@ const SWEEP_AFTER_ROPE_WIDE: &[FoldPattern<MetalFusion>] = &[
     // `attention_via_cache_v2`'s `ATTN_FOLD`: the plain writer, encoding or not.
     F_ROPED_DECODE,
     F_ROPED_PACKED,
-    F_COMBINE_EPILOGUE,
+    F_COMBINE_EPILOGUE_WIDE,
 ];
 
 const SWEEP_AFTER_ROPE_NARROW: &[FoldPattern<MetalFusion>] = &[
@@ -674,7 +700,7 @@ const SWEEP_AFTER_ROPE_NARROW: &[FoldPattern<MetalFusion>] = &[
     // `attention_via_cache_v2`'s `ATTN_FOLD`: the plain writer, encoding or not.
     F_ROPED_DECODE,
     F_ROPED_PACKED,
-    F_COMBINE_EPILOGUE,
+    F_COMBINE_EPILOGUE_NARROW,
 ];
 
 pub const METAL_FUSIONS: FusionTable<MetalFusion> = FusionTable {
