@@ -6,6 +6,8 @@
 // (`targets/cuda/tests/common/numerics.rs`), and the constants `HIDDEN`, `WEIGHTS` (the weight
 // buffers the rig uploads), `ARENA` (the largest tape's arena bytes) and
 // `BOUNDARY_DECODE_COSINE` ((n)'s cosine floor).
+// qwen3.6-35b-a3b's `cuda_prefill_35b.rs` includes it too (AI-native-Systems-Research/
+// scratchy#859): its MoE bundles are filled as the GEMMs that read them.
 
 use std::sync::OnceLock;
 
@@ -19,6 +21,8 @@ use scratchy_target_cuda::step::{
     CudaStep, EmbedBf16, GatedDeltaNetBf16, GemmBf16, gdn_bundle, gdn_conv_dim,
 };
 use scratchy_target_cuda::tape::{ArenaSpan, CudaTape};
+// A MoE model's bundle steps (qwen3.6-35b-a3b, `cuda_prefill_35b.rs`, #859).
+use scratchy_target_cuda::step::{ExpertGemmBf16, ExpertGemvBf16, RouterLogitsBf16, moe_bundle};
 
 const VOCAB: usize = 248_320;
 /// The real rows of the one-bucket forwards.
@@ -51,6 +55,9 @@ enum Role {
         nv: u32,
         head_v: u32,
     },
+    /// A MoE layer's dense bf16 bundle (`step::moe_bundle`): the router and every expert's
+    /// projections, each a GEMM's `[n, k]` matrix.
+    MoeBundle { experts: u32, hidden: u32, inter: u32 },
 }
 
 /// Every weight source's role, read off the tapes' steps; each source has one.
@@ -95,6 +102,35 @@ fn roles() -> Vec<Option<Role>> {
                         head_v,
                     },
                 ),
+                // Every step of a MoE layer that reads its bundle states the bundle's geometry.
+                CudaStep::RouterLogits(RouterLogitsBf16 {
+                    bundle,
+                    experts,
+                    hidden,
+                    inter,
+                    ..
+                })
+                | CudaStep::ExpertGemm(ExpertGemmBf16 {
+                    bundle,
+                    experts,
+                    hidden,
+                    inter,
+                    ..
+                })
+                | CudaStep::ExpertGemv(ExpertGemvBf16 {
+                    bundle,
+                    experts,
+                    hidden,
+                    inter,
+                    ..
+                }) => set(
+                    bundle.0,
+                    Role::MoeBundle {
+                        experts,
+                        hidden,
+                        inter,
+                    },
+                ),
                 _ => {}
             }
         }
@@ -137,6 +173,28 @@ fn weight(ix: usize, role: Role, bytes: u64) -> Vec<u16> {
                 f[at as usize / 4..][..n].copy_from_slice(&part);
             }
             f32_to_halves(&f)
+        }
+        // The experts as GEMMs: the router `[experts, hidden]` and every expert's gate and up
+        // rows uniform in ±1/√hidden, its down rows in ±1/√inter, each part from its own seed.
+        Role::MoeBundle {
+            experts,
+            hidden,
+            inter,
+        } => {
+            let l = moe_bundle(experts, hidden, inter).expect("the MoE bundle fits");
+            assert_eq!(l.bytes, bytes, "weight {ix}: the MoE bundle's bytes");
+            let parts = [
+                (l.gate_up - l.router, hidden),
+                (l.down - l.gate_up, hidden),
+                (l.bytes - l.down, inter),
+            ];
+            let mut out = Vec::with_capacity(len);
+            for (i, (part, k)) in parts.into_iter().enumerate() {
+                let n = part as usize / 2;
+                let seed = seed ^ ((i as u64 + 1) << 32);
+                out.extend(scaled(n, seed, 1.0 / (k as f32).sqrt()));
+            }
+            out
         }
     }
 }
@@ -956,9 +1014,24 @@ fn n_decodes_at_a_block_boundary() {
             at + 1,
             verdict(ok)
         );
+        if !boundary_floor_gates() {
+            eprintln!(
+                "(n) decode at P={at}: a MoE model's (n) floor is the user's, set from this \
+                 run's cosine={cos:.6} (#859): printed, not gated; finite={finite} gated {}",
+                verdict(finite)
+            );
+        }
+        let ok = ok || (!boundary_floor_gates() && finite);
         pass &= ok;
     }
     assert!(pass, "a decode at the block boundary is out of agreement");
+}
+
+/// Whether (n)'s cosine floor gates: for every dense model (`BOUNDARY_DECODE_COSINE`, the 0.8b's
+/// and 9b's measured floors). A MoE model's (qwen3.6-35b-a3b's, #859) is set by the user from its
+/// first run's printed cosines, so until then (n) prints the cosine and gates only finiteness.
+fn boundary_floor_gates() -> bool {
+    CUDA_TAPES.iter().all(|t| t.moe.is_none())
 }
 
 /// (o): at m=1, a position other than `prefix_len`, a block table too short for `P + 1`, a GDN

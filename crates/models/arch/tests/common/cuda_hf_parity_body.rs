@@ -6,6 +6,9 @@
 // constants `HIDDEN`, `WEIGHTS` (the weight buffers `load_weights` uploads), `UNTIED_LM_HEAD`
 // (the lm_head's own tensor, `None` when it is tied to the embedding table), and the goldens'
 // `MODEL` (`cuda_hf_reference.py --model`), `CHECKPOINT` and `GOLDENS` dir.
+// qwen3.6-35b-a3b's `cuda_hf_parity_35b.rs` includes it too (AI-native-Systems-Research/
+// scratchy#859): its P1 prints rather than gates (`p1_floor_gates`), and `load_checks` adds its
+// MoE bundles' rows.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -33,6 +36,40 @@ const CHUNK: usize = 128;
 
 fn verdict(pass: bool) -> &'static str {
     if pass { "PASS" } else { "FAIL" }
+}
+
+/// P1's rule per model (AI-native-Systems-Research/scratchy#859). `true`: the merged floor, min
+/// cosine(CUDA, f32) ≥ 0.999 on every row, gates P1 and P8's two decode-row cosines (qwen3.5-0.8b
+/// and qwen3.5-9b). `false`: qwen3.6-35b-a3b, whose rule is min cosine(CUDA, f32) ≥ min
+/// cosine(HF-bf16, f32) − δ and whose (n) floor for P8's own-row cosine is set from its first
+/// run: until the user sets both, those cosines are printed beside HF-bf16's, not gated, and the
+/// rest of P8 still gates.
+fn p1_floor_gates() -> bool {
+    MODEL != "qwen3.6-35b-a3b"
+}
+
+/// The most P5 or P7 prompts whose first divergence is a near-tie: 1, every model's, the 9b's
+/// value pending the user's decision (#859). P5 and P7 gate on this and on their merged `at most 1`
+/// line, which agree.
+fn near_tie_cap() -> usize {
+    1
+}
+
+/// The H100's device memory a worker over every tape may hold after its forwards: 78.0 GiB of
+/// the 79.6 GiB `cudaMemGetInfo` reports, about 1.5 GiB left for serve's KV budget (#859's
+/// memory gate).
+const PEAK_LIMIT: u64 = 78 << 30;
+
+/// Bytes as GiB.
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / f64::from(1u32 << 30)
+}
+
+/// Little-endian byte pairs as the u16 halves `DeviceBuffer` holds.
+fn le_halves(bytes: &[u8]) -> Vec<u16> {
+    (bytes.as_chunks::<2>().0.iter())
+        .map(|&p| u16::from_le_bytes(p))
+        .collect()
 }
 
 fn goldens_dir() -> PathBuf {
@@ -339,7 +376,192 @@ fn load_checks() {
         );
         pass &= ok;
     }
+    // A MoE model's first and last MoE bundles (qwen3.6-35b-a3b's layers 0 and 39; none in a
+    // dense model): the router whole at byte 0, experts 0 and `experts − 1`'s first `gate_up`
+    // and `down` rows, and the layer's shared-expert gate, each against the checkpoint's bytes.
+    let moe: Vec<(usize, CudaWeight)> = (CUDA_WEIGHTS.iter().enumerate())
+        .filter_map(|(ix, w)| match *w {
+            Some(b @ CudaWeight::MoeBundle { .. }) => Some((ix, b)),
+            _ => None,
+        })
+        .collect();
+    let ends = (moe.iter().enumerate()).filter(|&(n, _)| n == 0 || n + 1 == moe.len());
+    for (_, &(ix, bundle)) in ends {
+        let CudaWeight::MoeBundle {
+            router,
+            gate_up,
+            down,
+            experts,
+            hidden,
+            inter,
+        } = bundle
+        else {
+            unreachable!("matched a MoE bundle");
+        };
+        let layout = scratchy_target_cuda::step::moe_bundle(experts, hidden, inter)
+            .expect("the MoE bundle fits");
+        let device = r.weights[ix].download().expect("download the MoE bundle");
+        let (e, h, i) = (experts as usize, hidden as usize, inter as usize);
+        let (want, ..) = ck.take_to_cpu_bytes(router).expect("the router");
+        let at = layout.router as usize / 2;
+        let ok = device[at..][..e * h] == le_halves(&want)[..];
+        eprintln!(
+            "load: weight {ix} {router} [{e}, {h}] at byte {} equals the checkpoint's {}",
+            layout.router,
+            verdict(ok)
+        );
+        pass &= ok;
+        for (tensor, base, per_expert, row) in [
+            (gate_up, layout.gate_up, 2 * i * h, h),
+            (down, layout.down, h * i, i),
+        ] {
+            let (want, ..) = ck.take_to_cpu_bytes(tensor).expect("an expert tensor");
+            for expert in [0, e - 1] {
+                let from = expert * per_expert;
+                let at = base as usize / 2 + from;
+                let ok = device[at..][..row] == le_halves(&want[from * 2..][..row * 2])[..];
+                eprintln!(
+                    "load: weight {ix} {tensor} expert {expert} row 0 ({row} values) equals the \
+                     checkpoint's {}",
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+        let gate = router.replace(".mlp.gate.weight", ".mlp.shared_expert_gate.weight");
+        let gix = (CUDA_WEIGHTS.iter())
+            .position(|w| matches!(w, Some(CudaWeight::Bf16 { tensor, .. }) if *tensor == gate))
+            .unwrap_or_else(|| panic!("no entry for {gate}"));
+        let (want, ..) = ck.take_to_cpu_bytes(&gate).expect("the shared-expert gate");
+        let got = r.weights[gix].download().expect("download the shared-expert gate");
+        let ok = got == le_halves(&want);
+        eprintln!(
+            "load: weight {gix} {gate} ({} values) equals the checkpoint's {}",
+            got.len(),
+            verdict(ok)
+        );
+        pass &= ok;
+    }
     assert!(pass, "a load check failed");
+}
+
+/// `nvidia-smi`'s memory line for the memory gate's readings, or why there is none. Printed beside
+/// `cudaMemGetInfo`, information only.
+fn nvidia_smi() -> String {
+    std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.used,memory.total",
+            "--format=csv,noheader",
+        ])
+        .output()
+        .map_or_else(
+            |e| format!("nvidia-smi unavailable: {e}"),
+            |o| String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        )
+}
+
+/// The memory gate (#859), run first and alone: `cudaMemGetInfo` and `nvidia-smi` after the
+/// device opens, after `load_weights`, after a worker over every tape, and after one forward of
+/// the largest bucket's every row and one decode. Pass: `WEIGHTS` + 3 allocations, every buffer
+/// its `weight_bytes`, every bucket in the worker, and a peak (total − free after the forwards) at
+/// most `PEAK_LIMIT`. The KV pool is serve's cap, one sequence's block table plus block 0
+/// (`CUDA_MAX_BLOCKS_PER_SEQ` + 1); the GDN pool is the rig's. Reads only the goldens'
+/// `checkpoint`.
+#[test]
+fn memory_fits() {
+    let device = CudaDevice::open()
+        .unwrap_or_else(|e| panic!("the `nvcc` feature's tests need an sm_90 GPU (H100): {e}"));
+    let reading = |when: &str| {
+        let (free, total) = device.mem_info().unwrap_or_else(|e| panic!("mem_info: {e}"));
+        let (free, total) = (free as u64, total as u64);
+        eprintln!(
+            "memory {when}: used {:.3} GiB free {:.3} GiB total {:.3} GiB (cudaMemGetInfo); \
+             nvidia-smi used, total: {}",
+            gib(total - free),
+            gib(free),
+            gib(total),
+            nvidia_smi()
+        );
+        (free, total)
+    };
+    reading("after CudaDevice::open");
+    let before = device.allocations();
+    let t = Instant::now();
+    let weights = load_weights(&device, &checkpoint(), CUDA_TAPES, CUDA_WEIGHTS)
+        .unwrap_or_else(|e| panic!("load_weights: {e}"));
+    let load_secs = t.elapsed().as_secs_f64();
+    let loaded = device.allocations() - before;
+    reading("after load_weights");
+    let sizes_ok = (weights.iter().enumerate()).all(|(ix, b)| {
+        b.bytes() == (CUDA_TAPES.iter().map(|t| t.weight_bytes[ix]).max()).unwrap_or(0)
+    });
+    let blocks = scratchy_target_cuda::step::CUDA_MAX_BLOCKS_PER_SEQ + 1;
+    let mut w = CudaWorker::new(
+        &device,
+        CUDA_TAPES,
+        &weights,
+        Some(KvPoolConfig { num_blocks: blocks }),
+        Some(GDN_POOL),
+    )
+    .unwrap_or_else(|e| panic!("CudaWorker::new: {e}"));
+    let worker = device.allocations() - before - loaded;
+    reading("after CudaWorker::new");
+    let ms: Vec<u32> = CUDA_TAPES.iter().map(|t| t.bucket_m).collect();
+    let buckets_ok = ms == [1, 512, 1024, 2048, 4096];
+    let (b, tape) = (CUDA_TAPES.iter().enumerate())
+        .max_by_key(|(_, t)| t.bucket_m)
+        .expect("a tape");
+    let rows = tape.bucket_m;
+    let ids: Vec<u32> = (0..rows).map(|i| (i * 7919) % VOCAB as u32).collect();
+    let positions: Vec<u32> = (0..rows).collect();
+    let table: Vec<u32> = (0..blocks - 1).collect();
+    let kv = KvSequence {
+        block_table: &table,
+        prefix_len: 0,
+        q_len: rows,
+    };
+    let gdn = GdnSequence {
+        slot: 0,
+        q_len: rows,
+        fresh: true,
+    };
+    let mut out = vec![0u16; tape.result.bytes as usize / 2];
+    w.forward(
+        b,
+        Input::TokenIds(&ids),
+        &positions,
+        Some(&kv),
+        Some(&gdn),
+        &mut out,
+    )
+    .unwrap_or_else(|e| panic!("the m={rows} forward: {e}"));
+    let row = decode(&mut w, 7, rows, (&table[..], 0));
+    let non_finite = (out.iter().map(|&b| bf16::from_bits(b).to_f32()))
+        .chain(row.iter().copied())
+        .filter(|v| !v.is_finite())
+        .count();
+    let (free, total) = reading(&format!("after one m={rows} forward and one m=1 decode"));
+    let peak = total - free;
+    let ok = loaded == WEIGHTS && worker == 3 && sizes_ok && buckets_ok && peak <= PEAK_LIMIT;
+    eprintln!(
+        "memory: allocations weights={loaded} (expect {WEIGHTS}) worker={worker} (expect 3) \
+         every buffer its weight_bytes={sizes_ok} buckets {ms:?} (expect all five) arena={} KV \
+         pool={:?} ({blocks} blocks) GDN pool={:?} load_time={load_secs:.2}s non-finite \
+         logits={non_finite} (information only)",
+        w.arena_bytes(),
+        w.kv_pool_bytes(),
+        w.gdn_pool_bytes()
+    );
+    eprintln!(
+        "memory: peak {:.3} GiB of {:.3} GiB (headroom {:.3} GiB), need <= {:.1} GiB (#859's \
+         gate, about 1.5 GiB left for serve's KV budget) {}",
+        gib(peak),
+        gib(total),
+        gib(total - peak),
+        gib(PEAK_LIMIT),
+        verdict(ok)
+    );
+    assert!(ok, "the memory gate failed: see the lines above");
 }
 
 #[test]
@@ -371,6 +593,17 @@ fn p1_to_p4_one_forward_per_prompt() {
                 p.p
             );
         }
+        if !p1_floor_gates() {
+            eprintln!(
+                "P1 prompt {}: {MODEL} rule min cosine(CUDA, f32) >= min cosine(HF-bf16, f32) - \
+                 delta (delta: the user's, #859): CUDA {min_cos:.6} HF-bf16 {noise_cos:.6} \
+                 CUDA - HF-bf16 = {:+.6}; printed, not gated (the 0.999 line above is the 0.8b's \
+                 floor, printed beside it)",
+                p.p,
+                min_cos - noise_cos
+            );
+        }
+        let ok1 = ok1 || !p1_floor_gates();
         p1 &= ok1;
         // P2.
         let (rms, max) = error(got, &p.f32);
@@ -451,6 +684,17 @@ fn p1_to_p4_one_forward_per_prompt() {
         "P3 all prompts: top-1 agreement {agree}/{total} = {:.4} (information only)",
         agree as f64 / total as f64
     );
+    eprintln!(
+        "P1-P4 rules and their numbers' sources: P1 {} (0.999 from 0.8b runs, #816); P2 <= 2x \
+         HF-bf16's RMS and max per prompt (this run's HF-bf16, #816); P3 no top-1 disagreement \
+         outside a near-tie, margin <= 2x the row's max |HF-bf16 - f32| (this run's HF-bf16, the \
+         user's 2026-10-23 rule); P4 >= 4 of 5 shared on the last row (#816)",
+        if p1_floor_gates() {
+            "min cosine >= 0.999, gated"
+        } else {
+            "min cosine >= HF-bf16's - delta, printed until the user sets delta (#859)"
+        }
+    );
     assert!(p1 && p2 && p3 && p4, "P1 {p1} P2 {p2} P3 {p3} P4 {p4}");
 }
 
@@ -506,6 +750,14 @@ fn p5_greedy_matches_hf_f32() {
     let ok = near_ties <= 1;
     eprintln!(
         "P5: near-tie prompts {near_ties} (at most 1) {}",
+        verdict(ok)
+    );
+    let ok = ok && near_ties <= near_tie_cap();
+    eprintln!(
+        "P5 rule: every first divergence at a near-tie step, margin < 2x the step's bf16_max_err \
+         (this run's HF-bf16, #816); near-tie prompts {near_ties} against near_tie_cap() {} (the \
+         9b's cap, pending the user, #859) {}",
+        near_tie_cap(),
         verdict(ok)
     );
     assert!(pass && ok, "the greedy tokens differ from HF-f32's");
@@ -644,6 +896,13 @@ fn p7_greedy_via_decode_matches_hf_f32() {
         "P7: near-tie prompts {near_ties} (at most 1) {}",
         verdict(ok)
     );
+    let ok = ok && near_ties <= near_tie_cap();
+    eprintln!(
+        "P7 rule: P5's (this run's HF-bf16, #830); near-tie prompts {near_ties} against \
+         near_tie_cap() {} (the 9b's cap, pending the user, #859) {}",
+        near_tie_cap(),
+        verdict(ok)
+    );
     assert!(
         pass && ok,
         "the greedy tokens via decode differ from HF-f32's"
@@ -709,6 +968,27 @@ fn p8_the_decode_row_matches_hf_f32() {
             n - 1,
             verdict(ok_own)
         );
+        // qwen3.6-35b-a3b: both cosines printed, not gated, until the user sets P1's delta and
+        // the 35B's (n) floor (#859); everything else on the line still gates.
+        let ok_hf = ok_hf
+            || (!p1_floor_gates()
+                && rms <= 2.0 * noise_rms
+                && max <= 2.0 * noise_max
+                && (same || tie)
+                && shared >= 4);
+        let ok_own = ok_own || (!p1_floor_gates() && (same_own || tie));
+        if !p1_floor_gates() {
+            eprintln!(
+                "P8 prompt {} decode row {}: {MODEL} cosine vs HF-f32 {cos:.6} (HF-bf16's last \
+                 row {:.6}, under P1's rule, delta the user's) and vs CUDA's one-shot \
+                 {cos_own:.6} (the 35B's (n) floor the user's): printed, not gated; the rest \
+                 {} (sources: P2-P4's, #830)",
+                p.p,
+                n - 1,
+                cosine(bf16_row, f32_row),
+                verdict(ok_hf && ok_own)
+            );
+        }
         pass &= ok_hf && ok_own;
     }
     assert!(
