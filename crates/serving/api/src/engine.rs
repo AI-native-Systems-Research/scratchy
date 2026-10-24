@@ -1243,9 +1243,6 @@ impl AsyncEngine {
         Ok((base_id, model, rx))
     }
 
-    /// Add a non-streaming completion request.
-    ///
-    /// Supports `n > 1` and multi-prompt: generates `num_prompts * n` choices.
     /// A completion request's children, one per (prompt, n) pair, every one resolved and checked
     /// ([`Self::check_admissible`]) before any is submitted. `max_tokens` is resolved against each
     /// prompt's length, so a later prompt can be refused where the first is not, and a refusal
@@ -1317,6 +1314,9 @@ impl AsyncEngine {
         Ok(children)
     }
 
+    /// Add a non-streaming completion request.
+    ///
+    /// Supports `n > 1` and multi-prompt: generates `num_prompts * n` choices.
     pub async fn completion(
         &self,
         request: protocol::CompletionRequest,
@@ -2407,14 +2407,6 @@ impl AsyncEngine {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Submit a request to the engine.
-    ///
-    /// Inserts the request state into the map (brief lock), then sends the
-    /// engine request to the step loop via channel (non-blocking).
-    ///
-    /// Note: `requests_total` and `prompt_tokens_total` metrics are the
-    /// caller's responsibility (once per HTTP request). This method only
-    /// increments `requests_active` (once per engine-core request).
     /// Whether a request this long, sampling with `params`, may be submitted: its prompt within
     /// the model's context, and its params within the ranges vLLM's `SamplingParams` checks
     /// (temperature, top_p / top_k / min_p, the penalties, max_tokens against min_tokens, …).
@@ -2440,6 +2432,14 @@ impl AsyncEngine {
         Ok(())
     }
 
+    /// Submit a request to the engine.
+    ///
+    /// Inserts the request state into the map (brief lock), then sends the
+    /// engine request to the step loop via channel (non-blocking).
+    ///
+    /// Note: `requests_total` and `prompt_tokens_total` metrics are the
+    /// caller's responsibility (once per HTTP request). This method only
+    /// increments `requests_active` (once per engine-core request).
     #[allow(clippy::too_many_arguments)]
     async fn submit_request(
         &self,
