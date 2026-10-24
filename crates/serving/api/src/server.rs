@@ -675,28 +675,30 @@ async fn tokenize(
     let text = if let Some(prompt) = &request.prompt {
         prompt.clone()
     } else if let Some(messages) = &request.messages {
-        {
-            let template = match state.engine.chat_template() {
-                Some(t) => t,
-                None => {
-                    return Json(protocol::ErrorResponse::new(
-                        "Chat-style tokenize requires a chat template",
-                        "BadRequestError",
-                        400,
-                    ))
-                    .into_response();
-                }
-            };
-            match template.render_chat(messages, None, None, request.add_generation_prompt) {
-                Ok(text) => text,
-                Err(e) => {
-                    return Json(protocol::ErrorResponse::new(
-                        format!("Chat template rendering failed: {e}"),
-                        "BadRequestError",
-                        400,
-                    ))
-                    .into_response();
-                }
+        // As the prefill renders it: the tools, and the kwargs over the server's defaults (#214).
+        let rendered = state.engine.render_chat(
+            messages,
+            request.tools.as_deref(),
+            request.chat_template_kwargs.as_ref(),
+            request.add_generation_prompt,
+        );
+        match rendered {
+            Some(Ok(text)) => text,
+            Some(Err(e)) => {
+                return Json(protocol::ErrorResponse::new(
+                    format!("Chat template rendering failed: {e}"),
+                    "BadRequestError",
+                    400,
+                ))
+                .into_response();
+            }
+            None => {
+                return Json(protocol::ErrorResponse::new(
+                    "Chat-style tokenize requires a chat template",
+                    "BadRequestError",
+                    400,
+                ))
+                .into_response();
             }
         }
     } else {

@@ -782,6 +782,22 @@ impl AsyncEngine {
     }
 
     /// Get a reference to the chat template, if available.
+    /// ⭐ A CHAT PROMPT, RENDERED ONE WAY (#214): `messages` and `tools` through the model's chat
+    /// template, with the server's default chat-template kwargs and `kwargs` merged over them.
+    /// The prefill renders through it, and so does `/tokenize`, so its count is the prefill's.
+    /// `None` without a chat template.
+    pub(crate) fn render_chat(
+        &self,
+        messages: &[protocol::ChatCompletionMessageParam],
+        tools: Option<&[protocol::ChatCompletionToolsParam]>,
+        kwargs: Option<&HashMap<String, serde_json::Value>>,
+        add_generation_prompt: bool,
+    ) -> Option<ServeResult<String>> {
+        let template = self.chat_template.as_ref()?;
+        let merged = merge_chat_template_kwargs(self.default_chat_template_kwargs.as_ref(), kwargs);
+        Some(template.render_chat(messages, tools, merged.as_ref(), add_generation_prompt))
+    }
+
     pub fn chat_template(&self) -> Option<&Arc<ChatTemplate>> {
         self.chat_template.as_ref()
     }
@@ -3148,19 +3164,14 @@ impl AsyncEngine {
         sampling_params: &mut SamplingParams,
     ) -> ServeResult<EngineCoreRequest> {
         // Build text from chat messages — using chat template if available.
-        let text = if let Some(template) = &self.chat_template {
-            // Merge default + per-request chat template kwargs.
-            let merged_kwargs = merge_chat_template_kwargs(
-                self.default_chat_template_kwargs.as_ref(),
-                request.chat_template_kwargs.as_ref(),
-            );
-
-            template.render_chat(
-                &request.messages,
-                request.tools.as_deref(),
-                merged_kwargs.as_ref(),
-                true,
-            )?
+        let rendered = self.render_chat(
+            &request.messages,
+            request.tools.as_deref(),
+            request.chat_template_kwargs.as_ref(),
+            true,
+        );
+        let text = if let Some(rendered) = rendered {
+            rendered?
         } else {
             // Fallback: concatenate messages with newlines.
             let mut text = String::new();
@@ -4647,6 +4658,74 @@ mod tests {
         let harmony = crate::reasoning_parser::get_reasoning_parser("gpt_oss", &vocab).unwrap();
         engine.set_reasoning_parser(harmony);
         assert!(reads(&engine, "hi T\n\nU\n\n"), "text markers: always read");
+    }
+
+    /// `/tokenize` counts a chat request's prompt as the prefill builds it (#214): its tools, and
+    /// its chat-template kwargs merged over the server's defaults. The handler's count is the
+    /// prefill's prompt ids, `chat_to_engine_request`'s; without the tools it falls short, as it
+    /// did before.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn tokenize_counts_a_chat_prompt_as_the_prefill_builds_it() {
+        use tower::ServiceExt;
+        let mut engine = make_test_engine_with_tokenizer();
+        let template = "{% for m in messages %}{{ m.content }}{% endfor %}\
+                        {% if tools %}TOOLS:{{ tools | tojson }}{% endif %}\
+                        {% if think %}THINK{% endif %}{% if terse %}TERSE{% endif %}";
+        engine.set_chat_template(Arc::new(ChatTemplate::new(template.to_string()).unwrap()));
+        engine.set_default_chat_template_kwargs(HashMap::from([(
+            "think".to_string(),
+            serde_json::json!(true),
+        )]));
+        let tools = serde_json::json!([{"type": "function", "function": {
+            "name": "Bash", "description": "Run a shell command",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}
+        }}]);
+        let kwargs = serde_json::json!({"terse": true});
+        let request = protocol::ChatCompletionRequest {
+            tools: Some(serde_json::from_value(tools.clone()).unwrap()),
+            chat_template_kwargs: Some(serde_json::from_value(kwargs.clone()).unwrap()),
+            ..make_chat_request()
+        };
+        let mut params = engine.build_sampling_params_from_chat(&request).unwrap();
+        let prefill = (engine.chat_to_engine_request("test-1", &request, &mut params))
+            .unwrap()
+            .prompt_token_ids
+            .unwrap();
+
+        let state = Arc::new(crate::server::AppState {
+            engine: Arc::new(engine),
+            config: Default::default(),
+            is_pooling: false,
+            scratchy_core_config: None,
+            requests_served: std::sync::atomic::AtomicU64::new(0),
+        });
+        let count = |body: serde_json::Value| {
+            let router = crate::server::build_router(state.clone());
+            async move {
+                let request = http::Request::builder()
+                    .method("POST")
+                    .uri("/tokenize")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap();
+                let response = router.oneshot(request).await.unwrap();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                response["count"].as_u64().unwrap() as usize
+            }
+        };
+        let messages = serde_json::to_value(&request.messages).unwrap();
+        let counted = count(serde_json::json!({
+            "messages": messages, "tools": tools, "chat_template_kwargs": kwargs,
+        }))
+        .await;
+        assert_eq!(counted, prefill.len(), "the prefill's count");
+        let without_tools =
+            count(serde_json::json!({"messages": messages, "chat_template_kwargs": kwargs})).await;
+        assert!(without_tools < counted, "{without_tools} without the tools");
     }
 
     #[test]

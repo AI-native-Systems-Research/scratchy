@@ -1330,6 +1330,16 @@ pub struct TokenizeRequest {
     #[serde(default)]
     pub messages: Option<Vec<ChatCompletionMessageParam>>,
 
+    /// The tools a chat request declares, rendered into its prompt as the chat path renders them
+    /// (chat-style only).
+    #[serde(default)]
+    pub tools: Option<Vec<ChatCompletionToolsParam>>,
+
+    /// Extra kwargs for the chat template (e.g. `{"enable_thinking": false}`), merged over the
+    /// server's defaults as the chat path merges them (chat-style only).
+    #[serde(default)]
+    pub chat_template_kwargs: Option<std::collections::HashMap<String, serde_json::Value>>,
+
     /// Whether to add special tokens (e.g. BOS). Default `true` for prompt
     /// mode, `false` for chat mode (chat template usually adds them).
     #[serde(default)]
