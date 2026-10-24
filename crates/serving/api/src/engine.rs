@@ -2470,6 +2470,14 @@ impl AsyncEngine {
                 self.max_model_len
             )));
         }
+        // Its sampling params hold to the ranges vLLM's `SamplingParams` checks (temperature,
+        // top_p / top_k / min_p, the penalties, max_tokens against min_tokens, …), refused here
+        // with the rest of a request's validation — every endpoint's request passes through.
+        if let Some(params) = &ec_request.sampling_params {
+            params
+                .validate()
+                .map_err(|e| ServeError::Validation(e.into_owned()))?;
+        }
         #[cfg(feature = "metrics")]
         {
             let metrics = crate::metrics::VllmMetrics::global();

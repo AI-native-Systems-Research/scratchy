@@ -1481,6 +1481,45 @@ mod tests {
         assert_eq!(error["error"]["type"], "BadRequestError", "{error}");
     }
 
+    /// Sampling params outside vLLM's ranges are a 400 naming the param, on every endpoint, before
+    /// the engine sees the request. They used to reach it unchecked.
+    #[tokio::test]
+    async fn out_of_range_sampling_params_are_a_400() {
+        let chat = r#""messages": [{"role": "user", "content": "Hi"}]"#;
+        for (uri, body, param) in [
+            (
+                "/v1/chat/completions",
+                format!(r#"{{{chat}, "presence_penalty": 5}}"#),
+                "presence_penalty",
+            ),
+            (
+                "/v1/chat/completions",
+                format!(r#"{{{chat}, "temperature": -1, "stream": true}}"#),
+                "temperature",
+            ),
+            (
+                "/v1/completions",
+                r#"{"prompt": "Hi", "top_p": 0}"#.to_string(),
+                "top_p",
+            ),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap();
+            let response = build_router(make_test_state())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri} {body}");
+            let error = error_body(response).await;
+            let message = error["error"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains(param), "{uri} {body}: {error}");
+        }
+    }
+
     /// The body of an error response, as JSON.
     async fn error_body(response: axum::response::Response) -> serde_json::Value {
         let body = response.into_body().collect().await.unwrap().to_bytes();
