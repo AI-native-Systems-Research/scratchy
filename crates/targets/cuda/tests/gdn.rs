@@ -1457,3 +1457,202 @@ fn mismatched(a: &[u16], b: &[u16]) -> usize {
     assert_eq!(a.len(), b.len(), "the two outputs differ in length");
     a.iter().zip(b).filter(|(x, y)| x != y).count()
 }
+
+// ── #855: R8, the base-comparison dump and the timing line ─────────
+
+/// R8 (#855's first STOP gate): the scan's rank-1 update, `warp::row_map<base_ops::fma_AxCtB>(S,
+/// T, S, u)` on its `rt_fl<16, 128>` state tile, is `T · u + S` with `u` one value per row (the
+/// probe kernel in `kernels/gdn_scan.cu`). Two cases, TK-0's probe's: small integers and halves,
+/// where every result is exact in f32, and random values in [-2, 2] within `2⁻²²·(|T·u| + |S|)`.
+/// Each line also counts the elements a wrong reading would match: `S·u + T`, `T·S + u`, and `u`
+/// taken by column.
+#[test]
+fn the_rank_one_update_is_t_times_u_plus_s() {
+    use scratchy_target_cuda::kernels::gdn_rank_one_probe;
+    const R: usize = 16;
+    const C: usize = 128;
+    let device = h100();
+    let mut pass = true;
+    for exact in [true, false] {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ((x >> 11) as f64 / (1u64 << 53) as f64 * 4.0 - 2.0) as f32
+        };
+        let (mut s, mut t, mut u) = (vec![0f32; R * C], vec![0f32; R * C], vec![0f32; R]);
+        for r in 0..R {
+            u[r] = if exact {
+                (r as f32 + 1.0) * 0.5 * if r % 2 == 1 { -1.0 } else { 1.0 }
+            } else {
+                rnd()
+            };
+            for c in 0..C {
+                s[r * C + c] = if exact {
+                    ((r * C + c) % 61) as f32 - 30.0
+                } else {
+                    rnd()
+                };
+                t[r * C + c] = if exact {
+                    ((r * 7 + c * 3) % 17) as f32 - 8.0
+                } else {
+                    rnd()
+                };
+            }
+        }
+        let (sb, tb, ub) = (
+            up_f32(&device, &s),
+            up_f32(&device, &t),
+            up_f32(&device, &u),
+        );
+        let out = up_f32_bits(&device, R * C, NAN_F32);
+        // SAFETY: cudaMalloc pointers are 256-byte aligned; `s`, `t` and `out` hold 16·128 f32
+        // and `u` 16; `out` is its own allocation; null is the default stream, which the
+        // download below waits for.
+        unsafe {
+            gdn_rank_one_probe(
+                (sb.ptr(), tb.ptr(), ub.ptr()),
+                out.ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("the rank-one probe launches");
+        let got = down_f32(&out);
+        let (mut bad, mut s_u_t, mut t_s_u, mut by_col, mut worst) = (0, 0, 0, 0, 0.0f64);
+        for r in 0..R {
+            for c in 0..C {
+                let i = r * C + c;
+                let (si, ti, ur) = (f64::from(s[i]), f64::from(t[i]), f64::from(u[r]));
+                let want = ti * ur + si;
+                let bound = if exact {
+                    0.0
+                } else {
+                    ((ti * ur).abs() + si.abs()) * 2f64.powi(-22)
+                };
+                let g = f64::from(got[i]);
+                let err = (g - want).abs();
+                // A NaN `got` counts as out of reference.
+                bad += usize::from(err.is_nan() || err > bound);
+                if bound > 0.0 {
+                    worst = worst.max(err / bound);
+                }
+                let near = |alt: f64| (g - alt).abs() <= bound.max(1e-30);
+                s_u_t += usize::from(near(si * ur + ti));
+                t_s_u += usize::from(near(ti * si + ur));
+                by_col += usize::from(near(ti * f64::from(u[c % R]) + si));
+            }
+        }
+        let what = if exact {
+            "small integers and halves (every result exact in f32)"
+        } else {
+            "random values in [-2, 2]"
+        };
+        let ok = bad == 0;
+        eprintln!(
+            "R8 {what}: out_of_reference={bad} of {} worst_err/bound={worst:.6} (matches S*u+T at \
+             {s_u_t}, T*S+u at {t_s_u}, u by column at {by_col}) {}",
+            R * C,
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "R8: the rank-one update is not T·u + S: stop before the scan tests"
+    );
+}
+
+/// For the base-against-change comparison (#855): the scan's `o` (the real rows) and the slot's
+/// final state of a fresh step at the 0.8b and 9b geometries, L ∈ {1, 64, 300, 2048}, written as
+/// raw little-endian f32 to `<CARGO_TARGET_TMPDIR>/gdn_scan_dump/<case>_{o,state}.bin`, with
+/// `case= o_elems= state_elems= fnv1a=` printed. The same file run at two commits gives the
+/// `base_vs_pr mismatched_bits=` per case; this test asserts only that each step ran.
+#[test]
+fn the_scan_outputs_are_dumped_for_a_base_comparison() {
+    let device = h100();
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gdn_scan_dump");
+    std::fs::create_dir_all(&dir).expect("create the dump directory");
+    let fnv = |bytes: &[u8]| {
+        (bytes.iter()).fold(0xCBF2_9CE4_8422_2325u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+        })
+    };
+    for d in [G08, G9] {
+        let bu = bundle(d, 0xD0D0);
+        let bb = upload_bundle(&device, &bu);
+        for q_len in [1usize, 64, 300, 2048] {
+            let x = inputs(d, q_len, 0xD0D1 ^ q_len as u64);
+            let c = chunk(&x, d, 0, q_len, q_len + PAD);
+            let pool = Pool::new(&device, d, NAN_F32);
+            let s = run_step(&device, &pool, &bb, d, &c, (1, true)).expect("the step launches");
+            let o: Vec<u8> = (s.o[..q_len * d.value_dim()].iter())
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            let state: Vec<u8> = (pool.ssm_slot(1).iter())
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            let case = format!("gdn_scan_{}_L{q_len}", name(d));
+            std::fs::write(dir.join(format!("{case}_o.bin")), &o).expect("write o");
+            std::fs::write(dir.join(format!("{case}_state.bin")), &state).expect("write the state");
+            eprintln!(
+                "case={case} o_elems={} state_elems={} fnv1a_o={:016x} fnv1a_state={:016x}",
+                o.len() / 4,
+                state.len() / 4,
+                fnv(&o),
+                fnv(&state)
+            );
+        }
+    }
+}
+
+/// The scan's time per launch at L = 300 and 4096, at the 0.8b and 9b geometries: 20 launches of
+/// the scan alone on the default stream, over one step's conv_out, g and β, after one warm-up,
+/// timed to the download that waits for them. Recorded for the base-against-change comparison,
+/// not asserted.
+#[test]
+fn the_scan_time_is_recorded() {
+    const LAUNCHES: u32 = 20;
+    let device = h100();
+    for d in [G08, G9] {
+        let bu = bundle(d, 0xD1D0);
+        let bb = upload_bundle(&device, &bu);
+        for q_len in [300usize, 4096] {
+            let x = inputs(d, q_len, 0xD1D1 ^ q_len as u64);
+            let c = chunk(&x, d, 0, q_len, q_len);
+            let pool = Pool::new(&device, d, NAN_F32);
+            let s = run_step(&device, &pool, &bb, d, &c, (0, true)).expect("the step launches");
+            let (cv, g, beta) = (
+                up_f32(&device, &s.conv_out),
+                up_f32(&device, &s.g),
+                up_f32(&device, &s.beta),
+            );
+            let o = up_f32_bits(&device, q_len * d.value_dim(), NAN_F32);
+            let seq = up_u32(&device, &[0, q_len as u32, 1, 0]);
+            let launch = || {
+                // SAFETY: as `run_step`'s, for the scan alone over this step's own scratch.
+                unsafe {
+                    gdn_scan(
+                        (cv.ptr(), g.ptr(), beta.ptr()),
+                        (pool.ssm.ptr(), pool.layout.ssm_elems_per_slot() as u64),
+                        seq.ptr(),
+                        o.ptr(),
+                        (q_len as u32, d.nk as u32, d.nv as u32),
+                        (d.head_k as u32, d.head_v as u32, gdn_scale(d.head_k as u32)),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("gdn_scan");
+            };
+            launch();
+            seq.download().expect("wait for the warm-up");
+            let start = std::time::Instant::now();
+            for _ in 0..LAUNCHES {
+                launch();
+            }
+            seq.download().expect("wait for the launches");
+            let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(LAUNCHES);
+            eprintln!("gdn scan time {} L={q_len}: {us:.1} us/launch", name(d));
+        }
+    }
+}
