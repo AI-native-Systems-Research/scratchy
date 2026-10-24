@@ -4392,6 +4392,37 @@ mod tests {
         assert_eq!(composite(null), vec![248044], "a null top level is none");
         let neither = serde_json::json!({"text_config": {"hidden_size": 1024}});
         assert!(composite(neither).is_empty());
+
+        // With the checkpoint's tokenizer files, the nested id joins the tokenizer's and the
+        // template's: Qwen3.5-0.8B's `[248044, 248046]`, where main stops on 248046 alone.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"eos_token": "<|im_end|>",
+                "chat_template": "{% for m in messages %}<|im_start|>{{ m.content }}<|im_end|>{% endfor %}"}"#,
+        )
+        .unwrap();
+        let tokenizer_json = r#"{
+            "version": "1.0",
+            "added_tokens": [
+                {"id": 248045, "content": "<|im_start|>", "single_word": false, "lstrip": false,
+                 "rstrip": false, "normalized": false, "special": true},
+                {"id": 248046, "content": "<|im_end|>", "single_word": false, "lstrip": false,
+                 "rstrip": false, "normalized": false, "special": true}
+            ],
+            "model": {"type": "BPE", "merges": [],
+                      "vocab": {"a": 0, "<|im_start|>": 248045, "<|im_end|>": 248046}}
+        }"#;
+        let tokenizer = Tokenizer::from_hf_tokenizer(tokenizer_json.parse().unwrap());
+        let mut config = HfModelConfig::default();
+        config.extra.insert(
+            "text_config".to_string(),
+            serde_json::json!({"eos_token_id": 248044}),
+        );
+        assert_eq!(
+            resolve_eos_token_ids(&config, Some(dir.path()), Some(&tokenizer)),
+            vec![248044, 248046]
+        );
     }
 
     #[test]
