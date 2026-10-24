@@ -4084,12 +4084,12 @@ fn build_completion_logprobs(
 /// prompt alone and be answered; the OpenAI API refuses it with a 400, in its own words. Checked
 /// with `tool_choice`, as every chat request's sampling params are built.
 fn check_messages(messages: &[protocol::ChatCompletionMessageParam]) -> ServeResult<()> {
-    match messages.is_empty() {
-        true => Err(ServeError::Validation(
+    if messages.is_empty() {
+        return Err(ServeError::Validation(
             "[] is too short - 'messages'".to_string(),
-        )),
-        false => Ok(()),
+        ));
     }
+    Ok(())
 }
 
 /// ⛔ A `tool_choice` THAT NEEDS A TOOL NAMES ONE THE REQUEST DECLARES. A forced tool missing

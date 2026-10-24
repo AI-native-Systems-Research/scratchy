@@ -1481,17 +1481,31 @@ mod tests {
         assert_eq!(error["error"]["type"], "BadRequestError", "{error}");
     }
 
-    /// An empty `messages` list is the OpenAI API's 400 too, on every chat endpoint. It used to
-    /// render the template's generation prompt alone and be answered.
+    /// An empty `messages` list is the OpenAI API's 400 too, on every chat endpoint; an empty
+    /// Responses `input` is one naming `input`, with `instructions` or without. Each used to render
+    /// the template's generation prompt alone and be answered.
     #[tokio::test]
     async fn test_chat_completions_empty_messages() {
-        for (uri, body) in [
-            ("/v1/chat/completions", r#"{"messages": []}"#),
+        let messages = "[] is too short - 'messages'";
+        let input = "'input' is an empty list";
+        for (uri, body, says) in [
+            ("/v1/chat/completions", r#"{"messages": []}"#, messages),
             (
                 "/v1/chat/completions",
                 r#"{"messages": [], "stream": true}"#,
+                messages,
             ),
-            ("/v1/chat/completions/render", r#"{"messages": []}"#),
+            (
+                "/v1/chat/completions/render",
+                r#"{"messages": []}"#,
+                messages,
+            ),
+            ("/v1/responses", r#"{"input": []}"#, input),
+            (
+                "/v1/responses",
+                r#"{"input": [], "instructions": "Be brief."}"#,
+                input,
+            ),
         ] {
             let request = Request::builder()
                 .method("POST")
@@ -1506,7 +1520,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri} {body}");
             let error = error_body(response).await;
             let message = error["error"]["message"].as_str().unwrap_or_default();
-            assert!(message.contains("[] is too short - 'messages'"), "{error}");
+            assert!(message.contains(says), "{uri} {body}: {error}");
         }
     }
 

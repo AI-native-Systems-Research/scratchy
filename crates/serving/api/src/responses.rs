@@ -22,7 +22,7 @@ use uuid::Uuid;
 use scratchy_core_common::FinishReason;
 
 use crate::engine::StreamDelta;
-use crate::error::ApiJson;
+use crate::error::{ApiJson, ServeError};
 use crate::protocol;
 use crate::server::AppState;
 
@@ -239,6 +239,18 @@ fn new_resp_id() -> String {
 // ---------------------------------------------------------------------------
 // Conversion: ResponsesRequest → ChatCompletionRequest
 // ---------------------------------------------------------------------------
+
+/// A request has input to answer: an empty item list has none, `instructions` or not (there is no
+/// `previous_response_id` history to stand in for it). Refused naming `input`, the field the client
+/// sent, before it becomes a chat request, whose own check would name `messages`.
+fn check_input(input: &ResponsesInput) -> Result<(), ServeError> {
+    if matches!(input, ResponsesInput::Items(items) if items.is_empty()) {
+        return Err(ServeError::Validation(
+            "'input' is an empty list: there is nothing to answer".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 fn convert_request(req: &ResponsesRequest) -> protocol::ChatCompletionRequest {
     let mut messages = Vec::new();
@@ -525,6 +537,9 @@ pub async fn responses(
         request.model, request.stream
     );
 
+    if let Err(e) = check_input(&request.input) {
+        return e.into_response();
+    }
     let is_stream = request.stream;
     let mut chat_request = convert_request(&request);
 
