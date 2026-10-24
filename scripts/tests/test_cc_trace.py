@@ -1079,8 +1079,16 @@ def _rejection(tid, text):
                                          "is_error": True, "content": text}]}
 
 
+# Claude Code 2.1.310's own words, captured from a real session: a call missing a
+# required parameter, one whose arguments are not JSON, and one naming no tool.
 REJECTED = ("<tool_use_error>InputValidationError: Read failed due to the following issue:\n"
             "The required parameter `file_path` is missing</tool_use_error>")
+REJECTED_NOT_JSON = (
+    "<tool_use_error>InputValidationError: Read was called with input that could not be "
+    "parsed as JSON.\nYou sent (first 20 of 20 bytes): {\"file_path\": \"m.py\"\nCommon "
+    "causes: unescaped backslashes in file paths (use / or \\\\), unescaped control "
+    "characters, or truncated output. Retry with valid JSON.</tool_use_error>")
+REJECTED_NO_TOOL = "<tool_use_error>Error: No such tool available: Nonexistent</tool_use_error>"
 
 
 def make_task(root):
@@ -1336,6 +1344,12 @@ class LiveTest(unittest.TestCase):
         _, detail = self._live(sessions=1)
         self.assertEqual(detail["sessions"][0]["tool_call_failures"], 1)
 
+    def test_a_call_naming_no_tool_counts(self):
+        self._history([_assistant(_tool("Nonexistent", "n1")),
+                       _rejection("n1", REJECTED_NO_TOOL)])
+        _, detail = self._live(sessions=1)
+        self.assertEqual(detail["sessions"][0]["tool_call_failures"], 1)
+
     def test_a_rejection_counts_when_the_last_request_does_not_carry_it(self):
         # The rejection is in the second request's history; the last one is a
         # side request (or a compacted history) that no longer has it.
@@ -1346,11 +1360,14 @@ class LiveTest(unittest.TestCase):
 
     def test_a_broken_call_that_claude_code_then_rejects_counts_once(self):
         # _tool_stream's call has id "t": its arguments are not JSON, and Claude
-        # Code sends back a rejection for that same id in every later request.
+        # Code sends back a rejection for that same id in every later request,
+        # with the call itself kept as it arrived.
         self.replies[0] = _tool_stream("Read", '{"file_path": "m.py"')
         it = iter(self.replies * 10)
         FakeAnthropic.reply = staticmethod(lambda body: next(it))
-        rejected = [_assistant(_tool("Read", "t")), _rejection("t", REJECTED)]
+        call = {"type": "tool_use", "id": "t", "name": "Read",
+                "input": {"__unparsedToolInput": {"raw": '{"file_path": "m.py"', "len": 20}}}
+        rejected = [_assistant(call), _rejection("t", REJECTED_NOT_JSON)]
         self._history(rejected, rejected + [_assistant(_tool("Edit", "u")), _result("u")])
         _, detail = self._live(sessions=1)
         self.assertEqual(detail["sessions"][0]["tool_call_failures"], 1)
