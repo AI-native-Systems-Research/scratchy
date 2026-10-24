@@ -15,7 +15,7 @@
 #![cfg(feature = "e2e")]
 
 use scratchy_e2e::assertions::assert_valid_completion_response;
-use scratchy_e2e::{Client, TestServer};
+use scratchy_e2e::{Client, TestModels, TestServer};
 use scratchy_serving_api::protocol::{CompletionPrompt, CompletionRequest};
 
 fn greedy_completion(prompt: &str, max_tokens: u32) -> CompletionRequest {
@@ -28,7 +28,7 @@ fn greedy_completion(prompt: &str, max_tokens: u32) -> CompletionRequest {
 }
 
 async fn start_cpu_server() -> (TestServer, Client) {
-    let server = TestServer::builder("HuggingFaceTB/SmolLM2-135M-Instruct")
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_device("cpu")
         .with_dtype("f32")
         .start()
@@ -238,17 +238,12 @@ async fn assert_reports_cached_tokens(client: &Client, device: &str) {
 /// On the hosted `macos-26` CI runner this would SKIP — paravirtual GPU, no
 /// Metal 4 — so CI only lints this file; the assertions execute on a real GPU,
 /// run locally.
-///
-/// Uses the DENSE checkpoint, not `TestModels::SMOLLM`: that constant is MLX
-/// 4-bit on metal and will not load without a `quant/<preset>` feature. This
-/// stem matches `model/smollm2-135m`, the feature set the metal CI job already
-/// builds.
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_prefix_cache_reports_cached_tokens_metal() {
     scratchy_e2e::skip_if_no_gpu!();
-    let server = TestServer::builder("HuggingFaceTB/SmolLM2-135M-Instruct")
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_device("metal")
         .start()
         .await
