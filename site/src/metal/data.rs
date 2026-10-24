@@ -35,6 +35,12 @@ pub struct Run {
 /// its dead ones 0 to 19.8%.
 const LIVE_SHARE: f64 = 0.5;
 
+/// The least share of its answer tokens a live cell delivers where every answer ran to length:
+/// scratchy's live cells, which honour `ignore_eos`, deliver 99% or more in every published run. A
+/// live cell under it stopped answers early, at EOS (#479), so its numbers measure less decode than
+/// the cell asked for ([`Cell::short`]).
+const FULL_SHARE: f64 = 0.99;
+
 impl Run {
     /// Mark the cells that measured a server which had stopped answering (#413). The bench judges
     /// that itself where it can (`dead_server` on a cell, from a scratchy cell that came back with
@@ -58,6 +64,21 @@ impl Run {
             for e in Engine::ALL.into_iter().filter(|e| e.honours_ignore_eos()) {
                 for c in e.cells_mut(m) {
                     c.dead |= c.delivered(base).is_some_and(|share| share < LIVE_SHARE);
+                }
+            }
+        }
+    }
+
+    /// Mark the live cells whose answers came back short of the tokens asked for (#479): an
+    /// engine that ignores `ignore_eos` stops at EOS, so its tok/s, TPOT and E2E latency come from
+    /// a shorter decode than the cell's label says. Done as the run loads, after
+    /// [`mark_dead`](Self::mark_dead), so a dead cell is never also short.
+    pub fn mark_short(&mut self) {
+        let base = self.config.base().and_then(|b| b.output);
+        for m in &mut self.models {
+            for e in Engine::ALL {
+                for c in e.cells_mut(m) {
+                    c.short = (c.delivered(base)).filter(|&share| !c.dead && share < FULL_SHARE);
                 }
             }
         }
@@ -554,6 +575,9 @@ pub struct Cell {
     /// The bench's verdict that the server it measured answered with almost nothing (a scratchy
     /// cell under half its answer tokens): its requests are recorded failed ([`Run::mark_dead`]).
     pub dead_server: bool,
+    /// The share of the answer tokens asked for that a live cell delivered, where its answers came
+    /// back short ([`Run::mark_short`]); None where they ran to length or it can't say.
+    pub short: Option<f64>,
 }
 
 impl Cell {
@@ -652,6 +676,7 @@ impl TryFrom<RawCell> for Cell {
             mem_below_weights: false,
             timed_out: c.timed_out,
             dead_server: c.dead_server,
+            short: None,
         })
     }
 }

@@ -284,6 +284,8 @@ pub const NO_STREAM: &str = "no stream";
 pub const PARTIAL: &str = "†";
 /// Marks any number from a cell where some requests failed.
 pub const FAILED: &str = "‡";
+/// Marks any number from a cell whose answers came back short of the tokens asked for.
+pub const SHORT: &str = "§";
 /// Stands in for a peak RSS below the model's own weights ([`peak_rss`]).
 pub const BELOW_WEIGHTS: &str = "below weights";
 
@@ -416,7 +418,8 @@ pub fn failed_note(c: Option<&Cell>) -> String {
 }
 
 /// The marks a cell's value carries: † for a timing from only some of its
-/// requests, ‡ for any number from a cell where requests failed.
+/// requests, ‡ for any number from a cell where requests failed, § for any
+/// number from a cell whose answers came back short.
 pub fn marks(c: Option<&Cell>, metric: Metric) -> String {
     let mut m = String::new();
     if partial(c, metric) {
@@ -425,7 +428,25 @@ pub fn marks(c: Option<&Cell>, metric: Metric) -> String {
     if failed(c) > 0 {
         m += FAILED;
     }
+    if short(c).is_some() {
+        m += SHORT;
+    }
     m
+}
+
+/// The share of the answer tokens asked for that a cell delivered, where its answers came back
+/// short ([`Cell::short`]).
+pub fn short(c: Option<&Cell>) -> Option<f64> {
+    c.and_then(|c| c.short)
+}
+
+pub fn short_note(c: Option<&Cell>) -> String {
+    short(c).map_or_else(String::new, |share| {
+        format!(
+            "answers stopped early: {:.0}% of the answer tokens asked for",
+            share * 100.0
+        )
+    })
 }
 
 /// What a cell's marks mean, for a table view or a tooltip; "" without any.
@@ -436,6 +457,9 @@ pub fn marks_note(c: Option<&Cell>, metric: Metric) -> String {
     }
     if failed(c) > 0 {
         parts.push(failed_note(c));
+    }
+    if short(c).is_some() {
+        parts.push(short_note(c));
     }
     parts.join("; ")
 }
