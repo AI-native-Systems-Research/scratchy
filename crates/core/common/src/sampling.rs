@@ -468,9 +468,16 @@ impl SamplingParams {
         if self.stop.iter().any(|s| s.is_empty()) {
             return Err("stop cannot contain an empty string".into());
         }
-        // Greedy-specific check.
-        if self.temperature < SAMPLING_EPS && self.n > 1 {
-            return Err(format!("n must be 1 when using greedy sampling, got {}", self.n).into());
+        self.check_greedy_n(self.n)?;
+        Ok(())
+    }
+
+    /// Whether these params may serve `n` choices: under greedy sampling every choice would be
+    /// the same tokens, so `n` must be 1, in vLLM's words (`_verify_greedy_sampling`). The server
+    /// asks it with the request's `n`, which sets the number of choices outside these params.
+    pub fn check_greedy_n(&self, n: u32) -> Result<(), std::borrow::Cow<'static, str>> {
+        if self.sampling_type() == SamplingType::Greedy && n > 1 {
+            return Err(format!("n must be 1 when using greedy sampling, got {n}.").into());
         }
         Ok(())
     }
@@ -695,7 +702,18 @@ mod tests {
             ..Default::default()
         };
         let err = p.validate().unwrap_err();
-        assert!(err.contains("greedy"));
+        assert_eq!(err, "n must be 1 when using greedy sampling, got 2.");
+        // The same rule for an `n` from outside the params; sampled, any `n` passes.
+        assert_eq!(
+            p.check_greedy_n(3).unwrap_err(),
+            "n must be 1 when using greedy sampling, got 3."
+        );
+        assert!(p.check_greedy_n(1).is_ok());
+        let sampled = SamplingParams {
+            temperature: 0.7,
+            ..p
+        };
+        assert!(sampled.check_greedy_n(3).is_ok());
     }
 
     #[test]
