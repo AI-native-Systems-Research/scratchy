@@ -285,7 +285,9 @@ const SWA_PREFILL_CHUNK_CAP: usize = 2048;
 /// Resolve the full set of stop-on-generate token IDs the engine
 /// should honor, merging three HuggingFace conventions:
 ///
-/// 1. `config.json::eos_token_id` — single int or array. Always read.
+/// 1. `config.json::eos_token_id` — single int or array. Always read. A composite config with
+///    none at its top level gives its text backbone's, `text_config.eos_token_id` (Qwen3.5), as
+///    HF's `GenerationConfig.from_model_config` reads `get_text_config().eos_token_id` (#844).
 /// 2. `generation_config.json::eos_token_id` — same shape, but
 ///    authoritative when present (HF transformers reads this first
 ///    at `model.generate()` time; vLLM Python mirrors that).
@@ -327,8 +329,12 @@ fn resolve_eos_token_ids(
         }
     };
 
-    // (1) config.json::eos_token_id
-    if let Some(v) = hf_config.extra.get("eos_token_id") {
+    // (1) config.json::eos_token_id, or its text backbone's.
+    let config_eos = (hf_config.extra.get("eos_token_id")).or_else(|| {
+        let text_config = hf_config.extra.get("text_config")?;
+        text_config.get("eos_token_id")
+    });
+    if let Some(v) = config_eos {
         for id in extract_ids(v) {
             push(id, &mut out);
         }
@@ -4361,6 +4367,28 @@ mod tests {
             resolve_eos_token_ids(&config, Some(dir.path()), None),
             vec![11, 2]
         );
+    }
+
+    /// A composite config with no top-level `eos_token_id` stops on its text backbone's (#844):
+    /// `Qwen/Qwen3.5-0.8B` keeps `<|endoftext|>` (248044) only under `text_config`, and has no
+    /// `generation_config.json`, where HF transformers falls back to it. A top-level one is the
+    /// config's own, as before, and a nested one beside it adds nothing.
+    #[test]
+    fn a_composite_config_stops_on_its_text_backbones_eos() {
+        let composite = |config_json: serde_json::Value| {
+            let mut config = HfModelConfig::default();
+            let serde_json::Value::Object(fields) = config_json else {
+                unreachable!()
+            };
+            config.extra.extend(fields);
+            resolve_eos_token_ids(&config, None, None)
+        };
+        let nested = serde_json::json!({"text_config": {"eos_token_id": 248044}});
+        assert_eq!(composite(nested), vec![248044], "the text backbone's");
+        let both = serde_json::json!({"eos_token_id": 2, "text_config": {"eos_token_id": 248044}});
+        assert_eq!(composite(both), vec![2], "the top level's, as before");
+        let neither = serde_json::json!({"text_config": {"hidden_size": 1024}});
+        assert!(composite(neither).is_empty());
     }
 
     #[test]
