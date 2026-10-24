@@ -70,12 +70,13 @@ pub fn load_sharegpt(
             _ => continue,
         };
 
-        // Tokenize to get lengths.
+        // Tokenize to get lengths, with the special tokens, as vLLM's `ShareGPTDataset` counts
+        // them (`tokenizer(prompt).input_ids`): a text prompt is sent with them.
         let prompt_encoding = tokenizer
-            .encode(prompt, false)
+            .encode(prompt, true)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
         let output_encoding = tokenizer
-            .encode(output, false)
+            .encode(output, true)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
 
         let prompt_len = prompt_encoding.len();
