@@ -100,7 +100,7 @@ ROOT="$(cd -- "${HERE}/.." &>/dev/null && pwd)"
 MODELS_ALL=(
   # One model per class, small for a 36 GB Mac and large for a 64 GB one:
   # sliding-window attention, Mamba-2 hybrid, Gated DeltaNet hybrid, dense.
-  "gpt-oss-20b=jesusoctavioas/gpt-oss-20b-mlx-4Bit:mlx-affine-b4-g64-qembed"          # 11.8 GB, MoE, alternating sliding window
+  "gpt-oss-20b=scratchery/gpt-oss-20b-4bit:mlx-affine-b4-g64-qembed"                  # 11.8 GB, MoE, alternating sliding window
   "gpt-oss-120b-3bit=scratchery/gpt-oss-120b-3bit:"                                    # 51.4 GB, MoE, alternating sliding window, 3-bit
   "nemotron-3-nano-30b-a3b=mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-4bit:mlx-affine-b4-g64-qembed"             # 17.8 GB, MoE, Mamba-2 hybrid
   "nemotron-3-super-120b-a12b=mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-OptiQ-2bit:mlx-affine-b4-g64-qembed" # 47.5 GB, latent MoE, Mamba-2 hybrid, OptiQ 2-bit
