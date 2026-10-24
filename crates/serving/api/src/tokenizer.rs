@@ -357,6 +357,17 @@ mod tests {
         assert_eq!(reached, "hello");
     }
 
+    /// The BOS fixture's post-processor puts `<s>` in front, and `<s>` in the text reads as that
+    /// one special token: what a template that writes `{{ bos_token }}` gives such a tokenizer.
+    #[test]
+    fn test_tokenizer_with_bos_posts_and_reads_its_bos() {
+        let tok = make_test_tokenizer_with_bos();
+        let bos_hi = [&[256], &tok.encode("hi", false).unwrap()[..]].concat();
+        assert_eq!(tok.encode("hi", true).unwrap(), bos_hi);
+        assert_eq!(tok.encode("<s>hi", false).unwrap(), bos_hi);
+        assert_eq!(tok.num_special_tokens_to_add(false), 1);
+    }
+
     #[test]
     fn test_tokenizer_encode_decode_roundtrip() {
         let tok = make_test_tokenizer();
