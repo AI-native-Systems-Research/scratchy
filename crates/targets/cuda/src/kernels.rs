@@ -39,6 +39,7 @@ unsafe extern "C" {
         k: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_rms_norm_bf16_prepare() -> i32;
     fn scratchy_cuda_rms_norm_bf16(
         x: *const c_void,
         gain: *const c_void,
@@ -49,6 +50,7 @@ unsafe extern "C" {
         gain_offset: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_add_bf16_prepare() -> i32;
     fn scratchy_cuda_add_bf16(
         a: *const c_void,
         b: *const c_void,
@@ -57,6 +59,7 @@ unsafe extern "C" {
         cols: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_silu_mul_bf16_prepare() -> i32;
     fn scratchy_cuda_silu_mul_bf16(
         gate: *const c_void,
         up: *const c_void,
@@ -84,6 +87,7 @@ unsafe extern "C" {
         head_dim: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gate_apply_bf16_prepare() -> i32;
     fn scratchy_cuda_gate_apply_bf16(
         attn: *const c_void,
         gate: *const c_void,
@@ -393,6 +397,10 @@ impl std::error::Error for KernelError {}
 const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gemm_bf16_abt", scratchy_cuda_gemm_bf16_abt_prepare),
     ("attn_prefill_bf16", scratchy_cuda_attn_prefill_bf16_prepare),
+    ("rms_norm_bf16", scratchy_cuda_rms_norm_bf16_prepare),
+    ("add_bf16", scratchy_cuda_add_bf16_prepare),
+    ("silu_mul_bf16", scratchy_cuda_silu_mul_bf16_prepare),
+    ("gate_apply_bf16", scratchy_cuda_gate_apply_bf16_prepare),
 ];
 
 /// Run every kernel's one-time setup on the current device, stopping at the first failure, which
@@ -490,8 +498,10 @@ pub unsafe fn gemm_bf16_abt(
 // shape rule: `rows` and `cols` non-zero, `cols` a multiple of 8 (one 16-byte vector of bf16:
 // `step::RMS_NORM_BF16_COLS`, `ADD_BF16_COLS`, `SILU_MUL_BF16_COLS`), and `rows · cols` at most
 // `i32::MAX`. Any other shape returns `KernelError::RowShape` before any pointer is touched, and
-// launches nothing. A failed launch returns the launch's own `cudaError_t`. None needs a one-time
-// setup (each uses under 48 KiB of shared memory), so none is in `PREPARE`.
+// launches nothing. A failed launch returns the launch's own `cudaError_t`; a C++ exception from
+// ThunderKittens' host code (a tensor-map encode), `KernelError::HostException`. Each is a
+// ThunderKittens 16-row tile kernel whose dynamic shared memory is over the default 48 KiB, so
+// each is in `PREPARE`, which must have run on the current device first.
 
 /// Launch the bf16 RMSNorm: `y[r, c] = x[r, c] / sqrt(mean(x[r, :]²) + eps) · (gain_offset +
 /// gain[c])`, `x` and `y` `[rows, cols]`, `gain` `[cols]`, in f32 with one bf16 rounding per

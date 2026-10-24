@@ -1,127 +1,204 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// bf16 RMSNorm for the H100: y[r, c] = x[r, c] / sqrt(mean(x[r, :]²) + eps) · (gain_offset + g[c]),
-// with x and y [rows, cols] and g [cols], all row-major bf16. All math is f32; each output is
-// rounded to bf16 once (round-to-nearest-even). `gain_offset` is the gain convention's constant:
-// 0 for a stored gain (llama, qwen3), 1 for a zero-centred one (qwen3.5, gemma). One kernel serves
-// both; the macro never folds the offset into the weights.
+// bf16 RMSNorm for the H100: y[r, c] = x[r, c] / sqrt(mean(x[r, :]²) + eps) · (gain_offset +
+// gain[c]), `x` and `y` `[rows, cols]` row-major bf16, `gain` `[cols]` bf16. Computed in f32,
+// rounded once to bf16 (round-to-nearest-even) per output. `gain_offset` is the gain convention's
+// (`GainConvention::offset`: 0 for Llama's gain, 1 for qwen3.5's zero-centred one).
 //
-// Plain CUDA, not ThunderKittens: the op is a row reduction followed by a per-element map, with no
-// matrix multiply, so register/shared tiles, WGMMA and TMA bring nothing. Metal's counterpart is
-// `shaders/rmsnorm.metal` (f32 sum of squares, `rms = sqrt(sum/N + eps)`, `(x / rms) · w`).
+// ThunderKittens' 16-row tile (PLAN-tk100 §2 S2, §3.3): one CTA per block of 16 rows, one
+// warpgroup of 4 warps. Warp `w` takes the 256-column tiles `w, w + 4, …` of the block, in two
+// passes over `x`, each tile TMA-loaded by the warp's lane 0 into a plain `st_bf<16, 256, false>`
+// through a 2-stage ring per warp:
+//   1. The sum of squares: `warp::load` into `rt_fl<16, 256>` (exact), `warp::mul` by itself,
+//      `warp::row_sum` into the warp's `col_vec` across its tiles in ascending order. Each warp
+//      stores its sums to an `sv_fl<16>`; after the warpgroup's barrier, every warp loads the four
+//      and adds them in warp order 0, 1, 2, 3, so all four hold the same bits. Then
+//      `inv = rsqrt(sum / cols + eps)`: `warp::div` by `cols`, then `scratchy::ops::rms_inv` with
+//      `eps`, today's expression.
+//   2. The output: `x` re-read by TMA (the plain-CUDA kernel also read it twice), `warp::mul_row`
+//      by `inv`, `warp::mul_col` by the tile's gain plus `gain_offset` (a `row_vec`), stored into
+//      the tile (`warp::store`, the one RNE rounding) and TMA-stored.
+// A tile's gain is TMA-loaded as an `sv_bf<256>`: a vector box is never swizzled and is bounded by
+// the array's `cols`, so the columns past `cols` of a partial last tile read zeros. Every tile is
+// plain, never swizzled: a box past the array's rows (the last block's padding) or columns
+// (`cols % 256 ≠ 0`) reads zeros and stores nothing (TK-1's R1 gate, `tests/tma_bounds.rs`). A
+// padding row's sum is 0, its `inv` `rsqrt(eps)`, finite, and it is never stored; rows never mix.
 //
-// One 256-thread block per row, in two passes over the row:
-//   1. each thread sums x² over its 16-byte vectors (a fixed stride), each warp reduces its 32
-//      partials with an xor butterfly, lane 0 of each warp stores the warp's sum in shared memory,
-//      and after one __syncthreads every thread adds the 8 warp sums in warp order. The order of
-//      every addition is fixed by the thread layout alone, with no atomics, so the same input gives
-//      the same bits on every run.
-//   2. each thread re-reads its vectors of x and of the gain and writes y.
+// The reduction order, fixed: `row_sum`'s within a tile (`ops/group/register/tile/
+// reductions.cuh`), the warp's tiles ascending, then the four warps in order. It is not the
+// plain-CUDA kernel's (each lane's `fmaf` chain, a xor butterfly, then 8 warps), so the bits
+// differ within the f64 bound; it is the same on every run, so repeats are bit-identical. A product
+// is no longer fused into its sum (`mul`, then `row_sum`): one more rounding per element, within
+// the bound's 2⁻⁸.
 //
-// Built with `--use_fast_math` (build.rs): rsqrtf and the division are the approximate ones, and
-// subnormals flush to zero. The tests' bound (2⁻⁸ relative plus 2⁻²⁴ absolute) allows for both.
+// Built with `--use_fast_math` (build.rs): `rsqrtf` is the approximate reciprocal square root, as
+// before. Shared memory: 4 warps × 2 stages × (an 8 KiB tile and a 512-byte gain vector), and the
+// four 64-byte sums, plus 1,024 bytes of alignment slack, set once by
+// `scratchy_cuda_rms_norm_bf16_prepare` (in `PREPARE`).
 
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include "kittens.cuh"
+#include "scratchy_ops.cuh"
 
 #include <climits>
 #include <cstdint>
 
-// The launcher's return code that is not a `cudaError_t` (which is non-negative). `src/kernels.rs`
-// mirrors it.
+using namespace kittens;
+
+// The launcher's return codes that are not a `cudaError_t` (which is non-negative).
+// `src/kernels.rs` mirrors them.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
+#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
-// bf16 values per 16-byte vector: every load and store is one `uint4`.
-constexpr int VEC = 8;
-// Threads per block, one block per row.
-constexpr int THREADS = 256;
-constexpr int WARPS = THREADS / 32;
+// `step::RMS_NORM_BF16_COLS`: `cols` is a multiple of it, so every row stride is a multiple of 16
+// bytes, as the tensor maps need.
+constexpr uint32_t VEC = 8;
+constexpr int ROWS = 16;
+constexpr int COLS = 256;
+constexpr int WARPS = 4;
+constexpr int STAGES = 2;
+constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
+// The warpgroup's named barrier (0 is `__syncthreads`).
+constexpr int SUMS_BARRIER = 1;
 
-// The 8 bf16 at `p` (16-byte aligned), widened to f32. Widening is exact.
-__device__ __forceinline__ void load8(const __nv_bfloat16* p, float (&f)[VEC]) {
-    const uint4 raw = *reinterpret_cast<const uint4*>(p);
-    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
-#pragma unroll
-    for (int i = 0; i < VEC / 2; ++i) {
-        const float2 v = __bfloat1622float2(h[i]);
-        f[2 * i] = v.x;
-        f[2 * i + 1] = v.y;
-    }
-}
+using tile = st_bf<ROWS, COLS, false>;
+using gain_vec = sv_bf<COLS>;
+using sums_vec = sv_fl<ROWS>;
+using x_gl = gl<bf16, 1, 1, -1, -1, tile>;
+using g_gl = gl<bf16, 1, 1, 1, -1, gain_vec>;
+using acc_tile = rt_fl<ROWS, COLS>;
+using row_values = acc_tile::col_vec;
+using col_values = acc_tile::row_vec;
 
-// `f`, each rounded once to bf16 (round-to-nearest-even), stored as one vector at `p`.
-__device__ __forceinline__ void store8(__nv_bfloat16* p, const float (&f)[VEC]) {
-    uint4 raw;
-    __nv_bfloat162* h = reinterpret_cast<__nv_bfloat162*>(&raw);
-#pragma unroll
-    for (int i = 0; i < VEC / 2; ++i) {
-        h[i] = __floats2bfloat162_rn(f[2 * i], f[2 * i + 1]);
-    }
-    *reinterpret_cast<uint4*>(p) = raw;
-}
+struct rms_globals {
+    x_gl x;
+    g_gl gain;
+    x_gl y;
+    // The 256-column tiles of a row, the last one partial when `cols % 256 ≠ 0`.
+    int col_tiles;
+    float cols;
+    float eps;
+    float gain_offset;
+};
 
-__global__ void __launch_bounds__(THREADS)
-rms_norm_bf16_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ gain,
-                     __nv_bfloat16* __restrict__ y, int cols, float eps, float gain_offset) {
-    __shared__ float warp_sums[WARPS];
-    const size_t row = blockIdx.x;
-    const __nv_bfloat16* xr = x + row * size_t(cols);
-    __nv_bfloat16* yr = y + row * size_t(cols);
-    // `cols` is a multiple of VEC (the launcher's rule), so a row is whole vectors: no tail.
-    const int vecs = cols / VEC;
+constexpr size_t SMEM_USED =
+    WARPS * STAGES * (sizeof(tile) + sizeof(gain_vec)) + WARPS * sizeof(sums_vec);
+// The tiles plus the slack `tma_swizzle_allocator` may spend aligning the first to 1024 bytes.
+constexpr int RMS_SMEM_BYTES = int(SMEM_USED) + 1024;
+static_assert(RMS_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
 
-    float sum = 0.0f;
-    for (int v = threadIdx.x; v < vecs; v += THREADS) {
-        float f[VEC];
-        load8(xr + v * VEC, f);
-#pragma unroll
-        for (int i = 0; i < VEC; ++i) {
-            sum = fmaf(f[i], f[i], sum);
+__global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_bf16_ker(
+    const __grid_constant__ rms_globals g) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    tile(&x_smem)[WARPS][STAGES] = al.allocate<tile, WARPS, STAGES>();
+    gain_vec(&g_smem)[WARPS][STAGES] = al.allocate<gain_vec, WARPS, STAGES>();
+    sums_vec(&sums)[WARPS] = al.allocate<sums_vec, WARPS>();
+    __shared__ kittens::semaphore arrived[WARPS][STAGES];
+
+    const int w = kittens::warpid();
+    const int row_block = blockIdx.x;
+    // This warp's tiles; its load `i` of `2 · mine` (pass 1's, then pass 2's) is in stage `i % 2`
+    // at phase `(i / 2) % 2`.
+    const int mine = (g.col_tiles - w + WARPS - 1) / WARPS;
+    if (warp::laneid() == 0) {
+        for (int s = 0; s < STAGES; s++) {
+            init_semaphore(arrived[w][s], 0, 1);
         }
     }
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum += __shfl_xor_sync(0xffffffffu, sum, offset);
-    }
-    if (threadIdx.x % 32 == 0) {
-        warp_sums[threadIdx.x / 32] = sum;
-    }
-    __syncthreads();
-    // Every thread adds the warp sums in the same order, so every thread holds the same `inv`.
-    // Nothing writes `warp_sums` after the barrier, so no second one is needed.
-    float total = 0.0f;
-#pragma unroll
-    for (int w = 0; w < WARPS; ++w) {
-        total += warp_sums[w];
-    }
-    const float inv = rsqrtf(total / float(cols) + eps);
-
-    for (int v = threadIdx.x; v < vecs; v += THREADS) {
-        float f[VEC], g[VEC];
-        load8(xr + v * VEC, f);
-        load8(gain + v * VEC, g);
-#pragma unroll
-        for (int i = 0; i < VEC; ++i) {
-            f[i] = f[i] * inv * (g[i] + gain_offset);
+    __syncwarp();
+    auto issue = [&](int i) {
+        const int stage = i % STAGES, t = w + (i % mine) * WARPS;
+        const bool second = i >= mine;
+        coord<tile> at = {0, 0, row_block, t};
+        warp::tma::expect_bytes(arrived[w][stage], sizeof(tile) + (second ? sizeof(gain_vec) : 0));
+        warp::tma::load_async(x_smem[w][stage], g.x, at, arrived[w][stage]);
+        if (second) {
+            coord<gain_vec> gat = {0, 0, 0, t};
+            warp::tma::load_async(g_smem[w][stage], g.gain, gat, arrived[w][stage]);
         }
-        store8(yr + v * VEC, f);
+    };
+
+    // Pass 1: this warp's sums of squares.
+    row_values part;
+    warp::zero(part);
+    if (mine > 0) {
+        issue(0);
     }
+    for (int i = 0; i < mine; i++) {
+        const int stage = i % STAGES;
+        // Pass 1 stores nothing: the next load may take the other stage once its tile was read
+        // (the previous iteration's `warp::load`, which every lane finished at this barrier).
+        __syncwarp();
+        issue(i + 1);  // pass 1's next tile, or pass 2's first (`i + 1 == mine`)
+        wait(arrived[w][stage], (i / STAGES) % 2);
+        acc_tile x;
+        warp::load(x, x_smem[w][stage]);
+        warp::mul(x, x, x);
+        warp::row_sum(part, x, part);
+    }
+    warp::store(sums[w], part);
+    warpgroup::sync(SUMS_BARRIER);
+    // Every warp adds the four partial sums in warp order, so all four hold the same bits.
+    row_values total, other;
+    warp::load(total, sums[0]);
+    for (int v = 1; v < WARPS; v++) {
+        warp::load(other, sums[v]);
+        warp::add(total, total, other);
+    }
+    row_values inv;
+    warp::div(inv, total, g.cols);
+    warp::bin_map<scratchy::ops::rms_inv>(inv, inv, g.eps);
+
+    // Pass 2: the output of this warp's tiles.
+    for (int i = mine; i < 2 * mine; i++) {
+        const int stage = i % STAGES, t = w + (i - mine) * WARPS;
+        // The other stage's previous store must have read its tile before the next load
+        // overwrites it.
+        warp::tma::store_async_read_wait();
+        __syncwarp();
+        if (i + 1 < 2 * mine) {
+            issue(i + 1);
+        }
+        wait(arrived[w][stage], (i / STAGES) % 2);
+        acc_tile x;
+        col_values gain;
+        warp::load(x, x_smem[w][stage]);
+        warp::load(gain, g_smem[w][stage]);
+        warp::add(gain, gain, g.gain_offset);
+        warp::mul_row(x, x, inv);
+        warp::mul_col(x, x, gain);
+        warp::store(x_smem[w][stage], x);
+        __syncwarp();
+        coord<tile> at = {0, 0, row_block, t};
+        warp::tma::store_async(g.y, x_smem[w][stage], at);
+    }
+    warp::tma::store_async_wait();
 }
 
 }  // namespace
 
-// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched; any other value = the
-// cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
+// The kernel's one-time setup: allow it `RMS_SMEM_BYTES` of dynamic shared memory on the current
+// device (the default limit is 48 KB). Run once per device before any launch
+// (`kernels::prepare_all`, called by `CudaDevice::open`), never per launch.
+//
+// 0 = done; any other value = the cudaError_t of setting the attribute.
+extern "C" int scratchy_cuda_rms_norm_bf16_prepare(void) {
+    return static_cast<int>(cudaFuncSetAttribute(
+        rms_norm_bf16_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, RMS_SMEM_BYTES));
+}
+
+// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
+// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
+// = the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
 // runtime's last-error state.
 //
-// `rows` and `cols` must be non-zero, `cols` a multiple of 8 (every row then starts 16-byte aligned
-// and is whole vectors), and `rows · cols` at most INT_MAX; all three are checked before any
-// pointer is touched. `x`, `gain` and `y` must be 16-byte-aligned device pointers to `rows·cols`,
-// `cols` and `rows·cols` bf16, `y` overlapping neither input. 32 bytes of static shared memory,
-// so no one-time setup. The launch is asynchronous on `stream`; the caller owns it and
-// synchronizes.
+// `rows` and `cols` must be non-zero, `cols` a multiple of 8, and `rows · cols` at most INT_MAX;
+// all three are checked before any pointer is touched. `x` and `y` must be 16-byte-aligned device
+// pointers to `rows·cols` bf16 and `gain` to `cols` bf16, `y` overlapping neither input.
+// `scratchy_cuda_rms_norm_bf16_prepare` must have succeeded on the current device. The launch is
+// asynchronous on `stream`; the caller owns it and synchronizes.
 extern "C" int scratchy_cuda_rms_norm_bf16(const void* x, const void* gain, void* y, uint32_t rows,
                                            uint32_t cols, float eps, float gain_offset,
                                            void* stream /* cudaStream_t; null = default stream */) {
@@ -129,12 +206,24 @@ extern "C" int scratchy_cuda_rms_norm_bf16(const void* x, const void* gain, void
         uint64_t(rows) * uint64_t(cols) > uint64_t(INT_MAX)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
-    const __nv_bfloat16* xp = static_cast<const __nv_bfloat16*>(x);
-    const __nv_bfloat16* gp = static_cast<const __nv_bfloat16*>(gain);
-    __nv_bfloat16* yp = static_cast<__nv_bfloat16*>(y);
-    int icols = static_cast<int>(cols);
-    void* args[] = {&xp, &gp, &yp, &icols, &eps, &gain_offset};
-    const dim3 grid(rows), block(THREADS);
-    return static_cast<int>(cudaLaunchKernel(rms_norm_bf16_kernel, grid, block, args, 0,
-                                             static_cast<cudaStream_t>(stream)));
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        bf16* xp = static_cast<bf16*>(const_cast<void*>(x));
+        bf16* gp = static_cast<bf16*>(const_cast<void*>(gain));
+        bf16* yp = static_cast<bf16*>(y);
+        // Building each `gl` encodes its tensor map into host memory; nothing is allocated on
+        // the device. Every row stride is `2·cols` bytes, a multiple of 16.
+        x_gl xg{xp, nullptr, nullptr, size_t(rows), size_t(cols)};
+        g_gl gg{gp, nullptr, nullptr, nullptr, size_t(cols)};
+        x_gl yg{yp, nullptr, nullptr, size_t(rows), size_t(cols)};
+        const int col_tiles = int((cols + uint32_t(COLS) - 1) / uint32_t(COLS));
+        rms_globals G{xg, gg, yg, col_tiles, float(cols), eps, gain_offset};
+        void* args[] = {&G};
+        const dim3 grid((rows + uint32_t(ROWS) - 1) / uint32_t(ROWS)), block(NUM_THREADS);
+        return static_cast<int>(cudaLaunchKernel(rms_norm_bf16_ker, grid, block, args,
+                                                 RMS_SMEM_BYTES,
+                                                 static_cast<cudaStream_t>(stream)));
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
 }

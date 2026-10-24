@@ -46,6 +46,58 @@ __device__ inline float2 rescale_exact1::op<float2>(const float2& o, const float
     return float2{rescale_exact1::op<float>(o.x, n.x, c), rescale_exact1::op<float>(o.y, n.y, c)};
 }
 
+// The RMSNorm's inverse root of one row's mean square plus eps: `rsqrtf(m + eps)`, with `m` the
+// row's sum of squares already divided by `cols` (`warp::div`), so the two together are today's
+// `rsqrtf(total / float(cols) + eps)`. A division then an add: nothing contracts into an FMA.
+// The `float2` form serves the packed column vector of a row-layout tile (see `rescale_exact1`).
+struct rms_inv {
+    template <typename T>
+    static __device__ inline T op(const T& m, const T& eps) {
+        return rsqrtf(m + eps);
+    }
+};
+template <>
+__device__ inline float rms_inv::op<float>(const float& m, const float& eps) {
+    return rsqrtf(m + eps);
+}
+template <>
+__device__ inline float2 rms_inv::op<float2>(const float2& m, const float2& eps) {
+    return float2{rms_inv::op<float>(m.x, eps.x), rms_inv::op<float>(m.y, eps.y)};
+}
+
+// SwiGLU's activation: `g / (1 + e^(−g)) · u`, the expression the plain-CUDA kernel computed. For
+// `g ≤ −88`, `__expf(−g)` overflows to +inf and the result is a signed zero, never NaN.
+struct silu_mul {
+    template <typename T>
+    static __device__ inline T op(const T& g, const T& u) {
+        return g / (1.0f + __expf(-g)) * u;
+    }
+};
+template <>
+__device__ inline float silu_mul::op<float>(const float& g, const float& u) {
+    return g / (1.0f + __expf(-g)) * u;
+}
+template <>
+__device__ inline float2 silu_mul::op<float2>(const float2& g, const float2& u) {
+    return float2{silu_mul::op<float>(g.x, u.x), silu_mul::op<float>(g.y, u.y)};
+}
+
+// The attention output gate: `a / (1 + e^(−g))`, the expression the plain-CUDA kernel computed.
+struct gate_apply {
+    template <typename T>
+    static __device__ inline T op(const T& a, const T& g) {
+        return a / (1.0f + __expf(-g));
+    }
+};
+template <>
+__device__ inline float gate_apply::op<float>(const float& a, const float& g) {
+    return a / (1.0f + __expf(-g));
+}
+template <>
+__device__ inline float2 gate_apply::op<float2>(const float2& a, const float2& g) {
+    return float2{gate_apply::op<float>(a.x, g.x), gate_apply::op<float>(a.y, g.y)};
+}
+
 // TK-GAP(rv_ternary_map) begin
 // A register-vector map over two vectors and one scalar, `dst[i][j] = op(a[i][j], b[i][j], c)`:
 // TK's own vector `bin_op` (`ops/group/register/vec/maps.cuh`) takes one vector and a scalar, or

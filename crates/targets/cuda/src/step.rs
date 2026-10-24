@@ -115,9 +115,8 @@ pub const GEMM_NARROW_BF16_MULTIPLE: u32 = 8;
 /// (`kernels/gemv_bf16.cu`). `n` is non-zero, and `n` and `k` are at most `i32::MAX`; `m` is 1.
 pub const GEMV_BF16_MULTIPLE: u32 = 8;
 
-/// The RMSNorm's `cols` is a non-zero multiple of this: each thread loads and stores 16-byte
-/// vectors of 8 bf16 (`kernels/rms_norm_bf16.cu`). `rows` is non-zero and `rows · cols` at most
-/// `i32::MAX`.
+/// The RMSNorm's `cols` is a non-zero multiple of this: 8 bf16 is 16 bytes, so every row stride is a multiple of 16 bytes, as the ThunderKittens 16-row tile's TMA tensor maps need (`kernels/rms_norm_bf16.cu`). `rows`
+/// is non-zero and `rows · cols` at most `i32::MAX`.
 pub const RMS_NORM_BF16_COLS: u32 = 8;
 
 /// `y[r, c] = x[r, c] / rms(x[r, :]) · (offset + gain[c])`, `rms(x) = sqrt(mean(x²) + eps)`,
@@ -158,8 +157,8 @@ impl RmsNormBf16 {
     }
 }
 
-/// The add's `cols` is a non-zero multiple of this (`kernels/add_bf16.cu`: one 8-wide bf16
-/// vector per thread), `rows` non-zero, and `rows · cols` at most `i32::MAX`.
+/// The add's `cols` is a non-zero multiple of this (8 bf16 is 16 bytes, so every row stride is a multiple of 16 bytes, as the ThunderKittens 16-row tile's TMA tensor maps need, `kernels/add_bf16.cu`), `rows`
+/// non-zero, and `rows · cols` at most `i32::MAX`.
 pub const ADD_BF16_COLS: u32 = 8;
 
 /// `out = a + b` over `[rows, cols]`, bf16 in and out: one f32 add, one rounding. No broadcast:
@@ -173,8 +172,8 @@ pub struct AddBf16 {
     pub cols: u32,
 }
 
-/// The SiluMul's `cols` is a non-zero multiple of this (`kernels/silu_mul_bf16.cu`: one 8-wide
-/// bf16 vector per thread), `rows` non-zero, and `rows · cols` at most `i32::MAX`.
+/// The SiluMul's `cols` is a non-zero multiple of this (8 bf16 is 16 bytes, so every row stride is a multiple of 16 bytes, as the ThunderKittens 16-row tile's TMA tensor maps need, `kernels/silu_mul_bf16.cu`),
+/// `rows` non-zero, and `rows · cols` at most `i32::MAX`.
 pub const SILU_MUL_BF16_COLS: u32 = 8;
 
 /// `out = gate / (1 + e^(−gate)) · up` over `[rows, cols]`, bf16 in and out, computed in f32 and
@@ -232,8 +231,8 @@ pub struct GateSplitBf16 {
     pub head_dim: u32,
 }
 
-/// The gate apply's `cols` is a non-zero multiple of this (`kernels/gate_apply_bf16.cu`: one
-/// 8-wide bf16 vector per thread), `rows` non-zero, and `rows · cols` at most `i32::MAX`.
+/// The gate apply's `cols` is a non-zero multiple of this (8 bf16 is 16 bytes, so every row stride is a multiple of 16 bytes, as the ThunderKittens 16-row tile's TMA tensor maps need, `kernels/gate_apply_bf16.cu`),
+/// `rows` non-zero, and `rows · cols` at most `i32::MAX`.
 pub const GATE_APPLY_BF16_COLS: u32 = 8;
 
 /// `out = attn / (1 + e^(−gate))` over `[rows, cols]`, bf16 in and out, computed in f32 and
