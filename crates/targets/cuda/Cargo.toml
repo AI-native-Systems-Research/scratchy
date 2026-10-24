@@ -69,6 +69,12 @@ required-features = ["nvcc"]
 name = "row_ops"
 required-features = ["nvcc"]
 
+# The MoE block's kernels (#857: route, sort, expert GEMM and GEMV, combine, gate scale) against
+# f64 CPU references and exact host results, on the GPU. Not built without `nvcc`.
+[[test]]
+name = "moe"
+required-features = ["nvcc"]
+
 # The rope, gate-split and gate-apply kernels against a CPU reference, on the GPU. Not built
 # without `nvcc`.
 [[test]]

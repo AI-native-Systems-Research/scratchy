@@ -137,6 +137,11 @@ pub const GEMM_NARROW_BF16_MULTIPLE: u32 = 8;
 /// The one `n` the narrow GEMM takes off [`GEMM_NARROW_BF16_MULTIPLE`]: a one-column projection
 /// (a shared expert's gate), stored one bf16 per row.
 pub const GEMM_NARROW_BF16_ONE: u32 = 1;
+/// At `n` = [`GEMM_NARROW_BF16_ONE`] the narrow GEMM's `k` is a non-zero multiple of this: its
+/// warp-vector kernel walks each row in chunks of one naive `rv_fl<256>`
+/// (`kernels/gemm_narrow_bf16.cu`). Checked by the launcher only; qwen3-5-moe's shared expert gate
+/// has `k` = 2048.
+pub const GEMM_NARROW_BF16_ONE_K_MULTIPLE: u32 = 256;
 
 /// The GEMV's `k` is a non-zero multiple of this: 8 bf16 is 16 bytes, so every row stride of `a`
 /// and `B` is a multiple of 16 bytes, as their TMA tensor maps need (`kernels/gemv_bf16.cu`). `n`
@@ -787,8 +792,9 @@ pub struct ExpertCombineBf16 {
     pub down_rows: u32,
 }
 
-/// The gate scale's `cols` is a non-zero multiple of this (`kernels/gate_scale_bf16.cu`: one
-/// 8-wide bf16 vector per thread), `rows` non-zero, and `rows · cols` at most `i32::MAX`.
+/// The gate scale's `cols` is a non-zero multiple of this (8 bf16 is 16 bytes, so every row stride
+/// is a multiple of 16 bytes, as the ThunderKittens 16-row tile's TMA tensor maps need,
+/// `kernels/gate_scale_bf16.cu`), `rows` non-zero, and `rows · cols` at most `i32::MAX`.
 pub const GATE_SCALE_BF16_COLS: u32 = 8;
 
 /// `out = routed + shared · (1 / (1 + e^(−g)))` over `[rows, cols]`, `g` `[rows, 1]` broadcast

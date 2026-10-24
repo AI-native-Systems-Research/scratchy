@@ -96,6 +96,16 @@ unsafe extern "C" {
         cols: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gate_scale_bf16_prepare() -> i32;
+    fn scratchy_cuda_gate_scale_bf16(
+        routed: *const c_void,
+        shared: *const c_void,
+        g: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_kv_append_bf16(
         k: *const c_void,
         v: *const c_void,
@@ -437,6 +447,7 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("add_bf16", scratchy_cuda_add_bf16_prepare),
     ("silu_mul_bf16", scratchy_cuda_silu_mul_bf16_prepare),
     ("gate_apply_bf16", scratchy_cuda_gate_apply_bf16_prepare),
+    ("gate_scale_bf16", scratchy_cuda_gate_scale_bf16_prepare),
     ("attn_decode_bf16", scratchy_cuda_attn_decode_bf16_prepare),
 ];
 
@@ -704,6 +715,28 @@ pub unsafe fn gate_apply_bf16(
     check(code, KernelError::RowShape { rows, cols })
 }
 
+/// Launch the bf16 shared-expert gate scale `out = routed + shared · (1 / (1 + e^(−g)))` over
+/// `[rows, cols]`, `g` `[rows, 1]` broadcast across its row, in f32 with one bf16 rounding per
+/// element (`kernels/gate_scale_bf16.cu`). Asynchronous; the shape rule is the row kernels'
+/// (`step::GATE_SCALE_BF16_COLS`).
+///
+/// # Safety
+///
+/// [`prepare_all`] must have succeeded on the current device. `routed`, `shared` and `out` must
+/// be 16-byte-aligned device pointers to at least `rows·cols` bf16 elements each and `g` to `rows`,
+/// valid for the whole kernel, with `out` overlapping no input. `stream` must be a live
+/// `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn gate_scale_bf16(
+    (routed, shared, g): (*const c_void, *const c_void, *const c_void),
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe { scratchy_cuda_gate_scale_bf16(routed, shared, g, out, rows, cols, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
 /// Launch the paged KV cache's write: for each token row `t` whose `slot_mapping[t]` is not
 /// `u32::MAX`, row `t` of `k` and of `v` (`[rows, kv_heads · head_dim]`) copied bit for bit into
 /// `k_cache` and `v_cache` (`[num_blocks, kv_heads, 64, head_dim]`) at that slot. A slot whose
@@ -826,9 +859,14 @@ pub unsafe fn attn_prefill_bf16(
 /// row's bits depend only on its own row of `A` and on `B`, not on the launch or on `m`.
 /// Asynchronous.
 ///
+/// `n = 1` (`step::GEMM_NARROW_BF16_ONE`, a shared expert's gate) runs a ThunderKittens
+/// warp-vector kernel instead, one warp per row in a fixed order, its one bf16 per row rounded
+/// once.
+///
 /// Refused with [`KernelError::NarrowShape`], before any pointer is touched, unless `m` is
-/// non-zero, `n` a non-zero multiple of 8 and at most 64 (`step::GEMM_NARROW_BF16_MULTIPLE`,
-/// `GEMM_NARROW_BF16_MAX_N`), `k` a non-zero multiple of 8, and `m` and `k` at most `i32::MAX`.
+/// non-zero, `n` 1 or a non-zero multiple of 8 and at most 64 (`step::GEMM_NARROW_BF16_MULTIPLE`,
+/// `GEMM_NARROW_BF16_MAX_N`), `k` a non-zero multiple of 8 (of 256 when `n` is 1,
+/// `step::GEMM_NARROW_BF16_ONE_K_MULTIPLE`), and `m` and `k` at most `i32::MAX`.
 ///
 /// # Safety
 ///
