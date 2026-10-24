@@ -1041,6 +1041,7 @@ fn tied_model(ms: &[u32], head: &str, vocab: u32) -> TargetModelInput {
             vocab_size: vocab,
             gdn: None,
             dsl_shared_expert_bases: Vec::new(),
+            attn_classes: Vec::new(),
         },
         weight_prefixes: vec![
             (1, None, "model.norm".to_string()),

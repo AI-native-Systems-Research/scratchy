@@ -2032,6 +2032,74 @@ pub(crate) fn declared_rope_theta(model: &ModelParams) -> Option<f64> {
         .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
 }
 
+/// The global attention class's geometry: a hybrid sliding/global arch's full-attention layers
+/// (`GLOBAL_HEAD_DIM`, `NUM_GLOBAL_KV_HEADS`, `GLOBAL_ROT_DIM`, `ROPE_PROPORTIONAL`), the base
+/// class's on a uniform model. One derivation, read by metal's `CanonicalParams` impl and by the
+/// target-emitter seam's attention classes.
+pub(crate) struct GlobalAttnClass {
+    pub head_dim: u32,
+    pub kv_heads: u32,
+    pub rot_dim: u32,
+    /// Proportional rope: lane `i` pairs with `i + head_dim/2`, not `i + rot_dim/2`.
+    pub proportional: bool,
+}
+
+/// [`GlobalAttnClass`] from the config, the base class's `(head_dim, kv_heads, rot_dim)` beside it
+/// (`kv_heads` already divided by `tp`).
+///
+/// Per-layer-class geometry for hybrid sliding/global arches whose classes differ in dims
+/// (Gemma4: sliding 256×8kv full-rope vs global 512×1kv proportional-rope-128). Config keys
+/// `global_head_dim` / `num_global_key_value_heads` / `global_partial_rotary_factor` feed it;
+/// absent keys fall back to the base values (uniform models unchanged).
+pub(crate) fn global_attn_class(
+    model: &ModelParams,
+    tp: u32,
+    (head_dim, num_kv_heads, rot_dim_val): (u32, u32, u32),
+) -> GlobalAttnClass {
+    let global_head_dim: u32 = model
+        .bounds
+        .get("global_head_dim")
+        .map(|&v| v as u32)
+        .unwrap_or(head_dim);
+    let num_global_kv_heads: u32 = model
+        .bounds
+        .get("num_global_key_value_heads")
+        .map(|&v| (v as u32) / tp)
+        .unwrap_or(num_kv_heads);
+    let global_rot_dim: u32 = model
+        .scalars
+        .get("global_partial_rotary_factor")
+        .copied()
+        .filter(|&f| (f - 1.0).abs() > 1e-9)
+        .map(|f| (f * global_head_dim as f64).round() as u32)
+        // Fallback must honor the BASE partial factor on uniform
+        // models (global_head_dim == head_dim): Qwen3.5's full-
+        // attention layers lower through the is_global arm, and the
+        // old `global_head_dim` fallback rotated the FULL 256-dim
+        // head against the 64-wide partial cos/sin table — rows past
+        // the table read zeros and zeroed Q/K for every token beyond
+        // ~4 (the "rambling, input-blind thinker" failure). Hybrid
+        // arches with distinct global dims and genuinely full global
+        // rope (no factor) keep the old fallback.
+        .unwrap_or(if global_head_dim == head_dim {
+            rot_dim_val
+        } else {
+            global_head_dim
+        });
+    // Proportional rope marker — same predicate that routes the
+    // rotary cache builder to `new_proportional_from_gpuweights`.
+    // Drives the metal rope kernel's pairing offset (lane i pairs
+    // with i + head_dim/2, not i + rot_dim/2).
+    let proportional = global_rot_dim != global_head_dim
+        && model.scalars.contains_key("global_partial_rotary_factor");
+    GlobalAttnClass {
+        head_dim: global_head_dim,
+        kv_heads: num_global_kv_heads,
+        rot_dim: global_rot_dim,
+        proportional,
+    }
+}
+
 /// The rotated lanes of a `head_dim`-wide head: `partial_rotary_factor · head_dim` for a
 /// partial-rope arch (Qwen3.5: 0.25 · 256 = 64), else the full `head_dim`.
 pub(crate) fn rot_dim(model: &ModelParams, head_dim: u32) -> u32 {
@@ -7312,6 +7380,13 @@ fn target_model_input(
             (id, index, prefix)
         })
         .collect();
+    let sliding = (fuf.nodes.iter()).any(|n| {
+        matches!(
+            n.op,
+            OpKind::SlidingAttention | OpKind::SinkSlidingAttention
+        )
+    });
+    let attn_classes = target_attn_classes(model, tp_world_size, head_dim, sliding);
     TargetModelInput {
         stem: stem.clone(),
         buckets,
@@ -7326,8 +7401,66 @@ fn target_model_input(
             vocab_size: bound("vocab_size").unwrap_or(0),
             gdn,
             dsl_shared_expert_bases: program.weights.shared_expert_bases(),
+            attn_classes,
         },
     }
+}
+
+/// The model's attention classes, for the target-emitter seam: the base class (its rope base
+/// frequency `rope_local_base_freq` on a hybrid arch, which rotates its sliding layers by the
+/// local table, else `rope_theta`; its window `sliding_window` when the DSL has a sliding
+/// attention, `sliding`), then the global class ([`global_attn_class`]) when its geometry is not
+/// the base's.
+#[cfg(feature = "target-emitter")]
+fn target_attn_classes(
+    model: &ModelParams,
+    tp_world_size: u8,
+    head_dim: u32,
+    sliding: bool,
+) -> Vec<scratchy_subtile::handoff::TargetAttnClass> {
+    use scratchy_subtile::handoff::{RopePairing, TargetAttnClass};
+    let tp = u32::from(tp_world_size);
+    let kv_heads = model
+        .bounds
+        .get("num_key_value_heads")
+        .map_or(0, |&v| v as u32)
+        / tp;
+    let base_rot = rot_dim(model, head_dim);
+    let global = global_attn_class(model, tp, (head_dim, kv_heads, base_rot));
+    let theta = declared_rope_theta(model);
+    let local_theta = (model.scalars.get("rope_local_base_freq").copied())
+        .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64));
+    let window = (model.bounds.get("sliding_window"))
+        .and_then(|&w| u32::try_from(w).ok())
+        .and_then(std::num::NonZeroU32::new);
+    let hybrid =
+        (global.head_dim, global.kv_heads, global.rot_dim) != (head_dim, kv_heads, base_rot);
+    let base = TargetAttnClass {
+        head_dim,
+        kv_heads,
+        rot_dim: base_rot,
+        rope_theta: match hybrid {
+            true => local_theta.or(theta),
+            false => theta,
+        },
+        pairing: RopePairing::HalfRotated,
+        window: window.filter(|_| sliding),
+    };
+    let mut classes = vec![base];
+    if hybrid {
+        classes.push(TargetAttnClass {
+            head_dim: global.head_dim,
+            kv_heads: global.kv_heads,
+            rot_dim: global.rot_dim,
+            rope_theta: theta,
+            pairing: match global.proportional {
+                true => RopePairing::HalfHead,
+                false => RopePairing::HalfRotated,
+            },
+            window: None,
+        });
+    }
+    classes
 }
 
 /// Whether this model uses rotary position embeddings — any `Rotary` extern
@@ -7671,36 +7804,12 @@ fn emit_canonical_params_impl(
     // `global_partial_rotary_factor` feed the GLOBAL_* consts read by
     // the full-attention metal lowering arms; absent keys fall back to
     // the base values (uniform models unchanged).
-    let global_head_dim: u32 = model
-        .bounds
-        .get("global_head_dim")
-        .map(|&v| v as u32)
-        .unwrap_or(head_dim);
-    let num_global_kv_heads: u32 = model
-        .bounds
-        .get("num_global_key_value_heads")
-        .map(|&v| (v as u32) / tp)
-        .unwrap_or(num_kv_heads);
-    let global_rot_dim: u32 = model
-        .scalars
-        .get("global_partial_rotary_factor")
-        .copied()
-        .filter(|&f| (f - 1.0).abs() > 1e-9)
-        .map(|f| (f * global_head_dim as f64).round() as u32)
-        // Fallback must honor the BASE partial factor on uniform
-        // models (global_head_dim == head_dim): Qwen3.5's full-
-        // attention layers lower through the is_global arm, and the
-        // old `global_head_dim` fallback rotated the FULL 256-dim
-        // head against the 64-wide partial cos/sin table — rows past
-        // the table read zeros and zeroed Q/K for every token beyond
-        // ~4 (the "rambling, input-blind thinker" failure). Hybrid
-        // arches with distinct global dims and genuinely full global
-        // rope (no factor) keep the old fallback.
-        .unwrap_or(if global_head_dim == head_dim {
-            rot_dim_val
-        } else {
-            global_head_dim
-        });
+    let GlobalAttnClass {
+        head_dim: global_head_dim,
+        kv_heads: num_global_kv_heads,
+        rot_dim: global_rot_dim,
+        proportional: rope_proportional,
+    } = global_attn_class(model, tp, (head_dim, num_kv_heads, rot_dim_val));
     // GUARD: the rope cos/sin table is
     // rotary_dim wide; a kernel-side rot const that disagrees reads
     // past the table into zeros and silently zeroes Q/K for every
@@ -7721,12 +7830,6 @@ fn emit_canonical_params_impl(
     let num_global_kv_heads_lit = proc_macro2::Literal::u32_unsuffixed(num_global_kv_heads);
     let global_rot_dim_lit = proc_macro2::Literal::u32_unsuffixed(global_rot_dim);
     let global_q_size_lit = proc_macro2::Literal::usize_unsuffixed(global_q_size);
-    // Proportional rope marker — same predicate that routes the
-    // rotary cache builder to `new_proportional_from_gpuweights`.
-    // Drives the metal rope kernel's pairing offset (lane i pairs
-    // with i + head_dim/2, not i + rot_dim/2).
-    let rope_proportional = global_rot_dim != global_head_dim
-        && model.scalars.contains_key("global_partial_rotary_factor");
     let rope_proportional_tokens: proc_macro2::TokenStream = if rope_proportional {
         quote! { const ROPE_PROPORTIONAL: bool = true; }
     } else {

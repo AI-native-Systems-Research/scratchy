@@ -380,6 +380,37 @@ pub struct TargetModelFacts {
     /// expert bundle whose shared expert the DSL states as ops of its own, which a target's
     /// expert combine therefore must not add again (the single-owner rule).
     pub dsl_shared_expert_bases: Vec<String>,
+    /// The model's attention classes: the base class first (every layer of a uniform model, the
+    /// sliding layers of a hybrid one, read by the `Cos { local: true }` table when there is a
+    /// second class), then the global class when its geometry differs (Gemma 4's full-attention
+    /// layers, read by the `Cos { local: false }` table). A uniform model has exactly one, equal
+    /// to [`Self::head_dim`], [`Self::rot_dim`] and [`Self::rope_theta`]. Which class a layer is
+    /// is its attention ops' own fact: their mask's window and their head dim.
+    pub attn_classes: Vec<TargetAttnClass>,
+}
+
+/// One attention class's geometry: what a layer of it rotates, caches and masks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TargetAttnClass {
+    pub head_dim: u32,
+    pub kv_heads: u32,
+    /// The rotated lanes of a head.
+    pub rot_dim: u32,
+    /// The class's rope base frequency; `None` when the config declares none.
+    pub rope_theta: Option<f64>,
+    pub pairing: RopePairing,
+    /// The keys a query sees, the last `window` positions; `None` for full causal attention.
+    pub window: Option<std::num::NonZeroU32>,
+}
+
+/// Which lane a rotated lane `i` pairs with: a fact of the model's rope, not of a target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopePairing {
+    /// Lane `i + rot_dim/2`: half the rotated span (NeoX, and Qwen3.5's partial rope).
+    HalfRotated,
+    /// Lane `i + head_dim/2`: half the head (Gemma 4's proportional rope, which rotates
+    /// `rot_dim` of `head_dim` lanes with the full `head_dim` as its frequencies' denominator).
+    HalfHead,
 }
 
 /// A Gated-DeltaNet model's key-head geometry: `linear_num_key_heads`, `linear_key_head_dim`,

@@ -605,8 +605,9 @@ pub struct PrefixCapacity(std::num::NonZeroU32);
 ///
 /// A dense MoE (its experts the checkpoint's own bf16 tensors, no affine storage) lowers to
 /// [`ExpertWeight::Dense`] expert matmuls only under [`Self::Lower`]; under [`Self::Refuse`] the
-/// bridge refuses it ([`BridgeError::NoMetalRealization`]), as it always has. Only the
-/// `moe_block` bank reads this; the Gemma and gpt-oss banks are affine-only either way.
+/// bridge refuses it ([`BridgeError::NoMetalRealization`]), as it always has. The `moe_block` and
+/// `gemma_moe` banks read this: under [`Self::Refuse`] a Gemma bank with no affine storage keeps
+/// its `(64, 4)` affine fallback. The gpt-oss bank is affine-only either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenseExperts {
     /// The caller's target has no dense expert kernels: refuse a dense bank.
@@ -1664,6 +1665,12 @@ pub fn lower_decode_to_wavefront(
                     }
                     _ => (64, 4),
                 };
+                // A bank with no affine storage is the checkpoint's own bf16 experts: dense under
+                // `DenseExperts::Lower`, with no per-channel scale sources (each `ExpertMatmul`
+                // then reads rows, pairs and its weight, as `moe_block`'s dense bank does). Under
+                // `Refuse` it keeps the affine fallback above.
+                let dense = !matches!(ew.2, crate::quantization::StorageFormat::Affine { .. })
+                    && bx.dense_experts == DenseExperts::Lower;
                 // Routes off its own pre-norm of `router_in`: logits → top-k → scores at a
                 // `hidden^-0.5` temperature → softmax → × per-expert scale. GeGLU experts over
                 // `expert_in`.
@@ -1685,12 +1692,23 @@ pub fn lower_decode_to_wavefront(
                 let s_src = |bx: &mut Builder, t: BundleTensor, out: u32| {
                     expert_src(bx, t, e_rows * out, 1)
                 };
+                // A dense bank binds no scale: its "scale" is its weight, which a dense
+                // `ExpertMatmul` never reads as an operand.
                 let gate_w = w_src(&mut bx, BundleTensor::ExpertGateW, moe_inter, hidden);
-                let gate_s = s_src(&mut bx, BundleTensor::ExpertGateS, moe_inter);
+                let gate_s = match dense {
+                    true => gate_w,
+                    false => s_src(&mut bx, BundleTensor::ExpertGateS, moe_inter),
+                };
                 let up_w = w_src(&mut bx, BundleTensor::ExpertUpW, moe_inter, hidden);
-                let up_s = s_src(&mut bx, BundleTensor::ExpertUpS, moe_inter);
+                let up_s = match dense {
+                    true => up_w,
+                    false => s_src(&mut bx, BundleTensor::ExpertUpS, moe_inter),
+                };
                 let down_w = w_src(&mut bx, BundleTensor::ExpertDownW, hidden, moe_inter);
-                let down_s = s_src(&mut bx, BundleTensor::ExpertDownS, hidden);
+                let down_s = match dense {
+                    true => down_w,
+                    false => s_src(&mut bx, BundleTensor::ExpertDownS, hidden),
+                };
                 bx.expand();
                 let norm = SubOp::RouterNorm { eps, router: gemma };
                 let xr = bx.push_op(norm, vec![router_in, InputRef::Ext(r_scale)]);
@@ -1712,7 +1730,10 @@ pub fn lower_decode_to_wavefront(
                     k,
                     inter: moe_inter,
                     hidden,
-                    weight: ExpertWeight::Affine(ExpertQuant::declared(group_size, bits)),
+                    weight: match dense {
+                        true => ExpertWeight::Dense,
+                        false => ExpertWeight::Affine(ExpertQuant::declared(group_size, bits)),
+                    },
                     bundle: ExpertBundle::SwitchGlu,
                     body: ExpertBody::Gated(GatedAct::Gelu),
                     shared: SharedExpertBound(None),

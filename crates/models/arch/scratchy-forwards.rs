@@ -216,11 +216,13 @@ const SPYRE_CAPABLE: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
 /// arch-wide `model/qwen3-5` panics at build time naming that refusal; build `model/qwen3.5-0.8b`
 /// (CLAUDE.md asks for a per-stem build anyway). qwen3-5-moe's `qwen3.5-35b-a3b-parity-tiny`
 /// (hidden 128, head_dim 32) is refused the same way, so the arch-wide `model/qwen3-5-moe`
-/// panics too; build `model/qwen3.6-35b-a3b`.
+/// panics too; build `model/qwen3.6-35b-a3b`. gemma4-moe's tiny configs (`-class-tiny`,
+/// `-parity-tiny*`: GEMMs off the tiles, head dims 64 and 128) are refused the same way, so the
+/// arch-wide `model/gemma4-moe` panics; build `model/gemma-4-26b-a4b-it`.
 ///
 /// Must agree with src/lib.rs gates; an arch selected under `cuda` but not listed here is refused
 /// by name below rather than silently dropped.
-const CUDA_CAPABLE: &[&str] = &["qwen3-5", "qwen3-5-moe"];
+const CUDA_CAPABLE: &[&str] = &["qwen3-5", "qwen3-5-moe", "gemma4-moe"];
 
 /// A checkpoint config's identity for matching: its architecture and shape (hidden size, layers,
 /// vocab size; the text decoder's when `text_config` nests it).
