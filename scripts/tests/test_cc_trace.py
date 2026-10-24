@@ -10,6 +10,8 @@ import http.client
 import http.server
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -364,13 +366,14 @@ class FakeAnthropic(http.server.BaseHTTPRequestHandler):
     Class attributes steer it: `reply(body)` returns the stream (or an HTTP
     status to fail with), and `counting = False` leaves /v1/messages out of
     `requests_served` — what a replay that reached some other server looks like
-    from here.
+    from here. `has_counter = False` leaves `requests_served` off /server_info.
     """
 
     protocol_version = "HTTP/1.1"
     served = 0
     resets = 0
     counting = True
+    has_counter = True
     seen = []
     reply = staticmethod(lambda body: _stream())
 
@@ -390,8 +393,10 @@ class FakeAnthropic(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         cls = type(self)
         if self.path == "/server_info":
-            self._send(200, {"requests_served": cls.served,
-                             "system_env": {"vllm_version": "0.1.0"}})
+            info = {"system_env": {"vllm_version": "0.1.0"}}
+            if cls.has_counter:
+                info["requests_served"] = cls.served
+            self._send(200, info)
             return
         cls.served += 1
         if self.path == "/v1/models":
@@ -1007,6 +1012,388 @@ class HelperTest(unittest.TestCase):
     def test_redact_query_leaves_clean_queries_alone(self):
         self.assertEqual(cc_trace.redact_query("beta=true"), "beta=true")
         self.assertEqual(cc_trace.redact_query("api_key=x&b=1"), "api_key=%3Credacted%3E&b=1")
+
+
+# ------------------------------------------------------------------------ live
+
+# Stands in for `scr launch claude` in the live tests: it reads `--server-url`,
+# sends the turns in $FAKE_TURNS (a JSON list of request bodies) to it as
+# Claude Code would, then applies $FAKE_FIX to the working copy the way an agent
+# edits files, and runs $FAKE_SHELL there the way an agent runs Bash. No real
+# Claude Code, no GPU.
+FAKE_SCR = r'''#!/usr/bin/env python3
+import json, os, subprocess, sys, urllib.request
+args = sys.argv[1:]
+url = args[args.index("--server-url") + 1]
+for body in json.loads(os.environ.get("FAKE_TURNS", "[]")):
+    req = urllib.request.Request(url + "/v1/messages?beta=true", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": "claude-cli/2.1.295 (external, sdk-cli)"})
+    urllib.request.urlopen(req).read()
+fix = os.environ.get("FAKE_FIX")
+if fix:
+    open("m.py", "w").write(fix)
+if os.environ.get("FAKE_SHELL"):
+    subprocess.run(os.environ["FAKE_SHELL"], shell=True, check=True)
+'''
+
+TASK_BROKEN = "def add(a, b):\n    return a - b\n"
+TASK_FIXED = "def add(a, b):\n    return a + b\n"
+TASK_GRADE = """#!/usr/bin/env bash
+cd "$(dirname "$0")"
+git diff --quiet HEAD -- t.py || { echo FAIL; exit 1; }
+python3 t.py >/dev/null 2>&1 && echo PASS || { echo FAIL; exit 1; }
+"""
+
+
+def _tool_stream(name, arguments, text=""):
+    """A reply that calls one tool with `arguments` streamed as raw JSON text."""
+    events = [(0, _ev("message_start", message={"usage": {"input_tokens": 100, "output_tokens": 1}}))]
+    if text:
+        events += [(0, _ev("content_block_delta", index=0,
+                           delta={"type": "text_delta", "text": text}))]
+    events += [
+        (0, _ev("content_block_start", index=1,
+                content_block={"type": "tool_use", "id": "t", "name": name, "input": {}})),
+        (0, _ev("content_block_delta", index=1,
+                delta={"type": "input_json_delta", "partial_json": arguments})),
+        (0, _ev("content_block_stop", index=1)),
+        (0, _ev("message_delta", delta={"stop_reason": "tool_use"},
+                usage={"input_tokens": 100, "output_tokens": 12})),
+        (0, _ev("message_stop")),
+    ]
+    return events
+
+
+def _text_stream(text):
+    return [(0, _ev("message_start", message={"usage": {"input_tokens": 100, "output_tokens": 1}})),
+            (0, _ev("content_block_delta", index=0, delta={"type": "text_delta", "text": text})),
+            (0, _ev("message_delta", delta={"stop_reason": "end_turn"},
+                    usage={"input_tokens": 100, "output_tokens": 8})),
+            (0, _ev("message_stop"))]
+
+
+def _rejection(tid, text):
+    """A tool result Claude Code marked is_error, with `text` as what it said."""
+    return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid,
+                                         "is_error": True, "content": text}]}
+
+
+# Claude Code 2.1.310's own words, captured from a real session: a call missing a
+# required parameter, one whose arguments are not JSON, and one naming no tool.
+REJECTED = ("<tool_use_error>InputValidationError: Read failed due to the following issue:\n"
+            "The required parameter `file_path` is missing</tool_use_error>")
+REJECTED_NOT_JSON = (
+    "<tool_use_error>InputValidationError: Read was called with input that could not be "
+    "parsed as JSON.\nYou sent (first 20 of 20 bytes): {\"file_path\": \"m.py\"\nCommon "
+    "causes: unescaped backslashes in file paths (use / or \\\\), unescaped control "
+    "characters, or truncated output. Retry with valid JSON.</tool_use_error>")
+REJECTED_NO_TOOL = "<tool_use_error>Error: No such tool available: Nonexistent</tool_use_error>"
+
+
+def make_task(root):
+    """The smoke task as a task directory: a bug in m.py, a test in t.py, a grader."""
+    d = Path(root)
+    d.mkdir(parents=True)
+    (d / "m.py").write_text(TASK_BROKEN)
+    (d / "t.py").write_text("from m import add\nassert add(2, 3) == 5\nprint('OK')\n")
+    (d / "TASK.md").write_text("t.py fails. Fix m.py so it passes. Do not edit t.py.\n")
+    (d / "grade.sh").write_text(TASK_GRADE)
+    (d / "grade.sh").chmod(0o755)
+    for cmd in (["git", "init", "-q"], ["git", "add", "-A"],
+                ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "task"]):
+        subprocess.run(cmd, cwd=d, check=True)
+    return d
+
+
+class LiveTest(unittest.TestCase):
+    def setUp(self):
+        FakeAnthropic.served = 0
+        FakeAnthropic.resets = 0
+        FakeAnthropic.counting = True
+        self.addCleanup(setattr, FakeAnthropic, "has_counter", True)
+        FakeAnthropic.seen = []
+        self.engine = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeAnthropic)
+        self.engine.daemon_threads = True
+        self.url = f"http://127.0.0.1:{_serve(self.engine)}"
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.task = make_task(self.root / "task")
+        self.scr = self.root / "scr"
+        self.scr.write_text(FAKE_SCR)
+        self.scr.chmod(0o755)
+        bodies = conversation()
+        self.replies = [_tool_stream("Read", '{"file_path": "m.py"}'),
+                        _tool_stream("Edit", '{"file_path": "m.py"}'),
+                        _text_stream("Fixed.")]
+        it = iter(self.replies * 10)
+        FakeAnthropic.reply = staticmethod(lambda body: next(it))
+        self.env = {**os.environ, "FAKE_TURNS": json.dumps(bodies[:3]), "FAKE_FIX": TASK_FIXED}
+        # `live` checks that Claude Code is installed; the fake scr never calls it.
+        self.claude = self.root / "bin" / "claude"
+        self.claude.parent.mkdir()
+        self.claude.write_text("#!/bin/sh\n")
+        self.claude.chmod(0o755)
+        self.env["PATH"] = f"{self.claude.parent}{os.pathsep}{os.environ['PATH']}"
+        self._path = os.environ["PATH"]
+        os.environ["PATH"] = self.env["PATH"]
+
+    def tearDown(self):
+        os.environ["PATH"] = self._path
+        self.engine.shutdown()
+        self.engine.server_close()
+        self.tmp.cleanup()
+
+    def _live(self, **kw):
+        args = dict(engine="scratchy", model="gemma", machine="m5max-64", rung="R1",
+                    scratchy_sha="abc123", ollama_version="0.40.4", engine_provenance=PER_ENGINE,
+                    out_dir=self.root / "out", sessions=2, scr=str(self.scr), cooldown_s=0,
+                    run_id="test-laneB", env=self.env, log=lambda msg: None)
+        args.update(kw)
+        return cc_trace.live(self.task, self.url, **args)
+
+    def _meas(self, run, metric):
+        return next(m for m in run["measurements"] if m["metric"] == metric)
+
+    def test_runs_records_and_grades_every_session(self):
+        run, detail = self._live()
+        self.assertEqual(run["status"], "published", run.get("void"))
+        self.assertEqual(run["lane"], "B")
+        s = detail["sessions"]
+        self.assertEqual([r["pass"] for r in s], [True, True])
+        self.assertEqual([r["turns"] for r in s], [3, 3])
+        # Each session was recorded into its own corpus, with the agent identified.
+        for i in (1, 2):
+            m = json.loads((self.root / "out" / f"session-{i}" / "corpus" / "manifest.json").read_text())
+            self.assertEqual((m["agent"], m["agent_version"]), ("claude-code", "2.1.295"))
+        self.assertEqual(self._meas(run, "task_pass")["stat"]["median"], 1.0)
+        self.assertEqual(self._meas(run, "turns_to_completion")["stat"]["median"], 3)
+        self.assertEqual(self._meas(run, "task_pass")["n"], 2)
+        # scratchy's cache is cleared before every session.
+        self.assertEqual(FakeAnthropic.resets, 2)
+        self.assertEqual(run["provenance"]["claude_version"], "2.1.295")
+
+    def test_only_lane_b_metrics(self):
+        run, _ = self._live()
+        metrics = {m["metric"] for m in run["measurements"]}
+        self.assertEqual(metrics, {"task_pass", "tool_call_parse_failure_rate",
+                                   "turns_to_completion", "wall_clock_s", "tokens_in",
+                                   "tokens_out"})
+        # Energy is deferred (#158), and the board no longer declares it.
+        self.assertEqual(run["gaps"], [])
+        lane_a = {"ttft_ms", "tpot_ms", "reprefill_ratio", "turn_e2e_ms", "e2e_star_ms"}
+        self.assertFalse(metrics & lane_a)
+
+    def test_a_session_whose_fix_fails_is_graded_fail(self):
+        self.env["FAKE_FIX"] = TASK_BROKEN
+        run, detail = self._live()
+        self.assertEqual(run["status"], "published")
+        self.assertEqual([r["pass"] for r in detail["sessions"]], [False, False])
+        self.assertEqual(self._meas(run, "task_pass")["stat"]["median"], 0.0)
+
+    def test_each_session_starts_from_the_task_not_the_last_session(self):
+        # The first session fixes m.py; the second must still see the bug.
+        run, detail = self._live()
+        for i in (1, 2):
+            work = self.root / "out" / f"session-{i}" / "workdir"
+            self.assertEqual(subprocess.run(["git", "-C", str(work), "rev-parse", "HEAD"],
+                                            capture_output=True, text=True).stdout,
+                             subprocess.run(["git", "-C", str(self.task), "rev-parse", "HEAD"],
+                                            capture_output=True, text=True).stdout)
+        self.assertEqual((self.task / "m.py").read_text(), TASK_BROKEN)
+
+    def test_a_broken_tool_call_counts_but_a_failing_command_does_not(self):
+        # Arguments that are not JSON: the engine broke the call.
+        self.replies[0] = _tool_stream("Read", '{"file_path": "m.py"')
+        it = iter(self.replies * 10)
+        FakeAnthropic.reply = staticmethod(lambda body: next(it))
+        run, detail = self._live(sessions=1)
+        self.assertEqual(detail["sessions"][0]["tool_call_failures"], 1)
+        self.assertEqual(detail["sessions"][0]["tool_calls"], 2)
+        self.assertEqual(self._meas(run, "tool_call_parse_failure_rate")["stat"]["median"], 0.5)
+
+    def test_a_call_left_as_text_counts_as_lost(self):
+        self.replies[2] = _text_stream('<tool_call>{"name": "Bash"}</tool_call>')
+        it = iter(self.replies * 10)
+        FakeAnthropic.reply = staticmethod(lambda body: next(it))
+        _, detail = self._live(sessions=1)
+        s = detail["sessions"][0]
+        self.assertEqual((s["tool_calls"], s["tool_calls_lost"], s["tool_call_failures"]), (2, 1, 1))
+
+    def test_a_session_the_engine_did_not_serve_is_void(self):
+        FakeAnthropic.counting = False
+        run, _ = self._live(sessions=1)
+        self.assertEqual(run["status"], "void")
+        self.assertIn("fairness rule 7", run["void"])
+        self.assertEqual(run["measurements"], [])
+
+    def test_a_session_that_never_reached_the_engine_is_void(self):
+        self.env["FAKE_TURNS"] = "[]"
+        run, _ = self._live(sessions=1)
+        self.assertEqual(run["status"], "void")
+        self.assertIn("never talked to it", run["void"])
+
+    def test_refuses_to_start_when_nothing_answers(self):
+        with self.assertRaises(SystemExit) as e:
+            cc_trace.live(self.task, "http://127.0.0.1:9", engine="scratchy", model="gemma",
+                          machine="m", rung="R1", scratchy_sha="a", ollama_version="0.40.4",
+                          engine_provenance=PER_ENGINE, out_dir=self.root / "o",
+                          scr=str(self.scr), env=self.env, log=lambda m: None)
+        self.assertIn("answers as None", str(e.exception))
+
+    def test_refuses_a_task_without_a_prompt_or_grader(self):
+        (self.task / "TASK.md").unlink()
+        with self.assertRaises(SystemExit) as e:
+            self._live()
+        self.assertIn("TASK.md", str(e.exception))
+
+    def test_a_hidden_grader_replaces_the_tasks_own(self):
+        hidden = self.root / "hidden.sh"
+        hidden.write_text('#!/usr/bin/env bash\ncd "$1" && grep -q "a + b" m.py && echo PASS || '
+                          '{ echo FAIL; exit 1; }\n')
+        hidden.chmod(0o755)
+        (self.task / "grade.sh").write_text("#!/bin/sh\necho FAIL\nexit 1\n")
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "x"],
+                       cwd=self.task, check=True)
+        _, detail = self._live(sessions=1, grader=hidden)
+        self.assertEqual(detail["sessions"][0]["pass"], True)
+
+    def test_relative_scr_and_out_dir(self):
+        # The PR's own example passes `--scr target/release/scr`, and cmd_live's
+        # default --out-dir is relative to --out.
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        (self.root / "target" / "release").mkdir(parents=True)
+        self.scr.rename(self.root / "target" / "release" / "scr")
+        os.chdir(self.root)
+        run, detail = self._live(sessions=1, scr="target/release/scr", out_dir="out")
+        self.assertEqual(run["status"], "published", run.get("void"))
+        self.assertEqual(detail["sessions"][0]["pass"], True)
+        self.assertTrue((self.root / "out" / "session-1" / "corpus" / "manifest.json").exists())
+
+    def test_the_agent_cannot_change_the_grader_that_grades_it(self):
+        commit = ["git", "-c", "user.name=a", "-c", "user.email=a@a", "commit", "-qam", "agent"]
+        cheat_t = "printf 'print(\"OK\")\\n' > t.py && " + " ".join(commit)
+        cases = [
+            # (what the agent's Bash did, its fix of m.py, graded as)
+            ("printf '#!/bin/sh\\necho PASS\\n' > grade.sh", TASK_BROKEN, False),
+            ("rm grade.sh", TASK_FIXED, True),
+            ("rm grade.sh", TASK_BROKEN, False),
+            # A test the agent rewrote and committed, so `git diff HEAD` is clean.
+            (cheat_t, TASK_BROKEN, False),
+            # No history left for the grader's `git diff HEAD`.
+            ("rm -rf .git", TASK_FIXED, True),
+            # A history of the agent's own, with its grade.sh committed in it.
+            ("rm -rf .git && printf '#!/bin/sh\\necho PASS\\n' > grade.sh && git init -q && "
+             "git add -A && " + " ".join(commit), TASK_BROKEN, False),
+        ]
+        for i, (shell, fix, passed) in enumerate(cases):
+            with self.subTest(shell=shell, fixed=fix == TASK_FIXED):
+                self.env.update(FAKE_SHELL=shell, FAKE_FIX=fix)
+                run, detail = self._live(sessions=1, out_dir=self.root / f"out-{i}")
+                self.assertEqual(run["status"], "published", run.get("void"))
+                self.assertEqual(detail["sessions"][0]["pass"], passed,
+                                 detail["sessions"][0]["grader"])
+        self.assertEqual((self.task / "grade.sh").read_text(), TASK_GRADE)
+
+    def test_a_grader_that_hangs_fails_the_session(self):
+        hung = self.root / "hung.sh"
+        hung.write_text("#!/bin/sh\nsleep 30\necho PASS\n")
+        hung.chmod(0o755)
+        saved = cc_trace.GRADER_TIMEOUT_S
+        self.addCleanup(setattr, cc_trace, "GRADER_TIMEOUT_S", saved)
+        cc_trace.GRADER_TIMEOUT_S = 1
+        t0 = time.monotonic()
+        run, detail = self._live(sessions=2, grader=hung)
+        self.assertLess(time.monotonic() - t0, 20)
+        self.assertEqual(run["status"], "published", run.get("void"))
+        self.assertEqual([r["pass"] for r in detail["sessions"]], [False, False])
+        self.assertIn("timed out", detail["sessions"][0]["grader"])
+
+    def test_a_missing_grader_is_refused_before_any_session(self):
+        with self.assertRaises(SystemExit) as e:
+            self._live(grader=self.root / "nowhere.sh")
+        self.assertIn("nowhere.sh", str(e.exception))
+        self.assertEqual(FakeAnthropic.seen, [])
+        self.assertFalse((self.root / "out").exists())
+
+    def test_a_timed_out_session_leaves_nothing_running(self):
+        # What Claude Code looks like to `scr launch`: a child that keeps editing
+        # the working copy after scr itself is gone.
+        self.env["FAKE_FIX"] = TASK_BROKEN
+        self.env["FAKE_SHELL"] = ("(sleep 2; printf 'def add(a, b):\\n    return a + b\\n' "
+                                  "> m.py) & sleep 6")
+        run, detail = self._live(sessions=1, timeout_s=1)
+        s = detail["sessions"][0]
+        self.assertTrue(s["timed_out"])
+        self.assertEqual(s["pass"], False)
+        time.sleep(3)
+        work = self.root / "out" / "session-1" / "workdir"
+        self.assertEqual((work / "m.py").read_text(), TASK_BROKEN)
+
+    def _history(self, *histories):
+        """FAKE_TURNS whose requests carry these message lists after the first prompt."""
+        first = conversation()[0]
+        self.env["FAKE_TURNS"] = json.dumps(
+            [first] + [{**first, "messages": first["messages"] + h} for h in histories])
+
+    def test_a_failing_command_does_not_count_but_a_rejected_call_does(self):
+        self._history([_assistant(_tool("Read", "r1")), _rejection("r1", REJECTED),
+                       _assistant(_tool("Bash", "b1")),
+                       _rejection("b1", "Exit code 1\nAssertionError: add(2, 3) == -1")])
+        _, detail = self._live(sessions=1)
+        self.assertEqual(detail["sessions"][0]["tool_call_failures"], 1)
+
+    def test_a_call_naming_no_tool_counts(self):
+        self._history([_assistant(_tool("Nonexistent", "n1")),
+                       _rejection("n1", REJECTED_NO_TOOL)])
+        _, detail = self._live(sessions=1)
+        self.assertEqual(detail["sessions"][0]["tool_call_failures"], 1)
+
+    def test_a_rejection_counts_when_the_last_request_does_not_carry_it(self):
+        # The rejection is in the second request's history; the last one is a
+        # side request (or a compacted history) that no longer has it.
+        rejected = [_assistant(_tool("Read", "r1")), _rejection("r1", REJECTED)]
+        self._history(rejected, [_user("summarize this conversation in 5 words")])
+        _, detail = self._live(sessions=1)
+        self.assertEqual(detail["sessions"][0]["tool_call_failures"], 1)
+
+    def test_a_broken_call_that_claude_code_then_rejects_counts_once(self):
+        # _tool_stream's call has id "t": its arguments are not JSON, and Claude
+        # Code sends back a rejection for that same id in every later request,
+        # with the call itself kept as it arrived.
+        self.replies[0] = _tool_stream("Read", '{"file_path": "m.py"')
+        it = iter(self.replies * 10)
+        FakeAnthropic.reply = staticmethod(lambda body: next(it))
+        call = {"type": "tool_use", "id": "t", "name": "Read",
+                "input": {"__unparsedToolInput": {"raw": '{"file_path": "m.py"', "len": 20}}}
+        rejected = [_assistant(call), _rejection("t", REJECTED_NOT_JSON)]
+        self._history(rejected, rejected + [_assistant(_tool("Edit", "u")), _result("u")])
+        _, detail = self._live(sessions=1)
+        self.assertEqual(detail["sessions"][0]["tool_call_failures"], 1)
+
+    def test_scratchy_with_no_counter_is_void(self):
+        FakeAnthropic.has_counter = False
+        run, _ = self._live(sessions=1)
+        self.assertEqual(run["status"], "void")
+        self.assertIn("fairness rule 7", run["void"])
+        self.assertEqual(run["measurements"], [])
+
+    @unittest.skipUnless(VALIDATOR.exists() and BOARD.exists(),
+                         "needs site/build_leaderboard.py and board.json (#176)")
+    def test_five_sessions_pass_the_board(self):
+        # A model the board declares; `gemma` is only the fake engine's name for it.
+        run, _ = self._live(sessions=cc_trace.LIVE_MIN_SESSIONS, model="gemma-4-12b-it",
+                            served_model="gemma")
+        self.assertEqual(run["status"], "published", run.get("void"))
+        self.assertEqual(board_problems(run), [])
+
+    def test_pass_rate_interval_contains_the_rate(self):
+        for passes in ([True] * 5, [False] * 5, [True, False, True, True, False]):
+            s = cc_trace.pass_rate_stat(passes)
+            self.assertLessEqual(s["p10"], s["median"])
+            self.assertLessEqual(s["median"], s["p90"])
+            self.assertTrue(0 <= s["p10"] and s["p90"] <= 1)
 
 
 if __name__ == "__main__":
