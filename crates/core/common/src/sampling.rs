@@ -336,6 +336,29 @@ pub fn seed_to_uniform(seed: u32) -> f32 {
     f32::from_bits((seed >> 9) | 0x3F80_0000) - 1.0
 }
 
+/// The token that would complete `bad_word` after `generated`: its last token, once `generated`
+/// ends with all of it before that (a one-token word, always). `None` for an empty word.
+pub fn bad_word_completion(generated: &[u32], bad_word: &[u32]) -> Option<u32> {
+    let (&last, before) = bad_word.split_last()?;
+    generated.ends_with(before).then_some(last)
+}
+
+/// What a request may sample next ([`SamplingParams::next_tokens`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct NextTokens<'a> {
+    /// Only these, when the request names its `allowed_token_ids`.
+    pub only: Option<&'a [u32]>,
+    /// Never these.
+    pub banned: Vec<u32>,
+}
+
+impl NextTokens<'_> {
+    /// Whether it may sample any token of the vocabulary.
+    pub fn is_free(&self) -> bool {
+        self.only.is_none() && self.banned.is_empty()
+    }
+}
+
 impl SamplingParams {
     /// Determine the [`SamplingType`] implied by these parameters.
     ///
@@ -373,6 +396,37 @@ impl SamplingParams {
             && self.presence_penalty == 0.0
             && self.frequency_penalty == 0.0;
         !penalty_free
+    }
+
+    /// Whether the tokens this request may sample next are fewer than the vocabulary: an allowed
+    /// set, a bad word, or stop tokens it may not end on yet ([`Self::next_tokens`]). A draft or a
+    /// step on the device ahead of the host cannot honor that, since `next_tokens` is decided
+    /// token by token.
+    pub fn restricts_tokens(&self) -> bool {
+        self.allowed_token_ids.is_some()
+            || self.bad_words_token_ids.is_some()
+            || self.min_tokens > 0
+    }
+
+    /// What this request may sample after its `generated` tokens, `eos` the model's own stop
+    /// tokens. vLLM's `allowed_token_ids`, `bad_words` and `min_tokens`: a bad word's last token is
+    /// banned once the generated tokens end with the rest of it (a one-token word, always), and
+    /// until `min_tokens` are generated, so are the stop tokens, its EOS among them unless it
+    /// ignores EOS.
+    pub fn next_tokens(&self, generated: &[u32], eos: &[u32]) -> NextTokens<'_> {
+        let mut banned: Vec<u32> = (self.bad_words_token_ids.iter().flatten())
+            .filter_map(|word| bad_word_completion(generated, word))
+            .collect();
+        if generated.len() < self.min_tokens as usize {
+            banned.extend(&self.stop_token_ids);
+            if !self.ignore_eos {
+                banned.extend(eos);
+            }
+        }
+        NextTokens {
+            only: self.allowed_token_ids.as_deref(),
+            banned,
+        }
     }
 
     /// Validate the sampling parameters, returning an error message on failure.
@@ -865,6 +919,62 @@ mod tests {
             ..Default::default()
         };
         assert!(p.validate().is_ok());
+    }
+
+    /// A one-token bad word is always banned; a longer one, once the generated tokens end with all
+    /// of it but its last token.
+    #[test]
+    fn a_bad_word_is_completed_by_its_last_token_after_the_rest() {
+        assert_eq!(bad_word_completion(&[], &[42]), Some(42));
+        assert_eq!(bad_word_completion(&[1, 2, 3], &[42]), Some(42));
+        assert_eq!(bad_word_completion(&[5, 10, 20], &[10, 20, 30]), Some(30));
+        assert_eq!(bad_word_completion(&[10, 20], &[10, 20, 30]), Some(30));
+        assert_eq!(bad_word_completion(&[5, 10, 21], &[10, 20, 30]), None);
+        assert_eq!(bad_word_completion(&[20], &[10, 20, 30]), None);
+        assert_eq!(bad_word_completion(&[1, 2], &[]), None);
+    }
+
+    /// `next_tokens` is vLLM's `allowed_token_ids`, `bad_words` and `min_tokens`, and a request
+    /// with none of them may sample anything.
+    #[test]
+    fn next_tokens_bans_bad_words_and_early_stops_within_the_allowed_set() {
+        let eos = [2];
+        let free = SamplingParams::default();
+        assert!(!free.restricts_tokens());
+        assert!(free.next_tokens(&[7, 8], &eos).is_free());
+
+        let p = SamplingParams {
+            allowed_token_ids: Some(vec![2, 3, 4, 30]),
+            bad_words_token_ids: Some(vec![vec![10, 20, 30], vec![4]]),
+            stop_token_ids: vec![9],
+            min_tokens: 3,
+            ..Default::default()
+        };
+        assert!(p.restricts_tokens());
+        let next = p.next_tokens(&[10, 20], &eos);
+        assert_eq!(next.only, Some(&[2, 3, 4, 30][..]));
+        assert_eq!(
+            next.banned,
+            vec![30, 4, 9, 2],
+            "the words' completions, then the stops"
+        );
+        let next = p.next_tokens(&[10, 20, 5], &eos);
+        assert_eq!(
+            next.banned,
+            vec![4],
+            "min_tokens reached: only the one-token word"
+        );
+
+        let ignoring = SamplingParams {
+            min_tokens: 1,
+            ignore_eos: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            ignoring.next_tokens(&[], &eos).banned,
+            Vec::<u32>::new(),
+            "EOS stops nothing"
+        );
     }
 }
 

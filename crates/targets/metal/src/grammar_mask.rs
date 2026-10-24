@@ -7,8 +7,9 @@
 //! Forces every token NOT permitted by a request's grammar FSM to `-inf`
 //! before the greedy `argmax`, so constrained / guided decoding (JSON
 //! schema, regex, EBNF, structural tags) produces only grammar-valid
-//! tokens. The allowed set is a dense bitset (1 bit/token, set =
-//! allowed), one row per constrained request; `rows[gid]` maps the
+//! tokens; and every token its sampling params rule out (`allowed_token_ids`,
+//! `bad_words`, `min_tokens`' stop tokens: [`push_allow_row`]). The allowed set is a
+//! dense bitset (1 bit/token, set = allowed), one row per constrained request; `rows[gid]` maps the
 //! grammar row to the logits batch row to mask, so a mixed batch (some
 //! requests constrained, some free) is handled by dispatching exactly
 //! `num_rows` threadgroups and leaving the other logits rows untouched.
@@ -131,5 +132,44 @@ pub fn push_allow_bitset_row(out: &mut Vec<u32>, allowed: &[u32], vocab: u32) {
         if tok < vocab {
             row[(tok >> 5) as usize] |= 1u32 << (tok & 31);
         }
+    }
+}
+
+/// Append the allow-bitset row of a request that may sample `allowed` (the whole vocabulary when
+/// `None`) less `banned`. Like [`push_allow_bitset_row`], no bit past `vocab` is set.
+pub fn push_allow_row(out: &mut Vec<u32>, allowed: Option<&[u32]>, banned: &[u32], vocab: u32) {
+    let wpr = words_per_row(vocab) as usize;
+    let base = out.len();
+    match allowed {
+        Some(allowed) => push_allow_bitset_row(out, allowed, vocab),
+        None => {
+            out.resize(base + wpr, u32::MAX);
+            if !vocab.is_multiple_of(32) {
+                out[base + wpr - 1] = (1u32 << (vocab % 32)) - 1;
+            }
+        }
+    }
+    let row = &mut out[base..base + wpr];
+    for &tok in banned {
+        if tok < vocab {
+            row[(tok >> 5) as usize] &= !(1u32 << (tok & 31));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row allows what it names, or the whole vocabulary and nothing past it, less the banned.
+    #[test]
+    fn an_allow_row_is_its_allowed_set_less_the_banned() {
+        let mut out = Vec::new();
+        push_allow_row(&mut out, None, &[3, 39, 99], 40);
+        assert_eq!(out, vec![!(1 << 3), 0xff & !(1 << 7)]);
+        push_allow_row(&mut out, Some(&[1, 2, 3, 99]), &[2], 40);
+        assert_eq!(out[2..], [0b1010, 0]);
+        push_allow_row(&mut out, None, &[], 64);
+        assert_eq!(out[4..], [u32::MAX, u32::MAX]);
     }
 }

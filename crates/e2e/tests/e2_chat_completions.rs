@@ -11,7 +11,9 @@
 
 use scratchy_e2e::assertions::{assert_coherent_text, assert_valid_chat_response};
 use scratchy_e2e::{Client, TestModels, TestServer};
-use scratchy_serving_api::protocol::{ChatCompletionMessageParam, ChatCompletionRequest};
+use scratchy_serving_api::protocol::{
+    ChatCompletionMessageParam, ChatCompletionRequest, ChatCompletionResponse, TokenizeRequest,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -573,9 +575,18 @@ async fn test_chat_invalid_json() {
 async fn test_chat_allowed_token_ids_constrains_output() {
     let (_server, client) = start_smollm().await;
 
-    // Only allow a tiny set of token IDs. Run greedy so output is deterministic.
-    // We verify every generated token is in the allow list.
-    let allowed = vec![198, 220, 284, 330]; // typical BPE tokens
+    // Only allow the tokens of " yes" and " no", greedy, so the reply can only be made of them.
+    let ids = |text: &str| {
+        let request = TokenizeRequest {
+            prompt: Some(text.to_string()),
+            add_special_tokens: Some(false),
+            ..serde_json::from_str("{}").unwrap()
+        };
+        let client = &client;
+        async move { client.tokenize(&request).await.unwrap().tokens }
+    };
+    let (yes, no) = (ids(" yes").await, ids(" no").await);
+    let allowed: Vec<u32> = yes.iter().chain(&no).copied().collect();
     let request = ChatCompletionRequest {
         messages: vec![user_msg("Say hello")],
         max_tokens: Some(10),
@@ -586,8 +597,34 @@ async fn test_chat_allowed_token_ids_constrains_output() {
 
     let resp = client.chat_completion(&request).await.unwrap();
     assert_eq!(resp.choices.len(), 1);
-    let tokens = resp.usage.completion_tokens.unwrap_or(0);
-    assert!(tokens > 0, "should generate at least 1 token");
+    assert_eq!(resp.usage.completion_tokens, Some(10), "no EOS is allowed");
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    let rest = text.replace(" yes", "").replace(" no", "");
+    assert!(
+        rest.is_empty(),
+        "only {allowed:?} are allowed, got {text:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_chat_min_tokens_holds_back_eos() {
+    let (_server, client) = start_smollm().await;
+
+    // A short greeting ends well before 20 tokens; min_tokens bans the EOS until then.
+    let request = |min_tokens| ChatCompletionRequest {
+        messages: vec![user_msg("Say hi")],
+        max_tokens: Some(40),
+        temperature: Some(0.0),
+        min_tokens,
+        ..default_chat_request()
+    };
+    let plain = client.chat_completion(&request(0)).await.unwrap();
+    let short = plain.usage.completion_tokens.unwrap_or(0);
+    assert!(short < 20, "the control must end early, got {short} tokens");
+    let held = client.chat_completion(&request(20)).await.unwrap();
+    let tokens = held.usage.completion_tokens.unwrap_or(0);
+    assert!(tokens >= 20, "min_tokens=20, got {tokens} tokens");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -595,25 +632,34 @@ async fn test_chat_allowed_token_ids_constrains_output() {
 async fn test_chat_bad_words() {
     let (_server, client) = start_smollm().await;
 
-    // Ask the model to say "hello" but ban the word "hello".
-    let request = ChatCompletionRequest {
+    // Ask the model to say "hello" but ban "hello" and "Hello". Without the ban it answers "Hello.".
+    // vLLM's ban is case-sensitive (each word, and each after a space), so the check is too.
+    let request = |bad_words: Option<Vec<String>>| ChatCompletionRequest {
         messages: vec![user_msg("Say the word hello")],
         max_tokens: Some(30),
         temperature: Some(0.0),
-        bad_words: Some(vec!["hello".to_string()]),
+        bad_words,
         ..default_chat_request()
     };
+    let text = |resp: &ChatCompletionResponse| {
+        (resp.choices[0].message.content.clone()).unwrap_or_default()
+    };
 
-    let resp = client.chat_completion(&request).await.unwrap();
-    let text = resp.choices[0]
-        .message
-        .content
-        .as_deref()
-        .unwrap_or("")
-        .to_lowercase();
+    let plain = client.chat_completion(&request(None)).await.unwrap();
     assert!(
-        !text.contains("hello"),
-        "output should not contain banned word 'hello', got: {text}"
+        text(&plain).contains("Hello"),
+        "the control says it: {:?}",
+        text(&plain)
+    );
+    let banned = vec!["hello".to_string(), "Hello".to_string()];
+    let resp = client
+        .chat_completion(&request(Some(banned)))
+        .await
+        .unwrap();
+    let text = text(&resp);
+    assert!(
+        !text.contains("hello") && !text.contains("Hello"),
+        "output should not contain a banned word, got: {text}"
     );
 }
 

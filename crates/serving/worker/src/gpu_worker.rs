@@ -133,27 +133,28 @@ pub type SeqMmInfo = (u32, u32, u32, u32, u32);
 // Model enum (dispatches to LLaMA / Qwen2 / Gemma2)
 // ---------------------------------------------------------------------------
 
-/// Host-gathered grammar allow-masks for one decode step: a dense vocab
-/// bitset per constrained request (`allow_bits`, row-major,
-/// `words_per_row` u32 per row, bit set = token allowed) plus the logits
-/// batch row each bitset masks (`rows`). Built in `execute_model` where
-/// the req_id -> batch-row mapping is known, then uploaded + dispatched
-/// before argmax in `forward_argmax_blocking`.
-#[cfg(all(feature = "metal", feature = "guided-decoding"))]
-struct GrammarMaskHost {
+/// Host-gathered token allow-masks for one decode step: a dense vocab
+/// bitset per request whose next token is restricted, by a grammar or by
+/// its sampling params (`allow_bits`, row-major, `words_per_row` u32 per
+/// row, bit set = token allowed), plus the logits batch row each bitset
+/// masks (`rows`). Built in `execute_model` where the req_id -> batch-row
+/// mapping is known, then uploaded + dispatched before argmax in
+/// `forward_argmax_blocking`.
+#[cfg(feature = "metal")]
+struct TokenMaskHost {
     rows: Vec<u32>,
     allow_bits: Vec<u32>,
 }
 
-/// GPU-resident form of [`GrammarMaskHost`]: the uploaded bitset / row
+/// GPU-resident form of [`TokenMaskHost`]: the uploaded bitset / row
 /// buffers + the MTL4
 /// argument table, captured by the forward followup closure to dispatch
-/// the grammar mask just before argmax. `kernels_addr` is a raw pointer
+/// the token mask just before argmax. `kernels_addr` is a raw pointer
 /// to the worker's `GrammarMaskKernels` (same `'static` trick the argmax
 /// path uses for `argmax_kernels`); valid for the synchronous duration of
 /// the forward call.
-#[cfg(all(feature = "metal", feature = "guided-decoding"))]
-struct GrammarMaskGpu {
+#[cfg(feature = "metal")]
+struct TokenMaskGpu {
     allow_bits: scratchy_target_metal::grammar_mask::Buffer,
     rows: scratchy_target_metal::grammar_mask::Buffer,
     arg_table: ::objc2::rc::Retained<
@@ -370,25 +371,21 @@ pub struct MetalWorker {
     /// `tokenizer.json` the first time a grammar request appears.
     #[cfg(feature = "guided-decoding")]
     grammar_factory: Option<std::sync::Arc<scratchy_serving_engine::grammar::LlgParserFactory>>,
-    /// The tokens the engine stops a request on, which every grammar ends on
-    /// (`Worker::set_stop_token_ids`).
-    #[cfg(feature = "guided-decoding")]
+    /// The tokens the engine stops a request on (`Worker::set_stop_token_ids`):
+    /// every grammar ends on them, and a request may not sample them before
+    /// its `min_tokens`.
     stop_token_ids: Vec<u32>,
-    /// Compiled grammar-mask kernel (forces disallowed logits to -inf
+    /// Compiled token-mask kernel (forces disallowed logits to -inf
     /// before argmax). Built alongside `argmax_kernels` at load_model.
-    #[cfg(feature = "guided-decoding")]
-    grammar_mask_kernels: Option<scratchy_target_metal::grammar_mask::GrammarMaskKernels>,
-    /// This step's gathered grammar allow-masks (host-side), built in
+    token_mask_kernels: Option<scratchy_target_metal::grammar_mask::GrammarMaskKernels>,
+    /// This step's gathered token allow-masks (host-side), built in
     /// `execute_model` and consumed (`.take()`) in
     /// `forward_argmax_blocking` to dispatch the mask before argmax.
-    #[cfg(feature = "guided-decoding")]
-    grammar_pending: Option<GrammarMaskHost>,
-    /// The grammar mask's allow-bitsets and row map, reused across
+    token_mask_pending: Option<TokenMaskHost>,
+    /// The token mask's allow-bitsets and row map, reused across
     /// decode steps (memcpy per step) and grown only when a batch needs more.
-    #[cfg(feature = "guided-decoding")]
-    grammar_buf_allow: Option<scratchy_target_metal::residency::Pinned>,
-    #[cfg(feature = "guided-decoding")]
-    grammar_buf_rows: Option<scratchy_target_metal::residency::Pinned>,
+    token_mask_buf_allow: Option<scratchy_target_metal::residency::Pinned>,
+    token_mask_buf_rows: Option<scratchy_target_metal::residency::Pinned>,
     /// Phase 6 chain-advance kernel. One small kernel that bumps
     /// per-req `runtime.positions` / `slot_mapping` / `seqused_k` in
     /// place between K-step chain iters. Cached at load_model so the
@@ -1103,16 +1100,11 @@ impl MetalWorker {
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
             grammar_factory: None,
-            #[cfg(feature = "guided-decoding")]
             stop_token_ids: Vec::new(),
-            #[cfg(feature = "guided-decoding")]
-            grammar_mask_kernels: None,
-            #[cfg(feature = "guided-decoding")]
-            grammar_pending: None,
-            #[cfg(feature = "guided-decoding")]
-            grammar_buf_allow: None,
-            #[cfg(feature = "guided-decoding")]
-            grammar_buf_rows: None,
+            token_mask_kernels: None,
+            token_mask_pending: None,
+            token_mask_buf_allow: None,
+            token_mask_buf_rows: None,
             chain_advance_kernel: None,
             draft_chain_advance_kernel: None,
             mtp_chain_kernel: None,
@@ -2096,10 +2088,8 @@ impl MetalWorker {
                         None => self.draft_model.is_none(),
                     }
                     && sched.num_scheduled_tokens.keys().all(|req_id| {
-                        !self
-                            .sampling_params_map
-                            .get(req_id)
-                            .is_some_and(SamplingParams::reads_history)
+                        !(self.sampling_params_map.get(req_id))
+                            .is_some_and(|p| p.reads_history() || p.restricts_tokens())
                             && !self.mm_data_buffers.contains_key(req_id)
                             && !constrained(req_id)
                     }))
@@ -4052,25 +4042,23 @@ impl MetalWorker {
         let argmax_kernels_ptr: *const scratchy_target_metal::argmax::ArgmaxKernels =
             argmax_kernels;
         let argmax_kernels_addr = argmax_kernels_ptr as usize;
-        // Stage this step's grammar mask (constrained / guided decoding) into
+        // Stage this step's token mask (a grammar's, or sampling params') into
         // its pinned buffers. The closure binds these by gpuAddress and runs
         // the mask on the forward encoder before argmax.
-        #[cfg(feature = "guided-decoding")]
-        let grammar_pending = self.grammar_pending.take();
-        #[cfg(feature = "guided-decoding")]
-        let grammar_mask_ctx: Option<GrammarMaskGpu> = if let (Some(h), Some(kernels)) =
-            (grammar_pending, self.grammar_mask_kernels.as_ref())
+        let token_mask_pending = self.token_mask_pending.take();
+        let token_mask_ctx: Option<TokenMaskGpu> = if let (Some(h), Some(kernels)) =
+            (token_mask_pending, self.token_mask_kernels.as_ref())
         {
             use ::objc2_metal::{MTLBuffer, MTLDevice};
             let kernels_addr =
                 kernels as *const scratchy_target_metal::grammar_mask::GrammarMaskKernels as usize;
             let grew = reserve_pinned(
-                &mut self.grammar_buf_allow,
+                &mut self.token_mask_buf_allow,
                 &mtl_device,
                 &residency,
                 h.allow_bits.len().max(1) * 4,
             ) | reserve_pinned(
-                &mut self.grammar_buf_rows,
+                &mut self.token_mask_buf_rows,
                 &mtl_device,
                 &residency,
                 h.rows.len().max(1) * 4,
@@ -4078,8 +4066,8 @@ impl MetalWorker {
             if grew {
                 residency.commit();
             }
-            let allow = self.grammar_buf_allow.as_ref().unwrap();
-            let rows = self.grammar_buf_rows.as_ref().unwrap();
+            let allow = self.token_mask_buf_allow.as_ref().unwrap();
+            let rows = self.token_mask_buf_rows.as_ref().unwrap();
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     h.allow_bits.as_ptr(),
@@ -4100,7 +4088,7 @@ impl MetalWorker {
                     .newArgumentTableWithDescriptor_error(&desc)
                     .expect("grammar_mask arg_table alloc returned nil")
             };
-            Some(GrammarMaskGpu {
+            Some(TokenMaskGpu {
                 allow_bits: (**allow).clone(),
                 rows: (**rows).clone(),
                 arg_table,
@@ -4166,12 +4154,12 @@ impl MetalWorker {
                 }
                 // ── Grammar mask (constrained / guided decoding) ─────────
                 // Runs on THIS encoder before argmax: forces every token
-                // disallowed by a request's grammar FSM to -inf so the greedy
-                // argmax can only pick a grammar-valid token. The mask emits
+                // disallowed by a request's grammar FSM or sampling params to
+                // -inf so the greedy argmax (and the sampler after it) can only
+                // pick an allowed token. The mask emits
                 // its own pre-barrier (forward-write -> mask-read); argmax's
                 // pre-barrier then orders mask-write -> argmax-read.
-                #[cfg(feature = "guided-decoding")]
-                if let Some(ref gm) = grammar_mask_ctx {
+                if let Some(ref gm) = token_mask_ctx {
                     // Mask the FULL logits width. The shader treats any slot
                     // beyond the bitset (the lm_head's vocab padding past the
                     // tokenizer vocab) as disallowed, so padded tokens can never
@@ -5267,7 +5255,7 @@ fn sampled(
 /// Grow `slot` to a pinned, zeroed buffer of at least `bytes`, replacing (and
 /// so unpinning) a smaller one. Returns whether it allocated, i.e. whether
 /// `residency` needs a commit before the next command buffer.
-#[cfg(all(feature = "metal", feature = "guided-decoding"))]
+#[cfg(feature = "metal")]
 fn reserve_pinned(
     slot: &mut Option<scratchy_target_metal::residency::Pinned>,
     device: &scratchy_target_metal::mtl4_dispatch::Device,
@@ -5285,17 +5273,14 @@ fn reserve_pinned(
 
 #[cfg(feature = "metal")]
 impl Worker for MetalWorker {
-    /// Kept for the grammar factory, which is built the first time a grammar request appears; one
-    /// built before is dropped, to be built again ending on these. A build without
-    /// `guided-decoding` samples no grammar.
+    /// Kept for `min_tokens`, and for the grammar factory, which is built the first time a grammar
+    /// request appears; one built before is dropped, to be built again ending on these.
     fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+        self.stop_token_ids = stop_token_ids.to_vec();
         #[cfg(feature = "guided-decoding")]
         {
-            self.stop_token_ids = stop_token_ids.to_vec();
             self.grammar_factory = None;
         }
-        #[cfg(not(feature = "guided-decoding"))]
-        let _ = stop_token_ids;
     }
 
     fn init_device(&mut self) -> ExecutorResult<()> {
@@ -5682,10 +5667,9 @@ impl Worker for MetalWorker {
         // first masked decode step never pays pipeline-compile latency.
         // The parser factory (llguidance, from tokenizer.json) is built
         // lazily on the first grammar request — see `ensure_grammar_factory`.
-        #[cfg(feature = "guided-decoding")]
         {
             let t_gm = std::time::Instant::now();
-            let grammar_mask = scratchy_target_metal::grammar_mask::GrammarMaskKernels::new(
+            let token_mask = scratchy_target_metal::grammar_mask::GrammarMaskKernels::new(
                 &gpu_device.device,
                 &off_tape.grammar_mask,
             )
@@ -5696,7 +5680,7 @@ impl Worker for MetalWorker {
                 "ScratchyWorker(metal): GrammarMaskKernels::new in {:?}",
                 t_gm.elapsed()
             );
-            self.grammar_mask_kernels = Some(grammar_mask);
+            self.token_mask_kernels = Some(token_mask);
         }
         self.select_rows_kernel =
             scratchy_target_metal::select_rows::SelectRowsKernel::new(&gpu_device.device, off_tape)
@@ -7014,52 +6998,61 @@ impl Worker for MetalWorker {
         let req_ids_in_order: Vec<String> = attn.req_ids.clone();
         let q_lens: Vec<usize> = attn.q_lens.clone();
 
-        // ── Constrained / guided decoding: gather this step's grammar
-        // allow-masks ───────────────────────────────────────────────────
-        // For every request with an active grammar FSM that will sample a
-        // real token this step, build a dense vocab bitset of its allowed
+        // ── Token masks: a grammar's, and the sampling params' ──────────────
+        // For every request that will sample a real token this step under an
+        // active grammar FSM, or under sampling params that restrict its next
+        // token (`SamplingParams::next_tokens`: `allowed_token_ids`,
+        // `bad_words`, `min_tokens`), build a dense vocab bitset of its allowed
         // tokens and record the logits row to mask (`sampled_rows.last_of(i)`).
         // The mask is dispatched before argmax in `forward_argmax_blocking`
-        // (it `.take()`s `grammar_pending`), and the FSM is advanced with the
-        // sampled token after readback. Skipped (no overhead) when no request
-        // is constrained. Speculative-verify rows are excluded: grammar needs
-        // a host `advance()` between every token, which the K-row verify can't
-        // provide, so a grammar request must not also carry spec drafts.
-        #[cfg(feature = "guided-decoding")]
-        {
-            self.grammar_pending = None;
-            if !self.grammar_states.is_empty() {
-                let vocab = self.model.as_deref().map(|m| m.vocab_size()).unwrap_or(0) as u32;
-                if vocab > 0 {
-                    let mut rows: Vec<u32> = Vec::new();
-                    let mut allow_bits: Vec<u32> = Vec::new();
-                    for (i, req_id) in req_ids_in_order.iter().enumerate() {
-                        // Still-prefilling chunk → no token sampled this step.
-                        if !prepared.req_inputs[i].emits_token {
-                            continue;
-                        }
-                        // Speculative verify batch → unsupported with grammar.
-                        if !prepared.req_inputs[i].spec_token_ids.is_empty() {
-                            continue;
-                        }
-                        let Some(guide) = self.grammar_states.get_mut(req_id) else {
-                            continue;
-                        };
-                        // `None` => grammar terminated; leave the row unmasked.
-                        let Some(allowed) = guide.allowed_tokens() else {
-                            continue;
-                        };
-                        rows.push(sampled_rows.last_of(i) as u32);
-                        scratchy_target_metal::grammar_mask::push_allow_bitset_row(
-                            &mut allow_bits,
-                            &allowed,
-                            vocab,
-                        );
-                    }
-                    if !rows.is_empty() {
-                        self.grammar_pending = Some(GrammarMaskHost { rows, allow_bits });
-                    }
+        // (it `.take()`s `token_mask_pending`), and a grammar's FSM is advanced
+        // with the sampled token after readback. Skipped (no overhead) when no
+        // request is restricted. Speculative-verify rows are excluded: both need
+        // the host between every token, which the K-row verify can't provide, so
+        // neither kind of request carries spec drafts.
+        self.token_mask_pending = None;
+        let vocab = self.model.as_deref().map(|m| m.vocab_size()).unwrap_or(0) as u32;
+        if vocab > 0 {
+            let mut rows: Vec<u32> = Vec::new();
+            let mut allow_bits: Vec<u32> = Vec::new();
+            for (i, req_id) in req_ids_in_order.iter().enumerate() {
+                // Still prefilling → no token sampled this step; verifying drafts → unmasked.
+                let input = &prepared.req_inputs[i];
+                if !input.emits_token || !input.spec_token_ids.is_empty() {
+                    continue;
                 }
+                // `None`: no grammar, or one that has terminated.
+                #[cfg(feature = "guided-decoding")]
+                let grammar =
+                    (self.grammar_states.get_mut(req_id)).and_then(|g| g.allowed_tokens());
+                #[cfg(not(feature = "guided-decoding"))]
+                let grammar: Option<Vec<u32>> = None;
+                let next = (self.sampling_params_map.get(req_id))
+                    .map(|p| {
+                        p.next_tokens(self.input_batch.history(req_id).1, &self.stop_token_ids)
+                    })
+                    .unwrap_or_default();
+                let allowed: Option<std::borrow::Cow<'_, [u32]>> = match (grammar, next.only) {
+                    (Some(grammar), Some(only)) => {
+                        let only: std::collections::HashSet<&u32> = only.iter().collect();
+                        Some(grammar.into_iter().filter(|t| only.contains(t)).collect())
+                    }
+                    (Some(grammar), None) => Some(grammar.into()),
+                    (None, only) => only.map(std::borrow::Cow::Borrowed),
+                };
+                if allowed.is_none() && next.banned.is_empty() {
+                    continue;
+                }
+                rows.push(sampled_rows.last_of(i) as u32);
+                scratchy_target_metal::grammar_mask::push_allow_row(
+                    &mut allow_bits,
+                    allowed.as_deref(),
+                    &next.banned,
+                    vocab,
+                );
+            }
+            if !rows.is_empty() {
+                self.token_mask_pending = Some(TokenMaskHost { rows, allow_bits });
             }
         }
 
@@ -8108,12 +8101,12 @@ impl Worker for MetalWorker {
         self.argmax_kernels = None;
         self.draft_vocab_suffix = None;
         self.argmax_slots.clear();
+        self.token_mask_kernels = None;
+        self.token_mask_pending = None;
+        self.token_mask_buf_allow = None;
+        self.token_mask_buf_rows = None;
         #[cfg(feature = "guided-decoding")]
         {
-            self.grammar_mask_kernels = None;
-            self.grammar_pending = None;
-            self.grammar_buf_allow = None;
-            self.grammar_buf_rows = None;
             self.grammar_states.clear();
             self.grammar_factory = None;
         }

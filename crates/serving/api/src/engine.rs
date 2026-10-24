@@ -3640,7 +3640,9 @@ impl AsyncEngine {
         })
     }
 
-    /// Tokenize bad_words strings into token ID sequences.
+    /// Tokenize bad_words strings into token ID sequences, as vLLM does: each word as it starts a
+    /// text, and again after a space, to ban it mid-text, when the space makes a token sequence of
+    /// the same length that starts differently.
     fn tokenize_bad_words(
         &self,
         bad_words: &Option<Vec<String>>,
@@ -3654,11 +3656,18 @@ impl AsyncEngine {
         let Some(ref tokenizer) = self.tokenizer else {
             return Ok(None);
         };
-        let mut result = Vec::with_capacity(words.len());
+        let mut result = Vec::with_capacity(2 * words.len());
         for word in words {
-            let ids = tokenizer.encode(word, false)?;
-            if !ids.is_empty() {
-                result.push(ids);
+            let word = word.trim_start();
+            let bare = tokenizer.encode(word, false)?;
+            let Some(&first) = bare.first() else {
+                continue;
+            };
+            let spaced = tokenizer.encode(&format!(" {word}"), false)?;
+            let mid_text = spaced.len() == bare.len() && spaced.first() != Some(&first);
+            result.push(bare);
+            if mid_text {
+                result.push(spaced);
             }
         }
         if result.is_empty() {
@@ -4409,6 +4418,47 @@ mod tests {
         let client = Box::new(InprocClient::new(make_engine_config(), executor));
         let tok = Arc::new(make_test_tokenizer());
         AsyncEngine::with_tokenizer(client, "test-model".to_string(), 4096, tok)
+    }
+
+    /// A bad word is banned as it starts a text and, as vLLM bans it, mid-text: after a space,
+    /// when the space makes a sequence as long that starts differently (`" hi"` one token, as
+    /// `"hi"` is). A space that adds a token of its own adds no second sequence.
+    #[test]
+    fn a_bad_word_is_banned_at_the_start_and_mid_text() {
+        use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+        let mut alphabet: Vec<char> = ByteLevel::alphabet().into_iter().collect();
+        alphabet.sort();
+        let mut vocab: serde_json::Map<String, serde_json::Value> = (alphabet.iter())
+            .enumerate()
+            .map(|(i, c)| (c.to_string(), serde_json::json!(i)))
+            .collect();
+        for (i, token) in ["hi", "Ġh", "Ġhi"].into_iter().enumerate() {
+            vocab.insert(token.to_string(), serde_json::json!(256 + i));
+        }
+        let json = serde_json::json!({
+            "version": "1.0",
+            "model": {"type": "BPE", "vocab": vocab, "merges": ["Ġ h", "Ġh i", "h i"]},
+            "pre_tokenizer": {
+                "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true,
+                "use_regex": true
+            },
+        });
+        let tok = crate::tokenizer::Tokenizer::from_hf_tokenizer(json.to_string().parse().unwrap());
+        let client = Box::new(InprocClient::new(
+            make_engine_config(),
+            Box::new(NoopExecutor::new(1024)),
+        ));
+        let engine = AsyncEngine::with_tokenizer(client, "m".to_string(), 4096, Arc::new(tok));
+        let words = |w: &[&str]| Some(w.iter().map(|w| w.to_string()).collect());
+
+        let hi = engine.tokenize_bad_words(&words(&["hi"])).unwrap().unwrap();
+        assert_eq!(hi, vec![vec![256], vec![258]], "\"hi\" and \" hi\"");
+        let lo = engine
+            .tokenize_bad_words(&words(&["  lo"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(lo.len(), 1, "\" lo\" is one token longer: {lo:?}");
+        assert_eq!(engine.tokenize_bad_words(&words(&[""])).unwrap(), None);
     }
 
     fn make_chat_request() -> protocol::ChatCompletionRequest {

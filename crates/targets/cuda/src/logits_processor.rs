@@ -14,7 +14,7 @@ use crate::device::GpuDevice;
 use crate::driver;
 use crate::tensor::GpuTensor;
 
-use scratchy_core_common::sampling::SamplingParams;
+use scratchy_core_common::sampling::{SamplingParams, bad_word_completion};
 
 // ---------------------------------------------------------------------------
 // BatchUpdate — notification of batch composition changes
@@ -730,27 +730,6 @@ impl BadWordsProcessor {
     }
 }
 
-/// Check if `output_tokens` ends with the prefix of `bad_word` (all but the last token).
-/// If so, return the completing token (the last token of the bad word).
-fn bad_word_suffix_match(output_tokens: &[u32], bad_word: &[u32]) -> Option<u32> {
-    if bad_word.is_empty() {
-        return None;
-    }
-    // Single-token bad word: always suppress it.
-    if bad_word.len() == 1 {
-        return Some(bad_word[0]);
-    }
-    // Multi-token: check if output ends with bad_word[..len-1].
-    let prefix = &bad_word[..bad_word.len() - 1];
-    if output_tokens.len() >= prefix.len()
-        && output_tokens[output_tokens.len() - prefix.len()..] == *prefix
-    {
-        Some(bad_word[bad_word.len() - 1])
-    } else {
-        None
-    }
-}
-
 impl LogitsProcessor for BadWordsProcessor {
     fn update_state(
         &mut self,
@@ -773,7 +752,7 @@ impl LogitsProcessor for BadWordsProcessor {
                     .map(|b| b.as_slice())
                     .unwrap_or(&[]);
                 for bad_word in bad_words {
-                    if let Some(suppress_token) = bad_word_suffix_match(output_tokens, bad_word) {
+                    if let Some(suppress_token) = bad_word_completion(output_tokens, bad_word) {
                         req_indices.push(req_idx as i32);
                         token_ids.push(suppress_token as i32);
                     }
@@ -1085,35 +1064,6 @@ mod tests {
             Box::new(MinTokensProcessor::new()),
         ]);
         assert!(!pipeline.any_active());
-    }
-
-    #[test]
-    fn test_bad_word_suffix_match_single_token() {
-        // Single-token bad word: always suppress.
-        assert_eq!(bad_word_suffix_match(&[], &[42]), Some(42));
-        assert_eq!(bad_word_suffix_match(&[1, 2, 3], &[42]), Some(42));
-    }
-
-    #[test]
-    fn test_bad_word_suffix_match_multi_token() {
-        // "bad word" = [10, 20, 30]. Prefix = [10, 20].
-        // Output ends with [10, 20] → suppress 30.
-        assert_eq!(bad_word_suffix_match(&[5, 10, 20], &[10, 20, 30]), Some(30));
-        // Output does NOT end with [10, 20] → no suppression.
-        assert_eq!(bad_word_suffix_match(&[5, 10, 21], &[10, 20, 30]), None);
-        // Output too short for prefix.
-        assert_eq!(bad_word_suffix_match(&[20], &[10, 20, 30]), None);
-    }
-
-    #[test]
-    fn test_bad_word_suffix_match_empty() {
-        assert_eq!(bad_word_suffix_match(&[1, 2], &[]), None);
-    }
-
-    #[test]
-    fn test_bad_word_suffix_match_exact_prefix() {
-        // Output exactly equals the prefix.
-        assert_eq!(bad_word_suffix_match(&[10, 20], &[10, 20, 30]), Some(30));
     }
 
     #[test]
