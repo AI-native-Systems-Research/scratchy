@@ -1617,8 +1617,8 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
         let message = anthropic_error(&error);
         assert!(
-            message.contains("at least one message is required"),
-            "{error}"
+            message.contains(" messages: at least one message is required"),
+            "Anthropic's text, its path once: {error}"
         );
 
         let undeclared = r#"{"max_tokens": 8, "messages": [{"role": "user", "content": "Hi"}],

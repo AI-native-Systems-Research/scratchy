@@ -327,8 +327,10 @@ async fn test_anthropic_empty_messages() {
         .await
         .unwrap();
 
-    // Empty messages should fail at the engine level
-    assert!(!resp.status().is_success());
+    // Anthropic's 400, before the engine sees the request.
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let error: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error", "{error}");
 }
 
 // ===========================================================================

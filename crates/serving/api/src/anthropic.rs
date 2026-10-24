@@ -108,7 +108,7 @@ pub struct AnthropicMessage {
 }
 
 /// A request's messages: at least one, as the Messages API requires. An empty list is its 400,
-/// `messages: at least one message is required`.
+/// `messages: at least one message is required` (the field's path is serde's).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "Vec<AnthropicMessage>")]
 pub struct Messages(Vec<AnthropicMessage>);
@@ -117,7 +117,7 @@ impl TryFrom<Vec<AnthropicMessage>> for Messages {
     type Error = &'static str;
     fn try_from(messages: Vec<AnthropicMessage>) -> Result<Self, Self::Error> {
         if messages.is_empty() {
-            return Err("messages: at least one message is required");
+            return Err("at least one message is required");
         }
         Ok(Self(messages))
     }
