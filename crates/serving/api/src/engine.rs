@@ -2184,8 +2184,11 @@ impl AsyncEngine {
             // calls neither — without a port of the print here the flag is silently dead on
             // `scr serve` (#394). `exec_wait` pairs with the step finalized NEXT iteration (it is
             // the recv round trip that produced that result, resolve included); `sched_next` is
-            // the schedule wall time measured after that finalize. Decode-only steps print too
-            // when they carry more than one row — tokens==reqs distinguishes them from prefill.
+            // the schedule wall of the iteration that waited for this step: after the previous
+            // finalize, before this step's recv (≈0 when nothing was scheduled then: a speculative
+            // step in flight, or two steps already). Decode-only steps print too when they carry
+            // more than one row — tokens==reqs distinguishes them from prefill, except under
+            // speculative decoding, where a verify step's drafts count as scheduled tokens.
             let ttft_phase = std::env::var_os("SCRATCHY_TTFT_PHASE").is_some();
             let mut last_exec_wait = Duration::ZERO;
             let mut last_sched_wall = Duration::ZERO;
