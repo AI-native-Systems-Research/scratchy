@@ -1475,7 +1475,7 @@ impl MetalWorker {
         let buckets = |m: Model<'_>| -> ExecutorResult<Vec<u32>> {
             let rungs = scratchy_target_metal::interpreter::metal::MetalRungs::of(m.metal_rungs())
                 .map_err(|e| ExecutorError::WorkerInit(format!("bucket costs: {e}")))?;
-            Ok(rungs.buckets.iter().map(|spec| spec.bucket_m).collect())
+            Ok(rungs.bucket_ms())
         };
         let rows = dev.max_decode_rows;
         let draft = self.draft_model.as_deref();

@@ -45,8 +45,8 @@ pub use forward::{
     build_mrope_cos_sin_override,
 };
 pub use pool::{
-    MetalBucketSpec, MetalRungs, MetalWorkerPool, Onto, PickedRung, PoolBuildError, PooledWorker,
-    RuntimeFactory, TqGroup, WorkerGuard, host_guest, pick_rung,
+    FoldBand, MetalBucketSpec, MetalRungs, MetalWorkerPool, Onto, PickedRung, PoolBuildError,
+    PooledWorker, RuntimeFactory, TqGroup, WorkerGuard, host_guest, pick_rung,
 };
 pub use runtime::RuntimeBindings;
 pub use worker::{

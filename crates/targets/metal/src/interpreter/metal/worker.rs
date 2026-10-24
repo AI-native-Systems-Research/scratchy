@@ -2724,6 +2724,7 @@ mod tests {
     fn buckets(slots: u32, hidden: &[u32]) -> Vec<super::super::pool::MetalBucketSpec> {
         let bucket = |&backbone_slot: &u32| super::super::pool::MetalBucketSpec {
             bucket_m: 1,
+            band: super::super::pool::FoldBand::Narrow,
             num_arena_slots: slots,
             terminal_slot: 0,
             backbone_slot,

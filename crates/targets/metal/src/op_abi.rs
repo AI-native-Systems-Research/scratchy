@@ -31,7 +31,7 @@ use crate::tape::lowered::{RuntimeGate, WeightTensor};
 use crate::tape::step::MoeRegion;
 use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, OutputAlias};
 use scratchy_subtile::tape_folding::{
-    CountedOperands, FoldPattern, FusionTable, GatedKernel, NormReader, RowFold,
+    CountedOperands, FoldPattern, FusionTable, GatedKernel, NormReader, RoutedBands, RowFold,
 };
 use scratchy_subtile::tape_steps::OperandIx;
 
@@ -355,7 +355,8 @@ pub const METAL_SORTED_PAIRS_PER_EXPERT: std::ops::Range<f32> = 0.5..1.0;
 
 /// The bucket rows from which a gathered bake's gate/up command runs the pairs that share an
 /// expert in the expert's first pair (`SharedExperts::InFirstPair`, up to [`METAL_VERIFY_ROWS`]):
-/// one row's picks are distinct experts.
+/// one row's picks are distinct experts. A bake whose gate/up command routes its tokens
+/// (`MetalFusion::MoeRouted`) runs its pairs apart whatever its rows.
 pub const METAL_SHARED_EXPERTS_FROM: u32 = 2;
 
 /// The baked (row, pick) pairs at and above which even a verify-sized gathered bake runs its
@@ -426,8 +427,8 @@ pub enum MetalFusion {
     QmvEpilogue,
     /// A one-row router's logits that normalize its input as they load it.
     NormedRouter,
-    /// A one-row MoE block's gated expert command that routes its token itself, from the logits,
-    /// and stores the picks and scores the later ones read.
+    /// A gathered MoE block's gated expert command, up to verify-sized rows, that routes each of
+    /// its tokens itself, from the logits, and stores the picks and scores the later commands read.
     MoeRouted,
     /// `residual + rmsnorm(delta)`.
     NormAdd,
@@ -447,198 +448,263 @@ const ROPED_ATTENTION_WRITERS: &[MetalFusion] = &[MetalFusion::RopeAppend, Metal
 
 /// Metal's fusions, in the order the shared fold pass applies them. An attention reads its new K/V
 /// (operands 1..) out of the cache its rope wrote, so only its query is a consumer edge.
-pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
-    use MetalFusion as F;
-    use SubOpKind as K;
-    FusionTable {
-        counted: &[CountedOperands {
-            kind: K::AttnDecode,
-            before: OperandIx(1),
-        }],
-        sweeps: &[
-            &[
-                FoldPattern::Sibling {
-                    driver: K::RopeAppend,
-                    sibling: K::RopeRotate,
-                    kernel: F::RopeAppend,
-                },
-                FoldPattern::CentredNorm {
-                    norm: K::RmsNorm,
-                    sub: K::Sub,
-                    mean: K::Mean,
-                    bias: K::BiasAdd,
-                    kernel: F::MeanSubRmsNorm,
-                    biased: F::MeanSubRmsNormBiasAdd,
-                },
-                FoldPattern::MatvecEpilogue {
-                    anchor: K::MatmulTile,
-                    weights: Some(GemmWeightKind::Affine),
-                    bias: Some(K::BiasAdd),
-                    scale: Some(K::ScalarMul),
-                    gate_scale: None,
-                    add: K::Add,
-                    gated: &[K::Silu, K::Gelu, K::Mul],
-                    kernel: F::QmvEpilogue,
-                },
-                // A MoE block's input norm too: its router's logits, its shared expert's matvecs
-                // and its gathered experts each normalize the rows as they load them.
-                FoldPattern::NormedMatvecs {
-                    norm: K::RmsNorm,
-                    readers: &[
-                        NormReader::Matvec {
-                            kind: K::MatmulTile,
-                            weights: Some(GemmWeightKind::Affine),
-                        },
-                        NormReader::Matvec {
-                            kind: K::RouterLogits,
-                            weights: None,
-                        },
-                        NormReader::Gathered {
-                            sort: K::ExpertSort,
-                            gathered_below: METAL_SORTED_PAIRS,
-                        },
-                    ],
-                    kernel: F::NormedQmv,
-                },
-                FoldPattern::NormedMatvecs {
-                    norm: K::RouterNorm,
-                    readers: &[NormReader::Matvec {
-                        kind: K::RouterLogits,
-                        weights: None,
-                    }],
-                    kernel: F::NormedRouter,
-                },
-                FoldPattern::Gated {
-                    mul: K::Mul,
-                    activations: &[
-                        GatedKernel {
-                            activation: K::Silu,
-                            split: F::SiluMul,
-                            fused: F::FusedGateUpSiluMul,
-                        },
-                        GatedKernel {
-                            activation: K::Gelu,
-                            split: F::GeluMul,
-                            fused: F::FusedGateUpGeluMul,
-                        },
-                    ],
-                },
-            ],
-            // After the row programs: what they left of the residual adds and their norms.
-            &[
-                FoldPattern::ResidualNorm {
-                    norm: K::RmsNorm,
-                    add: K::Add,
-                    kernel: F::FusedAddRmsNorm,
-                },
-                FoldPattern::NormedRope {
-                    rope: K::RopeAppend,
-                    gain_norm: K::RmsNorm,
-                    unit_norm: K::RmsNormUnit,
-                    kernel: F::RopeAppendNormed,
-                },
-                FoldPattern::NormAddScale {
-                    scale: K::ScalarWeightMul,
-                    add: K::Add,
-                    norm: K::RmsNorm,
-                    kernel: F::NormAddScalarMul,
-                },
-                FoldPattern::ExpertActivation {
-                    act: K::ExpertGatedAct,
-                    matmul: K::ExpertMatmul,
-                    kernel: F::MoeGateUpAct,
-                },
-                FoldPattern::ExpertActivation {
-                    act: K::ExpertAct,
-                    matmul: K::ExpertMatmul,
-                    kernel: F::MoeUpAct,
-                },
-                FoldPattern::ExpertCombined {
-                    combine: K::ExpertCombine,
-                    unsort: K::ExpertUnsort,
-                    matmul: K::ExpertMatmul,
-                    kernel: F::MoeDownCombine,
-                },
-                // `moe_route.metal`'s program: a softmax over every expert first (Qwen) or the
-                // F32 sigmoid + correction bias GLM-4's noaux_tc routes by, then the scores
-                // scaled, softmaxed or renormalized, scaled per expert, and scaled last
-                // (Nemotron-H's routed scaling factor, after the renorm).
-                FoldPattern::Route {
-                    top_k: K::RouteTopK,
-                    sort: K::RouteArgsort,
-                    pre: &[K::RouteSoftmax, K::RouteSigmoidBias, K::RouteBias],
-                    gather: K::RouteGatherScores,
-                    tail: &[
-                        &[K::RouteScale],
-                        &[K::RouteSoftmax, K::RouteRenorm],
-                        &[K::RouteExpertScale],
-                        &[K::RouteScale],
-                    ],
-                    kernel: F::MoeRoute,
-                },
-            ],
-            // After the rope folds: it extends the writer command they made. A norm folds into the
-            // add it feeds only when no fold took either with more. After the expert and routing
-            // folds, the routing into the expert commands: under the grouped bake's pairs, they
-            // read each token's row by its picks.
-            &[
-                FoldPattern::Encoded {
-                    writer: K::RopeAppend,
-                    encode: K::KvEncode,
-                    kernel: F::KvEncoded,
-                },
-                FoldPattern::Encoded {
-                    writer: K::KvAppend,
-                    encode: K::KvEncode,
-                    kernel: F::KvEncoded,
-                },
-                FoldPattern::NormAdd {
-                    add: K::Add,
-                    norm: K::RmsNorm,
-                    kernel: F::NormAdd,
-                },
-                FoldPattern::RoutedExperts {
-                    top_k: K::RouteTopK,
-                    sort: K::ExpertSort,
-                    gathered_below: METAL_SORTED_PAIRS,
-                    shared_from: METAL_SHARED_EXPERTS_FROM,
-                    kernel: F::MoeRouted,
-                },
-                // `attention_via_cache_v2`'s `ATTN_FOLD`: the plain writer, encoding or not.
-                FoldPattern::RopedAttention {
-                    attention: K::AttnDecode,
-                    rope: K::RopeAppend,
-                    writers: ROPED_ATTENTION_WRITERS,
-                    kernel: F::RopedAttention,
-                },
-                FoldPattern::RopedAttention {
-                    attention: K::AttnPackedKv,
-                    rope: K::RopeAppend,
-                    writers: ROPED_ATTENTION_WRITERS,
-                    kernel: F::RopedAttention,
-                },
-                // After the expert folds: the combine's command is the down's and the unsort's.
-                FoldPattern::MatvecEpilogue {
-                    anchor: K::ExpertCombine,
-                    weights: None,
-                    bias: None,
-                    scale: None,
-                    gate_scale: Some(K::GateScale),
-                    add: K::Add,
-                    gated: &[],
-                    kernel: F::CombineEpilogue,
-                },
-            ],
+///
+/// Two tables share every pattern but one: the routed-experts fold's band. The wide band
+/// ([`METAL_FUSIONS`]) folds through the verify-sized rows on Max-scale M5 silicon, where the
+/// fold's per-threadgroup routing has the cores to hide behind (measured, M5 Max 40-core:
+/// −4.1% TPOT at conc-1 MTP-on). The narrow band ([`METAL_FUSIONS_NARROW`]) keeps the fold's
+/// one-row origin — main's decision at every bucket — because on 10-core silicon the
+/// per-threadgroup routing costs more than the dispatch it saves (measured, base M5:
+/// +4.7% verify ITL, PR #847's review); every chip but the wide class lowers under it, and
+/// an unmeasured chip joins the wide set only when benched.
+const SWEEP_ELEMENTWISE: &[FoldPattern<MetalFusion>] = &[
+    FoldPattern::Sibling {
+        driver: SubOpKind::RopeAppend,
+        sibling: SubOpKind::RopeRotate,
+        kernel: MetalFusion::RopeAppend,
+    },
+    FoldPattern::CentredNorm {
+        norm: SubOpKind::RmsNorm,
+        sub: SubOpKind::Sub,
+        mean: SubOpKind::Mean,
+        bias: SubOpKind::BiasAdd,
+        kernel: MetalFusion::MeanSubRmsNorm,
+        biased: MetalFusion::MeanSubRmsNormBiasAdd,
+    },
+    FoldPattern::MatvecEpilogue {
+        anchor: SubOpKind::MatmulTile,
+        weights: Some(GemmWeightKind::Affine),
+        bias: Some(SubOpKind::BiasAdd),
+        scale: Some(SubOpKind::ScalarMul),
+        gate_scale: None,
+        add: SubOpKind::Add,
+        gated: &[SubOpKind::Silu, SubOpKind::Gelu, SubOpKind::Mul],
+        kernel: MetalFusion::QmvEpilogue,
+    },
+    // A MoE block's input norm too: its router's logits, its shared expert's matvecs
+    // and its gathered experts each normalize the rows as they load them.
+    FoldPattern::NormedMatvecs {
+        norm: SubOpKind::RmsNorm,
+        readers: &[
+            NormReader::Matvec {
+                kind: SubOpKind::MatmulTile,
+                weights: Some(GemmWeightKind::Affine),
+            },
+            NormReader::Matvec {
+                kind: SubOpKind::RouterLogits,
+                weights: None,
+            },
+            NormReader::Gathered {
+                sort: SubOpKind::ExpertSort,
+                gathered_below: METAL_SORTED_PAIRS,
+            },
         ],
-        // `row_program.metal`'s limits: 16 instructions hold 8 steps with their loads and stores.
-        // After the matvecs took their ends.
-        rows: Some(RowFold {
-            after_sweep: 1,
-            kinds: &[K::RmsNorm, K::Add, K::ScalarWeightMul, K::ScalarMul],
-            steps: 8,
-            inputs: 4,
-            outputs: 3,
-            kernel: F::RowProgram,
-        }),
-    }
+        kernel: MetalFusion::NormedQmv,
+    },
+    FoldPattern::NormedMatvecs {
+        norm: SubOpKind::RouterNorm,
+        readers: &[NormReader::Matvec {
+            kind: SubOpKind::RouterLogits,
+            weights: None,
+        }],
+        kernel: MetalFusion::NormedRouter,
+    },
+    FoldPattern::Gated {
+        mul: SubOpKind::Mul,
+        activations: &[
+            GatedKernel {
+                activation: SubOpKind::Silu,
+                split: MetalFusion::SiluMul,
+                fused: MetalFusion::FusedGateUpSiluMul,
+            },
+            GatedKernel {
+                activation: SubOpKind::Gelu,
+                split: MetalFusion::GeluMul,
+                fused: MetalFusion::FusedGateUpGeluMul,
+            },
+        ],
+    },
+];
+
+const SWEEP_EXPERTS: &[FoldPattern<MetalFusion>] = &[
+    // After the row programs: what they left of the residual adds and their norms.
+    FoldPattern::ResidualNorm {
+        norm: SubOpKind::RmsNorm,
+        add: SubOpKind::Add,
+        kernel: MetalFusion::FusedAddRmsNorm,
+    },
+    FoldPattern::NormedRope {
+        rope: SubOpKind::RopeAppend,
+        gain_norm: SubOpKind::RmsNorm,
+        unit_norm: SubOpKind::RmsNormUnit,
+        kernel: MetalFusion::RopeAppendNormed,
+    },
+    FoldPattern::NormAddScale {
+        scale: SubOpKind::ScalarWeightMul,
+        add: SubOpKind::Add,
+        norm: SubOpKind::RmsNorm,
+        kernel: MetalFusion::NormAddScalarMul,
+    },
+    FoldPattern::ExpertActivation {
+        act: SubOpKind::ExpertGatedAct,
+        matmul: SubOpKind::ExpertMatmul,
+        kernel: MetalFusion::MoeGateUpAct,
+    },
+    FoldPattern::ExpertActivation {
+        act: SubOpKind::ExpertAct,
+        matmul: SubOpKind::ExpertMatmul,
+        kernel: MetalFusion::MoeUpAct,
+    },
+    FoldPattern::ExpertCombined {
+        combine: SubOpKind::ExpertCombine,
+        unsort: SubOpKind::ExpertUnsort,
+        matmul: SubOpKind::ExpertMatmul,
+        kernel: MetalFusion::MoeDownCombine,
+    },
+    // `moe_route.metal`'s program: a softmax over every expert first (Qwen) or the
+    // F32 sigmoid + correction bias GLM-4's noaux_tc routes by, then the scores
+    // scaled, softmaxed or renormalized, scaled per expert, and scaled last
+    // (Nemotron-H's routed scaling factor, after the renorm).
+    FoldPattern::Route {
+        top_k: SubOpKind::RouteTopK,
+        sort: SubOpKind::RouteArgsort,
+        pre: &[
+            SubOpKind::RouteSoftmax,
+            SubOpKind::RouteSigmoidBias,
+            SubOpKind::RouteBias,
+        ],
+        gather: SubOpKind::RouteGatherScores,
+        tail: &[
+            &[SubOpKind::RouteScale],
+            &[SubOpKind::RouteSoftmax, SubOpKind::RouteRenorm],
+            &[SubOpKind::RouteExpertScale],
+            &[SubOpKind::RouteScale],
+        ],
+        kernel: MetalFusion::MoeRoute,
+    },
+];
+
+// The sweep after the rope folds: it extends the writer command they made. A norm folds into the
+// add it feeds only when no fold took either with more. After the expert and routing
+// folds, the routing into the expert commands: under the grouped bake's pairs, they
+// read each token's row by its picks.
+const F_KV_ENCODED_ROPE: FoldPattern<MetalFusion> = FoldPattern::Encoded {
+    writer: SubOpKind::RopeAppend,
+    encode: SubOpKind::KvEncode,
+    kernel: MetalFusion::KvEncoded,
+};
+const F_KV_ENCODED_APPEND: FoldPattern<MetalFusion> = FoldPattern::Encoded {
+    writer: SubOpKind::KvAppend,
+    encode: SubOpKind::KvEncode,
+    kernel: MetalFusion::KvEncoded,
+};
+const F_NORM_ADD: FoldPattern<MetalFusion> = FoldPattern::NormAdd {
+    add: SubOpKind::Add,
+    norm: SubOpKind::RmsNorm,
+    kernel: MetalFusion::NormAdd,
+};
+const F_ROPED_DECODE: FoldPattern<MetalFusion> = FoldPattern::RopedAttention {
+    attention: SubOpKind::AttnDecode,
+    rope: SubOpKind::RopeAppend,
+    writers: ROPED_ATTENTION_WRITERS,
+    kernel: MetalFusion::RopedAttention,
+};
+const F_ROPED_PACKED: FoldPattern<MetalFusion> = FoldPattern::RopedAttention {
+    attention: SubOpKind::AttnPackedKv,
+    rope: SubOpKind::RopeAppend,
+    writers: ROPED_ATTENTION_WRITERS,
+    kernel: MetalFusion::RopedAttention,
+};
+// After the expert folds: the combine's command is the down's and the unsort's.
+const F_COMBINE_EPILOGUE: FoldPattern<MetalFusion> = FoldPattern::MatvecEpilogue {
+    anchor: SubOpKind::ExpertCombine,
+    weights: None,
+    bias: None,
+    scale: None,
+    gate_scale: Some(SubOpKind::GateScale),
+    add: SubOpKind::Add,
+    gated: &[],
+    kernel: MetalFusion::CombineEpilogue,
+};
+
+/// The wide band's routed-experts fold: through the verify-sized rows.
+const F_ROUTED_WIDE: FoldPattern<MetalFusion> = FoldPattern::RoutedExperts {
+    top_k: SubOpKind::RouteTopK,
+    sort: SubOpKind::ExpertSort,
+    bands: &RoutedBands {
+        rows_through: METAL_VERIFY_ROWS,
+        grouped_pairs: METAL_SORTED_PAIRS,
+        grouped_bundles: METAL_GROUPED_EXPERTS,
+        sorted_per_expert: METAL_SORTED_PAIRS_PER_EXPERT,
+        grouped_per_expert: METAL_GROUPED_PAIRS_PER_EXPERT,
+    },
+    kernel: MetalFusion::MoeRouted,
+};
+
+/// The narrow band's: the fold's one-row origin, main's decision at every bucket.
+const F_ROUTED_NARROW: FoldPattern<MetalFusion> = FoldPattern::RoutedExperts {
+    top_k: SubOpKind::RouteTopK,
+    sort: SubOpKind::ExpertSort,
+    bands: &RoutedBands {
+        rows_through: 1,
+        grouped_pairs: METAL_SORTED_PAIRS,
+        grouped_bundles: METAL_GROUPED_EXPERTS,
+        sorted_per_expert: METAL_SORTED_PAIRS_PER_EXPERT,
+        grouped_per_expert: METAL_GROUPED_PAIRS_PER_EXPERT,
+    },
+    kernel: MetalFusion::MoeRouted,
+};
+
+const SWEEP_AFTER_ROPE_WIDE: &[FoldPattern<MetalFusion>] = &[
+    F_KV_ENCODED_ROPE,
+    F_KV_ENCODED_APPEND,
+    F_NORM_ADD,
+    F_ROUTED_WIDE,
+    // `attention_via_cache_v2`'s `ATTN_FOLD`: the plain writer, encoding or not.
+    F_ROPED_DECODE,
+    F_ROPED_PACKED,
+    F_COMBINE_EPILOGUE,
+];
+
+const SWEEP_AFTER_ROPE_NARROW: &[FoldPattern<MetalFusion>] = &[
+    F_KV_ENCODED_ROPE,
+    F_KV_ENCODED_APPEND,
+    F_NORM_ADD,
+    F_ROUTED_NARROW,
+    // `attention_via_cache_v2`'s `ATTN_FOLD`: the plain writer, encoding or not.
+    F_ROPED_DECODE,
+    F_ROPED_PACKED,
+    F_COMBINE_EPILOGUE,
+];
+
+pub const METAL_FUSIONS: FusionTable<MetalFusion> = FusionTable {
+    counted: &[CountedOperands {
+        kind: SubOpKind::AttnDecode,
+        before: OperandIx(1),
+    }],
+    sweeps: &[SWEEP_ELEMENTWISE, SWEEP_EXPERTS, SWEEP_AFTER_ROPE_WIDE],
+    // `row_program.metal`'s limits: 16 instructions hold 8 steps with their loads and stores.
+    // After the matvecs took their ends.
+    rows: Some(RowFold {
+        after_sweep: 1,
+        kinds: &[
+            SubOpKind::RmsNorm,
+            SubOpKind::Add,
+            SubOpKind::ScalarWeightMul,
+            SubOpKind::ScalarMul,
+        ],
+        steps: 8,
+        inputs: 4,
+        outputs: 3,
+        kernel: MetalFusion::RowProgram,
+    }),
+};
+
+/// Metal's fusions under the narrow routed band — every pattern but the routed-experts fold
+/// shared with [`METAL_FUSIONS`] by name. The band every chip but the wide-M5 class lowers
+/// under; see the table pair's doc above.
+pub const METAL_FUSIONS_NARROW: FusionTable<MetalFusion> = FusionTable {
+    counted: METAL_FUSIONS.counted,
+    sweeps: &[SWEEP_ELEMENTWISE, SWEEP_EXPERTS, SWEEP_AFTER_ROPE_NARROW],
+    rows: METAL_FUSIONS.rows,
 };

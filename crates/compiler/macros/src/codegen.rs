@@ -14444,7 +14444,7 @@ pub fn emit_model(
     #[cfg(feature = "metal")]
     let mut metal_steps: BTreeMap<
         crate::assignment::WorkloadPoint,
-        scratchy_target_metal::tape::step::MetalStepTape,
+        scratchy_target_metal_compiler::canonical::ClassedCanonical,
     > = BTreeMap::new();
     // THE MODEL'S SOURCE MANIFEST: every weight family its tapes bind, interned as the canonicals
     // lower, plus the class rotary tables rope-on-read binds (the same caches the Weights struct
@@ -14565,19 +14565,21 @@ pub fn emit_model(
                 BackboneLayout::Encoder => scratchy_subtile::sample_rows::ResultRows::Every,
             },
         };
-        let lowered = mc3::lower_canonical(&l, &facts, mc, at, &mut metal_sources)
+        let lowered = mc3::lower_canonical_classed(&l, &facts, mc, at, &mut metal_sources)
             .unwrap_or_else(|e| panic!("[m2-flip] {stem} m={m}: {e}"));
-        *ns_field = lowered.colours.get();
-        *bb_slot_field = lowered.hidden.0;
-        *term_field = lowered.result.index();
+        // The narrow band's shared bucket facts — the classed lowering proved the wide band
+        // keeps every one of them (only the step tapes may differ).
+        *ns_field = lowered.narrow.colours.get();
+        *bb_slot_field = lowered.narrow.hidden.0;
+        *term_field = lowered.narrow.result.index();
         // Arena sizing evaluates a FUF shape per colour, so colour 0 (the embedded hidden) is
         // keyed by the FUF Embed tile.
-        let mut arena = lowered.arena;
+        let mut arena = lowered.narrow.arena.clone();
         if let Some(et) = fuf.nodes.iter().find(|nd| nd.op == OpKind::Embed) {
             arena.insert_at(et.id, 0, 0);
         }
         *slots_dec = arena;
-        metal_steps.insert(*canonical, lowered.steps);
+        metal_steps.insert(*canonical, lowered);
         // THE WEIGHTS STRUCT, from the tape's bindings. Metal's one ABI fact in it: a gate/up
         // pair is ONE packed `__fused__` buffer.
         let abi = WeightAbi {
@@ -14759,7 +14761,9 @@ pub fn emit_model(
         };
     };
 
-    // METAL_BUCKETS — one row per distinct `num_tokens` point. The
+    // METAL_BUCKETS — one row per distinct `num_tokens` point per routed fold band: the bands
+    // colour differently, so each carries its own slots, terminal and arena (twin rows, sharing
+    // everything, when the bands fold the same step tape). The
     // metal pool dispatches on `num_tokens` only (no sk axis); for
     // models that declared `sk_buckets` we pick the `sk_bucket == 0`
     // canonical at each `m`, falling back to whichever wp exists for
@@ -14831,9 +14835,6 @@ pub fn emit_model(
         let (_, num_slots_b, backbone_slot_b, terminal_slot_b, slots_b) =
             &canonical_lowered[&canonical];
         let bucket_m_lit = proc_macro2::Literal::u32_unsuffixed(m as u32);
-        let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots_b);
-        let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_b);
-        let backbone_slot_lit = proc_macro2::Literal::u32_unsuffixed(*backbone_slot_b);
 
         // Per-tape_index arena_bytes: register-coloring tells us which
         // (tile, output_slot) pairs share an arena slot; for THIS
@@ -14844,81 +14845,101 @@ pub fn emit_model(
         // entries once at init time to size the per-worker arena
         // (init-time alloc, reused across every forward).
         let bp_bounds = bounds_for_wp(model, wp, tp_world_size);
-        // The logits: the terminal tile and the in-place logit tail under it, back to the lm_head
-        // — the terminal slot's chain. A forward leaves only the rows its step samples there, so
-        // they take that slot's bytes a row (`MetalBucketSpec::logits_row_bytes`), its rows
-        // counted at load; an encoder's terminal rows are every row, as are every row of a
-        // backend that samples none (metal alone compacts them).
-        // A tile output the coloring did not register (a refused canonical's empty map, an input
-        // the tape's arena keys by another tile) is in no slot, so not the terminal's.
-        let in_terminal = |id: TileId, slot: u8| {
-            (slots_b.iter()).any(|(at, colour)| at == (id, slot) && colour == *terminal_slot_b)
-        };
-        let logits_tiles: Vec<(TileId, u8)> = match layout {
-            BackboneLayout::Decoder { .. } if cfg!(feature = "metal") => {
-                let mut chain = vec![(last_node_id, 0u8)];
-                while let Some(&(tile, _)) = chain.last() {
-                    let under = fuf.get(tile).inputs.iter().find_map(|i| match *i {
-                        crate::fuf::FufInput::Tile { id, slot } if in_terminal(id, slot) => {
-                            Some((id, slot))
+        // One fold band's bucket facts — its colouring's slot count, terminal, hidden and
+        // per-slot bytes; each band's step tape was coloured under its own colouring, so its
+        // bucket row carries its own. The logits: the terminal tile and the in-place logit
+        // tail under it, back to the lm_head — the terminal slot's chain. A forward leaves only
+        // the rows its step samples there, so they take that slot's bytes a row
+        // (`MetalBucketSpec::logits_row_bytes`), its rows counted at load; an encoder's
+        // terminal rows are every row, as are every row of a backend that samples none (metal
+        // alone compacts them). A tile output the coloring did not register (a refused
+        // canonical's empty map, an input the tape's arena keys by another tile) is in no
+        // slot, so not the terminal's.
+        let mut band_facts = |num_slots: u32,
+                              terminal_slot: u32,
+                              backbone_slot: u32,
+                              slots: &crate::weight_vocab::SlotMap|
+         -> (u32, u32, u32, Vec<u64>, u64) {
+            let in_terminal = |id: TileId, slot: u8| {
+                (slots.iter()).any(|(at, colour)| at == (id, slot) && colour == terminal_slot)
+            };
+            let logits_tiles: Vec<(TileId, u8)> = match layout {
+                BackboneLayout::Decoder { .. } if cfg!(feature = "metal") => {
+                    let mut chain = vec![(last_node_id, 0u8)];
+                    while let Some(&(tile, _)) = chain.last() {
+                        let under = fuf.get(tile).inputs.iter().find_map(|i| match *i {
+                            crate::fuf::FufInput::Tile { id, slot } if in_terminal(id, slot) => {
+                                Some((id, slot))
+                            }
+                            _ => None,
+                        });
+                        match under {
+                            Some(under) if !chain.contains(&under) => chain.push(under),
+                            _ => break,
                         }
-                        _ => None,
-                    });
-                    match under {
-                        Some(under) if !chain.contains(&under) => chain.push(under),
-                        _ => break,
                     }
+                    chain
                 }
-                chain
+                BackboneLayout::Decoder { .. } | BackboneLayout::Encoder => Vec::new(),
+            };
+            let mut bucket_arena_bytes: Vec<u64> = vec![0u64; num_slots as usize];
+            let mut logits_row_bytes: u64 = 0;
+            for ((tile_id, out_slot), color) in slots.iter() {
+                let node = fuf.get(tile_id);
+                let shape = &node.outputs[out_slot as usize];
+                let dims = crate::weight_vocab::eval_shape_with(shape, &bp_bounds)
+                    .expect("shape inference left a Var in a tile output — codegen invariant");
+                // f16 = 2 bytes/element; metal kernels are f16-only.
+                if logits_tiles.contains(&(tile_id, out_slot)) {
+                    let row: u64 = dims.iter().skip(1).product();
+                    logits_row_bytes = logits_row_bytes.max(row.saturating_mul(2));
+                    continue;
+                }
+                let bytes = dims.into_iter().product::<u64>().saturating_mul(2);
+                let slot_idx = color as usize;
+                if bytes > bucket_arena_bytes[slot_idx] {
+                    bucket_arena_bytes[slot_idx] = bytes;
+                }
             }
-            BackboneLayout::Decoder { .. } | BackboneLayout::Encoder => Vec::new(),
+            // Every color must have at least one (tile, slot) pair; if
+            for b in &mut bucket_arena_bytes {
+                if *b == 0 {
+                    *b = 1;
+                }
+            }
+            if metal_ladder_arena.len() < bucket_arena_bytes.len() {
+                metal_ladder_arena.resize(bucket_arena_bytes.len(), 0);
+            }
+            for (ladder, &bytes) in metal_ladder_arena.iter_mut().zip(&bucket_arena_bytes) {
+                *ladder = (*ladder).max(bytes);
+            }
+            metal_hidden_slots.insert(backbone_slot);
+            (
+                num_slots,
+                terminal_slot,
+                backbone_slot,
+                bucket_arena_bytes,
+                logits_row_bytes,
+            )
         };
-        let mut bucket_arena_bytes: Vec<u64> = vec![0u64; *num_slots_b as usize];
-        let mut logits_row_bytes: u64 = 0;
-        for ((tile_id, out_slot), color) in slots_b.iter() {
-            let node = fuf.get(tile_id);
-            let shape = &node.outputs[out_slot as usize];
-            let dims = crate::weight_vocab::eval_shape_with(shape, &bp_bounds)
-                .expect("shape inference left a Var in a tile output — codegen invariant");
-            // f16 = 2 bytes/element; metal kernels are f16-only.
-            if logits_tiles.contains(&(tile_id, out_slot)) {
-                let row: u64 = dims.iter().skip(1).product();
-                logits_row_bytes = logits_row_bytes.max(row.saturating_mul(2));
-                continue;
-            }
-            let bytes = dims.into_iter().product::<u64>().saturating_mul(2);
-            let slot_idx = color as usize;
-            if bytes > bucket_arena_bytes[slot_idx] {
-                bucket_arena_bytes[slot_idx] = bytes;
-            }
-        }
-        let logits_row_bytes_lit = proc_macro2::Literal::u64_unsuffixed(logits_row_bytes);
-        // Every color must have at least one (tile, slot) pair; if
-        // the worker ever sees a 0-byte arena slot it'll fail the
-        // ICB residency. Guarantee a 1-byte minimum so unused colors
-        // (none expected, but defensive) still allocate a valid
-        // `MTLBuffer`.
-        for b in &mut bucket_arena_bytes {
-            if *b == 0 {
-                *b = 1;
-            }
-        }
-        if metal_ladder_arena.len() < bucket_arena_bytes.len() {
-            metal_ladder_arena.resize(bucket_arena_bytes.len(), 0);
-        }
-        for (ladder, &bytes) in metal_ladder_arena.iter_mut().zip(&bucket_arena_bytes) {
-            *ladder = (*ladder).max(bytes);
-        }
-        metal_hidden_slots.insert(*backbone_slot_b);
-
-        let arena_static_ident = bucket_static_ident("METAL_ARENA_BYTES_M", wp);
-        let arena_bytes_lits = bucket_arena_bytes
-            .iter()
-            .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
-        metal_arena_bytes_statics.push(quote! {
-            #[cfg(feature = "metal")]
-            static #arena_static_ident: &[u64] = &[ #(#arena_bytes_lits),* ];
-        });
+        // The narrow band's facts: the shared tuple the metal front-end swap wrote (which the
+        // FORWARD_TABLE row reads too).
+        let narrow = band_facts(*num_slots_b, *terminal_slot_b, *backbone_slot_b, slots_b);
+        // The wide band's: its own canonical's when the bands fold differently at this bucket,
+        // the narrow's twin when they fold the same (no routing ops, or the fold refused) —
+        // either way the pool picks one row per bucket by its device's band.
+        #[cfg(feature = "metal")]
+        let wide = match metal_steps.get(&canonical).and_then(|c| c.wide.as_ref()) {
+            Some(wide) => band_facts(
+                wide.colours.get(),
+                wide.result.index(),
+                wide.hidden.0,
+                &wide.arena,
+            ),
+            None => narrow.clone(),
+        };
+        #[cfg(not(feature = "metal"))]
+        let wide = narrow.clone();
         // Bake this bucket's tape rungs at expansion — one per device
         // generation, addressing, KV cap and TurboQuant decode heads —
         // every fact baked; the pool picks one. See static_tape.rs.
@@ -14940,9 +14961,15 @@ pub fn emit_model(
                     );
                     quote! { &[] }
                 }
-                Some(steps) => {
+                Some(classed) => {
                     let input = scratchy_target_metal_compiler::static_tape::BucketLowerInput {
-                        steps,
+                        steps: &classed.narrow.steps,
+                        wide_band: classed.wide.as_ref().map(|wide| {
+                            scratchy_target_metal_compiler::static_tape::WideBand {
+                                steps: &wide.steps,
+                                num_arena_slots: wide.colours.get(),
+                            }
+                        }),
                         bucket_m: m as u32,
                         num_arena_slots: *num_slots_b,
                         rotary: metal_rotary,
@@ -14976,22 +15003,49 @@ pub fn emit_model(
             true => quote! { METAL_KERNELS },
             false => quote! { &[] },
         };
-        metal_bucket_entries.push(quote! {
-            ::scratchy_target_metal::interpreter::metal::MetalBucketSpec {
-                bucket_m: #bucket_m_lit,
-                num_arena_slots: #num_slots_lit,
-                terminal_slot: #terminal_slot_lit,
-                backbone_slot: #backbone_slot_lit,
-                arena_bytes: #arena_static_ident,
-                logits_row_bytes: #logits_row_bytes_lit,
-                backbone: #bb_static,
-                lm_head: #lm_static,
-                backbone_barriers: #bb_barriers_static,
-                lm_head_barriers: #lh_barriers_static,
-                tapes: #tapes_static_toks,
-                kernels: #kernels_toks,
-            },
-        });
+        // One row per fold band — the wide band's statics under its own names, the tapes and
+        // kernels shared: the pick keeps the row whose band the device's class lowers.
+        let band_rows = [
+            ("Narrow", "METAL_ARENA_BYTES_M", &narrow),
+            ("Wide", "METAL_ARENA_BYTES_WIDE_M", &wide),
+        ];
+        for (
+            band,
+            arena_prefix,
+            (num_slots, terminal_slot, backbone_slot, arena_bytes, logits_row_bytes),
+        ) in band_rows
+        {
+            let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots);
+            let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(*terminal_slot);
+            let backbone_slot_lit = proc_macro2::Literal::u32_unsuffixed(*backbone_slot);
+            let logits_row_bytes_lit = proc_macro2::Literal::u64_unsuffixed(*logits_row_bytes);
+            let arena_static_ident = bucket_static_ident(arena_prefix, wp);
+            let arena_bytes_lits = arena_bytes
+                .iter()
+                .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
+            metal_arena_bytes_statics.push(quote! {
+                #[cfg(feature = "metal")]
+                static #arena_static_ident: &[u64] = &[ #(#arena_bytes_lits),* ];
+            });
+            let band_ident = proc_macro2::Ident::new(band, proc_macro2::Span::call_site());
+            metal_bucket_entries.push(quote! {
+                ::scratchy_target_metal::interpreter::metal::MetalBucketSpec {
+                    bucket_m: #bucket_m_lit,
+                    band: ::scratchy_target_metal::interpreter::metal::FoldBand::#band_ident,
+                    num_arena_slots: #num_slots_lit,
+                    terminal_slot: #terminal_slot_lit,
+                    backbone_slot: #backbone_slot_lit,
+                    arena_bytes: #arena_static_ident,
+                    logits_row_bytes: #logits_row_bytes_lit,
+                    backbone: #bb_static,
+                    lm_head: #lm_static,
+                    backbone_barriers: #bb_barriers_static,
+                    lm_head_barriers: #lh_barriers_static,
+                    tapes: #tapes_static_toks,
+                    kernels: #kernels_toks,
+                },
+            });
+        }
     }
 
     // THE ARENA RANKS: the slots by size at their largest bucket, largest first, ties by slot —
@@ -15240,8 +15294,10 @@ pub fn emit_model(
         #(#metal_arena_bytes_statics)*
 
         /// Per-canonical tape_index plan for the Metal pool. One row per
-        /// `num_tokens` point, ordered ascending. `MetalWorkerPool::pick_bucket`
-        /// is a linear smallest-fit scan, so order matters.
+        /// `num_tokens` point per routed fold band (`FoldBand`), ordered ascending, a
+        /// bucket's band rows adjacent. A pool keeps one band's rows (`pick_rung`), so its
+        /// bucket index is no index into this table: a forward's slots come from the pool's
+        /// own rows (`MetalWorkerPool::bucket_spec`).
         #[cfg(feature = "metal")]
         pub static METAL_BUCKETS:
             &[::scratchy_target_metal::interpreter::metal::MetalBucketSpec]
@@ -16065,7 +16121,7 @@ pub fn emit_model(
                         (),
                         ::scratchy_target_metal::interpreter::metal::ForwardError,
                     > {
-                        let spec = &METAL_BUCKETS[bucket_idx];
+                        let spec = pool.bucket_spec(bucket_idx);
                         let logits_buf = &worker.arena[spec.terminal_slot as usize];
                         let hidden_buf = &worker.arena[spec.backbone_slot as usize];
                         let vocab = METAL_VOCAB_SIZE as u32;
@@ -16077,7 +16133,7 @@ pub fn emit_model(
                 pool.forward_with_tail(
                     inputs,
                     |worker, bucket_idx| {
-                        let spec = &METAL_BUCKETS[bucket_idx];
+                        let spec = pool.bucket_spec(bucket_idx);
                         use ::scratchy_target_metal::interpreter::metal::__re::MTLBuffer as _;
                         // The caller's rows of the final hidden states (an MTP head's next input),
                         // before the worker goes back to the pool and its arena is reused.
@@ -16179,8 +16235,7 @@ pub fn emit_model(
                 ) -> &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
                     dyn ::scratchy_forward_compiler::metal_followup_reexports::MTLBuffer,
                 > {
-                    let spec = &METAL_BUCKETS[self.0.bucket_idx()];
-                    &self.0.worker().arena[spec.backbone_slot as usize]
+                    &self.0.worker().arena[self.0.bucket_spec().backbone_slot as usize]
                 }
 
                 fn logits(
@@ -16188,8 +16243,7 @@ pub fn emit_model(
                 ) -> &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
                     dyn ::scratchy_forward_compiler::metal_followup_reexports::MTLBuffer,
                 > {
-                    let spec = &METAL_BUCKETS[self.0.bucket_idx()];
-                    &self.0.worker().arena[spec.terminal_slot as usize]
+                    &self.0.worker().arena[self.0.bucket_spec().terminal_slot as usize]
                 }
 
                 fn vocab(&self) -> u32 {
@@ -16233,8 +16287,7 @@ pub fn emit_model(
                 let bucket_idx = pool
                     .pick_bucket_for(inputs)
                     .map_err(|e| format!("MetalWorkerPool::pick_bucket_for: {e}"))?;
-                let terminal_slot =
-                    METAL_BUCKETS[bucket_idx].terminal_slot as usize;
+                let terminal_slot = pool.bucket_spec(bucket_idx).terminal_slot as usize;
                 let vocab = METAL_VOCAB_SIZE as u32;
 
                 pool.with_chain_encoder(

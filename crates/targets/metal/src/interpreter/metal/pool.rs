@@ -48,6 +48,29 @@ use crate::tape::lowered::{ClassedTape, KvAddressing};
 use objc2::runtime::ProtocolObject;
 use scratchy_ir::{CanonicalParams, Instruction};
 
+/// The routed fold band a bucket row carries: which band's step tape its slots, terminal and
+/// arena were coloured under ([`crate::op_abi::METAL_FUSIONS`] wide,
+/// [`crate::op_abi::METAL_FUSIONS_NARROW`] narrow). One row per bucket per band — a bucket
+/// whose bands fold the same step tape (every dense model, and every bucket the routed fold
+/// refuses) carries twin rows, whose facts serve every class alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum FoldBand {
+    /// The band every chip but the wide-M5 class lowers: the fold's one-row origin.
+    Narrow,
+    /// The band the wide-M5 class lowers: the fold through the verify-sized rows.
+    Wide,
+}
+
+impl FoldBand {
+    /// The band a device of `class` runs.
+    pub fn for_class(class: crate::tape::lowered::GenClass) -> Self {
+        match class {
+            crate::tape::lowered::GenClass::M5Wide => FoldBand::Wide,
+            _ => FoldBand::Narrow,
+        }
+    }
+}
+
 /// One bucket's compile-time data, ready to be lowered + handed to a
 /// [`MetalWorkerPool`].
 ///
@@ -72,6 +95,9 @@ use scratchy_ir::{CanonicalParams, Instruction};
 /// an `Arc<[MetalBucketSpec]>` cheaply.
 pub struct MetalBucketSpec {
     pub bucket_m: u32,
+    /// The routed fold band this row's slots, terminal and arena were coloured under; the pool
+    /// keeps the rows whose band its device's class lowers. See [`FoldBand`].
+    pub band: FoldBand,
     pub num_arena_slots: u32,
     /// Index in the colored arena where this bucket's terminal
     /// activation lands (lm_head output for decoder layouts; the
@@ -337,6 +363,9 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     allocator: Arc<MetalAllocator>,
     pipelines: Arc<SpecializedPipelines>,
     bucket_tapes: Arc<[LoweredMetalTape]>,
+    /// Each tape's bucket row, index for index: the slots a forward's outputs are read from
+    /// ([`Self::bucket_spec`]).
+    bucket_specs: Arc<[&'static MetalBucketSpec]>,
     /// The KV cap rung the tapes are baked for: the row stride each step's block tables are laid
     /// out at.
     block_table_stride: MaxBlocksPerSeq,
@@ -613,20 +642,32 @@ pub fn pick_rung(
         tq,
         ranks,
     } = *rungs;
-    let smallest = bucket_specs
+    // The bucket rows whose band this device lowers — one per bucket, the other band's row
+    // dropped here — kept to those the memory budget affords, at least the smallest.
+    let band_specs = |band: FoldBand| {
+        bucket_specs
+            .iter()
+            .filter(|s| s.band == band)
+            .collect::<Vec<_>>()
+    };
+    let profile = crate::device::known_profile(device)
+        .ok_or_else(|| PoolBuildError::UnknownDevice(device.name().to_string()))?;
+    let gpu_cores = crate::device::gpu_cores(device).ok_or(PoolBuildError::UnknownGpuCores)?;
+    // The class the routed fold's band rides on: a Max-scale M5 (enough GPU cores) takes the
+    // wide band, every other chip the narrow one — selection only, both bands baked at expansion.
+    let gen_class = crate::tape::lowered::GenClass::for_device(profile.generation, gpu_cores);
+    let band = FoldBand::for_class(gen_class);
+    let band_buckets = band_specs(band);
+    let smallest = band_buckets
         .iter()
         .min_by_key(|s| s.bucket_m)
         .ok_or(PoolBuildError::NoBuckets)?;
     let affords = |s: &&MetalBucketSpec| max_bucket_m.is_none_or(|cap| s.bucket_m <= cap);
-    let mut buckets: Vec<&MetalBucketSpec> = bucket_specs.iter().filter(affords).collect();
+    let mut buckets: Vec<&MetalBucketSpec> = band_buckets.iter().copied().filter(affords).collect();
     if buckets.is_empty() {
         buckets.push(smallest);
     }
-    let profile = crate::device::known_profile(device)
-        .ok_or_else(|| PoolBuildError::UnknownDevice(device.name().to_string()))?;
-    let gen_class = crate::tape::lowered::GenClass::of(profile.generation);
     let need = MaxBlocksPerSeq(u32::try_from(block_cap).unwrap_or(u32::MAX));
-    let gpu_cores = crate::device::gpu_cores(device).ok_or(PoolBuildError::UnknownGpuCores)?;
     let tq_heads = TqDecodeHeads::for_group(tq.head_dim, tq.q_heads, tq.kv_heads, gpu_cores);
     let serves = |t: &&ClassedTape| {
         t.gen_class == gen_class
@@ -701,6 +742,15 @@ impl MetalRungs {
     ) -> Result<PickedRung<'static>, PoolBuildError> {
         pick_rung(device, self, max_bucket_m, block_cap, addressing)
     }
+
+    /// The model's bucket sizes, ascending, each once: its table holds a row per bucket per fold
+    /// band ([`FoldBand`]), of which a device runs one.
+    pub fn bucket_ms(&self) -> Vec<u32> {
+        let mut ms: Vec<u32> = self.buckets.iter().map(|s| s.bucket_m).collect();
+        ms.sort_unstable();
+        ms.dedup();
+        ms
+    }
 }
 
 impl<W: CanonicalParams> MetalWorkerPool<W> {
@@ -717,7 +767,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         weights: &W,
         allocator: Arc<MetalAllocator>,
         pipelines: Arc<SpecializedPipelines>,
-        bucket_tapes: Arc<[LoweredMetalTape]>,
+        // Each bucket's row and the tape it runs, in bucket order: a forward's output slots are
+        // read off the row of the tape it ran ([`Self::bucket_spec`]).
+        buckets: &[(&'static MetalBucketSpec, LoweredMetalTape)],
         block_table_stride: MaxBlocksPerSeq,
         arena_layout: ArenaLayout,
         runtime_factory: RuntimeFactory,
@@ -731,6 +783,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         W: ModelSources,
     {
         assert!(max_workers >= 1, "max_workers must be >= 1");
+        let bucket_tapes: Arc<[LoweredMetalTape]> = buckets.iter().map(|&(_, tape)| tape).collect();
+        let bucket_specs: Arc<[&'static MetalBucketSpec]> =
+            buckets.iter().map(|&(spec, _)| spec).collect();
         let sources = ResolvedSources::resolve(weights, &allocator, &bucket_tapes)?;
 
         // The shared `MetalResidencySet` lives on the allocator now —
@@ -752,6 +807,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             allocator,
             pipelines,
             bucket_tapes,
+            bucket_specs,
             block_table_stride,
             sources,
             arena_layout: Arc::new(arena_layout),
@@ -840,8 +896,10 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 cache.register_baked(spec.kernels);
             }
         }
-        let tapes: Vec<LoweredMetalTape> = picked.iter().map(|(_, rung)| rung.tape).collect();
-        let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
+        let buckets: Vec<_> = picked
+            .iter()
+            .map(|&(spec, rung)| (spec, rung.tape))
+            .collect();
         let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache), variant));
         let sparse_plan = SparsePlan {
             bucket_arena,
@@ -853,7 +911,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             weights,
             allocator,
             pipelines,
-            bucket_tapes,
+            &buckets,
             variant.cap,
             arena_layout,
             runtime_factory,
@@ -968,6 +1026,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         } else {
             None
         }
+    }
+
+    /// The bucket row of the bucket at `bucket_idx` ([`Self::pick_bucket`]'s index): the slots its
+    /// forward leaves the final hidden states and logits in. The model's baked table holds a row
+    /// per bucket per fold band ([`FoldBand`]), so only the pool's own rows are indexed this way.
+    pub fn bucket_spec(&self, bucket_idx: usize) -> &'static MetalBucketSpec {
+        self.bucket_specs[bucket_idx]
     }
 
     /// Map a real `num_tokens` to the bucket index that should run.
@@ -1818,9 +1883,9 @@ impl<W: CanonicalParams> Onto<'_, W> {
         &self.guard.worker
     }
 
-    /// The bucket the last forward ran.
-    pub fn bucket_idx(&self) -> usize {
-        self.bucket_idx
+    /// The bucket row of the bucket the last forward ran ([`MetalWorkerPool::bucket_spec`]).
+    pub fn bucket_spec(&self) -> &'static MetalBucketSpec {
+        self.guard.pool.bucket_spec(self.bucket_idx)
     }
 }
 
@@ -2517,7 +2582,7 @@ mod tests {
             &weights,
             allocator,
             pipelines,
-            tapes,
+            &test_buckets(&tapes),
             MaxBlocksPerSeq(128),
             arena_layout,
             runtime_factory,
@@ -2763,7 +2828,7 @@ mod tests {
             &weights,
             allocator,
             pipelines,
-            tapes,
+            &test_buckets(&tapes),
             MaxBlocksPerSeq(128),
             arena_layout,
             runtime_factory,
@@ -2799,6 +2864,28 @@ mod tests {
             return;
         };
         assert!(matches!(pool.pick_bucket(0), Err(ForwardError::ZeroTokens)));
+    }
+
+    /// The wide class is the M5 generation at Max-scale core counts alone: the class the routed
+    /// fold's wide band rides on (`M5_WIDE_MIN_CORES` — measured on a 40-core M5 Max, PR #847,
+    /// and lost on a 10-core base M5, its review). Every other chip, and an M5 under the
+    /// threshold, lowers the narrow band.
+    #[test]
+    fn the_wide_class_is_a_max_scale_m5_alone() {
+        use crate::tape::ids::GpuCores;
+        use crate::tape::lowered::GenClass;
+        use crate::tape::targets::AppleSiliconGen as G;
+        let class = |generation, cores| GenClass::for_device(generation, GpuCores(cores));
+        assert_eq!(class(G::M5, 10), GenClass::M5);
+        // The unmeasured 20-core M5 Pro stays narrow until benched.
+        assert_eq!(class(G::M5, 20), GenClass::M5);
+        assert_eq!(class(G::M5, 40), GenClass::M5Wide);
+        assert_eq!(class(G::M4, 40), GenClass::Mid);
+        assert_eq!(class(G::M1, 32), GenClass::M1);
+        let band = |generation, cores| FoldBand::for_class(class(generation, cores));
+        assert_eq!(band(G::M5, 40), FoldBand::Wide);
+        assert_eq!(band(G::M5, 10), FoldBand::Narrow);
+        assert_eq!(band(G::M2, 10), FoldBand::Narrow);
     }
 
     #[test]
@@ -3398,6 +3485,18 @@ mod tests {
     /// stands one worker up eagerly.
     const EMPTY_BACKBONE: &[Instruction] = &[];
 
+    /// A bucket's two band rows, identical — the twin rows a real model emits when its bands
+    /// fold the same step tape, so whichever band the device picks serves it.
+    fn twin_rows(spec: &MetalBucketSpec) -> Vec<MetalBucketSpec> {
+        vec![
+            *spec,
+            MetalBucketSpec {
+                band: FoldBand::Wide,
+                ..*spec
+            },
+        ]
+    }
+
     /// Baked tape rungs for an empty test bucket — what the macro
     /// would emit for `(empty, empty)` instruction streams: an
     /// empty-command tape per (gen class × chunked) pair at KV cap 128.
@@ -3422,7 +3521,7 @@ mod tests {
             cache_live: &[],
         };
         let mut v = Vec::new();
-        for gen_class in [GenClass::M1, GenClass::Mid, GenClass::M5] {
+        for gen_class in [GenClass::M1, GenClass::Mid, GenClass::M5, GenClass::M5Wide] {
             for addressing in [KvAddressing::Direct, KvAddressing::Chunked] {
                 v.push(ClassedTape {
                     gen_class,
@@ -3440,6 +3539,33 @@ mod tests {
     // One barrier flag per backbone/lm_head `Instruction`; both slices
     // are empty here so the barrier slices are empty too.
     const EMPTY_BARRIERS: &[bool] = &[];
+
+    /// Each of `tapes` with its bucket row (leaked: a pool's rows are `'static`). A test's forwards
+    /// read no output slot, so each row's are slot 0.
+    fn test_buckets(
+        tapes: &[LoweredMetalTape],
+    ) -> Vec<(&'static MetalBucketSpec, LoweredMetalTape)> {
+        (tapes.iter())
+            .map(|&tape| {
+                let spec = &*Box::leak(Box::new(MetalBucketSpec {
+                    bucket_m: tape.bucket_m,
+                    band: FoldBand::Narrow,
+                    num_arena_slots: tape.num_arena_slots,
+                    terminal_slot: 0,
+                    backbone_slot: 0,
+                    arena_bytes: TEST_ARENA_BYTES,
+                    logits_row_bytes: 0,
+                    backbone: EMPTY_BACKBONE,
+                    lm_head: EMPTY_LM_HEAD,
+                    backbone_barriers: EMPTY_BARRIERS,
+                    lm_head_barriers: EMPTY_BARRIERS,
+                    tapes: &[],
+                    kernels: &[],
+                }));
+                (spec, tape)
+            })
+            .collect()
+    }
 
     /// `specs` as one model's rungs, ranked `ranks` (leaked: a pool's rungs are `'static`).
     fn test_rungs(specs: &[MetalBucketSpec], ranks: ArenaRanks) -> &'static MetalRungs {
@@ -3523,8 +3649,9 @@ mod tests {
     /// pipeline cache / lowering / pool spawn end-to-end.
     #[test]
     fn for_buckets_builds_pool_for_single_empty_bucket() {
-        let specs = [MetalBucketSpec {
+        let spec = MetalBucketSpec {
             bucket_m: 1,
+            band: FoldBand::Narrow,
             num_arena_slots: 2,
             terminal_slot: 1,
             backbone_slot: 0,
@@ -3536,7 +3663,8 @@ mod tests {
             lm_head_barriers: EMPTY_BARRIERS,
             tapes: test_empty_tapes(1, 2),
             kernels: &[],
-        }];
+        };
+        let specs = twin_rows(&spec);
         let Some(res) = build_via_for_buckets(&specs, 2) else {
             eprintln!("skipping: no Metal device");
             return;
@@ -3555,8 +3683,9 @@ mod tests {
     /// contract: "the POOL refuses at load".
     #[test]
     fn for_buckets_refuses_bucket_with_no_tape_variants() {
-        let specs = [MetalBucketSpec {
+        let spec = MetalBucketSpec {
             bucket_m: 1,
+            band: FoldBand::Narrow,
             num_arena_slots: 2,
             terminal_slot: 1,
             backbone_slot: 0,
@@ -3568,7 +3697,8 @@ mod tests {
             lm_head_barriers: EMPTY_BARRIERS,
             tapes: &[],
             kernels: &[],
-        }];
+        };
+        let specs = twin_rows(&spec);
         let Some(res) = build_via_for_buckets(&specs, 1) else {
             eprintln!("skipping: no Metal device");
             return;
@@ -3590,9 +3720,10 @@ mod tests {
     /// `Arc<[…]>`.
     #[test]
     fn for_buckets_preserves_bucket_order() {
-        let specs = [
+        let narrow = [
             MetalBucketSpec {
                 bucket_m: 1,
+                band: FoldBand::Narrow,
                 num_arena_slots: 2,
                 terminal_slot: 1,
                 backbone_slot: 0,
@@ -3607,6 +3738,7 @@ mod tests {
             },
             MetalBucketSpec {
                 bucket_m: 8,
+                band: FoldBand::Narrow,
                 num_arena_slots: 2,
                 terminal_slot: 1,
                 backbone_slot: 0,
@@ -3620,6 +3752,7 @@ mod tests {
                 kernels: &[],
             },
         ];
+        let specs = narrow.iter().flat_map(twin_rows).collect::<Vec<_>>();
         let Some(res) = build_via_for_buckets(&specs, 1) else {
             eprintln!("skipping: no Metal device");
             return;
@@ -3631,6 +3764,77 @@ mod tests {
             pool.pick_bucket(9),
             Err(ForwardError::NoBucketFits { .. })
         ));
+    }
+
+    /// A pool's bucket row is its own bucket's, in its device's band: the model's table holds a
+    /// row per bucket per fold band, so the pool's bucket index is no index into that table (the
+    /// bands' rows interleave). Each band's rows here name their own slots, so a row of the other
+    /// band, or of another bucket, shows.
+    #[test]
+    fn a_pools_bucket_row_is_its_own_buckets_in_one_band() {
+        let slots = |band| match band {
+            FoldBand::Narrow => (1, 0),
+            FoldBand::Wide => (0, 1),
+        };
+        let row = |bucket_m, band| {
+            let (terminal_slot, backbone_slot) = slots(band);
+            MetalBucketSpec {
+                bucket_m,
+                band,
+                num_arena_slots: 2,
+                terminal_slot,
+                backbone_slot,
+                arena_bytes: TEST_ARENA_BYTES,
+                logits_row_bytes: 0,
+                backbone: EMPTY_BACKBONE,
+                lm_head: EMPTY_LM_HEAD,
+                backbone_barriers: EMPTY_BARRIERS,
+                lm_head_barriers: EMPTY_BARRIERS,
+                tapes: test_empty_tapes(bucket_m, 2),
+                kernels: &[],
+            }
+        };
+        let specs = ([1, 8].into_iter())
+            .flat_map(|m| [FoldBand::Narrow, FoldBand::Wide].map(|band| row(m, band)))
+            .collect::<Vec<_>>();
+        let Some(res) = build_via_for_buckets(&specs, 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let pool = res.expect("for_buckets constructs pool");
+        let band = pool.bucket_spec(0).band;
+        for (bucket_idx, bucket_m) in [1, 8].into_iter().enumerate() {
+            let spec = pool.bucket_spec(bucket_idx);
+            assert_eq!(spec.bucket_m, bucket_m);
+            assert_eq!(spec.band, band);
+            assert_eq!((spec.terminal_slot, spec.backbone_slot), slots(band));
+        }
+    }
+
+    /// A model's bucket sizes name each bucket once, whatever rows its bands add.
+    #[test]
+    fn bucket_ms_names_each_bucket_once() {
+        let spec = |bucket_m| MetalBucketSpec {
+            bucket_m,
+            band: FoldBand::Narrow,
+            num_arena_slots: 2,
+            terminal_slot: 1,
+            backbone_slot: 0,
+            arena_bytes: TEST_ARENA_BYTES,
+            logits_row_bytes: 0,
+            backbone: EMPTY_BACKBONE,
+            lm_head: EMPTY_LM_HEAD,
+            backbone_barriers: EMPTY_BARRIERS,
+            lm_head_barriers: EMPTY_BARRIERS,
+            tapes: &[],
+            kernels: &[],
+        };
+        let specs = [spec(1), spec(8)]
+            .iter()
+            .flat_map(twin_rows)
+            .collect::<Vec<_>>();
+        assert_eq!(specs.len(), 4);
+        assert_eq!(test_rungs(&specs, ArenaRanks::NONE).bucket_ms(), [1, 8]);
     }
 
     /// A host pool built to hold its guest allocates what the budget prices for it
@@ -3651,6 +3855,7 @@ mod tests {
         static GUEST_ARENA: [u64; 3] = [64 * K, 128 * K, 512 * K];
         let spec = |arena: &'static [u64], backbone_slot| MetalBucketSpec {
             bucket_m: 1,
+            band: FoldBand::Narrow,
             num_arena_slots: 3,
             terminal_slot: 1,
             backbone_slot,
@@ -3663,7 +3868,10 @@ mod tests {
             tapes: test_empty_tapes(1, 3),
             kernels: &[],
         };
-        let (host, guest) = ([spec(&HOST_ARENA, 2)], [spec(&GUEST_ARENA, 0)]);
+        let (host, guest) = (
+            twin_rows(&spec(&HOST_ARENA, 2)),
+            twin_rows(&spec(&GUEST_ARENA, 0)),
+        );
         let host = test_rungs(&host, ArenaRanks::new(&[0, 2, 1], &[0, 1], &host));
         let guest = test_rungs(&guest, ArenaRanks::new(&[2, 1, 0], &[2, 1], &guest));
         let pick = |rungs: &MetalRungs| {
