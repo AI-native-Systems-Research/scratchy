@@ -7,7 +7,7 @@ floor that move must not cut through. Some tests encode empirical claims about h
 clients we don't control, and about behaviour over time. No type can state those, and they are
 not a backlog.
 
-"No weakening tests" in [`CLAUDE.md`](../CLAUDE.md) means what this page says.
+"No weakening tests" in the repo's `CLAUDE.md` means what this page says.
 
 ## The five tiers
 
