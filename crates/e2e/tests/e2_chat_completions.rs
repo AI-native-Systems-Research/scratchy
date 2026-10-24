@@ -742,3 +742,46 @@ async fn test_render_chat_completion_with_tools() {
         .expect("prompt should be a string");
     assert!(!prompt.is_empty());
 }
+
+/// `logit_bias` moves the reply: +100 on the token of " yes" makes a greedy reply nothing but it,
+/// where the same request without the bias answers otherwise; a key that is not a token id is a
+/// 400.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_chat_logit_bias_moves_the_reply() {
+    let (_server, client) = start_smollm().await;
+
+    let tokenize = scratchy_serving_api::protocol::TokenizeRequest {
+        prompt: Some(" yes".to_string()),
+        add_special_tokens: Some(false),
+        ..serde_json::from_str("{}").unwrap()
+    };
+    let yes = client.tokenize(&tokenize).await.unwrap().tokens[0];
+    let request = |bias: Option<(String, f64)>| ChatCompletionRequest {
+        messages: vec![user_msg("Say hi")],
+        max_tokens: Some(4),
+        temperature: Some(0.0),
+        logit_bias: bias.map(|b| std::collections::HashMap::from([b])),
+        ..default_chat_request()
+    };
+    let text = |resp: &scratchy_serving_api::protocol::ChatCompletionResponse| {
+        (resp.choices[0].message.content.clone()).unwrap_or_default()
+    };
+
+    let plain = client.chat_completion(&request(None)).await.unwrap();
+    assert_ne!(text(&plain), " yes yes yes yes", "the control");
+    let biased = client
+        .chat_completion(&request(Some((yes.to_string(), 100.0))))
+        .await
+        .unwrap();
+    assert_eq!(text(&biased), " yes yes yes yes");
+
+    let resp = client
+        .chat_completion_raw(&serde_json::json!({
+            "messages": [{"role": "user", "content": "Say hi"}],
+            "logit_bias": {"abc": 1},
+        }))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400, "a key that is not a token id");
+}

@@ -3582,7 +3582,7 @@ impl AsyncEngine {
             skip_special_tokens: request.skip_special_tokens && !keep_special_tokens,
             logprobs,
             prompt_logprobs: request.prompt_logprobs.map(|n| n as i32),
-            logit_bias: parse_logit_bias(&request.logit_bias),
+            logit_bias: parse_logit_bias(&request.logit_bias)?,
             guided_grammar,
             allowed_token_ids: request.allowed_token_ids.clone(),
             bad_words_token_ids,
@@ -3632,7 +3632,7 @@ impl AsyncEngine {
             skip_special_tokens: request.skip_special_tokens,
             logprobs,
             prompt_logprobs: request.prompt_logprobs.map(|n| n as i32),
-            logit_bias: parse_logit_bias(&request.logit_bias),
+            logit_bias: parse_logit_bias(&request.logit_bias)?,
             guided_grammar,
             allowed_token_ids: request.allowed_token_ids.clone(),
             bad_words_token_ids,
@@ -3868,10 +3868,6 @@ async fn route_step_outputs(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Convert API-style logit_bias (string keys, f64 values) to sampler format.
-///
-/// OpenAI API uses string token IDs as keys; we parse them to u32.
-/// Invalid keys are silently ignored.
 /// Truncate prompt token IDs from the left, keeping the last N tokens.
 ///
 /// `truncate` values: `None` → no-op, `Some(-1)` → no-op (model max),
@@ -3896,22 +3892,29 @@ fn truncate_prompt(tokens: &mut Vec<u32>, truncate: Option<i64>) -> ServeResult<
     Ok(())
 }
 
+/// API-style `logit_bias` (string token-id keys, f64 values) as the sampler takes it: each bias
+/// clamped to [-100, 100], as vLLM clamps it. A key that is not a token id, or more than
+/// [`scratchy_core_common::MAX_LOGIT_BIAS`] of them, is a 400.
 fn parse_logit_bias(
     api_bias: &Option<std::collections::HashMap<String, f64>>,
-) -> Option<std::collections::HashMap<u32, f32>> {
-    let bias = api_bias.as_ref()?;
-    if bias.is_empty() {
-        return None;
+) -> ServeResult<Option<std::collections::HashMap<u32, f32>>> {
+    let Some(bias) = api_bias.as_ref().filter(|b| !b.is_empty()) else {
+        return Ok(None);
+    };
+    let max = scratchy_core_common::MAX_LOGIT_BIAS;
+    if bias.len() > max {
+        return Err(ServeError::Validation(format!(
+            "logit_bias may name at most {max} tokens, got {}",
+            bias.len()
+        )));
     }
-    let parsed: std::collections::HashMap<u32, f32> = bias
-        .iter()
-        .filter_map(|(k, &v)| k.parse::<u32>().ok().map(|tid| (tid, v as f32)))
-        .collect();
-    if parsed.is_empty() {
-        None
-    } else {
-        Some(parsed)
-    }
+    let parsed = bias.iter().map(|(k, &v)| match k.parse::<u32>() {
+        Ok(token) => Ok((token, v.clamp(-100.0, 100.0) as f32)),
+        Err(_) => Err(ServeError::Validation(format!(
+            "logit_bias keys are token ids, got {k:?}"
+        ))),
+    });
+    Ok(Some(parsed.collect::<ServeResult<_>>()?))
 }
 
 /// Parse `response_format` from an API request into a `GuidedGrammar`.
@@ -4409,6 +4412,26 @@ mod tests {
         let client = Box::new(InprocClient::new(make_engine_config(), executor));
         let tok = Arc::new(make_test_tokenizer());
         AsyncEngine::with_tokenizer(client, "test-model".to_string(), 4096, tok)
+    }
+
+    /// `logit_bias` keys are token ids and each bias is clamped to [-100, 100], as vLLM clamps
+    /// it; a key that is not a token id, or more entries than the sampler holds, is a 400.
+    #[test]
+    fn logit_bias_is_parsed_clamped_and_capped() {
+        let bias =
+            |pairs: &[(&str, f64)]| Some(pairs.iter().map(|&(k, v)| (k.to_string(), v)).collect());
+        let parsed = parse_logit_bias(&bias(&[("7", 3.5), ("9", 1e9), ("11", -1e9)])).unwrap();
+        assert_eq!(
+            parsed,
+            Some(HashMap::from([(7, 3.5), (9, 100.0), (11, -100.0)]))
+        );
+        assert_eq!(parse_logit_bias(&None).unwrap(), None);
+        assert_eq!(parse_logit_bias(&bias(&[])).unwrap(), None);
+        assert!(parse_logit_bias(&bias(&[("abc", 1.0)])).is_err());
+        let many: Vec<(String, f64)> = (0..=scratchy_core_common::MAX_LOGIT_BIAS)
+            .map(|t| (t.to_string(), 1.0))
+            .collect();
+        assert!(parse_logit_bias(&Some(many.into_iter().collect())).is_err());
     }
 
     fn make_chat_request() -> protocol::ChatCompletionRequest {

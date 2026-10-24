@@ -315,6 +315,9 @@ inline uint2 descent_pick(device const uint* h, uint round, uint k, uint2 prior,
 //                 logit -= freq * count + pres
 // Token id == vocab_size is padding (never matches a real vocab index); a
 // step without penalties has empty histories (consts[2], consts[3] = 0).
+// Then each row's logit bias (OpenAI `logit_bias`), after the penalties as
+// vLLM applies it: logit += bias_values[j] for bias_token_ids[j] == token, the
+// row's `consts[4]` entries padded the same way (0 on a step without one).
 // ---------------------------------------------------------------------------
 
 template <typename T>
@@ -331,6 +334,8 @@ template <typename T>
     device       uint*  partials          [[buffer(9)]],
     constant     uint*  consts            [[buffer(10)]],
     device       uint*  hist              [[buffer(11)]],
+    device const int*   bias_token_ids    [[buffer(12)]],
+    device const float* bias_values       [[buffer(13)]],
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
@@ -338,6 +343,7 @@ template <typename T>
     uint nslices = consts[0];
     uint max_output_len = consts[2];
     uint max_prompt_len = consts[3];
+    uint max_bias = consts[4];
     uint row = tgp / nslices;
     uint slice = tgp % nslices;
     device const uint* state = row_state + (size_t)row * ROW_STATE_LEN;
@@ -345,6 +351,8 @@ template <typename T>
     device float* rowp = scratch + (size_t)row * vocab;
     device const int* out_ids    = output_token_ids + (size_t)row * max_output_len;
     device const int* prompt_ids = prompt_token_ids + (size_t)row * max_prompt_len;
+    device const int*   bias_ids  = bias_token_ids + (size_t)row * max_bias;
+    device const float* bias_vals = bias_values + (size_t)row * max_bias;
     float rep_pen  = rep_penalties[row];
     float freq_pen = freq_penalties[row];
     float pres_pen = pres_penalties[row];
@@ -374,6 +382,9 @@ template <typename T>
                 logit *= rep_pen;
             }
             logit -= freq_pen * (float)count + pres_pen;
+        }
+        for (uint j = 0; j < max_bias; j++) {
+            if (bias_ids[j] == (int)v) logit += bias_vals[j];
         }
         rowp[v] = logit;
         local_max = max(local_max, logit * inv_temp);
