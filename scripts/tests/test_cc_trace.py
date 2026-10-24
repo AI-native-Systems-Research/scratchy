@@ -1234,6 +1234,19 @@ class LiveTest(unittest.TestCase):
         _, detail = self._live(sessions=1, grader=hidden)
         self.assertEqual(detail["sessions"][0]["pass"], True)
 
+    def test_relative_scr_and_out_dir(self):
+        # The PR's own example passes `--scr target/release/scr`, and cmd_live's
+        # default --out-dir is relative to --out.
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        (self.root / "target" / "release").mkdir(parents=True)
+        self.scr.rename(self.root / "target" / "release" / "scr")
+        os.chdir(self.root)
+        run, detail = self._live(sessions=1, scr="target/release/scr", out_dir="out")
+        self.assertEqual(run["status"], "published", run.get("void"))
+        self.assertEqual(detail["sessions"][0]["pass"], True)
+        self.assertTrue((self.root / "out" / "session-1" / "corpus" / "manifest.json").exists())
+
     @unittest.skipUnless(VALIDATOR.exists() and BOARD.exists(),
                          "needs site/build_leaderboard.py and board.json (#176)")
     def test_five_sessions_pass_the_board(self):

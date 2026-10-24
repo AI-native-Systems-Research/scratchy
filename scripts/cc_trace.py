@@ -1592,9 +1592,12 @@ def live(task, endpoint, *, engine, model, machine, rung, scratchy_sha, engine_p
     task_dir, prompt = load_task(task)
     if grader is None and not (task_dir / TASK_GRADER).is_file():
         raise SystemExit(f"{task_dir}: no {TASK_GRADER}, and no --grader given")
+    # Every session runs in its own working copy, so a relative path would be
+    # read from there.
     scr_path = shutil.which(scr) or (scr if Path(scr).is_file() else None)
     if not scr_path:
         raise SystemExit(f"no scr binary at {scr!r}; build it with the `claude` feature")
+    scr_path = str(Path(scr_path).resolve())
     if not shutil.which("claude"):
         raise SystemExit("`claude` (Claude Code) is not on PATH")
     up = _parse_url(endpoint, "--endpoint")
@@ -1605,7 +1608,7 @@ def live(task, endpoint, *, engine, model, machine, rung, scratchy_sha, engine_p
         up, endpoint, engine, ollama_version=ollama_version, context_length=context_length,
         model_name=served_model)
     reset_name, reset, _ = make_reset(engine, endpoint, model=served_model, timeout_s=timeout_s)
-    out_dir = Path(out_dir)
+    out_dir = Path(out_dir).resolve()
     if out_dir.exists() and any(out_dir.iterdir()):
         raise SystemExit(f"{out_dir} is not empty; every run needs its own --out-dir")
     out_dir.mkdir(parents=True, exist_ok=True)
