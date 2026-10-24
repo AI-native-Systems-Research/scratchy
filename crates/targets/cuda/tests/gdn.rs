@@ -1656,3 +1656,212 @@ fn the_scan_time_is_recorded() {
         }
     }
 }
+
+// ── #856: the two tightenings, the base-comparison dump and the timing lines ──
+
+/// The two launcher tightenings (#856), each refused before a pointer is touched with its output
+/// unchanged: the conv1d at `conv_dim` 192 (a valid kernel and state stride, but not a multiple of
+/// 128, one warp's channels) and the gating at `nv` 24 (not a multiple of 16).
+#[test]
+fn the_tightened_gdn_launchers_refuse_a_width_off_their_instantiation() {
+    let device = h100();
+    let small = |n: usize| up_f32_bits(&device, n, NAN_F32);
+    let (x, w, st, seq, out) = (
+        small(1 << 12),
+        small(1 << 12),
+        small(1 << 12),
+        small(4),
+        small(1 << 12),
+    );
+    let unchanged = |b: &DeviceBuffer| down_f32(b).iter().all(|v| v.to_bits() == NAN_F32);
+    let null = std::ptr::null_mut();
+    let (rows, cd, k) = (4u32, 192u32, 4u32);
+    // SAFETY: the launcher refuses this shape before it touches a pointer.
+    let got = unsafe {
+        gdn_conv1d(
+            (x.ptr(), w.ptr()),
+            (st.ptr(), u64::from(cd) * 3),
+            seq.ptr(),
+            out.ptr(),
+            (rows, cd, k),
+            null,
+        )
+    };
+    let want = KernelError::GdnConvShape {
+        rows,
+        conv_dim: cd,
+        kernel: k,
+    };
+    let kept = unchanged(&out) && unchanged(&st);
+    let conv_ok = got == Err(want) && kept;
+    eprintln!(
+        "refused conv1d rows={rows} conv_dim={cd} kernel={k}: {got:?} output_unchanged={kept} {}",
+        verdict(conv_ok)
+    );
+    let (rows, nv) = (4u32, 24u32);
+    // SAFETY: as above.
+    let got = unsafe {
+        gdn_gating(
+            (x.ptr(), x.ptr()),
+            (w.ptr(), w.ptr()),
+            seq.ptr(),
+            (out.ptr(), out.ptr()),
+            (rows, nv),
+            null,
+        )
+    };
+    let kept = unchanged(&out);
+    let gating_ok = got == Err(KernelError::GdnGatingShape { rows, nv }) && kept;
+    eprintln!(
+        "refused gating rows={rows} nv={nv}: {got:?} output_unchanged={kept} {}",
+        verdict(gating_ok)
+    );
+    assert!(
+        conv_ok && gating_ok,
+        "a tightened GDN launcher did not refuse a width off its instantiation"
+    );
+}
+
+/// For the base-against-change comparison (#856): one fresh step at the 0.8b and 9b geometries,
+/// L ∈ {1, 64, 300, 2048}: the conv1d's `conv_out` (real rows) and the slot's conv ring after it,
+/// the gating's `g` and `β` (real rows), and the gated norm's `out` (every row), written as raw
+/// little-endian bytes (f32, bf16 for `out`) to `<CARGO_TARGET_TMPDIR>/gdn_dump/<case>_<what>.bin`,
+/// with `case= what= elems= fnv1a=` printed. The same file run at two commits gives the
+/// `base_vs_pr mismatched_bits=` per case and buffer; this test asserts only that each step ran.
+#[test]
+fn the_gdn_stage_outputs_are_dumped_for_a_base_comparison() {
+    let device = h100();
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gdn_dump");
+    std::fs::create_dir_all(&dir).expect("create the dump directory");
+    let fnv = |bytes: &[u8]| {
+        (bytes.iter()).fold(0xCBF2_9CE4_8422_2325u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+        })
+    };
+    let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    for d in [G08, G9] {
+        let bu = bundle(d, 0xD2D0);
+        let bb = upload_bundle(&device, &bu);
+        for q_len in [1usize, 64, 300, 2048] {
+            let x = inputs(d, q_len, 0xD2D1 ^ q_len as u64);
+            let c = chunk(&x, d, 0, q_len, q_len + PAD);
+            let pool = Pool::new(&device, d, NAN_F32);
+            let s = run_step(&device, &pool, &bb, d, &c, (1, true)).expect("the step launches");
+            let case = format!("gdn_{}_L{q_len}", name(d));
+            let out: Vec<u8> = s.out.iter().flat_map(|b| b.to_le_bytes()).collect();
+            for (what, bytes, elem) in [
+                (
+                    "conv_out",
+                    f32_bytes(&s.conv_out[..q_len * d.conv_dim()]),
+                    4,
+                ),
+                ("ring", f32_bytes(&pool.conv_slot(1)), 4),
+                ("g", f32_bytes(&s.g[..q_len * d.nv]), 4),
+                ("beta", f32_bytes(&s.beta[..q_len * d.nv]), 4),
+                ("out", out, 2),
+            ] {
+                std::fs::write(dir.join(format!("{case}_{what}.bin")), &bytes)
+                    .expect("write a dump");
+                eprintln!(
+                    "case={case} what={what} elems={} fnv1a={:016x}",
+                    bytes.len() / elem,
+                    fnv(&bytes)
+                );
+            }
+        }
+    }
+}
+
+/// Each of the three kernels' time per launch at L = 300 and 4096, at the 0.8b and 9b geometries:
+/// 20 launches of one kernel alone on the default stream, over one step's own inputs and scratch,
+/// after one warm-up, timed to the download that waits for them. Recorded for the
+/// base-against-change comparison, not asserted.
+#[test]
+fn the_gdn_conv_gating_and_norm_times_are_recorded() {
+    const LAUNCHES: u32 = 20;
+    let device = h100();
+    let null = std::ptr::null_mut();
+    for d in [G08, G9] {
+        let bu = bundle(d, 0xD3D0);
+        let bb = upload_bundle(&device, &bu);
+        for q_len in [300usize, 4096] {
+            let x = inputs(d, q_len, 0xD3D1 ^ q_len as u64);
+            let c = chunk(&x, d, 0, q_len, q_len);
+            let pool = Pool::new(&device, d, NAN_F32);
+            let s = run_step(&device, &pool, &bb, d, &c, (0, true)).expect("the step launches");
+            let (r, cd, nv, hv) = (
+                q_len as u32,
+                d.conv_dim() as u32,
+                d.nv as u32,
+                d.head_v as u32,
+            );
+            let (qkv, z, a, b) = (
+                up(&device, &c.qkv),
+                up(&device, &c.z),
+                up(&device, &c.a),
+                up(&device, &c.b),
+            );
+            let conv_out = up_f32_bits(&device, q_len * d.conv_dim(), NAN_F32);
+            let (g, beta) = (
+                up_f32_bits(&device, q_len * d.nv, NAN_F32),
+                up_f32_bits(&device, q_len * d.nv, NAN_F32),
+            );
+            let o = up_f32(&device, &s.o);
+            let out = up(&device, &vec![NAN_BF16; q_len * d.value_dim()]);
+            // `start` 0: the conv reads the ring the step above wrote, never a fresh NaN slot.
+            let seq = up_u32(&device, &[0, q_len as u32, 0, 0]);
+            let l = pool.layout;
+            let time = |what: &str, launch: &dyn Fn()| {
+                launch();
+                seq.download().expect("wait for the warm-up");
+                let start = std::time::Instant::now();
+                for _ in 0..LAUNCHES {
+                    launch();
+                }
+                seq.download().expect("wait for the launches");
+                let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(LAUNCHES);
+                eprintln!("gdn {what} time {} L={q_len}: {us:.1} us/launch", name(d));
+            };
+            // SAFETY (each closure): as `run_step`'s, each kernel alone over this step's buffers.
+            time("conv1d", &|| {
+                unsafe {
+                    gdn_conv1d(
+                        (qkv.ptr(), bb.w.ptr()),
+                        (pool.conv.ptr(), l.conv_elems_per_slot() as u64),
+                        seq.ptr(),
+                        conv_out.ptr(),
+                        (r, cd, d.conv_kernel as u32),
+                        null,
+                    )
+                }
+                .expect("gdn_conv1d");
+            });
+            time("gating", &|| {
+                unsafe {
+                    gdn_gating(
+                        (a.ptr(), b.ptr()),
+                        (bb.a_log.ptr(), bb.dt_bias.ptr()),
+                        seq.ptr(),
+                        (g.ptr(), beta.ptr()),
+                        (r, nv),
+                        null,
+                    )
+                }
+                .expect("gdn_gating");
+            });
+            time("gated_norm", &|| {
+                unsafe {
+                    gdn_rms_norm_gated(
+                        (o.ptr(), z.ptr(), bb.norm.ptr()),
+                        seq.ptr(),
+                        out.ptr(),
+                        (r, nv, hv),
+                        EPS,
+                        null,
+                    )
+                }
+                .expect("gdn_rms_norm_gated");
+            });
+        }
+    }
+}
