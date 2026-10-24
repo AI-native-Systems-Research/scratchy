@@ -104,15 +104,17 @@ pub struct GemmBf16 {
     pub k: u32,
 }
 
-/// The narrow GEMM's largest `n`: each lane of its warp keeps `n` f32 partial sums in registers
-/// (`kernels/gemm_narrow_bf16.cu`).
+/// The narrow GEMM's largest `n`: all of `B`'s rows are one 64-row ThunderKittens tile, and every
+/// column of `C` one 64-column output tile (`kernels/gemm_narrow_bf16.cu`).
 pub const GEMM_NARROW_BF16_MAX_N: u32 = 64;
-/// The narrow GEMM's `n` and `k` are non-zero multiples of this: `k` is read in 16-byte vectors of
-/// 8 bf16, and `n` keeps every row of `C` 16-byte aligned.
+/// The narrow GEMM's `n` and `k` are non-zero multiples of this: 8 bf16 is 16 bytes, so every row
+/// stride of `A`, `B` and `C` is a multiple of 16 bytes, as their TMA tensor maps need.
 pub const GEMM_NARROW_BF16_MULTIPLE: u32 = 8;
 
-/// The GEMV's `k` is a non-zero multiple of this: each lane reads 16-byte vectors of 8 bf16
-/// (`kernels/gemv_bf16.cu`). `n` is non-zero, and `n` and `k` are at most `i32::MAX`; `m` is 1.
+/// The GEMV's `k` is a non-zero multiple of this: 8 bf16 is 16 bytes, so every row stride of `a`
+/// and `B` is a multiple of 16 bytes, as their TMA tensor maps need (`kernels/gemv_bf16.cu`). `n`
+/// is non-zero (any value: `c` is written without a tensor map), and `n` and `k` are at most
+/// `i32::MAX`; `m` is 1.
 pub const GEMV_BF16_MULTIPLE: u32 = 8;
 
 /// The RMSNorm's `cols` is a non-zero multiple of this: 8 bf16 is 16 bytes, so every row stride is a multiple of 16 bytes, as the ThunderKittens 16-row tile's TMA tensor maps need (`kernels/rms_norm_bf16.cu`). `rows`
