@@ -29,10 +29,11 @@ use scratchy_target_cuda::step::{
     GATE_SPLIT_BF16_HEAD_DIM, GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
     GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_NARROW_BF16_MAX_N,
     GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16,
-    GateScaleBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16, MOE_ROUTE_EXPERTS,
+    GateScaleBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_EXPERTS,
     MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, PairRows, RMS_NORM_BF16_COLS,
-    ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RopeAppendBf16, RopeBf16,
-    RopePairing, RouteProgram, RouterLogitsBf16, SILU_MUL_BF16_COLS, SiluMulBf16,
+    ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16,
+    RopeBf16, RopePairing, RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS,
+    SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
@@ -124,13 +125,17 @@ pub fn lower_step(
             weight,
             bundle,
         } => expert_matmul(cx, s, (*proj, *n, k.get()), (*weight, *bundle), computes),
-        L::ExpertGatedAct { act } => expert_gated_act(cx, s, *act, computes).map(CudaStep::SiluMul),
+        L::ExpertGatedAct { act } => expert_gated_act(cx, s, *act, computes),
         L::ExpertUnsort => return expert_unsort(cx, s, computes).map(|()| None),
         L::ExpertCombine { hidden, shared } => {
             expert_combine(cx, s, *hidden, shared.0.is_some(), computes)
                 .map(CudaStep::ExpertCombine)
         }
         L::GateScale => gate_scale(cx, s).map(CudaStep::GateScale),
+        L::ScalarMul { scale } => scalar_mul(cx, s, *scale).map(CudaStep::Scale),
+        L::RmsNormUnit { eps } => rms_norm_unit(cx, s, *eps).map(CudaStep::RmsNormUnit),
+        L::ScalarWeightMul => layer_scale(cx, s).map(CudaStep::LayerScale),
+        L::TanhSoftCap { cap } => soft_cap(cx, s, *cap).map(CudaStep::SoftCap),
         // A routing runs only as the `MoeRoute` fold its top-k drives: one the fold left (a
         // softmax or argsort it did not absorb, a top-k driving none, a gather or renorm no
         // top-k took as its epilogue) has no kernel.
@@ -144,20 +149,17 @@ pub fn lower_step(
             rule: MoeShapeRule::Routing,
         }),
         // SwiGLU runs only as the `SiluMul` fold: a `Silu` the fold left, a `Mul` driving none,
-        // and the pre-fused op (which only spyre's `fuse_silu_mul` makes) have no kernel.
+        // and the pre-fused op (which only spyre's `fuse_silu_mul` makes) have no kernel. GeGLU
+        // runs only as the `GeluMul` fold: a `Gelu` it left is refused below, as not lowered.
         L::Elementwise(E::Silu | E::Mul) | L::SiluMul => Err(CanonicalRefusal::Unfused {
             step: s.step,
             op: op.name(),
         }),
         L::SumReduce { .. }
         | L::Elementwise(E::Gelu | E::QuickGelu | E::GeluErf | E::Relu2 | E::Sub | E::BiasAdd)
-        | L::ScalarMul { .. }
         | L::RmsNormReduce { .. }
         | L::RmsNormApply { .. }
         | L::KvAppend { .. }
-        | L::TanhSoftCap { .. }
-        | L::RmsNormUnit { .. }
-        | L::ScalarWeightMul
         | L::Concat { .. }
         | L::LoadRows { .. }
         | L::EmbeddingGather { .. }
@@ -238,14 +240,9 @@ pub fn lower_fused(
     computes: &[TapeStep<'_>],
 ) -> Result<CudaStep, CanonicalRefusal> {
     match fusion.kernel {
-        CudaFusion::SiluMul => silu_mul(cx, s, fusion.shape, computes).map(CudaStep::SiluMul),
+        CudaFusion::SiluMul => gated_mul(cx, s, fusion.shape, computes).map(CudaStep::SiluMul),
+        CudaFusion::GeluMul => gated_mul(cx, s, fusion.shape, computes).map(CudaStep::GeluMul),
         CudaFusion::MoeRoute => moe_route(cx, s, fusion.shape, computes).map(CudaStep::MoeRoute),
-        // The GeGLU fold has its row in `CUDA_FUSIONS`; its step is #885's next part. Only a
-        // `Gelu` folds into it, and no qwen tape has one.
-        CudaFusion::GeluMul => Err(CanonicalRefusal::NotLowered {
-            step: s.step,
-            op: "GeluMul",
-        }),
     }
 }
 
@@ -370,10 +367,10 @@ fn add(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<AddBf16, CanonicalRefusal> {
     })
 }
 
-/// The `SiluMul` fold of `mul(silu(gate), up)` as one bf16 launch: `gate` is the absorbed
-/// `Silu`'s operand 0, `up` the driving `Mul`'s operand 1, `out` the `Mul`'s colour. The `Silu`'s
-/// own colour is never written.
-fn silu_mul(
+/// The `SiluMul` fold of `mul(silu(gate), up)`, or the `GeluMul` fold of `mul(gelu(gate), up)`,
+/// as one bf16 launch: `gate` is the absorbed activation's operand 0, `up` the driving `Mul`'s
+/// operand 1, `out` the `Mul`'s colour. The activation's own colour is never written.
+fn gated_mul(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     shape: FusedShape,
@@ -1015,6 +1012,119 @@ fn gate_apply(
     })
 }
 
+/// The one activation operand (operand 0) of a unary row op, `[rows, cols]` as its output, and
+/// that output's shape under the row rule of `multiple`.
+fn unary_row(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    multiple: u32,
+) -> Result<(Colour, u32, u32), CanonicalRefusal> {
+    let x = match s.node.inputs.as_slice() {
+        [x] => x,
+        [] => return Err(operand(s, 0, OperandRefusal::Missing)),
+        [_, ..] => return Err(operand(s, 1, OperandRefusal::Extra)),
+    };
+    let TensorShape { rows, cols } = cx.graph.shape(s.node.output.tensor);
+    row_shape(s, rows, cols, multiple)?;
+    same_shape(cx, s, 0, x, rows, cols)?;
+    whole_tensors(cx, s, &[(0, x)])?;
+    let xc = activation(cx, s, 0, s.inputs.iter().next())?;
+    Ok((xc, rows, cols))
+}
+
+/// Refuse a compile-time scalar of a row op unless it is finite and, when `positive`, above 0.
+fn finite_scalar(s: &TapeStep<'_>, value: f32, positive: bool) -> Result<(), CanonicalRefusal> {
+    if value.is_finite() && (!positive || value > 0.0) {
+        return Ok(());
+    }
+    Err(CanonicalRefusal::Scalar {
+        step: s.step,
+        op: s.node.op.name(),
+        value,
+    })
+}
+
+/// `ScalarMul { scale }` as the bf16 scale (Gemma's embedding scale): `x` (operand 0) a computed
+/// slot or the embedded hidden, times the op's `scale`.
+fn scalar_mul(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    scale: f32,
+) -> Result<ScaleBf16, CanonicalRefusal> {
+    let (xc, rows, cols) = unary_row(cx, s, SCALE_BF16_COLS)?;
+    finite_scalar(s, scale, false)?;
+    let at = arena(cx)?;
+    Ok(ScaleBf16 {
+        x: at(xc),
+        out: at(colour_of(cx, s.writes)),
+        rows,
+        cols,
+        scale_bits: scale.to_bits(),
+    })
+}
+
+/// `RmsNormUnit { eps }` as the bf16 RMSNorm with no gain (Gemma's `v_norm`): `x` (operand 0) a
+/// computed slot or the embedded hidden, `rows` and `cols` the output's.
+fn rms_norm_unit(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    eps: f32,
+) -> Result<RmsNormUnitBf16, CanonicalRefusal> {
+    let (xc, rows, cols) = unary_row(cx, s, RMS_NORM_BF16_COLS)?;
+    if !(eps.is_finite() && eps > 0.0) {
+        return Err(CanonicalRefusal::NormEps { step: s.step, eps });
+    }
+    let at = arena(cx)?;
+    Ok(RmsNormUnitBf16 {
+        x: at(xc),
+        y: at(colour_of(cx, s.writes)),
+        rows,
+        cols,
+        eps_bits: eps.to_bits(),
+    })
+}
+
+/// `ScalarWeightMul` as the bf16 layer scale (Gemma's `layer_scalar`): `x` (operand 0) a computed
+/// slot or the embedded hidden, times operand 1, a `[1, 1]` model weight.
+fn layer_scale(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<LayerScaleBf16, CanonicalRefusal> {
+    let (x, w) = match s.node.inputs.as_slice() {
+        [x, w] => (x, w),
+        [_] | [] => return Err(operand(s, 1, OperandRefusal::Missing)),
+        [_, _, ..] => return Err(operand(s, 2, OperandRefusal::Extra)),
+    };
+    let TensorShape { rows, cols } = cx.graph.shape(s.node.output.tensor);
+    row_shape(s, rows, cols, SCALE_BF16_COLS)?;
+    same_shape(cx, s, 0, x, rows, cols)?;
+    same_shape(cx, s, 1, w, 1, 1)?;
+    whole_tensors(cx, s, &[(0, x), (1, w)])?;
+    let at = arena(cx)?;
+    let mut inputs = s.inputs.iter();
+    let xc = activation(cx, s, 0, inputs.next())?;
+    let scale = weight_operand(cx, s, 1, inputs.next())?;
+    Ok(LayerScaleBf16 {
+        x: at(xc),
+        scale,
+        out: at(colour_of(cx, s.writes)),
+        rows,
+        cols,
+    })
+}
+
+/// `TanhSoftCap { cap }` as the bf16 soft-cap (Gemma's final logits): `x` (operand 0) a computed
+/// slot or the embedded hidden, `cap` finite and above 0.
+fn soft_cap(cx: &StepCx<'_>, s: &TapeStep<'_>, cap: f32) -> Result<SoftCapBf16, CanonicalRefusal> {
+    let (xc, rows, cols) = unary_row(cx, s, SOFT_CAP_BF16_COLS)?;
+    finite_scalar(s, cap, true)?;
+    let at = arena(cx)?;
+    Ok(SoftCapBf16 {
+        x: at(xc),
+        out: at(colour_of(cx, s.writes)),
+        rows,
+        cols,
+        cap_bits: cap.to_bits(),
+    })
+}
+
 // ── The MoE block ───────────────────────────────────────────────────
 
 /// A MoE op's refusal.
@@ -1336,32 +1446,34 @@ fn expert_matmul(
     }))
 }
 
-/// `ExpertGatedAct { act: Silu }` as the bf16 `SiluMul` over the MoE scratch's rows: `silu(gate)
-/// · up` from the gate and up projections (operands 0 and 1) into the activation rows, every row
-/// of the regions (a sorted bucket's padding rows hold `+0.0`, its rows past the live tiles stale
-/// data no step reads). Any other activation is refused.
+/// `ExpertGatedAct { act }` as the bf16 `SiluMul` (Qwen's SiLU) or `GeluMul` (Gemma's GELU) over
+/// the MoE scratch's rows: `act(gate) · up` from the gate and up projections (operands 0 and 1)
+/// into the activation rows, every row of the regions (a sorted bucket's padding rows hold `+0.0`,
+/// its rows past the live tiles stale data no step reads). Any other activation is refused.
 fn expert_gated_act(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     act: GatedAct,
     computes: &[TapeStep<'_>],
-) -> Result<SiluMulBf16, CanonicalRefusal> {
-    if act != GatedAct::Silu {
-        return Err(moe_refusal(s, MoeShapeRule::Activation));
-    }
+) -> Result<CudaStep, CanonicalRefusal> {
+    let kernel: fn(SiluMulBf16) -> CudaStep = match act {
+        GatedAct::Silu => CudaStep::SiluMul,
+        GatedAct::Gelu => CudaStep::GeluMul,
+        _ => return Err(moe_refusal(s, MoeShapeRule::Activation)),
+    };
     let proj_is = |p: ExpertProj| move |op: &SubOp| matches!(op, SubOp::ExpertMatmul { proj, .. } if *proj == p);
     moe_producer(cx, s, 0, computes, proj_is(ExpertProj::Gate))?;
     moe_producer(cx, s, 1, computes, proj_is(ExpertProj::Up))?;
     let moe = moe_tape(cx, s)?;
     let rows = moe.expert_rows(cx.tokens.unwrap_or(0));
     row_shape(s, rows, moe.inter, SILU_MUL_BF16_COLS)?;
-    Ok(SiluMulBf16 {
+    Ok(kernel(SiluMulBf16 {
         gate: moe.gate.offset,
         up: moe.up.offset,
         out: moe.act.offset,
         rows,
         cols: moe.inter,
-    })
+    }))
 }
 
 /// `ExpertUnsort`: no launch. The combine reads each pair's down row through the sort's `pos`

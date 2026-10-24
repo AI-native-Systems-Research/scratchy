@@ -132,6 +132,10 @@ pub const ATTN_BF16_HEAD_DIMS: &[u32] = &[256, 512];
 /// is 16 blocks.
 pub const ATTN_WINDOW_MULTIPLE: u32 = CUDA_KV_BLOCK_SIZE;
 
+/// The scale's and the layer scale's `cols` is a non-zero multiple of this (one 16-byte vector of
+/// 8 bf16), `rows` non-zero, and `rows · cols` at most `i32::MAX`.
+pub const SCALE_BF16_COLS: u32 = 8;
+
 /// The soft-cap's `cols` is a non-zero multiple of this (one 16-byte vector of 8 bf16), `rows`
 /// non-zero, and `rows · cols` at most `i32::MAX`.
 pub const SOFT_CAP_BF16_COLS: u32 = 8;

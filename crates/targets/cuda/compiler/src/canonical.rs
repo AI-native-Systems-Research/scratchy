@@ -238,6 +238,13 @@ pub enum CanonicalRefusal {
         step: usize,
         eps: f32,
     },
+    /// The `step`-th `Compute` is a scale or a soft-cap whose compile-time scalar `value` is not
+    /// finite, or (a soft-cap's cap, which divides) not above 0.
+    Scalar {
+        step: usize,
+        op: &'static str,
+        value: f32,
+    },
     /// The `step`-th `Compute` is an RmsNorm whose gain is `[rows, cols]`, not `[1, want]`.
     GainShape {
         step: usize,
@@ -441,7 +448,7 @@ pub enum MoeShapeRule {
     Bundle,
     /// The expert bank is affine; CUDA's expert kernels take dense bf16 only.
     Affine,
-    /// The gated activation is not SiLU, the one `silu_mul_bf16.cu` computes.
+    /// The gated activation is neither SiLU (`silu_mul_bf16.cu`) nor GELU (the `GeluMul` step).
     Activation,
     /// The routing is not the fold of a softmax, an argsort and a gather (and a renorm).
     Routing,
@@ -714,6 +721,10 @@ impl std::fmt::Display for CanonicalRefusal {
                 f,
                 "step {step} (RmsNorm) has eps = {eps}; it must be finite and above 0"
             ),
+            Self::Scalar { step, op, value } => write!(
+                f,
+                "step {step} ({op}) has a scalar of {value}; it must be finite, and a cap above 0"
+            ),
             Self::GainShape {
                 step,
                 rows,
@@ -934,7 +945,7 @@ impl std::fmt::Display for MoeShapeRule {
                  GEMM for"
             ),
             Self::Affine => write!(f, "its experts are affine; CUDA's take dense bf16 only"),
-            Self::Activation => write!(f, "its gated activation is not SiLU"),
+            Self::Activation => write!(f, "its gated activation is neither SiLU nor GELU"),
             Self::Routing => write!(
                 f,
                 "its routing is not a softmax, then the top-k, then an optional renorm"
