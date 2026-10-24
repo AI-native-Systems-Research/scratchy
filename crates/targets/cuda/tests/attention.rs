@@ -1039,3 +1039,52 @@ fn the_decode_attention_launcher_refuses_each_bad_shape() {
     }
     assert!(pass, "a decode refusal launched or wrote");
 }
+
+/// The KV append is instantiated for head_dim 256 only (#853), so head_dim 128 (a multiple of 8)
+/// is refused and leaves the cache untouched; and the same append twice, over the same poisoned
+/// caches, gives the same bits.
+#[test]
+fn kv_append_refuses_head_dim_128_and_repeats() {
+    let device = h100();
+    let Appended {
+        caches: (kc, vc),
+        kv: (kb, vb),
+        slots: sb,
+        after: (kh, vh),
+        pass,
+    } = append_bit_exact(&device, 2);
+    let (r, h, d, block_size) = (256u32, 2u32, 128u32, BS as u32);
+    // SAFETY: refused before any pointer is touched.
+    let got = unsafe {
+        kv_append_bf16(
+            (kb.ptr(), vb.ptr()),
+            sb.ptr(),
+            (kc.ptr(), vc.ptr()),
+            (r, h, d),
+            (block_size, BLOCKS as u32),
+            std::ptr::null_mut(),
+        )
+    };
+    let want = Err(KernelError::KvAppendShape {
+        rows: r,
+        kv_heads: h,
+        head_dim: d,
+        block_size,
+    });
+    let untouched = kc.download().expect("K") == kh && vc.download().expect("V") == vh;
+    let refused = got == want && untouched;
+    eprintln!(
+        "kv_append refusal (head_dim 128): {got:?} cache_untouched={untouched} {}",
+        verdict(refused)
+    );
+    let again = append_bit_exact(&device, 2);
+    let mismatched = mismatched_bits(&again.after.0, &kh) + mismatched_bits(&again.after.1, &vh);
+    eprintln!(
+        "kv_append rows=256 kv_heads=2 repeat mismatched_bits={mismatched} {}",
+        verdict(mismatched == 0)
+    );
+    assert!(
+        pass && again.pass && refused && mismatched == 0,
+        "the KV append did not refuse head_dim 128, or did not repeat bit for bit"
+    );
+}

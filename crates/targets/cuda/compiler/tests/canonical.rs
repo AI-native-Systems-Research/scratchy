@@ -653,6 +653,29 @@ fn a_gate_split_above_int_max_elements_is_refused() {
     ));
 }
 
+/// A gate split at a head dim the kernel is not instantiated for: 128 is a multiple of 8 and
+/// `half_cols` 2048 is whole heads of it, so only the last check, the one head dim 256 the kernel
+/// takes (#853), refuses it.
+#[test]
+fn a_gate_split_off_the_instantiated_head_dim_is_refused() {
+    let facts = CudaModelFacts {
+        head_dim: 128,
+        ..FACTS
+    };
+    let e = refusal(&attn_gate(256), facts);
+    assert!(e.to_string().contains("head_dim must be 256"), "{e}");
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GateShape {
+            step: 2,
+            half_cols: 2048,
+            head_dim: 128,
+            rule: GateShapeRule::HeadNotInstantiated { want: 256 },
+            ..
+        }
+    ));
+}
+
 /// `ProducerMissing` cannot be reached through `lower_canonical`: `computes` there is every
 /// `Compute` of the tape, and every computed operand is a slot one of them writes. So the lowering
 /// function is called directly, with the `Silu` the `SiluMul` fold absorbed left out of
