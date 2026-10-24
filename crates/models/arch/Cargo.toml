@@ -839,3 +839,10 @@ required-features = ["nvcc", "qwen3.5-9b-text-only"]
 name = "cuda_hf_parity_9b"
 required-features = ["nvcc", "qwen3.5-9b-text-only"]
 
+# A diagnostic for TK-1 (#846): every narrow GEMM and GDN output of qwen3.5-9b's prompt 6 on the
+# real checkpoint, against an f64 reference and dumped for a base-against-change comparison. Needs
+# nvcc, an H100, the checkpoint and the goldens, as `cuda_hf_parity_9b`.
+[[test]]
+name = "cuda_narrow_diag_9b"
+required-features = ["nvcc", "qwen3.5-9b-text-only"]
+
