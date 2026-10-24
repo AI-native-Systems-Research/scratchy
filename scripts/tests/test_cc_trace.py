@@ -1296,6 +1296,20 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(FakeAnthropic.seen, [])
         self.assertFalse((self.root / "out").exists())
 
+    def test_a_timed_out_session_leaves_nothing_running(self):
+        # What Claude Code looks like to `scr launch`: a child that keeps editing
+        # the working copy after scr itself is gone.
+        self.env["FAKE_FIX"] = TASK_BROKEN
+        self.env["FAKE_SHELL"] = ("(sleep 2; printf 'def add(a, b):\\n    return a + b\\n' > m.py) & "
+                                  "sleep 6")
+        run, detail = self._live(sessions=1, timeout_s=1)
+        s = detail["sessions"][0]
+        self.assertTrue(s["timed_out"])
+        self.assertEqual(s["pass"], False)
+        time.sleep(3)
+        work = self.root / "out" / "session-1" / "workdir"
+        self.assertEqual((work / "m.py").read_text(), TASK_BROKEN)
+
     @unittest.skipUnless(VALIDATOR.exists() and BOARD.exists(),
                          "needs site/build_leaderboard.py and board.json (#176)")
     def test_five_sessions_pass_the_board(self):

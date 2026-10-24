@@ -1598,13 +1598,9 @@ def run_session(task, workdir, corpus, endpoint, *, scr, model, served_model, en
            "--allowedTools", "Read,Write,Edit,Bash"]
     t0 = time.monotonic()
     try:
-        p = subprocess.run(cmd, cwd=workdir, env=env, capture_output=True, text=True,
-                           timeout=timeout_s)
-        exit_code, timed_out, output = p.returncode, False, p.stdout + p.stderr
-    except subprocess.TimeoutExpired as e:
-        # text=True does not decode what a timeout leaves behind.
-        exit_code, timed_out = None, True
-        output = b"".join(x or b"" for x in (e.stdout, e.stderr)).decode("utf-8", "replace")
+        with open(Path(corpus) / "claude.log", "wb") as output:
+            exit_code, timed_out = run_own_group(cmd, cwd=workdir, env=env, timeout=timeout_s,
+                                                 stdout=output, stderr=subprocess.STDOUT)
     finally:
         server.shutdown()
         server.server_close()
@@ -1614,7 +1610,6 @@ def run_session(task, workdir, corpus, endpoint, *, scr, model, served_model, en
         server.corpus.close()
     seconds = time.monotonic() - t0
     served_after = requests_served(info_url)
-    (Path(corpus) / "claude.log").write_text(output)
     passed, grader_said = grade(workdir, task["grader"], task_dir=task["dir"],
                                 commit=task["commit"], aside=Path(corpus).parent / "agent.git")
     stats = session_stats(corpus)
