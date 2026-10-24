@@ -3,16 +3,28 @@
 
 //! E2E tests for reasoning parser (`--reasoning-parser`).
 //!
-//! Tests both non-streaming and streaming paths with different parsers.
-//! Uses SmolLM (which doesn't produce `<think>` tokens) to verify the code
-//! path works without errors, and optionally Qwen3 for real reasoning output.
+//! Tests both non-streaming and streaming paths with different parsers, on Qwen3-0.6B
+//! (`TestModels::QWEN3`), a model that thinks: its reply opens `<think>…</think>` and then
+//! answers, so a parser has real reasoning to split off. A parser refuses a model whose
+//! vocabulary has no think tokens (as vLLM's does), so these cannot run on SmolLM. The two
+//! no-parser tests run on SmolLM, whose architecture installs no parser of its own.
 //!
-//! Run with: `cargo test -p vllm-e2e --features e2e --test e_reasoning -- --ignored --test-threads=1`
+//! On metal the two models need two builds, as `TestModels::QWEN3` is MLX 4-bit there and a
+//! quant preset replaces SmolLM2's dense emission. The parser tests (on cuda drop the quant
+//! feature; QWEN3 is dense there):
+//! `cargo test -p scratchy-e2e -p scratchy-models -p scratchy-quantizations --features
+//! e2e,metal,scratchy-models/qwen3-0.6b,scratchy-quantizations/mlx-affine-b4-g64
+//! --test e_reasoning -- --ignored --test-threads=1 --skip no_reasoning_parser`
+//! and the no-parser tests:
+//! `cargo test -p scratchy-e2e -p scratchy-models --features e2e,metal,scratchy-models/smollm2-135m
+//! --test e_reasoning -- --ignored --test-threads=1 no_reasoning_parser`
 
 #![cfg(feature = "e2e")]
 
 use scratchy_e2e::{Client, TestModels, TestServer};
-use scratchy_serving_api::protocol::{ChatCompletionMessageParam, ChatCompletionRequest};
+use scratchy_serving_api::protocol::{
+    ChatCompletionMessageParam, ChatCompletionRequest, ChatCompletionStreamResponse,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -33,235 +45,181 @@ fn default_chat_request() -> ChatCompletionRequest {
     serde_json::from_str(r#"{"messages": []}"#).unwrap()
 }
 
+/// A short question Qwen3-0.6B thinks about and then answers within the token budget.
+fn thinking_request(stream: bool) -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        messages: vec![user_msg("Say hello.")],
+        max_tokens: Some(1024),
+        temperature: Some(0.0),
+        stream,
+        ..default_chat_request()
+    }
+}
+
+async fn start_qwen3(parser: &str) -> (TestServer, Client) {
+    let server = TestServer::builder(TestModels::QWEN3)
+        .with_reasoning_parser(parser)
+        .start()
+        .await
+        .expect("server should start with the reasoning parser");
+    let client = Client::new(server.base_url());
+    (server, client)
+}
+
+/// What the deltas of a streamed reply carried: its reasoning and its content, concatenated.
+fn streamed(chunks: &[ChatCompletionStreamResponse]) -> (String, String) {
+    let (mut reasoning, mut content) = (String::new(), String::new());
+    for choice in chunks.iter().flat_map(|c| &c.choices) {
+        reasoning.push_str(choice.delta.reasoning.as_deref().unwrap_or(""));
+        content.push_str(choice.delta.content.as_deref().unwrap_or(""));
+    }
+    (reasoning, content)
+}
+
+/// Neither part of a split reply carries the think markers themselves.
+fn assert_no_markers(part: &str, what: &str) {
+    assert!(
+        !part.contains("<think>") && !part.contains("</think>"),
+        "{what} carries a think marker: {part:?}"
+    );
+}
+
 // ===========================================================================
-// Tests with SmolLM + deepseek_r1 parser
+// deepseek_r1 parser: the thinking is reasoning, the answer content
 // ===========================================================================
-// SmolLM doesn't produce <think> tokens, so DeepSeek R1 parser treats the
-// entire output as reasoning (no </think> found). This tests the wiring.
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_reasoning_parser_deepseek_r1_nonstreaming() {
-    let server = TestServer::builder(TestModels::SMOLLM)
-        .with_reasoning_parser("deepseek_r1")
-        .start()
+    let (_server, client) = start_qwen3("deepseek_r1").await;
+    let resp = client
+        .chat_completion(&thinking_request(false))
         .await
-        .expect("server should start with reasoning parser");
-    let client = Client::new(server.base_url());
-
-    let request = ChatCompletionRequest {
-        messages: vec![user_msg("Say hello.")],
-        max_tokens: Some(20),
-        temperature: Some(0.0),
-        ..default_chat_request()
-    };
-
-    let resp = client.chat_completion(&request).await.unwrap();
-    assert_eq!(resp.choices.len(), 1);
+        .unwrap();
     let msg = &resp.choices[0].message;
-
-    // SmolLM doesn't produce </think>, so DeepSeek parser:
-    // everything is reasoning, content is None.
+    let reasoning = msg.reasoning.as_deref().unwrap_or("");
+    let content = msg.content.as_deref().unwrap_or("");
     assert!(
-        msg.reasoning.is_some(),
-        "reasoning field should be populated (entire output is reasoning)"
+        !reasoning.trim().is_empty(),
+        "the thinking is reasoning: {msg:?}"
     );
-    assert!(
-        msg.content.is_none(),
-        "content should be None when model produces no </think>"
-    );
+    assert!(!content.trim().is_empty(), "the answer is content: {msg:?}");
+    assert_no_markers(reasoning, "reasoning");
+    assert_no_markers(content, "content");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_reasoning_parser_deepseek_r1_streaming() {
-    let server = TestServer::builder(TestModels::SMOLLM)
-        .with_reasoning_parser("deepseek_r1")
-        .start()
+    let (_server, client) = start_qwen3("deepseek_r1").await;
+    let chunks = client
+        .chat_completion_stream(&thinking_request(true))
         .await
-        .expect("server should start with reasoning parser");
-    let client = Client::new(server.base_url());
-
-    let request = ChatCompletionRequest {
-        messages: vec![user_msg("Say hello.")],
-        max_tokens: Some(20),
-        temperature: Some(0.0),
-        stream: true,
-        ..default_chat_request()
-    };
-
-    let chunks = client.chat_completion_stream(&request).await.unwrap();
-    assert!(!chunks.is_empty(), "should have at least one chunk");
-
-    // Collect reasoning and content from streaming deltas.
-    let mut has_reasoning = false;
-    let mut has_content = false;
-    for chunk in &chunks {
-        for choice in &chunk.choices {
-            if choice.delta.reasoning.is_some() {
-                has_reasoning = true;
-            }
-            if choice.delta.content.is_some() {
-                has_content = true;
-            }
-        }
-    }
-
-    // With DeepSeek parser and no </think> from SmolLM, all deltas should
-    // be reasoning (the streaming state never transitions to content).
-    assert!(has_reasoning, "streaming should have reasoning deltas");
-    // Content may or may not appear depending on whether model accidentally
-    // produces </think>-like tokens. Don't assert on has_content.
-    let _ = has_content;
+        .unwrap();
+    let (reasoning, content) = streamed(&chunks);
+    assert!(!reasoning.trim().is_empty(), "reasoning deltas");
+    assert!(!content.trim().is_empty(), "content deltas");
+    assert_no_markers(&reasoning, "streamed reasoning");
+    assert_no_markers(&content, "streamed content");
 }
 
 // ===========================================================================
-// Tests with SmolLM + qwen3 parser
+// qwen3 parser: the same split, and none when the request turns thinking off
 // ===========================================================================
-// SmolLM doesn't produce <think> or </think> tokens, so Qwen3 parser treats
-// everything as content (thinking disabled).
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_reasoning_parser_qwen3_nonstreaming() {
-    let server = TestServer::builder(TestModels::SMOLLM)
-        .with_reasoning_parser("qwen3")
-        .start()
+    let (_server, client) = start_qwen3("qwen3").await;
+    let resp = client
+        .chat_completion(&thinking_request(false))
         .await
-        .expect("server should start with qwen3 reasoning parser");
-    let client = Client::new(server.base_url());
-
-    let request = ChatCompletionRequest {
-        messages: vec![user_msg("Say hello.")],
-        max_tokens: Some(20),
-        temperature: Some(0.0),
-        ..default_chat_request()
-    };
-
-    let resp = client.chat_completion(&request).await.unwrap();
-    assert_eq!(resp.choices.len(), 1);
+        .unwrap();
     let msg = &resp.choices[0].message;
-
-    // Qwen3: no </think> → thinking disabled, everything is content.
     assert!(
-        msg.reasoning.is_none(),
-        "reasoning should be None (thinking disabled)"
+        msg.reasoning
+            .as_deref()
+            .is_some_and(|r| !r.trim().is_empty()),
+        "thinking on: reasoning populated: {msg:?}"
     );
-    assert!(msg.content.is_some(), "content should be populated");
+    assert!(
+        msg.content.as_deref().is_some_and(|c| !c.trim().is_empty()),
+        "thinking on: the answer is content: {msg:?}"
+    );
+
+    // `enable_thinking: false`: the template closes thinking, and the whole reply is content.
+    let no_thinking = ChatCompletionRequest {
+        chat_template_kwargs: Some(
+            [("enable_thinking".to_string(), serde_json::json!(false))].into(),
+        ),
+        ..thinking_request(false)
+    };
+    let resp = client.chat_completion(&no_thinking).await.unwrap();
+    let msg = &resp.choices[0].message;
+    assert!(
+        msg.reasoning.as_deref().is_none_or(|r| r.trim().is_empty()),
+        "thinking off: no reasoning: {msg:?}"
+    );
+    let content = msg.content.as_deref().unwrap_or("");
+    assert!(!content.trim().is_empty(), "thinking off: content: {msg:?}");
+    assert_no_markers(content, "content with thinking off");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_reasoning_parser_qwen3_streaming() {
-    let server = TestServer::builder(TestModels::SMOLLM)
-        .with_reasoning_parser("qwen3")
-        .start()
+    let (_server, client) = start_qwen3("qwen3").await;
+    let chunks = client
+        .chat_completion_stream(&thinking_request(true))
         .await
-        .expect("server should start with qwen3 reasoning parser");
-    let client = Client::new(server.base_url());
-
-    let request = ChatCompletionRequest {
-        messages: vec![user_msg("Say hello.")],
-        max_tokens: Some(20),
-        temperature: Some(0.0),
-        stream: true,
-        ..default_chat_request()
-    };
-
-    let chunks = client.chat_completion_stream(&request).await.unwrap();
-    assert!(!chunks.is_empty(), "should have at least one chunk");
-
-    // Collect content deltas.
-    let mut has_content = false;
-    let mut has_reasoning = false;
-    for chunk in &chunks {
-        for choice in &chunk.choices {
-            if choice.delta.content.is_some() {
-                has_content = true;
-            }
-            if choice.delta.reasoning.is_some() {
-                has_reasoning = true;
-            }
-        }
-    }
-
-    // Qwen3 with SmolLM: no think tokens → everything is content.
-    assert!(has_content, "should have content deltas");
-    // SmolLM tokens won't match <think>/<think> IDs, so reasoning
-    // should not appear (thinking disabled path in Qwen3 streaming).
-    let _ = has_reasoning; // Don't hard-assert — depends on vocab overlap.
+        .unwrap();
+    let (reasoning, content) = streamed(&chunks);
+    assert!(!reasoning.trim().is_empty(), "reasoning deltas");
+    assert!(!content.trim().is_empty(), "content deltas");
+    assert_no_markers(&content, "streamed content");
 }
 
 // ===========================================================================
-// include_reasoning=false
+// include_reasoning=false: the reasoning is dropped, the answer kept
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_include_reasoning_false_nonstreaming() {
-    let server = TestServer::builder(TestModels::SMOLLM)
-        .with_reasoning_parser("deepseek_r1")
-        .start()
-        .await
-        .expect("server should start");
-    let client = Client::new(server.base_url());
-
+    let (_server, client) = start_qwen3("deepseek_r1").await;
     let request = ChatCompletionRequest {
-        messages: vec![user_msg("Say hello.")],
-        max_tokens: Some(20),
-        temperature: Some(0.0),
         include_reasoning: false,
-        ..default_chat_request()
+        ..thinking_request(false)
     };
-
     let resp = client.chat_completion(&request).await.unwrap();
-    assert_eq!(resp.choices.len(), 1);
     let msg = &resp.choices[0].message;
-
-    // Even though DeepSeek extracts reasoning, include_reasoning=false
-    // should suppress it.
-    assert!(
-        msg.reasoning.is_none(),
-        "reasoning should be suppressed with include_reasoning=false"
-    );
+    assert!(msg.reasoning.is_none(), "reasoning suppressed: {msg:?}");
+    let content = msg.content.as_deref().unwrap_or("");
+    assert!(!content.trim().is_empty(), "the answer is kept: {msg:?}");
+    assert_no_markers(content, "content");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_include_reasoning_false_streaming() {
-    let server = TestServer::builder(TestModels::SMOLLM)
-        .with_reasoning_parser("deepseek_r1")
-        .start()
-        .await
-        .expect("server should start");
-    let client = Client::new(server.base_url());
-
+    let (_server, client) = start_qwen3("deepseek_r1").await;
     let request = ChatCompletionRequest {
-        messages: vec![user_msg("Say hello.")],
-        max_tokens: Some(20),
-        temperature: Some(0.0),
-        stream: true,
         include_reasoning: false,
-        ..default_chat_request()
+        ..thinking_request(true)
     };
-
     let chunks = client.chat_completion_stream(&request).await.unwrap();
-    assert!(!chunks.is_empty(), "should have chunks");
-
-    // No reasoning deltas should appear.
-    for chunk in &chunks {
-        for choice in &chunk.choices {
-            assert!(
-                choice.delta.reasoning.is_none(),
-                "reasoning should be suppressed in streaming with include_reasoning=false"
-            );
-        }
-    }
+    let (reasoning, content) = streamed(&chunks);
+    assert!(reasoning.is_empty(), "no reasoning deltas: {reasoning:?}");
+    assert!(!content.trim().is_empty(), "the answer is kept");
+    assert_no_markers(&content, "streamed content");
 }
 
 // ===========================================================================
 // No reasoning parser — verify reasoning field is absent/null
 // ===========================================================================
+// On SmolLM: a server installs the reasoning parser its architecture names whatever the flags
+// (`auto_install_reasoning_parser`), and Qwen3's is `qwen3`, so only an architecture with none
+// serves without one.
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
