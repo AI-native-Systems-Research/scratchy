@@ -564,14 +564,9 @@ mod tests {
             let dim = 128;
             let mut rng = Lcg(7);
             let idx: Vec<u8> = (0..dim)
-                .map(|_| (rng.0.wrapping_add(1) % (1 << bits)) as u8)
-                .collect();
-            let mut rng2 = Lcg(7);
-            let idx: Vec<u8> = idx
-                .iter()
                 .map(|_| {
-                    rng2.0 = rng2.0.wrapping_mul(6364136223846793005).wrapping_add(1);
-                    ((rng2.0 >> 40) % (1 << bits)) as u8
+                    rng.0 = rng.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ((rng.0 >> 40) % (1 << bits)) as u8
                 })
                 .collect();
             let packed = pack_indices(&idx, bits);

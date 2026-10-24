@@ -753,8 +753,8 @@ mod yarn_tests {
             &gpt_oss_yarn(),
         );
         let half = GPT_OSS_HEAD_DIM / 2;
-        for i in 0..GPT_OSS_HEAD_DIM {
-            assert_eq!(table[i], if i < half { 1.0 } else { 0.0 });
+        for (i, &v) in table[..GPT_OSS_HEAD_DIM].iter().enumerate() {
+            assert_eq!(v, if i < half { 1.0 } else { 0.0 });
         }
         // No temperature anywhere: sample every 97th row (prime
         // stride) rather than all 131072 — the value law is per-entry.
