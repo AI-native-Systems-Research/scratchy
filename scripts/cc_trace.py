@@ -69,6 +69,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
@@ -655,15 +656,17 @@ def time_stream(lines, t_sent):
 
 
 def recorded_usage(corpus, row):
-    """{output_tokens, prompt_tokens, stop_reason} of the response the recorder
-    saved for `row`; empty when it saved none.
+    """{recorded_output_tokens, recorded_prompt_tokens, recorded_stop_reason} of the
+    response the recorder saved for `row`, each None when it saved none.
 
     The engine-independent reference: E2E* normalizes to its output length, and
     the context and cut-short checks compare against it.
     """
+    none = {"recorded_output_tokens": None, "recorded_prompt_tokens": None,
+            "recorded_stop_reason": None}
     path = Path(corpus) / "responses" / f"{row['seq']:06d}.body"
     if not path.exists():
-        return {}
+        return none
     data = path.read_bytes()
     if (row.get("resp_content_encoding") or "").lower() == "gzip":
         data = gzip.decompress(data)
@@ -673,9 +676,9 @@ def recorded_usage(corpus, row):
             usage.update((ev.get("message") or {}).get("usage") or ev.get("usage") or {})
             stop_reason = (ev.get("delta") or {}).get("stop_reason") or stop_reason
     except TurnFailed:
-        return {}
-    return {"output_tokens": usage.get("output_tokens") or None,
-            "prompt_tokens": prompt_tokens(usage), "stop_reason": stop_reason}
+        return none
+    return {"recorded_output_tokens": usage.get("output_tokens") or None,
+            "recorded_prompt_tokens": prompt_tokens(usage), "recorded_stop_reason": stop_reason}
 
 
 def load_corpus(corpus):
@@ -712,10 +715,50 @@ def load_corpus(corpus):
             turns.append({"seq": seq, "query": req.get("query") or "",
                           "headers": req.get("headers") or [], "body": req["body"],
                           "in_flight": row.get("in_flight", 0),
-                          "recorded": recorded_usage(d, row)})
+                          **recorded_usage(d, row)})
             continue
         skipped[reason] = skipped.get(reason, 0) + 1
     return manifest, turns, skipped
+
+
+@dataclass(frozen=True)
+class RecordedSize:
+    """How big the recorded session is, for the context-window check and the provenance."""
+
+    # The largest recorded prompt (input + cache read + cache creation tokens).
+    max_prompt_tokens: int
+    # The most context one recorded turn took: its prompt plus its recorded reply.
+    max_turn_tokens: int
+    # Turns the recording has no prompt length for (no saved response, or no usage in it).
+    turns_without_prompt: int
+
+    @classmethod
+    def of(cls, turns):
+        prompts = [t["recorded_prompt_tokens"] for t in turns]
+        return cls(
+            max_prompt_tokens=max(n or 0 for n in prompts),
+            max_turn_tokens=max((t["recorded_prompt_tokens"] or 0)
+                                + (t["recorded_output_tokens"] or 0) for t in turns),
+            turns_without_prompt=sum(1 for n in prompts if n is None))
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    """What a replay ran with: its own settings, and what the endpoint check found
+    (the ollama version and the context window, with where the window came from)."""
+
+    machine: str
+    rung: str
+    scratchy_sha: str
+    engine_provenance: dict
+    temperature: float
+    warmup: bool
+    served_model: str | None
+    ollama_version: str
+    context_length: int
+    # "/v1/models" when the endpoint reported its window (and any --context-length
+    # agreed), "--context-length" when only the flag gave it (ollama).
+    context_length_source: str
 
 
 def _without_cache_control(x):
@@ -1060,12 +1103,13 @@ def aggregate(samples, *, engine, model, repeat):
     return measurements, gaps, by_turn_index
 
 
-def check_endpoint(up, endpoint, engine, *, ollama_version, context_length, model_name):
-    """(ollama_version, context_length), once the endpoint is shown to be `engine`.
+def check_endpoint(endpoint, engine, *, ollama_version, context_length, model_name):
+    """(ollama_version, context_length, where the context length came from), once the
+    endpoint is shown to be `engine`.
 
     Runs before the counter snapshot, because these requests may count.
     """
-    found = probe_engine(up)
+    found = probe_engine(_parse_url(endpoint, "--endpoint"))
     if found is None or found["name"] != engine:
         raise SystemExit(f"--endpoint {endpoint} answers as {found and found['name']!r}, "
                          f"not {engine!r}")
@@ -1081,7 +1125,9 @@ def check_endpoint(up, endpoint, engine, *, ollama_version, context_length, mode
         raise SystemExit(f"--context-length {context_length} but /v1/models reports {reported}")
     if not (context_length or reported):
         raise SystemExit("/v1/models reports no max_model_len; pass --context-length")
-    return ollama_version, context_length or reported
+    if reported:
+        return ollama_version, reported, "/v1/models"
+    return ollama_version, context_length, "--context-length"
 
 
 def replay_turns(up, turns, *, repeat, warmup, temperature, served_model, timeout_s,
@@ -1118,14 +1164,14 @@ def replay_turns(up, turns, *, repeat, warmup, temperature, served_model, timeou
                     f"{where}: read {timing['cache_read_input_tokens']} prompt tokens from "
                     f"the prefix cache right after {reset_name} cleared it, so this pass "
                     "did not start cold")
-            recorded_out = t["recorded"].get("output_tokens")
+            recorded_out = t["recorded_output_tokens"]
             cut = timing["stop_reason"] == "max_tokens"
             if cut and (recorded_out or 0) > timing["output_tokens"]:
                 return samples, sent, (
                     f"{where}: stopped at max_tokens after {timing['output_tokens']} tokens "
                     f"where the recording produced {recorded_out}: the reply was cut short "
                     "(#161 fairness rule 3)")
-            recorded_prompt = t["recorded"].get("prompt_tokens")
+            recorded_prompt = t["recorded_prompt_tokens"]
             short = prompt_shortfall(recorded_prompt, timing["prompt_tokens"])
             if short:
                 return samples, sent, (
@@ -1146,9 +1192,8 @@ def replay_turns(up, turns, *, repeat, warmup, temperature, served_model, timeou
     return samples, sent, None
 
 
-def build_provenance(manifest, corpus, turns, skipped, samples, *, machine, rung,
-                     scratchy_sha, ollama_version, context_length, engine_provenance,
-                     temperature, cache_reset, resets, warmup, served_model, disclosed):
+def build_provenance(manifest, corpus, turns, skipped, samples, cfg, size, *, cache_reset,
+                     resets, disclosed):
     """The run's provenance block, every key the leaderboard requires.
 
     The turn counts below are over the measured repeats; the warm-up pass is
@@ -1158,14 +1203,14 @@ def build_provenance(manifest, corpus, turns, skipped, samples, *, machine, rung
     differs = [t for t in samples if None not in (t["prompt_tokens"], t["recorded_prompt_tokens"])
                and t["prompt_tokens"] != t["recorded_prompt_tokens"]]
     return {
-        "machine": machine,
-        "rung": rung,
-        "scratchy_sha": scratchy_sha,
+        "machine": cfg.machine,
+        "rung": cfg.rung,
+        "scratchy_sha": cfg.scratchy_sha,
         "claude_version": manifest["agent_version"],
-        "ollama_version": ollama_version,
-        "context_length_tokens": context_length,
-        **engine_provenance,
-        "sampling": {"temperature": temperature},
+        "ollama_version": cfg.ollama_version,
+        "context_length_tokens": cfg.context_length,
+        **cfg.engine_provenance,
+        "sampling": {"temperature": cfg.temperature},
         "trace_corpus": {
             "id": Path(corpus).resolve().name,
             "claude_version": manifest["agent_version"],
@@ -1179,8 +1224,12 @@ def build_provenance(manifest, corpus, turns, skipped, samples, *, machine, rung
             "max_in_flight": max(t["in_flight"] for t in turns),
             "turn_classes": {tc: sum(1 for t in turns if t["turn_class"] == tc)
                              for tc in TURN_CLASSES[1:]},
-            "max_recorded_prompt_tokens": max(t["recorded"].get("prompt_tokens") or 0
-                                              for t in turns),
+            "max_recorded_prompt_tokens": size.max_prompt_tokens,
+            # The context window the session was checked against came from the
+            # endpoint, or from the flag alone (ollama reports none).
+            "context_length_source": cfg.context_length_source,
+            # Turns the fit check could not count: the recording has no prompt length.
+            "turns_without_recorded_prompt": size.turns_without_prompt,
             # How this run replayed it. The board's provenance has no key of its
             # own for this, so it travels with the corpus it describes.
             "replay": {
@@ -1192,10 +1241,15 @@ def build_provenance(manifest, corpus, turns, skipped, samples, *, machine, rung
                 "cache_reset_seconds": resets,
                 # One pass before the measured repeats, kept out of every
                 # headline cell; False when --no-warmup skipped it.
-                "warmup": warmup,
-                "served_model": served_model,
+                "warmup": cfg.warmup,
+                "served_model": cfg.served_model,
                 "unstreamed_turns": sum(1 for t in samples if t["unstreamed"]),
                 "max_tokens_turns": sum(1 for t in samples if t["stop_reason"] == "max_tokens"),
+                # Of those, the turns the cut-short check could not judge: the
+                # recording has no reply length to compare with.
+                "max_tokens_turns_unverified": sum(
+                    1 for t in samples
+                    if t["stop_reason"] == "max_tokens" and t["recorded_output_tokens"] is None),
                 "prompt_tokens_differ_turns": len(differs),
                 "prompt_shortfall_tolerance": {"tokens": PROMPT_SHORTFALL_TOKENS,
                                                "fraction": PROMPT_SHORTFALL_FRACTION},
@@ -1235,9 +1289,13 @@ def replay(corpus, endpoint, *, engine, model, machine, rung, scratchy_sha, engi
                          f"{manifest.get('agent_version')!r}, not a Claude Code version")
     classify(turns)
     model_name = served_model or turns[0]["body"].get("model")
-    ollama_version, context_length = check_endpoint(
-        up, endpoint, engine, ollama_version=ollama_version, context_length=context_length,
+    ollama_version, context_length, context_source = check_endpoint(
+        endpoint, engine, ollama_version=ollama_version, context_length=context_length,
         model_name=model_name)
+    cfg = RunConfig(machine=machine, rung=rung, scratchy_sha=scratchy_sha,
+                    engine_provenance=engine_provenance, temperature=temperature, warmup=warmup,
+                    served_model=served_model, ollama_version=ollama_version,
+                    context_length=context_length, context_length_source=context_source)
 
     reset_name, reset, reset_url = make_reset(engine, endpoint, reset_cache_url=reset_cache_url,
                                               model=model_name, timeout_s=timeout_s)
@@ -1250,11 +1308,15 @@ def replay(corpus, endpoint, *, engine, model, machine, rung, scratchy_sha, engi
     ) if applies]
 
     void = None
-    biggest = max(t["recorded"].get("prompt_tokens") or 0 for t in turns)
-    if biggest > context_length:
-        void = (f"the corpus's largest recorded prompt is {biggest} tokens and this engine's "
-                f"context window is {context_length}: the session does not fit "
-                "(#161 fairness rule 3, #322)")
+    size = RecordedSize.of(turns)
+    if size.turns_without_prompt == len(turns):
+        void = ("the recording has no prompt length for any turn, so nothing shows the "
+                f"session fits this engine's {context_length}-token context window "
+                "(#161 fairness rule 3)")
+    elif size.max_turn_tokens > context_length:
+        void = (f"the corpus's largest recorded turn takes {size.max_turn_tokens} tokens, its "
+                f"prompt and its recorded reply, and this engine's context window is "
+                f"{context_length}: the session does not fit (#161 fairness rule 3, #322)")
     served_before = requests_served(info_url)
     if served_before is None:
         if ENGINES[engine]["counts_requests"]:
@@ -1280,12 +1342,8 @@ def replay(corpus, endpoint, *, engine, model, machine, rung, scratchy_sha, engi
                     f"sent {sent}: the endpoint did not serve exactly this replay "
                     "(#161 fairness rule 7)")
 
-    prov = build_provenance(
-        manifest, corpus, turns, skipped, samples, machine=machine, rung=rung,
-        scratchy_sha=scratchy_sha, ollama_version=ollama_version,
-        context_length=context_length, engine_provenance=engine_provenance,
-        temperature=temperature, cache_reset=reset_name, resets=resets, warmup=warmup,
-        served_model=served_model, disclosed=disclosed)
+    prov = build_provenance(manifest, corpus, turns, skipped, samples, cfg, size,
+                            cache_reset=reset_name, resets=resets, disclosed=disclosed)
     run = {"schema": SCHEMA, "run_id": run_id or f"laneA-{engine}-{model}-{machine}-{rung}",
            "lane": "A", "status": "published", "provenance": prov,
            "measurements": [], "gaps": [], "ablations": []}
