@@ -26,7 +26,7 @@ const fn ch(title: &'static str, src: &'static str, slug: &'static str) -> Chapt
     Chapter { title, src, slug }
 }
 
-pub const CHAPTERS: [Chapter; 6] = [
+pub const CHAPTERS: [Chapter; 7] = [
     ch("Introduction", "site/content/introduction.md", "index"),
     ch("Building", "docs/BUILD.md", "BUILD"),
     ch("The compiler", "docs/COMPILER.md", "COMPILER"),
@@ -37,6 +37,7 @@ pub const CHAPTERS: [Chapter; 6] = [
         "spyre/KUBERNETES",
     ),
     ch("Contributing", "CONTRIBUTING.md", "CONTRIBUTING"),
+    ch("Testing", "docs/TESTING.md", "TESTING"),
 ];
 
 pub const BLOGS: [Chapter; 2] = [
@@ -54,15 +55,17 @@ pub const BLOGS: [Chapter; 2] = [
 
 /// Internal links: markdown source -> built .html shell. The docs/-prefixed
 /// forms come before the bare ones.
-const LINK_REWRITES: [(&str, &str); 11] = [
+const LINK_REWRITES: [(&str, &str); 13] = [
     ("](docs/BUILD.md)", "](BUILD.html)"),
     ("](docs/COMPILER.md)", "](COMPILER.html)"),
     ("](docs/MODELS.md)", "](MODELS.html)"),
     ("](docs/spyre/KUBERNETES.md)", "](spyre/KUBERNETES.html)"),
+    ("](docs/TESTING.md)", "](TESTING.html)"),
     ("](BUILD.md)", "](BUILD.html)"),
     ("](COMPILER.md)", "](COMPILER.html)"),
     ("](MODELS.md)", "](MODELS.html)"),
     ("](spyre/KUBERNETES.md)", "](spyre/KUBERNETES.html)"),
+    ("](TESTING.md)", "](TESTING.html)"),
     ("](CONTRIBUTING.md)", "](CONTRIBUTING.html)"),
     (
         "](CLAUDE.md)",

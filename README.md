@@ -116,6 +116,7 @@ mechanics.
 fairness rules, and how to review the startup harness without a GPU.
 - See [`docs/spyre/KUBERNETES.md`](docs/spyre/KUBERNETES.md) for help using OpenShift to build an image for Spyre.
 - See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the PR workflow, CI gates, and architecture invariants.
+- See [`docs/TESTING.md`](docs/TESTING.md) for the five test tiers and the tests that must stay tests.
 
 ## License
 
