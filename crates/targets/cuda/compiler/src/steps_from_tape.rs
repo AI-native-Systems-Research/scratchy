@@ -240,6 +240,12 @@ pub fn lower_fused(
     match fusion.kernel {
         CudaFusion::SiluMul => silu_mul(cx, s, fusion.shape, computes).map(CudaStep::SiluMul),
         CudaFusion::MoeRoute => moe_route(cx, s, fusion.shape, computes).map(CudaStep::MoeRoute),
+        // The GeGLU fold has its row in `CUDA_FUSIONS`; its step is #885's next part. Only a
+        // `Gelu` folds into it, and no qwen tape has one.
+        CudaFusion::GeluMul => Err(CanonicalRefusal::NotLowered {
+            step: s.step,
+            op: "GeluMul",
+        }),
     }
 }
 

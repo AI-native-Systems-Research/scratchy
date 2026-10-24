@@ -92,11 +92,8 @@ pub fn cuda_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRule
         | L::GatedDeltaNet
         | L::Mamba2 { .. }
         | L::Mean
-        | L::RouterNorm { .. }
         | L::RouteSigmoidBias { .. }
         | L::RouteBias { .. }
-        | L::RouteScale { .. }
-        | L::RouteExpertScale { .. }
         | L::ExpertAct { .. }
         | L::ExpertCombine { .. }
         | L::KvEncode { .. }
@@ -107,7 +104,12 @@ pub fn cuda_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRule
         | L::SampleRowsScatter
         | L::AllRowsMatmul => FRESH.reads_across(),
         // The routed half of a MoE block: in the MoE scratch ([`cuda_moe_write`]), not a colour.
-        L::RouterLogits { .. }
+        // Gemma's router norm is `[m, hidden]` bf16 like a colour, but only its router reads it,
+        // so it lives in the scratch's router-norm region with the rest of the routing.
+        L::RouterNorm { .. }
+        | L::RouteScale { .. }
+        | L::RouteExpertScale { .. }
+        | L::RouterLogits { .. }
         | L::RouteSoftmax
         | L::RouteArgsort
         | L::RouteTopK { .. }
@@ -135,19 +137,23 @@ pub enum CudaFusion {
     /// `silu(gate) · up` in one launch (`kernels/silu_mul_bf16.cu`): the SwiGLU MLP's `Silu`
     /// folded into the `Mul` it gates.
     SiluMul,
+    /// `gelu_tanh(gate) · up` in one launch: the GeGLU MLP's `Gelu` folded into the `Mul` it
+    /// gates, and Gemma's expert activation. Its kernel is #885's 13b.
+    GeluMul,
     /// A MoE block's routing in one launch (`kernels/moe_route_bf16.cu`): the softmax over the
-    /// router's logits and their argsort folded into the top-k, the gathered scores and their
-    /// renorm its epilogues.
+    /// router's logits (Qwen) or none (Gemma) and their argsort folded into the top-k; the
+    /// gathered scores, their scale, softmax or renorm, and the per-expert scale its epilogues.
     MoeRoute,
 }
 
 /// CUDA's fusions, in the order the shared fold pass applies them: one sweep of two patterns. The
-/// `Silu` a `Mul` reads as its operand 0 folds into that `Mul` (metal's `Gated` row, with its
-/// `Silu` activation only). A MoE block's top-k folds in the softmax and the argsort before it,
-/// and takes the gathered scores and their renorm as its epilogues (metal's `Route` row, with
-/// Qwen's softmax-first routing only).
+/// `Silu` or `Gelu` a `Mul` reads as its operand 0 folds into that `Mul` (metal's `Gated` row).
+/// A MoE block's top-k folds in the softmax (Qwen's softmax-first routing) and the argsort before
+/// it, and takes as its epilogues the gathered scores, Gemma's `hidden^-0.5` scale (tail stage 0),
+/// a softmax over the picks (Gemma) or their renorm (Qwen) (stage 1), and Gemma's per-expert scale
+/// (stage 2): metal's `Route` row, without its sigmoid and bias routings and its last scale.
 ///
-/// `fused` repeats `SiluMul`: CUDA's `ModelFoldFacts` never sets `fold_projections`, so the shared
+/// `fused` repeats `split`: CUDA's `ModelFoldFacts` never sets `fold_projections`, so the shared
 /// pass always picks `split`, and the gate and up GEMMs stay launches of their own. A `Gated` fold
 /// with its projections folded in is refused at lowering (`CanonicalRefusal::FusionShape`); one
 /// kernel for the gate and up GEMMs is a later GEMM-epilogue issue.
@@ -156,18 +162,30 @@ pub const CUDA_FUSIONS: FusionTable<CudaFusion> = FusionTable {
     sweeps: &[&[
         FoldPattern::Gated {
             mul: SubOpKind::Mul,
-            activations: &[GatedKernel {
-                activation: SubOpKind::Silu,
-                split: CudaFusion::SiluMul,
-                fused: CudaFusion::SiluMul,
-            }],
+            activations: &[
+                GatedKernel {
+                    activation: SubOpKind::Silu,
+                    split: CudaFusion::SiluMul,
+                    fused: CudaFusion::SiluMul,
+                },
+                GatedKernel {
+                    activation: SubOpKind::Gelu,
+                    split: CudaFusion::GeluMul,
+                    fused: CudaFusion::GeluMul,
+                },
+            ],
         },
         FoldPattern::Route {
             top_k: SubOpKind::RouteTopK,
             sort: SubOpKind::RouteArgsort,
             pre: &[SubOpKind::RouteSoftmax],
             gather: SubOpKind::RouteGatherScores,
-            tail: &[&[], &[SubOpKind::RouteRenorm], &[], &[]],
+            tail: &[
+                &[SubOpKind::RouteScale],
+                &[SubOpKind::RouteSoftmax, SubOpKind::RouteRenorm],
+                &[SubOpKind::RouteExpertScale],
+                &[],
+            ],
             kernel: CudaFusion::MoeRoute,
         },
     ]],
@@ -178,7 +196,7 @@ pub const CUDA_FUSIONS: FusionTable<CudaFusion> = FusionTable {
 
 /// A region of the tape's MoE scratch (`crate::tape::MoeTape`): CUDA's own, because its regions
 /// are not metal's (`MoeRegion`): i32 indices, f32 scores, expert runs padded to
-/// [`CUDA_EXPERT_TILE_ROWS`] rows, and no router-norm region.
+/// [`CUDA_EXPERT_TILE_ROWS`] rows, and Gemma's router norm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CudaMoeRegion {
     /// `[m, experts]` bf16, the router's logits.
@@ -197,6 +215,9 @@ pub enum CudaMoeRegion {
     Act,
     /// `[R, hidden]` bf16 (gathered: `[P, hidden]`), the down projection.
     Down,
+    /// `[m, hidden]` bf16, the router's own pre-norm (Gemma's `RouterNorm`), which only the
+    /// router reads.
+    RouterNorm,
 }
 
 /// Where an off-arena MoE op's value is.
@@ -215,12 +236,14 @@ pub enum CudaMoeWrite {
 }
 
 /// CUDA's MoE dataflow: where each op of a block's value is. `None` for an op CUDA lowers no MoE
-/// step for (the router norm, the sigmoid and bias routings, the scales, the ungated expert).
+/// step for (the sigmoid and bias routings, the ungated expert) or that only rides the
+/// `MoeRoute` fold as an epilogue (the scales).
 pub fn cuda_moe_write<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> Option<CudaMoeWrite> {
     use CudaMoeRegion as R;
     use CudaMoeWrite as W;
     use SubOp as L;
     Some(match op {
+        L::RouterNorm { .. } => W::Region(R::RouterNorm),
         L::RouterLogits { .. } => W::Region(R::Logits),
         L::RouteSoftmax | L::RouteArgsort => W::InFold,
         L::RouteTopK { .. } => W::Region(R::TopKIdx),
@@ -239,14 +262,21 @@ pub fn cuda_moe_write<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> Option<CudaM
 }
 
 /// The expert bundles CUDA has a sorted grouped GEMM and an expert GEMV for: the dense bf16
-/// shared-fused bundle (the router, then every expert's fused gate and up, then every expert's
-/// down). Every other bundle is refused at expansion.
+/// shared-fused bundle (Qwen: the router, then every expert's fused gate and up, then every
+/// expert's down) and Gemma's dense bf16 SwitchGLU bank (the same three tensors back to back;
+/// its router's two gains are weights of their own). Every other bundle is refused at expansion.
 ///
 /// Metal's speed gates have no counterpart here, on purpose: `METAL_GROUPED_PAIRS_PER_EXPERT`,
 /// `METAL_SORTED_PAIRS_PER_EXPERT`, `METAL_SHARED_EXPERTS_FROM` and
 /// `METAL_SHARED_EXPERTS_MAX_PAIRS` choose between kernels by speed, or refine the gathered mode,
 /// and speed is not yet CUDA's concern: it has one kernel per mode.
-pub const CUDA_GROUPED_EXPERTS: &[ExpertBundle] = &[ExpertBundle::SharedFused];
+pub const CUDA_GROUPED_EXPERTS: &[ExpertBundle] =
+    &[ExpertBundle::SharedFused, ExpertBundle::SwitchGlu];
+
+/// The expert counts CUDA's MoE steps take: Gemma 4 26B-A4B's 128 and Qwen3.6-35B-A3B's 256.
+/// Every other count is refused at expansion (`MoeShapeRule::Experts`). The 128-expert kernels
+/// are #885's 13b.
+pub const MOE_EXPERT_COUNTS: &[u32] = &[128, 256];
 
 /// The (token, pick) pairs of a bucket from which its tape sorts the pairs by expert and runs the
 /// grouped GEMM; under it each pair's expert GEMV reads the pair's token row directly (gathered).
@@ -275,10 +305,11 @@ mod tests {
     use scratchy_subtile::subtile_ir::{GainConvention, RowScale};
     use scratchy_subtile::tape_colouring::{Outputs, Reads, Residency};
 
-    /// The tables declare exactly the two fused kernels CUDA has, `SiluMul` and `MoeRoute`, and no
+    /// The tables declare exactly CUDA's fused kernels, `SiluMul`, `GeluMul` and `MoeRoute`, and no
     /// sliced `lm_head`: any other pattern, or a sampled weight, would ask the shared passes for a
-    /// kernel CUDA does not have. The routing fold takes Qwen's softmax-first routing only: the
-    /// softmax as its one pre, the renorm as its one tail stage (stage 1, the post-softmax slot).
+    /// kernel CUDA does not have. The routing fold takes the softmax as its one pre (Qwen), and as
+    /// its tail Gemma's scale (stage 0), a softmax or a renorm (stage 1) and Gemma's per-expert
+    /// scale (stage 2), nothing at stage 3.
     #[test]
     fn cuda_declares_only_the_silu_mul_and_moe_route_folds_and_no_sampled_rows() {
         assert!(CUDA_FUSIONS.counted.is_empty());
@@ -302,12 +333,15 @@ mod tests {
             panic!("expected one Gated and one Route pattern, got {sweep:?}");
         };
         assert_eq!(*mul, SubOpKind::Mul);
-        let [act] = activations else {
-            panic!("expected one gated activation, got {activations:?}");
+        let [silu, gelu] = activations else {
+            panic!("expected two gated activations, got {activations:?}");
         };
-        assert_eq!(act.activation, SubOpKind::Silu);
-        assert_eq!(act.split, CudaFusion::SiluMul);
-        assert_eq!(act.fused, CudaFusion::SiluMul);
+        assert_eq!(silu.activation, SubOpKind::Silu);
+        assert_eq!(silu.split, CudaFusion::SiluMul);
+        assert_eq!(silu.fused, CudaFusion::SiluMul);
+        assert_eq!(gelu.activation, SubOpKind::Gelu);
+        assert_eq!(gelu.split, CudaFusion::GeluMul);
+        assert_eq!(gelu.fused, CudaFusion::GeluMul);
         assert_eq!(
             (*top_k, *sort, *gather),
             (
@@ -317,15 +351,27 @@ mod tests {
             )
         );
         assert_eq!(*pre, [SubOpKind::RouteSoftmax]);
-        assert_eq!(**tail, [&[][..], &[SubOpKind::RouteRenorm], &[], &[]]);
+        assert_eq!(
+            **tail,
+            [
+                &[SubOpKind::RouteScale][..],
+                &[SubOpKind::RouteSoftmax, SubOpKind::RouteRenorm],
+                &[SubOpKind::RouteExpertScale],
+                &[],
+            ]
+        );
         assert_eq!(*kernel, CudaFusion::MoeRoute);
     }
 
-    /// The MoE facts: one dense bundle with a grouped GEMM, sorted from metal's 64 pairs, expert
-    /// runs padded to the GEMM's 128-row tile.
+    /// The MoE facts: two dense bundles with a grouped GEMM, at 128 or 256 experts, sorted from
+    /// metal's 64 pairs, expert runs padded to the GEMM's 128-row tile.
     #[test]
     fn the_moe_facts() {
-        assert_eq!(CUDA_GROUPED_EXPERTS, [ExpertBundle::SharedFused]);
+        assert_eq!(
+            CUDA_GROUPED_EXPERTS,
+            [ExpertBundle::SharedFused, ExpertBundle::SwitchGlu]
+        );
+        assert_eq!(MOE_EXPERT_COUNTS, [128, 256]);
         assert_eq!(CUDA_SORTED_PAIRS, 64);
         assert_eq!(CUDA_EXPERT_TILE_ROWS, 128);
         assert_eq!(CUDA_EXPERT_TILE_ROWS, crate::step::GEMM_BF16_TILE.0);
@@ -388,6 +434,26 @@ mod tests {
             (SubOp::RouteScale { scale: 2.0 }, None),
         ];
         for (op, want) in cases {
+            assert_eq!(cuda_moe_write(&op), want, "{}", op.name());
+        }
+        let gemma = RouterBundle::Gemma;
+        let gemma_cases: [(SubOp, Option<CudaMoeWrite>); 3] = [
+            (
+                SubOp::RouterNorm {
+                    eps: 1e-6,
+                    router: gemma,
+                },
+                Some(W::Region(R::RouterNorm)),
+            ),
+            (SubOp::RouteExpertScale { router: gemma }, None),
+            (
+                SubOp::ExpertGatedAct {
+                    act: GatedAct::Gelu,
+                },
+                Some(W::Region(R::Act)),
+            ),
+        ];
+        for (op, want) in gemma_cases {
             assert_eq!(cuda_moe_write(&op), want, "{}", op.name());
         }
     }
@@ -505,6 +571,23 @@ mod tests {
                 fresh_across(Outputs::One),
             ),
         ];
+        let gemma = scratchy_subtile::subtile_ir::RouterBundle::Gemma;
+        let cases = cases.into_iter().chain([
+            (SubOp::ScalarMul { scale: 53.0 }, fresh_across(Outputs::One)),
+            (SubOp::RmsNormUnit { eps: 1e-6 }, fresh_across(Outputs::One)),
+            (SubOp::ScalarWeightMul, fresh_across(Outputs::One)),
+            (SubOp::TanhSoftCap { cap: 30.0 }, fresh_across(Outputs::One)),
+            (SubOp::Elementwise(EwKind::Gelu), fresh_across(Outputs::One)),
+            (
+                SubOp::RouterNorm {
+                    eps: 1e-6,
+                    router: gemma,
+                },
+                off_arena,
+            ),
+            (SubOp::RouteScale { scale: 0.0188 }, off_arena),
+            (SubOp::RouteExpertScale { router: gemma }, off_arena),
+        ]);
         for (op, want) in cases {
             let got = cuda_colour_rule(&op);
             let name = op.name();
