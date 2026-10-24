@@ -1168,6 +1168,12 @@ impl EngineCore {
 
         let params = &request.sampling_params;
 
+        // A stop token before `min_tokens` stops nothing (vLLM's `check_stop`). A backend that
+        // masks the stop tokens until then never samples one; this holds for one that doesn't.
+        if num_output_tokens < params.min_tokens {
+            return (None, None);
+        }
+
         // Check each new token against stop conditions.
         for &token_id in new_token_ids {
             // 3. Check EOS tokens (unless ignore_eos is set).
@@ -1689,6 +1695,56 @@ mod tests {
             let req_out = &outputs[&0].outputs[0];
             assert_eq!(req_out.new_token_ids, [42, 1000], "{reason:?}");
             assert_eq!(req_out.finish_reason, Some(reason));
+        }
+    }
+
+    /// An EOS or stop token among the first `min_tokens` outputs stops nothing, as vLLM's
+    /// `check_stop` skips it; the first one after them stops the request.
+    #[test]
+    fn min_tokens_holds_the_stop_until_it_is_reached() {
+        for stop in [Stop::Eos, Stop::Token] {
+            let mut config = make_test_config();
+            config.eos_token_ids = vec![1000];
+            let mut engine = EngineCore::new(config, Box::new(NoopExecutor::new(1024)));
+            let params = SamplingParams {
+                max_tokens: Some(100),
+                min_tokens: 3,
+                stop_token_ids: vec![7],
+                ..Default::default()
+            };
+            let req = Request::new("req-1".to_string(), vec![10, 20], params, 0.0, 0, 0, None);
+            engine.add_request(req);
+            let scheduler_output = engine.scheduler.schedule();
+            let s = match stop {
+                Stop::Eos => 1000,
+                Stop::Token => 7,
+            };
+            let model_output = ModelRunnerOutput {
+                req_ids: vec!["req-1".to_string()],
+                req_id_to_index: [("req-1".to_string(), 0)].into_iter().collect(),
+                sampled_token_ids: vec![vec![42, s, 43, s, 44]],
+                logprobs: None,
+                prompt_logprobs_dict: std::collections::HashMap::new(),
+                draft_token_ids: None,
+                pooler_output: None,
+                d2h_resolver: None,
+                draft_seed_inputs: None,
+                kv_extent: std::collections::HashMap::new(),
+                kv_pool_reach: None,
+                kv_backed: None,
+            };
+
+            let outputs = engine.update_from_output(&scheduler_output, &model_output);
+            let req_out = &outputs[&0].outputs[0];
+            assert_eq!(req_out.new_token_ids, [42, s, 43, s], "{stop:?}");
+            assert_eq!(req_out.finish_reason, Some(FinishReason::Stop), "{stop:?}");
+            assert_eq!(req_out.stop_reason, Some(StopReason::Token(s)), "{stop:?}");
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        enum Stop {
+            Eos,
+            Token,
         }
     }
 
