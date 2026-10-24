@@ -3139,8 +3139,9 @@ mod tests {
     }
 
     /// Over every published run: a cell whose answers came back short of the tokens asked for
-    /// carries § and says what share it delivered, a dead cell never does, and scratchy, which
-    /// honours `ignore_eos`, has no short live cell (#479).
+    /// carries § and says what share it delivered, and a dead cell never does (#479). Whether
+    /// scratchy answers to length is the matrix script's to judge as it measures (`run_cell`);
+    /// the page marks whatever it is given.
     #[test]
     fn published_cells_that_stopped_answers_early_are_marked_short() {
         use super::numbers::{Engine, Metric, SHORT, cfmt, marks_note, short};
@@ -3178,11 +3179,6 @@ mod tests {
             }
         }
         eprintln!("short cells by engine: {by_engine:?}");
-        assert_eq!(
-            by_engine.get("scratchy"),
-            None,
-            "scratchy answers to length"
-        );
         assert!(
             by_engine.get("omlx").is_some_and(|&n| n > 0),
             "#479's oMLX cells stop short: {by_engine:?}"
