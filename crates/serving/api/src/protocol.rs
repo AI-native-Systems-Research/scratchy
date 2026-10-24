@@ -1341,7 +1341,7 @@ pub struct TokenizeRequest {
     pub chat_template_kwargs: Option<std::collections::HashMap<String, serde_json::Value>>,
 
     /// Whether to add special tokens (e.g. BOS). Default `true` for prompt
-    /// mode, `false` for chat mode (chat template usually adds them).
+    /// mode; for chat mode, whatever the prefill adds to the rendered prompt.
     #[serde(default)]
     pub add_special_tokens: Option<bool>,
 

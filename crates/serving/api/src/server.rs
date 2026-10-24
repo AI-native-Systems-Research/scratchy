@@ -671,18 +671,19 @@ async fn tokenize(
         }
     };
 
-    // Determine the text to tokenize: either from prompt or chat messages.
-    let text = if let Some(prompt) = &request.prompt {
-        prompt.clone()
+    // A prompt adds the special tokens unless told not to. A chat prompt is rendered and encoded
+    // as the prefill does (#214): the tools, the kwargs over the server's defaults, and the
+    // prefill's special tokens unless the client names its own.
+    let encoded = if let Some(prompt) = &request.prompt {
+        tokenizer.encode(prompt, request.add_special_tokens.unwrap_or(true))
     } else if let Some(messages) = &request.messages {
-        // As the prefill renders it: the tools, and the kwargs over the server's defaults (#214).
         let rendered = state.engine.render_chat(
             messages,
             request.tools.as_deref(),
             request.chat_template_kwargs.as_ref(),
             request.add_generation_prompt,
         );
-        match rendered {
+        let text = match rendered {
             Some(Ok(text)) => text,
             Some(Err(e)) => {
                 return Json(protocol::ErrorResponse::new(
@@ -700,6 +701,10 @@ async fn tokenize(
                 ))
                 .into_response();
             }
+        };
+        match request.add_special_tokens {
+            Some(add_special) => tokenizer.encode(&text, add_special),
+            None => tokenizer.encode_chat(&text, &[]).map(|(ids, _)| ids),
         }
     } else {
         return Json(protocol::ErrorResponse::new(
@@ -710,11 +715,7 @@ async fn tokenize(
         .into_response();
     };
 
-    let add_special = request
-        .add_special_tokens
-        .unwrap_or(request.prompt.is_some());
-
-    match tokenizer.encode(&text, add_special) {
+    match encoded {
         Ok(token_ids) => {
             let token_strs = if request.return_token_strs.unwrap_or(false) {
                 Some(
