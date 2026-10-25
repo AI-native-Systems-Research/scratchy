@@ -47,6 +47,19 @@ pub struct HeadRegistration {
     /// arch (`scratchy_serving_engine::spec_decode::mtp`'s module docs: what it is measured at,
     /// and what blocks it).
     pub verify_rows: u8,
+    /// How it drafts a sequence's tokens.
+    pub drafting: HeadDrafting,
+}
+
+/// How a head drafts a sequence's tokens each step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadDrafting {
+    /// A token a pass, each pass reading the last's (a multi-token-prediction head).
+    Chained,
+    /// Every draft in one pass over a block of rows — the sequence's newest token and a mask row a
+    /// draft — reading the context of the rows its target retained, which it commits to rings of
+    /// its own (Splash's DFlash2 drafter).
+    Block,
 }
 
 /// A drafter published as a checkpoint of its own that its target drafts with by default: no
@@ -95,12 +108,21 @@ pub fn draft_head(arch_hint: &str) -> Option<HeadRegistration> {
         .map(|(_, head)| head)
 }
 
-/// The compiled multi-token-prediction head of a target whose checkpoint architecture is
-/// `target_arch`, if this build compiled one.
-pub fn head_of(target_arch: &str) -> Option<HeadRegistration> {
+/// The compiled head a target whose checkpoint architecture is `target_arch`, of `shape`, drafts
+/// with by default, if this build compiled one: a drafter published for its shape (Splash's
+/// DFlash2 drafter for Qwen3.6-35B-A3B) before a head its checkpoint may carry.
+pub fn head_of(target_arch: &str, shape: Option<TargetShape>) -> Option<HeadRegistration> {
+    let mut heads = heads_of(target_arch);
+    let first = heads.next()?;
+    let published = |head: &HeadRegistration| shape.and_then(|s| head.published_for(s)).is_some();
+    Some(std::iter::once(first).chain(heads).find(published).unwrap_or(first))
+}
+
+/// Every compiled head that drafts for a target whose checkpoint architecture is `target_arch`.
+pub fn heads_of(target_arch: &str) -> impl Iterator<Item = HeadRegistration> + '_ {
     registered()
         .map(|(_, head)| head)
-        .find(|head| head.drafts_for.contains(&target_arch))
+        .filter(move |head| head.drafts_for.contains(&target_arch))
 }
 
 /// Every compiled head, with its arch's checkpoint architectures. A build without a target
@@ -167,6 +189,7 @@ mod tests {
             }],
             drafts: 2,
             verify_rows: 3,
+            drafting: HeadDrafting::Chained,
         };
         assert_eq!(
             head.published_for(GEMMA_26B),

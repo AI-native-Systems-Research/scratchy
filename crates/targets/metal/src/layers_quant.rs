@@ -221,6 +221,18 @@ pub trait MetalAffineQuantOps {
     ) -> Result<Self>
     where
         Self: Sized;
+
+    /// One projection of several on-disk projections' rows, in order, still packed: Splash's
+    /// fused QKV (`runtime/model/DraftCheckpoint.cpp`, `Builder::projection` over q, k and v).
+    fn load_rows_concat(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        group_size: u32,
+        bits: u32,
+        expected_in_features: u32,
+    ) -> Result<Self>
+    where
+        Self: Sized;
 }
 
 /// Affine `scales` / `biases` the model's quantized kernels cannot read as stored: they read
@@ -338,6 +350,95 @@ impl MetalAffineQuantOps for AffineQuantLinear {
             affine_biases,
             linear_bias,
             in_features,
+            out_features,
+            group_size,
+            bits,
+        })
+    }
+
+    /// Each prefix's packed rows, scales and biases appended along dim 0: an MLX-affine group
+    /// runs along K, so a row dequantizes from its own codes, scale and bias wherever it sits,
+    /// and the fused projection's rows are its parts' rows in order. A part's linear bias is
+    /// refused, not dropped. A part stays in the store: another fused projection may pack it too.
+    fn load_rows_concat(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        group_size: u32,
+        bits: u32,
+        expected_in_features: u32,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !prefixes.is_empty(),
+            "AffineQuantLinear::load_rows_concat: empty prefix list"
+        );
+        let compiled = weights
+            .rmsnorm_scale_dtype()
+            .ok_or_else(|| AffineScaleError::Unpinned {
+                tensor: format!("{}.scales", prefixes[0]),
+            })?;
+        let (mut codes, mut scales, mut biases) = (Vec::new(), Vec::new(), Vec::new());
+        let mut out_features = 0usize;
+        let mut widths: Option<(usize, usize)> = None;
+        for prefix in prefixes {
+            anyhow::ensure!(
+                !weights.contains(&format!("{prefix}.bias")),
+                "affine rows concat: `{prefix}.bias` present — a fused projection carries no bias"
+            );
+            let (w, w_shape, w_dtype) = weights.copy_cpu(&format!("{prefix}.weight"))?;
+            let (s, s_shape, s_dtype) = weights.copy_cpu(&format!("{prefix}.scales"))?;
+            let (b, b_shape, b_dtype) = weights.copy_cpu(&format!("{prefix}.biases"))?;
+            anyhow::ensure!(
+                w_dtype == DType::U32 && w_shape.len() == 2,
+                "affine rows concat: `{prefix}.weight` is {w_dtype} {w_shape:?} (expected U32 rank 2)"
+            );
+            for (name, dtype) in [("scales", s_dtype), ("biases", b_dtype)] {
+                if dtype != compiled {
+                    return Err(AffineScaleError::Mismatch {
+                        tensor: format!("{prefix}.{name}"),
+                        on_disk: dtype,
+                        compiled,
+                    }
+                    .into());
+                }
+            }
+            let (rows, packed_cols) = (w_shape[0], w_shape[1]);
+            let in_features = packed_cols * 32 / bits as usize;
+            anyhow::ensure!(
+                affine_packed_cols(in_features, bits) == packed_cols
+                    && in_features == expected_in_features as usize,
+                "affine rows concat: `{prefix}.weight` [{rows}, {packed_cols}] is not a bits={bits} \
+                 packing of in_features={expected_in_features}"
+            );
+            let groups = in_features / group_size as usize;
+            anyhow::ensure!(
+                s_shape == [rows, groups] && b_shape == s_shape,
+                "affine rows concat: `{prefix}` scales {s_shape:?} / biases {b_shape:?} are not \
+                 [{rows}, {groups}]"
+            );
+            match widths {
+                Some(w) => anyhow::ensure!(
+                    w == (packed_cols, groups),
+                    "affine rows concat: `{prefix}` row width differs from the first part's"
+                ),
+                None => widths = Some((packed_cols, groups)),
+            }
+            codes.extend_from_slice(&w);
+            scales.extend_from_slice(&s);
+            biases.extend_from_slice(&b);
+            out_features += rows;
+        }
+        let (packed_cols, groups) = widths.expect("at least one prefix");
+        let weight =
+            weights.alloc_packed_from_host(&codes, &[out_features, packed_cols], DType::U32)?;
+        let scales = weights.alloc_packed_from_host(&scales, &[out_features, groups], compiled)?;
+        let affine_biases =
+            weights.alloc_packed_from_host(&biases, &[out_features, groups], compiled)?;
+        Ok(Self {
+            weight,
+            scales,
+            affine_biases,
+            linear_bias: None,
+            in_features: expected_in_features as usize,
             out_features,
             group_size,
             bits,
@@ -625,6 +726,16 @@ pub trait MetalLinearLayerOps {
     where
         Self: Sized;
 
+    fn load_affine_quant_rows_concat(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        group_size: u32,
+        bits: u32,
+        expected_in_features: u32,
+    ) -> Result<Self>
+    where
+        Self: Sized;
+
     fn load_nvfp4_quant<W: WeightSource + ?Sized>(
         weights: &mut W,
         prefix: &str,
@@ -682,6 +793,26 @@ impl MetalLinearLayerOps for LinearLayer {
             bits,
             expected_in_features,
         )?)))
+    }
+
+    /// Load a fused MLX-affine linear from several prefixes' rows, still packed
+    /// ([`MetalAffineQuantOps::load_rows_concat`]).
+    fn load_affine_quant_rows_concat(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        group_size: u32,
+        bits: u32,
+        expected_in_features: u32,
+    ) -> Result<Self> {
+        Ok(Self::AffineQuant(Box::new(
+            AffineQuantLinear::load_rows_concat(
+                weights,
+                prefixes,
+                group_size,
+                bits,
+                expected_in_features,
+            )?,
+        )))
     }
 
     /// Load an NVFP4 4-bit quantized linear by safetensors prefix

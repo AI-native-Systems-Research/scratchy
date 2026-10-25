@@ -37,6 +37,7 @@ pub(crate) fn alias_preamble() -> TokenStream {
         use ::scratchy_target_metal::tape::lowered as __tl;
         use ::scratchy_target_metal::tape::constants as __tc;
         use ::scratchy_target_metal::tape::ids as __ti;
+        use ::scratchy_target_metal::dflash2 as __td;
     }
 }
 
@@ -51,7 +52,7 @@ fn module_of(ty: &str) -> Result<TokenStream, Error> {
         | "LoweredCommand" | "GatedCommand" | "GemmDims" | "WeightTensor"
         | "RuntimeBindingKind" | "ActivationWidth" | "LoweredMetalTape" | "ClassedTape"
         | "GenClass" | "KvAddressing" | "TapeLoop" | "TapeCommands" | "Fence" | "SetAxis"
-        | "LogitsRows" | "RowTile" | "DecodePartials" | "SplitSteps" => {
+        | "LogitsRows" | "RowTile" | "DecodePartials" | "SplitSteps" | "PlayLive" => {
             quote!(__tl)
         }
         "ConstantValue" | "ConstantType" | "ConstSlot" => {
@@ -66,6 +67,7 @@ fn module_of(ty: &str) -> Result<TokenStream, Error> {
         | "KPartitionSizeI32" | "AttnScale" | "RmsNormEps" => {
             quote!(__ti)
         }
+        "DraftOutput" => quote!(__td),
         other => return Err(Error(format!("const_tokens: unmapped type `{other}`"))),
     };
     Ok(m)

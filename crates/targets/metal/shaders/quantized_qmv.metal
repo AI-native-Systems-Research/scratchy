@@ -2277,6 +2277,12 @@ constant constexpr bool COMBINE_RESIDUAL = COMBINE_RESIDUAL_FC_SET && COMBINE_RE
 SCRATCHY_CONSTANT_OPTIONAL(bool, COMBINE_LINEAR_BIAS_FC, 6);
 constant constexpr bool COMBINE_LINEAR_BIAS = COMBINE_LINEAR_BIAS_FC_SET && COMBINE_LINEAR_BIAS_FC;
 
+// 22 (`COMBINE_ROWS_SORTED`): each pair's x row sits where a sorted bake's sort put it — row
+// pos[pair] (buffer(11)) of the rows its gated command wrote in sorted order — not at the pair's
+// own row. Unset: no buffer(11).
+SCRATCHY_CONSTANT_OPTIONAL(bool, COMBINE_ROWS_SORTED_FC, 22);
+constant constexpr bool COMBINE_ROWS_SORTED = COMBINE_ROWS_SORTED_FC_SET && COMBINE_ROWS_SORTED_FC;
+
 // The MoE block's down projection and its weighted combine:
 // `out[n, d] = Σ_k down[n, k, d] · scores[n, k]`, summed in slot order (as `moe_weighted_sum`).
 // Each pair's x row is its own (the gated activation's rows); GATHER_PER_ROW is the top-k.
@@ -2285,6 +2291,7 @@ constant constexpr bool COMBINE_LINEAR_BIAS = COMBINE_LINEAR_BIAS_FC_SET && COMB
 //   buffer(4)   = rhs_indices           buffer(7) = out    [N, out_vec]
 //   buffer(8)   = shared rows, gate-scaled   buffer(9) = the gate, gate-scaled
 //   buffer(10)  = down LINEAR biases [E, out_vec], gpt-oss only
+//   buffer(11)  = pos [N, top_k], each pair's row of x in a sorted bake's order (COMBINE_ROWS_SORTED)
 // Dispatch (N, ceil(out_vec / 4), 1), threadgroup (32, top_k, 1): token n = tid.x (fastest, as
 // the gated kernel's pairs); simdgroup k runs pair (n, k)'s matvec over the 4-row group tid.y, then lanes 0-3 of simdgroup 0 combine the group's
 // rows. A pair row another threadgroup also writes (qmv_impl redoing a tail) gets the same bits.
@@ -2301,13 +2308,15 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     const device T_act*    shared_y    [[buffer(8)]],
     const device T_act*    gate        [[buffer(9)]],
     const device T_act*    down_bias   [[buffer(10)]],
+    const device uint32_t* pos         [[buffer(11)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
   uint n = tid.x;
   uint nk = n * uint(GATHER_PER_ROW) + simd_gid;
+  const uint x_row = COMBINE_ROWS_SORTED ? pos[nk] : nk;
   gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
-      w, scales, biases, x, rhs_indices[nk], y, nk, nk, tid.y / 2, tid.y % 2, simd_lid,
+      w, scales, biases, x, rhs_indices[nk], y, nk, x_row, tid.y / 2, tid.y % 2, simd_lid,
       nullptr);
   threadgroup_barrier(mem_flags::mem_device);
   uint row = tid.y * 4 + simd_lid;

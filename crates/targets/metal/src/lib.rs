@@ -228,6 +228,7 @@ pub mod argmax;
 pub mod chain_advance;
 pub mod cpu_reference;
 pub mod device;
+pub mod dflash2;
 /// Metal lowered from the SHARED `SubtileTape` — the same artifact spyre lowers. Lives here,
 /// in the target crate, beside spyre's `lower_subtile_tape_to_superdsc`.
 pub mod from_tape;
@@ -387,10 +388,10 @@ pub use loaders::{
     load_layered_linear_affine_dequant_as_dense,
     load_layered_linear_affine_dequant_concat_as_dense,
     load_layered_linear_affine_dequant_concat_as_dense_mixed, load_layered_linear_affine_quant,
-    load_layered_linear_affine_quant_mixed, load_layered_linear_dense,
-    load_layered_linear_dense_concat_packed, load_layered_linear_dense_vision,
-    load_layered_linear_nvfp4_quant, load_layered_linear_nvfp4_quant_concat, load_layered_rms_norm,
-    load_layered_rms_norm_vision,
+    load_layered_linear_affine_quant_mixed, load_layered_linear_affine_quant_rows_concat,
+    load_layered_linear_dense, load_layered_linear_dense_concat_packed,
+    load_layered_linear_dense_vision, load_layered_linear_nvfp4_quant,
+    load_layered_linear_nvfp4_quant_concat, load_layered_rms_norm, load_layered_rms_norm_vision,
 };
 
 /// Per-layer device-memory RAII type for the pooled caches under metal:
