@@ -197,7 +197,9 @@ impl BlockDrafter {
             let end = step.history_lens[i];
             let reaches_end = step.positions[rows.end - 1] + 1 >= end;
             let from = end.saturating_sub(self.window as u32);
-            let skip = (rows.clone()).take_while(|&r| step.positions[r] < from).count();
+            let skip = (rows.clone())
+                .take_while(|&r| step.positions[r] < from)
+                .count();
             let kept = rows.start + skip..rows.end;
             if kept.is_empty() {
                 continue;
@@ -208,7 +210,9 @@ impl BlockDrafter {
             commit.slot_mapping.extend(kept.clone().map(|_| u32::MAX));
             commit.cu_seqlens_q.push(commit.input_ids.len() as u32);
             commit.seqused_k.push(step.positions[rows.end - 1] + 1);
-            commit.hidden_rows.push((start, kept.start as u32, kept.len() as u32));
+            commit
+                .hidden_rows
+                .push((start, kept.start as u32, kept.len() as u32));
             commit.steps.push(i);
             // A sequence the target samples every row of verifies them; one it samples the last
             // row of gets that row's token; one it samples none of runs a prompt chunk short of
@@ -363,7 +367,9 @@ mod tests {
             history: vec![41],
             sampled: SampledRows::of(&[0, 8], |_| true).expect("rows"),
         };
-        let passes = DRAFTER.passes(&step.rows(), &plan(&["a"])).expect("planned");
+        let passes = DRAFTER
+            .passes(&step.rows(), &plan(&["a"]))
+            .expect("planned");
         assert!(passes.commit.cycle);
         assert_eq!(passes.commit.hidden_rows, [(0, 0, 8)]);
         let block = passes.block.expect("drafts");
@@ -382,11 +388,21 @@ mod tests {
         let drafts = DRAFTER.drafts(&block, &proposals, &[8], &step.rows(), &[vec![1]]);
         assert_eq!(drafts["a"], proposals);
         let budgeted = DRAFTER.drafts(&block, &proposals, &[3], &step.rows(), &[vec![1]]);
-        assert_eq!(budgeted["a"], [900, 901], "a verify of 3 rows checks 2 proposals");
+        assert_eq!(
+            budgeted["a"],
+            [900, 901],
+            "a verify of 3 rows checks 2 proposals"
+        );
         let anchor = DRAFTER.drafts(&block, &proposals, &[1], &step.rows(), &[vec![1]]);
-        assert!(anchor["a"].is_empty(), "a verify of its anchor alone checks none");
+        assert!(
+            anchor["a"].is_empty(),
+            "a verify of its anchor alone checks none"
+        );
         let chunk = DRAFTER.drafts(&block, &proposals, &[8], &step.rows(), &[vec![]]);
-        assert!(chunk.is_empty(), "a step that produced no token drafts nothing");
+        assert!(
+            chunk.is_empty(),
+            "a step that produced no token drafts nothing"
+        );
     }
 
     /// Splash's draft context plan, at a window of 16 positions: a 40-token prompt prefilled in
@@ -412,7 +428,10 @@ mod tests {
         assert_eq!(middle.commit.positions, (24..32).collect::<Vec<_>>());
         assert_eq!(middle.commit.input_ids, (124..132).collect::<Vec<_>>());
         assert_eq!(middle.commit.hidden_rows, [(0, 8, 8)]);
-        assert_eq!(middle.block, None, "a chunk short of its end drafts nothing");
+        assert_eq!(
+            middle.block, None,
+            "a chunk short of its end drafts nothing"
+        );
         let last = (drafter.passes(&chunk(32, 40).rows(), &plan(&["a"]))).expect("commits");
         assert_eq!(last.commit.positions, (32..40).collect::<Vec<_>>());
         let block = last.block.expect("drafts at its end");
@@ -431,7 +450,9 @@ mod tests {
             history: vec![41],
             sampled: SampledRows::of(&[0, 3], |_| true).expect("rows"),
         };
-        let passes = DRAFTER.passes(&step.rows(), &plan(&["a"])).expect("planned");
+        let passes = DRAFTER
+            .passes(&step.rows(), &plan(&["a"]))
+            .expect("planned");
         assert!(passes.commit.cycle);
         assert_eq!(passes.commit.hidden_rows, [(0, 0, 3)]);
         let block = passes.block.expect("drafts");
@@ -451,7 +472,9 @@ mod tests {
             history: vec![5],
             sampled: SampledRows::of(&[0, 5], |_| false).expect("rows"),
         };
-        let passes = DRAFTER.passes(&last.rows(), &plan(&["a"])).expect("planned");
+        let passes = DRAFTER
+            .passes(&last.rows(), &plan(&["a"]))
+            .expect("planned");
         assert!(!passes.commit.cycle);
         let block = passes.block.expect("drafts");
         let lane = BlockLane {
@@ -474,7 +497,10 @@ mod tests {
         let passes = (DRAFTER.passes(&decoding.rows(), &plan(&["a", "b"]))).expect("planned");
         assert!(!passes.commit.cycle, "a decode step commits every row");
         assert_eq!(passes.commit.positions, [30, 12]);
-        assert_eq!(passes.block, None, "two sequences' blocks overflow 8 verify rows");
+        assert_eq!(
+            passes.block, None,
+            "two sequences' blocks overflow 8 verify rows"
+        );
         assert_eq!(DRAFTER.passes(&decoding.rows(), &plan(&[])), None);
     }
 }

@@ -243,7 +243,12 @@ impl CycleLayout {
         let at = |section: u64| base + section;
         [
             vec![logits, at(self.lanes), at(self.partial_masses)],
-            vec![logits, at(self.lanes), at(self.partial_masses), at(self.vocabulary_rows)],
+            vec![
+                logits,
+                at(self.lanes),
+                at(self.partial_masses),
+                at(self.vocabulary_rows),
+            ],
             vec![
                 logits,
                 at(self.lanes),
@@ -340,7 +345,13 @@ impl TargetSamplingKernels {
         rows: u32,
     ) {
         let [mass, search, draw] = tables;
-        encode_after(&self.mass, encoder, mass, rows * TARGET_SAMPLING_SHARDS, 256);
+        encode_after(
+            &self.mass,
+            encoder,
+            mass,
+            rows * TARGET_SAMPLING_SHARDS,
+            256,
+        );
         encode_after(&self.search, encoder, search, rows, VOCABULARY_THREADS);
         encode_after(
             &self.draw,

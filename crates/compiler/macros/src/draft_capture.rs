@@ -43,7 +43,10 @@ pub fn insert(ast: &Ast) -> Ast {
     let mut out = ast.clone();
     let statements = &mut out.statements;
     let site = (0..statements.len()).rev().find_map(|i| {
-        let Stmt::For { ivar, end, body, .. } = &statements[i] else {
+        let Stmt::For {
+            ivar, end, body, ..
+        } = &statements[i]
+        else {
             return None;
         };
         if !matches!(end, BoundExpr::Ident(e) if e == LAYER_COUNT) {
@@ -121,7 +124,9 @@ fn read(stmts: &[Stmt]) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for s in stmts {
         match s {
-            Stmt::Assign { value, .. } | Stmt::AssignTuple { value, .. } => reads(value, &mut names),
+            Stmt::Assign { value, .. } | Stmt::AssignTuple { value, .. } => {
+                reads(value, &mut names)
+            }
             Stmt::For { body, .. } => names.extend(read(body)),
             Stmt::If {
                 then_body,
@@ -179,7 +184,9 @@ mod tests {
             .join("../../models/arch/configs/llama/llama-3.2-1b.json");
         let mut params = config::load_file(&path).expect("load config");
         let set = LayerSet::of(captured.iter().copied());
-        params.layer_sets.insert(DRAFT_CAPTURE_LAYERS.to_string(), set);
+        params
+            .layer_sets
+            .insert(DRAFT_CAPTURE_LAYERS.to_string(), set);
         params
     }
 
@@ -201,7 +208,10 @@ mod tests {
     fn a_target_with_no_drafter_unrolls_as_before() {
         let ast = parse_body(DECODER).expect("parse");
         let params = llama(&[]);
-        let (before, after) = (unroll_ast(&ast, &params), unroll_ast(&insert(&ast), &params));
+        let (before, after) = (
+            unroll_ast(&ast, &params),
+            unroll_ast(&insert(&ast), &params),
+        );
         assert_eq!(ops(&before), ops(&after));
     }
 

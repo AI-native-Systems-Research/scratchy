@@ -32,5 +32,8 @@ fn every_capture_copies_a_finished_layer_output() {
             }
         }
     }
-    assert!(captures > 0, "the target captures no rows: build it with a drafter beside it");
+    assert!(
+        captures > 0,
+        "the target captures no rows: build it with a drafter beside it"
+    );
 }
