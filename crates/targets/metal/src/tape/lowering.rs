@@ -8666,16 +8666,18 @@ fn lower_moe_step(
         // (token, expert) row to its padded slot — at padding 1 (sorted) or 64 (grouped).
         // Gathered: nothing — the projections read the token rows.
         S::Sort(Slot(x)) if s.grouping != MoeGrouping::Gathered => {
-            let (mpad, one) = (s.l.mpad_max as i32, (1, 1, 1));
+            let mpad = s.l.mpad_max as i32;
             let pad = s.grouping.pad().expect("a sorted bake pads");
             let sentinel = s.grouping.sentinel(e) as i32;
+            // One command groups the routes and fills the padding (Splash's `group_routes`).
             let offsets = vec![
                 C::int(0, pairs as i32),
                 C::int(1, e as i32),
+                C::int(2, mpad),
                 C::int(3, k as i32),
                 C::int(6, pad as i32),
+                C::int(7, sentinel),
             ];
-            let init = vec![C::int(1, e as i32), C::int(2, mpad), C::int(7, sentinel)];
             let scatter = [0, 1, 2, 3, 4]
                 .into_iter()
                 .zip([pairs, e, s.l.mpad_max, k, hidden]);
@@ -8723,7 +8725,7 @@ fn lower_moe_step(
                         lib,
                         "moe_group_offsets",
                         offsets,
-                        grid(one, (256, 1, 1), None),
+                        grid((l.mpad_max.max(e).div_ceil(256), 1, 1), (256, 1, 1), None),
                         vec![
                             s.at(0, R::TopKIndices),
                             at(1, l.grp_count),
@@ -8733,15 +8735,9 @@ fn lower_moe_step(
                                 kind: RuntimeBindingKind::NumTokensU32,
                                 binding_index: 4,
                             },
+                            at(5, l.grp_indices_pad),
+                            at(6, l.grp_fill),
                         ],
-                    ),
-                    cmd(
-                        KernelId::MoeGroupInit,
-                        lib,
-                        "moe_group_init",
-                        init,
-                        grid((l.mpad_max.div_ceil(256), 1, 1), (256, 1, 1), None),
-                        vec![at(0, l.grp_indices_pad), at(1, l.grp_fill)],
                     ),
                     cmd(
                         scatter_kernel,
