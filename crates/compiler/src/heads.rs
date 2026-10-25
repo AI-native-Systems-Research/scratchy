@@ -115,7 +115,12 @@ pub fn head_of(target_arch: &str, shape: Option<TargetShape>) -> Option<HeadRegi
     let mut heads = heads_of(target_arch);
     let first = heads.next()?;
     let published = |head: &HeadRegistration| shape.and_then(|s| head.published_for(s)).is_some();
-    Some(std::iter::once(first).chain(heads).find(published).unwrap_or(first))
+    Some(
+        std::iter::once(first)
+            .chain(heads)
+            .find(published)
+            .unwrap_or(first),
+    )
 }
 
 /// Every compiled head that drafts for a target whose checkpoint architecture is `target_arch`.

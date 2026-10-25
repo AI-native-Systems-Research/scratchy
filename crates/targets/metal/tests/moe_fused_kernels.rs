@@ -476,7 +476,11 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
         let (combined_down_y, combined_out) = (e_buf(pairs * HIDDEN), e_buf(tokens * HIDDEN));
         let mut combine = block.down.bindings().to_vec();
         combine.extend([(&sorted_gate_y, 3), (&block.indices[0], 4)]);
-        combine.extend([(&combined_down_y, 5), (&block.scores, 6), (&combined_out, 7)]);
+        combine.extend([
+            (&combined_down_y, 5),
+            (&block.scores, 6),
+            (&combined_out, 7),
+        ]);
         combine.push((&pos, 11));
 
         run(&device, 1, 1, |_| {
@@ -835,7 +839,11 @@ fn moe_group_offsets_count_every_expert_at_256() {
         assert_eq!(got_count, want_count, "{what}: counts");
         let got_offset = common::read_slice::<u32>(&offset, QWEN_EXPERTS);
         assert_eq!(got_offset, want_offset, "{what}: offsets");
-        assert_eq!(common::read_slice::<u32>(&total, 1), vec![acc], "{what}: total");
+        assert_eq!(
+            common::read_slice::<u32>(&total, 1),
+            vec![acc],
+            "{what}: total"
+        );
     }
 }
 
